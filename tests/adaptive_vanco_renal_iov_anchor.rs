@@ -39,6 +39,8 @@ use ferx_core::{
 use std::collections::HashMap;
 use std::path::Path;
 
+mod common;
+
 /// The anchor seed. Must match the seed the frozen κ / troughs in the R kit were
 /// generated at (the κ reconstruction is seed-deterministic). Identical to the #701
 /// IOV anchor's seed, so the per-occasion κ is the same model-independent stream.
@@ -173,7 +175,7 @@ fn print_coordination() {
 
 /// Fast guard: a typo in the composed example fails here, by name, rather than as a mismatch in
 /// the cross-engine check below. Parses the model (full `[adaptive_dosing]` validate), pins the
-/// scenario (one κ, the CRCL covariate referenced, trough control law, `auc_target` absent),
+/// scenario (one κ, the CRCL covariate referenced, trough control law, no `auc_target` declared),
 /// and runs a short seeded reactive run through the default frozen-replay verifier.
 #[test]
 fn vanco_renal_iov_example_parses_and_runs_the_verifier() {
@@ -187,7 +189,7 @@ fn vanco_renal_iov_example_parses_and_runs_the_verifier() {
         .expect("[adaptive_dosing] block present");
     assert_eq!(
         spec.auc_target, None,
-        "auc_target is a typed error here (#700/#701)"
+        "the example declares no auc_target; the window-AUC test adds one (#943)"
     );
     assert_eq!(spec.at.len(), 14, "14 daily decisions");
 
@@ -272,4 +274,54 @@ fn vanco_renal_iov_titration_matches_mrgsolve() {
         "the trough trajectory must vary substantially under CRCL × κ (spread {:.3} mg/L)",
         hi - lo
     );
+}
+
+/// mrgsolve's AUC24 of each closed inter-decision window (#943), frozen in
+/// `tests/reference/vanco_renal_iov_mrgsolve/expected.md`: an AUC compartment `dxdt_AUC = CENT/V` reset at the
+/// start of each window, integrated on the same piecewise-constant CL as the troughs above.
+const REF_AUC24: [f64; 13] = [
+    111.033800, 160.428342, 182.509348, 269.686668, 446.210865, 465.141934, 537.141299, 481.392114,
+    501.969692, 496.472543, 463.978639, 441.207326, 393.515239,
+];
+
+/// Relative band of each ferx AUC24 against mrgsolve's (#943), the band of the constant-path
+/// vanco anchor. Measured on Linux aarch64 (`tools/linux-test.sh`), identical in every
+/// printed digit on macOS arm64: the windows read −2.7e-6 to +1.3e-6 relative, so 5e-5 is at least
+/// 19× headroom. This is a cross-engine band (RK45 + a trapezoid on soft samples vs
+/// LSODA + an AUC compartment), not ferx's own accuracy; the kit has a constant `V` and no
+/// `[scaling]`, so it checks the exposure of the per-segment trajectory, and the readout
+/// conversion under κ and covariates is pinned by the closed forms in
+/// `src/api/tests/adaptive_auc_tv_tests.rs`.
+const AUC_REL_TOL: f64 = 5e-5;
+
+/// Each window's AUC24 matches mrgsolve's to [`AUC_REL_TOL`] (#943): the exposure integral
+/// under the per-segment snapshot, checked window by window rather than through the
+/// attainment fraction.
+#[test]
+fn vanco_renal_iov_window_aucs_match_mrgsolve() {
+    common::assert_window_aucs_match(&windows_in, &REF_AUC24, AUC_REL_TOL, "renal_iov");
+}
+
+/// Run the anchor scenario with `auc_target = band` and count the windows in it.
+fn windows_in(band: (f64, f64)) -> usize {
+    let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal_iov.ferx"))
+        .expect("model must parse");
+    let mut spec = parsed
+        .adaptive_dosing
+        .clone()
+        .expect("[adaptive_dosing] present");
+    spec.auc_target = Some(band);
+    let pop = anchor_population(&spec.at);
+    let mut opts = AdaptiveSimulateOptions::default();
+    opts.seed = Some(ANCHOR_SEED);
+    let res = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        &spec,
+        &opts,
+    )
+    .expect("adaptive run with auc_target");
+    common::windows_in_band(&res)
 }

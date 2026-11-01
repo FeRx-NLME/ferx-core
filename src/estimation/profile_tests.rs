@@ -3471,6 +3471,12 @@ fn a_level_that_log_packs_declines_the_adjoint_gradient() {
 /// and 2.4e-5. The solve at F2's own `inner_maxiter` records no subject: the straddle.
 /// Dies when an off-mode subject still takes the adjoint (nothing recorded). The two solves'
 /// levels are not compared: an unconverged inner solve is a different objective.
+///
+/// At `inner_maxiter = 2` the population inner loop's cold starts stop short, while the
+/// line search's warm re-solves end on a certified Nelder–Mead fallback, a mode (#2539): so
+/// every subject is recorded and the re-solves still take the adjoint. The re-solve source
+/// of the flag is pinned directly, at `inner_maxiter = 1`, where a warm re-solve stops short
+/// too but the solve itself cannot converge.
 #[test]
 fn a_subject_off_its_mode_takes_the_resolved_level_gradient() {
     let p = prep(F2, F2_DATA, Some(3), |t| t);
@@ -3499,18 +3505,32 @@ fn a_subject_off_its_mode_takes_the_resolved_level_gradient() {
         cut.n_adjoint_gradients
     );
     assert!(full.n_adjoint_gradients > 0);
-    // At `inner_maxiter = 2` no state of the solve is at its mode, the population inner
-    // loop's start states nor the line search's re-solves, so every level gradient must
-    // be the re-solved one: each source of the flag is pinned on its own.
+    // The start states: every subject's cold inner solve stops short of its mode.
     assert_eq!(
         cut.fd_gradient_subjects.len(),
         p.population.subjects.len(),
         "off-mode subjects took the adjoint gradient"
     );
-    assert_eq!(
-        cut.n_adjoint_gradients, 0,
-        "an off-mode state took the adjoint gradient"
+    // The re-solves: certified fallbacks, so the adjoint serves them.
+    assert!(
+        cut.n_adjoint_gradients > 0,
+        "a certified fallback re-solve was declined"
     );
+    // A re-solve that stops short is flagged on its own.
+    let one = FitOptions {
+        inner_maxiter: 1,
+        ..o.clone()
+    };
+    let (cf, c1) = (ctx(&p, &layout, &o), ctx(&p, &layout, &one));
+    let zero = DVector::zeros(cf.model.n_eta);
+    for i in 0..p.population.subjects.len() {
+        let start = cf.resolve(i, &p.init_params, &zero).warm().add_scalar(0.1);
+        let s = c1.resolve(i, &p.init_params, &start);
+        assert!(
+            s.off_mode,
+            "subject {i}: a re-solve that stopped short is not flagged: {s:?}"
+        );
+    }
 }
 
 // ── #2112: bounded profiled blocks ─────────────────────────────────────────────────
@@ -4799,7 +4819,33 @@ fn cov_ctx<'a>(
 }
 
 fn cov_point(p: &crate::api::PreparedRun, layout: &ProfileLayout, o: &FitOptions) -> CovPoint {
-    let hold = hold_template(layout, &p.init_params);
+    cov_point_from(p, layout, o, &p.init_params)
+}
+
+/// [`cov_point`] with the levels started at those `options(p)`'s own solve finds, and
+/// cold EBEs: the solve under `o` then takes no Newton step, so every final state is the
+/// population inner loop's cold start. At `inner_maxiter = 2` each of those stops short of
+/// its mode, where a line-search re-solve would end on a certified fallback (#2539).
+fn cov_point_at_solved_levels(
+    p: &crate::api::PreparedRun,
+    layout: &ProfileLayout,
+    o: &FitOptions,
+) -> CovPoint {
+    let solved = cov_point(p, layout, &options(p)).solve;
+    let mut template = p.init_params.clone();
+    template.theta.clone_from(&solved.params.theta);
+    let cp = cov_point_from(p, layout, o, &template);
+    assert_eq!(cp.solve.iterations, 0, "the start is not the solved levels");
+    cp
+}
+
+fn cov_point_from(
+    p: &crate::api::PreparedRun,
+    layout: &ProfileLayout,
+    o: &FitOptions,
+    template: &ModelParameters,
+) -> CovPoint {
+    let hold = hold_template(layout, template);
     let PackedStart {
         packed: x, fixed, ..
     } = pack_with_bounds(&hold);
@@ -4807,7 +4853,7 @@ fn cov_point(p: &crate::api::PreparedRun, layout: &ProfileLayout, o: &FitOptions
     let solve = cov_ctx(p, layout, o)
         .solve(
             &unpack_params(&x, &hold),
-            &ProfileWarm::from_template(layout, &p.init_params),
+            &ProfileWarm::from_template(layout, template),
         )
         .unwrap_or_else(|e| panic!("the profile solve failed: {e:?}"));
     let x_hat = solved_point(layout, &hold, &x, &solve);
@@ -5029,9 +5075,9 @@ fn cov_step(p: &crate::api::PreparedRun, o: &FitOptions) -> (CovStepOutcome, usi
 
 /// A subject whose mode may not be one takes the re-solved differences for its level
 /// blocks and its `Aᵢ`, and is listed, `A` still built (the adjoint's identity is exact only at a
-/// mode, #2401 review row 2). At `inner_maxiter = 2` every F2 subject's solve stops short;
-/// at F2's own setting none does: the straddle. Dies when the blocks ignore
-/// `ProfileSolve::off_mode`.
+/// mode, #2401 review row 2). At `inner_maxiter = 2` every F2 subject's cold solve stops
+/// short ([`cov_point_at_solved_levels`]); at F2's own setting none does: the straddle.
+/// Dies when the blocks ignore `ProfileSolve::off_mode`.
 #[test]
 fn a_subject_off_its_mode_takes_the_resolved_level_blocks() {
     on_fit_pool(|| {
@@ -5043,7 +5089,11 @@ fn a_subject_off_its_mode_takes_the_resolved_level_blocks() {
             ..o.clone()
         };
         for (opts, all_off) in [(&o, false), (&short, true)] {
-            let cp = cov_point(&p, &layout, opts);
+            let cp = if all_off {
+                cov_point_at_solved_levels(&p, &layout, opts)
+            } else {
+                cov_point(&p, &layout, opts)
+            };
             assert!(
                 cp.solve.off_mode.iter().all(|&b| b == all_off),
                 "{:?}",
@@ -5067,8 +5117,8 @@ fn a_subject_off_its_mode_takes_the_resolved_level_blocks() {
 }
 
 /// A subject off its mode on fewer observations than `min_obs_for_convergence_check` keeps
-/// the re-solved differences but is not named by the FD-fallback warnings (#2408). At `inner_maxiter = 2` every F2 subject (8 observations) stops
-/// short; the straddle is the threshold, 8 (none excused) against 9 (all excused). Dies
+/// the re-solved differences but is not named by the FD-fallback warnings (#2408). At `inner_maxiter = 2` every F2 subject's (8 observations) cold
+/// solve stops short ([`cov_point_at_solved_levels`]); the straddle is the threshold, 8 (none excused) against 9 (all excused). Dies
 /// when the excuse is dropped (the warnings name them at 9), widened past the threshold
 /// (they are silent at 8), or applied to the fallback itself (the level blocks stop being
 /// re-solved).
@@ -5090,7 +5140,7 @@ fn an_off_mode_subject_below_min_obs_is_not_reported() {
                 min_obs_for_convergence_check: min_obs,
                 ..options(&p)
             };
-            let cp = cov_point(&p, &layout, &o);
+            let cp = cov_point_at_solved_levels(&p, &layout, &o);
             assert!(
                 cp.solve.off_mode.iter().all(|&b| b),
                 "{:?}",
@@ -5578,6 +5628,175 @@ fn uncertainty_draws_hold_a_level_the_step_held_on_its_bound() {
     assert!(
         moved > 50,
         "the free level of the same study varies: {moved}"
+    );
+}
+
+// ── #2539: a certified Nelder–Mead fallback is a mode ──────────────────────────────
+
+/// F2's template moved to NONMEM's FOCEI optimum (`profile_mbma.ext`, final row): THETA1–3,
+/// OMEGA(1,1) and the κ variance OMEGA(2,2). The levels stay at the file's start.
+fn f2_at_nonmem(p: &crate::api::PreparedRun) -> ModelParameters {
+    let ext = std::fs::read_to_string(root().join("nonmem_anchor/results/profile_mbma.ext"))
+        .expect("ext");
+    let row: Vec<f64> = ext
+        .lines()
+        .find(|l| l.trim_start().starts_with("-1000000000"))
+        .expect("final row")
+        .split_whitespace()
+        .skip(1)
+        .map(|v| v.parse().expect("number"))
+        .collect();
+    // … THETA39, SIGMA(1,1), OMEGA(1,1), OMEGA(2,1), OMEGA(2,2), OMEGA(3,1), OMEGA(3,2),
+    // OMEGA(3,3), OBJ.
+    let n = row.len();
+    let mut t = p.init_params.clone();
+    t.theta[..3].copy_from_slice(&row[..3]);
+    let mut om = t.omega.matrix.clone();
+    om[(0, 0)] = row[n - 7];
+    t.omega =
+        crate::types::OmegaMatrix::from_matrix(om, t.omega.eta_names.clone(), t.omega.diagonal);
+    let iov = t.omega_iov.as_mut().expect("F2 has a kappa");
+    let mut m = iov.matrix.clone();
+    m[(0, 0)] = row[n - 5];
+    *iov = crate::types::OmegaMatrix::from_matrix(m, iov.eta_names.clone(), iov.diagonal);
+    t
+}
+
+/// Worst gap, in conditional SEs, between the adjoint level gradient at a certified
+/// Nelder–Mead fallback and the converged reference (the reconverged differences at the
+/// fully converged mode), over every subject of F2 (3 studies, `inner_maxiter = 2`) and
+/// `nested_levels_3` (`inner_maxiter = 3`). Measured 5.750e-7 on Linux aarch64 and on macOS
+/// arm64 alike (F2 1.272e-7): the reference's own stencil noise, the reconverged differences from the same
+/// states reading 7.6e-8 … 1.9e-7. 10× headroom.
+///
+/// It pins the certifier arms these fixtures reach, not the worst a certified fallback can
+/// be: the resolution arm admits up to `√(2e-11·(1 + |f|))` SEs (`off_mode`'s doc), ~1e-5
+/// at `|f| ≈ 5`, above this bound (#2554 review r1 §2).
+const CERTIFIED_FALLBACK_GAP: f64 = 6e-6;
+
+/// The adjoint level gradient at a certified fallback against the converged reference, and
+/// at a solve that stopped short, on one fixture: returns the worst certified gap and the
+/// worst short one, both in conditional SEs. Every certified state must be one
+/// (`converged`, `used_fallback`, not [`off_mode`]) and every short one flagged.
+fn certified_and_short_gaps(p: &crate::api::PreparedRun, short_maxiter: usize) -> (f64, f64) {
+    let layout = layout_of(p);
+    let o = options(p);
+    let short = FitOptions {
+        inner_maxiter: short_maxiter,
+        ..o.clone()
+    };
+    let (cf, cs) = (ctx(p, &layout, &o), ctx(p, &layout, &short));
+    let params = &p.init_params;
+    let scale = cf
+        .solve(params, &ProfileWarm::from_template(&layout, params))
+        .expect("the solve converges")
+        .level_scale;
+    let x = pack_params(params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).unwrap();
+    let zero = DVector::zeros(cf.model.n_eta);
+    let (mut certified, mut short_gap) = (0.0_f64, 0.0_f64);
+    for i in 0..p.population.subjects.len() {
+        let se: Vec<f64> = layout.reads[i].iter().map(|r| scale[r.level]).collect();
+        let steps: Vec<f64> = se.iter().map(|s| FD_STEP_SE * s).collect();
+        let mode = cf.resolve(i, params, &zero);
+        assert!(!mode.off_mode, "subject {i}: the reference is not a mode");
+        let reference = cf.total_gradient_fd(i, params, &mode, &steps);
+        let gap = |s: &SubjectState| -> f64 {
+            let g = cs
+                .total_gradient_adjoint(i, &pt, s)
+                .unwrap_or_else(|| panic!("subject {i}: the adjoint declined"));
+            let d: Vec<f64> = g
+                .iter()
+                .zip(&reference)
+                .zip(&se)
+                .map(|((a, b), s)| ((a - b) * s).abs())
+                .collect();
+            assert!(d.iter().all(|v| v.is_finite()), "subject {i}: {d:?}");
+            d.into_iter().fold(0.0, f64::max)
+        };
+        // A warm start off the mode leaves the short BFGS stopping short; the fallback then
+        // certifies the mode.
+        let fb = cs.resolve(i, params, &mode.warm().add_scalar(1e-2));
+        assert!(
+            !fb.unconverged && fb.fallback && !fb.off_mode,
+            "subject {i}: not a certified fallback: {fb:?}"
+        );
+        certified = certified.max(gap(&fb));
+        let cold = cs.resolve(i, params, &zero);
+        if cold.unconverged {
+            assert!(cold.off_mode, "subject {i}: a short solve is not flagged");
+            short_gap = short_gap.max(gap(&cold));
+        }
+    }
+    (certified, short_gap)
+}
+
+/// #2539: a certified Nelder–Mead fallback is a mode, so it keeps the adjoint level gradient
+/// (dual-vs-FD parity, AGENTS.md). Before, `off_mode` read `used_fallback` too and sent it to
+/// the reconverged differences, which a warm start already at its mode always reaches at an
+/// outer optimum. The adjoint there is within [`CERTIFIED_FALLBACK_GAP`] of the converged
+/// reference. The straddle is #2401 review row 2's own case: from a solve that stopped
+/// short, still [`off_mode`], the same adjoint is more than one SE off on `nested_levels_3`
+/// (measured 4.58, subject 5), so the predicate separates a material error from none. Runs
+/// on the adjoint: every gradient compared is `total_gradient_adjoint`'s, which panics if it
+/// declines.
+#[test]
+fn a_certified_fallback_takes_the_adjoint_level_gradient() {
+    let (f2, f2_short) = certified_and_short_gaps(&prep(F2, F2_DATA, Some(3), |t| t), 2);
+    let (nested, nested_short) =
+        certified_and_short_gaps(&scored(prep(NESTED, NESTED_DATA, None, nested_corr)), 3);
+    eprintln!(
+        "certified fallback: F2 {f2:.3e}, nested {nested:.3e} SE; stopped short: F2 \
+         {f2_short:.3e}, nested {nested_short:.3e} SE"
+    );
+    assert!(f2 <= CERTIFIED_FALLBACK_GAP, "F2: {f2:.3e} SE");
+    assert!(nested <= CERTIFIED_FALLBACK_GAP, "nested: {nested:.3e} SE");
+    assert!(
+        nested_short > 1.0,
+        "the straddle is gone: {nested_short:.3e} SE"
+    );
+}
+
+/// #2539, the fit: F2 started at NONMEM's FOCEI optimum. Near the optimum the outer steps
+/// are ~1e-8, every warm EBE already sits at its mode, and the population inner loop ends
+/// some subjects on a certified fallback (subjects 7 and 11 on macOS arm64, 1, 4, 5 and 9
+/// on Linux aarch64, at `0703293c`), which `off_mode` declined, so the fit warned
+/// `W_PROFILE_FD_GRADIENT`. Now none does. The fit's `converged` is not asserted: its
+/// stationary-start verdict is #2539's other half.
+///
+/// The precondition is asserted too (#2554 review r1 §1): some evaluation ended a subject
+/// on a fallback, and none stopped short, so every fallback was certified. A change to the
+/// warm starts that stops the fallback firing would otherwise leave this test passing with
+/// or without the fix. It is read off the fit's own counters, not one solve at this start:
+/// a single solve there ends no subject on a fallback (measured, 0 of 12); the fallbacks
+/// come from the outer loop's ~1e-8 steps, each warm-started from the previous mode.
+#[test]
+fn a_profiled_fit_at_its_optimum_keeps_the_adjoint_level_gradient() {
+    let p = prep(F2, F2_DATA, None, |t| t);
+    let o = FitOptions {
+        outer_maxiter: 500,
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    let r = optimize_profiled(&p.parsed.model, &p.population, &f2_at_nonmem(&p), &o);
+    eprintln!(
+        "F2 at NONMEM's optimum: OFV {:.9}, converged {}, {} evals, {} fallbacks, max {} \
+         unconverged",
+        r.ofv, r.converged, r.n_iterations, r.total_ebe_fallbacks, r.max_unconverged_subjects
+    );
+    assert!(r.ofv.is_finite());
+    assert!(
+        r.total_ebe_fallbacks > 0 && r.max_unconverged_subjects == 0,
+        "the straddle is gone: {} fallbacks, max {} unconverged",
+        r.total_ebe_fallbacks,
+        r.max_unconverged_subjects
+    );
+    assert!(
+        !r.warnings
+            .iter()
+            .any(|w| w.contains("W_PROFILE_FD_GRADIENT")),
+        "{:?}",
+        r.warnings
     );
 }
 

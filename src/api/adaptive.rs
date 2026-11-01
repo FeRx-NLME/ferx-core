@@ -601,29 +601,6 @@ where
     let mut decisions: Vec<DecisionLogEntry> = Vec::new();
     let mut metrics: Vec<AdaptiveSubjectMetrics> = Vec::new();
 
-    // `auc_target_attainment` (#391 S2.5b) integrates the monitored signal inside the
-    // reactive driver's own walk (#943): every break is a node on both sides, so a
-    // system reset (EVID=3/4) or a mid-window base dose integrates exactly. A
-    // time-varying-covariate, TIME-in-PK or IOV subject is still refused here, until the
-    // per-segment readout is validated against an external reference for those paths
-    // (#943, second half). Every other adaptive output — predictions, decisions, the dose
-    // ledger, `target_window` — is fully per-event / per-occasion aware.
-    if auc_target.is_some()
-        && (model.n_kappa > 0
-            || population
-                .subjects
-                .iter()
-                .any(|s| crate::pk::subject_needs_per_event_pk(model, s)))
-    {
-        return Err(super::entry_refusals::adaptive_unsupported(
-            None,
-            "adaptive-dosing `auc_target` is not yet supported for time-varying-covariate, \
-             TIME-in-PK, or IOV (`kappa`) subjects: its per-occasion exposure integral is not \
-             yet validated against an external reference. Drop `auc_target` (all other outputs \
-             remain per-event / per-occasion aware), or track #943.",
-        ));
-    }
-
     // The driver's refusals that are a function of the inputs alone (#1983): checked here,
     // before any subject is simulated, rather than on the first subject the driver reaches.
     //
@@ -793,7 +770,7 @@ where
             // snapshot below. The IOV snapshot is owned (recomputed per replicate as κ
             // is redrawn); the #700-only path reuses `event_pk_buf`. One shared
             // predicate (`subject_needs_per_event_pk`) gates the #700 branch, the
-            // materialiser, and the `auc_target` guard so they cannot drift apart.
+            // materialiser, and the base × reset guard so they cannot drift apart.
             let event_pk_iov: Option<crate::pk::EventPkParams> = eta_occ.as_ref().map(|eo| {
                 // IOV: each obs / pk-only record carries its occasion's κ (and any
                 // #700 covariate); records before the first decision use the baseline.

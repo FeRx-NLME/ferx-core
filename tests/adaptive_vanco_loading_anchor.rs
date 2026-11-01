@@ -32,6 +32,8 @@ use ferx_core::parser::model_parser::parse_full_model_file;
 use ferx_core::{read_nonmem_csv, simulate_adaptive_from_spec, AdaptiveSimulateOptions};
 use std::path::Path;
 
+mod common;
+
 /// mrgsolve 1.7.2 reference, frozen in `tests/reference/vanco_loading_mrgsolve/expected.md`.
 /// Per daily MAINTENANCE decision: `(time_h, trough_mg_per_L, dose_mg)`. The doses are
 /// exact f64 (`750 · 1.25^k` within `dose_bounds`), so ferx matches them bit-for-bit;
@@ -206,4 +208,56 @@ fn vanco_loading_titration_matches_mrgsolve() {
     assert_eq!(m.n_decreases, 0);
     assert_eq!(m.n_holds, 0);
     assert!(!m.discontinued);
+}
+
+/// mrgsolve's AUC24 of each closed inter-decision window (#943), frozen in
+/// `tests/reference/vanco_loading_mrgsolve/expected.md`: an AUC compartment `dxdt_AUC = CENT/V` reset at the
+/// start of each window, integrated on the same piecewise-constant CL as the troughs above.
+const REF_AUC24: [f64; 5] = [242.711204, 277.831468, 339.591553, 422.170914, 527.015315];
+
+/// Relative band of each ferx AUC24 against mrgsolve's (#943), the band of the constant-path
+/// vanco anchor. Measured on Linux aarch64 (`tools/linux-test.sh`), identical in every
+/// printed digit on macOS arm64: the windows read −7.7e-6 to −7.1e-6 relative, so 5e-5 is at least
+/// 6× headroom. This is a cross-engine band (RK45 + a trapezoid on soft samples vs
+/// LSODA + an AUC compartment), not ferx's own accuracy; the kit has a constant `V` and no
+/// `[scaling]`, so it checks the exposure of the per-segment trajectory, and the readout
+/// conversion under κ and covariates is pinned by the closed forms in
+/// `src/api/tests/adaptive_auc_tv_tests.rs`.
+const AUC_REL_TOL: f64 = 5e-5;
+
+/// Each window's AUC24 matches mrgsolve's to [`AUC_REL_TOL`] (#943): the exposure integral
+/// under the per-segment snapshot, checked window by window rather than through the
+/// attainment fraction.
+#[test]
+fn vanco_loading_window_aucs_match_mrgsolve() {
+    common::assert_window_aucs_match(&windows_in, &REF_AUC24, AUC_REL_TOL, "loading");
+}
+
+/// Run the anchor scenario with `auc_target = band` and count the windows in it.
+fn windows_in(band: (f64, f64)) -> usize {
+    let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_loading.ferx"))
+        .expect("model must parse");
+    let mut spec = parsed
+        .adaptive_dosing
+        .clone()
+        .expect("[adaptive_dosing] present");
+    spec.auc_target = Some(band);
+    let pop = read_nonmem_csv(
+        Path::new("tests/reference/vanco_loading_mrgsolve/vanco_loading_subject.csv"),
+        None,
+        None,
+    )
+    .expect("vanco loading subject data must load");
+    let mut opts = AdaptiveSimulateOptions::default();
+    opts.seed = Some(1);
+    let res = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        &spec,
+        &opts,
+    )
+    .expect("adaptive run with auc_target");
+    common::windows_in_band(&res)
 }

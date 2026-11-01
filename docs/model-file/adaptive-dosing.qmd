@@ -400,7 +400,11 @@ The result bundles four tidy, long-form artifacts — each tagged by
   under the monitored signal falls in the `auc_target` band. The driver integrates it on
   the run's own trajectory: a 128-panel trapezoid per window read off the solver's
   accepted steps, plus a node on each side of every dose, reset or infusion end inside
-  the window, so a discontinuity integrates exactly; requesting it leaves the run
+  the window — and, under a time-varying covariate, `TIME` in the PK or IOV, every data
+  record, where the PK snapshot changes — so a discontinuity integrates exactly; each
+  segment is read under the PK, κ and covariate row of the record that governs it (the
+  `[scaling]` divisor keeps the baseline covariates, as `simulate()` does). Requesting it
+  leaves the run
   bit-identical (#943). It is scored over the windows between **realized**
   decisions, so if a run discontinues (a `Stop`) the later, dose-free scheduled
   windows are not counted — discontinuation is already its own metric, and folding
@@ -715,10 +719,7 @@ cannot see a failure in the solver itself.
   that changes over the horizon (e.g. declining renal function driving clearance)
   correctly drives CL/V/KA, the monitored signal, and every dose decision; the
   frozen-replay verifier validates the per-event bookkeeping. A model whose PK reads
-  the `TIME` built-in is covered the same way. *Caveat:* declaring `auc_target` on a
-  time-varying-covariate or `TIME`-in-PK subject is still a typed error: the
-  per-segment exposure integral is not yet validated against an external reference
-  (#943).
+  the `TIME` built-in is covered the same way, `auc_target` included (#943).
 - **System resets (EVID=3) are supported** — the reactive driver zeros the
   compartments at each reset time (re-seeding any `init(state)=expr`) and turns off
   controller-issued infusions opened before the reset, exactly as `predict()` /
@@ -745,8 +746,9 @@ cannot see a failure in the solver itself.
   run (`tests/reference/vanco_renal_iov_mrgsolve/`). `kappa` is
   drawn on a dedicated per-(subject, replicate) substream (disjoint from the η and
   assay streams), so a non-IOV run is unchanged and enabling a `Dv` monitor never
-  shifts the draws. *Caveat:* as with time-varying covariates, `auc_target` on an IOV
-  model is still a typed error (#943).
+  shifts the draws. `auc_target` reads each segment under the κ it was integrated with
+  (#943), the governing record's: with records only at the decisions, a window carries
+  the **next** window's κ, as its trajectory does.
   Between-subject η is still drawn per subject/replicate; parameter-uncertainty
   propagation is a later layer.
 - **Deterministic ODE only** — a stochastic (`[diffusion]` / SDE) model is rejected

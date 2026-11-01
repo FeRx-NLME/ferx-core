@@ -811,11 +811,13 @@ the unprofiled one (#2136):
   enough to stop the profiled L-BFGS early. The same holds inside the profile solve:
   a subject the adjoint cannot serve, or whose inner solve stopped short of its mode
   (the adjoint gradient is exact only at a mode), gets the re-solved central difference
-  for its level gradient. `W_PROFILE_FD_GRADIENT` gives the number of such subjects,
+  for its level gradient. A Nelder–Mead fallback counts as stopped short only when it
+  was not certified stationary; a certified one keeps the adjoint, as a converged
+  BFGS solve does (#2539). `W_PROFILE_FD_GRADIENT` gives the number of such subjects,
   once for the fit and once for the covariance step (#2109, #2405). The covariance step's exact level Hessians
   fall back the same way, with a warning of their own. A subject with fewer
   observations than `min_obs_for_convergence_check` whose inner solve stopped short
-  (or fell back to Nelder–Mead) still takes the re-solved differences, but these
+  (an uncertified Nelder–Mead fallback included) still takes the re-solved differences, but these
   warnings do not count it, as the fit's unconverged-EBE count does not (#2408).
 - **The log-packing floor.** A structural θ that the optimizer drives onto ferx's
   internal `1e-10` floor while the objective still falls as it rises is restarted from
