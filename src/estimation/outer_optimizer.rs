@@ -5218,7 +5218,8 @@ fn optimize_nlopt_attempt(
     // predictor changes the path. Measured on `examples/warfarin_dcm.ferx` (Linux x86_64):
     // from ±20% perturbed starts it reached the same optima as without it in fewer
     // iterations, but from the shipped start it settled at OFV −164.5 against −1173.6.
-    let warm_predictor = model.n_kappa == 0
+    let warm_predictor = model.n_eta > 0
+        && model.n_kappa == 0
         && init_params.mixture.is_none()
         && !model.has_covariate_nn()
         && crate::sens::ode_provider::adjoint::outer_model_in_scope(model)

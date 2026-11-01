@@ -989,20 +989,140 @@ pub(crate) struct TypicalProgram {
     pub(crate) defs: Vec<Expression>,
     /// The typical value itself.
     pub(crate) root: Expression,
+    /// The same program over covariate slots, built on first use ([`Self::slotted`]).
+    slots: std::sync::OnceLock<SlottedTypical>,
+}
+
+/// A [`TypicalProgram`] with every covariate read through a slot (#2549): the M-step
+/// evaluates one subject's typical value at hundreds of θ, and a covariate's name was
+/// hashed on every read. `Covariate(name)` is `CovariateIdx(slot)`; the names
+/// [`TypicalEnv`] resolves to a constant are that constant (`MACHEPS` to ε, any other
+/// name to `0`); a definition is still `VariableIdx(j)`, read from the values computed so
+/// far exactly as `TypicalEnv` reads them.
+#[derive(Debug, Clone)]
+struct SlottedTypical {
+    defs: Vec<Expression>,
+    root: Expression,
+    covariates: Vec<String>,
 }
 
 impl TypicalProgram {
+    pub(crate) fn new(defs: Vec<Expression>, root: Expression) -> Self {
+        Self {
+            defs,
+            root,
+            slots: std::sync::OnceLock::new(),
+        }
+    }
+
     /// A program with no definitions.
     #[cfg(test)]
     pub(crate) fn of(root: Expression) -> Self {
-        Self {
-            defs: Vec::new(),
-            root,
-        }
+        Self::new(Vec::new(), root)
+    }
+
+    fn slotted(&self) -> &SlottedTypical {
+        self.slots.get_or_init(|| {
+            let mut covariates: Vec<String> = Vec::new();
+            let mut slot = |e: &Expression| -> Expression {
+                let mut e = e.clone();
+                visit_expr_nodes_mut(&mut e, &mut |n: &mut Expression| {
+                    let to =
+                        match n {
+                            Expression::Covariate(name) => {
+                                let i = covariates.iter().position(|c| c == name).unwrap_or_else(
+                                    || {
+                                        covariates.push(name.clone());
+                                        covariates.len() - 1
+                                    },
+                                );
+                                Expression::CovariateIdx(i)
+                            }
+                            Expression::Variable(name) if name.eq_ignore_ascii_case("MACHEPS") => {
+                                Expression::Literal(f64::EPSILON)
+                            }
+                            Expression::Variable(_) | Expression::CovariateIdx(_) => {
+                                Expression::Literal(0.0)
+                            }
+                            _ => return,
+                        };
+                    *n = to;
+                });
+                e
+            };
+            let defs = self.defs.iter().map(&mut slot).collect();
+            let root = slot(&self.root);
+            SlottedTypical {
+                defs,
+                root,
+                covariates,
+            }
+        })
+    }
+
+    /// The covariates [`Self::eval_at`] reads, in slot order.
+    pub(crate) fn covariate_slots(&self) -> &[String] {
+        &self.slotted().covariates
+    }
+
+    /// One subject's covariate values in [`Self::covariate_slots`] order (a missing one
+    /// reads `0`, as in [`Self::eval`]).
+    pub(crate) fn gather(&self, covariates: &HashMap<String, f64>) -> Vec<f64> {
+        self.covariate_slots()
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect()
     }
 
     /// The typical value at `theta` and one subject's covariate snapshot.
     pub(crate) fn eval(&self, theta: &[f64], covariates: &HashMap<String, f64>) -> f64 {
+        let mut covs: Vec<f64> = crate::scratch::take();
+        covs.extend(
+            self.covariate_slots()
+                .iter()
+                .map(|n| covariates.get(n).copied().unwrap_or(0.0)),
+        );
+        let v = self.eval_at(theta, &covs);
+        crate::scratch::give(covs);
+        v
+    }
+
+    /// [`Self::eval`] at covariate values already [`Self::gather`]ed: bit-identical, the
+    /// same tree through the same `eval_expr`, without a name lookup.
+    pub(crate) fn eval_at(&self, theta: &[f64], covs: &[f64]) -> f64 {
+        let p = self.slotted();
+        let mut values: Vec<f64> = crate::scratch::take();
+        for d in &p.defs {
+            let v = eval_expr(
+                d,
+                theta,
+                &[],
+                &SliceEnv {
+                    covariates: covs,
+                    vars: &values,
+                },
+                &[],
+            );
+            values.push(v);
+        }
+        let v = eval_expr(
+            &p.root,
+            theta,
+            &[],
+            &SliceEnv {
+                covariates: covs,
+                vars: &values,
+            },
+            &[],
+        );
+        crate::scratch::give(values);
+        v
+    }
+
+    /// The map-keyed walk [`Self::eval`] replaced, kept as the reference its parity test
+    /// pins.
+    #[cfg(test)]
+    pub(crate) fn eval_by_name(&self, theta: &[f64], covariates: &HashMap<String, f64>) -> f64 {
         let mut values = Vec::with_capacity(self.defs.len());
         for d in &self.defs {
             let v = eval_expr(
@@ -1088,6 +1208,7 @@ pub(crate) struct ProgramDefs {
     index: HashMap<*const Expression, usize>,
 }
 
+#[cfg(test)]
 /// The environment a [`TypicalProgram`] evaluates in: data covariates by name,
 /// the definitions computed so far by index. A stray local name reads `0.0`
 /// (`MACHEPS` excepted, as in [`MapEnv`]), which is why detection rejects one
@@ -1097,6 +1218,7 @@ struct TypicalEnv<'a> {
     defs: &'a [f64],
 }
 
+#[cfg(test)]
 impl EvalEnv for TypicalEnv<'_> {
     #[inline]
     fn resolve(&self, expr: &Expression) -> f64 {
@@ -2101,10 +2223,7 @@ impl<'a, V: RhsView<'a>> TypicalParts<V> {
                 })
             }
         };
-        TypicalProgram {
-            defs: defs.defs,
-            root,
-        }
+        TypicalProgram::new(defs.defs, root)
     }
 }
 
@@ -9728,33 +9847,15 @@ fn parse_markov_model_block(
         eta_names.len(),
     );
 
-    let indiv = needed_indiv_stmts;
-    let gen_states = generator_states.clone();
+    let tree = CtmmGeneratorTree::new(
+        &needed_indiv_stmts,
+        &transitions,
+        &generator_states,
+        n_states,
+    );
     let generator_fn: crate::types::GeneratorFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, state: &[f64]| {
-            // A referenced ODE state parses as a `Covariate` leaf, so `eval_expression`
-            // resolves it from the covariates map. On the inhomogeneous path overlay the
-            // current state values there; the homogeneous path leaves `gen_states` empty and
-            // uses the caller's map unchanged (no clone).
-            let cov_owned;
-            let cov: &HashMap<String, f64> = if gen_states.is_empty() {
-                covariates
-            } else {
-                let mut c = covariates.clone();
-                for (name, idx) in &gen_states {
-                    c.insert(name.clone(), state.get(*idx).copied().unwrap_or(0.0));
-                }
-                cov_owned = c;
-                &cov_owned
-            };
-            let vars = eval_indiv_param_vars(&indiv, theta, eta, cov);
-            let mut q = nalgebra::DMatrix::<f64>::zeros(n_states, n_states);
-            for (j, k, expr) in &transitions {
-                let rate = eval_expression(expr, theta, eta, cov, &vars, &[]);
-                q[(*j, *k)] += rate;
-                q[(*j, *j)] -= rate;
-            }
-            q
+            tree.generator(theta, eta, covariates, state)
         },
     );
 
@@ -9772,6 +9873,205 @@ fn parse_markov_model_block(
         theta_set,
         eta_set,
     ))
+}
+
+/// The `f64` generator of a `[markov_model]`: the intensities and the
+/// `[individual_parameters]` statements they read, with every name resolved to a slot
+/// once at parse (#2549). The time-inhomogeneous likelihood calls it at every stage of
+/// every occupancy-ODE step, and it used to clone the subject's covariate map, overlay the
+/// ODE state, build a variable map and hash every name it read on each call.
+///
+/// Bit-identical to that map-keyed walk: the same tree, evaluated by the same generic
+/// `eval_expr`/`eval_cond`, with only name resolution moved to slots — a name nothing
+/// assigns reads 0, a state an intensity reads shadows a covariate of the same name (as
+/// the overlay's insert did), and `MACHEPS` reads machine epsilon whether or not it is
+/// assigned. Not the bytecode: [`CtmmGeneratorProgram`] serves the derivatives, and its
+/// `f64` instantiation is not pinned bitwise to the tree.
+#[cfg(feature = "markov")]
+struct CtmmGeneratorTree {
+    /// `AssignIdx`/`If` only, over var and covariate slots.
+    stmts: Vec<Statement>,
+    n_vars: usize,
+    /// The slot every `MACHEPS` spelling reads.
+    eps_slot: usize,
+    rates: Vec<(usize, usize, Expression)>,
+    /// Covariate names by slot: every `Covariate` leaf the statements and intensities read.
+    cov_names: Vec<String>,
+    /// `(covariate slot, ODE state index)` of each state an intensity reads, in the
+    /// overlay's order (a repeated name: the last one wins, as its insert did).
+    state_slots: Vec<(usize, usize)>,
+    n_states: usize,
+}
+
+#[cfg(feature = "markov")]
+impl CtmmGeneratorTree {
+    fn new(
+        stmts: &[Statement],
+        transitions: &[(usize, usize, Expression)],
+        generator_states: &[(String, usize)],
+        n_states: usize,
+    ) -> Self {
+        fn names(e: &Expression, vars: &mut Vec<String>, covs: &mut Vec<String>) {
+            visit_expr_nodes(e, &mut |n| match n {
+                Expression::Variable(v) if !vars.contains(v) => vars.push(v.clone()),
+                Expression::Covariate(c) if !covs.contains(c) => covs.push(c.clone()),
+                _ => {}
+            });
+        }
+        fn walk(stmts: &[Statement], vars: &mut Vec<String>, covs: &mut Vec<String>) {
+            for s in stmts {
+                match s {
+                    Statement::Assign(name, e) => {
+                        if !vars.contains(name) {
+                            vars.push(name.clone());
+                        }
+                        names(e, vars, covs);
+                    }
+                    Statement::If {
+                        branches,
+                        else_body,
+                    } => {
+                        for (c, body) in branches {
+                            visit_condition_nodes(c, &mut |e| names(e, vars, covs));
+                            walk(body, vars, covs);
+                        }
+                        if let Some(eb) = else_body {
+                            walk(eb, vars, covs);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (mut vars, mut covs) = (Vec::new(), Vec::new());
+        walk(stmts, &mut vars, &mut covs);
+        for (_, _, e) in transitions {
+            names(e, &mut vars, &mut covs);
+        }
+        let is_eps = |n: &str| n.eq_ignore_ascii_case("MACHEPS");
+        let eps_slot = 0;
+        let mut read_idx: HashMap<String, usize> = HashMap::new();
+        let mut write_idx: HashMap<String, usize> = HashMap::new();
+        let mut n_vars = 1;
+        for v in &vars {
+            if is_eps(v) {
+                read_idx.insert(v.clone(), eps_slot);
+                write_idx.insert(v.clone(), usize::MAX);
+            } else {
+                read_idx.insert(v.clone(), n_vars);
+                write_idx.insert(v.clone(), n_vars);
+                n_vars += 1;
+            }
+        }
+        let cov_idx: HashMap<String, usize> = covs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), i))
+            .collect();
+        fn resolve(
+            stmts: &[Statement],
+            read_idx: &HashMap<String, usize>,
+            write_idx: &HashMap<String, usize>,
+            cov_idx: &HashMap<String, usize>,
+        ) -> Vec<Statement> {
+            let mut out = Vec::new();
+            for s in stmts {
+                match s {
+                    Statement::Assign(name, e) => {
+                        let mut e = e.clone();
+                        resolve_expr_indices(&mut e, read_idx, cov_idx);
+                        out.push(Statement::AssignIdx(write_idx[name], e));
+                    }
+                    Statement::If {
+                        branches,
+                        else_body,
+                    } => out.push(Statement::If {
+                        branches: branches
+                            .iter()
+                            .map(|(c, body)| {
+                                let mut c = c.clone();
+                                resolve_condition_indices(&mut c, read_idx, cov_idx);
+                                (c, resolve(body, read_idx, write_idx, cov_idx))
+                            })
+                            .collect(),
+                        else_body: else_body
+                            .as_ref()
+                            .map(|eb| resolve(eb, read_idx, write_idx, cov_idx)),
+                    }),
+                    // The map walk skips anything else (an `[individual_parameters]` list
+                    // holds assignments and conditionals only).
+                    _ => {}
+                }
+            }
+            out
+        }
+        let stmts = resolve(stmts, &read_idx, &write_idx, &cov_idx);
+        let rates = transitions
+            .iter()
+            .map(|(j, k, e)| {
+                let mut e = e.clone();
+                resolve_expr_indices(&mut e, &read_idx, &cov_idx);
+                (*j, *k, e)
+            })
+            .collect();
+        let state_slots = generator_states
+            .iter()
+            .filter_map(|(name, idx)| cov_idx.get(name).map(|&slot| (slot, *idx)))
+            .collect();
+        CtmmGeneratorTree {
+            stmts,
+            n_vars,
+            eps_slot,
+            rates,
+            cov_names: covs,
+            state_slots,
+            n_states,
+        }
+    }
+
+    /// `Q(θ, η, covariates, state)`, every row summing to zero.
+    fn generator(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        state: &[f64],
+    ) -> nalgebra::DMatrix<f64> {
+        let mut cov: Vec<f64> = crate::scratch::take();
+        cov.extend(
+            self.cov_names
+                .iter()
+                .map(|n| covariates.get(n).copied().unwrap_or(0.0)),
+        );
+        for &(slot, idx) in &self.state_slots {
+            cov[slot] = state.get(idx).copied().unwrap_or(0.0);
+        }
+        let mut vars: Vec<f64> = crate::scratch::take();
+        vars.resize(self.n_vars, 0.0);
+        vars[self.eps_slot] = f64::EPSILON;
+        let mut stack: Vec<f64> = crate::scratch::take();
+        eval_statements_indexed_with_stack(
+            &self.stmts,
+            theta,
+            eta,
+            &cov,
+            &mut vars,
+            None,
+            &[],
+            &mut stack,
+        );
+        let s = self.n_states;
+        let mut q = nalgebra::DMatrix::<f64>::zeros(s, s);
+        for (j, k, expr) in &self.rates {
+            let rate = eval_expression_indexed(expr, theta, eta, &cov, &vars, &[]);
+            q[(*j, *k)] += rate;
+            q[(*j, *j)] -= rate;
+        }
+        crate::scratch::give(cov);
+        crate::scratch::give(vars);
+        crate::scratch::give(stack);
+        q
+    }
 }
 
 /// Pre-scan `[event_model]` blocks for ODE-accumulated hazards (joint PK-TTE, #564).
@@ -16419,14 +16719,59 @@ fn strip_line_comment(line: &str) -> &str {
 fn model_name_declaration(trimmed: &str) -> Option<&str> {
     static MODEL_NAME_DECLARATION_RE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^model(?:\s*=\s*|\s+)(\w+)$").unwrap());
+    // `^model…` is case-sensitive: a line not starting with it never compiles the regex.
+    if !trimmed.starts_with("model") {
+        return None;
+    }
     let re = &*MODEL_NAME_DECLARATION_RE;
     re.captures(trimmed).map(|c| c.get(1).unwrap().as_str())
 }
 
+/// A block header line: `[block_type]` or `[block_type INSTANCE]`, the whole line. Shared
+/// by `parse_model_name` and `extract_blocks`, so each process compiles it once (#2549).
+static BLOCK_HEADER_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"^\[(\w+)(?:\s+(\w+))?\]$").unwrap());
+
+/// Whether `line` opens, after its leading whitespace, with the lowercase ASCII keyword
+/// `kw` as a `(?i)^\s*kw` pattern reads it — a necessary condition for such a pattern to
+/// match, so the regex behind it is compiled only for a line it could match (#2549:
+/// compiling the `[parameters]` patterns was a fifth of a small fit).
+///
+/// Exactly the regex's semantics: `\s` and `str::trim_start` are both Unicode
+/// `White_Space`, and `(?i)` is Unicode simple case folding, under which the only
+/// characters folding onto an ASCII letter other than its own case pair are `K`
+/// (U+212A, onto `k`) and `ſ` (U+017F, onto `s`).
+fn leads_with_keyword_ci(line: &str, kw: &str) -> bool {
+    let mut cs = line.trim_start().chars();
+    kw.chars().all(|k| {
+        cs.next().is_some_and(|c| {
+            let f = match c {
+                '\u{212A}' => 'k',
+                '\u{017F}' => 's',
+                c => c.to_ascii_lowercase(),
+            };
+            f == k
+        })
+    })
+}
+
+/// `re.captures(line)` for a `(?i)^\s*kw…` pattern, compiling `re` only when the line
+/// leads with `kw` ([`leads_with_keyword_ci`]).
+fn keyword_captures<'h>(
+    re: &std::sync::LazyLock<Regex>,
+    kw: &str,
+    line: &'h str,
+) -> Option<regex::Captures<'h>> {
+    if leads_with_keyword_ci(line, kw) {
+        re.captures(line)
+    } else {
+        None
+    }
+}
+
 fn parse_model_name(content: &str) -> Result<String, String> {
-    static HEADER_RE: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"^\[\w+(?:\s+\w+)?\]$").unwrap());
-    let header_re = &*HEADER_RE;
+    // `extract_blocks`' own header pattern: the preamble ends where the first block opens.
+    let header_re = &*BLOCK_HEADER_RE;
     let mut name: Option<String> = None;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = strip_line_comment(line).trim();
@@ -16490,9 +16835,7 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
     //   `[block_type INSTANCE]`   — named (e.g. `[covariate_nn TYPICAL_PK]`)
     // Anchor on the whole line so things like `states=[central]` inside an
     // ODE structural definition aren't misread as a block-tag opener.
-    static BLOCK_RE: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"^\[(\w+)(?:\s+(\w+))?\]$").unwrap());
-    let block_re = &*BLOCK_RE;
+    let block_re = &*BLOCK_HEADER_RE;
 
     // current_target: either an unnamed block name, or a (block_type, instance) pair.
     enum BlockTarget {
@@ -17690,7 +18033,6 @@ fn parse_parameters(
     static THETA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"(?i)^\s*theta\s+(\w+)\s*(?:\[([^\]]*)\])?\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?\s*$",).unwrap()
     });
-    let theta_re = &*THETA_RE;
 
     // omega NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
@@ -17717,7 +18059,6 @@ fn parse_parameters(
             r"(?i)^\s*omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
         ),).unwrap()
     });
-    let omega_re = &*OMEGA_RE;
 
     // block_omega (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
     //
@@ -17740,7 +18081,6 @@ fn parse_parameters(
             r"(?i)^\s*block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
         ),).unwrap()
     });
-    let block_omega_re = &*BLOCK_OMEGA_RE;
 
     // block_sigma (NAME1, NAME2, ...) = [lower_triangle_covariances] | ... FIX
     //
@@ -17753,7 +18093,6 @@ fn parse_parameters(
             r"(?i)^\s*block_sigma\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
         ),).unwrap()
     });
-    let block_sigma_re = &*BLOCK_SIGMA_RE;
 
     // sigma NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
@@ -17768,7 +18107,6 @@ fn parse_parameters(
             r"(?i)^\s*sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
         ),).unwrap()
     });
-    let sigma_re = &*SIGMA_RE;
 
     // kappa NAME ~ value [FIX] [(sd|variance|var)] [FIX]  (IOV diagonal variance)
     // Same group layout as omega_re.
@@ -17777,7 +18115,6 @@ fn parse_parameters(
             r"(?i)^\s*kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
         ),).unwrap()
     });
-    let kappa_re = &*KAPPA_RE;
 
     // block_kappa (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
     // Same group layout as `block_omega_re`, tag in group 4.
@@ -17786,13 +18123,11 @@ fn parse_parameters(
             r"(?i)^\s*block_kappa\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
         ),).unwrap()
     });
-    let block_kappa_re = &*BLOCK_KAPPA_RE;
 
     // level NAME by COLUMN in PARENT  (#1082: a nested variability level below ID)
     static LEVEL_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)^\s*level\s+(\w+)\s+by\s+(\w+)\s+in\s+(\w+)\s*$").unwrap()
     });
-    let level_re = &*LEVEL_RE;
 
     // Rejoin multi-line `block_*` declarations before matching.
     let lines = join_bracketed_lines(lines);
@@ -17822,7 +18157,7 @@ fn parse_parameters(
         let (line, profiled) = split_profile_modifier(&line);
         let line = &line;
         let mut weight_consumed = false;
-        if let Some(caps) = level_re.captures(line) {
+        if let Some(caps) = keyword_captures(&LEVEL_RE, "level", line) {
             if prior_decl.is_some() || weight_expr.is_some() {
                 return Err(format!(
                     "[parameters] level {}: a level takes no `prior(...)` or `weight =`; a \
@@ -17841,7 +18176,7 @@ fn parse_parameters(
         // matched. `None` at the bottom of the loop with a `prior_decl` present
         // means the prior had no home — an error, never a silent drop.
         let mut prior_target: Option<(String, crate::types::ParameterKind)> = None;
-        if let Some(caps) = theta_re.captures(line) {
+        if let Some(caps) = keyword_captures(&THETA_RE, "theta", line) {
             let name = caps[1].to_string();
             let block = match caps.get(2) {
                 Some(m) => Some(parse_theta_block_spec(&name, m.as_str())?),
@@ -17991,7 +18326,7 @@ fn parse_parameters(
                     });
                 }
             }
-        } else if let Some(caps) = block_omega_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&BLOCK_OMEGA_RE, "block_omega", line) {
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -18029,7 +18364,7 @@ fn parse_parameters(
                 lower_triangle: values,
                 fixed,
             });
-        } else if let Some(caps) = block_sigma_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&BLOCK_SIGMA_RE, "block_sigma", line) {
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -18087,7 +18422,7 @@ fn parse_parameters(
                 lower_triangle: values,
                 fixed,
             });
-        } else if let Some(caps) = block_kappa_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&BLOCK_KAPPA_RE, "block_kappa", line) {
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -18127,7 +18462,7 @@ fn parse_parameters(
                 lower_triangle: values,
                 fixed,
             });
-        } else if let Some(caps) = omega_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&OMEGA_RE, "omega", line) {
             let name = caps[1].to_string();
             let raw: f64 = caps[2]
                 .parse()
@@ -18157,7 +18492,7 @@ fn parse_parameters(
                 fixed,
                 init_as_sd,
             });
-        } else if let Some(caps) = sigma_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&SIGMA_RE, "sigma", line) {
             let name = caps[1].to_string();
             let raw: f64 = caps[2]
                 .parse()
@@ -18187,7 +18522,7 @@ fn parse_parameters(
                 fixed,
                 init_as_sd,
             });
-        } else if let Some(caps) = kappa_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&KAPPA_RE, "kappa", line) {
             let name = caps[1].to_string();
             let raw: f64 = caps[2]
                 .parse()
@@ -18248,16 +18583,16 @@ fn parse_parameters(
             if let Some((head, _)) = shown.split_once(';') {
                 let is_declaration = |s: &str| {
                     [
-                        &theta_re,
-                        &omega_re,
-                        &block_omega_re,
-                        &block_sigma_re,
-                        &sigma_re,
-                        &kappa_re,
-                        &block_kappa_re,
+                        (&THETA_RE, "theta"),
+                        (&OMEGA_RE, "omega"),
+                        (&BLOCK_OMEGA_RE, "block_omega"),
+                        (&BLOCK_SIGMA_RE, "block_sigma"),
+                        (&SIGMA_RE, "sigma"),
+                        (&KAPPA_RE, "kappa"),
+                        (&BLOCK_KAPPA_RE, "block_kappa"),
                     ]
                     .iter()
-                    .any(|re| re.is_match(s))
+                    .any(|(re, kw)| leads_with_keyword_ci(s, kw) && re.is_match(s))
                 };
                 if shown.split(';').all(is_declaration) {
                     return Err(format!(
@@ -18311,7 +18646,7 @@ fn parse_parameters(
                      residual error write the modifier on the `[error_model]` statement \
                      instead.",
                     line.trim(),
-                    if block_kappa_re.is_match(line) {
+                    if leads_with_keyword_ci(line, "block_kappa") && BLOCK_KAPPA_RE.is_match(line) {
                         " A `block_kappa` cannot carry one: the weight scales a single \
                          kappa's variance, and a block's off-diagonal covariances would \
                          need the same divisor to stay a valid covariance matrix — declare \

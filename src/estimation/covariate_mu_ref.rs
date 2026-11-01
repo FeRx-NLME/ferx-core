@@ -109,7 +109,31 @@ impl GroupMember<'_> {
     /// scale). `NaN` when the lognormal typical value is not positive — the
     /// caller treats a `NaN` mu as "this θ is not admissible".
     pub fn mu(&self, theta: &[f64], subject: &Subject) -> f64 {
-        let a = eval_typical_value(&self.spec.typical, theta, &subject.covariates);
+        self.link(eval_typical_value(
+            &self.spec.typical,
+            theta,
+            &subject.covariates,
+        ))
+    }
+
+    /// Every subject's covariates in the typical value's slot order, gathered once for
+    /// the many θ an M-step evaluates (#2549).
+    pub(crate) fn cov_rows(&self, population: &Population) -> Vec<Vec<f64>> {
+        population
+            .subjects
+            .iter()
+            .map(|s| self.spec.typical.gather(&s.covariates))
+            .collect()
+    }
+
+    /// [`Self::mu`] at one subject's [`Self::cov_rows`] row: bit-identical, without
+    /// hashing a covariate name.
+    pub(crate) fn mu_at(&self, theta: &[f64], covs: &[f64]) -> f64 {
+        self.link(self.spec.typical.eval_at(theta, covs))
+    }
+
+    /// `g(A)`: [`Self::mu`]'s link on a typical value.
+    fn link(&self, a: f64) -> f64 {
         match self.transform {
             MuTransform::Log => {
                 if a.is_finite() && a > 0.0 {
@@ -954,16 +978,21 @@ impl CovariateMuGroup<'_> {
             Some(c) => c.l().transpose(),
             None => DMatrix::from_diagonal(&w.diagonal().map(|v| v.max(0.0).sqrt())),
         };
+        let rows: Vec<Vec<Vec<f64>>> = self
+            .members
+            .iter()
+            .map(|m| m.cov_rows(population))
+            .collect();
         let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
             let mut r = Vec::with_capacity(population.subjects.len() * q);
             let mut ss = 0.0;
-            for (i, s) in population.subjects.iter().enumerate() {
+            for i in 0..population.subjects.len() {
                 let mut e = DVector::<f64>::zeros(q);
                 for (l, v) in input.etas[i].iter().take(q).enumerate() {
                     e[l] = *v;
                 }
                 for (m, member) in self.members.iter().enumerate() {
-                    let mu = member.mu(theta, s);
+                    let mu = member.mu_at(theta, &rows[m][i]);
                     if !mu.is_finite() {
                         return None;
                     }
@@ -1036,9 +1065,19 @@ impl CovariateMuGroup<'_> {
             }
             theta
         };
+        let rows: Vec<Vec<Vec<f64>>> = self
+            .members
+            .iter()
+            .map(|m| m.cov_rows(population))
+            .collect();
         let eval = |xv: &[f64]| -> f64 {
             let theta = theta_at(xv);
-            let mu_new = self.mus(&theta, population);
+            let mu_new: Vec<Vec<f64>> = self
+                .members
+                .iter()
+                .zip(&rows)
+                .map(|(m, rows)| rows.iter().map(|c| m.mu_at(&theta, c)).collect())
+                .collect();
             if mu_new.iter().flatten().any(|m| !m.is_finite()) {
                 return 1e20;
             }
@@ -1142,11 +1181,12 @@ fn solve_exact_single(
             t
         })
         .collect();
+    let rows = member.cov_rows(population);
     let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
         let mut r = Vec::with_capacity(n);
         let mut ss = 0.0;
-        for (i, s) in population.subjects.iter().enumerate() {
-            let m = member.mu(theta, s);
+        for (i, row) in rows.iter().enumerate() {
+            let m = member.mu_at(theta, row);
             if !m.is_finite() {
                 return None;
             }

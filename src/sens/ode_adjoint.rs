@@ -4243,68 +4243,65 @@ fn run<const N: usize, const M: usize>(
             0.0,
             (0..N).map(|k| (R::c(w[k]), lg[k], R::c(1.0))),
         );
-    // Copied: the non-Gaussian term's θ block records its own scalar tape below.
-    let sadj = rsweep::<1>(&[psi])[..n_in].to_vec();
-    let psi_of = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
-    // The mode response's rows `y_r = Σ_k Z_rk (∇_η l)_k`, `Z` the BSV rows of `H⁻¹`, so
-    // `dη̂_r/dx = −∂y_r/∂x` (`Z` held constant: `H` is the derivative of `∇_η l` at the
-    // mode): one lane per BSV effect, however wide the stacked `[η, κ]` system. Swept now:
-    // the non-Gaussian θ block below overwrites the tape.
-    let dx_rows: Vec<(usize, usize, Vec<f64>)> = if eta_dx.is_some() {
-        eta_dx_lanes::<N>(&h, &lg, active.min(N), n_bsv.min(active).min(N), n_in)
-    } else {
-        Vec::new()
+    // Ψ and (with the mode response) its rows `y_r = Σ_k Z_rk (∇_η l)_k`, `Z` the BSV rows
+    // of `H⁻¹`, so `dη̂_r/dx = −∂y_r/∂x` (`Z` held constant: `H` is the derivative of
+    // `∇_η l` at the mode): one lane per BSV effect, however wide the stacked `[η, κ]`
+    // system. All outputs share each sweep as lanes, Ψ in lane 0. Copied: the non-Gaussian
+    // term's θ block records its own scalar tape below.
+    let mut outs = vec![psi];
+    if eta_dx.is_some() {
+        outs.extend(eta_dx_outputs::<N>(
+            &h,
+            &lg,
+            active.min(N),
+            n_bsv.min(active).min(N),
+        ));
+    }
+    let chunks = sweep_lanes(&outs, n_in);
+    // Output `o`'s adjoint at a recorded input: every chunk but the last is full.
+    let out_adj = |o: usize, x: R| -> f64 {
+        let (lanes, _, adj) = &chunks[o / DX_LANES];
+        x.idx().map_or(0.0, |i| adj[i * lanes + o % DX_LANES])
     };
+    let psi_of = |x: R| out_adj(0, x);
 
-    // ---- 4. Ψ seeds on the taped predictions, one single-lane sweep to the θ leaves -----
-    let vadj = vadj_init::<1>();
-    let mut top = 0usize;
-    let mut seed = |node: u32, comp: usize, v: f64| {
-        if node != NONE {
-            top = top.max(node as usize + 1);
-            vadj[vadj_index::<N, 1>(node, comp, 0)] += v;
-        }
-    };
-    for (j, p) in preds.iter().enumerate() {
-        seed(p.i, 0, psi_of(fr[j]));
-        for k in 0..N {
-            seed(p.i, 1 + k, psi_of(gr[j][k]));
+    // ---- 4. the outputs' seeds on the taped predictions, one sweep per chunk to θ ------
+    let mut lane_theta: Vec<Vec<f64>> = Vec::with_capacity(outs.len());
+    for (lanes, n, adj) in &chunks {
+        let seeds = DxSeeds {
+            preds: &preds,
+            fr: &fr,
+            gr: &gr,
+            pop: pop.as_ref().zip(pr0.as_ref()),
+        };
+        // A leaf's value-component adjoint (θ, and the networks' outputs under the
+        // reduction), by lane.
+        let vadj = |at: &dyn Fn(&DualV<N, M>, usize) -> f64| -> Option<()> {
+            for l in 0..*n {
+                #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
+                let mut ta: Vec<f64> = th.iter().map(|lf| at(lf, l)).collect();
+                #[cfg(feature = "nn")]
+                if let Some((red, z)) = &nn_out {
+                    add_nn_weight_adjoint(model, red, z, theta, |lf| at(lf, l), &mut ta)?;
+                }
+                lane_theta.push(ta);
+            }
+            Some(())
+        };
+        match lanes {
+            1 => seeds.sweep::<1>(adj, *n, vadj)?,
+            2 => seeds.sweep::<2>(adj, *n, vadj)?,
+            _ => seeds.sweep::<DX_LANES>(adj, *n, vadj)?,
         }
     }
-    if let (Some(p0), Some(r0)) = (pop.as_ref(), pr0.as_ref()) {
-        for (p, &x) in p0.iter().zip(r0) {
-            seed(p.i, 0, psi_of(x));
-        }
-    }
-    let adj = vsweep::<N, 1>(top);
-    // A leaf's value-component adjoint (θ, and the networks' outputs under the reduction).
-    let at = |l: &DualV<N, M>| {
-        if l.i == NONE {
-            0.0
-        } else {
-            adj[vadj_index::<N, 1>(l.i, 0, 0)]
-        }
-    };
-    #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
-    let mut theta_adj: Vec<f64> = th.iter().map(at).collect();
-    #[cfg(feature = "nn")]
-    if let Some((red, z)) = &nn_out {
-        add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
-    }
-    // The non-Gaussian term's θ block, for `Ψ` and (with the mode response) for each of the
-    // response's rows: one recording of the term at η̂, swept per seed.
-    let mut ng_rows: Vec<Vec<f64>> = Vec::new();
+    // The non-Gaussian term's θ block for every output: one recording of the term at η̂,
+    // swept per seed.
     if let Some(ngr) = ng_r.as_ref() {
         let n = n_bsv;
-        let mut seeds = vec![ng_adjoints(ngr, n, psi_of)];
-        for (lanes, rows, adj) in &dx_rows {
-            for l in 0..*rows {
-                seeds.push(ng_adjoints(ngr, n, |x: R| {
-                    x.idx().map_or(0.0, |i| adj[i * lanes + l])
-                }));
-            }
-        }
-        let mut d = if seeds.len() == 1 {
+        let seeds: Vec<_> = (0..outs.len())
+            .map(|o| ng_adjoints(ngr, n, |x: R| out_adj(o, x)))
+            .collect();
+        let d = if seeds.len() == 1 {
             let (a_q, a_g, a_h) = &seeds[0];
             let part = NgSeed {
                 eta: &eta[..n],
@@ -4316,9 +4313,10 @@ fn run<const N: usize, const M: usize>(
         } else {
             ng_theta_adjoint_seeds(model, subject, theta, &eta[..n], &seeds)?
         };
-        ng_rows = d.split_off(1);
-        for (t, dv) in theta_adj.iter_mut().zip(d.remove(0)) {
-            *t += dv;
+        for (ta, d) in lane_theta.iter_mut().zip(d) {
+            for (t, dv) in ta.iter_mut().zip(d) {
+                *t += dv;
+            }
         }
     }
     let out = packed_gradient(
@@ -4326,70 +4324,33 @@ fn run<const N: usize, const M: usize>(
         template,
         params,
         x.len(),
-        &theta_adj,
+        &lane_theta[0],
         &psi_of,
         &pr,
         &om,
         &so,
         &pv,
     );
-    if !dx_rows.is_empty() {
-        // ---- 5. the mode response from the same recording --------------------------------
-        // Each row's tape adjoints seed the taped predictions exactly as Ψ's did in step 4.
-        let n_rows: usize = dx_rows.iter().map(|c| c.1).sum();
-        let mut lane_theta: Vec<Vec<f64>> = Vec::with_capacity(n_rows);
-        for (lanes, n, adj) in &dx_rows {
-            let seeds = DxSeeds {
-                preds: &preds,
-                fr: &fr,
-                gr: &gr,
-                pop: pop.as_ref().zip(pr0.as_ref()),
-            };
-            let vadj = |at: &dyn Fn(&DualV<N, M>, usize) -> f64| -> Option<()> {
-                for l in 0..*n {
-                    #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
-                    let mut ta: Vec<f64> = th.iter().map(|lf| at(lf, l)).collect();
-                    #[cfg(feature = "nn")]
-                    if let Some((red, z)) = &nn_out {
-                        add_nn_weight_adjoint(model, red, z, theta, |lf| at(lf, l), &mut ta)?;
-                    }
-                    lane_theta.push(ta);
-                }
-                Some(())
-            };
-            match lanes {
-                1 => seeds.sweep::<1>(adj, *n, vadj)?,
-                2 => seeds.sweep::<2>(adj, *n, vadj)?,
-                _ => seeds.sweep::<DX_LANES>(adj, *n, vadj)?,
-            }
-        }
+    if outs.len() > 1 {
+        // ---- 5. the mode response from the same sweeps ------------------------------------
+        let n_rows = outs.len() - 1;
         let mut cols = vec![DVector::<f64>::zeros(n_rows); x.len()];
-        let mut r = 0usize;
-        for (lanes, n, adj) in &dx_rows {
-            for l in 0..*n {
-                let of = |x: R| -> f64 { x.idx().map_or(0.0, |i| adj[i * lanes + l]) };
-                let mut ta = std::mem::take(&mut lane_theta[r]);
-                if let Some(d) = ng_rows.get(r) {
-                    for (t, dv) in ta.iter_mut().zip(d) {
-                        *t += dv;
-                    }
-                }
-                let row = packed_gradient(
-                    model,
-                    template,
-                    params,
-                    x.len(),
-                    &ta,
-                    &of,
-                    &pr,
-                    &om,
-                    &so,
-                    &pv,
-                );
-                for (c, v) in cols.iter_mut().zip(row) {
-                    c[r] = -v;
-                }
-                r += 1;
+        for r in 0..n_rows {
+            let of = |x: R| out_adj(r + 1, x);
+            let row = packed_gradient(
+                model,
+                template,
+                params,
+                x.len(),
+                &lane_theta[r + 1],
+                &of,
+                &pr,
+                &om,
+                &so,
+                &pv,
+            );
+            for (c, v) in cols.iter_mut().zip(row) {
+                c[r] = -v;
             }
         }
         let ok = cols.iter().all(|c| c.iter().all(|v| v.is_finite()));
@@ -4400,20 +4361,18 @@ fn run<const N: usize, const M: usize>(
     Some(out)
 }
 
-/// Widest lane chunk of the fused mode response (step 5 of [`run`]).
+/// Widest lane chunk of the fused gradient-and-response sweeps ([`run`]).
 const DX_LANES: usize = 4;
 
-/// The mode response's scalar-tape sweep (step 3 of [`run`]): rows `y_r = Σ_k Z_rk g_k` for
-/// `r < n_rows`, `Z = (H⁻¹)_{r,:}` over the `n_act` live effects, swept in chunks of 1, 2 or
-/// [`DX_LANES`] lanes. Each chunk is `(lanes, rows in it, adjoints[node·lanes + lane])`
-/// for the tape's first `n_in` nodes, its inputs. Empty when `H` is singular.
-fn eta_dx_lanes<const N: usize>(
+/// The mode response's rows on the scalar tape (step 3 of [`run`]): `y_r = Σ_k Z_rk g_k`
+/// for `r < n_rows`, `Z = (H⁻¹)_{r,:}` over the `n_act` live effects. Empty when `H` is
+/// singular.
+fn eta_dx_outputs<const N: usize>(
     h: &DMatrix<f64>,
     g: &[R; N],
     n_act: usize,
     n_rows: usize,
-    n_in: usize,
-) -> Vec<(usize, usize, Vec<f64>)> {
+) -> Vec<R> {
     let haa = h.view((0, 0), (n_act, n_act)).into_owned();
     let rhs = DMatrix::<f64>::identity(n_act, n_rows);
     let z = match haa.clone().cholesky() {
@@ -4424,26 +4383,32 @@ fn eta_dx_lanes<const N: usize>(
     let Some(z) = z.filter(|z| z.iter().all(|v| v.is_finite())) else {
         return Vec::new();
     };
-    let y: Vec<R> = (0..n_rows)
+    (0..n_rows)
         .map(|r| {
             <R as crate::sens::num::PkNum>::wsum3(
                 0.0,
                 (0..n_act).map(|k| (R::c(z[(k, r)]), g[k], R::c(1.0))),
             )
         })
-        .collect();
+        .collect()
+}
+
+/// Sweep the scalar tape for `outs`, in chunks of 1, 2 or [`DX_LANES`] lanes (every chunk
+/// but the last full). Each chunk is `(lanes, outputs in it, adjoints[node·lanes + lane])`
+/// for the tape's first `n_in` nodes, its inputs.
+fn sweep_lanes(outs: &[R], n_in: usize) -> Vec<(usize, usize, Vec<f64>)> {
+    fn sweep<const L: usize>(y: &[R], n_in: usize) -> (usize, Vec<f64>) {
+        let outs: [R; L] = std::array::from_fn(|i| y.get(i).copied().unwrap_or(R::c(0.0)));
+        (L, rsweep::<L>(&outs)[..n_in * L].to_vec())
+    }
     let mut out = Vec::new();
     let mut r0 = 0;
-    while r0 < n_rows {
-        let left = n_rows - r0;
-        fn sweep<const L: usize>(y: &[R], n_in: usize) -> (usize, Vec<f64>) {
-            let outs: [R; L] = std::array::from_fn(|i| y.get(i).copied().unwrap_or(R::c(0.0)));
-            (L, rsweep::<L>(&outs)[..n_in * L].to_vec())
-        }
+    while r0 < outs.len() {
+        let left = outs.len() - r0;
         let (lanes, adj) = match left {
-            1 => sweep::<1>(&y[r0..], n_in),
-            2 => sweep::<2>(&y[r0..], n_in),
-            _ => sweep::<DX_LANES>(&y[r0..], n_in),
+            1 => sweep::<1>(&outs[r0..], n_in),
+            2 => sweep::<2>(&outs[r0..], n_in),
+            _ => sweep::<DX_LANES>(&outs[r0..], n_in),
         };
         let n = left.min(lanes);
         out.push((lanes, n, adj));

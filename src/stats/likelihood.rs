@@ -675,13 +675,19 @@ pub(crate) fn accumulate_non_gaussian_nll(
             hazard, recurrence, ..
         } = endpoint
         {
-            let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                .obs_records
-                .iter()
-                .filter(|r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt))
-                .cloned()
-                .collect();
+            // A pooled buffer (#2549): this runs on every inner objective evaluation.
+            let mut records_for_cmt: Vec<crate::types::ObsRecord> = crate::scratch::take();
+            records_for_cmt.extend(
+                subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned(),
+            );
             if records_for_cmt.is_empty() {
+                crate::scratch::give(records_for_cmt);
                 continue; // subject has no records for this TTE CMT
             }
             let raw = tte_endpoint_nll_visit(
@@ -696,6 +702,7 @@ pub(crate) fn accumulate_non_gaussian_nll(
                 &mut |_| {},
             );
             *acc += factor * raw;
+            crate::scratch::give(records_for_cmt);
         }
     }
     // Discrete families (binary today; ordinal/Poisson/… later) — one add, matching the TTE terms.
@@ -1984,13 +1991,19 @@ fn non_gaussian_mode_terms(
             ..
         } = endpoint
         {
-            let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                .obs_records
-                .iter()
-                .filter(|r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt))
-                .cloned()
-                .collect();
+            // A pooled buffer (#2549): this runs on every inner objective evaluation.
+            let mut records_for_cmt: Vec<crate::types::ObsRecord> = crate::scratch::take();
+            records_for_cmt.extend(
+                subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned(),
+            );
             if records_for_cmt.is_empty() {
+                crate::scratch::give(records_for_cmt);
                 continue; // subject has no records for this TTE CMT
             }
             // Closure that evaluates the TTE NLL at a given eta vector — re-solving
@@ -2063,6 +2076,7 @@ fn non_gaussian_mode_terms(
                     }
                 };
             }
+            crate::scratch::give(records_for_cmt);
         }
     }
 

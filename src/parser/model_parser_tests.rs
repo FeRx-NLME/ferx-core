@@ -30901,11 +30901,7 @@ fn assert_inliner_matches_eager(
         let view = scope.view(at, raw);
         let mut defs = ProgramDefs::default();
         let root = view.materialise(&mut defs);
-        let got = TypicalProgram {
-            defs: defs.defs,
-            root,
-        }
-        .inlined();
+        let got = TypicalProgram::new(defs.defs, root).inlined();
         assert_eq!(
             format!("{got:?}"),
             format!("{want:?}"),
@@ -36665,4 +36661,193 @@ fn the_product_walk_is_linear_on_a_diamond() {
         assert_eq!(count(20) - c0, 20 * per_level, "{re}: depth 20 is linear");
         assert_eq!(count(30) - c0, 30 * per_level, "{re}: depth 30 is linear");
     }
+}
+
+/// #2549: `leads_with_keyword_ci` gates the `[parameters]` regexes, so it must accept
+/// every line their `(?i)^\s*kw` prefix accepts — and, to be the same predicate rather
+/// than a looser one, reject every line it rejects. Checked against the prefix regex
+/// itself over the folding and whitespace edge cases: the Kelvin sign and long s (the
+/// only non-ASCII characters simple case folding maps onto ASCII letters), the dotted
+/// and dotless i (which it does not), and Unicode `White_Space` beyond ASCII.
+#[test]
+fn keyword_gate_is_the_case_insensitive_prefix_regex() {
+    let kws = [
+        "theta",
+        "omega",
+        "sigma",
+        "kappa",
+        "level",
+        "block_omega",
+        "block_sigma",
+        "block_kappa",
+    ];
+    let leads = [
+        "", " ", "\t", "\n ", "\u{a0}", "\u{2003}", "\u{85}", "\u{200b}", "x ",
+    ];
+    let mut checked = 0usize;
+    for kw in kws {
+        let re = regex::Regex::new(&format!(r"(?i)^\s*{kw}")).unwrap();
+        let mut spellings = vec![
+            kw.to_string(),
+            kw.to_ascii_uppercase(),
+            kw.replace('k', "\u{212A}"),
+            kw.replace('s', "\u{17F}"),
+            kw.replace('a', "\u{e1}"),
+            kw.replace('i', "\u{130}"),
+            kw.replace('l', "\u{131}"),
+            kw[..kw.len() - 1].to_string(),
+            kw.replace('_', "-"),
+        ];
+        // Mixed case, one letter at a time.
+        for i in 0..kw.len() {
+            let mut s: Vec<char> = kw.chars().collect();
+            s[i] = s[i].to_ascii_uppercase();
+            spellings.push(s.into_iter().collect());
+        }
+        for lead in leads {
+            for sp in &spellings {
+                for tail in ["", " x", "(1)", "_tail"] {
+                    let line = format!("{lead}{sp}{tail}");
+                    assert_eq!(
+                        super::leads_with_keyword_ci(&line, kw),
+                        re.is_match(&line),
+                        "gate and regex disagree on {line:?} for {kw}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    // The cases that make the gate non-trivial are in the corpus, on both sides.
+    assert!(super::leads_with_keyword_ci("\u{a0}\u{212A}APPA", "kappa"));
+    assert!(super::leads_with_keyword_ci("\u{17F}igma ~ 1", "sigma"));
+    assert!(!super::leads_with_keyword_ci("\u{200b}theta", "theta"));
+    assert!(checked > 1000);
+}
+
+/// #2549: the slot-resolved CTMM generator is bit-identical to the map-keyed walk it
+/// replaced (kept here as the reference): the same intensities over a covariate map
+/// overlaid with the ODE state, on a conditional `[individual_parameters]` value, a
+/// state that shadows a covariate of the same name, `MACHEPS` (read as ε even when
+/// assigned), a covariate missing from the map, and a state slice shorter than the
+/// state index (both read 0).
+#[cfg(feature = "markov")]
+#[test]
+fn slot_resolved_ctmm_generator_is_the_map_walk() {
+    let tn: Vec<String> = ["TH1", "TH2"].iter().map(|s| s.to_string()).collect();
+    let en: Vec<String> = ["ETA1"].iter().map(|s| s.to_string()).collect();
+    let ctx = ParseCtx::new(&tn, &en, &[]);
+    let src = "TV = TH1 * (WT / 70) ^ 0.75\n\
+               if (SEX == 1) {\n  K = TV * exp(ETA1)\n} else {\n  K = TV * 1.1 * exp(ETA1)\n}\n\
+               MACHEPS = 3\n\
+               M = MACHEPS * 1e10\n\
+               R1 = K * CONC / (CONC + TH2) + M\n\
+               R2 = exp(TH2) * (1 + EFF) + K / (1 + AUX)\n";
+    let mut stmts = parse_block_statements(src, ctx, StatementMode::Plain).expect("parses");
+    let rate = |s: Statement| match s {
+        Statement::Assign(_, e) => e,
+        other => panic!("not an assignment: {other:?}"),
+    };
+    let r2 = rate(stmts.pop().unwrap());
+    let r1 = rate(stmts.pop().unwrap());
+    let transitions = vec![(0, 1, r1), (1, 0, r2), (1, 2, Expression::Literal(0.25))];
+    // `EFF` is also a covariate column; the state overlay must win, as the insert did.
+    let states = vec![
+        ("CONC".to_string(), 0),
+        ("EFF".to_string(), 1),
+        ("AUX".to_string(), 7),
+    ];
+    let tree = CtmmGeneratorTree::new(&stmts, &transitions, &states, 3);
+    let by_map = |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, state: &[f64]| {
+        let mut c = cov.clone();
+        for (name, idx) in &states {
+            c.insert(name.clone(), state.get(*idx).copied().unwrap_or(0.0));
+        }
+        let vars = eval_indiv_param_vars(&stmts, theta, eta, &c);
+        let mut q = nalgebra::DMatrix::<f64>::zeros(3, 3);
+        for (j, k, expr) in &transitions {
+            let rate = eval_expression(expr, theta, eta, &c, &vars, &[]);
+            q[(*j, *k)] += rate;
+            q[(*j, *j)] -= rate;
+        }
+        q
+    };
+    let mut checked = 0;
+    for sex in [1.0, 2.0] {
+        for wt in [None, Some(53.5), Some(91.25)] {
+            let mut cov: HashMap<String, f64> = HashMap::new();
+            cov.insert("SEX".into(), sex);
+            cov.insert("EFF".into(), 123.0);
+            if let Some(w) = wt {
+                cov.insert("WT".into(), w);
+            }
+            for (theta, eta) in [
+                ([0.3, -1.2], [0.0]),
+                ([1.7, 0.4], [-0.35]),
+                ([0.05, 2.5], [1.1]),
+            ] {
+                for state in [vec![0.0, 0.0], vec![3.25, 0.125], vec![1e-9, 47.0]] {
+                    let got = tree.generator(&theta, &eta, &cov, &state);
+                    let want = by_map(&theta, &eta, &cov, &state);
+                    for (g, w) in got.iter().zip(want.iter()) {
+                        assert_eq!(g.to_bits(), w.to_bits(), "{got} vs {want}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 54);
+    // The fixture exercises the overlay: the state moves `Q`, and `EFF`'s column value
+    // (123) is shadowed by the state's.
+    let mut cov: HashMap<String, f64> = HashMap::new();
+    cov.insert("EFF".into(), 123.0);
+    let at = |state: &[f64]| tree.generator(&[0.3, -1.2], &[0.0], &cov, state);
+    assert_ne!(at(&[0.0, 0.0]), at(&[3.25, 0.125]));
+    assert_eq!(at(&[0.0, 0.0])[(1, 0)], (-1.2f64).exp());
+}
+
+/// #2549: a typical value read through covariate slots is bit-identical to the
+/// map-keyed walk it replaced (`eval_by_name`), on the shapes detection produces —
+/// local definitions (a diamond of them), a covariate read twice, a conditional, the
+/// `MACHEPS` constant — and on a subject missing a covariate (both read `0`).
+#[test]
+fn slotted_typical_value_is_the_map_walk() {
+    let src = "B = (WT / 70) ^ TH_WT\n\
+               C = B * (1 + TH_AGE * (AGE - 40))\n\
+               D = C + B * MACHEPS\n\
+               CL = TVCL * D * min(WT / 70, 1.2) * (1 + 0.1 * SEX) * exp(ETA_CL)\n";
+    let groups = detect_groups(src, &["TVCL", "TH_WT", "TH_AGE"], &["ETA_CL"]);
+    let typical = &groups
+        .first()
+        .unwrap_or_else(|| panic!("a covariate mu-ref is detected in:\n{src}"))
+        .typical;
+    assert!(
+        !typical.defs.is_empty(),
+        "the fixture keeps local definitions"
+    );
+    let mut checked = 0;
+    for (wt, age, sex) in [
+        (Some(70.0), Some(40.0), Some(1.0)),
+        (Some(52.25), Some(63.0), Some(2.0)),
+        (None, Some(25.0), Some(1.0)),
+        (Some(91.5), None, None),
+    ] {
+        let mut cov: HashMap<String, f64> = HashMap::new();
+        for (k, v) in [("WT", wt), ("AGE", age), ("SEX", sex)] {
+            if let Some(v) = v {
+                cov.insert(k.into(), v);
+            }
+        }
+        for theta in [[0.3, 0.75, 0.01], [2.5, -0.4, -0.02], [1e-3, 1.2, 0.0]] {
+            let want = typical.eval_by_name(&theta, &cov);
+            let got = typical.eval(&theta, &cov);
+            let row = typical.gather(&cov);
+            let at = typical.eval_at(&theta, &row);
+            assert_eq!(got.to_bits(), want.to_bits(), "eval: {got} vs {want}");
+            assert_eq!(at.to_bits(), want.to_bits(), "eval_at: {at} vs {want}");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 12);
 }
