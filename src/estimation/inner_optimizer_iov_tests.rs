@@ -6141,3 +6141,65 @@ fn the_iov_schedule_cache_is_bit_identical_and_declines_a_lagtime() {
     );
     assert!(cacheable_schedule_iov(&lagged, &pop.subjects[0]).is_none());
 }
+
+/// #2557: under `inner_optimizer = nelder_mead` a subject is reported converged only at a
+/// certified mode. The primary search's own end point used to set `converged` from NM's
+/// simplex spread, so every warfarin subject came back converged while sitting off its mode
+/// (‖∇‖ up to 0.88, `|Δη|` up to 1.7e-4 on `main`). Each converged NM EBE is compared with the default BFGS
+/// mode of the same subject, in η units: the Newton-step arm certifies within `tol` of the
+/// mode while allowing a large gradient on a stiff direction, so a gradient bound would
+/// test the wrong thing. Warfarin is closed form with the analytic inner gradient, so the
+/// certificate and the BFGS reference both run on the exact objective.
+#[test]
+fn nelder_mead_primary_reports_converged_only_at_its_mode() {
+    use crate::stats::likelihood::individual_nll;
+    use std::path::Path;
+    let model = crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+        .expect("warfarin parses");
+    let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    let p = &model.default_params;
+    let solve = |mode, s| {
+        let _armed = arm_inner_settings(InnerSettings { mode, warm: false });
+        find_ebe(&model, s, p, 200, 1e-5, None, None, 0)
+    };
+    let dist = |a: &DVector<f64>, b: &[f64]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, |m, d| {
+                assert!(d.is_finite(), "non-finite η");
+                m.max(d)
+            })
+    };
+    let (mut worst, mut raw_worst) = (0.0_f64, 0.0_f64);
+    for s in &pop.subjects {
+        let mode = solve(crate::types::InnerOptimizer::Auto, s);
+        assert!(mode.converged, "{}: the BFGS reference", s.id);
+        // NM's own stop from η = 0, the same search the primary runs: the fixture is one
+        // where that stop is not a mode, so certifying it is what moves the answer.
+        let obj = |x: &[f64]| individual_nll(&model, s, &p.theta, x, &p.omega, &p.sigma.values);
+        let mut raw = vec![0.0; model.n_eta];
+        nelder_mead_minimize(&obj, &mut raw, model.n_eta, 200, 1e-5);
+        raw_worst = raw_worst.max(dist(&mode.eta, &raw));
+        let nm = solve(crate::types::InnerOptimizer::NelderMead, s);
+        assert!(nm.converged, "{}: a certifiable NM stop is reported", s.id);
+        assert!(
+            !nm.used_fallback,
+            "{}: the primary search certified it",
+            s.id
+        );
+        worst = worst.max(dist(&mode.eta, nm.eta.as_slice()));
+    }
+    eprintln!("NM-certified vs BFGS mode: {worst:.3e}; raw NM stop: {raw_worst:.3e}");
+    assert!(worst <= NM_CERTIFIED_ETA_GAP, "{worst:.3e}");
+    assert!(
+        raw_worst > 10.0 * NM_CERTIFIED_ETA_GAP,
+        "the fixture's NM stop is already at its mode: {raw_worst:.3e}"
+    );
+}
+
+/// Worst `|η̂_NM − η̂_BFGS|∞` over warfarin's subjects for a certified Nelder–Mead EBE.
+/// Measured 4.771e-8 on macOS arm64, against 1.674e-4 for NM's own stop (the old
+/// `converged = true` point): 20× headroom, and 170× below the stop it must reject.
+const NM_CERTIFIED_ETA_GAP: f64 = 1e-6;

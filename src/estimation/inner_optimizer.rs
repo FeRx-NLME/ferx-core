@@ -534,10 +534,11 @@ pub struct EbeResult {
     /// of immediately repeating the same evaluation.
     pub(crate) terminal_hessian: Option<DMatrix<f64>>,
     /// True when the returned η̂ is certified stationary: BFGS met `gnorm < tol` (or its
-    /// objective-stall stop on a noise-floored objective), or a Nelder–Mead fallback result
-    /// passed `FallbackCertifier`'s stationarity tests. Nelder–Mead's own simplex-spread
-    /// stop never sets it (#1527). False on iteration-limit exit regardless of which
-    /// optimizer was used.
+    /// objective-stall stop on a noise-floored objective), or a Nelder–Mead result — the
+    /// fallback's (#1527), or the primary search's under `inner_optimizer = nelder_mead`
+    /// (#2557) — passed `FallbackCertifier`'s stationarity tests. Nelder–Mead's own
+    /// simplex-spread stop never sets it. False when BFGS exits at its iteration limit and
+    /// no certificate holds.
     pub converged: bool,
     /// True when the BFGS optimizer failed and Nelder-Mead was invoked as fallback.
     pub used_fallback: bool,
@@ -1082,7 +1083,7 @@ impl FallbackCertifier<'_> {
     /// Whether `x` is a certified stationary point of `obj`; may move `x` to a polished,
     /// certified point that is no worse (see the type's docs). A non-finite `x` is never
     /// certified.
-    fn certify(&self, obj: &dyn Fn(&[f64]) -> f64, x: &mut Vec<f64>) -> bool {
+    pub(crate) fn certify(&self, obj: &dyn Fn(&[f64]) -> f64, x: &mut Vec<f64>) -> bool {
         self.certify_within(obj, x, &|_| true)
     }
 
@@ -5176,8 +5177,10 @@ fn inner_use_lbfgs(n: usize) -> bool {
 }
 
 /// Inner EBE minimization with an externally-provided gradient (analytic
-/// sensitivities or AD). Fit-scoped dispatch (dense BFGS / L-BFGS / Nelder–Mead); the
-/// `NelderMead` mode ignores the supplied gradient.
+/// sensitivities or AD). Fit-scoped dispatch (dense BFGS / L-BFGS / Nelder–Mead). The
+/// `NelderMead` mode searches without the gradient but certifies its end point with it
+/// ([`FallbackCertifier::certify`]), so `true` means a stationary point under every
+/// `inner_optimizer` (#2557).
 #[allow(clippy::too_many_arguments)]
 fn inner_minimize_with_grad(
     obj: &dyn Fn(&[f64]) -> f64,
@@ -5196,7 +5199,24 @@ fn inner_minimize_with_grad(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
     ) {
-        return nelder_mead_minimize(obj, x, n, max_iter, tol);
+        // NM's simplex-spread exit is its stopping rule, not a certificate (#1527): measured
+        // under `inner_optimizer = nelder_mead`, every cold EBE across twelve bundled examples
+        // reported converged, 108 of 177 at a gradient norm above 1e-3 (up to 12.4 on
+        // `schnider`). Certify the end point as the fallback does, whatever NM's own flag.
+        nelder_mead_minimize(obj, x, n, max_iter, tol);
+        let cert = FallbackCertifier {
+            grad,
+            precond,
+            stop_precond,
+            stall_at,
+            n,
+            max_iter,
+            tol,
+        };
+        let mut end = x.to_vec();
+        let ok = cert.certify(obj, &mut end);
+        x.copy_from_slice(&end);
+        return ok;
     }
     if inner_use_lbfgs(n) {
         lbfgs_core(
