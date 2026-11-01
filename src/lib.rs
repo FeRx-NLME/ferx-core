@@ -3,7 +3,6 @@ pub mod build_info;
 pub mod cancel;
 #[cfg(feature = "survival")]
 pub mod categorical;
-pub(crate) mod devflags;
 pub mod diagnostics;
 pub(crate) mod dosing;
 pub mod edit;

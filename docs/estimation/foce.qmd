@@ -913,6 +913,32 @@ The inner loop warm-starts EBE estimation from the previous outer iteration's EB
 
 The warm start is taken from the **best point seen so far**, not from whatever the optimizer evaluated last ([#1290](https://github.com/FeRx-NLME/ferx-core/issues/1290)). That distinction matters because the individual objective can be multimodal: a trial step the line search is about to reject may land somewhere the inner loop solves into a different, worse basin, and if those EBEs were carried forward, every later evaluation would inherit them. The starting point would then re-evaluate *worse* than it did a moment earlier — an objective that moves under the optimizer's feet, which no line search can descend. Anchoring the warm start to the incumbent keeps the objective at the incumbent reproducible; evaluations that do not improve on it leave the cache untouched.
 
+### Predicted warm starts {#predicted-warm-starts}
+
+A step of the outer optimizer moves every subject's mode, and an inner solve started at the
+incumbent's EBEs stops on the old mode's side of the new one, a tolerance away. That error is
+not noise: it moves with the step, and the quasi-Newton update reads it as curvature of the
+objective. So under FOCE and FOCEI each evaluation starts its inner solves at the modes
+*predicted* for its own point, $\hat\eta^{0} = \hat\eta + (d\hat\eta/dx)(x - x_0)$
+(Almquist et al. 2015, Eq. 48), with $x_0$ the incumbent
+([#2549](https://github.com/FeRx-NLME/ferx-core/issues/2549)).
+
+The mode response $d\hat\eta/dx = -H^{-1}\,\partial(\nabla_\eta l)/\partial x$ is exact,
+and it comes from the outer gradient's own recording: one more sweep per random effect, formed
+only on the evaluations that become the incumbent, whose modes the next evaluation starts
+from. The prediction is a start, not an answer. Every subject is still solved to `inner_tol`,
+and a large step is capped to two prior SDs, so a basin the incumbent's EBEs sit in is not
+traded on extrapolation. On eight FOCE/FOCEI benchmark fits the outer iterations fell by
+24–68% at the same optimum (`mm` 166 → 71, `pk1` 51 → 31, `pk2_ode` 77 → 40). A subject
+the adjoint declines, or one with no data, is predicted not to move.
+
+The predictor serves models without IOV or `[mixture]` whose outer gradient is the analytic
+one. Under IOV a subject's κ̂ is not predicted; its warm inner solve is instead seeded with
+the stacked Gauss–Newton metric, as a BSV solve is; a cold start stays unseeded, because
+the metric's full first step [selects the basin](../model-file/fit-options.qmd#escaping-a-multimodal-individual-objective).
+Under Laplace and AGQ
+the same predictor was measured and left out: it moved no fit's iteration count there.
+
 ### The final inner loop {#final-inner-loop}
 
 When the outer optimizer stops, ferx restores the best point it saw

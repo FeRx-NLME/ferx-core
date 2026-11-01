@@ -36,9 +36,6 @@ thread_local! {
 /// An empty `Vec<T>` from this thread's spare list, or a new one.
 #[inline]
 pub(crate) fn take<T: 'static>() -> Vec<T> {
-    if !crate::devflags::on(crate::devflags::POOL) {
-        return Vec::new();
-    }
     SPARE
         .try_with(|p| {
             p.borrow_mut()
@@ -62,9 +59,7 @@ pub(crate) fn take_with_capacity<T: 'static>(n: usize) -> Vec<T> {
 /// Return a buffer from [`take`] to this thread's spare list, emptied.
 #[inline]
 pub(crate) fn give<T: 'static>(mut v: Vec<T>) {
-    if v.capacity() == 0
-        || v.capacity().saturating_mul(std::mem::size_of::<T>()) > MAX_SPARE_BYTES
-        || !crate::devflags::on(crate::devflags::POOL)
+    if v.capacity() == 0 || v.capacity().saturating_mul(std::mem::size_of::<T>()) > MAX_SPARE_BYTES
     {
         return;
     }

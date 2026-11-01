@@ -1371,7 +1371,7 @@ fn pk_space_predictions<T: VmNum>(
     let order = T::JET_ORDER;
     // The order gate first: the inner loop's first-order recording (every η-gradient) never
     // takes the lift, and used to build the live-slot list below only to discard it (#2549).
-    if crate::devflags::on(crate::devflags::F7) && (order < 2 || order > 4) {
+    if !(2..=4).contains(&order) {
         return None;
     }
     let live: Vec<(usize, T)> = by_slot
@@ -1780,15 +1780,9 @@ fn closed_form_finish<T: VmNum>(
         }
         // One scale for every observation: applied directly, no per-observation copy
         // (#2549 W1). The same divisions in the same order.
-        spec if crate::devflags::on(crate::devflags::F5) => {
+        spec => {
             let s = scale_of(spec)?;
             for y in preds.iter_mut() {
-                apply(y, s)?;
-            }
-        }
-        spec => {
-            let scales: Vec<Option<T>> = vec![scale_of(spec)?; preds.len()];
-            for (y, s) in preds.iter_mut().zip(scales) {
                 apply(y, s)?;
             }
         }
@@ -1897,7 +1891,7 @@ fn record_analytic_events<T: VmNum>(
                          cov: &std::collections::HashMap<String, f64>,
                          time: f64|
      -> usize {
-        if per_record || !crate::devflags::on(crate::devflags::IOVBUF) {
+        if per_record {
             entries.push(at(occ, cov, time));
             return entries.len() - 1;
         }

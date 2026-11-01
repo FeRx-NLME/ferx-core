@@ -1936,8 +1936,7 @@ pub(crate) fn predict_iov_in<K: AsRef<[f64]>>(
 
     // The closed-form event walk with a cached schedule borrows each record's snapshot
     // from a table of distinct ones (#2549); every other engine reads one per record.
-    let indexed = crate::devflags::on(crate::devflags::IOVBUF)
-        && !iov_table_off()
+    let indexed = !iov_table_off()
         && schedule.is_some()
         && model.ode_spec.is_none()
         && !model.is_algebraic()

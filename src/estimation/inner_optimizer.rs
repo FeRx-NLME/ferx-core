@@ -832,13 +832,6 @@ impl InnerHessianSeed {
                 | EstimationMethod::FoceGn
                 | EstimationMethod::FoceGnHybrid,
                 None,
-            ) if crate::devflags::exp(crate::devflags::X1) => Self::Exact,
-            (
-                EstimationMethod::Foce
-                | EstimationMethod::FoceI
-                | EstimationMethod::FoceGn
-                | EstimationMethod::FoceGnHybrid,
-                None,
             ) => Self::GaussNewton,
             _ => Self::None,
         }
@@ -2160,8 +2153,7 @@ fn find_ebe_impl(
     let both = !(genuinely_warm || policy.seed == InnerHessianSeed::None);
     // The two cold solves screen the same Sobol starts on the same objective, and a screen
     // descent reads neither solve's incumbent: the second takes the first one's descents.
-    let share = both && crate::devflags::on(crate::devflags::SCRSHARE);
-    if share {
+    if both {
         SCREEN_SHARE.with(|c| *c.borrow_mut() = Some(None));
     }
     let normal = solve(false).expect("an unforced solve always returns a result");
@@ -2169,9 +2161,7 @@ fn find_ebe_impl(
         return normal;
     }
     let seeded = solve(true);
-    if share {
-        SCREEN_SHARE.with(|c| *c.borrow_mut() = None);
-    }
+    SCREEN_SHARE.with(|c| *c.borrow_mut() = None);
     match seeded {
         Some(seeded) if seeded.nll + COLD_SEED_TIE_TOL < normal.nll => seeded,
         _ => normal,
@@ -2784,31 +2774,6 @@ fn find_ebe_solve(
                         precond.as_deref(),
                         stop_precond,
                         &stall_at,
-                        &|cand: &[f64]| {
-                            let h = (crate::devflags::exp(crate::devflags::X6)
-                                && seed_kind != InnerHessianSeed::None
-                                && dense_bfgs_route)
-                                .then(|| {
-                                    analytic_inner_seed_hessian(
-                                        model,
-                                        subject,
-                                        params,
-                                        cand,
-                                        schedule,
-                                        mult.as_deref(),
-                                        err_keys.as_ref(),
-                                        &mut obs_grad_recycle.borrow_mut(),
-                                        seed_kind == InnerHessianSeed::Exact,
-                                        frozen,
-                                    )
-                                })
-                                .flatten()
-                                .map(|(h, _)| h);
-                            if let Some(k) = rows_at.borrow_mut().as_mut() {
-                                k.clear();
-                            }
-                            h
-                        },
                     );
                     SCREEN_SHARE.with(|c| {
                         if let Some(slot) = c.borrow_mut().as_mut() {
@@ -3508,27 +3473,22 @@ fn find_ebe_iov(
     // metric's full first step selects the mode's basin (`find_ebe_impl`, #1474/#1504) —
     // measured on `iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm`, a seeded cold
     // first step lands 28.8 above the mode where the unseeded one stops 3.0 short.
-    let iov_seed = (crate::devflags::on(crate::devflags::IOVSEED)
-        && is_warm_start(eta_init, init_is_mode))
-    .then(|| {
-        let mut st: Vec<f64> = x[..n_eta]
-            .iter()
-            .zip(mu.iter())
-            .map(|(p, m)| p - m)
-            .collect();
-        for k in to_kappas(&x) {
-            st.extend_from_slice(&k);
-        }
-        if crate::devflags::exp(crate::devflags::X2) {
-            crate::sens::ode_provider::adjoint::exact_inner_hessian(model, subject, params, &st)
-        } else {
+    let iov_seed = is_warm_start(eta_init, init_is_mode)
+        .then(|| {
+            let mut st: Vec<f64> = x[..n_eta]
+                .iter()
+                .zip(mu.iter())
+                .map(|(p, m)| p - m)
+                .collect();
+            for k in to_kappas(&x) {
+                st.extend_from_slice(&k);
+            }
             // The positive Gauss–Newton metric `H̃` (first-order duals only), the seed the
             // non-IOV FOCE/FOCEI solve already takes (#1389, #2287).
             crate::sens::ode_provider::adjoint::exact_htilde(model, subject, params, &st)
-        }
-    })
-    .flatten()
-    .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
+        })
+        .flatten()
+        .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
     let bfgs_converged = inner_minimize_with_grad(
         &obj,
         &agrad,
@@ -5547,96 +5507,6 @@ fn dense_bfgs_core(
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> bool {
-    if !crate::devflags::exp(crate::devflags::STATS) {
-        return dense_bfgs_core_inner(
-            obj,
-            grad,
-            x,
-            n,
-            max_iter,
-            tol,
-            precond,
-            hessian_seed,
-            stop_precond,
-            stall_at,
-            short_line_search,
-        );
-    }
-    let nobj = std::cell::Cell::new(0usize);
-    let ngrad = std::cell::Cell::new(0usize);
-    let o = |e: &[f64]| {
-        nobj.set(nobj.get() + 1);
-        obj(e)
-    };
-    let gseq = std::cell::RefCell::new(String::new());
-    let g = |e: &[f64]| {
-        ngrad.set(ngrad.get() + 1);
-        let v = grad(e);
-        let nn = v.iter().map(|a| a * a).sum::<f64>().sqrt();
-        gseq.borrow_mut().push_str(&format!(" {nn:.1e}"));
-        v
-    };
-    let ok = dense_bfgs_core_inner(
-        &o,
-        &g,
-        x,
-        n,
-        max_iter,
-        tol,
-        precond,
-        hessian_seed,
-        stop_precond,
-        stall_at,
-        short_line_search,
-    );
-    {
-        static N_UNSEEDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        if hessian_seed.is_none()
-            && N_UNSEEDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0
-        {
-            let bt = std::backtrace::Backtrace::force_capture().to_string();
-            let fr: Vec<&str> = bt
-                .lines()
-                .filter(|l| {
-                    l.contains("ferx_core::")
-                        && !l.contains("{{closure}}")
-                        && !l.contains("closure#")
-                        && !l.contains("call_")
-                        && !l.contains("dense_bfgs")
-                        && !l.contains("inner_minimize")
-                })
-                .map(|l| l.trim().rsplit("::").nth(1).unwrap_or(""))
-                .take(8)
-                .collect();
-            eprintln!("UNSEEDED {}", fr.join(" <- "));
-        }
-    }
-    let gfin = grad(x);
-    let gnorm_final = gfin.iter().map(|v| v * v).sum::<f64>().sqrt();
-    eprintln!(
-        "INNERSTAT seed={} ok={ok} obj={} grad={} gfinal={gnorm_final:.3e} tol={tol:.1e} seq={}",
-        hessian_seed.is_some(),
-        nobj.get(),
-        ngrad.get(),
-        gseq.borrow()
-    );
-    ok
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dense_bfgs_core_inner(
-    obj: &dyn Fn(&[f64]) -> f64,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    hessian_seed: Option<&DMatrix<f64>>,
-    stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool,
-    short_line_search: bool,
-) -> bool {
     let seed_inv = seed_h_inv(n, hessian_seed);
     let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
     let mut g = grad(x);
@@ -6065,7 +5935,8 @@ const SCREEN_MIN_OMEGA_DIST: f64 = 0.5;
 /// depends neither on the worker thread nor on the subject's position in the data. Empty
 /// when there is nothing to draw, or more random effects than the Sobol table carries.
 /// The #2013 screen's descents: one inner minimisation from each of [`screen_starts`]'
-/// points, in order, with `seed_at` the dense BFGS seed at a start.
+/// points, in order. Reads neither the solve's incumbent nor its metric, so the two cold
+/// solves of `find_ebe_impl` share them (`SCREEN_SHARE`).
 #[allow(clippy::too_many_arguments)]
 fn screen_descents(
     obj: &dyn Fn(&[f64]) -> f64,
@@ -6079,12 +5950,10 @@ fn screen_descents(
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
     stall_at: &dyn Fn(&[f64]) -> bool,
-    seed_at: &dyn Fn(&[f64]) -> Option<DMatrix<f64>>,
 ) -> Vec<ScreenDescent> {
     screen_starts(obj, omega, n_eta, n, subject_id)
         .into_iter()
         .map(|mut cand| {
-            let seed = seed_at(&cand);
             let ok = inner_minimize_with_grad(
                 obj,
                 agrad,
@@ -6093,7 +5962,7 @@ fn screen_descents(
                 max_iter,
                 tol,
                 precond,
-                seed.as_ref(),
+                None,
                 stop_precond,
                 stall_at,
                 false,

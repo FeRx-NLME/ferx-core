@@ -5201,8 +5201,7 @@ fn optimize_nlopt_attempt(
     // intentional. This auto-enable now only fires for an explicit
     // `optimizer = slsqp` on IOV models (the path it was originally written for).
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
-    #[allow(unused_mut)]
-    let mut scale = nlopt_scale_vector(
+    let scale = nlopt_scale_vector(
         &x0,
         init_params,
         &bounds,
@@ -5210,35 +5209,6 @@ fn optimize_nlopt_attempt(
         auto_scale_iov,
         identity_scales,
     );
-    // EXPERIMENT (#2549 X8): unit-Fisher coordinates — each packed coordinate divided by
-    // `1/√Bᵢᵢ`, `B = Σᵢ gᵢgᵢᵀ` the BHHH information at the start from the per-subject
-    // gradients at the pre-flight's EBEs.
-    if crate::devflags::exp(crate::devflags::X8) && model.n_kappa == 0 {
-        if let Some(ehs) = first_eval_etas {
-            let kap: Vec<Vec<DVector<f64>>> = vec![Vec::new(); ehs.len()];
-            if let Some(per) = per_subject_outer_gradients_checked(
-                model,
-                population,
-                init_params,
-                &x0,
-                ehs,
-                &kap,
-                options,
-                false,
-            ) {
-                let fixed = packed_fixed_mask(init_params);
-                for i in 0..n {
-                    let b: f64 = per.iter().map(|g| g[i] * g[i]).sum();
-                    if !fixed[i] && b.is_finite() && b > 0.0 {
-                        scale[i] = 1.0 / b.sqrt();
-                    }
-                }
-                if crate::devflags::exp(crate::devflags::STATS) {
-                    eprintln!("X8 scale {scale:?}");
-                }
-            }
-        }
-    }
     // The EBE warm-start predictor (`NloptState::pred_jac`) where the adjoint forms the mode
     // response: FOCE/FOCEI on a BSV-only, non-mixture model the outer gradient serves. An IOV
     // subject's κ̂ is not predicted, and its seeded warm solve already starts near the mode.
