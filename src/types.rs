@@ -8248,22 +8248,18 @@ pub struct FitResult {
     /// bundle saved before it was recorded.
     #[serde(default)]
     pub left_init: Option<bool>,
-    /// For a fit that did not leave its initial estimates (`left_init ==
-    /// Some(false)`), whether they are a stationary point of the objective: the
-    /// BHHH Newton decrement there — the OFV a Newton step would still gain — is
-    /// negligible (#2506). `Some(true)` is a warm start at an optimum (a
-    /// bootstrap sample, a refit from a previous fit's estimates), which
-    /// `crate::stalled_at_init` does not call a stall. `Some(false)` is a fit
-    /// that did not move although a descent was still predicted from its start —
-    /// the #751 stall, also reported `converged = false`. The decrement is the
-    /// per-subject analytic one where the model has it, and finite-differenced
-    /// from the objective otherwise (AGQ, mixtures, models outside the analytic
-    /// outer scope). `None` when the fit left its start, when neither form could
-    /// be formed (more than 24 free parameters without an analytic gradient, an
-    /// unusable objective at a probe), for every estimator other than the NLopt
-    /// outer loop, and for a `.fitrx` bundle saved before it was recorded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stationary_start: Option<bool>,
+    /// The fit did not leave its initial estimates (`left_init == Some(false)`),
+    /// and they were verified to be an optimum (#2506): a restart of the outer
+    /// optimizer from a perturbation of them converged back to their objective,
+    /// to within 0.1 OFV. That is a warm start at an optimum (a bootstrap
+    /// sample, a refit from a previous fit's estimates), which
+    /// `crate::stalled_at_init` does not call a stall. `false` whenever that was
+    /// not shown: the fit left its start, the restart was inconclusive or had no
+    /// budget left, the estimator is not the NLopt outer loop, or the `.fitrx`
+    /// bundle predates the field. A stall the restart *improved on* is reported
+    /// as the restart's own estimates, which left the start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stationary_start: bool,
     /// Whether the BSV Ω was estimated as a diagonal (`omega NAME ~ v`, one
     /// packed coordinate per η) or a full Cholesky block (`block_omega`, a
     /// lower triangle) — the packed layout of `covariance_matrix`, which the

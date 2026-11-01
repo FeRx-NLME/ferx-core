@@ -238,32 +238,32 @@ it does not move either. Displacement alone cannot tell that from a stall, and b
 [#2506](https://github.com/FeRx-NLME/ferx-core/issues/2506) such a refit came back at the same OFV with
 `W_STALLED_AT_INIT` and, on L-BFGS and BOBYQA alike, `converged = false`.
 
-When the NLopt outer loop ends without leaving its start, it now asks whether the start is
-**first-order optimal**: the BHHH Newton decrement there (the OFV a Newton step would still
-gain, the same quantity the stagnation guard reads) must be at most 0.1. A start that passes
-is a stationary start: the trace's plateau and the cold re-solve are checked as for any
-other plateaued stop, the fit is reported `converged = true`, no `stalled_at_init` warning
-is raised, and `Strictness::default()` passes it. `FitResult::stationary_start` records the
-verdict (`true`, `false`, or absent when the fit moved or the decrement cannot be formed).
+When the NLopt outer loop ends without leaving its start, it now asks the optimizer whether
+the start is an optimum: it **restarts from a perturbation of the start** (every free
+coordinate moved by 0.1 in the optimizer's scaled space, alternating in sign and turned
+around at a bound) on what is left of the fit's `maxiter` budget, and compares where that
+restart ends with the objective at the start.
 
-A cold start at model-file guesses that do not move still has a descent predicted from it,
-so it is still a stall: flagged, and rejected by the search gates. It is also reported
-`converged = false` even when the optimizer itself reported success (BOBYQA can meet its
-`xtol` at the start), so a bootstrap's "minimization terminated" filter drops it.
+- **It converges back**, to within 0.1 OFV (the threshold the stagnation guard uses to call a
+  fit finished): the start was an optimum. The trace's plateau and the cold re-solve are
+  checked as for any other plateaued stop, the fit is reported `converged = true` at the
+  start's estimates, no `stalled_at_init` warning is raised, and `Strictness::default()`
+  passes it. `FitResult::stationary_start` is `true`. Measured on warm refits of
+  `two_cpt_iv` (L-BFGS, BOBYQA, AGQ) and a two-class mixture, the restart ends within
+  `1e-6` OFV of the start.
+- **It finds a lower objective**, by more than 0.1: the start was a stall. The restart's
+  result is reported instead, as a continuation of the same fit, with a warning that says
+  so. A stop the optimizer reported as a success (BOBYQA can meet its `xtol` at the start)
+  is treated the same way.
+- **Anything else** (it did not converge, or converged higher, in another basin; no budget
+  was left): no verdict. The fit is judged by displacement as before, and its warning says
+  the start *may* have been an optimum rather than asserting it was not.
 
-The decrement is formed from the per-subject analytic gradients where the model has them.
-Under AGQ, for a mixture, and for a model outside the analytic outer scope it is
-finite-differenced from the objective the optimizer minimised instead (gradient and full
-Hessian, EBEs re-solved at every point: `1 + 2n + n(n−1)` objective evaluations, paid only
-by a fit that did not move). It never reads a descent as an optimum: a coordinate on its
-bound is kept out only when stepping inward raises the objective (a feasible descent leaves
-the start untested), every curvature direction counts with a floor (so a gradient along a
-flat direction is a large gain, not zero), and a saddle with a small gradient is left
-untested rather than called a minimum. Measured at converged optima it reads about `1e-7` there, and
-in the hundreds at the model-file inits of the same models. Above 24 free parameters the
-finite-difference form is not attempted; such a fit, and any estimator other than the
-NLopt outer loop, is judged by displacement as before, and its warning says the start
-*may* have been an optimum rather than asserting it was not.
+Because the question is answered by the optimizer itself, bounds, flat directions and
+saddles are handled the way every fit handles them, and the check covers any model and
+objective, AGQ and mixtures included. It costs one extra optimization from near the start,
+paid only by a fit that did not move. Estimators other than the NLopt outer loop do not run
+it.
 
 ### A THETA on the log-packing floor {#log-packing-floor}
 

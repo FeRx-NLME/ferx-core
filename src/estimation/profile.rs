@@ -2656,7 +2656,7 @@ pub(crate) fn optimize_profiled(
         cond_dist: None,
         packed_estimate: Some(x_hat),
         left_init: None,
-        stationary_start: None,
+        stationary_start: false,
         mixture_posteriors: None,
         vi: None,
     }
@@ -2835,7 +2835,7 @@ fn failed_result(
         cond_dist: None,
         packed_estimate: None,
         left_init: None,
-        stationary_start: None,
+        stationary_start: false,
         mixture_posteriors: None,
         vi: None,
     }

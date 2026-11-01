@@ -1411,7 +1411,7 @@ fn a_replicate_started_at_its_own_optimum_is_not_excluded() {
         Some(false),
         "fixture precondition: a replicate started at its own optimum does not move"
     );
-    assert_eq!(warm.stationary_start, Some(true));
+    assert!(warm.stationary_start, "{:?}", warm.warnings);
     assert!(
         (warm.ofv - base.ofv).abs() < 1e-3,
         "replicate {} vs base {}",

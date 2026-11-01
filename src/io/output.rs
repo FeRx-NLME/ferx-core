@@ -4002,7 +4002,7 @@ mod tests {
             packed_estimate: None,
             mixture_overrides: None,
             left_init: None,
-            stationary_start: None,
+            stationary_start: false,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
         }
@@ -5185,7 +5185,7 @@ mod tests {
             packed_estimate: None,
             mixture_overrides: None,
             left_init: None,
-            stationary_start: None,
+            stationary_start: false,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
         }

@@ -2009,7 +2009,7 @@ fn run_mcem(
         cond_dist: None,
         packed_estimate: None,
         left_init: None,
-        stationary_start: None,
+        stationary_start: false,
         mixture_posteriors: None,
         vi: None,
     })
@@ -2948,7 +2948,7 @@ fn run_mcem_mixture(
         cond_dist: None,
         packed_estimate: None,
         left_init: None,
-        stationary_start: None,
+        stationary_start: false,
         mixture_posteriors,
         vi: None,
     })

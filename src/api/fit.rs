@@ -2005,7 +2005,7 @@ fn fit_inner(
                         cond_dist: None,
                         packed_estimate: None,
                         left_init: None,
-                        stationary_start: None,
+                        stationary_start: false,
                         vi: None,
                         mixture_posteriors: None,
                     });
@@ -2100,7 +2100,7 @@ fn fit_inner(
                     cond_dist: None,
                     packed_estimate: None,
                     left_init: None,
-                    stationary_start: None,
+                    stationary_start: false,
                     mixture_posteriors: None,
                     vi: None,
                 });

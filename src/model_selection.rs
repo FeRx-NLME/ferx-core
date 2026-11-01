@@ -290,11 +290,11 @@ pub struct Strictness {
     ///
     /// A candidate warm-started from its parent's final estimates (or a refit
     /// of a stored winner) legitimately converges within the tolerance of where
-    /// it began. The NLopt outer loop tells that apart from a stall by testing
-    /// whether the start it did not leave is a stationary point
-    /// (`FitResult::stationary_start`, #2506), so such a fit passes this gate.
-    /// Results without that verdict — another estimator, an objective whose
-    /// Newton decrement cannot be formed (AGQ, mixture), an older `.fitrx`
+    /// it began. The NLopt outer loop tells that apart from a stall by restarting
+    /// from a perturbation of the start it did not leave and checking that it
+    /// converges back (`FitResult::stationary_start`, #2506), so such a fit
+    /// passes this gate. Results without that verification — another estimator,
+    /// a restart with no budget left or an inconclusive one, an older `.fitrx`
     /// bundle — are judged by displacement alone, which assumes a **cold
     /// start**; turn the gate off for a warm-started search over those and rely
     /// on `require_converged`.
@@ -568,8 +568,8 @@ pub const INIT_STALL_REL_TOL: f64 = 1e-2;
 /// optimizer verdict is `None` rather than a guess.
 ///
 /// A fit whose optimizer verdict says it did not move, but whose start it also
-/// found to be a stationary point (`FitResult::stationary_start == Some(true)`,
-/// #2506), is **not** stalled: that is a warm start at an optimum — a bootstrap
+/// verified to be an optimum (`FitResult::stationary_start`, #2506), is **not**
+/// stalled: that is a warm start at an optimum — a bootstrap
 /// sample or a refit from a previous fit's estimates — and its objective is the
 /// optimum's. Only the optimizer reading can tell the two apart; the
 /// natural-scale fallback below is relative to where the fit *started*, which
@@ -595,9 +595,9 @@ pub fn stalled_at_init(result: &FitResult) -> Option<bool> {
         return None;
     }
     if let Some(left) = result.left_init {
-        // A start the optimizer found already stationary is a warm start at an
-        // optimum, not a stall (#2506).
-        return Some(!left && result.stationary_start != Some(true));
+        // A start the optimizer verified to be an optimum is a warm start, not a
+        // stall (#2506).
+        return Some(!left && !result.stationary_start);
     }
     let moved = |x: f64, x0: f64| -> bool {
         let d = (x - x0).abs();
