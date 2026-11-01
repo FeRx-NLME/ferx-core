@@ -5212,8 +5212,15 @@ fn optimize_nlopt_attempt(
     // The EBE warm-start predictor (`NloptState::pred_jac`) where the adjoint forms the mode
     // response: FOCE/FOCEI on a BSV-only, non-mixture model the outer gradient serves. An IOV
     // subject's κ̂ is not predicted, and its seeded warm solve already starts near the mode.
+    //
+    // Not on a `[covariate_nn]` model, for the reason the inner seed is not used there
+    // (#1474): on a network of saturating units the path decides the optimum, and the
+    // predictor changes the path. Measured on `examples/warfarin_dcm.ferx` (Linux x86_64):
+    // from ±20% perturbed starts it reached the same optima as without it in fewer
+    // iterations, but from the shipped start it settled at OFV −164.5 against −1173.6.
     let warm_predictor = model.n_kappa == 0
         && init_params.mixture.is_none()
+        && !model.has_covariate_nn()
         && crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
         && !warm_predictor_off();
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
