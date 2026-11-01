@@ -3843,6 +3843,90 @@ fn nlopt_gradient_trace_emits_per_param_columns() {
     std::fs::remove_file(&path).ok();
 }
 
+/// The `method` column every row of an unprofiled fit's trace carries, under `method`,
+/// `n_agq` and `optimizer` (which picks the `write_foce` call site: SLSQP the NLopt one,
+/// built-in BFGS the other).
+fn traced_methods(
+    method: crate::types::EstimationMethod,
+    n_agq: usize,
+    optimizer: crate::types::Optimizer,
+) -> Vec<String> {
+    // A parsed model in the analytic scope: `focei, n_agq > 1` needs it (`fit` rejects it
+    // outside with `E_FOCEI_NAGQ_UNSUPPORTED`), and the hand-built `make_model` routes to
+    // FD, where that objective returns the sentinel and BFGS writes no row.
+    let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
+        "examples/warfarin.ferx",
+    ))
+    .expect("warfarin parses");
+    let mut population =
+        crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+    population.subjects.truncate(4);
+    let coord_names = crate::estimation::parameterization::coordinate_names(&model.default_params);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "ferx_trace_label_{method:?}_{n_agq}_{optimizer:?}_{}_{nanos}.csv",
+        std::process::id()
+    ));
+    let path_s = path.to_str().unwrap().to_string();
+    crate::estimation::trace::init(path_s, &coord_names).unwrap();
+    let opts = crate::types::FitOptions {
+        method,
+        n_agq,
+        interaction: crate::types::interaction_for(method, true),
+        optimizer,
+        outer_maxiter: 2,
+        run_covariance_step: false,
+        ..crate::types::FitOptions::default()
+    };
+    let _ = optimize_population(&model, &population, &model.default_params, &opts);
+    crate::estimation::trace::finish();
+    let contents = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    let mut lines = contents.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let col = header.iter().position(|c| *c == "method").unwrap();
+    lines
+        .map(|l| l.split(',').nth(col).unwrap().to_string())
+        .collect()
+}
+
+/// #2552: an unprofiled fit's trace names the objective it scores, at both `write_foce`
+/// sites. Both sites used to match only `FoceI`, so `laplace` was traced `foce` and
+/// `focei, n_agq = 3` (AGQ) `focei`. Each case asserts its own label on every row and
+/// that no row carries any other estimator's label, so a site writing the wrong name —
+/// or a helper collapsing two estimators onto one label — fails here.
+#[test]
+fn an_unprofiled_fit_traces_the_objective_it_scores() {
+    use crate::types::{EstimationMethod as M, Optimizer as O};
+    let labels = ["foce", "focei", "laplace", "agq"];
+    for optimizer in [O::Slsqp, O::Bfgs] {
+        for (method, n_agq, want) in [
+            (M::Foce, 1, "foce"),
+            (M::FoceI, 1, "focei"),
+            (M::Laplace, 1, "laplace"),
+            (M::FoceI, 3, "agq"),
+        ] {
+            let rows = traced_methods(method, n_agq, optimizer);
+            let case = format!("{method:?}, n_agq = {n_agq}, {optimizer:?}");
+            assert!(!rows.is_empty(), "{case}: no trace rows");
+            assert!(
+                rows.iter().all(|r| r == want),
+                "{case}: {rows:?}, want {want}"
+            );
+            for other in labels.iter().filter(|&&l| l != want) {
+                assert!(
+                    !rows.iter().any(|r| r == other),
+                    "{case}: a row is labelled {other}: {rows:?}"
+                );
+            }
+        }
+    }
+}
+
 // ── global pre-search (CRS2-LM) ──────────────────────────────────────────
 
 /// Exercises the `run_global_presearch` branch. CRS2-LM may be absent from

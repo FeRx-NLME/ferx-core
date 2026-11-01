@@ -2443,14 +2443,7 @@ pub(crate) fn optimize_profiled(
         });
         crate::estimation::trace::write_foce(
             n_evals.load(Ordering::Relaxed),
-            // The gate `fit_term` scores by: a Laplace fit is not traced as `focei` (#2107).
-            if options.agq_nodes().is_some() {
-                "laplace"
-            } else if options.interaction {
-                "focei"
-            } else {
-                "foce"
-            },
+            crate::estimation::trace::method_label(options),
             solve.ofv,
             grad_norm,
             None,

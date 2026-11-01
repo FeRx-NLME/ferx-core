@@ -6072,10 +6072,7 @@ fn optimize_nlopt_attempt(
         // Optimizer trace (step_norm in scaled space)
         if crate::estimation::trace::is_active() {
             let step_norm = if step > 0.0 { Some(step) } else { None };
-            let method_str = match options.method {
-                EstimationMethod::FoceI => "focei",
-                _ => "foce",
-            };
+            let method_str = crate::estimation::trace::method_label(options);
             let optimizer_str = match algo {
                 nlopt::Algorithm::Bobyqa => "bobyqa",
                 nlopt::Algorithm::Mma => "mma",
@@ -7601,10 +7598,7 @@ fn optimize_bfgs(
                 .map(|i| (xs[i] - xs_old[i]).powi(2))
                 .sum::<f64>()
                 .sqrt();
-            let method_str = match options.method {
-                EstimationMethod::FoceI => "focei",
-                _ => "foce",
-            };
+            let method_str = crate::estimation::trace::method_label(options);
             let optimizer_str = match options.optimizer {
                 Optimizer::Lbfgs => "lbfgs",
                 _ => "bfgs",
