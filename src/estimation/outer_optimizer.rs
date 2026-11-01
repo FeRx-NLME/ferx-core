@@ -1559,7 +1559,8 @@ fn run_inner_loop_and_nll_prepared(
     // the predictor does not serve AGQ.
     fallback_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
-    agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds)>,
+    // The fused AGQ gradient's inputs, and whether it forms the mode response (#2549).
+    agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds, bool)>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
     // `prev_etas` are converged modes at `params` ([`InnerSolvePolicy::init_is_mode`]):
     // only the first evaluation seeded from the flat-theta pre-flight passes `true` (#2076).
@@ -1591,37 +1592,59 @@ fn run_inner_loop_and_nll_prepared(
             |_: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
                 (ebe.terminal_hessian.clone(), ebe.nll)
             };
-        let (etas, h_matrices, stats, kappas, terminal_work) = match schedules {
-            Some(cache) => crate::estimation::inner_optimizer::run_inner_loop_warm_map_cached(
-                model,
-                population,
-                params,
-                options.inner_maxiter,
-                options.inner_tol,
-                prev_etas,
-                mu_k,
-                options.min_obs_for_convergence_check as usize,
-                options.inner_restarts,
-                cache,
-                policy,
-                cancel,
-                take_terminal_work,
-            ),
-            None => crate::estimation::inner_optimizer::run_inner_loop_warm_map(
-                model,
-                population,
-                params,
-                options.inner_maxiter,
-                options.inner_tol,
-                prev_etas,
-                mu_k,
-                options.min_obs_for_convergence_check as usize,
-                options.inner_restarts,
-                policy,
-                cancel,
-                take_terminal_work,
-            ),
-        };
+        let (etas, h_matrices, stats, kappas, terminal_work) =
+            match (schedules, prev_etas.zip(fallback_etas)) {
+                // Predicted starts, each with its mode to fall back to (#2549).
+                (_, Some((start, fallback))) => {
+                    crate::estimation::inner_optimizer::run_inner_loop_predicted_map_cached(
+                        model,
+                        population,
+                        params,
+                        options.inner_maxiter,
+                        options.inner_tol,
+                        start,
+                        fallback,
+                        mu_k,
+                        options.min_obs_for_convergence_check as usize,
+                        options.inner_restarts,
+                        schedules,
+                        policy,
+                        cancel,
+                        take_terminal_work,
+                    )
+                }
+                (Some(cache), None) => {
+                    crate::estimation::inner_optimizer::run_inner_loop_warm_map_cached(
+                        model,
+                        population,
+                        params,
+                        options.inner_maxiter,
+                        options.inner_tol,
+                        prev_etas,
+                        mu_k,
+                        options.min_obs_for_convergence_check as usize,
+                        options.inner_restarts,
+                        cache,
+                        policy,
+                        cancel,
+                        take_terminal_work,
+                    )
+                }
+                (None, None) => crate::estimation::inner_optimizer::run_inner_loop_warm_map(
+                    model,
+                    population,
+                    params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    prev_etas,
+                    mu_k,
+                    options.min_obs_for_convergence_check as usize,
+                    options.inner_restarts,
+                    policy,
+                    cancel,
+                    take_terminal_work,
+                ),
+            };
         // A cancel observed during the pass left placeholders, not modes: do not run
         // the quadrature on them (#574).
         if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled) {
@@ -1636,36 +1659,39 @@ fn run_inner_loop_and_nll_prepared(
             );
         }
         let n_nodes = options.agq_nodes().expect("AGQ branch");
-        let evaluation = agq_gradient_inputs.map(|(template, x, bounds)| match schedules {
-            Some(cache) => crate::estimation::agq::agq_population_evaluate_with_schedules(
-                model,
-                population,
-                params,
-                template,
-                x,
-                &etas,
-                &kappas,
-                bounds,
-                options,
-                n_nodes,
-                options.hessian_anchor(),
-                cache,
-                &terminal_work,
-            ),
-            None => crate::estimation::agq::agq_population_evaluate(
-                model,
-                population,
-                params,
-                template,
-                x,
-                &etas,
-                &kappas,
-                bounds,
-                options,
-                n_nodes,
-                options.hessian_anchor(),
-            ),
-        });
+        let evaluation =
+            agq_gradient_inputs.map(|(template, x, bounds, want_eta_dx)| match schedules {
+                Some(cache) => crate::estimation::agq::agq_population_evaluate_with_schedules(
+                    model,
+                    population,
+                    params,
+                    template,
+                    x,
+                    &etas,
+                    &kappas,
+                    bounds,
+                    options,
+                    n_nodes,
+                    options.hessian_anchor(),
+                    cache,
+                    &terminal_work,
+                    want_eta_dx,
+                ),
+                None => crate::estimation::agq::agq_population_evaluate(
+                    model,
+                    population,
+                    params,
+                    template,
+                    x,
+                    &etas,
+                    &kappas,
+                    bounds,
+                    options,
+                    n_nodes,
+                    options.hessian_anchor(),
+                    want_eta_dx,
+                ),
+            });
         let nll = evaluation.as_ref().map_or_else(
             || {
                 crate::estimation::agq::agq_population_nll_prepared(
@@ -5693,7 +5719,12 @@ fn optimize_nlopt_attempt(
                     Some(predicted.as_ref().unwrap_or(&state.cached_etas)),
                     predicted.is_some().then_some(state.cached_etas.as_slice()),
                     Some(&mu_k),
-                    fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
+                    fuse_agq_gradient.then_some((
+                        init_params,
+                        x.as_slice(),
+                        &bounds,
+                        warm_predictor,
+                    )),
                     Some(&schedule_cache),
                     std::mem::take(&mut state.cached_etas_are_modes),
                     options.cancel.as_ref(),
@@ -9721,6 +9752,7 @@ fn population_gradient_with_agq_evaluation(
             reconverge,
             agq_evaluation,
             Some(declines),
+            eta_dx,
         ) {
             return g;
         }

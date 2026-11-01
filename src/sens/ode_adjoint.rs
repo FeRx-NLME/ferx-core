@@ -397,6 +397,19 @@ pub(crate) fn subject_adjoint_gradient_with_eta_dx_at(
     } else {
         Objective::Foce
     };
+    subject_adjoint_gradient_and_eta_dx_at(model, subject, pt, eta_hat, objective)
+}
+
+/// [`subject_adjoint_gradient_with_eta_dx_at`] for any objective the adjoint serves: under
+/// Laplace/AGQ (`Objective::Agq`) the response of the conditional mode the quadrature is
+/// centred on, from the exact inner Hessian, out of the quadrature gradient's own tape.
+pub(crate) fn subject_adjoint_gradient_and_eta_dx_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+) -> (Option<Vec<f64>>, Option<Vec<DVector<f64>>>) {
     let mut dx = None;
     let g = adjoint_gradient(model, subject, pt, eta_hat, objective, false, Some(&mut dx));
     let dx = if g.is_some() { dx } else { None };
@@ -866,7 +879,7 @@ fn adjoint_gradient(
     where
         Bucket<N, M>: ExactAnchor<N, M>,
     {
-        match objective {
+        let go_run = |eta_dx: Option<&mut Option<Vec<DVector<f64>>>>| match objective {
             Objective::Agq { n_agq, exact } => run_agq::<N, M>(
                 sc.model,
                 subject,
@@ -879,40 +892,36 @@ fn adjoint_gradient(
                 exact,
                 sc.width,
                 held,
+                eta_dx,
             ),
-            _ => {
-                let go_run = |eta_dx: Option<&mut Option<Vec<DVector<f64>>>>| {
-                    run::<N, M>(
-                        sc.model,
-                        sc.pop_model,
-                        subject,
-                        sc.layout.as_ref(),
-                        template,
-                        sc.params,
-                        x,
-                        &sc.eta,
-                        objective != Objective::Foce,
-                        sc.width,
-                        eta_dx,
-                    )
-                };
-                match eta_dx {
-                    None => go_run(None),
-                    // The mode response shares the gradient's sweeps, and a lane that fails
-                    // there (a non-finite row adjoint, say from a near-singular `H`) fails
-                    // the whole pass. The gradient must not depend on whether the response
-                    // was asked for, so a failed fused pass is re-run as the gradient alone,
-                    // whose lane 0 is the same arithmetic, and reports no response
-                    // (#2549 review r2 #2).
-                    Some(o) => match go_run(Some(&mut *o)) {
-                        Some(g) => Some(g),
-                        None => {
-                            *o = None;
-                            go_run(None)
-                        }
-                    },
+            _ => run::<N, M>(
+                sc.model,
+                sc.pop_model,
+                subject,
+                sc.layout.as_ref(),
+                template,
+                sc.params,
+                x,
+                &sc.eta,
+                objective != Objective::Foce,
+                sc.width,
+                eta_dx,
+            ),
+        };
+        match eta_dx {
+            None => go_run(None),
+            // The mode response shares the gradient's sweeps, and a lane that fails there (a
+            // non-finite row adjoint, say from a near-singular `H`) fails the whole pass. The
+            // gradient must not depend on whether the response was asked for, so a failed
+            // fused pass is re-run as the gradient alone, whose Ψ is the same arithmetic, and
+            // reports no response (#2549 review r2 #2).
+            Some(o) => match go_run(Some(&mut *o)) {
+                Some(g) => Some(g),
+                None => {
+                    *o = None;
+                    go_run(None)
                 }
-            }
+            },
         }
     }
     by_bucket!(
@@ -4660,6 +4669,7 @@ fn run_agq<const N: usize, const M: usize>(
     exact: bool,
     active: usize,
     held: bool,
+    eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
 ) -> Option<Vec<f64>>
 where
     Bucket<N, M>: ExactAnchor<N, M>,
@@ -4798,6 +4808,7 @@ where
             active,
             held,
             ng.as_ref(),
+            eta_dx,
         )
     } else {
         agq_taped::<N, M, M, false>(
@@ -4818,6 +4829,7 @@ where
             active,
             held,
             ng.as_ref(),
+            eta_dx,
         )
     }
 }
@@ -4883,6 +4895,7 @@ trait ExactAnchor<const N: usize, const M: usize> {
         active: usize,
         held: bool,
         ng: Option<&AgqNg>,
+        eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
     ) -> Option<Vec<f64>>;
 }
 
@@ -4906,10 +4919,11 @@ macro_rules! exact_anchor_buckets {
                 active: usize,
                 held: bool,
                 ng: Option<&AgqNg>,
+                eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
             ) -> Option<Vec<f64>> {
                 agq_taped::<$n, $m, $n, true>(
                     model, subject, lay, template, params, x, eta, ctx, so, pv, p1, grid,
-                    h_inner, true, active, held, ng,
+                    h_inner, true, active, held, ng, eta_dx,
                 )
             }
         })*
@@ -4931,6 +4945,7 @@ macro_rules! exact_anchor_buckets {
                 _: usize,
                 _: bool,
                 _: Option<&AgqNg>,
+                _: Option<&mut Option<Vec<DVector<f64>>>>,
             ) -> Option<Vec<f64>> {
                 None
             }
@@ -4965,6 +4980,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     active: usize,
     held: bool,
     ng: Option<&AgqNg>,
+    eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
     let n_obs = subject.observations.len();
@@ -5223,6 +5239,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let b = DVector::from_column_slice(&grad_eta);
     // `frozen = None` on both sides: AGQ's `l` is the conditional one (`lg` above), so the
     // gate judges the objective the identity differentiates.
+    let mut at_mode = true;
     let w = match mode_solve(&h_inner, &b, &grad_l, || {
         let mut g = inner_search_gradient::<N>(model, subject, lay, theta, eta, ctx, pv, None)?;
         if let Some(ng) = ng {
@@ -5233,7 +5250,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         Some(g)
     }) {
         Some(w) => w,
-        None if held => DVector::zeros(N),
+        None if held => {
+            at_mode = false;
+            DVector::zeros(N)
+        }
         None => return None,
     };
 
@@ -5243,6 +5263,27 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let s2 = rsweep::<1>(&[psi]).to_vec();
     let (_, mut theta_adj) = sweep(&s2, true)?;
     let psi_of = |x: R| -> f64 { ra(&s2, x) };
+    // ---- the mode response's sweeps, as [`run`] forms it for FOCE(I) (#2549) -----------
+    // The quadrature is centred on the conditional mode `η̂ = argmin l`, whatever the
+    // anchor, so its response is `dη̂/dx = −H⁻¹ ∂(∇_η l)/∂x` with `H = ∇²_η l` the exact
+    // inner Hessian (`h_inner`; the FOCEI anchor's `H̃` places the nodes, it is not the
+    // mode's derivative). Rows `y_r = Σ_k Z_rk (∇_η l)_k`, `Z` the BSV rows of `H⁻¹` held
+    // constant, so `dη̂_r/dx = −∂y_r/∂x`: swept together over the scalar tape, then each
+    // back through the recording at `η̂`, as Ψ is — here, before the non-Gaussian term's θ
+    // block below records over the scalar tape. Not at a declined mode (`held`), where
+    // there is no identity to differentiate.
+    let response = match &eta_dx {
+        Some(_) if at_mode => {
+            let rows = eta_dx_outputs::<N>(&h_inner, &lg, active.min(N), n_bsv.min(active).min(N));
+            let adjs = sweep_lanes_split(&rows);
+            let mut tas = Vec::with_capacity(rows.len());
+            for adj in &adjs {
+                tas.push(sweep(adj, true)?.1);
+            }
+            Some((adjs, tas))
+        }
+        _ => None,
+    };
     // The term's θ-derivatives: at η̂ through `(q, ∇q, ∇²q)`, at each node through its value.
     if let (Some(ngr), Some(_)) = (ng_r.as_ref(), ng) {
         let (a_q, a_g, a_h) = ng_adjoints(ngr, n_bsv, psi_of);
@@ -5268,7 +5309,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         }
         add(ng_theta_adjoint(model, subject, theta, &parts)?);
     }
-    Some(packed_gradient(
+    let out = packed_gradient(
         model,
         template,
         params,
@@ -5279,7 +5320,60 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         &om,
         so,
         pv,
-    ))
+    );
+    // The response's non-Gaussian θ block and its packing, from the adjoints taken above.
+    if let Some(o) = eta_dx {
+        *o = None;
+        if let Some((adjs, mut tas)) = response.filter(|(a, _)| !a.is_empty()) {
+            let n_rows = adjs.len();
+            if let Some(ngr) = ng_r.as_ref() {
+                let seeds: Vec<_> = adjs
+                    .iter()
+                    .map(|adj| ng_adjoints(ngr, n_bsv, |v| ra(adj, v)))
+                    .collect();
+                let d = ng_theta_adjoint_seeds(model, subject, theta, &eta[..n_bsv], &seeds)?;
+                for (ta, d) in tas.iter_mut().zip(d) {
+                    for (t, dv) in ta.iter_mut().zip(d) {
+                        *t += dv;
+                    }
+                }
+            }
+            let mut cols = vec![DVector::<f64>::zeros(n_rows); x.len()];
+            for (r, (adj, ta)) in adjs.iter().zip(&tas).enumerate() {
+                let of = |v: R| ra(adj, v);
+                let row =
+                    packed_gradient(model, template, params, x.len(), ta, &of, &pr, &om, so, pv);
+                for (c, v) in cols.iter_mut().zip(row) {
+                    c[r] = -v;
+                }
+            }
+            let ok = cols.iter().all(|c| c.iter().all(|v| v.is_finite()));
+            *o = ok.then_some(cols);
+        }
+    }
+    Some(out)
+}
+
+/// Each of `outs`' full adjoint vectors over the scalar tape, from lane-batched sweeps
+/// ([`DX_LANES`] outputs per walk of the tape).
+fn sweep_lanes_split(outs: &[R]) -> Vec<Vec<f64>> {
+    fn split<const L: usize>(y: &[R], out: &mut Vec<Vec<f64>>) {
+        let o: [R; L] = std::array::from_fn(|i| y.get(i).copied().unwrap_or(R::c(0.0)));
+        let buf = rsweep::<L>(&o);
+        let n = buf.len() / L;
+        for l in 0..y.len().min(L) {
+            out.push((0..n).map(|i| buf[i * L + l]).collect());
+        }
+    }
+    let mut out = Vec::with_capacity(outs.len());
+    for chunk in outs.chunks(DX_LANES) {
+        match chunk.len() {
+            1 => split::<1>(chunk, &mut out),
+            2 => split::<2>(chunk, &mut out),
+            _ => split::<DX_LANES>(chunk, &mut out),
+        }
+    }
+    out
 }
 
 #[path = "ode_adjoint_hessian.rs"]

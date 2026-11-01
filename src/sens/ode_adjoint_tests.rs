@@ -2915,6 +2915,7 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         false,
         None,
         Some(&log),
+        None,
     )
     .expect("population gradient");
     for (k, (&gk, &hk)) in g.iter().zip(&held).enumerate() {
@@ -7205,4 +7206,119 @@ fn a_failed_mode_response_keeps_the_gradient() {
         assert!(a.is_finite(), "the gradient is finite");
         assert_eq!(a.to_bits(), b.to_bits(), "the gradient moved");
     }
+}
+
+/// Laplace/AGQ's mode response (#2549) is the FOCEI one: the quadrature is centred on the
+/// conditional mode `η̂ = argmin l`, the same inner problem FOCEI solves, so
+/// `dη̂/dx = −(∇²_η l)⁻¹ ∂(∇_η l)/∂x` with the exact inner Hessian under either anchor (the
+/// FOCEI anchor's `H̃` places the nodes; it is not the mode's derivative). The two come from
+/// different recordings — FOCEI's `run` and the quadrature's `agq_taped` — so their
+/// agreement checks each against the other; FOCEI's is pinned to the standalone response
+/// (`the_fused_mode_response_is_the_standalone_one`). Asking for the response leaves the
+/// quadrature gradient bit for bit.
+#[test]
+fn the_quadrature_mode_response_is_the_focei_one() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let three = parse_model_string(&one_cpt_oral_n_eta(3)).unwrap();
+    let s3 = subject(
+        &three,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    #[allow(unused_mut)]
+    let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("three".into(), three, s3)];
+    #[cfg(feature = "survival")]
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        (
+            "examples/tte_competing_risks.ferx",
+            "data/tte_competing_risks.csv",
+        ),
+    ] {
+        let prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap()
+            .clone();
+        cases.push((m.into(), prep.parsed.model, s));
+    }
+    let _ = root;
+    let mut worst = 0.0f64;
+    let mut live = 0.0f64;
+    let mut n_checked = 0;
+    for (name, model, s) in &cases {
+        assert!(
+            model.n_eta > 0,
+            "{name}: a model with random effects has a mode to respond"
+        );
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        let eta = ebe_for(model, s, &params, 1e-12, true);
+        for (n_agq, exact) in [(1, true), (3, true), (1, false), (3, false)] {
+            let objective = Objective::Agq { n_agq, exact };
+            let (focei, (plain, (fused, dx))) = std::thread::scope(|sc| {
+                std::thread::Builder::new()
+                    .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                    .spawn_scoped(sc, || {
+                        let pt = PackedPoint::new(&params, &x).unwrap();
+                        let focei = subject_adjoint_gradient_with_eta_dx_at(
+                            model,
+                            s,
+                            &pt,
+                            eta.as_slice(),
+                            true,
+                        )
+                        .1;
+                        let plain =
+                            subject_adjoint_gradient_at(model, s, &pt, eta.as_slice(), objective);
+                        let fused = subject_adjoint_gradient_and_eta_dx_at(
+                            model,
+                            s,
+                            &pt,
+                            eta.as_slice(),
+                            objective,
+                        );
+                        (focei, (plain, fused))
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            });
+            let label = format!("{name} n_agq={n_agq} exact={exact}");
+            let (plain, fused) = (
+                plain.unwrap_or_else(|| panic!("{label}: no gradient")),
+                fused.unwrap_or_else(|| panic!("{label}: no fused gradient")),
+            );
+            for (a, b) in plain.iter().zip(&fused) {
+                assert_eq!(a.to_bits(), b.to_bits(), "{label}: the gradient moved");
+            }
+            let want = focei.unwrap_or_else(|| panic!("{label}: no FOCEI response"));
+            let got = dx.unwrap_or_else(|| panic!("{label}: no quadrature response"));
+            assert_eq!(got.len(), want.len(), "{label}");
+            for (gk, wk) in got.iter().zip(&want) {
+                assert_eq!(gk.len(), wk.len(), "{label}");
+                for (a, b) in gk.iter().zip(wk.iter()) {
+                    assert!(a.is_finite() && b.is_finite(), "{label}: {a} vs {b}");
+                    worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+                    live = live.max(b.abs());
+                }
+            }
+            n_checked += 1;
+            eprintln!("{label}: quadrature vs FOCEI mode response {worst:.2e}");
+        }
+    }
+    assert!(n_checked >= 4, "every anchor and node count was checked");
+    assert!(live > 1e-2, "the mode does not move: the test sees nothing");
+    assert!(
+        worst < 1e-10,
+        "quadrature vs FOCEI mode response {worst:.2e}"
+    );
 }

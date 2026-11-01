@@ -640,7 +640,7 @@ fn a_cancelled_inner_pass_scores_no_objective() {
             agq,
             "fixture: one arm per branch"
         );
-        let gradient_inputs = agq.then_some((params, x.as_slice(), &bounds));
+        let gradient_inputs = agq.then_some((params, x.as_slice(), &bounds, false));
         let run = |cancel| {
             run_inner_loop_and_nll_prepared(
                 &model,
