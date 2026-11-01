@@ -1,5 +1,5 @@
 //! Integration tests for the **evaluation-only** IMP stage (`imp_eval_only = true`,
-//! NONMEM `IMP EONLY=1`): `[fit_options] methods = [..., imp]` with the evaluator
+//! NONMEM `IMP EONLY=1`): `[fit_options] method = [..., imp]` with the evaluator
 //! flag set.
 //!
 //! Covers validation (an eval-only Imp must be terminal; not duplicated) and the
@@ -41,7 +41,7 @@ fn imp_only_chain_runs_standalone() {
     let (model, population, mut opts) = warfarin_setup();
     opts.methods = vec![EstimationMethod::Imp];
     let result = fit(&model, &population, &model.default_params, &opts)
-        .expect("methods = [imp] (standalone) must produce a fit");
+        .expect("method = [imp] (standalone) must produce a fit");
     let imp = result
         .importance_sampling
         .as_ref()
@@ -61,7 +61,7 @@ fn imp_before_estimator_is_rejected() {
     opts.methods = vec![EstimationMethod::Imp, EstimationMethod::FoceI];
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
-        .expect("methods = [imp, focei] must be rejected")
+        .expect("method = [imp, focei] must be rejected")
         .to_string();
     assert!(
         err.contains("final stage"),

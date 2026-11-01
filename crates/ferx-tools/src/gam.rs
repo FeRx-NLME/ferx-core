@@ -1030,21 +1030,16 @@ mod tests {
         }
     }
 
+    /// `tempfile` picks a fresh random name per call and removes the directory
+    /// when the guard drops, panic included. A `(pid, nanos)` name collided
+    /// between this binary's parallel tests whenever two landed in one clock
+    /// tick (macOS `SystemTime` resolves to µs), failing with `AlreadyExists`
+    /// (#1322).
     fn write_to_temp(result: &GamResult) -> String {
-        let dir = std::env::temp_dir().join(format!(
-            "ferx-gam-csv-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir(&dir).expect("temp dir");
-        let path = dir.join("out.csv");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("out.csv");
         write_gam_csv(result, path.to_str().unwrap()).expect("write csv");
-        let text = std::fs::read_to_string(&path).expect("read csv");
-        let _ = std::fs::remove_dir_all(&dir);
-        text
+        std::fs::read_to_string(&path).expect("read csv")
     }
 
     #[test]

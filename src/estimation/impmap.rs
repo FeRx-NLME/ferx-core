@@ -159,6 +159,18 @@ enum ProposalRecenter {
     SampleMoments,
 }
 
+impl ProposalRecenter {
+    /// The estimation method this recentering strategy implements, so the shared
+    /// MCEM core can ask `EstimationMethod::requires_random_effects` about the
+    /// method actually running rather than restating the membership rule (#1050).
+    fn method(self) -> EstimationMethod {
+        match self {
+            ProposalRecenter::Map => EstimationMethod::Impmap,
+            ProposalRecenter::SampleMoments => EstimationMethod::Imp,
+        }
+    }
+}
+
 /// Convert a weighted posterior covariance `Cov` into the proposal precision
 /// `Σ⁻¹ = Cov⁻¹` that [`subject_is_draws`]/`build_proposal` expects (it forms the
 /// proposal scale as `(Σ⁻¹ + λI)⁻¹`). Used only by the IMP (`SampleMoments`)
@@ -750,7 +762,7 @@ fn run_mcem(
             auto,
         );
     }
-    if n_eta == 0 {
+    if recenter.method().requires_random_effects() && n_eta == 0 {
         return Err(format!(
             "{label} requires at least one random effect (n_eta = 0). \
              Use FOCE/FOCEI for fixed-effects-only models."
@@ -897,6 +909,9 @@ fn run_mcem(
     let cov_group_conflicts = mu_ref_pairs_for_cov_groups(&mu_ref_split);
     let MuRefPairs {
         eligible: mu_ref_pairs,
+        // SAEM-only (#2540): this M-step steps the packed θ, which is not an
+        // additive anchor's mu when the θ is log-packed.
+        additive: _,
         identity_packed_log,
         log_packed_logit,
         shared_theta,
@@ -1999,6 +2014,7 @@ fn run_mcem(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     })
 }
 
@@ -2060,7 +2076,7 @@ fn run_mcem_mixture(
         .ok_or_else(|| format!("{label} mixture requires params.mixture (per-class Ω/Σ)"))?;
 
     // ---- Validation (mixture scope) ----
-    if n_eta == 0 {
+    if recenter.method().requires_random_effects() && n_eta == 0 {
         return Err(format!(
             "{label} requires at least one random effect (n_eta = 0)."
         ));
@@ -2937,6 +2953,7 @@ fn run_mcem_mixture(
         left_init: None,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
     })
 }
 
@@ -3182,6 +3199,21 @@ fn theta_sigma_weighted_mstep_mixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The MCEM core's run-time n_eta = 0 guard asks `requires_random_effects`
+    /// of `recenter.method()` (#1050), so each strategy must name the method it
+    /// implements — and both must be members, or that guard silently disappears.
+    #[test]
+    fn proposal_recenter_names_its_method_and_both_require_random_effects() {
+        assert_eq!(ProposalRecenter::Map.method(), EstimationMethod::Impmap);
+        assert_eq!(
+            ProposalRecenter::SampleMoments.method(),
+            EstimationMethod::Imp
+        );
+        for r in [ProposalRecenter::Map, ProposalRecenter::SampleMoments] {
+            assert!(r.method().requires_random_effects());
+        }
+    }
 
     // ── #996 end-to-end helpers: a tiny 2-class mixture dataset ──────────
     //

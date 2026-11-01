@@ -1,0 +1,33 @@
+# #2540 control for saem_additive_mu.ferx: the same model with E0 folded into
+# BASE, so TVE0 is summed with another term and is not mu-referenced. SAEM then
+# moves it only through the eta-frozen numerical M-step, and lands several OFV
+# units above the MLE, as NONMEM SAEM without MU_ does (saem_additive_mu_nomu.ctl).
+
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  theta EMAX(13.4506) FIX
+  theta ED50(31.4307) FIX
+  theta ET50(3.526) FIX
+
+  omega ETA_E0 ~ 4.0 (sd)
+
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[covariates]
+  DOSE   continuous
+  SE     continuous
+  PLAFIX continuous
+
+[individual_parameters]
+  BASE = TVE0 + PLAFIX + ETA_E0
+
+[structural_model]
+  DRUG = EMAX * DOSE / (ED50 + DOSE) * TIME / (TIME + ET50)
+  y    = BASE - DRUG
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = SE
+
+[fit_options]
+  method     = saem
+  covariance = false

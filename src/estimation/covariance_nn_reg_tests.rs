@@ -486,3 +486,87 @@ fn the_penalty_notes_are_covariance_step_warnings_and_are_replaced() {
         again.warnings
     );
 }
+
+/// #2541 review r1 §4: the stationarity gradient carries the NN penalty exactly when the
+/// estimator minimised it, so `g` and `H` are always the same objective's.
+///
+/// Two halves. Directly on `cov_objective_gradient`: the gradient with the regularizer minus
+/// the one without is the penalty's own packed gradient, and the one without at λ = 5 is the
+/// λ = 0 gradient to the bit. Through the step: VI (which applies `nn_l2`) at λ = 5 (the
+/// L2 test's λ_a above, where `R` is positive definite; at 0.5 it is still indefinite)
+/// prints the decrement recomputed here from the *penalized* gradient and the returned `R⁻¹`,
+/// and not the one from the unpenalized gradient — so dropping the step's regularizer at the
+/// call site reddens it. SAEM never reaches the gradient on this fixture: without
+/// the penalty its `R` is indefinite here (the module doc) and the #1781 fallback takes it.
+#[test]
+fn the_stationarity_gradient_carries_the_penalty_exactly_when_the_estimator_applied_it() {
+    use crate::estimation::cov_diagnostics::NON_STATIONARY_TOKEN;
+    use crate::estimation::outer_optimizer::cov_objective_gradient;
+    let fx = fixture();
+    let (model, params, population) = &fx;
+    let x = pack_params(params);
+    let bounds = pack_with_bounds(params).bounds;
+    let o0 = options(0.0, 0.0, true, CovarianceMethod::Hessian);
+    let o1 = options(5.0, 0.0, true, CovarianceMethod::Hessian);
+    let zeros = vec![DVector::zeros(model.n_eta); population.subjects.len()];
+    let (_, etas, h, kappas) =
+        reconverge_population(&x, model, population, params, &zeros, &o1, 1e-10, true);
+    let reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, &o1);
+    assert!(reg.is_active());
+    let grad = |o: &FitOptions, reg| {
+        cov_objective_gradient(
+            &x, params, model, population, &etas, &h, &kappas, &bounds, o, reg,
+        )
+    };
+    let unpenalized = grad(&o1, None);
+    assert_eq!(
+        unpenalized,
+        grad(&o0, None),
+        "λ must not reach an unpenalized g"
+    );
+    let penalized = grad(&o1, Some(&reg));
+    let mut penalty = vec![0.0; x.len()];
+    reg.add_packed_gradient(&params.theta, &mut penalty);
+    assert!(
+        penalty.iter().map(|v| v.abs()).fold(0.0, f64::max) > 1e-3,
+        "fixture: the penalty gradient must be live: {penalty:?}"
+    );
+    for k in 0..x.len() {
+        let gap = penalized[k] - unpenalized[k] - penalty[k];
+        assert!(
+            gap.abs() <= 1e-9 * (1.0 + penalty[k].abs()),
+            "coordinate {k}: penalized − unpenalized − penalty = {gap:e}"
+        );
+    }
+
+    // Through the step, under VI.
+    let (cov, warnings) = step(EstimationMethod::Vi, &fx, &o1);
+    let w: Vec<&String> = warnings
+        .iter()
+        .filter(|w| w.starts_with(NON_STATIONARY_TOKEN))
+        .collect();
+    assert_eq!(w.len(), 1, "the fixture is not an optimum: {warnings:?}");
+    assert!(!w[0].contains("eigenvalue floor"), "R kept: {}", w[0]);
+    let printed: f64 = w[0]
+        .split("by an estimated ")
+        .nth(1)
+        .and_then(|t| t.split(" OFV units").next())
+        .and_then(|t| t.parse().ok())
+        .expect("the decrement clause");
+    let free = free_idx(params);
+    let h_inv = DMatrix::from_fn(free.len(), free.len(), |a, b| cov[(free[a], free[b])] / 2.0);
+    let decrement = |g: &[f64]| {
+        let gf = DVector::from_iterator(free.len(), free.iter().map(|&i| g[i]));
+        0.5 * gf.dot(&(&h_inv * &gf))
+    };
+    let (right, wrong) = (decrement(&penalized), decrement(&unpenalized));
+    eprintln!("VI decrement: printed {printed}, penalized g {right}, unpenalized g {wrong}");
+    assert!(
+        (printed - right).abs() <= 1e-3 * right.max(1.0),
+        "printed {printed} vs the penalized gradient's {right}"
+    );
+    assert!(
+        (printed - wrong).abs() > 1e-2 * wrong.max(1.0),
+        "fixture: the two flags must print different decrements ({right} vs {wrong})"
+    );
+}

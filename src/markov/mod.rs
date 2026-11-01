@@ -70,7 +70,7 @@ use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 /// rate×time), so it is treated as the degenerate case and repels the optimizer.
 /// The bound sits far below the overflow point (`1e18^10 = 1e180 ≪ f64::MAX`) and
 /// far above any legitimate argument.
-const MAX_EXP_ARG_ABS: f64 = 1e18;
+pub(crate) const MAX_EXP_ARG_ABS: f64 = 1e18;
 
 /// A single continuous-time Markov state observation: the process was seen in
 /// integer `state` at `time`. The CTMM likelihood consumes *consecutive* pairs
@@ -417,7 +417,7 @@ pub(crate) fn has_negative_offdiagonal_g<T: crate::sens::num::PkNum>(q: &[T], s:
 /// pins the identity against the direct per-direction form.
 ///
 /// `dq[a]` must be a valid generator *direction* (zero row sums). The caller gets that for
-/// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_duals`.
+/// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_g`.
 ///
 /// Returns `Ok(None)` where [`ctmm_data_term`] returns `SUBJECT_SENTINEL_NLL`: at a degenerate
 /// generator the value is a flat repellent constant with no meaningful derivative, so the

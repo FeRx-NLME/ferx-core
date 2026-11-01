@@ -4291,7 +4291,7 @@ mod absorption {
     use super::*;
     use crate::api::bind_theta_levels_from_fit;
     use crate::parser::model_parser::{LevelBindings, LevelContrast};
-    use nalgebra::DMatrix;
+    use nalgebra::{DMatrix, DVector};
 
     /// Rank threshold on singular values normalised by `‖Z‖_F`; the gap it
     /// sits in is measured and asserted by `binder_agrees_with_the_jacobian_oracle`.
@@ -9996,6 +9996,433 @@ mod absorption {
         assert!(wrong.is_empty(), "not refused:\n{}", wrong.join("\n"));
     }
 
+    /// #1878. F3 with `ETA_X` read nowhere but the square:
+    /// `E0 = S + (ETA_E0 - ETA_X)² · OCC`. Each random effect alone moves `y`
+    /// with `OCC` inside the subject, outside the one level's column; but
+    /// shifting both by `c` leaves the square unchanged, and the level absorbs
+    /// the `c` left over. The joint oracle at the moved point absorbs both, and
+    /// the binder refuses under every contrast and auto, naming `ETA_E0` with
+    /// its partner. (`ETA_X` itself has derivative 0 at η = 0, the first probe
+    /// point, so it is not measured there and the refusal names `ETA_E0`
+    /// alone, which dropping does resolve.) The twin is F3 itself: the same
+    /// square with `ETA_X` also on `EMAX`, where the shared shift moves `EMAX`
+    /// too; it binds, so the pair straddles the joint span.
+    ///
+    /// The linear pair `E0 = S + (ETA_E0 - ETA_X) · OCC` is the same
+    /// combination at first order at both points, so both are measured: the
+    /// refusal names each with its partner and says dropping one is a remedy —
+    /// not the one-column refusal's "drop all of them" (#1880), which holds
+    /// only for random effects each absorbed alone.
+    ///
+    /// The baseline: `(ETA_E0 + 2 * ETA_X) * W` moves `y` with `W` under
+    /// either, and one is twice the other. They duplicate each other, and
+    /// together they still reach no level; the oracle absorbs neither, and it
+    /// binds.
+    ///
+    /// Mutations — the joint span taken against the levels alone (the issue's
+    /// head: both pairs bind); the partner clause deleted, or the combined
+    /// refusal (the refusals lack them); the others joined where they carry
+    /// the column on their own (the duplicate pair is refused).
+    #[test]
+    fn a_combination_of_random_effects_is_measured_jointly() {
+        let pop = arms_pop();
+        let moved = Point {
+            scale: 1.0,
+            per_occasion: true,
+        };
+        let model = |emax: &'static str, e0: String| {
+            move |c: &str| {
+                let r = row_1836("#1878", format!("  EMAX = {emax}\n  E0 = {e0}"), false);
+                let text = row_text(&r)(c);
+                let out = text.replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_E0 ~ 0.1\n  omega ETA_X ~ 0.1\n",
+                );
+                assert_ne!(out, text, "ETA_X is declared");
+                out
+            }
+        };
+        let together = |re: &str, other: &str| {
+            format!(
+                "the random effect `{re}`, moved together with `{other}`, moves `y`, at every \
+                 record of each subject, exactly as some combination of this block's levels does"
+            )
+        };
+        let square = format!("{S} + (ETA_E0 - ETA_X) * (ETA_E0 - ETA_X) * OCC");
+        let pair = model("TVEMAX", square.clone());
+        let twin = model("TVEMAX * exp(ETA_X)", square);
+        let linear = model("TVEMAX", format!("{S} + (ETA_E0 - ETA_X) * OCC"));
+        let mut wrong = Vec::new();
+        for (tag, text, at) in [("pair", &pair, moved), ("linear", &linear, Point::ZERO)] {
+            let jac = jacobian_at(&text("none"), &pop, at);
+            let (absorbed, _) = joint_oracle(&jac, LevelContrast::SumToZero);
+            if absorbed != ["ETA_E0", "ETA_X"] {
+                wrong.push(format!("{tag}: the oracle absorbs {absorbed:?}"));
+            }
+        }
+        for c in ALL {
+            match try_bind(&pair(c), &pop) {
+                Err(e) => {
+                    let e0 = together("ETA_E0", "ETA_X");
+                    if !e.contains(&e0) || !e.contains(MEASURED_AT) {
+                        wrong.push(format!("pair {c:?}: lacks the joint clause: {e}"));
+                    }
+                }
+                Ok(b) => wrong.push(format!("pair {c:?}: bound {b:?}")),
+            }
+            match try_bind(&linear(c), &pop) {
+                Err(e) => {
+                    for must in [
+                        together("ETA_E0", "ETA_X").as_str(),
+                        together("ETA_X", "ETA_E0").as_str(),
+                        MEASURED_AT,
+                        "the levels absorb `ETA_E0` and `ETA_X` in combination",
+                        "none of them alone, but moved together they move `y` as the levels do, \
+                         so the model is not identified under any contrast.",
+                        "Each combination needs every random effect in it: drop one from each \
+                         combination, or remove the block.",
+                    ] {
+                        if !e.contains(must) {
+                            wrong.push(format!("linear {c:?}: lacks {must:?}: {e}"));
+                        }
+                    }
+                }
+                Ok(b) => wrong.push(format!("linear {c:?}: bound {b:?}")),
+            }
+            for (tag, text) in [("pair", &pair), ("linear", &linear)] {
+                // Dropping one is a remedy here, not something to deny.
+                if let Err(e) = try_bind(&text(c), &pop) {
+                    if e.contains("drop all of them") {
+                        wrong.push(format!("{tag} {c:?}: says drop all: {e}"));
+                    }
+                }
+            }
+        }
+        agrees_with_joint_oracle_at("pair", &pair, &pop, moved, &mut wrong);
+        agrees_with_joint_oracle("linear", &linear, &pop, &mut wrong);
+        agrees_with_joint_oracle_at("linear moved", &linear, &pop, moved, &mut wrong);
+        // Under `none` a free `TVE0` aliases the levels whatever the random
+        // effects (#2448): that refusal is the rank check's, not absorption.
+        let aliased = |c: &str, e: &str| {
+            c == "none"
+                && e.starts_with("`TVE0` and the levels of `theta PLACEBO[STUDY]` (`contrast = none`) are aliased:")
+        };
+        for c in ALL {
+            match try_bind(&twin(c), &pop) {
+                Err(e) if !aliased(c, &e) => wrong.push(format!("twin {c:?}: refused: {e}")),
+                _ => {}
+            }
+        }
+        agrees_with_joint_oracle_at("twin", &twin, &pop, moved, &mut wrong);
+        let duplicate = model(
+            "TVEMAX",
+            "TVE0 + PLACEBO\n  E0 = E0 + (ETA_E0 + 2 * ETA_X) * W".to_string(),
+        );
+        for c in ["", "sum_to_zero", "ref", "none"] {
+            match try_bind(&duplicate(c), &pop) {
+                Err(e) if !aliased(c, &e) => wrong.push(format!("duplicate {c:?}: refused: {e}")),
+                _ => {}
+            }
+        }
+        agrees_with_joint_oracle_at("duplicate", &duplicate, &pop, moved, &mut wrong);
+        assert!(wrong.is_empty(), "jointly:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878 reviews r1, r2, r5 and r6. A combination that moves a kappa by
+    /// the same amount on every occasion of a subject, against an η, is not
+    /// the block's to absorb: a shift common to several units is the prior's
+    /// to pin, as it pins `ETA + c`, every `KAPPA − c` in any model with both,
+    /// and as the binder already has it for a kappa alone on levels spanning
+    /// its occasions — the control, `kshape`'s `K-E0` on `[STUDY]` with the η
+    /// unread, every level by `c` against every kappa by `−c`. Each fixture
+    /// has an exact flat direction — every η by `c`, every kappa by `−c`, the levels
+    /// by what that leaves — asserted on the Jacobian, and each binds the
+    /// global contrast and agrees with the joint oracle, which measures each
+    /// unit's column on its own:
+    ///
+    /// - r1, `[STUDY, OCC]`, `ETA_E0 · W + KAPPA_E0 · (W + 1)`: the levels
+    ///   take `c` on every occasion;
+    /// - r5, the same with `KAPPA_E0 · (W + 2 − OCC)`: `[c, 0, −c]`, which
+    ///   sums to zero within the subject;
+    /// - r6, the r1 row on the one-column `[STUDY]`, where the levels span
+    ///   the occasions: the subject's one level takes `c`;
+    /// - r2, `[STUDY, OCC]`, two ηs, `ETA_A · W + ETA_B · W² + KAPPA_E0 · (1
+    ///   + W + W²)`: both ηs by `c`;
+    /// - the control: no η.
+    ///
+    /// Mutation — the kappa measured with the random effects at coarser units
+    /// (reviews r1–r5's machinery: r1, r2 and r5 are refused under global).
+    #[test]
+    fn an_equal_kappa_shift_against_an_eta_is_the_priors_to_pin() {
+        let pop = arms_pop();
+        let row = |tag, cols, kappa: &str| -> Row {
+            (
+                tag,
+                cols,
+                format!("  E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * ({kappa})"),
+                format!("E0 + {EMAXY}"),
+                true,
+            )
+        };
+        let r1 = row("r1", "STUDY, OCC", "W + 1");
+        let r5 = row("r5", "STUDY, OCC", "W + 2 - OCC");
+        let r6 = row("r6", "STUDY", "W + 1");
+        let two = two_eta_model(
+            "TVE0 + PLACEBO + ETA_A * W + ETA_B * W * W + KAPPA_E0 * (1 + W + W * W)".into(),
+            true,
+        );
+        type Fixture<'a> = (&'a str, Box<dyn Fn(&str) -> String + 'a>, &'a [&'a str]);
+        let fixtures: Vec<Fixture> = vec![
+            ("r1", Box::new(row_text(&r1)), &["ETA_E0"]),
+            ("r5", Box::new(row_text(&r5)), &["ETA_E0"]),
+            ("r6", Box::new(row_text(&r6)), &["ETA_E0"]),
+            ("r2", Box::new(two), &["ETA_A", "ETA_B"]),
+            (
+                "κ alone",
+                Box::new(|c: &str| kshape("K-E0", false, "STUDY", c)),
+                &[],
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (tag, text, etas) in &fixtures {
+            // `Σ Z_η − Σ Z_κ` outside the block's levels, relative to its norm:
+            // zero when the flat direction is exact.
+            let j = jacobian_at(&text("none"), &pop, Point::ZERO);
+            let sum = |name: &str| -> DVector<f64> {
+                let (.., z) = j.res.iter().find(|(n, ..)| n == name).unwrap();
+                z.column_sum()
+            };
+            let mut v = -sum("KAPPA_E0");
+            for eta in *etas {
+                v += sum(eta);
+            }
+            assert!(v.iter().all(|x| x.is_finite()), "{tag}: non-finite");
+            let n = v.norm();
+            let col = DMatrix::from_column_slice(v.len(), 1, v.as_slice());
+            let outside = residual_sv(&col, &j.xb)[0] / n;
+            eprintln!("{tag}: flat direction outside the levels {outside:.3e}");
+            if outside >= 1e-8 {
+                wrong.push(format!("{tag}: no flat direction ({outside:.1e})"));
+            }
+            for c in ["", "sum_to_zero"] {
+                match try_bind(&text(c), &pop) {
+                    Ok((LevelContrast::SumToZero, _)) => {}
+                    got => wrong.push(format!("{tag} {c:?}: {got:?}, want global")),
+                }
+            }
+            agrees_with_joint_oracle(tag, text.as_ref(), &pop, &mut wrong);
+        }
+        assert!(wrong.is_empty(), "equal shift:\n{}", wrong.join("\n"));
+    }
+
+    /// `cf_model` on `[STUDY, OCC]` with `E0` as given, `ETA_E0` swapped for
+    /// `ETA_A` and `ETA_B`, and `KAPPA_E0` declared when `kappa`.
+    fn two_eta_model(e0: String, kappa: bool) -> impl Fn(&str) -> String {
+        move |c: &str| {
+            let text = cf_model(
+                c,
+                "STUDY, OCC",
+                &format!("{BASE}  E0 = {e0}"),
+                &format!("E0 + {EMAXY}"),
+            );
+            let k = if kappa {
+                "  kappa KAPPA_E0 ~ 0.1\n"
+            } else {
+                ""
+            };
+            let out = text.replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                &format!("  omega ETA_A ~ 0.1\n  omega ETA_B ~ 0.1\n{k}"),
+            );
+            assert_ne!(out, text, "the random effects are declared");
+            out
+        }
+    }
+
+    /// #1878 review r2, finding 1. On the nested `[STUDY, OCC]`, `E0 = TVE0 +
+    /// PLACEBO + ETA_A + (ETA_A - ETA_B) · W`: neither η alone moves `y` as an
+    /// occasion's level does (`W` varies inside each), and shifting both by
+    /// `c` moves it by `c` at every record of the subject — a shift common to
+    /// the subject's levels, which `sum_to_zero_within` removes. So the block
+    /// absorbs the pair under the global contrasts and not under within: the
+    /// partition rule for random effects each absorbed alone, which would
+    /// refuse every contrast, must not judge it. Global is refused naming the
+    /// partner, within binds, auto resolves to it, and every cell agrees with
+    /// the joint oracle.
+    ///
+    /// Mutation — the partition rule restored for combinations (the pair is
+    /// refused under within and auto).
+    #[test]
+    fn a_combination_within_rescues_binds_within() {
+        let pop = arms_pop();
+        let moved = Point {
+            scale: 1.0,
+            per_occasion: true,
+        };
+        let pair = two_eta_model("TVE0 + PLACEBO + ETA_A + (ETA_A - ETA_B) * W".into(), false);
+        let clause = "the random effect `ETA_A`, moved together with `ETA_B`, moves `y`, at \
+                      every record of each subject, exactly as some combination of this block's \
+                      levels does";
+        let mut wrong = Vec::new();
+        for c in ["sum_to_zero", "ref", "none"] {
+            match try_bind(&pair(c), &pop) {
+                Err(e) if e.contains(clause) && !e.contains(WITHIN) => {}
+                got => wrong.push(format!("pair {c:?}: {got:?}")),
+            }
+        }
+        for c in ["", "sum_to_zero_within"] {
+            match try_bind(&pair(c), &pop) {
+                Ok((LevelContrast::SumToZeroWithin, _)) => {}
+                got => wrong.push(format!("pair {c:?}: {got:?}, want within")),
+            }
+        }
+        agrees_with_joint_oracle("pair", &pair, &pop, &mut wrong);
+        agrees_with_joint_oracle_at("pair moved", &pair, &pop, moved, &mut wrong);
+        assert!(wrong.is_empty(), "within:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878 review r7. On the nested `[STUDY, OCC]`, `ETA_A · W + ETA_B · (OCC
+    /// − 2 − W)`: neither η alone moves `y` as the levels do (`W` varies inside
+    /// each occasion), and both shifted by `c` move it by `c · (OCC − 2)`, a
+    /// direction that sums to zero within each subject — so no contrast, the
+    /// within one included, leaves it free. `ETA_C · W² + ETA_D · (3 (OCC −
+    /// 2)² − 2 − W²)` is a second, independent combination of the same kind
+    /// (`c · (3 (OCC − 2)² − 2)`). Every contrast is refused, and the remedy is
+    /// one random effect from each combination: dropping the named one leaves
+    /// the other pair unidentified. With one pair, the same refusal and remedy.
+    ///
+    /// Mutation — the remedy taken from a single absorbed random effect
+    /// (`drop the random effect`): both fixtures fail.
+    #[test]
+    fn independent_combinations_within_need_one_dropped_from_each() {
+        let pop = arms_pop();
+        let pair = "ETA_A * W + ETA_B * (OCC - 2 - W)";
+        let model = |e0: String| {
+            move |c: &str| {
+                let text = cf_model(
+                    c,
+                    "STUDY, OCC",
+                    &format!("{BASE}  E0 = TVE0 + PLACEBO + {e0}"),
+                    &format!("E0 + {EMAXY}"),
+                );
+                let out = text.replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_A ~ 0.1\n  omega ETA_B ~ 0.1\n  omega ETA_C ~ 0.1\n  \
+                     omega ETA_D ~ 0.1\n",
+                );
+                assert_ne!(out, text, "the random effects are declared");
+                out
+            }
+        };
+        let one = model(pair.to_string());
+        let two = model(format!(
+            "{pair} + ETA_C * W * W + ETA_D * (3 * (OCC - 2) * (OCC - 2) - 2 - W * W)"
+        ));
+        let mut wrong = Vec::new();
+        let fixtures: [(&str, &dyn Fn(&str) -> String); 2] =
+            [("one pair", &one), ("two pairs", &two)];
+        for (tag, text) in fixtures {
+            for c in ALL {
+                match try_bind(&text(c), &pop) {
+                    Err(e) => {
+                        for must in [
+                            "moved together with `ETA_B`",
+                            "`sum_to_zero_within` included: the model is not identified. \
+                             Remove the block, or drop one random effect from each combination.",
+                        ] {
+                            if !e.contains(must) {
+                                wrong.push(format!("{tag} {c:?}: lacks {must:?}: {e}"));
+                            }
+                        }
+                    }
+                    Ok(b) => wrong.push(format!("{tag} {c:?}: bound {b:?}")),
+                }
+            }
+            agrees_with_joint_oracle(tag, text, &pop, &mut wrong);
+        }
+        assert!(wrong.is_empty(), "each combination:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878 with #2421's per-class measurement. A two-class mixture whose
+    /// classes absorb `ETA_E0` through different partners — class 1 with
+    /// `ETA_X`, class 2 with `ETA_Y`, each `(ETA_E0 − partner) · OCC` on top of
+    /// `TVE0 + PLACEBO + ETA_E0` — is refused under every contrast, and the
+    /// refusal names both partners: each class moves `ETA_E0` with its own.
+    /// The control has one partner in both classes, and names only it.
+    ///
+    /// Mutations — the partners taken from the first class only (`ETA_Y`
+    /// missing), or the last only (`ETA_X` missing); the control fails if a
+    /// class's absent partner is named.
+    #[test]
+    fn a_mixture_names_every_class_partner() {
+        let pop = arms_pop();
+        let model = |second: &'static str| {
+            move |c: &str| {
+                let s = "TVE0 + PLACEBO + ETA_E0";
+                let text = cf_model(
+                    c,
+                    "STUDY",
+                    &format!(
+                        "{BASE}  E0 = if (MIXNUM == 1) {s} + (ETA_E0 - ETA_X) * OCC else {s} + \
+                         (ETA_E0 - {second}) * OCC"
+                    ),
+                    &format!("E0 + {EMAXY}"),
+                );
+                let out = text
+                    .replace(
+                        "  omega ETA_E0 ~ 0.1\n",
+                        "  omega ETA_E0 ~ 0.1\n  omega ETA_X ~ 0.1\n  omega ETA_Y ~ 0.1\n  \
+                         theta MIXL(0.0, -10.0, 10.0)\n",
+                    )
+                    .replace(
+                        "[structural_model]",
+                        "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n[structural_model]",
+                    );
+                assert_ne!(out, text, "the mixture is declared");
+                out
+            }
+        };
+        let mut wrong = Vec::new();
+        for (tag, second, named, unnamed) in [
+            (
+                "two partners",
+                "ETA_Y",
+                &["`ETA_X`", "`ETA_Y`"][..],
+                &[][..],
+            ),
+            ("one partner", "ETA_X", &["`ETA_X`"][..], &["`ETA_Y`"][..]),
+        ] {
+            let text = model(second);
+            for c in ALL {
+                match try_bind(&text(c), &pop) {
+                    Err(e) => {
+                        let clause = e
+                            .split("the random effect `ETA_E0`, moved together with ")
+                            .nth(1)
+                            .and_then(|r| r.split(", moves `y`").next());
+                        match clause {
+                            Some(partners) => {
+                                for n in named {
+                                    if !partners.contains(n) {
+                                        wrong.push(format!("{tag} {c:?}: lacks {n}: {e}"));
+                                    }
+                                }
+                                for n in unnamed {
+                                    if partners.contains(n) {
+                                        wrong.push(format!("{tag} {c:?}: names {n}: {e}"));
+                                    }
+                                }
+                            }
+                            None => wrong.push(format!("{tag} {c:?}: no partner clause: {e}")),
+                        }
+                    }
+                    Ok(b) => wrong.push(format!("{tag} {c:?}: bound {b:?}")),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "per class:\n{}", wrong.join("\n"));
+    }
+
     /// B4b (#1961 review, F1). The block basis `carried` projects on spans what
     /// a dense basis of every column spans: on three subjects, one-subject
     /// columns, a column across two subjects and a θ-like column across all
@@ -14386,6 +14813,10 @@ mod nested_units;
 /// The span certificate on an ODE model's carried-over state (#1877).
 #[path = "theta_levels_carry_over_tests.rs"]
 mod carry_over;
+
+/// The span certificate on a random effect that scales the residual error (#1879).
+#[path = "theta_levels_residual_scale_tests.rs"]
+mod residual_scale;
 
 mod carried_scale {
     use super::*;

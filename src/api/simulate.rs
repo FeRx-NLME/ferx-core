@@ -562,48 +562,86 @@ pub(crate) fn check_param_shape(
 /// depot-reading analytic readout on a subject superposition cannot reconstruct (#650 / #375 /
 /// #1488) or a malformed built-in absorption input rate (#588) reaches the emitter and
 /// produces wrong rows or a panic deep in the prediction loop.
-fn check_simulate_preconditions(
-    model: &CompiledModel,
-    population: &Population,
+///
+/// The list has two halves (#1288): the checks that read `params`, which run on every call,
+/// and the ones that read only the model and the population ([`DrawIndependentChecked`]),
+/// which `checked` lets a caller that already ran them on this same model and population
+/// skip — `simulate_with_uncertainty` reaches here once per draw, and those recompute one
+/// verdict each time. A `checked` for any other model or population is ignored, so the
+/// argument can save work but never a check. The return is the proof for the next call.
+fn check_simulate_preconditions<'a>(
+    model: &'a CompiledModel,
+    population: &'a Population,
     params: &ModelParameters,
-) -> Result<(), EngineError> {
+    checked: Option<DrawIndependentChecked<'_>>,
+) -> Result<DrawIndependentChecked<'a>, EngineError> {
     let theta = &params.theta;
     check_theta_length(model, theta)?;
     // A missing Ω_IOV keeps its own message (#1019), so it is checked before the shape.
     validate_iov_simulatable(model, params)?;
     check_param_shape(model, &ParamBlock::all_of(params))?;
-    // Nested levels (#1082 PR4): the κ draw groups records by their level labels, so a
-    // record with none is refused, as `fit()` refuses it.
-    first_error(&super::validation::check_level_labels(model, population))?;
-    // The `correlation` line (#1976): the data checks `fit()` runs (RESET / TIES), then
-    // ρ's range at the value drawn at.
-    first_error(&super::validation::check_residual_correlation_data(
-        model, population,
-    ))?;
+    let checked = match checked {
+        Some(c) if c.covers(model, population) => DrawIndependentChecked { model, population },
+        _ => DrawIndependentChecked::run(model, population)?,
+    };
+    // ρ's range at the value drawn at (#1976).
     first_error(&super::validation::check_residual_correlation_value(
         model, population, params,
     ))?;
-    first_error(&check_modeled_dose_rates(model, population))?;
-    first_error(&check_dose_compartments(model, population))?;
-    first_error(&check_absorption_closed_form_support_diags(
-        model, population,
-    ))?;
+    // The one closed-form guard that reads θ: a draw can land in the flip-flop regime
+    // its point estimate is clear of.
     first_error(&check_absorption_flip_flop_no_twin_diags(
         model, population, theta,
     ))?;
-    #[cfg(feature = "survival")]
-    first_error(&check_survival_tv_covariates(model, population))?;
-    // Same freeze on the `TIME` axis — `draw_ode_tte_latent` root-finds the same frozen
-    // snapshot for its event times (#1853; as fit() does).
-    #[cfg(feature = "survival")]
-    first_error(&check_survival_time_dependent_pk_diags(model))?;
-    // A Form C readout of the oral depot amount on a subject whose doses superposition
-    // cannot reconstruct — an EVID=3/4 reset (#650) or a dose outside the default
-    // compartment (#375). Without it a release build returns rows from a phantom depot and
-    // a debug build panics in `pk::analytical_state_at_times` (#1488; as fit() and
-    // predict_diag() do).
-    first_error(&check_analytic_readout_support(model, population))?;
-    first_error(&check_absorption_dosing(model, population))
+    Ok(checked)
+}
+
+/// Proof that the half of [`check_simulate_preconditions`] that reads no parameter value
+/// passed on this model and population (#1288). Only [`DrawIndependentChecked::run`] makes
+/// one, and it remembers what it checked, so it cannot vouch for another population.
+#[derive(Clone, Copy)]
+struct DrawIndependentChecked<'a> {
+    model: &'a CompiledModel,
+    population: &'a Population,
+}
+
+impl<'a> DrawIndependentChecked<'a> {
+    /// Run the draw-independent checks. None reads `params`: `check_absorption_dosing`
+    /// reads the model's own default θ, the same for every draw.
+    fn run(model: &'a CompiledModel, population: &'a Population) -> Result<Self, EngineError> {
+        super::note_draw_independent_run();
+        // Nested levels (#1082 PR4): the κ draw groups records by their level labels, so a
+        // record with none is refused, as `fit()` refuses it.
+        first_error(&super::validation::check_level_labels(model, population))?;
+        // The `correlation` line (#1976): the data checks `fit()` runs (RESET / TIES).
+        first_error(&super::validation::check_residual_correlation_data(
+            model, population,
+        ))?;
+        first_error(&check_modeled_dose_rates(model, population))?;
+        first_error(&check_dose_compartments(model, population))?;
+        first_error(&check_absorption_closed_form_support_diags(
+            model, population,
+        ))?;
+        #[cfg(feature = "survival")]
+        first_error(&check_survival_tv_covariates(model, population))?;
+        // Same freeze on the `TIME` axis — `draw_ode_tte_latent` root-finds the same frozen
+        // snapshot for its event times (#1853; as fit() does).
+        #[cfg(feature = "survival")]
+        first_error(&check_survival_time_dependent_pk_diags(model))?;
+        // A Form C readout of the oral depot amount on a subject whose doses superposition
+        // cannot reconstruct — an EVID=3/4 reset (#650) or a dose outside the default
+        // compartment (#375). Without it a release build returns rows from a phantom depot
+        // and a debug build panics in `pk::analytical_state_at_times` (#1488; as fit() and
+        // predict_diag() do).
+        first_error(&check_analytic_readout_support(model, population))?;
+        first_error(&check_absorption_dosing(model, population))?;
+        Ok(Self { model, population })
+    }
+
+    /// Whether this proof is for `model` and `population` — the same objects, not equal ones.
+    fn covers(&self, model: &CompiledModel, population: &Population) -> bool {
+        std::ptr::eq(self.model, model) && std::ptr::eq(self.population, population)
+    }
 }
 
 /// Simulate observations under `opts`, returning only the observation rows.
@@ -618,7 +656,7 @@ pub fn simulate_with_options(
     n_sim: usize,
     opts: &SimulateOptions,
 ) -> Result<Vec<SimulationResult>, EngineError> {
-    simulate_with_options_diag(model, population, params, n_sim, opts).map(|o| o.results)
+    simulate_with_options_impl(model, population, params, n_sim, opts, false).map(|o| o.results)
 }
 
 /// Simulate observations, optionally with propensity-score matching.
@@ -653,12 +691,29 @@ pub fn simulate_with_options(
 /// `fit()` refuses to stay quiet about served the same rows here with nothing attached.
 /// `postfit::non_fit_diagnostics` documents exactly what that bundle includes and what it
 /// deliberately leaves out (the findings whose subject is a fit).
+///
+/// [`SimulationOutput::parameters`] carries the η, κ, individual parameters and
+/// `[derived]` / `[output]` values each simulated subject was drawn with, one row per
+/// `(draw, sim, id)` (#2505); [`SimulatedParameters`] documents the convention.
 pub fn simulate_with_options_diag(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
     opts: &SimulateOptions,
+) -> Result<SimulationOutput, EngineError> {
+    simulate_with_options_impl(model, population, params, n_sim, opts, true)
+}
+
+/// [`simulate_with_options_diag`], building the drawn-parameter table only when
+/// `with_parameters` (#2505): the row-only wrapper discards it, so it does not pay for it.
+fn simulate_with_options_impl(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+    with_parameters: bool,
 ) -> Result<SimulationOutput, EngineError> {
     use rand::SeedableRng;
 
@@ -771,7 +826,9 @@ pub fn simulate_with_options_diag(
     // reason: otherwise a malformed multi-pathway / SS / infusion absorption model
     // integrates the whole warm-EBE pass first and fails only at the chokepoint,
     // with a confusable "EBE did not converge" instead of the real cause.
-    check_simulate_preconditions(model, population, params)?;
+    // The chokepoint then reruns only the half that reads `params` (#1288).
+    let checked = check_simulate_preconditions(model, population, params, None)?;
+    let mut table = SimulatedParameters::for_model(model);
 
     let method = match opts.match_method {
         Some(m) => m,
@@ -790,10 +847,12 @@ pub fn simulate_with_options_diag(
                     1,
                     None,
                     opts.horizon,
+                    Some(checked),
                     class_root,
                     &mut rng,
                     &mut warnings,
                     &mut flip_flop,
+                    with_parameters.then_some(&mut table),
                 )
             });
             let results = results?;
@@ -819,7 +878,11 @@ pub fn simulate_with_options_diag(
                 &stats,
                 super::SolverStatsPhase::Simulate,
             ));
-            return Ok(SimulationOutput { results, warnings });
+            return Ok(SimulationOutput {
+                results,
+                warnings,
+                parameters: table,
+            });
         }
     };
 
@@ -913,10 +976,12 @@ pub fn simulate_with_options_diag(
             1,
             Some((&eta_hats, omega_inv, method)),
             opts.horizon,
+            Some(checked),
             class_root,
             &mut rng,
             &mut warnings,
             &mut flip_flop,
+            with_parameters.then_some(&mut table),
         )
     });
     let results = results?;
@@ -930,7 +995,11 @@ pub fn simulate_with_options_diag(
         &stats,
         super::SolverStatsPhase::Simulate,
     ));
-    Ok(SimulationOutput { results, warnings })
+    Ok(SimulationOutput {
+        results,
+        warnings,
+        parameters: table,
+    })
 }
 
 fn simulate_inner<R: rand::Rng>(
@@ -961,10 +1030,13 @@ fn simulate_inner<R: rand::Rng>(
         1,
         None,
         None,
+        // No entry point ahead of this one ran the list.
+        None,
         class_root,
         rng,
         &mut warnings,
         &mut flip_flop,
+        None,
     )
 }
 
@@ -993,7 +1065,7 @@ fn emit_subject_rows<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
     warnings: &mut Vec<String>,
-) {
+) -> DrawnPrediction {
     // `horizon` and `warnings` are consumed only by the TTE path below; without the
     // `survival` feature there are no TTE endpoints, so discard them to avoid unused-arg warns.
     #[cfg(not(feature = "survival"))]
@@ -1008,6 +1080,7 @@ fn emit_subject_rows<R: rand::Rng>(
     // used here, and the κ draws happen on this occasion-aware branch instead.
     // Non-IOV models keep the TV-covariate-aware fast-path dispatcher unchanged
     // and draw no extra randoms, so their output is byte-identical.
+    let mut kappas: Vec<Vec<f64>> = Vec::new();
     let ipreds = if model.n_kappa > 0 {
         let omega_iov = params.omega_iov.as_ref().expect(
             "omega_iov is present whenever the model declares kappa (n_kappa > 0) — \
@@ -1024,7 +1097,7 @@ fn emit_subject_rows<R: rand::Rng>(
         // refuses a nested subject without cells), so it is present for every κ model.
         // The factor is the declared Ω_IOV's, a zero κ exactly 0 (#1605).
         let kappa_factor = crate::stats::nested_levels::KappaDraw::factor(model, omega_iov);
-        let kappas = kappa_draw
+        kappas = kappa_draw
             .expect("simulate_inner_with_draw builds a KappaDraw per subject of a kappa model")
             .draw(&kappa_factor, normal, rng);
         pk::predict_iov(
@@ -1139,6 +1212,16 @@ fn emit_subject_rows<R: rand::Rng>(
         results,
         warnings,
     );
+
+    DrawnPrediction { ipreds, kappas }
+}
+
+/// What [`emit_subject_rows`] predicted one subject with, for the drawn-parameter table
+/// (#2505): the IPRED it added residual error to, and the κ it drew (one vector per
+/// occasion group, in `predict_iov` order; empty without IOV).
+struct DrawnPrediction {
+    ipreds: Vec<f64>,
+    kappas: Vec<Vec<f64>>,
 }
 
 /// The residual covariance structure — today the `block_sigma` correlations — a
@@ -1548,10 +1631,12 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     draw: usize,
     matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
     horizon: Option<f64>,
+    checked: Option<DrawIndependentChecked<'_>>,
     class_root: u64,
     rng: &mut R,
     warnings: &mut Vec<String>,
     flip_flop: &mut SimulatedFlipFlopTally,
+    mut table: Option<&mut SimulatedParameters>,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     use rand_distr::Normal;
 
@@ -1562,8 +1647,10 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // the same chokepoint.
     //
     // Every precondition below is an `Err`, never a panic (#898), and every
-    // `simulate*` entry point returns it as is.
-    check_simulate_preconditions(model, population, params)?;
+    // `simulate*` entry point returns it as is. `checked` skips only the half that reads
+    // no parameter value, and only when it was run on this very model and population
+    // (#1288); every caller states whether it has one.
+    check_simulate_preconditions(model, population, params, checked)?;
     // Nested levels (#1082 PR4): each record's level labels name its cell, which the κ
     // draw groups by level. `simulate()` takes the caller's population as given, so the
     // cells are assigned here, as `fitted_population` does for `fit()`; a population an
@@ -1633,6 +1720,9 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
+        // What each subject of this replicate was drawn with, for the parameter table
+        // (#2505). Nothing is kept when the caller asked for no table.
+        let mut drawn: Vec<DrawnSubject> = Vec::new();
         match matched {
             Some((fitted, omega_inv, method)) => {
                 // Draw a pool of one eta per subject for this replicate, then
@@ -1663,7 +1753,8 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     // propensity-matched run is counted on the η it was assigned, not the
                     // one it drew.
                     flip_flop.observe(model, subject, &params.theta, &eta_slice);
-                    emit_subject_rows(
+                    let first_row = results.len();
+                    let predicted = emit_subject_rows(
                         model,
                         subject,
                         kappa_draws.get(i),
@@ -1677,6 +1768,14 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         &mut results,
                         &mut *warnings,
                     );
+                    if table.is_some() {
+                        drawn.push(DrawnSubject::new(
+                            &eta_slice[..n_eta],
+                            predicted,
+                            None,
+                            &results[first_row..],
+                        ));
+                    }
                 }
             }
             None => {
@@ -1691,7 +1790,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
                     flip_flop.observe(model, subject, &params.theta, &eta_slice);
-                    emit_subject_rows(
+                    let predicted = emit_subject_rows(
                         model,
                         subject,
                         kappa_draws.get(i),
@@ -1711,12 +1810,263 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     for row in &mut results[first_row..] {
                         row.mixnum = mixnum;
                     }
+                    if table.is_some() {
+                        drawn.push(DrawnSubject::new(
+                            &eta_slice[..n_eta],
+                            predicted,
+                            mixnum,
+                            &results[first_row..],
+                        ));
+                    }
                 }
             }
+        }
+        if let Some(table) = table.as_deref_mut() {
+            append_drawn_parameters(model, population, &params.theta, draw, sim, &drawn, table);
         }
     }
 
     Ok(results)
+}
+
+/// One subject's draw in one `(draw, sim)` replicate, as the chokepoint simulated it — the
+/// input of [`append_drawn_parameters`] (#2505).
+struct DrawnSubject {
+    /// The BSV η (`n_eta`), without the κ tail.
+    eta: Vec<f64>,
+    /// One κ vector per occasion group, in `predict_iov` order; empty without IOV.
+    kappas: Vec<Vec<f64>>,
+    /// The class the subject ran under, 1-based; `None` without a `[mixture]`.
+    mixnum: Option<usize>,
+    ipreds: Vec<f64>,
+    /// The simulated value of each Gaussian observation row, in observation order: the
+    /// `DV` a `[derived]` expression reads for this replicate.
+    values: Vec<f64>,
+}
+
+impl DrawnSubject {
+    /// `rows` are the rows the subject emitted, Gaussian ones first, one per IPRED.
+    fn new(
+        eta: &[f64],
+        predicted: DrawnPrediction,
+        mixnum: Option<usize>,
+        rows: &[SimulationResult],
+    ) -> Self {
+        let values = rows[..predicted.ipreds.len()]
+            .iter()
+            .map(|r| r.outcome.continuous_value())
+            .collect();
+        Self {
+            eta: eta.to_vec(),
+            kappas: predicted.kappas,
+            mixnum,
+            ipreds: predicted.ipreds,
+            values,
+        }
+    }
+
+    /// The `[η, κ]` vector `pk_param_fn` reads at a record of occasion `occ`: this
+    /// occasion's κ, or zeros for one with no group — the selection
+    /// `compute_extra_output_columns` makes for the sdtab.
+    fn eta_at(
+        &self,
+        model: &CompiledModel,
+        layout: &crate::stats::stacked_layout::StackedLayout,
+        occ: u32,
+    ) -> Vec<f64> {
+        let mut full = Vec::with_capacity(self.eta.len() + model.n_kappa);
+        full.extend_from_slice(&self.eta);
+        if model.n_kappa > 0 {
+            match layout.group_of(occ).and_then(|k| self.kappas.get(k)) {
+                Some(kappa) => full.extend_from_slice(kappa),
+                None => full.extend(std::iter::repeat_n(0.0, model.n_kappa)),
+            }
+        }
+        full
+    }
+}
+
+/// The indices into `indiv_param_names` the table reports: every declared individual
+/// parameter, without the parser's synthetic readout slots.
+fn reported_individual_indices(model: &CompiledModel) -> Vec<usize> {
+    (0..model.indiv_param_names.len())
+        .filter(|&k| {
+            !crate::parser::model_parser::is_synthetic_readout_param(&model.indiv_param_names[k])
+        })
+        .collect()
+}
+
+/// Append one [`SimulatedSubjectParameters`] row per subject of one replicate (#2505).
+///
+/// Every value is the subject's value at its **first observation row** — its covariates
+/// and `TIME` there, its η, and the κ of that row's occasion — NONMEM's `FIRSTONLY`. A
+/// subject with no Gaussian observation (a TTE- or binary-only one) reports its
+/// individual parameters at its baseline covariates and `TIME = 0`, and no `[derived]`
+/// value. A column whose value differs across one subject's observation rows is named in
+/// [`SimulatedParameters::varying`].
+fn append_drawn_parameters(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    draw: usize,
+    sim: usize,
+    drawn: &[DrawnSubject],
+    table: &mut SimulatedParameters,
+) {
+    let reported = reported_individual_indices(model);
+    let derived = drawn_derived_columns(model, population, theta, drawn);
+    if table.derived_names.is_empty() {
+        if let Some(columns) = derived.iter().find(|c| !c.is_empty()) {
+            table.derived_names = columns.iter().map(|(n, _)| n.clone()).collect();
+        }
+    }
+    for (i, (subject, d)) in population.subjects.iter().zip(drawn).enumerate() {
+        let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
+        let n_obs = subject.obs_times.len();
+        let values_at = |j: usize| -> Vec<f64> {
+            let occ = subject.occasions.get(j).copied().unwrap_or(0);
+            model.indiv_param_values(
+                theta,
+                &d.eta_at(model, &layout, occ),
+                subject.obs_cov(j),
+                subject.param_time_obs(j),
+                d.mixnum,
+            )
+        };
+        let all = if n_obs == 0 {
+            model.indiv_param_values(
+                theta,
+                &d.eta_at(model, &layout, 0),
+                &subject.covariates,
+                0.0,
+                d.mixnum,
+            )
+        } else {
+            let first = values_at(0);
+            for j in 1..n_obs {
+                let at_j = values_at(j);
+                for &k in &reported {
+                    if !same_value(first[k], at_j[k]) {
+                        table.note_varying(&model.indiv_param_names[k]);
+                    }
+                }
+            }
+            first
+        };
+        let mut derived_values = vec![f64::NAN; table.derived_names.len()];
+        if let Some(columns) = derived.get(i) {
+            for (name, values) in columns {
+                if let Some(col) = values.first() {
+                    if let Some(slot) = table.derived_names.iter().position(|n| n == name) {
+                        derived_values[slot] = *col;
+                    }
+                    if values.iter().any(|v| !same_value(*v, *col)) {
+                        table.note_varying(name);
+                    }
+                }
+            }
+        }
+        table.rows.push(SimulatedSubjectParameters {
+            draw,
+            sim,
+            id: subject.id.clone(),
+            mixnum: d.mixnum,
+            eta: d.eta.clone(),
+            kappas: d.kappas.clone(),
+            individual: reported.iter().map(|&k| all[k]).collect(),
+            derived: derived_values,
+        });
+    }
+}
+
+/// Equal, or both `NaN`: a column that is `NaN` on every row does not vary.
+fn same_value(a: f64, b: f64) -> bool {
+    a == b || (a.is_nan() && b.is_nan())
+}
+
+/// Each subject's `[derived]` / `[output]` columns for one replicate (#2505), from the
+/// same `compute_extra_output_columns` the fit's sdtab is built by, with the replicate's
+/// draws in place of the EBEs: its η and κ, the class it ran under, its IPRED, and its
+/// simulated values as `DV`. Empty when the model declares neither block.
+fn drawn_derived_columns(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    drawn: &[DrawnSubject],
+) -> Vec<Vec<(String, Vec<f64>)>> {
+    if model.derived_exprs.is_empty() && model.output_columns.is_empty() {
+        return Vec::new();
+    }
+    let mut simulated = population.clone();
+    for (subject, d) in simulated.subjects.iter_mut().zip(drawn) {
+        for (dv, value) in subject.observations.iter_mut().zip(&d.values) {
+            *dv = *value;
+        }
+    }
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    let mut subjects: Vec<SubjectResult> = simulated
+        .subjects
+        .iter()
+        .zip(drawn)
+        .map(|(subject, d)| {
+            let _mix_guard = d
+                .mixnum
+                .map(crate::parser::model_parser::MixtureClassGuard::enter);
+            let n_obs = d.ipreds.len();
+            // States are not reconstructed on the IOV path, as for a fitted IOV subject.
+            let compartment_states = if model.n_kappa == 0 {
+                pk::compute_predictions_with_states(model, subject, theta, &d.eta).1
+            } else {
+                Vec::new()
+            };
+            SubjectResult {
+                id: subject.id.clone(),
+                eta: DVector::from_column_slice(&d.eta),
+                ipred: d.ipreds.clone(),
+                pred: pk::compute_predictions_with_tv(model, subject, theta, &zero_eta),
+                iwres: vec![f64::NAN; n_obs],
+                cwres: vec![f64::NAN; n_obs],
+                npde: Vec::new(),
+                npd: Vec::new(),
+                ofv_contribution: f64::NAN,
+                cens: subject.cens.clone(),
+                n_obs,
+                pmix: None,
+                mixest: None,
+                extra_columns: Vec::new(),
+                per_obs_tad: Vec::new(),
+                compartment_states,
+                #[cfg(feature = "survival")]
+                discrete_rows: Vec::new(),
+                #[cfg(feature = "survival")]
+                tte_rows: Vec::new(),
+            }
+        })
+        .collect();
+    let kappas: Vec<Vec<DVector<f64>>> = drawn
+        .iter()
+        .map(|d| {
+            d.kappas
+                .iter()
+                .map(|k| DVector::from_column_slice(k))
+                .collect()
+        })
+        .collect();
+    let mixest: Option<Vec<usize>> = model.mixture.is_some().then(|| {
+        drawn
+            .iter()
+            .map(|d| d.mixnum.map_or(0, |k| k - 1))
+            .collect()
+    });
+    super::compute_extra_output_columns(
+        model,
+        &simulated,
+        theta,
+        &kappas,
+        &mut subjects,
+        mixest.as_deref(),
+    );
+    subjects.into_iter().map(|sr| sr.extra_columns).collect()
 }
 
 /// Options controlling `simulate_with_uncertainty()`.
@@ -1763,7 +2113,7 @@ pub fn simulate_with_uncertainty(
     fit_result: &FitResult,
     opts: &SimulateUncertaintyOptions,
 ) -> Result<Vec<SimulationResult>, EngineError> {
-    simulate_with_uncertainty_diag(model, population, fit_result, opts).map(|o| o.results)
+    simulate_with_uncertainty_impl(model, population, fit_result, opts, false).map(|o| o.results)
 }
 
 /// [`simulate_with_uncertainty`] with the diagnostics attached (#1645) — the uncertainty twin of
@@ -1791,11 +2141,27 @@ pub fn simulate_with_uncertainty(
 /// A caller relaying data-reader findings should take them from here, never from
 /// [`Population::warnings`] directly: the raw list still holds the findings the shared filter
 /// withholds (`W_NO_DOSES` / `W_CMT_DEFAULTED` on a compartment-free model).
+///
+/// [`SimulationOutput::parameters`] carries one row per `(draw, sim, id)` of the η, κ,
+/// individual parameters and `[derived]` / `[output]` values each subject was simulated
+/// with, under its draw's θ (#2505). A skipped draw has no rows.
 pub fn simulate_with_uncertainty_diag(
     model: &CompiledModel,
     population: &Population,
     fit_result: &FitResult,
     opts: &SimulateUncertaintyOptions,
+) -> Result<SimulationOutput, EngineError> {
+    simulate_with_uncertainty_impl(model, population, fit_result, opts, true)
+}
+
+/// [`simulate_with_uncertainty_diag`], building the drawn-parameter table only when
+/// `with_parameters` (#2505).
+fn simulate_with_uncertainty_impl(
+    model: &CompiledModel,
+    population: &Population,
+    fit_result: &FitResult,
+    opts: &SimulateUncertaintyOptions,
+    with_parameters: bool,
 ) -> Result<SimulationOutput, EngineError> {
     use rand::SeedableRng;
 
@@ -1871,6 +2237,7 @@ pub fn simulate_with_uncertainty_diag(
     // `warnings`. The per-subject handling — no whole-run panic, degenerate subjects
     // censored — applies either way.
     let mut sim_warnings: Vec<String> = Vec::new();
+    let mut table = SimulatedParameters::for_model(model);
     // One solver-stats scope around every draw: the loop is serial (the RNG draw order is
     // part of the contract), so the thread-local scope sees every integration. #1304.
     let (looped, stats) = super::with_solver_stats(model, || -> Result<(), EngineError> {
@@ -1883,6 +2250,7 @@ pub fn simulate_with_uncertainty_diag(
             &mut rng,
             &mut results,
             &mut sim_warnings,
+            with_parameters.then_some(&mut table),
         )
     });
     looped?;
@@ -1906,6 +2274,7 @@ pub fn simulate_with_uncertainty_diag(
     Ok(SimulationOutput {
         results,
         warnings: sim_warnings,
+        parameters: table,
     })
 }
 
@@ -1920,6 +2289,7 @@ fn simulate_uncertainty_draws(
     rng: &mut rand::rngs::StdRng,
     results: &mut Vec<SimulationResult>,
     sim_warnings: &mut Vec<String>,
+    mut table: Option<&mut SimulatedParameters>,
 ) -> Result<(), EngineError> {
     // 1-based indices of the skipped draws, and the first one's reason (#1485).
     let mut skipped: Vec<usize> = Vec::new();
@@ -1930,6 +2300,11 @@ fn simulate_uncertainty_draws(
     // tallied individual is an η within an otherwise serviceable draw — so both warnings
     // can fire on one run.
     let mut flip_flop = SimulatedFlipFlopTally::default();
+    // The draw-independent half of the chokepoint's list, run once at the first draw that is
+    // simulated (#1288). Not "at draw 1": the skip below can pass over draw 1, and a check
+    // keyed to it would then never run. Lazily, so a run whose every draw is skipped is
+    // refused for that, as before, and a zero-draw run still returns no rows.
+    let mut checked: Option<DrawIndependentChecked<'_>> = None;
     for (k, params) in draws.iter().enumerate() {
         // A parameter draw can land in the flip-flop regime even when the point
         // estimate is in-domain. For a twin-less transit/IG closed form,
@@ -1946,6 +2321,10 @@ fn simulate_uncertainty_draws(
             first_reason.get_or_insert(msg);
             continue;
         }
+        let proof = match checked {
+            Some(c) => c,
+            None => *checked.insert(DrawIndependentChecked::run(model, population)?),
+        };
         let mut rows = simulate_inner_with_draw(
             model,
             population,
@@ -1954,10 +2333,12 @@ fn simulate_uncertainty_draws(
             k + 1,
             None,
             None,
+            Some(proof),
             class_root,
             rng,
             sim_warnings,
             &mut flip_flop,
+            table.as_deref_mut(),
         )?;
         results.append(&mut rows);
     }
@@ -2013,6 +2394,81 @@ pub struct SimulationResult {
     pub mixnum: Option<usize>,
 }
 
+/// One simulated subject's drawn parameters in one `(draw, sim)` replicate (#2505) — a row
+/// of [`SimulatedParameters`], keyed like the [`SimulationResult`] rows it produced.
+///
+/// Each value is the subject's value at its first observation row (NONMEM's `$TABLE …
+/// FIRSTONLY`); [`SimulatedParameters::varying`] names any column that changes across a
+/// subject's rows. The vectors are parallel to the table's name lists.
+#[derive(Debug, Clone)]
+pub struct SimulatedSubjectParameters {
+    pub draw: usize,
+    pub sim: usize,
+    pub id: String,
+    /// The mixture class (`MIXNUM`, 1-based) the subject ran under; `None` without a
+    /// `[mixture]`, as [`SimulationResult::mixnum`].
+    pub mixnum: Option<usize>,
+    /// The drawn between-subject η, parallel to [`SimulatedParameters::eta_names`].
+    pub eta: Vec<f64>,
+    /// The drawn inter-occasion κ, one vector per occasion group of the subject (in the
+    /// order `predict` indexes them); empty for a model without IOV.
+    pub kappas: Vec<Vec<f64>>,
+    /// The `[individual_parameters]` values, parallel to
+    /// [`SimulatedParameters::individual_names`].
+    pub individual: Vec<f64>,
+    /// The `[derived]` / `[output]` values, parallel to
+    /// [`SimulatedParameters::derived_names`]; `NaN` for a subject with no observation row.
+    pub derived: Vec<f64>,
+}
+
+/// The parameters each simulated subject was drawn with (#2505): one
+/// [`SimulatedSubjectParameters`] row per `(draw, sim, id)`, with the column names held
+/// once. [`SimulationOutput::parameters`].
+///
+/// A row reports every value at the subject's **first observation row** — its covariates,
+/// `TIME`, and the κ of that row's occasion — the `FIRSTONLY` convention of a NONMEM
+/// simulation table. Under a time-varying covariate (or a `TIME`-dependent parameter,
+/// or IOV) a value can differ across the subject's rows; every such column is named in
+/// `varying`, so a reader knows which of the reported values are a first-row snapshot
+/// rather than the subject's value at every row. A subject with no Gaussian observation
+/// reports its individual parameters at its baseline covariates and `TIME = 0`.
+///
+/// `[derived]` / `[output]` values are the columns the fit's sdtab carries for the same
+/// model, computed by the same code with the simulated η, κ, class, IPRED and `DV`.
+#[derive(Debug, Clone, Default)]
+pub struct SimulatedParameters {
+    /// The model's η names.
+    pub eta_names: Vec<String>,
+    /// The model's `[individual_parameters]`, in declaration order.
+    pub individual_names: Vec<String>,
+    /// The `[derived]` / `[output]` columns; empty when the model declares neither.
+    pub derived_names: Vec<String>,
+    /// The columns (from `individual_names` / `derived_names`) whose value differed across
+    /// the observation rows of at least one simulated subject.
+    pub varying: Vec<String>,
+    pub rows: Vec<SimulatedSubjectParameters>,
+}
+
+impl SimulatedParameters {
+    /// An empty table with `model`'s η and individual-parameter names.
+    fn for_model(model: &CompiledModel) -> Self {
+        Self {
+            eta_names: model.eta_names.clone(),
+            individual_names: reported_individual_indices(model)
+                .into_iter()
+                .map(|k| model.indiv_param_names[k].clone())
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    fn note_varying(&mut self, name: &str) {
+        if !self.varying.iter().any(|n| n == name) {
+            self.varying.push(name.to_string());
+        }
+    }
+}
+
 /// The result of [`simulate_with_options_diag`] and [`simulate_with_uncertainty_diag`]: the
 /// simulated rows plus any non-fatal
 /// per-subject diagnostics collected during the run.
@@ -2060,4 +2516,7 @@ pub struct SimulationResult {
 pub struct SimulationOutput {
     pub results: Vec<SimulationResult>,
     pub warnings: Vec<String>,
+    /// The parameters each simulated subject was drawn with — η, κ, individual parameters
+    /// and `[derived]` / `[output]` values — one row per `(draw, sim, id)` (#2505).
+    pub parameters: SimulatedParameters,
 }

@@ -39,6 +39,8 @@ theta TVKA(1.0, 0.01, 50.0)
 
 ## Theta level blocks
 
+> **Maturity: beta** ([#1064](https://github.com/FeRx-NLME/ferx-core/issues/1064)).
+
 Some models need *hundreds* of fixed effects that share one declaration. The
 motivating case is an **unstructured placebo effect** in a model-based
 meta-analysis: every (study × timepoint) cell gets its own fixed effect, so that
@@ -522,6 +524,39 @@ the next occasion's records through the drug it leaves behind, so an occasion
 sampled once is not refused on that alone when the carry-over identifies it.
 The refusal says the absorption was measured, not where it sits.
 
+###### Combinations of random effects
+
+The measurement is joint over the random effects it measures at one unit — a
+subject's ηs, an occasion's kappas (#1878): the block can absorb a combination of two that neither reaches alone.
+With `E0 = S + (ETA_E0 - ETA_X) * (ETA_E0 - ETA_X) * OCC` and `ETA_X` read
+nowhere else, either random effect alone moves `y` with `OCC`, which the
+subject's one level cannot follow; shifted together they leave the square
+unchanged and move `y` by a constant the level takes up. So each random effect
+is measured against the levels and the other measured random effects together,
+and the refusal names its partners (`` `ETA_E0`, moved together with
+`ETA_X`, ``). On a one-column block it says to drop one random effect from
+each combination: unlike two random effects each absorbed alone, dropping one
+breaks the combination it is part of. On a
+nested block each contrast is judged on the combination, so
+`sum_to_zero_within` binds when what the combination leaves the levels is a
+shift common to each group, as with `ETA_A + (ETA_A - ETA_B) * W` on
+`[STUDY, OCC]`. The others join only where they do not reproduce it on their own:
+two random effects that only duplicate each other are not the block's to
+absorb. Read `ETA_X` anywhere else as well (`EMAX = TVEMAX * exp(ETA_X)`) and
+the joint shift moves `EMAX` too: the model binds.
+
+Random effects at different units are not combined. On `[STUDY, OCC]`,
+`E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * (W + 1)` moves `y`, shifting the η
+by `c` and every occasion's kappa by `-c`, exactly as a shift of every level by
+`c`, yet the block binds: that combination moves the kappa by the same amount on
+every occasion, and a shift common to several units is pinned by the random
+effect's prior, as the same trade between an η and its kappas is in any model
+with both. It is the reason the block's levels must lie within one unit of a
+random effect for it to be absorbed at all: with
+`E0 = TVE0 + PLACEBO + KAPPA_E0` on a `[STUDY]` block whose subjects each have
+several occasions, a level and every kappa of its subject shifted against it
+leave `y` unchanged too, and the block binds.
+
 On a nested block the measurement also decides whether
 `sum_to_zero_within` rescues it. That contrast removes each group's mean, so it
 helps only when the random effect moves `y` like a shift common to the
@@ -532,14 +567,40 @@ every contrast.
 
 Like the shared-expression rule, the measurement judges the predictions: a
 block that also scales the residual error is refused when its effect on the
-predictions absorbs the random effect, and a random effect on the residual
-error itself (`iiv_on_ruv`) moves no prediction, so it is not measured. It
-judges each random effect alone, not a combination of two. Unlike the
-[dead-level check](#levels-with-no-effect), it runs on a model with a hazard,
-Markov or binary endpoint, a mixture, or an EKF diffusion term too (#2421): it
-judges the predictions, which those do not take away, every class's under a
-mixture. A random effect that reaches only such a channel moves no prediction,
-and is not measured.
+predictions absorbs the random effect. The random effect on the residual error
+itself is the one exception ([below](#the-random-effect-on-the-residual-error)).
+Unlike the [dead-level check](#levels-with-no-effect), it runs on a model with
+a hazard, Markov or binary endpoint, a mixture, or an EKF diffusion term too
+(#2421): it judges the predictions, which those do not take away, every class's
+under a mixture. A random effect that reaches only such a channel moves no
+prediction, and is not measured.
+
+###### The random effect on the residual error
+
+An `iiv_on_ruv` random effect scales the residual SD of every record of its
+subject by `exp(ETA_RUV)` and moves no prediction, so the predictions alone
+cannot see it (#1879). It is measured on each record's prediction together with
+the log of its residual variance, and the levels with it. A block absorbs it
+where some combination of the subject's levels scales the residual error as
+`ETA_RUV` does and leaves every prediction where it is. With one study per
+subject, `DV ~ proportional(PROP_ERR * exp(ERRSCALE))` on a `[STUDY]` block is
+refused under every contrast: each level and its subject's `ETA_RUV` are the
+same number, and the fit would push `ETA_RUV`'s ω to zero, informed only by its
+prior. The refusal says that `ETA_RUV` scales the residual error and moves no
+prediction. A record whose variance the likelihood cannot score as written,
+such as a proportional error at prediction 0 on a sample before the dose, is
+left out of the comparison: the likelihood puts a fixed floor there, which no
+level and no random effect moves. The verdict does not depend on the units of
+`y`.
+
+Two models that look alike bind. A block on the additive part alone,
+`combined(PROP_ERR, ADD_ERR * exp(ERRSCALE))`, changes the variance by an amount
+that follows the prediction, which a constant `exp(ETA_RUV)` scale cannot
+follow. A block on the prediction, `y = central / V * exp(ERRSCALE)` under a
+proportional error, scales the residual SD exactly as `ETA_RUV` does, but it
+also moves the prediction, which `ETA_RUV` does not. On a nested
+`[STUDY, OCC]` block, `ETA_RUV` is a shift common to the subject's levels, so
+`sum_to_zero_within` leaves it identified, and auto takes that contrast.
 
 #### Kappas
 
@@ -678,6 +739,8 @@ subject; the guards above still matter for the size of the estimation problem.
 
 #### Profiled level blocks
 
+> **Maturity: beta** ([#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065)).
+
 A block marked `profile` takes its levels out of the optimizer's search. They are
 solved for instead:
 
@@ -691,8 +754,16 @@ FOCE/FOCEI objective over the block, for the structural parameters being tried. 
 does this by Newton on the **total** gradient, which includes the levels' effect on
 η̂. Where the outer gradient is analytic, that gradient is the adjoint's exact one,
 one recording per subject per Newton step. Elsewhere, and under `gradient = fd`, it
-is a central difference with each subject's EBE re-solved at every point (#2109). The
-optimizer then searches only
+is a central difference with each subject's EBE re-solved at every point (#2109). On
+the 100-study placebo fit with `sum_to_zero_within` levels (8 visits per study, 700
+levels), the adjoint removed 87,906 of the 91,160 EBE re-solves in the outer
+optimizer's profile solves. The fit with its covariance step took 1.0 s instead of
+1.9–2.0 s, at the same OFV and with the same 31 evaluations (Linux aarch64, one
+thread, #2405). With `verbose`, a profiled fit prints these counts when its outer
+optimizer stops, before the covariance step. The count covers the optimizer's
+evaluations only: the flat-θ pre-flight's solves and the covariance step's are not in
+it.
+The optimizer then searches only
 the structural θ, Ω, Ω_IOV and Σ. A placebo model with 800 levels and 5 structural
 parameters becomes a 5-dimensional search, and the default covariance stays `r`. Under
 `optimizer = auto` a profiled fit runs L-BFGS: at the solved levels the gradient over
@@ -731,7 +802,8 @@ the unprofiled one (#2136):
   their solved values, so a resumed fit starts its first profile solve from them.
 - **Optimizer trace.** `optimizer_trace = true` writes one row per evaluation. The
   `val:` columns show the levels at their solved values. Their `grad:` columns are
-  `NA`, because the optimizer does not search over the levels.
+  `NA`, because the optimizer does not search over the levels. The `method` column
+  names the objective the levels are solved under: `foce`, `focei` or `laplace`.
 - **Per-subject gradient fallback.** If a subject cannot get the analytic outer
   gradient at some trial point, its finite-difference replacement re-solves its
   EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.
@@ -739,8 +811,8 @@ the unprofiled one (#2136):
   enough to stop the profiled L-BFGS early. The same holds inside the profile solve:
   a subject the adjoint cannot serve, or whose inner solve stopped short of its mode
   (the adjoint gradient is exact only at a mode), gets the re-solved central difference
-  for its level gradient. A warning gives the number of such subjects, once for the fit
-  and once for the covariance step (#2109). The covariance step's exact level Hessians
+  for its level gradient. `W_PROFILE_FD_GRADIENT` gives the number of such subjects,
+  once for the fit and once for the covariance step (#2109, #2405). The covariance step's exact level Hessians
   fall back the same way, with a warning of their own. A subject with fewer
   observations than `min_obs_for_convergence_check` whose inner solve stopped short
   (or fell back to Nelder–Mead) still takes the re-solved differences, but these
@@ -874,10 +946,18 @@ some other way:
   (`E_PROFILE_NOT_LINEAR`);
 - `FIX` on the block, which leaves nothing to solve, and a box that is a point, is
   empty or does not hold the init (see [Bounds on a profiled block](#bounds-on-a-profiled-block));
-- any method other than `foce` / `focei` at `n_agq = 1`, a non-additive or
+- any method other than `foce`, `focei` or `laplace`, or a stage that asks for
+  `n_agq > 1` (judged per stage of a method chain), a non-additive or
   log-transformed residual error, M3, a non-Gaussian endpoint,
   a `[mixture]`, `[diffusion]` or FREM model, `optimizer = trust_region` or `mma`,
   `global_search`, or a parameter prior (`E_PROFILE_SCOPE`).
+
+Under `method = laplace` (one node) the levels minimise the Laplace objective the fit
+reports, with each subject scored by its own `½log|H|` term (#2107). The Newton step
+keeps the least-squares matrix. That matrix is exact for a model linear in its random
+effects, so such a model still profiles in one step, at the same levels as `focei`. On a
+model nonlinear in them it converges at the same rate as under `focei`. Adaptive
+quadrature (`n_agq > 1`) is not profiled yet.
 
 Random effects on the block's rows are fine (the binder's identifiability rules apply
 as they do unprofiled), and so is a prediction nonlinear in them. So is a residual

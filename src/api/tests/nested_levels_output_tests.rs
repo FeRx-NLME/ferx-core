@@ -227,6 +227,29 @@ fn an_unobserved_group_takes_its_weight_from_its_own_record() {
     assert_eq!(typical, vec![Some(20.0), None]);
 }
 
+/// The same when study 3's only record is an EVID=3/4 reset row instead of an `MDV = 1`
+/// row (#1153 review r1 #3): the reset row's own NS = 30 is study 3's weight, so the
+/// median is still 20, not the 10 the subject's covariates would give.
+#[test]
+fn a_group_only_a_reset_row_carries_takes_its_weight_from_that_row() {
+    let m = model_with("kappa K_ST ~ 4.0 at STUDY weight = NS");
+    let mut p = population(2);
+    for s in &mut p.subjects {
+        s.pk_only_times.truncate(1);
+        s.pk_only_covariates.truncate(1);
+        s.reset_times = vec![2.5];
+        s.reset_covariates = vec![snap(3.0, 1.0)];
+    }
+    assign_level_cells(&m, &mut p);
+    assert_eq!(
+        NestedLayout::of(&m, &p.subjects[0]).map(|n| n.n_cells()),
+        Some(5),
+        "study 3 is still a cell, now from the reset row"
+    );
+    let typical = kappa_weight_typicals(&m, &p, &m.default_params.theta);
+    assert_eq!(typical, vec![Some(20.0), None]);
+}
+
 // ── the KAPPA rows, summary and YAML `at LEVEL` ──────────────────────────────────
 
 /// A fit result with two kappas, `K_ST` (log-normal) and `K_ARM` (weight `NARM`, typical

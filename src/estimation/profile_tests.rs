@@ -120,9 +120,14 @@ fn total_ofv(c: &ProfileCtx<'_>, params: &ModelParameters, beta: &[f64]) -> f64 
 /// point is the gradient's zero whatever the matrix). Returns the minimum and its
 /// argument.
 fn oracle_min(c: &ProfileCtx<'_>, params: &ModelParameters, start: &[f64]) -> (f64, Vec<f64>) {
+    oracle_min_of(|x| total_ofv(c, params, x), start)
+}
+
+/// [`oracle_min`] on any objective of the levels `f`, so a test can hand it one that
+/// shares nothing with [`ProfileCtx::resolve`] (#2107's D3-L).
+fn oracle_min_of(f: impl Fn(&[f64]) -> f64, start: &[f64]) -> (f64, Vec<f64>) {
     let n = start.len();
     let mut b = start.to_vec();
-    let f = |x: &[f64]| total_ofv(c, params, x);
     let at = |b: &[f64], d: &[(usize, f64)]| {
         let mut x = b.to_vec();
         for &(j, v) in d {
@@ -166,6 +171,11 @@ fn oracle_min(c: &ProfileCtx<'_>, params: &ModelParameters, start: &[f64]) -> (f
 /// levels at the current η̂, H and κ̂ held, re-solve the EBEs, repeat. Each inner step is
 /// Newton on the held objective with the Newton matrix; returns its objective.
 fn frozen_fixed_point(c: &ProfileCtx<'_>, params: &ModelParameters, start: &[f64]) -> f64 {
+    total_ofv(c, params, &frozen_levels(c, params, start))
+}
+
+/// The levels of [`frozen_fixed_point`], the held objective being the fit's own term.
+fn frozen_levels(c: &ProfileCtx<'_>, params: &ModelParameters, start: &[f64]) -> Vec<f64> {
     let mut b = start.to_vec();
     let n = b.len();
     let zero = DVector::zeros(c.model.n_eta);
@@ -186,7 +196,7 @@ fn frozen_fixed_point(c: &ProfileCtx<'_>, params: &ModelParameters, start: &[f64
             states
                 .iter()
                 .enumerate()
-                .map(|(i, s)| c.held(i, &q, s, c.options.interaction))
+                .map(|(i, s)| c.fit_term(i, &q, &s.eta, &s.h, &s.kappas))
                 .sum()
         };
         let h = 1e-3;
@@ -217,7 +227,7 @@ fn frozen_fixed_point(c: &ProfileCtx<'_>, params: &ModelParameters, start: &[f64
             break;
         }
     }
-    total_ofv(c, params, &b)
+    b
 }
 
 fn layout_of(p: &crate::api::PreparedRun) -> ProfileLayout {
@@ -1904,9 +1914,21 @@ fn a_profiled_fit_writes_a_checkpoint_at_its_incumbent() {
 /// (unread) gradient entries.
 #[test]
 fn a_profiled_fit_writes_its_optimizer_trace() {
-    let path = temp("trace.csv");
+    profiled_trace(|t| t, "focei", "trace.csv");
+}
+
+/// #2107: the trace's method column names the estimator. A profiled Laplace fit was
+/// traced `focei`, since Laplace inherits `interaction = true`. Dies when the label is
+/// chosen from `interaction` alone.
+#[test]
+fn a_profiled_laplace_fit_is_traced_as_laplace() {
+    profiled_trace(laplace, "laplace", "trace_laplace.csv");
+}
+
+fn profiled_trace(edit: fn(String) -> String, method: &str, file: &str) {
+    let path = temp(file);
     let path_s = path.to_str().unwrap().to_string();
-    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let p = prep(F2, F2_DATA, Some(2), edit);
     let names = crate::estimation::parameterization::coordinate_names(&p.init_params);
     crate::estimation::trace::init(path_s.clone(), &names).unwrap();
     let o = FitOptions {
@@ -1933,6 +1955,7 @@ fn a_profiled_fit_writes_its_optimizer_trace() {
     let tve0 = names.iter().position(|n| n == "TVE0").unwrap();
     for row in &rows {
         assert_eq!(row.len(), 17 + 2 * n, "{row:?}");
+        assert_eq!(row[1], method, "the method column: {row:?}");
         assert!(row[3].parse::<f64>().unwrap().is_finite(), "ofv {row:?}");
         assert_ne!(row[17 + tve0 + n], "NA", "a structural gradient: {row:?}");
         for &k in &layout.coords {
@@ -3147,23 +3170,24 @@ fn a_declined_subject_takes_the_fd_gradient_and_is_recorded() {
 /// β̂ lie within ~2e-5 SE of each other. Realised 1.1e-7 SE (Linux aarch64, macOS arm64).
 const DECLINED_BETA: f64 = 1e-5;
 
-/// The fit-level warning, in full: one subject declined, named, with the consequence.
-/// Asserted by equality, so dropping any clause of it fails. The same fit without the
-/// switch is the straddle: no warning.
+/// The fit-level warning, in full: its code, one subject declined, named, with the
+/// consequence. Asserted by equality, so dropping any clause of it fails. The same fit
+/// without the switch is the straddle: no warning.
 #[test]
 fn a_profiled_fit_reports_its_fd_profile_gradients() {
     let (p, forced) = with_declined(0, || short_profiled_fit(|t| t));
     let n = p.population.subjects.len();
     let id = &p.population.subjects[0].id;
     let want = format!(
-        "1 of {n} subjects could not be given the exact analytic gradient of the profile \
-         solve during this fit (e.g. subject {id}), and their profiled levels' gradients \
-         used reconverged finite differences, which are correct but slower."
+        "W_PROFILE_FD_GRADIENT: 1 of {n} subjects could not be given the exact analytic \
+         gradient of the profile solve during this fit (e.g. subject {id}), and their \
+         profiled levels' gradients used reconverged finite differences, which are correct \
+         but slower."
     );
     let ours = |r: &OuterResult| -> Vec<String> {
         r.warnings
             .iter()
-            .filter(|w| w.contains("gradient of the profile solve"))
+            .filter(|w| w.contains("W_PROFILE_FD_GRADIENT"))
             .cloned()
             .collect()
     };
@@ -3197,15 +3221,199 @@ fn the_profiled_covariance_step_reports_its_fd_profile_gradients() {
         .filter(|w| w.contains("during the covariance step"))
         .collect();
     assert_eq!(mine.len(), 1, "{:?}", out.warnings);
-    assert!(
-        mine[0].starts_with(&format!(
-            "1 of {} subjects could not be given the exact analytic gradient of the profile \
-             solve during the covariance step (e.g. subject {id})",
+    assert_eq!(
+        *mine[0],
+        format!(
+            "W_PROFILE_FD_GRADIENT: {} of {} subjects could not be given the exact analytic \
+             gradient of the profile solve during the covariance step (e.g. subject {id}), and \
+             their profiled levels' gradients used reconverged finite differences, which are \
+             correct but slower.",
+            1,
             p.population.subjects.len()
-        )),
-        "{}",
-        mine[0]
+        )
     );
+}
+
+/// #2405: the warning is classified by its code, not its prose. Both phases' text is
+/// `GradientFallback` at `Info`; the same text without the code is not, so the straddle
+/// is asserted and the arm cannot quietly become a prose match. Dies when the arm is
+/// dropped, or moved below a prose arm that claims the text.
+#[test]
+fn the_profile_fd_gradient_warning_is_classified_by_its_code() {
+    use crate::types::{classify_warning, WarningCode, WarningSeverity};
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let subjects = std::collections::BTreeSet::from([0usize]);
+    for during in ["during this fit", "during the covariance step"] {
+        let w = profile_fd_gradient_warning(&p.population, &subjects, during).unwrap();
+        let c = classify_warning(&w);
+        assert_eq!(c.severity, WarningSeverity::Info, "{w}");
+        assert_eq!(c.category, WarningCode::GradientFallback, "{w}");
+        let bare = w.strip_prefix("W_PROFILE_FD_GRADIENT: ").unwrap();
+        let b = classify_warning(bare);
+        assert!(
+            (b.severity, b.category) != (WarningSeverity::Info, WarningCode::GradientFallback),
+            "the prose alone classifies as the code does, so the straddle is gone: {bare}"
+        );
+    }
+}
+
+/// #2405: the work a solve counts, against identities that hold for any run. Every Newton
+/// pass takes one level gradient per subject, so a group's gradients are its subjects
+/// times its passes; a declined subject's gradient is differenced, two re-solves per
+/// level it reads. Dies when a gradient is not counted, a decline is counted as adjoint,
+/// or the difference re-solves are dropped.
+#[test]
+fn a_profile_solve_counts_its_work() {
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let warm = ProfileWarm::from_template(&layout, &p.init_params);
+    let run = |declined: Option<usize>| {
+        let mut work = ProfileCounts::default();
+        FORCE_PROFILE_GRADIENT_DECLINE.with(|x| x.set(declined));
+        let s = c.solve_counted(&p.init_params, &warm, &mut work);
+        FORCE_PROFILE_GRADIENT_DECLINE.with(|x| x.set(None));
+        (s.expect("the profile solve failed"), work)
+    };
+    let (plain_s, plain) = run(None);
+    let (forced_s, forced) = run(Some(1));
+    // The identities below need both arms to stop after the same steps, so their final
+    // criteria must sit clear of `PROFILE_TOL` against the ~1e-7 SE a decline moves the
+    // gradient by (#2405 review S3). Measured on Linux aarch64 and macOS arm64 alike: both
+    // arms stop at 5.239e-6 (margin 4.761e-6, ~48× the perturbation) after 8 steps; plain
+    // 8 re-solves and 11 adjoint gradients, forced 7 adjoint + 4 differenced and
+    // 8 + 2·3·4 = 32 re-solves.
+    eprintln!(
+        "plain {plain:?}, criterion {:.3e} (margin {:.3e}); forced {forced:?}, criterion \
+         {:.3e} (margin {:.3e})",
+        plain_s.criterion,
+        PROFILE_TOL - plain_s.criterion,
+        forced_s.criterion,
+        PROFILE_TOL - forced_s.criterion
+    );
+    assert_eq!(plain.fd_gradients, 0, "{plain:?}");
+    assert_eq!(plain.adjoint_gradients, plain_s.n_adjoint_gradients);
+    assert!(plain.newton_steps >= plain_s.iterations.max(1), "{plain:?}");
+    // The straddle: the decline moves gradients from adjoint to differenced and nothing else,
+    // since the two solves take the same steps (β̂ within 1e-5 SE, above).
+    assert_eq!(
+        forced.newton_steps, plain.newton_steps,
+        "{forced:?} vs {plain:?}"
+    );
+    assert!(forced.fd_gradients >= 1, "{forced:?}");
+    assert_eq!(
+        forced.adjoint_gradients + forced.fd_gradients,
+        plain.adjoint_gradients,
+        "{forced:?} vs {plain:?}"
+    );
+    let k1 = layout.reads[1].len();
+    assert_eq!(
+        forced.resolves,
+        plain.resolves + 2 * k1 * forced.fd_gradients,
+        "{forced:?} vs {plain:?}"
+    );
+}
+
+/// #2405: a failed group's work is counted, not dropped with its `Err`. Every group is
+/// failed after its first Newton step: the solve fails, and the work it did is there.
+/// Dies when the counts are summed after the failure returns.
+#[test]
+fn a_failed_profile_solve_still_counts_its_work() {
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let warm = ProfileWarm::from_template(&layout, &p.init_params);
+    let mut work = ProfileCounts::default();
+    FORCE_PROFILE_GROUP_FAILURE.with(|x| x.set(Some(1)));
+    let s = c.solve_counted(&p.init_params, &warm, &mut work);
+    FORCE_PROFILE_GROUP_FAILURE.with(|x| x.set(None));
+    eprintln!("failed {work:?}, groups {}", layout.groups.len());
+    // Measured on Linux aarch64 and macOS arm64 alike: 3 groups, 3 steps, 3 re-solves, 6
+    // adjoint gradients.
+    assert!(
+        matches!(s, Err(ProfileFailure::NotConverged { .. })),
+        "{s:?}"
+    );
+    let n = p.population.subjects.len();
+    assert_eq!(
+        work.newton_steps,
+        layout.groups.len(),
+        "one step per group: {work:?}"
+    );
+    assert_eq!(
+        work.adjoint_gradients,
+        2 * n,
+        "two passes per subject: {work:?}"
+    );
+    assert!(
+        work.resolves >= n,
+        "one line-search trial per subject at least: {work:?}"
+    );
+}
+
+/// #2405: the `verbose` summary, in full. Each figure lands in its own slot.
+#[test]
+fn the_profile_work_summary_names_each_count() {
+    let c = ProfileCounts {
+        newton_steps: 11,
+        resolves: 222,
+        adjoint_gradients: 33,
+        fd_gradients: 4,
+    };
+    assert_eq!(
+        profile_work_summary(7, 2, &c),
+        "Profile solves of the outer optimizer: 7 evaluations (2 solve failures, their work \
+         counted), 11 Newton steps summed over groups, 222 EBE re-solves, level gradients 33 \
+         adjoint / 4 finite-difference"
+    );
+}
+
+/// #2405: a `verbose` profiled fit sums its solves' work, a failed solve's included. With
+/// one subject declined the fit records differenced gradients; with every group failed at
+/// its first pass, every solve fails and the fit still records each one's gradients (and
+/// takes `failed_result`). Runs `verbose`, so the summary line is
+/// executed. Dies when the fit stops accumulating, or accumulates only successful solves.
+#[test]
+fn a_verbose_profiled_fit_sums_its_profile_work() {
+    let verbose_fit = || {
+        let p = prep(F2, F2_DATA, Some(2), |t| t);
+        let o = FitOptions {
+            outer_maxiter: 3,
+            run_covariance_step: false,
+            verbose: true,
+            ..options(&p)
+        };
+        LAST_PROFILE_WORK.with(|c| c.set(None));
+        LAST_PROFILE_SUMMARY.with(|c| *c.borrow_mut() = None);
+        let _ = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+        let (n, failed, work) = LAST_PROFILE_WORK
+            .with(std::cell::Cell::get)
+            .expect("the fit recorded its work");
+        // What was printed is the line of what was summed (#2405 review N2).
+        let printed = LAST_PROFILE_SUMMARY.with(|c| c.borrow_mut().take());
+        assert_eq!(printed, Some(profile_work_summary(n, failed, &work)));
+        (n, failed, work)
+    };
+    let (n, failed, work) = with_declined(0, verbose_fit);
+    eprintln!("declined: {n} evals, {failed} failed, {work:?}");
+    assert!(n >= 1);
+    assert_eq!(failed, 0, "{work:?}");
+    assert!(
+        work.fd_gradients >= 1 && work.adjoint_gradients >= 1,
+        "{work:?}"
+    );
+
+    FORCE_PROFILE_GROUP_FAILURE.with(|x| x.set(Some(0)));
+    let out = std::panic::catch_unwind(verbose_fit);
+    FORCE_PROFILE_GROUP_FAILURE.with(|x| x.set(None));
+    let (n, failed, work) = out.unwrap_or_else(|e| std::panic::resume_unwind(e));
+    eprintln!("failing: {n} evals, {failed} failed, {work:?}");
+    assert!(n >= 1);
+    assert_eq!(failed, n, "every solve fails");
+    assert_eq!(work.newton_steps, 0, "{work:?}");
+    assert!(work.adjoint_gradients >= n, "{work:?}");
 }
 
 /// A level that would log-pack declines the adjoint level gradient (#2401 review row 1):
@@ -5402,4 +5610,266 @@ fn a_resolution_certified_mode_is_off_mode() {
         off_mode(&ebe(true)),
         "a resolution-only certificate is not a mode to tol"
     );
+}
+
+// ── #2107: the profile under `method = laplace` (PR-L) ──────────────────────────────
+//
+// Every test that guards the objective's identity runs on F2, where the Laplace and
+// FOCEI objectives differ (by 0.75 OFV at its initial point), so "scores FOCEI instead"
+// is reachable. F1 is used only where Laplace = FOCEI in the levels is the point (N1-L).
+
+/// The fixture's text under `method = laplace` (one node).
+fn laplace(t: String) -> String {
+    assert!(t.contains("  method     = focei\n"), "the fixture moved");
+    t.replace("  method     = focei\n", "  method     = laplace\n")
+}
+
+/// The Laplace population objective with the layout's coordinates at `beta`: every EBE
+/// re-solved cold by the population inner loop and scored by
+/// [`crate::estimation::agq::agq_population_nll`], the unprofiled fit's own Laplace
+/// objective. It shares nothing with [`ProfileCtx::resolve`] or `fit_term`, so it is the
+/// reference a solve scoring the wrong objective cannot agree with.
+fn laplace_ofv(p: &crate::api::PreparedRun, params: &ModelParameters, beta: &[f64]) -> f64 {
+    let layout = layout_of(p);
+    let o = options(p);
+    let mut q = params.clone();
+    for (&k, &b) in layout.coords.iter().zip(beta) {
+        q.theta[k] = b;
+    }
+    let mu = compute_mu_k(&p.parsed.model, &q.theta, o.mu_referencing);
+    let (e, _, _, k) = run_inner_loop_warm_seeded(
+        &p.parsed.model,
+        &p.population,
+        &q,
+        o.inner_maxiter,
+        PROFILE_INNER_TOL,
+        None,
+        Some(&mu),
+        0,
+        o.inner_restarts,
+        InnerHessianSeed::for_options(&o),
+        &o,
+    );
+    2.0 * crate::estimation::agq::agq_population_nll(
+        &p.parsed.model,
+        &p.population,
+        &q,
+        &e,
+        &k,
+        o.agq_nodes().expect("a Laplace fixture"),
+        o.hessian_anchor(),
+    )
+}
+
+/// N1-L. On F1 (linear in (η, κ), additive error) the exact `∂²l/∂η²` is FOCEI's `H̃` and
+/// reads no level, so `½log|H|` is constant in the levels: the Laplace solve still lands
+/// in **one** Newton step, at FOCEI's levels. Dies when the Newton matrix is taken from the
+/// fit's own Laplace term (`fit_term` in `held_hessian`): the held-η̂ curvature
+/// `XᵀR⁻¹X`, which converges linearly.
+#[test]
+fn a_linear_model_profiles_in_one_newton_step_under_laplace() {
+    let pf = prep(F1, F1_DATA, None, |t| t);
+    let pl = prep(F1, F1_DATA, None, laplace);
+    assert_eq!(options(&pl).agq_nodes(), Some(1));
+    let (_, sf) = solve_at(&pf);
+    let (layout, sl) = solve_at(&pl);
+    assert!(
+        sl.n_adjoint_gradients > 0 && sl.fd_gradient_subjects.is_empty(),
+        "N1-L runs on the adjoint level gradient"
+    );
+    let worst = layout
+        .coords
+        .iter()
+        .map(|&k| (sl.params.theta[k] - sf.params.theta[k]).abs())
+        .fold(0.0_f64, |a, v| {
+            assert!(v.is_finite());
+            a.max(v)
+        });
+    eprintln!(
+        "N1-L: {} step(s), criterion {:.2e}, max |β_laplace − β_focei| {worst:.3e}",
+        sl.iterations, sl.criterion
+    );
+    assert_eq!(sl.iterations, 1, "criterion {:.3e}", sl.criterion);
+    assert!(sl.criterion.is_finite() && sl.criterion <= PROFILE_TOL);
+    assert!(worst < N1L_LEVELS, "{worst:.3e}");
+}
+
+/// Worst realised |β_laplace − β_focei| on F1: 8.9e-16 (macOS arm64), rounding. The
+/// bound is set where a one-step solve to `PROFILE_TOL` from a different objective would
+/// land (≥ 1e-6), with the measured value far below it.
+const N1L_LEVELS: f64 = 1e-10;
+
+/// D3-L. On F2 cut to two studies, the Laplace solve's objective and levels equal the
+/// dense oracle's minimum of the **unprofiled Laplace objective** ([`laplace_ofv`],
+/// nothing shared with the solve), and the frozen-EBE fixed point lands above it by more
+/// than 1e-2, in the same test (the straddle). Dies when the solve scores FOCEI
+/// (`subject_nll` in `resolve` or `fit_term`): it then minimises the wrong function and
+/// misses the oracle.
+#[test]
+fn the_laplace_profile_objective_is_the_minimum_over_the_levels() {
+    let p = prep(F2, F2_DATA, Some(2), laplace);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let warm = ProfileWarm::from_template(&layout, &p.init_params);
+    let s = c.solve(&p.init_params, &warm).expect("the solve converges");
+    assert!(s.n_adjoint_gradients > 0 && s.fd_gradient_subjects.is_empty());
+    let (o_star, b_star) = oracle_min_of(|b| laplace_ofv(&p, &p.init_params, b), &warm.beta);
+    let frozen = laplace_ofv(
+        &p,
+        &p.init_params,
+        &frozen_levels(&c, &p.init_params, &warm.beta),
+    );
+    assert!(s.ofv.is_finite() && o_star.is_finite() && frozen.is_finite());
+    let worst_beta = layout
+        .coords
+        .iter()
+        .zip(&b_star)
+        .zip(&s.se_scale)
+        .map(|((&k, &b), &se)| ((s.params.theta[k] - b) / se).abs())
+        .fold(0.0_f64, |a, v| {
+            assert!(v.is_finite());
+            a.max(v)
+        });
+    eprintln!(
+        "D3-L: profile {:.10} oracle {:.10} (Δ {:.2e}), worst level gap {:.2e} SE, \
+         frozen-EBE Δ {:.3e}, {} steps",
+        s.ofv,
+        o_star,
+        s.ofv - o_star,
+        worst_beta,
+        frozen - o_star,
+        s.iterations
+    );
+    assert!(
+        s.iterations > 1,
+        "a nonlinear fixture takes more than one step"
+    );
+    assert!((s.ofv - o_star).abs() < D3L_OFV, "{} vs {}", s.ofv, o_star);
+    assert!(worst_beta < D3_BETA_BOUND, "{worst_beta}");
+    assert!(
+        frozen - o_star > D3L_FROZEN,
+        "the straddle: {}",
+        frozen - o_star
+    );
+}
+
+/// Worst realised |ΔOFV| 1.4e-10 (probe, macOS arm64): the oracle's FD and inner-solve
+/// noise. The plan's exit bound.
+const D3L_OFV: f64 = 1e-8;
+/// The frozen-EBE point above the minimum must exceed this for D3-L to mean anything.
+/// Realised 2.36e-2 (1.2e-2 per study).
+const D3L_FROZEN: f64 = 1e-2;
+
+/// D0-L. The Laplace solve's objective equals [`crate::estimation::agq::agq_population_nll`]
+/// after a cold population inner loop, at the joint point it returns. Dies when `fit_term`
+/// scores FOCEI, reads FOCEI's Gauss–Newton anchor, or drops `½log|H|`.
+#[test]
+fn the_laplace_profiled_objective_is_the_unprofiled_one_at_its_own_point() {
+    let p = prep(F2, F2_DATA, Some(3), laplace);
+    let (layout, s) = solve_at(&p);
+    let beta: Vec<f64> = layout.coords.iter().map(|&k| s.params.theta[k]).collect();
+    let plain = laplace_ofv(&p, &s.params, &beta);
+    // The straddle: FOCEI's profile objective at the same structural point.
+    let (_, f) = solve_at(&prep(F2, F2_DATA, Some(3), |t| t));
+    eprintln!(
+        "D0-L: profiled {:.12} plain {:.12} (Δ {:.2e}); FOCEI {:.6}",
+        s.ofv,
+        plain,
+        s.ofv - plain,
+        f.ofv
+    );
+    assert!(s.ofv.is_finite() && plain.is_finite() && f.ofv.is_finite());
+    assert!((s.ofv - plain).abs() < D0_BOUND, "{} vs {}", s.ofv, plain);
+    assert!(
+        (s.ofv - f.ofv).abs() > 1e3 * D0_BOUND,
+        "Laplace ≠ FOCEI here"
+    );
+}
+
+/// G2-L. The adjoint level gradient under `laplace` against the reconverged differences
+/// of the Laplace term ([`level_gradient_gaps`]). Dies when `objective()` returns
+/// `Focei` under Laplace: the adjoint then differentiates the wrong function.
+#[test]
+fn the_adjoint_level_gradient_is_the_reconverged_fd_one_under_laplace() {
+    for (name, p) in [
+        ("F2", prep(F2, F2_DATA, Some(3), laplace)),
+        (
+            "F2 car1",
+            scored(prep(F2, F2_DATA, Some(3), |t| {
+                laplace(t)
+                    .replace(
+                        "  omega ETA_EM",
+                        "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM",
+                    )
+                    .replace(
+                        "weight = SE\n",
+                        "weight = SE\n  correlation car1(RHO) by OCC\n",
+                    )
+            })),
+        ),
+    ] {
+        assert!(profile_gradient_is_analytic(&p.parsed.model, &options(&p)));
+        let (gap, size) = level_gradient_gaps(&p);
+        eprintln!("G2-L {name}: worst gap {gap:.3e} SE, largest gradient {size:.3e} SE");
+        assert!(
+            size > G2_LIVE,
+            "{name}: the gradient is not live ({size:.3e})"
+        );
+        assert!(gap < G2_BOUND, "{name}: {gap:.3e}");
+    }
+}
+
+/// G1-L. Under `laplace` the envelope gradient is the gradient of the profile objective
+/// on both engines, and the solve's level gradient runs on the outer gradient's engine:
+/// the profile's predicate is the one AGQ's outer gradient routes on
+/// (`agq::analytic_score_supported`), on either `gradient` setting. Dies when
+/// `profile_gradient_is_analytic` ignores `gradient = fd` (the solve on the adjoint while
+/// the outer loop is on FD, asserted from the counts in [`envelope_matches_fd`]).
+#[test]
+fn the_envelope_gradient_is_the_profile_gradient_under_laplace() {
+    for (fd, edit) in [
+        (false, laplace as fn(String) -> String),
+        (true, |t| {
+            forced_fd(t).replace("  method     = focei\n", "  method     = laplace\n")
+        }),
+    ] {
+        let p = prep(F2, F2_DATA, Some(3), edit);
+        let o = options(&p);
+        assert_eq!(o.agq_nodes(), Some(1));
+        assert_eq!(
+            profile_gradient_is_analytic(&p.parsed.model, &o),
+            crate::estimation::agq::analytic_score_supported(&p.parsed.model),
+            "fd={fd}: one predicate"
+        );
+        assert_eq!(profile_gradient_is_analytic(&p.parsed.model, &o), !fd);
+        envelope_matches_fd(edit, !fd);
+    }
+}
+
+/// G3-L. A subject whose adjoint level gradient is declined under `laplace` takes the
+/// **reconverged** differences — the EBE re-solved at every point — and the solve lands
+/// where the all-adjoint one does. Dies when a declined subject's gradient is taken with
+/// its EBE held (the frozen-EBE shortcut, +1.2e-2 OFV per study here).
+#[test]
+fn a_declined_subject_takes_the_reconverged_gradient_under_laplace() {
+    let p = prep(F2, F2_DATA, Some(3), laplace);
+    let (layout, plain) = solve_at(&p);
+    let (_, forced) = with_declined(1, || solve_at(&p));
+    assert_eq!(forced.fd_gradient_subjects, vec![1]);
+    assert!(plain.fd_gradient_subjects.is_empty());
+    let worst = layout
+        .coords
+        .iter()
+        .zip(&forced.se_scale)
+        .map(|(&k, se)| (forced.params.theta[k] - plain.params.theta[k]).abs() / se)
+        .fold(0.0_f64, |a, b| {
+            assert!(b.is_finite());
+            a.max(b)
+        });
+    eprintln!(
+        "G3-L: declined vs adjoint β̂ {worst:.3e} SE, ΔOFV {:.2e}",
+        forced.ofv - plain.ofv
+    );
+    assert!(worst < DECLINED_BETA, "{worst:.3e}");
 }

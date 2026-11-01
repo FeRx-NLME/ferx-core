@@ -253,7 +253,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if subject_has_survival_records(subject) {
         return IOV_SURVIVAL_REASON;
     }
-    if !crate::sens::ode_provider::adjoint::model_in_scope(model) {
+    if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         return "model outside IOV analytic scope";
     }
     // A nested-level subject never given its cells has no compact axes (#1082): every
@@ -615,22 +615,17 @@ fn analytic_inner_seed_hessian(
         return None;
     }
     // The light path fuses the first BFGS gradient, so it must assemble exactly the
-    // terms `analytic_eta_nll_gradient_with_schedule` does. Everything that routine
-    // routes elsewhere (dense-R, `iiv_on_ruv`, FREM pseudo-rows, an endpoint-only
-    // subject) declines here to the full provider, whose seed carries no gradient.
-    let mut light_supported = model.residual_error_eta.is_none()
+    // terms `analytic_eta_nll_gradient_with_schedule` does: the Gaussian rows below, the
+    // prior, and the subject's non-Gaussian blocks (TTE, binary, CTMM) through the same
+    // `non_gaussian_eta_grad`. Leaving a block out hands BFGS the gradient of a different
+    // objective than `obj` scores — on a joint PK-TTE subject every warm start then began
+    // off the hazard term and fell to Nelder–Mead (#2482). Everything that routine routes
+    // elsewhere (dense-R, `iiv_on_ruv`, FREM pseudo-rows, an endpoint-only subject)
+    // declines here to the full provider, whose seed carries no gradient.
+    let light_supported = model.residual_error_eta.is_none()
         && !model.residual_cov_at(params).is_dense()
         && model.frem_config.is_none()
         && !subject.obs_times.is_empty();
-    // A CTMM subject's inner gradient carries the `ctmm_subject_eta_grad` block on top of
-    // the Gaussian one; this loop does not fold it, so a fused gradient here would hand
-    // BFGS the gradient of a different objective than `obj` scores.
-    #[cfg(feature = "markov")]
-    {
-        light_supported = light_supported && !model.has_ctmm();
-    }
-    // Likewise the binary block (#2024), now that binary subjects run the analytic gradient.
-    light_supported = light_supported && !model.has_discrete();
     if light_supported && !exact {
         let hint = std::mem::take(obs_grad_recycle);
         let _ = (schedule, hint);
@@ -706,16 +701,36 @@ fn analytic_inner_seed_hessian(
                 }
             }
             *obs_grad_recycle = sens;
-            if valid && htilde.iter().all(|v| v.is_finite()) {
+            // The non-Gaussian blocks; one that declines declines the fused gradient too.
+            let endpoints = if subject.obs_records.is_empty() {
+                Some(Vec::new())
+            } else {
+                non_gaussian_eta_grad(model, subject, &params.theta, eta)
+            };
+            if let (true, Some(endpoints)) =
+                (valid && htilde.iter().all(|v| v.is_finite()), endpoints)
+            {
                 let prior = &params.omega.inv * DVector::from_column_slice(eta);
                 for (g, p) in gradient.iter_mut().zip(prior.iter()) {
                     *g += p;
+                }
+                for (g, q) in gradient.iter_mut().zip(&endpoints) {
+                    *g += q;
                 }
                 if gradient.iter().all(|v| v.is_finite()) {
                     return Some((htilde, Some(gradient)));
                 }
             }
         }
+    }
+    // A subject with no Gaussian rows has no Gauss–Newton metric to seed from: `H̃` would be
+    // `Ω⁻¹` plus the endpoint term's curvature, a second-order pass of the term per solve that
+    // returns no fused gradient. Measured on #2482's endpoint-only fits (bobyqa, best of 4),
+    // the unseeded solve is faster on every one — tte_gompertz 0.079 → 0.037 s,
+    // tte_competing_risks 0.060 → 0.043 s, rtte_exponential 0.193 → 0.159 s — at the same
+    // OFV, while a joint PK-TTE subject keeps the seed it gains from (0.72 vs 1.01 s).
+    if !exact && subject.obs_times.is_empty() {
+        return None;
     }
     // The full seed is a metric only (no fused gradient), valid under a frozen variance for
     // the reason given at `frozen_var_preds` above: the unified recording's exact Hessian
@@ -1472,7 +1487,7 @@ fn certified_stuck_partial(
 /// per-vertex ODE cost as a hand-written `[odes]` IOV model even though the primary's own
 /// `ode_spec` is `None`. The reroute is subject-static here (driven by `n_kappa`, not by data),
 /// so the model-only classifier is exact.
-fn is_ode_iov(model: &CompiledModel) -> bool {
+pub(crate) fn is_ode_iov(model: &CompiledModel) -> bool {
     model.n_kappa > 0 && (model.ode_spec.is_some() || model.absorption_ode_equivalent.is_some())
 }
 
@@ -1651,10 +1666,28 @@ pub(crate) fn cacheable_schedule(
     model: &CompiledModel,
     subject: &Subject,
 ) -> Option<pk::event_driven::EventSchedule> {
-    if (subject.has_tv_covariates()
-        || subject.has_resets()
-        || pk::model_uses_time_anywhere(model))
-        && model.ode_spec.is_none()
+    ((subject.has_tv_covariates() || subject.has_resets() || pk::model_uses_time_anywhere(model))
+        && schedule_stays_fresh(model, subject))
+    .then(|| subject_schedule(model, subject))
+}
+
+/// [`cacheable_schedule`] for an IOV subject (#1564): its staleness rules alone, without
+/// the routing arm. An IOV subject on an event-driven model always walks the event-driven
+/// funnel (`pk::predict_iov_in`), which otherwise rebuilt and re-sorted the schedule inside
+/// every objective evaluation of the EBE search (10.6% of a `warfarin_iov` fit).
+pub(crate) fn cacheable_schedule_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> Option<pk::event_driven::EventSchedule> {
+    schedule_stays_fresh(model, subject).then(|| subject_schedule(model, subject))
+}
+
+/// The staleness rules of [`cacheable_schedule`], the one place they live, so the IOV
+/// gate ([`cacheable_schedule_iov`]) and the routed one cannot drift: an analytical,
+/// event-driven, non-algebraic model, with no lagtime and no `F` reshaping a rate-defined
+/// infusion's window.
+fn schedule_stays_fresh(model: &CompiledModel, subject: &Subject) -> bool {
+    model.ode_spec.is_none()
         // A compartment-free model (#811) never runs the event-driven walk — the
         // predictor short-circuits before it — and its `pk_model` is a placeholder,
         // so a schedule built from it would be a cache for a route nothing takes.
@@ -1664,16 +1697,10 @@ pub(crate) fn cacheable_schedule(
         && pk::event_driven::supports_event_driven(model.pk_model)
         && !model.has_lagtime()
         && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
-    {
-        Some(pk::event_driven::EventSchedule::for_subject(
-            subject,
-            model.pk_model,
-            &subject.doses,
-            &[],
-        ))
-    } else {
-        None
-    }
+}
+
+fn subject_schedule(model: &CompiledModel, subject: &Subject) -> pk::event_driven::EventSchedule {
+    pk::event_driven::EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &[])
 }
 
 /// Per-coordinate "weakly-identified random effect" detector for the guarded
@@ -2329,6 +2356,10 @@ fn find_ebe_solve(
     // `df_deta` allocations in place instead of allocating one `Vec<f64>` per
     // observation on every call.
     let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
+    // The η (bits) whose exact rows `obs_grad_recycle` holds — set by a successful analytic
+    // gradient, cleared by anything else that writes the buffer — so the terminal Jacobian at
+    // the solve's own end point reuses them instead of recording the subject again (#1564).
+    let rows_at: RefCell<Option<Vec<u64>>> = RefCell::new(None);
     let pred_recycle = RefCell::new(Vec::<f64>::new());
     // `obj`'s own scratch.
     let eta_work = RefCell::new(DVector::zeros(n_eta));
@@ -2403,6 +2434,30 @@ fn find_ebe_solve(
         v
     };
 
+    // No random effects: the mode is the empty vector and `H` has no columns, so there is
+    // nothing to search, seed or certify — only the objective at it. Without this the solve
+    // still ran its seed, gradient and `H` passes per subject per evaluation, each on an
+    // empty η (a binary or CTMM model without random effects paid twice the base's fit time).
+    if n_eta == 0 {
+        let nll = obj(&[]);
+        return Some(EbeResult {
+            eta: DVector::zeros(0),
+            h_matrix: DMatrix::zeros(subject.obs_times.len(), 0),
+            terminal_hessian: policy
+                .capture_terminal_hessian
+                .then(|| DMatrix::zeros(0, 0)),
+            converged: true,
+            used_fallback: false,
+            grad_norm: 0.0,
+            nll,
+            kappas: Vec::new(),
+            hard_reject: false,
+            screen_moved: false,
+            twin_moved: false,
+            resolution_certified: false,
+        });
+    }
+
     // BFGS with the exact analytic η-gradient from the adjoint's recorder when
     // in scope (Almquist et al. 2015): one recorder evaluation per inner step
     // instead of the FD gradient's ~2·n_eta+1 predictions, and exact → fewer
@@ -2454,6 +2509,7 @@ fn find_ebe_solve(
             });
         }
         let t0 = std::time::Instant::now();
+        *rows_at.borrow_mut() = None;
         match analytic_eta_nll_gradient_with_schedule(
             model,
             subject,
@@ -2473,6 +2529,7 @@ fn find_ebe_solve(
             frozen,
         ) {
             Some(g) => {
+                *rows_at.borrow_mut() = Some(e.iter().map(|v| v.to_bits()).collect());
                 #[cfg(test)]
                 INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1, c.get().2)));
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -2551,6 +2608,8 @@ fn find_ebe_solve(
             )
         })
         .flatten();
+    // The seed wrote its own rows into the buffer.
+    *rows_at.borrow_mut() = None;
     let initial_hessian = seed.map(|(hessian, gradient)| {
         if use_analytic {
             *fused_first_gradient.borrow_mut() = gradient;
@@ -2913,12 +2972,31 @@ fn find_ebe_solve(
         .then(|| analytic_terminal_work(model, subject, params, &eta_true))
         .flatten();
     let terminal_hessian = terminal_work.as_ref().map(|(_, h)| h.clone());
+    // The last analytic gradient's rows, when it was taken at exactly this η: the same
+    // `exact_obs_grads_into` recording `ebe_h_matrix` would repeat, so the same Jacobian.
+    // Built only when the terminal work carries no Jacobian of its own.
+    let held_jac = || {
+        rows_at
+            .borrow()
+            .as_ref()
+            .filter(|bits| {
+                bits.iter()
+                    .copied()
+                    .eq(eta_true.iter().map(|v| v.to_bits()))
+            })
+            .and_then(|_| {
+                let rows = obs_grad_recycle.borrow();
+                (rows.len() == subject.obs_times.len()
+                    && rows.iter().all(|r| r.df_deta.len() == n_eta))
+                .then(|| DMatrix::from_fn(rows.len(), n_eta, |j, k| rows[j].df_deta[k]))
+            })
+    };
     let h_matrix = ebe_h_matrix(
         model,
         subject,
         params,
         &eta_true,
-        terminal_work.map(|(jac, _)| jac),
+        terminal_work.map(|(jac, _)| jac).or_else(held_jac),
         &mut pk_scratch_cell.borrow_mut(),
         schedule,
     );
@@ -3145,7 +3223,20 @@ fn find_ebe_iov(
             let cells: Vec<&[f64]> = (0..k_occasions)
                 .map(|k| &w[kappa_range(n_eta, n_kappa, k)])
                 .collect();
-            n.compact(&w[..n_eta], &cells)
+            // `compact` refuses only cells off this layout, and the guard above makes them
+            // its own by construction: both counts are `iov_occasion_groups(subject)`, and
+            // `kappa_level` is parallel to `kappa_names` (#2382). Loud in debug should that
+            // ever drift; in release the search still starts at η̂.
+            debug_assert!(
+                n.n_cells() == k_occasions && n.n_kappa() == n_kappa,
+                "#2382: subject {}: nested layout has {} cells of {} κ, the warm start {} of {}",
+                subject.id,
+                n.n_cells(),
+                n.n_kappa(),
+                k_occasions,
+                n_kappa,
+            );
+            Some(nested_warm_start(n, &w[..n_eta], &cells))
         }
         (Some(_), Some(w)) => Some(w[..n_eta.min(w.len())].to_vec()),
         _ => None,
@@ -3186,6 +3277,7 @@ fn find_ebe_iov(
         EbeVariance::Conditional => None,
     };
     let frozen = frozen_var_preds.as_deref();
+    let schedule = cacheable_schedule_iov(model, subject);
 
     let obj = |p: &[f64]| -> f64 {
         // Recover bsv_eta = psi - mu; kappas pass through unchanged.
@@ -3212,7 +3304,7 @@ fn find_ebe_iov(
             // objective: the outer loop moves ρ, so the EBE search must see it.
             model.residual_cov_at(params),
             &mut pk_scratch.borrow_mut(),
-            None,
+            schedule.as_ref(),
             frozen,
         )
     };
@@ -3364,7 +3456,29 @@ fn find_ebe_iov(
         }
     };
 
-    let start_nll = obj(&x);
+    let mut start_nll = obj(&x);
+    // A joint warm start carries the previous evaluation's κ̂ (#2261). At a far outer
+    // line-search point those κ̂ can be much worse than κ = 0 — a κ̂ that absorbed an
+    // occasion's misfit under the old θ amplifies it under the new one — and push the
+    // start over the rejection gate below, which then walls the whole trial for a point
+    // the κ = 0 start (the pre-#2261 one) solves without trouble. The wall makes the
+    // outer L-BFGS backtrack to a tiny step at every iteration: on busulfan (ODE + IOV)
+    // the second evaluation, at DAY1_CL = −0.9, was walled from κ̂ and finite from κ = 0,
+    // and the fit took 234 evaluations; with this retry alone, 118 (#2508). So the gate is
+    // asked of the κ = 0 start too before it rejects, and the search starts there when
+    // only that one passes.
+    if !init_is_mode
+        && x[n_eta..].iter().any(|&k| k != 0.0)
+        && reject_ode_iov_inner_start(model, subject.obs_times.len(), start_nll)
+    {
+        let mut kappa_free = x.clone();
+        kappa_free[n_eta..].fill(0.0);
+        let kappa_free_nll = obj(&kappa_free);
+        if !reject_ode_iov_inner_start(model, subject.obs_times.len(), kappa_free_nll) {
+            x = kappa_free;
+            start_nll = kappa_free_nll;
+        }
+    }
     let has_informative_warm_start = eta_init
         .map(|warm| warm.iter().any(|v| v.abs() > 1e-8))
         .unwrap_or(false);
@@ -3527,10 +3641,14 @@ fn analytic_iov_inner_supported(
     subject: &Subject,
     params: &ModelParameters,
 ) -> bool {
-    crate::sens::ode_provider::adjoint::model_in_scope(model)
+    // The inner recorder's scope, as the non-IOV inner (`analytic_inner_grad_supported`):
+    // `model_in_scope` is the *outer* adjoint's, which refuses every non-Gaussian model —
+    // a TTE + IOV model would then report an analytic label and run FD. A subject with no
+    // Gaussian rows needs no recorder at all.
+    (crate::sens::ode_provider::adjoint::recorder_in_scope(model) || subject.obs_times.is_empty())
         && params.omega_iov.is_some()
         && !analytic_inner_common_bail(model)
-        && !subject_has_survival_records(subject)
+        && non_gaussian_eta_grad_served(model, subject)
 }
 
 /// The `H` matrix an IOV EBE solve reports at `(bsv_eta, kappas)`: BSV columns only
@@ -3574,6 +3692,18 @@ fn iov_ebe_h_matrix(
             compute_jacobian_fd_iov(model, subject, &params.theta, bsv_eta, &kappas_slices)
         }
     }
+}
+
+/// The compact start of a nested-level joint warm start `(η̂, per-cell κ̂)`: compacted, or
+/// `η̂` alone when `NestedLayout::compact` refuses `cells` — κ then restarts at 0, as for a
+/// width-only warm start, but the search keeps η̂ rather than starting cold (#2382).
+fn nested_warm_start(
+    n: &crate::stats::nested_levels::NestedLayout,
+    eta_hat: &[f64],
+    cells: &[&[f64]],
+) -> Vec<f64> {
+    n.compact(eta_hat, cells)
+        .unwrap_or_else(|| eta_hat.to_vec())
 }
 
 /// Build the IOV optimizer seed in `[psi_bsv, kappa_1, ..., kappa_K]` order.
@@ -3960,9 +4090,11 @@ pub(crate) fn non_gaussian_eta_grad_served(model: &CompiledModel, subject: &Subj
 ///
 /// Strict on purpose. The inner gradient is a *sum* of term gradients, so admitting a
 /// subject that also carries a TTE or count record would silently drop that term's
-/// contribution — a wrong gradient, not a slow one. TTE has no analytic η-channel yet (its
-/// `HazardParamFn` is an `f64` closure outside `sens/`), so such a subject keeps FD for the
-/// whole objective.
+/// contribution — a wrong gradient, not a slow one. A TTE record is served when its
+/// endpoint has an exact channel ([`crate::survival::tte_subject_eta_grad`]): an analytic
+/// hazard with a dual-evaluable program, or an ODE-accumulated one whose subject the dual
+/// walk serves (`survival::tte_record_served`). A record without one keeps FD for the whole
+/// objective.
 ///
 /// Always `false` without the `survival` feature (there are no such records to serve).
 fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject) -> bool {
@@ -3975,21 +4107,41 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
         // rather than an `expm` — is not one of them.
         let served = |cmt: usize| -> bool {
             match model.endpoints.get(&cmt) {
-                Some(EndpointLikelihood::Binary { lp_program, .. }) => {
-                    lp_program.as_ref().is_some_and(|p| p.gradient_in_scope())
-                }
+                Some(EndpointLikelihood::Binary { lp_program, .. }) => lp_program.is_some(),
                 #[cfg(feature = "markov")]
                 Some(EndpointLikelihood::Ctmm {
                     generator_program, ..
-                }) => generator_program
-                    .as_ref()
-                    .is_some_and(|p| p.gradient_in_scope()),
+                }) => generator_program.as_ref().is_some(),
                 _ => false,
             }
         };
-        subject.obs_records.iter().all(|r| match r {
-            ObsRecord::DiscreteState { cmt, .. } => served(*cmt),
-            _ => false,
+        // A subject's records sit on one or two CMTs: decide each CMT once rather than per
+        // record (two endpoint-map lookups each, on every gate of every inner evaluation).
+        let mut last: Option<(bool, usize, bool)> = None;
+        subject.obs_records.iter().all(|r| {
+            let (event, cmt) = match r {
+                ObsRecord::DiscreteState { cmt, .. } => (false, *cmt),
+                ObsRecord::Event { cmt, .. } => (true, *cmt),
+                #[allow(unreachable_patterns)]
+                _ => return false,
+            };
+            if let Some((e, c, ok)) = last {
+                if (e, c) == (event, cmt) {
+                    return ok;
+                }
+            }
+            // A record on a CMT no endpoint claims is read by no term (every likelihood path
+            // selects its records by endpoint), so it cannot leave a term unserved — counting
+            // it would send the whole subject to FD over data the objective ignores.
+            let ok = if !model.endpoints.contains_key(&cmt) {
+                true
+            } else if event {
+                crate::survival::tte_record_served(model, subject, cmt)
+            } else {
+                served(cmt)
+            };
+            last = Some((event, cmt, ok));
+            ok
         })
     }
     #[cfg(not(feature = "survival"))]
@@ -3997,6 +4149,70 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
         let _ = (model, subject);
         false
     }
+}
+
+/// The η-gradient (1×, BSV η) of the subject's non-Gaussian data terms — TTE, binary and
+/// CTMM, each exact — summed. `None` when any term the subject carries declines (the caller
+/// then keeps FD for the point). Zero without the `survival` feature (no such records).
+fn non_gaussian_eta_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<f64>> {
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    let mut g = vec![0.0_f64; eta.len()];
+    #[cfg(feature = "survival")]
+    {
+        let mut add = |part: Vec<f64>| {
+            for (acc, gi) in g.iter_mut().zip(&part) {
+                *acc += gi;
+            }
+        };
+        if subject
+            .obs_records
+            .iter()
+            .any(|r| matches!(r, crate::types::ObsRecord::Event { .. }))
+        {
+            add(crate::survival::tte_subject_eta_grad(model, subject, theta, eta)?.1);
+        }
+        if model.has_discrete() {
+            add(crate::categorical::discrete_subject_eta_grad(model, subject, theta, eta)?.1);
+        }
+        #[cfg(feature = "markov")]
+        if model.has_ctmm() {
+            add(crate::markov::endpoint::ctmm_subject_eta_grad(model, subject, theta, eta)?.1);
+        }
+    }
+    #[cfg(not(feature = "survival"))]
+    let _ = (model, subject, theta);
+    Some(g)
+}
+
+/// Whether every non-Gaussian endpoint of `model` has an exact channel: a binary predictor
+/// and a CTMM generator with dual-evaluable programs, and every TTE endpoint served
+/// ([`crate::survival::tte_endpoint_served`]). Vacuously `true` with none.
+pub(crate) fn non_gaussian_endpoints_served(model: &CompiledModel) -> bool {
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() && !all_ctmm_endpoints_analytic(model) {
+        return false;
+    }
+    #[cfg(feature = "survival")]
+    {
+        if model.has_discrete() && !crate::categorical::all_binary_endpoints_analytic(model) {
+            return false;
+        }
+        if model.has_tte()
+            && !model.endpoints.iter().all(|(cmt, ep)| {
+                !matches!(ep, crate::types::EndpointLikelihood::Tte { .. })
+                    || crate::survival::tte_endpoint_served(model, *cmt)
+            })
+        {
+            return false;
+        }
+    }
+    let _ = model;
+    true
 }
 
 /// Model-level half of [`analytic_inner_grad_supported`]: every gate that does
@@ -4038,11 +4254,17 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     if model.has_discrete() && !crate::categorical::all_binary_endpoints_analytic(model) {
         return false;
     }
-    // TTE (#1861): a hazard term has no analytic η-channel at all, so every subject carrying
-    // a survival record declines at the guard in `analytic_inner_grad_supported`, whatever
-    // engine its hazard runs on. Reporting "analytic" here labelled a joint PK-TTE fit whose
-    // every subject ran FD as `analytic (Dual2)`.
-    if model.has_tte() {
+    // TTE (#1861): an endpoint with an exact η-channel (`survival::tte_endpoint_served`: an
+    // analytic hazard with a dual-evaluable program, or an ODE-accumulated one) is reported
+    // analytic; one without declines every subject carrying its records at the guard in
+    // `analytic_inner_grad_supported`, and reporting "analytic" then would mislabel the fit.
+    #[cfg(feature = "survival")]
+    if model.has_tte()
+        && !model.endpoints.iter().all(|(cmt, ep)| {
+            !matches!(ep, crate::types::EndpointLikelihood::Tte { .. })
+                || crate::survival::tte_endpoint_served(model, *cmt)
+        })
+    {
         return false;
     }
     // The unified recorder's scope, or an endpoint-only model (no structural model, no
@@ -4073,9 +4295,7 @@ fn all_ctmm_endpoints_analytic(model: &CompiledModel) -> bool {
     model.endpoints.iter().all(|(_, ep)| match ep {
         EndpointLikelihood::Ctmm {
             generator_program, ..
-        } => generator_program
-            .as_ref()
-            .is_some_and(|p| p.gradient_in_scope()),
+        } => generator_program.as_ref().is_some(),
         _ => true,
     })
 }
@@ -4340,7 +4560,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // first, because it is the one that decides whether this subject can be served at all
     // (the Gaussian provider's own `None` is handled below, as before).
     //
-    // TTE / count records have no analytic η-channel. Refuse a subject carrying one here,
+    // A record without an exact η-channel (a hazard without a program, a subject outside the
+    // dual walk's scope, a count). Refuse it here,
     // not only upstream in `analytic_inner_grad_supported`: HMC and VI call this directly,
     // and a gradient missing a whole data term is wrong, not slow.
     if !non_gaussian_eta_grad_served(model, subject) {
@@ -4363,8 +4584,25 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     } else {
         None
     };
+    // TTE: exact, the analytic hazard's parameters over a first-order η-dual through the
+    // survival curves; the same 1× scale.
+    #[cfg(feature = "survival")]
+    let tte_grad: Option<Vec<f64>> = if subject
+        .obs_records
+        .iter()
+        .any(|r| matches!(r, crate::types::ObsRecord::Event { .. }))
+    {
+        Some(crate::survival::tte_subject_eta_grad(model, subject, theta, eta)?.1)
+    } else {
+        None
+    };
     #[cfg(feature = "survival")]
     let fold_nongaussian = |grad: &mut [f64]| {
+        if let Some(g) = &tte_grad {
+            for (acc, gi) in grad.iter_mut().zip(g.iter()) {
+                *acc += gi;
+            }
+        }
         #[cfg(feature = "markov")]
         if let Some(g) = &ctmm_grad {
             for (acc, gi) in grad.iter_mut().zip(g.iter()) {
@@ -4709,18 +4947,29 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     mult: Option<&[Vec<f64>]>,
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
+    // A record without an exact η-channel would leave its term out of the gradient: refuse
+    // the subject here too, not only at the routing gate (direct callers skip that).
+    if !non_gaussian_eta_grad_served(model, subject) {
+        return None;
+    }
     // The recording reads the per-cell `stacked_true` and returns the jet over the
     // layout's axes — the compact vector under nested levels (#1082), the stack itself
     // otherwise — so the gradient below is over the vector the EBE search moves.
     let n_eta = layout.n_eta();
     let axes = layout.to_axes(stacked_true)?;
-    let sens = crate::sens::ode_provider::adjoint::exact_obs_grads_in(
-        model,
-        subject,
-        Some(layout),
-        theta,
-        stacked_true,
-    )?;
+    // No Gaussian rows ⇒ no Gaussian data term and nothing to record (an endpoint-only
+    // subject: its inner gradient is the prior plus the non-Gaussian terms below).
+    let sens = if subject.obs_times.is_empty() {
+        Vec::new()
+    } else {
+        crate::sens::ode_provider::adjoint::exact_obs_grads_in(
+            model,
+            subject,
+            Some(layout),
+            theta,
+            stacked_true,
+        )?
+    };
     let n_stacked = layout.n_axes();
     // IIV on residual error (`iiv_on_ruv`, #474) for IOV models: every residual variance
     // scales by `s = exp(2·η_ruv)` (η_ruv lives in the BSV block of the stacked vector),
@@ -4782,6 +5031,15 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     }
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;
+    }
+    // The non-Gaussian data terms (TTE, binary, CTMM), at 1× as in the objective. Their
+    // expressions read only the BSV η (a κ is rejected in an endpoint at parse), which
+    // leads the stacked vector, so the whole term lands in the BSV block.
+    if subject_has_survival_records(subject) {
+        let g = non_gaussian_eta_grad(model, subject, theta, &stacked_true[..n_eta])?;
+        for (acc, gi) in grad.iter_mut().zip(&g) {
+            *acc += gi;
+        }
     }
     // Prior: block-diagonal Σ_b⁻¹·b. BSV block Ω_bsv⁻¹·η_bsv, each κ block Ω_L⁻¹·κ_g —
     // one block per occasion group (the κ-variance shared across occasions, SAME), or under
@@ -5313,6 +5571,35 @@ fn lbfgs_run(
     SearchExit::Failed
 }
 
+/// The dense BFGS update's operands, held for one solve (#1564): `ρs`, `ρy`, `yᵀ`, `sᵀ`,
+/// the two outer products, `I − ρsyᵀ`, `I − ρysᵀ` and their product with `H`.
+struct BfgsUpdateBuffers {
+    rs: DVector<f64>,
+    ry: DVector<f64>,
+    yt: nalgebra::RowDVector<f64>,
+    st: nalgebra::RowDVector<f64>,
+    outer_a: DMatrix<f64>,
+    outer_b: DMatrix<f64>,
+    left: DMatrix<f64>,
+    right: DMatrix<f64>,
+    t: DMatrix<f64>,
+}
+
+impl BfgsUpdateBuffers {
+    fn new(n: usize) -> Self {
+        BfgsUpdateBuffers {
+            rs: DVector::zeros(n),
+            ry: DVector::zeros(n),
+            yt: nalgebra::RowDVector::zeros(n),
+            st: nalgebra::RowDVector::zeros(n),
+            outer_a: DMatrix::zeros(n, n),
+            outer_b: DMatrix::zeros(n, n),
+            left: DMatrix::zeros(n, n),
+            right: DMatrix::zeros(n, n),
+            t: DMatrix::zeros(n, n),
+        }
+    }
+}
 /// Dense (`n×n` inverse-Hessian) BFGS driver, retained for low-dimensional inner
 /// problems where it beats L-BFGS (no two-loop bookkeeping) and for the
 /// solver-scaling benchmark. `grad` supplies the gradient (FD or analytic).
@@ -5372,6 +5659,7 @@ fn dense_bfgs_run(
     let mut s_vec = DVector::zeros(n);
     let mut y_vec = DVector::zeros(n);
     let eye = DMatrix::identity(n, n);
+    let mut upd = BfgsUpdateBuffers::new(n);
     let mut line_search_point = vec![0.0; n];
     // Track the objective at the current iterate so the line search never has to
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).
@@ -5537,10 +5825,25 @@ fn dense_bfgs_run(
             let sy = s_vec.dot(&y_vec);
             if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), enable_stall) {
                 let rho = 1.0 / sy;
-                let s_yt = rho * &s_vec * y_vec.transpose();
-                let y_st = rho * &y_vec * s_vec.transpose();
-                let s_st = rho * &s_vec * s_vec.transpose();
-                h_inv = (&eye - &s_yt) * &h_inv * (&eye - &y_st) + s_st;
+                // `(I − ρsyᵀ)·H·(I − ρysᵀ) + ρssᵀ` with the operands' own kernels (`mul_to`
+                // is what `*` calls), into buffers held for the solve rather than a fresh
+                // matrix per product (#1564): the same arithmetic, bit for bit.
+                upd.rs.copy_from(&s_vec);
+                upd.rs *= rho;
+                upd.ry.copy_from(&y_vec);
+                upd.ry *= rho;
+                upd.yt.tr_copy_from(&y_vec);
+                upd.st.tr_copy_from(&s_vec);
+                upd.rs.mul_to(&upd.yt, &mut upd.outer_a);
+                upd.ry.mul_to(&upd.st, &mut upd.outer_b);
+                upd.left.copy_from(&eye);
+                upd.left -= &upd.outer_a;
+                upd.right.copy_from(&eye);
+                upd.right -= &upd.outer_b;
+                upd.left.mul_to(&h_inv, &mut upd.t);
+                upd.t.mul_to(&upd.right, &mut h_inv);
+                upd.rs.mul_to(&upd.st, &mut upd.outer_a);
+                h_inv += &upd.outer_a;
                 h_unshaped = false;
             }
         }
@@ -5766,29 +6069,35 @@ fn screen_starts(
     n: usize,
     subject_id: &str,
 ) -> Vec<Vec<f64>> {
-    use crate::estimation::importance_sampling::{inv_normal_cdf, sobol_uniforms, SOBOL_MAX_DIMS};
+    use crate::estimation::importance_sampling::{
+        for_each_sobol_uniform, inv_normal_cdf, SOBOL_MAX_DIMS,
+    };
     if n == 0 || n_eta == 0 || n_eta > SOBOL_MAX_DIMS || omega.chol.nrows() != n_eta {
         return Vec::new();
     }
-    let mut scored: Vec<(f64, Vec<f64>)> = sobol_uniforms(n_eta, n, screen_seed(subject_id))
-        .into_iter()
-        .filter_map(|u| {
-            let z = DVector::from_iterator(
-                n_eta,
-                u.iter().map(|&ui| SCREEN_SD_MULT * inv_normal_cdf(ui)),
-            );
-            let e: Vec<f64> = (&omega.chol * z).iter().copied().collect();
-            let v = obj(&e);
-            v.is_finite().then_some((v, e))
-        })
-        .collect();
-    // Stable, and `total_cmp` is a total order, so ties keep Sobol order.
-    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-    scored
-        .into_iter()
-        .take(SCREEN_TOP_K)
-        .map(|(_, e)| e)
-        .collect()
+    // The lowest `SCREEN_TOP_K` so far, lowest first. A point goes in after every
+    // kept point it ties (`total_cmp` is a total order), which is the order a
+    // stable sort of all `n` scored points gives, so only the kept starts are
+    // ever copied out of the reused buffers.
+    let mut best: Vec<(f64, Vec<f64>)> = Vec::with_capacity(SCREEN_TOP_K + 1);
+    let mut z = DVector::<f64>::zeros(n_eta);
+    let mut e = DVector::<f64>::zeros(n_eta);
+    for_each_sobol_uniform(n_eta, n, screen_seed(subject_id), |u| {
+        for (zi, &ui) in z.iter_mut().zip(u) {
+            *zi = SCREEN_SD_MULT * inv_normal_cdf(ui);
+        }
+        omega.chol.mul_to(&z, &mut e);
+        let v = obj(e.as_slice());
+        if !v.is_finite() {
+            return;
+        }
+        let at = best.partition_point(|(b, _)| b.total_cmp(&v).is_le());
+        if at < SCREEN_TOP_K {
+            best.insert(at, (v, e.as_slice().to_vec()));
+            best.truncate(SCREEN_TOP_K);
+        }
+    });
+    best.into_iter().map(|(_, e)| e).collect()
 }
 
 /// 64-bit FNV-1a of a subject ID: the #2013 screen's Sobol scramble seed. A fixed

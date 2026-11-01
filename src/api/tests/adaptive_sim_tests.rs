@@ -3568,20 +3568,21 @@ fn adaptive_auc_target_rejects_iov() {
 }
 
 #[test]
-fn adaptive_auc_target_rejects_reset() {
-    // #716: system resets are now honored by the driver and the frozen-replay
-    // verifier, but the exposure metric (`auc_target_attainment`) integrates a dense
-    // grid that does NOT apply resets, so declaring `auc_target` on a reset subject is
-    // a typed error rather than a silently un-reset AUC. The model is a plain ODE
-    // (no TV covariate, no IOV), so only the reset can trip this guard — pinning the
-    // reset branch specifically.
-    let mut parsed = parse_full_model(SPEC_DEGENERATE).expect("model + block parse");
-    parsed
-        .adaptive_dosing
-        .as_mut()
-        .expect("[adaptive_dosing]")
-        .auc_target = Some((400.0, 600.0));
-    let spec = parsed.adaptive_dosing.as_ref().unwrap();
+fn adaptive_auc_target_integrates_a_reset_window() {
+    // #943 (formerly refused, #716): the window AUC is integrated on the driver's own walk,
+    // where the reset at t = 36 is a break with its pre-reset and post-reset nodes, so the
+    // window straddling it integrates exactly. Plain ODE, no TV covariate, no IOV: only the
+    // reset is under test. ETA_CL's variance is negligible, so ke = CL/V = 0.1 and the
+    // closed forms hold. Decisions 0/24/48 each re-issue the 100 bolus:
+    //   w0 = [0, 24]:  (100/ke)(1 − e^{−24ke})                      ≈ 909.3
+    //   w1 = [24, 48]: (A(24⁺)/ke)(1 − e^{−12ke}), then 0 after 36  ≈ 762.2,
+    //   A(24⁺) = 100·e^{−24ke} + 100.
+    // A band of ±0.1% around one window attains exactly 1/2, so both values are pinned
+    // through `simulate_adaptive_from_spec`. Ignoring the reset makes w1 ≈ 991.8, and the
+    // second band then attains 0.
+    let src = SPEC_DEGENERATE.replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 1e-12");
+    let parsed = parse_full_model(&src).expect("model + block parse");
+    let mut spec = parsed.adaptive_dosing.clone().expect("[adaptive_dosing]");
     let mut subject = subj("1", vec![24.0, 48.0], vec![]);
     subject.reset_times = vec![36.0];
     let pop = population(vec![subject]);
@@ -3589,20 +3590,28 @@ fn adaptive_auc_target_rejects_reset() {
         seed: Some(1),
         ..Default::default()
     };
-    let err = simulate_adaptive_from_spec(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        1,
-        spec,
-        &opts,
-    )
-    .expect_err("auc_target on a reset subject must be rejected");
-    assert!(
-        err.to_string().to_lowercase().contains("auc_target")
-            && err.to_string().to_lowercase().contains("reset"),
-        "error should cite auc_target + reset: {err}"
-    );
+    let ke = 0.1_f64;
+    let w0 = (100.0 / ke) * (1.0 - (-ke * 24.0).exp());
+    let a24 = 100.0 * (-ke * 24.0).exp() + 100.0;
+    let w1 = (a24 / ke) * (1.0 - (-ke * 12.0).exp());
+    for (label, w) in [("w0", w0), ("w1", w1)] {
+        spec.auc_target = Some((w * (1.0 - 1e-3), w * (1.0 + 1e-3)));
+        let res = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            &spec,
+            &opts,
+        )
+        .expect("auc_target on a reset subject runs");
+        assert_eq!(res.decisions.len(), 3);
+        assert_eq!(
+            res.metrics[0].auc_target_attainment,
+            Some(0.5),
+            "{label} = {w}: exactly one of the two windows is in its ±0.1% band"
+        );
+    }
 }
 
 #[test]
@@ -4182,7 +4191,7 @@ fn from_spec_metrics_track_titration_and_window() {
         .filter(|d| (8.0..=13.0).contains(&d.observed_signals[0].value))
         .count();
     assert_eq!(m.pct_time_in_window, Some(in_band as f64 / n as f64));
-    // No `auc_target` on this spec ⇒ the signal-AUC pass is skipped and the
+    // No `auc_target` on this spec ⇒ the window AUC is skipped and the
     // exposure metric stays unreported.
     assert_eq!(m.auc_target_attainment, None);
 }
@@ -4190,9 +4199,9 @@ fn from_spec_metrics_track_titration_and_window() {
 #[test]
 fn from_spec_reports_auc_target_attainment() {
     // End-to-end wiring of the exposure metric (#391 S2.5b): declaring
-    // `auc_target` turns on the signal-AUC pass in `run_adaptive_population`,
+    // `auc_target` turns on the driver's window AUC in `run_adaptive_population`,
     // which feeds `auc_target_attainment`. The exact AUCs are pinned by the
-    // analytic unit test (`adaptive_window_signal_aucs_matches_closed_form`); here
+    // analytic unit test (`adaptive_window_auc_matches_closed_form`); here
     // two *extreme* bands make the attainment deterministic regardless of the
     // realized AUCs, so the run/pass/metric chain is exercised without re-deriving
     // the integral: an all-covering band attains 1, an unreachable band attains 0.
@@ -6800,6 +6809,87 @@ fn adaptive_finite_pre_dose_window_is_judged_on_its_trajectory() {
     );
 }
 
+#[test]
+fn adaptive_window_auc_keeps_the_clock_probe_on_its_own_samples() {
+    // #943 review r1 #1. The clock probe (#1572) and the window AUC share one soft-sample list
+    // (`merge_soft_times`), and each takes its states back by position. Decisions at 0 (hold),
+    // 12 and 36 (both dose) put the pre-dose window (0, 12] inside AUC window [0, 12], so the
+    // probe grid and the AUC grid interleave on it. On #1572 T2's gate, threshold 40 runs and
+    // threshold 20 is refused at the dose at 12, a verdict read off the trajectory on (6, ~9.2].
+    // With the AUC requested, each verdict — and, where the run returns, every prediction —
+    // must be the one the run gives without it.
+    //
+    // Mutation that reddens it: read the probe's states positionally (`soft[k]`, the pre-#943
+    // zip) instead of through its positions in the merged list — the probe then pairs grid
+    // times after 6 with early states (`central` ≈ 50 > 40), and threshold 40 is refused.
+    let model_pk = |src: &str| {
+        let model = parse_model_string(src).expect("parse the gated model");
+        let mut pk = [0.0; crate::types::MAX_PK_PARAMS];
+        pk[crate::types::PK_IDX_CL] = 5.0;
+        pk[crate::types::PK_IDX_V] = 50.0;
+        (model, pk)
+    };
+    let run = |src: &str, with_auc: bool| {
+        let (model, pk) = model_pk(src);
+        let ode = model.ode_spec.as_ref().unwrap();
+        let base = subj("1", vec![0.0, 6.0, 20.0, 40.0], vec![]);
+        let spec = MonitorSpec::new("A", 1, ObserveMode::Ipred);
+        let mons = vec![crate::sim::adaptive::AdaptiveMonitor {
+            spec: &spec,
+            observe: None,
+            obs_scale: None,
+        }];
+        let mut decide =
+            |ctx: &crate::sim::adaptive::ControllerCtx| crate::sim::adaptive::ControllerDecision {
+                actions: if ctx.decision_index == 0 {
+                    vec![DoseAction::Hold]
+                } else {
+                    vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+                },
+                rule: None,
+            };
+        let mut aucs = Vec::new();
+        let res = crate::ode::ode_predictions_adaptive_impl(
+            ode,
+            &pk,
+            None,
+            None,
+            None,
+            &model.default_params.theta,
+            &[0.0],
+            &base,
+            &[0.0, 12.0, 36.0],
+            &mons,
+            &mut decide,
+            100,
+            None,
+            with_auc.then_some(&mut aucs),
+        );
+        (res.map_err(|e| format!("{e:?}")), aucs)
+    };
+
+    let (plain40, _) = run(&ode_state_and_time_gate("40.0"), false);
+    let (auc40, aucs40) = run(&ode_state_and_time_gate("40.0"), true);
+    let plain40 = plain40.expect("threshold 40 never enters the `TAD` arm: it runs");
+    let auc40 = auc40.unwrap_or_else(|e| {
+        panic!("threshold 40 with the AUC: the probe must read its own samples and run: {e}")
+    });
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&auc40.predictions), bits(&plain40.predictions));
+    assert_eq!(aucs40.len(), 2);
+    assert!(
+        aucs40.iter().all(|a| a.is_finite() && *a > 0.0),
+        "{aucs40:?}"
+    );
+
+    let (plain20, _) = run(&ode_state_and_time_gate("20.0"), false);
+    let (auc20, _) = run(&ode_state_and_time_gate("20.0"), true);
+    let plain20 = plain20.expect_err("threshold 20 enters the `TAD` arm on (6, ~9.2]: refused");
+    let auc20 = auc20.expect_err("threshold 20 with the AUC: refused as without it");
+    assert!(plain20.contains("(0, 12]"), "{plain20}");
+    assert_eq!(auc20, plain20, "the AUC leaves the refusal unchanged");
+}
+
 /// #2089's fixture, on the time-varying-covariate path, where every record is a segment
 /// break: `X` runs to its pole at t = 2 when `x_rate` is 0.5, so the windows after it start
 /// from the solver's all-`NaN` pad (#1539); `Y` reads `TAD` after t = 6, through `y_rhs`.
@@ -7488,13 +7578,13 @@ fn adaptive_reset_as_first_record_is_the_origin() {
 
 #[test]
 fn adaptive_auc_pass_holds_init_before_the_origin() {
-    // #936 review R3. The AUC-target pass (`adaptive_window_signal_aucs`, dense solve) was
-    // already on the static origin; after #936 the driver shares it. Base record obs 6/20/40,
-    // decisions 0/6/12/24, one ledger bolus at 12. Window [0, 6] lies before the origin (6),
-    // so the state is held at `init` = 50 there and its AUC is exactly 300.
+    // #936 review R3. The window AUC is integrated on the driver's own walk (#943), which
+    // starts at the static origin. Base record obs 6/20/40, decisions 0/6/12/24, one
+    // controller bolus at 12. Window [0, 6] lies before the origin (6), so the state is held
+    // at `init` = 50 there and its AUC is exactly 300.
     //
-    // Mutation that reddens it: seed the dense solve at 0.0 instead of the subject's start
-    // (the [0, 6] window would integrate a decay: 500·(1 − e^{-0.6}) = 225.6, not 300).
+    // Mutation that reddens it: start the walk at 0.0 instead of the subject's start (the
+    // [0, 6] window would integrate a decay: 500·(1 − e^{-0.6}) = 225.6, not 300).
     let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
     let ode = model.ode_spec.as_ref().unwrap();
     let mut pk = [0.0; crate::types::MAX_PK_PARAMS];
@@ -7502,33 +7592,39 @@ fn adaptive_auc_pass_holds_init_before_the_origin() {
     pk[crate::types::PK_IDX_V] = 50.0;
     pk[crate::types::PK_IDX_F] = 1.0;
     let base = subj("1", vec![6.0, 20.0, 40.0], vec![]);
-    let ledger = vec![crate::sim::adaptive::DoseLedgerEntry {
-        subject: "1".into(),
-        draw: 0,
-        sim: 0,
-        dose_idx: 0,
-        time: 12.0,
-        amt: 100.0,
-        cmt: 1,
-        rate: 0.0,
-        decision_idx: 2,
-        rule_fired: "bolus".into(),
-        observed_signals: Vec::new(),
-        pre_state: None,
-        post_state: None,
-        f_applied: 1.0,
+    let spec = MonitorSpec::new("A", 1, ObserveMode::Ipred);
+    let mons = vec![crate::sim::adaptive::AdaptiveMonitor {
+        spec: &spec,
+        observe: None,
+        obs_scale: None,
     }];
-    let aucs = crate::ode::predictions::adaptive_window_signal_aucs(
+    let mut decide =
+        |ctx: &crate::sim::adaptive::ControllerCtx| crate::sim::adaptive::ControllerDecision {
+            actions: if ctx.t == 12.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            },
+            rule: None,
+        };
+    let mut aucs = Vec::new();
+    crate::ode::ode_predictions_adaptive_impl(
         ode,
         &pk,
+        None,
+        None,
+        None,
         &model.default_params.theta,
         &[0.0],
         &base,
         &[0.0, 6.0, 12.0, 24.0],
-        &ledger,
+        &mons,
+        &mut decide,
+        100,
         None,
-        1,
-    );
+        Some(&mut aucs),
+    )
+    .expect("driver runs");
     let k = K_936;
     let want = [
         300.0,
@@ -7545,8 +7641,10 @@ fn adaptive_auc_pass_holds_init_before_the_origin() {
         (aucs[0] - 300.0).abs() <= 1e-9,
         "window [0, 6] precedes the origin, so init is held: {aucs:?}"
     );
-    // Trapezoid error on the decaying windows, measured at 1.8e-6 and 7.3e-6 relative; the
-    // bound carries ~7× headroom and is 2 000× below the pre-origin mutation's effect.
+    // Error on the decaying windows, measured at 1.8e-6 and 7.3e-6 relative on Linux aarch64
+    // (`tools/linux-test.sh`) and macOS arm64 alike, in every printed digit, and the same as
+    // the old dense pass to two digits; the bound carries ~7× headroom and is
+    // 2 000× below the pre-origin mutation's effect.
     for i in 1..3 {
         let rel = ((aucs[i] - want[i]) / want[i]).abs();
         assert!(
@@ -8738,4 +8836,480 @@ fn assay_residual_variance_reads_the_parameter_sets_correlation() {
         (declared - 7.0).abs() < 1e-12,
         "fallback: {declared}, want 7"
     );
+}
+
+// ── #2371 / #2528: an `ADDL`-implied base dose on the adaptive path ─────────────────────
+//
+// Since #1909 an implied dose takes its covariates and `TIME` from its governing record (the
+// first record at or after it). #2371: under IOV it must take that record's occasion too,
+// as `predict_iov` takes its `OCC`. #2528: it is not a data record, so a decision between
+// it and its governing record must not read the covariates it carries. The subjects come
+// from the CSV reader, which is what sets `DoseEvent::implied`.
+
+/// The one subject in `csv`, read with covariate `cov` and, if given, `OCC` as the IOV column.
+fn read_subject_2371(csv: &str, cov: &str, occ: Option<&str>) -> Subject {
+    use std::io::Write;
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(csv.as_bytes()).unwrap();
+    crate::io::datareader::read_nonmem_csv(f.path(), Some(&[cov]), occ)
+        .expect("read the #2371 fixture")
+        .subjects
+        .remove(0)
+}
+
+/// IOV on CL, and CL reads the covariate `X`.
+const ODE_IOV_X_2371: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * X * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// A dose at 0 whose `ADDL` implies doses at 12 and 24, observed at 6 (`X = 1`), 18 and 30
+/// (`X = x_after`). The dose at 12 is governed by the observation at 18, the one at 24 by
+/// the observation at 30. With `occ`, an `OCC` column holds each row's decision window.
+fn addl_csv_2371(decisions: &[f64], x_after: f64, occ: bool) -> String {
+    let cell = |t: f64| {
+        if occ {
+            format!(
+                ",{}",
+                crate::pk::occasion_of(decisions, t).expect("a row before the first decision")
+            )
+        } else {
+            String::new()
+        }
+    };
+    format!(
+        "ID,TIME,DV,EVID,MDV,AMT,ADDL,II,X{}\n1,0,.,1,1,100,2,12,1{}\n1,6,5,0,0,.,.,.,1{}\n\
+         1,18,5,0,0,.,.,.,{x_after}{}\n1,30,5,0,0,.,.,.,{x_after}{}\n",
+        if occ { ",OCC" } else { "" },
+        cell(0.0),
+        cell(6.0),
+        cell(18.0),
+        cell(30.0)
+    )
+}
+
+/// The degenerate oracle (#2371): a holding controller over the `ADDL` regimen against
+/// `predict_iov` on the same rows with `OCC` = decision window and the run's own η and κ.
+/// `predict_iov` is the static engine `simulate()` routes an IOV ODE subject to; `simulate()`
+/// itself draws κ on another stream, so it is compared with the reconstructed draws. Returns
+/// `(adaptive IPRED, predict_iov IPRED)` at the observations, and asserts the straddle the
+/// caller names: whether the implied dose at 12 and its governing record (the observation
+/// at 18) fall in different decision windows.
+fn iov_implied_dose_oracle(
+    decisions: &[f64],
+    x_after: f64,
+    straddles: bool,
+) -> (Vec<f64>, Vec<f64>) {
+    let model = parse_model_string(ODE_IOV_X_2371).expect("parse");
+    let subject = read_subject_2371(&addl_csv_2371(decisions, x_after, false), "X", None);
+    let implied = subject.doses[1]
+        .implied
+        .expect("the dose at 12 is ADDL-implied");
+    assert_eq!((subject.doses[1].time, implied.gov_time), (12.0, 18.0));
+    assert_eq!(
+        crate::pk::occasion_of(decisions, 12.0) != crate::pk::occasion_of(decisions, 18.0),
+        straddles,
+        "the fixture's straddle: the implied dose and its governing record in different windows"
+    );
+    let mut pop = population(vec![subject]);
+    pop.covariate_names = vec!["X".to_string()];
+    let seed = 2371u64;
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: decisions.to_vec(),
+        ..Default::default() // verify = true: frozen replay + #748 snapshot checks
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("runs and passes the default-on verifiers");
+    let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
+    assert!(
+        (kappas[0][0] - kappas[1][0]).abs() > 1e-2,
+        "the windows' κ must differ, else the oracle cannot tell them apart: {kappas:?}"
+    );
+    let static_subject =
+        read_subject_2371(&addl_csv_2371(decisions, x_after, true), "X", Some("OCC"));
+    let want = crate::pk::predict_iov(
+        &model,
+        &static_subject,
+        &model.default_params.theta,
+        &reconstruct_eta_bsv(&model, seed),
+        &kappas,
+    );
+    let got: Vec<f64> = res.trajectories.iter().map(|r| r.ipred).collect();
+    assert_eq!(got.len(), want.len());
+    (got, want)
+}
+
+/// Worst relative difference, `NaN`-safe: a non-finite value fails rather than folds away.
+fn worst_rel_2371(got: &[f64], want: &[f64]) -> f64 {
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| {
+            assert!(
+                g.is_finite() && w.is_finite(),
+                "non-finite IPRED: {g} / {w}"
+            );
+            (g - w).abs() / w.abs()
+        })
+        .fold(0.0, f64::max)
+}
+
+fn bits_2371(v: &[f64]) -> Vec<u64> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+#[test]
+fn an_implied_dose_across_a_decision_boundary_takes_its_governing_records_kappa() {
+    // #2371. Decisions at 0 and 15: the implied dose at 12 is in window 0, the observation at
+    // 18 that governs it in window 1, and X steps 1 → 2 there. Before the fix the dose's
+    // snapshot took window 0's κ with window 1's X: 5.6e-2 off at t=18 (25.83 → 27.29).
+    // Measured after: 8.3e-16 relative (about 6 ULP). The boundary at 15 is no record, so the
+    // driver breaks the interval [12, 18] there and `predict_iov` does not; the decision-
+    // on-a-record case below, which shares everything but that break, is bit-identical.
+    let (got, want) = iov_implied_dose_oracle(&[0.0, 15.0], 2.0, true);
+    let worst = worst_rel_2371(&got, &want);
+    assert!(
+        worst <= 1e-12,
+        "adaptive {got:?} vs predict_iov {want:?}: worst rel {worst:e}"
+    );
+}
+
+#[test]
+fn an_implied_dose_across_a_decision_boundary_with_a_constant_covariate_is_exact() {
+    // #2371, the κ alone: X constant, so only the dose's occasion can differ. The pre-fix
+    // driver was 4.7e-2 off at t=18 here — the parent-row rule (#1909's alternative) keeps
+    // that κ and fails this oracle too.
+    let (got, want) = iov_implied_dose_oracle(&[0.0, 15.0], 1.0, true);
+    assert_eq!(
+        bits_2371(&got),
+        bits_2371(&want),
+        "adaptive {got:?} vs predict_iov {want:?}"
+    );
+}
+
+#[test]
+fn an_implied_dose_whose_governing_record_opens_a_window_is_exact() {
+    // #2371 with the boundary ON the governing record (the decision at 18 observes there):
+    // the dose at 12 is in window 0, its governing record in window 1, X steps — and no
+    // break sits inside [12, 18], so the driver integrates what `predict_iov` integrates.
+    let (got, want) = iov_implied_dose_oracle(&[0.0, 18.0], 2.0, true);
+    assert_eq!(
+        bits_2371(&got),
+        bits_2371(&want),
+        "adaptive {got:?} vs predict_iov {want:?}"
+    );
+}
+
+#[test]
+fn an_implied_dose_in_its_governing_records_window_is_exact() {
+    // #2371 control: decisions at 0 and 20 put the dose at 12 and the observation at 18 in
+    // one window (and the dose at 24 with the observation at 30 in the next), so the old and
+    // new rules agree. Exact before and after; the straddle is asserted false.
+    let (got, want) = iov_implied_dose_oracle(&[0.0, 20.0], 2.0, false);
+    assert_eq!(
+        bits_2371(&got),
+        bits_2371(&want),
+        "adaptive {got:?} vs predict_iov {want:?}"
+    );
+}
+
+/// The #2528 fixture: a dose at 0 (CRCL 100), an observation at 6 (CRCL 100), observations at
+/// 18 and 30 (CRCL 50), and doses at 12 and 24 — implied by the first row's `ADDL`, or written
+/// as rows of their own (CRCL 100 at 12, 50 at 24).
+fn crcl_csv_2528(addl: bool) -> &'static str {
+    if addl {
+        "ID,TIME,DV,EVID,MDV,AMT,ADDL,II,CRCL\n1,0,.,1,1,100,2,12,100\n\
+         1,6,5,0,0,.,.,.,100\n1,18,5,0,0,.,.,.,50\n1,30,5,0,0,.,.,.,50\n"
+    } else {
+        "ID,TIME,DV,EVID,MDV,AMT,ADDL,II,CRCL\n1,0,.,1,1,100,.,.,100\n\
+         1,6,5,0,0,.,.,.,100\n1,12,.,1,1,100,.,.,100\n1,18,5,0,0,.,.,.,50\n\
+         1,24,.,1,1,100,.,.,50\n1,30,5,0,0,.,.,.,50\n"
+    }
+}
+
+/// #2528 on `model_src`: a 100-unit bolus at decisions 0 and 15 (`run_capture_1148`), from
+/// the `ADDL` regimen and from the same doses as rows. Both must read CRCL 100 at 15 — the
+/// observation at 6 (`ADDL`) or the dose row at 12 — and land IPRED@18 on the closed form.
+fn assert_decision_skips_the_implied_dose(model_src: &str, label: &str) {
+    let model = parse_model_string(model_src).expect("parse");
+    let addl = read_subject_2371(crcl_csv_2528(true), "CRCL", None);
+    // The straddle under the old rule: the implied dose at 12 is the latest base-regimen entry
+    // before 15, and it carries the CRCL of the observation at 18.
+    assert!(
+        addl.doses[1].implied.is_some(),
+        "{label}: the dose at 12 is implied"
+    );
+    assert_eq!(
+        addl.dose_cov(1)["CRCL"],
+        50.0,
+        "{label}: it carries obs@18's CRCL"
+    );
+    let rows = read_subject_2371(crcl_csv_2528(false), "CRCL", None);
+    assert!(
+        rows.doses.iter().all(|d| d.implied.is_none()),
+        "{label}: no implied dose"
+    );
+
+    // F = 0.8·CRCL/100, k = 0.1/h. In both runs: the base dose at 0 and the bolus at 0 (F 0.8)
+    // and the bolus at 15 under the in-force CRCL 100 (F 0.8). The base dose at 12 enters
+    // with its own F: 0.4 when implied (its governing record's CRCL, #1909), 0.8 as a row.
+    let e = |dt: f64| (-0.1f64 * dt).exp();
+    let ipred18 = |f12: f64, f15: f64| {
+        100.0 * (0.8 + 0.8) * e(18.0) + 100.0 * f12 * e(6.0) + 100.0 * f15 * e(3.0)
+    };
+    for (subject, f12, kind) in [(addl, 0.4, "ADDL"), (rows, 0.8, "rows")] {
+        let (res, seen) = run_capture_1148(&model, subject, &[0.0, 15.0]);
+        assert_eq!(
+            crcl_seen_at_1148(&seen, 15.0),
+            100.0,
+            "{label}/{kind}: the decision at 15 must read the latest record's CRCL 100, not \
+             the 50 first recorded at 18"
+        );
+        let (got, want, future) = (
+            ipred_at_1148(&res, 18.0),
+            ipred18(f12, 0.8),
+            ipred18(f12, 0.4),
+        );
+        assert!(
+            (got - want).abs() <= band_1148(want),
+            "{label}/{kind}: IPRED@18 = {got}; the bolus at 15 under CRCL 100 gives {want:.6}, \
+             under the future CRCL 50 {future:.6}"
+        );
+    }
+}
+
+#[test]
+fn a_decision_after_an_implied_dose_reads_the_latest_record() {
+    // #2528, non-IOV: the decision reads `in_force` through `locf_decision_cov` (ctx) and the
+    // readout PK (the bolus's F). Before the fix the `ADDL` run read CRCL 50 at 15, so the
+    // bolus there entered with F = 0.4: IPRED@18 on that closed form is 78.033016, 27.5 %
+    // below the 107.665745 asserted here (both with this controller's bolus at 0 as well).
+    assert_decision_skips_the_implied_dose(ODE_TV_F, "non-IOV");
+}
+
+#[test]
+fn a_decision_after_an_implied_dose_reads_the_latest_record_under_iov() {
+    // #2528, IOV: the bolus's F comes from `decision_pk[g]`, built in `run_adaptive_population`
+    // from the same `locf_decision_cov`, and the #1599 scan re-derives that row.
+    assert_decision_skips_the_implied_dose(ODE_TV_F_IOV, "IOV");
+}
+
+// #2532: a trough listed before a co-timed base dose at a later decision. The reader moves
+// the trough one ULP below the dose (#614); on the time-varying path (IOV turns it on) that
+// observation is a break of its own, 3.6e-15 before the dose's break at 18.
+const TROUGH_TIE_2532_CSV: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,0,1,100,1,1
+1,6,0,0,0,1,0
+1,18,0,0,0,1,0
+1,18,0,1,100,1,1
+1,30,0,0,0,1,0
+";
+
+/// The #2532 subject as the reader produces it — with the trough moved below the dose,
+/// which is the input the defect needs (a hand-built `subj` at a bare `18.0` is not it).
+fn trough_tie_2532_population() -> Population {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut f, TROUGH_TIE_2532_CSV.as_bytes()).unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+    let s = &pop.subjects[0];
+    assert_eq!(
+        s.obs_times[1],
+        18.0f64.next_down(),
+        "fixture premise: the reader moved the trough one ULP below the dose at 18 (#614)"
+    );
+    pop
+}
+
+/// Run the #2532 subject with a holding controller that records the state it reads at each
+/// decision; returns the run and those `(t, central)` reads.
+fn run_trough_tie_2532(
+    model: &CompiledModel,
+    seed: u64,
+) -> (AdaptiveSimulationResult, Vec<(f64, f64)>) {
+    let pop = trough_tie_2532_population();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let make = move || {
+        let sink = sink.clone();
+        move |c: &ControllerCtx| {
+            sink.lock().unwrap().push((c.t, c.state[0]));
+            vec![DoseAction::Hold]
+        }
+    };
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: vec![0.0, 18.0],
+        ..Default::default() // verify = true: the frozen replay must agree too
+    };
+    let res = simulate_adaptive(model, &pop, &model.default_params, 1, make, &opts)
+        .expect("trough-tie run passes the default verifiers");
+    let reads = seen.lock().unwrap().clone();
+    (res, reads)
+}
+
+#[test]
+fn iov_trough_before_a_cotimed_base_dose_reads_pre_dose_2532() {
+    // Degenerate oracle: `hold_all` ⇒ only the base regimen, so adaptive must equal
+    // `predict_iov` on the same rows with the run's own η and κ, `OCC` = engine window.
+    // Before the fix the base dose at 18 fired at the trough's break (the first break in
+    // its `EVENT_MATCH_TOL` band), so IPRED@18 was 116.641 against `predict_iov`'s 16.641 —
+    // off by exactly the dose — and the decision at 18 read the same post-dose 116.641.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let seed = 7u64;
+    let decisions = [0.0, 18.0];
+    let (res, reads) = run_trough_tie_2532(&model, seed);
+
+    let eta_bsv = reconstruct_eta_bsv(&model, seed);
+    let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
+    assert!(
+        (kappas[0][0] - kappas[1][0]).abs() > 1e-3,
+        "the two windows' κ must differ, else the per-segment occasion is unobserved"
+    );
+    let mut static_subject = trough_tie_2532_population().subjects.remove(0);
+    static_subject.occasions = static_subject
+        .obs_times
+        .iter()
+        .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
+        .collect();
+    static_subject.dose_occasions = static_subject
+        .doses
+        .iter()
+        .map(|d| crate::pk::occasion_of(&decisions, d.time).expect("dose in a window") as u32)
+        .collect();
+    assert_eq!(
+        static_subject.occasions,
+        vec![0, 1, 1],
+        "the trough is in window 1"
+    );
+    let preds = crate::pk::predict_iov(
+        &model,
+        &static_subject,
+        &model.default_params.theta,
+        &eta_bsv,
+        &kappas,
+    );
+
+    // A third value, outside both engines: each segment decays under the κ of the record
+    // that ends it (NONMEM end-of-interval), so (0,6] is window 0 and (6,18] window 1.
+    let k = |g: usize| 0.1 * (eta_bsv[0] + kappas[g][0]).exp();
+    let trough = 100.0 * (-6.0 * k(0) - 12.0 * k(1)).exp();
+
+    assert_eq!(res.trajectories.len(), 3);
+    for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred).abs() <= 1e-9 + 1e-9 * pred.abs(),
+            "adaptive IOV IPRED {} != predict_iov {} at t={}",
+            traj.ipred,
+            pred,
+            traj.time
+        );
+    }
+    let ipred18 = res.trajectories[1].ipred;
+    assert!(
+        (ipred18 - trough).abs() < 1e-6 && (preds[1] - trough).abs() < 1e-6,
+        "IPRED@18 adaptive {ipred18} / predict_iov {} must be the trough {trough}",
+        preds[1]
+    );
+    // The controller reads the same trough at its decision (#933), not trough + 100.
+    assert_eq!(reads.len(), 2);
+    assert_eq!(reads[1].0, 18.0);
+    assert!(
+        (reads[1].1 - trough).abs() < 1e-6,
+        "decision at 18 read {} — the trough is {trough}, the post-dose level {}",
+        reads[1].1,
+        trough + 100.0
+    );
+}
+
+#[test]
+fn non_iov_trough_before_a_cotimed_base_dose_stays_pre_dose_2532() {
+    // Control for the test above: the constant path has no observation breaks, so it read
+    // the trough correctly before #2532 and must still. Exact closed form, η-free model.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse ODE model");
+    let (res, reads) = run_trough_tie_2532(&model, 7);
+    let trough = 100.0 * (-1.8f64).exp(); // 16.529889
+    let ipred: Vec<f64> = res.trajectories.iter().map(|t| t.ipred).collect();
+    let want = [
+        100.0 * (-0.6f64).exp(),
+        trough,
+        trough * (-1.2f64).exp() + 100.0 * (-1.2f64).exp(),
+    ];
+    for (got, want) in ipred.iter().zip(want) {
+        assert!(
+            (got - want).abs() < 1e-6,
+            "IPRED {got} != closed form {want}"
+        );
+    }
+    assert!(
+        (reads[1].1 - trough).abs() < 1e-6,
+        "decision at 18 read {}, trough {trough}",
+        reads[1].1
+    );
+}
+
+#[test]
+fn constant_path_trough_at_a_derived_break_agrees_with_predict_2532() {
+    // #2532 review r1: the dose rule moved only on the time-varying walk. On the constant
+    // path the frozen replay is the static engine, which stays band-only (first break) with
+    // its dual / state twins (#2534), so the driver must too — this pins the two together.
+    // An infusion of 2.96 at RATE 1 from 5.1 ends at `5.1 + 2.96`, one ULP below 8.06: a
+    // derived break with the reader's nudged trough on it, and the bolus at 8.06 inside its
+    // band. Handing the constant driver the real next break fires that bolus one break later
+    // than the replay does, and the verifier refuses the run. Agreement, not a value: when
+    // #2534 moves the static engine, both sides move together.
+    let csv = "ID,TIME,DV,EVID,AMT,RATE,CMT,MDV
+1,0,0,1,100,0,1,1
+1,5.1,0,1,2.96,1,1,1
+1,8.06,0,0,0,0,1,0
+1,8.06,0,1,100,0,1,1
+1,12,0,0,0,0,1,0
+";
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut f, csv.as_bytes()).unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+    let trough = pop.subjects[0].obs_times[0];
+    assert_eq!(
+        trough,
+        8.06f64.next_down(),
+        "premise: the reader nudged the trough"
+    );
+    assert_eq!(
+        5.1 + 2.96,
+        trough,
+        "premise: the infusion ends on the trough's bits"
+    );
+
+    let model = parse_model_string(ODE_NO_IIV).expect("parse ODE model");
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        decision_times: vec![0.0],
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("constant-path driver and its static replay apply the bolus at one break");
+    // `pred` (η = 0) is IPRED here: `ODE_NO_IIV`'s η is drawn but not referenced.
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
+    assert_eq!(res.trajectories.len(), preds.len());
+    for (traj, p) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - p.pred).abs() <= 1e-9 + 1e-9 * p.pred.abs(),
+            "adaptive IPRED {} != predict {} at t={}",
+            traj.ipred,
+            p.pred,
+            traj.time
+        );
+    }
 }

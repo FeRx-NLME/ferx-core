@@ -280,6 +280,24 @@ pub trait PkNum:
         s
     }
 
+    /// `x₁·y₁ + x₂·y₂`: a product rule's tangent (`g·v′ + v·g′`). The reverse tape
+    /// (`sens::rtape::R`) overrides it to record **one** node with the four partials instead
+    /// of three (two products and a sum, #2481 §2.2); every other type keeps exactly this
+    /// arithmetic, so its values do not move.
+    #[inline]
+    fn dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self {
+        x1 * y1 + x2 * y2
+    }
+
+    /// `((x₁·y₁ + x₂·y₂) + x₃·y₃) + x₄·y₄`, left to right: a second-order product rule's
+    /// Hessian entry. As [`Self::dot2`]: one node on the reverse tape, this arithmetic
+    /// everywhere else.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self {
+        x1 * y1 + x2 * y2 + x3 * y3 + x4 * y4
+    }
+
     /// Tape position for [`Self::tape_rollback`]; `0` for types that record nothing.
     #[inline]
     fn tape_mark() -> usize {
