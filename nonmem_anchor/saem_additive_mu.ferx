@@ -1,0 +1,41 @@
+# #2540 SAEM additive mu-reference anchor. `level_se_mbma_fit.ferx` (mbma_placebo
+# without the between-arm kappa) with every theta but TVE0 held at NONMEM
+# `level_se_a`'s optimum: EMAX/ED50/ET50 FIX, the PLACEBO levels entered as the
+# fixed data column PLAFIX (saem_additive_mu.csv). Only TVE0 and omega are free.
+#
+# `E0 = TVE0 + ETA_E0` on a line of its own is an additive mu-reference, so SAEM
+# moves TVE0 by the closed-form shift TVE0 += gamma * mean(eta). TVE0's lower bound
+# of 0 packs it as log(TVE0), so the shift runs on the natural scale. The NONMEM
+# twin is saem_additive_mu.ctl (MU_1 = THETA(1), E0 = MU_1 + ETA(1)).
+# saem_additive_mu_inline.ferx is this model with E0 folded into BASE, the
+# non-mu-referenced control.
+
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  theta EMAX(13.4506) FIX
+  theta ED50(31.4307) FIX
+  theta ET50(3.526) FIX
+
+  omega ETA_E0 ~ 4.0 (sd)
+
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[covariates]
+  DOSE   continuous
+  SE     continuous
+  PLAFIX continuous
+
+[individual_parameters]
+  E0   = TVE0 + ETA_E0
+  BASE = E0 + PLAFIX
+
+[structural_model]
+  DRUG = EMAX * DOSE / (ED50 + DOSE) * TIME / (TIME + ET50)
+  y    = BASE - DRUG
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = SE
+
+[fit_options]
+  method     = saem
+  covariance = false

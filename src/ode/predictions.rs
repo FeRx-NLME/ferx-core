@@ -5483,12 +5483,14 @@ fn eta_for<'a>(eta_occ: Option<&'a [Vec<f64>]>, eta: &'a [f64], occ: Option<usiz
 ///   are integrated and augmented by the controller's decisions. Base doses occupy the
 ///   leading `0..n_base` slots of the growing `shadow` dose list, are seeded through the
 ///   same static-engine break/apply helpers, and appear in the controller's
-///   `ctx.history`. Supported on constant-covariate models, and (since #930) on
-///   time-varying-covariate models for plain bolus / infusion base doses — each base
-///   dose's F is resolved from its own covariate snapshot (`event_pk.dose[k]`). Still a
-///   typed error: a base regimen combined with IOV (#931) or system resets (#932), and —
-///   under a time-varying covariate — an SS / lagged / input-rate / modeled-rate base
-///   dose (a #930 follow-up). A dose-free base subject is the special case `n_base == 0`
+///   `ctx.history`. Supported on constant-covariate models, and (since #930 / #931) on
+///   time-varying-covariate and IOV models for plain bolus / infusion base doses — each
+///   base dose's F is resolved from its own snapshot (`event_pk.dose[k]`). Since #932 a
+///   base regimen also composes with system resets on the constant-covariate path. Still a
+///   typed error: a base regimen with a system reset under a
+///   time-varying covariate or IOV (a #932 follow-up), and — under a time-varying covariate
+///   or IOV — an SS / lagged / input-rate / modeled-rate base dose (a #930 / #931
+///   follow-up). A dose-free base subject is the special case `n_base == 0`
 ///   and is byte-identical to before.
 /// - **No lagged or input-rate (absorption) dosing.** Controller dosing into a
 ///   compartment with a dose lag time, or one fed by a built-in input-rate
@@ -5565,6 +5567,7 @@ pub(crate) fn ode_predictions_adaptive(
         &mut decide,
         max_decisions,
         assay,
+        None,
     )
 }
 
@@ -5610,6 +5613,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
     controller: &mut dyn FnMut(&ControllerCtx) -> ControllerDecision,
     max_decisions: usize,
     assay: Option<&AssayNoise>,
+    // `Some` ⇒ also integrate the first monitor's signal over each realized
+    // inter-decision window ([`AdaptiveWindowAucs`], #943) and write one AUC per window
+    // here, in observation units. `None` ⇒ no AUC; the walk is unchanged either way.
+    window_aucs: Option<&mut Vec<f64>>,
 ) -> Result<AdaptiveRun, AdaptiveDriverError> {
     let n = ode.n_states;
     let tv = event_pk.is_some();
@@ -5996,6 +6003,13 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // first realized dose to judge them at (phase B). Empty for every model that reads no
     // dose clock, and dropped unjudged by a run that never doses.
     let mut pending_clock_windows: Vec<PendingClockWindow> = Vec::new();
+    // #943: the window AUC, integrated over the first monitor's signal. Only requested
+    // with a monitor to read (`auc_target` declares one).
+    let mut auc = window_aucs
+        .is_some()
+        .then(|| monitors.first())
+        .flatten()
+        .map(|mon| AdaptiveWindowAucs::new(decision_times, mon));
     while k < break_times.len() {
         let t_start = break_times[k];
         if t_start >= t_base0 - EVENT_MATCH_TOL {
@@ -6182,37 +6196,22 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 let mut observed: Vec<ObservedSignal> = Vec::with_capacity(monitors.len());
                 for am in monitors.iter() {
                     let m = am.spec;
-                    // A declarative `[adaptive_dosing]` block (S2) supplies a
-                    // compiled `observe` expression for the latent value; absent
-                    // one (the programmatic path), read the model's cmt readout.
-                    let latent = match am.observe {
-                        // `[adaptive_dosing] observe` compiles through the same
-                        // `build_y_output_fn` as a `[scaling]` Form C readout, so it can
-                        // reference the `TIME` / `T` built-in — enter this decision's time
-                        // so it resolves there rather than to the thread-local default
-                        // (#1028). The `None` arm's `read_observable` guards itself.
-                        Some(f) => {
-                            let _time_guard =
-                                crate::parser::model_parser::ModelTimeGuard::enter(t_start);
-                            f(&u, pk_readout, theta, readout_eta, decision_cov)
-                        }
-                        None => read_observable(
-                            ode,
-                            &u,
-                            pk_readout,
-                            theta,
-                            readout_eta,
-                            decision_cov,
-                            m.cmt,
-                            t_start,
-                        ),
-                    };
-                    // The model's readout includes its `[scaling]` Form A/B divisor, so the
-                    // controller reads what an observation on `m.cmt` would (#2129) — and,
-                    // under `Dv`, so does the σ drawn from it below. The caller sets
-                    // `obs_scale` only on a monitor with no `observe` expression, so this is
-                    // the identity on the `Some(f)` arm.
-                    let latent = am.scale_readout(latent, readout_eta);
+                    // A declarative `[adaptive_dosing]` block (S2) supplies a compiled
+                    // `observe` expression for the latent value; absent one (the
+                    // programmatic path), the model's cmt readout, divided by its
+                    // `[scaling]` Form A/B divisor so the controller reads what an
+                    // observation on `m.cmt` would (#2129) — and, under `Dv`, so does the
+                    // σ drawn from it below.
+                    let latent = adaptive_monitor_signal(
+                        ode,
+                        am,
+                        &u,
+                        pk_readout,
+                        theta,
+                        readout_eta,
+                        decision_cov,
+                        t_start,
+                    );
                     // A finite state (guarded above) that reads out non-finite is a readout
                     // defect, not a divergence (#1578): a `[scaling]` readout or an `observe`
                     // expression that divides by zero, say. The `Dv` clamp below cannot
@@ -6608,6 +6607,33 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     .copy_from_slice(&seg_pk.values[..crate::types::MAX_PK_PARAMS]);
             }
 
+            // #943: this segment's share of the window AUC. Its nodes are the post-event
+            // value at `t_start` (pushed here, after every event of this break), the window
+            // grid points strictly inside the segment (soft samples of the integration
+            // below) and the pre-event value at `t_end` (pushed after it, before the next
+            // break's events). All read under this segment's `seg_pk` / `seg_eta`. The
+            // covariates are the subject's static map, the one `[scaling]` reads (#2129).
+            let auc_window = auc.as_ref().and_then(|a| a.window_of(t_start));
+            let auc_grid: Vec<f64> = match (&auc, auc_window) {
+                (Some(a), Some(w)) if started => a.grid_inside(w, t_start, t_end),
+                _ => Vec::new(),
+            };
+            let auc_signal = |mon: &AdaptiveMonitor, u: &[f64], t: f64| {
+                adaptive_monitor_signal(
+                    ode,
+                    mon,
+                    u,
+                    seg_pk_values,
+                    theta,
+                    seg_eta,
+                    &shadow.covariates,
+                    t,
+                )
+            };
+            if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
+                a.push(w, t_start, auc_signal(a.monitor, &u, t_start));
+            }
+
             // Per-dose lagtimes for the segment (computed once above for the bolus pass and
             // reused here). Base doses (indices `0..n_base`, #702) carry their resolved
             // lagtime; controller-injected doses (`n_base..`) are lag-0 (a nonzero lag is
@@ -6643,6 +6669,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 } else {
                     Vec::new()
                 };
+                // One soft-sample list for both readers; each takes its own positions back.
+                let (soft_times, probe_at, auc_at) = merge_soft_times(&probe_times, &auc_grid);
                 let soft = integrate_segment(
                     ode,
                     &mut u,
@@ -6660,8 +6688,13 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     &mut predictions,
                     None,
                     &mut auto_state,
-                    &probe_times,
+                    &soft_times,
                 );
+                if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
+                    for (&t, &i) in auc_grid.iter().zip(&auc_at) {
+                        a.push(w, t, auc_signal(a.monitor, &soft[i], t));
+                    }
+                }
 
                 // #1151 / #1535 / #1572: a segment whose dose clock had no referent — a window
                 // before the first realized (or base) dose on a `TAD`/`TAFD`-reading RHS — is
@@ -6684,7 +6717,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     if let Some((tad, tafd)) = clock_candidates {
                         let mut samples = Vec::with_capacity(probe_times.len() + 1);
                         samples.push((t_start, u_start));
-                        samples.extend(probe_times.iter().copied().zip(soft));
+                        samples.extend(
+                            probe_times
+                                .iter()
+                                .zip(&probe_at)
+                                .map(|(&t, &i)| (t, soft[i].clone())),
+                        );
                         pending_clock_windows.push(PendingClockWindow {
                             t_start,
                             t_end,
@@ -6705,6 +6743,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 ) {
                     return Err(AdaptiveDriverError::unsupported(msg));
                 }
+            }
+            // Before the origin nothing evolves, so the held state needs no interior points.
+            if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
+                a.push(w, t_end, auc_signal(a.monitor, &u, t_end));
             }
 
             // Advance the LOCF carry: after integrating into `t_end`, the record in force
@@ -6732,6 +6774,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
 
     // Clamp negative predictions to zero, matching the static predictor.
     clamp_negative_predictions(&ode.readout, &mut predictions);
+
+    if let Some(out) = window_aucs {
+        *out = auc.map_or_else(Vec::new, |a| a.into_realized(decisions.len()));
+    }
 
     Ok(AdaptiveRun {
         predictions,
@@ -7285,169 +7331,145 @@ fn adaptive_frozen_replay_tv(
 }
 
 /// Number of trapezoid panels per inter-decision window for the metrics-only
-/// signal-AUC (#391 S2.5b). A fixed *subdivision count* (unit-agnostic — not a step
-/// in time units), generous enough that the trapezoid discretization error on a
-/// smooth PK curve sits well below the cross-engine solver agreement. This is the
-/// AUC machinery's **own** grid: it deliberately does not touch the reactive
-/// driver's `saveat`, because the stepper clamps `dt` to land on each save point
-/// (`solver.rs`), so adding points there would perturb the bit-aligned trajectory
-/// and the default-on frozen-replay verifier.
+/// window AUC (#391 S2.5b). A fixed *subdivision count* (unit-agnostic — not a step
+/// in time units). The grid points are soft samples of the driver's own integration
+/// ([`integrate_segment`]'s `chz_times`, #570), so they never clamp the step sequence
+/// and the reactive trajectory — hence the frozen-replay verifier — is bit-identical
+/// with or without the AUC (#943).
 const ADAPTIVE_AUC_PANELS: usize = 128;
 
-/// Per-(inter-decision)-window AUC of the **latent** monitored signal — the input
-/// to the `auc_target_attainment` metric (#391 S2.5b).
+/// The value monitor `am` presents at state `u` and time `t`, in observation units:
+/// its compiled `observe` expression when it has one, else the model readout on
+/// `am.spec.cmt` divided by its `[scaling]` divisor under `eta` (#2129).
 ///
-/// Metrics-only: the exposure never feeds the controller (the `when` rules titrate
-/// on the point `signal`), so it is computed here — *after* the reactive run, from
-/// the realized `ledger` — rather than inline in the hot loop. Like
-/// [`verify_adaptive_frozen_replay`] it rebuilds the static dose schedule from the
-/// run's `ledger` and replays it through the trusted dense-state engine
-/// ([`ode_dense_solve_states`]); each window is integrated on its **own** uniform
-/// sub-grid and reduced with the shared trapezoid rule ([`crate::api::trapezoid`]).
-///
-/// **Window convention — left-closed / right-open.** Each window
-/// `[decision_times[k], decision_times[k+1]]` includes the dose at its left edge
-/// `a` (the post-dose state there is the true start of this window's exposure) but
-/// **not** the dose at its right edge `b`, which belongs to the next window.
-/// [`ode_dense_solve_states`] saves the *post-dose* state at a save point that
-/// coincides with a dose time, so the windows cannot share one grid + one solve:
-/// that folds the next window's dose into this window's right endpoint — a spurious
-/// jump of ≈ ½·Δsignal·(window ⁄ panels) for an instantaneous (bolus) dose (an
-/// infusion delivers ≈0 at its start instant and is unaffected, but the convention
-/// must be correct for both). So each window is solved against a static subject that
-/// keeps only the doses **before** `b` (`time < b`), leaving `b` a plain pre-dose
-/// decay point. Controller doses sit on the decision grid (window edges), so for them
-/// `time < b` is exactly "at or before `a`" and the window is integrated exactly. A
-/// pre-scheduled base maintenance dose (#702) may instead land strictly inside
-/// `(a, b)`; it is kept — dropping it would under-count this window's exposure — and
-/// is integrated exactly for an infusion / absorption input (whose signal stays
-/// continuous), with only the same ≈ ½·Δsignal·(window ⁄ panels) node-placement error
-/// as above for the rarer instantaneous bolus into the monitored compartment.
-///
-/// **Cost — `O(m²)`, deliberately.** This is one dense solve per window, and
-/// because [`ode_dense_solve_states`] always starts from `t = 0` (it cannot resume
-/// from a saved state), window `k` re-integrates `[0, decision_times[k+1]]` — so the
-/// pass is quadratic in the decision count `m` (`1 + 2 + … + (m−1)`), versus `O(m)`
-/// for a single shared solve. That is an accepted trade for correctness: the pass
-/// runs **only** when `auc_target` is declared and **only after** the reactive run
-/// (a per-(subject, replicate) reporting step, never inside the fit/inner loop), so
-/// for the intended TDM scale (tens of decisions, a microsecond each) the quadratic
-/// factor is negligible. Collapsing it back to `O(m)` would require a solver entry
-/// point that resumes from a mid-trajectory state, or a dense readout of the
-/// *pre-dose* value at a dose instant — both larger changes to the shared engine,
-/// left as a follow-up rather than bundled into the boundary fix.
-///
-/// Returns one AUC per **closed** window `[decision_times[k], decision_times[k+1]]`
-/// (length `decision_times.len() − 1`; empty for a single decision — there is no
-/// window to integrate over). The signal is the latent readout the driver itself
-/// would resolve: the compiled `observe` expression when present (the `Ipred`
-/// path), else the model's `monitor_cmt` readout (the `Dv` path's underlying
-/// latent — the AUC is always over the un-noised signal, never the assay draw).
-///
-/// `base_subject` carries the run's covariates **and** any pre-scheduled base regimen
-/// (#702 — a loading / maintenance dose on `subject.doses`): each window is integrated
-/// against those base doses (kept via clone, so their `SS`/lagtime/infusion attributes
-/// carry over) plus the controller's realized ledger doses, restricted per the window
-/// composition below. On the dose-free path `base_subject.doses` is empty, so this is
-/// the prior ledger-only rebuild. This pass uses a **single** PK snapshot
-/// (`pk_params_flat`), exact only for constant-covariate subjects — a time-varying (or
-/// TIME-in-PK) or IOV subject with an `auc_target` is rejected upstream in
-/// `run_adaptive_population` (#700/#701), so it never reaches here.
+/// The one spelling of "what this monitor reads": the decision hook resolves the
+/// controller's signal through it, and the window AUC (#943) integrates it at every grid
+/// point under that point's own PK snapshot and `[η | κ]`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn adaptive_window_signal_aucs(
+fn adaptive_monitor_signal(
     ode: &OdeSpec,
-    pk_params_flat: &[f64],
+    am: &AdaptiveMonitor,
+    u: &[f64],
+    pk: &[f64],
     theta: &[f64],
     eta: &[f64],
-    base_subject: &Subject,
-    decision_times: &[f64],
-    ledger: &[DoseLedgerEntry],
-    observe: Option<&OdeOutputFn>,
-    monitor_cmt: usize,
-) -> Vec<f64> {
-    let m = decision_times.len();
-    if m < 2 {
-        return Vec::new();
+    cov: &HashMap<String, f64>,
+    t: f64,
+) -> f64 {
+    let latent = match am.observe {
+        // `[adaptive_dosing] observe` compiles through the same `build_y_output_fn` as a
+        // `[scaling]` Form C readout, so it can reference the `TIME` / `T` built-in — enter
+        // `t` so it resolves there rather than to the thread-local default (#1028). The
+        // `None` arm's `read_observable` guards itself.
+        Some(f) => {
+            let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(t);
+            f(u, pk, theta, eta, cov)
+        }
+        None => read_observable(ode, u, pk, theta, eta, cov, am.spec.cmt, t),
+    };
+    // The caller sets `obs_scale` only on a monitor with no `observe` expression, so this
+    // is the identity on the `Some(f)` arm.
+    am.scale_readout(latent, eta)
+}
+
+/// Per-(inter-decision)-window AUC of the monitored signal, accumulated inside the
+/// reactive driver's own segment walk — the input to the `auc_target_attainment` metric
+/// (#391 S2.5b, #943).
+///
+/// **Window convention — left-closed / right-open.** Window `k` is
+/// `[decision_times[k], decision_times[k+1]]`; it starts from the state the events at its
+/// left edge left (the dose there is this window's) and ends at the state its right edge
+/// found (the dose there is the next window's).
+///
+/// **Nodes.** Every decision is a break of the walk, so each segment `(t_start, t_end]`
+/// lies inside one window. The driver pushes, per segment, the post-event value at
+/// `t_start`, the window's uniform grid points strictly inside the segment (soft samples
+/// of the same integration), and the pre-event value at `t_end`. A break inside a window —
+/// a base dose, an infusion end, an EVID=3/4 reset — therefore carries both its `b⁻` and
+/// its `a⁺` node, and the trapezoid integrates the jump exactly as a zero-width panel.
+/// Each point reads under its segment's PK and `[η | κ]`, the snapshot the state itself
+/// was integrated with.
+///
+/// **Cost — `O(m)`.** One walk serves every window; the old post-hoc pass re-solved from
+/// `t = 0` for each window (`O(m²)`).
+struct AdaptiveWindowAucs<'d> {
+    edges: &'d [f64],
+    // The monitor whose signal is integrated.
+    monitor: &'d AdaptiveMonitor<'d>,
+    // Each window's `(t, signal)` nodes, in walk order.
+    points: Vec<Vec<(f64, f64)>>,
+}
+
+impl<'d> AdaptiveWindowAucs<'d> {
+    fn new(decision_times: &'d [f64], monitor: &'d AdaptiveMonitor<'d>) -> Self {
+        Self {
+            edges: decision_times,
+            monitor,
+            points: vec![Vec::new(); decision_times.len().saturating_sub(1)],
+        }
     }
 
-    let panels = ADAPTIVE_AUC_PANELS;
-    // BSV-only ⇒ the subject's static covariate snapshot applies at every grid time.
-    let cov = &base_subject.covariates;
+    /// The window holding the segment that starts at the break `t_start`, or `None` before
+    /// the first decision or from the last one on. Decisions are bit-exact breaks (the
+    /// driver's survival guards), so the segment cannot straddle a window edge.
+    fn window_of(&self, t_start: f64) -> Option<usize> {
+        let k = self.edges.partition_point(|&d| d <= t_start);
+        (k >= 1 && k < self.edges.len()).then(|| k - 1)
+    }
 
-    // One closed window at a time (see "Window convention" above): integrate
-    // `[a, b]` against a static subject carrying the base regimen and ledger doses
-    // that can influence this window — everything before the right edge `b` (see the
-    // per-window composition below) — so the dose at `b` (the next window's) never
-    // folds into this window's endpoint.
-    (0..m - 1)
-        .map(|k| {
-            let (a, b) = (decision_times[k], decision_times[k + 1]);
+    /// Window `w`'s grid points strictly inside `(t_start, t_end)`, ascending. The ends
+    /// are nodes of their own.
+    fn grid_inside(&self, w: usize, t_start: f64, t_end: f64) -> Vec<f64> {
+        let (a, b) = (self.edges[w], self.edges[w + 1]);
+        let span = b - a;
+        let panels = ADAPTIVE_AUC_PANELS;
+        (1..panels)
+            .map(|i| a + span * (i as f64) / (panels as f64))
+            .filter(|&g| g > t_start && g < t_end)
+            .collect()
+    }
 
-            // Compose the window's static regimen exactly as
-            // [`verify_adaptive_frozen_replay`] does: the pre-scheduled base regimen
-            // (#702) — CLONED, so each base dose's `SS`/`II`/lagtime/modeled-`RATE`/
-            // infusion attributes survive (a `DoseEvent::new` rebuild would silently
-            // reset them to a plain `Fixed` bolus) — followed by the controller's
-            // realized ledger doses, then restricted to the doses that can influence
-            // this window. A dose strictly after the right edge `b` cannot affect
-            // `[a, b]` (causality); the dose *at* `b` is the next window's left-edge
-            // dose, whose post-dose jump would otherwise fold into this window's right
-            // endpoint ([`ode_dense_solve_states`] saves the post-dose state at a save
-            // point on a dose time). Both are dropped by `time < b`; doses at or before
-            // `a` (state setup) and any base maintenance dose strictly inside `(a, b)`
-            // are kept. Controller doses sit on the decision grid (= window edges), so
-            // for them `time < b` is byte-identical to the old `<= a` — the pure-
-            // controller path is unchanged; only a base regimen (previously dropped by
-            // the `sub.doses = ledger` overwrite) is now integrated. The `1e-9` guards
-            // float equality at `b`, far below any real decision spacing.
-            let mut sub = base_subject.clone();
-            sub.doses.extend(
-                ledger
-                    .iter()
-                    .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
-            );
-            sub.doses.retain(|d| d.time < b - 1e-9);
+    /// Append the node `(t, s)` to window `w`.
+    fn push(&mut self, w: usize, t: f64, s: f64) {
+        self.points[w].push((t, s));
+    }
 
-            // The window's own uniform sub-grid: `panels + 1` points, `grid[0] == a`
-            // (post-dose) and `grid[panels] == b` (pre-dose decay).
-            let span = b - a;
-            let grid: Vec<f64> = (0..=panels)
-                .map(|i| a + span * (i as f64) / (panels as f64))
-                .collect();
+    /// The AUCs of the first `n_realized - 1` windows, each reduced by the shared trapezoid
+    /// rule ([`crate::api::trapezoid`]; its stable sort keeps a break's `b⁻` before its
+    /// `a⁺`). After a `Stop` no decision is logged, so the realized decisions are a prefix
+    /// of the schedule, and a window past the last realized decision is discontinuation,
+    /// not exposure.
+    fn into_realized(self, n_realized: usize) -> Vec<f64> {
+        self.points
+            .iter()
+            .take(n_realized.saturating_sub(1))
+            .map(|pts| crate::api::trapezoid(pts))
+            .collect()
+    }
+}
 
-            let states = ode_dense_solve_states(ode, pk_params_flat, theta, eta, &sub, &grid);
-
-            // Latent signal at each grid point (the same readout the driver resolves
-            // at a decision), then trapezoid the window.
-            let pts: Vec<(f64, f64)> = states
-                .iter()
-                .enumerate()
-                .map(|(i, u)| {
-                    let s = match observe {
-                        // Same `TIME` guard as the decision-time monitor read above
-                        // (#1028), at this grid point's own time.
-                        Some(f) => {
-                            let _time_guard =
-                                crate::parser::model_parser::ModelTimeGuard::enter(grid[i]);
-                            f(u, pk_params_flat, theta, eta, cov)
-                        }
-                        None => read_observable(
-                            ode,
-                            u,
-                            pk_params_flat,
-                            theta,
-                            eta,
-                            cov,
-                            monitor_cmt,
-                            grid[i],
-                        ),
-                    };
-                    (grid[i], s)
-                })
-                .collect();
-            crate::api::trapezoid(&pts)
-        })
-        .collect()
+/// Merge two ascending time lists into one, dropping bit-identical duplicates, and
+/// return each input's positions in the merged list.
+fn merge_soft_times(a: &[f64], b: &[f64]) -> (Vec<f64>, Vec<usize>, Vec<usize>) {
+    let mut merged: Vec<f64> = Vec::with_capacity(a.len() + b.len());
+    let (mut ia, mut ib) = (Vec::with_capacity(a.len()), Vec::with_capacity(b.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        let take_a = j >= b.len() || (i < a.len() && a[i] <= b[j]);
+        let t = if take_a { a[i] } else { b[j] };
+        if merged.last().is_none_or(|&l| l.to_bits() != t.to_bits()) {
+            merged.push(t);
+        }
+        let pos = merged.len() - 1;
+        if take_a {
+            ia.push(pos);
+            i += 1;
+        } else {
+            ib.push(pos);
+            j += 1;
+        }
+    }
+    (merged, ia, ib)
 }
 
 /// ODE-based predictions with per-event PK parameters (time-varying-covariate

@@ -909,6 +909,9 @@ fn run_mcem(
     let cov_group_conflicts = mu_ref_pairs_for_cov_groups(&mu_ref_split);
     let MuRefPairs {
         eligible: mu_ref_pairs,
+        // SAEM-only (#2540): this M-step steps the packed θ, which is not an
+        // additive anchor's mu when the θ is log-packed.
+        additive: _,
         identity_packed_log,
         log_packed_logit,
         shared_theta,

@@ -94,9 +94,10 @@ pub fn tafd_tad_for_subject(
 /// Observation times are not guaranteed to be sorted (preserved in input row
 /// order), so sort by time before integrating to prevent negative dt windows.
 ///
-/// `pub(crate)` so the reactive-dosing signal-AUC pass
-/// ([`crate::ode::adaptive_window_signal_aucs`], #391 S2.5b) shares this one
-/// implementation rather than carrying a second copy of the rule.
+/// `pub(crate)` so the reactive driver's window AUC (`auc_target_attainment`, #391
+/// S2.5b, #943) shares this one implementation rather than carrying a second copy of
+/// the rule. The sort is stable, so two nodes at one time — the value a break found and
+/// the value it left — keep their order and form a zero-width panel.
 pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
     if points.len() < 2 {
         return f64::NAN;
