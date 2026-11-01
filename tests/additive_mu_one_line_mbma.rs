@@ -10,7 +10,10 @@
 //!   associate differently. The bound is a guard that the FOCE change stays below the
 //!   printed digits, not a detector of the mu-reference: FOCEI's optimum does not depend
 //!   on the centring, and with the one-line arm disabled the gap is the same 1.3e-12.
-//!   What dies when the arm goes is the `ETA_E0 → TVE0` assertion in `both`.
+//!   That is the plan's proposed mutation (μ = 0 for one spelling), so no mutation of this
+//!   PR's code reddens the bound; it would take an FOCEI regression that makes the two
+//!   spellings reach different optima. What dies when the arm goes is the
+//!   `ETA_E0 → TVE0` assertion in `both`.
 //! - SAEM (T7, `slow-tests`). Per seed the spellings differ (the summation order changes
 //!   the floating-point path and the chain diverges), so the check is distributional:
 //!   five seeds of each, the one-line median within the split's runs and every run near

@@ -685,7 +685,7 @@ impl MuRefScan<'_> {
         at: usize,
     ) -> Option<(usize, MuRef)> {
         let s = &stmts[at];
-        let Statement::Assign(owner, raw_expr) = s else {
+        let Statement::Assign(_, raw_expr) = s else {
             return None;
         };
         let (theta_names, eta_names, nn) = (self.theta_names, self.eta_names, self.nn_specs);
@@ -711,7 +711,7 @@ impl MuRefScan<'_> {
         let exclusive =
             thetas_read_outside_the_group(stmts, theta_names, self.outside_idents, &[s], theta)
                 .is_empty()
-                && !eta_read_outside_the_group(stmts, owner, eta_idx);
+                && !eta_read_outside_the_group(stmts, OwnerOf::Statement(s), eta_idx);
         exclusive.then_some((eta_idx, mu_ref))
     }
 }
@@ -764,8 +764,15 @@ fn reads_unresolved_local<'a, V: RhsView<'a>>(v: V) -> bool {
             reads_unresolved_local(v.child(l)) || reads_unresolved_local(v.child(r))
         }
         Expression::UnaryFn(_, a) => reads_unresolved_local(v.child(a)),
-        Expression::Conditional(_, t, f) => {
-            reads_unresolved_local(v.child(t)) || reads_unresolved_local(v.child(f))
+        Expression::ThetaGather { idx, .. } => reads_unresolved_local(v.child(idx)),
+        // The condition too, as `typical_summary_of` walks it: a θ-bearing local in
+        // `if (X > 40)` steps the typical value with θ (#2553 review r1 §4).
+        Expression::Conditional(c, t, f) => {
+            let mut in_condition = false;
+            for_each_condition_operand(c, &mut |x| {
+                in_condition |= reads_unresolved_local(v.child(x))
+            });
+            in_condition || reads_unresolved_local(v.child(t)) || reads_unresolved_local(v.child(f))
         }
         _ => false,
     }
@@ -1781,7 +1788,7 @@ fn detect_covariate_mu_refs(
             &owners_and_anchors,
             &entry.theta_names,
         );
-        entry.eta_shared = eta_read_outside_the_group(stmts, owner, eta_idx);
+        entry.eta_shared = eta_read_outside_the_group(stmts, OwnerOf::Name(owner), eta_idx);
     };
     let anchors: Vec<CovariateMuRef> = anchors
         .into_iter()
@@ -1943,10 +1950,38 @@ fn thetas_read_outside_the_group(
 /// `φ` freezing it. The group is not dropped, only routed to the prior-plus-data
 /// engine, which evaluates the data term *with* the shift applied and is
 /// therefore correct for any number of uses.
-fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) -> bool {
-    stmts.iter().any(|s| match s {
+///
+/// `owner` names what is *not* a second use. [`OwnerOf::Name`] skips every assignment
+/// to that name, which is what the #619 groups have always done. [`OwnerOf::Statement`]
+/// (a top-level assignment, compared by address as in [`spread_theta_taint`]) skips that
+/// statement and the assignments to its name *before* it, which it overwrites; one
+/// *after* it is a second use, so `BASE = BASE + 0.5*ETA_E0` drops the anchor (#2544).
+fn eta_read_outside_the_group(stmts: &[Statement], owner: OwnerOf, eta_idx: usize) -> bool {
+    let mut skip = match owner {
+        OwnerOf::Statement(Statement::Assign(name, _)) => OwnerOf::Name(name),
+        other => other,
+    };
+    stmts.iter().any(|s| {
+        if let OwnerOf::Statement(o) = owner {
+            if std::ptr::eq(o, s) {
+                skip = owner;
+                return false;
+            }
+        }
+        eta_read_by(s, skip, eta_idx)
+    })
+}
+
+/// Whether `s` reads `eta_idx`, `skip` being the assignments that do not count
+/// ([`eta_read_outside_the_group`]).
+fn eta_read_by(s: &Statement, skip: OwnerOf, eta_idx: usize) -> bool {
+    match s {
         Statement::Assign(name, expr) => {
-            if name == owner {
+            let skipped = match skip {
+                OwnerOf::Name(n) => name == n,
+                OwnerOf::Statement(o) => std::ptr::eq(o, s),
+            };
+            if skipped {
                 return false;
             }
             let mut reads = false;
@@ -1961,15 +1996,18 @@ fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) 
             branches,
             else_body,
         } => {
-            branches
-                .iter()
-                .any(|(_, body)| eta_read_outside_the_group(body, owner, eta_idx))
-                || else_body
-                    .as_ref()
-                    .is_some_and(|eb| eta_read_outside_the_group(eb, owner, eta_idx))
+            let any = |body: &[Statement]| body.iter().any(|b| eta_read_by(b, skip, eta_idx));
+            branches.iter().any(|(_, body)| any(body)) || else_body.as_deref().is_some_and(any)
         }
         _ => false,
-    })
+    }
+}
+
+/// Which assignment owns an eta, for [`eta_read_outside_the_group`].
+#[derive(Clone, Copy)]
+enum OwnerOf<'a> {
+    Name(&'a str),
+    Statement(&'a Statement),
 }
 
 /// Names (uppercased) whose value depends on `theta_idx`, following assignments

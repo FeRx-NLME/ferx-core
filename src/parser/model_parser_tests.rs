@@ -36751,6 +36751,11 @@ fn a_one_line_additive_sum_is_an_identity_mu_ref() {
              BASE = TVE0 + X + ETA_E0\n  ETAX_USE = ETA_X",
         ),
         (
+            "θ through an if-local in a condition",
+            "  if (FLARE > 1) {\n    X = TVE0\n  } else {\n    X = 0\n  }\n  \
+             BASE = TVE0 + (if (X > 40) 1 else 0) + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
             "η through a local",
             "  X = 0.5 * ETA_X\n  BASE = TVE0 + PLACEBO + X + ETA_E0\n  ETAX_USE = 0",
         ),
@@ -36773,9 +36778,17 @@ fn a_one_line_additive_sum_is_an_identity_mu_ref() {
 /// the taint not stopped at the owner line, `owners = &[]` ((a), (d)).
 #[test]
 fn an_additive_mu_ref_needs_its_theta_and_eta_exclusive() {
-    for (label, base) in [
-        ("one-line", "  BASE = TVE0 + PLACEBO + ETA_E0"),
-        ("two-term", "  E0 = TVE0 + ETA_E0\n  BASE = E0 + PLACEBO"),
+    for (label, base, reassigned) in [
+        (
+            "one-line",
+            "  BASE = TVE0 + PLACEBO + ETA_E0",
+            "  BASE = BASE + 0.5 * ETA_E0",
+        ),
+        (
+            "two-term",
+            "  E0 = TVE0 + ETA_E0\n  BASE = E0 + PLACEBO",
+            "  E0 = E0 + 0.5 * ETA_E0\n  BASE = E0 + PLACEBO",
+        ),
     ] {
         let case = |indiv_tail: &str, extra: &str| {
             e0_anchor(&additive_mu_model(&format!("{base}\n{indiv_tail}"), extra))
@@ -36802,6 +36815,13 @@ fn an_additive_mu_ref_needs_its_theta_and_eta_exclusive() {
             None,
             "{label} (e)"
         );
+        // (f) a later assignment to the *owner's name* that reads the eta again: a second
+        // use like (e), so the gate compares statements, not names (#2553 review r1 §2).
+        assert_eq!(
+            case(&format!("{reassigned}\n  ETAX_USE = ETA_X"), ""),
+            None,
+            "{label} (f)"
+        );
     }
 }
 
@@ -36824,6 +36844,38 @@ fn a_later_one_line_additive_mu_ref_clears_the_class_aware_entry() {
         Some(("TVCL3".to_string(), MuTransform::Identity))
     );
     assert_eq!(class_anchors(&model, "ETA_CL"), None);
+
+    // The mixture scan builds its own inline scope and `outside_idents`, so each gets a
+    // row (#2553 review r1 §3). (i) The later line reads its θ through a local: only the
+    // scope's inlining sees it. Dies under: the mixture loop's `scope.record` deleted.
+    let via_local = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         TV = TVCL3\n  CL = TV + 0.1 * WT + ETA_CL\n  V = TVV",
+    );
+    assert_eq!(
+        via_local
+            .mu_refs
+            .get("ETA_CL")
+            .map(|m| m.theta_name.clone()),
+        Some("TVCL3".to_string()),
+        "via a local"
+    );
+    assert_eq!(class_anchors(&via_local, "ETA_CL"), None, "via a local");
+    // (ii) The later line's θ also reaches the model through `V`, which the structural
+    // model reads: `mu_refs` drops it, so the class-aware entry must stay. Dies under:
+    // the mixture scan's `outside_idents` emptied.
+    let shared = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = TVCL3 + 0.1 * WT + ETA_CL\n  V = TVV + 0 * TVCL3",
+    );
+    assert!(!shared.mu_refs.contains_key("ETA_CL"), "θ read elsewhere");
+    assert_eq!(
+        class_anchors(&shared, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string()]),
+        "θ read elsewhere"
+    );
 }
 
 /// T2 control (#2544): the exclusivity gate is for the BSV M-step and leaves
