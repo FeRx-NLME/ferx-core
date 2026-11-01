@@ -911,8 +911,8 @@ struct SubjectState {
     unconverged: bool,
     fallback: bool,
     /// The mode may not be one: its solve, from the population inner loop or a re-solve,
-    /// did not converge or fell back to Nelder–Mead ([`off_mode`]). Its level gradient
-    /// then takes the re-solved differences, never the adjoint's identity at a non-mode.
+    /// did not converge ([`off_mode`]). Its level gradient then takes the re-solved
+    /// differences, never the adjoint's identity at a non-mode.
     off_mode: bool,
     /// Off its mode on a subject below `min_obs_for_convergence_check`
     /// ([`excused_off_mode`]): the re-solved differences still serve it, but it is not
@@ -924,8 +924,20 @@ struct SubjectState {
 /// does not hold there (#2401 review row 2). Measured on `nested_levels_3` at
 /// `inner_maxiter = 3`: the adjoint level gradient at such a state was 4.6 conditional SEs
 /// from the converged one, the re-solved differences from the same state 2.4e-5.
+///
+/// A Nelder–Mead fallback is off its mode only when it is uncertified. `converged` on a
+/// fallback means `FallbackCertifier` passed it on stationarity (#1527): its gradient arm
+/// is the BFGS stop's `‖g‖ < tol`, its polish the same stall stop a BFGS solve takes, and
+/// its resolution arm, `½gᵀH⁻¹g ≤ INNER_FTOL_REL·(1 + |f|)` (`1e-11`), lets the gradient sit
+/// above `tol`. The identity's error there is `gᵀH⁻¹b`, which Cauchy–Schwarz with a positive
+/// definite `H` bounds by `√(2e-11·(1 + |f|))` level SEs: ~1e-5 SE at F2's per-subject `|f|`,
+/// ~5e-4 SE at `|f| ≈ 1.3e4`. Immaterial against the 4.6 SE of a solve that stopped short,
+/// so a certified fallback keeps the adjoint (#2539). Declining those sent subjects to FD at
+/// every outer optimum: a warm start
+/// already at its mode leaves BFGS no step to take, so it hands off to a fallback that
+/// certifies in place (F2 at NONMEM's optimum: 4 of 12 subjects on Linux, 2 on macOS).
 fn off_mode(ebe: &crate::estimation::inner_optimizer::EbeResult) -> bool {
-    !ebe.converged || ebe.used_fallback
+    !ebe.converged
 }
 
 /// Whether `subject` has fewer observations than `min_obs_for_convergence_check`, the
@@ -937,9 +949,9 @@ fn below_min_obs(subject: &crate::types::Subject, min_obs: u32) -> bool {
 /// Whether an off-mode solve is excused from the FD-fallback warnings (#2408): its subject
 /// has fewer observations than `min_obs_for_convergence_check`, the subjects the fit's
 /// unconverged-EBE count already excuses. Such a subject keeps the re-solved level
-/// gradient, the correct one at a non-mode, but is not named. A Nelder–Mead fallback is
-/// excused too: outside ODE+IOV a BFGS that stops short always falls back, so excusing
-/// only the bare stop would leave the excuse unreachable on every other model.
+/// gradient, the correct one at a non-mode, but is not named. An uncertified Nelder–Mead
+/// fallback is such a solve too (its `converged` is false): outside ODE+IOV a BFGS that
+/// stops short always falls back, so the excuse reaches every model.
 fn excused_off_mode(
     ebe: &crate::estimation::inner_optimizer::EbeResult,
     subject: &crate::types::Subject,
