@@ -752,12 +752,15 @@ fn fixed_ebe_score_iov<const N: usize, const M: usize>(
             t: Vec::new(),
         })
     });
+    // Every node an adjoint is read at below is an input recorded above, so the sweep's
+    // adjoints are kept for that prefix only.
+    let n_in = crate::sens::rtape::rtape_len();
     let fval = match ngr.as_ref() {
         Some(ngr) => ng_f_grad(&ctx, &fr, &gr, &er, &pr, ngr, interaction)?.0,
         None => objective::<R, N>(&ctx, interaction, &fr, &gr, &er, pr0.as_deref(), &pr)?.0,
     };
     // Copied: the non-Gaussian term's θ block records its own scalar tape below.
-    let sadj = rsweep::<1>(&[fval]).to_vec();
+    let sadj = rsweep::<1>(&[fval])[..n_in].to_vec();
     let psi_of = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
     let ng_adj = ngr.as_ref().map(|ngr| ng_adjoints(ngr, n_bsv, psi_of));
 
@@ -3935,6 +3938,122 @@ fn ng_theta_adjoint(
     out.iter().all(|v| v.is_finite()).then_some(out)
 }
 
+/// [`ng_theta_adjoint`] for several seeds at one `eta`: the term's θ-block contraction for
+/// each `(a_q, a_g, a_h)`, the term evaluated **once** on the second-order forward η-dual
+/// over the tape and swept once per seed (#2549: the gradient's `Ψ` and each row of its mode
+/// response share η̂). A seed's result is bit-identical to [`ng_theta_adjoint`] on that seed
+/// alone; with any value-only seed (no η-derivative weight), whose evaluation that function
+/// takes on the plain tape type, each seed goes through it instead.
+#[cfg(feature = "survival")]
+#[allow(clippy::type_complexity)]
+fn ng_theta_adjoint_seeds(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    seeds: &[(f64, Vec<f64>, Vec<Vec<f64>>)],
+) -> Option<Vec<Vec<f64>>> {
+    use crate::sens::rtape::DualH;
+    use crate::survival::{NonGaussianTerm, SubjectTerm};
+    let n = eta.len();
+    let value_only = |(_, a_g, a_h): &(f64, Vec<f64>, Vec<Vec<f64>>)| {
+        a_g.iter().all(|&v| v == 0.0) && a_h.iter().flatten().all(|&v| v == 0.0)
+    };
+    if n == 0 || seeds.iter().any(value_only) {
+        return seeds
+            .iter()
+            .map(|(a_q, a_g, a_h)| {
+                let part = NgSeed {
+                    eta,
+                    a_q: *a_q,
+                    a_g,
+                    a_h,
+                };
+                ng_theta_adjoint(model, subject, theta, &[part])
+            })
+            .collect();
+    }
+    fn go<const NB: usize, const MB: usize>(
+        term: &NonGaussianTerm<'_>,
+        th: &[R],
+        eta: &[f64],
+        seeds: &[(f64, Vec<f64>, Vec<Vec<f64>>)],
+    ) -> Option<Vec<R>> {
+        type H<const NB: usize, const MB: usize> = DualH<NB, MB, R>;
+        let n = eta.len();
+        if n > NB {
+            return None;
+        }
+        let zero = R::c(0.0);
+        let thh: Vec<H<NB, MB>> = th
+            .iter()
+            .map(|&v| H::<NB, MB> {
+                v,
+                g: [zero; NB],
+                h: [zero; MB],
+            })
+            .collect();
+        let et: Vec<H<NB, MB>> = (0..n)
+            .map(|k| {
+                let mut g = [zero; NB];
+                g[k] = R::c(1.0);
+                H::<NB, MB> {
+                    v: R::c(eta[k]),
+                    g,
+                    h: [zero; MB],
+                }
+            })
+            .collect();
+        let y = term.eval(&thh, &et)?;
+        Some(
+            seeds
+                .iter()
+                .map(|(a_q, a_g, a_h)| {
+                    let mut acc = R::c(*a_q) * y.v;
+                    for k in 0..n {
+                        acc = acc + R::c(a_g[k]) * y.g[k];
+                        for l in 0..=k {
+                            acc = acc + R::c(a_h[k][l]) * y.hess(k, l);
+                        }
+                    }
+                    // `ng_theta_adjoint` sums its parts from zero: the same node, so the
+                    // same adjoints.
+                    zero + acc
+                })
+                .collect(),
+        )
+    }
+    let term = NonGaussianTerm::new(model, subject);
+    rtape_reset();
+    let th: Vec<R> = theta.iter().map(|&v| rinput(v)).collect();
+    let accs = match n {
+        1 => go::<1, 1>(&term, &th, eta, seeds)?,
+        2 => go::<2, 3>(&term, &th, eta, seeds)?,
+        3 | 4 => go::<4, 10>(&term, &th, eta, seeds)?,
+        5..=8 => go::<8, 36>(&term, &th, eta, seeds)?,
+        _ => return None,
+    };
+    accs.into_iter()
+        .map(|acc| {
+            let adj = rsweep::<1>(&[acc]);
+            let out: Vec<f64> = th.iter().map(|x| x.idx().map_or(0.0, |i| adj[i])).collect();
+            out.iter().all(|v| v.is_finite()).then_some(out)
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "survival"))]
+#[allow(clippy::type_complexity)]
+fn ng_theta_adjoint_seeds(
+    _: &CompiledModel,
+    _: &Subject,
+    _: &[f64],
+    _: &[f64],
+    _: &[(f64, Vec<f64>, Vec<Vec<f64>>)],
+) -> Option<Vec<Vec<f64>>> {
+    None
+}
+
 #[cfg(not(feature = "survival"))]
 fn ng_theta_adjoint(
     _: &CompiledModel,
@@ -4115,6 +4234,10 @@ fn run<const N: usize, const M: usize>(
     // η-Hessian as tape inputs; their θ-derivatives are contracted with the adjoints in
     // step 4.
     let ng_r = ng.as_ref().map(ng_tape_inputs::<N>);
+    // Every node an adjoint is read at below is one of the inputs recorded above (`rinput`:
+    // predictions, their tangents, the parameter and non-Gaussian leaves), so a sweep's
+    // adjoints are kept for this prefix only, not for the objective's whole recording.
+    let n_in = crate::sens::rtape::rtape_len();
     let (fval, lg) = match ng_r.as_ref() {
         Some(ngr) => {
             objective_ng::<R, N>(&ctx, interaction, &fr, &gr, &er, pr0.as_deref(), ngr, &pr)?
@@ -4127,14 +4250,14 @@ fn run<const N: usize, const M: usize>(
             (0..N).map(|k| (R::c(w[k]), lg[k], R::c(1.0))),
         );
     // Copied: the non-Gaussian term's θ block records its own scalar tape below.
-    let sadj = rsweep::<1>(&[psi]).to_vec();
+    let sadj = rsweep::<1>(&[psi])[..n_in].to_vec();
     let psi_of = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
     // The mode response's rows `y_r = Σ_k Z_rk (∇_η l)_k`, `Z` the BSV rows of `H⁻¹`, so
     // `dη̂_r/dx = −∂y_r/∂x` (`Z` held constant: `H` is the derivative of `∇_η l` at the
     // mode): one lane per BSV effect, however wide the stacked `[η, κ]` system. Swept now:
     // the non-Gaussian θ block below overwrites the tape.
     let dx_rows: Vec<(usize, usize, Vec<f64>)> = if eta_dx.is_some() {
-        eta_dx_lanes::<N>(&h, &lg, active.min(N), n_bsv.min(active).min(N))
+        eta_dx_lanes::<N>(&h, &lg, active.min(N), n_bsv.min(active).min(N), n_in)
     } else {
         Vec::new()
     };
@@ -4174,17 +4297,33 @@ fn run<const N: usize, const M: usize>(
     if let Some((red, z)) = &nn_out {
         add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
     }
+    // The non-Gaussian term's θ block, for `Ψ` and (with the mode response) for each of the
+    // response's rows: one recording of the term at η̂, swept per seed.
+    let mut ng_rows: Vec<Vec<f64>> = Vec::new();
     if let Some(ngr) = ng_r.as_ref() {
         let n = n_bsv;
-        let (a_q, a_g, a_h) = ng_adjoints(ngr, n, psi_of);
-        let part = NgSeed {
-            eta: &eta[..n],
-            a_q,
-            a_g: &a_g,
-            a_h: &a_h,
+        let mut seeds = vec![ng_adjoints(ngr, n, psi_of)];
+        for (lanes, rows, adj) in &dx_rows {
+            for l in 0..*rows {
+                seeds.push(ng_adjoints(ngr, n, |x: R| {
+                    x.idx().map_or(0.0, |i| adj[i * lanes + l])
+                }));
+            }
+        }
+        let mut d = if seeds.len() == 1 {
+            let (a_q, a_g, a_h) = &seeds[0];
+            let part = NgSeed {
+                eta: &eta[..n],
+                a_q: *a_q,
+                a_g,
+                a_h,
+            };
+            vec![ng_theta_adjoint(model, subject, theta, &[part])?]
+        } else {
+            ng_theta_adjoint_seeds(model, subject, theta, &eta[..n], &seeds)?
         };
-        let d = ng_theta_adjoint(model, subject, theta, &[part])?;
-        for (t, dv) in theta_adj.iter_mut().zip(d) {
+        ng_rows = d.split_off(1);
+        for (t, dv) in theta_adj.iter_mut().zip(d.remove(0)) {
             *t += dv;
         }
     }
@@ -4236,16 +4375,7 @@ fn run<const N: usize, const M: usize>(
             for l in 0..*n {
                 let of = |x: R| -> f64 { x.idx().map_or(0.0, |i| adj[i * lanes + l]) };
                 let mut ta = std::mem::take(&mut lane_theta[r]);
-                if let Some(ngr) = ng_r.as_ref() {
-                    let nb = n_bsv;
-                    let (a_q, a_g, a_h) = ng_adjoints(ngr, nb, of);
-                    let part = NgSeed {
-                        eta: &eta[..nb],
-                        a_q,
-                        a_g: &a_g,
-                        a_h: &a_h,
-                    };
-                    let d = ng_theta_adjoint(model, subject, theta, &[part])?;
+                if let Some(d) = ng_rows.get(r) {
                     for (t, dv) in ta.iter_mut().zip(d) {
                         *t += dv;
                     }
@@ -4281,13 +4411,14 @@ const DX_LANES: usize = 4;
 
 /// The mode response's scalar-tape sweep (step 3 of [`run`]): rows `y_r = Σ_k Z_rk g_k` for
 /// `r < n_rows`, `Z = (H⁻¹)_{r,:}` over the `n_act` live effects, swept in chunks of 1, 2 or
-/// [`DX_LANES`] lanes. Each chunk is `(lanes, rows in it, adjoints[node·lanes + lane])`.
-/// Empty when `H` is singular.
+/// [`DX_LANES`] lanes. Each chunk is `(lanes, rows in it, adjoints[node·lanes + lane])`
+/// for the tape's first `n_in` nodes, its inputs. Empty when `H` is singular.
 fn eta_dx_lanes<const N: usize>(
     h: &DMatrix<f64>,
     g: &[R; N],
     n_act: usize,
     n_rows: usize,
+    n_in: usize,
 ) -> Vec<(usize, usize, Vec<f64>)> {
     let haa = h.view((0, 0), (n_act, n_act)).into_owned();
     let rhs = DMatrix::<f64>::identity(n_act, n_rows);
@@ -4311,14 +4442,14 @@ fn eta_dx_lanes<const N: usize>(
     let mut r0 = 0;
     while r0 < n_rows {
         let left = n_rows - r0;
-        fn sweep<const L: usize>(y: &[R]) -> (usize, Vec<f64>) {
+        fn sweep<const L: usize>(y: &[R], n_in: usize) -> (usize, Vec<f64>) {
             let outs: [R; L] = std::array::from_fn(|i| y.get(i).copied().unwrap_or(R::c(0.0)));
-            (L, rsweep::<L>(&outs).to_vec())
+            (L, rsweep::<L>(&outs)[..n_in * L].to_vec())
         }
         let (lanes, adj) = match left {
-            1 => sweep::<1>(&y[r0..]),
-            2 => sweep::<2>(&y[r0..]),
-            _ => sweep::<DX_LANES>(&y[r0..]),
+            1 => sweep::<1>(&y[r0..], n_in),
+            2 => sweep::<2>(&y[r0..], n_in),
+            _ => sweep::<DX_LANES>(&y[r0..], n_in),
         };
         let n = left.min(lanes);
         out.push((lanes, n, adj));
