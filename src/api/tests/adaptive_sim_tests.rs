@@ -2693,6 +2693,83 @@ fn adaptive_base_regimen_with_reset_under_tv_covariate_matches_static_predict() 
 }
 
 #[test]
+fn adaptive_base_regimen_with_reset_under_tv_init_reseeds_from_the_reset_row() {
+    // #932 follow-up, PR #2556 review row 1. Under `ODE_TV_COV` nothing reads the reset, so the
+    // reset row's own snapshot never reaches a prediction. Here `init(central) = 10·CRCL`
+    // re-seeds the state at the reset from that snapshot (#1133), on top of the base regimen
+    // (the EVID=4 cell's post-reset state is `seed + dose`). The reset row's CRCL, 65, differs
+    // from the LOCF value at 18 (80), from the next record's (60) and from t=0's (100), so a seed
+    // read from any of those records instead moves the post-reset trajectory.
+    let model = parse_model_string(ODE_TV_INIT).expect("parse TV-init ODE model");
+    for (label, base) in base_reset_cells() {
+        let run = |reset_crcl: f64| {
+            let mut s = subj("1", BASE_RESET_OBS.to_vec(), base.clone());
+            s.covariates = crcl_1148(100.0);
+            s.obs_covariates = BASE_RESET_OBS.iter().map(|&t| base_reset_crcl(t)).collect();
+            s.dose_covariates = base.iter().map(|d| base_reset_crcl(d.time)).collect();
+            s.reset_times = vec![BASE_RESET_AT];
+            s.reset_covariates = vec![crcl_1148(reset_crcl)];
+            let mut pop = population(vec![s]);
+            pop.covariate_names = vec!["CRCL".to_string()];
+            let opts = AdaptiveSimulateOptions {
+                seed: Some(932),
+                decision_times: BASE_RESET_DECISIONS.to_vec(),
+                ..Default::default() // verify = true
+            };
+            let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+                .unwrap_or_else(|e| panic!("{label}: base × reset × init under TV must run: {e}"));
+            (pop, res)
+        };
+        let (pop, res) = run(65.0);
+        assert_eq!(res.ledger.len(), 4, "{label}: a bolus at every decision");
+
+        let mut realized = pop.subjects[0].clone();
+        realized.doses = base_reset_realized(&base, &res.ledger);
+        realized.dose_covariates = realized
+            .doses
+            .iter()
+            .map(|d| base_reset_crcl(d.time))
+            .collect();
+        realized.dose_occasions = vec![1; realized.doses.len()];
+        let mut static_pop = pop.clone();
+        static_pop.subjects = vec![realized];
+        let preds = predict(&model, &static_pop, &model.default_params).unwrap();
+
+        assert_eq!(res.trajectories.len(), preds.len(), "{label}");
+        for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+            assert!(
+                traj.ipred.is_finite() && pred.pred.is_finite(),
+                "{label}: t={}",
+                traj.time
+            );
+            // Measured: 0 on all 32 rows (macOS arm64). A seed read from the LOCF record (80)
+            // instead moves t=20 by 150·e^{-0.2} ≈ 123.
+            assert!(
+                (traj.ipred - pred.pred).abs() <= 1e-9 * (1.0 + pred.pred.abs()),
+                "{label}: adaptive IPRED {} != predict() {} at t={}",
+                traj.ipred,
+                pred.pred,
+                traj.time
+            );
+        }
+
+        // The reset row's snapshot is live: the same run with the reset row carrying the LOCF
+        // CRCL (80) reads a different post-reset state, by the seed difference 10·(80−65) = 150
+        // decayed over the two hours to t=20 (k = 0.1).
+        let (_, locf) = run(80.0);
+        let at20 = |r: &AdaptiveSimulationResult| ipred_at_1148(r, 20.0);
+        let want = 150.0 * (-0.2f64).exp();
+        assert!(
+            ((at20(&locf) - at20(&res)) - want).abs() < 1e-6,
+            "{label}: the reset must seed from its own row: CRCL 65 → {}, 80 → {}, want a gap of \
+             {want}",
+            at20(&res),
+            at20(&locf)
+        );
+    }
+}
+
+#[test]
 fn adaptive_base_regimen_with_reset_under_iov_matches_predict_iov() {
     // #932 follow-up, the IOV half. Same cells, on a per-occasion κ on CL with occasion =
     // decision window (#701). The κ and η are reconstructed from the seed exactly as in
