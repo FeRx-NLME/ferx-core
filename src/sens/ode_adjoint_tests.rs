@@ -6743,29 +6743,32 @@ fn the_fused_mode_response_is_the_standalone_one() {
     #[allow(unused_mut)]
     let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("five".into(), five, s5)];
     #[cfg(feature = "survival")]
-    let mut endpoint_cases = vec![
-        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
-        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
-        ("examples/binary_logistic.ferx", "data/binary_logistic.csv"),
-        (
-            "examples/tte_competing_risks.ferx",
-            "data/tte_competing_risks.csv",
-        ),
-    ];
-    if cfg!(feature = "markov") {
-        endpoint_cases.push(("examples/ctmm_pd_2state.ferx", "data/ctmm_pd_2state.csv"));
-    }
-    for (m, d) in endpoint_cases {
-        let prep =
-            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
-        let s = prep
-            .population
-            .subjects
-            .iter()
-            .find(|s| !s.obs_records.is_empty())
-            .unwrap()
-            .clone();
-        cases.push((m.into(), prep.parsed.model, s));
+    {
+        let mut endpoint_cases = vec![
+            ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+            ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+            ("examples/binary_logistic.ferx", "data/binary_logistic.csv"),
+            (
+                "examples/tte_competing_risks.ferx",
+                "data/tte_competing_risks.csv",
+            ),
+        ];
+        if cfg!(feature = "markov") {
+            endpoint_cases.push(("examples/ctmm_pd_2state.ferx", "data/ctmm_pd_2state.csv"));
+        }
+        for (m, d) in endpoint_cases {
+            let prep =
+                crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}")))
+                    .unwrap();
+            let s = prep
+                .population
+                .subjects
+                .iter()
+                .find(|s| !s.obs_records.is_empty())
+                .unwrap()
+                .clone();
+            cases.push((m.into(), prep.parsed.model, s));
+        }
     }
     // A `[covariate_nn]` model: the network weights reach the response through the
     // per-lane `add_nn_weight_adjoint`, as they reach the gradient through Ψ's.

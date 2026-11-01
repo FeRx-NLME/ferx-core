@@ -933,11 +933,12 @@ A subject's predicted step is capped at two prior standard deviations in Ω's ow
 the adjoint declines, or one with no data, is predicted not to move.
 
 The predictor serves models without IOV, `[mixture]` or `[covariate_nn]` whose outer gradient
-is the analytic one. A covariate network is left out for the reason its inner solves are not
-seeded either: on saturating units the path decides which optimum a fit reaches, and the
-predictor changes the path. On `examples/warfarin_dcm.ferx` it reached the same optima from
-perturbed starts in fewer iterations, but from the shipped start it settled at OFV −164.5
-against −1173.6. Under IOV a subject's κ̂ is not predicted; its warm inner solve is instead seeded with
+is the analytic one. A covariate network is left out because there it costs time and saves
+none: on the DCM with normalised inputs, from ten perturbed starts each way, it reached
+optima of the same quality (median OFV −1495 against −1483), but the fits ran to the
+iteration cap with or without it and its response through the network's weights made each
+outer iteration about 60% more expensive. On saturating units the path also decides which
+optimum a fit reaches, which is why a network's inner solves are not seeded either. Under IOV a subject's κ̂ is not predicted; its warm inner solve is instead seeded with
 the stacked Gauss–Newton metric, as a BSV solve is; a cold start stays unseeded, because
 the metric's full first step [selects the basin](../model-file/fit-options.qmd#escaping-a-multimodal-individual-objective).
 Under Laplace and AGQ

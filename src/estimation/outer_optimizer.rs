@@ -5213,11 +5213,14 @@ fn optimize_nlopt_attempt(
     // response: FOCE/FOCEI on a BSV-only, non-mixture model the outer gradient serves. An IOV
     // subject's κ̂ is not predicted, and its seeded warm solve already starts near the mode.
     //
-    // Not on a `[covariate_nn]` model, for the reason the inner seed is not used there
-    // (#1474): on a network of saturating units the path decides the optimum, and the
-    // predictor changes the path. Measured on `examples/warfarin_dcm.ferx` (Linux x86_64):
-    // from ±20% perturbed starts it reached the same optima as without it in fewer
-    // iterations, but from the shipped start it settled at OFV −164.5 against −1173.6.
+    // Not on a `[covariate_nn]` model: there it costs time and saves none. Measured on the
+    // DCM with normalised inputs (`center`/`scale`), ten ±20% perturbed starts each way
+    // (Linux x86_64): the optima it reaches match those without it (median OFV −1495 vs
+    // −1483, best −1603 vs −1588), but the fits run to the iteration cap either way and the
+    // response through the network's ~150 weights makes each outer iteration ~60% dearer
+    // (9.8 ms vs 6.0 ms), 2.3× the wall time overall. On the unnormalised shipped example
+    // it also changed which optimum the shipped start reached (OFV −164.5 vs −1173.6): on
+    // saturating units the path decides the optimum, as for the inner seed (#1474).
     let warm_predictor = model.n_eta > 0
         && model.n_kappa == 0
         && init_params.mixture.is_none()
