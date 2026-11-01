@@ -461,8 +461,8 @@ fn adaptive_refusals_carry_their_codes() {
         seed: Some(1),
         ..Default::default()
     };
-    // An IOV twin of `ode`. Since #943 `auc_target` is accepted under IOV; what still
-    // refuses there is a base regimen × EVID=3 reset (a #932 follow-up), with or without it.
+    // An IOV twin of `ode`. Since #943 `auc_target` is accepted under IOV, and since the
+    // #932 follow-up so is a base regimen × EVID=3 reset: the two together must run.
     let ode_iov = parse_model_string(
         &ODE_ADAPTIVE
             .replace(
@@ -475,6 +475,17 @@ fn adaptive_refusals_carry_their_codes() {
     let mut base_reset_iov = observed("1", &[1.0, 40.0]);
     base_reset_iov.reset_times = vec![30.0];
     let base_reset_iov = population_of(vec![base_reset_iov], &[]);
+    let ok = from_spec(
+        &ode_iov,
+        &base_reset_iov,
+        &|s| s.auc_target = Some((300.0, 500.0)),
+        seeded(),
+    );
+    assert!(
+        ok.is_ok(),
+        "from_spec, auc_target on an IOV model with a base regimen × reset must run: {:?}",
+        ok.err()
+    );
     check_rows(vec![
         row(
             "simulate_adaptive, no [odes]",
@@ -598,21 +609,6 @@ fn adaptive_refusals_carry_their_codes() {
             "simulate_adaptive_from_spec: [adaptive_dosing] `observe` references \
              covariate(s) not found in data (case-sensitive): WT. Available covariate \
              columns: (none).",
-        ),
-        row(
-            "from_spec, auc_target on an IOV model with a base regimen × reset",
-            from_spec(
-                &ode_iov,
-                &base_reset_iov,
-                &|s| s.auc_target = Some((300.0, 500.0)),
-                seeded(),
-            ),
-            "E_ADAPTIVE_UNSUPPORTED",
-            None,
-            "subject '1': a pre-scheduled base regimen combined with system resets (EVID=3/4) \
-             is not yet supported under time-varying covariates or inter-occasion \
-             variability; #932 supports base × reset on the constant-covariate path only \
-             (time-varying-covariate / IOV base × reset is a follow-up)",
         ),
     ]);
 }
