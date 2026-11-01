@@ -1732,6 +1732,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 unseeded_iov_warm: false,
             },
             true,
+            None,
         )
         .expect("premise: the seed is in scope on this fixture");
         assert_ne!(
@@ -1844,6 +1845,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
             schedule.as_ref(),
             policy(InnerHessianSeed::GaussNewton),
             true,
+            None,
         )
         .expect("premise: the seed is in scope");
         assert!(
@@ -6704,5 +6706,67 @@ fn the_terminal_jacobian_from_the_last_gradient_is_the_fresh_one() {
             r.h_matrix,
             fresh
         );
+    }
+}
+
+/// A predicted start the solve fails from is solved again from the previous mode (#2549
+/// review r2 #3). One warfarin subject's start is thrown far out of its basin, as an
+/// extrapolated line-search trial can; every other subject starts at its own mode.
+/// - The straddle: without the fallback, that subject's solve fails from the bad start.
+/// - With it, the subject keeps the objective of the solve from its mode, bit for bit.
+/// - Every other subject, which solves from its start, is bit-identical to the plain pass.
+#[test]
+fn a_failed_predicted_start_is_solved_again_from_the_mode() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin parses");
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("data loads");
+    let params = &model.default_params;
+    let (modes, _, _, _) = run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, None, 0, 0);
+    let mut predicted = modes.clone();
+    predicted[2].fill(40.0);
+    let policy = InnerSolvePolicy::default();
+    let outcome = |_: &Subject, e: &EbeResult| (e.nll, solve_failed(e), e.eta.as_slice().to_vec());
+    let plain = |start: &[DVector<f64>]| {
+        run_inner_loop_warm_map(
+            &model,
+            &pop,
+            params,
+            500,
+            1e-8,
+            Some(start),
+            None,
+            0,
+            0,
+            policy,
+            None,
+            outcome,
+        )
+        .4
+    };
+    let from_bad = plain(&predicted);
+    let from_modes = plain(&modes);
+    let (_, _, _, _, with_fallback) = run_inner_loop_predicted_map_cached(
+        &model, &pop, params, 500, 1e-8, &predicted, &modes, None, 0, 0, None, policy, None,
+        outcome,
+    );
+
+    assert!(
+        from_bad[2].1,
+        "the fixture's bad start fails: {:?}",
+        from_bad[2]
+    );
+    assert!(!from_modes[2].1, "the solve from the mode succeeds");
+    assert_eq!(
+        with_fallback[2].0.to_bits(),
+        from_modes[2].0.to_bits(),
+        "the failed subject keeps the solve from its mode"
+    );
+    assert!(with_fallback[2].0.is_finite());
+    for i in (0..pop.subjects.len()).filter(|&i| i != 2) {
+        assert_eq!(with_fallback[i].2, from_bad[i].2, "subject {i} moved");
+        assert_eq!(with_fallback[i].0.to_bits(), from_bad[i].0.to_bits());
     }
 }

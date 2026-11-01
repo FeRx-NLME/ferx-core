@@ -934,13 +934,17 @@ outer iterations on some model: a cap of two prior standard deviations, damping 
 decrement (which measures how far the mode moves, not how wrong its prediction is), and
 choosing per evaluation between the predicted start and the previous mode, which breaks the
 start's smooth dependence on the parameters, the smoothness the predictor exists to give the
-outer optimizer. On the FOCE/FOCEI benchmark fits the outer iterations fell by up to 63%
+outer optimizer. A long line-search trial can still extrapolate a subject's start out of its basin.
+A subject whose inner solve then fails from the prediction (it does not converge, falls back
+to Nelder–Mead, or ends on a non-finite objective) is solved again from its previous mode and
+keeps the lower objective. That rescue is triggered by a failed solve, not by the size of the
+step, so it leaves every working prediction alone. On the FOCE/FOCEI benchmark fits the outer iterations fell by up to 63%
 at the same optimum (`mm` 166 → 62, `pktte_joint` 110 → 48, `pk2_ode` 77 → 40, `pk1`
 51 → 31, `pk2_big` 98 → 71); one, `one_cpt_infusion`, took 43 instead of 37 at the same
 instruction count. A subject the adjoint declines, or one with no data, is predicted not to move.
 
 The predictor serves models without IOV, `[mixture]` or `[covariate_nn]` whose outer gradient
-is the analytic one. A covariate network is left out because there it costs time and saves
+is the analytic one, under the NLopt optimizers and the built-in `bfgs`/`lbfgs` alike. A covariate network is left out because there it costs time and saves
 none: on the DCM with normalised inputs, from ten perturbed starts each way, it reached
 optima of the same quality (median OFV −1452 against −1483 without it, better on five of
 the ten starts), but the fits ran to the iteration cap with or without it, so the response

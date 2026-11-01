@@ -9899,6 +9899,7 @@ fn assert_first_eval_starts_at_preflight_mode(
                     &params,
                     &opts,
                     Some(&etas),
+                    None,
                     Some(&mu_k),
                     None,
                     None,
@@ -11261,8 +11262,9 @@ fn assert_next_pass_starts_at_previous_mode(
 /// [`assert_next_pass_starts_at_previous_mode`], where with `predicted` (the NLopt objective on
 /// a BSV-only model, #2549) a κ-free subject is handed the mode *predicted* for the new point,
 /// `η̂ + (dη̂/dx)(x − x₀)`, not `η̂` itself: still `n_eta` values and no κ, the search started
-/// exactly there, within the predictor's two-SD step cap of `η̂`, and moved for some subject
-/// (else the prediction is not live and the check is the plain one in disguise).
+/// exactly there — bit for bit the first-order expansion of the recorded response about the
+/// previous pass's `η̂` — and moved for some subject (else the prediction is not live and the
+/// check is the plain one in disguise).
 fn assert_next_pass_starts_at_previous_mode_or_prediction(
     label: &str,
     (model, pop, opts): (CompiledModel, Population, FitOptions),
@@ -11360,19 +11362,36 @@ fn assert_next_pass_starts_at_previous_mode_or_prediction(
                 "{label}: subject {}",
                 subject.id
             );
-            let step: f64 = got_init
+            let pred = rec
+                .predictions
                 .iter()
-                .zip(&p.eta)
-                .map(|(g, e)| (g - e) * (g - e))
-                .sum::<f64>()
-                .sqrt();
-            assert!(
-                got_init.iter().all(|v| v.is_finite()) && step <= 2.0 + 1e-12,
-                "{label}: subject {}: predicted start {got_init:?} is {step:.3e} from η̂ {:?}",
-                subject.id,
-                p.eta
+                .find(|r| r.pass == b)
+                .unwrap_or_else(|| panic!("{label}: pass {b} was handed no prediction"));
+            assert_eq!(
+                bits(pred.modes[i].as_slice()),
+                bits(&p.eta),
+                "{label}: subject {}: the prediction is not about pass {a}'s η̂",
+                subject.id
             );
-            moved |= step > 0.0;
+            let want = crate::estimation::sens_outer_gradient::predict_warm_etas(
+                &pred.modes,
+                &pred.jac,
+                &pred.anchor,
+                &pred.x,
+            );
+            assert!(
+                got_init.iter().all(|v| v.is_finite()),
+                "{label}: subject {}: predicted start {got_init:?}",
+                subject.id
+            );
+            assert_eq!(
+                bits(got_init),
+                bits(want[i].as_slice()),
+                "{label}: subject {}: pass {b} started at {got_init:?}, not η̂ + J·Δx {:?}",
+                subject.id,
+                want[i]
+            );
+            moved |= bits(got_init) != bits(&p.eta);
             continue;
         }
         assert_eq!(
@@ -13501,17 +13520,21 @@ fn a_leg_that_is_not_kept_hands_back_the_kept_ebe_state() {
     UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(true));
     UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().clear());
     HELD_SOLVE_AT_RESTORED.with(|c| c.set(None));
-    // Through the restart chain: on this fixture the first attempt ends on the basin probe,
-    // which takes no leg, and the restarted attempt — the one reported — takes the legs.
-    let result = optimize_nlopt(
-        &model,
-        &pop,
-        &model.default_params,
-        &opts,
-        &OuterFdDeclineLog::new(pop.subjects.len()),
-        None,
-        &[],
-    );
+    // Under FOCEI this fixture no longer traps since #2549's predicted warm start (see
+    // `tests/ebe_basin_shift.rs`), so the first attempt is the one reported and takes the
+    // legs; the hand-back does not depend on which attempt that is.
+    // Recorded on this thread: the leg switches above are thread-locals of the caller.
+    let (result, rec) = crate::estimation::inner_optimizer::record_inner_solves(|| {
+        optimize_nlopt(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            &[],
+        )
+    });
     UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(false));
     let legs = UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().split_off(0));
     let held_at_restored = HELD_SOLVE_AT_RESTORED.with(|c| c.get());
@@ -13538,6 +13561,21 @@ fn a_leg_that_is_not_kept_hands_back_the_kept_ebe_state() {
         Some(true),
         "the final restore holds the kept leg's EBE state, at the restored point"
     );
+    // #2549 review r2 #1: a leg starts cold, and its cold start drops the mode response with
+    // the modes, so no warm start is ever predicted from the zero-filled leg seed (which,
+    // being non-zero after `0 + J·Δx`, was taken for a warm start and skipped the cold
+    // solve's screens). The straddle: predictions do run in this fit.
+    assert!(
+        !rec.predictions.is_empty(),
+        "the predictor is live in this fit"
+    );
+    for p in &rec.predictions {
+        assert!(
+            p.modes.iter().any(|m| m.iter().any(|&v| v != 0.0)),
+            "pass {}: a warm start was predicted from the zero-filled leg seed",
+            p.pass
+        );
+    }
 }
 
 /// #2507 / #1564: `optimize_nlopt` runs its attempts with the covariance step deferred and

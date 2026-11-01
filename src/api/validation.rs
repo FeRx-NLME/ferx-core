@@ -9977,12 +9977,23 @@ pub(crate) fn check_nn_input_scale(
         let (center, scale) = (nn.mapper.input_center(), nn.mapper.input_scale());
         let mut flagged: Vec<String> = Vec::new();
         for (i, name) in nn.mapper.input_names().iter().enumerate() {
+            // Every value the network can be handed: the subject-static covariates and each
+            // record's own snapshot (a time-varying input is read per record). A missing value
+            // (non-finite in the data) is not an input; `scale` is finite and non-zero by
+            // construction (the block is refused at parse otherwise, `NnError`), so a finite
+            // value has a finite `z`.
             let worst = population
                 .subjects
                 .iter()
-                .filter_map(|s| s.covariates.get(name))
-                .map(|&x| ((x - center[i]) / scale[i]).abs())
-                .filter(|v| v.is_finite())
+                .flat_map(|s| {
+                    std::iter::once(&s.covariates)
+                        .chain((0..s.obs_times.len()).map(|j| s.obs_cov(j)))
+                        .chain((0..s.doses.len()).map(|k| s.dose_cov(k)))
+                        .chain((0..s.pk_only_times.len()).map(|m| s.pk_only_cov(m)))
+                })
+                .filter_map(|c| c.get(name).copied())
+                .filter(|x| x.is_finite())
+                .map(|x| ((x - center[i]) / scale[i]).abs())
                 .fold(0.0f64, f64::max);
             if worst > bound {
                 flagged.push(format!("{name} (|z| up to {worst:.3})"));
@@ -10573,6 +10584,10 @@ pub fn validate_model_file_with(
                         &population,
                         &init_params,
                     ));
+                    // A `[covariate_nn]` input the data saturate (#2549): `fit()` reports it
+                    // from the same check, so a clean `ferx check --data` and a fit agree.
+                    #[cfg(feature = "nn")]
+                    diags.extend(check_nn_input_scale(&parsed.model, &population));
                     // One informational row per nested level (#2035); `fit()` does not
                     // record it.
                     diags.extend(check_level_summary(&parsed.model, &population));

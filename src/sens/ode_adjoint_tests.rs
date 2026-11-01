@@ -7127,16 +7127,82 @@ fn the_fused_mode_response_matches_fd_of_the_inner_objective_on_a_covariate_nn_m
         });
         let want = -(&hinv * g);
         for j in 0..n {
-            let e = (dx[k][j] - want[j]).abs() / (1.0 + want[j].abs());
-            if e > 1e-3 {
-                eprintln!("BAD k={k} j={j} dx={:.6e} fd={:.6e}", dx[k][j], want[j]);
-            }
-            worst = worst.max(e);
+            // Finite before the fold: `f64::max` drops a `NaN`, so a response returning one
+            // would otherwise pass on the strength of the finite entries.
+            assert!(
+                dx[k][j].is_finite() && want[j].is_finite(),
+                "x[{k}] η[{j}]: response {} vs FD {}",
+                dx[k][j],
+                want[j]
+            );
+            worst = worst.max((dx[k][j] - want[j]).abs() / (1.0 + want[j].abs()));
         }
     }
     eprintln!("NN response vs FD of the inner objective: {worst:.2e}");
+    // Measured 5.12e-6 (Linux x86_64): the FD side is a nested central difference
+    // (`hx = 1e-5`, `de` above) of an objective with ~1e-13 rounding, so its own error is of
+    // that order; 1e-4 leaves 20× headroom for another platform's rounding.
     assert!(
         worst < 1e-4,
         "NN mode response vs FD of the inner objective {worst:.2e}"
     );
+}
+
+/// A failed mode response leaves the gradient alone (#2549 review r2 #2). The response
+/// rows share the gradient's sweeps, and a failing lane fails the fused pass; the pass is
+/// then re-run as the gradient alone. Forced here by `FAIL_RESPONSE_LANES`: the fused call
+/// returns the plain gradient bit for bit and no response, where without the re-run it
+/// returned no gradient at all.
+#[test]
+fn a_failed_mode_response_keeps_the_gradient() {
+    let model = parse_model_string(&one_cpt_oral_n_eta(3)).unwrap();
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-12, true);
+    let (plain, fused, fused_resp) = std::thread::scope(|sc| {
+        std::thread::Builder::new()
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .spawn_scoped(sc, || {
+                let plain = subject_adjoint_gradient(
+                    &model,
+                    &s,
+                    &params,
+                    &x,
+                    eta.as_slice(),
+                    Objective::Focei,
+                );
+                let pt = PackedPoint::new(&params, &x).unwrap();
+                // The straddle: without the hook the fused pass carries a response.
+                let (_, live) =
+                    subject_adjoint_gradient_with_eta_dx_at(&model, &s, &pt, eta.as_slice(), true);
+                assert!(live.is_some(), "the fixture's fused pass forms a response");
+                super::FAIL_RESPONSE_LANES.with(|f| f.set(true));
+                let (g, r) =
+                    subject_adjoint_gradient_with_eta_dx_at(&model, &s, &pt, eta.as_slice(), true);
+                super::FAIL_RESPONSE_LANES.with(|f| f.set(false));
+                (plain, g, r)
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    });
+    let (plain, fused) = (
+        plain.unwrap(),
+        fused.expect("the gradient survives the failed response"),
+    );
+    assert!(
+        fused_resp.is_none(),
+        "a failed response is reported as none"
+    );
+    assert_eq!(plain.len(), fused.len());
+    for (a, b) in plain.iter().zip(&fused) {
+        assert!(a.is_finite(), "the gradient is finite");
+        assert_eq!(a.to_bits(), b.to_bits(), "the gradient moved");
+    }
 }

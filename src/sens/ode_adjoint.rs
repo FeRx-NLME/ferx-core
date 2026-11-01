@@ -880,19 +880,39 @@ fn adjoint_gradient(
                 sc.width,
                 held,
             ),
-            _ => run::<N, M>(
-                sc.model,
-                sc.pop_model,
-                subject,
-                sc.layout.as_ref(),
-                template,
-                sc.params,
-                x,
-                &sc.eta,
-                objective != Objective::Foce,
-                sc.width,
-                eta_dx,
-            ),
+            _ => {
+                let go_run = |eta_dx: Option<&mut Option<Vec<DVector<f64>>>>| {
+                    run::<N, M>(
+                        sc.model,
+                        sc.pop_model,
+                        subject,
+                        sc.layout.as_ref(),
+                        template,
+                        sc.params,
+                        x,
+                        &sc.eta,
+                        objective != Objective::Foce,
+                        sc.width,
+                        eta_dx,
+                    )
+                };
+                match eta_dx {
+                    None => go_run(None),
+                    // The mode response shares the gradient's sweeps, and a lane that fails
+                    // there (a non-finite row adjoint, say from a near-singular `H`) fails
+                    // the whole pass. The gradient must not depend on whether the response
+                    // was asked for, so a failed fused pass is re-run as the gradient alone,
+                    // whose lane 0 is the same arithmetic, and reports no response
+                    // (#2549 review r2 #2).
+                    Some(o) => match go_run(Some(&mut *o)) {
+                        Some(g) => Some(g),
+                        None => {
+                            *o = None;
+                            go_run(None)
+                        }
+                    },
+                }
+            }
         }
     }
     by_bucket!(
@@ -4248,6 +4268,10 @@ fn run<const N: usize, const M: usize>(
         ));
     }
     let chunks = sweep_lanes(&outs, n_in);
+    #[cfg(test)]
+    if outs.len() > 1 && FAIL_RESPONSE_LANES.with(|f| f.get()) {
+        return None;
+    }
     // Output `o`'s adjoint at a recorded input: every chunk but the last is full.
     let out_adj = |o: usize, x: R| -> f64 {
         let (lanes, _, adj) = &chunks[o / DX_LANES];
@@ -4353,6 +4377,14 @@ fn run<const N: usize, const M: usize>(
 
 /// Widest lane chunk of the fused gradient-and-response sweeps ([`run`]).
 const DX_LANES: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: fail [`run`] whenever it carries mode-response lanes, as a non-finite row
+    /// adjoint would, to pin that the gradient survives a failed response.
+    pub(crate) static FAIL_RESPONSE_LANES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 /// The mode response's rows on the scalar tape (step 3 of [`run`]): `y_r = Σ_k Z_rk g_k`
 /// for `r < n_rows`, `Z = (H⁻¹)_{r,:}` over the `n_act` live effects. Empty when `H` is

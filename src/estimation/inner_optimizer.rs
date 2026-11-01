@@ -1963,8 +1963,42 @@ pub(crate) struct InnerRecording {
     /// Every inner solve, IOV or not: its subject and the tolerance it ran at.
     pub(crate) solve_tols: Vec<(String, f64)>,
     pub(crate) passes: Vec<PassRecord>,
+    /// Every warm-start prediction the outer loop handed a pass (#2549).
+    pub(crate) predictions: Vec<PredictionRecord>,
     n_passes: usize,
     current_pass: Option<usize>,
+}
+
+/// One first-order warm-start prediction `η̂ + (dη̂/dx)(x − x₀)` and the pass it seeded.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PredictionRecord {
+    /// The index of the pass the prediction was handed to.
+    pub(crate) pass: usize,
+    pub(crate) modes: Vec<DVector<f64>>,
+    pub(crate) jac: Vec<Vec<DVector<f64>>>,
+    pub(crate) anchor: Vec<f64>,
+    pub(crate) x: Vec<f64>,
+}
+
+/// Record a prediction for the next pass of the recording on this thread, if any.
+#[cfg(test)]
+pub(crate) fn record_prediction(
+    modes: &[DVector<f64>],
+    jac: &[Vec<DVector<f64>>],
+    anchor: &[f64],
+    x: &[f64],
+) {
+    with_recording(|r| {
+        let pass = r.n_passes;
+        r.predictions.push(PredictionRecord {
+            pass,
+            modes: modes.to_vec(),
+            jac: jac.to_vec(),
+            anchor: anchor.to_vec(),
+            x: x.to_vec(),
+        })
+    });
 }
 
 // The recording [`record_inner_solves`] runs on this thread; `None` (nothing recorded)
@@ -2136,10 +2170,15 @@ fn find_ebe_impl(
         return ebe;
     }
 
-    let solve = |cold_seed: bool| {
+    // The two cold solves screen the same Sobol starts on the same objective, and a screen
+    // descent reads neither solve's incumbent: the first one's descents are handed to the
+    // second through this cell, local to the call, so nothing outlives it (an unwind
+    // included) or reaches another subject.
+    let screen_share: RefCell<Option<Vec<ScreenDescent>>> = RefCell::new(None);
+    let solve = |cold_seed: bool, share: Option<&RefCell<Option<Vec<ScreenDescent>>>>| {
         find_ebe_solve(
             model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
-            cold_seed,
+            cold_seed, share,
         )
     };
     // The Hessian seed is a *local* model of the individual objective. Near the mode it
@@ -2163,17 +2202,12 @@ fn find_ebe_impl(
     // `freeze_flat_thetas` both pass zeros as `prev_etas`), so it counts as cold.
     let genuinely_warm = is_warm_start(eta_init, policy.init_is_mode);
     let both = !(genuinely_warm || policy.seed == InnerHessianSeed::None);
-    // The two cold solves screen the same Sobol starts on the same objective, and a screen
-    // descent reads neither solve's incumbent: the second takes the first one's descents.
-    if both {
-        SCREEN_SHARE.with(|c| *c.borrow_mut() = Some(None));
-    }
-    let normal = solve(false).expect("an unforced solve always returns a result");
+    let share = both.then_some(&screen_share);
+    let normal = solve(false, share).expect("an unforced solve always returns a result");
     if !both {
         return normal;
     }
-    let seeded = solve(true);
-    SCREEN_SHARE.with(|c| *c.borrow_mut() = None);
+    let seeded = solve(true, share);
     match seeded {
         Some(seeded) if seeded.nll + COLD_SEED_TIE_TOL < normal.nll => seeded,
         _ => normal,
@@ -2183,12 +2217,6 @@ fn find_ebe_impl(
 /// One screen descent's outcome: its end point, convergence flag and objective there
 /// (`None` for a non-finite end point).
 type ScreenDescent = Option<(Vec<f64>, bool, f64)>;
-
-thread_local! {
-    /// The screen descents of the first of `find_ebe_impl`'s two cold solves, for the second:
-    /// `Some(None)` while armed and not yet filled.
-    static SCREEN_SHARE: RefCell<Option<Option<Vec<ScreenDescent>>>> = const { RefCell::new(None) };
-}
 
 /// Whether `eta_init` is a genuine warm start: a mode carried in from an earlier solve.
 /// `None` and an all-zero vector are both cold. The outer loop's first evaluation, the
@@ -2227,6 +2255,9 @@ fn find_ebe_solve(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
     cold_seed: bool,
+    // `find_ebe_impl`'s two cold solves share one screen: the first fills the cell with its
+    // descents, the second takes them. `None`: screen for this solve alone.
+    screen_share: Option<&RefCell<Option<Vec<ScreenDescent>>>>,
 ) -> Option<EbeResult> {
     let n_eta = model.n_eta;
 
@@ -2770,7 +2801,7 @@ fn find_ebe_solve(
         // `inner_screen = 0`, at the price of `N` objective evaluations and `K` descents
         // per cold solve.
         if policy.screen > 0 {
-            let shared = SCREEN_SHARE.with(|c| c.borrow().clone().flatten());
+            let shared = screen_share.and_then(|c| c.borrow_mut().take());
             let descents: Vec<ScreenDescent> = match shared {
                 Some(d) => d,
                 None => {
@@ -2787,11 +2818,9 @@ fn find_ebe_solve(
                         stop_precond,
                         &stall_at,
                     );
-                    SCREEN_SHARE.with(|c| {
-                        if let Some(slot) = c.borrow_mut().as_mut() {
-                            *slot = Some(d.clone());
-                        }
-                    });
+                    if let Some(c) = screen_share {
+                        *c.borrow_mut() = Some(d.clone());
+                    }
                     d
                 }
             };
@@ -3118,7 +3147,6 @@ thread_local! {
 /// When `mu_k` is provided the BSV block is optimised in psi-space
 /// (`psi = eta_true + mu_k`) so mu-referencing benefits also apply to the BSV
 /// etas when IOV is active.  The returned `EbeResult.eta` is always `eta_true`.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn find_ebe_iov(
@@ -5983,14 +6011,9 @@ const SCREEN_SD_MULT: f64 = 2.0;
 /// as a different mode.
 const SCREEN_MIN_OMEGA_DIST: f64 = 0.5;
 
-/// Starts the #2013 screen keeps: the [`SCREEN_TOP_K`] lowest of `n` Sobol points from
-/// `N(0, (SCREEN_SD_MULT)²·Ω)`, by `obj`, lowest first. A point whose objective is not
-/// finite is dropped. The stream is keyed by [`screen_seed`] of the subject's ID, so it
-/// depends neither on the worker thread nor on the subject's position in the data. Empty
-/// when there is nothing to draw, or more random effects than the Sobol table carries.
 /// The #2013 screen's descents: one inner minimisation from each of [`screen_starts`]'
 /// points, in order. Reads neither the solve's incumbent nor its metric, so the two cold
-/// solves of `find_ebe_impl` share them (`SCREEN_SHARE`).
+/// solves of `find_ebe_impl` share them (`find_ebe_solve`'s `screen_share`).
 #[allow(clippy::too_many_arguments)]
 fn screen_descents(
     obj: &dyn Fn(&[f64]) -> f64,
@@ -6029,6 +6052,11 @@ fn screen_descents(
         .collect()
 }
 
+/// Starts the #2013 screen keeps: the [`SCREEN_TOP_K`] lowest of `n` Sobol points from
+/// `N(0, (SCREEN_SD_MULT)²·Ω)`, by `obj`, lowest first. A point whose objective is not
+/// finite is dropped. The stream is keyed by [`screen_seed`] of the subject's ID, so it
+/// depends neither on the worker thread nor on the subject's position in the data. Empty
+/// when there is nothing to draw, or more random effects than the Sobol table carries.
 fn screen_starts(
     obj: &dyn Fn(&[f64]) -> f64,
     omega: &crate::types::OmegaMatrix,
@@ -6811,6 +6839,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send + Default>(
         max_iter,
         tol,
         prev_etas,
+        None,
         mu_k,
         min_obs,
         restarts,
@@ -6853,6 +6882,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
         max_iter,
         tol,
         prev_etas,
+        None,
         mu_k,
         min_obs,
         restarts,
@@ -6861,6 +6891,64 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
         cancel,
         finish_subject,
     )
+}
+
+/// [`run_inner_loop_warm_map_cached`] from **predicted** starts (#2549): `prev_etas` are the
+/// first-order predictions `η̂ + (dη̂/dx)·Δx` of the outer loop's warm-start predictor and
+/// `fallback_etas` the modes they were predicted from.
+///
+/// The prediction is the mode's exact first-order expansion, so on a smooth stretch of the
+/// trajectory every subject solves from it and this is the plain warm pass, bit for bit. A
+/// long line-search trial can still extrapolate a start out of its basin, where the
+/// objective is non-finite or the solve fails from it ([`solve_failed`]); such a subject is
+/// solved again from its previous mode and keeps the lower objective. The retry is
+/// triggered by a failed solve, not by a bound on the step, so it changes nothing where the
+/// prediction works (#2549 review r2 #3).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: &[DVector<f64>],
+    fallback_etas: &[DVector<f64>],
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    policy: InnerSolvePolicy,
+    cancel: Option<&crate::cancel::CancelFlag>,
+    finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+    Vec<T>,
+) {
+    run_inner_loop_warm_map_impl(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        Some(prev_etas),
+        Some(fallback_etas),
+        mu_k,
+        min_obs,
+        restarts,
+        schedules,
+        policy,
+        cancel,
+        finish_subject,
+    )
+}
+
+/// Whether an inner solve failed from its start: not converged, rescued by the Nelder–Mead
+/// fallback, hard-rejected at the start, or ending on a non-finite objective.
+fn solve_failed(ebe: &EbeResult) -> bool {
+    !ebe.converged || ebe.used_fallback || ebe.hard_reject || !ebe.nll.is_finite()
 }
 
 /// What a subject skipped by a cooperative cancel reports in place of its EBE (#574).
@@ -6908,6 +6996,7 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
     max_iter: usize,
     tol: f64,
     prev_etas: Option<&[DVector<f64>]>,
+    fallback_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
     min_obs: usize,
     restarts: usize,
@@ -6960,9 +7049,33 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
                 Some(cache) => cache[i].as_ref(),
                 None => local_schedule.as_ref(),
             };
-            let ebe = find_ebe_cached(
+            let mut ebe = find_ebe_cached(
                 model, subject, params, max_iter, tol, init, mu_k, restarts, schedule, policy,
             );
+            // A predicted start that the solve fails from is solved again from the
+            // subject's previous mode, and the lower objective is kept (ties to the
+            // prediction) — see [`run_inner_loop_predicted_map_cached`].
+            if let Some(fallback) = fallback_etas.map(|f| f[i].as_slice()) {
+                if init != Some(fallback) && solve_failed(&ebe) {
+                    let alt = find_ebe_cached(
+                        model,
+                        subject,
+                        params,
+                        max_iter,
+                        tol,
+                        Some(fallback),
+                        mu_k,
+                        restarts,
+                        schedule,
+                        policy,
+                    );
+                    // `!(a >= b)`: a non-finite objective from the prediction loses to
+                    // any finite one.
+                    if alt.nll.is_finite() && !(alt.nll >= ebe.nll) {
+                        ebe = alt;
+                    }
+                }
+            }
             let extra = finish_subject(subject, &ebe);
             (ebe, extra)
         })
