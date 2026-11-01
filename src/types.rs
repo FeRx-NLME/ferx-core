@@ -7213,6 +7213,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
         )
+    } else if lower.starts_with("w_tte_solve_failed") {
+        // #2087: a simulated subject's ODE-accumulated event-time solve failed and the
+        // subject was censored. Ahead of every prose arm for the reason the arm above gives:
+        // the message interpolates the ODE solver's own failure text ("step budget",
+        // "non-finite", "stability-limited", "singular Jacobian", …), which prose arms below
+        // would claim as an estimation or solver-health problem.
+        (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("w_degenerate_cl_v") {
         // #2104: a non-positive or non-finite CL / V at the final estimates. A token arm ahead
         // of the generic "degenerate" → optimizer-health prose arm, which its wording would
