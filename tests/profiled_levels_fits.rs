@@ -289,6 +289,52 @@ fn d2_a_profiled_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
     );
 }
 
+/// `model` with `method = laplace` (one node), written to a temp file; its absolute path,
+/// which `prep`'s `root().join` keeps as is.
+fn laplace_copy(model: &str) -> String {
+    let text = std::fs::read_to_string(root().join(model)).unwrap();
+    assert!(text.contains("  method     = focei\n"), "fixture moved");
+    let path = unique_temp("ferx_profiled_fits_laplace");
+    std::fs::write(
+        &path,
+        text.replace("  method     = focei\n", "  method     = laplace\n"),
+    )
+    .unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// D1-L (#2107): D1 under `laplace`. F1 is linear in (η, κ), so the profile solve takes
+/// one step there under Laplace too.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn d1_l_a_profiled_laplace_fit_is_the_unprofiled_fit_linear_in_eta() {
+    degenerate_oracle(
+        &laplace_copy("tests/data/profile_mbma/f1_profile.ferx"),
+        "tests/data/mbma_placebo/mbma_placebo.csv",
+        "](0.0, -50.0, 50.0)",
+        4,
+    );
+}
+
+/// D2-L (#2107): D2 under `laplace`, on F2, where the Laplace objective is not FOCEI's.
+/// Measured on the probe (macOS arm64): the unprofiled restart improved by 4.1e-10.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn d2_l_a_profiled_laplace_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
+    degenerate_oracle(
+        &laplace_copy("nonmem_anchor/profile_mbma_fit.ferx"),
+        "nonmem_anchor/profile_mbma.csv",
+        "](0.0, -50.0, 50.0)",
+        3,
+    );
+}
+
 /// The profiled F2 fit against NONMEM's own optimum, every level a `THETA` there.
 /// On #2280's inner BFGS without #2285's `xtol_rel` ceiling and verification leg, this
 /// start stopped `converged: true` (`XtolReached`) 1.584e-3 above it (Linux aarch64).
@@ -314,10 +360,60 @@ fn a2_a_profiled_fit_reaches_nonmems_optimum() {
     assert!((f.ofv - obj).abs() < A2_FIT_OFV, "{} vs {obj}", f.ofv);
 }
 
+/// A2-L fit (#2107): profiled `laplace` fits of F2 from the model file's start and from
+/// A2's two #2285 starts land on NONMEM's LAPLACE optimum (`profile_mbma_laplace.ext`),
+/// converged. The band is A2's: a stopping rule sets it, and it still fails FOCEI's
+/// optimum, 0.0626 away.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn a2_l_a_profiled_laplace_fit_reaches_nonmems_optimum() {
+    let obj = ext_final_ofv("profile_mbma_laplace.ext");
+    assert!(
+        (obj - a2_nonmem_ofv()).abs() > 1e3 * A2_FIT_OFV,
+        "the straddle"
+    );
+    let p = prep(
+        &laplace_copy("nonmem_anchor/profile_mbma_fit.ferx"),
+        "nonmem_anchor/profile_mbma.csv",
+        None,
+    );
+    assert_eq!(p.init_params.theta[..3], [45.0, 8.0, 2.0], "fixture moved");
+    for start in [[45.0, 8.0, 2.0], [45.0, 6.0, 2.0], [40.0, 6.0, 2.0]] {
+        let mut params = p.init_params.clone();
+        params.theta[..3].copy_from_slice(&start);
+        let (f, t) = fit(&p, &params, false);
+        eprintln!(
+            "A2-L from {start:?}: ferx {:.9} NONMEM {obj:.9} (Δ {:.3e}), converged {}, {} \
+             evals, {t:.1}s",
+            f.ofv,
+            f.ofv - obj,
+            f.converged,
+            f.n_iterations
+        );
+        assert!(
+            f.converged && f.ofv.is_finite(),
+            "{start:?}: {:?}",
+            f.warnings
+        );
+        assert!(
+            (f.ofv - obj).abs() < A2_FIT_OFV,
+            "{start:?}: converged at {} vs NONMEM {obj}",
+            f.ofv
+        );
+    }
+}
+
 /// NONMEM's minimum on the F2 anchor, from the `.ext` final row.
 fn a2_nonmem_ofv() -> f64 {
-    let text =
-        std::fs::read_to_string(root().join("nonmem_anchor/results/profile_mbma.ext")).unwrap();
+    ext_final_ofv("profile_mbma.ext")
+}
+
+/// The OBJ of a NONMEM run's `.ext` final row, `name` under `nonmem_anchor/results`.
+fn ext_final_ofv(name: &str) -> f64 {
+    let text = std::fs::read_to_string(root().join("nonmem_anchor/results").join(name)).unwrap();
     text.lines()
         .find(|l| l.trim_start().starts_with("-1000000000"))
         .and_then(|l| l.split_whitespace().last())

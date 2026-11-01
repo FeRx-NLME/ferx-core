@@ -285,9 +285,9 @@ pub fn finish() -> Option<String> {
     })
 }
 
-/// Write one FOCE/FOCEI trace row.
+/// Write one FOCE/FOCEI/Laplace trace row.
 ///
-/// `method`           — "foce" or "focei" (may be overridden by `set_overrides`)
+/// `method`           — "foce", "focei" or "laplace" (may be overridden by `set_overrides`)
 /// `ofv`              — current OFV
 /// `grad_norm`        — L2 norm of the gradient (None for derivative-free optimizers)
 /// `step_norm`        — L2 norm of the parameter step (None when unavailable)
