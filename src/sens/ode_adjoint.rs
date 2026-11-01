@@ -1829,7 +1829,7 @@ fn record_analytic_events<T: VmNum>(
     } else {
         crate::pk::first_record_with_same_pk_inputs(
             model,
-            records.iter().map(|&(occ, cov, t)| (group(occ), cov, t)),
+            records.iter().map(|&(occ, cov, _)| (group(occ), cov)),
         )
     };
     // The distinct evaluations, and which one each record reads.

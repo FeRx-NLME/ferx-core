@@ -1228,12 +1228,15 @@ pub(crate) fn record_pk_inputs(
 ///
 /// A record's snapshot is `pk_param_fn(θ, η, cov, t)` with the `η` of its κ group
 /// `group`. That is a pure function of those inputs: its prefix cache is bit-exact, and
-/// the mixture class it reads is fixed for the call. So two records give the same bits
-/// when they have:
+/// the mixture class it reads is fixed for the call. When the individual-parameter
+/// program does not read `TIME`, two records therefore give the same bits when they have
+/// the same group and the same value for every covariate the model references, compared
+/// by bits.
 ///
-/// - the same group;
-/// - the same value for every covariate the model references, compared by bits;
-/// - the same time, when the individual-parameter program reads `TIME`.
+/// A program that reads `TIME` shares nothing, each record being its own. Two records
+/// would need equal times as well, which is rare: on a model whose CL drifts in `TIME`
+/// the index found almost nothing to share and made the fit 9–13% slower (#2543 review
+/// r1, 100 subjects × 35 records, macOS arm64).
 ///
 /// Comparing by bits is what the prefix cache does too: a `NaN` (#1111's missing value)
 /// matches itself, and `-0.0` does not match `0.0`. A model with no parsed program, such
@@ -1248,37 +1251,28 @@ pub(crate) fn record_pk_inputs(
 /// most of a time-varying-covariate fit.
 pub(crate) fn first_record_with_same_pk_inputs<'a>(
     model: &CompiledModel,
-    records: impl IntoIterator<
-        Item = (
-            Option<usize>,
-            &'a std::collections::HashMap<String, f64>,
-            f64,
-        ),
-    >,
+    records: impl IntoIterator<Item = (Option<usize>, &'a std::collections::HashMap<String, f64>)>,
 ) -> Vec<usize> {
-    if model.indiv_param_partials.indiv_param_program.is_none() {
+    if model.indiv_param_partials.indiv_param_program.is_none()
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+    {
         return (0..records.into_iter().count()).collect();
     }
     // The program looks covariates up by the names `referenced_covariates` held when it
     // was built, and later registrations only add to that list.
     let names = &model.referenced_covariates;
-    // Key layout: group, time (when read), a presence mask, then the covariate bits. The
-    // mask tells a missing covariate from one holding 0.0.
-    let with_time =
-        usize::from(crate::parser::model_parser::compiled_model_uses_time_builtin(model));
+    // Key layout: group, a presence mask, then the covariate bits. The mask tells a
+    // missing covariate from one holding 0.0.
     let n_mask = names.len().div_ceil(64);
-    let stride = 1 + with_time + n_mask + names.len();
-    let cov_part = 1 + with_time..stride;
+    let stride = 1 + n_mask + names.len();
+    let cov_part = 1..stride;
     let mut keys: Vec<u64> = Vec::new();
     let mut prev: Option<&std::collections::HashMap<String, f64>> = None;
-    for (group, cov, t) in records {
+    for (group, cov) in records {
         let start = keys.len();
         keys.resize(start + stride, 0);
         let (done, key) = keys.split_at_mut(start);
         key[0] = group.map_or(0, |g| g as u64 + 1);
-        if with_time == 1 {
-            key[1] = t.to_bits();
-        }
         // Consecutive records often borrow one map: every record of a static subject
         // does, and so does each run of records falling back to `subject.covariates`.
         if prev.is_some_and(|p| std::ptr::eq(p, cov)) {
@@ -1329,7 +1323,7 @@ fn fill_per_record_pk_params(
         model,
         records
             .iter()
-            .flat_map(|r| r.iter().map(|&(cov, t)| (None, cov, t))),
+            .flat_map(|r| r.iter().map(|&(cov, _)| (None, cov))),
     );
     // Record `i` of the concatenation sits at `(list, i - offset[list])`.
     let locate = |i: usize| {
@@ -3697,60 +3691,56 @@ mod tests {
             /* 10 */ covs(&[("AGE", 40.0)]),
             /* 11 the other covariate differs */ covs(&[("WT", 70.0), ("AGE", 41.0)]),
         ];
-        let mut records: Vec<(Option<usize>, &HashMap<String, f64>, f64)> = maps
-            .iter()
-            .enumerate()
-            // A distinct time per record: this model does not read `TIME`.
-            .map(|(i, m)| (None, m, i as f64))
-            .collect();
+        let mut records: Vec<(Option<usize>, &HashMap<String, f64>)> =
+            maps.iter().map(|m| (None, m)).collect();
         // 12, 13: the first record's inputs in another κ group; 14: in no group again.
-        records.extend([(Some(1), &maps[0], 0.0), (Some(1), &maps[1], 1.0)]);
-        records.push((None, &maps[1], 2.0));
+        records.extend([(Some(1), &maps[0]), (Some(1), &maps[1])]);
+        records.push((None, &maps[1]));
         // 15, 16: one map borrowed by consecutive records, as `subject.covariates` is.
-        records.extend([(None, &maps[3], 0.0), (None, &maps[3], 0.0)]);
+        records.extend([(None, &maps[3]), (None, &maps[3])]);
         assert_eq!(
             first_record_with_same_pk_inputs(&model, records.iter().copied()),
             [0, 0, 0, 3, 0, 5, 5, 7, 8, 9, 9, 11, 12, 12, 0, 3, 3]
         );
     }
 
+    /// The straddle: one program with and without its `TIME` read, on records whose
+    /// covariates and times all agree. Without `TIME` they share; with it each is its own,
+    /// even the two at the same time.
     #[test]
-    fn a_model_reading_time_shares_only_records_at_the_same_time() {
-        let model = crate::parser::model_parser::parse_model_string(
-            r#"
+    fn a_model_reading_time_shares_nothing() {
+        let src = |cl: &str| {
+            format!(
+                r#"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
   omega ETA_CL ~ 0.09
   sigma EPS ~ 0.1
 [individual_parameters]
-  CL = TVCL * exp(ETA_CL) * (1 + 0.01 * TIME)
-  V  = 10
+  CL = {cl}
+  V  = 10 * (WT/70)
 [structural_model]
   pk one_cpt_iv(cl=CL, v=V)
 [error_model]
   DV ~ additive(EPS)
-"#,
-        )
-        .expect("parses");
-        let m = HashMap::new();
-        let records = [
-            (None, &m, 1.0),
-            (None, &m, 1.0),
-            (None, &m, 2.0),
-            (None, &m, -0.0),
-        ];
+"#
+            )
+        };
+        let parse =
+            |cl: &str| crate::parser::model_parser::parse_model_string(&src(cl)).expect("parses");
+        let with_time = parse("TVCL * exp(ETA_CL) * (1 + 0.01 * TIME)");
+        let without = parse("TVCL * exp(ETA_CL)");
+        assert!(crate::parser::model_parser::compiled_model_uses_time_builtin(&with_time));
+        assert!(!crate::parser::model_parser::compiled_model_uses_time_builtin(&without));
+        let m = covs(&[("WT", 70.0)]);
+        let records = [(None, &m), (None, &m), (Some(0), &m), (Some(0), &m)];
         assert_eq!(
-            first_record_with_same_pk_inputs(&model, records.iter().copied()),
-            [0, 0, 2, 3]
+            first_record_with_same_pk_inputs(&without, records.iter().copied()),
+            [0, 0, 2, 2]
         );
-        // The model without its `TIME` read shares all four, so the key's time word is
-        // what kept them apart above.
-        let mut no_time = model;
-        no_time.indiv_param_partials.indiv_param_program = None;
         assert_eq!(
-            first_record_with_same_pk_inputs(&no_time, records.iter().copied()),
-            [0, 1, 2, 3],
-            "with no program each record is its own"
+            first_record_with_same_pk_inputs(&with_time, records.iter().copied()),
+            [0, 1, 2, 3]
         );
     }
 
@@ -3761,7 +3751,7 @@ mod tests {
         let model = cl_from_cr_model();
         assert!(model.indiv_param_partials.indiv_param_program.is_none());
         let m = covs(&[("CR", 1.0)]);
-        let records = [(None, &m, 0.0), (None, &m, 0.0), (Some(0), &m, 0.0)];
+        let records = [(None, &m), (None, &m), (Some(0), &m)];
         assert_eq!(
             first_record_with_same_pk_inputs(&model, records.iter().copied()),
             [0, 1, 2]
@@ -3848,9 +3838,9 @@ mod tests {
         // obs 3 and the reset reuses obs 1. A distinct WT per record reduces this test
         // to the unshared one.
         let records: Vec<_> = (0..5)
-            .map(|j| (None, s.obs_cov(j), 0.0))
-            .chain((0..2).map(|m| (None, s.pk_only_cov(m), 0.0)))
-            .chain([(None, s.reset_cov(0), 0.0)])
+            .map(|j| (None, s.obs_cov(j)))
+            .chain((0..2).map(|m| (None, s.pk_only_cov(m))))
+            .chain([(None, s.reset_cov(0))])
             .collect();
         assert_eq!(
             first_record_with_same_pk_inputs(&model, records),

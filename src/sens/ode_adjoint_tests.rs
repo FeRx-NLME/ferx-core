@@ -1176,7 +1176,7 @@ fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
             let records = crate::pk::record_pk_inputs(s);
             crate::pk::first_record_with_same_pk_inputs(
                 &model,
-                records.iter().map(|&(occ, cov, t)| (group(s, occ), cov, t)),
+                records.iter().map(|&(occ, cov, _)| (group(s, occ), cov)),
             )
         };
         let (fs, ft) = (first(&shared), first(&twin));
