@@ -5634,6 +5634,53 @@ fn mode_solve_declines_an_indefinite_hessian_off_the_mode() {
     assert!(super::mode_solve::<0>(&spd, &b, &[1e-2, 0.0], || None).is_some());
 }
 
+/// #2557: `MODE_STATIONARY_TOL` is a gradient gate of its own, and a point the inner
+/// search's certificate accepts can fail it. On a direction of curvature 1e4,
+/// `FallbackCertifier` certifies `η = (2e-8, 0)` by the Newton-step arm (`‖H⁻¹g‖ = 2e-8 <
+/// tol`) without moving it, at `‖g‖∞ = 2e-4`, twice the gate. That gradient on an indefinite
+/// `H` declines. Both halves are asserted, so the constant's doc (the certificate does not
+/// imply the gate) cannot silently go false in either direction: a certificate that starts
+/// bounding the gradient fails the first half, and a gate that starts accepting certified
+/// points fails the second. The control, the same `H` at a gradient under the gate, is taken.
+#[test]
+fn a_certified_point_can_fail_the_indefinite_stationarity_gate() {
+    use crate::estimation::inner_optimizer::FallbackCertifier;
+    let c = 1e4;
+    let obj = |x: &[f64]| 0.5 * (c * x[0] * x[0] + x[1] * x[1]);
+    let grad = |x: &[f64]| vec![c * x[0], x[1]];
+    let never = |_: &[f64]| false;
+    let cert = FallbackCertifier {
+        grad: &grad,
+        precond: None,
+        stop_precond: None,
+        stall_at: &never,
+        n: 2,
+        max_iter: 50,
+        tol: 1e-5,
+    };
+    let start = vec![2e-8, 0.0];
+    let mut x = start.clone();
+    assert!(
+        cert.certify(&obj, &mut x),
+        "the Newton-step arm certifies it"
+    );
+    assert_eq!(x, start, "certified in place, not polished");
+    let g = grad(&x);
+    let g_inf = g.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    assert!(
+        g_inf > super::MODE_STATIONARY_TOL,
+        "the certified point is above the gate: {g_inf:.2e}"
+    );
+    let indefinite = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+    let b = DVector::from_column_slice(&[1.0, -3.0]);
+    assert!(
+        super::mode_solve::<0>(&indefinite, &b, &g, || None).is_none(),
+        "a certified point above the gate declines"
+    );
+    let under: Vec<f64> = g.iter().map(|v| v * 0.4).collect();
+    assert!(super::mode_solve::<0>(&indefinite, &b, &under, || None).is_some());
+}
+
 /// A declined stationarity gate is judged again by the inner search's own gradient, which
 /// the definite branch never computes. The recording's `∇_η l` and the search's are exact
 /// derivatives of two floating-point solves that part at the solver's tolerance where the
