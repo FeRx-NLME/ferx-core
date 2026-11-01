@@ -22,10 +22,10 @@
 # faster or slower and the controller must re-titrate off the trough it observes: the
 # occasion-varying κ genuinely drives the ladder on top of the base regimen.
 #
-# `auc_target` is deliberately absent: its exposure metric integrates a dense grid
-# from a single frozen PK snapshot, silently wrong when CL switches per occasion, so
-# it is a typed error for an IOV (`kappa`) subject (#701). `target_window` (the
-# pct-in-band trough metric) stays — it is a per-occasion-aware decision-grid summary.
+# The block declares no `auc_target` (trough control is the scenario); it is supported
+# here since #943, and `tests/adaptive_vanco_iov_loading_anchor.rs` adds one to check each
+# window's AUC24 against mrgsolve. `target_window` (the pct-in-band trough metric)
+# is the decision-grid summary this example reports.
 #
 # Run with `simulate_adaptive_from_spec()` (not the plain forward `simulate()`).
 # Validated dose-for-dose against an independent mrgsolve run (mrgsolve, not NONMEM,

@@ -37,3 +37,15 @@ ferx (`tests/adaptive_vanco_loading_anchor.rs`) reproduces this maintenance ladd
 dose-for-dose and the troughs to a small cross-solver tolerance (RK45 vs LSODA).
 The loading dose is integrated by ferx's base-regimen path (#702) and the controller
 titrates on top of it -- exactly what this reference exercises.
+
+## Per-window AUC24
+
+The area under CENT/V over each closed inter-decision window, from an AUC compartment (dxdt_AUC = CENT/V) reset at the start of each window (mrgsolve 2.0.1). It is the external reference for `auc_target` (#943).
+
+| window | days [t0,t1] (h) | AUC24 (mg*h/L) |
+|---:|---:|---:|
+| 0 | [24, 48] | 242.711204 |
+| 1 | [48, 72] | 277.831468 |
+| 2 | [72, 96] | 339.591553 |
+| 3 | [96, 120] | 422.170914 |
+| 4 | [120, 144] | 527.015315 |

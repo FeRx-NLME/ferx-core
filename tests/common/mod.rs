@@ -173,3 +173,55 @@ pub fn binary_pop(subjects: &[(f64, Vec<(f64, u8)>)], cmt: usize) -> ferx_core::
         subjects,
     }
 }
+
+/// Each window AUC of an adaptive run matches `refs[i]` to `tol` relative (#943).
+///
+/// `windows_in(band)` runs the scenario with `auc_target = band` and returns how many
+/// realized windows fall in it — the only view of the window AUCs the public API gives.
+/// The bands are first checked pairwise disjoint, so a count of 1 in band `i` is window `i`
+/// and no other; tightening the reference spacing or widening the band past that point
+/// fails here, by name, instead of quietly letting two windows swap.
+pub fn assert_window_aucs_match(
+    windows_in: &dyn Fn((f64, f64)) -> usize,
+    refs: &[f64],
+    tol: f64,
+    label: &str,
+) {
+    let band_of = |r: f64| (r * (1.0 - tol), r * (1.0 + tol));
+    for (i, &a) in refs.iter().enumerate() {
+        for (j, &b) in refs.iter().enumerate().skip(i + 1) {
+            let (ba, bb) = (band_of(a), band_of(b));
+            assert!(
+                ba.1 < bb.0 || bb.1 < ba.0,
+                "{label}: windows {i} and {j}: references {a} and {b} are closer than the \
+                 band ({tol:e}), so a count of 1 no longer identifies the window"
+            );
+        }
+    }
+    assert_eq!(
+        windows_in((0.0, f64::MAX)),
+        refs.len(),
+        "{label}: number of realized windows"
+    );
+    for (i, &r) in refs.iter().enumerate() {
+        assert_eq!(
+            windows_in(band_of(r)),
+            1,
+            "{label}: window {i}: ferx's AUC24 is not within {tol:e} of mrgsolve's {r}"
+        );
+    }
+}
+
+/// The number of realized windows `res` scores in its `auc_target` band.
+pub fn windows_in_band(res: &ferx_core::AdaptiveSimulationResult) -> usize {
+    let n_windows = res.decisions.len() - 1;
+    let attain = res.metrics[0]
+        .auc_target_attainment
+        .expect("auc_target declared");
+    let n = attain * n_windows as f64;
+    assert!(
+        (n - n.round()).abs() < 1e-9,
+        "attainment {attain} is k/{n_windows}"
+    );
+    n.round() as usize
+}
