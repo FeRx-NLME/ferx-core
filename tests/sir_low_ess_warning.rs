@@ -309,10 +309,17 @@ fn mbma_placebo_is_healthy_under_packed_and_warns_under_natural() {
     // stop now takes a verification leg at a tight inner tolerance, which ends at the same
     // optimum (OFV 97.070036151 with and without it, worst estimate 8.5e-9 relative) in 75
     // evaluations instead of 69.
-    assert_ess(f.sir_ess, 159.033_237_342_320_06, "MBMA packed");
+    // #2544 moved both (159.033_237_342_320_06 → 159.033_196_129_924_76, −2.6e-7;
+    // 43.099_294_541_570_46 → 43.099_283_326_146_214, −2.6e-7; Linux aarch64, the packed one
+    // equal in every digit to the x86_64 slow-tests dispatch 41298213245): the one-line
+    // `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM` is now an additive mu-reference, so the FOCE
+    // inner loop runs in `ψ = η + TVE0` and stops the EBEs at a slightly different point.
+    // Same optimum: FOCEI OFV against the split spelling 1.3e-12, worst θ 5.7e-8 relative
+    // (`tests/additive_mu_one_line_mbma.rs`).
+    assert_ess(f.sir_ess, 159.033_196_129_924_76, "MBMA packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 
-    assert_ess(nat.sir_ess, 43.099_294_541_570_46, "MBMA natural");
+    assert_ess(nat.sir_ess, 43.099_283_326_146_214, "MBMA natural");
     let w = low_ess(&nat).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", nat.warnings));
     assert!(
         w.contains("`sir_scale = packed` may sample it better"),
