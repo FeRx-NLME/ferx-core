@@ -206,6 +206,43 @@ pub fn population_eta_dx(
         .collect()
 }
 
+/// The EBE warm start at `x_new` from the modes at `x_prev`: the mode map's first-order
+/// expansion `η̂ + (dη̂/dx)·(x_new − x_prev)` (Almquist Eq. 48), taken whole (#2549).
+///
+/// `dη̂/dx` is the exact derivative of the mode (implicit function theorem), so the start
+/// is accurate to second order in the outer step and the inner solve corrects the rest.
+/// Nothing is capped: every bound measured on the benchmark set lost iterations somewhere —
+/// a cap of two prior SDs, or damping by the Newton decrement (which measures how far the
+/// mode moves, not how wrong its prediction is) — and choosing per evaluation between this
+/// start and the previous mode broke the start's smooth dependence on `x`, which is what
+/// makes the objective the outer optimizer sees smooth (`rtte` 18 → 35, `mm` 53 → 255 outer
+/// iterations). A non-finite step leaves the mode.
+pub(crate) fn predict_warm_etas_first_order(
+    prev_etas: &[DVector<f64>],
+    jacs: &[Vec<DVector<f64>>],
+    x_prev: &[f64],
+    x_new: &[f64],
+) -> Vec<DVector<f64>> {
+    prev_etas
+        .iter()
+        .zip(jacs.iter())
+        .map(|(eta, jac)| {
+            let mut step = DVector::zeros(eta.len());
+            for (k, jk) in jac.iter().enumerate() {
+                let dx = x_new[k] - x_prev[k];
+                if dx != 0.0 && jk.len() == step.len() {
+                    step += jk * dx;
+                }
+            }
+            if step.iter().all(|v| v.is_finite()) {
+                eta + step
+            } else {
+                eta.clone()
+            }
+        })
+        .collect()
+}
+
 /// Almquist Eq. 48 warm-start: `η⁰ᵢ = η̂ᵢ + Σₖ (dη̂ᵢ/dx_k)·(x_new−x_prev)_k`.
 pub fn predict_warm_etas(
     prev_etas: &[DVector<f64>],
@@ -239,4 +276,45 @@ pub fn predict_warm_etas(
             eta + step
         })
         .collect()
+}
+
+#[cfg(test)]
+mod first_order_prediction_tests {
+    use super::predict_warm_etas_first_order;
+    use nalgebra::DVector;
+
+    /// The start is the mode map's first-order expansion, whole however long the step: a
+    /// mode that moves linearly in `x` is predicted exactly, at any distance.
+    #[test]
+    fn the_start_is_the_whole_first_order_expansion() {
+        let eta = vec![DVector::from_vec(vec![0.3, -0.1])];
+        let jac = vec![vec![
+            DVector::from_vec(vec![2.0, 0.0]),
+            DVector::from_vec(vec![0.5, -1.0]),
+        ]];
+        for scale in [1e-3, 1.0, 50.0] {
+            let p =
+                predict_warm_etas_first_order(&eta, &jac, &[1.0, 2.0], &[1.0 + scale, 2.0 + scale]);
+            let want = [0.3 + 2.5 * scale, -0.1 - scale];
+            assert!(
+                (p[0][0] - want[0]).abs() < 1e-12 * (1.0 + want[0].abs()),
+                "{}",
+                p[0]
+            );
+            assert!(
+                (p[0][1] - want[1]).abs() < 1e-12 * (1.0 + want[1].abs()),
+                "{}",
+                p[0]
+            );
+        }
+    }
+
+    /// A non-finite response leaves the mode rather than starting the solve at `NaN`.
+    #[test]
+    fn a_non_finite_step_leaves_the_mode() {
+        let eta = vec![DVector::from_vec(vec![0.3, -0.1])];
+        let jac = vec![vec![DVector::from_vec(vec![f64::NAN, 1.0])]];
+        let p = predict_warm_etas_first_order(&eta, &jac, &[0.0], &[1.0]);
+        assert_eq!(p[0].as_slice(), &[0.3, -0.1]);
+    }
 }

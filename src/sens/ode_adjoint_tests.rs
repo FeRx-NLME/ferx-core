@@ -6917,3 +6917,226 @@ fn the_tape_anchor_factor_is_productions() {
         assert!((tape - want).abs() < 1e-12, "tape {tape} vs {want} on {h}");
     }
 }
+
+/// #2549: the mode response fused into the outer gradient's own recording
+/// ([`subject_adjoint_gradient_with_eta_dx_at`]) is the standalone exact one
+/// ([`subject_adjoint_eta_dx`], itself pinned to the re-solved EBE above), on a Gaussian
+/// five-effect subject (width-6 bucket, so one padded lane and two sweep chunks) and on
+/// non-Gaussian subjects, under both interaction settings — and the gradient it rides on is
+/// unchanged bit for bit.
+#[test]
+fn the_fused_mode_response_is_the_standalone_one() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let five = parse_model_string(&one_cpt_oral_n_eta(5)).unwrap();
+    let s5 = subject(
+        &five,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2, 0.03, -0.02],
+    );
+    #[allow(unused_mut)]
+    let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("five".into(), five, s5)];
+    #[cfg(feature = "survival")]
+    {
+        let mut endpoint_cases = vec![
+            ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+            ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+            ("examples/binary_logistic.ferx", "data/binary_logistic.csv"),
+            (
+                "examples/tte_competing_risks.ferx",
+                "data/tte_competing_risks.csv",
+            ),
+        ];
+        if cfg!(feature = "markov") {
+            endpoint_cases.push(("examples/ctmm_pd_2state.ferx", "data/ctmm_pd_2state.csv"));
+        }
+        for (m, d) in endpoint_cases {
+            let prep =
+                crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}")))
+                    .unwrap();
+            let s = prep
+                .population
+                .subjects
+                .iter()
+                .find(|s| !s.obs_records.is_empty())
+                .unwrap()
+                .clone();
+            cases.push((m.into(), prep.parsed.model, s));
+        }
+    }
+    // A `[covariate_nn]` model: the network weights reach the response through the
+    // per-lane `add_nn_weight_adjoint`, as they reach the gradient through Ψ's.
+    #[cfg(feature = "nn")]
+    {
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_dcm.ferx"),
+            Some(&format!("{root}/data/warfarin_dcm.csv")),
+        )
+        .unwrap();
+        let s = prep.population.subjects[0].clone();
+        cases.push(("warfarin_dcm".into(), prep.parsed.model, s));
+    }
+    let _ = root;
+    let mut worst = 0.0f64;
+    let mut live = 0.0f64;
+    for (name, model, s) in &cases {
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        for interaction in [true, false] {
+            // The NN example is a FOCEI model; its FOCE adjoint declines the subject. A model
+            // without random effects has no mode to respond.
+            if (name == "warfarin_dcm" && !interaction) || model.n_eta == 0 {
+                continue;
+            }
+            let eta = ebe_for(model, s, &params, 1e-12, interaction);
+            let objective = if interaction {
+                Objective::Focei
+            } else {
+                Objective::Foce
+            };
+            let (plain, (fused_g, fused), want) = std::thread::scope(|sc| {
+                std::thread::Builder::new()
+                    .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                    .spawn_scoped(sc, || {
+                        let g = |_: ()| {
+                            subject_adjoint_gradient(
+                                model,
+                                s,
+                                &params,
+                                &x,
+                                eta.as_slice(),
+                                objective,
+                            )
+                        };
+                        let plain = g(());
+                        let pt = PackedPoint::new(&params, &x).unwrap();
+                        let fused = subject_adjoint_gradient_with_eta_dx_at(
+                            model,
+                            s,
+                            &pt,
+                            eta.as_slice(),
+                            interaction,
+                        );
+                        let want = subject_adjoint_eta_dx(
+                            model,
+                            s,
+                            &params,
+                            &x,
+                            eta.as_slice(),
+                            interaction,
+                        );
+                        (plain, fused, want)
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            });
+            let (plain, fused_g) = (plain.unwrap(), fused_g.unwrap());
+            for (a, b) in plain.iter().zip(&fused_g) {
+                assert_eq!(a.to_bits(), b.to_bits(), "{name}: the gradient moved");
+            }
+            let got = fused.unwrap_or_else(|| panic!("{name} {interaction}: no fused response"));
+            let want = want.unwrap();
+            assert_eq!(got.len(), want.len(), "{name}");
+            for (gk, wk) in got.iter().zip(&want) {
+                assert_eq!(gk.len(), wk.len(), "{name}");
+                for (a, b) in gk.iter().zip(wk.iter()) {
+                    assert!(a.is_finite() && b.is_finite(), "{name}");
+                    worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+                    live = live.max(b.abs());
+                }
+            }
+            eprintln!("{name} interaction={interaction}: fused vs standalone {worst:.2e}");
+        }
+    }
+    assert!(live > 1e-2, "the mode does not move: the test sees nothing");
+    // Measured 1.03e-15 (Linux x86_64): the two are one formula, swept in a different
+    // order; 1e-12 leaves three decades for another platform's rounding.
+    assert!(
+        worst < 1e-12,
+        "fused vs standalone mode response {worst:.2e}"
+    );
+}
+
+/// #2549: the fused mode response `dη̂/dx = −H⁻¹·∂(∇_η l)/∂x` on a `[covariate_nn]` model,
+/// against the same formula with both factors taken by mixed central differences of the
+/// conditional inner objective `l(η; x)` (`individual_nll`) at the same fixed `η`. No EBE is
+/// re-solved, so the oracle sees the network-weight coordinates smoothly — re-solved EBEs on
+/// this model jump by orders of magnitude between step sizes — and shares no derivative code
+/// with the response.
+#[cfg(feature = "nn")]
+#[test]
+fn the_fused_mode_response_matches_fd_of_the_inner_objective_on_a_covariate_nn_model() {
+    use crate::estimation::parameterization::unpack_params;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let prep = crate::api::prepare_run(
+        &format!("{root}/examples/warfarin_dcm.ferx"),
+        Some(&format!("{root}/data/warfarin_dcm.csv")),
+    )
+    .unwrap();
+    let model = &prep.parsed.model;
+    let params = moved_params(model);
+    let x = pack_params(&params);
+    let n = model.n_eta;
+    let s = &prep.population.subjects[0];
+    let eta = ebe_for(model, s, &params, 1e-12, true);
+    let pt = PackedPoint::new(&params, &x).unwrap();
+    let (_, dx) = std::thread::scope(|sc| {
+        std::thread::Builder::new()
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .spawn_scoped(sc, || {
+                subject_adjoint_gradient_with_eta_dx_at(model, s, &pt, eta.as_slice(), true)
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    });
+    let dx = dx.expect("an NN subject is served");
+    let l = |xv: &[f64], e: &[f64]| {
+        let p = unpack_params(xv, &params);
+        crate::stats::likelihood::individual_nll(model, s, &p.theta, e, &p.omega, &p.sigma.values)
+    };
+    let de = 1e-4;
+    let shift = |e: &[f64], j: usize, d: f64| {
+        let mut v = e.to_vec();
+        v[j] += d;
+        v
+    };
+    let h = nalgebra::DMatrix::from_fn(n, n, |a, b| {
+        let e = eta.as_slice();
+        (l(&x, &shift(&shift(e, a, de), b, de))
+            - l(&x, &shift(&shift(e, a, de), b, -de))
+            - l(&x, &shift(&shift(e, a, -de), b, de))
+            + l(&x, &shift(&shift(e, a, -de), b, -de)))
+            / (4.0 * de * de)
+    });
+    let hinv = h.clone().try_inverse().expect("H");
+    let mut worst = 0.0f64;
+    for k in 0..x.len() {
+        let hx = 1e-5 * (1.0 + x[k].abs());
+        let g = nalgebra::DVector::from_fn(n, |j, _| {
+            let e = eta.as_slice();
+            let xp = shift(&x, k, hx);
+            let xm = shift(&x, k, -hx);
+            (l(&xp, &shift(e, j, de)) - l(&xp, &shift(e, j, -de)) - l(&xm, &shift(e, j, de))
+                + l(&xm, &shift(e, j, -de)))
+                / (4.0 * de * hx)
+        });
+        let want = -(&hinv * g);
+        for j in 0..n {
+            let e = (dx[k][j] - want[j]).abs() / (1.0 + want[j].abs());
+            if e > 1e-3 {
+                eprintln!("BAD k={k} j={j} dx={:.6e} fd={:.6e}", dx[k][j], want[j]);
+            }
+            worst = worst.max(e);
+        }
+    }
+    eprintln!("NN response vs FD of the inner objective: {worst:.2e}");
+    assert!(
+        worst < 1e-4,
+        "NN mode response vs FD of the inner objective {worst:.2e}"
+    );
+}

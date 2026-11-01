@@ -19,6 +19,7 @@ pub mod ode;
 pub mod parser;
 pub mod pk;
 pub mod propensity_match;
+pub(crate) mod scratch;
 pub mod sens;
 pub(crate) mod serde_nalgebra;
 pub mod sim;
