@@ -1835,8 +1835,8 @@ fn record_analytic_events<T: VmNum>(
     };
     // The distinct evaluations, and which one each record reads. Reserved for one per
     // record: a `PkParams` is 1 KiB, and growing into the vector re-copied every
-    // evaluation already made, which cost a model whose records cannot share ~4%
-    // (#2543 review r1, row 3).
+    // evaluation already made, about 2% of a FOCEI fit on a model whose records cannot
+    // share (#2543 review r1, row 3).
     let mut snaps: Vec<(crate::types::PkParams, Vec<T>)> = Vec::with_capacity(records.len());
     let mut snap_of: Vec<usize> = Vec::with_capacity(records.len());
     for (i, &(occ, cov, time)) in records.iter().enumerate() {
