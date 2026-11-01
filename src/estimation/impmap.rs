@@ -24,17 +24,24 @@
 //! Laplace `ofv` for AIC/BIC comparability, identical in shape to SAEM's, so the
 //! covariance step and chained-stage handoff in `api.rs` need no special casing.
 //!
-//! ## Scope (v1)
+//! ## Inter-occasion variability (#2301)
 //!
-//! Inter-occasion variability (`κ` / `[iov]`) is **not yet supported** by the
-//! IMPMAP M-step (the κ sufficient statistics and Ω_iov update are a follow-up);
-//! such models are refused up front. SDE / `[diffusion]` models are refused for
-//! the same reason `IMP` refuses them. Use SAEM or FOCEI for those.
+//! An IOV subject samples its stacked `[η, κ₁..κ_K]` from one joint proposal
+//! against the prior `Ω ⊕ I_K ⊗ Ω_iov`, and Ω_iov takes the closed-form update
+//! `Σᵢ Σ_g E_w[κᵢg κᵢgᵀ] / Σᵢ Kᵢ` (`omega_iov_mstep`). Nested variability
+//! levels and IOV under a `[mixture]` are still refused.
+//!
+//! ## Scope
+//!
+//! SDE / `[diffusion]` models are refused for the same reason `IMP` refuses
+//! them. Use FOCE / FOCEI for those.
 
 use crate::estimation::covariate_mu_ref::{resolve_covariate_mu_groups, GroupStepInput};
+use crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov;
 use crate::estimation::importance_sampling::{
-    compute_posterior_hessian, find_optimal_iscale, subject_is_draws, SubjectDraws,
-    MIX_ESS_PMIX_FLOOR,
+    build_joint_omega_inv, compute_joint_posterior_hessian, compute_posterior_hessian,
+    find_optimal_iscale, find_optimal_iscale_with, subject_is_draws, subject_is_draws_with,
+    SubjectDraws, MIX_ESS_PMIX_FLOOR,
 };
 use crate::estimation::inner_optimizer::{find_ebe, EbeResult, InnerLoopStats};
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
@@ -46,6 +53,7 @@ use crate::estimation::saem::{
 };
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::obs_nll_subject_into;
+use crate::stats::stacked_layout::{kappa_range, stacked_width};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
@@ -486,15 +494,13 @@ fn find_ebe_multistart(
     let Some(l_omega) = omega_chol else {
         return best;
     };
-    let n_eta = l_omega.nrows();
+    let l_iov = kappa_start_chol(model, subject, params, mceta);
+    let kappa_draw = l_iov
+        .as_ref()
+        .map(|l| (l, crate::stats::stacked_layout::group_count(subject)));
     let mut rng = StdRng::seed_from_u64(subj_seed);
     for _start in 0..mceta {
-        // Draw z ~ N(0, I), compute eta_start = L_Ω · z.
-        let z: Vec<f64> = (0..n_eta)
-            .map(|_| StandardNormal.sample(&mut rng))
-            .collect();
-        let eta_start = l_omega * DVector::from_vec(z);
-        let eta_slice: Vec<f64> = eta_start.iter().copied().collect();
+        let eta_slice = random_start(&mut rng, l_omega, kappa_draw);
 
         let candidate = find_ebe(
             model,
@@ -513,14 +519,57 @@ fn find_ebe_multistart(
     best
 }
 
+/// The Cholesky factor of Ω_iov an IOV subject's `mceta` random starts draw κ
+/// from, or `None` for a subject that samples η alone (no IOV, no occasions, no
+/// restarts, or an Ω_iov that is not positive definite).
+fn kappa_start_chol(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    mceta: usize,
+) -> Option<DMatrix<f64>> {
+    if mceta == 0 || model.n_kappa == 0 || subject.occasions.is_empty() {
+        return None;
+    }
+    params
+        .omega_iov
+        .as_ref()
+        .and_then(|o| o.matrix.clone().cholesky())
+        .map(|c| c.l())
+}
+
+/// One `mceta` random start: η = L_Ω·z and, for an IOV subject, each of its
+/// `n_occ` κ blocks = L_iov·z, stacked as the `[η, κ₁..κ_K]` the IOV inner solve
+/// starts from (#2301). Without `kappa`, η alone — the draw sequence is then
+/// exactly the pre-IOV one.
+fn random_start(
+    rng: &mut StdRng,
+    l_omega: &DMatrix<f64>,
+    kappa: Option<(&DMatrix<f64>, usize)>,
+) -> Vec<f64> {
+    let mut draw = |l: &DMatrix<f64>| -> Vec<f64> {
+        let z: Vec<f64> = (0..l.nrows()).map(|_| StandardNormal.sample(rng)).collect();
+        (l * DVector::from_vec(z)).iter().copied().collect()
+    };
+    let mut start = draw(l_omega);
+    if let Some((l_iov, n_occ)) = kappa {
+        for _ in 0..n_occ {
+            start.extend(draw(l_iov));
+        }
+    }
+    start
+}
+
 /// Multi-start MAP: for each subject, run `find_ebe` with the warm-start (or
 /// cold-start), a cold re-solve when it was warm-started, and then `mceta`
-/// additional random starting points drawn from N(0, Ω). The start with the
+/// additional random starting points drawn from N(0, Ω) — with each occasion's κ
+/// drawn from N(0, Ω_iov) for an IOV subject (see [`random_start`]). The start with the
 /// lowest NLL wins. When `mceta == 0` this degrades to the best of the warm and
 /// cold solves (see [`find_ebe_multistart`] for why the cold one is kept).
 ///
-/// Returns `(eta_hats, h_matrices, stats)`. Kappas are always empty because
-/// IMPMAP refuses IOV models.
+/// Returns `(eta_hats, h_matrices, kappas, stats)`. `kappas[i]` holds subject
+/// `i`'s per-occasion κ̂ (empty without IOV); `prev_etas` may carry the stacked
+/// `[η̂, κ̂₁..κ̂_K]` of the previous sweep, which warm-starts κ too (#2301).
 #[allow(clippy::too_many_arguments)]
 fn run_map_multistart(
     model: &CompiledModel,
@@ -533,7 +582,12 @@ fn run_map_multistart(
     mceta: usize,
     seed: u64,
     iteration: usize,
-) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats) {
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+    InnerLoopStats,
+) {
     // Cholesky of Ω for drawing random starts (computed once, outside the
     // per-subject parallel loop).
     let omega_chol = if mceta > 0 {
@@ -576,8 +630,9 @@ fn run_map_multistart(
     };
     let eta_hats: Vec<DVector<f64>> = results.iter().map(|r| r.eta.clone()).collect();
     let h_matrices: Vec<DMatrix<f64>> = results.iter().map(|r| r.h_matrix.clone()).collect();
+    let kappas: Vec<Vec<DVector<f64>>> = results.into_iter().map(|r| r.kappas).collect();
 
-    (eta_hats, h_matrices, stats)
+    (eta_hats, h_matrices, kappas, stats)
 }
 
 /// Run IMPMAP. `warm_etas`, when supplied by a preceding chain stage, seed the
@@ -775,12 +830,33 @@ fn run_mcem(
              observation likelihood). Use FOCE / FOCEI instead."
         ));
     }
-    if model.n_kappa > 0 {
+    // IOV (#2301): each IOV subject samples its stacked `[η, κ₁..κ_K]` jointly.
+    // Nested variability levels (#1082) lay κ out per cell of several levels,
+    // which the joint proposal below does not model.
+    if model.n_kappa > 0 && model.has_nested_levels() {
         return Err(format!(
-            "{label} does not yet support inter-occasion variability (κ / [iov]); \
-             the IOV M-step is a planned follow-up. Use SAEM or FOCEI for IOV models."
+            "{label} does not yet support nested variability levels (#1082). Use FOCE or \
+             FOCEI for this model."
         ));
     }
+    let omega_iov_init: Option<&OmegaMatrix> = if model.n_kappa > 0 {
+        match init_params.omega_iov.as_ref() {
+            Some(iov) if iov.log_det.is_finite() => Some(iov),
+            Some(_) => {
+                return Err(format!(
+                    "{label}: initial Ω_iov log-determinant is not finite — check the κ \
+                     declarations."
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "{label}: the model declares κ (IOV) but no Ω_iov was supplied."
+                ))
+            }
+        }
+    } else {
+        None
+    };
     if !init_params.omega.log_det.is_finite() {
         return Err(format!(
             "{label}: initial Ω log-determinant is not finite — check the \
@@ -1066,6 +1142,24 @@ fn run_mcem(
     let mut theta_cur = init_params.theta.clone();
     let mut sigma_cur = init_params.sigma.values.clone();
     let mut omega_mat = init_params.omega.matrix.clone();
+    // IOV (#2301): Ω_iov, and each subject's number of κ blocks — the occasion
+    // groups its stacked `[η, κ₁..κ_K]` is sampled over. A subject with none
+    // (or a model without IOV) samples η alone, exactly as before.
+    let n_kappa = model.n_kappa;
+    let mut omega_iov_mat: Option<DMatrix<f64>> = omega_iov_init.map(|o| o.matrix.clone());
+    let n_occ_of: Vec<usize> = population
+        .subjects
+        .iter()
+        .map(|s| {
+            if n_kappa > 0 && !s.occasions.is_empty() {
+                crate::stats::stacked_layout::group_count(s)
+            } else {
+                0
+            }
+        })
+        .collect();
+    // MAP warm starts, stacked `[η̂, κ̂₁..κ̂_K]` for an IOV subject so κ is
+    // warm-started too. A chained stage's η-only warm start leaves κ at 0.
     let mut prev_etas: Option<Vec<DVector<f64>>> = warm_etas.map(|e| e.to_vec());
     // Previous iteration's per-subject weighted draws — the proposal source for
     // the IMP (`SampleMoments`) recenter path on iterations 2+. `None` on the
@@ -1076,6 +1170,7 @@ fn run_mcem(
     let mut acc_theta = vec![0.0f64; n_theta];
     let mut acc_sigma = vec![0.0f64; n_sigma];
     let mut acc_omega = DMatrix::<f64>::zeros(n_eta, n_eta);
+    let mut acc_omega_iov = DMatrix::<f64>::zeros(n_kappa, n_kappa);
     let mut n_acc = 0usize;
 
     let mut last_eta_hats: Vec<DVector<f64>> = Vec::new();
@@ -1092,6 +1187,9 @@ fn run_mcem(
         model
             .frem_config
             .as_ref()
+            // The Rao-Blackwell partition is over η alone; an IOV model samples
+            // the joint (η, κ) vector instead, as `run_importance_sampling` does.
+            .filter(|_| n_kappa == 0)
             .map(|fc| crate::estimation::importance_sampling::frem_pk_cov_partition(fc, n_eta))
             .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
     };
@@ -1149,7 +1247,7 @@ fn run_mcem(
             // declared correlation structure.
             residual_correlations: init_params.residual_correlations.clone(),
             residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
-            omega_iov: None,
+            omega_iov: omega_iov_snapshot(init_params, omega_iov_mat.as_ref()),
             kappa_fixed: init_params.kappa_fixed.clone(),
             mixture: None,
         };
@@ -1160,9 +1258,9 @@ fn run_mcem(
         // `prev_draws` is still `None` — to seed the proposal, then recenters
         // from the previous iteration's weighted moments inside the draws loop.
         let run_inner = recenter == ProposalRecenter::Map || prev_draws.is_none();
-        let (eta_hats, h_matrices) = if run_inner {
+        let (eta_hats, h_matrices, kappa_hats) = if run_inner {
             let mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
-            let (e, h, _stats) = run_map_multistart(
+            let (e, h, kap, _stats) = run_map_multistart(
                 model,
                 population,
                 &params_k,
@@ -1174,9 +1272,10 @@ fn run_mcem(
                 seed,
                 k,
             );
-            (e, h)
+            check_kappa_blocks(population, &kap, &n_occ_of, label)?;
+            (e, h, kap)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
 
         let omega_inv = params_k.omega.inv.clone();
@@ -1196,6 +1295,13 @@ fn run_mcem(
             n_eta,
             defensive_alpha,
         );
+        // The IOV twin (#2301): the joint prior `Ω ⊕ I_K ⊗ Ω_iov` and its defensive
+        // component depend only on the occasion count K, so build one per distinct
+        // K per iteration and share it read-only across subjects.
+        let joint_priors = params_k
+            .omega_iov
+            .as_ref()
+            .map(|iov| JointPriors::build(&params_k.omega, iov, &n_occ_of, defensive_alpha));
         let mut draws: Vec<_> = population
             .subjects
             .par_iter()
@@ -1210,6 +1316,83 @@ fn run_mcem(
                 if crate::cancel::is_cancelled(cancel) {
                     return SubjectDraws::cancelled(n_eta);
                 }
+                let subj_seed = seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32);
+
+                // IOV subject (#2301): sample the stacked `b = [η, κ₁..κ_K]` from one
+                // joint proposal against the block-diagonal prior `Ω ⊕ I_K ⊗ Ω_iov`,
+                // the construction `run_importance_sampling` already uses for the
+                // final objective. Every downstream moment is then over `b`.
+                let n_occ = n_occ_of[i];
+                if n_occ > 0 {
+                    let prior = joint_priors
+                        .as_ref()
+                        .expect("Ω_iov present for an IOV model (checked on entry)")
+                        .get(n_occ);
+                    let n_b = stacked_width(n_eta, n_kappa, n_occ);
+                    let omega_joint_inv = &prior.inv;
+                    let log_det_joint = prior.log_det;
+                    let (center, h_post) = if run_inner {
+                        let h = compute_joint_posterior_hessian(
+                            model,
+                            subject,
+                            &params_k.theta,
+                            &eta_hats[i],
+                            &kappa_hats[i],
+                            &params_k.sigma.values,
+                            &h_matrices[i],
+                            omega_joint_inv,
+                            n_eta,
+                            n_kappa,
+                            n_occ,
+                            scratch,
+                        );
+                        (stack_eta_kappa(&eta_hats[i], &kappa_hats[i]), h)
+                    } else {
+                        let pd = &prev_draws.as_ref().expect("prev_draws set when !run_inner")[i];
+                        let center = DVector::from_row_slice(&pd.mean);
+                        let cov = &pd.second_moment - &center * center.transpose();
+                        let h = covariance_to_proposal_hessian(
+                            &cov,
+                            &prior.matrix,
+                            IMP_PROPOSAL_COV_FLOOR,
+                        );
+                        (center, h)
+                    };
+                    let theta = &params_k.theta;
+                    let sigma = &params_k.sigma.values;
+                    let obs_nll = |b: &[f64], sc: &mut EventPkParams| {
+                        draw_obs_nll(model, subject, theta, sigma, b, sc)
+                    };
+                    let iscale = find_optimal_iscale_with(
+                        &obs_nll,
+                        &center,
+                        &h_post,
+                        omega_joint_inv,
+                        log_det_joint,
+                        n_b,
+                        nu,
+                        subj_seed,
+                        scratch,
+                        iscale_min,
+                        iscale_max,
+                    );
+                    return subject_is_draws_with(
+                        &obs_nll,
+                        &center,
+                        &h_post,
+                        omega_joint_inv,
+                        log_det_joint,
+                        n_b,
+                        k_samples,
+                        nu,
+                        subj_seed,
+                        scratch,
+                        iscale,
+                        use_sobol,
+                        prior.mixture.as_ref(),
+                    );
+                }
+
                 let (center, h_post) = if run_inner {
                     // Proposal centred at the conditional mode with
                     // first-order-variance (Sheiner–Beal posterior) scale.
@@ -1239,7 +1422,6 @@ fn run_mcem(
                     );
                     (center, h_post)
                 };
-                let subj_seed = seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32);
 
                 // FREM: Rao-Blackwellised low-dimensional PK sampling. The
                 // conditional PK proposal is usually well matched, but a
@@ -1411,9 +1593,11 @@ fn run_mcem(
         }
 
         // ---- M-step Ω: weighted second moment, structurally masked + floored ----
+        // The η block of each subject's second moment: the whole matrix for an
+        // η-only subject, its leading `n_eta × n_eta` block for an IOV subject.
         let mut new_omega = DMatrix::<f64>::zeros(n_eta, n_eta);
         for d in &draws {
-            new_omega += &d.second_moment;
+            new_omega += d.second_moment.view((0, 0), (n_eta, n_eta));
         }
         new_omega /= n_subjects as f64;
         for i in 0..n_eta {
@@ -1430,6 +1614,15 @@ fn run_mcem(
         }
         floor_omega_diagonal(&mut new_omega, &init_params.omega_fixed, OMEGA_DIAG_FLOOR);
         omega_mat = new_omega;
+
+        // ---- M-step Ω_iov (#2301): weighted κ second moment over every occasion ----
+        if let (Some(cur), Some(template)) = (omega_iov_mat.as_mut(), omega_iov_init) {
+            if let Some(m) =
+                omega_iov_mstep(&draws, &n_occ_of, n_eta, template, &init_params.kappa_fixed)
+            {
+                *cur = m;
+            }
+        }
 
         // ---- M-step σ + non-mu-ref θ: maximize weighted observation likelihood ----
         // Pin the log-mu-ref θ (handled by the closed-form shift below) so NLopt
@@ -1572,7 +1765,9 @@ fn run_mcem(
                 // Read per group, not once before the loop: an earlier group's
                 // step re-centred the draws below, and the exact engine folds
                 // every other eta's mean into its target through Ω's cross terms.
-                let eta_means: Vec<Vec<f64>> = draws.iter().map(|d| d.mean.clone()).collect();
+                // The η part only: an IOV subject's mean is stacked [η, κ₁, …] (#2301).
+                let eta_means: Vec<Vec<f64>> =
+                    draws.iter().map(|d| d.mean[..n_eta].to_vec()).collect();
                 let input = GroupStepInput {
                     theta: &theta_now,
                     theta_lower: &init_params.theta_lower,
@@ -1597,14 +1792,8 @@ fn run_mcem(
                                     }
                                     let mut e2 = eta.clone();
                                     group.shift_eta(&mut e2, shifts, i);
-                                    s += w * obs_nll_subject_into(
-                                        model,
-                                        subject,
-                                        th,
-                                        &sigma_now,
-                                        model.residual_cov_theta(th),
-                                        &e2,
-                                        scratch,
+                                    s += w * draw_obs_nll(
+                                        model, subject, th, &sigma_now, &e2, scratch,
                                     );
                                 }
                                 s
@@ -1683,8 +1872,14 @@ fn run_mcem(
         // on iterations 2+, leaving the iter-1 modes in place for the final EBE
         // pass).
         if run_inner {
-            prev_etas = Some(eta_hats.clone());
-            last_eta_hats = eta_hats;
+            // Stacked `[η̂, κ̂]` for an IOV subject, so κ is warm-started too.
+            let warm: Vec<DVector<f64>> = eta_hats
+                .iter()
+                .zip(kappa_hats.iter())
+                .map(|(e, kap)| stack_eta_kappa(e, kap))
+                .collect();
+            prev_etas = Some(warm.clone());
+            last_eta_hats = warm;
         }
 
         // IMP recenters the next iteration's proposal from these draws; IMPMAP
@@ -1703,6 +1898,9 @@ fn run_mcem(
                 acc_sigma[i] += sigma_cur[i];
             }
             acc_omega += &omega_mat;
+            if let Some(m) = omega_iov_mat.as_ref() {
+                acc_omega_iov += m;
+            }
             n_acc += 1;
         }
 
@@ -1727,7 +1925,7 @@ fn run_mcem(
     // model (13 ETAs) drifts from ~2.6 (FOCEI/NONMEM) to ~4.6 at K=300 and
     // recovers toward ~2.8 at K=6000 — while the *median* ESS stays ~0.8 the
     // whole time, so ESS alone does not flag it. Use the per-dimension sample
-    // density K / n_eta as the trigger (≥ ~100 keeps the bias small here), plus
+    // density K / (sampled dimension) as the trigger (≥ ~100 keeps the bias small here), plus
     // any fully-collapsed subjects. Skip for eval-only IS (no M-step to bias).
     // Triggers, using the *effective* (possibly auto-ramped) sample count:
     //  - too few samples for the dimension (a fast proxy that catches the common
@@ -1735,11 +1933,15 @@ fn run_mcem(
     //  - the objective is still MC-noisy at the end (the direct measure — also
     //    fires when `auto` ramped to the cap and could not reach the target), or
     //  - a subject's proposal fully collapsed.
-    const MIN_SAMPLES_PER_ETA: usize = 100;
     // The dimension heuristic only applies when `auto` is off — with `auto` on,
     // a low starting count is fine because it ramps when (and only when) the
     // objective is actually noisy, so the direct MC-SE check is the only trigger.
-    let under_sampled = !auto && n_eta > 0 && final_k_samples < MIN_SAMPLES_PER_ETA * n_eta;
+    // The dimension is the widest sampled vector: an IOV subject samples its
+    // stacked `[η, κ₁..κ_K]`, and the Ω_iov M-step is biased by under-sampling
+    // just as the Ω one is (#2301).
+    let max_occ = n_occ_of.iter().copied().max().unwrap_or(0);
+    let sampled_dim = crate::stats::stacked_layout::stacked_width(n_eta, n_kappa, max_occ);
+    let under_sampled = !auto && n_eta > 0 && final_k_samples < MIN_SAMPLES_PER_DIM * sampled_dim;
     let noisy = final_mc_se > 2.0 * AUTO_STDOBJ_TARGET;
     if !options.imp_eval_only && (under_sampled || noisy || final_n_collapsed > 0) {
         let (sample_opt, auto_opt) = if recenter == ProposalRecenter::Map {
@@ -1769,12 +1971,12 @@ fn run_mcem(
             )
         };
         warnings.push(format!(
-            "{label}: {} importance samples for a {}-ETA model give a noisy objective \
+            "{label}: {} importance samples for {} give a noisy objective \
              (per-subject MC SE = {:.3}, target {:.2}; median ESS/K = {:.2}). The weighted M-step \
              moments then carry a finite-sample bias — typical-value and Ω estimates may be off, \
              and it shrinks only as the sample count grows. {}{}",
             final_k_samples,
-            n_eta,
+            sampled_dimension_phrase(n_eta, n_kappa, max_occ),
             final_mc_se,
             AUTO_STDOBJ_TARGET,
             final_ess_median,
@@ -1820,6 +2022,13 @@ fn run_mcem(
     } else {
         (theta_cur.clone(), sigma_cur.clone(), omega_mat.clone())
     };
+    let final_omega_iov_mat: Option<DMatrix<f64>> = if n_acc > 0 {
+        omega_iov_mat
+            .as_ref()
+            .map(|_| &acc_omega_iov / n_acc as f64)
+    } else {
+        omega_iov_mat.clone()
+    };
 
     let final_omega = OmegaMatrix::from_matrix(
         final_omega_mat,
@@ -1844,7 +2053,7 @@ fn run_mcem(
         // declared correlation structure.
         residual_correlations: init_params.residual_correlations.clone(),
         residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
-        omega_iov: None,
+        omega_iov: omega_iov_snapshot(init_params, final_omega_iov_mat.as_ref()),
         kappa_fixed: init_params.kappa_fixed.clone(),
         mixture: None,
     };
@@ -1856,7 +2065,7 @@ fn run_mcem(
         Some(last_eta_hats.as_slice())
     };
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _stats) = run_map_multistart(
+    let (eta_hats, h_matrices, final_kappas, _stats) = run_map_multistart(
         model,
         population,
         &final_params,
@@ -1868,7 +2077,7 @@ fn run_mcem(
         seed,
         n_iter + 1, // distinct iteration index for final EBEs
     );
-    let final_kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n_subjects];
+    check_kappa_blocks(population, &final_kappas, &n_occ_of, label)?;
 
     let ofv = 2.0
         * pop_nll(
@@ -2957,6 +3166,230 @@ fn run_mcem_mixture(
     })
 }
 
+/// Below this many importance samples per sampled dimension (with `auto` off),
+/// the IMP / IMPMAP M-step moments are flagged as under-sampled (see `run_mcem`).
+const MIN_SAMPLES_PER_DIM: usize = 100;
+
+/// The model the IMP / IMPMAP sample-count warning names: `n_eta` alone, or for
+/// IOV the widest stacked `[η, κ₁..κ_K]` a subject samples (#2301).
+fn sampled_dimension_phrase(n_eta: usize, n_kappa: usize, max_occ: usize) -> String {
+    if n_kappa == 0 || max_occ == 0 {
+        return format!("a {n_eta}-ETA model");
+    }
+    format!(
+        "a {n_eta}-ETA model with {n_kappa} κ on each of up to {max_occ} occasions \
+         ({} sampled dimensions per subject)",
+        crate::stats::stacked_layout::stacked_width(n_eta, n_kappa, max_occ)
+    )
+}
+
+/// The run's current Ω_iov as an [`OmegaMatrix`] carrying the declared
+/// structural mask (as SAEM does: a free off-diagonal that happens to be 0 must
+/// not be read as structural), or the template unchanged without IOV.
+fn omega_iov_snapshot(
+    init_params: &ModelParameters,
+    current: Option<&DMatrix<f64>>,
+) -> Option<OmegaMatrix> {
+    match (init_params.omega_iov.as_ref(), current) {
+        (Some(t), Some(m)) => Some(OmegaMatrix::from_matrix_with_mask(
+            m.clone(),
+            t.eta_names.clone(),
+            t.diagonal,
+            t.free_mask.clone(),
+        )),
+        _ => init_params.omega_iov.clone(),
+    }
+}
+
+/// The MAP sweep's κ̂ must have one block per occasion group the joint proposal
+/// samples (`n_occ_of`), or the stacked mode would be mis-assembled. The same
+/// guard `run_importance_sampling` applies, here on every sweep.
+fn check_kappa_blocks(
+    population: &Population,
+    kappas: &[Vec<DVector<f64>>],
+    n_occ_of: &[usize],
+    label: &str,
+) -> Result<(), String> {
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let got = kappas.get(i).map_or(0, Vec::len);
+        if got != n_occ_of[i] {
+            return Err(format!(
+                "{label}: subject {} has {got} κ occasion block(s) from the MAP step but {} \
+                 occasion group(s) in the data; the joint (η, κ) proposal needs them to match.",
+                subject.id, n_occ_of[i],
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `[η, κ₁..κ_K]` as one vector — the layout the joint proposal samples, the
+/// IOV inner loop warm-starts from, and [`draw_obs_nll`] reads. Just `η` when
+/// `kappas` is empty.
+fn stack_eta_kappa(eta: &DVector<f64>, kappas: &[DVector<f64>]) -> DVector<f64> {
+    let mut v: Vec<f64> = eta.iter().copied().collect();
+    for k in kappas {
+        v.extend(k.iter().copied());
+    }
+    DVector::from_vec(v)
+}
+
+/// The joint prior `Ω ⊕ I_K ⊗ Ω_iov` of an IOV subject with `K` occasions, the
+/// pieces of it the E-step reads, and its defensive component (#2301).
+struct JointPrior {
+    /// `(Ω ⊕ I_K ⊗ Ω_iov)⁻¹`.
+    inv: DMatrix<f64>,
+    /// `log det Ω + K · log det Ω_iov`.
+    log_det: f64,
+    /// `Ω ⊕ I_K ⊗ Ω_iov`, the IMP proposal-covariance cap.
+    matrix: DMatrix<f64>,
+    mixture: Option<crate::estimation::importance_sampling::DefensiveMixture>,
+}
+
+/// One [`JointPrior`] per distinct occasion count in the population, built once
+/// per MCEM iteration — the IOV twin of sharing the η-only defensive component
+/// across subjects (#528).
+struct JointPriors(std::collections::BTreeMap<usize, JointPrior>);
+
+impl JointPriors {
+    fn build(omega: &OmegaMatrix, iov: &OmegaMatrix, n_occ_of: &[usize], alpha: f64) -> Self {
+        let (n_eta, n_kappa) = (omega.matrix.nrows(), iov.matrix.nrows());
+        let mut map = std::collections::BTreeMap::new();
+        for &n_occ in n_occ_of.iter().filter(|&&k| k > 0) {
+            map.entry(n_occ).or_insert_with(|| {
+                let inv = build_joint_omega_inv(&omega.inv, &iov.inv, n_eta, n_kappa, n_occ);
+                let mixture = crate::estimation::importance_sampling::DefensiveMixture::new(
+                    &inv,
+                    stacked_width(n_eta, n_kappa, n_occ),
+                    alpha,
+                );
+                JointPrior {
+                    inv,
+                    log_det: omega.log_det + n_occ as f64 * iov.log_det,
+                    matrix: crate::stats::stacked_layout::block_diag_stack(
+                        &omega.matrix,
+                        &iov.matrix,
+                        n_occ,
+                    ),
+                    mixture,
+                }
+            });
+        }
+        Self(map)
+    }
+
+    fn get(&self, n_occ: usize) -> &JointPrior {
+        &self.0[&n_occ]
+    }
+}
+
+thread_local! {
+    /// Reused per-occasion κ split for [`draw_obs_nll`].
+    static KAPPA_SPLIT: std::cell::RefCell<Vec<Vec<f64>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Split the stacked κ part of a sample into `buf[..n_occ]`, one `n_kappa`
+/// block per occasion, reusing `buf`'s allocations; returns `n_occ`. Entries
+/// past `n_occ` are left over from a wider subject and must not be read.
+fn split_kappas(kappa_part: &[f64], n_kappa: usize, buf: &mut Vec<Vec<f64>>) -> usize {
+    let n_occ = kappa_part.len() / n_kappa;
+    if buf.len() < n_occ {
+        buf.resize_with(n_occ, Vec::new);
+    }
+    for (dst, src) in buf.iter_mut().zip(kappa_part.chunks(n_kappa)) {
+        dst.clear();
+        dst.extend_from_slice(src);
+    }
+    n_occ
+}
+
+/// `−log p(yᵢ | b, θ, σ)` at one importance sample `b` of a subject. `b` is η
+/// alone (scored exactly as before #2301), or an IOV subject's stacked
+/// `[η, κ₁..κ_K]`, scored with per-occasion predictions — the observation NLL
+/// SAEM's IOV M-step uses.
+fn draw_obs_nll(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    b: &[f64],
+    scratch: &mut EventPkParams,
+) -> f64 {
+    let n_eta = model.n_eta;
+    if b.len() > n_eta {
+        // Split κ into a per-thread buffer rather than `n_occ` fresh `Vec`s per
+        // sample: this runs K times per subject per iteration.
+        KAPPA_SPLIT.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            let n_occ = split_kappas(&b[n_eta..], model.n_kappa, &mut buf);
+            obs_nll_subject_into_iov(
+                model,
+                subject,
+                theta,
+                sigma,
+                &b[..n_eta],
+                &buf[..n_occ],
+                scratch,
+            )
+        })
+    } else {
+        obs_nll_subject_into(
+            model,
+            subject,
+            theta,
+            sigma,
+            model.residual_cov_theta(theta),
+            b,
+            scratch,
+        )
+    }
+}
+
+/// Closed-form Ω_iov M-step (#2301): the importance-weighted second moment of
+/// κ pooled over every occasion of every IOV subject,
+/// `Ω_iov = Σᵢ Σ_g E_w[κᵢg κᵢgᵀ] / Σᵢ Kᵢ`, read off the κ diagonal blocks of
+/// each subject's stacked second moment. Then the Ω treatment: structural
+/// off-diagonals zeroed, `FIX` rows/columns restored from `template`, free
+/// diagonal floored. `None` when no subject has an occasion (nothing to
+/// estimate from — Ω_iov is left where it was).
+fn omega_iov_mstep(
+    draws: &[SubjectDraws],
+    n_occ_of: &[usize],
+    n_eta: usize,
+    template: &OmegaMatrix,
+    kappa_fixed: &[bool],
+) -> Option<DMatrix<f64>> {
+    let n_kappa = template.matrix.nrows();
+    let mut m = DMatrix::<f64>::zeros(n_kappa, n_kappa);
+    let mut n_blocks = 0usize;
+    for (d, &n_occ) in draws.iter().zip(n_occ_of) {
+        for g in 0..n_occ {
+            let r = kappa_range(n_eta, n_kappa, g);
+            m += d.second_moment.view((r.start, r.start), (n_kappa, n_kappa));
+        }
+        n_blocks += n_occ;
+    }
+    if n_blocks == 0 {
+        return None;
+    }
+    m /= n_blocks as f64;
+    for i in 0..n_kappa {
+        for j in 0..n_kappa {
+            if !template.free_mask[(i, j)] {
+                m[(i, j)] = 0.0;
+            }
+            let fi = kappa_fixed.get(i).copied().unwrap_or(false);
+            let fj = kappa_fixed.get(j).copied().unwrap_or(false);
+            if fi || fj {
+                m[(i, j)] = template.matrix[(i, j)];
+            }
+        }
+    }
+    floor_omega_diagonal(&mut m, kappa_fixed, OMEGA_DIAG_FLOOR);
+    Some(m)
+}
+
 /// Extract the lower triangle of a square matrix in row-major order:
 /// `(0,0), (1,0), (1,1), (2,0), (2,1), (2,2), …`
 fn lower_triangle(m: &DMatrix<f64>) -> Vec<f64> {
@@ -2968,6 +3401,44 @@ fn lower_triangle(m: &DMatrix<f64>) -> Vec<f64> {
         }
     }
     out
+}
+
+/// The value the weighted θ/σ M-step minimizes at natural-space `theta` /
+/// `sigma`: `Σᵢ Σₖ w̃ᵢₖ · obs_nll(yᵢ | bᵢₖ, θ, σ)`, or `1e20` when that is not
+/// finite. Each sample `bᵢₖ` is scored by [`draw_obs_nll`], so an IOV subject's
+/// samples are scored with their own κ (#2301).
+fn weighted_mstep_objective(
+    model: &CompiledModel,
+    population: &Population,
+    draws: &[SubjectDraws],
+    theta: &[f64],
+    sigma: &[f64],
+) -> f64 {
+    // Reduce in subject order (collect then serial sum) so the objective is
+    // reproducible regardless of rayon worker count — a parallel `.sum()`
+    // folds along thread-count-dependent split points and f64 addition is
+    // non-associative (#703).
+    let per_subj: Vec<f64> = population
+        .subjects
+        .par_iter()
+        .zip(draws.par_iter())
+        .map_init(EventPkParams::default, |scratch, (subject, d)| {
+            let mut s = 0.0f64;
+            for (w, b) in d.weights.iter().zip(d.etas.iter()) {
+                if *w == 0.0 {
+                    continue;
+                }
+                s += w * draw_obs_nll(model, subject, theta, sigma, b, scratch);
+            }
+            s
+        })
+        .collect();
+    let val: f64 = per_subj.iter().sum();
+    if val.is_finite() {
+        val
+    } else {
+        1e20
+    }
 }
 
 /// Weighted θ/σ M-step: minimize the importance-weighted observation NLL
@@ -3025,39 +3496,7 @@ fn theta_sigma_weighted_mstep(
     let obj = |xv: &[f64], _: Option<&mut [f64]>, _: &mut ()| -> f64 {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
-        // Reduce in subject order (collect then serial sum) so the objective is
-        // reproducible regardless of rayon worker count — a parallel `.sum()`
-        // folds along thread-count-dependent split points and f64 addition is
-        // non-associative (#703).
-        let per_subj: Vec<f64> = population
-            .subjects
-            .par_iter()
-            .zip(draws.par_iter())
-            .map_init(EventPkParams::default, |scratch, (subject, d)| {
-                let mut s = 0.0f64;
-                for (w, eta) in d.weights.iter().zip(d.etas.iter()) {
-                    if *w == 0.0 {
-                        continue;
-                    }
-                    s += w * obs_nll_subject_into(
-                        model,
-                        subject,
-                        &th,
-                        &sg,
-                        model.residual_cov_theta(&th),
-                        eta,
-                        scratch,
-                    );
-                }
-                s
-            })
-            .collect();
-        let val: f64 = per_subj.iter().sum();
-        if val.is_finite() {
-            val
-        } else {
-            1e20
-        }
+        weighted_mstep_objective(model, population, draws, &th, &sg)
     };
 
     let mut opt = nlopt::Nlopt::new(
@@ -4995,5 +5434,704 @@ mod tests {
             out_theta[0],
             log_theta[0]
         );
+    }
+
+    // ── Inter-occasion variability (#2301) ──
+
+    fn iov_model() -> CompiledModel {
+        crate::parser::model_parser::parse_full_model(include_str!(
+            "../../examples/warfarin_iov.ferx"
+        ))
+        .expect("warfarin_iov parses")
+        .model
+    }
+
+    fn iov_pop() -> Population {
+        crate::read_nonmem_csv(
+            std::path::Path::new("data/warfarin_iov.csv"),
+            None,
+            Some("OCC"),
+        )
+        .expect("warfarin_iov.csv reads")
+    }
+
+    /// A draw set carrying only the given stacked second moment (the Ω_iov
+    /// M-step reads nothing else).
+    fn draws_with_second_moment(m: DMatrix<f64>) -> SubjectDraws {
+        let mut d = SubjectDraws::cancelled(m.nrows());
+        d.second_moment = m;
+        d
+    }
+
+    /// A symmetric `n × n` matrix with distinct entries, so a block read from
+    /// the wrong offset cannot coincide with the right one.
+    fn distinct_spd(n: usize, seed: f64) -> DMatrix<f64> {
+        DMatrix::from_fn(n, n, |i, j| {
+            let (a, b) = (i.min(j) as f64, i.max(j) as f64);
+            if i == j {
+                1.0 + seed + 0.1 * a
+            } else {
+                0.01 * (seed + a + 3.0 * b)
+            }
+        })
+    }
+
+    /// `Ω_iov = Σᵢ Σ_g E_w[κκᵀ] / Σᵢ Kᵢ`: pooled over every occasion block of
+    /// every subject (here 2 + 1 occasions; the η-only subject contributes
+    /// none), read from the κ blocks — not the η block or an off-diagonal
+    /// η/κ block — and divided by the occasion count, not the subject count.
+    #[test]
+    fn omega_iov_mstep_pools_kappa_blocks_over_every_occasion() {
+        let (n_eta, n_kappa) = (1usize, 2usize);
+        let a = distinct_spd(n_eta + 2 * n_kappa, 0.0); // 2 occasions
+        let b = distinct_spd(n_eta + n_kappa, 5.0); // 1 occasion
+        let c = distinct_spd(n_eta, 9.0); // no occasion: η only
+        let draws = vec![
+            draws_with_second_moment(a.clone()),
+            draws_with_second_moment(b.clone()),
+            draws_with_second_moment(c),
+        ];
+        let n_occ_of = [2usize, 1, 0];
+        let want = (a.view((1, 1), (2, 2)).into_owned()
+            + a.view((3, 3), (2, 2)).into_owned()
+            + b.view((1, 1), (2, 2)).into_owned())
+            / 3.0;
+
+        let names = vec!["K1".to_string(), "K2".to_string()];
+        let full = OmegaMatrix::from_matrix_with_mask(
+            DMatrix::from_diagonal_element(2, 2, 0.04),
+            names.clone(),
+            false,
+            DMatrix::from_element(2, 2, true),
+        );
+        let got = omega_iov_mstep(&draws, &n_occ_of, n_eta, &full, &[false, false])
+            .expect("three occasions to estimate from");
+        assert!((&got - &want).abs().max() < 1e-15, "got {got}, want {want}");
+
+        // A diagonal template zeroes the off-diagonal; a FIXed κ keeps its
+        // declared row and column.
+        let diag = OmegaMatrix::from_matrix_with_mask(
+            DMatrix::from_diagonal_element(2, 2, 0.04),
+            names,
+            true,
+            DMatrix::from_fn(2, 2, |i, j| i == j),
+        );
+        let got = omega_iov_mstep(&draws, &n_occ_of, n_eta, &diag, &[false, true]).unwrap();
+        assert_eq!(got[(0, 1)], 0.0);
+        assert_eq!(got[(1, 0)], 0.0);
+        assert_eq!(got[(1, 1)], 0.04, "FIXed κ keeps its declared variance");
+        assert!((got[(0, 0)] - want[(0, 0)]).abs() < 1e-15);
+
+        // A free diagonal that collapses is floored, so Ω_iov stays PD.
+        let tiny = vec![draws_with_second_moment(DMatrix::from_diagonal_element(
+            n_eta + n_kappa,
+            n_eta + n_kappa,
+            1e-12,
+        ))];
+        let got = omega_iov_mstep(&tiny, &[1], n_eta, &full, &[false, false]).unwrap();
+        assert_eq!(got[(0, 0)], OMEGA_DIAG_FLOOR);
+
+        // No occasion anywhere: nothing to estimate from.
+        let none = vec![draws_with_second_moment(DMatrix::identity(n_eta, n_eta))];
+        assert!(omega_iov_mstep(&none, &[0], n_eta, &full, &[false, false]).is_none());
+    }
+
+    /// An IOV subject's stacked sample is scored with per-occasion predictions:
+    /// at κ = 0 that is the η-only likelihood, and a non-zero κ moves it. An
+    /// η-only sample is scored exactly as before #2301. Either half alone is
+    /// satisfied by a scorer that ignores κ.
+    #[test]
+    fn draw_obs_nll_scores_kappa_on_iov_samples_only() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let subject = &pop.subjects[0];
+        let n_occ = crate::stats::stacked_layout::group_count(subject);
+        assert_eq!(n_occ, 2, "fixture subject has two occasions");
+        let theta = &model.default_params.theta;
+        let sigma = &model.default_params.sigma.values;
+        let mut scratch = EventPkParams::default();
+        let eta = [0.1, -0.05, 0.2];
+
+        let plain = obs_nll_subject_into(
+            &model,
+            subject,
+            theta,
+            sigma,
+            model.residual_cov_theta(theta),
+            &eta,
+            &mut scratch,
+        );
+        let eta_only = draw_obs_nll(&model, subject, theta, sigma, &eta, &mut scratch);
+        assert_eq!(eta_only, plain, "an η-only sample is scored unchanged");
+
+        let mut b = eta.to_vec();
+        b.extend([0.0, 0.0]);
+        let at_zero = draw_obs_nll(&model, subject, theta, sigma, &b, &mut scratch);
+        assert!(
+            (at_zero - plain).abs() < 1e-9 * plain.abs().max(1.0),
+            "κ = 0 must reproduce the η-only NLL: {at_zero} vs {plain}"
+        );
+
+        b[eta.len() + 1] = 0.5; // κ on the second occasion only
+        let moved = draw_obs_nll(&model, subject, theta, sigma, &b, &mut scratch);
+        assert!(
+            (moved - at_zero).abs() > 1e-3,
+            "a non-zero κ must change the score: {moved} vs {at_zero}"
+        );
+    }
+
+    /// The θ/σ M-step objective scores each IOV sample with its own κ: the same
+    /// draws with every κ zeroed must give a different value, while the η part
+    /// is held fixed. A M-step that dropped κ (scoring `b[..n_eta]`) would
+    /// return the zeroed value for both.
+    #[test]
+    fn weighted_mstep_objective_reads_each_samples_kappa() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let n_eta = model.n_eta;
+        let theta = &model.default_params.theta;
+        let sigma = &model.default_params.sigma.values;
+        let draws_with = |kappa: f64| -> Vec<SubjectDraws> {
+            pop.subjects
+                .iter()
+                .map(|s| {
+                    let n_occ = crate::stats::stacked_layout::group_count(s);
+                    let b = |sign: f64| {
+                        let mut v = vec![0.05 * sign; n_eta];
+                        v.extend((0..n_occ).map(|g| sign * kappa * (g as f64 + 1.0)));
+                        v
+                    };
+                    let mut d = SubjectDraws::cancelled(n_eta);
+                    d.etas = vec![b(1.0), b(-1.0)];
+                    d.weights = vec![0.4, 0.6];
+                    d
+                })
+                .collect()
+        };
+        let live = weighted_mstep_objective(&model, &pop, &draws_with(0.3), theta, sigma);
+        let zero = weighted_mstep_objective(&model, &pop, &draws_with(0.0), theta, sigma);
+        assert!(
+            live.is_finite() && live < 1e19,
+            "objective must be real: {live}"
+        );
+        assert!(
+            zero.is_finite() && zero < 1e19,
+            "objective must be real: {zero}"
+        );
+        assert!(
+            (live - zero).abs() > 1e-2,
+            "κ must enter the M-step objective: {live} vs {zero} at κ = 0"
+        );
+    }
+
+    /// End to end on warfarin IOV: IMPMAP and IMP both return Ω_iov, move it
+    /// off its start, and report per-occasion κ̂ for every subject.
+    #[test]
+    fn imp_and_impmap_estimate_an_iov_model() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = model.default_params.clone();
+        let start = params.omega_iov.as_ref().expect("IOV model").matrix[(0, 0)];
+
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 3;
+        opts.impmap_samples = 100;
+        opts.impmap_seed = Some(3);
+        opts.imp_iterations = 3;
+        opts.imp_samples = 100;
+        opts.imp_seed = Some(3);
+        opts.run_covariance_step = false;
+
+        for (name, res) in [
+            ("impmap", run_impmap(&model, &pop, &params, None, &opts)),
+            ("imp", run_imp(&model, &pop, &params, None, &opts)),
+        ] {
+            let res = res.unwrap_or_else(|e| panic!("{name} on an IOV model: {e}"));
+            assert!(res.ofv.is_finite(), "{name}: ofv {}", res.ofv);
+            let iov = res
+                .params
+                .omega_iov
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: Ω_iov missing from the result"));
+            let est = iov.matrix[(0, 0)];
+            assert!(est.is_finite() && est > 0.0, "{name}: Ω_iov = {est}");
+            assert!(
+                (est - start).abs() > 1e-4,
+                "{name}: Ω_iov never left its start ({start} → {est})"
+            );
+            assert_eq!(res.kappas.len(), pop.subjects.len());
+            for (i, k) in res.kappas.iter().enumerate() {
+                assert_eq!(k.len(), 2, "{name}: subject {i} κ̂ blocks");
+            }
+        }
+    }
+
+    /// #2301's degenerate oracle: with Ω_iov FIXed at ~0 the κ draws carry no
+    /// variance, so an IOV fit must reproduce the same model without `[iov]`.
+    /// Unlike the κ = 0 scorer check, this runs the joint proposal, the stacked
+    /// moments and the η-block slice of the Ω M-step.
+    #[test]
+    fn iov_with_vanishing_omega_iov_matches_the_eta_only_fit() {
+        let src = include_str!("../../examples/warfarin_iov.ferx");
+        let parse = |s: &str| {
+            crate::parser::model_parser::parse_full_model(s)
+                .expect("parses")
+                .model
+        };
+        let degenerate = parse(&src.replace("kappa KAPPA_CL ~ 0.01", "kappa KAPPA_CL ~ 1e-8 FIX"));
+        let eta_only = parse(
+            &src.replace("  kappa KAPPA_CL ~ 0.01\n", "")
+                .replace(" + KAPPA_CL", ""),
+        );
+        assert_eq!(degenerate.n_kappa, 1);
+        assert_eq!(eta_only.n_kappa, 0);
+        let pop = iov_pop();
+
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 5;
+        opts.impmap_samples = 300;
+        opts.impmap_seed = Some(7);
+        opts.imp_iterations = 5;
+        opts.imp_samples = 300;
+        opts.imp_seed = Some(7);
+        opts.run_covariance_step = false;
+
+        type Runner = fn(
+            &CompiledModel,
+            &Population,
+            &ModelParameters,
+            Option<&[DVector<f64>]>,
+            &FitOptions,
+        ) -> Result<OuterResult, String>;
+        for (name, run) in [("impmap", run_impmap as Runner), ("imp", run_imp as Runner)] {
+            let a = run(&degenerate, &pop, &degenerate.default_params, None, &opts)
+                .unwrap_or_else(|e| panic!("{name} degenerate IOV: {e}"));
+            let b = run(&eta_only, &pop, &eta_only.default_params, None, &opts)
+                .unwrap_or_else(|e| panic!("{name} η-only: {e}"));
+            let mut worst = 0.0f64;
+            let rel = |x: f64, y: f64| (x - y).abs() / y.abs().max(1e-12);
+            for (x, y) in a.params.theta.iter().zip(&b.params.theta) {
+                assert!(x.is_finite() && y.is_finite());
+                worst = worst.max(rel(*x, *y));
+            }
+            for i in 0..eta_only.n_eta {
+                let (x, y) = (a.params.omega.matrix[(i, i)], b.params.omega.matrix[(i, i)]);
+                assert!(x.is_finite() && y.is_finite());
+                worst = worst.max(rel(x, y));
+            }
+            for (x, y) in a.params.sigma.values.iter().zip(&b.params.sigma.values) {
+                assert!(x.is_finite() && y.is_finite());
+                worst = worst.max(rel(*x, *y));
+            }
+            eprintln!(
+                "{name}: worst relative gap {worst:.3e}; θ {:?} vs {:?}; Ω {:?} vs {:?}",
+                a.params.theta,
+                b.params.theta,
+                a.params.omega.matrix.diagonal().as_slice(),
+                b.params.omega.matrix.diagonal().as_slice(),
+            );
+            // Measured (macOS arm64): worst 1.6e-2 (impmap) and 2.6e-2 (imp), the
+            // Monte-Carlo gap between two different random streams (the stacked
+            // draw is wider). 0.1 is ~4× the larger.
+            assert!(worst < 0.1, "{name}: worst relative gap {worst:.3e}");
+        }
+    }
+
+    /// `run_importance_sampling`'s joint (η, κ) estimate at `params`, with 2000
+    /// samples around the EBEs found there — the separate estimator the IMPMAP
+    /// trace is checked against below.
+    fn joint_is_at(
+        model: &CompiledModel,
+        pop: &Population,
+        params: &ModelParameters,
+    ) -> ImportanceSamplingResult {
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 2000;
+        opts.imp_seed = Some(5);
+        let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
+        let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
+            model,
+            pop,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            &mu_k,
+            0,
+            11,
+            1,
+        );
+        crate::estimation::importance_sampling::run_importance_sampling(
+            model,
+            pop,
+            params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &opts,
+        )
+        .expect("joint IS on an IOV model")
+    }
+
+    /// The trace −2LL of an IOV fit is the joint (η, κ) marginal. Iteration 1's
+    /// E-step runs at the start values, so its row must agree with
+    /// `run_importance_sampling`, a separate joint estimator
+    /// (`subject_is_estimate_joint`), at the same parameters. Dropping the
+    /// `n_occ · log det Ω_iov` term from `log_det_joint` moves the trace by
+    /// `Σᵢ Kᵢ · |ln det Ω_iov|`, far outside the bound below.
+    #[test]
+    fn impmap_iov_trace_ofv_matches_the_joint_is_marginal() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = model.default_params.clone();
+
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 1;
+        opts.impmap_samples = 2000;
+        opts.impmap_seed = Some(11);
+        opts.impmap_trace = true;
+        opts.run_covariance_step = false;
+
+        let res = run_impmap(&model, &pop, &params, None, &opts).expect("impmap on an IOV model");
+        let trace = res.impmap_trace.as_ref().expect("impmap_trace requested");
+        let row = trace
+            .rows
+            .iter()
+            .find(|r| r.iteration == 1)
+            .expect("iteration 1 row");
+        assert!(row.ofv.is_finite(), "trace ofv {}", row.ofv);
+
+        let is = joint_is_at(&model, &pop, &params);
+        assert!(is.minus2_log_likelihood.is_finite());
+
+        let iov = params.omega_iov.as_ref().expect("IOV model");
+        let n_occ_total: usize = pop
+            .subjects
+            .iter()
+            .map(crate::stats::stacked_layout::group_count)
+            .sum();
+        let m1_shift = n_occ_total as f64 * iov.log_det.abs();
+        let gap = (row.ofv - is.minus2_log_likelihood).abs();
+        eprintln!(
+            "trace {} vs IS {} (gap {gap}, IS mcse {}); dropping the κ prior's log-det moves it by {m1_shift}",
+            row.ofv, is.minus2_log_likelihood, is.mc_standard_error
+        );
+        // Measured (macOS arm64, 2000 samples each): gap 0.029 against an IS MC SE
+        // of 0.10; dropping the κ log-det moves the trace by 92. 0.5 is ~5 MC SE.
+        assert!(
+            gap < 0.5,
+            "trace {} vs IS {}: gap {gap}",
+            row.ofv,
+            is.minus2_log_likelihood
+        );
+        assert!(
+            m1_shift > 10.0,
+            "the fixture must make the κ log-det term visible"
+        );
+    }
+
+    #[test]
+    fn sampled_dimension_phrase_names_the_stacked_kappa_dimensions_only_for_iov() {
+        let iov = sampled_dimension_phrase(3, 1, 2);
+        assert_eq!(
+            iov,
+            "a 3-ETA model with 1 κ on each of up to 2 occasions (5 sampled dimensions per subject)"
+        );
+        // No IOV, or IOV declared but no subject has occasions: η alone.
+        assert_eq!(sampled_dimension_phrase(3, 0, 0), "a 3-ETA model");
+        assert_eq!(sampled_dimension_phrase(3, 1, 0), "a 3-ETA model");
+    }
+
+    /// The under-sampling trigger counts the stacked `[η, κ₁..κ_K]` width: at
+    /// K = 400 with `auto` off, warfarin_iov (3 η + 2 κ = 5 dimensions, needing
+    /// 500) warns and names 5 dimensions, while the same model without `[iov]`
+    /// (3 dimensions, needing 300) does not. Under the old `100 · n_eta` rule
+    /// neither warned, so the IOV leg straddles the change.
+    #[test]
+    fn imp_sample_count_warning_counts_the_stacked_kappa_dimensions() {
+        let src = include_str!("../../examples/warfarin_iov.ferx");
+        let parse = |s: &str| {
+            crate::parser::model_parser::parse_full_model(s)
+                .expect("parses")
+                .model
+        };
+        let iov = parse(src);
+        let eta_only = parse(
+            &src.replace("  kappa KAPPA_CL ~ 0.01\n", "")
+                .replace(" + KAPPA_CL", ""),
+        );
+        let pop = iov_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 400;
+        opts.impmap_auto = false;
+        opts.impmap_seed = Some(3);
+        opts.run_covariance_step = false;
+        assert!(400 < MIN_SAMPLES_PER_DIM * 5 && 400 >= MIN_SAMPLES_PER_DIM * 3);
+
+        let sample_warning = |model: &CompiledModel| -> Option<String> {
+            let res =
+                run_impmap(model, &pop, &model.default_params, None, &opts).expect("impmap runs");
+            res.warnings
+                .into_iter()
+                .find(|w| w.contains("importance samples for"))
+        };
+        let w =
+            sample_warning(&iov).expect("an IOV fit at K = 400 is under-sampled for 5 dimensions");
+        assert!(
+            w.contains("400 importance samples for a 3-ETA model with 1 κ on each of up to 2 occasions (5 sampled dimensions per subject)"),
+            "{w}"
+        );
+        assert_eq!(
+            sample_warning(&eta_only),
+            None,
+            "3 dimensions at K = 400 is enough"
+        );
+    }
+
+    /// An `mceta` random start for an IOV subject covers κ (#2301): it is the
+    /// stacked `[η, κ₁..κ_K]`, η from N(0, Ω) and every occasion's κ from
+    /// N(0, Ω_iov) — not κ restarted at 0. Without κ it is the pre-IOV draw.
+    #[test]
+    fn random_start_draws_each_occasions_kappa_from_omega_iov() {
+        let omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.02, 0.02, 0.04]);
+        let omega_iov = DMatrix::from_row_slice(1, 1, &[0.25]);
+        let l_omega = omega.clone().cholesky().unwrap().l();
+        let l_iov = omega_iov.clone().cholesky().unwrap().l();
+
+        // η alone: exactly L_Ω·z from the same stream.
+        let mut a = StdRng::seed_from_u64(9);
+        let mut b = StdRng::seed_from_u64(9);
+        let z: Vec<f64> = (0..2).map(|_| StandardNormal.sample(&mut b)).collect();
+        let want: Vec<f64> = (&l_omega * DVector::from_vec(z)).iter().copied().collect();
+        assert_eq!(random_start(&mut a, &l_omega, None), want);
+
+        // Stacked: 2 η + 3 occasions × 1 κ, with the declared variances.
+        let n = 20_000;
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut sum2 = [0.0f64; 5];
+        for _ in 0..n {
+            let s = random_start(&mut rng, &l_omega, Some((&l_iov, 3)));
+            assert_eq!(s.len(), 5);
+            for (acc, v) in sum2.iter_mut().zip(&s) {
+                *acc += v * v;
+            }
+        }
+        let var: Vec<f64> = sum2.iter().map(|s| s / n as f64).collect();
+        let want = [0.09, 0.04, 0.25, 0.25, 0.25];
+        for (k, (got, w)) in var.iter().zip(want).enumerate() {
+            // 20 000 draws: relative SE of a variance is sqrt(2/n) = 1%; 5% bound.
+            assert!(
+                (got / w - 1.0).abs() < 0.05,
+                "coordinate {k}: var {got} vs {w}"
+            );
+        }
+    }
+
+    /// The κ draw is wired in for exactly the subjects whose inner solve is the
+    /// stacked one: an IOV subject with restarts requested.
+    #[test]
+    fn kappa_start_chol_is_set_only_for_iov_subjects_with_restarts() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = &model.default_params;
+        let subject = &pop.subjects[0];
+        let l = kappa_start_chol(&model, subject, params, 3).expect("IOV subject, mceta = 3");
+        let var = params.omega_iov.as_ref().unwrap().matrix[(0, 0)];
+        assert!((l[(0, 0)] * l[(0, 0)] - var).abs() < 1e-15);
+        assert!(
+            kappa_start_chol(&model, subject, params, 0).is_none(),
+            "no restarts"
+        );
+
+        let src = include_str!("../../examples/warfarin_iov.ferx");
+        let eta_only = crate::parser::model_parser::parse_full_model(
+            &src.replace("  kappa KAPPA_CL ~ 0.01\n", "")
+                .replace(" + KAPPA_CL", ""),
+        )
+        .expect("parses")
+        .model;
+        assert!(kappa_start_chol(&eta_only, subject, &eta_only.default_params, 3).is_none());
+    }
+
+    /// With κ in the restarts, an IOV subject's multistart still returns a full
+    /// set of κ̂ blocks and never a worse mode than the baseline start.
+    #[test]
+    fn find_ebe_multistart_on_an_iov_subject_is_never_worse_than_baseline() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = &model.default_params;
+        let chol = params.omega.matrix.clone().cholesky().unwrap().l();
+        for subject in pop.subjects.iter().take(4) {
+            let n_occ = crate::stats::stacked_layout::group_count(subject);
+            let base =
+                find_ebe_multistart(&model, subject, params, 50, 1e-4, None, None, 0, 0, None, 7);
+            let multi = find_ebe_multistart(
+                &model,
+                subject,
+                params,
+                50,
+                1e-4,
+                None,
+                None,
+                0,
+                4,
+                Some(&chol),
+                7,
+            );
+            assert!(base.nll.is_finite() && multi.nll.is_finite());
+            assert!(
+                multi.nll <= base.nll + 1e-12,
+                "{} vs {}",
+                multi.nll,
+                base.nll
+            );
+            assert_eq!(multi.kappas.len(), n_occ, "subject {}", subject.id);
+        }
+    }
+
+    /// `find_ebe_multistart` hands the κ draw to the IOV inner solve. With
+    /// `inner_maxiter = 0` the solve returns (essentially) its start, so the
+    /// winning restart's κ̂ is its drawn κ — a draw from N(0, Ω_iov = 0.01), not
+    /// the 0 (or the solver's 2.5e-4 nudge) every start had before #2301's
+    /// review. Measured: the winners' |κ| reach 0.095; 0.005 is 20× the nudge.
+    #[test]
+    fn find_ebe_multistart_restarts_carry_their_kappa_draw_into_the_iov_solve() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = &model.default_params;
+        let chol = params.omega.matrix.clone().cholesky().unwrap().l();
+        let mut largest = 0.0f64;
+        for subject in &pop.subjects {
+            let multi = find_ebe_multistart(
+                &model,
+                subject,
+                params,
+                0,
+                1e-4,
+                None,
+                None,
+                0,
+                4,
+                Some(&chol),
+                7,
+            );
+            for k in multi.kappas.iter().flat_map(|b| b.iter()) {
+                assert!(k.is_finite());
+                largest = largest.max(k.abs());
+            }
+        }
+        assert!(
+            largest > 0.005,
+            "no restart carried a drawn κ: max |κ̂| = {largest}"
+        );
+    }
+
+    /// The per-K cache holds exactly what each IOV subject built for itself
+    /// before it existed: the joint inverse, log-det and prior matrix of its own
+    /// occasion count — bit for bit — and one entry per distinct K > 0.
+    #[test]
+    fn joint_priors_match_the_per_subject_construction_for_each_occasion_count() {
+        let omega = OmegaMatrix::from_matrix(
+            DMatrix::from_row_slice(2, 2, &[0.09, 0.02, 0.02, 0.04]),
+            vec!["A".into(), "B".into()],
+            false,
+        );
+        let iov = OmegaMatrix::from_matrix(
+            DMatrix::from_row_slice(1, 1, &[0.25]),
+            vec!["K".into()],
+            true,
+        );
+        let priors = JointPriors::build(&omega, &iov, &[2, 0, 1, 2, 3], 0.1);
+        assert_eq!(priors.0.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        for k in [1usize, 2, 3] {
+            let p = priors.get(k);
+            assert_eq!(
+                p.inv,
+                build_joint_omega_inv(&omega.inv, &iov.inv, 2, 1, k),
+                "K = {k}"
+            );
+            assert_eq!(p.log_det, omega.log_det + k as f64 * iov.log_det, "K = {k}");
+            assert_eq!(
+                p.matrix,
+                crate::stats::stacked_layout::block_diag_stack(&omega.matrix, &iov.matrix, k),
+                "K = {k}"
+            );
+            assert_eq!(p.inv.nrows(), 2 + k, "K = {k}");
+            assert!(
+                p.mixture.is_some(),
+                "α = 0.1 builds the defensive component"
+            );
+        }
+    }
+
+    /// The reused κ split must score every sample exactly as fresh `Vec`s did,
+    /// including a narrower subject scored right after a wider one on the same
+    /// thread. (Passing the whole buffer, stale blocks included, is an
+    /// equivalent mutation today — the scorer reads one block per occasion —
+    /// so `split_kappas`'s own test pins the slice contract.)
+    #[test]
+    fn draw_obs_nll_with_a_reused_kappa_buffer_matches_fresh_vecs() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let theta = &model.default_params.theta;
+        let sigma = &model.default_params.sigma.values;
+        let mut scratch = EventPkParams::default();
+        let fresh = |subject: &Subject, b: &[f64], scratch: &mut EventPkParams| {
+            let kappas: Vec<Vec<f64>> = b[3..].chunks(1).map(<[f64]>::to_vec).collect();
+            obs_nll_subject_into_iov(&model, subject, theta, sigma, &b[..3], &kappas, scratch)
+        };
+        // warfarin_iov subjects all have two occasions; a copy with every record
+        // on its first occasion has one.
+        let mut subjects: Vec<Subject> = Vec::new();
+        for s in pop.subjects.iter().take(4) {
+            let first = s.occasions[0];
+            let mut narrow = s.clone();
+            narrow.occasions.iter_mut().for_each(|o| *o = first);
+            narrow.dose_occasions.iter_mut().for_each(|o| *o = first);
+            narrow.pk_only_occasions.iter_mut().for_each(|o| *o = first);
+            narrow.reset_occasions.iter_mut().for_each(|o| *o = first);
+            subjects.push(s.clone());
+            subjects.push(narrow);
+        }
+        let widths: Vec<usize> = subjects
+            .iter()
+            .map(crate::stats::stacked_layout::group_count)
+            .collect();
+        assert!(
+            widths.windows(2).any(|w| w[0] > w[1]),
+            "the fixture must score a narrower subject after a wider one: {widths:?}"
+        );
+        for (n, subject) in subjects.iter().enumerate() {
+            let mut b = vec![0.1, -0.05, 0.2];
+            b.extend(
+                (0..widths[n])
+                    .map(|g| 0.03 * (g as f64 + 1.0) * if n % 4 < 2 { 1.0 } else { -1.0 }),
+            );
+            let got = draw_obs_nll(&model, subject, theta, sigma, &b, &mut scratch);
+            assert!(got.is_finite());
+            assert_eq!(
+                got,
+                fresh(subject, &b, &mut scratch),
+                "subject {} (call {n})",
+                subject.id
+            );
+        }
+    }
+
+    /// `split_kappas` reuses the buffer's allocations: after a wider sample the
+    /// first `n_occ` blocks hold exactly the narrower sample's κ (each block
+    /// cleared before refilling), and the returned count excludes the rest.
+    #[test]
+    fn split_kappas_refills_the_reused_blocks_and_counts_only_this_sample() {
+        let mut buf = Vec::new();
+        assert_eq!(
+            split_kappas(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, &mut buf),
+            3
+        );
+        assert_eq!(buf, vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]);
+        assert_eq!(split_kappas(&[7.0, 8.0], 2, &mut buf), 1);
+        assert_eq!(buf[..1], [vec![7.0, 8.0]]);
+        assert_eq!(buf.len(), 3, "the wider sample's allocations are kept");
     }
 }

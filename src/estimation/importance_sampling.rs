@@ -1532,6 +1532,60 @@ pub(crate) fn subject_is_draws(
     use_sobol: bool,
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectDraws {
+    let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
+        obs_nll_subject_into(
+            model,
+            subject,
+            theta,
+            sigma,
+            model.residual_cov_theta(theta),
+            eta,
+            scratch,
+        )
+    };
+    subject_is_draws_with(
+        &obs_nll,
+        eta_hat,
+        h,
+        omega_inv,
+        log_det_omega,
+        d,
+        k_samples,
+        nu,
+        seed,
+        scratch,
+        iscale,
+        use_sobol,
+        mixture,
+    )
+}
+
+/// The observation NLL `−log p(yᵢ | b, θ, σ)` of one subject at a sampled
+/// random-effect vector `b`: η alone ([`subject_is_draws`]), or the stacked
+/// `[η, κ₁..κ_K]` of an IOV subject (the IMP/IMPMAP E-step, #2301).
+pub(crate) type SampleObsNll<'a> = dyn Fn(&[f64], &mut EventPkParams) -> f64 + 'a;
+
+/// [`subject_is_draws`] with the per-sample observation NLL supplied by the
+/// caller, so the same proposal, weighting and moment code serves the η-only
+/// and the joint (η, κ) sampling of an IOV subject (#2301). `omega_inv` /
+/// `log_det_omega` are the prior of the whole `d`-vector being sampled, and so
+/// is the defensive `mixture`'s broad component.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn subject_is_draws_with(
+    obs_nll: &SampleObsNll<'_>,
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    k_samples: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    iscale: f64,
+    use_sobol: bool,
+    mixture: Option<&DefensiveMixture>,
+) -> SubjectDraws {
     let mvn = !nu.is_finite();
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -1620,16 +1674,7 @@ pub(crate) fn subject_is_draws(
             }
         }
 
-        let obs_nll = obs_nll_subject_into(
-            model,
-            subject,
-            theta,
-            sigma,
-            model.residual_cov_theta(theta),
-            &eta_sample,
-            scratch,
-        );
-        let log_p_y = -obs_nll;
+        let log_p_y = -obs_nll(&eta_sample, scratch);
 
         let mut quad_form = 0.0_f64;
         for i in 0..d {
@@ -1750,13 +1795,53 @@ pub(crate) fn find_optimal_iscale(
     iscale_min: f64,
     iscale_max: f64,
 ) -> f64 {
-    const N_PILOT: usize = 50;
-    iscale_pilot_grid_search(iscale_min, iscale_max, seed, |scale, pilot_seed| {
-        let draws = subject_is_draws(
+    let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
+        obs_nll_subject_into(
             model,
             subject,
             theta,
             sigma,
+            model.residual_cov_theta(theta),
+            eta,
+            scratch,
+        )
+    };
+    find_optimal_iscale_with(
+        &obs_nll,
+        eta_hat,
+        h,
+        omega_inv,
+        log_det_omega,
+        d,
+        nu,
+        seed,
+        scratch,
+        iscale_min,
+        iscale_max,
+    )
+}
+
+/// [`find_optimal_iscale`] with the per-sample observation NLL supplied by the
+/// caller — the pilot twin of [`subject_is_draws_with`], so a joint (η, κ)
+/// proposal is tuned on the joint ESS (#2301).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_optimal_iscale_with(
+    obs_nll: &SampleObsNll<'_>,
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    iscale_min: f64,
+    iscale_max: f64,
+) -> f64 {
+    const N_PILOT: usize = 50;
+    iscale_pilot_grid_search(iscale_min, iscale_max, seed, |scale, pilot_seed| {
+        let draws = subject_is_draws_with(
+            obs_nll,
             eta_hat,
             h,
             omega_inv,
@@ -1855,7 +1940,7 @@ fn kappa_fd_forced() -> bool {
 /// The Hessian is H_post = J' R^{-1} J + Omega_joint^{-1} where J is the
 /// Jacobian of predictions w.r.t. b.
 #[allow(clippy::too_many_arguments)]
-fn compute_joint_posterior_hessian(
+pub(crate) fn compute_joint_posterior_hessian(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],

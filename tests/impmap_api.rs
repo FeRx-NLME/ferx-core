@@ -1,7 +1,7 @@
 //! Integration tests for the IMPMAP estimator (`method = importance_sampling_map`).
 //!
 //! Tier 2 (fast, default PR job): wire-up and validation — IMPMAP runs standalone
-//! and as a chain stage, returns finite estimates, and refuses IOV models. These
+//! and as a chain stage, returns finite estimates, and fits IOV models. These
 //! cap iterations aggressively; convergence *quality* is asserted in the Tier-3
 //! slow suite below.
 
@@ -365,26 +365,36 @@ fn focei_impmap_imp_chain_produces_covariance_and_is_result() {
     );
 }
 
+/// IOV through the public `fit()` (#2301): validation lets it through, and the
+/// result carries Ω_IOV, per-occasion κ̂ and a κ-marginalised IS objective.
 #[test]
-fn impmap_rejects_iov_models() {
+fn impmap_fits_iov_models() {
     let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
         .expect("warfarin_iov model must parse");
-    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, None)
+    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
         .expect("warfarin_iov data must load");
     let mut opts = FitOptions::default();
     opts.verbose = false;
     opts.run_covariance_step = false;
     opts.method = EstimationMethod::Impmap;
     opts.impmap_iterations = 3;
+    opts.impmap_samples = 100;
+    opts.impmap_seed = Some(1);
 
-    let err = fit(&model, &population, &model.default_params, &opts)
-        .err()
-        .expect("impmap on an IOV model must be rejected (v1)")
-        .to_string();
-    assert!(
-        err.to_lowercase().contains("inter-occasion") || err.contains("IOV"),
-        "expected IOV-not-supported error, got: {err}"
-    );
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .unwrap_or_else(|e| panic!("impmap on an IOV model: {e}"));
+    let iov = result.omega_iov.as_ref().expect("Ω_IOV in the result");
+    assert!(iov[(0, 0)].is_finite() && iov[(0, 0)] > 0.0);
+    assert!(result.ofv.is_finite());
+    let is = result
+        .importance_sampling
+        .as_ref()
+        .expect("final IS objective");
+    assert!(is.minus2_log_likelihood.is_finite());
+    assert!(matches!(
+        is.kappa_treatment,
+        ferx_core::types::KappaTreatment::Marginalized
+    ));
 }
 
 #[test]

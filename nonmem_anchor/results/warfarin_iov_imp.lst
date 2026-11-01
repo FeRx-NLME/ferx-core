@@ -1,0 +1,576 @@
+Sat Oct 31 10:40:12 AM UTC 2026
+$PROBLEM Warfarin IOV (CL) - IMP estimation with inter-occasion variability (#2301)
+; Same model, data and initial estimates as warfarin_iov_impmap.ctl; only the
+; method differs (IMP: MAP on the first iteration only, then the proposal is
+; re-centred on the previous iteration's sample moments — ferx `method = imp`).
+; IOV is written NONMEM's way: one ETA per occasion sharing a variance via
+; BLOCK(1) SAME, which ferx spells `kappa`.
+$DATA warfarin_iov.csv IGNORE=@
+$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV OCC
+$SUBROUTINES ADVAN2 TRANS2
+$PK
+  OCC1 = 0
+  OCC2 = 0
+  IF(OCC.EQ.1) OCC1 = 1
+  IF(OCC.EQ.2) OCC2 = 1
+  IOVCL = OCC1*ETA(4) + OCC2*ETA(5)
+  CL = THETA(1)*EXP(ETA(1) + IOVCL)
+  V  = THETA(2)*EXP(ETA(2))
+  KA = THETA(3)*EXP(ETA(3))
+  S2 = V
+$ERROR
+  IPRED = F
+  Y = IPRED*(1 + EPS(1))
+$THETA (0, 0.2)   ; TVCL
+$THETA (0, 10.0)  ; TVV
+$THETA (0, 1.5)   ; TVKA
+$OMEGA 0.09       ; ETA_CL  (BSV)
+$OMEGA 0.04       ; ETA_V   (BSV)
+$OMEGA 0.30       ; ETA_KA  (BSV)
+$OMEGA BLOCK(1) 0.01   ; KAPPA_CL occasion 1
+$OMEGA BLOCK(1) SAME   ; KAPPA_CL occasion 2 (same variance => IOV)
+$SIGMA 0.04       ; proportional variance (= 0.2 SD, the .ferx init)
+$ESTIMATION METHOD=IMP INTERACTION NITER=200 ISAMPLE=300 PRINT=1 SEED=12345 NOABORT
+
+NM-TRAN MESSAGES
+  
+ WARNINGS AND ERRORS (IF ANY) FOR PROBLEM    1
+             
+ (WARNING  2) NM-TRAN INFERS THAT THE DATA ARE POPULATION.
+  
+Note: Analytical 2nd Derivatives are constructed in FSUBS but are never used.
+      You may insert $ABBR DERIV2=NO after the first $PROB to save FSUBS construction and compilation time
+  
+
+License Registered to:  InsightRX
+Expiration Date:    14 AUG 2027
+Current Date:       31 OCT 2026
+Days until program expires : 288
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.6.0 (nm760)
+ ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
+ CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
+ AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
+ PERFORMED BY NOUS INFOSYSTEMS.
+
+ PROBLEM NO.:         1
+ Warfarin IOV (CL) - IMP estimation with inter-occasion variability (#230
+0DATA CHECKOUT RUN:              NO
+ DATA SET LOCATED ON UNIT NO.:    2
+ THIS UNIT TO BE REWOUND:        NO
+ CREATE/ADD TO FDATA.csv:        YES
+ NO. OF DATA RECS IN DATA SET:      240
+ NO. OF DATA ITEMS IN DATA SET:   8
+ ID DATA ITEM IS DATA ITEM NO.:   1
+ DEP VARIABLE IS DATA ITEM NO.:   3
+ MDV DATA ITEM IS DATA ITEM NO.:  7
+0INDICES PASSED TO SUBROUTINE PRED:
+   4   2   5   6   0   0   0   0   0   0   0
+0LABELS FOR DATA ITEMS:
+ ID TIME DV EVID AMT RATE MDV OCC
+0FORMAT FOR DATA:
+ (8E8.0)
+
+ TOT. NO. OF OBS RECS:      220
+ TOT. NO. OF INDIVIDUALS:       10
+0LENGTH OF THETA:   3
+0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
+0OMEGA HAS BLOCK FORM:
+  1
+  0  2
+  0  0  3
+  0  0  0  4
+  0  0  0  0  4
+0DEFAULT OMEGA BOUNDARY TEST OMITTED:    NO
+0SIGMA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT SIGMA BOUNDARY TEST OMITTED:    NO
+0INITIAL ESTIMATE OF THETA:
+ LOWER BOUND    INITIAL EST    UPPER BOUND
+  0.0000E+00     0.2000E+00     0.1000E+07
+  0.0000E+00     0.1000E+02     0.1000E+07
+  0.0000E+00     0.1500E+01     0.1000E+07
+0INITIAL ESTIMATE OF OMEGA:
+ BLOCK SET NO.   BLOCK                                                                    FIXED
+        1                                                                                   NO
+                  0.9000E-01
+        2                                                                                   NO
+                  0.4000E-01
+        3                                                                                   NO
+                  0.3000E+00
+        4                                                                                   NO
+                  0.1000E-01
+0INITIAL ESTIMATE OF SIGMA:
+ 0.4000E-01
+1DOUBLE PRECISION PREDPP VERSION 7.6.0 (nm760)
+
+ ONE COMPARTMENT MODEL WITH FIRST-ORDER ABSORPTION (ADVAN2)
+0MAXIMUM NO. OF BASIC PK PARAMETERS:   3
+0BASIC PK PARAMETERS (AFTER TRANSLATION):
+   ELIMINATION RATE (K) IS BASIC PK PARAMETER NO.:  1
+   ABSORPTION RATE (KA) IS BASIC PK PARAMETER NO.:  3
+
+ TRANSLATOR WILL CONVERT PARAMETERS
+ CLEARANCE (CL) AND VOLUME (V) TO K (TRANS2)
+0COMPARTMENT ATTRIBUTES
+ COMPT. NO.   FUNCTION   INITIAL    ON/OFF      DOSE      DEFAULT    DEFAULT
+                         STATUS     ALLOWED    ALLOWED    FOR DOSE   FOR OBS.
+    1         DEPOT        OFF        YES        YES        YES        NO
+    2         CENTRAL      ON         NO         YES        NO         YES
+    3         OUTPUT       OFF        YES        NO         NO         NO
+1
+ ADDITIONAL PK PARAMETERS - ASSIGNMENT OF ROWS IN GG
+ COMPT. NO.                             INDICES
+              SCALE      BIOAVAIL.   ZERO-ORDER  ZERO-ORDER  ABSORB
+                         FRACTION    RATE        DURATION    LAG
+    1            *           *           *           *           *
+    2            4           *           *           *           *
+    3            *           -           -           -           -
+             - PARAMETER IS NOT ALLOWED FOR THIS MODEL
+             * PARAMETER IS NOT SUPPLIED BY PK SUBROUTINE;
+               WILL DEFAULT TO ONE IF APPLICABLE
+0DATA ITEM INDICES USED BY PRED ARE:
+   EVENT ID DATA ITEM IS DATA ITEM NO.:      4
+   TIME DATA ITEM IS DATA ITEM NO.:          2
+   DOSE AMOUNT DATA ITEM IS DATA ITEM NO.:   5
+   DOSE RATE DATA ITEM IS DATA ITEM NO.:     6
+
+0PK SUBROUTINE CALLED WITH EVERY EVENT RECORD.
+ PK SUBROUTINE NOT CALLED AT NONEVENT (ADDITIONAL OR LAGGED) DOSE TIMES.
+0ERROR SUBROUTINE CALLED WITH EVERY EVENT RECORD.
+1
+
+
+ #TBLN:      1
+ #METH: Importance Sampling
+
+ ESTIMATION STEP OMITTED:                 NO
+ SHRINK INFO WITH EVALUATION (EVALSHRINK) NO
+ ANALYSIS TYPE:                           POPULATION
+ NUMBER OF SADDLE POINT RESET ITERATIONS:      0
+ GRADIENT METHOD USED:               NOSLOW
+ CONDITIONAL ESTIMATES USED:              YES
+ CENTERED ETA:                            NO
+ EPS-ETA INTERACTION:                     YES
+ LAPLACIAN OBJ. FUNC.:                    NO
+ NO. OF FUNCT. EVALS. ALLOWED:            528
+ NO. OF SIG. FIGURES REQUIRED:            3
+ INTERMEDIATE PRINTOUT:                   YES
+ ESTIMATE OUTPUT TO MSF:                  NO
+ ABORT WITH PRED EXIT CODE 1:             NO
+ IND. OBJ. FUNC. VALUES SORTED:           NO
+ NUMERICAL DERIVATIVE
+       FILE REQUEST (NUMDER):               NONE
+ MAP (ETAHAT) ESTIMATION METHOD (OPTMAP):   0
+ ETA HESSIAN EVALUATION METHOD (ETADER):    0
+ INITIAL ETA FOR MAP ESTIMATION (MCETA):    0
+ SIGDIGITS FOR MAP ESTIMATION (SIGLO):      100
+ GRADIENT SIGDIGITS OF
+       FIXED EFFECTS PARAMETERS (SIGL):     100
+ NOPRIOR SETTING (NOPRIOR):                 0
+ NOCOV SETTING (NOCOV):                     OFF
+ DERCONT SETTING (DERCONT):                 OFF
+ FINAL ETA RE-EVALUATION (FNLETA):          1
+ EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
+       IN SHRINKAGE (ETASTYPE):             NO
+ NON-INFL. ETA CORRECTION (NONINFETA):      0
+ RAW OUTPUT FILE (FILE): warfarin_iov_imp.ext
+ EXCLUDE TITLE (NOTITLE):                   NO
+ EXCLUDE COLUMN LABELS (NOLABEL):           NO
+ FORMAT FOR ADDITIONAL FILES (FORMAT):      S1PE12.5
+ PARAMETER ORDER FOR OUTPUTS (ORDER):       TSOL
+ KNUTHSUMOFF:                               0
+ INCLUDE LNTWOPI:                           NO
+ INCLUDE CONSTANT TERM TO PRIOR (PRIORC):   NO
+ INCLUDE CONSTANT TERM TO OMEGA (ETA) (OLNTWOPI):NO
+ EM OR BAYESIAN METHOD USED:                IMPORTANCE SAMPLING (IMP)
+ MU MODELING PATTERN (MUM):
+ GRADIENT/GIBBS PATTERN (GRD):
+ AUTOMATIC SETTING FEATURE (AUTO):          0
+ CONVERGENCE TYPE (CTYPE):                  0
+ ITERATIONS (NITER):                        200
+ ANNEAL SETTING (CONSTRAIN):                 1
+ STARTING SEED FOR MC METHODS (SEED):       12345
+ MC SAMPLES PER SUBJECT (ISAMPLE):          300
+ RANDOM SAMPLING METHOD (RANMETHOD):        3U
+ EXPECTATION ONLY (EONLY):                  0
+ PROPOSAL DENSITY SCALING RANGE
+              (ISCALE_MIN, ISCALE_MAX):     0.100000000000000       ,10.0000000000000
+ SAMPLE ACCEPTANCE RATE (IACCEPT):          0.400000000000000
+ LONG TAIL SAMPLE ACCEPT. RATE (IACCEPTL):   0.00000000000000
+ T-DIST. PROPOSAL DENSITY (DF):             0
+ NO. ITERATIONS FOR MAP (MAPITER):          1
+ INTERVAL ITER. FOR MAP (MAPINTER):         0
+ MAP COVARIANCE/MODE SETTING (MAPCOV):      1
+ Gradient Quick Value (GRDQ):               0.00000000000000
+
+
+ THE FOLLOWING LABELS ARE EQUIVALENT
+ PRED=PREDI
+ RES=RESI
+ WRES=WRESI
+ IWRS=IWRESI
+ IPRD=IPREDI
+ IRS=IRESI
+
+ EM/BAYES SETUP:
+ THETAS THAT ARE MU MODELED:
+ 
+ THETAS THAT ARE SIGMA-LIKE:
+ 
+
+ MONITORING OF SEARCH:
+
+ iteration            0  OBJ=   341.22579590530665 eff.=     291. Smpl.=     300. Fit.= 0.97670
+ iteration            1  OBJ=   338.98869328413980 eff.=     474. Smpl.=     300. Fit.= 0.97613
+ iteration            2  OBJ=   328.11145314821408 eff.=    1063. Smpl.=     300. Fit.= 0.88099
+ iteration            3  OBJ=   325.76459519182862 eff.=      48. Smpl.=     300. Fit.= 0.96563
+ iteration            4  OBJ=   314.60577988085919 eff.=     136. Smpl.=     300. Fit.= 0.90698
+ iteration            5  OBJ=   311.81418350881364 eff.=     127. Smpl.=     300. Fit.= 0.96037
+ iteration            6  OBJ=   318.74465686315494 eff.=      75. Smpl.=     300. Fit.= 0.93167
+ iteration            7  OBJ=   313.03539286346427 eff.=     116. Smpl.=     300. Fit.= 0.91388
+ iteration            8  OBJ=   312.04336403268894 eff.=     107. Smpl.=     300. Fit.= 0.92915
+ iteration            9  OBJ=   312.98359181415015 eff.=     116. Smpl.=     300. Fit.= 0.93844
+ iteration           10  OBJ=   319.25010095670984 eff.=     281. Smpl.=     300. Fit.= 0.96073
+ iteration           11  OBJ=   314.68281743880266 eff.=     202. Smpl.=     300. Fit.= 0.90732
+ iteration           12  OBJ=   311.95584477161600 eff.=      61. Smpl.=     300. Fit.= 0.88971
+ iteration           13  OBJ=   310.61840327747342 eff.=     109. Smpl.=     300. Fit.= 0.92342
+ iteration           14  OBJ=   311.39732039319233 eff.=     103. Smpl.=     300. Fit.= 0.91066
+ iteration           15  OBJ=   314.72027716077821 eff.=     292. Smpl.=     300. Fit.= 0.96265
+ iteration           16  OBJ=   315.64516212389861 eff.=     192. Smpl.=     300. Fit.= 0.90748
+ iteration           17  OBJ=   311.85839200978143 eff.=      61. Smpl.=     300. Fit.= 0.88432
+ iteration           18  OBJ=   310.54920954446771 eff.=     102. Smpl.=     300. Fit.= 0.91376
+ iteration           19  OBJ=   309.88651505608556 eff.=     146. Smpl.=     300. Fit.= 0.91678
+ iteration           20  OBJ=   310.36108843256716 eff.=     115. Smpl.=     300. Fit.= 0.91405
+ iteration           21  OBJ=   310.25711950694006 eff.=     146. Smpl.=     300. Fit.= 0.93011
+ iteration           22  OBJ=   309.54738969817146 eff.=      93. Smpl.=     300. Fit.= 0.90790
+ iteration           23  OBJ=   311.27841669882110 eff.=     186. Smpl.=     300. Fit.= 0.93037
+ iteration           24  OBJ=   310.49705980643256 eff.=      85. Smpl.=     300. Fit.= 0.90791
+ iteration           25  OBJ=   310.50697604736615 eff.=     120. Smpl.=     300. Fit.= 0.91875
+ iteration           26  OBJ=   310.50369353212551 eff.=     109. Smpl.=     300. Fit.= 0.92385
+ iteration           27  OBJ=   310.00576017411498 eff.=     135. Smpl.=     300. Fit.= 0.92031
+ iteration           28  OBJ=   310.07753754575390 eff.=     121. Smpl.=     300. Fit.= 0.92856
+ iteration           29  OBJ=   310.02812308095582 eff.=     123. Smpl.=     300. Fit.= 0.92863
+ iteration           30  OBJ=   310.30331457100249 eff.=     111. Smpl.=     300. Fit.= 0.92056
+ iteration           31  OBJ=   310.18577043040449 eff.=     122. Smpl.=     300. Fit.= 0.92833
+ iteration           32  OBJ=   310.15774738044161 eff.=     124. Smpl.=     300. Fit.= 0.92937
+ iteration           33  OBJ=   310.18450315339527 eff.=     148. Smpl.=     300. Fit.= 0.93128
+ iteration           34  OBJ=   310.13144114647667 eff.=      96. Smpl.=     300. Fit.= 0.91248
+ iteration           35  OBJ=   310.02230036682272 eff.=     158. Smpl.=     300. Fit.= 0.93149
+ iteration           36  OBJ=   310.30812503553830 eff.=     103. Smpl.=     300. Fit.= 0.91834
+ iteration           37  OBJ=   309.70535063653244 eff.=     119. Smpl.=     300. Fit.= 0.92733
+ iteration           38  OBJ=   310.27404256266323 eff.=     143. Smpl.=     300. Fit.= 0.93281
+ iteration           39  OBJ=   309.40396444487601 eff.=     122. Smpl.=     300. Fit.= 0.91200
+ iteration           40  OBJ=   310.73142506881089 eff.=     142. Smpl.=     300. Fit.= 0.92734
+ iteration           41  OBJ=   310.82464309202118 eff.=     116. Smpl.=     300. Fit.= 0.91298
+ iteration           42  OBJ=   309.26630500795500 eff.=     158. Smpl.=     300. Fit.= 0.92990
+ iteration           43  OBJ=   310.45779897664380 eff.=      80. Smpl.=     300. Fit.= 0.90146
+ iteration           44  OBJ=   311.54609335441853 eff.=     137. Smpl.=     300. Fit.= 0.92356
+ iteration           45  OBJ=   313.36977332821539 eff.=     172. Smpl.=     300. Fit.= 0.93990
+ iteration           46  OBJ=   309.63961361388323 eff.=     124. Smpl.=     300. Fit.= 0.91073
+ iteration           47  OBJ=   310.87856034056460 eff.=     101. Smpl.=     300. Fit.= 0.90759
+ iteration           48  OBJ=   310.38489461778283 eff.=     145. Smpl.=     300. Fit.= 0.93056
+ iteration           49  OBJ=   310.28210559176944 eff.=      95. Smpl.=     300. Fit.= 0.91372
+ iteration           50  OBJ=   310.05496688606456 eff.=     120. Smpl.=     300. Fit.= 0.92122
+ iteration           51  OBJ=   310.22106483098946 eff.=     126. Smpl.=     300. Fit.= 0.91340
+ iteration           52  OBJ=   311.00627052800786 eff.=     175. Smpl.=     300. Fit.= 0.93853
+ iteration           53  OBJ=   310.30152708117561 eff.=     118. Smpl.=     300. Fit.= 0.90459
+ iteration           54  OBJ=   309.89645212208671 eff.=     108. Smpl.=     300. Fit.= 0.91962
+ iteration           55  OBJ=   309.78820860566037 eff.=     113. Smpl.=     300. Fit.= 0.92162
+ iteration           56  OBJ=   310.51645775708687 eff.=     122. Smpl.=     300. Fit.= 0.93033
+ iteration           57  OBJ=   309.90535634275744 eff.=     127. Smpl.=     300. Fit.= 0.92932
+ iteration           58  OBJ=   309.80106924794711 eff.=     114. Smpl.=     300. Fit.= 0.92369
+ iteration           59  OBJ=   310.14708148608526 eff.=     124. Smpl.=     300. Fit.= 0.93041
+ iteration           60  OBJ=   310.42827842862300 eff.=     129. Smpl.=     300. Fit.= 0.93466
+ iteration           61  OBJ=   309.42067209745971 eff.=     105. Smpl.=     300. Fit.= 0.91338
+ iteration           62  OBJ=   310.07441226177787 eff.=     154. Smpl.=     300. Fit.= 0.93720
+ iteration           63  OBJ=   309.89014655652704 eff.=     108. Smpl.=     300. Fit.= 0.92137
+ iteration           64  OBJ=   310.09119897017445 eff.=     113. Smpl.=     300. Fit.= 0.92042
+ iteration           65  OBJ=   310.18187263103147 eff.=     142. Smpl.=     300. Fit.= 0.93702
+ iteration           66  OBJ=   310.34789371526307 eff.=     104. Smpl.=     300. Fit.= 0.91939
+ iteration           67  OBJ=   309.97018704332510 eff.=     121. Smpl.=     300. Fit.= 0.92691
+ iteration           68  OBJ=   309.74346440593172 eff.=     136. Smpl.=     300. Fit.= 0.93547
+ iteration           69  OBJ=   310.32182618332655 eff.=     123. Smpl.=     300. Fit.= 0.93084
+ iteration           70  OBJ=   309.55715914501445 eff.=     137. Smpl.=     300. Fit.= 0.92776
+ iteration           71  OBJ=   310.38375228392334 eff.=     104. Smpl.=     300. Fit.= 0.91926
+ iteration           72  OBJ=   310.43021696426263 eff.=     146. Smpl.=     300. Fit.= 0.91322
+ iteration           73  OBJ=   309.85295733103237 eff.=     112. Smpl.=     300. Fit.= 0.92013
+ iteration           74  OBJ=   310.41104733751058 eff.=     108. Smpl.=     300. Fit.= 0.92415
+ iteration           75  OBJ=   310.21511024179620 eff.=     134. Smpl.=     300. Fit.= 0.93273
+ iteration           76  OBJ=   310.13334070660386 eff.=     119. Smpl.=     300. Fit.= 0.92628
+ iteration           77  OBJ=   310.03850363686985 eff.=     108. Smpl.=     300. Fit.= 0.92267
+ iteration           78  OBJ=   309.49978728295093 eff.=     126. Smpl.=     300. Fit.= 0.92131
+ iteration           79  OBJ=   309.82219763866277 eff.=     132. Smpl.=     300. Fit.= 0.93345
+ iteration           80  OBJ=   310.00954729922006 eff.=     110. Smpl.=     300. Fit.= 0.91884
+ iteration           81  OBJ=   310.57280487660137 eff.=     118. Smpl.=     300. Fit.= 0.92252
+ iteration           82  OBJ=   309.48227177772242 eff.=     181. Smpl.=     300. Fit.= 0.93672
+ iteration           83  OBJ=   310.05286568092117 eff.=     125. Smpl.=     300. Fit.= 0.91767
+ iteration           84  OBJ=   310.46834883011411 eff.=     123. Smpl.=     300. Fit.= 0.93407
+ iteration           85  OBJ=   310.08562943785796 eff.=      86. Smpl.=     300. Fit.= 0.90767
+ iteration           86  OBJ=   310.32789376916594 eff.=     124. Smpl.=     300. Fit.= 0.93233
+ iteration           87  OBJ=   309.87974037155078 eff.=     120. Smpl.=     300. Fit.= 0.92662
+ iteration           88  OBJ=   310.23199557726633 eff.=     134. Smpl.=     300. Fit.= 0.93381
+ iteration           89  OBJ=   310.76416957123780 eff.=     124. Smpl.=     300. Fit.= 0.91276
+ iteration           90  OBJ=   309.76526691603641 eff.=     147. Smpl.=     300. Fit.= 0.93029
+ iteration           91  OBJ=   309.97844915770565 eff.=     110. Smpl.=     300. Fit.= 0.92313
+ iteration           92  OBJ=   310.04889616100559 eff.=      99. Smpl.=     300. Fit.= 0.91794
+ iteration           93  OBJ=   310.48660620992018 eff.=     129. Smpl.=     300. Fit.= 0.92207
+ iteration           94  OBJ=   311.11227036604913 eff.=     147. Smpl.=     300. Fit.= 0.93295
+ iteration           95  OBJ=   310.06834643527606 eff.=     118. Smpl.=     300. Fit.= 0.90726
+ iteration           96  OBJ=   310.36927558124114 eff.=     122. Smpl.=     300. Fit.= 0.92435
+ iteration           97  OBJ=   309.79044713822532 eff.=     102. Smpl.=     300. Fit.= 0.91523
+ iteration           98  OBJ=   310.45483166256383 eff.=     122. Smpl.=     300. Fit.= 0.92434
+ iteration           99  OBJ=   308.65145876403977 eff.=     256. Smpl.=     300. Fit.= 0.95753
+ iteration          100  OBJ=   312.13595579430108 eff.=     282. Smpl.=     300. Fit.= 0.90908
+ iteration          101  OBJ=   311.67507956083830 eff.=      79. Smpl.=     300. Fit.= 0.92175
+ iteration          102  OBJ=   306.43329234154555 eff.=     307. Smpl.=     300. Fit.= 0.96408
+ iteration          103  OBJ=   312.63077692893910 eff.=     985. Smpl.=     300. Fit.= 0.89104
+ iteration          104  OBJ=   310.95521335751914 eff.=      85. Smpl.=     300. Fit.= 0.90147
+ iteration          105  OBJ=   310.92905752801482 eff.=     101. Smpl.=     300. Fit.= 0.91455
+ iteration          106  OBJ=   311.54176845691012 eff.=     158. Smpl.=     300. Fit.= 0.93351
+ iteration          107  OBJ=   312.14122953029965 eff.=      87. Smpl.=     300. Fit.= 0.91037
+ iteration          108  OBJ=   312.02742607168005 eff.=     133. Smpl.=     300. Fit.= 0.91423
+ iteration          109  OBJ=   319.60471895889827 eff.=     195. Smpl.=     300. Fit.= 0.94909
+ iteration          110  OBJ=   312.94959690383661 eff.=     129. Smpl.=     300. Fit.= 0.90741
+ iteration          111  OBJ=   312.76142024192097 eff.=      90. Smpl.=     300. Fit.= 0.91049
+ iteration          112  OBJ=   312.10420430986699 eff.=     117. Smpl.=     300. Fit.= 0.92341
+ iteration          113  OBJ=   310.75876276082528 eff.=     122. Smpl.=     300. Fit.= 0.91699
+ iteration          114  OBJ=   311.47780172701874 eff.=     121. Smpl.=     300. Fit.= 0.91906
+ iteration          115  OBJ=   310.70839080107589 eff.=     146. Smpl.=     300. Fit.= 0.92891
+ iteration          116  OBJ=   310.66216035699398 eff.=      99. Smpl.=     300. Fit.= 0.91483
+ iteration          117  OBJ=   310.83408033663750 eff.=     165. Smpl.=     300. Fit.= 0.92398
+ iteration          118  OBJ=   310.22521683368922 eff.=      95. Smpl.=     300. Fit.= 0.90999
+ iteration          119  OBJ=   310.46789169266759 eff.=     120. Smpl.=     300. Fit.= 0.93011
+ iteration          120  OBJ=   310.51281005319339 eff.=     125. Smpl.=     300. Fit.= 0.93167
+ iteration          121  OBJ=   310.75947278518743 eff.=     109. Smpl.=     300. Fit.= 0.92440
+ iteration          122  OBJ=   310.00683306183868 eff.=     120. Smpl.=     300. Fit.= 0.92617
+ iteration          123  OBJ=   309.85465301260660 eff.=     130. Smpl.=     300. Fit.= 0.92865
+ iteration          124  OBJ=   310.29794656664575 eff.=     139. Smpl.=     300. Fit.= 0.93495
+ iteration          125  OBJ=   309.96933674213335 eff.=     109. Smpl.=     300. Fit.= 0.92053
+ iteration          126  OBJ=   310.07170903590361 eff.=     133. Smpl.=     300. Fit.= 0.93324
+ iteration          127  OBJ=   309.90624645434588 eff.=     108. Smpl.=     300. Fit.= 0.91913
+ iteration          128  OBJ=   310.81077696989087 eff.=     162. Smpl.=     300. Fit.= 0.92732
+ iteration          129  OBJ=   310.46380859172893 eff.=      88. Smpl.=     300. Fit.= 0.91034
+ iteration          130  OBJ=   310.17031692736231 eff.=     147. Smpl.=     300. Fit.= 0.93698
+ iteration          131  OBJ=   309.90361820789423 eff.=     116. Smpl.=     300. Fit.= 0.92613
+ iteration          132  OBJ=   310.14414875824809 eff.=     110. Smpl.=     300. Fit.= 0.92247
+ iteration          133  OBJ=   310.13688562270136 eff.=     124. Smpl.=     300. Fit.= 0.93228
+ iteration          134  OBJ=   310.57934984934883 eff.=     115. Smpl.=     300. Fit.= 0.92815
+ iteration          135  OBJ=   310.36437394493544 eff.=     119. Smpl.=     300. Fit.= 0.92875
+ iteration          136  OBJ=   310.38872330944821 eff.=     157. Smpl.=     300. Fit.= 0.93184
+ iteration          137  OBJ=   310.21419045065232 eff.=      99. Smpl.=     300. Fit.= 0.91442
+ iteration          138  OBJ=   310.34449678206448 eff.=     108. Smpl.=     300. Fit.= 0.92307
+ iteration          139  OBJ=   310.16844198695992 eff.=     145. Smpl.=     300. Fit.= 0.93534
+ iteration          140  OBJ=   309.74701917382117 eff.=     113. Smpl.=     300. Fit.= 0.92278
+ iteration          141  OBJ=   309.66295546727696 eff.=     129. Smpl.=     300. Fit.= 0.93122
+ iteration          142  OBJ=   310.43565900285859 eff.=     124. Smpl.=     300. Fit.= 0.93244
+ iteration          143  OBJ=   310.35072619886648 eff.=     111. Smpl.=     300. Fit.= 0.92463
+ iteration          144  OBJ=   309.60479127184101 eff.=     121. Smpl.=     300. Fit.= 0.92535
+ iteration          145  OBJ=   310.30577467073721 eff.=     129. Smpl.=     300. Fit.= 0.93480
+ iteration          146  OBJ=   310.28356933180322 eff.=     110. Smpl.=     300. Fit.= 0.92260
+ iteration          147  OBJ=   309.86634106274255 eff.=     131. Smpl.=     300. Fit.= 0.93346
+ iteration          148  OBJ=   310.19178993376266 eff.=     123. Smpl.=     300. Fit.= 0.93177
+ iteration          149  OBJ=   309.96170090821414 eff.=     112. Smpl.=     300. Fit.= 0.92269
+ iteration          150  OBJ=   310.15744410645993 eff.=     138. Smpl.=     300. Fit.= 0.93375
+ iteration          151  OBJ=   309.81630686725759 eff.=     124. Smpl.=     300. Fit.= 0.92969
+ iteration          152  OBJ=   309.79576578661943 eff.=     110. Smpl.=     300. Fit.= 0.92351
+ iteration          153  OBJ=   310.12059786864711 eff.=     114. Smpl.=     300. Fit.= 0.92533
+ iteration          154  OBJ=   310.27186159228557 eff.=     136. Smpl.=     300. Fit.= 0.93332
+ iteration          155  OBJ=   309.79072560103572 eff.=     114. Smpl.=     300. Fit.= 0.91920
+ iteration          156  OBJ=   310.51532566676508 eff.=     132. Smpl.=     300. Fit.= 0.93577
+ iteration          157  OBJ=   309.95561535124995 eff.=     112. Smpl.=     300. Fit.= 0.92374
+ iteration          158  OBJ=   310.13209660894449 eff.=     116. Smpl.=     300. Fit.= 0.92097
+ iteration          159  OBJ=   310.49759021488200 eff.=     130. Smpl.=     300. Fit.= 0.93397
+ iteration          160  OBJ=   309.47945938797625 eff.=     125. Smpl.=     300. Fit.= 0.92886
+ iteration          161  OBJ=   310.48092969546610 eff.=     126. Smpl.=     300. Fit.= 0.93290
+ iteration          162  OBJ=   309.89951642547396 eff.=     105. Smpl.=     300. Fit.= 0.92090
+ iteration          163  OBJ=   310.19235844302546 eff.=     135. Smpl.=     300. Fit.= 0.93598
+ iteration          164  OBJ=   310.12918375784551 eff.=     108. Smpl.=     300. Fit.= 0.92363
+ iteration          165  OBJ=   310.20901976530359 eff.=     119. Smpl.=     300. Fit.= 0.92826
+ iteration          166  OBJ=   309.70221792637301 eff.=     155. Smpl.=     300. Fit.= 0.93373
+ iteration          167  OBJ=   310.24173302518369 eff.=     111. Smpl.=     300. Fit.= 0.91979
+ iteration          168  OBJ=   310.41582917474727 eff.=     122. Smpl.=     300. Fit.= 0.92369
+ iteration          169  OBJ=   310.22094824497867 eff.=     100. Smpl.=     300. Fit.= 0.91825
+ iteration          170  OBJ=   309.85397461935634 eff.=     130. Smpl.=     300. Fit.= 0.93255
+ iteration          171  OBJ=   310.01165202662236 eff.=     115. Smpl.=     300. Fit.= 0.92486
+ iteration          172  OBJ=   309.93611956061994 eff.=     140. Smpl.=     300. Fit.= 0.93450
+ iteration          173  OBJ=   309.70041897651271 eff.=     112. Smpl.=     300. Fit.= 0.92215
+ iteration          174  OBJ=   310.29093780346807 eff.=     119. Smpl.=     300. Fit.= 0.92898
+ iteration          175  OBJ=   309.98325802929162 eff.=     121. Smpl.=     300. Fit.= 0.92867
+ iteration          176  OBJ=   310.46987267338562 eff.=     141. Smpl.=     300. Fit.= 0.93725
+ iteration          177  OBJ=   310.67593443208403 eff.=      96. Smpl.=     300. Fit.= 0.91663
+ iteration          178  OBJ=   310.30538242725731 eff.=     166. Smpl.=     300. Fit.= 0.92454
+ iteration          179  OBJ=   310.14631470794751 eff.=      97. Smpl.=     300. Fit.= 0.91548
+ iteration          180  OBJ=   309.83408479965220 eff.=     138. Smpl.=     300. Fit.= 0.93114
+ iteration          181  OBJ=   310.23369089550346 eff.=     120. Smpl.=     300. Fit.= 0.92553
+ iteration          182  OBJ=   310.46598304572785 eff.=     102. Smpl.=     300. Fit.= 0.91531
+ iteration          183  OBJ=   310.06133406451403 eff.=     147. Smpl.=     300. Fit.= 0.93278
+ iteration          184  OBJ=   310.04026683106036 eff.=     103. Smpl.=     300. Fit.= 0.91827
+ iteration          185  OBJ=   310.31133591755832 eff.=     119. Smpl.=     300. Fit.= 0.92317
+ iteration          186  OBJ=   310.09746154588606 eff.=     130. Smpl.=     300. Fit.= 0.93586
+ iteration          187  OBJ=   310.38223045791790 eff.=     125. Smpl.=     300. Fit.= 0.93288
+ iteration          188  OBJ=   310.10608183781147 eff.=     112. Smpl.=     300. Fit.= 0.92480
+ iteration          189  OBJ=   309.95056216871967 eff.=     125. Smpl.=     300. Fit.= 0.93207
+ iteration          190  OBJ=   310.62745738755530 eff.=     151. Smpl.=     300. Fit.= 0.92639
+ iteration          191  OBJ=   310.26204722127028 eff.=      95. Smpl.=     300. Fit.= 0.91145
+ iteration          192  OBJ=   309.90736710918162 eff.=     121. Smpl.=     300. Fit.= 0.92858
+ iteration          193  OBJ=   310.11266570518802 eff.=     122. Smpl.=     300. Fit.= 0.92854
+ iteration          194  OBJ=   310.31747918412208 eff.=     114. Smpl.=     300. Fit.= 0.92643
+ iteration          195  OBJ=   310.16935169555774 eff.=     121. Smpl.=     300. Fit.= 0.93029
+ iteration          196  OBJ=   310.09777894341664 eff.=     135. Smpl.=     300. Fit.= 0.93575
+ iteration          197  OBJ=   309.68582879218491 eff.=     111. Smpl.=     300. Fit.= 0.92302
+ iteration          198  OBJ=   310.30440668964508 eff.=     141. Smpl.=     300. Fit.= 0.93554
+ iteration          199  OBJ=   310.28225054669554 eff.=     105. Smpl.=     300. Fit.= 0.92317
+ iteration          200  OBJ=   310.12658699053594 eff.=     122. Smpl.=     300. Fit.= 0.93001
+
+ #TERM:
+ OPTIMIZATION WAS NOT TESTED FOR CONVERGENCE
+
+
+ ETABAR IS THE ARITHMETIC MEAN OF THE ETA-ESTIMATES,
+ AND THE P-VALUE IS GIVEN FOR THE NULL HYPOTHESIS THAT THE TRUE MEAN IS 0.
+
+ ETABAR:        -2.7852E-03 -9.0644E-05  6.0579E-03 -6.6083E-02  6.7141E-02
+ SE:             5.2709E-02  2.8058E-02  3.5080E-02  4.7154E-02  3.4286E-02
+ N:                      10          10          10          10          10
+
+ P VAL.:         9.5786E-01  9.9742E-01  8.6290E-01  1.6109E-01  5.0198E-02
+
+ ETASHRINKSD(%)  1.6711E+01  1.4497E+01  3.4274E+01  1.2896E+01  3.1896E+01
+ ETASHRINKVR(%)  3.0629E+01  2.6892E+01  5.6801E+01  2.4129E+01  5.3618E+01
+ EBVSHRINKSD(%)  1.7540E+01  1.3508E+01  3.2968E+01  2.2539E+01  2.1935E+01
+ EBVSHRINKVR(%)  3.2003E+01  2.5191E+01  5.5067E+01  3.9998E+01  3.9058E+01
+ RELATIVEINF(%)  1.8217E+00  6.7681E+01  3.3209E+01  1.5501E+00  1.5922E+00
+ EPSSHRINKSD(%)  7.6758E+00
+ EPSSHRINKVR(%)  1.4762E+01
+
+  
+ TOTAL DATA POINTS NORMALLY DISTRIBUTED (N):          220
+ N*LOG(2PI) CONSTANT TO OBJECTIVE FUNCTION:    404.33295461005599     
+ OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT:    310.12658699053594     
+ OBJECTIVE FUNCTION VALUE WITH CONSTANT:       714.45954160059193     
+ REPORTED OBJECTIVE FUNCTION DOES NOT CONTAIN CONSTANT
+  
+ TOTAL EFFECTIVE ETAS (NIND*NETA):                            50
+  
+ #TERE:
+ Elapsed estimation  time in seconds:    23.23
+1
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                               IMPORTANCE SAMPLING                              ********************
+ #OBJT:**************                        FINAL VALUE OF OBJECTIVE FUNCTION                       ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+
+
+
+ #OBJV:********************************************           310.127       *********************************************
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                               IMPORTANCE SAMPLING                              ********************
+ ********************                             FINAL PARAMETER ESTIMATE                           ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+ THETA - VECTOR OF FIXED EFFECTS PARAMETERS   *********
+
+
+         TH 1      TH 2      TH 3     
+ 
+         1.72E-01  8.63E+00  1.19E+00
+ 
+
+
+ OMEGA - COV MATRIX FOR RANDOM EFFECTS - ETAS  ********
+
+
+         ETA1      ETA2      ETA3      ETA4      ETA5     
+ 
+ ETA1
++        4.01E-02
+ 
+ ETA2
++        0.00E+00  1.08E-02
+ 
+ ETA3
++        0.00E+00  0.00E+00  2.86E-02
+ 
+ ETA4
++        0.00E+00  0.00E+00  0.00E+00  3.51E-02
+ 
+ ETA5
++        0.00E+00  0.00E+00  0.00E+00  0.00E+00  3.51E-02
+ 
+
+
+ SIGMA - COV MATRIX FOR RANDOM EFFECTS - EPSILONS  ****
+
+
+         EPS1     
+ 
+ EPS1
++        3.56E-02
+ 
+1
+
+
+ OMEGA - CORR MATRIX FOR RANDOM EFFECTS - ETAS  *******
+
+
+         ETA1      ETA2      ETA3      ETA4      ETA5     
+ 
+ ETA1
++        2.00E-01
+ 
+ ETA2
++        0.00E+00  1.04E-01
+ 
+ ETA3
++        0.00E+00  0.00E+00  1.69E-01
+ 
+ ETA4
++        0.00E+00  0.00E+00  0.00E+00  1.87E-01
+ 
+ ETA5
++        0.00E+00  0.00E+00  0.00E+00  0.00E+00  1.87E-01
+ 
+
+
+ SIGMA - CORR MATRIX FOR RANDOM EFFECTS - EPSILONS  ***
+
+
+         EPS1     
+ 
+ EPS1
++        1.89E-01
+ 
+ Elapsed postprocess time in seconds:     0.00
+ Elapsed finaloutput time in seconds:     0.00
+ #CPUT: Total CPU Time in Seconds,       23.199
+Stop Time:
+Sat Oct 31 10:40:39 AM UTC 2026

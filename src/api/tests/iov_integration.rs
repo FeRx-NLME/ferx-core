@@ -2370,18 +2370,93 @@ fn test_check_model_options_block_sigma_iov_scope() {
     .is_none());
 }
 
-// IMPMAP does not yet support IOV; `ferx check` must flag it up front rather
-// than letting the fit fail at runtime (review finding #3).
+// IMP and IMPMAP estimate IOV models since #2301, so `ferx check` must not
+// refuse the combination (it used to, with E_IMPMAP_IOV_UNSUPPORTED).
 #[test]
-fn test_check_model_options_flags_impmap_iov() {
+fn test_check_model_options_accepts_imp_and_impmap_with_iov() {
     let model = make_iov_model();
-    let opts = fast_opts(EstimationMethod::Impmap, Optimizer::Bobyqa, false);
-    let diags = super::check_model_options(&model, &opts);
-    let d = diags
-        .iter()
-        .find(|d| d.code == "E_IMPMAP_IOV_UNSUPPORTED")
-        .expect("expected E_IMPMAP_IOV_UNSUPPORTED diagnostic");
-    assert!(d.is_error() && d.message.contains("inter-occasion"));
+    for method in [EstimationMethod::Impmap, EstimationMethod::Imp] {
+        let opts = fast_opts(method, Optimizer::Bobyqa, false);
+        let diags = super::check_model_options(&model, &opts);
+        let errors: Vec<&str> = diags
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.code.as_str())
+            .collect();
+        assert!(errors.is_empty(), "{method:?} + IOV refused: {errors:?}");
+    }
+}
+
+// IMP / IMPMAP estimate IOV, but their mixture E-step does not: `ferx check` must
+// refuse exactly [mixture] + κ under imp/impmap, and none of its three neighbours
+// (no κ, no imp/impmap in the chain, no mixture — the last pinned above).
+#[test]
+fn test_check_model_options_refuses_imp_mixture_with_iov() {
+    const MIXTURE_IOV: &str = "
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta P1(0.5, 0.001, 0.999)
+  omega ETA_CL ~ 0.05
+  kappa KAPPA_CL ~ 0.02
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  p(1) = P1
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL + KAPPA_CL) else TVCL2 * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let parse = |src: &str| crate::parser::model_parser::parse_model_string(src).expect("parse");
+    let refused = |model: &CompiledModel, methods: Vec<EstimationMethod>| -> Option<String> {
+        let mut opts = fast_opts(methods[0], Optimizer::Bobyqa, false);
+        opts.methods = methods;
+        super::check_model_options(model, &opts)
+            .into_iter()
+            .find(|d| d.code == "E_IMP_MIXTURE_IOV_UNSUPPORTED")
+            .map(|d| {
+                assert!(d.is_error(), "the code must be an error: {d:?}");
+                d.message
+            })
+    };
+
+    let mixture_iov = parse(MIXTURE_IOV);
+    assert!(mixture_iov.mixture.is_some() && mixture_iov.n_kappa > 0);
+    for method in [EstimationMethod::Imp, EstimationMethod::Impmap] {
+        let msg = refused(&mixture_iov, vec![method])
+            .unwrap_or_else(|| panic!("{method:?} + mixture + IOV must be refused at check time"));
+        assert!(msg.contains("[mixture]") && msg.contains("saem"), "{msg}");
+    }
+    // A later chain stage is caught too: the runtime refusal would fire after SAEM ran.
+    assert!(refused(
+        &mixture_iov,
+        vec![EstimationMethod::Saem, EstimationMethod::Impmap]
+    )
+    .is_some());
+    // Methods whose mixture path handles κ are not refused.
+    for method in [EstimationMethod::Saem, EstimationMethod::FoceI] {
+        assert_eq!(refused(&mixture_iov, vec![method]), None, "{method:?}");
+    }
+
+    // The same mixture without κ is not refused.
+    let mixture_no_iov = parse(
+        &MIXTURE_IOV
+            .replace("  kappa KAPPA_CL ~ 0.02\n", "")
+            .replace(" + KAPPA_CL", ""),
+    );
+    assert!(mixture_no_iov.mixture.is_some() && mixture_no_iov.n_kappa == 0);
+    for method in [EstimationMethod::Imp, EstimationMethod::Impmap] {
+        assert_eq!(refused(&mixture_no_iov, vec![method]), None, "{method:?}");
+    }
 }
 
 // The Enzyme AD path was retired, so explicitly requesting AD must error
