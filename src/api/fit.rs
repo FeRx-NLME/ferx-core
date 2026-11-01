@@ -1128,9 +1128,11 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
         Some(format!(
             "individual parameter(s) not mu-referenced: {}. This can strongly \
              affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible. \
-             For an additive ETA, give the typical value and the ETA a line of their own \
-             (`E0 = TVE0 + ETA_E0`) and build the rest on it (`BASE = E0 + ...`): a typical \
-             value summed with other terms in one line is not mu-referenced (#2540).",
+             An additive ETA is mu-referenced when its line adds one bare THETA, that one \
+             ETA, and terms that read neither (`BASE = TVE0 + PLACEBO + ETA_E0`): give each \
+             typical value a THETA of its own, not a multiple of one, and its own ETA. \
+             That THETA and that ETA must reach the model only through that line; when \
+             either also reaches it another way, splitting the line does not help (#2544).",
             names.join(", ")
         ))
     }

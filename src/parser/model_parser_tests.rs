@@ -36926,3 +36926,303 @@ fn the_product_walk_is_linear_on_a_diamond() {
         assert_eq!(count(30) - c0, 30 * per_level, "{re}: depth 30 is linear");
     }
 }
+
+// ── #2544: a one-line additive typical value is a mu-reference ───────────────
+
+/// An MBMA-shaped model (the shipped `mbma_placebo` with a covariate `FLARE`, a
+/// second BSV eta and a spare theta) with `indiv` as `[individual_parameters]`
+/// and `extra` appended to `[structural_model]`'s `y`. `indiv` must assign
+/// `BASE` and `ETAX_USE`.
+fn additive_mu_model(indiv: &str, extra: &str) -> CompiledModel {
+    let src = format!(
+        "[parameters]\n  theta TVE0(45.0, 0.0, 200.0)\n  theta B(1.0, -10.0, 10.0)\n  \
+         theta TH2(1.0, -10.0, 10.0)\n  \
+         theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)\n  \
+         omega ETA_E0 ~ 4.0\n  omega ETA_X ~ 1.0\n  kappa KAPPA ~ 4.0 (sd) weight = NARM\n  \
+         sigma ADD_ERR ~ 1.0 (variance) FIX\n\n\
+         [covariates]\n  STUDY categorical\n  NARM continuous\n  SE continuous\n  \
+         FLARE continuous\n\n\
+         [individual_parameters]\n{indiv}\n  KUSE = KAPPA\n\n\
+         [structural_model]\n  y = BASE + 0 * ETAX_USE + 0 * KUSE{extra}\n\n\
+         [error_model]\n  DV ~ additive(ADD_ERR) weight = SE\n\n\
+         [fit_options]\n  iov_column = OCC\n"
+    );
+    parse_model_string(&src).unwrap_or_else(|e| panic!("parse failed: {e}\n{src}"))
+}
+
+/// The anchor `mu_refs` records for `ETA_E0`, as `"THETA:Transform"`.
+fn e0_anchor(m: &CompiledModel) -> Option<String> {
+    m.mu_refs
+        .get("ETA_E0")
+        .map(|r| format!("{}:{:?}", r.theta_name, r.transform))
+}
+
+/// T1 (#2544): the one-line additive sum over its input space. Accepted rows
+/// give `ETA_E0 → TVE0` (`Identity`, Pattern 3's anchor); each rejected row
+/// asserts the eta is absent, and is the only row its condition rejects.
+/// Dies under, each condition of `additive_sum_anchor` dropped in turn: a second
+/// bare theta (row "two bare θ"), a second BSV eta ("second BSV η"), a BSV eta in
+/// a summand ("η in a summand"), the theta in a summand ("θ twice", "θ through a
+/// definition"), an unresolved local ("θ through an if-local", "η through a
+/// local"); and with every eta treated as BSV, the κ row.
+#[test]
+fn a_one_line_additive_sum_is_an_identity_mu_ref() {
+    let accepted = [
+        ("plain", "  BASE = TVE0 + PLACEBO + ETA_E0"),
+        ("eta first", "  BASE = ETA_E0 + TVE0 + PLACEBO"),
+        (
+            "κ summand (weighted kappa desugars to KAPPA/sqrt(NARM))",
+            "  BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA",
+        ),
+        ("θ·covariate summand", "  BASE = TVE0 + B * FLARE + ETA_E0"),
+        (
+            "θ through a definition in scope",
+            "  TV = TVE0\n  BASE = TV + PLACEBO + ETA_E0",
+        ),
+    ];
+    for (label, indiv) in accepted {
+        let m = additive_mu_model(&format!("{indiv}\n  ETAX_USE = ETA_X"), "");
+        assert_eq!(e0_anchor(&m).as_deref(), Some("TVE0:Identity"), "{label}");
+    }
+    let rejected = [
+        (
+            "second BSV η",
+            "  BASE = TVE0 + PLACEBO + ETA_E0 + ETA_X\n  ETAX_USE = 0",
+        ),
+        (
+            "η in a summand",
+            "  BASE = TVE0 + PLACEBO + 0.5 * ETA_X + ETA_E0\n  ETAX_USE = 0",
+        ),
+        (
+            "two bare θ",
+            "  BASE = TVE0 + TH2 + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
+            "θ twice",
+            "  BASE = TVE0 + 0 * TVE0 + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
+            "θ through a definition",
+            "  X = 2 * TVE0\n  BASE = TVE0 + X + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
+            "θ through an if-local",
+            "  if (FLARE > 1) {\n    X = 2 * TVE0\n  } else {\n    X = 0\n  }\n  \
+             BASE = TVE0 + X + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
+            "θ through an if-local in a condition",
+            "  if (FLARE > 1) {\n    X = TVE0\n  } else {\n    X = 0\n  }\n  \
+             BASE = TVE0 + (if (X > 40) 1 else 0) + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
+            "η through a local",
+            "  X = 0.5 * ETA_X\n  BASE = TVE0 + PLACEBO + X + ETA_E0\n  ETAX_USE = 0",
+        ),
+        (
+            "non-bare θ",
+            "  BASE = 2 * TVE0 + PLACEBO + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+    ];
+    for (label, indiv) in rejected {
+        let m = additive_mu_model(indiv, "");
+        assert_eq!(e0_anchor(&m), None, "{label}");
+    }
+}
+
+/// T2 (#2544): the exclusivity gate, both sides in one test, on the one-line and
+/// the two-term spelling. TVE0 read (a) nowhere else, (d) only by a dead
+/// intermediate → kept; (b) in `[structural_model]`, (c) by an individual
+/// parameter the model reads, (e) the eta read by a second line → dropped.
+/// Dies under: the theta gate deleted ((b), (c)); the eta gate deleted ((e));
+/// the taint not stopped at the owner line, `owners = &[]` ((a), (d)).
+#[test]
+fn an_additive_mu_ref_needs_its_theta_and_eta_exclusive() {
+    for (label, base, reassigned) in [
+        (
+            "one-line",
+            "  BASE = TVE0 + PLACEBO + ETA_E0",
+            "  BASE = BASE + 0.5 * ETA_E0",
+        ),
+        (
+            "two-term",
+            "  E0 = TVE0 + ETA_E0\n  BASE = E0 + PLACEBO",
+            "  E0 = E0 + 0.5 * ETA_E0\n  BASE = E0 + PLACEBO",
+        ),
+    ] {
+        let case = |indiv_tail: &str, extra: &str| {
+            e0_anchor(&additive_mu_model(&format!("{base}\n{indiv_tail}"), extra))
+        };
+        let kept = Some("TVE0:Identity".to_string());
+        assert_eq!(case("  ETAX_USE = ETA_X", ""), kept, "{label} (a)");
+        assert_eq!(
+            case("  ETAX_USE = ETA_X", " + 0 * TVE0"),
+            None,
+            "{label} (b)"
+        );
+        assert_eq!(
+            case("  ETAX_USE = ETA_X + 0 * TVE0", ""),
+            None,
+            "{label} (c)"
+        );
+        assert_eq!(
+            case("  DEAD = 2 * TVE0\n  ETAX_USE = ETA_X", ""),
+            kept,
+            "{label} (d)"
+        );
+        assert_eq!(
+            case("  ETAX_USE = ETA_X + 0 * ETA_E0", ""),
+            None,
+            "{label} (e)"
+        );
+        // (f) a later assignment to the *owner's name* that reads the eta again: a second
+        // use like (e), so the gate compares statements, not names (#2553 review r1 §2).
+        assert_eq!(
+            case(&format!("{reassigned}\n  ETAX_USE = ETA_X"), ""),
+            None,
+            "{label} (f)"
+        );
+    }
+}
+
+/// T3 (#2544): `MixtureSpec::mu_refs` and `CompiledModel::mu_refs` agree on a
+/// later one-line additive line: `mu_refs` keeps it, so the class-aware entry
+/// on the same eta goes. Dies under: `detect_mixture_mu_refs` matching the later
+/// line with the raw `detect_pattern`, which misses the three-term sum.
+#[test]
+fn a_later_one_line_additive_mu_ref_clears_the_class_aware_entry() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = TVCL3 + 0.1 * WT + ETA_CL\n  V = TVV",
+    );
+    assert_eq!(
+        model
+            .mu_refs
+            .get("ETA_CL")
+            .map(|m| (m.theta_name.clone(), m.transform)),
+        Some(("TVCL3".to_string(), MuTransform::Identity))
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+
+    // The mixture scan builds its own inline scope and `outside_idents`, so each gets a
+    // row (#2553 review r1 §3). (i) The later line reads its θ through a local: only the
+    // scope's inlining sees it. Dies under: the mixture loop's `scope.record` deleted.
+    let via_local = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         TV = TVCL3\n  CL = TV + 0.1 * WT + ETA_CL\n  V = TVV",
+    );
+    assert_eq!(
+        via_local
+            .mu_refs
+            .get("ETA_CL")
+            .map(|m| m.theta_name.clone()),
+        Some("TVCL3".to_string()),
+        "via a local"
+    );
+    assert_eq!(class_anchors(&via_local, "ETA_CL"), None, "via a local");
+    // (ii) The later line's θ also reaches the model through `V`, which the structural
+    // model reads: `mu_refs` drops it, so the class-aware entry must stay. Dies under:
+    // the mixture scan's `outside_idents` emptied.
+    let shared = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = TVCL3 + 0.1 * WT + ETA_CL\n  V = TVV + 0 * TVCL3",
+    );
+    assert!(!shared.mu_refs.contains_key("ETA_CL"), "θ read elsewhere");
+    assert_eq!(
+        class_anchors(&shared, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string()]),
+        "θ read elsewhere"
+    );
+}
+
+/// T2 control (#2544): the exclusivity gate is for the BSV M-step and leaves
+/// kappa anchors alone. `KX = TVCL + K` keeps `K → TVCL` in `kappa_mu_refs` even
+/// though `CL` carries `TVCL` to the prediction, as it did before the gate.
+/// Dies under: the gate applied to kappas too (`eta_idx >= self.n_bsv` dropped
+/// from `MuRefScan::classify_assignment`'s early return).
+#[test]
+fn the_additive_exclusivity_gate_leaves_kappa_anchors_alone() {
+    let m = kappa_scale_model(
+        &["K"],
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KX = TVCL + K",
+    );
+    assert_eq!(
+        m.kappa_mu_refs
+            .get("K")
+            .map(|r| (r.theta_name.clone(), r.transform)),
+        Some(("TVCL".to_string(), MuTransform::Identity))
+    );
+}
+
+/// #2544: SAEM's "not mu-referenced" advice over the additive input space, one row
+/// per cell, each asserting the sentence that serves it (the `_shared` one-line row is
+/// `tests/saem_additive_mu_nonmem_anchor.rs`'s). Dies under, each sentence of the
+/// message deleted in turn: the names (every warned row), the log-form advice (every
+/// warned row), the rule (the second-eta and non-bare rows), the own-theta / own-eta
+/// clause (the non-bare and second-eta rows), the exclusivity sentence (the two-term
+/// row). The exclusive one-line row does not name BASE.
+#[test]
+fn the_not_mu_referenced_advice_over_the_additive_input_space() {
+    let warn = |indiv: &str, extra: &str| {
+        crate::api::saem_non_mu_referenced_individual_params_warning(
+            &additive_mu_model(indiv, extra),
+            &[],
+        )
+    };
+    let named = |w: &str, name: &str| {
+        let list = w
+            .split("not mu-referenced: ")
+            .nth(1)
+            .and_then(|r| r.split('.').next())
+            .unwrap_or("");
+        list.split(", ").any(|n| n == name)
+    };
+    // The fixture's `ETAX_USE = ETA_X` is never mu-referenced, so a warning exists;
+    // it must not name BASE.
+    let w = warn("  BASE = TVE0 + PLACEBO + ETA_E0\n  ETAX_USE = ETA_X", "").unwrap();
+    assert!(
+        named(&w, "ETAX_USE") && !named(&w, "BASE"),
+        "one-line, exclusive: {w}"
+    );
+    let rows = [
+        (
+            "second BSV eta",
+            "  BASE = TVE0 + PLACEBO + ETA_E0 + ETA_X\n  ETAX_USE = 0",
+            "",
+            "and its own ETA",
+        ),
+        (
+            "non-bare theta",
+            "  BASE = 2 * TVE0 + PLACEBO + ETA_E0\n  ETAX_USE = ETA_X",
+            "",
+            "a THETA of its own, not a multiple of one",
+        ),
+        (
+            "two-term, theta read elsewhere",
+            "  E0 = TVE0 + ETA_E0\n  BASE = E0 + PLACEBO\n  ETAX_USE = ETA_X",
+            " + 0 * TVE0",
+            "That THETA and that ETA must reach the model only through that line",
+        ),
+    ];
+    for (label, indiv, extra, says) in rows {
+        let w = warn(indiv, extra).unwrap_or_else(|| panic!("{label}: no warning"));
+        let owner = if label.starts_with("two-term") {
+            "E0"
+        } else {
+            "BASE"
+        };
+        assert!(named(&w, owner), "{label}: names {owner}: {w}");
+        assert!(
+            w.contains("prefer forms such as `CL = TVCL * exp(ETA_CL)`"),
+            "{label}: {w}"
+        );
+        assert!(
+            w.contains("An additive ETA is mu-referenced when its line adds one bare THETA"),
+            "{label}: {w}"
+        );
+        assert!(w.contains(says), "{label}: {w}");
+    }
+}

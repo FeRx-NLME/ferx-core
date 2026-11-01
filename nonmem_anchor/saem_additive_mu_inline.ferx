@@ -1,7 +1,10 @@
-# #2540 control for saem_additive_mu.ferx: the same model with E0 folded into
-# BASE, so TVE0 is summed with another term and is not mu-referenced. SAEM then
-# moves it only through the eta-frozen numerical M-step, and lands several OFV
-# units above the MLE, as NONMEM SAEM without MU_ does (saem_additive_mu_nomu.ctl).
+# #2544 inline twin of saem_additive_mu.ferx: the same model with E0 folded into
+# BASE. The line adds one bare theta (TVE0), one eta (ETA_E0) and a term that reads
+# neither (PLAFIX), and TVE0 and ETA_E0 reach the model through nothing else, so it
+# is the same additive mu-reference as `E0 = TVE0 + ETA_E0` and SAEM moves TVE0 by
+# the same closed-form shift. The NONMEM twin is saem_additive_mu_inline.ctl
+# (BASE = MU_1 + PLA + ETA(1)), bit-identical to saem_additive_mu.ctl. Before #2544
+# this line was not a mu-reference; saem_additive_mu_shared.ferx is that control.
 
 [parameters]
   theta TVE0(45.0, 0.0, 200.0)

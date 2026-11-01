@@ -573,7 +573,7 @@ PARAM = 1/(1 + exp(-(THETA + ETA)))   # the same, written out by hand
 
 ferx records the `(ETA → THETA)` mapping and uses it to re-centre the inner-loop ETA search at each outer iteration — reproducing NONMEM / nlmixr2's MU-referencing behaviour without requiring you to write an explicit `MU_i` line. See the [FAQ](../faq.qmd#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2) for details on which patterns are and are not detected, and for the `mu_referencing = false` escape hatch.
 
-### Typical values on their own line, and explicit `MU_` variables
+### Typical values on their own line, and explicit `MU_` variables {#sec-typical-own-line}
 
 Detection also sees through a local variable that is defined earlier in the
 block, as long as that variable is assigned exactly once (never inside an `if`)
@@ -591,6 +591,27 @@ the same `(ETA_CL → TVCL)` mapping as the one-line forms above:
   V    = exp(MU_1 + ETA_V)
 ```
 
+An additive typical value may also share its line with other terms. Since
+[#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544) a sum of one bare theta,
+one eta, and terms that read neither is the same `(ETA_E0 → TVE0)` mapping as
+`E0 = TVE0 + ETA_E0`:
+
+```
+  BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM   # same as E0 = TVE0 + ETA_E0, BASE = E0 + PLACEBO + KAPPA_ARM
+```
+
+The other terms may read kappas, covariates and other thetas (`B * FLARE`). Not
+recognised:
+
+- a second eta in the sum, or the eta inside a term (`0.5 * ETA_E0`);
+- the theta in a term as well (`TVE0 + 0 * TVE0`), directly or through a local;
+- a theta that is not bare (`2 * TVE0 + ...`): give the typical value a theta of its own;
+- a term reading a local the detection cannot resolve (assigned twice, in an `if`, or
+  holding an eta);
+- a theta or eta that reaches the model by another route: another block names it, or
+  another individual parameter that the model reads does. This holds for the two-term
+  `E0 = TVE0 + ETA_E0` too, and splitting the line does not change it.
+
 ### Logit-normal parameters and the EM estimators {#sec-logit-mu-ref}
 
 SAEM and IMP/IMPMAP update a mu-referenced typical value with the closed-form EM
@@ -603,7 +624,7 @@ is used only when the packed scale *is* the mu scale:
 | `THETA * exp(ETA)` | `log(THETA)` | yes — `THETA` is log-packed (lower bound ≥ 0) |
 | `inv_logit(THETA + ETA)` | `THETA` | yes — a logit-scale `THETA` has a negative lower bound, so it is packed as-is |
 | `inv_logit(logit(THETA) + ETA)` | `logit(THETA)` | no — falls back to the numeric M-step |
-| `THETA + ETA` | `THETA` | no — falls back to the numeric M-step |
+| `THETA + ETA` | `THETA` | SAEM: yes, on the natural scale whatever the packing ([#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540)); IMP/IMPMAP: no |
 
 Both logit forms are correct and both are mu-referenced; the difference is only
 which one gets the faster, better-behaved M-step. For a bounded parameter that is

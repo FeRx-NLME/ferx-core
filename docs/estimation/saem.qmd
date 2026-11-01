@@ -233,17 +233,28 @@ a `[mixture]` an additive anchor stays on the numerical M-step, since the class-
 shift has no additive arm, and IMP and IMPMAP step the packed value, so for them an
 additive theta takes the numerical M-step too.
 
-The theta must enter only through that line. Write the typical value and the eta on
-a line of their own and build the rest on it:
+The typical value can have a line of its own or share one with other terms. Since
+[#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544) these two are the same
+mu-reference:
 
 ```
 E0   = TVE0 + ETA_E0
 BASE = E0 + PLACEBO + KAPPA_ARM
+
+BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM
 ```
 
-`BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM` is the same model, but it is not
-recognised as a mu-reference (SAEM warns `not mu-referenced: BASE`). This is the
-same split NONMEM asks for, with `MU_1 = THETA(1)` and `E0 = MU_1 + ETA(1)`.
+A line is recognised when it adds one bare theta, one eta, and terms that read
+neither; the terms may read kappas, covariates and other thetas. NONMEM writes the
+same thing as `MU_1 = THETA(1)` with `E0 = MU_1 + ETA(1)` or
+`BASE = MU_1 + PLA + ETA(1)`; the two streams end bit-identical
+(`nonmem_anchor/saem_additive_mu_inline.ctl`). The theta and the eta must enter the
+model only through that line, in either spelling. When another block reads the theta,
+or another individual parameter that the model reads does, or another line reads the
+eta, the anchor is dropped and SAEM warns `not mu-referenced: BASE`: the shift sets the
+theta to the mean of $\theta + \eta_i$, which is the M-step only if nothing else
+moves with it. [Individual parameters](../model-file/individual-parameters.qmd#sec-typical-own-line)
+lists the shapes that are not recognised.
 
 Without the shift, an additive theta sits on a ridge. With the etas frozen, the data
 determine only $\theta + \overline{\eta}$. The split between the two is set only by
@@ -256,9 +267,9 @@ units above the minimum on five seeds, with TVE0 4.7 low and $\omega^2$ 30.3 aga
 
 | | OFV (MLE 165.8260) |
 |---|---|
-| ferx, `BASE = TVE0 + PLAFIX + ETA_E0` | 168.54 – 172.76 |
+| ferx, `BASE = TVE0 + PLAFIX + ETA_E0` before #2544, or with TVE0 read elsewhere | 168.54 – 172.76 |
 | NONMEM, no `MU_` | 167.41 – 174.32 |
-| ferx, `E0 = TVE0 + ETA_E0` | 165.8260 – 165.8266 |
+| ferx, `E0 = TVE0 + ETA_E0`, and `BASE = TVE0 + PLAFIX + ETA_E0` since #2544 | 165.8260 – 165.8266 |
 | NONMEM, `MU_1` | 165.8260 – 165.8261 |
 
 On the full `mbma_placebo` model with the split spelling, SAEM lands at 97.33–98.39.
@@ -337,8 +348,8 @@ can bias the estimate outright.
 
 Whenever the estimation chain runs SAEM, ferx warns if any individual parameter's
 random effect is **not** mu-referenced — for example
-`BASE = TVE0 + PLACEBO + ETA_E0`, where the typical value is summed with other terms
-in one line, instead of `E0 = TVE0 + ETA_E0` on a line of its own
+`BASE = TVE0 + PLACEBO + ETA_E0` when TVE0 is also read in `[structural_model]`, so it
+does not enter only through that line
 ([additive mu-references](#saem-mstep-additive)). Such parameters cannot use the closed-form EM update
 above and fall back to the slower NLopt M-step, which can strongly slow convergence.
 (A typical value that reads several thetas, such as an additive covariate model, is
@@ -346,8 +357,9 @@ above and fall back to the slower NLopt M-step, which can strongly slow converge
 mu-references](#saem-mstep-covariate-mu-ref).) The warning fires independently of the `mu_referencing`
 fit option: turning the option off does not remove the risk — it removes the
 mu-centering that mitigates it — so the diagnostic is most warranted in exactly that
-case. Prefer log-mu-referenced forms (`P = TV * exp(ETA)`), the additive form on a
-line of its own (`E0 = TVE0 + ETA_E0`), or, for a parameter bounded to $(0,1)$, the
+case. Prefer log-mu-referenced forms (`P = TV * exp(ETA)`), the additive form
+(`E0 = TVE0 + ETA_E0`, or a sum with one bare theta and one eta), or, for a parameter
+bounded to $(0,1)$, the
 logit-scale form `P = inv_logit(LOGIT_P + ETA_P)`.
 :::
 
@@ -1032,10 +1044,15 @@ the 6-study `tests/data/mbma_placebo` model, η enters linearly with a fixed res
 default length, two at 500 + 2000 iterations) stopped 1–11 units above that, all reporting
 `converged` ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536); macOS arm64; on Linux
 the same runs stop 1.3–11.6 units above, seed 2 at 98.35 with a decrement of 1.46, which warns
-too). The cause is
-that model's one-line `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`, which leaves TVE0
-un-mu-referenced. With `E0 = TVE0 + ETA_E0` on a line of its own, SAEM lands at 97.33–98.39
-([Additive mu-references](#saem-mstep-additive)). The rows below are the one-line model:
+too). The cause was
+that model's one-line `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`, which before
+[#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544) left TVE0 un-mu-referenced.
+With TVE0 mu-referenced, SAEM on seeds 12345, 2, 3, 7, 11 lands at 97.33–98.39 for
+`E0 = TVE0 + ETA_E0` on a line of its own and, since #2544, at 97.21–98.88 for the
+one-line spelling (macOS arm64; per seed the two differ, since the sums associate
+differently, but the spread is the same —
+[Additive mu-references](#saem-mstep-additive)). The rows below are the one-line model
+before #2544, the shape a line whose theta is also read elsewhere still has:
 
 | fit | −2 log L | TVE0 | ω² | covariance step |
 |---|---|---|---|---|

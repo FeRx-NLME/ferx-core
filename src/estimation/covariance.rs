@@ -2895,7 +2895,8 @@ fn covariance_step(
         cov_warnings.push(msg);
     }
     // #2541: a positive-definite `R` says nothing about whether the estimate is stationary —
-    // on `mbma_placebo` SAEM seed 2 has a PD `R` and a Newton decrement of 14.9 OFV units, as
+    // on `mbma_placebo` (one-line, before #2544) SAEM seed 2 has a PD `R` and a Newton decrement
+    // of 14.9 OFV units, as
     // far from the minimum as the seed whose `R` the floor clipped. So the gradient decides.
     // Off the fallback a sampler's `R` was not clipped, so `inv.inverse` is exactly `H⁻¹`.
     // The gradient is taken at the modes reconverged at `cov_inner_tol` (a mixture re-solves
