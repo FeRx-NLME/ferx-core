@@ -9322,10 +9322,24 @@ pub(crate) fn ode_solve_until_chz_threshold(
     threshold: f64,
     horizon: f64,
 ) -> ThresholdOutcome {
-    use crate::ode::solver::{solve_ode_until_threshold, ThresholdCrossing};
+    use crate::ode::solver::{solve_ode_until_threshold_labelled, ThresholdCrossing};
 
     let n = ode.n_states;
     let opts = ode.effective_solver_opts();
+    // A `SolveFailed` reason reaches the user as a simulation warning (#2087), so it names the
+    // states as the model file does: `[odes]` names backticked, the injected accumulator by
+    // what it is rather than by its internal `__chz_<cmt>` name.
+    let labels: Vec<String> = (0..n)
+        .map(|k| {
+            if k == chz_state {
+                "the cumulative hazard".to_string()
+            } else {
+                ode.state_names
+                    .get(k)
+                    .map_or_else(|| format!("state {k}"), |name| format!("`{name}`"))
+            }
+        })
+        .collect();
     let mut u = ode.initial_state(disposition);
 
     // Resolve modeled-RATE doses once, exactly as the dense path (#324).
@@ -9421,7 +9435,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
 
         // The absolute CHZ threshold is held across segments — `u[chz_state]`
         // accumulates continuously, so a crossing in any segment is the event.
-        match solve_ode_until_threshold(
+        match solve_ode_until_threshold_labelled(
             &wrapped_rhs,
             &mut u,
             (t_start, t_end),
@@ -9429,6 +9443,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &opts,
             chz_state,
             threshold,
+            Some(&labels),
         ) {
             ThresholdCrossing::Crossed(t) => return ThresholdOutcome::Crossed(t),
             ThresholdCrossing::ReachedEnd => {} // u advanced; carry into next segment

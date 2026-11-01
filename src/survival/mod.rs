@@ -1739,10 +1739,13 @@ pub(crate) fn ode_cumhaz_hazard(
 /// `horizon` must be `Some` and finite — the `simulate` entry points validate this
 /// (a drug-driven hazard can vanish, so there is no implicit window). Left
 /// truncation (`entry_time > 0`) for an ODE hazard is a deferred follow-up and is
-/// rejected up front, so the search starts at 0. A non-finite / non-monotone
-/// (negative) hazard cannot yield a meaningful event time: rather than silently
-/// censoring a broken model it **panics** — the fit path has an optimizer to steer
-/// away via a sentinel NLL, but simulation does not.
+/// rejected up front, so the search starts at 0. A solve that cannot yield a
+/// meaningful event time (a diverged `[odes]` state, a non-finite / non-monotone
+/// hazard, an exhausted step budget) returns `Err` with the solver's reason; the
+/// caller censors that subject and names it in a `W_TTE_SOLVE_FAILED` warning
+/// (#2087), so one bad parameter draw does not cost the rest of the population.
+/// `u` is drawn before the solve, so a failed draw consumes exactly the RNG a
+/// successful one does.
 #[cfg(feature = "survival")]
 fn draw_ode_tte_latent<R: rand::Rng>(
     model: &crate::types::CompiledModel,
@@ -1751,9 +1754,8 @@ fn draw_ode_tte_latent<R: rand::Rng>(
     eta: &[f64],
     chz_state: usize,
     horizon: Option<f64>,
-    cmt: usize,
     rng: &mut R,
-) -> f64 {
+) -> Result<f64, String> {
     let horizon = horizon.expect(
         "ODE-accumulated TTE simulation requires a finite horizon; the simulate entry \
          points validate this before sampling",
@@ -1781,12 +1783,9 @@ fn draw_ode_tte_latent<R: rand::Rng>(
         threshold,
         horizon,
     ) {
-        crate::ode::ThresholdOutcome::Crossed(t) => t,
-        crate::ode::ThresholdOutcome::CensoredAtHorizon => f64::MAX,
-        crate::ode::ThresholdOutcome::SolveFailed(why) => panic!(
-            "ODE-accumulated TTE simulation failed for subject '{}' (CMT={cmt}): {why}",
-            subject.id
-        ),
+        crate::ode::ThresholdOutcome::Crossed(t) => Ok(t),
+        crate::ode::ThresholdOutcome::CensoredAtHorizon => Ok(f64::MAX),
+        crate::ode::ThresholdOutcome::SolveFailed(why) => Err(why),
     }
 }
 
@@ -2197,29 +2196,43 @@ pub fn simulate_tte<R: rand::Rng>(
                     (t, observed)
                 }
                 CauseKind::Ode { chz_state } => {
-                    let latent = draw_ode_tte_latent(
-                        model, subject, theta, eta, *chz_state, horizon, *cmt, rng,
-                    );
-                    let observed = latent < *window && latent < f64::MAX;
-                    (if observed { latent } else { *window }, observed)
+                    match draw_ode_tte_latent(model, subject, theta, eta, *chz_state, horizon, rng)
+                    {
+                        Ok(latent) => {
+                            let observed = latent < *window && latent < f64::MAX;
+                            (if observed { latent } else { *window }, observed)
+                        }
+                        Err(why) => {
+                            warnings.push(ode_solve_failed_warning(
+                                &subject.id,
+                                *cmt,
+                                &why,
+                                *window,
+                                false,
+                            ));
+                            (*window, false)
+                        }
+                    }
                 }
             };
             push(*cmt, t, observed, results);
         }
         // Competing risks: earliest latent event wins; the rest censor at that time.
         // Draw in record order so the RNG sequence stays deterministic across the mix.
+        // Every cause is drawn even after an ODE cause fails, so a subject consumes the
+        // same RNG either way and later subjects' draws do not shift (#2087).
         _ => {
-            let latents: Vec<f64> = causes
+            let drawn: Vec<Result<f64, String>> = causes
                 .iter()
-                .map(|(cmt, _, kind)| match kind {
+                .map(|(_, _, kind)| match kind {
                     CauseKind::Analytic {
                         family,
                         params,
                         entry_time,
-                    } => draw_tte_latent(*family, params, *entry_time, rng),
-                    CauseKind::Ode { chz_state } => draw_ode_tte_latent(
-                        model, subject, theta, eta, *chz_state, horizon, *cmt, rng,
-                    ),
+                    } => Ok(draw_tte_latent(*family, params, *entry_time, rng)),
+                    CauseKind::Ode { chz_state } => {
+                        draw_ode_tte_latent(model, subject, theta, eta, *chz_state, horizon, rng)
+                    }
                 })
                 .collect();
             // Shared administrative horizon across causes. `observation_window`
@@ -2236,6 +2249,28 @@ pub fn simulate_tte<R: rand::Rng>(
                 .iter()
                 .map(|(_, w, _)| *w)
                 .fold(f64::NEG_INFINITY, f64::max);
+            // A failed ODE cause leaves no latent to compete with, so no cause of the
+            // subject can be resolved: every cause is censored at the shared window and
+            // each failed cause is named. The #763 degenerate check below is skipped —
+            // the subject's outcome is already flagged.
+            if drawn.iter().any(Result::is_err) {
+                for ((cmt, ..), d) in causes.iter().zip(&drawn) {
+                    if let Err(why) = d {
+                        warnings.push(ode_solve_failed_warning(
+                            &subject.id,
+                            *cmt,
+                            why,
+                            window,
+                            true,
+                        ));
+                    }
+                }
+                for (cmt, ..) in &causes {
+                    push(*cmt, window, false, results);
+                }
+                return;
+            }
+            let latents: Vec<f64> = drawn.into_iter().map(Result::unwrap).collect();
             let (win_idx, obs_time, event) = resolve_competing_risks(&latents, window);
             // A censored competing-risks outcome is spurious when it is driven by a
             // degenerate *analytic* draw (the `f64::MAX` sentinel) rather than a genuine
@@ -2264,6 +2299,40 @@ fn degenerate_hazard_warning(id: &str, cmt: usize) -> String {
         "W_TTE_DEGENERATE_HAZARD: subject '{id}' (CMT={cmt}) drew a non-positive / non-finite \
          effective hazard rate; no event was generated and the subject is censored at the \
          observation window (#763). Check the hazard parameters / covariate values."
+    )
+}
+
+/// Diagnostic for a subject whose ODE-accumulated event-time solve failed (#2087):
+/// collected into [`crate::api::SimulationOutput::warnings`] in place of the panic that
+/// used to abort the whole simulation. `why` is the solver's reason
+/// ([`crate::ode::ThresholdOutcome::SolveFailed`]); the divergence sentence is added only
+/// when that reason says a state went non-finite, so a negative-hazard or step-budget
+/// failure is not blamed on a diverged right-hand side. `competing` selects the
+/// competing-risks wording, where every cause of the subject is censored.
+#[cfg(feature = "survival")]
+fn ode_solve_failed_warning(
+    id: &str,
+    cmt: usize,
+    why: &str,
+    window: f64,
+    competing: bool,
+) -> String {
+    let diverged = if why.contains("became non-finite") {
+        " The [odes] right-hand side diverged for this subject's parameter draw."
+    } else {
+        ""
+    };
+    let censored = if competing {
+        "every cause of the subject is censored at"
+    } else {
+        "the subject is censored at"
+    };
+    format!(
+        "W_TTE_SOLVE_FAILED: subject '{id}' (CMT={cmt}): the event-time solve of the \
+         ODE-accumulated hazard failed: {why}.{diverged} No event time could be simulated, so \
+         {censored} the observation window (t={window}) and is not simulated past the \
+         failure. The rest of the population still simulates. Check the [odes] right-hand \
+         side and the parameter values, including the drawn random effects."
     )
 }
 
@@ -4294,6 +4363,139 @@ mod tests {
         let (cif, s_all) = cif_curves(&cum);
         for i in 0..grid.len() {
             assert_abs_diff_eq!(cif[0][i], 1.0 - s_all[i], epsilon = 1e-12);
+        }
+    }
+
+    /// The solver's `SolveFailed` reasons, one per producer class, as the labelled CHZ
+    /// driver words them (`ode/solver.rs` `until_threshold_with` / `with_nonfinite_state_note`,
+    /// `ode/predictions.rs` `ode_solve_until_chz_threshold`). The bool is whether a state
+    /// went non-finite, i.e. whether the divergence sentence belongs in the warning.
+    #[cfg(feature = "survival")]
+    const SOLVE_FAILED_REASONS: [(&str, bool); 7] = [
+        (
+            "state `blowup` became non-finite before t=2.500017; step budget (10000) exhausted \
+             before reaching t_end=30.000000 (reached t=2.500017)",
+            true,
+        ),
+        (
+            "the cumulative hazard became non-finite at t=2.000000",
+            true,
+        ),
+        (
+            "the cumulative hazard decreased (0.500000 → 0.400000) over [1.000000, 1.100000]: \
+             non-monotone accumulator (negative rate / hazard)",
+            false,
+        ),
+        (
+            "step budget (10000) exhausted before reaching t_end=30.000000 (reached t=4.000000)",
+            false,
+        ),
+        (
+            "aborted at t=1.000000 after 3 min-dt clamp(s) (ode_stiff_abort_after): the segment \
+             is stability-limited",
+            false,
+        ),
+        (
+            "the step at t=1.000000 could not be formed even at min_dt (singular Jacobian system)",
+            false,
+        ),
+        ("non-finite break time", false),
+    ];
+
+    /// #2087 message input space: every producer class gets the code, the subject, the CMT,
+    /// the censoring time and each fixed sentence; the divergence sentence appears exactly
+    /// when a state went non-finite — both sides of that gate asserted here, in one test, so
+    /// forcing it either way reddens it.
+    ///
+    /// Mutations that redden it (one per sentence): drop the code / subject / CMT / reason;
+    /// make the divergence sentence unconditional, or delete it; delete the censoring
+    /// sentence or its window; delete "The rest of the population still simulates."; delete
+    /// the "Check the [odes]" advice.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ode_solve_failed_warning_covers_every_reason_class() {
+        for (why, nonfinite) in SOLVE_FAILED_REASONS {
+            let w = ode_solve_failed_warning("7", 2, why, 30.0, false);
+            assert!(
+                w.starts_with("W_TTE_SOLVE_FAILED: subject '7' (CMT=2): "),
+                "{w}"
+            );
+            assert!(w.contains(&format!("failed: {why}.")), "{w}");
+            assert_eq!(
+                w.contains(
+                    "The [odes] right-hand side diverged for this subject's parameter draw."
+                ),
+                nonfinite,
+                "divergence sentence must track whether a state went non-finite: {w}"
+            );
+            assert!(
+                w.contains(
+                    "No event time could be simulated, so the subject is censored at the \
+                     observation window (t=30) and is not simulated past the failure."
+                ),
+                "{w}"
+            );
+            assert!(
+                w.contains("The rest of the population still simulates."),
+                "{w}"
+            );
+            assert!(
+                w.contains(
+                    "Check the [odes] right-hand side and the parameter values, including the \
+                     drawn random effects."
+                ),
+                "{w}"
+            );
+            assert!(!w.contains("degenerate"), "{w}");
+            assert!(!w.contains("__chz"), "{w}");
+            // No bare 0-based state index: every "state " is followed by a label, not a digit.
+            for (i, _) in w.match_indices("state ") {
+                let next = w[i + "state ".len()..].chars().next();
+                assert!(!next.is_some_and(|c| c.is_ascii_digit()), "{w}");
+            }
+        }
+    }
+
+    /// #2087: the competing-risks wording says every cause is censored, the single-cause
+    /// wording does not — both sides of the `competing` gate on the same reason.
+    ///
+    /// Mutations that redden it: ignore `competing` (either wording on both legs).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ode_solve_failed_warning_competing_wording_straddles_the_gate() {
+        let (why, _) = SOLVE_FAILED_REASONS[0];
+        let cr = ode_solve_failed_warning("1", 3, why, 12.5, true);
+        let single = ode_solve_failed_warning("1", 3, why, 12.5, false);
+        assert!(
+            cr.contains(
+                "so every cause of the subject is censored at the observation window (t=12.5)"
+            ),
+            "{cr}"
+        );
+        assert!(!single.contains("every cause"), "{single}");
+        assert!(
+            single.contains("so the subject is censored at the observation window (t=12.5)"),
+            "{single}"
+        );
+    }
+
+    /// #2087 T6: every reason class, as the real builder words it, classifies as a
+    /// `simulation` warning — not as the solver-health / optimizer / stiffness category its
+    /// interpolated solver text ("step budget", "non-finite", "stability-limited",
+    /// "singular Jacobian") would otherwise match.
+    ///
+    /// Mutations that redden it: delete the `w_tte_solve_failed` arm in `classify_warning`, or
+    /// move it below the prose arms; rename the code off its `W_TTE_SOLVE_FAILED` prefix.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ode_solve_failed_warning_classifies_as_simulation() {
+        for competing in [false, true] {
+            for (why, _) in SOLVE_FAILED_REASONS {
+                let w = ode_solve_failed_warning("7", 2, why, 30.0, competing);
+                let e = crate::types::classify_warning(&w);
+                assert_eq!(e.category.as_str(), "simulation", "{w}");
+                assert_eq!(e.severity, crate::types::WarningSeverity::Warning, "{w}");
+            }
         }
     }
 }

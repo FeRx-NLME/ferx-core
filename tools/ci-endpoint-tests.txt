@@ -45,6 +45,7 @@ survival_time_dependent_pk
 tte_convergence
 tte_exponential_ebe_nonmem_anchor
 tte_inner_fd_warning
+tte_ode_solve_failed
 tte_residuals_nonmem_anchor
 tte_smoke
 vi_dcm_omega_recovery

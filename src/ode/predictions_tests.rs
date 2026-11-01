@@ -518,7 +518,53 @@ fn until_chz_threshold_negative_hazard_fails() {
         1000.0,
     ) {
         ThresholdOutcome::SolveFailed(msg) => {
-            assert!(msg.contains("non-monotone"), "msg: {msg}")
+            assert!(msg.contains("non-monotone"), "msg: {msg}");
+            // #2087: the reason reaches the user, so the accumulator is named by what it
+            // is — not by its index, nor by the state name the spec gave it.
+            assert!(
+                msg.starts_with("the cumulative hazard decreased ("),
+                "msg: {msg}"
+            );
+            assert!(!msg.contains("monitored state"), "msg: {msg}");
+            assert!(!msg.contains("chz"), "msg: {msg}");
+        }
+        other => panic!("expected SolveFailed, got {other:?}"),
+    }
+}
+
+/// #2087: an unmonitored `[odes]` state that diverges is named in the `SolveFailed` reason by
+/// its backticked `[odes]` name, not by its 0-based index. `central` here obeys
+/// `dC/dt = C²` from `C(0) = 1`, so it diverges at t = 1 while the accumulator stays finite.
+///
+/// Engine: the labelled CHZ driver, value path. Mutations that redden it: pass `None` labels
+/// from `ode_solve_until_chz_threshold` (prints `state 0`); render names without backticks.
+#[cfg(feature = "survival")]
+#[test]
+fn until_chz_threshold_names_a_diverged_state_by_its_odes_name() {
+    let ode = OdeSpec {
+        rhs: Box::new(|y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+            dy[0] = y[0] * y[0];
+            dy[1] = 0.0;
+        }),
+        ..one_cpt_chz_seeded_ode_spec(1.0)
+    };
+    let subject = make_subject(vec![], vec![]);
+    let pk = pk_one(10.0, 100.0);
+    match ode_solve_until_chz_threshold(
+        &ode,
+        &pk.values,
+        DoseReads::Shared(&pk.values),
+        &subject,
+        1,
+        5.0,
+        30.0,
+    ) {
+        ThresholdOutcome::SolveFailed(msg) => {
+            assert!(
+                msg.starts_with("state `central` became non-finite before t="),
+                "msg: {msg}"
+            );
+            assert!(!msg.contains("state 0"), "msg: {msg}");
         }
         other => panic!("expected SolveFailed, got {other:?}"),
     }
