@@ -5251,7 +5251,14 @@ impl AdaptiveRecordIndex {
     /// is not a record and the carry stays put. Shared by the driver and its frozen replay,
     /// so the two cannot advance the carry differently.
     fn carried_pk_at(&self, t_end: f64, event_pk: &crate::pk::EventPkParams) -> Option<PkParams> {
-        self.last_at(t_end).map(|rec| rec.pk(event_pk))
+        self.carried_record_at(t_end).map(|rec| rec.pk(event_pk))
+    }
+
+    /// The record whose snapshot the LOCF carry takes after the walk integrates into
+    /// `t_end` — the one lookup behind [`Self::carried_pk_at`] and the driver's carried
+    /// covariate row (#943 review r1 #1), so the two cannot advance on different records.
+    fn carried_record_at(&self, t_end: f64) -> Option<AdaptiveRecord> {
+        self.last_at(t_end)
     }
 
     /// Time of the record that GOVERNS the segment ending at `t_end` (#1073): `t_end`
@@ -5302,17 +5309,19 @@ fn governing_record_at(t_end: f64, records: &AdaptiveRecordIndex) -> Option<Adap
 /// Covariate twin of [`governing_segment_pk_at`] (#943): the row of the record whose
 /// snapshot the segment ending at `t_end` integrates under, so a readout that names a
 /// covariate directly (an `observe` expression, a Form C `y =`) reads the row its PK was
-/// built from. Past the final record, the row in force there ([`locf_decision_cov`]) —
-/// the record whose PK the walk carries on.
+/// built from. Past the final record, `last_cov` — the row the driver carries in step with
+/// `last_pk` (#943 review r1 #1). Not the row in force there: that skips an `ADDL`-implied
+/// dose (#2528), which the PK carry steps through, so a train running past the last data
+/// record would pair the implied dose's PK with an earlier record's row.
 fn governing_segment_cov_at<'a>(
     t_end: f64,
     records: &AdaptiveRecordIndex,
     subject: &'a Subject,
-    baseline: &'a HashMap<String, f64>,
+    last_cov: &'a HashMap<String, f64>,
 ) -> &'a HashMap<String, f64> {
     match governing_record_at(t_end, records) {
         Some(rec) => rec.cov(subject),
-        None => locf_decision_cov(records, t_end, subject, baseline),
+        None => last_cov,
     }
 }
 
@@ -5740,6 +5749,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // baseline window (`None`, κ = 0) and advances as the loop crosses decisions and
     // records. Unused (`!iov`).
     let mut last_occ: Option<usize> = None;
+    // Covariate twin of `last_pk` (#943 review r1 #1): the row of the record whose PK the
+    // carry holds, advanced at exactly the points `last_pk` is, so the window AUC's readout
+    // past the final record reads the row its PK came from. Read only there, and only when
+    // `tv` with an `auc_target`; before any record it is the baseline, as `init_pk` is.
+    let mut last_cov: &HashMap<String, f64> = &subject.covariates;
 
     let mut u = if tv {
         ode.initial_state(&init_pk.values)
@@ -6060,6 +6074,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
         if let (Some(dp), Some(&g)) = (decision_pk, decision_index_of.get(&t_start.to_bits())) {
             last_pk = dp[g];
             last_occ = Some(g);
+            // `decision_pk[g]` is built from this row (`run_adaptive_population`).
+            last_cov = locf_decision_cov(&records, t_start, subject, &subject.covariates);
         }
 
         // What a decision at `t_start` reads (#1148): ONE record — the one in force there
@@ -6643,7 +6659,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // integrated with. The `[scaling]` divisor inside `scale_readout` keeps the
             // subject's t = 0 covariates, as `simulate()` divides by (#2129).
             let seg_cov = if tv && auc.is_some() {
-                governing_segment_cov_at(t_end, &records, subject, &shadow.covariates)
+                governing_segment_cov_at(t_end, &records, subject, last_cov)
             } else {
                 &shadow.covariates
             };
@@ -6787,8 +6803,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // `last_params`. An EVID=3/4 reset is a record (#1133, #1148); of a co-timed
             // group the LAST in processing order is the one left in force (`last_at`).
             if tv {
-                if let Some(pk) = event_pk.and_then(|ev| records.carried_pk_at(t_end, ev)) {
-                    last_pk = pk;
+                if let (Some(ev), Some(rec)) = (event_pk, records.carried_record_at(t_end)) {
+                    last_pk = rec.pk(ev);
+                    last_cov = rec.cov(subject);
                     last_occ = seg_occ;
                 }
             }

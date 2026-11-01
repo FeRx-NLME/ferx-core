@@ -277,13 +277,15 @@ fn run_tv(csv: &str, want: &[f64], label: &str) {
 /// the window edges (records only at 0, 24, 48): each window is then one segment, and its
 /// AUC moves by 30% or more, so the interior record is what the first fixture measures.
 ///
-/// A third geometry ends the records at 36, before the last decision: the trailing segment
-/// has no governing record and reads the row in force at its end.
+/// A third geometry puts a decision where there is no data row (review r1 #3), and a fourth
+/// ends the records at 36, before the last decision: the trailing segment has no governing
+/// record and reads the row the PK carry holds.
 ///
 /// Mutations, each killing this test (#943 PR 2): read the grid points under the t = 0 PK
 /// (`pk_params_flat`, `V = 50`) instead of `seg_pk`; read them under the subject's static
-/// covariates (`FU = 0.5`) instead of the governing record's row; past the final record,
-/// read the baseline row instead of the one in force.
+/// covariates (`FU = 0.5`) instead of the governing record's row; read the in-force row
+/// instead of the governing one; past the final record, leave the carried row at the
+/// baseline instead of advancing it with the PK.
 #[test]
 fn auc_target_follows_a_covariate_that_changes_inside_a_window() {
     let rows = [
@@ -318,9 +320,65 @@ fn auc_target_follows_a_covariate_that_changes_inside_a_window() {
     run_tv(&tv_csv(&edges), &at_edges, "covariate on the window edges");
     assert_distinct(&inside, &at_edges, AUC_TOL, "interior record vs edges only");
 
+    // A decision with no data row (review r1 #3): the row at 24 moves to 30, so the
+    // segments either side of the decision at 24 both end ahead of it and run under the
+    // row at 30 — not the row in force at 24 (the one at 12).
+    let off_grid = [
+        obs_row(0.0, R0),
+        obs_row(12.0, R12),
+        obs_row(30.0, R24),
+        obs_row(36.0, R36),
+        obs_row(48.0, R48),
+    ];
+    let segs_off = |before_24| {
+        exact_window_aucs(
+            &[
+                tv_seg(0.0, 12.0, R12),
+                tv_seg(12.0, 24.0, before_24),
+                tv_seg(24.0, 30.0, R24),
+                tv_seg(30.0, 36.0, R36),
+                tv_seg(36.0, 48.0, R48),
+            ],
+            &boluses,
+            &[],
+            &DECISIONS,
+        )
+    };
+    let decision_off_grid = segs_off(R24);
+    run_tv(
+        &tv_csv(&off_grid),
+        &decision_off_grid,
+        "decision with no data row",
+    );
+    // The in-force row at 24 (the one at 12) for the readout, under the PK of the row at 30.
+    let (cl, v) = (5.0 * R24.0 / 100.0, 50.0 * R24.1 / 70.0);
+    let in_force_fu = exact_window_aucs(
+        &[
+            tv_seg(0.0, 12.0, R12),
+            Seg {
+                t0: 12.0,
+                t1: 24.0,
+                k: cl / v,
+                factor: R12.2 / v,
+            },
+            tv_seg(24.0, 30.0, R24),
+            tv_seg(30.0, 36.0, R36),
+            tv_seg(36.0, 48.0, R48),
+        ],
+        &boluses,
+        &[],
+        &DECISIONS,
+    );
+    assert_distinct(
+        &decision_off_grid,
+        &in_force_fu,
+        AUC_TOL,
+        "in-force row at a decision with no data row",
+    );
+
     // Records stop at 36, before the last decision: `(36, 48]` has no record ahead, so it
-    // runs under the last record that ran (the PK carry) and reads the row in force there —
-    // the record at 36, not the subject's baseline row.
+    // runs under the last record that ran (the PK carry) and reads that record's row — the
+    // one at 36, not the subject's baseline row.
     let short = [
         obs_row(0.0, R0),
         obs_row(12.0, R12),
@@ -654,6 +712,139 @@ fn auc_target_reads_a_reset_rows_own_kappa() {
         &in_window1,
         AUC_TOL,
         "reset at 30",
+    );
+}
+
+// ── Past the final record: the covariate row travels with the PK carry ─────────────────
+
+/// An `ADDL` train past the last data record (review r1 #1). The dose at 0 implies doses at
+/// 12, 24 and 36; the only other record is the observation at 6. Each implied dose with no
+/// record ahead keeps its parent row (#1909), so `(6, 36]` runs under the dose row at 0.
+/// `(36, 48]` has no governing record: it runs under the PK the walk carries (the implied
+/// dose at 36, so the row at 0) and must read that same row — not the row in force at 48,
+/// which skips implied doses (#2528) and is the observation's at 6.
+///
+/// Mutation: past the final record, read the in-force row (`locf_decision_cov`) instead of
+/// the carried one — this test dies (a 16% move in window 1, measured in review).
+#[test]
+fn auc_target_past_the_last_record_reads_the_carried_row() {
+    let rows = [
+        (0.0, 1, 100.0, 12.0, 3, R0.0, R0.1, R0.2),
+        obs_row(6.0, R12),
+    ];
+    // Base 100 at 0, 12, 24, 36, plus the controller's 100 at each decision.
+    let boluses = [(0.0, 200.0), (12.0, 100.0), (24.0, 200.0), (36.0, 100.0)];
+    let with_tail = |tail_fu: f64| {
+        let tail = tv_seg(36.0, 48.0, R0);
+        exact_window_aucs(
+            &[
+                tv_seg(0.0, 6.0, R12),
+                tv_seg(6.0, 12.0, R0),
+                tv_seg(12.0, 24.0, R0),
+                tv_seg(24.0, 36.0, R0),
+                Seg {
+                    factor: tail.factor / R0.2 * tail_fu,
+                    ..tail
+                },
+            ],
+            &boluses,
+            &[],
+            &DECISIONS,
+        )
+    };
+    let want = with_tail(R0.2);
+    run_tv(&tv_csv(&rows), &want, "ADDL train past the last record");
+    assert_distinct(
+        &want,
+        &with_tail(R12.2),
+        AUC_TOL,
+        "in-force row past the last record",
+    );
+}
+
+/// The IOV twin of [`auc_target_past_the_last_record_reads_the_carried_row`], where a
+/// decision resets the carry. `V` reads both `WT` and κ, and the signal names `FU`. The dose
+/// at 0 implies one at 12; the observation at 6 is the last data record. `(12, 24]` runs
+/// under the carry the implied dose left (its parent row at 0, κ_0). The decision at 24 then
+/// resets the carry to `decision_pk[1]`, built from the row in force there (the observation
+/// at 6) under κ_1, so `(24, 48]` reads that row. The carried row is the one the PK came
+/// from at both points, which "the last record" alone would get wrong at the second.
+///
+/// Mutations: read the in-force row past the last record — window 0 moves; read the last
+/// record's row (`last_at`, the implied dose at 12) — window 1 moves.
+#[test]
+fn auc_target_past_the_last_record_follows_a_decision_reset_under_iov() {
+    const MODEL_TV_IOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_V ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * CRCL / 100.0
+  V  = TVV * WT / 70.0 * exp(KAPPA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+    let m = parse_model_string(MODEL_TV_IOV).expect("parse");
+    let kappa = reconstructed_kappa(&m, IOV_SEED, DECISIONS.len());
+    let rows = [
+        (0.0, 1, 100.0, 12.0, 1, R0.0, R0.1, R0.2),
+        obs_row(6.0, R12),
+    ];
+    let pop = read_pop(&tv_csv(&rows), &TV_COVS);
+    let spec = fixed_dose_spec(Some(TV_OBSERVE), &DECISIONS, 100.0);
+    let seg = |t0: f64, t1: f64, pk_row: (f64, f64, f64), fu: f64, kappa: f64| {
+        let (cl, v) = (5.0 * pk_row.0 / 100.0, 50.0 * pk_row.1 / 70.0 * kappa.exp());
+        Seg {
+            t0,
+            t1,
+            k: cl / v,
+            factor: fu / v,
+        }
+    };
+    let boluses = [(0.0, 200.0), (12.0, 100.0), (24.0, 100.0)];
+    let aucs = |tail0_fu: f64, tail1_fu: f64| {
+        exact_window_aucs(
+            &[
+                seg(0.0, 6.0, R12, R12.2, kappa[0]),
+                seg(6.0, 12.0, R0, R0.2, kappa[0]),
+                seg(12.0, 24.0, R0, tail0_fu, kappa[0]),
+                seg(24.0, 48.0, R12, tail1_fu, kappa[1]),
+            ],
+            &boluses,
+            &[],
+            &DECISIONS,
+        )
+    };
+    let want = aucs(R0.2, R12.2);
+    assert_window_aucs(
+        &m,
+        &pop,
+        &spec,
+        IOV_SEED,
+        &want,
+        AUC_TOL,
+        "IOV, decision resets the carry",
+    );
+    assert_distinct(
+        &want,
+        &aucs(R12.2, R12.2),
+        AUC_TOL,
+        "in-force row before the decision",
+    );
+    assert_distinct(
+        &want,
+        &aucs(R0.2, R0.2),
+        AUC_TOL,
+        "last record's row after the decision",
     );
 }
 
