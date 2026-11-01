@@ -5603,6 +5603,7 @@ pub(crate) fn ode_predictions_adaptive(
         max_decisions,
         assay,
         None,
+        None,
     )
 }
 
@@ -5652,6 +5653,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // inter-decision window ([`AdaptiveWindowAucs`], #943) and write one AUC per window
     // here, in observation units. `None` ⇒ no AUC; the walk is unchanged either way.
     window_aucs: Option<&mut Vec<f64>>,
+    // The dosing interval in force at the first decision (#945). `None` ⇒ every grid point
+    // is due until the controller issues a [`DoseAction::SetInterval`] — the pre-#945
+    // behaviour, byte-identical while no `SetInterval` is issued.
+    start_interval: Option<f64>,
 ) -> Result<AdaptiveRun, AdaptiveDriverError> {
     let n = ode.n_states;
     let tv = event_pk.is_some();
@@ -6024,6 +6029,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let mut applied = vec![false; shadow.doses.len()];
 
     let mut stopped = false;
+    // #945: the dosing interval in force, and the time from which the next grid point is
+    // due (`None` ⇒ due now). Only a consulted decision moves `next_due`; a data record
+    // (a base dose, an EVID=3/4 reset) never does.
+    let mut interval = start_interval;
+    let mut next_due: Option<f64> = None;
 
     // Records read *at* the current break (#1226) — sorted once, hoisted so the walk
     // allocates once.
@@ -6336,7 +6346,16 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     });
                 }
 
-                let decision = {
+                // #945: at a grid point that is not yet due under the dosing interval the
+                // controller is not consulted: the point doses nothing and is logged as
+                // `NotDue`, with what the monitors read.
+                let due = adaptive_point_is_due(next_due, t_start);
+                let decision = if !due {
+                    ControllerDecision {
+                        actions: Vec::new(),
+                        rule: None,
+                    }
+                } else {
                     let ctx = ControllerCtx {
                         t: t_start,
                         state: &u,
@@ -6344,6 +6363,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         history: &shadow.doses,
                         decision_index,
                         signals: &signals,
+                        interval,
                     };
                     controller(&ctx)
                 };
@@ -6372,6 +6392,31 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             actions.len() - j - 1
                         )));
                     }
+                }
+                // #945: at most one interval change per decision, and none on a decision
+                // that discontinues (there is no next dose for it to schedule).
+                let set_intervals: Vec<f64> = actions
+                    .iter()
+                    .filter_map(|a| match *a {
+                        DoseAction::SetInterval { interval } => Some(interval),
+                        _ => None,
+                    })
+                    .collect();
+                if set_intervals.len() > 1 {
+                    return Err(AdaptiveDriverError::controller_action(format!(
+                        "decision {decision_index} at t={t_start}: at most one SetInterval per \
+                         decision, got {}",
+                        set_intervals.len()
+                    )));
+                }
+                if !set_intervals.is_empty() && actions.iter().any(DoseAction::is_stop) {
+                    return Err(AdaptiveDriverError::controller_action(format!(
+                        "decision {decision_index} at t={t_start}: SetInterval cannot be combined \
+                         with Stop; a discontinued subject has no next dose to schedule"
+                    )));
+                }
+                if let Some(&new_interval) = set_intervals.first() {
+                    interval = Some(new_interval);
                 }
 
                 // Count realized doses this decision so the log can categorize the
@@ -6477,7 +6522,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             });
                             n_dosed += 1;
                         }
-                        DoseAction::Hold => {}
+                        DoseAction::Hold | DoseAction::SetInterval { .. } => {}
                         DoseAction::Stop => {
                             stopped = true;
                             break;
@@ -6504,7 +6549,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // no ledger row. `stopped` was false on entry to this hook (it gates
                 // the hook), so its truth here means the `Stop` fired this decision.
                 // `observed` is moved in (the ledger rows above already cloned it).
-                let outcome = if stopped {
+                let outcome = if !due {
+                    DecisionOutcome::NotDue
+                } else if stopped {
                     DecisionOutcome::Stop { dosed: n_dosed }
                 } else if n_dosed > 0 {
                     DecisionOutcome::Dosed { n: n_dosed }
@@ -6519,7 +6566,24 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     time: t_start,
                     observed_signals: observed,
                     outcome,
+                    interval,
                 });
+
+                // #945: every consulted decision — a dose, a hold or an interval change —
+                // starts the next interval. The next due time must be a grid point (or
+                // past the last one), or the dose it schedules would silently move.
+                if due {
+                    next_due = interval.map(|d| t_start + d);
+                    if let Some(due) = next_due {
+                        if let Err(msg) = adaptive_due_on_grid(decision_times, due) {
+                            return Err(AdaptiveDriverError::controller_action(format!(
+                            "decision {decision_index} at t={t_start}: interval {} puts the next \
+                             due time at t={due}, {msg}",
+                            interval.unwrap_or(f64::NAN)
+                        )));
+                        }
+                    }
+                }
             }
         }
 
@@ -7408,6 +7472,37 @@ fn adaptive_monitor_signal(
     // The caller sets `obs_scale` only on a monitor with no `observe` expression, so this
     // is the identity on the `Some(f)` arm.
     am.scale_readout(latent, eta)
+}
+
+/// Tolerance for matching a due time to a review-grid point (#945): relative, so a
+/// decimal grid (`every 0.1`) and its sums of intervals agree past float rounding.
+fn adaptive_due_tol(t: f64) -> f64 {
+    1e-9 * t.abs().max(1.0)
+}
+
+/// Is the grid point `t` due, given the time `next_due` from which the next dose is due
+/// (`None` ⇒ due now: no decision consulted yet, or no dosing interval set)? (#945)
+pub(crate) fn adaptive_point_is_due(next_due: Option<f64>, t: f64) -> bool {
+    next_due.is_none_or(|due| t >= due - adaptive_due_tol(due))
+}
+
+/// `Ok` when the due time `due` lands on a review-grid point or past the last one; else the
+/// reason, naming the two grid points it falls between (#945). `grid` is strictly
+/// increasing (`validate_increasing_finite`).
+pub(crate) fn adaptive_due_on_grid(grid: &[f64], due: f64) -> Result<(), String> {
+    let tol = adaptive_due_tol(due);
+    let k = grid.partition_point(|&g| g < due - tol);
+    match grid.get(k) {
+        None => Ok(()),
+        Some(&g) if (g - due).abs() <= tol => Ok(()),
+        // A due time is a consulted grid point plus a positive interval, so a grid point
+        // lies below it and `k >= 1`.
+        Some(&g) => Err(format!(
+            "between the review-grid points t={} and t={g}; every interval must land on the \
+             `at` grid",
+            grid[k - 1]
+        )),
+    }
 }
 
 /// Per-(inter-decision)-window AUC of the monitored signal, accumulated inside the
