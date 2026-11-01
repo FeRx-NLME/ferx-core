@@ -259,8 +259,8 @@ pub struct AdaptiveSimulationResult {
 ///   controller. Supported on constant-covariate, time-varying-covariate (#930), and
 ///   IOV (#931) models. A base regimen also composes with system resets (EVID=3/4) on all
 ///   three (#932): the reset zeros the state and turns off a base infusion opened before it,
-///   and an EVID=4 reset+dose row's dose lands after its own reset. A steady-state / lagged / built-in-input-rate
-///   base dose is supported on the constant-covariate path (#719); under a time-varying
+///   and an EVID=4 reset+dose row's dose lands after its own reset. A steady-state / lagged /
+///   built-in-input-rate base dose is supported on the constant-covariate path (#719); under a time-varying
 ///   covariate or IOV those (and a modeled-`RATE` dose) are a typed error — a #930/#931
 ///   follow-up. A dose-free subject is the fully controller-driven special case.
 /// - **`Ipred` or `Dv` monitors.** A `Dv` monitor adds its endpoint's residual error
