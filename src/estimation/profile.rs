@@ -1,8 +1,8 @@
 //! Profiled θ level blocks (#1065).
 //!
 //! **The rule.** A `profile`d block's levels are, at every outer evaluation, the exact
-//! minimiser over the block of the same FOCE/FOCEI objective the unprofiled model would
-//! minimise. The minimiser is found by Newton on the **total** gradient — the EBEs
+//! minimiser over the block of the same objective (FOCE, FOCEI or Laplace) the unprofiled
+//! model would minimise. The minimiser is found by Newton on the **total** gradient — the EBEs
 //! re-solved at every point, so `dη̂/dβ` is in it — and never by a frozen-EBE shortcut:
 //! "solve the levels at the current η̂, re-solve η̂, repeat" converges to a point 0.05 OFV
 //! per study above the minimum once the prediction is nonlinear in η (the M3 probe on
@@ -990,15 +990,7 @@ impl ProfileCtx<'_> {
             0,
             self.options,
         );
-        let nll = subject_nll(
-            self.model,
-            subject,
-            params,
-            &ebe.eta,
-            &ebe.h_matrix,
-            &ebe.kappas,
-            self.options.interaction,
-        );
+        let nll = self.fit_term(i, params, &ebe.eta, &ebe.h_matrix, &ebe.kappas);
         let min_obs = self.options.min_obs_for_convergence_check;
         SubjectState {
             off_mode: off_mode(&ebe),
@@ -1012,8 +1004,46 @@ impl ProfileCtx<'_> {
         }
     }
 
-    /// Subject `i`'s objective term at `params` with its EBE, H and κ̂ held at `s`, under
-    /// `interaction` (the fit's own for the objective; `false` for the Newton matrix).
+    /// Subject `i`'s term of **the fit's own objective** at `params`, at the mode
+    /// `(η̂, κ̂)` with `h` its `H`: the FOCE / FOCEI term ([`subject_nll`] under the fit's
+    /// `interaction`) when the stage has no quadrature, and the quadrature term
+    /// (`agq::agq_subject_term`, under the stage's own anchor) when it does, so the solve
+    /// minimises the objective the fit reports (#2107). The Newton matrix does not read it
+    /// ([`Self::held_hessian`]).
+    fn fit_term(
+        &self,
+        i: usize,
+        params: &ModelParameters,
+        eta: &DVector<f64>,
+        h: &DMatrix<f64>,
+        kappas: &[DVector<f64>],
+    ) -> f64 {
+        let subject = &self.population.subjects[i];
+        if let Some(n_agq) = self.options.agq_nodes() {
+            return crate::estimation::agq::agq_subject_term(
+                self.model,
+                subject,
+                params,
+                eta.as_slice(),
+                kappas,
+                n_agq,
+                self.options.hessian_anchor(),
+            );
+        }
+        subject_nll(
+            self.model,
+            subject,
+            params,
+            eta,
+            h,
+            kappas,
+            self.options.interaction,
+        )
+    }
+
+    /// Subject `i`'s FOCE (`interaction = false`) or FOCEI term at `params` with its EBE,
+    /// H and κ̂ held at `s`: the Newton matrix's term ([`Self::held_hessian`]), never the
+    /// objective's, which is [`Self::fit_term`].
     fn held(&self, i: usize, params: &ModelParameters, s: &SubjectState, interaction: bool) -> f64 {
         subject_nll(
             self.model,
@@ -1038,6 +1068,13 @@ impl ProfileCtx<'_> {
     /// held-η̂ Hessian is `XᵀR⁻¹X` — the curvature with the random effects *not* free to
     /// absorb a level shift, larger than the total one. Measured on F1 (#1065): Newton on
     /// it converges linearly, ~1/30 per step, where `XᵀC̃⁻¹X` lands in one.
+    ///
+    /// Kept under `laplace` too (#2107): on a model linear in (η, κ) with additive error
+    /// the exact `∂²l/∂η²` is FOCEI's `H̃` and reads no level, so `½log|H|` is constant in
+    /// the levels and Newton still lands in one step (F1: one step, levels = FOCEI's to
+    /// 8.9e-16). Nonlinear in η it is a quasi-Newton matrix, as under FOCEI, contracting at
+    /// the same rate (F2: 33 steps against FOCEI's 32); the exact β-Hessian saved one
+    /// iteration there and cost a nested-dual recording per subject per step.
     fn held_hessian(
         &self,
         i: usize,
@@ -1064,12 +1101,20 @@ impl ProfileCtx<'_> {
         m
     }
 
-    /// The objective the adjoint differentiates: the fit's own. Under the profile's
-    /// additive-error scope the residual variance reads no η, so FOCE and FOCEI are one
-    /// objective here (a `foce` arm of G2 on F2 measured the same gaps to every printed
-    /// digit); the choice is kept for when that scope widens.
+    /// The objective the adjoint differentiates: the fit's own, the one [`Self::fit_term`]
+    /// scores. Under the profile's additive-error scope the residual variance reads no η,
+    /// so FOCE and FOCEI are one objective here (a `foce` arm of G2 on F2 measured the
+    /// same gaps to every printed digit); the choice is kept for when that scope widens.
+    /// Under quadrature it is the quadrature marginal at the stage's anchor (#2107), which
+    /// is a different function: `Focei` there is the gradient of FOCEI's objective.
     fn objective(&self) -> crate::sens::ode_provider::adjoint::Objective {
         use crate::sens::ode_provider::adjoint::Objective;
+        if let Some(n_agq) = self.options.agq_nodes() {
+            return Objective::Agq {
+                n_agq,
+                exact: self.options.hessian_anchor() == crate::types::HessianAnchor::Exact,
+            };
+        }
         if self.options.interaction {
             Objective::Focei
         } else {
@@ -1215,7 +1260,7 @@ impl ProfileCtx<'_> {
                     off_mode: start_off_mode.get(i).is_some_and(|m| m.0),
                     excused: start_off_mode.get(i).is_some_and(|m| m.1),
                 };
-                s.nll = self.held(i, &p, &s, self.options.interaction);
+                s.nll = self.fit_term(i, &p, &s.eta, &s.h, &s.kappas);
                 s
             })
             .collect();
@@ -1590,6 +1635,10 @@ impl GradientRoute {
 /// the outer gradient routes on (`envelope_gradient`), so the two cannot disagree and
 /// `gradient = fd` keeps the whole profile on finite differences. A subject the recorder
 /// declines at runtime still takes the reconverged differences, and is reported.
+///
+/// Under `laplace` the outer gradient routes on `agq::analytic_score_supported`, which
+/// is this same predicate by construction (#251), so there is one gate, not two; a test
+/// pins that the two agree on both `gradient` settings (#2107).
 pub(crate) fn profile_gradient_is_analytic(model: &CompiledModel, options: &FitOptions) -> bool {
     crate::sens::provider::analytic_outer_gradient_for_interaction(model, options.interaction)
 }
@@ -2389,7 +2438,14 @@ pub(crate) fn optimize_profiled(
         });
         crate::estimation::trace::write_foce(
             n_evals.load(Ordering::Relaxed),
-            if options.interaction { "focei" } else { "foce" },
+            // The gate `fit_term` scores by: a Laplace fit is not traced as `focei` (#2107).
+            if options.agq_nodes().is_some() {
+                "laplace"
+            } else if options.interaction {
+                "focei"
+            } else {
+                "foce"
+            },
             solve.ofv,
             grad_norm,
             None,
