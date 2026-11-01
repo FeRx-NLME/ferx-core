@@ -16520,8 +16520,10 @@ fn due_mask_no_interval_every_point_due() {
 }
 
 /// q12 grid, interval 24: 12 and 36 are not due, the controller is consulted at 0/24/48
-/// only, and the not-due rows still carry what the monitor read. Kills `>=` written as `>`
-/// in the due test (24 would read as not due), `next_due` moved at a not-due point (24 would
+/// only, and the not-due rows still carry what the monitor read. Kills a strict due test
+/// without the tolerance (`t > due`: 24 would read as not due; `t > due - tol` is an
+/// equivalent mutant, pinned instead by `due_mask_decimal_grid_needs_the_tolerance`),
+/// `next_due` moved at a not-due point (24 would
 /// then be due only at 36), and a not-due row with its signals dropped (the outcome metrics
 /// sample the decision log, so they would silently thin to the consulted points).
 #[test]
@@ -16740,8 +16742,9 @@ fn due_mask_base_dose_and_reset_do_not_touch_the_due_clock() {
 }
 
 /// Degenerate twin: an interval equal to the grid step (every point due, but through the
-/// mask) is bit-identical to no interval in everything but the logged interval. Kills a due
-/// test off by its tolerance, which would mark an exactly-due point not due.
+/// mask) is bit-identical to no interval in everything but the logged interval: routing a
+/// run through the mask changes nothing else. On this integer grid the tolerance is never
+/// exercised; `due_mask_decimal_grid_needs_the_tolerance` pins it.
 #[test]
 fn due_mask_interval_equal_to_grid_step_is_bit_identical_to_none() {
     let base = make_subject(vec![], vec![6.0, 30.0, 54.0]);
@@ -16834,4 +16837,96 @@ fn due_mask_auc_windows_stay_grid_windows() {
     let ke = 0.1f64;
     let want = 100.0 / ke * ((-ke * 12.0).exp() - (-ke * 24.0).exp());
     assert_relative_eq!(aucs[1], want, max_relative = 1e-3);
+}
+
+/// A decimal grid needs the due-time tolerance: on `k·0.1` with interval 0.3 the due time
+/// after t = 0.6000000000000001 is 0.9000000000000001, above `grid[9]` = 0.9. With the
+/// tolerance the pattern is every third point; without it 0.9 reads as not due and the walk
+/// refuses the interval as off-grid (between 0.9 and 1.0). Kills `adaptive_due_tol` → 0.
+#[test]
+fn due_mask_decimal_grid_needs_the_tolerance() {
+    let grid: Vec<f64> = (0..=12).map(|k| k as f64 * 0.1).collect();
+    assert!(
+        grid[6] + 0.3 > grid[9],
+        "the fixture must put a due time above a grid point"
+    );
+    let base = make_subject(vec![], vec![1.3]);
+    let (run, consulted) = run_due_mask(&base, &grid, Some(0.3), &mut bolus_100);
+    let run = run.expect("every due time lands on the grid within the tolerance");
+    assert_eq!(outcome_codes(&run), "D--D--D--D--D");
+    assert_eq!(
+        consulted,
+        vec![grid[0], grid[3], grid[6], grid[9], grid[12]]
+    );
+}
+
+/// An interval shorter than the grid's matching tolerance cannot advance: its due time
+/// matches the decision that set it. It is refused there, rather than making every later
+/// point due (the driver) or looping forever (the up-front walk). Kills the `g <= t` guard.
+#[test]
+fn due_mask_sub_tolerance_interval_is_refused() {
+    let base = make_subject(vec![], vec![60.0]);
+    let mut ctrl = |ctx: &ControllerCtx| {
+        let mut a = bolus_100(ctx);
+        if ctx.t == 0.0 {
+            a.push(DoseAction::SetInterval { interval: 1e-10 });
+        }
+        a
+    };
+    match run_due_mask(&base, &Q12_TO_48, None, &mut ctrl).0 {
+        Err(AdaptiveDriverError::Refusal { kind, message }) => {
+            assert_eq!(kind, AdaptiveRefusalKind::ControllerAction);
+            assert!(message.contains("decision 0 at t=0"), "{message}");
+            assert!(
+                message.contains("shorter than the review grid's matching tolerance"),
+                "{message}"
+            );
+        }
+        other => panic!("expected a controller-action refusal, got {other:?}"),
+    }
+}
+
+/// An interval whose due times leave the grid only later is refused at the decision that
+/// set it, not at the later decision that took no interval action. Grid [0, 24, 48, 60, 84],
+/// interval 24 from t=0: 24 and 48 land, 72 falls between 60 and 84. Kills a check of only
+/// the next due time (which would let decisions 0 and 1 dose and refuse decision 2).
+#[test]
+fn due_mask_interval_is_walked_whole_where_it_is_set() {
+    let base = make_subject(vec![], vec![90.0]);
+    let grid = [0.0, 24.0, 48.0, 60.0, 84.0];
+    let mut ctrl = |ctx: &ControllerCtx| {
+        let mut a = bolus_100(ctx);
+        if ctx.t == 0.0 {
+            a.push(DoseAction::SetInterval { interval: 24.0 });
+        }
+        a
+    };
+    let (run, consulted) = run_due_mask(&base, &grid, None, &mut ctrl);
+    match run {
+        Err(AdaptiveDriverError::Refusal { kind, message }) => {
+            assert_eq!(kind, AdaptiveRefusalKind::ControllerAction);
+            assert!(message.contains("decision 0 at t=0"), "{message}");
+            assert!(message.contains("due after t=48 at t=72"), "{message}");
+            assert!(message.contains("t=60 and t=84"), "{message}");
+        }
+        other => panic!("expected a controller-action refusal, got {other:?}"),
+    }
+    assert_eq!(consulted, vec![0.0]);
+}
+
+/// A decision that discontinues schedules nothing, so its interval is not walked: an
+/// off-grid starting interval with a `Stop` at the first decision runs, while the same
+/// interval with a dose there is refused. Kills the `!stopped` guard.
+#[test]
+fn due_mask_stop_schedules_nothing() {
+    let base = make_subject(vec![], vec![60.0]);
+    let grid = [0.0, 12.0, 24.0, 48.0];
+    let mut stop = |_ctx: &ControllerCtx| vec![DoseAction::Stop];
+    let (run, _) = run_due_mask(&base, &grid, Some(18.0), &mut stop);
+    assert_eq!(outcome_codes(&run.expect("a Stop is not refused")), "S");
+    let (run, _) = run_due_mask(&base, &grid, Some(18.0), &mut bolus_100);
+    assert!(
+        matches!(run, Err(AdaptiveDriverError::Refusal { .. })),
+        "the same interval with a dose is refused: {run:?}"
+    );
 }

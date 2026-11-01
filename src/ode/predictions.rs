@@ -6034,6 +6034,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // (a base dose, an EVID=3/4 reset) never does.
     let mut interval = start_interval;
     let mut next_due: Option<f64> = None;
+    // The interval whose due times have been walked against the grid (`adaptive_walk_due_
+    // times`): each interval is checked once, at the decision that puts it in force.
+    let mut walked: Option<f64> = None;
 
     // Records read *at* the current break (#1226) — sorted once, hoisted so the walk
     // allocates once.
@@ -6572,17 +6575,20 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // #945: every consulted decision — a dose, a hold or an interval change —
                 // starts the next interval. The next due time must be a grid point (or
                 // past the last one), or the dose it schedules would silently move.
-                if due {
-                    next_due = interval.map(|d| t_start + d);
-                    if let Some(due) = next_due {
-                        if let Err(msg) = adaptive_due_on_grid(decision_times, due) {
-                            return Err(AdaptiveDriverError::controller_action(format!(
-                            "decision {decision_index} at t={t_start}: interval {} puts the next \
-                             due time at t={due}, {msg}",
-                            interval.unwrap_or(f64::NAN)
-                        )));
-                        }
+                // #945: a consulted decision — a dose, a hold or an interval change — starts
+                // the next interval. A newly set interval has its due times walked here, at
+                // the decision that set it, so a dose can never be scheduled between two
+                // grid points. A `Stop` schedules nothing.
+                if due && !stopped {
+                    if let Some(d) = interval.filter(|&d| walked != Some(d)) {
+                        adaptive_walk_due_times(decision_times, t_start, d).map_err(|msg| {
+                            AdaptiveDriverError::controller_action(format!(
+                                "decision {decision_index} at t={t_start}: interval {d} {msg}"
+                            ))
+                        })?;
+                        walked = Some(d);
                     }
+                    next_due = interval.map(|d| t_start + d);
                 }
             }
         }
@@ -7486,22 +7492,46 @@ pub(crate) fn adaptive_point_is_due(next_due: Option<f64>, t: f64) -> bool {
     next_due.is_none_or(|due| t >= due - adaptive_due_tol(due))
 }
 
-/// `Ok` when the due time `due` lands on a review-grid point or past the last one; else the
-/// reason, naming the two grid points it falls between (#945). `grid` is strictly
-/// increasing (`validate_increasing_finite`).
-pub(crate) fn adaptive_due_on_grid(grid: &[f64], due: f64) -> Result<(), String> {
-    let tol = adaptive_due_tol(due);
-    let k = grid.partition_point(|&g| g < due - tol);
-    match grid.get(k) {
-        None => Ok(()),
-        Some(&g) if (g - due).abs() <= tol => Ok(()),
-        // A due time is a consulted grid point plus a positive interval, so a grid point
-        // lies below it and `k >= 1`.
-        Some(&g) => Err(format!(
-            "between the review-grid points t={} and t={g}; every interval must land on the \
-             `at` grid",
-            grid[k - 1]
-        )),
+/// Walk the due times a constant `interval` produces from the consulted grid point `from`
+/// to the end of `grid` (#945). Until the interval changes, every due point is consulted
+/// exactly when it falls due (a hold consumes its slot as a dose does), so this sequence is
+/// a function of `from` and `interval` alone and is checked whole, where the interval is
+/// set — never at a later decision that took no interval action. `Ok` when every due time
+/// lands on a grid point or past the last one; else the reason, naming the due time and the
+/// two grid points it falls between, or an interval too short to advance past `from` within
+/// the matching tolerance. `grid` is strictly increasing (`validate_increasing_finite`) and
+/// `interval` positive and finite (`DoseAction::validate`, `check_start_interval`).
+pub(crate) fn adaptive_walk_due_times(
+    grid: &[f64],
+    from: f64,
+    interval: f64,
+) -> Result<(), String> {
+    let mut t = from;
+    loop {
+        let due = t + interval;
+        let tol = adaptive_due_tol(due);
+        let k = grid.partition_point(|&g| g < due - tol);
+        match grid.get(k) {
+            None => return Ok(()),
+            // The matched point must lie after `t`, or the walk (and the driver's due test)
+            // would treat `t` itself as the next due point.
+            Some(&g) if (g - due).abs() <= tol && g <= t => {
+                return Err(format!(
+                    "is shorter than the review grid's matching tolerance: the decision due \
+                     after t={t} matches t={t} itself"
+                ))
+            }
+            Some(&g) if (g - due).abs() <= tol => t = g,
+            // `t` is a grid point below `due - tol`, so `k >= 1`.
+            Some(&g) => {
+                return Err(format!(
+                    "puts the decision due after t={t} at t={due}, between the review-grid \
+                     points t={} and t={g}; every due time must land on a point of \
+                     `decision_times`",
+                    grid[k - 1]
+                ))
+            }
+        }
     }
 }
 

@@ -14,7 +14,11 @@
 //!     and each consulted trough's distance to its nearest threshold.
 //!
 //! The ferx side is `vanco_interval.ferx` driven by a programmatic controller below, with
-//! `start_interval = 12` and `DoseAction::SetInterval` for every rung change.
+//! `start_interval = 12` and `DoseAction::SetInterval` for every rung change. Each subject
+//! runs at a **supplied η = 0** (`SuppliedEtas`), the typical-value patient mrgsolve
+//! simulates: the model's `omega ~ 1e-10` still draws an η of order 1e-5 on CL, and that
+//! drift — not either solver — was the whole of a 3.8e-4 mg/L one-sided gap at t = 288
+//! when the anchor drew it.
 //!
 //! Non-degeneracy: two subjects, multi-dose with drug on board at every later dose.
 //! Subject 1 (RF 0.15) climbs to the top rung, stays pinned there and holds at due points
@@ -25,8 +29,8 @@
 
 use ferx_core::parser::model_parser::parse_full_model_file;
 use ferx_core::{
-    read_nonmem_csv, simulate_adaptive, AdaptiveSimulateOptions, ControllerCtx, DecisionOutcome,
-    DoseAction, MonitorSpec, ObserveMode,
+    read_nonmem_csv, simulate_adaptive_with_inputs, AdaptiveInputs, AdaptiveSimulateOptions,
+    ControllerCtx, DecisionOutcome, DoseAction, MonitorSpec, ObserveMode, SuppliedEtas,
 };
 use std::path::Path;
 
@@ -104,13 +108,13 @@ fn controller() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
     }
 }
 
-/// Cross-solver trough band (mg/L). ferx (RK45 at the model's default tolerances) against
-/// mrgsolve (LSODA at 1e-10): the worst gap over all 50 grid points, printed by the test,
-/// is 3.833e-4 mg/L (~2e-5 relative; macOS arm64), so 1e-3 is 2.6× headroom. It is RK45's
-/// own error at default tolerances, the same order as `due_mask_skips_between_doses`'s
-/// closed-form check. The band stays far below the 0.13 mg/L smallest
-/// decision margin.
-const TROUGH_TOL: f64 = 1e-3;
+/// Cross-solver trough band (mg/L), ferx (RK45 at the model's default tolerances) against
+/// mrgsolve (LSODA at 1e-10) at η = 0. The worst gap over all 50 grid points, printed by
+/// the test, is 2.109e-8 mg/L on Linux aarch64 (`tools/linux-test.sh`) and identical on
+/// macOS arm64, so 1e-7 is 4.7× headroom; `expected.md`'s 9 decimals floor the comparison
+/// at 5e-10. A dosing defect worth naming moves a trough by orders of magnitude more (one
+/// misplaced 1000 mg dose is ~12 mg/L), and the smallest decision margin is 0.13 mg/L.
+const TROUGH_TOL: f64 = 1e-7;
 
 #[test]
 fn vanco_interval_extension_matches_mrgsolve() {
@@ -128,15 +132,16 @@ fn vanco_interval_extension_matches_mrgsolve() {
     opts.decision_times = grid.clone();
     opts.monitors = vec![MonitorSpec::new("C", 1, ObserveMode::Ipred)];
     opts.start_interval = Some(12.0);
-    let res = simulate_adaptive(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        1,
-        controller,
-        &opts,
+    let model = &parsed.model;
+    let etas = SuppliedEtas::from_table(
+        vec!["1".into(), "2".into()],
+        model.eta_names.clone(),
+        vec![vec![0.0; model.n_eta]; 2],
     )
-    .expect("runs and passes the default verifier");
+    .expect("η = 0 table");
+    let inputs = AdaptiveInputs::new(&model.default_params).with_etas(&etas);
+    let res = simulate_adaptive_with_inputs(model, &pop, &inputs, 1, controller, &opts)
+        .expect("runs and passes the default verifier");
 
     let reference = reference();
     assert_eq!(reference.len(), 2, "two subjects in the kit");

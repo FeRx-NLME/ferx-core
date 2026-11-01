@@ -9651,6 +9651,13 @@ fn start_interval_off_grid_is_refused_before_any_subject() {
     let msg = err.to_string();
     assert!(msg.contains("start_interval 18"), "{msg}");
     assert!(msg.contains("t=12 and t=24"), "{msg}");
+    // The grid is named as the caller wrote it (`decision_times`), not as the declarative
+    // block's `at`.
+    assert!(
+        msg.contains("every due time must land on a point of `decision_times`"),
+        "{msg}"
+    );
+    assert!(!msg.contains("`at`"), "{msg}");
     assert!(
         !msg.contains("subject"),
         "refused before any subject: {msg}"
@@ -9661,6 +9668,17 @@ fn start_interval_off_grid_is_refused_before_any_subject() {
         .expect_err("0 is not an interval");
     assert_eq!(err.code(), Some("E_ADAPTIVE_OPTIONS"), "{err}");
     assert!(err.to_string().contains("positive and finite"), "{err}");
+    // So is one too short to advance past the grid's matching tolerance; before the shared
+    // walk's `g <= t` guard this looped forever.
+    opts.start_interval = Some(1e-10);
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("1e-10 cannot advance on this grid");
+    assert_eq!(err.code(), Some("E_ADAPTIVE_OPTIONS"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("shorter than the review grid's matching tolerance"),
+        "{err}"
+    );
 }
 
 /// A controller's `SetInterval` that lands off the grid is a controller-action refusal that

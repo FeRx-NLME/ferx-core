@@ -500,19 +500,8 @@ fn check_start_interval(decision_times: &[f64], interval: f64) -> Result<(), Str
             "start_interval must be positive and finite; got {interval}"
         ));
     }
-    let mut t = decision_times[0];
-    let last = decision_times[decision_times.len() - 1];
-    while t + interval <= last {
-        let due = t + interval;
-        crate::ode::adaptive_due_on_grid(decision_times, due).map_err(|msg| {
-            format!("start_interval {interval} puts the decision due after t={t} at t={due}, {msg}")
-        })?;
-        // The grid point the due time matched (the first not below it).
-        let k =
-            decision_times.partition_point(|&g| !crate::ode::adaptive_point_is_due(Some(due), g));
-        t = decision_times[k];
-    }
-    Ok(())
+    crate::ode::adaptive_walk_due_times(decision_times, decision_times[0], interval)
+        .map_err(|msg| format!("start_interval {interval} {msg}"))
 }
 
 /// Shared per-(subject, replicate) orchestration behind [`simulate_adaptive`] and

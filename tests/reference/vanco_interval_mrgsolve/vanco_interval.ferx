@@ -5,9 +5,10 @@
 # a fixed 1000 mg 1-h infusion, an interval ladder 12/24/36/48 h moved by
 # `DoseAction::SetInterval`, on a q12 review grid.
 #
-# Negligible IIV: the engine requires one omega, so CL carries a vanishing
-# variance and each subject is effectively typical-value, comparable to the
-# typical-value mrgsolve run.
+# The engine requires one omega, so CL carries a vanishing variance. The anchor
+# still supplies eta = 0 for each subject: a drawn eta of order 1e-5 on CL is
+# enough to show up as a one-sided trough drift against the typical-value
+# mrgsolve run.
 
 [parameters]
   theta TVCL(4.0,  0.1,  50.0)   # clearance at RF = 1 (L/h)

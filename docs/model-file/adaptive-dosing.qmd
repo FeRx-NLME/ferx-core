@@ -329,11 +329,16 @@ wants to restart its interval after a reset can read `ctx.history` and issue
 ### Grid alignment
 
 Every due time must land on a grid point, or past the last one: a dose cannot be
-scheduled between two review times. A `start_interval` that would send one off
-the grid is refused before any subject runs (`E_ADAPTIVE_OPTIONS`). A
-`SetInterval` that does is refused at the decision that issued it
-(`E_ADAPTIVE_CONTROLLER_ACTION`), naming the subject, the decision, the due time
-and the two grid points it falls between.
+scheduled between two review times. An interval is checked once, where it is
+set: every due time it produces from there to the end of the grid is walked,
+since until it changes each due point is consulted exactly when it falls due. A
+`start_interval` that would send one off the grid is refused before any subject
+runs (`E_ADAPTIVE_OPTIONS`). A `SetInterval` that does is refused at the decision
+that issued it (`E_ADAPTIVE_CONTROLLER_ACTION`), never at a later decision that
+took no interval action, naming the subject, the decision, the due time and the
+two grid points it falls between. An interval too short to move past its own
+decision within the grid's matching tolerance is refused the same way. A
+decision that stops schedules nothing and is never refused for its interval.
 
 **Known limit.** Not-due points do not consult the controller, so a safety rule
 is not evaluated between doses; a toxicity check that must act between doses is
@@ -613,7 +618,9 @@ and the other lengthens, shortens and lengthens again; both saturate at the
 bottom rung at the first decision. Every consulted trough is at least 0.13 mg/L
 from its nearest threshold, so the outcome (dosed / hold / not due) and the
 interval at every one of the 50 grid points match mrgsolve exactly, and the
-troughs agree within the cross-solver band. The kit lives in
+troughs agree within the cross-solver band. Each subject runs at a supplied
+η = 0, the typical-value patient mrgsolve simulates: the model's `omega ~ 1e-10`
+would otherwise draw an η large enough to show as a one-sided trough drift. The kit lives in
 `tests/reference/vanco_interval_mrgsolve/`, exercised on every PR by
 `tests/adaptive_vanco_interval_anchor.rs`.
 

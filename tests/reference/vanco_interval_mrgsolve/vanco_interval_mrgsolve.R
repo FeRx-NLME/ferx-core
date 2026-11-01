@@ -95,7 +95,9 @@ run_subject <- function(rf) {
   do.call(rbind, rows)
 }
 
-fmt <- function(x) formatC(x, format = "f", digits = 6)
+# 9 decimals: the ferx anchor agrees to ~1e-7 with eta = 0, so 6 decimals would make
+# the frozen table, not the engines, the limit of the comparison.
+fmt <- function(x) formatC(x, format = "f", digits = 9)
 md <- c(
   "# Vancomycin interval-extension reference (mrgsolve)",
   "",
