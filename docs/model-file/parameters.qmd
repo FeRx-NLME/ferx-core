@@ -135,9 +135,12 @@ so it is refused rather than read at another level's θ. To simulate a design wi
 fit's θ layout. See
 [Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).
 
-Levels are discovered from **Gaussian observation records** only. A subject with
-no Gaussian observation — only time-to-event, binary, categorical or Markov
-records — reads the level its own baseline columns name (the first non-missing
+Levels are discovered from **Gaussian observation records**, and from the records of
+a `[binary_model]` predictor or a DTMM `[markov_model]` that reads the block (#2562).
+Those endpoints evaluate each record on its own, so each record is a level of the block
+and carries its own index, keyed on its `TIME` as written. A subject with neither — only
+time-to-event or CTMM records, or records of an endpoint that does not read the block —
+reads the level its own baseline columns name (the first non-missing
 value of each, as for any covariate its hazard or logit reads). So a TTE-only
 subject in study 3 reads `PLACEBO[STUDY=3]`. When its columns name no level the
 block has (a study with no Gaussian records, a study the fit never saw, no value
@@ -1030,8 +1033,10 @@ unprofiled fit's optimum under `foce`, `focei`, `laplace` and adaptive quadratur
 NONMEM's, with every level a `THETA`, under FOCEI and LAPLACE (see
 `nonmem_anchor/README.md`).
 
-A `[binary_model] logit` endpoint cannot read a θ level block yet, profiled or not
-(#2562), and ferx has no probit link.
+A `[binary_model] logit` endpoint reads a θ level block unprofiled (#2562), but a
+profiled block read there is refused with `E_PROFILE_SCOPE` until the binary half of
+#2111 lands; ferx has no probit link. A block read in a time-to-event hazard or a
+`[markov_model]` is refused the same way.
 
 ##### Bounds on a profiled block
 

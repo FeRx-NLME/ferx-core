@@ -238,14 +238,19 @@ fn the_index_check_reads_each_binary_record() {
 /// block absorbs it, so auto resolves to the within-study contrast, as on a Gaussian
 /// `y`. The η walk has to see the `[binary_model]` predictor for that.
 ///
-/// Mutation: leave the binary predictor out of the coupling walk's readouts and auto
-/// resolves to a global sum-to-zero (one free level per study and visit but one).
+/// Mutations: leave the binary predictor out of the coupling walk's readouts and auto
+/// resolves to a global sum-to-zero (one free level per study and visit but one); leave
+/// it out of the scale-share walk and the block shares no expression with the η.
 #[test]
 fn auto_sees_the_eta_the_binary_predictor_reads_with_the_block() {
     let text = BINARY.replace(", contrast = sum_to_zero_within", "");
     let (parsed, _) = bound(&text, &csv(&[0, 4, 8], true)).expect("binds");
     let decl = &parsed.model.theta_blocks().level_blocks()[0];
     assert_eq!(decl.contrast(), LevelContrast::SumToZeroWithin);
+    assert!(
+        decl.shares_scale_with_eta(),
+        "the predictor reads the block and the η in one expression"
+    );
 }
 
 /// A subject that also carries a time-to-event record cannot have one snapshot per
