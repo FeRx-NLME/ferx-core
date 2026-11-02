@@ -3,7 +3,7 @@
 //!
 //! Tier 2 (fast, default PR job): wire-up and validation — estimating IMP runs,
 //! moves parameters (vs the evaluation-only path which leaves them fixed), may
-//! sit mid-chain, and refuses IOV models.
+//! sit mid-chain, and fits IOV models.
 //!
 //! Tier 3 (slow): warm-started end-to-end convergence on rich data. Plain IMP
 //! uses a one-iteration-*lagged* proposal (mode/variance found only on the first
@@ -244,26 +244,26 @@ fn saem_then_imp_chain_runs() {
     assert!(result.ofv.is_finite());
 }
 
+/// Estimating IMP on an IOV model through the public `fit()` (#2301).
 #[test]
-fn imp_estimator_rejects_iov_models() {
+fn imp_estimator_fits_iov_models() {
     let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
         .expect("warfarin_iov model must parse");
-    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, None)
+    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
         .expect("warfarin_iov data must load");
     let mut opts = FitOptions::default();
     opts.verbose = false;
     opts.run_covariance_step = false;
     opts.method = EstimationMethod::Imp;
     opts.imp_iterations = 3;
+    opts.imp_samples = 100;
+    opts.imp_seed = Some(1);
 
-    let err = fit(&model, &population, &model.default_params, &opts)
-        .err()
-        .expect("estimating imp on an IOV model must be rejected (v1)")
-        .to_string();
-    assert!(
-        err.to_lowercase().contains("inter-occasion") || err.contains("IOV"),
-        "expected IOV-not-supported error, got: {err}"
-    );
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .unwrap_or_else(|e| panic!("estimating imp on an IOV model: {e}"));
+    let iov = result.omega_iov.as_ref().expect("Ω_IOV in the result");
+    assert!(iov[(0, 0)].is_finite() && iov[(0, 0)] > 0.0);
+    assert!(result.ofv.is_finite());
 }
 
 #[test]
