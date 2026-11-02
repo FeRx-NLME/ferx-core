@@ -873,6 +873,7 @@ fn fresh_state() -> NloptState {
         salvage_guard: SalvageGuardState::new(SalvageGuardPolicy::Off),
         pred_jac: None,
         pred_anchor: Vec::new(),
+        seed_hessians: None,
     }
 }
 
@@ -13859,4 +13860,149 @@ fn a_cold_start_drops_the_mode_response() {
     assert!(!state.cached_etas_are_modes);
     assert!(state.pred_jac.is_none(), "the response went with the modes");
     assert!(state.pred_anchor.is_empty());
+}
+
+/// #2549: a quadrature fit's gradient tolerance stop, or its bare `Failure` /
+/// `RoundoffLimited`, is a polish candidate — its stops are the reachable relative ones, met
+/// mid-descent on a slow creep, and it has no verification legs — while a FOCE/FOCEI gradient
+/// fit's (unreachable stops, verification legs) is not, and neither a latched stop, a spent
+/// budget, a forced stop nor a cancelled run is. BOBYQA keeps its tolerance stops only.
+#[test]
+fn a_quadrature_tolerance_stop_is_polished() {
+    use nlopt::{Algorithm, FailState, SuccessState};
+    let ok = |s| Ok((s, 0.0));
+    for algo in [Algorithm::Lbfgs, Algorithm::Slsqp] {
+        for s in [
+            SuccessState::FtolReached,
+            SuccessState::XtolReached,
+            SuccessState::Success,
+        ] {
+            assert!(tolerance_stop_needs_polish(
+                algo,
+                true,
+                &ok(s),
+                false,
+                false
+            ));
+            assert!(!tolerance_stop_needs_polish(
+                algo,
+                false,
+                &ok(s),
+                false,
+                false
+            ));
+        }
+        assert!(!tolerance_stop_needs_polish(
+            algo,
+            true,
+            &ok(SuccessState::FtolReached),
+            true,
+            false
+        ));
+        assert!(!tolerance_stop_needs_polish(
+            algo,
+            true,
+            &ok(SuccessState::FtolReached),
+            false,
+            true
+        ));
+        assert!(!tolerance_stop_needs_polish(
+            algo,
+            true,
+            &ok(SuccessState::MaxEvalReached),
+            false,
+            false
+        ));
+        for f in [FailState::Failure, FailState::RoundoffLimited] {
+            assert!(tolerance_stop_needs_polish(
+                algo,
+                true,
+                &Err((f, 0.0)),
+                false,
+                false
+            ));
+            assert!(!tolerance_stop_needs_polish(
+                algo,
+                false,
+                &Err((f, 0.0)),
+                false,
+                false
+            ));
+        }
+        assert!(!tolerance_stop_needs_polish(
+            algo,
+            true,
+            &Err((FailState::ForcedStop, 0.0)),
+            false,
+            false
+        ));
+    }
+    assert!(!tolerance_stop_needs_polish(
+        Algorithm::Bobyqa,
+        false,
+        &Err((FailState::Failure, 0.0)),
+        false,
+        false
+    ));
+    // MMA never had reachable stops to begin with; BOBYQA is polished either way.
+    assert!(!tolerance_stop_needs_polish(
+        Algorithm::Mma,
+        true,
+        &ok(SuccessState::FtolReached),
+        false,
+        false
+    ));
+    assert!(tolerance_stop_needs_polish(
+        Algorithm::Bobyqa,
+        false,
+        &ok(SuccessState::FtolReached),
+        false,
+        false
+    ));
+}
+
+/// A quadrature polish whose last leg settles on its gain test, on a line-search `Failure`,
+/// while the stop's Newton decrement still asks for a polish is not verified (#2585): on
+/// pk2_big under Laplace (`PERT=0.3`, seed 4) L-BFGS stopped with a predicted gain of 38.3,
+/// the leg failed without gaining, and the fit was reported converged 238 above the optimum.
+/// A leg ending on its tolerance is not a stall, whatever the decrement says (seed 2: 0.41
+/// predicted 0.003 from the optimum), and every other ending passes through.
+#[test]
+fn a_quadrature_polish_that_cannot_take_its_predicted_gain_is_stalled() {
+    use nlopt::{FailState, SuccessState};
+    let failure: NloptReturn = Err((FailState::Failure, 0.0));
+    assert_eq!(
+        quadrature_polish_end(PolishEnd::Settled, Some(38.3), &failure),
+        PolishEnd::Stalled { predicted: 38.3 }
+    );
+    assert_eq!(
+        quadrature_polish_end(PolishEnd::Settled, None, &failure),
+        PolishEnd::Settled
+    );
+    for last in [
+        Ok((SuccessState::FtolReached, 0.0)),
+        Ok((SuccessState::XtolReached, 0.0)),
+        Err((FailState::RoundoffLimited, 0.0)),
+        Err((FailState::ForcedStop, 0.0)),
+    ] {
+        assert_eq!(
+            quadrature_polish_end(PolishEnd::Settled, Some(0.41), &last),
+            PolishEnd::Settled,
+            "{last:?}"
+        );
+    }
+    for end in [
+        PolishEnd::NotNeeded,
+        PolishEnd::BudgetSpent,
+        PolishEnd::Skipped,
+        PolishEnd::LegCapReached { last_gain: 0.5 },
+    ] {
+        assert_eq!(quadrature_polish_end(end, Some(38.3), &failure), end);
+        assert_eq!(quadrature_polish_end(end, None, &failure), end);
+    }
+    let w = polish_stalled_warning(38.3);
+    assert!(
+        w.contains("3.830e1") && w.contains("not reported as converged"),
+        "{w}"
+    );
 }

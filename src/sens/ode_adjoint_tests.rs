@@ -7298,6 +7298,24 @@ fn the_quadrature_mode_response_is_the_focei_one() {
     );
     #[allow(unused_mut)]
     let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("three".into(), three, s3)];
+    // An IOV subject: the stacked `[η, κ]` solve, whose exact Hessian the fused pass and
+    // `exact_inner_hessian` must also agree on (#2585 review #4).
+    {
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_iov.ferx"),
+            Some(&format!("{root}/data/warfarin_iov.csv")),
+        )
+        .unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.occasions.is_empty())
+            .expect("an IOV subject")
+            .clone();
+        assert!(prep.parsed.model.n_kappa > 0, "premise: the model has IOV");
+        cases.push(("examples/warfarin_iov.ferx".into(), prep.parsed.model, s));
+    }
     #[cfg(feature = "survival")]
     for (m, d) in [
         ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
@@ -7387,5 +7405,120 @@ fn the_quadrature_mode_response_is_the_focei_one() {
     assert!(
         worst < 1e-10,
         "quadrature vs FOCEI mode response {worst:.2e}"
+    );
+}
+
+/// The exact inner Hessian a quadrature gradient pass hands back (`ModeOut::hessian`, #2549)
+/// is the one `exact_inner_hessian` forms: the quadrature objective's exact anchor now takes
+/// it from the score's pass instead of recomputing it, and the next warm inner solve takes it
+/// as its seed. Gaussian, joint PK–TTE and competing-risks subjects, both anchors, 1 and 3
+/// nodes; asked for without the response too.
+#[test]
+fn the_quadrature_mode_hessian_is_the_exact_inner_hessian() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let three = parse_model_string(&one_cpt_oral_n_eta(3)).unwrap();
+    let s3 = subject(
+        &three,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    #[allow(unused_mut)]
+    let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("three".into(), three, s3)];
+    // An IOV subject: the stacked `[η, κ]` solve, whose exact Hessian the fused pass and
+    // `exact_inner_hessian` must also agree on (#2585 review #4).
+    {
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_iov.ferx"),
+            Some(&format!("{root}/data/warfarin_iov.csv")),
+        )
+        .unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.occasions.is_empty())
+            .expect("an IOV subject")
+            .clone();
+        assert!(prep.parsed.model.n_kappa > 0, "premise: the model has IOV");
+        cases.push(("examples/warfarin_iov.ferx".into(), prep.parsed.model, s));
+    }
+    #[cfg(feature = "survival")]
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        (
+            "examples/tte_competing_risks.ferx",
+            "data/tte_competing_risks.csv",
+        ),
+    ] {
+        let prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap()
+            .clone();
+        cases.push((m.into(), prep.parsed.model, s));
+    }
+    let _ = root;
+    let mut worst = 0.0f64;
+    let mut n_checked = 0;
+    for (name, model, s) in &cases {
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        let eta = ebe_for(model, s, &params, 1e-12, true);
+        let want = exact_inner_hessian(model, s, &params, eta.as_slice())
+            .unwrap_or_else(|| panic!("{name}: exact_inner_hessian"));
+        for (n_agq, exact) in [(1, true), (3, true), (1, false), (3, false)] {
+            for want_dx in [false, true] {
+                let objective = Objective::Agq { n_agq, exact };
+                let got = std::thread::scope(|sc| {
+                    std::thread::Builder::new()
+                        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                        .spawn_scoped(sc, || {
+                            let pt = PackedPoint::new(&params, &x).unwrap();
+                            let mut out = ModeOut {
+                                want_dx,
+                                want_hessian: true,
+                                ..ModeOut::default()
+                            };
+                            let g = subject_adjoint_gradient_and_mode_at(
+                                model,
+                                s,
+                                &pt,
+                                eta.as_slice(),
+                                objective,
+                                &mut out,
+                            );
+                            assert!(g.is_some(), "{name}: the gradient");
+                            assert_eq!(out.eta_dx.is_some(), want_dx, "{name}: the response");
+                            out.hessian
+                        })
+                        .unwrap()
+                        .join()
+                        .unwrap()
+                });
+                let label = format!("{name} n_agq={n_agq} exact={exact} dx={want_dx}");
+                let got = got.unwrap_or_else(|| panic!("{label}: no mode Hessian"));
+                assert_eq!(got.shape(), want.shape(), "{label}");
+                for (a, b) in got.iter().zip(want.iter()) {
+                    assert!(a.is_finite() && b.is_finite(), "{label}: {a} vs {b}");
+                    worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+                }
+                n_checked += 1;
+            }
+        }
+    }
+    eprintln!("mode Hessian vs exact_inner_hessian: {worst:.2e} over {n_checked} cases");
+    // Measured 4.34e-16 over the 32 cases, the IOV ones included (Linux x86_64): the same
+    // kernel on the same jets, differing in rounding only; 1e-12 leaves four decades.
+    assert!(
+        worst < 1e-12,
+        "mode Hessian vs exact_inner_hessian {worst:.2e}"
     );
 }

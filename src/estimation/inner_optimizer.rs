@@ -580,6 +580,36 @@ pub struct EbeResult {
 /// light inner provider rather than paying for the full theta/mixed `Dual2` jet.
 /// Special residual/FREM cases retain the full-provider fallback.
 #[allow(clippy::too_many_arguments)]
+/// Does the subject's inner solve go unseeded whatever metric is on offer? The declines every
+/// seed honours, formed here ([`analytic_inner_seed_hessian`]) or carried from the outer
+/// gradient pass (#2585 review #1):
+///
+/// - an IOV subject (its occasion-stacked solve has its own seed);
+/// - the escape hatches the fused gradient honours (`gradient = fd`,
+///   `FERX_NO_ANALYTIC_INNER`): a user who routes the inner loop to FD because the analytic
+///   gradient misbehaves on their model must get the historical unseeded solve back, not FD
+///   gradients against a provider-built metric;
+/// - a covariate-NN model. The Gauss–Newton metric is only a faithful local model of the
+///   individual objective while residuals are small; on an NN-modulated surface mid-descent
+///   (large residuals, highly non-convex individual likelihoods) its Newton-scaled steps —
+///   warm or cold — were measured pulling 23 of 30 subjects into prior-unlikely η̂ basins,
+///   stalling a FOCEI fit ~950 OFV above the unseeded optimum or parking it unconverged on a
+///   start-dependent point (slow-tests red since #1389, #1474). These models keep the
+///   historical solve; the seed's speedup was measured on PK surfaces and is retained there.
+fn inner_seed_declined(model: &CompiledModel, subject: &Subject) -> bool {
+    if model.n_kappa > 0 && !subject.occasions.is_empty() {
+        return true;
+    }
+    if analytic_inner_common_bail(model) {
+        return true;
+    }
+    #[cfg(feature = "nn")]
+    if !model.covariate_nns.is_empty() {
+        return true;
+    }
+    false
+}
+
 fn analytic_inner_seed_hessian(
     model: &CompiledModel,
     subject: &Subject,
@@ -597,26 +627,7 @@ fn analytic_inner_seed_hessian(
     // too changes no test outcome), while a wrong *gradient* sends the first step astray.
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<(DMatrix<f64>, Option<Vec<f64>>)> {
-    if model.n_kappa > 0 && !subject.occasions.is_empty() {
-        return None;
-    }
-    // The seed is a provider product like the fused gradient, so it honours the same escape
-    // hatches (`gradient = fd`, `FERX_NO_ANALYTIC_INNER`): a user who routes the inner loop
-    // to FD because the analytic gradient misbehaves on their model must get the historical
-    // unseeded solve back, not FD gradients against a provider-built metric.
-    if analytic_inner_common_bail(model) {
-        return None;
-    }
-    // Covariate-NN models: decline the seed entirely. The Gauss–Newton metric is only a
-    // faithful local model of the individual objective while residuals are small; on an
-    // NN-modulated surface mid-descent (large residuals, highly non-convex individual
-    // likelihoods) its Newton-scaled steps — warm or cold — were measured pulling 23 of
-    // 30 subjects into prior-unlikely η̂ basins, stalling a FOCEI fit ~950 OFV above the
-    // unseeded optimum or parking it unconverged on a start-dependent point (slow-tests
-    // red since #1389, #1474). These models keep the historical solve; the seed's speedup
-    // was measured on PK surfaces and is retained there.
-    #[cfg(feature = "nn")]
-    if !model.covariate_nns.is_empty() {
+    if inner_seed_declined(model, subject) {
         return None;
     }
     // The light path fuses the first BFGS gradient, so it must assemble exactly the
@@ -1133,6 +1144,8 @@ impl FallbackCertifier<'_> {
         seed: Vec<f64>,
         admissible: &dyn Fn(&[f64]) -> bool,
     ) -> (Vec<f64>, bool) {
+        #[cfg(test)]
+        NM_FALLBACKS.with(|c| c.set(c.get() + 1));
         let mut x = seed;
         nelder_mead_minimize(obj, &mut x, self.n, self.max_iter * 5, self.tol);
         let ok = self.certify_within(obj, &mut x, admissible);
@@ -1344,6 +1357,28 @@ impl FallbackCertifier<'_> {
         self.newton_certifies_at(obj, x, &g)
     }
 
+    /// Whether a gradient search's unconverged end point `x` is already at its mode: the Newton
+    /// step there is positive definite and the decrease it predicts, `½gᵀH⁻¹g`, is at or below
+    /// the objective's resolution `INNER_FTOL_REL·(1 + |f|)` — no step could still be verified
+    /// by the objective, which is why the search stopped. Then [`Self::newton_certifies`]
+    /// carries `x` on toward `tol` and decides the flag, as it does for a fallback point. A
+    /// point short of its mode (a starved `inner_maxiter`, a hard search) predicts a resolvable
+    /// decrease and is left unchanged for the fallback (#2497).
+    fn certifies_partial_at_mode(&self, obj: &dyn Fn(&[f64]) -> f64, x: &mut Vec<f64>) -> bool {
+        if !x.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let g = (self.grad)(x);
+        let Some(newton) = self.pd_newton_step(x, &g) else {
+            return false;
+        };
+        let f = obj(x);
+        let decrement = 0.5 * DVector::from_column_slice(&g).dot(&newton);
+        f.is_finite()
+            && decrement <= INNER_FTOL_REL * (1.0 + f.abs())
+            && self.newton_certifies(obj, x, &g, &|_| true)
+    }
+
     /// `H⁻¹g` for the central-difference Hessian of `grad` at `x`, or `None` when `g` or `H`
     /// is non-finite or `H` is not positive definite.
     fn pd_newton_step(&self, x: &[f64], g: &[f64]) -> Option<DVector<f64>> {
@@ -1417,6 +1452,8 @@ fn argmin_inner_fallback(
     cold_seed: &[f64],
     cert: &FallbackCertifier,
 ) -> (Vec<f64>, bool) {
+    #[cfg(test)]
+    NM_FALLBACKS.with(|c| c.set(c.get() + 1));
     let (n, max_iter, tol) = (cert.n, cert.max_iter, cert.tol);
     let partial_f = obj(partial);
     let partial_usable = partial_f.is_finite();
@@ -1453,6 +1490,64 @@ fn argmin_inner_fallback(
     };
     let ok = cert.certify(obj, &mut best);
     (best, ok)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Turns off [`certified_stuck_partial`] (#2497) on this thread, for the tests' mutation
+    /// checks.
+    pub(crate) static STUCK_PARTIAL_CERT_OFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// [`InnerExit::Stuck`] exits of the inner searches on this thread, for the tests'
+    /// fixture premises.
+    pub(crate) static STUCK_EXITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Nelder–Mead recoveries on this thread: `argmin_inner_fallback` and
+    /// `FallbackCertifier::nelder_mead_recover` calls.
+    pub(crate) static NM_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Stuck partials [`certified_stuck_partial`] accepted, on every thread: a fit's inner solves
+/// run on its pool's workers, which the thread-locals above do not see. Read as a delta by a
+/// fit-level test's premise (`profile` tests, #2539).
+#[cfg(test)]
+pub(crate) static STUCK_CERTIFIED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether an inner search that ended [`InnerExit::Stuck`] is converged at its end point
+/// `x`: [`FallbackCertifier::certifies_partial_at_mode`] — the Newton decrement there is
+/// already below the objective's resolution, and its Newton steps carry `x` on toward `tol`.
+/// Shared by `find_ebe` and `find_ebe_iov`, which then skip the Nelder–Mead fallback.
+///
+/// Why (#2497): at a tight `inner_tol` (the #2462 verification leg's `1e-10`) a search
+/// reaches its mode before the objective can resolve the last decrease. On a 74-subject
+/// one-compartment IIV+IOV FOCEI fit, before this rule, 652 of the leg's 3996 IOV solves did, at ‖∇‖ 1e-8 …
+/// 2e-6, and each then paid a cold Nelder–Mead restart whose certificate accepted the same
+/// point. Only the `Stuck` exit qualifies: a search that ran out of `max_iter` or found no
+/// acceptable step keeps the fallback and its cold-restart basin comparison, as before. A
+/// stuck search is never an ODE objective's ([`exact_search_stuck`]), so the certificate's
+/// FD Hessian is taken on an exact objective (its gradient may still be finite differences).
+///
+/// The Newton certificate can accept a point by its resolution arm alone, where the objective
+/// cannot resolve the last decrease but the gradient still exceeds `tol`. Such a point is
+/// treated as a certified Nelder–Mead fallback is (#2539): converged, and on its mode for the
+/// profile's adjoint level gradient (`profile::off_mode`), whose error there the resolution
+/// arm bounds. `used_fallback` stays false: no restart ran.
+fn certified_stuck_partial(
+    exit: InnerExit,
+    cert: &FallbackCertifier,
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &mut Vec<f64>,
+) -> bool {
+    #[cfg(test)]
+    if STUCK_PARTIAL_CERT_OFF.with(|o| o.get()) {
+        return false;
+    }
+    let certified = exit == InnerExit::Stuck && cert.certifies_partial_at_mode(obj, x);
+    #[cfg(test)]
+    if certified {
+        STUCK_CERTIFIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    certified
 }
 
 /// An ODE-based model that also carries IOV (`κ`) random effects. The inner EBE path for
@@ -1885,11 +1980,39 @@ pub(crate) fn find_ebe_cached(
     )
 }
 
+/// Where a predicted warm start came from (#2549): the subject's mode at the incumbent, which
+/// the prediction extrapolates, and the exact inner Hessian there, carried from the
+/// incumbent's gradient pass — the warm solve's seed in place of a fresh one when the policy
+/// seeds exactly.
+#[derive(Clone, Copy)]
+pub(crate) struct PredictedFrom<'a> {
+    pub(crate) mode: &'a [f64],
+    pub(crate) seed: Option<&'a DMatrix<f64>>,
+}
+
+/// The population's [`PredictedFrom`]s: every subject's mode, and the carried Hessians when
+/// the incumbent's pass formed them.
+#[derive(Clone, Copy)]
+pub(crate) struct PredictedFromAll<'a> {
+    pub(crate) modes: &'a [DVector<f64>],
+    pub(crate) seeds: Option<&'a [Option<DMatrix<f64>>]>,
+}
+
+impl<'a> PredictedFromAll<'a> {
+    /// Subject `i`'s.
+    pub(crate) fn subject(&self, i: usize) -> PredictedFrom<'a> {
+        PredictedFrom {
+            mode: self.modes[i].as_slice(),
+            seed: self.seeds.and_then(|h| h.get(i)).and_then(Option::as_ref),
+        }
+    }
+}
+
 /// [`find_ebe_cached`] from a **predicted** start `eta_init`, with the mode it was predicted
-/// from as `fallback_start`: a predicted start whose objective is not usable (a first-order
-/// step carried out of the model's domain) is replaced by the fallback before the search
-/// begins (#2549 review r2 #3). The check is the search's own first evaluation, memoised, so
-/// a finite start costs nothing extra and is solved bit for bit as without a fallback.
+/// from in `predicted_from`: a predicted start whose objective is not usable (a first-order
+/// step carried out of the model's domain) is replaced by that mode before the search begins
+/// (#2549 review r2 #3). The check is the search's own first evaluation, memoised, so a
+/// finite start costs nothing extra and is solved bit for bit as without a fallback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_ebe_cached_from(
     model: &CompiledModel,
@@ -1902,7 +2025,7 @@ pub(crate) fn find_ebe_cached_from(
     restarts: usize,
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
-    fallback_start: Option<&[f64]>,
+    predicted_from: Option<PredictedFrom<'_>>,
 ) -> EbeResult {
     #[cfg(test)]
     EBE_SOLVES_STARTED.with(|n| n.set(n.get() + 1));
@@ -1917,7 +2040,7 @@ pub(crate) fn find_ebe_cached_from(
         restarts,
         schedule,
         policy,
-        fallback_start,
+        predicted_from,
     )
 }
 
@@ -2157,6 +2280,14 @@ fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
 thread_local! {
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Inner-solve seed Hessians formed from scratch on this thread and handed to the
+    /// search (not carried, and not declined; #2549).
+    pub(crate) static FRESH_SEEDS_FORMED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// The metric the last inner search on this thread started from, carried or fresh
+    /// (`None`: unseeded), so a test can see which one a solve used (#2585 review #2).
+    pub(crate) static LAST_INITIAL_HESSIAN: std::cell::RefCell<Option<DMatrix<f64>>> =
+        const { std::cell::RefCell::new(None) };
     /// #2095 flip-flop twin seeds that ran a descent: a model or subject the seed declines
     /// leaves this untouched.
     pub(crate) static TWIN_SEEDS_RUN: std::cell::Cell<usize> =
@@ -2222,7 +2353,7 @@ fn find_ebe_impl_from(
     restarts: usize,
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
-    fallback_start: Option<&[f64]>,
+    predicted_from: Option<PredictedFrom<'_>>,
 ) -> EbeResult {
     if inner_profile_enabled() {
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2300,7 +2431,7 @@ fn find_ebe_impl_from(
             policy,
             cold_seed,
             share,
-            fallback_start,
+            predicted_from,
         )
     };
     // The Hessian seed is a *local* model of the individual objective. Near the mode it
@@ -2380,10 +2511,12 @@ fn find_ebe_solve(
     // `find_ebe_impl`'s two cold solves share one screen: the first fills the cell with its
     // descents, the second takes them. `None`: screen for this solve alone.
     screen_share: Option<&RefCell<Option<Vec<ScreenDescent>>>>,
-    // The mode a predicted `eta_init` was predicted from ([`find_ebe_cached_from`]).
-    fallback_start: Option<&[f64]>,
+    // Where a predicted `eta_init` came from ([`find_ebe_cached_from`]).
+    predicted_from: Option<PredictedFrom<'_>>,
 ) -> Option<EbeResult> {
     let n_eta = model.n_eta;
+    let fallback_start = predicted_from.map(|p| p.mode);
+    let carried_seed = predicted_from.and_then(|p| p.seed);
 
     // mu: shift vector (zeros when no mu-referencing)
     // The inner EBE is optimised directly in eta_true space. Mu-referencing is a
@@ -2718,7 +2851,22 @@ fn find_ebe_solve(
         && dense_bfgs_route
         && (warm_start || cold_seed))
         .then(|| {
-            analytic_inner_seed_hessian(
+            // The incumbent's exact inner Hessian at the mode this warm start was predicted
+            // from, carried from its gradient pass (#2549), stands in for a fresh one at the
+            // start: an SPD metric of the same objective at a point O(Δx) away, so the first
+            // step is still the Newton step the prediction approximates and the search ends
+            // at the same mode, without a second-order recording per warm solve.
+            // It honours the same declines as a fresh one (`inner_seed_declined`).
+            if let Some(h) = carried_seed.filter(|h| {
+                seed_kind == InnerHessianSeed::Exact
+                    && warm_start
+                    && !cold_seed
+                    && h.nrows() == n_eta
+                    && h.ncols() == n_eta
+            }) {
+                return (!inner_seed_declined(model, subject)).then(|| (h.clone(), None));
+            }
+            let fresh = analytic_inner_seed_hessian(
                 model,
                 subject,
                 params,
@@ -2729,7 +2877,12 @@ fn find_ebe_solve(
                 &mut obs_grad_recycle.borrow_mut(),
                 seed_kind == InnerHessianSeed::Exact,
                 frozen,
-            )
+            );
+            #[cfg(test)]
+            if fresh.is_some() {
+                FRESH_SEEDS_FORMED.with(|n| n.set(n.get() + 1));
+            }
+            fresh
         })
         .flatten();
     // The seed wrote its own rows into the buffer.
@@ -2742,6 +2895,8 @@ fn find_ebe_solve(
         }
         hessian
     });
+    #[cfg(test)]
+    LAST_INITIAL_HESSIAN.with(|h| *h.borrow_mut() = initial_hessian.clone());
     if cold_seed && initial_hessian.is_none() {
         return None;
     }
@@ -2779,6 +2934,14 @@ fn find_ebe_solve(
     //     (e.g. run out along a FREM covariate pseudo-obs flat direction). Keeping it would
     //     mis-center the FREM/IMP proposal, so recover with NM from η=0 (or the warm partial)
     //     exactly as prior releases — bit-identical for analytical/FREM fits.
+    // A search stuck at its mode is converged ([`certified_stuck_partial`], #2497), FREM
+    // excepted: its restart is what re-centers the proposal (above).
+    let result =
+        if model.frem_config.is_none() && certified_stuck_partial(result, &cert, &obj, &mut eta) {
+            InnerExit::Converged
+        } else {
+            result
+        };
     let bfgs_converged = result.converged();
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
@@ -3733,7 +3896,6 @@ fn find_ebe_iov_seeded(
         &stall_at,
         false,
     );
-    let bfgs_converged = primary.converged();
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
     // (`argmin_inner_fallback`). This holds for ODE objectives (#555, a gradient-noise floor
@@ -3761,6 +3923,14 @@ fn find_ebe_iov_seeded(
         max_iter,
         tol,
     };
+    // #2497: a search stuck at its mode is converged, not a fallback — the same rule as
+    // the non-IOV path ([`certified_stuck_partial`]).
+    let primary = if certified_stuck_partial(primary, &cert, &obj, &mut x) {
+        InnerExit::Converged
+    } else {
+        primary
+    };
+    let bfgs_converged = primary.converged();
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
@@ -5498,15 +5668,23 @@ fn inner_use_lbfgs(n: usize) -> bool {
 /// How one inner minimisation ended. The same value is what a candidate swap carries into
 /// the incumbent (`ebe_exit = exit`), so whether the returned point converged and whether
 /// the certificate moved a Nelder–Mead stop cannot come from two different points.
+///
+/// The gradient drivers ([`dense_bfgs_run`] / [`lbfgs_run`]) return `Converged`, `Stuck` or
+/// `Failed`; [`dense_bfgs_core`] / [`lbfgs_core`] fold that to a bool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InnerExit {
-    /// Not certified.
+    /// Not certified: no acceptable step, or `max_iter` spent.
     Failed,
-    /// Certified where the search stopped.
+    /// Certified where the search stopped: the gradient norm under `tol`, an ODE objective's
+    /// stall stop at its noise floor, or a Nelder–Mead stop the certificate accepted as given.
     Converged,
     /// `inner_optimizer = nelder_mead` only: Nelder–Mead's stop was not a mode, and the
     /// certificate's gradient steps moved it to a certified one (#2571).
     NmMoved,
+    /// [`exact_search_stuck`]: accepted steps no longer move an exact objective or its
+    /// gradient. Unconverged, but the one exit where the end point may be at its mode with the
+    /// last decrease below the objective's resolution — see [`certified_stuck_partial`] (#2497).
+    Stuck,
 }
 
 impl InnerExit {
@@ -5519,7 +5697,7 @@ impl InnerExit {
     }
 
     fn converged(self) -> bool {
-        self != Self::Failed
+        matches!(self, Self::Converged | Self::NmMoved)
     }
 }
 
@@ -5569,8 +5747,8 @@ fn inner_minimize_with_grad(
         x.copy_from_slice(&end);
         return exit;
     }
-    let ok = if inner_use_lbfgs(n) {
-        lbfgs_core(
+    let exit = if inner_use_lbfgs(n) {
+        lbfgs_run(
             obj,
             grad,
             x,
@@ -5583,7 +5761,7 @@ fn inner_minimize_with_grad(
             short_line_search,
         )
     } else {
-        dense_bfgs_core(
+        dense_bfgs_run(
             obj,
             grad,
             x,
@@ -5597,7 +5775,11 @@ fn inner_minimize_with_grad(
             short_line_search,
         )
     };
-    InnerExit::certified(ok)
+    #[cfg(test)]
+    if exit == InnerExit::Stuck {
+        STUCK_EXITS.with(|c| c.set(c.get() + 1));
+    }
+    exit
 }
 
 /// Shared L-BFGS driver: two-loop direction + backtracking line search, bounded
@@ -5615,6 +5797,35 @@ fn lbfgs_core(
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> bool {
+    lbfgs_run(
+        obj,
+        grad,
+        x,
+        n,
+        max_iter,
+        tol,
+        precond,
+        stop_precond,
+        stall_at,
+        short_line_search,
+    )
+    .converged()
+}
+
+/// [`lbfgs_core`], reporting how the search ended ([`InnerExit`]).
+#[allow(clippy::too_many_arguments)]
+fn lbfgs_run(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+    precond: Option<&[f64]>,
+    stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool,
+    short_line_search: bool,
+) -> InnerExit {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
     let mut rho_hist: Vec<f64> = Vec::new();
@@ -5626,6 +5837,8 @@ fn lbfgs_core(
     // reached the mode declares convergence rather than spinning to `max_iter`. Gated on
     // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`).
     let mut stall = 0u32;
+    // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
+    let mut non_moves = NonMoveStreak::default();
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -5661,7 +5874,7 @@ fn lbfgs_core(
         // to accelerate the search above.
         let gnorm = grad_norm_metric(&g, stop_precond);
         if gnorm < tol {
-            return true;
+            return InnerExit::Converged;
         }
         // Has the gradient norm meaningfully improved on the best seen? (Plateau guard.)
         let gnorm_improving = gnorm < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
@@ -5711,8 +5924,8 @@ fn lbfgs_core(
                 f_new,
                 g_new,
             } => (alpha, f_new, g_new),
-            StepChoice::ConvergedAtFloor => return true,
-            StepChoice::Failed => return false,
+            StepChoice::ConvergedAtFloor => return InnerExit::Converged,
+            StepChoice::Failed => return InnerExit::Failed,
         };
         // Stall only for ODE objectives, and only once the gradient has plateaued (no
         // longer improving) — see [`INNER_FTOL_REL`]. `objective_stalled` is always called
@@ -5720,6 +5933,7 @@ fn lbfgs_core(
         // whether a reached count converts to convergence.
         let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
         let stalled = enable_stall && obj_flat && !gnorm_improving;
+        let f_old = f_cur;
         f_cur = f_new;
 
         let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
@@ -5727,11 +5941,23 @@ fn lbfgs_core(
             x[i] += s[i];
         }
         if stalled {
-            return true;
+            return InnerExit::Converged;
         }
         enable_stall = enable_stall || stall_at(x);
 
         let g_new = verified_g.take().unwrap_or_else(|| grad(x));
+        if exact_search_stuck(
+            enable_stall,
+            f_old,
+            f_new,
+            &g,
+            &g_new,
+            &s,
+            x,
+            &mut non_moves,
+        ) {
+            return InnerExit::Stuck;
+        }
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
 
         let sy: f64 = s.iter().zip(y.iter()).map(|(si, yi)| si * yi).sum();
@@ -5749,7 +5975,7 @@ fn lbfgs_core(
         crate::scratch::give(std::mem::replace(&mut g, g_new));
     }
 
-    false
+    InnerExit::Failed
 }
 
 /// The dense BFGS update's operands, held for one solve (#1564): `ρs`, `ρy`, `yᵀ`, `sᵀ`,
@@ -5798,6 +6024,37 @@ fn dense_bfgs_core(
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> bool {
+    dense_bfgs_run(
+        obj,
+        grad,
+        x,
+        n,
+        max_iter,
+        tol,
+        precond,
+        hessian_seed,
+        stop_precond,
+        stall_at,
+        short_line_search,
+    )
+    .converged()
+}
+
+/// [`dense_bfgs_core`], reporting how the search ended ([`InnerExit`]).
+#[allow(clippy::too_many_arguments)]
+fn dense_bfgs_run(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+    precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
+    stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool,
+    short_line_search: bool,
+) -> InnerExit {
     let seed_inv = seed_h_inv(n, hessian_seed);
     let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
     let mut g = grad(x);
@@ -5826,6 +6083,8 @@ fn dense_bfgs_core(
     // stall never stops a smooth analytical/FD fit and a non-stationary mid-descent iterate
     // can't be accepted.
     let mut stall = 0u32;
+    // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
+    let mut non_moves = NonMoveStreak::default();
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -5879,7 +6138,7 @@ fn dense_bfgs_core(
         }
         first_step = false;
         if gnorm < tol {
-            return true;
+            return InnerExit::Converged;
         }
 
         g_vec.as_mut_slice().copy_from_slice(&g);
@@ -5890,7 +6149,11 @@ fn dense_bfgs_core(
         }
 
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
-        if dg >= 0.0 {
+        // A non-descent direction resets the metric and takes its step without a curvature
+        // update. One step path for both, so the stall and non-move stops below have a
+        // single site each.
+        let reset = dg >= 0.0;
+        if reset {
             // Reset to the (preconditioned) steepest-descent metric, not raw
             // identity — for FREM the preconditioner is what keeps the descent
             // direction commensurate across the multi-scale dimensions.
@@ -5909,40 +6172,6 @@ fn dense_bfgs_core(
             if seed_inv.is_none() {
                 cap_curvature_free_step(&mut d, precond);
             }
-            let (alpha, f_new, mut verified_g) = match choose_step(
-                obj,
-                grad,
-                x,
-                &d,
-                &g,
-                f_cur,
-                stop_precond,
-                enable_stall,
-                gnorm_improving,
-                &mut line_search_point,
-                short_line_search,
-            ) {
-                StepChoice::Step {
-                    alpha,
-                    f_new,
-                    g_new,
-                } => (alpha, f_new, g_new),
-                StepChoice::ConvergedAtFloor => return true,
-                StepChoice::Failed => return false,
-            };
-            for i in 0..n {
-                x[i] += alpha * d[i];
-            }
-            let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
-            let stalled = enable_stall && obj_flat && !gnorm_improving;
-            f_cur = f_new;
-            if stalled {
-                return true;
-            }
-            enable_stall = enable_stall || stall_at(x);
-            let g_next = verified_g.take().unwrap_or_else(|| grad(x));
-            crate::scratch::give(std::mem::replace(&mut g, g_next));
-            continue;
         }
 
         let (alpha, f_new, mut verified_g) = match choose_step(
@@ -5963,8 +6192,8 @@ fn dense_bfgs_core(
                 f_new,
                 g_new,
             } => (alpha, f_new, g_new),
-            StepChoice::ConvergedAtFloor => return true,
-            StepChoice::Failed => return false,
+            StepChoice::ConvergedAtFloor => return InnerExit::Converged,
+            StepChoice::Failed => return InnerExit::Failed,
         };
 
         for i in 0..n {
@@ -5973,48 +6202,63 @@ fn dense_bfgs_core(
         }
         let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
         let stalled = enable_stall && obj_flat && !gnorm_improving;
+        let f_old = f_cur;
         f_cur = f_new;
         if stalled {
-            return true;
+            return InnerExit::Converged;
         }
         enable_stall = enable_stall || stall_at(x);
 
         let g_new = verified_g.take().unwrap_or_else(|| grad(x));
-        for i in 0..n {
-            y[i] = g_new[i] - g[i];
+        if exact_search_stuck(
+            enable_stall,
+            f_old,
+            f_new,
+            &g,
+            &g_new,
+            &s,
+            x,
+            &mut non_moves,
+        ) {
+            return InnerExit::Stuck;
         }
+        if !reset {
+            for i in 0..n {
+                y[i] = g_new[i] - g[i];
+            }
 
-        s_vec.as_mut_slice().copy_from_slice(&s);
-        y_vec.as_mut_slice().copy_from_slice(&y);
-        let sy = s_vec.dot(&y_vec);
-        if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), enable_stall) {
-            let rho = 1.0 / sy;
-            // `(I − ρsyᵀ)·H·(I − ρysᵀ) + ρssᵀ` with the operands' own kernels (`mul_to`
-            // is what `*` calls), into buffers held for the solve rather than a fresh
-            // matrix per product (#1564): the same arithmetic, bit for bit.
-            upd.rs.copy_from(&s_vec);
-            upd.rs *= rho;
-            upd.ry.copy_from(&y_vec);
-            upd.ry *= rho;
-            upd.yt.tr_copy_from(&y_vec);
-            upd.st.tr_copy_from(&s_vec);
-            upd.rs.mul_to(&upd.yt, &mut upd.outer_a);
-            upd.ry.mul_to(&upd.st, &mut upd.outer_b);
-            upd.left.copy_from(&eye);
-            upd.left -= &upd.outer_a;
-            upd.right.copy_from(&eye);
-            upd.right -= &upd.outer_b;
-            upd.left.mul_to(&h_inv, &mut upd.t);
-            upd.t.mul_to(&upd.right, &mut h_inv);
-            upd.rs.mul_to(&upd.st, &mut upd.outer_a);
-            h_inv += &upd.outer_a;
-            h_unshaped = false;
+            s_vec.as_mut_slice().copy_from_slice(&s);
+            y_vec.as_mut_slice().copy_from_slice(&y);
+            let sy = s_vec.dot(&y_vec);
+            if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), enable_stall) {
+                let rho = 1.0 / sy;
+                // `(I − ρsyᵀ)·H·(I − ρysᵀ) + ρssᵀ` with the operands' own kernels (`mul_to`
+                // is what `*` calls), into buffers held for the solve rather than a fresh
+                // matrix per product (#1564): the same arithmetic, bit for bit.
+                upd.rs.copy_from(&s_vec);
+                upd.rs *= rho;
+                upd.ry.copy_from(&y_vec);
+                upd.ry *= rho;
+                upd.yt.tr_copy_from(&y_vec);
+                upd.st.tr_copy_from(&s_vec);
+                upd.rs.mul_to(&upd.yt, &mut upd.outer_a);
+                upd.ry.mul_to(&upd.st, &mut upd.outer_b);
+                upd.left.copy_from(&eye);
+                upd.left -= &upd.outer_a;
+                upd.right.copy_from(&eye);
+                upd.right -= &upd.outer_b;
+                upd.left.mul_to(&h_inv, &mut upd.t);
+                upd.t.mul_to(&upd.right, &mut h_inv);
+                upd.rs.mul_to(&upd.st, &mut upd.outer_a);
+                h_inv += &upd.outer_a;
+                h_unshaped = false;
+            }
         }
 
         crate::scratch::give(std::mem::replace(&mut g, g_new));
     }
 
-    false
+    InnerExit::Failed
 }
 
 /// Nelder-Mead simplex minimization (fallback)
@@ -6753,6 +6997,84 @@ enum Verdict {
     Rejected(Option<Vec<f64>>),
 }
 
+/// Consecutive accepted non-moves after which an exact-objective inner search gives up
+/// ([`exact_search_stuck`]).
+const INNER_NON_MOVE_LIMIT: u32 = 5;
+
+/// Relative change of the gradient vector, `‖g_new − g‖ ≤ this·‖g‖`, within which an accepted
+/// step that left the objective bit-for-bit unchanged is a non-move ([`exact_search_stuck`]).
+/// The non-moves measured on #2497 changed the gradient by ~1e-9 of its norm; a search whose
+/// gradient falls by 0.05% (under the stall stop's 0.1% norm-plateau guard) or rotates at
+/// constant norm changes it by ≥ 5e-4 and is moving.
+const INNER_NON_MOVE_GRAD_REL: f64 = 1e-6;
+
+/// Step length, `‖s‖ ≤ this·(1 + ‖x‖)`, within which an accepted step is a non-move
+/// ([`exact_search_stuck`]). Measured on the #2497 fixtures (`warfarin_iov`, `three_cpt_iv`,
+/// the FREM fixture at `1e-10`): the objective-unchanged steps of a stuck search moved `x` by
+/// 1e-18 … 3e-16 of `1 + ‖x‖`, so this sits six orders above them. A step longer than this
+/// moved the iterate, whatever the objective and gradient read.
+const INNER_NON_MOVE_STEP_REL: f64 = 1e-10;
+
+/// True once an **exact**-objective search (`!enable_stall`) has taken
+/// [`INNER_NON_MOVE_LIMIT`] consecutive accepted steps that are non-moves: the objective
+/// bit-for-bit unchanged, the run's summed step length no more than
+/// [`INNER_NON_MOVE_STEP_REL`]`·(1 + ‖x‖)`,
+/// **and** the gradient vector, read at the step's end point, within
+/// [`INNER_NON_MOVE_GRAD_REL`] of the one before it. A step that moved the iterate, or moved
+/// the gradient — down, up, or round at constant norm — is a move and restarts the count. Shared by the dense and
+/// L-BFGS drivers, which then return [`InnerExit::Stuck`].
+///
+/// Why (#2497): next to the mode `c1·α·∇f·d` falls below ulp(f), so the Armijo test accepts
+/// `f_new == f` at a tiny backtracked `α`. That step moves `x` by ~`α·‖d‖`, leaves the
+/// gradient where it was, and its curvature pair is too small to reshape the metric, so the
+/// next iteration repeats it exactly. Measured at `inner_tol = 1e-10` on a 74-subject
+/// one-compartment IIV+IOV FOCEI fit (the #2462 verification leg's tolerance), before this rule: 652 of 3996
+/// IOV solves sat at ‖∇‖ 1e-8 … 2e-6 from iteration ~10 and repeated that non-move to
+/// `max_iter = 200` before the fallback took them. Stopping hands them to the caller 190
+/// iterations sooner at the same point. An ODE objective (`enable_stall`) has its own stall
+/// stop and is not counted.
+#[allow(clippy::too_many_arguments)]
+fn exact_search_stuck(
+    enable_stall: bool,
+    f_old: f64,
+    f_new: f64,
+    g_old: &[f64],
+    g_new: &[f64],
+    step: &[f64],
+    x_new: &[f64],
+    streak: &mut NonMoveStreak,
+) -> bool {
+    let travelled = streak.travelled + l2_norm(step);
+    let unmoved = || {
+        if travelled > INNER_NON_MOVE_STEP_REL * (1.0 + l2_norm(x_new)) {
+            return false;
+        }
+        let dg = g_old
+            .iter()
+            .zip(g_new)
+            .map(|(a, b)| (b - a) * (b - a))
+            .sum::<f64>()
+            .sqrt();
+        dg <= INNER_NON_MOVE_GRAD_REL * l2_norm(g_old)
+    };
+    if !enable_stall && f_new == f_old && unmoved() {
+        streak.count += 1;
+        streak.travelled = travelled;
+    } else {
+        *streak = NonMoveStreak::default();
+    }
+    streak.count >= INNER_NON_MOVE_LIMIT
+}
+
+/// The run of non-moves [`exact_search_stuck`] is counting: how many, and the summed length of
+/// their steps — a bound on how far the iterate has drifted since the run began, so steps that
+/// are each short but add up to a real move are not a non-move.
+#[derive(Clone, Copy, Debug, Default)]
+struct NonMoveStreak {
+    count: u32,
+    travelled: f64,
+}
+
 /// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
 /// for [`INNER_STALL_LIMIT`] consecutive accepted steps. Shared verbatim by the dense and
 /// L-BFGS inner drivers so the two paths cannot drift apart on convergence (#555).
@@ -7104,7 +7426,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
 
 /// [`run_inner_loop_warm_map_cached`] from **predicted** starts (#2549): `prev_etas` are the
 /// first-order predictions `η̂ + (dη̂/dx)·Δx` of the outer loop's warm-start predictor and
-/// `fallback_etas` the modes they were predicted from.
+/// `predicted_from` the modes they were predicted from, with the carried seeds.
 ///
 /// The prediction is the mode's exact first-order expansion, so on a smooth stretch of the
 /// trajectory every subject solves from it and this is the plain warm pass, bit for bit. A
@@ -7121,7 +7443,7 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
     max_iter: usize,
     tol: f64,
     prev_etas: &[DVector<f64>],
-    fallback_etas: &[DVector<f64>],
+    predicted_from: PredictedFromAll<'_>,
     mu_k: Option<&[f64]>,
     min_obs: usize,
     restarts: usize,
@@ -7143,7 +7465,7 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
         max_iter,
         tol,
         Some(prev_etas),
-        Some(fallback_etas),
+        Some(predicted_from),
         mu_k,
         min_obs,
         restarts,
@@ -7156,6 +7478,11 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
 
 /// Replace a predicted start whose objective `at_start` is not usable (not finite, or on the
 /// `SUBJECT_SENTINEL_NLL` rail) by the mode it was predicted from ([`find_ebe_cached_from`]).
+///
+/// Not by the mode wherever that scores lower: both are starts for one minimisation, but on
+/// `pk2_big` under Laplace (#2585, ten `PERT = 0.3` starts) taking the lower one changed
+/// which starts ended in a poor optimum without changing how many (one went from −3485.208
+/// to −2688.01), the path dependence the predictor's smoothness argument predicts.
 fn start_at_fallback_if_unusable(at_start: f64, eta: &mut [f64], fallback: &[f64]) {
     if !crate::stats::likelihood::is_usable_subject_nll(at_start) {
         eta.copy_from_slice(fallback);
@@ -7218,7 +7545,7 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
     max_iter: usize,
     tol: f64,
     prev_etas: Option<&[DVector<f64>]>,
-    fallback_etas: Option<&[DVector<f64>]>,
+    predicted_from: Option<PredictedFromAll<'_>>,
     mu_k: Option<&[f64]>,
     min_obs: usize,
     restarts: usize,
@@ -7271,10 +7598,10 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
                 Some(cache) => cache[i].as_ref(),
                 None => local_schedule.as_ref(),
             };
-            let fallback = fallback_etas.map(|f| f[i].as_slice());
+            let from = predicted_from.map(|p| p.subject(i));
+            let fallback = from.map(|p| p.mode);
             let mut ebe = find_ebe_cached_from(
-                model, subject, params, max_iter, tol, init, mu_k, restarts, schedule, policy,
-                fallback,
+                model, subject, params, max_iter, tol, init, mu_k, restarts, schedule, policy, from,
             );
             // A predicted start that the solve fails from is solved again from the
             // subject's previous mode, and the lower objective is kept (ties to the

@@ -182,7 +182,7 @@
 //! | `E_BINARY_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[binary_model]` (binary / categorical) endpoint (#760) |
 //! | `E_CTMM_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[markov_model]` (CTMM or DTMM) endpoint (#759, #2473) |
 //! | `E_CTMM_IOV_UNSUPPORTED` | a `[markov_model]` (CTMM or DTMM) endpoint on a model with IOV (`n_kappa > 0`); the generator / transition probabilities use BSV η only, so κ would be ignored (#759, #2473) |
-//! | `E_IMPMAP_IOV_UNSUPPORTED` | `method = impmap` anywhere in a method chain on a model with IOV (`n_kappa > 0`); IMPMAP has no κ M-step yet |
+//! | `E_IMP_MIXTURE_IOV_UNSUPPORTED` | `method = imp` / `impmap` anywhere in the chain on a `[mixture]` model with IOV (`n_kappa > 0`); their mixture E-step has no κ (#2301) |
 //! | `E_VI_MODEL_UNSUPPORTED` | `method = vi` anywhere in a chain on a model with a non-Gaussian (TTE / categorical) endpoint or an SDE (`[diffusion]`) block, whose likelihood VI's fixed-η data term does not evaluate |
 //! | `W_VI_OMEGA_UNANCHORED` | `vi_kl = mc` with `vi_omega_update = adam` on a chain that runs VI leaves Ω driven only by a Monte-Carlo gradient; expect a noisy Ω trace and possible non-convergence |
 //! | `E_BLOCK_SIGMA_METHOD_UNSUPPORTED` | a `block_sigma` model with a stage other than `foce`, `focei`, `saem`, `imp`, `laplace` or `vi` in the chain (i.e. `gn`, `gn_hybrid`, `impmap`, `bayes`) |
@@ -211,6 +211,7 @@
 //! | `W_IG_FLIP_FLOP` | a twin-carrying inverse-Gaussian absorption model is in the flip-flop regime at typical values (η = 0) for some subject; ferx evaluates the equivalent ODE model there (informational) |
 //! | `W_IOV_NO_OCCASIONS` | an IOV model with an Ω_IOV was handed subjects with no occasion label after the occasion rule was applied, so they were simulated at κ = 0 with no inter-occasion variability (#1955, #1980) |
 //! | `W_FREM_DRAWN_ETA` | a FREM model was simulated with η drawn from Ω for some subjects (no `match_method`, no supplied η), so their PK follows the drawn covariate η, not their own covariate values (#2245) |
+//! | `W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET` | an adaptive decision point lies after an in-order EVID=3/4 reset on the written clock and before it on the engine clock, because the reader moved the reset past a running infusion, `ADDL` train or co-timed record (#1609); the dose issued there is wiped by the reset. Silent from a restarting period on. Raised by every `simulate_adaptive*` entry point (#2559) |
 //! | `W_SIMULATED_FLIP_FLOP` | some simulated individuals dosed before an observation drew an η in the flip-flop regime of a twin-less transit / IG closed form, so their dose-driven concentration was clamped to zero (#1823); also counted for the NPDE/NPD reference replicates (#1928) |
 //! | `W_UNCERTAINTY_DRAWS_SKIPPED` | some uncertainty draws put a twin-less transit / IG closed form in the flip-flop regime at typical values and were skipped, so intervals built from the rest are biased (#786, #1485) |
 //! | `W_RTTE_DEGENERATE` | a simulated subject's recurrent-event hazard is degenerate (expected events non-finite or above 1e6, or the stream passed 1e6 events); its stream was skipped or truncated and censored at the horizon (#762) |

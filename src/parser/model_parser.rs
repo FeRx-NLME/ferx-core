@@ -14378,19 +14378,72 @@ fn parse_diffusion_block(
 // Feature-gated behind `nn`. Without the feature the parser surfaces a
 // clear error so users get told to rebuild with `--features nn`.
 
-#[cfg(feature = "nn")]
+/// The fields of one `[covariate_nn NAME]` block, read once (#1331).
+///
+/// Compiled in every build: the network evaluation needs the `nn` feature, but
+/// the DCM exporter (`crate::nn::export`) only needs what the block *says*, and
+/// it has to run in the default build ferx-r ships. Both consumers read the block
+/// through [`parse_nn_block_fields`] — a second, export-only reader of the same
+/// `key = value` lines is exactly the pair that would drift unseen, since the two
+/// would only ever be compared on a model someone happened to run both ways.
 #[derive(Debug, Clone)]
-pub(crate) struct CovariateNnSpec {
+pub(crate) struct NnBlockSpec {
+    /// The block's instance name, as written (`TYPICAL_PK`).
     pub name: String,
-    pub mapper: crate::nn::NamedMlpMapper,
-    pub theta_names: Vec<String>,
-    pub theta_inits: Vec<f64>,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    /// Hidden-layer widths, input and output excluded.
+    pub hidden: Vec<usize>,
+    pub hidden_activation: crate::nn::Activation,
+    pub output_activation: crate::nn::Activation,
+    /// Per-input `center`; `None` when the block declares none (the identity).
+    pub center: Option<Vec<f64>>,
+    /// Per-input `scale`; `None` when the block declares none (the identity).
+    pub scale: Option<Vec<f64>>,
+    /// Per-output `init`, on the output scale; read only by the `nn` build.
+    #[cfg_attr(not(feature = "nn"), allow(dead_code))]
+    pub init: Option<Vec<f64>>,
 }
 
-#[cfg(feature = "nn")]
-fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnSpec, String> {
-    use crate::nn::{Activation, CovariateMapper, MlpMapper, NamedMlpMapper};
+impl NnBlockSpec {
+    /// The full layer shape `[n_inputs, hidden..., n_outputs]`.
+    pub fn layer_sizes(&self) -> Vec<usize> {
+        let mut sizes = Vec::with_capacity(self.hidden.len() + 2);
+        sizes.push(self.inputs.len());
+        sizes.extend(self.hidden.iter().copied());
+        sizes.push(self.outputs.len());
+        sizes
+    }
 
+    /// The auto-generated weight-θ names, in the network's flat weight order:
+    /// per layer `l` (1-based), the row-major `W` block (`W_<NAME>_<l>_<i>_<j>`,
+    /// unit `i`, input `j`) then the bias vector (`B_<NAME>_<l>_<i>`). The fit
+    /// reports the weights under exactly these names, which is how the exporter
+    /// finds them in a `FitResult` without knowing where the block sits in θ.
+    pub fn weight_theta_names(&self) -> Vec<String> {
+        let upper = self.name.to_ascii_uppercase();
+        let sizes = self.layer_sizes();
+        let mut names = Vec::new();
+        for l in 1..sizes.len() {
+            for i in 1..=sizes[l] {
+                for j in 1..=sizes[l - 1] {
+                    names.push(format!("W_{}_{}_{}_{}", upper, l, i, j));
+                }
+            }
+            for i in 1..=sizes[l] {
+                names.push(format!("B_{}_{}_{}", upper, l, i));
+            }
+        }
+        names
+    }
+}
+
+/// Read the `key = value` lines of a `[covariate_nn NAME]` block into an
+/// [`NnBlockSpec`]. Every syntactic check on the block lives here; what is left
+/// to the `nn` build is what only a constructed network can say (normalisation
+/// lengths and values, output names that are not PK parameters, `init` ranges).
+pub(crate) fn parse_nn_block_fields(name: &str, lines: &[String]) -> Result<NnBlockSpec, String> {
+    use crate::nn::Activation;
     // Collect simple `key = value` pairs. Each value is either a list
     // `[a, b, c]` or a bare identifier / integer.
     let mut fields: HashMap<String, String> = HashMap::new();
@@ -14514,40 +14567,76 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         }
     }
 
-    let n_inputs = inputs.len();
-    let mut layer_sizes = Vec::with_capacity(hidden.len() + 2);
-    layer_sizes.push(inputs.len());
-    layer_sizes.extend(hidden.iter().copied());
-    layer_sizes.push(outputs.len());
-
-    let mlp = MlpMapper::new(layer_sizes.clone(), hidden_activation, output_activation)
-        .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
     // Optional per-input normalisation: the network sees `(x - center) / scale`.
-    // Absent keys default to the identity, so an existing model is unchanged. Declared
+    // Absent keys mean the identity, so an existing model is unchanged. Declared
     // rather than estimated from the data — see `NamedMlpMapper::input_scale` for why.
-    let take_float_list = |field: &str, default: f64| -> Result<Vec<f64>, String> {
-        let Some(raw) = fields.get(field) else {
-            return Ok(vec![default; n_inputs]);
-        };
-        let parsed = parse_float_array(raw)
-            .map_err(|e| format!("[covariate_nn {}] `{}`: {}", name, field, e))?;
-        Ok(parsed)
+    let take_float_list = |field: &str| -> Result<Option<Vec<f64>>, String> {
+        fields
+            .get(field)
+            .map(|raw| {
+                parse_float_array(raw)
+                    .map_err(|e| format!("[covariate_nn {}] `{}`: {}", name, field, e))
+            })
+            .transpose()
     };
-    let center = take_float_list("center", 0.0)?;
-    let scale = take_float_list("scale", 1.0)?;
+    let center = take_float_list("center")?;
+    let scale = take_float_list("scale")?;
+    let init = take_float_list("init")?;
 
-    let mapper = NamedMlpMapper::new(mlp, inputs, outputs)
+    Ok(NnBlockSpec {
+        name: name.to_string(),
+        inputs,
+        outputs,
+        hidden,
+        hidden_activation,
+        output_activation,
+        center,
+        scale,
+        init,
+    })
+}
+
+#[cfg(feature = "nn")]
+#[derive(Debug, Clone)]
+pub(crate) struct CovariateNnSpec {
+    pub name: String,
+    pub mapper: crate::nn::NamedMlpMapper,
+    pub theta_names: Vec<String>,
+    pub theta_inits: Vec<f64>,
+}
+
+/// Build the network a `[covariate_nn NAME]` block declares: the fields from
+/// [`parse_nn_block_fields`], then the mapper, the weight-θ names and their
+/// deterministic starting values.
+#[cfg(feature = "nn")]
+fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnSpec, String> {
+    use crate::nn::{CovariateMapper, MlpMapper, NamedMlpMapper};
+
+    let block = parse_nn_block_fields(name, lines)?;
+    let n_inputs = block.inputs.len();
+    let output_activation = block.output_activation;
+    let layer_sizes = block.layer_sizes();
+
+    let mlp = MlpMapper::new(
+        layer_sizes.clone(),
+        block.hidden_activation,
+        output_activation,
+    )
+    .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
+    let center = block.center.clone().unwrap_or_else(|| vec![0.0; n_inputs]);
+    let scale = block.scale.clone().unwrap_or_else(|| vec![1.0; n_inputs]);
+
+    let mapper = NamedMlpMapper::new(mlp, block.inputs.clone(), block.outputs.clone())
         .map_err(|e| format!("[covariate_nn {}] {}", name, e))?
         .with_normalization(center, scale)
         .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
 
-    // Auto-generate weight-theta names + Glorot-style deterministic inits.
-    // Names are uppercase to match the codebase convention (TVCL, THETA_WT,
-    // DIFF_CENTRAL, …). Inits use a fixed PRNG (xorshift seeded by name) so
-    // builds are reproducible without pulling `rand` into the parser.
+    // Auto-generated weight-theta names (`NnBlockSpec::weight_theta_names`) +
+    // Glorot-style deterministic inits. Inits use a fixed PRNG (xorshift seeded by
+    // name) so builds are reproducible without pulling `rand` into the parser.
     let upper = name.to_ascii_uppercase();
-    let mut theta_names = Vec::new();
-    let mut theta_inits = Vec::new();
+    let theta_names = block.weight_theta_names();
+    let mut theta_inits = Vec::with_capacity(theta_names.len());
     let mut state: u64 = {
         // Tiny string hash → seed. Deterministic across runs.
         let mut h: u64 = 0xcbf29ce484222325;
@@ -14569,14 +14658,10 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         let n_lm1 = layer_sizes[l - 1];
         // Glorot/Xavier scale: weights ~ U(-r, r), r = sqrt(6 / (fan_in + fan_out)).
         let r = (6.0 / (n_lm1 + n_l) as f64).sqrt();
-        for i in 1..=n_l {
-            for j in 1..=n_lm1 {
-                theta_names.push(format!("W_{}_{}_{}_{}", upper, l, i, j));
-                theta_inits.push(2.0 * r * next_unit());
-            }
+        for _ in 0..n_l * n_lm1 {
+            theta_inits.push(2.0 * r * next_unit());
         }
-        for i in 1..=n_l {
-            theta_names.push(format!("B_{}_{}_{}", upper, l, i));
+        for _ in 0..n_l {
             // Biases initialised to 0 — standard for tanh/sigmoid; for ReLU
             // you'd want a small positive bias, but this module's intended
             // hidden activation for [covariate_nn] is `tanh` (softplus on the
@@ -14585,6 +14670,7 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         }
     }
     debug_assert_eq!(theta_names.len(), mapper.n_weights());
+    debug_assert_eq!(theta_inits.len(), theta_names.len());
 
     // Optional `init = [v_1, …, v_K]`: one starting value per output, on the scale the
     // network *emits* (a clearance in L/h, a volume in L) rather than on the weight
@@ -14608,9 +14694,7 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
     // is not frozen: it receives gradient immediately (`∂z_k/∂W_L[k,j] = a_{L-1}[j]`, which
     // is nonzero), and the hidden layers start receiving gradient one step later, once
     // `W_L` has moved off zero.
-    if let Some(raw) = fields.get("init") {
-        let values =
-            parse_float_array(raw).map_err(|e| format!("[covariate_nn {}] `init`: {}", name, e))?;
+    if let Some(values) = &block.init {
         let n_out = mapper.mlp().n_outputs();
         if values.len() != n_out {
             return Err(format!(
@@ -17090,6 +17174,16 @@ pub fn known_block_names() -> Vec<&'static str> {
 }
 
 /// Whether the cargo feature a registry entry names is enabled in this build.
+/// The feature a `[name]` block needs when this build lacks it, or `None` when
+/// the block is not feature-gated, its feature is on, or it is not a block name.
+pub(crate) fn block_disabled_feature(name: &str) -> Option<&'static str> {
+    BLOCK_REGISTRY
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .and_then(|(_, _, feature)| *feature)
+        .filter(|f| !block_feature_enabled(f))
+}
+
 fn block_feature_enabled(feature: &str) -> bool {
     match feature {
         "survival" => cfg!(feature = "survival"),
@@ -17231,7 +17325,7 @@ const MODEL_NAME_FORMS: &str = "`model NAME` or `model = NAME` (letters, digits 
 /// `line` with a trailing `#` / `//` comment removed. The block extractor and
 /// the preamble reader share one definition of "comment" so a `model` line and
 /// a `[block]` header cannot disagree on where a line ends.
-fn strip_line_comment(line: &str) -> &str {
+pub(crate) fn strip_line_comment(line: &str) -> &str {
     match line.find('#').into_iter().chain(line.find("//")).min() {
         Some(idx) => &line[..idx],
         None => line,
@@ -17373,14 +17467,28 @@ struct ExtractedBlocks {
     block_lines: HashMap<String, usize>,
 }
 
+/// A block header line, read the one way [`extract_blocks`] reads it: `(type
+/// lower-cased, instance)` for a line that opens a block, `None` otherwise.
+/// `trimmed` is the line with its comment stripped and whitespace trimmed.
+///
+/// Two header forms:
+///   `[block_type]`            — unnamed (existing)
+///   `[block_type INSTANCE]`   — named (e.g. `[covariate_nn TYPICAL_PK]`)
+/// Anchored on the whole line so things like `states=[central]` inside an ODE
+/// structural definition aren't misread as a block-tag opener. Shared with the
+/// DCM exporter (`crate::nn::export`), which rewrites model text block by block
+/// and must agree with the parser on where each block starts.
+pub(crate) fn block_header(trimmed: &str) -> Option<(String, Option<String>)> {
+    BLOCK_HEADER_RE.captures(trimmed).map(|caps| {
+        (
+            caps[1].to_lowercase(),
+            caps.get(2).map(|m| m.as_str().to_string()),
+        )
+    })
+}
+
 fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
     let mut out = ExtractedBlocks::default();
-    // Two header forms:
-    //   `[block_type]`            — unnamed (existing)
-    //   `[block_type INSTANCE]`   — named (e.g. `[covariate_nn TYPICAL_PK]`)
-    // Anchor on the whole line so things like `states=[central]` inside an
-    // ODE structural definition aren't misread as a block-tag opener.
-    let block_re = &*BLOCK_HEADER_RE;
 
     // current_target: either an unnamed block name, or a (block_type, instance) pair.
     enum BlockTarget {
@@ -17399,18 +17507,10 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
             continue;
         }
 
-        if let Some(caps) = block_re.captures(trimmed) {
-            let ty = caps[1].to_lowercase();
-            headers.push((
-                ty.clone(),
-                caps.get(2).map(|m| m.as_str().to_string()),
-                idx + 1,
-            ));
-            current = match caps.get(2) {
-                Some(m) => Some(BlockTarget::Named {
-                    ty,
-                    name: m.as_str().to_string(),
-                }),
+        if let Some((ty, instance)) = block_header(trimmed) {
+            headers.push((ty.clone(), instance.clone(), idx + 1));
+            current = match instance {
+                Some(name) => Some(BlockTarget::Named { ty, name }),
                 None => {
                     // Record the 1-based header line; first occurrence wins.
                     out.block_lines.entry(ty.clone()).or_insert(idx + 1);
@@ -17746,7 +17846,7 @@ fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
 /// The entry criterion is that a *statement* in the block can never begin with a
 /// binary operator — see [`join_continuation_lines`] for why that is what makes
 /// joining a strict widening rather than a reinterpretation.
-const CONTINUATION_BLOCKS: &[&str] = &[
+pub(crate) const CONTINUATION_BLOCKS: &[&str] = &[
     "individual_parameters",
     "odes",
     "scaling",
@@ -17768,12 +17868,12 @@ const CONTINUATION_BLOCKS: &[&str] = &[
 /// `if`, or a brace — never with a binary operator — so a line opening with one
 /// of these can only be a continuation, and joining it strictly widens the
 /// accepted grammar rather than reinterpreting anything that parsed before.
-const CONTINUATION_LEADERS: &[char] = &['+', '-', '*', '/', '^'];
+pub(crate) const CONTINUATION_LEADERS: &[char] = &['+', '-', '*', '/', '^'];
 
 /// Trailing characters that mark a line as unfinished, so the *next* line
 /// continues it. `=` is included so `LEMAX =` followed by an indented expression
 /// works; `,` so a multi-line argument list does.
-const CONTINUATION_TRAILERS: &[char] = &['+', '-', '*', '/', '^', ',', '='];
+pub(crate) const CONTINUATION_TRAILERS: &[char] = &['+', '-', '*', '/', '^', ',', '='];
 
 /// Join operator continuation lines into single logical lines (#1030).
 ///
@@ -22754,6 +22854,12 @@ pub(crate) const SUPPORTED_UNARY_FNS: &[&str] = &[
     "logit",
     "inv_logit",
     "expit",
+    // #1331: the two `[covariate_nn]` activations that have no exact spelling in
+    // the other builtins. Both evaluate through `crate::nn::Activation` — the code
+    // the network itself runs — so an exported DCM reproduces it bit for bit,
+    // including softplus's `|z| > 20` tails that `log(1 + exp(z))` gets wrong.
+    "tanh",
+    "softplus",
 ];
 
 /// Panic message for the (parser-guaranteed unreachable) tail of each
@@ -26086,7 +26192,7 @@ fn is_scaling_entry_key(base: &str) -> bool {
 
 /// Whether `name` is a syntactically valid DSL identifier (the shape the
 /// tokenizer produces for `Token::Ident`).
-fn is_plain_identifier(name: &str) -> bool {
+pub(crate) fn is_plain_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -26095,7 +26201,11 @@ fn is_plain_identifier(name: &str) -> bool {
 /// Names a `[scaling]` intermediate may not take: the built-ins the expression
 /// parser resolves before it would ever consult the intermediate table, so a
 /// binding under one of these names would silently never be read.
-fn scaling_intermediate_reserved(name: &str) -> Option<&'static str> {
+///
+/// The DCM exporter (`crate::nn::export`) refuses a network input under one of
+/// these names for the same reason: written into an expression, it would read
+/// the built-in, not the data column.
+pub(crate) fn scaling_intermediate_reserved(name: &str) -> Option<&'static str> {
     if name == "TIME" || name == "time" {
         return Some("the model-time built-in");
     }
@@ -27225,19 +27335,15 @@ fn eval_expr<E: EvalEnv>(
                 "floor" => v.floor(),
                 "ceil" => v.ceil(),
                 "round" => v.round(),
-                "inv_logit" | "expit" => {
-                    // Numerically stable: avoid exp overflow for very negative v
-                    if v >= 0.0 {
-                        1.0 / (1.0 + (-v).exp())
-                    } else {
-                        let e = v.exp();
-                        e / (1.0 + e)
-                    }
-                }
+                // The network's own stable sigmoid, so an exported `sigmoid` head
+                // is the same code, not a twin of it (#1331).
+                "inv_logit" | "expit" => crate::nn::Activation::Sigmoid.apply(v),
                 "logit" => {
                     let clamped = v.clamp(1e-15, 1.0 - 1e-15);
                     (clamped / (1.0 - clamped)).ln()
                 }
+                "tanh" => crate::nn::Activation::Tanh.apply(v),
+                "softplus" => crate::nn::Activation::Softplus.apply(v),
                 // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
                 _ => unreachable!("{UNARY_FN_ARM_MISSING} (eval_expr, `{name}`)"),
             }
@@ -27409,6 +27515,10 @@ enum Op {
     Abs,
     InvLogit,
     Logit,
+    /// `tanh(x)` and `softplus(x)` (#1331): `crate::nn::Activation::{Tanh, Softplus}`,
+    /// the code a `[covariate_nn]` runs, on every evaluator.
+    Tanh,
+    Softplus,
     CmpLt,
     CmpLe,
     CmpGt,
@@ -27486,7 +27596,14 @@ struct IpStmtDeps {
 /// the hoist gate below *less* eager, not more).
 fn ip_op_cost(op: &Op) -> u32 {
     match op {
-        Op::Pow | Op::Exp | Op::Ln | Op::Sqrt | Op::Logit | Op::InvLogit => 20,
+        Op::Pow
+        | Op::Exp
+        | Op::Ln
+        | Op::Sqrt
+        | Op::Logit
+        | Op::InvLogit
+        | Op::Tanh
+        | Op::Softplus => 20,
         Op::Div | Op::Mod => 4,
         _ => 1,
     }
@@ -27530,6 +27647,8 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
             | Op::Abs
             | Op::InvLogit
             | Op::Logit
+            | Op::Tanh
+            | Op::Softplus
             | Op::CmpLt
             | Op::CmpLe
             | Op::CmpGt
@@ -27699,6 +27818,8 @@ fn ip_op_pops(op: &Op) -> Option<usize> {
         | Op::Abs
         | Op::InvLogit
         | Op::Logit
+        | Op::Tanh
+        | Op::Softplus
         | Op::LogicNot
         | Op::IsPresent
         | Op::Floor
@@ -28409,6 +28530,8 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::Abs
             | Op::InvLogit
             | Op::Logit
+            | Op::Tanh
+            | Op::Softplus
             | Op::LogicNot
             | Op::IsPresent
             | Op::Floor
@@ -28532,6 +28655,8 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 "abs" => bc.ops.push(Op::Abs),
                 "inv_logit" | "expit" => bc.ops.push(Op::InvLogit),
                 "logit" => bc.ops.push(Op::Logit),
+                "tanh" => bc.ops.push(Op::Tanh),
+                "softplus" => bc.ops.push(Op::Softplus),
                 "floor" => bc.ops.push(Op::Floor),
                 "ceil" => bc.ops.push(Op::Ceil),
                 "round" => bc.ops.push(Op::Round),
@@ -28779,16 +28904,13 @@ fn eval_bytecode_lanes<L: Lane>(
             Op::Floor => unary!(|v| v.floor()),
             Op::Ceil => unary!(|v| v.ceil()),
             Op::Round => unary!(|v| v.round()),
-            Op::InvLogit => unary!(|v| if v >= 0.0 {
-                1.0 / (1.0 + (-v).exp())
-            } else {
-                let e = v.exp();
-                e / (1.0 + e)
-            }),
+            Op::InvLogit => unary!(|v| crate::nn::Activation::Sigmoid.apply(v)),
             Op::Logit => unary!(|v| {
                 let clamped = v.clamp(1e-15, 1.0 - 1e-15);
                 (clamped / (1.0 - clamped)).ln()
             }),
+            Op::Tanh => unary!(|v| crate::nn::Activation::Tanh.apply(v)),
+            Op::Softplus => unary!(|v| crate::nn::Activation::Softplus.apply(v)),
             Op::CmpLt => binary!(|l, r| bool01(l < r)),
             Op::CmpLe => binary!(|l, r| bool01(l <= r)),
             Op::CmpGt => binary!(|l, r| bool01(l > r)),
@@ -29050,6 +29172,17 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::InvLogit => {
                 let v = pop!();
                 push!(v.inv_logit());
+            }
+            // The network's own generic activation: same branches on the value, so
+            // the value is bit-identical to the `f64` arms and the jet is the
+            // taken branch's (#1331).
+            Op::Tanh => {
+                let v = pop!();
+                push!(crate::nn::Activation::Tanh.apply_g(v));
+            }
+            Op::Softplus => {
+                let v = pop!();
+                push!(crate::nn::Activation::Softplus.apply_g(v));
             }
             Op::Logit => {
                 let v = pop!();
@@ -31103,6 +31236,8 @@ fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
         | Op::Abs
         | Op::InvLogit
         | Op::Logit
+        | Op::Tanh
+        | Op::Softplus
         | Op::CmpLt
         | Op::CmpLe
         | Op::CmpGt
@@ -32528,6 +32663,9 @@ fn resolve_condition_indices(
 //   UnaryFn("abs", a)      : if a ≥ 0 then a' else −a' (boundary undefined)
 //   UnaryFn("inv_logit"|"expit", a) : inv_logit(a) · (1 − inv_logit(a)) · a'
 //   UnaryFn("logit", a)    : a' / (a · (1 − a))
+//   UnaryFn("tanh", a)     : (1 − tanh(a)²) · a'
+//   UnaryFn("softplus", a) : a' / exp(a)·a' / inv_logit(a)·a' on the branch
+//                            `Activation::Softplus` takes (a > 20 / a < −20 / else)
 //   UnaryFn("floor"|"ceil"|"round", a) : 0 (piecewise constant; the integer
 //                            boundaries are undefined and ignored, as for Mod)
 //   Power(b, e)            : b^e · (e'·ln(b) + e · b'/b)  (general; subsumes
@@ -32775,6 +32913,33 @@ fn differentiate_with_chain(
                     let one_minus_a = sub(Expression::Literal(1.0), (**arg).clone());
                     let denom = mul((**arg).clone(), one_minus_a);
                     div(da, denom)
+                }
+                "tanh" => {
+                    // (1 − tanh(a)²) · a'
+                    let t = Expression::UnaryFn("tanh".into(), arg.clone());
+                    mul(sub(Expression::Literal(1.0), mul(t.clone(), t)), da)
+                }
+                "softplus" => {
+                    // The derivative of the branch `Activation::Softplus` takes:
+                    // `a > 20 → a'`, `a < −20 → exp(a)·a'`, else `inv_logit(a)·a'`.
+                    let cmp = |op, c| {
+                        Box::new(Condition::Compare(
+                            (**arg).clone(),
+                            op,
+                            Expression::Literal(c),
+                        ))
+                    };
+                    let exp_a = Expression::UnaryFn("exp".into(), arg.clone());
+                    let sig_a = Expression::UnaryFn("inv_logit".into(), arg.clone());
+                    Expression::Conditional(
+                        cmp(CmpOp::Gt, 20.0),
+                        Box::new(da.clone()),
+                        Box::new(Expression::Conditional(
+                            cmp(CmpOp::Lt, -20.0),
+                            Box::new(mul(exp_a, da.clone())),
+                            Box::new(mul(sig_a, da)),
+                        )),
+                    )
                 }
                 "floor" | "ceil" | "round" => {
                     // Piecewise constant: 0 almost everywhere, undefined on the

@@ -530,6 +530,11 @@ mod adaptive_auc_tv_tests;
 #[path = "tests/adaptive_obs_scale_tests.rs"]
 mod adaptive_obs_scale_tests;
 
+// #2559: a decision the reader's move of a reset put before that reset.
+#[cfg(test)]
+#[path = "tests/adaptive_moved_reset_tests.rs"]
+mod adaptive_moved_reset_tests;
+
 // #2156: FREM covariate rows on the adaptive path.
 #[cfg(test)]
 #[path = "tests/adaptive_frem_tests.rs"]

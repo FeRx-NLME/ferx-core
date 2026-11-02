@@ -2483,7 +2483,10 @@ pub(crate) fn profiled_converged(
     match end {
         PolishEnd::Settled if profiled_stop_needs_verify(algo, last, cancelled, left_init) => true,
         PolishEnd::Settled | PolishEnd::NotNeeded => status_is_converged(last),
-        PolishEnd::LegCapReached { .. } | PolishEnd::BudgetSpent | PolishEnd::Skipped => false,
+        PolishEnd::LegCapReached { .. }
+        | PolishEnd::Stalled { .. }
+        | PolishEnd::BudgetSpent
+        | PolishEnd::Skipped => false,
     }
 }
 

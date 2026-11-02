@@ -504,6 +504,109 @@ fn check_start_interval(decision_times: &[f64], interval: f64) -> Result<(), Str
         .map_err(|msg| format!("start_interval {interval} {msg}"))
 }
 
+/// Lines of `W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET` kept before the rest are counted
+/// in one closing line (#2559).
+const MOVED_RESET_WARNING_CAP: usize = 10;
+
+/// `W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET` (#2559): a decision point that the reader's
+/// move of an EVID=3/4 reset (#1609) put on the other side of that reset.
+///
+/// `read_nonmem_csv` moves a reset written at or before the running watermark — the latest
+/// record, infusion end or `ADDL` dose so far — to just past it, with every later row. The
+/// driver reads `decision_times` on that engine clock, so a decision written after the
+/// reset can run before the moved reset, which then wipes the dose it issued. A point is
+/// flagged against reset `r` when it is after `r` on the written clock and before it on
+/// the engine clock. "After" includes the reset's own instant, because the driver applies
+/// a reset before the decision hook at the same break.
+///
+/// Only an **in-order** reset is checked: its written `TIME` is not before any earlier
+/// record. An `ADDL`-implied dose and an infusion end are not records — they are what
+/// moves an in-order reset. A reset whose `TIME` goes back (a restarting period) is
+/// skipped, and so is every reset after it: a written decision time is ambiguous there,
+/// since that `TIME` exists in both periods, and the user has to write every later
+/// decision on the engine clock anyway.
+///
+/// Reads the written times the reader kept (`reset_period_times` and the raw-time
+/// vectors). An in-memory subject has none, so its two clocks agree and it never warns.
+fn decisions_before_moved_reset_warnings(
+    population: &Population,
+    decision_times: &[f64],
+) -> Vec<String> {
+    use crate::ode::predictions::EVENT_MATCH_TOL;
+    let after = |t: f64, reset: f64| t >= reset - EVENT_MATCH_TOL;
+    // A written time is a decimal the user typed; the shift `engine − written` is not.
+    let show = |t: f64| {
+        let s = format!("{t:.6}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    let mut lines = Vec::new();
+    for s in &population.subjects {
+        for &engine in &s.reset_times {
+            // An unmoved reset needs no gate of its own: with `written == engine` no
+            // point is on two sides of it.
+            let written = s.param_time_at(engine);
+            let earlier_records = (0..s.obs_times.len())
+                .filter(|&j| s.obs_times[j] < engine)
+                .map(|j| s.readout_time(j))
+                .chain(
+                    (0..s.pk_only_times.len())
+                        .filter(|&m| s.pk_only_times[m] < engine)
+                        .map(|m| s.param_time_pk_only(m)),
+                )
+                .chain(
+                    s.doses
+                        .iter()
+                        .filter(|d| d.implied.is_none() && d.time < engine)
+                        .map(|d| s.param_time_at(d.time)),
+                )
+                .chain(
+                    s.reset_times
+                        .iter()
+                        .filter(|&&t| t < engine)
+                        .map(|&t| s.param_time_at(t)),
+                );
+            // A restart ends the check for this subject, not just for this reset: from here
+            // on decisions are written on the engine clock, so no later reset's written
+            // `TIME` is on the decision clock, in order or not (#2595 review r1, row 1).
+            // `reset_times` is ascending, so every later reset is skipped.
+            if earlier_records.into_iter().any(|w| written < w) {
+                break;
+            }
+            let flagged: Vec<String> = decision_times
+                .iter()
+                .filter(|&&d| after(d, written) && !after(d, engine))
+                .map(|&d| show(d))
+                .collect();
+            if flagged.is_empty() {
+                continue;
+            }
+            let shift = show(engine - written);
+            lines.push(format!(
+                "W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET: subject {id}: decision time(s) {list} \
+                 come after the reset written at TIME {w} but before it on the engine clock, \
+                 where it runs at {e}. The data reader moved this reset, and every row after \
+                 it, later by {shift} (#1609). `decision_times` and the `[adaptive_dosing]` \
+                 block's `at` are read on the engine clock, so a dose issued at these times \
+                 lands before the reset, and the reset removes it. To decide after the reset, \
+                 add {shift} to each decision time written between it and the next reset.",
+                id = s.id,
+                list = flagged.join(", "),
+                w = show(written),
+                e = show(engine),
+            ));
+        }
+    }
+    if lines.len() > MOVED_RESET_WARNING_CAP {
+        let more = lines.len() - MOVED_RESET_WARNING_CAP;
+        lines.truncate(MOVED_RESET_WARNING_CAP);
+        lines.push(format!(
+            "W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET: and {more} more reset(s) like these, \
+             not listed."
+        ));
+    }
+    lines
+}
+
 /// Shared per-(subject, replicate) orchestration behind [`simulate_adaptive`] and
 /// [`simulate_adaptive_from_spec`]: draw η ~ N(0, Ω) (or take the subject's supplied
 /// η, #1594), mint a **fresh** controller,
@@ -599,6 +702,8 @@ where
     // ascending ⇒ no duplicates) so the two paths cannot drift.
     crate::sim::adaptive::validate_increasing_finite(decision_times, "`decision_times`")
         .map_err(super::entry_refusals::adaptive_options)?;
+    // Data-only, so once per run, not per replicate (#2559).
+    let moved_reset_warnings = decisions_before_moved_reset_warnings(population, decision_times);
 
     use rand::SeedableRng;
 
@@ -1073,6 +1178,7 @@ where
          values their PK does not follow. Supply the FREM fit's EBEs as `SuppliedEtas` \
          (`AdaptiveInputs::with_etas`), which are conditioned on each subject's covariate rows.",
     ));
+    warnings.extend(moved_reset_warnings);
     warnings.extend(super::non_fit_diagnostics(
         model,
         population,

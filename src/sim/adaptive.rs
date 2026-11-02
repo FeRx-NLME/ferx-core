@@ -312,7 +312,9 @@ pub struct DoseLedgerEntry {
 /// `dosed` so a "give a final dose, then discontinue" action list (`[Bolus, Stop]`)
 /// is logged faithfully rather than as a bare stop.
 ///
-/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
+/// `#[non_exhaustive]`: downstream, read it through [`DecisionOutcome::label`] and
+/// [`DecisionOutcome::n_dosed`] rather than a wildcard match, whose catch-all arm
+/// would guess both for a variant added later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DecisionOutcome {
@@ -333,6 +335,38 @@ pub enum DecisionOutcome {
     /// read, so the entry carries its `observed_signals`. Distinct from `Hold`,
     /// which is a consulted decision that chose not to dose.
     NotDue,
+}
+
+impl DecisionOutcome {
+    /// The outcome's stable output label: `"dosed"`, `"hold"`, `"stop"` or
+    /// `"not_due"` (ferx-r's `decisions$OUTCOME`).
+    ///
+    /// It lives here so a downstream crate needs no wildcard arm on this
+    /// `#[non_exhaustive]` enum (#2581). The match is exhaustive inside ferx-core, so
+    /// a new variant does not compile until it is given a label.
+    pub fn label(&self) -> &'static str {
+        match *self {
+            DecisionOutcome::Dosed { .. } => "dosed",
+            DecisionOutcome::Hold => "hold",
+            DecisionOutcome::Stop { .. } => "stop",
+            DecisionOutcome::NotDue => "not_due",
+        }
+    }
+
+    /// The number of realized doses this decision issued: `n` for `Dosed`, `dosed`
+    /// for `Stop`, `0` for `Hold` and `NotDue`.
+    ///
+    /// Like [`DecisionOutcome::label`], an exhaustive match inside ferx-core (#2581).
+    /// A downstream wildcard arm would report `0` for a future variant that doses, and
+    /// nothing would flag it; here such a variant does not compile until it is counted.
+    pub fn n_dosed(&self) -> usize {
+        match *self {
+            DecisionOutcome::Dosed { n } => n,
+            DecisionOutcome::Hold => 0,
+            DecisionOutcome::Stop { dosed } => dosed,
+            DecisionOutcome::NotDue => 0,
+        }
+    }
 }
 
 /// One decision the controller made, recorded for **every** decision time —
@@ -1581,6 +1615,46 @@ mod tests {
             DecisionOutcome::Stop { dosed: 1 }
         );
         assert_ne!(DecisionOutcome::Hold, DecisionOutcome::Stop { dosed: 0 });
+    }
+
+    // #2581: one test per variant, each asserting both `label()` and `n_dosed()`.
+    // The literals are ferx-r's `decisions$OUTCOME` strings, so they must not move.
+    // "Every variant has a label" is not tested at runtime: both methods are
+    // exhaustive matches, so an unlabelled variant fails to compile.
+
+    /// Kills: swapping the `Dosed` label with another; `Dosed`'s count returning a
+    /// constant (`3` is neither `0` nor `1`).
+    #[test]
+    fn outcome_dosed_label_and_count() {
+        let o = DecisionOutcome::Dosed { n: 3 };
+        assert_eq!(o.label(), "dosed");
+        assert_eq!(o.n_dosed(), 3);
+    }
+
+    /// Kills: swapping the `Hold` label with another; `Hold` reporting a dose.
+    #[test]
+    fn outcome_hold_label_and_count() {
+        let o = DecisionOutcome::Hold;
+        assert_eq!(o.label(), "hold");
+        assert_eq!(o.n_dosed(), 0);
+    }
+
+    /// Kills: swapping the `Stop` label with another; `Stop`'s count made `0` (a
+    /// dose-then-stop would read as a bare stop).
+    #[test]
+    fn outcome_stop_label_and_count() {
+        let o = DecisionOutcome::Stop { dosed: 2 };
+        assert_eq!(o.label(), "stop");
+        assert_eq!(o.n_dosed(), 2);
+    }
+
+    /// Kills: swapping the `NotDue` label with another (or respelling it
+    /// `"notdue"`); `NotDue` reporting a dose.
+    #[test]
+    fn outcome_not_due_label_and_count() {
+        let o = DecisionOutcome::NotDue;
+        assert_eq!(o.label(), "not_due");
+        assert_eq!(o.n_dosed(), 0);
     }
 
     #[test]

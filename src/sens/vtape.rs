@@ -2022,14 +2022,25 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
             }
             continue;
         }
+        // The live width of this node's adjoint: with every second-order component's
+        // adjoint zero (a sweep seeded on values and tangents only, such as the EBE mode
+        // response's rows, #2549), the rules below write nothing past the tangents, so the
+        // accumulation stops there. A skipped term is an exact zero.
+        let w = if c[1 + N..].iter().any(|x| *x != 0.0) {
+            nc
+        } else {
+            1 + N
+        };
         let lin = |adj: &mut Vec<f64>, p: usize, s: f64, c: &[f64]| {
-            for k in 0..nc {
+            for k in 0..w {
                 adj[p * nc + k] += s * c[k];
             }
         };
         match nd.op {
             Op::Leaf | Op::Rhs => {}
-            Op::Solve => unreachable!("the LU block hook is declined on a taped-Hessian recording"),
+            Op::Solve => {
+                unreachable!("the LU block hook is declined on a taped-Hessian recording")
+            }
             Op::Add => {
                 lin(adj, nd.a as usize, 1.0, &c);
                 lin(adj, nd.b as usize, 1.0, &c);
@@ -2055,19 +2066,21 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
                 }
                 for k in 0..cnt {
                     let (ia, ib) = (t.auxi[s0 + 1 + 2 * k], t.auxi[s0 + 2 + 2 * k]);
-                    let mut part = |id: u32| -> Vec<f64> {
+                    // Borrowed, not copied: the factor's components on the tape, or a
+                    // constant factor's in `auxf`.
+                    let mut part = |id: u32| -> &[f64] {
                         if id != NONE {
-                            vals[id as usize * nc..id as usize * nc + nc].to_vec()
+                            &vals[id as usize * nc..id as usize * nc + nc]
                         } else {
-                            let r = t.auxf[xf..xf + nc].to_vec();
+                            let r = &t.auxf[xf..xf + nc];
                             xf += nc;
                             r
                         }
                     };
                     let (av, bv) = (part(ia), part(ib));
-                    ga.iter_mut().for_each(|x| *x = 0.0);
-                    gb.iter_mut().for_each(|x| *x = 0.0);
-                    mul_adjoint::<N>(&pairs, &av, &bv, &c, &mut ga, &mut gb);
+                    ga[..w].iter_mut().for_each(|x| *x = 0.0);
+                    gb[..w].iter_mut().for_each(|x| *x = 0.0);
+                    mul_adjoint::<N>(&pairs, av, bv, &c, &mut ga, &mut gb);
                     if ia != NONE {
                         lin(adj, ia as usize, 1.0, &ga);
                     }
@@ -2092,8 +2105,8 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
             }
             Op::Mul => {
                 let (a, b) = (nd.a as usize, nd.b as usize);
-                ga.iter_mut().for_each(|x| *x = 0.0);
-                gb.iter_mut().for_each(|x| *x = 0.0);
+                ga[..w].iter_mut().for_each(|x| *x = 0.0);
+                gb[..w].iter_mut().for_each(|x| *x = 0.0);
                 mul_adjoint::<N>(
                     &pairs,
                     &vals[a * nc..a * nc + nc],
@@ -2120,7 +2133,8 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
                 for (tt, &(k, l)) in pairs.iter().enumerate() {
                     uv[1 + N + tt] = d1 * bv[1 + N + tt] + d2 * bv[1 + k] * bv[1 + l];
                 }
-                ga.iter_mut().for_each(|x| *x = 0.0);
+                ga[..w].iter_mut().for_each(|x| *x = 0.0);
+                // In full: `unary_adjoint` below reads every component of `ub`.
                 ub.iter_mut().for_each(|x| *x = 0.0);
                 mul_adjoint::<N>(
                     &pairs,
@@ -2130,7 +2144,7 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
                     &mut ga,
                     &mut ub,
                 );
-                gb.iter_mut().for_each(|x| *x = 0.0);
+                gb[..w].iter_mut().for_each(|x| *x = 0.0);
                 unary_adjoint::<N>(&pairs, bv, &ub, d1, d2, d3, &mut gb);
                 lin(adj, a, 1.0, &ga);
                 lin(adj, b, 1.0, &gb);
