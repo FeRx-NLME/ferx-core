@@ -8100,15 +8100,18 @@ pub struct FitResult {
     /// inner solve returned a fallback's point (`EbeResult::used_fallback`): the recovery
     /// after the primary search failed its certificate, or the runaway-EBE guard's. A solve
     /// whose fallback point a multi-start candidate then replaced is not counted (#2589).
-    /// Always `0` for `gn` / `gn_hybrid`'s Gauss–Newton phase, SAEM, trust-region, VI and
-    /// IMP, which do not count it.
+    /// Counted only by the FOCE/FOCEI outer loop under an NLopt optimizer (`auto`, `bobyqa`,
+    /// `slsqp`, `nlopt_lbfgs`, `mma`), by a fit with a `profile`d level block, and by Bayes'
+    /// posterior-mean inner loop. Every other path reports `0` without counting, e.g.
+    /// `optimizer = bfgs` / `lbfgs` / `trust_region`, SAEM, `gn`'s Gauss–Newton phase, VI,
+    /// IMP / IMPMAP and an evaluation-only stage.
     pub total_ebe_fallbacks: u32,
     /// Under `inner_optimizer = nelder_mead`: how many times, summed over every inner loop
     /// like `total_ebe_fallbacks` (not a count of distinct subjects), a subject's Nelder–Mead
     /// stop was not a mode and the stationarity certificate moved it there with the gradient.
     /// The primary search's moved point is not a fallback. Always `0` under every other
-    /// `inner_optimizer`, and always `0` for `gn` / `gn_hybrid`'s Gauss–Newton phase, SAEM,
-    /// trust-region, VI and IMP, which do not count it (#2571).
+    /// `inner_optimizer`, and counted only on the paths that count `total_ebe_fallbacks`
+    /// (#2571).
     pub total_ebe_nm_polished: u32,
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,

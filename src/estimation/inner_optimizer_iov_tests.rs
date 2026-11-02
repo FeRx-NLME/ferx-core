@@ -6296,9 +6296,10 @@ fn certify_moved_names_a_moved_point_whichever_test_moved_it() {
         None
     );
     // The Hessian is a central difference of the gradient, so the step is `2/3` to its
-    // truncation error, not to the bit.
+    // truncation error, not to the bit: measured `|x − 2/3| = 4.413e-11` (macOS arm64), so
+    // `1e-9` keeps ~23× headroom while an unmoved `x = 1` misses it by 1/3.
     assert!(
-        (x[0] - 2.0 / 3.0).abs() < 1e-6,
+        (x[0] - 2.0 / 3.0).abs() < 1e-9,
         "the accepted Newton step stays: {x:?}"
     );
 }
@@ -6391,7 +6392,9 @@ fn nelder_mead_primary_flags_the_subjects_the_certificate_moved() {
 /// nelder_mead` sums the moved subjects of every inner loop into
 /// `FitResult::total_ebe_nm_polished`, apart from `total_ebe_fallbacks`; under the default
 /// optimizer the count is 0. At `inner_tol = 1e-5` every warfarin NM stop needs the move
-/// (measured 10 of 10 per loop), so any evaluation contributes.
+/// (measured 10 of 10 per loop), so any evaluation contributes. #2589: the built-in
+/// `optimizer = bfgs` does not count, so the same fit under it reports 0, as the
+/// `FitResult` docs say; that pins the "every other path reports 0" half of them.
 #[test]
 fn a_nelder_mead_fit_reports_the_moved_subjects() {
     use crate::types::{EstimationMethod, FitOptions, InnerOptimizer, Optimizer};
@@ -6400,11 +6403,11 @@ fn a_nelder_mead_fit_reports_the_moved_subjects() {
         .expect("warfarin parses");
     let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data loads");
-    let run = |inner_optimizer| {
+    let run_with = |optimizer, inner_optimizer| {
         let opts = FitOptions {
             method: EstimationMethod::Foce,
             interaction: false,
-            optimizer: Optimizer::Bobyqa,
+            optimizer,
             inner_optimizer,
             inner_tol: 1e-5,
             outer_maxiter: 2,
@@ -6415,6 +6418,7 @@ fn a_nelder_mead_fit_reports_the_moved_subjects() {
         };
         crate::fit(&model, &pop, &model.default_params, &opts).expect("fit")
     };
+    let run = |inner_optimizer| run_with(Optimizer::Bobyqa, inner_optimizer);
     let nm = run(InnerOptimizer::NelderMead);
     let auto = run(InnerOptimizer::Auto);
     eprintln!(
@@ -6424,4 +6428,10 @@ fn a_nelder_mead_fit_reports_the_moved_subjects() {
     assert!(nm.total_ebe_nm_polished > 0, "{}", nm.total_ebe_nm_polished);
     assert_eq!(nm.total_ebe_fallbacks, 0, "fixture: no subject fell back");
     assert_eq!(auto.total_ebe_nm_polished, 0);
+    let bfgs = run_with(Optimizer::Bfgs, InnerOptimizer::NelderMead);
+    assert_eq!(
+        (bfgs.total_ebe_nm_polished, bfgs.total_ebe_fallbacks),
+        (0, 0),
+        "optimizer = bfgs does not count"
+    );
 }
