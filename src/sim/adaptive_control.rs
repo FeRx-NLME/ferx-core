@@ -22,7 +22,7 @@ use crate::diagnostics::Diagnostic;
 use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
     AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
-    ControllerDecision, DoseAction, DoseStep, MonitorSpec, ObserveMode,
+    ControllerDecision, DoseAction, DoseStep, IntervalStep, MonitorSpec, ObserveMode,
 };
 use crate::types::CompiledModel;
 
@@ -62,11 +62,16 @@ struct AdaptiveController {
     confirm: u32,
     rules: Vec<AdaptiveRule>,
     levels: Option<Vec<f64>>,
+    /// The dosing-interval ladder (#945); `None` when the block declares none.
+    intervals: Option<Vec<f64>>,
     // ── running state ──
     /// The dose carried forward between decisions (re-issued when no rule fires).
     dose: f64,
     /// Index into `levels` (discrete titration only).
     level: usize,
+    /// Index into `intervals`: the interval in force. The driver holds the same
+    /// value, since only this controller sets it, from `start_interval` on.
+    rung: usize,
     /// The rule index matched at the previous decision (for the `confirm` streak).
     last_rule: Option<usize>,
     /// Consecutive matches of `last_rule` so far.
@@ -82,14 +87,20 @@ impl AdaptiveController {
             Some(l) => l.iter().position(|&x| x == spec.start_dose).unwrap_or(0),
             None => 0,
         };
+        let rung = match (&spec.intervals, spec.start_interval) {
+            (Some(l), Some(d)) => l.iter().position(|&x| x == d).unwrap_or(0),
+            _ => 0,
+        };
         Self {
             route: spec.route.clone(),
             dose_bounds: spec.dose_bounds,
             confirm: spec.confirm,
             rules: spec.rules.clone(),
             levels: spec.levels.clone(),
+            intervals: spec.intervals.clone(),
             dose: spec.start_dose,
             level,
+            rung,
             last_rule: None,
             streak: 0,
             stopped: false,
@@ -142,8 +153,11 @@ impl AdaptiveController {
                                  // the label before `apply` takes `&mut self`.
                 let rule = self.rules[idx].label();
                 let action = self.rules[idx].action.clone();
+                let step = self.rules[idx].interval;
+                let mut actions = self.apply(action);
+                actions.extend(self.step_interval(step));
                 return ControllerDecision {
-                    actions: self.apply(action),
+                    actions,
                     rule: Some(rule),
                 };
             }
@@ -169,7 +183,26 @@ impl AdaptiveController {
                 self.step_dose(step, false);
                 self.emit_dose(self.dose)
             }
+            AdaptiveAction::Maintain => self.emit_dose(self.dose),
         }
+    }
+
+    /// Move the interval one rung (#945), saturating at both ends, and name the new
+    /// interval to the driver. A step that does not move the rung (already at that
+    /// end) emits nothing: the interval in force is unchanged.
+    fn step_interval(&mut self, step: Option<IntervalStep>) -> Option<DoseAction> {
+        let (step, ladder) = (step?, self.intervals.as_ref()?);
+        let rung = match step {
+            IntervalStep::Lengthen => (self.rung + 1).min(ladder.len() - 1),
+            IntervalStep::Shorten => self.rung.saturating_sub(1),
+        };
+        if rung == self.rung {
+            return None;
+        }
+        self.rung = rung;
+        Some(DoseAction::SetInterval {
+            interval: ladder[rung],
+        })
     }
 
     /// Move the running dose one step up/down, clamped to `dose_bounds`.
@@ -398,6 +431,8 @@ mod tests {
             target_window: None,
             auc_target: None,
             rules,
+            intervals: None,
+            start_interval: None,
         }
     }
 
@@ -406,6 +441,7 @@ mod tests {
             op,
             threshold,
             action,
+            interval: None,
         }
     }
 
@@ -753,6 +789,8 @@ mod tests {
             target_window: None,
             auc_target: None,
             rules: vec![rule(Comparison::Gt, 1000.0, AdaptiveAction::Hold)],
+            intervals: None,
+            start_interval: None,
         }
     }
 
@@ -826,5 +864,150 @@ mod tests {
             "out of range: {err:?}"
         );
         assert_eq!(err.code, "E_ADAPTIVE_SPEC", "{err:?}");
+    }
+
+    // ── #945: the dosing-interval ladder ─────────────────────────────────────────
+
+    /// `spec` with an interval ladder and `start_interval`; the rules carry their own
+    /// interval effects.
+    fn interval_spec(
+        confirm: u32,
+        intervals: &[f64],
+        start: f64,
+        rules: Vec<AdaptiveRule>,
+    ) -> AdaptiveDosingSpec {
+        let mut s = spec(
+            100.0,
+            AdaptiveRoute::Bolus { cmt: 1 },
+            (0.0, 400.0),
+            confirm,
+            None,
+            rules,
+        );
+        s.intervals = Some(intervals.to_vec());
+        s.start_interval = Some(start);
+        s
+    }
+
+    fn with_interval(mut r: AdaptiveRule, step: IntervalStep) -> AdaptiveRule {
+        r.interval = Some(step);
+        r
+    }
+
+    fn set_interval(interval: f64) -> DoseAction {
+        DoseAction::SetInterval { interval }
+    }
+
+    /// An interval-only rule re-issues the running dose and steps one rung per firing;
+    /// at the top rung it emits no `SetInterval`, since the interval in force does not
+    /// change. Kills the `.min(len - 1)` clamp (index out of bounds) and a step that
+    /// re-emits the unchanged top interval.
+    #[test]
+    fn interval_ladder_lengthens_and_saturates_at_top() {
+        let s = interval_spec(
+            1,
+            &[12.0, 24.0, 48.0],
+            12.0,
+            vec![with_interval(
+                rule(Comparison::Gt, 20.0, AdaptiveAction::Maintain),
+                IntervalStep::Lengthen,
+            )],
+        );
+        let out = run(&s, &[30.0, 30.0, 30.0, 30.0]);
+        let b = DoseAction::Bolus { amt: 100.0, cmt: 1 };
+        assert_eq!(out[0], vec![b.clone(), set_interval(24.0)]);
+        assert_eq!(out[1], vec![b.clone(), set_interval(48.0)]);
+        assert_eq!(out[2], vec![b.clone()]);
+        assert_eq!(out[3], vec![b]);
+    }
+
+    /// The rung starts at `start_interval` (24, not the ladder's first rung), so the
+    /// first `shorten` moves to 12 and the next one saturates. Kills a rung seeded at
+    /// index 0 (the first `shorten` would emit nothing) and the `saturating_sub`.
+    #[test]
+    fn interval_ladder_starts_at_start_interval_and_saturates_at_bottom() {
+        let s = interval_spec(
+            1,
+            &[12.0, 24.0, 48.0],
+            24.0,
+            vec![with_interval(
+                rule(Comparison::Lt, 5.0, AdaptiveAction::Maintain),
+                IntervalStep::Shorten,
+            )],
+        );
+        let out = run(&s, &[1.0, 1.0, 1.0]);
+        assert_eq!(out[0], vec![bolus(100.0, 1)[0].clone(), set_interval(12.0)]);
+        assert_eq!(out[1], bolus(100.0, 1));
+        assert_eq!(out[2], bolus(100.0, 1));
+    }
+
+    /// A dose effect and an interval effect compose in one rule: `hold, lengthen`
+    /// emits only the interval (the driver logs a hold that consumes its slot), and
+    /// `decrease 50%, lengthen` emits the lowered dose and the interval.
+    #[test]
+    fn dose_and_interval_effects_compose() {
+        let s = interval_spec(
+            1,
+            &[12.0, 24.0, 48.0],
+            12.0,
+            vec![
+                with_interval(
+                    rule(Comparison::Gt, 40.0, AdaptiveAction::Hold),
+                    IntervalStep::Lengthen,
+                ),
+                with_interval(
+                    rule(
+                        Comparison::Gt,
+                        20.0,
+                        AdaptiveAction::Decrease(DoseStep::Percent(50.0)),
+                    ),
+                    IntervalStep::Lengthen,
+                ),
+            ],
+        );
+        let out = run(&s, &[50.0, 30.0]);
+        assert_eq!(out[0], vec![set_interval(24.0)]);
+        assert_eq!(out[1], vec![bolus(50.0, 1)[0].clone(), set_interval(48.0)]);
+    }
+
+    /// `confirm` gates the interval effect exactly as it gates the dose effect: with
+    /// `confirm = 2` the rung moves on every second consecutive match. Kills an
+    /// interval step applied on the first match, outside the streak.
+    #[test]
+    fn confirm_gates_the_interval_effect() {
+        let s = interval_spec(
+            2,
+            &[12.0, 24.0, 48.0],
+            12.0,
+            vec![with_interval(
+                rule(Comparison::Gt, 20.0, AdaptiveAction::Maintain),
+                IntervalStep::Lengthen,
+            )],
+        );
+        let out = run(&s, &[30.0, 30.0, 30.0, 30.0]);
+        assert_eq!(out[0], bolus(100.0, 1));
+        assert_eq!(out[1], vec![bolus(100.0, 1)[0].clone(), set_interval(24.0)]);
+        assert_eq!(out[2], bolus(100.0, 1));
+        assert_eq!(out[3], vec![bolus(100.0, 1)[0].clone(), set_interval(48.0)]);
+    }
+
+    /// The rule label names both effects, and an interval-only rule names just the
+    /// interval: it is the ledger's `rule_fired`.
+    #[test]
+    fn rule_label_names_both_effects() {
+        let r = with_interval(
+            rule(
+                Comparison::Gt,
+                20.0,
+                AdaptiveAction::Decrease(DoseStep::Percent(25.0)),
+            ),
+            IntervalStep::Lengthen,
+        );
+        assert_eq!(r.label(), "signal > 20 : decrease 25%, lengthen");
+        let r = with_interval(
+            rule(Comparison::Lt, 10.0, AdaptiveAction::Maintain),
+            IntervalStep::Shorten,
+        );
+        assert_eq!(r.label(), "signal < 10 : shorten");
     }
 }

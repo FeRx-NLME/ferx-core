@@ -551,6 +551,23 @@ fn adaptive_refusals_carry_their_codes() {
              block's `observe`; leave `opts.monitors` empty",
         ),
         row(
+            "from_spec, start_interval also set",
+            from_spec(
+                &ode,
+                &pop,
+                &none,
+                AdaptiveSimulateOptions {
+                    start_interval: Some(24.0),
+                    ..seeded()
+                },
+            ),
+            "E_ADAPTIVE_OPTIONS",
+            None,
+            "simulate_adaptive_from_spec takes its dosing interval from the \
+             [adaptive_dosing] block's `intervals` / `start_interval`; leave \
+             `opts.start_interval` empty",
+        ),
+        row(
             "from_spec, no [odes]",
             from_spec(&iv, &pop, &none, seeded()),
             "E_ADAPTIVE_UNSUPPORTED",

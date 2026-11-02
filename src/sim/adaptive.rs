@@ -836,6 +836,15 @@ pub struct AdaptiveDosingSpec {
     /// then skipped entirely — it is the metric's only consumer). See
     /// [`AdaptiveSubjectMetrics::auc_target_attainment`].
     pub auc_target: Option<(f64, f64)>,
+    /// The dosing-interval ladder (#945), strictly increasing and positive, like
+    /// `levels` for the dose. A rule's `lengthen` / `shorten` steps one rung and
+    /// saturates at both ends. Set together with `start_interval`, or neither.
+    pub intervals: Option<Vec<f64>>,
+    /// The dosing interval in force from the first decision (#945): one of
+    /// `intervals`. A grid point of `at` is then due only once this long has passed
+    /// since the last consulted decision; the other points log `not_due`. `None`
+    /// (without `intervals`) consults every point, as before.
+    pub start_interval: Option<f64>,
     /// The first-matching-rule ladder, in file order.
     pub rules: Vec<AdaptiveRule>,
 }
@@ -1034,6 +1043,78 @@ impl AdaptiveDosingSpec {
                 }
             }
         }
+        self.validate_intervals()
+    }
+
+    /// The dosing-interval ladder's invariants (#945), shared by the parser and the
+    /// hand-built path through [`AdaptiveDosingSpec::validate`]. The check that each
+    /// interval lands on the `at` grid needs the `every` step and stays in the parser;
+    /// on an explicit list it is the driver's, at the decision that sets the interval.
+    fn validate_intervals(&self) -> Result<(), String> {
+        let steps_interval = self.rules.iter().any(|r| r.interval.is_some());
+        match (&self.intervals, self.start_interval) {
+            (None, None) => {
+                if steps_interval {
+                    return Err("[adaptive_dosing]: `lengthen` / `shorten` require an \
+                                `intervals = [...]` ladder and a `start_interval`"
+                        .to_string());
+                }
+            }
+            (Some(_), None) => {
+                return Err(
+                    "[adaptive_dosing]: `intervals` requires a `start_interval` (one of the \
+                     intervals), the interval in force from the first decision"
+                        .to_string(),
+                )
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "[adaptive_dosing]: `start_interval` requires an `intervals = [...]` ladder; \
+                     for a fixed interval write `intervals = [d]` and `start_interval = d`"
+                        .to_string(),
+                )
+            }
+            (Some(l), Some(start)) => {
+                validate_increasing_finite(l, "intervals")?;
+                // Strictly increasing ⇒ `l[0]` is the minimum.
+                if l[0] <= 0.0 {
+                    return Err(format!(
+                        "[adaptive_dosing]: intervals must be > 0: {}",
+                        l[0]
+                    ));
+                }
+                if !l.contains(&start) {
+                    return Err(format!(
+                        "[adaptive_dosing]: start_interval {start} must be one of the declared \
+                         intervals {l:?}"
+                    ));
+                }
+            }
+        }
+        if let Some(r) = self
+            .rules
+            .iter()
+            .find(|r| r.interval.is_some() && r.action == AdaptiveAction::Stop)
+        {
+            return Err(format!(
+                "[adaptive_dosing]: `stop` cannot be combined with `lengthen` / `shorten` (a \
+                 stopped course has no next dose): when {}",
+                r.label()
+            ));
+        }
+        // `Maintain` is the dose effect of an interval-only rule; without the interval
+        // effect the rule does nothing, and its label would name no effect at all.
+        if let Some(r) = self
+            .rules
+            .iter()
+            .find(|r| r.interval.is_none() && r.action == AdaptiveAction::Maintain)
+        {
+            return Err(format!(
+                "[adaptive_dosing]: a rule must have an effect; `Maintain` is only the dose \
+                 effect of a rule that also lengthens or shortens the interval: when {}",
+                r.label().trim_end()
+            ));
+        }
         Ok(())
     }
 }
@@ -1059,6 +1140,32 @@ pub struct AdaptiveRule {
     pub threshold: f64,
     /// What to do when this rule is the first to match.
     pub action: AdaptiveAction,
+    /// The rule's interval effect, if any (#945): step the `intervals` ladder one
+    /// rung. Composes with `action`, which is then [`AdaptiveAction::Maintain`]
+    /// for an interval-only rule.
+    pub interval: Option<IntervalStep>,
+}
+
+/// A rule's interval effect: one rung along the `intervals` ladder (#945),
+/// saturating at both ends.
+///
+/// `#[non_exhaustive]`: new interval effects land additively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IntervalStep {
+    /// The next longer interval (`lengthen`).
+    Lengthen,
+    /// The next shorter interval (`shorten`).
+    Shorten,
+}
+
+impl IntervalStep {
+    fn label(self) -> &'static str {
+        match self {
+            IntervalStep::Lengthen => "lengthen",
+            IntervalStep::Shorten => "shorten",
+        }
+    }
 }
 
 /// A signal comparison operator.
@@ -1090,6 +1197,9 @@ pub enum AdaptiveAction {
     Hold,
     /// Discontinue all future dosing.
     Stop,
+    /// Re-issue the running dose unchanged: the dose effect of a rule that only
+    /// changes the interval (`when signal > 15 : lengthen`, #945).
+    Maintain,
 }
 
 /// The magnitude of an [`AdaptiveAction::Increase`] / [`AdaptiveAction::Decrease`].
@@ -1125,6 +1235,7 @@ impl AdaptiveAction {
             AdaptiveAction::Decrease(DoseStep::Level) => "decrease".to_string(),
             AdaptiveAction::Hold => "hold".to_string(),
             AdaptiveAction::Stop => "stop".to_string(),
+            AdaptiveAction::Maintain => String::new(),
         }
     }
 }
@@ -1134,11 +1245,16 @@ impl AdaptiveRule {
     /// (`"signal < 10 : increase 25%"`) — recorded as the dose ledger's
     /// `rule_fired` so an audit can name which rung produced each dose.
     pub(crate) fn label(&self) -> String {
+        let effects: Vec<String> = [self.action.label()]
+            .into_iter()
+            .chain(self.interval.map(|i| i.label().to_string()))
+            .filter(|e| !e.is_empty())
+            .collect();
         format!(
             "signal {} {} : {}",
             self.op.symbol(),
             self.threshold,
-            self.action.label()
+            effects.join(", ")
         )
     }
 }
@@ -1220,7 +1336,10 @@ mod tests {
                 op: Comparison::Lt,
                 threshold: 10.0,
                 action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+                interval: None,
             }],
+            intervals: None,
+            start_interval: None,
         }
     }
 
@@ -1238,6 +1357,7 @@ mod tests {
                 op: Comparison::Lt,
                 threshold: 10.0,
                 action: AdaptiveAction::Increase(DoseStep::Level),
+                interval: None,
             }]
         };
 
@@ -1301,6 +1421,7 @@ mod tests {
             op: Comparison::Lt,
             threshold: 10.0,
             action: AdaptiveAction::Increase(DoseStep::Level),
+            interval: None,
         }];
         assert!(s.validate().unwrap_err().contains("strictly increasing"));
     }
@@ -2005,5 +2126,123 @@ mod tests {
         assert_eq!(m.n_holds, 1);
         assert_eq!(m.n_not_due, 2);
         assert_eq!(m.signal_mean, Some(15.0));
+    }
+
+    // ── #945: the dosing-interval ladder's invariants ─────────────────────────────
+
+    fn interval_base() -> AdaptiveDosingSpec {
+        let mut s = base_spec();
+        s.intervals = Some(vec![12.0, 24.0, 48.0]);
+        s.start_interval = Some(24.0);
+        s.rules[0].interval = Some(IntervalStep::Lengthen);
+        s
+    }
+
+    #[test]
+    fn validate_accepts_an_interval_ladder() {
+        interval_base().validate().expect("well-formed ladder");
+        // A ladder with no rule stepping it is a fixed interval, also valid.
+        let mut s = interval_base();
+        s.rules[0].interval = None;
+        s.validate().expect("fixed interval");
+    }
+
+    /// Each pairing rule on its own input, its message asserted with the sentence that
+    /// tells the user what to write. Deleting any one guard leaves its spec accepted.
+    #[test]
+    fn validate_pairs_intervals_with_start_interval_and_the_rule_steps() {
+        let mut s = interval_base();
+        s.start_interval = None;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains("`intervals` requires a `start_interval`")
+                && e.contains("in force from the first decision"),
+            "{e}"
+        );
+
+        let mut s = interval_base();
+        s.intervals = None;
+        s.rules[0].interval = None;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains("`start_interval` requires an `intervals = [...]` ladder")
+                && e.contains("write `intervals = [d]` and `start_interval = d`"),
+            "{e}"
+        );
+
+        let mut s = interval_base();
+        s.intervals = None;
+        s.start_interval = None;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains(
+                "`lengthen` / `shorten` require an `intervals = [...]` ladder and a \
+                 `start_interval`"
+            ),
+            "{e}"
+        );
+    }
+
+    /// A hand-built rule whose only effect is `Maintain` does nothing; the parser never
+    /// writes one. It is refused and named, and the same rule with an interval effect is
+    /// accepted, so the guard is on the missing effect.
+    #[test]
+    fn validate_rejects_a_rule_with_no_effect() {
+        let mut s = interval_base();
+        s.rules[0].action = AdaptiveAction::Maintain;
+        s.rules[0].interval = None;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains("a rule must have an effect")
+                && e.contains("only the dose effect of a rule that also lengthens or shortens")
+                && e.ends_with("when signal < 10 :"),
+            "{e}"
+        );
+        s.rules[0].interval = Some(IntervalStep::Shorten);
+        s.validate().expect("an interval-only rule is valid");
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_interval_ladder() {
+        let mut s = interval_base();
+        s.intervals = Some(vec![24.0, 12.0]);
+        assert!(s
+            .validate()
+            .unwrap_err()
+            .contains("intervals must be strictly increasing"));
+
+        let mut s = interval_base();
+        s.intervals = Some(vec![0.0, 24.0]);
+        s.start_interval = Some(24.0);
+        let e = s.validate().unwrap_err();
+        assert!(e.contains("intervals must be > 0: 0"), "{e}");
+
+        let mut s = interval_base();
+        s.start_interval = Some(36.0);
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains(
+                "start_interval 36 must be one of the declared intervals [12.0, 24.0, 48.0]"
+            ),
+            "{e}"
+        );
+    }
+
+    /// `stop` with an interval effect is refused and the rule is named; the same rule
+    /// with `hold` instead is accepted, so the guard is on `stop`, not on the effect.
+    #[test]
+    fn validate_rejects_stop_with_an_interval_effect() {
+        let mut s = interval_base();
+        s.rules[0].action = AdaptiveAction::Stop;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains(
+                "`stop` cannot be combined with `lengthen` / `shorten` (a stopped course has \
+                 no next dose)"
+            ) && e.contains("when signal < 10 : stop, lengthen"),
+            "{e}"
+        );
+        s.rules[0].action = AdaptiveAction::Hold;
+        s.validate().expect("hold, lengthen is valid");
     }
 }
