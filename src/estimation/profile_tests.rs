@@ -5862,6 +5862,12 @@ fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
 /// or without the fix. It is read off the fit's own counters, not one solve at this start:
 /// a single solve there ends no subject on a fallback (measured, 0 of 12); the fallbacks
 /// come from the outer loop's ~1e-8 steps, each warm-started from the previous mode.
+///
+/// Since #2497 those warm searches stop `Stuck` at their mode and the same Newton certificate
+/// accepts them in place, without the restart (measured on Linux x86_64: 0 fallbacks, 6 stuck
+/// partials certified). The precondition therefore counts both: a point certified off the
+/// BFGS stop, by a fallback or as a stuck partial (`STUCK_CERTIFIED`, a process-wide counter,
+/// so a test running alongside can only add to it).
 #[test]
 fn a_profiled_fit_at_its_optimum_keeps_the_adjoint_level_gradient() {
     let p = prep(F2, F2_DATA, None, |t| t);
@@ -5870,17 +5876,27 @@ fn a_profiled_fit_at_its_optimum_keeps_the_adjoint_level_gradient() {
         run_covariance_step: false,
         ..options(&p)
     };
+    use crate::estimation::inner_optimizer::STUCK_CERTIFIED;
+    use std::sync::atomic::Ordering;
+    let stuck0 = STUCK_CERTIFIED.load(Ordering::Relaxed);
     let r = optimize_profiled(&p.parsed.model, &p.population, &f2_at_nonmem(&p), &o);
+    let stuck = STUCK_CERTIFIED.load(Ordering::Relaxed) - stuck0;
     eprintln!(
-        "F2 at NONMEM's optimum: OFV {:.9}, converged {}, {} evals, {} fallbacks, max {} \
-         unconverged",
-        r.ofv, r.converged, r.n_iterations, r.total_ebe_fallbacks, r.max_unconverged_subjects
+        "F2 at NONMEM's optimum: OFV {:.9}, converged {}, {} evals, {} fallbacks, {} stuck \
+         partials certified, max {} unconverged",
+        r.ofv,
+        r.converged,
+        r.n_iterations,
+        r.total_ebe_fallbacks,
+        stuck,
+        r.max_unconverged_subjects
     );
     assert!(r.ofv.is_finite());
     assert!(
-        r.total_ebe_fallbacks > 0 && r.max_unconverged_subjects == 0,
-        "the straddle is gone: {} fallbacks, max {} unconverged",
+        r.total_ebe_fallbacks as usize + stuck > 0 && r.max_unconverged_subjects == 0,
+        "the straddle is gone: {} fallbacks, {} stuck partials certified, max {} unconverged",
         r.total_ebe_fallbacks,
+        stuck,
         r.max_unconverged_subjects
     );
     assert!(
