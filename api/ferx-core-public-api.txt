@@ -2187,6 +2187,9 @@ pub ferx_core::sim::adaptive::DecisionOutcome::Hold
 pub ferx_core::sim::adaptive::DecisionOutcome::NotDue
 pub ferx_core::sim::adaptive::DecisionOutcome::Stop
 pub ferx_core::sim::adaptive::DecisionOutcome::Stop::dosed: usize
+impl ferx_core::sim::adaptive::DecisionOutcome
+pub fn ferx_core::sim::adaptive::DecisionOutcome::label(&self) -> &'static str
+pub fn ferx_core::sim::adaptive::DecisionOutcome::n_dosed(&self) -> usize
 #[non_exhaustive] pub enum ferx_core::sim::adaptive::DoseAction
 pub ferx_core::sim::adaptive::DoseAction::Bolus
 pub ferx_core::sim::adaptive::DoseAction::Bolus::amt: f64
@@ -3854,6 +3857,9 @@ pub ferx_core::DecisionOutcome::Hold
 pub ferx_core::DecisionOutcome::NotDue
 pub ferx_core::DecisionOutcome::Stop
 pub ferx_core::DecisionOutcome::Stop::dosed: usize
+impl ferx_core::sim::adaptive::DecisionOutcome
+pub fn ferx_core::sim::adaptive::DecisionOutcome::label(&self) -> &'static str
+pub fn ferx_core::sim::adaptive::DecisionOutcome::n_dosed(&self) -> usize
 pub enum ferx_core::DerivedKind
 pub ferx_core::DerivedKind::Aggregate
 pub ferx_core::DerivedKind::Aggregate::filter: core::option::Option<ferx_core::DerivedFilterFn>

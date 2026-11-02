@@ -171,13 +171,7 @@ fn vanco_interval_extension_matches_mrgsolve() {
         );
         for (d, (t, trough, outcome, interval)) in got.iter().zip(want) {
             assert_eq!(d.time, *t, "subject {id}");
-            let label = match d.outcome {
-                DecisionOutcome::Dosed { .. } => "dosed",
-                DecisionOutcome::Hold => "hold",
-                DecisionOutcome::NotDue => "not_due",
-                _ => "other",
-            };
-            assert_eq!(label, outcome, "subject {id} t={t}: outcome");
+            assert_eq!(d.outcome.label(), outcome, "subject {id} t={t}: outcome");
             assert_eq!(
                 d.interval,
                 Some(*interval),
