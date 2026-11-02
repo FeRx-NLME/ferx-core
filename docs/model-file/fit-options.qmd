@@ -1066,7 +1066,7 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | `gamma` | SAEM | SAEM step-size (1 in exploration, 1/k in convergence) |
 | `mh_accept_rate` | SAEM | Mean acceptance rate across all subjects (MH or HMC). In mixed HMC/MH runs (`n_leapfrog > 0` with some MH-fallback subjects) this is an aggregate across both samplers. |
 | `n_ebe_unconverged` | FOCE/FOCEI | Subjects whose inner optimizer did not converge |
-| `n_ebe_fallback` | FOCE/FOCEI | Subjects that fell back to Nelder-Mead |
+| `n_ebe_fallback` | FOCE/FOCEI | Subjects whose returned EBE is a fallback's point: the Nelder–Mead recovery after the primary inner search failed, or the runaway-EBE guard's. A fallback point that a multi-start candidate replaced is not counted (#2589) |
 | `val:<name>` | all | Per-parameter estimate, one column per optimized coordinate, in **natural / reporting scale** (θ as values, Ω as variances/covariances, Σ as variances) |
 | `grad:<name>` | FOCE/FOCEI/GN | Per-parameter gradient, in the optimizer's **transformed/scaled** space (`NA` for SAEM); `sqrt(sum(grad:<name>^2)) == grad_norm` |
 

@@ -8096,15 +8096,24 @@ pub struct FitResult {
     pub ebe_convergence_warnings: u32,
     /// Worst-case number of unconverged subjects in a single outer iteration.
     pub max_unconverged_subjects: u32,
-    /// Total number of times the Nelder-Mead fallback was invoked across all
-    /// subjects and all outer iterations.  Always `0` for SAEM.
+    /// How many times, summed over every inner loop (not a count of distinct subjects), an
+    /// inner solve returned a fallback's point (`EbeResult::used_fallback`): the recovery
+    /// after the primary search failed its certificate, or the runaway-EBE guard's. A solve
+    /// whose fallback point a multi-start candidate then replaced is not counted (#2589).
+    /// Counted only by the outer loop under an NLopt optimizer (`auto`, `bobyqa`, `slsqp`,
+    /// `mma`, and `nlopt_lbfgs` with its model-file aliases `lbfgs` / `bfgs`), for FOCE,
+    /// FOCEI, Laplace and AGQ alike; by a fit with a `profile`d level block; and by Bayes'
+    /// posterior-mean inner loop. Every other path reports `0` without counting, e.g.
+    /// `optimizer = trust_region`, SAEM, `gn` and `gn_hybrid` (whose FOCEI polish does not
+    /// carry its count over), VI, IMP / IMPMAP, an evaluation-only stage, and the built-in
+    /// optimizer a Rust caller reaches with [`Optimizer::Bfgs`] / [`Optimizer::Lbfgs`].
     pub total_ebe_fallbacks: u32,
     /// Under `inner_optimizer = nelder_mead`: how many times, summed over every inner loop
     /// like `total_ebe_fallbacks` (not a count of distinct subjects), a subject's Nelder–Mead
     /// stop was not a mode and the stationarity certificate moved it there with the gradient.
     /// The primary search's moved point is not a fallback. Always `0` under every other
-    /// `inner_optimizer`, and always `0` for `gn` / `gn_hybrid`'s Gauss–Newton phase, SAEM,
-    /// trust-region, VI and IMP, which do not count it (#2571).
+    /// `inner_optimizer`, and counted only on the paths that count `total_ebe_fallbacks`
+    /// (#2571).
     pub total_ebe_nm_polished: u32,
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,
