@@ -327,8 +327,8 @@ const REF_AUC24: [f64; 7] = [
     272.193121, 253.330123, 363.439398, 594.316285, 468.198058, 490.444398, 508.391939,
 ];
 
-/// Relative band of each ferx AUC24 against mrgsolve's (#943), the band of the constant-path
-/// vanco anchor. Measured on Linux aarch64 (`tools/linux-test.sh`), identical in every
+/// Relative band of each ferx AUC24 against mrgsolve's (#943), the band the constant-path
+/// vanco anchor used before it moved to η = 0 (#2580). Measured on Linux aarch64 (`tools/linux-test.sh`), identical in every
 /// printed digit on macOS arm64: the windows read +1.6e-6 to +1.3e-5 relative, so 5e-5 is at least
 /// 3.9× headroom. This is a cross-engine band (RK45 + a trapezoid on soft samples vs
 /// LSODA + an AUC compartment), not ferx's own accuracy; the kit has a constant `V` and no

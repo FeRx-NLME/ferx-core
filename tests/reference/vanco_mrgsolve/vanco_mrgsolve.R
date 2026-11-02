@@ -28,7 +28,7 @@
 # dedicated AUC compartment (dxdt_AUC = CENT/V), reset at the start of each day.
 #
 # Regenerate:  Rscript vanco_mrgsolve.R   (run from this directory)
-# Requires:    mrgsolve (tested with 1.7.2) + a C/C++ toolchain (JIT compile).
+# Requires:    mrgsolve (tested with 1.7.2 and 2.0.1) + a C/C++ toolchain (JIT compile).
 
 suppressMessages(library(mrgsolve))
 
@@ -101,7 +101,7 @@ n_dec_a   <- sum(diff(ladder$dose) < 0)
 in_auc    <- win_auc >= auc_lo & win_auc <= auc_hi
 attain    <- mean(in_auc)         # fraction of days with AUC24 in [400, 600]
 
-cat("=== vancomycin AUC-TDM titration ladder (mrgsolve 1.7.2) ===\n")
+cat("=== vancomycin AUC-TDM titration ladder (mrgsolve", as.character(packageVersion("mrgsolve")), ") ===\n")
 print(ladder, row.names = FALSE, digits = 10)
 cat("\nper-window AUC24 (mg*h/L):\n")
 print(round(win_auc, 6))
@@ -111,14 +111,16 @@ cat(sprintf(
   cum, n_inc_rule, n_inc, n_dec_a, sum(in_auc), length(win_auc), attain))
 
 # ---- freeze expected.md ------------------------------------------------------
-fmt <- function(x) formatC(x, format = "f", digits = 6)
+fmt <- function(x) formatC(x, format = "f", digits = 9)
 ladder_tbl <- c(
   "| decision | time (h) | trough (mg/L) | dose (mg) | action |",
   "|---:|---:|---:|---:|:---|",
-  apply(ladder, 1, function(r) sprintf(
-    "| %d | %d | %s | %s | %s |",
-    as.integer(r["decision"]), as.integer(r["time"]), fmt(as.numeric(r["trough"])),
-    fmt(as.numeric(r["dose"])), trimws(r["action"]))))
+  # Column-wise, not apply(ladder, 1, ...): apply() coerces a mixed data.frame to a
+  # character matrix through format(), which keeps 7 significant digits and would
+  # round every trough and dose before fmt() sees it.
+  sprintf("| %d | %d | %s | %s | %s |",
+    as.integer(ladder$decision), as.integer(ladder$time), fmt(ladder$trough),
+    fmt(ladder$dose), ladder$action))
 auc_tbl <- c(
   "| window | days [t0,t1] (h) | AUC24 (mg*h/L) | in [400,600] |",
   "|---:|---:|---:|:--:|",
@@ -129,7 +131,8 @@ auc_tbl <- c(
 md <- c(
   "# Vancomycin AUC-TDM titration reference (mrgsolve)",
   "",
-  "Frozen output of `vanco_mrgsolve.R` (mrgsolve 1.7.2). External anchor for the",
+  sprintf("Frozen output of `vanco_mrgsolve.R` (mrgsolve %s). External anchor for the",
+          as.character(packageVersion("mrgsolve"))),
   "reactive `[adaptive_dosing]` *continuous* (percentage) titration and the",
   "metrics-only AUC machinery (`auc_target` -> `auc_target_attainment`) in",
   "`examples/adaptive_vanco_auc.ferx` (epic #391 S2.5b). NONMEM has no feedback",
@@ -164,11 +167,13 @@ md <- c(
   "  start_dose, so there are one fewer realized step-ups -- ferx counts dose changes)",
   sprintf("- auc_target_attainment = %d/%d = %.10g", sum(in_auc), length(win_auc), attain),
   "",
-  "ferx (`tests/adaptive_vanco_anchor.rs`) reproduces this ladder dose-for-dose,",
-  "the troughs to < 0.01 mg/L (a cross-solver difference), and the AUC-target",
-  "attainment fraction exactly. ferx integrates the exposure by a 128-panel",
-  "trapezoid per window (vs this AUC compartment), which agrees to ~1e-5",
-  "relative -- far inside the margin from each AUC24 to the band edges, so the",
-  "in/out classification (hence attainment) is identical.")
+  "ferx (`tests/adaptive_vanco_anchor.rs`), run at a supplied eta = 0 (the",
+  "typical-value patient simulated here), reproduces this ladder dose-for-dose,",
+  "the troughs to ~1e-9 mg/L, and the AUC-target attainment fraction exactly.",
+  "ferx integrates the exposure by a 128-panel trapezoid per window (vs this AUC",
+  "compartment), which agrees to ~3e-6 relative -- far inside the margin from",
+  "each AUC24 to the band edges, so the in/out classification (hence",
+  "attainment) is identical. The model's omega ~ 1e-10 would otherwise draw an",
+  "eta of order 1e-5 on CL and offset every trough one-sidedly (#2580).")
 writeLines(md, "expected.md")
 cat("\nwrote expected.md\n")

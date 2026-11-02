@@ -7,7 +7,7 @@
 //! reference kit lives in `tests/reference/vanco_mrgsolve/`:
 //!
 //!   - `vanco_mrgsolve.R` builds the identical structural model (a 1-cpt IV
-//!     vancomycin model, once-daily 1-h infusion) in mrgsolve 1.7.2 and runs an R
+//!     vancomycin model, once-daily 1-h infusion) in mrgsolve 2.0.1 and runs an R
 //!     loop whose controller mirrors ferx's continuous-titration semantics exactly
 //!     (read the latent pre-dose trough, first-matching rule wins, `increase 25%`
 //!     / `decrease 25%` scale the running dose by 1.25 / 0.75 and clamp to
@@ -18,18 +18,21 @@
 //!
 //! ## What this anchors — the reactive decisions and the exposure metric
 //!
-//! The model under test is `examples/adaptive_vanco_auc.ferx`. With negligible IIV
-//! it is effectively a typical-value patient, so ferx's reactive driver (RK45) and
-//! mrgsolve's R loop (LSODA) integrate the *same* ODE system and the controller
-//! sees the *same* trough trajectory — they must therefore reach the *same* dose
+//! The model under test is `examples/adaptive_vanco_auc.ferx`, run at a **supplied
+//! η = 0** (`common::simulate_from_spec_at_typical_value`): the typical-value patient
+//! mrgsolve simulates. The model's `omega ~ 1e-10` still draws an η of order 1e-5 on CL,
+//! and that drift — not either solver — was the whole of a one-sided 3.7e-4 mg/L trough
+//! gap and a 1.6e-5 AUC24 under-read when the anchor drew it (#2580). At η = 0 ferx's
+//! reactive driver (RK45) and mrgsolve's R loop (LSODA) integrate the *same* ODE system,
+//! the controller sees the *same* trough trajectory, and they reach the *same* dose
 //! decisions. The empiric start is subtherapeutic, the controller titrates the
 //! dose up to keep the trough in `[10, 15]` mg/L, and the daily AUC24 climbs
 //! through the `[400, 600]` mg·h/L target band — so `auc_target_attainment` is a
 //! non-trivial fraction (the early under-dosed days miss; the converged days hit).
 //!
 //! ferx reproduces every dose **exactly** (the titration is exact f64 arithmetic
-//! shared with the R loop), every trough to a small cross-solver tolerance, and
-//! the AUC-target attainment fraction exactly. ferx integrates the exposure by a
+//! shared with the R loop), every trough to [`SIGNAL_TOL`], and the AUC-target
+//! attainment fraction exactly. ferx integrates the exposure by a
 //! 128-panel trapezoid per window on the driver's own trajectory (#943) while
 //! mrgsolve uses an AUC compartment; `vanco_window_aucs_match_mrgsolve` pins each of
 //! the 13 daily AUC24 values to [`AUC_REL_TOL`], far inside the margin from each to the
@@ -38,27 +41,29 @@
 //! `adaptive_window_auc_*` in `src/ode/predictions_tests.rs`.
 
 use ferx_core::parser::model_parser::parse_full_model_file;
-use ferx_core::{read_nonmem_csv, simulate_adaptive_from_spec, AdaptiveSimulateOptions};
+use ferx_core::{read_nonmem_csv, AdaptiveSimulationResult};
 use std::path::Path;
 
-/// mrgsolve 1.7.2 reference, frozen in `tests/reference/vanco_mrgsolve/expected.md`.
+mod common;
+
+/// mrgsolve reference, frozen to 9 decimals in `tests/reference/vanco_mrgsolve/expected.md`.
 /// Per daily decision: `(time_h, trough_mg_per_L, dose_mg)`. The doses are exact
 /// f64 (`500 · 1.25^k`, within `dose_bounds`), so ferx matches them bit-for-bit.
 const REF_LADDER: [(f64, f64, f64); 14] = [
-    (0.0, 0.000000, 625.0),
-    (24.0, 2.412900, 781.25),
-    (48.0, 3.742876, 976.5625),
-    (72.0, 4.897488, 1220.703125),
-    (96.0, 6.187790, 1525.87890625),
-    (120.0, 7.754595, 1907.3486328125),
-    (144.0, 9.699224, 2384.185791015625),
-    (168.0, 12.125832, 2384.185791015625),
-    (192.0, 12.856712, 2384.185791015625),
-    (216.0, 13.076849, 2384.185791015625),
-    (240.0, 13.143153, 2384.185791015625),
-    (264.0, 13.163123, 2384.185791015625),
-    (288.0, 13.169138, 2384.185791015625),
-    (312.0, 13.170950, 2384.185791015625),
+    (0.0, 0.000000000, 625.0),
+    (24.0, 2.412899604, 781.25),
+    (48.0, 3.742875900, 976.5625),
+    (72.0, 4.897488188, 1220.703125),
+    (96.0, 6.187789635, 1525.87890625),
+    (120.0, 7.754594597, 1907.3486328125),
+    (144.0, 9.699224226, 2384.185791015625),
+    (168.0, 12.125831719, 2384.185791015625),
+    (192.0, 12.856711850, 2384.185791015625),
+    (216.0, 13.076848715, 2384.185791015625),
+    (240.0, 13.143152665, 2384.185791015625),
+    (264.0, 13.163123031, 2384.185791015625),
+    (288.0, 13.169137990, 2384.185791015625),
+    (312.0, 13.170949660, 2384.185791015625),
 ];
 
 /// The first 7 decisions (0..=6) fire the `increase 25%` rung; the rest re-issue
@@ -72,29 +77,47 @@ const N_INCREASE_RULE_FIRINGS: usize = 7;
 /// change, not by which rule fired" semantics of `AdaptiveSubjectMetrics`.
 const N_DOSE_INCREASES: usize = 6;
 
-/// Cross-solver trough tolerance (mg/L); see the module note. The observed RK45
-/// vs LSODA gap is ~1e-4, so this is a safe but meaningful guard.
-const SIGNAL_TOL: f64 = 0.02;
+/// Cross-solver trough band (mg/L), ferx (RK45 at the model's default tolerances) against
+/// mrgsolve (LSODA at 1e-10) at η = 0. The worst gap over the 14 decisions, printed by the
+/// test, is 1.045e-9 mg/L on Linux aarch64 (`tools/linux-test.sh`) and identical on macOS
+/// arm64, so 5e-9 is 4.8× headroom; `expected.md`'s 9 decimals floor the comparison at
+/// 5e-10. With the drawn η the gap was 3.71e-4, all one sign (#2580). A dosing defect worth
+/// naming moves a trough by orders of magnitude more (one 25% titration step is ~1 mg/L at
+/// steady state).
+const SIGNAL_TOL: f64 = 5e-9;
 
 /// Frozen AUC-target attainment: 8 of the 13 closed daily windows have AUC24 in
 /// `[400, 600]` (windows 5..=12; the 5 early under-dosed days miss).
 const REF_AUC_IN_BAND: usize = 8;
 const REF_AUC_WINDOWS: usize = 13;
 
-/// mrgsolve's per-window AUC24 (mg·h/L), frozen in `expected.md` to 1e-6.
+/// mrgsolve's per-window AUC24 (mg·h/L), frozen in `expected.md` to 9 decimals.
 const REF_AUC24: [f64; REF_AUC_WINDOWS] = [
-    107.992008, 168.712974, 221.048379, 279.369752, 350.133627, 437.944566, 547.514298, 581.428845,
-    591.643710, 594.720369, 595.647040, 595.926149, 596.010214,
+    107.992007917,
+    168.712974085,
+    221.048379232,
+    279.369752324,
+    350.133627321,
+    437.944565617,
+    547.514297892,
+    581.428845133,
+    591.643710453,
+    594.720368765,
+    595.647040435,
+    595.926148572,
+    596.010214337,
 ];
 
-/// Relative band of each ferx AUC24 against mrgsolve's. Measured on Linux aarch64
+/// Relative band of each ferx AUC24 against mrgsolve's, at η = 0. Measured on Linux aarch64
 /// (`tools/linux-test.sh`), identical in every printed digit on macOS arm64, by bisecting
-/// each window's AUC through the public band: every window reads low by 1.07e-5 (window 0)
-/// to 1.63e-5 (window 12), so 5e-5 is 3× headroom. The two engines integrate the same ODE
-/// with different solvers (RK45 vs LSODA) and quadratures (a trapezoid on soft samples vs an
-/// AUC compartment), so this is a cross-engine band, not ferx's own accuracy. Windows 11 and
-/// 12, the closest pair, differ by 1.4e-4 relative, so a band this wide still isolates one.
-const AUC_REL_TOL: f64 = 5e-5;
+/// each window's AUC through the public band: the worst window is window 0 at −2.75e-6 and
+/// the rest lie within ±7.5e-7, so 1e-5 is 3.6× headroom. With the drawn η every window read
+/// low by 1.07e-5 to 1.63e-5 (#2580). This is a cross-engine band, not ferx's own accuracy:
+/// the engines differ in solver (RK45 vs LSODA) and in quadrature (a 128-panel trapezoid on
+/// soft samples vs an AUC compartment), and the remainder is not split between the two.
+/// Windows 11 and 12, the closest pair, differ by 1.4e-4 relative, so the band isolates
+/// each window.
+const AUC_REL_TOL: f64 = 1e-5;
 
 /// Fast guard: a typo in `adaptive_vanco_auc.ferx` — which exercises new DSL surface,
 /// notably the `auc_target` key — fails here, by name, rather than as a mismatch in the
@@ -129,32 +152,7 @@ fn vanco_example_parses_and_pins_the_scenario() {
 
 #[test]
 fn vanco_titration_matches_mrgsolve() {
-    let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_auc.ferx"))
-        .expect("vanco model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] present");
-    let pop = read_nonmem_csv(
-        Path::new("tests/reference/vanco_mrgsolve/vanco_subject.csv"),
-        None,
-        None,
-    )
-    .expect("vanco subject data must load");
-
-    // `AdaptiveSimulateOptions` is `#[non_exhaustive]`: build from `default()`.
-    let mut opts = AdaptiveSimulateOptions::default();
-    opts.seed = Some(1);
-
-    let res = simulate_adaptive_from_spec(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        1,
-        spec,
-        &opts,
-    )
-    .expect("adaptive vanco sim runs");
+    let res = run(None);
 
     // Every decision dosed (no hold/stop here), so the ledger is 14 long.
     assert_eq!(res.decisions.len(), 14, "one decision per day");
@@ -162,6 +160,7 @@ fn vanco_titration_matches_mrgsolve() {
 
     // Per-decision: the trough matches mrgsolve within the cross-solver band, and
     // the realized dose matches the frozen ladder exactly (exact f64 titration).
+    let mut worst: f64 = 0.0;
     for (i, &(t_ref, trough_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
@@ -170,12 +169,14 @@ fn vanco_titration_matches_mrgsolve() {
             .first()
             .map(|s| s.value)
             .unwrap_or(f64::NAN);
+        assert!(sig.is_finite(), "decision {i}: trough {sig}");
+        let gap = (sig - trough_ref).abs();
+        worst = worst.max(gap);
         assert!(
-            (sig - trough_ref).abs() < SIGNAL_TOL,
-            "decision {i}: ferx trough {sig:.6} vs mrgsolve {trough_ref:.6} \
-             (|Δ| {:.6} >= {SIGNAL_TOL}); a trajectory mismatch this large signals \
-             a structural/integration bug",
-            (sig - trough_ref).abs()
+            gap < SIGNAL_TOL,
+            "decision {i}: ferx trough {sig:.9} vs mrgsolve {trough_ref:.9} \
+             (|Δ| {gap:.3e} >= {SIGNAL_TOL:e}); a trajectory mismatch this large signals \
+             a structural/integration bug"
         );
         let e = &res.ledger[i];
         assert!(
@@ -184,6 +185,8 @@ fn vanco_titration_matches_mrgsolve() {
             e.amt
         );
     }
+
+    eprintln!("vanco: worst trough gap {worst:.3e} mg/L (band {SIGNAL_TOL:e})");
 
     // The first 7 decisions climb (the `increase` rung); the rest re-issue the
     // converged dose (recorded by route — an infusion).
@@ -239,34 +242,31 @@ fn vanco_titration_matches_mrgsolve() {
     );
 }
 
-/// Run the vanco scenario with `auc_target = band` and return the number of the 13
-/// daily windows whose AUC24 lies in it — the only view of the window AUCs the public
-/// API gives.
-fn windows_in(band: (f64, f64)) -> usize {
+/// Run the vanco scenario at η = 0, with `auc_target` replaced by `band` when given.
+fn run(band: Option<(f64, f64)>) -> AdaptiveSimulationResult {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_auc.ferx"))
         .expect("vanco model must parse");
     let mut spec = parsed
         .adaptive_dosing
         .clone()
         .expect("[adaptive_dosing] present");
-    spec.auc_target = Some(band);
+    if let Some(band) = band {
+        spec.auc_target = Some(band);
+    }
     let pop = read_nonmem_csv(
         Path::new("tests/reference/vanco_mrgsolve/vanco_subject.csv"),
         None,
         None,
     )
     .expect("vanco subject data must load");
-    let mut opts = AdaptiveSimulateOptions::default();
-    opts.seed = Some(1);
-    let res = simulate_adaptive_from_spec(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        1,
-        &spec,
-        &opts,
-    )
-    .expect("adaptive vanco sim runs");
+    common::simulate_from_spec_at_typical_value(&parsed.model, &pop, &spec)
+}
+
+/// Run the vanco scenario with `auc_target = band` and return the number of the 13
+/// daily windows whose AUC24 lies in it — the only view of the window AUCs the public
+/// API gives.
+fn windows_in(band: (f64, f64)) -> usize {
+    let res = run(Some(band));
     let attain = res.metrics[0]
         .auc_target_attainment
         .expect("auc_target declared");

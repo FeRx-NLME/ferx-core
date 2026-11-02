@@ -29,7 +29,7 @@
 #     to dose_bounds, no rule match -> re-issue the running dose unchanged.
 #
 # Regenerate:  Rscript vanco_loading_mrgsolve.R   (run from this directory)
-# Requires:    mrgsolve (tested with 1.7.2) + a C/C++ toolchain (JIT compile).
+# Requires:    mrgsolve (tested with 1.7.2 and 2.0.1) + a C/C++ toolchain (JIT compile).
 
 suppressMessages(library(mrgsolve))
 
@@ -95,25 +95,28 @@ n_inc_rule <- sum(ladder$action == "increase")
 n_inc      <- sum(diff(ladder$dose) > 0)
 n_dec_a    <- sum(diff(ladder$dose) < 0)
 
-cat("=== vancomycin loading-dose + maintenance titration (mrgsolve 1.7.2) ===\n")
+cat("=== vancomycin loading-dose + maintenance titration (mrgsolve", as.character(packageVersion("mrgsolve")), ") ===\n")
 cat(sprintf("loading bolus = %g mg at t=0 (pre-scheduled base regimen)\n", load_dose))
 print(ladder, row.names = FALSE, digits = 10)
 cat(sprintf("\ncum_maintenance_dose=%g increase_rule_fired=%d n_dose_increases=%d n_dose_decreases=%d\n",
             cum, n_inc_rule, n_inc, n_dec_a))
 
 # ---- freeze expected.md ------------------------------------------------------
-fmt <- function(x) formatC(x, format = "f", digits = 6)
+fmt <- function(x) formatC(x, format = "f", digits = 9)
 ladder_tbl <- c(
   "| decision | time (h) | trough (mg/L) | maintenance dose (mg) | action |",
   "|---:|---:|---:|---:|:---|",
-  apply(ladder, 1, function(r) sprintf(
-    "| %d | %d | %s | %s | %s |",
-    as.integer(r["decision"]), as.integer(r["time"]), fmt(as.numeric(r["trough"])),
-    fmt(as.numeric(r["dose"])), trimws(r["action"]))))
+  # Column-wise, not apply(ladder, 1, ...): apply() coerces a mixed data.frame to a
+  # character matrix through format(), which keeps 7 significant digits and would
+  # round every trough and dose before fmt() sees it.
+  sprintf("| %d | %d | %s | %s | %s |",
+    as.integer(ladder$decision), as.integer(ladder$time), fmt(ladder$trough),
+    fmt(ladder$dose), ladder$action))
 md <- c(
   "# Vancomycin loading-dose + maintenance-titration reference (mrgsolve)",
   "",
-  "Frozen output of `vanco_loading_mrgsolve.R` (mrgsolve 1.7.2). External anchor for",
+  sprintf("Frozen output of `vanco_loading_mrgsolve.R` (mrgsolve %s). External anchor for",
+          as.character(packageVersion("mrgsolve"))),
   "the reactive `[adaptive_dosing]` **pre-scheduled base regimen** support (#702) in",
   "`examples/adaptive_vanco_loading.ferx`. NONMEM has no feedback dosing, so mrgsolve",
   "is the comparator; the R driver mirrors ferx's controller semantics exactly.",
@@ -143,8 +146,9 @@ md <- c(
   sprintf("- n_increases = %d, n_decreases = %d (realized maintenance step-ups/-downs)",
           n_inc, n_dec_a),
   "",
-  "ferx (`tests/adaptive_vanco_loading_anchor.rs`) reproduces this maintenance ladder",
-  "dose-for-dose and the troughs to a small cross-solver tolerance (RK45 vs LSODA).",
+  "ferx (`tests/adaptive_vanco_loading_anchor.rs`), run at a supplied eta = 0 (the",
+  "typical-value patient simulated here), reproduces this maintenance ladder",
+  "dose-for-dose and the troughs to ~1e-9 mg/L (#2580).",
   "The loading dose is integrated by ferx's base-regimen path (#702) and the controller",
   "titrates on top of it -- exactly what this reference exercises.")
 auc_tbl <- c(
@@ -153,7 +157,7 @@ auc_tbl <- c(
   vapply(seq_along(win_auc), function(i) sprintf(
     "| %d | [%d, %d] | %s |",
     i - 1, as.integer(dec_t[i]), as.integer(dec_t[i + 1]),
-    formatC(win_auc[i], format = "f", digits = 6)), character(1)))
+    formatC(win_auc[i], format = "f", digits = 9)), character(1)))
 md <- c(md,
   "",
   "## Per-window AUC24",

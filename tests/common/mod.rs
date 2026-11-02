@@ -225,3 +225,28 @@ pub fn windows_in_band(res: &ferx_core::AdaptiveSimulationResult) -> usize {
     );
     n.round() as usize
 }
+
+/// Run `spec` with every subject at a **supplied η = 0** (#2580): the typical-value patient
+/// an mrgsolve kit simulates. A model's `omega ~ 1e-10` still draws an η of order 1e-5,
+/// which offsets every trough and AUC one-sidedly against such a kit — the whole of the
+/// gap the vanco anchors once attributed to the solvers. Seed 1, as every kit run uses.
+pub fn simulate_from_spec_at_typical_value(
+    model: &ferx_core::CompiledModel,
+    pop: &ferx_core::types::Population,
+    spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec,
+) -> ferx_core::AdaptiveSimulationResult {
+    let ids: Vec<String> = pop.subjects.iter().map(|s| s.id.clone()).collect();
+    let n = ids.len();
+    let etas = ferx_core::SuppliedEtas::from_table(
+        ids,
+        model.eta_names.clone(),
+        vec![vec![0.0; model.n_eta]; n],
+    )
+    .expect("η = 0 table");
+    let inputs = ferx_core::AdaptiveInputs::new(&model.default_params).with_etas(&etas);
+    // `AdaptiveSimulateOptions` is `#[non_exhaustive]`: build from `default()`.
+    let mut opts = ferx_core::AdaptiveSimulateOptions::default();
+    opts.seed = Some(1);
+    ferx_core::simulate_adaptive_from_spec_with_inputs(model, pop, &inputs, 1, spec, &opts)
+        .expect("adaptive run at η = 0 passes the default verifier")
+}

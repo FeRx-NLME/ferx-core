@@ -1,6 +1,6 @@
 # Vancomycin loading-dose + maintenance-titration reference (mrgsolve)
 
-Frozen output of `vanco_loading_mrgsolve.R` (mrgsolve 1.7.2). External anchor for
+Frozen output of `vanco_loading_mrgsolve.R` (mrgsolve 2.0.1). External anchor for
 the reactive `[adaptive_dosing]` **pre-scheduled base regimen** support (#702) in
 `examples/adaptive_vanco_loading.ferx`. NONMEM has no feedback dosing, so mrgsolve
 is the comparator; the R driver mirrors ferx's controller semantics exactly.
@@ -20,12 +20,12 @@ dose, not 0), so a dropped or mis-integrated base regimen would move every troug
 
 | decision | time (h) | trough (mg/L) | maintenance dose (mg) | action |
 |---:|---:|---:|---:|:---|
-| 0 | 24 | 5.647391 | 937.500000 | increase |
-| 1 | 48 | 5.230581 | 1171.875000 | increase |
-| 2 | 72 | 5.987445 | 1464.844000 | increase |
-| 3 | 96 | 7.318415 | 1831.055000 | increase |
-| 4 | 120 | 9.098053 | 2288.818000 | increase |
-| 5 | 144 | 11.357516 | 2288.818000 | reissue |
+| 0 | 24 | 5.647391473 | 937.500000000 | increase |
+| 1 | 48 | 5.230581295 | 1171.875000000 | increase |
+| 2 | 72 | 5.987445399 | 1464.843750000 | increase |
+| 3 | 96 | 7.318414634 | 1831.054687500 | increase |
+| 4 | 120 | 9.098052548 | 2288.818359375 | increase |
+| 5 | 144 | 11.357516291 | 2288.818359375 | reissue |
 
 ## Summary
 
@@ -33,8 +33,9 @@ dose, not 0), so a dropped or mis-integrated base regimen would move every troug
 - cumulative_maintenance_dose = 9982.91 mg
 - n_increases = 4, n_decreases = 0 (realized maintenance step-ups/-downs)
 
-ferx (`tests/adaptive_vanco_loading_anchor.rs`) reproduces this maintenance ladder
-dose-for-dose and the troughs to a small cross-solver tolerance (RK45 vs LSODA).
+ferx (`tests/adaptive_vanco_loading_anchor.rs`), run at a supplied eta = 0 (the
+typical-value patient simulated here), reproduces this maintenance ladder
+dose-for-dose and the troughs to ~1e-9 mg/L (#2580).
 The loading dose is integrated by ferx's base-regimen path (#702) and the controller
 titrates on top of it -- exactly what this reference exercises.
 
@@ -44,8 +45,8 @@ The area under CENT/V over each closed inter-decision window, from an AUC compar
 
 | window | days [t0,t1] (h) | AUC24 (mg*h/L) |
 |---:|---:|---:|
-| 0 | [24, 48] | 242.711204 |
-| 1 | [48, 72] | 277.831468 |
-| 2 | [72, 96] | 339.591553 |
-| 3 | [96, 120] | 422.170914 |
-| 4 | [120, 144] | 527.015315 |
+| 0 | [24, 48] | 242.711203568 |
+| 1 | [48, 72] | 277.831467910 |
+| 2 | [72, 96] | 339.591552808 |
+| 3 | [96, 120] | 422.170913604 |
+| 4 | [120, 144] | 527.015314969 |

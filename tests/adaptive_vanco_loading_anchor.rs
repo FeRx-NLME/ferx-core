@@ -7,7 +7,7 @@
 //! kit lives in `tests/reference/vanco_loading_mrgsolve/`:
 //!
 //!   - `vanco_loading_mrgsolve.R` builds the identical 1-cpt IV vancomycin model in
-//!     mrgsolve 1.7.2, applies a 1500 mg LOADING bolus at t=0, and runs an R loop whose
+//!     mrgsolve 2.0.1, applies a 1500 mg LOADING bolus at t=0, and runs an R loop whose
 //!     controller mirrors ferx's continuous-titration semantics exactly (read the latent
 //!     pre-dose trough, first-matching rule wins, `increase 25%` / `decrease 25%` scale
 //!     the running dose by 1.25 / 0.75 and clamp to `dose_bounds`, no match re-issues).
@@ -22,38 +22,47 @@
 //! DECAYED LOADING DOSE — nothing else is in the system yet (the first maintenance dose
 //! is issued *at* that decision). So a dropped or mis-integrated base regimen (#702)
 //! would move that trough to ~0 and every trough after it: the trough comparison below
-//! is the base-regimen test. ferx (RK45) and mrgsolve (LSODA) integrate the same ODE, so
-//! they reach the same troughs (to a small cross-solver tolerance) and — the titration
+//! is the base-regimen test. The run uses a **supplied η = 0**
+//! (`common::simulate_from_spec_at_typical_value`), the typical-value patient mrgsolve
+//! simulates: the model's `omega ~ 1e-10` still draws an η of order 1e-5 on CL, and that
+//! drift — not either solver — was the whole of a one-sided 3.0e-4 mg/L trough gap when the
+//! anchor drew it (#2580). At η = 0 ferx (RK45) and mrgsolve (LSODA) integrate the same ODE,
+//! so they reach the same troughs (to [`SIGNAL_TOL`]) and — the titration
 //! being exact f64 arithmetic (`750·1.25^k`) with every trough margins away from the rule
 //! thresholds — the same maintenance doses bit-for-bit. The loading dose is a base dose,
 //! so it never appears in the reactive `ledger` (which holds only controller doses).
 
 use ferx_core::parser::model_parser::parse_full_model_file;
-use ferx_core::{read_nonmem_csv, simulate_adaptive_from_spec, AdaptiveSimulateOptions};
+use ferx_core::{read_nonmem_csv, AdaptiveSimulationResult};
 use std::path::Path;
 
 mod common;
 
-/// mrgsolve 1.7.2 reference, frozen in `tests/reference/vanco_loading_mrgsolve/expected.md`.
+/// mrgsolve reference, frozen to 9 decimals in `tests/reference/vanco_loading_mrgsolve/expected.md`.
 /// Per daily MAINTENANCE decision: `(time_h, trough_mg_per_L, dose_mg)`. The doses are
 /// exact f64 (`750 · 1.25^k` within `dose_bounds`), so ferx matches them bit-for-bit;
 /// the day-1 trough is the decayed 1500 mg loading dose.
 const REF_LADDER: [(f64, f64, f64); 6] = [
-    (24.0, 5.647391, 937.5),
-    (48.0, 5.230581, 1171.875),
-    (72.0, 5.987445, 1464.84375),
-    (96.0, 7.318415, 1831.0546875),
-    (120.0, 9.098053, 2288.818359375),
-    (144.0, 11.357516, 2288.818359375),
+    (24.0, 5.647391473, 937.5),
+    (48.0, 5.230581295, 1171.875),
+    (72.0, 5.987445399, 1464.84375),
+    (96.0, 7.318414634, 1831.0546875),
+    (120.0, 9.098052548, 2288.818359375),
+    (144.0, 11.357516291, 2288.818359375),
 ];
 
 /// The first 5 decisions fire the `increase 25%` rung (troughs below 10); the last
 /// re-issues the converged dose (trough in [10, 15]), recorded by route.
 const N_INCREASE_RULE_FIRINGS: usize = 5;
 
-/// Cross-solver trough tolerance (mg/L). The model is a pure 1-cpt IV bolus decay, so
-/// RK45 and LSODA agree far tighter than this; 0.01 is a safe but meaningful guard.
-const SIGNAL_TOL: f64 = 0.01;
+/// Cross-solver trough band (mg/L), ferx (RK45 at the model's default tolerances) against
+/// mrgsolve (LSODA at 1e-10) at η = 0. The worst gap over the 6 decisions, printed by the
+/// test, is 6.004e-10 mg/L on Linux aarch64 (`tools/linux-test.sh`) and identical on macOS
+/// arm64, so 5e-9 is 8.3× headroom; `expected.md`'s 9 decimals floor the comparison at
+/// 5e-10, which is why the headroom is wider than the vanco anchor's. With the drawn η the
+/// gap was 2.99e-4, all one sign (#2580). A dropped loading dose moves the day-1 trough by
+/// ~5.6 mg/L.
+const SIGNAL_TOL: f64 = 5e-9;
 
 /// The pre-scheduled loading dose (mg), carried on the subject, not in the ledger.
 const LOADING_DOSE_MG: f64 = 1500.0;
@@ -100,32 +109,7 @@ fn vanco_loading_example_parses_and_pins_the_scenario() {
 
 #[test]
 fn vanco_loading_titration_matches_mrgsolve() {
-    let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_loading.ferx"))
-        .expect("vanco loading model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] present");
-    let pop = read_nonmem_csv(
-        Path::new("tests/reference/vanco_loading_mrgsolve/vanco_loading_subject.csv"),
-        None,
-        None,
-    )
-    .expect("vanco loading subject data must load");
-
-    // `AdaptiveSimulateOptions` is `#[non_exhaustive]`: build from `default()`.
-    let mut opts = AdaptiveSimulateOptions::default();
-    opts.seed = Some(1);
-
-    let res = simulate_adaptive_from_spec(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        1,
-        spec,
-        &opts,
-    )
-    .expect("adaptive vanco loading-dose sim runs and passes the base-aware verifier");
+    let res = run(None);
 
     // Six maintenance decisions, each dosed (no hold/stop here). The loading dose is a
     // BASE dose — it drives the trajectory but never enters the reactive ledger.
@@ -155,6 +139,7 @@ fn vanco_loading_titration_matches_mrgsolve() {
 
     // Per-decision: the trough matches mrgsolve within the cross-solver band, and the
     // realized maintenance dose matches the frozen ladder exactly (exact f64 titration).
+    let mut worst: f64 = 0.0;
     for (i, &(t_ref, trough_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
@@ -163,12 +148,14 @@ fn vanco_loading_titration_matches_mrgsolve() {
             .first()
             .map(|s| s.value)
             .unwrap_or(f64::NAN);
+        assert!(sig.is_finite(), "decision {i}: trough {sig}");
+        let gap = (sig - trough_ref).abs();
+        worst = worst.max(gap);
         assert!(
-            (sig - trough_ref).abs() < SIGNAL_TOL,
-            "decision {i}: ferx trough {sig:.6} vs mrgsolve {trough_ref:.6} \
-             (|Δ| {:.6} >= {SIGNAL_TOL}); a trough mismatch this large signals a dropped \
-             or mis-integrated base regimen",
-            (sig - trough_ref).abs()
+            gap < SIGNAL_TOL,
+            "decision {i}: ferx trough {sig:.9} vs mrgsolve {trough_ref:.9} \
+             (|Δ| {gap:.3e} >= {SIGNAL_TOL:e}); a trough mismatch this large signals a dropped \
+             or mis-integrated base regimen"
         );
         let e = &res.ledger[i];
         assert!(
@@ -177,6 +164,8 @@ fn vanco_loading_titration_matches_mrgsolve() {
             e.amt
         );
     }
+
+    eprintln!("loading: worst trough gap {worst:.3e} mg/L (band {SIGNAL_TOL:e})");
 
     // The first 5 decisions climb (the `increase` rung); the last re-issues the converged
     // dose (recorded by route — a bolus).
@@ -213,17 +202,25 @@ fn vanco_loading_titration_matches_mrgsolve() {
 /// mrgsolve's AUC24 of each closed inter-decision window (#943), frozen in
 /// `tests/reference/vanco_loading_mrgsolve/expected.md`: an AUC compartment `dxdt_AUC = CENT/V` reset at the
 /// start of each window, integrated on the same piecewise-constant CL as the troughs above.
-const REF_AUC24: [f64; 5] = [242.711204, 277.831468, 339.591553, 422.170914, 527.015315];
+const REF_AUC24: [f64; 5] = [
+    242.711203568,
+    277.831467910,
+    339.591552808,
+    422.170913604,
+    527.015314969,
+];
 
-/// Relative band of each ferx AUC24 against mrgsolve's (#943), the band of the constant-path
-/// vanco anchor. Measured on Linux aarch64 (`tools/linux-test.sh`), identical in every
-/// printed digit on macOS arm64: the windows read −7.7e-6 to −7.1e-6 relative, so 5e-5 is at least
-/// 6× headroom. This is a cross-engine band (RK45 + a trapezoid on soft samples vs
-/// LSODA + an AUC compartment), not ferx's own accuracy; the kit has a constant `V` and no
+/// Relative band of each ferx AUC24 against mrgsolve's (#943), at η = 0.
+/// Measured on Linux aarch64 (`tools/linux-test.sh`), identical in
+/// every printed digit on macOS arm64: every window reads high by 7.32e-6, so 2.5e-5 is 3.4×
+/// headroom. That offset is the trapezoid's own error, not the solvers or η: each window is
+/// a pure exponential (bolus doses, `k = CL/V = 0.05`/h), on which a 128-panel trapezoid over
+/// 24 h over-reads by `(k·h)²/12 = 7.32e-6` with `h = 24/128` h. This is a cross-engine band (RK45 + a trapezoid on
+/// soft samples vs LSODA + an AUC compartment), not ferx's own accuracy; the kit has a constant `V` and no
 /// `[scaling]`, so it checks the exposure of the per-segment trajectory, and the readout
 /// conversion under κ and covariates is pinned by the closed forms in
 /// `src/api/tests/adaptive_auc_tv_tests.rs`.
-const AUC_REL_TOL: f64 = 5e-5;
+const AUC_REL_TOL: f64 = 2.5e-5;
 
 /// Each window's AUC24 matches mrgsolve's to [`AUC_REL_TOL`] (#943): the exposure integral
 /// under the per-segment snapshot, checked window by window rather than through the
@@ -235,29 +232,25 @@ fn vanco_loading_window_aucs_match_mrgsolve() {
 
 /// Run the anchor scenario with `auc_target = band` and count the windows in it.
 fn windows_in(band: (f64, f64)) -> usize {
+    common::windows_in_band(&run(Some(band)))
+}
+
+/// Run the anchor scenario at η = 0, with `auc_target` replaced by `band` when given.
+fn run(band: Option<(f64, f64)>) -> AdaptiveSimulationResult {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_loading.ferx"))
-        .expect("model must parse");
+        .expect("vanco loading model must parse");
     let mut spec = parsed
         .adaptive_dosing
         .clone()
         .expect("[adaptive_dosing] present");
-    spec.auc_target = Some(band);
+    if let Some(band) = band {
+        spec.auc_target = Some(band);
+    }
     let pop = read_nonmem_csv(
         Path::new("tests/reference/vanco_loading_mrgsolve/vanco_loading_subject.csv"),
         None,
         None,
     )
     .expect("vanco loading subject data must load");
-    let mut opts = AdaptiveSimulateOptions::default();
-    opts.seed = Some(1);
-    let res = simulate_adaptive_from_spec(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        1,
-        &spec,
-        &opts,
-    )
-    .expect("adaptive run with auc_target");
-    common::windows_in_band(&res)
+    common::simulate_from_spec_at_typical_value(&parsed.model, &pop, &spec)
 }
