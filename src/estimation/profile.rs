@@ -23,7 +23,11 @@
 //!   exact one wherever the production outer gradient is analytic (#2109), otherwise a
 //!   central difference with the EBE re-solved at each point. On a model linear in (η, κ)
 //!   the Newton step is the exact GLS solution and the solve takes one step; otherwise a
-//!   few.
+//!   few. A block read through one logit link around that affine read,
+//!   `y = inv_logit(c × block + rest)` (#2111), makes the problem a GLM, where the GLS
+//!   matrix is only quasi-Newton: there the matrix is the adjoint's exact Hessian of the
+//!   fit's own term ([`ProfileCtx::exact_hessian`]), and the second differences of the
+//!   re-solved term where the adjoint declines ([`ProfileCtx::resolved_hessian`]).
 //! - [`optimize_profiled`]: the outer loop over the structural parameters only. Its
 //!   gradient is the production outer gradient at `β̂`, with the levels held the way
 //!   `FIX` holds a θ: by the envelope theorem `dO_p/dθ = ∂O/∂θ |_{β = β̂}`, because
@@ -96,6 +100,19 @@ pub(crate) const PROFILE_INNER_TOL: f64 = crate::estimation::inner_optimizer::ST
 
 /// The central-difference step of the total gradient, in conditional standard errors.
 const FD_STEP_SE: f64 = 1e-2;
+
+/// [`FD_STEP_SE`] on a block read through a logit link (#2111). The link's curvature puts
+/// the truncation error of a `1e-2` step at 3.4e-6 SE on a fixture whose probabilities run
+/// 0.1–0.9, a third of [`PROFILE_TOL`]; at `1e-3` it is 3.4e-8, the re-solve noise
+/// included (2.8e-6 / 2.8e-8 on B2, 0.2–0.8). macOS arm64; Linux agrees.
+const LINKED_FD_STEP_SE: f64 = 1e-3;
+
+/// The step of a linked block's differenced Newton matrix
+/// ([`ProfileCtx::resolved_hessian`]), in conditional standard errors. At `1e-2` it is
+/// within 1e-5 of the exact matrix, in units of the levels' own curvature, on B2, and 4e-5 on a
+/// subject reading a dependent level through a slack; below it the re-solves' noise over
+/// `h²` takes over (4e-4 at `3e-3`). A Newton matrix needs none of those digits.
+const LINKED_HESSIAN_STEP_SE: f64 = 1e-2;
 
 /// The FD step of the covariance step's `D` and `B` off the exact route (#2109), in
 /// conditional standard errors for a level and the global `fd_hessian_step · (1 + |x|)` for
@@ -223,6 +240,9 @@ pub(crate) struct ProfileGroup {
     pub(crate) borders: Vec<usize>,
     /// Per entry of `coords`, the index into `borders` of the dependent that sums it.
     border_of: Vec<Option<usize>>,
+    /// Some coordinate's block is read through a logit link (the parser's `linked`,
+    /// #2111): the Newton matrix is the adjoint's exact one ([`ProfileCtx::exact_hessian`]).
+    pub(crate) linked: bool,
 }
 
 impl ProfileGroup {
@@ -620,6 +640,17 @@ impl ProfileLayout {
             })
             .collect();
 
+        // The θ of every block read through a logit link (#2111).
+        let linked_theta: std::collections::HashSet<usize> = blocks
+            .decls
+            .iter()
+            .filter(|d| d.linked)
+            .flat_map(|d| d.spec.levels.iter())
+            .flat_map(|r| match *r {
+                LevelRule::Free(k) => k as usize..k as usize + 1,
+                LevelRule::NegSum(a, b) => a as usize..b as usize,
+            })
+            .collect();
         // Union-find over positions: a subject couples every coordinate it reads, a
         // dependent's reader every θ of its group.
         let mut parent: Vec<usize> = (0..coords.len()).collect();
@@ -635,12 +666,14 @@ impl ProfileLayout {
                     subjects: Vec::new(),
                     borders: Vec::new(),
                     border_of: Vec::new(),
+                    linked: false,
                 });
                 groups.len() - 1
             });
             *slot = (g, groups[g].coords.len());
             groups[g].coords.push(p);
             groups[g].border_of.push(None);
+            groups[g].linked |= linked_theta.contains(&coords[p]);
         }
         for (i, set) in active.iter().enumerate() {
             if let Some(&p) = set.first() {
@@ -1067,7 +1100,9 @@ impl ProfileCtx<'_> {
     /// marginal `(y − f(η̂) + Hη̂)ᵀ C̃⁻¹ (·) + log|C̃|`, `C̃ = HΩHᵀ + R`, so it is quadratic
     /// in the levels and a forward second difference is exact up to rounding at any step
     /// (`1 + 2k + k(k−1)/2` evaluations, where a central stencil takes `2k²`); `steps`
-    /// sets it per level.
+    /// sets it per level. That needs the affine route: through a logit link (#2111) it is
+    /// neither quadratic nor a good Newton matrix, and the solve uses
+    /// [`Self::exact_hessian`] or [`Self::resolved_hessian`] there.
     ///
     /// Not the fit's own term under FOCEI: that one is the conditional (Laplace) form, whose
     /// held-η̂ Hessian is `XᵀR⁻¹X` — the curvature with the random effects *not* free to
@@ -1099,6 +1134,97 @@ impl ProfileCtx<'_> {
             for b in 0..a {
                 let g = steps[b];
                 let v = (at(&[(a, h), (b, g)]) - f1[a] - f1[b] + f0) / (h * g);
+                m[(a, b)] = v;
+                m[(b, a)] = v;
+            }
+        }
+        m
+    }
+
+    /// The exact Newton matrix of subject `i` over its levels on a block read through a
+    /// logit link (#2111): the adjoint's second derivative of the fit's own term
+    /// ([`Self::objective`]) over the θ the levels' `moves` touch, at the mode `s`, read
+    /// along the moves (`Mᵀ h M`). It is the total Hessian, `dη̂/dβ` in it, which is what
+    /// Newton on the total gradient needs: the GLS matrix of [`Self::held_hessian`] is
+    /// exact only while the prediction is affine in the levels. Measured on the bounded
+    /// `inv_logit` fixture (10 studies): 3 iterations, quadratic, against the held matrix's
+    /// 9, linear at ~0.1 per step, to the same OFV.
+    ///
+    /// `None` where the subject declines, as [`Self::total_gradient_adjoint`] does: a level
+    /// that log-packs, a mode the identity cannot be formed at, or a recorder decline. The
+    /// solve then takes [`Self::resolved_hessian`], not the held matrix: on a fixture with
+    /// probabilities 0.1–0.9 the held matrix contracted at 0.96 per step on one study and
+    /// did not converge in [`MAX_PROFILE_ITER`] steps, where the exact one took 4.
+    fn exact_hessian(
+        &self,
+        i: usize,
+        pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
+        s: &SubjectState,
+    ) -> Option<DMatrix<f64>> {
+        use crate::sens::ode_provider::adjoint::subject_adjoint_cov_block_at;
+        if self.reads_a_log_packed_level(i, pt.template) {
+            return None;
+        }
+        let subject = &self.population.subjects[i];
+        let mode = crate::estimation::covariance::stacked_mode(
+            self.model,
+            subject,
+            &s.eta,
+            Some(&s.kappas),
+        )?;
+        let reads = &self.layout.reads[i];
+        let mut touched: Vec<usize> = reads
+            .iter()
+            .flat_map(|r| r.moves.iter().map(|&(k, _)| k))
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
+        let h = subject_adjoint_cov_block_at(
+            self.model,
+            subject,
+            pt,
+            &mode,
+            self.objective(),
+            &touched,
+        )?;
+        // Every θ the moves touch packs as itself (checked above), so `∂²/∂x²` is `∂²/∂θ²`.
+        let m = DMatrix::from_fn(touched.len(), reads.len(), |t, a| {
+            reads[a]
+                .moves
+                .iter()
+                .filter(|&&(k, _)| k == touched[t])
+                .map(|&(_, c)| c)
+                .sum::<f64>()
+        });
+        let d = m.transpose() * h * &m;
+        d.iter().all(|v| v.is_finite()).then_some(d)
+    }
+
+    /// Subject `i`'s Newton matrix over its levels as central second differences of its
+    /// re-solved term ([`Self::resolve`], warm from the mode `s`), the EBE re-found at every
+    /// point, so `dη̂/dβ` is in it: the matrix [`Self::exact_hessian`] computes, where the
+    /// adjoint declines (#2111). `2k²` re-solves; `steps` sets the step per level.
+    fn resolved_hessian(
+        &self,
+        i: usize,
+        params: &ModelParameters,
+        s: &SubjectState,
+        steps: &[f64],
+    ) -> DMatrix<f64> {
+        let reads = &self.layout.reads[i];
+        let k = reads.len();
+        let warm = s.warm();
+        let at =
+            |moves: &[(usize, f64)]| self.resolve(i, &shifted(params, reads, moves), &warm).nll;
+        let mut m = DMatrix::zeros(k, k);
+        for a in 0..k {
+            let h = steps[a];
+            m[(a, a)] = (at(&[(a, h)]) - 2.0 * s.nll + at(&[(a, -h)])) / (h * h);
+            for b in 0..a {
+                let g = steps[b];
+                let v = (at(&[(a, h), (b, g)]) - at(&[(a, h), (b, -g)]) - at(&[(a, -h), (b, g)])
+                    + at(&[(a, -h), (b, -g)]))
+                    / (4.0 * h * g);
                 m[(a, b)] = v;
                 m[(b, a)] = v;
             }
@@ -1281,6 +1407,8 @@ impl ProfileCtx<'_> {
             #[cfg(test)]
             force_decline: FORCE_PROFILE_GRADIENT_DECLINE.with(std::cell::Cell::get),
             #[cfg(test)]
+            force_matrix_decline: FORCE_PROFILE_MATRIX_DECLINE.with(std::cell::Cell::get),
+            #[cfg(test)]
             fail_after: FORCE_PROFILE_GROUP_FAILURE.with(std::cell::Cell::get),
         };
         let outcomes: Vec<(Result<GroupOutcome, ProfileFailure>, ProfileCounts)> = layout
@@ -1394,21 +1522,10 @@ impl ProfileCtx<'_> {
         let blocks = coupled_blocks(n, &subj_loc);
         let mut iterations = 0;
         // The step of the Newton matrix's difference: one SE once a pass has measured
-        // it, a unit step before. The term is quadratic, so either is exact up to
+        // it, a unit step before. The held term is quadratic, so either is exact up to
         // rounding; the SE step only keeps the differences on the objective's own scale.
         let mut m_steps = vec![1.0; n];
-        loop {
-            // The Newton matrix first: its diagonal sizes the gradient's steps.
-            let parts: Vec<DMatrix<f64>> = g
-                .subjects
-                .par_iter()
-                .zip(states.par_iter())
-                .zip(subj_loc.par_iter())
-                .map(|((&i, s), loc)| {
-                    let st: Vec<f64> = loc.iter().map(|&l| m_steps[l]).collect();
-                    self.held_hessian(i, &p, s, &st)
-                })
-                .collect();
+        let assemble = |parts: &[DMatrix<f64>]| {
             let mut m = DMatrix::zeros(n, n);
             for (part, loc) in parts.iter().zip(&subj_loc) {
                 for (a, &la) in loc.iter().enumerate() {
@@ -1417,15 +1534,10 @@ impl ProfileCtx<'_> {
                     }
                 }
             }
-            let se: Vec<f64> = g
-                .theta_diagonal(&m)
-                .into_iter()
-                .map(|d| (d.is_finite() && d > 0.0).then(|| 1.0 / d.sqrt()))
-                .collect::<Option<_>>()
-                .ok_or(ProfileFailure::Singular)?;
-            // A level's own scale. Without borders it is `se`; a θ no subject reads
-            // directly has no curvature of its own and is never stepped.
-            let level_se: Vec<f64> = (0..n)
+            m
+        };
+        let diag_se = |m: &DMatrix<f64>| -> Vec<f64> {
+            (0..n)
                 .map(|l| {
                     let d = m[(l, l)];
                     if d.is_finite() && d > 0.0 {
@@ -1434,14 +1546,101 @@ impl ProfileCtx<'_> {
                         1.0
                     }
                 })
-                .collect();
-            m_steps.clone_from(&level_se);
-            let steps: Vec<f64> = level_se.iter().map(|s| FD_STEP_SE * s).collect();
+                .collect()
+        };
+        loop {
             // On the adjoint route, one packed point for the group: every subject is at `p`.
             let x = route.adjoint.then(|| pack_params(&p));
             let pt = x
                 .as_deref()
                 .and_then(|x| crate::sens::ode_provider::adjoint::PackedPoint::new(&p, x));
+            // The Newton matrix first: its diagonal sizes the gradient's steps. On a linked
+            // group (#2111), each subject's exact matrix where the adjoint serves it, at a
+            // mode only, as the level gradient below; otherwise the second differences of
+            // its re-solved term ([`Self::resolved_hessian`]), never the held matrix, which
+            // through a link can contract at 0.96 per step.
+            let exact: Vec<Option<DMatrix<f64>>> = g
+                .subjects
+                .par_iter()
+                .zip(states.par_iter())
+                .map(|(&i, s)| {
+                    let pt = pt
+                        .as_ref()
+                        .filter(|_| g.linked && !s.off_mode && !route.declines_matrix())?;
+                    self.exact_hessian(i, pt, s)
+                })
+                .collect();
+            let held_parts = |m_steps: &[f64]| -> Vec<DMatrix<f64>> {
+                g.subjects
+                    .par_iter()
+                    .zip(states.par_iter())
+                    .zip(subj_loc.par_iter())
+                    .zip(exact.par_iter())
+                    .map(|(((&i, s), loc), e)| match e {
+                        Some(e) => e.clone(),
+                        None => {
+                            let st: Vec<f64> = loc.iter().map(|&l| m_steps[l]).collect();
+                            self.held_hessian(i, &p, s, &st)
+                        }
+                    })
+                    .collect()
+            };
+            let n_exact = exact.iter().filter(|e| e.is_some()).count();
+            let m = if !g.linked {
+                assemble(&held_parts(&m_steps))
+            } else if n_exact == exact.len() {
+                counts.exact_matrices += n_exact;
+                assemble(&exact.iter().flatten().cloned().collect::<Vec<_>>())
+            } else {
+                counts.exact_matrices += n_exact;
+                counts.fd_matrices += exact.len() - n_exact;
+                // The differences step in SEs. Before any pass has measured them, the held
+                // matrix (cheap, and of the right scale) sizes them.
+                let scale = if iterations == 0 {
+                    diag_se(&assemble(&held_parts(&m_steps)))
+                } else {
+                    m_steps.clone()
+                };
+                let parts: Vec<DMatrix<f64>> = g
+                    .subjects
+                    .par_iter()
+                    .zip(states.par_iter())
+                    .zip(subj_loc.par_iter())
+                    .zip(exact.par_iter())
+                    .map(|(((&i, s), loc), e)| match e {
+                        Some(e) => e.clone(),
+                        None => {
+                            let st: Vec<f64> = loc
+                                .iter()
+                                .map(|&l| LINKED_HESSIAN_STEP_SE * scale[l])
+                                .collect();
+                            self.resolved_hessian(i, &p, s, &st)
+                        }
+                    })
+                    .collect();
+                for (e, loc) in exact.iter().zip(&subj_loc) {
+                    if e.is_none() {
+                        counts.resolves += 2 * loc.len() * loc.len();
+                    }
+                }
+                assemble(&parts)
+            };
+            let se: Vec<f64> = g
+                .theta_diagonal(&m)
+                .into_iter()
+                .map(|d| (d.is_finite() && d > 0.0).then(|| 1.0 / d.sqrt()))
+                .collect::<Option<_>>()
+                .ok_or(ProfileFailure::Singular)?;
+            // A level's own scale. Without borders it is `se`; a θ no subject reads
+            // directly has no curvature of its own and is never stepped.
+            let level_se = diag_se(&m);
+            m_steps.clone_from(&level_se);
+            let fd_step = if g.linked {
+                LINKED_FD_STEP_SE
+            } else {
+                FD_STEP_SE
+            };
+            let steps: Vec<f64> = level_se.iter().map(|s| fd_step * s).collect();
             // Per subject: the gradient, and whether the adjoint served it.
             let parts: Vec<(Vec<f64>, bool)> = g
                 .subjects
@@ -1590,6 +1789,12 @@ pub(crate) struct ProfileCounts {
     /// route's own choice under `gradient = fd`, or a decline).
     pub(crate) adjoint_gradients: usize,
     pub(crate) fd_gradients: usize,
+    /// On a block read through a logit link (#2111), subject Newton matrices the adjoint
+    /// served exactly, and those taken by second differences of the re-solved term
+    /// instead (off the adjoint's route, off the mode, or declined); their re-solves are in
+    /// `resolves`. Zero on an affine block, whose GLS matrix is exact.
+    pub(crate) exact_matrices: usize,
+    pub(crate) fd_matrices: usize,
 }
 
 impl ProfileCounts {
@@ -1598,6 +1803,8 @@ impl ProfileCounts {
         self.resolves += o.resolves;
         self.adjoint_gradients += o.adjoint_gradients;
         self.fd_gradients += o.fd_gradients;
+        self.exact_matrices += o.exact_matrices;
+        self.fd_matrices += o.fd_matrices;
     }
 }
 
@@ -1607,12 +1814,20 @@ impl ProfileCounts {
 /// `Eval` line reports the most any one group took. A function so a test can assert the
 /// text the fit prints.
 pub(crate) fn profile_work_summary(n_evals: usize, n_failed: usize, c: &ProfileCounts) -> String {
-    format!(
+    let mut line = format!(
         "Profile solves of the outer optimizer: {n_evals} evaluations ({n_failed} solve \
          failures, their work counted), {} Newton steps summed over groups, {} EBE re-solves, \
          level gradients {} adjoint / {} finite-difference",
         c.newton_steps, c.resolves, c.adjoint_gradients, c.fd_gradients
-    )
+    );
+    // Only a block read through a logit link has a matrix choice to report (#2111).
+    if c.exact_matrices + c.fd_matrices > 0 {
+        line.push_str(&format!(
+            ", logit-linked Newton matrices {} exact / {} finite-difference",
+            c.exact_matrices, c.fd_matrices
+        ));
+    }
+    line
 }
 
 /// Where a solve's level gradients come from: the adjoint, a subject at a time with the
@@ -1622,6 +1837,9 @@ struct GradientRoute {
     /// Test switch: the subject (population index) whose adjoint gradient is declined.
     #[cfg(test)]
     force_decline: Option<usize>,
+    /// Test switch: every subject's exact Newton matrix is declined.
+    #[cfg(test)]
+    force_matrix_decline: bool,
     /// Test switch: every group still unconverged after this many Newton steps fails.
     #[cfg(test)]
     fail_after: Option<usize>,
@@ -1631,6 +1849,14 @@ impl GradientRoute {
     fn declines(&self, _i: usize) -> bool {
         #[cfg(test)]
         if self.force_decline == Some(_i) {
+            return true;
+        }
+        false
+    }
+
+    fn declines_matrix(&self) -> bool {
+        #[cfg(test)]
+        if self.force_matrix_decline {
             return true;
         }
         false
@@ -1788,6 +2014,10 @@ thread_local! {
     /// (population index) adjoint level gradient, so it takes the FD fallback (#2109).
     pub(crate) static FORCE_PROFILE_GRADIENT_DECLINE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// Test switch: every profile solve started on this thread declines every subject's
+    /// exact Newton matrix on a linked block, so it takes the held one (#2111).
+    pub(crate) static FORCE_PROFILE_MATRIX_DECLINE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// Test switch: every profile solve started on this thread fails each group still
     /// unconverged after this many Newton steps, so a test reaches a failed group's work.
     pub(crate) static FORCE_PROFILE_GROUP_FAILURE: std::cell::Cell<Option<usize>> =

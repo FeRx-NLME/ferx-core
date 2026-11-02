@@ -943,10 +943,11 @@ every prediction as `c × block` plus terms that do not read it, with `c` taken 
 the data alone (`/ WPSE` is fine). Each of the following is refused, never fitted
 some other way:
 
-- the block reached through a function, a power, a state, a divisor, a parameter
-  coefficient, or an `if` whose condition reads more than data; two reads multiplied
-  or divided; read with a second profiled block; or read by no prediction at all
-  (`E_PROFILE_NOT_LINEAR`);
+- the block reached through a function (other than one logit link around the whole
+  prediction, see [Through a logit link](#through-a-logit-link)), a power, a state, a
+  divisor, a parameter coefficient, or an `if` whose condition reads more than data; two
+  reads multiplied or divided; read with a second profiled block; or read by no
+  prediction at all (`E_PROFILE_NOT_LINEAR`);
 - `FIX` on the block, which leaves nothing to solve, and a box that is a point, is
   empty or does not hold the init (see [Bounds on a profiled block](#bounds-on-a-profiled-block));
 - any method other than `foce`, `focei` or `laplace`, a non-additive or
@@ -992,6 +993,40 @@ The condition must read data only. One that reads a θ, an η or the block itsel
 refused, and so is every `max`, `min` or `clamp` of the block, since each compares the
 block. Every branch must itself be affine: a branch giving `PLACEBO[STUDY]` under one
 condition and `exp(PLACEBO[STUDY])` under the other is refused, naming the `exp`.
+
+##### Through a logit link
+
+A bounded endpoint, such as an observed proportion, can read the block through one
+logit link, as long as the link is the whole prediction (#2111):
+
+```
+[individual_parameters]
+  LP = TVL + PLACEBO + ETA_S + EMAX * TRT
+
+[structural_model]
+  y = inv_logit(LP)
+```
+
+`expit` is the same link, and it may also be written inline (`y = inv_logit(TVL +
+PLACEBO + …)`) or through a parameter (`P = inv_logit(LP)`, `y = P`). Inside the link the
+rule above applies unchanged: the argument must read the block as `c × block` plus terms
+that do not read it. A function inside the link is refused by name, as it is anywhere.
+So is a link that is not the whole prediction, such as `100 * inv_logit(LP)`,
+`inv_logit(LP) + E` or a link inside a link. The refusal says so.
+
+The solve is then a generalised linear model, not least squares, so the least-squares
+Newton matrix no longer fits it. The solve takes the exact Hessian of the fit's own
+objective from the adjoint instead, which is quadratic in the levels' convergence
+(three steps per study on the test fixture). Where the adjoint cannot serve a subject, or
+under `gradient = fd`, it takes the second differences of the objective with the random
+effects re-solved at every point, which converge as fast and cost `2k²` EBE re-solves for
+a subject reading `k` levels. `verbose` reports how many of each it took. Under
+`foce`, `focei`, `laplace` and adaptive quadrature the profiled levels reach the
+unprofiled fit's optimum, and NONMEM's with every level a `THETA` (see
+`nonmem_anchor/README.md`).
+
+A `[binary_model] logit` endpoint cannot read a θ level block yet, profiled or not
+(#2562), and ferx has no probit link.
 
 ##### Bounds on a profiled block
 
