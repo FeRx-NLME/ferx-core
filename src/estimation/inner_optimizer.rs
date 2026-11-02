@@ -939,6 +939,12 @@ pub(crate) struct InnerSolvePolicy {
     /// and its FD Hessian would cost every draw `2·n_eta` gradients per subject. `false`, the
     /// `Default`, otherwise. The IOV inner solve does not read it.
     pub(crate) keep_certified_start: bool,
+    /// An IOV subject's warm solve starts unseeded, as before #2549, whatever `seed` says.
+    /// Set by the profiled fit's passes: its convergence rule is calibrated on the unseeded
+    /// solve's endpoints, and on A2's (50, 6, 2) start the seeded warm solves, equal to
+    /// tolerance, left it 1.7e-6 above NONMEM and unconverged after four verification legs
+    /// (+8.6e-8 converged unseeded). `false`, the `Default`, seeds as `seed` says.
+    pub(crate) unseeded_iov_warm: bool,
 }
 
 impl InnerSolvePolicy {
@@ -957,6 +963,7 @@ impl InnerSolvePolicy {
             twin_seed: options.inner_twin_seed,
             init_is_mode: false,
             keep_certified_start: false,
+            unseeded_iov_warm: false,
         }
     }
 }
@@ -1821,10 +1828,44 @@ pub(crate) fn find_ebe_cached(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
 ) -> EbeResult {
+    find_ebe_cached_from(
+        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy, None,
+    )
+}
+
+/// [`find_ebe_cached`] from a **predicted** start `eta_init`, with the mode it was predicted
+/// from as `fallback_start`: a predicted start whose objective is not usable (a first-order
+/// step carried out of the model's domain) is replaced by the fallback before the search
+/// begins (#2549 review r2 #3). The check is the search's own first evaluation, memoised, so
+/// a finite start costs nothing extra and is solved bit for bit as without a fallback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_ebe_cached_from(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    policy: InnerSolvePolicy,
+    fallback_start: Option<&[f64]>,
+) -> EbeResult {
     #[cfg(test)]
     EBE_SOLVES_STARTED.with(|n| n.set(n.get() + 1));
-    find_ebe_impl(
-        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
+    find_ebe_impl_from(
+        model,
+        subject,
+        params,
+        max_iter,
+        tol,
+        eta_init,
+        mu_k,
+        restarts,
+        schedule,
+        policy,
+        fallback_start,
     )
 }
 
@@ -1956,8 +1997,42 @@ pub(crate) struct InnerRecording {
     /// Every inner solve, IOV or not: its subject and the tolerance it ran at.
     pub(crate) solve_tols: Vec<(String, f64)>,
     pub(crate) passes: Vec<PassRecord>,
+    /// Every warm-start prediction the outer loop handed a pass (#2549).
+    pub(crate) predictions: Vec<PredictionRecord>,
     n_passes: usize,
     current_pass: Option<usize>,
+}
+
+/// One first-order warm-start prediction `η̂ + (dη̂/dx)(x − x₀)` and the pass it seeded.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PredictionRecord {
+    /// The index of the pass the prediction was handed to.
+    pub(crate) pass: usize,
+    pub(crate) modes: Vec<DVector<f64>>,
+    pub(crate) jac: Vec<Vec<DVector<f64>>>,
+    pub(crate) anchor: Vec<f64>,
+    pub(crate) x: Vec<f64>,
+}
+
+/// Record a prediction for the next pass of the recording on this thread, if any.
+#[cfg(test)]
+pub(crate) fn record_prediction(
+    modes: &[DVector<f64>],
+    jac: &[Vec<DVector<f64>>],
+    anchor: &[f64],
+    x: &[f64],
+) {
+    with_recording(|r| {
+        let pass = r.n_passes;
+        r.predictions.push(PredictionRecord {
+            pass,
+            modes: modes.to_vec(),
+            jac: jac.to_vec(),
+            anchor: anchor.to_vec(),
+            x: x.to_vec(),
+        })
+    });
 }
 
 // The recording [`record_inner_solves`] runs on this thread; `None` (nothing recorded)
@@ -2073,6 +2148,26 @@ fn find_ebe_impl(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
 ) -> EbeResult {
+    find_ebe_impl_from(
+        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy, None,
+    )
+}
+
+/// [`find_ebe_impl`] with a fallback for a predicted start ([`find_ebe_cached_from`]).
+#[allow(clippy::too_many_arguments)]
+fn find_ebe_impl_from(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    policy: InnerSolvePolicy,
+    fallback_start: Option<&[f64]>,
+) -> EbeResult {
     if inner_profile_enabled() {
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2102,7 +2197,7 @@ fn find_ebe_impl(
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
-        let ebe = find_ebe_iov(
+        let ebe = find_ebe_iov_seeded(
             model,
             subject,
             params,
@@ -2112,6 +2207,11 @@ fn find_ebe_impl(
             mu_k,
             policy.ebe_variance,
             policy.init_is_mode,
+            if policy.unseeded_iov_warm {
+                InnerHessianSeed::None
+            } else {
+                policy.seed
+            },
         );
         #[cfg(test)]
         with_recording(|r| {
@@ -2124,10 +2224,26 @@ fn find_ebe_impl(
         return ebe;
     }
 
-    let solve = |cold_seed: bool| {
+    // The two cold solves screen the same Sobol starts on the same objective, and a screen
+    // descent reads neither solve's incumbent: the first one's descents are handed to the
+    // second through this cell, local to the call, so nothing outlives it (an unwind
+    // included) or reaches another subject.
+    let screen_share: RefCell<Option<Vec<ScreenDescent>>> = RefCell::new(None);
+    let solve = |cold_seed: bool, share: Option<&RefCell<Option<Vec<ScreenDescent>>>>| {
         find_ebe_solve(
-            model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
+            model,
+            subject,
+            params,
+            max_iter,
+            tol,
+            eta_init,
+            mu_k,
+            restarts,
+            schedule,
+            policy,
             cold_seed,
+            share,
+            fallback_start,
         )
     };
     // The Hessian seed is a *local* model of the individual objective. Near the mode it
@@ -2150,15 +2266,22 @@ fn find_ebe_impl(
     // An all-zero "warm" start is a cold placeholder (the outer loop's first evaluation and
     // `freeze_flat_thetas` both pass zeros as `prev_etas`), so it counts as cold.
     let genuinely_warm = is_warm_start(eta_init, policy.init_is_mode);
-    let normal = solve(false).expect("an unforced solve always returns a result");
-    if genuinely_warm || policy.seed == InnerHessianSeed::None {
+    let both = !(genuinely_warm || policy.seed == InnerHessianSeed::None);
+    let share = both.then_some(&screen_share);
+    let normal = solve(false, share).expect("an unforced solve always returns a result");
+    if !both {
         return normal;
     }
-    match solve(true) {
+    let seeded = solve(true, share);
+    match seeded {
         Some(seeded) if seeded.nll + COLD_SEED_TIE_TOL < normal.nll => seeded,
         _ => normal,
     }
 }
+
+/// One screen descent's outcome: its end point, convergence flag and objective there
+/// (`None` for a non-finite end point).
+type ScreenDescent = Option<(Vec<f64>, bool, f64)>;
 
 /// Whether `eta_init` is a genuine warm start: a mode carried in from an earlier solve.
 /// `None` and an all-zero vector are both cold. The outer loop's first evaluation, the
@@ -2197,6 +2320,11 @@ fn find_ebe_solve(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
     cold_seed: bool,
+    // `find_ebe_impl`'s two cold solves share one screen: the first fills the cell with its
+    // descents, the second takes them. `None`: screen for this solve alone.
+    screen_share: Option<&RefCell<Option<Vec<ScreenDescent>>>>,
+    // The mode a predicted `eta_init` was predicted from ([`find_ebe_cached_from`]).
+    fallback_start: Option<&[f64]>,
 ) -> Option<EbeResult> {
     let n_eta = model.n_eta;
 
@@ -2345,12 +2473,24 @@ fn find_ebe_solve(
         }
         let v = obj_uncached(e);
         let mut m = memo.borrow_mut();
-        if m.len() == OBJ_MEMO {
-            m.remove(0);
-        }
-        m.push((e.iter().map(|x| x.to_bits()).collect(), v));
+        // The evicted entry's key buffer is reused for the new one (#2549 W1).
+        let mut key = if m.len() == OBJ_MEMO {
+            m.remove(0).0
+        } else {
+            Vec::with_capacity(e.len())
+        };
+        key.clear();
+        key.extend(e.iter().map(|x| x.to_bits()));
+        m.push((key, v));
         v
     };
+    // A predicted start out of the model's domain starts at the mode it was predicted from
+    // ([`find_ebe_cached_from`]); memoised, so the search's first evaluation reuses it. Out of
+    // the domain is what the objective reports there: not finite, or on the
+    // `SUBJECT_SENTINEL_NLL` rail it maps an undefined point to.
+    if let Some(fallback) = fallback_start.filter(|f| f.len() == eta.len()) {
+        start_at_fallback_if_unusable(obj(&eta), &mut eta, fallback);
+    }
 
     // No random effects: the mode is the empty vector and `H` has no columns, so there is
     // nothing to search, seed or certify — only the objective at it. Without this the solve
@@ -2426,7 +2566,10 @@ fn find_ebe_solve(
             });
         }
         let t0 = std::time::Instant::now();
-        *rows_at.borrow_mut() = None;
+        // Invalidated by emptying, so the key buffer survives for the refill below.
+        if let Some(k) = rows_at.borrow_mut().as_mut() {
+            k.clear();
+        }
         match analytic_eta_nll_gradient_with_schedule(
             model,
             subject,
@@ -2446,7 +2589,13 @@ fn find_ebe_solve(
             frozen,
         ) {
             Some(g) => {
-                *rows_at.borrow_mut() = Some(e.iter().map(|v| v.to_bits()).collect());
+                {
+                    // The held key's buffer is refilled, not reallocated (#2549 W1).
+                    let mut held = rows_at.borrow_mut();
+                    let key = held.get_or_insert_with(Vec::new);
+                    key.clear();
+                    key.extend(e.iter().map(|v| v.to_bits()));
+                }
                 #[cfg(test)]
                 INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1, c.get().2)));
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -2526,7 +2675,9 @@ fn find_ebe_solve(
         })
         .flatten();
     // The seed wrote its own rows into the buffer.
-    *rows_at.borrow_mut() = None;
+    if let Some(k) = rows_at.borrow_mut().as_mut() {
+        k.clear();
+    }
     let initial_hessian = seed.map(|(hessian, gradient)| {
         if use_analytic {
             *fused_first_gradient.borrow_mut() = gradient;
@@ -2724,26 +2875,30 @@ fn find_ebe_solve(
         // `inner_screen = 0`, at the price of `N` objective evaluations and `K` descents
         // per cold solve.
         if policy.screen > 0 {
-            let starts = screen_starts(&obj, &params.omega, n_eta, policy.screen, &subject.id);
-            for start in starts {
-                let mut cand = start;
-                let ok = inner_minimize_with_grad(
-                    &obj,
-                    &agrad,
-                    &mut cand,
-                    n_eta,
-                    max_iter,
-                    tol,
-                    precond.as_deref(),
-                    None,
-                    stop_precond,
-                    &stall_at,
-                    false,
-                );
-                if !cand.iter().all(|v| v.is_finite()) {
-                    continue;
+            let shared = screen_share.and_then(|c| c.borrow_mut().take());
+            let descents: Vec<ScreenDescent> = match shared {
+                Some(d) => d,
+                None => {
+                    let d = screen_descents(
+                        &obj,
+                        &agrad,
+                        &params.omega,
+                        n_eta,
+                        policy.screen,
+                        &subject.id,
+                        max_iter,
+                        tol,
+                        precond.as_deref(),
+                        stop_precond,
+                        &stall_at,
+                    );
+                    if let Some(c) = screen_share {
+                        *c.borrow_mut() = Some(d.clone());
+                    }
+                    d
                 }
-                let cand_nll = obj(&cand);
+            };
+            for (cand, ok, cand_nll) in descents.into_iter().flatten() {
                 if cand_nll + 1e-9 < nll {
                     if omega_distance(&cand, &eta, &params.omega) > SCREEN_MIN_OMEGA_DIST {
                         nll = cand_nll;
@@ -2879,10 +3034,14 @@ fn find_ebe_solve(
         rows_at
             .borrow()
             .as_ref()
+            // An empty key holds no rows (η is never empty here: the no-random-effect
+            // case returned above).
             .filter(|bits| {
-                bits.iter()
-                    .copied()
-                    .eq(eta_true.iter().map(|v| v.to_bits()))
+                !bits.is_empty()
+                    && bits
+                        .iter()
+                        .copied()
+                        .eq(eta_true.iter().map(|v| v.to_bits()))
             })
             .and_then(|_| {
                 let rows = obs_grad_recycle.borrow();
@@ -3062,6 +3221,7 @@ thread_local! {
 /// When `mu_k` is provided the BSV block is optimised in psi-space
 /// (`psi = eta_true + mu_k`) so mu-referencing benefits also apply to the BSV
 /// etas when IOV is active.  The returned `EbeResult.eta` is always `eta_true`.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn find_ebe_iov(
     model: &CompiledModel,
@@ -3073,6 +3233,35 @@ fn find_ebe_iov(
     mu_k: Option<&[f64]>,
     ebe_variance: EbeVariance,
     init_is_mode: bool,
+) -> EbeResult {
+    find_ebe_iov_seeded(
+        model,
+        subject,
+        params,
+        max_iter,
+        tol,
+        eta_init,
+        mu_k,
+        ebe_variance,
+        init_is_mode,
+        InnerHessianSeed::GaussNewton,
+    )
+}
+
+/// The IOV inner solve, its warm start seeded per `seed` (the stage's
+/// [`InnerSolvePolicy::seed`]).
+#[allow(clippy::too_many_arguments)]
+fn find_ebe_iov_seeded(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    ebe_variance: EbeVariance,
+    init_is_mode: bool,
+    seed: InnerHessianSeed,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -3419,8 +3608,55 @@ fn find_ebe_iov(
         };
     }
 
+    // Seed the IOV BFGS with the stacked Gauss–Newton metric at the start point (#2287,
+    // #2549), as the non-IOV FOCE/FOCEI solve is seeded, instead of the identity metric that
+    // left η and κ (Ω vs Ω_IOV scales) to be learned step by step: on `warfarin_iov` 54
+    // gradients per solve and 124 of 753 solves falling to Nelder–Mead before, 4.6× fewer
+    // instructions per fit after, at an OFV 1e-8 lower. The seed changes only the path to the
+    // mode; `None` (out of the recorder's scope, or a size mismatch) keeps the unseeded solve.
+    // Like the non-IOV solve's, only a genuinely warm start is seeded: from a cold start the
+    // metric's full first step selects the mode's basin (`find_ebe_impl`, #1474/#1504) —
+    // measured on `iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm`, a seeded cold
+    // first step lands 28.8 above the mode where the unseeded one stops 3.0 short.
+    // The same gates as the BSV seed (`analytic_inner_seed_hessian`): the stage's seed policy
+    // (`FERX_NO_INNER_HESSIAN_SEED`), the analytic opt-outs, no `[covariate_nn]` (whose seeded
+    // steps selected worse basins, #1474), and only on the dense-BFGS route that reads it.
+    let seeded = seed != InnerHessianSeed::None
+        && !analytic_inner_common_bail(model)
+        && !model.has_covariate_nn()
+        && !matches!(
+            inner_optimizer_mode(),
+            crate::types::InnerOptimizer::NelderMead
+        )
+        && !inner_use_lbfgs(n_flat);
+    let iov_seed = (seeded && is_warm_start(eta_init, init_is_mode))
+        .then(|| {
+            let mut st: Vec<f64> = x[..n_eta]
+                .iter()
+                .zip(mu.iter())
+                .map(|(p, m)| p - m)
+                .collect();
+            for k in to_kappas(&x) {
+                st.extend_from_slice(&k);
+            }
+            // The positive Gauss–Newton metric `H̃` (first-order duals only), the seed the
+            // non-IOV FOCE/FOCEI solve already takes (#1389, #2287).
+            crate::sens::ode_provider::adjoint::exact_htilde(model, subject, params, &st)
+        })
+        .flatten()
+        .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
     let bfgs_converged = inner_minimize_with_grad(
-        &obj, &agrad, &mut x, n_flat, max_iter, tol, None, None, None, &stall_at, false,
+        &obj,
+        &agrad,
+        &mut x,
+        n_flat,
+        max_iter,
+        tol,
+        None,
+        iov_seed.as_ref(),
+        None,
+        &stall_at,
+        false,
     );
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
@@ -4515,7 +4751,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
         // `mut` is only exercised by the non-Gaussian fold below.
         #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
-        let mut grad: Vec<f64> = prior_work.as_slice().to_vec();
+        let mut grad: Vec<f64> = crate::scratch::take_with_capacity(prior_work.len());
+        grad.extend_from_slice(prior_work.as_slice());
         #[cfg(feature = "survival")]
         fold_nongaussian(&mut grad);
         return Some(grad);
@@ -5374,7 +5611,7 @@ fn lbfgs_core(
             y_hist.push(y);
         }
 
-        g = g_new;
+        crate::scratch::give(std::mem::replace(&mut g, g_new));
     }
 
     false
@@ -5568,7 +5805,8 @@ fn dense_bfgs_core(
                 return true;
             }
             enable_stall = enable_stall || stall_at(x);
-            g = verified_g.take().unwrap_or_else(|| grad(x));
+            let g_next = verified_g.take().unwrap_or_else(|| grad(x));
+            crate::scratch::give(std::mem::replace(&mut g, g_next));
             continue;
         }
 
@@ -5638,7 +5876,7 @@ fn dense_bfgs_core(
             h_unshaped = false;
         }
 
-        g = g_new;
+        crate::scratch::give(std::mem::replace(&mut g, g_new));
     }
 
     false
@@ -5846,6 +6084,47 @@ const SCREEN_SD_MULT: f64 = 2.0;
 /// Least Ω⁻¹-metric distance from the incumbent η̂ at which a #2013 screen descent counts
 /// as a different mode.
 const SCREEN_MIN_OMEGA_DIST: f64 = 0.5;
+
+/// The #2013 screen's descents: one inner minimisation from each of [`screen_starts`]'
+/// points, in order. Reads neither the solve's incumbent nor its metric, so the two cold
+/// solves of `find_ebe_impl` share them (`find_ebe_solve`'s `screen_share`).
+#[allow(clippy::too_many_arguments)]
+fn screen_descents(
+    obj: &dyn Fn(&[f64]) -> f64,
+    agrad: &dyn Fn(&[f64]) -> Vec<f64>,
+    omega: &crate::types::OmegaMatrix,
+    n_eta: usize,
+    n: usize,
+    subject_id: &str,
+    max_iter: usize,
+    tol: f64,
+    precond: Option<&[f64]>,
+    stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool,
+) -> Vec<ScreenDescent> {
+    screen_starts(obj, omega, n_eta, n, subject_id)
+        .into_iter()
+        .map(|mut cand| {
+            let ok = inner_minimize_with_grad(
+                obj,
+                agrad,
+                &mut cand,
+                n_eta,
+                max_iter,
+                tol,
+                precond,
+                None,
+                stop_precond,
+                stall_at,
+                false,
+            );
+            cand.iter().all(|v| v.is_finite()).then(|| {
+                let v = obj(&cand);
+                (cand, ok, v)
+            })
+        })
+        .collect()
+}
 
 /// Starts the #2013 screen keeps: the [`SCREEN_TOP_K`] lowest of `n` Sobol points from
 /// `N(0, (SCREEN_SD_MULT)²·Ω)`, by `obj`, lowest first. A point whose objective is not
@@ -6312,12 +6591,15 @@ fn gradient_verified_step(
     g: &[f64],
     stop_precond: Option<&[f64]>,
 ) -> Verdict {
-    let cand: Vec<f64> = x.iter().zip(d).map(|(xi, di)| xi + di).collect();
+    let mut cand: Vec<f64> = crate::scratch::take_with_capacity(x.len());
+    cand.extend(x.iter().zip(d).map(|(xi, di)| xi + di));
     let fc = obj(&cand);
     if !(fc.is_finite() && fc <= f + INNER_FTOL_REL * (1.0 + f.abs())) {
+        crate::scratch::give(cand);
         return Verdict::Rejected(None);
     }
     let g_cand = grad(&cand);
+    crate::scratch::give(cand);
     let gc = grad_norm_metric(&g_cand, stop_precond);
     if gc.is_finite() && gc < 0.5 * grad_norm_metric(g, stop_precond) {
         Verdict::Verified(fc, g_cand)
@@ -6631,6 +6913,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send + Default>(
         max_iter,
         tol,
         prev_etas,
+        None,
         mu_k,
         min_obs,
         restarts,
@@ -6673,6 +6956,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
         max_iter,
         tol,
         prev_etas,
+        None,
         mu_k,
         min_obs,
         restarts,
@@ -6681,6 +6965,76 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
         cancel,
         finish_subject,
     )
+}
+
+/// [`run_inner_loop_warm_map_cached`] from **predicted** starts (#2549): `prev_etas` are the
+/// first-order predictions `η̂ + (dη̂/dx)·Δx` of the outer loop's warm-start predictor and
+/// `fallback_etas` the modes they were predicted from.
+///
+/// The prediction is the mode's exact first-order expansion, so on a smooth stretch of the
+/// trajectory every subject solves from it and this is the plain warm pass, bit for bit. A
+/// long line-search trial can still extrapolate a start out of its basin, where the
+/// solve fails outright from it ([`solve_failed`]: a hard reject or a non-finite
+/// objective); such a subject is solved again from its previous mode and keeps the lower
+/// objective. The retry is triggered by a failed solve, not by a bound on the step, so it
+/// changes nothing where the prediction works (#2549 review r2 #3).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: &[DVector<f64>],
+    fallback_etas: &[DVector<f64>],
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    policy: InnerSolvePolicy,
+    cancel: Option<&crate::cancel::CancelFlag>,
+    finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+    Vec<T>,
+) {
+    run_inner_loop_warm_map_impl(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        Some(prev_etas),
+        Some(fallback_etas),
+        mu_k,
+        min_obs,
+        restarts,
+        schedules,
+        policy,
+        cancel,
+        finish_subject,
+    )
+}
+
+/// Replace a predicted start whose objective `at_start` is not usable (not finite, or on the
+/// `SUBJECT_SENTINEL_NLL` rail) by the mode it was predicted from ([`find_ebe_cached_from`]).
+fn start_at_fallback_if_unusable(at_start: f64, eta: &mut [f64], fallback: &[f64]) {
+    if !crate::stats::likelihood::is_usable_subject_nll(at_start) {
+        eta.copy_from_slice(fallback);
+    }
+}
+
+/// Whether an inner solve failed outright from its start: hard-rejected there, or ending on
+/// an objective that is not usable (not finite, or on the `SUBJECT_SENTINEL_NLL` rail). Not
+/// an unconverged or Nelder–Mead-certified end: on an ODE model
+/// that is routinely the RK45 gradient-noise floor blocking `‖g‖ < tol` at a genuine mode
+/// (#555), so treating it as a failed start re-solved healthy predictions and changed the
+/// trajectory (`mm` 62 → 67 outer iterations, `ctmm_pd_2state` 130 → 145).
+fn solve_failed(ebe: &EbeResult) -> bool {
+    ebe.hard_reject || !crate::stats::likelihood::is_usable_subject_nll(ebe.nll)
 }
 
 /// What a subject skipped by a cooperative cancel reports in place of its EBE (#574).
@@ -6728,6 +7082,7 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
     max_iter: usize,
     tol: f64,
     prev_etas: Option<&[DVector<f64>]>,
+    fallback_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
     min_obs: usize,
     restarts: usize,
@@ -6780,9 +7135,35 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
                 Some(cache) => cache[i].as_ref(),
                 None => local_schedule.as_ref(),
             };
-            let ebe = find_ebe_cached(
+            let fallback = fallback_etas.map(|f| f[i].as_slice());
+            let mut ebe = find_ebe_cached_from(
                 model, subject, params, max_iter, tol, init, mu_k, restarts, schedule, policy,
+                fallback,
             );
+            // A predicted start that the solve fails from is solved again from the
+            // subject's previous mode, and the lower objective is kept (ties to the
+            // prediction) — see [`run_inner_loop_predicted_map_cached`].
+            if let Some(fallback) = fallback {
+                if init != Some(fallback) && solve_failed(&ebe) {
+                    let alt = find_ebe_cached(
+                        model,
+                        subject,
+                        params,
+                        max_iter,
+                        tol,
+                        Some(fallback),
+                        mu_k,
+                        restarts,
+                        schedule,
+                        policy,
+                    );
+                    // `!(a >= b)`: a non-finite objective from the prediction loses to
+                    // any finite one.
+                    if alt.nll.is_finite() && !(alt.nll >= ebe.nll) {
+                        ebe = alt;
+                    }
+                }
+            }
             let extra = finish_subject(subject, &ebe);
             (ebe, extra)
         })

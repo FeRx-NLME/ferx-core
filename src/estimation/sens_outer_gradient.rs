@@ -206,37 +206,82 @@ pub fn population_eta_dx(
         .collect()
 }
 
-/// Almquist Eq. 48 warm-start: `η⁰ᵢ = η̂ᵢ + Σₖ (dη̂ᵢ/dx_k)·(x_new−x_prev)_k`.
+/// The EBE warm start at `x_new` from the modes at `x_prev`: the mode map's first-order
+/// expansion `η̂ + (dη̂/dx)·(x_new − x_prev)` (Almquist Eq. 48), taken whole (#2549).
+///
+/// `dη̂/dx` is the exact derivative of the mode (implicit function theorem), so the start
+/// is accurate to second order in the outer step and the inner solve corrects the rest.
+/// Nothing is capped: every bound measured on the benchmark set lost iterations somewhere —
+/// a cap of two prior SDs (and, before #2549, an L2 cap of 2 on this function), or damping
+/// by the Newton decrement (which measures how far the mode moves, not how wrong its
+/// prediction is) — and choosing per evaluation between this start and the previous mode
+/// broke the start's smooth dependence on `x`, which is what makes the objective the outer
+/// optimizer sees smooth (`rtte` 18 → 35, `mm` 53 → 255 outer iterations). A start the
+/// inner solve then fails from is solved again from the mode by the fit's inner pass, a
+/// rescue that leaves every working prediction alone. A non-finite step leaves the mode, and
+/// a Jacobian column of the wrong length is skipped.
 pub fn predict_warm_etas(
     prev_etas: &[DVector<f64>],
     jacs: &[Vec<DVector<f64>>],
     x_prev: &[f64],
     x_new: &[f64],
 ) -> Vec<DVector<f64>> {
-    // Cap on the L2 norm of a single predicted η warm-start step. The inner solve
-    // re-refines from the warm start, so this only needs to keep it inside a sane
-    // region: on a large or ill-conditioned outer step the linear Eq.48
-    // extrapolation can overshoot the basin, and if the inner BFGS then hits
-    // max_iter it can land at a different mode, perturbing the reported OFV.
-    // η live on the O(1) random-effects scale, so ~2 (a few IIV SDs) rarely binds
-    // on a normal step but blocks a runaway one. PR #381 review finding #8.
-    const MAX_PREDICT_STEP_NORM: f64 = 2.0;
     prev_etas
         .iter()
         .zip(jacs.iter())
         .map(|(eta, jac)| {
-            let mut step = DVector::zeros(eta.len());
+            let mut start = eta.clone();
             for (k, jk) in jac.iter().enumerate() {
                 let dx = x_new[k] - x_prev[k];
-                if dx != 0.0 {
-                    step += jk * dx;
+                if dx != 0.0 && jk.len() == start.len() {
+                    start.axpy(dx, jk, 1.0);
                 }
             }
-            let norm = step.norm();
-            if norm > MAX_PREDICT_STEP_NORM {
-                step *= MAX_PREDICT_STEP_NORM / norm;
+            if start.iter().all(|v| v.is_finite()) {
+                start
+            } else {
+                eta.clone()
             }
-            eta + step
         })
         .collect()
+}
+
+#[cfg(test)]
+mod first_order_prediction_tests {
+    use super::predict_warm_etas;
+    use nalgebra::DVector;
+
+    /// The start is the mode map's first-order expansion, whole however long the step: a
+    /// mode that moves linearly in `x` is predicted exactly, at any distance.
+    #[test]
+    fn the_start_is_the_whole_first_order_expansion() {
+        let eta = vec![DVector::from_vec(vec![0.3, -0.1])];
+        let jac = vec![vec![
+            DVector::from_vec(vec![2.0, 0.0]),
+            DVector::from_vec(vec![0.5, -1.0]),
+        ]];
+        for scale in [1e-3, 1.0, 50.0] {
+            let p = predict_warm_etas(&eta, &jac, &[1.0, 2.0], &[1.0 + scale, 2.0 + scale]);
+            let want = [0.3 + 2.5 * scale, -0.1 - scale];
+            assert!(
+                (p[0][0] - want[0]).abs() < 1e-12 * (1.0 + want[0].abs()),
+                "{}",
+                p[0]
+            );
+            assert!(
+                (p[0][1] - want[1]).abs() < 1e-12 * (1.0 + want[1].abs()),
+                "{}",
+                p[0]
+            );
+        }
+    }
+
+    /// A non-finite response leaves the mode rather than starting the solve at `NaN`.
+    #[test]
+    fn a_non_finite_step_leaves_the_mode() {
+        let eta = vec![DVector::from_vec(vec![0.3, -0.1])];
+        let jac = vec![vec![DVector::from_vec(vec![f64::NAN, 1.0])]];
+        let p = predict_warm_etas(&eta, &jac, &[0.0], &[1.0]);
+        assert_eq!(p[0].as_slice(), &[0.3, -0.1]);
+    }
 }

@@ -1635,6 +1635,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
+                unseeded_iov_warm: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1699,6 +1700,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
+                unseeded_iov_warm: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1727,8 +1729,11 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
+                unseeded_iov_warm: false,
             },
             true,
+            None,
+            None,
         )
         .expect("premise: the seed is in scope on this fixture");
         assert_ne!(
@@ -1802,6 +1807,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         twin_seed: false,
         init_is_mode: false,
         keep_certified_start: false,
+        unseeded_iov_warm: false,
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)
@@ -1840,6 +1846,8 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
             schedule.as_ref(),
             policy(InnerHessianSeed::GaussNewton),
             true,
+            None,
+            None,
         )
         .expect("premise: the seed is in scope");
         assert!(
@@ -6701,4 +6709,112 @@ fn the_terminal_jacobian_from_the_last_gradient_is_the_fresh_one() {
             fresh
         );
     }
+}
+
+/// A predicted start whose objective is undefined starts at the mode it was predicted from,
+/// and a solve that fails outright is retried there (#2549 review r2 #3): the two decisions,
+/// on every kind of value the objective can report. A usable start is kept and a usable end
+/// is not a failure, so the fallback changes nothing where a prediction works.
+#[test]
+fn an_unusable_predicted_start_or_end_takes_the_mode() {
+    use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
+    let fallback = [0.1, -0.2];
+    for (at_start, replaced) in [
+        (f64::NAN, true),
+        (f64::INFINITY, true),
+        (SUBJECT_SENTINEL_NLL, true),
+        (2.0 * SUBJECT_SENTINEL_NLL, true),
+        (3.5e7, false),
+        (-24.07, false),
+    ] {
+        let mut eta = [40.0, 40.0];
+        start_at_fallback_if_unusable(at_start, &mut eta, &fallback);
+        assert_eq!(eta == fallback, replaced, "start objective {at_start:e}");
+        let end = EbeResult {
+            eta: DVector::from_vec(vec![0.0; 2]),
+            h_matrix: DMatrix::zeros(0, 2),
+            terminal_hessian: None,
+            converged: false,
+            used_fallback: true,
+            grad_norm: 1.0,
+            nll: at_start,
+            kappas: Vec::new(),
+            hard_reject: false,
+            screen_moved: false,
+            twin_moved: false,
+        };
+        // Unconverged and rescued by Nelder–Mead is not an outright failure (on an ODE model
+        // that is the gradient-noise floor at a genuine mode); only the objective decides.
+        assert_eq!(solve_failed(&end), replaced, "end objective {at_start:e}");
+        assert!(solve_failed(&EbeResult {
+            hard_reject: true,
+            nll: -24.07,
+            ..end
+        }));
+    }
+}
+
+/// The inner solve is robust to a wildly extrapolated predicted start (#2549 review r2 #3):
+/// from `η = ±1000` on one warfarin subject — far past any first-order step a line search
+/// makes — it returns the solve from the subject's mode, to rounding, with no Nelder–Mead
+/// recovery; the other subjects are bit-identical to the plain pass. So the prediction needs
+/// no bound for the inner solve's sake, and the fallback above is reserved for an objective
+/// that is undefined at the start.
+#[test]
+fn an_extrapolated_predicted_start_still_reaches_the_mode() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin parses");
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("data loads");
+    let params = &model.default_params;
+    let (modes, _, _, _) = run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, None, 0, 0);
+    let policy = InnerSolvePolicy::default();
+    let outcome = |_: &Subject, e: &EbeResult| {
+        (
+            e.used_fallback,
+            std::iter::once(e.nll)
+                .chain(e.eta.iter().copied())
+                .collect::<Vec<f64>>(),
+        )
+    };
+    let from_modes = run_inner_loop_warm_map(
+        &model,
+        &pop,
+        params,
+        500,
+        1e-8,
+        Some(&modes),
+        None,
+        0,
+        0,
+        policy,
+        None,
+        outcome,
+    )
+    .4;
+    let mut worst = 0.0f64;
+    for far in [-1e3, 1e3] {
+        let mut predicted = modes.clone();
+        predicted[2].fill(far);
+        let (_, _, _, _, got) = run_inner_loop_predicted_map_cached(
+            &model, &pop, params, 500, 1e-8, &predicted, &modes, None, 0, 0, None, policy, None,
+            outcome,
+        );
+        assert!(!got[2].0, "η = {far}: no Nelder–Mead recovery needed");
+        for (&a, &b) in got[2].1.iter().zip(&from_modes[2].1) {
+            assert!(a.is_finite() && b.is_finite(), "η = {far}: {a} vs {b}");
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+        }
+        for i in (0..pop.subjects.len()).filter(|&i| i != 2) {
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got[i].1), bits(&from_modes[i].1), "subject {i} moved");
+        }
+    }
+    eprintln!("extrapolated start vs the solve from the mode: {worst:.3e}");
+    // Measured 9.9e-14 (Linux x86_64): two converged searches of one mode, from different
+    // starts, stopped at `inner_tol = 1e-8`; 1e-10 leaves room for another path's rounding
+    // while a different mode would be O(1) away.
+    assert!(worst < 1e-10, "extrapolated start vs the mode: {worst:.3e}");
 }

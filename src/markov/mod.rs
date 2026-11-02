@@ -644,9 +644,19 @@ pub fn ctmm_inhomogeneous_transition_with_opts(
     // would only coincide for a generator that commutes across time (constant Q,
     // or a scalar-scaled Q(τ)=g(τ)·Q₀); it is wrong for a genuinely non-commuting
     // time-varying generator. `params` is unused — `q_at` captures what it needs.
+    // `P` and `P·Q` reuse two buffers across the stages (#2549): `mul_to` is the product
+    // `*` itself runs, so the values are the allocating form's.
+    let work = std::cell::RefCell::new((DMatrix::<f64>::zeros(s, s), DMatrix::<f64>::zeros(s, s)));
     let rhs = |u: &[f64], _params: &[f64], t: f64, du: &mut [f64]| {
-        let p = DMatrix::from_row_slice(s, s, u);
-        let dp = p * q_at(t);
+        let q = q_at(t);
+        let mut w = work.borrow_mut();
+        let (p, dp) = &mut *w;
+        for i in 0..s {
+            for j in 0..s {
+                p[(i, j)] = u[i * s + j];
+            }
+        }
+        p.mul_to(&q, dp);
         for i in 0..s {
             for j in 0..s {
                 du[i * s + j] = dp[(i, j)];

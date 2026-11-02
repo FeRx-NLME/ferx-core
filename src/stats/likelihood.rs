@@ -675,13 +675,19 @@ pub(crate) fn accumulate_non_gaussian_nll(
             hazard, recurrence, ..
         } = endpoint
         {
-            let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                .obs_records
-                .iter()
-                .filter(|r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt))
-                .cloned()
-                .collect();
+            // A pooled buffer (#2549): this runs on every inner objective evaluation.
+            let mut records_for_cmt: Vec<crate::types::ObsRecord> = crate::scratch::take();
+            records_for_cmt.extend(
+                subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned(),
+            );
             if records_for_cmt.is_empty() {
+                crate::scratch::give(records_for_cmt);
                 continue; // subject has no records for this TTE CMT
             }
             let raw = tte_endpoint_nll_visit(
@@ -696,6 +702,7 @@ pub(crate) fn accumulate_non_gaussian_nll(
                 &mut |_| {},
             );
             *acc += factor * raw;
+            crate::scratch::give(records_for_cmt);
         }
     }
     // Discrete families (binary today; ordinal/Poisson/… later) — one add, matching the TTE terms.
@@ -1984,13 +1991,19 @@ fn non_gaussian_mode_terms(
             ..
         } = endpoint
         {
-            let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                .obs_records
-                .iter()
-                .filter(|r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt))
-                .cloned()
-                .collect();
+            // A pooled buffer (#2549): this runs on every inner objective evaluation.
+            let mut records_for_cmt: Vec<crate::types::ObsRecord> = crate::scratch::take();
+            records_for_cmt.extend(
+                subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned(),
+            );
             if records_for_cmt.is_empty() {
+                crate::scratch::give(records_for_cmt);
                 continue; // subject has no records for this TTE CMT
             }
             // Closure that evaluates the TTE NLL at a given eta vector — re-solving
@@ -2063,6 +2076,7 @@ fn non_gaussian_mode_terms(
                     }
                 };
             }
+            crate::scratch::give(records_for_cmt);
         }
     }
 
@@ -4715,6 +4729,25 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
     )
 }
 
+/// `vᵀ·M·v` with `M·v` formed by nalgebra's own matrix–vector kernel into a pooled buffer,
+/// then nalgebra's `dot`: the same kernels, in the same order, as
+/// `DVector::from_column_slice(v).dot(&(m * &DVector::from_column_slice(v)))`, without the
+/// two vectors that expression allocates per call (#2549 W1). Pinned bit for bit by
+/// `quad_form_is_the_allocating_expression_bit_for_bit`.
+pub(crate) fn quad_form(m: &DMatrix<f64>, v: &[f64]) -> f64 {
+    let n = v.len();
+    let mut tmp = crate::scratch::take_with_capacity(n);
+    tmp.resize(n, 0.0);
+    let vv = nalgebra::DVectorView::from_slice(v, n);
+    let r = {
+        let mut tv = nalgebra::DVectorViewMut::from_slice(&mut tmp, n);
+        m.mul_to(&vv, &mut tv);
+        vv.dot(&tv)
+    };
+    crate::scratch::give(tmp);
+    r
+}
+
 /// [`individual_nll_iov_frozen`] over a caller-built `layout`
 /// ([`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of)),
 /// so the EBE search builds the subject's layout once rather than once per objective
@@ -4745,8 +4778,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     // BSV eta prior
     let omega_inv = &omega.inv;
     let log_det_omega = omega.log_det;
-    let eta_vec = DVector::from_column_slice(eta);
-    let eta_prior = eta_vec.dot(&(omega_inv * &eta_vec));
+    let eta_prior = quad_form(omega_inv, eta);
 
     // Kappa priors and IOV log-det
     let Some(iov) = omega_iov else {
@@ -4774,8 +4806,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
         None => {
             let mut kappa_prior = 0.0;
             for kap in kappas {
-                let kap_vec = DVector::from_column_slice(kap.as_ref());
-                kappa_prior += kap_vec.dot(&(iov_inv * &kap_vec));
+                kappa_prior += quad_form(iov_inv, kap.as_ref());
             }
             let k_occasions = kappas.len();
             (kappa_prior, (k_occasions as f64) * log_det_iov)
@@ -9613,5 +9644,36 @@ mod negative_prediction_tests {
             nll >= SUBJECT_SENTINEL_NLL,
             "NaN prediction must hit the 1e20 sentinel; got {nll}"
         );
+    }
+}
+
+#[cfg(test)]
+mod quad_form_tests {
+    use super::quad_form;
+    use nalgebra::{DMatrix, DVector};
+
+    /// #2549 W1: `quad_form` is the allocating `v.dot(&(M * &v))` bit for bit, on dense
+    /// symmetric matrices of every size the estimators use, with values spanning many
+    /// magnitudes so a different summation order would show.
+    #[test]
+    fn quad_form_is_the_allocating_expression_bit_for_bit() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let u = (state >> 11) as f64 / (1u64 << 53) as f64;
+            (u - 0.5) * 10f64.powi(((state >> 3) % 7) as i32 - 3)
+        };
+        for n in 1..=24 {
+            for _ in 0..20 {
+                let a = DMatrix::from_fn(n, n, |_, _| next());
+                let m = &a * a.transpose();
+                let v: Vec<f64> = (0..n).map(|_| next()).collect();
+                let dv = DVector::from_column_slice(&v);
+                let want = dv.dot(&(&m * &dv));
+                assert_eq!(quad_form(&m, &v).to_bits(), want.to_bits(), "n = {n}");
+            }
+        }
     }
 }

@@ -8114,6 +8114,9 @@ mod parameter_prior_check_tests;
 #[cfg(all(test, feature = "nn"))]
 #[path = "tests/nn_bare_output_start_tests.rs"]
 mod nn_bare_output_start_tests;
+#[cfg(all(test, feature = "nn"))]
+#[path = "tests/nn_input_scale_tests.rs"]
+mod nn_input_scale_tests;
 
 /// Reject a `prior(...)` declaration that cannot be applied (#254).
 ///
@@ -9942,6 +9945,81 @@ pub(crate) fn check_nn_bare_output_start(model: &CompiledModel, theta: &[f64]) -
     diags
 }
 
+/// `W_NN_UNSCALED_INPUT` (#2549): a `[covariate_nn]` input whose values in the data reach,
+/// after the block's own `center`/`scale`, a magnitude that saturates a hidden unit by itself
+/// at the first layer's initial weight scale. With Glorot weights of scale
+/// `a = √(6 / (fan_in + fan_out))` a pre-activation past `3` puts `tanh` (and the sigmoid,
+/// twice as wide) where its derivative is below 1e-2, so an input past `3 / a` does it alone.
+/// There the layer is nearly blind to its input, and which optimum a fit reaches depends on
+/// the path to it: on `examples/warfarin_dcm.ferx` without normalisation, starts perturbed by
+/// 1e-6 ended at OFV −164 or −1173 depending only on the inner warm-start strategy. Saturating
+/// hidden activations only; one warning per block, naming every such input.
+#[cfg(feature = "nn")]
+pub(crate) fn check_nn_input_scale(
+    model: &CompiledModel,
+    population: &crate::types::Population,
+) -> Vec<Diagnostic> {
+    use crate::nn::Activation;
+    let mut diags = Vec::new();
+    for nn in &model.covariate_nns {
+        let mlp = nn.mapper.mlp();
+        let width = match mlp.hidden_activation() {
+            Activation::Tanh => 3.0,
+            Activation::Sigmoid => 6.0,
+            _ => continue,
+        };
+        let sizes = mlp.layer_sizes();
+        if sizes.len() < 3 {
+            continue;
+        }
+        let a = (6.0 / (sizes[0] + sizes[1]) as f64).sqrt();
+        let bound = width / a;
+        let (center, scale) = (nn.mapper.input_center(), nn.mapper.input_scale());
+        let mut flagged: Vec<String> = Vec::new();
+        for (i, name) in nn.mapper.input_names().iter().enumerate() {
+            // Every value the network can be handed: the subject-static covariates and each
+            // record's own snapshot (a time-varying input is read per record). A missing value
+            // (non-finite in the data) is not an input; `scale` is finite and non-zero by
+            // construction (the block is refused at parse otherwise, `NnError`), so a finite
+            // value has a finite `z`.
+            let worst = population
+                .subjects
+                .iter()
+                .flat_map(|s| {
+                    std::iter::once(&s.covariates)
+                        .chain((0..s.obs_times.len()).map(|j| s.obs_cov(j)))
+                        .chain((0..s.doses.len()).map(|k| s.dose_cov(k)))
+                        .chain((0..s.pk_only_times.len()).map(|m| s.pk_only_cov(m)))
+                })
+                .filter_map(|c| c.get(name).copied())
+                .filter(|x| x.is_finite())
+                .map(|x| ((x - center[i]) / scale[i]).abs())
+                .fold(0.0f64, f64::max);
+            if worst > bound {
+                flagged.push(format!("{name} (|z| up to {worst:.3})"));
+            }
+        }
+        if flagged.is_empty() {
+            continue;
+        }
+        diags.push(Diagnostic::warning(
+            "W_NN_UNSCALED_INPUT",
+            format!(
+                "W_NN_UNSCALED_INPUT: [covariate_nn {name}] input {list} reaches past \
+                 {bound:.3} after the block's center/scale, where one input alone saturates \
+                 a {act} unit at the first layer's initial weight scale. A saturated layer \
+                 barely learns, and which optimum the fit reaches can then depend on the path \
+                 to it. Declare `center` and `scale` in the block (the input's mean and SD, \
+                 or its range) so the inputs land within a few units of 0.",
+                name = nn.name,
+                list = flagged.join(", "),
+                act = mlp.hidden_activation().as_str(),
+            ),
+        ));
+    }
+    diags
+}
+
 /// Map a free-text parse **warning** to its check-report code.
 ///
 /// Warning sibling of [`parse_error_to_diagnostic`], and split out of
@@ -10506,6 +10584,10 @@ pub fn validate_model_file_with(
                         &population,
                         &init_params,
                     ));
+                    // A `[covariate_nn]` input the data saturate (#2549): `fit()` reports it
+                    // from the same check, so a clean `ferx check --data` and a fit agree.
+                    #[cfg(feature = "nn")]
+                    diags.extend(check_nn_input_scale(&parsed.model, &population));
                     // One informational row per nested level (#2035); `fit()` does not
                     // record it.
                     diags.extend(check_level_summary(&parsed.model, &population));
