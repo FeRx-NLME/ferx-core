@@ -1015,15 +1015,6 @@ fn numerical_mstep_scope_gap(
     None
 }
 
-/// Apply the same re-centring a closed-form mu-reference shift makes to
-/// `state.etas` to the stored previous draws of the K-draw M-step objective
-/// (#1458).
-///
-/// The shift keeps `g(P_i) = g(TVP) + eta_i` after `log TVP` moves by `delta`,
-/// so a stored draw that is *not* shifted stops describing the individual
-/// parameters it was drawn for, and the averaged objective would then mix
-/// values of `P_i` from two different parameterisations. `draws` is empty on
-/// every default fit, so this is a no-op there.
 /// One mu-referenced θ's closed-form SAEM shift: moves the packed θ by `γ·mean(η)` on its
 /// mu scale, clamped to its packed `bounds`, then re-centres every η — the current draw and
 /// the extra draws — by the change it **realised**. Not by `γ·mean(η)`: when the clamp bites
@@ -1062,6 +1053,15 @@ fn closed_form_mu_shift(
     recentre_eta_draws(extra_eta_draws, eta_idx, delta);
 }
 
+/// Apply the same re-centring a closed-form mu-reference shift makes to
+/// `state.etas` to the stored previous draws of the K-draw M-step objective
+/// (#1458).
+///
+/// The shift keeps `g(P_i) = g(TVP) + eta_i` after `log TVP` moves by `delta`,
+/// so a stored draw that is *not* shifted stops describing the individual
+/// parameters it was drawn for, and the averaged objective would then mix
+/// values of `P_i` from two different parameterisations. `draws` is empty on
+/// every default fit, so this is a no-op there.
 fn recentre_eta_draws(draws: &mut [Vec<Vec<f64>>], eta_idx: usize, delta: f64) {
     if delta == 0.0 {
         return;
@@ -3641,15 +3641,13 @@ pub(crate) enum NoClassMoveCause {
     IdentityPacked(Vec<String>),
 }
 
-/// The warning for a class-switched value whose class SAEM cannot move (#2458).
-///
-/// The bias it states is the one measured on `tests/nonmem/mixture_iv.csv`
-/// with the orbit move off (10 seeds at `54c86f15`): `TVCL2` 3.1439 vs
-/// NONMEM IMPMAP 2.8193, +11.5 %, and `p(1)` 0.5394 against a 16/30 start.
 /// The advisory for additive mu-referenced typical values under a `[mixture]` (#2548): they
 /// take SAEM's natural-scale closed-form shift only in a single-population fit (#2540), since
 /// the class-aware mixture shift has no additive arm, so here they stay on the numerical
-/// M-step — the ridge #2540 measured — with nothing else saying so.
+/// M-step — the ridge #2540 measured — with nothing else saying so. The remedy names the
+/// non-negative lower bound because a log-normal θ with a negative one is identity-packed and
+/// stays numerical too (`classify_mixture_mu_ref_pairs`, #996). It names FOCEI as the check
+/// because IMP/IMPMAP put an additive θ on a numerical M-step as well.
 pub(crate) fn mixture_additive_mu_ref_warning(names: &[&str]) -> String {
     format!(
         "SAEM: the additive mu-referenced typical value(s) {} (`P = θ + η`) are estimated by \
@@ -3657,12 +3655,17 @@ pub(crate) fn mixture_additive_mu_ref_warning(names: &[&str]) -> String {
          additive typical value runs only in a single-population fit; the class-aware \
          mixture shift has no additive arm yet. On a single population that numerical \
          M-step stopped 1–11 OFV above the maximum likelihood (#2540). Check these values \
-         against an IMP/IMPMAP or FOCEI fit, or write the parameter log-normal \
-         (`P = θ·exp(η)`), which the mixture shift covers (#2548).",
+         against a FOCEI fit, or write the parameter log-normal (`P = θ·exp(η)`) with a \
+         non-negative lower bound, which the mixture shift covers (#2548).",
         names.join(", ")
     )
 }
 
+/// The warning for a class-switched value whose class SAEM cannot move (#2458).
+///
+/// The bias it states is the one measured on `tests/nonmem/mixture_iv.csv`
+/// with the orbit move off (10 seeds at `54c86f15`): `TVCL2` 3.1439 vs
+/// NONMEM IMPMAP 2.8193, +11.5 %, and `p(1)` 0.5394 against a 16/30 start.
 pub(crate) fn no_class_move_warning(names: &[&str], cause: &NoClassMoveCause) -> String {
     let (reason, advice) = match cause {
         NoClassMoveCause::MuReferencingOff => (
@@ -7757,11 +7760,14 @@ mod tests {
             "runs only in a single-population fit",
             "the class-aware mixture shift has no additive arm yet",
             "stopped 1–11 OFV above the maximum likelihood (#2540)",
-            "against an IMP/IMPMAP or FOCEI fit",
-            "(`P = θ·exp(η)`), which the mixture shift covers (#2548)",
+            "against a FOCEI fit",
+            "(`P = θ·exp(η)`) with a non-negative lower bound",
+            "which the mixture shift covers (#2548)",
         ] {
             assert!(w.contains(part), "missing {part:?} in {w}");
         }
+        // IMP/IMPMAP share the limit, so the message must not offer them as the check.
+        assert!(!w.contains("IMP"), "offers IMP/IMPMAP as the check: {w}");
     }
 
     fn switched_warning(res: &crate::types::FitResult) -> Option<&String> {

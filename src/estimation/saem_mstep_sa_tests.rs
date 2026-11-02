@@ -728,8 +728,10 @@ fn the_mu_shift_keeps_phi_at_a_bound() {
             }
         };
         let bounds = (to_packed(0.5), to_packed(10.0));
-        // mean η 2.0 (additive) / 0.5 (log): both carry θ past the bound from 9.5.
-        let eta_mean = if additive { 2.0 } else { 0.5 };
+        // mean η 2.0 (additive) / 1.0 (log): both carry θ past the bound from 9.5. Realised
+        // change from 9.5 is 0.5 (additive) / ln(10/9.5) = 0.051 (log), so the straddle
+        // below clears its 0.4 bar by ≥ 0.55 in every case.
+        let eta_mean = if additive { 2.0 } else { 1.0 };
         for start in [9.5, 10.0] {
             let mut packed = to_packed(start);
             let mut etas: Vec<Vec<f64>> = [-1.0, 0.0, 1.0]
