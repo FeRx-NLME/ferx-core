@@ -226,6 +226,9 @@ static LEGACY_KAPPA_SLICE_ALLOCATION: std::sync::atomic::AtomicBool =
 pub(crate) struct PopulationEvaluation {
     pub(crate) nll: f64,
     gradient: Option<Vec<f64>>,
+    /// Each subject's mode response `dη̂ᵢ/dx`, when asked for (the EBE warm-start predictor,
+    /// #2549); `None` for a subject it does not reach.
+    eta_dx: Option<Vec<Option<Vec<nalgebra::DVector<f64>>>>>,
     /// How each subject's score was formed, in subject order (for the outer FD-fallback
     /// warning).
     routes: Vec<ScoreRoute>,
@@ -576,6 +579,20 @@ pub(crate) fn agq_subject_nll(
     )
 }
 
+/// AGQ's grid scale from its anchor Hessian `h`: `chol(h)` itself when `h` is
+/// positive-definite, so the one-node rule is the Laplace approximation `l(η̂) + ½log|h|`
+/// with no jitter in it (#2538); otherwise [`build_proposal`]'s jittered anchor, then its
+/// prior-scale fallback. `build_proposal` keeps the jitter for its importance-sampling
+/// callers, whose proposal is a sampling density, not part of the objective.
+pub(crate) fn agq_proposal(
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    d: usize,
+) -> Option<crate::estimation::importance_sampling::Proposal> {
+    crate::estimation::importance_sampling::Proposal::from_precision(h, d)
+        .or_else(|| build_proposal(h, omega_inv, d))
+}
+
 /// Same as the body [`agq_subject_nll`] delegates to, but `schedule` is now a caller-supplied
 /// parameter instead of a fresh [`cacheable_schedule`] rebuild on every call — see
 /// [`crate::estimation::inner_optimizer::build_schedule_cache`]. It depends only on
@@ -634,12 +651,12 @@ fn agq_subject_evaluate(
         // `check_model_options`, so this is only reachable if that guard is bypassed).
         return SUBJECT_SENTINEL_NLL;
     };
-    // `build_proposal` applies the relative jitter and — if the FD Hessian came back
-    // indefinite (a loosely-converged mode, a flat direction) — falls back to the prior-scale
-    // factor (`Ω`, or the block-diagonal `Ω_joint` under IOV). That fallback keeps AGQ
-    // *consistent* (any invertible scale integrates to the same limit); it only costs
-    // nodes-worth of efficiency, which is the right failure mode.
-    let Some(proposal) = build_proposal(&h, &stack.omega_joint_inv, d) else {
+    // The anchor itself when it factorises, so one node is Laplace exactly (#2538); the
+    // jittered anchor and then the prior-scale factor (`Ω`, or the block-diagonal `Ω_joint`
+    // under IOV) only when it does not (a loosely-converged mode, a flat direction). Those
+    // fallbacks keep AGQ *consistent* (any invertible scale integrates to the same limit);
+    // they only cost nodes-worth of efficiency, which is the right failure mode.
+    let Some(proposal) = agq_proposal(&h, &stack.omega_joint_inv, d) else {
         return SUBJECT_SENTINEL_NLL;
     };
 
@@ -786,6 +803,45 @@ pub(crate) fn agq_subject_objective_anchored(
     )
 }
 
+/// One subject's term of [`agq_population_nll`] at its joint mode `(η̂, κ̂)`: the same
+/// stacked mode, rule and [`agq_subject_evaluate`] call as the population sum, with no
+/// hoisted schedule or retained Hessian, so a caller summing it over subjects reproduces
+/// [`agq_population_nll`] term for term. The profile solve scores each subject with it
+/// under `laplace` (#2107).
+pub(crate) fn agq_subject_term(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    kappas: &[nalgebra::DVector<f64>],
+    n_nodes: usize,
+    anchor: HessianAnchor,
+) -> f64 {
+    let (nodes, weights, cached_log_weights) = cached_gauss_hermite(n_nodes);
+    let uncached_log_weights;
+    let log_weights = if cached_log_weights_enabled() {
+        cached_log_weights
+    } else {
+        uncached_log_weights = weights.iter().map(|w| w.ln()).collect::<Vec<_>>();
+        &uncached_log_weights
+    };
+    let stack = Stack::new(model, params, kappas.len());
+    let b_hat = stack_mode(eta_hat, kappas);
+    agq_subject_evaluate(
+        model,
+        subject,
+        params,
+        &stack,
+        &b_hat,
+        nodes,
+        log_weights,
+        anchor,
+        None,
+        None,
+        None,
+    )
+}
+
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
 /// OFV, exactly as it does `crate::estimation::outer_optimizer::pop_nll`.
 ///
@@ -906,10 +962,23 @@ pub(crate) fn agq_population_evaluate(
     options: &crate::types::FitOptions,
     n_nodes: usize,
     anchor: HessianAnchor,
+    want_eta_dx: bool,
 ) -> PopulationEvaluation {
     agq_population_evaluate_impl(
-        model, population, params, template, x, eta_hats, kappas, bounds, options, n_nodes, anchor,
-        None, None,
+        model,
+        population,
+        params,
+        template,
+        x,
+        eta_hats,
+        kappas,
+        bounds,
+        options,
+        n_nodes,
+        anchor,
+        None,
+        None,
+        want_eta_dx,
     )
 }
 
@@ -931,6 +1000,7 @@ pub(crate) fn agq_population_evaluate_with_schedules(
     anchor: HessianAnchor,
     schedules: &[Option<pk::event_driven::EventSchedule>],
     terminal_work: &[TerminalLaplaceWork],
+    want_eta_dx: bool,
 ) -> PopulationEvaluation {
     agq_population_evaluate_impl(
         model,
@@ -946,6 +1016,7 @@ pub(crate) fn agq_population_evaluate_with_schedules(
         anchor,
         Some(schedules),
         Some(terminal_work),
+        want_eta_dx,
     )
 }
 
@@ -964,12 +1035,19 @@ fn agq_population_evaluate_impl(
     anchor: HessianAnchor,
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
     terminal_work: Option<&[TerminalLaplaceWork]>,
+    // Whether each subject's mode response `dη̂ᵢ/dx` is formed with its score (#2549).
+    want_eta_dx: bool,
 ) -> PopulationEvaluation {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
     let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
 
-    let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>)> = population
+    #[allow(clippy::type_complexity)]
+    let per_subject: Vec<(
+        f64,
+        Option<(Vec<f64>, ScoreRoute)>,
+        Option<Vec<nalgebra::DVector<f64>>>,
+    )> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -997,14 +1075,20 @@ fn agq_population_evaluate_impl(
                 None,
                 terminal_work.map(|all| all[i].1),
             );
-            let score = context.score_routed(subject, eta_hats[i].as_slice(), subj_kappas, true);
-            (nll, score)
+            let (score, dx) = context.score_routed_with_eta_dx(
+                subject,
+                eta_hats[i].as_slice(),
+                subj_kappas,
+                true,
+                want_eta_dx,
+            );
+            (nll, score, dx)
         })
         .collect();
-    let nll = per_subject.iter().map(|(nll, _)| nll).sum();
+    let nll = per_subject.iter().map(|(nll, _, _)| nll).sum();
     let gradient = per_subject.iter().try_fold(
         vec![0.0; x.len()],
-        |mut result, (_, score)| -> Option<Vec<f64>> {
+        |mut result, (_, score, _)| -> Option<Vec<f64>> {
             for (out, g) in result.iter_mut().zip(&score.as_ref()?.0) {
                 *out += 2.0 * g;
             }
@@ -1013,12 +1097,14 @@ fn agq_population_evaluate_impl(
     );
     let routes = per_subject
         .iter()
-        .map(|(_, s)| s.as_ref().map_or(ScoreRoute::Reconverged, |s| s.1))
+        .map(|(_, s, _)| s.as_ref().map_or(ScoreRoute::Reconverged, |s| s.1))
         .collect();
+    let eta_dx = want_eta_dx.then(|| per_subject.into_iter().map(|(_, _, dx)| dx).collect());
     PopulationEvaluation {
         nll,
         gradient,
         routes,
+        eta_dx,
     }
 }
 
@@ -1182,14 +1268,33 @@ impl<'a> SubjectScoreContext<'a> {
         kappas: &[nalgebra::DVector<f64>],
         held_ok: bool,
     ) -> Option<(Vec<f64>, ScoreRoute)> {
+        self.score_routed_with_eta_dx(subject, eta, kappas, held_ok, false)
+            .0
+    }
+
+    /// [`Self::score_routed`], and with `want_eta_dx` the subject's mode response
+    /// `dη̂/dx` from the same adjoint pass (exact route only; #2549).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn score_routed_with_eta_dx(
+        &self,
+        subject: &Subject,
+        eta: &[f64],
+        kappas: &[nalgebra::DVector<f64>],
+        held_ok: bool,
+        want_eta_dx: bool,
+    ) -> (
+        Option<(Vec<f64>, ScoreRoute)>,
+        Option<Vec<nalgebra::DVector<f64>>>,
+    ) {
         if crate::cancel::is_cancelled(&self.options.cancel) {
-            return None;
+            return (None, None);
         }
         let joint_warm = stack_mode(eta, kappas);
         if !self.force_fd {
             // The adjoint (any node count, either anchor): the exact `dFᵢ/dx`.
             use crate::sens::ode_provider::adjoint::{
-                subject_adjoint_gradient_at, subject_adjoint_held_ebe_score_at, Objective,
+                subject_adjoint_gradient_and_eta_dx_at, subject_adjoint_gradient_at,
+                subject_adjoint_held_ebe_score_at, Objective,
             };
             let objective = Objective::Agq {
                 n_agq: self.nodes.len(),
@@ -1209,21 +1314,31 @@ impl<'a> SubjectScoreContext<'a> {
             };
             if let Some(pt) = &self.point {
                 let b = &joint_warm[..];
-                let exact = subject_adjoint_gradient_at(self.model, subject, pt, b, objective);
+                let (exact, dx) = if want_eta_dx {
+                    subject_adjoint_gradient_and_eta_dx_at(self.model, subject, pt, b, objective)
+                } else {
+                    (
+                        subject_adjoint_gradient_at(self.model, subject, pt, b, objective),
+                        None,
+                    )
+                };
                 if let Some(g) = accept(exact) {
-                    return Some((g, ScoreRoute::Exact));
+                    return (Some((g, ScoreRoute::Exact)), dx);
                 }
                 if held_ok && self.model.n_kappa == 0 {
                     let held =
                         subject_adjoint_held_ebe_score_at(self.model, subject, pt, b, objective);
                     if let Some(g) = accept(held) {
-                        return Some((g, ScoreRoute::HeldEbe));
+                        return (Some((g, ScoreRoute::HeldEbe)), None);
                     }
                 }
             }
         }
-        self.finite_difference_score(subject, &joint_warm)
-            .map(|g| (g, ScoreRoute::Reconverged))
+        (
+            self.finite_difference_score(subject, &joint_warm)
+                .map(|g| (g, ScoreRoute::Reconverged)),
+            None,
+        )
     }
 
     fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
@@ -1312,6 +1427,9 @@ pub(crate) fn population_gradient_mixed(
     force_fd: bool,
     evaluation: Option<PopulationEvaluation>,
     declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
+    // The mode response's destination, for the EBE warm-start predictor (#2549): filled
+    // from a fused `evaluation` that formed it, else from this pass's scores.
+    eta_dx: Option<&mut Option<Vec<Vec<nalgebra::DVector<f64>>>>>,
 ) -> Option<Vec<f64>> {
     if let Some(evaluation) = evaluation {
         if let Some(log) = declines {
@@ -1319,24 +1437,31 @@ pub(crate) fn population_gradient_mixed(
                 route.record(log, i);
             }
         }
+        if let (Some(slot), Some(per)) = (eta_dx, evaluation.eta_dx) {
+            *slot = Some(assemble_eta_dx(per, eta_hats, x.len()));
+        }
         return evaluation.gradient;
     }
+    let want_eta_dx = eta_dx.is_some();
     let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
     let scores: Vec<_> = population
         .subjects
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            context.score_routed(
+            context.score_routed_with_eta_dx(
                 subject,
                 eta_hats[i].as_slice(),
                 kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
                 true,
+                want_eta_dx,
             )
         })
         .collect();
     let mut result = vec![0.0; x.len()];
-    for (i, score) in scores.into_iter().enumerate() {
+    let mut per = Vec::with_capacity(scores.len());
+    for (i, (score, dx)) in scores.into_iter().enumerate() {
+        per.push(dx);
         let (score, route) = score?;
         if let Some(log) = declines {
             route.record(log, i);
@@ -1345,7 +1470,27 @@ pub(crate) fn population_gradient_mixed(
             *out += 2.0 * g;
         }
     }
+    if let Some(slot) = eta_dx {
+        *slot = Some(assemble_eta_dx(per, eta_hats, x.len()));
+    }
     result.iter().all(|v| v.is_finite()).then_some(result)
+}
+
+/// The population's mode response from each subject's: a subject the response does not
+/// reach (declined, a held or finite-difference score, a singular inner Hessian) is
+/// predicted not to move, as under FOCE(I).
+fn assemble_eta_dx(
+    per: Vec<Option<Vec<nalgebra::DVector<f64>>>>,
+    eta_hats: &[nalgebra::DVector<f64>],
+    np: usize,
+) -> Vec<Vec<nalgebra::DVector<f64>>> {
+    per.into_iter()
+        .zip(eta_hats)
+        .map(|(dx, e)| {
+            dx.filter(|c| c.len() == np && c.iter().all(|v| v.len() == e.len()))
+                .unwrap_or_else(|| vec![nalgebra::DVector::zeros(e.len()); np])
+        })
+        .collect()
 }
 
 /// Packed gradient of the AGQ **OFV** (`2 · Σᵢ Fᵢ`), or `None` if a complete finite gradient
@@ -1602,6 +1747,7 @@ mod tests {
                 &options,
                 3,
                 anchor,
+                false,
             );
             let terms_only =
                 agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
@@ -1625,6 +1771,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             )
             .expect("uncached gradient");
             let fused = population_gradient_mixed(
@@ -1638,6 +1785,7 @@ mod tests {
                 &options,
                 false,
                 Some(evaluation),
+                None,
                 None,
             )
             .expect("fused gradient");
@@ -1837,20 +1985,14 @@ mod tests {
     /// tests pin the *Exact*-anchor AGQ(1) against NONMEM `LAPLACIAN`, which is the other
     /// anchor, and the `d == 0` degenerate case.
     ///
-    /// The residual is **not zero**, and the reason is load-bearing for the derivative work:
-    /// `build_proposal` regularises with a per-dimension relative jitter
-    /// `Λᵢᵢ = max(1e-6·|Hᵢᵢ|, 1e-10)`, so the objective's log-determinant term is
-    /// `½log|H̃ + Λ|`, not `½log|H̃|`. To first order the gap is `½·1e-6·tr((H̃+Λ)⁻¹diag|H̃|)`,
-    /// i.e. `~½·1e-6·d` — small, but a *systematic* offset, not noise. Any "exact" analytic
-    /// derivative of this objective must therefore differentiate `H̃ + Λ`; differentiating
-    /// `H̃` alone would be wrong at the same relative order and would show up as a
-    /// consistent bias no amount of step-size tuning removes.
-    ///
-    /// The assertion is two-sided on purpose: an upper bound catches the identity breaking,
-    /// and a lower bound catches the jitter silently disappearing (which would make a future
-    /// `H̃`-only derivative look correct here while being wrong in general).
+    /// The residual was not zero before #2538: `build_proposal` regularises with a
+    /// per-dimension relative jitter `Λᵢᵢ = max(1e-6·|Hᵢᵢ|, 1e-10)`, and the one-node rule
+    /// took `½log|H̃ + Λ|`, a systematic `~½·1e-6·d` above FOCEI's `½log|H̃|`. The anchor is
+    /// now factored unjittered whenever it is positive-definite (`agq_proposal`), so the
+    /// two are the same number up to rounding. The bound sits below the old offset, so the
+    /// jitter coming back turns this red.
     #[test]
-    fn agq_one_node_gauss_newton_is_the_focei_marginal_up_to_the_proposal_jitter() {
+    fn agq_one_node_gauss_newton_is_the_focei_marginal() {
         use crate::estimation::inner_optimizer::find_ebe;
         use crate::stats::likelihood::foce_subject_nll;
 
@@ -1917,7 +2059,7 @@ mod tests {
             schedule.as_ref(),
         )
         .expect("gauss-newton anchor in scope");
-        let proposal = build_proposal(&h_anchor, &stack.omega_joint_inv, d).expect("proposal");
+        let proposal = agq_proposal(&h_anchor, &stack.omega_joint_inv, d).expect("proposal");
         let laplace_closed_form = nll_at_mode + 0.5 * proposal.log_det_inv_scale;
         assert!(
             (agq - laplace_closed_form).abs() < 1e-12,
@@ -1927,22 +2069,13 @@ mod tests {
 
         let gap = (agq - focei).abs();
 
-        // Upper bound: a few times the first-order jitter estimate `½·1e-6·d`. Anything
-        // larger means the two are no longer the same marginal.
+        // The jitter's first-order offset was `½·1e-6·d` (1.5e-6 here); measured now: 0.0,
+        // the two spellings agree bit for bit. The bound leaves rounding room only.
         let jitter_scale = 0.5e-6 * d as f64;
         assert!(
-            gap < 20.0 * jitter_scale,
+            gap < 1e-12,
             "AGQ(1, GaussNewton) must be the FOCEI marginal: agq={agq}, focei={focei}, \
-             gap={gap:.3e}, expected < {:.3e}",
-            20.0 * jitter_scale
-        );
-        // Lower bound: the jitter is really there. If this trips, `build_proposal` stopped
-        // regularising and the derivative work below can drop its `Λ` terms.
-        assert!(
-            gap > 1e-9,
-            "expected a non-zero proposal-jitter offset, got gap={gap:.3e} — if \
-             `build_proposal` no longer jitters, the analytic AGQ derivative may \
-             differentiate H̃ directly"
+             gap={gap:.3e}, the old jitter offset was ~{jitter_scale:.3e}"
         );
     }
 
@@ -2164,6 +2297,7 @@ mod tests {
                 &options,
                 3,
                 anchor,
+                false,
             );
             let cached_eval = agq_population_evaluate_with_schedules(
                 &model,
@@ -2179,6 +2313,7 @@ mod tests {
                 anchor,
                 &schedules,
                 &terminal_work,
+                false,
             );
             assert_eq!(uncached_eval.nll.to_bits(), cached_eval.nll.to_bits());
             let (uncached_grad, cached_grad) = (
@@ -2209,6 +2344,7 @@ mod tests {
                     anchor,
                     Some(&schedules),
                     None,
+                    false,
                 );
                 let reused_one = agq_population_evaluate_impl(
                     &model,
@@ -2224,6 +2360,7 @@ mod tests {
                     anchor,
                     Some(&schedules),
                     Some(&terminal_work),
+                    false,
                 );
                 assert_eq!(fresh_one.nll.to_bits(), reused_one.nll.to_bits());
                 for (fresh, reused) in fresh_one

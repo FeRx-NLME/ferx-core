@@ -61,9 +61,11 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/covariance.rs",
-        2,
+        3,
         "the covariance step's score and objective, called with `post_opts` from `fit` and \
-         with `fitted_marginal_options`'s result from `run_covariance`",
+         with `fitted_marginal_options`'s result from `run_covariance`; the third names the \
+         FOCE / FOCEI marginal a SIR pass weights by in `W_COV_NON_STATIONARY_ESTIMATE` \
+         (#2536), on the same resolved options",
     ),
     (
         "src/estimation/fit_inputs.rs",
@@ -73,8 +75,9 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/gauss_newton.rs",
-        11,
-        "the GN optimizer and its gradient kernels receive the stage options",
+        13,
+        "the GN optimizer and its gradient kernels receive the stage options (the exact \
+         fixed-EBE score and EBE-response correction pick their objective from them, #2482)",
     ),
     (
         "src/estimation/impmap.rs",
@@ -93,13 +96,15 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/outer_optimizer.rs",
-        15,
+        13,
         "the outer optimizer and objective, run on a stage's options; \
-         `warm_ebe_start_check` (#2097) runs on the Gauss–Newton stage's options",
+         `warm_ebe_start_check` (#2097) runs on the Gauss–Newton stage's options \
+         (#2549: the built-in BFGS loop's two standalone `population_eta_dx` reads went \
+         with its separate mode-response pass)",
     ),
     (
         "src/estimation/profile.rs",
-        5,
+        3,
         "the profiled outer loop is a stage of the stage loop, on its stage options; the \
          profile solve's adjoint level gradient (#2109) differentiates the same stage objective",
     ),
@@ -107,6 +112,12 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "src/estimation/saem.rs",
         1,
         "the SAEM stage's final objective, on its stage options",
+    ),
+    (
+        "src/estimation/trace.rs",
+        1,
+        "`method_label` (#2552) resolves the flag itself, `interaction_for(options.method, \
+         options.interaction)`: the raw field is only the inherited value it passes in",
     ),
     (
         "src/estimation/vi/run.rs",

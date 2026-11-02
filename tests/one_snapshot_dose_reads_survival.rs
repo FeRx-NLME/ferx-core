@@ -15,12 +15,12 @@
 //! this file exercises.
 //!
 //! **Engine.** Every fixture here is the dense f64 walk (`ode_dense_solve_states_reading`)
-//! or the threshold walk (`ode_solve_until_chz_threshold`). A subject carrying a TTE record
-//! resolves its inner η-gradient to finite differences (`subject_has_survival_records`):
-//! there is **no** `Dual2` twin of this path, so there is no parity test to add. That is
-//! pinned at Tier 1 (`inner_optimizer::tests::an_ode_hazard_subject_resolves_its_inner_
-//! gradient_to_fd`) rather than here; since #1861 `FitResult::gradient_method_inner` reads
-//! `finite differences` on this model too, as the run banner's per-subject route does.
+//! or the threshold walk (`ode_solve_until_chz_threshold`). The dual twin of the hazard
+//! curves (`ode_cumhaz_hazard_g`) serves only subjects on the static walk with an autonomous
+//! RHS; these fixtures read `TIME` in `$PK`, which that walk declines, so their inner
+//! η-gradient resolves to finite differences and there is no dual path here to keep in
+//! parity. The routing boundary is pinned at Tier 1
+//! (`inner_optimizer::tests::an_ode_hazard_subject_resolves_its_inner_gradient_by_the_walks_scope`).
 //!
 //! **The fixture.** `DROP` is a literal spliced into `$PK` that only ever acts at
 //! `TIME < 0.5` (a literal, not a theta: a `0 FIX` theta is packed on the log scale and

@@ -215,7 +215,7 @@ fn imp_estimator_may_lead_a_chain() {
     opts.methods = vec![EstimationMethod::Imp, EstimationMethod::FoceI];
     opts.outer_maxiter = 25;
     let result = fit(&model, &population, &model.default_params, &opts)
-        .expect("methods = [imp, focei] must be allowed for estimating imp");
+        .expect("method = [imp, focei] must be allowed for estimating imp");
     assert_eq!(
         result.method_chain,
         vec![EstimationMethod::Imp, EstimationMethod::FoceI]

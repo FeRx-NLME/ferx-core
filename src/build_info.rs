@@ -68,8 +68,10 @@ impl GradientMethodKind {
 /// walk declines LTBS, so every such subject runs FD), and out-of-scope ODE subjects (oral
 /// infusion into a built-in absorption compartment, a rate-defined infusion under `F ≠ 1`).
 /// Steady-state and modeled-duration doses are **analytic** on the ODE event-driven walk, not
-/// FD (#914 / #530). A model with a TTE endpoint reports FD (#1861): a hazard term has no
-/// analytic η-channel, so every subject carrying a survival record runs FD.
+/// FD (#914 / #530). A model with a non-Gaussian endpoint reports analytic when every
+/// endpoint has an exact η-channel (`analytic_inner_grad_supported_model`, #2482) and FD otherwise
+/// (#1861); a subject whose record that channel still declines — an ODE hazard beside a
+/// steady-state dose — is the FD-fallback warning's to report.
 pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
     if crate::estimation::inner_optimizer::inner_reports_analytic_model(model) {
         GradientMethodKind::Analytic
@@ -82,7 +84,7 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 ///
 /// For a gradient-driven FOCE/FOCEI fit the outer optimiser uses the **exact
 /// analytic** packed gradient when the model is in the adjoint gradient's
-/// scope (`adjoint::model_in_scope`, IOV included) and the user did not
+/// scope (`adjoint::outer_model_in_scope`, IOV and served non-Gaussian endpoints included) and the user did not
 /// force FD — mirroring the live dispatch in `outer_optimizer` (PR #381 review
 /// #4), so the report tracks the headline feature instead of always reading
 /// "finite differences". Otherwise:
@@ -170,7 +172,7 @@ pub fn gradient_method_outer(
                 | Optimizer::Mma
                 | Optimizer::TrustRegion => {
                     // Shared predicate (#490) — IOV-aware (since #2093 via
-                    // `adjoint::model_in_scope`, which admits ODE IOV models too), so the reported method tracks the live outer
+                    // `adjoint::outer_model_in_scope`, which admits ODE IOV models too), so the reported method tracks the live outer
                     // dispatch (`outer_optimizer.rs`) for IOV as well (#466 review #4 / #439 IOV).
                     // Shared with `resolve_auto` so the reported method tracks the live outer
                     // dispatch; a custom-magnitude model is analytic on both FOCE and FOCEI now

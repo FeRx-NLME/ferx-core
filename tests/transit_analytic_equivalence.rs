@@ -345,10 +345,12 @@ fn transit_flip_flop_routes_to_ode_twin() {
 /// the escape the shorthand reaches −228.539600 (θ 2.05 / 3.33 / 3.04 / 20.25, the
 /// simulated 2 / 4 / 3 / 20), while the hand ODE's L-BFGS, on fixed-EBE outer gradients for
 /// all four subjects, does not: started *at* that optimum it reports `converged` at
-/// −215.687 (Linux aarch64). That is a defect of its own and not this test's object. So the
-/// test now pins the object directly: the two objectives are one function (equal at the
-/// shorthand's optimum), the shorthand's gradient fit converges off the floor, and the hand
-/// ODE fitted by BOBYQA (−228.192) lands on the same optimum within the band.
+/// −215.687 (Linux aarch64). That was a defect of its own (#2461: the EBE guard rejected the
+/// start, so it was never a candidate) and is pinned here only as its invariant — a
+/// converged verdict never sits above its own start. Otherwise the test pins the object
+/// directly: the two objectives are one function (equal at the shorthand's optimum), the
+/// shorthand's gradient fit converges off the floor, and the hand ODE fitted by BOBYQA
+/// (−228.192) lands on the same optimum within the band.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -440,6 +442,34 @@ fn transit_flip_flop_fit_matches_ode_twin() {
         "hand ODE at the shorthand's optimum {} vs shorthand {}",
         e.ofv,
         ra.ofv
+    );
+
+    // #2461: the hand ODE's L-BFGS fit *started at* that optimum. Its first evaluation is
+    // rejected by the EBE guard (one of four subjects' inner loops falls back to
+    // Nelder–Mead there) on macOS arm64, so the start is never a candidate and the run walks
+    // off it, to the TVNTR floor at −59.31; at #2460's head on Linux aarch64 it reported
+    // `converged` at −215.687. On Linux x86_64 at b68c6731 the start is accepted and the
+    // fit stays at −228.7949 (`W_STALLED_AT_INIT`); at dad870c0 it reached the floor too,
+    // and the floor escape's restart reported `converged` at −191.927 — above the fit's
+    // start but below the restart's own, which is what the per-run check compared it to.
+    // Whatever it reaches, a converged verdict may not sit above the fit's start by more
+    // than the plateau bound, and a run that does carries `W_ABOVE_START`.
+    let from_opt = fit(&hd, &pop, &at, &opts).expect("ODE fit from the optimum ok");
+    let bound = e.ofv + 1e-3 * (1.0 + e.ofv.abs());
+    let above = from_opt
+        .warnings
+        .iter()
+        .any(|w| w.contains("W_ABOVE_START"));
+    eprintln!(
+        "hand ODE L-BFGS from the optimum: OFV {:.6} (start {:.6}), converged {}, W_ABOVE_START {}",
+        from_opt.ofv, e.ofv, from_opt.converged, above
+    );
+    assert!(
+        !from_opt.converged || from_opt.ofv <= bound,
+        "converged at {} above its start {}: {:?}",
+        from_opt.ofv,
+        e.ofv,
+        from_opt.warnings
     );
 
     // The hand ODE fitted on its own, by BOBYQA (see above for why not L-BFGS): the same

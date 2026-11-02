@@ -159,6 +159,10 @@ struct FitWire {
     ebe_convergence_warnings: u32,
     max_unconverged_subjects: u32,
     total_ebe_fallbacks: u32,
+    /// `FitResult::total_ebe_nm_polished` (#2571). Absent on bundles written before the
+    /// field existed; those load as 0, which is what every fit reported until then.
+    #[serde(default)]
+    total_ebe_nm_polished: u32,
     warnings: Vec<String>,
     /// The structured warnings that carry a `details` payload (#2268), as
     /// `WarningEntry` JSON. Only those: every other entry is rebuilt from
@@ -1210,6 +1214,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         ebe_convergence_warnings: r.ebe_convergence_warnings,
         max_unconverged_subjects: r.max_unconverged_subjects,
         total_ebe_fallbacks: r.total_ebe_fallbacks,
+        total_ebe_nm_polished: r.total_ebe_nm_polished,
         warnings: r.warnings.clone(),
         warning_details: r
             .warnings_structured
@@ -2094,6 +2099,8 @@ fn parse_subjects(
             // them belongs with the checkpoint format, not here (#897 follow-up).
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
+            #[cfg(feature = "survival")]
+            tte_rows: Vec::new(),
         });
     }
 
@@ -2933,7 +2940,7 @@ fn wire_to_fit_result(
         sir_ess,
         sir_resamples_packed,
         // .fitrx v1: importance_sampling is not serialised — re-run via
-        // `methods = [..., imp]` if the consumer needs the IS LL.
+        // `method = [..., imp]` if the consumer needs the IS LL.
         importance_sampling: None,
         impmap_trace: None,
         bayes: None,
@@ -2966,6 +2973,7 @@ fn wire_to_fit_result(
         ebe_convergence_warnings: w.ebe_convergence_warnings,
         max_unconverged_subjects: w.max_unconverged_subjects,
         total_ebe_fallbacks: w.total_ebe_fallbacks,
+        total_ebe_nm_polished: w.total_ebe_nm_polished,
         covariance_status: covariance_status_from_str(&w.covariance_status)?,
         // Absent key → `None` (a pre-#1382 bundle simply did not record it);
         // present-but-unrecognised → `Corrupt`, the same verdict every other
@@ -6088,6 +6096,54 @@ mod tests {
             loaded.fit.covariance_method, None,
             "an absent key must load as `None`, not as a default estimator"
         );
+    }
+
+    /// #2571: `total_ebe_nm_polished` survives a save/load, and a bundle written before the
+    /// field existed loads it as 0, the count every fit reported until then.
+    #[test]
+    fn total_ebe_nm_polished_round_trips_and_defaults_to_zero() {
+        use std::io::{Read as _, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nm-polished.fitrx");
+        let mut r = minimal_fit_result();
+        r.total_ebe_nm_polished = 7;
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        assert_eq!(load_fit(&path).unwrap().fit.total_ebe_nm_polished, 7);
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut removed = false;
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().unwrap().to_string();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            if name == "fit.json" {
+                let mut v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+                removed = v
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("total_ebe_nm_polished")
+                    .is_some();
+                buf = serde_json::to_vec_pretty(&v).unwrap();
+            }
+            entries.push((name, buf));
+        }
+        assert!(
+            removed,
+            "premise: the key was written, so stripping it means something"
+        );
+        let patched = dir.path().join("nm-polished-patched.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&patched).unwrap());
+        for (name, body) in entries {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap();
+        assert_eq!(load_fit(&patched).unwrap().fit.total_ebe_nm_polished, 0);
     }
 
     /// #1382: an unrecognised token is `Corrupt`, the same verdict every other

@@ -24,10 +24,9 @@ BOTH the covariate decline and the per-occasion kappa. Each day's infusion runs 
 THIS occasion's (CRCL, kappa) and the decay on the NEXT occasion's (CRCL, kappa)
 (end-of-interval convention ferx's per-segment PK uses).
 
-`auc_target` is intentionally absent: its exposure metric integrates a dense grid
-from a single frozen PK snapshot, which is silently wrong when CL changes across the
-horizon (a drifting covariate OR a per-occasion kappa), so it is a typed error for a
-time-varying-covariate / IOV subject (#700/#701).
+`auc_target` is supported here since #943: each window is integrated under the
+covariate- and occasion-driven CL its trajectory runs under. The per-window AUC24 below is its
+reference; the pct-in-window trough metric (`target_window`) is retained.
 
 ## Realized ladder (ferx doses + declining CRCL + reconstructed kappa, mrgsolve troughs)
 
@@ -53,3 +52,23 @@ the same seed (declining CRCL x reconstructed kappa), computes its troughs (RK45
 and asserts they match these mrgsolve troughs (LSODA) to a small cross-solver
 tolerance. Both engines integrate the identical composed piecewise-constant CL, so
 the whole trough trajectory agrees.
+
+## Per-window AUC24
+
+The area under CENT/V over each closed inter-decision window, from an AUC compartment (dxdt_AUC = CENT/V) reset at the start of each window (mrgsolve 2.0.1). It is the external reference for `auc_target` (#943).
+
+| window | days [t0,t1] (h) | AUC24 (mg*h/L) |
+|---:|---:|---:|
+| 0 | [0, 24] | 111.033800 |
+| 1 | [24, 48] | 160.428342 |
+| 2 | [48, 72] | 182.509348 |
+| 3 | [72, 96] | 269.686668 |
+| 4 | [96, 120] | 446.210865 |
+| 5 | [120, 144] | 465.141934 |
+| 6 | [144, 168] | 537.141299 |
+| 7 | [168, 192] | 481.392114 |
+| 8 | [192, 216] | 501.969692 |
+| 9 | [216, 240] | 496.472543 |
+| 10 | [240, 264] | 463.978639 |
+| 11 | [264, 288] | 441.207326 |
+| 12 | [288, 312] | 393.515239 |

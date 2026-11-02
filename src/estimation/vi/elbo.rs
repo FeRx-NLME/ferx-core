@@ -471,6 +471,18 @@ fn eta_data_grad(
             return (g, false);
         }
     }
+    // Past the closed forms (M3 censoring, a dense or serial residual, a residual
+    // magnitude): the analytic kernel's data term against the inner search's exact
+    // η-Jacobian. It is the data gradient alone, so no prior is subtracted.
+    if mode != EtaGradMode::Fd {
+        if let Some(g) = crate::sens::ode_provider::adjoint::fixed_theta_data_eta_grad(
+            model, subject, theta, sigma, z,
+        )
+        .filter(|g| g.len() == z.len())
+        {
+            return (g, false);
+        }
+    }
     // `true` whenever the finite-difference route was taken, whether it was asked
     // for or fallen back to — `n_fd_subjects` reports what actually happened.
     // In `Analytic` mode FD is never *requested*, so a `true` there can only mean

@@ -299,5 +299,5 @@ println!("{}", result.final_model.render());
 
 `CovsearchRun` also takes a `threads` override, a `CancelFlag` that stops the
 search between candidates with what it has, and a progress callback
-(`CovsearchEvent`). `ferx_tools::allometry::run_allometry` is the library
+(`CovsearchEvent`). Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_tools::search::CandidateFinished`, #2512). `ferx_tools::allometry::run_allometry` is the library
 form of `ferx allometry`.

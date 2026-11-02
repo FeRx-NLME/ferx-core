@@ -103,6 +103,14 @@ two-covariate DCM, unnormalized inputs pushed weights to ~1e11 and left the
 residual error at 15× its true value; the same model with standardized inputs
 kept every weight inside `[-1.3, 1.6]`.
 
+A fit warns when it is handed inputs like these. `W_NN_UNSCALED_INPUT` names every input
+whose values in the data, after the block's `center`/`scale`, reach past `3/a` (`6/a` for a
+sigmoid), where `a = √(6/(fan_in + fan_out))` is the first layer's Glorot weight scale: past
+that, one input alone drives a hidden unit into saturation at its initial weights. On such a
+network which optimum a fit reaches can depend on the path to it — without normalisation,
+`examples/warfarin_dcm.ferx` ends at very different objectives depending only on how the
+inner loop is warm-started (#2549).
+
 Use the covariate's mean and SD in your dataset, or any round numbers near them —
 the network does not care whether the standardization is exact, only that its
 inputs land in roughly `[-3, 3]`:

@@ -2510,6 +2510,15 @@ fn note_filled_cells(
     }
 }
 
+/// Removes and returns `cmt`'s pending TTE `DV=0` row, keeping the others in the
+/// order their rows appeared. `Vec::remove` (not `swap_remove`) is what preserves
+/// that order, which the end-of-subject flush relies on.
+#[cfg(feature = "survival")]
+fn take_tte_pending(pending: &mut Vec<(usize, (f64, f64))>, cmt: usize) -> Option<(f64, f64)> {
+    let i = pending.iter().position(|&(c, _)| c == cmt)?;
+    Some(pending.remove(i).1)
+}
+
 fn parse_subject(
     id: &str,
     rows: &[Vec<String>],
@@ -2604,11 +2613,15 @@ fn parse_subject(
     // LOCF snapshot of each kept endpoint row, when any covariate is time-varying: the
     // only trace those rows leave of their covariates (#1854; see the field's doc).
     let mut endpoint_covariates: Vec<HashMap<String, f64>> = Vec::new();
-    // tte_pending_left: per-CMT pending DV=0 row (may be a left-bound for an interval
+    // tte_pending: per-CMT pending DV=0 row (may be a left-bound for an interval
     //   or a right-censored event, depending on whether the next row is DV=2).
-    //   Map value is (time, entry_time). TTE-only, hence `survival`-gated.
+    //   Entries are (cmt, (time, entry_time)), at most one per CMT, in the order their
+    //   rows appeared: the end-of-subject flush emits them in that order, so two causes
+    //   censored at the same time keep a deterministic record order (a `HashMap` here
+    //   made competing-risks simulation irreproducible under a fixed seed, #2569).
+    //   TTE-only, hence `survival`-gated.
     #[cfg(feature = "survival")]
-    let mut tte_pending_left: HashMap<usize, (f64, f64)> = HashMap::new();
+    let mut tte_pending: Vec<(usize, (f64, f64))> = Vec::new();
 
     // Time-constant covariates: first non-missing value across all rows.
     // Used as the subject-static fallback (and for the AD fast path, which
@@ -3335,7 +3348,8 @@ fn parse_subject(
                             // DV=0: tentatively a right-censored event, or left-bound of
                             // interval-censored pair. Save as pending; flush on next row.
                             // Flush any existing pending for this CMT first.
-                            if let Some((t_left, e_left)) = tte_pending_left.remove(&cmt) {
+                            if let Some((t_left, e_left)) = take_tte_pending(&mut tte_pending, cmt)
+                            {
                                 obs_records.push(ObsRecord::Event {
                                     time: t_left,
                                     event_type: EventType::RightCensored,
@@ -3343,11 +3357,12 @@ fn parse_subject(
                                     cmt,
                                 });
                             }
-                            tte_pending_left.insert(cmt, (time, entry_time));
+                            tte_pending.push((cmt, (time, entry_time)));
                         }
                         1 => {
                             // DV=1: exact event. Flush any pending left for this CMT.
-                            if let Some((t_left, e_left)) = tte_pending_left.remove(&cmt) {
+                            if let Some((t_left, e_left)) = take_tte_pending(&mut tte_pending, cmt)
+                            {
                                 obs_records.push(ObsRecord::Event {
                                     time: t_left,
                                     event_type: EventType::RightCensored,
@@ -3364,7 +3379,8 @@ fn parse_subject(
                         }
                         2 => {
                             // DV=2: interval-censored right-bound. Must follow a DV=0.
-                            let left = tte_pending_left.remove(&cmt).ok_or_else(|| {
+                            let pending = take_tte_pending(&mut tte_pending, cmt);
+                            let left = pending.ok_or_else(|| {
                                 format!(
                                     "Subject {id}: DV=2 row at TIME={time} on CMT={cmt} \
                                      not preceded by a DV=0 row on the same CMT — \
@@ -3628,6 +3644,11 @@ fn parse_subject(
     // ending at a train's last dose, never tie with it. An implied dose with no record at
     // or after it keeps its parent's inputs; nothing observes it.
     let sorted_implied: Vec<bool> = perm.iter().map(|&i| dose_implied[i]).collect();
+    // Implied doses governed by an observation / pk-only row, as `(dose, record)`: the
+    // #1810 / #614 passes below may still move that record's engine time one ULP, so
+    // `ImpliedDose::gov_time` is re-read from it once they have run (#2371).
+    let mut gov_by_obs: Vec<(usize, usize)> = Vec::new();
+    let mut gov_by_pk_only: Vec<(usize, usize)> = Vec::new();
     if sorted_implied.contains(&true) {
         #[derive(Clone, Copy)]
         enum Rec {
@@ -3665,16 +3686,26 @@ fn parse_subject(
                 sorted_doses[k].implied = Some(crate::types::ImpliedDose {
                     parent,
                     param_time: written_at(sorted_doses[parent].time),
+                    gov_time: sorted_doses[parent].time,
                 });
                 continue;
             };
-            let param_time = match rec {
-                Rec::Dose(d) => written_at(sorted_doses[d].time),
-                Rec::Obs(j) => obs_raw_times[j],
-                Rec::PkOnly(m) => pk_only_raw_times[m],
-                Rec::Reset(r) => written_at(reset_times[r]),
+            let (param_time, gov_time) = match rec {
+                Rec::Dose(d) => (written_at(sorted_doses[d].time), sorted_doses[d].time),
+                Rec::Obs(j) => (obs_raw_times[j], obs_times[j]),
+                Rec::PkOnly(m) => (pk_only_raw_times[m], pk_only_times[m]),
+                Rec::Reset(r) => (written_at(reset_times[r]), reset_times[r]),
             };
-            sorted_doses[k].implied = Some(crate::types::ImpliedDose { parent, param_time });
+            sorted_doses[k].implied = Some(crate::types::ImpliedDose {
+                parent,
+                param_time,
+                gov_time,
+            });
+            match rec {
+                Rec::Obs(j) => gov_by_obs.push((k, j)),
+                Rec::PkOnly(m) => gov_by_pk_only.push((k, m)),
+                Rec::Dose(_) | Rec::Reset(_) => {}
+            }
             if any_tv {
                 sorted_dose_cov[k] = match rec {
                     Rec::Dose(d) => sorted_dose_cov[d].clone(),
@@ -3745,10 +3776,12 @@ fn parse_subject(
     // observation sorts last among the kinds, so a pk-only row sharing its ULP still
     // goes first.
     //
-    // A tie that carries a reset or an SS dose is left alone. Both replace the state at
-    // the tie, so which record governs the advance into it does not matter, and #614
-    // keeps an observation at an SS dose's time on purpose (see below). Doses are never
-    // moved. `obs_raw_times` keep the written TIME, and nothing reports a pk-only time.
+    // A tie that carries a reset is left alone: the reset replaces the state at the tie,
+    // so which record governs the advance into it does not matter. An SS dose is not
+    // exempt (#2510). A record listed before it reads the state carried from the previous
+    // record (NONMEM 7.5.1, `nonmem_anchor/dtmm_ss_record_order.ctl`), and that state
+    // depends on which record advanced the system there. Doses are never moved.
+    // `obs_raw_times` keep the written TIME, and nothing reports a pk-only time.
     // This runs before #614, which then finds no dose at a moved observation's time
     // and leaves it alone.
     if !pk_only_times.is_empty() {
@@ -3756,7 +3789,7 @@ fn parse_subject(
         tie_times.sort_by(f64::total_cmp);
         tie_times.dedup();
         for t in tie_times {
-            if reset_times.contains(&t) || sorted_doses.iter().any(|d| d.time == t && d.ss) {
+            if reset_times.contains(&t) {
                 continue;
             }
             // The first record of each kind at `t`, in file order. Each vector was filled
@@ -3809,34 +3842,56 @@ fn parse_subject(
     // single ULP) and leaves `obs_raw_times` — the user-clock value reported in
     // sdtab/covtab and by predict()/simulate() — untouched.
     //
-    // Only a "pure trough" is nudged: every coincident dose is non-SS and comes
-    // *after* the observation in the file. If any coincident dose precedes the
-    // observation (a genuine post-dose sample, or a rare dose/obs/dose straddle)
-    // it is left alone. SS doses are excluded: a sub-dose-time sample would read
-    // 0 instead of the periodic pre-arrival trough the SS closed form supplies.
+    // Only a "pure trough" is nudged: every coincident dose comes *after* the
+    // observation in the file. If any coincident dose precedes the observation (a
+    // genuine post-dose sample, or a rare dose/obs/dose straddle) it is left alone.
+    //
+    // Steady-state doses are included (#2510). NONMEM 7.5.1
+    // (`nonmem_anchor/dtmm_ss_record_order.ctl`) reads a record listed before an SS=1
+    // dose from the amounts carried from the previous record: the initial state (0, or the
+    // `init()` value) before a first SS dose, the prior history before a later one. The SS dose's implied pulse train contributes
+    // nothing before its own record (`docs/model-file/steady-state.qmd`), so one ULP
+    // below the dose is exactly that carried state. Until #2510 SS doses were excluded,
+    // and such an observation read the post-dose steady state.
     for j in 0..obs_times.len() {
         let t = obs_times[j];
-        let mut later_nonss = false;
-        let mut earlier_any = false;
+        let mut later = false;
+        let mut earlier = false;
         for d in 0..sorted_doses.len() {
-            if sorted_doses[d].time == t && !sorted_doses[d].ss {
+            if sorted_doses[d].time == t {
                 if sorted_dose_rec[d] > obs_rec[j] {
-                    later_nonss = true;
+                    later = true;
                 } else if sorted_dose_rec[d] < obs_rec[j] {
-                    earlier_any = true;
+                    earlier = true;
                 }
             }
         }
-        if later_nonss && !earlier_any {
+        if later && !earlier {
             obs_times[j] = t.next_down();
+        }
+    }
+
+    // The engine time an implied dose's occasion is read at is its governing record's as
+    // the subject holds it (#2371): after the two passes above, which move times in place,
+    // so the indices recorded by the #1909 pass still name the same records. Doses are
+    // never moved, and resets are not moved here.
+    for (k, j) in gov_by_obs {
+        if let Some(i) = sorted_doses[k].implied.as_mut() {
+            i.gov_time = obs_times[j];
+        }
+    }
+    for (k, m) in gov_by_pk_only {
+        if let Some(i) = sorted_doses[k].implied.as_mut() {
+            i.gov_time = pk_only_times[m];
         }
     }
 
     // Flush any remaining pending TTE left-bounds as right-censored events.
     // This handles the common case: final row is a right-censored DV=0 with no
     // following DV=2 — the subject was censored at its last observation time.
+    // Emitted in data-row order (see `tte_pending`), never in CMT or hash order.
     #[cfg(feature = "survival")]
-    for (cmt, (t_left, e_left)) in tte_pending_left {
+    for (cmt, (t_left, e_left)) in tte_pending {
         obs_records.push(crate::types::ObsRecord::Event {
             time: t_left,
             event_type: crate::types::EventType::RightCensored,

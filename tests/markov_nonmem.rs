@@ -55,7 +55,10 @@ const NM_LQ10: f64 = -1.215660;
 const NM_OFV: f64 = 606.98181;
 
 // `examples/ctmm_pd_2state.ferx` at its data-generating initial estimates, one evaluation.
-const OFV_AT_TRUTH: f64 = 715.6644417808;
+// Since #2482 the drug-driven η-Hessian in `½ log|H̃|` is exact (the occupancy ODE on dual
+// numbers) rather than #2437's 0.1-posterior-SD stencil, which #2437 measured holding only to
+// 0.5%: the objective moved by −1.25e-3, from 715.6644417808 (Linux x86_64 measurement).
+const OFV_AT_TRUTH: f64 = 715.6631881368;
 const OFV_AT_TRUTH_TOL: f64 = 1e-7;
 // More than the 3.88 that refitting everything but LQ01 at its true value buys; 2.1 below
 // the measured 6.59.
@@ -123,8 +126,8 @@ fn drug_driven_ctmm_ofv_at_truth() -> f64 {
 /// Drug-driven (time-inhomogeneous) CTMM, objective pin (#817, #2437).
 ///
 /// One evaluation at the data-generating parameters, so it pins the occupancy integration
-/// and the FD η-Hessian without depending on where an optimizer stops. Measured:
-/// 715.6644417809 on Linux x86_64 and 715.6644417808 on macOS arm64. The bound is 1e-7
+/// and the exact η-Hessian without depending on where an optimizer stops. Measured:
+/// 715.6631881368 on Linux x86_64 (#2482). The bound is 1e-7
 /// because a CTMM occupancy integration is not reproducible to the last digit across
 /// platforms in general: on the previous step the same evaluation differed by 1.4e-9.
 #[test]

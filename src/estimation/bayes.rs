@@ -27,8 +27,8 @@ use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{individual_nll_into_with_schedule_cov, individual_nll_iov};
 use crate::types::{
-    BayesResult, CompiledModel, FitOptions, ModelParameters, OmegaMatrix, Population, SigmaVector,
-    Subject,
+    BayesResult, CompiledModel, EstimationMethod, FitOptions, ModelParameters, OmegaMatrix,
+    Population, SigmaVector, Subject,
 };
 use nalgebra::{Cholesky, DMatrix, DVector};
 use rand::rngs::StdRng;
@@ -863,7 +863,7 @@ pub fn run_bayes(
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
     let n_sigma = init_params.sigma.values.len();
-    if n_eta == 0 {
+    if EstimationMethod::Bayes.requires_random_effects() && n_eta == 0 {
         return Err("Bayesian estimation requires at least one random effect (eta)".to_string());
     }
 
@@ -2246,6 +2246,7 @@ pub fn run_bayes(
         ebe_convergence_warnings: ebe_stats.n_unconverged as u32,
         max_unconverged_subjects: ebe_stats.n_unconverged as u32,
         total_ebe_fallbacks: ebe_stats.n_fallback as u32,
+        total_ebe_nm_polished: ebe_stats.n_nm_polished as u32,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal: None,
@@ -2256,6 +2257,7 @@ pub fn run_bayes(
         left_init: None,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
     })
 }
 

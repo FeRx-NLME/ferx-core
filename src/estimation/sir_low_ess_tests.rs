@@ -778,6 +778,16 @@ fn natural_scale_lower_limit_is_box_independent_where_packed_is_not() {
 /// so each probed variance has ΔOFV 0 and is flagged. Returns the probe and
 /// the call count.
 fn counted_floor_probe(cancel: Option<crate::cancel::CancelFlag>) -> (Vec<FloorProbe>, usize) {
+    counted_floor_probe_unscored(cancel, &[])
+}
+
+/// [`counted_floor_probe`], with the calls numbered (1-based) in `unscored` returning no
+/// objective, as a point whose subject is rejected at its inner start even cold does
+/// (#2382). Call 1 is the baseline, then one per free variance in coordinate order.
+fn counted_floor_probe_unscored(
+    cancel: Option<crate::cancel::CancelFlag>,
+    unscored: &[usize],
+) -> (Vec<FloorProbe>, usize) {
     let (model, _) = probe_fixture();
     let p = &model.default_params;
     let PackedStart {
@@ -790,7 +800,7 @@ fn counted_floor_probe(cancel: Option<crate::cancel::CancelFlag>) -> (Vec<FloorP
     let calls = Cell::new(0);
     let ofv_at = |_: &ModelParameters, _: &[f64]| {
         calls.set(calls.get() + 1);
-        0.0
+        (!unscored.contains(&calls.get())).then_some(0.0)
     };
     let probe = floor_probe(&packed, &bounds, p, &fixed, &names, &cancel, ofv_at);
     (probe, calls.get())
@@ -817,6 +827,25 @@ fn floor_probe_stops_on_cancel_and_returns_nothing() {
     // Polls: before the baseline (0), before ETA_CL (1), before ETA_V (2: trips).
     let (mid, n) = counted_floor_probe(Some(CancelFlag::trip_after(2)));
     assert_eq!((mid.len(), n), (0, 2), "mid-probe cancel ignored: {mid:?}");
+}
+
+/// #2382: a probe point with no objective is dropped, not scored. Read as a ΔOFV of
+/// `0 − base` it would sit under 3.84 and the warning would name a variance the data
+/// never spoke to. With no objective at the baseline there is no probe at all, and no
+/// point after it is scored.
+///
+/// Mutations: `floor_probe` reading a `None` point as 0 dies on the first assertion (it
+/// keeps `ETA_CL`); reading a `None` baseline as 0 dies on the second (it probes on).
+#[test]
+fn floor_probe_drops_a_point_with_no_objective() {
+    // Call 2 is ETA_CL, the first variance.
+    let (probe, n) = counted_floor_probe_unscored(None, &[2]);
+    let names: Vec<&str> = probe.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["ETA_V", "ETA_Q", "KAPPA_CL"], "{probe:?}");
+    assert_eq!(n, 5, "every point is still tried");
+
+    let (probe, n) = counted_floor_probe_unscored(None, &[1]);
+    assert_eq!((probe.len(), n), (0, 1), "no baseline, no probe: {probe:?}");
 }
 
 /// #1754, warning level: the same probe through [`low_ess_warning`]. Not

@@ -696,9 +696,9 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
 /// the box while another drifted in — this fails on the *identity* of the
 /// coordinate, so either direction reddens.
 ///
-/// The eleven entries below are all `OmegaDiagonal` / `Below`, i.e. all already
-/// in #1229's scope: eight simulate-only adaptive-dosing models declaring
-/// `omega ~ 1e-10`, two `reset_init_snapshot_*` anchors declaring `~ 0.0`, and
+/// The twelve entries below are all `OmegaDiagonal` / `Below`, i.e. all already
+/// in #1229's scope: nine simulate-only adaptive-dosing models declaring
+/// `omega ~ 1e-10` (the ninth is the #945 mrgsolve kit's model), two `reset_init_snapshot_*` anchors declaring `~ 0.0`, and
 /// `tests/fixtures/iov_scaling.ferx` declaring `kappa KAPPA_V ~ 0.000001`.
 /// **Zero** θ, Σ, off-diagonal or upper-rail hits — which is what makes this
 /// change safe for everything shipped.
@@ -717,7 +717,7 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
 /// no corpus guard at all. The corpus carries **zero** inverted boxes; this is
 /// what keeps that true.
 #[test]
-fn no_shipped_model_file_starts_outside_its_box_except_the_known_eleven() {
+fn no_shipped_model_file_starts_outside_its_box_except_the_known_twelve() {
     let allowed: std::collections::BTreeSet<&str> = [
         "examples/adaptive_platelet_ladder.ferx::ETA_CL",
         "examples/adaptive_vanco_auc.ferx::ETA_CL",
@@ -730,6 +730,7 @@ fn no_shipped_model_file_starts_outside_its_box_except_the_known_eleven() {
         "nonmem_anchor/reset_init_snapshot_fit.ferx::ETA_CL",
         "nonmem_anchor/reset_init_snapshot_occ.ferx::ETA_CL",
         "tests/fixtures/iov_scaling.ferx::KAPPA_V",
+        "tests/reference/vanco_interval_mrgsolve/vanco_interval.ferx::ETA_CL",
     ]
     .into_iter()
     .collect();

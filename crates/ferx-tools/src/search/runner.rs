@@ -203,9 +203,35 @@ impl Runner {
         data: &Population,
         options: &RunOptions,
     ) -> Result<RunReport, String> {
-        self.run_with_fitter(candidates, data, options, |candidate, threads_per_fit| {
-            compile_and_fit(candidate, data, options, threads_per_fit, &self.cancel)
-        })
+        self.run_observed(candidates, data, options, &|_| {})
+    }
+
+    /// [`run`](Self::run), calling `on_finished` with each candidate's result
+    /// as soon as it is known (#2512).
+    ///
+    /// A fitted candidate is reported from the lane that fitted it, right
+    /// after its journal row is written — so in completion order, from
+    /// whichever thread finished it. A candidate that needed no fit (reused
+    /// from the journal or a [`reuse_from`](Self::reuse_from) directory, or a
+    /// duplicate) is reported after the fits, in submission order. Every
+    /// result the returned [`RunReport`] carries is reported exactly once;
+    /// candidates a cancelled run never reached are not reported.
+    pub fn run_observed(
+        &self,
+        candidates: &[Candidate],
+        data: &Population,
+        options: &RunOptions,
+        on_finished: &(dyn Fn(&CandidateResult) + Sync),
+    ) -> Result<RunReport, String> {
+        self.run_with_fitter_observed(
+            candidates,
+            data,
+            options,
+            |candidate, threads_per_fit| {
+                compile_and_fit(candidate, data, options, threads_per_fit, &self.cancel)
+            },
+            on_finished,
+        )
     }
 
     /// The body of [`run`](Self::run), with the fit itself injected.
@@ -216,12 +242,29 @@ impl Runner {
     /// tests in the slow tier and make the concurrency assertion untestable
     /// (there is no way to observe "two fits are in flight" from outside
     /// `fit()`).
+    #[cfg(test)]
     fn run_with_fitter<F>(
         &self,
         candidates: &[Candidate],
         data: &Population,
         options: &RunOptions,
         fitter: F,
+    ) -> Result<RunReport, String>
+    where
+        F: Fn(&Candidate, usize) -> Result<FitResult, CandidateError> + Sync,
+    {
+        self.run_with_fitter_observed(candidates, data, options, fitter, &|_| {})
+    }
+
+    /// [`run_with_fitter`](Self::run_with_fitter) with the
+    /// [`run_observed`](Self::run_observed) callback.
+    fn run_with_fitter_observed<F>(
+        &self,
+        candidates: &[Candidate],
+        data: &Population,
+        options: &RunOptions,
+        fitter: F,
+        on_finished: &(dyn Fn(&CandidateResult) + Sync),
     ) -> Result<RunReport, String>
     where
         F: Fn(&Candidate, usize) -> Result<FitResult, CandidateError> + Sync,
@@ -392,6 +435,7 @@ impl Runner {
             if let Some(j) = &journal {
                 j.append(&record_of(&result), result.fit.as_ref());
             }
+            on_finished(&result);
             n_fitted.fetch_add(1, Ordering::Relaxed);
             Some((i, result))
         };
@@ -450,14 +494,19 @@ impl Runner {
         let mut n_reused = 0usize;
         for i in (0..candidates.len()).filter(|i| duplicate_of[*i].is_none()) {
             if let Some(result) = by_index.remove(&i) {
-                n_reused += usize::from(result.reused);
+                // A foreign fit is reported here; one this run fitted already
+                // was, from its lane.
+                if result.reused {
+                    n_reused += 1;
+                    on_finished(&result);
+                }
                 outcomes.insert(i, result);
             } else if let Some(record) = reused.get(hashes[i].as_str()) {
                 n_reused += 1;
-                outcomes.insert(
-                    i,
-                    reused_result(&candidates[i], record, self.cache_dir.as_deref(), options),
-                );
+                let result =
+                    reused_result(&candidates[i], record, self.cache_dir.as_deref(), options);
+                on_finished(&result);
+                outcomes.insert(i, result);
             }
         }
 
@@ -475,7 +524,7 @@ impl Runner {
                 // worth. `duplicate_of` names where to find it.
                 Some(first) => {
                     if let Some(source) = outcomes.get(&first) {
-                        results.push(CandidateResult {
+                        let duplicate = CandidateResult {
                             id: candidates[i].id.clone(),
                             hash: hashes[i].clone(),
                             parent: candidates[i].parent.clone(),
@@ -489,7 +538,9 @@ impl Runner {
                             error: source.error.clone(),
                             duplicate_of: Some(source.id.clone()),
                             reused: source.reused,
-                        });
+                        };
+                        on_finished(&duplicate);
+                        results.push(duplicate);
                     }
                 }
             }

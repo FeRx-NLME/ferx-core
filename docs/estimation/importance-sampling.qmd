@@ -93,7 +93,7 @@ importance-sampling −2 log L at the last iteration (macOS arm64):
 | `examples/two_cpt_oral_cov.ferx`, 30 | 4.8e14, every subject low-ESS | −1199.6 | `[focei, imp]` −1199.4 |
 | FREM warfarin fixture (`tests/frem_warfarin.rs`), 3 | +328.8 | −151.6 | 60 iterations reach −220.9; SAEM / IMPMAP −220.7 |
 
-A warm start (`methods = [focei, imp]`) still saves iterations. A subject whose
+A warm start (`method = [focei, imp]`) still saves iterations. A subject whose
 posterior is very sharp can still lose overlap after a large step in a parameter
 the shift does not own (a non-mu-referenced θ, σ, or Ω), and
 [`impmap`](impmap.qmd), which re-centres on the mode every iteration, is the
@@ -151,7 +151,7 @@ Rules for the **evaluation-only** mode:
   centre/scale) there via a FOCE inner loop. When chained after an estimator
   (`[focei, imp]`), it uses that stage's EBEs/Jacobian instead.
 - **Must appear at most once** (true for both modes).
-- **Must be terminal.** `methods = [imp, focei]` with `imp_eval_only` is rejected
+- **Must be terminal.** `method = [imp, focei]` with `imp_eval_only` is rejected
   — a following stage would overwrite the parameters and make the IS result
   meaningless. (The *estimating* `imp` has no such restriction; it may lead or
   sit mid-chain like any estimator.)
@@ -388,7 +388,7 @@ typed as `Option<ImportanceSamplingResult>`.
 
 ferx's estimating `imp` is validated against NONMEM 7.5.1 `METHOD=IMP` on the
 warfarin example (10-subject extract, `data/warfarin.csv`). Both engines are
-warm-started from a FOCE/FOCEI pass (ferx `methods = [focei, imp]`; NONMEM
+warm-started from a FOCE/FOCEI pass (ferx `method = [focei, imp]`; NONMEM
 `$EST METHOD=COND INTERACTION` → `$EST METHOD=IMP INTERACTION NITER=100
 ISAMPLE=1000 SEED=12345`, control stream `tests/nonmem/warfarin_imp.ctl`).
 
@@ -423,7 +423,7 @@ lives in `tests/warfarin_imp_nonmem.rs`.
 
 ## See also
 
-- [SAEM](saem.qmd) — common upstream stage for `methods = [saem, imp]`.
+- [SAEM](saem.qmd) — common upstream stage for `method = [saem, imp]`.
 - [SIR](sir.qmd) — a different importance-sampling-flavoured procedure
   that targets *parameter uncertainty* (CIs on θ/Ω/σ), not the marginal
   likelihood. The name overlap is unfortunate; the two methods are

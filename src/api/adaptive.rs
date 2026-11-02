@@ -163,6 +163,15 @@ pub struct AdaptiveSimulateOptions {
     /// Per-run decision cap — the runaway / closed-loop guard. The driver errors
     /// if a schedule exceeds it.
     pub max_decisions: usize,
+    /// The dosing interval in force at the first decision (#945). `None` (the
+    /// default) makes every point of `decision_times` due, as before; `Some(Δ)`
+    /// consults the controller only once `Δ` has passed since the last decision it
+    /// was consulted at, and logs the points in between as
+    /// [`crate::sim::adaptive::DecisionOutcome::NotDue`]. `Δ` must be positive and
+    /// finite, and every due time it produces must land on a point of
+    /// `decision_times`. A controller changes it with
+    /// [`crate::sim::adaptive::DoseAction::SetInterval`].
+    pub start_interval: Option<f64>,
 }
 
 impl Default for AdaptiveSimulateOptions {
@@ -173,6 +182,7 @@ impl Default for AdaptiveSimulateOptions {
             monitors: Vec::new(),
             verify: true,
             max_decisions: 10_000,
+            start_interval: None,
         }
     }
 }
@@ -257,15 +267,15 @@ pub struct AdaptiveSimulationResult {
 /// - **Pre-scheduled base regimen (#702).** A subject MAY carry pre-scheduled doses
 ///   (a loading / maintenance regimen), which are integrated and augmented by the
 ///   controller. Supported on constant-covariate, time-varying-covariate (#930), and
-///   IOV (#931) models. Since #932 a base regimen also composes with system resets
-///   (EVID=3/4) on the constant-covariate path (the reset zeros the state and turns off a
-///   base infusion opened before it, and an EVID=4 reset+dose row's dose lands after its own
-///   reset); base × reset under a time-varying covariate or IOV is still a typed error (a
-///   #932 follow-up). A steady-state / lagged / built-in-input-rate
-///   base dose is supported on the constant-covariate path (#719); under a time-varying
+///   IOV (#931) models. A base regimen also composes with system resets (EVID=3/4) on all
+///   three (#932): the reset zeros the state and turns off a base infusion opened before it,
+///   and an EVID=4 reset+dose row's dose lands after its own reset. A steady-state / lagged /
+///   built-in-input-rate base dose is supported on the constant-covariate path (#719); under a time-varying
 ///   covariate or IOV those (and a modeled-`RATE` dose) are a typed error — a #930/#931
 ///   follow-up. A dose-free subject is the fully controller-driven special case.
-/// - **Ipred monitors only.** A `Dv` monitor is rejected (needs S1.5).
+/// - **`Ipred` or `Dv` monitors.** A `Dv` monitor adds its endpoint's residual error
+///   to the reading, drawn on a dedicated assay substream (#391 S1.5); a `Dv` monitor on
+///   a compartment with no `[error_model]` entry is rejected before any subject runs.
 /// - **Verification (default on).** Each run's realized ledger is replayed
 ///   through the static engine and checked against the reactive trajectory; a
 ///   divergence beyond solver tolerance is an `Err`.
@@ -392,7 +402,7 @@ where
         // Programmatic path: no declarative block, so no target band — the
         // window-dependent metric (`pct_time_in_window`) is left unreported.
         None,
-        // ...and no `auc_target`, so the signal-AUC pass is skipped and
+        // ...and no `auc_target`, so the window AUC is skipped and
         // `auc_target_attainment` is left unreported.
         None,
         opts,
@@ -478,6 +488,22 @@ fn spec_refusal(message: String) -> EngineError {
         .in_context("simulate_adaptive_from_spec")
 }
 
+/// Check a starting dosing interval against the review grid before any subject runs
+/// (#945). Until a controller changes it, a constant interval schedules every consulted
+/// decision from the first grid point on — a hold consumes its slot exactly as a dose
+/// does — so the due times are a function of the inputs alone, and an interval that
+/// sends one between two grid points is refused here, not on the first subject. The
+/// driver re-checks after every `SetInterval`, which this cannot foresee.
+fn check_start_interval(decision_times: &[f64], interval: f64) -> Result<(), String> {
+    if !(interval.is_finite() && interval > 0.0) {
+        return Err(format!(
+            "start_interval must be positive and finite; got {interval}"
+        ));
+    }
+    crate::ode::adaptive_walk_due_times(decision_times, decision_times[0], interval)
+        .map_err(|msg| format!("start_interval {interval} {msg}"))
+}
+
 /// Shared per-(subject, replicate) orchestration behind [`simulate_adaptive`] and
 /// [`simulate_adaptive_from_spec`]: draw η ~ N(0, Ω) (or take the subject's supplied
 /// η, #1594), mint a **fresh** controller,
@@ -516,7 +542,7 @@ where
     // Start the process-global SS-equilibration non-convergence sink clean (#867, #1652). This
     // must stay the FIRST statement: the base-snapshot precompute below runs its own SS
     // equilibrations, and a clear placed after it would drop the note they wrote. The frozen-
-    // replay verifier and the signal-AUC pass write into the same window — same run, deduped.
+    // replay verifier writes into the same window — same run, deduped.
     crate::dosing::clear_ss_nonconvergence_warnings();
     let params = inputs.params;
 
@@ -601,88 +627,23 @@ where
     let mut decisions: Vec<DecisionLogEntry> = Vec::new();
     let mut metrics: Vec<AdaptiveSubjectMetrics> = Vec::new();
 
-    // `auc_target_attainment` (#391 S2.5b) integrates a dense grid with a single PK
-    // snapshot — exact only for constant-covariate subjects. A time-varying (or
-    // TIME-in-PK) subject would silently get a frozen-PK AUC (there is no exact
-    // per-event dense-grid solver — even the fit path approximates TV states with a
-    // warning, and the adaptive result has no warnings channel). So reject the
-    // combination loudly (#700) rather than report a wrong metric. Every other
-    // adaptive output — predictions, decisions, the dose ledger, `target_window` — is
-    // fully per-event covariate-aware; only this one exposure metric is deferred.
-    //
-    // System resets (EVID=3, #716) are deferred for a *different* reason — not a
-    // frozen snapshot. The dense solver itself IS reset-aware: `adaptive_window_signal_aucs`
-    // drives `ode_dense_solve_states` with the base subject's `reset_times`, and that
-    // solver breaks at each reset and re-seeds the state (`build_segment_break_times` +
-    // `apply_segment_boundary`), so a window entirely before or after a reset integrates
-    // exactly. The gap is the trapezoid: each inter-decision window is integrated on a
-    // *uniform* grid, and a reset is a state discontinuity at an arbitrary time, so the
-    // one window straddling it would need pre- and post-reset nodes (values at rt⁻ and rt⁺)
-    // to integrate the jump correctly — which the uniform grid does not carry. Rather than
-    // report that one window's AUC biased low, defer `auc_target` on reset subjects until
-    // the grid places nodes at reset instants. Every other adaptive output is reset-aware
-    // (the driver and the frozen-replay verifier).
-    if auc_target.is_some()
-        && (model.n_kappa > 0
-            || population
-                .subjects
-                .iter()
-                .any(|s| crate::pk::subject_needs_per_event_pk(model, s) || s.has_resets()))
-    {
-        return Err(super::entry_refusals::adaptive_unsupported(
-            None,
-            "adaptive-dosing `auc_target` is not yet supported for time-varying-covariate, \
-             TIME-in-PK, IOV (`kappa`), or system-reset (EVID=3) subjects. For a drifting \
-             covariate or a per-occasion κ the exposure metric integrates its dense grid from a \
-             single frozen PK snapshot, which is silently wrong when the PK changes across the \
-             horizon. For a reset the dense solver *does* zero the state, but the per-window \
-             trapezoid grid carries no node at the reset instant, so the one window straddling \
-             the reset would integrate that discontinuity inaccurately. Drop `auc_target` (all \
-             other outputs remain per-event / per-occasion / reset aware), or track \
-             #700/#701/#716 for a per-event, reset-node-aware AUC.",
-        ));
-    }
-
     // The driver's refusals that are a function of the inputs alone (#1983): checked here,
     // before any subject is simulated, rather than on the first subject the driver reaches.
-    // Within one subject, in the order the driver checked them; but base × reset now runs
-    // over every subject before `max_decisions` and the monitor checks, so on an input with
-    // two of these faults the one reported first can differ from the driver's.
     //
-    // #702/#930/#931/#932: a pre-scheduled base regimen (loading / maintenance dose) IS
+    // #702/#930/#931/#932: a pre-scheduled base regimen (loading / maintenance dose) is
     // supported on the constant-covariate path (the controller augments it), on the time-
-    // varying-covariate path (#930), and — since #931 — under inter-occasion variability (each
-    // base dose's F resolved from its own occasion-κ / covariate snapshot in the driver). Since
-    // #932 it composes with system resets (EVID=3/4) on the CONSTANT-covariate path: the reset
-    // zeros the state and lowers `reset_floor` (which already turns off base infusions opened
-    // before it — they live in `shadow.doses`, gated by `active_infusions`), and both the
-    // reset-aware static verifier (`ode_predictions_with_extra_breaks`) and the reference
-    // event-driven engine apply Reset < Dose identically, so the degenerate oracle holds.
-    // (An EVID=4 reset+dose row records BOTH a reset and a dose, so its dose is just a base
-    // dose landing at the reset instant — zeroed, then re-applied — reaching this path.)
-    //
-    // Base × reset UNDER a time-varying covariate or IOV stays a typed error: the
-    // per-event-PK replay (`adaptive_frozen_replay_tv`) is itself reset-aware, but its
-    // composition with a base regimen across a reset is not yet oracle-verified against the
-    // reference, so loud-fail rather than risk a silent mis-integration (a #932 follow-up).
-    // "Time-varying or IOV" is the driver's `tv` — `event_pk` is `Some` — decided by the
-    // same two predicates the loop below uses to build `event_pk`.
-    for subject in &population.subjects {
-        let tv = model.n_kappa > 0 || crate::pk::subject_needs_per_event_pk(model, subject);
-        if !subject.doses.is_empty() && subject.has_resets() && tv {
-            return Err(super::entry_refusals::adaptive_unsupported(
-                None,
-                format!(
-                    "subject '{}': a pre-scheduled base regimen combined with system resets \
-                     (EVID=3/4) is not yet supported under time-varying covariates or \
-                     inter-occasion variability; #932 supports base × reset on the \
-                     constant-covariate path only (time-varying-covariate / IOV base × reset is \
-                     a follow-up)",
-                    subject.id
-                ),
-            ));
-        }
-    }
+    // varying-covariate path (#930) and under inter-occasion variability (#931, each base
+    // dose's F resolved from its own occasion-κ / covariate snapshot in the driver). It
+    // composes with system resets (EVID=3/4) on every one of them: the reset zeros the state
+    // and lowers `reset_floor`, which turns off a base infusion opened before it (base
+    // infusions live in `shadow.doses`, gated by `active_infusions`), and the reset-aware
+    // static verifiers (`ode_predictions_with_extra_breaks`, and `adaptive_frozen_replay_tv`
+    // on the time-varying / IOV path) apply Reset < Dose as the reference engines do. An
+    // EVID=4 row records both a reset and a dose, so its dose is a base dose landing at the
+    // reset instant — zeroed, then applied. The time-varying / IOV half (the #932 follow-up)
+    // is pinned by the degenerate oracle against `predict()` / `predict_iov` on a bolus, a
+    // running infusion, an EVID=4 dose and a dose train across the reset
+    // (`adaptive_base_regimen_with_reset_under_{tv_covariate,iov}_…`).
     if decision_times.len() > opts.max_decisions {
         return Err(super::entry_refusals::adaptive_options(format!(
             "decision schedule has {} points, exceeding max_decisions = {} (runaway guard); \
@@ -690,6 +651,9 @@ where
             decision_times.len(),
             opts.max_decisions
         )));
+    }
+    if let Some(d) = opts.start_interval {
+        check_start_interval(decision_times, d).map_err(super::entry_refusals::adaptive_options)?;
     }
     for am in monitors {
         let m = am.spec;
@@ -740,7 +704,7 @@ where
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         for (subject, supplied) in population.subjects.iter().zip(&supplied_etas) {
-            // Held for the whole subject: the driver, the verifiers and the AUC pass all
+            // Held for the whole subject: the driver (and its window AUC) and the verifiers all
             // read `MIXNUM`, and every use of `params` below is this class's.
             let class = classes.enter(subject, 1, sim);
             let params = class.params;
@@ -835,7 +799,7 @@ where
             // snapshot below. The IOV snapshot is owned (recomputed per replicate as κ
             // is redrawn); the #700-only path reuses `event_pk_buf`. One shared
             // predicate (`subject_needs_per_event_pk`) gates the #700 branch, the
-            // materialiser, and the `auc_target` guard so they cannot drift apart.
+            // materialiser, and the base × reset guard so they cannot drift apart.
             let event_pk_iov: Option<crate::pk::EventPkParams> = eta_occ.as_ref().map(|eo| {
                 // IOV: each obs / pk-only record carries its occasion's κ (and any
                 // #700 covariate); records before the first decision use the baseline.
@@ -913,6 +877,11 @@ where
 
             // A fresh controller per (subject, replicate) — see the factory note.
             let mut controller = make_controller();
+            // The exposure metric's window AUCs (#391 S2.5b), integrated by the driver on its
+            // own walk (#943): requested only when an `auc_target` is declared (its sole
+            // consumer) and a monitor exists to read.
+            let mut window_aucs: Vec<f64> = Vec::new();
+            let want_aucs = auc_target.is_some() && !monitors.is_empty();
             // A refusal carries the code of its kind; a runtime failure carries none (#1983).
             let run: AdaptiveRun = crate::ode::ode_predictions_adaptive_impl(
                 ode,
@@ -928,6 +897,8 @@ where
                 &mut controller,
                 opts.max_decisions,
                 Some(&assay),
+                want_aucs.then_some(&mut window_aucs),
+                opts.start_interval,
             )
             .map_err(|e| match e {
                 crate::ode::AdaptiveDriverError::Refusal { kind, message } => entry.driver_refusal(
@@ -1015,72 +986,35 @@ where
                 });
             }
 
-            // Signal-AUC pass for the exposure metric (#391 S2.5b): run only when an
-            // `auc_target` is declared (its sole consumer) and a monitor exists. It
-            // re-integrates the realized ledger on its own dense grid — separate from,
-            // and never perturbing, the reactive run + verifier above.
+            // The window AUCs cover the **realized** decisions only (the driver truncates to
+            // `run.decisions`), NOT the full scheduled `decision_times`: after a `Stop` the
+            // controller discontinues and the later scheduled decisions never happen, so
+            // scoring their dose-free, washed-out windows would fold discontinuation —
+            // already a first-class outcome (`discontinued` / `time_to_discontinuation`) —
+            // into the exposure metric as silent misses (double-counting one event into two
+            // metrics). Confining to realized decisions keeps `auc_target_attainment` a clean
+            // "of the windows we dosed, how many hit target", on the same realized basis as
+            // `pct_time_in_window`. For a run that never discontinues the two decision lists
+            // are identical.
             //
-            // Windowed over the **realized** decision times (`run.decisions`), NOT the
-            // full scheduled `decision_times`: after a `Stop` the controller
-            // discontinues and the later scheduled decisions never happen, so scoring
-            // their dose-free, washed-out windows would fold discontinuation — already
-            // a first-class outcome (`discontinued` / `time_to_discontinuation`) — into
-            // the exposure metric as silent misses (double-counting one event into two
-            // metrics). Confining to realized decisions keeps `auc_target_attainment`
-            // a clean "of the windows we dosed, how many hit target", on the same
-            // realized basis as `pct_time_in_window`. For a run that never
-            // discontinues the two decision lists are identical.
-            //
-            // Dropping the post-`Stop` windows loses no *dosed* window: a declarative
-            // `Stop` is dose-free (`adaptive_control::Controller::apply` maps it to
-            // `[DoseAction::Stop]`, never `[dose, Stop]`), so the last realized window
-            // already covers the last dose. The one controller that *can* dose-then-
-            // stop is the programmatic `Vec<DoseAction>` API, and that path runs with
-            // `auc_target = None` (the AUC pass is skipped) — so a dose issued *at* a
-            // stop never coincides with this metric. If that ever changes (a
-            // dose-on-stop reaching the AUC pass), the final dose's window would need
-            // explicit handling — the `debug_assert!` in the match arm below is the
-            // tripwire for exactly that, and `sim::adaptive::run_has_dose_on_stop` (with
-            // its unit test plus the `..._after_discontinuation` test) pins the
-            // dose-free-`Stop` invariant this relies on.
-            let window_aucs: Vec<f64> = match (auc_target, monitors.first()) {
-                (Some(_), Some(mon)) => {
-                    // Tripwire (see the note above): realized-window scoring is exact only
-                    // while no `Stop` carries a dose. Unreachable today; this fires in
-                    // debug/test builds if a future change ever routes a dose-on-stop here,
-                    // rather than silently under-reporting that final dose's exposure.
-                    debug_assert!(
-                        !crate::sim::adaptive::run_has_dose_on_stop(&run.decisions),
-                        "auc_target_attainment: a Stop carried a final dose (`[dose, Stop]`); \
-                         its post-stop exposure window is unscored under realized-window \
-                         scoring — the dose-free-Stop invariant no longer holds, so that \
-                         window now needs explicit handling"
-                    );
-                    let realized_decision_times: Vec<f64> =
-                        run.decisions.iter().map(|d| d.time).collect();
-                    let aucs = crate::ode::adaptive_window_signal_aucs(
-                        ode,
-                        &pk.values,
-                        &params.theta,
-                        &eta_slice,
-                        subject,
-                        &realized_decision_times,
-                        &run.ledger,
-                        mon.observe,
-                        mon.spec.cmt,
-                    );
-                    // The pass integrates the bare readout (#2129).
-                    adaptive_window_aucs_to_model_scale(
-                        model,
-                        subject,
-                        mon,
-                        &eta_slice,
-                        eta_occ.as_deref(),
-                        aucs,
-                    )
-                }
-                _ => Vec::new(),
-            };
+            // Dropping the post-`Stop` windows loses no *dosed* window: a declarative `Stop`
+            // is dose-free (`adaptive_control::Controller::apply` maps it to
+            // `[DoseAction::Stop]`, never `[dose, Stop]`), so the last realized window already
+            // covers the last dose. The one controller that *can* dose-then-stop is the
+            // programmatic `Vec<DoseAction>` API, and that path runs with `auc_target = None`
+            // (no AUC is requested) — so a dose issued *at* a stop never coincides with this
+            // metric. If that ever changes, the final dose's window would need explicit
+            // handling — the `debug_assert!` below is the tripwire for exactly that, and
+            // `sim::adaptive::run_has_dose_on_stop` (with its unit test plus the
+            // `..._after_discontinuation` test) pins the dose-free-`Stop` invariant this
+            // relies on.
+            debug_assert!(
+                !want_aucs || !crate::sim::adaptive::run_has_dose_on_stop(&run.decisions),
+                "auc_target_attainment: a Stop carried a final dose (`[dose, Stop]`); its \
+                 post-stop exposure window is unscored under realized-window scoring — the \
+                 dose-free-Stop invariant no longer holds, so that window now needs explicit \
+                 handling"
+            );
 
             // Per-subject outcome metrics for this run, computed from its realized
             // ledger + decision log (S2.4) and the window AUC series (S2.5b). Taken
@@ -1153,54 +1087,6 @@ where
         metrics,
         warnings,
     })
-}
-
-/// Divide the `auc_target` window AUCs, integrated on the bare readout, by the
-/// monitor's `[scaling]` divisor (#2129).
-///
-/// The divisor is evaluated once per subject: under `eta_slice` (κ = 0) and, as
-/// `apply_scaling` always does, on the static covariate snapshot at t = 0. Dividing the
-/// window AUC by it is exact while two conditions hold, and each `debug_assert!` below
-/// states one of them:
-///
-/// - **No decision-window κ.** Under IOV each window reads under its own `[η | κ_g]`, so
-///   a κ the divisor reads moves it between windows, and one κ = 0 divisor is wrong.
-/// - **No per-event PK.** This divide is right for such a subject, since the divisor
-///   never follows the covariates. The AUC it divides is not: the window pass integrates
-///   one frozen PK snapshot, so a time-varying covariate or `TIME` in the PK leaves the
-///   integrand itself wrong.
-///
-/// The `auc_target` refusal in `run_adaptive_population` keeps both cases out today, so
-/// neither fires in production. They state the conditions at the place that relies on
-/// them, so a widened refusal fails here in debug builds. The second one calls the same
-/// `subject_needs_per_event_pk` the refusal calls, so it shares that predicate's
-/// definition of per-event PK. Both go when #943 rewrites the window pass per grid point
-/// (#2156). Pinned by `adaptive_frem_tests::window_auc_divide_asserts_no_decision_kappa`
-/// and `adaptive_frem_tests::window_auc_divide_asserts_no_per_event_pk`.
-pub(crate) fn adaptive_window_aucs_to_model_scale(
-    model: &CompiledModel,
-    subject: &Subject,
-    mon: &crate::sim::adaptive::AdaptiveMonitor,
-    eta_slice: &[f64],
-    eta_occ: Option<&[Vec<f64>]>,
-    aucs: Vec<f64>,
-) -> Vec<f64> {
-    debug_assert!(
-        eta_occ.is_none(),
-        "auc_target: subject '{}' has a decision-window κ, so its [scaling] divisor can \
-         change between windows, but the window AUCs are divided by one κ = 0 divisor; \
-         convert per grid point instead (#943)",
-        subject.id
-    );
-    debug_assert!(
-        !crate::pk::subject_needs_per_event_pk(model, subject),
-        "auc_target: subject '{}' needs per-event PK, but the window AUCs integrate one \
-         frozen PK snapshot; integrate per event instead (#943)",
-        subject.id
-    );
-    aucs.into_iter()
-        .map(|auc| mon.scale_readout(auc, eta_slice))
-        .collect()
 }
 
 /// Put the adaptive driver's bare readout rows on the scale `simulate()` reports: the
@@ -1513,8 +1399,9 @@ fn slice_bits_eq(a: &[f64], b: &[f64]) -> bool {
 /// `EVENT_MATCH_TOL`) — a base dose row, an EVID=2 row, an observation or an EVID=3/4
 /// reset row; at one instant the last processed, i.e. observation over EVID=2 over dose
 /// over reset, and within one kind the row listed last; the subject's baseline covariates
-/// before the first record. `subject.doses` must hold the base regimen only, as it does
-/// in `run_adaptive_population`.
+/// before the first record. An `ADDL`-implied dose is not a data record (#2528): it carries
+/// its governing record's covariates, recorded after it. `subject.doses` must hold the base
+/// regimen only, as it does in `run_adaptive_population`.
 ///
 /// One sorted pass over the records walked alongside the decisions in time order, so this
 /// default-on check costs O((R + D) log) per subject and replicate, not O(R × D).
@@ -1529,7 +1416,11 @@ pub(super) fn decision_covs_by_scan<'a>(
     rows.extend(
         (0..subject.reset_times.len()).map(|r| (subject.reset_times[r], subject.reset_cov(r))),
     );
-    rows.extend((0..subject.doses.len()).map(|k| (subject.doses[k].time, subject.dose_cov(k))));
+    rows.extend(
+        (0..subject.doses.len())
+            .filter(|&k| subject.doses[k].implied.is_none())
+            .map(|k| (subject.doses[k].time, subject.dose_cov(k))),
+    );
     rows.extend(
         (0..subject.pk_only_times.len())
             .map(|m| (subject.pk_only_times[m], subject.pk_only_cov(m))),
@@ -1628,12 +1519,15 @@ fn check_event_pk_records(
         ));
     }
     // The engine clock picks the occasion; `$PK` reads the TIME as written (#1969). An
-    // `ADDL`-implied dose then takes its parent row's lag (#1909).
+    // `ADDL`-implied dose takes both from its governing record (#1909, #2371) — read off the
+    // raw field here, not through `Subject::dose_occasion_time`, the builder's helper — and
+    // its lag from its parent row (#1909).
     let mut want_dose: Vec<crate::types::PkParams> = (0..subject.doses.len())
         .map(|k| {
+            let d = &subject.doses[k];
             (model.pk_param_fn)(
                 theta,
-                eta_at(subject.doses[k].time),
+                eta_at(d.implied.map_or(d.time, |i| i.gov_time)),
                 subject.dose_cov(k),
                 subject.dose_param_time(k),
             )
@@ -1736,7 +1630,9 @@ fn check_event_pk_records(
 /// The decision schedule (`spec.at`) and the monitored signal (`spec.observe`)
 /// come from the block, so `opts.decision_times` and `opts.monitors` **must be
 /// left empty**: setting either is a typed error rather than a silently-ignored
-/// field (the spec would otherwise have two sources of truth). `opts.seed`,
+/// field (the spec would otherwise have two sources of truth). The same holds for
+/// the dosing interval (#945): the block's `start_interval` is used, and a set
+/// `opts.start_interval` is refused. `opts.seed`,
 /// `opts.verify`, and `opts.max_decisions` apply exactly as for
 /// [`simulate_adaptive`].
 ///
@@ -1798,6 +1694,18 @@ pub fn simulate_adaptive_from_spec_with_inputs(
              block's `observe`; leave `opts.monitors` empty",
         ));
     }
+    if opts.start_interval.is_some() {
+        return Err(super::entry_refusals::adaptive_options(
+            "simulate_adaptive_from_spec takes its dosing interval from the \
+             [adaptive_dosing] block's `intervals` / `start_interval`; leave \
+             `opts.start_interval` empty",
+        ));
+    }
+    // The block's starting interval reaches the driver through the same option the
+    // programmatic entry uses, so both run one due mask and one up-front grid check.
+    let mut opts = opts.clone();
+    opts.start_interval = spec.start_interval;
+    let opts = &opts;
 
     // Compile the block against the model: the `observe` expression, the single
     // `signal` monitor (carrying the assay endpoint under `with_assay_error`), and
@@ -1864,7 +1772,7 @@ pub fn simulate_adaptive_from_spec_with_inputs(
         // `pct_time_in_window` metric (it never influences dosing).
         spec.target_window,
         // ...and the optional exposure band feeds `auc_target_attainment` (likewise
-        // metrics-only); `Some` here is what turns on the signal-AUC pass.
+        // metrics-only); `Some` here is what turns on the window AUC.
         spec.auc_target,
         opts,
         AdaptiveEntry::Spec {

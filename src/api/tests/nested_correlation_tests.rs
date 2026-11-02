@@ -162,6 +162,7 @@ fn each_level_term_of_r_tilde_enters_the_iov_foce_marginal() {
         s,
         &p.theta,
         &p.sigma.values,
+        m.residual_cov_at(p),
         false,
         &lin,
     );
@@ -298,6 +299,7 @@ fn rho_zero_composes_with_the_nested_fit_and_rho_moves_it() {
                 s,
                 &p.theta,
                 &p.sigma.values,
+                m.residual_cov_at(p),
                 true,
                 &lin,
             );

@@ -20,7 +20,8 @@ use std::collections::HashMap;
 /// A dosing action a controller can take at a decision time.
 ///
 /// `Hold` and `Stop` carry no payload: `Hold` skips *this* decision (the regimen
-/// continues), while `Stop` discontinues all future dosing for the subject. Only
+/// continues), while `Stop` discontinues all future dosing for the subject.
+/// `SetInterval` changes the dosing interval from this decision on (#945). Only
 /// `Bolus`/`Infuse` map to a [`DoseEvent`] — see [`DoseAction::to_dose_event`].
 ///
 /// `#[non_exhaustive]`: new actions (e.g. the infusion-truncating safety-halt of
@@ -43,6 +44,14 @@ pub enum DoseAction {
     /// the schedule, it does not retract an active infusion. Truncating an
     /// in-flight infusion is a distinct action tracked in #495.
     Stop,
+    /// Set the dosing interval to `interval` from this decision on (#945). The
+    /// decision schedule stays a fixed review grid; a grid point is *due* once
+    /// `interval` has passed since the last decision the controller was consulted
+    /// at, and the controller is consulted only at due points (the others are
+    /// logged as [`DecisionOutcome::NotDue`]). The next due time must land on a
+    /// grid point or past the last one. At most one per decision, never together
+    /// with `Stop`; it composes with one dose (or `Hold`).
+    SetInterval { interval: f64 },
 }
 
 impl DoseAction {
@@ -60,7 +69,7 @@ impl DoseAction {
             DoseAction::Infuse { amt, cmt, rate } => {
                 Some(DoseEvent::new(time, amt, cmt, rate, false, 0.0))
             }
-            DoseAction::Hold | DoseAction::Stop => None,
+            DoseAction::Hold | DoseAction::Stop | DoseAction::SetInterval { .. } => None,
         }
     }
 
@@ -75,14 +84,22 @@ impl DoseAction {
     /// integrator: compartment `0` (CMT is 1-based — `cmt - 1` would underflow a
     /// `usize`), a non-positive or non-finite infusion `rate` (which
     /// [`DoseEvent::new`] would silently turn into a zero-duration "infusion",
-    /// i.e. a degenerate bolus), and a non-finite / negative `amt`. `Hold`/`Stop`
-    /// are always valid. The driver (S1.3a) calls this and surfaces the error
+    /// i.e. a degenerate bolus), a non-finite / negative `amt`, and a
+    /// `SetInterval` that is not positive and finite. `Hold`/`Stop` are always valid. The driver (S1.3a) calls this and surfaces the error
     /// rather than letting a bad action reach the integrator.
     pub fn validate(&self) -> Result<(), String> {
         let (amt, cmt, rate) = match *self {
             DoseAction::Bolus { amt, cmt } => (amt, cmt, None),
             DoseAction::Infuse { amt, cmt, rate } => (amt, cmt, Some(rate)),
             DoseAction::Hold | DoseAction::Stop => return Ok(()),
+            DoseAction::SetInterval { interval } => {
+                if !(interval.is_finite() && interval > 0.0) {
+                    return Err(format!(
+                        "SetInterval requires a positive, finite interval; got {interval}"
+                    ));
+                }
+                return Ok(());
+            }
         };
         if cmt == 0 {
             return Err("dose target compartment is 0, but CMT is 1-based".to_string());
@@ -232,6 +249,10 @@ pub struct ControllerCtx<'a> {
     /// Resolved monitored signals keyed by [`MonitorSpec::name`] (latent or
     /// assay-noised per each monitor's mode).
     pub signals: &'a HashMap<String, f64>,
+    /// The dosing interval in force before this decision (#945): the last
+    /// [`DoseAction::SetInterval`], else the run's starting interval. `None` while
+    /// no interval is set, i.e. every grid point is due.
+    pub interval: Option<f64>,
 }
 
 impl ControllerCtx<'_> {
@@ -290,7 +311,10 @@ pub struct DoseLedgerEntry {
 /// decision (invisible in the dose ledger) is still on the record. `Stop` carries
 /// `dosed` so a "give a final dose, then discontinue" action list (`[Bolus, Stop]`)
 /// is logged faithfully rather than as a bare stop.
+///
+/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecisionOutcome {
     /// The controller issued `n` realized dose(s) (bolus/infusion with `amt > 0`).
     /// Always `n >= 1`: a decision whose actions are all `Hold` or zero-amount is
@@ -304,6 +328,11 @@ pub enum DecisionOutcome {
     /// final action — the driver rejects any action after it — so `dosed` is a
     /// faithful count, never an undercount from a silently-dropped trailing dose.
     Stop { dosed: usize },
+    /// The grid point was not due under the current dosing interval (#945): the
+    /// controller was not consulted and no dose was given. The monitors were still
+    /// read, so the entry carries its `observed_signals`. Distinct from `Hold`,
+    /// which is a consulted decision that chose not to dose.
+    NotDue,
 }
 
 /// One decision the controller made, recorded for **every** decision time —
@@ -323,7 +352,10 @@ pub enum DecisionOutcome {
 ///
 /// A decision reached *after* a `Stop` is not logged — once discontinued the
 /// driver issues no further decisions, so the `Stop` entry is the last record.
+///
+/// `#[non_exhaustive]`: new audit fields land additively.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DecisionLogEntry {
     /// Subject id.
     pub subject: String,
@@ -338,8 +370,11 @@ pub struct DecisionLogEntry {
     /// What the controller observed at this decision (per-analyte value + mode) —
     /// the exact inputs to reproduce the decision.
     pub observed_signals: Vec<ObservedSignal>,
-    /// What the controller did (dose / hold / stop).
+    /// What the controller did (dose / hold / stop), or `NotDue`.
     pub outcome: DecisionOutcome,
+    /// The dosing interval in force after this decision (#945); `None` while no
+    /// interval is set, i.e. every grid point is due.
+    pub interval: Option<f64>,
 }
 
 /// Result of one reactive-dosing run over a single subject: the observation-time
@@ -403,8 +438,12 @@ pub struct AdaptiveSubjectMetrics {
     /// Times the realized dose stepped **down** relative to the previous realized
     /// dose (see [`AdaptiveSubjectMetrics::n_increases`]).
     pub n_decreases: usize,
-    /// Decisions that issued no dose ([`DecisionOutcome::Hold`]).
+    /// Consulted decisions that issued no dose ([`DecisionOutcome::Hold`]); grid
+    /// points that were not due are counted in `n_not_due`, not here.
     pub n_holds: usize,
+    /// Grid points at which the controller was not consulted because no dose was
+    /// due under the current dosing interval ([`DecisionOutcome::NotDue`], #945).
+    pub n_not_due: usize,
     /// Whether the controller discontinued (a [`DecisionOutcome::Stop`] decision).
     pub discontinued: bool,
     /// Time of the `Stop` decision, or `None` if the run never discontinued.
@@ -432,10 +471,11 @@ pub struct AdaptiveSubjectMetrics {
     /// denominator is the number of windows between consecutive **realized**
     /// decisions (`realized_decisions − 1`), so a run with fewer than two decisions
     /// has no window and the metric is `None`. `None` also when no `auc_target` is
-    /// declared (the signal-AUC pass is then skipped). Unlike the point summary above,
-    /// this is an **integrated-exposure** quantity: it is computed by re-integrating
-    /// the realized dose ledger on a dense grid (the AUC pass never perturbs the
-    /// reactive run), not reduced from the decision-grid signals.
+    /// declared (the window AUC is then skipped). Unlike the point summary above,
+    /// this is an **integrated-exposure** quantity: the reactive driver integrates the
+    /// signal over each window on the run's own trajectory, with a node on each side of
+    /// every dose, reset or infusion end inside it (#943; requesting it leaves the run
+    /// bit-identical), not reduced from the decision-grid signals.
     ///
     /// **Scored over realized decisions only.** If the controller `Stop`s, the later
     /// *scheduled* decisions never happen, and their dose-free, washed-out windows are
@@ -458,14 +498,14 @@ pub struct AdaptiveSubjectMetrics {
 /// `true` if any logged decision is a `Stop` that *also* issued a dose — the
 /// `[dose, Stop]` shape (`DecisionOutcome::Stop { dosed > 0 }`).
 ///
-/// The realized-window signal-AUC pass (`auc_target_attainment`) relies on this
+/// The realized-window AUC (`auc_target_attainment`) relies on this
 /// being **false**: it scores only the windows between realized decisions, so a
 /// dose issued *at* a stop has no following decision to bound its window and would
 /// be silently dropped. That case is currently unreachable on the AUC path — a
 /// declarative `Stop` is dose-free, and the only controller that can dose-then-stop
 /// (the programmatic API) runs with `auc_target = None` — so the call site
 /// `debug_assert!`s on this predicate rather than handling the window. If a future
-/// change lets a dose-on-stop reach the AUC pass, the assert trips in debug/test
+/// change lets a dose-on-stop reach the window AUC, the assert trips in debug/test
 /// builds instead of quietly under-reporting exposure.
 pub(crate) fn run_has_dose_on_stop(decisions: &[DecisionLogEntry]) -> bool {
     decisions
@@ -480,7 +520,7 @@ pub(crate) fn run_has_dose_on_stop(decisions: &[DecisionLogEntry]) -> bool {
 /// sim)` run (the rows the per-subject driver emits), in emission order: `ledger`
 /// in dose order and `decisions` in schedule order. `window_aucs` is that run's
 /// per-(inter-decision)-window signal AUC series (one entry per closed window,
-/// `decisions − 1` long), supplied by the caller's signal-AUC pass — `&[]` when
+/// `decisions − 1` long), supplied by the driver's window AUC — `&[]` when
 /// no `auc_target` is declared (the pass is skipped). The function is **pure**: it
 /// re-integrates nothing, treating `window_aucs` as just another input artifact, so
 /// it stays unit-testable on hand-built rows. `target_window` / `auc_target` come
@@ -521,6 +561,10 @@ pub(crate) fn compute_subject_metrics(
         .iter()
         .filter(|d| matches!(d.outcome, DecisionOutcome::Hold))
         .count();
+    let n_not_due = decisions
+        .iter()
+        .filter(|d| matches!(d.outcome, DecisionOutcome::NotDue))
+        .count();
     let stop = decisions
         .iter()
         .find(|d| matches!(d.outcome, DecisionOutcome::Stop { .. }));
@@ -554,7 +598,7 @@ pub(crate) fn compute_subject_metrics(
     };
 
     // Exposure attainment: the fraction of inter-decision windows whose signal AUC
-    // is in band. The denominator is the number of windows the AUC pass produced
+    // is in band. The denominator is the number of windows the driver integrated
     // (`decisions − 1`); `window_aucs` is empty when no `auc_target` is declared (or
     // there is fewer than one window), so both leave the metric `None`.
     let auc_target_attainment = match auc_target {
@@ -574,6 +618,7 @@ pub(crate) fn compute_subject_metrics(
         n_increases,
         n_decreases,
         n_holds,
+        n_not_due,
         discontinued,
         time_to_discontinuation,
         signal_min,
@@ -727,6 +772,7 @@ pub(crate) struct AssayNoise<'a> {
 /// `with_assay_error = false`) **or** `with_assay_error = true` naming a model
 /// output via `assay_cmt` — never both.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AdaptiveDosingSpec {
     /// The latent (Ipred) monitored signal — a free-form expression over states +
     /// individual parameters (e.g. `central / V`), compiled against the model in
@@ -786,10 +832,19 @@ pub struct AdaptiveDosingSpec {
     /// ([`AdaptiveSubjectMetrics::auc_target_attainment`], #391 S2.5b) and never
     /// influences dosing. `low` must be finite and `≥ 0` (an AUC of a non-negative
     /// signal cannot be negative); `high` may be `+∞` for a one-sided "at or above
-    /// `low`" target. `None` leaves the metric unreported (the signal-AUC pass is
+    /// `low`" target. `None` leaves the metric unreported (the window AUC is
     /// then skipped entirely — it is the metric's only consumer). See
     /// [`AdaptiveSubjectMetrics::auc_target_attainment`].
     pub auc_target: Option<(f64, f64)>,
+    /// The dosing-interval ladder (#945), strictly increasing and positive, like
+    /// `levels` for the dose. A rule's `lengthen` / `shorten` steps one rung and
+    /// saturates at both ends. Set together with `start_interval`, or neither.
+    pub intervals: Option<Vec<f64>>,
+    /// The dosing interval in force from the first decision (#945): one of
+    /// `intervals`. A grid point of `at` is then due only once this long has passed
+    /// since the last consulted decision; the other points log `not_due`. `None`
+    /// (without `intervals`) consults every point, as before.
+    pub start_interval: Option<f64>,
     /// The first-matching-rule ladder, in file order.
     pub rules: Vec<AdaptiveRule>,
 }
@@ -988,6 +1043,78 @@ impl AdaptiveDosingSpec {
                 }
             }
         }
+        self.validate_intervals()
+    }
+
+    /// The dosing-interval ladder's invariants (#945), shared by the parser and the
+    /// hand-built path through [`AdaptiveDosingSpec::validate`]. The check that each
+    /// interval lands on the `at` grid needs the `every` step and stays in the parser;
+    /// on an explicit list it is the driver's, at the decision that sets the interval.
+    fn validate_intervals(&self) -> Result<(), String> {
+        let steps_interval = self.rules.iter().any(|r| r.interval.is_some());
+        match (&self.intervals, self.start_interval) {
+            (None, None) => {
+                if steps_interval {
+                    return Err("[adaptive_dosing]: `lengthen` / `shorten` require an \
+                                `intervals = [...]` ladder and a `start_interval`"
+                        .to_string());
+                }
+            }
+            (Some(_), None) => {
+                return Err(
+                    "[adaptive_dosing]: `intervals` requires a `start_interval` (one of the \
+                     intervals), the interval in force from the first decision"
+                        .to_string(),
+                )
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "[adaptive_dosing]: `start_interval` requires an `intervals = [...]` ladder; \
+                     for a fixed interval write `intervals = [d]` and `start_interval = d`"
+                        .to_string(),
+                )
+            }
+            (Some(l), Some(start)) => {
+                validate_increasing_finite(l, "intervals")?;
+                // Strictly increasing ⇒ `l[0]` is the minimum.
+                if l[0] <= 0.0 {
+                    return Err(format!(
+                        "[adaptive_dosing]: intervals must be > 0: {}",
+                        l[0]
+                    ));
+                }
+                if !l.contains(&start) {
+                    return Err(format!(
+                        "[adaptive_dosing]: start_interval {start} must be one of the declared \
+                         intervals {l:?}"
+                    ));
+                }
+            }
+        }
+        if let Some(r) = self
+            .rules
+            .iter()
+            .find(|r| r.interval.is_some() && r.action == AdaptiveAction::Stop)
+        {
+            return Err(format!(
+                "[adaptive_dosing]: `stop` cannot be combined with `lengthen` / `shorten` (a \
+                 stopped course has no next dose): when {}",
+                r.label()
+            ));
+        }
+        // `Maintain` is the dose effect of an interval-only rule; without the interval
+        // effect the rule does nothing, and its label would name no effect at all.
+        if let Some(r) = self
+            .rules
+            .iter()
+            .find(|r| r.interval.is_none() && r.action == AdaptiveAction::Maintain)
+        {
+            return Err(format!(
+                "[adaptive_dosing]: a rule must have an effect; `Maintain` is only the dose \
+                 effect of a rule that also lengthens or shortens the interval: when {}",
+                r.label().trim_end()
+            ));
+        }
         Ok(())
     }
 }
@@ -1002,7 +1129,10 @@ pub enum AdaptiveRoute {
 }
 
 /// One rung of the ladder: `when signal <op> <threshold> : <action>`.
+///
+/// `#[non_exhaustive]`: new rule effects land additively.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AdaptiveRule {
     /// The comparison applied to the observed `signal`.
     pub op: Comparison,
@@ -1010,6 +1140,32 @@ pub struct AdaptiveRule {
     pub threshold: f64,
     /// What to do when this rule is the first to match.
     pub action: AdaptiveAction,
+    /// The rule's interval effect, if any (#945): step the `intervals` ladder one
+    /// rung. Composes with `action`, which is then [`AdaptiveAction::Maintain`]
+    /// for an interval-only rule.
+    pub interval: Option<IntervalStep>,
+}
+
+/// A rule's interval effect: one rung along the `intervals` ladder (#945),
+/// saturating at both ends.
+///
+/// `#[non_exhaustive]`: new interval effects land additively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IntervalStep {
+    /// The next longer interval (`lengthen`).
+    Lengthen,
+    /// The next shorter interval (`shorten`).
+    Shorten,
+}
+
+impl IntervalStep {
+    fn label(self) -> &'static str {
+        match self {
+            IntervalStep::Lengthen => "lengthen",
+            IntervalStep::Shorten => "shorten",
+        }
+    }
 }
 
 /// A signal comparison operator.
@@ -1028,7 +1184,10 @@ pub enum Comparison {
 }
 
 /// What a matched rule does to the running dose.
+///
+/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum AdaptiveAction {
     /// Raise the dose (by a percentage, or one level if the block declares `levels`).
     Increase(DoseStep),
@@ -1038,6 +1197,9 @@ pub enum AdaptiveAction {
     Hold,
     /// Discontinue all future dosing.
     Stop,
+    /// Re-issue the running dose unchanged: the dose effect of a rule that only
+    /// changes the interval (`when signal > 15 : lengthen`, #945).
+    Maintain,
 }
 
 /// The magnitude of an [`AdaptiveAction::Increase`] / [`AdaptiveAction::Decrease`].
@@ -1073,6 +1235,7 @@ impl AdaptiveAction {
             AdaptiveAction::Decrease(DoseStep::Level) => "decrease".to_string(),
             AdaptiveAction::Hold => "hold".to_string(),
             AdaptiveAction::Stop => "stop".to_string(),
+            AdaptiveAction::Maintain => String::new(),
         }
     }
 }
@@ -1082,11 +1245,16 @@ impl AdaptiveRule {
     /// (`"signal < 10 : increase 25%"`) — recorded as the dose ledger's
     /// `rule_fired` so an audit can name which rung produced each dose.
     pub(crate) fn label(&self) -> String {
+        let effects: Vec<String> = [self.action.label()]
+            .into_iter()
+            .chain(self.interval.map(|i| i.label().to_string()))
+            .filter(|e| !e.is_empty())
+            .collect();
         format!(
             "signal {} {} : {}",
             self.op.symbol(),
             self.threshold,
-            self.action.label()
+            effects.join(", ")
         )
     }
 }
@@ -1168,7 +1336,10 @@ mod tests {
                 op: Comparison::Lt,
                 threshold: 10.0,
                 action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+                interval: None,
             }],
+            intervals: None,
+            start_interval: None,
         }
     }
 
@@ -1186,6 +1357,7 @@ mod tests {
                 op: Comparison::Lt,
                 threshold: 10.0,
                 action: AdaptiveAction::Increase(DoseStep::Level),
+                interval: None,
             }]
         };
 
@@ -1249,6 +1421,7 @@ mod tests {
             op: Comparison::Lt,
             threshold: 10.0,
             action: AdaptiveAction::Increase(DoseStep::Level),
+            interval: None,
         }];
         assert!(s.validate().unwrap_err().contains("strictly increasing"));
     }
@@ -1343,6 +1516,7 @@ mod tests {
             history: &history,
             decision_index: 0,
             signals: &signals,
+            interval: None,
         };
 
         assert_eq!(ctx.t, 24.0);
@@ -1395,6 +1569,7 @@ mod tests {
             time: 72.0,
             observed_signals: vec![obs.clone()],
             outcome: DecisionOutcome::Dosed { n: 2 },
+            interval: None,
         };
         assert_eq!(entry.clone(), entry);
         assert_eq!(entry.observed_signals[0], obs);
@@ -1636,6 +1811,7 @@ mod tests {
                 })
                 .unwrap_or_default(),
             outcome,
+            interval: None,
         }
     }
 
@@ -1758,7 +1934,7 @@ mod tests {
         assert_eq!(m.signal_max, None);
         assert_eq!(m.signal_mean, None);
         assert_eq!(m.pct_time_in_window, None);
-        // An `auc_target` was set, but the AUC pass produced no windows (no run), so
+        // An `auc_target` was set, but the driver integrated no windows (no run), so
         // the exposure metric is `None` rather than a 0/0 NaN.
         assert_eq!(m.auc_target_attainment, None);
     }
@@ -1807,7 +1983,7 @@ mod tests {
     fn metrics_auc_target_attainment_counts_windows_in_band() {
         // `auc_target_attainment` is a pure reduction of the caller's per-window AUC
         // series against the band — exercise it directly on a hand-built series (the
-        // AUC pass that produces it is integration-tested separately). Four windows
+        // driver's window AUC that produces it is tested separately). Four windows
         // with AUCs [380, 450, 520, 610]; the band is the vancomycin AUC₂₄ target.
         let ledger = vec![ledger_entry(100.0)];
         let decisions = vec![decision(0.0, Some(10.0), DecisionOutcome::Dosed { n: 1 })];
@@ -1862,7 +2038,7 @@ mod tests {
 
     #[test]
     fn run_has_dose_on_stop_flags_only_dose_carrying_stops() {
-        // The invariant the realized-window AUC pass relies on: no `[dose, Stop]`. A
+        // The invariant the realized-window AUC relies on: no `[dose, Stop]`. A
         // declarative `Stop` is dose-free (`dosed: 0`); a dose issued *at* a stop
         // (`dosed > 0`, the programmatic `[Bolus, Stop]` shape) is what would strand
         // an unscored final-dose window — the call-site `debug_assert!` trips on it.
@@ -1913,5 +2089,160 @@ mod tests {
         let mut s = base_spec();
         s.auc_target = Some((400.0, f64::INFINITY));
         assert!(s.validate().is_ok());
+    }
+
+    /// `SetInterval` injects nothing and must carry a positive, finite interval (#945).
+    /// Kills the `validate` guard (a zero / negative / non-finite interval would reach the
+    /// driver, where `t + 0` makes every later point due at once and `NaN` never due).
+    #[test]
+    fn set_interval_maps_to_no_dose_and_validates_its_interval() {
+        assert!(DoseAction::SetInterval { interval: 24.0 }
+            .to_dose_event(0.0)
+            .is_none());
+        assert!(!DoseAction::SetInterval { interval: 24.0 }.is_stop());
+        assert!(DoseAction::SetInterval { interval: 24.0 }
+            .validate()
+            .is_ok());
+        for bad in [0.0, -12.0, f64::NAN, f64::INFINITY] {
+            let err = DoseAction::SetInterval { interval: bad }
+                .validate()
+                .unwrap_err();
+            assert!(err.contains("positive, finite interval"), "{bad}: {err}");
+        }
+    }
+
+    /// A not-due grid point is counted in `n_not_due`, never as a hold, and its signal still
+    /// feeds the signal summary (#945). Kills `NotDue` counted as `Hold`, and a summary that
+    /// skips not-due rows (`signal_mean` would be 10, not 15).
+    #[test]
+    fn metrics_count_not_due_apart_from_holds() {
+        let decisions = vec![
+            decision(0.0, Some(10.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(12.0, Some(20.0), DecisionOutcome::NotDue),
+            decision(24.0, Some(10.0), DecisionOutcome::Hold),
+            decision(36.0, Some(20.0), DecisionOutcome::NotDue),
+        ];
+        let m = compute_subject_metrics("S", 1, 1, &[], &decisions, None, None, &[]);
+        assert_eq!(m.n_holds, 1);
+        assert_eq!(m.n_not_due, 2);
+        assert_eq!(m.signal_mean, Some(15.0));
+    }
+
+    // ── #945: the dosing-interval ladder's invariants ─────────────────────────────
+
+    fn interval_base() -> AdaptiveDosingSpec {
+        let mut s = base_spec();
+        s.intervals = Some(vec![12.0, 24.0, 48.0]);
+        s.start_interval = Some(24.0);
+        s.rules[0].interval = Some(IntervalStep::Lengthen);
+        s
+    }
+
+    #[test]
+    fn validate_accepts_an_interval_ladder() {
+        interval_base().validate().expect("well-formed ladder");
+        // A ladder with no rule stepping it is a fixed interval, also valid.
+        let mut s = interval_base();
+        s.rules[0].interval = None;
+        s.validate().expect("fixed interval");
+    }
+
+    /// Each pairing rule on its own input, its message asserted with the sentence that
+    /// tells the user what to write. Deleting any one guard leaves its spec accepted.
+    #[test]
+    fn validate_pairs_intervals_with_start_interval_and_the_rule_steps() {
+        let mut s = interval_base();
+        s.start_interval = None;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains("`intervals` requires a `start_interval`")
+                && e.contains("in force from the first decision"),
+            "{e}"
+        );
+
+        let mut s = interval_base();
+        s.intervals = None;
+        s.rules[0].interval = None;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains("`start_interval` requires an `intervals = [...]` ladder")
+                && e.contains("write `intervals = [d]` and `start_interval = d`"),
+            "{e}"
+        );
+
+        let mut s = interval_base();
+        s.intervals = None;
+        s.start_interval = None;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains(
+                "`lengthen` / `shorten` require an `intervals = [...]` ladder and a \
+                 `start_interval`"
+            ),
+            "{e}"
+        );
+    }
+
+    /// A hand-built rule whose only effect is `Maintain` does nothing; the parser never
+    /// writes one. It is refused and named, and the same rule with an interval effect is
+    /// accepted, so the guard is on the missing effect.
+    #[test]
+    fn validate_rejects_a_rule_with_no_effect() {
+        let mut s = interval_base();
+        s.rules[0].action = AdaptiveAction::Maintain;
+        s.rules[0].interval = None;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains("a rule must have an effect")
+                && e.contains("only the dose effect of a rule that also lengthens or shortens")
+                && e.ends_with("when signal < 10 :"),
+            "{e}"
+        );
+        s.rules[0].interval = Some(IntervalStep::Shorten);
+        s.validate().expect("an interval-only rule is valid");
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_interval_ladder() {
+        let mut s = interval_base();
+        s.intervals = Some(vec![24.0, 12.0]);
+        assert!(s
+            .validate()
+            .unwrap_err()
+            .contains("intervals must be strictly increasing"));
+
+        let mut s = interval_base();
+        s.intervals = Some(vec![0.0, 24.0]);
+        s.start_interval = Some(24.0);
+        let e = s.validate().unwrap_err();
+        assert!(e.contains("intervals must be > 0: 0"), "{e}");
+
+        let mut s = interval_base();
+        s.start_interval = Some(36.0);
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains(
+                "start_interval 36 must be one of the declared intervals [12.0, 24.0, 48.0]"
+            ),
+            "{e}"
+        );
+    }
+
+    /// `stop` with an interval effect is refused and the rule is named; the same rule
+    /// with `hold` instead is accepted, so the guard is on `stop`, not on the effect.
+    #[test]
+    fn validate_rejects_stop_with_an_interval_effect() {
+        let mut s = interval_base();
+        s.rules[0].action = AdaptiveAction::Stop;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains(
+                "`stop` cannot be combined with `lengthen` / `shorten` (a stopped course has \
+                 no next dose)"
+            ) && e.contains("when signal < 10 : stop, lengthen"),
+            "{e}"
+        );
+        s.rules[0].action = AdaptiveAction::Hold;
+        s.validate().expect("hold, lengthen is valid");
     }
 }

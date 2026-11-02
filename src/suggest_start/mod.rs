@@ -648,10 +648,12 @@ fn mu_ref_etas_for_param(model: &CompiledModel, indiv_name: &str) -> Vec<(String
 /// and the name rule used to send the clearance onto `THS` and key CL's omega to
 /// `ETA_CL` (#1922 review r3). Dependence is read off the parse-time partial
 /// `∂param/∂eta`, which folds to the literal `0` when `param` does not reach
-/// `eta`. When that dependence cannot be read — a parameter with no partials
-/// row, as an `if`-assigned one has none — the η is declined: it is known to be
-/// another parameter's, and borrowing it on an unknown dependence sent a
-/// conditional `CL`'s clearance onto `THS` the same way (#1922 review r5).
+/// `eta`, read on the parameter's **last** row — the one holding its final value
+/// (an `if`-assigned parameter has a guarded row per branch, #2471). When that
+/// dependence cannot be read — a parameter with no partials row — the η is
+/// declined: it is known to be another parameter's, and borrowing it on an
+/// unknown dependence sent a conditional `CL`'s clearance onto `THS` the same
+/// way (#1922 review r5).
 fn name_rule_may_use(model: &CompiledModel, param: &str, eta: &str) -> bool {
     let partials = &model.indiv_param_partials;
     match partials.mu_ref_owners.get(eta) {
@@ -659,7 +661,7 @@ fn name_rule_may_use(model: &CompiledModel, param: &str, eta: &str) -> bool {
         Some(owner) if owner == param => return true,
         Some(_) => {}
     }
-    let Some(row) = partials.names.iter().position(|n| n == param) else {
+    let Some(row) = partials.names.iter().rposition(|n| n == param) else {
         return false;
     };
     let Some(k) = model.eta_names.iter().position(|n| n == eta) else {
@@ -2498,11 +2500,12 @@ mod tests {
         );
     }
 
-    /// A parameter with no partials row cannot show it does not read an η owned
-    /// by another parameter, so the name rule declines that η (review round 5).
-    /// An `if`-assigned `CL` has no row; next to `S = THS * exp(ETA_CL)` the name
-    /// rule used to accept `ETA_CL` on that unknown, and NCA wrote the clearance
-    /// onto `THS` — a θ no PK role owns, so the collision guard could not see it.
+    /// An η owned by another parameter is declined unless the parameter reads it
+    /// (review round 5). Next to `S = THS * exp(ETA_CL)` the name rule used to
+    /// accept `ETA_CL` for an `if`-assigned `CL`, and NCA wrote the clearance onto
+    /// `THS` — a θ no PK role owns, so the collision guard could not see it. Such
+    /// a `CL` had no partials row then; since #2471 it has a guarded row per
+    /// branch, and the last one shows it does not read `ETA_CL`.
     #[test]
     fn a_conditional_parameter_does_not_borrow_another_parameters_eta() {
         let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  \
@@ -2515,9 +2518,19 @@ mod tests {
              [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
              [error_model]\n  DV ~ proportional(PROP_ERR)\n";
         let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
-        // The premise: CL has no partials row, and ETA_CL is S's and passes the
-        // name rule for CL.
-        assert!(!m.indiv_param_partials.names.iter().any(|n| n == "CL"));
+        // The premise: CL's last partials row does not read ETA_CL, and ETA_CL
+        // is S's and passes the name rule for CL.
+        let p = &m.indiv_param_partials;
+        let row = p
+            .names
+            .iter()
+            .rposition(|n| n == "CL")
+            .expect("CL has rows");
+        let k = m.eta_names.iter().position(|n| n == "ETA_CL").unwrap();
+        assert!(matches!(
+            p.d_d_eta[row][k],
+            crate::parser::model_parser::Expression::Literal(v) if v == 0.0
+        ));
         assert_eq!(
             m.indiv_param_partials
                 .mu_ref_owners

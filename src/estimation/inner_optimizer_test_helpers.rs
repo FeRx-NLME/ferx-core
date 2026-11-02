@@ -58,6 +58,33 @@ pub(crate) fn warfarin_iov_fixture() -> (CompiledModel, Population, FitOptions) 
     (model, pop, opts)
 }
 
+/// [`warfarin_iov_fixture`] with its closed form written as `[odes]`: an ODE + IOV model,
+/// whose outer caches restart κ at 0 (#2508).
+pub(crate) fn warfarin_iov_ode_fixture() -> (CompiledModel, Population, FitOptions) {
+    let src = include_str!("../../examples/warfarin_iov.ferx");
+    let pk = "  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n";
+    assert_eq!(src.matches(pk).count(), 1, "anchor {pk:?} moved");
+    let src = src.replacen(
+        pk,
+        "  ode(states=[depot, central])\n\n[odes]\n  d/dt(depot)   = -KA * depot\n  \
+         d/dt(central) =  KA * depot - (CL/V) * central\n\n[scaling]\n  y = central / V\n",
+        1,
+    );
+    let (model, mut pop, opts) = load_iov_fixture(&src, "data/warfarin_iov.csv", 2);
+    assert!(
+        model.ode_spec.is_some() && model.n_kappa > 0,
+        "fixture: must be an ODE + IOV model"
+    );
+    let mut no_occ = pop.subjects[0].clone();
+    no_occ.id = "NO_OCC".into();
+    no_occ.occasions.clear();
+    no_occ.dose_occasions.clear();
+    no_occ.reset_occasions.clear();
+    no_occ.pk_only_occasions.clear();
+    pop.subjects.push(no_occ);
+    (model, pop, opts)
+}
+
 /// `nested_levels_3` (exact3): study → arm nested below the subject.
 pub(crate) fn nested_levels_fixture() -> (CompiledModel, Population, FitOptions) {
     load_iov_fixture(

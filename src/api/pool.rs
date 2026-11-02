@@ -232,6 +232,15 @@ impl FitScope {
             let recording = crate::estimation::inner_optimizer::recording_handle();
             move || crate::estimation::inner_optimizer::with_recording_handle(recording, f)
         };
+        // So is the warm-start predictor's test switch (#2549).
+        #[cfg(test)]
+        let f = {
+            let off = crate::estimation::outer_optimizer::warm_predictor_off();
+            move || {
+                let _off = off.then(crate::estimation::outer_optimizer::WarmPredictorOff::new);
+                f()
+            }
+        };
         move || {
             #[cfg(test)]
             let _declined = ForcedDeclineGuard::set(declined);

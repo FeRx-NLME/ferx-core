@@ -387,7 +387,7 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
 
 ## Residual weighting (`weight = ...`)
 
-> **Maturity: experimental** ([#1029](https://github.com/FeRx-NLME/ferx-core/issues/1029)).
+> **Maturity: beta** ([#1029](https://github.com/FeRx-NLME/ferx-core/issues/1029)).
 
 Meta-analysis data does not arrive one observation at a time. Each row is a
 *trial-arm summary* — a mean effect with its own reported standard error, or a
@@ -941,9 +941,22 @@ assays receive the NONMEM-style covariance term
 Current scope: `block_sigma` is supported for the Gaussian `method = foce`,
 `method = focei`, `method = saem`, and `method = imp` fits. The Gauss-Newton
 optimizers (`gn` / `gn_hybrid`), M3 censored-observation likelihoods, FREM
-covariate pseudo-observations, `iiv_on_ruv`, TTE endpoints, and IOV reject
+covariate pseudo-observations, `iiv_on_ruv` and TTE endpoints reject
 correlated residual sigma blocks until their residual-error derivative code is
-extended beyond diagonal RUV. SDE/EKF process-noise models carry the correlation
+extended beyond diagonal RUV.
+
+**With IOV** (`kappa`), `block_sigma` is fitted by `method = foce` and
+`method = focei` (single node, `n_agq = 1`) only (#979). The IOV marginal
+linearizes over the stacked `[η, κ]` system, `R̃ = H Σ_b Hᵀ + R`, with `R` the
+dense residual covariance at the correlation the outer loop is proposing, and
+each subject's EBE search scores the same dense `R`. Both loops keep their exact
+analytic gradients. The other estimators' IOV objectives score each row on its
+own, so `saem`, `imp`, `laplace`, `vi` and `n_agq > 1` refuse the combination
+with `E_BLOCK_SIGMA_IOV_UNSUPPORTED`. A two-endpoint total/unbound model with a κ
+on CL matches NONMEM's FOCEI objective to 5e-8 and its η̂/κ̂ to 2e-7
+(`nonmem_anchor/block_sigma_iov.*`).
+
+SDE/EKF process-noise models carry the correlation
 under `method = foce` / `method = focei` (the EKF variance is added to the dense
 `R`) but are rejected under `method = saem`, whose M-step data term does not yet
 include the process-noise inflation.
