@@ -6393,8 +6393,10 @@ fn nelder_mead_primary_flags_the_subjects_the_certificate_moved() {
 /// `FitResult::total_ebe_nm_polished`, apart from `total_ebe_fallbacks`; under the default
 /// optimizer the count is 0. At `inner_tol = 1e-5` every warfarin NM stop needs the move
 /// (measured 10 of 10 per loop), so any evaluation contributes. #2589: the built-in
-/// `optimizer = bfgs` does not count, so the same fit under it reports 0, as the
-/// `FitResult` docs say; that pins the "every other path reports 0" half of them.
+/// optimizer behind `Optimizer::Bfgs` (reachable only from Rust: the model-file keyword
+/// `bfgs` is an alias of `nlopt_lbfgs`, which counts) does not count, so the same fit under
+/// it reports 0, as the `FitResult` docs say; that pins the "every other path reports 0"
+/// half of them.
 #[test]
 fn a_nelder_mead_fit_reports_the_moved_subjects() {
     use crate::types::{EstimationMethod, FitOptions, InnerOptimizer, Optimizer};

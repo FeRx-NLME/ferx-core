@@ -308,7 +308,7 @@ pub(crate) fn method_label(options: &crate::types::FitOptions) -> &'static str {
 /// `step_norm`        — L2 norm of the parameter step (None when unavailable)
 /// `optimizer`        — optimizer name string, e.g. "slsqp", "bobyqa", "bfgs"
 /// `n_ebe_unconverged`— subjects that did not meet EBE tolerance (None = unavailable)
-/// `n_ebe_fallback`   — subjects that used Nelder-Mead fallback (None = unavailable)
+/// `n_ebe_fallback`   — subjects whose returned EBE is a fallback's point (None = unavailable)
 ///
 /// `values`           — per-coordinate estimates, natural scale (packed order)
 /// `grads`            — per-coordinate gradient, scaled space (None for
@@ -353,7 +353,7 @@ pub fn write_foce(
 /// `method`           — "gn" or "gn_hybrid"
 /// `phase`            — "" for pure GN, "gn" for GN phase of hybrid
 /// `n_ebe_unconverged`— subjects that did not meet EBE tolerance (None = unavailable)
-/// `n_ebe_fallback`   — subjects that used Nelder-Mead fallback (None = unavailable)
+/// `n_ebe_fallback`   — subjects whose returned EBE is a fallback's point (None = unavailable)
 #[allow(clippy::too_many_arguments)]
 pub fn write_gn(
     iter: usize,
