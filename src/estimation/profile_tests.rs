@@ -5816,7 +5816,8 @@ fn laplace(t: String) -> String {
 /// re-solved cold by the population inner loop and scored by
 /// [`crate::estimation::agq::agq_population_nll`], the unprofiled fit's own Laplace
 /// objective. It shares nothing with [`ProfileCtx::resolve`] or `fit_term`, so it is the
-/// reference a solve scoring the wrong objective cannot agree with.
+/// reference a solve scoring the wrong objective cannot agree with. At `n_agq > 1` it is the
+/// stage's quadrature objective, at the stage's nodes and anchor (#2107 PR-A).
 fn laplace_ofv(p: &crate::api::PreparedRun, params: &ModelParameters, beta: &[f64]) -> f64 {
     let layout = layout_of(p);
     let o = options(p);
@@ -6060,4 +6061,328 @@ fn a_declined_subject_takes_the_reconverged_gradient_under_laplace() {
         forced.ofv - plain.ofv
     );
     assert!(worst < DECLINED_BETA, "{worst:.3e}");
+}
+
+// ── #2107: the profile under adaptive quadrature, `n_agq = 3` (PR-A) ─────────────────
+//
+// PR-L's code serves both anchors: `fit_term` and `objective()` read `agq_nodes()` and
+// `hessian_anchor()`, which carry the stage's node count and its anchor (`laplace`: the
+// exact `H`; `focei`: the Gauss–Newton `H̃`). So every test runs on **both**, and every
+// test that guards the objective's identity runs on F2, where the two anchors, and
+// `n_agq = 3` against `n_agq = 1`, are different functions. NONMEM has no adaptive
+// quadrature. The external anchor is by reduction: the `n_agq = 1` path is PR-L's
+// NONMEM-anchored Laplace, which this PR leaves unchanged, and N1-A shows three nodes on a
+// Gaussian integrand give the Laplace value. Every `n_agq > 1` claim is a parity with the
+// unprofiled quadrature objective. A0: the 2-of-12 AGQ(3) adjoint declines
+// the plan measured at `65e9d6f8` were `off_mode`'s Nelder–Mead arm, which #2554 removed;
+// every fixture below asserts it runs on the adjoint.
+
+/// The fixture's text under `method = laplace` with `n_agq = 3`: the exact-anchor quadrature.
+fn agq3_laplace(t: String) -> String {
+    assert!(t.contains("  method     = focei\n"), "the fixture moved");
+    t.replace(
+        "  method     = focei\n",
+        "  method     = laplace\n  n_agq      = 3\n",
+    )
+}
+
+/// The fixture's text under `method = focei` with `n_agq = 3`: the Gauss–Newton-anchored
+/// quadrature.
+fn agq3_focei(t: String) -> String {
+    assert!(t.contains("  method     = focei\n"), "the fixture moved");
+    t.replace(
+        "  method     = focei\n",
+        "  method     = focei\n  n_agq      = 3\n",
+    )
+}
+
+/// Both anchors at three nodes, each with the anchor it must resolve to.
+const AGQ3: [(&str, fn(String) -> String, crate::types::HessianAnchor); 2] = [
+    ("laplace", agq3_laplace, crate::types::HessianAnchor::Exact),
+    (
+        "focei",
+        agq3_focei,
+        crate::types::HessianAnchor::GaussNewton,
+    ),
+];
+
+/// The arm runs three-node quadrature at its own anchor: what every test below relies on.
+fn assert_agq3(name: &str, p: &crate::api::PreparedRun, anchor: crate::types::HessianAnchor) {
+    let o = options(p);
+    assert_eq!(o.agq_nodes(), Some(3), "{name}");
+    assert_eq!(o.hessian_anchor(), anchor, "{name}");
+}
+
+/// The node count is read. The three-node `laplace` solve moves away from the one-node
+/// solve on F2[3], by more than a thousand times `D0_BOUND`. A profile that ignored
+/// `n_agq` would agree with the one-node solve at three nodes and fail here. This test is
+/// not the external anchor. The reduction to PR-L's NONMEM-anchored Laplace rests on two
+/// things: the `n_agq = 1` path is PR-L's, which this PR does not change, and
+/// [`a_linear_model_profiles_in_one_newton_step_under_quadrature`] shows that three nodes
+/// on a Gaussian integrand give the Laplace value at FOCEI's levels (#2561 review row 2).
+#[test]
+fn three_nodes_move_the_one_node_laplace_solve() {
+    let p1 = prep(F2, F2_DATA, Some(3), laplace);
+    assert_eq!(options(&p1).agq_nodes(), Some(1));
+    let (_, one) = solve_at(&p1);
+    let (_, s3) = solve_at(&prep(F2, F2_DATA, Some(3), agq3_laplace));
+    eprintln!(
+        "n_agq: one node {:.12}, three nodes {:.12}",
+        one.ofv, s3.ofv
+    );
+    assert!(one.ofv.is_finite() && s3.ofv.is_finite());
+    assert!(
+        (s3.ofv - one.ofv).abs() > 1e3 * D0_BOUND,
+        "n_agq = 3 is not the one-node objective: {} vs {}",
+        s3.ofv,
+        one.ofv
+    );
+}
+
+/// N1-A. On F1 (linear in (η, κ), additive error) every node's integrand is Gaussian in the
+/// random effects, so the quadrature is the Laplace value at either anchor, and the solve
+/// lands in **one** Newton step, at FOCEI's levels. Dies when the Newton matrix is taken
+/// from the fit's own quadrature term (`fit_term` in `held_hessian`).
+#[test]
+fn a_linear_model_profiles_in_one_newton_step_under_quadrature() {
+    let (_, sf) = solve_at(&prep(F1, F1_DATA, None, |t| t));
+    for (name, edit, anchor) in AGQ3 {
+        let p = prep(F1, F1_DATA, None, edit);
+        assert_agq3(name, &p, anchor);
+        let (layout, s) = solve_at(&p);
+        assert!(
+            s.n_adjoint_gradients > 0 && s.fd_gradient_subjects.is_empty(),
+            "N1-A {name} runs on the adjoint level gradient"
+        );
+        let worst = layout
+            .coords
+            .iter()
+            .map(|&k| (s.params.theta[k] - sf.params.theta[k]).abs())
+            .fold(0.0_f64, |a, v| {
+                assert!(v.is_finite());
+                a.max(v)
+            });
+        eprintln!(
+            "N1-A {name}: {} step(s), criterion {:.2e}, max |β_agq − β_focei| {worst:.3e}",
+            s.iterations, s.criterion
+        );
+        assert_eq!(s.iterations, 1, "{name}: criterion {:.3e}", s.criterion);
+        assert!(s.criterion.is_finite() && s.criterion <= PROFILE_TOL);
+        assert!(worst < N1L_LEVELS, "{name}: {worst:.3e}");
+    }
+}
+
+/// D3-A. On F2 cut to two studies, each anchor's solve equals the dense oracle's minimum of
+/// the **unprofiled quadrature objective** ([`laplace_ofv`], which scores
+/// `agq_population_nll` at the stage's nodes and anchor and shares nothing with the solve),
+/// and the frozen-EBE fixed point lands above it, in the same test (the straddle). Dies
+/// when the solve scores the one-node or FOCEI term instead of the stage's own.
+#[test]
+fn the_quadrature_profile_objective_is_the_minimum_over_the_levels() {
+    for (name, edit, anchor) in AGQ3 {
+        let p = prep(F2, F2_DATA, Some(2), edit);
+        assert_agq3(name, &p, anchor);
+        let layout = layout_of(&p);
+        let o = options(&p);
+        let c = ctx(&p, &layout, &o);
+        let warm = ProfileWarm::from_template(&layout, &p.init_params);
+        let s = c.solve(&p.init_params, &warm).expect("the solve converges");
+        assert!(s.n_adjoint_gradients > 0 && s.fd_gradient_subjects.is_empty());
+        let (o_star, b_star) = oracle_min_of(|b| laplace_ofv(&p, &p.init_params, b), &warm.beta);
+        let frozen = laplace_ofv(
+            &p,
+            &p.init_params,
+            &frozen_levels(&c, &p.init_params, &warm.beta),
+        );
+        assert!(s.ofv.is_finite() && o_star.is_finite() && frozen.is_finite());
+        let worst_beta = layout
+            .coords
+            .iter()
+            .zip(&b_star)
+            .zip(&s.se_scale)
+            .map(|((&k, &b), &se)| ((s.params.theta[k] - b) / se).abs())
+            .fold(0.0_f64, |a, v| {
+                assert!(v.is_finite());
+                a.max(v)
+            });
+        eprintln!(
+            "D3-A {name}: profile {:.10} oracle {:.10} (Δ {:.2e}), worst level gap {:.2e} SE, \
+             frozen-EBE Δ {:.3e}, {} steps",
+            s.ofv,
+            o_star,
+            s.ofv - o_star,
+            worst_beta,
+            frozen - o_star,
+            s.iterations
+        );
+        assert!(s.iterations > 1, "{name}: a nonlinear fixture");
+        assert!(
+            (s.ofv - o_star).abs() < D3L_OFV,
+            "{name}: {} vs {}",
+            s.ofv,
+            o_star
+        );
+        assert!(worst_beta < D3_BETA_BOUND, "{name}: {worst_beta}");
+        assert!(
+            frozen - o_star > D3A_FROZEN,
+            "{name}: the straddle: {}",
+            frozen - o_star
+        );
+    }
+}
+
+/// The frozen-EBE point above the minimum must exceed this for D3-A to mean anything. The
+/// quadrature straddle on F2[2] is narrower than Laplace's: realised 4.69e-4 (`laplace`) and
+/// 4.36e-4 (`focei`) against D3-L's 2.36e-2, so D3-L's `1e-2` does not carry over. The
+/// solve-vs-oracle gap is 4.9e-11 at both anchors, so `D3L_OFV` (1e-8) sits four decades
+/// under this bound and ~4× under the realised straddle (macOS arm64).
+const D3A_FROZEN: f64 = 1e-4;
+
+/// D0-A. Each anchor's profiled objective equals `agq_population_nll` after a cold
+/// population inner loop, at the joint point the solve returns ([`laplace_ofv`]). The
+/// straddles, in one test: the one-node Laplace solve and the other anchor's solve land
+/// elsewhere, so a `fit_term` that reads the wrong node count or the wrong anchor dies.
+#[test]
+fn the_quadrature_profiled_objective_is_the_unprofiled_one_at_its_own_point() {
+    let (_, one) = solve_at(&prep(F2, F2_DATA, Some(3), laplace));
+    let mut ofvs = Vec::new();
+    for (name, edit, anchor) in AGQ3 {
+        let p = prep(F2, F2_DATA, Some(3), edit);
+        assert_agq3(name, &p, anchor);
+        let (layout, s) = solve_at(&p);
+        assert!(s.n_adjoint_gradients > 0 && s.fd_gradient_subjects.is_empty());
+        let beta: Vec<f64> = layout.coords.iter().map(|&k| s.params.theta[k]).collect();
+        let plain = laplace_ofv(&p, &s.params, &beta);
+        eprintln!(
+            "D0-A {name}: profiled {:.12} plain {:.12} (Δ {:.2e}); n_agq=1 {:.6}",
+            s.ofv,
+            plain,
+            s.ofv - plain,
+            one.ofv
+        );
+        assert!(s.ofv.is_finite() && plain.is_finite() && one.ofv.is_finite());
+        assert!(
+            (s.ofv - plain).abs() < D0_BOUND,
+            "{name}: {} vs {}",
+            s.ofv,
+            plain
+        );
+        assert!(
+            (s.ofv - one.ofv).abs() > 1e3 * D0_BOUND,
+            "{name}: n_agq = 3 ≠ n_agq = 1 here"
+        );
+        ofvs.push(s.ofv);
+    }
+    assert!(
+        (ofvs[0] - ofvs[1]).abs() > 1e3 * D0_BOUND,
+        "the anchors differ here: {ofvs:?}"
+    );
+}
+
+/// G2-A, the dual-vs-FD parity under quadrature. Each anchor's adjoint level gradient
+/// (`Objective::Agq { n_agq: 3, exact }`) against the reconverged central differences of
+/// the stage's own term ([`level_gradient_gaps`], the EBE re-solved at every point), in
+/// conditional SEs. Dies when `objective()` hands the adjoint the wrong node count or the
+/// wrong anchor: the gradient of another function. The car1 arm adds a dense `R`.
+#[test]
+fn the_adjoint_level_gradient_is_the_reconverged_fd_one_under_quadrature() {
+    for (name, edit, anchor) in AGQ3 {
+        for (fixture, p) in [
+            ("F2", prep(F2, F2_DATA, Some(3), edit)),
+            (
+                "F2 car1",
+                scored(prep(F2, F2_DATA, Some(3), |t| {
+                    edit(t)
+                        .replace(
+                            "  omega ETA_EM",
+                            "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM",
+                        )
+                        .replace(
+                            "weight = SE\n",
+                            "weight = SE\n  correlation car1(RHO) by OCC\n",
+                        )
+                })),
+            ),
+        ] {
+            assert_agq3(name, &p, anchor);
+            assert!(profile_gradient_is_analytic(&p.parsed.model, &options(&p)));
+            let (gap, size) = level_gradient_gaps(&p);
+            eprintln!(
+                "G2-A {name} {fixture}: worst gap {gap:.3e} SE, largest gradient {size:.3e} SE"
+            );
+            assert!(
+                size > G2_LIVE,
+                "{name} {fixture}: the gradient is not live ({size:.3e})"
+            );
+            assert!(gap < G2_BOUND, "{name} {fixture}: {gap:.3e}");
+        }
+    }
+}
+
+/// G1-A. Under quadrature the envelope gradient is the gradient of the profile objective on
+/// both engines, at both anchors, and the solve's level gradient runs on the outer
+/// gradient's engine (`agq::analytic_score_supported`, with `gradient = fd` respected).
+#[test]
+fn the_envelope_gradient_is_the_profile_gradient_under_quadrature() {
+    for (name, edit, anchor) in AGQ3 {
+        for fd in [false, true] {
+            let arm = move |t: String| if fd { forced_fd_agq(edit(t)) } else { edit(t) };
+            let p = prep(F2, F2_DATA, Some(3), arm);
+            assert_agq3(name, &p, anchor);
+            let o = options(&p);
+            assert_eq!(
+                profile_gradient_is_analytic(&p.parsed.model, &o),
+                crate::estimation::agq::analytic_score_supported(&p.parsed.model) && !fd,
+                "{name} fd={fd}: one predicate"
+            );
+            envelope_matches_fd(arm, !fd);
+        }
+    }
+}
+
+/// `gradient = fd` on a fixture already rewritten by an [`AGQ3`] edit.
+fn forced_fd_agq(t: String) -> String {
+    assert!(t.contains("  n_agq      = 3\n"), "not a quadrature fixture");
+    t.replace(
+        "  n_agq      = 3\n",
+        "  n_agq      = 3\n  gradient   = fd\n",
+    )
+}
+
+/// G3-A. A subject whose adjoint level gradient is declined under quadrature takes the
+/// **reconverged** differences, and the solve lands where the all-adjoint one does, at
+/// both anchors. Dies when a declined subject's gradient is taken with its EBE held (the
+/// quadrature's held-EBE salvage, `subject_adjoint_held_ebe_score`).
+#[test]
+fn a_declined_subject_takes_the_reconverged_gradient_under_quadrature() {
+    for (name, edit, anchor) in AGQ3 {
+        let p = prep(F2, F2_DATA, Some(3), edit);
+        assert_agq3(name, &p, anchor);
+        let (layout, plain) = solve_at(&p);
+        let (_, forced) = with_declined(1, || solve_at(&p));
+        assert_eq!(forced.fd_gradient_subjects, vec![1], "{name}");
+        assert!(plain.fd_gradient_subjects.is_empty(), "{name}");
+        let worst = layout
+            .coords
+            .iter()
+            .zip(&forced.se_scale)
+            .map(|(&k, se)| (forced.params.theta[k] - plain.params.theta[k]).abs() / se)
+            .fold(0.0_f64, |a, b| {
+                assert!(b.is_finite());
+                a.max(b)
+            });
+        eprintln!(
+            "G3-A {name}: declined vs adjoint β̂ {worst:.3e} SE, ΔOFV {:.2e}",
+            forced.ofv - plain.ofv
+        );
+        assert!(worst < DECLINED_BETA, "{name}: {worst:.3e}");
+    }
+}
+
+/// The trace's method column under `focei` with `n_agq = 3`: `laplace`, the quadrature
+/// objective the levels are solved under, as `parameters.qmd` says. Dies when the label is
+/// chosen from `method` or `interaction` instead of `agq_nodes()`.
+#[test]
+fn a_profiled_focei_quadrature_fit_is_traced_as_laplace() {
+    profiled_trace(agq3_focei, "laplace", "trace_focei_agq.csv");
 }
