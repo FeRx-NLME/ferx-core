@@ -688,9 +688,9 @@ and the shift to add to the decision times between that reset and the next one. 
 infusion of 600 at rate 20 from 0 with `EVID=3` at 18 runs to 30, so the reset runs at 31,
 and a decision written at 24 is flagged with a shift of 13.
 
-A reset whose `TIME` goes back (a restarting period) is not checked. A written decision
-time is ambiguous there, since that `TIME` exists in both periods, so write that period's
-decisions on the engine clock.
+A reset whose `TIME` goes back (a restarting period) is not checked, and neither is any
+reset after it. A written decision time is ambiguous there, since that `TIME` exists in
+both periods, so write every decision from that period onward on the engine clock.
 
 ### Where a reactive run starts
 

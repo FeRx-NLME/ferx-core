@@ -522,8 +522,9 @@ const MOVED_RESET_WARNING_CAP: usize = 10;
 /// Only an **in-order** reset is checked: its written `TIME` is not before any earlier
 /// record. An `ADDL`-implied dose and an infusion end are not records — they are what
 /// moves an in-order reset. A reset whose `TIME` goes back (a restarting period) is
-/// skipped: a written decision time is ambiguous there, since that `TIME` exists in both
-/// periods, and the user has to write that period's decisions on the engine clock anyway.
+/// skipped, and so is every reset after it: a written decision time is ambiguous there,
+/// since that `TIME` exists in both periods, and the user has to write every later
+/// decision on the engine clock anyway.
 ///
 /// Reads the written times the reader kept (`reset_period_times` and the raw-time
 /// vectors). An in-memory subject has none, so its two clocks agree and it never warns.
@@ -564,8 +565,12 @@ fn decisions_before_moved_reset_warnings(
                         .filter(|&&t| t < engine)
                         .map(|&t| s.param_time_at(t)),
                 );
+            // A restart ends the check for this subject, not just for this reset: from here
+            // on decisions are written on the engine clock, so no later reset's written
+            // `TIME` is on the decision clock, in order or not (#2595 review r1, row 1).
+            // `reset_times` is ascending, so every later reset is skipped.
             if earlier_records.into_iter().any(|w| written < w) {
-                continue;
+                break;
             }
             let flagged: Vec<String> = decision_times
                 .iter()

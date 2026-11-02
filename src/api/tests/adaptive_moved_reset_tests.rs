@@ -175,7 +175,8 @@ fn addl_case_flags_both_decisions_before_the_moved_reset() {
         w[0].contains("decision time(s) 24, 36 come after the reset written at TIME 18")
             && w[0].contains("where it runs at 37.")
             && w[0].contains("later by 19 (#1609)")
-            && w[0].contains("add 19 to each"),
+            && w[0].contains("add 19 to each")
+            && w[0].contains("are read on the engine clock"),
         "{}",
         w[0]
     );
@@ -252,6 +253,40 @@ fn restarting_period_is_silent() {
     assert!(d >= 0.0 && d < 25.0, "premise: the side test straddles");
     let w = warnings_for(&pop, &[0.0, d, 31.0]);
     assert!(w.is_empty(), "a restarting period must not warn: {w:?}");
+}
+
+/// Period 1 at 0–24, a restart at `TIME` 0 (engine 25), then 600 @ 20 from written 0
+/// (engine 25 to 55) and an in-order EVID=3 written at 30, which the infusion moves to 56.
+/// Written 30 is above every period-1 `TIME`, so it passes the in-order test, but after a
+/// restart the user writes decisions on the engine clock: 40 is period-2 written 15, before
+/// that reset as meant.
+const RESET_AFTER_RESTART_CSV: &str = "1,0,0,1,100,1,1,0,0,0
+1,6,0,0,0,1,0,0,0,0
+1,24,0,0,0,1,0,0,0,0
+1,0,0,3,0,1,1,0,0,0
+1,0,0,1,600,1,1,20,0,0
+1,6,0,0,0,1,0,0,0,0
+1,30,0,3,0,1,1,0,0,0
+1,36,0,0,0,1,0,0,0,0
+";
+
+#[test]
+fn a_reset_after_a_restart_is_not_checked() {
+    // #2595 review r1, row 1: this warned "decision time(s) 40 come after the reset written
+    // at TIME 30 … add 26". 40 is before that reset as meant, and 25 of the 26 is the
+    // restart's offset, not the reset's own move.
+    let pop = read(RESET_AFTER_RESTART_CSV);
+    assert_resets(&pop, &[25.0, 56.0], &[0.0, 30.0], "reset after a restart");
+    let d = 40.0;
+    assert!(
+        d >= 30.0 && d < 56.0,
+        "premise: the side test straddles the second reset"
+    );
+    let w = warnings_for(&pop, &[25.0, d]);
+    assert!(
+        w.is_empty(),
+        "no reset after a restart is on the decision clock: {w:?}"
+    );
 }
 
 #[test]
