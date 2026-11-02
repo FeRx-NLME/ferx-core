@@ -544,8 +544,10 @@ pub struct EbeResult {
     pub used_fallback: bool,
     /// True when, under `inner_optimizer = nelder_mead`, the returned η̂ is the primary
     /// search's point but Nelder–Mead's own stop was not a mode: the stationarity certificate
-    /// moved it there with the gradient (Newton steps or a BFGS polish). Not a fallback, so
-    /// `used_fallback` stays false; always false under every other `inner_optimizer` (#2571).
+    /// moved it there with the gradient (Newton steps or a BFGS polish). The primary search's
+    /// own point is not a fallback; but `used_fallback` records that a fallback *ran* in this
+    /// solve, so a moved restart candidate that replaces a fallback point carries both flags.
+    /// Always false under every other `inner_optimizer` (#2571).
     pub nm_polished: bool,
     /// L2 gradient norm at the solution; 0.0 when Nelder-Mead was used.
     pub grad_norm: f64,
@@ -1157,12 +1159,9 @@ impl FallbackCertifier<'_> {
         let decrement = 0.5 * DVector::from_column_slice(g).dot(&newton);
         newton.norm() < self.tol || (f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs()))
     }
-    /// [`Self::certify`], accepting a polished point only when `admissible` holds there. The
-    /// runaway-EBE guard (#958) uses it: it recovers with Nelder–Mead precisely because the
-    /// gradient there may not be trustworthy, so a gradient polish that marches back past the
-    /// runaway limit must not be the point it returns.
     /// [`Self::certify`], also saying whether the certified point is the one handed in
-    /// (`None`: not certified, and `x` is unchanged). Under `inner_optimizer = nelder_mead`
+    /// (`None`: not certified; `x` may still have been moved by Newton steps the certificate
+    /// accepted before it failed). Under `inner_optimizer = nelder_mead`
     /// this is what tells a subject whose Nelder–Mead stop was already a mode from one the
     /// gradient had to move there (#2571). Decided by comparing bits, not by which test
     /// fired: the Newton test takes steps too, so "certified by Newton" does not mean
@@ -1182,6 +1181,10 @@ impl FallbackCertifier<'_> {
         })
     }
 
+    /// [`Self::certify`], accepting a polished point only when `admissible` holds there. The
+    /// runaway-EBE guard (#958) uses it: it recovers with Nelder–Mead precisely because the
+    /// gradient there may not be trustworthy, so a gradient polish that marches back past the
+    /// runaway limit must not be the point it returns.
     fn certify_within(
         &self,
         obj: &dyn Fn(&[f64]) -> f64,
@@ -3764,8 +3767,13 @@ fn find_ebe_iov_seeded(
     // solve and one bad outer line-search point would launch a very expensive search
     // ([`skip_ode_iov_nm_fallback`]). That policy stands here, so such a subject keeps
     // whatever the BFGS returned.
-    let mut bfgs_converged = bfgs_converged;
-    let mut nm_converged = nm_converged;
+    // One exit for the returned point, as in the non-IOV solve: the runaway swap below
+    // replaces it whole, so "converged" and "moved" never describe two different points.
+    let mut ebe_exit = if bfgs_converged {
+        primary
+    } else {
+        InnerExit::certified(nm_converged)
+    };
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
     if !skip_ode_iov_nm_fallback(model)
         && iov_prior_maha(&x, &mu, n_eta, n_kappa, k_occasions, nested, params) > runaway_limit
@@ -3778,8 +3786,7 @@ fn find_ebe_iov_seeded(
         });
         if cold.iter().all(|v| v.is_finite()) && obj(&cold) < obj(&x) {
             x = cold;
-            bfgs_converged = false;
-            nm_converged = cold_ok;
+            ebe_exit = InnerExit::certified(cold_ok);
             used_fallback = true;
         }
     }
@@ -3802,11 +3809,9 @@ fn find_ebe_iov_seeded(
         eta: DVector::from_column_slice(&bsv_eta),
         h_matrix,
         terminal_hessian: None,
-        converged: (bfgs_converged || nm_converged) && nll.is_finite(),
+        converged: ebe_exit.converged() && nll.is_finite(),
         used_fallback,
-        // `bfgs_converged` is cleared when the runaway guard swaps in its recovery, so the
-        // flag never outlives the primary point it describes.
-        nm_polished: bfgs_converged && primary == InnerExit::NmMoved,
+        nm_polished: ebe_exit == InnerExit::NmMoved,
         grad_norm: 0.0,
         nll,
         kappas: kappas_vec,
@@ -5469,12 +5474,6 @@ fn inner_use_lbfgs(n: usize) -> bool {
     }
 }
 
-/// Inner EBE minimization with an externally-provided gradient (analytic
-/// sensitivities or AD). Fit-scoped dispatch (dense BFGS / L-BFGS / Nelder–Mead). The
-/// `NelderMead` mode searches without the gradient but certifies its end point with it
-/// ([`FallbackCertifier::certify`]), so `true` means a stationary point under every
-/// `inner_optimizer` (#2557).
-#[allow(clippy::too_many_arguments)]
 /// How one inner minimisation ended. The same value is what a candidate swap carries into
 /// the incumbent (`ebe_exit = exit`), so whether the returned point converged and whether
 /// the certificate moved a Nelder–Mead stop cannot come from two different points.
@@ -5503,6 +5502,12 @@ impl InnerExit {
     }
 }
 
+/// Inner EBE minimization with an externally-provided gradient (analytic
+/// sensitivities or AD). Fit-scoped dispatch (dense BFGS / L-BFGS / Nelder–Mead). The
+/// `NelderMead` mode searches without the gradient but certifies its end point with it
+/// ([`FallbackCertifier::certify_moved`]), so `Converged` / `NmMoved` mean a stationary
+/// point under every `inner_optimizer` (#2557, #2571).
+#[allow(clippy::too_many_arguments)]
 fn inner_minimize_with_grad(
     obj: &dyn Fn(&[f64]) -> f64,
     grad: &dyn Fn(&[f64]) -> Vec<f64>,
