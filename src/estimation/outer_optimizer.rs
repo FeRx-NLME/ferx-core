@@ -357,7 +357,7 @@ pub fn optimize_population(
                 result,
                 budget,
                 "iterations",
-                None,
+                |w| w == OUTER_NONCONVERGENCE_WARNING,
                 |p, o| optimize_bfgs(model, population, p, o, &declines, None),
             )
         }
@@ -378,7 +378,7 @@ pub fn optimize_population(
                 result,
                 budget,
                 "iterations",
-                Some(crate::estimation::trust_region::NO_INITIAL_PROGRESS_NOTICE),
+                crate::estimation::trust_region::is_nonconvergence_notice,
                 |p, o| {
                     crate::estimation::trust_region::optimize_trust_region_seeded(
                         model, population, p, o, None,
@@ -3680,8 +3680,8 @@ fn start_probe_verdict(start_ofv: f64, probe_ofv: f64, probe_converged: bool) ->
 /// moved [`START_PROBE_STEP_S`], alternating in sign so the move is not along one
 /// diagonal, and turned around at a bound that leaves no room for it. A coordinate with
 /// room for the step on neither side moves half the larger room. `None` when no
-/// coordinate could move the full step — the box is too tight for a probe to say
-/// anything about the start.
+/// coordinate moved at least [`INIT_ESCAPE_STEP_S`]: a probe that converged back from
+/// there would not have left its own start, so it could say nothing about this one.
 fn perturbed_start(x: &[f64], fixed: &[bool], lower: &[f64], upper: &[f64]) -> Option<Vec<f64>> {
     let mut out = x.to_vec();
     let mut moved = false;
@@ -3696,12 +3696,12 @@ fn perturbed_start(x: &[f64], fixed: &[bool], lower: &[f64], upper: &[f64]) -> O
         };
         if room(s) >= START_PROBE_STEP_S {
             out[k] += s * START_PROBE_STEP_S;
-            moved = true;
         } else if up >= down {
             out[k] += 0.5 * up.max(0.0);
         } else {
             out[k] -= 0.5 * down.max(0.0);
         }
+        moved |= (out[k] - x[k]).abs() >= INIT_ESCAPE_STEP_S;
         sign = -sign;
     }
     moved.then_some(out)
@@ -3711,6 +3711,46 @@ fn perturbed_start(x: &[f64], fixed: &[bool], lower: &[f64], upper: &[f64]) -> O
 /// the penalized objective at the unmoved start, and the evaluations already spent, it
 /// runs the probe and returns [`start_probe_verdict`].
 type StartProbe<'a> = dyn Fn(&ModelParameters, f64, usize) -> Option<bool> + 'a;
+
+/// What [`optimize_nlopt`] carries out of its first attempt once the start probe (#2506)
+/// has answered: the attempt to report, with its restart cause, and whether the #751
+/// held-cap stall retry ([`resolve_stall_retry`]) is to be skipped.
+///
+/// - `Some(false)` — the probe's lower result, as a continuation of the same fit; no
+///   retry, since it left the start.
+/// - `Some(true)` — the first attempt, its start verified an optimum; no retry either,
+///   since there is no stall to retry, though its published `left_init` stays `false`.
+/// - anything else — the first attempt, retried exactly when it did not leave its start.
+///
+/// The probe's evaluations count in the reported `n_iterations` whichever result is
+/// kept.
+type ProbedAttempt = (OuterResult, Option<RestartCause>, Option<bool>);
+fn settle_start_probe(
+    first: (OuterResult, Option<RestartCause>),
+    first_left_init: bool,
+    probed: Option<ProbedAttempt>,
+) -> ((OuterResult, Option<RestartCause>), bool) {
+    let (mut first, first_cause) = first;
+    match probed {
+        Some((mut found, found_cause, Some(false))) => {
+            found.warnings.push(start_probe_adopted_warning(
+                first.ofv,
+                first.n_iterations,
+                "evaluations",
+            ));
+            found.n_iterations += first.n_iterations;
+            ((found, found_cause), true)
+        }
+        Some((spent, _, verdict)) => {
+            first.n_iterations += spent.n_iterations;
+            (
+                (first, first_cause),
+                first_left_init || verdict == Some(true),
+            )
+        }
+        None => ((first, first_cause), first_left_init),
+    }
+}
 
 /// The `FitResult` warning a fit carries when it stalled on its initial estimates and the
 /// start probe found a lower objective, so the probe's result is reported (#2506). Its
@@ -3725,6 +3765,10 @@ fn start_probe_adopted_warning(stalled_ofv: f64, stalled_count: usize, unit: &st
     )
 }
 
+/// The warning the built-in BFGS loops and the NLopt outer loop push on a fit their
+/// stop rule did not call converged.
+pub(crate) const OUTER_NONCONVERGENCE_WARNING: &str = "Outer optimization did not converge";
+
 /// The #2506 start probe for the outer optimizers that are not NLopt's — the built-in
 /// BFGS / L-BFGS loops, `trust_region`, and `method = gn` / `gn_hybrid` — which publish
 /// no `left_init` of their own and so would leave a warm start at an optimum to the
@@ -3737,10 +3781,12 @@ fn start_probe_adopted_warning(stalled_ofv: f64, stalled_count: usize, unit: &st
 /// [`start_probe_verdict`] reads its penalized objective against the start's:
 ///
 /// - `Some(true)` — `result` is reported as a verified warm start: `left_init =
-///   Some(false)`, `stationary_start = true`. When the run itself stopped unconverged
-///   *because* it never left the start — its warning contains `no_move_notice`, which
-///   only `trust_region` has — that warning is withdrawn and the run is reported
-///   converged: the probe has just answered the question it could not;
+///   Some(false)`, `stationary_start = true`, `converged = true`. A run that stopped
+///   unconverged without leaving its start stopped *because* it could find no descent,
+///   and the probe has just shown there is none; every warning `nonconvergence_notice`
+///   recognises as the optimizer's own stop-rule verdict is withdrawn with it. Nothing
+///   else can have left it unconverged here: a non-finite objective, cancellation and
+///   an exhausted budget each keep the probe from running;
 /// - `Some(false)` — the start was a stall: the probe's result is reported, with
 ///   [`start_probe_adopted_warning`];
 /// - `None` — `result` is reported unchanged, and the displacement check judges it.
@@ -3756,7 +3802,7 @@ pub(crate) fn verify_unmoved_start(
     result: OuterResult,
     budget: usize,
     unit: &str,
-    no_move_notice: Option<&str>,
+    nonconvergence_notice: fn(&str) -> bool,
     rerun: impl FnOnce(&ModelParameters, &FitOptions) -> OuterResult,
 ) -> OuterResult {
     let PackedStart {
@@ -3815,11 +3861,8 @@ pub(crate) fn verify_unmoved_start(
                 n_iterations: result.n_iterations + probe.n_iterations,
                 ..result
             };
-            if let Some(notice) = no_move_notice {
-                let before = verified.warnings.len();
-                verified.warnings.retain(|w| !w.contains(notice));
-                verified.converged |= verified.warnings.len() < before;
-            }
+            verified.converged = true;
+            verified.warnings.retain(|w| !nonconvergence_notice(w));
             verified
         }
         None => OuterResult {
@@ -4564,26 +4607,14 @@ fn optimize_nlopt(
         *probed.borrow_mut() = Some((result, outcome, verdict));
         verdict
     };
-    let ((mut first, first_cause), first_left_init) = attempt(init_params, false, Some(&probe));
-    let first_attempt = match probed.take() {
-        // The start was a stall and the probe found the lower objective: report the probe,
-        // as a continuation of the same fit.
-        Some((mut found, found_outcome, Some(false))) => {
-            found.warnings.push(start_probe_adopted_warning(
-                first.ofv,
-                first.n_iterations,
-                "evaluations",
-            ));
-            found.n_iterations += first.n_iterations;
-            ((found, found_outcome.restart_cause()), true)
-        }
-        // The probe is part of the fit either way: its evaluations count.
-        Some((spent, _, _)) => {
-            first.n_iterations += spent.n_iterations;
-            ((first, first_cause), first_left_init)
-        }
-        None => ((first, first_cause), first_left_init),
-    };
+    let ((first, first_cause), first_left_init) = attempt(init_params, false, Some(&probe));
+    let first_attempt = settle_start_probe(
+        (first, first_cause),
+        first_left_init,
+        probed
+            .take()
+            .map(|(found, outcome, verdict)| (found, outcome.restart_cause(), verdict)),
+    );
     let (first, restart_cause) = resolve_stall_retry(
         options.optimizer,
         options.verbose,
@@ -7199,7 +7230,7 @@ fn optimize_nlopt_once_probed(
         warnings.push(w);
     }
     if !converged {
-        warnings.push("Outer optimization did not converge".to_string());
+        warnings.push(OUTER_NONCONVERGENCE_WARNING.to_string());
     }
     // A stall with no budget left is not restarted (see
     // `worth_restarting_mid_descent`), and the reason the user can act on is the
@@ -7895,7 +7926,7 @@ fn optimize_bfgs(
         warnings.push(w);
     }
     if !converged {
-        warnings.push("Outer optimization did not converge".to_string());
+        warnings.push(OUTER_NONCONVERGENCE_WARNING.to_string());
     }
 
     OuterResult {

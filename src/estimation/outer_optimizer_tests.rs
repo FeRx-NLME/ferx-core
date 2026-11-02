@@ -4799,14 +4799,21 @@ fn the_probe_start_moves_every_free_coordinate_inside_the_box() {
         "turned around on its lower bound"
     );
     // A coordinate with less than the step either way moves half the larger room and
-    // stays inside the box, as long as some other coordinate makes the full move.
+    // stays inside the box.
     let p = perturbed_start(&[0.0, 0.0], &[false; 2], &[-0.02, -inf], &[0.06, inf]).unwrap();
     assert_eq!(p, vec![0.03, -step]);
-    // No coordinate can make the full move: no probe.
+    // That partial move alone is a probe, as long as it is an escape: 0.03 is, …
     assert_eq!(
         perturbed_start(&[0.0], &[false], &[-0.02], &[0.06]),
+        Some(vec![0.03]),
+        "a tight box that still leaves room for an escape"
+    );
+    // … 0.0075 is not, and neither is a sum of such moves: no probe.
+    assert!(0.0075 < INIT_ESCAPE_STEP_S);
+    assert_eq!(
+        perturbed_start(&[0.0, 0.0], &[false; 2], &[-0.01; 2], &[0.015; 2]),
         None,
-        "a box too tight for the step"
+        "a box too tight for an escape"
     );
     assert_eq!(
         perturbed_start(&[0.0], &[true], &[-inf], &[inf]),
@@ -13321,7 +13328,7 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
             unmoved(),
             7,
             "iterations",
-            None,
+            |_| false,
             |p, o| {
                 calls.borrow_mut().push((pack_params(p), o.outer_maxiter));
                 OuterResult {
@@ -13367,30 +13374,15 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
             "{verdict:?}: only a verified start publishes `left_init`"
         );
     }
-    // A verified start withdraws the run's own no-move notice and reports it converged
-    // (trust-region's "every step was rejected" stop); any other unconverged run stays
-    // unconverged, and an unverified one keeps its notice.
-    let notice = crate::estimation::trust_region::NO_INITIAL_PROGRESS_NOTICE;
-    for (warning, probe_converged, promoted) in [
-        (
-            format!("Trust-region did not converge: … — {notice}, so …"),
-            true,
-            true,
-        ),
-        (
-            "Trust-region did not converge: reached the iteration budget".into(),
-            true,
-            false,
-        ),
-        (
-            format!("Trust-region did not converge: … — {notice}, so …"),
-            false,
-            false,
-        ),
-    ] {
+    // A verified start is reported converged, whatever the run's own stop rule said,
+    // and loses exactly the warnings the optimizer's predicate names as that verdict;
+    // an unverified one keeps both its verdict and its notice.
+    const NOTICE: &str = "the optimizer's own non-convergence notice";
+    let (notice, other) = (NOTICE, "an unrelated warning");
+    for (probe_converged, verified) in [(true, true), (false, false)] {
         let run = OuterResult {
             converged: false,
-            warnings: vec![warning.clone()],
+            warnings: vec![notice.to_string(), other.to_string()],
             ..unmoved()
         };
         let result = verify_unmoved_start(
@@ -13401,15 +13393,25 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
             run,
             7,
             "iterations",
-            Some(notice),
+            |w| w == NOTICE,
             |p, _| OuterResult {
                 ofv: start_ofv,
                 converged: probe_converged,
                 ..at(p)
             },
         );
-        assert_eq!(result.converged, promoted, "{warning}");
-        assert_eq!(result.warnings.contains(&warning), !promoted, "{warning}");
+        assert_eq!(result.stationary_start, verified);
+        assert_eq!(result.converged, verified, "verified = {verified}");
+        assert_eq!(
+            result.warnings.iter().any(|w| w == notice),
+            !verified,
+            "verified = {verified}: {:?}",
+            result.warnings
+        );
+        assert!(
+            result.warnings.iter().any(|w| w == other),
+            "verified = {verified}"
+        );
     }
     // No probe: a run that moved, one with no budget, one with no valid objective.
     let mut moved = init.clone();
@@ -13442,13 +13444,65 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
             result,
             budget,
             "iterations",
-            None,
+            |_| false,
             |p, _| {
                 ran.set(true);
                 at(p)
             },
         );
         assert!(!ran.get() && result.left_init.is_none(), "{label}");
+    }
+}
+
+/// #2506: what the NLopt fit carries out of a probed first attempt, and whether the
+/// #751 held-cap retry still runs. A verified start skips it — there is no stall to
+/// retry, and a fresh-budget retry could replace the verified result — while keeping
+/// the first attempt and its unmoved verdict; a lower probe is reported with the stall
+/// warning; no verdict leaves the retry to `left_init`. The probe's evaluations count
+/// every time.
+#[test]
+fn a_verified_start_skips_the_stall_retry_and_a_lower_probe_is_reported() {
+    let (model, pop) = two_cpt_iv_fixture();
+    let opts = options_2506(crate::types::Optimizer::NloptLbfgs);
+    let init = model.default_params.clone();
+    let mut off = init.clone();
+    off.theta = init.theta.iter().map(|t| 1.1 * t).collect();
+    let at = |p: &ModelParameters, n: usize| OuterResult {
+        left_init: Some(false),
+        n_iterations: n,
+        ..evaluate_at_initial_params(&model, &pop, p, &opts)
+    };
+    let init_packed = pack_params(&init);
+    for (verdict, skip_retry, reports_probe) in [
+        (Some(true), true, false),
+        (Some(false), true, true),
+        (None, false, false),
+    ] {
+        let ((result, _), skip) = settle_start_probe(
+            (at(&init, 1), None),
+            false,
+            Some((at(&off, 4), None, verdict)),
+        );
+        assert_eq!(skip, skip_retry, "{verdict:?}: retry skipped");
+        assert_eq!(
+            pack_params(&result.params) != init_packed,
+            reports_probe,
+            "{verdict:?}: which attempt is reported"
+        );
+        assert_eq!(result.n_iterations, 5, "{verdict:?}: both legs count");
+        assert_eq!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("stalled on its initial estimates")),
+            reports_probe,
+            "{verdict:?}"
+        );
+    }
+    // Unprobed, the retry follows `left_init` alone.
+    for left in [false, true] {
+        let (_, skip) = settle_start_probe((at(&init, 1), None), left, None);
+        assert_eq!(skip, left);
     }
 }
 
@@ -13602,6 +13656,13 @@ fn assert_warm_refit_verified(
             .warnings
             .iter()
             .any(|w| w.contains("W_STALLED_AT_INIT")),
+        "{label}: {:?}",
+        warm.warnings
+    );
+    // The run's own non-convergence verdict goes with the stall flag: a verified start
+    // is converged, and nothing on the result may say otherwise.
+    assert!(
+        !warm.warnings.iter().any(|w| w.contains("did not converge")),
         "{label}: {:?}",
         warm.warnings
     );

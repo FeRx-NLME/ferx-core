@@ -241,7 +241,8 @@ it does not move either. Displacement alone cannot tell that from a stall, and b
 When the NLopt outer loop ends without leaving its start, it now asks the optimizer whether
 the start is an optimum: it **restarts from a perturbation of the start** (every free
 coordinate moved by 0.1 in the optimizer's scaled space, alternating in sign and turned
-around at a bound) on what is left of the fit's `maxiter` budget, and compares where that
+around at a bound; a tight box may shorten a coordinate's move, and the restart runs
+as long as some coordinate moves at least 0.01) on what is left of the fit's `maxiter` budget, and compares where that
 restart ends with the objective at the start.
 
 - **It converges back**, to within 0.1 OFV (the threshold the stagnation guard uses to call a
@@ -268,8 +269,10 @@ The other FOCE-family outer optimizers run the same restart: the built-in `bfgs`
 loops, `trust_region`, and `method = gn` / `gn_hybrid`. Their perturbation is 0.1 in the
 packed (log / Cholesky) parameter space. BFGS and trust-region restart on what is left of
 `maxiter`. Gauss–Newton does not count the iterations it used, so its restart gets a fresh
-`maxiter`. A verified start keeps its estimates, its `converged` verdict and its covariance
-step, and `FitResult::stationary_start` is `true`. A lower restart is reported in its place, with the
+`maxiter`. A verified start keeps its estimates and its covariance step, is reported
+`converged = true` with the optimizer's own "did not converge" notice withdrawn (a run that
+never left its start stopped because it found no descent, which the restart has just
+confirmed), and `FitResult::stationary_start` is `true`. A lower restart is reported in its place, with the
 same warning. Other estimators (SAEM, IMP, Bayes, VI) do not run it.
 
 ### A THETA on the log-packing floor {#log-packing-floor}

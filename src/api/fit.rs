@@ -2212,7 +2212,7 @@ fn fit_inner(
                     result,
                     stage_opts.outer_maxiter,
                     "iterations",
-                    None,
+                    crate::estimation::gauss_newton::is_nonconvergence_notice,
                     gn,
                 )
             }
