@@ -10932,8 +10932,11 @@ fn parse_adaptive_dosing_block(
 /// exactly when the interval is a whole multiple of `S` (#945). Checked here, where the
 /// step is known, so the error names the value and the step before any subject runs;
 /// on an explicit `at` list the driver refuses an off-grid due time instead. The
-/// tolerance matches the driver's grid matching, so a decimal step (`every 0.1`, interval
-/// `0.3`) passes here exactly when it passes there.
+/// tolerance is the driver's relative 1e-9, taken on the interval rather than on the due
+/// time, so the parser is never looser than the driver: a decimal step (`every 0.1`,
+/// interval `0.3`) passes both, and far from t = 0 the driver may accept an interval the
+/// parser refuses, never the reverse. `k < 1` refuses an interval below the step that the
+/// residual alone would let through (`1e-10` on `every 12`).
 fn check_intervals_on_every_grid(ladder: &[f64], step: f64) -> Result<(), String> {
     for &d in ladder {
         let k = (d / step).round();
@@ -11119,6 +11122,21 @@ fn parse_rule_effects(effects: &str) -> Result<(AdaptiveAction, Option<IntervalS
     let mut dose: Option<AdaptiveAction> = None;
     let mut interval: Option<IntervalStep> = None;
     for part in effects.split(',').map(str::trim) {
+        // A stray comma: a whole empty effect list keeps `parse_rule_action`'s own message.
+        if part.is_empty() && effects.contains(',') {
+            return Err(format!(
+                "[adaptive_dosing]: a rule has an empty effect (a stray comma?): {effects}"
+            ));
+        }
+        if let Some(word) = ["lengthen", "shorten"]
+            .into_iter()
+            .find(|w| part != *w && part.split_whitespace().next() == Some(*w))
+        {
+            return Err(format!(
+                "[adaptive_dosing]: `{word}` steps the `intervals` ladder one rung and takes no \
+                 operand: {part}"
+            ));
+        }
         let step = match part {
             "lengthen" => Some(IntervalStep::Lengthen),
             "shorten" => Some(IntervalStep::Shorten),

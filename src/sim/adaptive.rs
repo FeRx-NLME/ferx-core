@@ -843,7 +843,7 @@ pub struct AdaptiveDosingSpec {
     /// The dosing interval in force from the first decision (#945): one of
     /// `intervals`. A grid point of `at` is then due only once this long has passed
     /// since the last consulted decision; the other points log `not_due`. `None`
-    /// (with `intervals`) consults every point, as before.
+    /// (without `intervals`) consults every point, as before.
     pub start_interval: Option<f64>,
     /// The first-matching-rule ladder, in file order.
     pub rules: Vec<AdaptiveRule>,
@@ -1102,6 +1102,19 @@ impl AdaptiveDosingSpec {
                 r.label()
             ));
         }
+        // `Maintain` is the dose effect of an interval-only rule; without the interval
+        // effect the rule does nothing, and its label would name no effect at all.
+        if let Some(r) = self
+            .rules
+            .iter()
+            .find(|r| r.interval.is_none() && r.action == AdaptiveAction::Maintain)
+        {
+            return Err(format!(
+                "[adaptive_dosing]: a rule must have an effect; `Maintain` is only the dose \
+                 effect of a rule that also lengthens or shortens the interval: when {}",
+                r.label().trim_end()
+            ));
+        }
         Ok(())
     }
 }
@@ -1135,7 +1148,10 @@ pub struct AdaptiveRule {
 
 /// A rule's interval effect: one rung along the `intervals` ladder (#945),
 /// saturating at both ends.
+///
+/// `#[non_exhaustive]`: new interval effects land additively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IntervalStep {
     /// The next longer interval (`lengthen`).
     Lengthen,
@@ -2159,9 +2175,31 @@ mod tests {
         s.start_interval = None;
         let e = s.validate().unwrap_err();
         assert!(
-            e.contains("`lengthen` / `shorten` require an `intervals = [...]` ladder"),
+            e.contains(
+                "`lengthen` / `shorten` require an `intervals = [...]` ladder and a \
+                 `start_interval`"
+            ),
             "{e}"
         );
+    }
+
+    /// A hand-built rule whose only effect is `Maintain` does nothing; the parser never
+    /// writes one. It is refused and named, and the same rule with an interval effect is
+    /// accepted, so the guard is on the missing effect.
+    #[test]
+    fn validate_rejects_a_rule_with_no_effect() {
+        let mut s = interval_base();
+        s.rules[0].action = AdaptiveAction::Maintain;
+        s.rules[0].interval = None;
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains("a rule must have an effect")
+                && e.contains("only the dose effect of a rule that also lengthens or shortens")
+                && e.ends_with("when signal < 10 :"),
+            "{e}"
+        );
+        s.rules[0].interval = Some(IntervalStep::Shorten);
+        s.validate().expect("an interval-only rule is valid");
     }
 
     #[test]
@@ -2198,8 +2236,10 @@ mod tests {
         s.rules[0].action = AdaptiveAction::Stop;
         let e = s.validate().unwrap_err();
         assert!(
-            e.contains("`stop` cannot be combined with `lengthen` / `shorten`")
-                && e.contains("when signal < 10 : stop, lengthen"),
+            e.contains(
+                "`stop` cannot be combined with `lengthen` / `shorten` (a stopped course has \
+                 no next dose)"
+            ) && e.contains("when signal < 10 : stop, lengthen"),
             "{e}"
         );
         s.rules[0].action = AdaptiveAction::Hold;

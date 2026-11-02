@@ -714,10 +714,39 @@ fn interval_rule_effect_errors() {
         &LADDER,
         &["when signal > 20 : stop, lengthen"],
     ));
-    assert_adaptive_err(&e, "`stop` cannot be combined with `lengthen` / `shorten`");
+    assert_adaptive_err(
+        &e,
+        "`stop` cannot be combined with `lengthen` / `shorten` (a stopped course has no next \
+         dose)",
+    );
     let e = perr_owned(interval_block(&LADDER, &["when signal > 20 : lengthn"]));
     assert_adaptive_err(&e, "unknown action `lengthn`");
     assert!(e.contains("lengthen/shorten"), "{e}");
+}
+
+/// A stray comma names itself, on either side of an effect; a rule with nothing after the
+/// `:` keeps its own message. An operand on an interval effect is refused as such, not
+/// read as a malformed dose percentage.
+#[test]
+fn interval_rule_malformed_effect_errors() {
+    for rule in ["when signal > 20 : hold,", "when signal > 20 : , lengthen"] {
+        let e = perr_owned(interval_block(&LADDER, &[rule]));
+        assert_adaptive_err(&e, "a rule has an empty effect (a stray comma?)");
+        assert!(!e.contains("no action after"), "{e}");
+    }
+    let e = perr_owned(interval_block(&LADDER, &["when signal > 20 :"]));
+    assert_adaptive_err(&e, "rule has no action after `:`");
+    let e = perr_owned(interval_block(&LADDER, &["when signal > 20 : lengthen 2"]));
+    assert_adaptive_err(
+        &e,
+        "`lengthen` steps the `intervals` ladder one rung and takes no operand: lengthen 2",
+    );
+    assert!(!e.contains("percentage"), "{e}");
+    let e = perr_owned(interval_block(
+        &LADDER,
+        &["when signal > 20 : hold, shorten 12"],
+    ));
+    assert_adaptive_err(&e, "`shorten` steps the `intervals` ladder");
 }
 
 #[test]
@@ -736,8 +765,13 @@ fn interval_keys_must_come_together() {
     let e = perr_owned(interval_block(&[], &rule));
     assert_adaptive_err(
         &e,
-        "`lengthen` / `shorten` require an `intervals = [...]` ladder",
+        "`lengthen` / `shorten` require an `intervals = [...]` ladder and a `start_interval`",
     );
+    let e = perr_owned(interval_block(
+        &["intervals = [12, q24]", "start_interval = 12"],
+        &rule,
+    ));
+    assert_adaptive_err(&e, "bad intervals:");
     let e = perr_owned(interval_block(
         &["intervals = [24, 12]", "start_interval = 12"],
         &rule,
@@ -766,12 +800,22 @@ fn intervals_must_be_multiples_of_the_every_step() {
         "interval 18 is not a whole multiple of the `at` step 12, so its due times would \
          fall between decision times",
     );
-    // Shorter than the step: no whole multiple at all.
+    // Half the step rounds to one step and fails on the residual.
     let e = perr_owned(interval_block(
         &["intervals = [6, 12]", "start_interval = 12"],
         &rule,
     ));
     assert_adaptive_err(&e, "interval 6 is not a whole multiple of the `at` step 12");
+    // Far below the step the residual is inside the tolerance and only `k < 1` refuses it
+    // (the driver would refuse it too, at the first decision).
+    let e = perr_owned(interval_block(
+        &["intervals = [1e-10, 12]", "start_interval = 12"],
+        &rule,
+    ));
+    assert_adaptive_err(
+        &e,
+        "interval 0.0000000001 is not a whole multiple of the `at` step 12",
+    );
 
     let mut decimal = interval_block(&["intervals = [0.3, 0.6]", "start_interval = 0.3"], &rule);
     decimal.retain(|l| !l.starts_with("at "));
