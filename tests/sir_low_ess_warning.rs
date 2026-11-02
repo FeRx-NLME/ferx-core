@@ -275,9 +275,9 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
 
 /// S4 + S10 on the MBMA BTAV shape, both halves in one test.
 ///
-/// Packed (default): ESS 159.03342968405167 since #2549 with #2544 (159.0334071602698 from #2549 alone; 159.03319612992476 from #2544 alone; 159.03323734232006 from #2462; 159.0331768009516 from #2261 PR 2; 159.03317704270248 from #2261 PR 1; 159.03342053931178 from #2093; 143.22 before it), 1.59× the threshold, and no SIR
+/// Packed (default): ESS 159.03340958544695 since #2549's warm verification legs (159.03342968405167 from #2549 with #2544; 159.0334071602698 from #2549 alone; 159.03319612992476 from #2544 alone; 159.03323734232006 from #2462; 159.0331768009516 from #2261 PR 2; 159.03317704270248 from #2261 PR 1; 159.03342053931178 from #2093; 143.22 before it), 1.59× the threshold, and no SIR
 /// warning — the closest healthy fixture to the threshold, so moving it to
-/// `sir_resamples` (250) reddens this half. Natural: ESS 43.09944471640555 since #2549 with #2544 (43.099435640565254 from #2549 alone; 43.099283326146214 from #2544 alone; 43.09929454157046 from #2462; 43.09925605709212 from #2261; 43.09944242607953 from #2093; 35.19 before it),
+/// `sir_resamples` (250) reddens this half. Natural: ESS 43.099436598567785 since #2549's warm verification legs (43.09944471640555 from #2549 with #2544; 43.099435640565254 from #2549 alone; 43.099283326146214 from #2544 alone; 43.09929454157046 from #2462; 43.09925605709212 from #2261; 43.09944242607953 from #2093; 35.19 before it),
 /// **with** the warning, which points back to `packed` and carries no box
 /// sentence. Flipping the default to natural reddens the packed half.
 #[test]
@@ -320,10 +320,14 @@ fn mbma_placebo_is_healthy_under_packed_and_warns_under_natural() {
     // +1.5e-6; 43.099_283_326_146_214 → 43.099_444_716_405_55, +3.7e-6; Linux x86_64): the
     // predicted EBE warm start ends the FOCE inner solves at a slightly different point, as in
     // the FOCE note above. Both stay on their side of the threshold.
-    assert_ess(f.sir_ess, 159.033_429_684_051_67, "MBMA packed");
+    // #2549's warm verification legs moved both again (159.033_429_684_051_67 →
+    // 159.033_409_585_446_95, −1.3e-7; 43.099_444_716_405_55 → 43.099_436_598_567_785,
+    // −1.9e-7; Linux x86_64): the #2462 leg now starts at the incumbent's own modes rather
+    // than cold, so it stops at a slightly different point of the same optimum.
+    assert_ess(f.sir_ess, 159.033_409_585_446_95, "MBMA packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 
-    assert_ess(nat.sir_ess, 43.099_444_716_405_55, "MBMA natural");
+    assert_ess(nat.sir_ess, 43.099_436_598_567_785, "MBMA natural");
     let w = low_ess(&nat).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", nat.warnings));
     assert!(
         w.contains("`sir_scale = packed` may sample it better"),
