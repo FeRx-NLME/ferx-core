@@ -6572,9 +6572,6 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     interval,
                 });
 
-                // #945: every consulted decision — a dose, a hold or an interval change —
-                // starts the next interval. The next due time must be a grid point (or
-                // past the last one), or the dose it schedules would silently move.
                 // #945: a consulted decision — a dose, a hold or an interval change — starts
                 // the next interval. A newly set interval has its due times walked here, at
                 // the decision that set it, so a dose can never be scheduled between two
