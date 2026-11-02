@@ -235,6 +235,32 @@ fn a_binary_endpoint_gets_the_same_two_codes() {
     );
 }
 
+/// A `[markov_model]` endpoint is in the same family: the DTMM fixture read model-blind
+/// carries its state rows as Gaussian CMT-5 observations, named as a Markov endpoint; read
+/// routed, it passes (#2473).
+#[cfg(feature = "markov")]
+#[test]
+fn a_markov_endpoint_gets_the_unrouted_code() {
+    const DTMM_MODEL: &str = "examples/dtmm_2state.ferx";
+    const DTMM_DATA: &str = "nonmem_anchor/dtmm_2state.csv";
+    let m = model(DTMM_MODEL);
+    let msg = message_of(
+        &check_model_data(&m, &unrouted(DTMM_DATA)),
+        "E_ENDPOINT_UNROUTED",
+    );
+    assert!(
+        msg.contains("CMT 5") && msg.contains("Markov (`[markov_model]`)"),
+        "{msg}"
+    );
+    let ok = routed(&m, DTMM_DATA);
+    assert!(
+        !codes(&check_model_data(&m, &ok))
+            .iter()
+            .any(|c| c.starts_with("E_ENDPOINT_")),
+        "routed DTMM population must pass"
+    );
+}
+
 /// `predict()` returned a concentration for the event row; it now returns an `Err`
 /// naming the loader (#898).
 #[test]
