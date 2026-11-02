@@ -3218,6 +3218,57 @@ mod tests {
         }
     }
 
+    /// #2588 (M11): the MAP sweep's `n_nm_polished` counts the subjects whose returned EBE
+    /// the certificate moved under `inner_optimizer = nelder_mead`. Neither caller of
+    /// [`run_map_multistart`] reads its stats today (`_stats` at both sites), so no fit can
+    /// observe this count; only a direct call can pin it. The oracle is the same solve per
+    /// subject on the calling thread: with no warm start and `mceta = 0` the sweep's EBE is
+    /// `find_ebe` from η = 0. At warfarin's `inner_tol = 1e-5` every NM stop needs the move
+    /// (#2571), so the count is non-zero; under the default optimizer it is 0.
+    #[test]
+    fn the_map_sweep_counts_the_moved_subjects_under_nelder_mead() {
+        use crate::estimation::inner_optimizer::{arm_inner_settings, InnerSettings};
+        use crate::types::{FitOptions, InnerOptimizer};
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let p = &model.default_params;
+        let (max_iter, tol) = (200, 1e-5);
+        let mu_k = compute_mu_k(&model, &p.theta, true);
+        let sweep = |mode| {
+            let opts = FitOptions {
+                inner_optimizer: mode,
+                ..Default::default()
+            };
+            crate::api::with_fit_scope(&opts, || {
+                run_map_multistart(&model, &pop, p, max_iter, tol, None, &mu_k, 0, 1, 0).2
+            })
+            .expect("the scope builds")
+        };
+        let expected = {
+            let _armed = arm_inner_settings(InnerSettings {
+                mode: InnerOptimizer::NelderMead,
+                warm: false,
+            });
+            pop.subjects
+                .iter()
+                .filter(|s| find_ebe(&model, s, p, max_iter, tol, None, Some(&mu_k), 0).nm_polished)
+                .count()
+        };
+        let nm = sweep(InnerOptimizer::NelderMead);
+        eprintln!(
+            "IMPMAP sweep under nelder_mead: {} of {} moved",
+            nm.n_nm_polished,
+            pop.subjects.len()
+        );
+        assert!(expected > 0, "fixture: no subject moved");
+        assert_eq!(nm.n_nm_polished, expected, "{nm:?}");
+        assert_eq!(sweep(InnerOptimizer::Auto).n_nm_polished, 0);
+    }
+
     // ── #996 end-to-end helpers: a tiny 2-class mixture dataset ──────────
     //
     // Two weight groups with well-separated clearances, so the class draw is

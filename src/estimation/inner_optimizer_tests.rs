@@ -2439,6 +2439,13 @@ fn ebe_prior_maha_is_the_omega_inverse_quadratic_form() {
 /// This EBE is **not** multimodal — eight seeds under the analytic gradient (itself verified
 /// against FD of the predictor to 2.6e-7) all reach the same mode — so the two routes must
 /// return it. Fails without the runaway guard: the FD route returns the runaway instead.
+///
+/// Not under `inner_optimizer = nelder_mead` (#2588): there the cold primary search is the
+/// same derivative-free Nelder–Mead from η = 0 the guard recovers with, and its certificate
+/// stays put. Measured on this fixture under NM, both routes end `NmMoved` at
+/// `ηᵀΩ⁻¹η = 5.13` against the limit of 300, so the guard never runs and its exit swap
+/// (`ebe_exit = certified(cold_ok)`, which clears `nm_polished`) has no NM fixture. Reaching
+/// it would need a warm start past the limit inside a far, higher basin; none is cheap.
 #[test]
 fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
     let model_src = "[parameters]\n  theta KEL(0.05, 0.001, 5.0)\n  theta VC(3, 0.1, 100.0)\n  theta KSS(10, 0.1, 500.0)\n  theta KINT(0.5, 0.01, 50.0)\n  theta KDEG(0.05, 0.001, 5.0)\n  theta RBASE(20, 0.5, 500.0)\n  omega IIV_KEL   ~ 0.09\n  omega IIV_VC    ~ 0.04\n  omega IIV_RBASE ~ 0.09\n  sigma PROP_DRUG ~ 0.15 (sd)\n  sigma PROP_TGT  ~ 0.20 (sd)\n[individual_parameters]\n  KEL   = KEL * exp(IIV_KEL)\n  VC    = VC * exp(IIV_VC)\n  RBASE = RBASE * exp(IIV_RBASE)\n  KSS   = KSS\n  KINT  = KINT\n  KDEG  = KDEG\n  KSYN  = RBASE * KDEG\n[structural_model]\n  ode(states=[CENT, RTOT])\n[odes]\n  init(RTOT) = RBASE\n  CT = CENT / VC\n  RT = RTOT\n  BB = CT - RT - KSS\n  CF = 0.5 * (BB + sqrt(BB*BB + 4*KSS*CT))\n  FB = CF / (KSS + CF)\n  d/dt(CENT) = -KEL * CF * VC - RT * KINT * FB * VC\n  d/dt(RTOT) = KSYN - KDEG * RT - (KINT - KDEG) * RT * FB\n[scaling]\n  y[CMT=1] = CENT / VC\n  y[CMT=3] = RTOT\n[error_model]\n  CMT=1: DV ~ proportional(PROP_DRUG)\n  CMT=3: DV ~ proportional(PROP_TGT)\n[fit_options]\n  method     = focei\n  ode_reltol = 1e-9\n  ode_abstol = 1e-9\n";

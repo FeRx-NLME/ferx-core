@@ -1333,6 +1333,82 @@ mod tests {
         );
     }
 
+    /// #2588 (M12): the mixture evaluation's `n_nm_polished` counts the subjects with a
+    /// contributing class whose EBE the certificate moved under `inner_optimizer =
+    /// nelder_mead`. The oracle re-solves each class on the calling thread exactly as
+    /// [`mixture_class_solves_follow_the_stage_convention`] does (bit-identical η there),
+    /// and scores the flags over the evaluation's own posterior weights. Under the default
+    /// optimizer the count is 0.
+    #[test]
+    fn mixture_counts_the_subjects_a_contributing_class_moved() {
+        use crate::estimation::inner_optimizer::{
+            arm_inner_settings, find_ebe_with_variance, EbeVariance, InnerSettings,
+        };
+        use crate::types::InnerOptimizer;
+        let model = crate::parser::model_parser::parse_model_string(
+            &MIX_FIT_MODEL.replace("sigma EPS ~ 0.01", "sigma EPS ~ 0.09"),
+        )
+        .unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let params = &model.default_params;
+        let eval = |mode| {
+            let opts = crate::types::FitOptions {
+                method: crate::types::EstimationMethod::Foce,
+                interaction: false,
+                inner_optimizer: mode,
+                ..Default::default()
+            };
+            crate::api::with_fit_scope(&opts, || {
+                super::mixture_ofv(&model, &pop, params, &opts, None)
+            })
+            .expect("the scope builds")
+        };
+        let nm = eval(InnerOptimizer::NelderMead);
+        let opts = crate::types::FitOptions::default();
+        let k = nm.etas_by_class.len();
+        let moved: Vec<Vec<bool>> = (0..k)
+            .map(|cls| {
+                let _class = crate::parser::model_parser::MixtureClassGuard::enter(cls + 1);
+                let _armed = arm_inner_settings(InnerSettings {
+                    mode: InnerOptimizer::NelderMead,
+                    warm: false,
+                });
+                let cp = super::class_params(params, cls);
+                pop.subjects
+                    .iter()
+                    .map(|s| {
+                        find_ebe_with_variance(
+                            &model,
+                            s,
+                            &cp,
+                            opts.inner_maxiter,
+                            opts.inner_tol,
+                            None,
+                            None,
+                            opts.inner_restarts,
+                            EbeVariance::Population,
+                        )
+                        .nm_polished
+                    })
+                    .collect()
+            })
+            .collect();
+        let expected = (0..pop.subjects.len())
+            .filter(|&i| {
+                let flags: Vec<bool> = (0..k).map(|cls| moved[cls][i]).collect();
+                any_contributing(&flags, &nm.pmix[i])
+            })
+            .count();
+        eprintln!(
+            "mixture under nelder_mead: {} of {} subjects moved",
+            nm.ebe_stats.n_nm_polished,
+            pop.subjects.len()
+        );
+        assert!(expected > 0, "fixture: no contributing class moved");
+        assert_eq!(nm.ebe_stats.n_nm_polished, expected);
+        assert_eq!(eval(InnerOptimizer::Auto).ebe_stats.n_nm_polished, 0);
+    }
+
     #[test]
     fn iov_mixture_gradient_falls_back_to_fd() {
         // #985: the analytic mixture gradient does not yet emit κ-slot gradients and

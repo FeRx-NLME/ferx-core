@@ -5760,6 +5760,74 @@ fn a_certified_fallback_takes_the_adjoint_level_gradient() {
     );
 }
 
+/// #2588 (M8): the profile solve's `n_nm_polished` is the population loop's count at the
+/// start levels **plus** its own re-solved states. Asserting only that the solve's count is
+/// non-zero (as [`under_nelder_mead_a_state_on_the_adjoint_is_a_mode`] does) passes on the
+/// loop's count alone, so dropping the states term went unseen. Here the start loop is run
+/// again with the solve's own arguments (`ProfileCtx::solve`'s `run_inner_loop_warm_map`
+/// call), and the solve must count more than it: every Newton step re-solves each EBE under
+/// `nelder_mead`, and at F2's tolerance the certificate moves some of those stops.
+#[test]
+fn the_profile_solve_counts_its_own_moved_states() {
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let cf = ctx(&p, &layout, &o);
+    let params = &p.init_params;
+    let counts = |mode| {
+        let scoped = FitOptions {
+            inner_optimizer: mode,
+            ..o.clone()
+        };
+        crate::api::with_fit_scope(&scoped, || {
+            let warm = ProfileWarm::from_template(&layout, params);
+            let mut ps = params.clone();
+            for (pos, (&k, &b)) in layout.coords.iter().zip(&warm.beta).enumerate() {
+                ps.theta[k] = b.clamp(layout.lower[pos], layout.upper[pos]);
+            }
+            let mu_k = compute_mu_k(cf.model, &ps.theta, o.mu_referencing);
+            let start = run_inner_loop_warm_map(
+                cf.model,
+                cf.population,
+                &ps,
+                o.inner_maxiter,
+                cf.inner_tol,
+                warm.etas.as_deref(),
+                Some(&mu_k),
+                o.min_obs_for_convergence_check as usize,
+                o.inner_restarts,
+                InnerSolvePolicy {
+                    seed: InnerHessianSeed::for_options(&o),
+                    unseeded_iov_warm: true,
+                    ..InnerSolvePolicy::for_stage(&o, cf.model)
+                },
+                None,
+                |_, _| (),
+            )
+            .2
+            .n_nm_polished;
+            let solve = cf
+                .solve(params, &warm)
+                .expect("the solve converges")
+                .ebe
+                .n_nm_polished;
+            (start, solve)
+        })
+        .expect("the scope builds")
+    };
+    let (start, solve) = counts(crate::types::InnerOptimizer::NelderMead);
+    eprintln!("nelder_mead profile solve: start loop {start}, solve {solve}");
+    assert!(
+        solve > start,
+        "the re-solved states added no moved count: start loop {start}, solve {solve}"
+    );
+    assert!(
+        solve - start <= p.population.subjects.len(),
+        "one final state per subject: start loop {start}, solve {solve}"
+    );
+    assert_eq!(counts(crate::types::InnerOptimizer::Auto), (0, 0));
+}
+
 /// #2557: under `inner_optimizer = nelder_mead`, a state the profile solve keeps on the
 /// adjoint (`off_mode` false) is a mode. `off_mode` reads only `converged` since #2554, and
 /// the primary NM search used to set it from NM's simplex spread: on `main` F2 subject 1's
