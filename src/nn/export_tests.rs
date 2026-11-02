@@ -18,6 +18,7 @@ use crate::parser::model_parser::{parse_model_string, SUPPORTED_UNARY_FNS};
 const FIXTURE_MODEL: &str = include_str!("../../tests/data/dcm_export/model.ferx");
 const FIXTURE_THETA: &str = include_str!("../../tests/data/dcm_export/theta.csv");
 const FIXTURE_EXPECTED: &str = include_str!("../../tests/data/dcm_export/expected_analytic.ferx");
+const FIXTURE_FITTED: &str = include_str!("../../tests/data/dcm_export/expected_fitted.ferx");
 
 fn fixture_theta() -> (Vec<String>, Vec<f64>) {
     FIXTURE_THETA
@@ -571,11 +572,19 @@ fn quoted_paths_are_never_rewritten() {
     );
 }
 
+/// The fixture's fit: its θ, and Ω / Σ estimates that differ from every value the
+/// model file declares, so an export that kept a starting value shows.
 fn fixture_fit(model_text: Option<&str>) -> crate::types::FitResult {
     let (names, theta) = fixture_theta();
     crate::types::FitResult {
         theta,
         theta_names: names,
+        eta_names: ["ETA_CL", "ETA_V", "ETA_KA"].map(String::from).to_vec(),
+        omega: nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![
+            0.0912, 0.0437, 0.3125,
+        ])),
+        sigma: vec![0.1234],
+        sigma_names: vec!["PROP_ERR".into()],
         model_text: model_text.map(str::to_string),
         // Finite, so the fit round-trips through JSON (a `NaN` is written `null`).
         shrinkage_eps: 0.0,
@@ -592,9 +601,11 @@ fn fixture_fit(model_text: Option<&str>) -> crate::types::FitResult {
 #[test]
 fn a_fit_made_with_a_different_network_is_refused() {
     let fit = fixture_fit(Some(FIXTURE_MODEL));
-    // Control: the model the fit was made with exports, and identically to the
-    // name-lookup entry point.
-    let got = export_dcm_from_fit(FIXTURE_MODEL, &fit, &DcmExportOptions::default()).unwrap();
+    // Control: the model the fit was made with exports — under `network_only`
+    // identically to the name-lookup entry point.
+    let mut network_only = DcmExportOptions::default();
+    network_only.network_only = true;
+    let got = export_dcm_from_fit(FIXTURE_MODEL, &fit, &network_only).unwrap();
     assert_eq!(got, FIXTURE_EXPECTED);
     // Comments, layout and `init` do not define the network.
     let cosmetic = FIXTURE_MODEL
@@ -680,6 +691,168 @@ fn the_committed_fit_json_is_the_fixture_fit() {
         fit.theta.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
     );
     assert_eq!(read.model_text, fit.model_text);
+    assert_eq!(read.omega, fit.omega);
+    assert_eq!(read.sigma, fit.sigma);
+}
+
+/// The committed fitted export: the fixture at its fit, every parameter at the
+/// fit's estimate. Regenerate with `FERX_WRITE_DCM_FITTED=1`.
+#[test]
+fn fitted_export_matches_the_committed_text() {
+    let fit = fixture_fit(Some(FIXTURE_MODEL));
+    let got = export_dcm_from_fit(FIXTURE_MODEL, &fit, &DcmExportOptions::default()).unwrap();
+    if std::env::var_os("FERX_WRITE_DCM_FITTED").is_some() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/dcm_export/expected_fitted.ferx"
+        );
+        std::fs::write(path, &got).unwrap();
+    }
+    assert_eq!(got, FIXTURE_FITTED);
+}
+
+/// Every estimate lands in the export, bit for bit on the scale the fit reports
+/// it on: a θ, a variance-declared Ω and an `(sd)`-declared Σ.
+#[test]
+fn the_fitted_export_declares_every_estimate_of_the_fit() {
+    let fit = fixture_fit(Some(FIXTURE_MODEL));
+    let text = export_dcm_from_fit(FIXTURE_MODEL, &fit, &DcmExportOptions::default()).unwrap();
+    let p = parse_model_string(&text).unwrap().default_params;
+    let i = p.theta_names.iter().position(|n| n == "TVV").unwrap();
+    assert_eq!(p.theta[i].to_bits(), 31.5f64.to_bits());
+    assert_eq!(p.omega.eta_names, fit.eta_names);
+    for (got, want) in p.omega.matrix.iter().zip(fit.omega.iter()) {
+        assert_eq!(got.to_bits(), want.to_bits());
+    }
+    assert_eq!(p.sigma.values[0].to_bits(), 0.1234f64.to_bits());
+    assert!(text.contains("theta TVV(31.5, 1, 100)"), "{text}");
+    assert!(text.contains("sigma PROP_ERR ~ 0.1234 (sd)"), "{text}");
+    assert!(text.contains("is the fit's estimate"), "{text}");
+}
+
+/// A declaration keeps its scale — the `(sd)` tag and an inline prior on it
+/// still mean what they did — and a block declaration over several lines, a
+/// correlated `block_sigma` and a kappa are written as well. Values that cross a
+/// scale read back within the rounding of the conversion.
+#[test]
+fn declarations_keep_their_scale_and_blocks_are_written() {
+    let model = FIXTURE_MODEL
+        .replace(
+            "  omega ETA_CL ~ 0.1\n  omega ETA_V  ~ 0.05\n",
+            "  block_omega (ETA_CL, ETA_V) = [0.1,\n     0.01, 0.05]   # CL-V\n",
+        )
+        .replace(
+            "  omega ETA_KA ~ 0.2",
+            "  omega ETA_KA ~ 0.4 (sd) prior(0.4, rse = 30%)\n  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        )
+        .replace(
+            "  sigma PROP_ERR ~ 0.1 (sd)",
+            "  block_sigma (PROP_ERR, ADD_ERR) = [0.01, 0.001, 0.04]",
+        )
+        .replace("exp(ETA_CL)", "exp(ETA_CL + KAPPA_CL)")
+        .replace(
+            "DV ~ proportional(PROP_ERR)",
+            "DV ~ combined(PROP_ERR, ADD_ERR)",
+        );
+    let mut fit = fixture_fit(Some(&model));
+    fit.omega[(0, 1)] = 0.0123;
+    fit.omega[(1, 0)] = 0.0123;
+    fit.omega_iov = Some(nalgebra::DMatrix::from_element(1, 1, 0.0456));
+    fit.kappa_names = vec!["KAPPA_CL".into()];
+    fit.sigma = vec![0.1234, 0.25];
+    fit.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+    fit.residual_correlations = vec![crate::types::ResidualCorrelation {
+        sigma_i: 0,
+        sigma_j: 1,
+        rho: 0.3,
+    }];
+    let text = export_dcm_from_fit(&model, &fit, &DcmExportOptions::default()).unwrap();
+    assert!(
+        text.contains("block_omega (ETA_CL, ETA_V) = [0.0912, 0.0123, 0.0437]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("omega ETA_KA ~ 0.5590169943749475 (sd) prior(0.4, rse = 30%)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("kappa KAPPA_CL ~ 0.0456 weight = NARM"),
+        "{text}"
+    );
+    let p = parse_model_string(&text).unwrap().default_params;
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-15 * b.abs();
+    assert!(close(p.omega.matrix[(2, 2)], 0.3125), "{}", p.omega.matrix);
+    assert!(close(p.sigma.values[0], 0.1234) && close(p.sigma.values[1], 0.25));
+    assert!(
+        close(p.residual_correlations[0].rho, 0.3),
+        "{:?}",
+        p.residual_correlations
+    );
+    assert_eq!(
+        p.omega_iov.unwrap().matrix[(0, 0)].to_bits(),
+        0.0456f64.to_bits()
+    );
+}
+
+/// An estimate the export cannot declare is an error naming it, with the
+/// way out; `network_only` takes it and keeps the model's own values.
+#[test]
+fn an_estimate_with_no_declaration_is_refused_unless_network_only() {
+    let mut fit = fixture_fit(Some(FIXTURE_MODEL));
+    fit.theta_names.push("TVEXTRA".into());
+    fit.theta.push(2.0);
+    let err = export_dcm_from_fit(FIXTURE_MODEL, &fit, &DcmExportOptions::default()).unwrap_err();
+    assert!(
+        err.contains("theta TVEXTRA") && err.contains("--network-only"),
+        "{err}"
+    );
+    let mut fit = fixture_fit(Some(FIXTURE_MODEL));
+    fit.eta_names[1] = "ETA_OTHER".into();
+    let err = export_dcm_from_fit(FIXTURE_MODEL, &fit, &DcmExportOptions::default()).unwrap_err();
+    assert!(err.contains("omega ETA_OTHER"), "{err}");
+    let mut fit = fixture_fit(Some(FIXTURE_MODEL));
+    fit.sigma_names[0] = "ADD_ERR".into();
+    let err = export_dcm_from_fit(FIXTURE_MODEL, &fit, &DcmExportOptions::default()).unwrap_err();
+    assert!(err.contains("sigma ADD_ERR"), "{err}");
+    let mut opts = DcmExportOptions::default();
+    opts.network_only = true;
+    let text = export_dcm_from_fit(FIXTURE_MODEL, &fit, &opts).unwrap();
+    assert!(text.contains("theta TVV(30, 1, 100)"), "{text}");
+    assert!(
+        text.contains("keeps the value this file declared"),
+        "{text}"
+    );
+}
+
+/// A repeated network input is named as such, not blamed on a second block.
+#[test]
+fn a_repeated_input_or_output_is_named() {
+    let (names, theta) = fixture_theta();
+    for (from, to, dup) in [
+        ("[WT, CRCL]", "[WT, wt]", "`inputs` lists `wt`"),
+        ("[CL, KA]", "[CL, CL]", "`outputs` lists `CL`"),
+    ] {
+        let model = FIXTURE_MODEL.replacen(from, to, 1);
+        let err = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap_err();
+        assert!(err.contains(dup), "{err}");
+    }
+}
+
+/// A block this build cannot parse is left out of the validation parse and kept
+/// in the export, so a joint DCM exports from the default-feature `ferx`.
+#[cfg(not(feature = "survival"))]
+#[test]
+fn a_block_this_build_cannot_parse_is_kept_and_not_validated() {
+    let (names, theta) = fixture_theta();
+    let model =
+        format!("{FIXTURE_MODEL}\n[event_model]\n  cmt = 2\n  hazard = 0.01 * TYPICAL_PK.CL\n");
+    let text = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap();
+    // The straddle: the export itself does not parse in this build.
+    assert!(parse_model_string(&text).is_err());
+    assert!(
+        text.contains("[event_model]\n  cmt = 2\n  hazard = 0.01 * TYPICAL_PK_CL"),
+        "{text}"
+    );
 }
 
 /// The expression language's `/` returns 0 below a 1e-30 divisor; a network

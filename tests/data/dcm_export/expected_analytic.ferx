@@ -1,6 +1,7 @@
 # Exported by `ferx export-dcm` (#1331): the [covariate_nn] block(s) TYPICAL_PK written
 # out as plain equations at the fitted weights. Predictions equal the fitted
 # network's; the weights are inlined as constants, not estimated — do not refit them.
+# Every other theta / omega / sigma keeps the value this file declared.
 # Fixture for the DCM export (#1331): a [covariate_nn] model whose export is
 # committed next to it as `expected_analytic.ferx`. 2 -> 3 -> 2 -> 2, two hidden
 # layers, outputs routed to the non-adjacent CL and KA slots.

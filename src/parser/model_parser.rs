@@ -16332,6 +16332,16 @@ pub fn known_block_names() -> Vec<&'static str> {
 }
 
 /// Whether the cargo feature a registry entry names is enabled in this build.
+/// The feature a `[name]` block needs when this build lacks it, or `None` when
+/// the block is not feature-gated, its feature is on, or it is not a block name.
+pub(crate) fn block_disabled_feature(name: &str) -> Option<&'static str> {
+    BLOCK_REGISTRY
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .and_then(|(_, _, feature)| *feature)
+        .filter(|f| !block_feature_enabled(f))
+}
+
 fn block_feature_enabled(feature: &str) -> bool {
     match feature {
         "survival" => cfg!(feature = "survival"),
@@ -27953,7 +27963,7 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             }
             Op::InvLogit => {
                 let v = pop!();
-                push!(crate::nn::Activation::Sigmoid.apply_g(v));
+                push!(v.inv_logit());
             }
             // The network's own generic activation: same branches on the value, so
             // the value is bit-identical to the `f64` arms and the jet is the

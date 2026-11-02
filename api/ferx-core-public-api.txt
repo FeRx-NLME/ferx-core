@@ -1121,6 +1121,7 @@ pub mod ferx_core::nn::export
 pub ferx_core::nn::export::DcmWeightForm::FixedTheta
 pub ferx_core::nn::export::DcmWeightForm::Literal
 #[non_exhaustive] pub struct ferx_core::nn::export::DcmExportOptions
+pub ferx_core::nn::export::DcmExportOptions::network_only: bool
 pub ferx_core::nn::export::DcmExportOptions::weight_form: ferx_core::nn::export::DcmWeightForm
 pub fn ferx_core::nn::export::export_dcm_as_analytic(model_text: &str, theta_names: &[alloc::string::String], theta: &[f64], opts: &ferx_core::nn::export::DcmExportOptions) -> core::result::Result<alloc::string::String, alloc::string::String>
 pub fn ferx_core::nn::export::export_dcm_from_fit(model_text: &str, fit: &ferx_core::FitResult, opts: &ferx_core::nn::export::DcmExportOptions) -> core::result::Result<alloc::string::String, alloc::string::String>

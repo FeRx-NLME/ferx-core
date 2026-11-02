@@ -52,9 +52,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::Activation;
 use crate::parser::model_parser::{
-    block_header, is_plain_identifier, parse_model_string, parse_nn_block_fields,
-    scaling_intermediate_reserved, strip_line_comment, NnBlockSpec,
+    block_disabled_feature, block_header, is_plain_identifier, parse_model_string,
+    parse_nn_block_fields, scaling_intermediate_reserved, strip_line_comment, NnBlockSpec,
 };
+
+#[path = "export_values.rs"]
+mod values;
 
 /// How the exported model carries the fitted weights.
 #[non_exhaustive]
@@ -81,6 +84,13 @@ pub enum DcmWeightForm {
 pub struct DcmExportOptions {
     /// How the weights appear in the exported model.
     pub weight_form: DcmWeightForm,
+    /// [`export_dcm_from_fit`] only: keep every `theta` / `omega` / `sigma` /
+    /// `kappa` at the value the model text declares instead of writing the
+    /// fit's estimates — the fitted network inside the model as written. For a
+    /// model with a declaration the estimates cannot be written into (a vector
+    /// θ, a `[covariate_model]` θ, a `[mixture]` class override), which
+    /// `export_dcm_from_fit` otherwise refuses.
+    pub network_only: bool,
 }
 
 /// Expand every `[covariate_nn]` block of `model_text` into explicit
@@ -106,6 +116,21 @@ pub fn export_dcm_as_analytic(
     theta_names: &[String],
     theta: &[f64],
     opts: &DcmExportOptions,
+) -> Result<String, String> {
+    export_networks(model_text, theta_names, theta, opts, OTHERS_AS_WRITTEN)
+}
+
+/// The header line on the other parameters, for each entry point.
+const OTHERS_AS_WRITTEN: &str =
+    "# Every other theta / omega / sigma keeps the value this file declared.\n";
+const OTHERS_FITTED: &str = "# Every other theta / omega / sigma is the fit's estimate.\n";
+
+fn export_networks(
+    model_text: &str,
+    theta_names: &[String],
+    theta: &[f64],
+    opts: &DcmExportOptions,
+    others: &str,
 ) -> Result<String, String> {
     if theta_names.len() != theta.len() {
         return Err(format!(
@@ -149,6 +174,7 @@ pub fn export_dcm_as_analytic(
             DcmWeightForm::FixedTheta => "FIXed thetas",
         }
     ));
+    out.push_str(others);
     // A model may read a weight θ directly (the parser allows it, #1016). Those
     // θ disappear with the block, so under `Literal` each reference becomes the
     // weight's value; under `FixedTheta` the θ is declared again and the
@@ -199,8 +225,7 @@ fn check_exported(
     nets: &[(NnBlockSpec, Vec<f64>)],
     names: &NameTable,
 ) -> Result<(), String> {
-    let model = parse_model_string(&without_priors(text))
-        .map_err(|e| format!("the exported model does not parse, so it is not returned: {e}"))?;
+    let model = parse_for_validation(text)?;
     // A `NAME.OUTPUT` read where the generated statements are not in scope (a
     // `[parameters]` kappa weight, say) becomes a bare name there, which parses
     // as a data column the dataset does not have.
@@ -242,22 +267,27 @@ fn check_exported(
     Ok(())
 }
 
-/// `text` without its `[priors]` block(s), for the validation parse only.
+/// `text` without the blocks the validation parse leaves out.
 ///
 /// `[priors] from_fit = "…"` is expanded during a parse, reading the named fit
 /// file against the process's working directory — not the model's, which this
 /// text transform does not know. Priors decide nothing the validation looks at
 /// (whether the text parses, how each name resolves), so they are left out of it
-/// rather than read from a path that may not resolve here; the returned export
-/// keeps them verbatim.
-fn without_priors(text: &str) -> String {
+/// rather than read from a path that may not resolve here.
+///
+/// A block this build cannot parse (`[event_model]` without `survival`, say) is
+/// left out too: the export is a text transform that never evaluates one, and
+/// refusing it would make a joint DCM unexportable from the default-feature
+/// `ferx` binary. The rest of the model is still validated. The returned export
+/// keeps every block verbatim either way.
+fn validation_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut in_priors = false;
+    let mut skip = false;
     for line in text.lines() {
         if let Some((ty, _)) = block_header(strip_line_comment(line).trim()) {
-            in_priors = ty == "priors";
+            skip = ty == "priors" || block_disabled_feature(&ty).is_some();
         }
-        if !in_priors {
+        if !skip {
             out.push_str(line);
             out.push('\n');
         }
@@ -265,8 +295,24 @@ fn without_priors(text: &str) -> String {
     out
 }
 
-/// [`export_dcm_as_analytic`] at a fit's weights, after confirming the fit was
-/// made with the networks `model_text` declares.
+/// Parse the export for validation (see [`validation_text`]).
+fn parse_for_validation(text: &str) -> Result<crate::types::CompiledModel, String> {
+    parse_model_string(&validation_text(text))
+        .map_err(|e| format!("the exported model does not parse, so it is not returned: {e}"))
+}
+
+/// Export the fitted model: [`export_dcm_as_analytic`] at a fit's weights, with
+/// every other `theta` / `omega` / `sigma` / `kappa` declaration set to the fit's
+/// estimate, after confirming the fit was made with the networks `model_text`
+/// declares.
+///
+/// Each declaration keeps the scale it is written on (a `(sd)` tag, an inline
+/// `prior(...)`), and the export is parsed again to confirm it declares every
+/// estimate — bit for bit where the declared scale is the one the fit reports
+/// (variances for Ω and κ, SDs for Σ), within a few ULP of the conversion where
+/// it is not. A declaration the estimate cannot be written into is an error
+/// naming it; [`DcmExportOptions::network_only`] keeps the model's own values
+/// instead.
 ///
 /// The weight θ names carry only the block name and the matrix indices, so a
 /// model whose network kept its name and shape but changed an input, an
@@ -293,7 +339,23 @@ pub fn export_dcm_from_fit(
          checked against this model; export from the fit's `.fitrx` bundle instead",
     )?;
     check_same_networks(model_text, fitted)?;
-    export_dcm_as_analytic(model_text, &fit.theta_names, &fit.theta, opts)
+    if opts.network_only {
+        return export_dcm_as_analytic(model_text, &fit.theta_names, &fit.theta, opts);
+    }
+    let networks = export_networks(
+        model_text,
+        &fit.theta_names,
+        &fit.theta,
+        opts,
+        OTHERS_FITTED,
+    )?;
+    let exported = values::write_fitted_values(&networks, fit);
+    let weights: HashSet<String> = network_specs(model_text)?
+        .iter()
+        .flat_map(NnBlockSpec::weight_theta_names)
+        .collect();
+    values::check_fitted_values(&parse_for_validation(&exported)?, fit, &weights)?;
+    Ok(exported)
 }
 
 /// Every `[covariate_nn]` block of `text`, read by the parser's field reader.
@@ -520,6 +582,18 @@ fn lookup_weights(
 /// the `nn` build applies to the same values: in a build without `nn` nothing
 /// else has looked at them, and the emission indexes them by input.
 fn check_exportable(spec: &NnBlockSpec) -> Result<(), String> {
+    // Each generates one variable per entry, so a repeat (in any case — the
+    // collision scan folds case) would be declared twice.
+    for (field, names) in [("inputs", &spec.inputs), ("outputs", &spec.outputs)] {
+        let mut seen = HashSet::new();
+        if let Some(dup) = names.iter().find(|n| !seen.insert(n.to_ascii_uppercase())) {
+            return Err(format!(
+                "[covariate_nn {}] `{field}` lists `{dup}` more than once; list each \
+                 once before exporting",
+                spec.name
+            ));
+        }
+    }
     let n_in = spec.inputs.len();
     for (field, values) in [("center", &spec.center), ("scale", &spec.scale)] {
         if let Some(v) = values {
@@ -672,8 +746,8 @@ impl NameTable {
             }
             if !seen.insert(key) {
                 return Err(format!(
-                    "the export would declare `{g}` twice (two [covariate_nn] blocks \
-                     generate the same name); rename one of the blocks before exporting"
+                    "the export would declare `{g}` twice: two [covariate_nn] blocks \
+                     generate the same name; rename one of the blocks before exporting"
                 ));
             }
         }

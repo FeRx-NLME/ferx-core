@@ -2,7 +2,7 @@
 //! population PK model (#1331).
 //!
 //! Thin by construction: read the fit, call
-//! [`ferx_core::nn::export::export_dcm_as_analytic`], write the text. The
+//! [`ferx_core::nn::export::export_dcm_from_fit`], write the text. The
 //! transform itself lives in `ferx-core`.
 
 use ferx_core::nn::export::{export_dcm_from_fit, DcmExportOptions, DcmWeightForm};
@@ -10,16 +10,19 @@ use ferx_core::types::FitResult;
 use std::path::Path;
 
 pub const EXPORT_DCM_USAGE: &str = "\
-Usage: ferx export-dcm <run.fitrx>                       [-o <out.ferx>] [--fixed-theta]
-       ferx export-dcm <model.ferx> --fit <run.fitrx|run.json> [-o <out.ferx>] [--fixed-theta]
+Usage: ferx export-dcm <run.fitrx>                       [options]
+       ferx export-dcm <model.ferx> --fit <run.fitrx|run.json> [options]
 
 Writes a fitted deep compartment model (a model with [covariate_nn] blocks) out
 as an ordinary population PK model: each network becomes plain
 [individual_parameters] equations at the fitted weights. The result has no
 [covariate_nn] block and loads without the `nn` feature. Each network's
-equations give exactly what the fitted network does, but only the networks
-carry the fit's values: every other theta / omega / sigma keeps the value the
-model file declares, so the export does not reproduce the whole fit.
+equations give exactly what the fitted network does, and every other theta /
+omega / sigma / kappa is written at the fit's estimate, so the export is the
+fitted model. A declaration the estimate cannot be written into (a vector
+theta, a [covariate_model] theta, a [mixture] class override) is an error;
+--network-only then keeps the model file's values for everything but the
+networks.
 
 With a separate model file, the fit must have been made with the same networks
 (same inputs, outputs, layers, activations, center and scale); a mismatch is an
@@ -35,6 +38,8 @@ accepted: it rounds to 6 decimals and does not list the network weights.
                     (default: {model}-analytic.ferx next to the input)
   --fixed-theta     declare each weight as a FIXed theta and reference it by
                     name, instead of inlining the values
+  --network-only    write only the networks at the fit's values; keep every
+                    other parameter at the value the model file declares
   -h, --help        print this help and exit
 ";
 
@@ -45,6 +50,7 @@ struct Args {
     fit: Option<String>,
     output: Option<String>,
     fixed_theta: bool,
+    network_only: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -57,6 +63,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "-o" | "--output" => &mut parsed.output,
             "--fixed-theta" => {
                 parsed.fixed_theta = true;
+                continue;
+            }
+            "--network-only" => {
+                parsed.network_only = true;
                 continue;
             }
             _ if a.starts_with('-') => return Err(format!("unexpected argument `{a}`")),
@@ -153,15 +163,36 @@ pub fn run(args: &[String]) -> i32 {
     };
     let out = parsed
         .output
+        .clone()
         .map(std::path::PathBuf::from)
         .unwrap_or(default_out);
-    match write_export(&text, &fit, parsed.fixed_theta, &out) {
+    let inputs = std::iter::once(&parsed.input).chain(&parsed.fit);
+    if let Some(input) = inputs.map(Path::new).find(|i| same_file(i, &out)) {
+        eprintln!(
+            "Error: the output `{}` is the input `{}`; writing it would overwrite the \
+             original. Pass a different -o",
+            out.display(),
+            input.display()
+        );
+        return 2;
+    }
+    let mut opts = DcmExportOptions::default();
+    if parsed.fixed_theta {
+        opts.weight_form = DcmWeightForm::FixedTheta;
+    }
+    opts.network_only = parsed.network_only;
+    match write_export(&text, &fit, &opts, &out) {
         Ok(()) => {
             println!("Wrote {}", out.display());
-            println!(
-                "Note: only the networks carry the fit's values; every other theta, \
-                 omega and sigma keeps the value the model file declares."
-            );
+            if parsed.network_only {
+                println!(
+                    "Note: --network-only: every theta, omega and sigma outside the \
+                     networks keeps the value the model file declares."
+                );
+            }
+            for note in notes(&text, Path::new(&parsed.input), &out) {
+                println!("Note: {note}");
+            }
             0
         }
         Err(e) => {
@@ -171,14 +202,91 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// Export `text` at `fit`'s weights — after checking `fit` was made with the
-/// networks `text` declares — and write it to `out`.
-fn write_export(text: &str, fit: &FitResult, fixed_theta: bool, out: &Path) -> Result<(), String> {
-    let mut opts = DcmExportOptions::default();
-    if fixed_theta {
-        opts.weight_form = DcmWeightForm::FixedTheta;
+/// Do `a` and `b` name the same existing file?
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
-    let exported = export_dcm_from_fit(text, fit, &opts)?;
+}
+
+/// The `key = value` entries of `[data]` / `[priors]` that name a file.
+fn file_entries(text: &str) -> Vec<(&'static str, String)> {
+    let mut block = String::new();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let code = line.split('#').next().unwrap_or_default().trim();
+        if let Some(inner) = code.strip_prefix('[').and_then(|c| c.strip_suffix(']')) {
+            block = inner
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            continue;
+        }
+        let Some((key, value)) = code.split_once('=') else {
+            continue;
+        };
+        let key = match (block.as_str(), key.trim()) {
+            ("data", "path") => "[data] path",
+            ("priors", "from_fit") => "[priors] from_fit",
+            _ => continue,
+        };
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        out.push((key, value.to_string()));
+    }
+    out
+}
+
+/// What the user should know about the written export that the export cannot
+/// say for itself.
+///
+/// A relative `[data] path` or `[priors] from_fit` is copied as written, and
+/// resolves against wherever the export is loaded from; the original resolved it
+/// against its own directory, which for a `.fitrx` this command does not know. A
+/// `from_fit` prior was made for the network model: its network-weight entries
+/// match no free theta in the export and are skipped when it is loaded.
+fn notes(text: &str, input: &Path, out: &Path) -> Vec<String> {
+    let dir = |p: &Path| {
+        p.parent()
+            .map(|d| d.canonicalize().unwrap_or_else(|_| d.to_path_buf()))
+    };
+    let from_bundle = input
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("fitrx"));
+    let moved = from_bundle || dir(input) != dir(out);
+    let mut notes = Vec::new();
+    for (key, value) in file_entries(text) {
+        let relative = !Path::new(&value).is_absolute() && !value.starts_with('~');
+        if relative && moved {
+            notes.push(format!(
+                "{key} = \"{value}\" is relative and copied as written; it now resolves \
+                 against `{}`, not the original model's directory",
+                out.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."))
+                    .display()
+            ));
+        }
+        if key == "[priors] from_fit" {
+            notes.push(format!(
+                "{key} = \"{value}\" was made for the network model; its network-weight \
+                 entries match no free theta in the export and are skipped when it loads"
+            ));
+        }
+    }
+    notes
+}
+
+/// Export `text` at `fit` — after checking `fit` was made with the networks
+/// `text` declares — and write it to `out`.
+fn write_export(
+    text: &str,
+    fit: &FitResult,
+    opts: &DcmExportOptions,
+    out: &Path,
+) -> Result<(), String> {
+    let exported = export_dcm_from_fit(text, fit, opts)?;
     std::fs::write(out, exported).map_err(|e| format!("cannot write `{}`: {e}", out.display()))
 }
 
@@ -214,6 +322,7 @@ mod tests {
             fit: Some("run.json".into()),
             output: Some("out.ferx".into()),
             fixed_theta: true,
+            network_only: false,
         };
         for order in [
             &[
@@ -261,6 +370,56 @@ mod tests {
             .contains("expected a .fitrx"));
     }
 
+    /// `-o` naming the model or the fit is refused before anything is written.
+    #[test]
+    fn an_output_that_is_an_input_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("m.ferx");
+        let fit = dir.path().join("run.json");
+        std::fs::write(&model, "keep").unwrap();
+        std::fs::write(&fit, "keep").unwrap();
+        let (m, f) = (model.to_str().unwrap(), fit.to_str().unwrap());
+        for out in [m, f] {
+            assert_eq!(run(&args(&["export-dcm", m, "--fit", f, "-o", out])), 2);
+        }
+        assert_eq!(std::fs::read_to_string(&model).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&fit).unwrap(), "keep");
+        assert!(same_file(&model, &dir.path().join(".").join("m.ferx")));
+        assert!(!same_file(&model, &dir.path().join("new.ferx")));
+    }
+
+    /// A relative path is flagged when the export lands elsewhere, and only
+    /// then; a `from_fit` prior is always flagged.
+    #[test]
+    fn relative_paths_and_from_fit_priors_are_noted() {
+        let text =
+            "[data]\n  path = \"../data/pk.csv\"  # rel\n[priors]\n  from_fit = prev.fitrx\n";
+        let here = Path::new("models/m.ferx");
+        let same = notes(text, here, Path::new("models/m-analytic.ferx"));
+        assert_eq!(same.len(), 1, "{same:?}");
+        assert!(same[0].contains("network-weight"), "{same:?}");
+        let moved = notes(text, here, Path::new("out/m.ferx"));
+        assert!(
+            moved
+                .iter()
+                .any(|n| n.contains("\"../data/pk.csv\" is relative") && n.contains("`out`")),
+            "{moved:?}"
+        );
+        assert!(
+            moved
+                .iter()
+                .any(|n| n.contains("\"prev.fitrx\" is relative")),
+            "{moved:?}"
+        );
+        let bundle = notes(text, Path::new("run.fitrx"), Path::new("run-analytic.ferx"));
+        assert!(
+            bundle.iter().any(|n| n.contains("is relative")),
+            "{bundle:?}"
+        );
+        let absolute = "[data]\n  path = \"/abs/pk.csv\"\n";
+        assert!(notes(absolute, Path::new("run.fitrx"), Path::new("x.ferx")).is_empty());
+    }
+
     #[test]
     fn the_yaml_report_is_refused_for_its_precision() {
         let err = read_fit(Path::new("run-fit.yaml")).unwrap_err();
@@ -275,13 +434,19 @@ mod tests {
         let model = std::fs::read_to_string(root.join("model.ferx")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("dcm-analytic.ferx");
-        write_export(&model, &fit, false, &out).unwrap();
+        write_export(&model, &fit, &DcmExportOptions::default(), &out).unwrap();
+        let got = std::fs::read_to_string(&out).unwrap();
+        let want = std::fs::read_to_string(root.join("expected_fitted.ferx")).unwrap();
+        assert_eq!(got, want);
+        let mut network_only = DcmExportOptions::default();
+        network_only.network_only = true;
+        write_export(&model, &fit, &network_only, &out).unwrap();
         let got = std::fs::read_to_string(&out).unwrap();
         let want = std::fs::read_to_string(root.join("expected_analytic.ferx")).unwrap();
         assert_eq!(got, want);
         // A model whose network is not the fit's is an error, not a file.
         let other = model.replace("activation = tanh", "activation = relu");
-        let err = write_export(&other, &fit, false, &out).unwrap_err();
+        let err = write_export(&other, &fit, &DcmExportOptions::default(), &out).unwrap_err();
         assert!(
             err.contains("not the network the fit was made with"),
             "{err}"
