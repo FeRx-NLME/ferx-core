@@ -2510,6 +2510,15 @@ fn note_filled_cells(
     }
 }
 
+/// Removes and returns `cmt`'s pending TTE `DV=0` row, keeping the others in the
+/// order their rows appeared. `Vec::remove` (not `swap_remove`) is what preserves
+/// that order, which the end-of-subject flush relies on.
+#[cfg(feature = "survival")]
+fn take_tte_pending(pending: &mut Vec<(usize, (f64, f64))>, cmt: usize) -> Option<(f64, f64)> {
+    let i = pending.iter().position(|&(c, _)| c == cmt)?;
+    Some(pending.remove(i).1)
+}
+
 fn parse_subject(
     id: &str,
     rows: &[Vec<String>],
@@ -2604,11 +2613,15 @@ fn parse_subject(
     // LOCF snapshot of each kept endpoint row, when any covariate is time-varying: the
     // only trace those rows leave of their covariates (#1854; see the field's doc).
     let mut endpoint_covariates: Vec<HashMap<String, f64>> = Vec::new();
-    // tte_pending_left: per-CMT pending DV=0 row (may be a left-bound for an interval
+    // tte_pending: per-CMT pending DV=0 row (may be a left-bound for an interval
     //   or a right-censored event, depending on whether the next row is DV=2).
-    //   Map value is (time, entry_time). TTE-only, hence `survival`-gated.
+    //   Entries are (cmt, (time, entry_time)), at most one per CMT, in the order their
+    //   rows appeared: the end-of-subject flush emits them in that order, so two causes
+    //   censored at the same time keep a deterministic record order (a `HashMap` here
+    //   made competing-risks simulation irreproducible under a fixed seed, #2569).
+    //   TTE-only, hence `survival`-gated.
     #[cfg(feature = "survival")]
-    let mut tte_pending_left: HashMap<usize, (f64, f64)> = HashMap::new();
+    let mut tte_pending: Vec<(usize, (f64, f64))> = Vec::new();
 
     // Time-constant covariates: first non-missing value across all rows.
     // Used as the subject-static fallback (and for the AD fast path, which
@@ -3335,7 +3348,8 @@ fn parse_subject(
                             // DV=0: tentatively a right-censored event, or left-bound of
                             // interval-censored pair. Save as pending; flush on next row.
                             // Flush any existing pending for this CMT first.
-                            if let Some((t_left, e_left)) = tte_pending_left.remove(&cmt) {
+                            if let Some((t_left, e_left)) = take_tte_pending(&mut tte_pending, cmt)
+                            {
                                 obs_records.push(ObsRecord::Event {
                                     time: t_left,
                                     event_type: EventType::RightCensored,
@@ -3343,11 +3357,12 @@ fn parse_subject(
                                     cmt,
                                 });
                             }
-                            tte_pending_left.insert(cmt, (time, entry_time));
+                            tte_pending.push((cmt, (time, entry_time)));
                         }
                         1 => {
                             // DV=1: exact event. Flush any pending left for this CMT.
-                            if let Some((t_left, e_left)) = tte_pending_left.remove(&cmt) {
+                            if let Some((t_left, e_left)) = take_tte_pending(&mut tte_pending, cmt)
+                            {
                                 obs_records.push(ObsRecord::Event {
                                     time: t_left,
                                     event_type: EventType::RightCensored,
@@ -3364,7 +3379,8 @@ fn parse_subject(
                         }
                         2 => {
                             // DV=2: interval-censored right-bound. Must follow a DV=0.
-                            let left = tte_pending_left.remove(&cmt).ok_or_else(|| {
+                            let pending = take_tte_pending(&mut tte_pending, cmt);
+                            let left = pending.ok_or_else(|| {
                                 format!(
                                     "Subject {id}: DV=2 row at TIME={time} on CMT={cmt} \
                                      not preceded by a DV=0 row on the same CMT — \
@@ -3865,8 +3881,9 @@ fn parse_subject(
     // Flush any remaining pending TTE left-bounds as right-censored events.
     // This handles the common case: final row is a right-censored DV=0 with no
     // following DV=2 — the subject was censored at its last observation time.
+    // Emitted in data-row order (see `tte_pending`), never in CMT or hash order.
     #[cfg(feature = "survival")]
-    for (cmt, (t_left, e_left)) in tte_pending_left {
+    for (cmt, (t_left, e_left)) in tte_pending {
         obs_records.push(crate::types::ObsRecord::Event {
             time: t_left,
             event_type: crate::types::EventType::RightCensored,
