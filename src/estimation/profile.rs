@@ -986,6 +986,9 @@ struct SubjectState {
     /// are carried separately.
     unconverged: bool,
     fallback: bool,
+    /// The re-solve's Nelder–Mead stop was moved to its mode by the certificate
+    /// (`EbeResult::nm_polished`, #2571); `false` for a mode from the population inner loop.
+    nm_polished: bool,
     /// The mode may not be one: its solve, from the population inner loop or a re-solve,
     /// did not converge ([`off_mode`]). Its level gradient then takes the re-solved
     /// differences, never the adjoint's identity at a non-mode.
@@ -1082,6 +1085,7 @@ impl ProfileCtx<'_> {
             kappas: ebe.kappas,
             nll,
             fallback: ebe.used_fallback,
+            nm_polished: ebe.nm_polished,
         }
     }
 
@@ -1432,6 +1436,7 @@ impl ProfileCtx<'_> {
                     nll: 0.0,
                     unconverged: false,
                     fallback: false,
+                    nm_polished: false,
                     off_mode: start_off_mode.get(i).is_some_and(|m| m.0),
                     excused: start_off_mode.get(i).is_some_and(|m| m.1),
                 };
@@ -1497,6 +1502,8 @@ impl ProfileCtx<'_> {
                 .n_unconverged
                 .max(states.iter().filter(|s| s.unconverged).count()),
             n_fallback: start_stats.n_fallback + states.iter().filter(|s| s.fallback).count(),
+            n_nm_polished: start_stats.n_nm_polished
+                + states.iter().filter(|s| s.nm_polished).count(),
             n_start_rejected: start_stats.n_start_rejected,
         };
         let (mut etas, mut h_matrices, mut kappas) = (Vec::new(), Vec::new(), Vec::new());
@@ -2675,6 +2682,7 @@ pub(crate) fn optimize_profiled(
             let mut acc = ebe_accum.lock().unwrap();
             acc.max_unconverged = acc.max_unconverged.max(solve.ebe.n_unconverged);
             acc.total_fallback += solve.ebe.n_fallback;
+            acc.total_nm_polished += solve.ebe.n_nm_polished;
             // The unprofiled loop's EBE guard, on the same counts: too many unconverged
             // subjects (or one hard-rejected at its start) and the trial is a wall.
             if ebe_guard_rejects(
@@ -2998,6 +3006,7 @@ pub(crate) fn optimize_profiled(
         ebe_convergence_warnings: ebe.n_guarded as u32,
         max_unconverged_subjects: ebe.max_unconverged as u32,
         total_ebe_fallbacks: ebe.total_fallback as u32,
+        total_ebe_nm_polished: ebe.total_nm_polished as u32,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal: cov.and_then(|c| c.sir_fallback_proposal),
@@ -3140,6 +3149,7 @@ pub(crate) struct ResolvedLevels {
 struct EbeAccum {
     max_unconverged: usize,
     total_fallback: usize,
+    total_nm_polished: usize,
     n_guarded: usize,
     /// The profile solves' summed work, and how many of them failed (#2405).
     work: ProfileCounts,
@@ -3177,6 +3187,7 @@ fn failed_result(
         ebe_convergence_warnings: ebe.n_guarded as u32,
         max_unconverged_subjects: ebe.max_unconverged as u32,
         total_ebe_fallbacks: ebe.total_fallback as u32,
+        total_ebe_nm_polished: ebe.total_nm_polished as u32,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal: None,

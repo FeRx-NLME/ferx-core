@@ -73,6 +73,8 @@ pub struct OuterResult {
     pub ebe_convergence_warnings: u32,
     pub max_unconverged_subjects: u32,
     pub total_ebe_fallbacks: u32,
+    /// See `FitResult::total_ebe_nm_polished` (#2571).
+    pub total_ebe_nm_polished: u32,
     /// Gradient at the best-OFV parameter point in packed space (log-theta,
     /// Cholesky-omega, log-sigma). `Some` for NLopt gradient-based runs
     /// (SLSQP, L-BFGS, MMA) when at least one gradient-requesting iteration
@@ -1182,6 +1184,7 @@ fn evaluate_at_initial_params(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal,
@@ -5525,6 +5528,7 @@ fn optimize_nlopt_attempt(
     struct EbeAccum {
         max_unconverged: usize,
         total_fallback: usize,
+        total_nm_polished: usize,
         n_convergence_warnings: usize,
         /// Evaluations rejected because the objective was not a finite number rather than
         /// by the EBE guard (#1617 review round 3 #2). Counted here, not inferred from the
@@ -5658,6 +5662,7 @@ fn optimize_nlopt_attempt(
             let stats = InnerLoopStats {
                 n_unconverged: m.ebe_stats.n_unconverged,
                 n_fallback: m.ebe_stats.n_fallback,
+                n_nm_polished: m.ebe_stats.n_nm_polished,
                 n_start_rejected: m.ebe_stats.n_start_rejected,
             };
             let ofv = m.ofv;
@@ -5788,6 +5793,7 @@ fn optimize_nlopt_attempt(
                 acc.max_unconverged = ebe_stats.n_unconverged;
             }
             acc.total_fallback += ebe_stats.n_fallback;
+            acc.total_nm_polished += ebe_stats.n_nm_polished;
             if ebe_guard_triggered {
                 acc.n_convergence_warnings += 1;
             } else if !raw_ofv.is_finite() {
@@ -7224,6 +7230,7 @@ fn optimize_nlopt_attempt(
         ebe_convergence_warnings: ebe_final.n_convergence_warnings as u32,
         max_unconverged_subjects: ebe_final.max_unconverged as u32,
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
+        total_ebe_nm_polished: ebe_final.total_nm_polished as u32,
         final_gradient,
         final_gradient_source,
         sir_fallback_proposal,
@@ -7860,6 +7867,7 @@ fn optimize_bfgs(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal,
@@ -8185,6 +8193,7 @@ fn reporting_fd_gradient(
             let stats = InnerLoopStats {
                 n_unconverged: m.ebe_stats.n_unconverged,
                 n_fallback: m.ebe_stats.n_fallback,
+                n_nm_polished: m.ebe_stats.n_nm_polished,
                 n_start_rejected: m.ebe_stats.n_start_rejected,
             };
             (m.ofv, stats)

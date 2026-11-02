@@ -542,6 +542,13 @@ pub struct EbeResult {
     pub converged: bool,
     /// True when the BFGS optimizer failed and Nelder-Mead was invoked as fallback.
     pub used_fallback: bool,
+    /// True when, under `inner_optimizer = nelder_mead`, the returned η̂ is the primary
+    /// search's point but Nelder–Mead's own stop was not a mode: the stationarity certificate
+    /// moved it there with the gradient (Newton steps or a BFGS polish). The primary search's
+    /// own point is not a fallback; but `used_fallback` records that a fallback *ran* in this
+    /// solve, so a moved restart candidate that replaces a fallback point carries both flags.
+    /// Always false under every other `inner_optimizer` (#2571).
+    pub nm_polished: bool,
     /// L2 gradient norm at the solution; 0.0 when Nelder-Mead was used.
     pub grad_norm: f64,
     pub nll: f64,
@@ -976,6 +983,9 @@ pub struct InnerLoopStats {
     pub n_unconverged: usize,
     /// Subjects for which the BFGS→Nelder-Mead fallback was triggered.
     pub n_fallback: usize,
+    /// Subjects whose Nelder–Mead stop the stationarity certificate moved to a mode
+    /// (`EbeResult::nm_polished`); 0 unless `inner_optimizer = nelder_mead` (#2571).
+    pub n_nm_polished: usize,
     /// Subjects hard-rejected at their inner start (pathological ODE+IOV warm-start
     /// NLL). Any non-zero count forces the outer EBE guard to reject the trial,
     /// regardless of `max_unconverged_frac` or the `min_obs` filter (#603 review #1/#2).
@@ -1086,6 +1096,16 @@ pub(crate) struct FallbackCertifier<'a> {
     pub(crate) tol: f64,
 }
 
+/// How [`FallbackCertifier`] certified a point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Certified {
+    /// The point handed in, bit for bit: the gradient test, or the Newton test with no step
+    /// taken.
+    AsGiven,
+    /// A point the certificate moved to: Newton steps, or the gradient polish.
+    Moved,
+}
+
 impl FallbackCertifier<'_> {
     /// Whether `x` is a certified stationary point of `obj`; may move `x` to a polished,
     /// certified point that is no worse (see the type's docs). A non-finite `x` is never
@@ -1139,6 +1159,28 @@ impl FallbackCertifier<'_> {
         let decrement = 0.5 * DVector::from_column_slice(g).dot(&newton);
         newton.norm() < self.tol || (f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs()))
     }
+    /// [`Self::certify`], also saying whether the certified point is the one handed in
+    /// (`None`: not certified; `x` may still have been moved by Newton steps the certificate
+    /// accepted before it failed). Under `inner_optimizer = nelder_mead`
+    /// this is what tells a subject whose Nelder–Mead stop was already a mode from one the
+    /// gradient had to move there (#2571). Decided by comparing bits, not by which test
+    /// fired: the Newton test takes steps too, so "certified by Newton" does not mean
+    /// "unmoved".
+    pub(crate) fn certify_moved(
+        &self,
+        obj: &dyn Fn(&[f64]) -> f64,
+        x: &mut Vec<f64>,
+    ) -> Option<Certified> {
+        let start: Vec<u64> = x.iter().map(|v| v.to_bits()).collect();
+        self.certify(obj, x).then(|| {
+            if x.iter().map(|v| v.to_bits()).eq(start) {
+                Certified::AsGiven
+            } else {
+                Certified::Moved
+            }
+        })
+    }
+
     /// [`Self::certify`], accepting a polished point only when `admissible` holds there. The
     /// runaway-EBE guard (#958) uses it: it recovers with Nelder–Mead precisely because the
     /// gradient there may not be trustworthy, so a gradient polish that marches back past the
@@ -2185,6 +2227,7 @@ fn find_ebe_impl_from(
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
+            nm_polished: false,
             grad_norm: 0.0,
             nll: SUBJECT_SENTINEL_NLL,
             kappas: Vec::new(),
@@ -2282,7 +2325,7 @@ fn find_ebe_impl_from(
 
 /// One screen descent's outcome: its end point, convergence flag and objective there
 /// (`None` for a non-finite end point).
-type ScreenDescent = Option<(Vec<f64>, bool, f64)>;
+type ScreenDescent = Option<(Vec<f64>, InnerExit, f64)>;
 
 /// Whether `eta_init` is a genuine warm start: a mode carried in from an earlier solve.
 /// `None` and an all-zero vector are both cold. The outer loop's first evaluation, the
@@ -2507,6 +2550,7 @@ fn find_ebe_solve(
                 .then(|| DMatrix::zeros(0, 0)),
             converged: true,
             used_fallback: false,
+            nm_polished: false,
             grad_norm: 0.0,
             nll,
             kappas: Vec::new(),
@@ -2692,8 +2736,10 @@ fn find_ebe_solve(
         && use_analytic
         && !enable_stall
         && model.frem_config.is_none();
-    let result = start_certified
-        || inner_minimize_with_grad(
+    let result = if start_certified {
+        InnerExit::Converged
+    } else {
+        inner_minimize_with_grad(
             &obj,
             &agrad,
             &mut eta,
@@ -2705,7 +2751,8 @@ fn find_ebe_solve(
             stop_precond,
             &stall_at,
             short_line_search,
-        );
+        )
+    };
 
     // If BFGS failed, fall back to Nelder-Mead. The recovery policy depends on whether the
     // objective carries a gradient-noise floor (ODE) or is exact (analytical / event-driven /
@@ -2719,7 +2766,7 @@ fn find_ebe_solve(
     //     (e.g. run out along a FREM covariate pseudo-obs flat direction). Keeping it would
     //     mis-center the FREM/IMP proposal, so recover with NM from η=0 (or the warm partial)
     //     exactly as prior releases — bit-identical for analytical/FREM fits.
-    let bfgs_converged = result;
+    let bfgs_converged = result.converged();
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
         // A final BFGS update can meet the requested tolerance exactly as the iteration
@@ -2773,7 +2820,11 @@ fn find_ebe_solve(
         (false, false)
     };
 
-    let mut ebe_converged = bfgs_converged || nm_converged;
+    let mut ebe_exit = if bfgs_converged {
+        result
+    } else {
+        InnerExit::certified(nm_converged)
+    };
     let mut nll = obj(&eta);
 
     // ── Guarded multi-start inner EBE (`[fit_options] inner_restarts`) ──────
@@ -2813,7 +2864,7 @@ fn find_ebe_solve(
     // coordinate's EBE is unchanged from `inner_restarts = 0` unless a seed finds a
     // strictly better mode.
     // A candidate that replaces the incumbent replaces its convergence flag too
-    // (`ebe_converged = ok`, in both the screen and the axis scan): a descent that stopped
+    // (`ebe_exit = ok`, in both the screen and the axis scan): a descent that stopped
     // at `inner_maxiter` below a converged incumbent is not a mode, and keeping the
     // incumbent's `true` reported it as one and hid it from `max_unconverged_frac` (#2100).
     // It is still taken — it is strictly lower, so likely in the better basin.
@@ -2856,7 +2907,7 @@ fn find_ebe_solve(
                     {
                         nll = cand_nll;
                         eta = cand;
-                        ebe_converged = ok;
+                        ebe_exit = ok;
                         twin_moved = true;
                     }
                 }
@@ -2904,7 +2955,7 @@ fn find_ebe_solve(
                     if omega_distance(&cand, &eta, &params.omega) > SCREEN_MIN_OMEGA_DIST {
                         nll = cand_nll;
                         eta = cand;
-                        ebe_converged = ok;
+                        ebe_exit = ok;
                         screen_moved = true;
                     } else {
                         #[cfg(test)]
@@ -2956,7 +3007,7 @@ fn find_ebe_solve(
                         if cand_nll + 1e-9 < nll {
                             nll = cand_nll;
                             eta = cand;
-                            ebe_converged = ok;
+                            ebe_exit = ok;
                         }
                     }
                 }
@@ -3015,7 +3066,7 @@ fn find_ebe_solve(
             if cold_nll < nll {
                 nll = cold_nll;
                 eta = cold;
-                ebe_converged = cold_ok;
+                ebe_exit = InnerExit::certified(cold_ok);
                 used_fallback = true;
             }
         }
@@ -3065,8 +3116,9 @@ fn find_ebe_solve(
         eta: DVector::from_column_slice(&eta_true),
         h_matrix,
         terminal_hessian,
-        converged: ebe_converged,
+        converged: ebe_exit.converged(),
         used_fallback,
+        nm_polished: ebe_exit == InnerExit::NmMoved,
         grad_norm: 0.0, // not computed to avoid extra FD calls; available via nll.is_finite()
         nll,
         kappas: Vec::new(),
@@ -3600,6 +3652,7 @@ fn find_ebe_iov_seeded(
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
+            nm_polished: false,
             grad_norm: 0.0,
             nll: start_nll,
             kappas: kappas_vec,
@@ -3646,7 +3699,7 @@ fn find_ebe_iov_seeded(
         })
         .flatten()
         .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
-    let bfgs_converged = inner_minimize_with_grad(
+    let primary = inner_minimize_with_grad(
         &obj,
         &agrad,
         &mut x,
@@ -3659,6 +3712,7 @@ fn find_ebe_iov_seeded(
         &stall_at,
         false,
     );
+    let bfgs_converged = primary.converged();
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
     // (`argmin_inner_fallback`). This holds for ODE objectives (#555, a gradient-noise floor
@@ -3713,8 +3767,13 @@ fn find_ebe_iov_seeded(
     // solve and one bad outer line-search point would launch a very expensive search
     // ([`skip_ode_iov_nm_fallback`]). That policy stands here, so such a subject keeps
     // whatever the BFGS returned.
-    let mut bfgs_converged = bfgs_converged;
-    let mut nm_converged = nm_converged;
+    // One exit for the returned point, as in the non-IOV solve: the runaway swap below
+    // replaces it whole, so "converged" and "moved" never describe two different points.
+    let mut ebe_exit = if bfgs_converged {
+        primary
+    } else {
+        InnerExit::certified(nm_converged)
+    };
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
     if !skip_ode_iov_nm_fallback(model)
         && iov_prior_maha(&x, &mu, n_eta, n_kappa, k_occasions, nested, params) > runaway_limit
@@ -3727,8 +3786,7 @@ fn find_ebe_iov_seeded(
         });
         if cold.iter().all(|v| v.is_finite()) && obj(&cold) < obj(&x) {
             x = cold;
-            bfgs_converged = false;
-            nm_converged = cold_ok;
+            ebe_exit = InnerExit::certified(cold_ok);
             used_fallback = true;
         }
     }
@@ -3751,8 +3809,9 @@ fn find_ebe_iov_seeded(
         eta: DVector::from_column_slice(&bsv_eta),
         h_matrix,
         terminal_hessian: None,
-        converged: (bfgs_converged || nm_converged) && nll.is_finite(),
+        converged: ebe_exit.converged() && nll.is_finite(),
         used_fallback,
+        nm_polished: ebe_exit == InnerExit::NmMoved,
         grad_norm: 0.0,
         nll,
         kappas: kappas_vec,
@@ -5415,11 +5474,39 @@ fn inner_use_lbfgs(n: usize) -> bool {
     }
 }
 
+/// How one inner minimisation ended. The same value is what a candidate swap carries into
+/// the incumbent (`ebe_exit = exit`), so whether the returned point converged and whether
+/// the certificate moved a Nelder–Mead stop cannot come from two different points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InnerExit {
+    /// Not certified.
+    Failed,
+    /// Certified where the search stopped.
+    Converged,
+    /// `inner_optimizer = nelder_mead` only: Nelder–Mead's stop was not a mode, and the
+    /// certificate's gradient steps moved it to a certified one (#2571).
+    NmMoved,
+}
+
+impl InnerExit {
+    fn certified(ok: bool) -> Self {
+        if ok {
+            Self::Converged
+        } else {
+            Self::Failed
+        }
+    }
+
+    fn converged(self) -> bool {
+        self != Self::Failed
+    }
+}
+
 /// Inner EBE minimization with an externally-provided gradient (analytic
 /// sensitivities or AD). Fit-scoped dispatch (dense BFGS / L-BFGS / Nelder–Mead). The
 /// `NelderMead` mode searches without the gradient but certifies its end point with it
-/// ([`FallbackCertifier::certify`]), so `true` means a stationary point under every
-/// `inner_optimizer` (#2557).
+/// ([`FallbackCertifier::certify_moved`]), so `Converged` / `NmMoved` mean a stationary
+/// point under every `inner_optimizer` (#2557, #2571).
 #[allow(clippy::too_many_arguments)]
 fn inner_minimize_with_grad(
     obj: &dyn Fn(&[f64]) -> f64,
@@ -5433,7 +5520,7 @@ fn inner_minimize_with_grad(
     stop_precond: Option<&[f64]>,
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
-) -> bool {
+) -> InnerExit {
     if matches!(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
@@ -5453,11 +5540,15 @@ fn inner_minimize_with_grad(
             tol,
         };
         let mut end = x.to_vec();
-        let ok = cert.certify(obj, &mut end);
+        let exit = match cert.certify_moved(obj, &mut end) {
+            None => InnerExit::Failed,
+            Some(Certified::AsGiven) => InnerExit::Converged,
+            Some(Certified::Moved) => InnerExit::NmMoved,
+        };
         x.copy_from_slice(&end);
-        return ok;
+        return exit;
     }
-    if inner_use_lbfgs(n) {
+    let ok = if inner_use_lbfgs(n) {
         lbfgs_core(
             obj,
             grad,
@@ -5484,7 +5575,8 @@ fn inner_minimize_with_grad(
             stall_at,
             short_line_search,
         )
-    }
+    };
+    InnerExit::certified(ok)
 }
 
 /// Shared L-BFGS driver: two-loop direction + backtracking line search, bounded
@@ -7087,6 +7179,7 @@ fn cancelled_ebe_placeholder(
         terminal_hessian: None,
         converged: false,
         used_fallback: false,
+        nm_polished: false,
         grad_norm: 0.0,
         nll: f64::INFINITY,
         kappas: vec![DVector::zeros(model.n_kappa); n_occ],
@@ -7212,6 +7305,7 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
             .filter(|((r, _), s)| !r.converged && s.observations.len() >= min_obs.max(1))
             .count(),
         n_fallback: results.iter().filter(|(r, _)| r.used_fallback).count(),
+        n_nm_polished: results.iter().filter(|(r, _)| r.nm_polished).count(),
         // No `min_obs` filter: a hard reject forces trial rejection even for a single
         // short-record subject, which the `n_unconverged` filter would otherwise drop.
         n_start_rejected: results.iter().filter(|(r, _)| r.hard_reject).count(),
