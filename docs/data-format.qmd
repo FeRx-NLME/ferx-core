@@ -308,7 +308,7 @@ state. Measured against NONMEM 7.5.1
 state for both orderings.
 
 Two cases are not yet covered
-([#2510](https://github.com/FeRx-NLME/ferx-core/issues/2510)). A time-to-event,
+([#2568](https://github.com/FeRx-NLME/ferx-core/issues/2568)). A time-to-event,
 CTMM or other non-Gaussian record listed before a co-timed dose still sees that
 dose. In a tie that holds a dose both before and after an observation (including
 an `ADDL`-implied dose landing at the tie), the observation sees both doses,
