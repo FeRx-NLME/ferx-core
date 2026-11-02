@@ -1,7 +1,7 @@
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::sim::adaptive::{
     validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, DoseStep,
+    Comparison, DoseStep, IntervalStep,
 };
 use crate::types::*;
 use regex::Regex;
@@ -10734,6 +10734,10 @@ fn parse_adaptive_dosing_block(
     let mut dose_bounds: Option<(f64, f64)> = None;
     let mut confirm: u32 = 1;
     let mut levels: Option<Vec<f64>> = None;
+    let mut intervals: Option<Vec<f64>> = None;
+    let mut start_interval: Option<f64> = None;
+    // The `every` step of `at`, kept for the intervals-on-the-grid check (#945).
+    let mut at_step: Option<f64> = None;
     let mut target_window: Option<(f64, f64)> = None;
     let mut auc_target: Option<(f64, f64)> = None;
     let mut rules: Vec<AdaptiveRule> = Vec::new();
@@ -10781,7 +10785,11 @@ fn parse_adaptive_dosing_block(
                 }
                 assay_cmt = Some(c);
             }
-            "at" => at = Some(parse_decision_schedule(val)?),
+            "at" => {
+                let (times, step) = parse_decision_schedule(val)?;
+                at = Some(times);
+                at_step = step;
+            }
             "start_dose" => {
                 let d: f64 = val
                     .parse()
@@ -10827,6 +10835,18 @@ fn parse_adaptive_dosing_block(
                     .map_err(|e| format!("[adaptive_dosing]: bad levels: {e}"))?;
                 validate_increasing_finite(&l, "levels")?;
                 levels = Some(l);
+            }
+            "intervals" => {
+                let l = parse_float_array(val)
+                    .map_err(|e| format!("[adaptive_dosing]: bad intervals: {e}"))?;
+                validate_increasing_finite(&l, "intervals")?;
+                intervals = Some(l);
+            }
+            "start_interval" => {
+                let d: f64 = val
+                    .parse()
+                    .map_err(|_| format!("[adaptive_dosing]: bad start_interval: {val}"))?;
+                start_interval = Some(d);
             }
             "target_window" => {
                 // Therapeutic band `[low, high]` for the `pct_time_in_window` metric
@@ -10898,19 +10918,47 @@ fn parse_adaptive_dosing_block(
         dose_bounds,
         confirm,
         levels,
+        intervals,
+        start_interval,
         target_window,
         auc_target,
         rules,
     };
     spec.validate()?;
+    if let (Some(step), Some(ladder)) = (at_step, &spec.intervals) {
+        check_intervals_on_every_grid(ladder, step)?;
+    }
     Ok(spec)
+}
+
+/// On an `at = every S …` grid, every due time an interval produces lands on the grid
+/// exactly when the interval is a whole multiple of `S` (#945). Checked here, where the
+/// step is known, so the error names the value and the step before any subject runs;
+/// on an explicit `at` list the driver refuses an off-grid due time instead. The
+/// tolerance is the driver's relative 1e-9, taken on the interval rather than on the due
+/// time, so the parser is never looser than the driver: a decimal step (`every 0.1`,
+/// interval `0.3`) passes both, and far from t = 0 the driver may accept an interval the
+/// parser refuses, never the reverse. `k < 1` refuses an interval below the step that the
+/// residual alone would let through (`1e-10` on `every 12`).
+fn check_intervals_on_every_grid(ladder: &[f64], step: f64) -> Result<(), String> {
+    for &d in ladder {
+        let k = (d / step).round();
+        if k < 1.0 || (d - k * step).abs() > 1e-9 * d.max(1.0) {
+            return Err(format!(
+                "[adaptive_dosing]: interval {d} is not a whole multiple of the `at` step {step}, \
+                 so its due times would fall between decision times"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parse an `at =` decision schedule: either an explicit list `[t1, t2, …]` or an
 /// arithmetic sequence `every <Δ> from <t0> to <t1>` (inclusive), expanded to
 /// explicit times. The `to` bound is required (an open-ended schedule has no
-/// finite decision list); times must be finite and strictly increasing.
-fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
+/// finite decision list); times must be finite and strictly increasing. Returns the
+/// times and, for `every`, the step (`None` for a list).
+fn parse_decision_schedule(val: &str) -> Result<(Vec<f64>, Option<f64>), String> {
     let v = val.trim();
     if v.starts_with('[') {
         if !v.ends_with(']') {
@@ -10925,7 +10973,7 @@ fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
         if times[0] < 0.0 {
             return Err(format!("[adaptive_dosing]: `at` times must be >= 0: {val}"));
         }
-        return Ok(times);
+        return Ok((times, None));
     }
     let toks: Vec<&str> = v.split_whitespace().collect();
     if toks.len() != 6 || toks[0] != "every" || toks[2] != "from" || toks[4] != "to" {
@@ -10971,7 +11019,7 @@ fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
     let n = n_f as usize;
     // Index-based expansion (t0 + i·Δ) avoids accumulating floating-point drift.
     let times: Vec<f64> = (0..=n).map(|i| t0 + i as f64 * step).collect();
-    Ok(times)
+    Ok((times, Some(step)))
 }
 
 /// Parse a `route =` value: `bolus(cmt = N)` or `infuse(cmt = N, over = T)`.
@@ -11060,12 +11108,58 @@ fn parse_adaptive_rule(rest: &str) -> Result<AdaptiveRule, String> {
         )
     })?;
     let (op, threshold) = parse_signal_condition(cond.trim())?;
-    let action = parse_rule_action(action.trim())?;
+    let (action, interval) = parse_rule_effects(action.trim())?;
     Ok(AdaptiveRule {
         op,
         threshold,
         action,
+        interval,
     })
+}
+
+/// Split a rule's effects on `,` (#945): at most one dose effect (`increase` /
+/// `decrease` / `hold` / `stop`) and at most one interval effect (`lengthen` /
+/// `shorten`), in either order. An interval-only rule re-issues the running dose
+/// ([`AdaptiveAction::Maintain`]).
+fn parse_rule_effects(effects: &str) -> Result<(AdaptiveAction, Option<IntervalStep>), String> {
+    let mut dose: Option<AdaptiveAction> = None;
+    let mut interval: Option<IntervalStep> = None;
+    for part in effects.split(',').map(str::trim) {
+        // A stray comma: a whole empty effect list keeps `parse_rule_action`'s own message.
+        if part.is_empty() && effects.contains(',') {
+            return Err(format!(
+                "[adaptive_dosing]: a rule has an empty effect (a stray comma?): {effects}"
+            ));
+        }
+        if let Some(word) = ["lengthen", "shorten"]
+            .into_iter()
+            .find(|w| part != *w && part.split_whitespace().next() == Some(*w))
+        {
+            return Err(format!(
+                "[adaptive_dosing]: `{word}` steps the `intervals` ladder one rung and takes no \
+                 operand: {part}"
+            ));
+        }
+        let step = match part {
+            "lengthen" => Some(IntervalStep::Lengthen),
+            "shorten" => Some(IntervalStep::Shorten),
+            _ => None,
+        };
+        if let Some(step) = step {
+            if interval.replace(step).is_some() {
+                return Err(format!(
+                    "[adaptive_dosing]: a rule takes at most one interval effect \
+                     (`lengthen` or `shorten`): {effects}"
+                ));
+            }
+        } else if dose.replace(parse_rule_action(part)?).is_some() {
+            return Err(format!(
+                "[adaptive_dosing]: a rule takes at most one dose effect \
+                 (`increase`, `decrease`, `hold` or `stop`): {effects}"
+            ));
+        }
+    }
+    Ok((dose.unwrap_or(AdaptiveAction::Maintain), interval))
 }
 
 /// Parse `signal <op> <value>` where `<op>` is one of `< <= > >= ==`.
@@ -11137,7 +11231,7 @@ fn parse_rule_action(action: &str) -> Result<AdaptiveAction, String> {
         "increase" => Ok(AdaptiveAction::Increase(step)),
         "decrease" => Ok(AdaptiveAction::Decrease(step)),
         other => Err(format!(
-            "[adaptive_dosing]: unknown action `{other}` (expected increase/decrease/hold/stop): {action}"
+            "[adaptive_dosing]: unknown action `{other}` (expected increase/decrease/hold/stop/lengthen/shorten): {action}"
         )),
     }
 }

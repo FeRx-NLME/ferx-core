@@ -176,8 +176,10 @@ pub(crate) enum TteHorizon {
 ///   subject are unsupported (a full reset would zero the hazard accumulator
 ///   mid-flight; conditional sampling past entry is a deferred follow-up).
 ///
-/// A genuinely divergent hazard (negative / non-finite) is *not* preventable here —
-/// it surfaces loudly during integration (never as a silent censor).
+/// A genuinely divergent model (a diverged `[odes]` state, a negative / non-finite
+/// hazard) is *not* preventable here — it depends on the parameter draw. It surfaces
+/// during integration, per subject: that subject is censored at the window and named in
+/// a `W_TTE_SOLVE_FAILED` warning (#2087), never silently.
 ///
 /// `horizon` says what the caller could have supplied. Where a horizon is required and
 /// missing, a caller that takes one is told to set it (`E_SIMULATE_HORIZON`); a caller

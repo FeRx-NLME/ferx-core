@@ -803,8 +803,9 @@ the unprofiled one (#2136):
 - **Optimizer trace.** `optimizer_trace = true` writes one row per evaluation. The
   `val:` columns show the levels at their solved values. Their `grad:` columns are
   `NA`, because the optimizer does not search over the levels. The `method` column
-  names the objective the levels are solved under: `foce`, `focei` or `laplace`.
-  Every quadrature stage is traced `laplace`, `focei` with `n_agq > 1` included.
+  names the objective the levels are solved under: `foce`, `focei`, `laplace` or
+  `agq`. A quadrature stage is traced `laplace` at one node and `agq` above one,
+  `focei` with `n_agq > 1` included — the same labels as an unprofiled fit's trace.
 - **Per-subject gradient fallback.** If a subject cannot get the analytic outer
   gradient at some trial point, its finite-difference replacement re-solves its
   EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.

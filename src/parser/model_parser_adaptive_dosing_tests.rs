@@ -72,6 +72,7 @@ fn full_continuous_block_parses() {
             op: Comparison::Lt,
             threshold: 10.0,
             action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+            interval: None,
         }
     );
     assert_eq!(
@@ -626,4 +627,227 @@ fn parsed_model_carries_adaptive_dosing_block() {
 fn parsed_model_without_block_is_none() {
     let parsed = parse_full_model(MODEL_HEAD).expect("plain model parses");
     assert!(parsed.adaptive_dosing.is_none());
+}
+
+// ── #945: the dosing-interval ladder ──
+
+/// `valid_min` on a q12 grid, with `extra` lines appended and its rule replaced by
+/// `rules`.
+fn interval_block(extra: &[&str], rules: &[&str]) -> Vec<String> {
+    let mut b: Vec<String> = without("when")
+        .into_iter()
+        .filter(|l| !l.starts_with("at "))
+        .collect();
+    b.push("at = every 12 from 0 to 96".into());
+    b.extend(extra.iter().map(|s| s.to_string()));
+    b.extend(rules.iter().map(|s| s.to_string()));
+    b
+}
+
+const LADDER: [&str; 2] = ["intervals = [12, 24, 36]", "start_interval = 24"];
+
+#[test]
+fn interval_ladder_block_parses() {
+    let spec = parse_adaptive_dosing_block(&interval_block(
+        &LADDER,
+        &[
+            "when signal > 40 : hold, lengthen",
+            "when signal > 20 : decrease 25%, lengthen",
+            "when signal > 15 : lengthen",
+            "when signal < 5 : shorten, increase 10%",
+        ],
+    ))
+    .expect("interval ladder parses");
+    assert_eq!(spec.intervals, Some(vec![12.0, 24.0, 36.0]));
+    assert_eq!(spec.start_interval, Some(24.0));
+    let effects: Vec<_> = spec
+        .rules
+        .iter()
+        .map(|r| (r.action.clone(), r.interval))
+        .collect();
+    assert_eq!(
+        effects,
+        vec![
+            (AdaptiveAction::Hold, Some(IntervalStep::Lengthen)),
+            (
+                AdaptiveAction::Decrease(DoseStep::Percent(25.0)),
+                Some(IntervalStep::Lengthen)
+            ),
+            // An interval-only rule re-issues the running dose.
+            (AdaptiveAction::Maintain, Some(IntervalStep::Lengthen)),
+            // Either order.
+            (
+                AdaptiveAction::Increase(DoseStep::Percent(10.0)),
+                Some(IntervalStep::Shorten)
+            ),
+        ]
+    );
+    // A block without the keys is unchanged.
+    let plain = parse_adaptive_dosing_block(&without("nothing")).expect("valid_min parses");
+    assert_eq!((plain.intervals, plain.start_interval), (None, None));
+    assert_eq!(plain.rules[0].interval, None);
+}
+
+/// One rule, one dose effect and one interval effect: each excess is refused with
+/// the sentence naming what a rule may carry. `stop` with an interval effect is
+/// refused by the shared validator.
+#[test]
+fn interval_rule_effect_errors() {
+    let e = perr_owned(interval_block(
+        &LADDER,
+        &["when signal > 20 : lengthen, shorten"],
+    ));
+    assert_adaptive_err(
+        &e,
+        "a rule takes at most one interval effect (`lengthen` or `shorten`): lengthen, shorten",
+    );
+    let e = perr_owned(interval_block(
+        &LADDER,
+        &["when signal > 20 : hold, decrease 10%"],
+    ));
+    assert_adaptive_err(
+        &e,
+        "a rule takes at most one dose effect (`increase`, `decrease`, `hold` or `stop`): \
+         hold, decrease 10%",
+    );
+    let e = perr_owned(interval_block(
+        &LADDER,
+        &["when signal > 20 : stop, lengthen"],
+    ));
+    assert_adaptive_err(
+        &e,
+        "`stop` cannot be combined with `lengthen` / `shorten` (a stopped course has no next \
+         dose)",
+    );
+    let e = perr_owned(interval_block(&LADDER, &["when signal > 20 : lengthn"]));
+    assert_adaptive_err(&e, "unknown action `lengthn`");
+    assert!(e.contains("lengthen/shorten"), "{e}");
+}
+
+/// A stray comma names itself, on either side of an effect; a rule with nothing after the
+/// `:` keeps its own message. An operand on an interval effect is refused as such, not
+/// read as a malformed dose percentage.
+#[test]
+fn interval_rule_malformed_effect_errors() {
+    for rule in ["when signal > 20 : hold,", "when signal > 20 : , lengthen"] {
+        let e = perr_owned(interval_block(&LADDER, &[rule]));
+        assert_adaptive_err(&e, "a rule has an empty effect (a stray comma?)");
+        assert!(!e.contains("no action after"), "{e}");
+    }
+    let e = perr_owned(interval_block(&LADDER, &["when signal > 20 :"]));
+    assert_adaptive_err(&e, "rule has no action after `:`");
+    let e = perr_owned(interval_block(&LADDER, &["when signal > 20 : lengthen 2"]));
+    assert_adaptive_err(
+        &e,
+        "`lengthen` steps the `intervals` ladder one rung and takes no operand: lengthen 2",
+    );
+    assert!(!e.contains("percentage"), "{e}");
+    let e = perr_owned(interval_block(
+        &LADDER,
+        &["when signal > 20 : hold, shorten 12"],
+    ));
+    assert_adaptive_err(&e, "`shorten` steps the `intervals` ladder");
+}
+
+#[test]
+fn interval_keys_must_come_together() {
+    let rule = ["when signal > 20 : lengthen"];
+    let e = perr_owned(interval_block(&["intervals = [12, 24]"], &rule));
+    assert_adaptive_err(&e, "`intervals` requires a `start_interval`");
+    let e = perr_owned(interval_block(
+        &["start_interval = 12"],
+        &["when signal > 20 : hold"],
+    ));
+    assert_adaptive_err(
+        &e,
+        "`start_interval` requires an `intervals = [...]` ladder",
+    );
+    let e = perr_owned(interval_block(&[], &rule));
+    assert_adaptive_err(
+        &e,
+        "`lengthen` / `shorten` require an `intervals = [...]` ladder and a `start_interval`",
+    );
+    let e = perr_owned(interval_block(
+        &["intervals = [12, q24]", "start_interval = 12"],
+        &rule,
+    ));
+    assert_adaptive_err(&e, "bad intervals:");
+    let e = perr_owned(interval_block(
+        &["intervals = [24, 12]", "start_interval = 12"],
+        &rule,
+    ));
+    assert_adaptive_err(&e, "intervals must be strictly increasing");
+    let e = perr_owned(interval_block(
+        &["intervals = [12, 24]", "start_interval = q12"],
+        &rule,
+    ));
+    assert_adaptive_err(&e, "bad start_interval: q12");
+}
+
+/// On an `every S` grid each interval must be a whole multiple of `S`; the error
+/// names the value and the step. A decimal step needs the tolerance (0.3 is not
+/// 3 × 0.1 in floating point), and an explicit `at` list leaves the check to the
+/// driver.
+#[test]
+fn intervals_must_be_multiples_of_the_every_step() {
+    let rule = ["when signal > 20 : lengthen"];
+    let e = perr_owned(interval_block(
+        &["intervals = [12, 18]", "start_interval = 12"],
+        &rule,
+    ));
+    assert_adaptive_err(
+        &e,
+        "interval 18 is not a whole multiple of the `at` step 12, so its due times would \
+         fall between decision times",
+    );
+    // Half the step rounds to one step and fails on the residual.
+    let e = perr_owned(interval_block(
+        &["intervals = [6, 12]", "start_interval = 12"],
+        &rule,
+    ));
+    assert_adaptive_err(&e, "interval 6 is not a whole multiple of the `at` step 12");
+    // Far below the step the residual is inside the tolerance and only `k < 1` refuses it
+    // (the driver would refuse it too, at the first decision).
+    let e = perr_owned(interval_block(
+        &["intervals = [1e-10, 12]", "start_interval = 12"],
+        &rule,
+    ));
+    assert_adaptive_err(
+        &e,
+        "interval 0.0000000001 is not a whole multiple of the `at` step 12",
+    );
+
+    let mut decimal = interval_block(&["intervals = [0.3, 0.6]", "start_interval = 0.3"], &rule);
+    decimal.retain(|l| !l.starts_with("at "));
+    decimal.push("at = every 0.1 from 0 to 1.2".into());
+    assert!(0.3 != 3.0 * 0.1, "the fixture must need the tolerance");
+    parse_adaptive_dosing_block(&decimal).expect("0.3 is a multiple of 0.1 within tolerance");
+
+    let mut list = interval_block(&["intervals = [12, 18]", "start_interval = 12"], &rule);
+    list.retain(|l| !l.starts_with("at "));
+    list.push("at = [0, 12, 24, 30]".into());
+    let spec = parse_adaptive_dosing_block(&list).expect("an explicit list defers to the driver");
+    assert_eq!(spec.intervals, Some(vec![12.0, 18.0]));
+}
+
+fn perr_owned(body: Vec<String>) -> String {
+    parse_adaptive_dosing_block(&body).expect_err("expected a typed parse error")
+}
+
+/// The rule words reach a whole-model parse: nothing in the model-level checks reads
+/// `lengthen` / `shorten` as an identifier.
+#[test]
+fn parsed_model_carries_an_interval_ladder() {
+    let with_block = format!(
+        "{MODEL_HEAD}\n[adaptive_dosing]\n  observe = central / V\n  at = every 12 from 0 to 96\n  \
+         start_dose = 100\n  route = bolus(cmt = 1)\n  dose_bounds = [0, 400]\n  \
+         intervals = [12, 24]\n  start_interval = 12\n  \
+         when signal > 20 : decrease 25%, lengthen\n  when signal < 5 : shorten\n"
+    );
+    let spec = parse_full_model(&with_block)
+        .expect("model with an interval ladder parses")
+        .adaptive_dosing
+        .expect("block attached");
+    assert_eq!(spec.start_interval, Some(12.0));
+    assert_eq!(spec.rules[1].interval, Some(IntervalStep::Shorten));
 }

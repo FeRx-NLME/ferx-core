@@ -176,7 +176,10 @@ fn spec_hold() -> AdaptiveDosingSpec {
             op: Comparison::Lt,
             threshold: -1e9,
             action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+            interval: None,
         }],
+        intervals: None,
+        start_interval: None,
     }
 }
 

@@ -163,6 +163,15 @@ pub struct AdaptiveSimulateOptions {
     /// Per-run decision cap — the runaway / closed-loop guard. The driver errors
     /// if a schedule exceeds it.
     pub max_decisions: usize,
+    /// The dosing interval in force at the first decision (#945). `None` (the
+    /// default) makes every point of `decision_times` due, as before; `Some(Δ)`
+    /// consults the controller only once `Δ` has passed since the last decision it
+    /// was consulted at, and logs the points in between as
+    /// [`crate::sim::adaptive::DecisionOutcome::NotDue`]. `Δ` must be positive and
+    /// finite, and every due time it produces must land on a point of
+    /// `decision_times`. A controller changes it with
+    /// [`crate::sim::adaptive::DoseAction::SetInterval`].
+    pub start_interval: Option<f64>,
 }
 
 impl Default for AdaptiveSimulateOptions {
@@ -173,6 +182,7 @@ impl Default for AdaptiveSimulateOptions {
             monitors: Vec::new(),
             verify: true,
             max_decisions: 10_000,
+            start_interval: None,
         }
     }
 }
@@ -478,6 +488,22 @@ fn spec_refusal(message: String) -> EngineError {
         .in_context("simulate_adaptive_from_spec")
 }
 
+/// Check a starting dosing interval against the review grid before any subject runs
+/// (#945). Until a controller changes it, a constant interval schedules every consulted
+/// decision from the first grid point on — a hold consumes its slot exactly as a dose
+/// does — so the due times are a function of the inputs alone, and an interval that
+/// sends one between two grid points is refused here, not on the first subject. The
+/// driver re-checks after every `SetInterval`, which this cannot foresee.
+fn check_start_interval(decision_times: &[f64], interval: f64) -> Result<(), String> {
+    if !(interval.is_finite() && interval > 0.0) {
+        return Err(format!(
+            "start_interval must be positive and finite; got {interval}"
+        ));
+    }
+    crate::ode::adaptive_walk_due_times(decision_times, decision_times[0], interval)
+        .map_err(|msg| format!("start_interval {interval} {msg}"))
+}
+
 /// Shared per-(subject, replicate) orchestration behind [`simulate_adaptive`] and
 /// [`simulate_adaptive_from_spec`]: draw η ~ N(0, Ω) (or take the subject's supplied
 /// η, #1594), mint a **fresh** controller,
@@ -625,6 +651,9 @@ where
             decision_times.len(),
             opts.max_decisions
         )));
+    }
+    if let Some(d) = opts.start_interval {
+        check_start_interval(decision_times, d).map_err(super::entry_refusals::adaptive_options)?;
     }
     for am in monitors {
         let m = am.spec;
@@ -869,6 +898,7 @@ where
                 opts.max_decisions,
                 Some(&assay),
                 want_aucs.then_some(&mut window_aucs),
+                opts.start_interval,
             )
             .map_err(|e| match e {
                 crate::ode::AdaptiveDriverError::Refusal { kind, message } => entry.driver_refusal(
@@ -1600,7 +1630,9 @@ fn check_event_pk_records(
 /// The decision schedule (`spec.at`) and the monitored signal (`spec.observe`)
 /// come from the block, so `opts.decision_times` and `opts.monitors` **must be
 /// left empty**: setting either is a typed error rather than a silently-ignored
-/// field (the spec would otherwise have two sources of truth). `opts.seed`,
+/// field (the spec would otherwise have two sources of truth). The same holds for
+/// the dosing interval (#945): the block's `start_interval` is used, and a set
+/// `opts.start_interval` is refused. `opts.seed`,
 /// `opts.verify`, and `opts.max_decisions` apply exactly as for
 /// [`simulate_adaptive`].
 ///
@@ -1662,6 +1694,18 @@ pub fn simulate_adaptive_from_spec_with_inputs(
              block's `observe`; leave `opts.monitors` empty",
         ));
     }
+    if opts.start_interval.is_some() {
+        return Err(super::entry_refusals::adaptive_options(
+            "simulate_adaptive_from_spec takes its dosing interval from the \
+             [adaptive_dosing] block's `intervals` / `start_interval`; leave \
+             `opts.start_interval` empty",
+        ));
+    }
+    // The block's starting interval reaches the driver through the same option the
+    // programmatic entry uses, so both run one due mask and one up-front grid check.
+    let mut opts = opts.clone();
+    opts.start_interval = spec.start_interval;
+    let opts = &opts;
 
     // Compile the block against the model: the `observe` expression, the single
     // `signal` monitor (carrying the assay endpoint under `with_assay_error`), and

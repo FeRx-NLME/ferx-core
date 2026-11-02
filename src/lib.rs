@@ -74,7 +74,7 @@ pub use propensity_match::MatchMethod;
 pub use sim::adaptive::{
     AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, AdaptiveSubjectMetrics,
     Comparison, ControllerCtx, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry,
-    DoseStep, MonitorSpec, ObserveMode, ObservedSignal,
+    DoseStep, IntervalStep, MonitorSpec, ObserveMode, ObservedSignal,
 };
 pub use suggest_start::{inits_from_nca, NcaInit, SuggestedStart};
 pub use types::*;

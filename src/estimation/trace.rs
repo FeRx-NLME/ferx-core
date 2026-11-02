@@ -285,9 +285,24 @@ pub fn finish() -> Option<String> {
     })
 }
 
-/// Write one FOCE/FOCEI/Laplace trace row.
+/// The `method` column of a FOCE-family outer-loop row: the objective that row scores,
+/// not the method's name alone. `laplace` at one quadrature node, `agq` above one (a
+/// `laplace` or `focei` fit with `n_agq > 1`), otherwise `focei` / `foce` by the
+/// interaction the stage resolves. The one label the unprofiled NLopt and BFGS loops and
+/// the profiled loop all write (#2552).
+pub(crate) fn method_label(options: &crate::types::FitOptions) -> &'static str {
+    match options.agq_nodes() {
+        Some(1) => "laplace",
+        Some(_) => "agq",
+        None if crate::types::interaction_for(options.method, options.interaction) => "focei",
+        None => "foce",
+    }
+}
+
+/// Write one FOCE/FOCEI/Laplace/AGQ trace row.
 ///
-/// `method`           — "foce", "focei" or "laplace" (may be overridden by `set_overrides`)
+/// `method`           — `method_label`'s "foce", "focei", "laplace" or "agq" (may be
+///                      overridden by `set_overrides`)
 /// `ofv`              — current OFV
 /// `grad_norm`        — L2 norm of the gradient (None for derivative-free optimizers)
 /// `step_norm`        — L2 norm of the parameter step (None when unavailable)
