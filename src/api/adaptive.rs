@@ -1630,7 +1630,9 @@ fn check_event_pk_records(
 /// The decision schedule (`spec.at`) and the monitored signal (`spec.observe`)
 /// come from the block, so `opts.decision_times` and `opts.monitors` **must be
 /// left empty**: setting either is a typed error rather than a silently-ignored
-/// field (the spec would otherwise have two sources of truth). `opts.seed`,
+/// field (the spec would otherwise have two sources of truth). The same holds for
+/// the dosing interval (#945): the block's `start_interval` is used, and a set
+/// `opts.start_interval` is refused. `opts.seed`,
 /// `opts.verify`, and `opts.max_decisions` apply exactly as for
 /// [`simulate_adaptive`].
 ///
@@ -1692,6 +1694,18 @@ pub fn simulate_adaptive_from_spec_with_inputs(
              block's `observe`; leave `opts.monitors` empty",
         ));
     }
+    if opts.start_interval.is_some() {
+        return Err(super::entry_refusals::adaptive_options(
+            "simulate_adaptive_from_spec takes its dosing interval from the \
+             [adaptive_dosing] block's `intervals` / `start_interval`; leave \
+             `opts.start_interval` empty",
+        ));
+    }
+    // The block's starting interval reaches the driver through the same option the
+    // programmatic entry uses, so both run one due mask and one up-front grid check.
+    let mut opts = opts.clone();
+    opts.start_interval = spec.start_interval;
+    let opts = &opts;
 
     // Compile the block against the model: the `observe` expression, the single
     // `signal` monitor (carrying the assay endpoint under `with_assay_error`), and

@@ -56,6 +56,8 @@ with the run, never with a fitted model's parameters.
 | `dose_bounds` | ✓ | Inclusive `[low, high]` clamp applied to every emitted dose. |
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. |
+| `intervals` | | Dosing-interval ladder `[d1, d2, …]`, strictly increasing and positive. Rules step it with `lengthen` / `shorten`. Requires `start_interval`. See [Changing the dosing interval](#changing-the-dosing-interval). |
+| `start_interval` | | The dosing interval in force from the first decision; one of `intervals`, and required with it. |
 | `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
 | `auc_target` | | Exposure band `[low, high]` for the **area under the monitored signal** over each inter-decision window (e.g. vancomycin AUC₂₄ when decisions are daily), used **only** to report the `auc_target_attainment` outcome metric — like `target_window` it does **not** influence dosing. `low` must be `≥ 0`; `high` may be `inf`. Declaring it makes the reactive driver integrate the signal over each window as it simulates — any pre-scheduled base regimen (#702) together with the realized controller doses, on the run's own trajectory; omit it to skip that integral and leave `auc_target_attainment` unreported. |
 | `with_assay_error` | signal¹ | Titrate on the **noised measurement** of a model output (named by `assay_cmt`) instead of a latent expression (default `false`). The signal's value comes from that output's `[scaling]` readout and its σ from that output's `[error_model]`, so the two are always on the same scale — there is no re-typed `observe` expression to mis-scale. Mutually exclusive with `observe`. |
@@ -111,6 +113,13 @@ most specific / most severe condition first. `<op>` is one of `< <= > >= ==`.
 | `increase` / `decrease` | Step one rung up / down a `levels` ladder. |
 | `hold` | Skip this decision's dose. |
 | `stop` | Discontinue all future dosing. |
+| `lengthen` / `shorten` | Step one rung up / down the `intervals` ladder. |
+
+A rule carries at most one **dose effect** (the first four rows) and at most one
+**interval effect** (`lengthen` / `shorten`), separated by a comma in either
+order: `when signal > 20 : decrease 25%, lengthen`. A rule with only an interval
+effect re-issues the running dose. `stop` cannot be combined with an interval
+effect.
 
 A dose change is clamped to `dose_bounds`; a level step saturates at the ends of
 the ladder. When no rule matches (or a matched rule has not yet `confirm`-ed),
@@ -308,6 +317,36 @@ controller was consulted at. The controller is consulted only at due points.
   that slot.
 - **The controller can read it.** `ctx.interval` is the interval in force before
   the decision.
+
+### In the `[adaptive_dosing]` block
+
+The block declares the interval as a ladder, like `levels` for the dose, and its
+rules move along it:
+
+```
+[adaptive_dosing]
+  at             = every 12 from 0 to 336   # the review grid
+  intervals      = [12, 24, 36, 48]         # the interval ladder
+  start_interval = 24                       # in force from the first decision
+  when signal > 20 : decrease 25%, lengthen
+  when signal > 15 : lengthen
+  when signal < 10 : shorten
+```
+
+`lengthen` and `shorten` step one rung and saturate at both ends; a step at an
+end changes nothing. A rule with only an interval effect re-issues the running
+dose, and `hold, lengthen` skips the dose and lengthens. The `confirm` debounce
+gates both effects of a rule together, and its streak counts consulted decisions
+only, since the controller is not called at a not-due point. `intervals` and
+`start_interval` come together, and `lengthen` / `shorten` need both.
+
+On an `at = every S …` grid, every interval must be a whole multiple of `S`, or
+its due times would fall between review times; the parse error names the
+interval and the step. With an explicit `at` list that check is the run's: an
+off-grid due time is refused as described under
+[Grid alignment](#grid-alignment). The block is the only source of the interval
+on [`simulate_adaptive_from_spec()`]: setting `opts.start_interval` there is
+refused (`E_ADAPTIVE_OPTIONS`), as for `opts.decision_times`.
 
 ### Not-due points
 
@@ -622,7 +661,10 @@ troughs agree within the cross-solver band. Each subject runs at a supplied
 η = 0, the typical-value patient mrgsolve simulates: the model's `omega ~ 1e-10`
 would otherwise draw an η large enough to show as a one-sided trough drift. The kit lives in
 `tests/reference/vanco_interval_mrgsolve/`, exercised on every PR by
-`tests/adaptive_vanco_interval_anchor.rs`.
+`tests/adaptive_vanco_interval_anchor.rs`. The same controller written as an
+`[adaptive_dosing]` block (`intervals = [12, 24, 36, 48]`, `hold, lengthen`,
+`lengthen`, `shorten`) reproduces the programmatic run bit for bit: ledger,
+decision log and trajectories.
 
 ## Model time in a reactive run
 

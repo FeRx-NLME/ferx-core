@@ -27,10 +27,11 @@
 //! least 0.13 mg/L from its nearest threshold, so a cross-solver difference cannot flip a
 //! decision: the outcome and interval sequences must match exactly.
 
-use ferx_core::parser::model_parser::parse_full_model_file;
+use ferx_core::parser::model_parser::{parse_full_model, parse_full_model_file};
 use ferx_core::{
-    read_nonmem_csv, simulate_adaptive_with_inputs, AdaptiveInputs, AdaptiveSimulateOptions,
-    ControllerCtx, DecisionOutcome, DoseAction, MonitorSpec, ObserveMode, SuppliedEtas,
+    read_nonmem_csv, simulate_adaptive_from_spec_with_inputs, simulate_adaptive_with_inputs,
+    AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult, CompiledModel,
+    ControllerCtx, DecisionOutcome, DoseAction, MonitorSpec, ObserveMode, Population, SuppliedEtas,
 };
 use std::path::Path;
 
@@ -116,33 +117,50 @@ fn controller() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
 /// misplaced 1000 mg dose is ~12 mg/L), and the smallest decision margin is 0.13 mg/L.
 const TROUGH_TOL: f64 = 1e-7;
 
-#[test]
-fn vanco_interval_extension_matches_mrgsolve() {
-    let parsed = parse_full_model_file(Path::new(&format!("{KIT}/vanco_interval.ferx")))
-        .expect("model parses");
-    let pop = read_nonmem_csv(
+/// The kit's q12 review grid, 0–288 h.
+fn grid() -> Vec<f64> {
+    (0..=24).map(|k| 12.0 * k as f64).collect()
+}
+
+fn kit_population() -> Population {
+    read_nonmem_csv(
         Path::new(&format!("{KIT}/vanco_interval_subjects.csv")),
         None,
         None,
     )
-    .expect("subjects load");
-    let grid: Vec<f64> = (0..=24).map(|k| 12.0 * k as f64).collect();
-    let mut opts = AdaptiveSimulateOptions::default();
-    opts.seed = Some(1);
-    opts.decision_times = grid.clone();
-    opts.monitors = vec![MonitorSpec::new("C", 1, ObserveMode::Ipred)];
-    opts.start_interval = Some(12.0);
-    let model = &parsed.model;
-    let etas = SuppliedEtas::from_table(
+    .expect("subjects load")
+}
+
+/// η = 0 for both subjects: the typical-value patient mrgsolve simulates.
+fn zero_etas(model: &CompiledModel) -> SuppliedEtas {
+    SuppliedEtas::from_table(
         vec!["1".into(), "2".into()],
         model.eta_names.clone(),
         vec![vec![0.0; model.n_eta]; 2],
     )
-    .expect("η = 0 table");
-    let inputs = AdaptiveInputs::new(&model.default_params).with_etas(&etas);
-    let res = simulate_adaptive_with_inputs(model, &pop, &inputs, 1, controller, &opts)
-        .expect("runs and passes the default verifier");
+    .expect("η = 0 table")
+}
 
+/// The kit run through the programmatic controller above.
+fn run_closure() -> AdaptiveSimulationResult {
+    let parsed = parse_full_model_file(Path::new(&format!("{KIT}/vanco_interval.ferx")))
+        .expect("model parses");
+    let model = &parsed.model;
+    let mut opts = AdaptiveSimulateOptions::default();
+    opts.seed = Some(1);
+    opts.decision_times = grid();
+    opts.monitors = vec![MonitorSpec::new("C", 1, ObserveMode::Ipred)];
+    opts.start_interval = Some(12.0);
+    let etas = zero_etas(model);
+    let inputs = AdaptiveInputs::new(&model.default_params).with_etas(&etas);
+    simulate_adaptive_with_inputs(model, &kit_population(), &inputs, 1, controller, &opts)
+        .expect("runs and passes the default verifier")
+}
+
+#[test]
+fn vanco_interval_extension_matches_mrgsolve() {
+    let res = run_closure();
+    let grid = grid();
     let reference = reference();
     assert_eq!(reference.len(), 2, "two subjects in the kit");
     let mut worst: f64 = 0.0;
@@ -228,4 +246,178 @@ fn vanco_interval_kit_is_non_degenerate() {
         assert_eq!((s[0].1, s[0].3), (0.0, 12.0), "bottom-rung shorten at t=0");
         assert!(s.iter().any(|row| row.2 == "not_due"));
     }
+}
+
+/// The kit's controller written as an `[adaptive_dosing]` block (#945 PR2): the same
+/// grid, dose, ladder and thresholds as `controller()`, with `hold, lengthen` for the
+/// hold rung and interval-only rules for the others.
+const KIT_BLOCK: &str = "
+[adaptive_dosing]
+  observe = CENT / V
+  at = every 12 from 0 to 288
+  start_dose = 1000
+  route = infuse(cmt = 1, over = 1)
+  dose_bounds = [1000, 1000]
+  intervals = [12, 24, 36, 48]
+  start_interval = 12
+  when signal > 25 : hold, lengthen
+  when signal > 14 : lengthen
+  when signal < 9 : shorten
+";
+
+/// The kit model with `block` appended, run through `simulate_adaptive_from_spec`.
+fn run_block(block: &str) -> AdaptiveSimulationResult {
+    let src = std::fs::read_to_string(format!("{KIT}/vanco_interval.ferx")).expect("kit model");
+    let parsed = parse_full_model(&format!("{src}\n{block}")).expect("model with block parses");
+    let spec = parsed.adaptive_dosing.as_ref().expect("block attached");
+    let model = &parsed.model;
+    let mut opts = AdaptiveSimulateOptions::default();
+    opts.seed = Some(1);
+    let etas = zero_etas(model);
+    let inputs = AdaptiveInputs::new(&model.default_params).with_etas(&etas);
+    simulate_adaptive_from_spec_with_inputs(model, &kit_population(), &inputs, 1, spec, &opts)
+        .expect("runs and passes the default verifier")
+}
+
+type Ledger = Vec<(String, u64, usize, u64, u64)>;
+type Decisions = Vec<(String, u64, String, Option<u64>, Vec<u64>)>;
+type Trajectories = Vec<(String, u64, usize, u64)>;
+
+/// Everything the two entry points must agree on, with every `f64` as its bits. The
+/// ledger's `rule_fired` is left out: a closure names no rule, the block names its own.
+fn fingerprint(r: &AdaptiveSimulationResult) -> (Ledger, Decisions, Trajectories) {
+    let ledger = r
+        .ledger
+        .iter()
+        .map(|e| {
+            (
+                e.subject.clone(),
+                e.time.to_bits(),
+                e.cmt,
+                e.amt.to_bits(),
+                e.rate.to_bits(),
+            )
+        })
+        .collect();
+    let decisions = r
+        .decisions
+        .iter()
+        .map(|d| {
+            (
+                d.subject.clone(),
+                d.time.to_bits(),
+                format!("{:?}", d.outcome),
+                d.interval.map(f64::to_bits),
+                d.observed_signals
+                    .iter()
+                    .map(|s| s.value.to_bits())
+                    .collect(),
+            )
+        })
+        .collect();
+    let traj = r
+        .trajectories
+        .iter()
+        .map(|t| (t.id.clone(), t.time.to_bits(), t.cmt, t.ipred.to_bits()))
+        .collect();
+    (ledger, decisions, traj)
+}
+
+/// The block reproduces the programmatic controller bit for bit: the ledger, every
+/// decision (outcome, interval after it, the signal read) and every trajectory row.
+/// The closure run is itself pinned to mrgsolve above, so this carries that anchor
+/// over to the declarative syntax. A block that steps the ladder wrongly, lengthens on
+/// the hold rung without holding, or loses `start_interval` on its way to the driver
+/// changes a dose time and fails here.
+#[test]
+fn vanco_interval_block_reproduces_the_closure_bit_for_bit() {
+    let closure = run_closure();
+    let block = run_block(KIT_BLOCK);
+    assert!(
+        block
+            .decisions
+            .iter()
+            .any(|d| d.outcome == DecisionOutcome::NotDue),
+        "the block must exercise the due mask"
+    );
+    let (cl, cd, ct) = fingerprint(&closure);
+    let (bl, bd, bt) = fingerprint(&block);
+    assert_eq!(bl, cl, "ledger");
+    assert_eq!(bd, cd, "decision log");
+    assert_eq!(bt, ct, "trajectories");
+}
+
+/// Degenerate twin through the block: a one-rung ladder equal to the grid step makes
+/// every point due through the mask, and must be bit-identical to the same block with
+/// no interval keys. The rules carry no interval effect here, so only the mask and
+/// `start_interval`'s route to the driver are under test.
+#[test]
+fn one_rung_ladder_equal_to_the_grid_step_is_bit_identical_to_no_ladder() {
+    let base = "
+[adaptive_dosing]
+  observe = CENT / V
+  at = every 12 from 0 to 288
+  start_dose = 1000
+  route = infuse(cmt = 1, over = 1)
+  dose_bounds = [500, 2000]
+  when signal > 25 : hold
+  when signal < 9 : increase 25%
+";
+    let plain = run_block(base);
+    let laddered = run_block(&format!(
+        "{base}  intervals = [12]\n  start_interval = 12\n"
+    ));
+    assert!(
+        laddered.decisions.iter().all(|d| d.interval == Some(12.0)),
+        "the ladder must reach the driver"
+    );
+    assert!(plain.decisions.iter().all(|d| d.interval.is_none()));
+    // Non-degenerate: the rules fire, so the twin compares a reactive schedule.
+    assert!(plain
+        .decisions
+        .iter()
+        .any(|d| d.outcome == DecisionOutcome::Hold));
+    assert!(plain.ledger.iter().any(|e| e.amt != 1000.0));
+    let (pl, pd, pt) = fingerprint(&plain);
+    let (ll, ld, lt) = fingerprint(&laddered);
+    assert_eq!(ll, pl, "ledger");
+    assert_eq!(lt, pt, "trajectories");
+    // The decision logs differ only in the interval column.
+    let strip = |d: Decisions| {
+        d.into_iter()
+            .map(|(a, b, c, _, e)| (a, b, c, e))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(strip(ld), strip(pd), "decision log");
+}
+
+/// The block owns the interval, as it owns the grid: a `start_interval` also set on
+/// the options is refused before any subject runs.
+#[test]
+fn block_refuses_an_options_start_interval() {
+    let src = std::fs::read_to_string(format!("{KIT}/vanco_interval.ferx")).expect("kit model");
+    let parsed = parse_full_model(&format!("{src}\n{KIT_BLOCK}")).expect("parses");
+    let model = &parsed.model;
+    let mut opts = AdaptiveSimulateOptions::default();
+    opts.start_interval = Some(12.0);
+    let err = simulate_adaptive_from_spec_with_inputs(
+        model,
+        &kit_population(),
+        &AdaptiveInputs::new(&model.default_params),
+        1,
+        parsed.adaptive_dosing.as_ref().expect("block"),
+        &opts,
+    )
+    .expect_err("two sources of the interval");
+    let msg = err.to_string();
+    assert_eq!(
+        err.diagnostic().map(|d| d.code.as_str()),
+        Some("E_ADAPTIVE_OPTIONS"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("`intervals` / `start_interval`")
+            && msg.contains("leave `opts.start_interval` empty"),
+        "{msg}"
+    );
 }

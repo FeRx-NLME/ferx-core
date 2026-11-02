@@ -105,7 +105,10 @@ pub(super) fn fixed_dose_spec(observe: Option<&str>, at: &[f64], dose: f64) -> A
             op: Comparison::Lt,
             threshold: -1e9,
             action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+            interval: None,
         }],
+        intervals: None,
+        start_interval: None,
     }
 }
 

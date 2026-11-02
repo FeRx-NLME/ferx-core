@@ -2163,6 +2163,7 @@ pub mod ferx_core::sim::adaptive
 pub ferx_core::sim::adaptive::AdaptiveAction::Decrease(ferx_core::sim::adaptive::DoseStep)
 pub ferx_core::sim::adaptive::AdaptiveAction::Hold
 pub ferx_core::sim::adaptive::AdaptiveAction::Increase(ferx_core::sim::adaptive::DoseStep)
+pub ferx_core::sim::adaptive::AdaptiveAction::Maintain
 pub ferx_core::sim::adaptive::AdaptiveAction::Stop
 pub enum ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::sim::adaptive::AdaptiveRoute::Bolus
@@ -2202,6 +2203,9 @@ pub fn ferx_core::sim::adaptive::DoseAction::validate(&self) -> core::result::Re
 pub enum ferx_core::sim::adaptive::DoseStep
 pub ferx_core::sim::adaptive::DoseStep::Level
 pub ferx_core::sim::adaptive::DoseStep::Percent(f64)
+pub enum ferx_core::sim::adaptive::IntervalStep
+pub ferx_core::sim::adaptive::IntervalStep::Lengthen
+pub ferx_core::sim::adaptive::IntervalStep::Shorten
 pub enum ferx_core::sim::adaptive::ObserveMode
 pub ferx_core::sim::adaptive::ObserveMode::Dv
 pub ferx_core::sim::adaptive::ObserveMode::Ipred
@@ -2211,18 +2215,21 @@ pub ferx_core::sim::adaptive::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::confirm: u32
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_bounds: (f64, f64)
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe_declared_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::route: ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::rules: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveRule>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_dose: f64
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_interval: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::target_window: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::with_assay_error: bool
 impl ferx_core::sim::adaptive::AdaptiveDosingSpec
 pub fn ferx_core::sim::adaptive::AdaptiveDosingSpec::validate(&self) -> core::result::Result<(), alloc::string::String>
 #[non_exhaustive] pub struct ferx_core::sim::adaptive::AdaptiveRule
 pub ferx_core::sim::adaptive::AdaptiveRule::action: ferx_core::sim::adaptive::AdaptiveAction
+pub ferx_core::sim::adaptive::AdaptiveRule::interval: core::option::Option<ferx_core::sim::adaptive::IntervalStep>
 pub ferx_core::sim::adaptive::AdaptiveRule::op: ferx_core::sim::adaptive::Comparison
 pub ferx_core::sim::adaptive::AdaptiveRule::threshold: f64
 pub struct ferx_core::sim::adaptive::AdaptiveRun
@@ -3751,6 +3758,7 @@ pub type ferx_core::types::TvFn = alloc::boxed::Box<(dyn core::ops::function::Fn
 pub ferx_core::AdaptiveAction::Decrease(ferx_core::sim::adaptive::DoseStep)
 pub ferx_core::AdaptiveAction::Hold
 pub ferx_core::AdaptiveAction::Increase(ferx_core::sim::adaptive::DoseStep)
+pub ferx_core::AdaptiveAction::Maintain
 pub ferx_core::AdaptiveAction::Stop
 pub enum ferx_core::AdaptiveRoute
 pub ferx_core::AdaptiveRoute::Bolus
@@ -4015,6 +4023,9 @@ pub ferx_core::IntegralWindow::Explicit::to: f64
 pub ferx_core::IntegralWindow::Periodic
 pub ferx_core::IntegralWindow::Periodic::anchor: f64
 pub ferx_core::IntegralWindow::Periodic::period: f64
+pub enum ferx_core::IntervalStep
+pub ferx_core::IntervalStep::Lengthen
+pub ferx_core::IntervalStep::Shorten
 pub enum ferx_core::IovOccasionRule
 pub ferx_core::IovOccasionRule::Column
 pub ferx_core::IovOccasionRule::PerDose
@@ -4248,12 +4259,14 @@ pub ferx_core::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::confirm: u32
 pub ferx_core::AdaptiveDosingSpec::dose_bounds: (f64, f64)
+pub ferx_core::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
 pub ferx_core::AdaptiveDosingSpec::observe_declared_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::AdaptiveDosingSpec::route: ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::AdaptiveDosingSpec::rules: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveRule>
 pub ferx_core::AdaptiveDosingSpec::start_dose: f64
+pub ferx_core::AdaptiveDosingSpec::start_interval: core::option::Option<f64>
 pub ferx_core::AdaptiveDosingSpec::target_window: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::with_assay_error: bool
 impl ferx_core::sim::adaptive::AdaptiveDosingSpec
@@ -4268,6 +4281,7 @@ pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::Suppl
 pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
 #[non_exhaustive] pub struct ferx_core::AdaptiveRule
 pub ferx_core::AdaptiveRule::action: ferx_core::sim::adaptive::AdaptiveAction
+pub ferx_core::AdaptiveRule::interval: core::option::Option<ferx_core::sim::adaptive::IntervalStep>
 pub ferx_core::AdaptiveRule::op: ferx_core::sim::adaptive::Comparison
 pub ferx_core::AdaptiveRule::threshold: f64
 #[non_exhaustive] pub struct ferx_core::AdaptiveSimulateOptions

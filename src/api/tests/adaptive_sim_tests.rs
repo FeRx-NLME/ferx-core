@@ -3391,7 +3391,10 @@ fn simple_titration_spec() -> AdaptiveDosingSpec {
             op: Comparison::Lt,
             threshold: 50.0,
             action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+            interval: None,
         }],
+        intervals: None,
+        start_interval: None,
     }
 }
 
@@ -4139,7 +4142,10 @@ fn from_spec_three_witnesses_equals_handwritten_closure() {
             op: Comparison::Lt,
             threshold: 50.0,
             action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+            interval: None,
         }],
+        intervals: None,
+        start_interval: None,
     };
     let spec_opts = AdaptiveSimulateOptions {
         seed: Some(7),
@@ -4721,7 +4727,10 @@ fn from_spec_dv_collapses_to_ipred_as_sigma_to_zero() {
             op: Comparison::Lt,
             threshold: 50.0,
             action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+            interval: None,
         }],
+        intervals: None,
+        start_interval: None,
     };
     // Choice-2 Dv: no observe expression — measure model output #1 (whose
     // readout `y = central` for ODE_NO_IIV is the same quantity the Ipred spec
