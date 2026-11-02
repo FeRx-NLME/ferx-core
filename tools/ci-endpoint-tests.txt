@@ -20,6 +20,7 @@ categorical_smoke
 cmt_data_selection_scope
 cmt_endpoint_scope
 ctmm_time_dependent_pk
+dcm_export_predict
 dose_compartment_routing
 dtmm_nonmem_anchor
 kappa_correlation_auto_lbfgs_fits

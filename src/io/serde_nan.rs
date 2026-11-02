@@ -157,6 +157,117 @@ pub mod opt_present {
     }
 }
 
+/// A JSON value read back with every `null` that lands on a plain `f64` (or
+/// `f32`) as `NaN` — the inverse of `serde_json` writing a non-finite float as
+/// `null`, for a whole type at once rather than one annotated field at a time.
+///
+/// Every other `null` reads as it would from the bare [`serde_json::Value`]: an
+/// `Option` becomes `None`, a unit becomes `()`, anything else is an error.
+/// Arrays, objects and newtypes are walked so a nested `f64` gets the same rule;
+/// an enum's payload is read by the bare `Value` (no NaN-able enum payload is
+/// written today).
+pub(crate) struct NullAsNan(pub(crate) serde_json::Value);
+
+impl<'de> serde::Deserializer<'de> for NullAsNan {
+    type Error = serde_json::Error;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        use serde_json::Value;
+        match self.0 {
+            Value::Array(items) => v.visit_seq(NullAsNanSeq(items.into_iter())),
+            Value::Object(map) => v.visit_map(NullAsNanMap {
+                entries: map.into_iter(),
+                value: None,
+            }),
+            other => serde::Deserializer::deserialize_any(other, v),
+        }
+    }
+
+    fn deserialize_f64<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Null => v.visit_f64(f64::NAN),
+            other => serde::Deserializer::deserialize_f64(other, v),
+        }
+    }
+
+    fn deserialize_f32<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        self.deserialize_f64(v)
+    }
+
+    fn deserialize_option<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Null => v.visit_none(),
+            other => v.visit_some(NullAsNan(other)),
+        }
+    }
+
+    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        v: V,
+    ) -> Result<V::Value, Self::Error> {
+        v.visit_newtype_struct(self)
+    }
+
+    fn deserialize_enum<V: serde::de::Visitor<'de>>(
+        self,
+        name: &'static str,
+        variants: &'static [&'static str],
+        v: V,
+    ) -> Result<V::Value, Self::Error> {
+        serde::Deserializer::deserialize_enum(self.0, name, variants, v)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 char str string bytes byte_buf
+        unit unit_struct seq tuple tuple_struct map struct identifier ignored_any
+    }
+}
+
+struct NullAsNanSeq(std::vec::IntoIter<serde_json::Value>);
+
+impl<'de> serde::de::SeqAccess<'de> for NullAsNanSeq {
+    type Error = serde_json::Error;
+
+    fn next_element_seed<T: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, Self::Error> {
+        self.0
+            .next()
+            .map(|v| seed.deserialize(NullAsNan(v)))
+            .transpose()
+    }
+}
+
+struct NullAsNanMap {
+    entries: serde_json::map::IntoIter,
+    value: Option<serde_json::Value>,
+}
+
+impl<'de> serde::de::MapAccess<'de> for NullAsNanMap {
+    type Error = serde_json::Error;
+
+    fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        let Some((key, value)) = self.entries.next() else {
+            return Ok(None);
+        };
+        self.value = Some(value);
+        seed.deserialize(serde_json::Value::String(key)).map(Some)
+    }
+
+    fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> Result<V::Value, Self::Error> {
+        let value = self.value.take().expect("next_key_seed runs first");
+        seed.deserialize(NullAsNan(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[derive(serde::Serialize, serde::Deserialize, Debug)]

@@ -7,4 +7,4 @@ pub mod fitrx;
 pub mod hash;
 pub(crate) mod model_source;
 pub mod output;
-mod serde_nan;
+pub(crate) mod serde_nan;

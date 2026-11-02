@@ -13,7 +13,6 @@ pub mod io;
 #[cfg(feature = "markov")]
 pub mod markov;
 pub mod model_selection;
-#[cfg(feature = "nn")]
 pub mod nn;
 pub mod ode;
 pub mod parser;
