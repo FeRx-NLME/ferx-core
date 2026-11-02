@@ -184,6 +184,7 @@ the model has fewer than two valid residuals, and `cov_condition_number` is
   "ebe_convergence_warnings": 0,
   "max_unconverged_subjects": 0,
   "total_ebe_fallbacks": 0,
+  "total_ebe_nm_polished": 0,
   "warnings": [],
   "saem_mu_ref_m_step_evals_saved": null,
 

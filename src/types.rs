@@ -8033,11 +8033,12 @@ pub struct FitResult {
     /// Total number of times the Nelder-Mead fallback was invoked across all
     /// subjects and all outer iterations.  Always `0` for SAEM.
     pub total_ebe_fallbacks: u32,
-    /// Under `inner_optimizer = nelder_mead`: how many times, counted like
-    /// `total_ebe_fallbacks`, a subject's Nelder–Mead stop was not a mode and the
-    /// stationarity certificate moved it there with the gradient. Those subjects are not
-    /// fallbacks. The rest of the converged, non-fallback solves are the ones Nelder–Mead
-    /// alone reached. Always `0` under every other `inner_optimizer` (#2571).
+    /// Under `inner_optimizer = nelder_mead`: how many times, summed over every inner loop
+    /// like `total_ebe_fallbacks` (not a count of distinct subjects), a subject's Nelder–Mead
+    /// stop was not a mode and the stationarity certificate moved it there with the gradient.
+    /// The primary search's moved point is not a fallback. Always `0` under every other
+    /// `inner_optimizer`, and always `0` for `gn` / `gn_hybrid`'s Gauss–Newton phase, SAEM,
+    /// trust-region, VI and IMP, which do not count it (#2571).
     pub total_ebe_nm_polished: u32,
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,
