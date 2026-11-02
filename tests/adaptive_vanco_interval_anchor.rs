@@ -199,6 +199,21 @@ fn vanco_interval_extension_matches_mrgsolve() {
             .map(|e| e.time)
             .collect();
         assert_eq!(ledger, dosed, "subject {id}: realized dose times");
+        // Each decision's `n_dosed()` is its own ledger rows (#2581), checked per
+        // decision so two mis-counts cannot cancel in a sum.
+        for d in &got {
+            let rows = res
+                .ledger
+                .iter()
+                .filter(|e| e.subject == *id && e.decision_idx == d.decision_idx)
+                .count();
+            assert_eq!(
+                d.outcome.n_dosed(),
+                rows,
+                "subject {id} t={}: n_dosed vs ledger rows",
+                d.time
+            );
+        }
         assert!(res
             .ledger
             .iter()
