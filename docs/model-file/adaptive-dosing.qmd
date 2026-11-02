@@ -674,6 +674,24 @@ decision log and trajectories.
 
 ## Model time in a reactive run
 
+### Decision times after a moved reset
+
+Decision times are on the engine clock. The data reader moves a reset written at or before
+the end of a running infusion or `ADDL` train, or at the `TIME` of the record before it, to
+just past that point, and every later row moves with it (#1609). A decision time names the
+moved clock, so a decision written after such a reset can run before it, and the reset then
+removes the dose that decision issued.
+
+When that happens, the run's `warnings` carry `W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET`
+(#2559). It names the subject, the decision times, the reset's written and engine times,
+and the shift to add to the decision times between that reset and the next one. An
+infusion of 600 at rate 20 from 0 with `EVID=3` at 18 runs to 30, so the reset runs at 31,
+and a decision written at 24 is flagged with a shift of 13.
+
+A reset whose `TIME` goes back (a restarting period) is not checked, and neither is any
+reset after it. A written decision time is ambiguous there, since that `TIME` exists in
+both periods, so write every decision from that period onward on the engine clock.
+
 ### Where a reactive run starts
 
 A reactive run starts where `predict()` starts on the same realized schedule: at the
@@ -860,9 +878,8 @@ cannot see a failure in the solver itself.
   **pre-scheduled base regimen** (#932): it zeros the base regimen's state and turns off a base
   infusion opened before it (the reset floor), and an **EVID=4** reset+dose row — which records both a
   reset and a dose — reaches the adaptive path as a base dose landing *after* its own reset
-  (Reset < Dose), matching `predict()`. Decision times are on the engine clock: a reset the reader
-  moves (one written inside a running infusion or `ADDL` train, #1609) moves every later row, and a
-  decision time names the moved clock. `auc_target` composes with resets (#943): the window that
+  (Reset < Dose), matching `predict()`. Decision times are on the engine clock, which a moved reset shifts
+  (see [Decision times after a moved reset](#decision-times-after-a-moved-reset)). `auc_target` composes with resets (#943): the window that
   straddles a reset carries a node at the state the reset found and one at
   the state it left, so the drop integrates exactly.
 - **Inter-occasion variability (IOV) is supported** — a fresh occasion `kappa` is
