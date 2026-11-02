@@ -4244,7 +4244,7 @@ pub fn parse_full_model_with(
         block_sigmas,
         eta_names_bsv,
         kappa_info,
-        vector_theta_decls,
+        mut vector_theta_decls,
         mut level_block_decls,
         unbound_level_blocks,
         declared_priors,
@@ -5367,7 +5367,7 @@ pub fn parse_full_model_with(
         }
         for block in &profiled {
             let others: Vec<String> = profiled.iter().filter(|o| *o != block).cloned().collect();
-            profile_route_check(
+            let linked = profile_route_check(
                 &indiv_stmts,
                 &readouts,
                 &error_lines,
@@ -5376,6 +5376,9 @@ pub fn parse_full_model_with(
                 &states,
             )
             .map_err(|(why, site)| profile_route_message(block, &why, &site))?;
+            if let Some(d) = vector_theta_decls.iter_mut().find(|d| d.name == *block) {
+                d.linked = linked;
+            }
         }
         for d in &vector_theta_decls {
             read_index.push((
@@ -18814,6 +18817,7 @@ fn parse_parameters(
                         spec: std::sync::Arc::new(GatherSpec { name, levels }),
                         index_covariate,
                         profiled,
+                        linked: false,
                         profile_box,
                     });
                 }
@@ -22850,6 +22854,11 @@ pub(crate) struct VectorThetaDecl {
     /// Declared `profile` (#1065): the levels are solved for at every outer
     /// evaluation rather than searched by the optimizer.
     pub(crate) profiled: bool,
+    /// A profiled block some prediction reads through a logit link (#2111): the whole
+    /// prediction is `inv_logit(c × block + rest)` ([`profile_route_check`]). The profile
+    /// solve's Newton matrix is then the exact one, not the GLS matrix, which is exact only
+    /// on an affine route. `false` for an unprofiled block.
+    pub(crate) linked: bool,
     /// A profiled block's declared `(lower, upper)` (#2112): the box the profile solve
     /// holds each free θ of the block in. `None` for an unprofiled block, whose bounds
     /// are its θ's own, and for a profiled one declared without bounds.
@@ -24686,6 +24695,9 @@ pub(crate) enum ProfileRouteBreak {
     /// No prediction reads the block, so its levels have nothing to be solved from
     /// (#2103 review #8).
     Unread,
+    /// Inside a logit link (`inv_logit`, `expit`) that is not the whole prediction
+    /// (#2111): scaled, added to, or inside another link.
+    InnerLink(String),
 }
 
 /// Where a [`ProfileRouteBreak`] was found.
@@ -24700,6 +24712,12 @@ pub(crate) enum ProfileRouteSite {
 /// The label [`profile_route_check`] gives the `y` readouts.
 pub(crate) const Y_READOUT: &str = "the `y` readout";
 
+/// Whether `f` is a logit link, the one function a profiled block may be read through
+/// (#2111).
+fn is_logit_link(f: &str) -> bool {
+    f == "inv_logit" || f == "expit"
+}
+
 /// The route half of `E_PROFILE_NOT_LINEAR` (#1065): every prediction must read a
 /// `profile`d block as `c × block + (the rest)`, where `c` reads data and literals
 /// only, along `+`, `−` (so a sum of two reads, #2114), and `×`/`÷` by such a `c`,
@@ -24707,6 +24725,12 @@ pub(crate) const Y_READOUT: &str = "the `y` readout";
 /// never through the states.
 /// That is what makes the profile solve a least-squares problem with design
 /// matrix `c`.
+///
+/// One logit link may sit around that, as the whole prediction (#2111):
+/// `y = inv_logit(c × block + rest)`, written inline or as the individual parameter `y`
+/// reads (`P = inv_logit(LP)`, `y = P`). The solve is then a GLM, not least squares, and
+/// `Ok(true)` tells it so: its Newton matrix becomes the exact one. A link anywhere else
+/// on the route (scaled, added to, nested) is refused.
 ///
 /// `readouts` are the predictions, each with the label a refusal names it by: the
 /// `y` readouts, and each `[scaling] obs_scale` divisor as `state / obs_scale`, so a
@@ -24723,7 +24747,7 @@ pub(crate) fn profile_route_check(
     block: &str,
     others: &[String],
     states: &StateInputs,
-) -> Result<(), (ProfileRouteBreak, ProfileRouteSite)> {
+) -> Result<bool, (ProfileRouteBreak, ProfileRouteSite)> {
     let (assigns, reach_out) = coupling_defs(stmts);
     let exprs: Vec<Expression> = readouts.iter().map(|(_, e)| e.clone()).collect();
     let ctx = CouplingCtx {
@@ -24762,13 +24786,24 @@ pub(crate) fn profile_route_check(
         taint: &taint,
     };
     let mut read = false;
+    let mut linked = false;
     for (label, e) in readouts {
         if !ctx.expr_reads(e, &src, &taint, ctx.out(), false) {
             continue;
         }
         read = true;
         let site = ProfileRouteSite::Readout(label.clone());
-        walk.affine(e, ctx.out(), &site)?;
+        match walk.outer_link(e, ctx.out(), &site) {
+            Some(args) => {
+                linked = true;
+                for (arg, at, site) in args {
+                    walk.affine(arg, at, &site)?;
+                }
+            }
+            None => {
+                walk.affine(e, ctx.out(), &site)?;
+            }
+        }
         for other in others {
             let is_other = |e: &Expression| matches!(e, Expression::ThetaGather { spec, .. } if spec.name == *other);
             let osrc = Source {
@@ -24784,7 +24819,7 @@ pub(crate) fn profile_route_check(
     if !read {
         return Err((ProfileRouteBreak::Unread, y()));
     }
-    Ok(())
+    Ok(linked)
 }
 
 /// The one plain data column every read of `block` is indexed by, across the
@@ -24859,6 +24894,11 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
             "Here one prediction reads `{block}` and `{o}`, which is profiled too; a \
              prediction may read only one profiled block."
         ),
+        ProfileRouteBreak::InnerLink(c) => format!(
+            "Here `{block}` reaches `y` through {c} {at}. A logit link is accepted only as the \
+             whole prediction, `y = inv_logit(c × {block} + …)`, on every branch of an `if` \
+             that chooses it, not scaled, added to or inside another link."
+        ),
         ProfileRouteBreak::Unread => unreachable!("answered above"),
     };
     format!(
@@ -24880,6 +24920,52 @@ struct ProfileWalk<'w, 'a> {
 impl ProfileWalk<'_, '_> {
     fn reads(&self, e: &Expression, at: At<'_>) -> bool {
         self.ctx.expr_reads(e, self.src, self.taint, at, false)
+    }
+
+    /// The arguments of the logit link a prediction `e` is, each with where it is read
+    /// (#2111): `e` itself `inv_logit(arg)` / `expit(arg)`; a name whose reaching
+    /// definitions are; or an `if` (two definitions, or an inline `if`) whose condition
+    /// reads data only and whose every arm reading the block is. One argument per such
+    /// arm, each then walked for an affine read; an arm that does not read the block adds
+    /// none, as it adds `c = 0` to an affine route (#2114). `None` when the prediction is
+    /// anything else, the link included once scaled, added to or on only some arms, so
+    /// the affine walk sees it and refuses it there.
+    fn outer_link<'e>(
+        &'e self,
+        e: &'e Expression,
+        at: At<'e>,
+        site: &ProfileRouteSite,
+    ) -> Option<Vec<(&'e Expression, At<'e>, ProfileRouteSite)>> {
+        let arms = |parts: Vec<(&'e Expression, At<'e>, ProfileRouteSite)>| {
+            let mut out = Vec::new();
+            for (e, at, site) in parts {
+                if self.reads(e, at) {
+                    out.extend(self.outer_link(e, at, &site)?);
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        };
+        match e {
+            Expression::UnaryFn(f, arg) if is_logit_link(f) => Some(vec![(arg, at, site.clone())]),
+            Expression::Variable(n) | Expression::Covariate(n) => {
+                let defs = self.ctx.resolve(at, n);
+                if defs.is_empty()
+                    || (defs.len() > 1 && !defs.iter().all(|&d| self.chosen_by_data(d)))
+                {
+                    return None;
+                }
+                let param = ProfileRouteSite::Param(n.clone());
+                arms(
+                    defs.iter()
+                        .map(|&d| (self.ctx.assigns[d].rhs, self.ctx.at(d), param.clone()))
+                        .collect(),
+                )
+            }
+            Expression::Conditional(c, t, f) if self.cond_data_only(c, at) => {
+                arms(vec![(&**t, at, site.clone()), (&**f, at, site.clone())])
+            }
+            _ => None,
+        }
     }
 
     /// Whether `e` reads the block, `Err` when it does but not affinely.
@@ -24932,6 +25018,11 @@ impl ProfileWalk<'_, '_> {
                     (BinOp::Mul, false, true) if self.data_only(l, at) => Ok(true),
                     _ => fail(ProfileRouteBreak::Coefficient),
                 }
+            }
+            // A link is peeled only as the whole prediction ([`Self::outer_link`]); one
+            // reached here is scaled, added to, or nested.
+            Expression::UnaryFn(f, _) if is_logit_link(f) => {
+                fail(ProfileRouteBreak::InnerLink(format!("`{f}(...)`")))
             }
             Expression::UnaryFn(f, _) => fail(ProfileRouteBreak::Construct(format!("`{f}(...)`"))),
             Expression::Power(..) => fail(ProfileRouteBreak::Construct("a power (`^`)".into())),

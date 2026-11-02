@@ -106,6 +106,7 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 | **Unit invariance under proportional error** | the FOCEI objective with IPRED below `1e-6` (the old absolute `1e-12` residual-variance floor), on one dataset in two units — [#2441](https://github.com/FeRx-NLME/ferx-core/issues/2441) | `unit_invariance_prop_{k1,k1e6}.ctl` | `unit_invariance_prop_fit.ferx` *(in `tests/unit_invariance_prop_nonmem_anchor.rs`)* |
 | **Slow-accumulation steady state** | `SS=1` at `λ·II = 0.024` on `ADVAN1` and its oral `ADVAN2` twin — [#908](https://github.com/FeRx-NLME/ferx-core/issues/908); see the section below | `ss_slow_advan{1,2}.ctl` | *(in `tests/nonmem_dose_compartment_anchor.rs`)* |
 | **Profile likelihood on a level block** | an unstructured placebo with a BTAV κ and a drug effect nonlinear in `ETA` — [#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065); bounded, one level `FIX`ed at the bound the profiled box holds it on — [#2112](https://github.com/FeRx-NLME/ferx-core/issues/2112); from a start that puts TVE0 on ferx's log-packing floor — [#2339](https://github.com/FeRx-NLME/ferx-core/issues/2339); under `METHOD=1 LAPLACE` — [#2107](https://github.com/FeRx-NLME/ferx-core/issues/2107); see the section below | `profile_mbma.ctl`, `profile_mbma_bound.ctl`, `profile_mbma_tve0_55.ctl`, `profile_mbma_laplace.ctl` (4) | `profile_mbma_fit.ferx` *(in `tests/profiled_levels.rs`)* |
+| **Profile likelihood through a logit link** | a bounded proportion whose unstructured placebo and study `ETA` sit inside `inv_logit`, under `METHOD=1 INTER` and `METHOD=1 LAPLACE INTER` — [#2111](https://github.com/FeRx-NLME/ferx-core/issues/2111); see the section below | `profile_logit_b2_focei.ctl`, `profile_logit_b2_laplace.ctl` (2) | `profile_logit_b2.ferx` *(in `tests/profiled_logit_levels.rs`)* |
 | **Nested levels × residual correlation** | `exact3` with each arm's residuals correlated, `correlation ar1\|car1(RHO) by ARM` — [#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082) PR5 (`MAXEVAL=0`, FOCEI; `gen_ctl.py` writes the streams) | `nested_levels_3_ar1/{ar1_r0,ar1_p05,ar1_m04,car1_p06}.ctl` | *(in `tests/nested_levels_correlation_nonmem_anchor.rs`)* |
 | **NPDE / NPD with a correlated residual** | a `block_sigma` correlation inside one combined error (A, ρ = −0.9) and across an `L2` total/unbound pair (B, ρ = −0.8) — [#1733](https://github.com/FeRx-NLME/ferx-core/issues/1733) | `npde_block_sigma_{a,b}.ctl` | `tests/fixtures/npde_block_sigma_{a,b}.ferx` *(in `tests/npde_block_sigma_nonmem_anchor.rs`)* |
 | **SAEM additive mu-reference** | SAEM on `E0 = MU_1 + ETA(1)` (additive mu-ref) against the same model without `MU_`, TVE0 and ω² free, every other θ `FIX` at `level_se_a`'s optimum; each estimate scored by `METHOD=1 MAXEVAL=0` — [#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540); the one-line `BASE = MU_1 + PLA + ETA(1)` as a mu-reference — [#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544); see the section below | `saem_additive_mu.ctl`, `saem_additive_mu_inline.ctl`, `saem_additive_mu_nomu.ctl` | `saem_additive_mu.ferx`, `saem_additive_mu_inline.ferx`, `saem_additive_mu_shared.ferx` *(in `tests/saem_additive_mu_nonmem_anchor.rs`)* |
@@ -1488,3 +1489,34 @@ below, NONMEM's levels being the end of a three-significant-digit fit), free-lev
 within 2.2e-3 of (a), dependent ones within 2.8e-3 of (b) — inside the 3.4e-3 / 4.2e-3
 the unprofiled anchor shows at the same point. Dropping the covariance step's
 `D⁻¹BᵀCov(θ)BD⁻¹` term fails it.
+
+**A-B2, a profiled block through a logit link (#2111).** `profile_logit_b2_focei.ctl` and
+`profile_logit_b2_laplace.ctl` code `profile_logit_b2.ferx` with every level a `THETA`
+(each study's last visit dependent, as ferx lays it out). Data `profile_logit_b2.csv`,
+written by `simulate_profile_logit_b2.py` (synthetic, seed 2111): 10 studies × 4 visits ×
+2 arms, ID = study, DV the observed proportion of 30 Bernoulli draws per arm-visit, and
+`Y = 1/(1 + EXP(−LP)) + EPS(1)` with `LP = TVL + PLACEBO + ETA(1) + EMAX·TRT`. Both the
+block and the study `ETA` sit inside the link, so the prediction is nonlinear in both and
+the profile solve's least-squares matrix no longer applies; ferx takes the adjoint's exact
+Newton matrix there. The arm-visit probabilities run from about 0.2 to 0.8, so the link
+is live on every row. `$ESTIMATION … SIGL=12 NSIG=4`, `$COVARIANCE MATRIX=R SIGL=12`, both
+`MINIMIZATION SUCCESSFUL` (4.1 / 4.5 significant digits) with the covariance step complete.
+Run with `nm3` (`~/NONMEMruns/ferx-2111-profile-logit/committed/`). Results:
+`results/profile_logit_b2_{focei,laplace}.{lst,ext,cov,phi}`.
+
+| | FOCEI (`METHOD=1 INTER`) | LAPLACE (`METHOD=1 LAPLACE INTER`) |
+|---|---|---|
+| NONMEM OBJ, anchor image | −344.413016237 | −344.385100318 |
+| arm64 / arm64-nofma | −344.413015951 | −344.385100494 |
+| ferx profiled at NONMEM's structural point, ΔOFV | −7.1e-8 | −2.0e-7 |
+| 30 free levels, solved by ferx | ≤ 9.5e-5 NONMEM SEs | ≤ 1.8e-4 NONMEM SEs |
+| free-level SEs vs `$COV` | ≤ 4.1e-5 | ≤ 1.5e-5 |
+| TVL / EMAX SEs vs `$COV` | 2.7e-5 / 1.9e-5 | 2.4e-5 / 4.8e-6 |
+| ferx profiled fit from the inits (`slow-tests`), ΔOFV | −7.5e-8 | −2.1e-7 |
+
+ferx is handed TVL, EMAX, Ω and σ and solves the 30 free levels itself
+(`tests/profiled_logit_levels.rs`, Tier 2), every level gradient and Newton matrix on the
+adjoint; ferx sits below NONMEM both times, whose levels are the end of a 4.1 / 4.5
+significant-digit fit. `$COV` at `SIGL=12` is precise here, so the structural SEs are
+compared with it directly. The same file's `slow-tests` twin fits from the model file's
+inits and lands on each OBJ. Numbers are macOS arm64; the Linux run agrees.

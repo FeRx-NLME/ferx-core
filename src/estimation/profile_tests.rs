@@ -2330,6 +2330,7 @@ fn bordered_fixture(border_of: Vec<Option<usize>>, nb: usize) -> ProfileGroup {
         subjects: Vec::new(),
         borders: (0..nb).collect(),
         border_of,
+        linked: false,
     }
 }
 
@@ -3361,6 +3362,7 @@ fn the_profile_work_summary_names_each_count() {
         resolves: 222,
         adjoint_gradients: 33,
         fd_gradients: 4,
+        ..Default::default()
     };
     assert_eq!(
         profile_work_summary(7, 2, &c),
@@ -6456,3 +6458,7 @@ fn a_profiled_quadrature_fit_is_traced_as_agq() {
     profiled_trace(agq3_focei, "agq", "trace_focei_agq.csv");
     profiled_trace(agq3_laplace, "agq", "trace_laplace_agq.csv");
 }
+
+/// #2111: a block read through a logit link.
+#[path = "profile_logit_tests.rs"]
+mod logit;

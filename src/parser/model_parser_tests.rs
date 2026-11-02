@@ -28794,6 +28794,7 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
         spec,
         index_covariate: None,
         profiled: false,
+        linked: false,
         profile_box: None,
     }]);
     let why = ode_level_block_read("H0 * KM[K + 1]")
@@ -35630,6 +35631,148 @@ fn profile_refuses_a_route_through_the_states() {
         ),
         "{msg}"
     );
+}
+
+// ── #2111: a profiled block read through a logit link ────────────────────────
+
+/// The parsed `linked` flag of block `name` (#2111).
+fn linked_of(text: &str, name: &str) -> bool {
+    let parsed = parse_full_model(text).unwrap_or_else(|e| panic!("{e}"));
+    parsed
+        .model
+        .indiv_param_partials
+        .theta_blocks
+        .decls
+        .iter()
+        .find(|d| d.name == name)
+        .expect("the block")
+        .linked
+}
+
+const LINK_SENTENCE: &str = "A logit link is accepted only as the whole prediction";
+
+/// The two arms of an `if` on data, each a link around an affine read.
+const LINK_BRANCHES: &str = "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0\n  if (DOSE > 0) {\n    P = \
+                             inv_logit(LP)\n  } else {\n    P = inv_logit(LP - 0.1)\n  }";
+
+/// A logit link around the affine read, as the whole prediction, is accepted and marks
+/// the block `linked`: inline, as `expit`, through the parameter `y` reads, through a
+/// chain of them, and on every branch of an `if` on data, two-definition or inline, an arm
+/// that does not read the block included. The affine control parses unlinked, so the flag
+/// is the link's and not every profiled block's. Dies when the link is not peeled (each
+/// accepted row refused), when only a single definition is peeled (the branch rows), or
+/// when `linked` is set for every block (the control).
+#[test]
+fn profile_accepts_one_outermost_logit_link_and_marks_the_block_linked() {
+    let base = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let lp = "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let inline_if = format!("{lp}\n  P = if (DOSE > 0) inv_logit(LP) else inv_logit(LP - 0.1)");
+    let unread_arm = format!("{lp}\n  P = if (DOSE > 0) inv_logit(LP) else 0.5");
+    for (indiv, y) in [
+        (LINK_BRANCHES, "P"),
+        (inline_if.as_str(), "P"),
+        (unread_arm.as_str(), "P"),
+        (base, "inv_logit(BASE)"),
+        (
+            "  BASE = TVE0 + ETA_E0",
+            "expit(BASE + 2.0 * DOSE * PLACEBO[STUDY])",
+        ),
+        (
+            "  P = inv_logit(TVE0 + PLACEBO[STUDY] / WPSE + ETA_E0)",
+            "P",
+        ),
+        (
+            "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0\n  P = inv_logit(LP)\n  Q = P",
+            "Q",
+        ),
+    ] {
+        assert!(
+            linked_of(&route_model(indiv, y, ADD), "PLACEBO"),
+            "{indiv} / y = {y}"
+        );
+    }
+    assert!(!linked_of(&route_model(base, "BASE", ADD), "PLACEBO"));
+    assert!(!linked_of(&route_model(base, "BASE", ADD), "ARMFX"));
+}
+
+/// A link that is not the whole prediction is refused with the link's own sentence:
+/// scaled, added to, scaled through the parameter carrying it, nested inside another
+/// link (whose outer one is peeled and whose inner one is named), or on one branch of an
+/// `if` whose other branch reads the block without one. That last row is
+/// [`LINK_BRANCHES`] with one arm's link removed, so the pair straddles the every-branch
+/// rule. Dies when either sentence is deleted, or when the outermost-only gate is removed
+/// (the scaled rows would parse).
+#[test]
+fn profile_refuses_a_logit_link_that_is_not_the_whole_prediction() {
+    let base = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let one_arm = LINK_BRANCHES.replace("inv_logit(LP - 0.1)", "LP - 0.1");
+    assert_ne!(one_arm, LINK_BRANCHES, "the fixture moved");
+    for (indiv, y, at) in [
+        (one_arm.as_str(), "P", "in `P` in [individual_parameters]"),
+        (base, "100 * inv_logit(BASE)", "in the `y` readout"),
+        (base, "inv_logit(BASE) + 0.1", "in the `y` readout"),
+        (base, "inv_logit(inv_logit(BASE))", "in the `y` readout"),
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  P = inv_logit(BASE)",
+            "2 * P",
+            "in `P` in [individual_parameters]",
+        ),
+    ] {
+        let msg = route_err(indiv, y, ADD);
+        assert_route_frame(&msg);
+        let here = format!("Here `PLACEBO` reaches `y` through `inv_logit(...)` {at}.");
+        assert!(msg.contains(&here), "missing {here:?} in {msg}");
+        assert!(
+            msg.contains(
+                "A logit link is accepted only as the whole prediction, `y = inv_logit(c × \
+                 PLACEBO + …)`, on every branch of an `if` that chooses it, not scaled, added \
+                 to or inside another link."
+            ),
+            "{msg}"
+        );
+    }
+}
+
+/// Inside an accepted link the affine walk runs unchanged, so a function there is named,
+/// and the link is not: the culprit is `exp`, not `inv_logit`. A function that is not a
+/// logit link around the read (`logit`, `log`) keeps its own message, without the link
+/// sentence. Each refused row's twin with the function removed parses, so the pair
+/// straddles the walk inside the link.
+#[test]
+fn profile_names_a_function_inside_the_link_and_keeps_other_functions_refused() {
+    let msg = route_err(
+        "  BASE = TVE0 + ETA_E0",
+        "inv_logit(BASE + exp(PLACEBO[STUDY]))",
+        ADD,
+    );
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains("Here `PLACEBO` reaches `y` through `exp(...)` in the `y` readout."),
+        "{msg}"
+    );
+    assert!(!msg.contains("`inv_logit(...)`"), "{msg}");
+    assert!(!msg.contains(LINK_SENTENCE), "{msg}");
+    parse_full_model(&route_model(
+        "  BASE = TVE0 + ETA_E0",
+        "inv_logit(BASE + PLACEBO[STUDY])",
+        ADD,
+    ))
+    .unwrap_or_else(|e| panic!("{e}"));
+    for f in ["logit", "log"] {
+        let msg = route_err(
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+            &format!("{f}(BASE)"),
+            ADD,
+        );
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(&format!(
+                "Here `PLACEBO` reaches `y` through `{f}(...)` in the `y` readout."
+            )),
+            "{msg}"
+        );
+        assert!(!msg.contains(LINK_SENTENCE), "{f}: {msg}");
+    }
 }
 
 // ── #2103 review round 1 ────────────────────────────────────────────────────
