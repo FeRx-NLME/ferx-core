@@ -929,6 +929,7 @@ fn the_guarded_resolve_warning_names_the_trigger_that_fired() {
     let stats = |n_unconverged, n_start_rejected| InnerLoopStats {
         n_unconverged,
         n_fallback: 0,
+        n_nm_polished: 0,
         n_start_rejected,
     };
     let start = profile_resolve_guarded_msg(&stats(0, 1), 12, 1.0, false);
@@ -5783,7 +5784,7 @@ fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
     let x = pack_params(params);
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).unwrap();
     let zero = DVector::zeros(cf.model.n_eta);
-    let (mut worst, mut primary) = (0.0_f64, 0);
+    let (mut worst, mut primary, mut moved) = (0.0_f64, 0, 0);
     for i in 0..p.population.subjects.len() {
         let se: Vec<f64> = layout.reads[i].iter().map(|r| scale[r.level]).collect();
         let steps: Vec<f64> = se.iter().map(|s| FD_STEP_SE * s).collect();
@@ -5801,6 +5802,8 @@ fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
             continue;
         }
         primary += usize::from(!nm.fallback);
+        moved += usize::from(nm.nm_polished);
+        assert!(!(nm.nm_polished && nm.fallback), "subject {i}: both");
         let g = cf
             .total_gradient_adjoint(i, &pt, &nm)
             .unwrap_or_else(|| panic!("subject {i}: the adjoint declined"));
@@ -5816,13 +5819,32 @@ fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
         worst = worst.max(gap);
     }
     eprintln!(
-        "nelder_mead on the adjoint: worst {worst:.3e} SE over {primary} primary-path states"
+        "nelder_mead on the adjoint: worst {worst:.3e} SE over {primary} primary-path states, \
+         {moved} moved by the certificate"
     );
     assert!(
         primary > 0,
         "no state came from the primary NM search, so its certificate is untested"
     );
     assert!(worst <= CERTIFIED_FALLBACK_GAP, "{worst:.3e} SE");
+    // #2571: the states the certificate moved are the ones this test exists for (F2 subject
+    // 1's stop was 3.3e-2 off its mode), and the profile solve's own count reports them.
+    assert!(moved > 0, "no NM stop needed the certificate");
+    let solve_moved = |mode| {
+        let o = FitOptions {
+            inner_optimizer: mode,
+            ..o.clone()
+        };
+        crate::api::with_fit_scope(&o, || {
+            cf.solve(params, &ProfileWarm::from_template(&layout, params))
+                .expect("the solve converges")
+                .ebe
+                .n_nm_polished
+        })
+        .expect("the scope builds")
+    };
+    assert!(solve_moved(crate::types::InnerOptimizer::NelderMead) > 0);
+    assert_eq!(solve_moved(crate::types::InnerOptimizer::Auto), 0);
 }
 
 /// #2539, the fit: F2 started at NONMEM's FOCEI optimum. Near the optimum the outer steps

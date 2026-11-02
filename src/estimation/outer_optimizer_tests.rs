@@ -88,6 +88,7 @@ fn ebe_guard_rejects_on_hard_reject_and_fraction() {
     let stats = |n_unconverged, n_start_rejected| InnerLoopStats {
         n_unconverged,
         n_fallback: 0,
+        n_nm_polished: 0,
         n_start_rejected,
     };
 
@@ -10439,6 +10440,7 @@ fn identity_probe_objective_applies_the_ebe_guard() {
     let stats = |n_unconverged: usize, n_start_rejected: usize| InnerLoopStats {
         n_unconverged,
         n_fallback: 0,
+        n_nm_polished: 0,
         n_start_rejected,
     };
     let at = |raw: f64, s: InnerLoopStats| identity_probe_objective(raw, &s, 20, 0.1);
@@ -10474,6 +10476,7 @@ fn a_probe_the_ebe_guard_rejects_scales_the_theta() {
                 let s = InnerLoopStats {
                     n_unconverged,
                     n_fallback: 0,
+                    n_nm_polished: 0,
                     n_start_rejected: 0,
                 };
                 identity_probe_objective(f(i, v), &s, 20, 0.1)

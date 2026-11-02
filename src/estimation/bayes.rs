@@ -2246,6 +2246,7 @@ pub fn run_bayes(
         ebe_convergence_warnings: ebe_stats.n_unconverged as u32,
         max_unconverged_subjects: ebe_stats.n_unconverged as u32,
         total_ebe_fallbacks: ebe_stats.n_fallback as u32,
+        total_ebe_nm_polished: ebe_stats.n_nm_polished as u32,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal: None,

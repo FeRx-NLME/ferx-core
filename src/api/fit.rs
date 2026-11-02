@@ -2049,6 +2049,7 @@ fn fit_inner(
                         ebe_convergence_warnings: 0,
                         max_unconverged_subjects: 0,
                         total_ebe_fallbacks: 0,
+                        total_ebe_nm_polished: 0,
                         final_gradient: None,
                         final_gradient_source: None,
                         sir_fallback_proposal: None,
@@ -2144,6 +2145,7 @@ fn fit_inner(
                     ebe_convergence_warnings: 0,
                     max_unconverged_subjects: 0,
                     total_ebe_fallbacks: 0,
+                    total_ebe_nm_polished: 0,
                     final_gradient: None,
                     final_gradient_source: None,
                     sir_fallback_proposal: None,
@@ -3253,6 +3255,7 @@ fn fit_inner(
         ebe_convergence_warnings: result.ebe_convergence_warnings,
         max_unconverged_subjects: result.max_unconverged_subjects,
         total_ebe_fallbacks: result.total_ebe_fallbacks,
+        total_ebe_nm_polished: result.total_ebe_nm_polished,
         covariance_status,
         // #1382: the estimator that actually produced `covariance_matrix`, carried
         // up from the covariance step rather than read back off

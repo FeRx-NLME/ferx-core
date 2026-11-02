@@ -167,6 +167,7 @@ pub(crate) fn mixture_ofv_with_modes(
     let mut kappas_by_class: Vec<Vec<Vec<DVector<f64>>>> = Vec::with_capacity(k);
     let mut converged: Vec<Vec<bool>> = vec![vec![true; n]; k];
     let mut fallback: Vec<Vec<bool>> = vec![vec![false; n]; k];
+    let mut nm_polished: Vec<Vec<bool>> = vec![vec![false; n]; k];
     let mut hard_reject: Vec<Vec<bool>> = vec![vec![false; n]; k];
 
     for cls in 0..k {
@@ -232,6 +233,7 @@ pub(crate) fn mixture_ofv_with_modes(
             };
             converged[cls][i] = ebe.converged;
             fallback[cls][i] = ebe.used_fallback;
+            nm_polished[cls][i] = ebe.nm_polished;
             hard_reject[cls][i] = ebe.hard_reject;
             etas_c.push(ebe.eta);
             hmats_c.push(ebe.h_matrix);
@@ -250,6 +252,7 @@ pub(crate) fn mixture_ofv_with_modes(
     let mut mixest_h_mats = Vec::with_capacity(n);
     let mut mixest_kappas = Vec::with_capacity(n);
     let (mut n_unconverged, mut n_fallback, mut n_start_rejected) = (0usize, 0usize, 0usize);
+    let mut n_nm_polished = 0usize;
 
     for (i, subject) in population.subjects.iter().enumerate() {
         let logp = eval_mixing_log_probs(spec, &params.theta, &subject.covariates);
@@ -265,12 +268,16 @@ pub(crate) fn mixture_ofv_with_modes(
         // subject contributes at most one to each tally.
         let unconverged_i: Vec<bool> = (0..k).map(|cls| !converged[cls][i]).collect();
         let fallback_i: Vec<bool> = (0..k).map(|cls| fallback[cls][i]).collect();
+        let nm_polished_i: Vec<bool> = (0..k).map(|cls| nm_polished[cls][i]).collect();
         let reject_i: Vec<bool> = (0..k).map(|cls| hard_reject[cls][i]).collect();
         if any_contributing(&unconverged_i, &probs) {
             n_unconverged += 1;
         }
         if any_contributing(&fallback_i, &probs) {
             n_fallback += 1;
+        }
+        if any_contributing(&nm_polished_i, &probs) {
+            n_nm_polished += 1;
         }
         if any_contributing(&reject_i, &probs) {
             n_start_rejected += 1;
@@ -293,6 +300,7 @@ pub(crate) fn mixture_ofv_with_modes(
         ebe_stats: InnerLoopStats {
             n_unconverged,
             n_fallback,
+            n_nm_polished,
             n_start_rejected,
         },
     };
