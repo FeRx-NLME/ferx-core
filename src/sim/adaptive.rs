@@ -313,7 +313,8 @@ pub struct DoseLedgerEntry {
 /// is logged faithfully rather than as a bare stop.
 ///
 /// `#[non_exhaustive]`: downstream, read it through [`DecisionOutcome::label`] and
-/// [`DecisionOutcome::n_dosed`] rather than a match, which would need a wildcard arm.
+/// [`DecisionOutcome::n_dosed`] rather than a wildcard match, whose catch-all arm
+/// would guess both for a variant added later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DecisionOutcome {
@@ -344,7 +345,7 @@ impl DecisionOutcome {
     /// `#[non_exhaustive]` enum (#2581). The match is exhaustive inside ferx-core, so
     /// a new variant does not compile until it is given a label.
     pub fn label(&self) -> &'static str {
-        match self {
+        match *self {
             DecisionOutcome::Dosed { .. } => "dosed",
             DecisionOutcome::Hold => "hold",
             DecisionOutcome::Stop { .. } => "stop",
