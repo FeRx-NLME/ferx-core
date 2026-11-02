@@ -181,6 +181,11 @@ far its last-50 mean moves with the seed. The reference is therefore the mean of
 NONMEM seeds, and every ferx estimate falls within 0.78 of the larger of the two
 spreads (Ω~IOV~ 0.035458 vs 0.035538).
 
+Both anchors fit one dataset against NONMEM. A recovery check, fitting
+simulated IOV data and comparing `imp` / `impmap` against SAEM and FOCEI on
+the known truth, has not been run yet
+([#2596](https://github.com/FeRx-NLME/ferx-core/issues/2596)).
+
 ## Validation against NONMEM
 
 On the bundled warfarin example (1-cpt oral, proportional error, 3 mu-referenced
@@ -366,8 +371,11 @@ when it applies, the measured effect, and the warnings it carries.
 
 ## Not yet supported
 
-- **IOV together with a `[mixture]` block**, and **nested variability levels**
-  (`level … by … in …`) — refused; use FOCE / FOCEI.
+- **IOV together with a `[mixture]` block** — refused with
+  `E_IMP_MIXTURE_IOV_UNSUPPORTED`; use SAEM or FOCEI (see
+  [Inter-occasion variability](#impmap-iov)).
+- **Nested variability levels** (`level … by … in …`) — refused; use FOCE /
+  FOCEI.
 - **SDE / `[diffusion]`** — refused for the same reason `imp` refuses them (the
   EKF process-noise variance is not threaded through the IS observation
   likelihood). Use FOCE / FOCEI.
