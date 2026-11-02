@@ -7,7 +7,8 @@
 # moves TVE0 by the closed-form shift TVE0 += gamma * mean(eta). TVE0's lower bound
 # of 0 packs it as log(TVE0), so the shift runs on the natural scale. The NONMEM
 # twin is saem_additive_mu.ctl (MU_1 = THETA(1), E0 = MU_1 + ETA(1)).
-# saem_additive_mu_inline.ferx is this model with E0 folded into BASE, the
+# saem_additive_mu_inline.ferx is this model with E0 folded into BASE, the same
+# mu-reference written on one line (#2544); saem_additive_mu_shared.ferx is the
 # non-mu-referenced control.
 
 [parameters]

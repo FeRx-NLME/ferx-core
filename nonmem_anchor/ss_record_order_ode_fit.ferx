@@ -1,0 +1,23 @@
+# ODE twin of ss_record_order_fit.ferx (#2510): the same one-compartment system written as
+# `[odes]`, so the record-order rule is checked on the ODE engines as well as the closed form.
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  sigma ADD ~ 1.0
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ additive(ADD)
+[fit_options]
+  method = foce
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

@@ -461,7 +461,8 @@ fn adaptive_refusals_carry_their_codes() {
         seed: Some(1),
         ..Default::default()
     };
-    // An IOV twin of `ode`: `auc_target` still refuses a decision-window κ (#943).
+    // An IOV twin of `ode`. Since #943 `auc_target` is accepted under IOV, and since the
+    // #932 follow-up so is a base regimen × EVID=3 reset: the two together must run.
     let ode_iov = parse_model_string(
         &ODE_ADAPTIVE
             .replace(
@@ -471,6 +472,20 @@ fn adaptive_refusals_carry_their_codes() {
             .replace("exp(ETA_CL)", "exp(ETA_CL + KAPPA_CL)"),
     )
     .expect("parse");
+    let mut base_reset_iov = observed("1", &[1.0, 40.0]);
+    base_reset_iov.reset_times = vec![30.0];
+    let base_reset_iov = population_of(vec![base_reset_iov], &[]);
+    let ok = from_spec(
+        &ode_iov,
+        &base_reset_iov,
+        &|s| s.auc_target = Some((300.0, 500.0)),
+        seeded(),
+    );
+    assert!(
+        ok.is_ok(),
+        "from_spec, auc_target on an IOV model with a base regimen × reset must run: {:?}",
+        ok.err()
+    );
     check_rows(vec![
         row(
             "simulate_adaptive, no [odes]",
@@ -536,6 +551,23 @@ fn adaptive_refusals_carry_their_codes() {
              block's `observe`; leave `opts.monitors` empty",
         ),
         row(
+            "from_spec, start_interval also set",
+            from_spec(
+                &ode,
+                &pop,
+                &none,
+                AdaptiveSimulateOptions {
+                    start_interval: Some(24.0),
+                    ..seeded()
+                },
+            ),
+            "E_ADAPTIVE_OPTIONS",
+            None,
+            "simulate_adaptive_from_spec takes its dosing interval from the \
+             [adaptive_dosing] block's `intervals` / `start_interval`; leave \
+             `opts.start_interval` empty",
+        ),
+        row(
             "from_spec, no [odes]",
             from_spec(&iv, &pop, &none, seeded()),
             "E_ADAPTIVE_UNSUPPORTED",
@@ -594,22 +626,6 @@ fn adaptive_refusals_carry_their_codes() {
             "simulate_adaptive_from_spec: [adaptive_dosing] `observe` references \
              covariate(s) not found in data (case-sensitive): WT. Available covariate \
              columns: (none).",
-        ),
-        row(
-            "from_spec, auc_target on an IOV model",
-            from_spec(
-                &ode_iov,
-                &pop,
-                &|s| s.auc_target = Some((300.0, 500.0)),
-                seeded(),
-            ),
-            "E_ADAPTIVE_UNSUPPORTED",
-            None,
-            "adaptive-dosing `auc_target` is not yet supported for \
-             time-varying-covariate, TIME-in-PK, or IOV (`kappa`) subjects: its \
-             per-occasion exposure integral is not yet validated against an external \
-             reference. Drop `auc_target` (all other outputs remain per-event / \
-             per-occasion aware), or track #943.",
         ),
     ]);
 }
@@ -692,8 +708,8 @@ fn next_up(t: f64) -> f64 {
 /// entry by #1983: their code, block and whole text, and — the reason they moved — that
 /// each is raised **before any subject is simulated**. The controller factory is called
 /// once per (subject, replicate) just before the driver runs, so a row whose factory count
-/// is not 0 reached a subject first. That is what the driver-side check did: on the
-/// base × reset row subject '1' is valid and would run, and only subject '2' is refused.
+/// is not 0 reached a subject first. (Base × reset under IOV, the one per-subject row, left
+/// this table when the #932 follow-up lifted it; it is an accepting row below.)
 ///
 /// Each predicate is also asserted from its accepting side, in the same test, so a check
 /// stuck on "refuse" (or a gate deleted) reddens it.
@@ -762,16 +778,6 @@ fn adaptive_entry_refusals_simulate_no_subject() {
     let spec_dv_cmt2 = spec_on(2);
 
     let rows = vec![
-        row(
-            "base regimen × EVID=3 under IOV",
-            run("base × reset", &iov, &two, schedule(vec![0.0, 24.0])),
-            "E_ADAPTIVE_UNSUPPORTED",
-            None,
-            "subject '2': a pre-scheduled base regimen combined with system resets (EVID=3/4) \
-             is not yet supported under time-varying covariates or inter-occasion \
-             variability; #932 supports base × reset on the constant-covariate path only \
-             (time-varying-covariate / IOV base × reset is a follow-up)",
-        ),
         row(
             "max_decisions",
             run(
@@ -843,6 +849,16 @@ fn adaptive_entry_refusals_simulate_no_subject() {
             run("ok: base × reset", &ode, &two, schedule(vec![0.0, 24.0])).err(),
         ),
         (
+            "base × reset under IOV (#932 follow-up)",
+            run(
+                "ok: base × reset, IOV",
+                &iov,
+                &two,
+                schedule(vec![0.0, 24.0]),
+            )
+            .err(),
+        ),
+        (
             "two decisions under max_decisions = 2",
             run(
                 "ok: max_decisions",
@@ -898,7 +914,7 @@ fn adaptive_entry_refusals_simulate_no_subject() {
     // makes the zero above a measurement rather than a constant.
     for (name, n) in &counts {
         let want = match *name {
-            "ok: base × reset" => 2,
+            "ok: base × reset" | "ok: base × reset, IOV" => 2,
             n if n.starts_with("ok: ") => 1,
             _ => 0,
         };

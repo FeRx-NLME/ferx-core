@@ -157,8 +157,8 @@ pub(crate) fn propensity_input(message: impl Into<String>) -> EngineError {
 
 /// `E_ADAPTIVE_UNSUPPORTED`: a model the adaptive-dosing driver cannot simulate
 /// faithfully — no `[odes]` block, an SDE, a covariate-selected `[error_model]`, a
-/// residual `correlation` line — or an `auc_target` on a subject whose exposure metric
-/// it cannot integrate exactly. Once the driver runs (#1983): a base regimen it cannot
+/// residual `correlation` line — or a base regimen × EVID=3/4 reset under a time-varying
+/// covariate or IOV. Once the driver runs (#1983): a base regimen it cannot
 /// replay under a time-varying covariate or IOV, a non-finite break time, or a dose
 /// clock the RHS reads before any dose. `block` is the block at fault, when one is.
 pub(crate) fn adaptive_unsupported(block: Option<&str>, message: impl Into<String>) -> EngineError {

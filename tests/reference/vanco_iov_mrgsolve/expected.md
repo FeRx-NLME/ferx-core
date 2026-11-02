@@ -25,10 +25,9 @@ occasion's CL (end-of-interval convention ferx's per-segment IOV PK uses). The
 per-occasion κ swings CL across the horizon, so the controller re-titrates each
 day off the trough it observes.
 
-`auc_target` is intentionally absent: its exposure metric integrates a dense grid
-from a single frozen PK snapshot, which is silently wrong when CL switches per
-occasion, so it is a typed error for an IOV (`kappa`) subject (#701). The
-pct-in-window trough metric (`target_window`) is per-occasion aware and retained.
+`auc_target` is supported here since #943: each window is integrated under the
+per-occasion CL its trajectory runs under. The per-window AUC24 below is its
+reference; the pct-in-window trough metric (`target_window`) is retained.
 
 ## Realized ladder (ferx doses + reconstructed κ, mrgsolve troughs)
 
@@ -53,3 +52,23 @@ ferx (`tests/adaptive_vanco_iov_anchor.rs`) reconstructs the same per-occasion �
 computes its troughs live (RK45), and asserts they match these mrgsolve troughs
 (LSODA) to a small cross-solver tolerance. Both engines integrate the identical
 piecewise-constant CL, so the whole trough trajectory agrees.
+
+## Per-window AUC24
+
+The area under CENT/V over each closed inter-decision window, from an AUC compartment (dxdt_AUC = CENT/V) reset at the start of each window (mrgsolve 2.0.1). It is the external reference for `auc_target` (#943).
+
+| window | days [t0,t1] (h) | AUC24 (mg*h/L) |
+|---:|---:|---:|
+| 0 | [0, 24] | 117.894224 |
+| 1 | [24, 48] | 172.322318 |
+| 2 | [48, 72] | 185.623432 |
+| 3 | [72, 96] | 254.258103 |
+| 4 | [96, 120] | 398.101469 |
+| 5 | [120, 144] | 348.818476 |
+| 6 | [144, 168] | 452.808855 |
+| 7 | [168, 192] | 399.534846 |
+| 8 | [192, 216] | 547.645310 |
+| 9 | [216, 240] | 591.129975 |
+| 10 | [240, 264] | 650.768225 |
+| 11 | [264, 288] | 623.777441 |
+| 12 | [288, 312] | 504.594452 |

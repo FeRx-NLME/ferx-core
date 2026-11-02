@@ -96,13 +96,15 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/outer_optimizer.rs",
-        15,
+        13,
         "the outer optimizer and objective, run on a stage's options; \
-         `warm_ebe_start_check` (#2097) runs on the Gauss–Newton stage's options",
+         `warm_ebe_start_check` (#2097) runs on the Gauss–Newton stage's options \
+         (#2549: the built-in BFGS loop's two standalone `population_eta_dx` reads went \
+         with its separate mode-response pass)",
     ),
     (
         "src/estimation/profile.rs",
-        4,
+        3,
         "the profiled outer loop is a stage of the stage loop, on its stage options; the \
          profile solve's adjoint level gradient (#2109) differentiates the same stage objective",
     ),
@@ -110,6 +112,12 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "src/estimation/saem.rs",
         1,
         "the SAEM stage's final objective, on its stage options",
+    ),
+    (
+        "src/estimation/trace.rs",
+        1,
+        "`method_label` (#2552) resolves the flag itself, `interaction_for(options.method, \
+         options.interaction)`: the raw field is only the inherited value it passes in",
     ),
     (
         "src/estimation/vi/run.rs",

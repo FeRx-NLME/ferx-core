@@ -6107,8 +6107,13 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     let names = p.omega_iov.as_ref().unwrap().eta_names.clone();
     p.omega_iov = Some(OmegaMatrix::from_diagonal(&[0.04258], names));
     p.sigma.values = vec![0.0370648_f64.sqrt()];
+    // Unseeded (`InnerHessianSeed::None`): since #2549 a warm FOCE/FOCEI IOV solve is seeded
+    // with the Gauss–Newton metric, and that seeded re-solve reaches `tol` on this fixture
+    // without getting stuck (measured: no restart with the certificate off). The unseeded
+    // solve is the route every other IOV warm start takes (the non-FO-family stages, the
+    // L-BFGS route, `[covariate_nn]`, `FERX_NO_INNER_HESSIAN_SEED`).
     let solve = |s: &Subject, tol: f64, start: Option<&[f64]>| {
-        find_ebe_iov(
+        find_ebe_iov_seeded(
             &model,
             s,
             &p,
@@ -6118,6 +6123,7 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             None,
             EbeVariance::Conditional,
             false,
+            InnerHessianSeed::None,
         )
     };
     let flat = |r: &EbeResult| {
@@ -6127,7 +6133,7 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     };
     let run = |cert_off: bool| {
         STUCK_PARTIAL_CERT_OFF.with(|o| o.set(cert_off));
-        let out: Vec<(String, bool, f64, Vec<f64>, usize, bool)> = pop
+        let out: Vec<(String, bool, f64, Vec<f64>, usize)> = pop
             .subjects
             .iter()
             .filter(|s| !s.occasions.is_empty())
@@ -6137,14 +6143,7 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
                 let r = solve(s, TOL, Some(&start));
                 let nm = NM_FALLBACKS.with(|c| c.get()) - nm0;
                 assert!(r.converged, "subject {}: re-solve did not converge", s.id);
-                (
-                    s.id.clone(),
-                    r.used_fallback,
-                    r.nll,
-                    flat(&r),
-                    nm,
-                    r.resolution_certified,
-                )
+                (s.id.clone(), r.used_fallback, r.nll, flat(&r), nm)
             })
             .collect();
         STUCK_PARTIAL_CERT_OFF.with(|o| o.set(false));
@@ -6157,7 +6156,7 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
         "fixture premise: {} IOV solves",
         with.len()
     );
-    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize, bool)]| {
+    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize)]| {
         rs.iter()
             .filter(|r| r.4 > 0)
             .map(|r| r.0.clone())
@@ -6174,20 +6173,9 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
         restarts(&with),
         restarts(&without)
     );
-    // No restart ran, so none is reported; and the certificate never makes a point look *more*
-    // stationary than the restart did: one it certified only at the objective's resolution is
-    // `resolution_certified` (still off its mode to a `tol` consumer), one stationary to `tol`
-    // is neither.
-    let (mut cleared, mut at_resolution) = (0, 0);
+    // No restart ran, so none is reported.
     for (a, b) in with.iter().zip(&without) {
         assert!(!a.1, "subject {}: used_fallback with no restart run", a.0);
-        assert!(
-            !a.5 || b.1,
-            "subject {}: resolution_certified where the restart path had certified it",
-            a.0
-        );
-        cleared += usize::from(b.1 && !a.5);
-        at_resolution += usize::from(a.5);
         assert!(
             a.2.to_bits() == b.2.to_bits() && a.3 == b.3,
             "subject {}: the certificate returned NLL {} at {:?}, the restart NLL {} at {:?}",
@@ -6198,15 +6186,6 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             b.3
         );
     }
-    assert!(
-        cleared > 0,
-        "fixture premise: no certified point was stationary to tol"
-    );
-    // Dies when the call site never sets `resolution_certified`.
-    assert!(
-        at_resolution > 0,
-        "no point was certified only at resolution; the fixtures have both kinds"
-    );
 }
 
 /// #2497: `certifies_partial_at_mode` accepts only a search end point whose remaining Newton
@@ -6305,4 +6284,266 @@ fn the_iov_schedule_cache_is_bit_identical_and_declines_a_lagtime() {
         "premise: the fixture carries a lagtime"
     );
     assert!(cacheable_schedule_iov(&lagged, &pop.subjects[0]).is_none());
+}
+
+/// #2557: under `inner_optimizer = nelder_mead` a subject is reported converged only at a
+/// certified mode. The primary search's own end point used to set `converged` from NM's
+/// simplex spread, so every warfarin subject came back converged while sitting off its mode
+/// (‖∇‖ up to 0.88, `|Δη|` up to 1.7e-4 on `main`). Each converged NM EBE is compared with the default BFGS
+/// mode of the same subject, in η units: the Newton-step arm certifies within `tol` of the
+/// mode while allowing a large gradient on a stiff direction, so a gradient bound would
+/// test the wrong thing. Warfarin is closed form with the analytic inner gradient, so the
+/// certificate and the BFGS reference both run on the exact objective.
+#[test]
+fn nelder_mead_primary_reports_converged_only_at_its_mode() {
+    use crate::stats::likelihood::individual_nll;
+    use std::path::Path;
+    let model = crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+        .expect("warfarin parses");
+    let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    let p = &model.default_params;
+    let solve = |mode, s| {
+        let _armed = arm_inner_settings(InnerSettings { mode, warm: false });
+        find_ebe(&model, s, p, 200, 1e-5, None, None, 0)
+    };
+    let dist = |a: &DVector<f64>, b: &[f64]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, |m, d| {
+                assert!(d.is_finite(), "non-finite η");
+                m.max(d)
+            })
+    };
+    let (mut worst, mut raw_worst) = (0.0_f64, 0.0_f64);
+    for s in &pop.subjects {
+        let mode = solve(crate::types::InnerOptimizer::Auto, s);
+        assert!(mode.converged, "{}: the BFGS reference", s.id);
+        // NM's own stop from η = 0, the same search the primary runs: the fixture is one
+        // where that stop is not a mode, so certifying it is what moves the answer.
+        let obj = |x: &[f64]| individual_nll(&model, s, &p.theta, x, &p.omega, &p.sigma.values);
+        let mut raw = vec![0.0; model.n_eta];
+        nelder_mead_minimize(&obj, &mut raw, model.n_eta, 200, 1e-5);
+        raw_worst = raw_worst.max(dist(&mode.eta, &raw));
+        let nm = solve(crate::types::InnerOptimizer::NelderMead, s);
+        assert!(nm.converged, "{}: a certifiable NM stop is reported", s.id);
+        assert!(
+            !nm.used_fallback,
+            "{}: the primary search certified it",
+            s.id
+        );
+        worst = worst.max(dist(&mode.eta, nm.eta.as_slice()));
+    }
+    eprintln!("NM-certified vs BFGS mode: {worst:.3e}; raw NM stop: {raw_worst:.3e}");
+    assert!(worst <= NM_CERTIFIED_ETA_GAP, "{worst:.3e}");
+    assert!(
+        raw_worst > 10.0 * NM_CERTIFIED_ETA_GAP,
+        "the fixture's NM stop is already at its mode: {raw_worst:.3e}"
+    );
+}
+
+/// Worst `|η̂_NM − η̂_BFGS|∞` over warfarin's subjects for a certified Nelder–Mead EBE.
+/// Measured 4.771e-8 on macOS arm64, against 1.674e-4 for NM's own stop (the old
+/// `converged = true` point): 20× headroom, and 170× below the stop it must reject.
+const NM_CERTIFIED_ETA_GAP: f64 = 1e-6;
+
+/// #2571: [`FallbackCertifier::certify_moved`] says whether the certified point is the one
+/// handed in, decided on the bits rather than on which test fired. One case per way a point
+/// can be certified, plus the uncertified one:
+///
+/// * at the bowl's mode: the gradient test, unmoved → `AsGiven`;
+/// * the stiff bowl 1e-8 from its mode: the Newton test's step arm with **no** step taken →
+///   `AsGiven`;
+/// * the bowl `1e-4` from its mode: the Newton test **takes** its step (`1e-4 > tol`) and
+///   lands on the mode → `Moved`. This is the case that makes "certified by Newton" and
+///   "unmoved" different questions: labelling by test would call it unmoved;
+/// * the double well `(x² − 1)²` at `x = 0.3`, where `f'' < 0`: the Newton test declines (not
+///   positive definite) and the BFGS polish reaches `x = 1` → `Moved`;
+/// * the plane: nothing certifies → `None`, unmoved.
+#[test]
+fn certify_moved_names_a_moved_point_whichever_test_moved_it() {
+    let _cold = arm_inner_settings(InnerSettings::default());
+    let tol = 1e-5;
+    let bowl = |x: &[f64]| 50.0 * (x[0] - 1.0).powi(2);
+    let bowl_grad = |x: &[f64]| vec![100.0 * (x[0] - 1.0)];
+    let stiff = |x: &[f64]| 0.5e10 * (x[0] - 1.0).powi(2);
+    let stiff_grad = |x: &[f64]| vec![1e10 * (x[0] - 1.0)];
+    let well = |x: &[f64]| (x[0] * x[0] - 1.0).powi(2);
+    let well_grad = |x: &[f64]| vec![4.0 * x[0] * (x[0] * x[0] - 1.0)];
+    let plane = |x: &[f64]| 1e-2 * x[0];
+    let plane_grad = |_: &[f64]| vec![1e-2];
+
+    let mut x = vec![1.0];
+    assert_eq!(
+        exact_cert(&bowl_grad, 1, 50, tol).certify_moved(&bowl, &mut x),
+        Some(Certified::AsGiven),
+        "the gradient test"
+    );
+    assert_eq!(x, vec![1.0]);
+
+    let start = vec![1.0 + 1e-8];
+    let mut x = start.clone();
+    assert_eq!(
+        exact_cert(&stiff_grad, 1, 50, tol).certify_moved(&stiff, &mut x),
+        Some(Certified::AsGiven),
+        "the Newton test, no step taken"
+    );
+    assert_eq!(x, start);
+
+    let start = vec![1.0 + 1e-4];
+    assert!(
+        bowl_grad(&start)[0].abs() > 10.0 * tol,
+        "fixture: the gradient test fails"
+    );
+    let mut x = start.clone();
+    assert_eq!(
+        exact_cert(&bowl_grad, 1, 50, tol).certify_moved(&bowl, &mut x),
+        Some(Certified::Moved),
+        "the Newton test took its step"
+    );
+    assert!(x != start && bowl_grad(&x)[0].abs() < tol, "{x:?}");
+
+    let start = vec![0.3];
+    assert!(
+        12.0 * start[0] * start[0] - 4.0 < 0.0,
+        "fixture: f'' < 0, so the Newton test declines"
+    );
+    let mut x = start.clone();
+    assert_eq!(
+        exact_cert(&well_grad, 1, 50, tol).certify_moved(&well, &mut x),
+        Some(Certified::Moved),
+        "the BFGS polish"
+    );
+    assert!((x[0] - 1.0).abs() < 1e-4, "{x:?}");
+
+    let mut x = vec![0.0];
+    assert_eq!(
+        exact_cert(&plane_grad, 1, 50, tol).certify_moved(&plane, &mut x),
+        None
+    );
+    assert_eq!(x, vec![0.0], "an uncertified point is returned unchanged");
+}
+
+/// #2571: under `inner_optimizer = nelder_mead`, `EbeResult::nm_polished` marks exactly the
+/// subjects whose Nelder–Mead stop the certificate had to move, and `InnerLoopStats` counts
+/// them apart from `n_fallback`. On warfarin at `inner_tol = 1e-3` the fixture straddles:
+/// measured 2 of 10 subjects moved and 8 certified where NM stopped (macOS arm64; at
+/// `1e-5` all 10 move, so that tolerance would leave the unmoved side empty). Per subject,
+/// the flag is checked against what it claims: the returned η differs from NM's own stop
+/// (the same search from η = 0, re-run here) exactly when it is set. Under the default
+/// optimizer no subject is flagged.
+#[test]
+fn nelder_mead_primary_flags_the_subjects_the_certificate_moved() {
+    use crate::stats::likelihood::individual_nll;
+    use std::path::Path;
+    let model = crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+        .expect("warfarin parses");
+    let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    let p = &model.default_params;
+    let (max_iter, tol) = (200, 1e-3);
+    let nm_mode = || {
+        arm_inner_settings(InnerSettings {
+            mode: crate::types::InnerOptimizer::NelderMead,
+            warm: false,
+        })
+    };
+    let (mut moved, mut as_given) = (0, 0);
+    for s in &pop.subjects {
+        let obj = |x: &[f64]| individual_nll(&model, s, &p.theta, x, &p.omega, &p.sigma.values);
+        let mut stop = vec![0.0; model.n_eta];
+        nelder_mead_minimize(&obj, &mut stop, model.n_eta, max_iter, tol);
+        let nm = {
+            let _armed = nm_mode();
+            find_ebe(&model, s, p, max_iter, tol, None, None, 0)
+        };
+        assert!(nm.converged && !nm.used_fallback, "{}: fixture", s.id);
+        let differs = nm
+            .eta
+            .iter()
+            .zip(&stop)
+            .any(|(a, b)| a.to_bits() != b.to_bits());
+        assert_eq!(
+            nm.nm_polished,
+            differs,
+            "{}: flagged {} but the returned η {} NM's stop",
+            s.id,
+            nm.nm_polished,
+            if differs { "differs from" } else { "is" }
+        );
+        if nm.nm_polished {
+            moved += 1;
+        } else {
+            as_given += 1;
+        }
+        let _auto = arm_inner_settings(InnerSettings::default());
+        assert!(
+            !find_ebe(&model, s, p, max_iter, tol, None, None, 0).nm_polished,
+            "{}: flagged under the default optimizer",
+            s.id
+        );
+    }
+    eprintln!("warfarin, nelder_mead at tol {tol:e}: {moved} moved, {as_given} as given");
+    assert!(
+        moved > 0 && as_given > 0,
+        "no straddle: {moved} moved, {as_given} as given"
+    );
+
+    // The loop fans out over rayon, so the setting reaches its workers through a fit scope,
+    // not the calling thread's guard.
+    let stats = |nm: bool| {
+        let opts = crate::types::FitOptions {
+            inner_optimizer: if nm {
+                crate::types::InnerOptimizer::NelderMead
+            } else {
+                crate::types::InnerOptimizer::Auto
+            },
+            ..Default::default()
+        };
+        crate::api::with_fit_scope(&opts, || run_inner_loop(&model, &pop, p, max_iter, tol).2)
+            .expect("the scope builds")
+    };
+    let s = stats(true);
+    assert_eq!((s.n_nm_polished, s.n_fallback), (moved, 0), "{s:?}");
+    assert_eq!(stats(false).n_nm_polished, 0);
+}
+
+/// #2571, the reported count: a short warfarin FOCE fit under `inner_optimizer =
+/// nelder_mead` sums the moved subjects of every inner loop into
+/// `FitResult::total_ebe_nm_polished`, apart from `total_ebe_fallbacks`; under the default
+/// optimizer the count is 0. At `inner_tol = 1e-5` every warfarin NM stop needs the move
+/// (measured 10 of 10 per loop), so any evaluation contributes.
+#[test]
+fn a_nelder_mead_fit_reports_the_moved_subjects() {
+    use crate::types::{EstimationMethod, FitOptions, InnerOptimizer, Optimizer};
+    use std::path::Path;
+    let model = crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+        .expect("warfarin parses");
+    let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    let run = |inner_optimizer| {
+        let opts = FitOptions {
+            method: EstimationMethod::Foce,
+            interaction: false,
+            optimizer: Optimizer::Bobyqa,
+            inner_optimizer,
+            inner_tol: 1e-5,
+            outer_maxiter: 2,
+            run_covariance_step: false,
+            verbose: false,
+            threads: Some(1),
+            ..Default::default()
+        };
+        crate::fit(&model, &pop, &model.default_params, &opts).expect("fit")
+    };
+    let nm = run(InnerOptimizer::NelderMead);
+    let auto = run(InnerOptimizer::Auto);
+    eprintln!(
+        "nelder_mead fit: {} moved, {} fallbacks",
+        nm.total_ebe_nm_polished, nm.total_ebe_fallbacks
+    );
+    assert!(nm.total_ebe_nm_polished > 0, "{}", nm.total_ebe_nm_polished);
+    assert_eq!(nm.total_ebe_fallbacks, 0, "fixture: no subject fell back");
+    assert_eq!(auto.total_ebe_nm_polished, 0);
 }

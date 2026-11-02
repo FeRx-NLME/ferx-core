@@ -1402,7 +1402,7 @@ fn test_ebe_result_converged_flag() {
         terminal_hessian: None,
         converged: true,
         used_fallback: false,
-        resolution_certified: false,
+        nm_polished: false,
         grad_norm: 0.0,
         nll: 1.5,
         kappas: Vec::new(),
@@ -1636,6 +1636,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
+                unseeded_iov_warm: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1700,6 +1701,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
+                unseeded_iov_warm: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1728,8 +1730,11 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
+                unseeded_iov_warm: false,
             },
             true,
+            None,
+            None,
         )
         .expect("premise: the seed is in scope on this fixture");
         assert_ne!(
@@ -1803,6 +1808,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         twin_seed: false,
         init_is_mode: false,
         keep_certified_start: false,
+        unseeded_iov_warm: false,
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)
@@ -1841,6 +1847,8 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
             schedule.as_ref(),
             policy(InnerHessianSeed::GaussNewton),
             true,
+            None,
+            None,
         )
         .expect("premise: the seed is in scope");
         assert!(
@@ -1918,7 +1926,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             terminal_hessian: None,
             converged: false, // unconverged
             used_fallback: false,
-            resolution_certified: false,
+            nm_polished: false,
             grad_norm: 0.0,
             nll: 1.0,
             kappas: Vec::new(),
@@ -1932,7 +1940,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             terminal_hessian: None,
             converged: false, // also unconverged
             used_fallback: true,
-            resolution_certified: false,
+            nm_polished: false,
             grad_norm: 0.0,
             nll: 2.0,
             kappas: Vec::new(),
@@ -1967,7 +1975,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
         terminal_hessian: None,
         converged: false,
         used_fallback: false,
-        resolution_certified: false,
+        nm_polished: false,
         grad_norm: 0.0,
         nll: 1.0,
         kappas: Vec::new(),
@@ -6733,7 +6741,7 @@ fn exact_search_stuck_counts_only_consecutive_exact_non_moves() {
 }
 
 /// #2497: both inner drivers give up on an exact objective whose accepted steps no longer move
-/// it, its iterate or its gradient, and say so ([`SearchExit::Stuck`]), instead of repeating the
+/// it, its iterate or its gradient, and say so ([`InnerExit::Stuck`]), instead of repeating the
 /// same non-move to `max_iter`. Fixture: a constant objective with a constant gradient of norm
 /// ~1e-7 and a `1e-20` metric (`precond`), so every step is ~1e-27 — the shape measured at
 /// `inner_tol = 1e-10` next to an IOV mode, where the Armijo slack `c1·α·∇f·d` is below ulp(f),
@@ -6784,7 +6792,7 @@ fn inner_drivers_stop_on_repeated_exact_non_moves() {
             )
         };
         let name = if dense { "dense BFGS" } else { "L-BFGS" };
-        assert_eq!(exit, SearchExit::Stuck, "{name}");
+        assert_eq!(exit, InnerExit::Stuck, "{name}");
         assert!(
             grads.get() <= 4 * INNER_NON_MOVE_LIMIT as usize,
             "{name}: {} gradients for a search that cannot move (max_iter {MAX_ITER})",
@@ -6849,7 +6857,7 @@ fn inner_drivers_do_not_call_a_moving_gradient_stuck() {
             let name = if dense { "dense BFGS" } else { "L-BFGS" };
             assert_ne!(
                 exit,
-                SearchExit::Stuck,
+                InnerExit::Stuck,
                 "{name}: a gradient that {case} is moving"
             );
         }
@@ -6899,11 +6907,7 @@ fn inner_drivers_do_not_call_a_moving_iterate_stuck() {
             )
         };
         let name = if dense { "dense BFGS" } else { "L-BFGS" };
-        assert_ne!(
-            exit,
-            SearchExit::Stuck,
-            "{name}: the iterate moved to {x:?}"
-        );
+        assert_ne!(exit, InnerExit::Stuck, "{name}: the iterate moved to {x:?}");
         assert!(
             x[0] < -10.0,
             "{name}: fixture premise, the steps must move x, got {x:?}"
@@ -6955,7 +6959,7 @@ fn inner_drivers_do_not_call_a_cumulative_drift_stuck() {
         let name = if dense { "dense BFGS" } else { "L-BFGS" };
         assert_ne!(
             exit,
-            SearchExit::Stuck,
+            InnerExit::Stuck,
             "{name}: the iterate drifted to {x:?}"
         );
         assert!(
@@ -6965,15 +6969,13 @@ fn inner_drivers_do_not_call_a_cumulative_drift_stuck() {
     }
 }
 
-/// #2497: `certified_stuck_partial` certifies only a [`SearchExit::Stuck`] end point, and says
-/// whether it is stationary to `tol` or only at the objective's resolution. On the bowl
+/// #2497: `certified_stuck_partial` certifies only a [`InnerExit::Stuck`] end point. On the bowl
 /// `f = 1 + 50·(x − 1)²`, 1e-9 from its mode:
 /// - handed in as `Failed` (out of `max_iter`, no acceptable step), the same at-mode point is not
 ///   certified and does not move — the fallback and its cold-restart comparison keep it;
-/// - `Stuck` at `tol = 1e-12`: the Newton steps reach `‖∇‖ < tol`, so `Some(true)`;
-/// - `Stuck` at `tol = 0`, which no gradient norm can meet: the resolution arm certifies it,
-///   `Some(false)`, which the callers record as `resolution_certified` (`profile::off_mode`
-///   re-solves it, #2401) while `used_fallback` stays false — no restart ran.
+/// - `Stuck` at `tol = 1e-12`: certified, the Newton steps reaching `‖∇‖ < tol`;
+/// - `Stuck` at `tol = 0`, which no gradient norm can meet: certified by the resolution arm, as
+///   a Nelder–Mead fallback point would be (#2539) — no restart runs.
 #[test]
 fn certified_stuck_partial_takes_only_the_stuck_exit() {
     let bowl = |x: &[f64]| 1.0 + 50.0 * (x[0] - 1.0).powi(2);
@@ -6989,9 +6991,9 @@ fn certified_stuck_partial_takes_only_the_stuck_exit() {
     };
     let start = 1.0 + 1e-9;
     let mut failed = vec![start];
-    assert_eq!(
-        certified_stuck_partial(SearchExit::Failed, &cert(1e-12), &bowl, &mut failed),
-        None
+    assert!(
+        !certified_stuck_partial(InnerExit::Failed, &cert(1e-12), &bowl, &mut failed),
+        "a Failed exit is not certified"
     );
     assert_eq!(
         failed,
@@ -6999,15 +7001,16 @@ fn certified_stuck_partial_takes_only_the_stuck_exit() {
         "an uncertified point is left as it was"
     );
     let mut stuck = vec![start];
-    assert_eq!(
-        certified_stuck_partial(SearchExit::Stuck, &cert(1e-12), &bowl, &mut stuck),
-        Some(true)
-    );
+    assert!(certified_stuck_partial(
+        InnerExit::Stuck,
+        &cert(1e-12),
+        &bowl,
+        &mut stuck
+    ));
     assert!(bowl_grad(&stuck)[0].abs() < 1e-12, "at {stuck:?}");
     let mut at_resolution = vec![start];
-    assert_eq!(
-        certified_stuck_partial(SearchExit::Stuck, &cert(0.0), &bowl, &mut at_resolution),
-        Some(false),
+    assert!(
+        certified_stuck_partial(InnerExit::Stuck, &cert(0.0), &bowl, &mut at_resolution),
         "ended at {at_resolution:?}, ‖∇‖ = {:e}",
         bowl_grad(&at_resolution)[0].abs()
     );
@@ -7029,7 +7032,7 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     let (model, pop) = (prep.parsed.model, prep.population);
     let run = |cert_off: bool| {
         STUCK_PARTIAL_CERT_OFF.with(|o| o.set(cert_off));
-        let out: Vec<(String, bool, f64, Vec<f64>, usize, bool)> = pop
+        let out: Vec<(String, bool, f64, Vec<f64>, usize)> = pop
             .subjects
             .iter()
             .map(|s| {
@@ -7048,7 +7051,6 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
                     r.nll,
                     r.eta.iter().copied().collect(),
                     nm,
-                    r.resolution_certified,
                 )
             })
             .collect();
@@ -7057,7 +7059,7 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     };
     let without = run(true);
     let with = run(false);
-    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize, bool)]| {
+    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize)]| {
         rs.iter()
             .filter(|r| r.4 > 0)
             .map(|r| r.0.clone())
@@ -7074,20 +7076,9 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
         restarts(&with),
         restarts(&without)
     );
-    // No restart ran, so none is reported; and the certificate never makes a point look *more*
-    // stationary than the restart did: one it certified only at the objective's resolution is
-    // `resolution_certified` (still off its mode to a `tol` consumer), one stationary to `tol`
-    // is neither.
-    let (mut cleared, mut at_resolution) = (0, 0);
+    // No restart ran, so none is reported.
     for (a, b) in with.iter().zip(&without) {
         assert!(!a.1, "subject {}: used_fallback with no restart run", a.0);
-        assert!(
-            !a.5 || b.1,
-            "subject {}: resolution_certified where the restart path had certified it",
-            a.0
-        );
-        cleared += usize::from(b.1 && !a.5);
-        at_resolution += usize::from(a.5);
         assert!(
             a.2.to_bits() == b.2.to_bits() && a.3 == b.3,
             "subject {}: the certificate returned NLL {} at {:?}, the restart NLL {} at {:?}",
@@ -7098,22 +7089,15 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             b.3
         );
     }
-    assert!(
-        cleared > 0,
-        "fixture premise: no certified point was stationary to tol"
-    );
-    // Dies when the call site never sets `resolution_certified`.
-    assert!(
-        at_resolution > 0,
-        "no point was certified only at resolution; the fixtures have both kinds"
-    );
 }
 
 /// #2497: a FREM solve stuck at its mode still takes the Nelder–Mead restart — the FREM arm's
 /// restart is what re-centres the proposal (#1349), so `find_ebe` leaves FREM out of
 /// `certified_stuck_partial`. Fixture: `frem_model_and_subject` with `TV_WT = 72` (so the
-/// covariate η sits 18 from zero), solved cold at `1e-10`, where its search ends `Stuck`
-/// (measured: one stuck exit). Asserts the premise (a stuck exit happened), that the FREM
+/// covariate η sits 18 from zero), solved at `1e-5` and re-solved from that mode at `1e-10`, the
+/// verification leg's shape, where its search ends `Stuck` (measured: one stuck exit). Since
+/// #2549 the cold `1e-10` solve this used to take converges without getting stuck at this
+/// `TV_WT` (measured: 0 stuck exits), so the fixture is warm. Asserts the premise (a stuck exit happened), that the FREM
 /// Nelder–Mead recovery actually ran (counted, not read off `used_fallback`), and that the solve
 /// reports it; dies when the FREM exclusion is dropped or the restart is skipped.
 #[test]
@@ -7122,9 +7106,14 @@ fn frem_solve_stuck_at_its_mode_keeps_the_nelder_mead_restart() {
     let (model, subject) = frem_model_and_subject();
     let mut params = model.default_params.clone();
     params.theta[2] = 72.0;
+    let start: Vec<f64> = find_ebe(&model, &subject, &params, 200, 1e-5, None, None, 0)
+        .eta
+        .iter()
+        .copied()
+        .collect();
     STUCK_EXITS.with(|c| c.set(0));
     let nm0 = NM_FALLBACKS.with(|c| c.get());
-    let r = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
+    let r = find_ebe(&model, &subject, &params, 200, 1e-10, Some(&start), None, 0);
     let stuck = STUCK_EXITS.with(|c| c.get());
     let restarts = NM_FALLBACKS.with(|c| c.get()) - nm0;
     assert!(
@@ -7173,4 +7162,113 @@ fn the_terminal_jacobian_from_the_last_gradient_is_the_fresh_one() {
             fresh
         );
     }
+}
+
+/// A predicted start whose objective is undefined starts at the mode it was predicted from,
+/// and a solve that fails outright is retried there (#2549 review r2 #3): the two decisions,
+/// on every kind of value the objective can report. A usable start is kept and a usable end
+/// is not a failure, so the fallback changes nothing where a prediction works.
+#[test]
+fn an_unusable_predicted_start_or_end_takes_the_mode() {
+    use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
+    let fallback = [0.1, -0.2];
+    for (at_start, replaced) in [
+        (f64::NAN, true),
+        (f64::INFINITY, true),
+        (SUBJECT_SENTINEL_NLL, true),
+        (2.0 * SUBJECT_SENTINEL_NLL, true),
+        (3.5e7, false),
+        (-24.07, false),
+    ] {
+        let mut eta = [40.0, 40.0];
+        start_at_fallback_if_unusable(at_start, &mut eta, &fallback);
+        assert_eq!(eta == fallback, replaced, "start objective {at_start:e}");
+        let end = EbeResult {
+            eta: DVector::from_vec(vec![0.0; 2]),
+            h_matrix: DMatrix::zeros(0, 2),
+            terminal_hessian: None,
+            converged: false,
+            used_fallback: true,
+            nm_polished: false,
+            grad_norm: 1.0,
+            nll: at_start,
+            kappas: Vec::new(),
+            hard_reject: false,
+            screen_moved: false,
+            twin_moved: false,
+        };
+        // Unconverged and rescued by Nelder–Mead is not an outright failure (on an ODE model
+        // that is the gradient-noise floor at a genuine mode); only the objective decides.
+        assert_eq!(solve_failed(&end), replaced, "end objective {at_start:e}");
+        assert!(solve_failed(&EbeResult {
+            hard_reject: true,
+            nll: -24.07,
+            ..end
+        }));
+    }
+}
+
+/// The inner solve is robust to a wildly extrapolated predicted start (#2549 review r2 #3):
+/// from `η = ±1000` on one warfarin subject — far past any first-order step a line search
+/// makes — it returns the solve from the subject's mode, to rounding, with no Nelder–Mead
+/// recovery; the other subjects are bit-identical to the plain pass. So the prediction needs
+/// no bound for the inner solve's sake, and the fallback above is reserved for an objective
+/// that is undefined at the start.
+#[test]
+fn an_extrapolated_predicted_start_still_reaches_the_mode() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin parses");
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("data loads");
+    let params = &model.default_params;
+    let (modes, _, _, _) = run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, None, 0, 0);
+    let policy = InnerSolvePolicy::default();
+    let outcome = |_: &Subject, e: &EbeResult| {
+        (
+            e.used_fallback,
+            std::iter::once(e.nll)
+                .chain(e.eta.iter().copied())
+                .collect::<Vec<f64>>(),
+        )
+    };
+    let from_modes = run_inner_loop_warm_map(
+        &model,
+        &pop,
+        params,
+        500,
+        1e-8,
+        Some(&modes),
+        None,
+        0,
+        0,
+        policy,
+        None,
+        outcome,
+    )
+    .4;
+    let mut worst = 0.0f64;
+    for far in [-1e3, 1e3] {
+        let mut predicted = modes.clone();
+        predicted[2].fill(far);
+        let (_, _, _, _, got) = run_inner_loop_predicted_map_cached(
+            &model, &pop, params, 500, 1e-8, &predicted, &modes, None, 0, 0, None, policy, None,
+            outcome,
+        );
+        assert!(!got[2].0, "η = {far}: no Nelder–Mead recovery needed");
+        for (&a, &b) in got[2].1.iter().zip(&from_modes[2].1) {
+            assert!(a.is_finite() && b.is_finite(), "η = {far}: {a} vs {b}");
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+        }
+        for i in (0..pop.subjects.len()).filter(|&i| i != 2) {
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got[i].1), bits(&from_modes[i].1), "subject {i} moved");
+        }
+    }
+    eprintln!("extrapolated start vs the solve from the mode: {worst:.3e}");
+    // Measured 9.9e-14 (Linux x86_64): two converged searches of one mode, from different
+    // starts, stopped at `inner_tol = 1e-8`; 1e-10 leaves room for another path's rounding
+    // while a different mode would be O(1) away.
+    assert!(worst < 1e-10, "extrapolated start vs the mode: {worst:.3e}");
 }

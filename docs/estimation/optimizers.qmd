@@ -329,14 +329,18 @@ The last item is needed. Started from the incumbent's own modes, a subject's inn
 back to Nelder–Mead at exactly that point and score it slightly below every neighbour, so the leg's
 first line search fails and gains nothing.
 
-A leg **settles** the stop when it lowered its own objective by at most 3e-5. From the second leg
-on, a leg also settles when it ended no further below the leg before it than the objective can
-resolve there. That resolution is measured, not chosen. The leg's first, cold-seeded score of its
-starting point is compared with the score the same point had at the end of the previous leg, at
-the same tolerance, and their gap is how much the objective disagrees with itself. A leg that ends
-lower than the last by less than that gap, or not lower at all, is measuring the noise, not a
-descent (#2482: on `ctmm_pd_2state` the second leg ended 7.5e-5 lower inside a 9.1e-5 gap, where
-the old `net ≤ 0` rule ran a third). Otherwise another leg runs, up to four. A settled stop is
+A leg **settles** the stop when it lowered its own objective by at most 3e-5. The first leg also
+settles when it lowered it by at most 1e-3, the objective's noise floor (#2507): it ran to its own
+stop at the tight tolerance, which is what the leg exists to provide, and a second leg from there
+gained nothing in any measured case (at most 8.1e-9 on all 16 A2 starts that took one). From the
+second leg on, a leg also settles when it ended no further below the lowest leg before it than the
+objective can resolve there. That resolution is measured, not chosen. The leg's first, cold-seeded
+score of its starting point is compared with the score the same point had in the leg that found
+it, at the same tolerance, and their gap is how much the objective disagrees with itself. A leg that
+ends lower by less than that gap, or not lower at all, is measuring the noise, not a descent
+(#2482: on `ctmm_pd_2state` the second leg ended 7.5e-5 lower inside a 9.1e-5 gap, where the old
+`net ≤ 0` rule ran a third), and the fit keeps the lowest leg's point. Otherwise another leg runs,
+up to four. A settled stop is
 converged once the final cold re-solve reproduces it, as for the plateau check. Four legs that keep
 descending, or a spent `maxiter` budget, report `converged = false`, with a warning ("still
 improving after 4 verification legs").
@@ -356,6 +360,8 @@ evaluations to a 49-evaluation fit. The fit's reported OFV is still the final co
 re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather than the +4e-8 the
 leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) and mixtures do not take the leg.
 
+#### Inner searches stuck at their mode {#inner-search-stuck-at-mode}
+
 At `1e-10` many subjects' inner BFGS reach their mode before the objective can resolve the last
 decrease. Before #2497 each such solve repeated the same zero-gain step to `inner_maxiter`, then
 ran a Nelder–Mead restart that ended back at the same point. Now the search stops after five
@@ -363,9 +369,9 @@ accepted steps that leave the objective bit-for-bit unchanged and move the gradi
 most 1e-6 of its norm, while the steps together move the iterate by at most 1e-10 of its scale. If the
 Newton certificate then shows the point is at its mode, the solve counts as converged and skips
 the restart. A point the certificate accepts only because the objective can no longer resolve
-the remaining decrease, with its gradient still above `inner_tol`, is converged but not treated
-as a mode to `inner_tol`: a profiled fit's adjoint level gradient re-solves it, as it did when
-the restart certified such a point. The fallback count (`total_ebe_fallbacks`) counts only
+the remaining decrease, with its gradient still above `inner_tol`, is treated as a certified
+fallback point is: a profiled fit's adjoint level gradient keeps it, since the certificate
+bounds the error there. The fallback count (`total_ebe_fallbacks`) counts only
 restarts that ran. This applies to IOV and non-IOV subjects, but not to FREM,
 whose restart re-centres the proposal. A search that runs out of `inner_maxiter` or finds no
 acceptable step still takes the fallback.

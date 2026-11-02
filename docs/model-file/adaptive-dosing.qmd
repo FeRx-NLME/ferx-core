@@ -56,6 +56,8 @@ with the run, never with a fitted model's parameters.
 | `dose_bounds` | ✓ | Inclusive `[low, high]` clamp applied to every emitted dose. |
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. |
+| `intervals` | | Dosing-interval ladder `[d1, d2, …]`, strictly increasing and positive. Rules step it with `lengthen` / `shorten`. Requires `start_interval`. See [Changing the dosing interval](#changing-the-dosing-interval). |
+| `start_interval` | | The dosing interval in force from the first decision; one of `intervals`, and required with it. |
 | `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
 | `auc_target` | | Exposure band `[low, high]` for the **area under the monitored signal** over each inter-decision window (e.g. vancomycin AUC₂₄ when decisions are daily), used **only** to report the `auc_target_attainment` outcome metric — like `target_window` it does **not** influence dosing. `low` must be `≥ 0`; `high` may be `inf`. Declaring it makes the reactive driver integrate the signal over each window as it simulates — any pre-scheduled base regimen (#702) together with the realized controller doses, on the run's own trajectory; omit it to skip that integral and leave `auc_target_attainment` unreported. |
 | `with_assay_error` | signal¹ | Titrate on the **noised measurement** of a model output (named by `assay_cmt`) instead of a latent expression (default `false`). The signal's value comes from that output's `[scaling]` readout and its σ from that output's `[error_model]`, so the two are always on the same scale — there is no re-typed `observe` expression to mis-scale. Mutually exclusive with `observe`. |
@@ -111,6 +113,13 @@ most specific / most severe condition first. `<op>` is one of `< <= > >= ==`.
 | `increase` / `decrease` | Step one rung up / down a `levels` ladder. |
 | `hold` | Skip this decision's dose. |
 | `stop` | Discontinue all future dosing. |
+| `lengthen` / `shorten` | Step one rung up / down the `intervals` ladder. |
+
+A rule carries at most one **dose effect** (the first four rows) and at most one
+**interval effect** (`lengthen` / `shorten`), separated by a comma in either
+order: `when signal > 20 : decrease 25%, lengthen`. A rule with only an interval
+effect re-issues the running dose. `stop` cannot be combined with an interval
+effect.
 
 A dose change is clamped to `dose_bounds`; a level step saturates at the ends of
 the ladder. When no rule matches (or a matched rule has not yet `confirm`-ed),
@@ -243,6 +252,7 @@ declared *monitor* — and returns a list of [`DoseAction`]s:
 | `Infuse { amt, cmt, rate }` | Zero-order infusion; duration is `amt / rate`. |
 | `Hold` | Skip this decision — no dose now, the regimen continues. |
 | `Stop` | Discontinue all **future controller** dosing. An infusion already in flight runs to its scheduled end, and a pre-scheduled base regimen (#702) keeps dosing — `Stop` ends the controller's augmentation, not the patient's standing prescription. |
+| `SetInterval { interval }` | Change the dosing interval from this decision on (#945); see [Changing the dosing interval](#changing-the-dosing-interval). Composes with one dose or `Hold`. |
 
 A `Stop` must be the final action in a decision's list; issuing work after a
 `Stop` is a typed error, not a silently dropped dose.
@@ -286,6 +296,92 @@ the current rung of a titration ladder — and a single shared closure would lea
 that state from one subject to the next. The factory makes the isolation
 structural: a stateless rule is just a factory whose closure ignores its
 environment.
+
+## Changing the dosing interval
+
+The decision schedule (`decision_times`) is a fixed **review grid**: the times at
+which a decision *may* be taken. A controller can change how often it doses
+without changing that grid (#945). It holds a current **dosing interval**, and a
+grid point is **due** once that interval has passed since the last decision the
+controller was consulted at. The controller is consulted only at due points.
+
+- **Starting interval.** `AdaptiveSimulateOptions::start_interval` sets the
+  interval in force at the first decision. Left at `None` (the default), every
+  grid point is due, which is the behaviour without this feature.
+- **Changing it.** `DoseAction::SetInterval { interval }` takes effect from the
+  decision that issues it. On a q12 grid, lengthening from 24 to 36 at t = 24
+  makes the next due point t = 60. It composes with one dose or a `Hold`; two in
+  one decision, or one together with `Stop`, is refused.
+- **What counts as consulted.** A dose, a `Hold` (or an empty action list) and an
+  interval change all start the next interval: a hold at a due point consumes
+  that slot.
+- **The controller can read it.** `ctx.interval` is the interval in force before
+  the decision.
+
+### In the `[adaptive_dosing]` block
+
+The block declares the interval as a ladder, like `levels` for the dose, and its
+rules move along it:
+
+```
+[adaptive_dosing]
+  at             = every 12 from 0 to 336   # the review grid
+  intervals      = [12, 24, 36, 48]         # the interval ladder
+  start_interval = 24                       # in force from the first decision
+  when signal > 20 : decrease 25%, lengthen
+  when signal > 15 : lengthen
+  when signal < 10 : shorten
+```
+
+`lengthen` and `shorten` step one rung and saturate at both ends; a step at an
+end changes nothing. A rule with only an interval effect re-issues the running
+dose, and `hold, lengthen` skips the dose and lengthens. The `confirm` debounce
+gates both effects of a rule together, and its streak counts consulted decisions
+only, since the controller is not called at a not-due point. `intervals` and
+`start_interval` come together, and `lengthen` / `shorten` need both.
+
+On an `at = every S …` grid, every interval must be a whole multiple of `S`, or
+its due times would fall between review times; the parse error names the
+interval and the step. With an explicit `at` list that check is the run's: an
+off-grid due time is refused as described under
+[Grid alignment](#grid-alignment). The block is the only source of the interval
+on [`simulate_adaptive_from_spec()`]: setting `opts.start_interval` there is
+refused (`E_ADAPTIVE_OPTIONS`), as for `opts.decision_times`.
+
+### Not-due points
+
+At a grid point that is not due, the controller is not called and no dose is
+given, but the monitors are still read. The decision log records the point with
+the outcome `NotDue`, distinct from `Hold`, and with what the monitors read, so
+the signal summaries (`signal_min` / `signal_max` / `signal_mean`,
+`pct_time_in_window`) still cover every grid point. The metrics count these
+points as `n_not_due`, never as holds. Every decision-log row also carries the
+interval in force after it. `auc_target` windows stay the review-grid windows:
+with a q24 grid each window is a daily AUC, whatever the dosing interval.
+
+Data records never move the due clock. A pre-scheduled base dose (EVID=1), a
+reset (EVID=3) and a reset with a dose (EVID=4) are applied when they fall on a
+not-due point, and the controller is still not consulted there. A controller that
+wants to restart its interval after a reset can read `ctx.history` and issue
+`SetInterval`.
+
+### Grid alignment
+
+Every due time must land on a grid point, or past the last one: a dose cannot be
+scheduled between two review times. An interval is checked once, where it is
+set: every due time it produces from there to the end of the grid is walked,
+since until it changes each due point is consulted exactly when it falls due. A
+`start_interval` that would send one off the grid is refused before any subject
+runs (`E_ADAPTIVE_OPTIONS`). A `SetInterval` that does is refused at the decision
+that issued it (`E_ADAPTIVE_CONTROLLER_ACTION`), never at a later decision that
+took no interval action, naming the subject, the decision, the due time and the
+two grid points it falls between. An interval too short to move past its own
+decision within the grid's matching tolerance is refused the same way. A
+decision that stops schedules nothing and is never refused for its interval.
+
+**Known limit.** Not-due points do not consult the controller, so a safety rule
+is not evaluated between doses; a toxicity check that must act between doses is
+tracked as a follow-up under #391 (#1592).
 
 ## Monitors
 
@@ -400,7 +496,11 @@ The result bundles four tidy, long-form artifacts — each tagged by
   under the monitored signal falls in the `auc_target` band. The driver integrates it on
   the run's own trajectory: a 128-panel trapezoid per window read off the solver's
   accepted steps, plus a node on each side of every dose, reset or infusion end inside
-  the window, so a discontinuity integrates exactly; requesting it leaves the run
+  the window — and, under a time-varying covariate, `TIME` in the PK or IOV, every data
+  record, where the PK snapshot changes — so a discontinuity integrates exactly; each
+  segment is read under the PK, κ and covariate row of the record that governs it (the
+  `[scaling]` divisor keeps the baseline covariates, as `simulate()` does). Requesting it
+  leaves the run
   bit-identical (#943). It is scored over the windows between **realized**
   decisions, so if a run discontinues (a `Stop`) the later, dose-free scheduled
   windows are not counted — discontinuation is already its own metric, and folding
@@ -471,7 +571,15 @@ family. It is validated instead by:
   does do feedback dosing) — one for each titration mode: the discrete `levels`
   ladder, in [The platelet-ladder anchor](#the-platelet-ladder-anchor), and
   continuous (percentage) titration plus the AUC-exposure metric, in
-  [The vancomycin AUC-TDM anchor](#the-vancomycin-auc-tdm-anchor).
+  [The vancomycin AUC-TDM anchor](#the-vancomycin-auc-tdm-anchor);
+  and schedule adaptation (#945), in
+  [The vancomycin interval-extension anchor](#the-vancomycin-interval-extension-anchor).
+
+Schedule adaptation has one more internal oracle: a state-independent controller
+on a lengthened interval equals the static engine on the realized doses plus a
+zero-amount dose at every not-due grid point, bit for bit. The zero doses give the
+static engine the same segment breaks, and unlike the frozen replay this shares no
+code with the driver's break builder.
 
 ### The platelet-ladder anchor
 
@@ -505,7 +613,7 @@ exercised on every PR by `tests/adaptive_platelet_anchor.rs`.
 ### The vancomycin AUC-TDM anchor
 
 Continuous (percentage) titration **and** the `auc_target` exposure metric are
-cross-checked against **mrgsolve 1.7.2** on a vancomycin TDM scenario — a
+cross-checked against **mrgsolve 2.0.1** on a vancomycin TDM scenario — a
 1-compartment IV model dosed once daily by a 1-h infusion. At the start of each
 day the controller reads the pre-dose trough and titrates the dose ±25 % to hold
 the trough in `[10, 15]` mg/L (the control law), while the *reported* outcome is
@@ -523,18 +631,46 @@ the dose climbs (seven 25 % steps) and holds once the trough enters the band:
 | 7   | 12.1 | 2384 | 581 | **yes** |
 | 8–12| 12.9–13.2 | 2384 | 592–596 | **yes** |
 
-ferx reproduces every dose **exactly** (the titration is exact `f64` arithmetic
-shared with the R loop), every trough to a small cross-solver tolerance, and the
-AUC-target attainment fraction (**8 of 13 daily windows**) exactly. ferx
-integrates the daily exposure by a 128-panel trapezoid per window while mrgsolve
-uses an AUC compartment; the two agree to within 1.7e-5 relative on every one of the
-13 daily AUC₂₄ values, which the anchor asserts window by window, far inside the
+The anchor runs at a supplied η = 0, the typical-value patient mrgsolve
+simulates; the model's `omega ~ 1e-10` would otherwise draw an η of order 1e-5 on
+CL and offset every trough one-sidedly. ferx then reproduces every dose
+**exactly** (the titration is exact `f64` arithmetic shared with the R loop),
+every trough to within 5e-9 mg/L, and the AUC-target attainment fraction
+(**8 of 13 daily windows**) exactly. The worst trough gap, 1.0e-9 mg/L, is the
+mrgsolve table's own error: against the exact one-compartment closed form, ferx's
+troughs sit on it and the frozen LSODA values carry the whole gap. ferx integrates
+the daily exposure by a 128-panel trapezoid per window while mrgsolve uses an AUC
+compartment; the two agree to within 2.8e-6 relative on every one of the 13 daily
+AUC₂₄ values (all of it the trapezoid's own error), which the anchor asserts window
+by window, far inside the
 margin from each AUC₂₄ to the band edges, so the in/out classification — hence
 attainment — is identical. (The exact AUC accuracy is pinned separately by analytic
 unit tests against closed forms, including a bolus and a reset inside a window.) The
 model is `examples/adaptive_vanco_auc.ferx`; the mrgsolve model, R driver, and
 frozen output live in `tests/reference/vanco_mrgsolve/`, exercised on every
 PR by `tests/adaptive_vanco_anchor.rs`.
+
+### The vancomycin interval-extension anchor
+
+Schedule adaptation is cross-checked against **mrgsolve** on a 1-compartment IV
+vancomycin model with a fixed 1000 mg 1-h infusion and clearance scaled by a
+per-subject renal fraction. The review grid is every 12 h, and the controller
+moves the dosing interval on the ladder 12 / 24 / 36 / 48 h: at a due point it
+holds and lengthens above a trough of 25 mg/L, doses and lengthens above 14,
+doses and shortens below 9, and otherwise doses. The mrgsolve R loop applies the
+same due mask. Of the two subjects, one climbs to the top rung and holds there,
+and the other lengthens, shortens and lengthens again; both saturate at the
+bottom rung at the first decision. Every consulted trough is at least 0.13 mg/L
+from its nearest threshold, so the outcome (dosed / hold / not due) and the
+interval at every one of the 50 grid points match mrgsolve exactly, and the
+troughs agree within the cross-solver band. Each subject runs at a supplied
+η = 0, the typical-value patient mrgsolve simulates: the model's `omega ~ 1e-10`
+would otherwise draw an η large enough to show as a one-sided trough drift. The kit lives in
+`tests/reference/vanco_interval_mrgsolve/`, exercised on every PR by
+`tests/adaptive_vanco_interval_anchor.rs`. The same controller written as an
+`[adaptive_dosing]` block (`intervals = [12, 24, 36, 48]`, `hold, lengthen`,
+`lengthen`, `shorten`) reproduces the programmatic run bit for bit: ledger,
+decision log and trajectories.
 
 ## Model time in a reactive run
 
@@ -702,11 +838,10 @@ cannot see a failure in the solver itself.
   mrgsolve loading-dose runs (renal-decline #930, per-occasion κ #931). An `ADDL`-implied dose takes
   both from the record that governs it, and is no record for what a decision reads (#2371,
   #2528). A base regimen also
-  **composes with system resets** (EVID=3/4) on the constant-covariate path (since #932): the reset
-  zeros the state and turns off a base infusion opened before it, and an EVID=4 reset+dose row's dose
-  lands after its own reset — see *System resets* below. Still a typed error, never a silent
-  mis-integration of a delivered dose: a base regimen combined with a system reset **under a
-  time-varying covariate or IOV** (a #932 follow-up), and — under a time-varying covariate or IOV — a
+  **composes with system resets** (EVID=3/4), under constant covariates, time-varying covariates and
+  IOV alike (#932): the reset zeros the state and turns off a base infusion opened before it, and an
+  EVID=4 reset+dose row's dose lands after its own reset — see *System resets* below. Still a typed
+  error, never a silent mis-integration of a delivered dose: under a time-varying covariate or IOV, a
   steady-state, lagged, built-in input-rate, or modeled-`RATE` base dose (a #930 / #931 follow-up
   whose per-dose SS / lag / input-rate / rate-resolution bookkeeping the frozen-replay engine does
   not yet reproduce).
@@ -716,21 +851,19 @@ cannot see a failure in the solver itself.
   that changes over the horizon (e.g. declining renal function driving clearance)
   correctly drives CL/V/KA, the monitored signal, and every dose decision; the
   frozen-replay verifier validates the per-event bookkeeping. A model whose PK reads
-  the `TIME` built-in is covered the same way. *Caveat:* declaring `auc_target` on a
-  time-varying-covariate or `TIME`-in-PK subject is still a typed error: the
-  per-segment exposure integral is not yet validated against an external reference
-  (#943).
+  the `TIME` built-in is covered the same way, `auc_target` included (#943).
 - **System resets (EVID=3) are supported** — the reactive driver zeros the
   compartments at each reset time (re-seeding any `init(state)=expr`) and turns off
   controller-issued infusions opened before the reset, exactly as `predict()` /
   `simulate()` do on the event-driven path; the frozen-replay verifier is
-  reset-aware, so the reset is honored *and* checked each run. Since #932 a reset also composes with a
-  **pre-scheduled base regimen** on the constant-covariate path: it zeros the base regimen's state and
-  turns off a base infusion opened before it (the reset floor), and an **EVID=4** reset+dose row —
-  which records both a reset and a dose — reaches the adaptive path as a base dose landing *after* its
-  own reset (Reset < Dose), matching `predict()`. Base × reset under a time-varying covariate or IOV
-  stays a typed error (a #932 follow-up). `auc_target` composes with resets (#943): the
-  window that straddles a reset carries a node at the state the reset found and one at
+  reset-aware, so the reset is honored *and* checked each run. A reset also composes with a
+  **pre-scheduled base regimen** (#932): it zeros the base regimen's state and turns off a base
+  infusion opened before it (the reset floor), and an **EVID=4** reset+dose row — which records both a
+  reset and a dose — reaches the adaptive path as a base dose landing *after* its own reset
+  (Reset < Dose), matching `predict()`. Decision times are on the engine clock: a reset the reader
+  moves (one written inside a running infusion or `ADDL` train, #1609) moves every later row, and a
+  decision time names the moved clock. `auc_target` composes with resets (#943): the window that
+  straddles a reset carries a node at the state the reset found and one at
   the state it left, so the drop integrates exactly.
 - **Inter-occasion variability (IOV) is supported** — a fresh occasion `kappa` is
   drawn per **decision window** (occasion = decision index) and threaded through the
@@ -745,8 +878,9 @@ cannot see a failure in the solver itself.
   run (`tests/reference/vanco_renal_iov_mrgsolve/`). `kappa` is
   drawn on a dedicated per-(subject, replicate) substream (disjoint from the η and
   assay streams), so a non-IOV run is unchanged and enabling a `Dv` monitor never
-  shifts the draws. *Caveat:* as with time-varying covariates, `auc_target` on an IOV
-  model is still a typed error (#943).
+  shifts the draws. `auc_target` reads each segment under the κ it was integrated with
+  (#943), the governing record's: with records only at the decisions, a window carries
+  the **next** window's κ, as its trajectory does.
   Between-subject η is still drawn per subject/replicate; parameter-uncertainty
   propagation is a later layer.
 - **Deterministic ODE only** — a stochastic (`[diffusion]` / SDE) model is rejected

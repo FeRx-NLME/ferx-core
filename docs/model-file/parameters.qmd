@@ -803,7 +803,9 @@ the unprofiled one (#2136):
 - **Optimizer trace.** `optimizer_trace = true` writes one row per evaluation. The
   `val:` columns show the levels at their solved values. Their `grad:` columns are
   `NA`, because the optimizer does not search over the levels. The `method` column
-  names the objective the levels are solved under: `foce`, `focei` or `laplace`.
+  names the objective the levels are solved under: `foce`, `focei`, `laplace` or
+  `agq`. A quadrature stage is traced `laplace` at one node and `agq` above one,
+  `focei` with `n_agq > 1` included — the same labels as an unprofiled fit's trace.
 - **Per-subject gradient fallback.** If a subject cannot get the analytic outer
   gradient at some trial point, its finite-difference replacement re-solves its
   EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.
@@ -811,11 +813,13 @@ the unprofiled one (#2136):
   enough to stop the profiled L-BFGS early. The same holds inside the profile solve:
   a subject the adjoint cannot serve, or whose inner solve stopped short of its mode
   (the adjoint gradient is exact only at a mode), gets the re-solved central difference
-  for its level gradient. `W_PROFILE_FD_GRADIENT` gives the number of such subjects,
+  for its level gradient. A Nelder–Mead fallback counts as stopped short only when it
+  was not certified stationary; a certified one keeps the adjoint, as a converged
+  BFGS solve does (#2539). `W_PROFILE_FD_GRADIENT` gives the number of such subjects,
   once for the fit and once for the covariance step (#2109, #2405). The covariance step's exact level Hessians
   fall back the same way, with a warning of their own. A subject with fewer
   observations than `min_obs_for_convergence_check` whose inner solve stopped short
-  (or fell back to Nelder–Mead) still takes the re-solved differences, but these
+  (an uncertified Nelder–Mead fallback included) still takes the re-solved differences, but these
   warnings do not count it, as the fit's unconverged-EBE count does not (#2408).
 - **The log-packing floor.** A structural θ that the optimizer drives onto ferx's
   internal `1e-10` floor while the objective still falls as it rises is restarted from
@@ -940,14 +944,14 @@ every prediction as `c × block` plus terms that do not read it, with `c` taken 
 the data alone (`/ WPSE` is fine). Each of the following is refused, never fitted
 some other way:
 
-- the block reached through a function, a power, a state, a divisor, a parameter
-  coefficient, or an `if` whose condition reads more than data; two reads multiplied
-  or divided; read with a second profiled block; or read by no prediction at all
-  (`E_PROFILE_NOT_LINEAR`);
+- the block reached through a function (other than one logit link around the whole
+  prediction, see [Through a logit link](#through-a-logit-link)), a power, a state, a
+  divisor, a parameter coefficient, or an `if` whose condition reads more than data; two
+  reads multiplied or divided; read with a second profiled block; or read by no
+  prediction at all (`E_PROFILE_NOT_LINEAR`);
 - `FIX` on the block, which leaves nothing to solve, and a box that is a point, is
   empty or does not hold the init (see [Bounds on a profiled block](#bounds-on-a-profiled-block));
-- any method other than `foce`, `focei` or `laplace`, or a stage that asks for
-  `n_agq > 1` (judged per stage of a method chain), a non-additive or
+- any method other than `foce`, `focei` or `laplace`, a non-additive or
   log-transformed residual error, M3, a non-Gaussian endpoint,
   a `[mixture]`, `[diffusion]` or FREM model, `optimizer = trust_region` or `mma`,
   `global_search`, or a parameter prior (`E_PROFILE_SCOPE`).
@@ -956,8 +960,12 @@ Under `method = laplace` (one node) the levels minimise the Laplace objective th
 reports, with each subject scored by its own `½log|H|` term (#2107). The Newton step
 keeps the least-squares matrix. That matrix is exact for a model linear in its random
 effects, so such a model still profiles in one step, at the same levels as `focei`. On a
-model nonlinear in them it converges at the same rate as under `focei`. Adaptive
-quadrature (`n_agq > 1`) is not profiled yet.
+model nonlinear in them it converges at the same rate as under `focei`. Under adaptive
+quadrature (`n_agq > 1`, with `laplace` or `focei`) the levels minimise that stage's
+quadrature objective in the same way. `n_agq = 1` is the Laplace solve above, and a
+profiled quadrature fit reaches the unprofiled one's optimum and standard errors
+(#2107). A grid too large to evaluate is refused for every quadrature fit, profiled or
+not (`E_AGQ_GRID_TOO_LARGE`).
 
 Random effects on the block's rows are fine (the binder's identifiability rules apply
 as they do unprofiled), and so is a prediction nonlinear in them. So is a residual
@@ -986,6 +994,44 @@ The condition must read data only. One that reads a θ, an η or the block itsel
 refused, and so is every `max`, `min` or `clamp` of the block, since each compares the
 block. Every branch must itself be affine: a branch giving `PLACEBO[STUDY]` under one
 condition and `exp(PLACEBO[STUDY])` under the other is refused, naming the `exp`.
+
+##### Through a logit link
+
+A bounded endpoint, such as an observed proportion, can read the block through one
+logit link, as long as the link is the whole prediction (#2111):
+
+```
+[individual_parameters]
+  LP = TVL + PLACEBO + ETA_S + EMAX * TRT
+
+[structural_model]
+  y = inv_logit(LP)
+```
+
+`expit` is the same link, and it may also be written inline (`y = inv_logit(TVL +
+PLACEBO + …)`), through a parameter (`P = inv_logit(LP)`, `y = P`), or on every branch of
+an `if` on data (`P = if (TRT > 0) inv_logit(LP) else inv_logit(LP2)`, or the same as two
+assignments). Inside the link the rule above applies unchanged: the argument must read
+the block as `c × block` plus terms that do not read it. A function inside the link is
+refused by name, as it is anywhere. So is a link that is not the whole prediction, such
+as `100 * inv_logit(LP)`, `inv_logit(LP) + E`, a link inside a link, or a link on only
+some branches of an `if`. The refusal says so.
+
+The solve is then a generalised linear model, not least squares, so the least-squares
+Newton matrix no longer fits it. The solve takes the exact Hessian of the fit's own
+objective from the adjoint instead, so it converges quadratically (three steps per study
+on the test fixture). Where the adjoint cannot serve a subject, or under `gradient = fd`,
+it takes the second differences of the objective with the random effects re-solved at
+every point, which converge as fast and cost `2k²` EBE re-solves for a subject reading
+`k` levels. Away from the optimum that Hessian can be indefinite; the solve then damps it
+until it is positive definite, which costs steps but keeps each one a descent step.
+`verbose` reports how many matrices of each kind it took. The profiled levels reach the
+unprofiled fit's optimum under `foce`, `focei`, `laplace` and adaptive quadrature, and
+NONMEM's, with every level a `THETA`, under FOCEI and LAPLACE (see
+`nonmem_anchor/README.md`).
+
+A `[binary_model] logit` endpoint cannot read a θ level block yet, profiled or not
+(#2562), and ferx has no probit link.
 
 ##### Bounds on a profiled block
 

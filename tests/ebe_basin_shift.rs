@@ -51,6 +51,18 @@
 //! 7.0614, one subject, on both. Measured at `72e1c6ef` + #2441, macOS in `release`, Linux
 //! in `ci-test` via `tools/linux-test.sh`.
 //!
+//! **#2549: the two Tier-2 tests run with the warm-start predictor off.** #2549 starts every
+//! FOCE(I) inner solve at the mode predicted for the new point,
+//! `η̂ + (dη̂/dx)·Δx`, so a subject's start tracks the branch its mode is on instead of the
+//! previous parameters' mode. Under it none of 320 seeded 10-subject draws from `mm_n200.csv`
+//! traps (`random.Random(2549)`; 0 of 320 at full budget and at `maxiter = 3`), against 8 of
+//! #2441's 80 under the unpredicted start. The trap is the unpredicted warm start's, and the
+//! gate and the restart still serve every fit that starts that way (Laplace, AGQ, IOV,
+//! covariate networks, derivative-free BOBYQA, `FERX_EBE_PREDICTOR=0`). So the two tests below switch the
+//! predictor off (`FERX_EBE_PREDICTOR=0`) and keep the #2441 subset and its numbers; the
+//! Tier-3 benchmark runs with it, the default. The switch is process-wide, so every test in
+//! this file holds [`PREDICTOR_ENV`] while it fits.
+//!
 //! **The #2093 subset trapped on macOS arm64 too (#2070).** The #1527 subset did not: native macOS
 //! went straight to −79.1679 on its first leg (the #1688 libm split, not a defect in the
 //! gate), so both tests were red there and the restart path ran only on Linux. The #2093
@@ -71,6 +83,23 @@ use ferx_core::{fit, read_nonmem_csv};
 use std::path::Path;
 
 const MODEL: &str = "tests/fixtures/mm_basin_shift/mm.ferx";
+
+/// Serialises this file's fits around the process-wide `FERX_EBE_PREDICTOR` switch.
+static PREDICTOR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`fit_fixture`] with the EBE warm-start predictor switched off (`predicted = false`) or
+/// on, holding [`PREDICTOR_ENV`] for the fit.
+fn fit_fixture_with(data: &str, outer_maxiter: Option<usize>, predicted: bool) -> FitResult {
+    let _env = PREDICTOR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    if predicted {
+        std::env::remove_var("FERX_EBE_PREDICTOR");
+    } else {
+        std::env::set_var("FERX_EBE_PREDICTOR", "0");
+    }
+    let result = fit_fixture(data, outer_maxiter);
+    std::env::remove_var("FERX_EBE_PREDICTOR");
+    result
+}
 
 fn fit_fixture(data: &str, outer_maxiter: Option<usize>) -> FitResult {
     let text = std::fs::read_to_string(MODEL).expect("fixture model must exist");
@@ -111,7 +140,7 @@ fn quoted_pair(message: &str) -> (f64, f64) {
 /// check to find.
 #[test]
 fn a_trapped_fit_is_restarted_to_the_lower_objective() {
-    let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", None);
+    let result = fit_fixture_with("tests/fixtures/mm_basin_shift/mm_basin10.csv", None, false);
 
     // The straddle: this fixture must actually have trapped, or the remaining
     // assertions test a fit that never needed the fix. The adopted restart says so.
@@ -170,7 +199,11 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
 /// `converged = true`; the gap must surface as a warning and a non-converged fit.
 #[test]
 fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
-    let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", Some(3));
+    let result = fit_fixture_with(
+        "tests/fixtures/mm_basin_shift/mm_basin10.csv",
+        Some(3),
+        false,
+    );
 
     let warning = result
         .warnings_structured
@@ -219,7 +252,7 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
     ignore = "slow: opt in with --features slow-tests"
 )]
 fn mm_benchmark_reaches_the_optimum() {
-    let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_n200.csv", None);
+    let result = fit_fixture_with("tests/fixtures/mm_basin_shift/mm_n200.csv", None, true);
     assert!(
         result.ofv <= 775.40,
         "expected the FOCEI optimum 775.39 (pre-#1565: 784.33 reported converged), got {}",

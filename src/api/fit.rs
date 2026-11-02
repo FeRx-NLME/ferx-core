@@ -1128,9 +1128,11 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
         Some(format!(
             "individual parameter(s) not mu-referenced: {}. This can strongly \
              affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible. \
-             For an additive ETA, give the typical value and the ETA a line of their own \
-             (`E0 = TVE0 + ETA_E0`) and build the rest on it (`BASE = E0 + ...`): a typical \
-             value summed with other terms in one line is not mu-referenced (#2540).",
+             An additive ETA is mu-referenced when its line adds one bare THETA, that one \
+             ETA, and terms that read neither (`BASE = TVE0 + PLACEBO + ETA_E0`): give each \
+             typical value a THETA of its own, not a multiple of one, and its own ETA. \
+             That THETA and that ETA must reach the model only through that line; when \
+             either also reaches it another way, splitting the line does not help (#2544).",
             names.join(", ")
         ))
     }
@@ -1627,6 +1629,11 @@ fn fit_inner(
     for d in crate::api::validation::check_nn_bare_output_start(model, &init_params.theta) {
         accumulated_warnings.push(d.message);
     }
+    // A `[covariate_nn]` input the data drive into saturation (#2549).
+    #[cfg(feature = "nn")]
+    for d in crate::api::validation::check_nn_input_scale(model, population) {
+        accumulated_warnings.push(d.message);
+    }
     if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
         n_params_pre,
         covariance_cost,
@@ -2042,6 +2049,7 @@ fn fit_inner(
                         ebe_convergence_warnings: 0,
                         max_unconverged_subjects: 0,
                         total_ebe_fallbacks: 0,
+                        total_ebe_nm_polished: 0,
                         final_gradient: None,
                         final_gradient_source: None,
                         sir_fallback_proposal: None,
@@ -2137,6 +2145,7 @@ fn fit_inner(
                     ebe_convergence_warnings: 0,
                     max_unconverged_subjects: 0,
                     total_ebe_fallbacks: 0,
+                    total_ebe_nm_polished: 0,
                     final_gradient: None,
                     final_gradient_source: None,
                     sir_fallback_proposal: None,
@@ -3246,6 +3255,7 @@ fn fit_inner(
         ebe_convergence_warnings: result.ebe_convergence_warnings,
         max_unconverged_subjects: result.max_unconverged_subjects,
         total_ebe_fallbacks: result.total_ebe_fallbacks,
+        total_ebe_nm_polished: result.total_ebe_nm_polished,
         covariance_status,
         // #1382: the estimator that actually produced `covariance_matrix`, carried
         // up from the covariance step rather than read back off

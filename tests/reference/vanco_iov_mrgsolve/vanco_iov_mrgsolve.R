@@ -73,9 +73,10 @@ suppressMessages(library(mrgsolve))
 # piecewise-constant CL fed in at each window with that occasion's κ.
 code <- '
 $PARAM CL=4.0, V=80.0
-$CMT CENT
+$CMT CENT AUC
 $ODE
   dxdt_CENT = -(CL/V)*CENT;
+  dxdt_AUC  = CENT/V;            // exposure accumulator (reset each day, #943)
 '
 mod <- mcode("vanco_iov", code, rtol = 1e-12, atol = 1e-12, maxsteps = 1000000)
 
@@ -124,6 +125,7 @@ stopifnot(length(dose_at) == n_dec)
 # pre-dose trough recorded at each decision is CENT/V at that time (occasion g's
 # window has just opened, so the readout matches ferx's pre-dose observed signal).
 st_cent <- 0
+win_auc <- numeric(0)             # one AUC24 per closed inter-decision window (#943)
 rows    <- list()
 for (k in seq_along(dec_t)) {
   t0     <- dec_t[k]
@@ -139,15 +141,16 @@ for (k in seq_along(dec_t)) {
   if (k < length(dec_t)) {
     seg1 <- as.data.frame(mod |>
       param(CL = cl_at[k + 1], V = V) |>
-      init(CENT = st_cent) |>
+      init(CENT = st_cent, AUC = 0) |>
       ev(amt = dose_at[k], rate = dose_at[k] / tinf, cmt = 1) |>
       mrgsim(start = 0, end = tinf, delta = tinf))
     cent_after_inf <- seg1[nrow(seg1), ]$CENT
     seg2 <- as.data.frame(mod |>
       param(CL = cl_at[k + 1], V = V) |>
-      init(CENT = cent_after_inf) |>
+      init(CENT = cent_after_inf, AUC = seg1[nrow(seg1), ]$AUC) |>
       mrgsim(start = tinf, end = cycle_h, delta = cycle_h - tinf))
     st_cent <- seg2[nrow(seg2), ]$CENT
+    win_auc <- c(win_auc, seg2[nrow(seg2), ]$AUC)
   }
 }
 ladder <- do.call(rbind, rows)
@@ -194,10 +197,9 @@ md <- c(
   "per-occasion κ swings CL across the horizon, so the controller re-titrates each",
   "day off the trough it observes.",
   "",
-  "`auc_target` is intentionally absent: its exposure metric integrates a dense grid",
-  "from a single frozen PK snapshot, which is silently wrong when CL switches per",
-  "occasion, so it is a typed error for an IOV (`kappa`) subject (#701). The",
-  "pct-in-window trough metric (`target_window`) is per-occasion aware and retained.",
+  "`auc_target` is supported here since #943: each window is integrated under the",
+  "per-occasion CL its trajectory runs under. The per-window AUC24 below is its",
+  "reference; the pct-in-window trough metric (`target_window`) is retained.",
   "",
   "## Realized ladder (ferx doses + reconstructed κ, mrgsolve troughs)",
   "",
@@ -207,5 +209,22 @@ md <- c(
   "computes its troughs live (RK45), and asserts they match these mrgsolve troughs",
   "(LSODA) to a small cross-solver tolerance. Both engines integrate the identical",
   "piecewise-constant CL, so the whole trough trajectory agrees.")
+auc_tbl <- c(
+  "| window | days [t0,t1] (h) | AUC24 (mg*h/L) |",
+  "|---:|---:|---:|",
+  vapply(seq_along(win_auc), function(i) sprintf(
+    "| %d | [%d, %d] | %s |",
+    i - 1, as.integer(dec_t[i]), as.integer(dec_t[i + 1]),
+    formatC(win_auc[i], format = "f", digits = 6)), character(1)))
+md <- c(md,
+  "",
+  "## Per-window AUC24",
+  "",
+  sprintf(paste0("The area under CENT/V over each closed inter-decision window, from an AUC ",
+                 "compartment (dxdt_AUC = CENT/V) reset at the start of each window ",
+                 "(mrgsolve %s). It is the external reference for `auc_target` (#943)."),
+          as.character(packageVersion("mrgsolve"))),
+  "",
+  auc_tbl)
 writeLines(md, "expected.md")
 cat("\nwrote expected.md\n")

@@ -68,6 +68,7 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 | **Two observations the reader splits one ULP apart are both predicted** | when an `EVID=2` row or a dose follows the first observation of a tie, the reader moves that observation one ULP below the tie (#614, #1810). The ODE engines used to dedup their `saveat` at `1e-15`, which merges the pair at any `TIME ≤ 8`, so the second observation kept a `NaN` prediction and the objective was `NaN` ([#2010](https://github.com/FeRx-NLME/ferx-core/issues/2010)). Five subjects, one per tie shape at `TIME 4`: obs/`EVID=2`/obs, obs/obs/`EVID=2`, obs/obs, obs/lagged dose/obs, obs/obs/lagged dose; the test asserts which of them the reader splits. `ADVAN1 TRANS2` with `ALAG1`, `METHOD=1 MAXEVAL=0 POSTHOC`, against an `[odes]` twin at `maxiter = 0`. Linux aarch64 and macOS arm64, the same in every printed digit: \|ΔOFV\| **1.1e-8** (bound 1e-6), worst \|ΔPRED\| **9.7e-11** (1e-8), \|Δη\| **4.0e-8** (5e-7), \|ΔIPRED\| **1.9e-7** (2e-6). Before the fix, the objective and three `PRED`s were `NaN`. **Provenance: NONMEM 7.6.0, `nonmem:7.6.0-anchor`, run by @TeunP on PR #2011, 2026-10-15; the `.ctl` equals the `.lst` echo. NONMEM 7.5.1 (run by @carldelfin) gave the same `.tab` byte for byte and an OBJ 4.4e-15 away.** | `tied_obs_split.ctl` | `tied_obs_split_fit.ferx` *(test in `tests/tied_obs_split_nonmem_anchor.rs`)* |
 | **`init()` is seeded from the first record in file order** | a covariate-dependent `init(state) = expr` reads the `$PK` of the subject's first record **in file order, of any kind** (observation, `EVID=2`, dose) — [#2121](https://github.com/FeRx-NLME/ferx-core/issues/2121) (`ADVAN13 TOL=9`, `A_0(1) = 10·WT`, CL/V fixed, so `IPRED(0)` reads the seed: 14 for WT = 70, 28 for 140). `init_seed_tie`: 14 subjects, obs/obs, `EVID=2`/obs and dose/obs tied at the first instant in both file orders, a dose with no tie, TV covariates later and co-timed resets; `init_seed_tie_cells`: an `EVID=3` row and an `SS=1` dose at the first instant, and the dose/`EVID=2` pair in both orders (IDs 19, 20), so every pair of the three record kinds is anchored in both orders (ID 15, an observation before a co-timed `SS=1` dose, is left out: #2126). `init_seed_tie_ofv_{a,b}`: 20 subjects with an `EVID=2` row then an observation at `TIME 0`, η on the seed, `METHOD=1 INTER MAXEVAL=0 POSTHOC`; arm b (both rows the observation's WT) is the control. ferx `predict()`, the dual walk and the no-op adaptive driver against the `.tab`'s `IPRED`, and `fit()` at `maxiter = 0` against `#OBJV` (172.84328734 / 222.41002725). Worst `IPRED` error **2.6e-8** on all three engines and 8.2e-9 on the cells (bound 1e-6), OFV **1.1e-6 / 1.4e-6** (bound 1e-5), Linux aarch64 (the same digits on macOS arm64). On the merge-base `925f3b02`: `predict` 28 on ID 3 (NONMEM 14), adaptive 28 / 30 / 27.1 on IDs 3 / 5 / 7 (verify passing), OFV 222.41 on arm a. **Provenance: NONMEM 7.6.0, `nonmem:7.6.0-anchor`, run by @TeunP for #2121, 2026-10-18; each `.ctl` equals its `.lst` echo.** | `init_seed_tie.ctl`, `init_seed_tie_cells.ctl`, `init_seed_tie_ofv_a.ctl`, `init_seed_tie_ofv_b.ctl` | `init_seed_tie_fit.ferx`, `init_seed_tie_ofv_fit.ferx` *(tests in `tests/init_seed_tie_nonmem_anchor.rs`)* |
 | **An observation listed before a co-timed dose or `EVID=2` row reads pre-dose, at every instant** | the reader moves such an observation one ULP below the tie, and a dose matches a break symmetrically within 1e-12, so wherever the observation's time is a break of its own (the subject's first record time, its last observation, every observation on the adaptive time-varying path) the dose was applied first — [#2124](https://github.com/FeRx-NLME/ferx-core/issues/2124), [#2123](https://github.com/FeRx-NLME/ferx-core/issues/2123) (`init_seed_tie`'s model, `A_0(1) = 10·WT`, CL/V fixed, so every `IPRED` is a closed form). 15 subjects in tied pairs, both file orders: first instant at 0 and at 10, later doses at 4 / 8.2 / 24, the last observation at 6 and 20, `EVID=2` at 4, and a time-varying subject at 4. NONMEM reads every observation-first cell pre-dose (ID 8: 14, ID 10: 8.7810, ID 12: 2.1654, ID 14: 10.7251); worst NONMEM vs closed form **2.6e-8** (bound 1e-7). The engines (`predict()`, the dual walk, the state pass, the no-op adaptive driver) are judged against the closed forms on the same file. On `65e9d6f8`: ID 8 16, ID 10 10.781, ID 12 4.165 (`predict`, dual), ID 14 12.725 (adaptive), ID 7 refused. **Provenance: NONMEM 7.6.0, `nonmem:7.6.0-anchor`, run by @TeunP for #2485, 2026-10-31; the `.ctl` equals its `.lst` echo.** | `trough_tie.ctl` | `nonmem_anchor/trough_tie.csv` (read by both) *(tests in `tests/trough_tie.rs`)* |
+| **An observation listed before a co-timed `SS=1` dose reads the carried state** | the reader's #614 record-order pass skipped steady-state doses, so a Gaussian observation listed before a same-`TIME` `SS=1` row read the post-dose steady state, 14.3101276, in every case — [#2510](https://github.com/FeRx-NLME/ferx-core/issues/2510). The anchor was run during #2473 for DTMM state rows (`ADVAN1 TRANS2`, `CL = 1`, `V = 10`, every `$THETA` `FIX`, `$EST MAXEVAL=0`, `$TABLE FORMAT=s1PE23.16`) and is reused unchanged. A record listed **before** an `SS=1` dose reads the amounts carried from the previous record (**0** before a first SS dose; **4.3101276** on its own prior steady state; **5.4881164** on a non-SS history), and one listed after it reads the steady state (**14.3101276**). ferx `predict()` and the dual walk on the closed form and an `[odes]` twin, plus the ODE state pass, match to **2.7e-15** (the same digits on Linux x86_64 and macOS arm64). **Provenance: NONMEM 7.5.1, run for #2473 on `5b42209e`, 2026-10-30.** | `dtmm_ss_record_order.ctl` | `ss_record_order_fit.ferx`, `ss_record_order_ode_fit.ferx` *(tests in `tests/ss_record_order_nonmem_anchor.rs`)* |
 | **Canakinumab MBMA** | bounded-endpoint MBMA on real literature data: weighted logit readout (`weight = 1/sqrt(NARM)`, σ estimated), `kappa … weight = NARM`; the published `clamp` is present but never binds on these data, so it is not covered — [#1913](https://github.com/FeRx-NLME/ferx-core/issues/1913). **Data not in the repository** (CC BY-NC-ND); see [Canakinumab MBMA](#canakinumab-mbma-1913). | `mbma_canakinumab.ctl` | `tests/data/mbma_canakinumab/mbma_canakinumab.ferx` *(tests in `tests/mbma_canakinumab_case_study.rs`)* |
 | **Within-arm residual correlation** | `correlation cs(RHO) by ARM` / `ar1(RHO)` / `car1(RHO)`: `R_arm = σ² W C(ρ) W` on the naproxen MBMA with `weight = WPSE` — [#1081](https://github.com/FeRx-NLME/ferx-core/issues/1081). NONMEM has no residual-correlation record: `L2 = ARM` shares `EPS(1..5)` across an arm and each visit mixes them through the closed-form Cholesky factor of `C(ρ)`, `ρ = THETA(8)`. Seven `MAXEVAL=0` probes (`cs_r0`, `cs_p05`, `cs_m02`, `ar1_p05`, `ar1_m04`, `car_p08`, `car_p03`), six combined-error ones (`comb_*`) and three estimations (`cs_est`, `ar1_est`, `car_est`); see [Within-arm residual correlation](#within-arm-residual-correlation-1081). | `residual_correlation/*.ctl` | `residual_correlation/napx_cs.ferx` *(tests in `tests/residual_correlation_nonmem_anchor.rs`)* |
 | **Nested variability levels** | `level STUDY by STUDY in ID`, `level ARM by ARM in STUDY`, `kappa … at STUDY` and a weighted `kappa … at ARM` (sponsor → study → arm, arm labels local to a study) — [#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082) PR2. NONMEM codes the levels as occasion-style `ETA` slots with `$OMEGA BLOCK(1) SAME` (the design note's `exact3`), FOCEI; `_eval` is that optimum at `MAXEVAL=0 POSTHOC`, OBJ 107.04357106164440. ferx at the same point: \|ΔOFV\| 9.9e-8, worst \|ΔEBE\| 8.5e-6 | `nested_levels_3.ctl`, `nested_levels_3_eval.ctl` | `nested_levels_3.ferx` *(in `tests/nested_levels_nonmem_anchor.rs`)* |
@@ -106,11 +107,13 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 | **Unit invariance under proportional error** | the FOCEI objective with IPRED below `1e-6` (the old absolute `1e-12` residual-variance floor), on one dataset in two units — [#2441](https://github.com/FeRx-NLME/ferx-core/issues/2441) | `unit_invariance_prop_{k1,k1e6}.ctl` | `unit_invariance_prop_fit.ferx` *(in `tests/unit_invariance_prop_nonmem_anchor.rs`)* |
 | **Slow-accumulation steady state** | `SS=1` at `λ·II = 0.024` on `ADVAN1` and its oral `ADVAN2` twin — [#908](https://github.com/FeRx-NLME/ferx-core/issues/908); see the section below | `ss_slow_advan{1,2}.ctl` | *(in `tests/nonmem_dose_compartment_anchor.rs`)* |
 | **Profile likelihood on a level block** | an unstructured placebo with a BTAV κ and a drug effect nonlinear in `ETA` — [#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065); bounded, one level `FIX`ed at the bound the profiled box holds it on — [#2112](https://github.com/FeRx-NLME/ferx-core/issues/2112); from a start that puts TVE0 on ferx's log-packing floor — [#2339](https://github.com/FeRx-NLME/ferx-core/issues/2339); under `METHOD=1 LAPLACE` — [#2107](https://github.com/FeRx-NLME/ferx-core/issues/2107); see the section below | `profile_mbma.ctl`, `profile_mbma_bound.ctl`, `profile_mbma_tve0_55.ctl`, `profile_mbma_laplace.ctl` (4) | `profile_mbma_fit.ferx` *(in `tests/profiled_levels.rs`)* |
+| **Profile likelihood through a logit link** | a bounded proportion whose unstructured placebo and study `ETA` sit inside `inv_logit`, under `METHOD=1 INTER` and `METHOD=1 LAPLACE INTER` — [#2111](https://github.com/FeRx-NLME/ferx-core/issues/2111); see the section below | `profile_logit_b2_focei.ctl`, `profile_logit_b2_laplace.ctl` (2) | `profile_logit_b2.ferx` *(in `tests/profiled_logit_levels.rs`)* |
 | **Nested levels × residual correlation** | `exact3` with each arm's residuals correlated, `correlation ar1\|car1(RHO) by ARM` — [#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082) PR5 (`MAXEVAL=0`, FOCEI; `gen_ctl.py` writes the streams) | `nested_levels_3_ar1/{ar1_r0,ar1_p05,ar1_m04,car1_p06}.ctl` | *(in `tests/nested_levels_correlation_nonmem_anchor.rs`)* |
 | **NPDE / NPD with a correlated residual** | a `block_sigma` correlation inside one combined error (A, ρ = −0.9) and across an `L2` total/unbound pair (B, ρ = −0.8) — [#1733](https://github.com/FeRx-NLME/ferx-core/issues/1733) | `npde_block_sigma_{a,b}.ctl` | `tests/fixtures/npde_block_sigma_{a,b}.ferx` *(in `tests/npde_block_sigma_nonmem_anchor.rs`)* |
-| **SAEM additive mu-reference** | SAEM on `E0 = MU_1 + ETA(1)` (additive mu-ref) against the same model without `MU_`, TVE0 and ω² free, every other θ `FIX` at `level_se_a`'s optimum; each estimate scored by `METHOD=1 MAXEVAL=0` — [#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540); see the section below | `saem_additive_mu.ctl`, `saem_additive_mu_nomu.ctl` | `saem_additive_mu.ferx`, `saem_additive_mu_inline.ferx` *(in `tests/saem_additive_mu_nonmem_anchor.rs`)* |
+| **SAEM additive mu-reference** | SAEM on `E0 = MU_1 + ETA(1)` (additive mu-ref) against the same model without `MU_`, TVE0 and ω² free, every other θ `FIX` at `level_se_a`'s optimum; each estimate scored by `METHOD=1 MAXEVAL=0` — [#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540); the one-line `BASE = MU_1 + PLA + ETA(1)` as a mu-reference — [#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544); see the section below | `saem_additive_mu.ctl`, `saem_additive_mu_inline.ctl`, `saem_additive_mu_nomu.ctl` | `saem_additive_mu.ferx`, `saem_additive_mu_inline.ferx`, `saem_additive_mu_shared.ferx` *(in `tests/saem_additive_mu_nonmem_anchor.rs`)* |
 | **Level-block standard errors** | the per-level SEs of a `sum_to_zero_within` θ level block, with the dependent level last (a, ferx's own layout) or first (b, so it is a `THETA`) — [#1890](https://github.com/FeRx-NLME/ferx-core/issues/1890) | `level_se_{a,b}.ctl` | `level_se_mbma_fit.ferx` *(in `tests/level_se_nonmem_anchor.rs`)* |
 | **Mixture simulation draws the class** | `simulate_with_seed()` on a `[mixture]` model draws each subject's class at its mixing probability (covariate-dependent) and simulates it under that class's `MIXNUM`, Ω and Σ — [#2163](https://github.com/FeRx-NLME/ferx-core/issues/2163) (`$SIMULATION ONLYSIM`; distributional: quantiles per WT tercile, written by `make_mixture_sim_class.py`) | `mixture_sim_class.ctl` | `mixture_sim_class.ferx` *(in `tests/mixture_simulate_nonmem_anchor.rs`)* |
+| **Discrete-time Markov model** | `[markov_model] type = dtmm`, the probability of the state at a record given the previous observed state — [#2473](https://github.com/FeRx-NLME/ferx-core/issues/2473) (`$PRED` reading the previous observed DV from a `PDV` column, `$EST METHOD=COND LAPLACE LIKE SIGL=9 NSIG=3`). Two seeded fixtures (`make_dtmm_fixtures.py`): a 2-state model with a time-constant covariate and an η per transition, and a 3-state ordered model as a cumulative logit conditioned on the previous state, so the stay probabilities are the diagonal ferx fills in. Both datasets space records irregularly and carry `MDV = 1` rows inside the chains, so "a step is a record" and "a missing state links to the last observed one" are live on both sides. Compared: ferx's OFV evaluated once at NONMEM's final estimates — 3-state **5.7e-5**; 2-state **4.6e-3**, traced with `dtmm_2state_exact_laplace.py` (the 2-state model is separable, so its Laplace objective is exact outside both engines: 1049.40799, **2.0e-4** from ferx and 4.8e-3 from NONMEM, the gap on two subjects with a prior-dominated η, i.e. NONMEM's numerical second derivatives). Dropping the previous-state shift moves the 3-state OFV by ~300. The 3-state run stops on rounding errors (`ERROR=134`) with a gradient near zero; the comparison is at a fixed θ, so it is unaffected. ferx numbers Linux x86_64 (`tools/linux-test.sh`); macOS arm64 agrees to the 7th significant figure | `dtmm_{2,3}state.ctl` (2) | `dtmm_{2,3}state_fit.ferx` (in `tests/dtmm_nonmem_anchor.rs`) |
 
 The **`TIME`-readout** control runs on its own tiny `scaling_time_readout.csv`
 (one subject, 100 mg IV bolus, seven samples over 24 h) — see
@@ -1184,29 +1187,41 @@ log-packed FD arm and U2's bit-parity with `se_theta`), not by this anchor.
 (`outer_maxiter = 0` plus the covariance step, Tier 2, 2.6 s in debug). It bounds both
 gaps at 1e-2, 2.4× the worst (Linux aarch64 = macOS arm64 in every printed digit).
 
-## SAEM additive mu-reference (#2540)
+## SAEM additive mu-reference (#2540, #2544)
 
 `level_se_a.ctl` with every `THETA` but TVE0 `FIX` at its own optimum, so only TVE0
 and ω² are free and FOCEI is the exact likelihood (MLE 165.826023, `level_se_a`'s
 objective). Each stream runs `METHOD=SAEM NBURN=150 NITER=250 SEED=12345`, then
 `METHOD=1 INTER MAXEVAL=0` to score the SAEM estimate. Data: `level_se_mbma.csv`.
-Results: `results/saem_additive_mu{,_nomu}.{ext,lst}`, `nm3` anchor image (arm64
+Results: `results/saem_additive_mu{,_inline,_nomu}.{ext,lst}`, `nm3` anchor image (arm64
 agrees to 2e-7 with `MU_1` and 0.019 without).
 
 | Stream | TVE0 | ω² | OFV at seed 12345 | OFV, seeds 12345, 2, 3, 7, 11 |
 |---|---|---|---|---|
 | `saem_additive_mu.ctl` (`MU_1 = THETA(1)`, `E0 = MU_1 + ETA(1)`) | 48.7575 | 5.164 | 165.826056 | 165.8260 – 165.8261 |
+| `saem_additive_mu_inline.ctl` (`MU_1 = THETA(1)`, `BASE = MU_1 + PLA + ETA(1)`) | 48.7575 | 5.164 | 165.826056 | — |
 | `saem_additive_mu_nomu.ctl` (`BASE = TVE0 + PLA + ETA(1)`) | 45.9293 | 13.30 | 171.417778 | 167.41 – 174.32 |
 
+NONMEM is spelling-invariant: `saem_additive_mu_inline.ctl` (#2544) differs from
+`saem_additive_mu.ctl` only in writing the mu-reference inline, and its final `.ext`
+rows are bit-identical to it (SAEM objective 151.75461466519272, scored
+165.82605565533083) on the anchor image, arm64 and arm64-nofma.
+
 The ferx side is `saem_additive_mu.ferx` (`E0 = TVE0 + ETA_E0`, TVE0 bounded below by
-0, so log-packed) and `saem_additive_mu_inline.ferx` (folded into `BASE`), on
+0, so log-packed), `saem_additive_mu_inline.ferx` (folded into `BASE = TVE0 + PLAFIX +
+ETA_E0`) and the control `saem_additive_mu_shared.ferx` (the inline line, with TVE0
+also read in `[structural_model]` through a `+ 0*TVE0`: the same likelihood, but not a
+mu-reference, since TVE0 no longer enters only through `BASE`), on
 `saem_additive_mu.csv`: the same rows with the fixed level values as a `PLAFIX`
-column. Over the same five seeds ferx gives 165.8260–165.8266 for the split spelling
-and 168.54–172.76 for the inline one (172.66 at seed 12345). Before #2540 the split
-spelling gave the inline numbers too, since ferx took no additive mu-reference.
+column. Over the same five seeds ferx gives 165.8260–165.8266 for the split spelling.
+Before #2544 the inline spelling gave 168.54–172.76 (172.66 at seed 12345), what the
+`_shared` control still gives; since #2544 it is mu-referenced and equals the split
+spelling in every printed digit on all five seeds. Before #2540 the split spelling
+gave the inline numbers too, since ferx took no additive mu-reference.
 `tests/saem_additive_mu_nonmem_anchor.rs` (Tier 2, 3 s in debug) asserts the split
 fit within 5e-3 of the MLE (8× the five-seed spread), TVE0 and ω² against
-`saem_additive_mu.ctl`, and the inline control more than 1 above the MLE. On the
+`saem_additive_mu.ctl` and `saem_additive_mu_inline.ctl`, the inline fit equal to the
+split one, and the `_shared` control more than 1 above the MLE. On the
 full 22-θ model NONMEM SAEM is not a reference: with 21 un-mu-referenced θ it
 degenerates on every seed tried, mu-referenced or not.
 
@@ -1475,3 +1490,34 @@ below, NONMEM's levels being the end of a three-significant-digit fit), free-lev
 within 2.2e-3 of (a), dependent ones within 2.8e-3 of (b) — inside the 3.4e-3 / 4.2e-3
 the unprofiled anchor shows at the same point. Dropping the covariance step's
 `D⁻¹BᵀCov(θ)BD⁻¹` term fails it.
+
+**A-B2, a profiled block through a logit link (#2111).** `profile_logit_b2_focei.ctl` and
+`profile_logit_b2_laplace.ctl` code `profile_logit_b2.ferx` with every level a `THETA`
+(each study's last visit dependent, as ferx lays it out). Data `profile_logit_b2.csv`,
+written by `simulate_profile_logit_b2.py` (synthetic, seed 2111): 10 studies × 4 visits ×
+2 arms, ID = study, DV the observed proportion of 30 Bernoulli draws per arm-visit, and
+`Y = 1/(1 + EXP(−LP)) + EPS(1)` with `LP = TVL + PLACEBO + ETA(1) + EMAX·TRT`. Both the
+block and the study `ETA` sit inside the link, so the prediction is nonlinear in both and
+the profile solve's least-squares matrix no longer applies; ferx takes the adjoint's exact
+Newton matrix there. The arm-visit probabilities run from about 0.2 to 0.8, so the link
+is live on every row. `$ESTIMATION … SIGL=12 NSIG=4`, `$COVARIANCE MATRIX=R SIGL=12`, both
+`MINIMIZATION SUCCESSFUL` (4.1 / 4.5 significant digits) with the covariance step complete.
+Run with `nm3` (`~/NONMEMruns/ferx-2111-profile-logit/committed/`). Results:
+`results/profile_logit_b2_{focei,laplace}.{lst,ext,cov,phi}`.
+
+| | FOCEI (`METHOD=1 INTER`) | LAPLACE (`METHOD=1 LAPLACE INTER`) |
+|---|---|---|
+| NONMEM OBJ, anchor image | −344.413016237 | −344.385100318 |
+| arm64 / arm64-nofma | −344.413015951 | −344.385100494 |
+| ferx profiled at NONMEM's structural point, ΔOFV | −7.1e-8 | −2.0e-7 |
+| 30 free levels, solved by ferx | ≤ 9.5e-5 NONMEM SEs | ≤ 1.8e-4 NONMEM SEs |
+| free-level SEs vs `$COV` | ≤ 4.1e-5 | ≤ 1.5e-5 |
+| TVL / EMAX SEs vs `$COV` | 2.7e-5 / 1.9e-5 | 2.4e-5 / 4.8e-6 |
+| ferx profiled fit from the inits (`slow-tests`), ΔOFV | −7.5e-8 | −2.1e-7 |
+
+ferx is handed TVL, EMAX, Ω and σ and solves the 30 free levels itself
+(`tests/profiled_logit_levels.rs`, Tier 2), every level gradient and Newton matrix on the
+adjoint; ferx sits below NONMEM both times, whose levels are the end of a 4.1 / 4.5
+significant-digit fit. `$COV` at `SIGL=12` is precise here, so the structural SEs are
+compared with it directly. The same file's `slow-tests` twin fits from the model file's
+inits and lands on each OBJ. Numbers are macOS arm64; the Linux run agrees.

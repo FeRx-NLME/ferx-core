@@ -1,0 +1,35 @@
+# Fixture B2 of the #2111 profile tests and its NONMEM anchor: a bounded continuous
+# endpoint (an observed proportion per study, visit and arm) whose placebo block is read
+# through a logit link. Written by `simulate_profile_logit_b2.py`.
+# 10 studies x 4 visits x 2 arms, 80 rows, synthetic (seed 2111): TVL -0.5, EMAX 1.0,
+# SD of the study eta 0.5, so the arm-visit probabilities run from about 0.2 to 0.8 and
+# the link is live everywhere. Data: `profile_logit_b2.csv` beside this file.
+#
+# The study eta is inside the link, so the prediction is nonlinear in it and the GLS
+# Newton matrix of an affine route is only quasi-Newton here.
+#
+# The unprofiled twin is this file with ` profile` removed from the block line; NONMEM
+# codes it with every level a THETA in `profile_logit_b2_{focei,laplace}.ctl`.
+
+[parameters]
+  theta TVL(-0.3, -5.0, 5.0)
+  theta EMAX(0.5, -5.0, 5.0)
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile
+  omega ETA_S ~ 0.25
+  sigma ADD_ERR ~ 0.08 (sd)
+
+[covariates]
+  STUDY categorical
+  TRT   continuous
+
+[individual_parameters]
+  LP = TVL + PLACEBO + ETA_S + EMAX * TRT
+
+[structural_model]
+  y = inv_logit(LP)
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+
+[fit_options]
+  method     = focei
