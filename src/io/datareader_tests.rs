@@ -3223,6 +3223,27 @@ fn trailing_censored_tte_rows_flush_in_file_row_order() {
     }
 }
 
+/// A DV=2 right bound takes only its *own* CMT's pending DV=0 row: with a DV=0
+/// pending on CMT 3 alone, a DV=2 on CMT 2 has no left bound and is an error naming
+/// CMT 2. A `take_tte_pending` that ignored the CMT would pair it with CMT 3's row
+/// and silently read an interval-censored event on the wrong cause.
+#[cfg(feature = "survival")]
+#[test]
+fn interval_right_bound_without_its_own_cmt_left_bound_is_rejected() {
+    use std::collections::HashSet;
+    let mut f = NamedTempFile::new().expect("tempfile");
+    write!(f, "ID,TIME,DV,EVID,CMT\n1,5,0,0,3\n1,10,2,0,2\n").expect("write csv");
+    let tte: HashSet<usize> = [2, 3].into_iter().collect();
+    let routing = ObsRouting::tte_and_discrete(&tte, &HashSet::new());
+    let err = read_nonmem_csv_routed(f.path(), None, None, &[], None, None, &routing, &[])
+        .expect_err("a DV=2 with no DV=0 on its own CMT must be rejected");
+    assert!(
+        err.contains("DV=2 row at TIME=10 on CMT=2")
+            && err.contains("not preceded by a DV=0 row on the same CMT"),
+        "error must name the orphan DV=2 row and its CMT, got: {err}"
+    );
+}
+
 /// The discrete half of the same invariant: a CMT in the `discrete` routing set
 /// (binary / CTMM) never reaches the Gaussian grid either — the `integer_kind` arm
 /// precedes the Gaussian push, and `ObsRouting::validate` forbids a CMT in two sets.
