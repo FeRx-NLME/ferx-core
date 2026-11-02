@@ -3365,6 +3365,7 @@ pub ferx_core::types::FitResult::warnings: alloc::vec::Vec<alloc::string::String
 pub ferx_core::types::FitResult::warnings_structured: alloc::vec::Vec<ferx_core::WarningEntry>
 impl ferx_core::FitResult
 pub const ferx_core::FitResult::JSON_SCHEMA_VERSION: u32
+pub fn ferx_core::FitResult::from_json_str(text: &str) -> core::result::Result<ferx_core::FitResult, serde_json::error::Error>
 pub fn ferx_core::FitResult::to_json_value(&self) -> serde_json::value::Value
 pub struct ferx_core::types::FremConfig
 pub ferx_core::types::FremConfig::covariate_sigma_index: usize
@@ -4911,6 +4912,7 @@ pub ferx_core::FitResult::warnings: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::warnings_structured: alloc::vec::Vec<ferx_core::WarningEntry>
 impl ferx_core::FitResult
 pub const ferx_core::FitResult::JSON_SCHEMA_VERSION: u32
+pub fn ferx_core::FitResult::from_json_str(text: &str) -> core::result::Result<ferx_core::FitResult, serde_json::error::Error>
 pub fn ferx_core::FitResult::to_json_value(&self) -> serde_json::value::Value
 pub struct ferx_core::FremConfig
 pub ferx_core::FremConfig::covariate_sigma_index: usize

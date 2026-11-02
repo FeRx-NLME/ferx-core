@@ -486,13 +486,19 @@ fn check_same_networks(model_text: &str, fitted_text: &str) -> Result<(), String
 /// `[data] path` (which file, not how it is read); and `[priors]`, which
 /// shapes only a refit. Everything else — every equation, the error model,
 /// which parameters exist and which are `FIX`, `[fit_options]` — must match.
+/// A `[covariate_nn]` block is a set of `key = value` fields, as the parser
+/// reads it: its keys compare case-blind and its lines in sorted order.
 fn model_lines(text: &str) -> Vec<(String, &str)> {
     let mut out = Vec::new();
     // A header counts only once a line of its block does, so a block left empty
     // by the exclusions (a `[data]` holding only a path) is no difference.
     let mut header: Option<(String, &str)> = None;
+    // Where the current `[covariate_nn]` block's fields start in `out`; each
+    // field goes in at its sorted place among them.
+    let mut fields_from: Option<usize> = None;
     for (block, code, line) in logical_lines(text) {
         if block_header(&code).is_some() {
+            fields_from = None;
             header = Some((without_whitespace(&code), line));
             continue;
         }
@@ -501,12 +507,23 @@ fn model_lines(text: &str) -> Vec<(String, &str)> {
         match block.as_str() {
             "priors" => continue,
             "covariate_nn" if key.starts_with("init=") => continue,
+            "covariate_nn" => {
+                if let Some((k, v)) = norm.split_once('=') {
+                    norm = format!("{}={v}", k.to_ascii_lowercase());
+                }
+            }
             "data" if key.starts_with("path=") => continue,
             "parameters" => norm = mask_parameter_values(&norm),
             _ => {}
         }
         out.extend(header.take());
-        out.push((norm, line));
+        if block != "covariate_nn" {
+            out.push((norm, line));
+            continue;
+        }
+        let start = *fields_from.get_or_insert(out.len());
+        let at = start + out[start..].partition_point(|(n, _)| *n <= norm);
+        out.insert(at, (norm, line));
     }
     out
 }

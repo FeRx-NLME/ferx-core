@@ -494,7 +494,8 @@ weight names only record the block name and the shape, so without this check a
 fit of a different network of the same shape would export without complaint.
 The rest of the model has to be the fit's too — every equation, the error model,
 which parameters exist and which are `FIX` — or the estimates would be written
-into a model they were not made for. Comments, layout, the values in
+into a model they were not made for. Comments, layout, the order (and key
+case) of a `[covariate_nn]` block's fields, the values in
 `[parameters]` (starting values, bounds and inline priors — not a kappa
 `weight` expression), `[data] path` and `[priors]` may differ; anything else is
 an error naming the first line that does.

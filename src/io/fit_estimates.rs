@@ -87,7 +87,7 @@ pub(crate) fn read_fit_estimates(path: &Path) -> Result<Vec<SourceEstimate>, Str
         "json" => {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("failed to read `{}`: {e}", path.display()))?;
-            let fit: FitResult = serde_json::from_str(&text).map_err(|e| {
+            let fit = FitResult::from_json_str(&text).map_err(|e| {
                 format!(
                     "`{}` is not a ferx fit JSON (written by `--output-format json`): {e}",
                     path.display()

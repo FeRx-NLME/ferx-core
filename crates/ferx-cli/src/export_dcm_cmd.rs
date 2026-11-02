@@ -98,7 +98,7 @@ fn read_fit(path: &Path) -> Result<FitResult, String> {
         "json" => {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("failed to read `{}`: {e}", path.display()))?;
-            serde_json::from_str(&text).map_err(|e| {
+            FitResult::from_json_str(&text).map_err(|e| {
                 format!(
                     "`{}` is not a ferx fit JSON (written by `--output-format json`): {e}",
                     path.display()

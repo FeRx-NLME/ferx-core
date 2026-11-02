@@ -3329,6 +3329,47 @@ mod tests {
         assert!(parsed["ofv"].is_null());
     }
 
+    /// `FitResult::from_json_str` reads back the `null`s `write_result_json`
+    /// writes for non-finite floats: a plain `f64` (top level, and nested in a
+    /// `Vec` inside an `Option` struct) as `NaN`, an `Option<f64>` as `None`,
+    /// finite values unchanged. The plain serde read of the same file fails, so
+    /// the straddle is pinned too.
+    #[test]
+    fn from_json_str_reads_non_finite_nulls_back_as_nan() {
+        let mut fit = minimal_fit_result();
+        fit.ofv = 123.5;
+        fit.iwres_lag1_r = f64::NAN;
+        fit.dw_statistic = f64::INFINITY;
+        fit.cov_condition_number = None;
+        fit.covariate_table = Some(crate::types::CovariateTable {
+            names: vec!["WT".into(), "AGE".into()],
+            kinds: vec![crate::types::CovariateKind::Continuous; 2],
+            rows: vec![crate::types::CovariateRow {
+                id: "S1".into(),
+                time: 0.0,
+                evid: 0,
+                values: vec![f64::NAN, 41.0],
+            }],
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nan-fit.json");
+        crate::io::output::write_result_json(&fit, path.to_str().unwrap()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        let err = serde_json::from_str::<FitResult>(&text).unwrap_err();
+        assert!(err.to_string().contains("null"), "{err}");
+
+        let back = FitResult::from_json_str(&text).unwrap();
+        assert_eq!(back.ofv, 123.5);
+        assert!(back.iwres_lag1_r.is_nan(), "{}", back.iwres_lag1_r);
+        assert!(back.dw_statistic.is_nan(), "{}", back.dw_statistic);
+        assert_eq!(back.cov_condition_number, None);
+        let row = &back.covariate_table.unwrap().rows[0];
+        assert!(row.values[0].is_nan(), "{:?}", row.values);
+        assert_eq!(row.values[1], 41.0);
+        assert_eq!(back.theta, fit.theta);
+    }
+
     #[test]
     fn write_result_json_writes_parseable_file() {
         let dir = tempfile::tempdir().unwrap();

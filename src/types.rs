@@ -8351,6 +8351,20 @@ impl FitResult {
         }
         v
     }
+
+    /// Read a fit back from the JSON [`Self::to_json_value`] writes (a
+    /// `--output-format json` fit file).
+    ///
+    /// The inverse of that writer's one lossy step: a non-finite float was
+    /// written as `null`, and a `null` read into a plain `f64` comes back as
+    /// `NaN` (an `Option<f64>` reads it as `None`). A plain
+    /// `serde_json::from_str::<FitResult>` refuses such a file — any fit whose
+    /// diagnostics came out undefined, e.g. `dw_statistic` when no subject has
+    /// two IWRES values. The `schema_version` key is ignored.
+    pub fn from_json_str(text: &str) -> Result<FitResult, serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(text)?;
+        serde::Deserialize::deserialize(crate::io::serde_nan::NullAsNan(value))
+    }
 }
 
 /// Look up the SE for omega element (i, j) from the `se_omega` vector.

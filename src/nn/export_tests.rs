@@ -599,10 +599,11 @@ fn fixture_fit(model_text: Option<&str>) -> crate::types::FitResult {
         sigma: vec![0.1234],
         sigma_names: vec!["PROP_ERR".into()],
         model_text: model_text.map(str::to_string),
-        // Finite, so the fit round-trips through JSON (a `NaN` is written `null`).
-        shrinkage_eps: 0.0,
-        iwres_lag1_r: 0.0,
-        dw_statistic: 2.0,
+        // Undefined, as in a fit too sparse for them: the JSON writer puts `null`
+        // here, which the CLI's reader has to take back as `NaN`.
+        shrinkage_eps: f64::NAN,
+        iwres_lag1_r: f64::NAN,
+        dw_statistic: f64::NAN,
         ..crate::types::test_helpers::empty_fit_result()
     }
 }
@@ -894,6 +895,30 @@ fn a_statement_laid_out_over_several_lines_is_the_same_model() {
     assert!(err.contains("not the one the fit was made with"), "{err}");
 }
 
+/// A `[covariate_nn]` block is a set of fields to the parser: listing them in
+/// another order, or spelling a key in another case, is the same network and
+/// the same model, while a changed value still is not.
+#[test]
+fn network_fields_in_another_order_or_key_case_are_the_same_model() {
+    let fit = fixture_fit(Some(FIXTURE_MODEL));
+    let opts = DcmExportOptions::default();
+    let fields = "  center     = [70, -5]\n  scale      = [12, 23.5]\n";
+    assert!(FIXTURE_MODEL.contains(fields));
+    for spelling in [
+        "  scale      = [12, 23.5]\n  center     = [70, -5]\n",
+        "  center     = [70, -5]\n  SCALE      = [12, 23.5]\n",
+    ] {
+        let model = FIXTURE_MODEL.replace(fields, spelling);
+        export_dcm_from_fit(&model, &fit, &opts).unwrap_or_else(|e| panic!("{spelling}: {e}"));
+    }
+    let changed = FIXTURE_MODEL.replace(
+        fields,
+        "  scale      = [12, 23.5]\n  center     = [70, -6]\n",
+    );
+    let err = export_dcm_from_fit(&changed, &fit, &opts).unwrap_err();
+    assert!(err.contains("center"), "{err}");
+}
+
 /// The parser's other line rules: a bare `FIX` (or scale tag) on the line after
 /// a `block_*` declaration belongs to it, and a bare `end` is dropped — so
 /// neither layout is a different model, while a `FIX` that was not there is.
@@ -927,10 +952,11 @@ fn the_committed_fit_json_is_the_fixture_fit() {
     );
     let fit = fixture_fit(Some(FIXTURE_MODEL));
     if std::env::var_os("FERX_WRITE_DCM_FIT_JSON").is_some() {
-        std::fs::write(path, serde_json::to_string(&fit).unwrap()).unwrap();
+        std::fs::write(path, fit.to_json_value().to_string()).unwrap();
     }
-    let read: crate::types::FitResult =
-        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let read =
+        crate::types::FitResult::from_json_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert!(read.dw_statistic.is_nan(), "{}", read.dw_statistic);
     assert_eq!(read.theta_names, fit.theta_names);
     assert_eq!(
         read.theta.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
