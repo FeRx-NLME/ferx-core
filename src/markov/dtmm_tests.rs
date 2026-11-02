@@ -1,5 +1,6 @@
 use super::*;
 use crate::parser::model_parser::parse_model_string;
+use std::collections::HashMap;
 
 fn disc(time: f64, state: usize, cmt: usize) -> ObsRecord {
     ObsRecord::DiscreteState {
@@ -530,7 +531,7 @@ fn time_varying_covariate_reads_the_current_record() {
     // misaligned: a snapshot one short of the records
     let mut short = s.clone();
     short.endpoint_covariates.pop();
-    assert!(record_covariate_snapshots(&short).is_none());
+    assert!(short.record_covariate_snapshots().is_none());
     // misaligned: a time-to-event record on the subject
     let mut with_tte = s.clone();
     with_tte.obs_records.push(ObsRecord::Event {
@@ -540,7 +541,7 @@ fn time_varying_covariate_reads_the_current_record() {
         cmt: 7,
     });
     with_tte.endpoint_covariates.push(dose_cov(3.0));
-    assert!(record_covariate_snapshots(&with_tte).is_none());
+    assert!(with_tte.record_covariate_snapshots().is_none());
     for bad in [short, with_tte] {
         let refused = crate::api::check_survival_tv_covariates(&model, &population_of(bad));
         assert_eq!(refused.len(), 1, "{refused:?}");
@@ -593,8 +594,9 @@ fn reader_snapshots_align_with_state_records() {
     .expect("load");
     let _ = std::fs::remove_dir_all(&dir);
     let s = &run.population.subjects[0];
-    let snaps =
-        record_covariate_snapshots(s).expect("a time-varying DOSE yields aligned snapshots");
+    let snaps = s
+        .record_covariate_snapshots()
+        .expect("a time-varying DOSE yields aligned snapshots");
     let doses: Vec<f64> = snaps.iter().map(|c| c["DOSE"]).collect();
     assert_eq!(doses, [1.0, 1.0, 3.0, 3.0]);
     let (theta, eta) = ([-0.8_f64, -1.3], [0.0_f64]);

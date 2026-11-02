@@ -976,38 +976,52 @@ pub fn run_model_simulate_with_overrides(
             // observed 0). The loop now binds an empty `sims` instead of `continue`-ing,
             // so this drop reaches the all-NaN subject too.
             {
+                // The per-record covariate snapshots line up with the records (#2562), so
+                // a dropped record drops its snapshot too.
+                let aligned = subject.record_covariate_snapshots().is_some();
+                let mut keep: Vec<bool> = Vec::with_capacity(subject.obs_records.len());
                 subject.obs_records.retain_mut(|rec| {
-                    let crate::types::ObsRecord::DiscreteState {
-                        state,
-                        cmt,
-                        raw_time,
-                        ..
-                    } = rec
-                    else {
-                        return true; // not a discrete row — untouched
-                    };
-                    // Only this endpoint family's rows are ours to stamp or drop. A CTMM
-                    // `DiscreteState` row is also a discrete row, and matching it here
-                    // would silently delete it once CTMM simulation lands (#820) —
-                    // unreachable today only because CTMM `--simulate` is rejected
-                    // upstream, which is exactly the kind of latent data loss this PR
-                    // exists to remove.
-                    if !binary_cmts.contains(cmt) {
-                        return true;
-                    }
-                    match drawn
-                        .get_mut(&(*cmt, raw_time.to_bits()))
-                        .and_then(|q| q.pop_front())
-                    {
-                        Some(next) => {
-                            *state = next;
-                            true
+                    let kept = (|| {
+                        let crate::types::ObsRecord::DiscreteState {
+                            state,
+                            cmt,
+                            raw_time,
+                            ..
+                        } = rec
+                        else {
+                            return true; // not a discrete row — untouched
+                        };
+                        // Only this endpoint family's rows are ours to stamp or drop. A CTMM
+                        // `DiscreteState` row is also a discrete row, and matching it here
+                        // would silently delete it once CTMM simulation lands (#820) —
+                        // unreachable today only because CTMM `--simulate` is rejected
+                        // upstream, which is exactly the kind of latent data loss this PR
+                        // exists to remove.
+                        if !binary_cmts.contains(cmt) {
+                            return true;
                         }
-                        // No draw for this record (NaN predictor): drop it rather than
-                        // fit its placeholder as an observed 0.
-                        None => false,
-                    }
+                        match drawn
+                            .get_mut(&(*cmt, raw_time.to_bits()))
+                            .and_then(|q| q.pop_front())
+                        {
+                            Some(next) => {
+                                *state = next;
+                                true
+                            }
+                            // No draw for this record (NaN predictor): drop it rather than
+                            // fit its placeholder as an observed 0.
+                            None => false,
+                        }
+                    })();
+                    keep.push(kept);
+                    kept
                 });
+                if aligned {
+                    let mut k = keep.iter();
+                    subject
+                        .endpoint_covariates
+                        .retain(|_| k.next().copied().unwrap_or(true));
+                }
             }
         }
     }

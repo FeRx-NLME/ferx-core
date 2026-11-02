@@ -4734,6 +4734,28 @@ pub(crate) fn iov_single_occasion(message: impl Into<String>) -> Diagnostic {
 /// `markov_model` or `event_model`). `fit()` and every predict / simulate entry point
 /// surface it as an `Err` (#898), and `ferx check` reports it through
 /// [`check_model_data_rule`] (#1774).
+/// How an `E_ENDPOINT_TV_COVARIATE` message names the time-varying input `name`: a data
+/// covariate by its column, a θ level block's synthesized index column (#2562) by the
+/// block, since `__level_*` is engine plumbing no user wrote.
+#[cfg(feature = "survival")]
+fn tv_reference(name: &str) -> String {
+    match name.strip_prefix(crate::parser::model_parser::LEVEL_INDEX_PREFIX) {
+        Some(block) => format!("θ level block `{block}`, whose level changes between records"),
+        None => format!("covariate `{name}`"),
+    }
+}
+
+/// The remedy sentence for [`tv_reference`]'s input, ending in `otherwise`.
+#[cfg(feature = "survival")]
+fn tv_remedy(name: &str, otherwise: &str) -> String {
+    match name.strip_prefix(crate::parser::model_parser::LEVEL_INDEX_PREFIX) {
+        Some(block) => format!(
+            "Key `{block}` on columns that are constant within the subject, or {otherwise}."
+        ),
+        None => format!("Hold `{name}` constant within the subject, or {otherwise}."),
+    }
+}
+
 #[cfg(feature = "survival")]
 pub(crate) fn check_survival_tv_covariates(
     model: &CompiledModel,
@@ -4755,24 +4777,35 @@ pub(crate) fn check_survival_tv_covariates(
         }
         let tv_set: std::collections::HashSet<&str> = tv.iter().map(String::as_str).collect();
         for (cmt, endpoint) in &model.endpoints {
-            // Binary/categorical (#760): the logit predictor is evaluated at the baseline
-            // covariate snapshot (its closure takes no time argument), so a time-varying
-            // covariate on it would be silently frozen — the same #741 failure mode the
-            // hazard guard below rejects. `lp_covariates` includes covariates reached
-            // transitively through `[individual_parameters]`.
+            // Binary/categorical (#760, #2562): the logit predictor reads each record's own
+            // covariate snapshot, as the DTMM below does, so a time-varying covariate — or a
+            // θ level index that changes between visits — is honoured, provided the
+            // subject's snapshot lines up with its records. One that does not (a subject
+            // that also carries time-to-event rows) would silently fall back to the
+            // baseline. `lp_covariates` includes covariates reached transitively through
+            // `[individual_parameters]`.
             if let EndpointLikelihood::Binary { lp_covariates, .. } = endpoint {
                 if let Some(name) = lp_covariates.iter().find(|c| tv_set.contains(c.as_str())) {
-                    return refuse(
-                        "binary_model",
-                        format!(
-                        "[binary_model] on CMT={cmt}: the logit predictor references covariate \
-                         `{name}`, which is time-varying for subject `{}`. Time-varying covariates \
-                         on the predictor are not yet supported — it is evaluated at the baseline \
-                         covariate value, so the fit would silently use the wrong log-odds (#741). \
-                         Use a time-constant (baseline) covariate for now.",
-                        subject.id
-                    ),
-                    );
+                    if subject.record_covariate_snapshots().is_none() {
+                        return refuse(
+                            "binary_model",
+                            format!(
+                                "[binary_model] on CMT={cmt}: the logit predictor references \
+                                 {}, which is time-varying for subject `{}`, but that subject \
+                                 carries no per-record covariate snapshot aligned with its \
+                                 binary records (it also has time-to-event records, or was \
+                                 built in memory without `endpoint_covariates`), so the \
+                                 predictor could only read the baseline value (#741). {}",
+                                tv_reference(name),
+                                subject.id,
+                                tv_remedy(
+                                    name,
+                                    "fit the binary endpoint without the \
+                                                 time-to-event endpoint"
+                                ),
+                            ),
+                        );
+                    }
                 }
                 continue;
             }
@@ -4787,20 +4820,20 @@ pub(crate) fn check_survival_tv_covariates(
             } = endpoint
             {
                 if let Some(name) = prob_covariates.iter().find(|c| tv_set.contains(c.as_str())) {
-                    if crate::markov::dtmm::record_covariate_snapshots(subject).is_none() {
+                    if subject.record_covariate_snapshots().is_none() {
                         return refuse(
                             "markov_model",
                             format!(
                                 "[markov_model] (type = dtmm) on CMT={cmt}: a transition \
-                                 probability references covariate `{name}`, which is \
-                                 time-varying for subject `{}`, but that subject carries no \
-                                 per-record covariate snapshot aligned with its state records \
-                                 (it also has time-to-event records, or was built in memory \
-                                 without `endpoint_covariates`), so the probability could only \
-                                 read the baseline value (#741). Hold `{name}` constant within \
-                                 the subject, or fit the DTMM without the time-to-event \
-                                 endpoint.",
-                                subject.id
+                                 probability references {}, which is time-varying for subject \
+                                 `{}`, but that subject carries no per-record covariate \
+                                 snapshot aligned with its state records (it also has \
+                                 time-to-event records, or was built in memory without \
+                                 `endpoint_covariates`), so the probability could only read the \
+                                 baseline value (#741). {}",
+                                tv_reference(name),
+                                subject.id,
+                                tv_remedy(name, "fit the DTMM without the time-to-event endpoint"),
                             ),
                         );
                     }
@@ -4824,12 +4857,13 @@ pub(crate) fn check_survival_tv_covariates(
                     return refuse(
                         "markov_model",
                         format!(
-                        "[markov_model] on CMT={cmt}: a transition intensity references covariate \
-                         `{name}`, which is time-varying for subject `{}`. Time-varying covariates \
+                        "[markov_model] on CMT={cmt}: a transition intensity references {}, \
+                         which is time-varying for subject `{}`. Time-varying covariates \
                          on the generator are not yet supported — the generator is evaluated at the \
                          baseline covariate value (time-homogeneous CTMM), so the fit would \
                          silently use the wrong intensity (#741). A drug-driven Q(t) is Phase 6; \
                          use a time-constant (baseline) covariate for now.",
+                        tv_reference(name),
                         subject.id
                     ),
                     );

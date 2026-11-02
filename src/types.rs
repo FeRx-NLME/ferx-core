@@ -1297,6 +1297,53 @@ impl Subject {
         self.obs_covariates.get(j).unwrap_or(&self.covariates)
     }
 
+    /// The reader's per-row covariate snapshot, **aligned with [`Self::obs_records`]**, or
+    /// `None` when there is none to align.
+    ///
+    /// [`Self::endpoint_covariates`] holds one LOCF snapshot per data row routed to a
+    /// non-Gaussian endpoint, in reading order, taken after the row's own cells are read, so
+    /// the snapshot of a state row carries that row's covariate values. It is empty when no
+    /// covariate varies within the subject, and the baseline map is then exact. A
+    /// discrete-state or count row yields exactly one record and one snapshot, so the two
+    /// lists are parallel, unless the subject also carries time-to-event rows, which can
+    /// yield zero or two records per row. Those subjects, and an in-memory subject whose
+    /// snapshot length does not match, return `None`. `crate::api::check_survival_tv_covariates`
+    /// refuses such a subject when a predictor covariate varies, so `None` only ever stands
+    /// for "the baseline is exact". Shared by the binary predictor (#2562) and the DTMM
+    /// probabilities (#2473).
+    pub(crate) fn record_covariate_snapshots(&self) -> Option<&[HashMap<String, f64>]> {
+        let snaps = &self.endpoint_covariates;
+        let aligned =
+            !snaps.is_empty() && snaps.len() == self.obs_records.len() && !self.has_event_records();
+        aligned.then_some(snaps.as_slice())
+    }
+
+    /// Whether any of [`Self::obs_records`] is a time-to-event record, the one kind a data
+    /// row can yield zero or two of.
+    pub(crate) fn has_event_records(&self) -> bool {
+        #[cfg(feature = "survival")]
+        {
+            self.obs_records
+                .iter()
+                .any(|r| matches!(r, ObsRecord::Event { .. }))
+        }
+        #[cfg(not(feature = "survival"))]
+        {
+            false
+        }
+    }
+
+    /// The covariate map record `r` of [`Self::obs_records`] is evaluated with: its own
+    /// snapshot when `snaps` (this subject's [`Self::record_covariate_snapshots`], taken
+    /// once per walk) aligns, else the baseline map.
+    pub(crate) fn record_cov<'a>(
+        &'a self,
+        snaps: Option<&'a [HashMap<String, f64>]>,
+        r: usize,
+    ) -> &'a HashMap<String, f64> {
+        snaps.and_then(|s| s.get(r)).unwrap_or(&self.covariates)
+    }
+
     /// Covariate snapshot at dose index `k`. Same fallback as `obs_cov`.
     pub fn dose_cov(&self, k: usize) -> &HashMap<String, f64> {
         self.dose_covariates.get(k).unwrap_or(&self.covariates)

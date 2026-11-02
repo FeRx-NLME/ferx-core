@@ -105,12 +105,13 @@ fn for_each_binary_lp<F>(
     records: &[ObsRecord],
     theta: &[f64],
     eta: &[f64],
-    covariates: &HashMap<String, f64>,
+    snaps: Option<&[HashMap<String, f64>]>,
+    baseline: &HashMap<String, f64>,
     mut f: F,
 ) where
-    F: FnMut(BinaryRecordLp),
+    F: FnMut(BinaryRecordLp<'_>),
 {
-    for r in records {
+    for (idx, r) in records.iter().enumerate() {
         if let ObsRecord::DiscreteState {
             time,
             raw_time,
@@ -126,9 +127,14 @@ fn for_each_binary_lp<F>(
             // `TIME` is constant across records (the guard is a cheap thread-local
             // set/restore). The guard gets the **internal** clock (what the engine and
             // the likelihood use); `raw_time` is carried alongside purely for reporting.
+            // Each record reads its own covariate snapshot when the subject carries one
+            // aligned with its records (#2562): a time-varying covariate, or a θ level
+            // index that changes between visits. Otherwise the baseline map is exact.
+            let covariates = snaps.and_then(|s| s.get(idx)).unwrap_or(baseline);
             let lp = with_model_time(*time, || lp_fn(theta, eta, covariates));
             f(BinaryRecordLp {
                 model_time: *time,
+                covariates,
                 raw_time: *raw_time,
                 state: *state,
                 lp,
@@ -145,10 +151,13 @@ fn for_each_binary_lp<F>(
 /// reset-delimited occasions, where the internal timeline is shifted to stay monotonic.
 /// The predictor itself is always evaluated on the internal clock; only reporting uses
 /// this field.
-struct BinaryRecordLp {
+struct BinaryRecordLp<'a> {
     /// Internal (occasion-shifted) clock — what `with_model_time` must be given for any
     /// *further* predictor evaluation on this record, so it agrees with `lp` above.
     model_time: f64,
+    /// The covariate map `lp` was evaluated with, for any further predictor evaluation on
+    /// this record.
+    covariates: &'a HashMap<String, f64>,
     raw_time: f64,
     state: usize,
     lp: f64,
@@ -190,10 +199,11 @@ pub(crate) fn binary_data_term(
     records: &[ObsRecord],
     theta: &[f64],
     eta: &[f64],
-    covariates: &HashMap<String, f64>,
+    snaps: Option<&[HashMap<String, f64>]>,
+    baseline: &HashMap<String, f64>,
 ) -> f64 {
     let mut nll = 0.0;
-    for_each_binary_lp(lp_fn, cmt, records, theta, eta, covariates, |r| {
+    for_each_binary_lp(lp_fn, cmt, records, theta, eta, snaps, baseline, |r| {
         let (state, lp) = (r.state, r.lp);
         debug_assert!(state <= 1, "binary state must be 0/1 (validated pre-fit)");
         if !lp.is_finite() {
@@ -280,6 +290,7 @@ pub(crate) fn binary_subject_nll(
                 &subject.obs_records,
                 theta,
                 eta,
+                subject.record_covariate_snapshots(),
                 &subject.covariates,
             );
         }
@@ -305,6 +316,7 @@ pub(crate) fn binary_subject_nll(
                 &subject.obs_records,
                 theta,
                 eta,
+                subject.record_covariate_snapshots(),
                 &subject.covariates,
             );
         }
@@ -374,7 +386,8 @@ impl crate::survival::SubjectTerm for DiscreteTerm<'_> {
                 continue;
             };
             let prog = lp_program.as_ref()?;
-            for r in &self.subject.obs_records {
+            let snaps = self.subject.record_covariate_snapshots();
+            for (idx, r) in self.subject.obs_records.iter().enumerate() {
                 let ObsRecord::DiscreteState {
                     time,
                     state,
@@ -387,7 +400,9 @@ impl crate::survival::SubjectTerm for DiscreteTerm<'_> {
                 if *c != cmt {
                     continue;
                 }
-                let lp = with_model_time(*time, || prog.eval_g(th, et, &self.subject.covariates))?
+                // The value path's map (`for_each_binary_lp`), so the two cannot drift.
+                let cov = self.subject.record_cov(snaps, idx);
+                let lp = with_model_time(*time, || prog.eval_g(th, et, cov))?
                     .into_iter()
                     .next()?;
                 if !lp.val().is_finite() {
@@ -492,6 +507,7 @@ pub fn simulate_binary<R: rand::Rng>(
             &subject.obs_records,
             theta,
             eta,
+            subject.record_covariate_snapshots(),
             &subject.covariates,
             |r| {
                 let lp = r.lp;
@@ -561,6 +577,7 @@ pub fn predict_binary(
             &subject.obs_records,
             theta,
             eta,
+            subject.record_covariate_snapshots(),
             &subject.covariates,
             |r| {
                 let p = binary_prob(*link, r.lp);
@@ -638,6 +655,7 @@ pub fn binary_diagnostics(
             &subject.obs_records,
             theta,
             eta,
+            subject.record_covariate_snapshots(),
             &subject.covariates,
             |r| {
                 let p = binary_prob(*link, r.lp);
@@ -646,7 +664,7 @@ pub fn binary_diagnostics(
                 // PRED is the typical-subject probability (η = 0), mirroring the Gaussian
                 // `pred`/`ipred` split; IPRED conditions on this subject's EBE.
                 let pred = with_model_time(r.model_time, || {
-                    binary_prob(*link, lp_fn(theta, &zero_eta, &subject.covariates))
+                    binary_prob(*link, lp_fn(theta, &zero_eta, r.covariates))
                 });
                 let y = (r.state as f64).min(1.0);
                 rows.push(DiscreteObsDiagnostic {
@@ -711,7 +729,7 @@ mod tests {
         let recs = [rec(0.0, 1), rec(5.0, 0), rec(9.0, 1)];
         // Two events (y=1) and one non-event (y=0).
         let expect = -(2.0 * p.ln() + (1.0 - p).ln());
-        let got = binary_data_term(LinkFn::Logit, &const_lp(lp), 3, &recs, &[], &[], &cov);
+        let got = binary_data_term(LinkFn::Logit, &const_lp(lp), 3, &recs, &[], &[], None, &cov);
         assert!((got - expect).abs() < 1e-12, "got {got}, expect {expect}");
     }
 
@@ -720,7 +738,16 @@ mod tests {
     fn binary_data_term_half_probability() {
         let cov = HashMap::new();
         let recs = [rec(0.0, 0), rec(1.0, 1)];
-        let got = binary_data_term(LinkFn::Logit, &const_lp(0.0), 3, &recs, &[], &[], &cov);
+        let got = binary_data_term(
+            LinkFn::Logit,
+            &const_lp(0.0),
+            3,
+            &recs,
+            &[],
+            &[],
+            None,
+            &cov,
+        );
         assert!((got - 2.0 * std::f64::consts::LN_2).abs() < 1e-12);
     }
 
@@ -738,6 +765,7 @@ mod tests {
                 &[rec(0.0, state)],
                 &[],
                 &[],
+                None,
                 &cov,
             )
         };
@@ -822,6 +850,7 @@ mod tests {
                     &[rec(0.0, state)],
                     &[],
                     &[],
+                    None,
                     &cov,
                 );
                 assert!(

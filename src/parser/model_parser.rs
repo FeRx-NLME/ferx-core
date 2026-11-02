@@ -7187,6 +7187,16 @@ pub fn parse_full_model_with(
 
         model.referenced_covariates.sort();
     }
+    // #2562: which discrete-state endpoints read each level block, for the binder.
+    #[cfg(feature = "survival")]
+    for decl in model
+        .indiv_param_partials
+        .theta_blocks
+        .level_blocks
+        .iter_mut()
+    {
+        decl.record_cmts = level_record_cmts(&model.endpoints, &decl.index_covariate);
+    }
 
     // Warn about declared-but-unused parameters. Runs here (after [event_model]
     // parsing) so that parameters used only in [event_model] are not falsely
@@ -18799,6 +18809,7 @@ fn parse_parameters(
                                 eta_couplings: Vec::new(),
                                 eta_readers: Vec::new(),
                                 index_covariate: index_covariate.clone(),
+                                record_cmts: Vec::new(),
                             });
                             (levels, theta_names, Some(index_covariate))
                         }
@@ -19313,6 +19324,39 @@ pub(crate) const LEVEL_INDEX_PREFIX: &str = "__level_";
 /// gathers on.
 pub(crate) fn level_index_column(block: &str) -> String {
     format!("{LEVEL_INDEX_PREFIX}{block}")
+}
+
+/// The CMTs of the discrete-state endpoints whose expression reads the level index
+/// column `index`, sorted ([`LevelBlockDecl::record_cmts`], #2562). An endpoint's
+/// covariate list includes the columns reached through `[individual_parameters]`, so a
+/// block read through an individual parameter counts.
+#[cfg(feature = "survival")]
+fn level_record_cmts(
+    endpoints: &HashMap<usize, crate::types::EndpointLikelihood>,
+    index: &str,
+) -> Vec<usize> {
+    let mut cmts: Vec<usize> = Vec::new();
+    for (&cmt, ep) in endpoints {
+        use crate::types::EndpointLikelihood as E;
+        let reads = match ep {
+            E::Binary { lp_covariates, .. } => lp_covariates.iter().any(|c| c == index),
+            #[cfg(feature = "markov")]
+            E::Dtmm {
+                prob_covariates, ..
+            } => prob_covariates.iter().any(|c| c == index),
+            #[cfg(feature = "markov")]
+            E::Ctmm {
+                generator_covariates,
+                ..
+            } => generator_covariates.iter().any(|c| c == index),
+            _ => false,
+        };
+        if reads {
+            cmts.push(cmt);
+        }
+    }
+    cmts.sort_unstable();
+    cmts
 }
 
 /// Whether `name` is a synthesized level index column rather than a real data
@@ -23181,6 +23225,12 @@ pub struct LevelBlockDecl {
     pub(crate) eta_readers: Vec<Vec<String>>,
     /// Synthesized per-record index column the implicit gather reads.
     pub(crate) index_covariate: String,
+    /// Set by the parse: the CMTs of the discrete-state endpoints (`[binary_model]`, a
+    /// DTMM or CTMM `[markov_model]`) whose expression reads this block, sorted (#2562).
+    /// Their records define levels as the Gaussian observations do, and carry the index
+    /// in their per-record covariate snapshot. Time-to-event records never do: one data
+    /// row can yield zero or two of them.
+    pub(crate) record_cmts: Vec<usize>,
 }
 
 impl LevelBlockDecl {
