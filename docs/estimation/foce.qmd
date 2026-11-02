@@ -959,15 +959,17 @@ step, which is the error the predictor removes. On saturating units the path als
 optimum a fit reaches, which is why a network's inner solves are not seeded either. Under IOV a subject's κ̂ is not predicted; its warm inner solve is instead seeded with
 the stacked Gauss–Newton metric, as a BSV solve is; a cold start stays unseeded, because
 the metric's full first step [selects the basin](../model-file/fit-options.qmd#escaping-a-multimodal-individual-objective).
-Under Laplace and AGQ the predictor is left out, on measurement. The quadrature is
-centred on the same conditional mode, so its mode response is FOCEI's: the exact inner
-Hessian $\nabla^2_\eta l$, not the Gauss–Newton $\tilde H$ that places the nodes under
-the FOCEI anchor. It is formed from the quadrature's own tape and equals FOCEI's to rounding.
-But the predicted start left every quadrature fit's outer iteration count unchanged (20–21
-either way), so it saves inner work only. The inner pass is about 10–15% of a quadrature
-fit, whose cost is its gradient tape, and the response costs one more sweep of that tape
-per random effect. On `pk1` the fits came out 0.98 (Laplace), 0.91 and 0.84 (AGQ-3,
-Gauss–Newton and exact anchor) and 0.82–1.02 on the ODE twins.
+The predictor serves Laplace and AGQ too. The quadrature is centred on the same
+conditional mode, so its mode response is FOCEI's: the exact inner Hessian
+$\nabla^2_\eta l$, not the Gauss–Newton $\tilde H$ that places the nodes under the FOCEI
+anchor. It is formed from the quadrature's own tape and equals FOCEI's to rounding. On a
+hard quadrature fit it decides the result: Laplace on `pk2_big` (26 parameters, five
+random effects) reaches OFV −3485.11 with it, against −3458.81 without, in two-thirds of
+the work. On easy quadrature fits it changes no iteration count, since they stop on the
+[objective-change criterion](agq.qmd#where-agq-stops) about 20 iterations in. Each warm inner
+solve there starts from the Hessian the previous gradient pass formed at its mode, and the
+quadrature objective's exact anchor reuses that pass's Hessian too, so the exact inner
+Hessian is formed once per subject and evaluation.
 
 ### The final inner loop {#final-inner-loop}
 

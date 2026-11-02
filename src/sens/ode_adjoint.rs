@@ -51,7 +51,8 @@ use crate::sens::num::PkNum;
 use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
 use crate::sens::vfree::DualF;
 use crate::sens::vtape::{
-    vadj_index, vadj_index_h, vadj_init, vsweep, vsweep_h, vtape_reset, DualV, NONE,
+    vadj_index, vadj_index_h, vadj_index_h_lane, vadj_init, vsweep, vsweep_h, vsweep_h_lanes,
+    vtape_reset, DualV, NONE,
 };
 use crate::types::ModelParameters;
 use nalgebra::{DMatrix, DVector};
@@ -410,10 +411,38 @@ pub(crate) fn subject_adjoint_gradient_and_eta_dx_at(
     eta_hat: &[f64],
     objective: Objective,
 ) -> (Option<Vec<f64>>, Option<Vec<DVector<f64>>>) {
-    let mut dx = None;
-    let g = adjoint_gradient(model, subject, pt, eta_hat, objective, false, Some(&mut dx));
-    let dx = if g.is_some() { dx } else { None };
-    (g, dx)
+    let mut out = ModeOut {
+        want_dx: true,
+        ..ModeOut::default()
+    };
+    let g = subject_adjoint_gradient_and_mode_at(model, subject, pt, eta_hat, objective, &mut out);
+    (g, out.eta_dx)
+}
+
+/// [`subject_adjoint_gradient_at`], with whatever `out` asks for about the subject's mode
+/// ([`ModeOut`]) formed from the same pass. Both are `None` where the gradient is.
+pub(crate) fn subject_adjoint_gradient_and_mode_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+    out: &mut ModeOut,
+) -> Option<Vec<f64>> {
+    let g = adjoint_gradient(
+        model,
+        subject,
+        pt,
+        eta_hat,
+        objective,
+        false,
+        Some(&mut *out),
+    );
+    if g.is_none() {
+        out.eta_dx = None;
+        out.hessian = None;
+    }
+    g
 }
 
 /// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, for an AGQ subject whose mode
@@ -845,7 +874,7 @@ fn adjoint_gradient(
     eta_hat: &[f64],
     objective: Objective,
     held: bool,
-    eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
+    eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let (template, x) = (pt.template, pt.x);
     let mut sc = scope(model, subject, pt, eta_hat)?;
@@ -874,12 +903,12 @@ fn adjoint_gradient(
         x: &[f64],
         objective: Objective,
         held: bool,
-        eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
+        eta_dx: Option<&mut ModeOut>,
     ) -> Option<Vec<f64>>
     where
         Bucket<N, M>: ExactAnchor<N, M>,
     {
-        let go_run = |eta_dx: Option<&mut Option<Vec<DVector<f64>>>>| match objective {
+        let go_run = |eta_dx: Option<&mut ModeOut>| match objective {
             Objective::Agq { n_agq, exact } => run_agq::<N, M>(
                 sc.model,
                 subject,
@@ -917,10 +946,17 @@ fn adjoint_gradient(
             // reports no response (#2549 review r2 #2).
             Some(o) => match go_run(Some(&mut *o)) {
                 Some(g) => Some(g),
-                None => {
-                    *o = None;
-                    go_run(None)
+                None if o.want_dx => {
+                    let mut lite = ModeOut {
+                        want_hessian: o.want_hessian,
+                        ..ModeOut::default()
+                    };
+                    let g = go_run(Some(&mut lite));
+                    o.eta_dx = None;
+                    o.hessian = lite.hessian;
+                    g
                 }
+                None => None,
             },
         }
     }
@@ -1576,31 +1612,20 @@ fn lift_polynomial<T: VmNum>(
         .iter()
         .map(|&(_, d)| d - T::from_f64(d.val()))
         .collect();
-    let m = table.exps.len();
-    // `keep[k]`: monomial `k` reads only live directions.
-    let keep: Vec<bool> = table
-        .exps
-        .iter()
-        .map(|e| e.iter().skip(n).all(|&x| x == 0))
-        .collect();
-    let mut basis: Vec<T> = vec![T::from_f64(1.0); m];
-    for k in 1..m {
-        if keep[k] {
-            let (b, v) = table.parent[k];
-            basis[k] = if b == 0 {
-                dp[v as usize]
-            } else {
-                basis[b as usize] * dp[v as usize]
-            };
-        }
+    // The monomials of the live directions, built in place in compact order: a kept
+    // monomial's parent is kept and earlier (`Table::live`).
+    let lb = table.live(n);
+    let idx = &lb.idx;
+    let mut used: Vec<T> = Vec::with_capacity(idx.len());
+    for &(b, v) in &lb.parent {
+        let next = if b == 0 { dp[v] } else { used[b - 1] * dp[v] };
+        used.push(next);
     }
-    let idx: Vec<usize> = (1..m).filter(|&k| keep[k]).collect();
-    let used: Vec<T> = idx.iter().map(|&k| basis[k]).collect();
     let mut w = vec![0.0; idx.len()];
     coefs
         .iter()
         .map(|c| {
-            for (o, &k) in w.iter_mut().zip(&idx) {
+            for (o, &k) in w.iter_mut().zip(idx) {
                 *o = c[k];
             }
             if !(c[0].is_finite() && w.iter().all(|x| x.is_finite())) {
@@ -4130,7 +4155,7 @@ fn run<const N: usize, const M: usize>(
     eta: &[f64],
     interaction: bool,
     active: usize,
-    eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
+    eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
 
@@ -4268,7 +4293,7 @@ fn run<const N: usize, const M: usize>(
     // system. All outputs share each sweep as lanes, Ψ in lane 0. Copied: the non-Gaussian
     // term's θ block records its own scalar tape below.
     let mut outs = vec![psi];
-    if eta_dx.is_some() {
+    if eta_dx.as_ref().is_some_and(|o| o.want_dx) {
         outs.extend(eta_dx_outputs::<N>(
             &h,
             &lg,
@@ -4378,7 +4403,7 @@ fn run<const N: usize, const M: usize>(
         }
         let ok = cols.iter().all(|c| c.iter().all(|v| v.is_finite()));
         if let Some(o) = eta_dx {
-            *o = ok.then_some(cols);
+            o.eta_dx = ok.then_some(cols);
         }
     }
     Some(out)
@@ -4386,6 +4411,20 @@ fn run<const N: usize, const M: usize>(
 
 /// Widest lane chunk of the fused gradient-and-response sweeps ([`run`]).
 const DX_LANES: usize = 4;
+
+/// What a gradient pass can also hand back about the subject's mode, from its own recording
+/// (#2549): the exact mode response `dη̂/dx` (the EBE warm-start predictor's Jacobian) and,
+/// under the quadrature, the exact inner Hessian `∇²_η l` at the mode, which the quadrature
+/// objective's anchor and the next warm inner solve's seed would otherwise each recompute.
+#[derive(Debug, Default)]
+pub(crate) struct ModeOut {
+    /// Form the mode response.
+    pub(crate) want_dx: bool,
+    /// Hand back the exact inner Hessian (quadrature objectives only).
+    pub(crate) want_hessian: bool,
+    pub(crate) eta_dx: Option<Vec<DVector<f64>>>,
+    pub(crate) hessian: Option<DMatrix<f64>>,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -4669,7 +4708,7 @@ fn run_agq<const N: usize, const M: usize>(
     exact: bool,
     active: usize,
     held: bool,
-    eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
+    eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>>
 where
     Bucket<N, M>: ExactAnchor<N, M>,
@@ -4895,7 +4934,7 @@ trait ExactAnchor<const N: usize, const M: usize> {
         active: usize,
         held: bool,
         ng: Option<&AgqNg>,
-        eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
+        eta_dx: Option<&mut ModeOut>,
     ) -> Option<Vec<f64>>;
 }
 
@@ -4919,7 +4958,7 @@ macro_rules! exact_anchor_buckets {
                 active: usize,
                 held: bool,
                 ng: Option<&AgqNg>,
-                eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
+                eta_dx: Option<&mut ModeOut>,
             ) -> Option<Vec<f64>> {
                 agq_taped::<$n, $m, $n, true>(
                     model, subject, lay, template, params, x, eta, ctx, so, pv, p1, grid,
@@ -4945,7 +4984,7 @@ macro_rules! exact_anchor_buckets {
                 _: usize,
                 _: bool,
                 _: Option<&AgqNg>,
-                _: Option<&mut Option<Vec<DVector<f64>>>>,
+                _: Option<&mut ModeOut>,
             ) -> Option<Vec<f64>> {
                 None
             }
@@ -4980,7 +5019,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     active: usize,
     held: bool,
     ng: Option<&AgqNg>,
-    eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
+    eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
     let n_obs = subject.observations.len();
@@ -5164,7 +5203,8 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     }
     // `weights`: whether the θ adjoint is wanted (sweep 2), so the networks' backward
     // passes run once.
-    let sweep = |adj: &[f64], weights: bool| -> Option<([f64; N], Vec<f64>)> {
+    // `adj`: an output's adjoints on the scalar tape.
+    let sweep = |adj: TapeAdj<'_>, weights: bool| -> Option<([f64; N], Vec<f64>)> {
         let vadj = vadj_init::<1>();
         let mut top = 0usize;
         let mut put = |node: u32, comp: usize, v: f64| {
@@ -5175,12 +5215,12 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         };
         for j in 0..n_obs {
             let p = &p2[j];
-            put(p.i, 0, ra(adj, fr[j]));
+            put(p.i, 0, adj.at(fr[j]));
             for m in 0..N {
                 put(
                     p.i,
                     1 + m,
-                    (0..N).map(|k| ra(adj, gr[j][k]) * dirs[k][m]).sum(),
+                    (0..N).map(|k| adj.at(gr[j][k]) * dirs[k][m]).sum(),
                 );
             }
             if TH {
@@ -5190,7 +5230,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
                         for l in 0..N {
                             let t = crate::sens::vtape::tri(k, l);
                             let w = if k == l { 1.0 } else { 0.5 };
-                            s += dirs[k][m] * dirs[l][m] * w * ra(adj, qr[j][t]);
+                            s += dirs[k][m] * dirs[l][m] * w * adj.at(qr[j][t]);
                         }
                     }
                     put(p.i, 1 + N + m, s);
@@ -5203,7 +5243,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         if weights {
             for (ps, fl) in node_preds.iter().zip(&node_fr) {
                 for (p, &f) in ps.iter().zip(fl) {
-                    put(p.i, 0, ra(adj, f));
+                    put(p.i, 0, adj.at(f));
                 }
             }
         }
@@ -5220,11 +5260,84 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
         }
         Some((
-            std::array::from_fn(|k| ra(adj, er[k]) + at(&et[k])),
+            std::array::from_fn(|k| adj.at(er[k]) + at(&et[k])),
             theta_adj,
         ))
     };
-    let (mut grad_eta, _) = sweep(&s1, false)?;
+    // The mode response's rows of one `sweep_lane_chunks` chunk (`n ≤ DX_LANES` of them)
+    // through the recording at `η̂` in one walk (#2549): `sweep(.., true)` per row, as lanes.
+    // A row is a function of `∇_η l` at `η̂` alone, so only the `η̂` recording's value,
+    // tangent and (for completeness) second-order components are seeded; the node
+    // recordings, which `sweep` seeds for Ψ, carry no row adjoint.
+    let sweep_rows = |chunks: &[(usize, Vec<f64>)], ci: usize, n: usize| -> Option<Vec<Vec<f64>>> {
+        const LL: usize = DX_LANES;
+        let lidx = |node: u32, comp: usize, lane: usize| {
+            if TH {
+                vadj_index_h_lane::<N, M2, LL>(node, comp, lane)
+            } else {
+                vadj_index::<N, LL>(node, comp, lane)
+            }
+        };
+        let vadj = vadj_init::<LL>();
+        let mut top = 0usize;
+        for lane in 0..n {
+            let adj = TapeAdj::Lane(chunks, ci * DX_LANES + lane);
+            let mut put = |node: u32, comp: usize, v: f64| {
+                if node != NONE && v != 0.0 {
+                    top = top.max(node as usize + 1);
+                    vadj[lidx(node, comp, lane)] += v;
+                }
+            };
+            for j in 0..n_obs {
+                let p = &p2[j];
+                put(p.i, 0, adj.at(fr[j]));
+                for m in 0..N {
+                    put(
+                        p.i,
+                        1 + m,
+                        (0..N).map(|k| adj.at(gr[j][k]) * dirs[k][m]).sum(),
+                    );
+                }
+                if TH {
+                    for m in 0..N {
+                        let mut s = 0.0;
+                        for k in 0..N {
+                            for l in 0..N {
+                                let t = crate::sens::vtape::tri(k, l);
+                                let w = if k == l { 1.0 } else { 0.5 };
+                                s += dirs[k][m] * dirs[l][m] * w * adj.at(qr[j][t]);
+                            }
+                        }
+                        put(p.i, 1 + N + m, s);
+                    }
+                }
+            }
+        }
+        let vs = if TH {
+            vsweep_h_lanes::<N, M2, LL>(top)
+        } else {
+            vsweep::<N, LL>(top)
+        };
+        (0..n)
+            .map(|lane| {
+                let at = |d: &DualV<N, M2, TH>| {
+                    if d.i == NONE {
+                        0.0
+                    } else {
+                        vs[lidx(d.i, 0, lane)]
+                    }
+                };
+                #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
+                let mut theta_adj: Vec<f64> = th.iter().map(at).collect();
+                #[cfg(feature = "nn")]
+                if let Some((red, z)) = &nn_out {
+                    add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
+                }
+                Some(theta_adj)
+            })
+            .collect()
+    };
+    let (mut grad_eta, _) = sweep(TapeAdj::Plain(&s1), false)?;
     // The term's inputs at η̂ move with η̂ through their own η-derivatives (the node values'
     // movement is the linearisation's, already on the tape).
     if let (Some(ngr), Some(ng)) = (ng_r.as_ref(), ng) {
@@ -5261,7 +5374,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let psi =
         a - <R as crate::sens::num::PkNum>::wsum3(0.0, (0..N).map(|k| (R::c(w[k]), lg[k], one)));
     let s2 = rsweep::<1>(&[psi]).to_vec();
-    let (_, mut theta_adj) = sweep(&s2, true)?;
+    let (_, mut theta_adj) = sweep(TapeAdj::Plain(&s2), true)?;
     let psi_of = |x: R| -> f64 { ra(&s2, x) };
     // ---- the mode response's sweeps, as [`run`] forms it for FOCE(I) (#2549) -----------
     // The quadrature is centred on the conditional mode `η̂ = argmin l`, whatever the
@@ -5273,14 +5386,15 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     // block below records over the scalar tape. Not at a declined mode (`held`), where
     // there is no identity to differentiate.
     let response = match &eta_dx {
-        Some(_) if at_mode => {
+        Some(o) if o.want_dx && at_mode => {
             let rows = eta_dx_outputs::<N>(&h_inner, &lg, active.min(N), n_bsv.min(active).min(N));
-            let adjs = sweep_lanes_split(&rows);
+            let chunks = sweep_lane_chunks(&rows);
             let mut tas = Vec::with_capacity(rows.len());
-            for adj in &adjs {
-                tas.push(sweep(adj, true)?.1);
+            for ci in 0..chunks.len() {
+                let n = DX_LANES.min(rows.len() - ci * DX_LANES);
+                tas.extend(sweep_rows(&chunks, ci, n)?);
             }
-            Some((adjs, tas))
+            Some((rows.len(), chunks, tas))
         }
         _ => None,
     };
@@ -5323,13 +5437,15 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     );
     // The response's non-Gaussian θ block and its packing, from the adjoints taken above.
     if let Some(o) = eta_dx {
-        *o = None;
-        if let Some((adjs, mut tas)) = response.filter(|(a, _)| !a.is_empty()) {
-            let n_rows = adjs.len();
+        o.eta_dx = None;
+        // The exact inner Hessian the identity above solved with, over the live block.
+        o.hessian = (o.want_hessian && at_mode)
+            .then(|| h_inner.view((0, 0), (active, active)).into_owned())
+            .filter(|h| h.iter().all(|v| v.is_finite()));
+        if let Some((n_rows, chunks, mut tas)) = response.filter(|(n, _, _)| *n > 0) {
             if let Some(ngr) = ng_r.as_ref() {
-                let seeds: Vec<_> = adjs
-                    .iter()
-                    .map(|adj| ng_adjoints(ngr, n_bsv, |v| ra(adj, v)))
+                let seeds: Vec<_> = (0..n_rows)
+                    .map(|r| ng_adjoints(ngr, n_bsv, |v| lane_adj(&chunks, r, v)))
                     .collect();
                 let d = ng_theta_adjoint_seeds(model, subject, theta, &eta[..n_bsv], &seeds)?;
                 for (ta, d) in tas.iter_mut().zip(d) {
@@ -5339,8 +5455,8 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
                 }
             }
             let mut cols = vec![DVector::<f64>::zeros(n_rows); x.len()];
-            for (r, (adj, ta)) in adjs.iter().zip(&tas).enumerate() {
-                let of = |v: R| ra(adj, v);
+            for (r, ta) in tas.iter().enumerate() {
+                let of = |v: R| lane_adj(&chunks, r, v);
                 let row =
                     packed_gradient(model, template, params, x.len(), ta, &of, &pr, &om, so, pv);
                 for (c, v) in cols.iter_mut().zip(row) {
@@ -5348,32 +5464,55 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
                 }
             }
             let ok = cols.iter().all(|c| c.iter().all(|v| v.is_finite()));
-            *o = ok.then_some(cols);
+            o.eta_dx = ok.then_some(cols);
         }
     }
     Some(out)
 }
 
-/// Each of `outs`' full adjoint vectors over the scalar tape, from lane-batched sweeps
-/// ([`DX_LANES`] outputs per walk of the tape).
-fn sweep_lanes_split(outs: &[R]) -> Vec<Vec<f64>> {
-    fn split<const L: usize>(y: &[R], out: &mut Vec<Vec<f64>>) {
+/// `outs`' adjoints over the scalar tape, from lane-batched sweeps: one `(lanes, buffer)`
+/// per [`DX_LANES`] outputs, the buffer lane-interleaved as `rsweep` leaves it (node `i`,
+/// lane `l` at `i · lanes + l`) and copied once per chunk, not split per output. Read with
+/// [`lane_adj`].
+fn sweep_lane_chunks(outs: &[R]) -> Vec<(usize, Vec<f64>)> {
+    fn chunk<const L: usize>(y: &[R]) -> (usize, Vec<f64>) {
         let o: [R; L] = std::array::from_fn(|i| y.get(i).copied().unwrap_or(R::c(0.0)));
-        let buf = rsweep::<L>(&o);
-        let n = buf.len() / L;
-        for l in 0..y.len().min(L) {
-            out.push((0..n).map(|i| buf[i * L + l]).collect());
-        }
+        (L, rsweep::<L>(&o).to_vec())
     }
-    let mut out = Vec::with_capacity(outs.len());
-    for chunk in outs.chunks(DX_LANES) {
-        match chunk.len() {
-            1 => split::<1>(chunk, &mut out),
-            2 => split::<2>(chunk, &mut out),
-            _ => split::<DX_LANES>(chunk, &mut out),
-        }
+    outs.chunks(DX_LANES)
+        .map(|c| match c.len() {
+            1 => chunk::<1>(c),
+            2 => chunk::<2>(c),
+            _ => chunk::<DX_LANES>(c),
+        })
+        .collect()
+}
+
+/// Output `r`'s adjoint at scalar-tape node `v`, from [`sweep_lane_chunks`].
+#[inline]
+fn lane_adj(chunks: &[(usize, Vec<f64>)], r: usize, v: R) -> f64 {
+    TapeAdj::Lane(chunks, r).at(v)
+}
+
+/// One output's adjoints on the scalar tape: a single-lane buffer, or output `r` of
+/// [`sweep_lane_chunks`] read in place.
+#[derive(Clone, Copy)]
+enum TapeAdj<'a> {
+    Plain(&'a [f64]),
+    Lane(&'a [(usize, Vec<f64>)], usize),
+}
+
+impl TapeAdj<'_> {
+    #[inline]
+    fn at(self, v: R) -> f64 {
+        v.idx().map_or(0.0, |i| match self {
+            TapeAdj::Plain(adj) => adj[i],
+            TapeAdj::Lane(chunks, r) => {
+                let (lanes, buf) = &chunks[r / DX_LANES];
+                buf[i * lanes + r % DX_LANES]
+            }
+        })
     }
-    out
 }
 
 #[path = "ode_adjoint_hessian.rs"]

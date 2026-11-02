@@ -1830,6 +1830,7 @@ pub(crate) fn find_ebe_cached(
 ) -> EbeResult {
     find_ebe_cached_from(
         model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy, None,
+        None,
     )
 }
 
@@ -1851,6 +1852,7 @@ pub(crate) fn find_ebe_cached_from(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
     fallback_start: Option<&[f64]>,
+    carried_seed: Option<&DMatrix<f64>>,
 ) -> EbeResult {
     #[cfg(test)]
     EBE_SOLVES_STARTED.with(|n| n.set(n.get() + 1));
@@ -1866,6 +1868,7 @@ pub(crate) fn find_ebe_cached_from(
         schedule,
         policy,
         fallback_start,
+        carried_seed,
     )
 }
 
@@ -2107,6 +2110,9 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     /// #2095 flip-flop twin seeds that ran a descent: a model or subject the seed declines
     /// leaves this untouched.
+    // Inner-solve seed Hessians formed from scratch on this thread (not carried, #2549).
+    pub(crate) static FRESH_SEEDS_FORMED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     pub(crate) static TWIN_SEEDS_RUN: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     /// #2013 screen descents that came back lower than the incumbent but within
@@ -2150,6 +2156,7 @@ fn find_ebe_impl(
 ) -> EbeResult {
     find_ebe_impl_from(
         model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy, None,
+        None,
     )
 }
 
@@ -2167,6 +2174,7 @@ fn find_ebe_impl_from(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
     fallback_start: Option<&[f64]>,
+    carried_seed: Option<&DMatrix<f64>>,
 ) -> EbeResult {
     if inner_profile_enabled() {
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2244,6 +2252,7 @@ fn find_ebe_impl_from(
             cold_seed,
             share,
             fallback_start,
+            carried_seed,
         )
     };
     // The Hessian seed is a *local* model of the individual objective. Near the mode it
@@ -2325,6 +2334,9 @@ fn find_ebe_solve(
     screen_share: Option<&RefCell<Option<Vec<ScreenDescent>>>>,
     // The mode a predicted `eta_init` was predicted from ([`find_ebe_cached_from`]).
     fallback_start: Option<&[f64]>,
+    // That mode's exact inner Hessian, carried from the incumbent's gradient pass: the
+    // warm solve's seed in place of a fresh one when the policy seeds exactly.
+    carried_seed: Option<&DMatrix<f64>>,
 ) -> Option<EbeResult> {
     let n_eta = model.n_eta;
 
@@ -2660,6 +2672,22 @@ fn find_ebe_solve(
         && dense_bfgs_route
         && (warm_start || cold_seed))
         .then(|| {
+            // The incumbent's exact inner Hessian at the mode this warm start was predicted
+            // from, carried from its gradient pass (#2549), stands in for a fresh one at the
+            // start: an SPD metric of the same objective at a point O(Δx) away, so the first
+            // step is still the Newton step the prediction approximates and the search ends
+            // at the same mode, without a second-order recording per warm solve.
+            if let Some(h) = carried_seed.filter(|h| {
+                seed_kind == InnerHessianSeed::Exact
+                    && warm_start
+                    && !cold_seed
+                    && h.nrows() == n_eta
+                    && h.ncols() == n_eta
+            }) {
+                return Some((h.clone(), None));
+            }
+            #[cfg(test)]
+            FRESH_SEEDS_FORMED.with(|n| n.set(n.get() + 1));
             analytic_inner_seed_hessian(
                 model,
                 subject,
@@ -6914,6 +6942,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send + Default>(
         tol,
         prev_etas,
         None,
+        None,
         mu_k,
         min_obs,
         restarts,
@@ -6957,6 +6986,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
         tol,
         prev_etas,
         None,
+        None,
         mu_k,
         min_obs,
         restarts,
@@ -6987,6 +7017,9 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
     tol: f64,
     prev_etas: &[DVector<f64>],
     fallback_etas: &[DVector<f64>],
+    // The exact inner Hessians at `fallback_etas`, carried from the incumbent's gradient pass:
+    // the warm solves' seeds where the policy seeds with the exact one (#2549).
+    seed_hessians: Option<&[Option<DMatrix<f64>>]>,
     mu_k: Option<&[f64]>,
     min_obs: usize,
     restarts: usize,
@@ -7009,6 +7042,7 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
         tol,
         Some(prev_etas),
         Some(fallback_etas),
+        seed_hessians,
         mu_k,
         min_obs,
         restarts,
@@ -7083,6 +7117,7 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
     tol: f64,
     prev_etas: Option<&[DVector<f64>]>,
     fallback_etas: Option<&[DVector<f64>]>,
+    seed_hessians: Option<&[Option<DMatrix<f64>>]>,
     mu_k: Option<&[f64]>,
     min_obs: usize,
     restarts: usize,
@@ -7136,9 +7171,12 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
                 None => local_schedule.as_ref(),
             };
             let fallback = fallback_etas.map(|f| f[i].as_slice());
+            let carried = seed_hessians
+                .and_then(|h| h.get(i))
+                .and_then(Option::as_ref);
             let mut ebe = find_ebe_cached_from(
                 model, subject, params, max_iter, tol, init, mu_k, restarts, schedule, policy,
-                fallback,
+                fallback, carried,
             );
             // A predicted start that the solve fails from is solved again from the
             // subject's previous mode, and the lower objective is kept (ties to the

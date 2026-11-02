@@ -73,6 +73,7 @@
 //! which is the entire cost. Dimensionality is therefore bounded by [`MAX_AGQ_GRID`]
 //! instead, and a sparse (Smolyak) rule is the real answer for `d = 5..8` (issue #251).
 
+use crate::sens::ode_provider::adjoint::ModeOut;
 use crate::stats::stacked_layout::{kappa_range, stacked_width};
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
@@ -229,6 +230,9 @@ pub(crate) struct PopulationEvaluation {
     /// Each subject's mode response `dη̂ᵢ/dx`, when asked for (the EBE warm-start predictor,
     /// #2549); `None` for a subject it does not reach.
     eta_dx: Option<Vec<Option<Vec<nalgebra::DVector<f64>>>>>,
+    /// Each subject's exact inner Hessian at its mode, from its score's pass, under the exact
+    /// anchor (#2549): the objective's anchor there, and the next warm solve's seed.
+    mode_hessians: Option<Vec<Option<DMatrix<f64>>>>,
     /// How each subject's score was formed, in subject order (for the outer FD-fallback
     /// warning).
     routes: Vec<ScoreRoute>,
@@ -1042,12 +1046,8 @@ fn agq_population_evaluate_impl(
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
     let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
 
-    #[allow(clippy::type_complexity)]
-    let per_subject: Vec<(
-        f64,
-        Option<(Vec<f64>, ScoreRoute)>,
-        Option<Vec<nalgebra::DVector<f64>>>,
-    )> = population
+    let exact_anchor = matches!(anchor, HessianAnchor::Exact);
+    let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>, ModeOut)> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -1062,6 +1062,21 @@ fn agq_population_evaluate_impl(
                 None
             };
             let schedule = cached_schedule.or(local_schedule.as_ref());
+            // The score first: under the exact anchor its pass forms the exact inner Hessian
+            // at the mode, which the objective's anchor then takes instead of recomputing it
+            // (#2549) — the same kernel on the same mode.
+            let mut mode = ModeOut {
+                want_dx: want_eta_dx,
+                want_hessian: exact_anchor,
+                ..ModeOut::default()
+            };
+            let score = context.score_routed_with_mode(
+                subject,
+                eta_hats[i].as_slice(),
+                subj_kappas,
+                true,
+                &mut mode,
+            );
             let nll = agq_subject_evaluate(
                 model,
                 subject,
@@ -1072,17 +1087,10 @@ fn agq_population_evaluate_impl(
                 &log_weights,
                 anchor,
                 schedule,
-                None,
+                mode.hessian.as_ref(),
                 terminal_work.map(|all| all[i].1),
             );
-            let (score, dx) = context.score_routed_with_eta_dx(
-                subject,
-                eta_hats[i].as_slice(),
-                subj_kappas,
-                true,
-                want_eta_dx,
-            );
-            (nll, score, dx)
+            (nll, score, mode)
         })
         .collect();
     let nll = per_subject.iter().map(|(nll, _, _)| nll).sum();
@@ -1099,12 +1107,16 @@ fn agq_population_evaluate_impl(
         .iter()
         .map(|(_, s, _)| s.as_ref().map_or(ScoreRoute::Reconverged, |s| s.1))
         .collect();
-    let eta_dx = want_eta_dx.then(|| per_subject.into_iter().map(|(_, _, dx)| dx).collect());
+    let (eta_dx, mode_hessians): (Vec<_>, Vec<_>) = per_subject
+        .into_iter()
+        .map(|(_, _, m)| (m.eta_dx, m.hessian))
+        .unzip();
     PopulationEvaluation {
         nll,
         gradient,
         routes,
-        eta_dx,
+        eta_dx: want_eta_dx.then_some(eta_dx),
+        mode_hessians: (want_eta_dx && exact_anchor).then_some(mode_hessians),
     }
 }
 
@@ -1268,33 +1280,30 @@ impl<'a> SubjectScoreContext<'a> {
         kappas: &[nalgebra::DVector<f64>],
         held_ok: bool,
     ) -> Option<(Vec<f64>, ScoreRoute)> {
-        self.score_routed_with_eta_dx(subject, eta, kappas, held_ok, false)
-            .0
+        self.score_routed_with_mode(subject, eta, kappas, held_ok, &mut ModeOut::default())
     }
 
-    /// [`Self::score_routed`], and with `want_eta_dx` the subject's mode response
-    /// `dη̂/dx` from the same adjoint pass (exact route only; #2549).
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn score_routed_with_eta_dx(
+    /// [`Self::score_routed`], with what `mode` asks for about the subject's mode
+    /// ([`ModeOut`]: its response, its exact inner Hessian) formed by the same adjoint pass.
+    /// Exact route only; on any other `mode` comes back empty (#2549).
+    pub(crate) fn score_routed_with_mode(
         &self,
         subject: &Subject,
         eta: &[f64],
         kappas: &[nalgebra::DVector<f64>],
         held_ok: bool,
-        want_eta_dx: bool,
-    ) -> (
-        Option<(Vec<f64>, ScoreRoute)>,
-        Option<Vec<nalgebra::DVector<f64>>>,
-    ) {
+        mode: &mut ModeOut,
+    ) -> Option<(Vec<f64>, ScoreRoute)> {
+        mode.eta_dx = None;
+        mode.hessian = None;
         if crate::cancel::is_cancelled(&self.options.cancel) {
-            return (None, None);
+            return None;
         }
         let joint_warm = stack_mode(eta, kappas);
         if !self.force_fd {
             // The adjoint (any node count, either anchor): the exact `dFᵢ/dx`.
             use crate::sens::ode_provider::adjoint::{
-                subject_adjoint_gradient_and_eta_dx_at, subject_adjoint_gradient_at,
-                subject_adjoint_held_ebe_score_at, Objective,
+                subject_adjoint_gradient_and_mode_at, subject_adjoint_held_ebe_score_at, Objective,
             };
             let objective = Objective::Agq {
                 n_agq: self.nodes.len(),
@@ -1314,31 +1323,25 @@ impl<'a> SubjectScoreContext<'a> {
             };
             if let Some(pt) = &self.point {
                 let b = &joint_warm[..];
-                let (exact, dx) = if want_eta_dx {
-                    subject_adjoint_gradient_and_eta_dx_at(self.model, subject, pt, b, objective)
-                } else {
-                    (
-                        subject_adjoint_gradient_at(self.model, subject, pt, b, objective),
-                        None,
-                    )
-                };
+                let exact = subject_adjoint_gradient_and_mode_at(
+                    self.model, subject, pt, b, objective, mode,
+                );
                 if let Some(g) = accept(exact) {
-                    return (Some((g, ScoreRoute::Exact)), dx);
+                    return Some((g, ScoreRoute::Exact));
                 }
+                mode.eta_dx = None;
+                mode.hessian = None;
                 if held_ok && self.model.n_kappa == 0 {
                     let held =
                         subject_adjoint_held_ebe_score_at(self.model, subject, pt, b, objective);
                     if let Some(g) = accept(held) {
-                        return (Some((g, ScoreRoute::HeldEbe)), None);
+                        return Some((g, ScoreRoute::HeldEbe));
                     }
                 }
             }
         }
-        (
-            self.finite_difference_score(subject, &joint_warm)
-                .map(|g| (g, ScoreRoute::Reconverged)),
-            None,
-        )
+        self.finite_difference_score(subject, &joint_warm)
+            .map(|g| (g, ScoreRoute::Reconverged))
     }
 
     fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
@@ -1429,7 +1432,7 @@ pub(crate) fn population_gradient_mixed(
     declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
     // The mode response's destination, for the EBE warm-start predictor (#2549): filled
     // from a fused `evaluation` that formed it, else from this pass's scores.
-    eta_dx: Option<&mut Option<Vec<Vec<nalgebra::DVector<f64>>>>>,
+    eta_dx: Option<&mut crate::estimation::sens_outer_gradient::ModeResponses>,
 ) -> Option<Vec<f64>> {
     if let Some(evaluation) = evaluation {
         if let Some(log) = declines {
@@ -1438,30 +1441,40 @@ pub(crate) fn population_gradient_mixed(
             }
         }
         if let (Some(slot), Some(per)) = (eta_dx, evaluation.eta_dx) {
-            *slot = Some(assemble_eta_dx(per, eta_hats, x.len()));
+            slot.eta_dx = Some(assemble_eta_dx(per, eta_hats, x.len()));
+            slot.hessians = evaluation.mode_hessians;
         }
         return evaluation.gradient;
     }
     let want_eta_dx = eta_dx.is_some();
+    let want_hessian = want_eta_dx && matches!(options.hessian_anchor(), HessianAnchor::Exact);
     let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
     let scores: Vec<_> = population
         .subjects
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            context.score_routed_with_eta_dx(
+            let mut mode = ModeOut {
+                want_dx: want_eta_dx,
+                want_hessian,
+                ..ModeOut::default()
+            };
+            let score = context.score_routed_with_mode(
                 subject,
                 eta_hats[i].as_slice(),
                 kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
                 true,
-                want_eta_dx,
-            )
+                &mut mode,
+            );
+            (score, mode)
         })
         .collect();
     let mut result = vec![0.0; x.len()];
     let mut per = Vec::with_capacity(scores.len());
-    for (i, (score, dx)) in scores.into_iter().enumerate() {
-        per.push(dx);
+    let mut hessians = Vec::with_capacity(scores.len());
+    for (i, (score, mode)) in scores.into_iter().enumerate() {
+        per.push(mode.eta_dx);
+        hessians.push(mode.hessian);
         let (score, route) = score?;
         if let Some(log) = declines {
             route.record(log, i);
@@ -1471,7 +1484,8 @@ pub(crate) fn population_gradient_mixed(
         }
     }
     if let Some(slot) = eta_dx {
-        *slot = Some(assemble_eta_dx(per, eta_hats, x.len()));
+        slot.eta_dx = Some(assemble_eta_dx(per, eta_hats, x.len()));
+        slot.hessians = want_hessian.then_some(hessians);
     }
     result.iter().all(|v| v.is_finite()).then_some(result)
 }

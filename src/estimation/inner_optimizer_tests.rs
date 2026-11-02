@@ -1734,6 +1734,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
             true,
             None,
             None,
+            None,
         )
         .expect("premise: the seed is in scope on this fixture");
         assert_ne!(
@@ -1846,6 +1847,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
             schedule.as_ref(),
             policy(InnerHessianSeed::GaussNewton),
             true,
+            None,
             None,
             None,
         )
@@ -6799,8 +6801,8 @@ fn an_extrapolated_predicted_start_still_reaches_the_mode() {
         let mut predicted = modes.clone();
         predicted[2].fill(far);
         let (_, _, _, _, got) = run_inner_loop_predicted_map_cached(
-            &model, &pop, params, 500, 1e-8, &predicted, &modes, None, 0, 0, None, policy, None,
-            outcome,
+            &model, &pop, params, 500, 1e-8, &predicted, &modes, None, None, 0, 0, None, policy,
+            None, outcome,
         );
         assert!(!got[2].0, "η = {far}: no Nelder–Mead recovery needed");
         for (&a, &b) in got[2].1.iter().zip(&from_modes[2].1) {
@@ -6817,4 +6819,86 @@ fn an_extrapolated_predicted_start_still_reaches_the_mode() {
     // starts, stopped at `inner_tol = 1e-8`; 1e-10 leaves room for another path's rounding
     // while a different mode would be O(1) away.
     assert!(worst < 1e-10, "extrapolated start vs the mode: {worst:.3e}");
+}
+
+/// A warm solve under the exact-seed policy (Laplace) takes the carried exact inner Hessian
+/// at the mode its start was predicted from as its BFGS seed, in place of forming one at the
+/// start (#2549), and ends at the same mode. Warfarin subjects at moved parameters, started
+/// from their modes at the defaults, each solved twice: with the carried Hessian (no fresh
+/// seed formed) and without (one per subject).
+#[test]
+fn a_carried_exact_seed_replaces_the_fresh_one_and_reaches_the_same_mode() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin parses");
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("data loads");
+    let old = &model.default_params;
+    let (modes, _, _, _) = run_inner_loop_warm(&model, &pop, old, 500, 1e-8, None, None, 0, 0);
+    let mut moved = old.clone();
+    for t in moved.theta.iter_mut() {
+        *t *= 1.03;
+    }
+    let policy = InnerSolvePolicy {
+        seed: InnerHessianSeed::Exact,
+        ..InnerSolvePolicy::default()
+    };
+    let mut worst = 0.0f64;
+    let mut carried_any = 0;
+    for (i, s) in pop.subjects.iter().enumerate() {
+        let Some(h) = crate::sens::ode_provider::adjoint::exact_inner_hessian(
+            &model,
+            s,
+            old,
+            modes[i].as_slice(),
+        ) else {
+            continue;
+        };
+        let solve = |carried: Option<&DMatrix<f64>>| {
+            FRESH_SEEDS_FORMED.with(|n| n.set(0));
+            let r = find_ebe_cached_from(
+                &model,
+                s,
+                &moved,
+                500,
+                1e-8,
+                Some(modes[i].as_slice()),
+                None,
+                0,
+                None,
+                policy,
+                None,
+                carried,
+            );
+            (r, FRESH_SEEDS_FORMED.with(|n| n.get()))
+        };
+        let (with, fresh_with) = solve(Some(&h));
+        let (without, fresh_without) = solve(None);
+        assert_eq!(fresh_with, 0, "subject {}: the carried seed was used", s.id);
+        assert_eq!(
+            fresh_without, 1,
+            "subject {}: the fresh seed is formed",
+            s.id
+        );
+        assert!(with.converged && without.converged, "subject {}", s.id);
+        for (a, b) in with.eta.iter().zip(without.eta.iter()) {
+            assert!(a.is_finite() && b.is_finite());
+            worst = worst.max((a - b).abs());
+        }
+        carried_any += 1;
+    }
+    assert_eq!(
+        carried_any,
+        pop.subjects.len(),
+        "every subject carries a seed"
+    );
+    eprintln!("carried vs fresh seed, η̂: {worst:.3e}");
+    // Measured 1.24e-12 (Linux x86_64): two converged searches of one mode from one start,
+    // stopped at `inner_tol = 1e-8` on the gradient norm; 1e-6 still separates a different
+    // mode, which sits O(0.1) away.
+    assert!(
+        worst < 1e-6,
+        "carried vs fresh seed reach different modes ({worst:.3e})"
+    );
 }

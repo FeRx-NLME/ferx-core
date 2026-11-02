@@ -1899,6 +1899,16 @@ pub(crate) fn vadj_index_h<const N: usize, const M: usize>(node: u32, comp: usiz
     node as usize * (1 + N + M) + comp
 }
 
+/// [`vadj_index_h`] for lane `lane` of [`vsweep_h_lanes`] with `L` lanes.
+#[inline]
+pub(crate) fn vadj_index_h_lane<const N: usize, const M: usize, const L: usize>(
+    node: u32,
+    comp: usize,
+    lane: usize,
+) -> usize {
+    (node as usize * L + lane) * (1 + N + M) + comp
+}
+
 /// Single-lane backward sweep of a directional second-order recording
 /// (`DualV<N, N, true>`, `vtape_reset(1 + 2N)`), over nodes `0 .. top`, with seeds placed
 /// on any component via [`vadj_init`] / [`vadj_index_h`]. The second-order rules are the
@@ -1906,6 +1916,16 @@ pub(crate) fn vadj_index_h<const N: usize, const M: usize>(node: u32, comp: usiz
 /// `φ′a_k + φ″a_k²` of a unary, written with `(k, k)` pairs); a quotient is
 /// differentiated as `a · (1/b)`, the same function as the stored `a/b`.
 pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [f64] {
+    vsweep_h_lanes::<N, M, 1>(top)
+}
+
+/// [`vsweep_h`] with `L` lanes: `L` outputs' adjoints swept through one walk of the tape
+/// (#2549), lane-major within each node — node `i`, lane `l`, component `k` at
+/// `(i·L + l)·nc + k` ([`vadj_index_h_lane`]), so each lane's components are contiguous and
+/// take the single-lane rules unchanged. `L = 1` is [`vsweep_h`].
+pub(crate) fn vsweep_h_lanes<const N: usize, const M: usize, const L: usize>(
+    top: usize,
+) -> &'static [f64] {
     let t = vt();
     let nc = 1 + N + M;
     debug_assert_eq!(t.nc, nc, "vsweep_h needs a taped-Hessian recording");
@@ -1937,203 +1957,223 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
             next_rhs -= 1;
             let r = &t.rhss[next_rhs];
             debug_assert_eq!(r.layout.lanes(), nc);
-            rhs_block_adjoint(t, r, &mut du_bar, &mut x_bar, adj, |node, k| node * nc + k);
+            for l in 0..L {
+                rhs_block_adjoint(t, r, &mut du_bar, &mut x_bar, adj, |node, k| {
+                    (node * L + l) * nc + k
+                });
+            }
         }
-        c.copy_from_slice(&adj[i * nc..i * nc + nc]);
-        let tangent_live = c[1..].iter().any(|x| *x != 0.0);
-        if !tangent_live && c[0] == 0.0 {
-            continue;
-        }
-        let nd = t.nodes[i];
-        // Only the value lane is live (#2481 §2.1): a value is a function of its parents'
-        // values alone, so its adjoint reaches their value lanes and nothing else. The rules
-        // below are the full ones with every tangent and payload adjoint zero — the same
-        // products, without the `nc`-lane loops. An AGQ node recording is seeded on its value
-        // lane only, so its whole subgraph takes this path.
-        if !tangent_live {
-            let c0 = c[0];
-            let v = |p: usize| vals[p * nc];
+        for l in 0..L {
+            c.copy_from_slice(&adj[(i * L + l) * nc..(i * L + l) * nc + nc]);
+            let tangent_live = c[1..].iter().any(|x| *x != 0.0);
+            if !tangent_live && c[0] == 0.0 {
+                continue;
+            }
+            let nd = t.nodes[i];
+            // Only the value lane is live (#2481 §2.1): a value is a function of its parents'
+            // values alone, so its adjoint reaches their value lanes and nothing else. The rules
+            // below are the full ones with every tangent and payload adjoint zero — the same
+            // products, without the `nc`-lane loops. An AGQ node recording is seeded on its value
+            // lane only, so its whole subgraph takes this path.
+            if !tangent_live {
+                let c0 = c[0];
+                let v = |p: usize| vals[p * nc];
+                match nd.op {
+                    Op::Leaf | Op::Rhs => {}
+                    Op::Solve => {
+                        unreachable!("the LU block hook is declined on a taped-Hessian recording")
+                    }
+                    Op::Add => {
+                        adj[(nd.a as usize * L + l) * nc] += c0;
+                        adj[(nd.b as usize * L + l) * nc] += c0;
+                    }
+                    Op::Sub => {
+                        adj[(nd.a as usize * L + l) * nc] += c0;
+                        adj[(nd.b as usize * L + l) * nc] += -1.0 * c0;
+                    }
+                    Op::Shift => adj[(nd.a as usize * L + l) * nc] += c0,
+                    Op::Neg => adj[(nd.a as usize * L + l) * nc] += -1.0 * c0,
+                    Op::Scale => adj[(nd.a as usize * L + l) * nc] += t.auxf[nd.x as usize] * c0,
+                    Op::Lin => {
+                        let (s0, cnt, x0) = (nd.a as usize, nd.b as usize, nd.x as usize);
+                        for j in 0..cnt {
+                            adj[(t.auxi[s0 + j] as usize * L + l) * nc] += t.auxf[x0 + j] * c0;
+                        }
+                    }
+                    Op::Dot => {
+                        let (s0, cnt) = (nd.a as usize, nd.b as usize);
+                        let mut xf = nd.x as usize;
+                        if t.auxi[s0] != NONE {
+                            adj[(t.auxi[s0] as usize * L + l) * nc] += c0;
+                        }
+                        for k in 0..cnt {
+                            let (ia, ib) = (t.auxi[s0 + 1 + 2 * k], t.auxi[s0 + 2 + 2 * k]);
+                            let mut part = |id: u32| -> f64 {
+                                if id != NONE {
+                                    v(id as usize)
+                                } else {
+                                    let r = t.auxf[xf];
+                                    xf += nc;
+                                    r
+                                }
+                            };
+                            let (av, bv) = (part(ia), part(ib));
+                            if ia != NONE {
+                                adj[(ia as usize * L + l) * nc] += c0 * bv;
+                            }
+                            if ib != NONE {
+                                adj[(ib as usize * L + l) * nc] += c0 * av;
+                            }
+                        }
+                    }
+                    Op::Unary => {
+                        let h1 = t.auxf[nd.x as usize];
+                        adj[(nd.a as usize * L + l) * nc] += c0 * h1;
+                    }
+                    Op::Mul => {
+                        let (a, b) = (nd.a as usize, nd.b as usize);
+                        let (av, bv) = (v(a), v(b));
+                        adj[(a * L + l) * nc] += c0 * bv;
+                        adj[(b * L + l) * nc] += c0 * av;
+                    }
+                    Op::Div => {
+                        // As the full rule: the product into (a, 1/b), then 1/b's derivative.
+                        let (a, b) = (nd.a as usize, nd.b as usize);
+                        let bv = v(b);
+                        let (ib, ib2) = (1.0 / bv, 1.0 / (bv * bv));
+                        adj[(a * L + l) * nc] += c0 * ib;
+                        adj[(b * L + l) * nc] += c0 * v(a) * -ib2;
+                    }
+                }
+                continue;
+            }
+            // The live width of this node's adjoint: with every second-order component's
+            // adjoint zero (a sweep seeded on values and tangents only, such as the EBE mode
+            // response's rows, #2549), the rules below write nothing past the tangents, so the
+            // accumulation stops there. A skipped term is an exact zero.
+            let w = if c[1 + N..].iter().any(|x| *x != 0.0) {
+                nc
+            } else {
+                1 + N
+            };
+            let lin = |adj: &mut Vec<f64>, p: usize, s: f64, c: &[f64]| {
+                for k in 0..w {
+                    adj[(p * L + l) * nc + k] += s * c[k];
+                }
+            };
             match nd.op {
                 Op::Leaf | Op::Rhs => {}
                 Op::Solve => {
                     unreachable!("the LU block hook is declined on a taped-Hessian recording")
                 }
                 Op::Add => {
-                    adj[nd.a as usize * nc] += c0;
-                    adj[nd.b as usize * nc] += c0;
+                    lin(adj, nd.a as usize, 1.0, &c);
+                    lin(adj, nd.b as usize, 1.0, &c);
                 }
                 Op::Sub => {
-                    adj[nd.a as usize * nc] += c0;
-                    adj[nd.b as usize * nc] += -1.0 * c0;
+                    lin(adj, nd.a as usize, 1.0, &c);
+                    lin(adj, nd.b as usize, -1.0, &c);
                 }
-                Op::Shift => adj[nd.a as usize * nc] += c0,
-                Op::Neg => adj[nd.a as usize * nc] += -1.0 * c0,
-                Op::Scale => adj[nd.a as usize * nc] += t.auxf[nd.x as usize] * c0,
+                Op::Shift => lin(adj, nd.a as usize, 1.0, &c),
+                Op::Neg => lin(adj, nd.a as usize, -1.0, &c),
+                Op::Scale => lin(adj, nd.a as usize, t.auxf[nd.x as usize], &c),
                 Op::Lin => {
                     let (s0, cnt, x0) = (nd.a as usize, nd.b as usize, nd.x as usize);
                     for j in 0..cnt {
-                        adj[t.auxi[s0 + j] as usize * nc] += t.auxf[x0 + j] * c0;
+                        lin(adj, t.auxi[s0 + j] as usize, t.auxf[x0 + j], &c);
                     }
                 }
                 Op::Dot => {
                     let (s0, cnt) = (nd.a as usize, nd.b as usize);
                     let mut xf = nd.x as usize;
                     if t.auxi[s0] != NONE {
-                        adj[t.auxi[s0] as usize * nc] += c0;
+                        lin(adj, t.auxi[s0] as usize, 1.0, &c);
                     }
                     for k in 0..cnt {
                         let (ia, ib) = (t.auxi[s0 + 1 + 2 * k], t.auxi[s0 + 2 + 2 * k]);
-                        let mut part = |id: u32| -> f64 {
+                        // Borrowed, not copied: the factor's components on the tape, or a
+                        // constant factor's in `auxf`.
+                        let mut part = |id: u32| -> &[f64] {
                             if id != NONE {
-                                v(id as usize)
+                                &vals[id as usize * nc..id as usize * nc + nc]
                             } else {
-                                let r = t.auxf[xf];
+                                let r = &t.auxf[xf..xf + nc];
                                 xf += nc;
                                 r
                             }
                         };
                         let (av, bv) = (part(ia), part(ib));
+                        ga[..w].iter_mut().for_each(|x| *x = 0.0);
+                        gb[..w].iter_mut().for_each(|x| *x = 0.0);
+                        mul_adjoint::<N>(&pairs, av, bv, &c, &mut ga, &mut gb);
                         if ia != NONE {
-                            adj[ia as usize * nc] += c0 * bv;
+                            lin(adj, ia as usize, 1.0, &ga);
                         }
                         if ib != NONE {
-                            adj[ib as usize * nc] += c0 * av;
+                            lin(adj, ib as usize, 1.0, &gb);
                         }
                     }
                 }
                 Op::Unary => {
-                    let h1 = t.auxf[nd.x as usize];
-                    adj[nd.a as usize * nc] += c0 * h1;
+                    let x = nd.x as usize;
+                    let (h1, h2, h3) = (t.auxf[x], t.auxf[x + 1], t.auxf[x + 2]);
+                    let a = nd.a as usize;
+                    unary_adjoint::<N>(
+                        &pairs,
+                        &vals[a * nc..a * nc + nc],
+                        &c,
+                        h1,
+                        h2,
+                        h3,
+                        &mut adj[(a * L + l) * nc..(a * L + l) * nc + nc],
+                    );
                 }
                 Op::Mul => {
                     let (a, b) = (nd.a as usize, nd.b as usize);
-                    let (av, bv) = (v(a), v(b));
-                    adj[a * nc] += c0 * bv;
-                    adj[b * nc] += c0 * av;
+                    ga[..w].iter_mut().for_each(|x| *x = 0.0);
+                    gb[..w].iter_mut().for_each(|x| *x = 0.0);
+                    mul_adjoint::<N>(
+                        &pairs,
+                        &vals[a * nc..a * nc + nc],
+                        &vals[b * nc..b * nc + nc],
+                        &c,
+                        &mut ga,
+                        &mut gb,
+                    );
+                    // Accumulated separately so `a == b` (a square) adds both halves.
+                    lin(adj, a, 1.0, &ga);
+                    lin(adj, b, 1.0, &gb);
                 }
                 Op::Div => {
-                    // As the full rule: the product into (a, 1/b), then 1/b's derivative.
+                    // q = a·u, u = 1/b: u's components from b's, the product rule into (a, u),
+                    // then u's adjoint into b through the unary rule of 1/x.
                     let (a, b) = (nd.a as usize, nd.b as usize);
-                    let bv = v(b);
-                    let (ib, ib2) = (1.0 / bv, 1.0 / (bv * bv));
-                    adj[a * nc] += c0 * ib;
-                    adj[b * nc] += c0 * v(a) * -ib2;
-                }
-            }
-            continue;
-        }
-        let lin = |adj: &mut Vec<f64>, p: usize, s: f64, c: &[f64]| {
-            for k in 0..nc {
-                adj[p * nc + k] += s * c[k];
-            }
-        };
-        match nd.op {
-            Op::Leaf | Op::Rhs => {}
-            Op::Solve => unreachable!("the LU block hook is declined on a taped-Hessian recording"),
-            Op::Add => {
-                lin(adj, nd.a as usize, 1.0, &c);
-                lin(adj, nd.b as usize, 1.0, &c);
-            }
-            Op::Sub => {
-                lin(adj, nd.a as usize, 1.0, &c);
-                lin(adj, nd.b as usize, -1.0, &c);
-            }
-            Op::Shift => lin(adj, nd.a as usize, 1.0, &c),
-            Op::Neg => lin(adj, nd.a as usize, -1.0, &c),
-            Op::Scale => lin(adj, nd.a as usize, t.auxf[nd.x as usize], &c),
-            Op::Lin => {
-                let (s0, cnt, x0) = (nd.a as usize, nd.b as usize, nd.x as usize);
-                for j in 0..cnt {
-                    lin(adj, t.auxi[s0 + j] as usize, t.auxf[x0 + j], &c);
-                }
-            }
-            Op::Dot => {
-                let (s0, cnt) = (nd.a as usize, nd.b as usize);
-                let mut xf = nd.x as usize;
-                if t.auxi[s0] != NONE {
-                    lin(adj, t.auxi[s0] as usize, 1.0, &c);
-                }
-                for k in 0..cnt {
-                    let (ia, ib) = (t.auxi[s0 + 1 + 2 * k], t.auxi[s0 + 2 + 2 * k]);
-                    let mut part = |id: u32| -> Vec<f64> {
-                        if id != NONE {
-                            vals[id as usize * nc..id as usize * nc + nc].to_vec()
-                        } else {
-                            let r = t.auxf[xf..xf + nc].to_vec();
-                            xf += nc;
-                            r
-                        }
-                    };
-                    let (av, bv) = (part(ia), part(ib));
-                    ga.iter_mut().for_each(|x| *x = 0.0);
-                    gb.iter_mut().for_each(|x| *x = 0.0);
-                    mul_adjoint::<N>(&pairs, &av, &bv, &c, &mut ga, &mut gb);
-                    if ia != NONE {
-                        lin(adj, ia as usize, 1.0, &ga);
+                    let bv = &vals[b * nc..b * nc + nc];
+                    let (ib, ib2) = (1.0 / bv[0], 1.0 / (bv[0] * bv[0]));
+                    let (d1, d2, d3) = (-ib2, 2.0 * ib2 * ib, -6.0 * ib2 * ib2);
+                    uv[0] = ib;
+                    for k in 0..N {
+                        uv[1 + k] = d1 * bv[1 + k];
                     }
-                    if ib != NONE {
-                        lin(adj, ib as usize, 1.0, &gb);
+                    for (tt, &(k, l)) in pairs.iter().enumerate() {
+                        uv[1 + N + tt] = d1 * bv[1 + N + tt] + d2 * bv[1 + k] * bv[1 + l];
                     }
+                    ga[..w].iter_mut().for_each(|x| *x = 0.0);
+                    // In full: `unary_adjoint` below reads every component of `ub`.
+                    ub.iter_mut().for_each(|x| *x = 0.0);
+                    mul_adjoint::<N>(
+                        &pairs,
+                        &vals[a * nc..a * nc + nc],
+                        &uv,
+                        &c,
+                        &mut ga,
+                        &mut ub,
+                    );
+                    gb[..w].iter_mut().for_each(|x| *x = 0.0);
+                    unary_adjoint::<N>(&pairs, bv, &ub, d1, d2, d3, &mut gb);
+                    lin(adj, a, 1.0, &ga);
+                    lin(adj, b, 1.0, &gb);
                 }
-            }
-            Op::Unary => {
-                let x = nd.x as usize;
-                let (h1, h2, h3) = (t.auxf[x], t.auxf[x + 1], t.auxf[x + 2]);
-                let a = nd.a as usize;
-                unary_adjoint::<N>(
-                    &pairs,
-                    &vals[a * nc..a * nc + nc],
-                    &c,
-                    h1,
-                    h2,
-                    h3,
-                    &mut adj[a * nc..a * nc + nc],
-                );
-            }
-            Op::Mul => {
-                let (a, b) = (nd.a as usize, nd.b as usize);
-                ga.iter_mut().for_each(|x| *x = 0.0);
-                gb.iter_mut().for_each(|x| *x = 0.0);
-                mul_adjoint::<N>(
-                    &pairs,
-                    &vals[a * nc..a * nc + nc],
-                    &vals[b * nc..b * nc + nc],
-                    &c,
-                    &mut ga,
-                    &mut gb,
-                );
-                // Accumulated separately so `a == b` (a square) adds both halves.
-                lin(adj, a, 1.0, &ga);
-                lin(adj, b, 1.0, &gb);
-            }
-            Op::Div => {
-                // q = a·u, u = 1/b: u's components from b's, the product rule into (a, u),
-                // then u's adjoint into b through the unary rule of 1/x.
-                let (a, b) = (nd.a as usize, nd.b as usize);
-                let bv = &vals[b * nc..b * nc + nc];
-                let (ib, ib2) = (1.0 / bv[0], 1.0 / (bv[0] * bv[0]));
-                let (d1, d2, d3) = (-ib2, 2.0 * ib2 * ib, -6.0 * ib2 * ib2);
-                uv[0] = ib;
-                for k in 0..N {
-                    uv[1 + k] = d1 * bv[1 + k];
-                }
-                for (tt, &(k, l)) in pairs.iter().enumerate() {
-                    uv[1 + N + tt] = d1 * bv[1 + N + tt] + d2 * bv[1 + k] * bv[1 + l];
-                }
-                ga.iter_mut().for_each(|x| *x = 0.0);
-                ub.iter_mut().for_each(|x| *x = 0.0);
-                mul_adjoint::<N>(
-                    &pairs,
-                    &vals[a * nc..a * nc + nc],
-                    &uv,
-                    &c,
-                    &mut ga,
-                    &mut ub,
-                );
-                gb.iter_mut().for_each(|x| *x = 0.0);
-                unary_adjoint::<N>(&pairs, bv, &ub, d1, d2, d3, &mut gb);
-                lin(adj, a, 1.0, &ga);
-                lin(adj, b, 1.0, &gb);
             }
         }
     }

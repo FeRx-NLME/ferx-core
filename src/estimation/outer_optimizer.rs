@@ -1510,7 +1510,8 @@ fn run_inner_loop_and_nll(
     f64,
 ) {
     let (etas, h_matrices, stats, kappas, nll, _, _) = run_inner_loop_and_nll_prepared(
-        model, population, params, options, prev_etas, None, mu_k, None, schedules, false, cancel,
+        model, population, params, options, prev_etas, None, None, mu_k, None, schedules, false,
+        cancel,
     );
     (etas, h_matrices, stats, kappas, nll)
 }
@@ -1555,9 +1556,10 @@ fn run_inner_loop_and_nll_prepared(
     prev_etas: Option<&[DVector<f64>]>,
     // The modes `prev_etas` were predicted from, when they are the warm-start predictor's
     // first-order starts (#2549): a subject whose solve fails from its prediction is
-    // solved again from its mode ([`run_inner_loop_predicted_map_cached`]). FOCE(I) only;
-    // the predictor does not serve AGQ.
+    // solved again from its mode ([`run_inner_loop_predicted_map_cached`]).
     fallback_etas: Option<&[DVector<f64>]>,
+    // The incumbent's exact inner Hessians, the predicted starts' seeds (#2549).
+    seed_hessians: Option<&[Option<DMatrix<f64>>]>,
     mu_k: Option<&[f64]>,
     // The fused AGQ gradient's inputs, and whether it forms the mode response (#2549).
     agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds, bool)>,
@@ -1604,6 +1606,7 @@ fn run_inner_loop_and_nll_prepared(
                         options.inner_tol,
                         start,
                         fallback,
+                        seed_hessians,
                         mu_k,
                         options.min_obs_for_convergence_check as usize,
                         options.inner_restarts,
@@ -1737,6 +1740,7 @@ fn run_inner_loop_and_nll_prepared(
                 options.inner_tol,
                 start,
                 fallback,
+                seed_hessians,
                 mu_k,
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
@@ -1798,6 +1802,10 @@ struct NloptState {
     /// [`crate::estimation::sens_outer_gradient::predict_warm_etas`]).
     pred_jac: Option<Vec<Vec<DVector<f64>>>>,
     pred_anchor: Vec<f64>,
+    /// The incumbent's exact inner Hessians at its modes, from the gradient pass that formed
+    /// `pred_jac` (#2549): the next warm solves' BFGS seeds where the policy seeds with the
+    /// exact inner Hessian (Laplace), in place of a fresh one at each start.
+    seed_hessians: Option<Vec<Option<DMatrix<f64>>>>,
     cached_h_mats: Vec<DMatrix<f64>>,
     /// Mixture per-class EBE warm-start cache `[class][subject]` (#977 Phase 3).
     /// Empty for non-mixture models.
@@ -1843,6 +1851,7 @@ impl NloptState {
         self.cached_etas_are_modes = false;
         self.pred_jac = None;
         self.pred_anchor.clear();
+        self.seed_hessians = None;
     }
 }
 
@@ -2006,10 +2015,11 @@ fn stagnation_window(n: usize, short_window: bool) -> usize {
 
 /// Does a gradient-based NLopt run get reachable `xtol`/`ftol` stops?
 ///
-/// Only the quadrature objectives (Laplace, FOCEI with `n_agq > 1`) do: their
-/// gradient is finite-difference-limited, so they stop on objective change and step
-/// size, like BOBYQA. FOCE/FOCEI get unreachable `1e-12` stops and rely on the
-/// gradient norm. One predicate, read both where the tolerances are set and by
+/// Only the quadrature objectives (Laplace, FOCEI with `n_agq > 1`) do: they stop on
+/// objective change and step size, like BOBYQA, where FOCE/FOCEI get unreachable `1e-12`
+/// stops and rely on the gradient norm, the stagnation guard and the #2462 verification
+/// legs. Their gradient is exact now, so this is a cost/accuracy choice (see the stop
+/// setting in `optimize_nlopt_attempt` for the measurement), not a noise floor. One predicate, read both where the tolerances are set and by
 /// [`use_short_stagnation_window`], so the two cannot drift apart.
 fn gradient_run_has_reachable_stops(options: &FitOptions) -> bool {
     options.agq_nodes().is_some()
@@ -2163,6 +2173,7 @@ fn new_nlopt_state(
         cached_etas_are_modes: false,
         pred_jac: None,
         pred_anchor: Vec::new(),
+        seed_hessians: None,
         cached_h_mats: Vec::new(),
         cached_etas_by_class: Vec::new(),
         best_ofv: f64::INFINITY,
@@ -5373,7 +5384,7 @@ fn optimize_nlopt_attempt(
     // those fits. On the unnormalised shipped example
     // it also changed which optimum the shipped start reached (OFV −164.5 vs −1173.6): on
     // saturating units the path decides the optimum, as for the inner seed (#1474).
-    let warm_predictor = warm_predictor_serves(model, init_params, options);
+    let warm_predictor = warm_predictor_serves(model, init_params);
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
     // Scale x0 into optimizer space: xs[i] = x[i] / scale[i].
@@ -5718,6 +5729,7 @@ fn optimize_nlopt_attempt(
                     eval_options,
                     Some(predicted.as_ref().unwrap_or(&state.cached_etas)),
                     predicted.is_some().then_some(state.cached_etas.as_slice()),
+                    predicted.as_ref().and(state.seed_hessians.as_deref()),
                     Some(&mu_k),
                     fuse_agq_gradient.then_some((
                         init_params,
@@ -5832,7 +5844,7 @@ fn optimize_nlopt_attempt(
         // present exactly when `grad_norm_for_trace` is.
         let mut grad_vec_for_trace: Option<Vec<f64>> = None;
         // This evaluation's mode responses, when its gradient formed them (#2549).
-        let mut eta_dx: Option<Vec<Vec<DVector<f64>>>> = None;
+        let mut eta_dx = crate::estimation::sens_outer_gradient::ModeResponses::default();
         if let Some(g) = grad {
             // A rejected or non-finite point has no useful population gradient: steepest
             // ascent toward bounds center nudges the optimizer back. Fall through (no early
@@ -5970,8 +5982,11 @@ fn optimize_nlopt_attempt(
             // The next evaluation predicts its warm start from this incumbent's mode
             // response; a gradient-free evaluation keeps the last response, re-anchored here.
             if warm_predictor {
-                if let Some(j) = eta_dx.take() {
+                if let Some(j) = eta_dx.eta_dx.take() {
                     state.pred_jac = Some(j);
+                    // The incumbent's exact inner Hessians go with its responses: the next
+                    // warm solves' seeds where the policy seeds with the exact one.
+                    state.seed_hessians = eta_dx.hessians.take();
                 }
                 state.pred_anchor.clone_from(&x);
             }
@@ -6289,20 +6304,16 @@ fn optimize_nlopt_attempt(
     } else {
         opt.set_maxeval(max_eval).unwrap();
         if gradient_run_has_reachable_stops(options) {
-            // AGQ's gradient is exact but **finite-difference-limited**: the grid-response
-            // term and the posterior Hessian are both central differences, so the gradient
-            // carries a noise floor (~1e-4 relative). The 1e-12 stops below are therefore
-            // *unreachable* for it — and unreachable stops are not harmless. L-BFGS keeps
-            // stepping until the true gradient drops under that floor, at which point the
-            // search direction is noise, the line search cannot find a decrease, and NLopt
-            // returns a bare `NLOPT_FAILURE`. The fit is fine (the engine restores the
-            // best-seen point) but it is reported as *not converged*, which is a lie about a
-            // result that has been flat to 8 significant figures for 15 evaluations.
-            //
-            // So stop AGQ where its objective actually settles — the same reachable
-            // objective-change / step-size criteria BOBYQA gets — rather than chasing a
-            // gradient norm the gradient cannot deliver. FOCE/FOCEI keep the 1e-12 stops:
-            // their gradient is analytic to ~1e-11 and they *do* reach `XtolReached`.
+            // The quadrature stops where its objective settles — the reachable
+            // objective-change / step-size criteria BOBYQA gets — rather than on FOCE/FOCEI's
+            // unreachable 1e-12 stops, stagnation guard and verification legs. This began as
+            // a noise floor (the grid response and anchor Hessian were central differences);
+            // the gradient is exact now, and it stays as a measured cost/accuracy choice
+            // (#2549): giving Laplace/AGQ the FOCEI regime cost 1.15–2.9× on the `pk1` fits
+            // (ODE AGQ-3 222 G → 651 G instructions) for ≤1e-5 OFV, and 7× on `pk2_big` Laplace
+            // for 0.10. What decides a hard quadrature fit is the EBE warm-start predictor
+            // (`warm_predictor_serves`): with it `pk2_big` Laplace reaches −3485.11 under these
+            // stops, against −3458.81 without.
             opt.set_xtol_rel(options.outer_xtol).unwrap();
             let ftol = resolve_outer_ftol(
                 model.has_non_gaussian(),
@@ -7436,9 +7447,10 @@ fn optimize_bfgs(
     let fdfg = |x: &[f64],
                 prev_etas: &[DVector<f64>],
                 fallback: Option<&[DVector<f64>]>,
+                seeds: Option<&[Option<DMatrix<f64>>]>,
                 grad_eval_idx: &mut usize,
                 incumbent: Option<(f64, &[f64])>,
-                eta_dx: Option<&mut Option<Vec<Vec<DVector<f64>>>>>|
+                eta_dx: Option<&mut crate::estimation::sens_outer_gradient::ModeResponses>|
      -> (
         f64,
         Vec<f64>,
@@ -7455,6 +7467,7 @@ fn optimize_bfgs(
             options,
             Some(prev_etas),
             fallback,
+            seeds,
             Some(&mu_k),
             None,
             None,
@@ -7532,9 +7545,10 @@ fn optimize_bfgs(
     let fdfg_s = |xs: &[f64],
                   prev_etas: &[DVector<f64>],
                   fallback: Option<&[DVector<f64>]>,
+                  seeds: Option<&[Option<DMatrix<f64>>]>,
                   grad_eval_idx: &mut usize,
                   incumbent: Option<(f64, &[f64])>,
-                  eta_dx: Option<&mut Option<Vec<Vec<DVector<f64>>>>>|
+                  eta_dx: Option<&mut crate::estimation::sens_outer_gradient::ModeResponses>|
      -> (
         f64,
         Vec<f64>,
@@ -7543,8 +7557,15 @@ fn optimize_bfgs(
         Vec<f64>,
     ) {
         let x_r: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
-        let (f, g_r, ehs, hms, contribs) =
-            fdfg(&x_r, prev_etas, fallback, grad_eval_idx, incumbent, eta_dx);
+        let (f, g_r, ehs, hms, contribs) = fdfg(
+            &x_r,
+            prev_etas,
+            fallback,
+            seeds,
+            grad_eval_idx,
+            incumbent,
+            eta_dx,
+        );
         let g_s: Vec<f64> = (0..n).map(|i| g_r[i] * scale[i]).collect();
         (f, g_s, ehs, hms, contribs)
     };
@@ -7567,15 +7588,16 @@ fn optimize_bfgs(
     // the `FERX_EBE_PREDICTOR=0` A/B switch). Every `fdfg_s` call below is at a point the
     // backtracking line search accepted, so each one forms the response the next step
     // predicts from.
-    let use_predictor = warm_predictor_serves(model, init_params, options);
-    let mut last_jac: Option<Vec<Vec<DVector<f64>>>> = None;
+    let use_predictor = warm_predictor_serves(model, init_params);
+    let mut last = crate::estimation::sens_outer_gradient::ModeResponses::default();
     let (mut f_val, mut g, ehs, _, contribs) = fdfg_s(
         &xs,
         &cached_etas,
         None,
+        None,
         &mut grad_eval_idx,
         None,
-        use_predictor.then_some(&mut last_jac),
+        use_predictor.then_some(&mut last),
     );
     cached_etas = ehs;
     // #1520: the salvage guard's incumbent. Every `fdfg_s` call below is at a point the
@@ -7675,7 +7697,7 @@ fn optimize_bfgs(
         // falling back per subject to its mode where the solve fails from the prediction;
         // the plain warm start when there is no response.
         let x_new_real: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
-        let warm: Option<Vec<DVector<f64>>> = last_jac.as_ref().map(|jac| {
+        let warm: Option<Vec<DVector<f64>>> = last.eta_dx.as_ref().map(|jac| {
             crate::estimation::sens_outer_gradient::predict_warm_etas(
                 &cached_etas,
                 jac,
@@ -7683,19 +7705,20 @@ fn optimize_bfgs(
                 &x_new_real,
             )
         });
-        let mut new_jac = None;
+        let mut new_last = crate::estimation::sens_outer_gradient::ModeResponses::default();
         let (f_new, g_new, ehs, _, contribs) = fdfg_s(
             &xs,
             warm.as_deref().unwrap_or(&cached_etas),
             warm.is_some().then_some(cached_etas.as_slice()),
+            warm.as_ref().and(last.hessians.as_deref()),
             &mut grad_eval_idx,
             Some((incumbent.0, incumbent.1.as_slice())),
-            use_predictor.then_some(&mut new_jac),
+            use_predictor.then_some(&mut new_last),
         );
         cached_etas = ehs;
         incumbent = (f_new, contribs);
         if use_predictor {
-            last_jac = new_jac;
+            last = new_last;
             x_anchor_real = x_new_real;
         }
 
@@ -8726,26 +8749,18 @@ thread_local! {
 }
 
 /// Whether the EBE warm-start predictor serves this fit, for every outer optimizer that
-/// predicts (the NLopt objective and the built-in BFGS/L-BFGS loop): FOCE/FOCEI on a model
+/// predicts (the NLopt objective and the built-in BFGS/L-BFGS loop): a model
 /// with BSV random effects, no IOV (κ̂ is not predicted), no `[mixture]` and no
 /// `[covariate_nn]` (see the NLopt call site for the measurement), whose outer gradient the
 /// adjoint serves, so the mode response comes out of that gradient's own sweeps.
 ///
-/// Not under Laplace or AGQ. Their response is the same exact one — the quadrature is centred
-/// on the conditional mode, so it is FOCEI's `−(∇²_η l)⁻¹ ∂(∇_η l)/∂x`, and the quadrature
-/// tape forms it (`the_quadrature_mode_response_is_the_focei_one`, 3e-16) — but it does not
-/// pay. The predicted start leaves their outer iterations unchanged (20–21 either way on the
-/// five benchmark fits) and saves inner work only, and the inner pass is ~10–15% of a
-/// quadrature fit, whose cost is its gradient tape; the response is one more sweep of that
-/// tape per random effect. Measured (instructions, on/off): `pk1` Laplace 0.98, AGQ-3 0.91
-/// and 0.84 (exact anchor), the ODE twins 1.02 and 0.82.
-fn warm_predictor_serves(
-    model: &CompiledModel,
-    init_params: &ModelParameters,
-    options: &FitOptions,
-) -> bool {
-    options.agq_nodes().is_none()
-        && model.n_eta > 0
+/// Laplace and AGQ too: the quadrature is centred on the conditional mode, so its response
+/// is FOCEI's `−(∇²_η l)⁻¹ ∂(∇_η l)/∂x` with the exact inner Hessian, formed on the
+/// quadrature tape (`the_quadrature_mode_response_is_the_focei_one`). Under the exact-gradient
+/// stops it is what lets a hard quadrature fit converge: Laplace on `pk2_big` reaches
+/// −3485.21 with it and stalls at −3462.52, unconverged after 413 iterations, without.
+fn warm_predictor_serves(model: &CompiledModel, init_params: &ModelParameters) -> bool {
+    model.n_eta > 0
         && model.n_kappa == 0
         && init_params.mixture.is_none()
         && !model.has_covariate_nn()
@@ -9751,7 +9766,7 @@ fn population_gradient_with_agq_evaluation(
     agq_evaluation: Option<crate::estimation::agq::PopulationEvaluation>,
     trial: OuterTrial<'_>,
     declines: &OuterFdDeclineLog,
-    eta_dx: Option<&mut Option<Vec<Vec<DVector<f64>>>>>,
+    eta_dx: Option<&mut crate::estimation::sens_outer_gradient::ModeResponses>,
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
     *grad_eval_idx += 1;
@@ -9878,7 +9893,7 @@ fn population_gradient_with_agq_evaluation(
                 eta_dx.is_some(),
             );
             if let (Some(slot), Some(dx)) = (eta_dx, dx) {
-                *slot = Some(dx);
+                slot.eta_dx = Some(dx);
             }
             Some(g)
         };

@@ -872,6 +872,7 @@ fn fresh_state() -> NloptState {
         salvage_guard: SalvageGuardState::new(SalvageGuardPolicy::Off),
         pred_jac: None,
         pred_anchor: Vec::new(),
+        seed_hessians: None,
     }
 }
 
@@ -9899,6 +9900,7 @@ fn assert_first_eval_starts_at_preflight_mode(
                     &params,
                     &opts,
                     Some(&etas),
+                    None,
                     None,
                     Some(&mu_k),
                     None,
