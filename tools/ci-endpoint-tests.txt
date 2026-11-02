@@ -13,6 +13,7 @@
 # `#[ignore]`d, so they cost one cheap compile each and keep the invariant a plain
 # set equality with no exemption rule to get wrong.
 agq
+binary_logit_levels
 branch_only_param_hazard
 categorical_convergence
 categorical_smoke
