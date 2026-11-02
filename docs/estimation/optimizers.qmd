@@ -246,10 +246,14 @@ as long as some coordinate moves at least 0.01) on what is left of the fit's `ma
 restart ends with the objective at the start.
 
 - **It converges back**, to within 0.1 OFV (the threshold the stagnation guard uses to call a
-  fit finished): the start was an optimum. The trace's plateau and the cold re-solve are
-  checked as for any other plateaued stop, the fit is reported `converged = true` at the
-  start's estimates, no `stalled_at_init` warning is raised, and `Strictness::default()`
-  passes it. `FitResult::stationary_start` is `true`. Measured on warm refits of
+  fit finished): the start was an optimum, and **the restart's result is what is
+  reported** — its estimates, objective, `converged` verdict and warnings, as for any fit.
+  Nothing of the run that did not move is carried over, so every check that run would
+  have failed (the plateau rule, the EBE start-dependence check, the objective gate) is
+  asked again of the restart and answered on its own merits. The estimates differ from the
+  warm start by the optimizer's tolerance. While they are still within the escape step of
+  the start, `FitResult::stationary_start` is `true` and no `stalled_at_init` warning is
+  raised, so `Strictness::default()` passes a converged restart. Measured on warm refits of
   `two_cpt_iv` (L-BFGS, BOBYQA, AGQ) and a two-class mixture, the restart ends within
   `1e-6` OFV of the start.
 - **It finds a lower objective**, by more than 0.1: the start was a stall. The restart's
@@ -269,11 +273,8 @@ The other FOCE-family outer optimizers run the same restart: the built-in `bfgs`
 loops, `trust_region`, and `method = gn` / `gn_hybrid`. Their perturbation is 0.1 in the
 packed (log / Cholesky) parameter space. BFGS and trust-region restart on what is left of
 `maxiter`. Gauss–Newton does not count the iterations it used, so its restart gets a fresh
-`maxiter`. A verified start keeps its estimates and its covariance step, is reported
-`converged = true` with the optimizer's own "did not converge" notice withdrawn (a run that
-never left its start stopped because it found no descent, which the restart has just
-confirmed), and `FitResult::stationary_start` is `true`. A lower restart is reported in its place, with the
-same warning. Other estimators (SAEM, IMP, Bayes, VI) do not run it.
+`maxiter`. In both outcomes the restart's result is the one reported, exactly as on the
+NLopt path. Other estimators (SAEM, IMP, Bayes, VI) do not run it.
 
 ### A THETA on the log-packing floor {#log-packing-floor}
 

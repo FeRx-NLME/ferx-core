@@ -4693,57 +4693,8 @@ fn short_descending_tail_is_not_converged() {
 // `failure_is_converged_plateau` measures displacement (`progress`, `left_init`), so it
 // rejects a warm start at the MLE, which by construction has none: the issue's verbose
 // trace is `flat_tail = 19, feasible_evals = 20, left init = false → converged = false`.
-// `stationary_start_is_converged_plateau` replaces the two displacement tests with the
-// start probe's verdict and keeps the plateau and consistency tests.
-
-#[test]
-fn a_stationary_start_on_a_flat_trace_is_a_converged_plateau() {
-    // The issue's `two_cpt_oral_cov` warm refit, as measured.
-    let (evals, last_sig, best, cold) = (20, 1, Some(-1199.3264266550898), -1199.326426);
-    assert!(
-        !failure_is_converged_plateau(evals, last_sig, best, cold, false),
-        "fixture precondition: the displacement rule rejects the warm refit"
-    );
-    assert!(stationary_start_is_converged_plateau(
-        evals, last_sig, best, cold, true
-    ));
-    // The same trace from a start that is *not* stationary is the #751 stall.
-    assert!(!stationary_start_is_converged_plateau(
-        evals, last_sig, best, cold, false
-    ));
-}
-
-#[test]
-fn a_stationary_start_still_needs_the_plateau_and_the_cold_consistency() {
-    // No flat tail: one short of the minimum.
-    assert!(!stationary_start_is_converged_plateau(
-        PLATEAU_MIN_FLAT_EVALS,
-        1,
-        Some(-100.0),
-        -100.0,
-        true,
-    ));
-    assert!(stationary_start_is_converged_plateau(
-        PLATEAU_MIN_FLAT_EVALS + 1,
-        1,
-        Some(-100.0),
-        -100.0,
-        true,
-    ));
-    // A cold re-solve materially worse than best-seen exposes a warm-start artifact,
-    // stationary gradient or not (the SS-oral 83.3 vs 121.4 shape).
-    assert!(!stationary_start_is_converged_plateau(
-        20,
-        1,
-        Some(83.26),
-        121.4,
-        true
-    ));
-    // No feasible evaluation at all is not a plateau of anything.
-    assert!(!stationary_start_is_converged_plateau(
-        0, 0, None, 0.0, true
-    ));
-}
+// The start probe asks the optimizer instead, and a start it verifies is reported as the
+// probe's own result, with the probe's own verdict.
 
 #[test]
 fn the_start_probe_verdict_reads_the_probes_objective_against_the_starts() {
@@ -13174,72 +13125,59 @@ fn options_2506(optimizer: crate::types::Optimizer) -> FitOptions {
 
 /// #2506, the wiring inside the attempt, per PR and with no convergence loop: a first leg
 /// stopped at its start (one evaluation) hands the probe a perturbed start, the objective
-/// at the unmoved start and the evaluations spent, exactly once, and publishes
-/// `stationary_start` only for a `Some(true)` verdict. The probe here is a stub, so the
-/// three verdicts are each forced; the real probe is exercised through `fit()` below.
+/// at the unmoved start and the evaluations spent, exactly once — and publishes no
+/// `stationary_start` of its own, which only the probe's result carries
+/// (`settle_start_probe`). The probe here is a stub; the real one is exercised through
+/// `fit()` below.
 #[test]
-fn the_attempt_hands_an_unmoved_start_to_the_probe_and_publishes_its_verdict() {
+fn the_attempt_hands_an_unmoved_start_to_the_probe() {
     let (mut model, pop) = two_cpt_iv_fixture();
     model.name = "probe_wiring_2506".into();
     forced_stop_at_start::set(&model.name, None, false);
     let opts = options_2506(crate::types::Optimizer::NloptLbfgs);
     let init = model.default_params.clone();
     let init_packed = pack_params(&init);
-    for verdict in [Some(true), Some(false), None] {
-        let calls = std::cell::RefCell::new(Vec::new());
-        let probe = |start: &ModelParameters, start_ofv: f64, spent: usize| {
-            calls
-                .borrow_mut()
-                .push((pack_params(start), start_ofv, spent));
-            verdict
-        };
-        let (result, outcome) = optimize_nlopt_once_probed(
-            &model,
-            &pop,
-            &init,
-            &opts,
-            false,
-            &OuterFdDeclineLog::new(pop.subjects.len()),
-            None,
-            None,
-            &[],
-            Some(&probe),
-        );
-        assert!(
-            !outcome.left_init,
-            "{verdict:?}: fixture precondition — one evaluation cannot leave the start"
-        );
-        let calls = calls.into_inner();
-        assert_eq!(calls.len(), 1, "{verdict:?}: the probe runs once");
-        let (start, start_ofv, spent) = &calls[0];
-        assert_eq!(
-            *spent, 1,
-            "{verdict:?}: the stopped leg spent one evaluation"
-        );
-        assert!(
-            (start_ofv - result.ofv).abs() < 1e-9,
-            "{verdict:?}: the unmoved start's objective (no penalty on this model): {start_ofv} \
-             vs {}",
-            result.ofv
-        );
-        assert!(
-            start.iter().zip(&init_packed).any(|(a, b)| a != b),
-            "{verdict:?}: the probe starts off the start"
-        );
-        assert_eq!(
-            result.stationary_start,
-            verdict == Some(true),
-            "{verdict:?}"
-        );
-    }
+    let calls = std::cell::RefCell::new(Vec::new());
+    let probe = |start: &ModelParameters, start_ofv: f64, spent: usize| {
+        calls
+            .borrow_mut()
+            .push((pack_params(start), start_ofv, spent));
+    };
+    let (result, outcome) = optimize_nlopt_once_probed(
+        &model,
+        &pop,
+        &init,
+        &opts,
+        false,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        None,
+        None,
+        &[],
+        Some(&probe),
+    );
+    assert!(
+        !outcome.left_init,
+        "fixture precondition — one evaluation cannot leave the start"
+    );
+    let calls = calls.into_inner();
+    assert_eq!(calls.len(), 1, "the probe runs once");
+    let (start, start_ofv, spent) = &calls[0];
+    assert_eq!(*spent, 1, "the stopped leg spent one evaluation");
+    assert!(
+        (start_ofv - result.ofv).abs() < 1e-9,
+        "the unmoved start's objective (no penalty on this model): {start_ofv} vs {}",
+        result.ofv
+    );
+    assert!(
+        start.iter().zip(&init_packed).any(|(a, b)| a != b),
+        "the probe starts off the start"
+    );
+    assert!(!result.stationary_start);
     // A leg that has no budget left for the probe does not run it.
     model.name = "probe_wiring_2506_starved".into();
     forced_stop_at_start::set(&model.name, None, true);
     let ran = std::cell::Cell::new(false);
-    let probe = |_: &ModelParameters, _: f64, _: usize| {
-        ran.set(true);
-        Some(true)
-    };
+    let probe = |_: &ModelParameters, _: f64, _: usize| ran.set(true);
     let (result, _) = optimize_nlopt_once_probed(
         &model,
         &pop,
@@ -13294,12 +13232,14 @@ fn the_attempt_hands_an_unmoved_start_to_the_probe_and_publishes_its_verdict() {
 
 /// #2506 for the optimizers outside NLopt, per PR and with no convergence loop:
 /// [`verify_unmoved_start`] hands a run that did not move to `rerun` once, from a
-/// perturbed start and on `budget`, and acts on each verdict — a verified start keeps
-/// the run's estimates and publishes `left_init = Some(false)` with `stationary_start`,
-/// a lower probe replaces the run, anything else leaves it to the displacement check.
-/// The rerun is a stub returning a one-evaluation result with its verdict-deciding
-/// fields set, so each verdict is forced. It does not run for a run that moved, has no
-/// budget, or has no valid objective.
+/// perturbed start and on `budget`, and acts on each verdict. A verified start or a lower
+/// probe reports **the probe's own result** — its estimates, objective, verdict and
+/// warnings, none of the unmoved run's — and a verified one still within the escape step
+/// of the start is published `left_init = Some(false)` with `stationary_start`. Anything
+/// else reports the unmoved run, left to the displacement check. The rerun is a stub
+/// whose result is tagged with a warning of its own, so which run is reported is read off
+/// the result. It does not run for a run that moved, has no budget, or has no valid
+/// objective.
 #[test]
 fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
     let (model, pop) = two_cpt_iv_fixture();
@@ -13307,18 +13247,27 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
     let init = model.default_params.clone();
     let init_packed = pack_params(&init);
     let at = |p: &ModelParameters| evaluate_at_initial_params(&model, &pop, p, &opts);
+    let (run_tag, probe_tag) = ("the unmoved run's own warning", "the probe's own warning");
     let unmoved = || OuterResult {
-        converged: true,
+        converged: false,
         n_iterations: 2,
+        warnings: vec![run_tag.to_string()],
         ..at(&init)
     };
     let start_ofv = unmoved().ofv;
-    // (probe ofv, probe converged) → the verdict it forces.
-    for (probe_ofv, probe_converged, verdict) in [
-        (start_ofv + 0.5 * START_PROBE_TOL, true, Some(true)),
-        (start_ofv - 2.0 * START_PROBE_TOL, false, Some(false)),
-        (start_ofv + 0.5 * START_PROBE_TOL, false, None),
+    let tol = START_PROBE_TOL;
+    // (probe ofv, probe converged, probe ends back at the start) → verdict, and whether
+    // the reported result is published a stationary start.
+    for (probe_ofv, probe_converged, back_at_start, verdict, stationary) in [
+        (start_ofv + 0.5 * tol, true, true, Some(true), true),
+        // Lower, but within the tolerance: verified, and the lower result is reported.
+        (start_ofv - 0.5 * tol, true, true, Some(true), true),
+        // Verified, but the probe's estimates ended off the start: they left it.
+        (start_ofv + 0.5 * tol, true, false, Some(true), false),
+        (start_ofv - 2.0 * tol, false, false, Some(false), false),
+        (start_ofv + 0.5 * tol, false, true, None, false),
     ] {
+        let label = format!("{verdict:?}, probe back at start = {back_at_start}");
         let calls = std::cell::RefCell::new(Vec::new());
         let result = verify_unmoved_start(
             &model,
@@ -13328,31 +13277,48 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
             unmoved(),
             7,
             "iterations",
-            |_| false,
             |p, o| {
                 calls.borrow_mut().push((pack_params(p), o.outer_maxiter));
                 OuterResult {
                     ofv: probe_ofv,
                     converged: probe_converged,
                     n_iterations: 5,
-                    ..at(p)
+                    warnings: vec![probe_tag.to_string()],
+                    ..at(if back_at_start { &init } else { p })
                 }
             },
         );
         let calls = calls.into_inner();
-        assert_eq!(calls.len(), 1, "{verdict:?}: the probe runs once");
+        assert_eq!(calls.len(), 1, "{label}: the probe runs once");
         let (start, maxiter) = &calls[0];
-        assert_eq!(*maxiter, 7, "{verdict:?}: the probe runs on the budget");
+        assert_eq!(*maxiter, 7, "{label}: the probe runs on the budget");
         assert!(
             start.iter().zip(&init_packed).any(|(a, b)| a != b),
-            "{verdict:?}: the probe starts off the start"
+            "{label}: the probe starts off the start"
         );
         assert_eq!(
             result.n_iterations, 7,
-            "{verdict:?}: both runs' iterations count"
+            "{label}: both runs' iterations count"
         );
-        let adopted = pack_params(&result.params) != init_packed;
-        assert_eq!(adopted, verdict == Some(false), "{verdict:?}: adopted");
+        let reports_probe = verdict.is_some();
+        assert_eq!(
+            (
+                result.warnings.iter().any(|w| w == probe_tag),
+                result.warnings.iter().any(|w| w == run_tag),
+            ),
+            (reports_probe, !reports_probe),
+            "{label}: which run is reported: {:?}",
+            result.warnings
+        );
+        if reports_probe {
+            assert_eq!(result.ofv, probe_ofv, "{label}");
+            assert_eq!(
+                result.converged, probe_converged,
+                "{label}: the probe's verdict"
+            );
+        } else {
+            assert!(!result.converged, "{label}: the unmoved run's verdict");
+        }
         let stall_warning = result
             .warnings
             .iter()
@@ -13360,57 +13326,14 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
         assert_eq!(
             stall_warning,
             verdict == Some(false),
-            "{verdict:?}: {:?}",
+            "{label}: {:?}",
             result.warnings
         );
-        assert_eq!(
-            result.stationary_start,
-            verdict == Some(true),
-            "{verdict:?}"
-        );
+        assert_eq!(result.stationary_start, stationary, "{label}");
         assert_eq!(
             result.left_init,
-            (verdict == Some(true)).then_some(false),
-            "{verdict:?}: only a verified start publishes `left_init`"
-        );
-    }
-    // A verified start is reported converged, whatever the run's own stop rule said,
-    // and loses exactly the warnings the optimizer's predicate names as that verdict;
-    // an unverified one keeps both its verdict and its notice.
-    const NOTICE: &str = "the optimizer's own non-convergence notice";
-    let (notice, other) = (NOTICE, "an unrelated warning");
-    for (probe_converged, verified) in [(true, true), (false, false)] {
-        let run = OuterResult {
-            converged: false,
-            warnings: vec![notice.to_string(), other.to_string()],
-            ..unmoved()
-        };
-        let result = verify_unmoved_start(
-            &model,
-            &pop,
-            &init,
-            &opts,
-            run,
-            7,
-            "iterations",
-            |w| w == NOTICE,
-            |p, _| OuterResult {
-                ofv: start_ofv,
-                converged: probe_converged,
-                ..at(p)
-            },
-        );
-        assert_eq!(result.stationary_start, verified);
-        assert_eq!(result.converged, verified, "verified = {verified}");
-        assert_eq!(
-            result.warnings.iter().any(|w| w == notice),
-            !verified,
-            "verified = {verified}: {:?}",
-            result.warnings
-        );
-        assert!(
-            result.warnings.iter().any(|w| w == other),
-            "verified = {verified}"
+            (verdict == Some(true)).then_some(!stationary),
+            "{label}: only a verified start publishes `left_init`"
         );
     }
     // No probe: a run that moved, one with no budget, one with no valid objective.
@@ -13444,7 +13367,6 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
             result,
             budget,
             "iterations",
-            |_| false,
             |p, _| {
                 ran.set(true);
                 at(p)
@@ -13455,53 +13377,62 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
 }
 
 /// #2506: what the NLopt fit carries out of a probed first attempt, and whether the
-/// #751 held-cap retry still runs. A verified start skips it — there is no stall to
-/// retry, and a fresh-budget retry could replace the verified result — while keeping
-/// the first attempt and its unmoved verdict; a lower probe is reported with the stall
-/// warning; no verdict leaves the retry to `left_init`. The probe's evaluations count
-/// every time.
+/// #751 held-cap retry still runs. A verified start reports the probe's own result and
+/// skips the retry — there is no stall to retry — and is published a stationary start
+/// while the probe's estimates are still within the escape step of the user's start. A
+/// lower probe is reported with the stall warning. No verdict reports the first attempt
+/// and leaves the retry to `left_init`. The probe's evaluations count every time.
 #[test]
-fn a_verified_start_skips_the_stall_retry_and_a_lower_probe_is_reported() {
+fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
     let (model, pop) = two_cpt_iv_fixture();
     let opts = options_2506(crate::types::Optimizer::NloptLbfgs);
     let init = model.default_params.clone();
     let mut off = init.clone();
     off.theta = init.theta.iter().map(|t| 1.1 * t).collect();
-    let at = |p: &ModelParameters, n: usize| OuterResult {
-        left_init: Some(false),
+    let at = |p: &ModelParameters, n: usize, left: bool| OuterResult {
+        left_init: Some(left),
         n_iterations: n,
         ..evaluate_at_initial_params(&model, &pop, p, &opts)
     };
     let init_packed = pack_params(&init);
-    for (verdict, skip_retry, reports_probe) in [
-        (Some(true), true, false),
-        (Some(false), true, true),
-        (None, false, false),
+    // (verdict, probe left the user's start) → retry skipped, probe reported, stationary.
+    for (verdict, probe_left, skip_retry, reports_probe, stationary) in [
+        (Some(true), false, true, true, true),
+        (Some(true), true, true, true, false),
+        (Some(false), true, true, true, false),
+        (None, false, false, false, false),
     ] {
+        let label = format!("{verdict:?}, probe left = {probe_left}");
         let ((result, _), skip) = settle_start_probe(
-            (at(&init, 1), None),
+            (at(&init, 1, false), None),
             false,
-            Some((at(&off, 4), None, verdict)),
+            Some((at(&off, 4, probe_left), None, verdict)),
         );
-        assert_eq!(skip, skip_retry, "{verdict:?}: retry skipped");
+        assert_eq!(skip, skip_retry, "{label}: retry skipped");
         assert_eq!(
             pack_params(&result.params) != init_packed,
             reports_probe,
-            "{verdict:?}: which attempt is reported"
+            "{label}: which attempt is reported"
         );
-        assert_eq!(result.n_iterations, 5, "{verdict:?}: both legs count");
+        assert_eq!(result.n_iterations, 5, "{label}: both legs count");
         assert_eq!(
             result
                 .warnings
                 .iter()
                 .any(|w| w.contains("stalled on its initial estimates")),
-            reports_probe,
-            "{verdict:?}"
+            verdict == Some(false),
+            "{label}"
+        );
+        assert_eq!(result.stationary_start, stationary, "{label}");
+        assert_eq!(
+            result.left_init,
+            Some(!stationary && reports_probe),
+            "{label}"
         );
     }
     // Unprobed, the retry follows `left_init` alone.
     for left in [false, true] {
-        let (_, skip) = settle_start_probe((at(&init, 1), None), left, None);
+        let (_, skip) = settle_start_probe((at(&init, 1, left), None), left, None);
         assert_eq!(skip, left);
     }
 }
@@ -13582,7 +13513,7 @@ fn a_warm_refit_at_a_converged_fit_is_converged_and_not_flagged() {
         );
         let warm_start = warm_start_from(&model.default_params, &cold);
         let warm = crate::api::fit(&model, &pop, &warm_start, &opts).expect("warm fit");
-        assert_warm_refit_verified(&format!("{optimizer:?}"), &cold, &warm, 1e-3);
+        assert_warm_refit_verified(&format!("{optimizer:?}"), &cold, &warm);
     }
 }
 
@@ -13597,15 +13528,13 @@ fn a_warm_refit_at_a_converged_fit_is_converged_and_not_flagged() {
 )]
 fn a_warm_refit_on_a_non_nlopt_optimizer_is_converged_and_not_flagged() {
     let (model, pop) = two_cpt_iv_fixture();
-    // The objective bound on the warm refit against the cold fit. Gauss–Newton stops
-    // looser than the others: measured on macOS arm64, its warm refit ends 1.283e-3
-    // below its cold fit (BFGS 2.2e-10, trust-region 1.8e-6), so it gets 5e-3.
-    for (label, opts, ofv_tol) in [
-        ("bfgs", options_2506(crate::types::Optimizer::Bfgs), 1e-3),
+    // Measured on macOS arm64, the warm refits end within 3.3e-8 (BFGS), 1.7e-7
+    // (trust-region) and 2.0e-4 (GN) of their cold fits: inside the helper's 1e-3.
+    for (label, opts) in [
+        ("bfgs", options_2506(crate::types::Optimizer::Bfgs)),
         (
             "trust_region",
             options_2506(crate::types::Optimizer::TrustRegion),
-            1e-3,
         ),
         (
             "gn",
@@ -13613,7 +13542,6 @@ fn a_warm_refit_on_a_non_nlopt_optimizer_is_converged_and_not_flagged() {
                 method: EstimationMethod::FoceGn,
                 ..options_2506(crate::types::Optimizer::Auto)
             },
-            5e-3,
         ),
     ] {
         let cold = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("cold fit");
@@ -13624,7 +13552,7 @@ fn a_warm_refit_on_a_non_nlopt_optimizer_is_converged_and_not_flagged() {
         );
         let warm_start = warm_start_from(&model.default_params, &cold);
         let warm = crate::api::fit(&model, &pop, &warm_start, &opts).expect("warm fit");
-        assert_warm_refit_verified(label, &cold, &warm, ofv_tol);
+        assert_warm_refit_verified(label, &cold, &warm);
     }
 }
 
@@ -13633,7 +13561,6 @@ fn assert_warm_refit_verified(
     label: &str,
     cold: &crate::types::FitResult,
     warm: &crate::types::FitResult,
-    ofv_tol: f64,
 ) {
     eprintln!(
         "{label}: cold OFV {:.6}, warm OFV {:.6} (Δ {:.3e}), warm evaluations {}",
@@ -13646,7 +13573,7 @@ fn assert_warm_refit_verified(
     assert!(warm.stationary_start, "{label}: {:?}", warm.warnings);
     assert!(warm.converged, "{label}: {:?}", warm.warnings);
     assert!(
-        (warm.ofv - cold.ofv).abs() < ofv_tol,
+        (warm.ofv - cold.ofv).abs() < 1e-3,
         "{label}: the warm refit reports the warm start, at the cold fit's objective: {} vs {}",
         warm.ofv,
         cold.ofv
@@ -13739,6 +13666,6 @@ fn a_warm_refit_of_an_agq_or_mixture_fit_is_converged_and_not_flagged() {
         );
         let warm_start = warm_start_from(&model.default_params, &cold);
         let warm = crate::api::fit(&model, &pop, &warm_start, &opts).expect("warm");
-        assert_warm_refit_verified(label, &cold, &warm, 1e-3);
+        assert_warm_refit_verified(label, &cold, &warm);
     }
 }

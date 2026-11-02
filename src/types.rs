@@ -8242,8 +8242,9 @@ pub struct FitResult {
     /// on the point the reported estimates are built from. `Some(false)` is the
     /// #751 stall signature; `crate::stalled_at_init` prefers this to its own
     /// natural-scale comparison when it is present. `Some` for the NLopt outer
-    /// loop (BOBYQA, SLSQP, L-BFGS, MMA); `None` for the built-in BFGS, the
-    /// trust region, Gauss-Newton, SAEM / IMP / Bayes / VI, an
+    /// loop (BOBYQA, SLSQP, L-BFGS, MMA), and for the built-in BFGS, the trust
+    /// region and Gauss-Newton when they report a #2506 start-probe result;
+    /// otherwise `None` for those three, and for SAEM / IMP / Bayes / VI, an
     /// `outer_maxiter = 0` evaluation, hand-built results, and a `.fitrx`
     /// bundle saved before it was recorded.
     #[serde(default)]
@@ -8251,12 +8252,14 @@ pub struct FitResult {
     /// The fit did not leave its initial estimates (`left_init == Some(false)`),
     /// and they were verified to be an optimum (#2506): a restart of the outer
     /// optimizer from a perturbation of them converged back to their objective,
-    /// to within 0.1 OFV. That is a warm start at an optimum (a bootstrap
-    /// sample, a refit from a previous fit's estimates), which
-    /// `crate::stalled_at_init` does not call a stall. `false` whenever that was
-    /// not shown: the fit left its start, the restart was inconclusive or had no
-    /// budget left, the estimator is not the NLopt outer loop, or the `.fitrx`
-    /// bundle predates the field. A stall the restart *improved on* is reported
+    /// to within 0.1 OFV. The result is that restart's — its estimates, still
+    /// within the escape step of the start, and its own `converged` verdict.
+    /// That is a warm start at an optimum (a bootstrap sample, a refit from a
+    /// previous fit's estimates), which `crate::stalled_at_init` does not call a
+    /// stall. `false` whenever that was not shown: the fit left its start, the
+    /// restart was inconclusive or had no budget left, the estimator does not run
+    /// the restart (SAEM, IMP, Bayes, VI), or the `.fitrx` bundle predates the
+    /// field. A stall the restart *improved on* is reported
     /// as the restart's own estimates, which left the start.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stationary_start: bool,

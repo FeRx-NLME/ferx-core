@@ -685,20 +685,6 @@ const TRUST_REGION_CANCELLED: &str = "cancelled by user";
 /// instead of the iteration budget.
 const TRUST_REGION_NO_INITIAL_PROGRESS: &str = "made no progress from the starting values";
 
-/// The clause of the `TRUST_REGION_NO_INITIAL_PROGRESS` warning that names the stop.
-const NO_INITIAL_PROGRESS_NOTICE: &str = "every step was rejected from the first iteration";
-
-/// Prefix of every warning a trust-region fit carries when its stop was not called
-/// converged ([`classify_termination`], and a solver error).
-const NONCONVERGENCE_PREFIX: &str = "Trust-region did not converge";
-
-/// Is `w` one of trust-region's own non-convergence verdicts? The #2506 start probe
-/// withdraws them from a run whose start it verified an optimum
-/// (`outer_optimizer::verify_unmoved_start`).
-pub(crate) fn is_nonconvergence_notice(w: &str) -> bool {
-    w.starts_with(NONCONVERGENCE_PREFIX)
-}
-
 /// Map an argmin termination status onto `(converged, warning)`.
 ///
 /// Before #1000 every `Ok(_)` from the executor was reported as converged,
@@ -737,7 +723,7 @@ fn classify_termination(status: &TerminationStatus, max_iters: u64) -> (bool, Op
             (
                 false,
                 Some(format!(
-                    "{NONCONVERGENCE_PREFIX}: reached the iteration budget \
+                    "Trust-region did not converge: reached the iteration budget \
                      (maxiter = {max_iters}). The estimates and any standard errors are \
                      reported at a non-stationary point; {remedy}"
                 )),
@@ -749,21 +735,23 @@ fn classify_termination(status: &TerminationStatus, max_iters: u64) -> (bool, Op
             (
                 false,
                 Some(format!(
-                    "{NONCONVERGENCE_PREFIX}: {reason} — {NO_INITIAL_PROGRESS_NOTICE}, \
-                     so the fit never left them. Check the starting values \
+                    "Trust-region did not converge: {reason} — every step was rejected from the \
+                     first iteration, so the fit never left them. Check the starting values \
                      (`inits_from_nca` helps) and that the model is identifiable on this data."
                 )),
             )
         }
-        TerminationStatus::Terminated(reason) => {
-            (false, Some(format!("{NONCONVERGENCE_PREFIX}: {reason}")))
-        }
+        TerminationStatus::Terminated(reason) => (
+            false,
+            Some(format!("Trust-region did not converge: {reason}")),
+        ),
         // Unreachable: the executor only returns once the state is terminated.
         TerminationStatus::NotTerminated => (
             false,
-            Some(format!(
-                "{NONCONVERGENCE_PREFIX}: solver stopped without a termination reason"
-            )),
+            Some(
+                "Trust-region did not converge: solver stopped without a termination reason"
+                    .to_string(),
+            ),
         ),
     }
 }
@@ -944,7 +932,7 @@ pub(crate) fn optimize_trust_region_seeded(
             if options.verbose {
                 eprintln!("Trust-region stopped: {}", e);
             }
-            warnings.push(format!("{NONCONVERGENCE_PREFIX}: {e}"));
+            warnings.push(format!("Trust-region did not converge: {}", e));
             (false, x0.clone(), 0, None, None)
         }
     };
@@ -1662,28 +1650,6 @@ mod tests {
         let warn = warn.expect("MaxItersReached must warn");
         assert!(warn.contains("improve the starting values"), "{warn}");
         assert!(!warn.contains("cannot even be demonstrated"), "{warn}");
-    }
-
-    /// #2506: every verdict `classify_termination` gives a stop it did not call converged
-    /// is one `is_nonconvergence_notice` recognises — the start probe withdraws exactly
-    /// these from a verified warm start — and nothing else is.
-    #[test]
-    fn every_nonconvergence_verdict_is_a_nonconvergence_notice() {
-        for status in [
-            TerminationStatus::Terminated(TerminationReason::MaxItersReached),
-            TerminationStatus::Terminated(TerminationReason::SolverExit(
-                TRUST_REGION_NO_INITIAL_PROGRESS.to_string(),
-            )),
-            TerminationStatus::Terminated(TerminationReason::SolverExit("bail".to_string())),
-            TerminationStatus::NotTerminated,
-        ] {
-            let (converged, warn) = classify_termination(&status, 500);
-            let warn = warn.expect("an unconverged stop warns");
-            assert!(!converged && is_nonconvergence_notice(&warn), "{warn}");
-        }
-        assert!(!is_nonconvergence_notice(
-            "Negative IWRES autocorrelation detected (Durbin-Watson = 2.85)."
-        ));
     }
 
     /// A run that rejected every step from iteration 0 gets its own reason, so

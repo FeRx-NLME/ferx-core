@@ -48,25 +48,6 @@ pub(crate) const GN_ZERO_ETA_NONCONVERGENCE_WARNING: &str =
      (n_eta = 0). BHHH curvature is unreliable far from the optimum in \
      this regime, so the result may be badly wrong, not just imprecise.";
 
-/// The GN loop's own non-convergence notices: its trust radius collapsed, or it ran out
-/// of iterations.
-const GN_TRUST_RADIUS_COLLAPSED_WARNING: &str = "Gauss-Newton: trust radius collapsed";
-const GN_MAXITER_WARNING: &str = "Gauss-Newton: max iterations reached without convergence";
-
-/// Is `w` one of a GN fit's own non-convergence verdicts — the GN loop's, the
-/// `n_eta = 0` warning on top of them, or the `gn_hybrid` polish's? The #2506 start
-/// probe withdraws them from a run whose start it verified an optimum
-/// (`outer_optimizer::verify_unmoved_start`).
-pub(crate) fn is_nonconvergence_notice(w: &str) -> bool {
-    [
-        GN_TRUST_RADIUS_COLLAPSED_WARNING,
-        GN_MAXITER_WARNING,
-        GN_ZERO_ETA_NONCONVERGENCE_WARNING,
-        crate::estimation::outer_optimizer::OUTER_NONCONVERGENCE_WARNING,
-    ]
-    .contains(&w)
-}
-
 /// Run FOCE estimation using a Gauss-Newton optimizer.
 ///
 /// Returns the same `OuterResult` as `optimize_population`.
@@ -379,7 +360,7 @@ pub fn run_foce_gn(
                 if verbose {
                     eprintln!("  GN iter {:>3}: trust radius collapsed, stopping", iter);
                 }
-                warnings.push(GN_TRUST_RADIUS_COLLAPSED_WARNING.to_string());
+                warnings.push("Gauss-Newton: trust radius collapsed".to_string());
                 break;
             }
             if verbose {
@@ -458,7 +439,7 @@ pub fn run_foce_gn(
     }
 
     if !converged {
-        warnings.push(GN_MAXITER_WARNING.to_string());
+        warnings.push("Gauss-Newton: max iterations reached without convergence".to_string());
         // #1006: at n_eta = 0 an unconverged pure-GN run is the state that
         // predicts a badly wrong answer — there is no inner EBE loop to absorb
         // a poor start, so the BHHH step can collapse orders of magnitude above
@@ -5903,24 +5884,5 @@ mod tests {
                 "the BHHH matrix stays on the raw fixed-EBE score"
             );
         }
-    }
-
-    /// #2506: the notices the start probe withdraws from a verified GN warm start are
-    /// the GN loop's own non-convergence verdicts, the `n_eta = 0` warning raised on top
-    /// of them, and the `gn_hybrid` polish's — and nothing else.
-    #[test]
-    fn the_nonconvergence_notices_are_the_gn_and_polish_verdicts() {
-        for w in [
-            GN_TRUST_RADIUS_COLLAPSED_WARNING,
-            GN_MAXITER_WARNING,
-            GN_ZERO_ETA_NONCONVERGENCE_WARNING,
-            crate::estimation::outer_optimizer::OUTER_NONCONVERGENCE_WARNING,
-        ] {
-            assert!(is_nonconvergence_notice(w), "{w}");
-        }
-        assert!(!is_nonconvergence_notice(
-            "Gauss-Newton (BHHH) approximation may be inaccurate with M3 censoring; \
-             consider method=foce_i for heavy censoring fractions (>20%)."
-        ));
     }
 }

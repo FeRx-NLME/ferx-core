@@ -119,14 +119,15 @@ pub struct OuterResult {
     pub packed_estimate: Option<Vec<f64>>,
     /// Whether the fit left its initial estimates by the optimizer's own
     /// `INIT_ESCAPE_STEP_S` test (#751), measured on the restored best point.
-    /// `Some` for the NLopt outer loop (`optimize_nlopt`), `None` for every
-    /// other estimator; lifted onto `FitResult::left_init`.
+    /// `Some` for the NLopt outer loop (`optimize_nlopt`) and for a #2506 start-probe
+    /// result on the other outer optimizers (`verify_unmoved_start`), `None` otherwise;
+    /// lifted onto `FitResult::left_init`.
     pub left_init: Option<bool>,
-    /// The fit did not leave its initial estimates (`left_init == Some(false)`), and the
-    /// #2506 start probe verified them to be an optimum: a restart from a perturbation of
-    /// them converged back to their objective. A warm start at an optimum, not a #751
-    /// stall. `false` otherwise, and for every estimator other than the NLopt outer loop;
-    /// lifted onto `FitResult::stationary_start`.
+    /// This is the result of the #2506 start probe, which verified the initial estimates to
+    /// be an optimum — a restart from a perturbation of them converged back to their
+    /// objective — and its estimates are still within the escape step of them
+    /// (`left_init == Some(false)`). A warm start at an optimum, not a #751 stall. `false`
+    /// otherwise; lifted onto `FitResult::stationary_start`.
     pub stationary_start: bool,
     /// Per-subject mixture posteriors from the final mixture eval. `Some` only for
     /// a converged `[mixture]` fit (#977); `None` for every non-mixture path.
@@ -357,7 +358,6 @@ pub fn optimize_population(
                 result,
                 budget,
                 "iterations",
-                |w| w == OUTER_NONCONVERGENCE_WARNING,
                 |p, o| optimize_bfgs(model, population, p, o, &declines, None),
             )
         }
@@ -378,7 +378,6 @@ pub fn optimize_population(
                 result,
                 budget,
                 "iterations",
-                crate::estimation::trust_region::is_nonconvergence_notice,
                 |p, o| {
                     crate::estimation::trust_region::optimize_trust_region_seeded(
                         model, population, p, o, None,
@@ -3611,30 +3610,6 @@ fn failure_is_converged_plateau(
         && left_init
 }
 
-/// The other way a bare `Failure`/`ForcedStop` is a converged plateau (#2506): the fit never
-/// left its start because the start was already an optimum — a bootstrap sample or a refit
-/// warm-started from a previous fit's estimates. [`failure_is_converged_plateau`] cannot see
-/// that case: its **progress** and **left init** tests both measure displacement from `x₀`,
-/// and a start at the optimum has none to show. Here those two are replaced by
-/// `stationary_start`, the verdict of the start probe ([`start_probe_verdict`]): a restart
-/// from a perturbation of the start that converged back to the start's objective. A #751
-/// stall — inits that never moved, with lower objective still reachable from them —
-/// fails it. The **plateau** and **consistency** tests
-/// are kept as they are, so the trace must still be flat and the cold re-solve must still
-/// reproduce the best-seen objective.
-fn stationary_start_is_converged_plateau(
-    feasible_evals: usize,
-    last_sig_feasible_eval: usize,
-    best_seen_ofv: Option<f64>,
-    final_ofv: f64,
-    stationary_start: bool,
-) -> bool {
-    stationary_start
-        && feasible_evals >= 1
-        && feasible_evals.saturating_sub(last_sig_feasible_eval) >= PLATEAU_MIN_FLAT_EVALS
-        && cold_solve_is_consistent(best_seen_ofv, final_ofv)
-}
-
 /// Scaled-space size of the start probe's perturbation (#2506): each free coordinate of
 /// the start is moved this far before the probe runs. Ten times [`INIT_ESCAPE_STEP_S`], so
 /// a probe that converges back to the start has left *its own* start, and its plateau
@@ -3709,17 +3684,20 @@ fn perturbed_start(x: &[f64], fixed: &[bool], lower: &[f64], upper: &[f64]) -> O
 
 /// The probe [`optimize_nlopt`] hands the first attempt (#2506): given the perturbed start,
 /// the penalized objective at the unmoved start, and the evaluations already spent, it
-/// runs the probe and returns [`start_probe_verdict`].
-type StartProbe<'a> = dyn Fn(&ModelParameters, f64, usize) -> Option<bool> + 'a;
+/// runs the probe. What the probe found is acted on by [`settle_start_probe`], after the
+/// attempt, not by the attempt itself.
+type StartProbe<'a> = dyn Fn(&ModelParameters, f64, usize) + 'a;
 
 /// What [`optimize_nlopt`] carries out of its first attempt once the start probe (#2506)
 /// has answered: the attempt to report, with its restart cause, and whether the #751
 /// held-cap stall retry ([`resolve_stall_retry`]) is to be skipped.
 ///
-/// - `Some(false)` — the probe's lower result, as a continuation of the same fit; no
-///   retry, since it left the start.
-/// - `Some(true)` — the first attempt, its start verified an optimum; no retry either,
-///   since there is no stall to retry, though its published `left_init` stays `false`.
+/// - `Some(false)` — the probe's lower result, as a continuation of the same fit, with
+///   [`start_probe_adopted_warning`]; no retry, since it left the start.
+/// - `Some(true)` — the probe's result as well, through [`verified_start_result`]: the
+///   probe is a complete fit whose own stop rule, checks and warnings stand as they are,
+///   so nothing of the first attempt's verdict is carried over or rewritten. No retry —
+///   there is no stall to retry.
 /// - anything else — the first attempt, retried exactly when it did not leave its start.
 ///
 /// The probe's evaluations count in the reported `n_iterations` whichever result is
@@ -3741,15 +3719,32 @@ fn settle_start_probe(
             found.n_iterations += first.n_iterations;
             ((found, found_cause), true)
         }
-        Some((spent, _, verdict)) => {
-            first.n_iterations += spent.n_iterations;
+        Some((found, found_cause, Some(true))) => {
+            let left = found.left_init != Some(false);
             (
-                (first, first_cause),
-                first_left_init || verdict == Some(true),
+                (verified_start_result(found, left, &first), found_cause),
+                true,
             )
+        }
+        Some((spent, _, None)) => {
+            first.n_iterations += spent.n_iterations;
+            ((first, first_cause), first_left_init)
         }
         None => ((first, first_cause), first_left_init),
     }
+}
+
+/// The probe's result, reported for a start the probe verified (#2506): its own estimates,
+/// objective, `converged` verdict and warnings, as the probe produced them. `left` is
+/// whether those estimates are off the user's start by [`INIT_ESCAPE_STEP_S`]; within it
+/// the result is published `left_init = Some(false)` with `stationary_start = true`, which
+/// `model_selection::stalled_at_init` reads as a warm start rather than a stall. The
+/// unmoved run's evaluations count in `n_iterations`.
+fn verified_start_result(mut probe: OuterResult, left: bool, unmoved: &OuterResult) -> OuterResult {
+    probe.left_init = Some(left);
+    probe.stationary_start = !left;
+    probe.n_iterations += unmoved.n_iterations;
+    probe
 }
 
 /// The `FitResult` warning a fit carries when it stalled on its initial estimates and the
@@ -3765,10 +3760,6 @@ fn start_probe_adopted_warning(stalled_ofv: f64, stalled_count: usize, unit: &st
     )
 }
 
-/// The warning the built-in BFGS loops and the NLopt outer loop push on a fit their
-/// stop rule did not call converged.
-pub(crate) const OUTER_NONCONVERGENCE_WARNING: &str = "Outer optimization did not converge";
-
 /// The #2506 start probe for the outer optimizers that are not NLopt's — the built-in
 /// BFGS / L-BFGS loops, `trust_region`, and `method = gn` / `gn_hybrid` — which publish
 /// no `left_init` of their own and so would leave a warm start at an optimum to the
@@ -3780,13 +3771,9 @@ pub(crate) const OUTER_NONCONVERGENCE_WARNING: &str = "Outer optimization did no
 /// coordinate ([`perturbed_start`]) with `outer_maxiter = budget`, and
 /// [`start_probe_verdict`] reads its penalized objective against the start's:
 ///
-/// - `Some(true)` — `result` is reported as a verified warm start: `left_init =
-///   Some(false)`, `stationary_start = true`, `converged = true`. A run that stopped
-///   unconverged without leaving its start stopped *because* it could find no descent,
-///   and the probe has just shown there is none; every warning `nonconvergence_notice`
-///   recognises as the optimizer's own stop-rule verdict is withdrawn with it. Nothing
-///   else can have left it unconverged here: a non-finite objective, cancellation and
-///   an exhausted budget each keep the probe from running;
+/// - `Some(true)` — the start is verified, and the probe's result is reported through
+///   [`verified_start_result`]: a complete fit, whose own verdict and warnings stand, so
+///   nothing about the unmoved run is rewritten;
 /// - `Some(false)` — the start was a stall: the probe's result is reported, with
 ///   [`start_probe_adopted_warning`];
 /// - `None` — `result` is reported unchanged, and the displacement check judges it.
@@ -3802,7 +3789,6 @@ pub(crate) fn verify_unmoved_start(
     result: OuterResult,
     budget: usize,
     unit: &str,
-    nonconvergence_notice: fn(&str) -> bool,
     rerun: impl FnOnce(&ModelParameters, &FitOptions) -> OuterResult,
 ) -> OuterResult {
     let PackedStart {
@@ -3855,15 +3841,9 @@ pub(crate) fn verify_unmoved_start(
             probe
         }
         Some(true) => {
-            let mut verified = OuterResult {
-                left_init: Some(false),
-                stationary_start: true,
-                n_iterations: result.n_iterations + probe.n_iterations,
-                ..result
-            };
-            verified.converged = true;
-            verified.warnings.retain(|w| !nonconvergence_notice(w));
-            verified
+            let left =
+                !(max_scaled_deviation(&pack_params(&probe.params), &x0) < INIT_ESCAPE_STEP_S);
+            verified_start_result(probe, left, &result)
         }
         None => OuterResult {
             n_iterations: result.n_iterations + probe.n_iterations,
@@ -4605,7 +4585,6 @@ fn optimize_nlopt(
             );
         }
         *probed.borrow_mut() = Some((result, outcome, verdict));
-        verdict
     };
     let ((first, first_cause), first_left_init) = attempt(init_params, false, Some(&probe));
     let first_attempt = settle_start_probe(
@@ -7026,40 +7005,35 @@ fn optimize_nlopt_once_probed(
     // real objective at least once (with no feasible evaluation the start's objective is no
     // reference to compare against, and #1617 reports the run as it is), was not cancelled,
     // and has budget left — the probe continues the same fit, on its budget.
-    let stationary_start = match start_probe {
-        Some(probe)
-            if !left_init
-                && !feasibility.no_feasible()
-                && !crate::cancel::is_cancelled(&options.cancel)
-                && spent_evals + n_evals_outer.load(Ordering::Relaxed) < full_budget as usize =>
-        {
-            perturbed_start(
-                &restored_xs,
-                &packed_fixed_mask(init_params),
-                &lower_s,
-                &upper_s,
-            )
-            .and_then(|mut xp| {
-                for i in 0..n {
-                    xp[i] *= scale[i];
-                }
-                let start_ofv =
-                    final_ofv + nn_reg.penalty_value(&final_params.theta) + priors.penalty(&x0);
-                probe(
-                    &unpack_params(&xp, init_params),
-                    start_ofv,
-                    spent_evals + n_evals_outer.load(Ordering::Relaxed),
-                )
-            })
+    if let Some(probe) = start_probe.filter(|_| {
+        !left_init
+            && !feasibility.no_feasible()
+            && !crate::cancel::is_cancelled(&options.cancel)
+            && spent_evals + n_evals_outer.load(Ordering::Relaxed) < full_budget as usize
+    }) {
+        if let Some(mut xp) = perturbed_start(
+            &restored_xs,
+            &packed_fixed_mask(init_params),
+            &lower_s,
+            &upper_s,
+        ) {
+            for i in 0..n {
+                xp[i] *= scale[i];
+            }
+            let start_ofv =
+                final_ofv + nn_reg.penalty_value(&final_params.theta) + priors.penalty(&x0);
+            probe(
+                &unpack_params(&xp, init_params),
+                start_ofv,
+                spent_evals + n_evals_outer.load(Ordering::Relaxed),
+            );
         }
-        _ => None,
-    };
+    }
     if stationarity_check_pending {
         let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
-        let start_is_stationary = !left_init && stationary_start == Some(true);
         let accepted = if verified_stop {
             cold_solve_is_consistent(best_seen_ofv, consistency_ofv)
-                && (left_init || !verified_needs_left_init || start_is_stationary)
+                && (left_init || !verified_needs_left_init)
         } else {
             failure_is_converged_plateau(
                 feasible_evals,
@@ -7067,12 +7041,6 @@ fn optimize_nlopt_once_probed(
                 best_seen_ofv,
                 consistency_ofv,
                 left_init,
-            ) || stationary_start_is_converged_plateau(
-                feasible_evals,
-                last_sig_feasible_eval,
-                best_seen_ofv,
-                consistency_ofv,
-                start_is_stationary,
             )
         };
         if accepted {
@@ -7082,8 +7050,7 @@ fn optimize_nlopt_once_probed(
             let flat_tail = feasible_evals.saturating_sub(last_sig_feasible_eval);
             eprintln!(
                 "Plateau check: flat_tail = {} feasible evals (min {}), feasible_evals = {}, \
-                 best-seen {:?} vs cold {:.6} (reported {:.6}), left init = {}, \
-                 stationary start = {} → converged = {}",
+                 best-seen {:?} vs cold {:.6} (reported {:.6}), left init = {} → converged = {}",
                 flat_tail,
                 PLATEAU_MIN_FLAT_EVALS,
                 feasible_evals,
@@ -7091,7 +7058,6 @@ fn optimize_nlopt_once_probed(
                 consistency_ofv,
                 final_ofv,
                 left_init,
-                start_is_stationary,
                 converged,
             );
         }
@@ -7230,7 +7196,7 @@ fn optimize_nlopt_once_probed(
         warnings.push(w);
     }
     if !converged {
-        warnings.push(OUTER_NONCONVERGENCE_WARNING.to_string());
+        warnings.push("Outer optimization did not converge".to_string());
     }
     // A stall with no budget left is not restarted (see
     // `worth_restarting_mid_descent`), and the reason the user can act on is the
@@ -7317,8 +7283,8 @@ fn optimize_nlopt_once_probed(
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x0.clone()),
         left_init: Some(published_left_init),
-        // Only a fit that did not leave the user's start carries a verdict.
-        stationary_start: !published_left_init && stationary_start == Some(true),
+        // Set by `settle_start_probe` on the probe's result, never on an attempt's own.
+        stationary_start: false,
         mixture_posteriors: final_mixture_posteriors,
         vi: None,
     };
@@ -7926,7 +7892,7 @@ fn optimize_bfgs(
         warnings.push(w);
     }
     if !converged {
-        warnings.push(OUTER_NONCONVERGENCE_WARNING.to_string());
+        warnings.push("Outer optimization did not converge".to_string());
     }
 
     OuterResult {
