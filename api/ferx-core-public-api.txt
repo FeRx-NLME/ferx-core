@@ -16,6 +16,7 @@ pub ferx_core::api::AdaptiveSimulateOptions::decision_times: alloc::vec::Vec<f64
 pub ferx_core::api::AdaptiveSimulateOptions::max_decisions: usize
 pub ferx_core::api::AdaptiveSimulateOptions::monitors: alloc::vec::Vec<ferx_core::sim::adaptive::MonitorSpec>
 pub ferx_core::api::AdaptiveSimulateOptions::seed: core::option::Option<u64>
+pub ferx_core::api::AdaptiveSimulateOptions::start_interval: core::option::Option<f64>
 pub ferx_core::api::AdaptiveSimulateOptions::verify: bool
 impl core::default::Default for ferx_core::AdaptiveSimulateOptions
 pub fn ferx_core::AdaptiveSimulateOptions::default() -> Self
@@ -474,9 +475,11 @@ pub ferx_core::estimation::inner_optimizer::EbeResult::h_matrix: nalgebra::base:
 pub ferx_core::estimation::inner_optimizer::EbeResult::hard_reject: bool
 pub ferx_core::estimation::inner_optimizer::EbeResult::kappas: alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>
 pub ferx_core::estimation::inner_optimizer::EbeResult::nll: f64
+pub ferx_core::estimation::inner_optimizer::EbeResult::nm_polished: bool
 pub ferx_core::estimation::inner_optimizer::EbeResult::used_fallback: bool
 pub struct ferx_core::estimation::inner_optimizer::InnerLoopStats
 pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_fallback: usize
+pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_nm_polished: usize
 pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_start_rejected: usize
 pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_unconverged: usize
 pub const ferx_core::estimation::inner_optimizer::INNER_LBFGS_MIN_DIM: usize
@@ -532,6 +535,7 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::saem_mu_ref_m_step_eval
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_n_subjects_hmc: core::option::Option<usize>
 pub ferx_core::estimation::outer_optimizer::OuterResult::sir_fallback_proposal: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::total_ebe_fallbacks: u32
+pub ferx_core::estimation::outer_optimizer::OuterResult::total_ebe_nm_polished: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::vi: core::option::Option<ferx_core::ViResult>
 pub ferx_core::estimation::outer_optimizer::OuterResult::warnings: alloc::vec::Vec<alloc::string::String>
 pub fn ferx_core::estimation::outer_optimizer::optimize_population(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> ferx_core::estimation::outer_optimizer::OuterResult
@@ -1757,6 +1761,8 @@ pub fn ferx_core::sens::dual1::Dual1<N>::axpy_fold(acc: Self, terms: &[(Self, f6
 pub fn ferx_core::sens::dual1::Dual1<N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::detach(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
@@ -1843,6 +1849,8 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::axpy_fold(acc: Self, terms
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::detach(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
@@ -1885,6 +1893,8 @@ pub fn ferx_core::sens::num::PkNum::axpy_fold(acc: Self, terms: &[(Self, f64)]) 
 pub fn ferx_core::sens::num::PkNum::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::num::PkNum::cos(self) -> Self
 pub fn ferx_core::sens::num::PkNum::detach(self) -> Self
+pub fn ferx_core::sens::num::PkNum::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn ferx_core::sens::num::PkNum::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn ferx_core::sens::num::PkNum::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::num::PkNum::exp(self) -> Self
 pub fn ferx_core::sens::num::PkNum::from_f64(x: f64) -> Self
@@ -1925,6 +1935,8 @@ pub fn f64::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
 pub fn f64::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn f64::cos(self) -> Self
 pub fn f64::detach(self) -> Self
+pub fn f64::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn f64::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn f64::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn f64::exp(self) -> Self
 pub fn f64::from_f64(x: f64) -> Self
@@ -1965,6 +1977,8 @@ pub fn ferx_core::sens::dual1::Dual1<N>::axpy_fold(acc: Self, terms: &[(Self, f6
 pub fn ferx_core::sens::dual1::Dual1<N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::detach(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
@@ -2005,6 +2019,8 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::axpy_fold(acc: Self, terms
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::detach(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
@@ -2146,10 +2162,11 @@ pub fn ferx_core::sens::two_cpt::two_cpt_transit_g<T: ferx_core::sens::num::PkNu
 pub fn ferx_core::sens::two_cpt::two_cpt_zero_order_g<T: ferx_core::sens::num::PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, dur: T, f_bio: T) -> T
 pub mod ferx_core::sim
 pub mod ferx_core::sim::adaptive
-pub enum ferx_core::sim::adaptive::AdaptiveAction
+#[non_exhaustive] pub enum ferx_core::sim::adaptive::AdaptiveAction
 pub ferx_core::sim::adaptive::AdaptiveAction::Decrease(ferx_core::sim::adaptive::DoseStep)
 pub ferx_core::sim::adaptive::AdaptiveAction::Hold
 pub ferx_core::sim::adaptive::AdaptiveAction::Increase(ferx_core::sim::adaptive::DoseStep)
+pub ferx_core::sim::adaptive::AdaptiveAction::Maintain
 pub ferx_core::sim::adaptive::AdaptiveAction::Stop
 pub enum ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::sim::adaptive::AdaptiveRoute::Bolus
@@ -2163,10 +2180,11 @@ pub ferx_core::sim::adaptive::Comparison::Ge
 pub ferx_core::sim::adaptive::Comparison::Gt
 pub ferx_core::sim::adaptive::Comparison::Le
 pub ferx_core::sim::adaptive::Comparison::Lt
-pub enum ferx_core::sim::adaptive::DecisionOutcome
+#[non_exhaustive] pub enum ferx_core::sim::adaptive::DecisionOutcome
 pub ferx_core::sim::adaptive::DecisionOutcome::Dosed
 pub ferx_core::sim::adaptive::DecisionOutcome::Dosed::n: usize
 pub ferx_core::sim::adaptive::DecisionOutcome::Hold
+pub ferx_core::sim::adaptive::DecisionOutcome::NotDue
 pub ferx_core::sim::adaptive::DecisionOutcome::Stop
 pub ferx_core::sim::adaptive::DecisionOutcome::Stop::dosed: usize
 #[non_exhaustive] pub enum ferx_core::sim::adaptive::DoseAction
@@ -2178,6 +2196,8 @@ pub ferx_core::sim::adaptive::DoseAction::Infuse
 pub ferx_core::sim::adaptive::DoseAction::Infuse::amt: f64
 pub ferx_core::sim::adaptive::DoseAction::Infuse::cmt: usize
 pub ferx_core::sim::adaptive::DoseAction::Infuse::rate: f64
+pub ferx_core::sim::adaptive::DoseAction::SetInterval
+pub ferx_core::sim::adaptive::DoseAction::SetInterval::interval: f64
 pub ferx_core::sim::adaptive::DoseAction::Stop
 impl ferx_core::sim::adaptive::DoseAction
 pub fn ferx_core::sim::adaptive::DoseAction::is_stop(&self) -> bool
@@ -2186,27 +2206,33 @@ pub fn ferx_core::sim::adaptive::DoseAction::validate(&self) -> core::result::Re
 pub enum ferx_core::sim::adaptive::DoseStep
 pub ferx_core::sim::adaptive::DoseStep::Level
 pub ferx_core::sim::adaptive::DoseStep::Percent(f64)
+#[non_exhaustive] pub enum ferx_core::sim::adaptive::IntervalStep
+pub ferx_core::sim::adaptive::IntervalStep::Lengthen
+pub ferx_core::sim::adaptive::IntervalStep::Shorten
 pub enum ferx_core::sim::adaptive::ObserveMode
 pub ferx_core::sim::adaptive::ObserveMode::Dv
 pub ferx_core::sim::adaptive::ObserveMode::Ipred
-pub struct ferx_core::sim::adaptive::AdaptiveDosingSpec
+#[non_exhaustive] pub struct ferx_core::sim::adaptive::AdaptiveDosingSpec
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::assay_cmt: core::option::Option<usize>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::confirm: u32
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_bounds: (f64, f64)
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe_declared_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::route: ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::rules: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveRule>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_dose: f64
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_interval: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::target_window: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::with_assay_error: bool
 impl ferx_core::sim::adaptive::AdaptiveDosingSpec
 pub fn ferx_core::sim::adaptive::AdaptiveDosingSpec::validate(&self) -> core::result::Result<(), alloc::string::String>
-pub struct ferx_core::sim::adaptive::AdaptiveRule
+#[non_exhaustive] pub struct ferx_core::sim::adaptive::AdaptiveRule
 pub ferx_core::sim::adaptive::AdaptiveRule::action: ferx_core::sim::adaptive::AdaptiveAction
+pub ferx_core::sim::adaptive::AdaptiveRule::interval: core::option::Option<ferx_core::sim::adaptive::IntervalStep>
 pub ferx_core::sim::adaptive::AdaptiveRule::op: ferx_core::sim::adaptive::Comparison
 pub ferx_core::sim::adaptive::AdaptiveRule::threshold: f64
 pub struct ferx_core::sim::adaptive::AdaptiveRun
@@ -2223,6 +2249,7 @@ pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_decreases: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_holds: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_increases: usize
+pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_not_due: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::pct_time_in_window: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_max: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_mean: core::option::Option<f64>
@@ -2234,14 +2261,16 @@ pub struct ferx_core::sim::adaptive::ControllerCtx<'a>
 pub ferx_core::sim::adaptive::ControllerCtx::covariates: &'a std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub ferx_core::sim::adaptive::ControllerCtx::decision_index: usize
 pub ferx_core::sim::adaptive::ControllerCtx::history: &'a [ferx_core::DoseEvent]
+pub ferx_core::sim::adaptive::ControllerCtx::interval: core::option::Option<f64>
 pub ferx_core::sim::adaptive::ControllerCtx::signals: &'a std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub ferx_core::sim::adaptive::ControllerCtx::state: &'a [f64]
 pub ferx_core::sim::adaptive::ControllerCtx::t: f64
 impl ferx_core::sim::adaptive::ControllerCtx<'_>
 pub fn ferx_core::sim::adaptive::ControllerCtx<'_>::signal(&self, name: &str) -> core::option::Option<f64>
-pub struct ferx_core::sim::adaptive::DecisionLogEntry
+#[non_exhaustive] pub struct ferx_core::sim::adaptive::DecisionLogEntry
 pub ferx_core::sim::adaptive::DecisionLogEntry::decision_idx: usize
 pub ferx_core::sim::adaptive::DecisionLogEntry::draw: usize
+pub ferx_core::sim::adaptive::DecisionLogEntry::interval: core::option::Option<f64>
 pub ferx_core::sim::adaptive::DecisionLogEntry::observed_signals: alloc::vec::Vec<ferx_core::sim::adaptive::ObservedSignal>
 pub ferx_core::sim::adaptive::DecisionLogEntry::outcome: ferx_core::sim::adaptive::DecisionOutcome
 pub ferx_core::sim::adaptive::DecisionLogEntry::sim: usize
@@ -2484,6 +2513,13 @@ pub ferx_core::types::EndpointLikelihood::Ctmm::generator_program: core::option:
 pub ferx_core::types::EndpointLikelihood::Ctmm::generator_states: alloc::vec::Vec<(alloc::string::String, usize)>
 pub ferx_core::types::EndpointLikelihood::Ctmm::n_states: usize
 pub ferx_core::types::EndpointLikelihood::Ctmm::state_codes: alloc::vec::Vec<usize>
+pub ferx_core::types::EndpointLikelihood::Dtmm
+pub ferx_core::types::EndpointLikelihood::Dtmm::n_states: usize
+pub ferx_core::types::EndpointLikelihood::Dtmm::prob_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::EndpointLikelihood::Dtmm::prob_fn: ferx_core::TransitionProbFn
+pub ferx_core::types::EndpointLikelihood::Dtmm::prob_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::types::EndpointLikelihood::Dtmm::state_codes: alloc::vec::Vec<usize>
+pub ferx_core::types::EndpointLikelihood::Dtmm::transitions: alloc::vec::Vec<(usize, usize)>
 pub ferx_core::types::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::types::EndpointLikelihood::Tte
 pub ferx_core::types::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
@@ -2889,6 +2925,7 @@ pub fn ferx_core::CompiledModel::analytical_compartment_names(&self) -> &'static
 pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
+pub fn ferx_core::CompiledModel::dtmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core::Subject) -> &'a ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
@@ -2896,6 +2933,7 @@ pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
 pub fn ferx_core::CompiledModel::has_ctmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_custom_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_discrete(&self) -> bool
+pub fn ferx_core::CompiledModel::has_dtmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_lagtime(&self) -> bool
 pub fn ferx_core::CompiledModel::has_lagtime_on_cmt(&self, cmt: usize) -> bool
 pub fn ferx_core::CompiledModel::has_non_gaussian(&self) -> bool
@@ -3362,6 +3400,7 @@ pub ferx_core::types::FitResult::theta_init: alloc::vec::Vec<f64>
 pub ferx_core::types::FitResult::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::theta_transform: alloc::vec::Vec<ferx_core::ThetaTransform>
 pub ferx_core::types::FitResult::total_ebe_fallbacks: u32
+pub ferx_core::types::FitResult::total_ebe_nm_polished: u32
 pub ferx_core::types::FitResult::trace_path: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::uses_ode_solver: bool
 pub ferx_core::types::FitResult::uses_sde: bool
@@ -3717,11 +3756,13 @@ pub type ferx_core::types::LinearPredictorFn = alloc::boxed::Box<(dyn core::ops:
 pub type ferx_core::types::PkParamFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64) -> ferx_core::PkParams + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::RuvMagFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64, f64) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::ScaleFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, &ferx_core::PkParams) -> f64 + core::marker::Send + core::marker::Sync)>
+pub type ferx_core::types::TransitionProbFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> alloc::vec::Vec<f64> + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::TvFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> alloc::vec::Vec<f64> + core::marker::Send + core::marker::Sync)>
-pub enum ferx_core::AdaptiveAction
+#[non_exhaustive] pub enum ferx_core::AdaptiveAction
 pub ferx_core::AdaptiveAction::Decrease(ferx_core::sim::adaptive::DoseStep)
 pub ferx_core::AdaptiveAction::Hold
 pub ferx_core::AdaptiveAction::Increase(ferx_core::sim::adaptive::DoseStep)
+pub ferx_core::AdaptiveAction::Maintain
 pub ferx_core::AdaptiveAction::Stop
 pub enum ferx_core::AdaptiveRoute
 pub ferx_core::AdaptiveRoute::Bolus
@@ -3806,10 +3847,11 @@ pub ferx_core::CovariateStat::Mode
 impl ferx_core::CovariateStat
 pub fn ferx_core::CovariateStat::label(&self) -> alloc::string::String
 pub fn ferx_core::CovariateStat::literal(&self) -> core::option::Option<f64>
-pub enum ferx_core::DecisionOutcome
+#[non_exhaustive] pub enum ferx_core::DecisionOutcome
 pub ferx_core::DecisionOutcome::Dosed
 pub ferx_core::DecisionOutcome::Dosed::n: usize
 pub ferx_core::DecisionOutcome::Hold
+pub ferx_core::DecisionOutcome::NotDue
 pub ferx_core::DecisionOutcome::Stop
 pub ferx_core::DecisionOutcome::Stop::dosed: usize
 pub enum ferx_core::DerivedKind
@@ -3835,6 +3877,8 @@ pub ferx_core::DoseAction::Infuse
 pub ferx_core::DoseAction::Infuse::amt: f64
 pub ferx_core::DoseAction::Infuse::cmt: usize
 pub ferx_core::DoseAction::Infuse::rate: f64
+pub ferx_core::DoseAction::SetInterval
+pub ferx_core::DoseAction::SetInterval::interval: f64
 pub ferx_core::DoseAction::Stop
 impl ferx_core::sim::adaptive::DoseAction
 pub fn ferx_core::sim::adaptive::DoseAction::is_stop(&self) -> bool
@@ -3870,6 +3914,13 @@ pub ferx_core::EndpointLikelihood::Ctmm::generator_program: core::option::Option
 pub ferx_core::EndpointLikelihood::Ctmm::generator_states: alloc::vec::Vec<(alloc::string::String, usize)>
 pub ferx_core::EndpointLikelihood::Ctmm::n_states: usize
 pub ferx_core::EndpointLikelihood::Ctmm::state_codes: alloc::vec::Vec<usize>
+pub ferx_core::EndpointLikelihood::Dtmm
+pub ferx_core::EndpointLikelihood::Dtmm::n_states: usize
+pub ferx_core::EndpointLikelihood::Dtmm::prob_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::EndpointLikelihood::Dtmm::prob_fn: ferx_core::TransitionProbFn
+pub ferx_core::EndpointLikelihood::Dtmm::prob_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::EndpointLikelihood::Dtmm::state_codes: alloc::vec::Vec<usize>
+pub ferx_core::EndpointLikelihood::Dtmm::transitions: alloc::vec::Vec<(usize, usize)>
 pub ferx_core::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::EndpointLikelihood::Tte
 pub ferx_core::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
@@ -3976,6 +4027,9 @@ pub ferx_core::IntegralWindow::Explicit::to: f64
 pub ferx_core::IntegralWindow::Periodic
 pub ferx_core::IntegralWindow::Periodic::anchor: f64
 pub ferx_core::IntegralWindow::Periodic::period: f64
+#[non_exhaustive] pub enum ferx_core::IntervalStep
+pub ferx_core::IntervalStep::Lengthen
+pub ferx_core::IntervalStep::Shorten
 pub enum ferx_core::IovOccasionRule
 pub ferx_core::IovOccasionRule::Column
 pub ferx_core::IovOccasionRule::PerDose
@@ -4203,18 +4257,20 @@ pub ferx_core::WarningSeverity::Critical
 pub ferx_core::WarningSeverity::Info
 pub ferx_core::WarningSeverity::Warning
 pub struct ferx_core::AbsorptionOdeEquivalent
-pub struct ferx_core::AdaptiveDosingSpec
+#[non_exhaustive] pub struct ferx_core::AdaptiveDosingSpec
 pub ferx_core::AdaptiveDosingSpec::assay_cmt: core::option::Option<usize>
 pub ferx_core::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::confirm: u32
 pub ferx_core::AdaptiveDosingSpec::dose_bounds: (f64, f64)
+pub ferx_core::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
 pub ferx_core::AdaptiveDosingSpec::observe_declared_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::AdaptiveDosingSpec::route: ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::AdaptiveDosingSpec::rules: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveRule>
 pub ferx_core::AdaptiveDosingSpec::start_dose: f64
+pub ferx_core::AdaptiveDosingSpec::start_interval: core::option::Option<f64>
 pub ferx_core::AdaptiveDosingSpec::target_window: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::with_assay_error: bool
 impl ferx_core::sim::adaptive::AdaptiveDosingSpec
@@ -4227,8 +4283,9 @@ impl<'a> ferx_core::AdaptiveInputs<'a>
 pub fn ferx_core::AdaptiveInputs<'a>::new(params: &'a ferx_core::ModelParameters) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::SuppliedEtas) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
-pub struct ferx_core::AdaptiveRule
+#[non_exhaustive] pub struct ferx_core::AdaptiveRule
 pub ferx_core::AdaptiveRule::action: ferx_core::sim::adaptive::AdaptiveAction
+pub ferx_core::AdaptiveRule::interval: core::option::Option<ferx_core::sim::adaptive::IntervalStep>
 pub ferx_core::AdaptiveRule::op: ferx_core::sim::adaptive::Comparison
 pub ferx_core::AdaptiveRule::threshold: f64
 #[non_exhaustive] pub struct ferx_core::AdaptiveSimulateOptions
@@ -4236,6 +4293,7 @@ pub ferx_core::AdaptiveSimulateOptions::decision_times: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveSimulateOptions::max_decisions: usize
 pub ferx_core::AdaptiveSimulateOptions::monitors: alloc::vec::Vec<ferx_core::sim::adaptive::MonitorSpec>
 pub ferx_core::AdaptiveSimulateOptions::seed: core::option::Option<u64>
+pub ferx_core::AdaptiveSimulateOptions::start_interval: core::option::Option<f64>
 pub ferx_core::AdaptiveSimulateOptions::verify: bool
 impl core::default::Default for ferx_core::AdaptiveSimulateOptions
 pub fn ferx_core::AdaptiveSimulateOptions::default() -> Self
@@ -4255,6 +4313,7 @@ pub ferx_core::AdaptiveSubjectMetrics::n_decreases: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_holds: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_increases: usize
+pub ferx_core::AdaptiveSubjectMetrics::n_not_due: usize
 pub ferx_core::AdaptiveSubjectMetrics::pct_time_in_window: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::signal_max: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::signal_mean: core::option::Option<f64>
@@ -4371,6 +4430,7 @@ pub fn ferx_core::CompiledModel::analytical_compartment_names(&self) -> &'static
 pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
+pub fn ferx_core::CompiledModel::dtmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core::Subject) -> &'a ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
@@ -4378,6 +4438,7 @@ pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
 pub fn ferx_core::CompiledModel::has_ctmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_custom_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_discrete(&self) -> bool
+pub fn ferx_core::CompiledModel::has_dtmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_lagtime(&self) -> bool
 pub fn ferx_core::CompiledModel::has_lagtime_on_cmt(&self, cmt: usize) -> bool
 pub fn ferx_core::CompiledModel::has_non_gaussian(&self) -> bool
@@ -4414,6 +4475,7 @@ pub struct ferx_core::ControllerCtx<'a>
 pub ferx_core::ControllerCtx::covariates: &'a std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub ferx_core::ControllerCtx::decision_index: usize
 pub ferx_core::ControllerCtx::history: &'a [ferx_core::DoseEvent]
+pub ferx_core::ControllerCtx::interval: core::option::Option<f64>
 pub ferx_core::ControllerCtx::signals: &'a std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub ferx_core::ControllerCtx::state: &'a [f64]
 pub ferx_core::ControllerCtx::t: f64
@@ -4497,9 +4559,10 @@ pub ferx_core::DataSource::path: core::option::Option<std::path::PathBuf>
 impl ferx_core::DataSource
 pub fn ferx_core::DataSource::from_bytes(bytes: impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
 pub fn ferx_core::DataSource::read(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, alloc::string::String>
-pub struct ferx_core::DecisionLogEntry
+#[non_exhaustive] pub struct ferx_core::DecisionLogEntry
 pub ferx_core::DecisionLogEntry::decision_idx: usize
 pub ferx_core::DecisionLogEntry::draw: usize
+pub ferx_core::DecisionLogEntry::interval: core::option::Option<f64>
 pub ferx_core::DecisionLogEntry::observed_signals: alloc::vec::Vec<ferx_core::sim::adaptive::ObservedSignal>
 pub ferx_core::DecisionLogEntry::outcome: ferx_core::sim::adaptive::DecisionOutcome
 pub ferx_core::DecisionLogEntry::sim: usize
@@ -4917,6 +4980,7 @@ pub ferx_core::FitResult::theta_init: alloc::vec::Vec<f64>
 pub ferx_core::FitResult::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::theta_transform: alloc::vec::Vec<ferx_core::ThetaTransform>
 pub ferx_core::FitResult::total_ebe_fallbacks: u32
+pub ferx_core::FitResult::total_ebe_nm_polished: u32
 pub ferx_core::FitResult::trace_path: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::uses_ode_solver: bool
 pub ferx_core::FitResult::uses_sde: bool
@@ -5511,4 +5575,5 @@ pub type ferx_core::LinearPredictorFn = alloc::boxed::Box<(dyn core::ops::functi
 pub type ferx_core::PkParamFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64) -> ferx_core::PkParams + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::RuvMagFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64, f64) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::ScaleFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, &ferx_core::PkParams) -> f64 + core::marker::Send + core::marker::Sync)>
+pub type ferx_core::TransitionProbFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> alloc::vec::Vec<f64> + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::TvFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> alloc::vec::Vec<f64> + core::marker::Send + core::marker::Sync)>

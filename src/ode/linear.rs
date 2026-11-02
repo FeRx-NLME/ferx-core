@@ -94,7 +94,23 @@ fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: 
         }
         return;
     }
-    out[..n * n].fill(T::from_f64(0.0));
+    // The common compartment counts as literals into the one inlined loop, so it unrolls at
+    // each size; the same products in the same order, skips included (#1564).
+    match n {
+        2 => accumulate(x, y, 2, out, row_finite),
+        3 => accumulate(x, y, 3, out, row_finite),
+        4 => accumulate(x, y, 4, out, row_finite),
+        _ => accumulate(x, y, n, out, row_finite),
+    }
+}
+
+/// [`matmul_into`]'s accumulation: `out = x·y`, skipping a structural-zero `x[i][k]` whose
+/// row `k` of `y` is finite. Inlined into each call so a literal `n` unrolls the loops.
+#[inline(always)]
+fn accumulate<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: &[bool]) {
+    use crate::sens::linsolve::structural_zero;
+    let (x, y, out) = (&x[..n * n], &y[..n * n], &mut out[..n * n]);
+    out.fill(T::from_f64(0.0));
     for i in 0..n {
         for k in 0..n {
             let xik = x[i * n + k];
@@ -183,6 +199,12 @@ pub(crate) struct Expm<T> {
     piv: Vec<usize>,
     row_finite: Vec<bool>,
     cache: Vec<PadeEntry<T>>,
+    /// `n×n` buffers [`Self::reset`] released, handed out again for approximants, their
+    /// squarings and keys (#2549): a fit's segments otherwise allocate and free several per
+    /// new exponential.
+    spare: Vec<Vec<T>>,
+    /// Emptied `powers` lists, likewise.
+    spare_powers: Vec<Vec<Vec<T>>>,
 }
 
 impl<T: PkNum> Expm<T> {
@@ -202,12 +224,29 @@ impl<T: PkNum> Expm<T> {
             piv: vec![0; n],
             row_finite: vec![false; n],
             cache: Vec::new(),
+            spare: Vec::new(),
+            spare_powers: Vec::new(),
         }
+    }
+
+    /// An `n×n` buffer: a released one, or a new one. Its contents are unspecified; every
+    /// caller writes all of it.
+    fn buffer(spare: &mut Vec<Vec<T>>, n: usize) -> Vec<T> {
+        let mut v = spare.pop().unwrap_or_default();
+        v.clear();
+        v.resize(n * n, T::from_f64(0.0));
+        v
     }
 
     /// Forget every cached approximant (and invalidate every [`ExpmSlot`]).
     pub(crate) fn reset(&mut self) {
-        self.cache.clear();
+        for mut e in self.cache.drain(..) {
+            self.spare.append(&mut e.powers);
+            self.spare_powers.push(e.powers);
+            if e.key.capacity() > 0 {
+                self.spare.push(e.key);
+            }
+        }
     }
 
     /// Matrix exponential `exp(A)` of the row-major `n×n` matrix `a`, by scaling and squaring
@@ -263,13 +302,19 @@ impl<T: PkNum> Expm<T> {
         let idx = match found {
             Some(i) => i,
             None => {
-                let powers = self.pade().map(|r| vec![r]).unwrap_or_default();
+                let mut powers = self.spare_powers.pop().unwrap_or_default();
+                if let Some(r) = self.pade() {
+                    powers.push(r);
+                }
+                let key = if reusable {
+                    let mut k = Self::buffer(&mut self.spare, 0);
+                    k.extend_from_slice(&self.a1);
+                    k
+                } else {
+                    Vec::new()
+                };
                 self.cache.push(PadeEntry {
-                    key: if reusable {
-                        self.a1.clone()
-                    } else {
-                        Vec::new()
-                    },
+                    key,
                     reusable,
                     powers,
                 });
@@ -277,7 +322,10 @@ impl<T: PkNum> Expm<T> {
             }
         };
         let Expm {
-            cache, row_finite, ..
+            cache,
+            row_finite,
+            spare,
+            ..
         } = self;
         let entry = &mut cache[idx];
         if entry.powers.is_empty() {
@@ -286,17 +334,18 @@ impl<T: PkNum> Expm<T> {
         if entry.reusable {
             while entry.powers.len() <= s {
                 let last = entry.powers.last().expect("non-empty");
-                let mut sq = vec![T::from_f64(0.0); n * n];
+                let mut sq = Self::buffer(spare, n);
                 matmul_into(last, last, n, &mut sq, row_finite);
                 entry.powers.push(sq);
             }
         } else {
             // Never matched again: square in place and keep only the result.
-            let mut sq = vec![T::from_f64(0.0); n * n];
+            let mut sq = Self::buffer(spare, n);
             for _ in 0..s {
                 matmul_into(&entry.powers[0], &entry.powers[0], n, &mut sq, row_finite);
                 std::mem::swap(&mut entry.powers[0], &mut sq);
             }
+            spare.push(sq);
         }
         let power = if entry.reusable { s } else { 0 };
         let r = &entry.powers[power];
@@ -370,7 +419,7 @@ impl<T: PkNum> Expm<T> {
         if !lu_factor_in_place_g(q, &mut self.piv, n) {
             return None;
         }
-        let mut r = vec![T::from_f64(0.0); n * n];
+        let mut r = Self::buffer(&mut self.spare, n);
         let col = &mut self.col;
         for j in 0..n {
             for i in 0..n {

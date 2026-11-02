@@ -387,7 +387,7 @@ pub(crate) fn is_last_estimating_stage(
 ///
 /// The #1006 post-fit warning says a fixed-effects-only GN result "may be badly
 /// wrong". That is only true if nothing re-optimises it. `run_foce_gn` exempts
-/// `gn_hybrid` itself, but it cannot exempt a hand-written `methods = [gn, focei]`
+/// `gn_hybrid` itself, but it cannot exempt a hand-written `method = [gn, focei]`
 /// chain — `fit_inner` blanks `stage_opts.methods` per stage, so the GN stage sees
 /// `method = gn` and no chain. This is the other half of that exemption, applied
 /// where the chain *is* visible: a GN stage followed by a further estimating stage
@@ -1986,7 +1986,7 @@ fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
 /// non-finite penalty — a prior whose density is zero at the estimate, an
 /// overflowing log-normal prior on a runaway θ — produces a `FitResult` whose
 /// published `ofv` no estimator ever saw. The chained case is the same shape:
-/// `methods = vi, focei` reports the last stage's objective, and a multi-start
+/// `method = [vi, focei]` reports the last stage's objective, and a multi-start
 /// splice re-homes warnings across runs.
 ///
 /// Severity is [`WarningSeverity::Critical`] and the code is

@@ -176,8 +176,10 @@ pub(crate) enum TteHorizon {
 ///   subject are unsupported (a full reset would zero the hazard accumulator
 ///   mid-flight; conditional sampling past entry is a deferred follow-up).
 ///
-/// A genuinely divergent hazard (negative / non-finite) is *not* preventable here —
-/// it surfaces loudly during integration (never as a silent censor).
+/// A genuinely divergent model (a diverged `[odes]` state, a negative / non-finite
+/// hazard) is *not* preventable here — it depends on the parameter draw. It surfaces
+/// during integration, per subject: that subject is censored at the window and named in
+/// a `W_TTE_SOLVE_FAILED` warning (#2087), never silently.
 ///
 /// `horizon` says what the caller could have supplied. Where a horizon is required and
 /// missing, a caller that takes one is told to set it (`E_SIMULATE_HORIZON`); a caller
@@ -1667,6 +1669,16 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // sampled). Fail loud rather than return garbage — fit() supports CTMM, simulate()
     // does not. Mirrors the survival guards above; the CLI `--simulate` path returns this
     // as a clean Err in `run_model_simulate`. This is the single simulate chokepoint.
+    // DTMM (#2473) likewise: its records are discrete states the Gaussian emitter never
+    // visits, so a simulation would silently drop them.
+    #[cfg(feature = "markov")]
+    if model.has_dtmm() {
+        return Err(super::entry_refusals::ctmm_unsupported(
+            "simulate()/predict() does not support a [markov_model] `type = dtmm` endpoint yet \
+             — its discrete-time state chain has no simulation path, so its records would be \
+             silently dropped. DTMM simulation is a later slice.",
+        ));
+    }
     #[cfg(feature = "markov")]
     if model.has_ctmm() {
         return Err(super::entry_refusals::ctmm_unsupported(

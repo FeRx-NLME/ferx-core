@@ -626,6 +626,7 @@ fn run_map_multistart(
     let stats = InnerLoopStats {
         n_unconverged: results.iter().filter(|r| !r.converged).count(),
         n_fallback: results.iter().filter(|r| r.used_fallback).count(),
+        n_nm_polished: results.iter().filter(|r| r.nm_polished).count(),
         n_start_rejected: results.iter().filter(|r| r.hard_reject).count(),
     };
     let eta_hats: Vec<DVector<f64>> = results.iter().map(|r| r.eta.clone()).collect();
@@ -985,6 +986,9 @@ fn run_mcem(
     let cov_group_conflicts = mu_ref_pairs_for_cov_groups(&mu_ref_split);
     let MuRefPairs {
         eligible: mu_ref_pairs,
+        // SAEM-only (#2540): this M-step steps the packed θ, which is not an
+        // additive anchor's mu when the θ is log-packed.
+        additive: _,
         identity_packed_log,
         log_packed_logit,
         shared_theta,
@@ -2210,6 +2214,7 @@ fn run_mcem(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal,
@@ -3149,6 +3154,7 @@ fn run_mcem_mixture(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal,

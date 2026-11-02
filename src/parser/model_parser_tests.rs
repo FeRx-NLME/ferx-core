@@ -4258,7 +4258,7 @@ fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
 
 #[test]
 fn test_imp_method_and_imp_options_parse() {
-    // `methods = [focei, imp]` plus the `imp_*` keys must apply
+    // `method = [focei, imp]` plus the `imp_*` keys must apply
     // cleanly and produce no `unsupported_keys_warnings`.
     let opts = parse_fit_options(&[
         "method = [focei, imp]".to_string(),
@@ -4604,7 +4604,7 @@ fn test_unsupported_focei_key_under_saem_warns() {
 
 #[test]
 fn test_applicable_key_in_chain_no_warning() {
-    // methods = [saem, focei]: n_convergence applies to SAEM, optimizer
+    // method = [saem, focei]: n_convergence applies to SAEM, optimizer
     // applies to FOCEI, so neither should warn.
     let opts = parse_fit_options(&[
         "method = [saem, focei]".to_string(),
@@ -28794,6 +28794,7 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
         spec,
         index_covariate: None,
         profiled: false,
+        linked: false,
         profile_box: None,
     }]);
     let why = ode_level_block_read("H0 * KM[K + 1]")
@@ -29532,10 +29533,11 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
             "  CL = CL + CL * TVV",
             Custom,
         ),
+        // `CL = 2·TVCL + 2·RE`: the random effect enters twice (#1724).
         (
-            "reads itself twice, both +, unchanged",
+            "reads itself twice, both +, was Additive",
             "  CL = CL + CL",
-            Additive,
+            Custom,
         ),
         // Dies under: a consumed variable following its other readers once a
         // reassignment replaces it — `K10` is not the parameter either way.
@@ -29796,6 +29798,265 @@ fn a_self_reassignment_terminates() {
     assert_eq!(calls, 3, "one call per definition");
     let (_, kappa, _) = walk_counted("A = K\nA = A + 1\nA = A + 1\nCL = TVCL * exp(A)\n");
     assert_eq!(kappa, LogNormal);
+}
+
+// ── #1724: a random effect that enters its scale with a coefficient other than 1 ──
+
+/// Every row's ETA entries (each must carry `want`, and there must be some) and
+/// its kappa type, for the random effect `RE` in `indiv` — as in
+/// [`re_scale_twins`], which this checks every entry of.
+fn check_re_rows(rows: &[(&str, &str, crate::types::EtaParamType)]) {
+    let mut wrong = Vec::new();
+    for &(label, indiv, want) in rows {
+        let (eta, kappa) = re_scale_twins(indiv);
+        if eta.is_empty() || eta.iter().any(|(_, t)| *t != want) {
+            wrong.push(format!("ETA: {label}: {eta:?}, want {want:?}"));
+        }
+        if kappa != want {
+            wrong.push(format!("kappa: {label}: {kappa:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// #1724: every scale label assumes the random effect enters its scale with
+/// coefficient 1. However `2·η` is spelled, `log V = log TVV + 2η` has true
+/// CV `√(e^{4ω} − 1)` = 70.1% at ω = 0.1 against the printed `100·√ω` =
+/// 31.6%, so `withdraw_multiplied_scales` labels it `Custom` and no CV% or
+/// SD is printed. Every row was the label in its name before; each is
+/// asserted for an ETA and a kappa. Spelled every way the #2320 review loop
+/// found. The rows die together under the check deleted; the logit row also
+/// under the logit coefficient computed on another scale, and the
+/// reassignment row under a consumed parameter checked at its first value
+/// instead of its last.
+#[test]
+fn a_random_effect_entering_its_scale_twice_is_custom() {
+    use crate::types::EtaParamType::Custom;
+    let v = "  V = TVV * exp(ETA_V)\n";
+    let rows: Vec<(String, &str)> = [
+        (
+            "two exp factors, was LogNormal",
+            "  CL = TVCL * exp(RE) * exp(RE)",
+        ),
+        (
+            "two negated exp factors, was LogNormal",
+            "  CL = TVCL * -exp(RE) * -exp(RE)",
+        ),
+        (
+            "a negated product times an exp, was LogNormal",
+            "  CL = -(TVCL * exp(RE)) * exp(RE)",
+        ),
+        (
+            "one exp, read twice, was LogNormal",
+            "  CL = exp(RE + RE) * TVCL",
+        ),
+        ("one root, was Additive", "  CL = TVCL + RE + RE"),
+        (
+            "one inv_logit, was Logit",
+            "  CL = inv_logit(TVCL + RE + RE)",
+        ),
+        (
+            "an alias read twice, was LogNormal",
+            "  ECL = RE\n  CL = TVCL * exp(ECL) * exp(ECL)",
+        ),
+        (
+            "a diamond, was LogNormal",
+            "  A = RE\n  B = A + 1\n  C = A + 2\n  CL = TVCL * exp(B + C)",
+        ),
+        (
+            "two statements reach one exp, was LogNormal",
+            "  A = TVCL + RE\n  CL = exp(A + RE)",
+        ),
+        (
+            "a reassignment adds it again, was Additive",
+            "  CL = TVCL + RE\n  CL = CL + RE",
+        ),
+        (
+            "an exp intermediate multiplied in twice, was LogNormal",
+            "  EV = exp(RE)\n  CL = TVCL * EV * EV",
+        ),
+        (
+            "an exp intermediate beside its own exp, was LogNormal",
+            "  EV = exp(RE)\n  CL = TVCL * exp(RE) * EV",
+        ),
+        (
+            "an exp intermediate squared under abs, was LogNormal",
+            "  EV = exp(RE)\n  CL = TVCL * abs(EV * EV)",
+        ),
+        (
+            "an inline if of exps beside an exp, was LogNormal",
+            "  CL = TVCL * (if (WT > 70) exp(RE) else exp(RE)) * exp(RE)",
+        ),
+        (
+            "an exp intermediate that is an inline if, multiplied in twice, was LogNormal",
+            "  EV = if (WT > 70) exp(RE) else exp(RE)\n  CL = TVCL * EV * EV",
+        ),
+        (
+            "a transformed alias fed back into a parameter, was Additive",
+            "  CL = TVCL + RE\n  OLD = CL * 2\n  CL = OLD + RE",
+        ),
+        (
+            "a transformed alias that replaces a parameter, was Additive",
+            "  CL = TVCL + RE\n  OLD = CL * 2\n  CL = OLD",
+        ),
+        (
+            "an exp intermediate added to itself, then squared, was LogNormal",
+            "  EV = exp(RE)\n  A = EV + EV\n  CL = TVCL * A * A",
+        ),
+    ]
+    .into_iter()
+    .map(|(l, t)| (format!("{v}{t}"), l))
+    .collect();
+    let rows: Vec<_> = rows.iter().map(|(i, l)| (*l, i.as_str(), Custom)).collect();
+    check_re_rows(&rows);
+}
+
+/// #1724, the other side: the random effect enters each parameter with a
+/// coefficient of ±1 at every probe, or with one that varies (the label then
+/// describes another variable, or is not this check's question), so the label
+/// stands. Each is asserted for an ETA and a kappa.
+#[test]
+fn a_random_effect_entering_its_scale_once_keeps_its_label() {
+    use crate::types::EtaParamType::{self, *};
+    let v = "  V = TVV * exp(ETA_V)\n";
+    let rows: Vec<(String, &str, EtaParamType)> = [
+        // Dies under: the coefficient compared to 1 without `abs` — a sign
+        // never changes the CV (#1724 item 2) — and, for the two minus signs
+        // inside the product, `leaf_scales` folding unary minus as `+`/`-`.
+        ("a leading minus", "  CL = -TVCL * exp(RE)", LogNormal),
+        (
+            "a minus on the exp factor",
+            "  CL = TVCL * -exp(RE)",
+            LogNormal,
+        ),
+        (
+            "subtracted from zero",
+            "  CL = 0 - TVCL * exp(RE)",
+            LogNormal,
+        ),
+        (
+            "a negated exp argument",
+            "  CL = TVCL * exp(-RE)",
+            LogNormal,
+        ),
+        ("a subtracted root", "  CL = TVCL - RE", Additive),
+        // Dies under: the constant test dropped — `V`'s coefficient on the log
+        // scale is `CL / V`, which varies; `A` is an intermediate, so every
+        // parameter is checked.
+        (
+            "an intermediate in a parameter and a sum of parameters",
+            "  A = RE\n  CL = TVCL * exp(A)\n  V = TVV * exp(ETA_V) + CL",
+            LogNormal,
+        ),
+        // Dies under: the logit coefficient computed on another scale (the
+        // slope `P·(1 − P)` varies).
+        ("one inv_logit", "  CL = inv_logit(TVCL + RE)", Logit),
+        (
+            "max() reads it in a condition and one branch",
+            "  CL = TVCL * exp(max(RE, 0))",
+            LogNormal,
+        ),
+        (
+            "an inline if reads it in both branches",
+            "  CL = TVCL * exp(if (WT > 70) RE else RE + 1)",
+            LogNormal,
+        ),
+        (
+            "one alias into two parameters",
+            "  A = RE\n  CL = TVCL * exp(A)\n  V2 = TVV * exp(A)",
+            LogNormal,
+        ),
+        (
+            "an exp intermediate in two products",
+            "  EV = exp(RE)\n  CL = TVCL * EV\n  V2 = TVV * EV",
+            LogNormal,
+        ),
+        (
+            "an exp intermediate multiplied in once",
+            "  EV = exp(RE)\n  CL = TVCL / EV",
+            LogNormal,
+        ),
+        (
+            "an inline if of exps in a product",
+            "  CL = TVCL * (if (WT > 70) exp(RE) else exp(RE))",
+            LogNormal,
+        ),
+        (
+            "read twice, already custom",
+            "  CL = TVCL * RE * RE",
+            Custom,
+        ),
+        // A variable assigned inside an `if` statement has no partials, so
+        // nothing the check sees is right there; the label it was given stands.
+        // Dies under: a top-level row of a name an `if` reassigns kept as
+        // evaluable — the partials see `CL`'s doubled first line, though both
+        // branches replace it.
+        (
+            "a doubled line both branches of an if replace",
+            "  CL = TVCL * exp(RE + RE)\n  \
+             if (WT > 70) {\n    CL = TVCL * exp(RE)\n  } else {\n    CL = TVCL * exp(RE)\n  }",
+            LogNormal,
+        ),
+        // Dies under: a row reading a variable with no partials kept as
+        // evaluable — `A` reads as 0 with slope 0, so `CL` would read `2·RE`.
+        (
+            "an if-assigned intermediate that cancels one read",
+            "  if (WT > 70) {\n    A = -RE\n  } else {\n    A = -RE\n  }\n  \
+             CL = TVCL * exp(RE + RE + A)",
+            LogNormal,
+        ),
+        (
+            "two definitions in sibling branches",
+            "  if (WT > 70) {\n    A = RE\n  } else {\n    A = RE + 1\n  }\n  \
+             CL = TVCL * exp(A)",
+            LogNormal,
+        ),
+    ]
+    .into_iter()
+    .map(|(l, t, w)| (format!("{v}{t}"), l, w))
+    .collect();
+    let rows: Vec<_> = rows.iter().map(|(i, l, w)| (*l, i.as_str(), *w)).collect();
+    check_re_rows(&rows);
+}
+
+/// #1724: an ETA row on a parameter a consuming block reads is checked on that
+/// parameter alone. `V` reads `CL` twice, so `ETA_CL` enters `V` as `2·η`,
+/// but the row describes `CL`, where it enters once. (ETA only: a kappa has one
+/// label for every parameter, so its `V` coefficient counts.)
+/// Dies under: every ETA row checked against every parameter.
+#[test]
+fn an_eta_row_on_a_parameter_is_checked_on_that_parameter() {
+    use crate::types::EtaParamType::Additive;
+    let m = eta_scale_model("  CL = TVCL + ETA_CL\n  V = TVV * exp(ETA_V) + 2 * CL", "");
+    assert_eq!(eta_entries(&m, "ETA_CL"), vec![("CL".into(), Additive)]);
+}
+
+/// #1724: when the MU-reference pattern names a θ for an ETA that enters
+/// twice (`TVCL * exp(ETA) * exp(ETA)`), the withdrawn label takes the θ
+/// link with it. Dies under: `linked_theta` kept on a withdrawn label.
+#[test]
+fn a_withdrawn_label_drops_its_linked_theta() {
+    use crate::types::EtaParamType::*;
+    let cl = |indiv: &str| {
+        let m = eta_scale_model(&format!("{indiv}\n  V = TVV * exp(ETA_V)"), "");
+        let i = m
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .unwrap();
+        (i.param_type, i.linked_theta.clone())
+    };
+    let tvcl = || Some("TVCL".to_string());
+    assert_eq!(
+        cl("  CL = TVCL * exp(ETA_CL)"),
+        (LogNormal, tvcl()),
+        "read once"
+    );
+    assert_eq!(
+        cl("  CL = TVCL * exp(ETA_CL) * exp(ETA_CL)"),
+        (Custom, None),
+        "read twice"
+    );
 }
 
 // ── #1684 / #1676: diamonds of intermediates ────────────────────────────────
@@ -31398,19 +31659,24 @@ fn binary_model_key_and_link_word_are_not_reads_of_a_helper() {
 }
 
 /// `[markov_model]`: the state labels, in `states = [...]` and on a
-/// `transition` target, and the `type = ctmm` word.
+/// `transition` target, and the `type = ctmm` / `type = dtmm` words.
 #[cfg(feature = "markov")]
 #[test]
 fn markov_model_state_labels_are_not_reads_of_a_helper() {
-    let body = "[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
-                states = [awake=0, asleep=1]\n  transition awake  -> asleep = 0.5\n  \
-                transition asleep -> awake  = 0.3\n";
-    let cases: Vec<_> = ["AWAKE", "CTMM"]
+    let body = |ty: &str| {
+        format!(
+            "[markov_model]\n  type   = {ty}\n  cmt    = 5\n  \
+             states = [awake=0, asleep=1]\n  transition awake  -> asleep = 0.5\n  \
+             transition asleep -> awake  = 0.3\n"
+        )
+    };
+    let cases: Vec<_> = [("AWAKE", "ctmm"), ("CTMM", "ctmm"), ("DTMM", "dtmm")]
         .into_iter()
-        .map(|h| {
+        .map(|(h, ty)| {
+            let body = body(ty);
             (
                 h,
-                body.to_string(),
+                body.clone(),
                 body.replace("asleep = 0.5", &format!("asleep = 0.5 * {h}")),
                 "[markov_model]".to_string(),
             )
@@ -35367,6 +35633,148 @@ fn profile_refuses_a_route_through_the_states() {
     );
 }
 
+// ── #2111: a profiled block read through a logit link ────────────────────────
+
+/// The parsed `linked` flag of block `name` (#2111).
+fn linked_of(text: &str, name: &str) -> bool {
+    let parsed = parse_full_model(text).unwrap_or_else(|e| panic!("{e}"));
+    parsed
+        .model
+        .indiv_param_partials
+        .theta_blocks
+        .decls
+        .iter()
+        .find(|d| d.name == name)
+        .expect("the block")
+        .linked
+}
+
+const LINK_SENTENCE: &str = "A logit link is accepted only as the whole prediction";
+
+/// The two arms of an `if` on data, each a link around an affine read.
+const LINK_BRANCHES: &str = "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0\n  if (DOSE > 0) {\n    P = \
+                             inv_logit(LP)\n  } else {\n    P = inv_logit(LP - 0.1)\n  }";
+
+/// A logit link around the affine read, as the whole prediction, is accepted and marks
+/// the block `linked`: inline, as `expit`, through the parameter `y` reads, through a
+/// chain of them, and on every branch of an `if` on data, two-definition or inline, an arm
+/// that does not read the block included. The affine control parses unlinked, so the flag
+/// is the link's and not every profiled block's. Dies when the link is not peeled (each
+/// accepted row refused), when only a single definition is peeled (the branch rows), or
+/// when `linked` is set for every block (the control).
+#[test]
+fn profile_accepts_one_outermost_logit_link_and_marks_the_block_linked() {
+    let base = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let lp = "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let inline_if = format!("{lp}\n  P = if (DOSE > 0) inv_logit(LP) else inv_logit(LP - 0.1)");
+    let unread_arm = format!("{lp}\n  P = if (DOSE > 0) inv_logit(LP) else 0.5");
+    for (indiv, y) in [
+        (LINK_BRANCHES, "P"),
+        (inline_if.as_str(), "P"),
+        (unread_arm.as_str(), "P"),
+        (base, "inv_logit(BASE)"),
+        (
+            "  BASE = TVE0 + ETA_E0",
+            "expit(BASE + 2.0 * DOSE * PLACEBO[STUDY])",
+        ),
+        (
+            "  P = inv_logit(TVE0 + PLACEBO[STUDY] / WPSE + ETA_E0)",
+            "P",
+        ),
+        (
+            "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0\n  P = inv_logit(LP)\n  Q = P",
+            "Q",
+        ),
+    ] {
+        assert!(
+            linked_of(&route_model(indiv, y, ADD), "PLACEBO"),
+            "{indiv} / y = {y}"
+        );
+    }
+    assert!(!linked_of(&route_model(base, "BASE", ADD), "PLACEBO"));
+    assert!(!linked_of(&route_model(base, "BASE", ADD), "ARMFX"));
+}
+
+/// A link that is not the whole prediction is refused with the link's own sentence:
+/// scaled, added to, scaled through the parameter carrying it, nested inside another
+/// link (whose outer one is peeled and whose inner one is named), or on one branch of an
+/// `if` whose other branch reads the block without one. That last row is
+/// [`LINK_BRANCHES`] with one arm's link removed, so the pair straddles the every-branch
+/// rule. Dies when either sentence is deleted, or when the outermost-only gate is removed
+/// (the scaled rows would parse).
+#[test]
+fn profile_refuses_a_logit_link_that_is_not_the_whole_prediction() {
+    let base = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let one_arm = LINK_BRANCHES.replace("inv_logit(LP - 0.1)", "LP - 0.1");
+    assert_ne!(one_arm, LINK_BRANCHES, "the fixture moved");
+    for (indiv, y, at) in [
+        (one_arm.as_str(), "P", "in `P` in [individual_parameters]"),
+        (base, "100 * inv_logit(BASE)", "in the `y` readout"),
+        (base, "inv_logit(BASE) + 0.1", "in the `y` readout"),
+        (base, "inv_logit(inv_logit(BASE))", "in the `y` readout"),
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  P = inv_logit(BASE)",
+            "2 * P",
+            "in `P` in [individual_parameters]",
+        ),
+    ] {
+        let msg = route_err(indiv, y, ADD);
+        assert_route_frame(&msg);
+        let here = format!("Here `PLACEBO` reaches `y` through `inv_logit(...)` {at}.");
+        assert!(msg.contains(&here), "missing {here:?} in {msg}");
+        assert!(
+            msg.contains(
+                "A logit link is accepted only as the whole prediction, `y = inv_logit(c × \
+                 PLACEBO + …)`, on every branch of an `if` that chooses it, not scaled, added \
+                 to or inside another link."
+            ),
+            "{msg}"
+        );
+    }
+}
+
+/// Inside an accepted link the affine walk runs unchanged, so a function there is named,
+/// and the link is not: the culprit is `exp`, not `inv_logit`. A function that is not a
+/// logit link around the read (`logit`, `log`) keeps its own message, without the link
+/// sentence. Each refused row's twin with the function removed parses, so the pair
+/// straddles the walk inside the link.
+#[test]
+fn profile_names_a_function_inside_the_link_and_keeps_other_functions_refused() {
+    let msg = route_err(
+        "  BASE = TVE0 + ETA_E0",
+        "inv_logit(BASE + exp(PLACEBO[STUDY]))",
+        ADD,
+    );
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains("Here `PLACEBO` reaches `y` through `exp(...)` in the `y` readout."),
+        "{msg}"
+    );
+    assert!(!msg.contains("`inv_logit(...)`"), "{msg}");
+    assert!(!msg.contains(LINK_SENTENCE), "{msg}");
+    parse_full_model(&route_model(
+        "  BASE = TVE0 + ETA_E0",
+        "inv_logit(BASE + PLACEBO[STUDY])",
+        ADD,
+    ))
+    .unwrap_or_else(|e| panic!("{e}"));
+    for f in ["logit", "log"] {
+        let msg = route_err(
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+            &format!("{f}(BASE)"),
+            ADD,
+        );
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(&format!(
+                "Here `PLACEBO` reaches `y` through `{f}(...)` in the `y` readout."
+            )),
+            "{msg}"
+        );
+        assert!(!msg.contains(LINK_SENTENCE), "{f}: {msg}");
+    }
+}
+
 // ── #2103 review round 1 ────────────────────────────────────────────────────
 
 /// A one-compartment model whose prediction is scaled by `[scaling] <scaling>`;
@@ -36664,5 +37072,449 @@ fn the_product_walk_is_linear_on_a_diamond() {
         assert_eq!(count(10) - c0, 10 * per_level, "{re}: depth 10 is linear");
         assert_eq!(count(20) - c0, 20 * per_level, "{re}: depth 20 is linear");
         assert_eq!(count(30) - c0, 30 * per_level, "{re}: depth 30 is linear");
+    }
+}
+
+/// #2549: `leads_with_keyword_ci` gates the `[parameters]` regexes, so it must accept
+/// every line their `(?i)^\s*kw` prefix accepts — and, to be the same predicate rather
+/// than a looser one, reject every line it rejects. Checked against the prefix regex
+/// itself over the folding and whitespace edge cases: the Kelvin sign and long s (the
+/// only non-ASCII characters simple case folding maps onto ASCII letters), the dotted
+/// and dotless i (which it does not), and Unicode `White_Space` beyond ASCII.
+#[test]
+fn keyword_gate_is_the_case_insensitive_prefix_regex() {
+    let kws = [
+        "theta",
+        "omega",
+        "sigma",
+        "kappa",
+        "level",
+        "block_omega",
+        "block_sigma",
+        "block_kappa",
+    ];
+    let leads = [
+        "", " ", "\t", "\n ", "\u{a0}", "\u{2003}", "\u{85}", "\u{200b}", "x ",
+    ];
+    let mut checked = 0usize;
+    for kw in kws {
+        let re = regex::Regex::new(&format!(r"(?i)^\s*{kw}")).unwrap();
+        let mut spellings = vec![
+            kw.to_string(),
+            kw.to_ascii_uppercase(),
+            kw.replace('k', "\u{212A}"),
+            kw.replace('s', "\u{17F}"),
+            kw.replace('a', "\u{e1}"),
+            kw.replace('i', "\u{130}"),
+            kw.replace('l', "\u{131}"),
+            kw[..kw.len() - 1].to_string(),
+            kw.replace('_', "-"),
+        ];
+        // Mixed case, one letter at a time.
+        for i in 0..kw.len() {
+            let mut s: Vec<char> = kw.chars().collect();
+            s[i] = s[i].to_ascii_uppercase();
+            spellings.push(s.into_iter().collect());
+        }
+        for lead in leads {
+            for sp in &spellings {
+                for tail in ["", " x", "(1)", "_tail"] {
+                    let line = format!("{lead}{sp}{tail}");
+                    assert_eq!(
+                        super::leads_with_keyword_ci(&line, kw),
+                        re.is_match(&line),
+                        "gate and regex disagree on {line:?} for {kw}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    // The cases that make the gate non-trivial are in the corpus, on both sides.
+    assert!(super::leads_with_keyword_ci("\u{a0}\u{212A}APPA", "kappa"));
+    assert!(super::leads_with_keyword_ci("\u{17F}igma ~ 1", "sigma"));
+    assert!(!super::leads_with_keyword_ci("\u{200b}theta", "theta"));
+    assert!(checked > 1000);
+}
+
+/// #2549: the slot-resolved CTMM generator is bit-identical to the map-keyed walk it
+/// replaced (kept here as the reference): the same intensities over a covariate map
+/// overlaid with the ODE state, on a conditional `[individual_parameters]` value, a
+/// state that shadows a covariate of the same name, `MACHEPS` (read as ε even when
+/// assigned), a covariate missing from the map, and a state slice shorter than the
+/// state index (both read 0).
+#[cfg(feature = "markov")]
+#[test]
+fn slot_resolved_ctmm_generator_is_the_map_walk() {
+    let tn: Vec<String> = ["TH1", "TH2"].iter().map(|s| s.to_string()).collect();
+    let en: Vec<String> = ["ETA1"].iter().map(|s| s.to_string()).collect();
+    let ctx = ParseCtx::new(&tn, &en, &[]);
+    let src = "TV = TH1 * (WT / 70) ^ 0.75\n\
+               if (SEX == 1) {\n  K = TV * exp(ETA1)\n} else {\n  K = TV * 1.1 * exp(ETA1)\n}\n\
+               MACHEPS = 3\n\
+               M = MACHEPS * 1e10\n\
+               R1 = K * CONC / (CONC + TH2) + M\n\
+               R2 = exp(TH2) * (1 + EFF) + K / (1 + AUX)\n";
+    let mut stmts = parse_block_statements(src, ctx, StatementMode::Plain).expect("parses");
+    let rate = |s: Statement| match s {
+        Statement::Assign(_, e) => e,
+        other => panic!("not an assignment: {other:?}"),
+    };
+    let r2 = rate(stmts.pop().unwrap());
+    let r1 = rate(stmts.pop().unwrap());
+    let transitions = vec![(0, 1, r1), (1, 0, r2), (1, 2, Expression::Literal(0.25))];
+    // `EFF` is also a covariate column; the state overlay must win, as the insert did.
+    let states = vec![
+        ("CONC".to_string(), 0),
+        ("EFF".to_string(), 1),
+        ("AUX".to_string(), 7),
+    ];
+    let tree = CtmmGeneratorTree::new(&stmts, &transitions, &states, 3);
+    let by_map = |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, state: &[f64]| {
+        let mut c = cov.clone();
+        for (name, idx) in &states {
+            c.insert(name.clone(), state.get(*idx).copied().unwrap_or(0.0));
+        }
+        let vars = eval_indiv_param_vars(&stmts, theta, eta, &c);
+        let mut q = nalgebra::DMatrix::<f64>::zeros(3, 3);
+        for (j, k, expr) in &transitions {
+            let rate = eval_expression(expr, theta, eta, &c, &vars, &[]);
+            q[(*j, *k)] += rate;
+            q[(*j, *j)] -= rate;
+        }
+        q
+    };
+    let mut checked = 0;
+    for sex in [1.0, 2.0] {
+        for wt in [None, Some(53.5), Some(91.25)] {
+            let mut cov: HashMap<String, f64> = HashMap::new();
+            cov.insert("SEX".into(), sex);
+            cov.insert("EFF".into(), 123.0);
+            if let Some(w) = wt {
+                cov.insert("WT".into(), w);
+            }
+            for (theta, eta) in [
+                ([0.3, -1.2], [0.0]),
+                ([1.7, 0.4], [-0.35]),
+                ([0.05, 2.5], [1.1]),
+            ] {
+                for state in [vec![0.0, 0.0], vec![3.25, 0.125], vec![1e-9, 47.0]] {
+                    let got = tree.generator(&theta, &eta, &cov, &state);
+                    let want = by_map(&theta, &eta, &cov, &state);
+                    for (g, w) in got.iter().zip(want.iter()) {
+                        assert_eq!(g.to_bits(), w.to_bits(), "{got} vs {want}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 54);
+    // The fixture exercises the overlay: the state moves `Q`, and `EFF`'s column value
+    // (123) is shadowed by the state's.
+    let mut cov: HashMap<String, f64> = HashMap::new();
+    cov.insert("EFF".into(), 123.0);
+    let at = |state: &[f64]| tree.generator(&[0.3, -1.2], &[0.0], &cov, state);
+    assert_ne!(at(&[0.0, 0.0]), at(&[3.25, 0.125]));
+    assert_eq!(at(&[0.0, 0.0])[(1, 0)], (-1.2f64).exp());
+}
+
+// ── #2544: a one-line additive typical value is a mu-reference ───────────────
+
+/// An MBMA-shaped model (the shipped `mbma_placebo` with a covariate `FLARE`, a
+/// second BSV eta and a spare theta) with `indiv` as `[individual_parameters]`
+/// and `extra` appended to `[structural_model]`'s `y`. `indiv` must assign
+/// `BASE` and `ETAX_USE`.
+fn additive_mu_model(indiv: &str, extra: &str) -> CompiledModel {
+    let src = format!(
+        "[parameters]\n  theta TVE0(45.0, 0.0, 200.0)\n  theta B(1.0, -10.0, 10.0)\n  \
+         theta TH2(1.0, -10.0, 10.0)\n  \
+         theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)\n  \
+         omega ETA_E0 ~ 4.0\n  omega ETA_X ~ 1.0\n  kappa KAPPA ~ 4.0 (sd) weight = NARM\n  \
+         sigma ADD_ERR ~ 1.0 (variance) FIX\n\n\
+         [covariates]\n  STUDY categorical\n  NARM continuous\n  SE continuous\n  \
+         FLARE continuous\n\n\
+         [individual_parameters]\n{indiv}\n  KUSE = KAPPA\n\n\
+         [structural_model]\n  y = BASE + 0 * ETAX_USE + 0 * KUSE{extra}\n\n\
+         [error_model]\n  DV ~ additive(ADD_ERR) weight = SE\n\n\
+         [fit_options]\n  iov_column = OCC\n"
+    );
+    parse_model_string(&src).unwrap_or_else(|e| panic!("parse failed: {e}\n{src}"))
+}
+
+/// The anchor `mu_refs` records for `ETA_E0`, as `"THETA:Transform"`.
+fn e0_anchor(m: &CompiledModel) -> Option<String> {
+    m.mu_refs
+        .get("ETA_E0")
+        .map(|r| format!("{}:{:?}", r.theta_name, r.transform))
+}
+
+/// T1 (#2544): the one-line additive sum over its input space. Accepted rows
+/// give `ETA_E0 → TVE0` (`Identity`, Pattern 3's anchor); each rejected row
+/// asserts the eta is absent, and is the only row its condition rejects.
+/// Dies under, each condition of `additive_sum_anchor` dropped in turn: a second
+/// bare theta (row "two bare θ"), a second BSV eta ("second BSV η"), a BSV eta in
+/// a summand ("η in a summand"), the theta in a summand ("θ twice", "θ through a
+/// definition"), an unresolved local ("θ through an if-local", "η through a
+/// local"); and with every eta treated as BSV, the κ row.
+#[test]
+fn a_one_line_additive_sum_is_an_identity_mu_ref() {
+    let accepted = [
+        ("plain", "  BASE = TVE0 + PLACEBO + ETA_E0"),
+        ("eta first", "  BASE = ETA_E0 + TVE0 + PLACEBO"),
+        (
+            "κ summand (weighted kappa desugars to KAPPA/sqrt(NARM))",
+            "  BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA",
+        ),
+        ("θ·covariate summand", "  BASE = TVE0 + B * FLARE + ETA_E0"),
+        (
+            "θ through a definition in scope",
+            "  TV = TVE0\n  BASE = TV + PLACEBO + ETA_E0",
+        ),
+    ];
+    for (label, indiv) in accepted {
+        let m = additive_mu_model(&format!("{indiv}\n  ETAX_USE = ETA_X"), "");
+        assert_eq!(e0_anchor(&m).as_deref(), Some("TVE0:Identity"), "{label}");
+    }
+    let rejected = [
+        (
+            "second BSV η",
+            "  BASE = TVE0 + PLACEBO + ETA_E0 + ETA_X\n  ETAX_USE = 0",
+        ),
+        (
+            "η in a summand",
+            "  BASE = TVE0 + PLACEBO + 0.5 * ETA_X + ETA_E0\n  ETAX_USE = 0",
+        ),
+        (
+            "two bare θ",
+            "  BASE = TVE0 + TH2 + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
+            "θ twice",
+            "  BASE = TVE0 + 0 * TVE0 + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
+            "θ through a definition",
+            "  X = 2 * TVE0\n  BASE = TVE0 + X + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
+            "θ through an if-local",
+            "  if (FLARE > 1) {\n    X = 2 * TVE0\n  } else {\n    X = 0\n  }\n  \
+             BASE = TVE0 + X + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
+            "θ through an if-local in a condition",
+            "  if (FLARE > 1) {\n    X = TVE0\n  } else {\n    X = 0\n  }\n  \
+             BASE = TVE0 + (if (X > 40) 1 else 0) + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+        (
+            "η through a local",
+            "  X = 0.5 * ETA_X\n  BASE = TVE0 + PLACEBO + X + ETA_E0\n  ETAX_USE = 0",
+        ),
+        (
+            "non-bare θ",
+            "  BASE = 2 * TVE0 + PLACEBO + ETA_E0\n  ETAX_USE = ETA_X",
+        ),
+    ];
+    for (label, indiv) in rejected {
+        let m = additive_mu_model(indiv, "");
+        assert_eq!(e0_anchor(&m), None, "{label}");
+    }
+}
+
+/// T2 (#2544): the exclusivity gate, both sides in one test, on the one-line and
+/// the two-term spelling. TVE0 read (a) nowhere else, (d) only by a dead
+/// intermediate → kept; (b) in `[structural_model]`, (c) by an individual
+/// parameter the model reads, (e) the eta read by a second line → dropped.
+/// Dies under: the theta gate deleted ((b), (c)); the eta gate deleted ((e));
+/// the taint not stopped at the owner line, `owners = &[]` ((a), (d)).
+#[test]
+fn an_additive_mu_ref_needs_its_theta_and_eta_exclusive() {
+    for (label, base, reassigned) in [
+        (
+            "one-line",
+            "  BASE = TVE0 + PLACEBO + ETA_E0",
+            "  BASE = BASE + 0.5 * ETA_E0",
+        ),
+        (
+            "two-term",
+            "  E0 = TVE0 + ETA_E0\n  BASE = E0 + PLACEBO",
+            "  E0 = E0 + 0.5 * ETA_E0\n  BASE = E0 + PLACEBO",
+        ),
+    ] {
+        let case = |indiv_tail: &str, extra: &str| {
+            e0_anchor(&additive_mu_model(&format!("{base}\n{indiv_tail}"), extra))
+        };
+        let kept = Some("TVE0:Identity".to_string());
+        assert_eq!(case("  ETAX_USE = ETA_X", ""), kept, "{label} (a)");
+        assert_eq!(
+            case("  ETAX_USE = ETA_X", " + 0 * TVE0"),
+            None,
+            "{label} (b)"
+        );
+        assert_eq!(
+            case("  ETAX_USE = ETA_X + 0 * TVE0", ""),
+            None,
+            "{label} (c)"
+        );
+        assert_eq!(
+            case("  DEAD = 2 * TVE0\n  ETAX_USE = ETA_X", ""),
+            kept,
+            "{label} (d)"
+        );
+        assert_eq!(
+            case("  ETAX_USE = ETA_X + 0 * ETA_E0", ""),
+            None,
+            "{label} (e)"
+        );
+        // (f) a later assignment to the *owner's name* that reads the eta again: a second
+        // use like (e), so the gate compares statements, not names (#2553 review r1 §2).
+        assert_eq!(
+            case(&format!("{reassigned}\n  ETAX_USE = ETA_X"), ""),
+            None,
+            "{label} (f)"
+        );
+    }
+}
+
+/// T3 (#2544): `MixtureSpec::mu_refs` and `CompiledModel::mu_refs` agree on a
+/// later one-line additive line: `mu_refs` keeps it, so the class-aware entry
+/// on the same eta goes. Dies under: `detect_mixture_mu_refs` matching the later
+/// line with the raw `detect_pattern`, which misses the three-term sum.
+#[test]
+fn a_later_one_line_additive_mu_ref_clears_the_class_aware_entry() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = TVCL3 + 0.1 * WT + ETA_CL\n  V = TVV",
+    );
+    assert_eq!(
+        model
+            .mu_refs
+            .get("ETA_CL")
+            .map(|m| (m.theta_name.clone(), m.transform)),
+        Some(("TVCL3".to_string(), MuTransform::Identity))
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+
+    // The mixture scan builds its own inline scope and `outside_idents`, so each gets a
+    // row (#2553 review r1 §3). (i) The later line reads its θ through a local: only the
+    // scope's inlining sees it. Dies under: the mixture loop's `scope.record` deleted.
+    let via_local = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         TV = TVCL3\n  CL = TV + 0.1 * WT + ETA_CL\n  V = TVV",
+    );
+    assert_eq!(
+        via_local
+            .mu_refs
+            .get("ETA_CL")
+            .map(|m| m.theta_name.clone()),
+        Some("TVCL3".to_string()),
+        "via a local"
+    );
+    assert_eq!(class_anchors(&via_local, "ETA_CL"), None, "via a local");
+    // (ii) The later line's θ also reaches the model through `V`, which the structural
+    // model reads: `mu_refs` drops it, so the class-aware entry must stay. Dies under:
+    // the mixture scan's `outside_idents` emptied.
+    let shared = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = TVCL3 + 0.1 * WT + ETA_CL\n  V = TVV + 0 * TVCL3",
+    );
+    assert!(!shared.mu_refs.contains_key("ETA_CL"), "θ read elsewhere");
+    assert_eq!(
+        class_anchors(&shared, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string()]),
+        "θ read elsewhere"
+    );
+}
+
+/// T2 control (#2544): the exclusivity gate is for the BSV M-step and leaves
+/// kappa anchors alone. `KX = TVCL + K` keeps `K → TVCL` in `kappa_mu_refs` even
+/// though `CL` carries `TVCL` to the prediction, as it did before the gate.
+/// Dies under: the gate applied to kappas too (`eta_idx >= self.n_bsv` dropped
+/// from `MuRefScan::classify_assignment`'s early return).
+#[test]
+fn the_additive_exclusivity_gate_leaves_kappa_anchors_alone() {
+    let m = kappa_scale_model(
+        &["K"],
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KX = TVCL + K",
+    );
+    assert_eq!(
+        m.kappa_mu_refs
+            .get("K")
+            .map(|r| (r.theta_name.clone(), r.transform)),
+        Some(("TVCL".to_string(), MuTransform::Identity))
+    );
+}
+
+/// #2544: SAEM's "not mu-referenced" advice over the additive input space, one row
+/// per cell, each asserting the sentence that serves it (the `_shared` one-line row is
+/// `tests/saem_additive_mu_nonmem_anchor.rs`'s). Dies under, each sentence of the
+/// message deleted in turn: the names (every warned row), the log-form advice (every
+/// warned row), the rule (the second-eta and non-bare rows), the own-theta / own-eta
+/// clause (the non-bare and second-eta rows), the exclusivity sentence (the two-term
+/// row). The exclusive one-line row does not name BASE.
+#[test]
+fn the_not_mu_referenced_advice_over_the_additive_input_space() {
+    let warn = |indiv: &str, extra: &str| {
+        crate::api::saem_non_mu_referenced_individual_params_warning(
+            &additive_mu_model(indiv, extra),
+            &[],
+        )
+    };
+    let named = |w: &str, name: &str| {
+        let list = w
+            .split("not mu-referenced: ")
+            .nth(1)
+            .and_then(|r| r.split('.').next())
+            .unwrap_or("");
+        list.split(", ").any(|n| n == name)
+    };
+    // The fixture's `ETAX_USE = ETA_X` is never mu-referenced, so a warning exists;
+    // it must not name BASE.
+    let w = warn("  BASE = TVE0 + PLACEBO + ETA_E0\n  ETAX_USE = ETA_X", "").unwrap();
+    assert!(
+        named(&w, "ETAX_USE") && !named(&w, "BASE"),
+        "one-line, exclusive: {w}"
+    );
+    let rows = [
+        (
+            "second BSV eta",
+            "  BASE = TVE0 + PLACEBO + ETA_E0 + ETA_X\n  ETAX_USE = 0",
+            "",
+            "and its own ETA",
+        ),
+        (
+            "non-bare theta",
+            "  BASE = 2 * TVE0 + PLACEBO + ETA_E0\n  ETAX_USE = ETA_X",
+            "",
+            "a THETA of its own, not a multiple of one",
+        ),
+        (
+            "two-term, theta read elsewhere",
+            "  E0 = TVE0 + ETA_E0\n  BASE = E0 + PLACEBO\n  ETAX_USE = ETA_X",
+            " + 0 * TVE0",
+            "That THETA and that ETA must reach the model only through that line",
+        ),
+    ];
+    for (label, indiv, extra, says) in rows {
+        let w = warn(indiv, extra).unwrap_or_else(|| panic!("{label}: no warning"));
+        let owner = if label.starts_with("two-term") {
+            "E0"
+        } else {
+            "BASE"
+        };
+        assert!(named(&w, owner), "{label}: names {owner}: {w}");
+        assert!(
+            w.contains("prefer forms such as `CL = TVCL * exp(ETA_CL)`"),
+            "{label}: {w}"
+        );
+        assert!(
+            w.contains("An additive ETA is mu-referenced when its line adds one bare THETA"),
+            "{label}: {w}"
+        );
+        assert!(w.contains(says), "{label}: {w}");
     }
 }

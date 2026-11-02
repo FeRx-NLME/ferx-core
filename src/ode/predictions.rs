@@ -39,10 +39,13 @@ pub(crate) const INFUSION_EPS: f64 = 1e-12;
 /// then deduped at `1e-15`, so an event merged into a sub-`1e-15` neighbour is
 /// still applied at that representative break rather than dropped.
 ///
-/// **Invariant: `dedup (1e-15) ≤ EVENT_MATCH_TOL`, and a dose fires at the first
-/// break within `EVENT_MATCH_TOL` and at no other** — enforced by the
-/// `seed_applied` / `applied` masks the rescanning loops carry, not by the
-/// tolerance. #1186: a *derived* break (a route onset `dose.time + lag_cmt +
+/// **Invariant: `dedup (1e-15) ≤ EVENT_MATCH_TOL`, and a dose fires at one break
+/// within `EVENT_MATCH_TOL` and at no other** — enforced by the `seed_applied` /
+/// `applied` masks the rescanning loops carry, not by the tolerance. Which break:
+/// the last one at or before the event where a walk hands [`event_on_break`] the
+/// real next break (#2532); the first one in the band elsewhere.
+///
+/// #1186: a *derived* break (a route onset `dose.time + lag_cmt +
 /// lag_route`, an infusion end `dose.time + amt/rate`) is a multi-term float sum,
 /// so it routinely lands 1–2 ULP from another dose's own break — past the `1e-15`
 /// dedup and well inside this match. Every break in that gap used to re-apply the
@@ -158,6 +161,122 @@ pub(crate) fn reads_at_break(t: f64, t_break: f64) -> bool {
 #[inline]
 pub(crate) fn reads_in_segment(t: f64, t_start: f64, t_end: f64) -> bool {
     t - t_start >= EVENT_MATCH_TOL && t <= t_end
+}
+
+/// The state a record at `t` in a break's band reads: `pre`, the state the break's events
+/// found, when `t` is strictly earlier than `first_event`, the earliest record time among the
+/// events applied there; otherwise `post`, the state they left.
+///
+/// [`reads_at_break`] puts a record in the band of the break at or below it, and an event
+/// matches a break *symmetrically* within [`EVENT_MATCH_TOL`]. So when a record and an event
+/// are a few ULP apart, the record's break can be the earlier of the two times, and the event
+/// is applied there too. The reader produces exactly that pair whenever an observation is
+/// listed before a co-timed dose or EVID=2 row: it moves the observation one ULP below the
+/// tie (#614, #1810). The event-driven engine orders the two by exact time and reads the
+/// observation pre-dose, as NONMEM does. Read off `post`, it was the seed plus the dose (#2139
+/// on the dense walk; #2124 on the static walk's integration start and on every co-timed
+/// trough of the adaptive driver's time-varying path).
+///
+/// `pre` is `None` when the caller took no snapshot, which it may skip when the band is empty.
+#[inline]
+pub(crate) fn band_read_state<'a, T>(
+    t: f64,
+    first_event: f64,
+    pre: Option<&'a [T]>,
+    post: &'a [T],
+) -> &'a [T] {
+    match pre {
+        Some(pre) if t < first_event => pre,
+        _ => post,
+    }
+}
+
+/// Merge a sorted break list's sub-`1e-15` neighbours, except two bit-distinct **record**
+/// times (`records`, by bits), which both stay (#2123).
+///
+/// The adaptive time-varying driver and its frozen replay resolve an observation, an EVID=2
+/// row or a decision by its exact bits, so a record merged into a neighbour loses its
+/// per-event PK snapshot or its decision. The reader puts exactly such a pair on the
+/// timeline: an observation listed before a co-timed dose or EVID=2 row sits at
+/// `t.next_down()` (#614/#1810), one ULP before the row at `t`. Keeping both costs a
+/// sub-`1e-15` segment between them, which `integrate_segment` skips without stepping, so
+/// the state is the same and each record finds its own break. A derived break (an infusion
+/// end, a reset) still merges as before, and the exact-bit guard after the dedup still
+/// refuses a record merged into one. Both engines must call this with the same `records`,
+/// or their segmentations part and the verifier reports its own artifact.
+fn dedup_breaks_keeping_records(
+    break_times: &mut Vec<f64>,
+    records: &std::collections::HashSet<u64>,
+) {
+    break_times.dedup_by(|a, b| {
+        a.to_bits() == b.to_bits()
+            || ((*a - *b).abs() < 1e-15
+                && !(records.contains(&a.to_bits()) && records.contains(&b.to_bits())))
+    });
+}
+
+/// True when an event at `t_event` — a dose arrival, an SS record-time seed, an EVID=3/4
+/// reset — is applied at the break `t_break`, whose successor on the timeline is `t_next`
+/// (`f64::INFINITY` at the last break).
+///
+/// Within [`EVENT_MATCH_TOL`] of the break, **and** no later break at or before the event:
+/// an event that has a break of its own later in the band is applied there, not here. The
+/// band can hold two breaks when the reader moved a record one ULP below a co-timed event
+/// (#614, #1810) and that record is itself a break — every observation is on the
+/// time-varying / IOV adaptive walk (#2532). Matched by the band alone, the dose listed after
+/// a pre-dose observation fired at the observation's break, so the observation read the
+/// post-dose state, and so did a decision at the dose's own time (#933's trough).
+///
+/// The second condition never leaves an event unapplied: a later break at or before
+/// `t_event` is itself within the band, so the event fires there. The timeline's 1e-15 dedup
+/// keeps the earliest of a cluster, so some break always lies in `[t_event − 1e-15, t_event]`
+/// for an event whose own time was pushed. Combined with the apply-once masks, an event
+/// fires at the **last** break at or before it within the band.
+///
+/// **Where it is live.** Doses go through it with the real `t_next` only on the time-varying
+/// adaptive walk (`ode_predictions_adaptive_impl` when `tv`) and its frozen replay
+/// (`adaptive_frozen_replay_tv`), the one pair whose break list holds every observation. The
+/// static engine (`ode_predictions_with_extra_breaks_and_stats`) and the constant adaptive
+/// path pass `f64::INFINITY`, which is the band-only first-break rule, because the static
+/// engine's twins — the adjoint's `integrate_g`, `ode_predictions_with_states`,
+/// `apply_segment_boundary`'s dose loops, the EKF — all fire at the first break, and value and
+/// gradient must describe one function. A trough listed before a dose that a lag arrival or
+/// infusion end lands one ULP below still reads post-dose on those walks; that is #2534. Resets
+/// go through it with the real `t_next` in `apply_segment_boundary` (#2141).
+#[inline]
+pub(crate) fn event_on_break(t_event: f64, t_break: f64, t_next: f64) -> bool {
+    (t_event - t_break).abs() < EVENT_MATCH_TOL && t_event < t_next
+}
+
+/// The earliest EVID=3/4 reset time applied at the break `t_start` ([`event_on_break`] with
+/// successor `t_next`), or `+∞` when none is: a reset's share of [`band_read_state`]'s
+/// `first_event`, and the "does a reset fire here" test (`is_finite()`).
+///
+/// One spelling for every walk — the static walk, the adaptive driver, its time-varying
+/// frozen replay, `apply_segment_boundary` and the adjoint's `integrate_g` — because they are
+/// value, replay and dual twins of one predicate, and the verifier and the gradient parity
+/// only hold while they agree. The walks whose resets match by the band alone pass
+/// `f64::INFINITY`, which [`event_on_break`] reduces to `|rt − t_start| < EVENT_MATCH_TOL`.
+#[inline]
+pub(crate) fn earliest_reset_at_break(reset_times: &[f64], t_start: f64, t_next: f64) -> f64 {
+    reset_times
+        .iter()
+        .copied()
+        .filter(|&rt| event_on_break(rt, t_start, t_next))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The `t_next` the reactive driver hands [`event_on_break`] for a dose at break `k`: the real
+/// next break on the time-varying path, whose replay (`adaptive_frozen_replay_tv`) uses it
+/// too; `f64::INFINITY` on the constant path, whose replay is the static engine, which stays
+/// band-only (see [`event_on_break`]). Driver and replay must apply each dose at the same
+/// break, or the verifier refuses the run.
+fn doses_next_break(break_times: &[f64], k: usize, tv: bool) -> f64 {
+    if tv {
+        break_times.get(k + 1).copied().unwrap_or(f64::INFINITY)
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// The save points handed to `solve_ode` for the segment `(t_start, t_end]`: every time in
@@ -421,8 +540,12 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
 /// a terminal horizon (`max(0, …)`) into the timeline before sorting, so a timeline whose every
 /// sample precedes the first dose puts the first break *below* the start, and there the node is
 /// read at the `k = 0` boundary visit instead — the same seeded state by the other mechanism
-/// (#1218). Strict `<` (with the shared `1e-12`), so a time *on* the first break still reads at
-/// that boundary visit, post-dose.
+/// (#1218). Strict `t < first_break`, with no tolerance: a time *on* the first break still reads
+/// at that boundary visit, post-dose, and every time below it is filled. The boundary visit
+/// reads only `[first_break, first_break + EVENT_MATCH_TOL)` (see [`reads_at_break`]), so the
+/// fill must reach right up to the break. It used to stop at `first_break − 1e-12`, which left a
+/// node in `(first_break − 1e-12, first_break)` read by neither and `NaN` (#2510) — and one ULP
+/// below a first dose, where the reader puts a record listed before it, is exactly there.
 ///
 /// The scan is unconditional rather than a `take_while` over a sorted slice: `chz_times` is
 /// sorted-unique by the share's caller contract, but [`ode_dense_solve_states`] is `pub` and its
@@ -459,7 +582,7 @@ fn fill_prestart_states(
         return;
     };
     for (i, &t) in times.iter().enumerate() {
-        if t < first_break - 1e-12 {
+        if t < first_break {
             debug_assert_eq!(
                 u.len(),
                 states[i].len(),
@@ -3653,12 +3776,42 @@ pub(crate) fn seed_ext_params(
 /// maps to every index — recording only one would leave the others at their
 /// initial NaN.
 #[inline]
-fn build_obs_index_map(times: &[f64]) -> HashMap<u64, Vec<usize>> {
-    let mut map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in times.iter().enumerate() {
-        map.entry(t.to_bits()).or_default().push(i);
+fn build_obs_index_map(times: &[f64]) -> ObsIndex {
+    ObsIndex::new(times)
+}
+
+/// The indices of `times` at each exact time (by bits), ascending — what a
+/// `HashMap<u64, Vec<usize>>` keyed on `t.to_bits()` held, built per prediction call. Two
+/// vectors sorted by `(bits, index)` instead of a hashed map with a `Vec` per time: no SipHash
+/// and two allocations instead of one per distinct time (#1564).
+pub(crate) struct ObsIndex {
+    keys: Vec<u64>,
+    idx: Vec<usize>,
+}
+
+impl ObsIndex {
+    pub(crate) fn new(times: &[f64]) -> Self {
+        let mut pairs: Vec<(u64, usize)> = times
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.to_bits(), i))
+            .collect();
+        // Already in order for the usual non-decreasing times.
+        if !pairs.windows(2).all(|w| w[0] <= w[1]) {
+            pairs.sort_unstable();
+        }
+        ObsIndex {
+            keys: pairs.iter().map(|p| p.0).collect(),
+            idx: pairs.iter().map(|p| p.1).collect(),
+        }
     }
-    map
+
+    /// The indices at exactly `bits`, ascending; `None` when there are none.
+    pub(crate) fn get(&self, bits: &u64) -> Option<&[usize]> {
+        let lo = self.keys.partition_point(|k| k < bits);
+        let hi = lo + self.keys[lo..].partition_point(|k| k == bits);
+        (hi > lo).then(|| &self.idx[lo..hi])
+    }
 }
 
 /// ODE specification for a model
@@ -3935,7 +4088,7 @@ fn integrate_segment(
     pk_params_flat: &[f64],
     theta: &[f64],
     eta: &[f64],
-    obs_map: &HashMap<u64, Vec<usize>>,
+    obs_map: &ObsIndex,
     predictions: &mut [f64],
     stats: Option<&mut OdeSolverStats>,
     auto_state: &mut OdeAutoSwitchState,
@@ -4248,6 +4401,10 @@ fn collect_dose_break_times<'a>(
 /// last sub-step is the bolus jump in [`apply_prescheduled_boluses_at`], which is what
 /// sets it — that ordering is what lets the adaptive driver split the arrival around its
 /// decision hook (reseed → hook → boluses) and still mark the event exactly once.
+///
+/// Returns the earliest record time among the SS+lagtime seeds it applied, or `+∞` — its
+/// share of the `first_event` of [`band_read_state`]. The arrival is reported by
+/// [`apply_prescheduled_boluses_at`], which every caller runs at the same `t_start`.
 #[allow(clippy::too_many_arguments)] // two apply-once masks on top of the dose/PK context
 fn reseed_prescheduled_states_at(
     u: &mut [f64],
@@ -4256,12 +4413,16 @@ fn reseed_prescheduled_states_at(
     dose_lagtimes: &[f64],
     pk_params_flat: &[f64],
     t_start: f64,
+    // The next break on the timeline (`f64::INFINITY` at the last): an event with a break
+    // of its own later in the band is applied there, not here ([`event_on_break`]).
+    t_next: f64,
     reset_floor: f64,
     opts: &OdeSolverOptions,
     seed_applied: &mut [bool],
     applied: &[bool],
-) {
+) -> f64 {
     debug_assert!(seed_applied.len() >= doses.len() && applied.len() >= doses.len());
+    let mut first_event = f64::INFINITY;
     // SS + lagtime: at the dose record time (strictly before the lagged arrival) seed
     // the previous interval's steady-state tail so pre-lag observations don't read the
     // empty initial state. Phase II−lagtime is where the prior pulse has decayed to.
@@ -4270,8 +4431,9 @@ fn reseed_prescheduled_states_at(
         if seed_applied[i] {
             continue;
         }
-        if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < EVENT_MATCH_TOL {
+        if ss_seeded_at_record(dose, lag) && event_on_break(dose.time, t_start, t_next) {
             seed_applied[i] = true;
+            first_event = first_event.min(dose.time);
             let chz_before = chz_snapshot(ode, u);
             u.copy_from_slice(&ss_state_at_phase(
                 ode,
@@ -4294,7 +4456,7 @@ fn reseed_prescheduled_states_at(
         if applied[i] {
             continue;
         }
-        if (dose.time + dose_lagtimes[i] - t_start).abs() >= EVENT_MATCH_TOL {
+        if !event_on_break(dose.time + dose_lagtimes[i], t_start, t_next) {
             continue;
         }
         if !gate.live(doses, i) {
@@ -4304,6 +4466,8 @@ fn reseed_prescheduled_states_at(
         // only the pulse: re-equilibrating would replace the whole state with the
         // periodic trough and erase any dose that landed inside the pre-arrival window
         // (#1275). Only an unseeded (`lag = 0`) SS dose equilibrates at its arrival.
+        // Not counted into `first_event`: this arrival's bolus half marks it applied at the
+        // same `t_start` and reports it (both callers run it right after this pass).
         if ss_equilibrates_at_arrival(dose, dose_lagtimes[i]) {
             let chz_before = chz_snapshot(ode, u);
             u.copy_from_slice(&equilibrate_ss_state(
@@ -4315,6 +4479,7 @@ fn reseed_prescheduled_states_at(
             ));
         }
     }
+    first_event
 }
 
 /// Apply the bolus amount jump (`F·AMT`) of every pre-scheduled dose landing at `t_start`,
@@ -4325,6 +4490,8 @@ fn reseed_prescheduled_states_at(
 /// the reactive driver (#933) runs it AFTER the decision hook, over the full growing
 /// `shadow` dose list — base then controller-injected — so every bolus at `t_start` is
 /// applied in one dose-list-ordered pass, matching the frozen-replay verifier bit-for-bit.
+///
+/// Returns the earliest arrival time among the doses it marked applied, or `+∞`.
 fn apply_prescheduled_boluses_at(
     u: &mut [f64],
     ode: &OdeSpec,
@@ -4332,10 +4499,13 @@ fn apply_prescheduled_boluses_at(
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
     t_start: f64,
+    // See [`reseed_prescheduled_states_at`].
+    t_next: f64,
     reset_floor: f64,
     applied: &mut [bool],
-) {
+) -> f64 {
     debug_assert!(applied.len() >= doses.len());
+    let mut first_event = f64::INFINITY;
     // A bolus whose record precedes the `SS=1` record reached at this break, in (time, row
     // order), is wiped by that reset (#1588): a co-timed row *before* the `SS=1` row, and a
     // lagged dose still pending at it. So is one recorded before the EVID=3/4 reset in force
@@ -4346,13 +4516,14 @@ fn apply_prescheduled_boluses_at(
         if applied[i] {
             continue;
         }
-        if (dose.time + dose_lagtimes[i] - t_start).abs() >= EVENT_MATCH_TOL {
+        if !event_on_break(dose.time + dose_lagtimes[i], t_start, t_next) {
             continue;
         }
         // Set for EVERY dose matched at this break, whichever branch below fires
         // (bolus, input-rate-suppressed, or infusion) — this is the last sub-step of
         // the arrival event, so marking it here closes the whole arrival (#1186).
         applied[i] = true;
+        first_event = first_event.min(dose.time + dose_lagtimes[i]);
         if !is_real_infusion(dose)
             && !input_rate_consumes_cmt(ode, dose.cmt_raw())
             && gate.live(doses, i)
@@ -4369,6 +4540,7 @@ fn apply_prescheduled_boluses_at(
             }
         }
     }
+    first_event
 }
 
 /// Apply every pre-scheduled dose landing at `t_start` to the state `u`, in the order the
@@ -4392,34 +4564,38 @@ fn apply_prescheduled_doses_at(
     dose_f_bio: &[f64],
     pk_params_flat: &[f64],
     t_start: f64,
+    t_next: f64,
     reset_floor: f64,
     opts: &OdeSolverOptions,
     // Apply-once masks (#1186), owned by the walk and threaded through both halves.
     seed_applied: &mut [bool],
     applied: &mut [bool],
-) {
-    reseed_prescheduled_states_at(
+) -> f64 {
+    let reseeded = reseed_prescheduled_states_at(
         u,
         ode,
         doses,
         dose_lagtimes,
         pk_params_flat,
         t_start,
+        t_next,
         reset_floor,
         opts,
         seed_applied,
         applied,
     );
-    apply_prescheduled_boluses_at(
+    let arrived = apply_prescheduled_boluses_at(
         u,
         ode,
         doses,
         dose_lagtimes,
         dose_f_bio,
         t_start,
+        t_next,
         reset_floor,
         applied,
     );
+    reseeded.min(arrived)
 }
 
 fn ode_predictions_with_extra_breaks_and_stats(
@@ -4580,17 +4756,22 @@ fn ode_predictions_with_extra_breaks_and_stats(
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
+        // The records read at this break, collected *before* its events so that one
+        // strictly earlier than every event here reads the state they find (#2124, see
+        // [`band_read_state`]). `u_before` is cloned only when there is a record to read.
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        let reads_here =
+            !boundary_obs.is_empty() || chz_times.iter().any(|&t| reads_at_break(t, t_start));
+        let u_before = reads_here.then(|| u.clone());
+
         // System reset (EVID=3/4) at t_start: zero the compartments (or re-seed
         // `init(state)=expr`) and record the reset time so infusions / zero-order
         // windows opened earlier stop contributing. Applied BEFORE the dose passes
         // and the observation read below, so a reset sorts ahead of a dose or obs
         // at the same instant — the exact ordering `ode_predictions_event_driven`
         // uses (Reset < Dose < Obs). No-op when the subject carries no resets.
-        if subject
-            .reset_times
-            .iter()
-            .any(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL)
-        {
+        let mut first_event = earliest_reset_at_break(&subject.reset_times, t_start, f64::INFINITY);
+        if first_event.is_finite() {
             u = ode.initial_state(pk_params_flat);
             reset_floor = t_start;
         }
@@ -4601,7 +4782,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
         // static engine and the frozen-replay verifier apply base doses identically
         // (#798). Infusions add nothing here (injected as a derivative by
         // `active_infusions` below); a reset above already sorted ahead of this.
-        apply_prescheduled_doses_at(
+        first_event = first_event.min(apply_prescheduled_doses_at(
             &mut u,
             ode,
             &subject.doses,
@@ -4609,30 +4790,43 @@ fn ode_predictions_with_extra_breaks_and_stats(
             &dose_f_bio,
             pk_params_flat,
             t_start,
+            // Band-only (first break): the static engine's dual / state / EKF twins match
+            // that way, so moving it alone would split value from gradient. See
+            // [`event_on_break`] and #2534.
+            f64::INFINITY,
             reset_floor,
             &opts,
             &mut seed_applied,
             &mut applied,
-        );
+        ));
 
         // Record observations read *at* t_start (after the reset/dose passes above) —
         // its whole band `[t_start, t_start + EVENT_MATCH_TOL)`, not just the exact bits
         // (#1226). A lagged arrival is a multi-term float sum, so an observation whose
         // time is nominally the arrival routinely misses it by a few ULP; the old
         // exact-bit lookup handed those to the *preceding* segment, i.e. to the state
-        // before the dose was applied.
-        obs_index.records_at_break(t_start, &mut boundary_obs);
-        record_observations(
-            ode,
-            &boundary_obs,
-            &u,
-            pk_params_flat,
-            theta,
-            eta,
-            subject,
-            &mut predictions,
-            None,
-        );
+        // before the dose was applied. A record strictly earlier than the first event
+        // applied here reads `u_before` instead: the integration start at an observation
+        // the reader moved one ULP below a co-timed dose (#2124).
+        for &obs_idx in &boundary_obs {
+            let state = band_read_state(
+                subject.obs_times[obs_idx],
+                first_event,
+                u_before.as_deref(),
+                &u,
+            );
+            record_observations(
+                ode,
+                &[obs_idx],
+                state,
+                pk_params_flat,
+                theta,
+                eta,
+                subject,
+                &mut predictions,
+                None,
+            );
+        }
 
         // #570: a soft (CHZ) time coinciding with this segment's *left* boundary is
         // read here, as the post-dose / initial state `u` — the exact analogue of the
@@ -4655,10 +4849,12 @@ fn ode_predictions_with_extra_breaks_and_stats(
         // the #570 "shared solve ≡ dedicated path" invariant on the mirror geometry.
         // NONMEM applies a dose record strictly *later* than an observation record
         // second (`nonmem_anchor/lag_arrival_read_after_advan{1,13}`), so before the
-        // break is pre-event.
+        // break is pre-event. A soft time strictly earlier than the first event applied
+        // here reads `u_before`, as the observations above and the dedicated path do
+        // (#2139, #2124).
         for (gi, &t) in chz_times.iter().enumerate() {
             if reads_at_break(t, t_start) {
-                chz_states[gi] = u.clone();
+                chz_states[gi] = band_read_state(t, first_event, u_before.as_deref(), &u).to_vec();
             }
         }
 
@@ -4932,6 +5128,11 @@ pub(crate) struct AdaptiveRecordIndex {
     /// covariates — 2.5× in an injected dose's `F` (2.37× in IPRED@42 on the #1599 plan's
     /// fixture) — while every verifier shared this index and passed.
     obs: HashMap<u64, (usize, usize)>,
+    /// [`Self::times`] without the instants only an `ADDL`-implied dose occupies, and the
+    /// `(first, last)` base-regimen slot of the dose *records* at each instant: the search
+    /// space of [`Self::in_force`], for which an implied dose is not a record (#2528).
+    record_times: Vec<f64>,
+    dose_record: HashMap<u64, (usize, usize)>,
 }
 
 /// Record index `i` into a `(first, last)` slot: the first insert sets both ends, every
@@ -4954,21 +5155,30 @@ impl AdaptiveRecordIndex {
         for (r, &t) in subject.reset_times.iter().enumerate() {
             idx.reset.insert(t.to_bits(), r);
             idx.times.push(t);
+            idx.record_times.push(t);
         }
         for (k, d) in subject.doses.iter().take(n_base).enumerate() {
             push_first_last(&mut idx.dose, d.time, k);
             idx.times.push(d.time);
+            if d.implied.is_none() {
+                push_first_last(&mut idx.dose_record, d.time, k);
+                idx.record_times.push(d.time);
+            }
         }
         for (m, &t) in subject.pk_only_times.iter().enumerate() {
             push_first_last(&mut idx.pk_only, t, m);
             idx.times.push(t);
+            idx.record_times.push(t);
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {
             push_first_last(&mut idx.obs, t, j);
             idx.times.push(t);
+            idx.record_times.push(t);
         }
-        idx.times.sort_by(|a, b| a.total_cmp(b));
-        idx.times.dedup_by(|a, b| a.to_bits() == b.to_bits());
+        for times in [&mut idx.times, &mut idx.record_times] {
+            times.sort_by(|a, b| a.total_cmp(b));
+            times.dedup_by(|a, b| a.to_bits() == b.to_bits());
+        }
         idx
     }
 
@@ -4995,6 +5205,12 @@ impl AdaptiveRecordIndex {
     /// observation rows, each kind in file order, so the last one processed is what is in
     /// force after the instant: the last row of the last kind present, not its first (#1599).
     fn last_at(&self, t: f64) -> Option<AdaptiveRecord> {
+        self.last_at_among(t, &self.dose)
+    }
+
+    /// [`Self::last_at`] over the base-regimen slots `dose`: every base dose, or only the
+    /// dose records.
+    fn last_at_among(&self, t: f64, dose: &HashMap<u64, (usize, usize)>) -> Option<AdaptiveRecord> {
         let bits = t.to_bits();
         if let Some(&(_, j)) = self.obs.get(&bits) {
             return Some(AdaptiveRecord::Obs(j));
@@ -5002,7 +5218,7 @@ impl AdaptiveRecordIndex {
         if let Some(&(_, m)) = self.pk_only.get(&bits) {
             return Some(AdaptiveRecord::PkOnly(m));
         }
-        if let Some(&(_, k)) = self.dose.get(&bits) {
+        if let Some(&(_, k)) = dose.get(&bits) {
             return Some(AdaptiveRecord::Dose(k));
         }
         self.reset.get(&bits).copied().map(AdaptiveRecord::Reset)
@@ -5014,12 +5230,24 @@ impl AdaptiveRecordIndex {
     /// snapshot (never the first record *ahead*, which is the state seed's rule).
     ///
     /// This is the one resolution behind everything a decision reads: `ctx.covariates`,
-    /// the readout PK, and an injected dose's `F`; and the LOCF carry (`last_pk`) advances
-    /// through it too. Resets are records here (#1133): a decision after a reset reads the
-    /// reset row, as `$PK` ran on it.
+    /// the readout PK, and an injected dose's `F`. Resets are records here (#1133): a
+    /// decision after a reset reads the reset row, as `$PK` ran on it.
+    ///
+    /// **An `ADDL`-implied dose is not a record here** (#2528). NONMEM runs no `$PK` at
+    /// one, and since #1909 it carries its *governing* record's covariates — the first
+    /// record at or after it — so reading it here handed a decision between the dose and
+    /// that record a covariate recorded only later: CRCL 50 at t=15 from an observation at
+    /// t=18, an injected dose's `F` halved. It still terminates and governs a segment
+    /// ([`Self::at`]), and the disposition carry ([`Self::carried_pk_at`]) still steps
+    /// through it, as the static engines' trailing rule does: those describe the
+    /// integration, which runs under the governing record either way, not what a
+    /// controller can know.
     pub(crate) fn in_force(&self, t: f64) -> Option<AdaptiveRecord> {
-        let i = self.times.partition_point(|&r| r <= t + EVENT_MATCH_TOL);
-        i.checked_sub(1).and_then(|i| self.last_at(self.times[i]))
+        let i = self
+            .record_times
+            .partition_point(|&r| r <= t + EVENT_MATCH_TOL);
+        i.checked_sub(1)
+            .and_then(|i| self.last_at_among(self.record_times[i], &self.dose_record))
     }
 
     /// The PK the LOCF carry (`last_pk`) takes after the walk integrates into `t_end`: the
@@ -5027,7 +5255,14 @@ impl AdaptiveRecordIndex {
     /// is not a record and the carry stays put. Shared by the driver and its frozen replay,
     /// so the two cannot advance the carry differently.
     fn carried_pk_at(&self, t_end: f64, event_pk: &crate::pk::EventPkParams) -> Option<PkParams> {
-        self.last_at(t_end).map(|rec| rec.pk(event_pk))
+        self.carried_record_at(t_end).map(|rec| rec.pk(event_pk))
+    }
+
+    /// The record whose snapshot the LOCF carry takes after the walk integrates into
+    /// `t_end` — the one lookup behind [`Self::carried_pk_at`] and the driver's carried
+    /// covariate row (#943 review r1 #1), so the two cannot advance on different records.
+    fn carried_record_at(&self, t_end: f64) -> Option<AdaptiveRecord> {
+        self.last_at(t_end)
     }
 
     /// Time of the record that GOVERNS the segment ending at `t_end` (#1073): `t_end`
@@ -5066,6 +5301,34 @@ impl AdaptiveRecordIndex {
     }
 }
 
+/// The record that governs the segment ending at `t_end` (#1073): the first record at
+/// [`AdaptiveRecordIndex::governing`]'s time, or `None` past the final record. The one
+/// lookup behind [`governing_segment_pk_at`], [`governing_segment_occ_at`] and
+/// [`governing_segment_cov_at`], so a segment's PK, κ and covariate row come from the same
+/// record.
+fn governing_record_at(t_end: f64, records: &AdaptiveRecordIndex) -> Option<AdaptiveRecord> {
+    records.governing(t_end).and_then(|t| records.at(t))
+}
+
+/// Covariate twin of [`governing_segment_pk_at`] (#943): the row of the record whose
+/// snapshot the segment ending at `t_end` integrates under, so a readout that names a
+/// covariate directly (an `observe` expression, a Form C `y =`) reads the row its PK was
+/// built from. Past the final record, `last_cov` — the row the driver carries in step with
+/// `last_pk` (#943 review r1 #1). Not the row in force there: that skips an `ADDL`-implied
+/// dose (#2528), which the PK carry steps through, so a train running past the last data
+/// record would pair the implied dose's PK with an earlier record's row.
+fn governing_segment_cov_at<'a>(
+    t_end: f64,
+    records: &AdaptiveRecordIndex,
+    subject: &'a Subject,
+    last_cov: &'a HashMap<String, f64>,
+) -> &'a HashMap<String, f64> {
+    match governing_record_at(t_end, records) {
+        Some(rec) => rec.cov(subject),
+        None => last_cov,
+    }
+}
+
 /// PK governing the segment ENDING at `t_end` on the per-event adaptive walk (#1073).
 ///
 /// **An EVID=3/4 reset is a record here** (#1148), and so governs the segment that ends at
@@ -5099,7 +5362,7 @@ fn governing_segment_pk_at(
     event_pk: &crate::pk::EventPkParams,
     last_pk: PkParams,
 ) -> PkParams {
-    match records.governing(t_end).and_then(|t| records.at(t)) {
+    match governing_record_at(t_end, records) {
         Some(rec) => rec.pk(event_pk),
         // Past the final record. (`governing` only ever returns a time drawn from the record
         // grid, so `at` cannot miss.)
@@ -5119,16 +5382,20 @@ struct AdaptiveRecordOcc {
 
 impl AdaptiveRecordOcc {
     /// Every record's occasion from the decision schedule — exactly as the
-    /// occasion-aware `event_pk` was built in `run_adaptive_population`.
+    /// occasion-aware `event_pk` was built in `run_adaptive_population`, an `ADDL`-implied
+    /// dose taking its governing record's (`Subject::dose_occasion_time`, #2371).
+    ///
+    /// The dose arm feeds the η threaded into a segment an implied dose ends. An `[odes]`
+    /// RHS may not name a κ, so that η reaches the solution only through `seg_pk`, built
+    /// under the same occasion — but the window AUC (#943) also hands it to the monitor's
+    /// `[scaling]` divisor, where a κ-dependent scale observes it
+    /// (`auc_target_reads_an_implied_doses_occasion_under_iov`).
     fn new(subject: &Subject, n_base: usize, decision_times: &[f64]) -> Self {
         let occ = |t: f64| crate::pk::occasion_of(decision_times, t);
         AdaptiveRecordOcc {
             reset: subject.reset_times.iter().map(|&t| occ(t)).collect(),
-            dose: subject
-                .doses
-                .iter()
-                .take(n_base)
-                .map(|d| occ(d.time))
+            dose: (0..n_base.min(subject.doses.len()))
+                .map(|k| occ(subject.dose_occasion_time(k)))
                 .collect(),
             pk_only: subject.pk_only_times.iter().map(|&t| occ(t)).collect(),
             obs: subject.obs_times.iter().map(|&t| occ(t)).collect(),
@@ -5154,7 +5421,7 @@ fn governing_segment_occ_at(
     occ: &AdaptiveRecordOcc,
     last_occ: Option<usize>,
 ) -> Option<usize> {
-    match records.governing(t_end).and_then(|t| records.at(t)) {
+    match governing_record_at(t_end, records) {
         Some(rec) => occ.of(rec),
         None => last_occ,
     }
@@ -5256,12 +5523,13 @@ fn eta_for<'a>(eta_occ: Option<&'a [Vec<f64>]>, eta: &'a [f64], occ: Option<usiz
 ///   are integrated and augmented by the controller's decisions. Base doses occupy the
 ///   leading `0..n_base` slots of the growing `shadow` dose list, are seeded through the
 ///   same static-engine break/apply helpers, and appear in the controller's
-///   `ctx.history`. Supported on constant-covariate models, and (since #930) on
-///   time-varying-covariate models for plain bolus / infusion base doses — each base
-///   dose's F is resolved from its own covariate snapshot (`event_pk.dose[k]`). Still a
-///   typed error: a base regimen combined with IOV (#931) or system resets (#932), and —
-///   under a time-varying covariate — an SS / lagged / input-rate / modeled-rate base
-///   dose (a #930 follow-up). A dose-free base subject is the special case `n_base == 0`
+///   `ctx.history`. Supported on constant-covariate models, and (since #930 / #931) on
+///   time-varying-covariate and IOV models for plain bolus / infusion base doses — each
+///   base dose's F is resolved from its own snapshot (`event_pk.dose[k]`). A base regimen
+///   also composes with system resets, on the constant-covariate path since #932 and under a
+///   time-varying covariate or IOV since its follow-up. Still a typed error, under a
+///   time-varying covariate or IOV: an SS / lagged / input-rate / modeled-rate base dose (a
+///   #930 / #931 follow-up). A dose-free base subject is the special case `n_base == 0`
 ///   and is byte-identical to before.
 /// - **No lagged or input-rate (absorption) dosing.** Controller dosing into a
 ///   compartment with a dose lag time, or one fed by a built-in input-rate
@@ -5338,6 +5606,8 @@ pub(crate) fn ode_predictions_adaptive(
         &mut decide,
         max_decisions,
         assay,
+        None,
+        None,
     )
 }
 
@@ -5383,6 +5653,14 @@ pub(crate) fn ode_predictions_adaptive_impl(
     controller: &mut dyn FnMut(&ControllerCtx) -> ControllerDecision,
     max_decisions: usize,
     assay: Option<&AssayNoise>,
+    // `Some` ⇒ also integrate the first monitor's signal over each realized
+    // inter-decision window ([`AdaptiveWindowAucs`], #943) and write one AUC per window
+    // here, in observation units. `None` ⇒ no AUC; the walk is unchanged either way.
+    window_aucs: Option<&mut Vec<f64>>,
+    // The dosing interval in force at the first decision (#945). `None` ⇒ every grid point
+    // is due until the controller issues a [`DoseAction::SetInterval`] — the pre-#945
+    // behaviour, byte-identical while no `SetInterval` is issued.
+    start_interval: Option<f64>,
 ) -> Result<AdaptiveRun, AdaptiveDriverError> {
     let n = ode.n_states;
     let tv = event_pk.is_some();
@@ -5401,8 +5679,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // capture its per-dose lagtime / bioavailability, exactly as the static engine does.
     // On the (common) dose-free path `resolve_subject_doses` borrows `subject` unchanged,
     // `n_base == 0`, and both vectors are empty — so every base-regimen branch below is a
-    // no-op and the reactive path stays byte-identical. When base doses ARE present, only a
-    // base × reset subject UNDER a time-varying covariate / IOV is rejected upstream; the
+    // no-op and the reactive path stays byte-identical. When base doses ARE present, the
     // constant-covariate path governs both the base and controller doses with this single
     // frozen `pk_params_flat`, while the
     // per-event-PK path (a time-varying covariate #930 and/or IOV #931) overwrites each base
@@ -5418,8 +5695,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // administration time) instead of the t=0 `pk_params_flat` the constant path uses. This is
     // symmetric with a controller-injected dose, whose F is fixed from the driver's per-decision
     // LOCF snapshot at injection. `compute_event_pk_params_{into,iov}` populates `event_pk.dose`
-    // parallel to the base doses; base × reset is the only base combo rejected at entry
-    // (#1983), and it never reaches here.
+    // parallel to the base doses.
     //
     // Scope: only a plain FIXED bolus / real-infusion base dose into a PLAIN compartment is
     // supported here. A base dose that is steady-state, lagged, fed by a built-in input-rate
@@ -5479,6 +5755,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // baseline window (`None`, κ = 0) and advances as the loop crosses decisions and
     // records. Unused (`!iov`).
     let mut last_occ: Option<usize> = None;
+    // Covariate twin of `last_pk` (#943 review r1 #1): the row of the record whose PK the
+    // carry holds, advanced at exactly the points `last_pk` is, so the window AUC's readout
+    // past the final record reads the row its PK came from. Read only there, and only when
+    // `tv` with an `auc_target`; before any record it is the baseline, as `init_pk` is.
+    let mut last_cov: &HashMap<String, f64> = &subject.covariates;
 
     let mut u = if tv {
         ode.initial_state(&init_pk.values)
@@ -5522,10 +5803,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
         f64::NAN
     };
 
-    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in shadow.obs_times.iter().enumerate() {
-        obs_map.entry(t.to_bits()).or_default().push(i);
-    }
+    let obs_map = build_obs_index_map(&shadow.obs_times);
 
     // #1073 / #1148: the data records on this walk — base dose rows, EVID=2 pk-only rows,
     // observations and EVID=3/4 resets. `records.at` governs segments; `records.in_force`
@@ -5613,11 +5891,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
         break_times.extend(shadow.pk_only_times.iter().cloned());
     }
     // System-reset times (EVID=3/4, #716): each is a segment boundary where the state
-    // zeros. Since #932 a base regimen reaches here alongside its resets on the constant-
-    // covariate path — including an EVID=4 (reset+dose) row, whose dose is a base dose
-    // landing at the reset instant (Reset < Dose). Only base × reset UNDER a time-varying
-    // covariate / IOV is rejected by the guard above. Empty for a reset-free subject, so
-    // the bolus-only path stays byte-identical.
+    // zeros. A base regimen reaches here alongside its resets (#932, and its time-varying /
+    // IOV follow-up) — including an EVID=4 (reset+dose) row, whose dose is a base dose
+    // landing at the reset instant (Reset < Dose). Empty for a reset-free subject, so the
+    // bolus-only path stays byte-identical.
     break_times.extend(subject.reset_times.iter().copied());
     // #702/#930: fold in the pre-scheduled base regimen's breaks via the shared builder so the
     // reactive segmentation matches the static engine's exactly (the frozen-replay oracle).
@@ -5651,7 +5928,21 @@ pub(crate) fn ode_predictions_adaptive_impl(
         }
     }
     break_times.sort_by(|a, b| a.total_cmp(b));
-    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    if tv {
+        // #2123: every record time keeps its own break; `adaptive_frozen_replay_tv` builds
+        // the same set (its ledger doses sit at decision times).
+        let record_bits: std::collections::HashSet<u64> = decision_times
+            .iter()
+            .chain(shadow.obs_times.iter())
+            .chain(shadow.pk_only_times.iter())
+            .copied()
+            .chain(shadow.doses.iter().take(n_base).map(|d| d.time))
+            .map(f64::to_bits)
+            .collect();
+        dedup_breaks_keeping_records(&mut break_times, &record_bits);
+    } else {
+        break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    }
 
     // A non-finite break time makes the subject unsolvable (#1189) — see
     // [`timeline_has_non_finite`]. This driver already has a typed error channel, so
@@ -5666,13 +5957,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
         ));
     }
 
-    // #700 review guard: the tolerance dedup above can merge two break times within
-    // 1e-15 that are not bit-identical, but `AdaptiveRecordIndex` / `decision_index_of` /
-    // `obs_map` resolve records by *exact* bits. If a decision, observation, or
-    // pk-only time were merged into a different representative, its exact-bit lookup
-    // would silently miss — dropping a per-event PK snapshot or a dose decision, and
-    // the frozen-replay verifier (which shares this dedup) could not catch it. Fail
-    // loudly instead, honoring this module's "never a silent wrong answer" contract.
+    // #700 review guard: `AdaptiveRecordIndex` / `decision_index_of` / `obs_map` resolve
+    // records by *exact* bits. Since #2123 the dedup above keeps two bit-distinct record
+    // times apart, but it still merges a record into an earlier derived break within
+    // 1e-15 (an infusion end or a system reset — a lagged, SS or input-rate base dose is
+    // refused upstream on this path, so every other dose arrival is its own record time),
+    // and the record's exact-bit lookup would then silently miss — dropping a per-event PK
+    // snapshot or a dose decision, and the frozen-replay verifier (which shares this
+    // dedup) could not catch it. Fail loudly instead, honoring this module's "never a
+    // silent wrong answer" contract.
     // Integer-hour grids (every test / example) are bit-exact and never trip this.
     if tv {
         let surviving: std::collections::HashSet<u64> =
@@ -5685,10 +5978,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
             .find(|t| !surviving.contains(&t.to_bits()))
         {
             return Err(AdaptiveDriverError::options(format!(
-                "adaptive-dosing (time-varying) event time {t} lies within 1e-15 of another \
-                 break time but is not bit-identical, so its per-event PK / decision lookup \
-                 would be silently dropped. Align decision, observation, and EVID=2 times to \
-                 identical values (integer-valued time grids are unaffected)."
+                "adaptive-dosing (time-varying) event time {t} lies within 1e-15 after an \
+                 infusion-end or system-reset (EVID=3/4) break time but is not bit-identical, \
+                 so its per-event PK / decision lookup would be silently dropped. Align the \
+                 decision, observation or EVID=2 time with that break (integer-valued time \
+                 grids are unaffected)."
             )));
         }
     }
@@ -5739,6 +6033,14 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let mut applied = vec![false; shadow.doses.len()];
 
     let mut stopped = false;
+    // #945: the dosing interval in force, and the time from which the next grid point is
+    // due (`None` ⇒ due now). Only a consulted decision moves `next_due`; a data record
+    // (a base dose, an EVID=3/4 reset) never does.
+    let mut interval = start_interval;
+    let mut next_due: Option<f64> = None;
+    // The interval whose due times have been walked against the grid (`adaptive_walk_due_
+    // times`): each interval is checked once, at the decision that puts it in force.
+    let mut walked: Option<f64> = None;
 
     // Records read *at* the current break (#1226) — sorted once, hoisted so the walk
     // allocates once.
@@ -5755,11 +6057,26 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // first realized dose to judge them at (phase B). Empty for every model that reads no
     // dose clock, and dropped unjudged by a run that never doses.
     let mut pending_clock_windows: Vec<PendingClockWindow> = Vec::new();
+    // #943: the window AUC, integrated over the first monitor's signal. Only requested
+    // with a monitor to read (`auc_target` declares one).
+    let mut auc = window_aucs
+        .is_some()
+        .then(|| monitors.first())
+        .flatten()
+        .map(|mon| AdaptiveWindowAucs::new(decision_times, mon));
     while k < break_times.len() {
         let t_start = break_times[k];
         if t_start >= t_base0 - EVENT_MATCH_TOL {
             started = true;
         }
+
+        // The observations read at this break, collected before any of its events (reset,
+        // reseed, bolus) so that one strictly earlier than the first of them reads the state
+        // they find (#2124, [`band_read_state`]) — a trough the reader moved one ULP below a
+        // co-timed dose. `first_event` gathers the events' record times as they apply.
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        let u_before = (!boundary_obs.is_empty()).then(|| u.clone());
+        let mut first_event = f64::INFINITY;
 
         // #701 (IOV): a decision break opens its occasion window `g`. Set the LOCF PK
         // + occasion to occasion g's snapshot so the pre-dose readout, the injected
@@ -5770,6 +6087,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
         if let (Some(dp), Some(&g)) = (decision_pk, decision_index_of.get(&t_start.to_bits())) {
             last_pk = dp[g];
             last_occ = Some(g);
+            // `decision_pk[g]` is built from this row (`run_adaptive_population`).
+            last_cov = locf_decision_cov(&records, t_start, subject, &subject.covariates);
         }
 
         // What a decision at `t_start` reads (#1148): ONE record — the one in force there
@@ -5840,6 +6159,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
             };
             u = ode.initial_state(seed_pk);
             reset_floor = t_start;
+            first_event = first_event.min(earliest_reset_at_break(
+                &subject.reset_times,
+                t_start,
+                f64::INFINITY,
+            ));
         }
 
         // #702/#933: re-seed any pre-scheduled base *steady-state* state landing at
@@ -5861,18 +6185,19 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // prefix, so a slice of the same length keeps the indices aligned (#1186).
             seed_applied.resize(shadow.doses.len(), false);
             applied.resize(shadow.doses.len(), false);
-            reseed_prescheduled_states_at(
+            first_event = first_event.min(reseed_prescheduled_states_at(
                 &mut u,
                 ode,
                 &shadow.doses[..n_base],
                 &base_lagtimes,
                 pk_params_flat,
                 t_start,
+                doses_next_break(&break_times, k, tv),
                 reset_floor,
                 &ode.effective_solver_opts(),
                 &mut seed_applied[..n_base],
                 &applied[..n_base],
-            );
+            ));
         }
 
         // --- Decision hook: observe (pre-dose trough) -> decide -> dose. ---
@@ -5927,37 +6252,22 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 let mut observed: Vec<ObservedSignal> = Vec::with_capacity(monitors.len());
                 for am in monitors.iter() {
                     let m = am.spec;
-                    // A declarative `[adaptive_dosing]` block (S2) supplies a
-                    // compiled `observe` expression for the latent value; absent
-                    // one (the programmatic path), read the model's cmt readout.
-                    let latent = match am.observe {
-                        // `[adaptive_dosing] observe` compiles through the same
-                        // `build_y_output_fn` as a `[scaling]` Form C readout, so it can
-                        // reference the `TIME` / `T` built-in — enter this decision's time
-                        // so it resolves there rather than to the thread-local default
-                        // (#1028). The `None` arm's `read_observable` guards itself.
-                        Some(f) => {
-                            let _time_guard =
-                                crate::parser::model_parser::ModelTimeGuard::enter(t_start);
-                            f(&u, pk_readout, theta, readout_eta, decision_cov)
-                        }
-                        None => read_observable(
-                            ode,
-                            &u,
-                            pk_readout,
-                            theta,
-                            readout_eta,
-                            decision_cov,
-                            m.cmt,
-                            t_start,
-                        ),
-                    };
-                    // The model's readout includes its `[scaling]` Form A/B divisor, so the
-                    // controller reads what an observation on `m.cmt` would (#2129) — and,
-                    // under `Dv`, so does the σ drawn from it below. The caller sets
-                    // `obs_scale` only on a monitor with no `observe` expression, so this is
-                    // the identity on the `Some(f)` arm.
-                    let latent = am.scale_readout(latent, readout_eta);
+                    // A declarative `[adaptive_dosing]` block (S2) supplies a compiled
+                    // `observe` expression for the latent value; absent one (the
+                    // programmatic path), the model's cmt readout, divided by its
+                    // `[scaling]` Form A/B divisor so the controller reads what an
+                    // observation on `m.cmt` would (#2129) — and, under `Dv`, so does the
+                    // σ drawn from it below.
+                    let latent = adaptive_monitor_signal(
+                        ode,
+                        am,
+                        &u,
+                        pk_readout,
+                        theta,
+                        readout_eta,
+                        decision_cov,
+                        t_start,
+                    );
                     // A finite state (guarded above) that reads out non-finite is a readout
                     // defect, not a divergence (#1578): a `[scaling]` readout or an `observe`
                     // expression that divides by zero, say. The `Dv` clamp below cannot
@@ -6043,7 +6353,16 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     });
                 }
 
-                let decision = {
+                // #945: at a grid point that is not yet due under the dosing interval the
+                // controller is not consulted: the point doses nothing and is logged as
+                // `NotDue`, with what the monitors read.
+                let due = adaptive_point_is_due(next_due, t_start);
+                let decision = if !due {
+                    ControllerDecision {
+                        actions: Vec::new(),
+                        rule: None,
+                    }
+                } else {
                     let ctx = ControllerCtx {
                         t: t_start,
                         state: &u,
@@ -6051,6 +6370,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         history: &shadow.doses,
                         decision_index,
                         signals: &signals,
+                        interval,
                     };
                     controller(&ctx)
                 };
@@ -6079,6 +6399,31 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             actions.len() - j - 1
                         )));
                     }
+                }
+                // #945: at most one interval change per decision, and none on a decision
+                // that discontinues (there is no next dose for it to schedule).
+                let set_intervals: Vec<f64> = actions
+                    .iter()
+                    .filter_map(|a| match *a {
+                        DoseAction::SetInterval { interval } => Some(interval),
+                        _ => None,
+                    })
+                    .collect();
+                if set_intervals.len() > 1 {
+                    return Err(AdaptiveDriverError::controller_action(format!(
+                        "decision {decision_index} at t={t_start}: at most one SetInterval per \
+                         decision, got {}",
+                        set_intervals.len()
+                    )));
+                }
+                if !set_intervals.is_empty() && actions.iter().any(DoseAction::is_stop) {
+                    return Err(AdaptiveDriverError::controller_action(format!(
+                        "decision {decision_index} at t={t_start}: SetInterval cannot be combined \
+                         with Stop; a discontinued subject has no next dose to schedule"
+                    )));
+                }
+                if let Some(&new_interval) = set_intervals.first() {
+                    interval = Some(new_interval);
                 }
 
                 // Count realized doses this decision so the log can categorize the
@@ -6184,7 +6529,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             });
                             n_dosed += 1;
                         }
-                        DoseAction::Hold => {}
+                        DoseAction::Hold | DoseAction::SetInterval { .. } => {}
                         DoseAction::Stop => {
                             stopped = true;
                             break;
@@ -6211,7 +6556,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // no ledger row. `stopped` was false on entry to this hook (it gates
                 // the hook), so its truth here means the `Stop` fired this decision.
                 // `observed` is moved in (the ledger rows above already cloned it).
-                let outcome = if stopped {
+                let outcome = if !due {
+                    DecisionOutcome::NotDue
+                } else if stopped {
                     DecisionOutcome::Stop { dosed: n_dosed }
                 } else if n_dosed > 0 {
                     DecisionOutcome::Dosed { n: n_dosed }
@@ -6226,7 +6573,24 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     time: t_start,
                     observed_signals: observed,
                     outcome,
+                    interval,
                 });
+
+                // #945: a consulted decision — a dose, a hold or an interval change — starts
+                // the next interval. A newly set interval has its due times walked here, at
+                // the decision that set it, so a dose can never be scheduled between two
+                // grid points. A `Stop` schedules nothing.
+                if due && !stopped {
+                    if let Some(d) = interval.filter(|&d| walked != Some(d)) {
+                        adaptive_walk_due_times(decision_times, t_start, d).map_err(|msg| {
+                            AdaptiveDriverError::controller_action(format!(
+                                "decision {decision_index} at t={t_start}: interval {d} {msg}"
+                            ))
+                        })?;
+                        walked = Some(d);
+                    }
+                    next_due = interval.map(|d| t_start + d);
+                }
             }
         }
 
@@ -6249,23 +6613,25 @@ pub(crate) fn ode_predictions_adaptive_impl(
         // injected dose starts unapplied and is marked by this very pass.
         applied.resize(shadow.doses.len(), false);
         seed_applied.resize(shadow.doses.len(), false);
-        apply_prescheduled_boluses_at(
+        first_event = first_event.min(apply_prescheduled_boluses_at(
             &mut u,
             ode,
             &shadow.doses,
             &dose_lagtimes,
             &injected_f,
             t_start,
+            doses_next_break(&break_times, k, tv),
             reset_floor,
             &mut applied,
-        );
+        ));
 
         // Record the observations read *at* t_start (post-dose), mirroring
         // `ode_predictions`' left-boundary recording — its whole `EVENT_MATCH_TOL` band,
         // through the same [`RecordIndex::records_at_break`] the static engine and the frozen
-        // replay call, so the three cannot drift (#1226).
+        // replay call, so the three cannot drift (#1226). The band was collected at the top
+        // of this iteration; a member strictly earlier than the first event applied here
+        // reads `u_before` (#2124).
         {
-            obs_index.records_at_break(t_start, &mut boundary_obs);
             for &obs_idx in &boundary_obs {
                 let cmt = shadow.obs_cmts.get(obs_idx).copied().unwrap_or(0);
                 // On the TV path each observation reads with its own per-event PK
@@ -6283,9 +6649,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     eta,
                     if iov { record_occ.obs[obs_idx] } else { None },
                 );
+                let state = band_read_state(
+                    shadow.obs_times[obs_idx],
+                    first_event,
+                    u_before.as_deref(),
+                    &u,
+                );
                 predictions[obs_idx] = read_observable(
                     ode,
-                    &u,
+                    state,
                     obs_pk,
                     theta,
                     obs_eta,
@@ -6345,6 +6717,31 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     .copy_from_slice(&seg_pk.values[..crate::types::MAX_PK_PARAMS]);
             }
 
+            // #943: this segment's share of the window AUC. Its nodes are the post-event
+            // value at `t_start` (pushed here, after every event of this break), the window
+            // grid points strictly inside the segment (soft samples of the integration
+            // below) and the pre-event value at `t_end` (pushed after it, before the next
+            // break's events). All read under this segment's `seg_pk` / `seg_eta` and the
+            // covariate row of the record that governs it — the snapshot the state was
+            // integrated with. The `[scaling]` divisor inside `scale_readout` keeps the
+            // subject's t = 0 covariates, as `simulate()` divides by (#2129).
+            let seg_cov = if tv && auc.is_some() {
+                governing_segment_cov_at(t_end, &records, subject, last_cov)
+            } else {
+                &shadow.covariates
+            };
+            let auc_window = auc.as_ref().and_then(|a| a.window_of(t_start));
+            let auc_grid: Vec<f64> = match (&auc, auc_window) {
+                (Some(a), Some(w)) if started => a.grid_inside(w, t_start, t_end),
+                _ => Vec::new(),
+            };
+            let auc_signal = |mon: &AdaptiveMonitor, u: &[f64], t: f64| {
+                adaptive_monitor_signal(ode, mon, u, seg_pk_values, theta, seg_eta, seg_cov, t)
+            };
+            if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
+                a.push(w, t_start, auc_signal(a.monitor, &u, t_start));
+            }
+
             // Per-dose lagtimes for the segment (computed once above for the bolus pass and
             // reused here). Base doses (indices `0..n_base`, #702) carry their resolved
             // lagtime; controller-injected doses (`n_base..`) are lag-0 (a nonzero lag is
@@ -6380,6 +6777,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 } else {
                     Vec::new()
                 };
+                // One soft-sample list for both readers; each takes its own positions back.
+                let (soft_times, probe_at, auc_at) = merge_soft_times(&probe_times, &auc_grid);
                 let soft = integrate_segment(
                     ode,
                     &mut u,
@@ -6397,8 +6796,13 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     &mut predictions,
                     None,
                     &mut auto_state,
-                    &probe_times,
+                    &soft_times,
                 );
+                if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
+                    for (&t, &i) in auc_grid.iter().zip(&auc_at) {
+                        a.push(w, t, auc_signal(a.monitor, &soft[i], t));
+                    }
+                }
 
                 // #1151 / #1535 / #1572: a segment whose dose clock had no referent — a window
                 // before the first realized (or base) dose on a `TAD`/`TAFD`-reading RHS — is
@@ -6421,7 +6825,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     if let Some((tad, tafd)) = clock_candidates {
                         let mut samples = Vec::with_capacity(probe_times.len() + 1);
                         samples.push((t_start, u_start));
-                        samples.extend(probe_times.iter().copied().zip(soft));
+                        samples.extend(
+                            probe_times
+                                .iter()
+                                .zip(&probe_at)
+                                .map(|(&t, &i)| (t, soft[i].clone())),
+                        );
                         pending_clock_windows.push(PendingClockWindow {
                             t_start,
                             t_end,
@@ -6443,6 +6852,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     return Err(AdaptiveDriverError::unsupported(msg));
                 }
             }
+            // Before the origin nothing evolves, so the held state needs no interior points.
+            if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
+                a.push(w, t_end, auc_signal(a.monitor, &u, t_end));
+            }
 
             // Advance the LOCF carry: after integrating into `t_end`, the record in force
             // there — **if `t_end` is one** — is the most-recent PK. `last_occ` advances in
@@ -6457,8 +6870,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // `last_params`. An EVID=3/4 reset is a record (#1133, #1148); of a co-timed
             // group the LAST in processing order is the one left in force (`last_at`).
             if tv {
-                if let Some(pk) = event_pk.and_then(|ev| records.carried_pk_at(t_end, ev)) {
-                    last_pk = pk;
+                if let (Some(ev), Some(rec)) = (event_pk, records.carried_record_at(t_end)) {
+                    last_pk = rec.pk(ev);
+                    last_cov = rec.cov(subject);
                     last_occ = seg_occ;
                 }
             }
@@ -6469,6 +6883,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
 
     // Clamp negative predictions to zero, matching the static predictor.
     clamp_negative_predictions(&ode.readout, &mut predictions);
+
+    if let Some(out) = window_aucs {
+        *out = auc.map_or_else(Vec::new, |a| a.into_realized(decisions.len()));
+    }
 
     Ok(AdaptiveRun {
         predictions,
@@ -6539,7 +6957,7 @@ pub(crate) fn verify_adaptive_frozen_replay(
     // stays bit-aligned. On the dose-free path `base_subject.doses` is empty, so this is
     // the prior ledger-only rebuild — byte-identical. A base regimen reaches the constant
     // path (`event_pk` is `None`) and, since #930/#931, the per-event-PK path too (a
-    // time-varying covariate and/or IOV); only base × reset is still rejected upstream. On
+    // time-varying covariate and/or IOV), with or without system resets. On
     // the per-event-PK branch the base doses' F is recomputed from each dose's own snapshot
     // — the covariate active at, and the occasion κ of, its administration time (below) —
     // matching the driver.
@@ -6683,10 +7101,7 @@ fn adaptive_frozen_replay_tv(
     let n_obs = subject.obs_times.len();
     let iov = eta_occ.is_some();
 
-    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in subject.obs_times.iter().enumerate() {
-        obs_map.entry(t.to_bits()).or_default().push(i);
-    }
+    let obs_map = build_obs_index_map(&subject.obs_times);
 
     // #1073 / #1148: the records that can govern a segment, mirroring the driver's index
     // (and occasions, #701, resolved from the decision schedule `extra_breaks`).
@@ -6808,7 +7223,17 @@ fn adaptive_frozen_replay_tv(
             .filter(|b| b.is_finite() && *b > 0.0),
     );
     break_times.sort_by(|a, b| a.total_cmp(b));
-    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    // #2123: the driver's record set — decisions, obs, pk-only and dose rows (a ledger
+    // dose's row is its decision time).
+    let record_bits: std::collections::HashSet<u64> = extra_breaks
+        .iter()
+        .chain(subject.obs_times.iter())
+        .chain(subject.pk_only_times.iter())
+        .copied()
+        .chain(subject.doses.iter().map(|d| d.time))
+        .map(f64::to_bits)
+        .collect();
+    dedup_breaks_keeping_records(&mut break_times, &record_bits);
     // A non-finite break time makes the subject non-finite (#1189); `predictions` is
     // NaN-prefilled, matching what the driver this verifies now reports as an `Err`.
     if abandon_non_finite_timeline(break_times.iter().copied(), None) {
@@ -6835,6 +7260,12 @@ fn adaptive_frozen_replay_tv(
     let mut auto_state = OdeAutoSwitchState::default();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
+
+        // The band before this break's events, and the earliest of them, as in the driver
+        // (#2124, [`band_read_state`]).
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        let u_before = (!boundary_obs.is_empty()).then(|| u.clone());
+        let mut first_event = f64::INFINITY;
 
         // #701: open a decision window here, mirroring the driver — set the LOCF PK +
         // occasion to this decision's occasion snapshot so the coincident observation,
@@ -6873,6 +7304,11 @@ fn adaptive_frozen_replay_tv(
             );
             u = ode.initial_state(&event_pk.reset[r].values);
             reset_floor = t_start;
+            first_event = first_event.min(earliest_reset_at_break(
+                &subject.reset_times,
+                t_start,
+                f64::INFINITY,
+            ));
         }
 
         // Apply boluses landing at t_start (lag 0) with their realized F — at EVERY
@@ -6886,10 +7322,12 @@ fn adaptive_frozen_replay_tv(
             if applied[i] {
                 continue;
             }
-            if (d.time - t_start).abs() >= EVENT_MATCH_TOL {
+            let t_next = break_times.get(k + 1).copied().unwrap_or(f64::INFINITY);
+            if !event_on_break(d.time, t_start, t_next) {
                 continue;
             }
             applied[i] = true;
+            first_event = first_event.min(d.time);
             if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt_raw()) {
                 let cmt_idx = d.cmt_idx();
                 if cmt_idx < n {
@@ -6901,9 +7339,18 @@ fn adaptive_frozen_replay_tv(
         // Record obs read *at* the left boundary (post-dose) with each observation's own
         // per-event PK (consistent with the state propagated into this boundary). Same
         // [`RecordIndex::records_at_break`] band as the reactive driver this verifier replays,
-        // which is what keeps the pair bit-identical (#1028, #1226).
+        // which is what keeps the pair bit-identical (#1028, #1226), and the same pre-event
+        // read for a member strictly earlier than the first event here (#2124).
+        //
+        // No fixture reaches a pre-event read *here* today, measured by mutation (#2485
+        // review): this walk's record set holds every dose time, so a dose keeps its own
+        // break and fires there ([`event_on_break`]), and the reader moves an EVID=3/4 row
+        // listed after a co-timed record to a new occasion past it (`RESET_SEGMENT_GAP`), so
+        // nothing is applied at a break whose band holds an earlier record. The read is kept
+        // so the replay stays the driver's twin if either invariant is relaxed (a lagged or
+        // input-rate base dose on the time-varying path, refused upstream today); without
+        // it, that change would surface as a verifier refusal rather than a wrong value.
         {
-            obs_index.records_at_break(t_start, &mut boundary_obs);
             for &obs_idx in &boundary_obs {
                 let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
                 let obs_eta = eta_for(
@@ -6911,9 +7358,15 @@ fn adaptive_frozen_replay_tv(
                     eta,
                     if iov { record_occ.obs[obs_idx] } else { None },
                 );
+                let state = band_read_state(
+                    subject.obs_times[obs_idx],
+                    first_event,
+                    u_before.as_deref(),
+                    &u,
+                );
                 predictions[obs_idx] = read_observable(
                     ode,
-                    &u,
+                    state,
                     &event_pk.obs[obs_idx].values,
                     theta,
                     obs_eta,
@@ -6987,169 +7440,200 @@ fn adaptive_frozen_replay_tv(
 }
 
 /// Number of trapezoid panels per inter-decision window for the metrics-only
-/// signal-AUC (#391 S2.5b). A fixed *subdivision count* (unit-agnostic — not a step
-/// in time units), generous enough that the trapezoid discretization error on a
-/// smooth PK curve sits well below the cross-engine solver agreement. This is the
-/// AUC machinery's **own** grid: it deliberately does not touch the reactive
-/// driver's `saveat`, because the stepper clamps `dt` to land on each save point
-/// (`solver.rs`), so adding points there would perturb the bit-aligned trajectory
-/// and the default-on frozen-replay verifier.
+/// window AUC (#391 S2.5b). A fixed *subdivision count* (unit-agnostic — not a step
+/// in time units). The grid points are soft samples of the driver's own integration
+/// ([`integrate_segment`]'s `chz_times`, #570), so they never clamp the step sequence
+/// and the reactive trajectory — hence the frozen-replay verifier — is bit-identical
+/// with or without the AUC (#943).
 const ADAPTIVE_AUC_PANELS: usize = 128;
 
-/// Per-(inter-decision)-window AUC of the **latent** monitored signal — the input
-/// to the `auc_target_attainment` metric (#391 S2.5b).
+/// The value monitor `am` presents at state `u` and time `t`, in observation units:
+/// its compiled `observe` expression when it has one, else the model readout on
+/// `am.spec.cmt` divided by its `[scaling]` divisor under `eta` (#2129).
 ///
-/// Metrics-only: the exposure never feeds the controller (the `when` rules titrate
-/// on the point `signal`), so it is computed here — *after* the reactive run, from
-/// the realized `ledger` — rather than inline in the hot loop. Like
-/// [`verify_adaptive_frozen_replay`] it rebuilds the static dose schedule from the
-/// run's `ledger` and replays it through the trusted dense-state engine
-/// ([`ode_dense_solve_states`]); each window is integrated on its **own** uniform
-/// sub-grid and reduced with the shared trapezoid rule ([`crate::api::trapezoid`]).
-///
-/// **Window convention — left-closed / right-open.** Each window
-/// `[decision_times[k], decision_times[k+1]]` includes the dose at its left edge
-/// `a` (the post-dose state there is the true start of this window's exposure) but
-/// **not** the dose at its right edge `b`, which belongs to the next window.
-/// [`ode_dense_solve_states`] saves the *post-dose* state at a save point that
-/// coincides with a dose time, so the windows cannot share one grid + one solve:
-/// that folds the next window's dose into this window's right endpoint — a spurious
-/// jump of ≈ ½·Δsignal·(window ⁄ panels) for an instantaneous (bolus) dose (an
-/// infusion delivers ≈0 at its start instant and is unaffected, but the convention
-/// must be correct for both). So each window is solved against a static subject that
-/// keeps only the doses **before** `b` (`time < b`), leaving `b` a plain pre-dose
-/// decay point. Controller doses sit on the decision grid (window edges), so for them
-/// `time < b` is exactly "at or before `a`" and the window is integrated exactly. A
-/// pre-scheduled base maintenance dose (#702) may instead land strictly inside
-/// `(a, b)`; it is kept — dropping it would under-count this window's exposure — and
-/// is integrated exactly for an infusion / absorption input (whose signal stays
-/// continuous), with only the same ≈ ½·Δsignal·(window ⁄ panels) node-placement error
-/// as above for the rarer instantaneous bolus into the monitored compartment.
-///
-/// **Cost — `O(m²)`, deliberately.** This is one dense solve per window, and
-/// because [`ode_dense_solve_states`] always starts from `t = 0` (it cannot resume
-/// from a saved state), window `k` re-integrates `[0, decision_times[k+1]]` — so the
-/// pass is quadratic in the decision count `m` (`1 + 2 + … + (m−1)`), versus `O(m)`
-/// for a single shared solve. That is an accepted trade for correctness: the pass
-/// runs **only** when `auc_target` is declared and **only after** the reactive run
-/// (a per-(subject, replicate) reporting step, never inside the fit/inner loop), so
-/// for the intended TDM scale (tens of decisions, a microsecond each) the quadratic
-/// factor is negligible. Collapsing it back to `O(m)` would require a solver entry
-/// point that resumes from a mid-trajectory state, or a dense readout of the
-/// *pre-dose* value at a dose instant — both larger changes to the shared engine,
-/// left as a follow-up rather than bundled into the boundary fix.
-///
-/// Returns one AUC per **closed** window `[decision_times[k], decision_times[k+1]]`
-/// (length `decision_times.len() − 1`; empty for a single decision — there is no
-/// window to integrate over). The signal is the latent readout the driver itself
-/// would resolve: the compiled `observe` expression when present (the `Ipred`
-/// path), else the model's `monitor_cmt` readout (the `Dv` path's underlying
-/// latent — the AUC is always over the un-noised signal, never the assay draw).
-///
-/// `base_subject` carries the run's covariates **and** any pre-scheduled base regimen
-/// (#702 — a loading / maintenance dose on `subject.doses`): each window is integrated
-/// against those base doses (kept via clone, so their `SS`/lagtime/infusion attributes
-/// carry over) plus the controller's realized ledger doses, restricted per the window
-/// composition below. On the dose-free path `base_subject.doses` is empty, so this is
-/// the prior ledger-only rebuild. This pass uses a **single** PK snapshot
-/// (`pk_params_flat`), exact only for constant-covariate subjects — a time-varying (or
-/// TIME-in-PK) or IOV subject with an `auc_target` is rejected upstream in
-/// `run_adaptive_population` (#700/#701), so it never reaches here.
+/// The one spelling of "what this monitor reads": the decision hook resolves the
+/// controller's signal through it, and the window AUC (#943) integrates it at every grid
+/// point under that point's own PK snapshot and `[η | κ]`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn adaptive_window_signal_aucs(
+fn adaptive_monitor_signal(
     ode: &OdeSpec,
-    pk_params_flat: &[f64],
+    am: &AdaptiveMonitor,
+    u: &[f64],
+    pk: &[f64],
     theta: &[f64],
     eta: &[f64],
-    base_subject: &Subject,
-    decision_times: &[f64],
-    ledger: &[DoseLedgerEntry],
-    observe: Option<&OdeOutputFn>,
-    monitor_cmt: usize,
-) -> Vec<f64> {
-    let m = decision_times.len();
-    if m < 2 {
-        return Vec::new();
+    cov: &HashMap<String, f64>,
+    t: f64,
+) -> f64 {
+    let latent = match am.observe {
+        // `[adaptive_dosing] observe` compiles through the same `build_y_output_fn` as a
+        // `[scaling]` Form C readout, so it can reference the `TIME` / `T` built-in — enter
+        // `t` so it resolves there rather than to the thread-local default (#1028). The
+        // `None` arm's `read_observable` guards itself.
+        Some(f) => {
+            let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(t);
+            f(u, pk, theta, eta, cov)
+        }
+        None => read_observable(ode, u, pk, theta, eta, cov, am.spec.cmt, t),
+    };
+    // The caller sets `obs_scale` only on a monitor with no `observe` expression, so this
+    // is the identity on the `Some(f)` arm.
+    am.scale_readout(latent, eta)
+}
+
+/// Tolerance for matching a due time to a review-grid point (#945): relative, so a
+/// decimal grid (`every 0.1`) and its sums of intervals agree past float rounding.
+fn adaptive_due_tol(t: f64) -> f64 {
+    1e-9 * t.abs().max(1.0)
+}
+
+/// Is the grid point `t` due, given the time `next_due` from which the next dose is due
+/// (`None` ⇒ due now: no decision consulted yet, or no dosing interval set)? (#945)
+pub(crate) fn adaptive_point_is_due(next_due: Option<f64>, t: f64) -> bool {
+    next_due.is_none_or(|due| t >= due - adaptive_due_tol(due))
+}
+
+/// Walk the due times a constant `interval` produces from the consulted grid point `from`
+/// to the end of `grid` (#945). Until the interval changes, every due point is consulted
+/// exactly when it falls due (a hold consumes its slot as a dose does), so this sequence is
+/// a function of `from` and `interval` alone and is checked whole, where the interval is
+/// set — never at a later decision that took no interval action. `Ok` when every due time
+/// lands on a grid point or past the last one; else the reason, naming the due time and the
+/// two grid points it falls between, or an interval too short to advance past `from` within
+/// the matching tolerance. `grid` is strictly increasing (`validate_increasing_finite`) and
+/// `interval` positive and finite (`DoseAction::validate`, `check_start_interval`).
+pub(crate) fn adaptive_walk_due_times(
+    grid: &[f64],
+    from: f64,
+    interval: f64,
+) -> Result<(), String> {
+    let mut t = from;
+    loop {
+        let due = t + interval;
+        let tol = adaptive_due_tol(due);
+        let k = grid.partition_point(|&g| g < due - tol);
+        match grid.get(k) {
+            None => return Ok(()),
+            // The matched point must lie after `t`, or the walk (and the driver's due test)
+            // would treat `t` itself as the next due point.
+            Some(&g) if (g - due).abs() <= tol && g <= t => {
+                return Err(format!(
+                    "is shorter than the review grid's matching tolerance: the decision due \
+                     after t={t} matches t={t} itself"
+                ))
+            }
+            Some(&g) if (g - due).abs() <= tol => t = g,
+            // `t` is a grid point below `due - tol`, so `k >= 1`.
+            Some(&g) => {
+                return Err(format!(
+                    "puts the decision due after t={t} at t={due}, between the review-grid \
+                     points t={} and t={g}; every due time must land on a point of \
+                     `decision_times`",
+                    grid[k - 1]
+                ))
+            }
+        }
+    }
+}
+
+/// Per-(inter-decision)-window AUC of the monitored signal, accumulated inside the
+/// reactive driver's own segment walk — the input to the `auc_target_attainment` metric
+/// (#391 S2.5b, #943).
+///
+/// **Window convention — left-closed / right-open.** Window `k` is
+/// `[decision_times[k], decision_times[k+1]]`; it starts from the state the events at its
+/// left edge left (the dose there is this window's) and ends at the state its right edge
+/// found (the dose there is the next window's).
+///
+/// **Nodes.** Every decision is a break of the walk, so each segment `(t_start, t_end]`
+/// lies inside one window. The driver pushes, per segment, the post-event value at
+/// `t_start`, the window's uniform grid points strictly inside the segment (soft samples
+/// of the same integration), and the pre-event value at `t_end`. A break inside a window —
+/// a base dose, an infusion end, an EVID=3/4 reset — therefore carries both its `b⁻` and
+/// its `a⁺` node, and the trapezoid integrates the jump exactly as a zero-width panel.
+/// Each point reads under its segment's PK and `[η | κ]`, the snapshot the state itself
+/// was integrated with.
+///
+/// **Cost — `O(m)`.** One walk serves every window; the old post-hoc pass re-solved from
+/// `t = 0` for each window (`O(m²)`).
+struct AdaptiveWindowAucs<'d> {
+    edges: &'d [f64],
+    // The monitor whose signal is integrated.
+    monitor: &'d AdaptiveMonitor<'d>,
+    // Each window's `(t, signal)` nodes, in walk order.
+    points: Vec<Vec<(f64, f64)>>,
+}
+
+impl<'d> AdaptiveWindowAucs<'d> {
+    fn new(decision_times: &'d [f64], monitor: &'d AdaptiveMonitor<'d>) -> Self {
+        Self {
+            edges: decision_times,
+            monitor,
+            points: vec![Vec::new(); decision_times.len().saturating_sub(1)],
+        }
     }
 
-    let panels = ADAPTIVE_AUC_PANELS;
-    // BSV-only ⇒ the subject's static covariate snapshot applies at every grid time.
-    let cov = &base_subject.covariates;
+    /// The window holding the segment that starts at the break `t_start`, or `None` before
+    /// the first decision or from the last one on. Decisions are bit-exact breaks (the
+    /// driver's survival guards), so the segment cannot straddle a window edge.
+    fn window_of(&self, t_start: f64) -> Option<usize> {
+        let k = self.edges.partition_point(|&d| d <= t_start);
+        (k >= 1 && k < self.edges.len()).then(|| k - 1)
+    }
 
-    // One closed window at a time (see "Window convention" above): integrate
-    // `[a, b]` against a static subject carrying the base regimen and ledger doses
-    // that can influence this window — everything before the right edge `b` (see the
-    // per-window composition below) — so the dose at `b` (the next window's) never
-    // folds into this window's endpoint.
-    (0..m - 1)
-        .map(|k| {
-            let (a, b) = (decision_times[k], decision_times[k + 1]);
+    /// Window `w`'s grid points strictly inside `(t_start, t_end)`, ascending. The ends
+    /// are nodes of their own.
+    fn grid_inside(&self, w: usize, t_start: f64, t_end: f64) -> Vec<f64> {
+        let (a, b) = (self.edges[w], self.edges[w + 1]);
+        let span = b - a;
+        let panels = ADAPTIVE_AUC_PANELS;
+        (1..panels)
+            .map(|i| a + span * (i as f64) / (panels as f64))
+            .filter(|&g| g > t_start && g < t_end)
+            .collect()
+    }
 
-            // Compose the window's static regimen exactly as
-            // [`verify_adaptive_frozen_replay`] does: the pre-scheduled base regimen
-            // (#702) — CLONED, so each base dose's `SS`/`II`/lagtime/modeled-`RATE`/
-            // infusion attributes survive (a `DoseEvent::new` rebuild would silently
-            // reset them to a plain `Fixed` bolus) — followed by the controller's
-            // realized ledger doses, then restricted to the doses that can influence
-            // this window. A dose strictly after the right edge `b` cannot affect
-            // `[a, b]` (causality); the dose *at* `b` is the next window's left-edge
-            // dose, whose post-dose jump would otherwise fold into this window's right
-            // endpoint ([`ode_dense_solve_states`] saves the post-dose state at a save
-            // point on a dose time). Both are dropped by `time < b`; doses at or before
-            // `a` (state setup) and any base maintenance dose strictly inside `(a, b)`
-            // are kept. Controller doses sit on the decision grid (= window edges), so
-            // for them `time < b` is byte-identical to the old `<= a` — the pure-
-            // controller path is unchanged; only a base regimen (previously dropped by
-            // the `sub.doses = ledger` overwrite) is now integrated. The `1e-9` guards
-            // float equality at `b`, far below any real decision spacing.
-            let mut sub = base_subject.clone();
-            sub.doses.extend(
-                ledger
-                    .iter()
-                    .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
-            );
-            sub.doses.retain(|d| d.time < b - 1e-9);
+    /// Append the node `(t, s)` to window `w`.
+    fn push(&mut self, w: usize, t: f64, s: f64) {
+        self.points[w].push((t, s));
+    }
 
-            // The window's own uniform sub-grid: `panels + 1` points, `grid[0] == a`
-            // (post-dose) and `grid[panels] == b` (pre-dose decay).
-            let span = b - a;
-            let grid: Vec<f64> = (0..=panels)
-                .map(|i| a + span * (i as f64) / (panels as f64))
-                .collect();
+    /// The AUCs of the first `n_realized - 1` windows, each reduced by the shared trapezoid
+    /// rule ([`crate::api::trapezoid`]; its stable sort keeps a break's `b⁻` before its
+    /// `a⁺`). After a `Stop` no decision is logged, so the realized decisions are a prefix
+    /// of the schedule, and a window past the last realized decision is discontinuation,
+    /// not exposure.
+    fn into_realized(self, n_realized: usize) -> Vec<f64> {
+        self.points
+            .iter()
+            .take(n_realized.saturating_sub(1))
+            .map(|pts| crate::api::trapezoid(pts))
+            .collect()
+    }
+}
 
-            let states = ode_dense_solve_states(ode, pk_params_flat, theta, eta, &sub, &grid);
-
-            // Latent signal at each grid point (the same readout the driver resolves
-            // at a decision), then trapezoid the window.
-            let pts: Vec<(f64, f64)> = states
-                .iter()
-                .enumerate()
-                .map(|(i, u)| {
-                    let s = match observe {
-                        // Same `TIME` guard as the decision-time monitor read above
-                        // (#1028), at this grid point's own time.
-                        Some(f) => {
-                            let _time_guard =
-                                crate::parser::model_parser::ModelTimeGuard::enter(grid[i]);
-                            f(u, pk_params_flat, theta, eta, cov)
-                        }
-                        None => read_observable(
-                            ode,
-                            u,
-                            pk_params_flat,
-                            theta,
-                            eta,
-                            cov,
-                            monitor_cmt,
-                            grid[i],
-                        ),
-                    };
-                    (grid[i], s)
-                })
-                .collect();
-            crate::api::trapezoid(&pts)
-        })
-        .collect()
+/// Merge two ascending time lists into one, dropping bit-identical duplicates, and
+/// return each input's positions in the merged list.
+fn merge_soft_times(a: &[f64], b: &[f64]) -> (Vec<f64>, Vec<usize>, Vec<usize>) {
+    let mut merged: Vec<f64> = Vec::with_capacity(a.len() + b.len());
+    let (mut ia, mut ib) = (Vec::with_capacity(a.len()), Vec::with_capacity(b.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        let take_a = j >= b.len() || (i < a.len() && a[i] <= b[j]);
+        let t = if take_a { a[i] } else { b[j] };
+        if merged.last().is_none_or(|&l| l.to_bits() != t.to_bits()) {
+            merged.push(t);
+        }
+        let pos = merged.len() - 1;
+        if take_a {
+            ia.push(pos);
+            i += 1;
+        } else {
+            ib.push(pos);
+            j += 1;
+        }
+    }
+    (merged, ia, ib)
 }
 
 /// ODE-based predictions with per-event PK parameters (time-varying-covariate
@@ -7973,6 +8457,12 @@ pub fn ode_predictions_with_states(
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
+        // The band, collected before the events so a record strictly earlier than the
+        // first of them reads the state they find (#2124, [`band_read_state`]).
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        let u_before = (!boundary_obs.is_empty()).then(|| u.clone());
+        let mut first_event = f64::INFINITY;
+
         // SS + lagtime: at the dose *record* time (strictly before the lagged pulse
         // arrives) seed the previous interval's steady-state tail, exactly mirroring
         // the separate pre-pass in `ode_predictions` (lines 479-485).
@@ -7983,6 +8473,7 @@ pub fn ode_predictions_with_states(
             }
             if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < EVENT_MATCH_TOL {
                 seed_applied[i] = true;
+                first_event = first_event.min(dose.time);
                 let chz_before = chz_snapshot(ode, &u);
                 u = ss_state_at_phase(
                     ode,
@@ -8020,6 +8511,7 @@ pub fn ode_predictions_with_states(
                 // Marked for every matched dose, whichever branch fires below — the
                 // arrival is one event (equilibrate + bolus + infusion push) (#1186).
                 applied[dose_idx] = true;
+                first_event = first_event.min(t_eff);
                 let f = dose_f_bio[dose_idx];
                 let live = gate.live(&subject.doses, dose_idx);
                 if live && ss_equilibrates_at_arrival(dose, dose_lagtimes[dose_idx]) {
@@ -8056,19 +8548,27 @@ pub fn ode_predictions_with_states(
         }
 
         // Handle obs read *at* t_start (after dose) — the whole `EVENT_MATCH_TOL` band,
-        // through the same helper as the objective path (#1226).
-        obs_index.records_at_break(t_start, &mut boundary_obs);
-        record_observations(
-            ode,
-            &boundary_obs,
-            &u,
-            pk_params_flat,
-            theta,
-            eta,
-            subject,
-            &mut predictions,
-            Some(states.as_mut_slice()),
-        );
+        // through the same helper as the objective path (#1226), and with its pre-event
+        // read for a record strictly earlier than the first event here (#2124).
+        for &obs_idx in &boundary_obs {
+            let state = band_read_state(
+                subject.obs_times[obs_idx],
+                first_event,
+                u_before.as_deref(),
+                &u,
+            );
+            record_observations(
+                ode,
+                &[obs_idx],
+                state,
+                pk_params_flat,
+                theta,
+                eta,
+                subject,
+                &mut predictions,
+                Some(states.as_mut_slice()),
+            );
+        }
 
         // #731: integrate the open interval `(t_start, t_end]` to the next break, if
         // there is one. The final break has no successor — its dose was applied and its
@@ -8487,14 +8987,13 @@ fn apply_segment_boundary(
     // own later in the band (at or after `t_end`) is not on this one: a `saveat` read here
     // precedes it, as an observation between the two rows does in the event-driven walk.
     // On the final break (`t_end == t_start`) nothing later exists.
-    let on_this_break =
-        |rt: f64| (rt - t_start).abs() < EVENT_MATCH_TOL && (rt < t_end || t_end <= t_start);
-    let mut first_event = subject
-        .reset_times
-        .iter()
-        .copied()
-        .filter(|&rt| on_this_break(rt))
-        .fold(f64::INFINITY, f64::min);
+    let t_next = if t_end <= t_start {
+        f64::INFINITY
+    } else {
+        t_end
+    };
+    let on_this_break = |rt: f64| event_on_break(rt, t_start, t_next);
+    let mut first_event = earliest_reset_at_break(&subject.reset_times, t_start, t_next);
     if let Some(r) = subject
         .reset_times
         .iter()
@@ -8836,10 +9335,8 @@ fn ode_dense_solve_states_seeded(
         // event-driven engine orders the two by exact time and reads the observation
         // pre-dose, as NONMEM does; read off the post-dose `u` it was the seed plus the dose.
         for &i in &boundary_saveat {
-            result[i] = match &u_before {
-                Some(pre) if saveat[i] < forcings.first_event => pre.clone(),
-                _ => u.clone(),
-            };
+            result[i] =
+                band_read_state(saveat[i], forcings.first_event, u_before.as_deref(), &u).to_vec();
         }
 
         let Some(t_end) = next else {
@@ -8910,6 +9407,35 @@ pub enum ThresholdOutcome {
     SolveFailed(String),
 }
 
+/// The state labels the CHZ threshold driver's `SolveFailed` reasons use (#2087). The reason
+/// reaches the user as a simulation warning, so states are named as the model file names them,
+/// each label a full noun phrase:
+/// - a user `[odes]` state: `` [odes] state `<name>` ``;
+/// - the accumulator being searched (`chz_state`): `the cumulative hazard`;
+/// - any other injected accumulator (a second ODE-accumulated cause): `the cumulative hazard
+///   of CMT=<cmt>`.
+///
+/// No accumulator is ever named by its internal `__chz_<cmt>` state name: the user wrote it as
+/// an `[event_model] hazard = …`, not in `[odes]`.
+#[cfg(feature = "survival")]
+pub(crate) fn chz_threshold_state_labels(ode: &OdeSpec, chz_state: usize) -> Vec<String> {
+    (0..ode.n_states)
+        .map(|k| {
+            let name = ode.state_names.get(k);
+            if k == chz_state {
+                "the cumulative hazard".to_string()
+            } else if ode.chz_state_slots.contains(&k) {
+                match name.and_then(|n| n.strip_prefix("__chz_")) {
+                    Some(cmt) => format!("the cumulative hazard of CMT={cmt}"),
+                    None => "another cumulative hazard".to_string(),
+                }
+            } else {
+                name.map_or_else(|| format!("state {k}"), |n| format!("[odes] state `{n}`"))
+            }
+        })
+        .collect()
+}
+
 /// Integrate a subject's augmented ODE from `0` to `horizon`, applying doses /
 /// infusions / EVID-3 resets via the **same break-time segmentation as
 /// [`ode_dense_solve_states`]**, and halt at the first time `u[chz_state]` reaches
@@ -8951,10 +9477,11 @@ pub(crate) fn ode_solve_until_chz_threshold(
     threshold: f64,
     horizon: f64,
 ) -> ThresholdOutcome {
-    use crate::ode::solver::{solve_ode_until_threshold, ThresholdCrossing};
+    use crate::ode::solver::{solve_ode_until_threshold_labelled, ThresholdCrossing};
 
     let n = ode.n_states;
     let opts = ode.effective_solver_opts();
+    let labels = chz_threshold_state_labels(ode, chz_state);
     let mut u = ode.initial_state(disposition);
 
     // Resolve modeled-RATE doses once, exactly as the dense path (#324).
@@ -9050,7 +9577,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
 
         // The absolute CHZ threshold is held across segments — `u[chz_state]`
         // accumulates continuously, so a crossing in any segment is the event.
-        match solve_ode_until_threshold(
+        match solve_ode_until_threshold_labelled(
             &wrapped_rhs,
             &mut u,
             (t_start, t_end),
@@ -9058,6 +9585,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &opts,
             chz_state,
             threshold,
+            Some(&labels),
         ) {
             ThresholdCrossing::Crossed(t) => return ThresholdOutcome::Crossed(t),
             ThresholdCrossing::ReachedEnd => {} // u advanced; carry into next segment

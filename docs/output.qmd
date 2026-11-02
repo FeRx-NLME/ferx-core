@@ -373,7 +373,7 @@ The `estimation:` block replaces the standalone `{model}-timing.txt` file
 covered the whole CLI run, so the two are not a like-for-like replacement,
 just the closest equivalent), and `n_threads_used` is the Rayon worker count
 used. `wall_time_secs` is further broken down (#713) into a `{method}_wall_time_secs`
-entry for each stage of `method = ...`/`methods = [...]` (e.g. `focei_wall_time_secs`,
+entry for each stage of `method = ...`/`method = [...]` (e.g. `focei_wall_time_secs`,
 `imp_wall_time_secs` for a `[focei, imp]` chain) plus `covariance_wall_time_secs`
 for the post-estimation FD-Hessian / SIR-fallback step, which only ever runs
 once, on the last estimating stage (#615). The per-stage keys measure
@@ -612,6 +612,7 @@ Counters from the inner-loop (EBE) optimizer, useful for diagnosing problematic 
 | `ebe_convergence_warnings` | Number of outer iterations in which at least one subject had an unconverged EBE |
 | `max_unconverged_subjects` | Worst-case unconverged-subject count seen in a single outer iteration |
 | `total_ebe_fallbacks` | Total number of times the Nelder-Mead fallback was invoked across all subjects and outer iterations |
+| `total_ebe_nm_polished` | Under `inner_optimizer = nelder_mead`: total number of times, counted the same way, that a Nelder–Mead stop was not a mode and the stationarity certificate moved it there with the gradient. 0 otherwise |
 
 ## Optimizer Trace CSV
 

@@ -202,6 +202,19 @@ fn screen_starts_are_the_lowest_draws_of_the_scaled_prior() {
     want.sort_by(|a, b| sq(a).total_cmp(&sq(b)));
     assert_eq!(got, want[..3].to_vec());
 
+    // Ties among non-minimal values: the kept starts are a stable sort's first three,
+    // so a later draw never displaces an earlier one it ties. Coarse buckets of `sq`
+    // put many draws on each level.
+    let coarse = |e: &[f64]| (sq(e) * 4.0).floor();
+    let got = screen_starts(&coarse, &omega, 3, 100, "S1");
+    let mut want = draws.clone();
+    want.sort_by(|a, b| coarse(a).total_cmp(&coarse(b)));
+    assert!(
+        want[..4].windows(2).any(|w| coarse(&w[0]) == coarse(&w[1])),
+        "the fixture must tie inside the kept set or at its edge"
+    );
+    assert_eq!(got, want[..3].to_vec());
+
     // A draw whose objective is not finite is dropped, not ranked. `−∞` and a negative
     // NaN both sort ahead of every finite value under `total_cmp`, so a kept one would
     // take a top-K slot.

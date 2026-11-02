@@ -838,7 +838,9 @@ pub(crate) fn check_endpoint_routing(
                 Some(("binary (`[binary_model]`)", "binary_model"))
             }
             #[cfg(feature = "markov")]
-            EndpointLikelihood::Ctmm { .. } => Some(("Markov (`[markov_model]`)", "markov_model")),
+            EndpointLikelihood::Ctmm { .. } | EndpointLikelihood::Dtmm { .. } => {
+                Some(("Markov (`[markov_model]`)", "markov_model"))
+            }
             // Not an endpoint the parser ever registers here; skipped rather than
             // matched by a wildcard so a Gaussian CMT can never be reported as unrouted.
             EndpointLikelihood::Gaussian(_) => None,
@@ -4433,6 +4435,28 @@ pub(crate) fn check_ctmm_records(
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     for (cmt, endpoint) in &model.endpoints {
+        // DTMM (#2473): the same two checks, plus an observed change of state that no
+        // `transition` declares — probability 0 for every parameter value.
+        if let crate::types::EndpointLikelihood::Dtmm {
+            state_codes,
+            transitions,
+            ..
+        } = endpoint
+        {
+            let first_bad = population.subjects.iter().find_map(|subject| {
+                crate::markov::dtmm::validate_dtmm_records(
+                    *cmt,
+                    state_codes,
+                    transitions,
+                    &subject.obs_records,
+                )
+                .err()
+            });
+            if let Some(m) = first_bad {
+                diags.push(Diagnostic::error("E_CTMM_RECORDS", m).with_block("markov_model"));
+            }
+            continue;
+        }
         let crate::types::EndpointLikelihood::Ctmm { state_codes, .. } = endpoint else {
             continue;
         };
@@ -4749,6 +4773,37 @@ pub(crate) fn check_survival_tv_covariates(
                         subject.id
                     ),
                     );
+                }
+                continue;
+            }
+            // DTMM (#2473): the transition probabilities read each record's own covariate
+            // snapshot, so a time-varying covariate is honoured — provided the subject's
+            // snapshot lines up with its records (`record_covariate_snapshots`). One that
+            // does not (a subject that also carries time-to-event rows, or an in-memory
+            // subject without per-row snapshots) would silently fall back to the baseline.
+            #[cfg(feature = "markov")]
+            if let EndpointLikelihood::Dtmm {
+                prob_covariates, ..
+            } = endpoint
+            {
+                if let Some(name) = prob_covariates.iter().find(|c| tv_set.contains(c.as_str())) {
+                    if crate::markov::dtmm::record_covariate_snapshots(subject).is_none() {
+                        return refuse(
+                            "markov_model",
+                            format!(
+                                "[markov_model] (type = dtmm) on CMT={cmt}: a transition \
+                                 probability references covariate `{name}`, which is \
+                                 time-varying for subject `{}`, but that subject carries no \
+                                 per-record covariate snapshot aligned with its state records \
+                                 (it also has time-to-event records, or was built in memory \
+                                 without `endpoint_covariates`), so the probability could only \
+                                 read the baseline value (#741). Hold `{name}` constant within \
+                                 the subject, or fit the DTMM without the time-to-event \
+                                 endpoint.",
+                                subject.id
+                            ),
+                        );
+                    }
                 }
                 continue;
             }
@@ -5772,9 +5827,11 @@ pub(crate) fn check_ode_method_linear(
 }
 
 /// The estimation half of `E_PROFILE_SCOPE` (#1065): what a `profile`d θ level block
-/// can be fitted with. The profile solve is a least-squares step on the FOCE/FOCEI
-/// objective, so it needs that objective, Gaussian rows, and a residual variance that
-/// does not read the prediction. Each refusal names the block and what it saw; none
+/// can be fitted with. The profile solve minimises the fit's own objective — FOCE, FOCEI,
+/// or the quadrature marginal of a `laplace` / `focei` stage at any `n_agq` (#2107) — with
+/// a least-squares Newton step, so it needs one of those, Gaussian rows, and a residual
+/// variance that does not read the prediction. A grid too large to evaluate is
+/// `E_AGQ_GRID_TOO_LARGE`'s, raised for every quadrature fit, profiled or not. Each refusal names the block and what it saw; none
 /// falls back to fitting the levels another way, since the user asked for `profile`.
 ///
 /// The declaration half (bounds, `FIX`, a single θ) and the route
@@ -5812,30 +5869,26 @@ pub(crate) fn check_profiled_levels(
     };
     let mut out = Vec::new();
     for m in options.method_chain() {
-        if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
+        if !matches!(
+            m,
+            EstimationMethod::Foce | EstimationMethod::FoceI | EstimationMethod::Laplace
+        ) {
             out.push(refuse(
                 format!(
-                    "which only `foce` and `focei` estimate; this fit runs `{}`.",
+                    "which only `foce`, `focei` and `laplace` estimate; this fit runs `{}`.",
                     m.label()
                 ),
                 REMOVE,
             ));
         }
     }
-    if options.n_agq > 1 {
-        out.push(refuse(
-            format!(
-                "which only `foce` and `focei` estimate, at `n_agq = 1`; this fit asks for \
-                 `n_agq = {}` quadrature.",
-                options.n_agq
-            ),
-            REMOVE,
-        ));
-    }
     let endpoint = if model.has_tte() {
         Some("time-to-event")
     } else if model.has_binary() {
         Some("binary")
+    } else if cfg!(feature = "markov") && model.has_discrete() {
+        // Only a DTMM (#2473) reaches here: binary was matched above.
+        Some("Markov (DTMM)")
     } else if model.has_non_gaussian() {
         Some("Markov (CTMM)")
     } else {
@@ -5977,7 +6030,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // the marginal entry points), `impmap.rs` (both the IMP/IMPMAP driver and
     // its mixture core), `bayes.rs` and `saem.rs` (`run_saem`) — stay as the backstop for callers that
     // bypass this check; rejecting here as well means `ferx check` catches it
-    // and a `methods = [focei, imp]` chain fails up front rather than after the
+    // and a `method = [focei, imp]` chain fails up front rather than after the
     // FOCEI stage has run. Note this also fail-fasts an `imp_eval_only` chain
     // whose IMP failure was previously downgraded to a warning after the fit:
     // requesting an IMP objective at n_eta = 0 is a spec contradiction better
@@ -6025,7 +6078,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // A warning, not an error, because `gn` does reach the optimum from a good
     // start. Exempt whenever a later stage re-optimises the GN result: that is
     // `gn_hybrid` (whose FOCEI polish is internal to `run_foce_gn`) but equally
-    // a hand-written `methods = [gn, focei]`, which is the same thing spelled
+    // a hand-written `method = [gn, focei]`, which is the same thing spelled
     // out — hence `is_last_estimating_stage` on the GN stage rather than a bare
     // `chain.contains`. An unconverged pure-GN run at n_eta = 0 additionally
     // pushes a post-fit warning (`gauss_newton.rs`), under the same rule, since
@@ -6083,7 +6136,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
             );
         }
         // `n_agq` is a *chain* option, not a per-stage one, so a chain that pairs VI
-        // with a quadrature stage — the documented `methods = [vi, laplace]`,
+        // with a quadrature stage — the documented `method = [vi, laplace]`,
         // `agq_eval_only = true` readout, which turns VI's ELBO lower bound into a real
         // −2 log L — legitimately carries `n_agq > 1`: the grid belongs to the Laplace
         // stage, and VI ignores it. Reject only when *no* stage consumes it, i.e. when
@@ -6099,7 +6152,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     "E_VI_NAGQ_UNSUPPORTED",
                     "n_agq applies to method = laplace / focei quadrature, not to method = vi, \
                      which integrates over its variational posterior rather than a \
-                     Gauss-Hermite grid. Remove n_agq, or chain `methods = vi, laplace`.",
+                     Gauss-Hermite grid. Remove n_agq, or chain `method = [vi, laplace]`.",
                 )
                 .with_block("fit_options"),
             );
@@ -6200,6 +6253,37 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // (default), SAEM, and IMP are supported; the Gauss-Newton gradient is Gaussian-
     // specific, and IOV is not folded into the outer FOCE-IOV objective (the generator
     // is built with BSV-only η). Reject both fail-loud rather than silently mis-fit.
+    // DTMM (#2473) has the same two gaps, with the same codes.
+    #[cfg(feature = "markov")]
+    if model.has_dtmm() {
+        if chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
+        {
+            diags.push(
+                Diagnostic::error(
+                    "E_CTMM_GN_UNSUPPORTED",
+                    "method = gn / gn_hybrid is not supported with a [markov_model] \
+                     `type = dtmm` endpoint. The Gauss-Newton gradient is built from the Gaussian \
+                     residual structure and ignores the Markov transition likelihood, so it would \
+                     not move the parameters. Use method = focei (default), saem, or imp.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if model.n_kappa > 0 {
+            diags.push(
+                Diagnostic::error(
+                    "E_CTMM_IOV_UNSUPPORTED",
+                    "a [markov_model] `type = dtmm` endpoint is not yet supported together with \
+                     inter-occasion variability ([iov] / κ): its transition probabilities are \
+                     evaluated with per-subject (BSV) η only, so κ would be ignored. Fit the DTMM \
+                     endpoint without [iov] for now.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
     #[cfg(feature = "markov")]
     if model.has_ctmm() {
         if chain
@@ -6800,7 +6884,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     "E_AGQ_EVAL_ONLY",
                     "`agq_eval_only = true` requires a `laplace` stage — it is what evaluates \
                      the adaptive-quadrature marginal likelihood. Add `laplace` to `methods` \
-                     (e.g. `methods = vi, laplace`), or drop `agq_eval_only`.",
+                     (e.g. `method = [vi, laplace]`), or drop `agq_eval_only`.",
                 )
                 .with_block("fit_options"),
             );
@@ -8115,6 +8199,9 @@ mod parameter_prior_check_tests;
 #[cfg(all(test, feature = "nn"))]
 #[path = "tests/nn_bare_output_start_tests.rs"]
 mod nn_bare_output_start_tests;
+#[cfg(all(test, feature = "nn"))]
+#[path = "tests/nn_input_scale_tests.rs"]
+mod nn_input_scale_tests;
 
 /// Reject a `prior(...)` declaration that cannot be applied (#254).
 ///
@@ -8191,7 +8278,7 @@ pub(crate) fn check_parameter_priors(
         .with_suggestion(
             "Priors are applied by the FOCE family (foce, focei, laplace, gn, gn_hybrid). \
              Use one of those as the last estimating stage — chaining is fine, e.g. \
-             `methods = [saem, focei]` — or remove the prior declarations.",
+             `method = [saem, focei]` — or remove the prior declarations.",
         )];
     }
 
@@ -9943,6 +10030,81 @@ pub(crate) fn check_nn_bare_output_start(model: &CompiledModel, theta: &[f64]) -
     diags
 }
 
+/// `W_NN_UNSCALED_INPUT` (#2549): a `[covariate_nn]` input whose values in the data reach,
+/// after the block's own `center`/`scale`, a magnitude that saturates a hidden unit by itself
+/// at the first layer's initial weight scale. With Glorot weights of scale
+/// `a = √(6 / (fan_in + fan_out))` a pre-activation past `3` puts `tanh` (and the sigmoid,
+/// twice as wide) where its derivative is below 1e-2, so an input past `3 / a` does it alone.
+/// There the layer is nearly blind to its input, and which optimum a fit reaches depends on
+/// the path to it: on `examples/warfarin_dcm.ferx` without normalisation, starts perturbed by
+/// 1e-6 ended at OFV −164 or −1173 depending only on the inner warm-start strategy. Saturating
+/// hidden activations only; one warning per block, naming every such input.
+#[cfg(feature = "nn")]
+pub(crate) fn check_nn_input_scale(
+    model: &CompiledModel,
+    population: &crate::types::Population,
+) -> Vec<Diagnostic> {
+    use crate::nn::Activation;
+    let mut diags = Vec::new();
+    for nn in &model.covariate_nns {
+        let mlp = nn.mapper.mlp();
+        let width = match mlp.hidden_activation() {
+            Activation::Tanh => 3.0,
+            Activation::Sigmoid => 6.0,
+            _ => continue,
+        };
+        let sizes = mlp.layer_sizes();
+        if sizes.len() < 3 {
+            continue;
+        }
+        let a = (6.0 / (sizes[0] + sizes[1]) as f64).sqrt();
+        let bound = width / a;
+        let (center, scale) = (nn.mapper.input_center(), nn.mapper.input_scale());
+        let mut flagged: Vec<String> = Vec::new();
+        for (i, name) in nn.mapper.input_names().iter().enumerate() {
+            // Every value the network can be handed: the subject-static covariates and each
+            // record's own snapshot (a time-varying input is read per record). A missing value
+            // (non-finite in the data) is not an input; `scale` is finite and non-zero by
+            // construction (the block is refused at parse otherwise, `NnError`), so a finite
+            // value has a finite `z`.
+            let worst = population
+                .subjects
+                .iter()
+                .flat_map(|s| {
+                    std::iter::once(&s.covariates)
+                        .chain((0..s.obs_times.len()).map(|j| s.obs_cov(j)))
+                        .chain((0..s.doses.len()).map(|k| s.dose_cov(k)))
+                        .chain((0..s.pk_only_times.len()).map(|m| s.pk_only_cov(m)))
+                })
+                .filter_map(|c| c.get(name).copied())
+                .filter(|x| x.is_finite())
+                .map(|x| ((x - center[i]) / scale[i]).abs())
+                .fold(0.0f64, f64::max);
+            if worst > bound {
+                flagged.push(format!("{name} (|z| up to {worst:.3})"));
+            }
+        }
+        if flagged.is_empty() {
+            continue;
+        }
+        diags.push(Diagnostic::warning(
+            "W_NN_UNSCALED_INPUT",
+            format!(
+                "W_NN_UNSCALED_INPUT: [covariate_nn {name}] input {list} reaches past \
+                 {bound:.3} after the block's center/scale, where one input alone saturates \
+                 a {act} unit at the first layer's initial weight scale. A saturated layer \
+                 barely learns, and which optimum the fit reaches can then depend on the path \
+                 to it. Declare `center` and `scale` in the block (the input's mean and SD, \
+                 or its range) so the inputs land within a few units of 0.",
+                name = nn.name,
+                list = flagged.join(", "),
+                act = mlp.hidden_activation().as_str(),
+            ),
+        ));
+    }
+    diags
+}
+
 /// Map a free-text parse **warning** to its check-report code.
 ///
 /// Warning sibling of [`parse_error_to_diagnostic`], and split out of
@@ -10507,6 +10669,10 @@ pub fn validate_model_file_with(
                         &population,
                         &init_params,
                     ));
+                    // A `[covariate_nn]` input the data saturate (#2549): `fit()` reports it
+                    // from the same check, so a clean `ferx check --data` and a fit agree.
+                    #[cfg(feature = "nn")]
+                    diags.extend(check_nn_input_scale(&parsed.model, &population));
                     // One informational row per nested level (#2035); `fit()` does not
                     // record it.
                     diags.extend(check_level_summary(&parsed.model, &population));

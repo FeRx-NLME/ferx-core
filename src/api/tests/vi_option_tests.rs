@@ -103,7 +103,7 @@ fn nagq_diags(opts: &FitOptions) -> Vec<Diagnostic> {
 /// `n_agq` is a chain-wide option, so a chain that pairs VI with a quadrature stage
 /// legitimately carries `n_agq > 1` — the grid belongs to that stage, and VI ignores it.
 ///
-/// This is the documented way to finish a VI fit: `methods = [vi, laplace]` with
+/// This is the documented way to finish a VI fit: `method = [vi, laplace]` with
 /// `agq_eval_only = true` turns the ELBO, which is only a lower bound, into a real
 /// `−2 log L`. Rejecting `n_agq` for the whole chain made that path impossible to ask
 /// for. The check now fires only when *no* stage consumes the option.
@@ -127,7 +127,7 @@ fn n_agq_is_accepted_when_a_quadrature_stage_consumes_it() {
     readout.agq_eval_only = true;
     assert!(
         nagq_diags(&readout).is_empty(),
-        "methods = [vi, laplace] with agq_eval_only must accept n_agq"
+        "method = [vi, laplace] with agq_eval_only must accept n_agq"
     );
 
     // An *estimating* Laplace stage consumes it just the same — `agq_eval_only` decides

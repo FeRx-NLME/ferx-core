@@ -1575,6 +1575,109 @@ mod survival_smoke {
         );
     }
 
+    /// #2569: a subject's trailing right-censored rows (DV=0 with no following DV=2)
+    /// are flushed into `obs_records` in the order the rows appear in the file. The
+    /// reader used to flush them from a `HashMap`, so causes censored at one time came
+    /// out in a different order per parse, and the competing-risks simulation — which
+    /// draws each cause's latent time in record order — was not reproducible under a
+    /// fixed seed. The file lists the causes as CMT 3, 4, 2: neither ascending nor
+    /// descending, so a "sort by CMT" flush fails here too, not only hash order. Each
+    /// subject gets a fresh map, so a hash-order flush must land on one of 3! orders
+    /// for each of 4 subjects × 30 parses: a negligible chance of passing.
+    #[test]
+    fn censored_competing_causes_keep_file_row_order_and_simulate_reproducibly() {
+        use ferx_core::api::read_population_for;
+        use ferx_core::{simulate_with_options_diag, SimOutcome, SimulateOptions};
+        const M: &str = "
+[parameters]
+  theta TVL2(0.05, 0.001, 10.0)
+  theta TVL3(0.08, 0.001, 10.0)
+  theta TVL4(0.12, 0.001, 10.0)
+
+[event_model c2]
+  cmt    = 2
+  family = exponential
+  scale  = TVL2
+
+[event_model c3]
+  cmt    = 3
+  family = exponential
+  scale  = TVL3
+
+[event_model c4]
+  cmt    = 4
+  family = exponential
+  scale  = TVL4
+
+[fit_options]
+  method = focei
+";
+        const FILE_ORDER: [usize; 3] = [3, 4, 2];
+        let model = parse_model_string(M).expect("three-cause model parses");
+        let mut csv = String::from("ID,TIME,DV,EVID,CMT\n");
+        for id in 1..=4 {
+            for cmt in FILE_ORDER {
+                csv.push_str(&format!("{id},10,0,0,{cmt}\n"));
+            }
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("three_causes_censored.csv");
+        std::fs::write(&path, csv).expect("write csv");
+        let path = path.to_str().expect("utf-8 path");
+        let opts = SimulateOptions {
+            seed: Some(2569),
+            match_method: None,
+            horizon: Some(10.0),
+            iov_occasion: None,
+        };
+
+        let mut first: Option<Vec<(String, usize, u64, bool)>> = None;
+        for parse in 0..30 {
+            let (pop, _) = read_population_for(&model, &None, path, None, None, None, &[])
+                .expect("three-cause csv loads");
+            for s in &pop.subjects {
+                let order: Vec<usize> = s
+                    .obs_records
+                    .iter()
+                    .map(|r| match r {
+                        ObsRecord::Event {
+                            cmt,
+                            event_type: EventType::RightCensored,
+                            ..
+                        } => *cmt,
+                        other => panic!("expected a right-censored Event, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    order, FILE_ORDER,
+                    "parse {parse}, subject {}: censored records must keep file-row order",
+                    s.id
+                );
+            }
+            let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &opts)
+                .expect("three-cause simulate succeeds");
+            let rows: Vec<(String, usize, u64, bool)> = out
+                .results
+                .iter()
+                .map(|r| match r.outcome {
+                    SimOutcome::Event { time, observed } => {
+                        assert!(time.is_finite(), "simulated time must be finite");
+                        (r.id.clone(), r.cmt, time.to_bits(), observed)
+                    }
+                    _ => panic!("expected an Event outcome"),
+                })
+                .collect();
+            assert_eq!(rows.len(), 12, "one row per cause per subject");
+            match &first {
+                None => first = Some(rows),
+                Some(f) => assert_eq!(
+                    &rows, f,
+                    "parse {parse}: a fixed-seed simulation must be bit-identical across parses"
+                ),
+            }
+        }
+    }
+
     /// Re-simulating a competing-risks subject that already has an observed event
     /// (an `Exact` record, the sibling cause `RightCensored` at the same time)
     /// must NOT truncate the fresh draw at that original event time: an event

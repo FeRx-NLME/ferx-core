@@ -91,6 +91,45 @@ pub(crate) struct ScaledLoading {
     pub c2: f64,
 }
 
+/// An observation's sigma loadings, inline: no error model loads more than two slots
+/// (`combined`), and these are built per observation per objective evaluation, where a
+/// `Vec` each was a heap allocation on the inner loop's hot path (#1564). Derefs to the
+/// slice of its first `len` items; consumed by value it yields them in order.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Loads<T: Copy> {
+    len: usize,
+    items: [T; 2],
+}
+
+impl<T: Copy> Loads<T> {
+    fn empty(fill: T) -> Self {
+        Loads {
+            len: 0,
+            items: [fill; 2],
+        }
+    }
+
+    fn push(&mut self, x: T) {
+        self.items[self.len] = x;
+        self.len += 1;
+    }
+}
+
+impl<T: Copy> std::ops::Deref for Loads<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.items[..self.len]
+    }
+}
+
+impl<T: Copy> IntoIterator for Loads<T> {
+    type Item = T;
+    type IntoIter = std::iter::Take<std::array::IntoIter<T, 2>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter().take(self.len)
+    }
+}
+
 /// Compute residual variance for a single observation
 /// sigma_values: `[sigma1]` for additive/proportional, `[sigma1, sigma2]` for combined
 ///
@@ -146,63 +185,7 @@ impl ErrorSpec {
     /// sigma covariance matrix yields the scalar variance on the diagonal and
     /// the cross-observation covariance off diagonal.
     pub fn sigma_loadings(&self, cmt: usize, f: f64, n_sigma: usize) -> Vec<(usize, f64)> {
-        match self {
-            ErrorSpec::Single(em) => match em {
-                ErrorModel::Additive => {
-                    if n_sigma > 0 {
-                        vec![(0, 1.0)]
-                    } else {
-                        Vec::new()
-                    }
-                }
-                ErrorModel::Proportional => {
-                    if n_sigma > 0 {
-                        vec![(0, f)]
-                    } else {
-                        Vec::new()
-                    }
-                }
-                ErrorModel::Combined => {
-                    let mut out = Vec::with_capacity(2);
-                    if n_sigma > 0 {
-                        out.push((0, f));
-                    }
-                    if n_sigma > 1 {
-                        out.push((1, 1.0));
-                    }
-                    out
-                }
-            },
-            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
-                match map.get(&cmt) {
-                    Some(ep) => match ep.error_model {
-                        ErrorModel::Additive => ep
-                            .sigma_idx
-                            .first()
-                            .copied()
-                            .map(|i| vec![(i, 1.0)])
-                            .unwrap_or_default(),
-                        ErrorModel::Proportional => ep
-                            .sigma_idx
-                            .first()
-                            .copied()
-                            .map(|i| vec![(i, f)])
-                            .unwrap_or_default(),
-                        ErrorModel::Combined => {
-                            let mut out = Vec::with_capacity(2);
-                            if let Some(&i) = ep.sigma_idx.first() {
-                                out.push((i, f));
-                            }
-                            if let Some(&i) = ep.sigma_idx.get(1) {
-                                out.push((i, 1.0));
-                            }
-                            out
-                        }
-                    },
-                    None => Vec::new(),
-                }
-            }
-        }
+        self.sigma_loadings_inline(cmt, f, n_sigma).to_vec()
     }
 
     /// `∂(sigma loading coefficient)/∂f` for each slot an observation loads on,
@@ -217,63 +200,90 @@ impl ErrorSpec {
     /// these slopes — the off-diagonal `R` is linear in each observation's
     /// loadings, so `∂R_jk/∂f_j = cross(slopes_j, values_k)`.
     pub fn sigma_loading_slopes(&self, cmt: usize, n_sigma: usize) -> Vec<(usize, f64)> {
+        self.sigma_loading_slopes_inline(cmt, n_sigma).to_vec()
+    }
+
+    /// The slots an observation with key `cmt` loads on, in [`Self::sigma_loadings`]'s
+    /// order, each `true` when it is the proportional one (loading `f`, slope `1`) and
+    /// `false` when additive (loading `1`, slope `0`). The one shape both
+    /// [`Self::sigma_loadings`] and [`Self::sigma_loading_slopes`] read, without a heap
+    /// allocation.
+    fn loading_shape(&self, cmt: usize, n_sigma: usize) -> Loads<(usize, bool)> {
+        let mut out = Loads::empty((0, false));
         match self {
             ErrorSpec::Single(em) => match em {
                 ErrorModel::Additive => {
                     if n_sigma > 0 {
-                        vec![(0, 0.0)]
-                    } else {
-                        Vec::new()
+                        out.push((0, false));
                     }
                 }
                 ErrorModel::Proportional => {
                     if n_sigma > 0 {
-                        vec![(0, 1.0)]
-                    } else {
-                        Vec::new()
+                        out.push((0, true));
                     }
                 }
                 ErrorModel::Combined => {
-                    let mut out = Vec::with_capacity(2);
                     if n_sigma > 0 {
-                        out.push((0, 1.0));
+                        out.push((0, true));
                     }
                     if n_sigma > 1 {
-                        out.push((1, 0.0));
+                        out.push((1, false));
                     }
-                    out
                 }
             },
             ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
-                match map.get(&cmt) {
-                    Some(ep) => match ep.error_model {
-                        ErrorModel::Additive => ep
-                            .sigma_idx
-                            .first()
-                            .copied()
-                            .map(|i| vec![(i, 0.0)])
-                            .unwrap_or_default(),
-                        ErrorModel::Proportional => ep
-                            .sigma_idx
-                            .first()
-                            .copied()
-                            .map(|i| vec![(i, 1.0)])
-                            .unwrap_or_default(),
-                        ErrorModel::Combined => {
-                            let mut out = Vec::with_capacity(2);
+                if let Some(ep) = map.get(&cmt) {
+                    match ep.error_model {
+                        ErrorModel::Additive => {
                             if let Some(&i) = ep.sigma_idx.first() {
-                                out.push((i, 1.0));
+                                out.push((i, false));
+                            }
+                        }
+                        ErrorModel::Proportional => {
+                            if let Some(&i) = ep.sigma_idx.first() {
+                                out.push((i, true));
+                            }
+                        }
+                        ErrorModel::Combined => {
+                            if let Some(&i) = ep.sigma_idx.first() {
+                                out.push((i, true));
                             }
                             if let Some(&i) = ep.sigma_idx.get(1) {
-                                out.push((i, 0.0));
+                                out.push((i, false));
                             }
-                            out
                         }
-                    },
-                    None => Vec::new(),
+                    }
                 }
             }
         }
+        out
+    }
+
+    /// [`Self::sigma_loadings`], inline.
+    pub(crate) fn sigma_loadings_inline(
+        &self,
+        cmt: usize,
+        f: f64,
+        n_sigma: usize,
+    ) -> Loads<(usize, f64)> {
+        let mut out = Loads::empty((0, 0.0));
+        for (i, prop) in self.loading_shape(cmt, n_sigma) {
+            out.push((i, if prop { f } else { 1.0 }));
+        }
+        out
+    }
+
+    /// [`Self::sigma_loading_slopes`], inline.
+    pub(crate) fn sigma_loading_slopes_inline(
+        &self,
+        cmt: usize,
+        n_sigma: usize,
+    ) -> Loads<(usize, f64)> {
+        let mut out = Loads::empty((0, 0.0));
+        for (i, prop) in self.loading_shape(cmt, n_sigma) {
+            out.push((i, if prop { 1.0 } else { 0.0 }));
+        }
+        out
     }
 
     /// The loading shape of an observation with key `cmt`: per slot `(slot, c₀, slope)`, the
@@ -369,11 +379,10 @@ impl ErrorSpec {
         correlations: &[ResidualCorrelation],
         mult: &[f64],
     ) -> f64 {
-        let loadings: Vec<(usize, f64)> = self
-            .scaled_loadings(cmt, f_pred, sigma.len(), mult)
-            .into_iter()
-            .map(|l| (l.idx, l.c))
-            .collect();
+        let mut loadings = Loads::empty((0, 0.0));
+        for l in self.scaled_loadings(cmt, f_pred, sigma.len(), mult) {
+            loadings.push((l.idx, l.c));
+        }
         loadings_variance_g(&loadings, sigma, correlations, |k| correlations[k].rho)
     }
 
@@ -387,11 +396,10 @@ impl ErrorSpec {
         correlations: &[ResidualCorrelation],
         mult: &[f64],
     ) -> f64 {
-        let loadings: Vec<(usize, f64)> = self
-            .scaled_loadings(cmt, f_pred, sigma.len(), mult)
-            .into_iter()
-            .map(|l| (l.idx, l.c))
-            .collect();
+        let mut loadings = Loads::empty((0, 0.0));
+        for l in self.scaled_loadings(cmt, f_pred, sigma.len(), mult) {
+            loadings.push((l.idx, l.c));
+        }
         loadings_variance_raw_g(&loadings, sigma, correlations, |k| correlations[k].rho)
     }
 
@@ -409,43 +417,49 @@ impl ErrorSpec {
         f: f64,
         n_sigma: usize,
         mult: &[f64],
-    ) -> Vec<ScaledLoading> {
-        let loadings = self.sigma_loadings(cmt, f, n_sigma);
-        let slopes = self.sigma_loading_slopes(cmt, n_sigma);
-        loadings
-            .into_iter()
-            .map(|(idx, coeff)| {
-                let m = mult.get(idx).copied().unwrap_or(1.0);
-                let slope = slopes
-                    .iter()
-                    .find(|(i, _)| *i == idx)
-                    .map(|(_, s)| *s)
-                    .unwrap_or(0.0);
-                // Only a proportional-type loading (slope ≠ 0) is raised to a
-                // power; an additive slot's constant loading ignores its
-                // exponent entry.
-                match (slope != 0.0)
-                    .then(|| slot_exponent(mult, n_sigma, idx))
-                    .flatten()
-                {
-                    Some(p) if p != 1.0 => {
-                        let (g, g1, g2) = power_loading(f, p);
-                        ScaledLoading {
-                            idx,
-                            c: m * g,
-                            c1: m * g1,
-                            c2: m * g2,
-                        }
-                    }
-                    _ => ScaledLoading {
+    ) -> Loads<ScaledLoading> {
+        let loadings = self.sigma_loadings_inline(cmt, f, n_sigma);
+        let slopes = self.sigma_loading_slopes_inline(cmt, n_sigma);
+        let mut out = Loads::empty(ScaledLoading {
+            idx: 0,
+            c: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+        });
+        for l in loadings.into_iter().map(|(idx, coeff)| {
+            let m = mult.get(idx).copied().unwrap_or(1.0);
+            let slope = slopes
+                .iter()
+                .find(|(i, _)| *i == idx)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0);
+            // Only a proportional-type loading (slope ≠ 0) is raised to a
+            // power; an additive slot's constant loading ignores its
+            // exponent entry.
+            match (slope != 0.0)
+                .then(|| slot_exponent(mult, n_sigma, idx))
+                .flatten()
+            {
+                Some(p) if p != 1.0 => {
+                    let (g, g1, g2) = power_loading(f, p);
+                    ScaledLoading {
                         idx,
-                        c: coeff * m,
-                        c1: slope * m,
-                        c2: 0.0,
-                    },
+                        c: m * g,
+                        c1: m * g1,
+                        c2: m * g2,
+                    }
                 }
-            })
-            .collect()
+                _ => ScaledLoading {
+                    idx,
+                    c: coeff * m,
+                    c1: slope * m,
+                    c2: 0.0,
+                },
+            }
+        }) {
+            out.push(l);
+        }
+        out
     }
 
     /// The `power(...)` exponent of this observation's proportional slot, when
@@ -454,7 +468,7 @@ impl ErrorSpec {
         let slot = self.prop_sigma_slot(cmt)?;
         // `prop_sigma_slot` is `Some(0)` for an additive `Single` too; only a
         // slot whose loading actually slopes in `f` is raised to a power.
-        let slopes = self.sigma_loading_slopes(cmt, n_sigma);
+        let slopes = self.sigma_loading_slopes_inline(cmt, n_sigma);
         let slopes_in_f = slopes.iter().any(|&(i, s)| i == slot && s != 0.0);
         if !slopes_in_f {
             return None;
@@ -2146,7 +2160,11 @@ fn value_slope_loadings(
     };
     let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
     let scaled: Vec<Vec<ScaledLoading>> = (0..n)
-        .map(|j| error_spec.scaled_loadings(cmt_at(j), ipreds[j], sigma_values.len(), mrow(j)))
+        .map(|j| {
+            error_spec
+                .scaled_loadings(cmt_at(j), ipreds[j], sigma_values.len(), mrow(j))
+                .to_vec()
+        })
         .collect();
     let vload: Vec<Vec<(usize, f64)>> = scaled
         .iter()

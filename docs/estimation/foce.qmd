@@ -484,7 +484,7 @@ ends in Bayesian estimation, which reports posterior credible intervals instead 
 Hessian standard errors and runs no covariance step, so it has no effect.
 ```
 
-Where the Bayes stage falls in the chain is what decides this, not its presence: `methods = [bayes, focei]` ends on FOCEI, which runs the step and consumes every one of those keys, so no notice is issued. `methods = [focei, bayes]` does not.
+Where the Bayes stage falls in the chain is what decides this, not its presence: `method = [bayes, focei]` ends on FOCEI, which runs the step and consumes every one of those keys, so no notice is issued. `method = [focei, bayes]` does not.
 
 Every other estimator — FOCE, FOCEI, Laplace/AGQ, `gn`, `gn_hybrid`, SAEM, IMP, IMPMAP, VI — runs the covariance step and honours all six keys. They are framework-level for that reason, rather than listed per method ([#956](https://github.com/FeRx-NLME/ferx-core/issues/956)).
 
@@ -665,7 +665,7 @@ Whichever population it runs on, `run_covariance` prepares it the way `fit()` di
 
 #### Which settings `run_covariance` uses
 
-Every fit records, in `FitResult::scoring_settings` ([#426](https://github.com/FeRx-NLME/ferx-core/issues/426)), the settings of the stage that produced the estimates (and ran the inline covariance step): `inner_maxiter`, `inner_tol`, `inner_restarts`, `mu_referencing`, `n_agq`, `inner_optimizer`, `ebe_warm_start`, `gradient_method` and the six `ode_*` solver settings. `gradient_method` is `fd` whenever the fit ran on finite differences (the model file's `gradient = fd`, `FitOptions::gradient_method = Fd`, or an SDE model), so `run_covariance` with default options keeps the finite-difference R-matrix stencil the fit's own step used, also on a fit reloaded from a `.fitrx`; a passed `fd` still forces it on an analytic fit ([#1835](https://github.com/FeRx-NLME/ferx-core/issues/1835)). On a `methods = [..]` chain that is the last stage that estimates, with its own `inner_tol` (an estimating Laplace stage tightens it to 1e-8). A trailing evaluator (`agq_eval_only`, `imp_eval_only`) does not write it, though the reported OFV may be that evaluator's. `run_covariance` takes each of these from the record **wherever the passed options hold the default value**, and the passed value otherwise, so `run_covariance(&fit, None, None, &FitOptions::default())` reconverges the EBEs as the inline step did and reproduces a fit that pinned, say, `inner_optimizer = lbfgs`. No other fit in the process can change them. The test is by value, as in [`run_sir`](sir.qmd#which-settings-run_sir-uses): **an explicit default cannot override a non-default record** (`inner_optimizer = auto` on a fit recorded `lbfgs` runs `lbfgs`). To force a default, edit `fit.scoring_settings` or set it to `None` first. A fit loaded from a `.fitrx` saved before #426 has no record; it falls back to the SIR record's scoring half when SIR ran, else uses the passed options as given. An override of `inner_maxiter`, `inner_tol` or `inner_restarts` does not change the EBEs the step starts from, which are the fit's own (see above, #2026). It changes how the EBEs are reconverged at each finite-difference point, and so the `r` matrix, but `s` and `rsr` still take their scores at the fit's EBEs.
+Every fit records, in `FitResult::scoring_settings` ([#426](https://github.com/FeRx-NLME/ferx-core/issues/426)), the settings of the stage that produced the estimates (and ran the inline covariance step): `inner_maxiter`, `inner_tol`, `inner_restarts`, `mu_referencing`, `n_agq`, `inner_optimizer`, `ebe_warm_start`, `gradient_method` and the six `ode_*` solver settings. `gradient_method` is `fd` whenever the fit ran on finite differences (the model file's `gradient = fd`, `FitOptions::gradient_method = Fd`, or an SDE model), so `run_covariance` with default options keeps the finite-difference R-matrix stencil the fit's own step used, also on a fit reloaded from a `.fitrx`; a passed `fd` still forces it on an analytic fit ([#1835](https://github.com/FeRx-NLME/ferx-core/issues/1835)). On a `method = [..]` chain that is the last stage that estimates, with its own `inner_tol` (an estimating Laplace stage tightens it to 1e-8). A trailing evaluator (`agq_eval_only`, `imp_eval_only`) does not write it, though the reported OFV may be that evaluator's. `run_covariance` takes each of these from the record **wherever the passed options hold the default value**, and the passed value otherwise, so `run_covariance(&fit, None, None, &FitOptions::default())` reconverges the EBEs as the inline step did and reproduces a fit that pinned, say, `inner_optimizer = lbfgs`. No other fit in the process can change them. The test is by value, as in [`run_sir`](sir.qmd#which-settings-run_sir-uses): **an explicit default cannot override a non-default record** (`inner_optimizer = auto` on a fit recorded `lbfgs` runs `lbfgs`). To force a default, edit `fit.scoring_settings` or set it to `None` first. A fit loaded from a `.fitrx` saved before #426 has no record; it falls back to the SIR record's scoring half when SIR ran, else uses the passed options as given. An override of `inner_maxiter`, `inner_tol` or `inner_restarts` does not change the EBEs the step starts from, which are the fit's own (see above, #2026). It changes how the EBEs are reconverged at each finite-difference point, and so the `r` matrix, but `s` and `rsr` still take their scores at the fit's EBEs.
 
 The settings that define the covariance *step* rather than the objective (`covariance_method`, `fd_hessian_step`, `analytic_cov_hessian`, `cov_inner_tol`) are not recorded and are always the passed ones: on a fit that ran a non-default `covariance_method`, default options compute the default step, a different step rather than a wrong one.
 
@@ -912,6 +912,62 @@ which is the honest verdict for a fit handed its own optimum.
 The inner loop warm-starts EBE estimation from the previous outer iteration's EBEs. This significantly reduces computation time, especially in later iterations when parameters change slowly.
 
 The warm start is taken from the **best point seen so far**, not from whatever the optimizer evaluated last ([#1290](https://github.com/FeRx-NLME/ferx-core/issues/1290)). That distinction matters because the individual objective can be multimodal: a trial step the line search is about to reject may land somewhere the inner loop solves into a different, worse basin, and if those EBEs were carried forward, every later evaluation would inherit them. The starting point would then re-evaluate *worse* than it did a moment earlier — an objective that moves under the optimizer's feet, which no line search can descend. Anchoring the warm start to the incumbent keeps the objective at the incumbent reproducible; evaluations that do not improve on it leave the cache untouched.
+
+### Predicted warm starts {#predicted-warm-starts}
+
+A step of the outer optimizer moves every subject's mode, and an inner solve started at the
+incumbent's EBEs stops on the old mode's side of the new one, a tolerance away. That error is
+not noise: it moves with the step, and the quasi-Newton update reads it as curvature of the
+objective. So under FOCE and FOCEI each evaluation starts its inner solves at the modes
+*predicted* for its own point, $\hat\eta^{0} = \hat\eta + (d\hat\eta/dx)(x - x_0)$
+(Almquist et al. 2015, Eq. 48), with $x_0$ the incumbent
+([#2549](https://github.com/FeRx-NLME/ferx-core/issues/2549)).
+
+The mode response $d\hat\eta/dx = -H^{-1}\,\partial(\nabla_\eta l)/\partial x$ is exact,
+and it comes from the outer gradient's own recording: one more sweep per random effect, formed
+only on the evaluations that become the incumbent, whose modes the next evaluation starts
+from. The prediction is a start, not an answer: every subject is still solved to `inner_tol`.
+The prediction is taken whole: $d\hat\eta/dx$ is the mode's exact derivative (the implicit
+function theorem), so the start is accurate to second order in the outer step and the inner
+solve corrects the rest. No bound on the step is applied: each bound that was measured lost
+outer iterations on some model: a cap of two prior standard deviations, damping by the Newton
+decrement (which measures how far the mode moves, not how wrong its prediction is), and
+choosing per evaluation between the predicted start and the previous mode, which breaks the
+start's smooth dependence on the parameters, the smoothness the predictor exists to give the
+outer optimizer.
+
+A long line-search trial can extrapolate a subject's start far from its mode; the inner
+search walks back on its own (from $\eta = \pm 1000$ on a warfarin subject it returns the
+solve from the mode to $10^{-13}$). Only a start at which the objective is undefined (not
+finite, or on the sentinel it maps an undefined point to) starts at the previous mode
+instead, and a solve that ends there is retried from it. Both are triggered by the
+objective, not by the size of the step, so neither touches a working prediction. A subject
+the adjoint declines, or one with no data, is predicted not to move.
+
+On the FOCE/FOCEI benchmark fits the outer iterations fell by up to 60% at the same optimum
+(`mm` 166 → 67, `ctmm_pd_2state` 173 → 77, `pktte_joint` 110 → 46, `pk1` 51 → 31, `pk2_big`
+98 → 71).
+
+The predictor serves models without IOV, `[mixture]` or `[covariate_nn]` whose outer gradient
+is the analytic one, under the NLopt optimizers and the built-in `bfgs`/`lbfgs` alike. A covariate network is left out because there it costs time and saves
+none: on the DCM with normalised inputs, from ten perturbed starts each way, it reached
+optima of the same quality (median OFV −1452 against −1483 without it, better on five of
+the ten starts), but the fits ran to the iteration cap with or without it, so the response
+through the network's weights only added cost: 1.4× the wall time. Those fits are limited
+by the multimodal weight landscape, not by how closely the inner modes track the outer
+step, which is the error the predictor removes. On saturating units the path also decides which
+optimum a fit reaches, which is why a network's inner solves are not seeded either. Under IOV a subject's κ̂ is not predicted; its warm inner solve is instead seeded with
+the stacked Gauss–Newton metric, as a BSV solve is; a cold start stays unseeded, because
+the metric's full first step [selects the basin](../model-file/fit-options.qmd#escaping-a-multimodal-individual-objective).
+Under Laplace and AGQ the predictor is left out, on measurement. The quadrature is
+centred on the same conditional mode, so its mode response is FOCEI's: the exact inner
+Hessian $\nabla^2_\eta l$, not the Gauss–Newton $\tilde H$ that places the nodes under
+the FOCEI anchor. It is formed from the quadrature's own tape and equals FOCEI's to rounding.
+But the predicted start left every quadrature fit's outer iteration count unchanged (20–21
+either way), so it saves inner work only. The inner pass is about 10–15% of a quadrature
+fit, whose cost is its gradient tape, and the response costs one more sweep of that tape
+per random effect. On `pk1` the fits came out 0.98 (Laplace), 0.91 and 0.84 (AGQ-3,
+Gauss–Newton and exact anchor) and 0.82–1.02 on the ODE twins.
 
 ### The final inner loop {#final-inner-loop}
 

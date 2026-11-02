@@ -145,7 +145,7 @@ pub struct DoseEvent {
 /// the `TIME` and `OCC` `$PK` sees — from the **governing** record, the first record at
 /// or after the dose in (`TIME`, file order). The reader stores the governing record's
 /// covariates and `OCC` in the dose's own `Subject::dose_covariates` /
-/// `Subject::dose_occasions` entries, and the two fields here.
+/// `Subject::dose_occasions` entries, and the fields here.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ImpliedDose {
     /// Index in `Subject::doses` of the explicit dose whose `ADDL` implies this one. It
@@ -153,6 +153,11 @@ pub(crate) struct ImpliedDose {
     pub(crate) parent: usize,
     /// The `TIME` as written of the governing record.
     pub(crate) param_time: f64,
+    /// The engine time of the governing record as the subject holds it — after the reader's
+    /// one-ULP record-order moves (#614, #1810) — or the parent's when nothing governs the
+    /// dose. The adaptive path picks the dose's occasion (decision window) here, as the
+    /// static path takes the governing record's `OCC` (#2371).
+    pub(crate) gov_time: f64,
 }
 
 /// The derived rendering minus `evid4` and `implied`: ferx-tools' search journal hashes
@@ -1354,6 +1359,14 @@ impl Subject {
             Some(i) => i.param_time,
             None => self.param_time_at(d.time),
         }
+    }
+
+    /// The engine time whose occasion (decision window) dose `k` runs under on the adaptive
+    /// path: its own, or for an `ADDL`-implied dose the governing record's (#2371,
+    /// [`ImpliedDose::gov_time`]), as [`Self::dose_param_time`] reads that record's `TIME`.
+    pub(crate) fn dose_occasion_time(&self, k: usize) -> f64 {
+        let d = &self.doses[k];
+        d.implied.map_or(d.time, |i| i.gov_time)
     }
 
     /// The explicit dose whose `ADDL` implies dose `k` (#1909), whose `$PK` gives `k`
@@ -4196,6 +4209,15 @@ pub type GeneratorFn = Box<
     dyn Fn(&[f64], &[f64], &HashMap<String, f64>, &[f64]) -> nalgebra::DMatrix<f64> + Send + Sync,
 >;
 
+#[cfg(feature = "markov")]
+/// Closure evaluating every declared DTMM transition probability `P_jk(θ, η, covariates)`
+/// at one record, in the order of the endpoint's
+/// [`transitions`](EndpointLikelihood::Dtmm::transitions) list. Called under the record's
+/// model-time scope, so a `TIME` term in an expression reads that record's time. The stay
+/// probabilities are not returned — the endpoint fills `P_jj = 1 − Σ_{k≠j} P_jk`.
+pub type TransitionProbFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> Vec<f64> + Send + Sync>;
+
 #[cfg(feature = "survival")]
 /// Per-CMT endpoint likelihood specification.
 pub enum EndpointLikelihood {
@@ -4297,7 +4319,45 @@ pub enum EndpointLikelihood {
         /// argument through this map.
         generator_states: Vec<(String, usize)>,
     },
-    // Ordinal, Poisson, NegBin, Dtmm deferred to Phase 4/4b
+    /// Discrete-time Markov model (DTMM) endpoint (Phase 4b, #2473) — the discrete state
+    /// `s ∈ {0..S−1}` is observed via [`ObsRecord::DiscreteState`], and the probability of
+    /// the state at scored record `k` depends on the state observed at record `k−1`:
+    /// the per-subject data term is `−Σ_{k≥1} log P_k[s_{k−1}, s_k]`, the NONMEM
+    /// `PREVIOUS`-DV `$PRED` likelihood. The subject's first scored record is conditioned
+    /// on (it contributes nothing). `P_k` is a **per-record** transition-probability
+    /// matrix, not a function of `Δt`: the `[markov_model] transition` expressions are
+    /// the off-diagonal probabilities `P_jk`, evaluated at record `k` (its `TIME` and its
+    /// covariates), and the stay probability `P_jj = 1 − Σ_{k≠j} P_jk` is filled in. A
+    /// probability that reads an ODE model state (a drug-driven DTMM) is refused at parse.
+    /// Gated behind `markov`.
+    #[cfg(feature = "markov")]
+    Dtmm {
+        /// Number of states `S`.
+        n_states: usize,
+        /// Data DV code per state, indexed by 0-based state index — as
+        /// [`Self::Ctmm`]'s `state_codes`.
+        state_codes: Vec<usize>,
+        /// `(from, to)` state indices of each declared off-diagonal transition, parallel
+        /// to the outputs of [`prob_fn`](Self::Dtmm::prob_fn) (and of `prob_program`).
+        /// `from != to`, pairs unique (checked at parse).
+        transitions: Vec<(usize, usize)>,
+        /// Evaluates every declared transition probability at one record — see
+        /// [`TransitionProbFn`].
+        prob_fn: TransitionProbFn,
+        /// Resolved, dual-evaluable form of the same probabilities (one output per
+        /// transition), for the **analytic** inner gradient: `∂P_jk/∂(θ,η)` exactly,
+        /// chained through `∂(−log P)/∂P` instead of finite-differencing the data term.
+        /// `None` — and the endpoint keeps its FD gradient — when an expression cannot be
+        /// represented exactly or the `(θ, η)` width is past the dual dispatch cap.
+        prob_program: Option<crate::parser::model_parser::EndpointExprProgram>,
+        /// Covariate names referenced by any transition probability (including those
+        /// reached through `[individual_parameters]`). Read at the **record being scored**,
+        /// from the reader's per-row snapshot (`Subject::endpoint_covariates`); a subject
+        /// whose snapshot cannot be aligned with its records while one of these varies is
+        /// refused at fit setup by `crate::api::check_survival_tv_covariates` (#741).
+        prob_covariates: Vec<String>,
+    },
+    // Ordinal, Poisson, NegBin deferred to Phase 4
 }
 
 #[cfg(feature = "survival")]
@@ -4317,6 +4377,16 @@ impl std::fmt::Debug for EndpointLikelihood {
                 state_codes,
                 ..
             } => write!(f, "Ctmm(n_states={n_states}, codes={state_codes:?})"),
+            #[cfg(feature = "markov")]
+            EndpointLikelihood::Dtmm {
+                n_states,
+                state_codes,
+                transitions,
+                ..
+            } => write!(
+                f,
+                "Dtmm(n_states={n_states}, codes={state_codes:?}, transitions={transitions:?})"
+            ),
         }
     }
 }
@@ -5437,6 +5507,28 @@ impl CompiledModel {
             .any(|e| matches!(e, EndpointLikelihood::Ctmm { .. }))
     }
 
+    /// True if any endpoint is a [`Dtmm`](EndpointLikelihood::Dtmm) (discrete-time Markov)
+    /// endpoint — Phase 4b (#2473).
+    #[cfg(feature = "markov")]
+    pub fn has_dtmm(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Dtmm { .. }))
+    }
+
+    /// CMTs routed to a `Dtmm` endpoint, sorted ascending. Like [`Self::ctmm_cmts`], these
+    /// rows route to [`ObsRecord::DiscreteState`].
+    #[cfg(feature = "markov")]
+    pub fn dtmm_cmts(&self) -> Vec<usize> {
+        let mut c: Vec<usize> = self
+            .endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| matches!(ep, EndpointLikelihood::Dtmm { .. }).then_some(*cmt))
+            .collect();
+        c.sort_unstable();
+        c
+    }
+
     /// CMTs routed to a `Ctmm` endpoint, sorted ascending. The datareader routes
     /// these rows to [`ObsRecord::DiscreteState`] via `ObsRouting.discrete`, the
     /// same discrete-state plumbing the `Binary` endpoint uses.
@@ -5451,17 +5543,21 @@ impl CompiledModel {
         c
     }
 
-    /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint — the
-    /// binary / Bernoulli family today; ordinal / Poisson / negative-binomial extend this
+    /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint scored
+    /// by `discrete_subject_nll` — the binary / Bernoulli family and the discrete-time
+    /// Markov (DTMM, #2473) endpoint; ordinal / Poisson / negative-binomial extend this
     /// match. This is the family-agnostic gate for the discrete data term and its η-Hessian
     /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
-    /// without editing a likelihood dispatch site. Equals [`has_binary`](Self::has_binary)
-    /// today.
+    /// without editing a likelihood dispatch site. (The CTMM is not in it: it has its own
+    /// `ctmm_subject_nll` dispatch.)
     #[cfg(feature = "survival")]
     pub fn has_discrete(&self) -> bool {
-        self.endpoints
-            .values()
-            .any(|e| matches!(e, EndpointLikelihood::Binary { .. }))
+        self.endpoints.values().any(|e| match e {
+            EndpointLikelihood::Binary { .. } => true,
+            #[cfg(feature = "markov")]
+            EndpointLikelihood::Dtmm { .. } => true,
+            _ => false,
+        })
     }
 
     /// True if the model carries **any non-Gaussian endpoint** (TTE/RTTE, the
@@ -6524,7 +6620,7 @@ pub enum KappaTreatment {
 
 /// Result of the importance-sampling marginal log-likelihood step.
 ///
-/// Produced by the `Imp` stage in a method chain (`methods = [..., imp]`).
+/// Produced by the `Imp` stage in a method chain (`method = [..., imp]`).
 /// Surfaced on `FitResult.importance_sampling`.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ImportanceSamplingResult {
@@ -6620,7 +6716,7 @@ pub struct PosteriorSummary {
 /// the same variational family, and **not** comparable with a FOCE/FOCEI/SAEM
 /// OFV, with a `−2 log L`, or across families — a richer family raises the bound
 /// without the model fitting any better. Use [`FitOptions::vi_final_ofv`], or a
-/// `methods = vi, imp` chain, to obtain a genuine marginal likelihood.
+/// `method = [vi, imp]` chain, to obtain a genuine marginal likelihood.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[non_exhaustive]
 pub struct ViResult {
@@ -6720,10 +6816,10 @@ pub struct ViResult {
     /// The label of the later **estimating** stage that moved `(θ, Ω, σ)` after this VI
     /// stage ran, or `None` when nothing did.
     ///
-    /// A VI result survives the rest of a chain because `methods = [vi, laplace]` with
+    /// A VI result survives the rest of a chain because `method = [vi, laplace]` with
     /// `agq_eval_only` — a pure readout — is the recommended way to finish a VI fit, and
     /// dropping it there would discard the object exactly when it was produced correctly.
-    /// But `methods = [vi, focei]` re-estimates: the `FitResult`'s θ/Ω/σ and subject
+    /// But `method = [vi, focei]` re-estimates: the `FitResult`'s θ/Ω/σ and subject
     /// diagnostics then come from FOCEI, while everything here — `eta_means`, `eta_covs`,
     /// both ELBO halves and `elbo_tightness_ratio` — still describes the *pre-FOCEI*
     /// parameter point. That is a legitimate thing to report, but not without saying so.
@@ -7200,6 +7296,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
         )
+    } else if lower.starts_with("w_tte_solve_failed") {
+        // #2087: a simulated subject's ODE-accumulated event-time solve failed and the
+        // subject was censored. Ahead of every prose arm for the reason the arm above gives:
+        // the message interpolates the ODE solver's own failure text ("step budget",
+        // "non-finite", "stability-limited", "singular Jacobian", …), which prose arms below
+        // would claim as an estimation or solver-health problem.
+        (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("w_degenerate_cl_v") {
         // #2104: a non-positive or non-finite CL / V at the final estimates. A token arm ahead
         // of the generic "degenerate" → optimizer-health prose arm, which its wording would
@@ -7289,10 +7392,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // produced. Matched on its token, ahead of the prose arms: both forms say "covariance
         // step" and "not positive definite", which the `CovarianceFailed` prose arm below would
         // otherwise claim for the success form too.
+        //
+        // #2541 adds a third form: `R` was positive definite and returned, but the gradient
+        // says the estimate is not stationary. Nothing was floored or replaced, so it is a
+        // warning on the covariance route like `w_cov_quadrature_declined`, not
+        // `CovarianceRegularized`. Only the two #1781 forms say "eigenvalue floor".
         if lower.contains("covariance step failed") {
             (WarningSeverity::Critical, WarningCode::CovarianceFailed)
-        } else {
+        } else if lower.contains("eigenvalue floor") {
             (WarningSeverity::Warning, WarningCode::CovarianceRegularized)
+        } else {
+            (WarningSeverity::Warning, WarningCode::CovarianceStep)
         }
     } else if lower.contains("w_cov_quadrature_objective") {
         // #1781: a SAEM / IMP / IMPMAP estimate on a non-Gaussian model had its R and S taken
@@ -7785,7 +7895,7 @@ pub struct FitResult {
     /// Consumed by `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`.
     pub sir_resamples_packed: Option<Vec<Vec<f64>>>,
     /// Importance-sampling marginal log-likelihood result. `Some` when an
-    /// `Imp` stage ran in the method chain (`methods = [..., imp]`). The
+    /// `Imp` stage ran in the method chain (`method = [..., imp]`). The
     /// `−2 log L_IS` value is lower-bias than the FOCE/Laplace `ofv` for
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
@@ -7923,6 +8033,13 @@ pub struct FitResult {
     /// Total number of times the Nelder-Mead fallback was invoked across all
     /// subjects and all outer iterations.  Always `0` for SAEM.
     pub total_ebe_fallbacks: u32,
+    /// Under `inner_optimizer = nelder_mead`: how many times, summed over every inner loop
+    /// like `total_ebe_fallbacks` (not a count of distinct subjects), a subject's Nelder–Mead
+    /// stop was not a mode and the stationarity certificate moved it there with the gradient.
+    /// The primary search's moved point is not a fallback. Always `0` under every other
+    /// `inner_optimizer`, and always `0` for `gn` / `gn_hybrid`'s Gauss–Newton phase, SAEM,
+    /// trust-region, VI and IMP, which do not count it (#2571).
+    pub total_ebe_nm_polished: u32,
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,
     /// Which estimator produced `covariance_matrix`, the standard errors,
@@ -8179,7 +8296,7 @@ pub struct FitResult {
     #[serde(default)]
     pub sir_settings: Option<crate::estimation::sir::SirSettings>,
     /// The inner-loop and ODE settings of the stage that produced the estimates (and ran
-    /// the inline covariance step) (#426): on a `methods = [..]` chain, the last stage that
+    /// the inline covariance step) (#426): on a `method = [..]` chain, the last stage that
     /// estimates, with its own `inner_tol` (a quadrature stage runs at 1e-8 or tighter)
     /// rather than the top-level one. A trailing evaluator (`agq_eval_only`,
     /// `imp_eval_only`) does not write it, though the reported OFV may be that evaluator's. Set by every `fit()`; `None`
@@ -9159,7 +9276,7 @@ pub struct FitOptions {
     /// terminal chain stage. The AGQ analogue of [`Self::imp_eval_only`].
     ///
     /// The point is a *deterministic* marginal likelihood at a point some other method
-    /// reached. `methods = vi, laplace` with `agq_eval_only = true` and `n_agq = 21` is the
+    /// reached. `method = [vi, laplace]` with `agq_eval_only = true` and `n_agq = 21` is the
     /// recommended way to turn a VI fit's ELBO — which is only a bound — into a real
     /// `−2 log L`, and unlike the `imp` route it carries no Monte-Carlo error, so two runs
     /// agree bit for bit. `vi_final_ofv = laplace` is the same idea fixed at one node.
@@ -10356,7 +10473,7 @@ pub enum ViFinalOfv {
     /// FOCE/FOCEI fit of the same data. Cheap and deterministic.
     ///
     /// For an importance-sampling `−2 log L` instead, chain the stages:
-    /// `methods = vi, imp` with `imp_eval_only = true`, which consumes VI's
+    /// `method = [vi, imp]` with `imp_eval_only = true`, which consumes VI's
     /// parameters, EBEs and Hessians and additionally reports the IS diagnostics.
     Laplace,
 }

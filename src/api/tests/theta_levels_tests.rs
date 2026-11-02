@@ -14814,6 +14814,10 @@ mod nested_units;
 #[path = "theta_levels_carry_over_tests.rs"]
 mod carry_over;
 
+/// The span certificate on a random effect that scales the residual error (#1879).
+#[path = "theta_levels_residual_scale_tests.rs"]
+mod residual_scale;
+
 mod carried_scale {
     use super::*;
 

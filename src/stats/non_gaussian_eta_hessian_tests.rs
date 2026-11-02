@@ -122,7 +122,8 @@ fn binary_cell<'a>(label: &str, model: &'a CompiledModel, s: &'a Subject, eta: &
     let theta = model.default_params.theta.clone();
     let omega = model.default_params.omega.matrix.clone();
     let mode = crate::categorical::discrete_subject_nll(model, s, &theta, eta);
-    let (hessian, route) = discrete_data_term_eta_hessian(model, s, &theta, eta, mode, &omega);
+    let (hessian, route) = discrete_data_term_eta_hessian(model, s, &theta, eta, mode, &omega)
+        .expect("a binary curvature is always measurable");
     let exact = crate::categorical::discrete_subject_eta_hessian(model, s, &theta, eta);
     Cell {
         label: label.into(),
@@ -308,6 +309,43 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
         s
     };
 
+    // DTMM (#2473): three states, every step kind — stays, a declared off-diagonal from each
+    // row — with coupled η, a covariate and a `TIME` term; then beside a binary endpoint, so
+    // the discrete seam's two families are summed on both paths.
+    #[cfg(feature = "markov")]
+    let dtmm_body = "[markov_model]\n  type   = dtmm\n  cmt    = 5\n  states = [s0=0, s1=1, \
+                     s2=2]\n  transition s0 -> s1 = inv_logit(TH0 - 1.0 + ETA_A + 0.4 * X)\n  \
+                     transition s0 -> s2 = 0.2 * inv_logit(THX + ETA_A * ETA_B)\n  \
+                     transition s1 -> s0 = inv_logit(-0.8 + 0.5 * ETA_B + THT * TIME)\n  \
+                     transition s2 -> s1 = inv_logit(-1.0 - ETA_B + ETA_A)\n";
+    #[cfg(feature = "markov")]
+    let dtmm = parse(&format!(
+        "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  theta THX(0.5, -10.0, 10.0)\n  \
+         theta THT(0.3, -10.0, 10.0)\n  omega ETA_A ~ 0.25\n  omega ETA_B ~ 0.16\n{dtmm_body}"
+    ));
+    #[cfg(feature = "markov")]
+    let binary_and_dtmm = parse(&format!("{binary_src}{dtmm_body}"));
+    #[cfg(feature = "markov")]
+    let ds = {
+        let mut s = Subject {
+            id: "1".into(),
+            ..Default::default()
+        };
+        s.covariates.insert("X".into(), 0.8);
+        s.obs_records = [0, 0, 1, 1, 0, 2, 2, 1, 0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, st)| discrete(i as f64, st, 5))
+            .collect();
+        s
+    };
+    #[cfg(feature = "markov")]
+    let bds = {
+        let mut s = ds.clone();
+        s.obs_records.extend(bs.obs_records.iter().cloned());
+        s
+    };
+
     let params = "[parameters]\n  theta TA(0.08, 0.001, 10.0)\n  theta TB(1.4, 0.01, 10.0)\n  \
                   theta TX(0.3, -10.0, 10.0)\n  omega ETA_S ~ 0.25\n  omega ETA_K ~ 0.09\n";
     let single = [
@@ -398,6 +436,13 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
     {
         cells.push(ctmm_cell("ctmm", &ctmm_fast, &cs, &[0.3, -0.2]));
         cells.push(ctmm_cell("ctmm slow rates", &ctmm_slow, &cs, &[0.3, -0.2]));
+        cells.push(binary_cell("dtmm", &dtmm, &ds, &[0.3, -0.2]));
+        cells.push(binary_cell(
+            "binary + dtmm",
+            &binary_and_dtmm,
+            &bds,
+            &[0.3, -0.2],
+        ));
     }
     for (label, model, records, eta) in &tte_models {
         cells.push(tte_cell(label, model, records, &cov, eta));
@@ -439,7 +484,8 @@ fn endpoints_without_a_dual_program_fall_back_to_finite_differences() {
         let eta = vec![0.1; n];
         let omega = model.default_params.omega.matrix.clone();
         let mode = crate::categorical::discrete_subject_nll(&model, &s, &theta, &eta);
-        let (got, route) = discrete_data_term_eta_hessian(&model, &s, &theta, &eta, mode, &omega);
+        let (got, route) = discrete_data_term_eta_hessian(&model, &s, &theta, &eta, mode, &omega)
+            .expect("a binary curvature is always measurable");
         assert_eq!(route, want_route, "{n} η");
         let want = richardson_hessian(
             |e| crate::categorical::discrete_subject_nll(&model, &s, &theta, e),

@@ -1038,7 +1038,7 @@ pub(crate) fn saem_active_covariate_group_etas<'m>(
         return Vec::new();
     }
     let split = crate::estimation::saem::classify_mu_ref_pairs(model, &init_params.theta_lower);
-    let conflicts = crate::estimation::saem::mu_ref_pairs_for_cov_groups(&split);
+    let conflicts = crate::estimation::saem::saem_mu_ref_pairs_for_cov_groups(&split);
     let (groups, _notes) = crate::estimation::covariate_mu_ref::resolve_covariate_mu_groups(
         model,
         population,
@@ -1127,7 +1127,12 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
     } else {
         Some(format!(
             "individual parameter(s) not mu-referenced: {}. This can strongly \
-             affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
+             affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible. \
+             An additive ETA is mu-referenced when its line adds one bare THETA, that one \
+             ETA, and terms that read neither (`BASE = TVE0 + PLACEBO + ETA_E0`): give each \
+             typical value a THETA of its own, not a multiple of one, and its own ETA. \
+             That THETA and that ETA must reach the model only through that line; when \
+             either also reaches it another way, splitting the line does not help (#2544).",
             names.join(", ")
         ))
     }
@@ -1154,12 +1159,52 @@ fn floor_escaped(
     })
 }
 
+/// Fits in progress in this process: [`LastFitOut`] guards.
+static FITS_IN_PROGRESS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Held for the whole of one [`fit_inner`], on the single-start and the multi-start arm
+/// alike. Dropping the guard of the **last** fit in progress runs `on_last`, so a finishing
+/// fit never releases the tapes of another that is still recording on a shared pool.
+struct LastFitOut {
+    count: &'static std::sync::atomic::AtomicUsize,
+    on_last: fn(),
+}
+
+impl LastFitOut {
+    fn enter(count: &'static std::sync::atomic::AtomicUsize, on_last: fn()) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        LastFitOut { count, on_last }
+    }
+}
+
+impl Drop for LastFitOut {
+    fn drop(&mut self) {
+        if self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            (self.on_last)();
+        }
+    }
+}
+
+/// Release the outer gradient's vector tape once no fit is in progress (#2481 §2.7): each
+/// worker keeps its peak recording's buffers between subjects, and past the fits nothing
+/// needs them at that size. On a Rayon worker (the fit pool) every worker of that pool is
+/// trimmed; off one, only this thread, so the release never builds Rayon's global pool
+/// (#1460).
+fn release_worker_tapes() {
+    if rayon::current_thread_index().is_some() {
+        rayon::broadcast(|_| crate::sens::vtape::vtape_trim(0));
+    } else {
+        crate::sens::vtape::vtape_trim(0);
+    }
+}
+
 fn fit_inner(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
+    let _tapes = LastFitOut::enter(&FITS_IN_PROGRESS, release_worker_tapes);
     // LTBS needs the inner EBE loop converged tighter than the default for
     // reproducible standard errors (see `FitOptions::effective_inner_tol` /
     // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and
@@ -1584,6 +1629,11 @@ fn fit_inner(
     for d in crate::api::validation::check_nn_bare_output_start(model, &init_params.theta) {
         accumulated_warnings.push(d.message);
     }
+    // A `[covariate_nn]` input the data drive into saturation (#2549).
+    #[cfg(feature = "nn")]
+    for d in crate::api::validation::check_nn_input_scale(model, population) {
+        accumulated_warnings.push(d.message);
+    }
     if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
         n_params_pre,
         covariance_cost,
@@ -1644,11 +1694,11 @@ fn fit_inner(
     //   * `chain.last()` — an `imp_eval_only` stage deliberately does **not**
     //     touch `result`; its importance-sampled −2 log L goes to
     //     `FitResult::importance_sampling`, and the preceding estimator's
-    //     objective stays in `ofv`. So `methods = vi, imp` + `imp_eval_only`
+    //     objective stays in `ofv`. So `method = [vi, imp]` + `imp_eval_only`
     //     publishes *VI's* objective, under IMP's name.
     //   * `final_method` (the last **estimating** stage) — an AGQ readout stage is
     //     evaluation-only *and* replaces `prev.ofv` with its quadrature marginal,
-    //     so `methods = focei, laplace` + `agq_eval_only` publishes the
+    //     so `method = [focei, laplace]` + `agq_eval_only` publishes the
     //     eval-only stage's objective, not the estimator's.
     //
     // The two evaluation-only families differ in exactly this, so the only
@@ -1660,7 +1710,7 @@ fn fit_inner(
     //
     // `None` only until the first stage writes one.
     let mut objective_stage: Option<EstimationMethod> = None;
-    // A VI stage's result must survive later stages of a chain: `methods = vi, imp`
+    // A VI stage's result must survive later stages of a chain: `method = [vi, imp]`
     // is the *recommended* way to finish a VI fit, and reading `vi` off only the
     // final stage would silently discard it exactly when it was used correctly.
     let mut vi_result: Option<crate::types::ViResult> = None;
@@ -1917,7 +1967,7 @@ fn fit_inner(
         // grid on the conditional mode and scales it by the posterior Hessian; a mode carried
         // over from a method that never converged one (VI reports variational means, not
         // modes) would put the grid in the wrong place. Deterministic throughout, which is
-        // the whole point relative to `methods = ..., imp` with `imp_eval_only`.
+        // the whole point relative to `method = [..., imp]` with `imp_eval_only`.
         if method == EstimationMethod::Laplace && stage_opts.agq_eval_only {
             let n_nodes = stage_opts.agq_nodes().unwrap_or(1);
             let mu_k = crate::estimation::parameterization::compute_mu_k(
@@ -1999,6 +2049,7 @@ fn fit_inner(
                         ebe_convergence_warnings: 0,
                         max_unconverged_subjects: 0,
                         total_ebe_fallbacks: 0,
+                        total_ebe_nm_polished: 0,
                         final_gradient: None,
                         final_gradient_source: None,
                         sir_fallback_proposal: None,
@@ -2094,6 +2145,7 @@ fn fit_inner(
                     ebe_convergence_warnings: 0,
                     max_unconverged_subjects: 0,
                     total_ebe_fallbacks: 0,
+                    total_ebe_nm_polished: 0,
                     final_gradient: None,
                     final_gradient_source: None,
                     sir_fallback_proposal: None,
@@ -2229,7 +2281,8 @@ fn fit_inner(
                     .map_err(EngineError::uncoded)?
             }
             // #1065: a `profile`d block takes its own outer loop over the structural
-            // parameters; `check_profiled_levels` has refused every method but foce/focei.
+            // parameters; `check_profiled_levels` has refused every method but foce, focei
+            // and laplace at one node.
             _ if !model
                 .indiv_param_partials
                 .theta_blocks
@@ -2335,7 +2388,7 @@ fn fit_inner(
     // Mark a VI block that a later *estimating* stage has overtaken. The block is kept —
     // a trailing `agq_eval_only` / `imp_eval_only` readout is how a VI fit is meant to be
     // finished, and the per-subject variational covariance is the only one in the result —
-    // but on `methods = [vi, focei]` everything on it describes VI's parameter point, not
+    // but on `method = [vi, focei]` everything on it describes VI's parameter point, not
     // the one the fit reports. `is_last_estimating_stage` is the same predicate the loop
     // used, so trailing evaluators do not count as superseding.
     if let (Some(vi), Some(idx)) = (vi_result.as_mut(), vi_stage_idx) {
@@ -2870,7 +2923,7 @@ fn fit_inner(
     // internal ceiling cannot be, so the flag would otherwise hand a programmatic
     // consumer a point that is by construction not an interior optimum.
     // `result.params` holds the *final* stage's estimates, so a chained
-    // `methods = vi, focei` is gated on its last stage, like `run_covariance_step`.
+    // `method = [vi, focei]` is gated on its last stage, like `run_covariance_step`.
     let mut converged = result.converged;
     // The objective gate (#1303), applied to the OFV this `FitResult` publishes
     // — `ofv_data + ofv_prior`, which includes a penalty evaluated after the last
@@ -2884,7 +2937,7 @@ fn fit_inner(
     // `objective_stage` where it is declared), not a position in the chain.
     // Neither `chain.last()` nor `final_method` is right for both evaluation-only
     // families, and getting it wrong demotes a converged VI fit that was finished
-    // the recommended way (`methods = vi, imp` + `imp_eval_only`).
+    // the recommended way (`method = [vi, imp]` + `imp_eval_only`).
     let objective_stage = objective_stage.unwrap_or(final_method);
     if let Some((msg, mut entry)) =
         nonfinite_objective_warning(&mut converged, ofv, objective_stage, options)
@@ -3202,6 +3255,7 @@ fn fit_inner(
         ebe_convergence_warnings: result.ebe_convergence_warnings,
         max_unconverged_subjects: result.max_unconverged_subjects,
         total_ebe_fallbacks: result.total_ebe_fallbacks,
+        total_ebe_nm_polished: result.total_ebe_nm_polished,
         covariance_status,
         // #1382: the estimator that actually produced `covariance_matrix`, carried
         // up from the covariance step rather than read back off
@@ -3433,5 +3487,42 @@ mod trace_file_path_tests {
         for _ in 0..1_000 {
             assert!(seen.insert(trace_file_path()), "duplicate trace path");
         }
+    }
+}
+
+#[cfg(test)]
+mod last_fit_out_tests {
+    use super::LastFitOut;
+    use std::sync::atomic::AtomicUsize;
+
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn release() {
+        RELEASES.with(|r| r.set(r.get() + 1));
+    }
+
+    /// Review r1 #2: the tape release runs once, when the last of overlapping fits ends —
+    /// not when the first does, which would trim the tapes another fit is still recording on.
+    /// Mutation: release on every drop → 2 after the first fit ends.
+    #[test]
+    fn the_tapes_are_released_when_the_last_fit_ends() {
+        let first = LastFitOut::enter(&COUNT, release);
+        let second = LastFitOut::enter(&COUNT, release);
+        drop(first);
+        assert_eq!(
+            RELEASES.with(|r| r.get()),
+            0,
+            "another fit is still in progress"
+        );
+        drop(second);
+        assert_eq!(RELEASES.with(|r| r.get()), 1, "the last fit out releases");
+        drop(LastFitOut::enter(&COUNT, release));
+        assert_eq!(
+            RELEASES.with(|r| r.get()),
+            2,
+            "a lone fit releases on its own"
+        );
     }
 }

@@ -740,12 +740,49 @@ fn ss_state_at_phase_event_driven(
 /// get an `F`-scaled duration, duration-defined doses an `F`-scaled rate.
 /// Boluses are returned unchanged (`(0, 0)`); their `F` is applied to the amount
 /// via [`PkParams::bioavailable_amount`] in the walk. Parallel to `subject.doses`.
-fn bioavailable_doses(subject: &Subject, pk_at_dose: &[PkParams]) -> Vec<DoseEvent> {
+/// Per-record PK parameters as the walk reads them (#2549): a slice, one snapshot per
+/// record, or an [`Indexed`] table, where records sharing a snapshot hold its index
+/// instead of a 1 KB copy each. The walk only ever borrows a record's snapshot.
+pub(crate) trait PkAt {
+    fn at(&self, i: usize) -> &PkParams;
+    fn count(&self) -> usize;
+}
+
+impl PkAt for [PkParams] {
+    #[inline]
+    fn at(&self, i: usize) -> &PkParams {
+        &self[i]
+    }
+    #[inline]
+    fn count(&self) -> usize {
+        self.len()
+    }
+}
+
+/// Records as indices into a table of distinct snapshots.
+pub(crate) struct Indexed<'a> {
+    pub(crate) table: &'a [PkParams],
+    pub(crate) idx: &'a [u32],
+}
+
+impl PkAt for Indexed<'_> {
+    #[inline]
+    fn at(&self, i: usize) -> &PkParams {
+        &self.table[self.idx[i] as usize]
+    }
+    #[inline]
+    fn count(&self) -> usize {
+        self.idx.len()
+    }
+}
+
+fn bioavailable_doses<P: PkAt + ?Sized>(subject: &Subject, pk_at_dose: &P) -> Vec<DoseEvent> {
     subject
         .doses
         .iter()
-        .zip(pk_at_dose)
-        .map(|(d, p)| d.with_bioavailable_infusion(p.f_bio()))
+        .take(pk_at_dose.count())
+        .enumerate()
+        .map(|(k, d)| d.with_bioavailable_infusion(pk_at_dose.at(k).f_bio()))
         .collect()
 }
 
@@ -835,15 +872,37 @@ pub fn event_driven_predictions_with_schedule(
 /// taking the pre-built bioavailability-adjusted `eff_doses` so both entry points
 /// ([`event_driven_predictions`] and [`event_driven_predictions_with_schedule`])
 /// build them exactly once (#419).
+/// [`event_driven_predictions_with_schedule`] over per-record parameters held as a table and
+/// indices (#2549): the same walk, borrowing each record's snapshot from the table.
+pub(crate) fn event_driven_predictions_with_schedule_at<P: PkAt + ?Sized>(
+    pk_model: PkModel,
+    subject: &Subject,
+    schedule: &EventSchedule,
+    pk_at_dose: &P,
+    pk_at_obs: &P,
+    pk_at_pk_only: &P,
+) -> Vec<f64> {
+    let eff_doses = bioavailable_doses(subject, pk_at_dose);
+    event_driven_predictions_run(
+        pk_model,
+        subject,
+        schedule,
+        &eff_doses,
+        pk_at_dose,
+        pk_at_obs,
+        pk_at_pk_only,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
-fn event_driven_predictions_run(
+fn event_driven_predictions_run<P: PkAt + ?Sized>(
     pk_model: PkModel,
     subject: &Subject,
     schedule: &EventSchedule,
     eff_doses: &[DoseEvent],
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
-    pk_at_pk_only: &[PkParams],
+    pk_at_dose: &P,
+    pk_at_obs: &P,
+    pk_at_pk_only: &P,
 ) -> Vec<f64> {
     let t0 = profile_enabled().then(std::time::Instant::now);
     let preds = event_driven_predictions_with_schedule_impl(
@@ -863,7 +922,7 @@ fn event_driven_predictions_run(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn event_driven_predictions_with_schedule_impl(
+fn event_driven_predictions_with_schedule_impl<P: PkAt + ?Sized>(
     pk_model: PkModel,
     subject: &Subject,
     schedule: &EventSchedule,
@@ -875,13 +934,13 @@ fn event_driven_predictions_with_schedule_impl(
     // same adjusted doses, and the cached path only caches when `F` cannot reshape a
     // rate-defined window. Built once by the caller (`event_driven_predictions_run`).
     eff_doses: &[DoseEvent],
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
-    pk_at_pk_only: &[PkParams],
+    pk_at_dose: &P,
+    pk_at_obs: &P,
+    pk_at_pk_only: &P,
 ) -> Vec<f64> {
-    assert_eq!(pk_at_dose.len(), subject.doses.len());
-    assert_eq!(pk_at_obs.len(), subject.obs_times.len());
-    assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
+    assert_eq!(pk_at_dose.count(), subject.doses.len());
+    assert_eq!(pk_at_obs.count(), subject.obs_times.len());
+    assert_eq!(pk_at_pk_only.count(), subject.pk_only_times.len());
     debug_assert_eq!(eff_doses.len(), subject.doses.len());
 
     let n_obs = subject.obs_times.len();
@@ -936,9 +995,9 @@ fn event_driven_predictions_with_schedule_impl(
     let record_pk_at = |q: usize| -> &PkParams {
         let ev = schedule.events[q];
         match ev.kind {
-            EventKind::DoseRecord => &pk_at_dose[ev.orig_idx],
-            EventKind::PkOnly => &pk_at_pk_only[ev.orig_idx],
-            _ => &pk_at_obs[ev.orig_idx],
+            EventKind::DoseRecord => pk_at_dose.at(ev.orig_idx),
+            EventKind::PkOnly => pk_at_pk_only.at(ev.orig_idx),
+            _ => pk_at_obs.at(ev.orig_idx),
         }
     };
 
@@ -1018,7 +1077,7 @@ fn event_driven_predictions_with_schedule_impl(
                 if crate::dosing::ss_seeded_at_record(d, lag) {
                     state = ss_state_at_phase_event_driven(
                         pk_model,
-                        &pk_at_dose[ev.orig_idx],
+                        pk_at_dose.at(ev.orig_idx),
                         d,
                         crate::dosing::ss_seed_phase(d, lag),
                     );
@@ -1041,7 +1100,7 @@ fn event_driven_predictions_with_schedule_impl(
                 // Dose *attributes* belong to the dose row, so they read that
                 // row's own snapshot and never `pk_now`, which after #1073 is the
                 // next record's. Before the split the two were the same object.
-                let dose_pk = &pk_at_dose[ev.orig_idx];
+                let dose_pk = pk_at_dose.at(ev.orig_idx);
                 // Steady-state (SS=1): reset state and load with the SS
                 // amount from the infinite-past pulse train before the SS
                 // dose's own pulse is applied through the normal flow.
@@ -1136,16 +1195,16 @@ fn event_driven_predictions_with_schedule_impl(
 
 /// Borrows the event's snapshot (1 KB — see the note at `record_pk_at`).
 #[inline]
-fn pk_for<'a>(
+fn pk_for<'a, P: PkAt + ?Sized>(
     ev: Event,
-    pk_at_dose: &'a [PkParams],
-    pk_at_obs: &'a [PkParams],
-    pk_at_pk_only: &'a [PkParams],
+    pk_at_dose: &'a P,
+    pk_at_obs: &'a P,
+    pk_at_pk_only: &'a P,
 ) -> &'a PkParams {
     match ev.kind {
-        EventKind::DoseRecord | EventKind::Dose => &pk_at_dose[ev.orig_idx],
-        EventKind::Obs => &pk_at_obs[ev.orig_idx],
-        EventKind::PkOnly => &pk_at_pk_only[ev.orig_idx],
+        EventKind::DoseRecord | EventKind::Dose => pk_at_dose.at(ev.orig_idx),
+        EventKind::Obs => pk_at_obs.at(ev.orig_idx),
+        EventKind::PkOnly => pk_at_pk_only.at(ev.orig_idx),
         // Resets are handled by the caller before `pk_for`; they carry no
         // per-event PK snapshot.
         EventKind::Reset => unreachable!("Reset carries no PK params"),

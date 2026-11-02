@@ -344,7 +344,7 @@ fn check_model_options_rejects_saem_without_random_effects() {
 #[test]
 fn check_model_options_rejects_saem_anywhere_in_a_chain() {
     // The guard must fire on a chained fit too, up front — otherwise
-    // `methods = [saem, focei]` runs the whole SAEM stage before failing.
+    // `method = [saem, focei]` runs the whole SAEM stage before failing.
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
     model.n_eta = 0;
     let diags = check_model_options(
@@ -411,7 +411,7 @@ fn check_model_options_rejects_imp_impmap_bayes_without_random_effects() {
 
 #[test]
 fn check_model_options_rejects_imp_anywhere_in_a_chain() {
-    // `methods = [focei, imp]` previously ran the whole FOCEI stage before the
+    // `method = [focei, imp]` previously ran the whole FOCEI stage before the
     // IMP stage errored at run time (#1007); it must now fail up front.
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
     model.n_eta = 0;
@@ -556,7 +556,7 @@ fn check_model_options_does_not_warn_gn_hybrid_or_mixed_effects_gn() {
 
 #[test]
 fn check_model_options_rejects_imp_via_the_singular_method_field() {
-    // Every other guard test drives `methods = [...]`; a user writing
+    // Every other guard test drives `method = [...]`; a user writing
     // `method = imp` in `[fit_options]` reaches the same guard through
     // `method_chain()`'s *empty*-`methods` branch, which must be covered too.
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
@@ -603,7 +603,7 @@ fn check_model_options_rejects_eval_only_imp_without_random_effects() {
 
 #[test]
 fn check_model_options_does_not_warn_gn_polished_by_a_later_stage() {
-    // `methods = [gn, focei]` is `gn_hybrid` spelled out — the FOCEI stage
+    // `method = [gn, focei]` is `gn_hybrid` spelled out — the FOCEI stage
     // re-optimises the GN result, so the #1006 "may be badly wrong" advice does
     // not apply. The exemption keys off *last estimating stage*, not off the
     // `gn_hybrid` token, so both spellings behave the same.
