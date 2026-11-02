@@ -389,15 +389,49 @@ fn check_prior_import(exported: &str, model_dir: Option<&Path>) -> Result<bool, 
 /// Write `text` to `out` through a temporary file renamed over it. Renaming
 /// replaces the directory entry, never the file behind it, so an `out` that is
 /// a hard link to an input — which `same_file` cannot see on every platform —
-/// leaves the input's contents intact.
+/// leaves the input's contents intact. The temporary file is created fresh
+/// (`create_new`), so a path already there — a link someone placed at the
+/// expected name — is skipped, never written through.
 fn write_replacing(out: &Path, text: &str) -> Result<(), String> {
-    let name = out.file_name().and_then(|n| n.to_str()).unwrap_or("export");
-    let tmp = out.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, out));
+    use std::io::Write;
+    let fail = |e: std::io::Error| format!("cannot write `{}`: {e}", out.display());
+    let (tmp, mut file) = (0..100)
+        .find_map(|k| {
+            let tmp = temp_candidate(out, k);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(f) => Some(Ok((tmp, f))),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(e) => Some(Err(e)),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "no free temporary file name next to it",
+            ))
+        })
+        .map_err(fail)?;
+    let result = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            drop(file);
+            std::fs::rename(&tmp, out)
+        });
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    result.map_err(|e| format!("cannot write `{}`: {e}", out.display()))
+    result.map_err(fail)
+}
+
+/// The `k`-th temporary name `write_replacing` tries for `out`.
+fn temp_candidate(out: &Path, k: u32) -> std::path::PathBuf {
+    let name = out.file_name().and_then(|n| n.to_str()).unwrap_or("export");
+    out.with_file_name(format!(".{name}.{}.{k}.tmp", std::process::id()))
 }
 
 /// Export `text` at `fit` — after checking `fit` was made with the networks
@@ -543,6 +577,13 @@ mod tests {
             let link = dir.path().join("m-link.ferx");
             write_replacing(&link, "exported").unwrap();
             assert_eq!(std::fs::read_to_string(&link).unwrap(), "exported");
+            assert_eq!(original(&model), model_bytes);
+            // Nor through a link planted at the temporary name it would use
+            // first: that name is skipped for the next.
+            let out = dir.path().join("planted.ferx");
+            std::fs::hard_link(&model, temp_candidate(&out, 0)).unwrap();
+            write_replacing(&out, "exported").unwrap();
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "exported");
             assert_eq!(original(&model), model_bytes);
         }
     }

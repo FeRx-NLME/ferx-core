@@ -796,37 +796,55 @@ fn parameter_numbers_that_define_the_model_are_compared() {
 #[test]
 fn an_input_named_like_a_parameter_is_refused_even_when_the_column_is_read() {
     let (names, theta) = fixture_theta();
-    let model = |extra_theta: &str| {
-        FIXTURE_MODEL
+    // `declare` adds a parameter named ARM; `use_it` reads it (an η or κ nothing
+    // reads is refused by the parser on its own).
+    let model = |declare: &str, use_it: bool| {
+        let m = FIXTURE_MODEL
             .replace("inputs     = [WT, CRCL]", "inputs     = [ARM, CRCL]")
             .replace(
                 "  sigma PROP_ERR ~ 0.1 (sd)",
                 &format!(
-                    "{extra_theta}  theta RHO(0.3, -0.4, 0.95)\n  sigma PROP_ERR ~ 0.1 (sd)\n  \
+                    "{declare}  theta RHO(0.3, -0.4, 0.95)\n  sigma PROP_ERR ~ 0.1 (sd)\n  \
                      sigma ADD_ERR ~ 1.0 (sd)"
                 ),
             )
             .replace(
                 "DV ~ proportional(PROP_ERR)",
                 "DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation cs(RHO) by ARM",
-            )
+            );
+        if use_it {
+            m.replace("exp(ETA_V)", "exp(ETA_V + ARM)")
+        } else {
+            m
+        }
     };
-    let with_theta = model("  theta ARM(1, 0, 9)\n");
-    // The straddle: the column is read, so the data-column check alone passes.
-    let nn_start = with_theta.find("\n[covariate_nn ").unwrap() + 1;
-    let nn_end = with_theta[nn_start..].find("\n[").unwrap() + nn_start + 1;
-    let plain = format!("{}{}", &with_theta[..nn_start], &with_theta[nn_end..])
-        .replace("TYPICAL_PK.CL", "1")
-        .replace("TYPICAL_PK . KA", "1");
-    let parsed = parse_model_string(&plain).unwrap();
-    assert!(parsed.referenced_covariates.iter().any(|c| c == "ARM"));
-    let err = export(&with_theta, &names, &theta, DcmWeightForm::Literal).unwrap_err();
-    assert!(
-        err.contains("input `ARM` is also the name of a theta")
-            && err.contains("`Z_TYPICAL_PK_ARM`"),
-        "{err}"
-    );
-    export(&model(""), &names, &theta, DcmWeightForm::Literal).unwrap();
+    for (declare, use_it, what) in [
+        ("  theta ARM(1, 0, 9)\n", false, "a theta"),
+        ("  omega ARM ~ 0.1\n", true, "a random effect"),
+        ("  kappa ARM ~ 0.09\n", true, "a kappa"),
+    ] {
+        let colliding = model(declare, use_it);
+        // The straddle: the column is read too, so a data-column check alone
+        // would pass.
+        let nn_start = colliding.find("\n[covariate_nn ").unwrap() + 1;
+        let nn_end = colliding[nn_start..].find("\n[").unwrap() + nn_start + 1;
+        let plain = format!("{}{}", &colliding[..nn_start], &colliding[nn_end..])
+            .replace("TYPICAL_PK.CL", "1")
+            .replace("TYPICAL_PK . KA", "1");
+        let parsed = parse_model_string(&plain).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            parsed.referenced_covariates.iter().any(|c| c == "ARM"),
+            "{what}"
+        );
+        let err = export(&colliding, &names, &theta, DcmWeightForm::Literal).unwrap_err();
+        assert!(
+            err.contains(&format!("input `ARM` is also the name of {what}"))
+                && err.contains("`Z_TYPICAL_PK_ARM`"),
+            "{what}: {err}"
+        );
+    }
+    // The control: ARM is only the column.
+    export(&model("", false), &names, &theta, DcmWeightForm::Literal).unwrap();
 }
 
 /// Whitespace inside a quoted string is content: `"BODY WEIGHT"` and
@@ -873,6 +891,27 @@ fn a_statement_laid_out_over_several_lines_is_the_same_model() {
         "  CL = TYPICAL_PK.CL\n       * exp(2 * ETA_CL)",
     );
     let err = export_dcm_from_fit(&changed, &fit, &opts).unwrap_err();
+    assert!(err.contains("not the one the fit was made with"), "{err}");
+}
+
+/// The parser's other line rules: a bare `FIX` (or scale tag) on the line after
+/// a `block_*` declaration belongs to it, and a bare `end` is dropped — so
+/// neither layout is a different model, while a `FIX` that was not there is.
+#[test]
+fn a_block_fix_on_its_own_line_and_a_bare_end_are_layout() {
+    let blocked = |fix: &str| {
+        FIXTURE_MODEL.replace(
+            "  omega ETA_CL ~ 0.1\n  omega ETA_V  ~ 0.05\n",
+            &format!("  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.05]{fix}\n"),
+        )
+    };
+    let fit = fixture_fit(Some(&blocked(" FIX")));
+    let opts = DcmExportOptions::default();
+    export_dcm_from_fit(&blocked(" FIX"), &fit, &opts).unwrap();
+    export_dcm_from_fit(&blocked("\n  FIX"), &fit, &opts).unwrap();
+    let ended = blocked(" FIX").replace("[structural_model]", "end\n\n[structural_model]");
+    export_dcm_from_fit(&ended, &fit, &opts).unwrap();
+    let err = export_dcm_from_fit(&blocked(""), &fit, &opts).unwrap_err();
     assert!(err.contains("not the one the fit was made with"), "{err}");
 }
 

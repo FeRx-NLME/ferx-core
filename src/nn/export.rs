@@ -52,9 +52,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::Activation;
 use crate::parser::model_parser::{
-    block_disabled_feature, block_header, is_plain_identifier, parse_model_string,
-    parse_nn_block_fields, scaling_intermediate_reserved, strip_line_comment, NnBlockSpec,
-    CONTINUATION_BLOCKS, CONTINUATION_LEADERS, CONTINUATION_TRAILERS,
+    block_disabled_feature, block_header, folds_onto_block_declaration, is_plain_identifier,
+    parse_model_string, parse_nn_block_fields, scaling_intermediate_reserved, strip_line_comment,
+    NnBlockSpec, CONTINUATION_BLOCKS, CONTINUATION_LEADERS, CONTINUATION_TRAILERS,
 };
 
 #[path = "export_values.rs"]
@@ -512,17 +512,19 @@ fn model_lines(text: &str) -> Vec<(String, &str)> {
 }
 
 /// `text` as the parser groups it: `(block, code, first physical line)` per
-/// logical line, comments stripped. A line continues the one before while a
-/// `(` or `[` is open, and in an expression block (`CONTINUATION_BLOCKS`) when
-/// it starts with an operator or the one before ends with one — the parser's
-/// own rules, so a statement laid out over several lines compares equal to the
-/// same statement on one.
+/// logical line, comments and bare `end` lines dropped. A line continues the one
+/// before while a `(` or `[` is open; in `[parameters]` when it is a bare `FIX`
+/// or scale tag after a `block_*` declaration; and in an expression block
+/// (`CONTINUATION_BLOCKS`) when it starts with an operator or the one before
+/// ends with one — the parser's own rules, so a statement laid out over several
+/// lines compares equal to the same statement on one.
 fn logical_lines(text: &str) -> Vec<(String, String, &str)> {
     let mut out: Vec<(String, String, &str)> = Vec::new();
     let mut block = String::new();
     for line in text.lines() {
         let code = strip_line_comment(line).trim();
-        if code.is_empty() {
+        // `end` is a bare terminator the parser drops wherever it appears.
+        if code.is_empty() || code == "end" {
             continue;
         }
         if let Some((ty, _)) = block_header(code) {
@@ -534,6 +536,7 @@ fn logical_lines(text: &str) -> Vec<(String, String, &str)> {
             *b == block
                 && block_header(prev).is_none()
                 && (open_groups(prev) > 0
+                    || (block == "parameters" && folds_onto_block_declaration(prev, code))
                     || (CONTINUATION_BLOCKS.contains(&block.as_str())
                         && (code.starts_with(CONTINUATION_LEADERS)
                             || prev.ends_with(CONTINUATION_TRAILERS))))
