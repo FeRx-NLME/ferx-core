@@ -13,7 +13,7 @@
 //! off-diagonal probabilities `P_jk` (the `transition j -> k = <expr>` right-hand sides)
 //! evaluated at that record, and the stay probability `P_jj = 1 − Σ_{k≠j} P_jk` filled in.
 //! "At that record" means its `TIME` as written and its covariates (the reader's per-row
-//! snapshot, [`record_covariate_snapshots`]) — what a `$PRED` reads from the current record.
+//! snapshot, `Subject::record_covariate_snapshots`) — what a `$PRED` reads from the current record.
 //! A probability that reads an ODE model state (a drug-driven DTMM) is refused at parse. The previous record contributes
 //! only its *state*. This is the likelihood NONMEM scores with a `PREVIOUS`-DV `$PRED` under
 //! `$EST … LAPLACE LIKE`.
@@ -41,7 +41,6 @@
 use crate::parser::model_parser::with_model_time;
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{CompiledModel, EndpointLikelihood, ObsRecord, Subject};
-use std::collections::HashMap;
 
 /// Round-off allowance on the probability bounds: a declared probability may sit this far
 /// outside `[0, 1]`, and a row's off-diagonals may sum this far past 1, before the matrix is
@@ -89,39 +88,6 @@ fn collect_states(
         }
     }
     Ok(out)
-}
-
-/// The reader's per-row covariate snapshot of `subject`, **aligned with
-/// `subject.obs_records`**, or `None` when there is none to align.
-///
-/// `Subject::endpoint_covariates` holds one LOCF snapshot per data row routed to a
-/// non-Gaussian endpoint, in reading order, taken after the row's own cells are read — so
-/// the snapshot of a state row carries that row's covariate values. It is empty when no
-/// covariate varies within the subject (the baseline map is then exact). A discrete-state or
-/// count row yields exactly one record and one snapshot, so the two lists are parallel —
-/// unless the subject also carries time-to-event rows, which can yield zero or two records
-/// per row. Those subjects, and an in-memory subject whose snapshot length does not match,
-/// return `None`; `crate::api::check_survival_tv_covariates` refuses such a subject when a
-/// probability covariate varies, so `None` only ever stands for "the baseline is exact".
-pub(crate) fn record_covariate_snapshots(subject: &Subject) -> Option<&[HashMap<String, f64>]> {
-    let snaps = &subject.endpoint_covariates;
-    let aligned = !snaps.is_empty()
-        && snaps.len() == subject.obs_records.len()
-        && !subject
-            .obs_records
-            .iter()
-            .any(|r| matches!(r, ObsRecord::Event { .. }));
-    aligned.then_some(snaps.as_slice())
-}
-
-/// The covariate map record `rec` is evaluated with: its snapshot when aligned, else the
-/// subject's baseline map.
-fn record_cov<'a>(
-    subject: &'a Subject,
-    snaps: Option<&'a [HashMap<String, f64>]>,
-    rec: &ChainRecord,
-) -> &'a HashMap<String, f64> {
-    snaps.map_or(&subject.covariates, |s| &s[rec.idx])
 }
 
 /// Whether the declared probabilities `probs` (parallel to `transitions`) define a
@@ -180,12 +146,12 @@ fn dtmm_endpoint_nll(
     if chain.len() < 2 {
         return 0.0;
     }
-    let snaps = record_covariate_snapshots(subject);
+    let snaps = subject.record_covariate_snapshots();
     let mut nll = 0.0;
     for k in 1..chain.len() {
         let (prev, rec) = (chain[k - 1], chain[k]);
         // Everything but the previous *state* comes from the current record.
-        let cov = record_cov(subject, snaps, &rec);
+        let cov = subject.record_cov(snaps, rec.idx);
         // `TIME` is the record's TIME as written, as a `$PRED` reads it — not the engine
         // clock, which the reader stacks across reset occasions.
         let probs = with_model_time(rec.raw_time, || prob_fn(theta, eta, cov));
@@ -273,7 +239,7 @@ impl crate::survival::SubjectTerm for DtmmTerm<'_> {
         if subject.obs_records.is_empty() {
             return Some(nll);
         }
-        let snaps = record_covariate_snapshots(subject);
+        let snaps = subject.record_covariate_snapshots();
         for (cmt, endpoint) in dtmm_endpoints(model) {
             let EndpointLikelihood::Dtmm {
                 n_states,
@@ -290,7 +256,7 @@ impl crate::survival::SubjectTerm for DtmmTerm<'_> {
             for k in 1..chain.len() {
                 let (from, rec) = (chain[k - 1].state, chain[k]);
                 let to = rec.state;
-                let cov = record_cov(subject, snaps, &rec);
+                let cov = subject.record_cov(snaps, rec.idx);
                 let probs = with_model_time(rec.raw_time, || prog.eval_g(th, et, cov))?;
                 if probs.len() != transitions.len() {
                     return None;

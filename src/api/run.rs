@@ -976,7 +976,8 @@ pub fn run_model_simulate_with_overrides(
             // observed 0). The loop now binds an empty `sims` instead of `continue`-ing,
             // so this drop reaches the all-NaN subject too.
             {
-                subject.obs_records.retain_mut(|rec| {
+                // `retain_records` drops a record's covariate snapshot with it (#2562).
+                subject.retain_records(|rec| {
                     let crate::types::ObsRecord::DiscreteState {
                         state,
                         cmt,

@@ -1096,3 +1096,104 @@ fn rsr_is_silent_when_every_level_is_shared() {
         None
     );
 }
+
+// ── #2562: a profiled block read by a non-Gaussian endpoint ──────────────────
+
+/// A binary-only model whose `[binary_model]` predictor reads the counted block as `read`.
+#[cfg(feature = "survival")]
+fn binary_reading(read: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVL(-0.3, -5.0, 5.0)
+  theta PLACEBO[3](0.0) profile
+  omega ETA_S ~ 0.25
+
+[covariates]
+  STUDY categorical
+
+[binary_model]
+  cmt   = 1
+  logit = TVL + {read} + ETA_S
+"#
+    )
+}
+
+/// The route walk sees the `[binary_model]` predictor (#2562). An affine read there
+/// passes the walk, marks the block `linked` (the predictor's logit link is implicit,
+/// which #2111's binary half reads), and reaches `E_PROFILE_SCOPE`'s binary refusal —
+/// not the false "no prediction reads it". A non-affine read is refused by the walk,
+/// naming the construct and the predictor, not `y`. Both sides of the walk in one test.
+///
+/// Mutations: leave the predictor out of the walk's readouts and the affine model is
+/// refused as unread; walk it through `outer_link` instead of as an implicit link and
+/// `linked` is false; label it as `y` and the second message names `y`.
+#[cfg(feature = "survival")]
+#[test]
+fn a_profiled_block_in_the_binary_predictor_is_walked_as_a_linked_readout() {
+    let parsed = parse_full_model(&binary_reading("PLACEBO[STUDY]"))
+        .unwrap_or_else(|e| panic!("an affine binary read passes the walk: {e}"));
+    let decl = parsed
+        .model
+        .theta_blocks()
+        .decls
+        .iter()
+        .find(|d| d.name == "PLACEBO")
+        .unwrap();
+    assert!(decl.linked, "the binary predictor's link is implicit");
+    let msg = one_refusal(
+        &scope(&parsed.model, &FitOptions::default()),
+        "which needs a Gaussian likelihood on every row; this model has a binary endpoint.",
+        REMOVE,
+    );
+    assert!(!msg.contains("no prediction reads it"), "{msg}");
+
+    let err = parse_full_model(&binary_reading("exp(PLACEBO[STUDY])"))
+        .err()
+        .expect("a non-affine binary read is refused");
+    assert!(err.starts_with("E_PROFILE_NOT_LINEAR"), "{err}");
+    assert!(
+        err.contains(
+            "Here `PLACEBO` reaches `y` through `exp(...)` in the `[binary_model]` predictor."
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("the `y` readout"), "{err}");
+}
+
+/// A block read only in an `[event_model]` hazard is not "read by no prediction": the
+/// walk does not judge a hazard, so it leaves the model to `E_PROFILE_SCOPE`, which
+/// names the endpoint (#2562). The gate's other sides in one test: with no endpoint
+/// block, or a hazard that reads something else, the same block is refused as unread.
+///
+/// Mutations: drop the endpoint exemption and the hazard model is refused as unread;
+/// exempt any model with an endpoint block and the third model passes.
+#[cfg(feature = "survival")]
+#[test]
+fn a_profiled_block_read_only_in_a_hazard_reaches_the_endpoint_refusal() {
+    let unread = mbma("theta PLACEBO[3](0.0) profile", "0.0");
+    let err = parse_full_model(&unread)
+        .err()
+        .expect("read by nothing, with no endpoint block");
+    assert!(err.contains("no prediction reads it"), "{err}");
+
+    let text = unread
+        .replace("  omega ETA_E0", "  theta TVLAMBDA(0.05, 0.001, 10.0)\n  omega ETA_E0")
+        .replace(
+            "[error_model]",
+            "[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA * exp(PLACEBO[STUDY])\n\n[error_model]",
+        );
+    let msg = one_refusal(
+        &scope(&model_of(&text), &FitOptions::default()),
+        "which needs a Gaussian likelihood on every row; this model has a time-to-event endpoint.",
+        REMOVE,
+    );
+    assert!(!msg.contains("no prediction reads it"), "{msg}");
+
+    // An endpoint block that reads something else does not excuse an unread block.
+    let elsewhere = text.replace("TVLAMBDA * exp(PLACEBO[STUDY])", "TVLAMBDA");
+    let err = parse_full_model(&elsewhere)
+        .err()
+        .expect("the hazard does not read the block");
+    assert!(err.contains("no prediction reads it"), "{err}");
+}

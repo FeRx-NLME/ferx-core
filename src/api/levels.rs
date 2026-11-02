@@ -33,7 +33,7 @@ use crate::parser::model_parser::{
 };
 use crate::stats::nested_levels::{label_path, NestedLayout};
 use crate::types::{
-    CompiledModel, IovOccasionRule, NestedLevels, ParsedModel, Population, Subject,
+    CompiledModel, IovOccasionRule, NestedLevels, ObsRecord, ParsedModel, Population, Subject,
 };
 
 /// The record time, addressable as a level column even though it is not a
@@ -1025,9 +1025,10 @@ pub(crate) fn level_index_finding(
         });
     }
     for subject in &population.subjects {
-        for j in 0..subject.obs_times.len() {
+        let snaps = subject.record_covariate_snapshots();
+        for row in level_rows(decl, subject) {
             for c in decl.columns() {
-                if !column_value(subject, c, j).is_some_and(f64::is_finite) {
+                if !row_value(subject, snaps, c, row).is_some_and(f64::is_finite) {
                     return Some(LevelIndexFinding::ColumnMissing {
                         id: subject.id.clone(),
                         column: c.clone(),
@@ -1036,7 +1037,11 @@ pub(crate) fn level_index_finding(
             }
         }
     }
-    if population.subjects.iter().all(|s| s.obs_times.is_empty()) {
+    if population
+        .subjects
+        .iter()
+        .all(|s| level_rows(decl, s).next().is_none())
+    {
         // No record defines a level, so no index can be wrong.
         return None;
     }
@@ -1053,22 +1058,23 @@ pub(crate) fn level_index_finding(
         .map(|(level, i)| (level_key(&level.values), (*i, level)))
         .collect();
     for subject in &population.subjects {
-        for j in 0..subject.obs_times.len() {
+        let snaps = subject.record_covariate_snapshots();
+        for row in level_rows(decl, subject) {
             let values: Vec<f64> = decl
                 .columns()
                 .iter()
-                .map(|c| column_value(subject, c, j).unwrap_or(f64::NAN))
+                .map(|c| row_value(subject, snaps, c, row).unwrap_or(f64::NAN))
                 .collect();
             let &(want, level) = index
                 .get(&level_key(&values))
                 .expect("the table holds every level the population shows");
-            let got = subject.obs_cov(j).get(&column).copied();
+            let got = row_index(subject, snaps, &column, row);
             if got != Some(want as f64) {
                 return Some(LevelIndexFinding::Misindexed {
                     id: subject.id.clone(),
                     // The clock the label's `TIME=` reads too ([`column_value`]), so
                     // the message names one time, not two (#1796).
-                    time: Some(subject.readout_time(j)),
+                    time: row_time(subject, row),
                     label: level.label(decl.columns()),
                     want,
                     got,
@@ -1090,7 +1096,7 @@ fn no_gaussian_misindexed(
     for subject in population
         .subjects
         .iter()
-        .filter(|s| s.obs_times.is_empty())
+        .filter(|s| level_rows(decl, s).next().is_none())
     {
         let Ok(values) = baseline_level(decl, subject) else {
             continue;
@@ -1234,6 +1240,83 @@ fn cmp_levels(a: &Level, b: &Level) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
+/// A record that defines a level of a block: a Gaussian observation `j`, or record `r`
+/// of [`Subject::obs_records`], a discrete-state record of an endpoint whose expression
+/// reads the block ([`LevelBlockDecl::record_cmts`], #2562). A record of either kind is
+/// scored at its own level, so each one names a level the block must hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LevelRow {
+    Obs(usize),
+    Record(usize),
+}
+
+/// The rows of `subject` that define `decl`'s levels: every Gaussian observation, then
+/// every discrete-state record on one of the block's [`LevelBlockDecl::record_cmts`].
+fn level_rows<'a>(
+    decl: &'a LevelBlockDecl,
+    subject: &'a Subject,
+) -> impl Iterator<Item = LevelRow> + 'a {
+    let records = subject
+        .obs_records
+        .iter()
+        .enumerate()
+        .filter_map(|(r, rec)| match rec {
+            ObsRecord::DiscreteState { cmt, .. } if decl.record_cmts.contains(cmt) => {
+                Some(LevelRow::Record(r))
+            }
+            _ => None,
+        });
+    (0..subject.obs_times.len())
+        .map(LevelRow::Obs)
+        .chain(records)
+}
+
+/// The value of one level column on `row` of `subject`: [`column_value`] for a Gaussian
+/// observation; for a discrete-state record, its `TIME` as written (`raw_time`, the
+/// clock [`column_value`] keys on too) or the column in its own covariate snapshot
+/// (`snaps`, the subject's [`Subject::record_covariate_snapshots`]), else the baseline.
+fn row_value(
+    subject: &Subject,
+    snaps: Option<&[HashMap<String, f64>]>,
+    column: &str,
+    row: LevelRow,
+) -> Option<f64> {
+    match row {
+        LevelRow::Obs(j) => column_value(subject, column, j),
+        LevelRow::Record(r) => {
+            if column.eq_ignore_ascii_case(TIME_COLUMN) {
+                return match subject.obs_records.get(r) {
+                    Some(ObsRecord::DiscreteState { raw_time, .. }) => Some(*raw_time),
+                    _ => None,
+                };
+            }
+            subject.record_cov(snaps, r).get(column).copied()
+        }
+    }
+}
+
+/// The level index the predictors read on `row`: the observation's snapshot
+/// ([`Subject::obs_cov`]) or the record's ([`Subject::record_cov`]).
+fn row_index(
+    subject: &Subject,
+    snaps: Option<&[HashMap<String, f64>]>,
+    column: &str,
+    row: LevelRow,
+) -> Option<f64> {
+    match row {
+        LevelRow::Obs(j) => subject.obs_cov(j).get(column).copied(),
+        LevelRow::Record(r) => subject.record_cov(snaps, r).get(column).copied(),
+    }
+}
+
+/// The time a message names for `row`: the written time either way.
+fn row_time(subject: &Subject, row: LevelRow) -> Option<f64> {
+    match row {
+        LevelRow::Obs(j) => Some(subject.readout_time(j)),
+        LevelRow::Record(_) => row_value(subject, None, TIME_COLUMN, row),
+    }
+}
+
 /// The value of one level column on observation row `j` of `subject`.
 ///
 /// `TIME` is the time as written ([`Subject::readout_time`]), the TIME NONMEM keys
@@ -1263,10 +1346,11 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
     // level are kept, as before.
     let mut seen: std::collections::HashSet<Vec<u64>> = std::collections::HashSet::new();
     for subject in &population.subjects {
-        for j in 0..subject.obs_times.len() {
+        let snaps = subject.record_covariate_snapshots();
+        for row in level_rows(decl, subject) {
             let mut values = Vec::with_capacity(decl.columns().len());
             for column in decl.columns() {
-                let v = column_value(subject, column, j).ok_or_else(|| {
+                let v = row_value(subject, snaps, column, row).ok_or_else(|| {
                     format!(
                         "theta {}[...]: column `{column}` is not in the data \
                          (subject {})",
@@ -1344,6 +1428,29 @@ fn unit_of(
     }
 }
 
+/// [`unit_of`] for a [`LevelRow`]. A discrete-state record carries no occasion, so on
+/// [`Unit::Occasion`] it lies in none, and a kappa counts nowhere there; under nested
+/// levels its label path is read off its own snapshot (#2562).
+fn unit_of_row(
+    subject: &Subject,
+    snaps: Option<&[HashMap<String, f64>]>,
+    unit: Unit,
+    row: LevelRow,
+    nested: Option<&NestedLevels>,
+) -> Option<Vec<u64>> {
+    match row {
+        LevelRow::Obs(j) => unit_of(subject, unit, j, nested),
+        LevelRow::Record(r) => match unit {
+            Unit::Subject => Some(Vec::new()),
+            Unit::Occasion => None,
+            Unit::Level(l) => {
+                let path = label_path(nested?, subject.record_cov(snaps, r))?;
+                path.get(..=l).map(<[u64]>::to_vec)
+            }
+        },
+    }
+}
+
 /// Whether every level's observation records lie in a single unit (#1678,
 /// #1696): one subject for an η, one occasion of one subject for a kappa, one
 /// group of the kappa's level of one subject under nested levels.
@@ -1362,13 +1469,15 @@ fn levels_nest_in_units(
 ) -> bool {
     let mut owner: HashMap<Vec<u64>, (usize, Vec<u64>)> = HashMap::new();
     for (s, subject) in population.subjects.iter().enumerate() {
-        for j in 0..subject.obs_times.len() {
+        let snaps = subject.record_covariate_snapshots();
+        for row in level_rows(decl, subject) {
             let level: Option<Vec<u64>> = decl
                 .columns()
                 .iter()
-                .map(|c| column_value(subject, c, j).map(f64::to_bits))
+                .map(|c| row_value(subject, snaps, c, row).map(f64::to_bits))
                 .collect();
-            let (Some(level), Some(u)) = (level, unit_of(subject, unit, j, nested)) else {
+            let (Some(level), Some(u)) = (level, unit_of_row(subject, snaps, unit, row, nested))
+            else {
                 return false;
             };
             let u = (s, u);
@@ -1399,23 +1508,57 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population, lagged:
         return false;
     }
     population.subjects.iter().all(|subject| {
-        let mut seen: Vec<(Vec<f64>, usize)> = Vec::new();
-        (0..subject.obs_times.len()).all(|j| {
+        let snaps = subject.record_covariate_snapshots();
+        let mut seen: Vec<(Vec<f64>, LevelRow)> = Vec::new();
+        level_rows(decl, subject).all(|row| {
             let level: Vec<f64> = decl
                 .columns()
                 .iter()
-                .filter_map(|c| column_value(subject, c, j))
+                .filter_map(|c| row_value(subject, snaps, c, row))
                 .collect();
             match seen.iter().find(|(l, _)| *l == level) {
                 // Replicates, so a random effect moves both alike (#2131).
-                Some(&(_, j0)) => replicates(subject, j0, j, lagged),
+                Some(&(_, first)) => match (first, row) {
+                    (LevelRow::Obs(j0), LevelRow::Obs(j)) => replicates(subject, j0, j, lagged),
+                    (LevelRow::Record(r0), LevelRow::Record(r)) => {
+                        records_replicate(subject, snaps, r0, r)
+                    }
+                    // A Gaussian and a discrete record are scored by different
+                    // likelihoods, so a random effect need not move them alike.
+                    _ => false,
+                },
                 None => {
-                    seen.push((level, j));
+                    seen.push((level, row));
                     true
                 }
             }
         })
     })
+}
+
+/// [`replicates`] for two discrete-state records `r0` and `r` (#2562): one written
+/// time and one engine time (no reset between them, since a reset shifts the engine clock
+/// the predictor's `TIME` reads), one compartment and one covariate snapshot, so the data
+/// gives a random effect no way to move one and not the other. A record carries no
+/// occasion and no lag acts on it.
+fn records_replicate(
+    subject: &Subject,
+    snaps: Option<&[HashMap<String, f64>]>,
+    r0: usize,
+    r: usize,
+) -> bool {
+    let key = |r: usize| match subject.obs_records.get(r) {
+        Some(ObsRecord::DiscreteState {
+            time,
+            raw_time,
+            cmt,
+            ..
+        }) => Some((raw_time.to_bits(), time.to_bits(), *cmt)),
+        _ => None,
+    };
+    key(r0).is_some()
+        && key(r0) == key(r)
+        && subject.record_cov(snaps, r0) == subject.record_cov(snaps, r)
 }
 
 /// Whether observation records `j` and `k` of `subject` are replicates: one
@@ -1460,21 +1603,23 @@ fn replicates(subject: &Subject, j: usize, k: usize, lagged: bool) -> bool {
 /// occasion of a subject for a kappa, and within each group of its level for a
 /// kappa of a nested model.
 fn constant_within_units(
+    decl: &LevelBlockDecl,
     covariates: &[String],
     population: &Population,
     unit: Unit,
     nested: Option<&NestedLevels>,
 ) -> bool {
     population.subjects.iter().all(|subject| {
+        let snaps = subject.record_covariate_snapshots();
         covariates.iter().all(|c| {
             // Missing compares like any other value: a column absent from every
             // record is constant, one present on only some records changes.
             let mut first: Vec<(Vec<u64>, Option<f64>)> = Vec::new();
-            (0..subject.obs_times.len()).all(|j| {
-                let Some(u) = unit_of(subject, unit, j, nested) else {
+            level_rows(decl, subject).all(|row| {
+                let Some(u) = unit_of_row(subject, snaps, unit, row, nested) else {
                     return false;
                 };
-                let v = column_value(subject, c, j);
+                let v = row_value(subject, snaps, c, row);
                 match first.iter().find(|(u0, _)| *u0 == u) {
                     Some((_, v0)) => *v0 == v,
                     None => {
@@ -1660,6 +1805,7 @@ fn nesting_units(
 /// `y`. `None` when the walk names no site, which is where the span certificate
 /// is measured ([`spanned`]).
 fn structural_site<'a>(
+    decl: &LevelBlockDecl,
     c: &'a EtaCoupling,
     population: &Population,
     unit: Unit,
@@ -1669,7 +1815,7 @@ fn structural_site<'a>(
     let funnel = c
         .funnels
         .iter()
-        .find(|f| constant_within_units(&f.covariates, population, unit, nested));
+        .find(|f| constant_within_units(decl, &f.covariates, population, unit, nested));
     if let Some(f) = funnel {
         return Some(How::Site(&f.site));
     }
@@ -1709,7 +1855,7 @@ fn placements<'a>(
         .zip(units)
         .map(|(c, unit)| match unit {
             None => Placement::Unnested,
-            Some(unit) => match structural_site(c, population, unit, nested, resolving) {
+            Some(unit) => match structural_site(decl, c, population, unit, nested, resolving) {
                 Some(how) => Placement::Site(how, unit),
                 None => Placement::Silent(unit),
             },
@@ -1998,9 +2144,15 @@ fn non_gaussian_record_values(
     #[cfg(feature = "survival")]
     if model.has_non_gaussian() && !subject.obs_records.is_empty() {
         let mut prefix = subject.clone();
+        // Each record reads its own covariate snapshot when they line up (#2562): cut
+        // them with the records, or every prefix falls back to the baseline map.
+        let aligned = subject.record_covariate_snapshots().is_some();
         let mut out = Vec::with_capacity(subject.obs_records.len());
         for n in (1..=subject.obs_records.len()).rev() {
             prefix.obs_records.truncate(n);
+            if aligned {
+                prefix.endpoint_covariates.truncate(n);
+            }
             out.push(
                 crate::stats::likelihood::non_gaussian_terms(model, &prefix, theta, eta)
                     .into_iter()
@@ -2063,6 +2215,8 @@ fn indices_read(subject: &Subject, column: &str) -> Vec<f64> {
         &subject.dose_covariates,
         &subject.pk_only_covariates,
         &subject.reset_covariates,
+        // A discrete-state record's own index (#2562).
+        &subject.endpoint_covariates,
     ] {
         out.extend(maps.iter().filter_map(|m| m.get(column).copied()));
     }
@@ -5740,6 +5894,9 @@ fn share_site(share: &ScaleShare) -> String {
                 "the individual parameter `{p}` reads this block and carries a random effect{via}"
             )
         }
+        None if share.binary => {
+            format!("the `[binary_model]` predictor reads this block and a random effect{via}")
+        }
         None => format!("the `y` readout reads this block and a random effect{via}"),
     }
 }
@@ -5837,14 +5994,36 @@ fn write_index_column(
             })?;
             obs_index.push(idx);
         }
+        // The discrete-state records that read the block (#2562), each with its own
+        // index, from its own snapshot and written TIME.
+        let snaps = subject.record_covariate_snapshots();
+        let mut record_index: Vec<(usize, f64)> = Vec::new();
+        for row in level_rows(decl, subject) {
+            let LevelRow::Record(r) = row else {
+                continue;
+            };
+            let values: Vec<f64> = decl
+                .columns()
+                .iter()
+                .map(|c| row_value(subject, snaps, c, row).unwrap_or(f64::NAN))
+                .collect();
+            let idx = index_of(&values).ok_or_else(|| {
+                format!(
+                    "theta {}[...]: subject {} record {r} has a level combination that \
+                     was not discovered — the data changed between passes",
+                    decl.name(),
+                    subject.id
+                )
+            })?;
+            record_index.push((r, idx));
+        }
 
-        // A subject with no Gaussian observation (TTE, binary, categorical or Markov
-        // records only, #1797) has no record defining a level, and its records carry no
-        // covariate snapshot of their own: what its likelihood reads is its baseline
-        // `covariates`, so that is the level it is indexed at. A level the table does
-        // not hold gets index 1, and the subject is returned so the caller can refuse
-        // the binding if anything that subject is scored on reads the block.
-        let first = match obs_index.first() {
+        // A subject with no record defining a level (TTE, or records of an endpoint that
+        // does not read the block, only, #1797) is scored by a likelihood that reads its
+        // baseline `covariates`, so that is the level it is indexed at. A level the table
+        // does not hold gets index 1, and the subject is returned so the caller can
+        // refuse the binding if anything that subject is scored on reads the block.
+        let first = match obs_index.first().or(record_index.first().map(|(_, i)| i)) {
             Some(&i) => i,
             None => match baseline_level(decl, subject) {
                 Ok(values) => index_of(&values).unwrap_or_else(|| {
@@ -5864,6 +6043,7 @@ fn write_index_column(
             },
         };
         subject.covariates.insert(column.clone(), first);
+        write_record_index(decl, subject, &column, first, &record_index, table)?;
         let varies = obs_index.iter().any(|&v| v != first);
         if !varies {
             // Constant within the subject: the baseline map is enough, but any
@@ -5950,6 +6130,70 @@ fn write_index_column(
     // population with no observations, so every bound population has subjects
     // to carry it.
     Ok(unindexed)
+}
+
+/// Write the level index of each discrete-state record that reads the block into the
+/// record's own covariate snapshot (#2562), the map the binary predictor and the DTMM
+/// probabilities read it from. `first` is already the subject's baseline index.
+///
+/// Records that all sit at `first` need no snapshot of their own: the baseline is exact, and
+/// any snapshot the subject already carries gets `first`. Otherwise the
+/// snapshots are materialised from the baseline when the reader left them empty (no
+/// covariate varies within the subject), and every one gets `first` before the reading
+/// records get their own. A subject whose snapshots cannot line up with its records —
+/// it also carries time-to-event records, which a data row can yield zero or two of —
+/// cannot carry one index per record, so it is refused rather than scored at its first
+/// level.
+fn write_record_index(
+    decl: &LevelBlockDecl,
+    subject: &mut Subject,
+    column: &str,
+    first: f64,
+    record_index: &[(usize, f64)],
+    table: &[(Level, usize)],
+) -> Result<(), String> {
+    let Some(&(r, other)) = record_index.iter().find(|&&(_, i)| i != first) else {
+        // Constant within the subject: the baseline is exact, but snapshots that already
+        // exist (a time-varying covariate, or another block's index) are what each record
+        // reads, so they must carry it too.
+        for m in subject.endpoint_covariates.iter_mut() {
+            m.insert(column.to_string(), first);
+        }
+        return Ok(());
+    };
+    let aligned = !subject.has_event_records()
+        && (subject.endpoint_covariates.is_empty()
+            || subject.endpoint_covariates.len() == subject.obs_records.len());
+    if !aligned {
+        let label = |i: f64| {
+            table
+                .iter()
+                .find(|(_, k)| *k as f64 == i)
+                .map_or_else(String::new, |(l, _)| l.label(decl.columns()))
+        };
+        return Err(format!(
+            "theta {}[...]: subject {} has records its per-record covariate snapshots cannot \
+             be lined up with (it also carries time-to-event records, or was built in memory \
+             with snapshots of another length), so its records cannot each carry their own \
+             level of the block, and they are at more than one ({} and, at record {r}, {}). \
+             Key the block on columns that are constant within the subject, or fit the \
+             time-to-event endpoint separately.",
+            decl.name(),
+            subject.id,
+            label(first),
+            label(other),
+        ));
+    }
+    if subject.endpoint_covariates.is_empty() {
+        subject.endpoint_covariates = vec![subject.covariates.clone(); subject.obs_records.len()];
+    }
+    for m in subject.endpoint_covariates.iter_mut() {
+        m.insert(column.to_string(), first);
+    }
+    for &(r, i) in record_index {
+        subject.endpoint_covariates[r].insert(column.to_string(), i);
+    }
+    Ok(())
 }
 
 /// A subject with no Gaussian observation whose own level the writer could not index
@@ -6157,15 +6401,32 @@ fn unindexed_read_message(
     message.push_str(
         " A subject with no Gaussian observation takes its level from its baseline columns.",
     );
-    message.push_str(match source {
-        LevelSource::Data => {
+    // The records that define levels besides the Gaussian ones (#2562): those of the
+    // discrete-state endpoints that read the block.
+    let records = match decl.record_cmts.as_slice() {
+        [] => String::new(),
+        cmts => format!(
+            " and the records on CMT {}",
+            cmts.iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    message.push_str(&match source {
+        LevelSource::Data if records.is_empty() => {
             " The block's levels are discovered from Gaussian observation records only, \
              so a level that only such subjects show is not one of them."
+                .to_string()
         }
-        LevelSource::Fit => {
+        LevelSource::Data => format!(
+            " The block's levels are discovered from Gaussian observation records{records} \
+             only, so a level that only such subjects show is not one of them."
+        ),
+        LevelSource::Fit => format!(
             " A level's theta exists only for a combination the fit's Gaussian \
-             observations showed."
-        }
+             observations{records} showed."
+        ),
     });
     if read.iter().any(|u| u.why == Why::Time) {
         message.push_str(&format!(

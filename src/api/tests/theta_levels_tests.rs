@@ -5088,6 +5088,7 @@ mod absorption {
         let site = |param: Option<&str>, via: Option<&str>| ScaleShare {
             param: param.map(str::to_string),
             eta_via: via.map(str::to_string),
+            binary: false,
         };
         let via = |v: &str| Some(EtaRoute::Via(v.to_string()));
         let cases: [(&str, Option<ScaleShare>, Option<EtaRoute>); 8] = [
@@ -14801,6 +14802,11 @@ mod level_uncertainty {
         }
     }
 }
+
+/// A level block read by a discrete-state endpoint (#2562).
+#[cfg(feature = "survival")]
+#[path = "theta_levels_binary_tests.rs"]
+mod binary_records;
 
 /// A level `TIME` key reads the time as written (#1959, #1796).
 #[path = "theta_levels_written_time_tests.rs"]
