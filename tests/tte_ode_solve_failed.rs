@@ -264,15 +264,22 @@ fn warning_names_the_subject_the_state_and_the_censoring() {
     let w = w[0];
     for want in [
         "W_TTE_SOLVE_FAILED: subject '1' (CMT=2)",
-        "state `blowup` became non-finite",
+        "[odes] state `blowup` became non-finite",
         "The [odes] right-hand side diverged",
+        "Check the [odes] right-hand side and the parameter values",
         "censored at the observation window (t=30)",
         "not simulated past the failure",
         "The rest of the population still simulates.",
     ] {
         assert!(w.contains(want), "missing {want:?} in: {w}");
     }
-    for unwanted in ["state 0", "__chz", "subject '2'", "degenerate"] {
+    for unwanted in [
+        "state 0",
+        "__chz",
+        "subject '2'",
+        "degenerate",
+        "[event_model] hazard",
+    ] {
         assert!(!w.contains(unwanted), "unexpected {unwanted:?} in: {w}");
     }
     assert_eq!(out.warnings.len(), 1, "{:#?}", out.warnings);

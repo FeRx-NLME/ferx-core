@@ -2305,10 +2305,20 @@ fn degenerate_hazard_warning(id: &str, cmt: usize) -> String {
 /// Diagnostic for a subject whose ODE-accumulated event-time solve failed (#2087):
 /// collected into [`crate::api::SimulationOutput::warnings`] in place of the panic that
 /// used to abort the whole simulation. `why` is the solver's reason
-/// ([`crate::ode::ThresholdOutcome::SolveFailed`]); the divergence sentence is added only
-/// when that reason says a state went non-finite, so a negative-hazard or step-budget
-/// failure is not blamed on a diverged right-hand side. `competing` selects the
-/// competing-risks wording, where every cause of the subject is censored.
+/// ([`crate::ode::ThresholdOutcome::SolveFailed`]), with states labelled by
+/// `ode::predictions::chz_threshold_state_labels`. The reason decides which block the
+/// diagnosis and the advice point at, since the two failures live in different blocks of the
+/// model file:
+/// - an `[odes] state` that went non-finite → the `[odes]` right-hand side diverged;
+/// - a cumulative hazard that decreased → the `[event_model]` hazard went negative (the user
+///   wrote it there, not in `[odes]`), and the advice names that expression;
+/// - a cumulative hazard that went non-finite → the `[event_model]` hazard went non-finite,
+///   and the advice names both blocks (an `[odes]` state the hazard reads may be the cause);
+/// - neither (a step budget or stiff abort on finite states, a singular Jacobian, a
+///   non-finite break time) → no diagnosis sentence, and the advice names both blocks.
+///
+/// `competing` selects the competing-risks wording, where every cause of the subject is
+/// censored.
 #[cfg(feature = "survival")]
 fn ode_solve_failed_warning(
     id: &str,
@@ -2317,10 +2327,29 @@ fn ode_solve_failed_warning(
     window: f64,
     competing: bool,
 ) -> String {
-    let diverged = if why.contains("became non-finite") {
-        " The [odes] right-hand side diverged for this subject's parameter draw."
-    } else {
-        ""
+    let odes_diverged = why.contains("[odes] state `");
+    let hazard = why.contains("the cumulative hazard");
+    let hazard_negative = hazard && why.contains("decreased");
+    let mut diagnosis = String::new();
+    if odes_diverged {
+        diagnosis
+            .push_str(" The [odes] right-hand side diverged for this subject's parameter draw.");
+    }
+    if hazard {
+        diagnosis.push_str(if hazard_negative {
+            " The [event_model] hazard went negative for this subject's parameter draw."
+        } else {
+            " The [event_model] hazard went non-finite for this subject's parameter draw."
+        });
+    }
+    // A negative hazard is the hazard expression's own doing. A non-finite one may be, or may
+    // come from an `[odes]` state the hazard reads (the accumulator guard fires before any
+    // unmonitored state is reported), so it points at both blocks, as does a reason naming
+    // neither.
+    let check = match (odes_diverged, hazard, hazard_negative) {
+        (true, false, _) => "the [odes] right-hand side",
+        (false, true, true) => "the [event_model] hazard expression",
+        _ => "the [odes] right-hand side, the [event_model] hazard expression",
     };
     let censored = if competing {
         "every cause of the subject is censored at"
@@ -2329,10 +2358,10 @@ fn ode_solve_failed_warning(
     };
     format!(
         "W_TTE_SOLVE_FAILED: subject '{id}' (CMT={cmt}): the event-time solve of the \
-         ODE-accumulated hazard failed: {why}.{diverged} No event time could be simulated, so \
+         ODE-accumulated hazard failed: {why}.{diagnosis} No event time could be simulated, so \
          {censored} the observation window (t={window}) and is not simulated past the \
-         failure. The rest of the population still simulates. Check the [odes] right-hand \
-         side and the parameter values, including the drawn random effects."
+         failure. The rest of the population still simulates. Check {check} and the parameter \
+         values, including the drawn random effects."
     )
 }
 
@@ -4367,67 +4396,121 @@ mod tests {
     }
 
     /// The solver's `SolveFailed` reasons, one per producer class, as the labelled CHZ
-    /// driver words them (`ode/solver.rs` `until_threshold_with` / `with_nonfinite_state_note`,
-    /// `ode/predictions.rs` `ode_solve_until_chz_threshold`). The bool is whether a state
-    /// went non-finite, i.e. whether the divergence sentence belongs in the warning.
+    /// driver words them (`ode/solver.rs` `until_threshold_with` / `with_nonfinite_state_note`
+    /// with the labels of `ode/predictions.rs` `chz_threshold_state_labels`), each with the
+    /// diagnosis sentence and the advice the warning must carry for it.
     #[cfg(feature = "survival")]
-    const SOLVE_FAILED_REASONS: [(&str, bool); 7] = [
+    const SOLVE_FAILED_REASONS: [(&str, Diagnosis, &str); 8] = [
         (
-            "state `blowup` became non-finite before t=2.500017; step budget (10000) exhausted \
-             before reaching t_end=30.000000 (reached t=2.500017)",
-            true,
+            "[odes] state `blowup` became non-finite before t=2.500017; step budget (10000) \
+             exhausted before reaching t_end=30.000000 (reached t=2.500017)",
+            Diagnosis::OdesDiverged,
+            ODES,
         ),
         (
             "the cumulative hazard became non-finite at t=2.000000",
-            true,
+            Diagnosis::HazardNonFinite,
+            BOTH,
         ),
         (
             "the cumulative hazard decreased (0.500000 → 0.400000) over [1.000000, 1.100000]: \
              non-monotone accumulator (negative rate / hazard)",
-            false,
+            Diagnosis::HazardNegative,
+            HAZARD,
+        ),
+        (
+            "[odes] state `blowup`, the cumulative hazard of CMT=3 became non-finite before \
+             t=2.000000; step budget (10000) exhausted before reaching t_end=30.000000 \
+             (reached t=2.000000)",
+            Diagnosis::Both,
+            BOTH,
         ),
         (
             "step budget (10000) exhausted before reaching t_end=30.000000 (reached t=4.000000)",
-            false,
+            Diagnosis::None,
+            BOTH,
         ),
         (
             "aborted at t=1.000000 after 3 min-dt clamp(s) (ode_stiff_abort_after): the segment \
              is stability-limited",
-            false,
+            Diagnosis::None,
+            BOTH,
         ),
         (
             "the step at t=1.000000 could not be formed even at min_dt (singular Jacobian system)",
-            false,
+            Diagnosis::None,
+            BOTH,
         ),
-        ("non-finite break time", false),
+        ("non-finite break time", Diagnosis::None, BOTH),
     ];
 
+    /// Which diagnosis sentences a reason class must produce.
+    #[cfg(feature = "survival")]
+    #[derive(Clone, Copy, Debug)]
+    enum Diagnosis {
+        OdesDiverged,
+        HazardNonFinite,
+        HazardNegative,
+        Both,
+        None,
+    }
+
+    #[cfg(feature = "survival")]
+    const ODES: &str = "Check the [odes] right-hand side and the parameter values, including \
+                        the drawn random effects.";
+    #[cfg(feature = "survival")]
+    const HAZARD: &str = "Check the [event_model] hazard expression and the parameter values, \
+                          including the drawn random effects.";
+    #[cfg(feature = "survival")]
+    const BOTH: &str = "Check the [odes] right-hand side, the [event_model] hazard expression \
+                        and the parameter values, including the drawn random effects.";
+
     /// #2087 message input space: every producer class gets the code, the subject, the CMT,
-    /// the censoring time and each fixed sentence; the divergence sentence appears exactly
-    /// when a state went non-finite — both sides of that gate asserted here, in one test, so
-    /// forcing it either way reddens it.
+    /// the reason, the censoring sentence and the population sentence; and exactly the
+    /// diagnosis sentences and the advice its class calls for. Each diagnosis sentence is
+    /// asserted present where it belongs and absent everywhere else, so forcing any gate
+    /// either way reddens this test; the advice is asserted as the whole sentence, so a class
+    /// handed another class's advice reddens it too.
     ///
-    /// Mutations that redden it (one per sentence): drop the code / subject / CMT / reason;
-    /// make the divergence sentence unconditional, or delete it; delete the censoring
-    /// sentence or its window; delete "The rest of the population still simulates."; delete
-    /// the "Check the [odes]" advice.
+    /// Mutations that redden it (one per sentence or gate): drop the code / subject / CMT /
+    /// reason; delete or force any of the three diagnosis sentences; swap the negative and
+    /// non-finite hazard sentences; route any class to another advice; delete the censoring
+    /// sentence or its window; delete "The rest of the population still simulates.".
     #[cfg(feature = "survival")]
     #[test]
     fn ode_solve_failed_warning_covers_every_reason_class() {
-        for (why, nonfinite) in SOLVE_FAILED_REASONS {
+        const ODES_SENTENCE: &str =
+            "The [odes] right-hand side diverged for this subject's parameter draw.";
+        const NONFINITE_SENTENCE: &str =
+            "The [event_model] hazard went non-finite for this subject's parameter draw.";
+        const NEGATIVE_SENTENCE: &str =
+            "The [event_model] hazard went negative for this subject's parameter draw.";
+        for (why, diagnosis, advice) in SOLVE_FAILED_REASONS {
             let w = ode_solve_failed_warning("7", 2, why, 30.0, false);
             assert!(
                 w.starts_with("W_TTE_SOLVE_FAILED: subject '7' (CMT=2): "),
                 "{w}"
             );
             assert!(w.contains(&format!("failed: {why}.")), "{w}");
+            let (odes, nonfinite, negative) = match diagnosis {
+                Diagnosis::OdesDiverged => (true, false, false),
+                Diagnosis::HazardNonFinite => (false, true, false),
+                Diagnosis::HazardNegative => (false, false, true),
+                Diagnosis::Both => (true, true, false),
+                Diagnosis::None => (false, false, false),
+            };
+            assert_eq!(w.contains(ODES_SENTENCE), odes, "{diagnosis:?}: {w}");
             assert_eq!(
-                w.contains(
-                    "The [odes] right-hand side diverged for this subject's parameter draw."
-                ),
+                w.contains(NONFINITE_SENTENCE),
                 nonfinite,
-                "divergence sentence must track whether a state went non-finite: {w}"
+                "{diagnosis:?}: {w}"
             );
+            assert_eq!(
+                w.contains(NEGATIVE_SENTENCE),
+                negative,
+                "{diagnosis:?}: {w}"
+            );
+            assert!(w.ends_with(advice), "{diagnosis:?} advice: {w}");
             assert!(
                 w.contains(
                     "No event time could be simulated, so the subject is censored at the \
@@ -4437,13 +4520,6 @@ mod tests {
             );
             assert!(
                 w.contains("The rest of the population still simulates."),
-                "{w}"
-            );
-            assert!(
-                w.contains(
-                    "Check the [odes] right-hand side and the parameter values, including the \
-                     drawn random effects."
-                ),
                 "{w}"
             );
             assert!(!w.contains("degenerate"), "{w}");
@@ -4463,7 +4539,7 @@ mod tests {
     #[cfg(feature = "survival")]
     #[test]
     fn ode_solve_failed_warning_competing_wording_straddles_the_gate() {
-        let (why, _) = SOLVE_FAILED_REASONS[0];
+        let (why, ..) = SOLVE_FAILED_REASONS[0];
         let cr = ode_solve_failed_warning("1", 3, why, 12.5, true);
         let single = ode_solve_failed_warning("1", 3, why, 12.5, false);
         assert!(
@@ -4490,7 +4566,7 @@ mod tests {
     #[test]
     fn ode_solve_failed_warning_classifies_as_simulation() {
         for competing in [false, true] {
-            for (why, _) in SOLVE_FAILED_REASONS {
+            for (why, ..) in SOLVE_FAILED_REASONS {
                 let w = ode_solve_failed_warning("7", 2, why, 30.0, competing);
                 let e = crate::types::classify_warning(&w);
                 assert_eq!(e.category.as_str(), "simulation", "{w}");
