@@ -2602,9 +2602,10 @@ mod tests {
                 opts,
             )
         };
-        // `0`: the first instant, where one ULP is subnormal and the two times share a break;
-        // `4`: a later dose with residual drug, inside the `1e-15` break dedup; `8.2`: one ULP
-        // is above the dedup, so the record and the dose keep separate breaks.
+        // `0`: the first instant, where the record is the integration start, so the record and
+        // the dose share the first break. `4` and `8.2`: a later dose with residual drug, at two
+        // ULP sizes. The EKF breaks on doses and infusion ends, not on observations, so there
+        // the record is a save point of the segment ending at the dose's break.
         for (t, ss) in [0.0f64, 4.0, 8.2]
             .into_iter()
             .flat_map(|t| [(t, true), (t, false)])
@@ -2658,9 +2659,19 @@ mod tests {
     /// The control is the same SS dose as the subject's **first** event. The SS record resets
     /// the system, so the history before it cannot reach a later read. With no segment ending
     /// at `t`, the boundary read is the record's only read. Bolus and a 2-h infusion, at `4`
-    /// (inside the `1e-15` break dedup) and `8.2` (separate breaks). Measured before the fix:
-    /// post-dose `p_obs` 0.3366 against the steady state's 1.0000. Mutation: dropping the
-    /// re-assimilation fails the first case.
+    /// and `8.2`, over two histories:
+    ///
+    /// * a bolus at `0`, where the SS dose's own time is the break that applies it;
+    /// * an infusion ending exactly at `t⁻`. That puts a break one ULP below the SS dose,
+    ///   which matches it within `EVENT_MATCH_TOL`, so the dose is applied at a break that is
+    ///   not its own time. A reset flag keyed on `dose.time == t_start` fails this history only.
+    ///
+    /// Each also has a duplicate post-dose record (`[t⁻, t, t, t + 4]`). Both copies are one
+    /// instant and must share the steady state's single update, so a clear that stopped at
+    /// the first matching record leaves the second stale.
+    ///
+    /// Measured before the fix: post-dose `p_obs` 0.3366 against the steady state's 1.0000.
+    /// Mutation: dropping the re-assimilation fails the first case.
     #[test]
     fn ekf_split_tie_across_an_ss_dose_conditions_on_the_steady_state() {
         let pk = make_pk(1.0, 20.0);
@@ -2685,50 +2696,82 @@ mod tests {
             )
         };
         for t in [4.0f64, 8.2] {
-            for rate in [0.0, 50.0] {
-                let doses = [
-                    bolus_dose(100.0),
-                    DoseEvent::new(t, 100.0, 1, rate, true, 12.0),
-                ];
-                let split = run(&doses, &[t.next_down(), t, t + 4.0]);
-                let unsplit = run(&doses, &[t, t + 4.0]);
-                // The SS record resets the system, so the history before it cannot reach a
-                // later read, and a subject whose first event is the SS dose has no segment
-                // ending at `t` to read the record early: the boundary read is its only one.
-                let control = run(&doses[1..], &[t, t + 4.0]);
-                for (i, p) in split.iter().enumerate() {
+            // Rate 1, so the duration is the amount exactly and the end lands on `t⁻`.
+            let ends_at_t_minus = DoseEvent::new(0.0, t.next_down(), 1, 1.0, false, 0.0);
+            assert_eq!(
+                ends_at_t_minus.time + ends_at_t_minus.duration,
+                t.next_down(),
+                "the infusion must end exactly one ULP below the SS dose"
+            );
+            for (history, prior) in [("bolus", bolus_dose(100.0)), ("infusion", ends_at_t_minus)] {
+                for rate in [0.0, 50.0] {
+                    let case = format!("t = {t}, {history} history, SS rate = {rate}");
+                    let doses = [prior.clone(), DoseEvent::new(t, 100.0, 1, rate, true, 12.0)];
+                    let split = run(&doses, &[t.next_down(), t, t + 4.0]);
+                    let unsplit = run(&doses, &[t, t + 4.0]);
+                    let dup = run(&doses, &[t.next_down(), t, t, t + 4.0]);
+                    // The SS record resets the system, so the history before it cannot reach
+                    // a later read, and a subject whose first event is the SS dose has no
+                    // segment ending at `t` to read the record early: the boundary read is its
+                    // only one. One control per observation vector.
+                    //
+                    // Open (#2567 review): under an SS **infusion**, the covariance at `t + 4`
+                    // depends on whether the dose is applied at a break on its own time or at
+                    // one a ULP below it (`t = 4`, measured 0.34315 against 0.34245, ~0.2%).
+                    // Which one a subject gets is decided by the other breaks (the history, or
+                    // an observation at `t⁻` being the integration start), not by this fix. So
+                    // for an SS infusion only the post-dose rows are compared; for an SS bolus
+                    // every row is.
+                    let ctl = |obs: &[f64]| run(&doses[1..], obs);
+                    let (c_split, c_unsplit, c_dup) = (
+                        ctl(&[t.next_down(), t, t + 4.0]),
+                        ctl(&[t, t + 4.0]),
+                        ctl(&[t.next_down(), t, t, t + 4.0]),
+                    );
+                    for (i, p) in split.iter().chain(&dup).enumerate() {
+                        assert!(
+                            p.ipred.is_finite() && p.p_obs.is_finite() && p.p_obs > 0.0,
+                            "{case}, idx {i}: {p:?}"
+                        );
+                    }
+                    let mut rows = vec![
+                        ("split post-dose", &split[1], &c_split[1]),
+                        ("unsplit post-dose", &unsplit[0], &c_unsplit[0]),
+                        ("duplicate 1st post-dose", &dup[1], &c_dup[1]),
+                        ("duplicate 2nd post-dose", &dup[2], &c_dup[2]),
+                    ];
+                    if rate == 0.0 {
+                        rows.extend([
+                            ("split later", &split[2], &c_split[2]),
+                            ("unsplit later", &unsplit[1], &c_unsplit[1]),
+                            ("duplicate later", &dup[3], &c_dup[3]),
+                        ]);
+                    }
+                    for (name, s, c) in rows {
+                        assert!(
+                            (s.ipred - c.ipred).abs() <= 1e-12 * c.ipred,
+                            "{case}: {name} ipred {} vs control {}",
+                            s.ipred,
+                            c.ipred
+                        );
+                        assert!(
+                            (s.p_obs - c.p_obs).abs() <= 1e-12 * c.p_obs,
+                            "{case}: {name} p_obs {} vs first-event SS control {}",
+                            s.p_obs,
+                            c.p_obs
+                        );
+                    }
+                    // The two copies share one update, bit for bit.
+                    assert_eq!(dup[1].p_obs.to_bits(), dup[2].p_obs.to_bits(), "{case}");
+                    // Non-vacuity: the pre-dose record's covariance is not the steady state's,
+                    // so a post-dose record keeping it would fail above.
                     assert!(
-                        p.ipred.is_finite() && p.p_obs.is_finite() && p.p_obs > 0.0,
-                        "t = {t}, rate = {rate}, idx {i}: {p:?}"
+                        (split[0].p_obs - c_split[1].p_obs).abs() > 1e-6 * c_split[1].p_obs,
+                        "{case}: pre {} and SS {} covariances coincide",
+                        split[0].p_obs,
+                        c_split[1].p_obs
                     );
                 }
-                for (name, s, c) in [
-                    ("split post-dose", &split[1], &control[0]),
-                    ("split later", &split[2], &control[1]),
-                    ("unsplit post-dose", &unsplit[0], &control[0]),
-                    ("unsplit later", &unsplit[1], &control[1]),
-                ] {
-                    assert!(
-                        (s.ipred - c.ipred).abs() <= 1e-12 * c.ipred,
-                        "t = {t}, rate = {rate}: {name} ipred {} vs control {}",
-                        s.ipred,
-                        c.ipred
-                    );
-                    assert!(
-                        (s.p_obs - c.p_obs).abs() <= 1e-12 * c.p_obs,
-                        "t = {t}, rate = {rate}: {name} p_obs {} vs first-event SS control {}",
-                        s.p_obs,
-                        c.p_obs
-                    );
-                }
-                // Non-vacuity: the pre-dose record's covariance is not the steady state's,
-                // so a post-dose record keeping it would fail above.
-                assert!(
-                    (split[0].p_obs - control[0].p_obs).abs() > 1e-6 * control[0].p_obs,
-                    "t = {t}, rate = {rate}: pre {} and SS {} covariances coincide",
-                    split[0].p_obs,
-                    control[0].p_obs
-                );
             }
         }
     }
