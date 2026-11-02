@@ -2441,8 +2441,9 @@ fn ebe_prior_maha_is_the_omega_inverse_quadratic_form() {
 /// return it. Fails without the runaway guard: the FD route returns the runaway instead.
 ///
 /// Not under `inner_optimizer = nelder_mead` (#2588): there the cold primary search is the
-/// same derivative-free Nelder–Mead from η = 0 the guard recovers with, and its certificate
-/// stays put. Measured on this fixture under NM, both routes end `NmMoved` at
+/// same derivative-free Nelder–Mead from η = 0 the guard recovers with, and the certificate's
+/// move keeps it inside the runaway limit. Measured on this fixture under NM, both routes end
+/// `NmMoved` at
 /// `ηᵀΩ⁻¹η = 5.13` against the limit of 300, so the guard never runs and its exit swap
 /// (`ebe_exit = certified(cold_ok)`, which clears `nm_polished`) has no NM fixture. Reaching
 /// it would need a warm start past the limit inside a far, higher basin; none is cheap.

@@ -2268,9 +2268,11 @@ mod tests {
     /// #2588 (M13): a Bayes fit reports the posterior-mean inner loop's moved count in
     /// `total_ebe_nm_polished` under `inner_optimizer = nelder_mead`. That loop is the only
     /// inner solve the count reads (the sampler draws η by MH, not by a mode search), so it
-    /// is at most one per subject. At warfarin's `inner_tol = 1e-5` every NM stop needs the
-    /// move (#2571), so it is non-zero; under the default optimizer it is 0. A short chain
-    /// is enough: the count is about the inner solve at the posterior mean, not the mixing.
+    /// is at most one per subject. Measured 9 of 10 at `inner_tol = 1e-5` (macOS arm64): the
+    /// loop is warm-started from the chains' η, and the tenth subject's stop was not moved
+    /// (with no fallback either), so the bound is `0 < n ≤ subjects`, not `n = subjects`.
+    /// Under the default optimizer it is 0. A short chain is enough: the count is about the
+    /// inner solve at the posterior mean, not the mixing.
     #[test]
     fn a_bayes_fit_reports_the_moved_subjects_under_nelder_mead() {
         use crate::types::{FitOptions, InnerOptimizer};

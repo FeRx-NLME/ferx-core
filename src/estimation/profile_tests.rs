@@ -5766,7 +5766,11 @@ fn a_certified_fallback_takes_the_adjoint_level_gradient() {
 /// loop's count alone, so dropping the states term went unseen. Here the start loop is run
 /// again with the solve's own arguments (`ProfileCtx::solve`'s `run_inner_loop_warm_map`
 /// call), and the solve must count more than it: every Newton step re-solves each EBE under
-/// `nelder_mead`, and at F2's tolerance the certificate moves some of those stops.
+/// `nelder_mead`, and at F2's tolerance the certificate moves some of those stops (measured
+/// start 3, solve 6, on F2's 3 subjects). The bound is one-sided: a doubled start term would
+/// also give 6, and the final states' own flags are not exposed to assert the difference
+/// exactly. The start-loop arguments are a copy of `ProfileCtx::solve`'s, so a change there
+/// must be mirrored here (#2598 review r1, row 5).
 #[test]
 fn the_profile_solve_counts_its_own_moved_states() {
     let p = prep(F2, F2_DATA, Some(3), |t| t);
