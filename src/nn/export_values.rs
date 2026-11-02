@@ -41,16 +41,23 @@ static SD_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i-u)\(\s*sd\
 pub(super) fn write_fitted_values(text: &str, fit: &FitResult) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_parameters = false;
-    // A `block_*` declaration whose `[` … `]` spans several lines, joined.
+    // A `block_*` declaration whose `[` … `]` spans several lines, joined onto
+    // one, with the comments of its lines kept after it.
     let mut pending: Option<String> = None;
+    let mut comments: Vec<&str> = Vec::new();
     for line in text.lines() {
         let code = strip_line_comment(line);
         if let Some(open) = pending.as_mut() {
             open.push(' ');
             open.push_str(code.trim());
+            comments.push(line[code.len()..].trim());
             if code.contains(']') {
                 let joined = pending.take().expect("set above");
                 out.push_str(&rewrite_line(&joined, fit));
+                for c in comments.drain(..).filter(|c| !c.is_empty()) {
+                    out.push_str("  ");
+                    out.push_str(c);
+                }
                 out.push('\n');
             }
             continue;
@@ -65,6 +72,7 @@ pub(super) fn write_fitted_values(text: &str, fit: &FitResult) -> String {
                 out.push('\n');
             } else {
                 pending = Some(code.trim_end().to_string());
+                comments.push(line[code.len()..].trim());
             }
             continue;
         }

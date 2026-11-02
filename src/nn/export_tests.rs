@@ -669,6 +669,71 @@ fn a_fit_made_with_a_different_network_is_refused() {
     assert!(err.contains("no model text"), "{err}");
 }
 
+/// The model must be the fit's own outside the networks too: a changed
+/// equation, error model, parameter set or `FIX` keeps every network field and
+/// every weight name, and would otherwise be exported at estimates made for a
+/// different model. Comments, layout, the numbers in [parameters] and the data
+/// path may differ.
+#[test]
+fn a_model_changed_outside_the_networks_is_refused() {
+    let fit = fixture_fit(Some(FIXTURE_MODEL));
+    let opts = DcmExportOptions::default();
+    let cosmetic = FIXTURE_MODEL
+        .replace(
+            "  theta TVV(30, 1, 100)",
+            "  theta TVV ( 25 , -0.5, 200 )  # moved",
+        )
+        .replace("omega ETA_KA ~ 0.2", "omega ETA_KA ~ 2.5e-1")
+        .replace(
+            "[parameters]",
+            "[data]\n  path = \"elsewhere.csv\"\n\n[parameters]",
+        );
+    export_dcm_from_fit(&cosmetic, &fit, &opts).unwrap();
+    for (from, to, shown) in [
+        (
+            "V  = TVV * exp(ETA_V)",
+            "V  = 2 * TVV * exp(ETA_V)",
+            "`V  = 2 * TVV * exp(ETA_V)`",
+        ),
+        (
+            "proportional(PROP_ERR)",
+            "additive(PROP_ERR)",
+            "`DV ~ additive(PROP_ERR)`",
+        ),
+        (
+            "theta TVV(30, 1, 100)",
+            "theta TVV(30, 1, 100) FIX",
+            "`theta TVV(30, 1, 100) FIX`",
+        ),
+        (
+            "one_cpt_oral",
+            "one_cpt_iv_bolus",
+            "`pk one_cpt_iv_bolus(cl=CL, v=V, ka=KA)`",
+        ),
+        (
+            "  sigma PROP_ERR",
+            "  theta TVX(1, 0, 9)\n  sigma PROP_ERR",
+            "`theta TVX(1, 0, 9)`",
+        ),
+    ] {
+        let model = FIXTURE_MODEL.replace(from, to);
+        assert_ne!(model, FIXTURE_MODEL);
+        let err = export_dcm_from_fit(&model, &fit, &opts).unwrap_err();
+        assert!(
+            err.contains("not the one the fit was made with") && err.contains(shown),
+            "{from} -> {to}: {err}"
+        );
+    }
+    // A line the model lacks is named as missing.
+    let shorter = FIXTURE_MODEL.replace("  V  = TVV * exp(ETA_V)\n", "");
+    let err = export_dcm_from_fit(&shorter, &fit, &opts).unwrap_err();
+    assert!(
+        err.contains("`KA = TYPICAL_PK . KA * exp(ETA_KA)` where"),
+        "{err}"
+    );
+    assert!(err.contains("`V  = TVV * exp(ETA_V)`"), "{err}");
+}
+
 /// The committed `fit.json` the CLI test reads is this fixture's fit: the
 /// fixture's θ and model text. Regenerate it by setting
 /// `FERX_WRITE_DCM_FIT_JSON=1` (in an `nn` build, so the file carries the
@@ -739,7 +804,7 @@ fn declarations_keep_their_scale_and_blocks_are_written() {
     let model = FIXTURE_MODEL
         .replace(
             "  omega ETA_CL ~ 0.1\n  omega ETA_V  ~ 0.05\n",
-            "  block_omega (ETA_CL, ETA_V) = [0.1,\n     0.01, 0.05]   # CL-V\n",
+            "  block_omega (ETA_CL, ETA_V) = [0.1,   # var CL\n     0.01, 0.05]   # CL-V\n",
         )
         .replace(
             "  omega ETA_KA ~ 0.2",
@@ -768,7 +833,7 @@ fn declarations_keep_their_scale_and_blocks_are_written() {
     }];
     let text = export_dcm_from_fit(&model, &fit, &DcmExportOptions::default()).unwrap();
     assert!(
-        text.contains("block_omega (ETA_CL, ETA_V) = [0.0912, 0.0123, 0.0437]"),
+        text.contains("block_omega (ETA_CL, ETA_V) = [0.0912, 0.0123, 0.0437]  # var CL  # CL-V\n"),
         "{text}"
     );
     assert!(

@@ -492,6 +492,11 @@ and each `[covariate_nn]` block must declare the same inputs, outputs, layers,
 activations, `center` and `scale` in both (comments and `init` may differ). The
 weight names only record the block name and the shape, so without this check a
 fit of a different network of the same shape would export without complaint.
+The rest of the model has to be the fit's too — every equation, the error model,
+which parameters exist and which are `FIX` — or the estimates would be written
+into a model they were not made for. Comments, layout, the numbers in
+`[parameters]`, `[data] path` and `[priors]` may differ; anything else is an
+error naming the first line that does.
 
 The library entry points are `ferx_core::nn::export::export_dcm_from_fit` (model
 text + fit, with that check and the fit's other estimates) and
@@ -528,10 +533,14 @@ the networks and keep every other value as the model file declares it.
 The `[data]` and `[priors]` blocks are copied exactly. A relative `[data] path`
 or `[priors] from_fit` then resolves against wherever the export is loaded from,
 so `export-dcm` prints a note when the export is written to a different
-directory than the model (always, for a `.fitrx`, whose original directory it
-does not know). A `from_fit` prior was made for the network model; its
-network-weight entries match no free theta in the export and are skipped when it
-loads, which `export-dcm` also notes. `-o` naming the model or the fit is
+directory than the model. A `.fitrx` does not record the original model's
+directory, so for a bundle the note asks you to check the path resolves from the
+export's directory. A `from_fit` prior was made for the network model; its
+network-weight entries match no free theta in the export and are skipped. When
+the prior source can be found (next to the model file, or by an absolute path),
+`export-dcm` loads the export with it, and refuses the export if nothing else
+would import — the export would otherwise fail to load. When it cannot be found,
+the note says the check was not made. `-o` naming the model or the fit is
 refused rather than overwriting it.
 
 A block this build of ferx cannot parse — `[event_model]` or `[binary_model]`

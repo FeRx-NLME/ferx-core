@@ -324,7 +324,10 @@ fn parse_for_validation(text: &str) -> Result<crate::types::CompiledModel, Strin
 /// must define the same network in both: the same blocks by name, and in each
 /// the same inputs and outputs in order, hidden widths, both activations and
 /// `center` / `scale` bit for bit. Comments, layout and `init` (a starting value
-/// the fitted weights supersede) may differ.
+/// the fitted weights supersede) may differ. The rest of the model must match
+/// too — every equation, the error model, which parameters exist and which are
+/// `FIX` — up to comments, layout, the numbers in `[parameters]`, `[data] path`
+/// and `[priors]` (see `model_lines`).
 ///
 /// This is the entry point to use whenever the model text and the fit arrive
 /// separately (`ferx export-dcm model.ferx --fit run.json`). A fit that carries
@@ -339,6 +342,7 @@ pub fn export_dcm_from_fit(
          checked against this model; export from the fit's `.fitrx` bundle instead",
     )?;
     check_same_networks(model_text, fitted)?;
+    check_same_model(model_text, fitted)?;
     if opts.network_only {
         return export_dcm_as_analytic(model_text, &fit.theta_names, &fit.theta, opts);
     }
@@ -449,6 +453,94 @@ fn check_same_networks(model_text: &str, fitted_text: &str) -> Result<(), String
         }
     }
     Ok(())
+}
+
+/// The lines of `text` that define the model, each with whitespace removed:
+/// `(normalised, original)`.
+///
+/// Left out, since they cannot change what the model predicts at the fit:
+/// comments and blank lines; the numbers of `[parameters]` (starting values,
+/// bounds and inline priors — the export writes the fit's estimates over them);
+/// a `[covariate_nn]` `init` (a starting value the fitted weights supersede);
+/// `[data] path` (which file, not how it is read); and `[priors]`, which
+/// shapes only a refit. Everything else — every equation, the error model,
+/// which parameters exist and which are `FIX`, `[fit_options]` — must match.
+fn model_lines(text: &str) -> Vec<(String, &str)> {
+    static TOKEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"[A-Za-z_]\w*|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?").unwrap()
+    });
+    static SIGNED: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"([(,~=\[])[-+]#").unwrap());
+    let mut block = String::new();
+    let mut out = Vec::new();
+    // A header counts only once a line of its block does, so a block left empty
+    // by the exclusions (a `[data]` holding only a path) is no difference.
+    let mut header: Option<(String, &str)> = None;
+    for line in text.lines() {
+        let code = strip_line_comment(line).trim();
+        if code.is_empty() {
+            continue;
+        }
+        let mut norm: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        if let Some((ty, _)) = block_header(code) {
+            block = ty;
+            header = Some((norm, line));
+            continue;
+        }
+        match block.as_str() {
+            "priors" => continue,
+            "covariate_nn" if norm.to_ascii_lowercase().starts_with("init=") => continue,
+            "data" if norm.to_ascii_lowercase().starts_with("path=") => continue,
+            "parameters" => {
+                let masked = TOKEN.replace_all(&norm, |c: &regex::Captures| {
+                    let t = &c[0];
+                    if t.starts_with(|ch: char| ch.is_ascii_digit() || ch == '.') {
+                        "#".to_string()
+                    } else {
+                        t.to_string()
+                    }
+                });
+                norm = SIGNED.replace_all(&masked, "$1#").into_owned();
+            }
+            _ => {}
+        }
+        out.extend(header.take());
+        out.push((norm, line));
+    }
+    out
+}
+
+/// The whole-model half of the check behind [`export_dcm_from_fit`]: the model
+/// text must be the one the fit was made with, up to what [`model_lines`]
+/// leaves out. The network check alone would let a changed structural equation
+/// or error model through and export it at estimates made for another model.
+fn check_same_model(model_text: &str, fitted_text: &str) -> Result<(), String> {
+    let ours = model_lines(model_text);
+    let theirs = model_lines(fitted_text);
+    let differ = ours
+        .iter()
+        .map(Some)
+        .chain(std::iter::repeat(None))
+        .zip(theirs.iter().map(Some).chain(std::iter::repeat(None)))
+        .take(ours.len().max(theirs.len()))
+        .find(|(a, b)| a.map(|x| &x.0) != b.map(|x| &x.0));
+    match differ {
+        None => Ok(()),
+        Some((a, b)) => {
+            let show = |x: Option<&(String, &str)>| {
+                x.map_or("(nothing)".to_string(), |(_, l)| format!("`{}`", l.trim()))
+            };
+            Err(format!(
+                "the model is not the one the fit was made with: the model has {} where \
+                 the fit's model has {}; export from the fit's `.fitrx` bundle, or from \
+                 the model file the fit was made with. Only comments, layout, the numbers \
+                 in [parameters], a [covariate_nn] `init`, `[data] path` and [priors] may \
+                 differ",
+                show(a),
+                show(b)
+            ))
+        }
+    }
 }
 
 /// What one physical line of the model is, for the rewrite.
