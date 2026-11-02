@@ -1163,10 +1163,11 @@ fn a_profiled_block_in_the_binary_predictor_is_walked_as_a_linked_readout() {
 
 /// A block read only in an `[event_model]` hazard is not "read by no prediction": the
 /// walk does not judge a hazard, so it leaves the model to `E_PROFILE_SCOPE`, which
-/// names the endpoint (#2562). Both sides of that gate in one test: with no endpoint
-/// block, the same unread block is refused as unread.
+/// names the endpoint (#2562). The gate's other sides in one test: with no endpoint
+/// block, or a hazard that reads something else, the same block is refused as unread.
 ///
-/// Mutation: drop the endpoint exemption and the hazard model is refused as unread.
+/// Mutations: drop the endpoint exemption and the hazard model is refused as unread;
+/// exempt any model with an endpoint block and the third model passes.
 #[cfg(feature = "survival")]
 #[test]
 fn a_profiled_block_read_only_in_a_hazard_reaches_the_endpoint_refusal() {
@@ -1188,4 +1189,11 @@ fn a_profiled_block_read_only_in_a_hazard_reaches_the_endpoint_refusal() {
         REMOVE,
     );
     assert!(!msg.contains("no prediction reads it"), "{msg}");
+
+    // An endpoint block that reads something else does not excuse an unread block.
+    let elsewhere = text.replace("TVLAMBDA * exp(PLACEBO[STUDY])", "TVLAMBDA");
+    let err = parse_full_model(&elsewhere)
+        .err()
+        .expect("the hazard does not read the block");
+    assert!(err.contains("no prediction reads it"), "{err}");
 }

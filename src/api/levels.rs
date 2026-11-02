@@ -1537,8 +1537,10 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population, lagged:
 }
 
 /// [`replicates`] for two discrete-state records `r0` and `r` (#2562): one written
-/// time, one compartment and one covariate snapshot, so the data gives a random effect no
-/// way to move one and not the other. A record carries no occasion and no lag acts on it.
+/// time and one engine time (no reset between them, since a reset shifts the engine clock
+/// the predictor's `TIME` reads), one compartment and one covariate snapshot, so the data
+/// gives a random effect no way to move one and not the other. A record carries no
+/// occasion and no lag acts on it.
 fn records_replicate(
     subject: &Subject,
     snaps: Option<&[HashMap<String, f64>]>,
@@ -1546,7 +1548,12 @@ fn records_replicate(
     r: usize,
 ) -> bool {
     let key = |r: usize| match subject.obs_records.get(r) {
-        Some(ObsRecord::DiscreteState { raw_time, cmt, .. }) => Some((raw_time.to_bits(), *cmt)),
+        Some(ObsRecord::DiscreteState {
+            time,
+            raw_time,
+            cmt,
+            ..
+        }) => Some((raw_time.to_bits(), time.to_bits(), *cmt)),
         _ => None,
     };
     key(r0).is_some()
@@ -5887,6 +5894,9 @@ fn share_site(share: &ScaleShare) -> String {
                 "the individual parameter `{p}` reads this block and carries a random effect{via}"
             )
         }
+        None if share.binary => {
+            format!("the `[binary_model]` predictor reads this block and a random effect{via}")
+        }
         None => format!("the `y` readout reads this block and a random effect{via}"),
     }
 }
@@ -6126,7 +6136,8 @@ fn write_index_column(
 /// record's own covariate snapshot (#2562), the map the binary predictor and the DTMM
 /// probabilities read it from. `first` is already the subject's baseline index.
 ///
-/// Records that all sit at `first` need no snapshot: the baseline is exact. Otherwise the
+/// Records that all sit at `first` need no snapshot of their own: the baseline is exact, and
+/// any snapshot the subject already carries gets `first`. Otherwise the
 /// snapshots are materialised from the baseline when the reader left them empty (no
 /// covariate varies within the subject), and every one gets `first` before the reading
 /// records get their own. A subject whose snapshots cannot line up with its records —
@@ -6142,6 +6153,12 @@ fn write_record_index(
     table: &[(Level, usize)],
 ) -> Result<(), String> {
     let Some(&(r, other)) = record_index.iter().find(|&&(_, i)| i != first) else {
+        // Constant within the subject: the baseline is exact, but snapshots that already
+        // exist (a time-varying covariate, or another block's index) are what each record
+        // reads, so they must carry it too.
+        for m in subject.endpoint_covariates.iter_mut() {
+            m.insert(column.to_string(), first);
+        }
         return Ok(());
     };
     let aligned = !subject.has_event_records()
@@ -6155,10 +6172,12 @@ fn write_record_index(
                 .map_or_else(String::new, |(l, _)| l.label(decl.columns()))
         };
         return Err(format!(
-            "theta {}[...]: subject {} also carries time-to-event records, so its records \
-             cannot each carry their own level of the block, and they are at more than one \
-             ({} and, at record {r}, {}). Key the block on columns that are constant within \
-             the subject, or fit the time-to-event endpoint separately.",
+            "theta {}[...]: subject {} has records its per-record covariate snapshots cannot \
+             be lined up with (it also carries time-to-event records, or was built in memory \
+             with snapshots of another length), so its records cannot each carry their own \
+             level of the block, and they are at more than one ({} and, at record {r}, {}). \
+             Key the block on columns that are constant within the subject, or fit the \
+             time-to-event endpoint separately.",
             decl.name(),
             subject.id,
             label(first),

@@ -5314,23 +5314,30 @@ pub fn parse_full_model_with(
             &indiv_stmts,
         );
         let mut readout = readout;
+        let n_binary = binary_readouts.len();
         readout.extend(binary_readouts.iter().cloned());
         readout_with_states.extend(binary_readouts.iter().cloned());
         for decl in level_block_decls.iter_mut() {
             decl.scale_share =
-                block_shares_scale_with_eta(&indiv_stmts, &readout, &decl.name, None);
+                block_shares_scale_with_eta(&indiv_stmts, &readout, n_binary, &decl.name, None);
             decl.eta_couplings = (0..eta_names.len())
                 .map(|k| {
                     let mut c = level_block_eta_coupling(
                         &indiv_stmts,
                         &readout_with_states,
+                        n_binary,
                         &decl.name,
                         k,
                         &eta_names[k],
                         &states,
                     );
-                    c.share =
-                        block_shares_scale_with_eta(&indiv_stmts, &readout, &decl.name, Some(k));
+                    c.share = block_shares_scale_with_eta(
+                        &indiv_stmts,
+                        &readout,
+                        n_binary,
+                        &decl.name,
+                        Some(k),
+                    );
                     // A kappa runs the same walk; the binder measures it on its
                     // own unit, the occasion (see `EtaCoupling::kappa`).
                     c.kappa = k >= n_eta;
@@ -5385,24 +5392,27 @@ pub fn parse_full_model_with(
         }
         // An `[event_model]` hazard or a `[markov_model]` expression is not walked: no
         // profiled block may be read there (`check_profiled_levels`' `E_PROFILE_SCOPE`
-        // refuses every such model), so "no prediction reads it" would be a claim the
-        // walk cannot make (#2562).
-        let unwalked_endpoint = ["event_model", "markov_model"]
-            .iter()
-            .any(|b| blocks.contains_key(*b) || extracted.named.contains_key(*b));
+        // refuses every such model). A block one of them reads is not "read by no
+        // prediction" (#2562); one none of them reads still is.
+        let mut endpoint_lines: Vec<String> = Vec::new();
+        for b in ["event_model", "markov_model"] {
+            endpoint_lines.extend(blocks.get(b).into_iter().flatten().cloned());
+            if let Some(named) = extracted.named.get(b) {
+                endpoint_lines.extend(named.values().flatten().cloned());
+            }
+        }
         for block in &profiled {
             let others: Vec<String> = profiled.iter().filter(|o| *o != block).cloned().collect();
-            let linked = match profile_route_check(
+            let linked = profile_route_check(
                 &indiv_stmts,
                 &readouts,
                 &error_lines,
+                &endpoint_lines,
                 block,
                 &others,
                 &states,
-            ) {
-                Err((ProfileRouteBreak::Unread, _)) if unwalked_endpoint => false,
-                r => r.map_err(|(why, site)| profile_route_message(block, &why, &site))?,
-            };
+            )
+            .map_err(|(why, site)| profile_route_message(block, &why, &site))?;
             if let Some(d) = vector_theta_decls.iter_mut().find(|d| d.name == *block) {
                 d.linked = linked;
             }
@@ -7214,6 +7224,9 @@ pub fn parse_full_model_with(
 
         model.referenced_covariates.sort();
     }
+    // #2562: the gathers an endpoint block reads count for the pre-fit index check too, and
+    // they were parsed after `theta_blocks` took its first copy.
+    model.indiv_param_partials.theta_blocks.uses = VectorThetaScope::uses();
     // #2562: which discrete-state endpoints read each level block, for the binder.
     #[cfg(feature = "survival")]
     for decl in model
@@ -23287,6 +23300,9 @@ pub(crate) struct ScaleShare {
     /// The variable that carried the random effect into that expression, when
     /// the expression does not read the η itself.
     pub(crate) eta_via: Option<String>,
+    /// With `param` `None`: the expression is a `[binary_model]` predictor, not the `y`
+    /// readout (#2562).
+    pub(crate) binary: bool,
 }
 
 /// How one random effect relates to a level block (#1649, #1650), as far as
@@ -23884,6 +23900,7 @@ fn map_condition_operands<'a>(
 fn block_shares_scale_with_eta(
     stmts: &[Statement],
     readout: &[Expression],
+    n_binary: usize,
     block: &str,
     only_eta: Option<usize>,
 ) -> Option<ScaleShare> {
@@ -23910,13 +23927,15 @@ fn block_shares_scale_with_eta(
 
     let mut assigns = Vec::new();
     assignments(stmts, &mut assigns);
+    let n_y = readout.len() - n_binary;
     // `None` is the readout: it is read, never assigned to.
     assigns.extend(readout.iter().map(|e| (None, e)));
+    let first_readout = assigns.len() - readout.len();
     let mut block_tainted: Vec<&str> = Vec::new();
     let mut eta_tainted: Vec<&str> = Vec::new();
     loop {
         let before = (block_tainted.len(), eta_tainted.len());
-        for (lhs, rhs) in &assigns {
+        for (at, (lhs, rhs)) in assigns.iter().enumerate() {
             let mut reads_block = false;
             let mut reads_eta = false;
             let mut eta_via: Option<&str> = None;
@@ -23939,13 +23958,15 @@ fn block_shares_scale_with_eta(
                     } else {
                         eta_via.map(str::to_string)
                     },
+                    // The trailing readouts are the `[binary_model]` predictors.
+                    binary: lhs.is_none() && at >= first_readout + n_y,
                 });
             }
-            if let Some(lhs) = lhs {
-                if reads_block && !block_tainted.contains(lhs) {
+            if let Some(lhs) = *lhs {
+                if reads_block && !block_tainted.contains(&lhs) {
                     block_tainted.push(lhs);
                 }
-                if (reads_eta || eta_via.is_some()) && !eta_tainted.contains(lhs) {
+                if (reads_eta || eta_via.is_some()) && !eta_tainted.contains(&lhs) {
                     eta_tainted.push(lhs);
                 }
             }
@@ -24206,6 +24227,7 @@ fn coupling_assigns<'a>(
 fn level_block_eta_coupling(
     stmts: &[Statement],
     readout: &[Expression],
+    n_binary: usize,
     block: &str,
     k: usize,
     eta_name: &str,
@@ -24332,6 +24354,7 @@ fn level_block_eta_coupling(
                 site: ScaleShare {
                     param: Some(v.to_string()),
                     eta_via: via,
+                    binary: false,
                 },
                 covariates,
             });
@@ -24342,6 +24365,11 @@ fn level_block_eta_coupling(
         let (reads_any, reads_both) = reads(tb_states, te_states, ctx.out());
         let touched: Vec<&Expression> = readout.iter().filter(|e| reads_any(e)).collect();
         if let [y] = touched.as_slice() {
+            // The trailing readouts are the `[binary_model]` predictors (#2562).
+            let binary = readout
+                .iter()
+                .position(|e| std::ptr::eq(e, *y))
+                .is_some_and(|i| i >= readout.len() - n_binary);
             let mut covariates = Vec::new();
             let ops = ctx
                 .funnel_operands(y, &reads_any, &reads_both)
@@ -24363,6 +24391,7 @@ fn level_block_eta_coupling(
                     site: ScaleShare {
                         param: None,
                         eta_via: via,
+                        binary,
                     },
                     covariates,
                 });
@@ -24857,6 +24886,7 @@ pub(crate) fn profile_route_check(
     stmts: &[Statement],
     readouts: &[(String, Expression)],
     error_lines: &[String],
+    endpoint_lines: &[String],
     block: &str,
     others: &[String],
     states: &StateInputs,
@@ -24882,14 +24912,18 @@ pub(crate) fn profile_route_check(
     if ctx.state_tainted(&src, &taint) {
         return Err((ProfileRouteBreak::State, y()));
     }
-    // The residual error: a name after an `[error_model]` line's `~` that is the
-    // block, or an individual parameter carrying it at the end of the block. The
-    // variance then reads the block, and the solve is no longer least squares.
-    let error_reads = error_lines.iter().any(|l| {
-        let rhs = l.split_once('~').map_or("", |(_, r)| r);
-        rhs.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .any(|t| t == block || ctx.var_tainted(t, &taint, ctx.out()))
-    });
+    // A name on the right of `sep` in one of `lines` that is the block, or an individual
+    // parameter carrying it at the end of the block.
+    let lines_read = |lines: &[String], sep: char| {
+        lines.iter().any(|l| {
+            let rhs = l.split_once(sep).map_or("", |(_, r)| r);
+            rhs.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|t| t == block || ctx.var_tainted(t, &taint, ctx.out()))
+        })
+    };
+    // The residual error: the variance then reads the block, and the solve is no
+    // longer least squares.
+    let error_reads = lines_read(error_lines, '~');
     if error_reads {
         return Err((ProfileRouteBreak::Residual, y()));
     }
@@ -24931,7 +24965,9 @@ pub(crate) fn profile_route_check(
             }
         }
     }
-    if !read {
+    // A hazard or Markov expression the walk does not judge (#2562): `E_PROFILE_SCOPE`
+    // refuses the model for its endpoint, which is the true reason.
+    if !read && !lines_read(endpoint_lines, '=') {
         return Err((ProfileRouteBreak::Unread, y()));
     }
     Ok(linked)

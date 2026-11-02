@@ -317,10 +317,12 @@ fn a_subject_with_tte_records_is_refused_only_when_its_levels_differ() {
         .to_string();
     assert_eq!(
         err,
-        "theta PLACEBO[...]: subject 1 also carries time-to-event records, so its records \
-         cannot each carry their own level of the block, and they are at more than one \
-         (STUDY=1,TIME=0 and, at record 2, STUDY=1,TIME=4). Key the block on columns that are \
-         constant within the subject, or fit the time-to-event endpoint separately."
+        "theta PLACEBO[...]: subject 1 has records its per-record covariate snapshots cannot \
+         be lined up with (it also carries time-to-event records, or was built in memory with \
+         snapshots of another length), so its records cannot each carry their own level of the \
+         block, and they are at more than one (STUDY=1,TIME=0 and, at record 2, \
+         STUDY=1,TIME=4). Key the block on columns that are constant within the subject, or \
+         fit the time-to-event endpoint separately."
     );
     let mut p = parse_full_model(text).unwrap();
     let mut pop = population(vec![
@@ -686,4 +688,148 @@ fn a_visit_block_shared_by_studies_does_not_absorb_the_study_eta() {
     let (parsed, _) = bound(&text, &csv(&[0, 4, 8], true)).unwrap_or_else(|e| panic!("{e}"));
     let decl = &parsed.model.theta_blocks().level_blocks()[0];
     assert_eq!(decl.contrast(), LevelContrast::SumToZero);
+}
+
+/// A block constant within each subject (keyed on `STUDY`) beside a covariate that does
+/// vary (`TRT`): the reader writes a snapshot for every record, and each one must carry
+/// the block's index, since that snapshot is what the predictor reads. Before the PR the
+/// predictor read the baseline, which has it (PR #2590 review, finding 1).
+///
+/// Mutation: return before writing the index into existing snapshots when every record
+/// is at one level, and the records read index 0 (`NaN`): the binder refuses the block
+/// as aliased.
+#[test]
+fn a_subject_constant_block_reaches_snapshots_the_reader_wrote() {
+    let text = BINARY
+        .replace(
+            "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]",
+            "PLACEBO[STUDY]",
+        )
+        .replace(" + ETA_S", "")
+        .replace("  omega ETA_S ~ 0.25\n", "");
+    let (parsed, pop) = bound(&text, &csv(&[0, 4, 8], true)).unwrap_or_else(|e| panic!("{e}"));
+    let decl = &parsed.model.theta_blocks().level_blocks()[0];
+    assert_eq!(level_index_finding(decl, &pop), None);
+    for subject in &pop.subjects {
+        assert!(subject.record_covariate_snapshots().is_some(), "TRT varies");
+        for (study, _, index) in record_levels(subject) {
+            assert_eq!(index, study, "subject {}", subject.id);
+        }
+    }
+}
+
+/// The identifiability refusal names the `[binary_model]` predictor as the site where
+/// the block meets the random effect, not `y` (PR #2590 review).
+///
+/// Mutation: leave the share's `binary` flag false and the message says "the `y`
+/// readout".
+#[test]
+fn the_share_site_names_the_binary_predictor() {
+    let text = BINARY.replace(
+        "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]",
+        "PLACEBO[STUDY]",
+    );
+    let err = bound(&text, &csv(&[0, 4], true))
+        .err()
+        .expect("not identified");
+    assert!(
+        err.contains("the `[binary_model]` predictor reads this block and a random effect"),
+        "{err}"
+    );
+    assert!(!err.contains("the `y` readout"), "{err}");
+}
+
+/// Two records at one written time in two reset periods are not replicates: the reset
+/// shifts the engine clock the predictor's `TIME` reads, so an η on `TIME` moves them
+/// differently and the block keyed on the written time cannot carry it. Auto resolves as
+/// for a block with no η (PR #2590 review, finding 4).
+///
+/// Mutation: compare only the written time in `records_replicate` and the η reads as
+/// absorbed.
+#[test]
+fn records_in_two_reset_periods_are_not_replicates() {
+    let mut data = String::from(HEADER);
+    for s in 1..=3u32 {
+        for period in 0..2u32 {
+            if period == 1 {
+                data.push_str(&format!("{s},{s},0,.,1,3,1,0\n"));
+            }
+            for t in [0u32, 4] {
+                for k in 0..4u32 {
+                    let dv = u32::from((s + t + k + period) % 2 == 0);
+                    data.push_str(&format!("{s},{s},{t},{dv},1,0,0,0\n"));
+                }
+            }
+        }
+    }
+    let text = no_arm()
+        .replace(", contrast = sum_to_zero_within", "")
+        .replace("TVL + PLACEBO + ETA_S", "TVL + PLACEBO + ETA_S * TIME");
+    let (parsed, _) = bound(&text, &data).unwrap_or_else(|e| panic!("{e}"));
+    let decl = &parsed.model.theta_blocks().level_blocks()[0];
+    assert_eq!(decl.contrast(), LevelContrast::SumToZero);
+}
+
+/// The pre-fit index range check reads each binary record's own snapshot, where the
+/// predictor reads the index (PR #2590 review, finding 3): a record at index 3 of a
+/// two-level block is refused at its own time, while the baseline (1) is in range. The
+/// control: the same subject with every index in range passes.
+///
+/// Mutation: walk only Gaussian and dose rows in `check_theta_gather_indices` and the
+/// out-of-range record passes.
+#[test]
+fn the_gather_index_check_reads_each_binary_record() {
+    let model = parse_full_model(
+        r"
+[parameters]
+  theta TVL(-0.3, -5.0, 5.0)
+  theta PLACEBO[2](0.0)
+[binary_model]
+  cmt   = 1
+  logit = TVL + PLACEBO[IDX]
+",
+    )
+    .unwrap()
+    .model;
+    let population = |second: f64| {
+        let idx = |v: f64| HashMap::from([("IDX".to_string(), v)]);
+        let mut s = Subject {
+            id: "1".into(),
+            covariates: idx(1.0),
+            endpoint_covariates: vec![idx(1.0), idx(second)],
+            ..Default::default()
+        };
+        s.obs_records = [0.0, 4.0]
+            .map(|t| ObsRecord::DiscreteState {
+                time: t,
+                raw_time: t,
+                state: 1,
+                cmt: 1,
+            })
+            .to_vec();
+        Population {
+            subjects: vec![s],
+            covariate_names: vec!["IDX".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    };
+    let codes = |second: f64| -> Vec<(String, String)> {
+        crate::api::check_model_data(&model, &population(second))
+            .into_iter()
+            .filter(|d| d.code.starts_with("E_THETA_GATHER_INDEX"))
+            .map(|d| (d.code.to_string(), d.message))
+            .collect()
+    };
+    let refused = codes(3.0);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].0, "E_THETA_GATHER_INDEX_RANGE");
+    assert!(
+        refused[0].1.contains("is 3 on subject `1` at TIME 4"),
+        "{}",
+        refused[0].1
+    );
+    assert!(codes(2.0).is_empty(), "in range");
 }
