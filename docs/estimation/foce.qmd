@@ -959,17 +959,22 @@ step, which is the error the predictor removes. On saturating units the path als
 optimum a fit reaches, which is why a network's inner solves are not seeded either. Under IOV a subject's κ̂ is not predicted; its warm inner solve is instead seeded with
 the stacked Gauss–Newton metric, as a BSV solve is; a cold start stays unseeded, because
 the metric's full first step [selects the basin](../model-file/fit-options.qmd#escaping-a-multimodal-individual-objective).
-The predictor serves Laplace and AGQ too. The quadrature is centred on the same
-conditional mode, so its mode response is FOCEI's: the exact inner Hessian
-$\nabla^2_\eta l$, not the Gauss–Newton $\tilde H$ that places the nodes under the FOCEI
-anchor. It is formed from the quadrature's own tape and equals FOCEI's to rounding. On a
-hard quadrature fit it decides the result: Laplace on `pk2_big` (26 parameters, five
-random effects) reaches OFV −3485.11 with it, against −3458.81 without, in two-thirds of
-the work. On easy quadrature fits it changes no iteration count, since they stop on the
-[objective-change criterion](agq.qmd#where-agq-stops) about 20 iterations in. Each warm inner
-solve there starts from the Hessian the previous gradient pass formed at its mode, and the
-quadrature objective's exact anchor reuses that pass's Hessian too, so the exact inner
-Hessian is formed once per subject and evaluation.
+The predictor serves Laplace too. The quadrature is centred on the same conditional mode, so
+its mode response is FOCEI's: the exact inner Hessian $\nabla^2_\eta l$, not the
+Gauss–Newton $\tilde H$ that places the nodes under the FOCEI anchor. It is formed from the
+quadrature's own tape and equals FOCEI's to rounding. On a hard Laplace fit it decides the
+result: on `pk2_big` (26 parameters, five random effects) it reaches OFV −3485.11, against
+−3458.81 without, in two-thirds of the work. On an easy one it changes no iteration count,
+since Laplace stops on the [objective-change criterion](agq.qmd#where-agq-stops) about 20
+iterations in. Each warm inner solve there starts from the exact inner Hessian the previous
+gradient pass formed at its mode, and the objective's exact anchor reuses that pass's
+Hessian too, so the Hessian is formed once per subject and evaluation.
+
+It does not serve AGQ with more than one node. Each response row is one more sweep of a tape
+that grows with the node grid, while the inner work the prediction saves does not: on
+`pk2_big` at three nodes per effect (243 nodes) it cost 1.5× the work under the exact anchor
+and 1.2× under the Gauss–Newton anchor, for 0.026 and 0.013 OFV, and on the `pk1` AGQ-3 fits
+0.88–1.02× for none.
 
 ### The final inner loop {#final-inner-loop}
 

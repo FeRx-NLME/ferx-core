@@ -376,8 +376,8 @@ exact-Hessian anchor and the grid on its own tape, so the rule stays as a measur
 cost/accuracy choice. Giving Laplace/AGQ the FOCEI regime instead (#2549) cost 1.15–2.9× on
 the `pk1` benchmark fits (an ODE AGQ-3 fit from 222 G to 651 G instructions) for at most
 `1e-5` OFV, and 7× on a 26-parameter, five-effect Laplace fit for 0.10. Set `outer_ftol`
-lower where that precision matters. What decides a hard quadrature fit is the EBE warm-start
-predictor, which now serves the quadrature too ([Predicted warm starts](foce.qmd#predicted-warm-starts)).
+lower where that precision matters. What decides a hard Laplace fit is the EBE warm-start
+predictor, which now serves Laplace too ([Predicted warm starts](foce.qmd#predicted-warm-starts)).
 
 ### Don't use BOBYQA
 

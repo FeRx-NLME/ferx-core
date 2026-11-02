@@ -5384,7 +5384,7 @@ fn optimize_nlopt_attempt(
     // those fits. On the unnormalised shipped example
     // it also changed which optimum the shipped start reached (OFV −164.5 vs −1173.6): on
     // saturating units the path decides the optimum, as for the inner seed (#1474).
-    let warm_predictor = warm_predictor_serves(model, init_params);
+    let warm_predictor = warm_predictor_serves(model, init_params, options);
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
     // Scale x0 into optimizer space: xs[i] = x[i] / scale[i].
@@ -7588,7 +7588,7 @@ fn optimize_bfgs(
     // the `FERX_EBE_PREDICTOR=0` A/B switch). Every `fdfg_s` call below is at a point the
     // backtracking line search accepted, so each one forms the response the next step
     // predicts from.
-    let use_predictor = warm_predictor_serves(model, init_params);
+    let use_predictor = warm_predictor_serves(model, init_params, options);
     let mut last = crate::estimation::sens_outer_gradient::ModeResponses::default();
     let (mut f_val, mut g, ehs, _, contribs) = fdfg_s(
         &xs,
@@ -8754,13 +8754,22 @@ thread_local! {
 /// `[covariate_nn]` (see the NLopt call site for the measurement), whose outer gradient the
 /// adjoint serves, so the mode response comes out of that gradient's own sweeps.
 ///
-/// Laplace and AGQ too: the quadrature is centred on the conditional mode, so its response
-/// is FOCEI's `−(∇²_η l)⁻¹ ∂(∇_η l)/∂x` with the exact inner Hessian, formed on the
-/// quadrature tape (`the_quadrature_mode_response_is_the_focei_one`). Under the exact-gradient
-/// stops it is what lets a hard quadrature fit converge: Laplace on `pk2_big` reaches
-/// −3485.21 with it and stalls at −3462.52, unconverged after 413 iterations, without.
-fn warm_predictor_serves(model: &CompiledModel, init_params: &ModelParameters) -> bool {
-    model.n_eta > 0
+/// Laplace too: the quadrature is centred on the conditional mode, so its response is
+/// FOCEI's `−(∇²_η l)⁻¹ ∂(∇_η l)/∂x` with the exact inner Hessian, formed on the quadrature
+/// tape (`the_quadrature_mode_response_is_the_focei_one`). It decides a hard Laplace fit:
+/// on `pk2_big` it reaches −3485.11 in 59 G instructions, against −3458.81 in 90 G without.
+///
+/// Not AGQ with more than one node. Each response row is one more sweep of a tape that grows
+/// with the node grid, while the inner work it saves does not: on `pk2_big` at three nodes
+/// per effect (243) the predictor cost 1.5× (exact anchor) and 1.2× (Gauss–Newton) for
+/// 0.026 and 0.013 OFV, and on the `pk1` AGQ-3 fits 0.88–1.02× for none (#2549).
+fn warm_predictor_serves(
+    model: &CompiledModel,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> bool {
+    options.agq_nodes().is_none_or(|n| n == 1)
+        && model.n_eta > 0
         && model.n_kappa == 0
         && init_params.mixture.is_none()
         && !model.has_covariate_nn()

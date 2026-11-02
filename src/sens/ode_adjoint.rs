@@ -51,8 +51,7 @@ use crate::sens::num::PkNum;
 use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
 use crate::sens::vfree::DualF;
 use crate::sens::vtape::{
-    vadj_index, vadj_index_h, vadj_index_h_lane, vadj_init, vsweep, vsweep_h, vsweep_h_lanes,
-    vtape_reset, DualV, NONE,
+    vadj_index, vadj_index_h, vadj_init, vsweep, vsweep_h, vtape_reset, DualV, NONE,
 };
 use crate::types::ModelParameters;
 use nalgebra::{DMatrix, DVector};
@@ -5264,79 +5263,6 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             theta_adj,
         ))
     };
-    // The mode response's rows of one `sweep_lane_chunks` chunk (`n ≤ DX_LANES` of them)
-    // through the recording at `η̂` in one walk (#2549): `sweep(.., true)` per row, as lanes.
-    // A row is a function of `∇_η l` at `η̂` alone, so only the `η̂` recording's value,
-    // tangent and (for completeness) second-order components are seeded; the node
-    // recordings, which `sweep` seeds for Ψ, carry no row adjoint.
-    let sweep_rows = |chunks: &[(usize, Vec<f64>)], ci: usize, n: usize| -> Option<Vec<Vec<f64>>> {
-        const LL: usize = DX_LANES;
-        let lidx = |node: u32, comp: usize, lane: usize| {
-            if TH {
-                vadj_index_h_lane::<N, M2, LL>(node, comp, lane)
-            } else {
-                vadj_index::<N, LL>(node, comp, lane)
-            }
-        };
-        let vadj = vadj_init::<LL>();
-        let mut top = 0usize;
-        for lane in 0..n {
-            let adj = TapeAdj::Lane(chunks, ci * DX_LANES + lane);
-            let mut put = |node: u32, comp: usize, v: f64| {
-                if node != NONE && v != 0.0 {
-                    top = top.max(node as usize + 1);
-                    vadj[lidx(node, comp, lane)] += v;
-                }
-            };
-            for j in 0..n_obs {
-                let p = &p2[j];
-                put(p.i, 0, adj.at(fr[j]));
-                for m in 0..N {
-                    put(
-                        p.i,
-                        1 + m,
-                        (0..N).map(|k| adj.at(gr[j][k]) * dirs[k][m]).sum(),
-                    );
-                }
-                if TH {
-                    for m in 0..N {
-                        let mut s = 0.0;
-                        for k in 0..N {
-                            for l in 0..N {
-                                let t = crate::sens::vtape::tri(k, l);
-                                let w = if k == l { 1.0 } else { 0.5 };
-                                s += dirs[k][m] * dirs[l][m] * w * adj.at(qr[j][t]);
-                            }
-                        }
-                        put(p.i, 1 + N + m, s);
-                    }
-                }
-            }
-        }
-        let vs = if TH {
-            vsweep_h_lanes::<N, M2, LL>(top)
-        } else {
-            vsweep::<N, LL>(top)
-        };
-        (0..n)
-            .map(|lane| {
-                let at = |d: &DualV<N, M2, TH>| {
-                    if d.i == NONE {
-                        0.0
-                    } else {
-                        vs[lidx(d.i, 0, lane)]
-                    }
-                };
-                #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
-                let mut theta_adj: Vec<f64> = th.iter().map(at).collect();
-                #[cfg(feature = "nn")]
-                if let Some((red, z)) = &nn_out {
-                    add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
-                }
-                Some(theta_adj)
-            })
-            .collect()
-    };
     let (mut grad_eta, _) = sweep(TapeAdj::Plain(&s1), false)?;
     // The term's inputs at η̂ move with η̂ through their own η-derivatives (the node values'
     // movement is the linearisation's, already on the tape).
@@ -5381,8 +5307,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     // anchor, so its response is `dη̂/dx = −H⁻¹ ∂(∇_η l)/∂x` with `H = ∇²_η l` the exact
     // inner Hessian (`h_inner`; the FOCEI anchor's `H̃` places the nodes, it is not the
     // mode's derivative). Rows `y_r = Σ_k Z_rk (∇_η l)_k`, `Z` the BSV rows of `H⁻¹` held
-    // constant, so `dη̂_r/dx = −∂y_r/∂x`: swept together over the scalar tape, then each
-    // back through the recording at `η̂`, as Ψ is — here, before the non-Gaussian term's θ
+    // constant, so `dη̂_r/dx = −∂y_r/∂x`: swept together over the scalar tape as lanes and
+    // read in place, then each back through the recording at `η̂`, as Ψ is (a lane-batched
+    // second-order sweep measured slower than one per row: the lanes multiply what every
+    // node carries) — here, before the non-Gaussian term's θ
     // block below records over the scalar tape. Not at a declined mode (`held`), where
     // there is no identity to differentiate.
     let response = match &eta_dx {
@@ -5390,9 +5318,8 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             let rows = eta_dx_outputs::<N>(&h_inner, &lg, active.min(N), n_bsv.min(active).min(N));
             let chunks = sweep_lane_chunks(&rows);
             let mut tas = Vec::with_capacity(rows.len());
-            for ci in 0..chunks.len() {
-                let n = DX_LANES.min(rows.len() - ci * DX_LANES);
-                tas.extend(sweep_rows(&chunks, ci, n)?);
+            for r in 0..rows.len() {
+                tas.push(sweep(TapeAdj::Lane(&chunks, r), true)?.1);
             }
             Some((rows.len(), chunks, tas))
         }
