@@ -20,7 +20,8 @@ use std::collections::HashMap;
 /// A dosing action a controller can take at a decision time.
 ///
 /// `Hold` and `Stop` carry no payload: `Hold` skips *this* decision (the regimen
-/// continues), while `Stop` discontinues all future dosing for the subject. Only
+/// continues), while `Stop` discontinues all future dosing for the subject.
+/// `SetInterval` changes the dosing interval from this decision on (#945). Only
 /// `Bolus`/`Infuse` map to a [`DoseEvent`] — see [`DoseAction::to_dose_event`].
 ///
 /// `#[non_exhaustive]`: new actions (e.g. the infusion-truncating safety-halt of
@@ -43,6 +44,14 @@ pub enum DoseAction {
     /// the schedule, it does not retract an active infusion. Truncating an
     /// in-flight infusion is a distinct action tracked in #495.
     Stop,
+    /// Set the dosing interval to `interval` from this decision on (#945). The
+    /// decision schedule stays a fixed review grid; a grid point is *due* once
+    /// `interval` has passed since the last decision the controller was consulted
+    /// at, and the controller is consulted only at due points (the others are
+    /// logged as [`DecisionOutcome::NotDue`]). The next due time must land on a
+    /// grid point or past the last one. At most one per decision, never together
+    /// with `Stop`; it composes with one dose (or `Hold`).
+    SetInterval { interval: f64 },
 }
 
 impl DoseAction {
@@ -60,7 +69,7 @@ impl DoseAction {
             DoseAction::Infuse { amt, cmt, rate } => {
                 Some(DoseEvent::new(time, amt, cmt, rate, false, 0.0))
             }
-            DoseAction::Hold | DoseAction::Stop => None,
+            DoseAction::Hold | DoseAction::Stop | DoseAction::SetInterval { .. } => None,
         }
     }
 
@@ -75,14 +84,22 @@ impl DoseAction {
     /// integrator: compartment `0` (CMT is 1-based — `cmt - 1` would underflow a
     /// `usize`), a non-positive or non-finite infusion `rate` (which
     /// [`DoseEvent::new`] would silently turn into a zero-duration "infusion",
-    /// i.e. a degenerate bolus), and a non-finite / negative `amt`. `Hold`/`Stop`
-    /// are always valid. The driver (S1.3a) calls this and surfaces the error
+    /// i.e. a degenerate bolus), a non-finite / negative `amt`, and a
+    /// `SetInterval` that is not positive and finite. `Hold`/`Stop` are always valid. The driver (S1.3a) calls this and surfaces the error
     /// rather than letting a bad action reach the integrator.
     pub fn validate(&self) -> Result<(), String> {
         let (amt, cmt, rate) = match *self {
             DoseAction::Bolus { amt, cmt } => (amt, cmt, None),
             DoseAction::Infuse { amt, cmt, rate } => (amt, cmt, Some(rate)),
             DoseAction::Hold | DoseAction::Stop => return Ok(()),
+            DoseAction::SetInterval { interval } => {
+                if !(interval.is_finite() && interval > 0.0) {
+                    return Err(format!(
+                        "SetInterval requires a positive, finite interval; got {interval}"
+                    ));
+                }
+                return Ok(());
+            }
         };
         if cmt == 0 {
             return Err("dose target compartment is 0, but CMT is 1-based".to_string());
@@ -232,6 +249,10 @@ pub struct ControllerCtx<'a> {
     /// Resolved monitored signals keyed by [`MonitorSpec::name`] (latent or
     /// assay-noised per each monitor's mode).
     pub signals: &'a HashMap<String, f64>,
+    /// The dosing interval in force before this decision (#945): the last
+    /// [`DoseAction::SetInterval`], else the run's starting interval. `None` while
+    /// no interval is set, i.e. every grid point is due.
+    pub interval: Option<f64>,
 }
 
 impl ControllerCtx<'_> {
@@ -290,7 +311,10 @@ pub struct DoseLedgerEntry {
 /// decision (invisible in the dose ledger) is still on the record. `Stop` carries
 /// `dosed` so a "give a final dose, then discontinue" action list (`[Bolus, Stop]`)
 /// is logged faithfully rather than as a bare stop.
+///
+/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecisionOutcome {
     /// The controller issued `n` realized dose(s) (bolus/infusion with `amt > 0`).
     /// Always `n >= 1`: a decision whose actions are all `Hold` or zero-amount is
@@ -304,6 +328,11 @@ pub enum DecisionOutcome {
     /// final action — the driver rejects any action after it — so `dosed` is a
     /// faithful count, never an undercount from a silently-dropped trailing dose.
     Stop { dosed: usize },
+    /// The grid point was not due under the current dosing interval (#945): the
+    /// controller was not consulted and no dose was given. The monitors were still
+    /// read, so the entry carries its `observed_signals`. Distinct from `Hold`,
+    /// which is a consulted decision that chose not to dose.
+    NotDue,
 }
 
 /// One decision the controller made, recorded for **every** decision time —
@@ -323,7 +352,10 @@ pub enum DecisionOutcome {
 ///
 /// A decision reached *after* a `Stop` is not logged — once discontinued the
 /// driver issues no further decisions, so the `Stop` entry is the last record.
+///
+/// `#[non_exhaustive]`: new audit fields land additively.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DecisionLogEntry {
     /// Subject id.
     pub subject: String,
@@ -338,8 +370,11 @@ pub struct DecisionLogEntry {
     /// What the controller observed at this decision (per-analyte value + mode) —
     /// the exact inputs to reproduce the decision.
     pub observed_signals: Vec<ObservedSignal>,
-    /// What the controller did (dose / hold / stop).
+    /// What the controller did (dose / hold / stop), or `NotDue`.
     pub outcome: DecisionOutcome,
+    /// The dosing interval in force after this decision (#945); `None` while no
+    /// interval is set, i.e. every grid point is due.
+    pub interval: Option<f64>,
 }
 
 /// Result of one reactive-dosing run over a single subject: the observation-time
@@ -403,8 +438,12 @@ pub struct AdaptiveSubjectMetrics {
     /// Times the realized dose stepped **down** relative to the previous realized
     /// dose (see [`AdaptiveSubjectMetrics::n_increases`]).
     pub n_decreases: usize,
-    /// Decisions that issued no dose ([`DecisionOutcome::Hold`]).
+    /// Consulted decisions that issued no dose ([`DecisionOutcome::Hold`]); grid
+    /// points that were not due are counted in `n_not_due`, not here.
     pub n_holds: usize,
+    /// Grid points at which the controller was not consulted because no dose was
+    /// due under the current dosing interval ([`DecisionOutcome::NotDue`], #945).
+    pub n_not_due: usize,
     /// Whether the controller discontinued (a [`DecisionOutcome::Stop`] decision).
     pub discontinued: bool,
     /// Time of the `Stop` decision, or `None` if the run never discontinued.
@@ -522,6 +561,10 @@ pub(crate) fn compute_subject_metrics(
         .iter()
         .filter(|d| matches!(d.outcome, DecisionOutcome::Hold))
         .count();
+    let n_not_due = decisions
+        .iter()
+        .filter(|d| matches!(d.outcome, DecisionOutcome::NotDue))
+        .count();
     let stop = decisions
         .iter()
         .find(|d| matches!(d.outcome, DecisionOutcome::Stop { .. }));
@@ -575,6 +618,7 @@ pub(crate) fn compute_subject_metrics(
         n_increases,
         n_decreases,
         n_holds,
+        n_not_due,
         discontinued,
         time_to_discontinuation,
         signal_min,
@@ -728,6 +772,7 @@ pub(crate) struct AssayNoise<'a> {
 /// `with_assay_error = false`) **or** `with_assay_error = true` naming a model
 /// output via `assay_cmt` — never both.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AdaptiveDosingSpec {
     /// The latent (Ipred) monitored signal — a free-form expression over states +
     /// individual parameters (e.g. `central / V`), compiled against the model in
@@ -1003,7 +1048,10 @@ pub enum AdaptiveRoute {
 }
 
 /// One rung of the ladder: `when signal <op> <threshold> : <action>`.
+///
+/// `#[non_exhaustive]`: new rule effects land additively.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AdaptiveRule {
     /// The comparison applied to the observed `signal`.
     pub op: Comparison,
@@ -1029,7 +1077,10 @@ pub enum Comparison {
 }
 
 /// What a matched rule does to the running dose.
+///
+/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum AdaptiveAction {
     /// Raise the dose (by a percentage, or one level if the block declares `levels`).
     Increase(DoseStep),
@@ -1344,6 +1395,7 @@ mod tests {
             history: &history,
             decision_index: 0,
             signals: &signals,
+            interval: None,
         };
 
         assert_eq!(ctx.t, 24.0);
@@ -1396,6 +1448,7 @@ mod tests {
             time: 72.0,
             observed_signals: vec![obs.clone()],
             outcome: DecisionOutcome::Dosed { n: 2 },
+            interval: None,
         };
         assert_eq!(entry.clone(), entry);
         assert_eq!(entry.observed_signals[0], obs);
@@ -1637,6 +1690,7 @@ mod tests {
                 })
                 .unwrap_or_default(),
             outcome,
+            interval: None,
         }
     }
 
@@ -1914,5 +1968,42 @@ mod tests {
         let mut s = base_spec();
         s.auc_target = Some((400.0, f64::INFINITY));
         assert!(s.validate().is_ok());
+    }
+
+    /// `SetInterval` injects nothing and must carry a positive, finite interval (#945).
+    /// Kills the `validate` guard (a zero / negative / non-finite interval would reach the
+    /// driver, where `t + 0` makes every later point due at once and `NaN` never due).
+    #[test]
+    fn set_interval_maps_to_no_dose_and_validates_its_interval() {
+        assert!(DoseAction::SetInterval { interval: 24.0 }
+            .to_dose_event(0.0)
+            .is_none());
+        assert!(!DoseAction::SetInterval { interval: 24.0 }.is_stop());
+        assert!(DoseAction::SetInterval { interval: 24.0 }
+            .validate()
+            .is_ok());
+        for bad in [0.0, -12.0, f64::NAN, f64::INFINITY] {
+            let err = DoseAction::SetInterval { interval: bad }
+                .validate()
+                .unwrap_err();
+            assert!(err.contains("positive, finite interval"), "{bad}: {err}");
+        }
+    }
+
+    /// A not-due grid point is counted in `n_not_due`, never as a hold, and its signal still
+    /// feeds the signal summary (#945). Kills `NotDue` counted as `Hold`, and a summary that
+    /// skips not-due rows (`signal_mean` would be 10, not 15).
+    #[test]
+    fn metrics_count_not_due_apart_from_holds() {
+        let decisions = vec![
+            decision(0.0, Some(10.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(12.0, Some(20.0), DecisionOutcome::NotDue),
+            decision(24.0, Some(10.0), DecisionOutcome::Hold),
+            decision(36.0, Some(20.0), DecisionOutcome::NotDue),
+        ];
+        let m = compute_subject_metrics("S", 1, 1, &[], &decisions, None, None, &[]);
+        assert_eq!(m.n_holds, 1);
+        assert_eq!(m.n_not_due, 2);
+        assert_eq!(m.signal_mean, Some(15.0));
     }
 }
