@@ -118,10 +118,9 @@ const REF_AUC24: [f64; REF_AUC_WINDOWS] = [
 /// low by 1.07e-5 to 1.63e-5 (#2580). The remainder is all ferx's 128-panel trapezoid: on
 /// the exact 1-cpt curve (uniform grid plus the 1 h infusion-end node) it gives −2.748e-6
 /// for window 0 and −7.47e-7 for window 1, the measurement to 4 figures, while the kit's AUC
-/// compartment is within 1.6e-11 of the exact integral in every window (#2582 review). The
-/// sign follows the Euler–Maclaurin term `h²·k·(C_start − C_end) / (12·AUC)`: negative while
-/// the troughs climb, positive once they settle. Windows 11 and 12, the closest pair, differ
-/// by 1.4e-4 relative, so the band isolates each window.
+/// compartment is within 1.6e-11 of the exact integral in every window (#2582 review).
+/// Windows 11 and 12, the closest pair, differ by 1.4e-4 relative, so the band isolates
+/// each window.
 const AUC_REL_TOL: f64 = 1e-5;
 
 /// Fast guard: a typo in `adaptive_vanco_auc.ferx` — which exercises new DSL surface,
