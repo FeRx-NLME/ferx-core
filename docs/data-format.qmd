@@ -299,9 +299,10 @@ observation is ordered just ahead of its coincident dose; the `TIME` reported in
 evaluation, as is sometimes done when porting NONMEM datasets.
 
 The same holds at a **steady-state** dose (`SS=1`). An observation listed before
-a co-timed `SS=1` row reads the amounts carried from the previous record: 0
-before a first SS dose, or the history so far before a later one. An observation
-listed after it reads the steady state. Measured against NONMEM 7.5.1
+a co-timed `SS=1` row reads the amounts carried from the previous record: the
+initial state before a first SS dose (0, or the `init()` value), or the history
+so far before a later one. An observation listed after it reads the steady
+state. Measured against NONMEM 7.5.1
 (`nonmem_anchor/dtmm_ss_record_order.ctl`). Before
 [#2510](https://github.com/FeRx-NLME/ferx-core/issues/2510) ferx read the steady
 state for both orderings.

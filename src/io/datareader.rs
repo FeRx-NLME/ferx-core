@@ -3832,8 +3832,8 @@ fn parse_subject(
     //
     // Steady-state doses are included (#2510). NONMEM 7.5.1
     // (`nonmem_anchor/dtmm_ss_record_order.ctl`) reads a record listed before an SS=1
-    // dose from the amounts carried from the previous record: 0 before a first SS dose,
-    // the prior history before a later one. The SS dose's implied pulse train contributes
+    // dose from the amounts carried from the previous record: the initial state (0, or the
+    // `init()` value) before a first SS dose, the prior history before a later one. The SS dose's implied pulse train contributes
     // nothing before its own record (`docs/model-file/steady-state.qmd`), so one ULP
     // below the dose is exactly that carried state. Until #2510 SS doses were excluded,
     // and such an observation read the post-dose steady state.
