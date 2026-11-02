@@ -361,6 +361,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         covariance_status: CovarianceStatus::NotRequested,
         covariance_method: None,
         shrinkage_eta: Vec::new(),
@@ -510,6 +511,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         covariance_status: CovarianceStatus::Computed,
         // This fixture carries a covariance matrix, so it carries the estimator
         // that produced it — the `Some(matrix) ⟺ Some(method)` pairing #1382

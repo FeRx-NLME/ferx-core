@@ -613,7 +613,7 @@ exercised on every PR by `tests/adaptive_platelet_anchor.rs`.
 ### The vancomycin AUC-TDM anchor
 
 Continuous (percentage) titration **and** the `auc_target` exposure metric are
-cross-checked against **mrgsolve 1.7.2** on a vancomycin TDM scenario — a
+cross-checked against **mrgsolve 2.0.1** on a vancomycin TDM scenario — a
 1-compartment IV model dosed once daily by a 1-h infusion. At the start of each
 day the controller reads the pre-dose trough and titrates the dose ±25 % to hold
 the trough in `[10, 15]` mg/L (the control law), while the *reported* outcome is
@@ -631,12 +631,18 @@ the dose climbs (seven 25 % steps) and holds once the trough enters the band:
 | 7   | 12.1 | 2384 | 581 | **yes** |
 | 8–12| 12.9–13.2 | 2384 | 592–596 | **yes** |
 
-ferx reproduces every dose **exactly** (the titration is exact `f64` arithmetic
-shared with the R loop), every trough to a small cross-solver tolerance, and the
-AUC-target attainment fraction (**8 of 13 daily windows**) exactly. ferx
-integrates the daily exposure by a 128-panel trapezoid per window while mrgsolve
-uses an AUC compartment; the two agree to within 1.7e-5 relative on every one of the
-13 daily AUC₂₄ values, which the anchor asserts window by window, far inside the
+The anchor runs at a supplied η = 0, the typical-value patient mrgsolve
+simulates; the model's `omega ~ 1e-10` would otherwise draw an η of order 1e-5 on
+CL and offset every trough one-sidedly. ferx then reproduces every dose
+**exactly** (the titration is exact `f64` arithmetic shared with the R loop),
+every trough to within 5e-9 mg/L, and the AUC-target attainment fraction
+(**8 of 13 daily windows**) exactly. The worst trough gap, 1.0e-9 mg/L, is the
+mrgsolve table's own error: against the exact one-compartment closed form, ferx's
+troughs sit on it and the frozen LSODA values carry the whole gap. ferx integrates
+the daily exposure by a 128-panel trapezoid per window while mrgsolve uses an AUC
+compartment; the two agree to within 2.8e-6 relative on every one of the 13 daily
+AUC₂₄ values (all of it the trapezoid's own error), which the anchor asserts window
+by window, far inside the
 margin from each AUC₂₄ to the band edges, so the in/out classification — hence
 attainment — is identical. (The exact AUC accuracy is pinned separately by analytic
 unit tests against closed forms, including a bolus and a reset inside a window.) The

@@ -343,7 +343,7 @@ fn terminal_dose_on_chz_time_reads_post_dose_on_both_paths() {
 ///   `initial_state` the twin would compare `[0.0, 0.0]` to `[0.0, 0.0]` and pass just as
 ///   well against a fill written `vec![0.0; n]` — it would pin the slot, not the value.
 ///
-/// **Both engines must reach the pre-start node through their `< break_times[0] - 1e-12`
+/// **Both engines must reach the pre-start node through their `< break_times[0]`
 /// fill**, and that is what the second CHZ time (`12`, after the dose) is for. Each engine
 /// folds its own horizon into the timeline before sorting: the share folds
 /// `max(0, obs…, chz…)`, the dense builder folds `max(0, saveat…)` — and the dense engine's
@@ -431,6 +431,74 @@ fn prestart_chz_time_reads_the_seeded_state_on_both_paths() {
         (7.5 + 100.0) * (-0.1_f64 * 2.0).exp(),
         max_relative = 1e-4
     );
+}
+
+/// #2510: a sample time **just** below the first break, closer than `1e-12`, reads the seeded
+/// state on both engines. The fill used to stop at `first_break − 1e-12`, and the boundary
+/// visit reads only `[first_break, first_break + EVENT_MATCH_TOL)`, so a node in
+/// `(first_break − 1e-12, first_break)` was read by neither and stayed `NaN`. One ULP below a
+/// first dose, where the reader's record-order passes put a record listed before it, is
+/// exactly there. A Gaussian observation never lands in the gap (its own time is a break,
+/// and it is the first one), but a time read off the integration without being a break is:
+/// a CHZ time here, a CTMM record or a `[derived]` grid point in the dense solve.
+///
+/// Three pre-start nodes: one ULP below the dose at 10 (`1.8e-15`, the reader's nudge),
+/// `5e-13` below it (also inside the old gap), and `5` (well below, the control the old fill
+/// already covered). The post-start node at `12` lifts both engines' horizons above the start,
+/// so both take the fill (see `prestart_chz_time_reads_the_seeded_state_on_both_paths`).
+/// Mutation: restoring `t < first_break - 1e-12` leaves the first two `NaN` on both engines.
+#[cfg(feature = "survival")]
+#[test]
+fn prestart_fill_covers_a_time_just_below_the_first_break() {
+    let ode = one_cpt_chz_seeded_ode_spec(7.5);
+    let subject = make_subject(
+        vec![DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0)],
+        vec![12.0],
+    );
+    let pk = pk_one(10.0, 100.0);
+    let chz_times = vec![5.0, 10.0 - 5e-13, 10.0_f64.next_down(), 12.0];
+    assert_eq!(subject_integration_start(&subject), 10.0, "the first break");
+    let (_ipred, shared) =
+        ode_predictions_and_chz(&ode, &pk.values, &[], &[], &subject, &chz_times);
+    let dense = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &chz_times);
+    let seeded = ode.initial_state(&pk.values);
+    assert_eq!(seeded[0], 7.5, "fixture must seed a non-zero initial state");
+    for (name, states) in [("shared", &shared), ("dense", &dense)] {
+        for (i, &t) in chz_times[..3].iter().enumerate() {
+            assert_eq!(
+                states[i], seeded,
+                "{name}: t = {t:e} before the first break reads {:?}, want the seed",
+                states[i]
+            );
+        }
+        // Control: after the dose the state is integrated, not the seed.
+        let want = (7.5 + 100.0) * (-0.1_f64 * 2.0).exp();
+        assert_relative_eq!(states[3][0], want, max_relative = 1e-4);
+    }
+}
+
+/// The dense solve's `saveat` one ULP below a first dose that is **not** a break of the
+/// subject (no record sits there) — a CTMM record or a grid point — reads the seeded state,
+/// without the `survival` feature. See `prestart_fill_covers_a_time_just_below_the_first_break`.
+#[test]
+fn dense_saveat_one_ulp_below_the_first_dose_reads_the_seed() {
+    let mut ode = one_cpt_ode_spec();
+    ode.init_fn = Some(Box::new(|_p: &[f64]| vec![7.5]));
+    let pk = pk_one(1.0, 10.0);
+    for t_dose in [0.0_f64, 10.0] {
+        let subject = make_subject(
+            vec![DoseEvent::new(t_dose, 100.0, 1, 0.0, false, 0.0)],
+            vec![t_dose + 2.0],
+        );
+        let saveat = [t_dose.next_down(), t_dose, t_dose + 2.0];
+        let states = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &saveat);
+        assert_eq!(
+            states[0],
+            vec![7.5],
+            "t = {t_dose}: one ULP before the first dose reads the seed"
+        );
+        assert_relative_eq!(states[1][0], 107.5, max_relative = 1e-9);
+    }
 }
 
 /// A threshold above the asymptotic cumulative hazard (`CHZ → 100`) is never

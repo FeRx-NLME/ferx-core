@@ -475,9 +475,11 @@ pub ferx_core::estimation::inner_optimizer::EbeResult::h_matrix: nalgebra::base:
 pub ferx_core::estimation::inner_optimizer::EbeResult::hard_reject: bool
 pub ferx_core::estimation::inner_optimizer::EbeResult::kappas: alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>
 pub ferx_core::estimation::inner_optimizer::EbeResult::nll: f64
+pub ferx_core::estimation::inner_optimizer::EbeResult::nm_polished: bool
 pub ferx_core::estimation::inner_optimizer::EbeResult::used_fallback: bool
 pub struct ferx_core::estimation::inner_optimizer::InnerLoopStats
 pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_fallback: usize
+pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_nm_polished: usize
 pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_start_rejected: usize
 pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_unconverged: usize
 pub const ferx_core::estimation::inner_optimizer::INNER_LBFGS_MIN_DIM: usize
@@ -533,6 +535,7 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::saem_mu_ref_m_step_eval
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_n_subjects_hmc: core::option::Option<usize>
 pub ferx_core::estimation::outer_optimizer::OuterResult::sir_fallback_proposal: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::total_ebe_fallbacks: u32
+pub ferx_core::estimation::outer_optimizer::OuterResult::total_ebe_nm_polished: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::vi: core::option::Option<ferx_core::ViResult>
 pub ferx_core::estimation::outer_optimizer::OuterResult::warnings: alloc::vec::Vec<alloc::string::String>
 pub fn ferx_core::estimation::outer_optimizer::optimize_population(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> ferx_core::estimation::outer_optimizer::OuterResult
@@ -3397,6 +3400,7 @@ pub ferx_core::types::FitResult::theta_init: alloc::vec::Vec<f64>
 pub ferx_core::types::FitResult::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::theta_transform: alloc::vec::Vec<ferx_core::ThetaTransform>
 pub ferx_core::types::FitResult::total_ebe_fallbacks: u32
+pub ferx_core::types::FitResult::total_ebe_nm_polished: u32
 pub ferx_core::types::FitResult::trace_path: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::uses_ode_solver: bool
 pub ferx_core::types::FitResult::uses_sde: bool
@@ -4976,6 +4980,7 @@ pub ferx_core::FitResult::theta_init: alloc::vec::Vec<f64>
 pub ferx_core::FitResult::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::theta_transform: alloc::vec::Vec<ferx_core::ThetaTransform>
 pub ferx_core::FitResult::total_ebe_fallbacks: u32
+pub ferx_core::FitResult::total_ebe_nm_polished: u32
 pub ferx_core::FitResult::trace_path: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::uses_ode_solver: bool
 pub ferx_core::FitResult::uses_sde: bool
