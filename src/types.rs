@@ -8096,8 +8096,12 @@ pub struct FitResult {
     pub ebe_convergence_warnings: u32,
     /// Worst-case number of unconverged subjects in a single outer iteration.
     pub max_unconverged_subjects: u32,
-    /// Total number of times the Nelder-Mead fallback was invoked across all
-    /// subjects and all outer iterations.  Always `0` for SAEM.
+    /// How many times, summed over every inner loop (not a count of distinct subjects), an
+    /// inner solve returned a fallback's point (`EbeResult::used_fallback`): the recovery
+    /// after the primary search failed its certificate, or the runaway-EBE guard's. A solve
+    /// whose fallback point a multi-start candidate then replaced is not counted (#2589).
+    /// Always `0` for `gn` / `gn_hybrid`'s Gauss–Newton phase, SAEM, trust-region, VI and
+    /// IMP, which do not count it.
     pub total_ebe_fallbacks: u32,
     /// Under `inner_optimizer = nelder_mead`: how many times, summed over every inner loop
     /// like `total_ebe_fallbacks` (not a count of distinct subjects), a subject's Nelder–Mead

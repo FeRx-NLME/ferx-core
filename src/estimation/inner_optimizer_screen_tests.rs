@@ -1246,3 +1246,150 @@ fn a_non_gaussian_endpoint_takes_no_twin_seed() {
         "straddle: without the endpoint the subject is seeded"
     );
 }
+
+/// The multi-start block a #2589 sweep isolates: each is the only thing that differs
+/// between the cell's `off` and `on` solves.
+#[derive(Clone, Copy, Debug)]
+enum Swap {
+    Twin,
+    Screen,
+    Axis,
+}
+
+/// The flip-flop subject `id` of configuration 1 and both controls; for the axis scan each
+/// carries a per-row covariate the model never reads, so it scans every coordinate
+/// (`has_tv_covariates`), as in [`an_axis_seed_that_stopped_short_is_not_reported_converged`].
+fn fallback_sweep_subjects(site: Swap) -> Vec<Subject> {
+    let mut subjects: Vec<Subject> = ["S1", "S2", "S3", "S4"]
+        .iter()
+        .map(|id| flip_flop_subject(id, &CONFIGS[0]))
+        .collect();
+    subjects.extend(controls());
+    if matches!(site, Swap::Axis) {
+        for s in &mut subjects {
+            s.obs_covariates = TIMES
+                .iter()
+                .map(|_| std::collections::HashMap::from([("UNUSED".to_string(), 1.0)]))
+                .collect();
+            assert!(s.has_tv_covariates());
+        }
+    }
+    subjects
+}
+
+/// #2589: sweeps `inner_maxiter` × `inner_tol` × subject under `inner_optimizer = mode`,
+/// solving each cell with `site`'s block off and on, and asserts on every cell whose `off`
+/// solve returned a fallback point that `used_fallback` describes the point `on` returns:
+///
+/// * the block's candidate **replaced** it → `!on.used_fallback`;
+/// * the block ran and **kept** it (bit-identical η) → `on.used_fallback` still set.
+///
+/// On every cell `used_fallback` and `nm_polished` are never both set. Returns the number
+/// of (replaced, kept) cells, so a caller can require each side non-empty.
+fn sweep_fallback_flag(site: Swap, mode: crate::types::InnerOptimizer) -> (usize, usize) {
+    let cfg = &CONFIGS[0];
+    let (m, opts) = model(cfg.omega);
+    let _armed = arm_inner_settings(InnerSettings { mode, warm: false });
+    let (mut replaced, mut kept) = (0, 0);
+    for subj in fallback_sweep_subjects(site) {
+        for tol in [1e-5, 1e-3] {
+            for max_iter in 1..=30 {
+                let o = FitOptions {
+                    inner_maxiter: max_iter,
+                    inner_tol: tol,
+                    ..opts.clone()
+                };
+                let (off, on) = match site {
+                    Swap::Twin => (
+                        solve_with(&m, &o, &subj, 0, false, 1, None),
+                        solve_with(&m, &o, &subj, 0, true, 1, None),
+                    ),
+                    Swap::Screen => (
+                        solve(&m, &o, &subj, 0, 1, None),
+                        solve(&m, &o, &subj, 100, 1, None),
+                    ),
+                    Swap::Axis => (
+                        solve(&m, &o, &subj, 0, 0, None),
+                        solve(&m, &o, &subj, 0, 1, None),
+                    ),
+                };
+                let what = format!(
+                    "{site:?} {mode:?} {} inner_tol = {tol}, inner_maxiter = {max_iter}",
+                    subj.id
+                );
+                for r in [&off, &on] {
+                    assert!(
+                        !(r.used_fallback && r.nm_polished),
+                        "{what}: both flags set"
+                    );
+                }
+                if !off.used_fallback {
+                    continue;
+                }
+                let moved = match site {
+                    Swap::Twin => on.twin_moved,
+                    Swap::Screen => on.screen_moved,
+                    Swap::Axis => bits(&on.eta) != bits(&off.eta),
+                };
+                // Nothing but the block under test may differ: in the twin and screen cells
+                // the axis scan runs on both sides, so an unmoved block must leave η as is.
+                assert!(
+                    !matches!(site, Swap::Twin | Swap::Screen)
+                        || moved
+                        || bits(&on.eta) == bits(&off.eta),
+                    "{what}: η changed though the block did not move it"
+                );
+                if moved {
+                    assert!(
+                        !on.used_fallback,
+                        "{what}: a candidate replaced the fallback point (nll {:.6} < {:.6}) \
+                         but the flag stayed set",
+                        on.nll, off.nll
+                    );
+                    replaced += 1;
+                } else {
+                    assert!(
+                        on.used_fallback,
+                        "{what}: the block kept the fallback point but cleared the flag"
+                    );
+                    kept += 1;
+                }
+            }
+        }
+    }
+    eprintln!("{site:?} {mode:?}: {replaced} replaced, {kept} kept");
+    (replaced, kept)
+}
+
+/// Both sides of the sweep, under the default optimizer and under `nelder_mead`.
+fn check_fallback_sweep(site: Swap) {
+    for mode in [
+        crate::types::InnerOptimizer::Auto,
+        crate::types::InnerOptimizer::NelderMead,
+    ] {
+        let (replaced, kept) = sweep_fallback_flag(site, mode);
+        assert!(
+            replaced > 0 && kept > 0,
+            "{site:?} {mode:?}: no straddle ({replaced} replaced, {kept} kept)"
+        );
+    }
+}
+
+/// #2589, the twin-seed swap: a twin descent that replaces a fallback point clears
+/// `used_fallback`.
+#[test]
+fn a_twin_seed_that_replaces_a_fallback_point_clears_the_flag() {
+    check_fallback_sweep(Swap::Twin);
+}
+
+/// #2589, the Sobol screen's swap.
+#[test]
+fn a_screen_descent_that_replaces_a_fallback_point_clears_the_flag() {
+    check_fallback_sweep(Swap::Screen);
+}
+
+/// #2589, the axis scan's swap.
+#[test]
+fn an_axis_seed_that_replaces_a_fallback_point_clears_the_flag() {
+    check_fallback_sweep(Swap::Axis);
+}

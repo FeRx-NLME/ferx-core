@@ -540,13 +540,16 @@ pub struct EbeResult {
     /// simplex-spread stop never sets it. False when BFGS exits at its iteration limit and
     /// no certificate holds.
     pub converged: bool,
-    /// True when the BFGS optimizer failed and Nelder-Mead was invoked as fallback.
+    /// True when the returned η̂ is a fallback's point: the recovery after the primary search
+    /// failed its certificate (Nelder–Mead, or the lower of the search's partial and
+    /// Nelder–Mead), or the runaway-EBE guard's recovery (#958). A multi-start candidate that
+    /// replaces a fallback point clears it, so the flag describes the returned point, not
+    /// whether a fallback ran in this solve (#2589).
     pub used_fallback: bool,
     /// True when, under `inner_optimizer = nelder_mead`, the returned η̂ is the primary
     /// search's point but Nelder–Mead's own stop was not a mode: the stationarity certificate
     /// moved it there with the gradient (Newton steps or a BFGS polish). The primary search's
-    /// own point is not a fallback; but `used_fallback` records that a fallback *ran* in this
-    /// solve, so a moved restart candidate that replaces a fallback point carries both flags.
+    /// point is not a fallback, so this and `used_fallback` are never both set (#2589).
     /// Always false under every other `inner_optimizer` (#2571).
     pub nm_polished: bool,
     /// L2 gradient norm at the solution; 0.0 when Nelder-Mead was used.
@@ -981,7 +984,8 @@ impl InnerSolvePolicy {
 pub struct InnerLoopStats {
     /// Subjects whose optimizer did not meet the convergence tolerance.
     pub n_unconverged: usize,
-    /// Subjects for which the BFGS→Nelder-Mead fallback was triggered.
+    /// Subjects whose returned η̂ is a fallback's point (`EbeResult::used_fallback`): not the
+    /// subjects in whose solve a fallback ran and a multi-start candidate then won (#2589).
     pub n_fallback: usize,
     /// Subjects whose Nelder–Mead stop the stationarity certificate moved to a mode
     /// (`EbeResult::nm_polished`); 0 unless `inner_optimizer = nelder_mead` (#2571).
@@ -1068,8 +1072,9 @@ fn cold_eta_seed(
 ///    hands `max_unconverged_frac` subjects that are at their mode — a step-only test made
 ///    the EBE guard reject every trial of the Schnider NONMEM anchor fit
 ///    (`tests/schnider_propofol_nonmem.rs`, `inner_tol = 1e-8`; `W_NO_FEASIBLE_EVAL`). An
-///    indefinite `H` (a saddle or a non-convex region) fails the test. The point is returned
-///    unchanged. Skipped on a numerical objective (below), where a finite-difference Hessian
+///    indefinite `H` (a saddle or a non-convex region) fails the test. The test takes the
+///    Newton steps it computes and keeps each accepted one, each no worse beyond rounding,
+///    whether or not it then certifies ([`FallbackCertifier::newton_certifies`]). Skipped on a numerical objective (below), where a finite-difference Hessian
 ///    of a noise-floored gradient is not trustworthy and the stall-armed polish decides.
 /// 3. **Gradient polish** — the inner BFGS / L-BFGS driver run from η̂ (never Nelder–Mead, even
 ///    under `inner_optimizer = nelder_mead`), whose own exit is the certificate. It carries the per-iterate objective-stall predicate
@@ -1081,7 +1086,10 @@ fn cold_eta_seed(
 ///    at most `INNER_FTOL_REL·(1 + |f|)` while the gradient norm at least halves, #2270), so the
 ///    flag always belongs to the returned point (the #1337 rule).
 ///
-/// A point that passes none of them is returned unchanged and reported **unconverged**.
+/// A point that passes none of them is reported **unconverged**. It is not necessarily the
+/// point handed in: test 2 may have moved it by the Newton steps it accepted before failing
+/// (`x⁴` from `x = 1` with `max_iter = 1` comes back uncertified at `x = 2/3`); only a failed
+/// polish leaves it as test 2 left it (#2589).
 pub(crate) struct FallbackCertifier<'a> {
     /// The inner search's own gradient closure — the one BFGS used, so the two agree.
     pub(crate) grad: &'a dyn Fn(&[f64]) -> Vec<f64>,
@@ -2867,7 +2875,10 @@ fn find_ebe_solve(
     // (`ebe_exit = ok`, in both the screen and the axis scan): a descent that stopped
     // at `inner_maxiter` below a converged incumbent is not a mode, and keeping the
     // incumbent's `true` reported it as one and hid it from `max_unconverged_frac` (#2100).
-    // It is still taken — it is strictly lower, so likely in the better basin.
+    // It is still taken — it is strictly lower, so likely in the better basin. Likewise
+    // `used_fallback`: a candidate is a primary-search descent, so it clears the flag a
+    // replaced fallback point set, and `n_fallback` counts the points a fallback returned
+    // rather than the solves in which one ran (#2589).
     let mut screen_moved = false;
     let mut twin_moved = false;
     if restarts > 0 && !is_warm_start(eta_init, policy.init_is_mode) {
@@ -2908,6 +2919,7 @@ fn find_ebe_solve(
                         nll = cand_nll;
                         eta = cand;
                         ebe_exit = ok;
+                        used_fallback = false;
                         twin_moved = true;
                     }
                 }
@@ -2956,6 +2968,7 @@ fn find_ebe_solve(
                         nll = cand_nll;
                         eta = cand;
                         ebe_exit = ok;
+                        used_fallback = false;
                         screen_moved = true;
                     } else {
                         #[cfg(test)]
@@ -3008,6 +3021,7 @@ fn find_ebe_solve(
                             nll = cand_nll;
                             eta = cand;
                             ebe_exit = ok;
+                            used_fallback = false;
                         }
                     }
                 }

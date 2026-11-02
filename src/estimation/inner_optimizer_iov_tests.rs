@@ -6278,7 +6278,29 @@ fn certify_moved_names_a_moved_point_whichever_test_moved_it() {
         exact_cert(&plane_grad, 1, 50, tol).certify_moved(&plane, &mut x),
         None
     );
-    assert_eq!(x, vec![0.0], "an uncertified point is returned unchanged");
+    assert_eq!(
+        x,
+        vec![0.0],
+        "the plane: no step is taken, so x is unchanged"
+    );
+
+    // #2589: an uncertified point is not necessarily the one handed in. On `x⁴` from `x = 1`
+    // with `max_iter = 1` the Newton test takes its one step (`x − 4x³/12x² = 2/3`, a
+    // decrease, so it is kept), the resolution arm fails there (`½gᵀH⁻¹g ≈ 0.13`), and the
+    // one-iteration polish cannot reach `tol`: `None`, with `x` moved.
+    let quartic = |x: &[f64]| x[0].powi(4);
+    let quartic_grad = |x: &[f64]| vec![4.0 * x[0].powi(3)];
+    let mut x = vec![1.0];
+    assert_eq!(
+        exact_cert(&quartic_grad, 1, 1, tol).certify_moved(&quartic, &mut x),
+        None
+    );
+    // The Hessian is a central difference of the gradient, so the step is `2/3` to its
+    // truncation error, not to the bit.
+    assert!(
+        (x[0] - 2.0 / 3.0).abs() < 1e-6,
+        "the accepted Newton step stays: {x:?}"
+    );
 }
 
 /// #2571: under `inner_optimizer = nelder_mead`, `EbeResult::nm_polished` marks exactly the
