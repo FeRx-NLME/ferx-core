@@ -13682,10 +13682,10 @@ fn a_restarted_fit_runs_one_covariance_step() {
     .expect("fixture data loads");
     // `fit()` rather than `optimize_nlopt` alone: the fixture traps on the trajectory the
     // full entry point takes (its preflight seeds the first evaluation), as
-    // `tests/ebe_basin_shift.rs` measures it, under Laplace: since #2549's predicted warm
-    // start the fixture traps only on a route that keeps the unpredicted one (see that file).
+    // `tests/ebe_basin_shift.rs` measures it — with the unpredicted warm start the trap
+    // belongs to, as there (#2549; the fit pool carries the switch onto its thread).
+    let _off = WarmPredictorOff::new();
     let opts = FitOptions {
-        method: EstimationMethod::Laplace,
         run_covariance_step: true,
         verbose: false,
         threads: Some(1),
@@ -13758,4 +13758,25 @@ fn the_lower_cold_mode_count_is_the_subjects_the_held_state_scores_worse() {
         1,
         "a NaN held state is never counted as a shift"
     );
+}
+
+/// #2549 review r2 #1: a cold start drops the mode response with the modes. The response
+/// belongs to the modes it was taken at, so a start that zero-fills them and kept it would
+/// predict `0 + (dη̂/dx)·Δx`, which is no prediction of anything and, being non-zero, is
+/// taken for a warm start.
+#[test]
+fn a_cold_start_drops_the_mode_response() {
+    let mut state = new_nlopt_state(2, 2, &[0.0; 3], SalvageGuardPolicy::Off);
+    state.cached_etas = vec![DVector::from_vec(vec![0.3, -0.1]); 2];
+    state.cached_etas_are_modes = true;
+    state.pred_jac = Some(vec![vec![DVector::from_vec(vec![1.0, 2.0]); 3]; 2]);
+    state.pred_anchor = vec![0.5; 3];
+    state.reset_to_cold_start();
+    assert!(state
+        .cached_etas
+        .iter()
+        .all(|e| e.len() == 2 && e.iter().all(|&v| v == 0.0)));
+    assert!(!state.cached_etas_are_modes);
+    assert!(state.pred_jac.is_none(), "the response went with the modes");
+    assert!(state.pred_anchor.is_empty());
 }

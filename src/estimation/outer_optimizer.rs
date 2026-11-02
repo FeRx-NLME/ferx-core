@@ -5373,7 +5373,7 @@ fn optimize_nlopt_attempt(
     // those fits. On the unnormalised shipped example
     // it also changed which optimum the shipped start reached (OFV −164.5 vs −1173.6): on
     // saturating units the path decides the optimum, as for the inner seed (#1474).
-    let warm_predictor = warm_predictor_serves(model, init_params);
+    let warm_predictor = warm_predictor_serves(model, init_params, options);
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
     // Scale x0 into optimizer space: xs[i] = x[i] / scale[i].
@@ -6426,6 +6426,13 @@ fn optimize_nlopt_attempt(
                 }
                 let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
                 let mut state = opt_slot.take()?.recover_user_data();
+                // The incumbent's own modes, when the held state is this point's.
+                let held = best_solve_cl
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|inc| inc.xs == best_x)
+                    .map(|inc| outer_cache_warm_starts(model, &inc.etas, &inc.kappas));
                 x0.copy_from_slice(&best_x);
                 state.prev_x = best_x;
                 // Unlatched: a latched state answers every evaluation with the incumbent
@@ -6438,8 +6445,20 @@ fn optimize_nlopt_attempt(
                 state.best_ofv = f64::INFINITY;
                 state.last_improvement_eval = state.n_evals;
                 state.best_at_last_improvement = f64::INFINITY;
-                // A cold EBE seed for the first evaluation.
+                // The leg's first evaluation re-solves the incumbent's own modes at the leg's
+                // tolerance: a verification leg tightens the inner solve at the point it
+                // starts from, so its inner solves start at the modes of that point (#2549).
+                // A cold start re-selected every mode at `UNPROFILED_VERIFY_INNER_TOL`: on the
+                // ODE twin of `transit_flip_flop_fit_matches_ode_twin` it left one of four
+                // subjects unconverged, the EBE guard rejected the leg's start, and the leg
+                // walked to the TVNTR floor (−59.31 against the incumbent's −228.59). No mode
+                // response carries over: it belongs to the modes of the evaluation it was
+                // taken at, and the leg's first point needs none (Δx = 0). Cold only when the
+                // held state is another point's.
                 state.reset_to_cold_start();
+                if let Some(modes) = held.filter(|m| m.len() == state.cached_etas.len()) {
+                    state.cached_etas = modes;
+                }
                 *leg_best.borrow_mut() = BestPoint::new();
                 leg_first.set(None);
                 let mut leg =
@@ -7544,14 +7563,11 @@ fn optimize_bfgs(
     let mut grad_eval_idx = 0usize;
     // EBE warm-start predictor (Almquist Eq. 48, #2549): each accepted point's inner solves
     // start at `η̂ + (dη̂/dx)·Δx`, with the mode response from the accepted point's own
-    // gradient sweeps, as in the NLopt objective (`warm_predictor_serves`). Every
-    // `fdfg_s` call below is at a point the backtracking line search accepted, so each one
-    // forms the response the next step predicts from. `FERX_EBE_PREDICTOR=0` disables it
-    // here (A/B timing).
-    let use_predictor = warm_predictor_serves(model, init_params)
-        && std::env::var("FERX_EBE_PREDICTOR")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+    // gradient sweeps, as in the NLopt objective (`warm_predictor_serves`, which also reads
+    // the `FERX_EBE_PREDICTOR=0` A/B switch). Every `fdfg_s` call below is at a point the
+    // backtracking line search accepted, so each one forms the response the next step
+    // predicts from.
+    let use_predictor = warm_predictor_serves(model, init_params, options);
     let mut last_jac: Option<Vec<Vec<DVector<f64>>>> = None;
     let (mut f_val, mut g, ehs, _, contribs) = fdfg_s(
         &xs,
@@ -8709,44 +8725,61 @@ thread_local! {
     static WARM_PREDICTOR_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether [`WARM_PREDICTOR_OFF`] is set on this thread (never outside tests).
 /// Whether the EBE warm-start predictor serves this fit, for every outer optimizer that
 /// predicts (the NLopt objective and the built-in BFGS/L-BFGS loop): FOCE/FOCEI on a model
 /// with BSV random effects, no IOV (κ̂ is not predicted), no `[mixture]` and no
 /// `[covariate_nn]` (see the NLopt call site for the measurement), whose outer gradient the
 /// adjoint serves, so the mode response comes out of that gradient's own sweeps.
-fn warm_predictor_serves(model: &CompiledModel, init_params: &ModelParameters) -> bool {
-    model.n_eta > 0
+///
+/// Not under Laplace or AGQ. Their response is the same exact one — the quadrature is centred
+/// on the conditional mode, so it is FOCEI's `−(∇²_η l)⁻¹ ∂(∇_η l)/∂x`, and the quadrature
+/// tape forms it (`the_quadrature_mode_response_is_the_focei_one`, 3e-16) — but it does not
+/// pay. The predicted start leaves their outer iterations unchanged (20–21 either way on the
+/// five benchmark fits) and saves inner work only, and the inner pass is ~10–15% of a
+/// quadrature fit, whose cost is its gradient tape; the response is one more sweep of that
+/// tape per random effect. Measured (instructions, on/off): `pk1` Laplace 0.98, AGQ-3 0.91
+/// and 0.84 (exact anchor), the ODE twins 1.02 and 0.82.
+fn warm_predictor_serves(
+    model: &CompiledModel,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> bool {
+    options.agq_nodes().is_none()
+        && model.n_eta > 0
         && model.n_kappa == 0
         && init_params.mixture.is_none()
         && !model.has_covariate_nn()
         && crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
         && !warm_predictor_off()
+        // The A/B timing switch, for every optimizer that predicts.
+        && std::env::var("FERX_EBE_PREDICTOR").map_or(true, |v| v != "0")
 }
 
-fn warm_predictor_off() -> bool {
+/// Whether [`WARM_PREDICTOR_OFF`] is set on this thread (never outside tests). The fit pool
+/// carries it onto the thread that runs a fit (`api::pool`'s scope arming).
+pub(crate) fn warm_predictor_off() -> bool {
     #[cfg(test)]
     return WARM_PREDICTOR_OFF.with(|c| c.get());
     #[cfg(not(test))]
     false
 }
 
-/// RAII for [`WARM_PREDICTOR_OFF`]: set while alive.
+/// RAII for [`WARM_PREDICTOR_OFF`]: set while alive, the previous value restored on drop (so
+/// a guard the fit pool re-arms on the caller's own thread leaves the caller's in force).
 #[cfg(test)]
-pub(crate) struct WarmPredictorOff;
+pub(crate) struct WarmPredictorOff(bool);
 
 #[cfg(test)]
 impl WarmPredictorOff {
     pub(crate) fn new() -> Self {
-        WARM_PREDICTOR_OFF.with(|c| c.set(true));
-        Self
+        Self(WARM_PREDICTOR_OFF.with(|c| c.replace(true)))
     }
 }
 
 #[cfg(test)]
 impl Drop for WarmPredictorOff {
     fn drop(&mut self) {
-        WARM_PREDICTOR_OFF.with(|c| c.set(false));
+        WARM_PREDICTOR_OFF.with(|c| c.set(self.0));
     }
 }
 

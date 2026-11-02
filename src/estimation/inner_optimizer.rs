@@ -1828,10 +1828,44 @@ pub(crate) fn find_ebe_cached(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
 ) -> EbeResult {
+    find_ebe_cached_from(
+        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy, None,
+    )
+}
+
+/// [`find_ebe_cached`] from a **predicted** start `eta_init`, with the mode it was predicted
+/// from as `fallback_start`: a predicted start whose objective is not usable (a first-order
+/// step carried out of the model's domain) is replaced by the fallback before the search
+/// begins (#2549 review r2 #3). The check is the search's own first evaluation, memoised, so
+/// a finite start costs nothing extra and is solved bit for bit as without a fallback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_ebe_cached_from(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    policy: InnerSolvePolicy,
+    fallback_start: Option<&[f64]>,
+) -> EbeResult {
     #[cfg(test)]
     EBE_SOLVES_STARTED.with(|n| n.set(n.get() + 1));
-    find_ebe_impl(
-        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
+    find_ebe_impl_from(
+        model,
+        subject,
+        params,
+        max_iter,
+        tol,
+        eta_init,
+        mu_k,
+        restarts,
+        schedule,
+        policy,
+        fallback_start,
     )
 }
 
@@ -2114,6 +2148,26 @@ fn find_ebe_impl(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
 ) -> EbeResult {
+    find_ebe_impl_from(
+        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy, None,
+    )
+}
+
+/// [`find_ebe_impl`] with a fallback for a predicted start ([`find_ebe_cached_from`]).
+#[allow(clippy::too_many_arguments)]
+fn find_ebe_impl_from(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    policy: InnerSolvePolicy,
+    fallback_start: Option<&[f64]>,
+) -> EbeResult {
     if inner_profile_enabled() {
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2177,8 +2231,19 @@ fn find_ebe_impl(
     let screen_share: RefCell<Option<Vec<ScreenDescent>>> = RefCell::new(None);
     let solve = |cold_seed: bool, share: Option<&RefCell<Option<Vec<ScreenDescent>>>>| {
         find_ebe_solve(
-            model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
-            cold_seed, share,
+            model,
+            subject,
+            params,
+            max_iter,
+            tol,
+            eta_init,
+            mu_k,
+            restarts,
+            schedule,
+            policy,
+            cold_seed,
+            share,
+            fallback_start,
         )
     };
     // The Hessian seed is a *local* model of the individual objective. Near the mode it
@@ -2258,6 +2323,8 @@ fn find_ebe_solve(
     // `find_ebe_impl`'s two cold solves share one screen: the first fills the cell with its
     // descents, the second takes them. `None`: screen for this solve alone.
     screen_share: Option<&RefCell<Option<Vec<ScreenDescent>>>>,
+    // The mode a predicted `eta_init` was predicted from ([`find_ebe_cached_from`]).
+    fallback_start: Option<&[f64]>,
 ) -> Option<EbeResult> {
     let n_eta = model.n_eta;
 
@@ -2417,6 +2484,13 @@ fn find_ebe_solve(
         m.push((key, v));
         v
     };
+    // A predicted start out of the model's domain starts at the mode it was predicted from
+    // ([`find_ebe_cached_from`]); memoised, so the search's first evaluation reuses it. Out of
+    // the domain is what the objective reports there: not finite, or on the
+    // `SUBJECT_SENTINEL_NLL` rail it maps an undefined point to.
+    if let Some(fallback) = fallback_start.filter(|f| f.len() == eta.len()) {
+        start_at_fallback_if_unusable(obj(&eta), &mut eta, fallback);
+    }
 
     // No random effects: the mode is the empty vector and `H` has no columns, so there is
     // nothing to search, seed or certify — only the objective at it. Without this the solve
@@ -6900,10 +6974,10 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
 /// The prediction is the mode's exact first-order expansion, so on a smooth stretch of the
 /// trajectory every subject solves from it and this is the plain warm pass, bit for bit. A
 /// long line-search trial can still extrapolate a start out of its basin, where the
-/// objective is non-finite or the solve fails from it ([`solve_failed`]); such a subject is
-/// solved again from its previous mode and keeps the lower objective. The retry is
-/// triggered by a failed solve, not by a bound on the step, so it changes nothing where the
-/// prediction works (#2549 review r2 #3).
+/// solve fails outright from it ([`solve_failed`]: a hard reject or a non-finite
+/// objective); such a subject is solved again from its previous mode and keeps the lower
+/// objective. The retry is triggered by a failed solve, not by a bound on the step, so it
+/// changes nothing where the prediction works (#2549 review r2 #3).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
     model: &CompiledModel,
@@ -6945,10 +7019,22 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
     )
 }
 
-/// Whether an inner solve failed from its start: not converged, rescued by the Nelder–Mead
-/// fallback, hard-rejected at the start, or ending on a non-finite objective.
+/// Replace a predicted start whose objective `at_start` is not usable (not finite, or on the
+/// `SUBJECT_SENTINEL_NLL` rail) by the mode it was predicted from ([`find_ebe_cached_from`]).
+fn start_at_fallback_if_unusable(at_start: f64, eta: &mut [f64], fallback: &[f64]) {
+    if !crate::stats::likelihood::is_usable_subject_nll(at_start) {
+        eta.copy_from_slice(fallback);
+    }
+}
+
+/// Whether an inner solve failed outright from its start: hard-rejected there, or ending on
+/// an objective that is not usable (not finite, or on the `SUBJECT_SENTINEL_NLL` rail). Not
+/// an unconverged or Nelder–Mead-certified end: on an ODE model
+/// that is routinely the RK45 gradient-noise floor blocking `‖g‖ < tol` at a genuine mode
+/// (#555), so treating it as a failed start re-solved healthy predictions and changed the
+/// trajectory (`mm` 62 → 67 outer iterations, `ctmm_pd_2state` 130 → 145).
 fn solve_failed(ebe: &EbeResult) -> bool {
-    !ebe.converged || ebe.used_fallback || ebe.hard_reject || !ebe.nll.is_finite()
+    ebe.hard_reject || !crate::stats::likelihood::is_usable_subject_nll(ebe.nll)
 }
 
 /// What a subject skipped by a cooperative cancel reports in place of its EBE (#574).
@@ -7049,13 +7135,15 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
                 Some(cache) => cache[i].as_ref(),
                 None => local_schedule.as_ref(),
             };
-            let mut ebe = find_ebe_cached(
+            let fallback = fallback_etas.map(|f| f[i].as_slice());
+            let mut ebe = find_ebe_cached_from(
                 model, subject, params, max_iter, tol, init, mu_k, restarts, schedule, policy,
+                fallback,
             );
             // A predicted start that the solve fails from is solved again from the
             // subject's previous mode, and the lower objective is kept (ties to the
             // prediction) — see [`run_inner_loop_predicted_map_cached`].
-            if let Some(fallback) = fallback_etas.map(|f| f[i].as_slice()) {
+            if let Some(fallback) = fallback {
                 if init != Some(fallback) && solve_failed(&ebe) {
                     let alt = find_ebe_cached(
                         model,
