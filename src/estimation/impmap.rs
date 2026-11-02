@@ -3683,7 +3683,7 @@ mod tests {
                 ..Default::default()
             };
             crate::api::with_fit_scope(&opts, || {
-                run_map_multistart(&model, &pop, p, max_iter, tol, None, &mu_k, 0, 1, 0).2
+                run_map_multistart(&model, &pop, p, max_iter, tol, None, &mu_k, 0, 1, 0).3
             })
             .expect("the scope builds")
         };
