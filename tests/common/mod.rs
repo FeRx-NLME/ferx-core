@@ -226,26 +226,37 @@ pub fn windows_in_band(res: &ferx_core::AdaptiveSimulationResult) -> usize {
     n.round() as usize
 }
 
-/// Run `spec` with every subject at a **supplied η = 0** (#2580): the typical-value patient
-/// an mrgsolve kit simulates. A model's `omega ~ 1e-10` still draws an η of order 1e-5,
-/// which offsets every trough and AUC one-sidedly against such a kit — the whole of the
-/// gap the vanco anchors once attributed to the solvers. Seed 1, as every kit run uses.
+/// η = 0 for every subject of `pop` (#2580, #2583): the typical-value patient an mrgsolve
+/// kit simulates. A model's `omega ~ 1e-10` still draws an η of order 1e-5, which offsets
+/// every trough and AUC one-sidedly against such a kit — the whole of the gap the vanco
+/// anchors once attributed to the solvers. The one η = 0 builder: every adaptive kit anchor
+/// that runs at η = 0 uses it, whichever entry point it then calls. The renal and platelet
+/// anchors still draw η (#2580's out-of-scope table): renal CL never reads `ETA_CL`, and
+/// the platelet gap has another cause.
 ///
 /// η only: on an IOV model κ is still drawn, so the run is not the typical-value patient
-/// there. Both callers have no κ.
+/// there. None of its callers (the vanco, vanco-loading and vanco-interval anchors) has κ.
+pub fn typical_value_etas(
+    model: &ferx_core::CompiledModel,
+    pop: &ferx_core::types::Population,
+) -> ferx_core::SuppliedEtas {
+    let ids: Vec<String> = pop.subjects.iter().map(|s| s.id.clone()).collect();
+    let n = ids.len();
+    ferx_core::SuppliedEtas::from_table(
+        ids,
+        model.eta_names.clone(),
+        vec![vec![0.0; model.n_eta]; n],
+    )
+    .expect("η = 0 table")
+}
+
+/// Run `spec` at [`typical_value_etas`]. Seed 1, as every kit run uses.
 pub fn simulate_from_spec_at_typical_value(
     model: &ferx_core::CompiledModel,
     pop: &ferx_core::types::Population,
     spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec,
 ) -> ferx_core::AdaptiveSimulationResult {
-    let ids: Vec<String> = pop.subjects.iter().map(|s| s.id.clone()).collect();
-    let n = ids.len();
-    let etas = ferx_core::SuppliedEtas::from_table(
-        ids,
-        model.eta_names.clone(),
-        vec![vec![0.0; model.n_eta]; n],
-    )
-    .expect("η = 0 table");
+    let etas = typical_value_etas(model, pop);
     let inputs = ferx_core::AdaptiveInputs::new(&model.default_params).with_etas(&etas);
     // `AdaptiveSimulateOptions` is `#[non_exhaustive]`: build from `default()`.
     let mut opts = ferx_core::AdaptiveSimulateOptions::default();

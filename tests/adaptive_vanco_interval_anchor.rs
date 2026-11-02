@@ -15,10 +15,10 @@
 //!
 //! The ferx side is `vanco_interval.ferx` driven by a programmatic controller below, with
 //! `start_interval = 12` and `DoseAction::SetInterval` for every rung change. Each subject
-//! runs at a **supplied η = 0** (`SuppliedEtas`), the typical-value patient mrgsolve
-//! simulates: the model's `omega ~ 1e-10` still draws an η of order 1e-5 on CL, and that
-//! drift — not either solver — was the whole of a 3.8e-4 mg/L one-sided gap at t = 288
-//! when the anchor drew it.
+//! runs at a **supplied η = 0** (`common::typical_value_etas`), the typical-value patient
+//! mrgsolve simulates: the model's `omega ~ 1e-10` still draws an η of order 1e-5 on CL,
+//! and that drift — not either solver — was the whole of a 3.8e-4 mg/L one-sided gap at
+//! t = 288 when the anchor drew it.
 //!
 //! Non-degeneracy: two subjects, multi-dose with drug on board at every later dose.
 //! Subject 1 (RF 0.15) climbs to the top rung, stays pinned there and holds at due points
@@ -30,10 +30,12 @@
 use ferx_core::parser::model_parser::{parse_full_model, parse_full_model_file};
 use ferx_core::{
     read_nonmem_csv, simulate_adaptive_from_spec_with_inputs, simulate_adaptive_with_inputs,
-    AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult, CompiledModel,
-    ControllerCtx, DecisionOutcome, DoseAction, MonitorSpec, ObserveMode, Population, SuppliedEtas,
+    AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult, ControllerCtx,
+    DecisionOutcome, DoseAction, MonitorSpec, ObserveMode, Population,
 };
 use std::path::Path;
+
+mod common;
 
 const KIT: &str = "tests/reference/vanco_interval_mrgsolve";
 const LADDER: [f64; 4] = [12.0, 24.0, 36.0, 48.0];
@@ -131,16 +133,6 @@ fn kit_population() -> Population {
     .expect("subjects load")
 }
 
-/// η = 0 for both subjects: the typical-value patient mrgsolve simulates.
-fn zero_etas(model: &CompiledModel) -> SuppliedEtas {
-    SuppliedEtas::from_table(
-        vec!["1".into(), "2".into()],
-        model.eta_names.clone(),
-        vec![vec![0.0; model.n_eta]; 2],
-    )
-    .expect("η = 0 table")
-}
-
 /// The kit run through the programmatic controller above.
 fn run_closure() -> AdaptiveSimulationResult {
     let parsed = parse_full_model_file(Path::new(&format!("{KIT}/vanco_interval.ferx")))
@@ -151,9 +143,10 @@ fn run_closure() -> AdaptiveSimulationResult {
     opts.decision_times = grid();
     opts.monitors = vec![MonitorSpec::new("C", 1, ObserveMode::Ipred)];
     opts.start_interval = Some(12.0);
-    let etas = zero_etas(model);
+    let pop = kit_population();
+    let etas = common::typical_value_etas(model, &pop);
     let inputs = AdaptiveInputs::new(&model.default_params).with_etas(&etas);
-    simulate_adaptive_with_inputs(model, &kit_population(), &inputs, 1, controller, &opts)
+    simulate_adaptive_with_inputs(model, &pop, &inputs, 1, controller, &opts)
         .expect("runs and passes the default verifier")
 }
 
@@ -273,9 +266,10 @@ fn run_block(block: &str) -> AdaptiveSimulationResult {
     let model = &parsed.model;
     let mut opts = AdaptiveSimulateOptions::default();
     opts.seed = Some(1);
-    let etas = zero_etas(model);
+    let pop = kit_population();
+    let etas = common::typical_value_etas(model, &pop);
     let inputs = AdaptiveInputs::new(&model.default_params).with_etas(&etas);
-    simulate_adaptive_from_spec_with_inputs(model, &kit_population(), &inputs, 1, spec, &opts)
+    simulate_adaptive_from_spec_with_inputs(model, &pop, &inputs, 1, spec, &opts)
         .expect("runs and passes the default verifier")
 }
 
