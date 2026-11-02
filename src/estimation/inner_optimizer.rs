@@ -2296,6 +2296,10 @@ thread_local! {
     /// `SCREEN_MIN_OMEGA_DIST` of it, so the distance gate alone turned them away.
     pub(crate) static SCREEN_SAME_BASIN_REJECTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Axis-scan seeds that replaced the incumbent, so a test of the twin seed or the screen
+    /// can tell a cell where the axis scan, run after them, had the last word (#2598 review).
+    pub(crate) static AXIS_SWAPS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Build the per-subject [`EventSchedule`](pk::event_driven::EventSchedule) cache once per
@@ -3186,6 +3190,8 @@ fn find_ebe_solve(
                             eta = cand;
                             ebe_exit = ok;
                             used_fallback = false;
+                            #[cfg(test)]
+                            AXIS_SWAPS.with(|n| n.set(n.get() + 1));
                         }
                     }
                 }
