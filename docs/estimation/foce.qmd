@@ -959,15 +959,22 @@ step, which is the error the predictor removes. On saturating units the path als
 optimum a fit reaches, which is why a network's inner solves are not seeded either. Under IOV a subject's κ̂ is not predicted; its warm inner solve is instead seeded with
 the stacked Gauss–Newton metric, as a BSV solve is; a cold start stays unseeded, because
 the metric's full first step [selects the basin](../model-file/fit-options.qmd#escaping-a-multimodal-individual-objective).
-Under Laplace and AGQ the predictor is left out, on measurement. The quadrature is
-centred on the same conditional mode, so its mode response is FOCEI's: the exact inner
-Hessian $\nabla^2_\eta l$, not the Gauss–Newton $\tilde H$ that places the nodes under
-the FOCEI anchor. It is formed from the quadrature's own tape and equals FOCEI's to rounding.
-But the predicted start left every quadrature fit's outer iteration count unchanged (20–21
-either way), so it saves inner work only. The inner pass is about 10–15% of a quadrature
-fit, whose cost is its gradient tape, and the response costs one more sweep of that tape
-per random effect. On `pk1` the fits came out 0.98 (Laplace), 0.91 and 0.84 (AGQ-3,
-Gauss–Newton and exact anchor) and 0.82–1.02 on the ODE twins.
+The predictor serves Laplace too. The quadrature is centred on the same conditional mode, so
+its mode response is FOCEI's: the exact inner Hessian $\nabla^2_\eta l$, not the
+Gauss–Newton $\tilde H$ that places the nodes under the FOCEI anchor. It is formed from the
+quadrature's own tape and equals FOCEI's to rounding. On a hard Laplace fit it decides the
+result: on `pk2_big` (26 parameters, five random effects) it reaches OFV −3485.11, against
+−3458.81 without, in two-thirds of the work. On an easy one it changes no iteration count,
+since Laplace stops on the [objective-change criterion](agq.qmd#where-agq-stops) about 20
+iterations in. Each warm inner solve there starts from the exact inner Hessian the previous
+gradient pass formed at its mode, and the objective's exact anchor reuses that pass's
+Hessian too, so the Hessian is formed once per subject and evaluation.
+
+It does not serve AGQ with more than one node. Each response row is one more sweep of a tape
+that grows with the node grid, while the inner work the prediction saves does not: on
+`pk2_big` at three nodes per effect (243 nodes) it cost 1.5× the work under the exact anchor
+and 1.2× under the Gauss–Newton anchor, for 0.026 and 0.013 OFV, and on the `pk1` AGQ-3 fits
+0.88–1.02× for none.
 
 ### The final inner loop {#final-inner-loop}
 
