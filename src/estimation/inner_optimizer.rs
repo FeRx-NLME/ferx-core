@@ -2173,6 +2173,9 @@ fn find_ebe_impl_from(
     }
     #[cfg(test)]
     with_recording(|r| r.solve_tols.push((subject.id.clone(), tol)));
+    // Every evaluation below is this subject under this model, so the `$PK` sharing index
+    // is built once for the search instead of once per evaluation (#2558).
+    let _share = pk::sharing_scope::SharingScope::enter(model, subject);
 
     // A nested-level subject that was never given its cells (#1082): refused, never
     // estimated as one-level IOV or with κ dropped. `hard_reject` keeps the outer loop
