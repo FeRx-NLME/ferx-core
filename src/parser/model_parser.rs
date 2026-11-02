@@ -19471,7 +19471,7 @@ pub(crate) fn level_index_column(block: &str) -> String {
 /// covariate list includes the columns reached through `[individual_parameters]`, so a
 /// block read through an individual parameter counts.
 #[cfg(feature = "survival")]
-fn level_record_cmts(
+pub(crate) fn level_record_cmts(
     endpoints: &HashMap<usize, crate::types::EndpointLikelihood>,
     index: &str,
 ) -> Vec<usize> {

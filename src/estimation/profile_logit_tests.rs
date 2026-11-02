@@ -536,3 +536,7 @@ fn an_indefinite_newton_matrix_is_damped_and_the_solve_still_finds_the_minimum()
         assert!((s.ofv - omin).abs() < 1e-8, "{name}");
     }
 }
+
+/// The binary half of #2111: a block read by a `[binary_model] logit` predictor.
+#[path = "profile_binary_tests.rs"]
+mod binary;
