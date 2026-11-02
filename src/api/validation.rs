@@ -838,7 +838,9 @@ pub(crate) fn check_endpoint_routing(
                 Some(("binary (`[binary_model]`)", "binary_model"))
             }
             #[cfg(feature = "markov")]
-            EndpointLikelihood::Ctmm { .. } => Some(("Markov (`[markov_model]`)", "markov_model")),
+            EndpointLikelihood::Ctmm { .. } | EndpointLikelihood::Dtmm { .. } => {
+                Some(("Markov (`[markov_model]`)", "markov_model"))
+            }
             // Not an endpoint the parser ever registers here; skipped rather than
             // matched by a wildcard so a Gaussian CMT can never be reported as unrouted.
             EndpointLikelihood::Gaussian(_) => None,
@@ -4433,6 +4435,28 @@ pub(crate) fn check_ctmm_records(
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     for (cmt, endpoint) in &model.endpoints {
+        // DTMM (#2473): the same two checks, plus an observed change of state that no
+        // `transition` declares — probability 0 for every parameter value.
+        if let crate::types::EndpointLikelihood::Dtmm {
+            state_codes,
+            transitions,
+            ..
+        } = endpoint
+        {
+            let first_bad = population.subjects.iter().find_map(|subject| {
+                crate::markov::dtmm::validate_dtmm_records(
+                    *cmt,
+                    state_codes,
+                    transitions,
+                    &subject.obs_records,
+                )
+                .err()
+            });
+            if let Some(m) = first_bad {
+                diags.push(Diagnostic::error("E_CTMM_RECORDS", m).with_block("markov_model"));
+            }
+            continue;
+        }
         let crate::types::EndpointLikelihood::Ctmm { state_codes, .. } = endpoint else {
             continue;
         };
@@ -4749,6 +4773,37 @@ pub(crate) fn check_survival_tv_covariates(
                         subject.id
                     ),
                     );
+                }
+                continue;
+            }
+            // DTMM (#2473): the transition probabilities read each record's own covariate
+            // snapshot, so a time-varying covariate is honoured — provided the subject's
+            // snapshot lines up with its records (`record_covariate_snapshots`). One that
+            // does not (a subject that also carries time-to-event rows, or an in-memory
+            // subject without per-row snapshots) would silently fall back to the baseline.
+            #[cfg(feature = "markov")]
+            if let EndpointLikelihood::Dtmm {
+                prob_covariates, ..
+            } = endpoint
+            {
+                if let Some(name) = prob_covariates.iter().find(|c| tv_set.contains(c.as_str())) {
+                    if crate::markov::dtmm::record_covariate_snapshots(subject).is_none() {
+                        return refuse(
+                            "markov_model",
+                            format!(
+                                "[markov_model] (type = dtmm) on CMT={cmt}: a transition \
+                                 probability references covariate `{name}`, which is \
+                                 time-varying for subject `{}`, but that subject carries no \
+                                 per-record covariate snapshot aligned with its state records \
+                                 (it also has time-to-event records, or was built in memory \
+                                 without `endpoint_covariates`), so the probability could only \
+                                 read the baseline value (#741). Hold `{name}` constant within \
+                                 the subject, or fit the DTMM without the time-to-event \
+                                 endpoint.",
+                                subject.id
+                            ),
+                        );
+                    }
                 }
                 continue;
             }
@@ -5840,6 +5895,9 @@ pub(crate) fn check_profiled_levels(
         Some("time-to-event")
     } else if model.has_binary() {
         Some("binary")
+    } else if cfg!(feature = "markov") && model.has_discrete() {
+        // Only a DTMM (#2473) reaches here: binary was matched above.
+        Some("Markov (DTMM)")
     } else if model.has_non_gaussian() {
         Some("Markov (CTMM)")
     } else {
@@ -6204,6 +6262,37 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // (default), SAEM, and IMP are supported; the Gauss-Newton gradient is Gaussian-
     // specific, and IOV is not folded into the outer FOCE-IOV objective (the generator
     // is built with BSV-only η). Reject both fail-loud rather than silently mis-fit.
+    // DTMM (#2473) has the same two gaps, with the same codes.
+    #[cfg(feature = "markov")]
+    if model.has_dtmm() {
+        if chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
+        {
+            diags.push(
+                Diagnostic::error(
+                    "E_CTMM_GN_UNSUPPORTED",
+                    "method = gn / gn_hybrid is not supported with a [markov_model] \
+                     `type = dtmm` endpoint. The Gauss-Newton gradient is built from the Gaussian \
+                     residual structure and ignores the Markov transition likelihood, so it would \
+                     not move the parameters. Use method = focei (default), saem, or imp.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if model.n_kappa > 0 {
+            diags.push(
+                Diagnostic::error(
+                    "E_CTMM_IOV_UNSUPPORTED",
+                    "a [markov_model] `type = dtmm` endpoint is not yet supported together with \
+                     inter-occasion variability ([iov] / κ): its transition probabilities are \
+                     evaluated with per-subject (BSV) η only, so κ would be ignored. Fit the DTMM \
+                     endpoint without [iov] for now.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
     #[cfg(feature = "markov")]
     if model.has_ctmm() {
         if chain

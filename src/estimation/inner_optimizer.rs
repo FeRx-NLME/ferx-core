@@ -4238,7 +4238,9 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
                 #[cfg(feature = "markov")]
                 Some(EndpointLikelihood::Ctmm {
                     generator_program, ..
-                }) => generator_program.as_ref().is_some(),
+                }) => generator_program.is_some(),
+                #[cfg(feature = "markov")]
+                Some(EndpointLikelihood::Dtmm { prob_program, .. }) => prob_program.is_some(),
                 _ => false,
             }
         };
@@ -4326,7 +4328,7 @@ pub(crate) fn non_gaussian_endpoints_served(model: &CompiledModel) -> bool {
     }
     #[cfg(feature = "survival")]
     {
-        if model.has_discrete() && !crate::categorical::all_binary_endpoints_analytic(model) {
+        if model.has_discrete() && !crate::categorical::all_discrete_endpoints_analytic(model) {
             return false;
         }
         if model.has_tte()
@@ -4378,7 +4380,7 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     // Binary (#2024): the same reasoning — a `[binary_model]` whose linear predictor has no
     // dual-evaluable program declines every subject carrying its records.
     #[cfg(feature = "survival")]
-    if model.has_discrete() && !crate::categorical::all_binary_endpoints_analytic(model) {
+    if model.has_discrete() && !crate::categorical::all_discrete_endpoints_analytic(model) {
         return false;
     }
     // TTE (#1861): an endpoint with an exact η-channel (`survival::tte_endpoint_served`: an

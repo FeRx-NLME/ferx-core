@@ -1707,6 +1707,171 @@ pub(crate) fn ruv_scale_from(eta: &[f64], residual_error_eta: Option<usize>) -> 
 #[cfg(feature = "markov")]
 const CTMM_FD_SENTINEL_GUARD: f64 = 1e18;
 
+/// The Laplace curvature of a Markov endpoint's data term, from
+/// [`guarded_markov_fd_hessian`].
+#[cfg(feature = "markov")]
+#[derive(Debug)]
+pub(crate) enum MarkovCurvature {
+    /// The mode itself scores the sentinel: the subject is already repelled through its NLL
+    /// and there is no curvature to add.
+    Repelled,
+    /// The η-Hessian of the data term at the mode.
+    Block(DMatrix<f64>),
+    /// The mode is valid but no finite-difference stencil around it stays inside the valid
+    /// region, so the curvature cannot be measured. The caller repels the subject rather than
+    /// fold a zero (or sentinel-sized) curvature into `log|H̃|`.
+    Unmeasurable,
+}
+
+/// Quarterings of the step tried by the boundary fallback in [`guarded_markov_fd_hessian`]
+/// before the curvature is declared unmeasurable (`4⁻⁸ ≈ 1.5e-5` of the Shi step), never
+/// below [`MARKOV_STENCIL_MIN_STEP`].
+#[cfg(feature = "markov")]
+const MARKOV_STENCIL_SHRINKS: i32 = 8;
+
+/// The smallest step the boundary fallback differences over — the Shi step's own floor. Below
+/// it a stencil reads values equal to rounding (`1 + η²` is exactly `1` for `|η| < 1e-8`) and
+/// returns a zero curvature that is an artifact, which is the very answer the fallback exists
+/// to avoid.
+#[cfg(feature = "markov")]
+const MARKOV_STENCIL_MIN_STEP: f64 = 1e-6;
+
+/// The FD Hessian w.r.t. η of a Markov endpoint's data term `f` at the mode, guarded against
+/// the `1e20` subject sentinel — the DTMM's (#2473) fallback in
+/// [`discrete_data_term_eta_hessian`] when the exact η-jet declines (no dual program, or η past
+/// the widest bucket).
+///
+/// The term repels a parameter regime with the finite sentinel (a matrix leaving `[0, 1]` or
+/// summing past 1 in any row). A valid mode on or next to that boundary can put a stencil
+/// point in it, and a sentinel inside a central difference is a `~1e20 / h²` curvature. The
+/// likelihood still has its real curvature there, so the block is neither folded poisoned nor
+/// dropped: each entry is measured with a stencil whose points are all valid —
+///
+/// 1. the healthy path is the central difference on `data_term_hessian_steps`, bit-identical
+///    to an unguarded fold;
+/// 2. otherwise, per entry, at a gradient-scaled step and then at successively quartered steps (never
+///    below `1e-6`): the
+///    central difference if its four points are valid, else a one-sided one on whichever side
+///    is valid — `(2f₀ − 5f₁ + 4f₂ − f₃)/s²` along the axis for a diagonal entry (`O(s²)`),
+///    the quadrant difference `(f(a,b) − f(a,0) − f(0,b) + f₀)/(ab)` for an off-diagonal one;
+/// 3. an entry with no valid stencil at any step makes the block [`MarkovCurvature::Unmeasurable`].
+#[cfg(feature = "markov")]
+pub(crate) fn guarded_markov_fd_hessian(
+    f: &dyn Fn(&[f64]) -> f64,
+    eta_hat: &[f64],
+    mode: f64,
+    omega: &DMatrix<f64>,
+) -> MarkovCurvature {
+    use crate::survival::{
+        data_term_hessian_fd, data_term_hessian_steps, DATA_TERM_HESSIAN_STEP_PER_SD,
+    };
+    if mode >= CTMM_FD_SENTINEL_GUARD {
+        return MarkovCurvature::Repelled;
+    }
+    let n = eta_hat.len();
+    if n == 0 {
+        return MarkovCurvature::Block(DMatrix::zeros(0, 0));
+    }
+    let sane = |x: f64| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD;
+    // The healthy path is accepted only when every value its stencil read was valid, not when
+    // the finished entries look sane: the four corners of an off-diagonal stencil can all be
+    // the sentinel and cancel exactly (`S − S − S + S = 0`), a plausible zero curvature. (The
+    // step rule's own pilots step back from a sentinel by themselves, so only the stencil is
+    // watched.) Nor below the step floor: pilots halving away from a sentinel can settle on a
+    // step where the term reads as constant to rounding, another plausible zero.
+    let steps = data_term_hessian_steps(f, eta_hat, mode, omega, DATA_TERM_HESSIAN_STEP_PER_SD);
+    let poisoned = std::cell::Cell::new(false);
+    let watched = |e: &[f64]| {
+        let v = f(e);
+        if !sane(v) {
+            poisoned.set(true);
+        }
+        v
+    };
+    let h = data_term_hessian_fd(watched, eta_hat, &steps);
+    if !poisoned.get() && steps.iter().all(|&s| s >= MARKOV_STENCIL_MIN_STEP) {
+        return MarkovCurvature::Block(h);
+    }
+
+    // Boundary fallback, on a Shi (2021) gradient-scaled step from a probe taken on a valid side.
+    let at = |moves: &[(usize, f64)]| {
+        let mut e = eta_hat.to_vec();
+        for &(j, d) in moves {
+            e[j] += d;
+        }
+        let v = f(&e);
+        sane(v).then_some(v)
+    };
+    let probe = 1e-5_f64;
+    let inv_sum: f64 = (0..n)
+        .map(|j| {
+            let g = match (at(&[(j, probe)]), at(&[(j, -probe)])) {
+                (Some(fp), Some(fm)) => (fp - fm) / (2.0 * probe),
+                (Some(fp), None) => (fp - mode) / probe,
+                (None, Some(fm)) => (mode - fm) / probe,
+                (None, None) => 0.0,
+            };
+            1.0 / g.abs().max(1e-10)
+        })
+        .sum();
+    let base =
+        ((n as f64 / inv_sum).powf(1.0 / 3.0) * f64::EPSILON.powf(1.0 / 3.0)).clamp(1e-6, 0.1);
+
+    let diagonal = |j: usize, s: f64| -> Option<f64> {
+        if let (Some(fp), Some(fm)) = (at(&[(j, 2.0 * s)]), at(&[(j, -2.0 * s)])) {
+            // the same central stencil as `data_term_hessian_fd` (step 2s)
+            return Some((fp - 2.0 * mode + fm) / (4.0 * s * s));
+        }
+        [s, -s].into_iter().find_map(|d| {
+            let (f1, f2, f3) = (at(&[(j, d)])?, at(&[(j, 2.0 * d)])?, at(&[(j, 3.0 * d)])?);
+            Some((2.0 * mode - 5.0 * f1 + 4.0 * f2 - f3) / (d * d))
+        })
+    };
+    let off_diagonal = |j: usize, k: usize, s: f64| -> Option<f64> {
+        let central = (|| {
+            Some(
+                (at(&[(j, s), (k, s)])? - at(&[(j, s), (k, -s)])? - at(&[(j, -s), (k, s)])?
+                    + at(&[(j, -s), (k, -s)])?)
+                    / (4.0 * s * s),
+            )
+        })();
+        central.or_else(|| {
+            [(s, s), (s, -s), (-s, s), (-s, -s)]
+                .into_iter()
+                .find_map(|(a, b)| {
+                    let fab = at(&[(j, a), (k, b)])?;
+                    let (fa, fb) = (at(&[(j, a)])?, at(&[(k, b)])?);
+                    Some((fab - fa - fb + mode) / (a * b))
+                })
+        })
+    };
+
+    let mut h = DMatrix::zeros(n, n);
+    for j in 0..n {
+        for k in 0..=j {
+            let entry = (0..=MARKOV_STENCIL_SHRINKS).find_map(|i| {
+                let s = base * 0.25_f64.powi(i);
+                if i > 0 && s < MARKOV_STENCIL_MIN_STEP {
+                    return None;
+                }
+                if j == k {
+                    diagonal(j, s)
+                } else {
+                    off_diagonal(j, k, s)
+                }
+            });
+            match entry.filter(|&x| sane(x)) {
+                Some(x) => {
+                    h[(j, k)] = x;
+                    h[(k, j)] = x;
+                }
+                None => return MarkovCurvature::Unmeasurable,
+            }
+        }
+    }
+    MarkovCurvature::Block(h)
+}
+
 /// `residual_correlations` carries the **live** `block_sigma` off-diagonals,
 /// parallel to `sigma_values` (#847): FOCE/FOCEI estimate ρ, so the marginal has
 /// to be scored at the optimizer's current value, not the model's declaration.
@@ -1879,8 +2044,14 @@ pub(crate) fn tte_data_term_eta_hessian(
     )
 }
 
-/// The discrete (binary) data term's η-Hessian at `eta_hat`: exact when every binary
+/// The discrete (binary, DTMM) data term's η-Hessian at `eta_hat`: exact when every discrete
 /// endpoint has a dual program, else the FD stencil (`mode` is its value at `eta_hat`).
+///
+/// A DTMM's FD fallback goes through [`guarded_markov_fd_hessian`]: a perturbed-η matrix
+/// leaving `[0, 1]` scores the sentinel, which a plain stencil would fold as a `~1e20/h²`
+/// curvature (#2473). `None` — the caller repels the subject — when the mode is valid but no
+/// stencil around it is; a mode that is itself the sentinel contributes no curvature (the
+/// subject is already repelled by its value).
 #[cfg(feature = "survival")]
 pub(crate) fn discrete_data_term_eta_hessian(
     model: &CompiledModel,
@@ -1889,15 +2060,26 @@ pub(crate) fn discrete_data_term_eta_hessian(
     eta_hat: &[f64],
     mode: f64,
     omega: &DMatrix<f64>,
-) -> (DMatrix<f64>, EtaHessianRoute) {
+) -> Option<(DMatrix<f64>, EtaHessianRoute)> {
     if let Some((_, h)) =
         crate::categorical::discrete_subject_eta_hessian(model, subject, theta, eta_hat)
     {
-        return (h, EtaHessianRoute::Exact);
+        return Some((h, EtaHessianRoute::Exact));
     }
     let discrete_fn = |eta_eval: &[f64]| {
         crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
     };
+    #[cfg(feature = "markov")]
+    if model.has_dtmm() {
+        let n = eta_hat.len();
+        return match guarded_markov_fd_hessian(&discrete_fn, eta_hat, mode, omega) {
+            MarkovCurvature::Block(h) => Some((h, EtaHessianRoute::FiniteDifference)),
+            MarkovCurvature::Repelled => {
+                Some((DMatrix::zeros(n, n), EtaHessianRoute::FiniteDifference))
+            }
+            MarkovCurvature::Unmeasurable => None,
+        };
+    }
     let steps = crate::survival::data_term_hessian_steps(
         &discrete_fn,
         eta_hat,
@@ -1905,10 +2087,10 @@ pub(crate) fn discrete_data_term_eta_hessian(
         omega,
         crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD,
     );
-    (
+    Some((
         crate::survival::data_term_hessian_fd(&discrete_fn, eta_hat, &steps),
         EtaHessianRoute::FiniteDifference,
-    )
+    ))
 }
 
 /// The CTMM data term's η-Hessian at `eta_hat` (`mode` is its value there): exact for a
@@ -2095,15 +2277,21 @@ fn non_gaussian_mode_terms(
         note(parts, "categorical", mode);
         tte_nll_at_mode += mode;
         if n_eta > 0 {
-            tte_h += discrete_data_term_eta_hessian(
+            match discrete_data_term_eta_hessian(
                 model,
                 subject,
                 theta,
                 eta_hat.as_slice(),
                 mode,
                 omega,
-            )
-            .0;
+            ) {
+                Some((h, _)) => tte_h += h,
+                // A valid mode whose curvature cannot be measured is not scored with none.
+                None => {
+                    note(parts, "DTMM curvature unmeasurable", f64::NAN);
+                    tte_nll_at_mode += SUBJECT_SENTINEL_NLL;
+                }
+            }
         }
     }
 

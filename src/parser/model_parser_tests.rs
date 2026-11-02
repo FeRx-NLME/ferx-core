@@ -31658,19 +31658,24 @@ fn binary_model_key_and_link_word_are_not_reads_of_a_helper() {
 }
 
 /// `[markov_model]`: the state labels, in `states = [...]` and on a
-/// `transition` target, and the `type = ctmm` word.
+/// `transition` target, and the `type = ctmm` / `type = dtmm` words.
 #[cfg(feature = "markov")]
 #[test]
 fn markov_model_state_labels_are_not_reads_of_a_helper() {
-    let body = "[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
-                states = [awake=0, asleep=1]\n  transition awake  -> asleep = 0.5\n  \
-                transition asleep -> awake  = 0.3\n";
-    let cases: Vec<_> = ["AWAKE", "CTMM"]
+    let body = |ty: &str| {
+        format!(
+            "[markov_model]\n  type   = {ty}\n  cmt    = 5\n  \
+             states = [awake=0, asleep=1]\n  transition awake  -> asleep = 0.5\n  \
+             transition asleep -> awake  = 0.3\n"
+        )
+    };
+    let cases: Vec<_> = [("AWAKE", "ctmm"), ("CTMM", "ctmm"), ("DTMM", "dtmm")]
         .into_iter()
-        .map(|h| {
+        .map(|(h, ty)| {
+            let body = body(ty);
             (
                 h,
-                body.to_string(),
+                body.clone(),
                 body.replace("asleep = 0.5", &format!("asleep = 0.5 * {h}")),
                 "[markov_model]".to_string(),
             )

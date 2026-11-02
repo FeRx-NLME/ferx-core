@@ -6664,7 +6664,7 @@ fn the_outer_gradient_is_exact_with_a_non_gaussian_term() {
     assert!(worst < 5e-7, "worst relative difference {worst:.2e}");
 }
 
-/// The exact outer gradient on binary and CTMM endpoints — endpoint-only and beside a PK
+/// The exact outer gradient on binary, CTMM and DTMM endpoints — endpoint-only and beside a PK
 /// model — against the reconverged oracle, under both interaction settings.
 #[cfg(all(feature = "survival", feature = "markov"))]
 #[test]
@@ -6695,6 +6695,15 @@ fn the_outer_gradient_is_exact_on_binary_and_ctmm_endpoints() {
         ),
         ..Default::default()
     };
+    // The discrete-time Markov endpoint (#2473) on the same chain: per-record transition
+    // probabilities, a stay step and a `TIME` term, through the discrete seam's term.
+    let dtmm = parse_model_string(
+        "[parameters]\n  theta A(-0.8, -6.0, 3.0)\n  theta B(-1.3, -6.0, 3.0)\n  \
+         omega ETA_Q ~ 0.1\n[markov_model]\n  type   = dtmm\n  cmt    = 5\n  \
+         states = [awake=0, asleep=1]\n  transition awake  -> asleep = inv_logit(A + ETA_Q)\n  \
+         transition asleep -> awake  = inv_logit(B - 0.5 * ETA_Q + 0.1 * TIME)\n",
+    )
+    .unwrap();
     let binary = parse_model_string(
         "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
          omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  \
@@ -6717,6 +6726,7 @@ fn the_outer_gradient_is_exact_on_binary_and_ctmm_endpoints() {
     let mut worst = 0.0f64;
     for (tag, model, s) in [
         ("ctmm", &ctmm, &ctmm_s),
+        ("dtmm", &dtmm, &ctmm_s),
         ("binary", &binary, &binary_s),
         ("binary, no η", &fixed, &binary_s),
     ] {
@@ -6831,6 +6841,15 @@ fn the_cov_hessian_is_exact_with_a_non_gaussian_term() {
         ),
         ..Default::default()
     };
+    // The discrete-time Markov endpoint (#2473) on the same chain: per-record transition
+    // probabilities, a stay step and a `TIME` term, through the discrete seam's term.
+    let dtmm = parse_model_string(
+        "[parameters]\n  theta A(-0.8, -6.0, 3.0)\n  theta B(-1.3, -6.0, 3.0)\n  \
+         omega ETA_Q ~ 0.1\n[markov_model]\n  type   = dtmm\n  cmt    = 5\n  \
+         states = [awake=0, asleep=1]\n  transition awake  -> asleep = inv_logit(A + ETA_Q)\n  \
+         transition asleep -> awake  = inv_logit(B - 0.5 * ETA_Q + 0.1 * TIME)\n",
+    )
+    .unwrap();
     let binary = parse_model_string(
         "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
          omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  \
@@ -6842,6 +6861,7 @@ fn the_cov_hessian_is_exact_with_a_non_gaussian_term() {
         obs_records: states(3, &[(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)]),
         ..Default::default()
     };
+    cases.push(("dtmm".into(), dtmm, ctmm_s.clone()));
     cases.push(("ctmm".into(), ctmm, ctmm_s));
     cases.push(("binary".into(), binary, binary_s));
     let mut worst = 0.0f64;
