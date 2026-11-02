@@ -1896,6 +1896,165 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
     }
 }
 
+fn eta_bits(v: &DVector<f64>) -> Vec<u64> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// Runs `f` and returns its result with how many guarded multi-starts it entered and how many
+/// seeded cold solves skipped theirs (#2601). Both counters are thread-local and every solve
+/// here runs on the calling thread.
+fn count_multistart_runs_and_skips<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
+    let started = || EBE_MULTISTARTS_STARTED.with(|n| n.get());
+    let skipped = || EBE_MULTISTARTS_SKIPPED.with(|n| n.get());
+    let (s0, k0) = (started(), skipped());
+    let r = f();
+    (r, started() - s0, skipped() - k0)
+}
+
+/// #2601: a cold start under a seeded policy runs two solves (#1504), and the guarded
+/// multi-start reads only its incumbent. When the seeded solve's primary descent ends at the
+/// unseeded solve's mode, its multi-start would repeat the unseeded one's descents from the
+/// same starts, so it is skipped: one multi-start per subject, not two. On this unimodal
+/// subject nothing moves it, so the result is bit-identical to `inner_restarts = 0` (the
+/// pick between the two primary descents). The straddle is the unseeded policy, which runs one
+/// solve and so has nothing to skip.
+#[test]
+fn seeded_cold_solve_on_the_unseeded_mode_skips_its_multistart() {
+    let (model, subject) = wellidentified_oral_fixture();
+    let params = model.default_params.clone();
+    let solve = |restarts: usize, seed: InnerHessianSeed| {
+        find_ebe_cached(
+            &model,
+            &subject,
+            &params,
+            100,
+            1e-8,
+            None,
+            None,
+            restarts,
+            None,
+            InnerSolvePolicy {
+                seed,
+                ebe_variance: EbeVariance::Conditional,
+                capture_terminal_hessian: false,
+                accelerate_exact_outer: false,
+                screen: 100,
+                twin_seed: true,
+                init_is_mode: false,
+                keep_certified_start: false,
+                unseeded_iov_warm: false,
+            },
+        )
+    };
+    for kind in [InnerHessianSeed::GaussNewton, InnerHessianSeed::Exact] {
+        let (with, started, skipped) = count_multistart_runs_and_skips(|| solve(1, kind));
+        assert_eq!(
+            (started, skipped),
+            (1, 1),
+            "{kind:?}: the seeded cold solve found the unseeded mode and must skip its \
+             multi-start (multi-starts run, skipped)"
+        );
+        let without = solve(0, kind);
+        assert_eq!(
+            (eta_bits(&with.eta), with.nll.to_bits()),
+            (eta_bits(&without.eta), without.nll.to_bits()),
+            "{kind:?}: a multi-start that moved nothing must leave the cold pick bit-identical"
+        );
+        assert!(!with.screen_moved && !with.twin_moved, "{kind:?}");
+    }
+    let (_, started, skipped) =
+        count_multistart_runs_and_skips(|| solve(1, InnerHessianSeed::None));
+    assert_eq!(
+        (started, skipped),
+        (1, 0),
+        "an unseeded cold start runs one solve and its multi-start"
+    );
+}
+
+/// #2601's other side: a seeded cold descent that lands in a *different* basin from the
+/// unseeded one keeps its own multi-start, since from another incumbent it is not a repeat.
+/// The fixtures are `cold_seeded_solve_keeps_the_lower_of_both_metrics`'s, whose two metrics
+/// land O(10) apart in −log L; the gate is distance in the Ω⁻¹ metric, so each case asserts
+/// that its two primary end points lie past [`SCREEN_MIN_OMEGA_DIST`] as well.
+#[test]
+fn seeded_cold_solve_in_another_basin_keeps_its_multistart() {
+    use std::path::Path;
+    let model =
+        crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin_if.ferx"))
+            .expect("warfarin_if parses");
+    let pop = crate::io::datareader::read_nonmem_csv(
+        Path::new("data/warfarin_if.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .expect("warfarin_if data loads");
+    let policy = |seed| InnerSolvePolicy {
+        seed,
+        ebe_variance: EbeVariance::Conditional,
+        capture_terminal_hessian: false,
+        accelerate_exact_outer: true,
+        screen: 0,
+        twin_seed: false,
+        init_is_mode: false,
+        keep_certified_start: false,
+        unseeded_iov_warm: false,
+    };
+    for (id, k, factor) in [("9", 0, 5.0), ("11", 3, 5.0)] {
+        let subject = pop.subjects.iter().find(|s| s.id == id).expect("subject");
+        let mut params = model.default_params.clone();
+        params.theta[k] *= factor;
+        let schedule = cacheable_schedule(&model, subject);
+        let primary = |seed, cold_seed| {
+            find_ebe_solve(
+                &model,
+                subject,
+                &params,
+                500,
+                1e-6,
+                None,
+                None,
+                0,
+                schedule.as_ref(),
+                policy(seed),
+                cold_seed,
+                None,
+                None,
+            )
+            .expect("premise: the seed is in scope")
+        };
+        let unseeded = primary(InnerHessianSeed::None, false);
+        let seeded = primary(InnerHessianSeed::GaussNewton, true);
+        let dist = omega_distance(
+            seeded.eta.as_slice(),
+            unseeded.eta.as_slice(),
+            &params.omega,
+        );
+        assert!(
+            dist > SCREEN_MIN_OMEGA_DIST,
+            "premise, ID {id}: the two primary descents are {dist:.3} apart in the Ω⁻¹ metric"
+        );
+        let (_, started, skipped) = count_multistart_runs_and_skips(|| {
+            find_ebe_cached(
+                &model,
+                subject,
+                &params,
+                500,
+                1e-6,
+                None,
+                None,
+                1,
+                schedule.as_ref(),
+                policy(InnerHessianSeed::GaussNewton),
+            )
+        });
+        assert_eq!(
+            (started, skipped),
+            (2, 0),
+            "ID {id}: a seeded descent in another basin must run its own multi-start"
+        );
+    }
+}
+
 /// The stage seed is a pure function of the stage's options — no process state, so two
 /// concurrent fits cannot flip each other's seed and a post-fit `predict()` cannot inherit one.
 /// Pins the mapping: one-node Laplace → exact; any multi-node quadrature (either anchor) →
