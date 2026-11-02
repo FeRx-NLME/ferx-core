@@ -112,5 +112,6 @@ The **fit path** ships for both a time-homogeneous generator and a **drug-driven
 Van Loan derivative above; its derivatives are exact all the same, because the occupancy ODE
 is evaluated on dual numbers.
 
-Minimal-CTMM (`mctmm`), discrete-time Markov (`dtmm`), and CTMM simulation/prediction are
-planned follow-ups.
+The discrete-time Markov model (`type = dtmm`) has its own page,
+[Discrete-time Markov models](dtmm.qmd). Minimal-CTMM (`mctmm`) and CTMM
+simulation/prediction are planned follow-ups.

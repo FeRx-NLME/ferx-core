@@ -243,6 +243,7 @@ declared *monitor* — and returns a list of [`DoseAction`]s:
 | `Infuse { amt, cmt, rate }` | Zero-order infusion; duration is `amt / rate`. |
 | `Hold` | Skip this decision — no dose now, the regimen continues. |
 | `Stop` | Discontinue all **future controller** dosing. An infusion already in flight runs to its scheduled end, and a pre-scheduled base regimen (#702) keeps dosing — `Stop` ends the controller's augmentation, not the patient's standing prescription. |
+| `SetInterval { interval }` | Change the dosing interval from this decision on (#945); see [Changing the dosing interval](#changing-the-dosing-interval). Composes with one dose or `Hold`. |
 
 A `Stop` must be the final action in a decision's list; issuing work after a
 `Stop` is a typed error, not a silently dropped dose.
@@ -286,6 +287,62 @@ the current rung of a titration ladder — and a single shared closure would lea
 that state from one subject to the next. The factory makes the isolation
 structural: a stateless rule is just a factory whose closure ignores its
 environment.
+
+## Changing the dosing interval
+
+The decision schedule (`decision_times`) is a fixed **review grid**: the times at
+which a decision *may* be taken. A controller can change how often it doses
+without changing that grid (#945). It holds a current **dosing interval**, and a
+grid point is **due** once that interval has passed since the last decision the
+controller was consulted at. The controller is consulted only at due points.
+
+- **Starting interval.** `AdaptiveSimulateOptions::start_interval` sets the
+  interval in force at the first decision. Left at `None` (the default), every
+  grid point is due, which is the behaviour without this feature.
+- **Changing it.** `DoseAction::SetInterval { interval }` takes effect from the
+  decision that issues it. On a q12 grid, lengthening from 24 to 36 at t = 24
+  makes the next due point t = 60. It composes with one dose or a `Hold`; two in
+  one decision, or one together with `Stop`, is refused.
+- **What counts as consulted.** A dose, a `Hold` (or an empty action list) and an
+  interval change all start the next interval: a hold at a due point consumes
+  that slot.
+- **The controller can read it.** `ctx.interval` is the interval in force before
+  the decision.
+
+### Not-due points
+
+At a grid point that is not due, the controller is not called and no dose is
+given, but the monitors are still read. The decision log records the point with
+the outcome `NotDue`, distinct from `Hold`, and with what the monitors read, so
+the signal summaries (`signal_min` / `signal_max` / `signal_mean`,
+`pct_time_in_window`) still cover every grid point. The metrics count these
+points as `n_not_due`, never as holds. Every decision-log row also carries the
+interval in force after it. `auc_target` windows stay the review-grid windows:
+with a q24 grid each window is a daily AUC, whatever the dosing interval.
+
+Data records never move the due clock. A pre-scheduled base dose (EVID=1), a
+reset (EVID=3) and a reset with a dose (EVID=4) are applied when they fall on a
+not-due point, and the controller is still not consulted there. A controller that
+wants to restart its interval after a reset can read `ctx.history` and issue
+`SetInterval`.
+
+### Grid alignment
+
+Every due time must land on a grid point, or past the last one: a dose cannot be
+scheduled between two review times. An interval is checked once, where it is
+set: every due time it produces from there to the end of the grid is walked,
+since until it changes each due point is consulted exactly when it falls due. A
+`start_interval` that would send one off the grid is refused before any subject
+runs (`E_ADAPTIVE_OPTIONS`). A `SetInterval` that does is refused at the decision
+that issued it (`E_ADAPTIVE_CONTROLLER_ACTION`), never at a later decision that
+took no interval action, naming the subject, the decision, the due time and the
+two grid points it falls between. An interval too short to move past its own
+decision within the grid's matching tolerance is refused the same way. A
+decision that stops schedules nothing and is never refused for its interval.
+
+**Known limit.** Not-due points do not consult the controller, so a safety rule
+is not evaluated between doses; a toxicity check that must act between doses is
+tracked as a follow-up under #391 (#1592).
 
 ## Monitors
 
@@ -475,7 +532,15 @@ family. It is validated instead by:
   does do feedback dosing) — one for each titration mode: the discrete `levels`
   ladder, in [The platelet-ladder anchor](#the-platelet-ladder-anchor), and
   continuous (percentage) titration plus the AUC-exposure metric, in
-  [The vancomycin AUC-TDM anchor](#the-vancomycin-auc-tdm-anchor).
+  [The vancomycin AUC-TDM anchor](#the-vancomycin-auc-tdm-anchor);
+  and schedule adaptation (#945), in
+  [The vancomycin interval-extension anchor](#the-vancomycin-interval-extension-anchor).
+
+Schedule adaptation has one more internal oracle: a state-independent controller
+on a lengthened interval equals the static engine on the realized doses plus a
+zero-amount dose at every not-due grid point, bit for bit. The zero doses give the
+static engine the same segment breaks, and unlike the frozen replay this shares no
+code with the driver's break builder.
 
 ### The platelet-ladder anchor
 
@@ -539,6 +604,25 @@ unit tests against closed forms, including a bolus and a reset inside a window.)
 model is `examples/adaptive_vanco_auc.ferx`; the mrgsolve model, R driver, and
 frozen output live in `tests/reference/vanco_mrgsolve/`, exercised on every
 PR by `tests/adaptive_vanco_anchor.rs`.
+
+### The vancomycin interval-extension anchor
+
+Schedule adaptation is cross-checked against **mrgsolve** on a 1-compartment IV
+vancomycin model with a fixed 1000 mg 1-h infusion and clearance scaled by a
+per-subject renal fraction. The review grid is every 12 h, and the controller
+moves the dosing interval on the ladder 12 / 24 / 36 / 48 h: at a due point it
+holds and lengthens above a trough of 25 mg/L, doses and lengthens above 14,
+doses and shortens below 9, and otherwise doses. The mrgsolve R loop applies the
+same due mask. Of the two subjects, one climbs to the top rung and holds there,
+and the other lengthens, shortens and lengthens again; both saturate at the
+bottom rung at the first decision. Every consulted trough is at least 0.13 mg/L
+from its nearest threshold, so the outcome (dosed / hold / not due) and the
+interval at every one of the 50 grid points match mrgsolve exactly, and the
+troughs agree within the cross-solver band. Each subject runs at a supplied
+η = 0, the typical-value patient mrgsolve simulates: the model's `omega ~ 1e-10`
+would otherwise draw an η large enough to show as a one-sided trough drift. The kit lives in
+`tests/reference/vanco_interval_mrgsolve/`, exercised on every PR by
+`tests/adaptive_vanco_interval_anchor.rs`.
 
 ## Model time in a reactive run
 
