@@ -21,11 +21,10 @@
 # of window g (#701) — exactly the mechanism cross-validated here against an
 # independent mrgsolve run fed the same reconstructed κ.
 #
-# `auc_target` is deliberately absent: the exposure metric integrates a dense grid
-# from a single frozen PK snapshot, which is silently wrong when CL switches per
-# occasion, so `auc_target` is a typed error for an IOV (`kappa`) subject (#701).
-# `target_window` (the pct-in-band trough metric) stays — it is a decision-grid
-# summary evaluated at each occasion's own κ and is fully per-occasion aware.
+# The block declares no `auc_target` (trough control is the scenario); it is supported
+# here since #943, and `tests/adaptive_vanco_iov_anchor.rs` adds one to check each
+# window's AUC24 against mrgsolve. `target_window` (the pct-in-band trough metric)
+# is the decision-grid summary this example reports.
 #
 # Run with `simulate_adaptive_from_spec()` (not the plain forward `simulate()`).
 # Validated against an independent mrgsolve run (mrgsolve, not NONMEM, is the

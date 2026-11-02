@@ -283,7 +283,7 @@ println!("final: {}", result.final_structure.description());
 ```
 
 `IivsearchRun` takes the directory, a thread override, a cancel flag and a
-progress callback; every field is optional. The structure reader behind
+progress callback; every field is optional. Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_tools::search::CandidateFinished`, #2512). The structure reader behind
 the tool, `ferx_core::edit::VariabilityText::read`, is public too: it
 reports which parameter carries which η and κ, how they are blocked, and
 whether each line is in the canonical form.

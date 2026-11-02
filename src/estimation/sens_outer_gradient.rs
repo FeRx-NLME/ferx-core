@@ -69,7 +69,7 @@ fn subject_gradient(
     eta_hat: &[f64],
     interaction: bool,
 ) -> Option<Vec<f64>> {
-    if subject.observations.is_empty() {
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
         return Some(vec![0.0; x.len()]);
     }
     let pt = PackedPoint::new(template, x)?;
@@ -87,7 +87,9 @@ pub(crate) fn subject_gradient_at(
     eta_hat: &[f64],
     interaction: bool,
 ) -> Option<Vec<f64>> {
-    if subject.observations.is_empty() {
+    // No data at all contributes nothing; a subject with only non-Gaussian records still
+    // carries its term (the adjoint folds it in).
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
         return Some(vec![0.0; pt.x.len()]);
     }
     crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(

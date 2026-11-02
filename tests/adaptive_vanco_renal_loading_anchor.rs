@@ -36,6 +36,8 @@ use ferx_core::parser::model_parser::parse_full_model_file;
 use ferx_core::{read_nonmem_csv, simulate_adaptive_from_spec, AdaptiveSimulateOptions};
 use std::path::Path;
 
+mod common;
+
 /// mrgsolve 1.7.2 reference, frozen in
 /// `tests/reference/vanco_renal_loading_mrgsolve/expected.md`. Per daily MAINTENANCE
 /// decision: `(time_h, trough_mg_per_L, dose_mg)`. The doses are exact f64 (`750` scaled by
@@ -98,7 +100,7 @@ fn vanco_renal_loading_example_parses_and_pins_the_scenario() {
     );
     assert_eq!(
         spec.auc_target, None,
-        "auc_target must be absent — it is rejected for a time-varying-covariate subject (#700)"
+        "the example declares no auc_target; the window-AUC test adds one (#943)"
     );
     assert_eq!(
         spec.at.len(),
@@ -271,9 +273,63 @@ fn vanco_renal_loading_titration_matches_mrgsolve() {
         m.pct_time_in_window
     );
 
-    // `auc_target` was intentionally not declared (a typed error on a TV-covariate subject).
+    // The example declares no `auc_target`, so no exposure metric is reported.
     assert_eq!(
         m.auc_target_attainment, None,
         "no auc_target on the renal-loading (time-varying-covariate) example"
     );
+}
+
+/// mrgsolve's AUC24 of each closed inter-decision window (#943), frozen in
+/// `tests/reference/vanco_renal_loading_mrgsolve/expected.md`: an AUC compartment `dxdt_AUC = CENT/V` reset at the
+/// start of each window, integrated on the same piecewise-constant CL as the troughs above.
+const REF_AUC24: [f64; 7] = [
+    261.270558, 336.037198, 459.171369, 551.095341, 548.295417, 507.064148, 450.456723,
+];
+
+/// Relative band of each ferx AUC24 against mrgsolve's (#943), the band of the constant-path
+/// vanco anchor. Measured on Linux aarch64 (`tools/linux-test.sh`), identical in every
+/// printed digit on macOS arm64: the windows read +1.2e-6 to +5.3e-6 relative, so 5e-5 is at least
+/// 9× headroom. This is a cross-engine band (RK45 + a trapezoid on soft samples vs
+/// LSODA + an AUC compartment), not ferx's own accuracy; the kit has a constant `V` and no
+/// `[scaling]`, so it checks the exposure of the per-segment trajectory, and the readout
+/// conversion under κ and covariates is pinned by the closed forms in
+/// `src/api/tests/adaptive_auc_tv_tests.rs`.
+const AUC_REL_TOL: f64 = 5e-5;
+
+/// Each window's AUC24 matches mrgsolve's to [`AUC_REL_TOL`] (#943): the exposure integral
+/// under the per-segment snapshot, checked window by window rather than through the
+/// attainment fraction.
+#[test]
+fn vanco_renal_loading_window_aucs_match_mrgsolve() {
+    common::assert_window_aucs_match(&windows_in, &REF_AUC24, AUC_REL_TOL, "renal_loading");
+}
+
+/// Run the anchor scenario with `auc_target = band` and count the windows in it.
+fn windows_in(band: (f64, f64)) -> usize {
+    let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal_loading.ferx"))
+        .expect("model must parse");
+    let mut spec = parsed
+        .adaptive_dosing
+        .clone()
+        .expect("[adaptive_dosing] present");
+    spec.auc_target = Some(band);
+    let pop = read_nonmem_csv(
+        Path::new("tests/reference/vanco_renal_loading_mrgsolve/vanco_renal_loading_subject.csv"),
+        None,
+        None,
+    )
+    .expect("vanco renal-loading subject data must load");
+    let mut opts = AdaptiveSimulateOptions::default();
+    opts.seed = Some(1);
+    let res = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        &spec,
+        &opts,
+    )
+    .expect("adaptive run with auc_target");
+    common::windows_in_band(&res)
 }

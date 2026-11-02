@@ -3,7 +3,9 @@ use crate::estimation::inner_optimizer::{
     InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov, SUBJECT_SENTINEL_NLL};
+use crate::stats::likelihood::{
+    foce_subject_nll_cov, foce_subject_nll_iov_cov, SUBJECT_SENTINEL_NLL,
+};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 // `SymmetricEigen` is used only by this module's `#[cfg(test)]` code (the non-PD
@@ -127,6 +129,13 @@ pub struct OuterResult {
     /// `EstimationMethod::Vi`; carried here so the chain dispatch lifts it onto
     /// `FitResult.vi` through the same generic path `bayes` uses.
     pub vi: Option<crate::types::ViResult>,
+    /// The fit's first evaluation, unguarded — the reference [`above_start_warning`] holds
+    /// the reported objective against (#2461). `Some` for the NLopt outer loop, `None` for
+    /// every other estimator. It is the **fit's** start, not the last leg's: a restart leg
+    /// (#1277 mid-descent, #2093 basin shift) inherits it through [`RestartLeg`], and the
+    /// floor escape (#2339) hands the first run's to whichever run it reports, so a restart
+    /// that lands above the user's start cannot pass by comparing against its own.
+    pub(crate) start_eval: Option<StartEval>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -194,6 +203,13 @@ pub(crate) fn resolve_outer_optimizer(
     )
 }
 
+/// Run the outer optimizer for one stage from `init_params`.
+///
+/// The `converged` it returns carries **no** above-start verdict (#2461): an NLopt run
+/// records its first evaluation, and only [`crate::fit`] holds the reported result
+/// against it, after the floor escape. A direct caller can be handed `converged: true`
+/// at an objective above the one its starting estimates scored, which `fit` would
+/// report as `W_ABOVE_START`.
 pub fn optimize_population(
     model: &CompiledModel,
     population: &Population,
@@ -1148,6 +1164,7 @@ fn evaluate_at_initial_params(
         left_init: None,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
         params,
         ofv,
         converged: false,
@@ -1440,7 +1457,7 @@ pub(crate) fn subject_nll(
 ) -> f64 {
     if model.n_kappa > 0 {
         if let Some(ref iov) = params.omega_iov {
-            return foce_subject_nll_iov(
+            return foce_subject_nll_iov_cov(
                 model,
                 subject,
                 &params.theta,
@@ -1448,6 +1465,8 @@ pub(crate) fn subject_nll(
                 h_matrix,
                 &params.omega,
                 &params.sigma.values,
+                // Live `block_sigma` off-diagonals (#847, #979), as the non-IOV call below.
+                model.residual_cov_at(params),
                 interaction,
                 kappas,
                 iov,
@@ -1519,7 +1538,7 @@ fn agq_inner_solve_policy(
 
 /// Same dispatch as [`run_inner_loop_and_nll`], plus the AGQ gradient-fusion path,
 /// and an optional caller-hoisted schedule cache (see
-/// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_once` and
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_attempt` and
 /// `run_global_presearch` build the cache once per fit and pass it through here on every
 /// outer eval; `optimize_bfgs`'s legacy fallback passes `None` and pays the per-eval rebuild.
 ///
@@ -2022,6 +2041,22 @@ fn latched_stop_needs_plateau_check(
     latched: bool,
 ) -> bool {
     latched && (converged || max_eval_reached)
+}
+
+/// [`latched_stop_needs_plateau_check`] after the polish or verification legs. Under the
+/// #2462 verification a spent budget is final: it ended the legs before one could clear
+/// the latch, so the stop is unverified, and the plateau check is what the leg replaces.
+/// The BOBYQA polish keeps the #1530 rule, where a latch on the last permitted evaluation
+/// is still judged on the plateau.
+fn stop_needs_plateau_check_after_legs(
+    verify_on: bool,
+    polish_end: PolishEnd,
+    converged: bool,
+    max_eval_reached: bool,
+    latched: bool,
+) -> bool {
+    !(verify_on && polish_end == PolishEnd::BudgetSpent)
+        && latched_stop_needs_plateau_check(converged, max_eval_reached, latched)
 }
 
 /// Should this evaluation's EBEs become the warm start for the next one? (#1290)
@@ -2570,18 +2605,29 @@ pub(crate) const NONFINITE_OBJECTIVE_TOKEN: &str = "W_NONFINITE_OBJECTIVE";
 /// in both directions: an unclamped subject can reach `1e20` on its own (the same
 /// zero prediction against a DV of 12000 scores `1.44e20`), and the IOV + FREM
 /// refusal in `crate::stats::likelihood` returns `1e18`, so a subject refused
-/// there reads as too large rather than as clamped.
+/// there reads as too large rather than as clamped. The estimators only have the
+/// total; `fit()` has the subjects, and rereads the label from them where it can
+/// (`api::postfit::name_nonfinite_subjects`, #2265).
 pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
     if ofv.is_nan() {
         "NaN"
     } else if ofv.is_infinite() {
         "infinite"
     } else if ofv >= SUBJECT_SENTINEL_NLL {
-        "at the divergence sentinel"
+        REASON_AT_SENTINEL
     } else {
-        "too large to be a fit"
+        REASON_TOO_LARGE
     }
 }
+
+/// The finite-sentinel label of [`nonfinite_objective_reason`]. One spelling, since
+/// `fit()`'s reread from the subjects (#2265) writes the same labels and compares them
+/// against the gate's: two copies would read as a relabel on every reread.
+pub(crate) const REASON_AT_SENTINEL: &str = "at the divergence sentinel";
+
+/// The past-the-cutoff label of [`nonfinite_objective_reason`]; see
+/// [`REASON_AT_SENTINEL`].
+pub(crate) const REASON_TOO_LARGE: &str = "too large to be a fit";
 
 /// **The gate (#1303).** Demote a convergence verdict the reported objective
 /// does not support, and return the warning saying why (`None` when there is
@@ -2623,8 +2669,19 @@ pub(crate) fn gate_converged_on_objective(converged: &mut bool, ofv: f64) -> Opt
         return None;
     }
     *converged = false;
-    Some(format!(
-        "{NONFINITE_OBJECTIVE_TOKEN}: the objective at the final estimates is {} ({ofv:?}), so \
+    Some(nonfinite_objective_message(
+        ofv,
+        nonfinite_objective_reason(ofv),
+    ))
+}
+
+/// The [`gate_converged_on_objective`] message for `ofv` under the label `reason`.
+/// Separate from the gate so `fit()` can rebuild it word for word when the
+/// subjects give a better reading of the label than the total does (#2265); the
+/// estimators' copies are deduplicated by suffix, so the two must not drift.
+pub(crate) fn nonfinite_objective_message(ofv: f64, reason: &str) -> String {
+    format!(
+        "{NONFINITE_OBJECTIVE_TOKEN}: the objective at the final estimates is {reason} ({ofv:?}), so \
          the run did not converge on a solution of the problem posed and is reported \
          converged: false whatever the optimizer's own stop rule said. The parameter \
          estimates are wherever the optimizer stopped, not a minimum, and every quantity \
@@ -2633,9 +2690,8 @@ pub(crate) fn gate_converged_on_objective(converged: &mut bool, ofv: f64) -> Opt
          objective — a non-finite dose time, lagtime, bioavailability or infusion duration, \
          a covariate model that overflows at an observed covariate value, or a residual \
          variance driven to zero — and fix the data or the model rather than the optimizer \
-         settings.",
-        nonfinite_objective_reason(ofv)
-    ))
+         settings."
+    )
 }
 
 /// The `W_` token a run that never scored the real objective carries (#1617), so
@@ -2816,6 +2872,79 @@ pub(crate) fn no_feasible_eval_warning(
     ))
 }
 
+/// The token every [`above_start_warning`] message starts with (#2461).
+pub(crate) const ABOVE_START_TOKEN: &str = "W_ABOVE_START";
+
+/// The first evaluation of an outer run — the point it was started from — as the objective
+/// saw it **before** the EBE convergence guard (#2461). [`above_start_warning`] is its only
+/// reader.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StartEval {
+    /// The objective the optimizer ranks (priors and NN penalty included), unguarded.
+    pub ofv: f64,
+    /// Whether the EBE convergence guard rejected the evaluation.
+    pub guard_rejected: bool,
+    /// Subjects whose inner loop did not converge there.
+    pub n_unconverged: usize,
+    /// Subjects rejected at their inner start, whose `(η, H)` is a placeholder.
+    pub n_start_rejected: usize,
+}
+
+/// Demote `converged` and say why when an outer run reports an objective materially above
+/// the one its own starting estimates scored (#2461).
+///
+/// The best-seen restore (#59) only ranks evaluations the EBE guard accepted, so a start the
+/// guard rejects is never a candidate. On a small population that takes one subject: on the
+/// hand-written transit ODE of `transit_flip_flop_fit_matches_ode_twin`, started at the
+/// shorthand's optimum, one of four subjects' inner loops fell back to Nelder–Mead there,
+/// `1/4 > max_unconverged_frac = 0.1`, and the guard handed L-BFGS its center-push gradient
+/// at an objective of −228.81. The run walked off the optimum: on macOS arm64 to the TVNTR
+/// log-packing floor at −59.31, and at #2460's head on Linux aarch64 to a `converged`
+/// −215.687. (On Linux x86_64 the same start is accepted; the call is that close because
+/// the 96 h predictions sit near the ODE `abstol`.) A point worse than where the run started
+/// is not a minimum it found, whatever its trace says.
+///
+/// `reported` is the run's published objective plus the same penalties `start.ofv`
+/// carries. "Materially" is the plateau rule's own bound,
+/// [`PLATEAU_CONSISTENCY_REL_TOL`]·(1 + |start|), so a fit started at its optimum may land a
+/// solver's noise above it. A start with a hard-rejected subject is not compared: its
+/// objective was scored on a placeholder `(η, H)`.
+pub(crate) fn above_start_warning(
+    converged: &mut bool,
+    start: Option<StartEval>,
+    reported: f64,
+    n_subj: usize,
+    max_unconverged_frac: f64,
+) -> Option<String> {
+    let start = start?;
+    if start.n_start_rejected > 0
+        || !start.ofv.is_finite()
+        || !reported.is_finite()
+        || cold_solve_is_consistent(Some(start.ofv), reported)
+    {
+        return None;
+    }
+    *converged = false;
+    let cause = if start.guard_rejected {
+        format!(
+            " The EBE convergence guard rejected that starting evaluation: {} of {} subjects' \
+             inner loops did not converge there, against `max_unconverged_frac` = {}, so the \
+             optimizer never ranked the starting point and was pushed away from it.",
+            start.n_unconverged,
+            n_subj.max(1),
+            max_unconverged_frac,
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{ABOVE_START_TOKEN}: the outer optimizer reported OFV {reported:.6}, {:.4} above the \
+         {:.6} its starting estimates scored, so the fit is not reported as converged.{cause}",
+        reported - start.ofv,
+        start.ofv,
+    ))
+}
+
 /// Resolve a model's declared parameter priors (#254) against `template`'s
 /// packed layout, for an optimizer that needs the penalty on its objective.
 ///
@@ -2913,6 +3042,7 @@ fn reported_candidate(objectives: &[f64]) -> usize {
 /// objective at those EBEs. The two normally do agree — publication is gated on improving
 /// the same objective the tracker ranks — but [`BestPoint::observe`] also records
 /// guard-penalised evals, whose EBEs are deliberately not adopted, so they can part.
+#[derive(Clone)]
 struct IncumbentSolve {
     xs: Vec<f64>,
     etas: Vec<DVector<f64>>,
@@ -3451,12 +3581,26 @@ fn failure_is_converged_plateau(
     final_ofv: f64,
     left_init: bool,
 ) -> bool {
+    plateau_trace_shape(feasible_evals, last_sig_feasible_eval)
+        && cold_solve_is_consistent(best_seen_ofv, final_ofv)
+        && left_init
+}
+
+/// The trace half of [`failure_is_converged_plateau`], **progress** and **plateau**: what
+/// can be read before the final inner solve. The #2462 verification leg reads it to decide
+/// whether a bare `Failure` is a stop the plateau rule would accept.
+fn plateau_trace_shape(feasible_evals: usize, last_sig_feasible_eval: usize) -> bool {
     let made_progress = last_sig_feasible_eval >= 2;
     let flat_tail = feasible_evals.saturating_sub(last_sig_feasible_eval);
-    let plateaued = flat_tail >= PLATEAU_MIN_FLAT_EVALS;
-    let consistent = best_seen_ofv
-        .is_none_or(|best| final_ofv <= best + PLATEAU_CONSISTENCY_REL_TOL * (1.0 + best.abs()));
-    made_progress && plateaued && consistent && left_init
+    made_progress && flat_tail >= PLATEAU_MIN_FLAT_EVALS
+}
+
+/// The **consistency** half of [`failure_is_converged_plateau`]: the cold re-solve is not
+/// materially worse than the best-seen objective. Also the verdict on a stop the #2462
+/// leg verified, whose plateau the leg's gain test replaces.
+fn cold_solve_is_consistent(best_seen_ofv: Option<f64>, final_ofv: f64) -> bool {
+    best_seen_ofv
+        .is_none_or(|best| final_ofv <= best + PLATEAU_CONSISTENCY_REL_TOL * (1.0 + best.abs()))
 }
 
 /// Can [`per_subject_outer_gradients`] be formed for this objective at all — not an AGQ or
@@ -3557,7 +3701,8 @@ fn per_subject_outer_gradients_checked(
                     ),
                     // `x` is not the template's packed length: the adjoint declines, but a subject
                     // with no observations keeps the zero gradient it gives one.
-                    None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                    None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                        .then(|| vec![0.0; x.len()]),
                 }
             } else {
                 match pt.as_ref() {
@@ -3570,7 +3715,8 @@ fn per_subject_outer_gradients_checked(
                     ),
                     // `x` is not the template's packed length: the adjoint declines, but a subject
                     // with no observations keeps the zero gradient it gives one.
-                    None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                    None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                        .then(|| vec![0.0; x.len()]),
                 }
             };
             if scope.is_some_and(|s| !integration_backs_a_decrement(&s.collected())) {
@@ -3750,6 +3896,32 @@ pub(crate) fn joint_warm_starts(
         .collect()
 }
 
+/// The warm starts the FOCE/FOCEI outer caches (NLopt, built-in BFGS) hand the next
+/// evaluation: [`joint_warm_starts`] (`η̂` then every cell's `κ̂`, #2261), except on an
+/// ODE + IOV model, where they are `η̂` alone and each solve restarts κ at 0 (#2508).
+///
+/// An ODE + IOV inner solve keeps its BFGS partial instead of falling back to Nelder–Mead
+/// (`skip_ode_iov_nm_fallback`), and on the RK45 objective's noise floor that partial
+/// depends on where the search started. Started at the previous evaluation's κ̂, the
+/// population objective became a function of the optimizer's path: on busulfan (ODE,
+/// 2×2 BSV, κ on CL and V over 4 occasions, 299 subjects) re-evaluating the same point
+/// along a collapsing line search moved the OFV by 2–4e-3 against a gradient of |g|∞ ≈ 2,
+/// the outer L-BFGS could no longer find a descent step 2e-3 above the optimum, and the
+/// fit took 118 evaluations to the stagnation latch instead of 63. The κ = 0 restart is
+/// what the outer loop did before #2261, and the closed-form models #2261 measured keep
+/// the joint start.
+pub(super) fn outer_cache_warm_starts(
+    model: &CompiledModel,
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<DVector<f64>> {
+    if crate::estimation::inner_optimizer::is_ode_iov(model) {
+        ehs.to_vec()
+    } else {
+        joint_warm_starts(ehs, kappas)
+    }
+}
+
 /// One subject's [`joint_warm_starts`]: `eta`, then each of its κ `cells` in order.
 pub(crate) fn joint_warm_start(eta: &DVector<f64>, cells: &[DVector<f64>]) -> DVector<f64> {
     DVector::from_iterator(
@@ -3906,7 +4078,7 @@ thread_local! {
     /// How many tight re-solves [`predicted_remaining_gain`] started on this thread, so a
     /// test can see that an out-of-scope objective skips one (#2143 review).
     static TIGHT_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Replaces [`outer_eval_budget`]'s result in `optimize_nlopt_once`, so a test can
+    /// Replaces [`outer_eval_budget`]'s result in `optimize_nlopt_attempt`, so a test can
     /// end the budget exactly where a BOBYQA leg stopped (#1782) — `outer_maxiter`
     /// moves it only in steps of `n + 1`.
     pub(crate) static EVAL_BUDGET_OVERRIDE: std::cell::Cell<Option<u32>> =
@@ -3915,7 +4087,7 @@ thread_local! {
     /// on this thread (#1782).
     pub(crate) static FIRST_LEG_EVALS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
-    /// Replaces `POLISH_MIN_GAIN` in `optimize_nlopt_once`; `-inf` makes every polish
+    /// Replaces `POLISH_MIN_GAIN` in `optimize_nlopt_attempt`; `-inf` makes every polish
     /// leg count as still descending, so the run reaches the leg cap (#1782).
     pub(crate) static POLISH_MIN_GAIN_OVERRIDE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
@@ -4124,7 +4296,7 @@ fn optimize_nlopt(
     // decision below — the first attempt's would be the wrong one to act on when
     // the held-cap retry is the result being reported.
     let attempt = |init: &ModelParameters, hold_cap_at_init: bool| {
-        let (result, outcome) = optimize_nlopt_once(
+        let (result, outcome) = optimize_nlopt_attempt(
             model,
             population,
             init,
@@ -4134,6 +4306,7 @@ fn optimize_nlopt(
             None,
             first_eval_etas,
             identity_scales,
+            true,
         );
         ((result, outcome.restart_cause()), outcome.left_init)
     };
@@ -4149,7 +4322,7 @@ fn optimize_nlopt(
     // adopted, budget remains, and at most `MAX_BASIN_RESTARTS` times. The legs share one
     // budget (`RestartLeg::spent_evals`), so the total stays bounded by `outer_maxiter`.
     // A mid-descent stall keeps its single restart: a second stall reports as a stall.
-    resolve_restart_chain(
+    let mut result = resolve_restart_chain(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
         (first, restart_cause),
@@ -4165,19 +4338,17 @@ fn optimize_nlopt(
             // answers is "are the reported estimates still on top of the values the
             // user supplied", and that reference does not move when the optimizer
             // is restarted (#1277 review).
-            let (mut restarted, restarted_outcome) = optimize_nlopt_once(
+            let (mut restarted, restarted_outcome) = optimize_nlopt_attempt(
                 model,
                 population,
                 &stalled.params,
                 options,
                 false,
                 declines,
-                Some(RestartLeg {
-                    escape_from: init_params,
-                    spent_evals: stalled.n_iterations,
-                }),
+                Some(RestartLeg::continuing(init_params, stalled)),
                 None,
                 identity_scales,
+                true,
             );
             // `n_iterations` reports the evaluations the fit spent, and the
             // restart is a continuation of the same fit rather than a fresh one,
@@ -4202,7 +4373,34 @@ fn optimize_nlopt(
             (restarted, restarted_outcome.restart_cause())
         },
         penalized,
-    )
+    );
+    // The covariance step, once, on the attempt reported, at the exact packed vector it
+    // ended on (`packed_estimate`, which every NLopt attempt sets).
+    if let Some(x_hat) = result.packed_estimate.clone() {
+        let crate::estimation::covariance::CovStepOutcome {
+            matrix,
+            wall_time_secs,
+            warnings,
+            sir_fallback_proposal,
+            method,
+        } = crate::estimation::covariance::run_covariance_step(
+            &x_hat,
+            init_params,
+            model,
+            population,
+            &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            options,
+            options.verbose.then_some("Computing covariance matrix..."),
+        );
+        result.covariance_matrix = matrix;
+        result.covariance_method = method;
+        result.covariance_wall_time_secs = wall_time_secs;
+        result.sir_fallback_proposal = sir_fallback_proposal;
+        result.warnings.extend(warnings);
+    }
+    result
 }
 
 /// The restart chain behind [`optimize_nlopt`] (#2093): [`resolve_mid_descent_restart_adopting`], then,
@@ -4259,7 +4457,8 @@ const MAX_BASIN_RESTARTS: usize = 3;
 /// fit, anything else is a genuine stall. This acts on the second half, which
 /// until now was only *reported* ("Outer optimization did not converge") and
 /// never acted on. Measured on the #1277 fixture — the two-cpt DCM in
-/// `tests/fixtures/two_cpt_dcm_regularized.ferx` at `nn_l2 = 0` — L-BFGS quit at
+/// `tests/fixtures/two_cpt_dcm_regularized.ferx` at `nn_l2 = 0`, started without
+/// the `init` line it has carried since #1561 — L-BFGS quit at
 /// eval 12 with the trace still falling ~2600 OFV per eval; restarting from that
 /// point ran to convergence 3886 OFV units lower (3209.81 → −676.77; 7902 →
 /// −540 by eval 44 on Linux, where the abort sits at a different OFV). The
@@ -4433,8 +4632,8 @@ fn resolve_stall_retry<T>(
     retry
 }
 
-/// What makes the #1277 restart leg different from a fresh attempt — the two
-/// things it inherits from the leg it continues. See [`optimize_nlopt_once`].
+/// What makes the #1277 restart leg different from a fresh attempt — the three
+/// things it inherits from the leg it continues. See [`optimize_nlopt_attempt`].
 pub(crate) struct RestartLeg<'a> {
     /// The point the *published* escape verdict is measured against: the user's
     /// initial estimates, not the stalled leg's estimates this leg starts at.
@@ -4444,6 +4643,20 @@ pub(crate) struct RestartLeg<'a> {
     /// restart is a continuation of the same fit, and a user's `maxiter` is a
     /// bound on the fit (#1428).
     pub(crate) spent_evals: usize,
+    /// The fit's first evaluation, published on the leg's result in place of the leg's own
+    /// (see [`OuterResult::start_eval`]) — the counterpart of `escape_from` for #2461.
+    pub(crate) start_eval: Option<StartEval>,
+}
+
+impl<'a> RestartLeg<'a> {
+    /// The leg that continues `stalled`, a fit started at `init_params`.
+    pub(crate) fn continuing(init_params: &'a ModelParameters, stalled: &OuterResult) -> Self {
+        Self {
+            escape_from: init_params,
+            spent_evals: stalled.n_iterations,
+            start_eval: stalled.start_eval,
+        }
+    }
 }
 
 /// The evaluation budget one NLopt run is given: `outer_maxiter × (n + 1)` for the
@@ -4646,6 +4859,328 @@ pub(crate) fn polish_leg_cap_warning(last_gain: f64) -> String {
     )
 }
 
+type NloptReturn = Result<(nlopt::SuccessState, f64), (nlopt::FailState, f64)>;
+
+/// The inner tolerance an unprofiled verification leg runs at (#2462), or the user's
+/// `inner_tol` when tighter. At the default `1e-5` the EBE re-solve noise leaves L-BFGS no
+/// step it can certify on an ill-conditioned objective: on A2's unprofiled twin 16 of 80
+/// starts stopped 1.7e-4 to 5.3e-4 above NONMEM, all `converged`, and a fresh leg at the
+/// fit's own settings gained exactly 0 from every one of them. At `1e-10` the whole grid
+/// lands within 5.1e-8 (#2462's plan, §3).
+pub(crate) const UNPROFILED_VERIFY_INNER_TOL: f64 = 1e-10;
+
+/// An unprofiled verification leg settles when its own gain is at most this (#2462).
+/// Absolute OFV, measured inside the leg at its tolerance. Over A2's 80 starts (Linux
+/// aarch64), a first leg from a stop already within 1e-5 of the optimum gained at most
+/// 5.9e-6 and one from a stuck stop at least 1.70e-4, so 3e-5 sits 5.1× above the one and
+/// 5.7× below the other. On eight more fixtures with a known optimum (10 to 100 subjects,
+/// |OFV| 62 to 3792) the genuine side reached at most 1.8e-6, with no trend in either, so
+/// the threshold is not scaled.
+///
+/// It is not the only way a leg settles; see [`unprofiled_leg_settles`].
+pub(crate) const UNPROFILED_VERIFY_GAIN: f64 = 3e-5;
+
+/// Does an unprofiled fit get the #2462 verification leg at all? FOCE / FOCEI with a
+/// gradient optimizer (L-BFGS, SLSQP), whose `1e-12` stops are unreachable, so that its
+/// stops are bare `Failure`s the plateau rule accepts or tolerance stops met mid-descent.
+/// Not a quadrature objective, which has reachable stops
+/// (`gradient_run_has_reachable_stops`) and its own noise floor, and not a mixture, whose
+/// objective is a different solve.
+pub(crate) fn unprofiled_verify_applies(
+    algo: nlopt::Algorithm,
+    reachable_stops: bool,
+    is_mixture: bool,
+) -> bool {
+    matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp)
+        && !reachable_stops
+        && !is_mixture
+}
+
+/// Does a stop need a verification leg before it may be called converged (#2462)? Every
+/// stop that the status or the plateau rule would otherwise report converged: a success
+/// or tolerance status, and `Failure` / `ForcedStop` / `RoundoffLimited`. Not a spent
+/// budget or time, not a cancelled run.
+///
+/// The failures only once the fit has `left_init`, the guard
+/// `failure_is_converged_plateau` and the profiled `profiled_stop_needs_verify` keep: a
+/// leg from a start L-BFGS could not leave gains nothing and would report the initial
+/// estimates converged. `plateau_shape` is the rest of the plateau rule that can be read
+/// before the final inner solve (progress, and a flat tail); it gates `Failure` /
+/// `ForcedStop` at the first stop, which without it is not reported converged and goes to
+/// the #1277 restart instead. A leg's own stop passes `true`: its gain test replaces the
+/// flat tail.
+pub(crate) fn unprofiled_stop_needs_verify(
+    result: &NloptReturn,
+    cancelled: bool,
+    left_init: bool,
+    plateau_shape: bool,
+) -> bool {
+    !cancelled
+        && match result {
+            Ok((status, _)) => !matches!(
+                status,
+                nlopt::SuccessState::MaxEvalReached | nlopt::SuccessState::MaxTimeReached
+            ),
+            Err((nlopt::FailState::RoundoffLimited, _)) => left_init,
+            Err((nlopt::FailState::Failure | nlopt::FailState::ForcedStop, _)) => {
+                left_init && plateau_shape
+            }
+            Err(_) => false,
+        }
+}
+
+/// Does a verified stop also need `left_init` to be reported converged (#2462)? Only where
+/// the verdict before the leg asked for it: a first stop of `Failure` / `ForcedStop`, or a
+/// latched one, both of which went to the plateau rule. A success-class or
+/// `RoundoffLimited` stop was converged on its status alone, so a refit started at its own
+/// optimum, which never leaves its initial estimates, keeps that verdict once a leg has
+/// verified it.
+pub(crate) fn verified_stop_needs_left_init(first: &NloptReturn, latched: bool) -> bool {
+    latched
+        || matches!(
+            first,
+            Err((nlopt::FailState::Failure | nlopt::FailState::ForcedStop, _))
+        )
+}
+
+/// Does an unprofiled verification leg end the loop (#2462)? Any of three tests settles it:
+///
+/// - its own `gain`, first feasible evaluation to its best, is at most
+///   [`UNPROFILED_VERIFY_GAIN`];
+/// - it is the first leg (`first_leg`) and its gain is at most [`UNPROFILED_FIRST_LEG_GAIN`]
+///   (#2507);
+/// - or, from the second leg on, it ended no further below the lowest leg before it than
+///   the objective can resolve there (`net`, that leg's best minus this leg's, is at most
+///   `resolution`). `resolution` is measured, not chosen: the leg's cold-seeded first score
+///   of the incumbent against that incumbent's own score in the leg that found it — the
+///   same point at the same tolerance, so their gap is what the objective itself disagrees
+///   with itself by. All three are at the leg tolerance.
+///
+/// The net-change test is for an objective whose noise is larger than the threshold. On the
+/// 200-subject Michaelis–Menten benchmark (`tests/ebe_basin_shift.rs`, a multimodal inner
+/// problem) every leg at the optimum gains 9.3e-5 to 2.4e-3, from where its cold-seeded
+/// first evaluation lands, while the incumbent only wanders: −5.9e-4 to +6.5e-4 from leg to
+/// leg. On the gain alone every start reached the leg cap. A leg that ends above where the
+/// last one ended is measuring that noise, not a descent — and so is one that ends lower by
+/// less than the gap between two scores of its own starting point (#2482: on
+/// `ctmm_pd_2state`, whose optimum sits on a bound, the second leg ended 7.5e-5 lower where
+/// its start's two scores differed by 9.1e-5, and a third leg of ~60 evaluations ran).
+///
+/// The first-leg test is #2507's. `UNPROFILED_VERIFY_GAIN` tells a loose stop that was
+/// already at the optimum (its first leg gains at most 5.9e-6 on A2) from one that was
+/// stuck (at least 1.70e-4). A stuck stop then cost a second leg, from a point that is
+/// itself a stop at the tight tolerance, and that leg never descended: on A2's 80-start
+/// grid (macOS arm64) every one of the 16 second legs gained at most 8.1e-9, and on the
+/// rifapentine benchmark's 116-subject ODE model it ended 2.2e-5 *above* the first,
+/// after ~150 evaluations. A first leg runs from a cold EBE seed to its own stop at
+/// `UNPROFILED_VERIFY_INNER_TOL`, which is the configuration that put the whole A2 grid
+/// within 5.1e-8 of NONMEM when run as the fit itself; it needs a second leg only when it
+/// gained more than the objective's own noise floor, where it may still be descending.
+///
+/// A `NaN` gain (a leg with no feasible evaluation) does not settle, and neither does a
+/// missing `net`.
+pub(crate) fn unprofiled_leg_settles(
+    gain: f64,
+    net: Option<f64>,
+    resolution: Option<f64>,
+    first_leg: bool,
+) -> bool {
+    gain <= UNPROFILED_VERIFY_GAIN
+        || (first_leg && gain <= UNPROFILED_FIRST_LEG_GAIN)
+        || net.is_some_and(|d| d <= resolution.unwrap_or(0.0).max(0.0))
+}
+
+/// The gain at or below which the first unprofiled verification leg settles (#2507; see
+/// [`unprofiled_leg_settles`]). `POLISH_MIN_GAIN`, the 1e-3 the stagnation guard, the plateau
+/// check and the BOBYQA polish already treat as the FOCE objective's noise floor: above it a
+/// leg may still be descending.
+pub(crate) const UNPROFILED_FIRST_LEG_GAIN: f64 = POLISH_MIN_GAIN;
+
+/// One unprofiled verification leg as the loop judges it (#2462).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnprofiledLeg {
+    pub(crate) ret: NloptReturn,
+    /// The leg's own gain: its first feasible objective minus its best, `NaN` with none.
+    pub(crate) gain: f64,
+    /// The leg's best objective at its tolerance, `None` with no feasible evaluation.
+    pub(crate) best: Option<f64>,
+    /// The leg's first feasible objective — its cold-seeded score of the incumbent it
+    /// starts from — `None` with no feasible evaluation.
+    pub(crate) first: Option<f64>,
+}
+
+/// The #2462 verification legs: [`drive_legs`] settling on [`unprofiled_leg_settles`].
+/// `first_needs_verify` judges the first stop, which also needs the plateau shape
+/// ([`unprofiled_stop_needs_verify`]); `needs_verify` judges each leg's own return. Returns
+/// the last return, why the loop ended, and whether the stop was verified: the loop
+/// settled on a leg whose own return still needed verifying, so the leg's test, not its
+/// status, decided it. A leg that ran out of budget settles on `MaxEvalReached` and is not
+/// verified. The fourth value is the last leg's net change against the lowest leg before it
+/// (that leg's best minus this one's, so positive when it ended lower), `None` with no
+/// earlier feasible leg or when this leg had no feasible evaluation.
+pub(crate) fn unprofiled_verify_legs(
+    first: NloptReturn,
+    first_needs_verify: bool,
+    needs_verify: impl Fn(&NloptReturn) -> bool,
+    budget_left: impl Fn() -> u32,
+    mut leg: impl FnMut(u32) -> Option<UnprofiledLeg>,
+) -> (NloptReturn, PolishEnd, bool, Option<f64>) {
+    // (return, is the first stop, net change against the lowest previous leg, the
+    // resolution measured at this leg's start, is the first leg)
+    type Step = (NloptReturn, bool, Option<f64>, Option<f64>, bool);
+    let mut prev_best: Option<f64> = None;
+    let mut legs_run = 0usize;
+    let ((last, _, last_net, _, _), end) = drive_legs(
+        (first, true, None, None, false),
+        |s: &Step, gain| {
+            #[cfg(test)]
+            if UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.get()) {
+                return false;
+            }
+            unprofiled_leg_settles(gain, s.2, s.3, s.4)
+        },
+        |s: &Step| {
+            if s.1 {
+                first_needs_verify
+            } else {
+                needs_verify(&s.0)
+            }
+        },
+        budget_left,
+        |left| {
+            let l = leg(left)?;
+            legs_run += 1;
+            let net = prev_best.zip(l.best).map(|(p, b)| p - b);
+            // Only from the second leg: the first leg's incumbent was scored at the loose
+            // tolerance, so the gap to it is not the objective's resolution at this one.
+            // Against the lowest leg so far, which is where this leg started (#2507).
+            let resolution = prev_best.zip(l.first).map(|(p, f)| (f - p).abs());
+            // The lowest leg so far, the one the fit restores (#2507): a leg that ended above
+            // it leaves it in place, so the next leg is measured against it too.
+            prev_best = match (prev_best, l.best) {
+                (Some(p), Some(b)) => Some(p.min(b)),
+                (p, b) => b.or(p),
+            };
+            Some(((l.ret, false, net, resolution, legs_run == 1), l.gain))
+        },
+    );
+    let verified = matches!(end, PolishEnd::Settled) && needs_verify(&last);
+    (last, end, verified, last_net)
+}
+
+/// Is a finished #2462 verification leg's incumbent the one the fit keeps (#2507)? The first
+/// leg with a feasible evaluation is; a later one only when it ended strictly lower than the
+/// incumbent kept so far, since both are at the leg tolerance and the fit restores the lowest
+/// point it evaluated (#59).
+///
+/// `live` is the state the run's final restore reads with that point and that every leg
+/// overwrites from its first improving evaluation (each leg's own incumbent starts empty):
+/// in `optimize_nlopt_once`, the optimizer gradient (`last_gradient`) and the incumbent's
+/// whole EBE / `H` / κ solve (`best_solve`). `kept_best` / `kept_state` hold the kept leg's
+/// objective and that state. A kept leg's is recorded; a leg that is not kept has `live`
+/// replaced by the kept leg's, so `final_gradient` belongs to the point the fit reports and
+/// the final inner loop scores the held EBE state *at* that point — a state from another
+/// point fails its `xs` check and can only seed a fresh solve, which on a multimodal inner
+/// problem need not find the same modes. Before #2507 every later leg was kept, so the
+/// rifapentine benchmark reported its second leg's 1378.1047474 over the first's
+/// 1378.1047252.
+pub(crate) fn keep_verify_leg<G: Clone>(
+    kept_best: &mut Option<f64>,
+    kept_state: &mut Option<G>,
+    leg_best: Option<f64>,
+    live: &mut G,
+) -> bool {
+    match leg_best {
+        Some(b) if kept_best.is_none_or(|k| b < k) => {
+            *kept_best = Some(b);
+            *kept_state = Some(live.clone());
+            true
+        }
+        _ => {
+            if let Some(g) = kept_state {
+                *live = g.clone();
+            }
+            false
+        }
+    }
+}
+
+/// The internal switch for the #2462 verification leg. `false` restores the pre-#2462
+/// verdict on every stop; kept so a change in a test can be attributed to the leg.
+const UNPROFILED_VERIFY_LEG: bool = true;
+
+#[cfg(test)]
+thread_local! {
+    /// `optimize_nlopt_attempt` calls on this thread, for the tests.
+    pub(crate) static NLOPT_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Turns the #2462 leg off on this thread, for the tests' mutation checks.
+    pub(crate) static UNPROFILED_VERIFY_OFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
+    pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Makes no #2462 leg settle on this thread, so every stop runs `MAX_POLISH_LEGS` legs —
+    /// for the #2507 test of the kept leg's state.
+    pub(crate) static UNPROFILED_VERIFY_NEVER_SETTLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Whether the held `best_solve` at the final restore belonged to the restored point
+    /// (`None` with none held), for the #2507 tests.
+    pub(crate) static HELD_SOLVE_AT_RESTORED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn unprofiled_verify_enabled() -> bool {
+    #[cfg(test)]
+    if UNPROFILED_VERIFY_OFF.with(|o| o.get()) {
+        return false;
+    }
+    UNPROFILED_VERIFY_LEG
+}
+
+/// The warning for an unprofiled verification that reached the leg cap (#2462). It names
+/// the two numbers the settle test read: `last_net`, how far the last leg ended below the
+/// one before it, and `last_gain`, the last leg's own gain, which runs from its
+/// cold-seeded first evaluation and so includes the cold-versus-warm EBE gap.
+pub(crate) fn unprofiled_verify_cap_warning(last_gain: f64, last_net: Option<f64>) -> String {
+    let net = last_net.map_or(String::new(), |d| {
+        format!(" ended {d:.3e} below the leg before it, and")
+    });
+    format!(
+        "Outer optimization was still improving after {MAX_POLISH_LEGS} verification legs \
+         at a tight inner tolerance: the last{net} lowered the objective by {last_gain:.3e} \
+         from its own first evaluation, so it is not reported as converged; re-run from \
+         these estimates."
+    )
+}
+
+/// [`optimize_nlopt_attempt`] with its own covariance step.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn optimize_nlopt_once(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+    hold_cap_at_init: bool,
+    declines: &OuterFdDeclineLog,
+    restart: Option<RestartLeg<'_>>,
+    first_eval_etas: Option<&[DVector<f64>]>,
+    identity_scales: &[(usize, f64)],
+) -> (OuterResult, AttemptOutcome) {
+    optimize_nlopt_attempt(
+        model,
+        population,
+        init_params,
+        options,
+        hold_cap_at_init,
+        declines,
+        restart,
+        first_eval_etas,
+        identity_scales,
+        false,
+    )
+}
+
 /// One NLopt outer-optimizer run. Returns the result and the
 /// [`AttemptOutcome`] — whether the fit left its initial estimates, and whether
 /// it stopped mid-descent — which is what [`optimize_nlopt`] runs a second
@@ -4670,7 +5205,12 @@ pub(crate) fn polish_leg_cap_warning(last_gain: f64) -> String {
 ///   ([`outer_eval_budget`]), so the two legs together never exceed the
 ///   `outer_maxiter` the user set. The caller does not restart on an empty
 ///   budget: `set_maxeval(0)` means *unlimited* to NLopt, not "no evaluations".
-fn optimize_nlopt_once(
+///
+/// With `defer_covariance` the covariance step is left to the caller: [`optimize_nlopt`] runs
+/// it once, on the attempt it reports, rather than on every attempt of its retry and restart
+/// chain — a restarted fit used to pay a full step for a result it then replaced.
+#[allow(clippy::too_many_arguments)]
+fn optimize_nlopt_attempt(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -4680,9 +5220,13 @@ fn optimize_nlopt_once(
     restart: Option<RestartLeg<'_>>,
     first_eval_etas: Option<&[DVector<f64>]>,
     identity_scales: &[(usize, f64)],
+    defer_covariance: bool,
 ) -> (OuterResult, AttemptOutcome) {
+    #[cfg(test)]
+    NLOPT_ATTEMPTS.with(|c| c.set(c.get() + 1));
     let escape_from = restart.as_ref().map(|r| r.escape_from);
     let spent_evals = restart.as_ref().map_or(0, |r| r.spent_evals);
+    let inherited_start = restart.as_ref().map(|r| r.start_eval);
     let PackedStart {
         packed: mut x0,
         bounds,
@@ -4920,6 +5464,32 @@ fn optimize_nlopt_once(
 
     let verbose = options.verbose;
 
+    // #2462: the verification leg's state, shared with the objective. While `in_leg` is
+    // set the inner loop runs at `leg_options`' tolerance and every feasible evaluation is
+    // ranked in `leg_best`, the leg's own incumbent, instead of `best_seen`, which holds
+    // objectives at the user's tolerance; `leg_first` is the leg's first feasible
+    // objective, for its gain.
+    let verify_on = unprofiled_verify_enabled()
+        && unprofiled_verify_applies(
+            algo,
+            gradient_run_has_reachable_stops(options),
+            init_params.mixture.is_some(),
+        );
+    let leg_options = FitOptions {
+        inner_tol: options.inner_tol.min(UNPROFILED_VERIFY_INNER_TOL),
+        ..options.clone()
+    };
+    let in_leg = std::cell::Cell::new(false);
+    let leg_best = std::cell::RefCell::new(BestPoint::new());
+    let leg_first: std::cell::Cell<Option<f64>> = std::cell::Cell::new(None);
+    // Set when the #2093 basin probe ends a leg. Such a stop belongs to the basin-shift
+    // restart, not to a verification leg: on `final_ebe_solve`'s starved warfarin fit the
+    // probe stopped at 620.8 to restart from a cold re-solve's lower basin, and legs from
+    // there walked to −270.92 and settled, while the restart reaches −286.0042.
+    let basin_probe_fired = std::cell::Cell::new(false);
+    // #2461: the run's first evaluation, unguarded, for `above_start_warning`.
+    let start_eval: std::cell::Cell<Option<StartEval>> = std::cell::Cell::new(None);
+
     // NLopt objective: receives xs (scaled), unscales before running inner loop.
     // Gradient: d(OFV)/d(xs[i]) = d(OFV)/d(x[i]) * scale[i] (chain rule).
     let objective = |xs: &[f64], grad: Option<&mut [f64]>, state: &mut NloptState| -> f64 {
@@ -4952,6 +5522,9 @@ fn optimize_nlopt_once(
         // Unscale from optimizer space to real (log/Cholesky) space.
         let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
         let params = unpack_params(&x, init_params);
+        // The options the inner solve and the gradient run at: the leg's while it runs.
+        let in_verify_leg = in_leg.get();
+        let eval_options = if in_verify_leg { &leg_options } else { options };
 
         // EBE warm-start cache: the update below is withheld unless this eval
         // improves on the best seen, so the warm start always comes from the
@@ -4974,6 +5547,9 @@ fn optimize_nlopt_once(
         // MIXEST-class EBEs stand in for the warm-start / trace. The full `MixtureEval`
         // is kept in `mixeval` for the analytic gradient below.
         let mut mixeval: Option<crate::estimation::mixture::MixtureEval> = None;
+        // Every class's κ̂ for an IOV mixture's exact gradient (the eval keeps only the
+        // MIXEST class's).
+        let mut mixmodes: Option<crate::estimation::mixture::MixtureClassModes> = None;
         let fuse_agq_gradient = grad.is_some()
             && options.agq_nodes().is_some()
             && !reconverge_this_eval(options, state.n_grad_evals)
@@ -4985,8 +5561,15 @@ fn optimize_nlopt_once(
         let (ehs, hms, ebe_stats, kappas, raw_ofv, agq_evaluation) = if params.mixture.is_some() {
             let warm = (!state.cached_etas_by_class.is_empty())
                 .then_some(state.cached_etas_by_class.as_slice());
-            let mut m =
-                crate::estimation::mixture::mixture_ofv(model, population, &params, options, warm);
+            let mut m = if grad.is_some() && model.n_kappa > 0 {
+                let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
+                    model, population, &params, options, warm,
+                );
+                mixmodes = Some(modes);
+                m
+            } else {
+                crate::estimation::mixture::mixture_ofv(model, population, &params, options, warm)
+            };
             let stats = InnerLoopStats {
                 n_unconverged: m.ebe_stats.n_unconverged,
                 n_fallback: m.ebe_stats.n_fallback,
@@ -5029,7 +5612,7 @@ fn optimize_nlopt_once(
                     model,
                     population,
                     &params,
-                    options,
+                    eval_options,
                     Some(&state.cached_etas),
                     Some(&mu_k),
                     fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
@@ -5108,6 +5691,14 @@ fn optimize_nlopt_once(
         // line search can backtrack instead of failing on a first-step overshoot (#486; see
         // `guard_penalty_value`). Derivative-free BOBYQA (`grad` is `None`) keeps the wall.
         let guarded = ebe_guard_triggered || !raw_ofv.is_finite();
+        if start_eval.get().is_none() {
+            start_eval.set(Some(StartEval {
+                ofv: raw_ofv,
+                guard_rejected: ebe_guard_triggered,
+                n_unconverged: ebe_stats.n_unconverged,
+                n_start_rejected: ebe_stats.n_start_rejected,
+            }));
+        }
         let ofv = if guarded {
             if grad.is_some() {
                 guard_penalty_value(xs, &lower_s, &upper_s)
@@ -5149,8 +5740,13 @@ fn optimize_nlopt_once(
                 // the incumbent the salvage guard may measure this gradient point against.
                 let guard_reference = state.salvage_guard.reference(xs);
                 let mut grad_raw = if let Some(mev) = &mixeval {
-                    crate::estimation::mixture::mixture_gradient(
-                        model, population, &params, options, mev,
+                    crate::estimation::mixture::mixture_gradient_with_modes(
+                        model,
+                        population,
+                        &params,
+                        options,
+                        mev,
+                        mixmodes.as_ref(),
                     )
                     .unwrap_or_else(|| {
                         crate::estimation::mixture::mixture_gradient_fd(
@@ -5172,7 +5768,7 @@ fn optimize_nlopt_once(
                         &hms,
                         &kappas,
                         &bounds,
-                        options,
+                        eval_options,
                         &mut state.n_grad_evals,
                         agq_evaluation,
                         // #1520: the optimizer-facing objective at this point and the
@@ -5233,7 +5829,12 @@ fn optimize_nlopt_once(
                 // Gate on the global best (same tracker as the `best_seen` update
                 // below) so `last_gradient` always reflects the best point seen.
                 {
-                    let global_best = best_seen_cl.lock().unwrap().ofv();
+                    // Inside a #2462 leg the incumbent is the leg's own.
+                    let global_best = if in_verify_leg {
+                        leg_best.borrow().ofv()
+                    } else {
+                        best_seen_cl.lock().unwrap().ofv()
+                    };
                     if ofv < global_best {
                         *last_gradient_cl.lock().unwrap() = Some(grad_raw.clone());
                     }
@@ -5248,8 +5849,9 @@ fn optimize_nlopt_once(
         let warm_start_improved = adopt_warm_start(guarded, ofv, state.best_ofv);
         if warm_start_improved {
             // The next evaluation starts every subject at this one's whole mode, κ̂ with
-            // η̂, rather than restarting an IOV subject's κ at 0 (#2261).
-            state.cached_etas = joint_warm_starts(&ehs, &kappas);
+            // η̂, rather than restarting an IOV subject's κ at 0 (#2261) — except on an
+            // ODE + IOV model, see `outer_cache_warm_starts` (#2508).
+            state.cached_etas = outer_cache_warm_starts(model, &ehs, &kappas);
             // Publish the incumbent's whole EBE state for the final inner loop (#833).
             // The clone happens once per *improving* eval, not per eval, and `hms` is
             // moved into the (write-only) state cache afterwards rather than cloned
@@ -5317,10 +5919,26 @@ fn optimize_nlopt_once(
         // `best_seen` tracks the global minimum across the whole run so the
         // final restore (issue #59) lands on the true best point, even when the
         // optimizer drifts away from it before terminating.
-        best_seen_cl
-            .lock()
-            .unwrap()
-            .observe(state.n_evals, xs, ofv, ofv_clean);
+        //
+        // #2462: a verification leg ranks its feasible evaluations in its own incumbent,
+        // at its own tolerance; the leg copies it into `best_seen` when it ends. Mixing the
+        // two tolerances in one tracker would keep a loose objective that is lower only by
+        // its noise, and the next leg would restart from it.
+        if in_verify_leg {
+            if !guarded {
+                leg_best
+                    .borrow_mut()
+                    .observe(state.n_evals, xs, ofv, ofv_clean);
+                if leg_first.get().is_none() {
+                    leg_first.set(Some(ofv));
+                }
+            }
+        } else {
+            best_seen_cl
+                .lock()
+                .unwrap()
+                .observe(state.n_evals, xs, ofv, ofv_clean);
+        }
         // After updating best_ofv, check whether we've stalled. If yes,
         // `stagnation_stopped` is latched and the early-return at the
         // top of the closure trips on the next eval.
@@ -5368,16 +5986,20 @@ fn optimize_nlopt_once(
             }
             descending
         };
-        if stagnation_after_eval(
-            state,
-            n,
-            options.stagnation_guard,
-            algo,
-            gradient_run_has_reachable_stops(options),
-            last_sig_feasible_eval,
-            step,
-            still_descending,
-        ) {
+        // A #2462 leg does not latch: its gains sit far below the guard's 1e-3 window, and
+        // its own stop and the gain test are what end it.
+        if !in_verify_leg
+            && stagnation_after_eval(
+                state,
+                n,
+                options.stagnation_guard,
+                algo,
+                gradient_run_has_reachable_stops(options),
+                last_sig_feasible_eval,
+                step,
+                still_descending,
+            )
+        {
             stagnation_latched_cl.store(true, Ordering::Relaxed);
             latch_overrode_veto_cl.store(state.latch_overrode_veto, Ordering::Relaxed);
         }
@@ -5424,6 +6046,7 @@ fn optimize_nlopt_once(
                     if let Some(gap) = cold_solve_beats_best_seen(Some(cold), best) {
                         state.stagnation_stopped = true;
                         basin_probe_stopped = true;
+                        basin_probe_fired.set(true);
                         if verbose {
                             eprintln!(
                                 "Eval {:>4}: basin probe — a cold re-solve at the best point \
@@ -5620,55 +6243,181 @@ fn optimize_nlopt_once(
     let polish_min_gain = POLISH_MIN_GAIN_OVERRIDE
         .with(|o| o.get())
         .unwrap_or(POLISH_MIN_GAIN);
-    let (result, polish_end) = drive_polish_legs(
-        first_leg,
-        polish_min_gain,
-        |r| {
-            bobyqa_stop_needs_polish(
-                algo,
-                r,
-                stagnation_latched.load(Ordering::Relaxed),
-                crate::cancel::is_cancelled(&options.cancel),
-            )
-        },
-        || {
-            let used = spent_evals + n_evals_outer.load(Ordering::Relaxed);
-            full_budget.saturating_sub(used as u32)
-        },
-        |left| {
-            // Nothing feasible seen means the best point is the guard penalty's minimum
-            // (#1617) — not a place to polish from; the verdict below reports that run.
-            if plateau_tracker.lock().unwrap().2 == 0 {
-                return None;
-            }
-            let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
-            let mut state = opt_slot.take()?.recover_user_data();
-            x0.copy_from_slice(&best_x);
-            state.prev_x = best_x;
-            // A full stagnation window for the leg: the previous leg's flat tail is
-            // what ended it, and must not latch this one on its first eval.
-            state.last_improvement_eval = state.n_evals;
-            state.best_at_last_improvement = state.best_ofv;
-            let mut leg = nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
-            leg.set_lower_bounds(&lower_s).unwrap();
-            leg.set_upper_bounds(&upper_s).unwrap();
-            leg.set_maxeval(left).unwrap();
-            leg.set_xtol_rel(polish_xtol).unwrap();
-            leg.set_ftol_rel(polish_ftol).unwrap();
-            leg.set_initial_step(&bobyqa_initial_step(&lower_s, &upper_s))
-                .unwrap();
-            if options.verbose {
-                eprintln!(
+    let budget_left = || {
+        let used = spent_evals + n_evals_outer.load(Ordering::Relaxed);
+        full_budget.saturating_sub(used as u32)
+    };
+    // #2462: an unprofiled FOCE/FOCEI gradient stop is not evidence of a minimum either.
+    // At the default `inner_tol` the EBE re-solve noise leaves L-BFGS no step it can
+    // certify on an ill-conditioned objective, so it stops — on a bare `Failure` the
+    // plateau rule accepts, or on a tolerance status — 1e-4 above the optimum. A leg at
+    // the fit's own settings gains exactly 0 there. So each stop that would be reported
+    // converged gets a leg from the best point at a tight inner tolerance
+    // (`UNPROFILED_VERIFY_INNER_TOL`), with its own incumbent at that tolerance, the latch
+    // cleared, and a cold EBE seed for its first evaluation; it settles on
+    // `unprofiled_leg_settles`. The cold seed matters: from its own modes, a subject's
+    // inner BFGS at the incumbent can fail to certify a step and fall back to Nelder–Mead,
+    // which scored A2's (55, 5, 3.2) start 1.6e-9 below every neighbouring point, more than
+    // L-BFGS's first step could gain there, and that leg ended `Failure` with no gain.
+    let latched_at_stop = stagnation_latched.load(Ordering::Relaxed);
+    let verified_needs_left_init = verified_stop_needs_left_init(&first_leg, latched_at_stop);
+    // The best leg incumbent copied into `best_seen` so far (#2507), at the leg tolerance.
+    let mut kept_leg_best: Option<f64> = None;
+    // The optimizer gradient and the whole EBE state (`best_solve`) at that incumbent
+    // ([`keep_verify_leg`]).
+    let mut kept_leg_state: Option<(Option<Vec<f64>>, Option<IncumbentSolve>)> = None;
+    let (result, polish_end, verified_stop, last_net) = if verify_on {
+        let cancelled = crate::cancel::is_cancelled(&options.cancel);
+        // Measured on the incumbent the leg starts from, as `left_init` below is.
+        let left_init_at_stop = best_point()
+            .filter(|(x, _)| x.len() == n)
+            .is_some_and(|(x, _)| max_scaled_deviation(&x, &x0_start_s) >= INIT_ESCAPE_STEP_S);
+        let plateau_shape = {
+            let (_, last_sig, feasible) = *plateau_tracker.lock().unwrap();
+            plateau_trace_shape(feasible, last_sig)
+        };
+        let first_needs_verify = !basin_probe_fired.get()
+            && unprofiled_stop_needs_verify(
+                &first_leg,
+                cancelled,
+                left_init_at_stop,
+                plateau_shape,
+            );
+        unprofiled_verify_legs(
+            first_leg,
+            first_needs_verify,
+            // Read live: a cancel during a leg ends the legs there.
+            |r| {
+                !basin_probe_fired.get()
+                    && unprofiled_stop_needs_verify(
+                        r,
+                        crate::cancel::is_cancelled(&options.cancel),
+                        left_init_at_stop,
+                        true,
+                    )
+            },
+            budget_left,
+            |left| {
+                if plateau_tracker.lock().unwrap().2 == 0 {
+                    return None;
+                }
+                let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
+                let mut state = opt_slot.take()?.recover_user_data();
+                x0.copy_from_slice(&best_x);
+                state.prev_x = best_x;
+                // Unlatched: a latched state answers every evaluation with the incumbent
+                // and a zero gradient, and the latch carries into the recovered state.
+                state.stagnation_stopped = false;
+                state.recent_steps.clear();
+                stagnation_latched.store(false, Ordering::Relaxed);
+                // The leg's own incumbent, so its first evaluation is adopted as the
+                // warm start whatever the loose objective was.
+                state.best_ofv = f64::INFINITY;
+                state.last_improvement_eval = state.n_evals;
+                state.best_at_last_improvement = f64::INFINITY;
+                // A cold EBE seed for the first evaluation.
+                for e in state.cached_etas.iter_mut() {
+                    e.fill(0.0);
+                }
+                state.cached_etas_are_modes = false;
+                *leg_best.borrow_mut() = BestPoint::new();
+                leg_first.set(None);
+                let mut leg =
+                    nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
+                leg.set_lower_bounds(&lower_s).unwrap();
+                leg.set_upper_bounds(&upper_s).unwrap();
+                leg.set_maxeval(left).unwrap();
+                // The first leg's own stops (`verify_on` excludes the reachable ones).
+                leg.set_xtol_rel(1e-12).unwrap();
+                leg.set_ftol_rel(1e-12).unwrap();
+                in_leg.set(true);
+                let r = leg.optimize(&mut x0);
+                in_leg.set(false);
+                opt_slot = Some(leg);
+                let best = leg_best.borrow().get().map(|b| b.ofv);
+                let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
+                // The first leg's incumbent replaces the loose one: the two are at different
+                // tolerances, and the loose one can be lower by its noise alone. A later leg's
+                // replaces it only when lower; otherwise the kept leg's gradient and EBE state
+                // go back in, which this leg's improving evaluations overwrote
+                // ([`keep_verify_leg`]).
+                let mut live = (
+                    last_gradient.lock().unwrap().take(),
+                    best_solve.lock().unwrap().take(),
+                );
+                if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, best, &mut live) {
+                    *best_seen.lock().unwrap() = leg_best.borrow().clone();
+                }
+                *last_gradient.lock().unwrap() = live.0;
+                *best_solve.lock().unwrap() = live.1;
+                let outcome = UnprofiledLeg {
+                    ret: r,
+                    gain,
+                    best,
+                    first: leg_first.get(),
+                };
+                #[cfg(test)]
+                UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
+                if options.verbose {
+                    eprintln!(
+                        "Verification leg from OFV {before:.9} at inner_tol = {:e}: {:?}, \
+                         gain {gain:.3e}, best {best:?}",
+                        leg_options.inner_tol, outcome.ret,
+                    );
+                }
+                Some(outcome)
+            },
+        )
+    } else {
+        let (r, end) = drive_polish_legs(
+            first_leg,
+            polish_min_gain,
+            |r| {
+                bobyqa_stop_needs_polish(
+                    algo,
+                    r,
+                    stagnation_latched.load(Ordering::Relaxed),
+                    crate::cancel::is_cancelled(&options.cancel),
+                )
+            },
+            budget_left,
+            |left| {
+                // Nothing feasible seen means the best point is the guard penalty's minimum
+                // (#1617) — not a place to polish from; the verdict below reports that run.
+                if plateau_tracker.lock().unwrap().2 == 0 {
+                    return None;
+                }
+                let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
+                let mut state = opt_slot.take()?.recover_user_data();
+                x0.copy_from_slice(&best_x);
+                state.prev_x = best_x;
+                // A full stagnation window for the leg: the previous leg's flat tail is
+                // what ended it, and must not latch this one on its first eval.
+                state.last_improvement_eval = state.n_evals;
+                state.best_at_last_improvement = state.best_ofv;
+                let mut leg =
+                    nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
+                leg.set_lower_bounds(&lower_s).unwrap();
+                leg.set_upper_bounds(&upper_s).unwrap();
+                leg.set_maxeval(left).unwrap();
+                leg.set_xtol_rel(polish_xtol).unwrap();
+                leg.set_ftol_rel(polish_ftol).unwrap();
+                leg.set_initial_step(&bobyqa_initial_step(&lower_s, &upper_s))
+                    .unwrap();
+                if options.verbose {
+                    eprintln!(
                     "BOBYQA stopped on its tolerance (best objective = {before:.6}); polishing \
                      from the best point with ftol_rel = {polish_ftol:e}, \
                      xtol_rel = {polish_xtol:e} ({left} evaluations left).",
                 );
-            }
-            let r = leg.optimize(&mut x0);
-            opt_slot = Some(leg);
-            Some((r, best_point().map_or(0.0, |(_, after)| before - after)))
-        },
-    );
+                }
+                let r = leg.optimize(&mut x0);
+                opt_slot = Some(leg);
+                Some((r, best_point().map_or(0.0, |(_, after)| before - after)))
+            },
+        );
+        (r, end, false, None)
+    };
     let opt = opt_slot;
 
     // `max_eval_reached` distinguishes a spent evaluation budget from other
@@ -5716,19 +6465,42 @@ fn optimize_nlopt_once(
     // #1782: a polish that could not finish is not a converged fit, whatever the last
     // NLopt status says — the tolerance stop it was meant to verify still stands
     // unverified. A spent budget gets the ordinary "increase maxiter" advice below.
+    //
+    // #2462, the same for an unprofiled gradient stop: a leg cap or a spent budget is not
+    // converged, and not a plateau for the check below to accept either. A stop a leg
+    // verified is converged whatever the last leg's status, `Failure` included, once the
+    // cold re-solve below reproduces it; that check is the plateau rule's own, so it is
+    // deferred the same way.
     match polish_end {
         PolishEnd::BudgetSpent => {
             converged = false;
             max_eval_reached = true;
+            stationarity_check_pending = false;
         }
         PolishEnd::LegCapReached { last_gain } => {
             converged = false;
-            warnings.push(polish_leg_cap_warning(last_gain));
+            stationarity_check_pending = false;
+            warnings.push(if verify_on {
+                unprofiled_verify_cap_warning(last_gain, last_net)
+            } else {
+                polish_leg_cap_warning(last_gain)
+            });
         }
         PolishEnd::NotNeeded | PolishEnd::Settled | PolishEnd::Skipped => {}
     }
+    if verified_stop {
+        converged = false;
+        max_eval_reached = false;
+        stationarity_check_pending = true;
+    }
     let latched = stagnation_latched.load(Ordering::Relaxed);
-    if latched_stop_needs_plateau_check(converged, max_eval_reached, latched) {
+    if stop_needs_plateau_check_after_legs(
+        verify_on,
+        polish_end,
+        converged,
+        max_eval_reached,
+        latched,
+    ) {
         // The guard, not the budget, ended the run — even when its latch landed on
         // the last permitted eval — so no "increase maxiter" warning either.
         converged = false;
@@ -5968,6 +6740,8 @@ fn optimize_nlopt_once(
                 .unwrap()
                 .take()
                 .filter(|inc| inc.etas.len() == population.subjects.len());
+            #[cfg(test)]
+            HELD_SOLVE_AT_RESTORED.with(|c| c.set(held.as_ref().map(|inc| inc.xs == restored_xs)));
             // #1565: the opposite direction. Counting is a diagnostic for the warning,
             // and it reads the held state as *this point's*, so it needs the same
             // `xs` match as scoring it does below; AGQ's per-subject term is not the
@@ -6068,13 +6842,19 @@ fn optimize_nlopt_once(
     let consistency_ofv = cold_ofv.unwrap_or(final_ofv);
     if stationarity_check_pending {
         let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
-        if failure_is_converged_plateau(
-            feasible_evals,
-            last_sig_feasible_eval,
-            best_seen_ofv,
-            consistency_ofv,
-            left_init,
-        ) {
+        let accepted = if verified_stop {
+            cold_solve_is_consistent(best_seen_ofv, consistency_ofv)
+                && (left_init || !verified_needs_left_init)
+        } else {
+            failure_is_converged_plateau(
+                feasible_evals,
+                last_sig_feasible_eval,
+                best_seen_ofv,
+                consistency_ofv,
+                left_init,
+            )
+        };
+        if accepted {
             converged = true;
         }
         if options.verbose {
@@ -6163,6 +6943,22 @@ fn optimize_nlopt_once(
         warnings.push(veto_override_warning(*last_veto_gain.lock().unwrap()));
     }
 
+    // Why `optimize_nlopt` would restart this leg from its own best point.
+    let mid_descent_stall = worth_restarting_mid_descent(
+        stalled_mid_descent,
+        final_ofv,
+        budget_left,
+        feasibility.no_feasible(),
+    );
+    // The same three guards as the stall: a non-finite objective, no budget to run on, or
+    // nothing feasible to restart from all rule a restart out for the same reasons,
+    // whatever prompted it.
+    let basin_shift = worth_restarting_mid_descent(
+        basin_gap.is_some(),
+        final_ofv,
+        budget_left,
+        feasibility.no_feasible(),
+    );
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
     // Mixture (#983 Phase 6): `compute_covariance` builds the FD Hessian on the
@@ -6171,17 +6967,21 @@ fn optimize_nlopt_once(
     // EBEs; the mixture branch reconverges per class internally and does not use
     // them as a warm start.
     let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
-        let out = crate::estimation::covariance::run_covariance_step(
-            &x0,
-            init_params,
-            model,
-            population,
-            &final_ehs,
-            &final_hms,
-            &final_kappas,
-            options,
-            options.verbose.then_some("Computing covariance matrix..."),
-        );
+        let out = if defer_covariance {
+            crate::estimation::covariance::CovStepOutcome::skipped()
+        } else {
+            crate::estimation::covariance::run_covariance_step(
+                &x0,
+                init_params,
+                model,
+                population,
+                &final_ehs,
+                &final_hms,
+                &final_kappas,
+                options,
+                options.verbose.then_some("Computing covariance matrix..."),
+            )
+        };
         let crate::estimation::covariance::CovStepOutcome {
             matrix,
             wall_time_secs,
@@ -6237,27 +7037,29 @@ fn optimize_nlopt_once(
         None if options.report_final_gradient && !crate::cancel::is_cancelled(&options.cancel) => {
             if options.verbose {
                 eprintln!(
-                    "Computing a finite-difference gradient at the solution for reporting \
-                     ({} free coordinates) — the optimizer supplied none.",
+                    "Computing the gradient at the solution for reporting ({} free \
+                     coordinates) — the optimizer supplied none; exact where the outer \
+                     gradient is, else finite differences.",
                     packed_fixed_mask(init_params)
                         .iter()
                         .filter(|f| !**f)
                         .count(),
                 );
             }
-            let g = reporting_fd_gradient(
+            let (g, source) = reporting_gradient(
                 &x0,
                 init_params,
                 model,
                 population,
                 &final_ehs,
+                &final_hms,
                 &final_kappas,
                 &bounds,
                 options,
                 &nn_reg,
                 &priors,
             );
-            (Some(g), Some("finite_difference".to_string()))
+            (Some(g), Some(source.to_string()))
         }
         None => (None, None),
     };
@@ -6298,27 +7100,17 @@ fn optimize_nlopt_once(
         left_init: Some(published_left_init),
         mixture_posteriors: final_mixture_posteriors,
         vi: None,
+        // A restart leg publishes the fit's start, not its own (see `OuterResult::start_eval`).
+        start_eval: inherited_start.unwrap_or(start_eval.get()),
     };
     (
         result,
         AttemptOutcome {
             left_init,
-            mid_descent_stall: worth_restarting_mid_descent(
-                stalled_mid_descent,
-                final_ofv,
-                budget_left,
-                feasibility.no_feasible(),
-            ),
-            // The same three guards as the stall: a non-finite objective, no budget
-            // to run on, or nothing feasible to restart from all rule a restart out
-            // for the same reasons, whatever prompted it.
-            basin_shift: worth_restarting_mid_descent(
-                basin_gap.is_some(),
-                final_ofv,
-                budget_left,
-                feasibility.no_feasible(),
-            ),
-            stagnation_latched: latched,
+            mid_descent_stall,
+            basin_shift,
+            // A #2462 leg clears the latch it starts from; the attempt still latched.
+            stagnation_latched: latched || latched_at_stop,
             plateau_checked: stationarity_check_pending,
         },
     )
@@ -6557,8 +7349,15 @@ fn optimize_bfgs(
         // packed space `g` is already expressed in.
         let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
         let f = if ofv.is_finite() { ofv } else { 1e20 };
-        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261).
-        (f, g, joint_warm_starts(&ehs, &kappas), hms, contribs)
+        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261), except
+        // on an ODE + IOV model (#2508).
+        (
+            f,
+            g,
+            outer_cache_warm_starts(model, &ehs, &kappas),
+            hms,
+            contribs,
+        )
     };
 
     // Per-element scale factors for the BFGS outer loop.
@@ -6626,8 +7425,10 @@ fn optimize_bfgs(
     // unavailable it degrades to plain warm-start from prior η̂.
     // `n_kappa == 0` also keeps `cached_etas` η̂-wide here: under IOV it holds η̂ and every
     // cell's κ̂ (#2261), which the predictor's per-η Jacobian would misalign.
+    // The mode response folds a non-Gaussian term in as the outer gradient does, so the
+    // gradient's model scope is the predictor's.
     let use_predictor = model.n_kappa == 0
-        && crate::sens::ode_provider::adjoint::model_in_scope(model)
+        && crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
         && std::env::var("FERX_EBE_PREDICTOR")
             .map(|v| v != "0")
             .unwrap_or(true);
@@ -6912,6 +7713,7 @@ fn optimize_bfgs(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
         params: final_params,
         ofv: final_ofv,
         converged,
@@ -6963,7 +7765,7 @@ fn optimize_bfgs(
 /// #1778); every other path keeps the cheap analytical fixed-EBE gradient, which
 /// already converges OMEGA correctly (issue #99).
 #[allow(clippy::too_many_arguments)]
-fn reconverged_fd_gradient(
+pub(crate) fn reconverged_fd_gradient(
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,
@@ -7019,6 +7821,188 @@ fn reconverged_probe_ofv(
     } else {
         raw
     }
+}
+
+/// The gradient of the objective the covariance step's `R` is the Hessian of, at `x` (#2541):
+/// the OFV, plus the prior penalty, plus `nn_reg`'s covariate-NN penalty. `nn_reg` is the
+/// regularizer whose curvature the step adds to `R`
+/// ([`crate::estimation::covariance::cov_nn_regularizer`]; `None` when the estimator did not
+/// minimise the penalty), so `g` and `H` take the penalty from one value and cannot disagree
+/// about it (#2541 review r1 §4). Exact where [`exact_reporting_gradient`] is, otherwise its
+/// central-FD twin [`reporting_fd_gradient`], through the same [`reporting_gradient`] dispatch
+/// the post-fit reporting gradient takes. `options` is the covariance step's, so a #1781
+/// quadrature objective is the one differentiated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cov_objective_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    hms: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: Option<&crate::estimation::nn_reg::NnRegularizer>,
+) -> Vec<f64> {
+    // No penalty: zero λ builds the inert regularizer (the λ fields are read by nothing else).
+    let inert;
+    let nn_reg = match nn_reg {
+        Some(reg) => reg,
+        None => {
+            let zero_lambda = FitOptions {
+                nn_l2_lambda: 0.0,
+                nn_smooth_lambda: 0.0,
+                ..options.clone()
+            };
+            inert =
+                crate::estimation::nn_reg::NnRegularizer::build(model, population, &zero_lambda);
+            &inert
+        }
+    };
+    let priors = build_prior_set(model, init_params);
+    reporting_gradient(
+        x,
+        init_params,
+        model,
+        population,
+        ehs,
+        hms,
+        kappas,
+        bounds,
+        options,
+        nn_reg,
+        &priors,
+    )
+    .0
+}
+
+/// The penalized outer objective's gradient at `x`, and where it came from: exact
+/// ([`exact_reporting_gradient`], `"analytic"`) where it is available, else central
+/// differences ([`reporting_fd_gradient`], `"finite_difference"`). One dispatch for the
+/// post-fit `final_gradient` and the covariance step's stationarity test (#2541 review r1 §5).
+#[allow(clippy::too_many_arguments)]
+fn reporting_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    hms: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> (Vec<f64>, &'static str) {
+    match exact_reporting_gradient(
+        x,
+        init_params,
+        model,
+        population,
+        ehs,
+        hms,
+        kappas,
+        bounds,
+        options,
+        nn_reg,
+        priors,
+    ) {
+        Some(g) => (g, "analytic"),
+        None => (
+            reporting_fd_gradient(
+                x,
+                init_params,
+                model,
+                population,
+                ehs,
+                kappas,
+                bounds,
+                options,
+                nn_reg,
+                priors,
+            ),
+            "finite_difference",
+        ),
+    }
+}
+
+/// The exact gradient of the **penalized** outer objective at the reported estimates, for a
+/// run whose optimizer supplied none — what [`reporting_fd_gradient`] differences, taken
+/// instead from the analytic outer gradient at the final modes (the EBE response included,
+/// so it is the marginal's gradient, as the stencil's re-solved EBEs make that one), plus the
+/// NN-penalty and prior gradients. `None` — the caller takes the stencil — outside the
+/// analytic gradient's model scope, under `reconverge_gradient_interval`, when any subject
+/// would take a per-subject salvage (the label would then claim more than it delivers), or
+/// on a non-finite component. A mixture differentiates its K-fold objective at every class's
+/// modes, re-solved once at the estimates.
+#[allow(clippy::too_many_arguments)]
+fn exact_reporting_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    final_ehs: &[DVector<f64>],
+    final_hms: &[DMatrix<f64>],
+    final_kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> Option<Vec<f64>> {
+    if !crate::sens::provider::analytic_outer_gradient_available(model)
+        || reconverge_this_eval(options, 0)
+    {
+        return None;
+    }
+    let params = unpack_params(x, init_params);
+    let mut g = if params.mixture.is_some() {
+        let (eval, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
+            model, population, &params, options, None,
+        );
+        crate::estimation::mixture::mixture_gradient_with_modes(
+            model,
+            population,
+            &params,
+            options,
+            &eval,
+            Some(&modes),
+        )?
+    } else {
+        if final_ehs.len() != population.subjects.len() {
+            return None;
+        }
+        let declines = OuterFdDeclineLog::new(population.subjects.len());
+        let mut idx = 0usize;
+        let g = population_gradient_with_agq_evaluation(
+            x,
+            population.subjects.len(),
+            init_params,
+            model,
+            population,
+            final_ehs,
+            final_hms,
+            final_kappas,
+            bounds,
+            options,
+            &mut idx,
+            None,
+            OuterTrial::unknown(),
+            &declines,
+        );
+        if !declines.declined_indices().is_empty() {
+            return None;
+        }
+        g
+    };
+    nn_reg.add_packed_gradient(&params.theta, &mut g);
+    priors.add_gradient(x, &mut g);
+    for (gk, &fixed) in g.iter_mut().zip(&packed_fixed_mask(init_params)) {
+        if fixed {
+            *gk = 0.0;
+        }
+    }
+    (g.len() == x.len() && g.iter().all(|v| v.is_finite())).then_some(g)
 }
 
 /// Central-FD gradient of the **penalized** outer objective at the reported
@@ -7521,7 +8505,7 @@ fn subject_reconverged_fd_gradient_iov(
             0,
             options,
         );
-        crate::stats::likelihood::foce_subject_nll_iov(
+        crate::stats::likelihood::foce_subject_nll_iov_cov(
             model,
             subject,
             &params.theta,
@@ -7529,6 +8513,7 @@ fn subject_reconverged_fd_gradient_iov(
             &ebe.h_matrix,
             &params.omega,
             &params.sigma.values,
+            model.residual_cov_at(&params),
             options.interaction,
             &ebe.kappas,
             params
@@ -8130,7 +9115,8 @@ pub(crate) fn population_gradient_sens_mixed(
                 ),
                 // `x` is not the template's packed length: the adjoint declines, but a subject
                 // with no observations keeps the zero gradient it gives one.
-                None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                    .then(|| vec![0.0; x.len()]),
             };
             #[cfg(test)]
             let analytic = analytic.filter(|_| !declines.is_forced(i));
@@ -8156,7 +9142,12 @@ pub(crate) fn population_gradient_sens_mixed(
                         declines,
                         || {
                             non_iov_declined_salvage(
-                                structural || declines.reconverge_declined,
+                                // A non-Gaussian subject's held-EBE score drops the EBE
+                                // response it depends on strongly (#1778): reconverge it.
+                                structural
+                                    || declines.reconverge_declined
+                                    || (!subject.obs_records.is_empty()
+                                        && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model)),
                                 x,
                                 init_params,
                                 model,
@@ -8186,6 +9177,66 @@ pub(crate) fn population_gradient_sens_mixed(
         }
     }
     grad
+}
+
+/// One IOV subject's exact analytic packed outer gradient at the stacked mode
+/// `stacked = [η̂, κ̂₁ … κ̂_K]`, or `None` when the adjoint declines it. `pt` is `None` when
+/// `x` is not the template's packed length: the adjoint declines then, but a subject with no
+/// data at all (no observations, no endpoint records) keeps the zero gradient it gives one.
+///
+/// The analytic half of [`subject_iov_outer_gradient`], kept separate so
+/// [`population_gradient_sens_iov_mixed`] can put its #1520 guard between the two halves.
+fn subject_iov_analytic_gradient(
+    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
+    model: &CompiledModel,
+    subject: &Subject,
+    stacked: &DVector<f64>,
+    np: usize,
+    options: &FitOptions,
+) -> Option<Vec<f64>> {
+    match pt {
+        Some(pt) => subject_analytic_outer_gradient(
+            model,
+            subject,
+            pt,
+            stacked.as_slice(),
+            options.interaction,
+        ),
+        None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+            .then(|| vec![0.0; np]),
+    }
+}
+
+/// One IOV subject's packed outer gradient `dᵢ = ∂NLLᵢ/∂x`, κ̂ and η̂ response included: the
+/// exact adjoint where it takes the subject, else the reconverged-FD salvage
+/// [`subject_reconverged_fd_gradient_iov`]. The per-subject gradient the NLopt IOV route
+/// sums ([`population_gradient_sens_iov_mixed`]), so `method = gn` takes the same one
+/// (`gauss_newton::ebe_response_correction`, #2455). Unlike the population assembly it
+/// carries no #1520 salvage guard: GN has no incumbent to rank a trial point against.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn subject_iov_outer_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
+    stacked: &DVector<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    subject_iov_analytic_gradient(pt, model, subject, stacked, x.len(), options).unwrap_or_else(
+        || {
+            subject_reconverged_fd_gradient_iov(
+                x,
+                init_params,
+                model,
+                subject,
+                stacked,
+                bounds,
+                options,
+            )
+        },
+    )
 }
 
 /// **IOV** population gradient assembled **per subject** — the IOV analogue of
@@ -8221,18 +9272,8 @@ pub(crate) fn population_gradient_sens_iov_mixed(
         .enumerate()
         .map(|(i, subject)| {
             let stacked = joint_warm_start(&ehs[i], &kappas[i]);
-            match match pt.as_ref() {
-                Some(pt) => subject_analytic_outer_gradient(
-                    model,
-                    subject,
-                    pt,
-                    stacked.as_slice(),
-                    options.interaction,
-                ),
-                // `x` is not the template's packed length: the adjoint declines, but a subject
-                // with no observations keeps the zero gradient it gives one.
-                None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
-            } {
+            match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
+            {
                 Some(g) => g,
                 None => {
                     declines.record(i);

@@ -3628,6 +3628,11 @@ fn parse_subject(
     // ending at a train's last dose, never tie with it. An implied dose with no record at
     // or after it keeps its parent's inputs; nothing observes it.
     let sorted_implied: Vec<bool> = perm.iter().map(|&i| dose_implied[i]).collect();
+    // Implied doses governed by an observation / pk-only row, as `(dose, record)`: the
+    // #1810 / #614 passes below may still move that record's engine time one ULP, so
+    // `ImpliedDose::gov_time` is re-read from it once they have run (#2371).
+    let mut gov_by_obs: Vec<(usize, usize)> = Vec::new();
+    let mut gov_by_pk_only: Vec<(usize, usize)> = Vec::new();
     if sorted_implied.contains(&true) {
         #[derive(Clone, Copy)]
         enum Rec {
@@ -3665,16 +3670,26 @@ fn parse_subject(
                 sorted_doses[k].implied = Some(crate::types::ImpliedDose {
                     parent,
                     param_time: written_at(sorted_doses[parent].time),
+                    gov_time: sorted_doses[parent].time,
                 });
                 continue;
             };
-            let param_time = match rec {
-                Rec::Dose(d) => written_at(sorted_doses[d].time),
-                Rec::Obs(j) => obs_raw_times[j],
-                Rec::PkOnly(m) => pk_only_raw_times[m],
-                Rec::Reset(r) => written_at(reset_times[r]),
+            let (param_time, gov_time) = match rec {
+                Rec::Dose(d) => (written_at(sorted_doses[d].time), sorted_doses[d].time),
+                Rec::Obs(j) => (obs_raw_times[j], obs_times[j]),
+                Rec::PkOnly(m) => (pk_only_raw_times[m], pk_only_times[m]),
+                Rec::Reset(r) => (written_at(reset_times[r]), reset_times[r]),
             };
-            sorted_doses[k].implied = Some(crate::types::ImpliedDose { parent, param_time });
+            sorted_doses[k].implied = Some(crate::types::ImpliedDose {
+                parent,
+                param_time,
+                gov_time,
+            });
+            match rec {
+                Rec::Obs(j) => gov_by_obs.push((k, j)),
+                Rec::PkOnly(m) => gov_by_pk_only.push((k, m)),
+                Rec::Dose(_) | Rec::Reset(_) => {}
+            }
             if any_tv {
                 sorted_dose_cov[k] = match rec {
                     Rec::Dose(d) => sorted_dose_cov[d].clone(),
@@ -3829,6 +3844,21 @@ fn parse_subject(
         }
         if later_nonss && !earlier_any {
             obs_times[j] = t.next_down();
+        }
+    }
+
+    // The engine time an implied dose's occasion is read at is its governing record's as
+    // the subject holds it (#2371): after the two passes above, which move times in place,
+    // so the indices recorded by the #1909 pass still name the same records. Doses are
+    // never moved, and resets are not moved here.
+    for (k, j) in gov_by_obs {
+        if let Some(i) = sorted_doses[k].implied.as_mut() {
+            i.gov_time = obs_times[j];
+        }
+    }
+    for (k, m) in gov_by_pk_only {
+        if let Some(i) = sorted_doses[k].implied.as_mut() {
+            i.gov_time = pk_only_times[m];
         }
     }
 

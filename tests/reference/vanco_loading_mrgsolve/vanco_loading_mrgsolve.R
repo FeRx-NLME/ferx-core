@@ -36,9 +36,10 @@ suppressMessages(library(mrgsolve))
 # ---- structural model: identical params to adaptive_vanco_loading.ferx -------
 code <- '
 $PARAM CL=4.0, V=80.0
-$CMT CENT
+$CMT CENT AUC
 $ODE
   dxdt_CENT = -(CL/V)*CENT;
+  dxdt_AUC  = CENT/V;            // exposure accumulator (reset each day, #943)
 '
 mod <- mcode("vanco_loading", code, rtol = 1e-10, atol = 1e-10, maxsteps = 100000)
 
@@ -55,7 +56,7 @@ trough_hi  <- 15                  # trough > 15 -> decrease 25%
 
 # ---- loading dose: bolus at t=0, integrate [0, 24] to the first decision ------
 seg0    <- as.data.frame(mod |>
-  init(CENT = 0) |>
+  init(CENT = 0, AUC = 0) |>
   ev(amt = load_dose, cmt = 1) |>
   mrgsim(start = 0, end = cycle_h, delta = cycle_h))
 st_cent <- seg0[nrow(seg0), ]$CENT   # CENT at t=24 (pre first maintenance decision)
@@ -63,6 +64,7 @@ st_cent <- seg0[nrow(seg0), ]$CENT   # CENT at t=24 (pre first maintenance decis
 # ---- reactive maintenance loop (carry CENT across days) -----------------------
 dose <- start_dose
 rows <- list()
+win_auc <- numeric(0)            # one AUC24 per closed inter-decision window (#943)
 for (k in seq_along(dec_t)) {
   t0     <- dec_t[k]
   trough <- st_cent / V           # latent signal the controller sees (pre-dose)
@@ -79,10 +81,12 @@ for (k in seq_along(dec_t)) {
                           dose = dose, action = action)
   # Integrate this day's window [t0, t0 + 24] with the maintenance bolus applied at t0.
   seg     <- as.data.frame(mod |>
-    init(CENT = st_cent) |>
+    init(CENT = st_cent, AUC = 0) |>
     ev(amt = dose, cmt = 1) |>
     mrgsim(start = 0, end = cycle_h, delta = cycle_h))
   st_cent <- seg[nrow(seg), ]$CENT
+  # The last decision closes no window (#943).
+  if (k < length(dec_t)) win_auc <- c(win_auc, seg[nrow(seg), ]$AUC)
 }
 ladder <- do.call(rbind, rows)
 
@@ -143,5 +147,22 @@ md <- c(
   "dose-for-dose and the troughs to a small cross-solver tolerance (RK45 vs LSODA).",
   "The loading dose is integrated by ferx's base-regimen path (#702) and the controller",
   "titrates on top of it -- exactly what this reference exercises.")
+auc_tbl <- c(
+  "| window | days [t0,t1] (h) | AUC24 (mg*h/L) |",
+  "|---:|---:|---:|",
+  vapply(seq_along(win_auc), function(i) sprintf(
+    "| %d | [%d, %d] | %s |",
+    i - 1, as.integer(dec_t[i]), as.integer(dec_t[i + 1]),
+    formatC(win_auc[i], format = "f", digits = 6)), character(1)))
+md <- c(md,
+  "",
+  "## Per-window AUC24",
+  "",
+  sprintf(paste0("The area under CENT/V over each closed inter-decision window, from an AUC ",
+                 "compartment (dxdt_AUC = CENT/V) reset at the start of each window ",
+                 "(mrgsolve %s). It is the external reference for `auc_target` (#943)."),
+          as.character(packageVersion("mrgsolve"))),
+  "",
+  auc_tbl)
 writeLines(md, "expected.md")
 cat("\nwrote expected.md\n")

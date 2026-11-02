@@ -185,6 +185,7 @@ impl FoceiProblem<'_> {
                     i,
                     &etas[i],
                     &[],
+                    None,
                     nll,
                     &gi,
                     cache.as_ref(),
@@ -756,6 +757,28 @@ fn classify_termination(status: &TerminationStatus, max_iters: u64) -> (bool, Op
     }
 }
 
+/// The point a trust-region fit reports and the gradient quoted with it (#1034, #1052).
+///
+/// Clamps `best` to `bounds` *before* evaluating `gradient` at it: the trust region
+/// is unconstrained and can walk a theta past its bound, and every downstream
+/// consumer (`unpack_params`, the covariance step, `packed_estimate`) sees the
+/// clamped vector. Taking the gradient at the raw point would report a ‖∂OFV/∂x‖
+/// that belongs to a different parameter vector than the estimates it is printed
+/// next to. `gradient` is not called when `skip_gradient` is set (a cancelled run).
+fn clamped_point_and_gradient<G>(
+    mut best: Vec<f64>,
+    bounds: &PackedBounds,
+    skip_gradient: bool,
+    gradient: G,
+) -> (Vec<f64>, Option<Vec<f64>>)
+where
+    G: FnOnce(&Vec<f64>) -> Option<Vec<f64>>,
+{
+    clamp_to_bounds(&mut best, bounds);
+    let grad = if skip_gradient { None } else { gradient(&best) };
+    (best, grad)
+}
+
 pub fn optimize_trust_region(
     model: &CompiledModel,
     population: &Population,
@@ -854,25 +877,23 @@ pub(crate) fn optimize_trust_region_seeded(
                     res.state().get_termination_status()
                 );
             }
-            let mut vec = res
+            let best = res
                 .state()
                 .get_best_param()
                 .cloned()
                 .unwrap_or_else(|| x0.clone());
-            // Clamp *before* the gradient: the trust region is unconstrained and
-            // can walk a theta past its bound, and every downstream consumer
-            // (`unpack_params`, the covariance step, `packed_estimate`) sees the
-            // clamped vector. Taking the gradient at the raw point would report a
-            // ‖∂OFV/∂x‖ that belongs to a different parameter vector than the
-            // estimates it is printed next to.
-            //
+            let OptimizationResult {
+                problem: mut prob,
+                solver,
+                ..
+            } = res;
             // The box the run started from, not a second `compute_bounds` of the
             // same template (#1252): the box is a property of `init_params`,
             // which has not moved. `problem` owns the original and argmin does
             // not hand it back, so the two vectors were copied aside before the
             // move — cheaper than rebuilding the box, which allocates these two
             // *and* re-walks the packed vector and the FIX mask to build them.
-            clamp_to_bounds(&mut vec, &post_run_bounds);
+            //
             // Gradient at the returned point, for `FitResult.final_gradient` and
             // so the non-convergence warning can quote how far from stationary
             // the fit stopped. Reuses the executor's problem, and with it the
@@ -880,18 +901,14 @@ pub(crate) fn optimize_trust_region_seeded(
             // stopped precisely because its last steps were rejected, so `cost()`
             // has already overwritten the cache with the rejected trial point and
             // this misses. Budget one extra gradient evaluation per fit; it is
-            // per-fit, not per-iteration.
-            let OptimizationResult {
-                problem: mut prob,
-                solver,
-                ..
-            } = res;
-            // A cancelled run is discarded by `fit()`; skip the extra gradient pass.
-            let grad = if crate::cancel::is_cancelled(&options.cancel) {
-                None
-            } else {
-                prob.gradient(&vec).ok()
-            };
+            // per-fit, not per-iteration. A cancelled run is discarded by `fit()`,
+            // so it skips the extra gradient pass.
+            let (vec, grad) = clamped_point_and_gradient(
+                best,
+                &post_run_bounds,
+                crate::cancel::is_cancelled(&options.cancel),
+                |x| prob.gradient(x).ok(),
+            );
             // The optimizer's own EBEs at its best point, for the #833 comparison below
             // (#2097): held by the solver as each best point was accepted, not read
             // back from the cache, which the last (possibly rejected) trial owns.
@@ -1069,6 +1086,7 @@ pub(crate) fn optimize_trust_region_seeded(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     }
 }
 
@@ -1079,6 +1097,46 @@ mod tests {
     // still the clearest way for a test to build a box or a packed vector on
     // its own, so they are imported here rather than at module scope.
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    /// #1052: the reported gradient is taken at the *clamped* point. A stub gradient
+    /// records the vector it was called with; a revert to gradient-then-clamp hands it
+    /// the raw out-of-box point and fails the first assertion. The fixture straddles
+    /// the box on both sides (one coordinate above, one below, one inside) so the
+    /// clamp provably moves the point — `assert_ne!` pins that, or the test would pass
+    /// vacuously under either ordering.
+    #[test]
+    fn final_gradient_is_taken_at_the_clamped_point() {
+        let bounds = PackedBounds {
+            lower: vec![-1.0, -1.0, -1.0],
+            upper: vec![1.0, 1.0, 1.0],
+        };
+        let raw = vec![3.5, -2.0, 0.25];
+        let clamped = vec![1.0, -1.0, 0.25];
+        assert_ne!(raw, clamped, "fixture must leave the box");
+
+        let mut seen: Option<Vec<f64>> = None;
+        let (x, grad) = clamped_point_and_gradient(raw.clone(), &bounds, false, |p| {
+            seen = Some(p.clone());
+            Some(p.iter().map(|v| 2.0 * v).collect())
+        });
+        assert_eq!(
+            seen.as_deref(),
+            Some(clamped.as_slice()),
+            "gradient must be evaluated at the clamped point, not the raw best param"
+        );
+        assert_eq!(x, clamped, "the returned point must be the clamped one");
+        assert_eq!(grad, Some(vec![2.0, -2.0, 0.5]));
+
+        // A cancelled run skips the extra gradient pass but still reports the clamped point.
+        let mut called = false;
+        let (x, grad) = clamped_point_and_gradient(raw, &bounds, true, |_| {
+            called = true;
+            Some(vec![0.0; 3])
+        });
+        assert!(!called, "a cancelled run must not pay for the gradient");
+        assert!(grad.is_none());
+        assert_eq!(x, clamped);
+    }
 
     #[test]
     fn test_adaptive_steihaug_budget() {
@@ -1338,13 +1396,13 @@ mod tests {
     }
 
     /// #1778, the trust-region call site: on a TTE model with η, whose fixed-EBE score
-    /// drops `∂_η log|H̃| · dη̂/dθ`, `gradient()` must be the reconverged score `2·Σ dᵢ`
-    /// at the EBEs `compute_ad_grads` solved. Dies if `compute_ad_grads` stops calling
-    /// `gauss_newton::ebe_response_correction` (each `tᵢ` falls back to zero on this FD
-    /// path and the gradient to the biased `2·Σ gᵢ`).
+    /// drops `∂_η log|H̃| · dη̂/dθ`, `gradient()` must be the total derivative `2·Σ dᵢ` (the
+    /// exact adjoint) at the EBEs `compute_ad_grads` solved. Dies if `compute_ad_grads`
+    /// stops calling `gauss_newton::ebe_response_correction` (each `tᵢ` falls back to zero
+    /// and the gradient to the biased `2·Σ gᵢ`).
     #[cfg(feature = "survival")]
     #[test]
-    fn gradient_is_the_reconverged_score_on_a_tte_model_with_eta() {
+    fn gradient_is_the_total_derivative_on_a_tte_model_with_eta() {
         use crate::estimation::parameterization::{clamp_to_bounds, compute_bounds, pack_params};
         use argmin::core::Gradient;
 
@@ -1384,10 +1442,24 @@ mod tests {
 
         let (etas, _, per_subj, _) = problem.compute_ad_grads(&x0);
         let g = problem.gradient(&x0).expect("gradient");
+        // `dᵢ`: the exact total derivative (the adjoint at the mode), and the reconverged
+        // difference as a loose cross-check of it.
         let mut want = vec![0.0_f64; x0.len()];
+        let mut fd = vec![0.0_f64; x0.len()];
         let mut raw = vec![0.0_f64; x0.len()];
+        let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x0)
+            .unwrap();
+        let fixed = crate::estimation::parameterization::packed_fixed_mask(&model.default_params);
         for (i, subject) in population.subjects.iter().enumerate() {
-            let di = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+            let di = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
+                &model,
+                subject,
+                &pt,
+                etas[i].as_slice(),
+                crate::sens::ode_provider::adjoint::Objective::Focei,
+            )
+            .expect("in the adjoint's scope");
+            let fi = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
                 &x0,
                 &model.default_params,
                 &model,
@@ -1397,14 +1469,23 @@ mod tests {
                 &options,
             );
             for k in 0..x0.len() {
-                want[k] += 2.0 * di[k];
+                if !fixed[k] {
+                    want[k] += 2.0 * di[k];
+                }
+                fd[k] += 2.0 * fi[k];
                 raw[k] += 2.0 * per_subj[i][k];
             }
         }
         assert!(
-            g.iter().chain(&want).chain(&raw).all(|v| v.is_finite()),
-            "every side must be finite: gradient {g:?}, reconverged {want:?}, raw {raw:?}"
+            g.iter().chain(&want).chain(&fd).chain(&raw).all(|v| v.is_finite()),
+            "every side must be finite: gradient {g:?}, exact {want:?}, reconverged {fd:?}, raw {raw:?}"
         );
+        let vs_fd = want
+            .iter()
+            .zip(&fd)
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        // The reconverged difference's own error at its step and the inner tolerance.
+        assert!(vs_fd < 1e-4, "exact vs reconverged {vs_fd:.3e}");
         let off = g
             .iter()
             .zip(&want)
@@ -1414,12 +1495,11 @@ mod tests {
             .zip(&want)
             .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
         eprintln!("[#1778] trust-region: ‖g − 2Σd‖∞ = {off:.3e}, ‖2Σg − 2Σd‖∞ = {raw_gap:.3e}");
-        // Realised (macOS arm64): ‖g − 2Σd‖∞ = 0 (each `gᵢ + (dᵢ − gᵢ)` rounds back to
-        // `dᵢ`), ‖2Σg − 2Σd‖∞ = 2.435e-1. Bounds: 1e-10 allows for summation-order
-        // rounding on another platform; 5e-2 is 4.9× under the measured gap.
+        // Each `gᵢ + (dᵢ − gᵢ)` rounds back to `dᵢ`: 1e-10 allows for summation-order
+        // rounding. The raw gap was measured at 2.435e-1; 5e-2 is 4.9× under it.
         assert!(
             off < 1e-10,
-            "the trust-region gradient must be the reconverged score, off by {off:.3e}"
+            "the trust-region gradient must be the total derivative, off by {off:.3e}"
         );
         assert!(
             raw_gap > 5e-2,
@@ -1718,10 +1798,10 @@ mod tests {
         use crate::parser::model_parser::parse_full_model;
         use std::path::Path;
 
-        let parsed = parse_full_model(include_str!(
-            "../../tests/fixtures/two_cpt_dcm_regularized.ferx"
-        ))
-        .expect("DCM fixture parses");
+        // The bare start: its output-layer weights are live, so the curvature
+        // penalty and its gradient are not ≈ 0 (see `dcm_fixture_without_init`).
+        let parsed =
+            parse_full_model(&crate::nn::dcm_fixture_without_init()).expect("DCM fixture parses");
         let model = parsed.model;
         let population = read_nonmem_csv(
             Path::new("data/two_cpt_oral_cov.csv"),

@@ -639,14 +639,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
             "",
         ),
         // covariance.rs `S_SINGULAR_MSG`.
-        (
-            "Covariance step failed: the score cross-product matrix S is \
-             singular or rank-deficient (covariance_method = s); typically fewer subjects than \
-             free parameters, or collinear per-subject scores. Use covariance_method = r or \
-             rsr. SE estimates not available."
-                .into(),
-            "",
-        ),
+        (crate::estimation::covariance::S_SINGULAR_MSG.into(), ""),
         // covariance.rs quadrature score.
         (
             "Covariance step failed: could not obtain a converged, finite quadrature score \
@@ -4396,4 +4389,20 @@ fn time_varying_covariate_names_compares_the_snapshots_with_the_baseline() {
     // Control: snapshots equal to the baseline are not time-varying.
     s.covariates.insert("WT".to_string(), 0.0);
     assert!(s.time_varying_covariate_names().is_empty());
+}
+
+/// The membership of the "requires at least one random effect" family (#1007,
+/// #1050), pinned explicitly so a change to it is a deliberate edit here too.
+/// A new variant needs no entry: `requires_random_effects` is an exhaustive
+/// `match`, so it cannot compile without a membership decision, and both the
+/// up-front check and the run-time guards consult that predicate directly.
+#[test]
+fn requires_random_effects_is_exactly_saem_imp_impmap_bayes() {
+    use EstimationMethod::*;
+    for m in [Saem, Imp, Impmap, Bayes] {
+        assert!(m.requires_random_effects(), "{m:?} must be a member");
+    }
+    for m in [Foce, FoceI, FoceGn, FoceGnHybrid, Laplace, Vi] {
+        assert!(!m.requires_random_effects(), "{m:?} must not be a member");
+    }
 }

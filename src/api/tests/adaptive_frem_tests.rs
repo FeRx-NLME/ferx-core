@@ -11,8 +11,8 @@
 use super::*;
 use crate::parser::model_parser::parse_model_string;
 use crate::sim::adaptive::{
-    AdaptiveAction, AdaptiveDosingSpec, AdaptiveMonitor, AdaptiveRoute, AdaptiveRule, Comparison,
-    ControllerCtx, DoseAction, DoseStep, MonitorSpec, ObserveMode,
+    AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
+    DoseAction, DoseStep, MonitorSpec, ObserveMode,
 };
 use std::collections::HashMap;
 
@@ -417,79 +417,6 @@ fn row_conversion_matches_the_full_pk_sink() {
             }
         }
     }
-}
-
-/// A monitor with a `[scaling]` divisor of 2 on CMT 1, for the window-AUC divide tests.
-fn auc_divide(m: &CompiledModel, s: &Subject, eta_occ: Option<&[Vec<f64>]>) -> Vec<f64> {
-    let spec = MonitorSpec::new("A", 1, ObserveMode::Ipred);
-    let two = |_eta: &[f64]| 2.0;
-    let mon = AdaptiveMonitor {
-        spec: &spec,
-        observe: None,
-        obs_scale: Some(&two),
-    };
-    super::adaptive::adaptive_window_aucs_to_model_scale(
-        m,
-        s,
-        &mon,
-        &[0.0, 0.0],
-        eta_occ,
-        vec![4.0, 6.0],
-    )
-}
-
-/// The control for the two `#[should_panic]` tests below: a subject with no
-/// decision-window κ and no per-event PK divides each window AUC by its one divisor and
-/// trips neither assertion.
-#[test]
-fn window_auc_divide_on_a_constant_divisor() {
-    let m = model("  obs_scale = V", false, [1; 6]);
-    let s = subject("1", [1; 6], vec![1u32; OBS.len()]);
-    assert!(!crate::pk::subject_needs_per_event_pk(&m, &s));
-    assert_eq!(auc_divide(&m, &s, None), vec![2.0, 3.0]);
-}
-
-/// The `auc_target` divide states its first condition (#2156): handed a decision-window
-/// κ, it fails in debug instead of dividing every window by the κ = 0 divisor. The
-/// fixture's `V` reads `KAPPA_V`, so κ really moves the `obs_scale = V` divisor. Today
-/// the `auc_target` refusal keeps IOV out before this point; the assertion is what fails
-/// if that refusal is ever widened without the per-grid-point conversion (#943).
-///
-/// Regression: drop the `eta_occ.is_none()` assertion → this returns.
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "has a decision-window κ, so its [scaling] divisor can change")]
-fn window_auc_divide_asserts_no_decision_kappa() {
-    let m = model("  obs_scale = V", true, [1; 6]);
-    let s = subject("1", [1; 6], vec![1u32; OBS.len()]);
-    let eta_occ = vec![vec![0.0, 0.0, 0.3], vec![0.0, 0.0, -0.25]];
-    auc_divide(&m, &s, Some(&eta_occ));
-}
-
-/// The second condition: a subject that needs per-event PK. Here `CL` reads a `WT` that
-/// moves from 70 to 90 across the horizon. The `obs_scale = V` divisor does not move (it
-/// never follows the covariates), but the window pass would integrate the AUC from one
-/// frozen PK snapshot, so the integrand itself is wrong.
-///
-/// Regression: drop the `!subject_needs_per_event_pk` assertion → this returns.
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "needs per-event PK, but the window AUCs integrate one frozen PK")]
-fn window_auc_divide_asserts_no_per_event_pk() {
-    let src = model_src("  obs_scale = V", false, PROP).replace("CL = TVCL", "CL = TVCL * WT / 70");
-    let m = parse_model_string(&src).expect("parse");
-    let mut s = subject("1", [1; 6], vec![1u32; OBS.len()]);
-    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
-    s.covariates = wt(70.0);
-    s.obs_covariates = OBS
-        .iter()
-        .map(|&t| wt(if t < 5.0 { 70.0 } else { 90.0 }))
-        .collect();
-    assert!(
-        crate::pk::subject_needs_per_event_pk(&m, &s),
-        "fixture moves the PK"
-    );
-    auc_divide(&m, &s, None);
 }
 
 // ---- W_FREM_DRAWN_ETA (#2245) ---------------------------------------------------------

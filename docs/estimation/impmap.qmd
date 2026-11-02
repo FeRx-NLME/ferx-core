@@ -334,4 +334,4 @@ when it applies, the measured effect, and the warnings it carries.
   re-centered sibling estimator (and its evaluation-only mode) that shares
   IMPMAP's per-subject IS kernel and M-step.
 - [SAEM](saem.qmd) — the other sampling-based estimator; a common warm-start
-  (`methods = [saem, impmap]`).
+  (`method = [saem, impmap]`).

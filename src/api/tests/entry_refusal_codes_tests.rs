@@ -461,10 +461,31 @@ fn adaptive_refusals_carry_their_codes() {
         seed: Some(1),
         ..Default::default()
     };
-    let mut reset_subject = observed("1", &[1.0]);
-    reset_subject.reset_times = vec![30.0];
-    reset_subject.reset_covariates = vec![Default::default()];
-    reset_subject.reset_occasions = vec![1];
+    // An IOV twin of `ode`. Since #943 `auc_target` is accepted under IOV, and since the
+    // #932 follow-up so is a base regimen × EVID=3 reset: the two together must run.
+    let ode_iov = parse_model_string(
+        &ODE_ADAPTIVE
+            .replace(
+                "omega ETA_CL ~ 0.09",
+                "omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04",
+            )
+            .replace("exp(ETA_CL)", "exp(ETA_CL + KAPPA_CL)"),
+    )
+    .expect("parse");
+    let mut base_reset_iov = observed("1", &[1.0, 40.0]);
+    base_reset_iov.reset_times = vec![30.0];
+    let base_reset_iov = population_of(vec![base_reset_iov], &[]);
+    let ok = from_spec(
+        &ode_iov,
+        &base_reset_iov,
+        &|s| s.auc_target = Some((300.0, 500.0)),
+        seeded(),
+    );
+    assert!(
+        ok.is_ok(),
+        "from_spec, auc_target on an IOV model with a base regimen × reset must run: {:?}",
+        ok.err()
+    );
     check_rows(vec![
         row(
             "simulate_adaptive, no [odes]",
@@ -589,27 +610,6 @@ fn adaptive_refusals_carry_their_codes() {
              covariate(s) not found in data (case-sensitive): WT. Available covariate \
              columns: (none).",
         ),
-        row(
-            "from_spec, auc_target on a reset subject",
-            from_spec(
-                &ode,
-                &population_of(vec![reset_subject], &[]),
-                &|s| s.auc_target = Some((300.0, 500.0)),
-                seeded(),
-            ),
-            "E_ADAPTIVE_UNSUPPORTED",
-            None,
-            "adaptive-dosing `auc_target` is not yet supported for \
-             time-varying-covariate, TIME-in-PK, IOV (`kappa`), or system-reset (EVID=3) \
-             subjects. For a drifting covariate or a per-occasion κ the exposure metric \
-             integrates its dense grid from a single frozen PK snapshot, which is \
-             silently wrong when the PK changes across the horizon. For a reset the dense \
-             solver *does* zero the state, but the per-window trapezoid grid carries no \
-             node at the reset instant, so the one window straddling the reset would \
-             integrate that discontinuity inaccurately. Drop `auc_target` (all other \
-             outputs remain per-event / per-occasion / reset aware), or track \
-             #700/#701/#716 for a per-event, reset-node-aware AUC.",
-        ),
     ]);
 }
 
@@ -691,8 +691,8 @@ fn next_up(t: f64) -> f64 {
 /// entry by #1983: their code, block and whole text, and — the reason they moved — that
 /// each is raised **before any subject is simulated**. The controller factory is called
 /// once per (subject, replicate) just before the driver runs, so a row whose factory count
-/// is not 0 reached a subject first. That is what the driver-side check did: on the
-/// base × reset row subject '1' is valid and would run, and only subject '2' is refused.
+/// is not 0 reached a subject first. (Base × reset under IOV, the one per-subject row, left
+/// this table when the #932 follow-up lifted it; it is an accepting row below.)
 ///
 /// Each predicate is also asserted from its accepting side, in the same test, so a check
 /// stuck on "refuse" (or a gate deleted) reddens it.
@@ -761,16 +761,6 @@ fn adaptive_entry_refusals_simulate_no_subject() {
     let spec_dv_cmt2 = spec_on(2);
 
     let rows = vec![
-        row(
-            "base regimen × EVID=3 under IOV",
-            run("base × reset", &iov, &two, schedule(vec![0.0, 24.0])),
-            "E_ADAPTIVE_UNSUPPORTED",
-            None,
-            "subject '2': a pre-scheduled base regimen combined with system resets (EVID=3/4) \
-             is not yet supported under time-varying covariates or inter-occasion \
-             variability; #932 supports base × reset on the constant-covariate path only \
-             (time-varying-covariate / IOV base × reset is a follow-up)",
-        ),
         row(
             "max_decisions",
             run(
@@ -842,6 +832,16 @@ fn adaptive_entry_refusals_simulate_no_subject() {
             run("ok: base × reset", &ode, &two, schedule(vec![0.0, 24.0])).err(),
         ),
         (
+            "base × reset under IOV (#932 follow-up)",
+            run(
+                "ok: base × reset, IOV",
+                &iov,
+                &two,
+                schedule(vec![0.0, 24.0]),
+            )
+            .err(),
+        ),
+        (
             "two decisions under max_decisions = 2",
             run(
                 "ok: max_decisions",
@@ -897,7 +897,7 @@ fn adaptive_entry_refusals_simulate_no_subject() {
     // makes the zero above a measurement rather than a constant.
     for (name, n) in &counts {
         let want = match *name {
-            "ok: base × reset" => 2,
+            "ok: base × reset" | "ok: base × reset, IOV" => 2,
             n if n.starts_with("ok: ") => 1,
             _ => 0,
         };
@@ -1010,6 +1010,74 @@ fn adaptive_spec_route_refusals_carry_the_spec_code() {
     ]);
 }
 
+/// #2123 under IOV: a decision and an observation one ULP apart, the pair the IOV row of
+/// [`adaptive_driver_refusals_carry_their_codes`] used to refuse, now run on the IOV
+/// time-varying path with the frozen-replay verifier on, and each record reads in time order.
+///
+/// A differential pair under one seed (the same η and κ draws): the controller doses 100 or
+/// 0 at the decision. An observation one ULP **before** the decision must read the same in
+/// both runs (pre-dose); one ULP **after** it must read higher in the dosed run (post-dose).
+/// The observation at `2.0` reads higher in the dosed run in both orders, so the dose fired.
+///
+/// Regression caught (mutation-checked): `dedup_breaks_keeping_records` merging the two
+/// records again, which refuses the run, as on `main` before #2123.
+#[test]
+fn iov_decision_one_ulp_from_an_observation_runs_and_reads_in_time_order_2123() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction};
+    let iov = parse_model_string(ODE_IOV).expect("parse");
+    let run = |obs: f64, dec: f64, amt: f64| {
+        let o = AdaptiveSimulateOptions {
+            seed: Some(1),
+            decision_times: vec![dec],
+            verify: true,
+            ..Default::default()
+        };
+        let pop = population_of(vec![dose_free("1", &[obs, 2.0])], &[]);
+        simulate_adaptive(
+            &iov,
+            &pop,
+            &iov.default_params,
+            1,
+            || move |_: &ControllerCtx| vec![DoseAction::Bolus { amt, cmt: 1 }],
+            &o,
+        )
+        .unwrap_or_else(|e| panic!("obs {obs:e}, decision {dec:e}, amt {amt}: refused: {e}"))
+        .trajectories
+        .iter()
+        .map(|r| r.ipred)
+        .collect::<Vec<f64>>()
+    };
+    // (observation, decision, whether the observation is after the decision)
+    for (obs, dec, after) in [(1.0, next_up(1.0), false), (next_up(1.0), 1.0, true)] {
+        let dosed = run(obs, dec, 100.0);
+        let none = run(obs, dec, 0.0);
+        assert_eq!(dosed.len(), 2, "obs {obs:e}: rows");
+        assert!(
+            dosed.iter().chain(&none).all(|v| v.is_finite()),
+            "obs {obs:e}: non-finite {dosed:?} {none:?}"
+        );
+        assert!(
+            dosed[1] > none[1] + 1e-3,
+            "obs {obs:e}: the dose did not fire ({} vs {})",
+            dosed[1],
+            none[1]
+        );
+        if after {
+            assert!(
+                dosed[0] > none[0] + 1e-3,
+                "obs {obs:e} one ULP after the decision reads pre-dose: {} vs {}",
+                dosed[0],
+                none[0]
+            );
+        } else {
+            assert_eq!(
+                dosed[0], none[0],
+                "obs {obs:e} one ULP before the decision reads post-dose"
+            );
+        }
+    }
+}
+
 /// The refusals the adaptive driver still makes once it runs (#1983): they need the resolved
 /// doses, the break timeline or the controller's own output. One row per text, through
 /// `simulate_adaptive`, each keeping the run loop's `subject '…' (sim N):` prefix. Each
@@ -1057,6 +1125,10 @@ fn adaptive_driver_refusals_carry_their_codes() {
     ss_base.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)];
     let mut reset_at_1 = dose_free("1", &[2.0]);
     reset_at_1.reset_times = vec![1.0];
+    // Two record times within 1e-15 both keep their break (#2123); a record merged into a
+    // reset break is still refused.
+    let mut obs_after_reset = dose_free("1", &[next_up(1.0)]);
+    obs_after_reset.reset_times = vec![1.0];
     check_rows(vec![
         row(
             "base SS dose under IOV",
@@ -1089,20 +1161,20 @@ fn adaptive_driver_refusals_carry_their_codes() {
              timeline cannot be ordered",
         ),
         row(
-            "IOV: decision within 1e-15 of an observation",
+            "IOV: observation within 1e-15 after a reset",
             run(
                 &iov,
-                &population_of(vec![dose_free("1", &[1.0])], &[]),
-                vec![next_up(1.0)],
+                &population_of(vec![obs_after_reset], &[]),
+                vec![0.0],
                 bolus(100.0, 1),
             ),
             "E_ADAPTIVE_OPTIONS",
             None,
             "subject '1' (sim 1): adaptive-dosing (time-varying) event time 1.0000000000000002 \
-             lies within 1e-15 of another break time but is not bit-identical, so its \
-             per-event PK / decision lookup would be silently dropped. Align decision, \
-             observation, and EVID=2 times to identical values (integer-valued time grids are \
-             unaffected).",
+             lies within 1e-15 after an infusion-end or system-reset (EVID=3/4) break time but \
+             is not bit-identical, so its per-event PK / decision lookup would be silently \
+             dropped. Align the decision, observation or EVID=2 time with that break \
+             (integer-valued time grids are unaffected).",
         ),
         row(
             "constant path: decision within 1e-15 of a reset",

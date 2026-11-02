@@ -139,7 +139,7 @@ fn target_window_bad_band_errors() {
 
 #[test]
 fn auc_target_parses_band_and_one_sided() {
-    // Default: no `auc_target` ⇒ `None` (the signal-AUC pass is skipped and
+    // Default: no `auc_target` ⇒ `None` (the window AUC is skipped and
     // `auc_target_attainment` is unreported).
     let none = parse_adaptive_dosing_block(&without("nothing")).expect("valid_min parses");
     assert_eq!(none.auc_target, None);

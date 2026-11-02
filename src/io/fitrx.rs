@@ -2078,6 +2078,8 @@ fn parse_subjects(
             // them belongs with the checkpoint format, not here (#897 follow-up).
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
+            #[cfg(feature = "survival")]
+            tte_rows: Vec::new(),
         });
     }
 
@@ -2917,7 +2919,7 @@ fn wire_to_fit_result(
         sir_ess,
         sir_resamples_packed,
         // .fitrx v1: importance_sampling is not serialised — re-run via
-        // `methods = [..., imp]` if the consumer needs the IS LL.
+        // `method = [..., imp]` if the consumer needs the IS LL.
         importance_sampling: None,
         impmap_trace: None,
         bayes: None,

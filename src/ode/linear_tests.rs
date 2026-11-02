@@ -853,9 +853,13 @@ fn matmul_keeps_a_taped_zero_in_the_outer_gradient_type() {
     }
     let (sv, dp, dq) = sweep_ds(matmul::<DualV<1, 0>>);
     let (rv, rp, rq) = sweep_ds(matmul_reference::<DualV<1, 0>>);
+    // The values are the dense loop's bit for bit. The adjoints are compared to rounding:
+    // a taped type folds each entry into one tape node (`PkNum::dot_fold`), which sums the
+    // same adjoints in another order than the dense loop's node per operation.
     assert_eq!(sv.to_bits(), rv.to_bits());
-    assert_eq!(dq.to_bits(), rq.to_bits());
-    assert_eq!(dp.to_bits(), rp.to_bits(), "∂S/∂p: skip {dp} vs dense {rp}");
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-14 * (1.0 + b.abs());
+    assert!(close(dq, rq), "∂S/∂q: skip {dq} vs dense {rq}");
+    assert!(close(dp, rp), "∂S/∂p: skip {dp} vs dense {rp}");
     assert_ne!(
         dp, 0.0,
         "premise: the taped zero carries a θ-derivative into S"
@@ -1429,14 +1433,14 @@ fn only_types_without_a_tape_are_pooled_and_shared() {
     use crate::sens::rtape::{DualT, R};
     use crate::sens::vfree::DualF;
     // The predicate is a trait item, so a type beyond any hand-kept list is covered.
-    assert!(PooledExpm::<f64>::pooled());
-    assert!(PooledExpm::<Dual1<3>>::pooled());
-    assert!(PooledExpm::<Dual2<2>>::pooled());
-    assert!(PooledExpm::<DualF<2, 0>>::pooled());
-    assert!(PooledExpm::<DualF<20, 0>>::pooled());
-    assert!(!PooledExpm::<R>::pooled());
-    assert!(!PooledExpm::<DualT<2, R>>::pooled());
-    assert!(!PooledExpm::<crate::sens::vtape::DualV<2, 0>>::pooled());
+    assert!(pade_shared::<f64>());
+    assert!(pade_shared::<Dual1<3>>());
+    assert!(pade_shared::<Dual2<2>>());
+    assert!(pade_shared::<DualF<2, 0>>());
+    assert!(pade_shared::<DualF<20, 0>>());
+    assert!(!pade_shared::<R>());
+    assert!(!pade_shared::<DualT<2, R>>());
+    assert!(!pade_shared::<crate::sens::vtape::DualV<2, 0>>());
 }
 
 #[test]
@@ -1465,15 +1469,7 @@ fn a_taped_type_recomputes_every_exponential() {
 
 #[test]
 fn a_segment_reuses_the_threads_pade_work_bit_for_bit() {
-    let pooled = || {
-        EXPM_POOL.with(|p| {
-            p.borrow()
-                .iter()
-                .filter_map(|b| b.downcast_ref::<Expm<f64>>())
-                .map(|e| e.cache.len())
-                .sum::<usize>()
-        })
-    };
+    let pooled = pooled_pade_entries::<f64>;
     let (a, b) = (-0.8, 2.0);
     let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
         du[0] = a * u[0] + b;
@@ -1511,16 +1507,26 @@ fn a_segment_reuses_the_threads_pade_work_bit_for_bit() {
 
 #[test]
 fn a_full_pool_entry_count_is_forgotten_at_the_next_segment() {
-    let mut e = Expm::<f64>::new(2);
-    for k in 0..(POOL_MAX_ENTRIES + 2) {
-        // Distinct scaled matrices, none large enough to scale (each its own approximant).
-        let x = 1e-3 * (k + 1) as f64;
-        e.exp(&[x, 0.0, 0.0, -x]).expect("finite");
+    // Fill the thread's workspace past the bound with segments of distinct generators
+    // (none large enough to scale, so each is its own approximant)...
+    let run = |k: usize| {
+        let a = -1e-3 * (k + 1) as f64;
+        let rhs = move |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = a * u[0] + 1.0;
+        };
+        linear_segment_g(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &[]).expect("linear");
+    };
+    // One approximant each; the bound is checked at a segment's start, so `POOL_MAX_ENTRIES
+    // + 1` segments end one past it.
+    for k in 0..=POOL_MAX_ENTRIES {
+        run(k);
     }
-    assert!(e.cache.len() > POOL_MAX_ENTRIES);
-    drop(PooledExpm { expm: Some(e) });
-    let again = PooledExpm::<f64>::take(2);
-    assert!(again.cache.is_empty(), "{} kept", again.cache.len());
-    // A different size is a different workspace.
-    assert_eq!(PooledExpm::<f64>::take(3).n, 3);
+    assert!(pooled_pade_entries::<f64>() > POOL_MAX_ENTRIES);
+    // ...and the next segment forgets them all before computing its own.
+    run(POOL_MAX_ENTRIES + 5);
+    assert!(
+        pooled_pade_entries::<f64>() <= 2,
+        "{} kept",
+        pooled_pade_entries::<f64>()
+    );
 }

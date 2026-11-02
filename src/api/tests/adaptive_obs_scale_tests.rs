@@ -7,7 +7,7 @@
 //! (no NONMEM): the degenerate oracle (a holding controller must equal `simulate()`
 //! row for row) and the Form C twin (`obs_scale = V` must equal `y = central / V`
 //! under the same seed — Form C was always honoured, so it is the reference that sees
-//! the monitor, the IOV window and the AUC pass, which `simulate()` has no analogue of).
+//! the monitor, the IOV window and the window AUC, which `simulate()` has no analogue of).
 use super::*;
 use crate::parser::model_parser::parse_model_string;
 use crate::sim::adaptive::{

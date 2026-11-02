@@ -183,56 +183,117 @@ fn an_in_scope_profiled_block_is_not_refused() {
     assert!(scope(&plain, &FitOptions::default()).is_empty());
 }
 
-/// Every estimator outside `foce`/`focei`, alone or as a chain step, and quadrature.
-/// The message names what it saw and never claims a fallback.
+/// Every estimator outside `foce`/`focei`/`laplace`, alone or as a chain step. The message
+/// names what it saw, lists the three methods (not #1065's two) and never claims a
+/// fallback.
 #[test]
-fn profile_refuses_every_method_outside_foce_and_focei() {
+fn profile_refuses_every_method_outside_foce_focei_and_laplace() {
     for m in [
         EstimationMethod::Saem,
         EstimationMethod::Imp,
-        EstimationMethod::Laplace,
+        EstimationMethod::Impmap,
         EstimationMethod::FoceGn,
+        EstimationMethod::FoceGnHybrid,
         EstimationMethod::Bayes,
+        EstimationMethod::Vi,
     ] {
         let alone = FitOptions {
             method: m,
             ..FitOptions::default()
         };
         let chain = FitOptions {
-            methods: vec![EstimationMethod::FoceI, m],
+            methods: vec![EstimationMethod::Laplace, m],
             ..FitOptions::default()
         };
         for opts in [alone, chain] {
             let msg = one_refusal(
                 &scope(&model_of(&counted()), &opts),
                 &format!(
-                    "which only `foce` and `focei` estimate; this fit runs `{}`.",
+                    "which only `foce`, `focei` and `laplace` estimate; this fit runs `{}`.",
                     m.label()
                 ),
                 REMOVE,
             );
+            assert!(!msg.contains("only `foce` and `focei`"), "{msg}");
             assert!(!msg.contains("fall"), "{msg}");
         }
     }
-    for ok in [EstimationMethod::Foce, EstimationMethod::FoceI] {
+}
+
+/// The accepted side of the gate (#2107): `foce`, `focei` and `laplace` at one node, alone
+/// and as a chain; and `foce` with `n_agq > 1`, which FOCE ignores (`agq_nodes_for` is
+/// `None`) and which was refused only because `n_agq` used to be read fit-wide.
+#[test]
+fn profile_accepts_foce_focei_and_laplace_at_one_node() {
+    for ok in [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::Laplace,
+    ] {
         let opts = FitOptions {
             method: ok,
             ..FitOptions::default()
         };
         assert!(scope(&model_of(&counted()), &opts).is_empty(), "{ok:?}");
     }
-    let agq = FitOptions {
-        method: EstimationMethod::FoceI,
+    let chain = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
+        ..FitOptions::default()
+    };
+    assert!(scope(&model_of(&counted()), &chain).is_empty());
+    let foce_agq = FitOptions {
+        method: EstimationMethod::Foce,
         n_agq: 3,
         ..FitOptions::default()
     };
-    let msg = one_refusal(
-        &scope(&model_of(&counted()), &agq),
-        "which only `foce` and `focei` estimate, at `n_agq = 1`; this fit asks for \
-         `n_agq = 3` quadrature.",
-        REMOVE,
+    let msgs = scope(&model_of(&counted()), &foce_agq);
+    assert!(msgs.is_empty(), "{msgs:#?}");
+}
+
+/// Quadrature is judged per stage (#2107): the refusal names the stage asking for
+/// `n_agq > 1` and its node count, and not the method list, which `laplace` and `focei`
+/// are both on. A `[focei, laplace]` chain at `n_agq = 3` runs quadrature in **both**
+/// stages (`fit_inner` keeps the chain's `n_agq` on each stage, and `focei` with
+/// `n_agq > 1` is the Gauss–Newton-anchored quadrature), so each stage is named once.
+#[test]
+fn profile_refuses_quadrature_per_stage() {
+    let sentence = |m: &str| {
+        format!(
+            "which is not yet supported under adaptive quadrature; this fit's `{m}` stage asks \
+             for `n_agq = 3`."
+        )
+    };
+    for m in [EstimationMethod::Laplace, EstimationMethod::FoceI] {
+        let opts = FitOptions {
+            method: m,
+            n_agq: 3,
+            ..FitOptions::default()
+        };
+        let msg = one_refusal(
+            &scope(&model_of(&counted()), &opts),
+            &sentence(m.label()),
+            REMOVE,
+        );
+        assert!(!msg.contains("only `foce`"), "{msg}");
+        assert!(!msg.contains("fall"), "{msg}");
+    }
+    let chain = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
+        n_agq: 3,
+        ..FitOptions::default()
+    };
+    let msgs = scope(&model_of(&counted()), &chain);
+    assert_eq!(msgs.len(), 2, "{msgs:#?}");
+    let (focei, laplace) = (
+        EstimationMethod::FoceI.label(),
+        EstimationMethod::Laplace.label(),
     );
-    assert!(!msg.contains("fall"), "{msg}");
+    for (msg, (named, other)) in msgs.iter().zip([(focei, laplace), (laplace, focei)]) {
+        for s in [FRAME, sentence(named).as_str(), REMOVE] {
+            assert!(msg.contains(s), "missing {s:?} in {msg}");
+        }
+        assert!(!msg.contains(&format!("`{other}` stage")), "{msg}");
+    }
 }
 
 /// Proportional, power, combined and a log-transformed additive error, by name.

@@ -249,82 +249,94 @@ pub(crate) fn dtmm_subject_nll(
     nll
 }
 
-/// Exact `∂/∂η` of [`dtmm_subject_nll`]: each record's probabilities are replayed over
-/// `Dual1` (`EndpointExprProgram::eval_duals`, θ and η seeded, at the record's covariates
-/// and time) and chained through
+/// Every `Dtmm` endpoint's data term on the subject as a function of `(θ, η)`, on any number
+/// type: each record's probabilities replayed through the endpoint's program (at the record's
+/// covariates and written `TIME`) and scored as `−log P_obs`, where `P_obs` is the declared
+/// off-diagonal or the stay probability `1 − Σ_{k≠j} P_jk`. The `f64` instance is
+/// [`dtmm_subject_nll`]; a first-order η-jet is the inner gradient, a second-order one the
+/// Laplace η-Hessian, and tape leaves the outer θ-gradient, all through
+/// [`crate::categorical::DiscreteTerm`].
 ///
-/// ```text
-///   ∂/∂η [−log P_jk] = −(∂P_jk/∂η) / P_jk                       (j ≠ k)
-///   ∂/∂η [−log P_jj] = (Σ_{k≠j} ∂P_jk/∂η) / P_jj,  P_jj = 1 − Σ_{k≠j} P_jk
-/// ```
-///
-/// Returns `(value, ∂/∂η)` at the same 1× scale as the value. `None` — the caller falls
-/// back to FD — when an endpoint has no dual program, or on the penalized
-/// regime (a non-stochastic matrix or a zero-probability step), where the value is the flat
-/// sentinel.
+/// `None` — the caller finite-differences — when an endpoint has no dual program, or in the
+/// penalized regime (a non-stochastic matrix or a zero-probability step), where the value is
+/// the flat sentinel and has no derivative. Validity is judged on the values alone, exactly as
+/// the value path judges it.
+pub(crate) struct DtmmTerm<'a> {
+    pub(crate) model: &'a CompiledModel,
+    pub(crate) subject: &'a Subject,
+}
+
+impl crate::survival::SubjectTerm for DtmmTerm<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, th: &[T], et: &[T]) -> Option<T> {
+        let (model, subject) = (self.model, self.subject);
+        let mut nll = T::from_f64(0.0);
+        if subject.obs_records.is_empty() {
+            return Some(nll);
+        }
+        let snaps = record_covariate_snapshots(subject);
+        for (cmt, endpoint) in dtmm_endpoints(model) {
+            let EndpointLikelihood::Dtmm {
+                n_states,
+                state_codes,
+                transitions,
+                prob_program,
+                ..
+            } = endpoint
+            else {
+                continue;
+            };
+            let prog = prob_program.as_ref()?;
+            let chain = collect_states(cmt, state_codes, &subject.obs_records).ok()?;
+            for k in 1..chain.len() {
+                let (from, rec) = (chain[k - 1].state, chain[k]);
+                let to = rec.state;
+                let cov = record_cov(subject, snaps, &rec);
+                let probs = with_model_time(rec.raw_time, || prog.eval_g(th, et, cov))?;
+                if probs.len() != transitions.len() {
+                    return None;
+                }
+                let vals: Vec<f64> = probs.iter().map(|p| p.val()).collect();
+                if !is_stochastic(transitions, &vals, *n_states) {
+                    return None;
+                }
+                step_probability(transitions, &vals, from, to)?;
+                // `P_obs`: the observed off-diagonal, or one minus the row's off-diagonals.
+                let mut p_obs = T::from_f64(if from == to { 1.0 } else { 0.0 });
+                for (&(j, k2), &p) in transitions.iter().zip(&probs) {
+                    if j != from {
+                        continue;
+                    }
+                    if from == to {
+                        p_obs = p_obs - p;
+                    } else if k2 == to {
+                        p_obs = p_obs + p;
+                    }
+                }
+                nll = nll - p_obs.ln();
+            }
+        }
+        Some(nll)
+    }
+}
+
+/// Exact `∂/∂η` of [`dtmm_subject_nll`] — [`DtmmTerm`] at fixed θ on a first-order η-jet —
+/// at the same 1× scale as the value. `None` as for [`DtmmTerm`].
+#[cfg(test)]
 pub(crate) fn dtmm_subject_eta_grad(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> Option<(f64, Vec<f64>)> {
-    let n_eta = model.n_eta;
-    let mut nll = 0.0;
-    let mut grad = vec![0.0_f64; n_eta];
-    if subject.obs_records.is_empty() {
-        return Some((nll, grad));
+    let f = crate::survival::FixedTheta {
+        theta,
+        term: &DtmmTerm { model, subject },
+    };
+    if eta.is_empty() {
+        use crate::sens::eta_jets::EtaFunction;
+        return Some((f.eval::<f64>(&[])?, Vec::new()));
     }
-    let snaps = record_covariate_snapshots(subject);
-    for (cmt, endpoint) in dtmm_endpoints(model) {
-        let EndpointLikelihood::Dtmm {
-            n_states,
-            state_codes,
-            transitions,
-            prob_program,
-            ..
-        } = endpoint
-        else {
-            continue;
-        };
-        let prog = prob_program.as_ref()?;
-        let n_theta = prog.n_theta_axis();
-        // An axis layout that disagrees with the model's η count would zero-fill a
-        // gradient reported as analytic. Decline instead.
-        if prog.n_axes() != n_theta + n_eta {
-            return None;
-        }
-        let chain = collect_states(cmt, state_codes, &subject.obs_records).ok()?;
-        for k in 1..chain.len() {
-            let (from, rec) = (chain[k - 1].state, chain[k]);
-            let to = rec.state;
-            let cov = record_cov(subject, snaps, &rec);
-            let outs = with_model_time(rec.raw_time, || prog.eval_duals(theta, eta, cov))?;
-            if outs.len() != transitions.len() {
-                return None;
-            }
-            let probs: Vec<f64> = outs.iter().map(|(p, _)| *p).collect();
-            if !is_stochastic(transitions, &probs, *n_states) {
-                return None;
-            }
-            let p = step_probability(transitions, &probs, from, to)?;
-            nll -= p.ln();
-            // `∂P_obs/∂η`: the observed off-diagonal's jet, or minus the row's jets for a
-            // stay. `−log` then contributes `−∂P_obs/∂η / P_obs`.
-            for (&(j, k2), (_, dp)) in transitions.iter().zip(&outs) {
-                if j != from || (from != to && k2 != to) {
-                    continue;
-                }
-                let sign = if from == to { 1.0 } else { -1.0 };
-                for (acc, d) in grad.iter_mut().zip(&dp[n_theta..]) {
-                    if !d.is_finite() {
-                        return None;
-                    }
-                    *acc += sign * d / p;
-                }
-            }
-        }
-    }
-    Some((nll, grad))
+    crate::survival::eta_gradient_by_bucket(eta, &f)
 }
 
 /// Whether every `Dtmm` endpoint of `model` carries a dual-evaluable probability program,

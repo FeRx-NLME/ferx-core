@@ -658,6 +658,67 @@ fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
 
 /// Shared body: analytic M-step `(nll, grad)` for `model` vs `obs_nll_sum`
 /// and its forward difference, in the same log-packed space SAEM optimises.
+/// The θ block of a θ-dependent residual magnitude is the exact data score's: with it on,
+/// the M-step gradient differs in the bits from the per-θ difference quotient the test
+/// switch forces, and agrees with it to the quotient's accuracy. (The FD comparison in
+/// [`check_saem_mstep_matches_fd`] passes on either branch; this pins which one ran.)
+fn assert_magnitude_takes_the_exact_score(model: &CompiledModel, theta: &[f64], sigma: &[f64]) {
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![1.0, 4.0, 8.0],
+        observations: vec![8.0, 6.0, 4.0],
+        obs_cmts: vec![1; 3],
+        cens: vec![0; 3],
+        covariates: [("WPSE".to_string(), 0.5)].into_iter().collect(),
+        obs_covariates: vec![
+            [("WPSE".to_string(), 0.5)].into_iter().collect(),
+            [("WPSE".to_string(), 0.75)].into_iter().collect(),
+            [("WPSE".to_string(), 1.0)].into_iter().collect(),
+        ],
+        ..Default::default()
+    };
+    let (n_theta, n_sigma) = (theta.len(), sigma.len());
+    let n = n_theta + n_sigma;
+    let (mask, lo, hi) = (vec![true; n_theta], vec![-1e30; n], vec![1e30; n]);
+    let mut scratch = EventPkParams::default();
+    let mut run = |force: bool| {
+        DATA_SCORE_FD_FORCE.with(|c| c.set(force));
+        let r = obs_nll_subject_grad(
+            model,
+            &subject,
+            theta,
+            sigma,
+            &[0.05],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+        DATA_SCORE_FD_FORCE.with(|c| c.set(false));
+        r
+    };
+    let (nll_e, g_e) = run(false);
+    let (nll_f, g_f) = run(true);
+    assert_eq!(nll_e.to_bits(), nll_f.to_bits());
+    assert!(
+        (0..n_theta).any(|i| g_e[i].to_bits() != g_f[i].to_bits()),
+        "the exact θ branch did not run"
+    );
+    let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+    for i in 0..n {
+        // Measured below 1e-5 of the row: the quotient's forward-step truncation.
+        assert!(
+            (g_e[i] - g_f[i]).abs() < 1e-4 * scale,
+            "[{i}] {} vs {}",
+            g_e[i],
+            g_f[i]
+        );
+    }
+}
+
 fn check_saem_mstep_matches_fd(model: &CompiledModel, theta: &[f64], sigma_values: &[f64]) {
     use crate::types::{DoseEvent, Population};
 
@@ -816,6 +877,7 @@ fn obs_nll_subject_grad_theta_dependent_magnitude_matches_fd() {
     .expect("theta-dependent magnitude model parses");
     assert!(model.has_theta_dependent_ruv_magnitude());
     check_saem_mstep_matches_fd(&model, &[1.0, 10.0, 0.30], &[0.10, 0.50]);
+    assert_magnitude_takes_the_exact_score(&model, &[1.0, 10.0, 0.30], &[0.10, 0.50]);
 }
 
 /// #1182: the `power(σ, P)` exponent is a θ that moves the residual variance
@@ -845,6 +907,7 @@ fn obs_nll_subject_grad_power_exponent_matches_fd() {
     .expect("power model parses");
     assert!(model.has_ruv_exponent());
     check_saem_mstep_matches_fd(&model, &[1.0, 10.0, 1.3], &[0.10]);
+    assert_magnitude_takes_the_exact_score(&model, &[1.0, 10.0, 1.3], &[0.10]);
 }
 
 // ── #1458: the expected (Fisher) information of the frozen-η M-step ────────
@@ -2314,19 +2377,40 @@ fn obs_nll_subject_grad_ruv_mult_survives_a_nan_forward_prediction() {
         "forward TVA step must make a prediction NaN, or the fixture tests nothing: {pert:?}"
     );
 
-    let (nll, grad) = obs_nll_subject_grad(
-        &model,
-        &subject,
-        &theta,
-        &sigma,
-        &eta,
-        &[true; 4],
-        &[-1e30; 5],
-        &[1e30; 5],
-        4,
-        1,
-        &mut scratch,
+    let mut run = |force: bool| {
+        DATA_SCORE_FD_FORCE.with(|c| c.set(force));
+        let r = obs_nll_subject_grad(
+            &model,
+            &subject,
+            &theta,
+            &sigma,
+            &eta,
+            &[true; 4],
+            &[-1e30; 5],
+            &[1e30; 5],
+            4,
+            1,
+            &mut scratch,
+        );
+        DATA_SCORE_FD_FORCE.with(|c| c.set(false));
+        r
+    };
+    // The exact data score takes no step into the NaN side: every entry finite, so nothing
+    // downstream is poisoned. (At the domain edge `TVA = 1` the derivative of
+    // `(1 − TVA)^0.5` does not exist; the dual `pow` reads it as zero there.)
+    let (nll, grad) = run(false);
+    assert!(
+        nll.is_finite() && nll < 1e3,
+        "base NLL must score normally: {nll}"
     );
+    for (j, g) in grad.iter().enumerate() {
+        assert!(
+            g.is_finite(),
+            "exact path grad[{j}] is not finite: {grad:?}"
+        );
+    }
+    // The difference quotient — still the fallback on a decline — must repel there.
+    let (nll, grad) = run(true);
     assert!(
         nll.is_finite() && nll < 1e3,
         "base NLL must score normally: {nll}"
@@ -2345,6 +2429,547 @@ fn obs_nll_subject_grad_ruv_mult_survives_a_nan_forward_prediction() {
             grad[j].abs() < 1e6,
             "grad[{j}] = {} should be unaffected",
             grad[j]
+        );
+    }
+}
+
+/// The fixed-η data score is the analytic kernel's, taken exactly
+/// (`fixed_eta_data_score`), wherever SAEM and VI used to difference the whole NLL.
+///
+/// - **Gaussian** (`warfarin`): the kernel's score agrees with the closed-form path — itself
+///   exact (closed-form `∂nll/∂f`, the θ adjoint, analytic σ) — to rounding: an
+///   exact-vs-exact oracle for the kernel route.
+/// - **M3 censoring, a dense residual, IOV + M3**: the exact branch runs (it differs in the
+///   bits from the whole-NLL forward difference forced by the test switch), and agrees
+///   with that quotient to the quotient's own accuracy. The objective is unchanged.
+#[test]
+fn the_fixed_eta_data_score_is_exact() {
+    use crate::sens::ode_provider::adjoint::fixed_eta_data_score;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let load = |m: &str, d: &str| {
+        crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap()
+    };
+    let packed = |model: &CompiledModel, theta: &[f64], sigma: &[f64], dt: &[f64], ds: &[f64]| {
+        let mut g: Vec<f64> = (0..theta.len())
+            .map(|i| {
+                if model.default_params.theta_lower[i] >= 0.0 {
+                    theta[i] * dt[i]
+                } else {
+                    dt[i]
+                }
+            })
+            .collect();
+        g.extend((0..sigma.len()).map(|k| sigma[k] * ds[k]));
+        g
+    };
+    // Gaussian: kernel score vs the closed-form path, exact against exact.
+    let prep = load("examples/warfarin.ferx", "data/warfarin.csv");
+    let model = &prep.parsed.model;
+    let theta = model.default_params.theta.clone();
+    let sigma = model.default_params.sigma.values.clone();
+    let (n_theta, n_sigma) = (theta.len(), sigma.len());
+    let mask: Vec<bool> = model
+        .default_params
+        .theta_lower
+        .iter()
+        .map(|&l| l >= 0.0)
+        .collect();
+    let (lo, hi) = (
+        vec![-1e30; n_theta + n_sigma],
+        vec![1e30; n_theta + n_sigma],
+    );
+    let mut scratch = EventPkParams::default();
+    let mut worst_exact = 0.0f64;
+    for s in prep.population.subjects.iter().take(4) {
+        let eta = vec![0.05; model.n_eta];
+        let (nll, g) = obs_nll_subject_grad(
+            model,
+            s,
+            &theta,
+            &sigma,
+            &eta,
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+        let (knll, dt, ds) = fixed_eta_data_score(model, s, &theta, &sigma, &eta).unwrap();
+        let kg = packed(model, &theta, &sigma, &dt, &ds);
+        let scale = g.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+        for (a, b) in kg.iter().zip(&g) {
+            worst_exact = worst_exact.max((a - b).abs() / scale);
+        }
+        // The kernel drops the data term's constant; its value moves with the parameters
+        // as the closed form's does, so only the gradient is compared.
+        assert!(knll.is_finite() && nll.is_finite());
+    }
+    eprintln!("kernel data score vs the closed form: worst {worst_exact:.2e} of the row");
+    // Measured 1.8e-16: rounding. 1e-10 bounds the summation-order spread; a dropped
+    // censored-row weight or σ chain misses by O(1).
+    assert!(worst_exact < 1e-10, "{worst_exact:.2e}");
+
+    // M3, dense residual, IOV + M3: the exact branch against the forced quotient.
+    let mut worst = 0.0f64;
+    for (m, d) in [
+        ("examples/warfarin_bloq.ferx", "data/warfarin_bloq.csv"),
+        (
+            "examples/correlated_residual_combined.ferx",
+            "data/correlated_residual_combined.csv",
+        ),
+        (
+            "examples/warfarin_iov_bloq.ferx",
+            "data/warfarin_iov_bloq.csv",
+        ),
+    ] {
+        let prep = load(m, d);
+        let model = &prep.parsed.model;
+        let theta = model.default_params.theta.clone();
+        let sigma = model.default_params.sigma.values.clone();
+        let (n_theta, n_sigma) = (theta.len(), sigma.len());
+        let mask: Vec<bool> = model
+            .default_params
+            .theta_lower
+            .iter()
+            .map(|&l| l >= 0.0)
+            .collect();
+        let (lo, hi) = (
+            vec![-1e30; n_theta + n_sigma],
+            vec![1e30; n_theta + n_sigma],
+        );
+        for (i, s) in prep.population.subjects.iter().enumerate().take(3) {
+            let eta = vec![0.05; model.n_eta];
+            let run = |force: bool, scratch: &mut EventPkParams| {
+                DATA_SCORE_FD_FORCE.with(|c| c.set(force));
+                let r = if model.n_kappa > 0 {
+                    let kappas = vec![
+                        vec![0.03; model.n_kappa];
+                        crate::stats::likelihood::iov_occasion_groups(s).len()
+                    ];
+                    obs_nll_subject_grad_iov(
+                        model, s, &theta, &sigma, &eta, &kappas, &mask, &lo, &hi, n_theta, n_sigma,
+                        scratch,
+                    )
+                } else {
+                    obs_nll_subject_grad(
+                        model, s, &theta, &sigma, &eta, &mask, &lo, &hi, n_theta, n_sigma, scratch,
+                    )
+                };
+                DATA_SCORE_FD_FORCE.with(|c| c.set(false));
+                r
+            };
+            let (nll_e, g_e) = run(false, &mut scratch);
+            let (nll_f, g_f) = run(true, &mut scratch);
+            let tag = format!("{m} subject {i}");
+            assert_eq!(nll_e.to_bits(), nll_f.to_bits(), "{tag}: objective");
+            assert!(
+                g_e.iter()
+                    .zip(&g_f)
+                    .any(|(a, b)| a.to_bits() != b.to_bits()),
+                "{tag}: the exact branch did not run"
+            );
+            let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+            for (a, b) in g_e.iter().zip(&g_f) {
+                assert!(a.is_finite() && b.is_finite(), "{tag}");
+                worst = worst.max((a - b).abs() / scale);
+            }
+        }
+    }
+    eprintln!("exact data score vs the whole-NLL quotient: worst {worst:.2e} of the row");
+    // Measured 3.3e-4: the forward quotient's own truncation at its `1e-5` step (the
+    // `#2187` measure above sees 2.9e-4 on M3 for the same reason). 3× headroom.
+    assert!(worst < 1e-3, "{worst:.2e}");
+}
+
+/// SAEM's fixed-η score is exact on a model with non-Gaussian endpoints: the Gaussian rows
+/// by the kernel, the TTE / binary records by their own term's θ-dual. The oracle is a
+/// Richardson-extrapolated central difference of the whole fixed-η NLL
+/// (`obs_nll_subject_into`), far more accurate than the forward quotient the exact branch
+/// replaces; the test switch pins that the exact branch, not the quotient, ran.
+#[test]
+#[cfg(feature = "survival")]
+fn the_fixed_eta_score_is_exact_with_a_non_gaussian_term() {
+    use crate::stats::likelihood::obs_nll_subject_into;
+    use crate::types::ObsRecord;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut cases: Vec<(String, CompiledModel, Subject)> = Vec::new();
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let mut prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap()
+            .clone();
+        cases.push((m.into(), prep.parsed.model, s));
+    }
+    let binary = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
+         omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  \
+         logit = TH0 + ETA_I + THT * TIME * exp(0.5 * ETA_I)\n",
+    )
+    .unwrap();
+    let rows = [(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)];
+    cases.push((
+        "binary".into(),
+        binary,
+        Subject {
+            id: "1".into(),
+            obs_records: rows
+                .iter()
+                .map(|&(time, state)| ObsRecord::DiscreteState {
+                    time,
+                    raw_time: time,
+                    state,
+                    cmt: 3,
+                })
+                .collect(),
+            ..Default::default()
+        },
+    ));
+    let mut worst = 0.0f64;
+    for (tag, model, s) in &cases {
+        let theta = model.default_params.theta.clone();
+        let sigma = model.default_params.sigma.values.clone();
+        let (n_theta, n_sigma) = (theta.len(), sigma.len());
+        let mask: Vec<bool> = model
+            .default_params
+            .theta_lower
+            .iter()
+            .map(|&l| l >= 0.0)
+            .collect();
+        let (lo, hi) = (
+            vec![-1e30; n_theta + n_sigma],
+            vec![1e30; n_theta + n_sigma],
+        );
+        let eta = vec![0.05; model.n_eta];
+        let mut scratch = EventPkParams::default();
+        let run = |force: bool, scratch: &mut EventPkParams| {
+            DATA_SCORE_FD_FORCE.with(|c| c.set(force));
+            let r = obs_nll_subject_grad(
+                model, s, &theta, &sigma, &eta, &mask, &lo, &hi, n_theta, n_sigma, scratch,
+            );
+            DATA_SCORE_FD_FORCE.with(|c| c.set(false));
+            r
+        };
+        let (_, g) = run(false, &mut scratch);
+        let (_, g_fd) = run(true, &mut scratch);
+        assert!(
+            g.iter().zip(&g_fd).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "{tag}: the exact branch did not run"
+        );
+        // Richardson in the raw parameter, then the packing's chain factor.
+        let mut f = |th: &[f64], sg: &[f64]| {
+            obs_nll_subject_into(
+                model,
+                s,
+                th,
+                sg,
+                model.residual_cov_theta(th),
+                &eta,
+                &mut scratch,
+            )
+        };
+        let mut oracle = vec![0.0; n_theta + n_sigma];
+        for i in 0..n_theta + n_sigma {
+            let x0 = if i < n_theta {
+                theta[i]
+            } else {
+                sigma[i - n_theta]
+            };
+            let mut d = |h: f64| {
+                let (mut tp, mut tm, mut sp, mut sm) =
+                    (theta.clone(), theta.clone(), sigma.clone(), sigma.clone());
+                if i < n_theta {
+                    tp[i] += h;
+                    tm[i] -= h;
+                } else {
+                    sp[i - n_theta] += h;
+                    sm[i - n_theta] -= h;
+                }
+                (f(&tp, &sp) - f(&tm, &sm)) / (2.0 * h)
+            };
+            let h = 1e-3 * (1.0 + x0.abs());
+            let raw = (4.0 * d(h / 2.0) - d(h)) / 3.0;
+            oracle[i] = if i >= n_theta || mask[i] {
+                x0 * raw
+            } else {
+                raw
+            };
+        }
+        let scale = oracle.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+        for (k, (a, b)) in g.iter().zip(&oracle).enumerate() {
+            assert!(a.is_finite() && b.is_finite(), "{tag}[{k}]");
+            let e = (a - b).abs() / scale;
+            eprintln!("{tag}[{k}]: exact {a:.10e} richardson {b:.10e} ({e:.1e})");
+            worst = worst.max(e);
+        }
+        // The hazard / logit θ must actually move the score, or the term was dropped.
+        assert!(g.iter().any(|v| v.abs() > 1e-3), "{tag}: a zero score");
+    }
+    eprintln!("non-Gaussian fixed-η score vs Richardson: worst {worst:.2e}");
+    assert!(worst < 1e-6, "{worst:.2e}");
+}
+
+/// #2468 review: the exact fixed-η θ score (`exact_theta_score`, the adjoint SAEM's M-step
+/// and VI score θ by) against central differences of the `f64` production objective — the
+/// predictor those estimators evaluate, not the recorder's own forward tangents — with the
+/// exact path asserted to have served every case: an ODE subject, a closed-form transit
+/// subject the predictor routes to its ODE twin, FREM covariate rows on the closed form
+/// (whose prediction the adjoint overrides to `θ_cov + η_cov`), the same FREM rows under
+/// IOV (the stacked `[η | κ_0 | κ_1 …]`), and an IOV subject whose stack (51) is wider than
+/// the widest η-dispatch bucket (48), which a θ-only recording does not need.
+///
+/// The ODE fixtures integrate at `1e-10`/`1e-12`, so the differences of the adaptive
+/// solve resolve the score; the bound is relative to the largest component, so a θ whose
+/// score is near zero is not held to a relative tolerance it cannot meet. Measured worst
+/// 4.9e-10 of the largest component (transit twin, FREM, FREM + IOV; the ODE 2.0e-10, the
+/// wide IOV stack 8.1e-12), so the `1e-6` bound has ~2000× headroom.
+#[test]
+fn the_exact_theta_score_is_the_central_difference_of_the_production_objective() {
+    use crate::types::{DoseEvent, Population};
+    let parse = |src: &str| {
+        let mut m = crate::parser::model_parser::parse_model_string(src).expect("fixture parses");
+        // The model's own integrator and a transit twin's alike.
+        m.sync_ode_solver_opts(&crate::types::FitOptions {
+            ode_reltol: 1e-10,
+            ode_abstol: 1e-12,
+            ..Default::default()
+        });
+        m
+    };
+    let ode = parse(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+         theta TVKA(1.2, 0.05, 20.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n  \
+         sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+         V = TVV * exp(ETA_V)\n  KA = TVKA\n[structural_model]\n  ode(states=[depot, central])\n\
+         [odes]\n  d/dt(depot) = -KA * depot\n  d/dt(central) = KA * depot - (CL/V) * central\n\
+         [scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    );
+    let transit = parse(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVCL_LATE(5.0, 0.1, 100.0)\n  \
+         theta TVV(30.0, 1.0, 500.0)\n  theta TVMTT(1.5, 0.1, 20.0)\n  \
+         theta TVN(3.0, 0.5, 20.0)\n  theta TVLAG(0.3, 0.01, 5.0)\n  omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  if (TIME > 3.0) {\n    \
+         CL = TVCL_LATE * exp(ETA_CL)\n  } else {\n    CL = TVCL * exp(ETA_CL)\n  }\n  \
+         V = TVV\n  MTT = TVMTT\n  NTR = TVN\n  LAGTIME = TVLAG\n[structural_model]\n  \
+         pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    );
+    let iov_model = parse(
+        "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    );
+    let pk = |times: Vec<f64>, obs: Vec<f64>| Subject {
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(3.5, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_cmts: vec![1; times.len()],
+        cens: vec![0; times.len()],
+        obs_times: times,
+        observations: obs,
+        ..Default::default()
+    };
+    let six = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let ode_subject = pk(six.clone(), vec![2.1, 2.6, 2.4, 4.1, 3.9, 3.2]);
+    let transit_subject = pk(six.clone(), vec![1.2, 2.0, 2.2, 2.6, 3.0, 2.9]);
+    let routed = crate::pk::effective_model_for_eval(
+        &transit,
+        &transit_subject,
+        &transit.default_params.theta,
+        &[0.1],
+    );
+    assert!(
+        !std::ptr::eq(routed, &transit),
+        "fixture: the transit subject must run on the ODE twin"
+    );
+    let frem = frem_free_cov_sigma_model(false);
+    let frem_subject = with_frem_rows(pk(six.clone(), vec![4.6, 4.0, 3.5, 7.4, 6.3, 5.5]), &[75.0]);
+    let frem_iov = frem_free_cov_sigma_model(true);
+    let mut iov_subject = pk(six, vec![4.6, 4.0, 3.5, 7.4, 6.3, 5.5]);
+    iov_subject.occasions = vec![1, 1, 1, 2, 2, 2];
+    iov_subject.dose_occasions = vec![1, 2];
+    let iov_subject = with_frem_rows(iov_subject, &[75.0]);
+    // 50 occasions, a dose and an observation in each: the stack is 1 + 50 = 51 wide.
+    let n_occ = 50usize;
+    let wide_subject = Subject {
+        id: "1".into(),
+        doses: (0..n_occ)
+            .map(|k| DoseEvent::new(12.0 * k as f64, 100.0, 1, 0.0, false, 0.0))
+            .collect(),
+        dose_occasions: (1..=n_occ).map(|k| k as _).collect(),
+        obs_times: (0..n_occ).map(|k| 12.0 * k as f64 + 4.0).collect(),
+        observations: (0..n_occ).map(|k| 1.5 + 0.1 * (k as f64).sin()).collect(),
+        obs_cmts: vec![1; n_occ],
+        cens: vec![0; n_occ],
+        occasions: (1..=n_occ).map(|k| k as _).collect(),
+        ..Default::default()
+    };
+    let wide_kappas: Vec<Vec<f64>> = (0..n_occ).map(|k| vec![0.05 * (k as f64).cos()]).collect();
+
+    // (label, model, subject, θ, σ, η, κ per occasion)
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(
+        &str,
+        &CompiledModel,
+        &Subject,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<Vec<f64>>,
+    )> = vec![
+        (
+            "ode",
+            &ode,
+            &ode_subject,
+            vec![4.0, 30.0, 1.2],
+            vec![0.1],
+            vec![0.1, -0.05],
+            vec![],
+        ),
+        (
+            "transit_twin",
+            &transit,
+            &transit_subject,
+            vec![4.0, 5.0, 30.0, 1.5, 3.0, 0.3],
+            vec![0.1],
+            vec![0.1],
+            vec![],
+        ),
+        (
+            "frem",
+            &frem,
+            &frem_subject,
+            vec![1.5, 20.0, 70.0],
+            vec![0.5, 2.0],
+            vec![0.05, 1.0],
+            vec![],
+        ),
+        (
+            "frem_iov",
+            &frem_iov,
+            &iov_subject,
+            vec![1.5, 20.0, 70.0],
+            vec![0.5, 2.0],
+            vec![0.1, 1.0],
+            vec![vec![0.05], vec![-0.05]],
+        ),
+        (
+            "iov_wide",
+            &iov_model,
+            &wide_subject,
+            vec![5.0, 50.0],
+            vec![0.1],
+            vec![0.1],
+            wide_kappas,
+        ),
+    ];
+    for (label, model, subject, theta, sigma, eta, kappas) in cases {
+        let iov = !kappas.is_empty();
+        let (n_theta, n_sigma) = (theta.len(), sigma.len());
+        let n = n_theta + n_sigma;
+        let mask = vec![true; n_theta];
+        let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+        let mut scratch = EventPkParams::default();
+        let objective = |th: &[f64], scratch: &mut EventPkParams| -> f64 {
+            if iov {
+                obs_nll_subject_into_iov(model, subject, th, &sigma, &eta, &kappas, scratch)
+            } else {
+                let pop = Population {
+                    subjects: vec![subject.clone()],
+                    covariate_names: Vec::new(),
+                    dv_column: "DV".into(),
+                    input_columns: vec![],
+                    exclusions: None,
+                    warnings: vec![],
+                };
+                obs_nll_sum(model, &pop, th, &sigma, std::slice::from_ref(&eta), &[])
+            }
+        };
+        EXACT_THETA_SCORES.with(|c| c.set(0));
+        let (nll, grad) = if iov {
+            obs_nll_subject_grad_iov(
+                model,
+                subject,
+                &theta,
+                &sigma,
+                &eta,
+                &kappas,
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
+                &mut scratch,
+            )
+        } else {
+            obs_nll_subject_grad(
+                model,
+                subject,
+                &theta,
+                &sigma,
+                &eta,
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
+                &mut scratch,
+            )
+        };
+        assert_eq!(
+            EXACT_THETA_SCORES.with(|c| c.get()),
+            1,
+            "{label}: the exact θ score must serve the fixture (non-vacuity)"
+        );
+        assert!(
+            (nll - objective(&theta, &mut scratch)).abs() < 1e-9 * (1.0 + nll.abs()),
+            "{label}: the score's objective is the production one"
+        );
+        // Central differences in the packed (log θ) coordinates.
+        let mut want = vec![0.0f64; n_theta];
+        for (i, w) in want.iter_mut().enumerate() {
+            let h = 1e-5 * theta[i];
+            let at = |d: f64, scratch: &mut EventPkParams| {
+                let mut tp = theta.clone();
+                tp[i] += d;
+                objective(&tp, scratch)
+            };
+            *w = theta[i] * (at(h, &mut scratch) - at(-h, &mut scratch)) / (2.0 * h);
+        }
+        let scale = want.iter().fold(0.0f64, |m, w| m.max(w.abs()));
+        assert!(
+            scale > 1e-2,
+            "{label}: a flat θ score tests nothing ({want:?})"
+        );
+        let worst = grad[..n_theta]
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| {
+                assert!(g.is_finite(), "{label}: {g}");
+                (g - w).abs() / scale
+            })
+            .fold(0.0f64, f64::max);
+        eprintln!("{label}: exact θ score vs central FD, worst {worst:.2e} of the largest");
+        assert!(
+            worst < 1e-6,
+            "{label}: exact {:?} vs FD {want:?}",
+            &grad[..n_theta]
         );
     }
 }

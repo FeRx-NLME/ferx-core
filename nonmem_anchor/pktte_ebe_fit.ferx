@@ -1,0 +1,49 @@
+# Joint PK-TTE at the EBEs, live IIV on CL (#1885).
+#
+# The ferx twin of `nonmem_anchor/pktte_ebe.ctl` — same fixed THETA, Omega and Sigma, same
+# data and the same augmented system. Consumed by `tests/pktte_ebe_nonmem_anchor.rs`.
+# Everything is FIX, so a `maxiter = 0` fit is the inner problem alone: each subject's EBE
+# at the stated point, which is what NONMEM's `MAXEVAL=0 POSTHOC` reports as ETA1.
+#
+# `[fit_options]` pins the solver at reltol 1e-9 / abstol 1e-11, as `pktte_tdep_fit.ferx`
+# does; NONMEM runs `ADVAN13 TOL=9`.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVH0(0.01, FIX)
+  theta TVBETA(0.3, FIX)
+
+  omega ETA_CL ~ 0.09 FIX          # NONMEM `$OMEGA 0.09 FIX`: live, not estimated
+  sigma PROP_ERR ~ 0.01 FIX        # variance; NONMEM `$SIGMA 0.01 FIX`
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[scaling]
+  obs_scale = V                    # states are AMOUNTS; NONMEM's `$ERROR` divides by V
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

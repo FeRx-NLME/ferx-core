@@ -565,6 +565,7 @@ impl AmdResult {
 
 /// Progress, for a caller that wants to print it.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum AmdEvent {
     /// The plan, before the first fit.
     Planned {
@@ -614,6 +615,15 @@ pub enum AmdEvent {
     RetriesFinished {
         improved: bool,
         ofv: Option<f64>,
+    },
+    /// One candidate of a step's search, or one of the pipeline's own
+    /// single-model fits (`start`, `retries`), finished (#2512). `index` is
+    /// the step's position in the plan (`0` for the start fit), `tool` the
+    /// tool that fitted it, and `candidate.step` the step *within* that tool.
+    CandidateFinished {
+        index: usize,
+        tool: &'static str,
+        candidate: crate::search::CandidateFinished,
     },
 }
 
@@ -685,7 +695,7 @@ pub(crate) trait StepRunner {
     fn fit_one(
         &self,
         index: usize,
-        tool: &str,
+        tool: &'static str,
         dir_name: &str,
         config: &SearchConfig,
         model: &ModelText,
@@ -694,7 +704,7 @@ pub(crate) trait StepRunner {
 }
 
 /// The production step runner: the real tools, one directory each.
-pub(crate) struct ToolRunner {
+pub(crate) struct ToolRunner<'a> {
     pub dir: PathBuf,
     pub threads: Option<usize>,
     pub cancel: Option<CancelFlag>,
@@ -703,9 +713,12 @@ pub(crate) struct ToolRunner {
     /// edited model text into a *different* directory — cannot re-resolve to
     /// something else.
     pub data_path: String,
+    /// Where each candidate's [`AmdEvent::CandidateFinished`] goes; the
+    /// tools' other events are the pipeline's to summarise, not to forward.
+    pub progress: Option<ProgressFn<'a>>,
 }
 
-impl ToolRunner {
+impl ToolRunner<'_> {
     /// Materialise `model` as `<dir>/<dir_name>/input.ferx` and read it back
     /// as a [`BaseModel`].
     ///
@@ -755,6 +768,7 @@ pub fn run_amd(
         threads: run.threads,
         cancel: run.cancel.clone(),
         data_path: base.prepared.data_path.clone(),
+        progress: run.progress,
     };
     let result = drive(&runner, config, &options, &plan, &base.text, run.progress)?;
     write_report(&run.dir, &result)?;

@@ -51,6 +51,8 @@ use ferx_core::{
 use std::collections::HashMap;
 use std::path::Path;
 
+mod common;
+
 /// The anchor seed. Must match the seed the frozen κ / troughs in
 /// `tests/reference/vanco_iov_mrgsolve/{vanco_iov_mrgsolve.R,expected.md}` were
 /// generated at — the reconstruction is seed-deterministic, so a different seed
@@ -135,8 +137,8 @@ fn anchor_subject(decision_times: &[f64]) -> Subject {
 /// surface — fails here, by name, rather than as a mismatch in the cross-engine check below.
 /// `parse_full_model_file` runs the full `[adaptive_dosing]` `validate()`, so a successful
 /// parse plus these spot-checks pin the scenario the anchor relies on: exactly one κ (the IOV
-/// effect), the trough control law, and that `auc_target` is **absent** (it is a typed error
-/// for an IOV subject, #701). A short seeded run of the reactive driver then confirms it is
+/// effect), the trough control law, and that the example declares no `auc_target` (the
+/// window-AUC test adds one, #943). A short seeded run of the reactive driver then confirms it is
 /// `Ok` — the default frozen-replay verifier validating the realized run.
 #[test]
 fn vanco_iov_example_parses_and_runs_the_verifier() {
@@ -160,8 +162,7 @@ fn vanco_iov_example_parses_and_runs_the_verifier() {
     );
     assert_eq!(
         spec.auc_target, None,
-        "auc_target must be absent — it is a typed error for an IOV (`kappa`) \
-         subject (#701), so the IOV example never declares it"
+        "the IOV example declares no auc_target; the window-AUC test adds one (#943)"
     );
     assert_eq!(spec.at.len(), 14, "14 daily decisions, t = 0..=312 h");
     assert_eq!(spec.levels, None, "continuous (percentage) titration");
@@ -279,4 +280,61 @@ fn vanco_iov_titration_matches_mrgsolve() {
          (spread {:.3} mg/L) — else the anchor would not bite",
         hi - lo
     );
+}
+
+/// mrgsolve's AUC24 of each closed inter-decision window (#943), frozen in
+/// `tests/reference/vanco_iov_mrgsolve/expected.md`: an AUC compartment `dxdt_AUC = CENT/V` reset at the
+/// start of each window, integrated on the same piecewise-constant CL as the troughs above.
+const REF_AUC24: [f64; 13] = [
+    117.894224, 172.322318, 185.623432, 254.258103, 398.101469, 348.818476, 452.808855, 399.534846,
+    547.645310, 591.129975, 650.768225, 623.777441, 504.594452,
+];
+
+/// Relative band of each ferx AUC24 against mrgsolve's (#943), the band of the constant-path
+/// vanco anchor. Measured on Linux aarch64 (`tools/linux-test.sh`), identical in every
+/// printed digit on macOS arm64: the windows read −2.6e-6 to +3.4e-6 relative, so 5e-5 is at least
+/// 15× headroom. This is a cross-engine band (RK45 + a trapezoid on soft samples vs
+/// LSODA + an AUC compartment), not ferx's own accuracy; the kit has a constant `V` and no
+/// `[scaling]`, so it checks the exposure of the per-segment trajectory, and the readout
+/// conversion under κ and covariates is pinned by the closed forms in
+/// `src/api/tests/adaptive_auc_tv_tests.rs`.
+const AUC_REL_TOL: f64 = 5e-5;
+
+/// Each window's AUC24 matches mrgsolve's to [`AUC_REL_TOL`] (#943): the exposure integral
+/// under the per-segment snapshot, checked window by window rather than through the
+/// attainment fraction.
+#[test]
+fn vanco_iov_window_aucs_match_mrgsolve() {
+    common::assert_window_aucs_match(&windows_in, &REF_AUC24, AUC_REL_TOL, "iov");
+}
+
+/// Run the anchor scenario with `auc_target = band` and count the windows in it.
+fn windows_in(band: (f64, f64)) -> usize {
+    let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov.ferx"))
+        .expect("model must parse");
+    let mut spec = parsed
+        .adaptive_dosing
+        .clone()
+        .expect("[adaptive_dosing] present");
+    spec.auc_target = Some(band);
+    let pop = Population {
+        subjects: vec![anchor_subject(&spec.at)],
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let mut opts = AdaptiveSimulateOptions::default();
+    opts.seed = Some(ANCHOR_SEED);
+    let res = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        &spec,
+        &opts,
+    )
+    .expect("adaptive run with auc_target");
+    common::windows_in_band(&res)
 }

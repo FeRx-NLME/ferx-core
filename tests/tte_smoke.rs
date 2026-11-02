@@ -635,6 +635,7 @@ mod survival_smoke {
                     clock: RtteClock::Reset,
                 },
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
         );
         let pop = rtte_pop();
@@ -772,6 +773,7 @@ mod survival_smoke {
                     clock: RtteClock::Reset,
                 },
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
         );
         let mut pop = rtte_pop();
@@ -832,6 +834,7 @@ mod survival_smoke {
                     clock: RtteClock::Reset,
                 },
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
         );
         let mut pop = rtte_pop();
@@ -889,6 +892,7 @@ mod survival_smoke {
                     clock: RtteClock::Reset,
                 },
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
         );
         let mut pop = rtte_pop();
@@ -939,6 +943,7 @@ mod survival_smoke {
                     clock: RtteClock::Reset,
                 },
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
         );
         let mut pop = rtte_pop();

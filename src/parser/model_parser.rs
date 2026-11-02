@@ -600,7 +600,14 @@ fn detect_mu_refs(
     eta_names: &[String],
     nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
-    detect_mu_refs_with_owners(stmts, theta_names, eta_names, nn_specs)
+    let scan = MuRefScan {
+        theta_names,
+        eta_names,
+        n_bsv: eta_names.len(),
+        outside_idents: &HashSet::new(),
+        nn_specs,
+    };
+    detect_mu_refs_with_owners(stmts, &scan)
         .into_iter()
         .map(|(eta, (mu_ref, _owner))| (eta, mu_ref))
         .collect()
@@ -614,9 +621,7 @@ fn detect_mu_refs(
 /// capture `CL`'s θ in hash order (#1930).
 fn detect_mu_refs_with_owners(
     stmts: &[Statement],
-    theta_names: &[String],
-    eta_names: &[String],
-    nn_specs: &[(String, Vec<String>)],
+    scan: &MuRefScan,
 ) -> HashMap<String, (MuRef, String)> {
     let mut result = HashMap::new();
     // NONMEM-style explicit mu syntax (`MU_1 = log(TVCL)`, `CL = exp(MU_1 + ETA_CL)`)
@@ -635,18 +640,142 @@ fn detect_mu_refs_with_owners(
     let mut scope = InlineScope::new(stmts);
     for (at, s) in stmts.iter().enumerate() {
         if let Statement::Assign(name, raw_expr) = s {
-            let mut found = classify_mu_ref(raw_expr, theta_names, eta_names, nn_specs);
-            if found.is_none() && !scope.is_empty() {
-                let inlined = scope.view(at, raw_expr);
-                found = classify_mu_ref(inlined, theta_names, eta_names, nn_specs);
-            }
-            if let Some((eta_idx, mu_ref)) = found {
-                result.insert(eta_names[eta_idx].clone(), (mu_ref, name.clone()));
+            if let Some((eta_idx, mu_ref)) = scan.classify_assignment(stmts, &scope, at) {
+                result.insert(scan.eta_names[eta_idx].clone(), (mu_ref, name.clone()));
             }
             scope.record(at, name, raw_expr);
         }
     }
     result
+}
+
+/// What the per-line mu-reference classification reads besides the line: the
+/// names, how many of the etas are BSV (the rest are kappas), and the
+/// identifiers the other blocks spell (for the exclusivity gate).
+struct MuRefScan<'n> {
+    theta_names: &'n [String],
+    eta_names: &'n [String],
+    n_bsv: usize,
+    outside_idents: &'n HashSet<String>,
+    nn_specs: &'n [(String, Vec<String>)],
+}
+
+impl MuRefScan<'_> {
+    /// The mu-reference of the top-level assignment `stmts[at]`, or `None`.
+    ///
+    /// Shared by [`detect_mu_refs_with_owners`] and [`detect_mixture_mu_refs`],
+    /// which must agree on which line anchors which eta. Tries, in order, the
+    /// raw line, the line with the definitions in `scope` inlined, and the
+    /// one-line additive sum ([`additive_sum_anchor`], #2544). The last runs on
+    /// the inlined view only: on the raw line a local `X = 2*TVE0` is an opaque
+    /// name, and `TVE0 + X + ETA` would pass as reading `TVE0` once.
+    ///
+    /// An additive (`Identity`) anchor on a BSV eta is then kept only when the
+    /// theta and the eta enter the likelihood through this line alone
+    /// ([`thetas_read_outside_the_group`], [`eta_read_outside_the_group`], the
+    /// #619 pair). SAEM's additive M-step sets the theta to the mean of
+    /// `φ_i = θ + η_i` and re-centres the etas; that is exact only when nothing
+    /// else reads either. The gate applies to the two-term `TV + ETA` as well,
+    /// so the two spellings follow one rule. Kappa anchors and the log / logit
+    /// forms are not gated.
+    fn classify_assignment(
+        &self,
+        stmts: &[Statement],
+        scope: &InlineScope,
+        at: usize,
+    ) -> Option<(usize, MuRef)> {
+        let s = &stmts[at];
+        let Statement::Assign(_, raw_expr) = s else {
+            return None;
+        };
+        let (theta_names, eta_names, nn) = (self.theta_names, self.eta_names, self.nn_specs);
+        let (eta_idx, mu_ref) =
+            classify_mu_ref(raw_expr, theta_names, eta_names, nn).or_else(|| {
+                let inlined = scope.view(at, raw_expr);
+                (!scope.is_empty())
+                    .then(|| classify_mu_ref(inlined, theta_names, eta_names, nn))
+                    .flatten()
+                    .or_else(|| {
+                        let (e, t) = additive_sum_anchor(inlined, self.n_bsv)?;
+                        let mu_ref = MuRef {
+                            theta_name: theta_names.get(t)?.clone(),
+                            transform: MuTransform::Identity,
+                        };
+                        (e < eta_names.len()).then_some((e, mu_ref))
+                    })
+            })?;
+        if mu_ref.transform != MuTransform::Identity || eta_idx >= self.n_bsv {
+            return Some((eta_idx, mu_ref));
+        }
+        let theta = std::slice::from_ref(&mu_ref.theta_name);
+        let exclusive =
+            thetas_read_outside_the_group(stmts, theta_names, self.outside_idents, &[s], theta)
+                .is_empty()
+                && !eta_read_outside_the_group(stmts, OwnerOf::Statement(s), eta_idx);
+        exclusive.then_some((eta_idx, mu_ref))
+    }
+}
+
+/// `(eta_idx, theta_idx)` when `v` is a top-level `+` chain of three or more
+/// summands holding exactly one bare theta and exactly one bare BSV eta, where
+/// no other summand reads a BSV eta, that theta, or a local the inliner could
+/// not resolve: `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM` (#2544). This is
+/// the additive mu-reference the split spelling `E0 = TVE0 + ETA_E0` gives, so
+/// it returns the same anchor as `detect_pattern`'s Pattern 3.
+///
+/// A kappa may sit in any summand (`KAPPA/sqrt(NARM)` is how a weighted kappa
+/// desugars, #1031): the kappas are not what the BSV M-step moves. The eta and
+/// theta reads of the other summands are exact on an inlined view, since every
+/// substituted definition is eta-free and [`TypicalSummary::thetas`] sees
+/// through them; an unresolved local (assigned twice, in one `if` arm only, or
+/// eta-bearing) could hide either, so it rejects the line.
+fn additive_sum_anchor<'a, V: RhsView<'a>>(v: V, n_bsv: usize) -> Option<(usize, usize)> {
+    let mut terms = Vec::new();
+    flatten_chain(v, BinOp::Add, false, &mut terms);
+    if terms.len() < 3 {
+        return None;
+    }
+    let (mut theta, mut eta, mut others) = (None, None, Vec::new());
+    for t in terms {
+        match t.expr() {
+            Expression::Theta(i) if theta.is_none() => theta = Some(*i),
+            Expression::Theta(_) => return None,
+            // A second bare BSV eta falls through to `others`, which rejects it.
+            Expression::Eta(e) if *e < n_bsv && eta.is_none() => eta = Some(*e),
+            _ => others.push(t),
+        }
+    }
+    let (theta, eta) = (theta?, eta?);
+    let clean = |o: &V| {
+        !extract_eta_indices(o.expr()).iter().any(|&e| e < n_bsv)
+            && !o.typical_summary().thetas.contains(&theta)
+            && !reads_unresolved_local(*o)
+    };
+    others.iter().all(clean).then_some((eta, theta))
+}
+
+/// Whether `v` reads a `Variable` the view did not substitute: a local of this
+/// block the inliner could not resolve (see [`additive_sum_anchor`]). Walks
+/// into substituted definitions too: their bodies may read such a local.
+fn reads_unresolved_local<'a, V: RhsView<'a>>(v: V) -> bool {
+    match v.expr() {
+        Expression::Variable(_) => true,
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+            reads_unresolved_local(v.child(l)) || reads_unresolved_local(v.child(r))
+        }
+        Expression::UnaryFn(_, a) => reads_unresolved_local(v.child(a)),
+        Expression::ThetaGather { idx, .. } => reads_unresolved_local(v.child(idx)),
+        // The condition too, as `typical_summary_of` walks it: a θ-bearing local in
+        // `if (X > 40)` steps the typical value with θ (#2553 review r1 §4).
+        Expression::Conditional(c, t, f) => {
+            let mut in_condition = false;
+            for_each_condition_operand(c, &mut |x| {
+                in_condition |= reads_unresolved_local(v.child(x))
+            });
+            in_condition || reads_unresolved_local(v.child(t)) || reads_unresolved_local(v.child(f))
+        }
+        _ => false,
+    }
 }
 
 /// Match a `MIXNUM == <k>` (or `<k> == MIXNUM`) condition, returning the
@@ -777,10 +906,10 @@ fn detect_mixture_pattern(
 /// consumer (#996 review).
 fn detect_mixture_mu_refs(
     stmts: &[Statement],
-    theta_names: &[String],
-    eta_names: &[String],
+    scan: &MuRefScan,
     n_classes: usize,
 ) -> Vec<crate::types::MixtureMuRef> {
+    let (theta_names, eta_names) = (scan.theta_names, scan.eta_names);
     // `None` records "the last anchor for this eta was an ordinary mu-ref", which
     // `detect_mu_refs` already stores; the spec must then carry no entry for it.
     let mut latest: Vec<(String, Option<crate::types::MixtureMuRef>)> = Vec::new();
@@ -791,13 +920,19 @@ fn detect_mixture_mu_refs(
         Some(slot) => slot.1 = entry,
         None => latest.push((eta.to_string(), entry)),
     };
-    for s in stmts {
-        let Statement::Assign(_, expr) = s else {
+    let mut scope = InlineScope::new(stmts);
+    for (at, s) in stmts.iter().enumerate() {
+        let Statement::Assign(name, expr) = s else {
             continue;
         };
-        if let Some((eta_idx, theta_idx, log_transformed)) = detect_mixture_pattern(expr, n_classes)
-        {
-            if !log_transformed || eta_idx >= eta_names.len() {
+        let class_aware = detect_mixture_pattern(expr, n_classes);
+        let ordinary = match class_aware {
+            None => scan.classify_assignment(stmts, &scope, at),
+            Some(_) => None,
+        };
+        scope.record(at, name, expr);
+        if let Some((eta_idx, theta_idx, log_transformed)) = class_aware {
+            if !log_transformed || eta_idx >= scan.n_bsv {
                 continue;
             }
             if theta_idx.iter().any(|&t| t >= theta_names.len()) {
@@ -810,10 +945,12 @@ fn detect_mixture_mu_refs(
                 log_transformed,
             };
             set(&eta_name, Some(entry));
-        } else if let Some((eta_idx, _anchor, _log)) = detect_pattern(expr) {
+        } else if let Some((eta_idx, _)) = ordinary {
             // An ordinary mu-ref on the same eta, later in the block: it is what
-            // `detect_mu_refs` will keep, so drop any class-aware entry.
-            if eta_idx < eta_names.len() {
+            // `detect_mu_refs` will keep, so drop any class-aware entry. The same
+            // classifier as `detect_mu_refs_with_owners`, so the two cannot
+            // disagree on which line anchors an eta (#2544).
+            if eta_idx < scan.n_bsv {
                 let eta_name = eta_names[eta_idx].clone();
                 set(&eta_name, None);
             }
@@ -1651,7 +1788,7 @@ fn detect_covariate_mu_refs(
             &owners_and_anchors,
             &entry.theta_names,
         );
-        entry.eta_shared = eta_read_outside_the_group(stmts, owner, eta_idx);
+        entry.eta_shared = eta_read_outside_the_group(stmts, OwnerOf::Name(owner), eta_idx);
     };
     let anchors: Vec<CovariateMuRef> = anchors
         .into_iter()
@@ -1813,10 +1950,38 @@ fn thetas_read_outside_the_group(
 /// `φ` freezing it. The group is not dropped, only routed to the prior-plus-data
 /// engine, which evaluates the data term *with* the shift applied and is
 /// therefore correct for any number of uses.
-fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) -> bool {
-    stmts.iter().any(|s| match s {
+///
+/// `owner` names what is *not* a second use. [`OwnerOf::Name`] skips every assignment
+/// to that name, which is what the #619 groups have always done. [`OwnerOf::Statement`]
+/// (a top-level assignment, compared by address as in [`spread_theta_taint`]) skips that
+/// statement and the assignments to its name *before* it, which it overwrites; one
+/// *after* it is a second use, so `BASE = BASE + 0.5*ETA_E0` drops the anchor (#2544).
+fn eta_read_outside_the_group(stmts: &[Statement], owner: OwnerOf, eta_idx: usize) -> bool {
+    let mut skip = match owner {
+        OwnerOf::Statement(Statement::Assign(name, _)) => OwnerOf::Name(name),
+        other => other,
+    };
+    stmts.iter().any(|s| {
+        if let OwnerOf::Statement(o) = owner {
+            if std::ptr::eq(o, s) {
+                skip = owner;
+                return false;
+            }
+        }
+        eta_read_by(s, skip, eta_idx)
+    })
+}
+
+/// Whether `s` reads `eta_idx`, `skip` being the assignments that do not count
+/// ([`eta_read_outside_the_group`]).
+fn eta_read_by(s: &Statement, skip: OwnerOf, eta_idx: usize) -> bool {
+    match s {
         Statement::Assign(name, expr) => {
-            if name == owner {
+            let skipped = match skip {
+                OwnerOf::Name(n) => name == n,
+                OwnerOf::Statement(o) => std::ptr::eq(o, s),
+            };
+            if skipped {
                 return false;
             }
             let mut reads = false;
@@ -1831,15 +1996,18 @@ fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) 
             branches,
             else_body,
         } => {
-            branches
-                .iter()
-                .any(|(_, body)| eta_read_outside_the_group(body, owner, eta_idx))
-                || else_body
-                    .as_ref()
-                    .is_some_and(|eb| eta_read_outside_the_group(eb, owner, eta_idx))
+            let any = |body: &[Statement]| body.iter().any(|b| eta_read_by(b, skip, eta_idx));
+            branches.iter().any(|(_, body)| any(body)) || else_body.as_deref().is_some_and(any)
         }
         _ => false,
-    })
+    }
+}
+
+/// Which assignment owns an eta, for [`eta_read_outside_the_group`].
+#[derive(Clone, Copy)]
+enum OwnerOf<'a> {
+    Name(&'a str),
+    Statement(&'a Statement),
 }
 
 /// Names (uppercased) whose value depends on `theta_idx`, following assignments
@@ -2786,6 +2954,175 @@ fn classify_indiv_params(
     (eta_infos, theta_transform)
 }
 
+/// Withdraw a scale label whose random effect enters its scale with a constant
+/// coefficient other than ±1 (#1724).
+///
+/// Every label assumes a unit coefficient on its scale: `log P = … + η` for
+/// `LogNormal`, `P = … + η` for `Additive`, `logit P = … + η` for the logit
+/// labels, so `CV%` / `SD` is read straight off ω. However the model spells
+/// `2·η` — `exp(ETA_V) * exp(ETA_V)`, an intermediate multiplied in twice, an
+/// alias added back — the coefficient is `2` and the printed `100·√ω` (31.6%
+/// at ω = 0.1) is not the CV (`√(e^{4ω} − 1)`, 70.1%). Counting the reads
+/// syntactically can never be complete, so the coefficient is measured
+/// instead: the derivative program of `partials` gives `∂P/∂η` exactly, at a
+/// few fixed probe points, and the label becomes `Custom` (with no linked θ)
+/// when the coefficient on its scale is the same at every probe but not ±1.
+/// A sign never changes the CV, so `-exp(η)` and `exp(-η)` keep their label.
+///
+/// Only a **constant** coefficient other than ±1 is withdrawn: a coefficient
+/// that varies (`VSS = V1 + V2` beside a log-normal `V1`, `max(η, 0)`) means
+/// the label describes another variable or is the scale classifier's
+/// question, not this check's. A parameter a consuming block reads is checked
+/// at its final value; an ETA row on an intermediate is checked against every
+/// such parameter, as is a kappa (one label for all its parameters).
+///
+/// A row the derivative program does not hold is not checked: a variable
+/// assigned inside an `if` statement has no partials (nor does anything that
+/// reads it), and a row reading a neural-network output or an unresolved name
+/// cannot be evaluated here. Those keep the label they were given.
+#[allow(clippy::too_many_arguments)]
+fn withdraw_multiplied_scales(
+    partials: &IndivParamPartials,
+    stmts: &[Statement],
+    consumers: &HashSet<String>,
+    theta: &[f64],
+    n_cov: usize,
+    eta_names_bsv: &[String],
+    eta_infos: &mut [crate::types::EtaParamInfo],
+    kappa_types: &mut [crate::types::EtaParamType],
+) {
+    use crate::types::EtaParamType::{self, *};
+    let n = partials.names.len();
+    let n_axes = eta_names_bsv.len() + kappa_types.len();
+    if n == 0 || partials.d_d_eta.iter().any(|r| r.len() != n_axes) {
+        return;
+    }
+    let in_if: HashSet<String> = stmts
+        .iter()
+        .filter(|s| matches!(s, Statement::If { .. }))
+        .flat_map(|s| assigned_vars_in_order(std::slice::from_ref(s)))
+        .collect();
+
+    // A row is evaluable when every variable it reads is an earlier evaluable
+    // row. (A read of a row's partial — its tangent slot — comes with a read of
+    // its value.) An unresolved name or a network output has no value here.
+    let mut known = vec![false; n];
+    let mut latest: HashMap<usize, usize> = HashMap::new();
+    for i in 0..n {
+        let mut ok = !in_if.contains(&partials.names[i]);
+        let mut check = |e: &Expression| match e {
+            Expression::VariableIdx(s) if *s < partials.tangent_base => {
+                ok &= latest.get(s).is_some_and(|&r| known[r])
+            }
+            Expression::Variable(_) | Expression::Covariate(_) | Expression::NnOutput { .. } => {
+                ok = false
+            }
+            _ => {}
+        };
+        visit_expr_nodes(&partials.values[i], &mut check);
+        for d in &partials.d_d_eta[i] {
+            visit_expr_nodes(d, &mut check);
+        }
+        known[i] = ok;
+        latest.insert(partials.slots[i], i);
+    }
+    let final_row = |name: &str| (0..n).rev().find(|&i| partials.names[i] == name);
+    let consumed: Vec<usize> = {
+        let mut rows: Vec<usize> = partials
+            .names
+            .iter()
+            .filter(|m| consumers.contains(&m.to_ascii_uppercase()))
+            .filter_map(|m| final_row(m))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows.retain(|&r| known[r]);
+        rows
+    };
+
+    // `value[p][i]` and `slope[p][k][i]`: row `i`'s value and `∂/∂η_k` at probe `p`.
+    const PROBES: [(f64, f64, f64); 4] = [
+        (1.0, 0.0, 1.0),
+        (1.21, 0.31, 1.9),
+        (0.83, -0.47, 0.6),
+        (1.07, 0.73, 3.3),
+    ];
+    let mut value = Vec::new();
+    let mut slope = Vec::new();
+    for &(ft, fe, fc) in &PROBES {
+        let th: Vec<f64> = theta.iter().map(|t| t * ft + (ft - 1.0) * 0.1).collect();
+        let et: Vec<f64> = (0..n_axes).map(|k| fe * (1.0 + 0.13 * k as f64)).collect();
+        let cv: Vec<f64> = (0..n_cov).map(|c| fc * (1.0 + 0.07 * c as f64)).collect();
+        let mut vals = vec![0.0; n];
+        let mut per_axis = Vec::with_capacity(n_axes);
+        for k in 0..n_axes {
+            let mut vars = vec![0.0_f64; partials.tangent_base + n];
+            let mut d = vec![0.0; n];
+            for i in (0..n).filter(|&i| known[i]) {
+                let v = eval_expression_indexed(&partials.values[i], &th, &et, &cv, &vars, &[]);
+                let dv =
+                    eval_expression_indexed(&partials.d_d_eta[i][k], &th, &et, &cv, &vars, &[]);
+                vars[partials.slots[i]] = v;
+                vars[partials.tangent_base + i] = dv;
+                vals[i] = v;
+                d[i] = dv;
+            }
+            per_axis.push(d);
+        }
+        value.push(vals);
+        slope.push(per_axis);
+    }
+
+    // Whether row `i` reads axis `k` with a constant coefficient other than ±1
+    // on `scale`. A non-finite coefficient at any probe fails a comparison
+    // below, so it never withdraws a label.
+    let multiplied = |i: usize, k: usize, scale: EtaParamType| -> bool {
+        let coef: Vec<f64> = (0..PROBES.len())
+            .map(|p| {
+                let (v, d) = (value[p][i], slope[p][k][i]);
+                match scale {
+                    Additive => d,
+                    LogNormal => d / v,
+                    _ => d / (v * (1.0 - v)),
+                }
+            })
+            .collect();
+        let c0 = coef[0];
+        c0.abs() > 1e-9
+            && coef
+                .iter()
+                .all(|c| (c - c0).abs() <= 1e-7 * c0.abs().max(1.0))
+            && (c0.abs() - 1.0).abs() > 1e-6
+    };
+    let any_multiplied = |rows: &[usize], k: usize, scale: EtaParamType| {
+        rows.iter().any(|&i| multiplied(i, k, scale))
+    };
+
+    for info in eta_infos.iter_mut() {
+        if info.param_type == Custom {
+            continue;
+        }
+        let Some(k) = eta_names_bsv.iter().position(|e| *e == info.eta_name) else {
+            continue;
+        };
+        let x = &info.individual_param_name;
+        let rows: Vec<usize> = if consumers.contains(&x.to_ascii_uppercase()) {
+            final_row(x).filter(|&r| known[r]).into_iter().collect()
+        } else {
+            consumed.clone()
+        };
+        if any_multiplied(&rows, k, info.param_type) {
+            info.param_type = Custom;
+            info.linked_theta = None;
+        }
+    }
+    for (j, t) in kappa_types.iter_mut().enumerate() {
+        if *t != Custom && any_multiplied(&consumed, eta_names_bsv.len() + j, *t) {
+            *t = Custom;
+        }
+    }
+}
+
 /// Shared inputs of the positional ETA classification in [`classify_indiv_params`].
 struct EtaScaleCx<'a> {
     theta_names: &'a [String],
@@ -3308,8 +3645,11 @@ enum LeafReach {
 /// One ancestor on a leaf's path, as [`leaf_scales`]'s fold reads it.
 #[derive(Clone, Copy)]
 enum PathOp {
-    /// `+`, `-`, unary minus (`0 - x`).
+    /// `+`, `-`.
     AddSub,
+    /// Unary minus (`0 - x`): a sign, which no scale's CV depends on, so it
+    /// leaves either state as it is (#1724).
+    Neg,
     /// `*`, `/`.
     MulDiv,
     Exp,
@@ -3326,7 +3666,7 @@ enum PathOp {
 /// not the nearest ancestor. From [`Pending::Sum`], `+`/`-` stay, `exp` opens
 /// [`Pending::Product`], `inv_logit`/`expit` gives `Logit` and anything else
 /// (`*`, `/`, `^`, another function) gives `Custom`. From
-/// [`Pending::Product`], `*` and `/` stay and anything else — `^`, `+`/`-`, a
+/// [`Pending::Product`], `*`, `/` and unary minus stay and anything else — `^`, `+`/`-`, a
 /// function, a second `exp` — gives `Custom`: it changes the shape of the
 /// distribution, as a hand-written Box-Cox `exp((exp(η)^λ - 1)/λ)` or a shift
 /// `TV * exp(η) + TH` does, so `100·√ω` is not its CV. A path still open at
@@ -3349,6 +3689,7 @@ fn leaf_scales(
                 (Pending::Sum, PathOp::Exp) => Pending::Product,
                 (Pending::Sum, PathOp::Logit) => return LeafReach::At(EtaParamType::Logit),
                 (Pending::Product, PathOp::MulDiv) => Pending::Product,
+                (state, PathOp::Neg) => state,
                 _ => return LeafReach::At(EtaParamType::Custom),
             };
         }
@@ -3367,6 +3708,9 @@ fn leaf_scales(
             return;
         }
         let (op, args): (PathOp, [Option<&Expression>; 2]) = match e {
+            Expression::BinOp(l, BinOp::Sub, r) if is_literal_zero(l) => {
+                (PathOp::Neg, [Some(r), None])
+            }
             Expression::BinOp(l, BinOp::Add | BinOp::Sub, r) => {
                 (PathOp::AddSub, [Some(l), Some(r)])
             }
@@ -4315,7 +4659,7 @@ pub fn parse_full_model_with(
     // The stop set is the blocks that consume a parameter (#1662), not the
     // tier-2 `downstream_refs` above: `[derived]` only reports a value.
     let param_consumers = param_consumer_identifiers(blocks, &extracted.named);
-    let kappa_param_types =
+    let mut kappa_param_types =
         classify_kappa_params(&indiv_stmts, n_eta, &kappa_names, &param_consumers);
     if !weighted_kappa_slots.is_empty() {
         // A weighted kappa outside `[individual_parameters]` would read as the
@@ -5371,12 +5715,28 @@ pub fn parse_full_model_with(
             eta_names_bsv.len(),
         ))
     });
-    let all_mu_refs_owned = detect_mu_refs_with_owners(
-        &indiv_stmts,
-        &theta_names,
-        &all_eta_names,
-        &nn_specs_for_ctx,
-    );
+    // Every identifier any *other* block spells, so a theta that reaches the
+    // likelihood outside `[individual_parameters]` (an `[odes]` right-hand side,
+    // a `[derived]` readout) is visible to the exclusivity checks: the additive
+    // mu-refs' (#2544) and the covariate groups' (#619). `[parameters]` is
+    // excluded because it is where the thetas are declared; the only theta a
+    // model may name there is a FIXed one in a kappa weight, which no M-step
+    // moves.
+    let mut outside_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, lines) in blocks.iter() {
+        if key == "parameters" || key == "individual_parameters" {
+            continue;
+        }
+        collect_referenced_identifiers(lines, &mut outside_idents);
+    }
+    let mu_ref_scan = MuRefScan {
+        theta_names: &theta_names,
+        eta_names: &all_eta_names,
+        n_bsv: eta_names_bsv.len(),
+        outside_idents: &outside_idents,
+        nn_specs: &nn_specs_for_ctx,
+    };
+    let all_mu_refs_owned = detect_mu_refs_with_owners(&indiv_stmts, &mu_ref_scan);
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     // Owners of the BSV mu-refs, kept crate-private behind `indiv_param_partials`
     // (#1930): see `IndivParamPartials::mu_ref_owners`.
@@ -5400,19 +5760,6 @@ pub fn parse_full_model_with(
         .collect();
     // Multi-theta typical values (#619): a separate list, never a substitute
     // for `mu_refs` — see `detect_covariate_mu_refs`.
-    // Every identifier any *other* block spells, so a theta that reaches the
-    // likelihood outside `[individual_parameters]` (an `[odes]` right-hand side,
-    // a `[derived]` readout) is visible to the exclusivity check. `[parameters]`
-    // is excluded because it is where the thetas are declared; the only theta a
-    // model may name there is a FIXed one in a kappa weight, which no M-step
-    // moves.
-    let mut outside_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (key, lines) in blocks.iter() {
-        if key == "parameters" || key == "individual_parameters" {
-            continue;
-        }
-        collect_referenced_identifiers(lines, &mut outside_idents);
-    }
     let covariate_mu_refs = detect_covariate_mu_refs(
         &indiv_stmts,
         &theta_names,
@@ -5496,8 +5843,18 @@ pub fn parse_full_model_with(
 
     // Classify [individual_parameters] expressions for the R metadata layer.
     // Uses BSV-only eta names (no kappas).
-    let (eta_param_info, theta_transform) =
+    let (mut eta_param_info, theta_transform) =
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv, &param_consumers);
+    withdraw_multiplied_scales(
+        &indiv_param_partials,
+        &indiv_stmts,
+        &param_consumers,
+        &default_params.theta,
+        referenced_covariates.len(),
+        &eta_names_bsv,
+        &mut eta_param_info,
+        &mut kappa_param_types,
+    );
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
@@ -5809,13 +6166,19 @@ pub fn parse_full_model_with(
     // Class-aware mu-references (#996): detected here rather than in
     // `parse_mixture_block` because the scan needs both the parsed
     // `[individual_parameters]` statements and the mixture's class count.
+    // `model.eta_names` is the BSV etas, the prefix of the scan's `all_eta_names`.
+    let mixture_scan = MuRefScan {
+        theta_names: &model.theta_names,
+        eta_names: &model.eta_names,
+        n_bsv: model.eta_names.len(),
+        outside_idents: &outside_idents,
+        nn_specs: &nn_specs_for_ctx,
+    };
+    let mixture_mu_refs = mixture_spec
+        .as_ref()
+        .map(|spec| detect_mixture_mu_refs(&indiv_stmts, &mixture_scan, spec.n_classes));
     model.mixture = mixture_spec.map(|mut spec| {
-        spec.mu_refs = detect_mixture_mu_refs(
-            &indiv_stmts,
-            &model.theta_names,
-            &model.eta_names,
-            spec.n_classes,
-        );
+        spec.mu_refs = mixture_mu_refs.unwrap_or_default();
         spec
     });
     // A `MIXNUM`-switched typical value that did *not* yield a class-aware
@@ -8817,6 +9180,7 @@ fn parse_event_model_block(
                 // injected `d/dt(__chz)` derivative; the whole-subject time-varying check
                 // (the ODE solve freezes PK params at t=0) guards them, not this list.
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -8909,6 +9273,30 @@ fn parse_event_model_block(
     )?;
     reject_time_in_analytic_hazard(cmt, &hazard_exprs, &needed_indiv_stmts)?;
 
+    // The same parameters in dual-evaluable form, for the exact η-Hessian of the FOCEI
+    // Laplace term (#2437), in the `param_fn` layout below: the family's parameters, then
+    // `loghr` (an absent `loghr` is the `0.0` default either way). `None` keeps the endpoint
+    // on the FD Hessian (see `build_endpoint_expr_program`).
+    let hazard_program = {
+        let family_exprs: [&Option<Expression>; 2] = match family {
+            HazardFamily::Exponential => [&scale_expr, &None],
+            HazardFamily::Weibull => [&scale_expr, &shape_expr],
+            HazardFamily::Gompertz => [&alpha_expr, &gamma_expr],
+        };
+        let ordered: Vec<&Expression> = family_exprs
+            .into_iter()
+            .flatten()
+            .chain(loghr_expr.as_ref())
+            .collect();
+        build_endpoint_expr_program(
+            &ordered,
+            &needed_indiv_stmts,
+            &event_model_covariates,
+            theta_names.len(),
+            eta_names.len(),
+        )
+    };
+
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
     // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
@@ -8968,6 +9356,7 @@ fn parse_event_model_block(
             hazard: HazardSpec::Analytic { family, param_fn },
             recurrence,
             hazard_covariates: event_model_covariates.clone(),
+            hazard_program,
         },
         event_model_covariates,
         event_model_thetas,
@@ -9710,22 +10099,18 @@ fn parse_markov_model_block(
     // Fréchet derivative of `expm`, an exact likelihood gradient) instead of finite-
     // differencing the whole matrix-exponential likelihood.
     //
-    // Built only for the **time-homogeneous** endpoint: an intensity that reads an ODE state
-    // makes `Q` a functional of the PK trajectory, whose derivative needs the state's own
-    // sensitivities (and whose likelihood is an occupancy ODE, not an `expm` — so Van Loan
-    // does not apply). Those keep the FD path, so the program is `None` there.
-    let generator_program = if generator_states.is_empty() {
-        build_ctmm_generator_program(
-            &transitions,
-            &needed_indiv_stmts,
-            &generator_covariates,
-            n_states,
-            theta_names.len(),
-            eta_names.len(),
-        )
-    } else {
-        None
-    };
+    // An intensity that reads an ODE state makes `Q` a functional of the PK trajectory: the
+    // program reads each such state through a var slot, which the likelihood fills with the
+    // dual state solve's values, so the occupancy ODE carries their sensitivities.
+    let generator_program = build_ctmm_generator_program(
+        &transitions,
+        &needed_indiv_stmts,
+        &generator_covariates,
+        &generator_states,
+        n_states,
+        theta_names.len(),
+        eta_names.len(),
+    );
 
     let indiv = needed_indiv_stmts;
     let gen_states = generator_states.clone();
@@ -11491,7 +11876,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 other => {
                     return Err(format!(
                         "vi_final_ofv must be `none` or `laplace`, got `{other}`. For an \
-                         importance-sampling −2 log L, chain `methods = vi, imp` with \
+                         importance-sampling −2 log L, chain `method = [vi, imp]` with \
                          `imp_eval_only = true`."
                     ))
                 }
@@ -15494,8 +15879,9 @@ fn build_ode_spec(
     // that closure: states (all 0 at the time origin) then individual parameters, every
     // name under each case the closure binds; `MACHEPS` is its constant; covariates are
     // not in an init's scope (the closure reads them as 0, as `eval_output_g` does with an
-    // empty snapshot). `None` when any init reads the mixture index (`MIXNUM`, whose value
-    // comes from the class being evaluated) or a name the layout does not bind.
+    // empty snapshot). The mixture index (`MIXNUM`) reads the class being evaluated from
+    // its thread-local (`Op::PushMixNum`), as the closure does. `None` when an init reads a
+    // name the layout does not bind.
     let init_program: Option<Vec<(usize, OdeOutputProgram)>> = (!init_specs.is_empty())
         .then(|| {
             let mut var_idx: HashMap<String, usize> = HashMap::new();
@@ -15512,13 +15898,12 @@ fn build_ode_spec(
                 .iter()
                 .map(|(state_idx, expr)| {
                     let mut e = expr.clone();
-                    let mut mixnum = false;
-                    visit_expr_nodes_mut(&mut e, &mut |node| match node {
-                        Expression::Variable(n) if n.eq_ignore_ascii_case("MACHEPS") => {
-                            *node = Expression::Literal(f64::EPSILON)
+                    visit_expr_nodes_mut(&mut e, &mut |node| {
+                        if let Expression::Variable(n) = node {
+                            if n.eq_ignore_ascii_case("MACHEPS") {
+                                *node = Expression::Literal(f64::EPSILON)
+                            }
                         }
-                        Expression::MixNum => mixnum = true,
-                        _ => {}
                     });
                     resolve_expr_indices(&mut e, &var_idx, &HashMap::new());
                     let mut unresolved = false;
@@ -15527,7 +15912,7 @@ fn build_ode_spec(
                             unresolved = true;
                         }
                     });
-                    if mixnum || unresolved {
+                    if unresolved {
                         return None;
                     }
                     let bc = compile_bytecode(&e);
@@ -15592,7 +15977,6 @@ fn build_ode_spec(
         pk_reads_tafd,
         pk_reads_tad,
         pk_reads_solver_time,
-        has_chz: !chz_state_slots.is_empty(),
         affine_in_states,
         #[cfg(feature = "survival")]
         init_indiv_reads,
@@ -15609,6 +15993,7 @@ fn build_ode_spec(
         hoist: rhs_hoist,
         binding,
         columns: None,
+        f64_rhs: 0,
     };
 
     // One binding (states, parameters, time slots, the lifted parameter-only values) feeds
@@ -15644,8 +16029,11 @@ fn build_ode_spec(
                 u.len(),
                 state_count,
             );
-            // Compiled: no thread-local scratch, no `vars` binding, no hoist cache (recomputing
-            // the parameter-only values measured no slower than keying a cache on them).
+            // Compiled: no thread-local scratch, no `vars` binding, no hoist cache. This is the
+            // closure path, called through `dyn Fn` where nothing outlives one call to hold a
+            // cache in; the steppers' direct calls keep one per solve (`HoistCache`), with the
+            // values bit for bit this kernel's
+            // (`batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop`).
             let sink = match rhs_reg_f64.as_ref() {
                 Some(reg) => {
                     // No `ModelTimeGuard`: the program reads `TIME` through the time
@@ -15864,6 +16252,8 @@ fn build_ode_spec(
         )
     });
     rhs_program.columns = rhs_columns;
+    // The box's heap address is stable when the box moves into the spec.
+    rhs_program.f64_rhs = &*rhs as *const _ as *const () as usize;
 
     // Build the init_fn closure from the extracted `init(state) = expr`
     // directives. It mirrors the RHS variable binding: each individual parameter
@@ -17191,10 +17581,12 @@ fn parse_mixture_block(
                         .to_string(),
                 );
             }
+            let program = compile_ruv_mag_deriv_program(&expr, None, theta_names.len());
             mixing.push(MixingExpr {
                 class,
                 is_logit,
                 expr,
+                program,
             });
             continue;
         }
@@ -17497,10 +17889,141 @@ pub(crate) fn eval_mixing_log_probs(
     }
 }
 
-/// Analytic `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4),
-/// returned as `K × n_theta`. Only the **logit** form is differentiated here
-/// (`p = softmax(g)`), which is the general covariate-dependent case; the `p`
-/// (direct-probability) form returns `None` so the caller routes to FD.
+/// The exact `∂ ln p_ik / ∂ θ_j` (`K × n_theta`) of [`eval_mixing_log_probs`], for either
+/// mixing form: each mixing expression's θ-only program (compiled once, at parse) evaluated
+/// on the scalar reverse tape with θ as inputs, through the
+/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form), and one
+/// sweep per class. A clamped probability has the zero derivative its clamp gives the
+/// objective. `None` on a program that declines (a θ-count mismatch) or a non-finite
+/// result; the callers keep their difference quotients for that.
+pub(crate) fn mixing_logp_grad_exact(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<Vec<f64>>> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
+    rtape_reset();
+    let th: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+    let lp = mixing_logp_g::<R>(spec, &th, covariates)?;
+    let mut out = Vec::with_capacity(lp.len());
+    for &l in &lp {
+        let adj = rsweep::<1>(&[l]);
+        let row: Vec<f64> = th.iter().map(|t| t.idx().map_or(0.0, |i| adj[i])).collect();
+        out.push(row);
+    }
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+}
+
+/// `ln p_ik` over any number type: each mixing expression's θ-only program through the
+/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form). A clamped
+/// probability is a constant, so it carries the zero derivative its clamp gives the
+/// objective.
+fn mixing_logp_g<T: crate::sens::num::vm::VmNum>(
+    spec: &crate::types::MixtureSpec,
+    th: &[T],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<T>> {
+    let k = spec.n_classes;
+    let time = current_model_time();
+    // The programs were compiled once at parse (`MixingExpr::program`).
+    let eval = |m: &crate::types::MixingExpr| -> Option<T> {
+        m.program.eval_g::<T>(th, covariates, time, 0.0)
+    };
+    let clamp = |x: T, lo: f64, hi: f64| -> T {
+        if x.val() < lo {
+            T::from_f64(lo)
+        } else if x.val() > hi {
+            T::from_f64(hi)
+        } else {
+            x
+        }
+    };
+    Some(if spec.mixing.iter().all(|m| m.is_logit) {
+        let mut logits = vec![T::from_f64(0.0); k];
+        for m in &spec.mixing {
+            logits[m.class - 1] = eval(m)?;
+        }
+        let max = logits
+            .iter()
+            .map(|l| l.val())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut sum = T::from_f64(0.0);
+        for &l in &logits {
+            sum = sum + (l - T::from_f64(max)).exp();
+        }
+        let lse = T::from_f64(max) + sum.ln();
+        logits.iter().map(|&l| l - lse).collect()
+    } else {
+        let mut p = vec![T::from_f64(0.0); k];
+        let mut sum = T::from_f64(0.0);
+        for m in &spec.mixing {
+            let v = clamp(eval(m)?, 1e-12, 1.0 - 1e-12);
+            p[m.class - 1] = v;
+            sum = sum + v;
+        }
+        p[k - 1] = clamp(T::from_f64(1.0) - sum, 1e-12, 1.0);
+        let mut tot = T::from_f64(0.0);
+        for &v in &p {
+            tot = tot + v;
+        }
+        p.iter().map(|&v| (v / tot).ln()).collect()
+    })
+}
+
+/// The exact θ-Hessian `∂² ln p_ik / ∂θ_j ∂θ_l` of every class (`K` matrices,
+/// `n_theta × n_theta`), with the gradient rows of [`mixing_logp_grad_exact`]: forward over
+/// reverse, eight θ directions per recording on `DualT<8, R>`, one eight-lane sweep per
+/// class and chunk. `None` where the gradient declines.
+pub(crate) fn mixing_logp_hess_exact(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<(Vec<Vec<f64>>, Vec<nalgebra::DMatrix<f64>>)> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
+    const C: usize = 8;
+    let n = theta.len();
+    let k = spec.n_classes;
+    let mut grad = vec![vec![0.0; n]; k];
+    let mut hess = vec![nalgebra::DMatrix::<f64>::zeros(n, n); k];
+    for start in (0..n.max(1)).step_by(C) {
+        rtape_reset();
+        let leaves: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+        let th: Vec<DualT<C, R>> = leaves
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                let mut g = [R::c(0.0); C];
+                if (start..start + C).contains(&m) {
+                    g[m - start] = R::c(1.0);
+                }
+                DualT { v, g }
+            })
+            .collect();
+        let lp = mixing_logp_g::<DualT<C, R>>(spec, &th, covariates)?;
+        for (cls, y) in lp.iter().enumerate() {
+            if start == 0 {
+                let adj = rsweep::<1>(&[y.v]);
+                for (j, t) in leaves.iter().enumerate() {
+                    grad[cls][j] = t.idx().map_or(0.0, |i| adj[i]);
+                }
+            }
+            let adj = rsweep::<C>(&y.g);
+            for (lane, l) in (start..(start + C).min(n)).enumerate() {
+                for (j, t) in leaves.iter().enumerate() {
+                    hess[cls][(j, l)] = t.idx().map_or(0.0, |i| adj[i * C + lane]);
+                }
+            }
+        }
+    }
+    let finite = grad.iter().flatten().all(|v| v.is_finite())
+        && hess.iter().all(|h| h.iter().all(|v| v.is_finite()));
+    finite.then_some((grad, hess))
+}
+
+/// `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4), returned as
+/// `K × n_theta`: exact for either form ([`mixing_logp_grad_exact`]). Where that declines,
+/// the **logit** form (`p = softmax(g)`) falls back to the central difference below and
+/// the `p` (direct-probability) form returns `None` so the caller routes to FD.
 ///
 /// For the softmax: `∂ ln p_k/∂θ_j = ∂g_k/∂θ_j − Σ_m p_m ∂g_m/∂θ_j`, where the
 /// per-class scores `g_k` are the mixing expressions (reference class `K` has
@@ -17516,6 +18039,9 @@ pub(crate) fn mixing_logp_grad(
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Option<Vec<Vec<f64>>> {
+    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+        return Some(exact);
+    }
     if !spec.mixing.iter().all(|m| m.is_logit) {
         return None; // p-form → FD fallback
     }
@@ -17579,6 +18105,9 @@ pub(crate) fn mixing_logp_grad_fd(
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Vec<Vec<f64>> {
+    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+        return exact;
+    }
     let nt = theta.len();
     let mut out = vec![vec![0.0f64; nt]; spec.n_classes];
     let mut tperturb = theta.to_vec();
@@ -29331,12 +29860,6 @@ pub struct OdeRhsProgram {
     /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
     /// `stmts_read_slots`, which is #1124. Companion to [`Self::pk_reads_tafd`].
     pk_reads_solver_time: bool,
-    /// Does this system carry injected joint-PK-TTE `d/dt(__chz_<cmt>)` accumulator rows?
-    /// The `Vec<usize>` of slots lives on [`crate::ode::OdeSpec::chz_state_slots`]; the
-    /// program only needs the predicate, for the dual SS equilibration's entry assertion
-    /// (#1210) — that path has no accumulator handling and is reachable only if a routing
-    /// gate is widened.
-    has_chz: bool,
     /// One entry per `init(state) = …` directive: `(the state's slot, the individual
     /// parameters the expression reads, as indices into
     /// [`crate::types::CompiledModel::indiv_param_names`])`.
@@ -29363,6 +29886,36 @@ pub struct OdeRhsProgram {
     init_program: Option<Vec<(usize, OdeOutputProgram)>>,
     /// Which per-call binding work this program needs (#1523).
     binding: RhsBindingPlan,
+    /// Address of the `f64` closure built alongside this program (`OdeSpec::rhs`), `0` when
+    /// none: [`Self::direct_f64`] serves exactly that closure and no other.
+    f64_rhs: usize,
+}
+
+/// The `f64` RHS closure's native path as a plain value: the seeds, the `du` reset and the
+/// native call, in the closure's order, with the function looked up once. An integrator
+/// that holds one calls the model's machine code directly at every stage instead of through
+/// the closure (`OdeRhsProgram::direct_f64`).
+pub(crate) struct DirectRhsF64<'a> {
+    native: rhs_regcode::NativeF64<'a>,
+    binding: RhsBindingPlan,
+    state_count: usize,
+    /// The program's parameter-only values for this integration.
+    cache: std::cell::RefCell<rhs_regcode::HoistCache>,
+}
+
+impl DirectRhsF64<'_> {
+    /// The closure's `RhsSink::Value` arm when the native function runs: `true` with `du`
+    /// written bit for bit as the closure writes it; `false` when a slice is shorter than
+    /// the program reads, after which the caller runs the closure itself.
+    #[inline(always)]
+    pub(crate) fn eval(&self, u: &[f64], params: &[f64], t: f64, du: &mut [f64]) -> bool {
+        let seeds = self.binding.f64_seeds(params, t);
+        if self.binding.zero || du.len() != self.state_count {
+            du.fill(0.0);
+        }
+        self.native
+            .run(u, params, &seeds, du, &mut self.cache.borrow_mut())
+    }
 }
 
 /// Streams `Debug` output straight into a hasher, so a compiled program can be
@@ -29379,6 +29932,25 @@ impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
 }
 
 impl OdeRhsProgram {
+    /// `rhs` as direct native calls ([`DirectRhsF64`]): `Some` only when `rhs` is the very
+    /// closure this program was built with (same address) and the program has an `f64`
+    /// native function.
+    pub(crate) fn direct_f64(
+        &self,
+        rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
+    ) -> Option<DirectRhsF64<'_>> {
+        let addr = rhs as *const _ as *const () as usize;
+        if self.f64_rhs == 0 || self.f64_rhs != addr {
+            return None;
+        }
+        Some(DirectRhsF64 {
+            native: self.reg.as_ref()?.native_f64()?,
+            binding: self.binding,
+            state_count: self.state_count,
+            cache: Default::default(),
+        })
+    }
+
     /// Feed the compiled program's **structure** into `h`: every statement (with its
     /// constants and variable slots) and the slot plan, so two programs hash equal
     /// only when they compute the same thing the same way. Debug-only: the MR
@@ -29426,14 +29998,21 @@ impl OdeRhsProgram {
         Some(out)
     }
 
+    /// Whether every `init(...)` directive compiled ([`Self::init_state_g`] serves it).
+    pub(crate) fn has_init_program(&self) -> bool {
+        self.init_program.is_some()
+    }
+
+    /// Drop the compiled init program: the shape of an `init(...)` the compiled form could not
+    /// express, for the test pinning that the walks decline it.
+    #[cfg(test)]
+    pub(crate) fn drop_init_program_for_tests(&mut self) {
+        self.init_program = None;
+    }
+
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
     pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars
-    }
-
-    /// See [`OdeRhsProgram::has_chz`].
-    pub(crate) fn has_chz(&self) -> bool {
-        self.has_chz
     }
 
     /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants
@@ -30320,12 +30899,6 @@ fn compute_covariate_dependent_mask(
     )
 }
 
-/// Widest `(θ, η)` axis count the CTMM generator's dual dispatch specializes.
-/// Above this, [`CtmmGeneratorProgram::eval_generator_duals`] returns `None` and the
-/// endpoint keeps its finite-difference gradient — a fallback, never a wrong answer.
-#[cfg(feature = "markov")]
-pub(crate) const MAX_CTMM_AXES: usize = 24;
-
 /// Compiled, **dual-evaluable** `[markov_model]` transition intensities — the CTMM
 /// analogue of [`IndivParamProgram`] (#759).
 ///
@@ -30334,30 +30907,31 @@ pub(crate) const MAX_CTMM_AXES: usize = 24;
 /// differenced end-to-end (perturb η, rebuild `Q`, redo an `expm` per observation gap).
 /// This snapshot carries the same intensities in *resolved* form — the shared
 /// `Bytecode` the rest of the analytic-sensitivity path uses — so they can be replayed
-/// over `Dual1<M>` with θ and η seeded, yielding an exact `∂Q/∂(θ,η)`.
+/// over any dual type (`eval_generator_g`): through the
+/// scaling-and-squaring `expm` on that type (`markov::endpoint::CtmmTerm`) it gives the
+/// likelihood's exact η-gradient, η-Hessian and θ-derivatives. `∂Q/∂p` inherits the
+/// generator's **row-sum-zero constraint** for free: every intensity is added at its
+/// off-diagonal entry and subtracted from the diagonal, and differentiation is linear.
 ///
-/// Chained through the Van Loan Fréchet derivative of `expm`
-/// ([`markov::matrix_exp_frechet`](crate::markov::matrix_exp_frechet)) this gives the exact
-/// likelihood gradient. Note `∂Q/∂p` inherits the generator's **row-sum-zero constraint**
-/// for free: every intensity is added at its off-diagonal entry and subtracted from the
-/// diagonal, and differentiation is linear, so the derivative of a valid generator is a
-/// valid *direction*. That is the constraint `generator_rate_direction` hand-builds for the
-/// one-rate-at-a-time case, and the reason a naive "one gradient per `Q` entry" API is wrong
-/// (see the `markov` module docs).
-///
-/// Time-**inhomogeneous** endpoints (an intensity reading an ODE state) get no program:
-/// their likelihood is an occupancy ODE, not an `expm`, so Van Loan does not apply.
+/// A time-**inhomogeneous** endpoint (an intensity reading an ODE state) reads each state
+/// through a var slot past the `[individual_parameters]` ones (`state_slots`), which the
+/// caller fills with the state on its own number type: its likelihood is an occupancy ODE,
+/// differentiated through the dual state solve (`markov::endpoint`).
 #[cfg(feature = "markov")]
 #[derive(Debug, Clone)]
 pub struct CtmmGeneratorProgram {
     /// Resolved `[individual_parameters]` statements the intensities read, in
     /// dependency order (already restricted to the transitively-referenced subset).
     stmts: Vec<Statement>,
-    /// Var-slot count the statements above write into.
+    /// Var-slot count: the statements above write the leading ones, the ODE states the
+    /// intensities read fill the rest (`state_slots`).
     n_vars: usize,
     /// `(from, to, intensity)` — one compiled off-diagonal rate per `transition` line.
     rates: Vec<(usize, usize, Bytecode)>,
     n_states: usize,
+    /// `(var slot, ODE state index)` of each state an intensity reads; empty for a
+    /// time-homogeneous endpoint.
+    state_slots: Vec<(usize, usize)>,
     /// Covariate names in the generator's own (sorted) order, for the cov slice.
     cov_names: Vec<String>,
     n_theta: usize,
@@ -30368,74 +30942,95 @@ pub struct CtmmGeneratorProgram {
 
 #[cfg(feature = "markov")]
 impl CtmmGeneratorProgram {
-    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
-    pub(crate) fn n_theta_axis(&self) -> usize {
-        self.n_theta
+    /// The generator `Q` (row-major `S×S`) over any VM number type, θ and η carrying
+    /// whatever derivative structure the caller seeded — each intensity placed at its
+    /// off-diagonal entry and subtracted from the diagonal.
+    /// `None` on a θ/η count shorter than the program reads.
+    pub(crate) fn eval_generator_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        let (mut vars, cov_vec) = self.vars_g(theta, eta, covariates)?;
+        Some(self.generator_at_g(theta, eta, &cov_vec, &mut vars, &[]))
     }
 
-    /// `Q` and `∂Q/∂(θ, η)` at a covariate snapshot, evaluated over `Dual1<M>` with
-    /// θ_m on axis `m` and η_k on axis `n_theta + k`.
-    ///
-    /// Returns `(q, dq)` where `q` is the `S×S` generator and `dq[a]` is `∂Q/∂(axis a)`,
-    /// length `n_axes()`. Both are built by placing each intensity — value and jet — at
-    /// its off-diagonal entry and subtracting it from the diagonal, so each `dq[a]` has
-    /// zero row sums by construction.
-    ///
-    /// `None` above the dispatch cap ([`MAX_CTMM_AXES`]): the endpoint then keeps its FD
-    /// gradient rather than a wrong one.
-    pub(crate) fn eval_generator_duals(
+    /// Whether an intensity reads an ODE state (the time-inhomogeneous endpoint).
+    pub(crate) fn reads_states(&self) -> bool {
+        !self.state_slots.is_empty()
+    }
+
+    /// The `[individual_parameters]` var slots and the covariate slice, once per `(θ, η)`:
+    /// what [`generator_at_g`](Self::generator_at_g) reads at every state.
+    pub(crate) fn vars_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
-        eta: &[f64],
+        theta: &[T],
+        eta: &[T],
         covariates: &HashMap<String, f64>,
-    ) -> Option<(nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>)> {
-        macro_rules! disp {
-            ($($m:literal),+) => {
-                match self.n_axes() {
-                    $($m => Some(self.eval_generator_duals_n::<$m>(theta, eta, covariates)),)+
-                    _ => None,
-                }
-            };
+    ) -> Option<(Vec<T>, Vec<f64>)> {
+        if theta.len() < self.n_theta || eta.len() < self.n_eta {
+            return None;
         }
-        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
-    }
-
-    fn eval_generator_duals_n<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> (nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>) {
-        debug_assert_eq!(M, self.n_axes());
-        let rate_bcs: Vec<&Bytecode> = self.rates.iter().map(|(_, _, bc)| bc).collect();
-        let jets = eval_endpoint_jets::<M>(
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![T::from_f64(0.0); self.n_vars];
+        let mut stack: Vec<T> = Vec::new();
+        eval_statements_g::<T>(
             &self.stmts,
-            self.n_vars,
-            &rate_bcs,
-            &self.cov_names,
-            self.n_theta,
             theta,
             eta,
-            covariates,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &[],
+            &[],
         );
+        Some((vars, cov_vec))
+    }
 
-        let s = self.n_states;
-        let n_axes = self.n_axes();
-        let mut q = nalgebra::DMatrix::<f64>::zeros(s, s);
-        let mut dq = vec![nalgebra::DMatrix::<f64>::zeros(s, s); n_axes];
-        for ((j, k, _), rate) in self.rates.iter().zip(jets.iter()) {
-            q[(*j, *k)] += rate.value;
-            q[(*j, *j)] -= rate.value;
-            for (a, dq_a) in dq.iter_mut().enumerate().take(n_axes) {
-                let g = rate.grad[a];
-                dq_a[(*j, *k)] += g;
-                dq_a[(*j, *j)] -= g;
-            }
+    /// The generator `Q` (row-major) at the ODE state `state` (ignored by a homogeneous
+    /// endpoint), from [`vars_g`](Self::vars_g)'s slots; the state slots are overwritten.
+    pub(crate) fn generator_at_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        cov_vec: &[f64],
+        vars: &mut [T],
+        state: &[T],
+    ) -> Vec<T> {
+        for &(slot, idx) in &self.state_slots {
+            vars[slot] = state.get(idx).copied().unwrap_or(T::from_f64(0.0));
         }
-        (q, dq)
+        let mut stack: Vec<T> = Vec::new();
+        let s = self.n_states;
+        let mut q = vec![T::from_f64(0.0); s * s];
+        for (j, k, bc) in &self.rates {
+            let rate = eval_bytecode_g::<T>(bc, theta, eta, cov_vec, vars, &[], &mut stack);
+            q[j * s + k] = q[j * s + k] + rate;
+            q[j * s + j] = q[j * s + j] - rate;
+        }
+        q
+    }
+
+    /// The generator `Q` at fixed θ over any VM number type, η carrying whatever derivative
+    /// structure the caller seeded: `S×S`, **column-major** (nalgebra's layout), the
+    /// transpose of [`eval_generator_g`](Self::eval_generator_g)'s row-major one, so every
+    /// derivative has zero row sums. The homogeneous CTMM likelihood written once over `T`
+    /// reads it (#2437). `None` where [`eval_generator_g`](Self::eval_generator_g) is.
+    pub(crate) fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        let q = self.eval_generator_g(theta, eta, covariates)?;
+        let s = self.n_states;
+        Some((0..s * s).map(|c| q[(c % s) * s + c / s]).collect())
     }
 }
 
@@ -30443,45 +31038,67 @@ impl CtmmGeneratorProgram {
 /// `None` when the program cannot be represented exactly, in which case the endpoint keeps
 /// its FD gradient: an intensity or an `[individual_parameters]` value that reads an
 /// identifier we cannot bind (which would silently lower to a constant `0.0` push and thus
-/// a silently-wrong derivative), or a `(θ, η)` width past the dual dispatch cap.
+/// a silently-wrong derivative), or no `(θ, η)` axis at all. A width past the gradient's
+/// dual dispatch cap still gets a program: the η-Hessian runs it on η alone (#2437), and
+/// [`CtmmGeneratorProgram::gradient_in_scope`] routes the gradient.
 #[cfg(feature = "markov")]
 fn build_ctmm_generator_program(
     transitions: &[(usize, usize, Expression)],
     needed_indiv_stmts: &[Statement],
     generator_covariates: &[String],
+    generator_states: &[(String, usize)],
     n_states: usize,
     n_theta: usize,
     n_eta: usize,
 ) -> Option<CtmmGeneratorProgram> {
-    if n_theta + n_eta == 0 || n_theta + n_eta > MAX_CTMM_AXES {
+    if n_theta + n_eta == 0 {
         return None;
     }
-    let exprs: Vec<&Expression> = transitions.iter().map(|(_, _, e)| e).collect();
-    let (stmts, n_vars, bcs) =
-        compile_endpoint_exprs(&exprs, needed_indiv_stmts, generator_covariates)?;
+    // A state an intensity reads parses as a `Covariate` leaf; read it through a var slot
+    // instead, so it carries the state's own derivatives.
+    let state_names: Vec<String> = generator_states.iter().map(|(n, _)| n.clone()).collect();
+    let rewritten: Vec<Expression> = transitions
+        .iter()
+        .map(|(_, _, e)| {
+            let mut e = e.clone();
+            visit_expr_nodes_mut(&mut e, &mut |node: &mut Expression| {
+                if let Expression::Covariate(name) = node {
+                    if state_names.contains(name) {
+                        *node = Expression::Variable(name.clone());
+                    }
+                }
+            });
+            e
+        })
+        .collect();
+    let exprs: Vec<&Expression> = rewritten.iter().collect();
+    let (stmts, n_vars, bcs) = compile_endpoint_exprs(
+        &exprs,
+        needed_indiv_stmts,
+        generator_covariates,
+        &state_names,
+    )?;
     let rates: Vec<(usize, usize, Bytecode)> = transitions
         .iter()
         .zip(bcs)
         .map(|((j, k, _), bc)| (*j, *k, bc))
         .collect();
-
+    let first_state_slot = n_vars - state_names.len();
     Some(CtmmGeneratorProgram {
         stmts,
         n_vars,
         rates,
         n_states,
+        state_slots: generator_states
+            .iter()
+            .enumerate()
+            .map(|(i, (_, idx))| (first_state_slot + i, *idx))
+            .collect(),
         cov_names: generator_covariates.to_vec(),
         n_theta,
         n_eta,
     })
 }
-
-/// Widest `(θ, η)` axis count an [`EndpointExprProgram`]'s dual dispatch specializes.
-/// Above this, [`EndpointExprProgram::eval_duals`] returns `None` and the endpoint keeps
-/// its finite-difference gradient — a fallback, never a wrong answer. The same cap as the
-/// CTMM generator's, so both reuse one set of `Dual1<M>` instantiations.
-#[cfg(feature = "survival")]
-pub(crate) const MAX_ENDPOINT_AXES: usize = 24;
 
 /// Resolve the `[individual_parameters]` statements a non-Gaussian endpoint reads and
 /// compile each of `exprs` to bytecode against them — the shared front half of every
@@ -30498,10 +31115,13 @@ fn compile_endpoint_exprs(
     exprs: &[&Expression],
     needed_indiv_stmts: &[Statement],
     covariates: &[String],
+    extra_vars: &[String],
 ) -> Option<(Vec<Statement>, usize, Vec<Bytecode>)> {
     // Var slots for the `[individual_parameters]` values the expressions read, in the
-    // order they are assigned (so a later value may read an earlier one).
-    let var_names = assigned_vars_in_order(needed_indiv_stmts);
+    // order they are assigned (so a later value may read an earlier one), then the
+    // caller's `extra_vars` (the ODE states a CTMM intensity reads), which it fills itself.
+    let mut var_names = assigned_vars_in_order(needed_indiv_stmts);
+    var_names.extend(extra_vars.iter().cloned());
     let var_idx: HashMap<String, usize> = var_names
         .iter()
         .enumerate()
@@ -30548,64 +31168,30 @@ fn compile_endpoint_exprs(
     Some((stmts, n_vars, bcs))
 }
 
-/// Evaluate a compiled endpoint program over `Dual1<M>` — θ_m on axis `m`, η_k on axis
-/// `n_theta + k` — and return one jet per output bytecode. The shared back half of
-/// [`CtmmGeneratorProgram::eval_generator_duals`] and [`EndpointExprProgram::eval_duals`].
-///
-/// A `TIME` leaf (`Op::PushTime`) reads the model-time thread-local, so a caller that
-/// needs a per-record time wraps the call in `with_model_time`, exactly as the `f64`
-/// value path does.
+/// Evaluate a compiled endpoint program over any VM number type, with θ and η carrying
+/// whatever derivative structure the caller seeded, and return one value per output
+/// bytecode. The likelihoods written once over `T` (`EndpointExprProgram::eval_g`,
+/// `CtmmGeneratorProgram::eval_generator_g`) are both this function (#2437).
 #[cfg(feature = "survival")]
-#[allow(clippy::too_many_arguments)]
-fn eval_endpoint_jets<const M: usize>(
+fn eval_endpoint_outputs_g<T: crate::sens::num::vm::VmNum>(
     stmts: &[Statement],
     n_vars: usize,
     outputs: &[&Bytecode],
     cov_names: &[String],
-    n_theta: usize,
-    theta: &[f64],
-    eta: &[f64],
+    theta: &[T],
+    eta: &[T],
     covariates: &HashMap<String, f64>,
-) -> Vec<crate::sens::dual1::Dual1<M>> {
-    use crate::sens::dual1::Dual1;
-    let theta_d: Vec<Dual1<M>> = theta
-        .iter()
-        .enumerate()
-        .map(|(m, &v)| {
-            if m < n_theta && m < M {
-                Dual1::var(v, m)
-            } else {
-                // A θ the expressions cannot reference anyway (the program is sized by
-                // the model's declared θ count, so this is unreachable in practice).
-                Dual1::constant(v)
-            }
-        })
-        .collect();
-    let eta_d: Vec<Dual1<M>> = eta
-        .iter()
-        .enumerate()
-        .map(|(k, &v)| {
-            let dim = n_theta + k;
-            if dim < M {
-                Dual1::var(v, dim)
-            } else {
-                // IOV kappas are appended past the BSV η block and are rejected in an
-                // endpoint expression at parse, so they are correctly seeded as constants.
-                Dual1::constant(v)
-            }
-        })
-        .collect();
+) -> Vec<T> {
     let cov_vec: Vec<f64> = cov_names
         .iter()
         .map(|n| covariates.get(n).copied().unwrap_or(0.0))
         .collect();
-
-    let mut vars = vec![Dual1::<M>::constant(0.0); n_vars];
-    let mut stack: Vec<Dual1<M>> = Vec::new();
-    eval_statements_g::<Dual1<M>>(
+    let mut vars = vec![T::from_f64(0.0); n_vars];
+    let mut stack: Vec<T> = Vec::new();
+    eval_statements_g::<T>(
         stmts,
-        &theta_d,
-        &eta_d,
+        theta,
+        eta,
         &cov_vec,
         &mut vars,
         None,
@@ -30615,9 +31201,7 @@ fn eval_endpoint_jets<const M: usize>(
     );
     outputs
         .iter()
-        .map(|bc| {
-            eval_bytecode_g::<Dual1<M>>(bc, &theta_d, &eta_d, &cov_vec, &vars, &[], &mut stack)
-        })
+        .map(|bc| eval_bytecode_g::<T>(bc, theta, eta, &cov_vec, &vars, &[], &mut stack))
         .collect()
 }
 
@@ -30628,9 +31212,11 @@ fn eval_endpoint_jets<const M: usize>(
 /// The `f64` [`LinearPredictorFn`] tree-walks `Expression`s and can only ever produce
 /// the value, which is why the binary data term was finite-differenced end-to-end. This
 /// snapshot carries the same expressions in *resolved* bytecode form so they can be
-/// replayed over `Dual1<M>` with θ and η seeded, yielding exact `∂/∂(θ, η)`. It is the
-/// [`CtmmGeneratorProgram`] construction minus the generator assembly; both share
-/// `compile_endpoint_exprs` and `eval_endpoint_jets`.
+/// replayed over any dual type (`eval_g`), yielding their exact
+/// derivatives — the binary linear predictor and the analytic hazards' parameters. It is
+/// the [`CtmmGeneratorProgram`] construction minus the generator assembly; both share
+/// `compile_endpoint_exprs`. A `TIME` leaf reads the model-time thread-local, so a caller
+/// that needs a per-record time wraps the call in `with_model_time`.
 #[cfg(feature = "survival")]
 #[derive(Debug, Clone)]
 pub struct EndpointExprProgram {
@@ -30650,65 +31236,38 @@ pub struct EndpointExprProgram {
 
 #[cfg(feature = "survival")]
 impl EndpointExprProgram {
-    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
-    pub(crate) fn n_theta_axis(&self) -> usize {
-        self.n_theta
-    }
-
-    /// Value and `∂/∂(θ, η)` of every output at a covariate snapshot (and at the current
-    /// model time, for a `TIME` leaf). Each entry is `(value, grad)` with `grad` laid out
-    /// θ₀..θ_{T−1}, η₀..η_{E−1}, length [`n_axes`](Self::n_axes).
-    ///
-    /// `None` above the dispatch cap ([`MAX_ENDPOINT_AXES`]): the endpoint then keeps its
-    /// FD gradient rather than a wrong one.
-    pub(crate) fn eval_duals(
+    /// Every output over any VM number type, θ and η carrying whatever derivative structure
+    /// the caller seeded — a second-order η-dual for the η-Hessian (#2437), tape leaves for the
+    /// adjoint's θ block (#2482) — at a covariate snapshot and the current model time (a
+    /// `TIME` leaf). `None` on a θ/η count shorter than the program reads.
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
-        eta: &[f64],
+        theta: &[T],
+        eta: &[T],
         covariates: &HashMap<String, f64>,
-    ) -> Option<Vec<(f64, Vec<f64>)>> {
-        macro_rules! disp {
-            ($($m:literal),+) => {
-                match self.n_axes() {
-                    $($m => Some(self.eval_duals_n::<$m>(theta, eta, covariates)),)+
-                    _ => None,
-                }
-            };
+    ) -> Option<Vec<T>> {
+        if theta.len() < self.n_theta || eta.len() < self.n_eta {
+            return None;
         }
-        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
-    }
-
-    fn eval_duals_n<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Vec<(f64, Vec<f64>)> {
-        debug_assert_eq!(M, self.n_axes());
         let outs: Vec<&Bytecode> = self.outputs.iter().collect();
-        eval_endpoint_jets::<M>(
+        Some(eval_endpoint_outputs_g(
             &self.stmts,
             self.n_vars,
             &outs,
             &self.cov_names,
-            self.n_theta,
             theta,
             eta,
             covariates,
-        )
-        .into_iter()
-        .map(|d| (d.value, d.grad.to_vec()))
-        .collect()
+        ))
     }
 }
 
 /// Resolve + compile a non-Gaussian endpoint's scalar expressions into an
 /// [`EndpointExprProgram`]. `None` — the endpoint keeps its FD gradient — when an
 /// expression cannot be represented exactly (an identifier we cannot bind) or the
-/// `(θ, η)` width is zero or past the dual dispatch cap.
+/// `(θ, η)` width is zero. A width past the gradient's dual dispatch cap still gets a
+/// program: the η-Hessian runs it on η alone (#2437), and
+/// [`EndpointExprProgram::gradient_in_scope`] routes the gradient.
 #[cfg(feature = "survival")]
 fn build_endpoint_expr_program(
     exprs: &[&Expression],
@@ -30717,10 +31276,11 @@ fn build_endpoint_expr_program(
     n_theta: usize,
     n_eta: usize,
 ) -> Option<EndpointExprProgram> {
-    if n_theta + n_eta == 0 || n_theta + n_eta > MAX_ENDPOINT_AXES {
+    if n_theta + n_eta == 0 {
         return None;
     }
-    let (stmts, n_vars, outputs) = compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates)?;
+    let (stmts, n_vars, outputs) =
+        compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates, &[])?;
     Some(EndpointExprProgram {
         stmts,
         n_vars,
@@ -30773,6 +31333,43 @@ pub struct IndivParamProgram {
     /// point at the `CL` slot for (#1356). [`eval_param_values`](Self::eval_param_values)
     /// is the reader; `indiv_param_values_are_var_slot_ordered` pins the layout.
     n_top_level_vars: usize,
+}
+
+thread_local! {
+    /// Spare buffers of [`IndivParamProgram::eval_params_g`] and its cov-static fold: one
+    /// `Vec<Vec<T>>` of empty buffers per element type `T` the thread has used.
+    static VM_VECS: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Most spare buffers [`VM_VECS`] keeps per element type: more than one evaluation
+/// holds at once, so a steady state allocates nothing.
+const VM_VECS_MAX: usize = 8;
+
+/// An empty `Vec<T>` from this thread's pool, or a new one. Taken out of the pool, so a
+/// nested evaluation gets its own.
+fn take_vm_vec<T: 'static>() -> Vec<T> {
+    VM_VECS
+        .with(|p| {
+            p.borrow_mut()
+                .iter_mut()
+                .find_map(|b| b.downcast_mut::<Vec<Vec<T>>>())
+                .and_then(Vec::pop)
+        })
+        .unwrap_or_default()
+}
+
+/// Return a buffer from [`take_vm_vec`] to the pool, emptied.
+fn give_vm_vec<T: 'static>(mut v: Vec<T>) {
+    v.clear();
+    VM_VECS.with(|p| {
+        let mut p = p.borrow_mut();
+        match p.iter_mut().find_map(|b| b.downcast_mut::<Vec<Vec<T>>>()) {
+            Some(spare) if spare.len() < VM_VECS_MAX => spare.push(v),
+            Some(_) => {}
+            None => p.push(Box::new(vec![v])),
+        }
+    });
 }
 
 impl IndivParamProgram {
@@ -30865,26 +31462,33 @@ impl IndivParamProgram {
         covariates: &HashMap<String, f64>,
         nn: &[Vec<T>],
     ) -> Vec<T> {
-        let cov_vec: Vec<f64> = self
-            .cov_names
-            .iter()
-            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
-            .collect();
-        let mut vars = vec![T::from_f64(0.0); self.n_vars];
-        let mut stack: Vec<T> = Vec::new();
+        // Every buffer comes from this thread's pool, cleared and filled exactly as a
+        // fresh one would be, and goes back after.
+        let mut cov_vec: Vec<f64> = take_vm_vec();
+        cov_vec.extend(
+            self.cov_names
+                .iter()
+                .map(|n| covariates.get(n).copied().unwrap_or(0.0)),
+        );
+        let mut vars: Vec<T> = take_vm_vec();
+        vars.resize(self.n_vars, T::from_f64(0.0));
+        let mut stack: Vec<T> = take_vm_vec();
         // Cov-static fold (#485): evaluate the constant-across-(θ,η) slots once in
         // plain f64, seed them as constants (zero derivatives — exactly what they
         // carry), and skip their (pow/exp/log heavy) re-derivation in the generic
         // walk. `skip` empty ⇒ original full path.
         let skip: &[bool] = &self.cov_static_mask;
         if !skip.is_empty() {
-            let theta_v: Vec<f64> = theta.iter().map(|t| t.val()).collect();
+            let mut theta_v: Vec<f64> = take_vm_vec();
+            theta_v.extend(theta.iter().map(|t| t.val()));
             let static_vals = self.eval_cov_static_f64(&theta_v, &cov_vec);
             for (v, &is_static) in skip.iter().enumerate() {
                 if is_static {
                     vars[v] = T::from_f64(static_vals[v]);
                 }
             }
+            give_vm_vec(theta_v);
+            give_vm_vec(static_vals);
         }
         eval_statements_g::<T>(
             &self.stmts,
@@ -30897,10 +31501,15 @@ impl IndivParamProgram {
             skip,
             nn,
         );
-        self.pk_var_slots
+        let out = self
+            .pk_var_slots
             .iter()
             .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0)))
-            .collect()
+            .collect();
+        give_vm_vec(cov_vec);
+        give_vm_vec(vars);
+        give_vm_vec(stack);
+        out
     }
 
     /// Compute the f64 values of the cov-static var slots (the slots flagged in
@@ -30911,7 +31520,8 @@ impl IndivParamProgram {
     /// the returned values — are independent of the η seed used here (#485).
     fn eval_cov_static_f64(&self, theta: &[f64], cov_vec: &[f64]) -> Vec<f64> {
         use crate::sens::dual2::Dual2;
-        let dynamic: Vec<bool> = self.cov_static_mask.iter().map(|&s| !s).collect();
+        let mut dynamic: Vec<bool> = take_vm_vec();
+        dynamic.extend(self.cov_static_mask.iter().map(|&s| !s));
         // Evaluated over a zero-width `Dual2<0>` (no gradient/Hessian axes), NOT
         // native `f64`: the dual divides via `× recip` and raises powers via the
         // dual `powd`, both of which differ from `f64::/` / `f64::powf` by up to
@@ -30926,10 +31536,13 @@ impl IndivParamProgram {
         // `bytecode_is_dynamic`), but this zero-width pass may run inside a seeded
         // evaluation (`ModelNnAxisGuard`); suspend the seeding for its duration so a
         // future static read could not seed an axis a `Dual2<0>` does not have.
-        let theta_d: Vec<Dual2<0>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
-        let eta_zero = vec![Dual2::<0>::constant(0.0); self.n_eta];
-        let mut vars = vec![Dual2::<0>::constant(0.0); self.n_vars];
-        let mut stack: Vec<Dual2<0>> = Vec::new();
+        let mut theta_d: Vec<Dual2<0>> = take_vm_vec();
+        theta_d.extend(theta.iter().map(|&v| Dual2::constant(v)));
+        let mut eta_zero: Vec<Dual2<0>> = take_vm_vec();
+        eta_zero.resize(self.n_eta, Dual2::<0>::constant(0.0));
+        let mut vars: Vec<Dual2<0>> = take_vm_vec();
+        vars.resize(self.n_vars, Dual2::<0>::constant(0.0));
+        let mut stack: Vec<Dual2<0>> = take_vm_vec();
         eval_statements_g::<Dual2<0>>(
             &self.stmts,
             &theta_d,
@@ -30941,7 +31554,14 @@ impl IndivParamProgram {
             &dynamic,
             &[],
         );
-        vars.iter().map(|d| d.value).collect()
+        let mut out: Vec<f64> = take_vm_vec();
+        out.extend(vars.iter().map(|d| d.value));
+        give_vm_vec(dynamic);
+        give_vm_vec(theta_d);
+        give_vm_vec(eta_zero);
+        give_vm_vec(vars);
+        give_vm_vec(stack);
+        out
     }
 
     /// Evaluate every top-level `[individual_parameters]` name in plain `f64`,
@@ -31177,6 +31797,7 @@ impl ScaleDerivProgram {
 /// `var_to_pk_slot`. This lets the analytic outer θ/σ gradient differentiate
 /// `mult(θ)` exactly (a new direct-θ term in `∂R/∂θ`) instead of falling back to
 /// FD for a custom / time-varying σ magnitude.
+#[derive(Debug, Clone)]
 pub struct RuvMagDerivProgram {
     bc: Bytecode,
     n_theta: usize,
@@ -31747,11 +32368,17 @@ fn simplify_expr(expr: &Expression) -> Expression {
         Expression::Power(b, e) => {
             Expression::Power(Box::new(simplify_expr(b)), Box::new(simplify_expr(e)))
         }
-        Expression::Conditional(c, t, e) => Expression::Conditional(
-            c.clone(),
-            Box::new(simplify_expr(t)),
-            Box::new(simplify_expr(e)),
-        ),
+        Expression::Conditional(c, t, e) => {
+            let t = simplify_expr(t);
+            let e = simplify_expr(e);
+            // Both branches the same constant: the condition cannot matter.
+            // This is what keeps the partial of a guarded `if` row that does
+            // not read an axis (`sel == i ? 0 : 0`) the literal `0` (#2471).
+            match (&t, &e) {
+                (Expression::Literal(a), Expression::Literal(b)) if a == b => t,
+                _ => Expression::Conditional(c.clone(), Box::new(t), Box::new(e)),
+            }
+        }
         Expression::Literal(_)
         | Expression::Theta(_)
         | Expression::Eta(_)
@@ -31767,7 +32394,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
 
 // --- Milestone 2: `[individual_parameters]` partial derivatives ---
 //
-// For each top-level assignment `P_i = expr_i` in the `[individual_parameters]`
+// For each assignment `P_i = expr_i` in the `[individual_parameters]`
 // block, precompute the symbolic partial-derivative Expression trees
 //   ∂P_i/∂θ_k  for k in 0..n_theta_base
 //   ∂P_i/∂η_k  for k in 0..n_eta_extended  (BSV η followed by κ)
@@ -31785,12 +32412,12 @@ fn simplify_expr(expr: &Expression) -> Expression {
 // 3-5 — augmented RHS, Form C readout sensitivities, estimator wiring —
 // were reverted in #145; see the field doc on `CompiledModel.indiv_param_partials`.)
 //
-// Top-level `If { … }` statements in `[individual_parameters]` are not
-// differentiated — no in-tree user model uses them and handling them needs
-// branch-specific Conditional handling for the assignment-existence
-// boundary. They are silently skipped (their slot has no row in
-// `IndivParamPartials`); a future milestone can lift this restriction if a
-// real model needs it. `NnOutput` references in indiv params have ∂/∂θ = 0
+// Statement-level `If { … }` blocks are differentiated too (#2471): a selector
+// row records which branch the block takes, and each assignment in a branch
+// is a row guarded on it, so every branch keeps its own partials and the
+// evaluation selects one. Before #2471 they were skipped, so a variable
+// assigned in an `if` had no row and every later reader of it differentiated
+// it as a constant. `NnOutput` references in indiv params have ∂/∂θ = 0
 // (NN weights are treated as a separate axis class, deferred to a later
 // milestone) and the current differentiator correctly returns Literal(0)
 // for them.
@@ -31813,19 +32440,17 @@ fn simplify_expr(expr: &Expression) -> Expression {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // no runtime consumer after #145; see struct doc.
 pub struct IndivParamPartials {
-    /// Indiv-param names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
-    /// `[individual_parameters]` source-declaration order — one row per
-    /// top-level `Assign(name, _)`.
+    /// Row names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
+    /// `[individual_parameters]` source order — one row per `Assign(name, _)`,
+    /// those inside `if` bodies included, and one `if#<n>` row per
+    /// statement-level `if` (its selector, see `selector_base`).
     ///
-    /// CAUTION (issue #357): this is a *subset* of
-    /// `CompiledModel.indiv_param_names`, not a positional twin. A parameter
-    /// assigned only inside `if`/`else` branches and promoted because a
-    /// downstream block references it (e.g. a conditional `CL`) appears in
-    /// `indiv_param_names` but has NO row here — `build_indiv_param_partials`
-    /// skips `Statement::If`, and a piecewise param has no single symbolic
-    /// partial anyway (the AD inner loop falls back to FD; see the `eta_map`
-    /// note in `parse_full_model`). A future AD consumer MUST look partials up
-    /// by name, never zip them positionally against `indiv_param_names`.
+    /// CAUTION (issue #357): this is not a positional twin of
+    /// `CompiledModel.indiv_param_names`. A name assigned more than once has a
+    /// row per assignment — the **last** one holds its final value and
+    /// partials — and the selector rows name no parameter. A consumer MUST
+    /// look partials up by name (`rposition`), never zip them positionally
+    /// against `indiv_param_names`.
     pub(crate) names: Vec<String>,
     /// `d_d_theta[i][k]` = ∂P_i/∂θ_k. Inner Vec length = `n_theta_base`
     /// (user-declared θ count, NOT including NN-weight or diffusion θ which
@@ -31847,8 +32472,21 @@ pub struct IndivParamPartials {
     /// `2^d` paths of a diamond of intermediates was copied `2^d` times and the
     /// parse ran out of memory at depth 30. An upstream partial that simplified
     /// to a leaf (`0`, `ETA_CL`) is substituted in place instead, so zero
-    /// partials still fold away. Equal to `vars.len()` of the primal program.
+    /// partials still fold away. Equal to `vars.len()` of the primal program,
+    /// its selector slots included.
     pub(crate) tangent_base: usize,
+    /// The first selector slot (#2471). Each statement-level `if` in the
+    /// block, nested ones included, owns one slot in
+    /// `selector_base..tangent_base`, written by its `if#<n>` row with the
+    /// 1-based index of the branch taken (`0`: the `else`, or none). Every
+    /// assignment in a branch is the guarded row
+    /// `X = (enclosing guards ∧ sel == i) ? rhs : X`, so its partial is
+    /// `… ? ∂rhs : ∂X` — each branch's partial, selected per evaluation. The
+    /// selector is read once, before the branch rows: re-testing the
+    /// condition per row would switch branches mid-body when the body
+    /// reassigns a variable the condition reads. Equal to `tangent_base` when
+    /// the block has no `if`.
+    pub(crate) selector_base: usize,
     /// The primal variable slot each row assigns, parallel to `names`.
     pub(crate) slots: Vec<usize>,
     /// Each row's right-hand side in resolved form, parallel to
@@ -31917,6 +32555,7 @@ impl IndivParamPartials {
             d_d_theta: Vec::new(),
             d_d_eta: Vec::new(),
             tangent_base: 0,
+            selector_base: 0,
             slots: Vec::new(),
             values: Vec::new(),
             indiv_param_program: None,
@@ -31937,20 +32576,22 @@ impl IndivParamPartials {
     }
 }
 
-/// Compute partial-derivative expressions for every top-level `Assign` in
-/// `stmts` (the `[individual_parameters]` block, BEFORE
-/// `resolve_variable_indices` has bytecode-compiled it). Resolves each
-/// statement's expression locally (without mutating `stmts`), differentiates
-/// w.r.t. every θ/η axis, and threads a per-axis chain context so chained
-/// intermediate references get chain-ruled correctly.
+/// Compute partial-derivative expressions for every assignment in `stmts`
+/// (the `[individual_parameters]` block, BEFORE `resolve_variable_indices` has
+/// bytecode-compiled it). Resolves each statement's expression locally
+/// (without mutating `stmts`), differentiates w.r.t. every θ/η axis, and
+/// threads a per-axis chain context so chained intermediate references get
+/// chain-ruled correctly.
 ///
 /// The chain context maps an upstream row's slot to its *tangent slot*, not to
 /// its partial (see `IndivParamPartials::tangent_base`), so each partial is
 /// the size of its own right-hand side's derivative and the whole program is
 /// linear in the block (#1699).
 ///
-/// Top-level `If` and any non-`Assign` variant is skipped. Returns
-/// `IndivParamPartials::empty()` if there are no top-level Assigns.
+/// A statement-level `if` is part of the program (#2471): its branch is
+/// selected once, by a selector row, and each assignment inside it becomes a
+/// guarded row (see `IndivParamPartials::selector_base`). Any other non-`Assign`
+/// variant is skipped. Returns rows only for what the block assigns.
 fn build_indiv_param_partials(
     stmts: &[Statement],
     var_idx: &HashMap<String, usize>,
@@ -31958,104 +32599,35 @@ fn build_indiv_param_partials(
     n_theta_base: usize,
     n_eta_extended: usize,
 ) -> IndivParamPartials {
-    // Past every primal slot, so a tangent slot never aliases a variable.
-    let tangent_base = var_idx.values().map(|&i| i + 1).max().unwrap_or(0);
-    // Per-axis chain context: variable slot → what a read of it differentiates
-    // to along THIS axis (its tangent slot, or the partial itself when that is
-    // a leaf). Indexed by axis index, populated incrementally as we walk the
-    // assignments in source order.
-    let mut chain_theta: Vec<HashMap<usize, Expression>> =
-        (0..n_theta_base).map(|_| HashMap::new()).collect();
-    let mut chain_eta: Vec<HashMap<usize, Expression>> =
-        (0..n_eta_extended).map(|_| HashMap::new()).collect();
-
-    let mut names: Vec<String> = Vec::new();
-    let mut slots: Vec<usize> = Vec::new();
-    let mut values: Vec<Expression> = Vec::new();
-    let mut d_d_theta: Vec<Vec<Expression>> = Vec::new();
-    let mut d_d_eta: Vec<Vec<Expression>> = Vec::new();
-
-    // A leaf partial is copied into its readers — constant size, and it keeps
-    // `0` foldable by `simplify_expr` — anything larger is read by reference.
-    let chain_entry = |s: &Expression, row: usize| -> Expression {
-        match s {
-            Expression::BinOp(..)
-            | Expression::UnaryFn(..)
-            | Expression::Power(..)
-            | Expression::Conditional(..)
-            | Expression::ThetaGather { .. } => Expression::VariableIdx(tangent_base + row),
-            _ => s.clone(),
-        }
+    // Past every variable slot, so neither a selector nor a tangent slot
+    // aliases a variable; the selectors sit between the two.
+    let selector_base = var_idx.values().map(|&i| i + 1).max().unwrap_or(0);
+    let tangent_base = selector_base + count_if_statements(stmts);
+    let mut b = PartialsBuilder {
+        var_idx,
+        cov_idx,
+        selector_base,
+        tangent_base,
+        next_selector: selector_base,
+        chain_theta: (0..n_theta_base).map(|_| HashMap::new()).collect(),
+        chain_eta: (0..n_eta_extended).map(|_| HashMap::new()).collect(),
+        names: Vec::new(),
+        slots: Vec::new(),
+        values: Vec::new(),
+        d_d_theta: Vec::new(),
+        d_d_eta: Vec::new(),
     };
-
-    for stmt in stmts {
-        let Statement::Assign(name, raw_expr) = stmt else {
-            // If-blocks and any already-resolved variant (defensive — at the
-            // call site `stmts` is the parser's pristine pre-resolve output,
-            // so only Assign/If can appear): skip. Indiv-params with
-            // top-level conditionals get no partials in this milestone.
-            continue;
-        };
-        // Differentiate on a resolved CLONE of the expression — the
-        // caller (`build_pk_param_fn`) will run `resolve_variable_indices`
-        // on `stmts` independently, which destroys the Expression by
-        // compiling it to Bytecode. We can't share that work.
-        let mut resolved = raw_expr.clone();
-        resolve_expr_indices(&mut resolved, var_idx, cov_idx);
-
-        // Slot for this indiv param. `usize::MAX` (the resolve fallback)
-        // would mean the name isn't in `var_idx` — at this call site
-        // that's a parser bug because `[individual_parameters]` names
-        // populate `var_idx` unconditionally; debug-assert so a future
-        // pipeline change doesn't silently drop chain entries.
-        let slot = var_idx.get(name).copied().unwrap_or(usize::MAX);
-        debug_assert!(
-            slot != usize::MAX,
-            "build_indiv_param_partials: indiv-param `{name}` missing from var_idx — \
-             parser pipeline bug (var_idx must be built from the same name list before \
-             differentiation)",
-        );
-        let row = names.len();
-
-        let mut row_theta: Vec<Expression> = Vec::with_capacity(n_theta_base);
-        for k in 0..n_theta_base {
-            let d = differentiate_with_chain(&resolved, DiffAxis::Theta(k), &chain_theta[k]);
-            let s = simplify_expr(&d);
-            // Record this row in the chain context BEFORE pushing — any later
-            // assignment that references slot `k` will chain-rule through it.
-            // Always insert (even Literal(0)) so the chain map's "key present
-            // ⇔ slot is an upstream indiv-param" invariant is robust to zero
-            // partials.
-            if slot != usize::MAX {
-                chain_theta[k].insert(slot, chain_entry(&s, row));
-            }
-            row_theta.push(s);
-        }
-
-        let mut row_eta: Vec<Expression> = Vec::with_capacity(n_eta_extended);
-        for k in 0..n_eta_extended {
-            let d = differentiate_with_chain(&resolved, DiffAxis::Eta(k), &chain_eta[k]);
-            let s = simplify_expr(&d);
-            if slot != usize::MAX {
-                chain_eta[k].insert(slot, chain_entry(&s, row));
-            }
-            row_eta.push(s);
-        }
-
-        names.push(name.clone());
-        slots.push(slot);
-        values.push(resolved);
-        d_d_theta.push(row_theta);
-        d_d_eta.push(row_eta);
-    }
+    b.walk(stmts, None);
+    debug_assert_eq!(b.next_selector, tangent_base, "one selector per if");
 
     IndivParamPartials {
-        names,
-        d_d_theta,
-        d_d_eta,
+        names: b.names,
+        d_d_theta: b.d_d_theta,
+        d_d_eta: b.d_d_eta,
         tangent_base,
-        slots,
-        values,
+        selector_base,
+        slots: b.slots,
+        values: b.values,
         // Attached by the caller (`build_pk_param_fn` site) after the program is
         // compiled; the symbolic-partials builder itself doesn't produce it.
         indiv_param_program: None,
@@ -32066,6 +32638,186 @@ fn build_indiv_param_partials(
         lognormal_eta_chain: None,
         nested_levels: None,
         mu_ref_owners: std::collections::BTreeMap::new(),
+    }
+}
+
+/// Statement-level `if`s in `stmts`, nested ones included: the number of
+/// selector slots `build_indiv_param_partials` allocates.
+fn count_if_statements(stmts: &[Statement]) -> usize {
+    stmts
+        .iter()
+        .map(|s| match s {
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                1 + branches
+                    .iter()
+                    .map(|(_, body)| count_if_statements(body))
+                    .sum::<usize>()
+                    + else_body.as_deref().map_or(0, count_if_statements)
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The state `build_indiv_param_partials` threads through the block, `if`
+/// bodies included.
+struct PartialsBuilder<'a> {
+    var_idx: &'a HashMap<String, usize>,
+    cov_idx: &'a HashMap<String, usize>,
+    selector_base: usize,
+    tangent_base: usize,
+    /// The selector slot the next `if` takes.
+    next_selector: usize,
+    /// Per-axis chain context: variable slot → what a read of it differentiates
+    /// to along THIS axis (its tangent slot, or the partial itself when that is
+    /// a leaf). Indexed by axis index, populated incrementally as the rows are
+    /// emitted in source order.
+    chain_theta: Vec<HashMap<usize, Expression>>,
+    chain_eta: Vec<HashMap<usize, Expression>>,
+    names: Vec<String>,
+    slots: Vec<usize>,
+    values: Vec<Expression>,
+    d_d_theta: Vec<Vec<Expression>>,
+    d_d_eta: Vec<Vec<Expression>>,
+}
+
+impl PartialsBuilder<'_> {
+    /// Emit rows for `stmts`, each assignment guarded by `guard` — the
+    /// conjunction of the selector tests of every enclosing `if` branch, `None`
+    /// at the top level.
+    fn walk(&mut self, stmts: &[Statement], guard: Option<&Condition>) {
+        for stmt in stmts {
+            match stmt {
+                Statement::Assign(name, raw_expr) => {
+                    // Differentiate on a resolved CLONE of the expression — the
+                    // caller (`build_pk_param_fn`) will run `resolve_variable_indices`
+                    // on `stmts` independently, which destroys the Expression by
+                    // compiling it to Bytecode. We can't share that work.
+                    let mut resolved = raw_expr.clone();
+                    resolve_expr_indices(&mut resolved, self.var_idx, self.cov_idx);
+                    // Slot for this indiv param. `usize::MAX` (the resolve fallback)
+                    // would mean the name isn't in `var_idx` — at this call site
+                    // that's a parser bug because `[individual_parameters]` names
+                    // populate `var_idx` unconditionally; debug-assert so a future
+                    // pipeline change doesn't silently drop chain entries.
+                    let slot = self.var_idx.get(name).copied().unwrap_or(usize::MAX);
+                    debug_assert!(
+                        slot != usize::MAX,
+                        "build_indiv_param_partials: indiv-param `{name}` missing from var_idx — \
+                         parser pipeline bug (var_idx must be built from the same name list before \
+                         differentiation)",
+                    );
+                    // Inside a branch the row keeps the slot's current value when
+                    // the branch is not taken, so its partial keeps the current
+                    // tangent: `X = sel == i ? rhs : X` differentiates to
+                    // `sel == i ? ∂rhs : ∂X`, each branch's partial selected per
+                    // evaluation.
+                    let value = match guard {
+                        None => resolved,
+                        Some(g) => Expression::Conditional(
+                            Box::new(g.clone()),
+                            Box::new(resolved),
+                            Box::new(Expression::VariableIdx(slot)),
+                        ),
+                    };
+                    self.push_row(name.clone(), slot, value);
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // The selector holds the 1-based index of the branch taken,
+                    // `0` for the `else` (or none). Its conditions are read once,
+                    // before any branch row runs: a branch that reassigns a
+                    // variable its own condition reads must not switch the rows
+                    // after it to another branch, as re-testing the condition
+                    // per row would.
+                    let sel = self.next_selector;
+                    self.next_selector += 1;
+                    let mut selector = Expression::Literal(0.0);
+                    for (i, (cond, _)) in branches.iter().enumerate().rev() {
+                        let mut c = cond.clone();
+                        resolve_condition_indices(&mut c, self.var_idx, self.cov_idx);
+                        selector = Expression::Conditional(
+                            Box::new(c),
+                            Box::new(Expression::Literal((i + 1) as f64)),
+                            Box::new(selector),
+                        );
+                    }
+                    self.push_row(format!("if#{}", sel - self.selector_base), sel, selector);
+                    let taken = |i: usize| {
+                        let own = Condition::Compare(
+                            Expression::VariableIdx(sel),
+                            CmpOp::Eq,
+                            Expression::Literal(i as f64),
+                        );
+                        match guard {
+                            None => own,
+                            Some(g) => Condition::And(Box::new(g.clone()), Box::new(own)),
+                        }
+                    };
+                    for (i, (_, body)) in branches.iter().enumerate() {
+                        self.walk(body, Some(&taken(i + 1)));
+                    }
+                    if let Some(body) = else_body {
+                        self.walk(body, Some(&taken(0)));
+                    }
+                }
+                // Any already-resolved variant (defensive — at the call site
+                // `stmts` is the parser's pristine pre-resolve output, so only
+                // Assign/If can appear): skip.
+                _ => {}
+            }
+        }
+    }
+
+    /// Differentiate `value` along every axis and append it as the row
+    /// assigning `slot`.
+    fn push_row(&mut self, name: String, slot: usize, value: Expression) {
+        let row = self.names.len();
+        let tangent = self.tangent_base + row;
+        // A leaf partial is copied into its readers — constant size, and it keeps
+        // `0` foldable by `simplify_expr` — anything larger is read by reference.
+        let chain_entry = |s: &Expression| -> Expression {
+            match s {
+                Expression::BinOp(..)
+                | Expression::UnaryFn(..)
+                | Expression::Power(..)
+                | Expression::Conditional(..)
+                | Expression::ThetaGather { .. } => Expression::VariableIdx(tangent),
+                _ => s.clone(),
+            }
+        };
+        let along = |chain: &mut Vec<HashMap<usize, Expression>>,
+                     axis: fn(usize) -> DiffAxis|
+         -> Vec<Expression> {
+            chain
+                .iter_mut()
+                .enumerate()
+                .map(|(k, c)| {
+                    let s = simplify_expr(&differentiate_with_chain(&value, axis(k), c));
+                    // Record this row in the chain context — any later
+                    // assignment that references the slot chain-rules through
+                    // it. Always insert (even Literal(0)) so the chain map's
+                    // "key present ⇔ slot is an upstream row" invariant is
+                    // robust to zero partials.
+                    if slot != usize::MAX {
+                        c.insert(slot, chain_entry(&s));
+                    }
+                    s
+                })
+                .collect()
+        };
+        let row_theta = along(&mut self.chain_theta, DiffAxis::Theta);
+        let row_eta = along(&mut self.chain_eta, DiffAxis::Eta);
+        self.names.push(name);
+        self.slots.push(slot);
+        self.values.push(value);
+        self.d_d_theta.push(row_theta);
+        self.d_d_eta.push(row_eta);
     }
 }
 

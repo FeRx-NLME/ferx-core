@@ -75,6 +75,12 @@ anyway) or with an explicit `{#id}` if the wording has to stay.
 Every relative link must resolve, and so must its `#anchor`. See
 [How an id is generated](#how-an-id-is-generated) before hand-writing one.
 
+External `https://` links are out of R4's reach, since the linter makes no
+network call. The `External links` workflow checks them weekly instead (status
+and `#anchor`), never per PR, so a flaky site cannot redden one. Run the same
+check locally with `tools/check-external-links.py`; `--list` shows what it
+would fetch.
+
 ### Callout titles are not sections
 
 The heading that opens a callout is that callout's **title**. Pandoc lifts it
