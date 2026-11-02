@@ -205,10 +205,44 @@ pub fn run(args: &[String]) -> i32 {
 
 /// Do `a` and `b` name the same existing file?
 fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        // Device and inode: the file itself, so a hard link to an input is
+        // the input too, which comparing canonical paths would miss.
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
+}
+
+/// A line without its comment, as the model parser reads it: from the first
+/// `#` or `//`.
+fn code_of(line: &str) -> &str {
+    match line.find('#').into_iter().chain(line.find("//")).min() {
+        Some(i) => &line[..i],
+        None => line,
+    }
+}
+
+/// The block a `[name]` / `[name INSTANCE]` header opens, lower-cased as the
+/// parser folds it.
+fn header_of(code: &str) -> Option<String> {
+    let inner = code.trim().strip_prefix('[')?.strip_suffix(']')?;
+    Some(inner.split_whitespace().next()?.to_ascii_lowercase())
+}
+
+/// A `key = value` line's key, lower-cased as the `[data]` / `[priors]`
+/// readers fold it.
+fn key_of(code: &str) -> Option<String> {
+    code.split_once('=')
+        .map(|(k, _)| k.trim().to_ascii_lowercase())
 }
 
 /// The `key = value` entries of `[data]` / `[priors]` that name a file.
@@ -216,23 +250,17 @@ fn file_entries(text: &str) -> Vec<(&'static str, String)> {
     let mut block = String::new();
     let mut out = Vec::new();
     for line in text.lines() {
-        let code = line.split('#').next().unwrap_or_default().trim();
-        if let Some(inner) = code.strip_prefix('[').and_then(|c| c.strip_suffix(']')) {
-            block = inner
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string();
+        let code = code_of(line).trim();
+        if let Some(b) = header_of(code) {
+            block = b;
             continue;
         }
-        let Some((key, value)) = code.split_once('=') else {
-            continue;
-        };
-        let key = match (block.as_str(), key.trim()) {
-            ("data", "path") => "[data] path",
-            ("priors", "from_fit") => "[priors] from_fit",
+        let key = match (block.as_str(), key_of(code).as_deref()) {
+            ("data", Some("path")) => "[data] path",
+            ("priors", Some("from_fit")) => "[priors] from_fit",
             _ => continue,
         };
+        let value = code.split_once('=').map_or("", |(_, v)| v);
         let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
         out.push((key, value.to_string()));
     }
@@ -303,19 +331,14 @@ fn notes(text: &str, input: &Path, out: &Path, prior_checked: bool) -> Vec<Strin
 
 /// `text` with its `[priors] from_fit` pointed at `path`.
 fn with_from_fit(text: &str, path: &Path) -> String {
-    let mut block = "";
+    let mut in_priors = false;
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
-        let code = line.split('#').next().unwrap_or_default().trim();
-        if let Some(inner) = code.strip_prefix('[').and_then(|c| c.strip_suffix(']')) {
-            block = if inner.trim() == "priors" {
-                "priors"
-            } else {
-                ""
-            };
+        let code = code_of(line).trim();
+        if let Some(b) = header_of(code) {
+            in_priors = b == "priors";
         }
-        let key = code.split_once('=').map(|(k, _)| k.trim());
-        if block == "priors" && key == Some("from_fit") {
+        if in_priors && key_of(code).as_deref() == Some("from_fit") {
             out.push_str(&format!("  from_fit = \"{}\"\n", path.display()));
         } else {
             out.push_str(line);
@@ -457,19 +480,43 @@ mod tests {
     /// `-o` naming the model or the fit is refused before anything is written.
     #[test]
     fn an_output_that_is_an_input_is_refused() {
+        // Real inputs, so the command would export and write if the guard let it:
+        // a refusal for any other reason would keep the files as well.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/dcm_export");
         let dir = tempfile::tempdir().unwrap();
         let model = dir.path().join("m.ferx");
         let fit = dir.path().join("run.json");
-        std::fs::write(&model, "keep").unwrap();
-        std::fs::write(&fit, "keep").unwrap();
+        std::fs::copy(root.join("model.ferx"), &model).unwrap();
+        std::fs::copy(root.join("fit.json"), &fit).unwrap();
+        let original = |p: &Path| std::fs::read(p).unwrap();
+        let (model_bytes, fit_bytes) = (original(&model), original(&fit));
         let (m, f) = (model.to_str().unwrap(), fit.to_str().unwrap());
-        for out in [m, f] {
-            assert_eq!(run(&args(&["export-dcm", m, "--fit", f, "-o", out])), 2);
+        // Control: a fresh output is written.
+        let fresh = dir.path().join("new.ferx");
+        let fresh_s = fresh.to_str().unwrap();
+        assert_eq!(run(&args(&["export-dcm", m, "--fit", f, "-o", fresh_s])), 0);
+        assert!(fresh.exists());
+        let mut outs = vec![model.clone(), fit.clone()];
+        // A hard link to an input is that input: its path differs, the file
+        // does not.
+        #[cfg(unix)]
+        for (target, name) in [(&model, "m-link.ferx"), (&fit, "fit-link.json")] {
+            let link = dir.path().join(name);
+            std::fs::hard_link(target, &link).unwrap();
+            outs.push(link);
         }
-        assert_eq!(std::fs::read_to_string(&model).unwrap(), "keep");
-        assert_eq!(std::fs::read_to_string(&fit).unwrap(), "keep");
+        for out in &outs {
+            let o = out.to_str().unwrap();
+            assert_eq!(
+                run(&args(&["export-dcm", m, "--fit", f, "-o", o])),
+                2,
+                "{o}"
+            );
+            assert_eq!(original(&model), model_bytes, "{o}");
+            assert_eq!(original(&fit), fit_bytes, "{o}");
+        }
         assert!(same_file(&model, &dir.path().join(".").join("m.ferx")));
-        assert!(!same_file(&model, &dir.path().join("new.ferx")));
+        assert!(!same_file(&model, &fresh));
     }
 
     /// A relative path is flagged when the export lands elsewhere, and only
@@ -527,6 +574,14 @@ mod tests {
             ),
             "{bundle:?}"
         );
+        let spelled = "[Data] // c\n  PATH = \"a.csv\" // c\n[PRIORS]\n  From_Fit = b.json # c\n";
+        assert_eq!(
+            file_entries(spelled),
+            vec![
+                ("[data] path", "a.csv".to_string()),
+                ("[priors] from_fit", "b.json".to_string())
+            ]
+        );
         let absolute = "[data]\n  path = \"/abs/pk.csv\"\n";
         assert!(notes(absolute, Path::new("run.fitrx"), Path::new("x.ferx"), false).is_empty());
     }
@@ -541,13 +596,9 @@ mod tests {
         let model = std::fs::read_to_string(root.join("model.ferx")).unwrap();
         let fit: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&fit_path).unwrap()).unwrap();
+        assert_eq!(fit["theta_names"][0], "TVV");
         let dir = tempfile::tempdir().unwrap();
         let m = dir.path().join("m.ferx");
-        std::fs::write(
-            &m,
-            format!("{model}\n[priors]\n  from_fit = \"src.json\"\n"),
-        )
-        .unwrap();
         let out = dir.path().join("out.ferx");
         let run_with = |source_tvv: &str| {
             let mut src = fit.clone();
@@ -566,15 +617,22 @@ mod tests {
             ]));
             (code, out.exists())
         };
-        assert_eq!(fit["theta_names"][0], "TVV");
-        assert_eq!(run_with("OTHER"), (1, false));
-        let text = std::fs::read_to_string(&m).unwrap();
-        let err = check_prior_import(&text_export(&text, &fit_path), Some(dir.path())).unwrap_err();
-        assert!(
-            err.contains("no prior could be imported") && err.contains("remove `from_fit`"),
-            "{err}"
-        );
-        assert_eq!(run_with("TVV"), (0, true));
+        // Every spelling the parser reads as the same block and key.
+        for priors in [
+            "[priors]\n  from_fit = \"src.json\"\n",
+            "[PRIORS]   // header case and `//` as the parser reads them\n  FROM_FIT = src.json // c\n",
+        ] {
+            std::fs::write(&m, format!("{model}\n{priors}")).unwrap();
+            assert_eq!(run_with("OTHER"), (1, false), "{priors}");
+            let text = std::fs::read_to_string(&m).unwrap();
+            let err =
+                check_prior_import(&text_export(&text, &fit_path), Some(dir.path())).unwrap_err();
+            assert!(
+                err.contains("no prior could be imported") && err.contains("remove `from_fit`"),
+                "{priors}: {err}"
+            );
+            assert_eq!(run_with("TVV"), (0, true), "{priors}");
+        }
     }
 
     fn text_export(model: &str, fit_path: &Path) -> String {

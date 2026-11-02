@@ -326,7 +326,7 @@ fn parse_for_validation(text: &str) -> Result<crate::types::CompiledModel, Strin
 /// `center` / `scale` bit for bit. Comments, layout and `init` (a starting value
 /// the fitted weights supersede) may differ. The rest of the model must match
 /// too — every equation, the error model, which parameters exist and which are
-/// `FIX` — up to comments, layout, the numbers in `[parameters]`, `[data] path`
+/// `FIX` — up to comments, layout, the values in `[parameters]`, `[data] path`
 /// and `[priors]` (see `model_lines`).
 ///
 /// This is the entry point to use whenever the model text and the fit arrive
@@ -459,18 +459,14 @@ fn check_same_networks(model_text: &str, fitted_text: &str) -> Result<(), String
 /// `(normalised, original)`.
 ///
 /// Left out, since they cannot change what the model predicts at the fit:
-/// comments and blank lines; the numbers of `[parameters]` (starting values,
-/// bounds and inline priors — the export writes the fit's estimates over them);
+/// comments and blank lines; the values in `[parameters]` (starting values,
+/// bounds and inline priors — the export writes the fit's estimates over them;
+/// a kappa `weight` and a vector θ's size are compared);
 /// a `[covariate_nn]` `init` (a starting value the fitted weights supersede);
 /// `[data] path` (which file, not how it is read); and `[priors]`, which
 /// shapes only a refit. Everything else — every equation, the error model,
 /// which parameters exist and which are `FIX`, `[fit_options]` — must match.
 fn model_lines(text: &str) -> Vec<(String, &str)> {
-    static TOKEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"[A-Za-z_]\w*|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?").unwrap()
-    });
-    static SIGNED: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"([(,~=\[])[-+]#").unwrap());
     let mut block = String::new();
     let mut out = Vec::new();
     // A header counts only once a line of its block does, so a block left empty
@@ -491,23 +487,47 @@ fn model_lines(text: &str) -> Vec<(String, &str)> {
             "priors" => continue,
             "covariate_nn" if norm.to_ascii_lowercase().starts_with("init=") => continue,
             "data" if norm.to_ascii_lowercase().starts_with("path=") => continue,
-            "parameters" => {
-                let masked = TOKEN.replace_all(&norm, |c: &regex::Captures| {
-                    let t = &c[0];
-                    if t.starts_with(|ch: char| ch.is_ascii_digit() || ch == '.') {
-                        "#".to_string()
-                    } else {
-                        t.to_string()
-                    }
-                });
-                norm = SIGNED.replace_all(&masked, "$1#").into_owned();
-            }
+            "parameters" => norm = mask_parameter_values(&norm),
             _ => {}
         }
         out.extend(header.take());
         out.push((norm, line));
     }
     out
+}
+
+/// A whitespace-free `[parameters]` line with its *values* masked: the starting
+/// value, bounds and inline `prior(...)` arguments, which the export overwrites
+/// or which shape only a refit. A `weight = …` expression (it scales κ, so it is
+/// part of the model) and a vector θ's `[size]` are kept as written.
+fn mask_parameter_values(norm: &str) -> String {
+    static NUMBER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"[A-Za-z_]\w*|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?").unwrap()
+    });
+    static SIGNED: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"([(,~=\[])[-+]#").unwrap());
+    static PRIOR: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)prior\([^)]*\)").unwrap());
+    static VECTOR: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^theta\w+\[[^\]]*\]").unwrap());
+    let mask = |s: &str| {
+        let masked = NUMBER.replace_all(s, |c: &regex::Captures| {
+            let t = &c[0];
+            if t.starts_with(|ch: char| ch.is_ascii_digit() || ch == '.') {
+                "#".to_string()
+            } else {
+                t.to_string()
+            }
+        });
+        SIGNED.replace_all(&masked, "$1#").into_owned()
+    };
+    let line = PRIOR.replace_all(norm, "prior(#)");
+    let (head, tail) = match line.to_ascii_lowercase().find("weight=") {
+        Some(i) => line.split_at(i),
+        None => (line.as_ref(), ""),
+    };
+    let keep = VECTOR.find(head).map_or(0, |m| m.end());
+    format!("{}{}{tail}", &head[..keep], mask(&head[keep..]))
 }
 
 /// The whole-model half of the check behind [`export_dcm_from_fit`]: the model
@@ -533,7 +553,7 @@ fn check_same_model(model_text: &str, fitted_text: &str) -> Result<(), String> {
             Err(format!(
                 "the model is not the one the fit was made with: the model has {} where \
                  the fit's model has {}; export from the fit's `.fitrx` bundle, or from \
-                 the model file the fit was made with. Only comments, layout, the numbers \
+                 the model file the fit was made with. Only comments, layout, the values \
                  in [parameters], a [covariate_nn] `init`, `[data] path` and [priors] may \
                  differ",
                 show(a),

@@ -672,7 +672,7 @@ fn a_fit_made_with_a_different_network_is_refused() {
 /// The model must be the fit's own outside the networks too: a changed
 /// equation, error model, parameter set or `FIX` keeps every network field and
 /// every weight name, and would otherwise be exported at estimates made for a
-/// different model. Comments, layout, the numbers in [parameters] and the data
+/// different model. Comments, layout, the values in [parameters] and the data
 /// path may differ.
 #[test]
 fn a_model_changed_outside_the_networks_is_refused() {
@@ -732,6 +732,47 @@ fn a_model_changed_outside_the_networks_is_refused() {
         "{err}"
     );
     assert!(err.contains("`V  = TVV * exp(ETA_V)`"), "{err}");
+}
+
+/// Only values are masked in [parameters]: a kappa `weight` expression scales
+/// κ and a vector θ's size sets how many there are, so a change to a number in
+/// either is a different model. The values around them still may differ.
+#[test]
+fn parameter_numbers_that_define_the_model_are_compared() {
+    let mask = mask_parameter_values;
+    assert_eq!(
+        mask("kappaK~0.09weight=2*NARMprior(0.1,rse=30%)"),
+        mask("kappaK~0.5weight=2*NARMprior(0.3,rse=10%)")
+    );
+    assert_ne!(
+        mask("kappaK~0.09weight=2*NARM"),
+        mask("kappaK~0.09weight=3*NARM")
+    );
+    assert_ne!(
+        mask("kappaK~0.09WEIGHT=2*NARM"),
+        mask("kappaK~0.09WEIGHT=3*NARM")
+    );
+    assert_eq!(mask("thetaP[800](1,0,9)"), mask("thetaP[800](2,-1,8)"));
+    assert_ne!(mask("thetaP[800](1,0,9)"), mask("thetaP[801](1,0,9)"));
+    assert_ne!(mask("thetaP(1,0,9)"), mask("thetaP(1,0,9)FIX"));
+    assert_eq!(mask("omegaE~0.1(sd)"), mask("omegaE~-2.5e-1(sd)"));
+
+    // Through the whole check: a changed kappa weight is refused.
+    let with_kappa = |weight: &str| {
+        FIXTURE_MODEL
+            .replace(
+                "  omega ETA_KA ~ 0.2",
+                &format!("  omega ETA_KA ~ 0.2\n  kappa KAPPA_CL ~ 0.09 weight = {weight}"),
+            )
+            .replace("exp(ETA_CL)", "exp(ETA_CL + KAPPA_CL)")
+    };
+    let mut fit = fixture_fit(Some(&with_kappa("2 * NARM")));
+    fit.omega_iov = Some(nalgebra::DMatrix::from_element(1, 1, 0.0456));
+    fit.kappa_names = vec!["KAPPA_CL".into()];
+    let opts = DcmExportOptions::default();
+    export_dcm_from_fit(&with_kappa("2 * NARM"), &fit, &opts).unwrap();
+    let err = export_dcm_from_fit(&with_kappa("3 * NARM"), &fit, &opts).unwrap_err();
+    assert!(err.contains("weight = 3 * NARM"), "{err}");
 }
 
 /// The committed `fit.json` the CLI test reads is this fixture's fit: the
