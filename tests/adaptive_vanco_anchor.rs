@@ -77,13 +77,16 @@ const N_INCREASE_RULE_FIRINGS: usize = 7;
 /// change, not by which rule fired" semantics of `AdaptiveSubjectMetrics`.
 const N_DOSE_INCREASES: usize = 6;
 
-/// Cross-solver trough band (mg/L), ferx (RK45 at the model's default tolerances) against
-/// mrgsolve (LSODA at 1e-10) at η = 0. The worst gap over the 14 decisions, printed by the
-/// test, is 1.045e-9 mg/L on Linux aarch64 (`tools/linux-test.sh`) and identical on macOS
-/// arm64, so 5e-9 is 4.8× headroom; `expected.md`'s 9 decimals floor the comparison at
-/// 5e-10. With the drawn η the gap was 3.71e-4, all one sign (#2580). A dosing defect worth
-/// naming moves a trough by orders of magnitude more (one 25% titration step is ~1 mg/L at
-/// steady state).
+/// Trough band (mg/L) against mrgsolve (LSODA at rtol = atol = 1e-10, frozen to 9 decimals)
+/// at η = 0. The worst gap over the 14 decisions, printed by the test, is 1.045e-9 mg/L on
+/// Linux aarch64 (`tools/linux-test.sh`) and identical on macOS arm64, so 5e-9 is 4.8×
+/// headroom. That gap is the **reference's** error, not ferx's: against the exact 1-cpt
+/// infusion closed form the frozen troughs are off by −1.045e-9 … +2.6e-10, and ferx's gap
+/// to the kit is the mirror of that at every decision to 4 figures, so ferx sits on the
+/// closed form to well below 1e-12 (#2582 review). The band is therefore set by the kit;
+/// re-measure it after any re-freeze. With the drawn η the gap was 3.71e-4, all one sign
+/// (#2580). A dosing defect worth naming moves a trough by orders of magnitude more (one 25%
+/// titration step is ~1 mg/L at steady state).
 const SIGNAL_TOL: f64 = 5e-9;
 
 /// Frozen AUC-target attainment: 8 of the 13 closed daily windows have AUC24 in
@@ -112,11 +115,13 @@ const REF_AUC24: [f64; REF_AUC_WINDOWS] = [
 /// (`tools/linux-test.sh`), identical in every printed digit on macOS arm64, by bisecting
 /// each window's AUC through the public band: the worst window is window 0 at −2.75e-6 and
 /// the rest lie within ±7.5e-7, so 1e-5 is 3.6× headroom. With the drawn η every window read
-/// low by 1.07e-5 to 1.63e-5 (#2580). This is a cross-engine band, not ferx's own accuracy:
-/// the engines differ in solver (RK45 vs LSODA) and in quadrature (a 128-panel trapezoid on
-/// soft samples vs an AUC compartment), and the remainder is not split between the two.
-/// Windows 11 and 12, the closest pair, differ by 1.4e-4 relative, so the band isolates
-/// each window.
+/// low by 1.07e-5 to 1.63e-5 (#2580). The remainder is all ferx's 128-panel trapezoid: on
+/// the exact 1-cpt curve (uniform grid plus the 1 h infusion-end node) it gives −2.748e-6
+/// for window 0 and −7.47e-7 for window 1, the measurement to 4 figures, while the kit's AUC
+/// compartment is within 1.6e-11 of the exact integral in every window (#2582 review). The
+/// sign follows the Euler–Maclaurin term `h²·k·(C_start − C_end) / (12·AUC)`: negative while
+/// the troughs climb, positive once they settle. Windows 11 and 12, the closest pair, differ
+/// by 1.4e-4 relative, so the band isolates each window.
 const AUC_REL_TOL: f64 = 1e-5;
 
 /// Fast guard: a typo in `adaptive_vanco_auc.ferx` — which exercises new DSL surface,

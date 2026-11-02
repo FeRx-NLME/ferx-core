@@ -287,14 +287,14 @@ const REF_AUC24: [f64; 7] = [
     261.270558, 336.037198, 459.171369, 551.095341, 548.295417, 507.064148, 450.456723,
 ];
 
-/// Relative band of each ferx AUC24 against mrgsolve's (#943), the band the constant-path
-/// vanco anchor used before it moved to η = 0 (#2580). Measured on Linux aarch64 (`tools/linux-test.sh`), identical in every
-/// printed digit on macOS arm64: the windows read +1.2e-6 to +5.3e-6 relative, so 5e-5 is at least
-/// 9× headroom. This is a cross-engine band (RK45 + a trapezoid on soft samples vs
-/// LSODA + an AUC compartment), not ferx's own accuracy; the kit has a constant `V` and no
-/// `[scaling]`, so it checks the exposure of the per-segment trajectory, and the readout
-/// conversion under κ and covariates is pinned by the closed forms in
-/// `src/api/tests/adaptive_auc_tv_tests.rs`.
+/// Relative band of each ferx AUC24 against mrgsolve's (#943), the band the constant-path vanco
+/// anchor used before it moved to η = 0 (#2580). Measured on Linux aarch64
+/// (`tools/linux-test.sh`), identical in every printed digit on macOS arm64: the windows read
+/// +1.2e-6 to +5.3e-6 relative, so 5e-5 is at least 9× headroom. This is a cross-engine band
+/// (RK45 + a trapezoid on soft samples vs LSODA + an AUC compartment), not ferx's own accuracy;
+/// the kit has a constant `V` and no `[scaling]`, so it checks the exposure of the per-segment
+/// trajectory, and the readout conversion under κ and covariates is pinned by the closed forms
+/// in `src/api/tests/adaptive_auc_tv_tests.rs`.
 const AUC_REL_TOL: f64 = 5e-5;
 
 /// Each window's AUC24 matches mrgsolve's to [`AUC_REL_TOL`] (#943): the exposure integral

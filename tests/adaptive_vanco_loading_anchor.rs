@@ -55,13 +55,15 @@ const REF_LADDER: [(f64, f64, f64); 6] = [
 /// re-issues the converged dose (trough in [10, 15]), recorded by route.
 const N_INCREASE_RULE_FIRINGS: usize = 5;
 
-/// Cross-solver trough band (mg/L), ferx (RK45 at the model's default tolerances) against
-/// mrgsolve (LSODA at 1e-10) at η = 0. The worst gap over the 6 decisions, printed by the
-/// test, is 6.004e-10 mg/L on Linux aarch64 (`tools/linux-test.sh`) and identical on macOS
-/// arm64, so 5e-9 is 8.3× headroom; `expected.md`'s 9 decimals floor the comparison at
-/// 5e-10, which is why the headroom is wider than the vanco anchor's. With the drawn η the
-/// gap was 2.99e-4, all one sign (#2580). A dropped loading dose moves the day-1 trough by
-/// ~5.6 mg/L.
+/// Trough band (mg/L) against mrgsolve (LSODA at rtol = atol = 1e-10, frozen to 9 decimals)
+/// at η = 0. The worst gap over the 6 decisions, printed by the test, is 6.004e-10 mg/L on
+/// Linux aarch64 (`tools/linux-test.sh`) and identical on macOS arm64, so 5e-9 is 8.3×
+/// headroom. That gap is the **reference's** error, not ferx's: against the exact 1-cpt bolus
+/// closed form the frozen troughs are off by −6.004e-10 … +1.9e-10, and ferx's gap to the kit
+/// is the mirror of that at every decision, so ferx sits on the closed form (#2582 review).
+/// The band is therefore set by the kit; re-measure it after any re-freeze. With the drawn η
+/// the gap was 2.99e-4, all one sign (#2580). A dropped loading dose moves the day-1 trough
+/// by ~5.6 mg/L.
 const SIGNAL_TOL: f64 = 5e-9;
 
 /// The pre-scheduled loading dose (mg), carried on the subject, not in the ledger.

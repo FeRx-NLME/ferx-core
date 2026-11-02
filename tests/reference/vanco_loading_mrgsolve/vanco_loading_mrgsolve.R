@@ -148,7 +148,8 @@ md <- c(
   "",
   "ferx (`tests/adaptive_vanco_loading_anchor.rs`), run at a supplied eta = 0 (the",
   "typical-value patient simulated here), reproduces this maintenance ladder",
-  "dose-for-dose and the troughs to ~1e-9 mg/L (#2580).",
+  "dose-for-dose and the troughs to ~1e-9 mg/L (#2580); that gap is this table's own",
+  "error, since ferx sits on the exact 1-cpt bolus closed form (#2582).",
   "The loading dose is integrated by ferx's base-regimen path (#702) and the controller",
   "titrates on top of it -- exactly what this reference exercises.")
 auc_tbl <- c(

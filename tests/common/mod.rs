@@ -230,6 +230,9 @@ pub fn windows_in_band(res: &ferx_core::AdaptiveSimulationResult) -> usize {
 /// an mrgsolve kit simulates. A model's `omega ~ 1e-10` still draws an η of order 1e-5,
 /// which offsets every trough and AUC one-sidedly against such a kit — the whole of the
 /// gap the vanco anchors once attributed to the solvers. Seed 1, as every kit run uses.
+///
+/// η only: on an IOV model κ is still drawn, so the run is not the typical-value patient
+/// there. Both callers have no κ.
 pub fn simulate_from_spec_at_typical_value(
     model: &ferx_core::CompiledModel,
     pop: &ferx_core::types::Population,
