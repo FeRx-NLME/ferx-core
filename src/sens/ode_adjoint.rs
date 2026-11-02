@@ -438,8 +438,7 @@ pub(crate) fn subject_adjoint_gradient_and_mode_at(
         Some(&mut *out),
     );
     if g.is_none() {
-        out.eta_dx = None;
-        out.hessian = None;
+        out.clear();
     }
     g
 }
@@ -3277,6 +3276,14 @@ pub(crate) fn exact_obs_grads_into(
     true
 }
 
+/// IOV scores FREM rows by a sentinel, not the kernel's `l`, so the kernel's exact inner
+/// Hessian is not that subject's (as `exact_htilde` and `exact_inner_gradient_in` decline).
+/// The one decline of [`exact_inner_hessian`] that a quadrature gradient pass does not
+/// share, so that pass hands back no Hessian there either (#2585 review #4).
+fn iov_frem_mismatch(model: &CompiledModel, subject: &Subject) -> bool {
+    model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0)
+}
+
 /// The exact conditional Hessian `∇²_η l` at `eta`: the kernel's `l` over a second-order
 /// η-dual whose predictions carry `(f, G, Q)` from one canonical recording. The analytic
 /// replacement for a finite-difference posterior Hessian.
@@ -3316,10 +3323,7 @@ pub(crate) fn exact_inner_hessian(
         h.iter().all(|v| v.is_finite()).then_some(h)
     }
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
-    // IOV scores FREM rows by a sentinel, not the kernel's `l` (as `exact_htilde` and
-    // `exact_inner_gradient_in` decline).
-    let iov_mismatch = model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0);
-    if iov_mismatch {
+    if iov_frem_mismatch(&model, subject) {
         return None;
     }
     // A subject's non-Gaussian records add their term's exact η-Hessian.
@@ -4306,10 +4310,7 @@ fn run<const N: usize, const M: usize>(
         return None;
     }
     // Output `o`'s adjoint at a recorded input: every chunk but the last is full.
-    let out_adj = |o: usize, x: R| -> f64 {
-        let (lanes, _, adj) = &chunks[o / DX_LANES];
-        x.idx().map_or(0.0, |i| adj[i * lanes + o % DX_LANES])
-    };
+    let out_adj = |o: usize, x: R| -> f64 { lane_adj(&chunks, o, x) };
     let psi_of = |x: R| out_adj(0, x);
 
     // ---- 4. the outputs' seeds on the taped predictions, one sweep per chunk to θ ------
@@ -4423,6 +4424,14 @@ pub(crate) struct ModeOut {
     pub(crate) want_hessian: bool,
     pub(crate) eta_dx: Option<Vec<DVector<f64>>>,
     pub(crate) hessian: Option<DMatrix<f64>>,
+}
+
+impl ModeOut {
+    /// Drop the products, keeping what is wanted.
+    pub(crate) fn clear(&mut self) {
+        self.eta_dx = None;
+        self.hessian = None;
+    }
 }
 
 #[cfg(test)]
@@ -5083,6 +5092,14 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let node_qr: Vec<R> = ng
         .map(|ng| ng.nodes.iter().map(|(q, _)| rinput(*q)).collect())
         .unwrap_or_default();
+    // Node prediction rows f_j(b) = f_j + G_j·(b − b_j), with the node values as leaves.
+    let node_fr: Vec<Vec<R>> = node_preds
+        .iter()
+        .map(|ps| ps.iter().map(|p| rinput(p.v)).collect())
+        .collect();
+    // Every node an adjoint is read at below is one of the inputs recorded above, as in
+    // [`run`], so the response's lane sweeps keep their adjoints for this prefix only.
+    let n_in = crate::sens::rtape::rtape_len();
     // The anchor H_a on the tape: the exact inner Hessian from the predictions' (f, G, Q),
     // or FOCEI's H̃.
     let mut h_a: Vec<Vec<R>> = if exact {
@@ -5101,11 +5118,6 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     // both take the same branch).
     let lh = factor_anchor(&mut h_a, &pr.omega.inv)?;
     let half_logdet = R::c(0.5) * crate::sens::focei_kernel::chol_logdet(&lh);
-    // Node prediction rows f_j(b) = f_j + G_j·(b − b_j), with the node values as leaves.
-    let node_fr: Vec<Vec<R>> = node_preds
-        .iter()
-        .map(|ps| ps.iter().map(|p| rinput(p.v)).collect())
-        .collect();
     let ng_q = ng_r.as_ref().map_or(R::c(0.0), |n| n.q);
     let a = if grid.is_empty() {
         inner_l(ctx, &fr, &er, &pr, None)? + ng_q + half_logdet
@@ -5316,7 +5328,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let response = match &eta_dx {
         Some(o) if o.want_dx && at_mode => {
             let rows = eta_dx_outputs::<N>(&h_inner, &lg, active.min(N), n_bsv.min(active).min(N));
-            let chunks = sweep_lane_chunks(&rows);
+            let chunks = sweep_lanes(&rows, n_in);
             let mut tas = Vec::with_capacity(rows.len());
             for r in 0..rows.len() {
                 tas.push(sweep(TapeAdj::Lane(&chunks, r), true)?.1);
@@ -5365,8 +5377,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     // The response's non-Gaussian θ block and its packing, from the adjoints taken above.
     if let Some(o) = eta_dx {
         o.eta_dx = None;
-        // The exact inner Hessian the identity above solved with, over the live block.
-        o.hessian = (o.want_hessian && at_mode)
+        // The exact inner Hessian the identity above solved with, over the live block: the
+        // same kernel on the same jets as `exact_inner_hessian`, whose one extra decline is
+        // shared here so the objective's anchor is one function whichever pass forms it.
+        o.hessian = (o.want_hessian && at_mode && !iov_frem_mismatch(model, subject))
             .then(|| h_inner.view((0, 0), (active, active)).into_owned())
             .filter(|h| h.iter().all(|v| v.is_finite()));
         if let Some((n_rows, chunks, mut tas)) = response.filter(|(n, _, _)| *n > 0) {
@@ -5397,36 +5411,18 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     Some(out)
 }
 
-/// `outs`' adjoints over the scalar tape, from lane-batched sweeps: one `(lanes, buffer)`
-/// per [`DX_LANES`] outputs, the buffer lane-interleaved as `rsweep` leaves it (node `i`,
-/// lane `l` at `i · lanes + l`) and copied once per chunk, not split per output. Read with
-/// [`lane_adj`].
-fn sweep_lane_chunks(outs: &[R]) -> Vec<(usize, Vec<f64>)> {
-    fn chunk<const L: usize>(y: &[R]) -> (usize, Vec<f64>) {
-        let o: [R; L] = std::array::from_fn(|i| y.get(i).copied().unwrap_or(R::c(0.0)));
-        (L, rsweep::<L>(&o).to_vec())
-    }
-    outs.chunks(DX_LANES)
-        .map(|c| match c.len() {
-            1 => chunk::<1>(c),
-            2 => chunk::<2>(c),
-            _ => chunk::<DX_LANES>(c),
-        })
-        .collect()
-}
-
-/// Output `r`'s adjoint at scalar-tape node `v`, from [`sweep_lane_chunks`].
+/// Output `r`'s adjoint at recorded input `v`, from [`sweep_lanes`].
 #[inline]
-fn lane_adj(chunks: &[(usize, Vec<f64>)], r: usize, v: R) -> f64 {
+fn lane_adj(chunks: &[(usize, usize, Vec<f64>)], r: usize, v: R) -> f64 {
     TapeAdj::Lane(chunks, r).at(v)
 }
 
 /// One output's adjoints on the scalar tape: a single-lane buffer, or output `r` of
-/// [`sweep_lane_chunks`] read in place.
+/// [`sweep_lanes`] read in place (at recorded inputs only).
 #[derive(Clone, Copy)]
 enum TapeAdj<'a> {
     Plain(&'a [f64]),
-    Lane(&'a [(usize, Vec<f64>)], usize),
+    Lane(&'a [(usize, usize, Vec<f64>)], usize),
 }
 
 impl TapeAdj<'_> {
@@ -5435,7 +5431,7 @@ impl TapeAdj<'_> {
         v.idx().map_or(0.0, |i| match self {
             TapeAdj::Plain(adj) => adj[i],
             TapeAdj::Lane(chunks, r) => {
-                let (lanes, buf) = &chunks[r / DX_LANES];
+                let (lanes, _, buf) = &chunks[r / DX_LANES];
                 buf[i * lanes + r % DX_LANES]
             }
         })

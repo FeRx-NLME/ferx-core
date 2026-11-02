@@ -569,6 +569,36 @@ pub struct EbeResult {
 /// light inner provider rather than paying for the full theta/mixed `Dual2` jet.
 /// Special residual/FREM cases retain the full-provider fallback.
 #[allow(clippy::too_many_arguments)]
+/// Does the subject's inner solve go unseeded whatever metric is on offer? The declines every
+/// seed honours, formed here ([`analytic_inner_seed_hessian`]) or carried from the outer
+/// gradient pass (#2585 review #1):
+///
+/// - an IOV subject (its occasion-stacked solve has its own seed);
+/// - the escape hatches the fused gradient honours (`gradient = fd`,
+///   `FERX_NO_ANALYTIC_INNER`): a user who routes the inner loop to FD because the analytic
+///   gradient misbehaves on their model must get the historical unseeded solve back, not FD
+///   gradients against a provider-built metric;
+/// - a covariate-NN model. The Gauss–Newton metric is only a faithful local model of the
+///   individual objective while residuals are small; on an NN-modulated surface mid-descent
+///   (large residuals, highly non-convex individual likelihoods) its Newton-scaled steps —
+///   warm or cold — were measured pulling 23 of 30 subjects into prior-unlikely η̂ basins,
+///   stalling a FOCEI fit ~950 OFV above the unseeded optimum or parking it unconverged on a
+///   start-dependent point (slow-tests red since #1389, #1474). These models keep the
+///   historical solve; the seed's speedup was measured on PK surfaces and is retained there.
+fn inner_seed_declined(model: &CompiledModel, subject: &Subject) -> bool {
+    if model.n_kappa > 0 && !subject.occasions.is_empty() {
+        return true;
+    }
+    if analytic_inner_common_bail(model) {
+        return true;
+    }
+    #[cfg(feature = "nn")]
+    if !model.covariate_nns.is_empty() {
+        return true;
+    }
+    false
+}
+
 fn analytic_inner_seed_hessian(
     model: &CompiledModel,
     subject: &Subject,
@@ -586,26 +616,7 @@ fn analytic_inner_seed_hessian(
     // too changes no test outcome), while a wrong *gradient* sends the first step astray.
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<(DMatrix<f64>, Option<Vec<f64>>)> {
-    if model.n_kappa > 0 && !subject.occasions.is_empty() {
-        return None;
-    }
-    // The seed is a provider product like the fused gradient, so it honours the same escape
-    // hatches (`gradient = fd`, `FERX_NO_ANALYTIC_INNER`): a user who routes the inner loop
-    // to FD because the analytic gradient misbehaves on their model must get the historical
-    // unseeded solve back, not FD gradients against a provider-built metric.
-    if analytic_inner_common_bail(model) {
-        return None;
-    }
-    // Covariate-NN models: decline the seed entirely. The Gauss–Newton metric is only a
-    // faithful local model of the individual objective while residuals are small; on an
-    // NN-modulated surface mid-descent (large residuals, highly non-convex individual
-    // likelihoods) its Newton-scaled steps — warm or cold — were measured pulling 23 of
-    // 30 subjects into prior-unlikely η̂ basins, stalling a FOCEI fit ~950 OFV above the
-    // unseeded optimum or parking it unconverged on a start-dependent point (slow-tests
-    // red since #1389, #1474). These models keep the historical solve; the seed's speedup
-    // was measured on PK surfaces and is retained there.
-    #[cfg(feature = "nn")]
-    if !model.covariate_nns.is_empty() {
+    if inner_seed_declined(model, subject) {
         return None;
     }
     // The light path fuses the first BFGS gradient, so it must assemble exactly the
@@ -1830,15 +1841,42 @@ pub(crate) fn find_ebe_cached(
 ) -> EbeResult {
     find_ebe_cached_from(
         model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy, None,
-        None,
     )
 }
 
+/// Where a predicted warm start came from (#2549): the subject's mode at the incumbent, which
+/// the prediction extrapolates, and the exact inner Hessian there, carried from the
+/// incumbent's gradient pass — the warm solve's seed in place of a fresh one when the policy
+/// seeds exactly.
+#[derive(Clone, Copy)]
+pub(crate) struct PredictedFrom<'a> {
+    pub(crate) mode: &'a [f64],
+    pub(crate) seed: Option<&'a DMatrix<f64>>,
+}
+
+/// The population's [`PredictedFrom`]s: every subject's mode, and the carried Hessians when
+/// the incumbent's pass formed them.
+#[derive(Clone, Copy)]
+pub(crate) struct PredictedFromAll<'a> {
+    pub(crate) modes: &'a [DVector<f64>],
+    pub(crate) seeds: Option<&'a [Option<DMatrix<f64>>]>,
+}
+
+impl<'a> PredictedFromAll<'a> {
+    /// Subject `i`'s.
+    pub(crate) fn subject(&self, i: usize) -> PredictedFrom<'a> {
+        PredictedFrom {
+            mode: self.modes[i].as_slice(),
+            seed: self.seeds.and_then(|h| h.get(i)).and_then(Option::as_ref),
+        }
+    }
+}
+
 /// [`find_ebe_cached`] from a **predicted** start `eta_init`, with the mode it was predicted
-/// from as `fallback_start`: a predicted start whose objective is not usable (a first-order
-/// step carried out of the model's domain) is replaced by the fallback before the search
-/// begins (#2549 review r2 #3). The check is the search's own first evaluation, memoised, so
-/// a finite start costs nothing extra and is solved bit for bit as without a fallback.
+/// from in `predicted_from`: a predicted start whose objective is not usable (a first-order
+/// step carried out of the model's domain) is replaced by that mode before the search begins
+/// (#2549 review r2 #3). The check is the search's own first evaluation, memoised, so a
+/// finite start costs nothing extra and is solved bit for bit as without a fallback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_ebe_cached_from(
     model: &CompiledModel,
@@ -1851,8 +1889,7 @@ pub(crate) fn find_ebe_cached_from(
     restarts: usize,
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
-    fallback_start: Option<&[f64]>,
-    carried_seed: Option<&DMatrix<f64>>,
+    predicted_from: Option<PredictedFrom<'_>>,
 ) -> EbeResult {
     #[cfg(test)]
     EBE_SOLVES_STARTED.with(|n| n.set(n.get() + 1));
@@ -1867,8 +1904,7 @@ pub(crate) fn find_ebe_cached_from(
         restarts,
         schedule,
         policy,
-        fallback_start,
-        carried_seed,
+        predicted_from,
     )
 }
 
@@ -2108,11 +2144,16 @@ fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
 thread_local! {
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    /// #2095 flip-flop twin seeds that ran a descent: a model or subject the seed declines
-    /// leaves this untouched.
-    // Inner-solve seed Hessians formed from scratch on this thread (not carried, #2549).
+    /// Inner-solve seed Hessians formed from scratch on this thread and handed to the
+    /// search (not carried, and not declined; #2549).
     pub(crate) static FRESH_SEEDS_FORMED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// The metric the last inner search on this thread started from, carried or fresh
+    /// (`None`: unseeded), so a test can see which one a solve used (#2585 review #2).
+    pub(crate) static LAST_INITIAL_HESSIAN: std::cell::RefCell<Option<DMatrix<f64>>> =
+        const { std::cell::RefCell::new(None) };
+    /// #2095 flip-flop twin seeds that ran a descent: a model or subject the seed declines
+    /// leaves this untouched.
     pub(crate) static TWIN_SEEDS_RUN: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     /// #2013 screen descents that came back lower than the incumbent but within
@@ -2156,7 +2197,6 @@ fn find_ebe_impl(
 ) -> EbeResult {
     find_ebe_impl_from(
         model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy, None,
-        None,
     )
 }
 
@@ -2173,8 +2213,7 @@ fn find_ebe_impl_from(
     restarts: usize,
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
-    fallback_start: Option<&[f64]>,
-    carried_seed: Option<&DMatrix<f64>>,
+    predicted_from: Option<PredictedFrom<'_>>,
 ) -> EbeResult {
     if inner_profile_enabled() {
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2251,8 +2290,7 @@ fn find_ebe_impl_from(
             policy,
             cold_seed,
             share,
-            fallback_start,
-            carried_seed,
+            predicted_from,
         )
     };
     // The Hessian seed is a *local* model of the individual objective. Near the mode it
@@ -2332,13 +2370,12 @@ fn find_ebe_solve(
     // `find_ebe_impl`'s two cold solves share one screen: the first fills the cell with its
     // descents, the second takes them. `None`: screen for this solve alone.
     screen_share: Option<&RefCell<Option<Vec<ScreenDescent>>>>,
-    // The mode a predicted `eta_init` was predicted from ([`find_ebe_cached_from`]).
-    fallback_start: Option<&[f64]>,
-    // That mode's exact inner Hessian, carried from the incumbent's gradient pass: the
-    // warm solve's seed in place of a fresh one when the policy seeds exactly.
-    carried_seed: Option<&DMatrix<f64>>,
+    // Where a predicted `eta_init` came from ([`find_ebe_cached_from`]).
+    predicted_from: Option<PredictedFrom<'_>>,
 ) -> Option<EbeResult> {
     let n_eta = model.n_eta;
+    let fallback_start = predicted_from.map(|p| p.mode);
+    let carried_seed = predicted_from.and_then(|p| p.seed);
 
     // mu: shift vector (zeros when no mu-referencing)
     // The inner EBE is optimised directly in eta_true space. Mu-referencing is a
@@ -2677,6 +2714,7 @@ fn find_ebe_solve(
             // start: an SPD metric of the same objective at a point O(Δx) away, so the first
             // step is still the Newton step the prediction approximates and the search ends
             // at the same mode, without a second-order recording per warm solve.
+            // It honours the same declines as a fresh one (`inner_seed_declined`).
             if let Some(h) = carried_seed.filter(|h| {
                 seed_kind == InnerHessianSeed::Exact
                     && warm_start
@@ -2684,11 +2722,9 @@ fn find_ebe_solve(
                     && h.nrows() == n_eta
                     && h.ncols() == n_eta
             }) {
-                return Some((h.clone(), None));
+                return (!inner_seed_declined(model, subject)).then(|| (h.clone(), None));
             }
-            #[cfg(test)]
-            FRESH_SEEDS_FORMED.with(|n| n.set(n.get() + 1));
-            analytic_inner_seed_hessian(
+            let fresh = analytic_inner_seed_hessian(
                 model,
                 subject,
                 params,
@@ -2699,7 +2735,12 @@ fn find_ebe_solve(
                 &mut obs_grad_recycle.borrow_mut(),
                 seed_kind == InnerHessianSeed::Exact,
                 frozen,
-            )
+            );
+            #[cfg(test)]
+            if fresh.is_some() {
+                FRESH_SEEDS_FORMED.with(|n| n.set(n.get() + 1));
+            }
+            fresh
         })
         .flatten();
     // The seed wrote its own rows into the buffer.
@@ -2712,6 +2753,8 @@ fn find_ebe_solve(
         }
         hessian
     });
+    #[cfg(test)]
+    LAST_INITIAL_HESSIAN.with(|h| *h.borrow_mut() = initial_hessian.clone());
     if cold_seed && initial_hessian.is_none() {
         return None;
     }
@@ -6942,7 +6985,6 @@ pub(crate) fn run_inner_loop_warm_map<T: Send + Default>(
         tol,
         prev_etas,
         None,
-        None,
         mu_k,
         min_obs,
         restarts,
@@ -6986,7 +7028,6 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
         tol,
         prev_etas,
         None,
-        None,
         mu_k,
         min_obs,
         restarts,
@@ -6999,7 +7040,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
 
 /// [`run_inner_loop_warm_map_cached`] from **predicted** starts (#2549): `prev_etas` are the
 /// first-order predictions `η̂ + (dη̂/dx)·Δx` of the outer loop's warm-start predictor and
-/// `fallback_etas` the modes they were predicted from.
+/// `predicted_from` the modes they were predicted from, with the carried seeds.
 ///
 /// The prediction is the mode's exact first-order expansion, so on a smooth stretch of the
 /// trajectory every subject solves from it and this is the plain warm pass, bit for bit. A
@@ -7016,10 +7057,7 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
     max_iter: usize,
     tol: f64,
     prev_etas: &[DVector<f64>],
-    fallback_etas: &[DVector<f64>],
-    // The exact inner Hessians at `fallback_etas`, carried from the incumbent's gradient pass:
-    // the warm solves' seeds where the policy seeds with the exact one (#2549).
-    seed_hessians: Option<&[Option<DMatrix<f64>>]>,
+    predicted_from: PredictedFromAll<'_>,
     mu_k: Option<&[f64]>,
     min_obs: usize,
     restarts: usize,
@@ -7041,8 +7079,7 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
         max_iter,
         tol,
         Some(prev_etas),
-        Some(fallback_etas),
-        seed_hessians,
+        Some(predicted_from),
         mu_k,
         min_obs,
         restarts,
@@ -7055,6 +7092,11 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
 
 /// Replace a predicted start whose objective `at_start` is not usable (not finite, or on the
 /// `SUBJECT_SENTINEL_NLL` rail) by the mode it was predicted from ([`find_ebe_cached_from`]).
+///
+/// Not by the mode wherever that scores lower: both are starts for one minimisation, but on
+/// `pk2_big` under Laplace (#2585, ten `PERT = 0.3` starts) taking the lower one changed
+/// which starts ended in a poor optimum without changing how many (one went from −3485.208
+/// to −2688.01), the path dependence the predictor's smoothness argument predicts.
 fn start_at_fallback_if_unusable(at_start: f64, eta: &mut [f64], fallback: &[f64]) {
     if !crate::stats::likelihood::is_usable_subject_nll(at_start) {
         eta.copy_from_slice(fallback);
@@ -7116,8 +7158,7 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
     max_iter: usize,
     tol: f64,
     prev_etas: Option<&[DVector<f64>]>,
-    fallback_etas: Option<&[DVector<f64>]>,
-    seed_hessians: Option<&[Option<DMatrix<f64>>]>,
+    predicted_from: Option<PredictedFromAll<'_>>,
     mu_k: Option<&[f64]>,
     min_obs: usize,
     restarts: usize,
@@ -7170,13 +7211,10 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
                 Some(cache) => cache[i].as_ref(),
                 None => local_schedule.as_ref(),
             };
-            let fallback = fallback_etas.map(|f| f[i].as_slice());
-            let carried = seed_hessians
-                .and_then(|h| h.get(i))
-                .and_then(Option::as_ref);
+            let from = predicted_from.map(|p| p.subject(i));
+            let fallback = from.map(|p| p.mode);
             let mut ebe = find_ebe_cached_from(
-                model, subject, params, max_iter, tol, init, mu_k, restarts, schedule, policy,
-                fallback, carried,
+                model, subject, params, max_iter, tol, init, mu_k, restarts, schedule, policy, from,
             );
             // A predicted start that the solve fails from is solved again from the
             // subject's previous mode, and the lower objective is kept (ties to the

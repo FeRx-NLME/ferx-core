@@ -7231,6 +7231,24 @@ fn the_quadrature_mode_response_is_the_focei_one() {
     );
     #[allow(unused_mut)]
     let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("three".into(), three, s3)];
+    // An IOV subject: the stacked `[η, κ]` solve, whose exact Hessian the fused pass and
+    // `exact_inner_hessian` must also agree on (#2585 review #4).
+    {
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_iov.ferx"),
+            Some(&format!("{root}/data/warfarin_iov.csv")),
+        )
+        .unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.occasions.is_empty())
+            .expect("an IOV subject")
+            .clone();
+        assert!(prep.parsed.model.n_kappa > 0, "premise: the model has IOV");
+        cases.push(("examples/warfarin_iov.ferx".into(), prep.parsed.model, s));
+    }
     #[cfg(feature = "survival")]
     for (m, d) in [
         ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
@@ -7343,6 +7361,24 @@ fn the_quadrature_mode_hessian_is_the_exact_inner_hessian() {
     );
     #[allow(unused_mut)]
     let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("three".into(), three, s3)];
+    // An IOV subject: the stacked `[η, κ]` solve, whose exact Hessian the fused pass and
+    // `exact_inner_hessian` must also agree on (#2585 review #4).
+    {
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_iov.ferx"),
+            Some(&format!("{root}/data/warfarin_iov.csv")),
+        )
+        .unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.occasions.is_empty())
+            .expect("an IOV subject")
+            .clone();
+        assert!(prep.parsed.model.n_kappa > 0, "premise: the model has IOV");
+        cases.push(("examples/warfarin_iov.ferx".into(), prep.parsed.model, s));
+    }
     #[cfg(feature = "survival")]
     for (m, d) in [
         ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
@@ -7412,8 +7448,8 @@ fn the_quadrature_mode_hessian_is_the_exact_inner_hessian() {
         }
     }
     eprintln!("mode Hessian vs exact_inner_hessian: {worst:.2e} over {n_checked} cases");
-    // Measured 4.34e-16 over the 24 cases (Linux x86_64): the same kernel on the same jets,
-    // differing in rounding only; 1e-12 leaves four decades.
+    // Measured 4.34e-16 over the 32 cases, the IOV ones included (Linux x86_64): the same
+    // kernel on the same jets, differing in rounding only; 1e-12 leaves four decades.
     assert!(
         worst < 1e-12,
         "mode Hessian vs exact_inner_hessian {worst:.2e}"

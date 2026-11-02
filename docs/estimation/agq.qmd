@@ -376,8 +376,36 @@ exact-Hessian anchor and the grid on its own tape, so the rule stays as a measur
 cost/accuracy choice. Giving Laplace/AGQ the FOCEI regime instead (#2549) cost 1.15–2.9× on
 the `pk1` benchmark fits (an ODE AGQ-3 fit from 222 G to 651 G instructions) for at most
 `1e-5` OFV, and 7× on a 26-parameter, five-effect Laplace fit for 0.10. Set `outer_ftol`
-lower where that precision matters. What decides a hard Laplace fit is the EBE warm-start
-predictor, which now serves Laplace too ([Predicted warm starts](foce.qmd#predicted-warm-starts)).
+lower where that precision matters.
+
+That relative stop can still be met mid-descent on a slow creep: on `pk2_big`, Laplace
+stopped there 0.10 OFV above the optimum. So a quadrature tolerance stop is checked
+before it is accepted (#2549). From the incumbent's own per-subject quadrature scores (the
+rows its gradient summed, so the check costs no extra pass) the BHHH Newton decrement
+predicts how much a Newton step from the best point would still gain. Where that exceeds
+`1e-3` OFV, the stop takes the same polish legs a BOBYQA tolerance stop gets: L-BFGS
+restarted from the best point at `ftol_rel = 1e-10`, `xtol_rel = 1e-7`, another leg while
+one still gains more than `1e-3`, the last leg's stop deciding `converged`. On `pk2_big` that
+reaches −3485.2110, the optimum the exact-gradient regime ends at, in about half its work;
+the easy `pk1` fits read a predicted gain far below `1e-3` and stop as before.
+
+A leg whose line search fails without gaining, while the decrement still predicts more
+than `1e-3`, has not verified the stop, and the fit is **not reported as converged**, with
+a warning naming the predicted gain (#2585). That is the signature of an objective that is
+not smooth at the stop: some subjects' conditional modes switch between local minima as the
+parameters move, so the line search meets jumps its gradient cannot see. The failure, not
+the decrement's size, is the test: near an optimum the decrement overstates what is left
+(0.41 predicted 0.003 OFV from `pk2_big`'s optimum, where the legs end on their tolerance).
+
+From ten starts with every parameter perturbed by up to 30%, `pk2_big` under Laplace reached
+its optimum (to 0.003) from six and ended 39 to 285 OFV above it from four, each on a failed
+leg with 2.8 to 74 predicted; `main` before this release trapped four of the same ten
+(different ones: the warm-start predictor changes the path) and stopped 0.07 to 0.75 short
+of the optimum on the rest. The four used to be reported converged. Where the warning
+appears, compare fits from several starts.
+
+What decides a hard Laplace fit first is the EBE warm-start predictor, which now serves
+Laplace too ([Predicted warm starts](foce.qmd#predicted-warm-starts)).
 
 ### Don't use BOBYQA
 

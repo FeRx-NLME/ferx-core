@@ -233,6 +233,9 @@ pub(crate) struct PopulationEvaluation {
     /// Each subject's exact inner Hessian at its mode, from its score's pass, under the exact
     /// anchor (#2549): the objective's anchor there, and the next warm solve's seed.
     mode_hessians: Option<Vec<Option<DMatrix<f64>>>>,
+    /// Each subject's packed score, when every subject has one (#2549): the BHHH decrement's
+    /// rows at a tolerance stop.
+    scores: Option<Vec<Vec<f64>>>,
     /// How each subject's score was formed, in subject order (for the outer FD-fallback
     /// warning).
     routes: Vec<ScoreRoute>,
@@ -1107,6 +1110,10 @@ fn agq_population_evaluate_impl(
         .iter()
         .map(|(_, s, _)| s.as_ref().map_or(ScoreRoute::Reconverged, |s| s.1))
         .collect();
+    let scores: Option<Vec<Vec<f64>>> = per_subject
+        .iter()
+        .map(|(_, s, _)| s.as_ref().map(|(g, _)| g.clone()))
+        .collect();
     let (eta_dx, mode_hessians): (Vec<_>, Vec<_>) = per_subject
         .into_iter()
         .map(|(_, _, m)| (m.eta_dx, m.hessian))
@@ -1117,6 +1124,7 @@ fn agq_population_evaluate_impl(
         routes,
         eta_dx: want_eta_dx.then_some(eta_dx),
         mode_hessians: (want_eta_dx && exact_anchor).then_some(mode_hessians),
+        scores,
     }
 }
 
@@ -1294,8 +1302,7 @@ impl<'a> SubjectScoreContext<'a> {
         held_ok: bool,
         mode: &mut ModeOut,
     ) -> Option<(Vec<f64>, ScoreRoute)> {
-        mode.eta_dx = None;
-        mode.hessian = None;
+        mode.clear();
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return None;
         }
@@ -1329,8 +1336,7 @@ impl<'a> SubjectScoreContext<'a> {
                 if let Some(g) = accept(exact) {
                     return Some((g, ScoreRoute::Exact));
                 }
-                mode.eta_dx = None;
-                mode.hessian = None;
+                mode.clear();
                 if held_ok && self.model.n_kappa == 0 {
                     let held =
                         subject_adjoint_held_ebe_score_at(self.model, subject, pt, b, objective);
@@ -1440,13 +1446,16 @@ pub(crate) fn population_gradient_mixed(
                 route.record(log, i);
             }
         }
-        if let (Some(slot), Some(per)) = (eta_dx, evaluation.eta_dx) {
-            slot.eta_dx = Some(assemble_eta_dx(per, eta_hats, x.len()));
-            slot.hessians = evaluation.mode_hessians;
+        if let Some(slot) = eta_dx {
+            if let Some(per) = evaluation.eta_dx {
+                slot.eta_dx = Some(assemble_eta_dx(per, eta_hats, x.len()));
+                slot.hessians = evaluation.mode_hessians;
+            }
+            slot.scores = evaluation.scores;
         }
         return evaluation.gradient;
     }
-    let want_eta_dx = eta_dx.is_some();
+    let want_eta_dx = eta_dx.as_ref().is_some_and(|s| s.want_dx);
     let want_hessian = want_eta_dx && matches!(options.hessian_anchor(), HessianAnchor::Exact);
     let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
     let scores: Vec<_> = population
@@ -1472,10 +1481,12 @@ pub(crate) fn population_gradient_mixed(
     let mut result = vec![0.0; x.len()];
     let mut per = Vec::with_capacity(scores.len());
     let mut hessians = Vec::with_capacity(scores.len());
+    let mut rows = Vec::with_capacity(scores.len());
     for (i, (score, mode)) in scores.into_iter().enumerate() {
         per.push(mode.eta_dx);
         hessians.push(mode.hessian);
         let (score, route) = score?;
+        rows.push(score.clone());
         if let Some(log) = declines {
             route.record(log, i);
         }
@@ -1484,8 +1495,11 @@ pub(crate) fn population_gradient_mixed(
         }
     }
     if let Some(slot) = eta_dx {
-        slot.eta_dx = Some(assemble_eta_dx(per, eta_hats, x.len()));
-        slot.hessians = want_hessian.then_some(hessians);
+        if want_eta_dx {
+            slot.eta_dx = Some(assemble_eta_dx(per, eta_hats, x.len()));
+            slot.hessians = want_hessian.then_some(hessians);
+        }
+        slot.scores = Some(rows);
     }
     result.iter().all(|v| v.is_finite()).then_some(result)
 }

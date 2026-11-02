@@ -1615,8 +1615,9 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
     // #1504, and a start already at the mode would converge identically under any metric,
     // so the premise is exercised from a nonzero start away from the solution.
     let warm = vec![0.5, -0.4, 0.6];
-    let solve = |model: &CompiledModel, seed: InnerHessianSeed| {
-        let r = find_ebe_cached(
+    let carried = seed(&model, true).expect("premise: exact seed in scope").0;
+    let solve_from = |model: &CompiledModel, seed: InnerHessianSeed, h: Option<&DMatrix<f64>>| {
+        let r = find_ebe_cached_from(
             model,
             &subject,
             &params,
@@ -1637,14 +1638,24 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
             },
+            h.map(|h| PredictedFrom {
+                mode: &warm,
+                seed: Some(h),
+            }),
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
     };
+    let solve = |model: &CompiledModel, seed: InnerHessianSeed| solve_from(model, seed, None);
     let analytic_off = solve(&model, InnerHessianSeed::None);
     let analytic_on = solve(&model, InnerHessianSeed::GaussNewton);
     assert_ne!(
         analytic_off, analytic_on,
         "premise: the seed must change the analytic solve, or the fd identity is vacuous"
+    );
+    assert_ne!(
+        analytic_off,
+        solve_from(&model, InnerHessianSeed::Exact, Some(&carried)),
+        "premise: a carried seed must change the analytic solve too"
     );
 
     model.gradient_method = crate::types::GradientMethod::Fd;
@@ -1664,6 +1675,13 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
             "{kind:?} seed changed the `gradient = fd` inner solve"
         );
     }
+    // A Hessian carried from the outer gradient pass honours the hatch as well (#2585 review
+    // #1): under Laplace the outer adjoint forms one whatever the inner loop's route.
+    assert_eq!(
+        solve_from(&model, InnerHessianSeed::Exact, Some(&carried)),
+        fd_off,
+        "a carried seed changed the `gradient = fd` inner solve"
+    );
 }
 
 /// The seed is a *local* model of the individual objective: it accelerates a solve
@@ -1732,7 +1750,6 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 unseeded_iov_warm: false,
             },
             true,
-            None,
             None,
             None,
         )
@@ -1847,7 +1864,6 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
             schedule.as_ref(),
             policy(InnerHessianSeed::GaussNewton),
             true,
-            None,
             None,
             None,
         )
@@ -6801,8 +6817,23 @@ fn an_extrapolated_predicted_start_still_reaches_the_mode() {
         let mut predicted = modes.clone();
         predicted[2].fill(far);
         let (_, _, _, _, got) = run_inner_loop_predicted_map_cached(
-            &model, &pop, params, 500, 1e-8, &predicted, &modes, None, None, 0, 0, None, policy,
-            None, outcome,
+            &model,
+            &pop,
+            params,
+            500,
+            1e-8,
+            &predicted,
+            PredictedFromAll {
+                modes: &modes,
+                seeds: None,
+            },
+            None,
+            0,
+            0,
+            None,
+            policy,
+            None,
+            outcome,
         );
         assert!(!got[2].0, "η = {far}: no Nelder–Mead recovery needed");
         for (&a, &b) in got[2].1.iter().zip(&from_modes[2].1) {
@@ -6868,13 +6899,30 @@ fn a_carried_exact_seed_replaces_the_fresh_one_and_reaches_the_same_mode() {
                 0,
                 None,
                 policy,
-                None,
-                carried,
+                carried.map(|h| PredictedFrom {
+                    mode: modes[i].as_slice(),
+                    seed: Some(h),
+                }),
             );
             (r, FRESH_SEEDS_FORMED.with(|n| n.get()))
         };
         let (with, fresh_with) = solve(Some(&h));
+        // The search started from this subject's carried Hessian itself, bit for bit: not
+        // unseeded, not a fresh one, not another subject's (#2585 review #2).
+        let used = LAST_INITIAL_HESSIAN.with(|c| c.borrow_mut().take());
+        assert_eq!(
+            used.as_ref(),
+            Some(&h),
+            "subject {}: the search's metric is the carried seed",
+            s.id
+        );
         let (without, fresh_without) = solve(None);
+        let used = LAST_INITIAL_HESSIAN.with(|c| c.borrow_mut().take());
+        assert!(
+            used.is_some_and(|f| f != h),
+            "subject {}: a fresh seed, not the carried one",
+            s.id
+        );
         assert_eq!(fresh_with, 0, "subject {}: the carried seed was used", s.id);
         assert_eq!(
             fresh_without, 1,
@@ -6895,10 +6943,10 @@ fn a_carried_exact_seed_replaces_the_fresh_one_and_reaches_the_same_mode() {
     );
     eprintln!("carried vs fresh seed, η̂: {worst:.3e}");
     // Measured 1.24e-12 (Linux x86_64): two converged searches of one mode from one start,
-    // stopped at `inner_tol = 1e-8` on the gradient norm; 1e-6 still separates a different
-    // mode, which sits O(0.1) away.
+    // stopped at `inner_tol = 1e-8` on the gradient norm. 1e-10 keeps two decades of headroom
+    // and still fails a carried seed that stops the search loosely (#2585 review #9).
     assert!(
-        worst < 1e-6,
+        worst < 1e-10,
         "carried vs fresh seed reach different modes ({worst:.3e})"
     );
 }

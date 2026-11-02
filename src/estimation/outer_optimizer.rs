@@ -1510,8 +1510,7 @@ fn run_inner_loop_and_nll(
     f64,
 ) {
     let (etas, h_matrices, stats, kappas, nll, _, _) = run_inner_loop_and_nll_prepared(
-        model, population, params, options, prev_etas, None, None, mu_k, None, schedules, false,
-        cancel,
+        model, population, params, options, prev_etas, None, mu_k, None, schedules, false, cancel,
     );
     (etas, h_matrices, stats, kappas, nll)
 }
@@ -1554,12 +1553,11 @@ fn run_inner_loop_and_nll_prepared(
     params: &ModelParameters,
     options: &FitOptions,
     prev_etas: Option<&[DVector<f64>]>,
-    // The modes `prev_etas` were predicted from, when they are the warm-start predictor's
-    // first-order starts (#2549): a subject whose solve fails from its prediction is
-    // solved again from its mode ([`run_inner_loop_predicted_map_cached`]).
-    fallback_etas: Option<&[DVector<f64>]>,
-    // The incumbent's exact inner Hessians, the predicted starts' seeds (#2549).
-    seed_hessians: Option<&[Option<DMatrix<f64>>]>,
+    // Where `prev_etas` were predicted from, when they are the warm-start predictor's
+    // first-order starts (#2549): the modes, which a subject starts from where they score
+    // lower or its solve fails from the prediction, and the incumbent's exact inner
+    // Hessians, their seeds ([`run_inner_loop_predicted_map_cached`]).
+    predicted_from: Option<crate::estimation::inner_optimizer::PredictedFromAll<'_>>,
     mu_k: Option<&[f64]>,
     // The fused AGQ gradient's inputs, and whether it forms the mode response (#2549).
     agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds, bool)>,
@@ -1595,9 +1593,9 @@ fn run_inner_loop_and_nll_prepared(
                 (ebe.terminal_hessian.clone(), ebe.nll)
             };
         let (etas, h_matrices, stats, kappas, terminal_work) =
-            match (schedules, prev_etas.zip(fallback_etas)) {
+            match (schedules, prev_etas.zip(predicted_from)) {
                 // Predicted starts, each with its mode to fall back to (#2549).
-                (_, Some((start, fallback))) => {
+                (_, Some((start, from))) => {
                     crate::estimation::inner_optimizer::run_inner_loop_predicted_map_cached(
                         model,
                         population,
@@ -1605,8 +1603,7 @@ fn run_inner_loop_and_nll_prepared(
                         options.inner_maxiter,
                         options.inner_tol,
                         start,
-                        fallback,
-                        seed_hessians,
+                        from,
                         mu_k,
                         options.min_obs_for_convergence_check as usize,
                         options.inner_restarts,
@@ -1731,7 +1728,7 @@ fn run_inner_loop_and_nll_prepared(
             )
         };
     let (etas, h_matrices, stats, kappas, contributions) =
-        if let Some((start, fallback)) = prev_etas.zip(fallback_etas) {
+        if let Some((start, from)) = prev_etas.zip(predicted_from) {
             crate::estimation::inner_optimizer::run_inner_loop_predicted_map_cached(
                 model,
                 population,
@@ -1739,8 +1736,7 @@ fn run_inner_loop_and_nll_prepared(
                 options.inner_maxiter,
                 options.inner_tol,
                 start,
-                fallback,
-                seed_hessians,
+                from,
                 mu_k,
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
@@ -3130,6 +3126,9 @@ struct IncumbentSolve {
     etas: Vec<DVector<f64>>,
     h_mats: Vec<DMatrix<f64>>,
     kappas: Vec<Vec<DVector<f64>>>,
+    /// Under the quadrature, each subject's packed score at `xs`, when this evaluation formed
+    /// its gradient: the BHHH decrement a tolerance stop reads (#2549).
+    scores: Option<Vec<Vec<f64>>>,
 }
 
 /// What a cold re-solve at the final estimates says about `reference_ofv` (#833).
@@ -4098,6 +4097,72 @@ fn predicted_remaining_gain(
     )
 }
 
+/// [`predicted_remaining_gain`] for a quadrature objective (Laplace, AGQ; #2549): the BHHH
+/// Newton decrement of the objective the optimizer minimised, from each subject's exact
+/// quadrature score at `x` with its EBEs (`SubjectScoreContext::score_routed`, the scores the
+/// optimizer's own gradient sums) and the penalties' gradient and Hessian. It is what decides
+/// whether a quadrature tolerance stop takes the polish legs. `scores`: those rows when the
+/// incumbent's own gradient formed them, so the decrement costs no pass; else they are formed
+/// here. `None` when a subject's score cannot be formed, as for the FOCE form.
+#[allow(clippy::too_many_arguments)]
+fn quadrature_predicted_remaining_gain(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    scores: Option<&[Vec<f64>]>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> Option<f64> {
+    use rayon::prelude::*;
+    let formed: Vec<Vec<f64>>;
+    let per_subject: &[Vec<f64>] = match scores.filter(|s| s.len() == population.subjects.len()) {
+        Some(s) => s,
+        None => {
+            let context = crate::estimation::agq::SubjectScoreContext::new(
+                model,
+                init_params,
+                x,
+                options,
+                bounds,
+                false,
+            );
+            formed = population
+                .subjects
+                .par_iter()
+                .enumerate()
+                .map(|(i, subject)| {
+                    let k = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                    context
+                        .score_routed(subject, ehs.get(i)?.as_slice(), k, false)
+                        .map(|(g, _)| g)
+                })
+                .collect::<Option<_>>()?;
+            &formed
+        }
+    };
+    let n = x.len();
+    let theta = unpack_params(x, init_params).theta;
+    let mut penalty_grad = vec![0.0; n];
+    let mut penalty_hess = DMatrix::zeros(n, n);
+    nn_reg.add_packed_gradient(&theta, &mut penalty_grad);
+    nn_reg.add_packed_hessian(&theta, &mut |i, j, v| penalty_hess[(i, j)] += v);
+    priors.add_gradient(x, &mut penalty_grad);
+    priors.add_hessian(&mut |i, j, v| penalty_hess[(i, j)] += v);
+    bhhh_newton_decrement(
+        per_subject,
+        &penalty_grad,
+        &penalty_hess,
+        x,
+        bounds,
+        &packed_fixed_mask(init_params),
+    )
+}
+
 /// The per-subject outer gradients at `x` with the EBEs re-solved first, both under the
 /// tight ODE override `ode` ([`predicted_remaining_gain`], #2001). `None` when the scope
 /// cannot be built, the re-solve leaves a subject unconverged or start-rejected, or the
@@ -4815,6 +4880,44 @@ pub(crate) fn bobyqa_stop_needs_polish(
         && !cancelled
 }
 
+/// [`bobyqa_stop_needs_polish`], or the same tolerance stop from a gradient optimizer run with
+/// reachable stops (`gradient_run_has_reachable_stops`: the quadrature, #2549). Laplace/AGQ stop
+/// on the relative `ftol_rel = 1e-6`, met mid-descent on a slow creep as BOBYQA's is: on
+/// `pk2_big` Laplace it stopped 0.10 OFV above where the exact-gradient regime ends. So such a
+/// stop takes the same #1782 polish legs from the best point at the `POLISH_*` tolerances,
+/// with the last leg's stop deciding `converged`. So does a quadrature gradient run's bare
+/// `Failure` or `RoundoffLimited` — a line search that found no decrease, which FOCE/FOCEI's
+/// #2462 verification legs catch and the quadrature has none for: from one perturbed start
+/// `pk2_big` Laplace ended on one at −3446.13 and the plateau check called it converged, 39 OFV
+/// above the optimum. The caller polishes either only where a gain is predicted (the BHHH
+/// decrement). A latched, spent, forced or cancelled stop is never polished; for BOBYQA only
+/// its tolerance stops are, as before.
+pub(crate) fn tolerance_stop_needs_polish(
+    algo: nlopt::Algorithm,
+    reachable_stops: bool,
+    result: &Result<(nlopt::SuccessState, f64), (nlopt::FailState, f64)>,
+    latched: bool,
+    cancelled: bool,
+) -> bool {
+    let quadrature_stop = matches!(
+        result,
+        Ok((
+            nlopt::SuccessState::Success
+                | nlopt::SuccessState::FtolReached
+                | nlopt::SuccessState::XtolReached,
+            _
+        )) | Err((
+            nlopt::FailState::Failure | nlopt::FailState::RoundoffLimited,
+            _
+        ))
+    ) && !latched
+        && !cancelled;
+    bobyqa_stop_needs_polish(algo, result, latched, cancelled)
+        || (quadrature_stop
+            && reachable_stops
+            && matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp))
+}
+
 /// BOBYQA's initial trust radius per coordinate, in scaled space.
 ///
 /// NLopt's default rhobeg is 25% of the bound-width — huge in our log-space
@@ -4854,6 +4957,11 @@ pub(crate) enum PolishEnd {
     /// `MAX_POLISH_LEGS` legs ran and the last one still failed the settle test: it
     /// gained more than `min_gain`, or a profiled leg was still moving when it stopped.
     LegCapReached { last_gain: f64 },
+    /// A quadrature stop's last leg settled on a line-search `Failure` while the stop's BHHH
+    /// Newton decrement still predicted `predicted` > `POLISH_MIN_GAIN` (#2585): the leg
+    /// could not take a gain the local model says is there, so the stop is not verified. Set by the caller from the
+    /// last `needs_polish` decision, not by [`drive_legs`].
+    Stalled { predicted: f64 },
     /// A leg was wanted but could not start (no feasible point to polish from, #1617);
     /// the verdict is left to the paths that handle that run.
     Skipped,
@@ -4931,10 +5039,43 @@ pub(crate) fn drive_legs<R>(
     }
 }
 
+/// How a quadrature polish ended, given `stalled_gain` (the BHHH decrement behind the last
+/// decision to polish, `None` when the last stop needed no polish) and `last`, the last
+/// leg's return. A loop that settled on a leg's gain test with that decision standing, the
+/// leg having ended on a line-search `Failure`, is [`PolishEnd::Stalled`].
+///
+/// The `Failure` and not the decrement's size is what tells a stall: near an optimum the
+/// decrement overstates what is left (on `pk2_big`, 0.41 predicted 0.001–0.003 OFV from the
+/// optimum, legs ending `FtolReached`), while every start that stalled 10–240 OFV above it
+/// ended its leg on `Failure` with 2.8 to 74 predicted (#2585).
+pub(crate) fn quadrature_polish_end(
+    end: PolishEnd,
+    stalled_gain: Option<f64>,
+    last: &NloptReturn,
+) -> PolishEnd {
+    match (end, stalled_gain, last) {
+        (PolishEnd::Settled, Some(predicted), Err((nlopt::FailState::Failure, _))) => {
+            PolishEnd::Stalled { predicted }
+        }
+        (end, _, _) => end,
+    }
+}
+
+/// The warning for [`PolishEnd::Stalled`].
+pub(crate) fn polish_stalled_warning(predicted: f64) -> String {
+    format!(
+        "Outer optimization stopped where a Newton step is still predicted to lower the \
+         objective by {predicted:.3e}, and a polish leg from there failed its line search \
+         without gaining, so it is not reported as converged. The objective is not smooth at that point, typically \
+         because some subjects' conditional modes switch between local minima; re-run from \
+         other initial estimates and compare the objective."
+    )
+}
+
 /// The warning for [`PolishEnd::LegCapReached`].
 pub(crate) fn polish_leg_cap_warning(last_gain: f64) -> String {
     format!(
-        "Outer optimization (BOBYQA) was still improving after {MAX_POLISH_LEGS} polish legs \
+        "Outer optimization was still improving after {MAX_POLISH_LEGS} polish legs \
          from its tolerance stop (the last lowered the objective by {last_gain:.3e}), so it is \
          not reported as converged; re-run from these estimates or compare against a \
          gradient-based optimizer."
@@ -5372,7 +5513,8 @@ fn optimize_nlopt_attempt(
         identity_scales,
     );
     // The EBE warm-start predictor (`NloptState::pred_jac`) where the adjoint forms the mode
-    // response: FOCE/FOCEI on a BSV-only, non-mixture model the outer gradient serves. An IOV
+    // response: FOCE/FOCEI, and Laplace (AGQ with one node), on a BSV-only, non-mixture
+    // model the outer gradient serves; not AGQ with more than one node. An IOV
     // subject's κ̂ is not predicted, and its seeded warm solve already starts near the mode.
     //
     // Not on a `[covariate_nn]` model: there it costs time and saves none. Measured on the
@@ -5728,8 +5870,12 @@ fn optimize_nlopt_attempt(
                     &params,
                     eval_options,
                     Some(predicted.as_ref().unwrap_or(&state.cached_etas)),
-                    predicted.is_some().then_some(state.cached_etas.as_slice()),
-                    predicted.as_ref().and(state.seed_hessians.as_deref()),
+                    predicted.is_some().then_some(
+                        crate::estimation::inner_optimizer::PredictedFromAll {
+                            modes: &state.cached_etas,
+                            seeds: state.seed_hessians.as_deref(),
+                        },
+                    ),
                     Some(&mu_k),
                     fuse_agq_gradient.then_some((
                         init_params,
@@ -5844,7 +5990,10 @@ fn optimize_nlopt_attempt(
         // present exactly when `grad_norm_for_trace` is.
         let mut grad_vec_for_trace: Option<Vec<f64>> = None;
         // This evaluation's mode responses, when its gradient formed them (#2549).
-        let mut eta_dx = crate::estimation::sens_outer_gradient::ModeResponses::default();
+        let mut eta_dx = crate::estimation::sens_outer_gradient::ModeResponses {
+            want_dx: warm_predictor,
+            ..Default::default()
+        };
         if let Some(g) = grad {
             // A rejected or non-finite point has no useful population gradient: steepest
             // ascent toward bounds center nudges the optimizer back. Fall through (no early
@@ -5907,8 +6056,10 @@ fn optimize_nlopt_attempt(
                         declines,
                         // The predictor reads the mode response only where this evaluation
                         // becomes the incumbent's warm start.
-                        (warm_predictor && adopt_warm_start(guarded, ofv, state.best_ofv))
-                            .then_some(&mut eta_dx),
+                        // So does a quadrature tolerance stop's decrement (`scores`).
+                        ((warm_predictor || options.agq_nodes().is_some())
+                            && adopt_warm_start(guarded, ofv, state.best_ofv))
+                        .then_some(&mut eta_dx),
                     )
                 };
                 // Splice in the NN penalty gradient (computed above, in the same
@@ -5987,6 +6138,11 @@ fn optimize_nlopt_attempt(
                     // The incumbent's exact inner Hessians go with its responses: the next
                     // warm solves' seeds where the policy seeds with the exact one.
                     state.seed_hessians = eta_dx.hessians.take();
+                } else {
+                    // The modes moved without a new response, and the carried seeds are
+                    // the Hessians at the old ones: the next warm solves form their own
+                    // (#2585 review #3). The response itself is kept, re-anchored.
+                    state.seed_hessians = None;
                 }
                 state.pred_anchor.clone_from(&x);
             }
@@ -5999,6 +6155,7 @@ fn optimize_nlopt_attempt(
                 etas: ehs,
                 h_mats: hms.clone(),
                 kappas: kappas.clone(),
+                scores: eta_dx.scores.take(),
             });
             state.cached_h_mats = hms;
         } else {
@@ -6519,16 +6676,67 @@ fn optimize_nlopt_attempt(
             },
         )
     } else {
+        // The predicted gain behind the last decision to polish a quadrature stop; `None`
+        // once a stop needs no polish. A leg that then settles leaves it standing.
+        let stalled_gain = std::cell::Cell::new(None::<f64>);
         let (r, end) = drive_polish_legs(
             first_leg,
             polish_min_gain,
             |r| {
-                bobyqa_stop_needs_polish(
+                stalled_gain.set(None);
+                let reachable = gradient_run_has_reachable_stops(options);
+                if !tolerance_stop_needs_polish(
                     algo,
+                    reachable,
                     r,
                     stagnation_latched.load(Ordering::Relaxed),
                     crate::cancel::is_cancelled(&options.cancel),
-                )
+                ) {
+                    return false;
+                }
+                if !reachable {
+                    return true;
+                }
+                // A leg the #2093 basin probe ended belongs to the basin-shift restart, not
+                // to a polish (as for the #2462 verification legs).
+                if basin_probe_fired.get() {
+                    return false;
+                }
+                // A quadrature stop is polished where a Newton step from the best point is
+                // predicted to gain more than a polish leg needs to continue
+                // (`POLISH_MIN_GAIN`): the BHHH decrement of its exact per-subject scores. On
+                // an easy fit, already at its optimum to 1e-5, it reads far below and the
+                // stop stands; a slow creep reads above it (#2549). Where the decrement cannot
+                // be formed the stop is polished.
+                let incumbent = best_solve.lock().unwrap();
+                let Some(inc) = incumbent.as_ref() else {
+                    return true;
+                };
+                let x_inc: Vec<f64> = inc.xs.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                let gain = quadrature_predicted_remaining_gain(
+                    model,
+                    population,
+                    init_params,
+                    &x_inc,
+                    &inc.etas,
+                    &inc.kappas,
+                    inc.scores.as_deref(),
+                    &bounds,
+                    options,
+                    &nn_reg,
+                    &priors,
+                );
+                if verbose {
+                    eprintln!(
+                        "Quadrature tolerance stop: a Newton step from the best point is \
+                         predicted to gain {gain:?} (polished above {polish_min_gain:e})."
+                    );
+                }
+                let polish = gain.is_none_or(|g| g > polish_min_gain);
+                if polish {
+                    stalled_gain.set(gain);
+                }
+                polish
             },
             budget_left,
             |left| {
@@ -6552,11 +6760,13 @@ fn optimize_nlopt_attempt(
                 leg.set_maxeval(left).unwrap();
                 leg.set_xtol_rel(polish_xtol).unwrap();
                 leg.set_ftol_rel(polish_ftol).unwrap();
-                leg.set_initial_step(&bobyqa_initial_step(&lower_s, &upper_s))
-                    .unwrap();
+                if matches!(algo, nlopt::Algorithm::Bobyqa) {
+                    leg.set_initial_step(&bobyqa_initial_step(&lower_s, &upper_s))
+                        .unwrap();
+                }
                 if options.verbose {
                     eprintln!(
-                    "BOBYQA stopped on its tolerance (best objective = {before:.6}); polishing \
+                    "{algo:?} stopped on its tolerance (best objective = {before:.6}); polishing \
                      from the best point with ftol_rel = {polish_ftol:e}, \
                      xtol_rel = {polish_xtol:e} ({left} evaluations left).",
                 );
@@ -6566,6 +6776,10 @@ fn optimize_nlopt_attempt(
                 Some((r, best_point().map_or(0.0, |(_, after)| before - after)))
             },
         );
+        // A leg that gained nothing from a stop whose Newton decrement still predicts more
+        // than a leg needs to continue has not verified it: the objective is not smooth
+        // there (#2585).
+        let end = quadrature_polish_end(end, stalled_gain.get(), &r);
         (r, end, false, None)
     };
     let opt = opt_slot;
@@ -6635,6 +6849,11 @@ fn optimize_nlopt_attempt(
             } else {
                 polish_leg_cap_warning(last_gain)
             });
+        }
+        PolishEnd::Stalled { predicted } => {
+            converged = false;
+            stationarity_check_pending = false;
+            warnings.push(polish_stalled_warning(predicted));
         }
         PolishEnd::NotNeeded | PolishEnd::Settled | PolishEnd::Skipped => {}
     }
@@ -7441,86 +7660,85 @@ fn optimize_bfgs(
     // and per-subject `2·nllᵢ` of the last accepted iterate. Returns this point's
     // `2·nllᵢ` as its last element so the loop can promote it.
     //
-    // `fallback`: the modes `prev_etas` were predicted from, when they are predicted starts
-    // (`run_inner_loop_predicted_map_cached`); `eta_dx`: where to put this point's mode
+    // `predicted_from`: where `prev_etas` were predicted from, when they are predicted
+    // starts (`run_inner_loop_predicted_map_cached`); `eta_dx`: where to put this point's mode
     // response, formed by the gradient's own sweeps.
-    let fdfg = |x: &[f64],
-                prev_etas: &[DVector<f64>],
-                fallback: Option<&[DVector<f64>]>,
-                seeds: Option<&[Option<DMatrix<f64>>]>,
-                grad_eval_idx: &mut usize,
-                incumbent: Option<(f64, &[f64])>,
-                eta_dx: Option<&mut crate::estimation::sens_outer_gradient::ModeResponses>|
-     -> (
-        f64,
-        Vec<f64>,
-        Vec<DVector<f64>>,
-        Vec<DMatrix<f64>>,
-        Vec<f64>,
-    ) {
-        let params = unpack_params(x, init_params);
-        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let (ehs, hms, _, kappas, nll, _, contribs) = run_inner_loop_and_nll_prepared(
-            model,
-            population,
-            &params,
-            options,
-            Some(prev_etas),
-            fallback,
-            seeds,
-            Some(&mu_k),
-            None,
-            None,
-            cached_etas_are_modes.take(),
-            None, // the built-in BFGS loop polls between iterations (#574)
-        );
-        let contribs: Vec<f64> = contribs.iter().map(|v| 2.0 * v).collect();
-        let ofv = 2.0 * nll;
-        // The value the optimizer ranks this point on, for the guard: the penalties are
-        // re-added below together with their gradients, in the original order, so the
-        // returned `f` and `g` are unchanged by this read.
-        let trial = OuterTrial {
-            ofv: ofv + nn_reg.penalty_value(&params.theta) + priors.penalty(x),
-            contribs: &contribs,
-            incumbent,
+    let fdfg =
+        |x: &[f64],
+         prev_etas: &[DVector<f64>],
+         predicted_from: Option<crate::estimation::inner_optimizer::PredictedFromAll<'_>>,
+         grad_eval_idx: &mut usize,
+         incumbent: Option<(f64, &[f64])>,
+         eta_dx: Option<&mut crate::estimation::sens_outer_gradient::ModeResponses>|
+         -> (
+            f64,
+            Vec<f64>,
+            Vec<DVector<f64>>,
+            Vec<DMatrix<f64>>,
+            Vec<f64>,
+        ) {
+            let params = unpack_params(x, init_params);
+            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let (ehs, hms, _, kappas, nll, _, contribs) = run_inner_loop_and_nll_prepared(
+                model,
+                population,
+                &params,
+                options,
+                Some(prev_etas),
+                predicted_from,
+                Some(&mu_k),
+                None,
+                None,
+                cached_etas_are_modes.take(),
+                None, // the built-in BFGS loop polls between iterations (#574)
+            );
+            let contribs: Vec<f64> = contribs.iter().map(|v| 2.0 * v).collect();
+            let ofv = 2.0 * nll;
+            // The value the optimizer ranks this point on, for the guard: the penalties are
+            // re-added below together with their gradients, in the original order, so the
+            // returned `f` and `g` are unchanged by this read.
+            let trial = OuterTrial {
+                ofv: ofv + nn_reg.penalty_value(&params.theta) + priors.penalty(x),
+                contribs: &contribs,
+                incumbent,
+            };
+            // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x), and with `eta_dx` the mode response from the
+            // same sweeps.
+            let mut g = population_gradient_with_agq_evaluation(
+                x,
+                n_subj,
+                init_params,
+                model,
+                population,
+                &ehs,
+                &hms,
+                &kappas,
+                &bounds,
+                options,
+                grad_eval_idx,
+                None,
+                trial,
+                declines,
+                eta_dx,
+            );
+            // Penalized value + matching gradient fed to the optimizer (unregularized
+            // fits unchanged), in one pass. `ofv_at_fixed` above stays clean for
+            // final reporting.
+            let ofv = ofv + nn_reg.penalty_and_gradient(&params.theta, &mut g);
+            // Parameter priors (#254), value and gradient from one call, in the same
+            // packed space `g` is already expressed in.
+            let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
+            let f = if ofv.is_finite() { ofv } else { 1e20 };
+            // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261), except
+            // on an ODE + IOV model (#2508).
+            (
+                f,
+                g,
+                outer_cache_warm_starts(model, &ehs, &kappas),
+                hms,
+                contribs,
+            )
         };
-        // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x), and with `eta_dx` the mode response from the
-        // same sweeps.
-        let mut g = population_gradient_with_agq_evaluation(
-            x,
-            n_subj,
-            init_params,
-            model,
-            population,
-            &ehs,
-            &hms,
-            &kappas,
-            &bounds,
-            options,
-            grad_eval_idx,
-            None,
-            trial,
-            declines,
-            eta_dx,
-        );
-        // Penalized value + matching gradient fed to the optimizer (unregularized
-        // fits unchanged), in one pass. `ofv_at_fixed` above stays clean for
-        // final reporting.
-        let ofv = ofv + nn_reg.penalty_and_gradient(&params.theta, &mut g);
-        // Parameter priors (#254), value and gradient from one call, in the same
-        // packed space `g` is already expressed in.
-        let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
-        let f = if ofv.is_finite() { ofv } else { 1e20 };
-        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261), except
-        // on an ODE + IOV model (#2508).
-        (
-            f,
-            g,
-            outer_cache_warm_starts(model, &ehs, &kappas),
-            hms,
-            contribs,
-        )
-    };
 
     // Per-element scale factors for the BFGS outer loop.
     let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
@@ -7542,33 +7760,32 @@ fn optimize_bfgs(
     };
 
     // Wrappers that operate in scaled space; unscale before calling base closures.
-    let fdfg_s = |xs: &[f64],
-                  prev_etas: &[DVector<f64>],
-                  fallback: Option<&[DVector<f64>]>,
-                  seeds: Option<&[Option<DMatrix<f64>>]>,
-                  grad_eval_idx: &mut usize,
-                  incumbent: Option<(f64, &[f64])>,
-                  eta_dx: Option<&mut crate::estimation::sens_outer_gradient::ModeResponses>|
-     -> (
-        f64,
-        Vec<f64>,
-        Vec<DVector<f64>>,
-        Vec<DMatrix<f64>>,
-        Vec<f64>,
-    ) {
-        let x_r: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
-        let (f, g_r, ehs, hms, contribs) = fdfg(
-            &x_r,
-            prev_etas,
-            fallback,
-            seeds,
-            grad_eval_idx,
-            incumbent,
-            eta_dx,
-        );
-        let g_s: Vec<f64> = (0..n).map(|i| g_r[i] * scale[i]).collect();
-        (f, g_s, ehs, hms, contribs)
-    };
+    let fdfg_s =
+        |xs: &[f64],
+         prev_etas: &[DVector<f64>],
+         predicted_from: Option<crate::estimation::inner_optimizer::PredictedFromAll<'_>>,
+         grad_eval_idx: &mut usize,
+         incumbent: Option<(f64, &[f64])>,
+         eta_dx: Option<&mut crate::estimation::sens_outer_gradient::ModeResponses>|
+         -> (
+            f64,
+            Vec<f64>,
+            Vec<DVector<f64>>,
+            Vec<DMatrix<f64>>,
+            Vec<f64>,
+        ) {
+            let x_r: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
+            let (f, g_r, ehs, hms, contribs) = fdfg(
+                &x_r,
+                prev_etas,
+                predicted_from,
+                grad_eval_idx,
+                incumbent,
+                eta_dx,
+            );
+            let g_s: Vec<f64> = (0..n).map(|i| g_r[i] * scale[i]).collect();
+            (f, g_s, ehs, hms, contribs)
+        };
 
     let f_only_s = |xs: &[f64], prev_etas: &[DVector<f64>]| -> f64 {
         let x_r: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
@@ -7589,11 +7806,13 @@ fn optimize_bfgs(
     // backtracking line search accepted, so each one forms the response the next step
     // predicts from.
     let use_predictor = warm_predictor_serves(model, init_params, options);
-    let mut last = crate::estimation::sens_outer_gradient::ModeResponses::default();
+    let mut last = crate::estimation::sens_outer_gradient::ModeResponses {
+        want_dx: true,
+        ..Default::default()
+    };
     let (mut f_val, mut g, ehs, _, contribs) = fdfg_s(
         &xs,
         &cached_etas,
-        None,
         None,
         &mut grad_eval_idx,
         None,
@@ -7705,12 +7924,18 @@ fn optimize_bfgs(
                 &x_new_real,
             )
         });
-        let mut new_last = crate::estimation::sens_outer_gradient::ModeResponses::default();
+        let mut new_last = crate::estimation::sens_outer_gradient::ModeResponses {
+            want_dx: true,
+            ..Default::default()
+        };
         let (f_new, g_new, ehs, _, contribs) = fdfg_s(
             &xs,
             warm.as_deref().unwrap_or(&cached_etas),
-            warm.is_some().then_some(cached_etas.as_slice()),
-            warm.as_ref().and(last.hessians.as_deref()),
+            warm.is_some()
+                .then_some(crate::estimation::inner_optimizer::PredictedFromAll {
+                    modes: &cached_etas,
+                    seeds: last.hessians.as_deref(),
+                }),
             &mut grad_eval_idx,
             Some((incumbent.0, incumbent.1.as_slice())),
             use_predictor.then_some(&mut new_last),
@@ -9899,7 +10124,7 @@ fn population_gradient_with_agq_evaluation(
                 options,
                 trial,
                 declines,
-                eta_dx.is_some(),
+                eta_dx.as_ref().is_some_and(|s| s.want_dx),
             );
             if let (Some(slot), Some(dx)) = (eta_dx, dx) {
                 slot.eta_dx = Some(dx);

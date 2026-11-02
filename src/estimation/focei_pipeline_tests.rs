@@ -650,7 +650,6 @@ fn a_cancelled_inner_pass_scores_no_objective() {
                 None,
                 None,
                 None,
-                None,
                 gradient_inputs,
                 None,
                 false,

@@ -213,8 +213,13 @@ pub fn population_eta_dx(
 /// the next warm inner solve there (`None` for a subject without one).
 #[derive(Debug, Default)]
 pub(crate) struct ModeResponses {
+    /// Form the mode responses (the predictor serves the fit).
+    pub(crate) want_dx: bool,
     pub(crate) eta_dx: Option<Vec<Vec<DVector<f64>>>>,
     pub(crate) hessians: Option<Vec<Option<nalgebra::DMatrix<f64>>>>,
+    /// Under the quadrature, each subject's exact packed score — the rows the gradient sums —
+    /// kept for the BHHH decrement at a tolerance stop (`quadrature_predicted_remaining_gain`).
+    pub(crate) scores: Option<Vec<Vec<f64>>>,
 }
 
 /// The EBE warm start at `x_new` from the modes at `x_prev`: the mode map's first-order
