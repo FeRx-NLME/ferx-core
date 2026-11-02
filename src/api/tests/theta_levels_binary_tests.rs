@@ -1,0 +1,684 @@
+//! A θ level block read by a discrete-state endpoint (#2562): the records of every
+//! endpoint whose expression reads the block define its levels, as the Gaussian
+//! observations do, and each carries its own level index in its covariate snapshot.
+
+use super::*;
+use crate::api::levels::{level_index_finding, LevelIndexFinding};
+use crate::types::{ObsRecord, ParsedModel};
+
+/// The binary MBMA shape of #2111's B1, small: one subject per study, an arm covariate
+/// `TRT` that changes within the subject, the block on the log-odds.
+const BINARY: &str = r#"
+[parameters]
+  theta TVL(-0.3, -5.0, 5.0)
+  theta EMAX(0.5, -5.0, 5.0)
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0)
+  omega ETA_S ~ 0.25
+[covariates]
+  STUDY categorical
+  TRT   continuous
+[binary_model]
+  cmt   = 1
+  logit = TVL + PLACEBO + ETA_S + EMAX * TRT
+"#;
+
+/// [`BINARY`] without the arm term, so no covariate varies within a subject and the
+/// reader writes no per-record snapshot: the binder has to make them.
+fn no_arm() -> String {
+    BINARY
+        .replace(" + EMAX * TRT", "")
+        .replace("  theta EMAX(0.5, -5.0, 5.0)\n", "")
+}
+
+const HEADER: &str = "ID,STUDY,TIME,DV,CMT,EVID,MDV,TRT\n";
+
+/// Three studies (ID = study), visits at `times`, two arms, four Bernoulli rows per
+/// arm-visit with a pattern that varies by study, visit and arm, so no level and no arm
+/// is degenerate. Rows are written visit-major in `times` order, not sorted. Without
+/// `arms` every row carries `TRT = 0`, so no covariate varies within a subject.
+fn csv(times: &[u32], arms: bool) -> String {
+    let mut rows = String::from(HEADER);
+    for s in 1..=3u32 {
+        for (v, &t) in times.iter().enumerate() {
+            for trt in 0..=1u32 {
+                for k in 0..4u32 {
+                    let dv = u32::from((s + v as u32 + trt + k) % 3 == 0 || k == trt);
+                    let x = if arms { trt } else { 0 };
+                    rows.push_str(&format!("{s},{s},{t},{dv},1,0,0,{x}\n"));
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// Parse `text` and read `csv` for it through the file reader, which is what writes the
+/// per-record snapshots and routes the rows to `obs_records`.
+fn read(text: &str, csv: &str) -> (ParsedModel, Population) {
+    use std::io::Write as _;
+    let parsed = parse_full_model(text).unwrap();
+    let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    f.write_all(csv.as_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let pop = crate::api::read_population_for(&parsed.model, &None, &path, None, None, None, &[])
+        .expect("fixture data reads")
+        .0;
+    (parsed, pop)
+}
+
+fn bound(text: &str, csv: &str) -> Result<(ParsedModel, Population), String> {
+    let (mut parsed, mut pop) = read(text, csv);
+    crate::api::bind_theta_levels(&mut parsed, text, &mut pop).map_err(|e| e.to_string())?;
+    Ok((parsed, pop))
+}
+
+/// Per record of `subject`, `(STUDY, TIME as written, index)`.
+fn record_levels(subject: &Subject) -> Vec<(f64, f64, f64)> {
+    let col = level_index_column("PLACEBO");
+    let snaps = subject.record_covariate_snapshots();
+    subject
+        .obs_records
+        .iter()
+        .enumerate()
+        .map(|(r, rec)| {
+            let ObsRecord::DiscreteState { raw_time, .. } = rec else {
+                panic!("binary fixture: discrete records only");
+            };
+            let cov = subject.record_cov(snaps, r);
+            (cov["STUDY"], *raw_time, cov[&col])
+        })
+        .collect()
+}
+
+/// L1 + L2. On binary-only data with no time-varying covariate, the block's levels are
+/// the studies × visits the binary records show, and every record carries the index of
+/// its own level in a snapshot the binder made (the reader made none). Each label's
+/// index is its position in the bound labels.
+///
+/// Mutations: drop the discrete records from `level_rows` and the binding is refused
+/// ("the data carries no observation rows"); write the index into the baseline only and
+/// the visit-4 records read visit 0's index; skip materialising the snapshots and none
+/// is aligned.
+#[test]
+fn binary_records_define_the_levels_and_each_carries_its_own() {
+    let text = no_arm();
+    let data = csv(&[0, 4], false);
+    let (_, unbound) = read(&text, &data);
+    assert!(
+        unbound.subjects[0].endpoint_covariates.is_empty(),
+        "fixture precondition: the reader writes no snapshot without a time-varying covariate"
+    );
+    let (parsed, pop) = bound(&text, &data).expect("binary records define the levels");
+    let labels = parsed.model.theta_blocks().level_blocks()[0]
+        .labels()
+        .to_vec();
+    assert_eq!(
+        labels,
+        [1, 2, 3]
+            .iter()
+            .flat_map(|s| [0, 4].map(|t| format!("STUDY={s},TIME={t}")))
+            .collect::<Vec<_>>()
+    );
+    for subject in &pop.subjects {
+        assert!(
+            subject.record_covariate_snapshots().is_some(),
+            "subject {}: the binder materialises aligned snapshots",
+            subject.id
+        );
+        let levels = record_levels(subject);
+        assert_eq!(levels.len(), 16, "subject {}", subject.id);
+        for (study, time, index) in levels {
+            let want = labels
+                .iter()
+                .position(|l| *l == format!("STUDY={study},TIME={time}"))
+                .unwrap()
+                + 1;
+            assert_eq!(index, want as f64, "subject {} TIME {time}", subject.id);
+        }
+    }
+}
+
+/// L1 with a time-varying covariate: the reader's own snapshots carry the index, and
+/// `TRT` survives in them. This is B1's shape, which needed both halves of #2562.
+#[test]
+fn binary_records_carry_the_index_beside_their_own_covariates() {
+    let (_, pop) = bound(BINARY, &csv(&[0, 4, 8], true)).expect("B1's shape binds");
+    let s = &pop.subjects[1];
+    let snaps = s.record_covariate_snapshots().expect("aligned");
+    let trts: Vec<f64> = snaps.iter().map(|m| m["TRT"]).collect();
+    assert!(
+        trts.contains(&0.0) && trts.contains(&1.0),
+        "TRT kept: {trts:?}"
+    );
+    let indices: Vec<f64> = record_levels(s).iter().map(|l| l.2).collect();
+    assert_eq!(
+        {
+            let mut u = indices.clone();
+            u.dedup();
+            u
+        },
+        vec![4.0, 5.0, 6.0],
+        "study 2's three visits, in file order"
+    );
+}
+
+/// L3. A discrete record's `TIME` key is the time as written. After an `EVID=3` reset
+/// the reader runs the records on a shifted clock; their level must still be the written
+/// visit, so both periods share the visit-0 and visit-4 levels.
+///
+/// Mutation: key a record on its engine `time` and the second period's visits become
+/// new levels (`TIME=` a shifted value).
+#[test]
+fn a_record_after_a_reset_keys_on_its_written_time() {
+    let mut data = String::from(HEADER);
+    for s in 1..=3u32 {
+        for period in 0..2u32 {
+            if period == 1 {
+                data.push_str(&format!("{s},{s},0,.,1,3,1,0\n"));
+            }
+            for t in [0u32, 4] {
+                for k in 0..4u32 {
+                    let dv = u32::from((s + t + k + period) % 2 == 0);
+                    data.push_str(&format!("{s},{s},{t},{dv},1,0,0,0\n"));
+                }
+            }
+        }
+    }
+    let text = no_arm();
+    let (_, raw) = read(&text, &data);
+    let shifted = raw.subjects[0]
+        .obs_records
+        .iter()
+        .any(|r| matches!(r, ObsRecord::DiscreteState { time, raw_time, .. } if time != raw_time));
+    assert!(
+        shifted,
+        "fixture precondition: the reset shifts the engine clock"
+    );
+    let (parsed, _) = bound(&text, &data).expect("binds");
+    let labels = parsed.model.theta_blocks().level_blocks()[0]
+        .labels()
+        .to_vec();
+    assert_eq!(labels.len(), 6, "3 studies × 2 written visits: {labels:?}");
+    assert!(labels
+        .iter()
+        .all(|l| l.ends_with("TIME=0") || l.ends_with("TIME=4")));
+}
+
+/// F1. The index check re-derives each binary record's index from its own level and
+/// compares the one the predictor reads, naming the record's written time.
+///
+/// Mutation: let the check skip discrete records and the edited index goes unseen.
+#[test]
+fn the_index_check_reads_each_binary_record() {
+    let (parsed, mut pop) = bound(&no_arm(), &csv(&[0, 4], false)).expect("binds");
+    let decl = &parsed.model.theta_blocks().level_blocks()[0];
+    assert_eq!(level_index_finding(decl, &pop), None, "as bound");
+    let col = level_index_column("PLACEBO");
+    let s = &mut pop.subjects[2];
+    let r = s.obs_records.len() - 1;
+    s.endpoint_covariates[r].insert(col, 1.0);
+    match level_index_finding(decl, &pop) {
+        Some(LevelIndexFinding::Misindexed {
+            id,
+            time,
+            label,
+            want,
+            got,
+        }) => {
+            assert_eq!(id, "3");
+            assert_eq!(time, Some(4.0));
+            assert_eq!(label, "STUDY=3,TIME=4");
+            assert_eq!((want, got), (6, Some(1.0)));
+        }
+        other => panic!("an edited binary index is a finding: {other:?}"),
+    }
+}
+
+/// `contrast = auto` sees the study η the predictor reads beside the block (#1649): the
+/// block absorbs it, so auto resolves to the within-study contrast, as on a Gaussian
+/// `y`. The η walk has to see the `[binary_model]` predictor for that.
+///
+/// Mutation: leave the binary predictor out of the coupling walk's readouts and auto
+/// resolves to a global sum-to-zero (one free level per study and visit but one).
+#[test]
+fn auto_sees_the_eta_the_binary_predictor_reads_with_the_block() {
+    let text = BINARY.replace(", contrast = sum_to_zero_within", "");
+    let (parsed, _) = bound(&text, &csv(&[0, 4, 8], true)).expect("binds");
+    let decl = &parsed.model.theta_blocks().level_blocks()[0];
+    assert_eq!(decl.contrast(), LevelContrast::SumToZeroWithin);
+}
+
+/// A subject that also carries a time-to-event record cannot have one snapshot per
+/// record, so its binary records cannot each carry their own level: refused, naming
+/// both levels, rather than scored at the first. Both sides of the gate in one test:
+/// subjects with one level each on all their binary records bind, each at its own.
+///
+/// Mutations: drop the refusal and the first binding succeeds; refuse every unaligned
+/// subject and the second is refused.
+#[test]
+fn a_subject_with_tte_records_is_refused_only_when_its_levels_differ() {
+    let text = r#"
+[parameters]
+  theta LAM(0.1, 0.001, 10.0)
+  theta PLACEBO[STUDY, TIME, contrast = none](0.0)
+[covariates]
+  STUDY categorical
+[binary_model]
+  cmt   = 1
+  logit = PLACEBO
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = LAM
+"#;
+    let state = |time: f64, state: usize| ObsRecord::DiscreteState {
+        time,
+        raw_time: time,
+        state,
+        cmt: 1,
+    };
+    let subject = |id: u32, study: f64, times: [f64; 2]| {
+        let mut s = Subject {
+            id: id.to_string(),
+            ..Default::default()
+        };
+        s.covariates.insert("STUDY".into(), study);
+        s.obs_records = vec![
+            state(times[0], 1),
+            state(times[0], 0),
+            state(times[1], 1),
+            state(times[1], 0),
+            ObsRecord::Event {
+                time: 9.0,
+                event_type: crate::types::EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        s
+    };
+    let population = |subjects: Vec<Subject>| Population {
+        subjects,
+        covariate_names: vec!["STUDY".into()],
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let mut p = parse_full_model(text).unwrap();
+    let mut pop = population(vec![subject(1, 1.0, [0.0, 4.0])]);
+    let err = crate::api::bind_theta_levels(&mut p, text, &mut pop)
+        .expect_err("one subject, two levels, no aligned snapshot")
+        .to_string();
+    assert_eq!(
+        err,
+        "theta PLACEBO[...]: subject 1 also carries time-to-event records, so its records \
+         cannot each carry their own level of the block, and they are at more than one \
+         (STUDY=1,TIME=0 and, at record 2, STUDY=1,TIME=4). Key the block on columns that are \
+         constant within the subject, or fit the time-to-event endpoint separately."
+    );
+    let mut p = parse_full_model(text).unwrap();
+    let mut pop = population(vec![
+        subject(1, 1.0, [0.0, 0.0]),
+        subject(2, 2.0, [4.0, 4.0]),
+    ]);
+    crate::api::bind_theta_levels(&mut p, text, &mut pop).expect("one level per subject binds");
+    let col = level_index_column("PLACEBO");
+    let got: Vec<f64> = pop.subjects.iter().map(|s| s.covariates[&col]).collect();
+    assert_eq!(
+        got,
+        vec![1.0, 2.0],
+        "each at its own level, in the baseline"
+    );
+}
+
+/// Three studies (one subject each) of state records on CMT 5 at visits 0, 1, 2, 3,
+/// alternating states so every transition is observed.
+#[cfg(feature = "markov")]
+fn state_population() -> Population {
+    let subjects = (1..=3u32)
+        .map(|s| {
+            let mut subject = Subject {
+                id: s.to_string(),
+                ..Default::default()
+            };
+            subject.covariates.insert("STUDY".into(), f64::from(s));
+            subject.obs_records = (0..8u32)
+                .map(|k| {
+                    let t = f64::from(k / 2);
+                    ObsRecord::DiscreteState {
+                        time: t,
+                        raw_time: t,
+                        state: ((k + s) % 2) as usize,
+                        cmt: 5,
+                    }
+                })
+                .collect();
+            subject
+        })
+        .collect();
+    Population {
+        subjects,
+        covariate_names: vec!["STUDY".into()],
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// M. A DTMM transition probability reads each record's own snapshot (#2473), so its
+/// records define the levels of a block it reads, each carrying its own index, as a
+/// binary predictor's do.
+///
+/// Mutation: leave the DTMM arm out of `level_record_cmts` and the binding is refused
+/// as having no observation rows.
+#[cfg(feature = "markov")]
+#[test]
+fn dtmm_records_define_the_levels_of_a_block_their_probabilities_read() {
+    let text = r"
+[parameters]
+  theta A(-0.8, -10.0, 10.0)
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0)
+[covariates]
+  STUDY categorical
+[markov_model]
+  type   = dtmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = inv_logit(A + PLACEBO)
+  transition asleep -> awake  = inv_logit(A)
+";
+    let mut parsed = parse_full_model(text).unwrap();
+    let mut pop = state_population();
+    crate::api::bind_theta_levels(&mut parsed, text, &mut pop)
+        .unwrap_or_else(|e| panic!("DTMM records define the levels: {e}"));
+    let labels = parsed.model.theta_blocks().level_blocks()[0]
+        .labels()
+        .to_vec();
+    assert_eq!(labels.len(), 12, "3 studies × 4 visits: {labels:?}");
+    for subject in &pop.subjects {
+        let levels = record_levels(subject);
+        for (study, time, index) in levels {
+            let want = labels
+                .iter()
+                .position(|l| *l == format!("STUDY={study},TIME={time}"))
+                .unwrap()
+                + 1;
+            assert_eq!(index, want as f64, "subject {} TIME {time}", subject.id);
+        }
+    }
+}
+
+/// A CTMM generator is built once per subject from the baseline, so its records define
+/// no levels (#2562), and a block whose index changes within a subject (here between two
+/// Gaussian observations) is refused by `E_ENDPOINT_TV_COVARIATE`, naming the block
+/// rather than its synthesized `__level_` column. The control: an index constant within
+/// the subject passes.
+///
+/// Mutation: name the input as a covariate and the message names `__level_PLACEBO`.
+#[cfg(feature = "markov")]
+#[test]
+fn a_ctmm_generator_reading_a_changing_level_is_refused_naming_the_block() {
+    let model = parse_full_model(
+        r"
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta PLACEBO[STUDY, TIME](0.0)
+[covariates]
+  STUDY categorical
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + PLACEBO)
+  transition asleep -> awake  = exp(LQ10)
+",
+    )
+    .unwrap()
+    .model;
+    assert!(
+        model.theta_blocks().level_blocks()[0]
+            .record_cmts
+            .is_empty(),
+        "a CTMM's records define no levels"
+    );
+    let col = level_index_column("PLACEBO");
+    let population = |second: f64| {
+        let mut s = Subject {
+            id: "1".into(),
+            obs_times: vec![0.0, 1.0],
+            observations: vec![0.0; 2],
+            obs_cmts: vec![1; 2],
+            cens: vec![0; 2],
+            ..Default::default()
+        };
+        s.covariates.insert(col.clone(), 1.0);
+        s.obs_covariates = vec![
+            HashMap::from([(col.clone(), 1.0)]),
+            HashMap::from([(col.clone(), second)]),
+        ];
+        Population {
+            subjects: vec![s],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    };
+    let refused = crate::api::check_survival_tv_covariates(&model, &population(2.0));
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(
+        refused[0].message,
+        "[markov_model] on CMT=5: a transition intensity references θ level block `PLACEBO`, \
+         whose level changes between records, which is time-varying for subject `1`. \
+         Time-varying covariates on the generator are not yet supported — the generator is \
+         evaluated at the baseline covariate value (time-homogeneous CTMM), so the fit would \
+         silently use the wrong intensity (#741). A drug-driven Q(t) is Phase 6; use a \
+         time-constant (baseline) covariate for now."
+    );
+    assert!(
+        crate::api::check_survival_tv_covariates(&model, &population(1.0)).is_empty(),
+        "an index constant within the subject passes"
+    );
+}
+
+/// The binary arm of `E_ENDPOINT_TV_COVARIATE` names a level block by its name, and its
+/// remedy is to re-key the block, not to "hold `__level_PLACEBO` constant". Reached by
+/// an in-memory subject whose records carry a changing index but whose snapshots cannot
+/// align (it also has a time-to-event record); the binder refuses such a subject first.
+///
+/// Mutations: name the input as a covariate, or give the covariate remedy, and the text
+/// dies.
+#[test]
+fn the_binary_refusal_names_a_changing_level_block_and_how_to_re_key_it() {
+    let model = parse_full_model(&no_arm()).unwrap().model;
+    let col = level_index_column("PLACEBO");
+    let mut s = Subject {
+        id: "7".into(),
+        ..Default::default()
+    };
+    s.covariates.insert(col.clone(), 1.0);
+    s.obs_records = vec![
+        ObsRecord::DiscreteState {
+            time: 0.0,
+            raw_time: 0.0,
+            state: 1,
+            cmt: 1,
+        },
+        ObsRecord::Event {
+            time: 9.0,
+            event_type: crate::types::EventType::RightCensored,
+            entry_time: 0.0,
+            cmt: 2,
+        },
+    ];
+    s.endpoint_covariates = vec![
+        HashMap::from([(col.clone(), 1.0)]),
+        HashMap::from([(col.clone(), 2.0)]),
+    ];
+    let pop = Population {
+        subjects: vec![s],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let refused = crate::api::check_survival_tv_covariates(&model, &pop);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(
+        refused[0].message,
+        "[binary_model] on CMT=1: the logit predictor references θ level block `PLACEBO`, \
+         whose level changes between records, which is time-varying for subject `7`, but that \
+         subject carries no per-record covariate snapshot aligned with its binary records (it \
+         also has time-to-event records, or was built in memory without \
+         `endpoint_covariates`), so the predictor could only read the baseline value (#741). \
+         Key `PLACEBO` on columns that are constant within the subject, or fit the binary \
+         endpoint without the time-to-event endpoint."
+    );
+}
+
+/// #1797's refusal for a subject scored on something that reads the block at a level no
+/// record defines says which records define the levels: here the binary records on CMT 1
+/// as well as the Gaussian ones, since the TTE-only subject's `STUDY=3` appears on
+/// neither. With no reading discrete endpoint the sentence keeps its Gaussian-only form
+/// (pinned in `theta_levels_tests`).
+///
+/// Mutation: drop the `records` clause and the sentence claims the Gaussian records alone.
+#[test]
+fn the_unindexed_refusal_names_the_records_that_define_levels() {
+    let text = r#"
+[parameters]
+  theta LAM(0.1, 0.001, 10.0)
+  theta PLACEBO[STUDY, contrast = none](0.0)
+[covariates]
+  STUDY categorical
+[binary_model]
+  cmt   = 1
+  logit = PLACEBO
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = LAM * exp(PLACEBO)
+"#;
+    let subject = |id: u32, records: Vec<ObsRecord>| {
+        let mut s = Subject {
+            id: id.to_string(),
+            ..Default::default()
+        };
+        s.covariates.insert("STUDY".into(), f64::from(id));
+        s.obs_records = records;
+        s
+    };
+    let state = |state: usize| ObsRecord::DiscreteState {
+        time: 0.0,
+        raw_time: 0.0,
+        state,
+        cmt: 1,
+    };
+    let tte = ObsRecord::Event {
+        time: 9.0,
+        event_type: crate::types::EventType::Exact,
+        entry_time: 0.0,
+        cmt: 2,
+    };
+    let mut pop = Population {
+        subjects: vec![
+            subject(1, vec![state(1), state(0)]),
+            subject(2, vec![state(0), state(0), state(1)]),
+            subject(3, vec![tte]),
+        ],
+        covariate_names: vec!["STUDY".into()],
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let mut parsed = parse_full_model(text).unwrap();
+    let err = crate::api::bind_theta_levels(&mut parsed, text, &mut pop)
+        .expect_err("subject 3's hazard reads a level no record defines")
+        .to_string();
+    assert!(
+        err.contains(
+            " The block's levels are discovered from Gaussian observation records and the \
+             records on CMT 1 only, so a level that only such subjects show is not one of them."
+        ),
+        "{err}"
+    );
+
+    // The fit's levels, re-read with subject 3: the same claim about the fit.
+    let fit_pop = |subjects: Vec<Subject>| Population {
+        subjects,
+        ..pop.clone()
+    };
+    let mut parsed = parse_full_model(text).unwrap();
+    // Subject 1 also carries an event, so `LAM` is identified on the fit's data.
+    let mut with_event = pop.subjects[..2].to_vec();
+    with_event[0]
+        .obs_records
+        .push(pop.subjects[2].obs_records[0].clone());
+    let mut fitted = fit_pop(with_event);
+    crate::api::bind_theta_levels(&mut parsed, text, &mut fitted).expect("studies 1 and 2 bind");
+    let mut reread = fit_pop(pop.subjects.clone());
+    let err = crate::api::levels::write_fitted_level_columns(
+        &parsed.model,
+        &mut reread,
+        &parsed.model.data_bindings().levels,
+    )
+    .expect_err("the fit has no theta for STUDY=3")
+    .message;
+    assert!(
+        err.contains(
+            " A level's theta exists only for a combination the fit's Gaussian observations \
+             and the records on CMT 1 showed."
+        ),
+        "{err}"
+    );
+}
+
+/// The data-side half of absorption reads the binary records too. A study η that enters
+/// only through the arm — on the drug effect, or scaled by `TRT` — moves the two arms of
+/// one study-visit level differently, so the block cannot carry it: the records at one
+/// level are not replicates (`resolves_observations`), and `TRT` is not constant within
+/// a study (`constant_within_units`). Auto then resolves as for a block with no η, to the
+/// global sum-to-zero. The control is B1, where the η sits beside the block and is
+/// absorbed (`auto_sees_the_eta_the_binary_predictor_reads_with_the_block`).
+///
+/// Mutations: walk only the Gaussian observations in `resolves_observations` or in
+/// `constant_within_units` (both then hold vacuously on binary-only data) and the η reads
+/// as absorbed.
+#[test]
+fn an_eta_on_the_arm_is_not_absorbed_by_a_visit_block() {
+    for logit in [
+        "TVL + PLACEBO + EMAX * TRT * exp(ETA_S)",
+        "TVL + PLACEBO + EMAX * TRT + ETA_S * TRT",
+    ] {
+        let text = BINARY
+            .replace(", contrast = sum_to_zero_within", "")
+            .replace("TVL + PLACEBO + ETA_S + EMAX * TRT", logit);
+        let (parsed, _) =
+            bound(&text, &csv(&[0, 4, 8], true)).unwrap_or_else(|e| panic!("{logit}: {e}"));
+        let decl = &parsed.model.theta_blocks().level_blocks()[0];
+        assert_eq!(decl.contrast(), LevelContrast::SumToZero, "{logit}");
+    }
+}
+
+/// A block keyed on the visit alone is shared by every study, so its levels do not nest
+/// in the study η's units (`levels_nest_in_units`, on the binary records) and the η beside
+/// it is not absorbed: auto resolves to the global sum-to-zero.
+///
+/// Mutation: walk only the Gaussian observations in `levels_nest_in_units` (it then
+/// holds vacuously) and the η reads as absorbed.
+#[test]
+fn a_visit_block_shared_by_studies_does_not_absorb_the_study_eta() {
+    let text = BINARY.replace(
+        "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]",
+        "PLACEBO[TIME]",
+    );
+    let (parsed, _) = bound(&text, &csv(&[0, 4, 8], true)).unwrap_or_else(|e| panic!("{e}"));
+    let decl = &parsed.model.theta_blocks().level_blocks()[0];
+    assert_eq!(decl.contrast(), LevelContrast::SumToZero);
+}

@@ -14802,6 +14802,11 @@ mod level_uncertainty {
     }
 }
 
+/// A level block read by a discrete-state endpoint (#2562).
+#[cfg(feature = "survival")]
+#[path = "theta_levels_binary_tests.rs"]
+mod binary_records;
+
 /// A level `TIME` key reads the time as written (#1959, #1796).
 #[path = "theta_levels_written_time_tests.rs"]
 mod written_time_keys;

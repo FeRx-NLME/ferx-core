@@ -5303,7 +5303,19 @@ pub fn parse_full_model_with(
             &pk_param_map,
             &indiv_var_names,
         );
-        let readout_with_states = states.readout(&readout, blocks.contains_key("scaling"));
+        let mut readout_with_states = states.readout(&readout, blocks.contains_key("scaling"));
+        // #2562: a `[binary_model]` predictor is a prediction too. It reads no state,
+        // so it joins both readout lists as written.
+        let binary_readouts = binary_predictor_exprs(
+            blocks,
+            &extracted.named,
+            &theta_names,
+            &eta_names,
+            &indiv_stmts,
+        );
+        let mut readout = readout;
+        readout.extend(binary_readouts.iter().cloned());
+        readout_with_states.extend(binary_readouts.iter().cloned());
         for decl in level_block_decls.iter_mut() {
             decl.scale_share =
                 block_shares_scale_with_eta(&indiv_stmts, &readout, &decl.name, None);
@@ -5341,9 +5353,15 @@ pub fn parse_full_model_with(
         // divisor as `state / obs_scale` (#2103 review #1). An `obs_scale` is not a
         // `y` key, so without this a block in it reached no readout at all.
         let mut readouts: Vec<(String, Expression)> = readout_with_states
+            [..readout_with_states.len() - binary_readouts.len()]
             .iter()
             .map(|e| (Y_READOUT.to_string(), e.clone()))
             .collect();
+        readouts.extend(
+            binary_readouts
+                .iter()
+                .map(|e| (BINARY_READOUT.to_string(), e.clone())),
+        );
         // Every block's reads, not only a profiled one's: `read_index` reads them all.
         if let Some(lines) = blocks.get("scaling") {
             for (key, e) in scaling_key_exprs(
@@ -5365,17 +5383,26 @@ pub fn parse_full_model_with(
                 ));
             }
         }
+        // An `[event_model]` hazard or a `[markov_model]` expression is not walked: no
+        // profiled block may be read there (`check_profiled_levels`' `E_PROFILE_SCOPE`
+        // refuses every such model), so "no prediction reads it" would be a claim the
+        // walk cannot make (#2562).
+        let unwalked_endpoint = ["event_model", "markov_model"]
+            .iter()
+            .any(|b| blocks.contains_key(*b) || extracted.named.contains_key(*b));
         for block in &profiled {
             let others: Vec<String> = profiled.iter().filter(|o| *o != block).cloned().collect();
-            let linked = profile_route_check(
+            let linked = match profile_route_check(
                 &indiv_stmts,
                 &readouts,
                 &error_lines,
                 block,
                 &others,
                 &states,
-            )
-            .map_err(|(why, site)| profile_route_message(block, &why, &site))?;
+            ) {
+                Err((ProfileRouteBreak::Unread, _)) if unwalked_endpoint => false,
+                r => r.map_err(|(why, site)| profile_route_message(block, &why, &site))?,
+            };
             if let Some(d) = vector_theta_decls.iter_mut().find(|d| d.name == *block) {
                 d.linked = linked;
             }
@@ -19326,8 +19353,8 @@ pub(crate) fn level_index_column(block: &str) -> String {
     format!("{LEVEL_INDEX_PREFIX}{block}")
 }
 
-/// The CMTs of the discrete-state endpoints whose expression reads the level index
-/// column `index`, sorted ([`LevelBlockDecl::record_cmts`], #2562). An endpoint's
+/// The CMTs of the per-record discrete-state endpoints whose expression reads the level
+/// index column `index`, sorted ([`LevelBlockDecl::record_cmts`], #2562). An endpoint's
 /// covariate list includes the columns reached through `[individual_parameters]`, so a
 /// block read through an individual parameter counts.
 #[cfg(feature = "survival")]
@@ -19344,11 +19371,6 @@ fn level_record_cmts(
             E::Dtmm {
                 prob_covariates, ..
             } => prob_covariates.iter().any(|c| c == index),
-            #[cfg(feature = "markov")]
-            E::Ctmm {
-                generator_covariates,
-                ..
-            } => generator_covariates.iter().any(|c| c == index),
             _ => false,
         };
         if reads {
@@ -23225,11 +23247,12 @@ pub struct LevelBlockDecl {
     pub(crate) eta_readers: Vec<Vec<String>>,
     /// Synthesized per-record index column the implicit gather reads.
     pub(crate) index_covariate: String,
-    /// Set by the parse: the CMTs of the discrete-state endpoints (`[binary_model]`, a
-    /// DTMM or CTMM `[markov_model]`) whose expression reads this block, sorted (#2562).
-    /// Their records define levels as the Gaussian observations do, and carry the index
-    /// in their per-record covariate snapshot. Time-to-event records never do: one data
-    /// row can yield zero or two of them.
+    /// Set by the parse: the CMTs of the discrete-state endpoints whose expression reads
+    /// this block and is evaluated per record — `[binary_model]` and a DTMM
+    /// `[markov_model]` — sorted (#2562). Their records define levels as the Gaussian
+    /// observations do, and carry the index in their per-record covariate snapshot. A
+    /// CTMM generator is built once per subject from the baseline, and one time-to-event
+    /// data row can yield zero or two records, so neither defines levels.
     pub(crate) record_cmts: Vec<usize>,
 }
 
@@ -24762,6 +24785,46 @@ pub(crate) enum ProfileRouteSite {
 /// The label [`profile_route_check`] gives the `y` readouts.
 pub(crate) const Y_READOUT: &str = "the `y` readout";
 
+/// The label [`profile_route_check`] gives a `[binary_model]` predictor (#2562). Its
+/// logit link is implicit: the predictor is the link's argument, walked as an affine read,
+/// and a block it reads is `linked`.
+pub(crate) const BINARY_READOUT: &str = "the `[binary_model]` predictor";
+
+/// Every `[binary_model]` block's `logit` expression, the unnamed block first and the
+/// named ones by label, for the walks
+/// that judge how a level block reaches a prediction (#2562). Parsed as
+/// `parse_binary_model_block` parses it; a line that does not parse is left out here, since
+/// that parse reports it.
+fn binary_predictor_exprs(
+    blocks: &HashMap<String, Vec<String>>,
+    named: &HashMap<String, HashMap<String, Vec<String>>>,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_stmts: &[Statement],
+) -> Vec<Expression> {
+    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+    let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
+    // Named blocks by label, so the first site a refusal names does not depend on the
+    // map's order.
+    let mut labelled: Vec<(&String, &Vec<String>)> = named
+        .get("binary_model")
+        .map(|m| m.iter().collect())
+        .unwrap_or_default();
+    labelled.sort_by(|a, b| a.0.cmp(b.0));
+    blocks
+        .get("binary_model")
+        .into_iter()
+        .chain(labelled.into_iter().map(|(_, lines)| lines))
+        .flat_map(|lines| lines.iter())
+        .filter_map(|line| {
+            let (key, value) = line.trim().split_once('=')?;
+            (key.trim() == "logit")
+                .then(|| parse_scalar_expression(value.trim(), ctx).ok())
+                .flatten()
+        })
+        .collect()
+}
+
 /// Whether `f` is a logit link, the one function a profiled block may be read through
 /// (#2111).
 fn is_logit_link(f: &str) -> bool {
@@ -24843,7 +24906,9 @@ pub(crate) fn profile_route_check(
         }
         read = true;
         let site = ProfileRouteSite::Readout(label.clone());
-        match walk.outer_link(e, ctx.out(), &site) {
+        // A `[binary_model]` predictor is the argument of its implicit logit link (#2562).
+        let implicit = (label == BINARY_READOUT).then_some(vec![(e, ctx.out(), site.clone())]);
+        match implicit.or_else(|| walk.outer_link(e, ctx.out(), &site)) {
             Some(args) => {
                 linked = true;
                 for (arg, at, site) in args {

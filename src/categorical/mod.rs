@@ -1037,3 +1037,150 @@ pub(crate) mod exact_eta_hessian_tests {
         assert!(worst_closed < 1e-12, "{worst_closed:.2e}");
     }
 }
+
+/// The predictor reads each record's own covariate snapshot (#2562).
+#[cfg(test)]
+mod per_record_covariate_tests {
+    use super::*;
+    use crate::parser::model_parser::parse_model_string;
+
+    const XS: [f64; 3] = [0.0, 1.0, 2.5];
+    const STATES: [usize; 3] = [0, 1, 1];
+    const THETA: [f64; 2] = [-0.4, 0.8];
+    const ETA: [f64; 1] = [0.3];
+
+    fn model() -> CompiledModel {
+        parse_model_string(
+            r"
+[parameters]
+  theta TH0(-0.4, -10.0, 10.0)
+  theta THX(0.8, -10.0, 10.0)
+  omega ETA_0 ~ 0.3
+[binary_model]
+  cmt   = 3
+  logit = TH0 + THX * X + ETA_0
+",
+        )
+        .unwrap()
+    }
+
+    /// Three binary records whose `X` is 0, 1, 2.5 in their own snapshots, against a
+    /// baseline `X` of 0: the first record's value, so a baseline read is wrong on two.
+    fn subject() -> Subject {
+        let x = |v: f64| HashMap::from([("X".to_string(), v)]);
+        Subject {
+            id: "1".into(),
+            covariates: x(XS[0]),
+            obs_records: (0..3)
+                .map(|r| ObsRecord::DiscreteState {
+                    time: r as f64,
+                    raw_time: r as f64,
+                    state: STATES[r],
+                    cmt: 3,
+                })
+                .collect(),
+            endpoint_covariates: XS.iter().map(|&v| x(v)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn lp(r: usize, eta: f64) -> f64 {
+        THETA[0] + THETA[1] * XS[r] + eta
+    }
+
+    fn hand_nll(eta: f64) -> f64 {
+        (0..3)
+            .map(|r| softplus(lp(r, eta)) - STATES[r] as f64 * lp(r, eta))
+            .sum()
+    }
+
+    /// The value path and the dual path (inner η-gradient, η-Hessian, the adjoint's
+    /// jets) both score each record at its own `X`, asserted separately so a failure
+    /// names the side; the η-gradient is `Σ (p − y)`.
+    ///
+    /// Mutations: either path reading `subject.covariates` again dies on its own
+    /// assertion (the baseline-read NLL is 0.95 away).
+    #[test]
+    fn value_and_dual_paths_read_each_records_snapshot() {
+        let (m, s) = (model(), subject());
+        let want = hand_nll(ETA[0]);
+        let baseline: f64 = (0..3)
+            .map(|r| {
+                let l = THETA[0] + ETA[0];
+                softplus(l) - STATES[r] as f64 * l
+            })
+            .sum();
+        assert!(
+            (want - baseline).abs() > 0.5,
+            "fixture is live: {want} vs {baseline}"
+        );
+        let value = binary_subject_nll(&m, &s, &THETA, &ETA);
+        assert!(
+            (value - want).abs() < 1e-12,
+            "value path: {value} vs {want}"
+        );
+        let (dual, grad) = discrete_subject_eta_grad(&m, &s, &THETA, &ETA).expect("in scope");
+        assert!((dual - want).abs() < 1e-12, "dual path: {dual} vs {want}");
+        let g: f64 = (0..3)
+            .map(|r| inv_logit(lp(r, ETA[0])) - STATES[r] as f64)
+            .sum();
+        assert!(
+            (grad[0] - g).abs() < 1e-12,
+            "dual gradient: {} vs {g}",
+            grad[0]
+        );
+    }
+
+    /// `predict_binary`, `binary_diagnostics` (PRED at η = 0 and IPRED) and
+    /// `simulate_binary` report each record's probability at its own `X`.
+    ///
+    /// Mutation: any one of them reading the baseline dies on its own assertion.
+    #[test]
+    fn predictions_diagnostics_and_draws_read_each_records_snapshot() {
+        let (m, s) = (model(), subject());
+        let want = |r: usize, eta: f64| inv_logit(lp(r, eta));
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-14;
+
+        let mut preds = Vec::new();
+        predict_binary(&m, &s, &THETA, &ETA, &mut preds);
+        for (r, p) in preds.iter().enumerate() {
+            let Prediction::CatProbs { probs } = &p.prediction else {
+                panic!("binary prediction");
+            };
+            assert!(
+                close(probs[1], want(r, ETA[0])),
+                "predict_binary record {r}"
+            );
+        }
+
+        let diags = binary_diagnostics(&m, &s, &THETA, &ETA);
+        for (r, d) in diags.iter().enumerate() {
+            assert!(
+                close(d.ipred, want(r, ETA[0])),
+                "diagnostics IPRED record {r}"
+            );
+            assert!(close(d.pred, want(r, 0.0)), "diagnostics PRED record {r}");
+        }
+
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(2562);
+        let (mut sims, mut warnings) = (Vec::new(), Vec::new());
+        simulate_binary(
+            &m,
+            &s,
+            &THETA,
+            &ETA,
+            0,
+            0,
+            &mut rng,
+            &mut sims,
+            &mut warnings,
+        );
+        assert_eq!(sims.len(), 3);
+        for (r, x) in sims.iter().enumerate() {
+            assert!(
+                close(x.ipred, want(r, ETA[0])),
+                "simulate_binary record {r}"
+            );
+        }
+    }
+}

@@ -1333,6 +1333,25 @@ impl Subject {
         }
     }
 
+    /// `Vec::retain_mut` on [`Self::obs_records`] that keeps the per-record covariate
+    /// snapshots aligned (#2562): when [`Self::record_covariate_snapshots`] lines up with
+    /// the records, a dropped record drops its snapshot too.
+    #[cfg(feature = "survival")]
+    pub(crate) fn retain_records(&mut self, mut keep: impl FnMut(&mut ObsRecord) -> bool) {
+        let aligned = self.record_covariate_snapshots().is_some();
+        let mut kept: Vec<bool> = Vec::with_capacity(self.obs_records.len());
+        self.obs_records.retain_mut(|rec| {
+            let k = keep(rec);
+            kept.push(k);
+            k
+        });
+        if aligned {
+            let mut k = kept.into_iter();
+            self.endpoint_covariates
+                .retain(|_| k.next().unwrap_or(true));
+        }
+    }
+
     /// The covariate map record `r` of [`Self::obs_records`] is evaluated with: its own
     /// snapshot when `snaps` (this subject's [`Self::record_covariate_snapshots`], taken
     /// once per walk) aligns, else the baseline map.

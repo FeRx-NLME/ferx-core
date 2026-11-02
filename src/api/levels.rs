@@ -1428,6 +1428,29 @@ fn unit_of(
     }
 }
 
+/// [`unit_of`] for a [`LevelRow`]. A discrete-state record carries no occasion, so on
+/// [`Unit::Occasion`] it lies in none, and a kappa counts nowhere there; under nested
+/// levels its label path is read off its own snapshot (#2562).
+fn unit_of_row(
+    subject: &Subject,
+    snaps: Option<&[HashMap<String, f64>]>,
+    unit: Unit,
+    row: LevelRow,
+    nested: Option<&NestedLevels>,
+) -> Option<Vec<u64>> {
+    match row {
+        LevelRow::Obs(j) => unit_of(subject, unit, j, nested),
+        LevelRow::Record(r) => match unit {
+            Unit::Subject => Some(Vec::new()),
+            Unit::Occasion => None,
+            Unit::Level(l) => {
+                let path = label_path(nested?, subject.record_cov(snaps, r))?;
+                path.get(..=l).map(<[u64]>::to_vec)
+            }
+        },
+    }
+}
+
 /// Whether every level's observation records lie in a single unit (#1678,
 /// #1696): one subject for an η, one occasion of one subject for a kappa, one
 /// group of the kappa's level of one subject under nested levels.
@@ -1446,13 +1469,15 @@ fn levels_nest_in_units(
 ) -> bool {
     let mut owner: HashMap<Vec<u64>, (usize, Vec<u64>)> = HashMap::new();
     for (s, subject) in population.subjects.iter().enumerate() {
-        for j in 0..subject.obs_times.len() {
+        let snaps = subject.record_covariate_snapshots();
+        for row in level_rows(decl, subject) {
             let level: Option<Vec<u64>> = decl
                 .columns()
                 .iter()
-                .map(|c| column_value(subject, c, j).map(f64::to_bits))
+                .map(|c| row_value(subject, snaps, c, row).map(f64::to_bits))
                 .collect();
-            let (Some(level), Some(u)) = (level, unit_of(subject, unit, j, nested)) else {
+            let (Some(level), Some(u)) = (level, unit_of_row(subject, snaps, unit, row, nested))
+            else {
                 return false;
             };
             let u = (s, u);
@@ -1483,23 +1508,50 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population, lagged:
         return false;
     }
     population.subjects.iter().all(|subject| {
-        let mut seen: Vec<(Vec<f64>, usize)> = Vec::new();
-        (0..subject.obs_times.len()).all(|j| {
+        let snaps = subject.record_covariate_snapshots();
+        let mut seen: Vec<(Vec<f64>, LevelRow)> = Vec::new();
+        level_rows(decl, subject).all(|row| {
             let level: Vec<f64> = decl
                 .columns()
                 .iter()
-                .filter_map(|c| column_value(subject, c, j))
+                .filter_map(|c| row_value(subject, snaps, c, row))
                 .collect();
             match seen.iter().find(|(l, _)| *l == level) {
                 // Replicates, so a random effect moves both alike (#2131).
-                Some(&(_, j0)) => replicates(subject, j0, j, lagged),
+                Some(&(_, first)) => match (first, row) {
+                    (LevelRow::Obs(j0), LevelRow::Obs(j)) => replicates(subject, j0, j, lagged),
+                    (LevelRow::Record(r0), LevelRow::Record(r)) => {
+                        records_replicate(subject, snaps, r0, r)
+                    }
+                    // A Gaussian and a discrete record are scored by different
+                    // likelihoods, so a random effect need not move them alike.
+                    _ => false,
+                },
                 None => {
-                    seen.push((level, j));
+                    seen.push((level, row));
                     true
                 }
             }
         })
     })
+}
+
+/// [`replicates`] for two discrete-state records `r0` and `r` (#2562): one written
+/// time, one compartment and one covariate snapshot, so the data gives a random effect no
+/// way to move one and not the other. A record carries no occasion and no lag acts on it.
+fn records_replicate(
+    subject: &Subject,
+    snaps: Option<&[HashMap<String, f64>]>,
+    r0: usize,
+    r: usize,
+) -> bool {
+    let key = |r: usize| match subject.obs_records.get(r) {
+        Some(ObsRecord::DiscreteState { raw_time, cmt, .. }) => Some((raw_time.to_bits(), *cmt)),
+        _ => None,
+    };
+    key(r0).is_some()
+        && key(r0) == key(r)
+        && subject.record_cov(snaps, r0) == subject.record_cov(snaps, r)
 }
 
 /// Whether observation records `j` and `k` of `subject` are replicates: one
@@ -1544,21 +1596,23 @@ fn replicates(subject: &Subject, j: usize, k: usize, lagged: bool) -> bool {
 /// occasion of a subject for a kappa, and within each group of its level for a
 /// kappa of a nested model.
 fn constant_within_units(
+    decl: &LevelBlockDecl,
     covariates: &[String],
     population: &Population,
     unit: Unit,
     nested: Option<&NestedLevels>,
 ) -> bool {
     population.subjects.iter().all(|subject| {
+        let snaps = subject.record_covariate_snapshots();
         covariates.iter().all(|c| {
             // Missing compares like any other value: a column absent from every
             // record is constant, one present on only some records changes.
             let mut first: Vec<(Vec<u64>, Option<f64>)> = Vec::new();
-            (0..subject.obs_times.len()).all(|j| {
-                let Some(u) = unit_of(subject, unit, j, nested) else {
+            level_rows(decl, subject).all(|row| {
+                let Some(u) = unit_of_row(subject, snaps, unit, row, nested) else {
                     return false;
                 };
-                let v = column_value(subject, c, j);
+                let v = row_value(subject, snaps, c, row);
                 match first.iter().find(|(u0, _)| *u0 == u) {
                     Some((_, v0)) => *v0 == v,
                     None => {
@@ -1744,6 +1798,7 @@ fn nesting_units(
 /// `y`. `None` when the walk names no site, which is where the span certificate
 /// is measured ([`spanned`]).
 fn structural_site<'a>(
+    decl: &LevelBlockDecl,
     c: &'a EtaCoupling,
     population: &Population,
     unit: Unit,
@@ -1753,7 +1808,7 @@ fn structural_site<'a>(
     let funnel = c
         .funnels
         .iter()
-        .find(|f| constant_within_units(&f.covariates, population, unit, nested));
+        .find(|f| constant_within_units(decl, &f.covariates, population, unit, nested));
     if let Some(f) = funnel {
         return Some(How::Site(&f.site));
     }
@@ -1793,7 +1848,7 @@ fn placements<'a>(
         .zip(units)
         .map(|(c, unit)| match unit {
             None => Placement::Unnested,
-            Some(unit) => match structural_site(c, population, unit, nested, resolving) {
+            Some(unit) => match structural_site(decl, c, population, unit, nested, resolving) {
                 Some(how) => Placement::Site(how, unit),
                 None => Placement::Silent(unit),
             },
@@ -6327,15 +6382,32 @@ fn unindexed_read_message(
     message.push_str(
         " A subject with no Gaussian observation takes its level from its baseline columns.",
     );
-    message.push_str(match source {
-        LevelSource::Data => {
+    // The records that define levels besides the Gaussian ones (#2562): those of the
+    // discrete-state endpoints that read the block.
+    let records = match decl.record_cmts.as_slice() {
+        [] => String::new(),
+        cmts => format!(
+            " and the records on CMT {}",
+            cmts.iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    message.push_str(&match source {
+        LevelSource::Data if records.is_empty() => {
             " The block's levels are discovered from Gaussian observation records only, \
              so a level that only such subjects show is not one of them."
+                .to_string()
         }
-        LevelSource::Fit => {
+        LevelSource::Data => format!(
+            " The block's levels are discovered from Gaussian observation records{records} \
+             only, so a level that only such subjects show is not one of them."
+        ),
+        LevelSource::Fit => format!(
             " A level's theta exists only for a combination the fit's Gaussian \
-             observations showed."
-        }
+             observations{records} showed."
+        ),
     });
     if read.iter().any(|u| u.why == Why::Time) {
         message.push_str(&format!(
