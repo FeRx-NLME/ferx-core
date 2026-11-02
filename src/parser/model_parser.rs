@@ -24700,9 +24700,11 @@ pub(crate) fn profile_route_check(
         read = true;
         let site = ProfileRouteSite::Readout(label.clone());
         match walk.outer_link(e, ctx.out(), &site) {
-            Some((arg, at, site)) => {
+            Some(args) => {
                 linked = true;
-                walk.affine(arg, at, &site)?;
+                for (arg, at, site) in args {
+                    walk.affine(arg, at, &site)?;
+                }
             }
             None => {
                 walk.affine(e, ctx.out(), &site)?;
@@ -24800,8 +24802,8 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
         ),
         ProfileRouteBreak::InnerLink(c) => format!(
             "Here `{block}` reaches `y` through {c} {at}. A logit link is accepted only as the \
-             whole prediction, `y = inv_logit(c × {block} + …)`, not scaled, added to or \
-             inside another link."
+             whole prediction, `y = inv_logit(c × {block} + …)`, on every branch of an `if` \
+             that chooses it, not scaled, added to or inside another link."
         ),
         ProfileRouteBreak::Unread => unreachable!("answered above"),
     };
@@ -24826,26 +24828,48 @@ impl ProfileWalk<'_, '_> {
         self.ctx.expr_reads(e, self.src, self.taint, at, false)
     }
 
-    /// The argument of the logit link a prediction `e` is, with where it is read: `e`
-    /// itself `inv_logit(arg)` / `expit(arg)`, or a name with one reaching definition
-    /// that is (#2111). `None` when the prediction is anything else, the link included
-    /// once scaled or added to, so the affine walk sees it and refuses it there.
+    /// The arguments of the logit link a prediction `e` is, each with where it is read
+    /// (#2111): `e` itself `inv_logit(arg)` / `expit(arg)`; a name whose reaching
+    /// definitions are; or an `if` (two definitions, or an inline `if`) whose condition
+    /// reads data only and whose every arm reading the block is. One argument per such
+    /// arm, each then walked for an affine read; an arm that does not read the block adds
+    /// none, as it adds `c = 0` to an affine route (#2114). `None` when the prediction is
+    /// anything else, the link included once scaled, added to or on only some arms, so
+    /// the affine walk sees it and refuses it there.
     fn outer_link<'e>(
         &'e self,
         e: &'e Expression,
         at: At<'e>,
         site: &ProfileRouteSite,
-    ) -> Option<(&'e Expression, At<'e>, ProfileRouteSite)> {
+    ) -> Option<Vec<(&'e Expression, At<'e>, ProfileRouteSite)>> {
+        let arms = |parts: Vec<(&'e Expression, At<'e>, ProfileRouteSite)>| {
+            let mut out = Vec::new();
+            for (e, at, site) in parts {
+                if self.reads(e, at) {
+                    out.extend(self.outer_link(e, at, &site)?);
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        };
         match e {
-            Expression::UnaryFn(f, arg) if is_logit_link(f) => Some((arg, at, site.clone())),
-            Expression::Variable(n) | Expression::Covariate(n) => match self.ctx.resolve(at, n) {
-                &[d] => self.outer_link(
-                    self.ctx.assigns[d].rhs,
-                    self.ctx.at(d),
-                    &ProfileRouteSite::Param(n.clone()),
-                ),
-                _ => None,
-            },
+            Expression::UnaryFn(f, arg) if is_logit_link(f) => Some(vec![(arg, at, site.clone())]),
+            Expression::Variable(n) | Expression::Covariate(n) => {
+                let defs = self.ctx.resolve(at, n);
+                if defs.is_empty()
+                    || (defs.len() > 1 && !defs.iter().all(|&d| self.chosen_by_data(d)))
+                {
+                    return None;
+                }
+                let param = ProfileRouteSite::Param(n.clone());
+                arms(
+                    defs.iter()
+                        .map(|&d| (self.ctx.assigns[d].rhs, self.ctx.at(d), param.clone()))
+                        .collect(),
+                )
+            }
+            Expression::Conditional(c, t, f) if self.cond_data_only(c, at) => {
+                arms(vec![(&**t, at, site.clone()), (&**f, at, site.clone())])
+            }
             _ => None,
         }
     }

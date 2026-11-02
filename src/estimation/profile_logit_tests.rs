@@ -81,15 +81,21 @@ fn solve_b2(p: &crate::api::PreparedRun, o: &FitOptions) -> (ProfileSolve, Profi
 struct MatrixDecline;
 
 impl MatrixDecline {
+    /// Every subject's exact matrix declined.
     fn on() -> Self {
-        FORCE_PROFILE_MATRIX_DECLINE.with(|c| c.set(true));
+        Self::subject(usize::MAX)
+    }
+
+    /// Subject `i`'s exact matrix declined, every other one's served.
+    fn subject(i: usize) -> Self {
+        FORCE_PROFILE_MATRIX_DECLINE.with(|c| c.set(Some(i)));
         MatrixDecline
     }
 }
 
 impl Drop for MatrixDecline {
     fn drop(&mut self) {
-        FORCE_PROFILE_MATRIX_DECLINE.with(|c| c.set(false));
+        FORCE_PROFILE_MATRIX_DECLINE.with(|c| c.set(None));
     }
 }
 
@@ -234,6 +240,7 @@ fn the_profile_work_summary_names_the_matrix_counts_only_on_a_linked_block() {
     let linked = ProfileCounts {
         exact_matrices: 28,
         fd_matrices: 2,
+        damped_matrices: 3,
         ..affine
     };
     let base = "Profile solves of the outer optimizer: 5 evaluations (0 solve failures, their \
@@ -242,7 +249,7 @@ fn the_profile_work_summary_names_the_matrix_counts_only_on_a_linked_block() {
     assert_eq!(profile_work_summary(5, 0, &affine), base);
     assert_eq!(
         profile_work_summary(5, 0, &linked),
-        format!("{base}, logit-linked Newton matrices 28 exact / 2 finite-difference")
+        format!("{base}, logit-linked Newton matrices 28 exact / 2 finite-difference, 3 damped")
     );
 }
 
@@ -428,5 +435,104 @@ fn a_linked_block_profiles_under_quadrature() {
             counts.exact_matrices > 0 && counts.fd_matrices == 0,
             "{name}: {counts:?}"
         );
+        // The exact matrix under quadrature is that objective's: against the differenced
+        // one, which re-solves the quadrature term itself.
+        let zero = DVector::zeros(c.model.n_eta);
+        let x = pack_params(&s.params);
+        let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&s.params, &x).unwrap();
+        let mut worst = 0.0_f64;
+        for i in 0..p.population.subjects.len() {
+            let st = c.resolve(i, &s.params, &zero);
+            let se: Vec<f64> = layout.reads[i]
+                .iter()
+                .map(|r| s.level_scale[r.level])
+                .collect();
+            let exact = c
+                .exact_hessian(i, &pt, &st)
+                .expect("served under quadrature");
+            let steps: Vec<f64> = se.iter().map(|v| REF_STEP_SE * v).collect();
+            let fd = c.resolved_hessian(i, &s.params, &st, &steps);
+            for a in 0..se.len() {
+                for b in 0..se.len() {
+                    let e = ((exact[(a, b)] - fd[(a, b)]) * se[a] * se[b]).abs();
+                    assert!(e.is_finite(), "{name} subject {i}");
+                    worst = worst.max(e);
+                }
+            }
+        }
+        eprintln!("agq3 {name}: exact - FD {worst:.3e} (scaled)");
+        assert!(worst < 1e-4, "{name}: {worst:.3e}");
+    }
+}
+
+/// A group where the adjoint serves one subject's matrix and declines the other's: the
+/// exact part and the differenced part are summed into one matrix, and the first pass's
+/// differences are sized by the held pass. On [`b2_slack`] (two subjects per study),
+/// declining subject 0 leaves study 1 mixed; the solve takes as few iterations and lands
+/// on the levels of the undeclined one. Dies when the mixed arm drops either part (a
+/// subject's curvature missing from the group: the iterations or the levels), or does not
+/// count both.
+#[test]
+fn a_group_mixing_exact_and_differenced_matrices_solves_to_the_same_levels() {
+    let p = b2_slack();
+    let layout = layout_of(&p);
+    let g0 = &layout.groups[layout.local[layout.reads[0][0].level].0];
+    assert!(
+        g0.subjects.len() >= 2 && g0.subjects.contains(&0),
+        "the fixture moved"
+    );
+    let o = options(&p);
+    let (all, _) = solve_b2(&p, &o);
+    let (mixed, c) = {
+        let _decline = MatrixDecline::subject(0);
+        solve_b2(&p, &o)
+    };
+    eprintln!(
+        "mixed: {} it {c:?}; ofv gap {:.3e}, levels {:.3e} SE",
+        mixed.iterations,
+        mixed.ofv - all.ofv,
+        beta_gap_se(&layout, &all, &mixed)
+    );
+    assert!(c.exact_matrices > 0 && c.fd_matrices > 0, "{c:?}");
+    assert!(mixed.iterations <= NEWTON_MAX_ITER, "{}", mixed.iterations);
+    assert!((mixed.ofv - all.ofv).abs() < 1e-8);
+    assert!(beta_gap_se(&layout, &all, &mixed) < 1e-6);
+}
+
+/// Through the link the Newton matrix is the true Hessian, and away from the optimum it is
+/// indefinite. At TVL 2.5, EMAX −2 (two studies) the undamped solve failed `Singular`;
+/// damped ([`damped_to_pd`]) it converges, and its point is the minimum of the cold
+/// re-solved objective (the oracle started there, where its matrix is positive definite).
+/// The second point, the inits, needs no damping, so the pair straddles the damping gate.
+/// Dies when the damping is removed (the first point fails) or applied where the matrix is
+/// already positive definite (the inits' count).
+#[test]
+fn an_indefinite_newton_matrix_is_damped_and_the_solve_still_finds_the_minimum() {
+    let p = b2(Some(2), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let mut far = p.init_params.clone();
+    far.theta[0] = 2.5;
+    far.theta[1] = -2.0;
+    for (name, params, damped) in [("far", &far, true), ("inits", &p.init_params, false)] {
+        let mut counts = ProfileCounts::default();
+        let s = c
+            .solve_counted(
+                params,
+                &ProfileWarm::from_template(&layout, params),
+                &mut counts,
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let beta: Vec<f64> = layout.coords.iter().map(|&k| s.params.theta[k]).collect();
+        let (omin, _) = oracle_min(&c, params, &beta);
+        eprintln!(
+            "{name}: {} it, {} damped, solve - oracle {:.3e}",
+            s.iterations,
+            counts.damped_matrices,
+            s.ofv - omin
+        );
+        assert_eq!(counts.damped_matrices > 0, damped, "{name}: {counts:?}");
+        assert!((s.ofv - omin).abs() < 1e-8, "{name}");
     }
 }

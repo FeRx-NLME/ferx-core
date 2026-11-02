@@ -371,6 +371,49 @@ fn bordered_step(
     step.iter().all(|v| v.is_finite()).then_some(step)
 }
 
+/// `m`, the Newton matrix over a linked group's levels, made positive definite over its θ
+/// (`TᵀMT`, positive diagonal) by Levenberg–Marquardt damping, with whether it had to be
+/// (#2111). Through a logit link the exact and differenced matrices are the true Hessian,
+/// and that is indefinite away from the optimum: with Gaussian error each row contributes
+/// `σ′² − (y − σ)σ″`, negative where the prediction sits far from its observation. Without
+/// damping, 39 of 54 structural points of a scan over B2 (TVL × EMAX × ω) failed the solve
+/// with `Singular`, and a B2 fit met 7 such matrices in 813. `M + λ·diag(|M_ll|)`, `λ` from
+/// `1e-4` up by tens: still a descent direction for the line search, and `λ = 0` near the
+/// optimum, where the matrix is positive definite, so the convergence stays quadratic.
+/// `None` when no `λ ≤ 1e8` does, or `m` is not finite.
+fn damped_to_pd(g: &ProfileGroup, m: DMatrix<f64>) -> Option<(DMatrix<f64>, bool)> {
+    let pd = |m: &DMatrix<f64>| {
+        g.theta_diagonal(m)
+            .iter()
+            .all(|d| d.is_finite() && *d > 0.0)
+            && g.theta_matrix(m).cholesky().is_some()
+    };
+    if pd(&m) {
+        return Some((m, false));
+    }
+    if !m.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let n = m.nrows();
+    // A level with no curvature of its own still gets a share of the largest one.
+    let largest = (0..n).map(|l| m[(l, l)].abs()).fold(0.0_f64, f64::max);
+    let scale: Vec<f64> = (0..n)
+        .map(|l| m[(l, l)].abs().max(1e-8 * largest))
+        .collect();
+    let mut lambda = 1e-4;
+    while lambda <= 1e8 {
+        let mut d = m.clone();
+        for (l, s) in scale.iter().enumerate() {
+            d[(l, l)] += lambda * s;
+        }
+        if pd(&d) {
+            return Some((d, true));
+        }
+        lambda *= 10.0;
+    }
+    None
+}
+
 /// The Newton step over a group's θ with the θ in `held` left where they are: the
 /// bordered system when the group has borders and it is positive definite, else the θ
 /// form `−(TᵀMT)_FF⁻¹ (Tᵀg)_F` over the free θ `F`. With nothing held this is the
@@ -1148,7 +1191,7 @@ impl ProfileCtx<'_> {
     /// Newton on the total gradient needs: the GLS matrix of [`Self::held_hessian`] is
     /// exact only while the prediction is affine in the levels. Measured on the bounded
     /// `inv_logit` fixture (10 studies): 3 iterations, quadratic, against the held matrix's
-    /// 9, linear at ~0.1 per step, to the same OFV.
+    /// 7–9 (by its first step), linear at ~0.1 per step, to the same OFV.
     ///
     /// `None` where the subject declines, as [`Self::total_gradient_adjoint`] does: a level
     /// that log-packs, a mode the identity cannot be formed at, or a recorder decline. The
@@ -1566,7 +1609,7 @@ impl ProfileCtx<'_> {
                 .map(|(&i, s)| {
                     let pt = pt
                         .as_ref()
-                        .filter(|_| g.linked && !s.off_mode && !route.declines_matrix())?;
+                        .filter(|_| g.linked && !s.off_mode && !route.declines_matrix(i))?;
                     self.exact_hessian(i, pt, s)
                 })
                 .collect();
@@ -1624,6 +1667,15 @@ impl ProfileCtx<'_> {
                     }
                 }
                 assemble(&parts)
+            };
+            // Through a link the matrix is the true Hessian, which is indefinite away from
+            // the optimum (#2111): damp it to positive definite there.
+            let m = if g.linked {
+                let (m, damped) = damped_to_pd(g, m).ok_or(ProfileFailure::Singular)?;
+                counts.damped_matrices += usize::from(damped);
+                m
+            } else {
+                m
             };
             let se: Vec<f64> = g
                 .theta_diagonal(&m)
@@ -1795,6 +1847,9 @@ pub(crate) struct ProfileCounts {
     /// `resolves`. Zero on an affine block, whose GLS matrix is exact.
     pub(crate) exact_matrices: usize,
     pub(crate) fd_matrices: usize,
+    /// Group Newton matrices on a linked block that were not positive definite and were
+    /// damped until they were ([`damped_to_pd`]).
+    pub(crate) damped_matrices: usize,
 }
 
 impl ProfileCounts {
@@ -1805,6 +1860,7 @@ impl ProfileCounts {
         self.fd_gradients += o.fd_gradients;
         self.exact_matrices += o.exact_matrices;
         self.fd_matrices += o.fd_matrices;
+        self.damped_matrices += o.damped_matrices;
     }
 }
 
@@ -1823,8 +1879,8 @@ pub(crate) fn profile_work_summary(n_evals: usize, n_failed: usize, c: &ProfileC
     // Only a block read through a logit link has a matrix choice to report (#2111).
     if c.exact_matrices + c.fd_matrices > 0 {
         line.push_str(&format!(
-            ", logit-linked Newton matrices {} exact / {} finite-difference",
-            c.exact_matrices, c.fd_matrices
+            ", logit-linked Newton matrices {} exact / {} finite-difference, {} damped",
+            c.exact_matrices, c.fd_matrices, c.damped_matrices
         ));
     }
     line
@@ -1837,9 +1893,10 @@ struct GradientRoute {
     /// Test switch: the subject (population index) whose adjoint gradient is declined.
     #[cfg(test)]
     force_decline: Option<usize>,
-    /// Test switch: every subject's exact Newton matrix is declined.
+    /// Test switch: the subject (population index) whose exact Newton matrix is declined,
+    /// `usize::MAX` for every subject.
     #[cfg(test)]
-    force_matrix_decline: bool,
+    force_matrix_decline: Option<usize>,
     /// Test switch: every group still unconverged after this many Newton steps fails.
     #[cfg(test)]
     fail_after: Option<usize>,
@@ -1854,9 +1911,9 @@ impl GradientRoute {
         false
     }
 
-    fn declines_matrix(&self) -> bool {
+    fn declines_matrix(&self, _i: usize) -> bool {
         #[cfg(test)]
-        if self.force_matrix_decline {
+        if matches!(self.force_matrix_decline, Some(k) if k == _i || k == usize::MAX) {
             return true;
         }
         false
@@ -2014,10 +2071,11 @@ thread_local! {
     /// (population index) adjoint level gradient, so it takes the FD fallback (#2109).
     pub(crate) static FORCE_PROFILE_GRADIENT_DECLINE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
-    /// Test switch: every profile solve started on this thread declines every subject's
-    /// exact Newton matrix on a linked block, so it takes the held one (#2111).
-    pub(crate) static FORCE_PROFILE_MATRIX_DECLINE: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    /// Test switch: every profile solve started on this thread declines this subject's
+    /// (population index; `usize::MAX` for every subject) exact Newton matrix on a linked
+    /// block, so it takes the differenced one (#2111).
+    pub(crate) static FORCE_PROFILE_MATRIX_DECLINE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     /// Test switch: every profile solve started on this thread fails each group still
     /// unconverged after this many Newton steps, so a test reaches a failed group's work.
     pub(crate) static FORCE_PROFILE_GROUP_FAILURE: std::cell::Cell<Option<usize>> =

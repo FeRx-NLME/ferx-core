@@ -277,6 +277,6 @@ fn the_profiled_logit_covariance_is_the_unprofiled_one_at_the_same_point() {
             fu.ofv - fp.ofv
         );
         assert!((fu.ofv - fp.ofv).abs() < 1e-7, "{method}");
-        assert!(worst < 1e-8, "{method}: {worst:.3e}");
+        assert!(worst < 1e-9, "{method}: {worst:.3e}");
     }
 }

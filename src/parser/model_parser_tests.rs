@@ -35651,15 +35651,27 @@ fn linked_of(text: &str, name: &str) -> bool {
 
 const LINK_SENTENCE: &str = "A logit link is accepted only as the whole prediction";
 
+/// The two arms of an `if` on data, each a link around an affine read.
+const LINK_BRANCHES: &str = "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0\n  if (DOSE > 0) {\n    P = \
+                             inv_logit(LP)\n  } else {\n    P = inv_logit(LP - 0.1)\n  }";
+
 /// A logit link around the affine read, as the whole prediction, is accepted and marks
-/// the block `linked`: inline, as `expit`, through the parameter `y` reads, and through a
-/// chain of them. The affine control parses unlinked, so the flag is the link's and not
-/// every profiled block's. Dies when the link is not peeled (each accepted row refused) or
+/// the block `linked`: inline, as `expit`, through the parameter `y` reads, through a
+/// chain of them, and on every branch of an `if` on data, two-definition or inline, an arm
+/// that does not read the block included. The affine control parses unlinked, so the flag
+/// is the link's and not every profiled block's. Dies when the link is not peeled (each
+/// accepted row refused), when only a single definition is peeled (the branch rows), or
 /// when `linked` is set for every block (the control).
 #[test]
 fn profile_accepts_one_outermost_logit_link_and_marks_the_block_linked() {
     let base = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let lp = "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let inline_if = format!("{lp}\n  P = if (DOSE > 0) inv_logit(LP) else inv_logit(LP - 0.1)");
+    let unread_arm = format!("{lp}\n  P = if (DOSE > 0) inv_logit(LP) else 0.5");
     for (indiv, y) in [
+        (LINK_BRANCHES, "P"),
+        (inline_if.as_str(), "P"),
+        (unread_arm.as_str(), "P"),
         (base, "inv_logit(BASE)"),
         (
             "  BASE = TVE0 + ETA_E0",
@@ -35684,14 +35696,19 @@ fn profile_accepts_one_outermost_logit_link_and_marks_the_block_linked() {
 }
 
 /// A link that is not the whole prediction is refused with the link's own sentence:
-/// scaled, added to, scaled through the parameter carrying it, or nested inside another
-/// link, whose outer one is peeled and whose inner one is named. Dies when either
-/// sentence is deleted, or when the outermost-only gate is removed (the scaled rows
-/// would parse).
+/// scaled, added to, scaled through the parameter carrying it, nested inside another
+/// link (whose outer one is peeled and whose inner one is named), or on one branch of an
+/// `if` whose other branch reads the block without one. That last row is
+/// [`LINK_BRANCHES`] with one arm's link removed, so the pair straddles the every-branch
+/// rule. Dies when either sentence is deleted, or when the outermost-only gate is removed
+/// (the scaled rows would parse).
 #[test]
 fn profile_refuses_a_logit_link_that_is_not_the_whole_prediction() {
     let base = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let one_arm = LINK_BRANCHES.replace("inv_logit(LP - 0.1)", "LP - 0.1");
+    assert_ne!(one_arm, LINK_BRANCHES, "the fixture moved");
     for (indiv, y, at) in [
+        (one_arm.as_str(), "P", "in `P` in [individual_parameters]"),
         (base, "100 * inv_logit(BASE)", "in the `y` readout"),
         (base, "inv_logit(BASE) + 0.1", "in the `y` readout"),
         (base, "inv_logit(inv_logit(BASE))", "in the `y` readout"),
@@ -35708,7 +35725,8 @@ fn profile_refuses_a_logit_link_that_is_not_the_whole_prediction() {
         assert!(
             msg.contains(
                 "A logit link is accepted only as the whole prediction, `y = inv_logit(c × \
-                 PLACEBO + …)`, not scaled, added to or inside another link."
+                 PLACEBO + …)`, on every branch of an `if` that chooses it, not scaled, added \
+                 to or inside another link."
             ),
             "{msg}"
         );

@@ -1008,21 +1008,25 @@ logit link, as long as the link is the whole prediction (#2111):
 ```
 
 `expit` is the same link, and it may also be written inline (`y = inv_logit(TVL +
-PLACEBO + …)`) or through a parameter (`P = inv_logit(LP)`, `y = P`). Inside the link the
-rule above applies unchanged: the argument must read the block as `c × block` plus terms
-that do not read it. A function inside the link is refused by name, as it is anywhere.
-So is a link that is not the whole prediction, such as `100 * inv_logit(LP)`,
-`inv_logit(LP) + E` or a link inside a link. The refusal says so.
+PLACEBO + …)`), through a parameter (`P = inv_logit(LP)`, `y = P`), or on every branch of
+an `if` on data (`P = if (TRT > 0) inv_logit(LP) else inv_logit(LP2)`, or the same as two
+assignments). Inside the link the rule above applies unchanged: the argument must read
+the block as `c × block` plus terms that do not read it. A function inside the link is
+refused by name, as it is anywhere. So is a link that is not the whole prediction, such
+as `100 * inv_logit(LP)`, `inv_logit(LP) + E`, a link inside a link, or a link on only
+some branches of an `if`. The refusal says so.
 
 The solve is then a generalised linear model, not least squares, so the least-squares
 Newton matrix no longer fits it. The solve takes the exact Hessian of the fit's own
-objective from the adjoint instead, which is quadratic in the levels' convergence
-(three steps per study on the test fixture). Where the adjoint cannot serve a subject, or
-under `gradient = fd`, it takes the second differences of the objective with the random
-effects re-solved at every point, which converge as fast and cost `2k²` EBE re-solves for
-a subject reading `k` levels. `verbose` reports how many of each it took. Under
-`foce`, `focei`, `laplace` and adaptive quadrature the profiled levels reach the
-unprofiled fit's optimum, and NONMEM's with every level a `THETA` (see
+objective from the adjoint instead, so it converges quadratically (three steps per study
+on the test fixture). Where the adjoint cannot serve a subject, or under `gradient = fd`,
+it takes the second differences of the objective with the random effects re-solved at
+every point, which converge as fast and cost `2k²` EBE re-solves for a subject reading
+`k` levels. Away from the optimum that Hessian can be indefinite; the solve then damps it
+until it is positive definite, which costs steps but keeps each one a descent step.
+`verbose` reports how many matrices of each kind it took. The profiled levels reach the
+unprofiled fit's optimum under `foce`, `focei`, `laplace` and adaptive quadrature, and
+NONMEM's, with every level a `THETA`, under FOCEI and LAPLACE (see
 `nonmem_anchor/README.md`).
 
 A `[binary_model] logit` endpoint cannot read a θ level block yet, profiled or not
