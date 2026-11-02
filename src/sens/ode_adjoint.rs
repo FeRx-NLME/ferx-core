@@ -877,8 +877,8 @@ fn adjoint_gradient(
 /// fit). `None` when `H` is singular or the solve is not finite.
 ///
 /// The indefinite branch also needs the stationarity the identity rests on: there `η̂` came
-/// from the inner search's fallback, which can stop short (Nelder–Mead, max-iter), and the
-/// gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
+/// from a certified or iteration-limited inner search, which need not be stationary in
+/// `‖g‖∞` (see [`MODE_STATIONARY_TOL`]), and the gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
 /// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review) — under AGQ to the held-EBE
 /// score ([`subject_adjoint_held_ebe_score_at`]), not the reconverged one.
 ///
@@ -943,7 +943,9 @@ fn inner_search_gradient<const N: usize>(
 ///
 /// A gradient test of its own, **not** the inner search's certificate restated: a certified
 /// EBE can fail it (#2557). `FallbackCertifier`'s gradient arm (`‖g‖ < tol`) meets it at the
-/// default `inner_tol`, but not above `inner_tol = 1e-4`. Its Newton-step arm
+/// default `inner_tol` in the raw metric, but not above `inner_tol = 1e-4`, and not under
+/// FREM's preconditioned stop (#406), whose posterior-variance weights (~1e-6 on the covariate
+/// pseudo-observation dimensions) admit a raw `|g|∞` near 1e-2. Its Newton-step arm
 /// (`‖H⁻¹g‖ < tol`) admits `|g|` up to `c·tol` along a direction of curvature `c`, and its
 /// resolution arm (`½gᵀH⁻¹g ≤ INNER_FTOL_REL·(1 + |f|)`) bounds no gradient. Measured under
 /// `inner_optimizer = nelder_mead`: a `one_cpt_infusion` EBE certified by the Newton arm at
