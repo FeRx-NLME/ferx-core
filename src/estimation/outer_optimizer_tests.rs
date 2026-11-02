@@ -13285,6 +13285,173 @@ fn the_attempt_hands_an_unmoved_start_to_the_probe_and_publishes_its_verdict() {
     assert!(!ran.get() && !result.stationary_start);
 }
 
+/// #2506 for the optimizers outside NLopt, per PR and with no convergence loop:
+/// [`verify_unmoved_start`] hands a run that did not move to `rerun` once, from a
+/// perturbed start and on `budget`, and acts on each verdict — a verified start keeps
+/// the run's estimates and publishes `left_init = Some(false)` with `stationary_start`,
+/// a lower probe replaces the run, anything else leaves it to the displacement check.
+/// The rerun is a stub returning a one-evaluation result with its verdict-deciding
+/// fields set, so each verdict is forced. It does not run for a run that moved, has no
+/// budget, or has no valid objective.
+#[test]
+fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
+    let (model, pop) = two_cpt_iv_fixture();
+    let opts = options_2506(crate::types::Optimizer::Bfgs);
+    let init = model.default_params.clone();
+    let init_packed = pack_params(&init);
+    let at = |p: &ModelParameters| evaluate_at_initial_params(&model, &pop, p, &opts);
+    let unmoved = || OuterResult {
+        converged: true,
+        n_iterations: 2,
+        ..at(&init)
+    };
+    let start_ofv = unmoved().ofv;
+    // (probe ofv, probe converged) → the verdict it forces.
+    for (probe_ofv, probe_converged, verdict) in [
+        (start_ofv + 0.5 * START_PROBE_TOL, true, Some(true)),
+        (start_ofv - 2.0 * START_PROBE_TOL, false, Some(false)),
+        (start_ofv + 0.5 * START_PROBE_TOL, false, None),
+    ] {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = verify_unmoved_start(
+            &model,
+            &pop,
+            &init,
+            &opts,
+            unmoved(),
+            7,
+            "iterations",
+            None,
+            |p, o| {
+                calls.borrow_mut().push((pack_params(p), o.outer_maxiter));
+                OuterResult {
+                    ofv: probe_ofv,
+                    converged: probe_converged,
+                    n_iterations: 5,
+                    ..at(p)
+                }
+            },
+        );
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1, "{verdict:?}: the probe runs once");
+        let (start, maxiter) = &calls[0];
+        assert_eq!(*maxiter, 7, "{verdict:?}: the probe runs on the budget");
+        assert!(
+            start.iter().zip(&init_packed).any(|(a, b)| a != b),
+            "{verdict:?}: the probe starts off the start"
+        );
+        assert_eq!(
+            result.n_iterations, 7,
+            "{verdict:?}: both runs' iterations count"
+        );
+        let adopted = pack_params(&result.params) != init_packed;
+        assert_eq!(adopted, verdict == Some(false), "{verdict:?}: adopted");
+        let stall_warning = result
+            .warnings
+            .iter()
+            .any(|w| w.contains("stalled on its initial estimates") && w.contains("2 iterations"));
+        assert_eq!(
+            stall_warning,
+            verdict == Some(false),
+            "{verdict:?}: {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            result.stationary_start,
+            verdict == Some(true),
+            "{verdict:?}"
+        );
+        assert_eq!(
+            result.left_init,
+            (verdict == Some(true)).then_some(false),
+            "{verdict:?}: only a verified start publishes `left_init`"
+        );
+    }
+    // A verified start withdraws the run's own no-move notice and reports it converged
+    // (trust-region's "every step was rejected" stop); any other unconverged run stays
+    // unconverged, and an unverified one keeps its notice.
+    let notice = crate::estimation::trust_region::NO_INITIAL_PROGRESS_NOTICE;
+    for (warning, probe_converged, promoted) in [
+        (
+            format!("Trust-region did not converge: … — {notice}, so …"),
+            true,
+            true,
+        ),
+        (
+            "Trust-region did not converge: reached the iteration budget".into(),
+            true,
+            false,
+        ),
+        (
+            format!("Trust-region did not converge: … — {notice}, so …"),
+            false,
+            false,
+        ),
+    ] {
+        let run = OuterResult {
+            converged: false,
+            warnings: vec![warning.clone()],
+            ..unmoved()
+        };
+        let result = verify_unmoved_start(
+            &model,
+            &pop,
+            &init,
+            &opts,
+            run,
+            7,
+            "iterations",
+            Some(notice),
+            |p, _| OuterResult {
+                ofv: start_ofv,
+                converged: probe_converged,
+                ..at(p)
+            },
+        );
+        assert_eq!(result.converged, promoted, "{warning}");
+        assert_eq!(result.warnings.contains(&warning), !promoted, "{warning}");
+    }
+    // No probe: a run that moved, one with no budget, one with no valid objective.
+    let mut moved = init.clone();
+    moved.theta = init.theta.iter().map(|t| 1.1 * t).collect();
+    for (label, result, budget) in [
+        (
+            "moved",
+            OuterResult {
+                converged: true,
+                ..at(&moved)
+            },
+            7,
+        ),
+        ("no budget", unmoved(), 0),
+        (
+            "invalid objective",
+            OuterResult {
+                ofv: f64::NAN,
+                ..unmoved()
+            },
+            7,
+        ),
+    ] {
+        let ran = std::cell::Cell::new(false);
+        let result = verify_unmoved_start(
+            &model,
+            &pop,
+            &init,
+            &opts,
+            result,
+            budget,
+            "iterations",
+            None,
+            |p, _| {
+                ran.set(true);
+                at(p)
+            },
+        );
+        assert!(!ran.get() && result.left_init.is_none(), "{label}");
+    }
+}
+
 /// #2506, the stall half end to end, per PR: a fit whose first leg stops on the model-file
 /// inits is resumed from a perturbation of them, and the probe's lower result is what is
 /// reported — whichever status the stop returned, the **success** one included (BOBYQA
@@ -13361,7 +13528,49 @@ fn a_warm_refit_at_a_converged_fit_is_converged_and_not_flagged() {
         );
         let warm_start = warm_start_from(&model.default_params, &cold);
         let warm = crate::api::fit(&model, &pop, &warm_start, &opts).expect("warm fit");
-        assert_warm_refit_verified(&format!("{optimizer:?}"), &cold, &warm);
+        assert_warm_refit_verified(&format!("{optimizer:?}"), &cold, &warm, 1e-3);
+    }
+}
+
+/// #2506 on the outer optimizers that are not NLopt's — the built-in BFGS loop,
+/// `trust_region`, and `method = gn` — which publish no `left_init`, so before the
+/// probe reached them ([`verify_unmoved_start`]) their warm refit fell to the
+/// displacement check and carried `W_STALLED_AT_INIT`. Gated: fits to convergence.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: FOCEI fits to convergence; opt in with --features slow-tests"
+)]
+fn a_warm_refit_on_a_non_nlopt_optimizer_is_converged_and_not_flagged() {
+    let (model, pop) = two_cpt_iv_fixture();
+    // The objective bound on the warm refit against the cold fit. Gauss–Newton stops
+    // looser than the others: measured on macOS arm64, its warm refit ends 1.283e-3
+    // below its cold fit (BFGS 2.2e-10, trust-region 1.8e-6), so it gets 5e-3.
+    for (label, opts, ofv_tol) in [
+        ("bfgs", options_2506(crate::types::Optimizer::Bfgs), 1e-3),
+        (
+            "trust_region",
+            options_2506(crate::types::Optimizer::TrustRegion),
+            1e-3,
+        ),
+        (
+            "gn",
+            FitOptions {
+                method: EstimationMethod::FoceGn,
+                ..options_2506(crate::types::Optimizer::Auto)
+            },
+            5e-3,
+        ),
+    ] {
+        let cold = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("cold fit");
+        assert!(
+            cold.converged && crate::model_selection::stalled_at_init(&cold) == Some(false),
+            "{label}: fixture precondition — the cold fit converges away from its start: {:?}",
+            cold.warnings
+        );
+        let warm_start = warm_start_from(&model.default_params, &cold);
+        let warm = crate::api::fit(&model, &pop, &warm_start, &opts).expect("warm fit");
+        assert_warm_refit_verified(label, &cold, &warm, ofv_tol);
     }
 }
 
@@ -13370,6 +13579,7 @@ fn assert_warm_refit_verified(
     label: &str,
     cold: &crate::types::FitResult,
     warm: &crate::types::FitResult,
+    ofv_tol: f64,
 ) {
     eprintln!(
         "{label}: cold OFV {:.6}, warm OFV {:.6} (Δ {:.3e}), warm evaluations {}",
@@ -13382,7 +13592,7 @@ fn assert_warm_refit_verified(
     assert!(warm.stationary_start, "{label}: {:?}", warm.warnings);
     assert!(warm.converged, "{label}: {:?}", warm.warnings);
     assert!(
-        (warm.ofv - cold.ofv).abs() < 1e-3,
+        (warm.ofv - cold.ofv).abs() < ofv_tol,
         "{label}: the warm refit reports the warm start, at the cold fit's objective: {} vs {}",
         warm.ofv,
         cold.ofv
@@ -13468,6 +13678,6 @@ fn a_warm_refit_of_an_agq_or_mixture_fit_is_converged_and_not_flagged() {
         );
         let warm_start = warm_start_from(&model.default_params, &cold);
         let warm = crate::api::fit(&model, &pop, &warm_start, &opts).expect("warm");
-        assert_warm_refit_verified(label, &cold, &warm);
+        assert_warm_refit_verified(label, &cold, &warm, 1e-3);
     }
 }

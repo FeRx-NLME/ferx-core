@@ -685,6 +685,12 @@ const TRUST_REGION_CANCELLED: &str = "cancelled by user";
 /// instead of the iteration budget.
 const TRUST_REGION_NO_INITIAL_PROGRESS: &str = "made no progress from the starting values";
 
+/// The clause of the [`TRUST_REGION_NO_INITIAL_PROGRESS`] warning that names the stop:
+/// the #2506 start probe withdraws a warning carrying it once the start is verified as an
+/// optimum (`outer_optimizer::verify_unmoved_start`).
+pub(crate) const NO_INITIAL_PROGRESS_NOTICE: &str =
+    "every step was rejected from the first iteration";
+
 /// Map an argmin termination status onto `(converged, warning)`.
 ///
 /// Before #1000 every `Ok(_)` from the executor was reported as converged,
@@ -735,8 +741,8 @@ fn classify_termination(status: &TerminationStatus, max_iters: u64) -> (bool, Op
             (
                 false,
                 Some(format!(
-                    "Trust-region did not converge: {reason} — every step was rejected from the \
-                     first iteration, so the fit never left them. Check the starting values \
+                    "Trust-region did not converge: {reason} — {NO_INITIAL_PROGRESS_NOTICE}, \
+                     so the fit never left them. Check the starting values \
                      (`inits_from_nca` helps) and that the model is identifiable on this data."
                 )),
             )

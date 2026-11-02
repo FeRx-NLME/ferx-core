@@ -2196,11 +2196,24 @@ fn fit_inner(
                 .map_err(EngineError::uncoded)?
             }
             EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
-                crate::estimation::gauss_newton::run_foce_gn(
+                let gn = |p: &ModelParameters, o: &FitOptions| {
+                    crate::estimation::gauss_newton::run_foce_gn(model, population, p, o)
+                };
+                let result = gn(&stage_params, &stage_opts);
+                // #2506: GN publishes no `left_init`, so a run that did not move is
+                // probed. GN reports `n_iterations = maxiter` however early it stopped,
+                // so there is no "rest of the budget" to read: the probe gets a fresh
+                // `outer_maxiter`.
+                crate::estimation::outer_optimizer::verify_unmoved_start(
                     model,
                     population,
                     &stage_params,
                     &stage_opts,
+                    result,
+                    stage_opts.outer_maxiter,
+                    "iterations",
+                    None,
+                    gn,
                 )
             }
             EstimationMethod::Imp => {

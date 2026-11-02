@@ -337,21 +337,55 @@ pub fn optimize_population(
             first_eval_etas,
             &identity_scales,
         ),
-        Optimizer::Bfgs | Optimizer::Lbfgs => optimize_bfgs(
-            model,
-            population,
-            init_params,
-            options,
-            &declines,
-            first_eval_etas,
-        ),
-        Optimizer::TrustRegion => crate::estimation::trust_region::optimize_trust_region_seeded(
-            model,
-            population,
-            init_params,
-            options,
-            first_eval_etas,
-        ),
+        // #2506: these publish no `left_init`, so a run that did not move is probed here,
+        // on what is left of `outer_maxiter`.
+        Optimizer::Bfgs | Optimizer::Lbfgs => {
+            let result = optimize_bfgs(
+                model,
+                population,
+                init_params,
+                options,
+                &declines,
+                first_eval_etas,
+            );
+            let budget = options.outer_maxiter.saturating_sub(result.n_iterations);
+            verify_unmoved_start(
+                model,
+                population,
+                init_params,
+                options,
+                result,
+                budget,
+                "iterations",
+                None,
+                |p, o| optimize_bfgs(model, population, p, o, &declines, None),
+            )
+        }
+        Optimizer::TrustRegion => {
+            let result = crate::estimation::trust_region::optimize_trust_region_seeded(
+                model,
+                population,
+                init_params,
+                options,
+                first_eval_etas,
+            );
+            let budget = options.outer_maxiter.saturating_sub(result.n_iterations);
+            verify_unmoved_start(
+                model,
+                population,
+                init_params,
+                options,
+                result,
+                budget,
+                "iterations",
+                Some(crate::estimation::trust_region::NO_INITIAL_PROGRESS_NOTICE),
+                |p, o| {
+                    crate::estimation::trust_region::optimize_trust_region_seeded(
+                        model, population, p, o, None,
+                    )
+                },
+            )
+        }
     };
     // Surface the optimizer-downgrade and freeze warnings ahead of the optimizer's
     // own (they explain the substituted optimizer / why a parameter was held fixed,
@@ -3682,13 +3716,117 @@ type StartProbe<'a> = dyn Fn(&ModelParameters, f64, usize) -> Option<bool> + 'a;
 /// start probe found a lower objective, so the probe's result is reported (#2506). Its
 /// phrase "resumed from the best point seen" files it under `optimizer_health` with the
 /// #1277 notice.
-fn start_probe_adopted_warning(stalled_ofv: f64, stalled_evals: usize) -> String {
+fn start_probe_adopted_warning(stalled_ofv: f64, stalled_count: usize, unit: &str) -> String {
     format!(
         "Outer optimization stalled on its initial estimates (OFV = {stalled_ofv:.6} after \
-         {stalled_evals} evaluations) and was resumed from the best point seen, perturbed \
+         {stalled_count} {unit}) and was resumed from the best point seen, perturbed \
          off it, on the remaining maxiter budget; the reported estimates are from the \
          resumed run."
     )
+}
+
+/// The #2506 start probe for the outer optimizers that are not NLopt's — the built-in
+/// BFGS / L-BFGS loops, `trust_region`, and `method = gn` / `gn_hybrid` — which publish
+/// no `left_init` of their own and so would leave a warm start at an optimum to the
+/// displacement check in `model_selection::stalled_at_init`, which flags it.
+///
+/// `result` is the finished run from `init_params`. When its estimates did not leave the
+/// start (the packed move is under [`INIT_ESCAPE_STEP_S`], the NLopt attempt's own test),
+/// `rerun` is called once, from the start moved [`START_PROBE_STEP_S`] per free packed
+/// coordinate ([`perturbed_start`]) with `outer_maxiter = budget`, and
+/// [`start_probe_verdict`] reads its penalized objective against the start's:
+///
+/// - `Some(true)` — `result` is reported as a verified warm start: `left_init =
+///   Some(false)`, `stationary_start = true`. When the run itself stopped unconverged
+///   *because* it never left the start — its warning contains `no_move_notice`, which
+///   only `trust_region` has — that warning is withdrawn and the run is reported
+///   converged: the probe has just answered the question it could not;
+/// - `Some(false)` — the start was a stall: the probe's result is reported, with
+///   [`start_probe_adopted_warning`];
+/// - `None` — `result` is reported unchanged, and the displacement check judges it.
+///
+/// The probe's iterations count in the reported `n_iterations` either way. Nothing runs
+/// when the fit moved, was cancelled, has no valid objective, or `budget` is 0.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_unmoved_start(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+    result: OuterResult,
+    budget: usize,
+    unit: &str,
+    no_move_notice: Option<&str>,
+    rerun: impl FnOnce(&ModelParameters, &FitOptions) -> OuterResult,
+) -> OuterResult {
+    let PackedStart {
+        packed: mut x0,
+        bounds,
+        fixed,
+        ..
+    } = pack_with_bounds(init_params);
+    clamp_to_bounds(&mut x0, &bounds);
+    // `!(… < …)` so a non-finite deviation counts as moved: nothing to probe.
+    let left_init = !(max_scaled_deviation(&pack_params(&result.params), &x0) < INIT_ESCAPE_STEP_S);
+    if left_init
+        || budget == 0
+        || crate::cancel::is_cancelled(&options.cancel)
+        || !ofv_is_valid(result.ofv)
+    {
+        return result;
+    }
+    let Some(xp) = perturbed_start(&x0, &fixed, &bounds.lower, &bounds.upper) else {
+        return result;
+    };
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let priors = build_prior_set(model, init_params);
+    let penalized = |r: &OuterResult| {
+        r.ofv + nn_reg.penalty_value(&r.params.theta) + priors.penalty(&pack_params(&r.params))
+    };
+    let probe_options = FitOptions {
+        outer_maxiter: budget,
+        ..options.clone()
+    };
+    let mut probe = rerun(&unpack_params(&xp, init_params), &probe_options);
+    let (start_ofv, probe_ofv) = (penalized(&result), penalized(&probe));
+    let verdict = start_probe_verdict(start_ofv, probe_ofv, probe.converged);
+    if options.verbose {
+        eprintln!(
+            "Start probe: the fit did not leave its start (OFV = {start_ofv:.6}); a restart \
+             from a perturbation of it reached OFV = {probe_ofv:.6} (converged = {}) → \
+             stationary start = {verdict:?}",
+            probe.converged,
+        );
+    }
+    match verdict {
+        Some(false) => {
+            probe.warnings.push(start_probe_adopted_warning(
+                result.ofv,
+                result.n_iterations,
+                unit,
+            ));
+            probe.n_iterations += result.n_iterations;
+            probe
+        }
+        Some(true) => {
+            let mut verified = OuterResult {
+                left_init: Some(false),
+                stationary_start: true,
+                n_iterations: result.n_iterations + probe.n_iterations,
+                ..result
+            };
+            if let Some(notice) = no_move_notice {
+                let before = verified.warnings.len();
+                verified.warnings.retain(|w| !w.contains(notice));
+                verified.converged |= verified.warnings.len() < before;
+            }
+            verified
+        }
+        None => OuterResult {
+            n_iterations: result.n_iterations + probe.n_iterations,
+            ..result
+        },
+    }
 }
 
 /// The trace half of [`failure_is_converged_plateau`], **progress** and **plateau**: what
@@ -4431,9 +4569,11 @@ fn optimize_nlopt(
         // The start was a stall and the probe found the lower objective: report the probe,
         // as a continuation of the same fit.
         Some((mut found, found_outcome, Some(false))) => {
-            found
-                .warnings
-                .push(start_probe_adopted_warning(first.ofv, first.n_iterations));
+            found.warnings.push(start_probe_adopted_warning(
+                first.ofv,
+                first.n_iterations,
+                "evaluations",
+            ));
             found.n_iterations += first.n_iterations;
             ((found, found_outcome.restart_cause()), true)
         }
