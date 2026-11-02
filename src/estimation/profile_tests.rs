@@ -6447,10 +6447,12 @@ fn a_declined_subject_takes_the_reconverged_gradient_under_quadrature() {
     }
 }
 
-/// The trace's method column under `focei` with `n_agq = 3`: `laplace`, the quadrature
-/// objective the levels are solved under, as `parameters.qmd` says. Dies when the label is
-/// chosen from `method` or `interaction` instead of `agq_nodes()`.
+/// The trace's method column of a quadrature stage (`n_agq = 3`): `agq`, the objective the
+/// levels are solved under, under both anchors, as `parameters.qmd` says (#2552). Dies when
+/// the label is chosen from `method` or `interaction` instead of `agq_nodes()`, and when
+/// `n_agq > 1` collapses onto `laplace`.
 #[test]
-fn a_profiled_focei_quadrature_fit_is_traced_as_laplace() {
-    profiled_trace(agq3_focei, "laplace", "trace_focei_agq.csv");
+fn a_profiled_quadrature_fit_is_traced_as_agq() {
+    profiled_trace(agq3_focei, "agq", "trace_focei_agq.csv");
+    profiled_trace(agq3_laplace, "agq", "trace_laplace_agq.csv");
 }
