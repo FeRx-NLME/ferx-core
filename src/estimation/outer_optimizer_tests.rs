@@ -3896,13 +3896,12 @@ fn traced_methods(
 
 /// #2552: an unprofiled fit's trace names the objective it scores, at both `write_foce`
 /// sites. Both sites used to match only `FoceI`, so `laplace` was traced `foce` and
-/// `focei, n_agq = 3` (AGQ) `focei`. Each case asserts its own label on every row and
-/// that no row carries any other estimator's label, so a site writing the wrong name —
-/// or a helper collapsing two estimators onto one label — fails here.
+/// `focei, n_agq = 3` (AGQ) `focei`. Each case asserts its own label on every row, so a
+/// site writing the wrong name — or a helper collapsing two estimators onto one label —
+/// fails here.
 #[test]
 fn an_unprofiled_fit_traces_the_objective_it_scores() {
     use crate::types::{EstimationMethod as M, Optimizer as O};
-    let labels = ["foce", "focei", "laplace", "agq"];
     for optimizer in [O::Slsqp, O::Bfgs] {
         for (method, n_agq, want) in [
             (M::Foce, 1, "foce"),
@@ -3917,12 +3916,6 @@ fn an_unprofiled_fit_traces_the_objective_it_scores() {
                 rows.iter().all(|r| r == want),
                 "{case}: {rows:?}, want {want}"
             );
-            for other in labels.iter().filter(|&&l| l != want) {
-                assert!(
-                    !rows.iter().any(|r| r == other),
-                    "{case}: a row is labelled {other}: {rows:?}"
-                );
-            }
         }
     }
 }
