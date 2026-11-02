@@ -1074,8 +1074,9 @@ fn cold_eta_seed(
 ///    (`tests/schnider_propofol_nonmem.rs`, `inner_tol = 1e-8`; `W_NO_FEASIBLE_EVAL`). An
 ///    indefinite `H` (a saddle or a non-convex region) fails the test. The test takes the
 ///    Newton steps it computes and keeps each accepted one, each no worse beyond rounding,
-///    whether or not it then certifies ([`FallbackCertifier::newton_certifies`]). Skipped on a numerical objective (below), where a finite-difference Hessian
-///    of a noise-floored gradient is not trustworthy and the stall-armed polish decides.
+///    whether or not it then certifies ([`FallbackCertifier::newton_certifies`]). Skipped on
+///    a numerical objective (below), where a finite-difference Hessian of a noise-floored
+///    gradient is not trustworthy and the stall-armed polish decides.
 /// 3. **Gradient polish** — the inner BFGS / L-BFGS driver run from η̂ (never Nelder–Mead, even
 ///    under `inner_optimizer = nelder_mead`), whose own exit is the certificate. It carries the per-iterate objective-stall predicate
 ///    (`stall_at`, #555 / #1521), so a subject whose objective is numerical (an ODE, or a

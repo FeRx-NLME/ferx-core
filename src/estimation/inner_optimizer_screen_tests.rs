@@ -1285,7 +1285,13 @@ fn fallback_sweep_subjects(site: Swap) -> Vec<Subject> {
 /// * the block ran and **kept** it (bit-identical η) → `on.used_fallback` still set.
 ///
 /// On every cell `used_fallback` and `nm_polished` are never both set. Returns the number
-/// of (replaced, kept) cells, so a caller can require each side non-empty.
+/// of (replaced, kept) cells, so a caller can require each side non-empty. A kept cell
+/// must show the block ran (its test counters), or it would control nothing.
+///
+/// Both sides key on `off.used_fallback`. Under a seeded policy the `on` result can come
+/// from the other Hessian metric's solve (`find_ebe_impl`), whose own incumbent may not have
+/// been a fallback, so the replaced count can include such cells; they still assert the
+/// flag describes the returned point (#2594 review r1, row 4).
 fn sweep_fallback_flag(site: Swap, mode: crate::types::InnerOptimizer) -> (usize, usize) {
     let cfg = &CONFIGS[0];
     let (m, opts) = model(cfg.omega);
@@ -1299,20 +1305,23 @@ fn sweep_fallback_flag(site: Swap, mode: crate::types::InnerOptimizer) -> (usize
                     inner_tol: tol,
                     ..opts.clone()
                 };
-                let (off, on) = match site {
-                    Swap::Twin => (
-                        solve_with(&m, &o, &subj, 0, false, 1, None),
-                        solve_with(&m, &o, &subj, 0, true, 1, None),
-                    ),
-                    Swap::Screen => (
-                        solve(&m, &o, &subj, 0, 1, None),
-                        solve(&m, &o, &subj, 100, 1, None),
-                    ),
-                    Swap::Axis => (
-                        solve(&m, &o, &subj, 0, 0, None),
-                        solve(&m, &o, &subj, 0, 1, None),
-                    ),
+                let off = match site {
+                    Swap::Twin => solve_with(&m, &o, &subj, 0, false, 1, None),
+                    Swap::Screen => solve(&m, &o, &subj, 0, 1, None),
+                    Swap::Axis => solve(&m, &o, &subj, 0, 0, None),
                 };
+                // Counted over the `on` solve alone, so a kept cell can show its block ran.
+                EBE_MULTISTARTS_STARTED.with(|n| n.set(0));
+                TWIN_SEEDS_RUN.with(|n| n.set(0));
+                let on = match site {
+                    Swap::Twin => solve_with(&m, &o, &subj, 0, true, 1, None),
+                    Swap::Screen => solve(&m, &o, &subj, 100, 1, None),
+                    Swap::Axis => solve(&m, &o, &subj, 0, 1, None),
+                };
+                // The screen and a scan-all subject's axis seeds run whenever the multi-start
+                // does; the twin seed can decline, so it has its own counter.
+                let block_ran = EBE_MULTISTARTS_STARTED.with(|n| n.get()) > 0
+                    && (!matches!(site, Swap::Twin) || TWIN_SEEDS_RUN.with(|n| n.get()) > 0);
                 let what = format!(
                     "{site:?} {mode:?} {} inner_tol = {tol}, inner_maxiter = {max_iter}",
                     subj.id
@@ -1348,6 +1357,10 @@ fn sweep_fallback_flag(site: Swap, mode: crate::types::InnerOptimizer) -> (usize
                     );
                     replaced += 1;
                 } else {
+                    assert!(
+                        block_ran,
+                        "{what}: kept, but the block never ran, so the cell is no control"
+                    );
                     assert!(
                         on.used_fallback,
                         "{what}: the block kept the fallback point but cleared the flag"
