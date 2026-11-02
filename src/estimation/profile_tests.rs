@@ -5757,6 +5757,74 @@ fn a_certified_fallback_takes_the_adjoint_level_gradient() {
     );
 }
 
+/// #2557: under `inner_optimizer = nelder_mead`, a state the profile solve keeps on the
+/// adjoint (`off_mode` false) is a mode. `off_mode` reads only `converged` since #2554, and
+/// the primary NM search used to set it from NM's simplex spread: on `main` F2 subject 1's
+/// cold solve stopped `|Δη| = 3.3e-2` from its mode, was reported converged without a
+/// fallback, and took the adjoint 1.5e-3 SE off the converged reference, against ≤ 6e-6 SE
+/// for a certified fallback. Now the primary end point is certified. Dual-vs-FD parity
+/// (AGENTS.md): every compared gradient is `total_gradient_adjoint`'s (it panics if it
+/// declines), the reference the reconverged differences at the BFGS mode. Measured after
+/// the fix: worst 1.268e-7 SE, F2 subject 1 7.9e-8 (macOS arm64). The routing itself,
+/// `off_mode` sending a state to the re-solved differences, is
+/// [`a_subject_off_its_mode_takes_the_resolved_level_blocks`]; no predicate changed here.
+#[test]
+fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
+    use crate::estimation::inner_optimizer::{arm_inner_settings, InnerSettings};
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let cf = ctx(&p, &layout, &o);
+    let params = &p.init_params;
+    let scale = cf
+        .solve(params, &ProfileWarm::from_template(&layout, params))
+        .expect("the solve converges")
+        .level_scale;
+    let x = pack_params(params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).unwrap();
+    let zero = DVector::zeros(cf.model.n_eta);
+    let (mut worst, mut primary) = (0.0_f64, 0);
+    for i in 0..p.population.subjects.len() {
+        let se: Vec<f64> = layout.reads[i].iter().map(|r| scale[r.level]).collect();
+        let steps: Vec<f64> = se.iter().map(|s| FD_STEP_SE * s).collect();
+        let mode = cf.resolve(i, params, &zero);
+        assert!(!mode.off_mode, "subject {i}: the reference is not a mode");
+        let reference = cf.total_gradient_fd(i, params, &mode, &steps);
+        let nm = {
+            let _armed = arm_inner_settings(InnerSettings {
+                mode: crate::types::InnerOptimizer::NelderMead,
+                warm: false,
+            });
+            cf.resolve(i, params, &zero)
+        };
+        if nm.off_mode {
+            continue;
+        }
+        primary += usize::from(!nm.fallback);
+        let g = cf
+            .total_gradient_adjoint(i, &pt, &nm)
+            .unwrap_or_else(|| panic!("subject {i}: the adjoint declined"));
+        let gap = g
+            .iter()
+            .zip(&reference)
+            .zip(&se)
+            .map(|((a, b), s)| ((a - b) * s).abs())
+            .fold(0.0_f64, |m, d| {
+                assert!(d.is_finite(), "subject {i}: non-finite gap");
+                m.max(d)
+            });
+        worst = worst.max(gap);
+    }
+    eprintln!(
+        "nelder_mead on the adjoint: worst {worst:.3e} SE over {primary} primary-path states"
+    );
+    assert!(
+        primary > 0,
+        "no state came from the primary NM search, so its certificate is untested"
+    );
+    assert!(worst <= CERTIFIED_FALLBACK_GAP, "{worst:.3e} SE");
+}
+
 /// #2539, the fit: F2 started at NONMEM's FOCEI optimum. Near the optimum the outer steps
 /// are ~1e-8, every warm EBE already sits at its mode, and the population inner loop ends
 /// some subjects on a certified fallback (subjects 7 and 11 on macOS arm64, 1, 4, 5 and 9

@@ -940,8 +940,8 @@ fn adjoint_gradient(
 /// fit). `None` when `H` is singular or the solve is not finite.
 ///
 /// The indefinite branch also needs the stationarity the identity rests on: there `η̂` came
-/// from the inner search's fallback, which can stop short (Nelder–Mead, max-iter), and the
-/// gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
+/// from a certified or iteration-limited inner search, which need not be stationary in
+/// `‖g‖∞` (see [`MODE_STATIONARY_TOL`]), and the gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
 /// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review) — under AGQ to the held-EBE
 /// score ([`subject_adjoint_held_ebe_score_at`]), not the reconverged one.
 ///
@@ -1001,9 +1001,26 @@ fn inner_search_gradient<const N: usize>(
     inner_grad(ctx, &f, &g, &e, pv, frozen)
 }
 
-/// The largest `|∇_η l(η̂)|` [`mode_solve`] treats as a stationary point on its indefinite
-/// branch: ten times the inner search's default gradient tolerance (`inner_tol = 1e-5`),
-/// which a certified fallback end point meets.
+/// The largest `|∇_η l(η̂)|∞` [`mode_solve`] treats as a stationary point on its indefinite
+/// branch: ten times the inner search's default gradient tolerance (`inner_tol = 1e-5`).
+///
+/// A gradient test of its own, **not** the inner search's certificate restated: a certified
+/// EBE can fail it (#2557). `FallbackCertifier`'s gradient arm (`‖g‖ < tol`) meets it at the
+/// default `inner_tol` in the raw metric, but not above `inner_tol = 1e-4`, and not under
+/// FREM's preconditioned stop (#406), whose posterior-variance weights (~1e-6 on the covariate
+/// pseudo-observation dimensions) admit a raw `|g|∞` near 1e-2. Its Newton-step arm
+/// (`‖H⁻¹g‖ < tol`) admits `|g|` up to `c·tol` along a direction of curvature `c`, and its
+/// resolution arm (`½gᵀH⁻¹g ≤ INNER_FTOL_REL·(1 + |f|)`) bounds no gradient. Measured under
+/// `inner_optimizer = nelder_mead`: a `one_cpt_infusion` EBE certified by the Newton arm at
+/// `‖g‖∞ = 0.18`, curvature ~3e4. The stall stop on a numerical objective bounds no gradient
+/// either. Such a point declines here, to the same route as any other decline.
+///
+/// Kept rather than widened to accept those arms. The bound the identity's error obeys at a
+/// certified point, `√(2·INNER_FTOL_REL·(1 + |f|))` SEs, rests on a positive definite `H`, and
+/// both Newton arms need the certifier's finite-difference Hessian to factor. A certified
+/// point that reaches this branch is one where that Hessian and the exact one disagree on
+/// definiteness: the case the bound says nothing about. `mode_solve` also does not know
+/// whether `η̂` was certified.
 const MODE_STATIONARY_TOL: f64 = 1e-4;
 
 /// The θ leaves of a recording (value leaves, no tangent) for each θ the parameter
