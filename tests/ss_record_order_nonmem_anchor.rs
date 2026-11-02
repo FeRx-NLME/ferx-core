@@ -31,11 +31,13 @@ const MODELS: [&str; 2] = [
     "nonmem_anchor/ss_record_order_ode_fit.ferx",
 ];
 
-// Measured worst |ferx − NONMEM| on macOS arm64: 1.8e-15 (closed form) and 2.7e-15 (ODE,
-// reltol 1e-10) across predict, the dual walk and the state pass. NONMEM's table is ADVAN1
-// at 17 significant digits, so this is an exact-vs-exact comparison. The bound leaves ~2,000×
-// headroom; the smallest defect it guards (a pre-dose read taking the steady state) is
-// 14.31 − 5.49 = 8.8.
+// Measured worst |ferx − NONMEM|: 1.776e-15 (closed form) and 2.665e-15 (ODE twin, reltol
+// 1e-10, abstol 1e-12) across predict, the dual walk and the state pass — the same digits on
+// Linux x86_64 (`tools/linux-test.sh`, glibc 2.41) and macOS arm64. NONMEM's table is ADVAN1
+// at 17 significant digits. The closed-form leg is analytic against analytic; the ODE leg is a
+// numerical solve against it, and its error sits at the `1e-10` reltol's floor only because
+// one-compartment decay is smooth. The bound leaves ~3,750× headroom over the worst; the
+// smallest defect it guards (a pre-dose read taking the steady state) is 14.31 − 5.49 = 8.8.
 const BOUND: f64 = 1e-11;
 
 fn setup(model: &str) -> (CompiledModel, Population) {
