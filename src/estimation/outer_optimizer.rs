@@ -357,7 +357,7 @@ pub fn optimize_population(
                 options,
                 result,
                 budget,
-                "iterations",
+                |x, b| bfgs_scale(x, b, init_params, options),
                 |p, o| optimize_bfgs(model, population, p, o, &declines, None),
             )
         }
@@ -377,7 +377,7 @@ pub fn optimize_population(
                 options,
                 result,
                 budget,
-                "iterations",
+                |x, _| vec![1.0; x.len()],
                 |p, o| {
                     crate::estimation::trust_region::optimize_trust_region_seeded(
                         model, population, p, o, None,
@@ -3692,13 +3692,15 @@ type StartProbe<'a> = dyn Fn(&ModelParameters, f64, usize) + 'a;
 /// has answered: the attempt to report, with its restart cause, and whether the #751
 /// held-cap stall retry ([`resolve_stall_retry`]) is to be skipped.
 ///
-/// - `Some(false)` — the probe's lower result, as a continuation of the same fit, with
-///   [`start_probe_adopted_warning`]; no retry, since it left the start.
+/// - `Some(false)` — the first attempt, still a stall, with [`start_probe_stall_warning`]
+///   naming the lower objective the probe reached. The probe's result is not reported: a
+///   stall stays flagged however far a restart could get (#2506), and is retried like any
+///   other.
 /// - `Some(true)` — the probe's result as well, through [`verified_start_result`]: the
 ///   probe is a complete fit whose own stop rule, checks and warnings stand as they are,
 ///   so nothing of the first attempt's verdict is carried over or rewritten. No retry —
 ///   there is no stall to retry.
-/// - anything else — the first attempt, retried exactly when it did not leave its start.
+/// - `None` — the first attempt, retried exactly when it did not leave its start.
 ///
 /// The probe's evaluations count in the reported `n_iterations` whichever result is
 /// kept.
@@ -3710,14 +3712,15 @@ fn settle_start_probe(
 ) -> ((OuterResult, Option<RestartCause>), bool) {
     let (mut first, first_cause) = first;
     match probed {
-        Some((mut found, found_cause, Some(false))) => {
-            found.warnings.push(start_probe_adopted_warning(
+        Some((found, _, Some(false))) => {
+            first.warnings.push(start_probe_stall_warning(
                 first.ofv,
                 first.n_iterations,
                 "evaluations",
+                found.ofv,
             ));
-            found.n_iterations += first.n_iterations;
-            ((found, found_cause), true)
+            first.n_iterations += found.n_iterations;
+            ((first, first_cause), first_left_init)
         }
         Some((found, found_cause, Some(true))) => {
             let left = found.left_init != Some(false);
@@ -3748,15 +3751,20 @@ fn verified_start_result(mut probe: OuterResult, left: bool, unmoved: &OuterResu
 }
 
 /// The `FitResult` warning a fit carries when it stalled on its initial estimates and the
-/// start probe found a lower objective, so the probe's result is reported (#2506). Its
-/// phrase "resumed from the best point seen" files it under `optimizer_health` with the
-/// #1277 notice.
-fn start_probe_adopted_warning(stalled_ofv: f64, stalled_count: usize, unit: &str) -> String {
+/// start probe reached a lower objective (#2506). The reported estimates stay the stalled
+/// ones, so the stall is still flagged `W_STALLED_AT_INIT`; this says how much lower an
+/// objective was within reach. Both objectives are the clean −2LL.
+fn start_probe_stall_warning(
+    stalled_ofv: f64,
+    stalled_count: usize,
+    unit: &str,
+    probe_ofv: f64,
+) -> String {
     format!(
         "Outer optimization stalled on its initial estimates (OFV = {stalled_ofv:.6} after \
-         {stalled_count} {unit}) and was resumed from the best point seen, perturbed \
-         off it, on the remaining maxiter budget; the reported estimates are from the \
-         resumed run."
+         {stalled_count} {unit}): a restart from a perturbation of them reached OFV = \
+         {probe_ofv:.6}, so the reported estimates are not an optimum. Refit from \
+         different initial estimates."
     )
 }
 
@@ -3765,17 +3773,20 @@ fn start_probe_adopted_warning(stalled_ofv: f64, stalled_count: usize, unit: &st
 /// no `left_init` of their own and so would leave a warm start at an optimum to the
 /// displacement check in `model_selection::stalled_at_init`, which flags it.
 ///
-/// `result` is the finished run from `init_params`. When its estimates did not leave the
-/// start (the packed move is under [`INIT_ESCAPE_STEP_S`], the NLopt attempt's own test),
-/// `rerun` is called once, from the start moved [`START_PROBE_STEP_S`] per free packed
-/// coordinate ([`perturbed_start`]) with `outer_maxiter = budget`, and
+/// `result` is the finished run from `init_params`. Movement is measured in the rerun
+/// optimizer's own scaled space: `scale_of` maps the clamped packed start and its bounds
+/// to the scale vector that optimizer divides by ([`bfgs_scale`],
+/// `gauss_newton::gn_scale`, unit for trust-region). When the run's estimates did not
+/// leave the start (a scaled move under [`INIT_ESCAPE_STEP_S`], the NLopt attempt's own
+/// test), `rerun` is called once, from the start moved [`START_PROBE_STEP_S`] per free
+/// scaled coordinate ([`perturbed_start`]) with `outer_maxiter = budget`, and
 /// [`start_probe_verdict`] reads its penalized objective against the start's:
 ///
 /// - `Some(true)` — the start is verified, and the probe's result is reported through
 ///   [`verified_start_result`]: a complete fit, whose own verdict and warnings stand, so
 ///   nothing about the unmoved run is rewritten;
-/// - `Some(false)` — the start was a stall: the probe's result is reported, with
-///   [`start_probe_adopted_warning`];
+/// - `Some(false)` — the start was a stall: `result` is reported, published
+///   `left_init = Some(false)` so it is flagged as one, with [`start_probe_stall_warning`];
 /// - `None` — `result` is reported unchanged, and the displacement check judges it.
 ///
 /// The probe's iterations count in the reported `n_iterations` either way. Nothing runs
@@ -3788,7 +3799,7 @@ pub(crate) fn verify_unmoved_start(
     options: &FitOptions,
     result: OuterResult,
     budget: usize,
-    unit: &str,
+    scale_of: impl FnOnce(&[f64], &PackedBounds) -> Vec<f64>,
     rerun: impl FnOnce(&ModelParameters, &FitOptions) -> OuterResult,
 ) -> OuterResult {
     let PackedStart {
@@ -3798,16 +3809,25 @@ pub(crate) fn verify_unmoved_start(
         ..
     } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x0, &bounds);
+    let scale = scale_of(&x0, &bounds);
+    let x0_s = apply_scale(&x0, &scale);
+    let off_start = |r: &OuterResult| {
+        !(max_scaled_deviation(&apply_scale(&pack_params(&r.params), &scale), &x0_s)
+            < INIT_ESCAPE_STEP_S)
+    };
     // `!(… < …)` so a non-finite deviation counts as moved: nothing to probe.
-    let left_init = !(max_scaled_deviation(&pack_params(&result.params), &x0) < INIT_ESCAPE_STEP_S);
-    if left_init
+    if off_start(&result)
         || budget == 0
         || crate::cancel::is_cancelled(&options.cancel)
         || !ofv_is_valid(result.ofv)
     {
         return result;
     }
-    let Some(xp) = perturbed_start(&x0, &fixed, &bounds.lower, &bounds.upper) else {
+    let (lower_s, upper_s) = (
+        apply_scale(&bounds.lower, &scale),
+        apply_scale(&bounds.upper, &scale),
+    );
+    let Some(xp_s) = perturbed_start(&x0_s, &fixed, &lower_s, &upper_s) else {
         return result;
     };
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
@@ -3819,7 +3839,10 @@ pub(crate) fn verify_unmoved_start(
         outer_maxiter: budget,
         ..options.clone()
     };
-    let mut probe = rerun(&unpack_params(&xp, init_params), &probe_options);
+    let probe = rerun(
+        &unpack_params(&remove_scale(&xp_s, &scale), init_params),
+        &probe_options,
+    );
     let (start_ofv, probe_ofv) = (penalized(&result), penalized(&probe));
     let verdict = start_probe_verdict(start_ofv, probe_ofv, probe.converged);
     if options.verbose {
@@ -3832,17 +3855,19 @@ pub(crate) fn verify_unmoved_start(
     }
     match verdict {
         Some(false) => {
-            probe.warnings.push(start_probe_adopted_warning(
-                result.ofv,
-                result.n_iterations,
-                unit,
+            let mut stalled = result;
+            stalled.warnings.push(start_probe_stall_warning(
+                stalled.ofv,
+                stalled.n_iterations,
+                "iterations",
+                probe.ofv,
             ));
-            probe.n_iterations += result.n_iterations;
-            probe
+            stalled.left_init = Some(false);
+            stalled.n_iterations += probe.n_iterations;
+            stalled
         }
         Some(true) => {
-            let left =
-                !(max_scaled_deviation(&pack_params(&probe.params), &x0) < INIT_ESCAPE_STEP_S);
+            let left = off_start(&probe);
             verified_start_result(probe, left, &result)
         }
         None => OuterResult {
@@ -7401,6 +7426,28 @@ fn basin_shift_restart_warning(first_cold_ofv: f64, first_evals: usize) -> Strin
 //  Hand-rolled BFGS outer optimizer (legacy fallback)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// The scale vector the built-in BFGS / L-BFGS loop divides the clamped packed start `x`
+/// by: the space its steps, bounds and stopping rules live in. Also the space the #2506
+/// start probe measures their movement in ([`verify_unmoved_start`]).
+pub(crate) fn bfgs_scale(
+    x: &[f64],
+    bounds: &PackedBounds,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<f64> {
+    match resolve_scaling(options.parameter_scaling, options.optimizer) {
+        ParameterScaling::Rescale2 => compute_rescale2_scale(bounds),
+        ParameterScaling::Abs => compute_scale_packed(x, init_params),
+        ParameterScaling::None | ParameterScaling::Auto => {
+            if options.scale_params {
+                compute_scale_packed(x, init_params)
+            } else {
+                vec![1.0; x.len()]
+            }
+        }
+    }
+}
+
 fn optimize_bfgs(
     model: &CompiledModel,
     population: &Population,
@@ -7552,17 +7599,7 @@ fn optimize_bfgs(
     };
 
     // Per-element scale factors for the BFGS outer loop.
-    let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
-        ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
-        ParameterScaling::Abs => compute_scale_packed(&x, init_params),
-        ParameterScaling::None | ParameterScaling::Auto => {
-            if options.scale_params {
-                compute_scale_packed(&x, init_params)
-            } else {
-                vec![1.0; n]
-            }
-        }
-    };
+    let scale = bfgs_scale(&x, &bounds, init_params, options);
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
     let bounds_s = PackedBounds {

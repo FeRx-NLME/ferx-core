@@ -256,10 +256,13 @@ restart ends with the objective at the start.
   raised, so `Strictness::default()` passes a converged restart. Measured on warm refits of
   `two_cpt_iv` (L-BFGS, BOBYQA, AGQ) and a two-class mixture, the restart ends within
   `1e-6` OFV of the start.
-- **It finds a lower objective**, by more than 0.1: the start was a stall. The restart's
-  result is reported instead, as a continuation of the same fit, with a warning that says
-  so. A stop the optimizer reported as a success (BOBYQA can meet its `xtol` at the start)
-  is treated the same way.
+- **It finds a lower objective**, by more than 0.1: the start was a stall, and it is
+  **reported as one**: the run that did not move, with `W_STALLED_AT_INIT`, so a bootstrap
+  drops the sample and `Strictness::default()` fails it, however far the restart got. A
+  warning names the lower objective the restart reached, so you know better estimates are
+  within reach; refit from different initial estimates. A stop the optimizer reported as
+  a success (BOBYQA can meet its `xtol` at the start) is treated the same way. On L-BFGS
+  the retry for a stall at the start (identity-Hessian cap held on) still runs afterwards.
 - **Anything else** (it did not converge, or converged higher, in another basin; no budget
   was left): no verdict. The fit is judged by displacement as before, and its warning says
   the start *may* have been an optimum rather than asserting it was not.
@@ -270,11 +273,13 @@ objective, AGQ and mixtures included. It costs one extra optimization from near 
 paid only by a fit that did not move.
 
 The other FOCE-family outer optimizers run the same restart: the built-in `bfgs` / `lbfgs`
-loops, `trust_region`, and `method = gn` / `gn_hybrid`. Their perturbation is 0.1 in the
-packed (log / Cholesky) parameter space. BFGS and trust-region restart on what is left of
-`maxiter`. Gauss–Newton does not count the iterations it used, so its restart gets a fresh
-`maxiter`. In both outcomes the restart's result is the one reported, exactly as on the
-NLopt path. Other estimators (SAEM, IMP, Bayes, VI) do not run it.
+loops, `trust_region`, and `method = gn` / `gn_hybrid`. Their movement test and
+perturbation are measured in the space each optimizer steps in: the built-in BFGS loops'
+scaled space (`parameter_scaling`), Gauss–Newton's (`scale_params`), and the packed
+(log / Cholesky) space for trust-region, which does not scale. BFGS and trust-region
+restart on what is left of `maxiter`. Gauss–Newton does not count the iterations it used,
+so its restart gets a fresh `maxiter`. Each outcome is reported exactly as on the NLopt
+path. Other estimators (SAEM, IMP, Bayes, VI) do not run it.
 
 ### A THETA on the log-packing floor {#log-packing-floor}
 

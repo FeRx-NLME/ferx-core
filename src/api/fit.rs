@@ -2211,7 +2211,7 @@ fn fit_inner(
                     &stage_opts,
                     result,
                     stage_opts.outer_maxiter,
-                    "iterations",
+                    |x, _| crate::estimation::gauss_newton::gn_scale(x, &stage_opts),
                     gn,
                 )
             }

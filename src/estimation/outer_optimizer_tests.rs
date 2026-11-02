@@ -13231,15 +13231,18 @@ fn the_attempt_hands_an_unmoved_start_to_the_probe() {
 }
 
 /// #2506 for the optimizers outside NLopt, per PR and with no convergence loop:
-/// [`verify_unmoved_start`] hands a run that did not move to `rerun` once, from a
-/// perturbed start and on `budget`, and acts on each verdict. A verified start or a lower
-/// probe reports **the probe's own result** — its estimates, objective, verdict and
-/// warnings, none of the unmoved run's — and a verified one still within the escape step
-/// of the start is published `left_init = Some(false)` with `stationary_start`. Anything
-/// else reports the unmoved run, left to the displacement check. The rerun is a stub
-/// whose result is tagged with a warning of its own, so which run is reported is read off
-/// the result. It does not run for a run that moved, has no budget, or has no valid
-/// objective.
+/// [`verify_unmoved_start`] hands a run that did not move to `rerun` once, from a start
+/// perturbed in the rerun optimizer's **scaled** space and on `budget`, and acts on each
+/// verdict. A verified start reports **the probe's own result** — its estimates,
+/// objective, verdict and warnings, none of the unmoved run's — and one still within the
+/// escape step of the start is published `left_init = Some(false)` with
+/// `stationary_start`. A lower probe reports the unmoved run, published a stall
+/// (`left_init = Some(false)`) with the warning naming the probe's objective. No verdict
+/// reports the unmoved run, left to the displacement check. The rerun is a stub whose
+/// result is tagged with a warning of its own, so which run is reported is read off the
+/// result. It does not run for a run that moved, has no budget, or has no valid
+/// objective; "moved" is in scaled space, so a raw move above the escape step on a
+/// coordinate scaled down below it is still probed.
 #[test]
 fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
     let (model, pop) = two_cpt_iv_fixture();
@@ -13256,6 +13259,13 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
     };
     let start_ofv = unmoved().ofv;
     let tol = START_PROBE_TOL;
+    // The BFGS scale: `Abs` under `auto`, so a log-θ far from 0 is divided by |x|.
+    let scale_of = |x: &[f64], b: &PackedBounds| bfgs_scale(x, b, &init, &opts);
+    let scale = scale_of(&init_packed, &pack_with_bounds(&init).bounds);
+    assert!(
+        scale.iter().any(|&s| s > 1.2),
+        "fixture precondition: some coordinate is scaled: {scale:?}"
+    );
     // (probe ofv, probe converged, probe ends back at the start) → verdict, and whether
     // the reported result is published a stationary start.
     for (probe_ofv, probe_converged, back_at_start, verdict, stationary) in [
@@ -13276,7 +13286,7 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
             &opts,
             unmoved(),
             7,
-            "iterations",
+            scale_of,
             |p, o| {
                 calls.borrow_mut().push((pack_params(p), o.outer_maxiter));
                 OuterResult {
@@ -13292,15 +13302,20 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
         assert_eq!(calls.len(), 1, "{label}: the probe runs once");
         let (start, maxiter) = &calls[0];
         assert_eq!(*maxiter, 7, "{label}: the probe runs on the budget");
+        let scaled_move = max_scaled_deviation(
+            &apply_scale(start, &scale),
+            &apply_scale(&init_packed, &scale),
+        );
         assert!(
-            start.iter().zip(&init_packed).any(|(a, b)| a != b),
-            "{label}: the probe starts off the start"
+            (scaled_move - START_PROBE_STEP_S).abs() < 1e-12,
+            "{label}: the probe starts the probe step off the start in scaled space, \
+             not raw: {scaled_move}"
         );
         assert_eq!(
             result.n_iterations, 7,
             "{label}: both runs' iterations count"
         );
-        let reports_probe = verdict.is_some();
+        let reports_probe = verdict == Some(true);
         assert_eq!(
             (
                 result.warnings.iter().any(|w| w == probe_tag),
@@ -13319,10 +13334,12 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
         } else {
             assert!(!result.converged, "{label}: the unmoved run's verdict");
         }
-        let stall_warning = result
-            .warnings
-            .iter()
-            .any(|w| w.contains("stalled on its initial estimates") && w.contains("2 iterations"));
+        let stall_warning = result.warnings.iter().any(|w| {
+            w.contains("stalled on its initial estimates")
+                && w.contains("2 iterations")
+                && w.contains(&format!("reached OFV = {probe_ofv:.6}"))
+                && w.contains("not an optimum")
+        });
         assert_eq!(
             stall_warning,
             verdict == Some(false),
@@ -13332,10 +13349,40 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
         assert_eq!(result.stationary_start, stationary, "{label}");
         assert_eq!(
             result.left_init,
-            (verdict == Some(true)).then_some(!stationary),
-            "{label}: only a verified start publishes `left_init`"
+            verdict.map(|v| v && !stationary),
+            "{label}: a verdict publishes `left_init`; a lower probe flags the stall"
         );
     }
+    // Moved raw by more than the escape step on a scaled coordinate, but not in the
+    // optimizer's scaled space: still unmoved, so it is probed.
+    let k = (0..scale.len())
+        .max_by(|&a, &b| scale[a].total_cmp(&scale[b]))
+        .unwrap();
+    let raw_step = 1.2 * INIT_ESCAPE_STEP_S;
+    assert!(
+        raw_step / scale[k] < INIT_ESCAPE_STEP_S,
+        "fixture precondition"
+    );
+    let mut nudged = init_packed.clone();
+    nudged[k] += raw_step;
+    let ran = std::cell::Cell::new(false);
+    verify_unmoved_start(
+        &model,
+        &pop,
+        &init,
+        &opts,
+        OuterResult {
+            n_iterations: 2,
+            ..at(&unpack_params(&nudged, &init))
+        },
+        7,
+        scale_of,
+        |p, _| {
+            ran.set(true);
+            at(p)
+        },
+    );
+    assert!(ran.get(), "a scaled move under the escape step is probed");
     // No probe: a run that moved, one with no budget, one with no valid objective.
     let mut moved = init.clone();
     moved.theta = init.theta.iter().map(|t| 1.1 * t).collect();
@@ -13366,7 +13413,7 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
             &opts,
             result,
             budget,
-            "iterations",
+            scale_of,
             |p, _| {
                 ran.set(true);
                 at(p)
@@ -13380,8 +13427,9 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
 /// #751 held-cap retry still runs. A verified start reports the probe's own result and
 /// skips the retry — there is no stall to retry — and is published a stationary start
 /// while the probe's estimates are still within the escape step of the user's start. A
-/// lower probe is reported with the stall warning. No verdict reports the first attempt
-/// and leaves the retry to `left_init`. The probe's evaluations count every time.
+/// lower probe reports the first attempt, still a stall, with the warning naming the
+/// probe's objective, and leaves the retry to `left_init` like no verdict does. The
+/// probe's evaluations count every time.
 #[test]
 fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
     let (model, pop) = two_cpt_iv_fixture();
@@ -13399,7 +13447,7 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
     for (verdict, probe_left, skip_retry, reports_probe, stationary) in [
         (Some(true), false, true, true, true),
         (Some(true), true, true, true, false),
-        (Some(false), true, true, true, false),
+        (Some(false), true, false, false, false),
         (None, false, false, false, false),
     ] {
         let label = format!("{verdict:?}, probe left = {probe_left}");
@@ -13415,13 +13463,16 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
             "{label}: which attempt is reported"
         );
         assert_eq!(result.n_iterations, 5, "{label}: both legs count");
+        let probe_ofv = at(&off, 4, probe_left).ofv;
         assert_eq!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("stalled on its initial estimates")),
+            result.warnings.iter().any(|w| {
+                w.contains("stalled on its initial estimates")
+                    && w.contains("after 1 evaluations")
+                    && w.contains(&format!("reached OFV = {probe_ofv:.6}"))
+            }),
             verdict == Some(false),
-            "{label}"
+            "{label}: {:?}",
+            result.warnings
         );
         assert_eq!(result.stationary_start, stationary, "{label}");
         assert_eq!(
@@ -13438,13 +13489,16 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
 }
 
 /// #2506, the stall half end to end, per PR: a fit whose first leg stops on the model-file
-/// inits is resumed from a perturbation of them, and the probe's lower result is what is
-/// reported — whichever status the stop returned, the **success** one included (BOBYQA
-/// meeting `xtol` at its start, which a bootstrap's `converged` filter would otherwise
-/// keep). `outer_maxiter = 3` bounds the probe to a few iterations: no convergence loop,
-/// and the probe still ends hundreds of OFV units below the inits.
+/// inits is probed from a perturbation of them, the probe reaches a far lower objective,
+/// and the fit is **still reported as the stall** — the inits, `left_init = Some(false)`,
+/// `W_STALLED_AT_INIT`, failing `Strictness::default()` — with a warning naming the
+/// objective the probe reached. That holds whichever status the stop returned, the
+/// **success** one included (BOBYQA meeting `xtol` at its start, which a bootstrap's
+/// `converged` filter would otherwise keep): a stall is flagged however far a restart got.
+/// `outer_maxiter = 3` bounds the probe to a few iterations: no convergence loop, and the
+/// probe still ends hundreds of OFV units below the inits.
 #[test]
-fn a_stall_at_the_inits_is_reported_as_the_probes_lower_result() {
+fn a_stall_at_the_inits_stays_flagged_when_the_probe_finds_lower() {
     let (mut model, pop) = two_cpt_iv_fixture();
     let opts = FitOptions {
         outer_maxiter: 3,
@@ -13452,37 +13506,56 @@ fn a_stall_at_the_inits_is_reported_as_the_probes_lower_result() {
     };
     for status in [None, Some(nlopt::SuccessState::Success)] {
         model.name = format!("stall_probe_2506_{status:?}");
-        // The same stop with no budget left for the probe: the fit the probe replaces.
+        // The same stop with no budget left for the probe: the fit unprobed.
         forced_stop_at_start::set(&model.name, status, true);
         let at_inits = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("inits");
         assert_eq!(at_inits.left_init, Some(false), "{status:?}: precondition");
         forced_stop_at_start::set(&model.name, status, false);
         let result = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit");
+        assert_eq!(
+            result.ofv, at_inits.ofv,
+            "{status:?}: the stalled fit is reported, not the probe's"
+        );
+        assert_eq!(result.left_init, Some(false), "{status:?}");
+        assert!(!result.stationary_start, "{status:?}");
+        let reached: f64 = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("stalled on its initial estimates"))
+            .and_then(|w| w.split("reached OFV = ").nth(1))
+            .and_then(|t| t.split(',').next())
+            .and_then(|t| t.parse().ok())
+            .unwrap_or_else(|| panic!("{status:?}: no probe warning: {:?}", result.warnings));
         assert!(
-            result.ofv < at_inits.ofv - 10.0 * START_PROBE_TOL,
-            "{status:?}: the probe's result is reported: {} vs the inits' {}",
-            result.ofv,
+            reached < at_inits.ofv - 10.0 * START_PROBE_TOL,
+            "{status:?}: the warning names the probe's lower objective: {reached} vs the \
+             inits' {}",
             at_inits.ofv
         );
-        assert_eq!(result.left_init, Some(true), "{status:?}");
-        assert!(!result.stationary_start, "{status:?}");
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("stalled on its initial estimates")
-                    && w.contains("resumed from the best point seen, perturbed off it")),
-            "{status:?}: {:?}",
-            result.warnings
-        );
-        assert!(
-            result.n_iterations > 1,
+            result.n_iterations > at_inits.n_iterations,
             "{status:?}: the probe's evaluations count"
         );
         assert_eq!(
             crate::model_selection::stalled_at_init(&result),
-            Some(false),
+            Some(true),
             "{status:?}"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_STALLED_AT_INIT")),
+            "{status:?}: {:?}",
+            result.warnings
+        );
+        let v = crate::model_selection::check_strictness(
+            &result,
+            &crate::model_selection::Strictness::default(),
+        );
+        assert!(
+            !v.passed,
+            "{status:?}: a stall fails the default strictness: {v:?}"
         );
     }
 }
