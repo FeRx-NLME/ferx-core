@@ -1629,6 +1629,11 @@ fn fit_inner(
     for d in crate::api::validation::check_nn_bare_output_start(model, &init_params.theta) {
         accumulated_warnings.push(d.message);
     }
+    // A `[covariate_nn]` input the data drive into saturation (#2549).
+    #[cfg(feature = "nn")]
+    for d in crate::api::validation::check_nn_input_scale(model, population) {
+        accumulated_warnings.push(d.message);
+    }
     if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
         n_params_pre,
         covariance_cost,
