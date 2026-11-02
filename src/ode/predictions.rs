@@ -9281,6 +9281,35 @@ pub enum ThresholdOutcome {
     SolveFailed(String),
 }
 
+/// The state labels the CHZ threshold driver's `SolveFailed` reasons use (#2087). The reason
+/// reaches the user as a simulation warning, so states are named as the model file names them,
+/// each label a full noun phrase:
+/// - a user `[odes]` state: `` [odes] state `<name>` ``;
+/// - the accumulator being searched (`chz_state`): `the cumulative hazard`;
+/// - any other injected accumulator (a second ODE-accumulated cause): `the cumulative hazard
+///   of CMT=<cmt>`.
+///
+/// No accumulator is ever named by its internal `__chz_<cmt>` state name: the user wrote it as
+/// an `[event_model] hazard = …`, not in `[odes]`.
+#[cfg(feature = "survival")]
+pub(crate) fn chz_threshold_state_labels(ode: &OdeSpec, chz_state: usize) -> Vec<String> {
+    (0..ode.n_states)
+        .map(|k| {
+            let name = ode.state_names.get(k);
+            if k == chz_state {
+                "the cumulative hazard".to_string()
+            } else if ode.chz_state_slots.contains(&k) {
+                match name.and_then(|n| n.strip_prefix("__chz_")) {
+                    Some(cmt) => format!("the cumulative hazard of CMT={cmt}"),
+                    None => "another cumulative hazard".to_string(),
+                }
+            } else {
+                name.map_or_else(|| format!("state {k}"), |n| format!("[odes] state `{n}`"))
+            }
+        })
+        .collect()
+}
+
 /// Integrate a subject's augmented ODE from `0` to `horizon`, applying doses /
 /// infusions / EVID-3 resets via the **same break-time segmentation as
 /// [`ode_dense_solve_states`]**, and halt at the first time `u[chz_state]` reaches
@@ -9326,20 +9355,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
 
     let n = ode.n_states;
     let opts = ode.effective_solver_opts();
-    // A `SolveFailed` reason reaches the user as a simulation warning (#2087), so it names the
-    // states as the model file does: `[odes]` names backticked, the injected accumulator by
-    // what it is rather than by its internal `__chz_<cmt>` name.
-    let labels: Vec<String> = (0..n)
-        .map(|k| {
-            if k == chz_state {
-                "the cumulative hazard".to_string()
-            } else {
-                ode.state_names
-                    .get(k)
-                    .map_or_else(|| format!("state {k}"), |name| format!("`{name}`"))
-            }
-        })
-        .collect();
+    let labels = chz_threshold_state_labels(ode, chz_state);
     let mut u = ode.initial_state(disposition);
 
     // Resolve modeled-RATE doses once, exactly as the dense path (#324).

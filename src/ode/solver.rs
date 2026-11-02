@@ -2250,8 +2250,8 @@ fn until_threshold_with(
 /// side. The budget clause stays as the secondary fact. A finite `u` returns `clause`
 /// unchanged, byte for byte.
 ///
-/// With `labels` the states are named by their labels (#2087) instead of the 0-based index
-/// that `None` prints.
+/// With `labels` the states are named by their labels, comma-joined as the sentence's subject
+/// (#2087), instead of the `state(s) <k>` index form that `None` prints.
 fn with_nonfinite_state_note(
     u: &[f64],
     t: f64,
@@ -2264,13 +2264,19 @@ fn with_nonfinite_state_note(
         .filter(|(_, x)| !x.is_finite())
         .map(|(k, _)| state_label(labels, k))
         .collect();
-    match bad.len() {
-        0 => clause,
-        1 => format!(
+    match (bad.len(), labels.is_some()) {
+        (0, _) => clause,
+        // A label is a full noun phrase (`` [odes] state `x` ``, "the cumulative hazard of
+        // CMT=3"), so the labelled form carries no "state(s)" prefix of its own.
+        (_, true) => format!(
+            "{} became non-finite before t={t:.6}; {clause}",
+            bad.join(", ")
+        ),
+        (1, false) => format!(
             "state {} became non-finite before t={t:.6}; {clause}",
             bad[0]
         ),
-        _ => format!(
+        (_, false) => format!(
             "states {} became non-finite before t={t:.6}; {clause}",
             bad.join(", ")
         ),
@@ -4982,13 +4988,21 @@ mod tests {
     }
 
     /// #2087 T5: with labels the note names the states by label, in index order, singular and
-    /// plural; a finite `u` is still the clause alone.
+    /// plural, with no `state(s)` prefix of its own (a label is a full noun phrase); a finite
+    /// `u` is still the clause alone.
     ///
     /// Mutations that redden it: ignore `labels` (prints `0, 2`); index the labels by the
-    /// position in the non-finite list instead of the state index (prints `` `a`, `b` ``).
+    /// position in the non-finite list instead of the state index; keep the `state(s)` prefix
+    /// on the labelled form.
     #[test]
     fn nonfinite_state_note_names_states_by_label() {
-        let labels: Vec<String> = ["`a`", "`b`", "`c`"].map(String::from).to_vec();
+        let labels: Vec<String> = [
+            "[odes] state `a`",
+            "[odes] state `b`",
+            "the cumulative hazard of CMT=3",
+        ]
+        .map(String::from)
+        .to_vec();
         let clause = "step budget (5) exhausted".to_string();
         assert_eq!(
             with_nonfinite_state_note(
@@ -4997,11 +5011,12 @@ mod tests {
                 Some(&labels),
                 clause.clone()
             ),
-            "states `a`, `c` became non-finite before t=2.000000; step budget (5) exhausted"
+            "[odes] state `a`, the cumulative hazard of CMT=3 became non-finite before \
+             t=2.000000; step budget (5) exhausted"
         );
         assert_eq!(
             with_nonfinite_state_note(&[1.0, f64::NAN, 1.0], 2.0, Some(&labels), clause.clone()),
-            "state `b` became non-finite before t=2.000000; step budget (5) exhausted"
+            "[odes] state `b` became non-finite before t=2.000000; step budget (5) exhausted"
         );
         assert_eq!(
             with_nonfinite_state_note(&[0.0, 1.0, 2.0], 2.0, Some(&labels), clause.clone()),

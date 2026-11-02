@@ -561,13 +561,88 @@ fn until_chz_threshold_names_a_diverged_state_by_its_odes_name() {
     ) {
         ThresholdOutcome::SolveFailed(msg) => {
             assert!(
-                msg.starts_with("state `central` became non-finite before t="),
+                msg.starts_with("[odes] state `central` became non-finite before t="),
                 "msg: {msg}"
             );
             assert!(!msg.contains("state 0"), "msg: {msg}");
         }
         other => panic!("expected SolveFailed, got {other:?}"),
     }
+}
+
+/// #2087 review row 2: with two ODE-accumulated causes, the accumulator that is **not**
+/// being searched is named by its CMT, never by its internal `__chz_<cmt>` name. Slot 1
+/// (`__chz_2`) is the searched accumulator and stays finite (rate 0); slot 2 (`__chz_3`)
+/// obeys `dH/dt = H²` from `H(0) = 1`, so it diverges at t = 1, unmonitored, and the solve
+/// fails on the step budget with the non-finite note.
+///
+/// Engine: the labelled CHZ driver, value path. Mutations that redden it: label only
+/// `chz_state` (prints `` [odes] state `__chz_3` ``); drop the `chz_state_slots` arm's CMT.
+#[cfg(feature = "survival")]
+#[test]
+fn until_chz_threshold_names_another_cause_accumulator_by_its_cmt() {
+    let ode = OdeSpec {
+        rhs: Box::new(|y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+            dy[0] = 0.0;
+            dy[1] = 0.0;
+            dy[2] = y[2] * y[2];
+        }),
+        n_states: 3,
+        state_names: vec!["central".into(), "__chz_2".into(), "__chz_3".into()],
+        chz_state_slots: vec![1, 2],
+        init_fn: Some(Box::new(|_p: &[f64]| vec![1.0, 0.0, 1.0])),
+        ..one_cpt_chz_ode_spec()
+    };
+    let subject = make_subject(vec![], vec![]);
+    let pk = pk_one(10.0, 100.0);
+    match ode_solve_until_chz_threshold(
+        &ode,
+        &pk.values,
+        DoseReads::Shared(&pk.values),
+        &subject,
+        1,
+        5.0,
+        30.0,
+    ) {
+        ThresholdOutcome::SolveFailed(msg) => {
+            assert!(
+                msg.starts_with("the cumulative hazard of CMT=3 became non-finite before t="),
+                "msg: {msg}"
+            );
+            assert!(!msg.contains("__chz"), "msg: {msg}");
+        }
+        other => panic!("expected SolveFailed, got {other:?}"),
+    }
+}
+
+/// #2087: the label table itself, one cell per arm — a user `[odes]` state, the searched
+/// accumulator, another cause's accumulator, and an injected slot whose name carries no CMT.
+///
+/// Mutations that redden it: swap any two arms; drop the backticks or the `[odes] state`
+/// prefix; drop the `chz_state` check (the searched slot reads "of CMT=2").
+#[cfg(feature = "survival")]
+#[test]
+fn chz_threshold_state_labels_names_every_arm() {
+    let ode = OdeSpec {
+        n_states: 4,
+        state_names: vec![
+            "central".into(),
+            "__chz_2".into(),
+            "__chz_3".into(),
+            "odd".into(),
+        ],
+        chz_state_slots: vec![1, 2, 3],
+        ..one_cpt_chz_ode_spec()
+    };
+    assert_eq!(
+        chz_threshold_state_labels(&ode, 1),
+        [
+            "[odes] state `central`",
+            "the cumulative hazard",
+            "the cumulative hazard of CMT=3",
+            "another cumulative hazard",
+        ]
+    );
 }
 
 /// The driver's window AUCs (#943) for a run whose controller issues, at each decision,
