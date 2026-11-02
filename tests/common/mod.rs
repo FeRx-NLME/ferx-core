@@ -229,8 +229,10 @@ pub fn windows_in_band(res: &ferx_core::AdaptiveSimulationResult) -> usize {
 /// η = 0 for every subject of `pop` (#2580, #2583): the typical-value patient an mrgsolve
 /// kit simulates. A model's `omega ~ 1e-10` still draws an η of order 1e-5, which offsets
 /// every trough and AUC one-sidedly against such a kit — the whole of the gap the vanco
-/// anchors once attributed to the solvers. The one builder for every adaptive kit anchor,
-/// whichever entry point it then calls.
+/// anchors once attributed to the solvers. The one η = 0 builder: every adaptive kit anchor
+/// that runs at η = 0 uses it, whichever entry point it then calls. The renal and platelet
+/// anchors still draw η (#2580's out-of-scope table): renal CL never reads `ETA_CL`, and
+/// the platelet gap has another cause.
 ///
 /// η only: on an IOV model κ is still drawn, so the run is not the typical-value patient
 /// there. None of its callers (the vanco, vanco-loading and vanco-interval anchors) has κ.
