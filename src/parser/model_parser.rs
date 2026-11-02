@@ -16961,7 +16961,7 @@ fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
 /// The entry criterion is that a *statement* in the block can never begin with a
 /// binary operator — see [`join_continuation_lines`] for why that is what makes
 /// joining a strict widening rather than a reinterpretation.
-const CONTINUATION_BLOCKS: &[&str] = &[
+pub(crate) const CONTINUATION_BLOCKS: &[&str] = &[
     "individual_parameters",
     "odes",
     "scaling",
@@ -16983,12 +16983,12 @@ const CONTINUATION_BLOCKS: &[&str] = &[
 /// `if`, or a brace — never with a binary operator — so a line opening with one
 /// of these can only be a continuation, and joining it strictly widens the
 /// accepted grammar rather than reinterpreting anything that parsed before.
-const CONTINUATION_LEADERS: &[char] = &['+', '-', '*', '/', '^'];
+pub(crate) const CONTINUATION_LEADERS: &[char] = &['+', '-', '*', '/', '^'];
 
 /// Trailing characters that mark a line as unfinished, so the *next* line
 /// continues it. `=` is included so `LEMAX =` followed by an indented expression
 /// works; `,` so a multi-line argument list does.
-const CONTINUATION_TRAILERS: &[char] = &['+', '-', '*', '/', '^', ',', '='];
+pub(crate) const CONTINUATION_TRAILERS: &[char] = &['+', '-', '*', '/', '^', ',', '='];
 
 /// Join operator continuation lines into single logical lines (#1030).
 ///

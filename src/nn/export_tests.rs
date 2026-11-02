@@ -347,7 +347,20 @@ fn an_input_that_would_not_read_the_data_column_is_refused() {
     );
     let err = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap_err();
     assert!(
-        err.contains("`CRCL`") && err.contains("not read as a data covariate"),
+        err.contains("input `CRCL` is also the name of a theta"),
+        "{err}"
+    );
+    // A variable the model assigns: the generated normalisation comes first, so
+    // the parse refuses it as a forward reference.
+    let assigned = FIXTURE_MODEL
+        .replace("inputs     = [WT, CRCL]", "inputs     = [WT, XR]")
+        .replace(
+            "  V  = TVV * exp(ETA_V)",
+            "  XR = 2\n  V  = TVV * exp(ETA_V)",
+        );
+    let err = export(&assigned, &names, &theta, DcmWeightForm::Literal).unwrap_err();
+    assert!(
+        err.contains("forward reference") && err.contains("`XR`"),
         "{err}"
     );
     // The control: the fixture's own inputs are read as columns, so the check
@@ -773,6 +786,94 @@ fn parameter_numbers_that_define_the_model_are_compared() {
     export_dcm_from_fit(&with_kappa("2 * NARM"), &fit, &opts).unwrap();
     let err = export_dcm_from_fit(&with_kappa("3 * NARM"), &fit, &opts).unwrap_err();
     assert!(err.contains("weight = 3 * NARM"), "{err}");
+}
+
+/// An input that names a theta is refused even when the model also reads the
+/// column under that name elsewhere — a residual `correlation … by ARM` groups
+/// on the column, so `ARM` is among the data columns read, while the generated
+/// `Z_TYPICAL_PK_ARM = (ARM - …)` would read the theta. The control has no such
+/// theta and exports.
+#[test]
+fn an_input_named_like_a_parameter_is_refused_even_when_the_column_is_read() {
+    let (names, theta) = fixture_theta();
+    let model = |extra_theta: &str| {
+        FIXTURE_MODEL
+            .replace("inputs     = [WT, CRCL]", "inputs     = [ARM, CRCL]")
+            .replace(
+                "  sigma PROP_ERR ~ 0.1 (sd)",
+                &format!(
+                    "{extra_theta}  theta RHO(0.3, -0.4, 0.95)\n  sigma PROP_ERR ~ 0.1 (sd)\n  \
+                     sigma ADD_ERR ~ 1.0 (sd)"
+                ),
+            )
+            .replace(
+                "DV ~ proportional(PROP_ERR)",
+                "DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation cs(RHO) by ARM",
+            )
+    };
+    let with_theta = model("  theta ARM(1, 0, 9)\n");
+    // The straddle: the column is read, so the data-column check alone passes.
+    let nn_start = with_theta.find("\n[covariate_nn ").unwrap() + 1;
+    let nn_end = with_theta[nn_start..].find("\n[").unwrap() + nn_start + 1;
+    let plain = format!("{}{}", &with_theta[..nn_start], &with_theta[nn_end..])
+        .replace("TYPICAL_PK.CL", "1")
+        .replace("TYPICAL_PK . KA", "1");
+    let parsed = parse_model_string(&plain).unwrap();
+    assert!(parsed.referenced_covariates.iter().any(|c| c == "ARM"));
+    let err = export(&with_theta, &names, &theta, DcmWeightForm::Literal).unwrap_err();
+    assert!(
+        err.contains("input `ARM` is also the name of a theta")
+            && err.contains("`Z_TYPICAL_PK_ARM`"),
+        "{err}"
+    );
+    export(&model(""), &names, &theta, DcmWeightForm::Literal).unwrap();
+}
+
+/// Whitespace inside a quoted string is content: `"BODY WEIGHT"` and
+/// `"BODYWEIGHT"` are different columns, so a mapping that changed between
+/// them is a different model.
+#[test]
+fn a_quoted_column_header_is_compared_with_its_spaces() {
+    let mapped = |header: &str| {
+        FIXTURE_MODEL.replace(
+            "[parameters]",
+            &format!("[data]\n  path = \"pk.csv\"\n  WT = \"{header}\"\n\n[parameters]"),
+        )
+    };
+    let fit = fixture_fit(Some(&mapped("BODY WEIGHT")));
+    let opts = DcmExportOptions::default();
+    export_dcm_from_fit(&mapped("BODY WEIGHT"), &fit, &opts).unwrap();
+    let err = export_dcm_from_fit(&mapped("BODYWEIGHT"), &fit, &opts).unwrap_err();
+    assert!(err.contains(r#"`WT = "BODYWEIGHT"`"#), "{err}");
+    assert_eq!(
+        without_whitespace(r#"a = "x  y" + ' z'"#),
+        r#"a="x  y"+' z'"#
+    );
+}
+
+/// Layout is free in the way the parser makes it: a statement over several
+/// lines — an operator continuation, or a line break inside parentheses —
+/// compares equal to the same statement on one line, and a real change still
+/// does not.
+#[test]
+fn a_statement_laid_out_over_several_lines_is_the_same_model() {
+    let fit = fixture_fit(Some(FIXTURE_MODEL));
+    let opts = DcmExportOptions::default();
+    for layout in [
+        "  CL = TYPICAL_PK.CL\n       * exp(ETA_CL)",
+        "  CL = TYPICAL_PK.CL *\n       exp(ETA_CL)",
+        "  CL = TYPICAL_PK.CL * exp(\n       ETA_CL)",
+    ] {
+        let model = FIXTURE_MODEL.replace("  CL = TYPICAL_PK.CL * exp(ETA_CL)", layout);
+        assert_ne!(model, FIXTURE_MODEL);
+        export_dcm_from_fit(&model, &fit, &opts).unwrap_or_else(|e| panic!("{layout}: {e}"));
+    }
+    let changed = FIXTURE_MODEL.replace(
+        "  CL = TYPICAL_PK.CL * exp(ETA_CL)",
+        "  CL = TYPICAL_PK.CL\n       * exp(2 * ETA_CL)",
+    );
+    let err = export_dcm_from_fit(&changed, &fit, &opts).unwrap_err();
+    assert!(err.contains("not the one the fit was made with"), "{err}");
 }
 
 /// The committed `fit.json` the CLI test reads is this fixture's fit: the

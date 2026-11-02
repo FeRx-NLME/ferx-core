@@ -54,6 +54,7 @@ use super::Activation;
 use crate::parser::model_parser::{
     block_disabled_feature, block_header, is_plain_identifier, parse_model_string,
     parse_nn_block_fields, scaling_intermediate_reserved, strip_line_comment, NnBlockSpec,
+    CONTINUATION_BLOCKS, CONTINUATION_LEADERS, CONTINUATION_TRAILERS,
 };
 
 #[path = "export_values.rs"]
@@ -251,15 +252,34 @@ fn check_exported(
             }
         }
     }
+    // What a bare name resolves to ahead of a data column, in the parser's
+    // order: a θ, an η or κ, then a variable assigned earlier in the block. The
+    // generated normalisation is the block's first statement, so a variable
+    // assigned later is a forward reference the validation parse has already
+    // refused; that leaves θ, η and κ. Being read as a column *elsewhere* — a
+    // `correlation … by ARM` groups on the column whatever else `ARM` names —
+    // does not make the normalisation read it, so the input must name none.
+    let p = &model.default_params;
+    let mut shadowing: Vec<(&str, &str)> = Vec::new();
+    shadowing.extend(p.theta_names.iter().map(|n| (n.as_str(), "a theta")));
+    shadowing.extend(
+        p.omega
+            .eta_names
+            .iter()
+            .map(|n| (n.as_str(), "a random effect")),
+    );
+    if let Some(iov) = &p.omega_iov {
+        shadowing.extend(iov.eta_names.iter().map(|n| (n.as_str(), "a kappa")));
+    }
     for (spec, _) in nets {
         for input in &spec.inputs {
-            if !model.referenced_covariates.iter().any(|c| c == input) {
+            if let Some((_, what)) = shadowing.iter().find(|(n, _)| n == input) {
                 return Err(format!(
-                    "[covariate_nn {}] input `{input}` is not read as a data covariate in \
-                     the exported model: the model declares or assigns something else \
-                     named `{input}`, which an equation reads instead of the column. \
+                    "[covariate_nn {}] input `{input}` is also the name of {what}, which \
+                     the exported equation `{}` would read instead of the data column. \
                      Rename the column or the other `{input}` before exporting",
-                    spec.name
+                    spec.name,
+                    input_var(&spec.name, input)
                 ));
             }
         }
@@ -467,31 +487,105 @@ fn check_same_networks(model_text: &str, fitted_text: &str) -> Result<(), String
 /// shapes only a refit. Everything else — every equation, the error model,
 /// which parameters exist and which are `FIX`, `[fit_options]` — must match.
 fn model_lines(text: &str) -> Vec<(String, &str)> {
-    let mut block = String::new();
     let mut out = Vec::new();
     // A header counts only once a line of its block does, so a block left empty
     // by the exclusions (a `[data]` holding only a path) is no difference.
     let mut header: Option<(String, &str)> = None;
-    for line in text.lines() {
-        let code = strip_line_comment(line).trim();
-        if code.is_empty() {
+    for (block, code, line) in logical_lines(text) {
+        if block_header(&code).is_some() {
+            header = Some((without_whitespace(&code), line));
             continue;
         }
-        let mut norm: String = code.chars().filter(|c| !c.is_whitespace()).collect();
-        if let Some((ty, _)) = block_header(code) {
-            block = ty;
-            header = Some((norm, line));
-            continue;
-        }
+        let mut norm = without_whitespace(&code);
+        let key = norm.to_ascii_lowercase();
         match block.as_str() {
             "priors" => continue,
-            "covariate_nn" if norm.to_ascii_lowercase().starts_with("init=") => continue,
-            "data" if norm.to_ascii_lowercase().starts_with("path=") => continue,
+            "covariate_nn" if key.starts_with("init=") => continue,
+            "data" if key.starts_with("path=") => continue,
             "parameters" => norm = mask_parameter_values(&norm),
             _ => {}
         }
         out.extend(header.take());
         out.push((norm, line));
+    }
+    out
+}
+
+/// `text` as the parser groups it: `(block, code, first physical line)` per
+/// logical line, comments stripped. A line continues the one before while a
+/// `(` or `[` is open, and in an expression block (`CONTINUATION_BLOCKS`) when
+/// it starts with an operator or the one before ends with one — the parser's
+/// own rules, so a statement laid out over several lines compares equal to the
+/// same statement on one.
+fn logical_lines(text: &str) -> Vec<(String, String, &str)> {
+    let mut out: Vec<(String, String, &str)> = Vec::new();
+    let mut block = String::new();
+    for line in text.lines() {
+        let code = strip_line_comment(line).trim();
+        if code.is_empty() {
+            continue;
+        }
+        if let Some((ty, _)) = block_header(code) {
+            block = ty;
+            out.push((block.clone(), code.to_string(), line));
+            continue;
+        }
+        let continues = out.last().is_some_and(|(b, prev, _)| {
+            *b == block
+                && block_header(prev).is_none()
+                && (open_groups(prev) > 0
+                    || (CONTINUATION_BLOCKS.contains(&block.as_str())
+                        && (code.starts_with(CONTINUATION_LEADERS)
+                            || prev.ends_with(CONTINUATION_TRAILERS))))
+        });
+        match out.last_mut() {
+            Some((_, prev, _)) if continues => {
+                prev.push(' ');
+                prev.push_str(code);
+            }
+            _ => out.push((block.clone(), code.to_string(), line)),
+        }
+    }
+    out
+}
+
+/// `(` / `[` left open in `code`, outside quoted spans.
+fn open_groups(code: &str) -> i32 {
+    let bytes = code.as_bytes();
+    let (mut depth, mut i) = (0, 0);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                i = quoted_span_end(bytes, i);
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// `code` with its whitespace removed outside quoted spans: a quoted string —
+/// a column header such as `"BODY WEIGHT"` — keeps its spaces.
+fn without_whitespace(code: &str) -> String {
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'"' | b'\'') {
+            let end = quoted_span_end(bytes, i);
+            out.push_str(&code[i..end]);
+            i = end;
+            continue;
+        }
+        let ch = code[i..].chars().next().expect("in bounds");
+        if !ch.is_whitespace() {
+            out.push(ch);
+        }
+        i += ch.len_utf8();
     }
     out
 }

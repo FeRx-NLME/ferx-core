@@ -273,7 +273,12 @@ fn model_dir(input: &Path) -> Option<&Path> {
     let bundle = input
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("fitrx"));
-    (!bundle).then(|| input.parent().unwrap_or(Path::new("")))
+    (!bundle).then(|| {
+        input
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+    })
 }
 
 /// What the user should know about the written export that the export cannot
@@ -381,6 +386,20 @@ fn check_prior_import(exported: &str, model_dir: Option<&Path>) -> Result<bool, 
     }
 }
 
+/// Write `text` to `out` through a temporary file renamed over it. Renaming
+/// replaces the directory entry, never the file behind it, so an `out` that is
+/// a hard link to an input — which `same_file` cannot see on every platform —
+/// leaves the input's contents intact.
+fn write_replacing(out: &Path, text: &str) -> Result<(), String> {
+    let name = out.file_name().and_then(|n| n.to_str()).unwrap_or("export");
+    let tmp = out.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, out));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("cannot write `{}`: {e}", out.display()))
+}
+
 /// Export `text` at `fit` — after checking `fit` was made with the networks
 /// `text` declares — check its prior import, and write it to `out`. Returns
 /// whether the `from_fit` prior was checked.
@@ -393,7 +412,7 @@ fn write_export(
 ) -> Result<bool, String> {
     let exported = export_dcm_from_fit(text, fit, opts)?;
     let checked = check_prior_import(&exported, model_dir)?;
-    std::fs::write(out, exported).map_err(|e| format!("cannot write `{}`: {e}", out.display()))?;
+    write_replacing(out, &exported)?;
     Ok(checked)
 }
 
@@ -517,6 +536,15 @@ mod tests {
         }
         assert!(same_file(&model, &dir.path().join(".").join("m.ferx")));
         assert!(!same_file(&model, &fresh));
+        // Behind the guard, the write itself never truncates a hard-linked
+        // file: it replaces the link's directory entry.
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("m-link.ferx");
+            write_replacing(&link, "exported").unwrap();
+            assert_eq!(std::fs::read_to_string(&link).unwrap(), "exported");
+            assert_eq!(original(&model), model_bytes);
+        }
     }
 
     /// A relative path is flagged when the export lands elsewhere, and only
@@ -582,6 +610,15 @@ mod tests {
                 ("[priors] from_fit", "b.json".to_string())
             ]
         );
+        // A bare model file name and the default output beside it: no move.
+        let bare = notes(
+            text,
+            Path::new("m.ferx"),
+            Path::new("m-analytic.ferx"),
+            true,
+        );
+        assert_eq!(bare.len(), 1, "{bare:?}");
+        assert_eq!(model_dir(Path::new("m.ferx")), Some(Path::new(".")));
         let absolute = "[data]\n  path = \"/abs/pk.csv\"\n";
         assert!(notes(absolute, Path::new("run.fitrx"), Path::new("x.ferx"), false).is_empty());
     }
