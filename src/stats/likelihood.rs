@@ -9129,6 +9129,7 @@ DV ~ proportional(PROP_ERR)
                 interaction,
                 None,
                 None,
+                None,
                 Some(&mut parts),
             );
             (nll, parts)
