@@ -442,6 +442,11 @@ class Report:
         self.details.append(f"- `{mid}` {h['status']}: {h.get('error', '')}")
         if ok(b):
             self.failures.append(f"{mid}: fit {h['status']} at head, ok at the release")
+        elif mid in self.accepted:
+            # An accepted state stands in for the release baseline (`unbaselined_row`),
+            # so losing the fit is a failure against it — whether or not the release
+            # had this model at all.
+            self.failures.append(f"{mid}: fit {h['status']} at head, ok at its accepted state")
 
     def unbaselined_row(self, mid, h, b, p):
         why = "new since release" if b is None else f"release: {b['status']}"

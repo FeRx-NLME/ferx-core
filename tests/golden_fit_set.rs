@@ -446,6 +446,85 @@ fn fail_on_band_fails_a_nan_estimate() {
     assert!(md.contains("est(theta:V): nan > band"), "{md}");
 }
 
+/// A model the release never had, once accepted, is banded against its accepted state
+/// in every way the release would band it: a drift from that state fails, and so does
+/// losing the fit altogether (a timeout routes to a different row kind than a drift,
+/// which is exactly where the accepted state used to be forgotten).
+#[test]
+fn an_accepted_model_without_a_release_value_is_held_to_its_accepted_state() {
+    // The release never had `warfarin`; the accepted state is the only reference.
+    let date = fail_date();
+    let failed = r#"{"status": "timeout", "family": "FOCE, test", "error": "no result"}"#;
+    let mut drifted = perturbed_cl();
+    drifted[1].1 *= 1.01;
+    let cases: [(&str, String, bool, Option<&str>); 4] = [
+        (
+            "new-at-state",
+            model_rec("1234.5", 20, &perturbed_cl()),
+            true,
+            None,
+        ),
+        (
+            "new-drifted",
+            model_rec("1234.5", 20, &drifted),
+            true,
+            Some("warfarin: drifted from its accepted state: est(theta:V)"),
+        ),
+        (
+            "new-failed",
+            failed.to_string(),
+            true,
+            Some("warfarin: fit timeout at head, ok at its accepted state"),
+        ),
+        // Twin of the previous case without the accepted entry: the entry is what
+        // makes the lost fit a failure, so this one stays green.
+        ("new-failed-unaccepted", failed.to_string(), false, None),
+    ];
+    for (slot, head_rec, accept, want_failure) in cases {
+        let dir = scratch(slot);
+        let base = write(&dir, "base.json", &results("v", &[]));
+        let head = write(&dir, "head.json", &results("h", &[("warfarin", head_rec)]));
+        let bands_path = write(&dir, "bands.json", &bands(0.005));
+        if accept {
+            let state = results(
+                "pr",
+                &[("warfarin", model_rec("1234.5", 20, &perturbed_cl()))],
+            );
+            let acc = write(&dir, "accepted.json", &state);
+            let out = golden(&[
+                "accept",
+                "warfarin",
+                "--head",
+                &acc,
+                "--reason",
+                "#9999",
+                "--bands",
+                &bands_path,
+            ]);
+            assert!(out.status.success(), "accept: {}", text(&out));
+        }
+        let out = golden(&[
+            "report",
+            "--head",
+            &head,
+            "--base",
+            &base,
+            "--bands",
+            &bands_path,
+            "--today",
+            &date,
+        ]);
+        let md = text(&out);
+        match want_failure {
+            Some(msg) => {
+                assert!(!out.status.success(), "{slot} must fail:\n{md}");
+                assert!(md.contains(msg), "{slot}: want {msg:?}\n{md}");
+            }
+            None => assert!(out.status.success(), "{slot} must pass:\n{md}"),
+        }
+    }
+}
+
 /// A fit that fails at head but succeeded at the release fails the band mode; its twin,
 /// failing at both, is a known state and does not.
 #[test]
