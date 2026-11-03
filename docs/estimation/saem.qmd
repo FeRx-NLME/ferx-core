@@ -247,35 +247,40 @@ What this says:
 Since #2639 the kernel runs on ODE models: the refresh's η-gradient and
 η-Jacobian come from the adjoint's dual ODE walk, the same recorder that gives
 FOCEI its exact inner gradient there. Same protocol as the table above (6
-seeds, 150 + 250 iterations, one thread, IS −2 log L at 3000 samples), ferx
-`177e5877`, macOS arm64, two single-thread lanes on a machine shared with other
-fits; CPU is user+sys of the whole `[saem, imp]` run, so it includes the IS
-stage both arms share.
+seeds, 150 + 250 iterations, IS −2 log L at 3000 samples, fixed IS seed, Δ paired
+by seed against `rw`, negative is better), ferx `177e5877`, measured on
+**Linux** aarch64 (glibc 2.41, Docker): one lane, one thread, every arm
+interleaved per seed, nothing else running in the container VM (load average
+2.0–2.1 throughout). CPU is user+sys of the whole `[saem, imp]` run, so it
+includes the IS stage both arms share.
 
 | bench | Δ IS −2LL, `imh` | Δ, `imh` + `score_sa` | seed sd, `rw` → `imh` | CPU vs `rw` |
 |---|---|---|---|---|
-| busulfan first 100, closed form (control) | −2.23 ± 1.18 (6/6) | −3.06 ± 1.30 (6/6) | 1.27 → 0.38 | −2 % |
-| same, `[odes]`, `ode_method = rk45` | **−1.84 ± 1.06 (6/6)** | **−2.95 ± 0.62 (6/6)** | 0.85 → 0.43 | −2 % (19.7 → 19.4 s) |
-| TMDD QSS (60 subj, 1 η, 6 θ without η) | +0.78 ± 1.13 (2/6) | not comparable | 0.27 → 0.90 | −26 % |
+| busulfan first 100, closed form (control) | −2.25 ± 1.22 (6/6) | −3.06 ± 1.30 (6/6) | 1.27 → 0.39 | −1 % |
+| same, `[odes]`, `ode_method = rk45` | **−2.43 ± 1.69 (6/6)** | **−2.95 ± 0.62 (6/6)** | 1.44 → 0.36 | −3 % (19.5 → 18.9 s) |
+| TMDD QSS (60 subj, 1 η, 6 θ without η) | +0.05 ± 1.02 (4/6) | not comparable | 0.72 → 0.93 | −27 % |
 
 - **The busulfan ODE twin carries the analytic result over.** Integrated by
   RK45, it gains as much as the closed form does, on every seed, at the same CPU.
   Left on `ode_method = auto` the twin is solved exactly by the matrix
-  exponential and reproduces the closed form's numbers (4 of 6 seeds bit-for-bit).
+  exponential and reproduces the closed form's numbers, so it is not an ODE bench.
   ferx's IS −2 log L at NONMEM 7.5.1's own SAEM estimates on that model (three
   seeds, #1449) is 7531.1, 7531.9 and 7532.1 on the RK45 twin; `imh` reaches
-  7531.7 ± 0.4, `rw` 7533.5 ± 0.9.
-- **TMDD is the θ-without-η case again**, on a genuinely nonlinear, three-state
-  model: six of its seven θ are moved by the single-draw M-step, and under
-  `bobyqa` `imh` is slightly worse (the fit warns, as it does on busulfan with
-  `TVQ` free). The `score_sa` remedy does not apply here: it does not converge on
-  this model under either kernel (IS −2 log L 4830–9864 against 4762). NONMEM's
-  SAEM (`ISAMPLE=2`, same starts) does not converge on it either — V1 collapses
-  to 0.01 and three θ end at their initial values — so there is no external
-  reference for this row.
-- **Cost.** The kernel's cost report (`imh_cost_warning`) did not fire on either
-  ODE bench: one dual ODE sweep for the η-gradient and one for the η-Jacobian
-  amortise over the `saem_imh_refresh` interval as they do on the closed form.
+  7531.5 ± 0.4, `rw` 7533.9 ± 1.4.
+- **TMDD is a tie, at three quarters of the CPU.** It is the θ-without-η case
+  on a genuinely nonlinear three-state model: six of its seven θ are moved by the
+  single-draw M-step, and the fit warns about running `imh` with them under
+  `bobyqa`, as it does on busulfan with `TVQ` free. A macOS run of the same arms
+  leaned the other way (+0.78, 2/6), so read the row as no gain rather than as a
+  win. The `score_sa` remedy does not apply here: on macOS it did not converge on
+  this model under either kernel (IS −2 log L 4830–9864 against 4762), so that
+  column was not repeated. NONMEM's SAEM (`ISAMPLE=2`, same starts) does not
+  converge on it either — V1 collapses to 0.01 and three θ end at their initial
+  values — so there is no external reference for this row.
+- **Cost.** The kernel's cost report (`imh_cost_warning`) fired on none of the
+  30 `imh` fits: one dual ODE sweep for the η-gradient and one for the
+  η-Jacobian amortise over the `saem_imh_refresh` interval as they do on the
+  closed form.
 
 The E-step sampling is parallelized across subjects using Rayon.
 
