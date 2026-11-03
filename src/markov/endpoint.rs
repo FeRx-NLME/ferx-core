@@ -702,6 +702,10 @@ pub fn validate_ctmm_times(cmt: usize, records: &[ObsRecord]) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(all(test, feature = "survival"))]
+#[path = "endpoint_order_tests.rs"]
+mod endpoint_order_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
