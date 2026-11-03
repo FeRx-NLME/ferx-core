@@ -1,0 +1,427 @@
+Fri Oct 30 05:06:19 AM UTC 2026
+$PROBLEM 3-state minimal CTMM (mCTMM) anchor for ferx-core issue #2474
+; Schindler & Karlsson (AAPS J 2017) minimal continuous-time Markov model, scored
+; as a panel/snapshot CTMM likelihood with F_FLAG=1 (as tests/nonmem/ctmm_2state.ctl).
+; Steady state: proportional odds  F_k = 1/(1+exp(-(CUT_k - LP))),  LP = BX*X,
+;   P0 = F1, P1 = F2 - F1, P2 = 1 - F2,  CUT1 = THETA(2), CUT2 = CUT1 + EXP(THETA(3)).
+; Adjacent rates: q(k->k+1) = P(k+1)/(TAU*(P(k)+P(k+1))), q(k+1->k) = P(k)/(TAU*(...)),
+;   TAU = EXP(THETA(1)) the mean equilibration time.
+; P(dt) = expm(Q*dt) in closed form (Sylvester; Q has eigenvalues 0, L1, L2):
+;   P = (Q2 + S*Q + M*I)/M + E1*(Q2 - L2*Q)/(L1*(L1-L2)) + E2*(Q2 - L1*Q)/(L2*(L2-L1)),
+;   S = A+B+C+D, M = A*C + A*D + B*D, L1,2 = (-S +- SQRT(S*S-4M))/2.
+; Each record carries the previous state (PSTATE) and the gap (DT); the first record
+; per subject is the initial condition (MDV=1), as ferx conditions on the first state.
+$DATA mctmm_3state.csv IGNORE=@
+$INPUT ID DV PSTATE DT X MDV
+$PRED
+  F_FLAG = 1
+  TAU  = EXP(THETA(1))
+  CUT1 = THETA(2)
+  CUT2 = CUT1 + EXP(THETA(3))
+  LP   = THETA(4)*X
+  F1 = 1.0/(1.0 + EXP(-(CUT1 - LP)))
+  F2 = 1.0/(1.0 + EXP(-(CUT2 - LP)))
+  P0 = F1
+  P1 = F2 - F1
+  P2 = 1.0 - F2
+  A = P1/(TAU*(P0 + P1))
+  B = P0/(TAU*(P0 + P1))
+  C = P2/(TAU*(P1 + P2))
+  D = P1/(TAU*(P1 + P2))
+  Q11 = -A
+  Q12 = A
+  Q13 = 0.0
+  Q21 = B
+  Q22 = -B - C
+  Q23 = C
+  Q31 = 0.0
+  Q32 = D
+  Q33 = -D
+  S  = A + B + C + D
+  M  = A*C + A*D + B*D
+  SQ = SQRT(S*S - 4.0*M)
+  L1 = (-S + SQ)/2.0
+  L2 = (-S - SQ)/2.0
+  E1 = EXP(L1*DT)
+  E2 = EXP(L2*DT)
+  W0 = 1.0/M
+  W1 = E1/(L1*(L1 - L2))
+  W2 = E2/(L2*(L2 - L1))
+  R11 = Q11*Q11 + Q12*Q21 + Q13*Q31
+  P11 = W0*(R11 + S*Q11 + M*1.0) + W1*(R11 - L2*Q11) + W2*(R11 - L1*Q11)
+  R12 = Q11*Q12 + Q12*Q22 + Q13*Q32
+  P12 = W0*(R12 + S*Q12 + M*0.0) + W1*(R12 - L2*Q12) + W2*(R12 - L1*Q12)
+  R13 = Q11*Q13 + Q12*Q23 + Q13*Q33
+  P13 = W0*(R13 + S*Q13 + M*0.0) + W1*(R13 - L2*Q13) + W2*(R13 - L1*Q13)
+  R21 = Q21*Q11 + Q22*Q21 + Q23*Q31
+  P21 = W0*(R21 + S*Q21 + M*0.0) + W1*(R21 - L2*Q21) + W2*(R21 - L1*Q21)
+  R22 = Q21*Q12 + Q22*Q22 + Q23*Q32
+  P22 = W0*(R22 + S*Q22 + M*1.0) + W1*(R22 - L2*Q22) + W2*(R22 - L1*Q22)
+  R23 = Q21*Q13 + Q22*Q23 + Q23*Q33
+  P23 = W0*(R23 + S*Q23 + M*0.0) + W1*(R23 - L2*Q23) + W2*(R23 - L1*Q23)
+  R31 = Q31*Q11 + Q32*Q21 + Q33*Q31
+  P31 = W0*(R31 + S*Q31 + M*0.0) + W1*(R31 - L2*Q31) + W2*(R31 - L1*Q31)
+  R32 = Q31*Q12 + Q32*Q22 + Q33*Q32
+  P32 = W0*(R32 + S*Q32 + M*0.0) + W1*(R32 - L2*Q32) + W2*(R32 - L1*Q32)
+  R33 = Q31*Q13 + Q32*Q23 + Q33*Q33
+  P33 = W0*(R33 + S*Q33 + M*1.0) + W1*(R33 - L2*Q33) + W2*(R33 - L1*Q33)
+  PR = P11
+  IF (PSTATE.EQ.0 .AND. DV.EQ.1) PR = P12
+  IF (PSTATE.EQ.0 .AND. DV.EQ.2) PR = P13
+  IF (PSTATE.EQ.1 .AND. DV.EQ.0) PR = P21
+  IF (PSTATE.EQ.1 .AND. DV.EQ.1) PR = P22
+  IF (PSTATE.EQ.1 .AND. DV.EQ.2) PR = P23
+  IF (PSTATE.EQ.2 .AND. DV.EQ.0) PR = P31
+  IF (PSTATE.EQ.2 .AND. DV.EQ.1) PR = P32
+  IF (PSTATE.EQ.2 .AND. DV.EQ.2) PR = P33
+  ; ETA(1)*0: a dummy random effect NONMEM requires for multi-subject data; the
+  ; model is fixed-effects (Omega FIX 0), so it contributes nothing.
+  Y = PR + ETA(1)*0
+$THETA 0.5    ; LTAU  log mean equilibration time
+$THETA -0.3   ; C1    first cut-point
+$THETA 0.2    ; LD2   log increment to the second cut-point
+$THETA 0.3    ; BX    covariate effect on the linear predictor
+$OMEGA 0 FIX
+$ESTIMATION METHOD=0 MAXEVAL=9999 PRINT=5 NOABORT SIGL=12 NSIG=5
+$COVARIANCE MATRIX=R
+
+NM-TRAN MESSAGES
+  
+ WARNINGS AND ERRORS (IF ANY) FOR PROBLEM    1
+             
+ (WARNING  1) NM-TRAN INFERS THAT THE DATA ARE SINGLE-SUBJECT.
+  NONMEM RUN CANNOT BE PARALLELIZED.
+
+ (DATA WARNING   5) RECORD         8, DATA ITEM   2, CONTENTS: 2
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD        28, DATA ITEM   2, CONTENTS: 2
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD        37, DATA ITEM   2, CONTENTS: 1
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD        43, DATA ITEM   2, CONTENTS: 2
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD        50, DATA ITEM   2, CONTENTS: 1
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD        70, DATA ITEM   2, CONTENTS: 2
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD        79, DATA ITEM   2, CONTENTS: 1
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD        89, DATA ITEM   2, CONTENTS: 1
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       106, DATA ITEM   2, CONTENTS: 1
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       117, DATA ITEM   2, CONTENTS: 2
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       127, DATA ITEM   2, CONTENTS: 1
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       169, DATA ITEM   2, CONTENTS: 1
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       176, DATA ITEM   2, CONTENTS: 2
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       216, DATA ITEM   2, CONTENTS: 1
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       222, DATA ITEM   2, CONTENTS: 2
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       239, DATA ITEM   2, CONTENTS: 2
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       245, DATA ITEM   2, CONTENTS: 1
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       253, DATA ITEM   2, CONTENTS: 2
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       259, DATA ITEM   2, CONTENTS: 1
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1
+
+ (DATA WARNING   5) RECORD       290, DATA ITEM   2, CONTENTS: 2
+ THE DV DATA ITEM IS POSITIVE, BUT THE MDV DATA ITEM IS 1*
+
+ * THE MAXIMUM NUMBER OF WARNINGS OF ONE OR MORE TYPES WAS REACHED.
+ IT IS POSSIBLE THAT SOME WARNING MESSAGES WERE SUPPRESSED.
+  
+Note: Analytical 2nd Derivatives are constructed in FSUBS but are never used.
+      You may insert $ABBR DERIV2=NO after the first $PROB to save FSUBS construction and compilation time
+  
+
+License Registered to:  InsightRX
+Expiration Date:    14 AUG 2027
+Current Date:       30 OCT 2026
+Days until program expires : 289
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.5.1
+ ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
+ CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
+ AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
+ PERFORMED BY NOUS INFOSYSTEMS.
+
+ PROBLEM NO.:         1
+ 3-state minimal CTMM (mCTMM) anchor for ferx-core issue #2474
+0DATA CHECKOUT RUN:              NO
+ DATA SET LOCATED ON UNIT NO.:    2
+ THIS UNIT TO BE REWOUND:        NO
+ NO. OF DATA RECS IN DATA SET:      715
+ NO. OF DATA ITEMS IN DATA SET:   7
+ ID DATA ITEM IS DATA ITEM NO.:   7
+ DEP VARIABLE IS DATA ITEM NO.:   2
+ MDV DATA ITEM IS DATA ITEM NO.:  6
+0LABELS FOR DATA ITEMS:
+ ID DV PSTATE DT X MDV .ID.
+0FORMAT FOR DATA:
+ (6E5.0,1F2.0)
+
+ TOT. NO. OF OBS RECS:      635
+ TOT. NO. OF INDIVIDUALS:      635
+0LENGTH OF THETA:   4
+0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
+0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT OMEGA BOUNDARY TEST OMITTED:    NO
+0INITIAL ESTIMATE OF THETA:
+   0.5000E+00 -0.3000E+00  0.2000E+00  0.3000E+00
+0INITIAL ESTIMATE OF OMEGA:
+ 0.0000E+00
+0OMEGA CONSTRAINED TO BE THIS INITIAL ESTIMATE
+0COVARIANCE STEP OMITTED:        NO
+ R MATRIX SUBSTITUTED:          YES
+ S MATRIX SUBSTITUTED:           NO
+ EIGENVLS. PRINTED:              NO
+ COMPRESSED FORMAT:              NO
+ GRADIENT METHOD USED:     NOSLOW
+ SIGDIGITS ETAHAT (SIGLO):                  -1
+ SIGDIGITS GRADIENTS (SIGL):                -1
+ EXCLUDE COV FOR FOCE (NOFCOV):              NO
+ Cholesky Transposition of R Matrix (CHOLROFF):0
+ KNUTHSUMOFF:                                -1
+ RESUME COV ANALYSIS (RESUME):               NO
+ SIR SAMPLE SIZE (SIRSAMPLE):
+ NON-LINEARLY TRANSFORM THETAS DURING COV (THBND): 1
+ PRECONDTIONING CYCLES (PRECOND):        0
+ PRECONDTIONING TYPES (PRECONDS):        TOS
+ FORCED PRECONDTIONING CYCLES (PFCOND):0
+ PRECONDTIONING TYPE (PRETYPE):        0
+ FORCED POS. DEFINITE SETTING DURING PRECONDITIONING: (FPOSDEF):0
+ SIMPLE POS. DEFINITE SETTING: (POSDEF):-1
+1
+
+
+ #TBLN:      1
+ #METH: First Order
+
+ ESTIMATION STEP OMITTED:                 NO
+ ANALYSIS TYPE:                           SINGLE-SUBJECT
+ NUMBER OF SADDLE POINT RESET ITERATIONS:      0
+ GRADIENT METHOD USED:               SLOW
+ EPS-ETA INTERACTION:                     NO
+ NO. OF FUNCT. EVALS. ALLOWED:            9999
+ NO. OF SIG. FIGURES REQUIRED:            5
+ INTERMEDIATE PRINTOUT:                   YES
+ ESTIMATE OUTPUT TO MSF:                  NO
+ ABORT WITH PRED EXIT CODE 1:             NO
+ IND. OBJ. FUNC. VALUES SORTED:           NO
+ NUMERICAL DERIVATIVE
+       FILE REQUEST (NUMDER):               NONE
+ MAP (ETAHAT) ESTIMATION METHOD (OPTMAP):   0
+ ETA HESSIAN EVALUATION METHOD (ETADER):    0
+ INITIAL ETA FOR MAP ESTIMATION (MCETA):    0
+ SIGDIGITS FOR MAP ESTIMATION (SIGLO):      12
+ GRADIENT SIGDIGITS OF
+       FIXED EFFECTS PARAMETERS (SIGL):     12
+ NOPRIOR SETTING (NOPRIOR):                 0
+ NOCOV SETTING (NOCOV):                     OFF
+ DERCONT SETTING (DERCONT):                 OFF
+ FINAL ETA RE-EVALUATION (FNLETA):          1
+ EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
+       IN SHRINKAGE (ETASTYPE):             NO
+ NON-INFL. ETA CORRECTION (NONINFETA):      0
+ RAW OUTPUT FILE (FILE): mctmm_3state.ext
+ EXCLUDE TITLE (NOTITLE):                   NO
+ EXCLUDE COLUMN LABELS (NOLABEL):           NO
+ FORMAT FOR ADDITIONAL FILES (FORMAT):      S1PE12.5
+ PARAMETER ORDER FOR OUTPUTS (ORDER):       TSOL
+ KNUTHSUMOFF:                               0
+ INCLUDE LNTWOPI:                           NO
+ INCLUDE CONSTANT TERM TO PRIOR (PRIORC):   NO
+ INCLUDE CONSTANT TERM TO OMEGA (ETA) (OLNTWOPI):NO
+ ADDITIONAL CONVERGENCE TEST (CTYPE=4)?:    NO
+ EM OR BAYESIAN METHOD USED:                 NONE
+
+
+ THE FOLLOWING LABELS ARE EQUIVALENT
+ PRED=NPRED
+ RES=NRES
+ WRES=NWRES
+ IWRS=NIWRES
+ IPRD=NIPRED
+ IRS=NIRES
+
+ MONITORING OF SEARCH:
+
+
+0ITERATION NO.:    0    OBJECTIVE VALUE:   990.210411328232        NO. OF FUNC. EVALS.:   5
+ CUMULATIVE NO. OF FUNC. EVALS.:        5
+ NPARAMETR:  5.0000E-01 -3.0000E-01  2.0000E-01  3.0000E-01
+ PARAMETER:  1.0000E-01 -1.0000E-01  1.0000E-01  1.0000E-01
+ GRADIENT:  -2.2601E+02  8.2101E+01 -1.1334E+02 -8.1779E+01
+
+0ITERATION NO.:    5    OBJECTIVE VALUE:   966.988539588159        NO. OF FUNC. EVALS.:  33
+ CUMULATIVE NO. OF FUNC. EVALS.:       38
+ NPARAMETR:  5.9901E-01 -5.0331E-01  5.4624E-01  1.1071E+00
+ PARAMETER:  1.1980E-01 -1.6777E-01  2.7312E-01  3.6905E-01
+ GRADIENT:  -5.0229E+01 -1.3018E+01  1.6515E+01  6.5669E+00
+
+0ITERATION NO.:   10    OBJECTIVE VALUE:   966.446975191868        NO. OF FUNC. EVALS.:  42
+ CUMULATIVE NO. OF FUNC. EVALS.:       80
+ NPARAMETR:  6.3758E-01 -4.4078E-01  5.0658E-01  1.0651E+00
+ PARAMETER:  1.2752E-01 -1.4693E-01  2.5329E-01  3.5502E-01
+ GRADIENT:  -4.2997E-01 -1.2680E-01  1.3238E-01  7.2838E-02
+
+0ITERATION NO.:   15    OBJECTIVE VALUE:   966.446935879624        NO. OF FUNC. EVALS.:  45
+ CUMULATIVE NO. OF FUNC. EVALS.:      125
+ NPARAMETR:  6.3798E-01 -4.4042E-01  5.0635E-01  1.0648E+00
+ PARAMETER:  1.2760E-01 -1.4681E-01  2.5318E-01  3.5494E-01
+ GRADIENT:   7.4918E-02 -4.9716E-02  4.1829E-02  3.7058E-02
+
+0ITERATION NO.:   20    OBJECTIVE VALUE:   966.446931879539        NO. OF FUNC. EVALS.:  45
+ CUMULATIVE NO. OF FUNC. EVALS.:      170
+ NPARAMETR:  6.3790E-01 -4.4027E-01  5.0627E-01  1.0647E+00
+ PARAMETER:  1.2758E-01 -1.4676E-01  2.5314E-01  3.5490E-01
+ GRADIENT:  -2.4840E-02 -1.6426E-02  1.4299E-02  1.5582E-02
+
+0ITERATION NO.:   25    OBJECTIVE VALUE:   966.446931344640        NO. OF FUNC. EVALS.:  45
+ CUMULATIVE NO. OF FUNC. EVALS.:      215
+ NPARAMETR:  6.3793E-01 -4.4022E-01  5.0624E-01  1.0647E+00
+ PARAMETER:  1.2759E-01 -1.4674E-01  2.5312E-01  3.5488E-01
+ GRADIENT:   1.3169E-02 -3.8428E-03  5.0596E-03  7.7389E-03
+
+0ITERATION NO.:   30    OBJECTIVE VALUE:   966.446931277131        NO. OF FUNC. EVALS.:  46
+ CUMULATIVE NO. OF FUNC. EVALS.:      261
+ NPARAMETR:  6.3792E-01 -4.4021E-01  5.0623E-01  1.0646E+00
+ PARAMETER:  1.2758E-01 -1.4674E-01  2.5312E-01  3.5488E-01
+ GRADIENT:  -1.6004E-04 -3.4787E-04  1.9190E-03  4.6268E-03
+
+0ITERATION NO.:   35    OBJECTIVE VALUE:   966.446931249792        NO. OF FUNC. EVALS.:  53
+ CUMULATIVE NO. OF FUNC. EVALS.:      314
+ NPARAMETR:  6.3792E-01 -4.4022E-01  5.0623E-01  1.0646E+00
+ PARAMETER:  1.2758E-01 -1.4674E-01  2.5311E-01  3.5486E-01
+ GRADIENT:  -6.7669E-03  1.6602E-03  6.4921E-04  1.2483E-04
+
+0ITERATION NO.:   40    OBJECTIVE VALUE:   966.446931245139        NO. OF FUNC. EVALS.:  65
+ CUMULATIVE NO. OF FUNC. EVALS.:      379
+ NPARAMETR:  6.3793E-01 -4.4023E-01  5.0623E-01  1.0646E+00
+ PARAMETER:  1.2759E-01 -1.4674E-01  2.5311E-01  3.5486E-01
+ GRADIENT:   3.9250E-03  6.8890E-04 -6.1691E-05  6.5956E-04
+
+0ITERATION NO.:   43    OBJECTIVE VALUE:   966.446931244639        NO. OF FUNC. EVALS.:  38
+ CUMULATIVE NO. OF FUNC. EVALS.:      417
+ NPARAMETR:  6.3793E-01 -4.4023E-01  5.0623E-01  1.0646E+00
+ PARAMETER:  1.2759E-01 -1.4674E-01  2.5311E-01  3.5486E-01
+ GRADIENT:   3.8847E-03  2.8611E-04 -2.1986E-05  6.3999E-04
+ NUMSIGDIG:         1.5         2.7         4.1         2.7
+
+ #TERM:
+0MINIMIZATION TERMINATED
+ DUE TO ROUNDING ERRORS (ERROR=134)
+ NO. OF FUNCTION EVALUATIONS USED:      417
+ NO. OF SIG. DIGITS IN FINAL EST.:  1.5
+  
+ TOTAL DATA POINTS NORMALLY DISTRIBUTED (N):            0
+ N*LOG(2PI) CONSTANT TO OBJECTIVE FUNCTION:    0.0000000000000000     
+ OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT:    966.44693124463947     
+ OBJECTIVE FUNCTION VALUE WITH CONSTANT:       966.44693124463947     
+ REPORTED OBJECTIVE FUNCTION DOES NOT CONTAIN CONSTANT
+  
+ TOTAL EFFECTIVE ETAS (NIND*NETA):                             0
+  
+ #TERE:
+ Elapsed estimation  time in seconds:     0.25
+ Elapsed postprocess time in seconds:     0.00
+1
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                                   FIRST ORDER                                  ********************
+ #OBJT:**************                       MINIMUM VALUE OF OBJECTIVE FUNCTION                      ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+
+
+
+ #OBJV:********************************************      966.447       **************************************************
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                                   FIRST ORDER                                  ********************
+ ********************                             FINAL PARAMETER ESTIMATE                           ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+ THETA - VECTOR OF FIXED EFFECTS PARAMETERS   *********
+
+
+         TH 1      TH 2      TH 3      TH 4     
+ 
+         6.38E-01 -4.40E-01  5.06E-01  1.06E+00
+ 
+
+
+ OMEGA - COV MATRIX FOR RANDOM EFFECTS - ETAS  ********
+
+
+         ETA1     
+ 
+ ETA1
++        0.00E+00
+ 
+1
+
+
+ OMEGA - CORR MATRIX FOR RANDOM EFFECTS - ETAS  *******
+
+
+         ETA1     
+ 
+ ETA1
++        0.00E+00
+ 
+ Elapsed finaloutput time in seconds:     0.00
+ #CPUT: Total CPU Time in Seconds,        0.340
+Stop Time:
+Fri Oct 30 05:06:21 AM UTC 2026

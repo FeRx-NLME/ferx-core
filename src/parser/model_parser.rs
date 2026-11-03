@@ -9589,7 +9589,8 @@ fn is_matrix_rate_key(key: &str) -> bool {
 /// ready to insert into `CompiledModel::endpoints`.
 ///
 /// Supported lines (Option A — the ergonomic transition-list form):
-/// - `type`   — optional; `ctmm` (default). `mctmm`/`dtmm` are not yet supported.
+/// - `type`   — optional; `ctmm` (default) or `mctmm` (minimal CTMM, #2474 — see
+///   `expand_mctmm_transitions`). `dtmm` is not yet supported.
 /// - `cmt`    — required; positive integer (data-file CMT column value).
 /// - `states` — required; `[label=code, ...]` or bare `[code, ...]`. `code` is the
 ///   integer DV value that denotes the state; the optional `label` names it for the
@@ -9599,7 +9600,10 @@ fn is_matrix_rate_key(key: &str) -> bool {
 ///   evaluated per subject at a baseline covariate snapshot). The generator's
 ///   diagonal `q_jj = −Σ_{k≠j} q_jk` is filled automatically.
 ///
-/// Option B (the `q12 = …` matrix spelling), `init`, and `type = mctmm|dtmm` are
+/// - `tau`, `cutpoints = [...]`, `lp` — `type = mctmm` only; expanded into the adjacent-
+///   state transition list, which replaces the `transition` lines.
+///
+/// Option B (the `q12 = …` matrix spelling), `init`, and `type = dtmm` are
 /// rejected with a "not yet supported" message so the surface stays honest.
 #[cfg(feature = "markov")]
 #[allow(clippy::type_complexity)]
@@ -9645,6 +9649,13 @@ fn parse_markov_model_block(
     let mut states_seen = false;
     let mut states: Vec<(String, usize)> = Vec::new(); // ordered (label, DV code)
     let mut transitions_raw: Vec<(String, String, Expression)> = Vec::new();
+    // `type = mctmm` (#2474): the endpoint family and its generator-defining keys. The
+    // keys are collected raw and expanded into `transitions_raw` after the loop, so the
+    // block stays order-independent (a `type` line may follow the keys it governs).
+    let mut is_mctmm = false;
+    let mut tau_raw: Option<String> = None;
+    let mut cutpoints_raw: Option<Vec<String>> = None;
+    let mut lp_raw: Option<String> = None;
 
     for line in lines {
         let trimmed = line.trim();
@@ -9693,25 +9704,50 @@ fn parse_markov_model_block(
         match key {
             // `type` is optional and defaults to `ctmm`. The default is explicit: a block
             // with no `type` line parses as a CTMM (see the required-key checks below, which
-            // do not include `type`). `dtmm` (#2473) is dispatched on the value read here,
-            // never inherited from the default; mCTMM must do the same when it lands.
+            // do not include `type`). `dtmm` (#2473) and `mctmm` (#2474) are dispatched on
+            // the value read here, never inherited from the default.
             "type" => match value {
-                "ctmm" => is_dtmm = false,
-                "dtmm" => is_dtmm = true,
-                "mctmm" => {
-                    return Err(
-                        "[markov_model]: type `mctmm` is not yet supported — `ctmm` \
-                         (continuous-time) and `dtmm` (discrete-time) are available; mCTMM is \
-                         planned (Phase 4c)."
-                            .to_string(),
-                    )
-                }
+                "ctmm" => (is_dtmm, is_mctmm) = (false, false),
+                "dtmm" => (is_dtmm, is_mctmm) = (true, false),
+                "mctmm" => (is_dtmm, is_mctmm) = (false, true),
                 other => {
                     return Err(format!(
-                        "[markov_model]: unknown type `{other}` — expected `ctmm` or `dtmm`"
+                        "[markov_model]: unknown type `{other}` — expected `ctmm`, `dtmm` or \
+                         `mctmm`"
                     ))
                 }
             },
+            // mCTMM keys (#2474). Validated against `type` after the loop.
+            "tau" => {
+                // Parse now for a located error; the text is re-spliced into the
+                // expanded intensities below.
+                parse_scalar_expression(value, ctx)
+                    .map_err(|e| format!("[markov_model]: invalid `tau` expression: {e}"))?;
+                tau_raw = Some(value.to_string());
+            }
+            "lp" => {
+                parse_scalar_expression(value, ctx)
+                    .map_err(|e| format!("[markov_model]: invalid `lp` expression: {e}"))?;
+                lp_raw = Some(value.to_string());
+            }
+            "cutpoints" => {
+                let inner = value
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .ok_or_else(|| {
+                        format!(
+                            "[markov_model]: cutpoints `{value}` must be a bracketed list, e.g. \
+                             [C1, C1 + exp(D2)]"
+                        )
+                    })?;
+                let cuts = split_top_level_args(inner);
+                for c in &cuts {
+                    parse_scalar_expression(c, ctx).map_err(|e| {
+                        format!("[markov_model]: invalid cut-point expression `{c}`: {e}")
+                    })?;
+                }
+                cutpoints_raw = Some(cuts);
+            }
             "cmt" => {
                 let c = value.parse::<usize>().map_err(|_| {
                     format!("[markov_model]: invalid cmt `{value}` — expected a positive integer")
@@ -9782,8 +9818,9 @@ fn parse_markov_model_block(
                     ));
                 }
                 return Err(format!(
-                    "[markov_model]: unknown key `{other}` — valid keys: type, cmt, states, and \
-                     `transition A -> B = <intensity>` lines"
+                    "[markov_model]: unknown key `{other}` — valid keys: type, cmt, states, \
+                     `transition A -> B = <intensity>` lines (ctmm), and tau, cutpoints, lp \
+                     (mctmm)"
                 ));
             }
         }
@@ -9797,6 +9834,30 @@ fn parse_markov_model_block(
         return Err(format!(
             "[markov_model]: a Markov model needs at least 2 states; got {}",
             states.len()
+        ));
+    }
+    if is_mctmm {
+        transitions_raw = expand_mctmm_transitions(
+            &states,
+            &transitions_raw,
+            tau_raw,
+            cutpoints_raw,
+            lp_raw,
+            ctx,
+        )?;
+    } else if let Some(key) = [
+        tau_raw.as_ref().map(|_| "tau"),
+        cutpoints_raw.as_ref().map(|_| "cutpoints"),
+        lp_raw.as_ref().map(|_| "lp"),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    {
+        return Err(format!(
+            "[markov_model]: `{key}` is a minimal-CTMM key — it is only valid with \
+             `type = mctmm`. A `type = ctmm` (or `dtmm`) block lists its intensities \
+             (or probabilities) as `transition A -> B = <expr>` lines."
         ));
     }
     if transitions_raw.is_empty() {
@@ -10191,6 +10252,211 @@ fn parse_markov_model_block(
         theta_set,
         eta_set,
     ))
+}
+
+/// Expand a `type = mctmm` block (#2474) into the CTMM transition list it is sugar for.
+///
+/// The minimal CTMM of Schindler & Karlsson (AAPS J 2017;19:1424–1435) allows only
+/// transitions between **adjacent** ordered states and ties every adjacent rate to one
+/// mean equilibration time `τ` (`MET`) and the steady-state probabilities `π`, which follow
+/// a proportional-odds model:
+///
+/// ```text
+/// F_k = P(Y ≤ k) = inv_logit(α_k − lp)        k = 0..K−2   (F_{−1} = 0, F_{K−1} = 1)
+/// π_k = F_k − F_{k−1}
+/// q_{k→k+1} = π_{k+1} / (τ · (π_k + π_{k+1}))
+/// q_{k+1→k} = π_k     / (τ · (π_k + π_{k+1}))
+/// ```
+///
+/// Each adjacent pair is a two-state chain with total exchange rate `1/τ` and local
+/// equilibrium `π_k : π_{k+1}`, so the generator satisfies detailed balance with respect
+/// to `π` and `π` is its stationary distribution. A larger `lp` shifts mass to higher
+/// states.
+///
+/// The expansion is **textual**: each intensity is spliced from the user's own `tau`,
+/// cut-point and `lp` text and parsed exactly as if written as a `transition` line, so
+/// the result is bit-for-bit the hand-written CTMM and inherits every CTMM path
+/// unchanged — the dual generator program, the guards, and (when `lp`/`tau` reads an ODE
+/// state) the drug-driven `Q(t)` occupancy-ODE route.
+///
+/// The intensities are spliced in a tail-stable ratio form (`mctmm_rate_texts`), equal to
+/// the formulas above but finite for any cut-point/`lp` logit.
+///
+/// Adjacency comes from the order of `states`; the integer codes must increase strictly
+/// along it, so the list order and the code order can never disagree.
+#[cfg(feature = "markov")]
+fn expand_mctmm_transitions(
+    states: &[(String, usize)],
+    transitions_raw: &[(String, String, Expression)],
+    tau: Option<String>,
+    cutpoints: Option<Vec<String>>,
+    lp: Option<String>,
+    ctx: ParseCtx<'_>,
+) -> Result<Vec<(String, String, Expression)>, String> {
+    if !transitions_raw.is_empty() {
+        return Err(
+            "[markov_model]: `type = mctmm` builds its generator from `tau`, `cutpoints` and \
+             `lp` — remove the `transition` lines (or use `type = ctmm` to list intensities \
+             by hand)."
+                .to_string(),
+        );
+    }
+    let tau = tau.ok_or(
+        "[markov_model]: `type = mctmm` requires `tau = <expr>` (the mean equilibration time)",
+    )?;
+    let cuts = cutpoints.ok_or(
+        "[markov_model]: `type = mctmm` requires `cutpoints = [...]` (the K−1 proportional-odds \
+         cut-points of the steady-state distribution)",
+    )?;
+    let n = states.len();
+    if cuts.len() + 1 != n {
+        return Err(format!(
+            "[markov_model]: an mCTMM with {n} states needs {} cut-points; got {}",
+            n.saturating_sub(1),
+            cuts.len()
+        ));
+    }
+    if let Some(w) = states.windows(2).find(|w| w[1].1 <= w[0].1) {
+        return Err(format!(
+            "[markov_model]: mCTMM states must be listed in increasing code order — the list \
+             order defines adjacency, so `{}={}` followed by `{}={}` is ambiguous. Reorder \
+             `states` (or recode the DV) so the codes increase along the ordered scale.",
+            w[0].0, w[0].1, w[1].0, w[1].1
+        ));
+    }
+
+    let mut out = Vec::with_capacity(2 * (n - 1));
+    for (from, to, text) in mctmm_rate_texts(&cuts, lp.as_deref(), &tau) {
+        let expr = parse_scalar_expression(&text, ctx)
+            .map_err(|e| format!("[markov_model]: mCTMM expansion failed: {e}"))?;
+        out.push((states[from].0.clone(), states[to].0.clone(), expr));
+    }
+    Ok(out)
+}
+
+/// Smallest `τ` the mCTMM accepts: the `|b| < 1e-30 → 0` guard of the expression
+/// evaluators' division, below which `ratio / τ` would silently read `0`.
+#[cfg(feature = "markov")]
+const MCTMM_TAU_FLOOR: &str = "1e-30";
+
+/// The `2·(K−1)` mCTMM intensities as DSL text, `(from, to, text)` by state index.
+///
+/// The rates are evaluated as **ratios** of steady-state probabilities, never as
+/// differences of saturated logistics. With `x_k = α_k − lp` and `σ = inv_logit`, the
+/// pair `(k, k+1)` reads its three neighbouring cut-points `a = x_{k−1}`, `b = x_k`,
+/// `c = x_{k+1}` (absent at the ends of the scale, i.e. `a = −∞`, `c = +∞`). Using
+/// `σ(x) − σ(y) = σ(x)·σ(−y)·(1 − e^{y−x})`:
+///
+/// ```text
+/// π_{k+1} / (π_k + π_{k+1}) = σ(−b)/σ(−a) · (1 − e^{b−c}) / (1 − e^{a−c})
+/// π_k     / (π_k + π_{k+1}) = σ(b)/σ(c)   · (1 − e^{a−b}) / (1 − e^{a−c})
+/// ```
+///
+/// and each `σ` ratio is taken in the log domain, `σ(−b)/σ(−a) = exp(sp(a) − sp(b))`
+/// with the softplus `sp(x) = log(1 + eˣ)` written overflow-free as
+/// `(x + |x|)/2 + log(1 + e^{−|x|})`. The naive `π_{k+1} / (π_k + π_{k+1})` loses every
+/// digit once the cut-points sit deep in a tail — at `[40, 41]` both `F_k` round to `1`
+/// and the last pair is `0/0` — while this form stays exact to rounding at any logit.
+/// Every gap `x_i − x_j` is formed from the raw cut-points and every softplus difference
+/// from that exact gap, so a common `lp` far beyond the cut-point spacing (`|lp| = 1e16`
+/// against `[0, 1]`) cancels analytically instead of rounding the spacing away.
+/// Each rate is the ratio divided by `τ`. A `τ` at or below `MCTMM_TAU_FLOOR` (zero,
+/// negative, or too small for the evaluators' division), or cut-points that are not
+/// strictly and resolvably increasing, give every rate the value `−1`, so the subject is
+/// repelled instead of scored.
+#[cfg(feature = "markov")]
+fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize, usize, String)> {
+    let x: Vec<String> = cuts
+        .iter()
+        .map(|c| match lp {
+            Some(l) => format!("(({c}) - ({l}))"),
+            None => format!("({c})"),
+        })
+        .collect();
+    // Gaps between shifted cut-points, `x_i − x_j`, taken from the **raw** cut-points so
+    // the common `lp` cancels analytically: `(α_i − lp) − (α_j − lp)` rounded would lose
+    // the whole spacing once `|lp|` dwarfs it (`[0, 1]` at `lp = 1e16` reads `0`).
+    let gap = |i: usize, j: usize| format!("(({}) - ({}))", cuts[i], cuts[j]);
+    // `sp(u) − sp(v)` for the overflow-free softplus `sp(v) = log(1 + eᵛ)`, given the
+    // exact gap `d = u − v`. The hinge part `max(u, 0) − max(v, 0)` is
+    // `d/2 · (1 + (u + v)/(|u| + |v|))` — `d` on the positive side, `0` on the negative,
+    // `u` across zero — so the shift never enters a difference of two large numbers; the
+    // remaining `log(1 + e^{−|·|})` terms are bounded and absolutely accurate.
+    let spd = |u: &str, v: &str, d: &str| {
+        format!(
+            "({d} / 2 * (1 + ({u} + {v}) / (abs({u}) + abs({v}))) \
+             + log(1 + exp(-abs({u}))) - log(1 + exp(-abs({v}))))"
+        )
+    };
+    let neg = |v: &str| format!("(-{v})");
+    // `1 − eᵍ = −expm1(g)` to full relative precision; the DSL has no `expm1`, and the
+    // literal `1 - exp(g)` loses every digit as `g → 0` (`exp(−3e-17)` rounds to `1`,
+    // so a valid gap of `e^{−38}` read as a tie). Far from zero the literal form is exact
+    // to rounding; near zero the series `−g(1 + g/2)` (next term `g²/6 < 2e-17`
+    // relative); in between Kahan's `(u − 1)·g / log u` with `u = eᵍ`, whose rounding
+    // errors in `u − 1` and `log u` cancel.
+    let om = |g: &str| {
+        format!(
+            "(if (0.5 < abs({g})) (1 - exp({g})) else (if (abs({g}) < 1e-8) \
+             (-({g}) * (1 + ({g}) / 2)) else ((1 - exp({g})) * ({g}) / log(exp({g})))))"
+        )
+    };
+    // `ratio / τ`, repelled when `τ` is not a usable positive time. The evaluators' `/`
+    // returns `0.0` for `|τ| < 1e-30`, so `τ = 0` (or a value below that floor) would
+    // otherwise zero every rate — an *infinite* equilibration time standing in for an
+    // instantaneous one, which scores a repeated-state panel as a perfect fit. A negative
+    // off-diagonal instead hands the subject to the CTMM's degenerate-generator sentinel on
+    // both the `expm` and the occupancy-ODE paths (and declines the analytic gradient).
+    //
+    // The same repellent covers the cut-points, checked for the whole generator before
+    // any rate is used: every gap must satisfy `1 − e^{α_k − α_{k+1}} > MCTMM_TAU_FLOOR`
+    // (computed as `om`, so any representable increase above the floor passes).
+    // That is strict increase made numerically resolvable — every `1 − e^{·}` factor in
+    // the ratios below spans one or two gaps, so it stays off the division floor. Without
+    // it a non-increasing pattern such as `[0, 1, 0, 1]` puts exact zeros in both
+    // denominators around the negative `π_k`, the rates read `0`, every off-diagonal is
+    // non-negative, and a repeated-state panel scores as a perfect fit.
+    let mut cond = format!("{MCTMM_TAU_FLOOR} < ({tau})");
+    for w in cuts.windows(2) {
+        let g = format!("(({}) - ({}))", w[0], w[1]);
+        cond.push_str(&format!(" && {MCTMM_TAU_FLOOR} < {}", om(&g)));
+    }
+    let guarded = |ratio: &str| format!("(if ({cond}) (({ratio}) / ({tau})) else (-1))");
+
+    let mut out = Vec::with_capacity(2 * cuts.len());
+    for k in 0..cuts.len() {
+        let b = &x[k];
+        let a = k.checked_sub(1).map(|i| &x[i]);
+        let c = x.get(k + 1);
+        let (up, down) = match (a, c) {
+            (Some(a), Some(c)) => (
+                format!(
+                    "exp({}) * {} / {}",
+                    spd(a, b, &gap(k - 1, k)),
+                    om(&gap(k, k + 1)),
+                    om(&gap(k - 1, k + 1))
+                ),
+                format!(
+                    "exp({}) * {} / {}",
+                    spd(&neg(c), &neg(b), &gap(k, k + 1)),
+                    om(&gap(k - 1, k)),
+                    om(&gap(k - 1, k + 1))
+                ),
+            ),
+            (None, Some(c)) => (
+                format!("inv_logit({}) * {}", neg(b), om(&gap(k, k + 1))),
+                format!("exp({})", spd(&neg(c), &neg(b), &gap(k, k + 1))),
+            ),
+            (Some(a), None) => (
+                format!("exp({})", spd(a, b, &gap(k - 1, k))),
+                format!("inv_logit({b}) * {}", om(&gap(k - 1, k))),
+            ),
+            (None, None) => (format!("inv_logit({})", neg(b)), format!("inv_logit({b})")),
+        };
+        out.push((k, k + 1, guarded(&up)));
+        out.push((k + 1, k, guarded(&down)));
+    }
+    out
 }
 
 /// Build the [`EndpointLikelihood::Dtmm`](crate::types::EndpointLikelihood::Dtmm) endpoint

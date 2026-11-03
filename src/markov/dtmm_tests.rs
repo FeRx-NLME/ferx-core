@@ -474,9 +474,13 @@ fn parser_refuses_a_drug_driven_dtmm_and_mctmm() {
 
     let err =
         parse_model_string(&TWO_STATE.replace("type   = dtmm", "type   = mctmm")).unwrap_err();
-    assert!(err.contains("`mctmm` is not yet supported"), "{err}");
+    assert!(err.contains("remove the `transition` lines"), "{err}");
+    // an mCTMM key (#2474) on a DTMM is refused, not ignored
+    let err = parse_model_string(&TWO_STATE.replace("  cmt    = 5\n", "  cmt    = 5\n  tau = 2\n"))
+        .unwrap_err();
+    assert!(err.contains("`tau` is a minimal-CTMM key"), "{err}");
     let err = parse_model_string(&TWO_STATE.replace("type   = dtmm", "type   = hmm")).unwrap_err();
-    assert!(err.contains("expected `ctmm` or `dtmm`"), "{err}");
+    assert!(err.contains("expected `ctmm`, `dtmm` or `mctmm`"), "{err}");
 }
 
 /// The DOSE model of the covariate tests: the asleep → awake probability reads `DOSE`.
