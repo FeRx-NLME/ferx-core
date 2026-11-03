@@ -140,9 +140,11 @@ generator. `tau`, `cutpoints` and `lp` are refused under `type = ctmm`.
 
 The cut-points must stay **strictly increasing** or a `π_k` goes negative. Write the later
 ones as the previous plus a positive increment, as in `C1 + exp(LD2)`. ferx checks the
-ordering for each subject before using any rate. A subject whose cut-points decrease, tie,
-or sit closer together than double precision can resolve repels the optimizer instead of
-being scored, as for any negative CTMM intensity.
+ordering for each subject before using any rate. A subject whose cut-points decrease or
+tie repels the optimizer instead of being scored, as for any negative CTMM intensity. Any
+gap that double precision can represent is accepted and scored exactly, down to gaps of
+about `1e-30`. So a category that becomes rare, with nearly coincident cut-points, is still
+fitted rather than rejected.
 
 A complete runnable model is `examples/mctmm_3state.ferx` (with `data/mctmm_3state.csv`),
 which matches NONMEM — see [Continuous-time Markov models](../estimation/ctmm.qmd).

@@ -1084,22 +1084,27 @@ mod tests {
         let x0 = "((C1 + ETA_C) - (BX * X))";
         let x1 = "((C1 + ETA_C + exp(LD2)) - (BX * X))";
         let g01 = "((C1 + ETA_C) - (C1 + ETA_C + exp(LD2)))";
+        // `1 − eᵍ` spelled to full relative precision as g → 0 (the DSL has no `expm1`).
+        let om = format!(
+            "(if (0.5 < abs({g01})) (1 - exp({g01})) else (if (abs({g01}) < 1e-8) \
+             (-({g01}) * (1 + ({g01}) / 2)) else ((1 - exp({g01})) * ({g01}) / log(exp({g01})))))"
+        );
         let tau = "exp(LTAU + ETA_TAU)";
         // Each rate is `ratio / τ`, repelled (−1) unless τ clears the division floor.
         // …and unless the cut-point gap is resolvable (`1 − e^{α₀ − α₁} > 1e-30`).
         let rate = |r: &str| {
             format!(
-                "(if (1e-30 < ({tau}) && 1e-30 < (1 - exp({g01}))) \
+                "(if (1e-30 < ({tau}) && 1e-30 < {om}) \
                  (({r}) / ({tau})) else (-1))"
             )
         };
-        let up01 = format!("inv_logit((-{x0})) * (1 - exp({g01}))");
+        let up01 = format!("inv_logit((-{x0})) * {om}");
         let down01 = format!(
             "exp({})",
             spd(&format!("(-{x1})"), &format!("(-{x0})"), g01)
         );
         let up12 = format!("exp({})", spd(x0, x1, g01));
-        let down12 = format!("inv_logit({x1}) * (1 - exp({g01}))");
+        let down12 = format!("inv_logit({x1}) * {om}");
         let hand = MCTMM_3
             .replace("type      = mctmm", "type      = ctmm")
             .replace("  tau       = exp(LTAU + ETA_TAU)\n", "")
@@ -1260,6 +1265,95 @@ mod tests {
         assert!(((q[(1, 2)] + q[(2, 1)]) * 0.3_f64.exp() - 1.0).abs() < 1e-14);
     }
 
+    /// Regression (#2474 review): a valid but tiny cut-point gap must be scored at its exact
+    /// rates. `1 - exp(g)` rounds to `0` once `|g| < 2⁻⁵³` — at `[0, e^{−38}]`, `g = −3.1e-17`
+    /// is representable but `exp(g)` is `1.0` — so the ordering guard read a tie and repelled
+    /// a valid fit, and for slightly larger gaps the factor kept only `eps/|g|` relative
+    /// digits. The reference here is spelled independently with `f64::exp_m1`:
+    /// `π₁ = σ(α₁)·σ(−α₀)·(−expm1(α₀ − α₁))` (no `lp`, `τ = 1`), and each pair's rates are
+    /// `π_{k+1}/(π_k + π_{k+1})` and `π_k/(π_k + π_{k+1})`. Gaps are chosen to reach each
+    /// branch of the stable spelling (series, Kahan, literal).
+    #[test]
+    fn mctmm_tiny_cutpoint_gap_is_scored_exactly() {
+        let src = r"
+[parameters]
+  theta A0(0.0, -10.0, 10.0)
+  theta D(1.0, 0.0, 10.0)
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [a=0, b=1, c=2]
+  tau       = 1
+  cutpoints = [A0, A0 + D]
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let sig = |x: f64| 1.0 / (1.0 + (-x).exp());
+        let subject = ctmm_subject(&[(0.0, 0), (1.0, 0), (2.0, 2), (3.0, 2)]);
+        for (a0, d) in [
+            (0.0, (-38.0_f64).exp()), // series branch; `1 - exp` reads exactly 0
+            (0.0, 1e-9),              // series branch
+            (0.0, 1e-6),              // Kahan branch; `1 - exp` keeps ~10 digits
+            (0.0, 0.3),               // Kahan branch
+            (0.7, 1e-7),              // non-zero base: the gap is the rounded `α₀ − α₁`
+            (0.0, 2.0),               // literal branch
+        ] {
+            let (c0, c1) = (a0, a0 + d);
+            let g = c0 - c1;
+            let pi = [sig(c0), sig(c1) * sig(-c0) * -g.exp_m1(), sig(-c1)];
+            let q = generator_of(&model)(&[a0, d], &[], &HashMap::new(), &[]);
+            for k in 0..2 {
+                let s = pi[k] + pi[k + 1];
+                for (got, want, dir) in [
+                    (q[(k, k + 1)], pi[k + 1] / s, "up"),
+                    (q[(k + 1, k)], pi[k] / s, "down"),
+                ] {
+                    assert!(
+                        got > 0.0 && (got / want - 1.0).abs() < 1e-13,
+                        "cuts [{c0}, {c1}]: pair {k} {dir} rate {got}, want {want}"
+                    );
+                }
+            }
+            let v = ctmm_subject_nll(&model, &subject, &[a0, d], &[]);
+            assert!(
+                v.is_finite() && v > 0.0 && v < 1e6,
+                "cuts [{c0}, {c1}]: NLL {v} must be scored (sentinel {SUBJECT_SENTINEL_NLL})"
+            );
+            // The exact θ-jets differentiate whichever branch the gap lands in. FD cannot
+            // referee here — the step must stay below the gap, so at `D = e^{−38}` the O(1)
+            // rates move below f64 resolution — but at `A0 = 0` the rates are closed forms:
+            // `π = (½, σ(D) − ½, σ(−D))` gives `q01 = 1 − 1/(2σ(D))`, `q10 = 1/(2σ(D))`,
+            // `q12 = 2σ(−D)`, `q21 = 1 − 2σ(−D)`, differentiated by hand below.
+            if a0 == 0.0 {
+                let prog = match model.endpoints.get(&5) {
+                    Some(EndpointLikelihood::Ctmm {
+                        generator_program: Some(p),
+                        ..
+                    }) => p,
+                    _ => panic!("expected a dual-evaluable mCTMM program"),
+                };
+                let (_, dq) = prog
+                    .eval_generator_duals(&[a0, d], &[], &HashMap::new())
+                    .expect("within the dual cap");
+                let (sp, sm) = (sig(d), sig(-d));
+                for ((j, k), want) in [
+                    ((0, 1), sm / (2.0 * sp)),
+                    ((1, 0), -sm / (2.0 * sp)),
+                    ((1, 2), -2.0 * sp * sm),
+                    ((2, 1), 2.0 * sp * sm),
+                ] {
+                    let got = dq[1][(j, k)];
+                    assert!(
+                        (got / want - 1.0).abs() < 1e-12,
+                        "D = {d}: ∂q[{j},{k}]/∂D dual {got}, exact {want}"
+                    );
+                }
+            }
+        }
+        // The straddle: the literal spelling really does lose the smallest gap.
+        assert_eq!(1.0 - (-(-38.0_f64).exp()).exp(), 0.0);
+    }
+
     /// Regression (#2474 review): the cut-point spacing must survive a linear predictor that
     /// dwarfs it. Forming `x_k = α_k − lp` and *then* subtracting rounds the spacing away —
     /// with `[0, 1]` at `lp = 1e16` both `x_k` are `−1e16`, the first pair read
@@ -1398,6 +1492,8 @@ mod tests {
             [0.0, 1.0, 0.5, 2.0],         // one decrease
             [0.0, 1.0, 1.0, 2.0],         // a tie
             [0.0, 1.0, 1.0 + 1e-17, 2.0], // a gap below f64 resolution at 1
+            [0.0, 1.0, 1.0 - 1e-12, 2.0], // a decrease too small for `1 - exp` to see
+            [0.0, 1000.0, 0.0, 1.0],      // a decrease so large `exp(gap)` overflows
         ] {
             let q = gen(&cuts, &[], &HashMap::new(), &[]);
             assert!(

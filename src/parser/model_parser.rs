@@ -9955,6 +9955,18 @@ fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize,
         )
     };
     let neg = |v: &str| format!("(-{v})");
+    // `1 − eᵍ = −expm1(g)` to full relative precision; the DSL has no `expm1`, and the
+    // literal `1 - exp(g)` loses every digit as `g → 0` (`exp(−3e-17)` rounds to `1`,
+    // so a valid gap of `e^{−38}` read as a tie). Far from zero the literal form is exact
+    // to rounding; near zero the series `−g(1 + g/2)` (next term `g²/6 < 2e-17`
+    // relative); in between Kahan's `(u − 1)·g / log u` with `u = eᵍ`, whose rounding
+    // errors in `u − 1` and `log u` cancel.
+    let om = |g: &str| {
+        format!(
+            "(if (0.5 < abs({g})) (1 - exp({g})) else (if (abs({g}) < 1e-8) \
+             (-({g}) * (1 + ({g}) / 2)) else ((1 - exp({g})) * ({g}) / log(exp({g})))))"
+        )
+    };
     // `ratio / τ`, repelled when `τ` is not a usable positive time. The evaluators' `/`
     // returns `0.0` for `|τ| < 1e-30`, so `τ = 0` (or a value below that floor) would
     // otherwise zero every rate — an *infinite* equilibration time standing in for an
@@ -9963,7 +9975,8 @@ fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize,
     // both the `expm` and the occupancy-ODE paths (and declines the analytic gradient).
     //
     // The same repellent covers the cut-points, checked for the whole generator before
-    // any rate is used: every gap must satisfy `1 − e^{α_k − α_{k+1}} > MCTMM_TAU_FLOOR`.
+    // any rate is used: every gap must satisfy `1 − e^{α_k − α_{k+1}} > MCTMM_TAU_FLOOR`
+    // (computed as `om`, so any representable increase above the floor passes).
     // That is strict increase made numerically resolvable — every `1 − e^{·}` factor in
     // the ratios below spans one or two gaps, so it stays off the division floor. Without
     // it a non-increasing pattern such as `[0, 1, 0, 1]` puts exact zeros in both
@@ -9971,10 +9984,8 @@ fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize,
     // non-negative, and a repeated-state panel scores as a perfect fit.
     let mut cond = format!("{MCTMM_TAU_FLOOR} < ({tau})");
     for w in cuts.windows(2) {
-        cond.push_str(&format!(
-            " && {MCTMM_TAU_FLOOR} < (1 - exp(({}) - ({})))",
-            w[0], w[1]
-        ));
+        let g = format!("(({}) - ({}))", w[0], w[1]);
+        cond.push_str(&format!(" && {MCTMM_TAU_FLOOR} < {}", om(&g)));
     }
     let guarded = |ratio: &str| format!("(if ({cond}) (({ratio}) / ({tau})) else (-1))");
 
@@ -9986,25 +9997,25 @@ fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize,
         let (up, down) = match (a, c) {
             (Some(a), Some(c)) => (
                 format!(
-                    "exp({}) * (1 - exp({})) / (1 - exp({}))",
+                    "exp({}) * {} / {}",
                     spd(a, b, &gap(k - 1, k)),
-                    gap(k, k + 1),
-                    gap(k - 1, k + 1)
+                    om(&gap(k, k + 1)),
+                    om(&gap(k - 1, k + 1))
                 ),
                 format!(
-                    "exp({}) * (1 - exp({})) / (1 - exp({}))",
+                    "exp({}) * {} / {}",
                     spd(&neg(c), &neg(b), &gap(k, k + 1)),
-                    gap(k - 1, k),
-                    gap(k - 1, k + 1)
+                    om(&gap(k - 1, k)),
+                    om(&gap(k - 1, k + 1))
                 ),
             ),
             (None, Some(c)) => (
-                format!("inv_logit({}) * (1 - exp({}))", neg(b), gap(k, k + 1)),
+                format!("inv_logit({}) * {}", neg(b), om(&gap(k, k + 1))),
                 format!("exp({})", spd(&neg(c), &neg(b), &gap(k, k + 1))),
             ),
             (Some(a), None) => (
                 format!("exp({})", spd(a, b, &gap(k - 1, k))),
-                format!("inv_logit({b}) * (1 - exp({}))", gap(k - 1, k)),
+                format!("inv_logit({b}) * {}", om(&gap(k - 1, k))),
             ),
             (None, None) => (format!("inv_logit({})", neg(b)), format!("inv_logit({b})")),
         };
