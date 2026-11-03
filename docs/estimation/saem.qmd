@@ -781,8 +781,8 @@ seed-to-seed sd of 1.5 and 3.4–4.1, and a range of 7 and 14–15. The
 importance-sampling draw alone, with the SAEM seed held fixed, accounts for an
 sd of only 0.55 and 0.9. Most of the spread is where the chain ends. So a +4 or
 +7 between two builds at one seed is not evidence of a regression. Between the
-September build `e4743847` and `e1a05d1a`, the 40-seed means differed by
-−0.05 ± 0.34 and +0.31 ± 0.84.
+September build `e4743847` and `e1a05d1a`, the per-seed differences over the 40
+seeds averaged −0.05 ± 0.26 and +0.31 ± 0.66 (mean ± SE).
 
 To compare two builds, compare distributions:
 
@@ -791,9 +791,12 @@ tools/saem-seed-sweep.sh --model m.ferx --data d.csv \
   --rev e4743847 --rev main --seeds "$(seq -s ' ' 1 10)"
 ```
 
-The script builds each revision, runs the model once per seed (with
-`imp_seed = seed + 1000`), and prints each build's mean and sd and the shift
-against the first build with its Welch standard error. The model must end in an
+The script builds each revision and runs the model once per seed, with
+`imp_seed = seed + 1000`. It replaces `seed`, its alias `saem_seed` and
+`imp_seed` in `[fit_options]`. It prints each build's mean and sd, and the shift
+against the first build. The shift is the mean of the per-seed differences, with
+its standard error. Every build runs the same seed pairs, so pairing is the right
+test. The model must end in an
 `imp_eval_only` stage. `--fixed-saem-seed` varies only the IS draw, to measure
 the Monte-Carlo noise floor by itself.
 

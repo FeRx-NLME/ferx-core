@@ -17,15 +17,23 @@
 #     once under the `ci-test` profile into its own target dir under WORKDIR, which
 #     defaults to `target/saem-seed-sweep` — NOT /tmp, which is a small tmpfs on
 #     some dev boxes and fills up mid-build;
-#   - the model's `seed` and `imp_seed` lines are replaced (or added) per run, with
-#     imp_seed = seed + 1000 unless --imp-seed pins it;
+#   - inside [fit_options], every `seed`, `saem_seed` (its alias) and `imp_seed` line
+#     is dropped and `seed` / `imp_seed` are written fresh per run, with
+#     imp_seed = seed + 1000 unless --imp-seed pins it. Options apply in source
+#     order, so a surviving `saem_seed` below the injected `seed` would silently pin
+#     the SAEM seed while the table claims it varied. Other blocks are left alone:
+#     `[simulation]` has a `seed` of its own;
 #   - the objective read is the `-2 log L (IS)` line, so the model must end in an
 #     importance-sampling stage (`method = [saem, imp]` with `imp_eval_only = true`);
-#   - the summary is per-REV n / mean / sd / min / max, plus the mean shift of each
-#     later REV against the first with its Welch standard error.
+#   - the summary is per-REV n / mean / sd / min / max (descriptive), plus the shift
+#     of each later REV against the first, computed on PAIRED differences: every
+#     build runs the same (seed, imp_seed) pairs, so the comparison is the per-pair
+#     difference's mean and its standard error sd/sqrt(n). An unpaired (Welch) SE
+#     drops the covariance between two builds' runs at the same seeds and can make
+#     t too small or too large. Pairs where either side is NA are left out.
 #
-# A shift whose |t| stays below ~2 with both builds' ranges overlapping is chain
-# variation; a consistent upward shift is a regression worth bisecting. With
+# A paired shift whose |t| stays below ~2 is chain variation; a consistent upward
+# shift is a regression worth bisecting. With
 # --imp-seed fixed and --fixed-saem-seed, the sweep instead varies only the IS draw
 # and measures the IS Monte-Carlo noise floor on its own.
 
@@ -117,9 +125,11 @@ run_one() {
     { echo "error: refusing run directory for '$sha' '$s' '$is'" >&2; return 1; }
   local d=$workdir/runs/$sha/s$s-i$is
   rm -rf "$d"; mkdir -p "$d"
-  # Drop any existing seed / imp_seed line, then add both right under [fit_options].
+  # Inside [fit_options] only: drop every spelling of the two seeds (`saem_seed` is
+  # an alias of `seed`), then add both right under the header.
   awk -v s="$s" -v is="$is" '
-    /^[[:space:]]*(seed|imp_seed)[[:space:]]*=/ { next }
+    /^[[:space:]]*\[/ { in_fit = ($0 ~ /^[[:space:]]*\[fit_options\]/) }
+    in_fit && /^[[:space:]]*(seed|saem_seed|imp_seed)[[:space:]]*=/ { next }
     { print }
     /^[[:space:]]*\[fit_options\]/ { print "  seed = " s; print "  imp_seed = " is }
   ' "$model" > "$d/model.ferx"
@@ -167,24 +177,37 @@ echo
 awk -F'\t' '
   NR == 1 { next }
   !($1 in seen) { seen[$1] = 1; order[++k] = $1 }
+  { key = $3 SUBSEP $4; if (!(key in kseen)) { kseen[key] = 1; keys[++nk] = key } }
   $5 == "NA" { na[$1]++; next }
-  { n[$1]++; s[$1] += $5; ss[$1] += $5 * $5
-    if (!($1 in lo) || $5 < lo[$1]) lo[$1] = $5
-    if (!($1 in hi) || $5 > hi[$1]) hi[$1] = $5 }
+  { n[$1]++; x[$1, n[$1]] = $5 + 0; val[$1, key] = $5 + 0 }
   END {
     printf "%-14s %4s %4s %12s %8s %12s %12s\n", "rev", "n", "NA", "mean", "sd", "min", "max"
     for (j = 1; j <= k; j++) {
-      r = order[j]; m[r] = n[r] ? s[r] / n[r] : 0
-      v[r] = n[r] > 1 ? (ss[r] - n[r] * m[r] * m[r]) / (n[r] - 1) : 0
-      if (v[r] < 0) v[r] = 0
-      printf "%-14s %4d %4d %12.3f %8.3f %12.3f %12.3f\n", r, n[r], na[r], m[r], sqrt(v[r]), lo[r], hi[r]
+      r = order[j]; sum = 0; lo = ""; hi = ""
+      for (i = 1; i <= n[r]; i++) {
+        sum += x[r, i]
+        if (lo == "" || x[r, i] < lo) lo = x[r, i]
+        if (hi == "" || x[r, i] > hi) hi = x[r, i]
+      }
+      m = n[r] ? sum / n[r] : 0; v = 0
+      for (i = 1; i <= n[r]; i++) v += (x[r, i] - m) ^ 2
+      sd = n[r] > 1 ? sqrt(v / (n[r] - 1)) : 0
+      printf "%-14s %4d %4d %12.3f %8.3f %12.3f %12.3f\n", r, n[r], na[r], m, sd, lo + 0, hi + 0
     }
     b = order[1]
     for (j = 2; j <= k; j++) {
-      r = order[j]
-      if (n[b] < 2 || n[r] < 2) continue
-      se = sqrt(v[b] / n[b] + v[r] / n[r])
-      t = se > 0 ? sprintf("%+.2f", (m[r] - m[b]) / se) : "inf"
-      printf "%s - %s: %+.3f (Welch SE %.3f, t = %s)\n", r, b, m[r] - m[b], se, t
+      r = order[j]; np = 0; sum = 0; up = 0
+      for (q = 1; q <= nk; q++) {
+        key = keys[q]
+        if (!((b, key) in val) || !((r, key) in val)) continue
+        dd[++np] = val[r, key] - val[b, key]; sum += dd[np]; up += dd[np] > 0
+      }
+      if (np < 2) { printf "%s - %s: fewer than 2 complete pairs\n", r, b; continue }
+      m = sum / np; v = 0
+      for (i = 1; i <= np; i++) v += (dd[i] - m) ^ 2
+      se = sqrt(v / (np - 1)) / sqrt(np)
+      t = se > 0 ? sprintf("%+.2f", m / se) : "inf"
+      printf "%s - %s (paired, %d pairs): %+.3f (SE %.3f, t = %s); %s higher on %d of %d\n",
+        r, b, np, m, se, t, r, up, np
     }
   }' "$table"
