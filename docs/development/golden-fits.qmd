@@ -41,7 +41,13 @@ A `NaN` anywhere counts as a change, even when the release had `NaN` in the
 same place. The report never folds a `NaN` away the
 way `max` would (see AGENTS.md on `f64::max`). A row whose model or data file
 differs from the release's copy is marked as such, so an edited example does not
-read as engine drift. All fits run single-threaded (`RAYON_NUM_THREADS=1`).
+read as engine drift.
+
+All fits run on one worker thread. `golden.py` passes `--threads 1` and rejects
+any result whose `n_threads_used` is not 1. `RAYON_NUM_THREADS` alone does not do
+this, because ferx sizes its own pool from the machine's core count (#1460). If
+the flag were left out, the size of the runner would decide the reduction order,
+and that would show up as drift.
 
 Fit numbers come from **Linux** only. See
 [Reference platform](sdlc.qmd#reference-platform-linux). Do not compare a macOS

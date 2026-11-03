@@ -36,8 +36,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTUP_TOOLCHAIN: nightly
-  # One thread: the fits are compared digit for digit, and a parallel reduction
-  # order is not part of what this job measures.
+  # Kept for cargo; it does NOT pin the fits. ferx sizes its own pool (#1460), so
+  # golden.py passes `--threads 1` to every fit and rejects a result whose
+  # `n_threads_used` is not 1 — the fits are compared digit for digit, and the
+  # runner's core count must not pick the reduction order.
   RAYON_NUM_THREADS: 1
   FEATURES: ferx-core/markov   # implies survival: the TTE / binary / CTMM rows need both
 

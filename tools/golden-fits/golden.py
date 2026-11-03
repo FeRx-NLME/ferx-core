@@ -61,6 +61,12 @@ FLOOR_ITER = 2
 
 RESULTS_SCHEMA = 1
 
+# Every fit runs on exactly one worker. Since #1460 ferx sizes its own pool from
+# `available_parallelism()` and ignores RAYON_NUM_THREADS, so without `--threads 1`
+# the runner's core count would pick the reduction order and show up as drift.
+# `fit_one` also refuses a result whose own `n_threads_used` says otherwise.
+FERX_THREADS = 1
+
 
 def sha256(path: Path) -> str | None:
     try:
@@ -173,7 +179,8 @@ def fit_one(ferx: str, model: Path, data: Path, timeout: int, rec: dict) -> None
         t0 = time.monotonic()
         try:
             proc = subprocess.run(
-                [ferx, str(model), "--data", str(data), "--output-format", "json"],
+                [ferx, str(model), "--data", str(data), "--output-format", "json",
+                 "--threads", str(FERX_THREADS)],
                 cwd=work, capture_output=True, text=True, timeout=timeout, check=False,
             )
         except subprocess.TimeoutExpired:
@@ -187,7 +194,13 @@ def fit_one(ferx: str, model: Path, data: Path, timeout: int, rec: dict) -> None
             rec.update(status="failed",
                        error=f"exit {proc.returncode}: " + " | ".join(tail))
             return
-        rec.update(extract(json.loads(fits[0].read_text(encoding="utf-8"))))
+        fit = json.loads(fits[0].read_text(encoding="utf-8"))
+        used = fit.get("n_threads_used")
+        if used != FERX_THREADS:
+            rec.update(status="failed", error=f"fit ran on {used} threads, not "
+                       f"{FERX_THREADS}: its digits are not comparable")
+            return
+        rec.update(extract(fit))
         rec["status"] = "ok"
 
 

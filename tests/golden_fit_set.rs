@@ -627,7 +627,7 @@ fn bands_is_headroom_times_the_spread_and_refuses_a_short_window() {
 /// A block omega's off-diagonal is tracked, its SE read from the column-major packed
 /// lower triangle the way `types::omega_se_at` reads it, and a `null` OFV (the JSON
 /// writer's spelling of non-finite) comes back as NaN. A failing binary is a `failed`
-/// row, not an aborted run.
+/// row, not an aborted run, and so is a fit that ran on more than one thread.
 #[cfg(unix)]
 #[test]
 fn run_extracts_block_omega_and_reports_a_failed_fit() {
@@ -637,6 +637,7 @@ fn run_extracts_block_omega_and_reports_a_failed_fit() {
     std::fs::create_dir_all(dir.join("data")).unwrap();
     std::fs::write(dir.join("examples/ok.ferx"), "x").unwrap();
     std::fs::write(dir.join("examples/bad.ferx"), "x").unwrap();
+    std::fs::write(dir.join("examples/wide.ferx"), "x").unwrap();
     std::fs::write(dir.join("data/d.csv"), "x").unwrap();
     let fit = r#"{"ofv": null, "converged": true, "n_iterations": 7, "method": "Focei",
         "covariance_status": "Computed", "warnings": [],
@@ -646,18 +647,27 @@ fn run_extracts_block_omega_and_reports_a_failed_fit() {
                   "data": [0.1, 0.02, 0.05, 0.02, 0.3, 0.06, 0.05, 0.06, 0.7]},
         "se_omega": [0.01, 0.002, 0.005, 0.03, 0.006, 0.07],
         "sigma": [0.04], "sigma_names": ["PROP"], "se_sigma": [0.004],
-        "omega_iov": null}"#;
+        "omega_iov": null, "n_threads_used": 1}"#;
     std::fs::write(dir.join("fit.json"), fit).unwrap();
+    // The same fit, but on 4 workers: what a runner-sized pool reports.
+    let wide = fit.replace(r#""n_threads_used": 1"#, r#""n_threads_used": 4"#);
+    assert_ne!(wide, fit);
+    std::fs::write(dir.join("fit4.json"), wide).unwrap();
     let fake = dir.join("ferx");
     std::fs::write(
         &fake,
         format!(
-            // Refuses unless asked for JSON: `run` must request the file it reads.
+            // Refuses unless asked for JSON (`run` must request the file it reads) and
+            // for one thread: ferx ignores RAYON_NUM_THREADS (#1460), so the flag is the
+            // only thing that pins the reduction order.
             "#!/bin/sh\n\
              case \"$*\" in *'--output-format json'*) ;; *) echo 'no json' >&2; exit 9;; esac\n\
+             case \"$*\" in *'--threads 1'*) ;; *) echo 'no --threads 1' >&2; exit 8;; esac\n\
              case \"$1\" in *bad.ferx) echo boom >&2; exit 3;; esac\n\
-             cp '{}' ./ok-fit.json\n",
-            dir.join("fit.json").display()
+             case \"$1\" in *wide.ferx) cp '{wide}' ./wide-fit.json; exit 0;; esac\n\
+             cp '{ok}' ./ok-fit.json\n",
+            ok = dir.join("fit.json").display(),
+            wide = dir.join("fit4.json").display()
         ),
     )
     .unwrap();
@@ -666,7 +676,8 @@ fn run_extracts_block_omega_and_reports_a_failed_fit() {
         &dir,
         "models.tsv",
         "# c\nid\tmodel\tdata\tfamily\nok\texamples/ok.ferx\tdata/d.csv\tA\n\
-         bad\texamples/bad.ferx\tdata/d.csv\tB\ngone\texamples/gone.ferx\tdata/d.csv\tC\n",
+         bad\texamples/bad.ferx\tdata/d.csv\tB\ngone\texamples/gone.ferx\tdata/d.csv\tC\n\
+         wide\texamples/wide.ferx\tdata/d.csv\tD\n",
     );
     let out_path = dir.join("results.json");
     let out = golden(&[
@@ -714,6 +725,20 @@ fn run_extracts_block_omega_and_reports_a_failed_fit() {
         .unwrap()
         .contains("exit 3: boom"));
     assert_eq!(r["models"]["gone"]["status"], "missing");
+    // A fit that ran on 4 threads is not a comparable result, whatever its numbers.
+    let wide = &r["models"]["wide"];
+    assert_eq!(wide["status"], "failed", "{wide}");
+    assert!(
+        wide["error"]
+            .as_str()
+            .unwrap()
+            .contains("fit ran on 4 threads, not 1"),
+        "{wide}"
+    );
+    assert!(
+        wide.get("params").is_none(),
+        "no quantities from a wide fit: {wide}"
+    );
 }
 
 // -------------------------------------------------------------------------------------
@@ -817,6 +842,8 @@ fn workflow_is_a_linux_nightly_that_posts_the_table() {
         ["schedule", "workflow_dispatch"],
         "not a per-PR job: {on:?}"
     );
+    // Not a thread pin (ferx sizes its own pool, #1460) — `--threads 1` in golden.py
+    // is, and the fake-ferx test above requires it.
     assert!(wf.contains("RAYON_NUM_THREADS: 1"));
     // Two `run`s — the release on its own tree, head on this one — then the report into
     // the job summary.
