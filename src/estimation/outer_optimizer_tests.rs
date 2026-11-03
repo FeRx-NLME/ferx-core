@@ -9485,6 +9485,76 @@ fn the_basin_probe_restarts_on_a_material_share_and_absorbs_a_handful() {
     assert_eq!(basin_probe_action(None, 10), Restart);
 }
 
+/// The absorb arm records the cold solve as the incumbent (#2600 review): a warm incumbent
+/// at 100 whose cold re-solve scores 90, then a trial at 95, between the two. Before the
+/// fix only the warm-start cache moved, so `state.best_ofv` and `best_seen` stayed at 100,
+/// the 95 trial counted as an improvement, overwrote the held EBE state and became the
+/// restored point although 90 had been scored. Each tracker is asserted on its own, so a
+/// mutation dropping any one of the updates names it.
+#[test]
+fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
+    let xs_inc = vec![0.1, 0.2, 0.3];
+    let mut state = new_nlopt_state(2, 2, &xs_inc, SalvageGuardPolicy::Off);
+    state.best_ofv = 100.0;
+    state.n_evals = 32;
+    state.pred_jac = Some(vec![vec![DVector::zeros(2); 3]; 2]);
+    let mut best = BestPoint::new();
+    assert!(best.observe(31, &xs_inc, 100.0, 100.0));
+    let warm = |v: f64| IncumbentSolve {
+        xs: xs_inc.clone(),
+        etas: vec![DVector::from_element(2, v); 2],
+        h_mats: vec![DMatrix::identity(2, 2); 2],
+        kappas: vec![Vec::new(); 2],
+        scores: None,
+    };
+    let mut held = Some(warm(1.0));
+    let mut last_gradient = Some(vec![1.0, 2.0, 3.0]);
+    // Feasible baseline 100 last moved at feasible eval 20; 32 feasible evaluations so far.
+    let mut plateau = (100.0, 20usize, 32usize);
+    let cold_modes = vec![DVector::from_element(2, -0.5); 2];
+    absorb_cold_incumbent(
+        &mut state,
+        &mut best,
+        &mut held,
+        &mut last_gradient,
+        &mut plateau,
+        (90.0, 90.0),
+        cold_modes.clone(),
+        warm(-0.5),
+    );
+    assert_eq!(
+        state.cached_etas, cold_modes,
+        "warm starts are the cold modes"
+    );
+    assert!(
+        state.pred_jac.is_none(),
+        "the warm modes' response goes with them"
+    );
+    assert_eq!(
+        state.best_ofv, 90.0,
+        "the adoption bar is the cold objective"
+    );
+    assert!(
+        !adopt_warm_start(false, 95.0, state.best_ofv),
+        "95 does not beat 90"
+    );
+    assert_eq!(best.ofv(), 90.0, "best-seen is the cold objective");
+    assert!(
+        !best.observe(33, &[0.4, 0.5, 0.6], 95.0, 95.0),
+        "95 is not restored"
+    );
+    assert_eq!(best.get().map(|b| b.x.clone()), Some(xs_inc.clone()));
+    assert_eq!(
+        held.as_ref().map(|h| h.etas[0][0]),
+        Some(-0.5),
+        "the held EBE state is the cold solve's"
+    );
+    assert!(last_gradient.is_none(), "the warm modes' gradient is stale");
+    assert_eq!(plateau, (90.0, 32, 32), "the drop is progress");
+    // A point below the cold incumbent still wins, as any improvement does.
+    assert!(adopt_warm_start(false, 89.0, state.best_ofv));
+}
+
 /// The absorb arm end to end (#2600), as an A/B on one fit: the full 200-subject
 /// Michaelis–Menten population of `tests/ebe_basin_shift.rs`, warm-start predictor off (the
 /// trap is the unpredicted start's), once at the shipped share and once with the share
@@ -9499,7 +9569,7 @@ fn the_basin_probe_restarts_on_a_material_share_and_absorbs_a_handful() {
 ///
 /// Measured on native macOS arm64 (`ci-fast`; a Linux run is the reference for any band):
 /// restart arm 775.394246 converged in 102 evaluations over 2 attempts; absorb arm
-/// 775.394203 converged in 76 evaluations over 1 attempt, both probes at a 44.857 gap from
+/// 775.394217 converged in 76 evaluations over 1 attempt, both probes at a 44.857 gap from
 /// 5 subjects. Mutation: absorbing without handing the cold modes to the warm-start cache
 /// re-trapped (a second probe found 4 subjects), the end-of-leg check filed a restart, and
 /// the fit took 119 evaluations to 775.394520 — red on the no-restart assertion.
@@ -9568,7 +9638,7 @@ fn a_handful_of_switched_subjects_is_absorbed_into_the_running_leg() {
     );
     assert!(absorb.converged, "the absorbing leg reaches its own stop");
     assert!(absorb.ofv.is_finite() && restart.ofv.is_finite());
-    // Measured −4.3e-5 (absorb lower); 1e-3 is ~20× that, and far below the 44.9 gap.
+    // Measured −2.9e-5 (absorb lower); 1e-3 is ~30× that, and far below the 44.9 gap.
     assert!(
         (absorb.ofv - restart.ofv).abs() < 1e-3,
         "absorbing must reach the restart's optimum: {} vs {}",

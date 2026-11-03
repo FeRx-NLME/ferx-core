@@ -3328,6 +3328,55 @@ fn basin_probe_restart_share() -> f64 {
     BASIN_PROBE_RESTART_SHARE
 }
 
+/// Make the mid-leg probe's cold solve the leg's incumbent when it absorbs it (#2600):
+/// `ofv = (penalized, clean)` at `solve.xs`, its EBE state `solve`, and `modes` (the warm
+/// starts built from it).
+///
+/// Every tracker an evaluation's improvement is measured against moves to the cold
+/// objective, or a later trial scoring between it and the warm one would count as an
+/// improvement, overwrite the held EBE state, and be restored as the best point although the
+/// probe had already scored a lower one:
+///
+/// - `state.best_ofv`, the warm-start adoption rule's bar ([`adopt_warm_start`]);
+/// - `best` — `best_seen`, or a verification leg's own incumbent — the point the final
+///   restore lands on;
+/// - `best_solve`, the held EBE state the final inner loop scores at that point;
+/// - the plateau tracker's baseline: the drop is progress, and counting the trace as flat
+///   through it would let the plateau check certify a stop the cold modes just moved;
+/// - `last_gradient`, cleared: it is the warm modes' gradient, not this objective's. The
+///   next improving gradient evaluation sets it again; failing that the end of the fit
+///   forms one at the restored point.
+///
+/// The mode response and the inner-Hessian seeds belong to the warm modes they were taken
+/// at, so they go too, as on a verification leg's start ([`NloptState::reset_to_cold_start`]).
+#[allow(clippy::too_many_arguments)]
+fn absorb_cold_incumbent(
+    state: &mut NloptState,
+    best: &mut BestPoint,
+    best_solve: &mut Option<IncumbentSolve>,
+    last_gradient: &mut Option<Vec<f64>>,
+    plateau: &mut (f64, usize, usize),
+    (ofv, ofv_clean): (f64, f64),
+    modes: Vec<DVector<f64>>,
+    solve: IncumbentSolve,
+) {
+    state.reset_to_cold_start();
+    if modes.len() == state.cached_etas.len() {
+        state.cached_etas = modes;
+    }
+    if ofv < state.best_ofv {
+        state.best_ofv = ofv;
+    }
+    if best.observe(state.n_evals, &solve.xs, ofv, ofv_clean) {
+        *best_solve = Some(solve);
+        *last_gradient = None;
+    }
+    if plateau.0 - ofv > PLATEAU_OFV_THRESHOLD {
+        plateau.0 = ofv;
+        plateau.1 = plateau.2;
+    }
+}
+
 /// By how much a cold re-solve at the restored point *beat* the objective the optimizer
 /// minimised there, when it beat it by more than [`BASIN_SHIFT_ABS_TOL`] (#1565).
 ///
@@ -6451,16 +6500,34 @@ fn optimize_nlopt_attempt(
                                 }
                             }
                             BasinProbeAction::Absorb => {
-                                // The next evaluation starts every subject at its cold mode.
-                                // The mode response and the inner-Hessian seeds belong to the
-                                // modes they were taken at, so they go with them, as on a
-                                // verification leg's start; the next improving gradient
-                                // evaluation forms them again.
-                                state.reset_to_cold_start();
+                                // The cold solve is the incumbent now, in every tracker an
+                                // evaluation's improvement is measured against.
+                                let cold_penalized =
+                                    cold + nn_reg.penalty_value(&p.theta) + priors.penalty(&x_inc);
                                 let modes = outer_cache_warm_starts(model, &ehs, &kappas);
-                                if modes.len() == state.cached_etas.len() {
-                                    state.cached_etas = modes;
-                                }
+                                let solve = IncumbentSolve {
+                                    xs: xs_inc.clone(),
+                                    etas: ehs,
+                                    h_mats: hms,
+                                    kappas,
+                                    scores: None,
+                                };
+                                let mut leg_tracker = leg_best.borrow_mut();
+                                let mut seen_tracker = best_seen_cl.lock().unwrap();
+                                absorb_cold_incumbent(
+                                    state,
+                                    if in_verify_leg {
+                                        &mut leg_tracker
+                                    } else {
+                                        &mut seen_tracker
+                                    },
+                                    &mut best_solve_cl.lock().unwrap(),
+                                    &mut last_gradient_cl.lock().unwrap(),
+                                    &mut plateau_tracker_cl.lock().unwrap(),
+                                    (cold_penalized, cold),
+                                    modes,
+                                    solve,
+                                );
                                 if verbose {
                                     eprintln!(
                                         "Eval {:>4}: basin probe — a cold re-solve at the best \
