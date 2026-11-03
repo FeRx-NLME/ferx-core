@@ -3872,12 +3872,14 @@ fn start_probe_stall_warning(
 }
 
 /// The #2506 start probe for the outer optimizers that are not NLopt's — the built-in
-/// BFGS / L-BFGS loops, `trust_region`, and `method = gn` / `gn_hybrid` — which publish
-/// no `left_init` of their own and so would leave a warm start at an optimum to the
-/// displacement check in `model_selection::stalled_at_init`, which flags it.
+/// BFGS / L-BFGS loops, `trust_region`, `method = gn` / `gn_hybrid`, and the profiled
+/// loop (`profile::optimize_profiled_probed`, #2591) — which publish no `left_init` of
+/// their own and so would leave a warm start at an optimum to the displacement check in
+/// `model_selection::stalled_at_init`, which flags it.
 ///
-/// `result` is the finished run from `init_params`. Movement is measured in the rerun
-/// optimizer's own scaled space: `scale_of` maps the clamped packed start and its bounds
+/// `result` is the finished run from `init_params`. Movement is measured on the
+/// coordinates `init_params` leaves free, neither measured nor perturbed on a held one,
+/// in the rerun optimizer's own scaled space: `scale_of` maps the clamped packed start and its bounds
 /// to the scale vector that optimizer divides by ([`bfgs_scale`],
 /// `gauss_newton::gn_scale`, unit for trust-region). When the run's estimates did not
 /// leave the start (a scaled move under [`INIT_ESCAPE_STEP_S`], the NLopt attempt's own
@@ -3914,9 +3916,22 @@ pub(crate) fn verify_unmoved_start(
     clamp_to_bounds(&mut x0, &bounds);
     let scale = scale_of(&x0, &bounds);
     let x0_s = apply_scale(&x0, &scale);
+    // Only the free coordinates: a held one is not the optimizer's to move, and on a
+    // profiled fit (#2591) the held level coordinates are re-solved at every evaluation,
+    // so they leave the start whether or not the structural ones did.
+    let free_of = |x: &[f64]| -> Vec<f64> {
+        x.iter()
+            .zip(&fixed)
+            .filter(|&(_, &f)| !f)
+            .map(|(&v, _)| v)
+            .collect()
+    };
+    let x0_free = free_of(&x0_s);
     let off_start = |r: &OuterResult| {
-        !(max_scaled_deviation(&apply_scale(&pack_params(&r.params), &scale), &x0_s)
-            < INIT_ESCAPE_STEP_S)
+        !(max_scaled_deviation(
+            &free_of(&apply_scale(&pack_params(&r.params), &scale)),
+            &x0_free,
+        ) < INIT_ESCAPE_STEP_S)
     };
     // `!(… < …)` so a non-finite deviation counts as moved: nothing to probe.
     if off_start(&result)
@@ -10826,4 +10841,4 @@ fn covariance_gradient(
 
 #[cfg(test)]
 #[path = "outer_optimizer_tests.rs"]
-mod tests;
+pub(crate) mod tests;

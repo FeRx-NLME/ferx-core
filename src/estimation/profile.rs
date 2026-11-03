@@ -2578,6 +2578,72 @@ pub(crate) fn profiled_leg_tols(
     }
 }
 
+/// [`optimize_profiled`] with the #2506 start probe (#2591): a run whose structural
+/// coordinates did not leave the start is restarted from a perturbation of it
+/// (`outer_optimizer::verify_unmoved_start`), so a warm start at an optimum is published
+/// `stationary_start` and converged, while a stall stays flagged. What `fit()` runs.
+///
+/// Movement is measured where the profiled loop steps: the packed coordinates of the
+/// hold template, unscaled, its level coordinates held — they are re-solved at every
+/// evaluation, so they leave the start whatever the structural ones do. The probe reruns
+/// on the fit's own template, its levels profiled again; its budget is what is left of
+/// `outer_maxiter`, counting the run's evaluations in iterations of `free + 1` as the
+/// loop's own budget does.
+pub(crate) fn optimize_profiled_probed(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> OuterResult {
+    // Test hook (`outer_optimizer::forced_stop_at_start`): the run stops at its start —
+    // the evaluation-only solve there, reported converged exactly when a status is
+    // forced — and a `whole_fit` stop leaves the probe no budget.
+    #[cfg(test)]
+    let forced = crate::estimation::outer_optimizer::forced_stop_at_start::get(&model.name, true);
+    #[cfg(test)]
+    let result = match forced {
+        Some(stop) => {
+            let at_start = FitOptions {
+                outer_maxiter: 0,
+                ..options.clone()
+            };
+            let mut stopped = optimize_profiled(model, population, init_params, &at_start);
+            stopped.converged = stop.status.is_some();
+            stopped
+        }
+        None => optimize_profiled(model, population, init_params, options),
+    };
+    #[cfg(not(test))]
+    let result = optimize_profiled(model, population, init_params, options);
+    let layout = ProfileLayout::build(model, population, init_params)
+        .expect("optimize_profiled_probed is called for a model with a profiled block");
+    let hold = hold_template(&layout, init_params);
+    let per_iter = packed_fixed_mask(&hold).iter().filter(|&&f| !f).count() + 1;
+    let budget = options
+        .outer_maxiter
+        .saturating_sub(result.n_iterations.div_ceil(per_iter));
+    #[cfg(test)]
+    let budget = if forced.is_some_and(|s| s.whole_fit) {
+        0
+    } else {
+        budget
+    };
+    crate::estimation::outer_optimizer::verify_unmoved_start(
+        model,
+        population,
+        &hold,
+        options,
+        result,
+        budget,
+        |x, _| vec![1.0; x.len()],
+        |p, o| {
+            let mut p = p.clone();
+            p.theta_fixed.clone_from(&init_params.theta_fixed);
+            optimize_profiled(model, population, &p, o)
+        },
+    )
+}
+
 /// The outer loop of a fit with `profile`d blocks: NLopt over the structural packed
 /// coordinates, every evaluation a profile solve. Returns the same `OuterResult` the
 /// unprofiled path does, its `params` carrying the solved levels and the fit's own
@@ -2760,6 +2826,9 @@ pub(crate) fn optimize_profiled(
     };
 
     let mut converged = false;
+    // The start verdict published as `left_init` / `stationary_start` (#2506). Set only
+    // when the profiled levels are the only free coordinates (#2591).
+    let mut start_verdict: (Option<bool>, bool) = (None, false);
     if runs && !free.is_empty() {
         let lower: Vec<f64> = free.iter().map(|&i| bounds.lower[i]).collect();
         let upper: Vec<f64> = free.iter().map(|&i| bounds.upper[i]).collect();
@@ -2925,6 +2994,17 @@ pub(crate) fn optimize_profiled(
         // levels are still solved at the initial structural point.
         if let Some(solve) = evaluate(&x0) {
             trace_row(&solve, None);
+            // #2591: with the outer optimizer running but no structural coordinate free,
+            // the estimated levels are the whole fit, and a profile solve that returned
+            // has put them at their minimum. Whatever the levels started at, that
+            // minimum is the fit's optimum, so the empty structural start is
+            // stationary: published as such, the fit is converged and not a stall. A
+            // warm refit's levels start at that minimum and do not move, so displacement
+            // would otherwise read it as one.
+            if runs && free.is_empty() {
+                converged = true;
+                start_verdict = (Some(false), true);
+            }
         }
     }
     {
@@ -3017,8 +3097,8 @@ pub(crate) fn optimize_profiled(
         bayes: None,
         cond_dist: None,
         packed_estimate: Some(x_hat),
-        left_init: None,
-        stationary_start: false,
+        left_init: start_verdict.0,
+        stationary_start: start_verdict.1,
         mixture_posteriors: None,
         vi: None,
         start_eval: None,

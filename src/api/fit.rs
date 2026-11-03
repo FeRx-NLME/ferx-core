@@ -2296,7 +2296,8 @@ fn fit_inner(
             }
             // #1065: a `profile`d block takes its own outer loop over the structural
             // parameters; `check_profiled_levels` has refused every method but foce, focei
-            // and laplace at one node.
+            // and laplace at one node. A run that did not leave its start is probed
+            // (#2591), as on every other outer optimizer.
             _ if !model
                 .indiv_param_partials
                 .theta_blocks
@@ -2304,7 +2305,7 @@ fn fit_inner(
                 .is_empty() =>
             {
                 floor_escaped(model, population, &stage_params, &stage_opts, |p, o| {
-                    crate::estimation::profile::optimize_profiled(model, population, p, o)
+                    crate::estimation::profile::optimize_profiled_probed(model, population, p, o)
                 })
             }
             _ => floor_escaped(model, population, &stage_params, &stage_opts, |p, o| {
