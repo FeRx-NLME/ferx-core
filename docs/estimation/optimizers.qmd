@@ -276,7 +276,10 @@ paid only by a fit that did not move.
 A model with a `profile`d θ block runs the same check
 ([#2591](https://github.com/FeRx-NLME/ferx-core/issues/2591)). Only its structural
 coordinates count as moving or get perturbed: the profiled levels are re-solved at every
-evaluation, so they never stay at their initial values.
+evaluation, so they never stay at their initial values. When the levels are the only
+estimated parameters (every structural parameter `FIX`), there is nothing to restart. The
+fit is a single profile solve, which puts the levels at their minimum, so it is reported
+converged and is never flagged as a stall.
 
 The other FOCE-family outer optimizers run the same restart: the built-in `bfgs` / `lbfgs`
 loops, `trust_region`, and `method = gn` / `gn_hybrid`. Their movement test and

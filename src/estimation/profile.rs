@@ -2827,6 +2827,9 @@ pub(crate) fn optimize_profiled(
     };
 
     let mut converged = false;
+    // The start verdict published as `left_init` / `stationary_start` (#2506). Set only
+    // when the profiled levels are the only free coordinates (#2591).
+    let mut start_verdict: (Option<bool>, bool) = (None, false);
     if runs && !free.is_empty() {
         let lower: Vec<f64> = free.iter().map(|&i| bounds.lower[i]).collect();
         let upper: Vec<f64> = free.iter().map(|&i| bounds.upper[i]).collect();
@@ -2992,6 +2995,17 @@ pub(crate) fn optimize_profiled(
         // levels are still solved at the initial structural point.
         if let Some(solve) = evaluate(&x0) {
             trace_row(&solve, None);
+            // #2591: with the outer optimizer running but no structural coordinate free,
+            // the estimated levels are the whole fit, and a profile solve that returned
+            // has put them at their minimum. Whatever the levels started at, that
+            // minimum is the fit's optimum, so the empty structural start is
+            // stationary: published as such, the fit is converged and not a stall. A
+            // warm refit's levels start at that minimum and do not move, so displacement
+            // would otherwise read it as one.
+            if runs && free.is_empty() {
+                converged = true;
+                start_verdict = (Some(false), true);
+            }
         }
     }
     {
@@ -3084,8 +3098,8 @@ pub(crate) fn optimize_profiled(
         bayes: None,
         cond_dist: None,
         packed_estimate: Some(x_hat),
-        left_init: None,
-        stationary_start: false,
+        left_init: start_verdict.0,
+        stationary_start: start_verdict.1,
         mixture_posteriors: None,
         vi: None,
         start_eval: None,

@@ -6626,6 +6626,10 @@ fn f2_cold_fit_2591(name: &str) -> (crate::api::PreparedRun, FitOptions, crate::
 /// displacement check and carried the stall flag. Dies when `fit()` routes the profiled
 /// model to `optimize_profiled` unprobed.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: profiled FOCEI fits to convergence; opt in with --features slow-tests"
+)]
 fn a_profiled_warm_refit_at_its_own_optimum_is_verified() {
     let (p, o, cold) = f2_cold_fit_2591("profile_warm_refit_2591");
     let model = &p.parsed.model;
@@ -6652,6 +6656,10 @@ fn a_profiled_warm_refit_at_its_own_optimum_is_verified() {
 /// levels are re-solved off the file's inits, so the probe never runs and the stall is
 /// not published (`left_init` stays `None`).
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: profiled FOCEI fits to convergence; opt in with --features slow-tests"
+)]
 fn a_profiled_stop_at_its_start_is_verified_or_flagged_by_the_start() {
     use crate::estimation::outer_optimizer::forced_stop_at_start;
     let name = "profile_forced_stop_2591";
@@ -6721,6 +6729,111 @@ fn a_profiled_stop_at_its_start_is_verified_or_flagged_by_the_start() {
             "{status:?}: a stall fails the default strictness: {v:?}"
         );
     }
+}
+
+/// #2591, the profile-only shape: F2 with every structural coordinate `FIX`ed (θ, Ω, κ;
+/// Σ already is), so the profiled levels are the only estimated parameters and the outer
+/// optimizer has nothing to search. The fit is one profile solve, which puts the levels
+/// at their minimum — the fit's optimum, wherever they started. A cold fit from the
+/// file's inits and a warm refit from its estimates, whose levels start at that minimum
+/// and do not move, are both converged, published as a stationary start, not
+/// `stalled_at_init`, and pass `Strictness::default()`. The same model at
+/// `outer_maxiter = 0` (evaluation only, the other arm of the same branch) is not
+/// reported converged. Before the fix the profile-only fit published `left_init: None`,
+/// `converged = false`, and the warm refit fell to the displacement check and was
+/// flagged a stall. One profile solve per fit: no convergence loop.
+#[test]
+fn a_profile_only_fit_is_converged_and_not_a_stall() {
+    let mut p = prep(F2, F2_DATA, Some(2), |t| {
+        [
+            (
+                "theta TVE0(45.0, 0.0, 200.0)",
+                "theta TVE0(45.0, 0.0, 200.0) FIX",
+            ),
+            (
+                "theta EMAX(8.0, 0.0, 100.0)",
+                "theta EMAX(8.0, 0.0, 100.0) FIX",
+            ),
+            (
+                "theta ET50(2.0, 0.01, 100.0)",
+                "theta ET50(2.0, 0.01, 100.0) FIX",
+            ),
+            ("omega ETA_EM ~ 0.25", "omega ETA_EM ~ 0.25 FIX"),
+            ("kappa KAPPA_ARM ~ 1.0", "kappa KAPPA_ARM ~ 1.0 FIX"),
+        ]
+        .iter()
+        .fold(t, |t, (from, to)| {
+            assert!(t.contains(from), "fixture edit {from:?} no longer applies");
+            t.replace(from, to)
+        })
+    });
+    p.parsed.model.name = "profile_only_2591".to_string();
+    let model = &p.parsed.model;
+    let o = FitOptions {
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    let cold = crate::api::fit(model, &p.population, &p.init_params, &o).expect("cold fit");
+    let warm_start = warm_start_2591(&p.init_params, &cold);
+    let warm = crate::api::fit(model, &p.population, &warm_start, &o).expect("warm fit");
+    assert!(
+        p.init_params
+            .theta
+            .iter()
+            .zip(&cold.theta)
+            .any(|(a, b)| a != b),
+        "fixture precondition — the levels are estimated and leave the file's inits"
+    );
+    assert!(
+        warm.n_parameters > 0,
+        "fixture precondition — the levels are free, so `n_parameters == 0` does not \
+         short-circuit the stall check"
+    );
+    for (label, r) in [("cold", &cold), ("warm", &warm)] {
+        eprintln!(
+            "profile-only {label}: OFV {:.9}, converged {}, left_init {:?}, \
+             stationary_start {}",
+            r.ofv, r.converged, r.left_init, r.stationary_start
+        );
+        assert!(r.converged, "{label}: {:?}", r.warnings);
+        assert_eq!(r.left_init, Some(false), "{label}");
+        assert!(r.stationary_start, "{label}");
+        assert_eq!(
+            crate::model_selection::stalled_at_init(r),
+            Some(false),
+            "{label}"
+        );
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("W_STALLED_AT_INIT")),
+            "{label}: {:?}",
+            r.warnings
+        );
+        let v = crate::model_selection::check_strictness(
+            r,
+            &crate::model_selection::Strictness::default(),
+        );
+        assert!(v.passed, "{label}: {v:?}");
+    }
+    assert!(
+        (warm.ofv - cold.ofv).abs() < 1e-6,
+        "the warm refit solves to the same levels: {} vs {}",
+        warm.ofv,
+        cold.ofv
+    );
+    // Evaluation only: the same branch with the outer optimizer off is not a fit, and
+    // is not reported converged.
+    let eval_only = crate::api::fit(
+        model,
+        &p.population,
+        &p.init_params,
+        &FitOptions {
+            outer_maxiter: 0,
+            ..o.clone()
+        },
+    )
+    .expect("evaluation");
+    assert!(!eval_only.converged, "{:?}", eval_only.warnings);
+    assert!(!eval_only.stationary_start);
 }
 
 /// How far below the stalled inits both the cold optimum and the probe must end on the
