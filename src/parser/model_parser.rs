@@ -7741,6 +7741,15 @@ fn build_derived_filter_fn(cond: Condition) -> DerivedFilterFn {
 /// lowercase `wt` reference resolve.)
 /// Built-in time variables (TIME, TAFD, TAD, IPRED, PRED, DV) are inserted in
 /// both uppercase and lowercase for the same reason.
+/// Whether a `[derived]` read of `read` resolves to the value stored under `key`
+/// (a data column, individual parameter, compartment or earlier `[derived]`
+/// column): `build_derived_vars` stores each such key verbatim, uppercased and
+/// lowercased, and evaluation looks the read up verbatim. So `Wt` reads neither
+/// `wT` nor `WT` — only those three spellings of the key resolve (#2599).
+pub(crate) fn derived_read_resolves(key: &str, read: &str) -> bool {
+    read == key || read == key.to_uppercase() || read == key.to_lowercase()
+}
+
 fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
     let mut vars: HashMap<String, f64> = HashMap::new();
 
@@ -8252,7 +8261,7 @@ fn parse_derived_block(
         // name in `build_derived_vars`, so it is not a read of the data.
         reads.retain(|r| {
             !BUILTIN_SPECIALS.iter().any(|b| b.eq_ignore_ascii_case(r))
-                && !defined_derived.iter().any(|d| d.eq_ignore_ascii_case(r))
+                && !defined_derived.iter().any(|d| derived_read_resolves(d, r))
         });
         for r in reads {
             if !block_reads.contains(&r) {

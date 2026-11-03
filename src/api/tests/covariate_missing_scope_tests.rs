@@ -24,8 +24,9 @@
 //! covariates go silent); not registering `[scaling]` covariates (`CRCL` goes silent);
 //! dropping the `[derived]` reads from `columns_read_by_relations` (`LAB` goes silent);
 //! dropping the `[output]` echo columns (`OUT` goes silent); dropping the filter
-//! check (`KEEP` goes silent); matching `referenced_columns` ignoring case (`wt`
-//! warns); dropping the `[derived]`
+//! check (`KEEP` goes silent); counting a string comparison as a read (`FLAG`
+//! warns); matching `referenced_columns` ignoring case (`wt` warns); matching
+//! `[derived]` reads ignoring case (`mX` warns) or verbatim only (`ALB` goes silent); dropping the `[derived]`
 //! shadow from `output_echo_columns` (`LAB_RATIO` warns); re-adding the declared / `covariate_columns` widening (the last two tests).
 
 use crate::api::read_population_for;
@@ -37,7 +38,9 @@ use std::io::Write;
 
 /// `WT` is read in `[individual_parameters]`, `CRCL` only in `[scaling]`, `LAB` only
 /// in `[derived]`, `OUT` only in `[output]`; `[output]`'s `LAB_RATIO` is the derived
-/// column, not the data column of that name.
+/// column, not the data column of that name. `[derived]` resolves a column by its
+/// verbatim, uppercase or lowercase spelling only: `alb` reads the `ALB` column,
+/// `Mx` reads nothing — not the `mX` column beside it.
 const MODEL: &str = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  \
     theta TVV(40.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.02\n\
     [individual_parameters]\n  CL = TVCL * (WT / 70)^0.75 * exp(ETA_CL)\n  V  = TVV\n\
@@ -45,7 +48,7 @@ const MODEL: &str = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  \
     [odes]\n  d/dt(central) = -(CL / V) * central\n\
     [scaling]\n  y = central / V * CRCL / 100\n\
     [error_model]\n  DV ~ proportional(PROP)\n\
-    [derived]\n  LAB_RATIO = LAB / IPRED\n\
+    [derived]\n  LAB_RATIO = LAB / IPRED\n  ALB_RATIO = alb / IPRED\n  MX_RATIO = Mx / IPRED\n\
     [output]\n  OUT LAB_RATIO\n";
 
 /// The same model with the never-read `UNUSED_SOME` declared in `[covariates]`.
@@ -60,18 +63,21 @@ fn model_declaring_unused() -> String {
 /// Subject 2 has no value in any covariate column; `UNUSED_ALL` is `.` everywhere,
 /// the rest are filled for subject 1.
 ///
+/// `FLAG` is a label column, `KEEP` in every row: no cell is missing, though the
+/// numeric map holds the text as `NaN`, so the model-blind read warns for it.
+///
 /// `KEEP` is read only by the `[data_selection]` filter of
 /// [`an_unread_column_read_by_the_row_filter_warns`]; `wt` is an unread column whose
 /// name differs from the read `WT` only in case — a model covariate is matched
 /// case-sensitively, so reading `WT` must not make `wt` warn.
 const DATA: &str =
-    "ID,TIME,DV,EVID,AMT,CMT,WT,CRCL,LAB,OUT,LAB_RATIO,KEEP,wt,UNUSED_ALL,UNUSED_SOME\n\
-    1,0,.,1,100,1,70,100,5,1,9,0,70,.,3\n\
-    1,1,5.0,0,.,1,70,100,5,1,9,0,70,.,3\n\
-    1,4,3.0,0,.,1,70,100,5,1,9,0,70,.,3\n\
-    2,0,.,1,100,1,.,.,.,.,.,.,.,.,.\n\
-    2,1,4.0,0,.,1,.,.,.,.,.,.,.,.,.\n\
-    2,4,2.5,0,.,1,.,.,.,.,.,.,.,.,.\n";
+    "ID,TIME,DV,EVID,AMT,CMT,WT,CRCL,LAB,OUT,LAB_RATIO,KEEP,FLAG,ALB,mX,wt,UNUSED_ALL,UNUSED_SOME\n\
+    1,0,.,1,100,1,70,100,5,1,9,0,KEEP,40,2,70,.,3\n\
+    1,1,5.0,0,.,1,70,100,5,1,9,0,KEEP,40,2,70,.,3\n\
+    1,4,3.0,0,.,1,70,100,5,1,9,0,KEEP,40,2,70,.,3\n\
+    2,0,.,1,100,1,.,.,.,.,.,.,KEEP,.,.,.,.,.\n\
+    2,1,4.0,0,.,1,.,.,.,.,.,.,KEEP,.,.,.,.,.\n\
+    2,4,2.5,0,.,1,.,.,.,.,.,.,KEEP,.,.,.,.,.\n";
 
 fn data_file() -> tempfile::NamedTempFile {
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -124,7 +130,9 @@ fn the_model_blind_reader_warns_for_every_gapped_column() {
     assert_eq!(
         warned(&pop),
         [
+            "ALB",
             "CRCL",
+            "FLAG",
             "KEEP",
             "LAB",
             "LAB_RATIO",
@@ -132,6 +140,7 @@ fn the_model_blind_reader_warns_for_every_gapped_column() {
             "UNUSED_ALL",
             "UNUSED_SOME",
             "WT",
+            "mX",
             "wt"
         ],
         "{:?}",
@@ -146,7 +155,7 @@ fn an_unread_column_with_gaps_does_not_warn() {
     let pop = read(MODEL, None);
     assert_eq!(
         warned(&pop),
-        ["CRCL", "LAB", "OUT", "WT"],
+        ["ALB", "CRCL", "LAB", "OUT", "WT"],
         "{:?}",
         pop.warnings
     );
@@ -163,6 +172,8 @@ fn an_unread_column_with_gaps_does_not_warn() {
         !pop.warnings.iter().any(|w| w.contains("UNUSED")
             || w.contains("LAB_RATIO")
             || w.contains("KEEP")
+            || w.contains("FLAG")
+            || w.contains("covariate mX ")
             || w.contains("covariate wt ")),
         "no warning may name an unread column: {:?}",
         pop.warnings
@@ -177,7 +188,7 @@ fn a_derived_expression_records_the_names_it_reads() {
     let parsed = parse_full_model(MODEL).expect("model parses");
     assert_eq!(
         parsed.model.derived_reads(),
-        ["LAB"],
+        ["LAB", "alb", "Mx"],
         "IPRED is a built-in, not a column"
     );
     assert!(
@@ -229,9 +240,34 @@ fn an_unread_column_read_by_the_row_filter_warns() {
     let pop = read_filtered(MODEL, None, Some(&filter));
     assert_eq!(
         warned(&pop),
-        ["CRCL", "KEEP", "LAB", "OUT", "WT"],
+        ["ALB", "CRCL", "KEEP", "LAB", "OUT", "WT"],
         "{:?}",
         pop.warnings
     );
     assert_eq!(pop.subjects.len(), 2, "the NaN cell keeps subject 2");
+}
+
+/// A string comparison reads the raw cell, not the parsed one: `FLAG == DROP` on a
+/// `KEEP` label is no missing value, although the numeric map holds it as `NaN`. Both
+/// sides in one filter — the numeric `KEEP == 1` beside it still warns.
+#[test]
+fn a_column_read_only_by_a_string_comparison_does_not_warn() {
+    let filter = SelectionFilter::from_opts(
+        &["KEEP == 1".to_string(), "FLAG == DROP".to_string()],
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert!(
+        filter.needs_str_covariates(),
+        "FLAG == DROP is a string clause"
+    );
+    let pop = read_filtered(MODEL, None, Some(&filter));
+    assert_eq!(
+        warned(&pop),
+        ["ALB", "CRCL", "KEEP", "LAB", "OUT", "WT"],
+        "{:?}",
+        pop.warnings
+    );
+    assert_eq!(pop.subjects.len(), 2, "no row holds FLAG = DROP");
 }

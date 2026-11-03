@@ -1303,21 +1303,20 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
 /// Every data column a relation of `model` reads, the set `W_COVARIATE_MISSING`
 /// is raised for (#2599); the reader adds the columns its `[data_selection]`
 /// filter reads. Matched exactly: the required [`referenced_columns`], which are
-/// case-sensitive. Matched in any case: the names a `[derived]` expression looks
-/// up at evaluation time (not required columns, so not in
-/// `referenced_covariates`) and the `[output]` columns echoed from the data, both
-/// resolved case-insensitively. A column only declared in `[covariates]` or
+/// case-sensitive. Matched in any case: the `[output]` columns echoed from the
+/// data, resolved case-insensitively. Matched as `[derived]` resolves them (the
+/// verbatim, uppercase or lowercase spelling of the column): the names a
+/// `[derived]` expression looks up at evaluation time (not required columns, so
+/// not in `referenced_covariates`). A column only declared in `[covariates]` or
 /// listed in `covariate_columns`, with nothing reading it, is in neither — a gap
 /// in it reaches neither the objective nor an output.
 fn columns_read_by_relations(model: &CompiledModel) -> CovariateReads {
     CovariateReads {
         exact: referenced_columns(model).into_iter().collect(),
-        any_case: model
-            .derived_reads()
-            .iter()
-            .chain(super::output_columns::output_echo_columns(model))
+        any_case: super::output_columns::output_echo_columns(model)
             .cloned()
             .collect(),
+        derived: model.derived_reads().iter().cloned().collect(),
     }
 }
 

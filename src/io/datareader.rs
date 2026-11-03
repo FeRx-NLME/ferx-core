@@ -80,6 +80,19 @@ impl SelectionFilter {
             .any(|c| c.eq_ignore_ascii_case(col))
     }
 
+    /// True when any ignore/accept clause compares `col` as a number
+    /// (case-insensitive). The `W_COVARIATE_MISSING` gate asks this: a numeric
+    /// comparison reads the parsed cell, so a missing one is `NaN` there, while a
+    /// string comparison reads the raw text — `FLAG == DROP` on a `KEEP` label is
+    /// not a missing value, though the numeric map holds it as `NaN` (#2599).
+    pub(crate) fn reads_column_numerically(&self, col: &str) -> bool {
+        self.ignore
+            .iter()
+            .chain(self.accept.iter())
+            .flat_map(|c| c.numeric_columns())
+            .any(|c| c.eq_ignore_ascii_case(col))
+    }
+
     /// True when any ignore/accept clause compares a covariate column as a raw
     /// string, so the reader must build the per-row `str_covariates` map. Lets a
     /// purely numeric filter (the common case) skip that per-row allocation.
@@ -558,15 +571,24 @@ pub(crate) struct CovariateReads {
     /// Matched exactly: a model covariate is case-sensitive, so reading `WT` says
     /// nothing about an unread `wt` column beside it.
     pub exact: HashSet<String>,
-    /// Matched ignoring ASCII case: consumers that look a name up case-insensitively
-    /// (`[derived]`'s variable map, the `[output]` echo).
+    /// Matched ignoring ASCII case: the `[output]` echo, which looks a name up
+    /// case-insensitively.
     pub any_case: HashSet<String>,
+    /// `[derived]` reads, matched as its variable map resolves them: a column `K`
+    /// is read by `K`, its all-uppercase or its all-lowercase spelling, nothing
+    /// else (`derived_read_resolves`).
+    pub derived: HashSet<String>,
 }
 
 impl CovariateReads {
     /// Whether a consumer reads the dataset column `name`.
     fn reads(&self, name: &str) -> bool {
-        self.exact.contains(name) || self.any_case.iter().any(|c| c.eq_ignore_ascii_case(name))
+        self.exact.contains(name)
+            || self.any_case.iter().any(|c| c.eq_ignore_ascii_case(name))
+            || self
+                .derived
+                .iter()
+                .any(|r| crate::parser::model_parser::derived_read_resolves(name, r))
     }
 }
 
@@ -609,10 +631,11 @@ impl ObsRouting {
 
     /// Whether `W_COVARIATE_MISSING` may be raised for covariate column `name`.
     /// `filter` is the read's `[data_selection]` filter, itself a reader of the
-    /// columns its clauses name — resolved case-insensitively, as the reader does.
+    /// columns its clauses compare as numbers — resolved case-insensitively, as the
+    /// reader does. A string comparison reads the raw cell, not the parsed `NaN`.
     fn warns_missing_covariate(&self, name: &str, filter: Option<&SelectionFilter>) -> bool {
         self.warn_missing_covariates.as_ref().map_or(true, |reads| {
-            reads.reads(name) || filter.is_some_and(|f| f.references_column(name))
+            reads.reads(name) || filter.is_some_and(|f| f.reads_column_numerically(name))
         })
     }
 
