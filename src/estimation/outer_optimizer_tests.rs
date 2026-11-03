@@ -13889,6 +13889,8 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
         // Verified, the probe ended off the start but above it: the start's point is
         // reported, so it did not leave.
         (start_ofv + 0.5 * tol, true, false, Some(true), true),
+        // A tie goes to the start.
+        (start_ofv, true, false, Some(true), true),
         (start_ofv - 2.0 * tol, false, false, Some(false), false),
         (start_ofv + 0.5 * tol, false, true, None, false),
     ] {
@@ -14079,21 +14081,23 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
         ..at(&init, 1, false)
     };
     let start_ofv = first().ofv;
-    // (verdict, probe left the user's start, probe ended above the start) → retry
-    // skipped, the probe's point reported, stationary.
-    for (verdict, probe_left, probe_higher, skip_retry, reports_probe, stationary) in [
-        (Some(true), false, false, true, true, true),
-        (Some(true), true, false, true, true, false),
+    // (verdict, probe left the user's start, probe − start) → retry skipped, the probe's
+    // point reported, stationary. Within `START_PROBE_TOL` of the start either way, as a
+    // verified probe is.
+    for (verdict, probe_left, probe_delta, skip_retry, reports_probe, stationary) in [
+        (Some(true), false, -1e-3, true, true, true),
+        (Some(true), true, -1e-3, true, true, false),
         // Verified but higher: the start's point, whether or not the probe left it.
-        (Some(true), false, true, true, false, true),
-        (Some(true), true, true, true, false, true),
-        (Some(false), true, false, false, false, false),
-        (None, false, false, false, false, false),
+        (Some(true), false, 1e-3, true, false, true),
+        (Some(true), true, 1e-3, true, false, true),
+        // A tie goes to the start: the probe left it, yet the fit did not.
+        (Some(true), true, 0.0, true, false, true),
+        (Some(false), true, -1e-3, false, false, false),
+        (None, false, -1e-3, false, false, false),
     ] {
         let label =
-            format!("{verdict:?}, probe left = {probe_left}, probe higher = {probe_higher}");
-        // Within `START_PROBE_TOL` of the start either way, as a verified probe is.
-        let probe_ofv = start_ofv + if probe_higher { 1e-3 } else { -1e-3 };
+            format!("{verdict:?}, probe left = {probe_left}, probe − start = {probe_delta:+e}");
+        let probe_ofv = start_ofv + probe_delta;
         let probe = OuterResult {
             ofv: probe_ofv,
             converged: true,
@@ -14145,10 +14149,168 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
             "{label}"
         );
     }
+    // The comparison is on the objective `penalized` returns, not the clean OFV: a probe
+    // above the start by the clean OFV but below it once penalized is the point reported.
+    let probe = OuterResult {
+        ofv: start_ofv + 1e-3,
+        converged: true,
+        ..at(&off, 4, true)
+    };
+    let ((result, _), _) = settle_start_probe(
+        (first(), None),
+        false,
+        Some((probe, None, Some(true))),
+        |r| {
+            r.ofv
+                - if pack_params(&r.params) == init_packed {
+                    0.0
+                } else {
+                    1.0
+                }
+        },
+    );
+    assert_eq!(
+        result.ofv,
+        start_ofv + 1e-3,
+        "the penalized objective decides which point is reported"
+    );
     // Unprobed, the retry follows `left_init` alone.
     for left in [false, true] {
         let (_, skip) = settle_start_probe((at(&init, 1, left), None), left, None, |r| r.ofv);
         assert_eq!(skip, left);
+    }
+}
+
+/// #2506 (PR #2625 review): which fields a verified start takes from which run. Every
+/// field tied to the reported **point** — estimates, objective, EBEs and their Hessians,
+/// κ, the covariance step's output, the final gradient, the conditional distribution,
+/// the packed estimate, the mixture posteriors — is the unmoved run's when the start wins
+/// and the probe's otherwise; every field describing the **run** — its verdict, warnings
+/// and EBE counters — is the probe's either way. Each run carries its own tag in every
+/// field, so a field left out of the copy (or copied when it should not be) is named by
+/// the failure.
+#[test]
+fn a_verified_start_takes_every_point_field_from_the_lower_run() {
+    let (model, pop) = two_cpt_iv_fixture();
+    let opts = options_2506(crate::types::Optimizer::NloptLbfgs);
+    let base = evaluate_at_initial_params(&model, &pop, &model.default_params, &opts);
+    let tagged = |tag: f64, method: crate::types::CovarianceMethod| {
+        let m = DMatrix::from_element(1, 1, tag);
+        let v = DVector::from_element(1, tag);
+        OuterResult {
+            ofv: tag,
+            eta_hats: vec![v.clone()],
+            h_matrices: vec![m.clone()],
+            kappas: vec![vec![v]],
+            covariance_matrix: Some(m.clone()),
+            covariance_method: Some(method),
+            covariance_wall_time_secs: tag,
+            sir_fallback_proposal: Some(m),
+            final_gradient: Some(vec![tag]),
+            final_gradient_source: Some(format!("{tag}")),
+            cond_dist: Some(crate::types::CondDist {
+                cond_mean: vec![vec![tag]],
+                cond_sd: vec![],
+                samples: vec![],
+                shrinkage: vec![],
+                nsamp: 0,
+                burnin: 0,
+            }),
+            packed_estimate: Some(vec![tag]),
+            mixture_posteriors: Some(MixturePosteriors {
+                pmix: vec![vec![tag]],
+                mixest: vec![],
+            }),
+            converged: tag == 2.0,
+            warnings: vec![format!("{tag}")],
+            ebe_convergence_warnings: tag as u32,
+            max_unconverged_subjects: tag as u32,
+            total_ebe_fallbacks: tag as u32,
+            total_ebe_nm_polished: tag as u32,
+            n_iterations: 1,
+            ..evaluate_at_initial_params(&model, &pop, &model.default_params, &opts)
+        }
+    };
+    // (field, tag read off the result) for every field the test pins.
+    let point = |r: &OuterResult| {
+        vec![
+            ("ofv", r.ofv),
+            ("eta_hats", r.eta_hats[0][0]),
+            ("h_matrices", r.h_matrices[0][(0, 0)]),
+            ("kappas", r.kappas[0][0][0]),
+            (
+                "covariance_matrix",
+                r.covariance_matrix.as_ref().unwrap()[(0, 0)],
+            ),
+            (
+                "covariance_method",
+                if r.covariance_method == Some(crate::types::CovarianceMethod::Hessian) {
+                    1.0
+                } else {
+                    2.0
+                },
+            ),
+            ("covariance_wall_time_secs", r.covariance_wall_time_secs),
+            (
+                "sir_fallback_proposal",
+                r.sir_fallback_proposal.as_ref().unwrap()[(0, 0)],
+            ),
+            ("final_gradient", r.final_gradient.as_ref().unwrap()[0]),
+            (
+                "final_gradient_source",
+                r.final_gradient_source.as_ref().unwrap().parse().unwrap(),
+            ),
+            ("cond_dist", r.cond_dist.as_ref().unwrap().cond_mean[0][0]),
+            ("packed_estimate", r.packed_estimate.as_ref().unwrap()[0]),
+            (
+                "mixture_posteriors",
+                r.mixture_posteriors.as_ref().unwrap().pmix[0][0],
+            ),
+        ]
+    };
+    let run = |r: &OuterResult| {
+        vec![
+            ("converged", if r.converged { 2.0 } else { 1.0 }),
+            ("warnings", r.warnings[0].parse().unwrap()),
+            (
+                "ebe_convergence_warnings",
+                f64::from(r.ebe_convergence_warnings),
+            ),
+            (
+                "max_unconverged_subjects",
+                f64::from(r.max_unconverged_subjects),
+            ),
+            ("total_ebe_fallbacks", f64::from(r.total_ebe_fallbacks)),
+            ("total_ebe_nm_polished", f64::from(r.total_ebe_nm_polished)),
+        ]
+    };
+    let mut off = base.params.clone();
+    off.theta = base.params.theta.iter().map(|t| 1.1 * t).collect();
+    for start_wins in [true, false] {
+        let unmoved = tagged(1.0, crate::types::CovarianceMethod::Hessian);
+        let probe = OuterResult {
+            params: off.clone(),
+            ..tagged(2.0, crate::types::CovarianceMethod::Sandwich)
+        };
+        let result = verified_start_result(probe, true, unmoved, start_wins);
+        let want = if start_wins { 1.0 } else { 2.0 };
+        for (field, got) in point(&result) {
+            assert_eq!(got, want, "start wins = {start_wins}: `{field}`");
+        }
+        assert_eq!(
+            result.params.theta == base.params.theta,
+            start_wins,
+            "start wins = {start_wins}: `params`"
+        );
+        for (field, got) in run(&result) {
+            assert_eq!(
+                got, 2.0,
+                "start wins = {start_wins}: `{field}` is the probe's"
+            );
+        }
+        assert_eq!(result.n_iterations, 2, "both runs' evaluations count");
+        assert_eq!(result.stationary_start, start_wins);
+        assert_eq!(result.left_init, Some(!start_wins));
     }
 }
 
@@ -14309,9 +14471,16 @@ pub(crate) fn assert_warm_refit_verified(
     assert_eq!(warm.left_init, Some(false), "{label}: fixture precondition");
     assert!(warm.stationary_start, "{label}: {:?}", warm.warnings);
     assert!(warm.converged, "{label}: {:?}", warm.warnings);
+    // One-sided: a verified warm refit never reports an objective above the cold fit's
+    // (#2506, PR #2625). It may report one below it. The cold fit's OFV is scored on EBEs
+    // warm-started along its whole path, and a fresh EBE solve at the same estimates can
+    // land lower: `gn` measured −1.283e-3 on Linux x86_64 and aarch64 alike, with the start
+    // winning over the probe. Upward, the largest realised gap over every warm-refit row
+    // (L-BFGS, BOBYQA, BFGS, trust-region, AGQ, mixture, profiled) is +5.7e-10; the bound
+    // is 1e-6, over 1000× that.
     assert!(
-        (warm.ofv - cold.ofv).abs() < 1e-3,
-        "{label}: the warm refit reports the warm start, at the cold fit's objective: {} vs {}",
+        warm.ofv - cold.ofv <= 1e-6,
+        "{label}: the warm refit reports a point no worse than the cold fit's: {} vs {}",
         warm.ofv,
         cold.ofv
     );
