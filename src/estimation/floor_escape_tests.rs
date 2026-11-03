@@ -567,6 +567,7 @@ fn the_report_is_held_against_the_first_runs_start() {
         guard_rejected: false,
         n_unconverged: 0,
         n_start_rejected: 0,
+        rescored: None,
     };
     let fit_start = at(-228.712965);
     let escape = |restart_ofv: f64| {
@@ -687,5 +688,196 @@ fn the_report_is_held_against_the_first_runs_start() {
         (1, 1),
         "{:?}",
         already.warnings
+    );
+}
+
+/// #2619: a start that scored `∞` is re-scored once, at the start, evaluation-only, at the
+/// default inner budget, and the report is held against that — every cell of the input space
+/// in one test, so a gate stuck on either side of any branch reddens it. The figures are the
+/// profile tests' F2 at `inner_maxiter = 1`: re-scored start 26.465827, report 66.022863.
+#[test]
+fn a_start_that_scored_infinite_is_rescored_once_and_judged_against_that() {
+    use crate::estimation::outer_optimizer::ABOVE_START_TOKEN;
+    use std::cell::RefCell;
+    let start = template();
+    let at = |ofv: f64| StartEval {
+        ofv,
+        guard_rejected: false,
+        n_unconverged: 0,
+        n_start_rejected: 0,
+        rescored: None,
+    };
+    let with_im = |inner_maxiter: usize| FitOptions {
+        inner_maxiter,
+        optimizer_trace: true,
+        ..FitOptions::default()
+    };
+    // The fit returns `report` from a start that scored `first`, stopped away from the start
+    // (so a re-score at the stop is told apart); any further call returns a run whose
+    // recorded start is `rescore`. Every call's θ and options are kept.
+    let mut stop = start.clone();
+    stop.theta[1] *= 2.0;
+    let case = |options: &FitOptions,
+                first: Option<StartEval>,
+                report: f64,
+                rescore: Option<StartEval>,
+                penalty: f64| {
+        let calls = RefCell::new(Vec::<(Vec<f64>, FitOptions)>::new());
+        let r = escape_floor(
+            &start,
+            options,
+            2,
+            |p, o| {
+                calls.borrow_mut().push((p.theta.clone(), o.clone()));
+                if calls.borrow().len() == 1 {
+                    Stub {
+                        params: stop.clone(),
+                        ofv: report,
+                        start_eval: first,
+                        ..landed()
+                    }
+                } else {
+                    Stub {
+                        ofv: f64::INFINITY,
+                        converged: false,
+                        start_eval: rescore,
+                        ..landed()
+                    }
+                }
+            },
+            |_| penalty,
+        );
+        (r, calls.into_inner())
+    };
+    let tagged = |r: &Stub| -> Vec<String> {
+        r.warnings
+            .iter()
+            .filter(|w| w.starts_with(ABOVE_START_TOKEN))
+            .cloned()
+            .collect()
+    };
+    let inf = Some(at(f64::INFINITY));
+    let healthy = Some(at(26.465827));
+    let im1 = with_im(1);
+
+    // E: re-scored finite, report above → one call more, at the start, with the re-score's
+    // options; demoted, the message names both budgets and no guard.
+    let (e, calls) = case(&im1, inf, 66.022863, healthy, 0.0);
+    assert_eq!(calls.len(), 2, "the fit and one re-score");
+    let (theta, o) = &calls[1];
+    assert_ne!(
+        stop.theta, start.theta,
+        "the fixture must stop away from its start"
+    );
+    assert_eq!(
+        theta, &start.theta,
+        "re-scored at the start, not at the stop"
+    );
+    assert_eq!(
+        (
+            o.outer_maxiter,
+            o.inner_maxiter,
+            o.run_covariance_step,
+            o.optimizer_trace
+        ),
+        (0, 200, false, false),
+        "evaluation-only, at the default inner budget, writing no trace"
+    );
+    assert!(!e.converged, "{:?}", e.warnings);
+    let w = tagged(&e);
+    assert_eq!(w.len(), 1, "{:?}", e.warnings);
+    assert!(
+        w[0].contains("failed outright at `inner_maxiter` = 1")
+            && w[0].contains("at `inner_maxiter` = 200")
+            && w[0].contains("26.465827")
+            && !w[0].contains("guard"),
+        "{}",
+        w[0]
+    );
+    assert_eq!(
+        e.start_eval.and_then(|s| s.rescored),
+        Some(StartRescore {
+            run_inner_maxiter: 1,
+            rescore_inner_maxiter: 200
+        }),
+        "the published start is the re-scored one"
+    );
+    // The report is ranked with its penalty, as before: 66.022863 + 5.
+    let (pen, _) = case(&im1, inf, 66.022863, healthy, 5.0);
+    assert!(tagged(&pen)[0].contains("71.022863"), "{:?}", pen.warnings);
+
+    // F: re-scored finite, report within the bound → kept converged, no warning.
+    let (f, calls) = case(&im1, inf, 26.465827, healthy, 0.0);
+    assert_eq!(calls.len(), 2);
+    assert!(f.converged && tagged(&f).is_empty(), "{:?}", f.warnings);
+
+    // G / I: a re-score that is ∞, records no start, or is hard-rejected leaves the start
+    // unscored — no comparison, the verdict kept.
+    let hard = Some(StartEval {
+        n_start_rejected: 1,
+        ..at(26.465827)
+    });
+    for (label, rescore) in [("∞", inf), ("none", None), ("hard-rejected", hard)] {
+        let (g, calls) = case(&im1, inf, 66.022863, rescore, 0.0);
+        assert_eq!(calls.len(), 2, "{label}");
+        assert!(
+            g.converged && tagged(&g).is_empty(),
+            "{label}: {:?}",
+            g.warnings
+        );
+        // An unusable re-score is not published as the fit's start, except the hard-rejected
+        // one, which is a scored start the check itself declines.
+        let published = g.start_eval.and_then(|s| s.rescored).is_some();
+        assert_eq!(
+            published,
+            label == "hard-rejected",
+            "{label}: {:?}",
+            g.start_eval
+        );
+    }
+
+    // No re-score at all: a finite start (C, A), no start, a default or larger budget (the
+    // same deterministic failure again), an evaluation-only fit, a non-finite report.
+    for (label, options, first, report) in [
+        ("finite start", with_im(1), healthy, 20.0),
+        ("finite start, above", with_im(1), healthy, 66.022863),
+        ("no start", with_im(1), None, 66.022863),
+        ("default budget", with_im(200), inf, 66.022863),
+        ("larger budget", with_im(500), inf, 66.022863),
+        (
+            "evaluation-only fit",
+            FitOptions {
+                outer_maxiter: 0,
+                ..with_im(1)
+            },
+            inf,
+            66.022863,
+        ),
+        ("non-finite report", with_im(1), inf, f64::INFINITY),
+        (
+            "cancelled fit",
+            FitOptions {
+                cancel: Some({
+                    let c = crate::cancel::CancelFlag::new();
+                    c.cancel();
+                    c
+                }),
+                ..with_im(1)
+            },
+            inf,
+            66.022863,
+        ),
+    ] {
+        let (_, calls) = case(&options, first, report, healthy, 0.0);
+        assert_eq!(calls.len(), 1, "{label}: no re-score");
+    }
+    // The finite start above it is still demoted, on its own figure and without the
+    // re-score sentence.
+    let (a, _) = case(&im1, healthy, 66.022863, healthy, 0.0);
+    assert!(!a.converged, "{:?}", a.warnings);
+    assert!(
+        !tagged(&a)[0].contains("failed outright"),
+        "{:?}",
+        a.warnings
     );
 }
