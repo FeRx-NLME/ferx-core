@@ -9065,6 +9065,22 @@ pub struct FitOptions {
     /// Ignored under [`ScaleAdaptation::Interval`], which has no per-iteration
     /// step to skip.
     pub saem_scale_deadband: Option<(f64, f64)>,
+    /// Mini-batch (incremental) SAEM (#2607), set via `[fit_options]
+    /// batch_fraction = α`, `α ∈ (0, 1]`. Each iteration the E-step (block,
+    /// componentwise, HMC and κ kernels) runs on a uniformly drawn subset of
+    /// `⌈α·N⌉` subjects; the others keep their η — and so their stored
+    /// per-subject sufficient statistic — which every Ω, θ and σ update still
+    /// sums over all N (Kuhn, Matias & Rebafka 2020). The θ/σ M-step is
+    /// unchanged: it re-maximises over all N at the current η, stale draws
+    /// included.
+    ///
+    /// Default `1.0` draws no batch and is bit-identical to full-batch SAEM.
+    /// Opt-in only: a smaller α cuts the per-iteration E-step cost by about
+    /// `1 − α`, but each iteration also moves fewer chains, so reaching the
+    /// full-batch precision generally needs more iterations — see the SAEM
+    /// docs page for the measured trade-off. A programmatic value outside
+    /// `(0, 1]` is rejected by `run_saem`.
+    pub saem_batch_fraction: f64,
     /// Optional exploration-phase cap on the stochastic-approximation step for
     /// the **numerical θ/σ M-step** (issue #1011); `None` uses the model-keyed
     /// default of `estimation::saem::default_mstep_damping`: `1.0` — **off** —
@@ -9771,6 +9787,7 @@ impl Default for FitOptions {
             saem_adapt_interval: 50,
             saem_scale_adaptation: ScaleAdaptation::default(),
             saem_scale_deadband: Some(DEFAULT_SCALE_DEADBAND),
+            saem_batch_fraction: 1.0,
             saem_mstep_damping: None,
             saem_mstep_solver: SaemMstepSolver::default(),
             saem_mstep_draws: 1,
@@ -11246,6 +11263,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_scale_adaptation",
             "scale_deadband",
             "saem_scale_deadband",
+            "batch_fraction",
+            "saem_batch_fraction",
             "mstep_damping",
             "saem_mstep_damping",
             "mstep_solver",

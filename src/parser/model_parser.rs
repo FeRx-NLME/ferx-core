@@ -12059,6 +12059,16 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "scale_deadband" | "saem_scale_deadband" => {
             opts.saem_scale_deadband = parse_scale_deadband(key, value)?;
         }
+        "batch_fraction" | "saem_batch_fraction" => {
+            let v = parse_f64(key)?;
+            if !(v > 0.0 && v <= 1.0) {
+                return Err(format!(
+                    "fit option `{key}` must be in (0, 1] — the fraction of subjects whose SAEM \
+                     E-step runs each iteration (1 = every subject, the default); got {value}"
+                ));
+            }
+            opts.saem_batch_fraction = v;
+        }
         "mstep_damping" | "saem_mstep_damping" => {
             let v = parse_f64(key)?;
             // `1.0` is the documented "off" value (the pre-#1011 assignment), so

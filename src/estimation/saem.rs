@@ -3967,6 +3967,70 @@ pub(crate) fn componentwise_sweeps(n_mh_steps: usize, n_eta: usize) -> usize {
     }
 }
 
+/// Validate [`FitOptions::saem_batch_fraction`] for a run (#2607).
+///
+/// `FitOptions` is public, so a fraction built in Rust has not been through the
+/// parser's `(0, 1]` check. Anything outside that range — or non-finite — is a
+/// caller error rather than something to silently clamp: a fraction of `0`
+/// would run no E-step at all, and `NaN` has no meaning as a batch size.
+pub(crate) fn validate_batch_fraction(fraction: f64) -> Result<f64, String> {
+    if fraction.is_finite() && fraction > 0.0 && fraction <= 1.0 {
+        Ok(fraction)
+    } else {
+        Err(format!(
+            "SAEM: `batch_fraction` = {fraction} is outside (0, 1]. It is the fraction of \
+             subjects whose E-step runs each iteration; 1 (the default) runs every subject."
+        ))
+    }
+}
+
+/// Subjects in one iteration's mini-batch, `⌈α·N⌉` of them (at least one).
+pub(crate) fn batch_size(n_subjects: usize, fraction: f64) -> usize {
+    ((fraction * n_subjects as f64).ceil() as usize).clamp(1, n_subjects.max(1))
+}
+
+/// Mini-batch membership for SAEM iteration `k` (#2607), or `None` when every
+/// subject runs its E-step.
+///
+/// `None` whenever the batch would be the whole population — which includes
+/// the default `α = 1` — so the full-batch run takes **no** extra RNG draw and
+/// no extra branch, and stays bit-identical to the pre-#2607 loop.
+///
+/// The subset is a uniform draw without replacement of [`batch_size`]
+/// subjects (partial Fisher–Yates), seeded from `(master_seed, k)` alone: it is
+/// reproducible at a fixed seed and independent of the thread count, the same
+/// guarantee the per-subject MH RNGs give. The seed is mixed with a constant
+/// so the stream cannot coincide with any per-subject stream
+/// (`master_seed + 100_000·k + i`, `… + 999_999`).
+pub(crate) fn saem_batch_mask(
+    n_subjects: usize,
+    fraction: f64,
+    master_seed: u64,
+    k: usize,
+) -> Option<Vec<bool>> {
+    let m = batch_size(n_subjects, fraction);
+    if m >= n_subjects {
+        return None;
+    }
+    let mut rng = StdRng::seed_from_u64(
+        (master_seed ^ 0x9E37_79B9_7F4A_7C15).wrapping_add((k as u64).wrapping_mul(0x2545_F491)),
+    );
+    let mut idx: Vec<usize> = (0..n_subjects).collect();
+    let mut mask = vec![false; n_subjects];
+    for j in 0..m {
+        let r = rng.random_range(j..n_subjects);
+        idx.swap(j, r);
+        mask[idx[j]] = true;
+    }
+    Some(mask)
+}
+
+/// Whether subject `i` runs its E-step this iteration under `batch`.
+#[inline]
+fn in_batch(batch: Option<&[bool]>, i: usize) -> bool {
+    batch.is_none_or(|m| m[i])
+}
+
 // ---------------------------------------------------------------------------
 // Main SAEM loop
 // ---------------------------------------------------------------------------
@@ -4053,12 +4117,27 @@ pub fn run_saem(
 
     // Master RNG
     let master_seed = options.saem_seed.unwrap_or(12345);
+    // Mini-batch E-step (#2607): the fraction of subjects whose MH chain moves
+    // each iteration. The rest keep their η — and therefore their stored
+    // per-subject sufficient statistic — so every population statistic below is
+    // still summed over all N, which is the Kuhn, Matias & Rebafka (2020)
+    // scheme. `1.0` (default) never draws a batch; see `saem_batch_mask`.
+    let batch_fraction = validate_batch_fraction(options.saem_batch_fraction)?;
+    let batching = batch_size(n_subjects, batch_fraction) < n_subjects;
 
     if verbose {
         eprintln!(
             "SAEM: {} subjects, {} ETAs, {} total iter ({} explore + {} converge)",
             n_subjects, n_eta, n_iter, k1, k2
         );
+        if batching {
+            eprintln!(
+                "SAEM: mini-batch E-step, {} of {} subjects per iteration (batch_fraction = {})",
+                batch_size(n_subjects, batch_fraction),
+                n_subjects,
+                batch_fraction
+            );
+        }
         // The block count is data-derived unless the caller pinned it, so say
         // which of the two a run is using — otherwise a reader cannot tell the
         // resolved count from a coincidence.
@@ -4998,6 +5077,13 @@ pub fn run_saem(
             break;
         }
         let gamma = if k <= k1 { 1.0 } else { 1.0 / (k - k1) as f64 };
+        // This iteration's mini-batch (#2607); `None` = every subject.
+        let batch: Option<Vec<bool>> = if batching {
+            saem_batch_mask(n_subjects, batch_fraction, master_seed, k)
+        } else {
+            None
+        };
+        let batch_ref: Option<&[bool]> = batch.as_deref();
         // Damped SA step for the Ω sufficient statistic during exploration only.
         // With the full γ=1 used for θ, an undamped Ω would be overwritten each
         // exploration iteration by a single (warm-started, not-yet-equilibrated)
@@ -5168,6 +5254,23 @@ pub fn run_saem(
                 .map_init(
                     MhScratch::default,
                     |mh_scratch, (i, ((((eta, &nll), &scale), cw_sc_i), kappas_i))| {
+                        // Outside the mini-batch (#2607): the chain does not move.
+                        // η, its cached NLL and (for a mixture) its drawn class
+                        // are carried over unchanged, with no proposal counted —
+                        // so its stored contribution to every population
+                        // statistic is exactly its previous one.
+                        if !in_batch(batch_ref, i) {
+                            return (
+                                eta.clone(),
+                                nll,
+                                0,
+                                0,
+                                vec![0; n_eta],
+                                0,
+                                false,
+                                mix_ref.map_or(0, |m| m.classes[i]),
+                            );
+                        }
                         let subject = &population.subjects[i];
                         let mut rng = StdRng::seed_from_u64(
                             master_seed
@@ -5356,11 +5459,17 @@ pub fn run_saem(
                 state.nll_cache[i] = nll_new;
                 state.accept_counts[i] += n_acc;
                 state.proposal_counts[i] += n_prop;
+                // A subject outside this iteration's mini-batch ran no kernel
+                // (#2607): it must not count componentwise proposals, and must
+                // not take a Robbins-Monro step from a rate it never produced.
+                let ran = in_batch(batch_ref, i);
                 // Accumulate per-eta CW acceptance counts
                 let cw_acc_i: usize = per_eta_acc_cw.iter().sum();
-                for j in 0..n_eta {
-                    state.cw_accept_counts[i][j] += per_eta_acc_cw[j];
-                    state.cw_proposal_counts[i][j] += n_cw_sweeps;
+                if ran {
+                    for j in 0..n_eta {
+                        state.cw_accept_counts[i][j] += per_eta_acc_cw[j];
+                        state.cw_proposal_counts[i][j] += n_cw_sweeps;
+                    }
                 }
                 hmc_subjects[i] |= used_hmc;
                 // ---- Robbins-Monro step-scale adaptation (#1444, opt-in) ----
@@ -5369,7 +5478,7 @@ pub fn run_saem(
                 // a fixed factor applied eight times a run. The counters above
                 // are still maintained under this rule: the interval block
                 // below resets them, and the trace reads them.
-                if rm_scale_adaptation {
+                if rm_scale_adaptation && ran {
                     if n_prop > 0 || (n_cw_sweeps > 0 && !per_eta_acc_cw.is_empty()) {
                         first_scale_adapt.get_or_insert(k);
                     }
@@ -5479,6 +5588,10 @@ pub fn run_saem(
                 let updates: Vec<(Vec<Vec<f64>>, f64, usize, usize)> = (0..n_subjects)
                     .into_par_iter()
                     .map(|i| {
+                        // Outside the mini-batch (#2607) κ stays put, like η.
+                        if !in_batch(batch_ref, i) {
+                            return (st.kappas[i].clone(), st.nll_cache[i], 0, 0);
+                        }
                         let mut kappas_i = st.kappas[i].clone();
                         let subject = &population.subjects[i];
                         // Mixture (#985): κ must be sampled inside the subject's drawn
@@ -6355,12 +6468,17 @@ pub fn run_saem(
                 // proposals) are not scaled by the HMC denominator of 1.
                 let total_proposals = state.proposal_counts[i].max(1);
                 let rate = state.accept_counts[i] as f64 / total_proposals as f64;
+                // Under a mini-batch (#2607) a subject can go a whole interval
+                // without being drawn; its "rate" is then 0/0, not a measured
+                // 0%, and must not shrink its scales. Gated on `batching` so the
+                // full-batch run is untouched.
+                let block_seen = !batching || state.proposal_counts[i] > 0;
                 // Under the Robbins-Monro rule this scale is already stepped
                 // every iteration; applying the multiplicative bump on top would
                 // be a second, coarser controller fighting the first. The
                 // counters are still *reset* here under either rule, because the
                 // per-iteration trace reads them.
-                if !rm_scale_adaptation {
+                if !rm_scale_adaptation && block_seen {
                     first_scale_adapt.get_or_insert(k);
                     state.step_scales[i] = interval_scale_update(
                         state.step_scales[i],
@@ -6385,7 +6503,8 @@ pub fn run_saem(
                         let cw_total = state.cw_proposal_counts[i][j].max(1);
                         let cw_rate = state.cw_accept_counts[i][j] as f64 / cw_total as f64;
                         // Same split as the block scale above.
-                        if !rm_scale_adaptation {
+                        if !rm_scale_adaptation && (!batching || state.cw_proposal_counts[i][j] > 0)
+                        {
                             state.cw_step_scales[i][j] = interval_scale_update(
                                 state.cw_step_scales[i][j],
                                 cw_rate,
@@ -6402,7 +6521,9 @@ pub fn run_saem(
                 if n_kappa > 0 {
                     let kappa_total = state.kappa_proposal_counts[i].max(1);
                     let kappa_rate = state.kappa_accept_counts[i] as f64 / kappa_total as f64;
-                    if kappa_rate > 0.40 {
+                    if batching && state.kappa_proposal_counts[i] == 0 {
+                        // Not drawn this interval (#2607): no rate to act on.
+                    } else if kappa_rate > 0.40 {
                         state.kappa_step_scales[i] = (state.kappa_step_scales[i] * 1.1).min(5.0);
                     } else {
                         state.kappa_step_scales[i] = (state.kappa_step_scales[i] * 0.9).max(0.01);
@@ -12679,3 +12800,7 @@ mod mstep_sa_tests;
 #[cfg(test)]
 #[path = "saem_sigma_release_tests.rs"]
 mod sigma_release_tests;
+
+#[cfg(test)]
+#[path = "saem_minibatch_tests.rs"]
+mod minibatch_tests;
