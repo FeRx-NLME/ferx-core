@@ -28,7 +28,8 @@
 //!
 //! Escape hatches:
 //!
-//! 1. an `assert!` / `debug_assert!` / `prop_assert!` that DOMINATES the fold
+//! 1. an `assert!` / `prop_assert!` (not `debug_assert!`, which release-derived
+//!    test profiles compile out) that DOMINATES the fold
 //!    (an earlier statement of the fold's block or an enclosing one, with the
 //!    value not written or rebound in between — see [`Scope`]) and whose
 //!    condition guarantees the folded value finite. Only positive conjuncts
@@ -114,10 +115,18 @@ struct Fact {
 /// rebound in this scope (a `let`, a closure parameter, a `for`/`match`/`if let`
 /// pattern) or that a loop body mutates, so facts from OUTER scopes about them
 /// do not apply here.
+///
+/// `bound` names the locals this scope binds (by `let` or a pattern), and
+/// `ints` the subset visibly declared as integers. An integer exemption is a
+/// lookup through these, innermost first, so `{ let worst = 0usize; }` makes
+/// `worst` an integer inside that block only — never the float `worst` outside
+/// it, before it or after it (review 3).
 #[derive(Default)]
 struct Scope {
     facts: Vec<Fact>,
     masked: BTreeSet<String>,
+    bound: BTreeSet<String>,
+    ints: BTreeSet<String>,
 }
 
 /// What the escape-hatch and integer checks need to know about the enclosing fn.
@@ -125,8 +134,6 @@ struct Scope {
 struct FnCtx {
     /// The guard scopes, outermost first; see [`Scope`].
     scopes: Vec<Scope>,
-    /// Locals visibly declared as integers.
-    int_locals: BTreeSet<String>,
 }
 
 impl FnCtx {
@@ -150,44 +157,32 @@ impl FnCtx {
         }
     }
 
-    /// A local was rebound by a `let` in the innermost scope.
-    fn shadow(&mut self, names: BTreeSet<String>) {
+    /// A local was rebound by a `let` in the innermost scope; `int` when the
+    /// `let` visibly declares an integer.
+    fn shadow(&mut self, names: BTreeSet<String>, int: bool) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.facts.retain(|f| f.roots.is_disjoint(&names));
+            for n in &names {
+                scope.ints.remove(n);
+                if int {
+                    scope.ints.insert(n.clone());
+                }
+            }
+            scope.bound.extend(names.iter().cloned());
             scope.masked.extend(names);
         }
     }
-}
 
-impl FnCtx {
-    fn scan(block: &syn::Block) -> Self {
-        struct Scan(FnCtx);
-        impl<'ast> Visit<'ast> for Scan {
-            fn visit_local(&mut self, local: &'ast syn::Local) {
-                let (name, ty) = match &local.pat {
-                    syn::Pat::Ident(p) => (Some(p.ident.to_string()), None),
-                    syn::Pat::Type(pt) => match &*pt.pat {
-                        syn::Pat::Ident(p) => (Some(p.ident.to_string()), Some(&*pt.ty)),
-                        _ => (None, None),
-                    },
-                    _ => (None, None),
-                };
-                if let Some(name) = name {
-                    let int_ty = ty.is_some_and(type_is_int);
-                    let int_init = local
-                        .init
-                        .as_ref()
-                        .is_some_and(|i| expr_is_int(&i.expr, &BTreeSet::new()));
-                    if int_ty || int_init {
-                        self.0.int_locals.insert(name);
-                    }
-                }
-                visit::visit_local(self, local);
+    /// Is the local `name`, as resolved at this point, an integer? The
+    /// innermost scope that binds it decides; a name no scope binds (a fn
+    /// parameter, a static) is not known to be one.
+    fn is_int_local(&self, name: &str) -> bool {
+        for scope in self.scopes.iter().rev() {
+            if scope.bound.contains(name) {
+                return scope.ints.contains(name);
             }
         }
-        let mut s = Scan(FnCtx::default());
-        s.visit_block(block);
-        s.0
+        false
     }
 }
 
@@ -203,7 +198,7 @@ fn type_is_int(ty: &syn::Type) -> bool {
 }
 
 /// Is `e` visibly an integer, so it can never be `NaN`?
-fn expr_is_int(e: &Expr, int_locals: &BTreeSet<String>) -> bool {
+fn expr_is_int(e: &Expr, int_locals: &dyn Fn(&str) -> bool) -> bool {
     match e {
         Expr::Lit(l) => matches!(l.lit, syn::Lit::Int(_)),
         Expr::Paren(p) => expr_is_int(&p.expr, int_locals),
@@ -220,7 +215,7 @@ fn expr_is_int(e: &Expr, int_locals: &BTreeSet<String>) -> bool {
         }
         Expr::Path(p) => {
             if let Some(i) = p.path.get_ident() {
-                return int_locals.contains(&i.to_string());
+                return int_locals(&i.to_string());
             }
             // `usize::MAX`, `i64::MIN`.
             p.path
@@ -235,8 +230,10 @@ fn expr_is_int(e: &Expr, int_locals: &BTreeSet<String>) -> bool {
 
 /// The facts an `assert!`-shaped statement establishes, if it is one.
 ///
-/// `assert!` / `debug_assert!` / `prop_assert!` only: their first argument is
-/// a boolean the test fails on. `assert_eq!(x.is_finite(), false)` and friends
+/// `assert!` / `prop_assert!` only: their first argument is a boolean the test
+/// fails on. NOT `debug_assert!`: the nightly `ci-test` / `ci-fast` profiles
+/// inherit `release`, where it compiles to nothing, so the NaN it claims to
+/// catch is swallowed exactly there (review 3). `assert_eq!(x.is_finite(), false)` and friends
 /// guarantee nothing, so they do not count.
 fn assert_facts(m: &syn::Macro) -> Vec<Fact> {
     let name = m
@@ -246,7 +243,7 @@ fn assert_facts(m: &syn::Macro) -> Vec<Fact> {
         .map(|s| s.ident.to_string())
         .unwrap_or_default();
     let mut out = Vec::new();
-    if matches!(name.as_str(), "assert" | "debug_assert" | "prop_assert") {
+    if matches!(name.as_str(), "assert" | "prop_assert") {
         if let Ok(args) = m.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
             if let Some(cond) = args.first() {
                 collect_finite(cond, &mut out);
@@ -335,6 +332,16 @@ fn place_root(e: &Expr) -> Option<String> {
     }
 }
 
+/// The local behind an argument that is a place passed as-is (`e`, `s.x`,
+/// `v[i]`) — not `*e` or `&e`.
+fn bare_place_root(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Path(_) | Expr::Field(_) | Expr::Index(_) => place_root(e),
+        Expr::Paren(p) => bare_place_root(&p.expr),
+        _ => None,
+    }
+}
+
 /// Methods that do not mutate a place they are called on directly. Any other
 /// method called on a local counts as a write to it — conservative, since a
 /// missed write would let a stale fact excuse a fold.
@@ -376,8 +383,11 @@ const READ_ONLY_METHODS: &[&str] = &[
 ];
 
 /// Every local a statement (at any depth) writes: assignment and compound
-/// assignment targets, `&mut x` borrows, and the receiver of any method call
-/// not in [`READ_ONLY_METHODS`].
+/// assignment targets, `&mut x` borrows, the receiver of any method call not in
+/// [`READ_ONLY_METHODS`], and any local passed BARE as an argument to a function
+/// or to such a method — it may itself be a `&mut` (`overwrite(e)` with
+/// `e: &mut f64`, review 3). `f(*e)` and `f(&e)` pass a copy or a shared borrow
+/// and are not writes.
 fn mutated_roots<'a>(visit_fn: impl FnOnce(&mut dyn Visit<'a>)) -> BTreeSet<String> {
     struct M(BTreeSet<String>);
     impl<'ast> Visit<'ast> for M {
@@ -403,7 +413,9 @@ fn mutated_roots<'a>(visit_fn: impl FnOnce(&mut dyn Visit<'a>)) -> BTreeSet<Stri
                     if !READ_ONLY_METHODS.contains(&m.method.to_string().as_str()) =>
                 {
                     self.0.extend(place_root(&m.receiver));
+                    self.0.extend(m.args.iter().filter_map(bare_place_root));
                 }
+                Expr::Call(c) => self.0.extend(c.args.iter().filter_map(bare_place_root)),
                 _ => {}
             }
             visit::visit_expr(self, e);
@@ -447,6 +459,21 @@ fn pat_ident(p: &syn::Pat) -> Option<String> {
         syn::Pat::Type(t) => pat_ident(&t.pat),
         _ => None,
     }
+}
+
+/// Does this `let` visibly declare an integer — `let n: usize = …`, or an
+/// integer-valued initialiser (`0`, `v.len()`, `x as u32`, another int local)?
+fn local_is_int(local: &syn::Local, int_locals: &dyn Fn(&str) -> bool) -> bool {
+    let ty = match &local.pat {
+        syn::Pat::Type(pt) if matches!(&*pt.pat, syn::Pat::Ident(_)) => Some(&*pt.ty),
+        syn::Pat::Ident(_) => None,
+        _ => return false,
+    };
+    ty.is_some_and(type_is_int)
+        || local
+            .init
+            .as_ref()
+            .is_some_and(|i| expr_is_int(&i.expr, int_locals))
 }
 
 /// Identifiers bound by `let` patterns in an `if`/`while` condition.
@@ -909,11 +936,9 @@ impl Linter<'_> {
         }
     }
 
-    fn int_locals(&self) -> BTreeSet<String> {
-        self.ctx
-            .last()
-            .map(|c| c.int_locals.clone())
-            .unwrap_or_default()
+    /// Is `name` an integer local at this point of the walk?
+    fn is_int_local(&self, name: &str) -> bool {
+        self.ctx.last().is_some_and(|c| c.is_int_local(name))
     }
 
     fn report(&mut self, whole: &dyn Spanned, at_line: usize, shape: &str, guard: Guard) {
@@ -976,7 +1001,7 @@ impl Linter<'_> {
         if operands.is_empty() || (!call_form && place_key(cur) != lhs) {
             return;
         }
-        let ints = self.int_locals();
+        let ints = |n: &str| self.is_int_local(n);
         if expr_is_int(&a.left, &ints) || operands.iter().all(|o| expr_is_int(o, &ints)) {
             return;
         }
@@ -994,7 +1019,7 @@ impl Linter<'_> {
         if !reducer_swallows_nan(reducer) {
             return;
         }
-        if init.is_some_and(|i| expr_is_int(i, &self.int_locals())) {
+        if init.is_some_and(|i| expr_is_int(i, &|n| self.is_int_local(n))) {
             return;
         }
         let line = m.method.span().start().line;
@@ -1011,21 +1036,14 @@ impl Linter<'_> {
         t
     }
 
-    /// Production fns are walked (a `#[cfg(test)]` item may nest inside one)
-    /// but never reported on, so only a test fn pays for the guard scan.
-    fn scan_if_test(&self, block: &syn::Block) -> FnCtx {
-        if self.in_test() {
-            FnCtx::scan(block)
-        } else {
-            FnCtx::default()
-        }
-    }
-
-    fn push_scope(&mut self, masked: BTreeSet<String>) {
+    /// A scope that masks outer facts about `masked` and binds `bound` (with
+    /// no type known, so not as integers).
+    fn push_scope(&mut self, masked: BTreeSet<String>, bound: BTreeSet<String>) {
         if let Some(ctx) = self.ctx.last_mut() {
             ctx.scopes.push(Scope {
-                facts: Vec::new(),
                 masked,
+                bound,
+                ..Scope::default()
             });
         }
     }
@@ -1043,7 +1061,8 @@ impl Linter<'_> {
         ctx.invalidate(&mutated_roots(|v| v.visit_stmt(stmt)));
         let mac = match stmt {
             syn::Stmt::Local(l) => {
-                ctx.shadow(pat_bindings(&l.pat));
+                let int = local_is_int(l, &|n| ctx.is_int_local(n));
+                ctx.shadow(pat_bindings(&l.pat), int);
                 None
             }
             syn::Stmt::Macro(m) => Some(&m.mac),
@@ -1081,8 +1100,7 @@ impl<'ast> Visit<'ast> for Linter<'_> {
 
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         let t = self.enter(i.sig.ident.to_string(), &i.attrs);
-        let scanned = self.scan_if_test(&i.block);
-        self.ctx.push(scanned);
+        self.ctx.push(FnCtx::default());
         visit::visit_item_fn(self, i);
         self.ctx.pop();
         self.leave(t);
@@ -1090,8 +1108,7 @@ impl<'ast> Visit<'ast> for Linter<'_> {
 
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         let t = self.enter(i.sig.ident.to_string(), &i.attrs);
-        let scanned = self.scan_if_test(&i.block);
-        self.ctx.push(scanned);
+        self.ctx.push(FnCtx::default());
         visit::visit_impl_item_fn(self, i);
         self.ctx.pop();
         self.leave(t);
@@ -1099,12 +1116,7 @@ impl<'ast> Visit<'ast> for Linter<'_> {
 
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
         let t = self.enter(i.sig.ident.to_string(), &i.attrs);
-        let scanned = i
-            .default
-            .as_ref()
-            .map(|b| self.scan_if_test(b))
-            .unwrap_or_default();
-        self.ctx.push(scanned);
+        self.ctx.push(FnCtx::default());
         visit::visit_trait_item_fn(self, i);
         self.ctx.pop();
         self.leave(t);
@@ -1117,7 +1129,7 @@ impl<'ast> Visit<'ast> for Linter<'_> {
         if !self.in_test() || self.ctx.is_empty() {
             return visit::visit_block(self, b);
         }
-        self.push_scope(BTreeSet::new());
+        self.push_scope(BTreeSet::new(), BTreeSet::new());
         for stmt in &b.stmts {
             self.visit_stmt(stmt);
             self.after_stmt(stmt);
@@ -1126,8 +1138,8 @@ impl<'ast> Visit<'ast> for Linter<'_> {
     }
 
     fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
-        let params = c.inputs.iter().flat_map(pat_bindings).collect();
-        self.push_scope(params);
+        let params: BTreeSet<String> = c.inputs.iter().flat_map(pat_bindings).collect();
+        self.push_scope(params.clone(), params);
         visit::visit_expr_closure(self, c);
         self.pop_scope();
     }
@@ -1136,18 +1148,20 @@ impl<'ast> Visit<'ast> for Linter<'_> {
     /// anything the body writes — or the loop pattern binds — do not hold in it.
     fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
         self.visit_expr(&f.expr);
-        let mut masked = pat_bindings(&f.pat);
+        let bound = pat_bindings(&f.pat);
+        let mut masked = bound.clone();
         masked.extend(mutated_roots(|v| v.visit_block(&f.body)));
-        self.push_scope(masked);
+        self.push_scope(masked, bound);
         self.visit_block(&f.body);
         self.pop_scope();
     }
 
     fn visit_expr_while(&mut self, w: &'ast syn::ExprWhile) {
+        let bound = let_bindings(&w.cond);
         let mut masked = mutated_roots(|v| v.visit_block(&w.body));
-        masked.extend(let_bindings(&w.cond));
+        masked.extend(bound.iter().cloned());
         masked.extend(mutated_roots(|v| v.visit_expr(&w.cond)));
-        self.push_scope(masked);
+        self.push_scope(masked, bound);
         self.visit_expr(&w.cond);
         self.visit_block(&w.body);
         self.pop_scope();
@@ -1155,20 +1169,21 @@ impl<'ast> Visit<'ast> for Linter<'_> {
 
     fn visit_expr_loop(&mut self, l: &'ast syn::ExprLoop) {
         let masked = mutated_roots(|v| v.visit_block(&l.body));
-        self.push_scope(masked);
+        self.push_scope(masked, BTreeSet::new());
         self.visit_block(&l.body);
         self.pop_scope();
     }
 
     fn visit_expr_if(&mut self, i: &'ast syn::ExprIf) {
-        let masked = let_bindings(&i.cond);
-        self.push_scope(masked);
+        let bound = let_bindings(&i.cond);
+        self.push_scope(bound.clone(), bound);
         visit::visit_expr_if(self, i);
         self.pop_scope();
     }
 
     fn visit_arm(&mut self, a: &'ast syn::Arm) {
-        self.push_scope(pat_bindings(&a.pat));
+        let bound = pat_bindings(&a.pat);
+        self.push_scope(bound.clone(), bound);
         visit::visit_arm(self, a);
         self.pop_scope();
     }

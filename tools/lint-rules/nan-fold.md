@@ -48,22 +48,30 @@ Not flagged, because the value cannot be `NaN`: any shape where every operand is
 visibly an integer. That means an integer literal, `.len()`, `.count()`, an
 `as usize` style cast, `usize::MAX`, or a local declared with an integer type or
 integer literal. A `fold` whose initial value is an integer literal also counts.
+A local counts as an integer only where *that* declaration is in scope. A
+`let worst = 0usize` inside a block says nothing about a float `worst` before
+the block, after it, or in a sibling block, and a later float `let`, closure
+parameter or loop pattern of the same name hides it.
 
 ## Escape hatches
 
 1. **Assert the folded value is finite.** Put an `assert!` (or
-   `debug_assert!`, `prop_assert!`) *before* the fold whose condition
+   `prop_assert!`) *before* the fold whose condition
    *guarantees* the value the fold reads. Only positive conjuncts count: in
    `assert!(a.is_finite() && b.is_finite())` both are guaranteed, while
    `!x.is_finite()`, `x.is_finite() || y` and `assert_eq!(x.is_finite(), …)`
-   guarantee nothing.
+   guarantee nothing. `debug_assert!` doesn't count either. The nightly
+   `ci-test` and `ci-fast` profiles inherit `release`, where it compiles to
+   nothing, so the `NaN` it claims to catch is swallowed in exactly those runs.
 
    - **Where it holds.** The assert has to *dominate* the fold. It must be an
      earlier statement of the same block, or of a block that encloses the fold.
      `if check { assert!(e.is_finite()); }` guards nothing after the `if`, and
      an assert after the fold guards nothing. The guarantee is dropped when the
-     value is written: an assignment, `+=`, `&mut e`, or a call of a method that
-     might mutate it, such as `xs.push(…)`. It also lapses inside a loop body
+     value might be written: an assignment, `+=`, `&mut e`, a call of a method
+     that might mutate it, such as `xs.push(…)`, or passing it as-is to a
+     function or such a method (`overwrite(e)`), since it may itself be a
+     `&mut`. `f(*e)` and `f(&e)` are not writes. It also lapses inside a loop body
      that writes the value, because the next iteration runs after the write. It
      doesn't reach code where the name is rebound: a `let e`, a closure
      parameter `|e|`, or a `for e` / `match` / `if let` pattern.

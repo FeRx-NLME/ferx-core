@@ -361,3 +361,67 @@ fn nan_ok_is_lexed_not_searched() {
     let ok = "#[test]\nfn t<'a>(e: &'a f64) {\nw = w.max(*e); // nan-ok: reason\n}\n";
     assert!(findings(ok).is_empty());
 }
+
+/// Review round 3 (#2634).
+#[test]
+fn debug_assert_is_not_a_guard_because_release_profiles_compile_it_out() {
+    let src = t("debug_assert!(err.is_finite()); w = w.max(err);");
+    assert_eq!(findings(&src).len(), 1);
+    let src = t("debug_assert!(xs.iter().all(|e| e.is_finite())); let m = xs.iter().cloned().fold(0.0, f64::max);");
+    assert_eq!(findings(&src).len(), 1);
+    // `assert!` and `prop_assert!` always run.
+    assert!(findings(&t("assert!(err.is_finite()); w = w.max(err);")).is_empty());
+    assert!(findings(&t("prop_assert!(err.is_finite()); w = w.max(err);")).is_empty());
+}
+
+#[test]
+fn passing_a_local_bare_to_a_call_may_write_it() {
+    for body in [
+        // `e: &mut f64` handed on as-is: the callee may write NaN through it.
+        "assert!(e.is_finite()); overwrite(e); w = w.max(*e);",
+        "assert!(s.x.is_finite()); refill(s.x); w = w.max(s.x);",
+        "assert!(e.is_finite()); solver.step(e); w = w.max(*e);",
+        "assert!(xs.iter().all(|e| e.is_finite())); fill(xs); let m = xs.iter().cloned().fold(0.0, f64::max);",
+    ] {
+        assert_eq!(findings(&t(body)).len(), 1, "not flagged although possibly written: {body}");
+    }
+    for body in [
+        // A copy or a shared borrow cannot write the local.
+        "assert!(e.is_finite()); log(*e); w = w.max(*e);",
+        "assert!(e.is_finite()); show(&e); w = w.max(e);",
+        // Arguments of read-only methods are not writes either.
+        "assert!(e.is_finite() && a.is_finite()); let b = a.max(e); w = w.max(e);",
+    ] {
+        assert!(
+            findings(&t(body)).is_empty(),
+            "flagged although not written: {body}"
+        );
+    }
+}
+
+#[test]
+fn integer_locals_are_lexically_scoped() {
+    // The reviewer's case: an inner integer `worst` after the float fold.
+    let src =
+        t("let mut worst = 0.0; worst = worst.max(err); { let worst = 0usize; let _ = worst; }");
+    assert_eq!(findings(&src).len(), 1);
+    // …and before it, in a sibling block.
+    let src =
+        t("{ let worst = 0usize; let _ = worst; } let mut worst = 0.0; worst = worst.max(err);");
+    assert_eq!(findings(&src).len(), 1);
+    // A float rebinding of an integer name.
+    let src = t("let mut n = 0usize; let mut n = 0.0; n = n.max(x);");
+    assert_eq!(findings(&src).len(), 1);
+    // A pattern rebinding hides the outer integer.
+    let src = t("let n = 0usize; for n in floats { w = w.max(n); }");
+    assert_eq!(findings(&src).len(), 1);
+    let src = t("let mut n = 0usize; xs.iter().for_each(|n| { m = m.max(*n); });");
+    assert_eq!(findings(&src).len(), 1);
+    // The integer IS exempt where it is in scope, including nested blocks.
+    let src = t("let mut worst = 0.0; worst = worst.max(e) /* nan-ok: unrelated */; { let mut k = 0usize; k = k.max(v.len()); }");
+    assert_eq!(findings(&src).len(), 1, "only the float fold: {src}");
+    let src = t("let mut k = 0usize; if c { k = k.max(x); }");
+    assert!(findings(&src).is_empty());
+    let src = t("let mut k = 0usize; { let mut j = 0.0; } k = k.max(x);");
+    assert!(findings(&src).is_empty());
+}

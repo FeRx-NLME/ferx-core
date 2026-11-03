@@ -86,8 +86,8 @@ SUITES = {
     # an invocation with `--lib`. `exclude`: the packages the workflow's build args
     # `--exclude`; `run` refuses build args that disagree, so the target set the
     # planner schedules is the one cargo builds.
-    "slow": {"unit": ["--lib", "--bins"], "doc": True, "exclude": ["docs-lint"]},
-    "slow-nn": {"unit": ["--lib"], "exclude": ["docs-lint"]},
+    "slow": {"unit": ["--lib", "--bins"], "doc": True, "exclude": ["docs-lint", "patterns-lint"]},
+    "slow-nn": {"unit": ["--lib"], "exclude": ["docs-lint", "patterns-lint"]},
 }
 TEST_SUITES = ("slow", "slow-nn")  # `run` is plain `cargo test` + a manifest
 # The cargo that `run` invokes; overridable so the guard test can record the calls.
