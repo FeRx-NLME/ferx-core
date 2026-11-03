@@ -3011,9 +3011,16 @@ pub(crate) fn stalled_at_init_warning(result: &FitResult) -> Option<(String, War
     } else {
         "a comparison against the initial estimates (no free THETA, OMEGA or SIGMA moved by 1%)"
     };
+    // A start the optimizer verified to be an optimum never reaches here (#2506:
+    // `stalled_at_init` clears it). Any other start may still have been one — the
+    // verification can be inconclusive or out of budget — so the message must not claim
+    // otherwise.
+    let meaning = "Unless the initial values were already an optimum (a warm start from a \
+                   previous fit's estimates, which this fit could not verify), the reported \
+                   objective is the objective *of the initial values* and says nothing about \
+                   the model";
     let msg = format!(
-        "W_STALLED_AT_INIT: the fit never left its initial estimates, by {basis}. The reported \
-         objective is the objective *of the initial values* and says nothing about the model, \
+        "W_STALLED_AT_INIT: the fit never left its initial estimates, by {basis}. {meaning}, \
          even though `converged` may be true — a fit that never moved has a flat objective \
          trace to plateau on. Unmoved free THETA: {list}. Check the optimizer's own diagnostics \
          (`final_gradient`), try different initial estimates, or a gradient-based \

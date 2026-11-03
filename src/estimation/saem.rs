@@ -6803,6 +6803,7 @@ pub fn run_saem(
         cond_dist,
         packed_estimate: None,
         left_init: None,
+        stationary_start: false,
         mixture_posteriors,
         vi: None,
         start_eval: None,

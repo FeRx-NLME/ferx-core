@@ -422,6 +422,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         profiled_blocks: Vec::new(),
         profiled_levels_at_bound: Vec::new(),
         left_init: None,
+        stationary_start: false,
         omega_is_diagonal: None,
         kappa_is_diagonal: None,
     }
@@ -592,6 +593,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         packed_estimate: None,
         mixture_overrides: None,
         left_init: None,
+        stationary_start: false,
         omega_is_diagonal: Some(true),
         kappa_is_diagonal: None,
     }

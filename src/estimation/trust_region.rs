@@ -1085,6 +1085,7 @@ pub(crate) fn optimize_trust_region_seeded(
         // step bit-for-bit instead of re-decomposing `omega` (#816 follow-up).
         packed_estimate: Some(best_x.clone()),
         left_init: None,
+        stationary_start: false,
         mixture_posteriors: None,
         vi: None,
         start_eval: None,

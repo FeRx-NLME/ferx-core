@@ -152,3 +152,30 @@ fn a_fully_fixed_fit_is_not_a_stall() {
     r.n_parameters = 0;
     assert!(stalled_at_init_warning(&r).is_none());
 }
+
+/// #2506: a start the optimizer verified to be an optimum is a warm start and is not
+/// flagged at all; any other stall may still have started at one (the verification
+/// can be inconclusive, out of budget, or not run by the estimator), so the message
+/// hedges rather than asserting the objective is meaningless.
+#[test]
+fn the_message_hedges_on_a_start_that_was_not_verified() {
+    let mut r = stalled_result();
+    r.left_init = Some(false);
+
+    r.stationary_start = true;
+    assert!(
+        stalled_at_init_warning(&r).is_none(),
+        "a start the optimizer verified is not a stall"
+    );
+
+    for (left, label) in [(Some(false), "unverified"), (None, "natural scale")] {
+        r.left_init = left;
+        r.stationary_start = false;
+        let (msg, _) = stalled_at_init_warning(&r).expect("an unverified stall must warn");
+        assert!(
+            msg.contains("Unless the initial values were already an optimum")
+                && msg.contains("which this fit could not verify"),
+            "{label}: {msg}"
+        );
+    }
+}

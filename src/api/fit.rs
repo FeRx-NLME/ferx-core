@@ -2058,6 +2058,7 @@ fn fit_inner(
                         cond_dist: None,
                         packed_estimate: None,
                         left_init: None,
+                        stationary_start: false,
                         vi: None,
                         start_eval: None,
                         mixture_posteriors: None,
@@ -2154,6 +2155,7 @@ fn fit_inner(
                     cond_dist: None,
                     packed_estimate: None,
                     left_init: None,
+                    stationary_start: false,
                     mixture_posteriors: None,
                     vi: None,
                     start_eval: None,
@@ -2250,11 +2252,23 @@ fn fit_inner(
                 .map_err(EngineError::uncoded)?
             }
             EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
-                crate::estimation::gauss_newton::run_foce_gn(
+                let gn = |p: &ModelParameters, o: &FitOptions| {
+                    crate::estimation::gauss_newton::run_foce_gn(model, population, p, o)
+                };
+                let result = gn(&stage_params, &stage_opts);
+                // #2506: GN publishes no `left_init`, so a run that did not move is
+                // probed. GN reports `n_iterations = maxiter` however early it stopped,
+                // so there is no "rest of the budget" to read: the probe gets a fresh
+                // `outer_maxiter`.
+                crate::estimation::outer_optimizer::verify_unmoved_start(
                     model,
                     population,
                     &stage_params,
                     &stage_opts,
+                    result,
+                    stage_opts.outer_maxiter,
+                    |x, _| crate::estimation::gauss_newton::gn_scale(x, &stage_opts),
+                    gn,
                 )
             }
             EstimationMethod::Imp => {
@@ -3178,6 +3192,7 @@ fn fit_inner(
             .as_ref()
             .and_then(crate::estimation::parameterization::mixture_override_values),
         left_init: result.left_init,
+        stationary_start: result.stationary_start,
         omega_is_diagonal: Some(result.params.omega.diagonal),
         kappa_is_diagonal: result.params.omega_iov.as_ref().map(|m| m.diagonal),
         se_theta,

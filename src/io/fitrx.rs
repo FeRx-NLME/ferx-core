@@ -238,6 +238,11 @@ struct FitWire {
     // estimates against `theta_init` & co.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     left_init: Option<bool>,
+    // Whether a fit that did not leave its start was verified to have started at an
+    // optimum (#2506); absent on older bundles (and whenever false), whose
+    // `stalled_at_init` then reads `left_init` alone, as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stationary_start: bool,
     // The packed Ω / κ layout (#1177); absent on older bundles, which then
     // read their covariance matrix as stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1333,6 +1338,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         theta_init: r.theta_init.clone(),
         omega_init: Some(MatrixWire::from(&r.omega_init)),
         left_init: r.left_init,
+        stationary_start: r.stationary_start,
         omega_is_diagonal: r.omega_is_diagonal,
         kappa_is_diagonal: r.kappa_is_diagonal,
         sigma_init: r.sigma_init.clone(),
@@ -3051,6 +3057,7 @@ fn wire_to_fit_result(
         packed_estimate: w.packed_estimate,
         mixture_overrides: w.mixture_overrides,
         left_init: w.left_init,
+        stationary_start: w.stationary_start,
         omega_is_diagonal: w.omega_is_diagonal,
         kappa_is_diagonal: w.kappa_is_diagonal,
     };

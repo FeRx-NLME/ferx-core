@@ -816,6 +816,35 @@ fn stalled_at_init_with_free_parameters_outside_the_base_masks_defers_to_the_opt
     assert!(v.passed && v.skipped.len() == 1, "{v:?}");
 }
 
+/// #2506: a fit the optimizer says did not move, but whose start it verified to be
+/// an optimum (a restart from a perturbation converged back), is a warm start and
+/// not a stall — it passes the default strictness. Without the verification the
+/// displacement verdict stands, and the verification is read only for a fit that
+/// carries the optimizer's own escape verdict.
+#[test]
+fn stalled_at_init_clears_a_start_the_optimizer_verified() {
+    let mut r = minimal_fit_result();
+    r.theta_init = r.theta.clone();
+    r.omega_init = r.omega.clone();
+    r.sigma_init = r.sigma.clone();
+    r.left_init = Some(false);
+    r.stationary_start = true;
+    assert_eq!(stalled_at_init(&r), Some(false));
+    let v = check_strictness(&r, &Strictness::default());
+    assert!(v.passed, "{v:?}");
+
+    r.stationary_start = false;
+    assert_eq!(stalled_at_init(&r), Some(true));
+    let v = check_strictness(&r, &Strictness::default());
+    assert!(!v.passed, "{v:?}");
+
+    // No optimizer verdict: the natural-scale fallback has no verification to read,
+    // so the flag alone does not clear it.
+    r.left_init = None;
+    r.stationary_start = true;
+    assert_eq!(stalled_at_init(&r), Some(true));
+}
+
 /// The optimizer's `INIT_ESCAPE_STEP_S` test runs in its scaled packed space,
 /// where a log-packed coordinate is normalised by |ln θ₀|, so its 1 % and the
 /// natural-scale 1 % disagree on borderline fits (V₀ = 100 → 103: a stall to

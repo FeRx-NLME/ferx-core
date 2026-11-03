@@ -48,6 +48,17 @@ pub(crate) const GN_ZERO_ETA_NONCONVERGENCE_WARNING: &str =
      (n_eta = 0). BHHH curvature is unreliable far from the optimum in \
      this regime, so the result may be badly wrong, not just imprecise.";
 
+/// The scale vector GN's linear system and trust radius work in, from the clamped packed
+/// start `x`; `x` itself stays unscaled. Also the space the #2506 start probe measures
+/// movement in (`outer_optimizer::verify_unmoved_start`).
+pub(crate) fn gn_scale(x: &[f64], options: &FitOptions) -> Vec<f64> {
+    if options.scale_params {
+        compute_scale(x)
+    } else {
+        vec![1.0; x.len()]
+    }
+}
+
 /// Run FOCE estimation using a Gauss-Newton optimizer.
 ///
 /// Returns the same `OuterResult` as `optimize_population`.
@@ -77,11 +88,7 @@ pub fn run_foce_gn(
     // Scaling: computed once from initial x; x itself stays in real packed space
     // throughout the GN loop. Scaling only affects the linear system solve so
     // the Hessian is better conditioned when log-space values differ in magnitude.
-    let gn_scale: Vec<f64> = if options.scale_params {
-        compute_scale(&x)
-    } else {
-        vec![1.0; n_packed]
-    };
+    let gn_scale = gn_scale(&x, options);
 
     let mut warnings = Vec::new();
 
@@ -579,6 +586,7 @@ pub fn run_foce_gn(
             // covariance instead of re-decomposing `omega` (#816 follow-up).
             packed_estimate: Some(x.clone()),
             left_init: None,
+            stationary_start: false,
             mixture_posteriors: None,
             vi: None,
             start_eval: None,
@@ -756,6 +764,7 @@ pub fn run_foce_gn(
         // reused by `run_covariance` for a bit-for-bit covariance (#816 follow-up).
         packed_estimate: Some(final_packed),
         left_init: None,
+        stationary_start: false,
         mixture_posteriors: None,
         vi: None,
         start_eval: None,

@@ -231,6 +231,57 @@ optimizer concluded. The check is deliberately all-or-nothing — it fires only 
 per-parameter version would be worse than useless: an initial estimate close to the truth is one a good
 optimizer is supposed to leave alone, so a ratio test fires hardest on the arm that is right.
 
+### A warm start at an optimum {#warm-start-at-an-optimum}
+
+A fit started at a previous fit's final estimates (a bootstrap sample, a refit of a search
+winner, a model written back out with its estimates as initial values) has nowhere to go, so
+it does not move either. Displacement alone cannot tell that from a stall, and before
+[#2506](https://github.com/FeRx-NLME/ferx-core/issues/2506) such a refit came back at the same OFV with
+`W_STALLED_AT_INIT` and, on L-BFGS and BOBYQA alike, `converged = false`.
+
+When the NLopt outer loop ends without leaving its start, it now asks the optimizer whether
+the start is an optimum: it **restarts from a perturbation of the start** (every free
+coordinate moved by 0.1 in the optimizer's scaled space, alternating in sign and turned
+around at a bound; a tight box may shorten a coordinate's move, and the restart runs
+as long as some coordinate moves at least 0.01) on what is left of the fit's `maxiter` budget, and compares where that
+restart ends with the objective at the start.
+
+- **It converges back**, to within 0.01 OFV (about ten times the largest gap measured on
+  warm refits, 1.1e-3 under Gauss–Newton): the start was an optimum, and **the restart's result is what is
+  reported** — its estimates, objective, `converged` verdict and warnings, as for any fit.
+  Nothing of the run that did not move is carried over, so every check that run would
+  have failed (the plateau rule, the EBE start-dependence check, the objective gate) is
+  asked again of the restart and answered on its own merits. The estimates differ from the
+  warm start by the optimizer's tolerance. While they are still within the escape step of
+  the start, `FitResult::stationary_start` is `true` and no `stalled_at_init` warning is
+  raised, so `Strictness::default()` passes a converged restart. Measured on warm refits of
+  `two_cpt_iv` (L-BFGS, BOBYQA, AGQ) and a two-class mixture, the restart ends within
+  `1e-5` OFV of the start (Linux).
+- **It finds a lower objective**, by more than 0.01: the start was a stall, and it is
+  **reported as one**: the run that did not move, with `W_STALLED_AT_INIT`, so a bootstrap
+  drops the sample and `Strictness::default()` fails it, however far the restart got. A
+  warning names the lower objective the restart reached, so you know better estimates are
+  within reach; refit from different initial estimates. A stop the optimizer reported as
+  a success (BOBYQA can meet its `xtol` at the start) is treated the same way. On L-BFGS
+  the retry for a stall at the start (identity-Hessian cap held on) still runs afterwards.
+- **Anything else** (it did not converge, or converged higher, in another basin; no budget
+  was left): no verdict. The fit is judged by displacement as before, and its warning says
+  the start *may* have been an optimum rather than asserting it was not.
+
+Because the question is answered by the optimizer itself, bounds, flat directions and
+saddles are handled the way every fit handles them, and the check covers any model and
+objective, AGQ and mixtures included. It costs one extra optimization from near the start,
+paid only by a fit that did not move.
+
+The other FOCE-family outer optimizers run the same restart: the built-in `bfgs` / `lbfgs`
+loops, `trust_region`, and `method = gn` / `gn_hybrid`. Their movement test and
+perturbation are measured in the space each optimizer steps in: the built-in BFGS loops'
+scaled space (`parameter_scaling`), Gauss–Newton's (`scale_params`), and the packed
+(log / Cholesky) space for trust-region, which does not scale. BFGS and trust-region
+restart on what is left of `maxiter`. Gauss–Newton does not count the iterations it used,
+so its restart gets a fresh `maxiter`. Each outcome is reported exactly as on the NLopt
+path. Other estimators (SAEM, IMP, Bayes, VI) do not run it.
+
 ### A THETA on the log-packing floor {#log-packing-floor}
 
 A THETA declared non-negative (`theta CL(1.0, 0.0, 100.0)`) is optimized as `ln θ`, floored at
