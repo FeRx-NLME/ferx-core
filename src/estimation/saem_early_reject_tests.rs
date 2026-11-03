@@ -33,11 +33,14 @@
 //! is a lost speed-up, not a correctness defect, and the A/Bs are not built to see
 //! it.
 
-use super::{mh_early_rejects, mh_steps, mh_steps_componentwise, MhScratch};
+use super::{
+    early_reject_hooks, mh_early_rejects, mh_steps, mh_steps_componentwise, run_saem, MhGate,
+    MhScratch,
+};
 use crate::parser::model_parser::parse_model_string;
 use crate::stats::likelihood::{
     gaussian_row_term_lower_bound, individual_nll, individual_nll_prepared,
-    prepared_data_term_lower_bound, quad_form, DataTermLowerBound,
+    prepared_data_term_lower_bound, quad_form, DataTermLowerBound, PropLoading,
 };
 use crate::stats::residual_error::guard_variance;
 use crate::types::*;
@@ -203,6 +206,9 @@ fn run_chain_scaled(
 /// The A/B every kernel test runs: the gate must change no bit of the chain, and
 /// must have fired on at least `min_share` of all proposals (55 per subject).
 fn assert_gate_is_bit_identical(model: &CompiledModel, min_share: f64) {
+    let _shared = early_reject_hooks::LOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let pop = sparse_population(16);
     let mut fired = 0usize;
     let mut total = 0usize;
@@ -248,46 +254,127 @@ fn early_rejection_is_bit_identical_under_combined_error() {
 
 // ─── The bounds ───────────────────────────────────────────────────────────
 
-/// The scored term at prediction `f`, written the way the scoring loop scores it.
-fn row_term(y: f64, f: f64, a: f64, b: f64) -> f64 {
-    let v = guard_variance(f * f * b + a);
-    (y - f) * (y - f) / v + v.ln()
+/// One residual row: an observation, its additive and proportional SDs (either may
+/// be absent), and — for the `#484` magnitude path — the `(additive, proportional)`
+/// magnitude multipliers. `mult: None` is the bare-σ path.
+#[derive(Clone, Copy, Debug)]
+struct Row {
+    y: f64,
+    sd_add: Option<f64>,
+    sd_prop: Option<f64>,
+    mult: Option<(f64, f64)>,
 }
 
-/// Brute-force minimum over a grid that covers both signs, the guarded region near
-/// `f = 0`, and a dense band around `y`.
-fn grid_min(y: f64, a: f64, b: f64) -> f64 {
-    let mut fs = vec![0.0];
-    for e in -320..=40 {
-        let mag = 10f64.powf(e as f64 / 4.0);
-        fs.push(mag);
-        fs.push(-mag);
+const fn row(y: f64, sd_add: Option<f64>, sd_prop: Option<f64>) -> Row {
+    Row {
+        y,
+        sd_add,
+        sd_prop,
+        mult: None,
     }
-    for k in 0..=4000 {
-        let f = y * (k as f64 / 1000.0);
-        fs.push(f);
+}
+
+impl Row {
+    /// The additive variance in the scorer's arithmetic.
+    fn a(&self) -> f64 {
+        match (self.sd_add, self.mult) {
+            (None, _) => 0.0,
+            (Some(s), None) => s * s,
+            (Some(s), Some((m, _))) => m * m * s * s,
+        }
     }
-    fs.iter()
-        .map(|&f| row_term(y, f, a, b))
-        .fold(f64::INFINITY, |m, t| {
-            assert!(!t.is_nan(), "grid term NaN at y={y} a={a} b={b}");
-            m.min(t)
+
+    fn prop(&self) -> Option<PropLoading> {
+        self.sd_prop.map(|s| PropLoading {
+            sigma: s,
+            mult: self.mult.map(|(_, m)| m),
         })
+    }
+
+    fn bound(&self) -> f64 {
+        gaussian_row_term_lower_bound(self.y, self.a(), self.prop())
+    }
+
+    /// The scored term at prediction `f`, written the way the scoring loop scores it
+    /// on each path (`residual_variance` / `loadings_variance_sum`), so the
+    /// brute-force minimum sees the scorer's rounding, not the algebra.
+    fn term(&self, f: f64) -> f64 {
+        let p = match (self.sd_prop, self.mult) {
+            (None, _) => 0.0,
+            (Some(s), None) => {
+                let fs = f * s;
+                fs * fs
+            }
+            (Some(s), Some((_, m))) => {
+                let c = f * m;
+                c * c * s * s
+            }
+        };
+        let raw = match (self.sd_prop.is_some(), self.sd_add.is_some()) {
+            (true, true) => p + self.a(),
+            (true, false) => p,
+            (false, _) => self.a(),
+        };
+        let v = guard_variance(raw);
+        (self.y - f) * (self.y - f) / v + v.ln()
+    }
+
+    /// Brute-force minimum over a grid that covers both signs, the guarded region
+    /// near `f = 0`, and a dense band around `y`.
+    fn grid_min(&self) -> f64 {
+        let y = self.y;
+        let mut fs = vec![0.0];
+        for e in -320..=40 {
+            let mag = 10f64.powf(e as f64 / 4.0);
+            fs.push(mag);
+            fs.push(-mag);
+        }
+        for k in 0..=4000 {
+            fs.push(y * (k as f64 / 1000.0));
+        }
+        fs.iter()
+            .map(|&f| self.term(f))
+            .fold(f64::INFINITY, |m, t| {
+                assert!(!t.is_nan(), "grid term NaN for {self:?}");
+                m.min(t)
+            })
+    }
 }
 
-const ROW_CASES: [(f64, f64, f64); 12] = [
-    (3.0, 0.16, 0.0),
-    (3.0, 0.0, 0.0225),
-    (0.002, 0.0, 0.0225),
-    (450.0, 0.0, 0.09),
-    (-2.0, 0.0, 0.04),
-    (3.0, 0.04, 0.0144),
-    (0.05, 0.04, 0.0144),
-    (800.0, 0.04, 0.0144),
-    (3.0, 1e-30, 0.0144),
-    (1e-3, 1e-14, 1e-14),
-    (0.0, 0.25, 0.01),
-    (7.0, 0.0, 1e-300),
+const ROW_CASES: [Row; 15] = [
+    row(3.0, Some(0.4), None),
+    row(3.0, None, Some(0.15)),
+    row(0.002, None, Some(0.15)),
+    row(450.0, None, Some(0.3)),
+    row(-2.0, None, Some(0.2)),
+    row(3.0, Some(0.2), Some(0.12)),
+    row(0.05, Some(0.2), Some(0.12)),
+    row(800.0, Some(0.2), Some(0.12)),
+    row(3.0, Some(1e-15), Some(0.12)),
+    row(1e-3, Some(1e-7), Some(1e-7)),
+    row(0.0, Some(0.5), Some(0.1)),
+    row(7.0, None, Some(1e-150)),
+    // The #484 magnitude path, including the review-round-2 case: a magnitude whose
+    // square underflows (`1e-200 · 1e-200 = 0`) against a σ that would cancel it
+    // algebraically (`(1e-200 · 1e200)² = 1`). The scorer sees a guarded `0`.
+    Row {
+        y: 3.0,
+        sd_add: Some(1e200),
+        sd_prop: None,
+        mult: Some((1e-200, 1.0)),
+    },
+    Row {
+        y: 3.0,
+        sd_add: Some(1e200),
+        sd_prop: Some(1e200),
+        mult: Some((1e-200, 1e-200)),
+    },
+    Row {
+        y: 3.0,
+        sd_add: Some(0.2),
+        sd_prop: Some(0.1),
+        mult: Some((1.5, 0.7)),
+    },
 ];
 
 /// The bound is a bound: never above the term at any prediction. This is what a
@@ -295,12 +382,12 @@ const ROW_CASES: [(f64, f64, f64); 12] = [
 /// through the kernels, which see a loosening only when it flips a decision.
 #[test]
 fn row_bound_never_exceeds_the_term_it_bounds() {
-    for (y, a, b) in ROW_CASES {
-        let lb = gaussian_row_term_lower_bound(y, a, b);
-        let min = grid_min(y, a, b);
+    for r in ROW_CASES {
+        let lb = r.bound();
+        let min = r.grid_min();
         assert!(
             lb <= min + 1e-12 * min.abs().max(1.0),
-            "y={y} a={a} b={b}: bound {lb} exceeds the grid minimum {min}"
+            "{r:?}: bound {lb} exceeds the grid minimum {min}"
         );
     }
 }
@@ -311,13 +398,18 @@ fn row_bound_never_exceeds_the_term_it_bounds() {
 /// the gate off silently.
 #[test]
 fn row_bound_is_tight() {
-    assert_eq!(gaussian_row_term_lower_bound(3.0, 0.16, 0.0), 0.16f64.ln());
-    for (y, a, b) in [(3.0, 0.0, 0.0225), (450.0, 0.0, 0.09), (3.0, 0.04, 0.0144)] {
-        let lb = gaussian_row_term_lower_bound(y, a, b);
-        let min = grid_min(y, a, b);
+    assert_eq!(row(3.0, Some(0.4), None).bound(), (0.4f64 * 0.4).ln());
+    for r in [
+        row(3.0, None, Some(0.15)),
+        row(450.0, None, Some(0.3)),
+        row(3.0, Some(0.2), Some(0.12)),
+        ROW_CASES[14],
+    ] {
+        let lb = r.bound();
+        let min = r.grid_min();
         assert!(
             min - lb < 0.6,
-            "y={y} a={a} b={b}: bound {lb} is {} below the minimum {min}",
+            "{r:?}: bound {lb} is {} below the minimum {min}",
             min - lb
         );
     }
@@ -443,35 +535,39 @@ fn the_data_bound_declines_what_it_cannot_bound() {
 /// margin: a bound a hair above the threshold does not fire, a clear one does.
 #[test]
 fn the_gate_declines_the_rail_and_respects_its_margin() {
-    let bound = DataTermLowerBound {
-        lb: 10.0,
-        abs: 10.0,
-        n_rows: 3,
+    let gate = |offset: f64| MhGate {
+        bound: DataTermLowerBound {
+            lb: 10.0,
+            abs: 10.0,
+            n_rows: 3,
+        },
+        offset,
+        offset_abs: offset.abs(),
     };
-    // lb_nll = ½(eta_prior + log_det + 10).
+    let g = gate(0.0);
+    // lb_nll = ½(eta_prior + offset + 10).
     let lb_nll = |eta_prior: f64| 0.5 * (eta_prior + 0.0 + 10.0);
     // Clear: 20 ≫ threshold 5 − (−1) = 6.
-    assert!(mh_early_rejects(&bound, 30.0, 0.0, 5.0, -1.0));
+    assert!(mh_early_rejects(&g, 30.0, 5.0, -1.0));
     // A hair above the threshold, inside the margin: no.
     let thr = 5.0 - (-1.0);
     let eta_prior = 2.0 * thr - 10.0 + 1e-13;
     assert!(lb_nll(eta_prior) > thr);
-    assert!(!mh_early_rejects(&bound, eta_prior, 0.0, 5.0, -1.0));
+    assert!(!mh_early_rejects(&g, eta_prior, 5.0, -1.0));
     // Below the threshold: no.
-    assert!(!mh_early_rejects(&bound, 1.0, 0.0, 5.0, -1.0));
+    assert!(!mh_early_rejects(&g, 1.0, 5.0, -1.0));
     // log_u = −∞ (a uniform draw of exactly 0): threshold +∞, never fires.
-    assert!(!mh_early_rejects(
-        &bound,
-        1e300,
-        0.0,
-        5.0,
-        f64::NEG_INFINITY
-    ));
+    assert!(!mh_early_rejects(&g, 1e300, 5.0, f64::NEG_INFINITY));
     // Current state on the sentinel rail: never fires, however large the bound.
-    assert!(!mh_early_rejects(&bound, 1e300, 0.0, 1e20, -1.0));
-    // Non-finite log|Ω|.
-    assert!(!mh_early_rejects(&bound, 30.0, f64::INFINITY, 5.0, -1.0));
-    assert!(!mh_early_rejects(&bound, 30.0, f64::NAN, 5.0, -1.0));
+    assert!(!mh_early_rejects(&g, 1e300, 1e20, -1.0));
+    // Non-finite offset (log|Ω|).
+    assert!(!mh_early_rejects(&gate(f64::INFINITY), 30.0, 5.0, -1.0));
+    assert!(!mh_early_rejects(&gate(f64::NAN), 30.0, 5.0, -1.0));
+    // The offset counts: a negative one (log|Ω| < 0) pulls the bound under.
+    assert!(
+        mh_early_rejects(&gate(0.0), 4.0, 5.0, -1.0)
+            != mh_early_rejects(&gate(-10.0), 4.0, 5.0, -1.0)
+    );
 }
 
 /// Review of #2608: a finite observation large enough that `y²` overflows made the
@@ -528,4 +624,338 @@ fn an_overflowing_bound_declines_instead_of_rejecting_everything() {
         "fixture degenerate: the full kernel accepted nothing"
     );
     assert_eq!(on, off, "the gate changed a chain whose bound overflows");
+}
+
+/// Review of #2608, round 2: the bound used to compute the `#484` magnitude path's
+/// variance as `(m·σ)²` while the scorer computes `c·c·σ·σ` with `c = m`. With
+/// `m = 1e-200` and `σ = 1e200` the scorer's `m·m` underflows to `0`, the variance
+/// is guarded to `MIN_VARIANCE` and a zero-residual row scores `ln 1e-12 ≈ −27.6`;
+/// the reassociated bound said `ln 1 = 0` — above the scored term, so the gate
+/// could reject a proposal the full kernel accepts. The σ is passed directly (a
+/// file cannot declare `1e200` as a variance), the observations sit on the η = 0
+/// profile and the steps are tiny, so the gate-off chain accepts.
+#[test]
+fn the_bound_replays_the_magnitude_paths_arithmetic() {
+    let model = model("DV ~ additive(ADD * 1e-200)", "  sigma ADD ~ 0.4 (sd)\n");
+    let p = &model.default_params;
+    let sigma = vec![1e200];
+    let zeros = vec![0.0; model.n_eta];
+    let mut subject = sparse_population(1).subjects.remove(0);
+    subject.observations =
+        crate::pk::compute_predictions_with_tv(&model, &subject, &p.theta, &zeros);
+
+    let mut scratch = MhScratch::default();
+    scratch.begin_subject(&model, &subject, &p.theta, model.n_eta);
+    assert!(
+        model.ruv_obs_mult(&subject, &p.theta).is_some(),
+        "fixture must take the #484 magnitude path"
+    );
+    let bound = prepared_data_term_lower_bound(&model, &subject, &p.theta, &sigma, &scratch.prep)
+        .expect("an additive magnitude model is bounded");
+    let nll = individual_nll_prepared(
+        &model,
+        &subject,
+        &p.theta,
+        &zeros,
+        &p.omega,
+        &sigma,
+        &scratch.prep,
+        None,
+        &mut scratch.nll,
+    );
+    let data = 2.0 * nll - quad_form(&p.omega.inv, &zeros) - p.omega.log_det;
+    // The scored rows sit on the guard: 3 × ln 1e-12.
+    assert!(
+        (data - 3.0 * 1e-12f64.ln()).abs() < 1e-9,
+        "fixture must score the guarded variance (data = {data})"
+    );
+    assert!(
+        bound.lb <= data,
+        "bound {} above the scored data term {data}",
+        bound.lb
+    );
+
+    // Kernel A/B at that σ: the gate must not change the chain.
+    let chain = |gate_off: bool| {
+        let mut scratch = MhScratch::default();
+        scratch.begin_subject(&model, &subject, &p.theta, model.n_eta);
+        scratch.early_reject_off = gate_off;
+        let mut eta = zeros.clone();
+        let mut rng = StdRng::seed_from_u64(31);
+        let (acc, nll_out) = mh_steps(
+            &mut eta,
+            nll,
+            &subject,
+            &model,
+            &p.theta,
+            &p.omega,
+            &sigma,
+            1e-12,
+            None,
+            &mut rng,
+            30,
+            &mut scratch,
+            None,
+            None,
+        );
+        let mut bits: Vec<u64> = eta.iter().map(|x| x.to_bits()).collect();
+        bits.extend([acc as u64, nll_out.to_bits()]);
+        bits
+    };
+    let off = chain(true);
+    assert!(
+        off[model.n_eta] > 0,
+        "fixture degenerate: the full kernel accepted nothing"
+    );
+    assert_eq!(
+        chain(false),
+        off,
+        "the gate changed the chain on the magnitude path"
+    );
+}
+
+// ─── Whole fits ───────────────────────────────────────────────────────────
+//
+// The kernel A/Bs above pin each call; these pin the property the issue asks for —
+// a whole fixed-seed trajectory, gate on vs gate off, equal on raw bits — on every
+// path that reaches the gate: analytic, event-driven (time-varying covariates),
+// ODE, a mixture, BLOQ M3 rows, IOV (κ in the gate's offset), and the Bayes chain.
+// The gate is switched off process-wide (`early_reject_hooks::OFF`) because the
+// kernels run on rayon workers; each A/B also asserts the gate fired during the
+// gate-on arm, so an A/B whose fixture never reached it cannot pass.
+
+/// Restores `OFF` even when an assertion panics mid-A/B.
+struct GateOffGuard;
+impl Drop for GateOffGuard {
+    fn drop(&mut self) {
+        early_reject_hooks::OFF.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn fit_ab(name: &str, run: impl Fn() -> Vec<u64>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _exclusive = early_reject_hooks::LOCK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let _guard = GateOffGuard;
+    early_reject_hooks::OFF.store(false, SeqCst);
+    let before = early_reject_hooks::FIRED.load(SeqCst);
+    let on = run();
+    let fired = early_reject_hooks::FIRED.load(SeqCst) - before;
+    early_reject_hooks::OFF.store(true, SeqCst);
+    let off = run();
+    early_reject_hooks::OFF.store(false, SeqCst);
+    assert!(
+        fired > 0,
+        "{name}: the gate never fired during the gate-on fit, so this A/B cannot see it"
+    );
+    assert_eq!(on, off, "{name}: the early-rejection gate changed the fit");
+}
+
+fn fit_opts() -> FitOptions {
+    FitOptions {
+        saem_n_exploration: 6,
+        saem_n_convergence: 4,
+        saem_n_mh_steps: 6,
+        saem_omega_burnin: 0,
+        saem_seed: Some(2_608),
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    }
+}
+
+/// Every bit of the result the E-step feeds: estimates, objective, iteration
+/// count, posterior summaries and κs.
+fn result_bits(r: &crate::estimation::outer_optimizer::OuterResult) -> Vec<u64> {
+    let mut out = vec![r.ofv.to_bits(), r.n_iterations as u64];
+    out.extend(r.params.theta.iter().map(|v| v.to_bits()));
+    out.extend(r.params.omega.matrix.iter().map(|v| v.to_bits()));
+    out.extend(r.params.sigma.values.iter().map(|v| v.to_bits()));
+    for e in &r.eta_hats {
+        out.extend(e.iter().map(|v| v.to_bits()));
+    }
+    for subj in &r.kappas {
+        for k in subj {
+            out.extend(k.iter().map(|v| v.to_bits()));
+        }
+    }
+    out
+}
+
+fn saem_bits(model: &CompiledModel, pop: &Population) -> Vec<u64> {
+    let r = run_saem(model, pop, &model.default_params, &fit_opts()).expect("SAEM run");
+    result_bits(&r)
+}
+
+fn src_with(params: &str, indiv: &str, structural: &str, error: &str, extra: &str) -> String {
+    format!(
+        "[parameters]\n{params}\n[individual_parameters]\n{indiv}\n[structural_model]\n{structural}\n{extra}\n[error_model]\n  {error}\n"
+    )
+}
+
+const PK_PARAMS: &str = "  theta TVCL(3.0, 0.5, 30.0)\n  theta TVV(20.0, 2.0, 200.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.05\n  sigma PROP ~ 0.12 (sd)\n  sigma ADD ~ 0.2 (sd)\n";
+
+#[test]
+fn whole_saem_fit_is_bit_identical_analytic() {
+    let m = combined_model();
+    let pop = sparse_population(24);
+    fit_ab("analytic", || saem_bits(&m, &pop));
+}
+
+#[test]
+fn whole_saem_fit_is_bit_identical_ode() {
+    let m = parse_model_string(&src_with(
+        PK_PARAMS,
+        "  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n",
+        "  ode(states=[central])\n",
+        "DV ~ combined(PROP, ADD)",
+        "[odes]\n  d/dt(central) = -(CL/V) * central\n\n[scaling]\n  y = central / V\n",
+    ))
+    .expect("ODE fixture parses");
+    assert!(m.ode_spec.is_some(), "fixture must take the ODE engine");
+    let pop = sparse_population(16);
+    fit_ab("ode", || saem_bits(&m, &pop));
+}
+
+/// Time-varying covariates route every subject onto the event-driven walk.
+#[test]
+fn whole_saem_fit_is_bit_identical_event_driven() {
+    use std::collections::HashMap;
+    let m = parse_model_string(&src_with(
+        PK_PARAMS,
+        "  CL = TVCL * (WT / 70)^0.75 * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n",
+        "  pk one_cpt_iv(cl=CL, v=V)\n",
+        "DV ~ combined(PROP, ADD)",
+        "",
+    ))
+    .expect("event-driven fixture parses");
+    let mut pop = sparse_population(16);
+    pop.covariate_names = vec!["WT".into()];
+    for (i, s) in pop.subjects.iter_mut().enumerate() {
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        let w0 = 55.0 + 3.0 * i as f64;
+        s.dose_covariates = vec![wt(w0)];
+        s.obs_covariates = vec![wt(w0), wt(w0 + 2.0), wt(w0 + 5.0)];
+        s.covariates = wt(w0);
+    }
+    assert!(
+        pop.subjects.iter().all(|s| s.has_tv_covariates()),
+        "fixture must route onto the event-driven walk"
+    );
+    fit_ab("event-driven", || saem_bits(&m, &pop));
+}
+
+#[test]
+fn whole_saem_fit_is_bit_identical_mixture() {
+    let m = parse_model_string(
+        r"
+[parameters]
+  theta TVCL1(2.0, 0.01, 100.0)
+  theta TVCL2(5.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.12 (sd)
+  sigma ADD ~ 0.2 (sd)
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP, ADD)
+",
+    )
+    .expect("mixture fixture parses");
+    let pop = sparse_population(16);
+    fit_ab("mixture", || saem_bits(&m, &pop));
+}
+
+/// M3: the last sample of every other subject is censored at 0.8, so the gate's
+/// bound carries censored rows (bounded by 0) next to scored ones.
+#[test]
+fn whole_saem_fit_is_bit_identical_bloq_m3() {
+    let mut m = combined_model();
+    m.bloq_method = BloqMethod::M3;
+    let mut pop = sparse_population(16);
+    for s in pop.subjects.iter_mut().step_by(2) {
+        let last = s.observations.len() - 1;
+        s.observations[last] = 0.8;
+        s.cens[last] = 1;
+    }
+    assert!(m.bloq_in_force().has_censored_row(&pop.subjects[0].cens));
+    fit_ab("bloq-m3", || saem_bits(&m, &pop));
+}
+
+/// IOV: two occasions per subject; the η steps carry the κ prior in the gate's
+/// offset.
+#[test]
+fn whole_saem_fit_is_bit_identical_iov() {
+    let m = parse_model_string(&src_with(
+        &format!("{PK_PARAMS}  kappa KAPPA_CL ~ 0.04\n"),
+        "  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V  = TVV * exp(ETA_V)\n",
+        "  pk one_cpt_iv(cl=CL, v=V)\n",
+        "DV ~ combined(PROP, ADD)",
+        "",
+    ))
+    .expect("IOV fixture parses");
+    assert!(m.n_kappa > 0);
+    let mut pop = sparse_population(16);
+    for (i, s) in pop.subjects.iter_mut().enumerate() {
+        let f = i as f64;
+        s.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        s.dose_occasions = vec![1, 2];
+        s.obs_times = vec![1.0, 6.0, 25.0, 30.0];
+        s.observations = s
+            .obs_times
+            .iter()
+            .enumerate()
+            .map(|(k, &t)| {
+                let tad = if t >= 24.0 { t - 24.0 } else { t };
+                let carry = if t >= 24.0 {
+                    (-0.15_f64 * t).exp()
+                } else {
+                    0.0
+                };
+                5.0 * ((-0.15_f64 * tad).exp() + carry)
+                    * (1.0 + 0.25 * (f * 1.3 + k as f64 * 2.1).sin())
+            })
+            .collect();
+        s.obs_cmts = vec![1; 4];
+        s.cens = vec![0; 4];
+        s.occasions = vec![1, 1, 2, 2];
+    }
+    fit_ab("iov", || saem_bits(&m, &pop));
+}
+
+#[test]
+fn whole_bayes_chain_is_bit_identical() {
+    let m = combined_model();
+    let pop = sparse_population(12);
+    let opts = FitOptions {
+        bayes_warmup: 30,
+        bayes_iters: 30,
+        bayes_chains: 1,
+        bayes_thin: 1,
+        bayes_seed: Some(2_608),
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    fit_ab("bayes", || {
+        let r = crate::estimation::bayes::run_bayes(&m, &pop, &m.default_params, &opts)
+            .expect("Bayes run");
+        result_bits(&r)
+    });
 }

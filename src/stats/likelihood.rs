@@ -1021,41 +1021,95 @@ pub(crate) fn individual_nll_prepared(
 /// bound is ~0.2 below the exact minimum over `f`.
 const ROW_BOUND_SPLITS: [f64; 10] = [0.02, 0.04, 0.06, 0.08, 0.11, 0.15, 0.2, 0.3, 0.45, 0.65];
 
+/// How a row's proportional σ slot enters its scored variance, so its bound can
+/// replay the scorer's own floating-point operations (#2608 review round 2).
+///
+/// `m: None` is the bare-σ path (`residual_variance`: `fs = f·σ`, `fs·fs`); `Some(m)`
+/// is the `#484` magnitude path (`loadings_variance_sum`: `c = f·m`, `c·c·σ·σ`, left
+/// to right). Mathematically one formula, in `f64` they are not: with a magnitude
+/// of `1e-200` the second underflows to `0` where the reassociated `(m·σ)²` does
+/// not, so a bound built from the reassociated form can sit **above** the scored
+/// term. Both fields are stored as magnitudes — every operation squares them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PropLoading {
+    pub(crate) sigma: f64,
+    pub(crate) mult: Option<f64>,
+}
+
+impl PropLoading {
+    /// The scored proportional contribution at a prediction of magnitude `l`, in
+    /// the scorer's order. Every step is a product of non-negative numbers, and an
+    /// IEEE product rounds monotonically in each argument, so for any `|f| ≥ l` the
+    /// scored contribution is `≥` this value — exactly, not to a tolerance.
+    fn at(&self, l: f64) -> f64 {
+        match self.mult {
+            None => {
+                let fs = l * self.sigma;
+                fs * fs
+            }
+            Some(m) => {
+                let c = l * m;
+                c * c * self.sigma * self.sigma
+            }
+        }
+    }
+}
+
+/// The smallest `y²` the split bound is evaluated at. Below it the split terms
+/// (`c²y²`) and the scorer's `r·r` are at or near the subnormal range, where the
+/// mathematical inequalities the split relies on are not reproduced by the
+/// arithmetic, so the row takes the split-free floor instead.
+const ROW_BOUND_MIN_Y2: f64 = 1e-200;
+
 /// A lower bound, valid for **every** prediction `f`, on one Gaussian row's
-/// contribution `r²/v + ln v` (`r = y − f`) to the un-halved data term, when its
-/// raw residual variance is `a + b·f²` — `a` the additive part, `b` the
-/// proportional coefficient, both `≥ 0` — and the scored variance is
-/// [`guard_variance`](crate::stats::residual_error::guard_variance) of it.
+/// contribution `r²/v + ln v` (`r = y − f`) to the un-halved data term.
 ///
-/// Two facts carry the proof. (i) The scored `v` is at least
-/// `v_min = max(a, f64::MIN_POSITIVE)`: a raw variance `≥ MIN_POSITIVE` is scored
-/// as it is and is `≥ a`; anything smaller is replaced by `MIN_VARIANCE`, which
-/// exceeds `MIN_POSITIVE`. (ii) The scored `v` is at least the raw `a + b·f²`, for
-/// the same two reasons.
+/// `a` is the row's additive variance **as the scorer computes it** (the caller
+/// replays the scorer's operations), and `prop` its proportional slot, if any. The
+/// scored variance is `guard(P(f) + a)` — `P(f)` the proportional contribution in
+/// the scorer's arithmetic ([`PropLoading`]), `guard`
+/// [`guard_variance`](crate::stats::residual_error::guard_variance).
 ///
-/// * **Additive** (`b = 0`): `v` is the constant `a` (or `MIN_VARIANCE`), so
+/// Two facts carry the proof, both exact in `f64` because rounding is monotone and
+/// the guard only ever raises a variance. (i) The scored `v` is at least
+/// `v_min = max(a, f64::MIN_POSITIVE)`: `fl(P + a) ≥ a` for `P ≥ 0`, a variance
+/// `≥ MIN_POSITIVE` is scored as it is, and anything smaller is replaced by
+/// `MIN_VARIANCE > MIN_POSITIVE`. (ii) For `|f| ≥ l` the scored `v` is at least
+/// `fl(P(l) + a)` ([`PropLoading::at`]).
+///
+/// * **Additive** (`prop = None`): `v` is the constant `a` (or `MIN_VARIANCE`), so
 ///   `ln v_min` is the bound, attained at `r = 0`.
-/// * **Proportional / combined** (`b > 0`): split on a fraction `c ∈ (0, 1)`. If
+/// * **Proportional / combined**: split on a fraction `c ∈ (0, 1)`. If
 ///   `|y − f| ≥ c|y|`, then `r² ≥ c²y²` and the term is at least
 ///   `inf_{v ≥ v_min} c²y²/v + ln v`, which is `1 + ln(c²y²)` when `c²y² ≥ v_min`
 ///   (the stationary point `v = c²y²`) and `c²y²/v_min + ln v_min` otherwise (the
 ///   function increases on `[v_min, ∞)`). If `|y − f| < c|y|`, then
-///   `|f| > (1 − c)|y|`, so `v ≥ a + b(1 − c)²y²` and the term is at least its
-///   log (`r²/v ≥ 0`). The smaller of the two holds for every `f`; the largest
-///   over the splits is returned, and `ln v_min` (any `f`) is the floor.
+///   `|f| > (1 − c)|y|`, so by (ii) the term is at least `ln fl(P((1 − c)|y|) + a)`
+///   (`r²/v ≥ 0`). The smaller of the two holds for every `f`; the largest over the
+///   splits is returned, and `ln v_min` (any `f`) is the floor.
 ///
-/// A pure proportional row has **no** useful bound from `v` alone (`v → 0` as
-/// `f → 0`, #2443), which is why the split on `r` is needed: a prediction far
-/// from the observation pays in `r²/v` what it saves in `ln v`. A `NaN` `y`
-/// returns the floor, which is still valid (the full evaluation then returns the
-/// sentinel). See issue #2608.
-pub(crate) fn gaussian_row_term_lower_bound(y: f64, a: f64, b: f64) -> f64 {
+/// The split's `r²`/`y²` steps are real-number inequalities, so they carry the
+/// gate's rounding margin; a `y²` below [`ROW_BOUND_MIN_Y2`] (where those steps meet
+/// underflow) takes the floor instead. A pure proportional row has **no** useful
+/// bound from `v` alone (`v → 0` as `f → 0`, #2443), which is why the split on `r`
+/// is needed. A `NaN` `y` returns the floor; an overflowing `y²` returns `∞`, which
+/// the caller must refuse (see [`prepared_data_term_lower_bound`]).
+pub(crate) fn gaussian_row_term_lower_bound(y: f64, a: f64, prop: Option<PropLoading>) -> f64 {
     let v_min = a.max(f64::MIN_POSITIVE);
     let floor = v_min.ln();
-    if b == 0.0 {
+    let Some(prop) = prop else {
+        return floor;
+    };
+    let y2 = y * y;
+    if y2.is_infinite() {
+        // `c²y²` overflows while the scorer's `r·r` need not, so the far-side bound
+        // would claim `∞` for a finite term — no valid split exists here. `∞` tells
+        // the caller to decline the subject.
+        return f64::INFINITY;
+    }
+    if !(y2 >= ROW_BOUND_MIN_Y2) {
         return floor;
     }
-    let y2 = y * y;
     let mut best = floor;
     for c in ROW_BOUND_SPLITS {
         let q = c * c * y2;
@@ -1064,8 +1118,7 @@ pub(crate) fn gaussian_row_term_lower_bound(y: f64, a: f64, b: f64) -> f64 {
         } else {
             q / v_min + floor
         };
-        let one_c = 1.0 - c;
-        let near = (a + b * one_c * one_c * y2).max(v_min).ln();
+        let near = (prop.at((1.0 - c) * y.abs()) + a).max(v_min).ln();
         best = best.max(far.min(near));
     }
     best
@@ -1090,8 +1143,8 @@ pub(crate) struct DataTermLowerBound {
 /// variance) and every row it scores:
 ///
 /// * a Gaussian row is bounded by [`gaussian_row_term_lower_bound`] from its loading
-///   shape — `a = Σ (m·σ)²` over the additive slots, `b = (m·σ)²` for the
-///   proportional one, `m` the `#484` magnitude multiplier;
+///   shape, its additive variance and proportional slot computed with the scorer's
+///   own floating-point operations (bare σ, or the `#484` magnitude multiplier);
 /// * an M3-censored row contributes `−2·log Φ(·) ≥ 0`, bounded by `0`;
 /// * a non-Gaussian-endpoint row the loop skips (`#905`) contributes nothing.
 ///
@@ -1142,31 +1195,45 @@ pub(crate) fn prepared_data_term_lower_bound(
             continue;
         }
         let key = *prep.err_keys.get(j)?;
-        let mult: &[f64] = prep
+        // Replay the scorer's arithmetic, not the algebra (#2608 review round 2):
+        // the row loop takes the `#484` magnitude path (`variance_at_scaled`:
+        // `c = coeff·m`, `c·c·σ·σ`) whenever the subject has a magnitude row, else
+        // the bare-σ path (`residual_variance`: `σ·σ`, `(f·σ)·(f·σ)`).
+        let mult_row: Option<&[f64]> = prep
             .ruv_mult
             .as_ref()
             .and_then(|m| m.get(j))
-            .map_or(&[], Vec::as_slice);
+            .map(Vec::as_slice);
+        let mult = mult_row.unwrap_or(&[]);
         let (shape, n) = model.error_spec.sigma_loading_shape(key, n_sigma);
-        let (mut a, mut b) = (0.0, 0.0);
+        let mut a = 0.0;
+        let mut prop = None;
         for &(idx, c0, slope) in &shape[..n] {
             let s = *sigma_values.get(idx)?;
             let m = mult.get(idx).copied().unwrap_or(1.0);
             if slope != 0.0 {
                 if c0 != 0.0
+                    || slope != 1.0
+                    || prop.is_some()
                     || crate::stats::residual_error::slot_exponent(mult, n_sigma, idx)
                         .is_some_and(|p| p != 1.0)
                 {
                     return None;
                 }
-                let k = slope * m * s;
-                b += k * k;
+                prop = Some(PropLoading {
+                    sigma: s.abs(),
+                    mult: mult_row.map(|_| m.abs()),
+                });
             } else {
-                let k = c0 * m * s;
-                a += k * k;
+                if c0 != 1.0 || a != 0.0 {
+                    return None;
+                }
+                // `c = 1·m = m` exactly; `σ·σ` on the bare path is the same value
+                // as `1·1·σ·σ`, so one expression serves both.
+                a = m * m * s * s;
             }
         }
-        let row = gaussian_row_term_lower_bound(y, a, b);
+        let row = gaussian_row_term_lower_bound(y, a, prop);
         // A finite row can still overflow the bound's own arithmetic: `y²` is `∞`
         // for `|y| > ~1.3e154` while the scored `b·f²` stays finite for a small
         // enough `b`. An infinite bound is not a bound — the gate would read
