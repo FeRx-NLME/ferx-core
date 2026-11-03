@@ -2280,10 +2280,10 @@ fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
 thread_local! {
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    /// Seeded cold solves whose primary descent found the unseeded solve's mode, so they
-    /// skipped their own multi-start ([`ColdShare::primary`], #2601).
-    pub(crate) static EBE_MULTISTARTS_SKIPPED: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
+    /// This thread's [`MULTISTART_PROFILE`] moves — twin seed, screen, axis scan — so a test
+    /// can count them exactly while other tests' solves share the process-wide counters.
+    pub(crate) static MULTISTART_MOVES: std::cell::Cell<[usize; 3]> =
+        const { std::cell::Cell::new([0; 3]) };
     /// Inner-solve seed Hessians formed from scratch on this thread and handed to the
     /// search (not carried, and not declined; #2549).
     pub(crate) static FRESH_SEEDS_FORMED: std::cell::Cell<usize> =
@@ -2415,11 +2415,9 @@ fn find_ebe_impl_from(
     // The two cold solves screen the same Sobol starts on the same objective, and a screen
     // descent reads neither solve's incumbent: the first one's descents are handed to the
     // second through this cell, local to the call, so nothing outlives it (an unwind
-    // included) or reaches another subject. The cell also carries the first solve's primary
-    // end point, which lets the second skip a multi-start that would repeat the first's
-    // (see [`ColdShare`]).
-    let screen_share: RefCell<ColdShare> = RefCell::new(ColdShare::default());
-    let solve = |cold_seed: bool, share: Option<&RefCell<ColdShare>>| {
+    // included) or reaches another subject.
+    let screen_share: RefCell<Option<Vec<ScreenDescent>>> = RefCell::new(None);
+    let solve = |cold_seed: bool, share: Option<&RefCell<Option<Vec<ScreenDescent>>>>| {
         find_ebe_solve(
             model,
             subject,
@@ -2473,27 +2471,6 @@ fn find_ebe_impl_from(
 /// (`None` for a non-finite end point).
 type ScreenDescent = Option<(Vec<f64>, InnerExit, f64)>;
 
-/// What `find_ebe_impl`'s first cold solve (the unseeded one) hands its second (the seeded
-/// one, #1504) through `find_ebe_solve`'s `screen_share`.
-#[derive(Default)]
-struct ColdShare {
-    /// The #2013 screen's descents, which read neither solve's incumbent.
-    screen: Option<Vec<ScreenDescent>>,
-    /// The first solve's primary end point: its η̂ before the guarded multi-start ran.
-    ///
-    /// The second solve skips its own multi-start when its primary descent ends within
-    /// [`SCREEN_MIN_OMEGA_DIST`] of this point in the Ω⁻¹ metric, the distance below which
-    /// the screen already counts two points as one mode (#2601). The multi-start reads
-    /// only its incumbent — the twin seed maps it, the axis scan re-seeds around it, and the
-    /// screen's descents are shared — so from the same mode it would re-run the first
-    /// solve's descents from the same starts to within that distance, and on the 2-cpt
-    /// sparse-data fixture of #2601 it was ~40% of a cold evaluation's time. A seeded
-    /// descent that lands in a *different* basin, the case #1504 runs both metrics for,
-    /// keeps its multi-start. When no multi-start moves the subject, which is almost every
-    /// subject, the kept result is bit-identical to running both.
-    primary: Option<Vec<f64>>,
-}
-
 /// Whether `eta_init` is a genuine warm start: a mode carried in from an earlier solve.
 /// `None` and an all-zero vector are both cold. The outer loop's first evaluation, the
 /// pre-flight solve and `freeze_flat_thetas` pass zeros as a placeholder for "no previous
@@ -2533,7 +2510,7 @@ fn find_ebe_solve(
     cold_seed: bool,
     // `find_ebe_impl`'s two cold solves share one screen: the first fills the cell with its
     // descents, the second takes them. `None`: screen for this solve alone.
-    screen_share: Option<&RefCell<ColdShare>>,
+    screen_share: Option<&RefCell<Option<Vec<ScreenDescent>>>>,
     // Where a predicted `eta_init` came from ([`find_ebe_cached_from`]).
     predicted_from: Option<PredictedFrom<'_>>,
 ) -> Option<EbeResult> {
@@ -3072,30 +3049,7 @@ fn find_ebe_solve(
     // rather than the solves in which one ran (#2589).
     let mut screen_moved = false;
     let mut twin_moved = false;
-    // The seeded cold solve whose primary descent found the unseeded one's mode repeats none
-    // of its multi-start (see [`ColdShare::primary`]); the unseeded solve leaves its primary
-    // end point for it.
-    let repeats_first_solve = match screen_share {
-        Some(c) if cold_seed => c
-            .borrow()
-            .primary
-            .as_deref()
-            .is_some_and(|p| omega_distance(&eta, p, &params.omega) <= SCREEN_MIN_OMEGA_DIST),
-        Some(c) => {
-            c.borrow_mut().primary = Some(eta.clone());
-            false
-        }
-        None => false,
-    };
-    let multistart = restarts > 0 && !is_warm_start(eta_init, policy.init_is_mode);
-    if multistart && repeats_first_solve {
-        #[cfg(test)]
-        EBE_MULTISTARTS_SKIPPED.with(|n| n.set(n.get() + 1));
-        if inner_profile_enabled() {
-            PROFILE_MULTISTARTS_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    if multistart && !repeats_first_solve {
+    if restarts > 0 && !is_warm_start(eta_init, policy.init_is_mode) {
         #[cfg(test)]
         EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
         // ── Flip-flop twin seed (`[fit_options] inner_twin_seed`, #2095) ────────
@@ -3153,7 +3107,7 @@ fn find_ebe_solve(
         // `inner_screen = 0`, at the price of `N` objective evaluations and `K` descents
         // per cold solve.
         if policy.screen > 0 {
-            let shared = screen_share.and_then(|c| c.borrow_mut().screen.take());
+            let shared = screen_share.and_then(|c| c.borrow_mut().take());
             let descents: Vec<ScreenDescent> = match shared {
                 Some(d) => d,
                 None => {
@@ -3171,7 +3125,7 @@ fn find_ebe_solve(
                         &stall_at,
                     );
                     if let Some(c) = screen_share {
-                        c.borrow_mut().screen = Some(d.clone());
+                        *c.borrow_mut() = Some(d.clone());
                     }
                     d
                 }
@@ -3243,13 +3197,7 @@ fn find_ebe_solve(
                 }
             }
         }
-        if inner_profile_enabled() {
-            use std::sync::atomic::Ordering::Relaxed;
-            PROFILE_MULTISTARTS_RUN.fetch_add(1, Relaxed);
-            PROFILE_MULTISTART_TWIN_MOVED.fetch_add(u64::from(twin_moved), Relaxed);
-            PROFILE_MULTISTART_SCREEN_MOVED.fetch_add(u64::from(screen_moved), Relaxed);
-            PROFILE_MULTISTART_AXIS_MOVED.fetch_add(u64::from(axis_moved), Relaxed);
-        }
+        MULTISTART_PROFILE.record(twin_moved, screen_moved, axis_moved);
     }
 
     // ── Runaway-EBE guard (#958) ───────────────────────────────────────────
@@ -4370,17 +4318,65 @@ impl Drop for InnerSettingsGuard {
 /// rate is the prime suspect when inner value-eval (prediction) counts balloon.
 /// Guarded cold-start multi-starts that ran, and how many of them moved the incumbent
 /// through the twin seed, the screen or the per-coordinate scan (a solve can count under
-/// several), and the seeded cold solves that skipped theirs (#2601). Crate-private: read
-/// only through [`profile_report`].
-static PROFILE_MULTISTARTS_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PROFILE_MULTISTART_TWIN_MOVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static PROFILE_MULTISTART_SCREEN_MOVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static PROFILE_MULTISTART_AXIS_MOVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static PROFILE_MULTISTARTS_SKIPPED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+/// several), process-wide (#2601). They count unconditionally — four relaxed atomic adds
+/// per multi-start, against its dozens of descents — and [`profile_report`] prints them
+/// under `FERX_PROFILE=1`. Crate-private: not part of the public API.
+pub(crate) static MULTISTART_PROFILE: MultistartProfile = MultistartProfile::new();
+
+/// The counters behind [`MULTISTART_PROFILE`].
+pub(crate) struct MultistartProfile {
+    pub(crate) run: std::sync::atomic::AtomicU64,
+    pub(crate) twin_moved: std::sync::atomic::AtomicU64,
+    pub(crate) screen_moved: std::sync::atomic::AtomicU64,
+    pub(crate) axis_moved: std::sync::atomic::AtomicU64,
+}
+
+impl MultistartProfile {
+    const fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
+        Self {
+            run: AtomicU64::new(0),
+            twin_moved: AtomicU64::new(0),
+            screen_moved: AtomicU64::new(0),
+            axis_moved: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one multi-start and which of its searches moved the incumbent.
+    fn record(&self, twin: bool, screen: bool, axis: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.run.fetch_add(1, Relaxed);
+        self.twin_moved.fetch_add(u64::from(twin), Relaxed);
+        self.screen_moved.fetch_add(u64::from(screen), Relaxed);
+        self.axis_moved.fetch_add(u64::from(axis), Relaxed);
+        #[cfg(test)]
+        MULTISTART_MOVES.with(|m| {
+            let [twin_n, screen_n, axis_n] = m.get();
+            m.set([
+                twin_n + usize::from(twin),
+                screen_n + usize::from(screen),
+                axis_n + usize::from(axis),
+            ]);
+        });
+    }
+
+    /// The `FERX_PROFILE` report line, or `None` before any multi-start has run.
+    pub(crate) fn report_line(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let run = self.run.load(Relaxed);
+        (run > 0).then(|| {
+            format!(
+                "[profile] inner multi-start: {} run; moved the EBE by twin seed {}, screen {}, \
+                 axis scan {}",
+                run,
+                self.twin_moved.load(Relaxed),
+                self.screen_moved.load(Relaxed),
+                self.axis_moved.load(Relaxed),
+            )
+        })
+    }
+}
+
 pub static PROFILE_INNER_SOLVES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static PROFILE_INNER_ANALYTIC_GRAD: std::sync::atomic::AtomicU64 =
@@ -4428,17 +4424,8 @@ pub fn profile_report() {
             100.0 * fd as f64 / tot as f64
         );
     }
-    let run = PROFILE_MULTISTARTS_RUN.load(Relaxed);
-    let skipped = PROFILE_MULTISTARTS_SKIPPED.load(Relaxed);
-    if run + skipped > 0 {
-        eprintln!(
-            "[profile] inner multi-start: {} run, {} skipped (seeded cold solve on the unseeded one's mode); moved by twin seed {}, screen {}, axis scan {}",
-            run,
-            skipped,
-            PROFILE_MULTISTART_TWIN_MOVED.load(Relaxed),
-            PROFILE_MULTISTART_SCREEN_MOVED.load(Relaxed),
-            PROFILE_MULTISTART_AXIS_MOVED.load(Relaxed),
-        );
+    if let Some(line) = MULTISTART_PROFILE.report_line() {
+        eprintln!("{line}");
     }
 }
 
