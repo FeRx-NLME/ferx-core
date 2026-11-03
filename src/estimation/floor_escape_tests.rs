@@ -14,6 +14,7 @@ struct Stub {
     warnings: Vec<String>,
     floored: Vec<String>,
     near: Vec<NearFloorTheta>,
+    near_at_ofv: Option<f64>,
     near_probe_ofv: f64,
     penalty: f64,
     cov_secs: f64,
@@ -57,6 +58,7 @@ fn floor_stop() -> Stub {
         warnings: Vec::new(),
         floored: names(),
         near: Vec::new(),
+        near_at_ofv: None,
         near_probe_ofv: f64::NAN,
         penalty: 0.0,
         cov_secs: 0.0,
@@ -74,6 +76,7 @@ fn landed() -> Stub {
         warnings: Vec::new(),
         floored: Vec::new(),
         near: Vec::new(),
+        near_at_ofv: None,
         near_probe_ofv: f64::NAN,
         penalty: 0.0,
         cov_secs: 0.0,
@@ -107,13 +110,16 @@ fn resolve_probe(first: Stub, probe: Stub, restart: impl FnOnce(&Stub) -> Stub) 
 }
 
 /// The stub's `near_floor` hook: its near-floor θ, the restart's point re-scored (the same
-/// fit) and the probe as the same fit at `near_probe_ofv` (penalty kept, so the gate ranks
+/// fit, at `near_at_ofv` when set) and the probe as the same fit at `near_probe_ofv` (penalty kept, so the gate ranks
 /// like the real one).
 fn near_probe(s: &Stub) -> Option<(Vec<NearFloorTheta>, Stub, Stub)> {
     (!s.near.is_empty()).then(|| {
         (
             s.near.clone(),
-            s.clone(),
+            Stub {
+                ofv: s.near_at_ofv.unwrap_or(s.ofv),
+                ..s.clone()
+            },
             Stub {
                 ofv: s.near_probe_ofv,
                 ..s.clone()
@@ -1048,6 +1054,28 @@ fn a_restart_left_just_above_the_floor_is_converged_only_when_its_probe_is_flat(
             "probe {flat}"
         );
     }
+    // A re-score of the restart's own point that is invalid (`∞`, or the divergence
+    // sentinel) is no reference for a probe below it either.
+    for at in [f64::INFINITY, 1e21] {
+        let up = resolve(floor_stop(), 273.790, |_| Stub {
+            ofv: 42.788001,
+            near: near_emax(),
+            near_at_ofv: Some(at),
+            near_probe_ofv: 42.0,
+            ..landed()
+        });
+        assert!(up.converged, "re-score {at}: {:?}", up.warnings);
+    }
+    // The probe is judged against the re-score at its own budget, not the run's OFV: a
+    // probe at 42.0 is 0.79 below the run's 42.788001 but above a re-score of 41.0.
+    let up = resolve(floor_stop(), 273.790, |_| Stub {
+        ofv: 42.788001,
+        near: near_emax(),
+        near_at_ofv: Some(41.0),
+        near_probe_ofv: 42.0,
+        ..landed()
+    });
+    assert!(up.converged, "{:?}", up.warnings);
 }
 
 /// The gate ranks the near probe on the penalized objective, as the first stop's does: a
