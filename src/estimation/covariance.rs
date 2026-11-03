@@ -1376,8 +1376,42 @@ pub(crate) fn exact_candidate_derivatives(
     Some(acc)
 }
 
+/// The packed axes [`analytic_cov_assembly`] differentiates along, when that is fewer than all
+/// of them: the free coordinates, in packed order, or `None` for the full Hessian.
+///
+/// A held coordinate — a `FIX` θ/Ω/Σ, or a structural-zero Ω entry pinned at `0` — has
+/// `lower == upper` in the optimizer's box, and the covariance step reads only the free block
+/// of `R` (`hess_free` over `free_idx`); the FD stencil never perturbs a held coordinate
+/// either, so its rows and columns stay `0` there. The adjoint's Hessian costs `⌈axes/K⌉`
+/// passes per subject, though, so differentiating along every packed axis paid for rows
+/// nothing reads. On a 6-η model with a `2 × 2` block (#2597: the off-block Cholesky entries of
+/// the 6 × 6 lower triangle are structural zeros) that is 34 axes for 18 free: 9 passes per
+/// subject instead of 5, and a covariance step 1.8× slower than the forward-mode R it replaced.
+/// A block along the free axes is the full Hessian's sub-block to the bit — each entry is the
+/// same lane of a sweep along the same direction (`cov_block_on_axes_is_the_full_hessians_block`).
+///
+/// `None` (the full Hessian) when nothing is held, and on a `[covariate_nn]` model: a full
+/// Hessian goes through the networks' reduced basis (`NnReduction`), which a block bypasses,
+/// and the networks' weights are free axes, so there the block would cost more, not less.
+fn analytic_cov_axes(
+    model: &CompiledModel,
+    template: &ModelParameters,
+    n: usize,
+) -> Option<Vec<usize>> {
+    if model.has_covariate_nn() {
+        return None;
+    }
+    let fixed = packed_fixed_mask(template);
+    if fixed.len() != n {
+        return None;
+    }
+    let free: Vec<usize> = (0..n).filter(|&i| !fixed[i]).collect();
+    (!free.is_empty() && free.len() < n).then_some(free)
+}
+
 /// Assemble the exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, scaled to
-/// the OFV convention, for as much of the population as is in scope.
+/// the OFV convention, for as much of the population as is in scope. Held coordinates' rows and
+/// columns are `0` ([`analytic_cov_axes`]), as on the FD stencil route.
 ///
 /// Parallel subject assembly with a fixed-subject-order reduction, preserving deterministic
 /// results while distributing the quadrature node sweeps across workers.
@@ -1390,8 +1424,11 @@ pub(super) fn analytic_cov_assembly(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> AnalyticCovAssembly {
-    use crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian_at;
+    use crate::sens::ode_provider::adjoint::{
+        subject_adjoint_cov_block_at, subject_adjoint_cov_hessian_at,
+    };
     let n = x_hat.len();
+    let free_axes = analytic_cov_axes(model, template, n);
     let Some(per_subject) = per_subject_adjoint(
         model,
         population,
@@ -1402,7 +1439,17 @@ pub(super) fn analytic_cov_assembly(
         options,
         |subject, pt, b, objective| {
             // The adjoint's profile Hessian (`Uᵀ∇²Ψ U`): every objective, either anchor.
-            let h = subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?;
+            let h = match &free_axes {
+                Some(axes) => {
+                    let block =
+                        subject_adjoint_cov_block_at(model, subject, pt, b, objective, axes)?;
+                    if block.nrows() != axes.len() || block.ncols() != axes.len() {
+                        return None;
+                    }
+                    embed_free(&block, axes, n)
+                }
+                None => subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?,
+            };
             if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
                 return None;
             }
