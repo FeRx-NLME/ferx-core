@@ -2427,6 +2427,27 @@ fn foce_subject_nll_cov_split(
     // combinations that form does not carry (a dense residual, FREM).
     if density.is_some() && !interaction {
         let n = eta_hat.len();
+        let rowwise_rows = model.bloq_in_force().has_censored_row(&subject.cens)
+            || subject.fremtype.iter().any(|&ft| ft > 0);
+        if residual_cov.is_dense() && !rowwise_rows {
+            // A correlated residual: the dense conditional form, `½·B` left out.
+            return foce_subject_nll_interaction_dense_split(
+                subject,
+                &ipreds,
+                eta_hat,
+                h_matrix,
+                omega,
+                sigma_values,
+                &model.error_spec,
+                residual_cov,
+                &p_obs,
+                ruv_mult.as_deref(),
+                model.residual_error_eta,
+                false,
+                density.as_ref(),
+                parts,
+            );
+        }
         return foce_subject_nll_interaction_with_tte(
             subject,
             &ipreds,
@@ -2496,6 +2517,7 @@ fn foce_subject_nll_cov_split(
                 &p_obs,
                 ruv_mult.as_deref(),
                 model.residual_error_eta,
+                true,
                 density.as_ref(),
                 parts,
             )
@@ -3129,6 +3151,7 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
         p_obs,
         ruv_mult,
         residual_error_eta,
+        true,
         None, // no density: the wrapper's callers are Gaussian
         None,
     )
@@ -3149,6 +3172,9 @@ fn foce_subject_nll_interaction_dense_split(
     p_obs: &[f64],
     ruv_mult: Option<&[Vec<f64>]>,
     residual_error_eta: Option<usize>,
+    // FOCEI's `½·B` (the variance's η-curvature) in `H̃`, or FOCE's conditional form under a
+    // density (#1716), which leaves it out.
+    interaction: bool,
     // A density group's correction at η̂ (#1716): `c` into the prior, `½∇²c` into `H̃`.
     density: Option<&crate::stats::eta_density::DensityAtMode>,
     mut parts: PartSink<'_>,
@@ -3262,7 +3288,11 @@ fn foce_subject_nll_interaction_dense_split(
         }
     }
 
-    let htilde = term1 + 0.5 * b + &*prior_curv;
+    let htilde = if interaction {
+        term1 + 0.5 * b + &*prior_curv
+    } else {
+        term1 + &*prior_curv
+    };
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat)) + density.map_or(0.0, |d| d.c);
     note(&mut parts, "Gaussian residual term", 0.5 * data_ll);
     note(
@@ -4258,6 +4288,24 @@ fn foce_subject_nll_iov_linearized_split(
     // dispatcher (`foce_subject_nll_cov_split`).
     if density.is_some() && !interaction {
         let n_b = b_hat.len();
+        if residual_cov.is_dense() && !model.bloq_in_force().has_censored_row(&subject.cens) {
+            return foce_subject_nll_interaction_dense_split(
+                subject,
+                &ipreds,
+                &b_hat,
+                &h_full,
+                &sigma_b,
+                sigma_values,
+                &model.error_spec,
+                residual_cov,
+                &p_obs_iov,
+                ruv_mult.as_deref(),
+                model.residual_error_eta,
+                false,
+                density.as_ref(),
+                parts,
+            );
+        }
         return foce_subject_nll_interaction_with_tte(
             subject,
             &ipreds,
@@ -4318,6 +4366,7 @@ fn foce_subject_nll_iov_linearized_split(
                 &p_obs_iov,
                 ruv_mult.as_deref(),
                 model.residual_error_eta,
+                true,
                 density.as_ref(),
                 parts,
             )

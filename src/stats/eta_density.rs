@@ -12,15 +12,12 @@
 //! the Laplace / FOCE machinery runs in coordinates where the posterior is smooth (Pumas
 //! maps a constrained random effect the same way).
 //!
-//! | kind | support of η | parameters | latent density |
-//! |---|---|---|---|
-//! | `t(ν)` | ℝ (block: ℝⁿ) | scale matrix Ω, ν | multivariate t |
-//! | `logistic` | ℝ | variance ω | logistic, scale `√(3ω)/π` |
-//! | `gamma` | (0, ∞) | mean 1, variance ω | `k z − e^z/ω − lnΓ(k) − k ln ω`, `k = 1/ω` |
-//! | `invgamma` | (0, ∞) | mean 1, variance ω | `α ln β − lnΓ(α) − α z − β e^{−z}`, `α = 2 + 1/ω`, `β = α − 1` |
-//! | `lognormal` | (0, ∞) | mean 1, variance ω | `z ~ N(−s²/2, s²)`, `s² = ln(1 + ω)` |
-//! | `beta(μ)` | (0, 1) | mean μ, variance ω | `a ln σ(z) + b ln σ(−z) − ln B(a, b)`, `a = μn`, `b = (1−μ)n`, `n = μ(1−μ)/ω − 1` |
-//! | `logitnormal(μ)` | (0, 1) | location `logit μ`, variance ω | `z ~ N(logit μ, ω)` |
+//! The kinds are every distribution Pumas's `@random` block takes for a scalar or vector
+//! random effect (`DensityKind`), each with its latent density and parameterisation in
+//! `eta_density_kinds`: on ℝ mean 0 and variance `ω`, on (0, ∞) mean 1 and variance `ω`,
+//! on (0, 1) mean `μ` and variance `ω`, where the family has them. `truncated(KIND, lo,
+//! hi)` restricts any univariate kind, through a bounded map so the latent stays
+//! unconstrained.
 //!
 //! A block (`block_omega … density t(ν)`) is a multivariate t with one ν. The other kinds
 //! are univariate: correlating them needs a copula, which is not built. A Box-Cox
@@ -38,8 +35,8 @@
 //! objective is unchanged bit for bit. Ω is block-diagonal across declared blocks, so
 //! `Ω_g⁻¹` is `Ω⁻¹` restricted to the group, and for a univariate group `ω = 1/Ω⁻¹_aa`.
 //!
-//! The correction is written **once**, as [`correction_g`] over [`PkNum`]. `T = f64` is
-//! the value, the hyper-dual seeds of [`correction_jets_g`] give its exact η-gradient and
+//! The correction is written **once**, as `correction_g` over `PkNum`. `T = f64` is
+//! the value, the hyper-dual seeds of `correction_jets_g` give its exact η-gradient and
 //! η-Hessian, and the AD kernel's outer types carry `∂/∂θ` (the shape) and `∂/∂Ω` through
 //! the same function.
 
@@ -47,20 +44,80 @@ use crate::sens::num::PkNum;
 use crate::sens::rtape::DualT;
 use nalgebra::DMatrix;
 
-/// Which distribution a group of ETAs follows.
+/// Which distribution a group of ETAs follows: every distribution Pumas's `@random`
+/// block takes that a scalar or vector random effect can follow (`eta_density_kinds` has
+/// each one's parameterisation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DensityKind {
-    /// Student-t (multivariate over a block), one ν.
+    /// Student-t (multivariate over a block), one ν; scale² ω.
     StudentT,
-    /// Logistic.
+    /// Logistic, variance ω.
     Logistic,
-    /// Gamma, mean 1.
+    /// Laplace (double exponential), variance ω.
+    Laplace,
+    /// Cauchy, scale² ω.
+    Cauchy,
+    /// Gumbel, mean 0, variance ω.
+    Gumbel,
+    /// Normal-inverse-Gaussian, mean 0, variance ω, shapes ζ and ρ.
+    NormalInverseGaussian,
+    /// p-generalized Gaussian, variance ω, shape p.
+    PGeneralizedGaussian,
+    /// Generalized extreme value, mean 0, variance ω, shape ξ.
+    GeneralizedExtremeValue,
+    /// Arcsine on a symmetric interval, variance ω.
+    Arcsine,
+    /// Uniform on a symmetric interval, variance ω.
+    Uniform,
+    /// Biweight kernel, variance ω.
+    Biweight,
+    /// Triweight kernel, variance ω.
+    Triweight,
+    /// Epanechnikov kernel, variance ω.
+    Epanechnikov,
+    /// Cosine kernel, variance ω.
+    Cosine,
+    /// Semicircle, variance ω.
+    Semicircle,
+    /// Symmetric triangular, variance ω.
+    SymTriangular,
+    /// Gamma, mean 1, variance ω.
     Gamma,
-    /// Inverse gamma, mean 1.
+    /// Inverse gamma, mean 1, variance ω.
     InvGamma,
-    /// Log-normal, mean 1.
+    /// Log-normal, mean 1, variance ω.
     LogNormal,
-    /// Beta, mean μ.
+    /// Exponential, mean 1 (ω unused).
+    Exponential,
+    /// Erlang (gamma with shape k), mean 1 (ω unused).
+    Erlang,
+    /// Scaled chi-squared: the gamma with mean 1 and variance ω.
+    ChiSq,
+    /// Scaled chi (Nakagami), mean 1, variance ω.
+    Chi,
+    /// Rayleigh, mean 1 (ω unused).
+    Rayleigh,
+    /// Weibull, mean 1, variance ω.
+    Weibull,
+    /// Fréchet, mean 1, variance ω.
+    Frechet,
+    /// Inverse Gaussian, mean 1, variance ω.
+    InverseGaussian,
+    /// Beta prime, mean 1, variance ω.
+    BetaPrime,
+    /// Scaled noncentral chi-squared, mean 1, variance ω, k degrees of freedom.
+    NoncentralChiSq,
+    /// Kolmogorov (ω unused).
+    Kolmogorov,
+    /// Lévy, scale ω.
+    Levy,
+    /// Pareto, mean 1, variance ω.
+    Pareto,
+    /// Generalized Pareto, mean 1, variance ω.
+    GeneralizedPareto,
+    /// Log-uniform on `(a, b)` (ω unused).
+    LogUniform,
+    /// Beta, mean μ, variance ω.
     Beta,
     /// Logit-normal, location `logit μ`.
     LogitNormal,
@@ -69,7 +126,7 @@ pub enum DensityKind {
 /// How the model reads a latent `z`: `η = m(z)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DomainMap {
-    /// `η = z`, on ℝ.
+    /// `η = z`, on ℝ (a bounded kernel's support is enforced by its density).
     Identity,
     /// `η = exp(z)`, on (0, ∞).
     Exp,
@@ -86,44 +143,164 @@ impl DomainMap {
             DomainMap::InvLogit => Some("inv_logit"),
         }
     }
+
+    /// `m(z)`.
+    pub(crate) fn apply(self, z: f64) -> f64 {
+        match self {
+            DomainMap::Identity => z,
+            DomainMap::Exp => z.exp(),
+            DomainMap::InvLogit => 1.0 / (1.0 + (-z).exp()),
+        }
+    }
+
+    /// `m⁻¹(η)`.
+    pub(crate) fn invert(self, eta: f64) -> f64 {
+        match self {
+            DomainMap::Identity => eta,
+            DomainMap::Exp => eta.ln(),
+            DomainMap::InvLogit => (eta / (1.0 - eta)).ln(),
+        }
+    }
+}
+
+/// A shape θ a kind takes: the auto-declared name's prefix, its `(init, lower, upper)`,
+/// and the bounds a user-declared one must lie inside.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShapeSpec {
+    pub(crate) prefix: &'static str,
+    pub(crate) init: f64,
+    pub(crate) lower: f64,
+    pub(crate) upper: f64,
+    /// `(lo, hi)`: a declared θ's bounds must sit inside, strictly where `strict`.
+    pub(crate) domain: (f64, f64),
+    pub(crate) strict: bool,
+}
+
+const fn shape(
+    prefix: &'static str,
+    init: f64,
+    lower: f64,
+    upper: f64,
+    domain: (f64, f64),
+    strict: bool,
+) -> ShapeSpec {
+    ShapeSpec {
+        prefix,
+        init,
+        lower,
+        upper,
+        domain,
+        strict,
+    }
 }
 
 impl DensityKind {
     /// Every kind, for name lookup.
-    pub(crate) const ALL: [DensityKind; 7] = [
-        DensityKind::StudentT,
-        DensityKind::Logistic,
-        DensityKind::Gamma,
-        DensityKind::InvGamma,
-        DensityKind::LogNormal,
-        DensityKind::Beta,
-        DensityKind::LogitNormal,
-    ];
+    pub(crate) const ALL: [DensityKind; 36] = {
+        use DensityKind::*;
+        [
+            StudentT,
+            Logistic,
+            Laplace,
+            Cauchy,
+            Gumbel,
+            NormalInverseGaussian,
+            PGeneralizedGaussian,
+            GeneralizedExtremeValue,
+            Arcsine,
+            Uniform,
+            Biweight,
+            Triweight,
+            Epanechnikov,
+            Cosine,
+            Semicircle,
+            SymTriangular,
+            Gamma,
+            InvGamma,
+            LogNormal,
+            Exponential,
+            Erlang,
+            ChiSq,
+            Chi,
+            Rayleigh,
+            Weibull,
+            Frechet,
+            InverseGaussian,
+            BetaPrime,
+            NoncentralChiSq,
+            Kolmogorov,
+            Levy,
+            Pareto,
+            GeneralizedPareto,
+            LogUniform,
+            Beta,
+            LogitNormal,
+        ]
+    };
 
-    /// The model-file name after `density`.
+    /// The model-file name after `density` (the first of [`Self::aliases`]).
     pub(crate) fn name(self) -> &'static str {
+        self.aliases()[0]
+    }
+
+    /// The (lower-cased) model-file names of the kind; the first is canonical. Pumas's
+    /// type names, lower-cased, are always among them.
+    pub(crate) fn aliases(self) -> &'static [&'static str] {
+        use DensityKind::*;
         match self {
-            DensityKind::StudentT => "t",
-            DensityKind::Logistic => "logistic",
-            DensityKind::Gamma => "gamma",
-            DensityKind::InvGamma => "invgamma",
-            DensityKind::LogNormal => "lognormal",
-            DensityKind::Beta => "beta",
-            DensityKind::LogitNormal => "logitnormal",
+            StudentT => &["t", "tdist", "studentt"],
+            Logistic => &["logistic"],
+            Laplace => &["laplace"],
+            Cauchy => &["cauchy"],
+            Gumbel => &["gumbel"],
+            NormalInverseGaussian => &["nig", "normalinversegaussian"],
+            PGeneralizedGaussian => &["pgeneralizedgaussian", "pgg", "generalizednormal"],
+            GeneralizedExtremeValue => &["gev", "generalizedextremevalue"],
+            Arcsine => &["arcsine"],
+            Uniform => &["uniform"],
+            Biweight => &["biweight"],
+            Triweight => &["triweight"],
+            Epanechnikov => &["epanechnikov"],
+            Cosine => &["cosine"],
+            Semicircle => &["semicircle"],
+            SymTriangular => &["symtriangular", "symtriangulardist"],
+            Gamma => &["gamma"],
+            InvGamma => &["invgamma", "inversegamma"],
+            LogNormal => &["lognormal"],
+            Exponential => &["exponential"],
+            Erlang => &["erlang"],
+            ChiSq => &["chisq"],
+            Chi => &["chi"],
+            Rayleigh => &["rayleigh"],
+            Weibull => &["weibull"],
+            Frechet => &["frechet"],
+            InverseGaussian => &["inversegaussian"],
+            BetaPrime => &["betaprime"],
+            NoncentralChiSq => &["noncentralchisq"],
+            Kolmogorov => &["kolmogorov"],
+            Levy => &["levy"],
+            Pareto => &["pareto"],
+            GeneralizedPareto => &["gpd", "generalizedpareto"],
+            LogUniform => &["loguniform"],
+            Beta => &["beta"],
+            LogitNormal => &["logitnormal"],
         }
     }
 
     /// The kind a (lower-cased) name spells, if any.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|k| k.name() == name)
+        Self::ALL.into_iter().find(|k| k.aliases().contains(&name))
     }
 
     /// The domain map the model reads the latent through.
     pub(crate) fn map(self) -> DomainMap {
+        use DensityKind::*;
         match self {
-            DensityKind::StudentT | DensityKind::Logistic => DomainMap::Identity,
-            DensityKind::Gamma | DensityKind::InvGamma | DensityKind::LogNormal => DomainMap::Exp,
-            DensityKind::Beta | DensityKind::LogitNormal => DomainMap::InvLogit,
+            Gamma | InvGamma | LogNormal | Exponential | Erlang | ChiSq | Chi | Rayleigh
+            | Weibull | Frechet | InverseGaussian | BetaPrime | NoncentralChiSq | Kolmogorov
+            | Levy | Pareto | GeneralizedPareto | LogUniform => DomainMap::Exp,
+            Beta | LogitNormal => DomainMap::InvLogit,
+            _ => DomainMap::Identity,
         }
     }
 
@@ -132,13 +309,43 @@ impl DensityKind {
         self == DensityKind::StudentT
     }
 
-    /// The shape θ it takes, if any: `(prefix, init, lower, upper)` of an auto-declared
-    /// one (`NU_<ETA>`, `MU_<ETA>`). ν starts at the t-transform's Pharmpy default; μ at ½.
-    pub(crate) fn shape_theta(self) -> Option<(&'static str, f64, f64, f64)> {
+    /// Whether the kind has no free spread, so its `ω` is unused and must be `FIX`.
+    pub(crate) fn omega_unused(self) -> bool {
+        use DensityKind::*;
+        matches!(
+            self,
+            Exponential | Erlang | Rayleigh | Kolmogorov | LogUniform
+        )
+    }
+
+    /// The shape θs the kind takes, in argument order.
+    pub(crate) fn shapes(self) -> &'static [ShapeSpec] {
+        use DensityKind::*;
+        const INF: f64 = f64::INFINITY;
+        const T_NU: &[ShapeSpec] = &[shape("NU", 80.0, 3.0, 100.0, (0.0, INF), true)];
+        const NIG: &[ShapeSpec] = &[
+            shape("ZETA", 1.0, 0.01, 100.0, (0.0, INF), true),
+            shape("RHO", 0.0, -0.95, 0.95, (-1.0, 1.0), true),
+        ];
+        const PGG: &[ShapeSpec] = &[shape("P", 2.0, 0.5, 20.0, (0.0, INF), true)];
+        const GEV: &[ShapeSpec] = &[shape("XI", 0.1, -0.45, 0.45, (-INF, 0.5), true)];
+        const ERLANG: &[ShapeSpec] = &[shape("K", 2.0, 1.0, 50.0, (0.0, INF), true)];
+        const NCCHISQ: &[ShapeSpec] = &[shape("K", 2.0, 0.1, 100.0, (0.0, INF), true)];
+        const LOGUNIF: &[ShapeSpec] = &[
+            shape("A", 0.5, 0.001, 1.0, (0.0, INF), true),
+            shape("B", 2.0, 1.0, 1000.0, (0.0, INF), true),
+        ];
+        const MU: &[ShapeSpec] = &[shape("MU", 0.5, 0.001, 0.999, (0.0, 1.0), false)];
         match self {
-            DensityKind::StudentT => Some(("NU", 80.0, 3.0, 100.0)),
-            DensityKind::Beta | DensityKind::LogitNormal => Some(("MU", 0.5, 0.001, 0.999)),
-            _ => None,
+            StudentT => T_NU,
+            NormalInverseGaussian => NIG,
+            PGeneralizedGaussian => PGG,
+            GeneralizedExtremeValue => GEV,
+            Erlang => ERLANG,
+            NoncentralChiSq => NCCHISQ,
+            LogUniform => LOGUNIF,
+            Beta | LogitNormal => MU,
+            _ => &[],
         }
     }
 }
@@ -150,26 +357,69 @@ pub struct EtaDensity {
     pub(crate) kind: DensityKind,
     /// η positions, ascending: every ETA of one Ω block.
     pub(crate) etas: Vec<usize>,
-    /// θ indices of the shape: `[ν]` for t, `[μ]` for beta and logit-normal, empty
-    /// otherwise.
+    /// θ indices of the shapes: the kind's ([`DensityKind::shapes`] order), then a
+    /// truncation's θ-valued bounds.
     pub(crate) shape_thetas: Vec<usize>,
+    /// `truncated(KIND, lo, hi)`: the kind restricted to `(lo, hi)`, renormalised.
+    pub(crate) trunc: Option<Truncation>,
 }
 
-/// `ln(1 + x)` over `T`: the value from libm's `ln_1p` (no cancellation), the jets from
-/// `ln(1 + x)`, which are `ln_1p`'s. The `l − l.val()` term has value 0 and carries them.
-fn ln1p_g<T: PkNum>(x: T) -> T {
-    let l = (T::from_f64(1.0) + x).ln();
-    (l - T::from_f64(l.val())) + T::from_f64(x.val().ln_1p())
+/// One end of a truncation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Bound {
+    /// No bound on this side.
+    Open,
+    /// A fixed value.
+    Value(f64),
+    /// A θ: its position in [`EtaDensity::shape_thetas`].
+    Shape(usize),
 }
 
-/// `ln(1 + eˣ)`, without overflow: `x + ln(1 + e⁻ˣ)` for `x > 0`.
-fn softplus_g<T: PkNum>(x: T) -> T {
-    if x.val() > 0.0 {
-        x + ln1p_g((-x).exp())
-    } else {
-        ln1p_g(x.exp())
+/// `truncated(KIND, lo, hi)` (#1716): the kind's density on `(lo, hi)`, divided by the mass
+/// it puts there. The latent is unconstrained: the model reads `lo + (hi − lo)·inv_logit(z)`
+/// with both bounds, `lo + exp(z)` or `hi − exp(z)` with one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Truncation {
+    pub(crate) lo: Bound,
+    pub(crate) hi: Bound,
+}
+
+impl EtaDensity {
+    /// The model expression that reads the latent of η slot `eta` as the random effect, or
+    /// `None` where the model reads the latent itself. `theta_slot(k)` is θ `k`'s
+    /// expression.
+    pub(crate) fn read_expr(
+        &self,
+        eta: crate::parser::model_parser::Expression,
+    ) -> Option<crate::parser::model_parser::Expression> {
+        use crate::parser::model_parser::{BinOp, Expression as E};
+        let bound = |b: Bound| match b {
+            Bound::Open => None,
+            Bound::Value(v) => Some(E::Literal(v)),
+            Bound::Shape(p) => Some(E::Theta(self.shape_thetas[p])),
+        };
+        let bx = |l: E, op: BinOp, r: E| E::BinOp(Box::new(l), op, Box::new(r));
+        let call = |f: &str, a: E| E::UnaryFn(f.to_string(), Box::new(a));
+        match self.trunc {
+            Some(t) => match (bound(t.lo), bound(t.hi)) {
+                (Some(lo), Some(hi)) => Some(bx(
+                    lo.clone(),
+                    BinOp::Add,
+                    bx(bx(hi, BinOp::Sub, lo), BinOp::Mul, call("inv_logit", eta)),
+                )),
+                (Some(lo), None) => Some(bx(lo, BinOp::Add, call("exp", eta))),
+                (None, Some(hi)) => Some(bx(hi, BinOp::Sub, call("exp", eta))),
+                (None, None) => self.kind.map().function().map(|f| call(f, eta)),
+            },
+            None => self.kind.map().function().map(|f| call(f, eta)),
+        }
     }
 }
+
+use kinds::ln1p_g;
+
+#[path = "eta_density_kinds.rs"]
+mod kinds;
 
 /// `c_g(z)` of one group (see the module docs); `+∞` where the parameters leave the
 /// kind's domain (a beta variance at or above `μ(1 − μ)`). `eta` is the full latent
@@ -188,6 +438,46 @@ fn group_correction_g<T: PkNum>(
             q = q + oi(a, b) * eta[a] * eta[b];
         }
     }
+    if let Some(t) = d.trunc {
+        // Univariate: the kind's η-density on (lo, hi), renormalised, read through the
+        // truncation's own map; less the Gaussian term, as for every kind.
+        let a = d.etas[0];
+        let z = eta[a];
+        let w = c(1.0) / oi(a, a);
+        let shapes: Vec<T> = d.shape_thetas.iter().map(|&k| theta(k)).collect();
+        let ks = &shapes[..d.kind.shapes().len()];
+        let bound = |b: Bound| match b {
+            Bound::Open => None,
+            Bound::Value(v) => Some(c(v)),
+            Bound::Shape(p) => Some(shapes[p]),
+        };
+        let (lo, hi) = (bound(t.lo), bound(t.hi));
+        let (x, log_jac) = match (lo, hi) {
+            (Some(lo), Some(hi)) => (
+                lo + (hi - lo) * z.inv_logit(),
+                (hi - lo).ln() - kinds::softplus_g(-z) - kinds::softplus_g(z),
+            ),
+            (Some(lo), None) => (lo + z.exp(), z),
+            (None, Some(hi)) => (hi - z.exp(), z),
+            (None, None) => (z, c(0.0)),
+        };
+        let cdf = |b: Option<T>, open: f64| match b {
+            Some(v) => kinds::eta_cdf(d.kind, v, w, ks),
+            None => Some(c(open)),
+        };
+        let (Some(f_lo), Some(f_hi)) = (cdf(lo, 0.0), cdf(hi, 1.0)) else {
+            return c(f64::INFINITY);
+        };
+        let mass = f_hi - f_lo;
+        if !(mass.val() > 0.0) {
+            return c(f64::INFINITY);
+        }
+        let lp = kinds::eta_log_pdf(d.kind, x, w, ks) + log_jac - mass.ln();
+        if !lp.val().is_finite() {
+            return c(f64::INFINITY);
+        }
+        return c(-2.0) * lp - (q + w.ln() + ln_2pi);
+    }
     if d.kind == DensityKind::StudentT {
         let n = d.etas.len() as f64;
         let nu = theta(d.shape_thetas[0]);
@@ -201,49 +491,12 @@ fn group_correction_g<T: PkNum>(
     let a = d.etas[0];
     let z = eta[a];
     let w = c(1.0) / oi(a, a);
-    let gauss = q + w.ln() + ln_2pi;
-    // `−2 ln p_z(z)` of the kind.
-    let neg2 = match d.kind {
-        DensityKind::StudentT => unreachable!("handled above"),
-        DensityKind::Logistic => {
-            // s = √(3ω)/π; ln p = −u − 2 ln(1 + e^{−u}) − ln s, u = z/s.
-            let s = (c(3.0) * w).sqrt() * c(1.0 / std::f64::consts::PI);
-            let u = z * (c(1.0) / s);
-            c(2.0) * u + c(4.0) * softplus_g(-u) + c(2.0) * s.ln()
-        }
-        DensityKind::Gamma => {
-            let k = c(1.0) / w;
-            c(-2.0) * (k * z - z.exp() * k - k.ln_gamma() - k * w.ln())
-        }
-        DensityKind::InvGamma => {
-            let alpha = c(2.0) + c(1.0) / w;
-            let beta = alpha - c(1.0);
-            c(-2.0) * (alpha * beta.ln() - alpha.ln_gamma() - alpha * z - beta * (-z).exp())
-        }
-        DensityKind::LogNormal => {
-            let s2 = ln1p_g(w);
-            let r = z + s2 * c(0.5);
-            r * r * (c(1.0) / s2) + s2.ln() + ln_2pi
-        }
-        DensityKind::Beta => {
-            let mu = theta(d.shape_thetas[0]);
-            let n = mu * (c(1.0) - mu) * (c(1.0) / w) - c(1.0);
-            if !(n.val() > 0.0) {
-                return c(f64::INFINITY);
-            }
-            let (pa, pb) = (mu * n, (c(1.0) - mu) * n);
-            let ln_beta = pa.ln_gamma() + pb.ln_gamma() - n.ln_gamma();
-            // ln σ(z) = −softplus(−z), ln σ(−z) = −softplus(z).
-            c(2.0) * (pa * softplus_g(-z) + pb * softplus_g(z) + ln_beta)
-        }
-        DensityKind::LogitNormal => {
-            let mu = theta(d.shape_thetas[0]);
-            let m = mu.ln() - (c(1.0) - mu).ln();
-            let r = z - m;
-            r * r * (c(1.0) / w) + w.ln() + ln_2pi
-        }
-    };
-    neg2 - gauss
+    let shapes: Vec<T> = d.shape_thetas.iter().map(|&k| theta(k)).collect();
+    let neg2 = kinds::latent_neg2_logpdf(d.kind, z, w, &shapes);
+    if !neg2.val().is_finite() {
+        return c(f64::INFINITY);
+    }
+    neg2 - (q + w.ln() + ln_2pi)
 }
 
 /// `Σ_g c_g(η)`: what turns the Gaussian `ηᵀΩ⁻¹η + ln|Ω|` into the exact `−2 ln p(η)`.
@@ -460,6 +713,57 @@ pub(crate) fn correction_jets(
 /// multivariate t's scale mixture. A univariate kind draws the random effect from its
 /// distribution and stores the latent `m⁻¹(η)`. A Gaussian model draws nothing extra, so
 /// its random stream is untouched.
+/// A latent draw of a truncated group: `η` by the inverse CDF between `F(lo)` and `F(hi)`
+/// (bisection on the kind's CDF, inside a bracket that widens until it holds the target),
+/// then the truncation map's inverse.
+fn sample_truncated(
+    d: &EtaDensity,
+    t: Truncation,
+    w: f64,
+    shapes: &[f64],
+    rng: &mut impl rand::Rng,
+) -> f64 {
+    use rand_distr::{Distribution, Uniform};
+    let ks = &shapes[..d.kind.shapes().len()];
+    let val = |b: Bound| match b {
+        Bound::Open => None,
+        Bound::Value(v) => Some(v),
+        Bound::Shape(p) => Some(shapes[p]),
+    };
+    let (lo, hi) = (val(t.lo), val(t.hi));
+    let cdf = |x: f64| kinds::eta_cdf::<f64>(d.kind, x, w, ks).unwrap_or(f64::NAN);
+    let f_lo = lo.map_or(0.0, cdf);
+    let f_hi = hi.map_or(1.0, cdf);
+    let u: f64 = Uniform::new(0.0f64, 1.0).map_or(0.5, |d| d.sample(rng));
+    let target = f_lo + u * (f_hi - f_lo);
+    let sd = w.sqrt().max(1e-6);
+    let (mut a, mut b) = (lo.unwrap_or(-sd), hi.unwrap_or(sd));
+    while lo.is_none() && cdf(a) > target {
+        a -= (b - a).max(sd);
+    }
+    while hi.is_none() && cdf(b) < target {
+        b += (b - a).max(sd);
+    }
+    for _ in 0..200 {
+        let m = 0.5 * (a + b);
+        if cdf(m) < target {
+            a = m;
+        } else {
+            b = m;
+        }
+    }
+    let x = 0.5 * (a + b);
+    match (lo, hi) {
+        (Some(lo), Some(hi)) => {
+            let p = ((x - lo) / (hi - lo)).clamp(1e-300, 1.0 - 1e-16);
+            (p / (1.0 - p)).ln()
+        }
+        (Some(lo), None) => (x - lo).max(1e-300).ln(),
+        (None, Some(hi)) => (hi - x).max(1e-300).ln(),
+        (None, None) => x,
+    }
+}
+
 pub(crate) fn redraw_latents(
     densities: &[EtaDensity],
     omega: &DMatrix<f64>,
@@ -467,107 +771,64 @@ pub(crate) fn redraw_latents(
     eta: &mut [f64],
     rng: &mut impl rand::Rng,
 ) {
-    use rand_distr::{Beta, ChiSquared, Distribution, Gamma, StandardNormal};
+    use rand_distr::{ChiSquared, Distribution};
     for d in densities {
         let a = d.etas[0];
-        let w = omega[(a, a)];
-        let shape = d.shape_thetas.first().map(|&k| theta[k]);
-        match d.kind {
-            DensityKind::StudentT => {
-                let nu = shape.expect("t has ν");
-                let scale = match ChiSquared::new(nu) {
-                    Ok(chi) => (nu / chi.sample(rng).max(1e-300)).sqrt(),
-                    Err(_) => f64::NAN,
-                };
-                for &k in &d.etas {
-                    eta[k] *= scale;
-                }
+        let shapes: Vec<f64> = d.shape_thetas.iter().map(|&k| theta[k]).collect();
+        if d.kind == DensityKind::StudentT {
+            let nu = shapes[0];
+            let scale = match ChiSquared::new(nu) {
+                Ok(chi) => (nu / chi.sample(rng).max(1e-300)).sqrt(),
+                Err(_) => f64::NAN,
+            };
+            for &k in &d.etas {
+                eta[k] *= scale;
             }
-            DensityKind::Logistic => {
-                let s = (3.0 * w).sqrt() / std::f64::consts::PI;
-                let u: f64 = rand_distr::Uniform::new(0.0f64, 1.0)
-                    .map_or(0.5, |d| d.sample(rng))
-                    .max(f64::MIN_POSITIVE);
-                eta[a] = s * (u / (1.0 - u)).ln();
-            }
-            DensityKind::Gamma => {
-                eta[a] = Gamma::new(1.0 / w, w).map_or(f64::NAN, |g| g.sample(rng).ln());
-            }
-            DensityKind::InvGamma => {
-                let alpha = 2.0 + 1.0 / w;
-                // η = 1/G, G ~ Gamma(α, rate β = α − 1), so z = −ln G.
-                eta[a] = Gamma::new(alpha, 1.0 / (alpha - 1.0))
-                    .map_or(f64::NAN, |g| -g.sample(rng).ln());
-            }
-            DensityKind::LogNormal => {
-                let s2 = w.ln_1p();
-                let n: f64 = StandardNormal.sample(rng);
-                eta[a] = -0.5 * s2 + s2.sqrt() * n;
-            }
-            DensityKind::Beta => {
-                let mu = shape.expect("beta has μ");
-                let n = mu * (1.0 - mu) / w - 1.0;
-                eta[a] = Beta::new(mu * n, (1.0 - mu) * n).map_or(f64::NAN, |b| {
-                    let e: f64 = b.sample(rng);
-                    (e / (1.0 - e)).ln()
-                });
-            }
-            DensityKind::LogitNormal => {
-                let mu = shape.expect("logit-normal has μ");
-                let n: f64 = StandardNormal.sample(rng);
-                eta[a] = (mu / (1.0 - mu)).ln() + w.sqrt() * n;
-            }
+            continue;
         }
+        let w = omega[(a, a)];
+        if let Some(t) = d.trunc {
+            eta[a] = sample_truncated(d, t, w, &shapes, rng);
+            continue;
+        }
+        let draw = kinds::sample_eta(d.kind, w, &shapes, rng);
+        eta[a] = d.kind.map().invert(draw);
     }
 }
 
-/// What a `density` random effect is not carried beside yet (#1716), as `fit()`'s refusal:
-/// a `[mixture]` (each class draws its own Ω), FREM (its covariate ETAs are Gaussian
-/// pseudo-observations), a multivariate t block under Bayes (its ω move is univariate),
-/// VI's Adam Ω step (the Gaussian prior's gradient), and FOCE without interaction on a
-/// correlated residual (the conditional form FOCE takes under a density is the diagonal
-/// one). `None` when the fit can run.
+/// What a `density` random effect is not carried beside (#1716), as `fit()`'s refusal:
+/// FREM, whose covariate ETAs share one correlated Gaussian block with the parameter ETAs,
+/// and a `[mixture]` class override of a density ETA's ω (a density reads the Ω every
+/// class shares). `None` when the fit can run.
 pub(crate) fn fit_refusal(
     model: &crate::types::CompiledModel,
-    options: &crate::types::FitOptions,
-    params: &crate::types::ModelParameters,
+    _options: &crate::types::FitOptions,
+    _params: &crate::types::ModelParameters,
 ) -> Option<String> {
-    use crate::types::EstimationMethod as M;
     if model.eta_densities.is_empty() {
         return None;
     }
-    if model.mixture.is_some() {
-        return Some("a `density` random effect cannot be combined with a [mixture] yet".into());
-    }
     if model.frem_config.is_some() {
-        return Some("a `density` random effect cannot be combined with FREM".into());
+        return Some(
+            "a `density` random effect cannot be combined with FREM: FREM's covariate ETAs \
+             share one correlated Gaussian block with the parameter ETAs"
+                .into(),
+        );
     }
-    let methods = std::iter::once(options.method).chain(options.methods.iter().copied());
-    for m in methods {
-        if m == M::Vi && options.vi_omega_update != crate::types::ViOmegaUpdate::ClosedForm {
-            return Some(
-                "`vi_omega_update = adam` steps Ω by the Gaussian prior's gradient; a `density` \
-                 random effect needs the default `vi_omega_update = closed_form`, whose density \
-                 groups take their own M-step"
-                    .into(),
-            );
-        }
-        if m == M::Bayes && model.eta_densities.iter().any(|d| d.etas.len() > 1) {
-            return Some(
-                "`method = bayes` samples a univariate `density`'s ω, not a multivariate t \
-                 block's: declare each ETA on its own `omega` line"
-                    .into(),
-            );
-        }
-        let foce = matches!(m, M::Foce | M::FoceGn | M::FoceGnHybrid)
-            && !crate::types::interaction_for(m, options.interaction);
-        if foce && model.residual_cov_at(params).is_dense() {
-            return Some(
-                "FOCE without interaction scores a `density` random effect in its conditional \
-                 form, which is diagonal: a correlated residual (`block_sigma`, `correlation`) \
-                 needs `method = focei`"
-                    .into(),
-            );
+    if let Some(mix) = model.mixture.as_ref() {
+        for o in &mix.omega_overrides {
+            let hit = model
+                .eta_names
+                .iter()
+                .position(|n| n == &o.name)
+                .is_some_and(|k| model.eta_densities.iter().any(|d| d.etas.contains(&k)));
+            if hit {
+                return Some(format!(
+                    "class {} overrides the omega of `{}`, which follows a `density`: a density \
+                     reads one Ω shared by every class, so a per-class Ω for it is not supported",
+                    o.class, o.name
+                ));
+            }
         }
     }
     None

@@ -1446,31 +1446,37 @@ pub fn run_bayes(
                     }
                 }
 
-                // ---- 2d. a density ETA's ω (#1716): Metropolis on ln ω against its exact
-                // latent density, under the inverse-gamma prior the conjugate update uses.
+                // ---- 2d. a density group's Ω block (#1716): Metropolis against its exact
+                // latent density, under the inverse-Wishart prior's marginal on the block.
                 if !model.eta_densities.is_empty() {
-                    let a0 = (nu0 - n_eta as f64 + 1.0) / 2.0;
                     for (g, d) in model.eta_densities.iter().enumerate() {
-                        let j = d.etas[0];
-                        omega_mat[(j, j)] = omega_before[(j, j)];
-                        if init_params.omega_fixed.get(j).copied().unwrap_or(false) {
+                        for &a in &d.etas {
+                            for &b in &d.etas {
+                                omega_mat[(a, b)] = omega_before[(a, b)];
+                            }
+                        }
+                        if d.etas
+                            .iter()
+                            .any(|&a| init_params.omega_fixed.get(a).copied().unwrap_or(false))
+                        {
                             continue;
                         }
-                        let mut w = omega_before[(j, j)];
+                        let n_g = d.etas.len();
+                        let lam =
+                            DMatrix::from_fn(n_g, n_g, |i, j| lambda0[(d.etas[i], d.etas[j])]);
                         dens_prop[g] += 1;
-                        if crate::estimation::eta_density_mstep::mh_log_omega(
+                        if crate::estimation::eta_density_mstep::mh_group_omega(
                             d,
                             &etas,
-                            &mut w,
+                            &mut omega_mat,
                             &theta,
-                            a0,
-                            lambda0[(j, j)] / 2.0,
+                            nu0 - (n_eta - n_g) as f64,
+                            &lam,
                             dens_step[g],
                             &mut rng,
                         ) {
                             dens_acc[g] += 1;
                         }
-                        omega_mat[(j, j)] = w.max(OMEGA_DIAG_FLOOR);
                     }
                     omega_cur = OmegaMatrix::from_matrix(
                         omega_mat.clone(),

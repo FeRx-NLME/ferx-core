@@ -30,24 +30,70 @@ As in Pumas's `@random` block, the ETA *is* the distributed quantity: under
 
 ## Distributions
 
-| `density` | support | mean | spread | shape θ |
-|---|---|---|---|---|
-| `t(ν)` | ℝ | 0 | scale² ω (variance `ω·ν/(ν−2)`) | ν, bounded above 0 |
-| `logistic` | ℝ | 0 | variance ω | — |
-| `gamma` | (0, ∞) | 1 | variance ω | — |
-| `invgamma` | (0, ∞) | 1 | variance ω | — |
-| `lognormal` | (0, ∞) | 1 | variance ω | — |
-| `beta(μ)` | (0, 1) | μ | variance ω (needs ω < μ(1 − μ)) | μ, bounded in [0, 1] |
-| `logitnormal(μ)` | (0, 1) | — | `logit η ~ N(logit μ, ω)` | μ, bounded in [0, 1] |
+Every distribution Pumas's `@random` block takes for a scalar or vector random
+effect is available. The name after `density` is Pumas's, lower-cased; the
+aliases in parentheses also work. The value on the `omega` line is ω.
 
-The value on the `omega` line is always ω. A shape θ is named inside the
-parentheses, or declared automatically by empty ones: `density t()` declares
-`NU_ETA_V` (init 80, bounds 3–100) and `density beta()` declares `MU_ETA_F`
-(init 0.5, bounds 0.001–0.999).
+### On ℝ
 
-A `block_omega` can carry `density t(ν)`, which makes the block a multivariate
-t with one ν. The other kinds are univariate, and a block of them is refused:
-correlating them needs a copula, which is not supported.
+| `density` | parameterisation | shape θ |
+|---|---|---|
+| `t(ν)` (`tdist`) | scale² ω; a `block_omega` is multivariate t | ν > 0 |
+| `logistic` | mean 0, variance ω | — |
+| `laplace` | mean 0, variance ω | — |
+| `cauchy` | scale² ω | — |
+| `gumbel` | mean 0, variance ω | — |
+| `nig(ζ, ρ)` (`normalinversegaussian`) | mean 0, variance ω; ζ tail, ρ skew | ζ > 0, −1 < ρ < 1 |
+| `pgeneralizedgaussian(p)` (`pgg`) | mean 0, variance ω | p > 0 |
+| `gev(ξ)` (`generalizedextremevalue`) | mean 0, variance ω | ξ < ½ |
+| `arcsine`, `uniform` | mean 0, variance ω, on a symmetric interval | — |
+| `biweight`, `triweight`, `epanechnikov`, `cosine`, `semicircle`, `symtriangular` | mean 0, variance ω, on a symmetric interval | — |
+
+### On (0, ∞)
+
+| `density` | parameterisation | shape θ |
+|---|---|---|
+| `gamma`, `chisq` | mean 1, variance ω (a scaled χ² is a gamma) | — |
+| `invgamma` (`inversegamma`) | mean 1, variance ω | — |
+| `lognormal` | mean 1, variance ω | — |
+| `chi` | mean 1, variance ω (a scaled χ, i.e. Nakagami) | — |
+| `weibull`, `frechet` | mean 1, variance ω (shape solved from ω) | — |
+| `inversegaussian` | mean 1, variance ω | — |
+| `betaprime` | mean 1, variance ω | — |
+| `noncentralchisq(k)` | mean 1, variance ω | k > 0 |
+| `pareto`, `gpd` (`generalizedpareto`) | mean 1, variance ω | — |
+| `levy` | scale ω (no mean) | — |
+| `exponential`, `rayleigh`, `kolmogorov` | fixed shape (mean 1; Kolmogorov unscaled) | — |
+| `erlang(k)` | mean 1, variance 1/k | k > 0 |
+| `loguniform(a, b)` | on (a, b) | 0 < a < b |
+
+`exponential`, `rayleigh`, `erlang`, `kolmogorov` and `loguniform` have no free
+spread, so their omega is unused and must be declared `FIX`.
+
+### On (0, 1)
+
+| `density` | parameterisation | shape θ |
+|---|---|---|
+| `beta(μ)` | mean μ, variance ω (needs ω < μ(1 − μ)) | μ in [0, 1] |
+| `logitnormal(μ)` | `logit η ~ N(logit μ, ω)` | μ in [0, 1] |
+
+### Truncation and the rest of Pumas's list
+
+`density truncated(KIND, LO, HI)` restricts any univariate kind to `(LO, HI)`,
+renormalised: `truncated(gamma, 0.2, 5)`, `truncated(t(NU), -1, inf)`. A bound is
+a number, `inf` / `-inf`, or a `FIX`ed θ. The random effect is read through a
+bounded map, so the latent stays unconstrained. Pumas's `Constrained` is the same
+thing, and its `product_distribution` is one `omega` line per ETA. `normalcanon`
+and `normal` are the default Gaussian.
+
+Wishart, InverseWishart, LKJ and LKJCholesky are distributions of a matrix. A
+ferx ETA is a scalar, or a vector under `block_omega`, so they are not random-
+effect distributions here; they are priors on Ω.
+
+A shape θ is named inside the parentheses, or declared automatically by empty
+ones: `density t()` declares `NU_ETA_V`, `density beta()` declares `MU_ETA_F`.
+A block (`block_omega … density t(ν)`) is a multivariate t with one ν. The other
+kinds are univariate: correlating them needs a copula, which is not supported.
 
 ## Transforms
 
@@ -83,18 +129,19 @@ including `∂/∂ω` and `∂/∂ν` / `∂/∂μ`.
   curvature in `H̃`.
 - **FOCE** (no interaction): the Sheiner–Beal marginal integrates η as a
   Gaussian, so a density model takes the conditional form FOCE uses beside a
-  non-Gaussian endpoint (variance at the EBE, no interaction term). On a
-  Gaussian model it is unchanged.
+  non-Gaussian endpoint (variance at the EBE, no interaction term; on a
+  correlated residual, the dense form without it). On a Gaussian model it is
+  unchanged.
 - **IMP / IMPMAP**: importance weights use the exact prior; the Gaussian
   defensive proposal stays a proposal.
 - **SAEM / MCEM**: a density group's ω and shape θ have no sufficient
   statistic, so they move by Fisher scoring on their exact score, one step per
   SAEM iteration (NONMEM's rule for such parameters) and to convergence per
   MCEM iteration. Gaussian ETAs keep their closed form.
-- **Bayes**: the η and θ moves score the exact prior (so ν and μ are sampled
-  against it). A density ETA's ω has no conjugate update, so it moves by a
-  Metropolis step on `ln ω` under the same inverse-gamma prior a Gaussian
-  variance gets.
+- **Bayes**: the η and θ moves score the exact prior (so the shape θs are
+  sampled against it). A density group's Ω block has no conjugate update, so it
+  moves by a Metropolis step on its log-Cholesky factor, under the marginal the
+  inverse-Wishart prior puts on that block (an inverse gamma for one ETA).
 - **VI**: the KL term is sampled with the exact prior, and after each iteration
   a density group's ω and shape θ maximise the prior half of the ELBO over the
   variational draws (the MCEM objective).
@@ -103,13 +150,18 @@ including `∂/∂ω` and `∂/∂ν` / `∂/∂μ`.
 A density ETA is not mu-referenced, and its omega row is labelled `custom`, with
 no CV%.
 
-### Not supported yet
+### Not supported
 
-A `[mixture]`, FREM, FOCE without interaction on a correlated residual
-(`block_sigma`, `correlation`), a multivariate t block under `method = bayes`,
-and `vi_omega_update = adam` are refused with `E_DENSITY_UNSUPPORTED`. An IOV
-`kappa` cannot carry a `density`
+FREM is refused with `E_DENSITY_UNSUPPORTED`: its covariate ETAs share one
+correlated Gaussian block with the parameter ETAs. So is a `[mixture]` class
+that overrides a density ETA's omega, since a density reads the Ω every class
+shares. An IOV `kappa` cannot carry a `density`
 ([#1717](https://github.com/FeRx-NLME/ferx-core/issues/1717)).
+
+A kink or an edge inside the support (Laplace's at 0, the triangular kernel's,
+the uniform's and arcsine's edges) gives the Laplace and FOCE curvature nothing
+to read there. IMP, SAEM and Bayes score such kinds exactly; FOCE and Laplace
+run, but rely on the data for their curvature.
 
 ## Validation
 

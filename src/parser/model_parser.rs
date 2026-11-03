@@ -4258,7 +4258,12 @@ pub fn parse_full_model_with(
         unbound_level_blocks,
         declared_priors,
     ) = parse_parameters(param_lines, level_bindings)?;
-    let eta_densities = resolve_eta_densities(param_lines, &eta_names_bsv, &thetas)?;
+    let eta_densities = resolve_eta_densities(param_lines, &eta_names_bsv, &thetas, |e| {
+        omegas.iter().any(|o| o.name == e && o.fixed)
+            || block_omegas
+                .iter()
+                .any(|b| b.fixed && b.names.iter().any(|n| n == e))
+    })?;
     // Install the θ level table for the remainder of this parse so a
     // gather (`PLACEBO[IDX]`) resolves identically in every block that parses
     // expressions. Dropped at the end of `parse_full_model`, restoring whatever
@@ -4721,9 +4726,12 @@ pub fn parse_full_model_with(
     // `[individual_parameters]` is wrapped, on the AST, before mu-reference detection.
     // A read in any other block would see the latent instead, a plausible wrong answer,
     // so it is refused, as a weighted kappa's is.
-    let density_maps: HashMap<usize, &'static str> = eta_densities
+    let density_maps: HashMap<usize, Expression> = eta_densities
         .iter()
-        .filter_map(|d| d.kind.map().function().map(|f| (d.etas[0], f)))
+        .filter_map(|d| {
+            d.read_expr(Expression::Eta(d.etas[0]))
+                .map(|e| (d.etas[0], e))
+        })
         .collect();
     if !density_maps.is_empty() {
         let named_blocks = extracted
@@ -4750,11 +4758,7 @@ pub fn parse_full_model_with(
                 }
             }
         }
-        rewrite_eta_leaves(&mut indiv_stmts, &|i| {
-            density_maps
-                .get(&i)
-                .map(|f| Expression::UnaryFn((*f).to_string(), Box::new(Expression::Eta(i))))
-        });
+        rewrite_eta_leaves(&mut indiv_stmts, &|i| density_maps.get(&i).cloned());
     }
     if !weighted_kappa_slots.is_empty() {
         // Mu-reference detection (further down) runs on the *rewritten*
@@ -8446,12 +8450,29 @@ fn resolve_eta_densities(
     param_lines: &[String],
     eta_names: &[String],
     thetas: &[ThetaSpec],
+    omega_fixed: impl Fn(&str) -> bool,
 ) -> Result<Vec<crate::stats::eta_density::EtaDensity>, String> {
-    use crate::stats::eta_density::{DensityKind, EtaDensity};
+    use crate::stats::eta_density::{Bound, DensityKind, EtaDensity, Truncation};
     let mut out = Vec::new();
-    for d in crate::parser::eta_shape::omega_density_decls(param_lines)? {
+    for mut d in crate::parser::eta_shape::omega_density_decls(param_lines)? {
+        // `truncated(KIND[(SHAPES)], LO, HI)`: the inner kind and its shapes take the place
+        // of the clause's, and the bounds are read last.
+        let mut trunc_args: Option<(String, String)> = None;
+        if d.kind == "truncated" {
+            let (name, shapes, lo, hi) =
+                crate::parser::eta_shape::parse_truncated(&d.args, &d.line)?;
+            d.kind = name;
+            d.args = shapes.unwrap_or_default();
+            trunc_args = Some((lo, hi));
+        }
         let kind = DensityKind::from_name(&d.kind)
             .ok_or_else(|| crate::parser::eta_shape::unknown_density(&d.kind, &d.line))?;
+        if trunc_args.is_some() && d.etas.len() > 1 {
+            return Err(format!(
+                "[parameters] `truncated` is univariate: put it on a standalone `omega` line: `{}`",
+                d.line
+            ));
+        }
         if d.etas.len() > 1 && !kind.allows_block() {
             return Err(format!(
                 "[parameters] `density {}` is univariate: a block of correlated ETAs can be \
@@ -8469,22 +8490,37 @@ fn resolve_eta_densities(
             );
         }
         etas.sort_unstable();
-        let want = usize::from(kind.shape_theta().is_some());
+        let specs = kind.shapes();
+        let want = specs.len();
         if d.args.len() != want {
             return Err(format!(
                 "[parameters] `density {}` takes {} (got {}): `{}`",
                 d.kind,
-                if want == 1 {
-                    "one shape θ, or `()` to declare it"
-                } else {
-                    "no shape θ"
+                match want {
+                    0 => "no shape θ".to_string(),
+                    1 => format!("one shape θ ({}), or `()` to declare it", specs[0].prefix),
+                    n => format!(
+                        "{n} shape θs ({}), or `()` to declare them",
+                        specs
+                            .iter()
+                            .map(|sp| sp.prefix)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 },
                 d.args.len(),
                 d.line
             ));
         }
+        if kind.omega_unused() && !d.etas.iter().all(|e| omega_fixed(e)) {
+            return Err(format!(
+                "[parameters] `density {}` has no free spread, so its omega value is unused: \
+                 declare it `FIX` (e.g. `omega {} ~ 1 FIX density {}`): `{}`",
+                d.kind, d.etas[0], d.kind, d.line
+            ));
+        }
         let mut shape_thetas = Vec::with_capacity(want);
-        for a in &d.args {
+        for (a, sp) in d.args.iter().zip(specs) {
             let k = thetas.iter().position(|t| &t.name == a).ok_or_else(|| {
                 format!(
                     "[parameters] `{a}` in `{}` is not a declared θ — declare it, or write \
@@ -8493,27 +8529,81 @@ fn resolve_eta_densities(
                 )
             })?;
             let t = &thetas[k];
-            let bad_bounds = match kind {
-                DensityKind::StudentT => (!(t.lower > 0.0)).then_some("bounded above 0"),
-                DensityKind::Beta | DensityKind::LogitNormal => {
-                    (!(t.lower >= 0.0 && t.upper <= 1.0 && t.lower < t.upper))
-                        .then_some("bounded inside [0, 1]")
-                }
-                _ => None,
+            let (lo, hi) = sp.domain;
+            let inside = if sp.strict {
+                t.lower > lo && t.upper < hi
+            } else {
+                t.lower >= lo && t.upper <= hi
             };
-            if let Some(what) = bad_bounds {
+            if !(inside && t.lower < t.upper) {
                 return Err(format!(
-                    "[parameters] the shape θ `{a}` of `density {}` must be {what} (its bounds \
-                     are {}, {}): `{}`",
-                    d.kind, t.lower, t.upper, d.line
+                    "[parameters] the shape θ `{a}` of `density {}` must be bounded inside \
+                     {}{lo}, {hi}{} (its bounds are {}, {}): `{}`",
+                    d.kind,
+                    if sp.strict { "(" } else { "[" },
+                    if sp.strict { ")" } else { "]" },
+                    t.lower,
+                    t.upper,
+                    d.line
                 ));
             }
             shape_thetas.push(k);
+        }
+        let mut trunc = None;
+        if let Some((lo, hi)) = trunc_args {
+            let mut bound = |text: &str, open_side: f64| -> Result<Bound, String> {
+                let t = text.trim().to_ascii_lowercase();
+                if t == "inf" || t == "+inf" || t == "-inf" {
+                    let side = if t.starts_with('-') { -1.0 } else { 1.0 };
+                    if side != open_side {
+                        return Err(format!(
+                            "[parameters] a `truncated` bound `{text}` is on the wrong side: `{}`",
+                            d.line
+                        ));
+                    }
+                    return Ok(Bound::Open);
+                }
+                if let Ok(v) = t.parse::<f64>() {
+                    return Ok(Bound::Value(v));
+                }
+                let k = thetas
+                    .iter()
+                    .position(|th| th.name == text.trim())
+                    .ok_or_else(|| {
+                        format!(
+                        "[parameters] the `truncated` bound `{text}` is neither a number, `inf` \
+                         nor a declared θ: `{}`",
+                        d.line
+                    )
+                    })?;
+                if !thetas[k].fixed {
+                    return Err(format!(
+                        "[parameters] the `truncated` bound `{text}` must be a FIXed θ (or a \
+                         number): the model reads the random effect through its bounds, and a \
+                         truncation point has no regular estimate: `{}`",
+                        d.line
+                    ));
+                }
+                shape_thetas.push(k);
+                Ok(Bound::Shape(shape_thetas.len() - 1))
+            };
+            let (l, h) = (bound(&lo, -1.0)?, bound(&hi, 1.0)?);
+            if let (Bound::Value(a), Bound::Value(b)) = (l, h) {
+                if !(a < b) {
+                    return Err(format!(
+                        "[parameters] a `truncated` interval needs its lower bound below its \
+                         upper one: `{}`",
+                        d.line
+                    ));
+                }
+            }
+            trunc = Some(Truncation { lo: l, hi: h });
         }
         out.push(EtaDensity {
             kind,
             etas,
             shape_thetas,
+            trunc,
         });
     }
     Ok(out)

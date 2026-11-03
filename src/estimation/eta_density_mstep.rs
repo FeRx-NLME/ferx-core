@@ -33,15 +33,16 @@ use nalgebra::{DMatrix, DVector};
 struct GroupLayout {
     /// Whether Ω's block is free (not FIX).
     omega_free: bool,
-    /// The shape θ's index and bounds, if it is free.
-    shape: Option<(usize, f64, f64)>,
+    /// Per shape θ of the group (in `shape_thetas` order): its index and bounds when free,
+    /// `None` when FIXed (read from θ).
+    shapes: Vec<Option<(usize, f64, f64)>>,
     /// `n(n+1)/2` Cholesky entries (row-major lower triangle) when `omega_free`.
     n_chol: usize,
 }
 
 impl GroupLayout {
     fn dim(&self) -> usize {
-        self.n_chol + usize::from(self.shape.is_some())
+        self.n_chol + self.shapes.iter().filter(|s| s.is_some()).count()
     }
 }
 
@@ -84,14 +85,18 @@ impl DensityMstep {
                     .etas
                     .iter()
                     .any(|&a| omega_fixed.get(a).copied().unwrap_or(false));
-                let shape = d.shape_thetas.first().and_then(|&k| {
-                    let (lo, hi) = theta_bounds[k];
-                    (!theta_fixed.get(k).copied().unwrap_or(false) && lo < hi)
-                        .then_some((k, lo, hi))
-                });
+                let shapes = d
+                    .shape_thetas
+                    .iter()
+                    .map(|&k| {
+                        let (lo, hi) = theta_bounds[k];
+                        (!theta_fixed.get(k).copied().unwrap_or(false) && lo < hi)
+                            .then_some((k, lo, hi))
+                    })
+                    .collect();
                 GroupLayout {
                     omega_free,
-                    shape,
+                    shapes,
                     n_chol: if omega_free { n * (n + 1) / 2 } else { 0 },
                 }
             })
@@ -105,7 +110,7 @@ impl DensityMstep {
     pub(crate) fn owned_thetas(&self) -> Vec<usize> {
         self.layouts
             .iter()
-            .filter_map(|l| l.shape.map(|s| s.0))
+            .flat_map(|l| l.shapes.iter().filter_map(|s| s.map(|s| s.0)))
             .collect()
     }
 
@@ -177,62 +182,67 @@ impl DensityMstep {
     }
 }
 
-/// Bayes (#1716): one random-walk Metropolis move on `ln ω` of a univariate density
-/// group, for its full conditional `∝ Πᵢ p(zᵢ; ω, θ) · IG(ω; a₀, b₀)`. The prior is the
-/// inverse gamma the conjugate update gives a Gaussian variance, so the two kinds of ETA
-/// share one prior. Moves `omega` in place; returns whether the move was accepted.
+/// Bayes (#1716): one random-walk Metropolis move on a density group's Ω block, for its
+/// full conditional `∝ Πᵢ p(zᵢ; Ω_g, θ) · IW(Ω_g; ν, Λ)`. The prior is the marginal the
+/// conjugate update's inverse Wishart puts on the block (`ν = ν₀ − (p − n_g)`,
+/// `Λ = Λ₀`'s block), so Gaussian and density blocks share one prior; for one ETA it is
+/// the inverse gamma `IG(ν/2, Λ/2)`. The walk is on the block's log-Cholesky `ψ`, with the
+/// Jacobian `|∂Ω/∂ψ| ∝ Πᵢ L_iiⁿ⁻ⁱ⁺²` in the target. Moves `omega`'s block in place;
+/// returns whether the move was accepted.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn mh_log_omega(
+pub(crate) fn mh_group_omega(
     d: &EtaDensity,
     etas: &[Vec<f64>],
-    omega: &mut f64,
+    omega: &mut DMatrix<f64>,
     theta: &[f64],
-    a0: f64,
-    b0: f64,
+    nu: f64,
+    lambda: &DMatrix<f64>,
     step: f64,
     rng: &mut impl rand::Rng,
 ) -> bool {
     use rand_distr::{Distribution, StandardNormal, Uniform};
-    debug_assert_eq!(d.etas.len(), 1, "univariate groups only");
-    let a = d.etas[0];
-    let local = EtaDensity {
-        kind: d.kind,
-        etas: vec![0],
-        shape_thetas: if d.shape_thetas.is_empty() {
-            vec![]
-        } else {
-            vec![0]
-        },
+    let n = d.etas.len();
+    let layout = GroupLayout {
+        omega_free: true,
+        shapes: vec![None; d.shape_thetas.len()],
+        n_chol: n * (n + 1) / 2,
     };
-    let shape = d.shape_thetas.first().map_or(0.0, |&k| theta[k]);
-    let ln_2pi = std::f64::consts::TAU.ln();
-    // ln of the full conditional at u = ln ω, the Jacobian `+u` included.
-    let log_target = |u: f64| -> f64 {
-        let w = u.exp();
-        let oi = DMatrix::from_element(1, 1, 1.0 / w);
-        let mut lp = -(a0 + 1.0) * u - b0 / w + u;
+    let log_target = |psi: &DVector<f64>| -> f64 {
+        let l = chol_of(n, psi.as_slice());
+        let mut log_det = 0.0;
+        let mut log_jac = 0.0;
+        for (i, row) in l.iter().enumerate() {
+            log_det += 2.0 * row[i].ln();
+            log_jac += (n - i + 1) as f64 * row[i].ln();
+        }
+        let lm = DMatrix::from_fn(n, n, |i, j| l[i][j]);
+        let om = &lm * lm.transpose();
+        let Some(oi) = om.clone().try_inverse() else {
+            return f64::NEG_INFINITY;
+        };
+        let tr = (lambda * &oi).trace();
+        let mut lp = -0.5 * (nu + n as f64 + 1.0) * log_det - 0.5 * tr + log_jac;
         for e in etas {
-            let z = e[a];
-            let c = crate::stats::eta_density::correction(
-                std::slice::from_ref(&local),
-                &[z],
-                &oi,
-                &[shape],
-            );
-            lp += -0.5 * (z * z / w + u + ln_2pi + c);
+            lp += group_log_density(d, &layout, psi.as_slice(), &group_z(d, e), omega, theta);
         }
         lp
     };
-    let u0 = omega.ln();
-    let n: f64 = StandardNormal.sample(rng);
-    let u1 = u0 + step * n;
-    let (l0, l1) = (log_target(u0), log_target(u1));
+    let psi0 = pack(d, &layout, omega, theta);
+    let psi1 = DVector::from_iterator(
+        psi0.len(),
+        psi0.iter().map(|&v| {
+            let n: f64 = StandardNormal.sample(rng);
+            v + step * n
+        }),
+    );
+    let (l0, l1) = (log_target(&psi0), log_target(&psi1));
     let log_u = Uniform::new(0.0f64, 1.0)
-        .map_or(0.0, |d| d.sample(rng))
+        .map_or(0.0, |u| u.sample(rng))
         .max(f64::MIN_POSITIVE)
         .ln();
     if l1.is_finite() && log_u < l1 - l0 {
-        *omega = u1.exp();
+        let mut theta_scratch = theta.to_vec();
+        unpack(d, &layout, &psi1, omega, &mut theta_scratch);
         true
     } else {
         false
@@ -258,7 +268,7 @@ fn pack(d: &EtaDensity, l: &GroupLayout, omega: &DMatrix<f64>, theta: &[f64]) ->
             }
         }
     }
-    if let Some((k, lo, hi)) = l.shape {
+    for &(k, lo, hi) in l.shapes.iter().flatten() {
         v.push(to_unit(theta[k], lo, hi));
     }
     DVector::from_vec(v)
@@ -281,8 +291,8 @@ fn unpack(
             }
         }
     }
-    if let Some((k, lo, hi)) = l.shape {
-        theta[k] = from_unit(psi[l.n_chol], lo, hi);
+    for (j, &(k, lo, hi)) in l.shapes.iter().flatten().enumerate() {
+        theta[k] = from_unit(psi[l.n_chol + j], lo, hi);
     }
 }
 
@@ -353,21 +363,28 @@ fn group_log_density<T: PkNum>(
             q = q + oi[a][b] * zt[a] * zt[b];
         }
     }
-    // The group on its own: η positions 0..n, its shape θ at index 0.
+    // The group on its own: η positions 0..n, its shape θs at 0..m.
     let local = EtaDensity {
         kind: d.kind,
         etas: (0..n).collect(),
-        shape_thetas: if d.shape_thetas.is_empty() {
-            vec![]
-        } else {
-            vec![0]
-        },
+        shape_thetas: (0..d.shape_thetas.len()).collect(),
+        trunc: d.trunc,
     };
-    let shape_val = match l.shape {
-        Some((_, lo, hi)) => from_unit(psi[l.n_chol], lo, hi),
-        None => c(d.shape_thetas.first().map_or(0.0, |&k| theta[k])),
-    };
-    let corr = correction_g(&[local], &zt, |a, b| oi[a][b], |_| shape_val);
+    let mut free = 0;
+    let shape_vals: Vec<T> = l
+        .shapes
+        .iter()
+        .zip(&d.shape_thetas)
+        .map(|(sp, &k)| match sp {
+            Some((_, lo, hi)) => {
+                let v = from_unit(psi[l.n_chol + free], *lo, *hi);
+                free += 1;
+                v
+            }
+            None => c(theta[k]),
+        })
+        .collect();
+    let corr = correction_g(&[local], &zt, |a, b| oi[a][b], |k| shape_vals[k]);
     let ln_2pi = std::f64::consts::TAU.ln();
     c(-0.5) * (q + log_det + c(n as f64 * ln_2pi) + corr)
 }

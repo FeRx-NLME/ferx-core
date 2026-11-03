@@ -440,7 +440,7 @@ pub(crate) fn focei_f_grad<T: PkNum, const N: usize>(
 ) -> Option<(T, [T; N])> {
     if ctx.dense() {
         return Some((
-            focei_f_dense(ctx, f, g, eta, p)?.0,
+            focei_f_dense(ctx, f, g, eta, p, true)?.0,
             inner_grad(ctx, f, g, eta, p, None)?,
         ));
     }
@@ -486,8 +486,8 @@ pub(crate) fn focei_f_grad_ng<T: PkNum, const N: usize>(
 /// FOCE's (no interaction) `(F, ∇_η l)` under a density (#1716): the conditional rows with
 /// `½·c̃ᵀc̃` and the censored curvature left out of `H̃` — production's
 /// `foce_subject_nll_interaction_with_tte` with no endpoint term. The Sheiner–Beal marginal
-/// ([`foce_f`]) integrates η as `N(0, Ω)` and has no density form. `None` on a dense
-/// residual, which fit validation refuses beside a density under FOCE.
+/// ([`foce_f`]) integrates η as `N(0, Ω)` and has no density form. A dense residual takes
+/// the dense conditional form without `½·B`.
 pub(crate) fn foce_f_grad_density<T: PkNum, const N: usize>(
     ctx: &LikCtx,
     f: &[T],
@@ -496,7 +496,10 @@ pub(crate) fn foce_f_grad_density<T: PkNum, const N: usize>(
     p: &ParT<T>,
 ) -> Option<(T, [T; N])> {
     if ctx.dense() {
-        return None;
+        return Some((
+            focei_f_dense(ctx, f, g, eta, p, false)?.0,
+            inner_grad(ctx, f, g, eta, p, None)?,
+        ));
     }
     let (fv, grad, _) = match ctx.model.residual_error_eta {
         None => focei_rows::<T, N, 1>(ctx, f, g, eta, p, None, None, false),
@@ -526,7 +529,7 @@ fn focei_parts<T: PkNum, const N: usize>(
     p: &ParT<T>,
 ) -> Option<(T, [T; N], Vec<Vec<T>>)> {
     if ctx.dense() {
-        let (fv, ht) = focei_f_dense(ctx, f, g, eta, p)?;
+        let (fv, ht) = focei_f_dense(ctx, f, g, eta, p, true)?;
         return Some((fv, [T::from_f64(0.0); N], ht));
     }
     match ctx.model.residual_error_eta {
@@ -893,6 +896,7 @@ fn focei_f_dense<T: PkNum, const N: usize>(
     g: &[[T; N]],
     eta: &[T; N],
     p: &ParT<T>,
+    interaction: bool,
 ) -> Option<(T, Vec<Vec<T>>)> {
     let c = |x: f64| T::from_f64(x);
     let n = f.len();
@@ -948,7 +952,8 @@ fn focei_f_dense<T: PkNum, const N: usize>(
                     bab = bab + rd_k[a][jj][i] * rd_k[b][i][jj];
                 }
             }
-            ht[a][b] = ht[a][b] + hrh + c(0.5) * bab;
+            // FOCE's conditional form under a density (#1716) leaves `½·B` out.
+            ht[a][b] = ht[a][b] + hrh + if interaction { c(0.5) * bab } else { c(0.0) };
         }
     }
     if let Some((_, dh)) = ctx.density_half_jets(eta, p) {

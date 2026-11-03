@@ -2417,6 +2417,22 @@ fn run_mcem_mixture(
             }
         })
         .collect();
+    // #1716: the density groups' M-step (class-shared Ω blocks and shape θs).
+    let density_mstep = crate::estimation::eta_density_mstep::DensityMstep::new(
+        model,
+        &init_params.omega_fixed,
+        &init_params.theta_fixed,
+        &init_params
+            .theta_lower
+            .iter()
+            .zip(&init_params.theta_upper)
+            .map(|(&lo, &hi)| (lo, hi))
+            .collect::<Vec<_>>(),
+    );
+    let density_owned: Vec<usize> = density_mstep
+        .as_ref()
+        .map(|d| d.owned_thetas())
+        .unwrap_or_default();
     let mut log_theta_upper: Vec<f64> = (0..n_theta)
         .map(|i| {
             if theta_packs_log_mask[i] {
@@ -2914,6 +2930,11 @@ fn run_mcem_mixture(
             mstep_theta_lower[j] = log_theta[j];
             mstep_theta_upper[j] = log_theta[j];
         }
+        // #1716: a density's shape θ is its prior M-step's, after the Ω step below.
+        for &j in &density_owned {
+            mstep_theta_lower[j] = log_theta[j];
+            mstep_theta_upper[j] = log_theta[j];
+        }
         // Class-aware closed-form mu-ref θ shift (#996), computed *before* the
         // M-step because the pinning depends on which θ it can actually move this
         // iteration. `mixture_mu_ref_means` returns `None` for a θ whose classes
@@ -3028,6 +3049,33 @@ fn run_mcem_mixture(
         }
         floor_omega_diagonal(&mut new_omega, &init_params.omega_fixed, OMEGA_DIAG_FLOOR);
         omega_mat = new_omega;
+        // #1716: a density group's Ω block and shape θ, from the responsibility- and
+        // importance-weighted draws (the class-shared Ω a density reads).
+        if let Some(dm) = &density_mstep {
+            let weighted: Vec<(&[f64], f64)> = draws_by_class
+                .iter()
+                .enumerate()
+                .flat_map(|(c, class)| {
+                    class.iter().enumerate().flat_map(move |(i, d)| {
+                        d.etas
+                            .iter()
+                            .zip(&d.weights)
+                            .map(move |(e, &w)| (e.as_slice(), (i, c, w)))
+                    })
+                })
+                .map(|(e, (i, c, w))| (e, pmix[i][c] * w / n_subjects as f64))
+                .collect();
+            let mut theta_nat = theta_cur.clone();
+            dm.maximise(model, &weighted, &mut omega_mat, &mut theta_nat);
+            for &t in &density_owned {
+                theta_cur[t] = theta_nat[t];
+                log_theta[t] = if theta_packs_log_mask[t] {
+                    theta_nat[t].ln()
+                } else {
+                    theta_nat[t]
+                };
+            }
+        }
 
         // Accumulate the final `n_avg` iterations for the reported point estimate.
         if k > n_iter - n_avg {

@@ -853,14 +853,15 @@ fn the_omega_line_transform_is_the_eta_shape_block() {
 
 /// Each refusal names its cause: a density on a kappa (#1717), a transform on a block, a
 /// non-t kind on a block, an unknown kind, a wrong shape-θ count, a t whose ν may reach 0,
-/// a μ bounded outside [0, 1], a clause on a θ, trailing text after the clause, and a
-/// mapped ETA read raw outside `[individual_parameters]`.
+/// a μ bounded outside [0, 1], a clause on a θ, trailing text after the clause, a mapped
+/// ETA read raw outside `[individual_parameters]`, and a kind without a free spread whose
+/// ω is not `FIX`.
 /// Dies under: any one refusal removed (each asserts its own message).
 #[test]
 fn omega_line_distribution_refusals() {
     let indiv = "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)";
     let err = |omegas: &str, extra: &str| densed(omegas, indiv, extra).unwrap_err();
-    let cases: [(&str, &str, &str); 9] = [
+    let cases: [(&str, &str, &str); 10] = [
         (
             "  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  kappa K ~ 0.04 density t(NU)",
             "",
@@ -877,7 +878,7 @@ fn omega_line_distribution_refusals() {
             "univariate",
         ),
         (
-            "  omega ETA_CL ~ 0.1 density weibull\n  omega ETA_V ~ 0.1",
+            "  omega ETA_CL ~ 0.1 density banana\n  omega ETA_V ~ 0.1",
             "",
             "unknown density",
         ),
@@ -889,7 +890,7 @@ fn omega_line_distribution_refusals() {
         (
             "  omega ETA_CL ~ 0.1 density t(L)\n  omega ETA_V ~ 0.1",
             "",
-            "bounded above 0",
+            "bounded inside (0, inf)",
         ),
         (
             "  omega ETA_CL ~ 0.1 density beta(NU)\n  omega ETA_V ~ 0.1",
@@ -905,6 +906,11 @@ fn omega_line_distribution_refusals() {
             "  omega ETA_CL ~ 0.1 density gamma\n  omega ETA_V ~ 0.1",
             "[derived]\n  RAW = ETA_CL\n",
             "unconstrained latent",
+        ),
+        (
+            "  omega ETA_CL ~ 1 density exponential\n  omega ETA_V ~ 0.1",
+            "",
+            "declare it `FIX`",
         ),
     ];
     for (omegas, extra, says) in cases {

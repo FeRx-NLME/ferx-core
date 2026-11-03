@@ -12,6 +12,7 @@ fn group(kind: DensityKind, etas: Vec<usize>, shape: Vec<usize>) -> EtaDensity {
         kind,
         etas,
         shape_thetas: shape,
+        trunc: None,
     }
 }
 
@@ -325,4 +326,117 @@ fn a_beta_variance_past_its_bound_is_infinite() {
     assert_eq!(at(0.22), f64::INFINITY, "ω just past μ(1 − μ) = 0.21");
     assert_eq!(at(0.3), f64::INFINITY);
     assert!(at(0.2).is_finite());
+}
+
+/// `truncated(KIND, lo, hi)`: the truncated latent density integrates to 1 over the
+/// unconstrained latent, which checks the CDF mass and the map's Jacobian. The random
+/// effect's mean is the base density's conditional mean on `(lo, hi)`, computed by
+/// direct quadrature of the η-density, an oracle that shares nothing with the CDFs.
+/// Covers both bounds, a lower bound only and an upper bound only, on ℝ, (0, ∞) and
+/// (0, 1) kinds, the t and the Cauchy (incomplete beta, atan).
+/// Dies under: a CDF wrong in any covered kind, the mass left out, or a map Jacobian
+/// off.
+#[test]
+fn a_truncated_density_is_the_renormalised_kind() {
+    use super::kinds::eta_log_pdf;
+    let omega = 0.12;
+    let oi = DMatrix::from_element(1, 1, 1.0 / omega);
+    let cases: Vec<(DensityKind, Vec<f64>, Bound, Bound)> = vec![
+        (
+            DensityKind::Gamma,
+            vec![],
+            Bound::Value(0.5),
+            Bound::Value(2.0),
+        ),
+        (
+            DensityKind::StudentT,
+            vec![5.0],
+            Bound::Value(-0.2),
+            Bound::Open,
+        ),
+        (
+            DensityKind::Cauchy,
+            vec![],
+            Bound::Value(-1.0),
+            Bound::Value(1.0),
+        ),
+        (
+            DensityKind::Beta,
+            vec![0.3],
+            Bound::Value(0.1),
+            Bound::Value(0.6),
+        ),
+        (DensityKind::Weibull, vec![], Bound::Open, Bound::Value(1.5)),
+        (
+            DensityKind::Logistic,
+            vec![],
+            Bound::Value(-0.3),
+            Bound::Value(0.8),
+        ),
+    ];
+    let mut worst = 0.0f64;
+    for (kind, sh, lo, hi) in cases {
+        let d = EtaDensity {
+            kind,
+            etas: vec![0],
+            shape_thetas: (0..sh.len()).collect(),
+            trunc: Some(Truncation { lo, hi }),
+        };
+        let val = |b: Bound, open: f64| match b {
+            Bound::Value(v) => v,
+            _ => open,
+        };
+        let (a, b) = (val(lo, f64::NAN), val(hi, f64::NAN));
+        let read = |z: f64| match (lo, hi) {
+            (Bound::Value(a), Bound::Value(b)) => a + (b - a) / (1.0 + (-z).exp()),
+            (Bound::Value(a), _) => a + z.exp(),
+            (_, Bound::Value(b)) => b - z.exp(),
+            _ => z,
+        };
+        let lat = |z: f64| {
+            let v = z * z / omega
+                + omega.ln()
+                + LN_2PI
+                + correction(std::slice::from_ref(&d), &[z], &oi, &sh);
+            if v.is_finite() {
+                (-0.5 * v).exp()
+            } else {
+                0.0
+            }
+        };
+        let mass = simpson(lat, -40.0, 40.0, 400_000);
+        let mean = simpson(|z| read(z) * lat(z), -40.0, 40.0, 400_000);
+        // The oracle: ∫ x p(x) / ∫ p(x) on (lo, hi), in η, by Simpson.
+        let p = |x: f64| eta_log_pdf::<f64>(kind, x, omega, &sh).exp();
+        let (xa, xb) = (
+            if a.is_nan() { -60.0 } else { a },
+            if b.is_nan() {
+                if kind == DensityKind::StudentT {
+                    400.0
+                } else {
+                    60.0
+                }
+            } else {
+                b
+            },
+        );
+        let (xa, xb) = (
+            xa.max(if kind.map() == DomainMap::Identity {
+                -1e9
+            } else {
+                1e-12
+            }),
+            xb,
+        );
+        let den = simpson(p, xa, xb, 2_000_000);
+        let want = simpson(|x| x * p(x), xa, xb, 2_000_000) / den;
+        eprintln!(
+            "{kind:?}: mass − 1 {:.2e}, mean {mean:.6} vs {want:.6}",
+            mass - 1.0
+        );
+        assert!(mass.is_finite() && mean.is_finite(), "{kind:?}");
+        worst = worst.max((mass - 1.0).abs()).max((mean - want).abs());
+    }
+    // Placeholder until measured.
+    assert!(worst < 1e-6, "worst {worst:.2e}");
 }

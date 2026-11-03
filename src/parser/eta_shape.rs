@@ -475,11 +475,15 @@ pub(crate) fn find_dist_clause(line: &str) -> Result<Option<(usize, usize, DistC
         let args = if inner.is_empty() {
             Vec::new()
         } else {
-            inner.split(',').map(|a| a.trim().to_string()).collect()
+            split_top_level(inner)
         };
-        if args
-            .iter()
-            .any(|a| a.is_empty() || !a.bytes().all(is_ident))
+        // `truncated(KIND[(…)], LO, HI)` takes a kind and two bounds (numbers, `inf` or
+        // θ names), read by `parse_truncated`; every other kind takes θ names.
+        let truncated = kind.eq_ignore_ascii_case("truncated");
+        if !truncated
+            && args
+                .iter()
+                .any(|a| a.is_empty() || !a.bytes().all(is_ident))
         {
             return Err(format!(
                 "[parameters] the `{kw}` clause takes θ names, comma-separated: `{}`",
@@ -494,6 +498,61 @@ pub(crate) fn find_dist_clause(line: &str) -> Result<Option<(usize, usize, DistC
         return Ok(Some((i, close + 1, clause)));
     }
     Ok(None)
+}
+
+/// `s` split at its top-level commas (not inside parentheses), each part trimmed.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim().to_string());
+    out
+}
+
+/// A `truncated(KIND[(SHAPES)], LO, HI)` clause's parts: the inner kind's name, its shape
+/// arguments (`None` without parentheses), and the two bounds as written.
+pub(crate) fn parse_truncated(
+    args: &[String],
+    line: &str,
+) -> Result<(String, Option<Vec<String>>, String, String), String> {
+    let bad = || {
+        format!(
+            "[parameters] `truncated` takes a distribution and two bounds, e.g. \
+             `density truncated(gamma, 0.2, 5)` or `truncated(t(NU), -1, inf)`: `{}`",
+            line.trim()
+        )
+    };
+    if args.len() != 3 {
+        return Err(bad());
+    }
+    let spec = args[0].trim();
+    let (name, shapes) = match spec.find('(') {
+        Some(o) => {
+            let inner = spec[o + 1..].strip_suffix(')').ok_or_else(bad)?.trim();
+            let sh = if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner.split(',').map(|a| a.trim().to_string()).collect()
+            };
+            (spec[..o].trim().to_ascii_lowercase(), Some(sh))
+        }
+        None => (spec.to_ascii_lowercase(), None),
+    };
+    if name.is_empty() || name == "truncated" {
+        return Err(bad());
+    }
+    Ok((name, shapes, args[1].clone(), args[2].clone()))
 }
 
 /// `line` without its distribution clause, and the clause.
@@ -633,16 +692,49 @@ pub(crate) fn apply_omega_dist_clauses(
             *line = format!("{}{}", line[..s].trim_end(), &line[e..]);
             continue;
         }
-        let kind = DensityKind::from_name(&clause.kind)
-            .ok_or_else(|| unknown_density(&clause.kind, line))?;
-        let Some((prefix, init, lo, hi)) = kind.shape_theta() else {
-            continue;
-        };
-        if !clause.args.is_empty() {
+        if clause.kind == "truncated" {
+            let (name, shapes, lo, hi) = parse_truncated(&clause.args, line)?;
+            let kind = DensityKind::from_name(&name).ok_or_else(|| unknown_density(&name, line))?;
+            if kind.shapes().is_empty() || shapes.as_ref().is_some_and(|v| !v.is_empty()) {
+                continue;
+            }
+            let mut names = Vec::new();
+            for sp in kind.shapes() {
+                let n = format!("{}_{}", sp.prefix, etas[0]);
+                if theta_names.contains(&n) {
+                    return Err(format!(
+                        "[parameters] `density truncated({name}(), …)` would declare θ `{n}`, \
+                         which [parameters] already declares — name it inside the parentheses: \
+                         `{}`",
+                        line.trim()
+                    ));
+                }
+                new_thetas.push(format!(
+                    "theta {n}({}, {}, {})",
+                    sp.init, sp.lower, sp.upper
+                ));
+                names.push(n);
+            }
+            *line = format!(
+                "{} density truncated({name}({}), {lo}, {hi}){}",
+                line[..s].trim_end(),
+                names.join(", "),
+                &line[e..]
+            );
             continue;
         }
-        let names = vec![format!("{prefix}_{}", etas[0])];
-        for name in &names {
+        let kind = DensityKind::from_name(&clause.kind)
+            .ok_or_else(|| unknown_density(&clause.kind, line))?;
+        let specs = kind.shapes();
+        if specs.is_empty() || !clause.args.is_empty() {
+            continue;
+        }
+        let names: Vec<String> = specs
+            .iter()
+            .map(|sp| format!("{}_{}", sp.prefix, etas[0]))
+            .collect();
+        for (name, sp) in names.iter().zip(specs) {
+            let (init, lo, hi) = (sp.init, sp.lower, sp.upper);
             if theta_names.contains(name)
                 || new_thetas
                     .iter()
@@ -657,6 +749,7 @@ pub(crate) fn apply_omega_dist_clauses(
             }
             new_thetas.push(format!("theta {name}({init}, {lo}, {hi})"));
         }
+        let _ = &names;
         *line = format!(
             "{} density {}({}){}",
             line[..s].trim_end(),
