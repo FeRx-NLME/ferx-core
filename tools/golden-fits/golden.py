@@ -72,7 +72,7 @@ def sha256(path: Path) -> str | None:
 def read_manifest(path: Path) -> list[dict]:
     rows = []
     header = None
-    for raw in path.read_text().splitlines():
+    for raw in path.read_text(encoding="utf-8").splitlines():
         if not raw.strip() or raw.startswith("#"):
             continue
         cols = raw.split("\t")
@@ -111,7 +111,7 @@ def lower_tri_se(se: list | None, n: int, i: int, j: int) -> float | None:
     if len(se) == n_lt and n_lt != n:
         idx = sum(n - k for k in range(j)) + (i - j)
         return num(se[idx]) if idx < len(se) else None
-    if i == j and i < len(se):
+    if i == j and j < len(se):
         return num(se[i])
     return None
 
@@ -166,13 +166,37 @@ def extract(fit: dict) -> dict:
 # ---------------------------------------------------------------------------------
 
 
+def fit_one(ferx: str, model: Path, data: Path, timeout: int, rec: dict) -> None:
+    """Fit one model in a scratch directory and fill `rec` with its status and
+    extracted quantities. A failed or timed-out fit is a row, never an abort."""
+    with tempfile.TemporaryDirectory(prefix="golden-") as work:
+        t0 = time.monotonic()
+        try:
+            proc = subprocess.run(
+                [ferx, str(model), "--data", str(data), "--output-format", "json"],
+                cwd=work, capture_output=True, text=True, timeout=timeout, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            rec.update(wall_s=round(time.monotonic() - t0, 2), status="timeout",
+                       error=f"no result within {timeout} s")
+            return
+        rec["wall_s"] = round(time.monotonic() - t0, 2)
+        fits = list(Path(work).glob("*-fit.json"))
+        if proc.returncode != 0 or len(fits) != 1:
+            tail = (proc.stderr or proc.stdout).strip().splitlines()[-5:]
+            rec.update(status="failed",
+                       error=f"exit {proc.returncode}: " + " | ".join(tail))
+            return
+        rec.update(extract(json.loads(fits[0].read_text(encoding="utf-8"))))
+        rec["status"] = "ok"
+
+
 def cmd_run(a) -> int:
-    manifest = read_manifest(Path(a.manifest))
     only = set(a.only.split(",")) if a.only else None
     root = Path(a.root).resolve()
     ferx = str(Path(a.ferx).resolve())
     models = {}
-    for row in manifest:
+    for row in read_manifest(Path(a.manifest)):
         if only and row["id"] not in only:
             continue
         model, data = root / row["model"], root / row["data"]
@@ -184,31 +208,9 @@ def cmd_run(a) -> int:
             "data_sha256": sha256(data),
         }
         if rec["model_sha256"] is None or rec["data_sha256"] is None:
-            rec["status"] = "missing"
-            rec["error"] = "model or data file not in this tree"
-            models[row["id"]] = rec
-            print(f"[golden] {row['id']}: missing in {root}", flush=True)
-            continue
-        with tempfile.TemporaryDirectory(prefix=f"golden-{row['id']}-") as work:
-            t0 = time.monotonic()
-            try:
-                proc = subprocess.run(
-                    [ferx, str(model), "--data", str(data), "--output-format", "json"],
-                    cwd=work, capture_output=True, text=True, timeout=a.timeout,
-                )
-                rec["wall_s"] = round(time.monotonic() - t0, 2)
-                fits = list(Path(work).glob("*-fit.json"))
-                if proc.returncode != 0 or len(fits) != 1:
-                    rec["status"] = "failed"
-                    tail = (proc.stderr or proc.stdout).strip().splitlines()[-5:]
-                    rec["error"] = f"exit {proc.returncode}: " + " | ".join(tail)
-                else:
-                    rec.update(extract(json.loads(fits[0].read_text())))
-                    rec["status"] = "ok"
-            except subprocess.TimeoutExpired:
-                rec["wall_s"] = round(time.monotonic() - t0, 2)
-                rec["status"] = "timeout"
-                rec["error"] = f"no result within {a.timeout} s"
+            rec.update(status="missing", error="model or data file not in this tree")
+        else:
+            fit_one(ferx, model, data, a.timeout, rec)
         models[row["id"]] = rec
         print(f"[golden] {row['id']}: {rec['status']} in {rec.get('wall_s', 0)} s"
               + (f" OFV {rec['ofv']:.6f}" if rec["status"] == "ok" else ""), flush=True)
@@ -219,7 +221,8 @@ def cmd_run(a) -> int:
         "platform": f"{os.uname().sysname}/{os.uname().machine}",
         "models": models,
     }
-    Path(a.out).write_text(json.dumps(out, indent=1, sort_keys=True, allow_nan=True) + "\n")
+    text = json.dumps(out, indent=1, sort_keys=True, allow_nan=True) + "\n"
+    Path(a.out).write_text(text, encoding="utf-8")
     return 0
 
 
@@ -234,7 +237,7 @@ def load(path: str | None) -> dict | None:
     p = Path(path)
     if not p.is_file():
         return None
-    return json.loads(p.read_text())
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def rel(h: float, b: float) -> float:
@@ -364,17 +367,7 @@ def accepted_drift(mid: str, h: dict, entry: dict, bands: dict) -> list[str]:
     return out_of_band(mid, compare(h, pinned), bands)
 
 
-def cmd_report(a) -> int:
-    head = load(a.head)
-    if head is None:
-        raise SystemExit(f"no head results at {a.head}")
-    base = load(a.base)
-    prev = load(a.prev)
-    bands = load(a.bands)
-    today = a.today or dt.date.today().isoformat()
-    fail_mode = today >= FAIL_ON_BAND_FROM
-    accepted = (bands or {}).get("accepted", {})
-
+def report_header(head, base, prev, bands, today, fail_mode) -> list[str]:
     lines = [f"## Golden fit set — `{head.get('label')}` ({head.get('platform')})", ""]
     if base:
         lines.append(f"Diffed against the last release, **`{base.get('label')}`** "
@@ -393,85 +386,136 @@ def cmd_report(a) -> int:
         lines.append(f"\n**Report-only** until {FAIL_ON_BAND_FROM} ({days} days): this run "
                      "is measuring the natural spread. From that date a change outside "
                      "the measured band fails the job.")
-    lines += ["", "Δ est / Δ SE: the largest relative change over θ, ω, κ, σ, and the "
-              "parameter it is on. `=` is unchanged to the last digits printed.", "",
-              "| | model | family | OFV | Δ OFV | Δ est | Δ SE | iter (Δ) | Δ OFV prev | wall s |",
-              "|---|---|---|---:|---:|---|---|---:|---:|---:|"]
+    return lines + [
+        "", "Δ est / Δ SE: the largest relative change over θ, ω, κ, σ, and the "
+        "parameter it is on. `=` is unchanged to the last digits printed.", "",
+        "| | model | family | OFV | Δ OFV | Δ est | Δ SE | iter (Δ) | Δ OFV prev | wall s |",
+        "|---|---|---|---:|---:|---|---|---:|---:|---:|"]
 
-    failures: list[str] = []
-    details: list[str] = []
-    for mid, h in head["models"].items():
-        b = (base or {}).get("models", {}).get(mid)
-        p = (prev or {}).get("models", {}).get(mid)
-        fam = h.get("family", "")
+
+LEGEND = ("Legend: `=` unchanged · `≠` changed (report-only) · `🔺` outside the measured "
+          "band · `✔︎` outside the band, at the state accepted in bands.json · "
+          "`🆕` no release value · `❌` fit failed or OFV not finite.")
+
+
+def ok(rec) -> bool:
+    return rec is not None and rec.get("status") == "ok"
+
+
+class Report:
+    """The rows, details and failures of one `report` run. Each row kind is its own
+    method, so the verdict for each kind can be read (and changed) in one place."""
+
+    def __init__(self, bands, fail_mode):
+        self.bands = bands
+        self.fail_mode = fail_mode
+        self.enforce = fail_mode and bands is not None
+        self.accepted = (bands or {}).get("accepted", {})
+        self.rows: list[str] = []
+        self.details: list[str] = []
+        self.failures: list[str] = []
+
+    def add(self, mid, h, b, p):
         if h["status"] != "ok":
-            lines.append(f"| ❌ | `{mid}` | {fam} | {h['status']} | | | | | | {h.get('wall_s', '')} |")
-            details.append(f"- `{mid}` {h['status']}: {h.get('error', '')}")
-            if b is not None and b.get("status") == "ok":
-                failures.append(f"{mid}: fit {h['status']} at head, ok at the release")
-            continue
-        ofv = "**NaN**" if math.isnan(h["ofv"]) else f"{h['ofv']:.4f}"
-        iters = h.get("n_iterations")
-        if b is None or b.get("status") != "ok":
-            why = "new since release" if b is None else f"release: {b['status']}"
-            lines.append(f"| 🆕 | `{mid}` | {fam} | {ofv} | {why} | | | {iters} | "
-                         f"{signed_ofv(h['ofv'], p['ofv']) if p and p.get('status') == 'ok' else ''}"
-                         f" | {h.get('wall_s', '')} |")
-            if fail_mode and bands is not None:
-                if mid not in accepted:
-                    failures.append(f"{mid}: no release baseline to band against ({why})")
-                elif bad := accepted_drift(mid, h, accepted[mid], bands):
-                    failures.append(f"{mid}: drifted from its accepted state: " + "; ".join(bad))
-            continue
-        d = compare(h, b)
-        glyph = "≠" if changed(d) else "="
-        if math.isnan(h["ofv"]):
-            glyph = "❌"
-        oob = []
-        if fail_mode and bands is not None:
-            oob = out_of_band(mid, d, bands)
-            drift = accepted_drift(mid, h, accepted[mid], bands) if mid in accepted else []
-            if drift:
-                glyph = "🔺"
-                failures.append(f"{mid}: drifted from its accepted state: " + "; ".join(drift))
-            elif oob and mid in accepted:
-                glyph = "✔︎"  # outside the band vs the release, at its accepted state
-            elif oob:
-                glyph = "🔺"
-                failures.append(f"{mid}: " + "; ".join(oob))
-        if h.get("model_sha256") != b.get("model_sha256") or \
-                h.get("data_sha256") != b.get("data_sha256"):
-            fam += " *(input files differ from the release)*"
-        it = f"{iters} ({d['iter']:+d})" if d["iter"] else f"{iters}"
-        prev_s = (signed_ofv(h["ofv"], p["ofv"])
-                  if p and p.get("status") == "ok" else "")
-        lines.append(f"| {glyph} | `{mid}` | {fam} | {ofv} | {signed_ofv(h['ofv'], b['ofv'])} | "
-                     f"{fmt_rel(worst(d['est']))} | {fmt_rel(worst(d['se']))} | {it} | "
-                     f"{prev_s} | {h.get('wall_s', '')} |")
-        if changed(d) or oob:
-            details.append(detail_block(mid, h, b, d, oob, accepted.get(mid)))
+            self.failed_row(mid, h, b)
+        elif not ok(b):
+            self.unbaselined_row(mid, h, b, p)
+        else:
+            self.diff_row(mid, h, b, p)
 
-    if details:
-        lines += ["", "### Changed models", ""] + details
+    def failed_row(self, mid, h, b):
+        self.rows.append(f"| ❌ | `{mid}` | {h.get('family', '')} | {h['status']} "
+                         f"| | | | | | {h.get('wall_s', '')} |")
+        self.details.append(f"- `{mid}` {h['status']}: {h.get('error', '')}")
+        if ok(b):
+            self.failures.append(f"{mid}: fit {h['status']} at head, ok at the release")
+
+    def unbaselined_row(self, mid, h, b, p):
+        why = "new since release" if b is None else f"release: {b['status']}"
+        prev_s = signed_ofv(h["ofv"], p["ofv"]) if ok(p) else ""
+        self.rows.append(f"| 🆕 | `{mid}` | {h.get('family', '')} | {fmt_ofv(h['ofv'])} | "
+                         f"{why} | | | {h.get('n_iterations')} | {prev_s} | "
+                         f"{h.get('wall_s', '')} |")
+        if not self.enforce:
+            return
+        if mid not in self.accepted:
+            self.failures.append(f"{mid}: no release baseline to band against ({why})")
+        elif drift := accepted_drift(mid, h, self.accepted[mid], self.bands):
+            self.failures.append(f"{mid}: drifted from its accepted state: " + "; ".join(drift))
+
+    def verdict(self, mid, h, d) -> tuple[str, list[str]]:
+        """The row's glyph and its out-of-band list (vs the release)."""
+        glyph = "❌" if math.isnan(h["ofv"]) else "≠" if changed(d) else "="
+        if not self.enforce:
+            return glyph, []
+        oob = out_of_band(mid, d, self.bands)
+        if mid in self.accepted:
+            if drift := accepted_drift(mid, h, self.accepted[mid], self.bands):
+                self.failures.append(f"{mid}: drifted from its accepted state: "
+                                     + "; ".join(drift))
+                return "🔺", oob
+            # Outside the band vs the release, but at its accepted state.
+            return ("✔︎" if oob else glyph), oob
+        if oob:
+            self.failures.append(f"{mid}: " + "; ".join(oob))
+            return "🔺", oob
+        return glyph, oob
+
+    def diff_row(self, mid, h, b, p):
+        d = compare(h, b)
+        glyph, oob = self.verdict(mid, h, d)
+        fam = h.get("family", "")
+        if (h.get("model_sha256"), h.get("data_sha256")) != \
+                (b.get("model_sha256"), b.get("data_sha256")):
+            fam += " *(input files differ from the release)*"
+        iters = h.get("n_iterations")
+        it = f"{iters} ({d['iter']:+d})" if d["iter"] else f"{iters}"
+        prev_s = signed_ofv(h["ofv"], p["ofv"]) if ok(p) else ""
+        self.rows.append(f"| {glyph} | `{mid}` | {fam} | {fmt_ofv(h['ofv'])} | "
+                         f"{signed_ofv(h['ofv'], b['ofv'])} | {fmt_rel(worst(d['est']))} | "
+                         f"{fmt_rel(worst(d['se']))} | {it} | {prev_s} | "
+                         f"{h.get('wall_s', '')} |")
+        if changed(d) or oob:
+            self.details.append(detail_block(mid, h, b, d, oob, self.accepted.get(mid)))
+
+
+def fmt_ofv(v: float) -> str:
+    return "**NaN**" if math.isnan(v) else f"{v:.4f}"
+
+
+def cmd_report(a) -> int:
+    head = load(a.head)
+    if head is None:
+        raise SystemExit(f"no head results at {a.head}")
+    base, prev, bands = load(a.base), load(a.prev), load(a.bands)
+    today = a.today or dt.date.today().isoformat()
+    fail_mode = today >= FAIL_ON_BAND_FROM
+
+    rep = Report(bands, fail_mode)
+    for mid, h in head["models"].items():
+        rep.add(mid, h, (base or {}).get("models", {}).get(mid),
+                (prev or {}).get("models", {}).get(mid))
     if fail_mode and bands is None:
-        failures.insert(0, f"the report-only period ended on {FAIL_ON_BAND_FROM} and "
-                        "tools/golden-fits/bands.json is not committed — measure it with "
-                        "`golden.py bands` over the stored nightlies "
-                        "(docs/development/golden-fits.qmd)")
-    if failures:
-        lines += ["", "### Failing", ""] + [f"- {f}" for f in failures]
-    lines += ["", "Legend: `=` unchanged · `≠` changed (report-only) · `🔺` outside the measured "
-              "band · `✔︎` outside the band, at the state accepted in bands.json · `🆕` no release value · "
-              "`❌` fit failed or OFV not finite."]
+        rep.failures.insert(0, f"the report-only period ended on {FAIL_ON_BAND_FROM} and "
+                            "tools/golden-fits/bands.json is not committed — measure it "
+                            "with `golden.py bands` over the stored nightlies "
+                            "(docs/development/golden-fits.qmd)")
+
+    lines = report_header(head, base, prev, bands, today, fail_mode) + rep.rows
+    if rep.details:
+        lines += ["", "### Changed models", ""] + rep.details
+    if rep.failures:
+        lines += ["", "### Failing", ""] + [f"- {f}" for f in rep.failures]
+    lines += ["", LEGEND]
 
     text = "\n".join(lines) + "\n"
     if a.summary:
-        with open(a.summary, "a") as f:
+        with open(a.summary, "a", encoding="utf-8") as f:
             f.write(text)
     else:
         sys.stdout.write(text)
-    if failures and fail_mode:
-        for f in failures:
+    if rep.failures and fail_mode:
+        for f in rep.failures:
             print(f"::error title=golden fit set::{f}", file=sys.stderr)
         return 1
     return 0
@@ -517,7 +561,7 @@ def spread(values: list[float], relative: bool) -> float:
 
 
 def cmd_bands(a) -> int:
-    runs = [json.loads(Path(p).read_text()) for p in a.history]
+    runs = [json.loads(Path(p).read_text(encoding="utf-8")) for p in a.history]
     if len(runs) < a.min_nightlies:
         raise SystemExit(f"{len(runs)} nightlies given, {a.min_nightlies} required: the band "
                          "is a measurement of the natural spread and needs the full window")
@@ -551,7 +595,7 @@ def cmd_bands(a) -> int:
            "floors": {"rel": FLOOR_REL, "ofv": FLOOR_OFV, "iterations": FLOOR_ITER},
            "accepted": {},
            "models": out_models}
-    Path(a.out).write_text(json.dumps(out, indent=1, sort_keys=True) + "\n")
+    Path(a.out).write_text(json.dumps(out, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     print(f"[bands] {len(out_models)} models banded over {len(runs)} nightlies → {a.out}")
     return 0
 
@@ -569,7 +613,7 @@ def cmd_accept(a) -> int:
                                  "covariance_status", "params")}
     bands.setdefault("accepted", {})[a.id] = {
         "reason": a.reason, "label": head.get("label"), "state": state}
-    Path(a.bands).write_text(json.dumps(bands, indent=1, sort_keys=True) + "\n")
+    Path(a.bands).write_text(json.dumps(bands, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     print(f"[accept] {a.id} pinned at {head.get('label')} OFV {num(rec['ofv']):.6f}")
     return 0
 

@@ -836,11 +836,14 @@ fn the_fail_on_band_date_is_set_and_documented() {
         date.as_str() > "2026-11-03",
         "the switch must be in the future of #2635"
     );
-    for page in [
-        "docs/development/golden-fits.qmd",
-        "docs/development/sdlc.qmd",
-    ] {
-        let doc = std::fs::read_to_string(repo_root().join(page)).unwrap();
+    // Built from components, not written as one docs-rooted literal: `slow_test_path_filter`
+    // harvests every repo-relative path literal under `tests/` as an input of the heavy fit
+    // suite, and would demand `docs/**` in slow-tests.yml's push filter — firing the
+    // 5–60 min suite on every docs edit, for a page no fit reads. Same reason as the
+    // `concat!` in `changelog_fragments.rs`.
+    let dev_docs = repo_root().join("docs").join("development");
+    for page in ["golden-fits.qmd", "sdlc.qmd"] {
+        let doc = std::fs::read_to_string(dev_docs.join(page)).unwrap();
         assert!(
             doc.contains(&format!("report-only until {date}"))
                 || doc.contains(&format!("report-only until **{date}**"))
