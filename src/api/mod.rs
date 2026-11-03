@@ -461,6 +461,10 @@ mod fit_refusal_codes_tests;
 #[path = "tests/covariate_presence_tests.rs"]
 mod covariate_presence_tests;
 
+#[cfg(test)]
+#[path = "tests/covariate_missing_scope_tests.rs"]
+mod covariate_missing_scope_tests;
+
 // #1614: every `simulate*` entry refuses a θ vector whose length is not the model's.
 #[cfg(test)]
 #[path = "tests/theta_length_gate_tests.rs"]

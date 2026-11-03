@@ -6260,6 +6260,16 @@ impl CompiledModel {
         self.indiv_param_partials.nested_levels.as_ref()
     }
 
+    /// The names a `[derived]` expression looks up at evaluation time, other than
+    /// its built-ins (`IPRED`, `DV`, `TIME`, …) and earlier `[derived]` columns (#2599).
+    /// A covariate overrides an individual parameter or a compartment of the same
+    /// name there, so each is a read of the dataset column it names whenever one
+    /// exists. Not in [`CompiledModel::referenced_covariates`], since a
+    /// `[derived]`-only name is not a required column.
+    pub(crate) fn derived_reads(&self) -> &[String] {
+        &self.indiv_param_partials.derived_reads
+    }
+
     /// Whether an *active* custom residual magnitude depends on `θ`
     /// (see [`RuvMagnitude::theta_dependent`]).
     ///

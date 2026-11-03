@@ -112,6 +112,21 @@ pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
     auc
 }
 
+/// The `[output]` columns echoed from the subject's covariates (or, failing a
+/// covariate of that name, its individual parameters): every declared column but
+/// a `[derived]` one (filled by the derived pass), a mandatory sdtab column and an
+/// ETA (both ignored with `W_OUTPUT_DUPLICATE`). The single rule both
+/// [`compute_extra_output_columns`] and the reader's `W_COVARIATE_MISSING` gate
+/// (#2599) read, so the warning covers exactly the columns the echo reads.
+pub(crate) fn output_echo_columns(model: &CompiledModel) -> impl Iterator<Item = &String> {
+    model.output_columns.iter().filter(move |col| {
+        let is = |n: &str| n.eq_ignore_ascii_case(col);
+        !model.derived_exprs.iter().any(|d| is(&d.name))
+            && !OUTPUT_MANDATORY.iter().any(|m| is(m))
+            && !model.eta_names.iter().any(|e| is(e))
+    })
+}
+
 /// Compute all [derived] and [output] columns post-fit, storing results in
 /// each SubjectResult's `extra_columns` field.
 /// `mixest` (#985) is the fitted per-subject mixture class (0-based); `None` for
@@ -127,12 +142,6 @@ pub(crate) fn compute_extra_output_columns(
     mixest: Option<&[usize]>,
 ) {
     use crate::types::{AggFunction, DerivedContext, DerivedKind, IntegralStep, IntegralWindow};
-
-    let derived_names: Vec<&str> = model
-        .derived_exprs
-        .iter()
-        .map(|s| s.name.as_str())
-        .collect();
 
     for (si, sr) in subjects.iter_mut().enumerate() {
         // `MIXNUM` is 1-based; `mixest` is the 0-based fitted class.
@@ -314,24 +323,7 @@ pub(crate) fn compute_extra_output_columns(
         }
 
         // [output] columns: covariates + indiv params not already in derived
-        for col_name in &model.output_columns {
-            if derived_names
-                .iter()
-                .any(|d| d.eq_ignore_ascii_case(col_name))
-            {
-                continue; // will be filled by derived pass below
-            }
-            // Skip mandatory/duplicate columns
-            if OUTPUT_MANDATORY
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(col_name))
-                || model
-                    .eta_names
-                    .iter()
-                    .any(|e| e.eq_ignore_ascii_case(col_name))
-            {
-                continue;
-            }
+        for col_name in output_echo_columns(model) {
             let mut col_vals = Vec::with_capacity(n_obs);
             for j in 0..n_obs {
                 // Resolve covariates and individual parameters case-insensitively:
