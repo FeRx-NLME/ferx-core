@@ -13315,7 +13315,9 @@ fn a_retried_nlopt_fit_runs_one_covariance_step() {
 
 /// #2462 review, finding 1: a refit from a fit's own estimates never leaves its initial
 /// estimates, and its success-class stop was converged on its status before the leg. The
-/// leg verifies it at the same objective and must not then reject it on `left_init`.
+/// leg verifies it at the same objective and must not then reject it on `left_init`. Since
+/// #2506 the reported refit is the start probe's restart, which the leg verifies the same
+/// way.
 /// Warfarin FOCE / SLSQP, with the leg-off refit as the control.
 #[test]
 fn a_refit_from_its_own_optimum_stays_converged_after_the_leg() {
@@ -13355,8 +13357,12 @@ fn a_refit_from_its_own_optimum_stays_converged_after_the_leg() {
         "a verified refit at its optimum stays converged: {:?}",
         with.warnings
     );
+    // Neither refit leaves its start, so each is the #2506 start probe's restart, reported
+    // as its own fit; the two restarts stop at the optimizer's tolerance of the optimum,
+    // measured 6.67e-5 apart (Linux x86_64 CI and aarch64 alike). 1e-3 is 15× that and
+    // 10× inside the probe's own `START_PROBE_TOL`.
     assert!(
-        (with.ofv - without.ofv).abs() < 1e-6,
+        (with.ofv - without.ofv).abs() < 1e-3,
         "{} vs {}",
         with.ofv,
         without.ofv
