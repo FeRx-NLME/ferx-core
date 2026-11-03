@@ -14201,7 +14201,7 @@ fn a_warm_refit_on_a_non_nlopt_optimizer_is_converged_and_not_flagged() {
 }
 
 /// What a verified warm refit (#2506) must look like next to the cold fit it restarts.
-fn assert_warm_refit_verified(
+pub(crate) fn assert_warm_refit_verified(
     label: &str,
     cold: &crate::types::FitResult,
     warm: &crate::types::FitResult,

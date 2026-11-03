@@ -6569,6 +6569,164 @@ fn a_profiled_quadrature_fit_is_traced_as_agq() {
     profiled_trace(agq3_laplace, "agq", "trace_laplace_agq.csv");
 }
 
+/// `template` restarted at `result`'s estimates — θ (the profiled levels among them), Ω,
+/// κ and Σ — as a refit or a bootstrap replicate from a previous fit starts.
+fn warm_start_2591(
+    template: &ModelParameters,
+    result: &crate::types::FitResult,
+) -> ModelParameters {
+    use crate::types::OmegaMatrix;
+    let mut warm = template.clone();
+    warm.theta = result.theta.clone();
+    warm.omega = OmegaMatrix::from_matrix(
+        result.omega.clone(),
+        template.omega.eta_names.clone(),
+        template.omega.diagonal,
+    );
+    if let (Some(t), Some(m)) = (&template.omega_iov, &result.omega_iov) {
+        warm.omega_iov = Some(OmegaMatrix::from_matrix(
+            m.clone(),
+            t.eta_names.clone(),
+            t.diagonal,
+        ));
+    }
+    warm.sigma.values = result.sigma.clone();
+    warm
+}
+
+/// F2 on its first two studies under `name`, with the options of the #2591 fits, and its
+/// cold `fit()` from the file's inits. `KAPPA_ARM` is `FIX`ed: on this subset its variance
+/// collapses onto the lower rail (ln L = −6), and a refit started there is refused
+/// (`E_OMEGA_INIT_AT_RAIL`) before any optimizer runs.
+fn f2_cold_fit_2591(name: &str) -> (crate::api::PreparedRun, FitOptions, crate::types::FitResult) {
+    let mut p = prep(F2, F2_DATA, Some(2), |t| {
+        t.replace("kappa KAPPA_ARM ~ 1.0", "kappa KAPPA_ARM ~ 1.0 FIX")
+    });
+    p.parsed.model.name = name.to_string();
+    let model = &p.parsed.model;
+    let o = FitOptions {
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    let cold = crate::api::fit(model, &p.population, &p.init_params, &o).expect("cold fit");
+    assert!(
+        cold.converged && crate::model_selection::stalled_at_init(&cold) == Some(false),
+        "fixture precondition — the cold fit converges away from its start: {:?}",
+        cold.warnings
+    );
+    (p, o, cold)
+}
+
+/// #2591, the #2506 defect on the profiled driver, end to end through `fit()`: F2 refit
+/// from its own cold estimates — levels included — does not leave its start, and the
+/// start probe (`optimize_profiled_probed`) verifies it, so the refit is converged,
+/// `stationary_start`, at the cold objective, without `W_STALLED_AT_INIT`, and passes
+/// `Strictness::default()` (`assert_warm_refit_verified`, #2506's own check). Before
+/// #2591 `optimize_profiled` published `left_init: None`, the refit fell to the
+/// displacement check and carried the stall flag. Dies when `fit()` routes the profiled
+/// model to `optimize_profiled` unprobed.
+#[test]
+fn a_profiled_warm_refit_at_its_own_optimum_is_verified() {
+    let (p, o, cold) = f2_cold_fit_2591("profile_warm_refit_2591");
+    let model = &p.parsed.model;
+    let warm_start = warm_start_2591(&p.init_params, &cold);
+    let warm = crate::api::fit(model, &p.population, &warm_start, &o).expect("warm fit");
+    crate::estimation::outer_optimizer::tests::assert_warm_refit_verified(
+        "profiled F2",
+        &cold,
+        &warm,
+    );
+}
+
+/// #2591, the differential pair: the profiled run is forced to stop **at its start**
+/// (`forced_stop_at_start`, no status: reported `converged = false`), and the only
+/// variable is the start. From the cold fit's estimates the probe verifies it and the fit
+/// is converged and not a stall; from the file's inits the probe reaches a far lower
+/// objective, and the fit is still reported as the stall — the inits' objective,
+/// `left_init = Some(false)`, `W_STALLED_AT_INIT`, the probe's warning, failing
+/// `Strictness::default()`. A success-status stop at the inits (which a bootstrap's
+/// `converged` filter would keep) stays flagged the same way. Dies when the probe is
+/// skipped (the warm arm stays unconverged); when it calls every start stationary (the
+/// cold arm reports the probe); and when movement is measured on the level coordinates
+/// too — not on the warm arm, whose levels start solved, but on the cold one, whose
+/// levels are re-solved off the file's inits, so the probe never runs and the stall is
+/// not published (`left_init` stays `None`).
+#[test]
+fn a_profiled_stop_at_its_start_is_verified_or_flagged_by_the_start() {
+    use crate::estimation::outer_optimizer::forced_stop_at_start;
+    let name = "profile_forced_stop_2591";
+    let (p, o, cold) = f2_cold_fit_2591(name);
+    let model = &p.parsed.model;
+    let warm_start = warm_start_2591(&p.init_params, &cold);
+
+    forced_stop_at_start::set(name, None, false);
+    let warm = crate::api::fit(model, &p.population, &warm_start, &o).expect("warm fit");
+    crate::estimation::outer_optimizer::tests::assert_warm_refit_verified(
+        "profiled F2, forced stop at the warm start",
+        &cold,
+        &warm,
+    );
+
+    for status in [None, Some(nlopt::SuccessState::Success)] {
+        // The same stop with no budget left for the probe: the stall unprobed.
+        forced_stop_at_start::set(name, status, true);
+        let unprobed = crate::api::fit(model, &p.population, &p.init_params, &o).expect("inits");
+        forced_stop_at_start::set(name, status, false);
+        let r = crate::api::fit(model, &p.population, &p.init_params, &o).expect("inits");
+        eprintln!(
+            "{status:?}: stall OFV {:.6} (unprobed {:.6}), cold {:.6}; warnings {:?}",
+            r.ofv, unprobed.ofv, cold.ofv, r.warnings
+        );
+        assert_eq!(
+            r.ofv, unprobed.ofv,
+            "{status:?}: the stalled run is reported, not the probe's"
+        );
+        // Measured (Linux x86_64): the inits sit at 26.465827, 0.744 above the cold
+        // optimum 25.722100 the probe reaches — 74× the probe's 1e-2 tolerance.
+        assert!(
+            r.ofv - cold.ofv > STALL_GAP_2591,
+            "{status:?}: fixture precondition — the inits are not an optimum"
+        );
+        assert_eq!(r.left_init, Some(false), "{status:?}");
+        assert!(!r.stationary_start, "{status:?}");
+        let reached: f64 = r
+            .warnings
+            .iter()
+            .find(|w| w.contains("stalled on its initial estimates"))
+            .and_then(|w| w.split("reached OFV = ").nth(1))
+            .and_then(|t| t.split(',').next())
+            .and_then(|t| t.parse().ok())
+            .unwrap_or_else(|| panic!("{status:?}: no probe warning: {:?}", r.warnings));
+        assert!(
+            reached < r.ofv - STALL_GAP_2591,
+            "{status:?}: the warning names the probe's lower objective: {reached} vs {}",
+            r.ofv
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("W_STALLED_AT_INIT")),
+            "{status:?}: {:?}",
+            r.warnings
+        );
+        assert_eq!(
+            crate::model_selection::stalled_at_init(&r),
+            Some(true),
+            "{status:?}"
+        );
+        let v = crate::model_selection::check_strictness(
+            &r,
+            &crate::model_selection::Strictness::default(),
+        );
+        assert!(
+            !v.passed,
+            "{status:?}: a stall fails the default strictness: {v:?}"
+        );
+    }
+}
+
+/// How far below the stalled inits both the cold optimum and the probe must end on the
+/// #2591 fixture: half the measured 0.744, fifty times the probe's own tolerance.
+const STALL_GAP_2591: f64 = 0.5;
+
 /// #2111: a block read through a logit link.
 #[path = "profile_logit_tests.rs"]
 mod logit;

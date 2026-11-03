@@ -2578,6 +2578,74 @@ pub(crate) fn profiled_leg_tols(
     }
 }
 
+/// [`optimize_profiled`] with the #2506 start probe (#2591): a run whose structural
+/// coordinates did not leave the start is restarted from a perturbation of it
+/// (`outer_optimizer::verify_unmoved_start`), so a warm start at an optimum is published
+/// `stationary_start` and converged, while a stall stays flagged. What `fit()` runs.
+///
+/// Movement is measured where the profiled loop steps: the packed coordinates of the
+/// hold template, unscaled, its level coordinates held — they are re-solved at every
+/// evaluation, so they leave the start whatever the structural ones do. The probe reruns
+/// on the fit's own template, its levels profiled again; its budget is what is left of
+/// `outer_maxiter`, counting the run's evaluations in iterations of `free + 1` as the
+/// loop's own budget does.
+pub(crate) fn optimize_profiled_probed(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> OuterResult {
+    // Test hook (`outer_optimizer::forced_stop_at_start`): the run stops at its start —
+    // the evaluation-only solve there, reported converged exactly when a status is
+    // forced — and a `whole_fit` stop leaves the probe no budget.
+    #[cfg(test)]
+    let forced = crate::estimation::outer_optimizer::forced_stop_at_start::get(&model.name, true);
+    #[cfg(test)]
+    let result = match forced {
+        Some(stop) => {
+            let at_start = FitOptions {
+                outer_maxiter: 0,
+                ..options.clone()
+            };
+            OuterResult {
+                converged: stop.status.is_some(),
+                ..optimize_profiled(model, population, init_params, &at_start)
+            }
+        }
+        None => optimize_profiled(model, population, init_params, options),
+    };
+    #[cfg(not(test))]
+    let result = optimize_profiled(model, population, init_params, options);
+    let Some(layout) = ProfileLayout::build(model, population, init_params) else {
+        return result;
+    };
+    let hold = hold_template(&layout, init_params);
+    let per_iter = packed_fixed_mask(&hold).iter().filter(|&&f| !f).count() + 1;
+    let budget = options
+        .outer_maxiter
+        .saturating_sub(result.n_iterations.div_ceil(per_iter));
+    #[cfg(test)]
+    let budget = if forced.is_some_and(|s| s.whole_fit) {
+        0
+    } else {
+        budget
+    };
+    crate::estimation::outer_optimizer::verify_unmoved_start(
+        model,
+        population,
+        &hold,
+        options,
+        result,
+        budget,
+        |x, _| vec![1.0; x.len()],
+        |p, o| {
+            let mut p = p.clone();
+            p.theta_fixed.clone_from(&init_params.theta_fixed);
+            optimize_profiled(model, population, &p, o)
+        },
+    )
+}
+
 /// The outer loop of a fit with `profile`d blocks: NLopt over the structural packed
 /// coordinates, every evaluation a profile solve. Returns the same `OuterResult` the
 /// unprofiled path does, its `params` carrying the solved levels and the fit's own
