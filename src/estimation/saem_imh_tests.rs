@@ -1952,4 +1952,22 @@ fn the_stuck_warning_reaches_the_fit_result() {
         "the stuck warning never reached the result: {:?}",
         r.warnings
     );
+    // And it reports the convergence-phase window, not the run: 3 subjects × 2
+    // proposals × the 6 convergence iterations, against the run's 12.
+    let (conv_acc, conv_prop) = crate::estimation::saem::LAST_IMH_CONV.with(|c| c.get());
+    let run_prop = last_imh().proposals;
+    assert_eq!((conv_prop, run_prop), (36, 72));
+    let w = r
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("saem_kernel = imh accepted"))
+        .unwrap();
+    let want = format!(
+        "saem_kernel = imh accepted {:.2}% of its {conv_prop} proposals over the convergence phase",
+        conv_acc as f64 / conv_prop as f64 * 100.0
+    );
+    assert!(
+        w.starts_with(&want),
+        "{w}\nwanted the convergence window: {want}"
+    );
 }
