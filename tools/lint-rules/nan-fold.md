@@ -71,7 +71,9 @@ parameter or loop pattern of the same name hides it.
      value might be written: an assignment, `+=`, `&mut e`, a call of a method
      that might mutate it, such as `xs.push(…)`, or passing it as-is to a
      function or such a method (`overwrite(e)`), since it may itself be a
-     `&mut`. `f(*e)` and `f(&e)` are not writes. The write counts from where it
+     `&mut`. `f(*e)`, `f(&e)` and `f64::…(e)` calls are not writes. An assert
+     that itself writes the value, as in `assert!(e.is_finite() && refresh(&mut e))`,
+     guards nothing. The write counts from where it
      is evaluated, so `if refresh(&mut e) { w = w.max(e) }` is not guarded, and
      neither is a fold in the body of a `for` or `match` whose iterator or
      scrutinee writes the value. It also lapses inside a loop body or a closure

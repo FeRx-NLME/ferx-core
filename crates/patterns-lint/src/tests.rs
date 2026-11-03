@@ -504,3 +504,34 @@ fn a_closure_body_may_run_again_after_its_own_writes() {
     let ok = t("assert!(e.is_finite()); let mut f = || { w = w.max(e); }; f(); f();");
     assert!(findings(&ok).is_empty(), "closure without a write flagged");
 }
+
+#[test]
+fn an_assertion_that_writes_the_value_does_not_guard_it() {
+    for body in [
+        // The write runs after the check it breaks (review 6).
+        "assert!(e.is_finite() && refresh(&mut e)); w = w.max(e);",
+        "assert!(e.is_finite() && { e = f64::NAN; true }); w = w.max(e);",
+        "assert!(xs.iter().all(|x| x.is_finite()) && fill(xs)); let m = xs.iter().cloned().fold(0.0, f64::max);",
+    ] {
+        assert_eq!(findings(&t(body)).len(), 1, "assertion's own write ignored: {body}");
+    }
+    // A write to something else in the same assertion keeps the fact.
+    let ok = t("assert!(e.is_finite() && refresh(&mut other)); w = w.max(e);");
+    assert!(
+        findings(&ok).is_empty(),
+        "flagged although e is not written"
+    );
+}
+
+#[test]
+fn a_float_associated_call_is_not_a_write_of_its_arguments() {
+    for body in [
+        "assert!(e.is_finite()); let _ = f64::is_nan(e); w = w.max(e);",
+        "assert!(e.is_finite() && a.is_finite()); let _ = f64::max(a, e); w = w.max(e);",
+    ] {
+        assert!(
+            findings(&t(body)).is_empty(),
+            "f64:: call taken as a write: {body}"
+        );
+    }
+}

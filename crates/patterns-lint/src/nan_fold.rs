@@ -247,6 +247,12 @@ fn assert_facts(m: &syn::Macro) -> Vec<Fact> {
         if let Ok(args) = m.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
             if let Some(cond) = args.first() {
                 collect_finite(cond, &mut out);
+                // A write anywhere in the assertion may run after the check it
+                // would break — `assert!(e.is_finite() && refresh(&mut e))` —
+                // so a fact whose roots the assertion writes is not recorded
+                // at all (review 6). Order-blind, hence conservative.
+                let written = mutated_roots(|v| args.iter().for_each(|a| v.visit_expr(a)));
+                out.retain(|f| f.roots.is_disjoint(&written));
             }
         }
     }
@@ -495,6 +501,9 @@ fn direct_writes(e: &Expr) -> Vec<String> {
             out.extend(place_root(&m.receiver));
             out.extend(m.args.iter().filter_map(bare_place_root));
         }
+        // `f64::is_finite(x)`, `f64::max(a, b)`, …: every float associated fn
+        // takes its arguments by value, so none can write through one.
+        Expr::Call(c) if is_float_assoc_fn(&c.func) => {}
         Expr::Call(c) => out.extend(c.args.iter().filter_map(bare_place_root)),
         _ => {}
     }
@@ -582,6 +591,18 @@ fn let_bindings(cond: &Expr) -> BTreeSet<String> {
     let mut l = L(BTreeSet::new());
     l.visit_expr(cond);
     l.0
+}
+
+/// A path `f64::<anything>` or `f32::<anything>`.
+fn is_float_assoc_fn(e: &Expr) -> bool {
+    let Expr::Path(p) = e else { return false };
+    let segs: Vec<String> = p
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    segs.len() == 2 && (segs[0] == "f64" || segs[0] == "f32")
 }
 
 fn is_float_assoc_path(e: &Expr, name: &str) -> bool {
