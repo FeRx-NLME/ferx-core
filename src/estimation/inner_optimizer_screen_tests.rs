@@ -1514,3 +1514,130 @@ fn a_screen_descent_that_replaces_a_fallback_point_clears_the_flag() {
 fn an_axis_seed_that_replaces_a_fallback_point_clears_the_flag() {
     check_fallback_sweep(Swap::Axis);
 }
+
+/// #2601: the multi-start profile counts, on each solve that enters the multi-start, which of
+/// its three searches moved the EBE. One fixture per search, each the configuration on which
+/// that search alone carries the subject to the deeper mode, plus the unimodal controls, on
+/// which the multi-start runs and nothing moves. A search that stops reporting reddens its
+/// own row, and one reporting a move it did not make reddens the controls' or another row's.
+#[test]
+fn the_multistart_profile_counts_which_search_moved_the_ebe() {
+    let cfg = &CONFIGS[0];
+    let (m, opts) = model(cfg.omega);
+    let mut axis_subject = flip_flop_subject("S1", cfg);
+    axis_subject.obs_covariates = TIMES
+        .iter()
+        .map(|_| std::collections::HashMap::from([("UNUSED".to_string(), 1.0)]))
+        .collect();
+    // (label, subject, screen, twin seed, expected [twin, screen, axis] moved)
+    let rows: Vec<(&str, Subject, usize, bool, [bool; 3])> = vec![
+        (
+            "twin",
+            flip_flop_subject("S1", cfg),
+            0,
+            true,
+            [true, false, false],
+        ),
+        (
+            "screen",
+            flip_flop_subject("S1", cfg),
+            100,
+            false,
+            [false, true, false],
+        ),
+        ("axis", axis_subject, 0, false, [false, false, true]),
+        ("control a", controls()[0].clone(), 100, true, [false; 3]),
+        ("control b", controls()[1].clone(), 100, true, [false; 3]),
+    ];
+    for (what, subj, screen, twin, moved) in rows {
+        let started0 = EBE_MULTISTARTS_STARTED.with(|n| n.get());
+        let moves0 = MULTISTART_MOVES.with(|n| n.get());
+        let run0 = MULTISTART_PROFILE
+            .run
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let r = solve_with(&m, &opts, &subj, screen, twin, 1, None);
+        let started = EBE_MULTISTARTS_STARTED.with(|n| n.get()) - started0;
+        let moves = MULTISTART_MOVES.with(|n| n.get());
+        let delta: Vec<usize> = (0..3).map(|k| moves[k] - moves0[k]).collect();
+        assert!(
+            started > 0,
+            "{what}: premise, the solve entered the multi-start"
+        );
+        // The process-wide counter sees at least this thread's multi-starts.
+        assert!(
+            MULTISTART_PROFILE
+                .run
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - run0
+                >= started as u64,
+            "{what}: every multi-start is counted"
+        );
+        for (k, name) in ["twin seed", "screen", "axis scan"].iter().enumerate() {
+            assert_eq!(
+                delta[k] > 0,
+                moved[k],
+                "{what}: {name} moves counted {} over {started} multi-starts",
+                delta[k]
+            );
+            // A move is counted at most once per multi-start.
+            assert!(delta[k] <= started, "{what}: {name}");
+        }
+        if moved.iter().any(|&b| b) {
+            assert!(
+                (r.nll - cfg.deeper).abs() < 1e-4,
+                "{what}: premise, the search reached the deeper mode ({})",
+                r.nll
+            );
+        }
+    }
+    let line = MULTISTART_PROFILE.report_line().expect("multi-starts ran");
+    // `profile_report` prints exactly what `profile_report_lines` returns; the multi-start
+    // line is among them once a multi-start has run (the counters are process-wide, so
+    // another test's later solves can only append to the counts, not remove the line).
+    assert!(
+        profile_report_lines()
+            .iter()
+            .any(|l| l.starts_with("[profile] inner multi-start: ")),
+        "the report carries the multi-start line"
+    );
+    assert!(
+        line.starts_with("[profile] inner multi-start: ")
+            && line.contains(" run; moved the EBE by twin seed ")
+            && line.contains(", screen ")
+            && line.contains(", axis scan "),
+        "{line}"
+    );
+}
+
+/// `profile_report` writes nothing unless `FERX_PROFILE=1`, and then exactly the report
+/// lines, one per line — the inner-solve attribution included once an inner solve has
+/// been counted (#2601).
+#[test]
+fn the_profile_report_writes_its_lines_only_when_enabled() {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The inner-solve counters only advance under `FERX_PROFILE=1`; bump them directly so
+    // the attribution line is live. Process-wide and only ever added to, so another test
+    // can at most raise the counts this one reads.
+    PROFILE_INNER_SOLVES.fetch_add(1, Relaxed);
+    PROFILE_INNER_ANALYTIC_GRAD.fetch_add(1, Relaxed);
+
+    let mut off = Vec::new();
+    write_profile_report(false, &mut off);
+    assert!(off.is_empty(), "disabled report wrote {off:?}");
+
+    let mut on = Vec::new();
+    write_profile_report(true, &mut on);
+    let text = String::from_utf8(on).expect("utf-8 report");
+    let inner = text
+        .lines()
+        .find(|l| l.starts_with("[profile] inner: "))
+        .unwrap_or_else(|| panic!("no inner-solve line in {text:?}"));
+    assert!(
+        inner.contains(" EBE solves; ")
+            && inner.contains(" analytic-grad steps, ")
+            && inner.contains(" FD-fallback steps (")
+            && inner.ends_with("% fallback)"),
+        "{inner}"
+    );
+    assert!(text.ends_with('\n'), "each line is terminated: {text:?}");
+}

@@ -2280,6 +2280,10 @@ fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
 thread_local! {
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// This thread's [`MULTISTART_PROFILE`] moves — twin seed, screen, axis scan — so a test
+    /// can count them exactly while other tests' solves share the process-wide counters.
+    pub(crate) static MULTISTART_MOVES: std::cell::Cell<[usize; 3]> =
+        const { std::cell::Cell::new([0; 3]) };
     /// Inner-solve seed Hessians formed from scratch on this thread and handed to the
     /// search (not carried, and not declined; #2549).
     pub(crate) static FRESH_SEEDS_FORMED: std::cell::Cell<usize> =
@@ -3157,6 +3161,7 @@ fn find_ebe_solve(
             weakly_identified_coords(&obj, &eta, nll, &params.omega, n_eta)
         };
         let base = eta.clone();
+        let mut axis_moved = false;
         for i in 0..n_eta {
             if !scan_coord[i] {
                 continue;
@@ -3190,6 +3195,7 @@ fn find_ebe_solve(
                             eta = cand;
                             ebe_exit = ok;
                             used_fallback = false;
+                            axis_moved = true;
                             #[cfg(test)]
                             AXIS_SWAPS.with(|n| n.set(n.get() + 1));
                         }
@@ -3197,6 +3203,7 @@ fn find_ebe_solve(
                 }
             }
         }
+        MULTISTART_PROFILE.record(twin_moved, screen_moved, axis_moved);
     }
 
     // ── Runaway-EBE guard (#958) ───────────────────────────────────────────
@@ -4315,6 +4322,62 @@ impl Drop for InnerSettingsGuard {
 /// run, and per inner gradient step whether the exact analytic gradient served it
 /// or it fell back to the `~2·n_eta+1`-prediction FD gradient. A high fallback
 /// rate is the prime suspect when inner value-eval (prediction) counts balloon.
+/// Guarded cold-start multi-starts that ran, and how many of them moved the incumbent
+/// through the twin seed, the screen or the per-coordinate scan (a solve can count under
+/// several), process-wide (#2601). They count unconditionally — four relaxed atomic adds
+/// per multi-start, against its dozens of descents — and [`profile_report`] prints them
+/// under `FERX_PROFILE=1`. Crate-private: not part of the public API.
+pub(crate) static MULTISTART_PROFILE: MultistartProfile = MultistartProfile {
+    run: std::sync::atomic::AtomicU64::new(0),
+    twin_moved: std::sync::atomic::AtomicU64::new(0),
+    screen_moved: std::sync::atomic::AtomicU64::new(0),
+    axis_moved: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// The counters behind [`MULTISTART_PROFILE`].
+pub(crate) struct MultistartProfile {
+    pub(crate) run: std::sync::atomic::AtomicU64,
+    pub(crate) twin_moved: std::sync::atomic::AtomicU64,
+    pub(crate) screen_moved: std::sync::atomic::AtomicU64,
+    pub(crate) axis_moved: std::sync::atomic::AtomicU64,
+}
+
+impl MultistartProfile {
+    /// Record one multi-start and which of its searches moved the incumbent.
+    fn record(&self, twin: bool, screen: bool, axis: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.run.fetch_add(1, Relaxed);
+        self.twin_moved.fetch_add(u64::from(twin), Relaxed);
+        self.screen_moved.fetch_add(u64::from(screen), Relaxed);
+        self.axis_moved.fetch_add(u64::from(axis), Relaxed);
+        #[cfg(test)]
+        MULTISTART_MOVES.with(|m| {
+            let [twin_n, screen_n, axis_n] = m.get();
+            m.set([
+                twin_n + usize::from(twin),
+                screen_n + usize::from(screen),
+                axis_n + usize::from(axis),
+            ]);
+        });
+    }
+
+    /// The `FERX_PROFILE` report line, or `None` before any multi-start has run.
+    pub(crate) fn report_line(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let run = self.run.load(Relaxed);
+        (run > 0).then(|| {
+            format!(
+                "[profile] inner multi-start: {} run; moved the EBE by twin seed {}, screen {}, \
+                 axis scan {}",
+                run,
+                self.twin_moved.load(Relaxed),
+                self.screen_moved.load(Relaxed),
+                self.axis_moved.load(Relaxed),
+            )
+        })
+    }
+}
+
 pub static PROFILE_INNER_SOLVES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static PROFILE_INNER_ANALYTIC_GRAD: std::sync::atomic::AtomicU64 =
@@ -4345,23 +4408,40 @@ fn no_analytic_inner_forced() -> bool {
 
 /// Print the accumulated inner-loop attribution profile (no-op unless `FERX_PROFILE=1`).
 pub fn profile_report() {
-    if !inner_profile_enabled() {
+    write_profile_report(inner_profile_enabled(), &mut std::io::stderr().lock());
+}
+
+/// Write the [`profile_report`] lines to `out` when `enabled`; nothing otherwise.
+fn write_profile_report(enabled: bool, out: &mut impl std::io::Write) {
+    if !enabled {
         return;
     }
+    for line in profile_report_lines() {
+        // A diagnostic on stderr: a failed write has nowhere better to go.
+        let _ = writeln!(out, "{line}");
+    }
+}
+
+/// The lines [`profile_report`] prints: the inner-solve gradient attribution and the guarded
+/// multi-start's counts (#2601), each only once something was counted.
+fn profile_report_lines() -> Vec<String> {
     use std::sync::atomic::Ordering::Relaxed;
+    let mut lines = Vec::new();
     let solves = PROFILE_INNER_SOLVES.load(Relaxed);
     let ana = PROFILE_INNER_ANALYTIC_GRAD.load(Relaxed);
     let fd = PROFILE_INNER_FD_FALLBACK.load(Relaxed);
     if solves > 0 {
         let tot = (ana + fd).max(1);
-        eprintln!(
+        lines.push(format!(
             "[profile] inner: {} EBE solves; {} analytic-grad steps, {} FD-fallback steps ({:.2}% fallback)",
             solves,
             ana,
             fd,
             100.0 * fd as f64 / tot as f64
-        );
+        ));
     }
+    lines.extend(MULTISTART_PROFILE.report_line());
+    lines
 }
 
 /// The model-level inner-gradient bails that are independent of which analytic inner

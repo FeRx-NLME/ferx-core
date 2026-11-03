@@ -238,6 +238,16 @@ The seed applies only where the twin is an exact shift of the random effects:
 
 Everything else solves exactly as with `inner_twin_seed = false`, so the seed complements the screen and does not replace it. When the seed moves a subject's EBE at the final re-solve, that subject is named in the same `W_EBE_START_DEPENDENT` warning as the screen's.
 
+#### Measuring what the multi-start buys {#multistart-profile}
+
+On a large dataset the cold multi-start can be most of a `maxiter = 0` evaluation. On a synthetic sparse two-compartment IV model with block Ω and 3,000 subjects, the evaluation takes 0.57 s at the defaults and 0.12 s with `inner_restarts = 0`, while the screen moved 2 subjects and the per-coordinate seeds moved none (macOS arm64, one thread, [#2601](https://github.com/FeRx-NLME/ferx-core/issues/2601)). To see what it buys on your own data, set the environment variable `FERX_PROFILE=1`. At the end of the run, a line on stderr counts the multi-starts that ran and how many moved the EBE through the twin seed, the screen and the per-coordinate seeds:
+
+```
+[profile] inner multi-start: 6000 run; moved the EBE by twin seed 0, screen 2, axis scan 0
+```
+
+Under the seeded BFGS metric each cold solve runs twice (see [above](#escaping-a-multimodal-individual-objective)), so that count is two per subject per cold pass, and a subject can count under more than one search. If almost nothing moves, `inner_screen = 0` or `inner_restarts = 0` buys the time back. A subject that does move gets a different EBE, and the OFV changes with it.
+
 ### Covariance and standard errors {#covariance-and-standard-errors}
 
 The post-fit covariance step. See [Covariance Step](../estimation/foce.qmd#covariance-step) for what each estimator means.
