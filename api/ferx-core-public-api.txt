@@ -3230,10 +3230,12 @@ pub ferx_core::types::FitOptions::saem_conddist_nsamp: usize
 pub ferx_core::types::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::types::FitOptions::saem_mstep_draws: usize
 pub ferx_core::types::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
+pub ferx_core::types::FitOptions::saem_n_conditional_proposals: usize
 pub ferx_core::types::FitOptions::saem_n_convergence: usize
 pub ferx_core::types::FitOptions::saem_n_exploration: usize
 pub ferx_core::types::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::types::FitOptions::saem_n_mh_steps: usize
+pub ferx_core::types::FitOptions::saem_n_prior_proposals: usize
 pub ferx_core::types::FitOptions::saem_omega_burnin: usize
 pub ferx_core::types::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::types::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
@@ -4811,10 +4813,12 @@ pub ferx_core::FitOptions::saem_conddist_nsamp: usize
 pub ferx_core::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::FitOptions::saem_mstep_draws: usize
 pub ferx_core::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
+pub ferx_core::FitOptions::saem_n_conditional_proposals: usize
 pub ferx_core::FitOptions::saem_n_convergence: usize
 pub ferx_core::FitOptions::saem_n_exploration: usize
 pub ferx_core::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::FitOptions::saem_n_mh_steps: usize
+pub ferx_core::FitOptions::saem_n_prior_proposals: usize
 pub ferx_core::FitOptions::saem_omega_burnin: usize
 pub ferx_core::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>

@@ -26,6 +26,9 @@ use rand::SeedableRng;
 use rand_distr::StandardNormal;
 use std::collections::VecDeque;
 
+#[path = "saem_independence.rs"]
+mod independence;
+
 /// NLopt algorithm used for the SAEM M-step (non-mu-ref thetas + sigma).
 ///
 /// BOBYQA was chosen over the prior SLSQP after the Emax PKPD benchmark
@@ -1093,9 +1096,9 @@ fn resolve_mstep_options(
     if matches!(solver, SaemMstepSolver::ScoreSa) {
         match scope_gap {
             Some(reason) => warnings.push(format!(
-                "SAEM: `mstep_solver = score_sa` is not available for this model ({reason}), so \
-                 the numerical theta/sigma M-step keeps the single-draw derivative-free solver \
-                 (#1458)."
+                "SAEM: the score-based M-step (`mstep_solver = score_sa`, the default) is not \
+                 available for this model ({reason}), so the thetas and sigmas without a \
+                 closed-form update keep the single-draw derivative-free solver (#1458)."
             )),
             None => use_score_sa = true,
         }
@@ -1477,8 +1480,9 @@ impl MstepScoreSa {
             .subjects
             .par_iter()
             .zip(etas.par_iter())
-            .map_init(EventPkParams::default, |scratch, (subject, eta)| {
-                crate::estimation::fixed_eta_gradient::obs_nll_subject_grad_fisher(
+            .enumerate()
+            .map_init(EventPkParams::default, |scratch, (i, (subject, eta))| {
+                crate::estimation::fixed_eta_gradient::obs_nll_subject_grad_fisher_with_schedule(
                     model,
                     subject,
                     &theta_nat,
@@ -1490,6 +1494,7 @@ impl MstepScoreSa {
                     n_theta,
                     n_sigma,
                     scratch,
+                    schedules.get(i).and_then(Option::as_ref),
                 )
             })
             .collect();
@@ -4981,6 +4986,14 @@ pub fn run_saem(
     // established rebuild-per-call behaviour.
     let schedules = saem_schedule_cache(model, population);
 
+    // NONMEM's independence modes 1 and 1B (`saem_independence`): BSV-only and
+    // non-mixture, where the η conditional the kernels score is `individual_nll_prepared`'s.
+    // Mode 1B proposes from each subject's draws accumulated over the iterations so far.
+    let independence_scope = n_kappa == 0 && model.mixture.is_none();
+    let mut cond_moments: Vec<independence::ConditionalMoments> = (0..n_subjects)
+        .map(|_| independence::ConditionalMoments::new(n_eta))
+        .collect();
+
     // Main loop
     for k in 1..=n_iter {
         // Per-iteration combined (block + componentwise) accept / proposal
@@ -5104,6 +5117,10 @@ pub fn run_saem(
             // proposal Ω/σ/CW-SDs precomputed above are indexed by the draw.
             let mix_ref = saem_mix.as_ref();
             let mix_orbit_pairs_ref = mix_orbit_pairs.as_slice();
+            let moments_ref = cond_moments.as_slice();
+            // Mode 1's proposal is the population distribution, the same for every subject.
+            let prior_prop = independence::GaussianProposal::prior(&omega_k.chol);
+            let prior_prop_ref = &prior_prop;
             let class_omegas_ref = &class_omegas;
             let class_sigmas_ref = &class_sigmas;
             let class_cw_sd_ref = &class_cw_sd;
@@ -5262,6 +5279,47 @@ pub fn run_saem(
                         // scored at the wrong point, and the orbit member's own
                         // objective is the baseline instead (#2458).
                         let mut nll_cur = nll;
+                        // ---- NONMEM modes 1 and 1B: independence proposals ----
+                        // From the population distribution, then from the subject's own
+                        // accumulated conditional moments, before the random walks.
+                        if independence_scope && mix_ref.is_none() {
+                            if options.saem_n_prior_proposals > 0 {
+                                nll_cur = independence::independence_steps(
+                                    &mut eta_work,
+                                    nll_cur,
+                                    subject,
+                                    model,
+                                    theta_ref,
+                                    omega_ref,
+                                    sigma_ref,
+                                    prior_prop_ref,
+                                    &mut rng,
+                                    options.saem_n_prior_proposals,
+                                    mh_scratch,
+                                    schedules[i].as_ref(),
+                                )
+                                .1;
+                            }
+                            if options.saem_n_conditional_proposals > 0 {
+                                if let Some(prop) = moments_ref[i].proposal() {
+                                    nll_cur = independence::independence_steps(
+                                        &mut eta_work,
+                                        nll_cur,
+                                        subject,
+                                        model,
+                                        theta_ref,
+                                        omega_ref,
+                                        sigma_ref,
+                                        &prop,
+                                        &mut rng,
+                                        options.saem_n_conditional_proposals,
+                                        mh_scratch,
+                                        schedules[i].as_ref(),
+                                    )
+                                    .1;
+                                }
+                            }
+                        }
                         let mut n_acc_primary = 0_usize;
                         let mut n_prop_primary = 0_usize;
                         // HMC path: one gradient-guided proposal per SAEM iteration.
@@ -5353,6 +5411,10 @@ pub fn run_saem(
             {
                 drawn_classes[i] = mix_class;
                 state.etas[i] = eta_new;
+                // Mode 1B's moments, over every iteration's final draw.
+                if independence_scope {
+                    cond_moments[i].push(&state.etas[i]);
+                }
                 state.nll_cache[i] = nll_new;
                 state.accept_counts[i] += n_acc;
                 state.proposal_counts[i] += n_prop;

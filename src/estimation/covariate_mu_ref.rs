@@ -81,7 +81,8 @@
 //! M-steps prefer the group. FOCE / FOCEI / Laplace fits are byte-identical with
 //! and without a group.
 
-use crate::parser::model_parser::eval_typical_value;
+use crate::parser::model_parser::{eval_typical_value, TypicalCode};
+use crate::sens::rtape::DualT;
 use crate::types::{CompiledModel, CovariateMuRef, MuTransform, Population, Subject};
 use nalgebra::{DMatrix, DVector};
 
@@ -706,10 +707,125 @@ fn prior_weight(omega: &DMatrix<f64>) -> DMatrix<f64> {
 /// returns the residual vector and its sum of squares, or `None` at an
 /// inadmissible θ. Returns the full natural theta vector, or `None` when the
 /// starting point itself is inadmissible.
+/// One member's typical value compiled for a solve ([`TypicalCode`]), with every subject's
+/// covariate row gathered once: the exact closed-form M-steps evaluate it per subject per
+/// Levenberg–Marquardt trial, by name lookups and a tree walk before (#saem-gradients).
+struct MemberCode {
+    code: TypicalCode,
+    rows: Vec<Vec<f64>>,
+    transform: MuTransform,
+}
+
+impl MemberCode {
+    fn new(member: &GroupMember<'_>, population: &Population) -> Self {
+        let code = member.typical().lower();
+        let rows = population
+            .subjects
+            .iter()
+            .map(|s| code.covariate_row(&s.covariates))
+            .collect();
+        Self {
+            code,
+            rows,
+            transform: member.transform,
+        }
+    }
+
+    /// `g(A_i(θ))` for every subject, as [`GroupMember::mu`].
+    fn mus(&self, theta: &[f64]) -> Vec<f64> {
+        let (mut vars, mut stack) = (Vec::new(), Vec::new());
+        self.rows
+            .iter()
+            .map(|row| {
+                let a: f64 = self.code.eval_g(theta, row, &mut vars, &mut stack);
+                link(self.transform, a, 1.0).0
+            })
+            .collect()
+    }
+
+    /// [`Self::mus`] and each one's exact derivative over `free`, row `i` of the second
+    /// holding subject `i`'s; `None` for a group wider than the dual buckets. The values
+    /// are the `f64` pass's: a dual's value can differ in the last place (its `powf` is
+    /// spelled through `exp`/`ln`), and the residuals must be the tree evaluator's.
+    fn mus_with_jacobian(
+        &self,
+        theta: &[f64],
+        free: &[usize],
+    ) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
+        match free.len() {
+            0 => None,
+            1 => Some(self.dual_pass::<1>(theta, free)),
+            2 => Some(self.dual_pass::<2>(theta, free)),
+            3 | 4 => Some(self.dual_pass::<4>(theta, free)),
+            5..=8 => Some(self.dual_pass::<8>(theta, free)),
+            _ => None,
+        }
+    }
+
+    fn dual_pass<const N: usize>(
+        &self,
+        theta: &[f64],
+        free: &[usize],
+    ) -> (Vec<f64>, Vec<Vec<f64>>) {
+        let th: Vec<DualT<N, f64>> = theta
+            .iter()
+            .enumerate()
+            .map(|(t, &v)| {
+                let mut g = [0.0; N];
+                if let Some(j) = free.iter().position(|&f| f == t) {
+                    g[j] = 1.0;
+                }
+                DualT { v, g }
+            })
+            .collect();
+        let (mut vars, mut stack) = (Vec::new(), Vec::new());
+        let (mut fvars, mut fstack) = (Vec::new(), Vec::new());
+        let mut mus = Vec::with_capacity(self.rows.len());
+        let mut jac = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            let a: f64 = self.code.eval_g(theta, row, &mut fvars, &mut fstack);
+            let da = self.code.eval_g(&th, row, &mut vars, &mut stack);
+            let (m, scale) = link(self.transform, a, 1.0);
+            mus.push(m);
+            jac.push((0..free.len()).map(|j| scale * da.g[j]).collect());
+        }
+        (mus, jac)
+    }
+}
+
+/// `g(A)` under the member's link, and `dg/dA` times `da` (`1.0` for the derivative itself):
+/// `ln A` (`NaN` where `A` is not positive) under the lognormal link, `A` otherwise.
+fn link(transform: MuTransform, a: f64, da: f64) -> (f64, f64) {
+    match transform {
+        MuTransform::Log => {
+            if a.is_finite() && a > 0.0 {
+                (a.ln(), da / a)
+            } else {
+                (f64::NAN, f64::NAN)
+            }
+        }
+        MuTransform::Logit | MuTransform::Identity | MuTransform::LogitProbability => (a, da),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test counter: Levenberg–Marquardt iterations that fell back to a central-difference
+    /// Jacobian, so a test can pin that the exact one served.
+    pub(super) static FD_JACOBIANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Residuals, their sum of squares, and optionally their exact Jacobian
+/// ([`levenberg_marquardt`]).
+type Residuals = (Vec<f64>, f64, Option<DMatrix<f64>>);
+
+/// `residuals(θ, want_jac)` returns the residual vector, its sum of squares and, when asked
+/// and the residuals can supply it, their exact Jacobian over `free` (rows × `free.len()`).
+/// Without one the Jacobian is a central difference.
 fn levenberg_marquardt(
     input: &GroupStepInput<'_>,
     free: &[usize],
-    residuals: impl Fn(&[f64]) -> Option<(Vec<f64>, f64)>,
+    residuals: impl Fn(&[f64], bool) -> Option<Residuals>,
 ) -> Option<Vec<f64>> {
     let clamp = |t: usize, v: f64| -> f64 {
         let lo = input
@@ -722,26 +838,37 @@ fn levenberg_marquardt(
     };
 
     let mut theta = input.theta.to_vec();
-    let (mut r, mut ss) = residuals(&theta)?;
+    let (mut r, mut ss, mut exact) = residuals(&theta, true)?;
     let n = r.len();
     let d = free.len();
     let mut lambda = 1e-3;
     for _ in 0..EXACT_MAX_ITER {
-        // Jacobian of the residual, central differences per free theta.
-        let mut jac = DMatrix::<f64>::zeros(n, d);
-        for (j, &t) in free.iter().enumerate() {
-            let h = 1e-6 * theta[t].abs().max(1.0);
-            let mut up = theta.clone();
-            up[t] += h;
-            let mut dn = theta.clone();
-            dn[t] -= h;
-            let (Some((ru, _)), Some((rd, _))) = (residuals(&up), residuals(&dn)) else {
-                return Some(theta);
-            };
-            for i in 0..n {
-                jac[(i, j)] = (ru[i] - rd[i]) / (2.0 * h);
+        // Jacobian of the residual: exact where the residuals supply it, else central
+        // differences per free theta.
+        let jac = match exact.take() {
+            Some(j) => j,
+            None => {
+                #[cfg(test)]
+                FD_JACOBIANS.with(|c| c.set(c.get() + 1));
+                let mut jac = DMatrix::<f64>::zeros(n, d);
+                for (j, &t) in free.iter().enumerate() {
+                    let h = 1e-6 * theta[t].abs().max(1.0);
+                    let mut up = theta.clone();
+                    up[t] += h;
+                    let mut dn = theta.clone();
+                    dn[t] -= h;
+                    let (Some((ru, _, _)), Some((rd, _, _))) =
+                        (residuals(&up, false), residuals(&dn, false))
+                    else {
+                        return Some(theta);
+                    };
+                    for i in 0..n {
+                        jac[(i, j)] = (ru[i] - rd[i]) / (2.0 * h);
+                    }
+                }
+                jac
             }
-        }
+        };
         let rv = DVector::from_vec(r.clone());
         let jtj = jac.transpose() * &jac;
         let g = jac.transpose() * &rv;
@@ -759,8 +886,10 @@ fn levenberg_marquardt(
             for (j, &t) in free.iter().enumerate() {
                 trial[t] = clamp(t, theta[t] + delta[j]);
             }
-            match residuals(&trial) {
-                Some((rt, sst)) if sst <= ss => {
+            // With its Jacobian: a trial is usually accepted, and the next iteration
+            // starts from it.
+            match residuals(&trial, true) {
+                Some((rt, sst, jt)) if sst <= ss => {
                     let step: f64 = free
                         .iter()
                         .map(|&t| (trial[t] - theta[t]).abs() / theta[t].abs().max(1.0))
@@ -773,6 +902,7 @@ fn levenberg_marquardt(
                     if step < 1e-9 {
                         return Some(theta);
                     }
+                    exact = jt;
                     break;
                 }
                 _ => lambda *= 10.0,
@@ -944,7 +1074,12 @@ impl CovariateMuGroup<'_> {
         input: &GroupStepInput<'_>,
         free: &[usize],
     ) -> Option<Vec<f64>> {
-        let mu_old = self.mus(input.theta, population);
+        let codes: Vec<MemberCode> = self
+            .members
+            .iter()
+            .map(|m| MemberCode::new(m, population))
+            .collect();
+        let mu_old: Vec<Vec<f64>> = codes.iter().map(|c| c.mus(input.theta)).collect();
         if mu_old.iter().flatten().any(|m| !m.is_finite()) {
             return None;
         }
@@ -954,29 +1089,59 @@ impl CovariateMuGroup<'_> {
             Some(c) => c.l().transpose(),
             None => DMatrix::from_diagonal(&w.diagonal().map(|v| v.max(0.0).sqrt())),
         };
-        let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
-            let mut r = Vec::with_capacity(population.subjects.len() * q);
+        let n_subj = population.subjects.len();
+        let d = free.len();
+        let residuals = |theta: &[f64], want_jac: bool| -> Option<Residuals> {
+            // Every member's mus, and their exact derivatives where wanted and served.
+            let mut mus = Vec::with_capacity(codes.len());
+            let mut dmus = Vec::with_capacity(codes.len());
+            for c in &codes {
+                match want_jac.then(|| c.mus_with_jacobian(theta, free)).flatten() {
+                    Some((m, j)) => {
+                        mus.push(m);
+                        dmus.push(Some(j));
+                    }
+                    None => {
+                        mus.push(c.mus(theta));
+                        dmus.push(None);
+                    }
+                }
+            }
+            let exact = want_jac && dmus.iter().all(Option::is_some);
+            let mut r = Vec::with_capacity(n_subj * q);
+            let mut jac = exact.then(|| DMatrix::<f64>::zeros(n_subj * q, d));
             let mut ss = 0.0;
-            for (i, s) in population.subjects.iter().enumerate() {
+            for i in 0..n_subj {
                 let mut e = DVector::<f64>::zeros(q);
                 for (l, v) in input.etas[i].iter().take(q).enumerate() {
                     e[l] = *v;
                 }
+                // `∂e/∂θ_k`: minus each member's `∂μ/∂θ_k` on its eta.
+                let mut de = DMatrix::<f64>::zeros(q, d);
                 for (m, member) in self.members.iter().enumerate() {
-                    let mu = member.mu(theta, s);
+                    let mu = mus[m][i];
                     if !mu.is_finite() {
                         return None;
                     }
                     if member.eta_idx < q {
                         e[member.eta_idx] += mu_old[m][i] - mu;
+                        if let Some(Some(dm)) = exact.then(|| dmus[m].as_ref()) {
+                            for k in 0..d {
+                                de[(member.eta_idx, k)] -= dm[i][k];
+                            }
+                        }
                     }
                 }
                 for v in (&lt * e).iter() {
                     ss += v * v;
                     r.push(*v);
                 }
+                if let Some(j) = jac.as_mut() {
+                    let blk = &lt * de;
+                    j.view_mut((i * q, 0), (q, d)).copy_from(&blk);
+                }
             }
-            Some((r, ss))
+            Some((r, ss, jac))
         };
         levenberg_marquardt(input, free, residuals)
     }
@@ -1123,7 +1288,8 @@ fn solve_exact_single(
     free: &[usize],
 ) -> Option<Vec<f64>> {
     let n = population.subjects.len();
-    let mu_old = member.mus(input.theta, population);
+    let code = MemberCode::new(member, population);
+    let mu_old = code.mus(input.theta);
     if mu_old.iter().any(|m| !m.is_finite()) {
         return None;
     }
@@ -1142,11 +1308,17 @@ fn solve_exact_single(
             t
         })
         .collect();
-    let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
+    let residuals = |theta: &[f64], want_jac: bool| -> Option<Residuals> {
+        let (mus, dmu) = match want_jac
+            .then(|| code.mus_with_jacobian(theta, free))
+            .flatten()
+        {
+            Some((m, j)) => (m, Some(j)),
+            None => (code.mus(theta), None),
+        };
         let mut r = Vec::with_capacity(n);
         let mut ss = 0.0;
-        for (i, s) in population.subjects.iter().enumerate() {
-            let m = member.mu(theta, s);
+        for (i, &m) in mus.iter().enumerate() {
             if !m.is_finite() {
                 return None;
             }
@@ -1154,7 +1326,8 @@ fn solve_exact_single(
             ss += ri * ri;
             r.push(ri);
         }
-        Some((r, ss))
+        let jac = dmu.map(|d| DMatrix::from_fn(n, free.len(), |i, k| -d[i][k]));
+        Some((r, ss, jac))
     };
     levenberg_marquardt(input, free, residuals)
 }

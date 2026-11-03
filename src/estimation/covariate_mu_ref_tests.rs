@@ -201,10 +201,17 @@ fn exact_solver_recovers_planted_thetas() {
         omega: &omega,
         etas: &etas,
     };
+    FD_JACOBIANS.with(|c| c.set(0));
     let out = g.solve_exact(&pop, &input).expect("solvable");
     assert!((out[0] - 120.0).abs() < 1e-6, "TVCL = {}", out[0]);
     assert!((out[1] - 1.4).abs() < 1e-8, "TH_CRCL = {}", out[1]);
     assert_eq!(out[2], 10.0, "a theta outside the group is untouched");
+    // Every iteration took the exact Jacobian of the compiled typical value.
+    assert_eq!(
+        FD_JACOBIANS.with(|c| c.get()),
+        0,
+        "a finite-difference Jacobian ran"
+    );
 }
 
 #[test]
@@ -572,7 +579,15 @@ fn the_absorbed_anchor_takes_the_joint_gls_step() {
         omega: &omega,
         etas: &etas,
     };
+    FD_JACOBIANS.with(|c| c.set(0));
     let got = g.solve_exact(&pop, &input).expect("solvable");
+    // The joint step took the exact Jacobian on every iteration (#saem-gradients).
+    assert!(g.members.len() > 1, "premise: a joint group");
+    assert_eq!(
+        FD_JACOBIANS.with(|c| c.get()),
+        0,
+        "a finite-difference Jacobian ran"
+    );
     for (j, name) in ["TVV1", "TH_R", "TH_WT"].iter().enumerate() {
         assert!(got[j].is_finite(), "{name} is not finite: {}", got[j]);
         let rel = (got[j] - want[j]).abs() / want[j].abs().max(1.0);
@@ -1729,4 +1744,133 @@ fn an_earlier_assignment_to_another_groups_name_keeps_the_data_term() {
     assert_eq!(groups[0].eta_indices(), vec![0]);
     assert!(groups[0].needs_data_term, "{notes:?}");
     assert!(!groups[1].needs_data_term, "{notes:?}");
+}
+
+/// Covariate typical values over the shapes a mu-reference takes: additive, power and
+/// exponential in a covariate, each with two free thetas.
+const COMPILED_TYPICAL_MODELS: [&str; 3] = [
+    ADDITIVE_MODEL,
+    r"
+[parameters]
+  theta TVCL(150.0, 0.0, 1000.0)
+  theta TH_CRCL(0.75, -5.0, 5.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * (CRCL / 90.0)^TH_CRCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+    r"
+[parameters]
+  theta TVCL(150.0, 0.0, 1000.0)
+  theta TH_CRCL(0.01, -1.0, 1.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(TH_CRCL * (CRCL - 90.0)) * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+];
+
+/// The exact M-steps evaluate a member's typical value as compiled bytecode over a
+/// per-subject covariate row ([`MemberCode`]) instead of the tree walk over the covariate
+/// map ([`GroupMember::mu`]): the same `g(A_i(θ))`, bit for bit, at the declared thetas
+/// and away from them, and `NaN` at the same inadmissible point.
+#[test]
+fn the_compiled_typical_value_is_the_tree_one() {
+    let pop = pop_with_crcl(&CRCL_GRID);
+    let mut n_checked = 0;
+    for src in COMPILED_TYPICAL_MODELS {
+        let m = model(src);
+        let g = only_group(&m, &pop, &diag_omega(&[0.2, 0.1]));
+        let code = MemberCode::new(&g.members[0], &pop);
+        let d = m.default_params.theta.clone();
+        for theta in [
+            d.clone(),
+            vec![d[0] * 0.7, d[1] * 1.3, d[2]],
+            vec![10.0, 2.0, d[2]],
+        ] {
+            let tree = g.members[0].mus(&theta, &pop);
+            let compiled = code.mus(&theta);
+            for (a, b) in tree.iter().zip(&compiled) {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{theta:?}: tree {a} vs compiled {b}"
+                );
+                n_checked += 1;
+            }
+            // The Jacobian pass returns the same values.
+            let (with_jac, _) = code.mus_with_jacobian(&theta, &[0, 1]).unwrap();
+            for (a, b) in tree.iter().zip(&with_jac) {
+                assert_eq!(a.to_bits(), b.to_bits(), "{theta:?}: tree {a} vs {b}");
+            }
+        }
+    }
+    assert!(n_checked > 0);
+}
+
+/// The exact M-steps' Levenberg–Marquardt Jacobian `∂g(A_i)/∂θ` comes from a forward dual
+/// pass ([`MemberCode::mus_with_jacobian`]); it is the reverse-mode adjoint of the same
+/// program on the scalar tape, to rounding, for every subject and both free thetas.
+#[test]
+fn the_compiled_typical_jacobian_is_the_reverse_tape_one() {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
+    let pop = pop_with_crcl(&CRCL_GRID);
+    let mut worst = 0.0f64;
+    for src in COMPILED_TYPICAL_MODELS {
+        let m = model(src);
+        let g = only_group(&m, &pop, &diag_omega(&[0.2, 0.1]));
+        let code = MemberCode::new(&g.members[0], &pop);
+        let d = m.default_params.theta.clone();
+        // Every subject's typical value positive (the additive one is 0 at CRCL 40 for
+        // TVCL 120, TH_CRCL 2.4).
+        let theta = vec![d[0] * 0.9, d[1] * 0.9, d[2]];
+        let free = [0usize, 1];
+        let (_, jac) = code.mus_with_jacobian(&theta, &free).unwrap();
+        for (i, row) in code.rows.iter().enumerate() {
+            rtape_reset();
+            let th: Vec<R> = theta.iter().map(|&v| rinput(v)).collect();
+            let (mut vars, mut stack) = (Vec::new(), Vec::new());
+            let a = code.code.eval_g(&th, row, &mut vars, &mut stack);
+            let adj = rsweep::<1>(&[a]);
+            let av = code.mus(&theta)[i];
+            for (k, &t) in free.iter().enumerate() {
+                let da = th[t].idx().map_or(0.0, |x| adj[x]);
+                // Under the lognormal link `∂ ln A = ∂A / A`.
+                let want = da / av.exp();
+                let got = jac[i][k];
+                assert!(
+                    got.is_finite() && want.is_finite(),
+                    "subject {i}, θ{t}: {got} vs {want}"
+                );
+                worst = worst.max((got - want).abs() / (1.0 + want.abs()));
+            }
+        }
+    }
+    eprintln!("dual vs reverse-tape typical Jacobian: {worst:.3e}");
+    // Measured 3.47e-16 (Linux x86_64): two AD modes of one program, differing in rounding
+    // and in `exp(ln A)` standing for `A`; 1e-13 keeps ~300× headroom.
+    assert!(
+        worst < 1e-13,
+        "dual vs reverse-tape typical Jacobian {worst:.3e}"
+    );
 }

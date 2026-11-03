@@ -1217,6 +1217,98 @@ impl TypicalProgram {
     }
 }
 
+/// A [`TypicalProgram`] lowered to bytecode: every covariate it reads is a slot of
+/// [`Self::covs`], so a subject's values are gathered once into a row
+/// ([`Self::covariate_row`]) instead of looked up by name on every evaluation, and the
+/// program runs over any [`VmNum`](crate::sens::num::vm::VmNum): `f64` for the value, a
+/// dual in θ for its exact θ-derivatives (the SAEM mu-reference M-step's Jacobian).
+///
+/// The same semantics as [`TypicalProgram::eval`] through [`TypicalEnv`]: a stray local
+/// name lowers to `0.0`, `MACHEPS` to `f64::EPSILON`, a covariate missing from the row
+/// reads `0.0`, and the definitions are the `vars` the root reads by index. Pinned against
+/// the tree evaluator bit for bit by `typical_code_matches_the_tree_evaluator`.
+#[derive(Debug, Clone)]
+pub(crate) struct TypicalCode {
+    covs: Vec<String>,
+    defs: Vec<Bytecode>,
+    root: Bytecode,
+}
+
+impl TypicalProgram {
+    /// This program as [`TypicalCode`].
+    pub(crate) fn lower(&self) -> TypicalCode {
+        fn leaves(e: &Expression, covs: &mut Vec<String>) -> Expression {
+            match e {
+                Expression::Covariate(name) => {
+                    let slot = covs.iter().position(|c| c == name).unwrap_or_else(|| {
+                        covs.push(name.clone());
+                        covs.len() - 1
+                    });
+                    Expression::CovariateIdx(slot)
+                }
+                Expression::Variable(name) if name.eq_ignore_ascii_case("MACHEPS") => {
+                    Expression::Literal(f64::EPSILON)
+                }
+                Expression::Variable(_) | Expression::CovariateIdx(_) => Expression::Literal(0.0),
+                Expression::BinOp(l, op, r) => {
+                    Expression::BinOp(Box::new(leaves(l, covs)), *op, Box::new(leaves(r, covs)))
+                }
+                Expression::Power(b, x) => {
+                    Expression::Power(Box::new(leaves(b, covs)), Box::new(leaves(x, covs)))
+                }
+                Expression::UnaryFn(n, a) => {
+                    Expression::UnaryFn(n.clone(), Box::new(leaves(a, covs)))
+                }
+                Expression::ThetaGather { spec, idx } => Expression::ThetaGather {
+                    spec: spec.clone(),
+                    idx: Box::new(leaves(idx, covs)),
+                },
+                Expression::Conditional(c, t, f) => Expression::Conditional(
+                    Box::new(map_condition_operands(c, &mut |x| leaves(x, covs))),
+                    Box::new(leaves(t, covs)),
+                    Box::new(leaves(f, covs)),
+                ),
+                _ => e.clone(),
+            }
+        }
+        let mut covs = Vec::new();
+        let defs = self
+            .defs
+            .iter()
+            .map(|d| compile_bytecode(&leaves(d, &mut covs)))
+            .collect();
+        let root = compile_bytecode(&leaves(&self.root, &mut covs));
+        TypicalCode { covs, defs, root }
+    }
+}
+
+impl TypicalCode {
+    /// One subject's values of [`Self::covs`], `0.0` where the subject has none.
+    pub(crate) fn covariate_row(&self, covariates: &HashMap<String, f64>) -> Vec<f64> {
+        self.covs
+            .iter()
+            .map(|c| covariates.get(c).copied().unwrap_or(0.0))
+            .collect()
+    }
+
+    /// The typical value at `theta` and a [`Self::covariate_row`]. `vars` and `stack` are
+    /// scratch.
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        row: &[f64],
+        vars: &mut Vec<T>,
+        stack: &mut Vec<T>,
+    ) -> T {
+        vars.clear();
+        for d in &self.defs {
+            let v = eval_bytecode_g(d, theta, &[], row, vars, &[], stack);
+            vars.push(v);
+        }
+        eval_bytecode_g(&self.root, theta, &[], row, vars, &[], stack)
+    }
+}
+
 /// The definitions a [`TypicalProgram`] is being built with, and which
 /// substituted definition (by body address) each one is.
 #[derive(Default)]
@@ -12042,6 +12134,12 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "n_leapfrog" | "saem_n_leapfrog" => opts.saem_n_leapfrog = parse_usize("n_leapfrog")?,
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
+        "isample_m1" | "saem_n_prior_proposals" => {
+            opts.saem_n_prior_proposals = parse_usize(key)?;
+        }
+        "isample_m1b" | "saem_n_conditional_proposals" => {
+            opts.saem_n_conditional_proposals = parse_usize(key)?;
+        }
         "scale_adaptation" | "saem_scale_adaptation" => {
             opts.saem_scale_adaptation = match value.to_lowercase().as_str() {
                 "robbins_monro" | "robbins-monro" | "rm" => {

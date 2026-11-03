@@ -2857,6 +2857,106 @@ fn fixed_eta_theta_sweeps(
     (finite(&dense) && jac.as_ref().is_none_or(finite)).then_some((dense, jac))
 }
 
+/// The predictions at a fixed `eta` and their exact derivatives over the θ coordinates
+/// `free` (raw θ), by one **forward** pass: the recorders run on a first-order dual whose
+/// tangents are `free`. Returns `(f, df)` with `df[j][k] = ∂f_j/∂θ_{free[k]}`.
+///
+/// The forward twin of [`fixed_eta_theta_adjoint`]'s Jacobian, for the SAEM M-step's score
+/// and expected information, which need every row: the reverse tape pays a recording and one
+/// sweep per eight observations, the forward pass `1 + K` arithmetic per operation for `K`
+/// free θ and nothing per observation. `None` outside the recorders' scope, for more than
+/// eight free θ (the caller keeps the tape), on a recording whose length is not the
+/// subject's observation count, or on a non-finite result.
+pub(crate) fn fixed_eta_theta_forward(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    free: &[usize],
+) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
+    match free.len() {
+        0 => None,
+        1 => forward_theta::<1>(model, subject, theta, eta, free),
+        2 => forward_theta::<2>(model, subject, theta, eta, free),
+        3 | 4 => forward_theta::<4>(model, subject, theta, eta, free),
+        5..=8 => forward_theta::<8>(model, subject, theta, eta, free),
+        _ => None,
+    }
+}
+
+fn forward_theta<const K: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    free: &[usize],
+) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
+    use crate::sens::rtape::DualT;
+    type T<const K: usize> = DualT<K, f64>;
+    if !recorder_in_scope(model) {
+        return None;
+    }
+    // The basis every sibling entry point resolves: see [`fixed_eta_theta_sweeps`].
+    let (rec_model, _, axes, lay) = resolve_basis(model, subject, theta, eta, None)?;
+    if !std::ptr::eq(rec_model, model) && !recorder_in_scope(rec_model) {
+        return None;
+    }
+    let n_axis = theta_axis(rec_model)?;
+    let th: Vec<T<K>> = theta
+        .iter()
+        .enumerate()
+        .map(|(m, &v)| {
+            let mut g = [0.0; K];
+            if m < n_axis {
+                if let Some(k) = free.iter().position(|&f| f == m) {
+                    g[k] = 1.0;
+                }
+            }
+            DualT { v, g }
+        })
+        .collect();
+    let et: Vec<T<K>> = axes.iter().map(|&e| DualT { v: e, g: [0.0; K] }).collect();
+    let preds = record(
+        rec_model,
+        subject,
+        lay.as_deref(),
+        theta,
+        &axes,
+        &ThetaLeaves::theta(&th),
+        &et,
+    )?;
+    let n_obs = preds.len();
+    if n_obs != subject.observations.len() {
+        return None;
+    }
+    let mut f = Vec::with_capacity(n_obs);
+    let mut df = Vec::with_capacity(n_obs);
+    for (j, p) in preds.iter().enumerate() {
+        // A FREM covariate pseudo-observation predicts `θ_i + η_e` (the recorders return
+        // the PK prediction there): value and a unit derivative on `θ_i`.
+        let frem = model.frem_config.as_ref().and_then(|fc| {
+            let ft = subject.fremtype.get(j).filter(|&&ft| ft != 0)?;
+            fc.fremtype_to_indices.get(ft).copied()
+        });
+        match frem {
+            Some((ti, ei)) => {
+                f.push(theta.get(ti).copied().unwrap_or(0.0) + eta.get(ei).copied().unwrap_or(0.0));
+                df.push(
+                    free.iter()
+                        .map(|&m| if m == ti { 1.0 } else { 0.0 })
+                        .collect(),
+                );
+            }
+            None => {
+                f.push(p.v);
+                df.push(p.g[..free.len()].to_vec());
+            }
+        }
+    }
+    let finite = f.iter().all(|v| v.is_finite()) && df.iter().flatten().all(|v| v.is_finite());
+    finite.then_some((f, df))
+}
+
 /// Reverse sweeps over one θ-leaf recording of the predictions: row `r`'s seeds are the
 /// `(observation, weight)` pairs `seeds(r, put)` emits, its result `Σ w_j ∂f_j/∂θ` over raw θ.
 /// Rows are swept in lanes sized to what is left (8, then 4, 2, 1), so one row costs one

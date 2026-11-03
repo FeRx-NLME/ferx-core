@@ -369,7 +369,14 @@ fn saem_recovers_the_allometric_exponent_on_the_numerical_mstep() {
         "fixture must defeat covariate mu-ref detection: {:?}",
         model.covariate_mu_refs
     );
-    let result = fit(&model, &pop, &model.default_params, &saem_opts()).expect("SAEM must run");
+    // The #1415 repair is the derivative-free arm's (its first design and the exploration
+    // cap), so that arm is named: the default since #SAEMPR is `score_sa`, whose own arm is
+    // `score_sa_reaches_the_allometric_exponent_on_a_longer_schedule`.
+    let opts = FitOptions {
+        saem_mstep_solver: SaemMstepSolver::Bobyqa,
+        ..saem_opts()
+    };
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("SAEM must run");
     assert!(
         result
             .warnings
@@ -507,9 +514,9 @@ fn the_k_draw_mstep_estimator_also_recovers_the_allometric_exponent() {
 /// assertion in the meantime and would go red if the channel became *wrong*
 /// rather than slow.
 #[test]
-#[ignore = "#1480: score_sa under-recovers TH_WT at the default 150/250 schedule \
-            (0.7460 against NONMEM SAEM 0.9213, |Δ| 0.175, window 0.12). Its σ \
-            channel is fixed; the θ channel's convergence rate is not. \
+#[ignore = "score_sa moves a no-ETA TH_WT at the SA rate: 0.7460 at the default \
+            150/250 schedule against NONMEM SAEM 0.9213 — which NONMEM reached with \
+            TH_WT MU-referenced and NBURN=2000 NITER=1000, never by gradient (#SAEMPR). \
             score_sa_reaches_the_allometric_exponent_on_a_longer_schedule covers \
             the same θ at 300/700, where it lands at 0.9845."]
 fn score_sa_also_recovers_the_allometric_exponent() {
@@ -765,13 +772,19 @@ fn each_mstep_option_changes_the_fit_through_the_public_api() {
         r.theta.clone()
     };
 
-    let base = run(saem_opts());
+    // The base is the derivative-free arm, named: `score_sa` is the default since #SAEMPR,
+    // and `mstep_draws` acts on the derivative-free arm only.
+    let bobyqa = || FitOptions {
+        saem_mstep_solver: SaemMstepSolver::Bobyqa,
+        ..saem_opts()
+    };
+    let base = run(bobyqa());
 
-    // The control: the default arm run twice is bit-identical, so any
+    // The control: the base arm run twice is bit-identical, so any
     // difference below is the option and not fit-to-fit noise.
     assert_eq!(
         base,
-        run(saem_opts()),
+        run(bobyqa()),
         "two default fits at the same seed are not bit-identical — the \
          differences below cannot be attributed to the option"
     );
@@ -787,18 +800,12 @@ fn each_mstep_option_changes_the_fit_through_the_public_api() {
     };
 
     for (name, opts) in [
-        (
-            "mstep_solver = score_sa",
-            FitOptions {
-                saem_mstep_solver: SaemMstepSolver::ScoreSa,
-                ..saem_opts()
-            },
-        ),
+        ("mstep_solver = score_sa (the default)", saem_opts()),
         (
             "mstep_draws = 3",
             FitOptions {
                 saem_mstep_draws: 3,
-                ..saem_opts()
+                ..bobyqa()
             },
         ),
     ] {

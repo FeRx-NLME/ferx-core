@@ -60,6 +60,55 @@ Both kernels are symmetric in $\eta$, so the proposal density cancels and the ac
 
 **Reported acceptance is combined.** The `mh_accept_rate` column in the optimizer trace (and the verbose banner) is the **combined block + componentwise** rate. Reporting the block kernel alone is misleading for FREM-scale $\Omega$: as above, the block move reads 0% acceptance even when the componentwise sweep is mixing the chain perfectly well. If the *combined* post-burn-in rate stays below 1%, the E-step genuinely is not mixing and SAEM appends a warning to `FitResult.warnings` — the sampled ETAs never moved, so the $\Omega/\sigma$ estimates are unreliable (issue #895).
 
+#### Independence proposals: NONMEM's modes 1 and 1B {#saem-independence-kernels}
+
+Before the two random-walk kernels, each subject takes two kinds of **independence**
+proposal, the first two of NONMEM's four SAEM kernels (*Introduction to NONMEM 7.5*,
+§I.38; ferx's kernels 1 and 2 above are NONMEM's modes 2 and 3):
+
+- **Mode 1, `isample_m1` proposals** (NONMEM's `ISAMPLE_M1`): drawn from the population
+  distribution $N(0, \Omega)$. The proposal is the prior factor of the target, so the
+  acceptance ratio is the likelihood ratio alone.
+- **Mode 1B, `isample_m1b` proposals** (NONMEM's `ISAMPLE_M1B`): drawn from
+  $N(m_i, V_i)$, the subject's conditional mean and covariance accumulated over every
+  previous iteration's draw. It starts once a subject has more than $2 n_\eta$ draws, so
+  $V_i$ is not singular by construction.
+
+An independence proposal does not start from the chain's state, so one accepted move can
+cross the whole conditional, where a random-walk step moves a fraction of its SD. Each
+is a Metropolis–Hastings kernel with the ratio
+$\pi(\eta^*)\,q(\eta) / (\pi(\eta)\,q(\eta^*))$, so a poor proposal costs acceptance,
+never validity. Mode 1B's proposal adapts, but by $O(1/k)$ at the $k$-th draw, which is
+the diminishing adaptation that keeps an adaptive chain's target (Roberts & Rosenthal
+2007). Both modes are BSV-only: an IOV subject's η conditional also reads its κ, and a
+mixture subject's its drawn class, so those keep the random-walk kernels alone.
+
+Validated in `saem_independence_tests.rs`: on warfarin subjects, a chain of mode 1B
+composed with the random walk matches the conditional mean and variance of every η to
+0.029 SD and 1.8% of a self-normalised importance-sampling reference of 200 000 iid
+draws. The random walk alone, at a step of 0.5, is 0.42 SD off on one η over the same
+run: it mixes too slowly to be the reference.
+
+The defaults and their measured cost are in [Choosing the E-step kernels](#saem-kernel-defaults).
+
+#### Choosing the E-step kernels {#saem-kernel-defaults}
+
+The defaults are NONMEM's, `isample_m1 = 2` and `isample_m1b = 2`, and they were kept
+because they measured best where it matters. On `pk2_big` (300 subjects, five η, block
+Ω), importance-sampled −2 log L over nine seeds, with the score M-step:
+
+| E-step | mean | sd | worst seed | instructions |
+|---|---|---|---|---|
+| random walk only | −3500.9 | 2.8 | −3497.0 | 37.0 G |
+| + mode 1B | −3504.1 | 1.0 | −3502.6 | 39.7 G |
+| + modes 1 and 1B (default) | **−3505.7** | 1.2 | **−3504.3** | 42.3 G |
+
+The pre-#SAEMPR fit (random walk, `bobyqa`) averaged −3501.2 ± 3.3 at 47.8 G. On the
+smaller benchmarks the modes are a tie on the objective and cost 7–9 % each:
+`pk1` (500 subjects, three η) runs at 0.97× the pre-#SAEMPR speed and warfarin (10
+subjects) at 0.78×. Set `isample_m1 = 0` and `isample_m1b = 0` for the random-walk E-step
+alone.
+
 #### Choosing `n_mh_steps`
 
 `n_mh_steps` defaults to `auto`: the block count is sized from the dataset as
@@ -338,11 +387,40 @@ Combined or multi-endpoint error, `block_sigma`, M3 censoring, IOV,
 mixtures, fixed residual SDs, and models with a free numerical structural theta
 continue to use the general NLopt M-step.
 
-#### The NLopt M-step (BOBYQA) {#saem-mstep-bobyqa}
+#### The score M-step (default) {#saem-mstep-score}
 
-The NLopt M-step uses **BOBYQA** (derivative-free trust-region with quadratic interpolation). The earlier gradient-based SLSQP path was found to lock onto one side of the Emax-Hill identifiability ridge on the dense-Emax PKPD benchmark (under-estimating EMAX by ~40% at virtually identical OFV); BOBYQA's quadratic trust-region exploration lands much closer to truth and ~40% faster on that benchmark (no FD-gradient eval per parameter), while remaining numerically equivalent (ΔOFV < 0.1) on simpler PK-only models.
+Every parameter with a sufficient statistic takes its closed-form update above: a
+mu-referenced θ, Ω, and a single additive or proportional σ. What is left — a θ with no
+ETA, a σ of a combined residual — has none, and since #SAEMPR it moves the way NONMEM moves
+it (*Introduction to NONMEM 7.5*, §I.34): "expected values of gradients of the likelihood
+with respect to the thetas and sigmas … integrated over all possible values of the
+etas", then "a single iteration" maximisation step. In ferx that is `mstep_solver =
+score_sa`: one Robbins–Monro step per M-step on the score of the frozen-η objective,
+preconditioned by the SA-averaged expected information. By Fisher's identity the
+expected complete-data score is the observed-data score, so the recursion's fixed point
+is the maximum-likelihood estimate. NONMEM takes these gradients by forward differences;
+ferx takes them exactly, on the adjoint tape or, for the information's per-observation
+rows, by one forward pass over the free θ. A model whose every θ is mu-referenced or
+FIXed has no θ score to form, and none is formed.
 
-When `mu_referencing = false`, the full NLopt M-step runs for all thetas as before.
+Measured against the pre-#SAEMPR default on importance-sampled −2 log L (`method = [saem,
+imp]`, `imp_eval_only`), three seeds each, instructions on one core (see the PR for the
+whole table):
+
+| model | pre-#SAEMPR | `score_sa`, NONMEM kernels | speed |
+|---|---|---|---|
+| `emax_pkpd` | −36.00 ± 0.42 | −36.81 ± 0.05 | 1.71× |
+| `emax_timecourse` | 62.87 ± 0.12 | 62.89 ± 0.11 | 1.20× |
+| `pk1` | 5219.606 ± 0.014 | 5219.583 ± 0.007 | 0.97× |
+| `pk2_big` (9 seeds) | −3501.2 ± 3.3 | −3505.7 ± 1.2 | 1.13× |
+
+A model outside its scope (IOV, a mixture, M3, a TTE endpoint, `block_sigma`, a
+`[covariate_nn]` θ, a residual magnitude) keeps the derivative-free fallback, `mstep_solver
+= bobyqa`, and the fit says so in its warnings. That rule re-maximises the frozen-η
+objective at the single current draw with BOBYQA and adopts the maximiser, which carries
+the Jensen bias of [Averaging a maximiser is not maximising the
+average](#saem-mstep-jensen). BOBYQA replaced SLSQP there because SLSQP with
+finite-difference gradients locked onto one side of the Emax–Hill ridge.
 
 #### Thetas the closed-form update cannot reach {#saem-mstep-no-closed-form}
 
@@ -530,68 +608,41 @@ not about the estimator, and a near-i.i.d. kernel changes it.
 On the 100-subject subset the three arms are a tie (7531.37 ± 0.37 default against
 7531.14 ± 0.93 for `score_sa`), with `score_sa`'s seed spread 2.5× wider.
 
-#### Why `score_sa` is not the default
+#### Why `score_sa` is the default {#why-score_sa-is-the-default}
 
-It was a candidate in [#1449](https://github.com/FeRx-NLME/ferx-core/issues/1449) and it
-is not a close call on either side, which is why the answer is worth recording.
+It was a candidate in [#1449](https://github.com/FeRx-NLME/ferx-core/issues/1449), was
+held back by two findings, and became the default in #SAEMPR once both were resolved.
 
-**For.** Re-measured at today's shipped defaults (`n_mh_steps = auto`) over all eight
-SAEM benchmarks, 6 seeds each, single-threaded, it is tie-or-better than `bobyqa` on the
-importance-sampled −2 log L on every one — best on busulfan (−5.14), busulfan-`TVQ`-FIX
-(−5.58) and the thiotepa ODE bench (−11.07) — and it costs **25–54 % less CPU** (cefepime
-5.36 → 2.45 s, thiotepa 215 → 94 s), because one gradient sweep per iteration replaces a
-derivative-free solve whose cost is `mstep_maxiter·(n+1)` population passes.
+**For.** Over all eight #1449 SAEM benchmarks, 6 seeds each, it was tie-or-better than
+`bobyqa` on the importance-sampled −2 log L on every one — best on busulfan (−5.14),
+busulfan-`TVQ`-FIX (−5.58) and the thiotepa ODE bench (−11.07) — at 25–54 % less CPU.
+#SAEMPR's own measurement is in [The score M-step](#saem-mstep-score). And it is the SAEM
+M-step NONMEM runs for these parameters; `bobyqa` is not.
 
-**Against — the σ half, fixed in
-[#1480](https://github.com/FeRx-NLME/ferx-core/issues/1480).** As #1458 shipped it,
-`score_sa` stepped σ at the shared γ and in packed (log σ) units, which is #1445's two
-defects at once: during exploration `γ = 1`, so that is a *full* Newton step to one
-draw's score root with no Robbins-Monro averaging, and a log-scale blend is a geometric
-mean of the σ sequence. On the sparse combined-error fixture of #1445 — 300 subjects
-with a median of one observation each, truth `combined(prop = 0.13, add = 1.8)` — it
-scattered the *minority* additive σ. Measured seeds 1 / 2 / 3, `ci-test`, aarch64:
+**The σ half, fixed in [#1480](https://github.com/FeRx-NLME/ferx-core/issues/1480).** As
+#1458 shipped it, `score_sa` stepped σ at the shared γ and in log σ, which re-opened
+#1445's collapse of a minority additive σ. On #1445's sparse combined-error fixture
+(truth `ADD_ERR` 1.8), seeds 1 / 2 / 3:
 
 | | `ADD_ERR` (truth 1.8) | cross-seed sd |
 |---|---|---|
-| `bobyqa` (the default) | 1.33 / 1.83 / 2.17 | 0.42 |
+| `bobyqa` | 1.33 / 1.83 / 2.17 | 0.42 |
 | `score_sa` as #1458 shipped it | **0.84 / 0.52 / 1.13** | 0.31 |
-| `score_sa` with the γ_σ schedule only | 0.87 / 0.99 / 1.20 | 0.17 |
 | `score_sa` after #1480 | 1.90 / 1.86 / 2.11 | 0.14 |
 
-The third row is why the fix is both halves: the schedule alone still leaves seed 1 at
-0.87, under the factor-of-two gate of 0.9. The objective could not see any of it — the
-FOCE readout differs by under 2 units across all those fits, and the benchmark suite's
-−2 log L prefers `score_sa` throughout. This is the same channel #1445 is about, a
-variance component identified only where `σ_add` and `σ_prop·f` are comparable, and it
-is why `tests/saem_combined_error.rs` scores it against **simulation truth** rather than
-against another estimator.
+`tests/saem_combined_error.rs` scores it against **simulation truth**, since no objective
+in the suite could see the difference.
 
-**Against — the θ half, still open (#1480).** On the #619 `covmuref_power` anchor, whose
-`TH_WT` anchors no mu-reference and therefore moves only through this channel, `score_sa` at the
-default 150/250 schedule reaches **0.746** against NONMEM SAEM's 0.921 — outside the
-0.12 window the default solver satisfies. It is slow rather than wrong: at 300/700 it
-lands at **0.9845** (|Δ| 0.063) while `bobyqa` at that same schedule *overshoots* to
-1.1485 (|Δ| 0.227). So the window is a property of the estimator and the schedule
-together, and `score_sa` needs a longer run on a θ that starts far from its optimum.
-`tests/saem_covariate_mu_ref.rs` keeps the anchor at 300/700 live and gates the
-default-schedule arm on the open issue.
-
-A default has to be safe for the parameter the likelihood barely constrains and has to
-converge in the schedule it ships with, so `score_sa` stays opt-in. It is worth reaching
-for on a model with a free θ that has no ETA, with a longer schedule than the default if
-that θ starts far away.
-
-One further thing #1449 measured: `score_sa`'s score/information sweep does not reuse the
-cached event schedule, so on a model whose `[individual_parameters]` read `TIME` or a
-time-varying covariate it rebuilds two schedules per subject per iteration. That is an
-unrealised saving on top of the CPU numbers above, not a regression against them.
-
-Two things the numbers do **not** say. First, `d_final` against a long-run reference gets
-*worse* under `score_sa` (`TVQ` moves from −0.04 to −0.18 log units away from it) — but
-that reference is the same estimator run longer, so it carries the same bias, and it
-cannot arbitrate a change that removes it. Second, a FOCEI fit of the same model is not
-the oracle either: its own importance-sampled −2 log L is 60046.43, worse than every SAEM
-arm above, so it locates `TVQ` (7.60) no better than they do.
+**The θ half: not a defect.** On the `covmuref_power` fixture forced through this
+channel (`TH_WT` hidden from mu-reference detection), `score_sa` reaches 0.746 at the
+default 150/250 schedule and 0.985 at 300/700, against the NONMEM anchor's 0.921, while
+`bobyqa` overshoots to 1.149 at 300/700. That was read as `score_sa` converging too
+slowly. But the NONMEM anchor never moved `TH_WT` through its gradient channel: its
+control stream MU-references it (`MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70)`) and runs
+`NBURN=2000 NITER=1000 ISAMPLE=10`. A θ with no ETA moves at the SA step rate in any
+SAEM, because the ETAs absorb most of its information. ferx's closed-form covariate
+mu-reference reaches the anchor on the detectable form of the same model; on the hidden
+form the schedule decides it. NONMEM's own advice applies (§I.44): give such a θ an ETA.
 
 ::: {.callout-note}
 ## Neither is a substitute for attaching an ETA

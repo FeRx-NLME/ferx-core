@@ -7522,3 +7522,68 @@ fn the_quadrature_mode_hessian_is_the_exact_inner_hessian() {
         "mode Hessian vs exact_inner_hessian {worst:.2e}"
     );
 }
+
+/// The forward θ-sensitivities of the SAEM M-step's information
+/// ([`fixed_eta_theta_forward`]) are the reverse tape's Jacobian
+/// ([`fixed_eta_theta_adjoint`] with `want_jac`), to rounding: two AD modes of the same
+/// recording, on a closed-form model, an ODE model and a FREM model (whose covariate
+/// pseudo-observation takes the unit-derivative patch), at moved θ and a non-zero η.
+#[test]
+fn the_forward_theta_jacobian_is_the_reverse_one() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut cases: Vec<(String, CompiledModel, Vec<Subject>)> = Vec::new();
+    for (m, d) in [
+        ("examples/warfarin.ferx", "data/warfarin.csv"),
+        (
+            "examples/two_cpt_oral_ode.ferx",
+            "data/two_cpt_oral_cov.csv",
+        ),
+    ] {
+        let prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        let subjects = prep.population.subjects.iter().take(3).cloned().collect();
+        cases.push((m.into(), prep.parsed.model, subjects));
+    }
+    let frem = parse_model_string(FREM_MODEL).unwrap();
+    let mut fs = subject_shell(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[1.0, 6.0, 24.0, 0.0],
+    );
+    fs.fremtype = vec![0, 0, 0, 100];
+    fs.observations = vec![0.8, 0.6, 0.3, 75.0];
+    cases.push(("FREM".into(), frem, vec![fs]));
+    let mut worst = 0.0f64;
+    let mut n_rows = 0;
+    let mut frem_rows = 0;
+    for (m, model, subjects) in &cases {
+        let params = moved_params(model);
+        let n_theta = params.theta.len();
+        let free: Vec<usize> = (0..n_theta.min(8)).collect();
+        for s in subjects {
+            let eta: Vec<f64> = (0..model.n_eta).map(|k| 0.1 - 0.05 * k as f64).collect();
+            let w = vec![1.0; s.observations.len()];
+            let rev = fixed_eta_theta_adjoint(model, s, &params.theta, &eta, true, &w)
+                .unwrap_or_else(|| panic!("{m}: the tape serves"));
+            let jac = rev.jac.expect("rows");
+            let (_, df) = fixed_eta_theta_forward(model, s, &params.theta, &eta, &free)
+                .unwrap_or_else(|| panic!("{m}: the forward pass serves"));
+            for (j, row) in df.iter().enumerate() {
+                for (k, &i) in free.iter().enumerate() {
+                    let want = jac[j * n_theta + i];
+                    assert!(row[k].is_finite() && want.is_finite(), "{m}: {j},{i}");
+                    worst = worst.max((row[k] - want).abs() / (1.0 + want.abs()));
+                }
+                n_rows += 1;
+                frem_rows += usize::from(s.fremtype.get(j).is_some_and(|&f| f != 0));
+            }
+        }
+    }
+    eprintln!("forward vs reverse θ-Jacobian: {worst:.3e} over {n_rows} rows");
+    assert!(
+        frem_rows > 0,
+        "premise: a FREM pseudo-observation row was compared"
+    );
+    // Measured 1.15e-15 over 67 rows (Linux x86_64): two AD modes, in rounding; 1e-12
+    // keeps three decades.
+    assert!(worst < 1e-12, "forward vs reverse θ-Jacobian {worst:.3e}");
+}

@@ -323,6 +323,39 @@ fn release_fit_population(model: &CompiledModel) -> Population {
     pop
 }
 
+/// [`a_well_identified_sigma_is_released_in_a_production_fit`] under `score_sa`, the
+/// default M-step since #SAEMPR: σ takes trust-capped Newton steps (at most 0.5 in log σ),
+/// so the schedule is eight exploration M-steps and one convergence step. **Capped**, σ²
+/// keeps `0.8⁹ = 0.134` of its starting variance: σ ≥ √0.134 = 0.366 whatever the steps
+/// propose. **Released**, the Newton steps reach the maximiser near 0.1 within the eight.
+/// The bound sits between them.
+#[test]
+fn a_well_identified_sigma_is_released_under_score_sa() {
+    let model = parse_model_string(RELEASE_FIT_MODEL).expect("fixture parses");
+    let pop = release_fit_population(&model);
+    let mut opts = FitOptions::default();
+    opts.method = crate::types::EstimationMethod::Saem;
+    opts.saem_n_exploration = 8;
+    opts.saem_n_convergence = 1;
+    opts.saem_seed = Some(1464);
+    opts.run_covariance_step = false;
+    assert_eq!(
+        opts.saem_mstep_solver,
+        crate::types::SaemMstepSolver::ScoreSa
+    );
+    let sigma = crate::api::fit(&model, &pop, &model.default_params, &opts)
+        .expect("SAEM Ok")
+        .sigma[0];
+    eprintln!("score_sa σ after 8 + 1 M-steps: {sigma}");
+    assert!(sigma.is_finite(), "σ = {sigma}");
+    assert!(
+        sigma < 0.25,
+        "σ = {sigma} after eight exploration M-steps from 1.0 against a truth of \
+         {RELEASE_FIT_TRUE_PROP}: the capped schedule leaves σ ≥ 0.366, so the release did \
+         not reach the score-SA arm"
+    );
+}
+
 /// The release reaches a production fit: `run_saem` computes the SE at the
 /// M-step and hands the released step to the blend.
 ///
@@ -347,6 +380,11 @@ fn a_well_identified_sigma_is_released_in_a_production_fit() {
     opts.saem_n_convergence = 1;
     opts.saem_seed = Some(1464);
     opts.run_covariance_step = false;
+    // The closed forms below are the derivative-free arm's (its M-step assigns the
+    // maximiser, so a released σ lands near it in one step). Under `score_sa`, the default
+    // since #SAEMPR, σ moves by trust-capped Newton steps instead, which this schedule is too
+    // short to see; the release reaching that arm is `a_well_identified_sigma_is_released_under_score_sa`.
+    opts.saem_mstep_solver = crate::types::SaemMstepSolver::Bobyqa;
     let sigma = crate::api::fit(&model, &pop, &model.default_params, &opts)
         .expect("SAEM Ok")
         .sigma[0];

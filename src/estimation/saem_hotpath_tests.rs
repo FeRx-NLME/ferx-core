@@ -1039,35 +1039,15 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
     }
 }
 
-/// A gap #1449 found while measuring `score_sa` as a candidate default, pinned
-/// with its measured size.
-///
-/// `mstep_solver = score_sa` computes its score and
-/// expected information through
-/// `fixed_eta_gradient::obs_nll_subject_grad_fisher`, and that function takes
-/// **no cached schedule**: it predicts through `compute_predictions_with_tv_into`
-/// / `predict_iov` rather than their `_with_schedule` twins. On a model whose
-/// `[individual_parameters]` read `TIME` the event schedule is therefore rebuilt
-/// inside every M-step, where the derivative-free solver rebuilds none.
-///
-/// Measured on this fixture: tripling the iteration count adds **84** builds,
-/// i.e. exactly `extra_iters · n` (one per subject per M-step — the base
-/// prediction; the θ-derivatives come from the adjoint's own recording, which
-/// replaced a perturbed prediction per θ), against **0** for the same fixture
-/// under `mstep_solver = bobyqa`. It was `2 · extra_iters · n` while the θ
-/// derivative was a forward difference.
-///
-/// This is an unrealised saving, not a regression — `score_sa` is 25–54 % less
-/// CPU than `bobyqa` across the #1449 benchmark suite *including* the
-/// `TIME`-reading pembrolizumab bench, so the cache would make a win larger.
-/// The test asserts the leak is exactly the shape described, so that whoever
-/// threads the schedule through gets a red test naming this comment rather
-/// than a silent no-op, and so that the leak cannot grow unnoticed in the
-/// meantime.
+/// The score-SA M-step, the default since #SAEMPR, takes each subject's cached event
+/// schedule (`obs_nll_subject_grad_fisher_with_schedule`): on a `TIME`-reading model it
+/// adds no schedule builds per iteration. Until #SAEMPR it rebuilt one per subject per
+/// iteration (measured 67 → 151 builds over 14 extra iterations on 6 subjects, exactly
+/// one per subject per iteration), which this test pinned as a known leak; deleting the
+/// schedule argument at the call site brings that drift back and reddens it.
 #[test]
-fn the_score_sa_mstep_rebuilds_the_event_schedule() {
+fn the_score_sa_mstep_takes_the_cached_event_schedule() {
     let (model, pop) = (time_only_model(), baseline_cov_population());
-    let n = pop.subjects.len() as u64;
     let short = FitOptions {
         saem_mstep_solver: crate::types::SaemMstepSolver::ScoreSa,
         ..saem_opts()
@@ -1081,25 +1061,12 @@ fn the_score_sa_mstep_rebuilds_the_event_schedule() {
         with_build_count_1thread(|| run_bits_with(&model, &pop, opts)).1
     };
     let (a, b) = (count(&short), count(&long));
-    let extra_iters = (long.saem_n_exploration + long.saem_n_convergence
-        - short.saem_n_exploration
-        - short.saem_n_convergence) as u64;
-    let drift = b.saturating_sub(a);
-    // One build per subject per iteration, on the nose (measured 67 → 151 over
-    // 14 extra iterations on 6 subjects). Asserted as an equality rather than a
-    // bound: a *smaller* number means someone started threading the cache
-    // through and should delete this test, and a larger one is a new leak.
     assert_eq!(
-        drift,
-        extra_iters * n,
-        "score-SA M-step schedule builds {a} → {b} (drift {drift}) over {extra_iters} \
-         extra iterations on {n} subjects — expected exactly one rebuild per subject \
-         per iteration; if this is now lower, `obs_nll_subject_grad_fisher` has learnt \
-         to take the cached schedule and this test should go"
+        b.saturating_sub(a),
+        0,
+        "score-SA M-step schedule builds {a} → {b}: a longer run must add none"
     );
-    // The control: the same fixture and budgets under the derivative-free
-    // M-step rebuild nothing, so the number above is the solver's and not the
-    // fixture's.
+    // The control: the derivative-free M-step adds none either.
     let bob = |opts: &FitOptions| -> u64 {
         with_build_count_1thread(|| {
             run_bits_with(

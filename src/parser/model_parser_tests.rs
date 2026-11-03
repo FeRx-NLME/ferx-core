@@ -3869,15 +3869,15 @@ fn test_mstep_damping_round_trips_and_validates() {
 }
 
 /// `mstep_solver` and `mstep_draws` (#1458) round-trip under both spellings,
-/// default to the historical single-draw maximiser, and reject what they cannot
+/// default to the score-based SAEM M-step (#SAEMPR), and reject what they cannot
 /// act on.
 #[test]
 fn test_mstep_solver_and_draws_round_trip_and_validate() {
     let mut opts = FitOptions::default();
     assert_eq!(
         opts.saem_mstep_solver,
-        crate::types::SaemMstepSolver::Bobyqa,
-        "the default must stay the historical solver"
+        crate::types::SaemMstepSolver::ScoreSa,
+        "the default is the score-based SAEM M-step (#SAEMPR)"
     );
     assert_eq!(opts.saem_mstep_draws, 1, "the default must stay one draw");
 
@@ -37530,4 +37530,34 @@ fn the_not_mu_referenced_advice_over_the_additive_input_space() {
         );
         assert!(w.contains(says), "{label}: {w}");
     }
+}
+
+/// The E-step's independence-proposal counts (NONMEM's `ISAMPLE_M1` / `ISAMPLE_M1B`,
+/// #SAEMPR) take NONMEM's spelling and ferx's, default to NONMEM's 2 and 2, and accept 0 to
+/// turn a mode off.
+#[test]
+fn test_isample_m1_and_m1b_round_trip() {
+    let mut opts = FitOptions::default();
+    assert_eq!(
+        (
+            opts.saem_n_prior_proposals,
+            opts.saem_n_conditional_proposals
+        ),
+        (2, 2)
+    );
+    assert_eq!(apply_fit_option(&mut opts, "isample_m1", "0"), Ok(true));
+    assert_eq!(
+        apply_fit_option(&mut opts, "saem_n_conditional_proposals", "5"),
+        Ok(true)
+    );
+    assert_eq!(
+        (
+            opts.saem_n_prior_proposals,
+            opts.saem_n_conditional_proposals
+        ),
+        (0, 5)
+    );
+    assert_eq!(apply_fit_option(&mut opts, "isample_m1b", "0"), Ok(true));
+    assert_eq!(opts.saem_n_conditional_proposals, 0);
+    assert!(apply_fit_option(&mut opts, "isample_m1", "two").is_err());
 }

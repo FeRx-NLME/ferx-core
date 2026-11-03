@@ -269,6 +269,45 @@ fn exact_theta_score(
         }
         return true;
     }
+    // With every θ pinned (FIXed, or moved by the closed-form mu-reference update) there is
+    // no θ score to form: its entries stay zero, as each pinned coordinate's does below.
+    // On a fully mu-referenced model this skips a recording and sweep per subject per
+    // M-step that the step then ignores (32% of a `pk1` SAEM fit under `score_sa`).
+    if (0..n_theta).all(|i| lower[i] == upper[i]) {
+        return true;
+    }
+    // The information needs every `∂f_j/∂θ` row. For a handful of free θ one forward pass
+    // gives them all, where the reverse tape pays a recording and a sweep per eight
+    // observations; the score is then their `∂(obs_nll)/∂f`-weighted sum.
+    if df_packed.is_some() {
+        let free: Vec<usize> = (0..n_theta).filter(|&i| lower[i] != upper[i]).collect();
+        if let Some((_, df)) = crate::sens::ode_provider::adjoint::fixed_eta_theta_forward(
+            model, subject, theta, eta, &free,
+        )
+        .filter(|(f, _)| f.len() == d_nll_d_f.len())
+        {
+            let mut df_packed = df_packed;
+            for (k, &i) in free.iter().enumerate() {
+                let pack = if theta_packs_log_mask[i] {
+                    theta[i]
+                } else {
+                    1.0
+                };
+                grad[i] = pack
+                    * d_nll_d_f
+                        .iter()
+                        .zip(&df)
+                        .map(|(w, r)| w * r[k])
+                        .sum::<f64>();
+                if let Some(rows) = df_packed.as_deref_mut() {
+                    rows[i] = df.iter().map(|r| pack * r[k]).collect();
+                }
+            }
+            #[cfg(test)]
+            EXACT_THETA_SCORES.with(|c| c.set(c.get() + 1));
+            return true;
+        }
+    }
     let Some(x) = crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint(
         model,
         subject,
@@ -654,6 +693,7 @@ pub(crate) fn obs_nll_subject_grad(
         n_sigma,
         pk_scratch,
         false,
+        None,
     );
     (nll, grad)
 }
@@ -691,6 +731,9 @@ pub(crate) fn obs_nll_subject_grad(
 ///
 /// A `None` here is what the caller's scope gate turns into a documented
 /// fallback to the derivative-free M-step rather than a silently wrong step.
+/// Without a cached schedule; production calls
+/// [`obs_nll_subject_grad_fisher_with_schedule`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_grad_fisher(
     model: &CompiledModel,
@@ -718,6 +761,42 @@ pub(crate) fn obs_nll_subject_grad_fisher(
         n_sigma,
         pk_scratch,
         true,
+        None,
+    )
+}
+
+/// [`obs_nll_subject_grad_fisher`] on the subject's cached event schedule, so a
+/// time-varying-covariate subject does not rebuild it for every prediction the score and
+/// information need (#SAEMPR). `None` builds it per prediction, as the plain form does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn obs_nll_subject_grad_fisher_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    theta_packs_log_mask: &[bool],
+    lower: &[f64],
+    upper: &[f64],
+    n_theta: usize,
+    n_sigma: usize,
+    pk_scratch: &mut EventPkParams,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+) -> (f64, Vec<f64>, Option<Vec<f64>>) {
+    obs_nll_subject_grad_impl(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        eta,
+        theta_packs_log_mask,
+        lower,
+        upper,
+        n_theta,
+        n_sigma,
+        pk_scratch,
+        true,
+        schedule,
     )
 }
 
@@ -770,6 +849,8 @@ fn obs_nll_subject_grad_impl(
     n_sigma: usize,
     pk_scratch: &mut EventPkParams,
     want_fisher: bool,
+    // The subject's cached event schedule, or `None` to build it per prediction.
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
     let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3) || model.residual_is_dense();
@@ -784,8 +865,9 @@ fn obs_nll_subject_grad_impl(
         // obs_nll_subject_into for all parameters. Predictions are σ-independent,
         // so solve the model once and reuse the base predictions across every σ
         // perturbation — only θ perturbations need a fresh solve (#557).
-        let preds_base =
-            crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+        let preds_base = crate::pk::compute_predictions_with_tv_into_with_schedule(
+            model, subject, theta, eta, pk_scratch, schedule,
+        );
         let nll_base = obs_nll_subject_from_preds(
             model,
             subject,
@@ -886,8 +968,9 @@ fn obs_nll_subject_grad_impl(
     }
 
     // Non-M3 path.
-    let preds_base =
-        crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+    let preds_base = crate::pk::compute_predictions_with_tv_into_with_schedule(
+        model, subject, theta, eta, pk_scratch, schedule,
+    );
 
     let mut nll_base = 0.0f64;
     let n_obs = subject.observations.len();
@@ -991,8 +1074,9 @@ fn obs_nll_subject_grad_impl(
         let delta = sign * theta_fd_step(model, h_fd, theta, i);
         let mut theta_p = theta.to_vec();
         theta_p[i] += delta;
-        let preds_p =
-            crate::pk::compute_predictions_with_tv_into(model, subject, &theta_p, eta, pk_scratch);
+        let preds_p = crate::pk::compute_predictions_with_tv_into_with_schedule(
+            model, subject, &theta_p, eta, pk_scratch, schedule,
+        );
         // Difference on raw predictions — do NOT clip before differencing.
         // Clipping both pp and pb at 1e-12 before subtracting would produce a
         // zero difference whenever pb < 1e-12, silently zeroing the gradient.
@@ -1054,8 +1138,8 @@ fn obs_nll_subject_grad_impl(
             let delta = theta_fd_step(model, h_fd, theta, i);
             let mut theta_p = theta.to_vec();
             theta_p[i] += delta;
-            let preds_p = crate::pk::compute_predictions_with_tv_into(
-                model, subject, &theta_p, eta, pk_scratch,
+            let preds_p = crate::pk::compute_predictions_with_tv_into_with_schedule(
+                model, subject, &theta_p, eta, pk_scratch, schedule,
             );
             let pack = if theta_packs_log_mask[i] {
                 theta[i]

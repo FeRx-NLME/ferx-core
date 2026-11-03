@@ -9130,6 +9130,14 @@ pub struct FitOptions {
     /// model (the HMC `∂NLL/∂η` is the `Dual2` analytic gradient) — falls
     /// back to MH otherwise.
     pub saem_n_leapfrog: usize,
+    /// SAEM E-step: mode-1 proposals per subject per iteration, drawn from the
+    /// population distribution `N(0, Ω)` and accepted on the likelihood ratio — NONMEM's
+    /// `ISAMPLE_M1` (*Introduction to NONMEM 7.5*, §I.38), `[fit_options] isample_m1`.
+    pub saem_n_prior_proposals: usize,
+    /// SAEM E-step: mode-1B proposals per subject per iteration, drawn from the subject's
+    /// conditional mean and covariance accumulated over the previous iterations — NONMEM's
+    /// `ISAMPLE_M1B`, `[fit_options] isample_m1b`.
+    pub saem_n_conditional_proposals: usize,
     // Bayes (Gibbs-within-HMC) options — see EstimationMethod::Bayes.
     /// Number of warmup (burn-in + adaptation) sweeps per chain, discarded from
     /// the reported posterior. HMC step size / leapfrog count adapt during this
@@ -9772,6 +9780,8 @@ impl Default for FitOptions {
             saem_conddist_burnin: 20,
             saem_conddist_keep_samples: false,
             saem_n_leapfrog: 0,
+            saem_n_prior_proposals: 2,
+            saem_n_conditional_proposals: 2,
             bayes_warmup: 1000,
             bayes_iters: 1000,
             bayes_chains: 4,
@@ -10120,38 +10130,38 @@ pub enum ScaleAdaptation {
 /// point when the E-step draws are dispersed. See [`SaemMstepSolver::ScoreSa`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SaemMstepSolver {
-    /// The historical rule, and **the default**: a short derivative-free
-    /// (BOBYQA) re-maximisation of the frozen-η conditional objective at this
-    /// iteration's single η draw, whose *maximiser* is then assigned (or
-    /// Robbins-Monro blended when `mstep_damping` is set).
-    #[default]
+    /// The single-draw rule: a short derivative-free (BOBYQA) re-maximisation of the
+    /// frozen-η conditional objective at this iteration's draw, whose *maximiser* is then
+    /// assigned (or Robbins-Monro blended when `mstep_damping` is set). Not SAEM's
+    /// M-step: the average of per-draw maximisers converges to `E[θ*(η)]`, not to the
+    /// maximiser of `E[Q(θ, η)]`, a Jensen-type bias that grows as the E-step mixes
+    /// better (#1458). The default until #SAEMPR, and still the fallback for a model outside
+    /// [`SaemMstepSolver::ScoreSa`]'s scope.
     Bobyqa,
-    /// Stochastic approximation on the **score and expected information**, with
-    /// one Levenberg-Marquardt-damped Newton step per M-step on the averaged
-    /// quantities (Kuhn & Lavielle 2005; #1458).
+    /// **The default since #SAEMPR.** Stochastic approximation on the **score**, with one
+    /// Levenberg–Marquardt-damped Newton step per M-step preconditioned by the SA-averaged
+    /// expected information (Kuhn & Lavielle 2005; #1458): the faithful SAEM M-step for
+    /// the parameters without a sufficient statistic (a θ with no ETA, a σ of a combined
+    /// residual). It is how NONMEM moves those parameters — "expected values of gradients
+    /// of the likelihood with respect to the thetas and sigmas … integrated over all
+    /// possible values of the etas", then "a single iteration" maximisation step
+    /// (*Introduction to NONMEM 7.5*, §I.34) — with the exact adjoint score where NONMEM
+    /// takes forward differences. By Fisher's identity the averaged complete-data score is
+    /// the observed-data score, so the recursion's fixed point is the maximum-likelihood
+    /// estimate; there is no Jensen term.
     ///
-    /// Both averaged quantities are *linear* in the per-draw contribution, so
-    /// the recursion has no Jensen term — unlike an average of maximisers,
-    /// which converges to `E[θ*(η)]` rather than to the maximiser of
-    /// `E[Q(θ, η)]`. That bias is what makes a θ with no ETA (a covariate
-    /// effect, a structural parameter left without IIV) land away from its
-    /// optimum, and it grows when the E-step mixes better.
+    /// **Restricted to the plain Gaussian residual scope** the expected information has a
+    /// closed form on: no IOV, no mixture, no M3, no TTE endpoint, no `block_sigma`
+    /// residual correlation, no `[covariate_nn]` θ, no residual magnitude. A model outside
+    /// it falls back to [`SaemMstepSolver::Bobyqa`] with a warning naming the reason.
     ///
-    /// Opt-in, and **restricted to the plain Gaussian residual scope** the
-    /// expected information has a closed form on: no IOV, no mixture, no M3, no
-    /// TTE endpoint, no `block_sigma` residual correlation, no `[covariate_nn]`
-    /// θ, no residual magnitude. FREM is in scope since #1421. A fit outside
-    /// that scope falls back to [`SaemMstepSolver::Bobyqa`] with a warning
-    /// naming the reason.
-    ///
-    /// It was a **candidate default** in #1449 and did not become one: it is
-    /// tie-or-better than `bobyqa` on the importance-sampled −2 log L of all
-    /// eight SAEM benchmarks at 25–54 % less CPU, but on the sparse
-    /// combined-error fixture of #1445 it scatters a weakly identified
-    /// *minority* `σ_add` that the objective barely sees — 0.85 / 0.38 / 2.66
-    /// over three seeds against a simulation truth of 1.8, where `bobyqa`
-    /// returns 1.99 / 1.62 / 1.59. See
-    /// `tests/saem_combined_error.rs::score_sa_does_not_bring_back_the_additive_sigma_collapse`.
+    /// A θ with no ETA converges at the rate the SA step allows, which on a θ whose
+    /// information the ETAs mostly absorb is slow: on the `covmuref_power` fixture forced
+    /// through this channel, `TH_WT` reaches 0.746 at the default 150/250 schedule and
+    /// 0.985 at 300/700, against the NONMEM anchor's 0.921 — which NONMEM reached with
+    /// `TH_WT` MU-referenced (no gradient channel at all) and a 2000/1000 schedule. As
+    /// NONMEM advises (§I.44), give such a θ an ETA where the model allows.
+    #[default]
     ScoreSa,
 }
 
@@ -11232,6 +11242,10 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "n_mh_steps",
             "n_leapfrog",
             "saem_n_leapfrog",
+            "isample_m1",
+            "saem_n_prior_proposals",
+            "isample_m1b",
+            "saem_n_conditional_proposals",
             "adapt_interval",
             "scale_adaptation",
             "saem_scale_adaptation",
