@@ -123,7 +123,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
@@ -224,7 +224,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),

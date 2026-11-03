@@ -4958,8 +4958,10 @@ pub struct CompiledModel {
     /// Per-CMT non-Gaussian endpoint specifications.
     /// Empty for models with only Gaussian observations.
     /// Keyed by the CMT value declared in `[event_model]` / future blocks.
+    /// A `BTreeMap`, so iteration is in ascending CMT order on every compile: every
+    /// sum, emitted row and first-wins message over endpoints is reproducible (#2531).
     #[cfg(feature = "survival")]
-    pub endpoints: HashMap<usize, EndpointLikelihood>,
+    pub endpoints: std::collections::BTreeMap<usize, EndpointLikelihood>,
     /// FREM configuration. When `Some`, the model uses FREMTYPE-based
     /// observation dispatch: covariate pseudo-observations use individual
     /// parameter values as predictions and a near-zero additive sigma.

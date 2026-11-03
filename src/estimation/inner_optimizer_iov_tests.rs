@@ -633,7 +633,7 @@ fn make_iov_model() -> CompiledModel {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
@@ -2333,7 +2333,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
@@ -2506,7 +2506,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
     };
     let subject = Subject {
         obs_rgroup: Vec::new(),

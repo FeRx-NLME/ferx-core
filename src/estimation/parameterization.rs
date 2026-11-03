@@ -3924,7 +3924,7 @@ mod tests {
             derived_exprs: vec![],
             output_columns: vec![],
             #[cfg(feature = "survival")]
-            endpoints: std::collections::HashMap::new(),
+            endpoints: std::collections::BTreeMap::new(),
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),

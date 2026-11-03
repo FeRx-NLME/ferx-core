@@ -2436,6 +2436,14 @@ mod eta_hessian_step_tests;
 mod residual_tests;
 
 #[cfg(test)]
+#[path = "endpoint_order_test_helpers.rs"]
+pub(crate) mod endpoint_order_test_helpers;
+
+#[cfg(test)]
+#[path = "endpoint_order_tests.rs"]
+mod endpoint_order_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;

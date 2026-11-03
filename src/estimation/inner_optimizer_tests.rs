@@ -2121,7 +2121,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         output_columns: vec![],
         dose_attr_map: Default::default(),
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: Some(crate::types::FremConfig {
             fremtype_to_indices: {
                 let mut m = std::collections::HashMap::new();
