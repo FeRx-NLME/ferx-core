@@ -692,48 +692,63 @@ fn predict_survival_rows_are_in_ascending_cmt_order_on_every_compile() {
     }
 }
 
-/// The competing-risks `survival_all` and `cif` (and each row's `cum_hazard`) are the same
-/// bits on every compile: `cif_curves` sums every cause's `H_j` in the order the rows
-/// were collected, so with a map-ordered walk the values moved too, not only the rows.
-/// At `314b89fb` 40 compiles gave 2 distinct bit patterns for two causes and 6 for three.
+/// The competing-risks `survival_all` and `cif` are the same bits on every compile:
+/// `cif_curves` sums every cause's `H_j` (and `ΔH_j`) in the order the rows were
+/// collected, so with a map-ordered walk the values moved too, not only the rows.
+///
+/// Only the three-cause model can show it: a two-term `f64` sum commutes exactly, so the
+/// two-cause values are order-free (only its row order moved). And the three-cause sums
+/// must be order-sensitive on the grid — on `GRID` = 1, 5, 10, 30 every order of
+/// `0.10·t + 0.06·t + 0.0037·t` rounds to the same bits, so this test uses 0.7 and 1.3,
+/// where it does not, and asserts that straddle.
 ///
 /// Mutation: as for the row-order test, at the same site.
 #[test]
 fn predict_survival_cif_bits_are_the_same_on_every_compile() {
+    use crate::survival::endpoint_order_test_helpers::order_sensitive;
+    const CIF_GRID: [f64; 4] = [0.7, 1.3, 5.0, 14.0];
     let bits = |r: &SurvivalPredictionResult| {
         (
             r.id.clone(),
             r.cmt,
             r.survival_all.to_bits(),
             r.cif.to_bits(),
-            r.cum_hazard.to_bits(),
         )
     };
-    for (label, fx) in [
-        ("two-cause", EndpointOrderFixture::two_cause()),
-        ("three-cause", EndpointOrderFixture::three_cause()),
-    ] {
+    let fx = EndpointOrderFixture::three_cause();
+    let (m, pop) = fx.compile();
+    let first = predict_survival(&m, &pop, &m.default_params, &CIF_GRID).expect("predict");
+    assert!(
+        first
+            .iter()
+            .all(|r| r.cif.is_finite() && r.survival_all.is_finite()),
+        "{first:?}"
+    );
+    // Straddle: at some (subject, time) the causes' `H_j` sum to other bits in another order.
+    let straddles = first.iter().any(|r0| {
+        let h: Vec<f64> = first
+            .iter()
+            .filter(|r| r.id == r0.id && r.time == r0.time)
+            .map(|r| r.cum_hazard)
+            .collect();
+        h.len() == 3 && order_sensitive(0.0, &h)
+    });
+    assert!(
+        straddles,
+        "no H_j sum depends on the order: the pin cannot fail"
+    );
+    let mut want: Vec<_> = first.iter().map(bits).collect();
+    // Compared as sets of rows, so this test sees the values and not the row order.
+    want.sort_unstable();
+    for k in 0..COMPILES {
         let (m, pop) = fx.compile();
-        let first = predict_survival(&m, &pop, &m.default_params, &GRID).expect("predict");
-        assert!(
-            first
-                .iter()
-                .all(|r| r.cif.is_finite() && r.survival_all.is_finite()),
-            "{label}"
-        );
-        let mut want: Vec<_> = first.iter().map(bits).collect();
-        // Compare as sets of rows, so this test sees the values and not the row order.
-        want.sort_unstable();
-        for k in 0..COMPILES {
-            let (m, pop) = fx.compile();
-            let mut got: Vec<_> = predict_survival(&m, &pop, &m.default_params, &GRID)
-                .expect("predict")
-                .iter()
-                .map(bits)
-                .collect();
-            got.sort_unstable();
-            assert!(got == want, "{label}, compile {k}: the rows' bits moved");
-        }
+        let mut got: Vec<_> = predict_survival(&m, &pop, &m.default_params, &CIF_GRID)
+            .expect("predict")
+            .iter()
+            .map(bits)
+            .collect();
+        got.sort_unstable();
+        assert!(got == want, "compile {k}: the rows' S_all / CIF bits moved");
     }
 }
 
