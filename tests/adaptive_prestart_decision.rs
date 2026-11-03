@@ -27,7 +27,8 @@ use ferx_core::{
     parse_full_model_file, predict, read_nonmem_csv, simulate_adaptive, AdaptiveSimulateOptions,
     CompiledModel, Population,
 };
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::Path;
 
 const ANCHOR: &str = "adaptive_prestart_decision";
 
@@ -130,7 +131,10 @@ fn nonmem_ipred() -> Vec<(String, f64, f64)> {
 }
 
 /// The anchor dataset with every controller dose row removed — the subjects the adaptive
-/// runs start from. Written per process so parallel test binaries do not share a file.
+/// runs start from. Each call writes its own `NamedTempFile`: the tests in this file run as
+/// threads of one process, and a path keyed on the process id was shared by all three — one
+/// test's write truncated the file under another's read, and CI's slow-tests shard on
+/// `30a299bf` failed with `base csv: "Missing ID column"`.
 fn base_population() -> Population {
     let src = format!("nonmem_anchor/{ANCHOR}.csv");
     let text = std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("{src}: {e}"));
@@ -153,12 +157,11 @@ fn base_population() -> Population {
         }
     }
     assert_eq!(removed, 6, "controller dose rows in the anchor dataset");
-    let path: PathBuf =
-        std::env::temp_dir().join(format!("ferx_2125_base_{}.csv", std::process::id()));
-    std::fs::write(&path, out.join("\n") + "\n").expect("write base csv");
-    let pop = read_nonmem_csv(&path, None, None).expect("base csv");
-    let _ = std::fs::remove_file(&path);
-    pop
+    let mut f = tempfile::NamedTempFile::new().expect("temp file");
+    f.write_all((out.join("\n") + "\n").as_bytes())
+        .expect("write base csv");
+    f.flush().expect("flush base csv");
+    read_nonmem_csv(f.path(), None, None).expect("base csv")
 }
 
 /// Run each schedule on its own subject with the replay verifier on, the controller
