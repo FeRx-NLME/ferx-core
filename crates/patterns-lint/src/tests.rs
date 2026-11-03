@@ -459,3 +459,48 @@ fn a_write_invalidates_the_fact_where_it_is_evaluated_not_at_statement_end() {
         );
     }
 }
+
+#[test]
+fn an_assert_on_a_call_does_not_guard_a_second_call() {
+    for body in [
+        // Each call may answer differently: the assert checks one, the fold
+        // reads another (review 5).
+        "assert!(next().is_finite()); w = w.max(next());",
+        "assert!(s.sample().is_finite()); w = w.max(s.sample());",
+        "assert!(f64::is_finite(next())); w = w.max(next());",
+        "assert!((x - next()).is_finite()); w = w.max((x - next()).abs());",
+        "assert!(v[pick()].is_finite()); w = w.max(v[pick()]);",
+        "assert!(xs.iter().map(|x| g(*x)).all(f64::is_finite)); let m = xs.iter().map(|x| g(*x)).fold(0.0, f64::max);",
+    ] {
+        assert_eq!(findings(&t(body)).len(), 1, "a call's assert excused another call: {body}");
+    }
+    for body in [
+        // Locals, fields, indexing, pure float math and element-wise adapters
+        // re-evaluate to the same value.
+        "assert!(r.got.is_finite()); w = w.max(r.got);",
+        "assert!(v[i].is_finite()); w = w.max(v[i].abs());",
+        "assert!(x.sqrt().is_finite()); w = w.max(x.sqrt());",
+        "assert!(xs.iter().map(|x| x.abs()).all(f64::is_finite)); let m = xs.iter().map(|x| x.abs()).fold(0.0, f64::max);",
+    ] {
+        assert!(findings(&t(body)).is_empty(), "stable value flagged: {body}");
+    }
+}
+
+#[test]
+fn a_closure_body_may_run_again_after_its_own_writes() {
+    for body in [
+        // The second call folds the NaN the first one wrote (review 5).
+        "assert!(e.is_finite()); let mut f = || { w = w.max(e); e = f64::NAN; }; f(); f();",
+        "assert!(e.is_finite()); let mut f = || { w = w.max(e); refresh(&mut e); }; f(); f();",
+        "assert!(e.is_finite()); (0..3).for_each(|_| { w = w.max(e); e += 1.0; });",
+    ] {
+        assert_eq!(
+            findings(&t(body)).len(),
+            1,
+            "outer fact survived a closure's write: {body}"
+        );
+    }
+    // A closure that never writes the value keeps the outer fact.
+    let ok = t("assert!(e.is_finite()); let mut f = || { w = w.max(e); }; f(); f();");
+    assert!(findings(&ok).is_empty(), "closure without a write flagged");
+}

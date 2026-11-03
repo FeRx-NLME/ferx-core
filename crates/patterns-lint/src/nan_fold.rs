@@ -259,10 +259,17 @@ fn assert_facts(m: &syn::Macro) -> Vec<Fact> {
 /// parenthesised term is itself, and `!x.is_finite()`, `x.is_finite() || y`,
 /// or an `is_finite` buried in any other expression guarantee nothing.
 fn collect_finite(cond: &Expr, out: &mut Vec<Fact>) {
-    let value = |e: &Expr| Fact {
-        chain: false,
-        key: value_key(e),
-        roots: roots_of(e),
+    // Only a STABLE expression's assert says anything about its next
+    // evaluation: `assert!(next().is_finite()); w = w.max(next())` checks one
+    // call and folds another (review 5).
+    let value = |e: &Expr, out: &mut Vec<Fact>| {
+        if is_stable(e) {
+            out.push(Fact {
+                chain: false,
+                key: value_key(e),
+                roots: roots_of(e),
+            });
+        }
     };
     match cond {
         Expr::Paren(p) => collect_finite(&p.expr, out),
@@ -271,13 +278,16 @@ fn collect_finite(cond: &Expr, out: &mut Vec<Fact>) {
             collect_finite(&b.right, out);
         }
         Expr::MethodCall(m) if m.method == "is_finite" && m.args.is_empty() => {
-            out.push(value(&m.receiver));
+            value(&m.receiver, out);
         }
         Expr::Call(c) if c.args.len() == 1 && is_float_assoc_path(&c.func, "is_finite") => {
-            out.push(value(&c.args[0]));
+            value(&c.args[0], out);
         }
         Expr::MethodCall(m)
-            if m.method == "all" && m.args.len() == 1 && predicate_is_finite(&m.args[0]) =>
+            if m.method == "all"
+                && m.args.len() == 1
+                && predicate_is_finite(&m.args[0])
+                && is_stable(&m.receiver) =>
         {
             out.push(Fact {
                 chain: true,
@@ -286,6 +296,86 @@ fn collect_finite(cond: &Expr, out: &mut Vec<Fact>) {
             });
         }
         _ => {}
+    }
+}
+
+/// Methods whose result is a function of the receiver and arguments alone:
+/// pure float math, element-preserving or element-wise iterator adapters, and
+/// plain accessors. A call of anything else — any free function, any other
+/// method — may answer differently the second time, so an assert on it is not
+/// a fact about a later call (review 5).
+const STABLE_METHODS: &[&str] = &[
+    "abs",
+    "acos",
+    "as_ref",
+    "as_slice",
+    "asin",
+    "atan",
+    "by_ref",
+    "ceil",
+    "chain",
+    "chunks",
+    "clone",
+    "cloned",
+    "column",
+    "copied",
+    "cos",
+    "enumerate",
+    "exp",
+    "expect",
+    "filter",
+    "first",
+    "floor",
+    "get",
+    "into_iter",
+    "iter",
+    "last",
+    "len",
+    "ln",
+    "log10",
+    "log2",
+    "map",
+    "max",
+    "min",
+    "powf",
+    "powi",
+    "rev",
+    "round",
+    "row",
+    "signum",
+    "sin",
+    "skip",
+    "sqrt",
+    "step_by",
+    "take",
+    "tan",
+    "unwrap",
+    "values",
+    "windows",
+    "zip",
+];
+
+/// Does evaluating `e` again give the same value? Locals, fields, indexing,
+/// literals, casts, operators, [`STABLE_METHODS`] and closures whose bodies are
+/// stable; never a free-function call, another method, a macro or a block.
+fn is_stable(e: &Expr) -> bool {
+    match e {
+        Expr::Path(_) | Expr::Lit(_) => true,
+        Expr::Paren(p) => is_stable(&p.expr),
+        Expr::Reference(r) => is_stable(&r.expr),
+        Expr::Unary(u) => is_stable(&u.expr),
+        Expr::Field(f) => is_stable(&f.base),
+        Expr::Index(i) => is_stable(&i.expr) && is_stable(&i.index),
+        Expr::Cast(c) => is_stable(&c.expr),
+        Expr::Binary(b) => is_stable(&b.left) && is_stable(&b.right),
+        Expr::Tuple(t) => t.elems.iter().all(is_stable),
+        Expr::Closure(c) => is_stable(&c.body),
+        Expr::MethodCall(m) => {
+            STABLE_METHODS.contains(&m.method.to_string().as_str())
+                && is_stable(&m.receiver)
+                && m.args.iter().all(is_stable)
+        }
+        _ => false,
     }
 }
 
@@ -1142,8 +1232,13 @@ impl<'ast> Visit<'ast> for Linter<'_> {
     }
 
     fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        // A closure may be called any number of times, so — like a loop body —
+        // an outer fact about anything its body writes does not hold inside it
+        // (review 5): `|| { w = w.max(e); e = f64::NAN; }` called twice.
         let params: BTreeSet<String> = c.inputs.iter().flat_map(pat_bindings).collect();
-        self.push_scope(params.clone(), params);
+        let mut masked = params.clone();
+        masked.extend(mutated_roots(|v| v.visit_expr(&c.body)));
+        self.push_scope(masked, params);
         visit::visit_expr_closure(self, c);
         self.pop_scope();
     }

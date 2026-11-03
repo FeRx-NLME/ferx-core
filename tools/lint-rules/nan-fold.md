@@ -74,10 +74,16 @@ parameter or loop pattern of the same name hides it.
      `&mut`. `f(*e)` and `f(&e)` are not writes. The write counts from where it
      is evaluated, so `if refresh(&mut e) { w = w.max(e) }` is not guarded, and
      neither is a fold in the body of a `for` or `match` whose iterator or
-     scrutinee writes the value. It also lapses inside a loop body
-     that writes the value, because the next iteration runs after the write. It
-     doesn't reach code where the name is rebound: a `let e`, a closure
-     parameter `|e|`, or a `for e` / `match` / `if let` pattern.
+     scrutinee writes the value. It also lapses inside a loop body or a closure
+     body that writes the value, because the next iteration or call runs after
+     the write. It doesn't reach code where the name is rebound: a `let e`, a
+     closure parameter `|e|`, or a `for e` / `match` / `if let` pattern.
+   - **What it is about.** Only a *stable* expression can be asserted: locals,
+     fields, indexing, literals, casts, arithmetic, pure float methods
+     (`abs`, `sqrt`, `exp`, …), element-wise iterator adapters and closures
+     built from those. A call is checked once and folded again, so
+     `assert!(next().is_finite()); w = w.max(next())` is not guarded. Bind the
+     value to a local, assert the local, and fold that.
    - **What it proves.** An accumulator operand is guarded when it is the
      asserted expression itself, or is built from asserted values and literals
      so that no `NaN` can come out. Finite inputs can still overflow to
