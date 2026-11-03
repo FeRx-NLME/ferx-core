@@ -370,7 +370,7 @@ fn saem_recovers_the_allometric_exponent_on_the_numerical_mstep() {
         model.covariate_mu_refs
     );
     // The #1415 repair is the derivative-free arm's (its first design and the exploration
-    // cap), so that arm is named: the default since #SAEMPR is `score_sa`, whose own arm is
+    // cap), so that arm is named: the default since #2612 is `score_sa`, whose own arm is
     // `score_sa_reaches_the_allometric_exponent_on_a_longer_schedule`.
     let opts = FitOptions {
         saem_mstep_solver: SaemMstepSolver::Bobyqa,
@@ -516,7 +516,7 @@ fn the_k_draw_mstep_estimator_also_recovers_the_allometric_exponent() {
 #[test]
 #[ignore = "score_sa moves a no-ETA TH_WT at the SA rate: 0.7460 at the default \
             150/250 schedule against NONMEM SAEM 0.9213 — which NONMEM reached with \
-            TH_WT MU-referenced and NBURN=2000 NITER=1000, never by gradient (#SAEMPR). \
+            TH_WT MU-referenced and NBURN=2000 NITER=1000, never by gradient (#2612). \
             score_sa_reaches_the_allometric_exponent_on_a_longer_schedule covers \
             the same θ at 300/700, where it lands at 0.9845."]
 fn score_sa_also_recovers_the_allometric_exponent() {
@@ -772,7 +772,7 @@ fn each_mstep_option_changes_the_fit_through_the_public_api() {
         r.theta.clone()
     };
 
-    // The base is the derivative-free arm, named: `score_sa` is the default since #SAEMPR,
+    // The base is the derivative-free arm, named: `score_sa` is the default since #2612,
     // and `mstep_draws` acts on the derivative-free arm only.
     let bobyqa = || FitOptions {
         saem_mstep_solver: SaemMstepSolver::Bobyqa,

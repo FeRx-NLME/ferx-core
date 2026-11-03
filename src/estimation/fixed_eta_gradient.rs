@@ -767,7 +767,7 @@ pub(crate) fn obs_nll_subject_grad_fisher(
 
 /// [`obs_nll_subject_grad_fisher`] on the subject's cached event schedule, so a
 /// time-varying-covariate subject does not rebuild it for every prediction the score and
-/// information need (#SAEMPR). `None` builds it per prediction, as the plain form does.
+/// information need (#2612). `None` builds it per prediction, as the plain form does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_grad_fisher_with_schedule(
     model: &CompiledModel,

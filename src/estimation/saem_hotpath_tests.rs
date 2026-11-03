@@ -1039,9 +1039,9 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
     }
 }
 
-/// The score-SA M-step, the default since #SAEMPR, takes each subject's cached event
+/// The score-SA M-step, the default since #2612, takes each subject's cached event
 /// schedule (`obs_nll_subject_grad_fisher_with_schedule`): on a `TIME`-reading model it
-/// adds no schedule builds per iteration. Until #SAEMPR it rebuilt one per subject per
+/// adds no schedule builds per iteration. Until #2612 it rebuilt one per subject per
 /// iteration (measured 67 → 151 builds over 14 extra iterations on 6 subjects, exactly
 /// one per subject per iteration), which this test pinned as a known leak; deleting the
 /// schedule argument at the call site brings that drift back and reddens it.

@@ -324,7 +324,7 @@ fn release_fit_population(model: &CompiledModel) -> Population {
 }
 
 /// [`a_well_identified_sigma_is_released_in_a_production_fit`] under `score_sa`, the
-/// default M-step since #SAEMPR: σ takes trust-capped Newton steps (at most 0.5 in log σ),
+/// default M-step since #2612: σ takes trust-capped Newton steps (at most 0.5 in log σ),
 /// so the schedule is eight exploration M-steps and one convergence step. **Capped**, σ²
 /// keeps `0.8⁹ = 0.134` of its starting variance: σ ≥ √0.134 = 0.366 whatever the steps
 /// propose. **Released**, the Newton steps reach the maximiser near 0.1 within the eight.
@@ -382,7 +382,7 @@ fn a_well_identified_sigma_is_released_in_a_production_fit() {
     opts.run_covariance_step = false;
     // The closed forms below are the derivative-free arm's (its M-step assigns the
     // maximiser, so a released σ lands near it in one step). Under `score_sa`, the default
-    // since #SAEMPR, σ moves by trust-capped Newton steps instead, which this schedule is too
+    // since #2612, σ moves by trust-capped Newton steps instead, which this schedule is too
     // short to see; the release reaching that arm is `a_well_identified_sigma_is_released_under_score_sa`.
     opts.saem_mstep_solver = crate::types::SaemMstepSolver::Bobyqa;
     let sigma = crate::api::fit(&model, &pop, &model.default_params, &opts)

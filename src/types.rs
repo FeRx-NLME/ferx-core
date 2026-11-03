@@ -10135,10 +10135,10 @@ pub enum SaemMstepSolver {
     /// assigned (or Robbins-Monro blended when `mstep_damping` is set). Not SAEM's
     /// M-step: the average of per-draw maximisers converges to `E[θ*(η)]`, not to the
     /// maximiser of `E[Q(θ, η)]`, a Jensen-type bias that grows as the E-step mixes
-    /// better (#1458). The default until #SAEMPR, and still the fallback for a model outside
+    /// better (#1458). The default until #2612, and still the fallback for a model outside
     /// [`SaemMstepSolver::ScoreSa`]'s scope.
     Bobyqa,
-    /// **The default since #SAEMPR.** Stochastic approximation on the **score**, with one
+    /// **The default since #2612.** Stochastic approximation on the **score**, with one
     /// Levenberg–Marquardt-damped Newton step per M-step preconditioned by the SA-averaged
     /// expected information (Kuhn & Lavielle 2005; #1458): the faithful SAEM M-step for
     /// the parameters without a sufficient statistic (a θ with no ETA, a σ of a combined

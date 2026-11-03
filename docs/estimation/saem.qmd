@@ -103,9 +103,9 @@ because they measured best where it matters. On `pk2_big` (300 subjects, five η
 | + mode 1B | −3504.1 | 1.0 | −3502.6 | 39.7 G |
 | + modes 1 and 1B (default) | **−3505.7** | 1.2 | **−3504.3** | 42.3 G |
 
-The pre-#SAEMPR fit (random walk, `bobyqa`) averaged −3501.2 ± 3.3 at 47.8 G. On the
+The pre-#2612 fit (random walk, `bobyqa`) averaged −3501.2 ± 3.3 at 47.8 G. On the
 smaller benchmarks the modes are a tie on the objective and cost 7–9 % each:
-`pk1` (500 subjects, three η) runs at 0.97× the pre-#SAEMPR speed and warfarin (10
+`pk1` (500 subjects, three η) runs at 0.97× the pre-#2612 speed and warfarin (10
 subjects) at 0.78×. Set `isample_m1 = 0` and `isample_m1b = 0` for the random-walk E-step
 alone.
 
@@ -391,7 +391,7 @@ continue to use the general NLopt M-step.
 
 Every parameter with a sufficient statistic takes its closed-form update above: a
 mu-referenced θ, Ω, and a single additive or proportional σ. What is left — a θ with no
-ETA, a σ of a combined residual — has none, and since #SAEMPR it moves the way NONMEM moves
+ETA, a σ of a combined residual — has none, and since #2612 it moves the way NONMEM moves
 it (*Introduction to NONMEM 7.5*, §I.34): "expected values of gradients of the likelihood
 with respect to the thetas and sigmas … integrated over all possible values of the
 etas", then "a single iteration" maximisation step. In ferx that is `mstep_solver =
@@ -403,11 +403,11 @@ ferx takes them exactly, on the adjoint tape or, for the information's per-obser
 rows, by one forward pass over the free θ. A model whose every θ is mu-referenced or
 FIXed has no θ score to form, and none is formed.
 
-Measured against the pre-#SAEMPR default on importance-sampled −2 log L (`method = [saem,
+Measured against the pre-#2612 default on importance-sampled −2 log L (`method = [saem,
 imp]`, `imp_eval_only`), three seeds each, instructions on one core (see the PR for the
 whole table):
 
-| model | pre-#SAEMPR | `score_sa`, NONMEM kernels | speed |
+| model | pre-#2612 | `score_sa`, NONMEM kernels | speed |
 |---|---|---|---|
 | `emax_pkpd` | −36.00 ± 0.42 | −36.81 ± 0.05 | 1.71× |
 | `emax_timecourse` | 62.87 ± 0.12 | 62.89 ± 0.11 | 1.20× |
@@ -611,12 +611,12 @@ On the 100-subject subset the three arms are a tie (7531.37 ± 0.37 default agai
 #### Why `score_sa` is the default {#why-score_sa-is-the-default}
 
 It was a candidate in [#1449](https://github.com/FeRx-NLME/ferx-core/issues/1449), was
-held back by two findings, and became the default in #SAEMPR once both were resolved.
+held back by two findings, and became the default in #2612 once both were resolved.
 
 **For.** Over all eight #1449 SAEM benchmarks, 6 seeds each, it was tie-or-better than
 `bobyqa` on the importance-sampled −2 log L on every one — best on busulfan (−5.14),
 busulfan-`TVQ`-FIX (−5.58) and the thiotepa ODE bench (−11.07) — at 25–54 % less CPU.
-#SAEMPR's own measurement is in [The score M-step](#saem-mstep-score). And it is the SAEM
+#2612's own measurement is in [The score M-step](#saem-mstep-score). And it is the SAEM
 M-step NONMEM runs for these parameters; `bobyqa` is not.
 
 **The σ half, fixed in [#1480](https://github.com/FeRx-NLME/ferx-core/issues/1480).** As
