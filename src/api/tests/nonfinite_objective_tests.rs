@@ -516,7 +516,7 @@ fn vi_publishing_no_objective_is_exempt_but_vi_publishing_one_is_not() {
 /// **G11 — the exemption survives a trailing evaluation-only IMP stage.**
 /// (Review of #1303, finding 1 — a `converged: true` fit demoted to `false`.)
 ///
-/// `methods = vi, imp` with `imp_eval_only = true` is the **documented** way to
+/// `method = [vi, imp]` with `imp_eval_only = true` is the **documented** way to
 /// finish a VI fit: `ViFinalOfv`'s own doc points at it, because it consumes VI's
 /// parameters, EBEs and Hessians and reports a genuine importance-sampled
 /// −2 log L alongside the IS diagnostics.
@@ -3395,7 +3395,10 @@ fn the_label_is_read_from_the_subjects_when_they_are_the_objective() {
 /// `|clamped_total − ofv| / ofv` at the reread, printed under `--nocapture`. Four
 /// cells: FOCEI and FOCE, each at #2265's `1.44e20` and, under a prior on `TVCL`, at
 /// `DV = 12.25`, `1.5e14`, just past the cutoff. There one ulp is `0.03`, so the prior
-/// (`72.4` / `2.83`) shows in the sum, and the test asserts that it does. Measured on
+/// shows in the sum, and the test asserts that it does. `TVCL`'s upper bound (`1.2`) sits
+/// below the prior's mode (`1.5`), so the prior term cannot fall under its value at the
+/// bound whatever path the optimizer takes: with the #2549 warm-start predictor FOCEI
+/// reached the mode in three iterations and the prior read `5e-5`, under one ulp. Measured on
 /// macOS arm64, the gap is exactly `0` in all four. The 12.25 cells read "too large" on
 /// the total too, so they pin that the reread applies, not that it relabels.
 ///
@@ -3416,7 +3419,7 @@ fn a_fit_rereads_an_unclamped_subject_past_1e20_as_too_large() {
         parse_model_string(
             r#"
 [parameters]
-  theta TVCL(1.0, 0.1, 50.0)  prior(1.5, rse = 25%)
+  theta TVCL(1.0, 0.1, 1.2)  prior(1.5, rse = 25%)
   theta TVV(10.0, 1.0, 500.0)
   omega ETA_CL ~ 0.04
   sigma PROP ~ 0.04

@@ -479,72 +479,109 @@ pub fn solve_ekf(
         let t_start = break_times[k];
         let t_end = break_times[k + 1];
 
-        // Apply bolus doses at t_start (infusions enter via the wrapped RHS).
-        for (di, dose) in doses.iter().enumerate() {
-            if applied[di] {
-                continue;
-            }
-            if (dose.time - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL {
-                applied[di] = true;
-                // An `SS=1` record replaces the pair with the periodic trough (#1260); the
-                // record's own dose then lands on it below (bolus) or through
-                // `active_infusions` (infusion), exactly as on the ODE path.
-                if dose.ss && dose.ii > 0.0 {
-                    let (u_ss, p_ss) = equilibrate_ss_ekf(
-                        rhs,
-                        n,
-                        dose,
-                        dose_f_bio[di],
-                        pk_params_flat,
-                        diffusion_var,
-                        &opts,
-                    );
-                    u.copy_from_slice(&u_ss);
-                    p_mat = p_ss;
-                }
-                if !is_real_infusion(dose) {
-                    let cmt_idx = dose.cmt_idx();
-                    if cmt_idx < n {
-                        u[cmt_idx] += dose_f_bio[di] * dose.amt;
+        // Records read *at* t_start — the whole `EVENT_MATCH_TOL` band, through the same
+        // helper as the ODE engines (#1226). A dose matches a break symmetrically within
+        // `EVENT_MATCH_TOL`, so a record the reader moved one ULP below a co-timed dose
+        // (#614/#1810) can share the band with it. Such a record is read **before** the band's
+        // doses are applied, as `band_read_state` does on the ODE walks (#2124): every record
+        // earlier than the band's first dose takes the pre-event pair, every other one the
+        // post-event pair (#2510). At the subject's first instant the two always share a break,
+        // and before this the record read post-dose there (and, before an `SS=1` dose, the
+        // stationary covariance).
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        let first_event = doses
+            .iter()
+            .enumerate()
+            .filter(|&(di, d)| {
+                !applied[di] && (d.time - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL
+            })
+            .map(|(_, d)| d.time)
+            .fold(f64::INFINITY, f64::min);
+        // Set when an `SS=1` record at this break replaces the covariance (below).
+        let mut cov_replaced = false;
+        for pre_event in [true, false] {
+            if !pre_event {
+                // Apply bolus doses at t_start (infusions enter via the wrapped RHS).
+                for (di, dose) in doses.iter().enumerate() {
+                    if applied[di] {
+                        continue;
+                    }
+                    if (dose.time - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL {
+                        applied[di] = true;
+                        // An `SS=1` record replaces the pair with the periodic trough (#1260); the
+                        // record's own dose then lands on it below (bolus) or through
+                        // `active_infusions` (infusion), exactly as on the ODE path.
+                        if dose.ss && dose.ii > 0.0 {
+                            let (u_ss, p_ss) = equilibrate_ss_ekf(
+                                rhs,
+                                n,
+                                dose,
+                                dose_f_bio[di],
+                                pk_params_flat,
+                                diffusion_var,
+                                &opts,
+                            );
+                            u.copy_from_slice(&u_ss);
+                            p_mat = p_ss;
+                            cov_replaced = true;
+                        }
+                        if !is_real_infusion(dose) {
+                            let cmt_idx = dose.cmt_idx();
+                            if cmt_idx < n {
+                                u[cmt_idx] += dose_f_bio[di] * dose.amt;
+                            }
+                        }
                     }
                 }
             }
-        }
-
-        // Record obs read *at* t_start (after dose application) — the whole
-        // `EVENT_MATCH_TOL` band, through the same helper as the ODE engines (#1226).
-        obs_index.records_at_break(t_start, &mut boundary_obs);
-        for i in 0..boundary_obs.len() {
-            let obs_idx = boundary_obs[i];
-            let v = u[obs_cmt_idx];
-            let ipred = ekf_ipred(v);
-            if assimilated[obs_idx] {
-                // The **covariance** must be assimilated once; the **mean** is still the
-                // post-event one. An observation exactly on this break was saved by the
-                // segment that ended here, pre-dose — blocking it outright would keep that
-                // pre-dose `ipred` and reintroduce the very defect #1226 fixes (measured:
-                // 68.73 instead of 168.73). A bolus shifts the state deterministically and
-                // leaves `p_mat` untouched, so `p_obs` is the same either side of it and
-                // only the mean needs the later write.
-                results[obs_idx].ipred = ipred;
-                continue;
+            // An `SS=1` record replaces the covariance, discarding every update before it,
+            // so a post-event record that a segment ending here already assimilated against the
+            // carried covariance — an observation on the break, or the later half of a pair the
+            // reader split across the dose (#614) — is assimilated afresh against the steady
+            // state's, and the records after it condition on that update (#2510). A bolus leaves
+            // `p_mat` untouched, so without an SS record the single update stands.
+            if cov_replaced {
+                for &j in &boundary_obs {
+                    if obs_times[j] >= first_event {
+                        assimilated[j] = false;
+                    }
+                }
             }
-            let r = r_obs_vec.get(obs_idx).copied().unwrap_or(1.0);
-            let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
-            p_mat = p_new;
-            let point = EkfObsPoint { ipred, p_obs };
-            // Records sharing this exact time are one measurement instant: they take the
-            // same `ipred`/`p_obs` from this single update rather than each running their
-            // own. The in-segment read below collapses them the same way. They are
-            // *filled* rather than dropped: the band excludes them from the segment
-            // `saveat` too, so a dropped index would keep its
-            // `EkfObsPoint { ipred: 0.0, p_obs: 0.0 }` prefill and feed a finite,
-            // plausible zero into the likelihood.
-            let bits = obs_times[obs_idx].to_bits();
-            for &j in &boundary_obs {
-                if !assimilated[j] && obs_times[j].to_bits() == bits {
-                    results[j] = point.clone();
-                    assimilated[j] = true;
+            for i in 0..boundary_obs.len() {
+                let obs_idx = boundary_obs[i];
+                if (obs_times[obs_idx] < first_event) != pre_event {
+                    continue;
+                }
+                let v = u[obs_cmt_idx];
+                let ipred = ekf_ipred(v);
+                if assimilated[obs_idx] {
+                    // The **covariance** must be assimilated once; the **mean** is still the
+                    // post-event one. An observation exactly on this break was saved by the
+                    // segment that ended here, pre-dose — blocking it outright would keep that
+                    // pre-dose `ipred` and reintroduce the very defect #1226 fixes (measured:
+                    // 68.73 instead of 168.73). A bolus shifts the state deterministically and
+                    // leaves `p_mat` untouched, so `p_obs` is the same either side of it and
+                    // only the mean needs the later write.
+                    results[obs_idx].ipred = ipred;
+                    continue;
+                }
+                let r = r_obs_vec.get(obs_idx).copied().unwrap_or(1.0);
+                let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
+                p_mat = p_new;
+                let point = EkfObsPoint { ipred, p_obs };
+                // Records sharing this exact time are one measurement instant: they take the
+                // same `ipred`/`p_obs` from this single update rather than each running their
+                // own. The in-segment read below collapses them the same way. They are
+                // *filled* rather than dropped: the band excludes them from the segment
+                // `saveat` too, so a dropped index would keep its
+                // `EkfObsPoint { ipred: 0.0, p_obs: 0.0 }` prefill and feed a finite,
+                // plausible zero into the likelihood.
+                let bits = obs_times[obs_idx].to_bits();
+                for &j in &boundary_obs {
+                    if !assimilated[j] && obs_times[j].to_bits() == bits {
+                        results[j] = point.clone();
+                        assimilated[j] = true;
+                    }
                 }
             }
         }
@@ -2528,6 +2565,215 @@ mod tests {
         );
         assert_relative_eq!(split[1].p_obs, unsplit[1].p_obs, max_relative = 1e-12);
         assert_relative_eq!(split[2].p_obs, unsplit[2].p_obs, max_relative = 1e-12);
+    }
+
+    /// #2510: an observation the reader moved one ULP below a co-timed dose (`SS=1` or not)
+    /// reads the carried pre-dose mean *and covariance*. An SS record replaces the pair with
+    /// the periodic trough, so a walk that applied it before reading the `t⁻` record would hand
+    /// that record the stationary covariance. The reference is the same subject without the
+    /// dose (nothing acts before it), and the control is the record at `t + 4`, which must see
+    /// it.
+    ///
+    /// Measured before the fix: at `t = 0` the record read post-dose (`ipred` 100 for the
+    /// bolus, 221.64 for the SS dose, against 0), because a dose matches a break symmetrically
+    /// within `EVENT_MATCH_TOL` and the first break is the record's own. `t = 4` and `8.2`
+    /// already read pre-dose and are controls. Mutation: reading the band after the doses
+    /// (`pre_event` arm removed) fails the `t = 0` cases.
+    #[test]
+    fn ekf_observation_one_ulp_before_an_ss_dose_reads_the_carried_pair() {
+        let pk = make_pk(1.0, 20.0);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+        let run = |doses: &[DoseEvent], obs: &[f64]| {
+            solve_ekf(
+                &one_cpt_rhs,
+                1,
+                0,
+                &[0.1],
+                &pk,
+                &Default::default(),
+                &[],
+                doses,
+                obs,
+                &[0.01; 2],
+                opts,
+            )
+        };
+        // `0`: the first instant, where the record is the integration start, so the record and
+        // the dose share the first break. `4` and `8.2`: a later dose with residual drug, at two
+        // ULP sizes. The EKF breaks on doses and infusion ends, not on observations, so there
+        // the record is a save point of the segment ending at the dose's break.
+        for (t, ss) in [0.0f64, 4.0, 8.2]
+            .into_iter()
+            .flat_map(|t| [(t, true), (t, false)])
+        {
+            let history: Vec<DoseEvent> = if t > 0.0 {
+                vec![bolus_dose(100.0)]
+            } else {
+                vec![]
+            };
+            let mut doses = history.clone();
+            doses.push(DoseEvent::new(t, 100.0, 1, 0.0, ss, 12.0));
+            let obs = [t.next_down(), t + 4.0];
+            let with_ss = run(&doses, &obs);
+            let without = run(&history, &obs);
+            for p in &with_ss {
+                // `p_obs ≥ 0`, not `> 0`: before the first instant no diffusion has acted, so
+                // the carried covariance at `0⁻` is genuinely zero.
+                assert!(
+                    p.ipred.is_finite() && p.p_obs.is_finite() && p.p_obs >= 0.0,
+                    "t = {t}, ss = {ss}: {p:?}"
+                );
+            }
+            assert!(
+                (with_ss[0].ipred - without[0].ipred).abs() <= 1e-12 * without[0].ipred.max(1.0),
+                "t = {t}, ss = {ss}: ipred {} before the dose, want carried {}",
+                with_ss[0].ipred,
+                without[0].ipred
+            );
+            assert_relative_eq!(with_ss[0].p_obs, without[0].p_obs, max_relative = 1e-12);
+            // Control: the SS dose reaches the later record.
+            assert!(
+                with_ss[1].ipred > without[1].ipred + 50.0,
+                "t = {t}, ss = {ss}: the dose must reach t + 4: {} vs {}",
+                with_ss[1].ipred,
+                without[1].ipred
+            );
+        }
+    }
+
+    /// #2510 (review): a record read after an `SS=1` dose at its own break takes the steady
+    /// state's covariance. The segment ending at `t` saves the records there and marks them
+    /// assimilated against the carried covariance. The SS record then **replaces** `p_mat`
+    /// with the periodic one, so a post-dose record must be assimilated afresh against it, and
+    /// every later record conditions on that update. Before the fix only its mean was
+    /// rewritten, so its `p_obs` and the covariance the next record saw were pre-dose. This
+    /// held for a plain dose-then-observation tie (`unsplit`) before #2510. It also holds for
+    /// an `obs / SS dose / obs` tie the reader now splits into `[t⁻, t]` (`split`). A bolus does
+    /// not touch `p_mat`, which is why the non-SS pair keeps its single update
+    /// (`ekf_reader_split_tie_across_a_dose_is_one_update`).
+    ///
+    /// The control is the same SS dose as the subject's **first** event. The SS record resets
+    /// the system, so the history before it cannot reach a later read. With no segment ending
+    /// at `t`, the boundary read is the record's only read. Bolus and a 2-h infusion, at `4`
+    /// and `8.2`, over two histories:
+    ///
+    /// * a bolus at `0`, where the SS dose's own time is the break that applies it;
+    /// * an infusion ending exactly at `t⁻`. That puts a break one ULP below the SS dose,
+    ///   which matches it within `EVENT_MATCH_TOL`, so the dose is applied at a break that is
+    ///   not its own time. A reset flag keyed on `dose.time == t_start` fails this history only.
+    ///
+    /// Each also has a duplicate post-dose record (`[t⁻, t, t, t + 4]`). Both copies are one
+    /// instant and must share the steady state's single update, so a clear that stopped at
+    /// the first matching record leaves the second stale.
+    ///
+    /// Measured before the fix: post-dose `p_obs` 0.3366 against the steady state's 1.0000.
+    /// Mutation: dropping the re-assimilation fails the first case.
+    #[test]
+    fn ekf_split_tie_across_an_ss_dose_conditions_on_the_steady_state() {
+        let pk = make_pk(1.0, 20.0);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+        let run = |doses: &[DoseEvent], obs: &[f64]| {
+            solve_ekf(
+                &one_cpt_rhs,
+                1,
+                0,
+                &[0.1],
+                &pk,
+                &Default::default(),
+                &[],
+                doses,
+                obs,
+                &vec![0.01; obs.len()],
+                opts,
+            )
+        };
+        for t in [4.0f64, 8.2] {
+            // Rate 1, so the duration is the amount exactly and the end lands on `t⁻`.
+            let ends_at_t_minus = DoseEvent::new(0.0, t.next_down(), 1, 1.0, false, 0.0);
+            assert_eq!(
+                ends_at_t_minus.time + ends_at_t_minus.duration,
+                t.next_down(),
+                "the infusion must end exactly one ULP below the SS dose"
+            );
+            for (history, prior) in [("bolus", bolus_dose(100.0)), ("infusion", ends_at_t_minus)] {
+                for rate in [0.0, 50.0] {
+                    let case = format!("t = {t}, {history} history, SS rate = {rate}");
+                    let doses = [prior.clone(), DoseEvent::new(t, 100.0, 1, rate, true, 12.0)];
+                    let split = run(&doses, &[t.next_down(), t, t + 4.0]);
+                    let unsplit = run(&doses, &[t, t + 4.0]);
+                    let dup = run(&doses, &[t.next_down(), t, t, t + 4.0]);
+                    // The SS record resets the system, so the history before it cannot reach
+                    // a later read, and a subject whose first event is the SS dose has no
+                    // segment ending at `t` to read the record early: the boundary read is its
+                    // only one. One control per observation vector.
+                    //
+                    // Open (#2567 review): under an SS **infusion**, the covariance at `t + 4`
+                    // depends on whether the dose is applied at a break on its own time or at
+                    // one a ULP below it (`t = 4`, measured 0.34315 against 0.34245, ~0.2%).
+                    // Which one a subject gets is decided by the other breaks (the history, or
+                    // an observation at `t⁻` being the integration start), not by this fix. So
+                    // for an SS infusion only the post-dose rows are compared; for an SS bolus
+                    // every row is.
+                    let ctl = |obs: &[f64]| run(&doses[1..], obs);
+                    let (c_split, c_unsplit, c_dup) = (
+                        ctl(&[t.next_down(), t, t + 4.0]),
+                        ctl(&[t, t + 4.0]),
+                        ctl(&[t.next_down(), t, t, t + 4.0]),
+                    );
+                    for (i, p) in split.iter().chain(&dup).enumerate() {
+                        assert!(
+                            p.ipred.is_finite() && p.p_obs.is_finite() && p.p_obs > 0.0,
+                            "{case}, idx {i}: {p:?}"
+                        );
+                    }
+                    let mut rows = vec![
+                        ("split post-dose", &split[1], &c_split[1]),
+                        ("unsplit post-dose", &unsplit[0], &c_unsplit[0]),
+                        ("duplicate 1st post-dose", &dup[1], &c_dup[1]),
+                        ("duplicate 2nd post-dose", &dup[2], &c_dup[2]),
+                    ];
+                    if rate == 0.0 {
+                        rows.extend([
+                            ("split later", &split[2], &c_split[2]),
+                            ("unsplit later", &unsplit[1], &c_unsplit[1]),
+                            ("duplicate later", &dup[3], &c_dup[3]),
+                        ]);
+                    }
+                    for (name, s, c) in rows {
+                        assert!(
+                            (s.ipred - c.ipred).abs() <= 1e-12 * c.ipred,
+                            "{case}: {name} ipred {} vs control {}",
+                            s.ipred,
+                            c.ipred
+                        );
+                        assert!(
+                            (s.p_obs - c.p_obs).abs() <= 1e-12 * c.p_obs,
+                            "{case}: {name} p_obs {} vs first-event SS control {}",
+                            s.p_obs,
+                            c.p_obs
+                        );
+                    }
+                    // The two copies share one update, bit for bit.
+                    assert_eq!(dup[1].p_obs.to_bits(), dup[2].p_obs.to_bits(), "{case}");
+                    // Non-vacuity: the pre-dose record's covariance is not the steady state's,
+                    // so a post-dose record keeping it would fail above.
+                    assert!(
+                        (split[0].p_obs - c_split[1].p_obs).abs() > 1e-6 * c_split[1].p_obs,
+                        "{case}: pre {} and SS {} covariances coincide",
+                        split[0].p_obs,
+                        c_split[1].p_obs
+                    );
+                }
+            }
+        }
     }
 
     /// **The EKF covariance on a time-varying rate, against a quadrature oracle.**

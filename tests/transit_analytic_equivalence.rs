@@ -449,9 +449,11 @@ fn transit_flip_flop_fit_matches_ode_twin() {
     // Nelder–Mead there) on macOS arm64, so the start is never a candidate and the run walks
     // off it, to the TVNTR floor at −59.31; at #2460's head on Linux aarch64 it reported
     // `converged` at −215.687. On Linux x86_64 at b68c6731 the start is accepted and the
-    // fit stays at −228.7949 (`W_STALLED_AT_INIT`). Whatever it reaches, a converged
-    // verdict may not sit above its own start by more than the plateau bound, and a run
-    // that does carries `W_ABOVE_START`.
+    // fit stays at −228.7949 (`W_STALLED_AT_INIT`); at dad870c0 it reached the floor too,
+    // and the floor escape's restart reported `converged` at −191.927 — above the fit's
+    // start but below the restart's own, which is what the per-run check compared it to.
+    // Whatever it reaches, a converged verdict may not sit above the fit's start by more
+    // than the plateau bound, and a run that does carries `W_ABOVE_START`.
     let from_opt = fit(&hd, &pop, &at, &opts).expect("ODE fit from the optimum ok");
     let bound = e.ofv + 1e-3 * (1.0 + e.ofv.abs());
     let above = from_opt

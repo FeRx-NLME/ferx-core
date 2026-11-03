@@ -1,8 +1,8 @@
 //! Profiled θ level blocks (#1065).
 //!
 //! **The rule.** A `profile`d block's levels are, at every outer evaluation, the exact
-//! minimiser over the block of the same FOCE/FOCEI objective the unprofiled model would
-//! minimise. The minimiser is found by Newton on the **total** gradient — the EBEs
+//! minimiser over the block of the same objective (FOCE, FOCEI or Laplace) the unprofiled
+//! model would minimise. The minimiser is found by Newton on the **total** gradient — the EBEs
 //! re-solved at every point, so `dη̂/dβ` is in it — and never by a frozen-EBE shortcut:
 //! "solve the levels at the current η̂, re-solve η̂, repeat" converges to a point 0.05 OFV
 //! per study above the minimum once the prediction is nonlinear in η (the M3 probe on
@@ -23,7 +23,11 @@
 //!   exact one wherever the production outer gradient is analytic (#2109), otherwise a
 //!   central difference with the EBE re-solved at each point. On a model linear in (η, κ)
 //!   the Newton step is the exact GLS solution and the solve takes one step; otherwise a
-//!   few.
+//!   few. A block read through one logit link around that affine read,
+//!   `y = inv_logit(c × block + rest)` (#2111), makes the problem a GLM, where the GLS
+//!   matrix is only quasi-Newton: there the matrix is the adjoint's exact Hessian of the
+//!   fit's own term ([`ProfileCtx::exact_hessian`]), and the second differences of the
+//!   re-solved term where the adjoint declines ([`ProfileCtx::resolved_hessian`]).
 //! - [`optimize_profiled`]: the outer loop over the structural parameters only. Its
 //!   gradient is the production outer gradient at `β̂`, with the levels held the way
 //!   `FIX` holds a θ: by the envelope theorem `dO_p/dθ = ∂O/∂θ |_{β = β̂}`, because
@@ -96,6 +100,19 @@ pub(crate) const PROFILE_INNER_TOL: f64 = crate::estimation::inner_optimizer::ST
 
 /// The central-difference step of the total gradient, in conditional standard errors.
 const FD_STEP_SE: f64 = 1e-2;
+
+/// [`FD_STEP_SE`] on a block read through a logit link (#2111). The link's curvature puts
+/// the truncation error of a `1e-2` step at 3.4e-6 SE on a fixture whose probabilities run
+/// 0.1–0.9, a third of [`PROFILE_TOL`]; at `1e-3` it is 3.4e-8, the re-solve noise
+/// included (2.8e-6 / 2.8e-8 on B2, 0.2–0.8). macOS arm64; Linux agrees.
+const LINKED_FD_STEP_SE: f64 = 1e-3;
+
+/// The step of a linked block's differenced Newton matrix
+/// ([`ProfileCtx::resolved_hessian`]), in conditional standard errors. At `1e-2` it is
+/// within 1e-5 of the exact matrix, in units of the levels' own curvature, on B2, and 4e-5 on a
+/// subject reading a dependent level through a slack; below it the re-solves' noise over
+/// `h²` takes over (4e-4 at `3e-3`). A Newton matrix needs none of those digits.
+const LINKED_HESSIAN_STEP_SE: f64 = 1e-2;
 
 /// The FD step of the covariance step's `D` and `B` off the exact route (#2109), in
 /// conditional standard errors for a level and the global `fd_hessian_step · (1 + |x|)` for
@@ -223,6 +240,9 @@ pub(crate) struct ProfileGroup {
     pub(crate) borders: Vec<usize>,
     /// Per entry of `coords`, the index into `borders` of the dependent that sums it.
     border_of: Vec<Option<usize>>,
+    /// Some coordinate's block is read through a logit link (the parser's `linked`,
+    /// #2111): the Newton matrix is the adjoint's exact one ([`ProfileCtx::exact_hessian`]).
+    pub(crate) linked: bool,
 }
 
 impl ProfileGroup {
@@ -349,6 +369,49 @@ fn bordered_step(
         .map(|a| -(sol[(a, 0)] + (0..nb).map(|j| sol[(a, 1 + j)] * lambda[j]).sum::<f64>()))
         .collect();
     step.iter().all(|v| v.is_finite()).then_some(step)
+}
+
+/// `m`, the Newton matrix over a linked group's levels, made positive definite over its θ
+/// (`TᵀMT`, positive diagonal) by Levenberg–Marquardt damping, with whether it had to be
+/// (#2111). Through a logit link the exact and differenced matrices are the true Hessian,
+/// and that is indefinite away from the optimum: with Gaussian error each row contributes
+/// `σ′² − (y − σ)σ″`, negative where the prediction sits far from its observation. Without
+/// damping, 39 of 54 structural points of a scan over B2 (TVL × EMAX × ω) failed the solve
+/// with `Singular`, and a B2 fit met 7 such matrices in 813. `M + λ·diag(|M_ll|)`, `λ` from
+/// `1e-4` up by tens: still a descent direction for the line search, and `λ = 0` near the
+/// optimum, where the matrix is positive definite, so the convergence stays quadratic.
+/// `None` when no `λ ≤ 1e8` does, or `m` is not finite.
+fn damped_to_pd(g: &ProfileGroup, m: DMatrix<f64>) -> Option<(DMatrix<f64>, bool)> {
+    let pd = |m: &DMatrix<f64>| {
+        g.theta_diagonal(m)
+            .iter()
+            .all(|d| d.is_finite() && *d > 0.0)
+            && g.theta_matrix(m).cholesky().is_some()
+    };
+    if pd(&m) {
+        return Some((m, false));
+    }
+    if !m.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let n = m.nrows();
+    // A level with no curvature of its own still gets a share of the largest one.
+    let largest = (0..n).map(|l| m[(l, l)].abs()).fold(0.0_f64, f64::max);
+    let scale: Vec<f64> = (0..n)
+        .map(|l| m[(l, l)].abs().max(1e-8 * largest))
+        .collect();
+    let mut lambda = 1e-4;
+    while lambda <= 1e8 {
+        let mut d = m.clone();
+        for (l, s) in scale.iter().enumerate() {
+            d[(l, l)] += lambda * s;
+        }
+        if pd(&d) {
+            return Some((d, true));
+        }
+        lambda *= 10.0;
+    }
+    None
 }
 
 /// The Newton step over a group's θ with the θ in `held` left where they are: the
@@ -620,6 +683,17 @@ impl ProfileLayout {
             })
             .collect();
 
+        // The θ of every block read through a logit link (#2111).
+        let linked_theta: std::collections::HashSet<usize> = blocks
+            .decls
+            .iter()
+            .filter(|d| d.linked)
+            .flat_map(|d| d.spec.levels.iter())
+            .flat_map(|r| match *r {
+                LevelRule::Free(k) => k as usize..k as usize + 1,
+                LevelRule::NegSum(a, b) => a as usize..b as usize,
+            })
+            .collect();
         // Union-find over positions: a subject couples every coordinate it reads, a
         // dependent's reader every θ of its group.
         let mut parent: Vec<usize> = (0..coords.len()).collect();
@@ -635,12 +709,14 @@ impl ProfileLayout {
                     subjects: Vec::new(),
                     borders: Vec::new(),
                     border_of: Vec::new(),
+                    linked: false,
                 });
                 groups.len() - 1
             });
             *slot = (g, groups[g].coords.len());
             groups[g].coords.push(p);
             groups[g].border_of.push(None);
+            groups[g].linked |= linked_theta.contains(&coords[p]);
         }
         for (i, set) in active.iter().enumerate() {
             if let Some(&p) = set.first() {
@@ -910,9 +986,12 @@ struct SubjectState {
     /// are carried separately.
     unconverged: bool,
     fallback: bool,
+    /// The re-solve's Nelder–Mead stop was moved to its mode by the certificate
+    /// (`EbeResult::nm_polished`, #2571); `false` for a mode from the population inner loop.
+    nm_polished: bool,
     /// The mode may not be one: its solve, from the population inner loop or a re-solve,
-    /// did not converge or fell back to Nelder–Mead ([`off_mode`]). Its level gradient
-    /// then takes the re-solved differences, never the adjoint's identity at a non-mode.
+    /// did not converge ([`off_mode`]). Its level gradient then takes the re-solved
+    /// differences, never the adjoint's identity at a non-mode.
     off_mode: bool,
     /// Off its mode on a subject below `min_obs_for_convergence_check`
     /// ([`excused_off_mode`]): the re-solved differences still serve it, but it is not
@@ -924,8 +1003,20 @@ struct SubjectState {
 /// does not hold there (#2401 review row 2). Measured on `nested_levels_3` at
 /// `inner_maxiter = 3`: the adjoint level gradient at such a state was 4.6 conditional SEs
 /// from the converged one, the re-solved differences from the same state 2.4e-5.
+///
+/// A Nelder–Mead fallback is off its mode only when it is uncertified. `converged` on a
+/// fallback means `FallbackCertifier` passed it on stationarity (#1527): its gradient arm
+/// is the BFGS stop's `‖g‖ < tol`, its polish the same stall stop a BFGS solve takes, and
+/// its resolution arm, `½gᵀH⁻¹g ≤ INNER_FTOL_REL·(1 + |f|)` (`1e-11`), lets the gradient sit
+/// above `tol`. The identity's error there is `gᵀH⁻¹b`, which Cauchy–Schwarz with a positive
+/// definite `H` bounds by `√(2e-11·(1 + |f|))` level SEs: ~1e-5 SE at F2's per-subject `|f|`,
+/// ~5e-4 SE at `|f| ≈ 1.3e4`. Immaterial against the 4.6 SE of a solve that stopped short,
+/// so a certified fallback keeps the adjoint (#2539). Declining those sent subjects to FD at
+/// every outer optimum: a warm start
+/// already at its mode leaves BFGS no step to take, so it hands off to a fallback that
+/// certifies in place (F2 at NONMEM's optimum: 4 of 12 subjects on Linux, 2 on macOS).
 fn off_mode(ebe: &crate::estimation::inner_optimizer::EbeResult) -> bool {
-    !ebe.converged || ebe.used_fallback
+    !ebe.converged
 }
 
 /// Whether `subject` has fewer observations than `min_obs_for_convergence_check`, the
@@ -937,9 +1028,9 @@ fn below_min_obs(subject: &crate::types::Subject, min_obs: u32) -> bool {
 /// Whether an off-mode solve is excused from the FD-fallback warnings (#2408): its subject
 /// has fewer observations than `min_obs_for_convergence_check`, the subjects the fit's
 /// unconverged-EBE count already excuses. Such a subject keeps the re-solved level
-/// gradient, the correct one at a non-mode, but is not named. A Nelder–Mead fallback is
-/// excused too: outside ODE+IOV a BFGS that stops short always falls back, so excusing
-/// only the bare stop would leave the excuse unreachable on every other model.
+/// gradient, the correct one at a non-mode, but is not named. An uncertified Nelder–Mead
+/// fallback is such a solve too (its `converged` is false): outside ODE+IOV a BFGS that
+/// stops short always falls back, so the excuse reaches every model.
 fn excused_off_mode(
     ebe: &crate::estimation::inner_optimizer::EbeResult,
     subject: &crate::types::Subject,
@@ -983,15 +1074,7 @@ impl ProfileCtx<'_> {
             0,
             self.options,
         );
-        let nll = subject_nll(
-            self.model,
-            subject,
-            params,
-            &ebe.eta,
-            &ebe.h_matrix,
-            &ebe.kappas,
-            self.options.interaction,
-        );
+        let nll = self.fit_term(i, params, &ebe.eta, &ebe.h_matrix, &ebe.kappas);
         let min_obs = self.options.min_obs_for_convergence_check;
         SubjectState {
             off_mode: off_mode(&ebe),
@@ -1002,11 +1085,50 @@ impl ProfileCtx<'_> {
             kappas: ebe.kappas,
             nll,
             fallback: ebe.used_fallback,
+            nm_polished: ebe.nm_polished,
         }
     }
 
-    /// Subject `i`'s objective term at `params` with its EBE, H and κ̂ held at `s`, under
-    /// `interaction` (the fit's own for the objective; `false` for the Newton matrix).
+    /// Subject `i`'s term of **the fit's own objective** at `params`, at the mode
+    /// `(η̂, κ̂)` with `h` its `H`: the FOCE / FOCEI term ([`subject_nll`] under the fit's
+    /// `interaction`) when the stage has no quadrature, and the quadrature term
+    /// (`agq::agq_subject_term`, under the stage's own anchor) when it does, so the solve
+    /// minimises the objective the fit reports (#2107). The Newton matrix does not read it
+    /// ([`Self::held_hessian`]).
+    fn fit_term(
+        &self,
+        i: usize,
+        params: &ModelParameters,
+        eta: &DVector<f64>,
+        h: &DMatrix<f64>,
+        kappas: &[DVector<f64>],
+    ) -> f64 {
+        let subject = &self.population.subjects[i];
+        if let Some(n_agq) = self.options.agq_nodes() {
+            return crate::estimation::agq::agq_subject_term(
+                self.model,
+                subject,
+                params,
+                eta.as_slice(),
+                kappas,
+                n_agq,
+                self.options.hessian_anchor(),
+            );
+        }
+        subject_nll(
+            self.model,
+            subject,
+            params,
+            eta,
+            h,
+            kappas,
+            self.options.interaction,
+        )
+    }
+
+    /// Subject `i`'s FOCE (`interaction = false`) or FOCEI term at `params` with its EBE,
+    /// H and κ̂ held at `s`: the Newton matrix's term ([`Self::held_hessian`]), never the
+    /// objective's, which is [`Self::fit_term`].
     fn held(&self, i: usize, params: &ModelParameters, s: &SubjectState, interaction: bool) -> f64 {
         subject_nll(
             self.model,
@@ -1025,12 +1147,21 @@ impl ProfileCtx<'_> {
     /// marginal `(y − f(η̂) + Hη̂)ᵀ C̃⁻¹ (·) + log|C̃|`, `C̃ = HΩHᵀ + R`, so it is quadratic
     /// in the levels and a forward second difference is exact up to rounding at any step
     /// (`1 + 2k + k(k−1)/2` evaluations, where a central stencil takes `2k²`); `steps`
-    /// sets it per level.
+    /// sets it per level. That needs the affine route: through a logit link (#2111) it is
+    /// neither quadratic nor a good Newton matrix, and the solve uses
+    /// [`Self::exact_hessian`] or [`Self::resolved_hessian`] there.
     ///
     /// Not the fit's own term under FOCEI: that one is the conditional (Laplace) form, whose
     /// held-η̂ Hessian is `XᵀR⁻¹X` — the curvature with the random effects *not* free to
     /// absorb a level shift, larger than the total one. Measured on F1 (#1065): Newton on
     /// it converges linearly, ~1/30 per step, where `XᵀC̃⁻¹X` lands in one.
+    ///
+    /// Kept under `laplace` too (#2107): on a model linear in (η, κ) with additive error
+    /// the exact `∂²l/∂η²` is FOCEI's `H̃` and reads no level, so `½log|H|` is constant in
+    /// the levels and Newton still lands in one step (F1: one step, levels = FOCEI's to
+    /// 8.9e-16). Nonlinear in η it is a quasi-Newton matrix, as under FOCEI, contracting at
+    /// the same rate (F2: 33 steps against FOCEI's 32); the exact β-Hessian saved one
+    /// iteration there and cost a nested-dual recording per subject per step.
     fn held_hessian(
         &self,
         i: usize,
@@ -1057,12 +1188,111 @@ impl ProfileCtx<'_> {
         m
     }
 
-    /// The objective the adjoint differentiates: the fit's own. Under the profile's
-    /// additive-error scope the residual variance reads no η, so FOCE and FOCEI are one
-    /// objective here (a `foce` arm of G2 on F2 measured the same gaps to every printed
-    /// digit); the choice is kept for when that scope widens.
+    /// The exact Newton matrix of subject `i` over its levels on a block read through a
+    /// logit link (#2111): the adjoint's second derivative of the fit's own term
+    /// ([`Self::objective`]) over the θ the levels' `moves` touch, at the mode `s`, read
+    /// along the moves (`Mᵀ h M`). It is the total Hessian, `dη̂/dβ` in it, which is what
+    /// Newton on the total gradient needs: the GLS matrix of [`Self::held_hessian`] is
+    /// exact only while the prediction is affine in the levels. Measured on the bounded
+    /// `inv_logit` fixture (10 studies): 3 iterations, quadratic, against the held matrix's
+    /// 7–9 (by its first step), linear at ~0.1 per step, to the same OFV.
+    ///
+    /// `None` where the subject declines, as [`Self::total_gradient_adjoint`] does: a level
+    /// that log-packs, a mode the identity cannot be formed at, or a recorder decline. The
+    /// solve then takes [`Self::resolved_hessian`], not the held matrix: on a fixture with
+    /// probabilities 0.1–0.9 the held matrix contracted at 0.96 per step on one study and
+    /// did not converge in [`MAX_PROFILE_ITER`] steps, where the exact one took 4.
+    fn exact_hessian(
+        &self,
+        i: usize,
+        pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
+        s: &SubjectState,
+    ) -> Option<DMatrix<f64>> {
+        use crate::sens::ode_provider::adjoint::subject_adjoint_cov_block_at;
+        if self.reads_a_log_packed_level(i, pt.template) {
+            return None;
+        }
+        let subject = &self.population.subjects[i];
+        let mode = crate::estimation::covariance::stacked_mode(
+            self.model,
+            subject,
+            &s.eta,
+            Some(&s.kappas),
+        )?;
+        let reads = &self.layout.reads[i];
+        let mut touched: Vec<usize> = reads
+            .iter()
+            .flat_map(|r| r.moves.iter().map(|&(k, _)| k))
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
+        let h = subject_adjoint_cov_block_at(
+            self.model,
+            subject,
+            pt,
+            &mode,
+            self.objective(),
+            &touched,
+        )?;
+        // Every θ the moves touch packs as itself (checked above), so `∂²/∂x²` is `∂²/∂θ²`.
+        let m = DMatrix::from_fn(touched.len(), reads.len(), |t, a| {
+            reads[a]
+                .moves
+                .iter()
+                .filter(|&&(k, _)| k == touched[t])
+                .map(|&(_, c)| c)
+                .sum::<f64>()
+        });
+        let d = m.transpose() * h * &m;
+        d.iter().all(|v| v.is_finite()).then_some(d)
+    }
+
+    /// Subject `i`'s Newton matrix over its levels as central second differences of its
+    /// re-solved term ([`Self::resolve`], warm from the mode `s`), the EBE re-found at every
+    /// point, so `dη̂/dβ` is in it: the matrix [`Self::exact_hessian`] computes, where the
+    /// adjoint declines (#2111). `2k²` re-solves; `steps` sets the step per level.
+    fn resolved_hessian(
+        &self,
+        i: usize,
+        params: &ModelParameters,
+        s: &SubjectState,
+        steps: &[f64],
+    ) -> DMatrix<f64> {
+        let reads = &self.layout.reads[i];
+        let k = reads.len();
+        let warm = s.warm();
+        let at =
+            |moves: &[(usize, f64)]| self.resolve(i, &shifted(params, reads, moves), &warm).nll;
+        let mut m = DMatrix::zeros(k, k);
+        for a in 0..k {
+            let h = steps[a];
+            m[(a, a)] = (at(&[(a, h)]) - 2.0 * s.nll + at(&[(a, -h)])) / (h * h);
+            for b in 0..a {
+                let g = steps[b];
+                let v = (at(&[(a, h), (b, g)]) - at(&[(a, h), (b, -g)]) - at(&[(a, -h), (b, g)])
+                    + at(&[(a, -h), (b, -g)]))
+                    / (4.0 * h * g);
+                m[(a, b)] = v;
+                m[(b, a)] = v;
+            }
+        }
+        m
+    }
+
+    /// The objective the adjoint differentiates: the fit's own, the one [`Self::fit_term`]
+    /// scores. Under the profile's additive-error scope the residual variance reads no η,
+    /// so FOCE and FOCEI are one objective here (a `foce` arm of G2 on F2 measured the
+    /// same gaps to every printed digit); the choice is kept for when that scope widens.
+    /// Under quadrature it is the quadrature marginal at the stage's anchor (#2107), which
+    /// is a different function: `Focei` there is the gradient of FOCEI's objective.
     fn objective(&self) -> crate::sens::ode_provider::adjoint::Objective {
         use crate::sens::ode_provider::adjoint::Objective;
+        if let Some(n_agq) = self.options.agq_nodes() {
+            return Objective::Agq {
+                n_agq,
+                exact: self.options.hessian_anchor() == crate::types::HessianAnchor::Exact,
+            };
+        }
         if self.options.interaction {
             Objective::Focei
         } else {
@@ -1185,6 +1415,7 @@ impl ProfileCtx<'_> {
             self.options.inner_restarts,
             InnerSolvePolicy {
                 seed: InnerHessianSeed::for_options(self.options),
+                unseeded_iov_warm: true,
                 ..InnerSolvePolicy::for_stage(self.options, self.model)
             },
             None,
@@ -1205,10 +1436,11 @@ impl ProfileCtx<'_> {
                     nll: 0.0,
                     unconverged: false,
                     fallback: false,
+                    nm_polished: false,
                     off_mode: start_off_mode.get(i).is_some_and(|m| m.0),
                     excused: start_off_mode.get(i).is_some_and(|m| m.1),
                 };
-                s.nll = self.held(i, &p, &s, self.options.interaction);
+                s.nll = self.fit_term(i, &p, &s.eta, &s.h, &s.kappas);
                 s
             })
             .collect();
@@ -1222,6 +1454,8 @@ impl ProfileCtx<'_> {
             adjoint: profile_gradient_is_analytic(self.model, self.options),
             #[cfg(test)]
             force_decline: FORCE_PROFILE_GRADIENT_DECLINE.with(std::cell::Cell::get),
+            #[cfg(test)]
+            force_matrix_decline: FORCE_PROFILE_MATRIX_DECLINE.with(std::cell::Cell::get),
             #[cfg(test)]
             fail_after: FORCE_PROFILE_GROUP_FAILURE.with(std::cell::Cell::get),
         };
@@ -1268,6 +1502,8 @@ impl ProfileCtx<'_> {
                 .n_unconverged
                 .max(states.iter().filter(|s| s.unconverged).count()),
             n_fallback: start_stats.n_fallback + states.iter().filter(|s| s.fallback).count(),
+            n_nm_polished: start_stats.n_nm_polished
+                + states.iter().filter(|s| s.nm_polished).count(),
             n_start_rejected: start_stats.n_start_rejected,
         };
         let (mut etas, mut h_matrices, mut kappas) = (Vec::new(), Vec::new(), Vec::new());
@@ -1336,21 +1572,10 @@ impl ProfileCtx<'_> {
         let blocks = coupled_blocks(n, &subj_loc);
         let mut iterations = 0;
         // The step of the Newton matrix's difference: one SE once a pass has measured
-        // it, a unit step before. The term is quadratic, so either is exact up to
+        // it, a unit step before. The held term is quadratic, so either is exact up to
         // rounding; the SE step only keeps the differences on the objective's own scale.
         let mut m_steps = vec![1.0; n];
-        loop {
-            // The Newton matrix first: its diagonal sizes the gradient's steps.
-            let parts: Vec<DMatrix<f64>> = g
-                .subjects
-                .par_iter()
-                .zip(states.par_iter())
-                .zip(subj_loc.par_iter())
-                .map(|((&i, s), loc)| {
-                    let st: Vec<f64> = loc.iter().map(|&l| m_steps[l]).collect();
-                    self.held_hessian(i, &p, s, &st)
-                })
-                .collect();
+        let assemble = |parts: &[DMatrix<f64>]| {
             let mut m = DMatrix::zeros(n, n);
             for (part, loc) in parts.iter().zip(&subj_loc) {
                 for (a, &la) in loc.iter().enumerate() {
@@ -1359,15 +1584,10 @@ impl ProfileCtx<'_> {
                     }
                 }
             }
-            let se: Vec<f64> = g
-                .theta_diagonal(&m)
-                .into_iter()
-                .map(|d| (d.is_finite() && d > 0.0).then(|| 1.0 / d.sqrt()))
-                .collect::<Option<_>>()
-                .ok_or(ProfileFailure::Singular)?;
-            // A level's own scale. Without borders it is `se`; a θ no subject reads
-            // directly has no curvature of its own and is never stepped.
-            let level_se: Vec<f64> = (0..n)
+            m
+        };
+        let diag_se = |m: &DMatrix<f64>| -> Vec<f64> {
+            (0..n)
                 .map(|l| {
                     let d = m[(l, l)];
                     if d.is_finite() && d > 0.0 {
@@ -1376,14 +1596,110 @@ impl ProfileCtx<'_> {
                         1.0
                     }
                 })
-                .collect();
-            m_steps.clone_from(&level_se);
-            let steps: Vec<f64> = level_se.iter().map(|s| FD_STEP_SE * s).collect();
+                .collect()
+        };
+        loop {
             // On the adjoint route, one packed point for the group: every subject is at `p`.
             let x = route.adjoint.then(|| pack_params(&p));
             let pt = x
                 .as_deref()
                 .and_then(|x| crate::sens::ode_provider::adjoint::PackedPoint::new(&p, x));
+            // The Newton matrix first: its diagonal sizes the gradient's steps. On a linked
+            // group (#2111), each subject's exact matrix where the adjoint serves it, at a
+            // mode only, as the level gradient below; otherwise the second differences of
+            // its re-solved term ([`Self::resolved_hessian`]), never the held matrix, which
+            // through a link can contract at 0.96 per step.
+            let exact: Vec<Option<DMatrix<f64>>> = g
+                .subjects
+                .par_iter()
+                .zip(states.par_iter())
+                .map(|(&i, s)| {
+                    let pt = pt
+                        .as_ref()
+                        .filter(|_| g.linked && !s.off_mode && !route.declines_matrix(i))?;
+                    self.exact_hessian(i, pt, s)
+                })
+                .collect();
+            let held_parts = |m_steps: &[f64]| -> Vec<DMatrix<f64>> {
+                g.subjects
+                    .par_iter()
+                    .zip(states.par_iter())
+                    .zip(subj_loc.par_iter())
+                    .zip(exact.par_iter())
+                    .map(|(((&i, s), loc), e)| match e {
+                        Some(e) => e.clone(),
+                        None => {
+                            let st: Vec<f64> = loc.iter().map(|&l| m_steps[l]).collect();
+                            self.held_hessian(i, &p, s, &st)
+                        }
+                    })
+                    .collect()
+            };
+            let n_exact = exact.iter().filter(|e| e.is_some()).count();
+            let m = if !g.linked {
+                assemble(&held_parts(&m_steps))
+            } else if n_exact == exact.len() {
+                counts.exact_matrices += n_exact;
+                assemble(&exact.iter().flatten().cloned().collect::<Vec<_>>())
+            } else {
+                counts.exact_matrices += n_exact;
+                counts.fd_matrices += exact.len() - n_exact;
+                // The differences step in SEs. Before any pass has measured them, the held
+                // matrix (cheap, and of the right scale) sizes them.
+                let scale = if iterations == 0 {
+                    diag_se(&assemble(&held_parts(&m_steps)))
+                } else {
+                    m_steps.clone()
+                };
+                let parts: Vec<DMatrix<f64>> = g
+                    .subjects
+                    .par_iter()
+                    .zip(states.par_iter())
+                    .zip(subj_loc.par_iter())
+                    .zip(exact.par_iter())
+                    .map(|(((&i, s), loc), e)| match e {
+                        Some(e) => e.clone(),
+                        None => {
+                            let st: Vec<f64> = loc
+                                .iter()
+                                .map(|&l| LINKED_HESSIAN_STEP_SE * scale[l])
+                                .collect();
+                            self.resolved_hessian(i, &p, s, &st)
+                        }
+                    })
+                    .collect();
+                for (e, loc) in exact.iter().zip(&subj_loc) {
+                    if e.is_none() {
+                        counts.resolves += 2 * loc.len() * loc.len();
+                    }
+                }
+                assemble(&parts)
+            };
+            // Through a link the matrix is the true Hessian, which is indefinite away from
+            // the optimum (#2111): damp it to positive definite there.
+            let m = if g.linked {
+                let (m, damped) = damped_to_pd(g, m).ok_or(ProfileFailure::Singular)?;
+                counts.damped_matrices += usize::from(damped);
+                m
+            } else {
+                m
+            };
+            let se: Vec<f64> = g
+                .theta_diagonal(&m)
+                .into_iter()
+                .map(|d| (d.is_finite() && d > 0.0).then(|| 1.0 / d.sqrt()))
+                .collect::<Option<_>>()
+                .ok_or(ProfileFailure::Singular)?;
+            // A level's own scale. Without borders it is `se`; a θ no subject reads
+            // directly has no curvature of its own and is never stepped.
+            let level_se = diag_se(&m);
+            m_steps.clone_from(&level_se);
+            let fd_step = if g.linked {
+                LINKED_FD_STEP_SE
+            } else {
+                FD_STEP_SE
+            };
+            let steps: Vec<f64> = level_se.iter().map(|s| fd_step * s).collect();
             // Per subject: the gradient, and whether the adjoint served it.
             let parts: Vec<(Vec<f64>, bool)> = g
                 .subjects
@@ -1532,6 +1848,15 @@ pub(crate) struct ProfileCounts {
     /// route's own choice under `gradient = fd`, or a decline).
     pub(crate) adjoint_gradients: usize,
     pub(crate) fd_gradients: usize,
+    /// On a block read through a logit link (#2111), subject Newton matrices the adjoint
+    /// served exactly, and those taken by second differences of the re-solved term
+    /// instead (off the adjoint's route, off the mode, or declined); their re-solves are in
+    /// `resolves`. Zero on an affine block, whose GLS matrix is exact.
+    pub(crate) exact_matrices: usize,
+    pub(crate) fd_matrices: usize,
+    /// Group Newton matrices on a linked block that were not positive definite and were
+    /// damped until they were ([`damped_to_pd`]).
+    pub(crate) damped_matrices: usize,
 }
 
 impl ProfileCounts {
@@ -1540,6 +1865,9 @@ impl ProfileCounts {
         self.resolves += o.resolves;
         self.adjoint_gradients += o.adjoint_gradients;
         self.fd_gradients += o.fd_gradients;
+        self.exact_matrices += o.exact_matrices;
+        self.fd_matrices += o.fd_matrices;
+        self.damped_matrices += o.damped_matrices;
     }
 }
 
@@ -1549,12 +1877,20 @@ impl ProfileCounts {
 /// `Eval` line reports the most any one group took. A function so a test can assert the
 /// text the fit prints.
 pub(crate) fn profile_work_summary(n_evals: usize, n_failed: usize, c: &ProfileCounts) -> String {
-    format!(
+    let mut line = format!(
         "Profile solves of the outer optimizer: {n_evals} evaluations ({n_failed} solve \
          failures, their work counted), {} Newton steps summed over groups, {} EBE re-solves, \
          level gradients {} adjoint / {} finite-difference",
         c.newton_steps, c.resolves, c.adjoint_gradients, c.fd_gradients
-    )
+    );
+    // Only a block read through a logit link has a matrix choice to report (#2111).
+    if c.exact_matrices + c.fd_matrices > 0 {
+        line.push_str(&format!(
+            ", logit-linked Newton matrices {} exact / {} finite-difference, {} damped",
+            c.exact_matrices, c.fd_matrices, c.damped_matrices
+        ));
+    }
+    line
 }
 
 /// Where a solve's level gradients come from: the adjoint, a subject at a time with the
@@ -1564,6 +1900,10 @@ struct GradientRoute {
     /// Test switch: the subject (population index) whose adjoint gradient is declined.
     #[cfg(test)]
     force_decline: Option<usize>,
+    /// Test switch: the subject (population index) whose exact Newton matrix is declined,
+    /// `usize::MAX` for every subject.
+    #[cfg(test)]
+    force_matrix_decline: Option<usize>,
     /// Test switch: every group still unconverged after this many Newton steps fails.
     #[cfg(test)]
     fail_after: Option<usize>,
@@ -1577,12 +1917,24 @@ impl GradientRoute {
         }
         false
     }
+
+    fn declines_matrix(&self, _i: usize) -> bool {
+        #[cfg(test)]
+        if matches!(self.force_matrix_decline, Some(k) if k == _i || k == usize::MAX) {
+            return true;
+        }
+        false
+    }
 }
 
 /// Whether the profile solve's level gradient is the adjoint's (#2109): the predicate
 /// the outer gradient routes on (`envelope_gradient`), so the two cannot disagree and
 /// `gradient = fd` keeps the whole profile on finite differences. A subject the recorder
 /// declines at runtime still takes the reconverged differences, and is reported.
+///
+/// Under `laplace` the outer gradient routes on `agq::analytic_score_supported`, which
+/// is this same predicate by construction (#251), so there is one gate, not two; a test
+/// pins that the two agree on both `gradient` settings (#2107).
 pub(crate) fn profile_gradient_is_analytic(model: &CompiledModel, options: &FitOptions) -> bool {
     crate::sens::provider::analytic_outer_gradient_for_interaction(model, options.interaction)
 }
@@ -1725,6 +2077,11 @@ thread_local! {
     /// Test switch: every profile solve started on this thread declines this subject's
     /// (population index) adjoint level gradient, so it takes the FD fallback (#2109).
     pub(crate) static FORCE_PROFILE_GRADIENT_DECLINE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Test switch: every profile solve started on this thread declines this subject's
+    /// (population index; `usize::MAX` for every subject) exact Newton matrix on a linked
+    /// block, so it takes the differenced one (#2111).
+    pub(crate) static FORCE_PROFILE_MATRIX_DECLINE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
     /// Test switch: every profile solve started on this thread fails each group still
     /// unconverged after this many Newton steps, so a test reaches a failed group's work.
@@ -2126,7 +2483,10 @@ pub(crate) fn profiled_converged(
     match end {
         PolishEnd::Settled if profiled_stop_needs_verify(algo, last, cancelled, left_init) => true,
         PolishEnd::Settled | PolishEnd::NotNeeded => status_is_converged(last),
-        PolishEnd::LegCapReached { .. } | PolishEnd::BudgetSpent | PolishEnd::Skipped => false,
+        PolishEnd::LegCapReached { .. }
+        | PolishEnd::Stalled { .. }
+        | PolishEnd::BudgetSpent
+        | PolishEnd::Skipped => false,
     }
 }
 
@@ -2325,6 +2685,7 @@ pub(crate) fn optimize_profiled(
             let mut acc = ebe_accum.lock().unwrap();
             acc.max_unconverged = acc.max_unconverged.max(solve.ebe.n_unconverged);
             acc.total_fallback += solve.ebe.n_fallback;
+            acc.total_nm_polished += solve.ebe.n_nm_polished;
             // The unprofiled loop's EBE guard, on the same counts: too many unconverged
             // subjects (or one hard-rejected at its start) and the trial is a wall.
             if ebe_guard_rejects(
@@ -2382,7 +2743,7 @@ pub(crate) fn optimize_profiled(
         });
         crate::estimation::trace::write_foce(
             n_evals.load(Ordering::Relaxed),
-            if options.interaction { "focei" } else { "foce" },
+            crate::estimation::trace::method_label(options),
             solve.ofv,
             grad_norm,
             None,
@@ -2648,6 +3009,7 @@ pub(crate) fn optimize_profiled(
         ebe_convergence_warnings: ebe.n_guarded as u32,
         max_unconverged_subjects: ebe.max_unconverged as u32,
         total_ebe_fallbacks: ebe.total_fallback as u32,
+        total_ebe_nm_polished: ebe.total_nm_polished as u32,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal: cov.and_then(|c| c.sir_fallback_proposal),
@@ -2659,6 +3021,7 @@ pub(crate) fn optimize_profiled(
         stationary_start: false,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     }
 }
 
@@ -2790,6 +3153,7 @@ pub(crate) struct ResolvedLevels {
 struct EbeAccum {
     max_unconverged: usize,
     total_fallback: usize,
+    total_nm_polished: usize,
     n_guarded: usize,
     /// The profile solves' summed work, and how many of them failed (#2405).
     work: ProfileCounts,
@@ -2827,6 +3191,7 @@ fn failed_result(
         ebe_convergence_warnings: ebe.n_guarded as u32,
         max_unconverged_subjects: ebe.max_unconverged as u32,
         total_ebe_fallbacks: ebe.total_fallback as u32,
+        total_ebe_nm_polished: ebe.total_nm_polished as u32,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal: None,
@@ -2838,6 +3203,7 @@ fn failed_result(
         stationary_start: false,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     }
 }
 

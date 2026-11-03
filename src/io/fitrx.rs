@@ -159,6 +159,10 @@ struct FitWire {
     ebe_convergence_warnings: u32,
     max_unconverged_subjects: u32,
     total_ebe_fallbacks: u32,
+    /// `FitResult::total_ebe_nm_polished` (#2571). Absent on bundles written before the
+    /// field existed; those load as 0, which is what every fit reported until then.
+    #[serde(default)]
+    total_ebe_nm_polished: u32,
     warnings: Vec<String>,
     /// The structured warnings that carry a `details` payload (#2268), as
     /// `WarningEntry` JSON. Only those: every other entry is rebuilt from
@@ -1215,6 +1219,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         ebe_convergence_warnings: r.ebe_convergence_warnings,
         max_unconverged_subjects: r.max_unconverged_subjects,
         total_ebe_fallbacks: r.total_ebe_fallbacks,
+        total_ebe_nm_polished: r.total_ebe_nm_polished,
         warnings: r.warnings.clone(),
         warning_details: r
             .warnings_structured
@@ -1739,6 +1744,22 @@ fn epoch_to_utc(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 
 /// Read a fit bundle from `path`.
 pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
+    load_fit_with(path, true)
+}
+
+/// [`load_fit`] without re-reading a bundled `data.csv`: the population is
+/// always `None`.
+///
+/// For a caller that needs only the fit and the model source, such as the DCM
+/// exporter (`ferx export-dcm`). Re-reading the data parses the bundled model to
+/// learn its column mapping; a `[covariate_nn]` model does not parse in a build
+/// without `nn`, and the fallback read without the mapping can then fail on a
+/// renamed column — refusing an export that never needed the data.
+pub fn load_fit_without_population(path: &Path) -> Result<LoadedFit, FitrxError> {
+    load_fit_with(path, false)
+}
+
+fn load_fit_with(path: &Path, read_population: bool) -> Result<LoadedFit, FitrxError> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
 
@@ -1761,7 +1782,7 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
     };
     let preds_csv = read_text(&mut archive, "predictions.csv")?;
     let model_source = read_text(&mut archive, "model.ferx")?;
-    let data_csv = if archive.index_for_name("data.csv").is_some() {
+    let data_csv = if read_population && archive.index_for_name("data.csv").is_some() {
         Some(read_bytes(&mut archive, "data.csv")?)
     } else {
         None
@@ -2084,6 +2105,8 @@ fn parse_subjects(
             // them belongs with the checkpoint format, not here (#897 follow-up).
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
+            #[cfg(feature = "survival")]
+            tte_rows: Vec::new(),
         });
     }
 
@@ -2923,7 +2946,7 @@ fn wire_to_fit_result(
         sir_ess,
         sir_resamples_packed,
         // .fitrx v1: importance_sampling is not serialised — re-run via
-        // `methods = [..., imp]` if the consumer needs the IS LL.
+        // `method = [..., imp]` if the consumer needs the IS LL.
         importance_sampling: None,
         impmap_trace: None,
         bayes: None,
@@ -2956,6 +2979,7 @@ fn wire_to_fit_result(
         ebe_convergence_warnings: w.ebe_convergence_warnings,
         max_unconverged_subjects: w.max_unconverged_subjects,
         total_ebe_fallbacks: w.total_ebe_fallbacks,
+        total_ebe_nm_polished: w.total_ebe_nm_polished,
         covariance_status: covariance_status_from_str(&w.covariance_status)?,
         // Absent key → `None` (a pre-#1382 bundle simply did not record it);
         // present-but-unrecognised → `Corrupt`, the same verdict every other
@@ -3320,6 +3344,47 @@ mod tests {
         assert!(parsed["ofv"].is_null());
     }
 
+    /// `FitResult::from_json_str` reads back the `null`s `write_result_json`
+    /// writes for non-finite floats: a plain `f64` (top level, and nested in a
+    /// `Vec` inside an `Option` struct) as `NaN`, an `Option<f64>` as `None`,
+    /// finite values unchanged. The plain serde read of the same file fails, so
+    /// the straddle is pinned too.
+    #[test]
+    fn from_json_str_reads_non_finite_nulls_back_as_nan() {
+        let mut fit = minimal_fit_result();
+        fit.ofv = 123.5;
+        fit.iwres_lag1_r = f64::NAN;
+        fit.dw_statistic = f64::INFINITY;
+        fit.cov_condition_number = None;
+        fit.covariate_table = Some(crate::types::CovariateTable {
+            names: vec!["WT".into(), "AGE".into()],
+            kinds: vec![crate::types::CovariateKind::Continuous; 2],
+            rows: vec![crate::types::CovariateRow {
+                id: "S1".into(),
+                time: 0.0,
+                evid: 0,
+                values: vec![f64::NAN, 41.0],
+            }],
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nan-fit.json");
+        crate::io::output::write_result_json(&fit, path.to_str().unwrap()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        let err = serde_json::from_str::<FitResult>(&text).unwrap_err();
+        assert!(err.to_string().contains("null"), "{err}");
+
+        let back = FitResult::from_json_str(&text).unwrap();
+        assert_eq!(back.ofv, 123.5);
+        assert!(back.iwres_lag1_r.is_nan(), "{}", back.iwres_lag1_r);
+        assert!(back.dw_statistic.is_nan(), "{}", back.dw_statistic);
+        assert_eq!(back.cov_condition_number, None);
+        let row = &back.covariate_table.unwrap().rows[0];
+        assert!(row.values[0].is_nan(), "{:?}", row.values);
+        assert_eq!(row.values[1], 41.0);
+        assert_eq!(back.theta, fit.theta);
+    }
+
     #[test]
     fn write_result_json_writes_parseable_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -3622,6 +3687,45 @@ mod tests {
         assert_eq!(n_obs, 2, "mapped observations should be read");
         assert!(!pop.covariate_names.contains(&"TAFD".to_string()));
         assert!(!pop.covariate_names.contains(&"CONC".to_string()));
+    }
+
+    /// `load_fit_without_population` reads the fit and model source and leaves the
+    /// bundled data alone. The case it exists for: a bundle whose model this build
+    /// cannot parse (here a misspelled block stands in for a `[covariate_nn]` model
+    /// in a build without `nn`), with renamed columns. `load_fit` then falls back
+    /// to the unmapped read and fails on the missing `TIME` column — refusing a
+    /// caller that never needed the data, such as `ferx export-dcm`.
+    #[test]
+    fn load_fit_without_population_skips_the_bundled_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unparsable.fitrx");
+        let data_csv = dir.path().join("input.csv");
+        std::fs::write(
+            &data_csv,
+            "ID,TAFD,CONC,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n1,2,3.0,0,.\n",
+        )
+        .unwrap();
+        let model_source = "[not_a_block]\n[data]\n  TIME = TAFD\n  DV = CONC\n";
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(
+            &r,
+            &p,
+            model_source,
+            &path,
+            SaveFitOptions {
+                include_data: Some(data_csv),
+            },
+        )
+        .unwrap();
+
+        let err = load_fit(&path).expect_err("the control: the full load replays the data");
+        assert!(err.to_string().contains("TIME"), "{err}");
+        let loaded = load_fit_without_population(&path).unwrap();
+        assert!(loaded.population.is_none());
+        assert_eq!(loaded.model_source, model_source);
+        assert_eq!(loaded.fit.theta, r.theta);
+        assert_eq!(loaded.fit.model_text.as_deref(), Some(model_source));
     }
 
     #[cfg(feature = "survival")]
@@ -5999,6 +6103,54 @@ mod tests {
             loaded.fit.covariance_method, None,
             "an absent key must load as `None`, not as a default estimator"
         );
+    }
+
+    /// #2571: `total_ebe_nm_polished` survives a save/load, and a bundle written before the
+    /// field existed loads it as 0, the count every fit reported until then.
+    #[test]
+    fn total_ebe_nm_polished_round_trips_and_defaults_to_zero() {
+        use std::io::{Read as _, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nm-polished.fitrx");
+        let mut r = minimal_fit_result();
+        r.total_ebe_nm_polished = 7;
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        assert_eq!(load_fit(&path).unwrap().fit.total_ebe_nm_polished, 7);
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut removed = false;
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().unwrap().to_string();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            if name == "fit.json" {
+                let mut v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+                removed = v
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("total_ebe_nm_polished")
+                    .is_some();
+                buf = serde_json::to_vec_pretty(&v).unwrap();
+            }
+            entries.push((name, buf));
+        }
+        assert!(
+            removed,
+            "premise: the key was written, so stripping it means something"
+        );
+        let patched = dir.path().join("nm-polished-patched.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&patched).unwrap());
+        for (name, body) in entries {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap();
+        assert_eq!(load_fit(&patched).unwrap().fit.total_ebe_nm_polished, 0);
     }
 
     /// #1382: an unrecognised token is `Corrupt`, the same verdict every other

@@ -532,7 +532,7 @@ fn scaling_supported(model: &CompiledModel) -> bool {
 
 /// Whether the exact analytic **outer** (population) FOCE/FOCEI gradient is
 /// available for `model`: it is in the adjoint gradient's scope
-/// (`crate::sens::ode_provider::adjoint::model_in_scope`) and the user did not
+/// (`crate::sens::ode_provider::adjoint::outer_model_in_scope`) and the user did not
 /// force finite differences via `gradient_method = fd`.
 ///
 /// Single source of truth for the analytic-vs-FD outer-gradient decision. The
@@ -544,13 +544,11 @@ fn scaling_supported(model: &CompiledModel) -> bool {
 /// noisy FD gradient). The per-eval `reconverge_gradient_interval` override is
 /// orthogonal and handled at the dispatch site, not here.
 ///
-/// Non-Gaussian endpoints — `[event_model]` TTE and `[binary_model]` logistic (#760) —
-/// are excluded: their data log-likelihood has no analytic outer gradient (the
-/// adjoint only covers the structural PK/PD model), so such an objective
-/// (or a mixed PK + non-Gaussian objective) must be differentiated by finite differences.
-/// Without this guard the model would report an analytic gradient it cannot supply, so
-/// `resolve_auto` would pick a gradient-based optimizer that then stalls on a meaningless
-/// gradient (these endpoints are FD-only — see `docs/estimation/tte.qmd`).
+/// Non-Gaussian endpoints — `[event_model]` TTE, `[binary_model]` and CTMM — are in scope
+/// when every one has an exact channel (`inner_optimizer::non_gaussian_endpoints_served`):
+/// the adjoint folds their term into the objective. One without (a hazard built without a
+/// dual-evaluable program) keeps the model on finite differences, so `resolve_auto` cannot
+/// pick a gradient-based optimizer for a gradient the loop cannot supply.
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !GradientMethod::forced_fd(model) && analytic_outer_gradient_in_scope(model)
 }
@@ -567,7 +565,7 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
     // The adjoint gradient's model scope: it carries none of the retired (pre-#2093) forward
     // provider's width or slot limits, and serves kappa with a residual `correlation … by` line (#1082 PR5,
     // #2101) — the IOV marginal is the non-IOV dense one over the stacked system.
-    crate::sens::ode_provider::adjoint::model_in_scope(model)
+    crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
 }
 
 /// `analytic_outer_gradient_available`, kept as the shared entry point that
@@ -1583,38 +1581,36 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
         .and_then(|ar| ar.program.as_ref());
     let ro_pk: Option<[T; N_PK]> = readout
         .map(|_| std::array::from_fn(|s| dual_of(s, pk.values.get(s).copied().unwrap_or(0.0))));
-    let mut ro_state: Vec<T> = Vec::new();
-    let mut ro_vars: Vec<T> = Vec::new();
-    let mut ro_stack: Vec<T> = Vec::new();
+    let mut ro_state: Vec<T> = crate::scratch::take_for(0);
+    let mut ro_vars: Vec<T> = crate::scratch::take_for(0);
+    let mut ro_stack: Vec<T> = crate::scratch::take_for(0);
     // The clamped concentrations, then the analytic `init(...)` impulses on top (production
     // adds them before the readout and scaling; the two never coexist on the closed form).
-    let mut conc: Vec<T> = subject
-        .obs_times
-        .iter()
-        .map(|&t_obs| {
-            let fd = superpose_doses(
-                &seeded,
-                flags,
-                subject,
-                t_obs,
-                reset_floor_at(subject, t_obs),
-            );
-            // Mirror production's `conc.max(0.0)`.
-            if fd.val() < 0.0 {
-                T::from_f64(0.0)
-            } else {
-                fd
-            }
-        })
-        .collect();
+    let mut conc: Vec<T> = crate::scratch::take_for(subject.obs_times.len());
+    conc.extend(subject.obs_times.iter().map(|&t_obs| {
+        let fd = superpose_doses(
+            &seeded,
+            flags,
+            subject,
+            t_obs,
+            reset_floor_at(subject, t_obs),
+        );
+        // Mirror production's `conc.max(0.0)`.
+        if fd.val() < 0.0 {
+            T::from_f64(0.0)
+        } else {
+            fd
+        }
+    }));
     if !model.analytical_init.is_empty() {
-        let amount: Vec<T> = (0..pk.values.len())
-            .map(|s| dual_of(s, pk.values[s]))
-            .collect();
-        add_closed_form_init_g(model, subject, theta, eta, &amount, None, &mut conc)?;
+        let mut amount: Vec<T> = crate::scratch::take_for(pk.values.len());
+        amount.extend((0..pk.values.len()).map(|s| dual_of(s, pk.values[s])));
+        let added = add_closed_form_init_g(model, subject, theta, eta, &amount, None, &mut conc);
+        crate::scratch::give_for(amount);
+        added?;
     }
-    let mut out = Vec::with_capacity(subject.obs_times.len());
-    for (obs_i, conc) in conc.into_iter().enumerate() {
+    let mut out = crate::scratch::take_for(subject.obs_times.len());
+    for (obs_i, &conc) in conc.iter().enumerate() {
         let y = apply_readout_jet(
             conc,
             readout,
@@ -1627,6 +1623,10 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
         );
         out.push(y);
     }
+    crate::scratch::give_for(conc);
+    crate::scratch::give_for(ro_state);
+    crate::scratch::give_for(ro_vars);
+    crate::scratch::give_for(ro_stack);
     Some(out)
 }
 

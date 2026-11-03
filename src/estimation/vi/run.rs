@@ -1136,7 +1136,7 @@ pub fn run_vi(
             warnings.push(
                 "VI: `ofv` is NaN because the ELBO is a lower bound on the log likelihood, not \
                  a −2 log L, and is not comparable with a FOCE/SAEM OFV. Set \
-                 `vi_final_ofv = laplace`, or chain `methods = vi, imp` with \
+                 `vi_final_ofv = laplace`, or chain `method = [vi, imp]` with \
                  `imp_eval_only = true`, to evaluate a genuine marginal likelihood at the VI \
                  estimate. The bound itself is on `vi.neg_two_elbo`."
                     .to_string(),
@@ -1171,7 +1171,7 @@ pub fn run_vi(
     // the Laplace objective, not of the ELBO, so it is well-defined even when the
     // reported `ofv` is deliberately left `NaN`. `run_covariance_step` gates itself
     // on `options.run_covariance_step`, which `fit_inner` clears on every
-    // non-terminal stage of a chain — so a `methods = vi, focei` run pays for it
+    // non-terminal stage of a chain — so a `method = [vi, focei]` run pays for it
     // once, at the end.
     let cov_out = crate::estimation::covariance::run_covariance_step(
         &packed_final,
@@ -1267,6 +1267,7 @@ pub fn run_vi(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal,
@@ -1280,6 +1281,7 @@ pub fn run_vi(
         left_init: None,
         stationary_start: false,
         vi: Some(vi_result),
+        start_eval: None,
         mixture_posteriors: None,
     })
 }

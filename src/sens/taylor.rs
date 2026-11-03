@@ -57,6 +57,44 @@ pub(crate) struct Table {
     pub(crate) parent: Vec<(u16, u8)>,
     /// The index of `e_v`, the first-degree monomial of each variable.
     pub(crate) var: Vec<u16>,
+    /// [`LiveBasis`] of each live count `n ≤ P`, built on first use.
+    live: Vec<OnceLock<LiveBasis>>,
+}
+
+/// The monomials of degree ≥ 1 that read only the first `n` variables, in the table's order,
+/// with each one's parent in that same compact numbering (#2549): what an evaluation of the
+/// polynomial on `n` live directions needs, computed once per `(table, n)` instead of on
+/// every call.
+pub(crate) struct LiveBasis {
+    /// Table index of each kept monomial.
+    pub(crate) idx: Vec<usize>,
+    /// `(b, v)`: kept monomial `j` is `δp_v` when `b == 0`, else kept monomial `b − 1`
+    /// times `δp_v`.
+    pub(crate) parent: Vec<(usize, usize)>,
+}
+
+impl Table {
+    /// [`LiveBasis`] for `n` live directions.
+    pub(crate) fn live(&self, n: usize) -> &LiveBasis {
+        self.live[n].get_or_init(|| {
+            let keep = |k: usize| self.exps[k].iter().skip(n).all(|&x| x == 0);
+            let idx: Vec<usize> = (1..self.exps.len()).filter(|&k| keep(k)).collect();
+            let mut compact = vec![usize::MAX; self.exps.len()];
+            for (j, &k) in idx.iter().enumerate() {
+                compact[k] = j;
+            }
+            let parent = idx
+                .iter()
+                .map(|&k| {
+                    let (b, v) = self.parent[k];
+                    // A kept monomial's parent reads a subset of its variables: kept too.
+                    let b = if b == 0 { 0 } else { compact[b as usize] + 1 };
+                    (b, v as usize)
+                })
+                .collect();
+            LiveBasis { idx, parent }
+        })
+    }
 }
 
 const MAX_P: usize = 12;
@@ -124,6 +162,7 @@ fn build(p: usize, ord: usize) -> Table {
         })
         .collect();
     Table {
+        live: (0..=p).map(|_| OnceLock::new()).collect(),
         exps,
         deg,
         mul,

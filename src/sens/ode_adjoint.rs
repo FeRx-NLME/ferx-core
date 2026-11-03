@@ -45,7 +45,7 @@
 
 use super::*;
 use crate::estimation::parameterization::{lower_tri_entries, unpack_params};
-use crate::sens::focei_kernel::{foce_f, focei_f_grad, inner_grad, inner_l, LikCtx, ParT};
+use crate::sens::focei_kernel::{data_l, foce_f, focei_f_grad, inner_grad, inner_l, LikCtx, ParT};
 use crate::sens::num::vm::VmNum;
 use crate::sens::num::PkNum;
 use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
@@ -61,7 +61,10 @@ use nalgebra::{DMatrix, DVector};
 /// extra η directions inert (unit prior, read by no prediction). Every bucket is a full
 /// monomorphisation of the recorder stack, so the ladder trades a little padding at
 /// in-between widths for compile time and binary size; the cap is the η-Hessian payload's
-/// `N(N+1)/2` per operation, not any derivative limit.
+/// `N(N+1)/2` per operation, not any derivative limit. 12 and 32 earn their stacks: an IOV
+/// model with a few occasions lands at 9–12 or 25–32 stacked effects, and padding those to
+/// 16 or 48 carries 1.7–2.2× the lanes — measured on a 30-wide stack (3 η + 9 occasions ×
+/// 3 κ) as 2.1× the stack depth of the 32 bucket, past a 2 MiB thread (#2482).
 /// A model without random effects pads to 1: an inert direction with a unit prior, as
 /// every padded width carries, so `Ψ = F` exactly without a width-0 copy of the recorders.
 pub(crate) const WIDTH_BUCKETS: [usize; 11] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48];
@@ -82,12 +85,33 @@ pub(crate) fn likelihood_supported(
         && _subject.obs_records.is_empty()
 }
 
-/// Whether the model routes to the exact outer gradient through the adjoint: a recorder
-/// serves its predictions ([`recorder_in_scope`]) and its likelihood is Gaussian (a
-/// non-Gaussian endpoint's subjects decline, so the outer loop stays derivative-free).
-/// Individual subjects the recorders decline still fall back, per subject.
+/// A recorder serves the model's predictions ([`recorder_in_scope`]) and its likelihood is
+/// Gaussian. The production gates are [`outer_model_in_scope`] (which also serves non-Gaussian
+/// endpoints) and [`recorder_in_scope`]; this narrower predicate is kept for the tests that
+/// pin a Gaussian model's routing.
+#[cfg(test)]
 pub(crate) fn model_in_scope(model: &CompiledModel) -> bool {
     recorder_in_scope(model) && !model.has_non_gaussian()
+}
+
+/// The FOCE/FOCEI outer gradient's model scope: a recorder serves the model's predictions
+/// (or it is endpoint-only), and it also serves a model whose
+/// non-Gaussian endpoints all have an exact channel (`run` folds their terms into the
+/// objective, over the BSV block under IOV). AGQ (`analytic_score_supported`) and the EBE
+/// predictor (`optimize_bfgs`) take the same scope.
+pub(crate) fn outer_model_in_scope(model: &CompiledModel) -> bool {
+    (recorder_in_scope(model) || endpoint_only(model))
+        && (!model.has_non_gaussian()
+            || crate::estimation::inner_optimizer::non_gaussian_endpoints_served(model))
+}
+
+/// A model with no structural part — only non-Gaussian endpoints (`[markov_model]`,
+/// `[binary_model]` alone): no Gaussian rows to record, so no recorder is needed.
+fn endpoint_only(model: &CompiledModel) -> bool {
+    model.ode_spec.is_none()
+        && !model.is_algebraic()
+        && model.pk_indices.is_empty()
+        && model.has_non_gaussian()
 }
 
 /// Whether a recorder serves the model's Gaussian predictions: the model-level half of
@@ -236,7 +260,9 @@ pub(crate) fn watch_packed_points(template: &ModelParameters, f: &dyn Fn()) -> u
 }
 
 /// [`Scoped`] for a subject, or `None` outside the adjoint's scope: the shared prelude of
-/// the gradient and the covariance Hessian.
+/// the gradient and the covariance Hessian. A subject carrying non-Gaussian records is
+/// served when every one has an exact channel (`non_gaussian_terms_supported`): the
+/// objectives fold the term in, over the BSV block under IOV.
 pub(super) fn scope<'m>(
     model: &'m CompiledModel,
     subject: &Subject,
@@ -255,7 +281,12 @@ pub(super) fn scope<'m>(
         crate::pk::effective_model_for_eval(model, subject, &params.theta, &vec![0.0; model.n_eta])
     };
     let (model, width, eta, lay) = resolve(model, subject, &params.theta, eta_hat, None)?;
-    if !likelihood_supported(model, subject, &params) {
+    let supported = if !subject.obs_records.is_empty() {
+        non_gaussian_terms_supported(model, subject)
+    } else {
+        likelihood_supported(model, subject, &params)
+    };
+    if !supported {
         return None;
     }
     let seg = crate::estimation::parameterization::packed_segments(template);
@@ -345,7 +376,71 @@ pub(crate) fn subject_adjoint_gradient_at(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<Vec<f64>> {
-    adjoint_gradient(model, subject, pt, eta_hat, objective, false)
+    adjoint_gradient(model, subject, pt, eta_hat, objective, false, None)
+}
+
+/// [`subject_adjoint_gradient_at`] for FOCE/FOCEI, and with it the exact mode response
+/// `dη̂/dx` of the fit's own inner problem — one vector of the BSV effects per packed
+/// coordinate, the EBE warm-start predictor's Jacobian (Almquist Eq. 48) — formed from the
+/// gradient's own recording: one more sweep per BSV effect, no second recording (#2549).
+/// The response is `None` where the gradient is (the adjoint declined) or the inner Hessian
+/// is singular.
+pub(crate) fn subject_adjoint_gradient_with_eta_dx_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    interaction: bool,
+) -> (Option<Vec<f64>>, Option<Vec<DVector<f64>>>) {
+    let objective = if interaction {
+        Objective::Focei
+    } else {
+        Objective::Foce
+    };
+    subject_adjoint_gradient_and_eta_dx_at(model, subject, pt, eta_hat, objective)
+}
+
+/// [`subject_adjoint_gradient_with_eta_dx_at`] for any objective the adjoint serves: under
+/// Laplace/AGQ (`Objective::Agq`) the response of the conditional mode the quadrature is
+/// centred on, from the exact inner Hessian, out of the quadrature gradient's own tape.
+pub(crate) fn subject_adjoint_gradient_and_eta_dx_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+) -> (Option<Vec<f64>>, Option<Vec<DVector<f64>>>) {
+    let mut out = ModeOut {
+        want_dx: true,
+        ..ModeOut::default()
+    };
+    let g = subject_adjoint_gradient_and_mode_at(model, subject, pt, eta_hat, objective, &mut out);
+    (g, out.eta_dx)
+}
+
+/// [`subject_adjoint_gradient_at`], with whatever `out` asks for about the subject's mode
+/// ([`ModeOut`]) formed from the same pass. Both are `None` where the gradient is.
+pub(crate) fn subject_adjoint_gradient_and_mode_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+    out: &mut ModeOut,
+) -> Option<Vec<f64>> {
+    let g = adjoint_gradient(
+        model,
+        subject,
+        pt,
+        eta_hat,
+        objective,
+        false,
+        Some(&mut *out),
+    );
+    if g.is_none() {
+        out.clear();
+    }
+    g
 }
 
 /// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, for an AGQ subject whose mode
@@ -380,7 +475,394 @@ pub(crate) fn subject_adjoint_held_ebe_score_at(
     objective: Objective,
 ) -> Option<Vec<f64>> {
     matches!(objective, Objective::Agq { .. })
-        .then(|| adjoint_gradient(model, subject, pt, eta_hat, objective, true))?
+        .then(|| adjoint_gradient(model, subject, pt, eta_hat, objective, true, None))?
+}
+
+/// The fixed-EBE objective and its exact packed gradient at `η̂` with the linearisation
+/// `H` held as given: `F(θ, Ω, σ; η̂, H)` — the analytic kernel's FOCE (`interaction =
+/// false`, `R⁰` at `f(η = 0)` where the variance is f-dependent) or FOCEI objective, with
+/// `H` and `η̂` constants. This is the score the outer optimizer's fixed-EBE paths
+/// difference (GN, trust region, the S-matrix, the held-EBE salvage), taken exactly: one
+/// scalar-tape sweep of the objective gives its adjoints in the predictions, `Ω` and `σ`,
+/// and the predictions' θ-derivatives are contracted with them by one recording and one
+/// reverse sweep each ([`fixed_eta_theta_contractions`]). Every feature the kernel scores —
+/// M3 censoring, a dense residual, FREM rows, a residual-error η, a residual magnitude —
+/// is covered by construction. `None` outside the kernel's or the recorders' scope, under
+/// IOV (its linearisation is not a held `H`), or on a shape mismatch.
+pub(crate) fn subject_fixed_ebe_score_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    h: &DMatrix<f64>,
+    interaction: bool,
+) -> Option<(f64, Vec<f64>)> {
+    if model.n_kappa > 0 {
+        // `eta_hat` is the stacked `[η̂, κ̂]`; `h` holds the BSV columns only.
+        let sc = scope(model, subject, pt, eta_hat)?;
+        if h.nrows() != subject.observations.len() || h.ncols() != model.n_eta {
+            return None;
+        }
+        #[inline(never)]
+        fn go_iov<const N: usize, const M: usize>(
+            sc: &Scoped,
+            subject: &Subject,
+            pt: &PackedPoint<'_>,
+            h: &DMatrix<f64>,
+            interaction: bool,
+        ) -> Option<(f64, Vec<f64>)> {
+            fixed_ebe_score_iov::<N, M>(sc, subject, pt, h, interaction)
+        }
+        return by_bucket!(sc.bucket, go_iov, (&sc, subject, pt, h, interaction));
+    }
+    let sc = scope(model, subject, pt, eta_hat)?;
+    if h.nrows() != subject.observations.len() || h.ncols() != sc.width {
+        return None;
+    }
+    #[inline(never)]
+    fn go<const N: usize, const M: usize>(
+        sc: &Scoped,
+        subject: &Subject,
+        pt: &PackedPoint<'_>,
+        eta_hat: &[f64],
+        h: &DMatrix<f64>,
+        interaction: bool,
+    ) -> Option<(f64, Vec<f64>)>
+    where
+        Bucket<N, M>: ExactAnchor<N, M>,
+    {
+        fixed_ebe_score::<N>(sc, subject, pt, eta_hat, h, interaction)
+    }
+    by_bucket!(sc.bucket, go, (&sc, subject, pt, eta_hat, h, interaction))
+}
+
+fn fixed_ebe_score<const N: usize>(
+    sc: &Scoped,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    h: &DMatrix<f64>,
+    interaction: bool,
+) -> Option<(f64, Vec<f64>)> {
+    let (model, params, template) = (sc.model, sc.params, pt.template);
+    let theta = &params.theta;
+    let n_obs = subject.observations.len();
+    // A subject's non-Gaussian records: `(q, ∇q, ∇²q)` at `η̂`. Beside them production scores
+    // the conditional variance under either interaction setting (`focei_f_grad_ng`), so
+    // FOCE's population variance point is not read.
+    let n_bsv = model.n_eta;
+    let ng = if subject.obs_records.is_empty() {
+        None
+    } else {
+        if n_bsv > N {
+            return None;
+        }
+        Some(non_gaussian_eta_jets2(
+            model,
+            subject,
+            theta,
+            &eta_hat[..n_bsv],
+        )?)
+    };
+    let use_pop = ng.is_none() && !interaction && model.error_spec.has_f_dependent_variance();
+    // FOCE's variance point f(η = 0) is needed before the objective can be scored; its
+    // values come from one plain evaluation, its θ-derivatives from its own recording below.
+    let fpop = if use_pop {
+        let zeros = vec![0.0; sc.eta.len()];
+        let f0 = record::<f64>(
+            sc.pop_model,
+            subject,
+            None,
+            theta,
+            &zeros,
+            &ThetaLeaves::theta(theta),
+            &zeros,
+        )?;
+        Some((f0.len() == n_obs).then_some(f0)?)
+    } else {
+        None
+    };
+    let ctx = LikCtx::new(model, subject, params);
+    let so = stacked_omega::<N>(model, subject, template, params, sc.width);
+    let mut pv = ParT::of(model, subject, params);
+    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
+
+    // The objective on the scalar tape (`H` and `η̂` constants), scored inside the η̂
+    // recording's weights callback on that recording's own prediction values — one
+    // recording serves both the value and its θ-derivatives. Everything but the θ block
+    // is assembled there; the θ block is linear in `theta_adj` and added afterwards.
+    let scored: std::cell::RefCell<Option<(f64, Vec<f64>, Vec<f64>)>> = Default::default();
+    let ng_adj: std::cell::RefCell<Option<(f64, Vec<f64>, Vec<Vec<f64>>)>> = Default::default();
+    let score = |f: &[f64]| -> Option<Vec<Vec<f64>>> {
+        rtape_reset();
+        let fr: Vec<R> = f.iter().map(|&v| rinput(v)).collect();
+        let gr: Vec<[R; N]> = (0..n_obs)
+            .map(|j| std::array::from_fn(|k| R::c(if k < sc.width { h[(j, k)] } else { 0.0 })))
+            .collect();
+        let er: [R; N] = std::array::from_fn(|k| R::c(sc.eta.get(k).copied().unwrap_or(0.0)));
+        let pr0: Option<Vec<R>> = fpop
+            .as_ref()
+            .map(|p| p.iter().map(|&v| rinput(v)).collect());
+        let (pr, om) = tape_params(model, subject, &pv, &so)?;
+        let ngr = ng.as_ref().map(|(q, g, hq)| {
+            ng_tape_inputs::<N>(&NgJets {
+                q: *q,
+                g: g.clone(),
+                h: (0..g.len())
+                    .map(|k| (0..g.len()).map(|l| hq[(k, l)]).collect())
+                    .collect(),
+                t: Vec::new(),
+            })
+        });
+        let fval = match ngr.as_ref() {
+            Some(ngr) => ng_f_grad(&ctx, &fr, &gr, &er, &pr, ngr, interaction)?.0,
+            None => objective::<R, N>(&ctx, interaction, &fr, &gr, &er, pr0.as_deref(), &pr)?.0,
+        };
+        let sadj = rsweep::<1>(&[fval]);
+        let psi_of = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+        if let Some(ngr) = ngr.as_ref() {
+            *ng_adj.borrow_mut() = Some(ng_adjoints(ngr, n_bsv, psi_of));
+        }
+        let wf: Vec<f64> = fr.iter().map(|&x| psi_of(x)).collect();
+        let wp: Vec<f64> = pr0
+            .as_ref()
+            .map(|p0| p0.iter().map(|&x| psi_of(x)).collect())
+            .unwrap_or_default();
+        let base = packed_gradient(
+            model,
+            template,
+            params,
+            pt.x.len(),
+            &[],
+            &psi_of,
+            &pr,
+            &om,
+            &so,
+            &pv,
+        );
+        *scored.borrow_mut() = Some((fval.val(), base, wp));
+        Some(vec![wf])
+    };
+    // An endpoint-only subject has no prediction to record: its θ enter through the term.
+    let theta_mode = if n_obs == 0 && ng.is_some() {
+        score(&[])?;
+        vec![0.0; theta.len()]
+    } else {
+        fixed_eta_theta_contractions(model, subject, theta, eta_hat, score)?.pop()?
+    };
+    let (nll, mut grad, wp) = scored.into_inner()?;
+    let mut theta_adj = theta_mode;
+    if let Some((a_q, a_g, a_h)) = ng_adj.into_inner() {
+        let part = NgSeed {
+            eta: &eta_hat[..n_bsv],
+            a_q,
+            a_g: &a_g,
+            a_h: &a_h,
+        };
+        let d = ng_theta_adjoint(model, subject, theta, &[part])?;
+        for (t, dv) in theta_adj.iter_mut().zip(d) {
+            *t += dv;
+        }
+    }
+    if use_pop {
+        let zeros_eta = vec![0.0; eta_hat.len()];
+        let at_pop =
+            fixed_eta_theta_contractions(sc.pop_model, subject, theta, &zeros_eta, |_| {
+                Some(vec![wp])
+            })?
+            .pop()?;
+        for (a, b) in theta_adj.iter_mut().zip(at_pop) {
+            *a += b;
+        }
+    }
+    for (m, &a) in theta_adj.iter().enumerate() {
+        grad[m] += a * crate::estimation::sens_outer_gradient::theta_dx_chain(template, theta, m);
+    }
+    (nll.is_finite() && grad.iter().all(|g| g.is_finite())).then_some((nll, grad))
+}
+
+/// [`fixed_ebe_score`] under IOV: production's held objective (`foce_subject_nll_iov`) holds
+/// the BSV columns of `H` and `b̂ = [η̂, κ̂]`, and rebuilds the κ columns `∂f/∂κ` at `b̂` from
+/// θ. So the predictions are recorded with their κ-tangents on the vector tape (θ leaves,
+/// `b` free), the kernel's objective over the stacked system is scored on the scalar tape
+/// with the BSV columns constant and the κ columns as inputs, and one sweep seeded with both
+/// adjoints carries `∂f/∂θ` and `∂²f/∂κ∂θ` to the θ leaves together.
+fn fixed_ebe_score_iov<const N: usize, const M: usize>(
+    sc: &Scoped,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    h: &DMatrix<f64>,
+    interaction: bool,
+) -> Option<(f64, Vec<f64>)> {
+    let (model, params, template) = (sc.model, sc.params, pt.template);
+    let theta = &params.theta;
+    let lay = sc.layout.as_ref();
+    let eta = &sc.eta[..];
+    let n_bsv = model.n_eta;
+    vtape_reset(N + 1);
+    let axis = theta_axis(model).or_else(|| endpoint_only(model).then_some(theta.len()))?;
+    let th = theta_leaves::<N, M, false>(axis, theta);
+    #[cfg(feature = "nn")]
+    let nn_out = nn_output_leaves::<N, M, false>(model, subject, template, theta);
+    #[cfg(feature = "nn")]
+    let lv = ThetaLeaves::with_nn(&th, nn_out.as_ref().map(|(_, z)| z.as_slice()));
+    #[cfg(not(feature = "nn"))]
+    let lv = ThetaLeaves::theta(&th);
+    let unit = unit_dirs::<N>();
+    // `run`'s recording type (its second-order payload unread here), so the IOV score adds no
+    // recorder instantiation of its own.
+    // On the heap: at the widest bucket the array is ~470 KB and its `from_fn` builder a
+    // second transient copy, which overflowed a 2 MB thread's stack (a direct, non-fit caller
+    // such as a test thread or the R session) once this frame had grown (#2482).
+    let et: Vec<DualV<N, M>> = (0..N)
+        .map(|k| DualV::free(eta[k], unit[k], [0.0; M]))
+        .collect();
+    let preds = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
+        Vec::new()
+    } else {
+        record(model, subject, lay, theta, eta, &lv, &et)?
+    };
+    let n_obs = preds.len();
+    if n_obs != subject.observations.len() {
+        return None;
+    }
+    // Non-Gaussian records: `(q, ∇q, ∇²q)` on the BSV block, production's conditional
+    // variance under either interaction setting (as `fixed_ebe_score`).
+    let ng = if subject.obs_records.is_empty() {
+        None
+    } else {
+        if n_bsv > N {
+            return None;
+        }
+        Some(non_gaussian_eta_jets2(
+            model,
+            subject,
+            theta,
+            &eta[..n_bsv],
+        )?)
+    };
+    let pop = if ng.is_none() && !interaction && model.error_spec.has_f_dependent_variance() {
+        let p0 = record(
+            sc.pop_model,
+            subject,
+            lay,
+            theta,
+            &[0.0; N],
+            &lv,
+            &[DualV::constant(0.0); N],
+        )?;
+        (p0.len() == n_obs).then_some(p0)?.into()
+    } else {
+        None
+    };
+    let ctx = LikCtx::new(model, subject, params);
+    let so = stacked_omega::<N>(model, subject, template, params, sc.width);
+    let mut pv = ParT::of(model, subject, params);
+    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
+
+    rtape_reset();
+    let fr: Vec<R> = preds.iter().map(|p| rinput(p.v)).collect();
+    let gr: Vec<[R; N]> = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| {
+            std::array::from_fn(|k| {
+                if k < n_bsv {
+                    R::c(h[(j, k)])
+                } else if k < sc.width {
+                    rinput(p.g[k])
+                } else {
+                    R::c(0.0)
+                }
+            })
+        })
+        .collect();
+    let pr0: Option<Vec<R>> = pop
+        .as_ref()
+        .map(|p0: &Vec<DualV<N, M>>| p0.iter().map(|p| rinput(p.v)).collect());
+    let er: [R; N] = std::array::from_fn(|k| R::c(eta[k]));
+    let (pr, om) = tape_params(model, subject, &pv, &so)?;
+    let ngr = ng.as_ref().map(|(q, g, hq)| {
+        ng_tape_inputs::<N>(&NgJets {
+            q: *q,
+            g: g.clone(),
+            h: (0..g.len())
+                .map(|k| (0..g.len()).map(|l| hq[(k, l)]).collect())
+                .collect(),
+            t: Vec::new(),
+        })
+    });
+    // Every node an adjoint is read at below is an input recorded above, so the sweep's
+    // adjoints are kept for that prefix only.
+    let n_in = crate::sens::rtape::rtape_len();
+    let fval = match ngr.as_ref() {
+        Some(ngr) => ng_f_grad(&ctx, &fr, &gr, &er, &pr, ngr, interaction)?.0,
+        None => objective::<R, N>(&ctx, interaction, &fr, &gr, &er, pr0.as_deref(), &pr)?.0,
+    };
+    // Copied: the non-Gaussian term's θ block records its own scalar tape below.
+    let sadj = rsweep::<1>(&[fval])[..n_in].to_vec();
+    let psi_of = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+    let ng_adj = ngr.as_ref().map(|ngr| ng_adjoints(ngr, n_bsv, psi_of));
+
+    let vadj = vadj_init::<1>();
+    let mut top = 0usize;
+    let mut seed = |node: u32, comp: usize, v: f64| {
+        if node != NONE && v != 0.0 {
+            top = top.max(node as usize + 1);
+            vadj[vadj_index::<N, 1>(node, comp, 0)] += v;
+        }
+    };
+    for (j, p) in preds.iter().enumerate() {
+        seed(p.i, 0, psi_of(fr[j]));
+        for k in n_bsv..sc.width {
+            seed(p.i, 1 + k, psi_of(gr[j][k]));
+        }
+    }
+    if let (Some(p0), Some(r0)) = (pop.as_ref(), pr0.as_ref()) {
+        for (p, &x) in p0.iter().zip(r0) {
+            seed(p.i, 0, psi_of(x));
+        }
+    }
+    let adj = vsweep::<N, 1>(top);
+    let at = |l: &DualV<N, M>| {
+        if l.i == NONE {
+            0.0
+        } else {
+            adj[vadj_index::<N, 1>(l.i, 0, 0)]
+        }
+    };
+    #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
+    let mut theta_adj: Vec<f64> = th.iter().map(at).collect();
+    #[cfg(feature = "nn")]
+    if let Some((red, z)) = &nn_out {
+        add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
+    }
+    if let Some((a_q, a_g, a_h)) = ng_adj {
+        let part = NgSeed {
+            eta: &eta[..n_bsv],
+            a_q,
+            a_g: &a_g,
+            a_h: &a_h,
+        };
+        let d = ng_theta_adjoint(model, subject, theta, &[part])?;
+        for (t, dv) in theta_adj.iter_mut().zip(d) {
+            *t += dv;
+        }
+    }
+    let grad = packed_gradient(
+        model,
+        template,
+        params,
+        pt.x.len(),
+        &theta_adj,
+        &psi_of,
+        &pr,
+        &om,
+        &so,
+        &pv,
+    );
+    let nll = fval.val();
+    (nll.is_finite() && grad.iter().all(|g| g.is_finite())).then_some((nll, grad))
 }
 
 fn adjoint_gradient(
@@ -390,6 +872,7 @@ fn adjoint_gradient(
     eta_hat: &[f64],
     objective: Objective,
     held: bool,
+    eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let (template, x) = (pt.template, pt.x);
     let mut sc = scope(model, subject, pt, eta_hat)?;
@@ -407,6 +890,10 @@ fn adjoint_gradient(
         }
         objective => objective,
     };
+    // Not inlined: every bucket's recording lives on the stack, and inlined together they
+    // made this dispatcher a 2.4 MB frame that every call — every subject, every width —
+    // probed page by page. Out of line, a call pays for its own width's frame only.
+    #[inline(never)]
     fn go<const N: usize, const M: usize>(
         sc: &Scoped,
         subject: &Subject,
@@ -414,11 +901,12 @@ fn adjoint_gradient(
         x: &[f64],
         objective: Objective,
         held: bool,
+        eta_dx: Option<&mut ModeOut>,
     ) -> Option<Vec<f64>>
     where
         Bucket<N, M>: ExactAnchor<N, M>,
     {
-        match objective {
+        let go_run = |eta_dx: Option<&mut ModeOut>| match objective {
             Objective::Agq { n_agq, exact } => run_agq::<N, M>(
                 sc.model,
                 subject,
@@ -431,6 +919,7 @@ fn adjoint_gradient(
                 exact,
                 sc.width,
                 held,
+                eta_dx,
             ),
             _ => run::<N, M>(
                 sc.model,
@@ -443,10 +932,37 @@ fn adjoint_gradient(
                 &sc.eta,
                 objective != Objective::Foce,
                 sc.width,
+                eta_dx,
             ),
+        };
+        match eta_dx {
+            None => go_run(None),
+            // The mode response shares the gradient's sweeps, and a lane that fails there (a
+            // non-finite row adjoint, say from a near-singular `H`) fails the whole pass. The
+            // gradient must not depend on whether the response was asked for, so a failed
+            // fused pass is re-run as the gradient alone, whose Ψ is the same arithmetic, and
+            // reports no response (#2549 review r2 #2).
+            Some(o) => match go_run(Some(&mut *o)) {
+                Some(g) => Some(g),
+                None if o.want_dx => {
+                    let mut lite = ModeOut {
+                        want_hessian: o.want_hessian,
+                        ..ModeOut::default()
+                    };
+                    let g = go_run(Some(&mut lite));
+                    o.eta_dx = None;
+                    o.hessian = lite.hessian;
+                    g
+                }
+                None => None,
+            },
         }
     }
-    by_bucket!(sc.bucket, go, (&sc, subject, template, x, objective, held))
+    by_bucket!(
+        sc.bucket,
+        go,
+        (&sc, subject, template, x, objective, held, eta_dx)
+    )
 }
 
 /// `H⁻¹b` for the mode system `H w = ∇_η F` (`H` the exact inner Hessian at `η̂`): a
@@ -458,8 +974,8 @@ fn adjoint_gradient(
 /// fit). `None` when `H` is singular or the solve is not finite.
 ///
 /// The indefinite branch also needs the stationarity the identity rests on: there `η̂` came
-/// from the inner search's fallback, which can stop short (Nelder–Mead, max-iter), and the
-/// gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
+/// from a certified or iteration-limited inner search, which need not be stationary in
+/// `‖g‖∞` (see [`MODE_STATIONARY_TOL`]), and the gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
 /// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review) — under AGQ to the held-EBE
 /// score ([`subject_adjoint_held_ebe_score_at`]), not the reconverged one.
 ///
@@ -519,9 +1035,26 @@ fn inner_search_gradient<const N: usize>(
     inner_grad(ctx, &f, &g, &e, pv, frozen)
 }
 
-/// The largest `|∇_η l(η̂)|` [`mode_solve`] treats as a stationary point on its indefinite
-/// branch: ten times the inner search's default gradient tolerance (`inner_tol = 1e-5`),
-/// which a certified fallback end point meets.
+/// The largest `|∇_η l(η̂)|∞` [`mode_solve`] treats as a stationary point on its indefinite
+/// branch: ten times the inner search's default gradient tolerance (`inner_tol = 1e-5`).
+///
+/// A gradient test of its own, **not** the inner search's certificate restated: a certified
+/// EBE can fail it (#2557). `FallbackCertifier`'s gradient arm (`‖g‖ < tol`) meets it at the
+/// default `inner_tol` in the raw metric, but not above `inner_tol = 1e-4`, and not under
+/// FREM's preconditioned stop (#406), whose posterior-variance weights (~1e-6 on the covariate
+/// pseudo-observation dimensions) admit a raw `|g|∞` near 1e-2. Its Newton-step arm
+/// (`‖H⁻¹g‖ < tol`) admits `|g|` up to `c·tol` along a direction of curvature `c`, and its
+/// resolution arm (`½gᵀH⁻¹g ≤ INNER_FTOL_REL·(1 + |f|)`) bounds no gradient. Measured under
+/// `inner_optimizer = nelder_mead`: a `one_cpt_infusion` EBE certified by the Newton arm at
+/// `‖g‖∞ = 0.18`, curvature ~3e4. The stall stop on a numerical objective bounds no gradient
+/// either. Such a point declines here, to the same route as any other decline.
+///
+/// Kept rather than widened to accept those arms. The bound the identity's error obeys at a
+/// certified point, `√(2·INNER_FTOL_REL·(1 + |f|))` SEs, rests on a positive definite `H`, and
+/// both Newton arms need the certifier's finite-difference Hessian to factor. A certified
+/// point that reaches this branch is one where that Hessian and the exact one disagree on
+/// definiteness: the case the bound says nothing about. `mode_solve` also does not know
+/// whether `η̂` was certified.
 const MODE_STATIONARY_TOL: f64 = 1e-4;
 
 /// The θ leaves of a recording (value leaves, no tangent) for each θ the parameter
@@ -697,12 +1230,14 @@ fn taped_params<T: VmNum>(
         &[]
     };
     let vals = prog.eval_params_g(theta, eta, cov, nn);
-    let mut by_slot = vec![None; n_slots];
-    for (&(slot, _), v) in prog.pk_var_slots().iter().zip(vals) {
+    let mut by_slot = crate::scratch::take_for_opt::<T>(n_slots);
+    by_slot.resize(n_slots, None);
+    for (&(slot, _), &v) in prog.pk_var_slots().iter().zip(vals.iter()) {
         if slot < n_slots {
             by_slot[slot] = Some(v);
         }
     }
+    crate::scratch::give_for(vals);
     by_slot
 }
 
@@ -754,7 +1289,7 @@ fn apply_expression_scale<T: VmNum>(
 
 /// ODE engine: the static superposition walk, or (time-varying covariates, lag times,
 /// steady state, modeled doses, `TIME`, resets) the event-driven walk, with `init(...)`
-/// on either through the shared Taylor seed.
+/// on either through the compiled init program (`init_seed`).
 fn record_ode<T: VmNum>(
     model: &CompiledModel,
     subject: &Subject,
@@ -778,7 +1313,7 @@ fn record_ode<T: VmNum>(
         let preds = match pk_space_predictions(model, subject, &pk, &by_slot, PkEngine::Ode) {
             Some(p) => p,
             None => {
-                let init_state = init_seed::<T>(ode, &params_dual, &model.pk_indices)
+                let init_state = init_seed::<T>(ode, &params_dual)
                     .unwrap_or_else(|| vec![T::from_f64(0.0); ode.n_states]);
                 integrate_seeded_duals(model, subject, &pk.values, &params_dual, &init_state)?
             }
@@ -843,7 +1378,7 @@ fn record_analytic<T: VmNum>(
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
     let preds = match pk_space_predictions(model, subject, &pk, &by_slot, PkEngine::ClosedForm) {
-        Some(preds) => preds,
+        Some(preds) => Some(preds),
         None => crate::sens::provider::analytic_static_predictions(
             model,
             subject,
@@ -851,8 +1386,10 @@ fn record_analytic<T: VmNum>(
             |slot| by_slot.get(slot).copied().flatten(),
             th,
             et,
-        )?,
+        ),
     };
+    crate::scratch::give_opt_for::<T>(by_slot);
+    let preds = preds?;
     closed_form_finish(model, subject, theta, eta, th, et, prog, preds)
 }
 
@@ -911,12 +1448,17 @@ fn pk_space_predictions<T: VmNum>(
     if !model.analytical_init.is_empty() {
         return None;
     }
+    let order = T::JET_ORDER;
+    // The order gate first: the inner loop's first-order recording (every η-gradient) never
+    // takes the lift, and used to build the live-slot list below only to discard it (#2549).
+    if !(2..=4).contains(&order) {
+        return None;
+    }
     let live: Vec<(usize, T)> = by_slot
         .iter()
         .enumerate()
         .filter_map(|(s, d)| d.map(|d| (s, d)))
         .collect();
-    let order = T::JET_ORDER;
     // A tape-free first-order recording (the inner loop's η-gradient) records nothing either
     // way, and runs the engine over about as many lanes: there the generic path is the
     // cheaper one. An order-2 type that carries no η-Hessian and meets no tape is one too.
@@ -965,12 +1507,23 @@ fn pk_space_predictions<T: VmNum>(
                     t.exps
                         .iter()
                         .map(|e| {
-                            let nz: Vec<usize> = (0..$p).filter(|&v| e[v] > 0).collect();
-                            match (e.iter().map(|&x| x as usize).sum::<usize>(), nz.as_slice()) {
+                            // The (at most two) variables the degree-≤2 monomial moves,
+                            // without a per-coefficient allocation.
+                            let mut nz = [usize::MAX; 2];
+                            let mut k = 0;
+                            for v in 0..$p {
+                                if e[v] > 0 {
+                                    if k < 2 {
+                                        nz[k] = v;
+                                    }
+                                    k += 1;
+                                }
+                            }
+                            match (e.iter().map(|&x| x as usize).sum::<usize>(), k) {
                                 (0, _) => q.v,
-                                (1, [i]) => q.g[*i],
-                                (2, [i]) => 0.5 * q.h[crate::sens::vtape::tri(*i, *i)],
-                                (2, [i, j]) => q.h[crate::sens::vtape::tri(*i, *j)],
+                                (1, 1) => q.g[nz[0]],
+                                (2, 1) => 0.5 * q.h[crate::sens::vtape::tri(nz[0], nz[0])],
+                                (2, 2) => q.h[crate::sens::vtape::tri(nz[0], nz[1])],
                                 _ => unreachable!("degree ≤ 2"),
                             }
                         })
@@ -989,11 +1542,9 @@ fn pk_space_predictions<T: VmNum>(
         (2, 8) => quad!(8, 36),
         (3, 2) => taylor!(2, 3),
         (3, 4) => taylor!(4, 3),
-        (3, 6) => taylor!(6, 3),
         (3, 8) => taylor!(8, 3),
         (4, 2) => taylor!(2, 4),
         (4, 4) => taylor!(4, 4),
-        (4, 6) => taylor!(6, 4),
         _ => None,
     }
 }
@@ -1015,8 +1566,10 @@ fn pk_space_work(order: usize, n: usize) -> Option<usize> {
 fn pk_space_bucket(order: usize, n: usize) -> Option<usize> {
     match (order, n) {
         (2, 1..=4) => Some(n),
-        (2, 5 | 6) | (3 | 4, 5 | 6) => Some(6),
-        (2 | 3, 7 | 8) => Some(8),
+        (2, 5 | 6) => Some(6),
+        // No 6-slot Taylor type: a third-order lift over 5–6 slots pads to 8, a fourth-order
+        // one keeps the generic recording (each Taylor width instantiates every engine).
+        (2, 7 | 8) | (3, 5..=8) => Some(8),
         (3 | 4, 1 | 2) => Some(2),
         (3 | 4, 3 | 4) => Some(4),
         _ => None,
@@ -1051,7 +1604,7 @@ fn pk_space_jets<J: VmNum>(
                 .enumerate()
                 .map(|(s, &v)| at(s).map_or(J::from_f64(v), |i| seed(i, v)))
                 .collect();
-            let init = crate::sens::ode_provider::init_seed::<J>(ode, &params, &model.pk_indices)
+            let init = crate::sens::ode_provider::init_seed::<J>(ode, &params)
                 .unwrap_or_else(|| vec![J::from_f64(0.0); ode.n_states]);
             crate::sens::ode_provider::integrate_seeded_duals(
                 model, subject, &pk.values, &params, &init,
@@ -1074,31 +1627,20 @@ fn lift_polynomial<T: VmNum>(
         .iter()
         .map(|&(_, d)| d - T::from_f64(d.val()))
         .collect();
-    let m = table.exps.len();
-    // `keep[k]`: monomial `k` reads only live directions.
-    let keep: Vec<bool> = table
-        .exps
-        .iter()
-        .map(|e| e.iter().skip(n).all(|&x| x == 0))
-        .collect();
-    let mut basis: Vec<T> = vec![T::from_f64(1.0); m];
-    for k in 1..m {
-        if keep[k] {
-            let (b, v) = table.parent[k];
-            basis[k] = if b == 0 {
-                dp[v as usize]
-            } else {
-                basis[b as usize] * dp[v as usize]
-            };
-        }
+    // The monomials of the live directions, built in place in compact order: a kept
+    // monomial's parent is kept and earlier (`Table::live`).
+    let lb = table.live(n);
+    let idx = &lb.idx;
+    let mut used: Vec<T> = Vec::with_capacity(idx.len());
+    for &(b, v) in &lb.parent {
+        let next = if b == 0 { dp[v] } else { used[b - 1] * dp[v] };
+        used.push(next);
     }
-    let idx: Vec<usize> = (1..m).filter(|&k| keep[k]).collect();
-    let used: Vec<T> = idx.iter().map(|&k| basis[k]).collect();
     let mut w = vec![0.0; idx.len()];
     coefs
         .iter()
         .map(|c| {
-            for (o, &k) in w.iter_mut().zip(&idx) {
+            for (o, &k) in w.iter_mut().zip(idx) {
                 *o = c[k];
             }
             if !(c[0].is_finite() && w.iter().all(|x| x.is_finite())) {
@@ -1285,20 +1827,33 @@ fn closed_form_finish<T: VmNum>(
             _ => return None,
         })
     };
-    let scales: Vec<Option<T>> = match &model.scaling {
-        ScalingSpec::PerCmt(map) => subject
-            .obs_cmts
-            .iter()
-            .map(|c| map.get(c).map_or(Some(None), &mut scale_of))
-            .collect::<Option<_>>()?,
-        spec => vec![scale_of(spec)?; preds.len()],
-    };
-    for (y, s) in preds.iter_mut().zip(scales) {
+    let apply = |y: &mut T, s: Option<T>| -> Option<()> {
         if let Some(s) = s {
             if !(s.val() > 0.0 && s.val().is_finite()) {
                 return None;
             }
             *y = *y / s;
+        }
+        Some(())
+    };
+    match &model.scaling {
+        ScalingSpec::PerCmt(map) => {
+            let scales: Vec<Option<T>> = subject
+                .obs_cmts
+                .iter()
+                .map(|c| map.get(c).map_or(Some(None), &mut scale_of))
+                .collect::<Option<_>>()?;
+            for (y, s) in preds.iter_mut().zip(scales) {
+                apply(y, s)?;
+            }
+        }
+        // One scale for every observation: applied directly, no per-observation copy
+        // (#2549 W1). The same divisions in the same order.
+        spec => {
+            let s = scale_of(spec)?;
+            for y in preds.iter_mut() {
+                apply(y, s)?;
+            }
         }
     }
     if model.log_transform {
@@ -1384,68 +1939,84 @@ fn record_analytic_events<T: VmNum>(
             .collect();
         (pk, full)
     };
+    // Every record's `$PK` inputs: doses, then observations, then PK-only rows.
+    let (n_dose, n_obs) = (subject.doses.len(), subject.obs_times.len());
+    let records = crate::pk::record_pk_inputs(subject);
+    let group = |occ: u32| layout.and_then(|l| l.group_of(occ));
     // With subject-static covariates and no `TIME` read, every record of one occasion
-    // group reads the same parameters: evaluate them once per group (the per-group
-    // sources `predict_iov` and the forward provider share) rather than per record.
+    // group reads the same parameters, so the index below shares by group alone: one
+    // evaluation per group, the per-group sources `predict_iov` and the forward provider
+    // share. Every type takes that sharing; only a taped type on a per-record subject
+    // declines the index.
     let per_record = subject.has_tv_covariates()
         || !subject.pk_only_covariates.is_empty()
         || !subject.reset_covariates.is_empty()
         || uses_time;
-    let mut shared: std::collections::HashMap<Option<usize>, (crate::types::PkParams, Vec<T>)> =
-        std::collections::HashMap::new();
-    let mut at_record = |occ: u32,
-                         cov: &std::collections::HashMap<String, f64>,
-                         time: f64|
-     -> (crate::types::PkParams, Vec<T>) {
-        if per_record {
-            return at(occ, cov, time);
-        }
-        let key = layout.and_then(|l| l.group_of(occ));
-        shared
-            .entry(key)
-            .or_insert_with(|| at(occ, cov, time))
-            .clone()
+    // `first[i]`: the record whose evaluation record `i` reuses (itself when none);
+    // `None` when every record is its own.
+    let first: Option<Vec<usize>> = if per_record && T::RECORDS_TAPE {
+        // A taped type evaluates every record of a time-varying subject. Reusing one
+        // evaluation is the same function but a different tape: the reverse sweep then
+        // sums the records' adjoints into one node before passing them on, and that
+        // reorders the floating-point sums, so the gradient moves in its last digits
+        // (measured: the objective by ~4e-14 relative). The untaped types (`f64`, the
+        // inner loop's `DualF`) have no tape, so they reuse. The per-group sharing of a
+        // static subject predates the index and is kept on every type.
+        None
+    } else {
+        crate::pk::first_record_with_same_pk_inputs(
+            model,
+            records.iter().map(|&(occ, cov, _)| (group(occ), cov)),
+        )
     };
-    let mut doses: Vec<_> = (0..subject.doses.len())
-        .map(|k| {
-            at_record(
-                crate::pk::dose_row_occasion(subject, k),
-                subject.dose_cov(k),
-                subject.dose_param_time(k),
-            )
-        })
-        .collect();
-    // An `ADDL`-implied dose's lag is its parent row's (#1909), value and dual alike:
-    // `inherit_parent_dose_attrs{,_g}` over the `(PkParams, Vec<T>)` pair, so the copies
-    // come from the same `parent_dose_attr_copies`.
-    for (k, p, slot) in crate::pk::parent_dose_attr_copies(model, subject) {
-        doses[k].0.values[slot] = doses[p].0.values[slot];
-        debug_assert!(
-            slot < doses[p].1.len() && slot < doses[k].1.len(),
-            "dual seed too short for parent-dose slot {slot}"
-        );
-        if slot < doses[p].1.len() && slot < doses[k].1.len() {
-            doses[k].1[slot] = doses[p].1[slot];
+    // The distinct evaluations, and which one each record reads. Reserved for one per
+    // record: a `PkParams` is 1 KiB, and growing into the vector re-copied every
+    // evaluation already made, about 2% of a FOCEI fit on a model whose records cannot
+    // share (#2543 review r1, row 3).
+    let mut snaps: Vec<(crate::types::PkParams, Vec<T>)> = Vec::with_capacity(records.len());
+    let mut snap_of: Vec<usize> = Vec::with_capacity(records.len());
+    for (i, &(occ, cov, time)) in records.iter().enumerate() {
+        match first.as_ref().map(|f| f[i]).filter(|&f| f != i) {
+            None => {
+                snap_of.push(snaps.len());
+                snaps.push(at(occ, cov, time));
+            }
+            Some(f) => snap_of.push(snap_of[f]),
         }
     }
-    let obs: Vec<_> = (0..subject.obs_times.len())
-        .map(|j| {
-            at_record(
-                subject.occasions.get(j).copied().unwrap_or(0),
-                subject.obs_cov(j),
-                subject.param_time_obs(j),
-            )
-        })
-        .collect();
-    let pk_only: Vec<_> = (0..subject.pk_only_times.len())
-        .map(|m| {
-            at_record(
-                crate::pk::pk_only_row_occasion(subject, m).unwrap_or(u32::MAX),
-                subject.pk_only_cov(m),
-                subject.param_time_pk_only(m),
-            )
-        })
-        .collect();
+    // An `ADDL`-implied dose's lag is its parent row's (#1909), value and dual alike:
+    // `inherit_parent_dose_attrs{,_g}` over the `(PkParams, Vec<T>)` pair, so the copies
+    // come from the same `parent_dose_attr_copies`. An implied dose whose evaluation other
+    // records read gets its own copy first, so they keep their lag.
+    let mut readers: Option<Vec<u32>> = None;
+    for (k, p, slot) in crate::pk::parent_dose_attr_copies(model, subject) {
+        if snap_of[k] == snap_of[p] {
+            continue;
+        }
+        let readers = readers.get_or_insert_with(|| {
+            let mut n = vec![0; snaps.len()];
+            snap_of.iter().for_each(|&s| n[s] += 1);
+            n
+        });
+        if readers[snap_of[k]] > 1 {
+            readers[snap_of[k]] -= 1;
+            snaps.push(snaps[snap_of[k]].clone());
+            readers.push(1);
+            snap_of[k] = snaps.len() - 1;
+        }
+        let (dk, dp) = (snap_of[k], snap_of[p]);
+        snaps[dk].0.values[slot] = snaps[dp].0.values[slot];
+        debug_assert!(
+            slot < snaps[dp].1.len() && slot < snaps[dk].1.len(),
+            "dual seed too short for parent-dose slot {slot}"
+        );
+        if slot < snaps[dp].1.len() && slot < snaps[dk].1.len() {
+            snaps[dk].1[slot] = snaps[dp].1[slot];
+        }
+    }
+    let doses = &snap_of[..n_dose];
+    let obs = &snap_of[n_dose..n_dose + n_obs];
+    let pk_only = &snap_of[n_dose + n_obs..];
     let dual = |p: &[T]| PkDual {
         cl: p[PK_IDX_CL],
         v: p[PK_IDX_V],
@@ -1456,14 +2027,20 @@ fn record_analytic_events<T: VmNum>(
         v3: p[PK_IDX_V3],
         f: p[PK_IDX_F],
     };
-    let dose_pk: Vec<crate::types::PkParams> = doses.iter().map(|(pk, _)| *pk).collect();
-    let at_dose: Vec<_> = doses.iter().map(|(_, p)| dual(p)).collect();
-    let at_obs: Vec<_> = obs.iter().map(|(_, p)| dual(p)).collect();
-    let at_pk_only: Vec<_> = pk_only.iter().map(|(_, p)| dual(p)).collect();
-    let slot_dual =
-        |k: usize, slot: usize| doses[k].1.get(slot).copied().unwrap_or(T::from_f64(0.0));
+    let dose_pk: Vec<crate::types::PkParams> = doses.iter().map(|&s| snaps[s].0).collect();
+    let at_dose: Vec<_> = doses.iter().map(|&s| dual(&snaps[s].1)).collect();
+    let at_obs: Vec<_> = obs.iter().map(|&s| dual(&snaps[s].1)).collect();
+    let at_pk_only: Vec<_> = pk_only.iter().map(|&s| dual(&snaps[s].1)).collect();
+    let slot_dual = |k: usize, slot: usize| {
+        snaps[doses[k]]
+            .1
+            .get(slot)
+            .copied()
+            .unwrap_or(T::from_f64(0.0))
+    };
     let obs_params = |j: usize| -> [T; crate::types::MAX_PK_PARAMS] {
-        std::array::from_fn(|s| obs[j].1.get(s).copied().unwrap_or(T::from_f64(0.0)))
+        let p = &snaps[obs[j]].1;
+        std::array::from_fn(|s| p.get(s).copied().unwrap_or(T::from_f64(0.0)))
     };
     let readout = model
         .analytic_readout
@@ -1498,7 +2075,8 @@ fn record_analytic_events<T: VmNum>(
             .zip(&pk0.values)
             .map(|(d, &v)| d.unwrap_or(T::from_f64(v)))
             .collect();
-        let decay: Option<Vec<Vec<T>>> = iov.then(|| obs.iter().map(|(_, p)| p.clone()).collect());
+        let decay: Option<Vec<Vec<T>>> =
+            iov.then(|| obs.iter().map(|&s| snaps[s].1.clone()).collect());
         pv::add_closed_form_init_g(
             model,
             subject,
@@ -1720,6 +2298,79 @@ fn objective<T: crate::sens::num::PkNum, const N: usize>(
     }
 }
 
+/// [`objective`] of a subject carrying non-Gaussian records: `F` is production's one form
+/// for both interaction settings (`focei_f_grad_ng`: conditional variance, `½·c̃ᵀc̃` under
+/// FOCEI only, the term folded in); `∇_η l` is the inner objective's the EBE is stationary
+/// for — under FOCE the frozen-variance one at `fpop` (#1722) — plus `∇q`.
+#[cfg(feature = "survival")]
+pub(super) fn objective_ng<T: crate::sens::num::PkNum, const N: usize>(
+    ctx: &LikCtx,
+    interaction: bool,
+    f: &[T],
+    g: &[[T; N]],
+    eta: &[T; N],
+    fpop: Option<&[T]>,
+    ng: &crate::sens::focei_kernel::NonGauss<T, N>,
+    p: &ParT<T>,
+) -> Option<(T, [T; N])> {
+    let (fv, lg) = ng_f_grad(ctx, f, g, eta, p, ng, interaction)?;
+    match fpop {
+        Some(f0) if !interaction => {
+            let mut frozen = inner_grad(ctx, f, g, eta, p, Some(f0))?;
+            for k in 0..N {
+                frozen[k] = frozen[k] + ng.g[k];
+            }
+            Some((fv, frozen))
+        }
+        _ => Some((fv, lg)),
+    }
+}
+
+/// Without the `survival` feature there are no non-Gaussian records, so no term: a stub, so a
+/// default build compiles none of the term's objective for any width.
+#[cfg(not(feature = "survival"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn objective_ng<T: crate::sens::num::PkNum, const N: usize>(
+    _: &LikCtx,
+    _: bool,
+    _: &[T],
+    _: &[[T; N]],
+    _: &[T; N],
+    _: Option<&[T]>,
+    _: &crate::sens::focei_kernel::NonGauss<T, N>,
+    _: &ParT<T>,
+) -> Option<(T, [T; N])> {
+    None
+}
+
+/// `focei_f_grad_ng` — production's objective with a non-Gaussian term — under `survival`, a
+/// stub (no term exists) without it.
+#[cfg(feature = "survival")]
+fn ng_f_grad<T: crate::sens::num::PkNum, const N: usize>(
+    ctx: &LikCtx,
+    f: &[T],
+    g: &[[T; N]],
+    eta: &[T; N],
+    p: &ParT<T>,
+    ng: &crate::sens::focei_kernel::NonGauss<T, N>,
+    interaction: bool,
+) -> Option<(T, [T; N])> {
+    crate::sens::focei_kernel::focei_f_grad_ng(ctx, f, g, eta, p, ng, interaction)
+}
+
+#[cfg(not(feature = "survival"))]
+fn ng_f_grad<T: crate::sens::num::PkNum, const N: usize>(
+    _: &LikCtx,
+    _: &[T],
+    _: &[[T; N]],
+    _: &[T; N],
+    _: &ParT<T>,
+    _: &crate::sens::focei_kernel::NonGauss<T, N>,
+    _: bool,
+) -> Option<(T, [T; N])> {
+    None
+}
+
 /// The canonical recording at `eta` (any engine the adjoint serves): per observation the
 /// prediction, its η-gradient and its packed η-Hessian, or `None` outside the recorders'
 /// scope. Shared by [`exact_eta_jacobian`] and [`exact_inner_hessian`].
@@ -1734,7 +2385,12 @@ fn canonical_jets<const N: usize, const M: usize>(
     // arithmetic (`M = 0`: `(f, ∂f/∂η)`; `M = N(N+1)/2`: with `∂²f/∂η²`).
     let th: Vec<DualV<N, M>> = theta.iter().map(|&v| DualV::constant(v)).collect();
     let unit = unit_dirs::<N>();
-    let et: [DualV<N, M>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], [0.0; M]));
+    // On the heap: at the widest bucket the array is ~470 KB and its `from_fn` builder a
+    // second transient copy, which overflowed a 2 MB thread's stack (a direct, non-fit caller
+    // such as a test thread or the R session) once this frame had grown (#2482).
+    let et: Vec<DualV<N, M>> = (0..N)
+        .map(|k| DualV::free(eta[k], unit[k], [0.0; M]))
+        .collect();
     record(
         model,
         subject,
@@ -1758,10 +2414,11 @@ fn canonical_jets1<const N: usize>(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<DualF<N, 0>>> {
-    let th: Vec<DualF<N, 0>> = theta.iter().map(|&v| DualF::constant(v)).collect();
+    let mut th: Vec<DualF<N, 0>> = crate::scratch::take_with_capacity(theta.len());
+    th.extend(theta.iter().map(|&v| DualF::constant(v)));
     let unit = unit_dirs::<N>();
     let et: [DualF<N, 0>; N] = std::array::from_fn(|k| DualF::free(eta[k], unit[k], []));
-    record(
+    let p = record(
         model,
         subject,
         lay,
@@ -1770,7 +2427,9 @@ fn canonical_jets1<const N: usize>(
         &ThetaLeaves::theta(&th),
         &et,
     )
-    .filter(|p| p.len() == subject.observations.len())
+    .filter(|p| p.len() == subject.observations.len());
+    crate::scratch::give(th);
+    p
 }
 
 /// The model the predictor would evaluate for this subject (a closed-form absorption model
@@ -1837,10 +2496,12 @@ fn resolve_basis<'m, 'l>(
         if eta.len() != model.n_eta {
             return None;
         }
+        let mut e = crate::scratch::take_with_capacity(eta.len());
+        e.extend_from_slice(eta);
         (
             crate::pk::effective_model_for_eval(model, subject, theta, eta),
             model.n_eta,
-            eta.to_vec(),
+            e,
             None,
         )
     };
@@ -1897,6 +2558,40 @@ fn expand_nested<T: Copy>(
     Some(Some((v, d)))
 }
 
+/// The predictions and their η-Jacobian from one recording — [`exact_eta_jacobian`] with
+/// the values it already computes.
+fn eta_values_and_jacobian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(Vec<f64>, DMatrix<f64>)> {
+    #[inline(never)]
+    fn go<const N: usize, const M: usize>(
+        model: &CompiledModel,
+        subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+        theta: &[f64],
+        eta: &[f64],
+        w: usize,
+    ) -> Option<(Vec<f64>, DMatrix<f64>)> {
+        let p = canonical_jets1::<N>(model, subject, lay, theta, eta)?;
+        Some((
+            p.iter().map(|q| q.v).collect(),
+            DMatrix::from_fn(p.len(), w, |j, k| p[j].g[k]),
+        ))
+    }
+    let (model, w, eta, lay) = resolve(model, subject, theta, eta, None)?;
+    if model.is_sde() {
+        return None;
+    }
+    by_bucket!(
+        eta.len(),
+        go,
+        (model, subject, lay.as_deref(), theta, &eta, w)
+    )
+}
+
 /// The exact `∂f/∂η` (`n_obs × width`, stacked `[η, κ]` under IOV) from one first-order
 /// recording — the analytic replacement for a finite-difference η-Jacobian wherever the
 /// recorders serve the subject.
@@ -1906,6 +2601,7 @@ pub(crate) fn exact_eta_jacobian(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<DMatrix<f64>> {
+    #[inline(never)]
     fn go<const N: usize, const M: usize>(
         model: &CompiledModel,
         subject: &Subject,
@@ -1926,6 +2622,79 @@ pub(crate) fn exact_eta_jacobian(
         go,
         (model, subject, lay.as_deref(), theta, &eta, w)
     )
+}
+
+/// [`exact_eta_jacobian`]'s κ columns alone (`n_obs × width`, the BSV η columns left zero):
+/// one first-order recording whose tangent lanes are the κ axes only — the BSV η enter as
+/// constants — for callers that already hold the η columns (the IOV linearisation, the
+/// importance-sampling proposal). `None` without IOV, or where [`exact_eta_jacobian`]
+/// declines.
+pub(crate) fn exact_kappa_jacobian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<DMatrix<f64>> {
+    #[inline(never)]
+    fn go<const NK: usize>(
+        model: &CompiledModel,
+        subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+        theta: &[f64],
+        eta: &[f64],
+        n_bsv: usize,
+        w: usize,
+    ) -> Option<DMatrix<f64>> {
+        let th: Vec<DualF<NK, 0>> = theta.iter().map(|&v| DualF::constant(v)).collect();
+        let et: Vec<DualF<NK, 0>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                let mut g = [0.0; NK];
+                if (n_bsv..w).contains(&k) {
+                    g[k - n_bsv] = 1.0;
+                }
+                DualF::free(v, g, [])
+            })
+            .collect();
+        let p = record(
+            model,
+            subject,
+            lay,
+            theta,
+            eta,
+            &ThetaLeaves::theta(&th),
+            &et,
+        )
+        .filter(|p| p.len() == subject.observations.len())?;
+        Some(DMatrix::from_fn(p.len(), w, |j, k| {
+            if k >= n_bsv {
+                p[j].g[k - n_bsv]
+            } else {
+                0.0
+            }
+        }))
+    }
+    if model.n_kappa == 0 {
+        return None;
+    }
+    let (rec, w, eta, lay) = resolve(model, subject, theta, eta, None)?;
+    if rec.is_sde() {
+        return None;
+    }
+    let n_bsv = rec.n_eta;
+    let lay = lay.as_deref();
+    match w.checked_sub(n_bsv)? {
+        0 => None,
+        1 => go::<1>(rec, subject, lay, theta, &eta, n_bsv, w),
+        2 => go::<2>(rec, subject, lay, theta, &eta, n_bsv, w),
+        3 | 4 => go::<4>(rec, subject, lay, theta, &eta, n_bsv, w),
+        5..=8 => go::<8>(rec, subject, lay, theta, &eta, n_bsv, w),
+        9..=16 => go::<16>(rec, subject, lay, theta, &eta, n_bsv, w),
+        17..=24 => go::<24>(rec, subject, lay, theta, &eta, n_bsv, w),
+        25..=48 => go::<48>(rec, subject, lay, theta, &eta, n_bsv, w),
+        _ => None,
+    }
 }
 
 /// Per observation `(f, ∂f/∂η)` at `eta` (the stacked `[η, κ]` under IOV) from one
@@ -1978,6 +2747,44 @@ pub(crate) fn fixed_eta_theta_adjoint(
     want_jac: bool,
     weights: &[f64],
 ) -> Option<FixedEtaTheta> {
+    let (mut rows, jac) = fixed_eta_theta_sweeps(model, subject, theta, eta, want_jac, |f| {
+        (weights.len() == f.len()).then(|| vec![weights.to_vec()])
+    })?;
+    let grad = rows.pop()?;
+    Some(FixedEtaTheta {
+        jac: jac.map(|j| j.into_iter().flatten().collect()),
+        grad,
+    })
+}
+
+/// `Σ_j w_j ∂f_j/∂θ_m` for each weight row `w` the caller computes from the predictions
+/// `f` at a fixed `eta`, for every θ coordinate (raw θ; a θ no recording reads has a zero
+/// derivative). One recording on the vector tape — θ as leaves, η as plain values — and one
+/// reverse sweep per (up to) eight rows, however many θ there are: the exact replacement for
+/// a difference quotient of the predictions in θ. `None` outside the recorders' scope, on a
+/// recording whose length is not the subject's observation count, when `weights`
+/// declines, or on a non-finite result.
+pub(crate) fn fixed_eta_theta_contractions(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    weights: impl FnOnce(&[f64]) -> Option<Vec<Vec<f64>>>,
+) -> Option<Vec<Vec<f64>>> {
+    fixed_eta_theta_sweeps(model, subject, theta, eta, false, weights).map(|(rows, _)| rows)
+}
+
+/// The recording behind [`fixed_eta_theta_contractions`] and [`fixed_eta_theta_adjoint`]: the
+/// weight rows' contractions and, with `want_jac`, every `∂f_j/∂θ` row, each observation
+/// seeded by index on its own lane.
+fn fixed_eta_theta_sweeps(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    want_jac: bool,
+    weights: impl FnOnce(&[f64]) -> Option<Vec<Vec<f64>>>,
+) -> Option<(Vec<Vec<f64>>, Option<Vec<Vec<f64>>>)> {
     // One inert tangent: η is fixed, so no η-direction is carried.
     type T = DualV<1, 0>;
     if !recorder_in_scope(model) {
@@ -2017,63 +2824,397 @@ pub(crate) fn fixed_eta_theta_adjoint(
             fc.fremtype_to_indices.get(ft).map(|&(ti, _)| ti)
         })
         .collect();
-    if weights.len() != n_obs {
+    let f: Vec<f64> = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| match (frem[j], model.frem_config.as_ref()) {
+            (Some(ti), Some(fc)) => {
+                let ei = fc.fremtype_to_indices[&subject.fremtype[j]].1;
+                theta.get(ti).copied().unwrap_or(0.0) + eta.get(ei).copied().unwrap_or(0.0)
+            }
+            _ => p.v,
+        })
+        .collect();
+    let rows = weights(&f)?;
+    if rows.iter().any(|w| w.len() != n_obs) {
         return None;
     }
-    let w = weights;
-    let top = preds
-        .iter()
-        .filter(|p| p.i != NONE)
-        .map(|p| p.i as usize + 1)
-        .max()
-        .unwrap_or(0);
-    let adj = vadj_init::<1>();
-    for ((p, &wj), fr) in preds.iter().zip(w).zip(&frem) {
-        if p.i != NONE && fr.is_none() {
-            adj[vadj_index::<1, 1>(p.i, 0, 0)] += wj;
-        }
-    }
-    let a = vsweep::<1, 1>(top);
-    let at = |a: &[f64], l: &T, lane: usize, lanes: usize| -> f64 {
-        if l.i == NONE {
-            0.0
-        } else {
-            a[(l.i as usize * 2) * lanes + lane]
-        }
+    let sweeps = ThetaSweeps {
+        preds: &preds,
+        frem: &frem,
+        th: &th,
+        n_theta: theta.len(),
     };
-    let mut grad: Vec<f64> = th.iter().map(|l| at(a, l, 0, 1)).collect();
-    for (fr, &wj) in frem.iter().zip(w) {
-        if let Some(g) = fr.and_then(|ti| grad.get_mut(ti)) {
-            *g += wj;
+    let dense = sweeps.run(rows.len(), &|r, put| {
+        for (j, &w) in rows[r].iter().enumerate() {
+            if w != 0.0 {
+                put(j, w);
+            }
         }
+    });
+    let jac = want_jac.then(|| sweeps.run(n_obs, &|j, put| put(j, 1.0)));
+    let finite = |x: &Vec<Vec<f64>>| x.iter().flatten().all(|v| v.is_finite());
+    (finite(&dense) && jac.as_ref().is_none_or(finite)).then_some((dense, jac))
+}
+
+/// Reverse sweeps over one θ-leaf recording of the predictions: row `r`'s seeds are the
+/// `(observation, weight)` pairs `seeds(r, put)` emits, its result `Σ w_j ∂f_j/∂θ` over raw θ.
+/// Rows are swept in lanes sized to what is left (8, then 4, 2, 1), so one row costs one
+/// single-lane sweep.
+struct ThetaSweeps<'a> {
+    preds: &'a [DualV<1, 0>],
+    frem: &'a [Option<usize>],
+    th: &'a [DualV<1, 0>],
+    n_theta: usize,
+}
+
+type RowSeeds<'s> = dyn Fn(usize, &mut dyn FnMut(usize, f64)) + 's;
+
+impl ThetaSweeps<'_> {
+    fn run(&self, n_rows: usize, seeds: &RowSeeds<'_>) -> Vec<Vec<f64>> {
+        let mut out = Vec::with_capacity(n_rows);
+        let mut r0 = 0;
+        while r0 < n_rows {
+            let left = n_rows - r0;
+            match left {
+                1 => self.chunk::<1>(r0, 1, seeds, &mut out),
+                2 => self.chunk::<2>(r0, 2, seeds, &mut out),
+                3 | 4 => self.chunk::<4>(r0, left, seeds, &mut out),
+                _ => self.chunk::<8>(r0, left.min(8), seeds, &mut out),
+            }
+            r0 += left.min(8);
+        }
+        out
     }
-    let jac = want_jac.then(|| {
-        const L: usize = 8;
-        let n_theta = th.len();
-        let mut jac = vec![0.0; n_obs * n_theta];
-        for chunk in (0..n_obs).collect::<Vec<_>>().chunks(L) {
-            let adj = vadj_init::<L>();
-            let mut top = 0;
-            for (lane, &j) in chunk.iter().enumerate() {
-                let p = &preds[j];
-                if p.i != NONE && frem[j].is_none() {
-                    adj[vadj_index::<1, L>(p.i, 0, lane)] = 1.0;
+
+    fn chunk<const L: usize>(
+        &self,
+        r0: usize,
+        n: usize,
+        seeds: &RowSeeds<'_>,
+        out: &mut Vec<Vec<f64>>,
+    ) {
+        let adj = vadj_init::<L>();
+        let mut top = 0;
+        for lane in 0..n {
+            seeds(r0 + lane, &mut |j, w| {
+                let p = &self.preds[j];
+                if p.i != NONE && self.frem[j].is_none() {
+                    adj[vadj_index::<1, L>(p.i, 0, lane)] += w;
                     top = top.max(p.i as usize + 1);
                 }
-            }
-            let a = vsweep::<1, L>(top);
-            for (lane, &j) in chunk.iter().enumerate() {
-                for (m, l) in th.iter().enumerate() {
-                    jac[j * n_theta + m] = match frem[j] {
-                        Some(ti) => (m == ti) as u8 as f64,
-                        None => at(a, l, lane, L),
-                    };
+            });
+        }
+        let a = vsweep::<1, L>(top);
+        for lane in 0..n {
+            let mut g: Vec<f64> = (0..self.n_theta)
+                .map(|m| {
+                    self.th
+                        .get(m)
+                        .filter(|l| l.i != NONE)
+                        .map_or(0.0, |l| a[(l.i as usize * 2) * L + lane])
+                })
+                .collect();
+            seeds(r0 + lane, &mut |j, w| {
+                if let Some(gm) = self.frem[j].and_then(|ti| g.get_mut(ti)) {
+                    *gm += w;
                 }
+            });
+            out.push(g);
+        }
+    }
+}
+
+/// Whether the dual hazard walk ([`ode_states_at_g`], [`cumhaz_hazard_from_states`]) serves
+/// `subject`: a compiled RHS and parameter program,
+/// absorption forcings the dual walk lifts, and the static walk's scope (no time-varying
+/// covariates, resets, lag or steady-state dose — the static walk has no run-in, and routing
+/// the term's many number types through the event walk's would multiply its code by theirs).
+/// The routing predicates ask this, so a subject the walk declines is reported on FD rather
+/// than labelled analytic.
+#[cfg(feature = "survival")]
+pub(crate) fn ode_hazard_walk_in_scope(model: &CompiledModel, subject: &Subject) -> bool {
+    let Some(ode) = model.ode_spec.as_ref() else {
+        return false;
+    };
+    ode.rhs_program.is_some()
+        && ode.indiv_param_program.is_some()
+        && ode.input_rate.iter().all(|f| f.kind.supported_over_dual())
+        && !subject.has_ss_doses()
+        && static_walk_subject_supported(model, subject)
+}
+
+/// `H(t) = u[chz_state]` and `h(t) = u̇[chz_state]` at `times` from a solve saved there
+/// ([`ode_states_at_g`]): `h` is the RHS at the saved state, read at the value path's clock
+/// anchors (`TAFD` from the first dose record, `TAD` from the last arrival by `t` — the walk's
+/// scope has no compartment lag, so the arrivals are the records).
+#[cfg(feature = "survival")]
+pub(crate) fn cumhaz_hazard_from_states<T: VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    chz_state: usize,
+    times: &[f64],
+    solved: &DualStates<T>,
+) -> Option<(Vec<T>, Vec<T>)> {
+    let ode = model.ode_spec.as_ref()?;
+    let program = ode.rhs_program.as_ref()?;
+    if solved.states.len() != times.len() {
+        return None;
+    }
+    let mut du = vec![T::from_f64(0.0); ode.n_states];
+    let (mut vars, mut stack) = (Vec::new(), Vec::new());
+    let mut cum = Vec::with_capacity(times.len());
+    let mut haz = Vec::with_capacity(times.len());
+    for (st, &t) in solved.states.iter().zip(times) {
+        cum.push(st[chz_state]);
+        let tad_anchor = crate::ode::predictions::tad_anchor_for(&subject.doses, &[], t);
+        super::eval_rhs_anchored::<T>(
+            program,
+            st,
+            &solved.params,
+            t,
+            solved.first_dose_time,
+            T::from_f64(tad_anchor),
+            &mut du,
+            &mut vars,
+            &mut stack,
+        );
+        haz.push(du[chz_state]);
+    }
+    Some((cum, haz))
+}
+
+/// [`ode_states_at_g`]'s result: the ODE state at each requested time, with the parameter
+/// vector and first-dose time the solve ran under.
+#[cfg(feature = "survival")]
+pub(crate) struct DualStates<T> {
+    pub(crate) states: Vec<Vec<T>>,
+    pub(crate) params: Vec<T>,
+    pub(crate) first_dose_time: f64,
+}
+
+/// The subject's ODE state at `times` (sorted, non-decreasing) on any VM number type: the
+/// static dual walk (`integrate_g`) saving at `times` instead of the observations — what a
+/// state-driven endpoint (an ODE-accumulated hazard, a drug-driven CTMM intensity) reads.
+/// `None` outside [`ode_hazard_walk_in_scope`], under a compartment lag, or when the walk
+/// does not return one state per time.
+#[cfg(feature = "survival")]
+pub(crate) fn ode_states_at_g<T: VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[T],
+    eta: &[T],
+    times: &[f64],
+) -> Option<DualStates<T>> {
+    let ode = model.ode_spec.as_ref()?;
+    let program = ode.rhs_program.as_ref()?;
+    let prog = ode.indiv_param_program.as_ref()?;
+    if !ode_hazard_walk_in_scope(model, subject) || times.is_empty() {
+        return None;
+    }
+    let eta_v: Vec<f64> = eta.iter().map(|e| e.val()).collect();
+    let theta_v: Vec<f64> = theta.iter().map(|t| t.val()).collect();
+    let pk = (model.pk_param_fn)(&theta_v, &eta_v, &subject.covariates, 0.0);
+    if pk.values[crate::types::PK_IDX_LAGTIME].abs() > 1e-12 {
+        return None;
+    }
+    let by_slot = taped_params(
+        model,
+        prog,
+        pk.values.len(),
+        &ThetaLeaves::theta(theta),
+        eta,
+        &subject.covariates,
+    );
+    let params: Vec<T> = by_slot
+        .iter()
+        .zip(&pk.values)
+        .map(|(d, &v)| d.unwrap_or(T::from_f64(v)))
+        .collect();
+    let init =
+        super::init_seed::<T>(ode, &params).unwrap_or_else(|| vec![T::from_f64(0.0); ode.n_states]);
+    let dose_f_bio: Vec<T> = subject
+        .doses
+        .iter()
+        .map(|d| params[super::f_bio_slot(ode, d.cmt_raw())])
+        .collect();
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    let forcings = super::PreparedForcings::shared(ode, &params, super::prepare_dual_forcing::<T>);
+    // The walks save at the requested times rather than the subject's observations.
+    let states = super::integrate_g::<T>(
+        program,
+        ode.n_states,
+        subject,
+        times,
+        ode,
+        &forcings,
+        &params,
+        &dose_f_bio,
+        &init,
+        first_dose_time,
+        &ode.effective_solver_opts(),
+    )?;
+    // A non-finite state declines: the static walk anchors `TAD` by a fold over the doses
+    // at or before each segment, so a hazard reading it before the first dose integrates a
+    // `NaN` the value path (anchored at the first arrival) does not.
+    (states.len() == times.len() && states.iter().flatten().all(|v| v.val().is_finite())).then_some(
+        DualStates {
+            states,
+            params,
+            first_dose_time,
+        },
+    )
+}
+
+/// The fixed-η data objective `½·data_l` — `−log p(y | f(θ, η))` up to its constant, the
+/// conditional NLL SAEM's M-step and VI score at a draw `η` — with its exact gradient in
+/// raw θ and raw σ. The analytic kernel's data term on the scalar tape (σ as leaves, the
+/// serial ρ as a leaf on its θ, θ itself where the likelihood reads it directly: FREM rows
+/// and a residual magnitude), one sweep for its adjoints in the predictions and the
+/// parameters, and the predictions' θ-derivatives contracted with them by one recording and
+/// one reverse sweep ([`fixed_eta_theta_contractions`]). M3 censoring, a dense or serial
+/// residual and FREM rows are scored by construction; a subject's TTE, binary and CTMM records
+/// add their own term's exact θ-gradient ([`non_gaussian_theta_score`]). `eta` is the
+/// recordings' vector (the stacked `[η, κ…]` under IOV). `None` outside the recorders' or the
+/// kernel's scope, or on a non-finite result.
+pub(crate) fn fixed_eta_data_score(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>, Vec<f64>)> {
+    if subject.obs_records.is_empty() {
+        return gaussian_fixed_eta_data_score(model, subject, theta, sigma, eta);
+    }
+    // A subject with non-Gaussian records: its Gaussian rows by the kernel, plus the
+    // records' own term over the BSV η, each exact.
+    let (q, dq) = non_gaussian_theta_score(model, subject, theta, eta.get(..model.n_eta)?)?;
+    let (v, mut d_theta, d_sigma) = if subject.observations.is_empty() {
+        (0.0, vec![0.0; theta.len()], vec![0.0; sigma.len()])
+    } else {
+        gaussian_fixed_eta_data_score(model, subject, theta, sigma, eta)?
+    };
+    for (d, e) in d_theta.iter_mut().zip(&dq) {
+        *d += e;
+    }
+    Some((v + q, d_theta, d_sigma))
+}
+
+/// [`fixed_eta_data_score`]'s Gaussian (and M3) rows: the kernel's data term only.
+fn gaussian_fixed_eta_data_score(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>, Vec<f64>)> {
+    if model.n_eta > MAX_WIDTH || model.is_sde() {
+        return None;
+    }
+    let mut params = model.default_params.clone();
+    params.theta = theta.to_vec();
+    params.sigma.values = sigma.to_vec();
+    params.residual_correlations = model.residual_correlations.clone();
+    let n_obs = subject.observations.len();
+    let ctx = LikCtx::new(model, subject, &params);
+    let pv = ParT::of(model, subject, &params);
+    // The data term on the scalar tape, scored inside the recording's weights callback on
+    // its own prediction values: one recording gives the value and the θ-derivatives.
+    let scored: std::cell::RefCell<Option<(f64, Vec<f64>, Vec<f64>)>> = Default::default();
+    let d_theta_f = fixed_eta_theta_contractions(model, subject, theta, eta, |f| {
+        rtape_reset();
+        let mut pr: ParT<R> = pv.map(R::c);
+        pr.sigma = pv.sigma.iter().map(|&x| rinput(x)).collect();
+        pr.serial_rho = pv.serial_rho.map(rinput);
+        if theta_read_directly(model) {
+            pr.theta = pv.theta.iter().map(|&x| rinput(x)).collect();
+        }
+        pr.ruv_mult = match model.ruv_magnitude.as_ref().filter(|rm| rm.is_active()) {
+            Some(rm) => Some(
+                (0..n_obs)
+                    .map(|j| {
+                        rm.eval_obs_g(
+                            &pr.theta,
+                            subject.obs_cov(j),
+                            subject.readout_time(j),
+                            rm.tad_for(subject, j),
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            None => None,
+        };
+        let fr: Vec<R> = f.iter().map(|&v| rinput(v)).collect();
+        let er: Vec<R> = eta.iter().map(|&v| R::c(v)).collect();
+        let nll = R::c(0.5) * data_l(&ctx, &fr, &er, &pr, None)?;
+        let sadj = rsweep::<1>(&[nll]);
+        let adj = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+        // θ read directly (FREM rows, a residual magnitude), and the serial ρ's θ.
+        let mut d_direct: Vec<f64> = pr.theta.iter().map(|&t| adj(t)).collect();
+        if let (Some(sr), Some(rs)) = (pr.serial_rho, model.residual_serial.as_ref()) {
+            if let Some(d) = d_direct.get_mut(rs.rho_theta) {
+                *d += adj(sr);
             }
         }
-        jac
-    });
-    Some(FixedEtaTheta { grad, jac })
+        let d_sigma: Vec<f64> = pr.sigma.iter().map(|&x| adj(x)).collect();
+        let wf: Vec<f64> = fr.iter().map(|&x| adj(x)).collect();
+        *scored.borrow_mut() = Some((nll.val(), d_direct, d_sigma));
+        Some(vec![wf])
+    })?
+    .pop()?;
+    let (v, d_direct, d_sigma) = scored.into_inner()?;
+    let mut d_theta = d_theta_f;
+    for (d, e) in d_theta.iter_mut().zip(&d_direct) {
+        *d += e;
+    }
+    (v.is_finite() && d_theta.iter().chain(&d_sigma).all(|g| g.is_finite()))
+        .then_some((v, d_theta, d_sigma))
+}
+
+/// `∂(½·data_l)/∂η` at fixed θ and σ — the gradient of the conditional data NLL
+/// `−log p(y | f(θ, η))` in the random effects (the stacked `[η, κ…]` under IOV), which VI
+/// differences its ELBO's data term by. The predictions' η-Jacobian is the inner search's
+/// own recording ([`exact_eta_jacobian`]); the kernel's data term on the scalar tape gives
+/// its adjoints in the predictions and in η itself (a residual-error η's scale, FREM rows),
+/// so M3 censoring and a dense or serial residual are scored by construction. `None`
+/// outside the recorders' or the kernel's scope, or on a non-finite result.
+pub(crate) fn fixed_theta_data_eta_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta: &[f64],
+) -> Option<Vec<f64>> {
+    if !likelihood_supported(model, subject, &model.default_params) {
+        return None;
+    }
+    let mut params = model.default_params.clone();
+    params.theta = theta.to_vec();
+    params.sigma.values = sigma.to_vec();
+    params.residual_correlations = model.residual_correlations.clone();
+    let n_obs = subject.observations.len();
+    // One recording: the predictions' values and their η-Jacobian.
+    let (f, jac) = eta_values_and_jacobian(model, subject, theta, eta)?;
+    if f.len() != n_obs || jac.nrows() != n_obs || jac.ncols() != eta.len() {
+        return None;
+    }
+    let ctx = LikCtx::new(model, subject, &params);
+    let pr: ParT<R> = ParT::of(model, subject, &params).map(R::c);
+    rtape_reset();
+    let fr: Vec<R> = f.iter().map(|&v| rinput(v)).collect();
+    let er: Vec<R> = eta.iter().map(|&v| rinput(v)).collect();
+    let data = data_l(&ctx, &fr, &er, &pr, None)?;
+    let sadj = rsweep::<1>(&[R::c(0.5) * data]);
+    let adj = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+    let g: Vec<f64> = (0..eta.len())
+        .map(|k| adj(er[k]) + (0..n_obs).map(|j| adj(fr[j]) * jac[(j, k)]).sum::<f64>())
+        .collect();
+    g.iter().all(|v| v.is_finite()).then_some(g)
 }
 
 /// [`exact_obs_grads`] into `rows`, reusing its allocations (the inner loop calls this
@@ -2087,6 +3228,7 @@ pub(crate) fn exact_obs_grads_into(
     eta: &[f64],
     rows: &mut Vec<crate::sens::provider::ObsGrad>,
 ) -> bool {
+    #[inline(never)]
     fn go<const N: usize, const M: usize>(
         model: &CompiledModel,
         subject: &Subject,
@@ -2101,15 +3243,18 @@ pub(crate) fn exact_obs_grads_into(
             f: 0.0,
             df_deta: Vec::new(),
         });
+        let mut finite = true;
         for (row, q) in rows.iter_mut().zip(&p) {
             if !(q.v.is_finite() && q.g.iter().all(|v| v.is_finite())) {
-                return None;
+                finite = false;
+                break;
             }
             row.f = q.v;
             row.df_deta.clear();
             row.df_deta.extend_from_slice(&q.g[..w]);
         }
-        Some(())
+        crate::scratch::give(p);
+        finite.then_some(())
     }
     let Some((model, w, eta_p, lay)) = resolve(model, subject, theta, eta, layout) else {
         return false;
@@ -2117,13 +3262,14 @@ pub(crate) fn exact_obs_grads_into(
     if model.is_sde() {
         return false;
     }
-    if by_bucket!(
+    let served = by_bucket!(
         eta_p.len(),
         go,
         (model, subject, lay.as_deref(), theta, &eta_p, w, rows)
     )
-    .is_none()
-    {
+    .is_some();
+    crate::scratch::give(eta_p);
+    if !served {
         return false;
     }
     // A FREM covariate pseudo-observation predicts `θ_i + η_e`, with `∂f/∂η = e_e`.
@@ -2147,6 +3293,14 @@ pub(crate) fn exact_obs_grads_into(
     true
 }
 
+/// IOV scores FREM rows by a sentinel, not the kernel's `l`, so the kernel's exact inner
+/// Hessian is not that subject's (as `exact_htilde` and `exact_inner_gradient_in` decline).
+/// The one decline of [`exact_inner_hessian`] that a quadrature gradient pass does not
+/// share, so that pass hands back no Hessian there either (#2585 review #4).
+fn iov_frem_mismatch(model: &CompiledModel, subject: &Subject) -> bool {
+    model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0)
+}
+
 /// The exact conditional Hessian `∇²_η l` at `eta`: the kernel's `l` over a second-order
 /// η-dual whose predictions carry `(f, G, Q)` from one canonical recording. The analytic
 /// replacement for a finite-difference posterior Hessian.
@@ -2156,6 +3310,7 @@ pub(crate) fn exact_inner_hessian(
     params: &ModelParameters,
     eta: &[f64],
 ) -> Option<DMatrix<f64>> {
+    #[inline(never)]
     fn go<const N: usize, const M: usize>(
         model: &CompiledModel,
         subject: &Subject,
@@ -2164,7 +3319,12 @@ pub(crate) fn exact_inner_hessian(
         eta: &[f64],
         w: usize,
     ) -> Option<DMatrix<f64>> {
-        let p = canonical_jets::<N, M>(model, subject, lay, &params.theta, eta)?;
+        // An endpoint-only subject has no Gaussian rows to record.
+        let p = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
+            Vec::new()
+        } else {
+            canonical_jets::<N, M>(model, subject, lay, &params.theta, eta)?
+        };
         let ctx = LikCtx::new(model, subject, params);
         let mut pv = ParT::of(model, subject, params);
         pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
@@ -2180,27 +3340,85 @@ pub(crate) fn exact_inner_hessian(
         h.iter().all(|v| v.is_finite()).then_some(h)
     }
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
-    // IOV scores FREM rows by a sentinel, not the kernel's `l` (as `exact_htilde` and
-    // `exact_inner_gradient_in` decline).
-    let iov_mismatch = model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0);
-    if iov_mismatch || !likelihood_supported(model, subject, params) {
+    if iov_frem_mismatch(&model, subject) {
         return None;
     }
-    by_bucket!(
+    // A subject's non-Gaussian records add their term's exact η-Hessian.
+    let ng = if subject.obs_records.is_empty() {
+        if !likelihood_supported(model, subject, params) {
+            return None;
+        }
+        None
+    } else {
+        if !non_gaussian_terms_supported(model, subject) {
+            return None;
+        }
+        Some(non_gaussian_eta_hessian(
+            model,
+            subject,
+            &params.theta,
+            &eta[..model.n_eta],
+        )?)
+    };
+    let mut h = by_bucket!(
         eta.len(),
         go,
         (model, subject, lay.as_deref(), params, &eta, w)
-    )
+    )?;
+    if let Some(q) = ng {
+        let n = q.nrows();
+        let mut blk = h.view_mut((0, 0), (n, n));
+        blk += q;
+    }
+    Some(h)
+}
+
+/// Whether the adjoint's kernels serve a subject's non-Gaussian records: every one has an
+/// exact channel (`inner_optimizer::non_gaussian_eta_grad_served`), and the model has no SDE
+/// and at most [`WIDTH_BUCKETS`]' widest random effects. The terms read BSV η only, so under
+/// IOV they occupy the leading block of the stacked `[η, κ]`.
+fn non_gaussian_terms_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    model.n_eta <= WIDTH_BUCKETS[WIDTH_BUCKETS.len() - 1]
+        && !model.is_sde()
+        && crate::estimation::inner_optimizer::non_gaussian_eta_grad_served(model, subject)
+}
+
+/// [`crate::survival::non_gaussian_eta_hessian`], `None` without the `survival` feature.
+fn non_gaussian_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<DMatrix<f64>> {
+    non_gaussian_eta_jets2(model, subject, theta, eta).map(|(_, _, h)| h)
+}
+
+/// [`crate::survival::non_gaussian_eta_jets2`], `None` without the `survival` feature.
+fn non_gaussian_eta_jets2(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>, DMatrix<f64>)> {
+    #[cfg(feature = "survival")]
+    return crate::survival::non_gaussian_eta_jets2(model, subject, theta, eta);
+    #[cfg(not(feature = "survival"))]
+    {
+        let _ = (model, subject, theta, eta);
+        None
+    }
 }
 
 /// FOCEI's Gauss–Newton `H̃` at `eta` (the stacked `[η, κ]` under IOV), the kernel's on
-/// one tape-free first-order recording: the AGQ grid's `H̃` anchor.
+/// one tape-free first-order recording, plus a subject's non-Gaussian term's exact
+/// η-Hessian over the BSV block: the AGQ grid's `H̃` anchor.
 pub(crate) fn exact_htilde(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
     eta: &[f64],
 ) -> Option<DMatrix<f64>> {
+    #[inline(never)]
     fn go<const N: usize, const M: usize>(
         model: &CompiledModel,
         subject: &Subject,
@@ -2209,7 +3427,12 @@ pub(crate) fn exact_htilde(
         eta: &[f64],
         w: usize,
     ) -> Option<DMatrix<f64>> {
-        let p = canonical_jets1::<N>(model, subject, lay, &params.theta, eta)?;
+        // An endpoint-only subject has no Gaussian rows to record.
+        let p = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
+            Vec::new()
+        } else {
+            canonical_jets1::<N>(model, subject, lay, &params.theta, eta)?
+        };
         let ctx = LikCtx::new(model, subject, params);
         let mut pv = ParT::of(model, subject, params);
         pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
@@ -2225,14 +3448,38 @@ pub(crate) fn exact_htilde(
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
     // IOV scores FREM rows by a sentinel, not the kernel's `l`.
     let iov_mismatch = model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0);
-    if iov_mismatch || !likelihood_supported(model, subject, params) {
+    if iov_mismatch {
         return None;
     }
-    by_bucket!(
+    // A subject's non-Gaussian records add their term's exact η-Hessian, as FOCEI's own
+    // objective adds it to `H̃` (`foce_subject_nll_cov_split`).
+    let ng = if subject.obs_records.is_empty() {
+        if !likelihood_supported(model, subject, params) {
+            return None;
+        }
+        None
+    } else {
+        if !non_gaussian_terms_supported(model, subject) {
+            return None;
+        }
+        Some(non_gaussian_eta_hessian(
+            model,
+            subject,
+            &params.theta,
+            &eta[..model.n_eta],
+        )?)
+    };
+    let mut h = by_bucket!(
         eta.len(),
         go,
         (model, subject, lay.as_deref(), params, &eta, w)
-    )
+    )?;
+    if let Some(q) = ng {
+        let n = q.nrows();
+        let mut blk = h.view_mut((0, 0), (n, n));
+        blk += q;
+    }
+    Some(h)
 }
 
 /// The exact inner gradient `∇_η l` at `eta` (the stacked `[η, κ]` under IOV): the
@@ -2259,6 +3506,7 @@ pub(crate) fn exact_inner_gradient_in(
     eta: &[f64],
     frozen: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
+    #[inline(never)]
     fn go<const N: usize, const M: usize>(
         model: &CompiledModel,
         subject: &Subject,
@@ -2498,6 +3746,423 @@ fn packed_gradient(
     out
 }
 
+/// A subject's non-Gaussian term at `η` (θ fixed) with its η-derivatives to third order —
+/// what the FOCE/FOCEI adjoint needs of it: `q`, `∇q` and `∇²q` enter the objective, and
+/// their η-derivatives (`∇²q`, `∇³q`) the mode system `H w = ∇_η F`. From one evaluation on
+/// a third-order Taylor type in η (`Taylor<P, 3>`, `P` the smallest bucket ≥ `n`).
+pub(super) struct NgJets {
+    q: f64,
+    g: Vec<f64>,
+    h: Vec<Vec<f64>>,
+    t: Vec<Vec<Vec<f64>>>,
+}
+
+#[cfg(not(feature = "survival"))]
+fn ng_jets3(_: &CompiledModel, _: &Subject, _: &[f64], _: &[f64]) -> Option<NgJets> {
+    None
+}
+
+#[cfg(feature = "survival")]
+fn ng_jets3(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<NgJets> {
+    use crate::sens::eta_jets::EtaFunction;
+    use crate::survival::{FixedTheta, NonGaussianTerm};
+    let n = eta.len();
+    let term = NonGaussianTerm::new(model, subject);
+    let f = FixedTheta { theta, term: &term };
+    macro_rules! go {
+        ($p:literal) => {{
+            const L: usize = crate::sens::taylor::binom($p + 3, 3);
+            type J = crate::sens::taylor::Taylor<$p, 3, L>;
+            let et: Vec<J> = (0..n).map(|k| J::seed(eta[k], k)).collect();
+            let y = f.eval::<J>(&et)?;
+            let tab = crate::sens::taylor::table($p, 3);
+            let mut jets = NgJets {
+                q: y.c[0],
+                g: vec![0.0; n],
+                h: vec![vec![0.0; n]; n],
+                t: vec![vec![vec![0.0; n]; n]; n],
+            };
+            for (i, e) in tab.exps.iter().enumerate() {
+                if e.iter().skip(n).any(|&x| x > 0) {
+                    continue;
+                }
+                // ∂^α f = α!·c_α (normalised coefficients), placed at every ordering of α.
+                let fact: f64 = e
+                    .iter()
+                    .map(|&x| (1..=x as u32).product::<u32>() as f64)
+                    .product();
+                let d = y.c[i] * fact;
+                let vars: Vec<usize> = e
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(v, &x)| std::iter::repeat_n(v, x as usize))
+                    .collect();
+                match vars.as_slice() {
+                    [a] => jets.g[*a] = d,
+                    [a, b] => {
+                        jets.h[*a][*b] = d;
+                        jets.h[*b][*a] = d;
+                    }
+                    [a, b, c] => {
+                        for (x, y2, z) in [
+                            (*a, *b, *c),
+                            (*a, *c, *b),
+                            (*b, *a, *c),
+                            (*b, *c, *a),
+                            (*c, *a, *b),
+                            (*c, *b, *a),
+                        ] {
+                            jets.t[x][y2][z] = d;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some(jets)
+        }};
+    }
+    let jets = match n {
+        // No random effects: the value, with empty derivatives.
+        0 | 1 => go!(1),
+        2 => go!(2),
+        3 | 4 => go!(4),
+        5..=8 => go!(8),
+        _ => None,
+    }?;
+    (jets.q.is_finite() && jets.q < 1e19).then_some(jets)
+}
+
+/// The non-Gaussian term's `q`, `∇_η q` and symmetric `∇²_η q` as scalar-tape inputs (one
+/// input per `k ≥ l`, mirrored), zero past the jets' width.
+fn ng_tape_inputs<const N: usize>(j: &NgJets) -> crate::sens::focei_kernel::NonGauss<R, N> {
+    let n = j.g.len();
+    let rq = rinput(j.q);
+    let rg: [R; N] = std::array::from_fn(|k| if k < n { rinput(j.g[k]) } else { R::c(0.0) });
+    let mut rh = [[R::c(0.0); N]; N];
+    for k in 0..n {
+        for l in 0..=k {
+            let x = rinput(j.h[k][l]);
+            rh[k][l] = x;
+            rh[l][k] = x;
+        }
+    }
+    crate::sens::focei_kernel::NonGauss {
+        q: rq,
+        g: rg,
+        h: rh,
+    }
+}
+
+/// The adjoints `(a_q, a_g, a_h)` of [`ng_tape_inputs`]' inputs, `a_h[k][l]` for `k ≥ l`.
+fn ng_adjoints<const N: usize>(
+    ngr: &crate::sens::focei_kernel::NonGauss<R, N>,
+    n: usize,
+    adj: impl Fn(R) -> f64,
+) -> (f64, Vec<f64>, Vec<Vec<f64>>) {
+    let a_g = (0..n).map(|k| adj(ngr.g[k])).collect();
+    let a_h = (0..n)
+        .map(|k| {
+            (0..n)
+                .map(|l| if l <= k { adj(ngr.h[k][l]) } else { 0.0 })
+                .collect()
+        })
+        .collect();
+    (adj(ngr.q), a_g, a_h)
+}
+
+/// `∂/∂η_m` of the term's tape inputs contracted with their adjoints:
+/// `a_q·∂_m q + Σ_k a_g,k·∂²_km q + Σ_{k≥l} a_h,kl·∂³_klm q`, from the third-order jets.
+fn ng_eta_contraction<const N: usize>(
+    j: &NgJets,
+    ngr: &crate::sens::focei_kernel::NonGauss<R, N>,
+    adj: impl Fn(R) -> f64,
+) -> Vec<f64> {
+    let n = j.g.len();
+    let (a_q, a_g, a_h) = ng_adjoints(ngr, n, adj);
+    (0..n)
+        .map(|m| {
+            let mut acc = a_q * j.g[m];
+            for k in 0..n {
+                acc += a_g[k] * j.h[k][m];
+                for l in 0..=k {
+                    acc += a_h[k][l] * j.t[k][l][m];
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
+/// One contribution to [`ng_theta_adjoint`]: the term at `eta` (the BSV η), weighted by the
+/// adjoints of its value (`a_q`), η-gradient (`a_g`) and symmetric η-Hessian (`a_h[k][l]`,
+/// read for `k ≥ l`). Empty `a_g`/`a_h` weight the value alone.
+// Without `survival` the stub ignores its parts: the seeds are built, never read.
+#[cfg_attr(not(feature = "survival"), allow(dead_code))]
+struct NgSeed<'a> {
+    eta: &'a [f64],
+    a_q: f64,
+    a_g: &'a [f64],
+    a_h: &'a [Vec<f64>],
+}
+
+/// `Σ_parts ∂/∂θ [a_q·q + Σ_k a_g,k·∂_k q + Σ_{k≥l} a_h,kl·∂²_kl q]` at each part's `eta`: the
+/// non-Gaussian term's share of an adjoint's θ block, by **one** reverse sweep however many θ
+/// there are. θ are the inputs of a fresh scalar-tape recording; a part that weights the
+/// η-derivatives evaluates the term on a second-order forward η-dual over the tape
+/// (`DualH<NB, MB, R>`), a value-only part on `R` itself. Overwrites the scalar tape: a caller
+/// holding `rsweep`'s adjoints copies them first. `None` past 8 BSV random effects, when a
+/// record has no exact channel, or on a non-finite result.
+#[cfg(feature = "survival")]
+fn ng_theta_adjoint(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    parts: &[NgSeed<'_>],
+) -> Option<Vec<f64>> {
+    use crate::sens::rtape::DualH;
+    use crate::survival::{NonGaussianTerm, SubjectTerm};
+    fn go<const NB: usize, const MB: usize>(
+        term: &NonGaussianTerm<'_>,
+        th: &[R],
+        p: &NgSeed<'_>,
+    ) -> Option<R> {
+        type H<const NB: usize, const MB: usize> = DualH<NB, MB, R>;
+        let n = p.eta.len();
+        if n > NB {
+            return None;
+        }
+        let zero = R::c(0.0);
+        let thh: Vec<H<NB, MB>> = th
+            .iter()
+            .map(|&v| H::<NB, MB> {
+                v,
+                g: [zero; NB],
+                h: [zero; MB],
+            })
+            .collect();
+        let et: Vec<H<NB, MB>> = (0..n)
+            .map(|k| {
+                let mut g = [zero; NB];
+                g[k] = R::c(1.0);
+                H::<NB, MB> {
+                    v: R::c(p.eta[k]),
+                    g,
+                    h: [zero; MB],
+                }
+            })
+            .collect();
+        let y = term.eval(&thh, &et)?;
+        let mut acc = R::c(p.a_q) * y.v;
+        for k in 0..n {
+            acc = acc + R::c(p.a_g[k]) * y.g[k];
+            for l in 0..=k {
+                acc = acc + R::c(p.a_h[k][l]) * y.hess(k, l);
+            }
+        }
+        Some(acc)
+    }
+    let term = NonGaussianTerm::new(model, subject);
+    rtape_reset();
+    let th: Vec<R> = theta.iter().map(|&v| rinput(v)).collect();
+    let mut total = R::c(0.0);
+    for p in parts {
+        let n = p.eta.len();
+        let value_only = n == 0
+            || (p.a_g.iter().all(|&v| v == 0.0) && p.a_h.iter().flatten().all(|&v| v == 0.0));
+        let c = if value_only {
+            if p.a_q == 0.0 {
+                continue;
+            }
+            let et: Vec<R> = p.eta.iter().map(|&v| R::c(v)).collect();
+            R::c(p.a_q) * term.eval(&th, &et)?
+        } else {
+            match n {
+                1 => go::<1, 1>(&term, &th, p)?,
+                2 => go::<2, 3>(&term, &th, p)?,
+                3 | 4 => go::<4, 10>(&term, &th, p)?,
+                5..=8 => go::<8, 36>(&term, &th, p)?,
+                _ => return None,
+            }
+        };
+        total = total + c;
+    }
+    let adj = rsweep::<1>(&[total]);
+    let out: Vec<f64> = th.iter().map(|x| x.idx().map_or(0.0, |i| adj[i])).collect();
+    out.iter().all(|v| v.is_finite()).then_some(out)
+}
+
+/// [`ng_theta_adjoint`] for several seeds at one `eta`: the term's θ-block contraction for
+/// each `(a_q, a_g, a_h)`, the term evaluated **once** on the second-order forward η-dual
+/// over the tape and swept once per seed (#2549: the gradient's `Ψ` and each row of its mode
+/// response share η̂). A seed's result is bit-identical to [`ng_theta_adjoint`] on that seed
+/// alone; with any value-only seed (no η-derivative weight), whose evaluation that function
+/// takes on the plain tape type, each seed goes through it instead.
+#[cfg(feature = "survival")]
+#[allow(clippy::type_complexity)]
+fn ng_theta_adjoint_seeds(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    seeds: &[(f64, Vec<f64>, Vec<Vec<f64>>)],
+) -> Option<Vec<Vec<f64>>> {
+    use crate::sens::rtape::DualH;
+    use crate::survival::{NonGaussianTerm, SubjectTerm};
+    let n = eta.len();
+    let value_only = |(_, a_g, a_h): &(f64, Vec<f64>, Vec<Vec<f64>>)| {
+        a_g.iter().all(|&v| v == 0.0) && a_h.iter().flatten().all(|&v| v == 0.0)
+    };
+    if n == 0 || seeds.iter().any(value_only) {
+        return seeds
+            .iter()
+            .map(|(a_q, a_g, a_h)| {
+                let part = NgSeed {
+                    eta,
+                    a_q: *a_q,
+                    a_g,
+                    a_h,
+                };
+                ng_theta_adjoint(model, subject, theta, &[part])
+            })
+            .collect();
+    }
+    fn go<const NB: usize, const MB: usize>(
+        term: &NonGaussianTerm<'_>,
+        th: &[R],
+        eta: &[f64],
+        seeds: &[(f64, Vec<f64>, Vec<Vec<f64>>)],
+    ) -> Option<Vec<R>> {
+        type H<const NB: usize, const MB: usize> = DualH<NB, MB, R>;
+        let n = eta.len();
+        if n > NB {
+            return None;
+        }
+        let zero = R::c(0.0);
+        let thh: Vec<H<NB, MB>> = th
+            .iter()
+            .map(|&v| H::<NB, MB> {
+                v,
+                g: [zero; NB],
+                h: [zero; MB],
+            })
+            .collect();
+        let et: Vec<H<NB, MB>> = (0..n)
+            .map(|k| {
+                let mut g = [zero; NB];
+                g[k] = R::c(1.0);
+                H::<NB, MB> {
+                    v: R::c(eta[k]),
+                    g,
+                    h: [zero; MB],
+                }
+            })
+            .collect();
+        let y = term.eval(&thh, &et)?;
+        Some(
+            seeds
+                .iter()
+                .map(|(a_q, a_g, a_h)| {
+                    let mut acc = R::c(*a_q) * y.v;
+                    for k in 0..n {
+                        acc = acc + R::c(a_g[k]) * y.g[k];
+                        for l in 0..=k {
+                            acc = acc + R::c(a_h[k][l]) * y.hess(k, l);
+                        }
+                    }
+                    // `ng_theta_adjoint` sums its parts from zero: the same node, so the
+                    // same adjoints.
+                    zero + acc
+                })
+                .collect(),
+        )
+    }
+    let term = NonGaussianTerm::new(model, subject);
+    rtape_reset();
+    let th: Vec<R> = theta.iter().map(|&v| rinput(v)).collect();
+    let accs = match n {
+        1 => go::<1, 1>(&term, &th, eta, seeds)?,
+        2 => go::<2, 3>(&term, &th, eta, seeds)?,
+        3 | 4 => go::<4, 10>(&term, &th, eta, seeds)?,
+        5..=8 => go::<8, 36>(&term, &th, eta, seeds)?,
+        _ => return None,
+    };
+    accs.into_iter()
+        .map(|acc| {
+            let adj = rsweep::<1>(&[acc]);
+            let out: Vec<f64> = th.iter().map(|x| x.idx().map_or(0.0, |i| adj[i])).collect();
+            out.iter().all(|v| v.is_finite()).then_some(out)
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "survival"))]
+#[allow(clippy::type_complexity)]
+fn ng_theta_adjoint_seeds(
+    _: &CompiledModel,
+    _: &Subject,
+    _: &[f64],
+    _: &[f64],
+    _: &[(f64, Vec<f64>, Vec<Vec<f64>>)],
+) -> Option<Vec<Vec<f64>>> {
+    None
+}
+
+#[cfg(not(feature = "survival"))]
+fn ng_theta_adjoint(
+    _: &CompiledModel,
+    _: &Subject,
+    _: &[f64],
+    _: &[NgSeed<'_>],
+) -> Option<Vec<f64>> {
+    None
+}
+
+/// A subject's non-Gaussian data term `q(θ, η)` (TTE, binary and CTMM summed, 1×) and its
+/// exact θ-gradient at fixed `eta` (the BSV η): one scalar-tape recording with θ as inputs and
+/// one reverse sweep. `(0, 0)` for a subject with no non-Gaussian records; `None` when a record
+/// has no exact channel or on a non-finite result. Overwrites the scalar tape.
+#[cfg(feature = "survival")]
+pub(crate) fn non_gaussian_theta_score(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>)> {
+    use crate::survival::{NonGaussianTerm, SubjectTerm};
+    if subject.obs_records.is_empty() {
+        return Some((0.0, vec![0.0; theta.len()]));
+    }
+    rtape_reset();
+    let th: Vec<R> = theta.iter().map(|&v| rinput(v)).collect();
+    let et: Vec<R> = eta.iter().map(|&v| R::c(v)).collect();
+    let y = NonGaussianTerm::new(model, subject).eval(&th, &et)?;
+    let q = y.val();
+    let adj = rsweep::<1>(&[y]);
+    let out: Vec<f64> = th.iter().map(|x| x.idx().map_or(0.0, |i| adj[i])).collect();
+    (q.is_finite()
+        && q < crate::survival::REPEL_SENTINEL_FLOOR
+        && out.iter().all(|v| v.is_finite()))
+    .then_some((q, out))
+}
+
+#[cfg(not(feature = "survival"))]
+pub(crate) fn non_gaussian_theta_score(
+    _: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    _: &[f64],
+) -> Option<(f64, Vec<f64>)> {
+    subject
+        .obs_records
+        .is_empty()
+        .then(|| (0.0, vec![0.0; theta.len()]))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run<const N: usize, const M: usize>(
     model: &CompiledModel,
@@ -2510,6 +4175,7 @@ fn run<const N: usize, const M: usize>(
     eta: &[f64],
     interaction: bool,
     active: usize,
+    eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
 
@@ -2517,7 +4183,9 @@ fn run<const N: usize, const M: usize>(
     // Only the θ leaves are swept to, so η enters as free (untaped) inputs: an η-only
     // subexpression is plain forward arithmetic, taped only where it meets θ.
     vtape_reset(N + 1);
-    let th = theta_leaves::<N, M, false>(theta_axis(model)?, theta);
+    // An endpoint-only model has no parameter program (and no Gaussian rows to record).
+    let axis = theta_axis(model).or_else(|| endpoint_only(model).then_some(theta.len()))?;
+    let th = theta_leaves::<N, M, false>(axis, theta);
     // `[covariate_nn]` outputs as tape leaves when the weights reach the likelihood through
     // them alone (`NnReduction`): the recordings read the leaves, and the weights' adjoint
     // is one backward pass through each network below, in place of every network taped
@@ -2529,15 +4197,39 @@ fn run<const N: usize, const M: usize>(
     #[cfg(not(feature = "nn"))]
     let lv = ThetaLeaves::theta(&th);
     let unit = unit_dirs::<N>();
-    let et: [DualV<N, M>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], [0.0; M]));
-    let preds = record(model, subject, lay, theta, eta, &lv, &et)?;
+    // On the heap: at the widest bucket the array is ~470 KB and its `from_fn` builder a
+    // second transient copy, which overflowed a 2 MB thread's stack (a direct, non-fit caller
+    // such as a test thread or the R session) once this frame had grown (#2482).
+    let et: Vec<DualV<N, M>> = (0..N)
+        .map(|k| DualV::free(eta[k], unit[k], [0.0; M]))
+        .collect();
+    // A subject with no Gaussian rows (an endpoint-only one) has nothing to record.
+    let preds = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
+        Vec::new()
+    } else {
+        record(model, subject, lay, theta, eta, &lv, &et)?
+    };
     let n_obs = preds.len();
     if n_obs != subject.observations.len() {
         return None;
     }
+    // A subject's non-Gaussian records (TTE, binary, CTMM): the term and its η-derivatives
+    // to third order, for every step below. It reads BSV η only, so under IOV it lives on the
+    // stacked system's leading block (the jets pad past it).
+    let n_bsv = model.n_eta;
+    let ng = if subject.obs_records.is_empty() {
+        None
+    } else {
+        if n_bsv > N {
+            return None;
+        }
+        Some(ng_jets3(model, subject, theta, &eta[..n_bsv])?)
+    };
     // FOCE scores R⁰ at the population prediction f(η = 0): the same engine, on the same
-    // θ leaves, with η held at zero (values only).
-    let pop = if !interaction && model.error_spec.has_f_dependent_variance() {
+    // θ leaves, with η held at zero (values only). Beside a non-Gaussian term production's
+    // objective takes the conditional variance, but the EBE is still the frozen-variance
+    // inner objective's stationary point (#1722), so `∇_η l` reads this point either way.
+    let pop = if n_obs > 0 && !interaction && model.error_spec.has_f_dependent_variance() {
         let zeros = [0.0; N];
         let p0 = record(
             pop_model,
@@ -2564,11 +4256,24 @@ fn run<const N: usize, const M: usize>(
     let pop_v: Option<Vec<f64>> = pop
         .as_ref()
         .map(|p0: &Vec<DualV<N, M>>| p0.iter().map(|p| p.v).collect());
-    let (grad_f, h, grad_l) =
-        eta_derivatives(&ctx, interaction, &preds, pop_v.as_deref(), eta, &pv)?;
+    let (grad_f, h, grad_l) = eta_derivatives(
+        &ctx,
+        interaction,
+        &preds,
+        pop_v.as_deref(),
+        eta,
+        &pv,
+        ng.as_ref(),
+    )?;
     let fz = if interaction { None } else { pop_v.as_deref() };
     let w = mode_solve(&h, &grad_f, &grad_l, || {
-        inner_search_gradient::<N>(model, subject, lay, theta, eta, &ctx, &pv, fz)
+        let mut g = inner_search_gradient::<N>(model, subject, lay, theta, eta, &ctx, &pv, fz)?;
+        if let Some(j) = ng.as_ref() {
+            for (gk, qk) in g.iter_mut().zip(&j.g) {
+                *gk += qk;
+            }
+        }
+        Some(g)
     })?;
 
     // ---- 3. Ψ = F − wᵀ∇_η l on the scalar tape, one single-lane sweep -----------------
@@ -2583,63 +4288,278 @@ fn run<const N: usize, const M: usize>(
         .map(|p0: &Vec<DualV<N, M>>| p0.iter().map(|p| rinput(p.v)).collect());
     let er: [R; N] = std::array::from_fn(|k| rinput(eta[k]));
     let (pr, om) = tape_params(model, subject, &pv, &so)?;
-    let (fval, lg) = objective::<R, N>(&ctx, interaction, &fr, &gr, &er, pr0.as_deref(), &pr)?;
+    // The non-Gaussian term's value, η-gradient and (symmetric, one input per k ≥ l)
+    // η-Hessian as tape inputs; their θ-derivatives are contracted with the adjoints in
+    // step 4.
+    let ng_r = ng.as_ref().map(ng_tape_inputs::<N>);
+    // Every node an adjoint is read at below is one of the inputs recorded above (`rinput`:
+    // predictions, their tangents, the parameter and non-Gaussian leaves), so a sweep's
+    // adjoints are kept for this prefix only, not for the objective's whole recording.
+    let n_in = crate::sens::rtape::rtape_len();
+    let (fval, lg) = match ng_r.as_ref() {
+        Some(ngr) => {
+            objective_ng::<R, N>(&ctx, interaction, &fr, &gr, &er, pr0.as_deref(), ngr, &pr)?
+        }
+        None => objective::<R, N>(&ctx, interaction, &fr, &gr, &er, pr0.as_deref(), &pr)?,
+    };
     let psi = fval
         - <R as crate::sens::num::PkNum>::wsum3(
             0.0,
             (0..N).map(|k| (R::c(w[k]), lg[k], R::c(1.0))),
         );
-    let sadj = rsweep::<1>(&[psi]);
-    let psi_of = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+    // Ψ and (with the mode response) its rows `y_r = Σ_k Z_rk (∇_η l)_k`, `Z` the BSV rows
+    // of `H⁻¹`, so `dη̂_r/dx = −∂y_r/∂x` (`Z` held constant: `H` is the derivative of
+    // `∇_η l` at the mode): one lane per BSV effect, however wide the stacked `[η, κ]`
+    // system. All outputs share each sweep as lanes, Ψ in lane 0. Copied: the non-Gaussian
+    // term's θ block records its own scalar tape below.
+    let mut outs = vec![psi];
+    if eta_dx.as_ref().is_some_and(|o| o.want_dx) {
+        outs.extend(eta_dx_outputs::<N>(
+            &h,
+            &lg,
+            active.min(N),
+            n_bsv.min(active).min(N),
+        ));
+    }
+    let chunks = sweep_lanes(&outs, n_in);
+    #[cfg(test)]
+    if outs.len() > 1 && FAIL_RESPONSE_LANES.with(|f| f.get()) {
+        return None;
+    }
+    // Output `o`'s adjoint at a recorded input: every chunk but the last is full.
+    let out_adj = |o: usize, x: R| -> f64 { lane_adj(&chunks, o, x) };
+    let psi_of = |x: R| out_adj(0, x);
 
-    // ---- 4. Ψ seeds on the taped predictions, one single-lane sweep to the θ leaves -----
-    let vadj = vadj_init::<1>();
-    let mut top = 0usize;
-    let mut seed = |node: u32, comp: usize, v: f64| {
-        if node != NONE {
-            top = top.max(node as usize + 1);
-            vadj[vadj_index::<N, 1>(node, comp, 0)] += v;
-        }
-    };
-    for (j, p) in preds.iter().enumerate() {
-        seed(p.i, 0, psi_of(fr[j]));
-        for k in 0..N {
-            seed(p.i, 1 + k, psi_of(gr[j][k]));
+    // ---- 4. the outputs' seeds on the taped predictions, one sweep per chunk to θ ------
+    let mut lane_theta: Vec<Vec<f64>> = Vec::with_capacity(outs.len());
+    for (lanes, n, adj) in &chunks {
+        let seeds = DxSeeds {
+            preds: &preds,
+            fr: &fr,
+            gr: &gr,
+            pop: pop.as_ref().zip(pr0.as_ref()),
+        };
+        // A leaf's value-component adjoint (θ, and the networks' outputs under the
+        // reduction), by lane.
+        let vadj = |at: &dyn Fn(&DualV<N, M>, usize) -> f64| -> Option<()> {
+            for l in 0..*n {
+                #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
+                let mut ta: Vec<f64> = th.iter().map(|lf| at(lf, l)).collect();
+                #[cfg(feature = "nn")]
+                if let Some((red, z)) = &nn_out {
+                    add_nn_weight_adjoint(model, red, z, theta, |lf| at(lf, l), &mut ta)?;
+                }
+                lane_theta.push(ta);
+            }
+            Some(())
+        };
+        match lanes {
+            1 => seeds.sweep::<1>(adj, *n, vadj)?,
+            2 => seeds.sweep::<2>(adj, *n, vadj)?,
+            _ => seeds.sweep::<DX_LANES>(adj, *n, vadj)?,
         }
     }
-    if let (Some(p0), Some(r0)) = (pop.as_ref(), pr0.as_ref()) {
-        for (p, &x) in p0.iter().zip(r0) {
-            seed(p.i, 0, psi_of(x));
-        }
-    }
-    let adj = vsweep::<N, 1>(top);
-    // A leaf's value-component adjoint (θ, and the networks' outputs under the reduction).
-    let at = |l: &DualV<N, M>| {
-        if l.i == NONE {
-            0.0
+    // The non-Gaussian term's θ block for every output: one recording of the term at η̂,
+    // swept per seed.
+    if let Some(ngr) = ng_r.as_ref() {
+        let n = n_bsv;
+        let seeds: Vec<_> = (0..outs.len())
+            .map(|o| ng_adjoints(ngr, n, |x: R| out_adj(o, x)))
+            .collect();
+        let d = if seeds.len() == 1 {
+            let (a_q, a_g, a_h) = &seeds[0];
+            let part = NgSeed {
+                eta: &eta[..n],
+                a_q: *a_q,
+                a_g,
+                a_h,
+            };
+            vec![ng_theta_adjoint(model, subject, theta, &[part])?]
         } else {
-            adj[vadj_index::<N, 1>(l.i, 0, 0)]
+            ng_theta_adjoint_seeds(model, subject, theta, &eta[..n], &seeds)?
+        };
+        for (ta, d) in lane_theta.iter_mut().zip(d) {
+            for (t, dv) in ta.iter_mut().zip(d) {
+                *t += dv;
+            }
         }
-    };
-    #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
-    let mut theta_adj: Vec<f64> = th.iter().map(at).collect();
-    #[cfg(feature = "nn")]
-    if let Some((red, z)) = &nn_out {
-        add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
     }
     let out = packed_gradient(
         model,
         template,
         params,
         x.len(),
-        &theta_adj,
+        &lane_theta[0],
         &psi_of,
         &pr,
         &om,
         &so,
         &pv,
     );
+    if outs.len() > 1 {
+        // ---- 5. the mode response from the same sweeps ------------------------------------
+        let n_rows = outs.len() - 1;
+        let mut cols = vec![DVector::<f64>::zeros(n_rows); x.len()];
+        for r in 0..n_rows {
+            let of = |x: R| out_adj(r + 1, x);
+            let row = packed_gradient(
+                model,
+                template,
+                params,
+                x.len(),
+                &lane_theta[r + 1],
+                &of,
+                &pr,
+                &om,
+                &so,
+                &pv,
+            );
+            for (c, v) in cols.iter_mut().zip(row) {
+                c[r] = -v;
+            }
+        }
+        let ok = cols.iter().all(|c| c.iter().all(|v| v.is_finite()));
+        if let Some(o) = eta_dx {
+            o.eta_dx = ok.then_some(cols);
+        }
+    }
     Some(out)
+}
+
+/// Widest lane chunk of the fused gradient-and-response sweeps ([`run`]).
+const DX_LANES: usize = 4;
+
+/// What a gradient pass can also hand back about the subject's mode, from its own recording
+/// (#2549): the exact mode response `dη̂/dx` (the EBE warm-start predictor's Jacobian) and,
+/// under the quadrature, the exact inner Hessian `∇²_η l` at the mode, which the quadrature
+/// objective's anchor and the next warm inner solve's seed would otherwise each recompute.
+#[derive(Debug, Default)]
+pub(crate) struct ModeOut {
+    /// Form the mode response.
+    pub(crate) want_dx: bool,
+    /// Hand back the exact inner Hessian (quadrature objectives only).
+    pub(crate) want_hessian: bool,
+    pub(crate) eta_dx: Option<Vec<DVector<f64>>>,
+    pub(crate) hessian: Option<DMatrix<f64>>,
+}
+
+impl ModeOut {
+    /// Drop the products, keeping what is wanted.
+    pub(crate) fn clear(&mut self) {
+        self.eta_dx = None;
+        self.hessian = None;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: fail [`run`] whenever it carries mode-response lanes, as a non-finite row
+    /// adjoint would, to pin that the gradient survives a failed response.
+    pub(crate) static FAIL_RESPONSE_LANES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The mode response's rows on the scalar tape (step 3 of [`run`]): `y_r = Σ_k Z_rk g_k`
+/// for `r < n_rows`, `Z = (H⁻¹)_{r,:}` over the `n_act` live effects. Empty when `H` is
+/// singular.
+fn eta_dx_outputs<const N: usize>(
+    h: &DMatrix<f64>,
+    g: &[R; N],
+    n_act: usize,
+    n_rows: usize,
+) -> Vec<R> {
+    let haa = h.view((0, 0), (n_act, n_act)).into_owned();
+    let rhs = DMatrix::<f64>::identity(n_act, n_rows);
+    let z = match haa.clone().cholesky() {
+        Some(c) => Some(c.solve(&rhs)),
+        None => haa.lu().solve(&rhs),
+    };
+    // `H` symmetric: column `r` of `H⁻¹E` is row `r` of `H⁻¹`.
+    let Some(z) = z.filter(|z| z.iter().all(|v| v.is_finite())) else {
+        return Vec::new();
+    };
+    (0..n_rows)
+        .map(|r| {
+            <R as crate::sens::num::PkNum>::wsum3(
+                0.0,
+                (0..n_act).map(|k| (R::c(z[(k, r)]), g[k], R::c(1.0))),
+            )
+        })
+        .collect()
+}
+
+/// Sweep the scalar tape for `outs`, in chunks of 1, 2 or [`DX_LANES`] lanes (every chunk
+/// but the last full). Each chunk is `(lanes, outputs in it, adjoints[node·lanes + lane])`
+/// for the tape's first `n_in` nodes, its inputs.
+fn sweep_lanes(outs: &[R], n_in: usize) -> Vec<(usize, usize, Vec<f64>)> {
+    fn sweep<const L: usize>(y: &[R], n_in: usize) -> (usize, Vec<f64>) {
+        let outs: [R; L] = std::array::from_fn(|i| y.get(i).copied().unwrap_or(R::c(0.0)));
+        (L, rsweep::<L>(&outs)[..n_in * L].to_vec())
+    }
+    let mut out = Vec::new();
+    let mut r0 = 0;
+    while r0 < outs.len() {
+        let left = outs.len() - r0;
+        let (lanes, adj) = match left {
+            1 => sweep::<1>(&outs[r0..], n_in),
+            2 => sweep::<2>(&outs[r0..], n_in),
+            _ => sweep::<DX_LANES>(&outs[r0..], n_in),
+        };
+        let n = left.min(lanes);
+        out.push((lanes, n, adj));
+        r0 += n;
+    }
+    out
+}
+
+/// The taped predictions a mode-response chunk seeds (step 5 of [`run`]).
+struct DxSeeds<'a, const N: usize, const M: usize> {
+    preds: &'a [DualV<N, M>],
+    fr: &'a [R],
+    gr: &'a [[R; N]],
+    pop: Option<(&'a Vec<DualV<N, M>>, &'a Vec<R>)>,
+}
+
+impl<const N: usize, const M: usize> DxSeeds<'_, N, M> {
+    /// Seed `n` lanes from their scalar-tape adjoints `adj[node·L + lane]`, sweep the
+    /// prediction tape once, and hand `per_lane` each leaf's value adjoint by lane.
+    fn sweep<const L: usize>(
+        &self,
+        adj: &[f64],
+        n: usize,
+        per_lane: impl FnOnce(&dyn Fn(&DualV<N, M>, usize) -> f64) -> Option<()>,
+    ) -> Option<()> {
+        let of = |x: R, l: usize| x.idx().map_or(0.0, |i| adj[i * L + l]);
+        let vadj = vadj_init::<L>();
+        let mut top = 0usize;
+        let mut seed = |node: u32, comp: usize, l: usize, v: f64| {
+            if node != NONE && v != 0.0 {
+                top = top.max(node as usize + 1);
+                vadj[vadj_index::<N, L>(node, comp, l)] += v;
+            }
+        };
+        for l in 0..n {
+            for (j, p) in self.preds.iter().enumerate() {
+                seed(p.i, 0, l, of(self.fr[j], l));
+                for m in 0..N {
+                    seed(p.i, 1 + m, l, of(self.gr[j][m], l));
+                }
+            }
+            if let Some((p0, r0)) = self.pop {
+                for (p, &x) in p0.iter().zip(r0) {
+                    seed(p.i, 0, l, of(x, l));
+                }
+            }
+        }
+        let a = vsweep::<N, L>(top);
+        per_lane(&|lf: &DualV<N, M>, l: usize| {
+            if lf.i == NONE {
+                0.0
+            } else {
+                a[vadj_index::<N, L>(lf.i, 0, l)]
+            }
+        })
+    }
 }
 
 /// `∇_η F` and `H = ∂(∇_η l)/∂η` at `eta`, from `(F, ∇_η l)` over a forward η-dual: `f`
@@ -2652,6 +4572,7 @@ pub(super) fn eta_derivatives<const N: usize, const M: usize>(
     fpop: Option<&[f64]>,
     eta: &[f64],
     pv: &ParT<f64>,
+    ng: Option<&NgJets>,
 ) -> Option<(DVector<f64>, DMatrix<f64>, [f64; N])> {
     type D<const N: usize> = DualT<N, f64>;
     let fd: Vec<D<N>> = preds.iter().map(|p| DualT { v: p.v, g: p.g }).collect();
@@ -2671,17 +4592,79 @@ pub(super) fn eta_derivatives<const N: usize, const M: usize>(
     });
     let pd: Option<Vec<D<N>>> =
         fpop.map(|p0| p0.iter().map(|&v| DualT { v, g: [0.0; N] }).collect());
-    let (fa, la) = objective::<D<N>, N>(
-        ctx,
-        interaction,
-        &fd,
-        &gd,
-        &ed,
-        pd.as_deref(),
-        &pv.wrap::<N>(),
-    )?;
+    let (fa, la) = match ng {
+        Some(j) => objective_ng_eta_dual(ctx, interaction, &fd, &gd, &ed, pd.as_deref(), j, pv)?,
+        None => objective::<D<N>, N>(
+            ctx,
+            interaction,
+            &fd,
+            &gd,
+            &ed,
+            pd.as_deref(),
+            &pv.wrap::<N>(),
+        )?,
+    };
     let h = DMatrix::from_fn(N, N, |k, m| 0.5 * (la[k].g[m] + la[m].g[k]));
     Some((DVector::from_column_slice(&fa.g), h, la.map(|l| l.v)))
+}
+
+/// [`eta_derivatives`]' objective with a non-Gaussian term: the term's value, η-gradient and
+/// η-Hessian with their own η-derivatives (`NgJets`' third order) on the forward η-dual.
+/// Out of line: the term's `h` is `N²` duals of width `N`, a frame a Gaussian subject's call
+/// must not reserve (and probe) as well.
+#[cfg(feature = "survival")]
+#[inline(never)]
+#[allow(clippy::type_complexity)]
+fn objective_ng_eta_dual<const N: usize>(
+    ctx: &LikCtx,
+    interaction: bool,
+    fd: &[DualT<N, f64>],
+    gd: &[[DualT<N, f64>; N]],
+    ed: &[DualT<N, f64>; N],
+    pd: Option<&[DualT<N, f64>]>,
+    j: &NgJets,
+    pv: &ParT<f64>,
+) -> Option<(DualT<N, f64>, [DualT<N, f64>; N])> {
+    let pad = |k: usize| k < j.g.len();
+    let at = |v: &[f64], k: usize| if pad(k) { v[k] } else { 0.0 };
+    let ngd = Box::new(crate::sens::focei_kernel::NonGauss::<DualT<N, f64>, N> {
+        q: DualT {
+            v: j.q,
+            g: std::array::from_fn(|k| at(&j.g, k)),
+        },
+        g: std::array::from_fn(|k| DualT {
+            v: at(&j.g, k),
+            g: std::array::from_fn(|l| if pad(k) { at(&j.h[k], l) } else { 0.0 }),
+        }),
+        h: std::array::from_fn(|k| {
+            std::array::from_fn(|l| DualT {
+                v: if pad(k) { at(&j.h[k], l) } else { 0.0 },
+                g: std::array::from_fn(|m| {
+                    if pad(k) && pad(l) {
+                        at(&j.t[k][l], m)
+                    } else {
+                        0.0
+                    }
+                }),
+            })
+        }),
+    });
+    objective_ng::<DualT<N, f64>, N>(ctx, interaction, fd, gd, ed, pd, &ngd, &pv.wrap::<N>())
+}
+
+#[cfg(not(feature = "survival"))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn objective_ng_eta_dual<const N: usize>(
+    _: &LikCtx,
+    _: bool,
+    _: &[DualT<N, f64>],
+    _: &[[DualT<N, f64>; N]],
+    _: &[DualT<N, f64>; N],
+    _: Option<&[DualT<N, f64>]>,
+    _: &NgJets,
+    _: &ParT<f64>,
+) -> Option<(DualT<N, f64>, [DualT<N, f64>; N])> {
+    None
 }
 
 /// Theta leaves (shared by every recording on the tape) and η leaves with tangent rows
@@ -2693,9 +4676,18 @@ fn eta_leaves<const N: usize, const M: usize, const TH: bool>(
     std::array::from_fn(|k| DualV::leaf(eta[k], dirs[k], [0.0; M]))
 }
 
-/// The jitter production's proposal adds to the anchor Hessian (`build_proposal`):
-/// `H_ii += max(10⁻⁶|H_ii|, 10⁻¹⁰)`, on any number type.
-fn regularise<T: crate::sens::num::PkNum>(h: &mut [Vec<T>]) {
+/// The anchor's Cholesky factor, by production's rule (`agq::agq_proposal`, #2538): `H_a`
+/// itself when it is positive-definite, so one node is the Laplace approximation
+/// `l(η̂) + ½log|H_a|` exactly; else `H_a` with the jitter `H_ii += max(10⁻⁶|H_ii|, 10⁻¹⁰)`
+/// (`build_proposal`); else the prior precision `Ω⁻¹`. Branches on values only, so the
+/// tape differentiates whichever objective production evaluated.
+fn factor_anchor<T: crate::sens::num::PkNum>(
+    h: &mut [Vec<T>],
+    omega_inv: &[Vec<T>],
+) -> Option<Vec<Vec<T>>> {
+    if let Some(l) = crate::sens::focei_kernel::chol(h) {
+        return Some(l);
+    }
     for (i, row) in h.iter_mut().enumerate() {
         let d = row[i];
         row[i] = if 1e-6 * d.val().abs() > 1e-10 {
@@ -2704,6 +4696,7 @@ fn regularise<T: crate::sens::num::PkNum>(h: &mut [Vec<T>]) {
             d + T::from_f64(1e-10)
         };
     }
+    crate::sens::focei_kernel::chol(h).or_else(|| crate::sens::focei_kernel::chol(omega_inv))
 }
 
 /// Exact AGQ subject gradient by the adjoint method — `n_agq` Gauss–Hermite nodes per
@@ -2740,6 +4733,7 @@ fn run_agq<const N: usize, const M: usize>(
     exact: bool,
     active: usize,
     held: bool,
+    eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>>
 where
     Bucket<N, M>: ExactAnchor<N, M>,
@@ -2752,15 +4746,40 @@ where
     let eta_a: [f64; N] = std::array::from_fn(|k| eta[k]);
 
     // ---- 1. values at η̂ (an untaped canonical pass): f, G, Q; the exact H and the anchor
-    let p1 = canonical_jets::<N, M>(model, subject, lay, theta, eta)?;
+    // An endpoint-only subject has no Gaussian rows to record.
+    let p1 = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
+        Vec::new()
+    } else {
+        canonical_jets::<N, M>(model, subject, lay, theta, eta)?
+    };
     let f1: Vec<f64> = p1.iter().map(|p| p.v).collect();
     let g1: Vec<[f64; N]> = p1.iter().map(|p| p.g).collect();
     let q1: Vec<[f64; M]> = p1.iter().map(|p| p.h).collect();
+    // A subject's non-Gaussian records (TTE, binary, CTMM): the term's η-jets to third order
+    // at η̂, over the BSV block (the leading one of the stacked `[η, κ]` under IOV). Both
+    // anchors carry its `∇²q`, as production's do (`exact_inner_hessian`, `exact_htilde`).
+    let n_bsv = model.n_eta;
+    let ng = if subject.obs_records.is_empty() {
+        None
+    } else {
+        if n_bsv > N {
+            return None;
+        }
+        Some(ng_jets3(model, subject, theta, &eta[..n_bsv])?)
+    };
     let h_exact = {
         let h = crate::sens::focei_kernel::exact_inner_hessian_kernel(
             &ctx, &f1, &g1, &q1, &eta_a, &pv, active,
         )?;
-        DMatrix::from_fn(N, N, |a, b| h[a][b])
+        let mut h = DMatrix::from_fn(N, N, |a, b| h[a][b]);
+        if let Some(j) = ng.as_ref() {
+            for a in 0..n_bsv {
+                for b in 0..n_bsv {
+                    h[(a, b)] += j.h[a][b];
+                }
+            }
+        }
+        h
     };
     let h_inner = h_exact.clone();
     let mut h_a: Vec<Vec<f64>> = if exact {
@@ -2768,15 +4787,21 @@ where
             .map(|a| (0..N).map(|b| h_exact[(a, b)]).collect())
             .collect()
     } else {
-        crate::sens::focei_kernel::focei_htilde(&ctx, &f1, &g1, &eta_a, &pv)?
+        let mut h = crate::sens::focei_kernel::focei_htilde(&ctx, &f1, &g1, &eta_a, &pv)?;
+        if let Some(j) = ng.as_ref() {
+            for a in 0..n_bsv {
+                for b in 0..n_bsv {
+                    h[a][b] += j.h[a][b];
+                }
+            }
+        }
+        h
     };
-    regularise(&mut h_a);
-    // Production's fallback when the regularised anchor is not positive-definite (a mode
-    // the inner search left loosely converged, a flat direction): the prior precision `Ω⁻¹`
-    // scales the grid and its log-determinant enters `F` (`build_proposal`). It is part of
-    // the objective, so the gradient follows it rather than declining.
-    let lh = crate::sens::focei_kernel::chol(&h_a)
-        .or_else(|| crate::sens::focei_kernel::chol(&pv.omega.inv))?;
+    // Production's fallbacks when the anchor is not positive-definite (a mode the inner
+    // search left loosely converged, a flat direction): the jittered anchor, then the prior
+    // precision `Ω⁻¹`. Each is part of the objective, so the gradient follows it rather
+    // than declining.
+    let lh = factor_anchor(&mut h_a, &pv.omega.inv)?;
     // The tensor grid: per node its `z`, `c_j = Σ log w + ‖z‖²`, and `b_j` (f64).
     let (gh_nodes, _, gh_logw) = crate::estimation::agq::cached_gauss_hermite(n_agq);
     let one_point = n_agq == 1;
@@ -2818,16 +4843,85 @@ where
             }
         }
     }
+    // The term's value and η-gradient at every node, for its linearisation in `b` there.
+    let ng = match ng {
+        Some(jets) => {
+            let nodes = grid
+                .iter()
+                .map(|(_, _, b)| ng_value_grad(model, subject, theta, &b[..n_bsv]))
+                .collect::<Option<Vec<_>>>()?;
+            Some(AgqNg { jets, nodes })
+        }
+        None => None,
+    };
     if exact {
         <Bucket<N, M> as ExactAnchor<N, M>>::taped(
-            model, subject, lay, template, params, x, eta, &ctx, &so, &pv, &p1, &grid, h_inner,
-            active, held,
+            model,
+            subject,
+            lay,
+            template,
+            params,
+            x,
+            eta,
+            &ctx,
+            &so,
+            &pv,
+            &p1,
+            &grid,
+            h_inner,
+            active,
+            held,
+            ng.as_ref(),
+            eta_dx,
         )
     } else {
         agq_taped::<N, M, M, false>(
-            model, subject, lay, template, params, x, eta, &ctx, &so, &pv, &p1, &grid, h_inner,
-            exact, active, held,
+            model,
+            subject,
+            lay,
+            template,
+            params,
+            x,
+            eta,
+            &ctx,
+            &so,
+            &pv,
+            &p1,
+            &grid,
+            h_inner,
+            exact,
+            active,
+            held,
+            ng.as_ref(),
+            eta_dx,
         )
+    }
+}
+
+/// A subject's non-Gaussian term on the AGQ grid: its third-order η-jets at `η̂` and its
+/// value and η-gradient at each node.
+struct AgqNg {
+    jets: NgJets,
+    nodes: Vec<(f64, Vec<f64>)>,
+}
+
+/// The non-Gaussian term's value and η-gradient at `eta` (θ fixed).
+fn ng_value_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>)> {
+    #[cfg(feature = "survival")]
+    {
+        use crate::survival::{eta_gradient_by_bucket, FixedTheta, NonGaussianTerm};
+        let term = NonGaussianTerm::new(model, subject);
+        eta_gradient_by_bucket(eta, &FixedTheta { theta, term: &term })
+    }
+    #[cfg(not(feature = "survival"))]
+    {
+        let _ = (model, subject, theta, eta);
+        None
     }
 }
 
@@ -2864,6 +4958,8 @@ trait ExactAnchor<const N: usize, const M: usize> {
         h_inner: DMatrix<f64>,
         active: usize,
         held: bool,
+        ng: Option<&AgqNg>,
+        eta_dx: Option<&mut ModeOut>,
     ) -> Option<Vec<f64>>;
 }
 
@@ -2886,10 +4982,12 @@ macro_rules! exact_anchor_buckets {
                 h_inner: DMatrix<f64>,
                 active: usize,
                 held: bool,
+                ng: Option<&AgqNg>,
+                eta_dx: Option<&mut ModeOut>,
             ) -> Option<Vec<f64>> {
                 agq_taped::<$n, $m, $n, true>(
                     model, subject, lay, template, params, x, eta, ctx, so, pv, p1, grid,
-                    h_inner, true, active, held,
+                    h_inner, true, active, held, ng, eta_dx,
                 )
             }
         })*
@@ -2910,6 +5008,8 @@ macro_rules! exact_anchor_buckets {
                 _: DMatrix<f64>,
                 _: usize,
                 _: bool,
+                _: Option<&AgqNg>,
+                _: Option<&mut ModeOut>,
             ) -> Option<Vec<f64>> {
                 None
             }
@@ -2943,9 +5043,12 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     exact: bool,
     active: usize,
     held: bool,
+    ng: Option<&AgqNg>,
+    eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
     let n_obs = subject.observations.len();
+    let n_bsv = model.n_eta;
     let unit = unit_dirs::<N>();
     let vidx = |node: u32, comp: usize| {
         if TH {
@@ -2955,7 +5058,9 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         }
     };
     vtape_reset(if TH { 1 + 2 * N } else { N + 1 });
-    let th = theta_leaves::<N, M2, TH>(theta_axis(model)?, theta);
+    // An endpoint-only model has no parameter program (and no Gaussian rows to record).
+    let axis = theta_axis(model).or_else(|| endpoint_only(model).then_some(theta.len()))?;
+    let th = theta_leaves::<N, M2, TH>(axis, theta);
     // `[covariate_nn]` outputs as leaves, as `run` does, for both recordings below.
     #[cfg(feature = "nn")]
     let nn_out = nn_output_leaves::<N, M2, TH>(model, subject, template, theta);
@@ -2968,6 +5073,9 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let node_preds: Vec<Vec<DualV<N, M2, TH>>> = grid
         .iter()
         .map(|(_, _, b)| {
+            if n_obs == 0 {
+                return Some(Vec::new());
+            }
             record(
                 model,
                 subject,
@@ -2995,6 +5103,20 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         .collect();
     let er: [R; N] = std::array::from_fn(|k| rinput(eta[k]));
     let (pr, om) = tape_params(model, subject, pv, so)?;
+    // The non-Gaussian term at η̂ as tape inputs, as `run` takes it: `q`, `∇q` and the
+    // symmetric `∇²q` (one input per k ≥ l), and its value at each node.
+    let ng_r = ng.map(|ng| ng_tape_inputs::<N>(&ng.jets));
+    let node_qr: Vec<R> = ng
+        .map(|ng| ng.nodes.iter().map(|(q, _)| rinput(*q)).collect())
+        .unwrap_or_default();
+    // Node prediction rows f_j(b) = f_j + G_j·(b − b_j), with the node values as leaves.
+    let node_fr: Vec<Vec<R>> = node_preds
+        .iter()
+        .map(|ps| ps.iter().map(|p| rinput(p.v)).collect())
+        .collect();
+    // Every node an adjoint is read at below is one of the inputs recorded above, as in
+    // [`run`], so the response's lane sweeps keep their adjoints for this prefix only.
+    let n_in = crate::sens::rtape::rtape_len();
     // The anchor H_a on the tape: the exact inner Hessian from the predictions' (f, G, Q),
     // or FOCEI's H̃.
     let mut h_a: Vec<Vec<R>> = if exact {
@@ -3002,22 +5124,25 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     } else {
         crate::sens::focei_kernel::focei_htilde(ctx, &fr, &gr, &er, &pr)?
     };
-    regularise(&mut h_a);
-    // The same anchor fallback as `run_agq`, on the tape (both see the same values, so
+    if let Some(ngr) = ng_r.as_ref() {
+        for k in 0..n_bsv {
+            for l in 0..n_bsv {
+                h_a[k][l] = h_a[k][l] + ngr.h[k][l];
+            }
+        }
+    }
+    // The same anchor factor as `run_agq`, on the tape (both see the same values, so
     // both take the same branch).
-    let lh = crate::sens::focei_kernel::chol(&h_a)
-        .or_else(|| crate::sens::focei_kernel::chol(&pr.omega.inv))?;
+    let lh = factor_anchor(&mut h_a, &pr.omega.inv)?;
     let half_logdet = R::c(0.5) * crate::sens::focei_kernel::chol_logdet(&lh);
-    // Node prediction rows f_j(b) = f_j + G_j·(b − b_j), with the node values as leaves.
-    let node_fr: Vec<Vec<R>> = node_preds
-        .iter()
-        .map(|ps| ps.iter().map(|p| rinput(p.v)).collect())
-        .collect();
+    let ng_q = ng_r.as_ref().map_or(R::c(0.0), |n| n.q);
     let a = if grid.is_empty() {
-        inner_l(ctx, &fr, &er, &pr, None)? + half_logdet
+        inner_l(ctx, &fr, &er, &pr, None)? + ng_q + half_logdet
     } else {
         let mut terms: Vec<R> = Vec::with_capacity(grid.len());
-        for ((z, c, b0), (ps, fl)) in grid.iter().zip(node_preds.iter().zip(&node_fr)) {
+        for (j, ((z, c, b0), (ps, fl))) in
+            grid.iter().zip(node_preds.iter().zip(&node_fr)).enumerate()
+        {
             // b = η̂ + √2·L⁻ᵀz on the tape.
             let mut step = [R::c(0.0); N];
             for i in (0..N).rev() {
@@ -3039,7 +5164,19 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
                     )
                 })
                 .collect();
-            terms.push(R::c(*c) - inner_l(ctx, &fb, &b, &pr, None)?);
+            // The term at the node, linearised in `b` there as the predictions are.
+            let qb = match ng {
+                Some(ng) => {
+                    let gq = &ng.nodes[j].1;
+                    node_qr[j]
+                        + <R as crate::sens::num::PkNum>::wsum3(
+                            0.0,
+                            (0..n_bsv).map(|k| (R::c(gq[k]), b[k] - R::c(b0[k]), one)),
+                        )
+                }
+                None => R::c(0.0),
+            };
+            terms.push(R::c(*c) - (inner_l(ctx, &fb, &b, &pr, None)? + qb));
         }
         let mx = terms.iter().map(|t| t.v).fold(f64::NEG_INFINITY, f64::max);
         let sum = <R as crate::sens::num::PkNum>::wsum3(
@@ -3048,7 +5185,12 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         );
         R::c(0.5 * active as f64 * std::f64::consts::PI.ln()) + half_logdet - (R::c(mx) + sum.ln())
     };
-    let lg = inner_grad(ctx, &fr, &gr, &er, &pr, None)?;
+    let mut lg = inner_grad(ctx, &fr, &gr, &er, &pr, None)?;
+    if let Some(ngr) = ng_r.as_ref() {
+        for k in 0..N {
+            lg[k] = lg[k] + ngr.g[k];
+        }
+    }
 
     // ---- sweep 1: A's adjoints; under the exact anchor, S's eigen-directions --------
     let s1 = rsweep::<1>(&[a]).to_vec();
@@ -3079,13 +5221,18 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     };
     // The recording at η̂, along `dirs` (tangent m is the derivative along column m).
     let et = eta_leaves::<N, M2, TH>(eta, &dirs);
-    let p2 = record(model, subject, lay, theta, eta, &lv, &et)?;
+    let p2 = if n_obs == 0 {
+        Vec::new()
+    } else {
+        record(model, subject, lay, theta, eta, &lv, &et)?
+    };
     if p2.len() != n_obs {
         return None;
     }
     // `weights`: whether the θ adjoint is wanted (sweep 2), so the networks' backward
     // passes run once.
-    let sweep = |adj: &[f64], weights: bool| -> Option<([f64; N], Vec<f64>)> {
+    // `adj`: an output's adjoints on the scalar tape.
+    let sweep = |adj: TapeAdj<'_>, weights: bool| -> Option<([f64; N], Vec<f64>)> {
         let vadj = vadj_init::<1>();
         let mut top = 0usize;
         let mut put = |node: u32, comp: usize, v: f64| {
@@ -3096,12 +5243,12 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         };
         for j in 0..n_obs {
             let p = &p2[j];
-            put(p.i, 0, ra(adj, fr[j]));
+            put(p.i, 0, adj.at(fr[j]));
             for m in 0..N {
                 put(
                     p.i,
                     1 + m,
-                    (0..N).map(|k| ra(adj, gr[j][k]) * dirs[k][m]).sum(),
+                    (0..N).map(|k| adj.at(gr[j][k]) * dirs[k][m]).sum(),
                 );
             }
             if TH {
@@ -3111,16 +5258,21 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
                         for l in 0..N {
                             let t = crate::sens::vtape::tri(k, l);
                             let w = if k == l { 1.0 } else { 0.5 };
-                            s += dirs[k][m] * dirs[l][m] * w * ra(adj, qr[j][t]);
+                            s += dirs[k][m] * dirs[l][m] * w * adj.at(qr[j][t]);
                         }
                     }
                     put(p.i, 1 + N + m, s);
                 }
             }
         }
-        for (ps, fl) in node_preds.iter().zip(&node_fr) {
-            for (p, &f) in ps.iter().zip(fl) {
-                put(p.i, 0, ra(adj, f));
+        // The node recordings are functions of θ alone (their `b_j` are constants), so they
+        // feed only the θ adjoint: sweep 1, which keeps the η one, leaves them unseeded and
+        // `vsweep` skips their all-zero subgraphs (#2481 §2.1).
+        if weights {
+            for (ps, fl) in node_preds.iter().zip(&node_fr) {
+                for (p, &f) in ps.iter().zip(fl) {
+                    put(p.i, 0, adj.at(f));
+                }
             }
         }
         let vs = if TH {
@@ -3135,25 +5287,41 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         if let (Some((red, z)), true) = (&nn_out, weights) {
             add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
         }
-        #[cfg(not(feature = "nn"))]
-        let _ = weights;
         Some((
-            std::array::from_fn(|k| ra(adj, er[k]) + at(&et[k])),
+            std::array::from_fn(|k| adj.at(er[k]) + at(&et[k])),
             theta_adj,
         ))
     };
-    let (grad_eta, _) = sweep(&s1, false)?;
+    let (mut grad_eta, _) = sweep(TapeAdj::Plain(&s1), false)?;
+    // The term's inputs at η̂ move with η̂ through their own η-derivatives (the node values'
+    // movement is the linearisation's, already on the tape).
+    if let (Some(ngr), Some(ng)) = (ng_r.as_ref(), ng) {
+        let d = ng_eta_contraction(&ng.jets, ngr, |x| ra(&s1, x));
+        for k in 0..n_bsv {
+            grad_eta[k] += d[k];
+        }
+    }
     let grad_l: Vec<f64> = lg.iter().map(|l| l.v).collect();
     // `held`: past a declined mode solve, `w = 0` makes `Ψ = A`, the held-EBE score
     // (`subject_adjoint_held_ebe_score`).
     let b = DVector::from_column_slice(&grad_eta);
     // `frozen = None` on both sides: AGQ's `l` is the conditional one (`lg` above), so the
     // gate judges the objective the identity differentiates.
+    let mut at_mode = true;
     let w = match mode_solve(&h_inner, &b, &grad_l, || {
-        inner_search_gradient::<N>(model, subject, lay, theta, eta, ctx, pv, None)
+        let mut g = inner_search_gradient::<N>(model, subject, lay, theta, eta, ctx, pv, None)?;
+        if let Some(ng) = ng {
+            for (gk, qk) in g.iter_mut().zip(&ng.jets.g) {
+                *gk += qk;
+            }
+        }
+        Some(g)
     }) {
         Some(w) => w,
-        None if held => DVector::zeros(N),
+        None if held => {
+            at_mode = false;
+            DVector::zeros(N)
+        }
         None => return None,
     };
 
@@ -3161,9 +5329,57 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let psi =
         a - <R as crate::sens::num::PkNum>::wsum3(0.0, (0..N).map(|k| (R::c(w[k]), lg[k], one)));
     let s2 = rsweep::<1>(&[psi]).to_vec();
-    let (_, theta_adj) = sweep(&s2, true)?;
+    let (_, mut theta_adj) = sweep(TapeAdj::Plain(&s2), true)?;
     let psi_of = |x: R| -> f64 { ra(&s2, x) };
-    Some(packed_gradient(
+    // ---- the mode response's sweeps, as [`run`] forms it for FOCE(I) (#2549) -----------
+    // The quadrature is centred on the conditional mode `η̂ = argmin l`, whatever the
+    // anchor, so its response is `dη̂/dx = −H⁻¹ ∂(∇_η l)/∂x` with `H = ∇²_η l` the exact
+    // inner Hessian (`h_inner`; the FOCEI anchor's `H̃` places the nodes, it is not the
+    // mode's derivative). Rows `y_r = Σ_k Z_rk (∇_η l)_k`, `Z` the BSV rows of `H⁻¹` held
+    // constant, so `dη̂_r/dx = −∂y_r/∂x`: swept together over the scalar tape as lanes and
+    // read in place, then each back through the recording at `η̂`, as Ψ is (a lane-batched
+    // second-order sweep measured slower than one per row: the lanes multiply what every
+    // node carries) — here, before the non-Gaussian term's θ
+    // block below records over the scalar tape. Not at a declined mode (`held`), where
+    // there is no identity to differentiate.
+    let response = match &eta_dx {
+        Some(o) if o.want_dx && at_mode => {
+            let rows = eta_dx_outputs::<N>(&h_inner, &lg, active.min(N), n_bsv.min(active).min(N));
+            let chunks = sweep_lanes(&rows, n_in);
+            let mut tas = Vec::with_capacity(rows.len());
+            for r in 0..rows.len() {
+                tas.push(sweep(TapeAdj::Lane(&chunks, r), true)?.1);
+            }
+            Some((rows.len(), chunks, tas))
+        }
+        _ => None,
+    };
+    // The term's θ-derivatives: at η̂ through `(q, ∇q, ∇²q)`, at each node through its value.
+    if let (Some(ngr), Some(_)) = (ng_r.as_ref(), ng) {
+        let (a_q, a_g, a_h) = ng_adjoints(ngr, n_bsv, psi_of);
+        let mut add = |d: Vec<f64>| {
+            for (t, dv) in theta_adj.iter_mut().zip(d) {
+                *t += dv;
+            }
+        };
+        // One sweep for the term at η̂ (its value, ∇q and ∇²q) and at every node (its value).
+        let mut parts = vec![NgSeed {
+            eta: &eta[..n_bsv],
+            a_q,
+            a_g: &a_g,
+            a_h: &a_h,
+        }];
+        for ((_, _, b), &qr) in grid.iter().zip(&node_qr) {
+            parts.push(NgSeed {
+                eta: &b[..n_bsv],
+                a_q: psi_of(qr),
+                a_g: &[],
+                a_h: &[],
+            });
+        }
+        add(ng_theta_adjoint(model, subject, theta, &parts)?);
+    }
+    let out = packed_gradient(
         model,
         template,
         params,
@@ -3174,14 +5390,76 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         &om,
         so,
         pv,
-    ))
+    );
+    // The response's non-Gaussian θ block and its packing, from the adjoints taken above.
+    if let Some(o) = eta_dx {
+        o.eta_dx = None;
+        // The exact inner Hessian the identity above solved with, over the live block: the
+        // same kernel on the same jets as `exact_inner_hessian`, whose one extra decline is
+        // shared here so the objective's anchor is one function whichever pass forms it.
+        o.hessian = (o.want_hessian && at_mode && !iov_frem_mismatch(model, subject))
+            .then(|| h_inner.view((0, 0), (active, active)).into_owned())
+            .filter(|h| h.iter().all(|v| v.is_finite()));
+        if let Some((n_rows, chunks, mut tas)) = response.filter(|(n, _, _)| *n > 0) {
+            if let Some(ngr) = ng_r.as_ref() {
+                let seeds: Vec<_> = (0..n_rows)
+                    .map(|r| ng_adjoints(ngr, n_bsv, |v| lane_adj(&chunks, r, v)))
+                    .collect();
+                let d = ng_theta_adjoint_seeds(model, subject, theta, &eta[..n_bsv], &seeds)?;
+                for (ta, d) in tas.iter_mut().zip(d) {
+                    for (t, dv) in ta.iter_mut().zip(d) {
+                        *t += dv;
+                    }
+                }
+            }
+            let mut cols = vec![DVector::<f64>::zeros(n_rows); x.len()];
+            for (r, ta) in tas.iter().enumerate() {
+                let of = |v: R| lane_adj(&chunks, r, v);
+                let row =
+                    packed_gradient(model, template, params, x.len(), ta, &of, &pr, &om, so, pv);
+                for (c, v) in cols.iter_mut().zip(row) {
+                    c[r] = -v;
+                }
+            }
+            let ok = cols.iter().all(|c| c.iter().all(|v| v.is_finite()));
+            o.eta_dx = ok.then_some(cols);
+        }
+    }
+    Some(out)
+}
+
+/// Output `r`'s adjoint at recorded input `v`, from [`sweep_lanes`].
+#[inline]
+fn lane_adj(chunks: &[(usize, usize, Vec<f64>)], r: usize, v: R) -> f64 {
+    TapeAdj::Lane(chunks, r).at(v)
+}
+
+/// One output's adjoints on the scalar tape: a single-lane buffer, or output `r` of
+/// [`sweep_lanes`] read in place (at recorded inputs only).
+#[derive(Clone, Copy)]
+enum TapeAdj<'a> {
+    Plain(&'a [f64]),
+    Lane(&'a [(usize, usize, Vec<f64>)], usize),
+}
+
+impl TapeAdj<'_> {
+    #[inline]
+    fn at(self, v: R) -> f64 {
+        v.idx().map_or(0.0, |i| match self {
+            TapeAdj::Plain(adj) => adj[i],
+            TapeAdj::Lane(chunks, r) => {
+                let (lanes, _, buf) = &chunks[r / DX_LANES];
+                buf[i * lanes + r % DX_LANES]
+            }
+        })
+    }
 }
 
 #[path = "ode_adjoint_hessian.rs"]
 mod hessian;
 pub(crate) use hessian::{
-    cov_width_declines, subject_adjoint_cov_block_at, subject_adjoint_cov_diag_at,
-    subject_adjoint_cov_hessian_at, subject_adjoint_eta_dx_at,
+    cov_non_gaussian_served, cov_width_declines, subject_adjoint_cov_block_at,
+    subject_adjoint_cov_diag_at, subject_adjoint_cov_hessian_at, subject_adjoint_eta_dx_at,
 };
 #[cfg(test)]
 pub(crate) use hessian::{subject_adjoint_cov_hessian, subject_adjoint_eta_dx};

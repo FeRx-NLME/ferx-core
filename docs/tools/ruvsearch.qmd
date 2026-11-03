@@ -268,4 +268,4 @@ for feature in &result.features {
 ```
 
 `RuvsearchRun` takes the directory, a thread override, a cancel flag and a
-progress callback; every field is optional.
+progress callback; every field is optional. Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_tools::search::CandidateFinished`, #2512).

@@ -1015,6 +1015,44 @@ fn numerical_mstep_scope_gap(
     None
 }
 
+/// One mu-referenced θ's closed-form SAEM shift: moves the packed θ by `γ·mean(η)` on its
+/// mu scale, clamped to its packed `bounds`, then re-centres every η — the current draw and
+/// the extra draws — by the change it **realised**. Not by `γ·mean(η)`: when the clamp bites
+/// the realised change is smaller, and re-centring by the unclamped quantity would break
+/// `g(P_i) = g(TVP) + η_i` until the next MH refresh (#2548). `additive` (`P = θ + η`) shifts
+/// the natural θ and repacks it, since a θ with a non-negative lower bound packs as `log θ`
+/// and its packing is then not its mu scale (#2540); otherwise the packed value is the mu.
+#[allow(clippy::too_many_arguments)]
+fn closed_form_mu_shift(
+    packed: &mut f64,
+    bounds: (f64, f64),
+    packs_log: bool,
+    additive: bool,
+    gamma: f64,
+    etas: &mut [Vec<f64>],
+    extra_eta_draws: &mut [Vec<Vec<f64>>],
+    eta_idx: usize,
+) {
+    let (lo, hi) = bounds;
+    let mean_eta: f64 = etas.iter().map(|e| e[eta_idx]).sum::<f64>() / etas.len() as f64;
+    let before_packed = *packed;
+    let delta = if additive {
+        let unpack = |v: f64| if packs_log { v.exp() } else { v };
+        let pack = |t: f64| if packs_log { t.max(1e-10).ln() } else { t };
+        let before = unpack(before_packed);
+        let after = (before + gamma * mean_eta).clamp(unpack(lo), unpack(hi));
+        *packed = pack(after).clamp(lo, hi);
+        unpack(*packed) - before
+    } else {
+        *packed = (before_packed + gamma * mean_eta).clamp(lo, hi);
+        *packed - before_packed
+    };
+    for e in etas.iter_mut() {
+        e[eta_idx] -= delta;
+    }
+    recentre_eta_draws(extra_eta_draws, eta_idx, delta);
+}
+
 /// Apply the same re-centring a closed-form mu-reference shift makes to
 /// `state.etas` to the stored previous draws of the K-draw M-step objective
 /// (#1458).
@@ -3195,19 +3233,21 @@ fn saem_mixing_warning(
 /// |--------------------|------------|--------------------------|
 /// | `Log`              | `log θ`    | theta is **log**-packed  |
 /// | `Logit`            | `θ`        | theta is identity-packed |
-/// | `Identity`         | `θ`        | never (see below)        |
+/// | `Identity`         | `θ`        | never on the packed scale — see `additive` |
 /// | `LogitProbability` | `logit θ`  | never — no packing matches |
 ///
 /// A `Logit` mu-ref (`P = inv_logit(THETA + ETA)`) declares its theta on the
 /// logit scale, so its lower bound is negative and it is identity-packed — the
 /// packed value *is* the mu (#918).
 ///
-/// Additive mu-refs are left out even when identity-packed: they are the
-/// historical behaviour of this function, they are rare in practice, and the
-/// change is not needed to fix #918. `LogitProbability`
-/// (`inv_logit(logit(THETA) + ETA)`) has no packing whose scale is `logit θ`,
-/// so the closed form does not apply. Both fall through to the regular NLopt
-/// M-step, which is correct for any parameterisation, just slower.
+/// Additive mu-refs (`P = THETA + ETA`) are not in this list. SAEM takes them
+/// through [`MuRefPairs::additive`] instead, shifting the **natural** θ whatever
+/// its packing (#2540). IMP/IMPMAP read only `eligible` and step the packed
+/// value, so for them an additive anchor stays on the numerical M-step.
+/// `LogitProbability` (`inv_logit(logit(THETA) + ETA)`) has no packing whose
+/// scale is `logit θ`, so the closed form does not apply and it falls through
+/// to the regular NLopt M-step, which is correct for any parameterisation, just
+/// slower.
 ///
 /// `theta_lower` is the same lower-bound vector `run_saem` derives its packing
 /// mask from (`init_params.theta_lower`), not `model.default_params`, so a
@@ -3231,6 +3271,15 @@ pub(crate) struct MuRefPairs {
     /// `(theta_idx, eta_idx)` pairs whose packed scale is their mu scale, each
     /// theta owned by exactly one eta (see `shared_theta`).
     pub eligible: Vec<(usize, usize)>,
+    /// Additive anchors (`P = THETA + ETA`), each theta owned by exactly one
+    /// eta. Their mu scale is the natural θ, which no packing rule guarantees
+    /// is the packed one (a θ with a lower bound of 0 packs as `log θ`), so they
+    /// are kept apart from `eligible`: SAEM shifts them as `θ += γ·mean(η)` on
+    /// the natural scale and repacks (#2540). Without the shift they sit on a
+    /// ridge with `mean(η)` that the η-frozen numerical M-step crawls along —
+    /// on `mbma_placebo` 1–11 OFV above the exact MLE, as NONMEM SAEM without
+    /// `MU_` does too.
+    pub additive: Vec<(usize, usize)>,
     /// Lognormal anchors (`THETA*exp(ETA)`) whose theta is identity-packed
     /// because its lower bound is negative.
     pub identity_packed_log: Vec<usize>,
@@ -3260,6 +3309,16 @@ pub(crate) struct MuRefPairs {
 pub(crate) fn mu_ref_pairs_for_cov_groups(split: &MuRefPairs) -> Vec<(usize, usize)> {
     let mut v = split.eligible.clone();
     v.extend(split.shared_pairs.iter().copied());
+    v
+}
+
+/// SAEM's version of [`mu_ref_pairs_for_cov_groups`]: SAEM also runs the
+/// additive shift (`MuRefPairs::additive`, #2540), so a covariate group must not
+/// claim those pairs either. `run_saem` and `saem_active_covariate_group_etas`
+/// both read this one, so the warning and the run cannot disagree.
+pub(crate) fn saem_mu_ref_pairs_for_cov_groups(split: &MuRefPairs) -> Vec<(usize, usize)> {
+    let mut v = mu_ref_pairs_for_cov_groups(split);
+    v.extend(split.additive.iter().copied());
     v
 }
 
@@ -3303,6 +3362,7 @@ pub(crate) fn packed_scale_is_mu(transform: MuTransform, packs_log: bool) -> boo
 pub(crate) fn classify_mu_ref_pairs(model: &CompiledModel, theta_lower: &[f64]) -> MuRefPairs {
     let mut out = MuRefPairs {
         eligible: Vec::new(),
+        additive: Vec::new(),
         identity_packed_log: Vec::new(),
         log_packed_logit: Vec::new(),
         shared_theta: Vec::new(),
@@ -3316,7 +3376,7 @@ pub(crate) fn classify_mu_ref_pairs(model: &CompiledModel, theta_lower: &[f64]) 
     // eligible) would shift and pin `TVP` by `mean(η_CL)` while `ETA_V` is
     // never re-centred for that delta. Scanning `eligible` alone misses it
     // (#918 review).
-    let mut declared: Vec<(usize, usize, bool)> = Vec::new();
+    let mut declared: Vec<(usize, usize, bool, MuTransform)> = Vec::new();
     for (eta_idx, eta_name) in model.eta_names.iter().enumerate() {
         let Some(mu_ref) = model.mu_refs.get(eta_name) else {
             continue;
@@ -3341,22 +3401,25 @@ pub(crate) fn classify_mu_ref_pairs(model: &CompiledModel, theta_lower: &[f64]) 
                 MuTransform::Identity | MuTransform::LogitProbability => {}
             }
         }
-        declared.push((theta_idx, eta_idx, eligible));
+        declared.push((theta_idx, eta_idx, eligible, mu_ref.transform));
     }
     // Drop every pair on a theta claimed by more than one eta (see the doc
     // comment): both pairs go, the theta goes to the numerical M-step.
     let mut shared: Vec<usize> = Vec::new();
-    for (i, &(t, _, _)) in declared.iter().enumerate() {
+    for (i, &(t, _, _, _)) in declared.iter().enumerate() {
         if declared
             .iter()
             .enumerate()
-            .any(|(j, &(t2, _, _))| j != i && t2 == t)
+            .any(|(j, &(t2, _, _, _))| j != i && t2 == t)
         {
             shared.push(t);
         }
     }
-    for &(t, e, eligible) in &declared {
+    for &(t, e, eligible, transform) in &declared {
         if !eligible {
+            if transform == MuTransform::Identity && !shared.contains(&t) {
+                out.additive.push((t, e));
+            }
             continue;
         }
         if shared.contains(&t) {
@@ -3576,6 +3639,26 @@ pub(crate) enum NoClassMoveCause {
     /// identity-packed and their pair — every class theta, not only these — is
     /// not eligible.
     IdentityPacked(Vec<String>),
+}
+
+/// The advisory for additive mu-referenced typical values under a `[mixture]` (#2548): they
+/// take SAEM's natural-scale closed-form shift only in a single-population fit (#2540), since
+/// the class-aware mixture shift has no additive arm, so here they stay on the numerical
+/// M-step — the ridge #2540 measured — with nothing else saying so. The remedy names the
+/// non-negative lower bound because a log-normal θ with a negative one is identity-packed and
+/// stays numerical too (`classify_mixture_mu_ref_pairs`, #996). It names FOCEI as the check
+/// because IMP/IMPMAP put an additive θ on a numerical M-step as well.
+pub(crate) fn mixture_additive_mu_ref_warning(names: &[&str]) -> String {
+    format!(
+        "SAEM: the additive mu-referenced typical value(s) {} (`P = θ + η`) are estimated by \
+         the numerical M-step in this [mixture] model. SAEM's closed-form shift for an \
+         additive typical value runs only in a single-population fit; the class-aware \
+         mixture shift has no additive arm yet. On a single population that numerical \
+         M-step stopped 1–11 OFV above the maximum likelihood (#2540). Check these values \
+         against a FOCEI fit, or write the parameter log-normal (`P = θ·exp(η)`) with a \
+         non-negative lower bound, which the mixture shift covers (#2548).",
+        names.join(", ")
+    )
 }
 
 /// The warning for a class-switched value whose class SAEM cannot move (#2458).
@@ -4325,9 +4408,10 @@ pub fn run_saem(
     let mu_ref_split = classify_mu_ref_pairs(model, &init_params.theta_lower);
     // What a #619 covariate group may not collide with — every declared anchor
     // pair, including the ones the shared-anchor rule just dropped.
-    let cov_group_conflicts = mu_ref_pairs_for_cov_groups(&mu_ref_split);
+    let cov_group_conflicts = saem_mu_ref_pairs_for_cov_groups(&mu_ref_split);
     let MuRefPairs {
         eligible: mu_ref_pairs,
+        additive: additive_mu_ref_pairs,
         identity_packed_log: dropped_identity,
         log_packed_logit: dropped_log_packed_logit,
         shared_theta: dropped_shared_theta,
@@ -4427,6 +4511,17 @@ pub fn run_saem(
     // under a mixture: the class draw would have to enter the group's prior
     // term and that has not been derived. Same `mu_referencing` gate as the
     // closed-form shift — with it off every theta is numerical by design.
+    // Additive anchors (`P = THETA + ETA`) join the single-population shift with
+    // a natural-scale step (#2540); `additive_shift[t]` routes theta `t` to it.
+    // Not under a mixture, whose class-aware shift has no additive arm.
+    let mut mu_ref_pairs = mu_ref_pairs;
+    let mut additive_shift = vec![false; n_theta];
+    if saem_mix.is_none() {
+        for &(t, e) in &additive_mu_ref_pairs {
+            mu_ref_pairs.push((t, e));
+            additive_shift[t] = true;
+        }
+    }
     let (cov_mu_groups, cov_mu_notes) = if saem_mix.is_none() && options.mu_referencing {
         crate::estimation::covariate_mu_ref::resolve_covariate_mu_groups(
             model,
@@ -4517,6 +4612,17 @@ pub fn run_saem(
                 )
             };
             warnings.push(no_class_move_warning(&names, &cause));
+        }
+        // An additive anchor is dropped from the shift under a mixture (`additive_shift`
+        // above). Same `mu_referencing` gate as every closed-form advisory: with it off
+        // every θ is numerical by design.
+        let additive: Vec<&str> = additive_mu_ref_pairs
+            .iter()
+            .filter(|&&(t, _)| !init_params.theta_fixed.get(t).copied().unwrap_or(false))
+            .map(|&(t, _)| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+            .collect();
+        if !additive.is_empty() && options.mu_referencing {
+            warnings.push(mixture_additive_mu_ref_warning(&additive));
         }
     }
     let mut dropped_identity = dropped_identity;
@@ -5682,16 +5788,17 @@ pub fn run_saem(
                 //     g(TVP)_new = g(TVP)_old + mean_i(η_i)
                 // and SAEM applies the stochastic-approximation step size γ:
                 //     g(TVP)_new = g(TVP)_old + γ · mean_i(η_i)
-                // `log_theta[j]` *is* g(TVP) for every pair in `mu_ref_pairs`
-                // (that is what `classify_mu_ref_pairs` screens for), so the shift
-                // below is applied to the packed value directly, whichever link
-                // the parameter uses.
+                // `log_theta[j]` *is* g(TVP) for every eligible pair in
+                // `mu_ref_pairs` (that is what `classify_mu_ref_pairs` screens
+                // for), so the shift below is applied to the packed value
+                // directly, whichever link the parameter uses. An additive pair
+                // (`additive_shift`, #2540) is shifted on the natural scale and
+                // repacked instead, since its packing need not be its mu scale.
                 // After the update, η_i is re-centred by `mean(η)` so the
                 // sufficient statistic for ω is taken from zero-mean residuals
                 // (ω is updated from `s2` *after* the next MH step, but
                 // re-centring keeps `state.etas` consistent with the new TVP
                 // for the rest of this iteration's NLL cache refresh).
-                let n_subj = state.etas.len() as f64;
                 let mut temp_theta_lower = log_theta_lower.clone();
                 let mut temp_theta_upper = log_theta_upper.clone();
                 let mut n_pinned: u64 = 0;
@@ -5704,20 +5811,16 @@ pub fn run_saem(
                     {
                         continue;
                     }
-                    let mean_eta: f64 = state.etas.iter().map(|e| e[eta_idx]).sum::<f64>() / n_subj;
-                    let log_theta_before = log_theta[theta_idx];
-                    log_theta[theta_idx] = (log_theta_before + gamma * mean_eta)
-                        .clamp(log_theta_lower[theta_idx], log_theta_upper[theta_idx]);
-                    // Re-centre etas by the *actual* shift applied to log_theta,
-                    // not by `gamma * mean_eta` directly: when the update is
-                    // clamped at a bound the realised delta is smaller, and
-                    // shifting etas by the unclamped quantity would break
-                    // g(P_i) = g(TVP) + η_i until the next MH refresh.
-                    let delta = log_theta[theta_idx] - log_theta_before;
-                    for e in state.etas.iter_mut() {
-                        e[eta_idx] -= delta;
-                    }
-                    recentre_eta_draws(&mut extra_eta_draws, eta_idx, delta);
+                    closed_form_mu_shift(
+                        &mut log_theta[theta_idx],
+                        (log_theta_lower[theta_idx], log_theta_upper[theta_idx]),
+                        theta_packs_log_mask[theta_idx],
+                        additive_shift[theta_idx],
+                        gamma,
+                        &mut state.etas,
+                        &mut extra_eta_draws,
+                        eta_idx,
+                    );
                     // Pin so NLopt leaves the closed-form value unchanged.
                     temp_theta_lower[theta_idx] = log_theta[theta_idx];
                     temp_theta_upper[theta_idx] = log_theta[theta_idx];
@@ -6691,6 +6794,7 @@ pub fn run_saem(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal,
@@ -6702,6 +6806,7 @@ pub fn run_saem(
         stationary_start: false,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
     })
 }
 
@@ -7578,6 +7683,93 @@ mod tests {
             opts.iov_column = Some("OCC".to_string());
         }
         crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok")
+    }
+
+    /// #2548 item 1: an additive mu-referenced typical value under a `[mixture]` is named
+    /// at run time, because the class-aware shift drops it to the numerical M-step. One test,
+    /// both sides of each gate: the `mix996` mixture with `V = TVV + ETA_V` names TVV, and
+    /// only TVV (the switched TVCL1/TVCL2 take the class-aware shift); the same model with
+    /// the `[mixture]` block removed and CL on one θ does not warn, since there TVV takes the
+    /// natural-scale shift; the mixture under `mu_referencing = false`, where every θ is
+    /// numerical by design, does not warn either; nor does the mixture with TVV FIX.
+    #[test]
+    fn an_additive_anchor_under_a_mixture_is_named() {
+        let hit = |ws: &[String]| {
+            ws.iter()
+                .find(|w| w.contains("additive mu-referenced typical value"))
+                .cloned()
+        };
+        let fit = |src: &str, mu_referencing: bool| {
+            let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+            let mut opts = FitOptions::default();
+            opts.method = crate::types::EstimationMethod::Saem;
+            opts.saem_n_exploration = 4;
+            opts.saem_n_convergence = 2;
+            opts.saem_seed = Some(2548);
+            opts.run_covariance_step = false;
+            opts.mu_referencing = mu_referencing;
+            crate::api::fit(&model, &mix996_pop(3), &model.default_params, &opts)
+                .expect("SAEM Ok")
+                .warnings
+        };
+        let mixture = mix996_src("TVV + ETA_V");
+        let single = mixture
+            .replace("  theta TVCL2(3.0, 0.01, 100.0)\n", "")
+            .replace("  theta MIXL(0.0, -10.0, 10.0)\n", "")
+            .replace("[mixture]\n  nsub = 2\n  logit(1) = MIXL\n", "")
+            .replace(
+                "if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)",
+                "TVCL1 * exp(ETA_CL)",
+            );
+        assert!(
+            !single.contains("[mixture]") && !single.contains("MIXNUM"),
+            "the single-population twin still has a mixture"
+        );
+
+        let ws = fit(&mixture, true);
+        let w = hit(&ws).unwrap_or_else(|| panic!("no advisory under a mixture: {ws:?}"));
+        assert!(w.contains("TVV"), "names the additive θ: {w}");
+        assert!(
+            !w.contains("TVCL1") && !w.contains("TVCL2"),
+            "names only the additive θ: {w}"
+        );
+        let ws = fit(&single, true);
+        assert!(
+            hit(&ws).is_none(),
+            "a single population takes the shift: {ws:?}"
+        );
+        let ws = fit(&mixture, false);
+        assert!(hit(&ws).is_none(), "mu_referencing off: {ws:?}");
+        // A FIX θ is not estimated at all, so it is on no M-step to warn about.
+        let fixed = mixture.replace(
+            "theta TVV(10.0, 0.1, 1000.0)\n",
+            "theta TVV(10.0, 0.1, 1000.0) FIX\n",
+        );
+        assert_ne!(fixed, mixture, "the FIX twin did not change the model");
+        let ws = fit(&fixed, true);
+        assert!(hit(&ws).is_none(), "a FIX additive θ: {ws:?}");
+    }
+
+    /// The advisory's sentences, each pinned: what happens to the named θ, why (the
+    /// single-population shift has no class-aware arm), what that costs (the #2540
+    /// measurement), and what to do. Deleting any one sentence fails here.
+    #[test]
+    fn the_mixture_additive_advisory_says_what_why_cost_and_remedy() {
+        let w = mixture_additive_mu_ref_warning(&["TVE0", "TVEMAX"]);
+        for part in [
+            "typical value(s) TVE0, TVEMAX (`P = θ + η`) are estimated by the numerical M-step \
+             in this [mixture] model",
+            "runs only in a single-population fit",
+            "the class-aware mixture shift has no additive arm yet",
+            "stopped 1–11 OFV above the maximum likelihood (#2540)",
+            "against a FOCEI fit",
+            "(`P = θ·exp(η)`) with a non-negative lower bound",
+            "which the mixture shift covers (#2548)",
+        ] {
+            assert!(w.contains(part), "missing {part:?} in {w}");
+        }
+        // IMP/IMPMAP share the limit, so the message must not offer them as the check.
+        assert!(!w.contains("IMP"), "offers IMP/IMPMAP as the check: {w}");
     }
 
     fn switched_warning(res: &crate::types::FitResult) -> Option<&String> {
@@ -9872,6 +10064,81 @@ DV ~ additive(EPS)
         assert!(split.log_packed_logit.is_empty());
         // The dropped pair still counts as a conflict for a #619 group.
         assert_eq!(mu_ref_pairs_for_cov_groups(&split), vec![(1, 2), (0, 0)]);
+        // A shared theta takes no additive shift either (#2540): shifting `TVP`
+        // by `mean(η_V)` would move `CL` without re-centring `ETA_CL`.
+        assert!(split.additive.is_empty(), "{:?}", split.additive);
+    }
+
+    /// An additive anchor (`P = THETA + ETA`) gets SAEM's natural-scale shift
+    /// whatever its packing (#2540): the shipped MBMA `TVE0(45, 0, 200)` packs as
+    /// `log θ`, and leaving it numerical put SAEM 1–11 OFV above the exact MLE.
+    /// It never joins `eligible`, which IMP/IMPMAP step on the packed scale.
+    #[test]
+    fn classify_mu_ref_pairs_routes_an_additive_anchor_to_additive_on_either_packing() {
+        let m = model_with_mu_refs(
+            &["TVE0", "TVCL"],
+            &["ETA_E0", "ETA_CL"],
+            &[
+                ("ETA_E0", "TVE0", MuTransform::Identity),
+                ("ETA_CL", "TVCL", MuTransform::Log),
+            ],
+        );
+        for (lower_e0, packing) in [(0.0, "log"), (-200.0, "identity")] {
+            let split = classify_mu_ref_pairs(&m, &[lower_e0, 0.0]);
+            assert_eq!(split.additive, vec![(0, 0)], "{packing}-packed TVE0");
+            assert_eq!(split.eligible, vec![(1, 1)], "{packing}-packed TVE0");
+            assert!(
+                split.identity_packed_log.is_empty(),
+                "{packing}-packed TVE0"
+            );
+            assert!(split.shared_theta.is_empty(), "{packing}-packed TVE0");
+            // SAEM's group conflicts see the additive pair; the packed-scale
+            // list IMP/IMPMAP use does not.
+            assert_eq!(mu_ref_pairs_for_cov_groups(&split), vec![(1, 1)]);
+            assert_eq!(
+                saem_mu_ref_pairs_for_cov_groups(&split),
+                vec![(1, 1), (0, 0)]
+            );
+        }
+    }
+
+    /// T4 (#2544): on the shipped one-line `mbma_placebo`
+    /// (`BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`) SAEM's pair split routes
+    /// `(TVE0, ETA_E0)` to the natural-scale additive shift, as it does for the split
+    /// spelling; with TVE0 also read in `[structural_model]` the pair is nowhere, so
+    /// TVE0 takes the numerical M-step. Dies under: the one-line arm
+    /// (`additive_sum_anchor`) dropped, or the exclusivity gate dropped.
+    #[test]
+    fn classify_mu_ref_pairs_routes_the_one_line_mbma_anchor_to_additive() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/mbma_placebo/mbma_placebo.ferx"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let shared_text = text.replace(
+            "  y    = BASE - DRUG\n",
+            "  y    = BASE - DRUG + 0 * TVE0\n",
+        );
+        assert_ne!(text, shared_text, "the structural line moved");
+        let split_of = |src: &str| {
+            let m = crate::parser::model_parser::parse_full_model(src)
+                .expect("parses")
+                .model;
+            let tve0 = m.theta_names.iter().position(|n| n == "TVE0").unwrap();
+            let e0 = m.eta_names.iter().position(|n| n == "ETA_E0").unwrap();
+            let split = classify_mu_ref_pairs(&m, &m.default_params.theta_lower);
+            (split, tve0, e0)
+        };
+        let (one_line, tve0, e0) = split_of(&text);
+        assert_eq!(one_line.additive, vec![(tve0, e0)], "one-line");
+        assert!(one_line.shared_theta.is_empty(), "one-line");
+        let (shared, _, _) = split_of(&shared_text);
+        assert!(shared.additive.is_empty(), "shared: {:?}", shared.additive);
+        assert!(
+            !shared.eligible.iter().any(|&(t, _)| t == tve0),
+            "shared: {:?}",
+            shared.eligible
+        );
     }
 
     /// …but two *ineligible* anchors on one theta share nothing the closed

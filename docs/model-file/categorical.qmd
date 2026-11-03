@@ -53,9 +53,18 @@ supported; the fixed-effects case needs no `[structural_model]`, `[error_model]`
 `[individual_parameters]` blocks (a logistic-only model can be just `[parameters]` +
 `[binary_model]` + `[fit_options]`).
 
-Covariates on the predictor may vary **with time via the `TIME` builtin** (evaluated
-per observation). A time-varying covariate *column* on the predictor is not yet
-supported; declare a `[covariates]` value used at baseline instead.
+Covariates on the predictor are read **per record**: the `TIME` builtin is the
+record's time, and a covariate column that changes within a subject (an arm, a dose
+group) is read at the record's own value, as a `$PRED` reads the current record (#2562).
+The one exception is a subject that also carries time-to-event records, whose rows the
+reader cannot line up one-to-one with its binary records: a time-varying covariate on
+the predictor is then refused (`E_ENDPOINT_TV_COVARIATE`), since it could only be read
+at baseline.
+
+A θ level block (`theta PLACEBO[STUDY, TIME](0.0)`) may be read in the predictor, as in
+a binary model-based meta-analysis: each record is scored at the level its own columns
+name, and the binary records define the block's levels as Gaussian observations do (see
+[θ level blocks](parameters.qmd)). It cannot be `profile`d there yet (#2111).
 
 ## Data format
 

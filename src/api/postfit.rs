@@ -387,7 +387,7 @@ pub(crate) fn is_last_estimating_stage(
 ///
 /// The #1006 post-fit warning says a fixed-effects-only GN result "may be badly
 /// wrong". That is only true if nothing re-optimises it. `run_foce_gn` exempts
-/// `gn_hybrid` itself, but it cannot exempt a hand-written `methods = [gn, focei]`
+/// `gn_hybrid` itself, but it cannot exempt a hand-written `method = [gn, focei]`
 /// chain — `fit_inner` blanks `stage_opts.methods` per stage, so the GN stage sees
 /// `method = gn` and no chain. This is the other half of that exemption, applied
 /// where the chain *is* visible: a GN stage followed by a further estimating stage
@@ -948,6 +948,15 @@ pub(crate) fn compute_subject_results(
                     &params.theta,
                     eta.as_slice(),
                 ),
+                // TTE per-record residuals at the same EBE, off the curves the OFV
+                // contribution above scored (#901). Empty without a TTE endpoint.
+                #[cfg(feature = "survival")]
+                tte_rows: crate::stats::likelihood::tte_diagnostics(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta.as_slice(),
+                ),
             };
             // Read while the scope is still open; dropping it restores whatever
             // scope (usually none) this worker had before.
@@ -1025,13 +1034,26 @@ pub(crate) fn kappa_weight_typicals(
                                     .is_some_and(|o| occs.contains(o))
                             })
                             .map(|m| (subj.pk_only_cov(m), subj.param_time_pk_only(m)));
-                        pk_only.or_else(|| {
-                            (0..subj.doses.len())
-                                .find(|&d| {
-                                    subj.dose_occasions.get(d).is_some_and(|o| occs.contains(o))
-                                })
-                                .map(|d| (subj.dose_cov(d), subj.dose_param_time(d)))
-                        })
+                        pk_only
+                            .or_else(|| {
+                                (0..subj.doses.len())
+                                    .find(|&d| {
+                                        subj.dose_occasions.get(d).is_some_and(|o| occs.contains(o))
+                                    })
+                                    .map(|d| (subj.dose_cov(d), subj.dose_param_time(d)))
+                            })
+                            // A group only a reset row carries (#1153 review r1 #3).
+                            .or_else(|| {
+                                (0..subj.reset_times.len())
+                                    .find(|&r| {
+                                        subj.reset_occasions
+                                            .get(r)
+                                            .is_some_and(|o| occs.contains(o))
+                                    })
+                                    .map(|r| {
+                                        (subj.reset_cov(r), subj.param_time_at(subj.reset_times[r]))
+                                    })
+                            })
                     };
                     let (cov, time) = match first_obs {
                         Some(&j) => (subj.obs_cov(j), subj.param_time_obs(j)),
@@ -1129,7 +1151,7 @@ pub(crate) fn kappa_shrinkages(
     let informed: Vec<Vec<bool>> = population
         .subjects
         .iter()
-        .map(|s| crate::stats::likelihood::iov_group_informed(s, !model.is_algebraic()))
+        .map(|s| crate::stats::likelihood::iov_group_informed_for(model, s))
         .collect();
     (
         compute_kappa_shrinkage(kappas_per_subject, &informed, omega_iov),
@@ -1199,7 +1221,7 @@ pub(crate) fn nested_kappa_facts(
             }
             continue;
         };
-        let informed = crate::stats::likelihood::iov_group_informed(subj, !model.is_algebraic());
+        let informed = crate::stats::likelihood::iov_group_informed_for(model, subj);
         for (l, entry) in by_level.iter_mut().enumerate() {
             let ks = layout.kappas_at(l);
             let mut group_informed = vec![false; layout.level_count(l)];
@@ -1964,7 +1986,7 @@ fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
 /// non-finite penalty — a prior whose density is zero at the estimate, an
 /// overflowing log-normal prior on a runaway θ — produces a `FitResult` whose
 /// published `ofv` no estimator ever saw. The chained case is the same shape:
-/// `methods = vi, focei` reports the last stage's objective, and a multi-start
+/// `method = [vi, focei]` reports the last stage's objective, and a multi-start
 /// splice re-homes warnings across runs.
 ///
 /// Severity is [`WarningSeverity::Critical`] and the code is

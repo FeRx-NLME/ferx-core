@@ -45,6 +45,7 @@
 //! constructs exactly the constrained direction, so the caller cannot get the
 //! constraint wrong.
 
+pub(crate) mod dtmm;
 pub mod endpoint;
 
 use nalgebra::DMatrix;
@@ -70,7 +71,7 @@ use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 /// rate×time), so it is treated as the degenerate case and repels the optimizer.
 /// The bound sits far below the overflow point (`1e18^10 = 1e180 ≪ f64::MAX`) and
 /// far above any legitimate argument.
-const MAX_EXP_ARG_ABS: f64 = 1e18;
+pub(crate) const MAX_EXP_ARG_ABS: f64 = 1e18;
 
 /// A single continuous-time Markov state observation: the process was seen in
 /// integer `state` at `time`. The CTMM likelihood consumes *consecutive* pairs
@@ -417,7 +418,7 @@ pub(crate) fn has_negative_offdiagonal_g<T: crate::sens::num::PkNum>(q: &[T], s:
 /// pins the identity against the direct per-direction form.
 ///
 /// `dq[a]` must be a valid generator *direction* (zero row sums). The caller gets that for
-/// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_duals`.
+/// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_g`.
 ///
 /// Returns `Ok(None)` where [`ctmm_data_term`] returns `SUBJECT_SENTINEL_NLL`: at a degenerate
 /// generator the value is a flat repellent constant with no meaningful derivative, so the
@@ -644,9 +645,19 @@ pub fn ctmm_inhomogeneous_transition_with_opts(
     // would only coincide for a generator that commutes across time (constant Q,
     // or a scalar-scaled Q(τ)=g(τ)·Q₀); it is wrong for a genuinely non-commuting
     // time-varying generator. `params` is unused — `q_at` captures what it needs.
+    // `P` and `P·Q` reuse two buffers across the stages (#2549): `mul_to` is the product
+    // `*` itself runs, so the values are the allocating form's.
+    let work = std::cell::RefCell::new((DMatrix::<f64>::zeros(s, s), DMatrix::<f64>::zeros(s, s)));
     let rhs = |u: &[f64], _params: &[f64], t: f64, du: &mut [f64]| {
-        let p = DMatrix::from_row_slice(s, s, u);
-        let dp = p * q_at(t);
+        let q = q_at(t);
+        let mut w = work.borrow_mut();
+        let (p, dp) = &mut *w;
+        for i in 0..s {
+            for j in 0..s {
+                p[(i, j)] = u[i * s + j];
+            }
+        }
+        p.mul_to(&q, dp);
         for i in 0..s {
             for j in 0..s {
                 du[i * s + j] = dp[(i, j)];

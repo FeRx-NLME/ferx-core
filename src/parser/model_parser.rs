@@ -1,7 +1,7 @@
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::sim::adaptive::{
     validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, DoseStep,
+    Comparison, DoseStep, IntervalStep,
 };
 use crate::types::*;
 use regex::Regex;
@@ -600,7 +600,14 @@ fn detect_mu_refs(
     eta_names: &[String],
     nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
-    detect_mu_refs_with_owners(stmts, theta_names, eta_names, nn_specs)
+    let scan = MuRefScan {
+        theta_names,
+        eta_names,
+        n_bsv: eta_names.len(),
+        outside_idents: &HashSet::new(),
+        nn_specs,
+    };
+    detect_mu_refs_with_owners(stmts, &scan)
         .into_iter()
         .map(|(eta, (mu_ref, _owner))| (eta, mu_ref))
         .collect()
@@ -614,9 +621,7 @@ fn detect_mu_refs(
 /// capture `CL`'s θ in hash order (#1930).
 fn detect_mu_refs_with_owners(
     stmts: &[Statement],
-    theta_names: &[String],
-    eta_names: &[String],
-    nn_specs: &[(String, Vec<String>)],
+    scan: &MuRefScan,
 ) -> HashMap<String, (MuRef, String)> {
     let mut result = HashMap::new();
     // NONMEM-style explicit mu syntax (`MU_1 = log(TVCL)`, `CL = exp(MU_1 + ETA_CL)`)
@@ -635,18 +640,142 @@ fn detect_mu_refs_with_owners(
     let mut scope = InlineScope::new(stmts);
     for (at, s) in stmts.iter().enumerate() {
         if let Statement::Assign(name, raw_expr) = s {
-            let mut found = classify_mu_ref(raw_expr, theta_names, eta_names, nn_specs);
-            if found.is_none() && !scope.is_empty() {
-                let inlined = scope.view(at, raw_expr);
-                found = classify_mu_ref(inlined, theta_names, eta_names, nn_specs);
-            }
-            if let Some((eta_idx, mu_ref)) = found {
-                result.insert(eta_names[eta_idx].clone(), (mu_ref, name.clone()));
+            if let Some((eta_idx, mu_ref)) = scan.classify_assignment(stmts, &scope, at) {
+                result.insert(scan.eta_names[eta_idx].clone(), (mu_ref, name.clone()));
             }
             scope.record(at, name, raw_expr);
         }
     }
     result
+}
+
+/// What the per-line mu-reference classification reads besides the line: the
+/// names, how many of the etas are BSV (the rest are kappas), and the
+/// identifiers the other blocks spell (for the exclusivity gate).
+struct MuRefScan<'n> {
+    theta_names: &'n [String],
+    eta_names: &'n [String],
+    n_bsv: usize,
+    outside_idents: &'n HashSet<String>,
+    nn_specs: &'n [(String, Vec<String>)],
+}
+
+impl MuRefScan<'_> {
+    /// The mu-reference of the top-level assignment `stmts[at]`, or `None`.
+    ///
+    /// Shared by [`detect_mu_refs_with_owners`] and [`detect_mixture_mu_refs`],
+    /// which must agree on which line anchors which eta. Tries, in order, the
+    /// raw line, the line with the definitions in `scope` inlined, and the
+    /// one-line additive sum ([`additive_sum_anchor`], #2544). The last runs on
+    /// the inlined view only: on the raw line a local `X = 2*TVE0` is an opaque
+    /// name, and `TVE0 + X + ETA` would pass as reading `TVE0` once.
+    ///
+    /// An additive (`Identity`) anchor on a BSV eta is then kept only when the
+    /// theta and the eta enter the likelihood through this line alone
+    /// ([`thetas_read_outside_the_group`], [`eta_read_outside_the_group`], the
+    /// #619 pair). SAEM's additive M-step sets the theta to the mean of
+    /// `φ_i = θ + η_i` and re-centres the etas; that is exact only when nothing
+    /// else reads either. The gate applies to the two-term `TV + ETA` as well,
+    /// so the two spellings follow one rule. Kappa anchors and the log / logit
+    /// forms are not gated.
+    fn classify_assignment(
+        &self,
+        stmts: &[Statement],
+        scope: &InlineScope,
+        at: usize,
+    ) -> Option<(usize, MuRef)> {
+        let s = &stmts[at];
+        let Statement::Assign(_, raw_expr) = s else {
+            return None;
+        };
+        let (theta_names, eta_names, nn) = (self.theta_names, self.eta_names, self.nn_specs);
+        let (eta_idx, mu_ref) =
+            classify_mu_ref(raw_expr, theta_names, eta_names, nn).or_else(|| {
+                let inlined = scope.view(at, raw_expr);
+                (!scope.is_empty())
+                    .then(|| classify_mu_ref(inlined, theta_names, eta_names, nn))
+                    .flatten()
+                    .or_else(|| {
+                        let (e, t) = additive_sum_anchor(inlined, self.n_bsv)?;
+                        let mu_ref = MuRef {
+                            theta_name: theta_names.get(t)?.clone(),
+                            transform: MuTransform::Identity,
+                        };
+                        (e < eta_names.len()).then_some((e, mu_ref))
+                    })
+            })?;
+        if mu_ref.transform != MuTransform::Identity || eta_idx >= self.n_bsv {
+            return Some((eta_idx, mu_ref));
+        }
+        let theta = std::slice::from_ref(&mu_ref.theta_name);
+        let exclusive =
+            thetas_read_outside_the_group(stmts, theta_names, self.outside_idents, &[s], theta)
+                .is_empty()
+                && !eta_read_outside_the_group(stmts, OwnerOf::Statement(s), eta_idx);
+        exclusive.then_some((eta_idx, mu_ref))
+    }
+}
+
+/// `(eta_idx, theta_idx)` when `v` is a top-level `+` chain of three or more
+/// summands holding exactly one bare theta and exactly one bare BSV eta, where
+/// no other summand reads a BSV eta, that theta, or a local the inliner could
+/// not resolve: `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM` (#2544). This is
+/// the additive mu-reference the split spelling `E0 = TVE0 + ETA_E0` gives, so
+/// it returns the same anchor as `detect_pattern`'s Pattern 3.
+///
+/// A kappa may sit in any summand (`KAPPA/sqrt(NARM)` is how a weighted kappa
+/// desugars, #1031): the kappas are not what the BSV M-step moves. The eta and
+/// theta reads of the other summands are exact on an inlined view, since every
+/// substituted definition is eta-free and [`TypicalSummary::thetas`] sees
+/// through them; an unresolved local (assigned twice, in one `if` arm only, or
+/// eta-bearing) could hide either, so it rejects the line.
+fn additive_sum_anchor<'a, V: RhsView<'a>>(v: V, n_bsv: usize) -> Option<(usize, usize)> {
+    let mut terms = Vec::new();
+    flatten_chain(v, BinOp::Add, false, &mut terms);
+    if terms.len() < 3 {
+        return None;
+    }
+    let (mut theta, mut eta, mut others) = (None, None, Vec::new());
+    for t in terms {
+        match t.expr() {
+            Expression::Theta(i) if theta.is_none() => theta = Some(*i),
+            Expression::Theta(_) => return None,
+            // A second bare BSV eta falls through to `others`, which rejects it.
+            Expression::Eta(e) if *e < n_bsv && eta.is_none() => eta = Some(*e),
+            _ => others.push(t),
+        }
+    }
+    let (theta, eta) = (theta?, eta?);
+    let clean = |o: &V| {
+        !extract_eta_indices(o.expr()).iter().any(|&e| e < n_bsv)
+            && !o.typical_summary().thetas.contains(&theta)
+            && !reads_unresolved_local(*o)
+    };
+    others.iter().all(clean).then_some((eta, theta))
+}
+
+/// Whether `v` reads a `Variable` the view did not substitute: a local of this
+/// block the inliner could not resolve (see [`additive_sum_anchor`]). Walks
+/// into substituted definitions too: their bodies may read such a local.
+fn reads_unresolved_local<'a, V: RhsView<'a>>(v: V) -> bool {
+    match v.expr() {
+        Expression::Variable(_) => true,
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+            reads_unresolved_local(v.child(l)) || reads_unresolved_local(v.child(r))
+        }
+        Expression::UnaryFn(_, a) => reads_unresolved_local(v.child(a)),
+        Expression::ThetaGather { idx, .. } => reads_unresolved_local(v.child(idx)),
+        // The condition too, as `typical_summary_of` walks it: a θ-bearing local in
+        // `if (X > 40)` steps the typical value with θ (#2553 review r1 §4).
+        Expression::Conditional(c, t, f) => {
+            let mut in_condition = false;
+            for_each_condition_operand(c, &mut |x| {
+                in_condition |= reads_unresolved_local(v.child(x))
+            });
+            in_condition || reads_unresolved_local(v.child(t)) || reads_unresolved_local(v.child(f))
+        }
+        _ => false,
+    }
 }
 
 /// Match a `MIXNUM == <k>` (or `<k> == MIXNUM`) condition, returning the
@@ -777,10 +906,10 @@ fn detect_mixture_pattern(
 /// consumer (#996 review).
 fn detect_mixture_mu_refs(
     stmts: &[Statement],
-    theta_names: &[String],
-    eta_names: &[String],
+    scan: &MuRefScan,
     n_classes: usize,
 ) -> Vec<crate::types::MixtureMuRef> {
+    let (theta_names, eta_names) = (scan.theta_names, scan.eta_names);
     // `None` records "the last anchor for this eta was an ordinary mu-ref", which
     // `detect_mu_refs` already stores; the spec must then carry no entry for it.
     let mut latest: Vec<(String, Option<crate::types::MixtureMuRef>)> = Vec::new();
@@ -791,13 +920,19 @@ fn detect_mixture_mu_refs(
         Some(slot) => slot.1 = entry,
         None => latest.push((eta.to_string(), entry)),
     };
-    for s in stmts {
-        let Statement::Assign(_, expr) = s else {
+    let mut scope = InlineScope::new(stmts);
+    for (at, s) in stmts.iter().enumerate() {
+        let Statement::Assign(name, expr) = s else {
             continue;
         };
-        if let Some((eta_idx, theta_idx, log_transformed)) = detect_mixture_pattern(expr, n_classes)
-        {
-            if !log_transformed || eta_idx >= eta_names.len() {
+        let class_aware = detect_mixture_pattern(expr, n_classes);
+        let ordinary = match class_aware {
+            None => scan.classify_assignment(stmts, &scope, at),
+            Some(_) => None,
+        };
+        scope.record(at, name, expr);
+        if let Some((eta_idx, theta_idx, log_transformed)) = class_aware {
+            if !log_transformed || eta_idx >= scan.n_bsv {
                 continue;
             }
             if theta_idx.iter().any(|&t| t >= theta_names.len()) {
@@ -810,10 +945,12 @@ fn detect_mixture_mu_refs(
                 log_transformed,
             };
             set(&eta_name, Some(entry));
-        } else if let Some((eta_idx, _anchor, _log)) = detect_pattern(expr) {
+        } else if let Some((eta_idx, _)) = ordinary {
             // An ordinary mu-ref on the same eta, later in the block: it is what
-            // `detect_mu_refs` will keep, so drop any class-aware entry.
-            if eta_idx < eta_names.len() {
+            // `detect_mu_refs` will keep, so drop any class-aware entry. The same
+            // classifier as `detect_mu_refs_with_owners`, so the two cannot
+            // disagree on which line anchors an eta (#2544).
+            if eta_idx < scan.n_bsv {
                 let eta_name = eta_names[eta_idx].clone();
                 set(&eta_name, None);
             }
@@ -1651,7 +1788,7 @@ fn detect_covariate_mu_refs(
             &owners_and_anchors,
             &entry.theta_names,
         );
-        entry.eta_shared = eta_read_outside_the_group(stmts, owner, eta_idx);
+        entry.eta_shared = eta_read_outside_the_group(stmts, OwnerOf::Name(owner), eta_idx);
     };
     let anchors: Vec<CovariateMuRef> = anchors
         .into_iter()
@@ -1813,10 +1950,38 @@ fn thetas_read_outside_the_group(
 /// `φ` freezing it. The group is not dropped, only routed to the prior-plus-data
 /// engine, which evaluates the data term *with* the shift applied and is
 /// therefore correct for any number of uses.
-fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) -> bool {
-    stmts.iter().any(|s| match s {
+///
+/// `owner` names what is *not* a second use. [`OwnerOf::Name`] skips every assignment
+/// to that name, which is what the #619 groups have always done. [`OwnerOf::Statement`]
+/// (a top-level assignment, compared by address as in [`spread_theta_taint`]) skips that
+/// statement and the assignments to its name *before* it, which it overwrites; one
+/// *after* it is a second use, so `BASE = BASE + 0.5*ETA_E0` drops the anchor (#2544).
+fn eta_read_outside_the_group(stmts: &[Statement], owner: OwnerOf, eta_idx: usize) -> bool {
+    let mut skip = match owner {
+        OwnerOf::Statement(Statement::Assign(name, _)) => OwnerOf::Name(name),
+        other => other,
+    };
+    stmts.iter().any(|s| {
+        if let OwnerOf::Statement(o) = owner {
+            if std::ptr::eq(o, s) {
+                skip = owner;
+                return false;
+            }
+        }
+        eta_read_by(s, skip, eta_idx)
+    })
+}
+
+/// Whether `s` reads `eta_idx`, `skip` being the assignments that do not count
+/// ([`eta_read_outside_the_group`]).
+fn eta_read_by(s: &Statement, skip: OwnerOf, eta_idx: usize) -> bool {
+    match s {
         Statement::Assign(name, expr) => {
-            if name == owner {
+            let skipped = match skip {
+                OwnerOf::Name(n) => name == n,
+                OwnerOf::Statement(o) => std::ptr::eq(o, s),
+            };
+            if skipped {
                 return false;
             }
             let mut reads = false;
@@ -1831,15 +1996,18 @@ fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) 
             branches,
             else_body,
         } => {
-            branches
-                .iter()
-                .any(|(_, body)| eta_read_outside_the_group(body, owner, eta_idx))
-                || else_body
-                    .as_ref()
-                    .is_some_and(|eb| eta_read_outside_the_group(eb, owner, eta_idx))
+            let any = |body: &[Statement]| body.iter().any(|b| eta_read_by(b, skip, eta_idx));
+            branches.iter().any(|(_, body)| any(body)) || else_body.as_deref().is_some_and(any)
         }
         _ => false,
-    })
+    }
+}
+
+/// Which assignment owns an eta, for [`eta_read_outside_the_group`].
+#[derive(Clone, Copy)]
+enum OwnerOf<'a> {
+    Name(&'a str),
+    Statement(&'a Statement),
 }
 
 /// Names (uppercased) whose value depends on `theta_idx`, following assignments
@@ -2786,6 +2954,175 @@ fn classify_indiv_params(
     (eta_infos, theta_transform)
 }
 
+/// Withdraw a scale label whose random effect enters its scale with a constant
+/// coefficient other than ±1 (#1724).
+///
+/// Every label assumes a unit coefficient on its scale: `log P = … + η` for
+/// `LogNormal`, `P = … + η` for `Additive`, `logit P = … + η` for the logit
+/// labels, so `CV%` / `SD` is read straight off ω. However the model spells
+/// `2·η` — `exp(ETA_V) * exp(ETA_V)`, an intermediate multiplied in twice, an
+/// alias added back — the coefficient is `2` and the printed `100·√ω` (31.6%
+/// at ω = 0.1) is not the CV (`√(e^{4ω} − 1)`, 70.1%). Counting the reads
+/// syntactically can never be complete, so the coefficient is measured
+/// instead: the derivative program of `partials` gives `∂P/∂η` exactly, at a
+/// few fixed probe points, and the label becomes `Custom` (with no linked θ)
+/// when the coefficient on its scale is the same at every probe but not ±1.
+/// A sign never changes the CV, so `-exp(η)` and `exp(-η)` keep their label.
+///
+/// Only a **constant** coefficient other than ±1 is withdrawn: a coefficient
+/// that varies (`VSS = V1 + V2` beside a log-normal `V1`, `max(η, 0)`) means
+/// the label describes another variable or is the scale classifier's
+/// question, not this check's. A parameter a consuming block reads is checked
+/// at its final value; an ETA row on an intermediate is checked against every
+/// such parameter, as is a kappa (one label for all its parameters).
+///
+/// A row the derivative program does not hold is not checked: a variable
+/// assigned inside an `if` statement has no partials (nor does anything that
+/// reads it), and a row reading a neural-network output or an unresolved name
+/// cannot be evaluated here. Those keep the label they were given.
+#[allow(clippy::too_many_arguments)]
+fn withdraw_multiplied_scales(
+    partials: &IndivParamPartials,
+    stmts: &[Statement],
+    consumers: &HashSet<String>,
+    theta: &[f64],
+    n_cov: usize,
+    eta_names_bsv: &[String],
+    eta_infos: &mut [crate::types::EtaParamInfo],
+    kappa_types: &mut [crate::types::EtaParamType],
+) {
+    use crate::types::EtaParamType::{self, *};
+    let n = partials.names.len();
+    let n_axes = eta_names_bsv.len() + kappa_types.len();
+    if n == 0 || partials.d_d_eta.iter().any(|r| r.len() != n_axes) {
+        return;
+    }
+    let in_if: HashSet<String> = stmts
+        .iter()
+        .filter(|s| matches!(s, Statement::If { .. }))
+        .flat_map(|s| assigned_vars_in_order(std::slice::from_ref(s)))
+        .collect();
+
+    // A row is evaluable when every variable it reads is an earlier evaluable
+    // row. (A read of a row's partial — its tangent slot — comes with a read of
+    // its value.) An unresolved name or a network output has no value here.
+    let mut known = vec![false; n];
+    let mut latest: HashMap<usize, usize> = HashMap::new();
+    for i in 0..n {
+        let mut ok = !in_if.contains(&partials.names[i]);
+        let mut check = |e: &Expression| match e {
+            Expression::VariableIdx(s) if *s < partials.tangent_base => {
+                ok &= latest.get(s).is_some_and(|&r| known[r])
+            }
+            Expression::Variable(_) | Expression::Covariate(_) | Expression::NnOutput { .. } => {
+                ok = false
+            }
+            _ => {}
+        };
+        visit_expr_nodes(&partials.values[i], &mut check);
+        for d in &partials.d_d_eta[i] {
+            visit_expr_nodes(d, &mut check);
+        }
+        known[i] = ok;
+        latest.insert(partials.slots[i], i);
+    }
+    let final_row = |name: &str| (0..n).rev().find(|&i| partials.names[i] == name);
+    let consumed: Vec<usize> = {
+        let mut rows: Vec<usize> = partials
+            .names
+            .iter()
+            .filter(|m| consumers.contains(&m.to_ascii_uppercase()))
+            .filter_map(|m| final_row(m))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows.retain(|&r| known[r]);
+        rows
+    };
+
+    // `value[p][i]` and `slope[p][k][i]`: row `i`'s value and `∂/∂η_k` at probe `p`.
+    const PROBES: [(f64, f64, f64); 4] = [
+        (1.0, 0.0, 1.0),
+        (1.21, 0.31, 1.9),
+        (0.83, -0.47, 0.6),
+        (1.07, 0.73, 3.3),
+    ];
+    let mut value = Vec::new();
+    let mut slope = Vec::new();
+    for &(ft, fe, fc) in &PROBES {
+        let th: Vec<f64> = theta.iter().map(|t| t * ft + (ft - 1.0) * 0.1).collect();
+        let et: Vec<f64> = (0..n_axes).map(|k| fe * (1.0 + 0.13 * k as f64)).collect();
+        let cv: Vec<f64> = (0..n_cov).map(|c| fc * (1.0 + 0.07 * c as f64)).collect();
+        let mut vals = vec![0.0; n];
+        let mut per_axis = Vec::with_capacity(n_axes);
+        for k in 0..n_axes {
+            let mut vars = vec![0.0_f64; partials.tangent_base + n];
+            let mut d = vec![0.0; n];
+            for i in (0..n).filter(|&i| known[i]) {
+                let v = eval_expression_indexed(&partials.values[i], &th, &et, &cv, &vars, &[]);
+                let dv =
+                    eval_expression_indexed(&partials.d_d_eta[i][k], &th, &et, &cv, &vars, &[]);
+                vars[partials.slots[i]] = v;
+                vars[partials.tangent_base + i] = dv;
+                vals[i] = v;
+                d[i] = dv;
+            }
+            per_axis.push(d);
+        }
+        value.push(vals);
+        slope.push(per_axis);
+    }
+
+    // Whether row `i` reads axis `k` with a constant coefficient other than ±1
+    // on `scale`. A non-finite coefficient at any probe fails a comparison
+    // below, so it never withdraws a label.
+    let multiplied = |i: usize, k: usize, scale: EtaParamType| -> bool {
+        let coef: Vec<f64> = (0..PROBES.len())
+            .map(|p| {
+                let (v, d) = (value[p][i], slope[p][k][i]);
+                match scale {
+                    Additive => d,
+                    LogNormal => d / v,
+                    _ => d / (v * (1.0 - v)),
+                }
+            })
+            .collect();
+        let c0 = coef[0];
+        c0.abs() > 1e-9
+            && coef
+                .iter()
+                .all(|c| (c - c0).abs() <= 1e-7 * c0.abs().max(1.0))
+            && (c0.abs() - 1.0).abs() > 1e-6
+    };
+    let any_multiplied = |rows: &[usize], k: usize, scale: EtaParamType| {
+        rows.iter().any(|&i| multiplied(i, k, scale))
+    };
+
+    for info in eta_infos.iter_mut() {
+        if info.param_type == Custom {
+            continue;
+        }
+        let Some(k) = eta_names_bsv.iter().position(|e| *e == info.eta_name) else {
+            continue;
+        };
+        let x = &info.individual_param_name;
+        let rows: Vec<usize> = if consumers.contains(&x.to_ascii_uppercase()) {
+            final_row(x).filter(|&r| known[r]).into_iter().collect()
+        } else {
+            consumed.clone()
+        };
+        if any_multiplied(&rows, k, info.param_type) {
+            info.param_type = Custom;
+            info.linked_theta = None;
+        }
+    }
+    for (j, t) in kappa_types.iter_mut().enumerate() {
+        if *t != Custom && any_multiplied(&consumed, eta_names_bsv.len() + j, *t) {
+            *t = Custom;
+        }
+    }
+}
+
 /// Shared inputs of the positional ETA classification in [`classify_indiv_params`].
 struct EtaScaleCx<'a> {
     theta_names: &'a [String],
@@ -3308,8 +3645,11 @@ enum LeafReach {
 /// One ancestor on a leaf's path, as [`leaf_scales`]'s fold reads it.
 #[derive(Clone, Copy)]
 enum PathOp {
-    /// `+`, `-`, unary minus (`0 - x`).
+    /// `+`, `-`.
     AddSub,
+    /// Unary minus (`0 - x`): a sign, which no scale's CV depends on, so it
+    /// leaves either state as it is (#1724).
+    Neg,
     /// `*`, `/`.
     MulDiv,
     Exp,
@@ -3326,7 +3666,7 @@ enum PathOp {
 /// not the nearest ancestor. From [`Pending::Sum`], `+`/`-` stay, `exp` opens
 /// [`Pending::Product`], `inv_logit`/`expit` gives `Logit` and anything else
 /// (`*`, `/`, `^`, another function) gives `Custom`. From
-/// [`Pending::Product`], `*` and `/` stay and anything else — `^`, `+`/`-`, a
+/// [`Pending::Product`], `*`, `/` and unary minus stay and anything else — `^`, `+`/`-`, a
 /// function, a second `exp` — gives `Custom`: it changes the shape of the
 /// distribution, as a hand-written Box-Cox `exp((exp(η)^λ - 1)/λ)` or a shift
 /// `TV * exp(η) + TH` does, so `100·√ω` is not its CV. A path still open at
@@ -3349,6 +3689,7 @@ fn leaf_scales(
                 (Pending::Sum, PathOp::Exp) => Pending::Product,
                 (Pending::Sum, PathOp::Logit) => return LeafReach::At(EtaParamType::Logit),
                 (Pending::Product, PathOp::MulDiv) => Pending::Product,
+                (state, PathOp::Neg) => state,
                 _ => return LeafReach::At(EtaParamType::Custom),
             };
         }
@@ -3367,6 +3708,9 @@ fn leaf_scales(
             return;
         }
         let (op, args): (PathOp, [Option<&Expression>; 2]) = match e {
+            Expression::BinOp(l, BinOp::Sub, r) if is_literal_zero(l) => {
+                (PathOp::Neg, [Some(r), None])
+            }
             Expression::BinOp(l, BinOp::Add | BinOp::Sub, r) => {
                 (PathOp::AddSub, [Some(l), Some(r)])
             }
@@ -3900,7 +4244,7 @@ pub fn parse_full_model_with(
         block_sigmas,
         eta_names_bsv,
         kappa_info,
-        vector_theta_decls,
+        mut vector_theta_decls,
         mut level_block_decls,
         unbound_level_blocks,
         declared_priors,
@@ -4315,7 +4659,7 @@ pub fn parse_full_model_with(
     // The stop set is the blocks that consume a parameter (#1662), not the
     // tier-2 `downstream_refs` above: `[derived]` only reports a value.
     let param_consumers = param_consumer_identifiers(blocks, &extracted.named);
-    let kappa_param_types =
+    let mut kappa_param_types =
         classify_kappa_params(&indiv_stmts, n_eta, &kappa_names, &param_consumers);
     if !weighted_kappa_slots.is_empty() {
         // A weighted kappa outside `[individual_parameters]` would read as the
@@ -4959,22 +5303,41 @@ pub fn parse_full_model_with(
             &pk_param_map,
             &indiv_var_names,
         );
-        let readout_with_states = states.readout(&readout, blocks.contains_key("scaling"));
+        let mut readout_with_states = states.readout(&readout, blocks.contains_key("scaling"));
+        // #2562: a `[binary_model]` predictor is a prediction too. It reads no state,
+        // so it joins both readout lists as written.
+        let binary_readouts = binary_predictor_exprs(
+            blocks,
+            &extracted.named,
+            &theta_names,
+            &eta_names,
+            &indiv_stmts,
+        );
+        let mut readout = readout;
+        let n_binary = binary_readouts.len();
+        readout.extend(binary_readouts.iter().cloned());
+        readout_with_states.extend(binary_readouts.iter().cloned());
         for decl in level_block_decls.iter_mut() {
             decl.scale_share =
-                block_shares_scale_with_eta(&indiv_stmts, &readout, &decl.name, None);
+                block_shares_scale_with_eta(&indiv_stmts, &readout, n_binary, &decl.name, None);
             decl.eta_couplings = (0..eta_names.len())
                 .map(|k| {
                     let mut c = level_block_eta_coupling(
                         &indiv_stmts,
                         &readout_with_states,
+                        n_binary,
                         &decl.name,
                         k,
                         &eta_names[k],
                         &states,
                     );
-                    c.share =
-                        block_shares_scale_with_eta(&indiv_stmts, &readout, &decl.name, Some(k));
+                    c.share = block_shares_scale_with_eta(
+                        &indiv_stmts,
+                        &readout,
+                        n_binary,
+                        &decl.name,
+                        Some(k),
+                    );
                     // A kappa runs the same walk; the binder measures it on its
                     // own unit, the occasion (see `EtaCoupling::kappa`).
                     c.kappa = k >= n_eta;
@@ -4997,9 +5360,15 @@ pub fn parse_full_model_with(
         // divisor as `state / obs_scale` (#2103 review #1). An `obs_scale` is not a
         // `y` key, so without this a block in it reached no readout at all.
         let mut readouts: Vec<(String, Expression)> = readout_with_states
+            [..readout_with_states.len() - binary_readouts.len()]
             .iter()
             .map(|e| (Y_READOUT.to_string(), e.clone()))
             .collect();
+        readouts.extend(
+            binary_readouts
+                .iter()
+                .map(|e| (BINARY_READOUT.to_string(), e.clone())),
+        );
         // Every block's reads, not only a profiled one's: `read_index` reads them all.
         if let Some(lines) = blocks.get("scaling") {
             for (key, e) in scaling_key_exprs(
@@ -5021,17 +5390,32 @@ pub fn parse_full_model_with(
                 ));
             }
         }
+        // An `[event_model]` hazard or a `[markov_model]` expression is not walked: no
+        // profiled block may be read there (`check_profiled_levels`' `E_PROFILE_SCOPE`
+        // refuses every such model). A block one of them reads is not "read by no
+        // prediction" (#2562); one none of them reads still is.
+        let mut endpoint_lines: Vec<String> = Vec::new();
+        for b in ["event_model", "markov_model"] {
+            endpoint_lines.extend(blocks.get(b).into_iter().flatten().cloned());
+            if let Some(named) = extracted.named.get(b) {
+                endpoint_lines.extend(named.values().flatten().cloned());
+            }
+        }
         for block in &profiled {
             let others: Vec<String> = profiled.iter().filter(|o| *o != block).cloned().collect();
-            profile_route_check(
+            let linked = profile_route_check(
                 &indiv_stmts,
                 &readouts,
                 &error_lines,
+                &endpoint_lines,
                 block,
                 &others,
                 &states,
             )
             .map_err(|(why, site)| profile_route_message(block, &why, &site))?;
+            if let Some(d) = vector_theta_decls.iter_mut().find(|d| d.name == *block) {
+                d.linked = linked;
+            }
         }
         for d in &vector_theta_decls {
             read_index.push((
@@ -5371,12 +5755,28 @@ pub fn parse_full_model_with(
             eta_names_bsv.len(),
         ))
     });
-    let all_mu_refs_owned = detect_mu_refs_with_owners(
-        &indiv_stmts,
-        &theta_names,
-        &all_eta_names,
-        &nn_specs_for_ctx,
-    );
+    // Every identifier any *other* block spells, so a theta that reaches the
+    // likelihood outside `[individual_parameters]` (an `[odes]` right-hand side,
+    // a `[derived]` readout) is visible to the exclusivity checks: the additive
+    // mu-refs' (#2544) and the covariate groups' (#619). `[parameters]` is
+    // excluded because it is where the thetas are declared; the only theta a
+    // model may name there is a FIXed one in a kappa weight, which no M-step
+    // moves.
+    let mut outside_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, lines) in blocks.iter() {
+        if key == "parameters" || key == "individual_parameters" {
+            continue;
+        }
+        collect_referenced_identifiers(lines, &mut outside_idents);
+    }
+    let mu_ref_scan = MuRefScan {
+        theta_names: &theta_names,
+        eta_names: &all_eta_names,
+        n_bsv: eta_names_bsv.len(),
+        outside_idents: &outside_idents,
+        nn_specs: &nn_specs_for_ctx,
+    };
+    let all_mu_refs_owned = detect_mu_refs_with_owners(&indiv_stmts, &mu_ref_scan);
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     // Owners of the BSV mu-refs, kept crate-private behind `indiv_param_partials`
     // (#1930): see `IndivParamPartials::mu_ref_owners`.
@@ -5400,19 +5800,6 @@ pub fn parse_full_model_with(
         .collect();
     // Multi-theta typical values (#619): a separate list, never a substitute
     // for `mu_refs` — see `detect_covariate_mu_refs`.
-    // Every identifier any *other* block spells, so a theta that reaches the
-    // likelihood outside `[individual_parameters]` (an `[odes]` right-hand side,
-    // a `[derived]` readout) is visible to the exclusivity check. `[parameters]`
-    // is excluded because it is where the thetas are declared; the only theta a
-    // model may name there is a FIXed one in a kappa weight, which no M-step
-    // moves.
-    let mut outside_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (key, lines) in blocks.iter() {
-        if key == "parameters" || key == "individual_parameters" {
-            continue;
-        }
-        collect_referenced_identifiers(lines, &mut outside_idents);
-    }
     let covariate_mu_refs = detect_covariate_mu_refs(
         &indiv_stmts,
         &theta_names,
@@ -5496,8 +5883,18 @@ pub fn parse_full_model_with(
 
     // Classify [individual_parameters] expressions for the R metadata layer.
     // Uses BSV-only eta names (no kappas).
-    let (eta_param_info, theta_transform) =
+    let (mut eta_param_info, theta_transform) =
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv, &param_consumers);
+    withdraw_multiplied_scales(
+        &indiv_param_partials,
+        &indiv_stmts,
+        &param_consumers,
+        &default_params.theta,
+        referenced_covariates.len(),
+        &eta_names_bsv,
+        &mut eta_param_info,
+        &mut kappa_param_types,
+    );
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
@@ -5809,13 +6206,19 @@ pub fn parse_full_model_with(
     // Class-aware mu-references (#996): detected here rather than in
     // `parse_mixture_block` because the scan needs both the parsed
     // `[individual_parameters]` statements and the mixture's class count.
+    // `model.eta_names` is the BSV etas, the prefix of the scan's `all_eta_names`.
+    let mixture_scan = MuRefScan {
+        theta_names: &model.theta_names,
+        eta_names: &model.eta_names,
+        n_bsv: model.eta_names.len(),
+        outside_idents: &outside_idents,
+        nn_specs: &nn_specs_for_ctx,
+    };
+    let mixture_mu_refs = mixture_spec
+        .as_ref()
+        .map(|spec| detect_mixture_mu_refs(&indiv_stmts, &mixture_scan, spec.n_classes));
     model.mixture = mixture_spec.map(|mut spec| {
-        spec.mu_refs = detect_mixture_mu_refs(
-            &indiv_stmts,
-            &model.theta_names,
-            &model.eta_names,
-            spec.n_classes,
-        );
+        spec.mu_refs = mixture_mu_refs.unwrap_or_default();
         spec
     });
     // A `MIXNUM`-switched typical value that did *not* yield a class-aware
@@ -6820,6 +7223,19 @@ pub fn parse_full_model_with(
         }
 
         model.referenced_covariates.sort();
+    }
+    // #2562: the gathers an endpoint block reads count for the pre-fit index check too, and
+    // they were parsed after `theta_blocks` took its first copy.
+    model.indiv_param_partials.theta_blocks.uses = VectorThetaScope::uses();
+    // #2562: which discrete-state endpoints read each level block, for the binder.
+    #[cfg(feature = "survival")]
+    for decl in model
+        .indiv_param_partials
+        .theta_blocks
+        .level_blocks
+        .iter_mut()
+    {
+        decl.record_cmts = level_record_cmts(&model.endpoints, &decl.index_covariate);
     }
 
     // Warn about declared-but-unused parameters. Runs here (after [event_model]
@@ -8161,6 +8577,7 @@ fn restrict_and_validate_indiv_stmts(
     let predictor = match block {
         "event_model" => "a hazard expression",
         "binary_model" => "the logit predictor",
+        "markov_model" => "a transition probability",
         _ => "a predictor expression",
     };
     // (1) Direct IOV-κ reference — fail loud (#770).
@@ -9222,6 +9639,9 @@ fn parse_markov_model_block(
     let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
 
     let mut cmt_opt: Option<usize> = None;
+    // `type = dtmm` (#2473): the transition right-hand sides are per-record
+    // probabilities, not intensities. Read from the `type` line; absent ⇒ CTMM.
+    let mut is_dtmm = false;
     let mut states_seen = false;
     let mut states: Vec<(String, usize)> = Vec::new(); // ordered (label, DV code)
     let mut transitions_raw: Vec<(String, String, Expression)> = Vec::new();
@@ -9271,23 +9691,24 @@ fn parse_markov_model_block(
                 )
             })?;
         match key {
-            // `type` is optional and defaults to `ctmm` — the only endpoint family
-            // implemented today. The default is explicit: a block with no `type` line
-            // parses as a CTMM (see the required-key checks below, which do not include
-            // `type`). When mCTMM/DTMM land they must NOT silently inherit this default —
-            // dispatch on the value read here rather than widening the fall-through.
+            // `type` is optional and defaults to `ctmm`. The default is explicit: a block
+            // with no `type` line parses as a CTMM (see the required-key checks below, which
+            // do not include `type`). `dtmm` (#2473) is dispatched on the value read here,
+            // never inherited from the default; mCTMM must do the same when it lands.
             "type" => match value {
-                "ctmm" => {}
-                "mctmm" | "dtmm" => {
-                    return Err(format!(
-                        "[markov_model]: type `{value}` is not yet supported — only `ctmm` \
-                         (time-homogeneous CTMM) is available; mCTMM/DTMM are planned \
-                         (Phase 4b/4c)."
-                    ))
+                "ctmm" => is_dtmm = false,
+                "dtmm" => is_dtmm = true,
+                "mctmm" => {
+                    return Err(
+                        "[markov_model]: type `mctmm` is not yet supported — `ctmm` \
+                         (continuous-time) and `dtmm` (discrete-time) are available; mCTMM is \
+                         planned (Phase 4c)."
+                            .to_string(),
+                    )
                 }
                 other => {
                     return Err(format!(
-                        "[markov_model]: unknown type `{other}` — expected `ctmm`"
+                        "[markov_model]: unknown type `{other}` — expected `ctmm` or `dtmm`"
                     ))
                 }
             },
@@ -9374,7 +9795,7 @@ fn parse_markov_model_block(
     }
     if states.len() < 2 {
         return Err(format!(
-            "[markov_model]: a CTMM needs at least 2 states; got {}",
+            "[markov_model]: a Markov model needs at least 2 states; got {}",
             states.len()
         ));
     }
@@ -9445,6 +9866,22 @@ fn parse_markov_model_block(
             format!("__ferx_markov_model_{cmt}_{j}_{k}"),
             expr.clone(),
         ));
+    }
+
+    // A DTMM shares the `states` / `transition` grammar and every check above, but its
+    // right-hand sides are probabilities evaluated per record — no generator, no `expm`,
+    // and none of the CTMM-specific (TIME, drug-driven Q(t)) handling below.
+    if is_dtmm {
+        let (endpoint, prob_covariates, theta_set, eta_set) = build_dtmm_endpoint(
+            transitions,
+            state_codes,
+            theta_names,
+            eta_names,
+            indiv_stmts,
+            kappa_names,
+            ode_state_names,
+        )?;
+        return Ok((cmt, endpoint, prob_covariates, theta_set, eta_set));
     }
 
     // Collect covariate/theta/eta references across every intensity BEFORE the
@@ -9715,50 +10152,28 @@ fn parse_markov_model_block(
     // Fréchet derivative of `expm`, an exact likelihood gradient) instead of finite-
     // differencing the whole matrix-exponential likelihood.
     //
-    // Built only for the **time-homogeneous** endpoint: an intensity that reads an ODE state
-    // makes `Q` a functional of the PK trajectory, whose derivative needs the state's own
-    // sensitivities (and whose likelihood is an occupancy ODE, not an `expm` — so Van Loan
-    // does not apply). Those keep the FD path, so the program is `None` there.
-    let generator_program = if generator_states.is_empty() {
-        build_ctmm_generator_program(
-            &transitions,
-            &needed_indiv_stmts,
-            &generator_covariates,
-            n_states,
-            theta_names.len(),
-            eta_names.len(),
-        )
-    } else {
-        None
-    };
+    // An intensity that reads an ODE state makes `Q` a functional of the PK trajectory: the
+    // program reads each such state through a var slot, which the likelihood fills with the
+    // dual state solve's values, so the occupancy ODE carries their sensitivities.
+    let generator_program = build_ctmm_generator_program(
+        &transitions,
+        &needed_indiv_stmts,
+        &generator_covariates,
+        &generator_states,
+        n_states,
+        theta_names.len(),
+        eta_names.len(),
+    );
 
-    let indiv = needed_indiv_stmts;
-    let gen_states = generator_states.clone();
+    let tree = CtmmGeneratorTree::new(
+        &needed_indiv_stmts,
+        &transitions,
+        &generator_states,
+        n_states,
+    );
     let generator_fn: crate::types::GeneratorFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, state: &[f64]| {
-            // A referenced ODE state parses as a `Covariate` leaf, so `eval_expression`
-            // resolves it from the covariates map. On the inhomogeneous path overlay the
-            // current state values there; the homogeneous path leaves `gen_states` empty and
-            // uses the caller's map unchanged (no clone).
-            let cov_owned;
-            let cov: &HashMap<String, f64> = if gen_states.is_empty() {
-                covariates
-            } else {
-                let mut c = covariates.clone();
-                for (name, idx) in &gen_states {
-                    c.insert(name.clone(), state.get(*idx).copied().unwrap_or(0.0));
-                }
-                cov_owned = c;
-                &cov_owned
-            };
-            let vars = eval_indiv_param_vars(&indiv, theta, eta, cov);
-            let mut q = nalgebra::DMatrix::<f64>::zeros(n_states, n_states);
-            for (j, k, expr) in &transitions {
-                let rate = eval_expression(expr, theta, eta, cov, &vars, &[]);
-                q[(*j, *k)] += rate;
-                q[(*j, *j)] -= rate;
-            }
-            q
+            tree.generator(theta, eta, covariates, state)
         },
     );
 
@@ -9776,6 +10191,338 @@ fn parse_markov_model_block(
         theta_set,
         eta_set,
     ))
+}
+
+/// Build the [`EndpointLikelihood::Dtmm`](crate::types::EndpointLikelihood::Dtmm) endpoint
+/// of a `[markov_model] type = dtmm` block (#2473) from its resolved `transitions`
+/// (`(from, to, probability expression)`, already checked for unknown states,
+/// self-transitions and duplicates by [`parse_markov_model_block`]).
+///
+/// Returns `(endpoint, probability covariates, thetas, etas)`.
+///
+/// Each right-hand side is the per-record probability `P_jk` of moving from state `j`
+/// (observed at the previous record) to `k` (observed at this one). The probabilities share
+/// the binary endpoint's predictor rules through [`restrict_and_validate_indiv_stmts`] —
+/// IOV κ and `[covariate_nn]` outputs are refused — and are evaluated at the record being
+/// scored: its `TIME` and its covariates. A probability that reads an ODE model state — a
+/// drug-driven DTMM — is refused: a state read at a record needs NONMEM's same-`TIME` record
+/// order against doses, which the engines do not yet carry.
+#[cfg(feature = "markov")]
+#[allow(clippy::type_complexity)]
+fn build_dtmm_endpoint(
+    transitions: Vec<(usize, usize, Expression)>,
+    state_codes: Vec<usize>,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_stmts: &[Statement],
+    kappa_names: &[String],
+    ode_state_names: &[String],
+) -> Result<
+    (
+        crate::types::EndpointLikelihood,
+        Vec<String>,
+        std::collections::HashSet<usize>,
+        std::collections::HashSet<usize>,
+    ),
+    String,
+> {
+    use std::collections::HashSet;
+
+    let n_states = state_codes.len();
+    let exprs: Vec<&Expression> = transitions.iter().map(|(_, _, e)| e).collect();
+
+    let (theta_set, eta_set) = {
+        let mut theta_set = HashSet::new();
+        let mut eta_set = HashSet::new();
+        for expr in &exprs {
+            collect_theta_eta(expr, &mut theta_set, &mut eta_set);
+        }
+        (theta_set, eta_set)
+    };
+    let (needed_indiv_stmts, prob_covariates) = restrict_and_validate_indiv_stmts(
+        &exprs,
+        indiv_stmts,
+        eta_names,
+        kappa_names,
+        "markov_model",
+    )?;
+
+    // A probability naming an ODE state — directly, or through an `[individual_parameters]`
+    // value it reads — would parse as a covariate leaf and be reported as a missing data
+    // column, or silently read one. Refuse it by name. A state name that is also a θ/η name
+    // resolves to the parameter leaf, which carries only an index, so those leaves are mapped
+    // back to their names too: the probability would otherwise silently read the constant
+    // parameter in place of the state it names (the CTMM path refuses the same collision).
+    // An `[individual_parameters]` name shadows a state, as on the CTMM path.
+    if !ode_state_names.is_empty() {
+        let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+        let mut referenced: HashSet<String> = HashSet::new();
+        let mut note_name = |e: &Expression| {
+            let name = match e {
+                Expression::Variable(name) | Expression::Covariate(name) => Some(name),
+                Expression::Theta(i) => theta_names.get(*i),
+                Expression::Eta(i) => eta_names.get(*i),
+                _ => None,
+            };
+            if let Some(name) = name {
+                referenced.insert(name.clone());
+            }
+        };
+        for expr in &exprs {
+            visit_expr_nodes(expr, &mut note_name);
+        }
+        visit_stmt_nodes(&needed_indiv_stmts, &mut note_name);
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut referenced);
+        if let Some(name) = ode_state_names
+            .iter()
+            .find(|n| referenced.contains(*n) && !indiv_param_names.contains(n))
+        {
+            return Err(format!(
+                "[markov_model]: a `type = dtmm` transition probability reads the model state \
+                 `{name}`. A drug-driven DTMM is not yet supported: a state read at a record \
+                 needs NONMEM's same-TIME record order against doses, which ferx does not yet \
+                 carry. The probabilities may read θ, η, covariates and TIME. Use a \
+                 continuous-time `type = ctmm` for a drug-driven transition model \
+                 (tracked in #2510)."
+            ));
+        }
+    }
+
+    // The same probabilities in dual-evaluable form (one output per transition), for the
+    // analytic inner gradient. `None` keeps the endpoint on FD.
+    let prob_program = build_endpoint_expr_program(
+        &exprs,
+        &needed_indiv_stmts,
+        &prob_covariates,
+        theta_names.len(),
+        eta_names.len(),
+    );
+
+    let pairs: Vec<(usize, usize)> = transitions.iter().map(|&(j, k, _)| (j, k)).collect();
+    let prob_exprs: Vec<Expression> = transitions.into_iter().map(|(_, _, e)| e).collect();
+    let indiv = needed_indiv_stmts;
+    let prob_fn: crate::types::TransitionProbFn = Box::new(
+        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
+            let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+            prob_exprs
+                .iter()
+                .map(|e| eval_expression(e, theta, eta, covariates, &vars, &[]))
+                .collect()
+        },
+    );
+
+    Ok((
+        crate::types::EndpointLikelihood::Dtmm {
+            n_states,
+            state_codes,
+            transitions: pairs,
+            prob_fn,
+            prob_program,
+            prob_covariates: prob_covariates.clone(),
+        },
+        prob_covariates,
+        theta_set,
+        eta_set,
+    ))
+}
+
+/// The `f64` generator of a `[markov_model]`: the intensities and the
+/// `[individual_parameters]` statements they read, with every name resolved to a slot
+/// once at parse (#2549). The time-inhomogeneous likelihood calls it at every stage of
+/// every occupancy-ODE step, and it used to clone the subject's covariate map, overlay the
+/// ODE state, build a variable map and hash every name it read on each call.
+///
+/// Bit-identical to that map-keyed walk: the same tree, evaluated by the same generic
+/// `eval_expr`/`eval_cond`, with only name resolution moved to slots — a name nothing
+/// assigns reads 0, a state an intensity reads shadows a covariate of the same name (as
+/// the overlay's insert did), and `MACHEPS` reads machine epsilon whether or not it is
+/// assigned. Not the bytecode: [`CtmmGeneratorProgram`] serves the derivatives, and its
+/// `f64` instantiation is not pinned bitwise to the tree.
+#[cfg(feature = "markov")]
+struct CtmmGeneratorTree {
+    /// `AssignIdx`/`If` only, over var and covariate slots.
+    stmts: Vec<Statement>,
+    n_vars: usize,
+    /// The slot every `MACHEPS` spelling reads.
+    eps_slot: usize,
+    rates: Vec<(usize, usize, Expression)>,
+    /// Covariate names by slot: every `Covariate` leaf the statements and intensities read.
+    cov_names: Vec<String>,
+    /// `(covariate slot, ODE state index)` of each state an intensity reads, in the
+    /// overlay's order (a repeated name: the last one wins, as its insert did).
+    state_slots: Vec<(usize, usize)>,
+    n_states: usize,
+}
+
+#[cfg(feature = "markov")]
+impl CtmmGeneratorTree {
+    fn new(
+        stmts: &[Statement],
+        transitions: &[(usize, usize, Expression)],
+        generator_states: &[(String, usize)],
+        n_states: usize,
+    ) -> Self {
+        fn names(e: &Expression, vars: &mut Vec<String>, covs: &mut Vec<String>) {
+            visit_expr_nodes(e, &mut |n| match n {
+                Expression::Variable(v) if !vars.contains(v) => vars.push(v.clone()),
+                Expression::Covariate(c) if !covs.contains(c) => covs.push(c.clone()),
+                _ => {}
+            });
+        }
+        fn walk(stmts: &[Statement], vars: &mut Vec<String>, covs: &mut Vec<String>) {
+            for s in stmts {
+                match s {
+                    Statement::Assign(name, e) => {
+                        if !vars.contains(name) {
+                            vars.push(name.clone());
+                        }
+                        names(e, vars, covs);
+                    }
+                    Statement::If {
+                        branches,
+                        else_body,
+                    } => {
+                        for (c, body) in branches {
+                            visit_condition_nodes(c, &mut |e| names(e, vars, covs));
+                            walk(body, vars, covs);
+                        }
+                        if let Some(eb) = else_body {
+                            walk(eb, vars, covs);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (mut vars, mut covs) = (Vec::new(), Vec::new());
+        walk(stmts, &mut vars, &mut covs);
+        for (_, _, e) in transitions {
+            names(e, &mut vars, &mut covs);
+        }
+        let is_eps = |n: &str| n.eq_ignore_ascii_case("MACHEPS");
+        let eps_slot = 0;
+        let mut read_idx: HashMap<String, usize> = HashMap::new();
+        let mut write_idx: HashMap<String, usize> = HashMap::new();
+        let mut n_vars = 1;
+        for v in &vars {
+            if is_eps(v) {
+                read_idx.insert(v.clone(), eps_slot);
+                write_idx.insert(v.clone(), usize::MAX);
+            } else {
+                read_idx.insert(v.clone(), n_vars);
+                write_idx.insert(v.clone(), n_vars);
+                n_vars += 1;
+            }
+        }
+        let cov_idx: HashMap<String, usize> = covs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), i))
+            .collect();
+        fn resolve(
+            stmts: &[Statement],
+            read_idx: &HashMap<String, usize>,
+            write_idx: &HashMap<String, usize>,
+            cov_idx: &HashMap<String, usize>,
+        ) -> Vec<Statement> {
+            let mut out = Vec::new();
+            for s in stmts {
+                match s {
+                    Statement::Assign(name, e) => {
+                        let mut e = e.clone();
+                        resolve_expr_indices(&mut e, read_idx, cov_idx);
+                        out.push(Statement::AssignIdx(write_idx[name], e));
+                    }
+                    Statement::If {
+                        branches,
+                        else_body,
+                    } => out.push(Statement::If {
+                        branches: branches
+                            .iter()
+                            .map(|(c, body)| {
+                                let mut c = c.clone();
+                                resolve_condition_indices(&mut c, read_idx, cov_idx);
+                                (c, resolve(body, read_idx, write_idx, cov_idx))
+                            })
+                            .collect(),
+                        else_body: else_body
+                            .as_ref()
+                            .map(|eb| resolve(eb, read_idx, write_idx, cov_idx)),
+                    }),
+                    // The map walk skips anything else (an `[individual_parameters]` list
+                    // holds assignments and conditionals only).
+                    _ => {}
+                }
+            }
+            out
+        }
+        let stmts = resolve(stmts, &read_idx, &write_idx, &cov_idx);
+        let rates = transitions
+            .iter()
+            .map(|(j, k, e)| {
+                let mut e = e.clone();
+                resolve_expr_indices(&mut e, &read_idx, &cov_idx);
+                (*j, *k, e)
+            })
+            .collect();
+        let state_slots = generator_states
+            .iter()
+            .filter_map(|(name, idx)| cov_idx.get(name).map(|&slot| (slot, *idx)))
+            .collect();
+        CtmmGeneratorTree {
+            stmts,
+            n_vars,
+            eps_slot,
+            rates,
+            cov_names: covs,
+            state_slots,
+            n_states,
+        }
+    }
+
+    /// `Q(θ, η, covariates, state)`, every row summing to zero.
+    fn generator(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        state: &[f64],
+    ) -> nalgebra::DMatrix<f64> {
+        let mut cov: Vec<f64> = crate::scratch::take();
+        cov.extend(
+            self.cov_names
+                .iter()
+                .map(|n| covariates.get(n).copied().unwrap_or(0.0)),
+        );
+        for &(slot, idx) in &self.state_slots {
+            cov[slot] = state.get(idx).copied().unwrap_or(0.0);
+        }
+        let mut vars: Vec<f64> = crate::scratch::take();
+        vars.resize(self.n_vars, 0.0);
+        vars[self.eps_slot] = f64::EPSILON;
+        let mut stack: Vec<f64> = crate::scratch::take();
+        eval_statements_indexed_with_stack(
+            &self.stmts,
+            theta,
+            eta,
+            &cov,
+            &mut vars,
+            None,
+            &[],
+            &mut stack,
+        );
+        let s = self.n_states;
+        let mut q = nalgebra::DMatrix::<f64>::zeros(s, s);
+        for (j, k, expr) in &self.rates {
+            let rate = eval_expression_indexed(expr, theta, eta, &cov, &vars, &[]);
+            q[(*j, *k)] += rate;
+            q[(*j, *j)] -= rate;
+        }
+        crate::scratch::give(cov);
+        crate::scratch::give(vars);
+        crate::scratch::give(stack);
+        q
+    }
 }
 
 /// Pre-scan `[event_model]` blocks for ODE-accumulated hazards (joint PK-TTE, #564).
@@ -10037,6 +10784,10 @@ fn parse_adaptive_dosing_block(
     let mut dose_bounds: Option<(f64, f64)> = None;
     let mut confirm: u32 = 1;
     let mut levels: Option<Vec<f64>> = None;
+    let mut intervals: Option<Vec<f64>> = None;
+    let mut start_interval: Option<f64> = None;
+    // The `every` step of `at`, kept for the intervals-on-the-grid check (#945).
+    let mut at_step: Option<f64> = None;
     let mut target_window: Option<(f64, f64)> = None;
     let mut auc_target: Option<(f64, f64)> = None;
     let mut rules: Vec<AdaptiveRule> = Vec::new();
@@ -10084,7 +10835,11 @@ fn parse_adaptive_dosing_block(
                 }
                 assay_cmt = Some(c);
             }
-            "at" => at = Some(parse_decision_schedule(val)?),
+            "at" => {
+                let (times, step) = parse_decision_schedule(val)?;
+                at = Some(times);
+                at_step = step;
+            }
             "start_dose" => {
                 let d: f64 = val
                     .parse()
@@ -10130,6 +10885,18 @@ fn parse_adaptive_dosing_block(
                     .map_err(|e| format!("[adaptive_dosing]: bad levels: {e}"))?;
                 validate_increasing_finite(&l, "levels")?;
                 levels = Some(l);
+            }
+            "intervals" => {
+                let l = parse_float_array(val)
+                    .map_err(|e| format!("[adaptive_dosing]: bad intervals: {e}"))?;
+                validate_increasing_finite(&l, "intervals")?;
+                intervals = Some(l);
+            }
+            "start_interval" => {
+                let d: f64 = val
+                    .parse()
+                    .map_err(|_| format!("[adaptive_dosing]: bad start_interval: {val}"))?;
+                start_interval = Some(d);
             }
             "target_window" => {
                 // Therapeutic band `[low, high]` for the `pct_time_in_window` metric
@@ -10201,19 +10968,47 @@ fn parse_adaptive_dosing_block(
         dose_bounds,
         confirm,
         levels,
+        intervals,
+        start_interval,
         target_window,
         auc_target,
         rules,
     };
     spec.validate()?;
+    if let (Some(step), Some(ladder)) = (at_step, &spec.intervals) {
+        check_intervals_on_every_grid(ladder, step)?;
+    }
     Ok(spec)
+}
+
+/// On an `at = every S …` grid, every due time an interval produces lands on the grid
+/// exactly when the interval is a whole multiple of `S` (#945). Checked here, where the
+/// step is known, so the error names the value and the step before any subject runs;
+/// on an explicit `at` list the driver refuses an off-grid due time instead. The
+/// tolerance is the driver's relative 1e-9, taken on the interval rather than on the due
+/// time, so the parser is never looser than the driver: a decimal step (`every 0.1`,
+/// interval `0.3`) passes both, and far from t = 0 the driver may accept an interval the
+/// parser refuses, never the reverse. `k < 1` refuses an interval below the step that the
+/// residual alone would let through (`1e-10` on `every 12`).
+fn check_intervals_on_every_grid(ladder: &[f64], step: f64) -> Result<(), String> {
+    for &d in ladder {
+        let k = (d / step).round();
+        if k < 1.0 || (d - k * step).abs() > 1e-9 * d.max(1.0) {
+            return Err(format!(
+                "[adaptive_dosing]: interval {d} is not a whole multiple of the `at` step {step}, \
+                 so its due times would fall between decision times"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parse an `at =` decision schedule: either an explicit list `[t1, t2, …]` or an
 /// arithmetic sequence `every <Δ> from <t0> to <t1>` (inclusive), expanded to
 /// explicit times. The `to` bound is required (an open-ended schedule has no
-/// finite decision list); times must be finite and strictly increasing.
-fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
+/// finite decision list); times must be finite and strictly increasing. Returns the
+/// times and, for `every`, the step (`None` for a list).
+fn parse_decision_schedule(val: &str) -> Result<(Vec<f64>, Option<f64>), String> {
     let v = val.trim();
     if v.starts_with('[') {
         if !v.ends_with(']') {
@@ -10228,7 +11023,7 @@ fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
         if times[0] < 0.0 {
             return Err(format!("[adaptive_dosing]: `at` times must be >= 0: {val}"));
         }
-        return Ok(times);
+        return Ok((times, None));
     }
     let toks: Vec<&str> = v.split_whitespace().collect();
     if toks.len() != 6 || toks[0] != "every" || toks[2] != "from" || toks[4] != "to" {
@@ -10274,7 +11069,7 @@ fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
     let n = n_f as usize;
     // Index-based expansion (t0 + i·Δ) avoids accumulating floating-point drift.
     let times: Vec<f64> = (0..=n).map(|i| t0 + i as f64 * step).collect();
-    Ok(times)
+    Ok((times, Some(step)))
 }
 
 /// Parse a `route =` value: `bolus(cmt = N)` or `infuse(cmt = N, over = T)`.
@@ -10363,12 +11158,58 @@ fn parse_adaptive_rule(rest: &str) -> Result<AdaptiveRule, String> {
         )
     })?;
     let (op, threshold) = parse_signal_condition(cond.trim())?;
-    let action = parse_rule_action(action.trim())?;
+    let (action, interval) = parse_rule_effects(action.trim())?;
     Ok(AdaptiveRule {
         op,
         threshold,
         action,
+        interval,
     })
+}
+
+/// Split a rule's effects on `,` (#945): at most one dose effect (`increase` /
+/// `decrease` / `hold` / `stop`) and at most one interval effect (`lengthen` /
+/// `shorten`), in either order. An interval-only rule re-issues the running dose
+/// ([`AdaptiveAction::Maintain`]).
+fn parse_rule_effects(effects: &str) -> Result<(AdaptiveAction, Option<IntervalStep>), String> {
+    let mut dose: Option<AdaptiveAction> = None;
+    let mut interval: Option<IntervalStep> = None;
+    for part in effects.split(',').map(str::trim) {
+        // A stray comma: a whole empty effect list keeps `parse_rule_action`'s own message.
+        if part.is_empty() && effects.contains(',') {
+            return Err(format!(
+                "[adaptive_dosing]: a rule has an empty effect (a stray comma?): {effects}"
+            ));
+        }
+        if let Some(word) = ["lengthen", "shorten"]
+            .into_iter()
+            .find(|w| part != *w && part.split_whitespace().next() == Some(*w))
+        {
+            return Err(format!(
+                "[adaptive_dosing]: `{word}` steps the `intervals` ladder one rung and takes no \
+                 operand: {part}"
+            ));
+        }
+        let step = match part {
+            "lengthen" => Some(IntervalStep::Lengthen),
+            "shorten" => Some(IntervalStep::Shorten),
+            _ => None,
+        };
+        if let Some(step) = step {
+            if interval.replace(step).is_some() {
+                return Err(format!(
+                    "[adaptive_dosing]: a rule takes at most one interval effect \
+                     (`lengthen` or `shorten`): {effects}"
+                ));
+            }
+        } else if dose.replace(parse_rule_action(part)?).is_some() {
+            return Err(format!(
+                "[adaptive_dosing]: a rule takes at most one dose effect \
+                 (`increase`, `decrease`, `hold` or `stop`): {effects}"
+            ));
+        }
+    }
+    Ok((dose.unwrap_or(AdaptiveAction::Maintain), interval))
 }
 
 /// Parse `signal <op> <value>` where `<op>` is one of `< <= > >= ==`.
@@ -10440,7 +11281,7 @@ fn parse_rule_action(action: &str) -> Result<AdaptiveAction, String> {
         "increase" => Ok(AdaptiveAction::Increase(step)),
         "decrease" => Ok(AdaptiveAction::Decrease(step)),
         other => Err(format!(
-            "[adaptive_dosing]: unknown action `{other}` (expected increase/decrease/hold/stop): {action}"
+            "[adaptive_dosing]: unknown action `{other}` (expected increase/decrease/hold/stop/lengthen/shorten): {action}"
         )),
     }
 }
@@ -11363,7 +12204,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 other => {
                     return Err(format!(
                         "vi_final_ofv must be `none` or `laplace`, got `{other}`. For an \
-                         importance-sampling −2 log L, chain `methods = vi, imp` with \
+                         importance-sampling −2 log L, chain `method = [vi, imp]` with \
                          `imp_eval_only = true`."
                     ))
                 }
@@ -13537,19 +14378,72 @@ fn parse_diffusion_block(
 // Feature-gated behind `nn`. Without the feature the parser surfaces a
 // clear error so users get told to rebuild with `--features nn`.
 
-#[cfg(feature = "nn")]
+/// The fields of one `[covariate_nn NAME]` block, read once (#1331).
+///
+/// Compiled in every build: the network evaluation needs the `nn` feature, but
+/// the DCM exporter (`crate::nn::export`) only needs what the block *says*, and
+/// it has to run in the default build ferx-r ships. Both consumers read the block
+/// through [`parse_nn_block_fields`] — a second, export-only reader of the same
+/// `key = value` lines is exactly the pair that would drift unseen, since the two
+/// would only ever be compared on a model someone happened to run both ways.
 #[derive(Debug, Clone)]
-pub(crate) struct CovariateNnSpec {
+pub(crate) struct NnBlockSpec {
+    /// The block's instance name, as written (`TYPICAL_PK`).
     pub name: String,
-    pub mapper: crate::nn::NamedMlpMapper,
-    pub theta_names: Vec<String>,
-    pub theta_inits: Vec<f64>,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    /// Hidden-layer widths, input and output excluded.
+    pub hidden: Vec<usize>,
+    pub hidden_activation: crate::nn::Activation,
+    pub output_activation: crate::nn::Activation,
+    /// Per-input `center`; `None` when the block declares none (the identity).
+    pub center: Option<Vec<f64>>,
+    /// Per-input `scale`; `None` when the block declares none (the identity).
+    pub scale: Option<Vec<f64>>,
+    /// Per-output `init`, on the output scale; read only by the `nn` build.
+    #[cfg_attr(not(feature = "nn"), allow(dead_code))]
+    pub init: Option<Vec<f64>>,
 }
 
-#[cfg(feature = "nn")]
-fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnSpec, String> {
-    use crate::nn::{Activation, CovariateMapper, MlpMapper, NamedMlpMapper};
+impl NnBlockSpec {
+    /// The full layer shape `[n_inputs, hidden..., n_outputs]`.
+    pub fn layer_sizes(&self) -> Vec<usize> {
+        let mut sizes = Vec::with_capacity(self.hidden.len() + 2);
+        sizes.push(self.inputs.len());
+        sizes.extend(self.hidden.iter().copied());
+        sizes.push(self.outputs.len());
+        sizes
+    }
 
+    /// The auto-generated weight-θ names, in the network's flat weight order:
+    /// per layer `l` (1-based), the row-major `W` block (`W_<NAME>_<l>_<i>_<j>`,
+    /// unit `i`, input `j`) then the bias vector (`B_<NAME>_<l>_<i>`). The fit
+    /// reports the weights under exactly these names, which is how the exporter
+    /// finds them in a `FitResult` without knowing where the block sits in θ.
+    pub fn weight_theta_names(&self) -> Vec<String> {
+        let upper = self.name.to_ascii_uppercase();
+        let sizes = self.layer_sizes();
+        let mut names = Vec::new();
+        for l in 1..sizes.len() {
+            for i in 1..=sizes[l] {
+                for j in 1..=sizes[l - 1] {
+                    names.push(format!("W_{}_{}_{}_{}", upper, l, i, j));
+                }
+            }
+            for i in 1..=sizes[l] {
+                names.push(format!("B_{}_{}_{}", upper, l, i));
+            }
+        }
+        names
+    }
+}
+
+/// Read the `key = value` lines of a `[covariate_nn NAME]` block into an
+/// [`NnBlockSpec`]. Every syntactic check on the block lives here; what is left
+/// to the `nn` build is what only a constructed network can say (normalisation
+/// lengths and values, output names that are not PK parameters, `init` ranges).
+pub(crate) fn parse_nn_block_fields(name: &str, lines: &[String]) -> Result<NnBlockSpec, String> {
+    use crate::nn::Activation;
     // Collect simple `key = value` pairs. Each value is either a list
     // `[a, b, c]` or a bare identifier / integer.
     let mut fields: HashMap<String, String> = HashMap::new();
@@ -13673,40 +14567,76 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         }
     }
 
-    let n_inputs = inputs.len();
-    let mut layer_sizes = Vec::with_capacity(hidden.len() + 2);
-    layer_sizes.push(inputs.len());
-    layer_sizes.extend(hidden.iter().copied());
-    layer_sizes.push(outputs.len());
-
-    let mlp = MlpMapper::new(layer_sizes.clone(), hidden_activation, output_activation)
-        .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
     // Optional per-input normalisation: the network sees `(x - center) / scale`.
-    // Absent keys default to the identity, so an existing model is unchanged. Declared
+    // Absent keys mean the identity, so an existing model is unchanged. Declared
     // rather than estimated from the data — see `NamedMlpMapper::input_scale` for why.
-    let take_float_list = |field: &str, default: f64| -> Result<Vec<f64>, String> {
-        let Some(raw) = fields.get(field) else {
-            return Ok(vec![default; n_inputs]);
-        };
-        let parsed = parse_float_array(raw)
-            .map_err(|e| format!("[covariate_nn {}] `{}`: {}", name, field, e))?;
-        Ok(parsed)
+    let take_float_list = |field: &str| -> Result<Option<Vec<f64>>, String> {
+        fields
+            .get(field)
+            .map(|raw| {
+                parse_float_array(raw)
+                    .map_err(|e| format!("[covariate_nn {}] `{}`: {}", name, field, e))
+            })
+            .transpose()
     };
-    let center = take_float_list("center", 0.0)?;
-    let scale = take_float_list("scale", 1.0)?;
+    let center = take_float_list("center")?;
+    let scale = take_float_list("scale")?;
+    let init = take_float_list("init")?;
 
-    let mapper = NamedMlpMapper::new(mlp, inputs, outputs)
+    Ok(NnBlockSpec {
+        name: name.to_string(),
+        inputs,
+        outputs,
+        hidden,
+        hidden_activation,
+        output_activation,
+        center,
+        scale,
+        init,
+    })
+}
+
+#[cfg(feature = "nn")]
+#[derive(Debug, Clone)]
+pub(crate) struct CovariateNnSpec {
+    pub name: String,
+    pub mapper: crate::nn::NamedMlpMapper,
+    pub theta_names: Vec<String>,
+    pub theta_inits: Vec<f64>,
+}
+
+/// Build the network a `[covariate_nn NAME]` block declares: the fields from
+/// [`parse_nn_block_fields`], then the mapper, the weight-θ names and their
+/// deterministic starting values.
+#[cfg(feature = "nn")]
+fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnSpec, String> {
+    use crate::nn::{CovariateMapper, MlpMapper, NamedMlpMapper};
+
+    let block = parse_nn_block_fields(name, lines)?;
+    let n_inputs = block.inputs.len();
+    let output_activation = block.output_activation;
+    let layer_sizes = block.layer_sizes();
+
+    let mlp = MlpMapper::new(
+        layer_sizes.clone(),
+        block.hidden_activation,
+        output_activation,
+    )
+    .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
+    let center = block.center.clone().unwrap_or_else(|| vec![0.0; n_inputs]);
+    let scale = block.scale.clone().unwrap_or_else(|| vec![1.0; n_inputs]);
+
+    let mapper = NamedMlpMapper::new(mlp, block.inputs.clone(), block.outputs.clone())
         .map_err(|e| format!("[covariate_nn {}] {}", name, e))?
         .with_normalization(center, scale)
         .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
 
-    // Auto-generate weight-theta names + Glorot-style deterministic inits.
-    // Names are uppercase to match the codebase convention (TVCL, THETA_WT,
-    // DIFF_CENTRAL, …). Inits use a fixed PRNG (xorshift seeded by name) so
-    // builds are reproducible without pulling `rand` into the parser.
+    // Auto-generated weight-theta names (`NnBlockSpec::weight_theta_names`) +
+    // Glorot-style deterministic inits. Inits use a fixed PRNG (xorshift seeded by
+    // name) so builds are reproducible without pulling `rand` into the parser.
     let upper = name.to_ascii_uppercase();
-    let mut theta_names = Vec::new();
-    let mut theta_inits = Vec::new();
+    let theta_names = block.weight_theta_names();
+    let mut theta_inits = Vec::with_capacity(theta_names.len());
     let mut state: u64 = {
         // Tiny string hash → seed. Deterministic across runs.
         let mut h: u64 = 0xcbf29ce484222325;
@@ -13728,14 +14658,10 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         let n_lm1 = layer_sizes[l - 1];
         // Glorot/Xavier scale: weights ~ U(-r, r), r = sqrt(6 / (fan_in + fan_out)).
         let r = (6.0 / (n_lm1 + n_l) as f64).sqrt();
-        for i in 1..=n_l {
-            for j in 1..=n_lm1 {
-                theta_names.push(format!("W_{}_{}_{}_{}", upper, l, i, j));
-                theta_inits.push(2.0 * r * next_unit());
-            }
+        for _ in 0..n_l * n_lm1 {
+            theta_inits.push(2.0 * r * next_unit());
         }
-        for i in 1..=n_l {
-            theta_names.push(format!("B_{}_{}_{}", upper, l, i));
+        for _ in 0..n_l {
             // Biases initialised to 0 — standard for tanh/sigmoid; for ReLU
             // you'd want a small positive bias, but this module's intended
             // hidden activation for [covariate_nn] is `tanh` (softplus on the
@@ -13744,6 +14670,7 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         }
     }
     debug_assert_eq!(theta_names.len(), mapper.n_weights());
+    debug_assert_eq!(theta_inits.len(), theta_names.len());
 
     // Optional `init = [v_1, …, v_K]`: one starting value per output, on the scale the
     // network *emits* (a clearance in L/h, a volume in L) rather than on the weight
@@ -13767,9 +14694,7 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
     // is not frozen: it receives gradient immediately (`∂z_k/∂W_L[k,j] = a_{L-1}[j]`, which
     // is nonzero), and the hidden layers start receiving gradient one step later, once
     // `W_L` has moved off zero.
-    if let Some(raw) = fields.get("init") {
-        let values =
-            parse_float_array(raw).map_err(|e| format!("[covariate_nn {}] `init`: {}", name, e))?;
+    if let Some(values) = &block.init {
         let n_out = mapper.mlp().n_outputs();
         if values.len() != n_out {
             return Err(format!(
@@ -15366,8 +16291,9 @@ fn build_ode_spec(
     // that closure: states (all 0 at the time origin) then individual parameters, every
     // name under each case the closure binds; `MACHEPS` is its constant; covariates are
     // not in an init's scope (the closure reads them as 0, as `eval_output_g` does with an
-    // empty snapshot). `None` when any init reads the mixture index (`MIXNUM`, whose value
-    // comes from the class being evaluated) or a name the layout does not bind.
+    // empty snapshot). The mixture index (`MIXNUM`) reads the class being evaluated from
+    // its thread-local (`Op::PushMixNum`), as the closure does. `None` when an init reads a
+    // name the layout does not bind.
     let init_program: Option<Vec<(usize, OdeOutputProgram)>> = (!init_specs.is_empty())
         .then(|| {
             let mut var_idx: HashMap<String, usize> = HashMap::new();
@@ -15384,13 +16310,12 @@ fn build_ode_spec(
                 .iter()
                 .map(|(state_idx, expr)| {
                     let mut e = expr.clone();
-                    let mut mixnum = false;
-                    visit_expr_nodes_mut(&mut e, &mut |node| match node {
-                        Expression::Variable(n) if n.eq_ignore_ascii_case("MACHEPS") => {
-                            *node = Expression::Literal(f64::EPSILON)
+                    visit_expr_nodes_mut(&mut e, &mut |node| {
+                        if let Expression::Variable(n) = node {
+                            if n.eq_ignore_ascii_case("MACHEPS") {
+                                *node = Expression::Literal(f64::EPSILON)
+                            }
                         }
-                        Expression::MixNum => mixnum = true,
-                        _ => {}
                     });
                     resolve_expr_indices(&mut e, &var_idx, &HashMap::new());
                     let mut unresolved = false;
@@ -15399,7 +16324,7 @@ fn build_ode_spec(
                             unresolved = true;
                         }
                     });
-                    if mixnum || unresolved {
+                    if unresolved {
                         return None;
                     }
                     let bc = compile_bytecode(&e);
@@ -15464,7 +16389,6 @@ fn build_ode_spec(
         pk_reads_tafd,
         pk_reads_tad,
         pk_reads_solver_time,
-        has_chz: !chz_state_slots.is_empty(),
         affine_in_states,
         #[cfg(feature = "survival")]
         init_indiv_reads,
@@ -15982,7 +16906,9 @@ fn split_level_attachment(
     if !(lower.starts_with("kappa ") || lower.starts_with("block_kappa")) {
         return (line.to_string(), weight_expr, None);
     }
-    let re = Regex::new(r"(?i)^(.*\S)\s+at\s+(\w+)\s*$").unwrap();
+    static AT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^(.*\S)\s+at\s+(\w+)\s*$").unwrap());
+    let re = &*AT_RE;
     if let Some(w) = &weight_expr {
         if let Some(c) = re.captures(w) {
             return (
@@ -16248,6 +17174,16 @@ pub fn known_block_names() -> Vec<&'static str> {
 }
 
 /// Whether the cargo feature a registry entry names is enabled in this build.
+/// The feature a `[name]` block needs when this build lacks it, or `None` when
+/// the block is not feature-gated, its feature is on, or it is not a block name.
+pub(crate) fn block_disabled_feature(name: &str) -> Option<&'static str> {
+    BLOCK_REGISTRY
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .and_then(|(_, _, feature)| *feature)
+        .filter(|f| !block_feature_enabled(f))
+}
+
 fn block_feature_enabled(feature: &str) -> bool {
     match feature {
         "survival" => cfg!(feature = "survival"),
@@ -16389,7 +17325,7 @@ const MODEL_NAME_FORMS: &str = "`model NAME` or `model = NAME` (letters, digits 
 /// `line` with a trailing `#` / `//` comment removed. The block extractor and
 /// the preamble reader share one definition of "comment" so a `model` line and
 /// a `[block]` header cannot disagree on where a line ends.
-fn strip_line_comment(line: &str) -> &str {
+pub(crate) fn strip_line_comment(line: &str) -> &str {
     match line.find('#').into_iter().chain(line.find("//")).min() {
         Some(idx) => &line[..idx],
         None => line,
@@ -16422,14 +17358,59 @@ fn strip_line_comment(line: &str) -> &str {
 fn model_name_declaration(trimmed: &str) -> Option<&str> {
     static MODEL_NAME_DECLARATION_RE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^model(?:\s*=\s*|\s+)(\w+)$").unwrap());
+    // `^model…` is case-sensitive: a line not starting with it never compiles the regex.
+    if !trimmed.starts_with("model") {
+        return None;
+    }
     let re = &*MODEL_NAME_DECLARATION_RE;
     re.captures(trimmed).map(|c| c.get(1).unwrap().as_str())
 }
 
+/// A block header line: `[block_type]` or `[block_type INSTANCE]`, the whole line. Shared
+/// by `parse_model_name` and `extract_blocks`, so each process compiles it once (#2549).
+static BLOCK_HEADER_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"^\[(\w+)(?:\s+(\w+))?\]$").unwrap());
+
+/// Whether `line` opens, after its leading whitespace, with the lowercase ASCII keyword
+/// `kw` as a `(?i)^\s*kw` pattern reads it — a necessary condition for such a pattern to
+/// match, so the regex behind it is compiled only for a line it could match (#2549:
+/// compiling the `[parameters]` patterns was a fifth of a small fit).
+///
+/// Exactly the regex's semantics: `\s` and `str::trim_start` are both Unicode
+/// `White_Space`, and `(?i)` is Unicode simple case folding, under which the only
+/// characters folding onto an ASCII letter other than its own case pair are `K`
+/// (U+212A, onto `k`) and `ſ` (U+017F, onto `s`).
+fn leads_with_keyword_ci(line: &str, kw: &str) -> bool {
+    let mut cs = line.trim_start().chars();
+    kw.chars().all(|k| {
+        cs.next().is_some_and(|c| {
+            let f = match c {
+                '\u{212A}' => 'k',
+                '\u{017F}' => 's',
+                c => c.to_ascii_lowercase(),
+            };
+            f == k
+        })
+    })
+}
+
+/// `re.captures(line)` for a `(?i)^\s*kw…` pattern, compiling `re` only when the line
+/// leads with `kw` ([`leads_with_keyword_ci`]).
+fn keyword_captures<'h>(
+    re: &std::sync::LazyLock<Regex>,
+    kw: &str,
+    line: &'h str,
+) -> Option<regex::Captures<'h>> {
+    if leads_with_keyword_ci(line, kw) {
+        re.captures(line)
+    } else {
+        None
+    }
+}
+
 fn parse_model_name(content: &str) -> Result<String, String> {
-    static HEADER_RE: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"^\[\w+(?:\s+\w+)?\]$").unwrap());
-    let header_re = &*HEADER_RE;
+    // `extract_blocks`' own header pattern: the preamble ends where the first block opens.
+    let header_re = &*BLOCK_HEADER_RE;
     let mut name: Option<String> = None;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = strip_line_comment(line).trim();
@@ -16486,16 +17467,28 @@ struct ExtractedBlocks {
     block_lines: HashMap<String, usize>,
 }
 
+/// A block header line, read the one way [`extract_blocks`] reads it: `(type
+/// lower-cased, instance)` for a line that opens a block, `None` otherwise.
+/// `trimmed` is the line with its comment stripped and whitespace trimmed.
+///
+/// Two header forms:
+///   `[block_type]`            — unnamed (existing)
+///   `[block_type INSTANCE]`   — named (e.g. `[covariate_nn TYPICAL_PK]`)
+/// Anchored on the whole line so things like `states=[central]` inside an ODE
+/// structural definition aren't misread as a block-tag opener. Shared with the
+/// DCM exporter (`crate::nn::export`), which rewrites model text block by block
+/// and must agree with the parser on where each block starts.
+pub(crate) fn block_header(trimmed: &str) -> Option<(String, Option<String>)> {
+    BLOCK_HEADER_RE.captures(trimmed).map(|caps| {
+        (
+            caps[1].to_lowercase(),
+            caps.get(2).map(|m| m.as_str().to_string()),
+        )
+    })
+}
+
 fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
     let mut out = ExtractedBlocks::default();
-    // Two header forms:
-    //   `[block_type]`            — unnamed (existing)
-    //   `[block_type INSTANCE]`   — named (e.g. `[covariate_nn TYPICAL_PK]`)
-    // Anchor on the whole line so things like `states=[central]` inside an
-    // ODE structural definition aren't misread as a block-tag opener.
-    static BLOCK_RE: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"^\[(\w+)(?:\s+(\w+))?\]$").unwrap());
-    let block_re = &*BLOCK_RE;
 
     // current_target: either an unnamed block name, or a (block_type, instance) pair.
     enum BlockTarget {
@@ -16514,18 +17507,10 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
             continue;
         }
 
-        if let Some(caps) = block_re.captures(trimmed) {
-            let ty = caps[1].to_lowercase();
-            headers.push((
-                ty.clone(),
-                caps.get(2).map(|m| m.as_str().to_string()),
-                idx + 1,
-            ));
-            current = match caps.get(2) {
-                Some(m) => Some(BlockTarget::Named {
-                    ty,
-                    name: m.as_str().to_string(),
-                }),
+        if let Some((ty, instance)) = block_header(trimmed) {
+            headers.push((ty.clone(), instance.clone(), idx + 1));
+            current = match instance {
+                Some(name) => Some(BlockTarget::Named { ty, name }),
                 None => {
                     // Record the 1-based header line; first occurrence wins.
                     out.block_lines.entry(ty.clone()).or_insert(idx + 1);
@@ -16861,7 +17846,7 @@ fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
 /// The entry criterion is that a *statement* in the block can never begin with a
 /// binary operator — see [`join_continuation_lines`] for why that is what makes
 /// joining a strict widening rather than a reinterpretation.
-const CONTINUATION_BLOCKS: &[&str] = &[
+pub(crate) const CONTINUATION_BLOCKS: &[&str] = &[
     "individual_parameters",
     "odes",
     "scaling",
@@ -16883,12 +17868,12 @@ const CONTINUATION_BLOCKS: &[&str] = &[
 /// `if`, or a brace — never with a binary operator — so a line opening with one
 /// of these can only be a continuation, and joining it strictly widens the
 /// accepted grammar rather than reinterpreting anything that parsed before.
-const CONTINUATION_LEADERS: &[char] = &['+', '-', '*', '/', '^'];
+pub(crate) const CONTINUATION_LEADERS: &[char] = &['+', '-', '*', '/', '^'];
 
 /// Trailing characters that mark a line as unfinished, so the *next* line
 /// continues it. `=` is included so `LEMAX =` followed by an indented expression
 /// works; `,` so a multi-line argument list does.
-const CONTINUATION_TRAILERS: &[char] = &['+', '-', '*', '/', '^', ',', '='];
+pub(crate) const CONTINUATION_TRAILERS: &[char] = &['+', '-', '*', '/', '^', ',', '='];
 
 /// Join operator continuation lines into single logical lines (#1030).
 ///
@@ -17069,10 +18054,12 @@ fn parse_mixture_block(
                         .to_string(),
                 );
             }
+            let program = compile_ruv_mag_deriv_program(&expr, None, theta_names.len());
             mixing.push(MixingExpr {
                 class,
                 is_logit,
                 expr,
+                program,
             });
             continue;
         }
@@ -17375,10 +18362,141 @@ pub(crate) fn eval_mixing_log_probs(
     }
 }
 
-/// Analytic `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4),
-/// returned as `K × n_theta`. Only the **logit** form is differentiated here
-/// (`p = softmax(g)`), which is the general covariate-dependent case; the `p`
-/// (direct-probability) form returns `None` so the caller routes to FD.
+/// The exact `∂ ln p_ik / ∂ θ_j` (`K × n_theta`) of [`eval_mixing_log_probs`], for either
+/// mixing form: each mixing expression's θ-only program (compiled once, at parse) evaluated
+/// on the scalar reverse tape with θ as inputs, through the
+/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form), and one
+/// sweep per class. A clamped probability has the zero derivative its clamp gives the
+/// objective. `None` on a program that declines (a θ-count mismatch) or a non-finite
+/// result; the callers keep their difference quotients for that.
+pub(crate) fn mixing_logp_grad_exact(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<Vec<f64>>> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
+    rtape_reset();
+    let th: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+    let lp = mixing_logp_g::<R>(spec, &th, covariates)?;
+    let mut out = Vec::with_capacity(lp.len());
+    for &l in &lp {
+        let adj = rsweep::<1>(&[l]);
+        let row: Vec<f64> = th.iter().map(|t| t.idx().map_or(0.0, |i| adj[i])).collect();
+        out.push(row);
+    }
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+}
+
+/// `ln p_ik` over any number type: each mixing expression's θ-only program through the
+/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form). A clamped
+/// probability is a constant, so it carries the zero derivative its clamp gives the
+/// objective.
+fn mixing_logp_g<T: crate::sens::num::vm::VmNum>(
+    spec: &crate::types::MixtureSpec,
+    th: &[T],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<T>> {
+    let k = spec.n_classes;
+    let time = current_model_time();
+    // The programs were compiled once at parse (`MixingExpr::program`).
+    let eval = |m: &crate::types::MixingExpr| -> Option<T> {
+        m.program.eval_g::<T>(th, covariates, time, 0.0)
+    };
+    let clamp = |x: T, lo: f64, hi: f64| -> T {
+        if x.val() < lo {
+            T::from_f64(lo)
+        } else if x.val() > hi {
+            T::from_f64(hi)
+        } else {
+            x
+        }
+    };
+    Some(if spec.mixing.iter().all(|m| m.is_logit) {
+        let mut logits = vec![T::from_f64(0.0); k];
+        for m in &spec.mixing {
+            logits[m.class - 1] = eval(m)?;
+        }
+        let max = logits
+            .iter()
+            .map(|l| l.val())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut sum = T::from_f64(0.0);
+        for &l in &logits {
+            sum = sum + (l - T::from_f64(max)).exp();
+        }
+        let lse = T::from_f64(max) + sum.ln();
+        logits.iter().map(|&l| l - lse).collect()
+    } else {
+        let mut p = vec![T::from_f64(0.0); k];
+        let mut sum = T::from_f64(0.0);
+        for m in &spec.mixing {
+            let v = clamp(eval(m)?, 1e-12, 1.0 - 1e-12);
+            p[m.class - 1] = v;
+            sum = sum + v;
+        }
+        p[k - 1] = clamp(T::from_f64(1.0) - sum, 1e-12, 1.0);
+        let mut tot = T::from_f64(0.0);
+        for &v in &p {
+            tot = tot + v;
+        }
+        p.iter().map(|&v| (v / tot).ln()).collect()
+    })
+}
+
+/// The exact θ-Hessian `∂² ln p_ik / ∂θ_j ∂θ_l` of every class (`K` matrices,
+/// `n_theta × n_theta`), with the gradient rows of [`mixing_logp_grad_exact`]: forward over
+/// reverse, eight θ directions per recording on `DualT<8, R>`, one eight-lane sweep per
+/// class and chunk. `None` where the gradient declines.
+pub(crate) fn mixing_logp_hess_exact(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<(Vec<Vec<f64>>, Vec<nalgebra::DMatrix<f64>>)> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
+    const C: usize = 8;
+    let n = theta.len();
+    let k = spec.n_classes;
+    let mut grad = vec![vec![0.0; n]; k];
+    let mut hess = vec![nalgebra::DMatrix::<f64>::zeros(n, n); k];
+    for start in (0..n.max(1)).step_by(C) {
+        rtape_reset();
+        let leaves: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+        let th: Vec<DualT<C, R>> = leaves
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                let mut g = [R::c(0.0); C];
+                if (start..start + C).contains(&m) {
+                    g[m - start] = R::c(1.0);
+                }
+                DualT { v, g }
+            })
+            .collect();
+        let lp = mixing_logp_g::<DualT<C, R>>(spec, &th, covariates)?;
+        for (cls, y) in lp.iter().enumerate() {
+            if start == 0 {
+                let adj = rsweep::<1>(&[y.v]);
+                for (j, t) in leaves.iter().enumerate() {
+                    grad[cls][j] = t.idx().map_or(0.0, |i| adj[i]);
+                }
+            }
+            let adj = rsweep::<C>(&y.g);
+            for (lane, l) in (start..(start + C).min(n)).enumerate() {
+                for (j, t) in leaves.iter().enumerate() {
+                    hess[cls][(j, l)] = t.idx().map_or(0.0, |i| adj[i * C + lane]);
+                }
+            }
+        }
+    }
+    let finite = grad.iter().flatten().all(|v| v.is_finite())
+        && hess.iter().all(|h| h.iter().all(|v| v.is_finite()));
+    finite.then_some((grad, hess))
+}
+
+/// `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4), returned as
+/// `K × n_theta`: exact for either form ([`mixing_logp_grad_exact`]). Where that declines,
+/// the **logit** form (`p = softmax(g)`) falls back to the central difference below and
+/// the `p` (direct-probability) form returns `None` so the caller routes to FD.
 ///
 /// For the softmax: `∂ ln p_k/∂θ_j = ∂g_k/∂θ_j − Σ_m p_m ∂g_m/∂θ_j`, where the
 /// per-class scores `g_k` are the mixing expressions (reference class `K` has
@@ -17394,6 +18512,9 @@ pub(crate) fn mixing_logp_grad(
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Option<Vec<Vec<f64>>> {
+    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+        return Some(exact);
+    }
     if !spec.mixing.iter().all(|m| m.is_logit) {
         return None; // p-form → FD fallback
     }
@@ -17457,6 +18578,9 @@ pub(crate) fn mixing_logp_grad_fd(
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Vec<Vec<f64>> {
+    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+        return exact;
+    }
     let nt = theta.len();
     let mut out = vec![vec![0.0f64; nt]; spec.n_classes];
     let mut tperturb = theta.to_vec();
@@ -17554,7 +18678,6 @@ fn parse_parameters(
     static THETA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"(?i)^\s*theta\s+(\w+)\s*(?:\[([^\]]*)\])?\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?\s*$",).unwrap()
     });
-    let theta_re = &*THETA_RE;
 
     // omega NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
@@ -17581,7 +18704,6 @@ fn parse_parameters(
             r"(?i)^\s*omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
         ),).unwrap()
     });
-    let omega_re = &*OMEGA_RE;
 
     // block_omega (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
     //
@@ -17604,7 +18726,6 @@ fn parse_parameters(
             r"(?i)^\s*block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
         ),).unwrap()
     });
-    let block_omega_re = &*BLOCK_OMEGA_RE;
 
     // block_sigma (NAME1, NAME2, ...) = [lower_triangle_covariances] | ... FIX
     //
@@ -17617,7 +18738,6 @@ fn parse_parameters(
             r"(?i)^\s*block_sigma\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
         ),).unwrap()
     });
-    let block_sigma_re = &*BLOCK_SIGMA_RE;
 
     // sigma NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
@@ -17632,7 +18752,6 @@ fn parse_parameters(
             r"(?i)^\s*sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
         ),).unwrap()
     });
-    let sigma_re = &*SIGMA_RE;
 
     // kappa NAME ~ value [FIX] [(sd|variance|var)] [FIX]  (IOV diagonal variance)
     // Same group layout as omega_re.
@@ -17641,7 +18760,6 @@ fn parse_parameters(
             r"(?i)^\s*kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
         ),).unwrap()
     });
-    let kappa_re = &*KAPPA_RE;
 
     // block_kappa (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
     // Same group layout as `block_omega_re`, tag in group 4.
@@ -17650,10 +18768,11 @@ fn parse_parameters(
             r"(?i)^\s*block_kappa\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
         ),).unwrap()
     });
-    let block_kappa_re = &*BLOCK_KAPPA_RE;
 
     // level NAME by COLUMN in PARENT  (#1082: a nested variability level below ID)
-    let level_re = Regex::new(r"(?i)^\s*level\s+(\w+)\s+by\s+(\w+)\s+in\s+(\w+)\s*$").unwrap();
+    static LEVEL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*level\s+(\w+)\s+by\s+(\w+)\s+in\s+(\w+)\s*$").unwrap()
+    });
 
     // Rejoin multi-line `block_*` declarations before matching.
     let lines = join_bracketed_lines(lines);
@@ -17683,7 +18802,7 @@ fn parse_parameters(
         let (line, profiled) = split_profile_modifier(&line);
         let line = &line;
         let mut weight_consumed = false;
-        if let Some(caps) = level_re.captures(line) {
+        if let Some(caps) = keyword_captures(&LEVEL_RE, "level", line) {
             if prior_decl.is_some() || weight_expr.is_some() {
                 return Err(format!(
                     "[parameters] level {}: a level takes no `prior(...)` or `weight =`; a \
@@ -17702,7 +18821,7 @@ fn parse_parameters(
         // matched. `None` at the bottom of the loop with a `prior_decl` present
         // means the prior had no home — an error, never a silent drop.
         let mut prior_target: Option<(String, crate::types::ParameterKind)> = None;
-        if let Some(caps) = theta_re.captures(line) {
+        if let Some(caps) = keyword_captures(&THETA_RE, "theta", line) {
             let name = caps[1].to_string();
             let block = match caps.get(2) {
                 Some(m) => Some(parse_theta_block_spec(&name, m.as_str())?),
@@ -17830,6 +18949,7 @@ fn parse_parameters(
                                 eta_couplings: Vec::new(),
                                 eta_readers: Vec::new(),
                                 index_covariate: index_covariate.clone(),
+                                record_cmts: Vec::new(),
                             });
                             (levels, theta_names, Some(index_covariate))
                         }
@@ -17848,11 +18968,12 @@ fn parse_parameters(
                         spec: std::sync::Arc::new(GatherSpec { name, levels }),
                         index_covariate,
                         profiled,
+                        linked: false,
                         profile_box,
                     });
                 }
             }
-        } else if let Some(caps) = block_omega_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&BLOCK_OMEGA_RE, "block_omega", line) {
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -17890,7 +19011,7 @@ fn parse_parameters(
                 lower_triangle: values,
                 fixed,
             });
-        } else if let Some(caps) = block_sigma_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&BLOCK_SIGMA_RE, "block_sigma", line) {
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -17948,7 +19069,7 @@ fn parse_parameters(
                 lower_triangle: values,
                 fixed,
             });
-        } else if let Some(caps) = block_kappa_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&BLOCK_KAPPA_RE, "block_kappa", line) {
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -17988,7 +19109,7 @@ fn parse_parameters(
                 lower_triangle: values,
                 fixed,
             });
-        } else if let Some(caps) = omega_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&OMEGA_RE, "omega", line) {
             let name = caps[1].to_string();
             let raw: f64 = caps[2]
                 .parse()
@@ -18018,7 +19139,7 @@ fn parse_parameters(
                 fixed,
                 init_as_sd,
             });
-        } else if let Some(caps) = sigma_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&SIGMA_RE, "sigma", line) {
             let name = caps[1].to_string();
             let raw: f64 = caps[2]
                 .parse()
@@ -18048,7 +19169,7 @@ fn parse_parameters(
                 fixed,
                 init_as_sd,
             });
-        } else if let Some(caps) = kappa_re.captures(line) {
+        } else if let Some(caps) = keyword_captures(&KAPPA_RE, "kappa", line) {
             let name = caps[1].to_string();
             let raw: f64 = caps[2]
                 .parse()
@@ -18109,16 +19230,16 @@ fn parse_parameters(
             if let Some((head, _)) = shown.split_once(';') {
                 let is_declaration = |s: &str| {
                     [
-                        &theta_re,
-                        &omega_re,
-                        &block_omega_re,
-                        &block_sigma_re,
-                        &sigma_re,
-                        &kappa_re,
-                        &block_kappa_re,
+                        (&THETA_RE, "theta"),
+                        (&OMEGA_RE, "omega"),
+                        (&BLOCK_OMEGA_RE, "block_omega"),
+                        (&BLOCK_SIGMA_RE, "block_sigma"),
+                        (&SIGMA_RE, "sigma"),
+                        (&KAPPA_RE, "kappa"),
+                        (&BLOCK_KAPPA_RE, "block_kappa"),
                     ]
                     .iter()
-                    .any(|re| re.is_match(s))
+                    .any(|(re, kw)| leads_with_keyword_ci(s, kw) && re.is_match(s))
                 };
                 if shown.split(';').all(is_declaration) {
                     return Err(format!(
@@ -18172,7 +19293,7 @@ fn parse_parameters(
                      residual error write the modifier on the `[error_model]` statement \
                      instead.",
                     line.trim(),
-                    if block_kappa_re.is_match(line) {
+                    if leads_with_keyword_ci(line, "block_kappa") && BLOCK_KAPPA_RE.is_match(line) {
                         " A `block_kappa` cannot carry one: the weight scales a single \
                          kappa's variance, and a block's off-diagonal covariances would \
                          need the same divisor to stay a valid covariance matrix — declare \
@@ -18343,6 +19464,34 @@ pub(crate) const LEVEL_INDEX_PREFIX: &str = "__level_";
 /// gathers on.
 pub(crate) fn level_index_column(block: &str) -> String {
     format!("{LEVEL_INDEX_PREFIX}{block}")
+}
+
+/// The CMTs of the per-record discrete-state endpoints whose expression reads the level
+/// index column `index`, sorted ([`LevelBlockDecl::record_cmts`], #2562). An endpoint's
+/// covariate list includes the columns reached through `[individual_parameters]`, so a
+/// block read through an individual parameter counts.
+#[cfg(feature = "survival")]
+fn level_record_cmts(
+    endpoints: &HashMap<usize, crate::types::EndpointLikelihood>,
+    index: &str,
+) -> Vec<usize> {
+    let mut cmts: Vec<usize> = Vec::new();
+    for (&cmt, ep) in endpoints {
+        use crate::types::EndpointLikelihood as E;
+        let reads = match ep {
+            E::Binary { lp_covariates, .. } => lp_covariates.iter().any(|c| c == index),
+            #[cfg(feature = "markov")]
+            E::Dtmm {
+                prob_covariates, ..
+            } => prob_covariates.iter().any(|c| c == index),
+            _ => false,
+        };
+        if reads {
+            cmts.push(cmt);
+        }
+    }
+    cmts.sort_unstable();
+    cmts
 }
 
 /// Whether `name` is a synthesized level index column rather than a real data
@@ -21705,6 +22854,12 @@ pub(crate) const SUPPORTED_UNARY_FNS: &[&str] = &[
     "logit",
     "inv_logit",
     "expit",
+    // #1331: the two `[covariate_nn]` activations that have no exact spelling in
+    // the other builtins. Both evaluate through `crate::nn::Activation` — the code
+    // the network itself runs — so an exported DCM reproduces it bit for bit,
+    // including softplus's `|z| > 20` tails that `log(1 + exp(z))` gets wrong.
+    "tanh",
+    "softplus",
 ];
 
 /// Panic message for the (parser-guaranteed unreachable) tail of each
@@ -21884,6 +23039,11 @@ pub(crate) struct VectorThetaDecl {
     /// Declared `profile` (#1065): the levels are solved for at every outer
     /// evaluation rather than searched by the optimizer.
     pub(crate) profiled: bool,
+    /// A profiled block some prediction reads through a logit link (#2111): the whole
+    /// prediction is `inv_logit(c × block + rest)` ([`profile_route_check`]). The profile
+    /// solve's Newton matrix is then the exact one, not the GLS matrix, which is exact only
+    /// on an affine route. `false` for an unprofiled block.
+    pub(crate) linked: bool,
     /// A profiled block's declared `(lower, upper)` (#2112): the box the profile solve
     /// holds each free θ of the block in. `None` for an unprofiled block, whose bounds
     /// are its θ's own, and for a profiled one declared without bounds.
@@ -22206,6 +23366,13 @@ pub struct LevelBlockDecl {
     pub(crate) eta_readers: Vec<Vec<String>>,
     /// Synthesized per-record index column the implicit gather reads.
     pub(crate) index_covariate: String,
+    /// Set by the parse: the CMTs of the discrete-state endpoints whose expression reads
+    /// this block and is evaluated per record — `[binary_model]` and a DTMM
+    /// `[markov_model]` — sorted (#2562). Their records define levels as the Gaussian
+    /// observations do, and carry the index in their per-record covariate snapshot. A
+    /// CTMM generator is built once per subject from the baseline, and one time-to-event
+    /// data row can yield zero or two records, so neither defines levels.
+    pub(crate) record_cmts: Vec<usize>,
 }
 
 impl LevelBlockDecl {
@@ -22239,6 +23406,9 @@ pub(crate) struct ScaleShare {
     /// The variable that carried the random effect into that expression, when
     /// the expression does not read the η itself.
     pub(crate) eta_via: Option<String>,
+    /// With `param` `None`: the expression is a `[binary_model]` predictor, not the `y`
+    /// readout (#2562).
+    pub(crate) binary: bool,
 }
 
 /// How one random effect relates to a level block (#1649, #1650), as far as
@@ -22836,6 +24006,7 @@ fn map_condition_operands<'a>(
 fn block_shares_scale_with_eta(
     stmts: &[Statement],
     readout: &[Expression],
+    n_binary: usize,
     block: &str,
     only_eta: Option<usize>,
 ) -> Option<ScaleShare> {
@@ -22862,13 +24033,15 @@ fn block_shares_scale_with_eta(
 
     let mut assigns = Vec::new();
     assignments(stmts, &mut assigns);
+    let n_y = readout.len() - n_binary;
     // `None` is the readout: it is read, never assigned to.
     assigns.extend(readout.iter().map(|e| (None, e)));
+    let first_readout = assigns.len() - readout.len();
     let mut block_tainted: Vec<&str> = Vec::new();
     let mut eta_tainted: Vec<&str> = Vec::new();
     loop {
         let before = (block_tainted.len(), eta_tainted.len());
-        for (lhs, rhs) in &assigns {
+        for (at, (lhs, rhs)) in assigns.iter().enumerate() {
             let mut reads_block = false;
             let mut reads_eta = false;
             let mut eta_via: Option<&str> = None;
@@ -22891,13 +24064,15 @@ fn block_shares_scale_with_eta(
                     } else {
                         eta_via.map(str::to_string)
                     },
+                    // The trailing readouts are the `[binary_model]` predictors.
+                    binary: lhs.is_none() && at >= first_readout + n_y,
                 });
             }
-            if let Some(lhs) = lhs {
-                if reads_block && !block_tainted.contains(lhs) {
+            if let Some(lhs) = *lhs {
+                if reads_block && !block_tainted.contains(&lhs) {
                     block_tainted.push(lhs);
                 }
-                if (reads_eta || eta_via.is_some()) && !eta_tainted.contains(lhs) {
+                if (reads_eta || eta_via.is_some()) && !eta_tainted.contains(&lhs) {
                     eta_tainted.push(lhs);
                 }
             }
@@ -23158,6 +24333,7 @@ fn coupling_assigns<'a>(
 fn level_block_eta_coupling(
     stmts: &[Statement],
     readout: &[Expression],
+    n_binary: usize,
     block: &str,
     k: usize,
     eta_name: &str,
@@ -23284,6 +24460,7 @@ fn level_block_eta_coupling(
                 site: ScaleShare {
                     param: Some(v.to_string()),
                     eta_via: via,
+                    binary: false,
                 },
                 covariates,
             });
@@ -23294,6 +24471,11 @@ fn level_block_eta_coupling(
         let (reads_any, reads_both) = reads(tb_states, te_states, ctx.out());
         let touched: Vec<&Expression> = readout.iter().filter(|e| reads_any(e)).collect();
         if let [y] = touched.as_slice() {
+            // The trailing readouts are the `[binary_model]` predictors (#2562).
+            let binary = readout
+                .iter()
+                .position(|e| std::ptr::eq(e, *y))
+                .is_some_and(|i| i >= readout.len() - n_binary);
             let mut covariates = Vec::new();
             let ops = ctx
                 .funnel_operands(y, &reads_any, &reads_both)
@@ -23315,6 +24497,7 @@ fn level_block_eta_coupling(
                     site: ScaleShare {
                         param: None,
                         eta_via: via,
+                        binary,
                     },
                     covariates,
                 });
@@ -23720,6 +24903,9 @@ pub(crate) enum ProfileRouteBreak {
     /// No prediction reads the block, so its levels have nothing to be solved from
     /// (#2103 review #8).
     Unread,
+    /// Inside a logit link (`inv_logit`, `expit`) that is not the whole prediction
+    /// (#2111): scaled, added to, or inside another link.
+    InnerLink(String),
 }
 
 /// Where a [`ProfileRouteBreak`] was found.
@@ -23734,6 +24920,52 @@ pub(crate) enum ProfileRouteSite {
 /// The label [`profile_route_check`] gives the `y` readouts.
 pub(crate) const Y_READOUT: &str = "the `y` readout";
 
+/// The label [`profile_route_check`] gives a `[binary_model]` predictor (#2562). Its
+/// logit link is implicit: the predictor is the link's argument, walked as an affine read,
+/// and a block it reads is `linked`.
+pub(crate) const BINARY_READOUT: &str = "the `[binary_model]` predictor";
+
+/// Every `[binary_model]` block's `logit` expression, the unnamed block first and the
+/// named ones by label, for the walks
+/// that judge how a level block reaches a prediction (#2562). Parsed as
+/// `parse_binary_model_block` parses it; a line that does not parse is left out here, since
+/// that parse reports it.
+fn binary_predictor_exprs(
+    blocks: &HashMap<String, Vec<String>>,
+    named: &HashMap<String, HashMap<String, Vec<String>>>,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_stmts: &[Statement],
+) -> Vec<Expression> {
+    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+    let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
+    // Named blocks by label, so the first site a refusal names does not depend on the
+    // map's order.
+    let mut labelled: Vec<(&String, &Vec<String>)> = named
+        .get("binary_model")
+        .map(|m| m.iter().collect())
+        .unwrap_or_default();
+    labelled.sort_by(|a, b| a.0.cmp(b.0));
+    blocks
+        .get("binary_model")
+        .into_iter()
+        .chain(labelled.into_iter().map(|(_, lines)| lines))
+        .flat_map(|lines| lines.iter())
+        .filter_map(|line| {
+            let (key, value) = line.trim().split_once('=')?;
+            (key.trim() == "logit")
+                .then(|| parse_scalar_expression(value.trim(), ctx).ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// Whether `f` is a logit link, the one function a profiled block may be read through
+/// (#2111).
+fn is_logit_link(f: &str) -> bool {
+    f == "inv_logit" || f == "expit"
+}
+
 /// The route half of `E_PROFILE_NOT_LINEAR` (#1065): every prediction must read a
 /// `profile`d block as `c × block + (the rest)`, where `c` reads data and literals
 /// only, along `+`, `−` (so a sum of two reads, #2114), and `×`/`÷` by such a `c`,
@@ -23741,6 +24973,12 @@ pub(crate) const Y_READOUT: &str = "the `y` readout";
 /// never through the states.
 /// That is what makes the profile solve a least-squares problem with design
 /// matrix `c`.
+///
+/// One logit link may sit around that, as the whole prediction (#2111):
+/// `y = inv_logit(c × block + rest)`, written inline or as the individual parameter `y`
+/// reads (`P = inv_logit(LP)`, `y = P`). The solve is then a GLM, not least squares, and
+/// `Ok(true)` tells it so: its Newton matrix becomes the exact one. A link anywhere else
+/// on the route (scaled, added to, nested) is refused.
 ///
 /// `readouts` are the predictions, each with the label a refusal names it by: the
 /// `y` readouts, and each `[scaling] obs_scale` divisor as `state / obs_scale`, so a
@@ -23754,10 +24992,11 @@ pub(crate) fn profile_route_check(
     stmts: &[Statement],
     readouts: &[(String, Expression)],
     error_lines: &[String],
+    endpoint_lines: &[String],
     block: &str,
     others: &[String],
     states: &StateInputs,
-) -> Result<(), (ProfileRouteBreak, ProfileRouteSite)> {
+) -> Result<bool, (ProfileRouteBreak, ProfileRouteSite)> {
     let (assigns, reach_out) = coupling_defs(stmts);
     let exprs: Vec<Expression> = readouts.iter().map(|(_, e)| e.clone()).collect();
     let ctx = CouplingCtx {
@@ -23779,14 +25018,18 @@ pub(crate) fn profile_route_check(
     if ctx.state_tainted(&src, &taint) {
         return Err((ProfileRouteBreak::State, y()));
     }
-    // The residual error: a name after an `[error_model]` line's `~` that is the
-    // block, or an individual parameter carrying it at the end of the block. The
-    // variance then reads the block, and the solve is no longer least squares.
-    let error_reads = error_lines.iter().any(|l| {
-        let rhs = l.split_once('~').map_or("", |(_, r)| r);
-        rhs.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .any(|t| t == block || ctx.var_tainted(t, &taint, ctx.out()))
-    });
+    // A name on the right of `sep` in one of `lines` that is the block, or an individual
+    // parameter carrying it at the end of the block.
+    let lines_read = |lines: &[String], sep: char| {
+        lines.iter().any(|l| {
+            let rhs = l.split_once(sep).map_or("", |(_, r)| r);
+            rhs.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|t| t == block || ctx.var_tainted(t, &taint, ctx.out()))
+        })
+    };
+    // The residual error: the variance then reads the block, and the solve is no
+    // longer least squares.
+    let error_reads = lines_read(error_lines, '~');
     if error_reads {
         return Err((ProfileRouteBreak::Residual, y()));
     }
@@ -23796,13 +25039,26 @@ pub(crate) fn profile_route_check(
         taint: &taint,
     };
     let mut read = false;
+    let mut linked = false;
     for (label, e) in readouts {
         if !ctx.expr_reads(e, &src, &taint, ctx.out(), false) {
             continue;
         }
         read = true;
         let site = ProfileRouteSite::Readout(label.clone());
-        walk.affine(e, ctx.out(), &site)?;
+        // A `[binary_model]` predictor is the argument of its implicit logit link (#2562).
+        let implicit = (label == BINARY_READOUT).then_some(vec![(e, ctx.out(), site.clone())]);
+        match implicit.or_else(|| walk.outer_link(e, ctx.out(), &site)) {
+            Some(args) => {
+                linked = true;
+                for (arg, at, site) in args {
+                    walk.affine(arg, at, &site)?;
+                }
+            }
+            None => {
+                walk.affine(e, ctx.out(), &site)?;
+            }
+        }
         for other in others {
             let is_other = |e: &Expression| matches!(e, Expression::ThetaGather { spec, .. } if spec.name == *other);
             let osrc = Source {
@@ -23815,10 +25071,12 @@ pub(crate) fn profile_route_check(
             }
         }
     }
-    if !read {
+    // A hazard or Markov expression the walk does not judge (#2562): `E_PROFILE_SCOPE`
+    // refuses the model for its endpoint, which is the true reason.
+    if !read && !lines_read(endpoint_lines, '=') {
         return Err((ProfileRouteBreak::Unread, y()));
     }
-    Ok(())
+    Ok(linked)
 }
 
 /// The one plain data column every read of `block` is indexed by, across the
@@ -23893,6 +25151,11 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
             "Here one prediction reads `{block}` and `{o}`, which is profiled too; a \
              prediction may read only one profiled block."
         ),
+        ProfileRouteBreak::InnerLink(c) => format!(
+            "Here `{block}` reaches `y` through {c} {at}. A logit link is accepted only as the \
+             whole prediction, `y = inv_logit(c × {block} + …)`, on every branch of an `if` \
+             that chooses it, not scaled, added to or inside another link."
+        ),
         ProfileRouteBreak::Unread => unreachable!("answered above"),
     };
     format!(
@@ -23914,6 +25177,52 @@ struct ProfileWalk<'w, 'a> {
 impl ProfileWalk<'_, '_> {
     fn reads(&self, e: &Expression, at: At<'_>) -> bool {
         self.ctx.expr_reads(e, self.src, self.taint, at, false)
+    }
+
+    /// The arguments of the logit link a prediction `e` is, each with where it is read
+    /// (#2111): `e` itself `inv_logit(arg)` / `expit(arg)`; a name whose reaching
+    /// definitions are; or an `if` (two definitions, or an inline `if`) whose condition
+    /// reads data only and whose every arm reading the block is. One argument per such
+    /// arm, each then walked for an affine read; an arm that does not read the block adds
+    /// none, as it adds `c = 0` to an affine route (#2114). `None` when the prediction is
+    /// anything else, the link included once scaled, added to or on only some arms, so
+    /// the affine walk sees it and refuses it there.
+    fn outer_link<'e>(
+        &'e self,
+        e: &'e Expression,
+        at: At<'e>,
+        site: &ProfileRouteSite,
+    ) -> Option<Vec<(&'e Expression, At<'e>, ProfileRouteSite)>> {
+        let arms = |parts: Vec<(&'e Expression, At<'e>, ProfileRouteSite)>| {
+            let mut out = Vec::new();
+            for (e, at, site) in parts {
+                if self.reads(e, at) {
+                    out.extend(self.outer_link(e, at, &site)?);
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        };
+        match e {
+            Expression::UnaryFn(f, arg) if is_logit_link(f) => Some(vec![(arg, at, site.clone())]),
+            Expression::Variable(n) | Expression::Covariate(n) => {
+                let defs = self.ctx.resolve(at, n);
+                if defs.is_empty()
+                    || (defs.len() > 1 && !defs.iter().all(|&d| self.chosen_by_data(d)))
+                {
+                    return None;
+                }
+                let param = ProfileRouteSite::Param(n.clone());
+                arms(
+                    defs.iter()
+                        .map(|&d| (self.ctx.assigns[d].rhs, self.ctx.at(d), param.clone()))
+                        .collect(),
+                )
+            }
+            Expression::Conditional(c, t, f) if self.cond_data_only(c, at) => {
+                arms(vec![(&**t, at, site.clone()), (&**f, at, site.clone())])
+            }
+            _ => None,
+        }
     }
 
     /// Whether `e` reads the block, `Err` when it does but not affinely.
@@ -23966,6 +25275,11 @@ impl ProfileWalk<'_, '_> {
                     (BinOp::Mul, false, true) if self.data_only(l, at) => Ok(true),
                     _ => fail(ProfileRouteBreak::Coefficient),
                 }
+            }
+            // A link is peeled only as the whole prediction ([`Self::outer_link`]); one
+            // reached here is scaled, added to, or nested.
+            Expression::UnaryFn(f, _) if is_logit_link(f) => {
+                fail(ProfileRouteBreak::InnerLink(format!("`{f}(...)`")))
             }
             Expression::UnaryFn(f, _) => fail(ProfileRouteBreak::Construct(format!("`{f}(...)`"))),
             Expression::Power(..) => fail(ProfileRouteBreak::Construct("a power (`^`)".into())),
@@ -24505,7 +25819,7 @@ const WORD_VALUED_KEYS: &[(&str, &str, WordValue)] = &[
         WordValue::Words(&["forward", "reset"]),
     ),
     ("binary_model", "link", WordValue::Words(&["logit"])),
-    ("markov_model", "type", WordValue::Words(&["ctmm"])),
+    ("markov_model", "type", WordValue::Words(&["ctmm", "dtmm"])),
     ("markov_model", "states", WordValue::Labels),
     // `parse_decision_schedule`: `[t1, …]` or `every Δ from t0 to t1`.
     (
@@ -24878,7 +26192,7 @@ fn is_scaling_entry_key(base: &str) -> bool {
 
 /// Whether `name` is a syntactically valid DSL identifier (the shape the
 /// tokenizer produces for `Token::Ident`).
-fn is_plain_identifier(name: &str) -> bool {
+pub(crate) fn is_plain_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -24887,7 +26201,11 @@ fn is_plain_identifier(name: &str) -> bool {
 /// Names a `[scaling]` intermediate may not take: the built-ins the expression
 /// parser resolves before it would ever consult the intermediate table, so a
 /// binding under one of these names would silently never be read.
-fn scaling_intermediate_reserved(name: &str) -> Option<&'static str> {
+///
+/// The DCM exporter (`crate::nn::export`) refuses a network input under one of
+/// these names for the same reason: written into an expression, it would read
+/// the built-in, not the data column.
+pub(crate) fn scaling_intermediate_reserved(name: &str) -> Option<&'static str> {
     if name == "TIME" || name == "time" {
         return Some("the model-time built-in");
     }
@@ -26017,19 +27335,15 @@ fn eval_expr<E: EvalEnv>(
                 "floor" => v.floor(),
                 "ceil" => v.ceil(),
                 "round" => v.round(),
-                "inv_logit" | "expit" => {
-                    // Numerically stable: avoid exp overflow for very negative v
-                    if v >= 0.0 {
-                        1.0 / (1.0 + (-v).exp())
-                    } else {
-                        let e = v.exp();
-                        e / (1.0 + e)
-                    }
-                }
+                // The network's own stable sigmoid, so an exported `sigmoid` head
+                // is the same code, not a twin of it (#1331).
+                "inv_logit" | "expit" => crate::nn::Activation::Sigmoid.apply(v),
                 "logit" => {
                     let clamped = v.clamp(1e-15, 1.0 - 1e-15);
                     (clamped / (1.0 - clamped)).ln()
                 }
+                "tanh" => crate::nn::Activation::Tanh.apply(v),
+                "softplus" => crate::nn::Activation::Softplus.apply(v),
                 // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
                 _ => unreachable!("{UNARY_FN_ARM_MISSING} (eval_expr, `{name}`)"),
             }
@@ -26201,6 +27515,10 @@ enum Op {
     Abs,
     InvLogit,
     Logit,
+    /// `tanh(x)` and `softplus(x)` (#1331): `crate::nn::Activation::{Tanh, Softplus}`,
+    /// the code a `[covariate_nn]` runs, on every evaluator.
+    Tanh,
+    Softplus,
     CmpLt,
     CmpLe,
     CmpGt,
@@ -26278,7 +27596,14 @@ struct IpStmtDeps {
 /// the hoist gate below *less* eager, not more).
 fn ip_op_cost(op: &Op) -> u32 {
     match op {
-        Op::Pow | Op::Exp | Op::Ln | Op::Sqrt | Op::Logit | Op::InvLogit => 20,
+        Op::Pow
+        | Op::Exp
+        | Op::Ln
+        | Op::Sqrt
+        | Op::Logit
+        | Op::InvLogit
+        | Op::Tanh
+        | Op::Softplus => 20,
         Op::Div | Op::Mod => 4,
         _ => 1,
     }
@@ -26322,6 +27647,8 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
             | Op::Abs
             | Op::InvLogit
             | Op::Logit
+            | Op::Tanh
+            | Op::Softplus
             | Op::CmpLt
             | Op::CmpLe
             | Op::CmpGt
@@ -26491,6 +27818,8 @@ fn ip_op_pops(op: &Op) -> Option<usize> {
         | Op::Abs
         | Op::InvLogit
         | Op::Logit
+        | Op::Tanh
+        | Op::Softplus
         | Op::LogicNot
         | Op::IsPresent
         | Op::Floor
@@ -27201,6 +28530,8 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::Abs
             | Op::InvLogit
             | Op::Logit
+            | Op::Tanh
+            | Op::Softplus
             | Op::LogicNot
             | Op::IsPresent
             | Op::Floor
@@ -27324,6 +28655,8 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 "abs" => bc.ops.push(Op::Abs),
                 "inv_logit" | "expit" => bc.ops.push(Op::InvLogit),
                 "logit" => bc.ops.push(Op::Logit),
+                "tanh" => bc.ops.push(Op::Tanh),
+                "softplus" => bc.ops.push(Op::Softplus),
                 "floor" => bc.ops.push(Op::Floor),
                 "ceil" => bc.ops.push(Op::Ceil),
                 "round" => bc.ops.push(Op::Round),
@@ -27571,16 +28904,13 @@ fn eval_bytecode_lanes<L: Lane>(
             Op::Floor => unary!(|v| v.floor()),
             Op::Ceil => unary!(|v| v.ceil()),
             Op::Round => unary!(|v| v.round()),
-            Op::InvLogit => unary!(|v| if v >= 0.0 {
-                1.0 / (1.0 + (-v).exp())
-            } else {
-                let e = v.exp();
-                e / (1.0 + e)
-            }),
+            Op::InvLogit => unary!(|v| crate::nn::Activation::Sigmoid.apply(v)),
             Op::Logit => unary!(|v| {
                 let clamped = v.clamp(1e-15, 1.0 - 1e-15);
                 (clamped / (1.0 - clamped)).ln()
             }),
+            Op::Tanh => unary!(|v| crate::nn::Activation::Tanh.apply(v)),
+            Op::Softplus => unary!(|v| crate::nn::Activation::Softplus.apply(v)),
             Op::CmpLt => binary!(|l, r| bool01(l < r)),
             Op::CmpLe => binary!(|l, r| bool01(l <= r)),
             Op::CmpGt => binary!(|l, r| bool01(l > r)),
@@ -27842,6 +29172,17 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::InvLogit => {
                 let v = pop!();
                 push!(v.inv_logit());
+            }
+            // The network's own generic activation: same branches on the value, so
+            // the value is bit-identical to the `f64` arms and the jet is the
+            // taken branch's (#1331).
+            Op::Tanh => {
+                let v = pop!();
+                push!(crate::nn::Activation::Tanh.apply_g(v));
+            }
+            Op::Softplus => {
+                let v = pop!();
+                push!(crate::nn::Activation::Softplus.apply_g(v));
             }
             Op::Logit => {
                 let v = pop!();
@@ -29209,12 +30550,6 @@ pub struct OdeRhsProgram {
     /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
     /// `stmts_read_slots`, which is #1124. Companion to [`Self::pk_reads_tafd`].
     pk_reads_solver_time: bool,
-    /// Does this system carry injected joint-PK-TTE `d/dt(__chz_<cmt>)` accumulator rows?
-    /// The `Vec<usize>` of slots lives on [`crate::ode::OdeSpec::chz_state_slots`]; the
-    /// program only needs the predicate, for the dual SS equilibration's entry assertion
-    /// (#1210) — that path has no accumulator handling and is reachable only if a routing
-    /// gate is widened.
-    has_chz: bool,
     /// One entry per `init(state) = …` directive: `(the state's slot, the individual
     /// parameters the expression reads, as indices into
     /// [`crate::types::CompiledModel::indiv_param_names`])`.
@@ -29353,14 +30688,21 @@ impl OdeRhsProgram {
         Some(out)
     }
 
+    /// Whether every `init(...)` directive compiled ([`Self::init_state_g`] serves it).
+    pub(crate) fn has_init_program(&self) -> bool {
+        self.init_program.is_some()
+    }
+
+    /// Drop the compiled init program: the shape of an `init(...)` the compiled form could not
+    /// express, for the test pinning that the walks decline it.
+    #[cfg(test)]
+    pub(crate) fn drop_init_program_for_tests(&mut self) {
+        self.init_program = None;
+    }
+
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
     pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars
-    }
-
-    /// See [`OdeRhsProgram::has_chz`].
-    pub(crate) fn has_chz(&self) -> bool {
-        self.has_chz
     }
 
     /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants
@@ -29894,6 +31236,8 @@ fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
         | Op::Abs
         | Op::InvLogit
         | Op::Logit
+        | Op::Tanh
+        | Op::Softplus
         | Op::CmpLt
         | Op::CmpLe
         | Op::CmpGt
@@ -30247,12 +31591,6 @@ fn compute_covariate_dependent_mask(
     )
 }
 
-/// Widest `(θ, η)` axis count the CTMM generator's dual dispatch specializes.
-/// Above this, [`CtmmGeneratorProgram::eval_generator_duals`] returns `None` and the
-/// endpoint keeps its finite-difference gradient — a fallback, never a wrong answer.
-#[cfg(feature = "markov")]
-pub(crate) const MAX_CTMM_AXES: usize = 24;
-
 /// Compiled, **dual-evaluable** `[markov_model]` transition intensities — the CTMM
 /// analogue of [`IndivParamProgram`] (#759).
 ///
@@ -30261,30 +31599,31 @@ pub(crate) const MAX_CTMM_AXES: usize = 24;
 /// differenced end-to-end (perturb η, rebuild `Q`, redo an `expm` per observation gap).
 /// This snapshot carries the same intensities in *resolved* form — the shared
 /// `Bytecode` the rest of the analytic-sensitivity path uses — so they can be replayed
-/// over `Dual1<M>` with θ and η seeded, yielding an exact `∂Q/∂(θ,η)`.
+/// over any dual type (`eval_generator_g`): through the
+/// scaling-and-squaring `expm` on that type (`markov::endpoint::CtmmTerm`) it gives the
+/// likelihood's exact η-gradient, η-Hessian and θ-derivatives. `∂Q/∂p` inherits the
+/// generator's **row-sum-zero constraint** for free: every intensity is added at its
+/// off-diagonal entry and subtracted from the diagonal, and differentiation is linear.
 ///
-/// Chained through the Van Loan Fréchet derivative of `expm`
-/// ([`markov::matrix_exp_frechet`](crate::markov::matrix_exp_frechet)) this gives the exact
-/// likelihood gradient. Note `∂Q/∂p` inherits the generator's **row-sum-zero constraint**
-/// for free: every intensity is added at its off-diagonal entry and subtracted from the
-/// diagonal, and differentiation is linear, so the derivative of a valid generator is a
-/// valid *direction*. That is the constraint `generator_rate_direction` hand-builds for the
-/// one-rate-at-a-time case, and the reason a naive "one gradient per `Q` entry" API is wrong
-/// (see the `markov` module docs).
-///
-/// Time-**inhomogeneous** endpoints (an intensity reading an ODE state) get no program:
-/// their likelihood is an occupancy ODE, not an `expm`, so Van Loan does not apply.
+/// A time-**inhomogeneous** endpoint (an intensity reading an ODE state) reads each state
+/// through a var slot past the `[individual_parameters]` ones (`state_slots`), which the
+/// caller fills with the state on its own number type: its likelihood is an occupancy ODE,
+/// differentiated through the dual state solve (`markov::endpoint`).
 #[cfg(feature = "markov")]
 #[derive(Debug, Clone)]
 pub struct CtmmGeneratorProgram {
     /// Resolved `[individual_parameters]` statements the intensities read, in
     /// dependency order (already restricted to the transitively-referenced subset).
     stmts: Vec<Statement>,
-    /// Var-slot count the statements above write into.
+    /// Var-slot count: the statements above write the leading ones, the ODE states the
+    /// intensities read fill the rest (`state_slots`).
     n_vars: usize,
     /// `(from, to, intensity)` — one compiled off-diagonal rate per `transition` line.
     rates: Vec<(usize, usize, Bytecode)>,
     n_states: usize,
+    /// `(var slot, ODE state index)` of each state an intensity reads; empty for a
+    /// time-homogeneous endpoint.
+    state_slots: Vec<(usize, usize)>,
     /// Covariate names in the generator's own (sorted) order, for the cov slice.
     cov_names: Vec<String>,
     n_theta: usize,
@@ -30295,116 +31634,95 @@ pub struct CtmmGeneratorProgram {
 
 #[cfg(feature = "markov")]
 impl CtmmGeneratorProgram {
-    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
-    /// Whether [`eval_generator_duals`](Self::eval_generator_duals) serves this width
-    /// (at most [`MAX_CTMM_AXES`]): the model-level routing of the exact gradient reads
-    /// this, so it cannot report "analytic" for a program every subject's evaluation
-    /// declines.
-    pub(crate) fn gradient_in_scope(&self) -> bool {
-        self.n_axes() <= MAX_CTMM_AXES
-    }
-    pub(crate) fn n_theta_axis(&self) -> usize {
-        self.n_theta
-    }
-
-    /// `Q` and `∂Q/∂(θ, η)` at a covariate snapshot, evaluated over `Dual1<M>` with
-    /// θ_m on axis `m` and η_k on axis `n_theta + k`.
-    ///
-    /// Returns `(q, dq)` where `q` is the `S×S` generator and `dq[a]` is `∂Q/∂(axis a)`,
-    /// length `n_axes()`. Both are built by placing each intensity — value and jet — at
-    /// its off-diagonal entry and subtracting it from the diagonal, so each `dq[a]` has
-    /// zero row sums by construction.
-    ///
-    /// `None` above the dispatch cap ([`MAX_CTMM_AXES`]): the endpoint then keeps its FD
-    /// gradient rather than a wrong one.
-    pub(crate) fn eval_generator_duals(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Option<(nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>)> {
-        macro_rules! disp {
-            ($($m:literal),+) => {
-                match self.n_axes() {
-                    $($m => Some(self.eval_generator_duals_n::<$m>(theta, eta, covariates)),)+
-                    _ => None,
-                }
-            };
-        }
-        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
-    }
-
-    fn eval_generator_duals_n<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> (nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>) {
-        debug_assert_eq!(M, self.n_axes());
-        let rate_bcs: Vec<&Bytecode> = self.rates.iter().map(|(_, _, bc)| bc).collect();
-        let jets = eval_endpoint_jets::<M>(
-            &self.stmts,
-            self.n_vars,
-            &rate_bcs,
-            &self.cov_names,
-            self.n_theta,
-            theta,
-            eta,
-            covariates,
-        );
-
-        let s = self.n_states;
-        let n_axes = self.n_axes();
-        let mut q = nalgebra::DMatrix::<f64>::zeros(s, s);
-        let mut dq = vec![nalgebra::DMatrix::<f64>::zeros(s, s); n_axes];
-        for ((j, k, _), rate) in self.rates.iter().zip(jets.iter()) {
-            q[(*j, *k)] += rate.value;
-            q[(*j, *j)] -= rate.value;
-            for (a, dq_a) in dq.iter_mut().enumerate().take(n_axes) {
-                let g = rate.grad[a];
-                dq_a[(*j, *k)] += g;
-                dq_a[(*j, *j)] -= g;
-            }
-        }
-        (q, dq)
-    }
-
-    /// The generator `Q` at fixed θ over any VM number type, η carrying whatever derivative
-    /// structure the caller seeded: `S×S`, **column-major** (nalgebra's layout), assembled
-    /// like [`eval_generator_duals`](Self::eval_generator_duals) so every derivative has
-    /// zero row sums. The CTMM likelihood written once over `T` reads it (#2437).
+    /// The generator `Q` (row-major `S×S`) over any VM number type, θ and η carrying
+    /// whatever derivative structure the caller seeded — each intensity placed at its
+    /// off-diagonal entry and subtracted from the diagonal.
+    /// `None` on a θ/η count shorter than the program reads.
     pub(crate) fn eval_generator_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
+        theta: &[T],
         eta: &[T],
         covariates: &HashMap<String, f64>,
-    ) -> Vec<T> {
-        let theta_t: Vec<T> = theta.iter().map(|&v| T::from_f64(v)).collect();
-        let rate_bcs: Vec<&Bytecode> = self.rates.iter().map(|(_, _, bc)| bc).collect();
-        let rates = eval_endpoint_outputs_g(
+    ) -> Option<Vec<T>> {
+        let (mut vars, cov_vec) = self.vars_g(theta, eta, covariates)?;
+        Some(self.generator_at_g(theta, eta, &cov_vec, &mut vars, &[]))
+    }
+
+    /// Whether an intensity reads an ODE state (the time-inhomogeneous endpoint).
+    pub(crate) fn reads_states(&self) -> bool {
+        !self.state_slots.is_empty()
+    }
+
+    /// The `[individual_parameters]` var slots and the covariate slice, once per `(θ, η)`:
+    /// what [`generator_at_g`](Self::generator_at_g) reads at every state.
+    pub(crate) fn vars_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<(Vec<T>, Vec<f64>)> {
+        if theta.len() < self.n_theta || eta.len() < self.n_eta {
+            return None;
+        }
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![T::from_f64(0.0); self.n_vars];
+        let mut stack: Vec<T> = Vec::new();
+        eval_statements_g::<T>(
             &self.stmts,
-            self.n_vars,
-            &rate_bcs,
-            &self.cov_names,
-            &theta_t,
+            theta,
             eta,
-            covariates,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &[],
+            &[],
         );
+        Some((vars, cov_vec))
+    }
+
+    /// The generator `Q` (row-major) at the ODE state `state` (ignored by a homogeneous
+    /// endpoint), from [`vars_g`](Self::vars_g)'s slots; the state slots are overwritten.
+    pub(crate) fn generator_at_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        cov_vec: &[f64],
+        vars: &mut [T],
+        state: &[T],
+    ) -> Vec<T> {
+        for &(slot, idx) in &self.state_slots {
+            vars[slot] = state.get(idx).copied().unwrap_or(T::from_f64(0.0));
+        }
+        let mut stack: Vec<T> = Vec::new();
         let s = self.n_states;
         let mut q = vec![T::from_f64(0.0); s * s];
-        for ((j, k, _), rate) in self.rates.iter().zip(rates) {
-            q[j + k * s] = q[j + k * s] + rate;
-            q[j + j * s] = q[j + j * s] - rate;
+        for (j, k, bc) in &self.rates {
+            let rate = eval_bytecode_g::<T>(bc, theta, eta, cov_vec, vars, &[], &mut stack);
+            q[j * s + k] = q[j * s + k] + rate;
+            q[j * s + j] = q[j * s + j] - rate;
         }
         q
     }
 
-    /// The generator's state count `S`.
-    pub(crate) fn n_states(&self) -> usize {
-        self.n_states
+    /// The generator `Q` at fixed θ over any VM number type, η carrying whatever derivative
+    /// structure the caller seeded: `S×S`, **column-major** (nalgebra's layout), the
+    /// transpose of [`eval_generator_g`](Self::eval_generator_g)'s row-major one, so every
+    /// derivative has zero row sums. The homogeneous CTMM likelihood written once over `T`
+    /// reads it (#2437). `None` where [`eval_generator_g`](Self::eval_generator_g) is.
+    pub(crate) fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        let q = self.eval_generator_g(theta, eta, covariates)?;
+        let s = self.n_states;
+        Some((0..s * s).map(|c| q[(c % s) * s + c / s]).collect())
     }
 }
 
@@ -30420,6 +31738,7 @@ fn build_ctmm_generator_program(
     transitions: &[(usize, usize, Expression)],
     needed_indiv_stmts: &[Statement],
     generator_covariates: &[String],
+    generator_states: &[(String, usize)],
     n_states: usize,
     n_theta: usize,
     n_eta: usize,
@@ -30427,32 +31746,51 @@ fn build_ctmm_generator_program(
     if n_theta + n_eta == 0 {
         return None;
     }
-    let exprs: Vec<&Expression> = transitions.iter().map(|(_, _, e)| e).collect();
-    let (stmts, n_vars, bcs) =
-        compile_endpoint_exprs(&exprs, needed_indiv_stmts, generator_covariates)?;
+    // A state an intensity reads parses as a `Covariate` leaf; read it through a var slot
+    // instead, so it carries the state's own derivatives.
+    let state_names: Vec<String> = generator_states.iter().map(|(n, _)| n.clone()).collect();
+    let rewritten: Vec<Expression> = transitions
+        .iter()
+        .map(|(_, _, e)| {
+            let mut e = e.clone();
+            visit_expr_nodes_mut(&mut e, &mut |node: &mut Expression| {
+                if let Expression::Covariate(name) = node {
+                    if state_names.contains(name) {
+                        *node = Expression::Variable(name.clone());
+                    }
+                }
+            });
+            e
+        })
+        .collect();
+    let exprs: Vec<&Expression> = rewritten.iter().collect();
+    let (stmts, n_vars, bcs) = compile_endpoint_exprs(
+        &exprs,
+        needed_indiv_stmts,
+        generator_covariates,
+        &state_names,
+    )?;
     let rates: Vec<(usize, usize, Bytecode)> = transitions
         .iter()
         .zip(bcs)
         .map(|((j, k, _), bc)| (*j, *k, bc))
         .collect();
-
+    let first_state_slot = n_vars - state_names.len();
     Some(CtmmGeneratorProgram {
         stmts,
         n_vars,
         rates,
         n_states,
+        state_slots: generator_states
+            .iter()
+            .enumerate()
+            .map(|(i, (_, idx))| (first_state_slot + i, *idx))
+            .collect(),
         cov_names: generator_covariates.to_vec(),
         n_theta,
         n_eta,
     })
 }
-
-/// Widest `(θ, η)` axis count an [`EndpointExprProgram`]'s dual dispatch specializes.
-/// Above this, [`EndpointExprProgram::eval_duals`] returns `None` and the endpoint keeps
-/// its finite-difference gradient — a fallback, never a wrong answer. The same cap as the
-/// CTMM generator's, so both reuse one set of `Dual1<M>` instantiations.
-#[cfg(feature = "survival")]
-pub(crate) const MAX_ENDPOINT_AXES: usize = 24;
 
 /// Resolve the `[individual_parameters]` statements a non-Gaussian endpoint reads and
 /// compile each of `exprs` to bytecode against them — the shared front half of every
@@ -30469,10 +31807,13 @@ fn compile_endpoint_exprs(
     exprs: &[&Expression],
     needed_indiv_stmts: &[Statement],
     covariates: &[String],
+    extra_vars: &[String],
 ) -> Option<(Vec<Statement>, usize, Vec<Bytecode>)> {
     // Var slots for the `[individual_parameters]` values the expressions read, in the
-    // order they are assigned (so a later value may read an earlier one).
-    let var_names = assigned_vars_in_order(needed_indiv_stmts);
+    // order they are assigned (so a later value may read an earlier one), then the
+    // caller's `extra_vars` (the ODE states a CTMM intensity reads), which it fills itself.
+    let mut var_names = assigned_vars_in_order(needed_indiv_stmts);
+    var_names.extend(extra_vars.iter().cloned());
     let var_idx: HashMap<String, usize> = var_names
         .iter()
         .enumerate()
@@ -30519,62 +31860,9 @@ fn compile_endpoint_exprs(
     Some((stmts, n_vars, bcs))
 }
 
-/// Evaluate a compiled endpoint program over `Dual1<M>` — θ_m on axis `m`, η_k on axis
-/// `n_theta + k` — and return one jet per output bytecode. The shared back half of
-/// [`CtmmGeneratorProgram::eval_generator_duals`] and [`EndpointExprProgram::eval_duals`].
-///
-/// A `TIME` leaf (`Op::PushTime`) reads the model-time thread-local, so a caller that
-/// needs a per-record time wraps the call in `with_model_time`, exactly as the `f64`
-/// value path does.
-#[cfg(feature = "survival")]
-#[allow(clippy::too_many_arguments)]
-fn eval_endpoint_jets<const M: usize>(
-    stmts: &[Statement],
-    n_vars: usize,
-    outputs: &[&Bytecode],
-    cov_names: &[String],
-    n_theta: usize,
-    theta: &[f64],
-    eta: &[f64],
-    covariates: &HashMap<String, f64>,
-) -> Vec<crate::sens::dual1::Dual1<M>> {
-    use crate::sens::dual1::Dual1;
-    let theta_d: Vec<Dual1<M>> = theta
-        .iter()
-        .enumerate()
-        .map(|(m, &v)| {
-            if m < n_theta && m < M {
-                Dual1::var(v, m)
-            } else {
-                // A θ the expressions cannot reference anyway (the program is sized by
-                // the model's declared θ count, so this is unreachable in practice).
-                Dual1::constant(v)
-            }
-        })
-        .collect();
-    let eta_d: Vec<Dual1<M>> = eta
-        .iter()
-        .enumerate()
-        .map(|(k, &v)| {
-            let dim = n_theta + k;
-            if dim < M {
-                Dual1::var(v, dim)
-            } else {
-                // IOV kappas are appended past the BSV η block and are rejected in an
-                // endpoint expression at parse, so they are correctly seeded as constants.
-                Dual1::constant(v)
-            }
-        })
-        .collect();
-    eval_endpoint_outputs_g(
-        stmts, n_vars, outputs, cov_names, &theta_d, &eta_d, covariates,
-    )
-}
-
 /// Evaluate a compiled endpoint program over any VM number type, with θ and η carrying
 /// whatever derivative structure the caller seeded, and return one value per output
-/// bytecode. The `Dual1` gradient jets ([`eval_endpoint_jets`]) and the likelihoods
-/// written once over `T` (`EndpointExprProgram::eval_g`,
+/// bytecode. The likelihoods written once over `T` (`EndpointExprProgram::eval_g`,
 /// `CtmmGeneratorProgram::eval_generator_g`) are both this function (#2437).
 #[cfg(feature = "survival")]
 fn eval_endpoint_outputs_g<T: crate::sens::num::vm::VmNum>(
@@ -30616,9 +31904,11 @@ fn eval_endpoint_outputs_g<T: crate::sens::num::vm::VmNum>(
 /// The `f64` [`LinearPredictorFn`] tree-walks `Expression`s and can only ever produce
 /// the value, which is why the binary data term was finite-differenced end-to-end. This
 /// snapshot carries the same expressions in *resolved* bytecode form so they can be
-/// replayed over `Dual1<M>` with θ and η seeded, yielding exact `∂/∂(θ, η)`. It is the
-/// [`CtmmGeneratorProgram`] construction minus the generator assembly; both share
-/// `compile_endpoint_exprs` and `eval_endpoint_jets`.
+/// replayed over any dual type (`eval_g`), yielding their exact
+/// derivatives — the binary linear predictor and the analytic hazards' parameters. It is
+/// the [`CtmmGeneratorProgram`] construction minus the generator assembly; both share
+/// `compile_endpoint_exprs`. A `TIME` leaf reads the model-time thread-local, so a caller
+/// that needs a per-record time wraps the call in `with_model_time`.
 #[cfg(feature = "survival")]
 #[derive(Debug, Clone)]
 pub struct EndpointExprProgram {
@@ -30638,87 +31928,29 @@ pub struct EndpointExprProgram {
 
 #[cfg(feature = "survival")]
 impl EndpointExprProgram {
-    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
-    /// Whether [`eval_duals`](Self::eval_duals) serves this width (at most
-    /// [`MAX_ENDPOINT_AXES`]): the model-level routing of the exact gradient reads this,
-    /// so it cannot report "analytic" for a program every subject's evaluation declines.
-    pub(crate) fn gradient_in_scope(&self) -> bool {
-        self.n_axes() <= MAX_ENDPOINT_AXES
-    }
-    pub(crate) fn n_theta_axis(&self) -> usize {
-        self.n_theta
-    }
-
-    /// Value and `∂/∂(θ, η)` of every output at a covariate snapshot (and at the current
-    /// model time, for a `TIME` leaf). Each entry is `(value, grad)` with `grad` laid out
-    /// θ₀..θ_{T−1}, η₀..η_{E−1}, length [`n_axes`](Self::n_axes).
-    ///
-    /// `None` above the dispatch cap ([`MAX_ENDPOINT_AXES`]): the endpoint then keeps its
-    /// FD gradient rather than a wrong one.
-    pub(crate) fn eval_duals(
+    /// Every output over any VM number type, θ and η carrying whatever derivative structure
+    /// the caller seeded — a second-order η-dual for the η-Hessian (#2437), tape leaves for the
+    /// adjoint's θ block (#2482) — at a covariate snapshot and the current model time (a
+    /// `TIME` leaf). `None` on a θ/η count shorter than the program reads.
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
-        eta: &[f64],
+        theta: &[T],
+        eta: &[T],
         covariates: &HashMap<String, f64>,
-    ) -> Option<Vec<(f64, Vec<f64>)>> {
-        macro_rules! disp {
-            ($($m:literal),+) => {
-                match self.n_axes() {
-                    $($m => Some(self.eval_duals_n::<$m>(theta, eta, covariates)),)+
-                    _ => None,
-                }
-            };
+    ) -> Option<Vec<T>> {
+        if theta.len() < self.n_theta || eta.len() < self.n_eta {
+            return None;
         }
-        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
-    }
-
-    fn eval_duals_n<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Vec<(f64, Vec<f64>)> {
-        debug_assert_eq!(M, self.n_axes());
         let outs: Vec<&Bytecode> = self.outputs.iter().collect();
-        eval_endpoint_jets::<M>(
+        Some(eval_endpoint_outputs_g(
             &self.stmts,
             self.n_vars,
             &outs,
             &self.cov_names,
-            self.n_theta,
             theta,
             eta,
             covariates,
-        )
-        .into_iter()
-        .map(|d| (d.value, d.grad.to_vec()))
-        .collect()
-    }
-
-    /// Every output at fixed θ over any VM number type, η carrying whatever derivative
-    /// structure the caller seeded (and at the current model time, for a `TIME` leaf): the
-    /// endpoint's parameters inside a likelihood written once over `T`, so its η-Hessian is
-    /// that likelihood run on a second-order dual (#2437).
-    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
-        &self,
-        theta: &[f64],
-        eta: &[T],
-        covariates: &HashMap<String, f64>,
-    ) -> Vec<T> {
-        let theta_t: Vec<T> = theta.iter().map(|&v| T::from_f64(v)).collect();
-        let outs: Vec<&Bytecode> = self.outputs.iter().collect();
-        eval_endpoint_outputs_g(
-            &self.stmts,
-            self.n_vars,
-            &outs,
-            &self.cov_names,
-            &theta_t,
-            eta,
-            covariates,
-        )
+        ))
     }
 }
 
@@ -30739,7 +31971,8 @@ fn build_endpoint_expr_program(
     if n_theta + n_eta == 0 {
         return None;
     }
-    let (stmts, n_vars, outputs) = compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates)?;
+    let (stmts, n_vars, outputs) =
+        compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates, &[])?;
     Some(EndpointExprProgram {
         stmts,
         n_vars,
@@ -30884,26 +32117,33 @@ impl IndivParamProgram {
         covariates: &HashMap<String, f64>,
         nn: &[Vec<T>],
     ) -> Vec<T> {
-        let cov_vec: Vec<f64> = self
-            .cov_names
-            .iter()
-            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
-            .collect();
-        let mut vars = vec![T::from_f64(0.0); self.n_vars];
-        let mut stack: Vec<T> = Vec::new();
+        // Every buffer comes from this thread's pool, cleared and filled exactly as a
+        // fresh one would be, and goes back after.
+        let mut cov_vec: Vec<f64> = crate::scratch::take();
+        cov_vec.extend(
+            self.cov_names
+                .iter()
+                .map(|n| covariates.get(n).copied().unwrap_or(0.0)),
+        );
+        let mut vars: Vec<T> = crate::scratch::take_for(self.n_vars);
+        vars.resize(self.n_vars, T::from_f64(0.0));
+        let mut stack: Vec<T> = crate::scratch::take_for(0);
         // Cov-static fold (#485): evaluate the constant-across-(θ,η) slots once in
         // plain f64, seed them as constants (zero derivatives — exactly what they
         // carry), and skip their (pow/exp/log heavy) re-derivation in the generic
         // walk. `skip` empty ⇒ original full path.
         let skip: &[bool] = &self.cov_static_mask;
         if !skip.is_empty() {
-            let theta_v: Vec<f64> = theta.iter().map(|t| t.val()).collect();
+            let mut theta_v: Vec<f64> = crate::scratch::take();
+            theta_v.extend(theta.iter().map(|t| t.val()));
             let static_vals = self.eval_cov_static_f64(&theta_v, &cov_vec);
             for (v, &is_static) in skip.iter().enumerate() {
                 if is_static {
                     vars[v] = T::from_f64(static_vals[v]);
                 }
             }
+            crate::scratch::give(theta_v);
+            crate::scratch::give(static_vals);
         }
         eval_statements_g::<T>(
             &self.stmts,
@@ -30916,10 +32156,16 @@ impl IndivParamProgram {
             skip,
             nn,
         );
-        self.pk_var_slots
-            .iter()
-            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0)))
-            .collect()
+        let mut out = crate::scratch::take_for(self.pk_var_slots.len());
+        out.extend(
+            self.pk_var_slots
+                .iter()
+                .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0))),
+        );
+        crate::scratch::give(cov_vec);
+        crate::scratch::give_for(vars);
+        crate::scratch::give_for(stack);
+        out
     }
 
     /// Compute the f64 values of the cov-static var slots (the slots flagged in
@@ -30930,7 +32176,8 @@ impl IndivParamProgram {
     /// the returned values — are independent of the η seed used here (#485).
     fn eval_cov_static_f64(&self, theta: &[f64], cov_vec: &[f64]) -> Vec<f64> {
         use crate::sens::dual2::Dual2;
-        let dynamic: Vec<bool> = self.cov_static_mask.iter().map(|&s| !s).collect();
+        let mut dynamic: Vec<bool> = crate::scratch::take();
+        dynamic.extend(self.cov_static_mask.iter().map(|&s| !s));
         // Evaluated over a zero-width `Dual2<0>` (no gradient/Hessian axes), NOT
         // native `f64`: the dual divides via `× recip` and raises powers via the
         // dual `powd`, both of which differ from `f64::/` / `f64::powf` by up to
@@ -30945,10 +32192,13 @@ impl IndivParamProgram {
         // `bytecode_is_dynamic`), but this zero-width pass may run inside a seeded
         // evaluation (`ModelNnAxisGuard`); suspend the seeding for its duration so a
         // future static read could not seed an axis a `Dual2<0>` does not have.
-        let theta_d: Vec<Dual2<0>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
-        let eta_zero = vec![Dual2::<0>::constant(0.0); self.n_eta];
-        let mut vars = vec![Dual2::<0>::constant(0.0); self.n_vars];
-        let mut stack: Vec<Dual2<0>> = Vec::new();
+        let mut theta_d: Vec<Dual2<0>> = crate::scratch::take();
+        theta_d.extend(theta.iter().map(|&v| Dual2::constant(v)));
+        let mut eta_zero: Vec<Dual2<0>> = crate::scratch::take();
+        eta_zero.resize(self.n_eta, Dual2::<0>::constant(0.0));
+        let mut vars: Vec<Dual2<0>> = crate::scratch::take();
+        vars.resize(self.n_vars, Dual2::<0>::constant(0.0));
+        let mut stack: Vec<Dual2<0>> = crate::scratch::take();
         eval_statements_g::<Dual2<0>>(
             &self.stmts,
             &theta_d,
@@ -30960,7 +32210,14 @@ impl IndivParamProgram {
             &dynamic,
             &[],
         );
-        vars.iter().map(|d| d.value).collect()
+        let mut out: Vec<f64> = crate::scratch::take();
+        out.extend(vars.iter().map(|d| d.value));
+        crate::scratch::give(dynamic);
+        crate::scratch::give(theta_d);
+        crate::scratch::give(eta_zero);
+        crate::scratch::give(vars);
+        crate::scratch::give(stack);
+        out
     }
 
     /// Evaluate every top-level `[individual_parameters]` name in plain `f64`,
@@ -31196,6 +32453,7 @@ impl ScaleDerivProgram {
 /// `var_to_pk_slot`. This lets the analytic outer θ/σ gradient differentiate
 /// `mult(θ)` exactly (a new direct-θ term in `∂R/∂θ`) instead of falling back to
 /// FD for a custom / time-varying σ magnitude.
+#[derive(Debug, Clone)]
 pub struct RuvMagDerivProgram {
     bc: Bytecode,
     n_theta: usize,
@@ -31405,6 +32663,9 @@ fn resolve_condition_indices(
 //   UnaryFn("abs", a)      : if a ≥ 0 then a' else −a' (boundary undefined)
 //   UnaryFn("inv_logit"|"expit", a) : inv_logit(a) · (1 − inv_logit(a)) · a'
 //   UnaryFn("logit", a)    : a' / (a · (1 − a))
+//   UnaryFn("tanh", a)     : (1 − tanh(a)²) · a'
+//   UnaryFn("softplus", a) : a' / exp(a)·a' / inv_logit(a)·a' on the branch
+//                            `Activation::Softplus` takes (a > 20 / a < −20 / else)
 //   UnaryFn("floor"|"ceil"|"round", a) : 0 (piecewise constant; the integer
 //                            boundaries are undefined and ignored, as for Mod)
 //   Power(b, e)            : b^e · (e'·ln(b) + e · b'/b)  (general; subsumes
@@ -31652,6 +32913,33 @@ fn differentiate_with_chain(
                     let one_minus_a = sub(Expression::Literal(1.0), (**arg).clone());
                     let denom = mul((**arg).clone(), one_minus_a);
                     div(da, denom)
+                }
+                "tanh" => {
+                    // (1 − tanh(a)²) · a'
+                    let t = Expression::UnaryFn("tanh".into(), arg.clone());
+                    mul(sub(Expression::Literal(1.0), mul(t.clone(), t)), da)
+                }
+                "softplus" => {
+                    // The derivative of the branch `Activation::Softplus` takes:
+                    // `a > 20 → a'`, `a < −20 → exp(a)·a'`, else `inv_logit(a)·a'`.
+                    let cmp = |op, c| {
+                        Box::new(Condition::Compare(
+                            (**arg).clone(),
+                            op,
+                            Expression::Literal(c),
+                        ))
+                    };
+                    let exp_a = Expression::UnaryFn("exp".into(), arg.clone());
+                    let sig_a = Expression::UnaryFn("inv_logit".into(), arg.clone());
+                    Expression::Conditional(
+                        cmp(CmpOp::Gt, 20.0),
+                        Box::new(da.clone()),
+                        Box::new(Expression::Conditional(
+                            cmp(CmpOp::Lt, -20.0),
+                            Box::new(mul(exp_a, da.clone())),
+                            Box::new(mul(sig_a, da)),
+                        )),
+                    )
                 }
                 "floor" | "ceil" | "round" => {
                     // Piecewise constant: 0 almost everywhere, undefined on the

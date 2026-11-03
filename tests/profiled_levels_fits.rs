@@ -289,6 +289,176 @@ fn d2_a_profiled_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
     );
 }
 
+/// `model` with `method = laplace` (one node), written to a temp file; its absolute path,
+/// which `prep`'s `root().join` keeps as is.
+fn laplace_copy(model: &str) -> String {
+    let text = std::fs::read_to_string(root().join(model)).unwrap();
+    assert!(text.contains("  method     = focei\n"), "fixture moved");
+    let path = unique_temp("ferx_profiled_fits_laplace");
+    std::fs::write(
+        &path,
+        text.replace("  method     = focei\n", "  method     = laplace\n"),
+    )
+    .unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// D1-L (#2107): D1 under `laplace`. F1 is linear in (η, κ), so the profile solve takes
+/// one step there under Laplace too.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn d1_l_a_profiled_laplace_fit_is_the_unprofiled_fit_linear_in_eta() {
+    degenerate_oracle(
+        &laplace_copy("tests/data/profile_mbma/f1_profile.ferx"),
+        "tests/data/mbma_placebo/mbma_placebo.csv",
+        "](0.0, -50.0, 50.0)",
+        4,
+    );
+}
+
+/// D2-L (#2107): D2 under `laplace`, on F2, where the Laplace objective is not FOCEI's.
+/// Measured on the probe (macOS arm64): the unprofiled restart improved by 4.1e-10.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn d2_l_a_profiled_laplace_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
+    degenerate_oracle(
+        &laplace_copy("nonmem_anchor/profile_mbma_fit.ferx"),
+        "nonmem_anchor/profile_mbma.csv",
+        "](0.0, -50.0, 50.0)",
+        3,
+    );
+}
+
+/// The warnings that report a subject falling back to finite differences anywhere in a fit:
+/// the inner gradient, the outer gradient, the profile solve, the covariance step's R-matrix
+/// or level blocks. Their wordings differ ("finite differences", "finite-difference outer
+/// gradients", "(finite-difference Hessian …)", "finite-differenced subjects"), so the match
+/// is on the hyphen-folded stem. A bare `contains("finite difference")` saw only the two
+/// profile warnings and missed the outer-gradient and covariance fallbacks (#2561 review
+/// row 1).
+fn fd_fallback_warnings(warnings: &[String]) -> Vec<&String> {
+    warnings
+        .iter()
+        .filter(|w| {
+            w.to_lowercase()
+                .replace('-', " ")
+                .contains("finite differen")
+        })
+        .collect()
+}
+
+/// `model` with `method` at `n_agq = 3`, written to a temp file; its absolute path.
+fn agq3_copy(model: &str, method: &str) -> String {
+    let text = std::fs::read_to_string(root().join(model)).unwrap();
+    assert!(text.contains("  method     = focei\n"), "fixture moved");
+    let path = unique_temp(&format!("ferx_profiled_fits_agq3_{method}"));
+    std::fs::write(
+        &path,
+        text.replace(
+            "  method     = focei\n",
+            &format!("  method     = {method}\n  n_agq      = 3\n"),
+        ),
+    )
+    .unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// D1-A / D2-A (#2107 PR-A): the degenerate oracle at `n_agq = 3`, at both anchors, every
+/// fit on the adjoint (no FD-fallback warning on either side; A0 traced the plan's 2-of-12
+/// declines to `off_mode`'s Nelder–Mead arm, removed by #2554).
+fn agq3_degenerate_oracle(model: &str, data: &str, n_struct: usize, straddle: bool) {
+    for method in ["laplace", "focei"] {
+        let (_, prof, plain) = degenerate_oracle_with(
+            &agq3_copy(model, method),
+            data,
+            None,
+            "](0.0, -50.0, 50.0)",
+            n_struct,
+        );
+        for (side, f) in [("profiled", &prof), ("unprofiled", &plain)] {
+            assert!(
+                f.method.label().eq_ignore_ascii_case(method),
+                "{method} {side}: {:?}",
+                f.method
+            );
+            assert!(
+                fd_fallback_warnings(&f.warnings).is_empty(),
+                "{method} {side}: {:?}",
+                f.warnings
+            );
+        }
+        if straddle {
+            // `FitResult` records no `n_agq`, so the three nodes are shown by the optimum:
+            // the same anchor's one-node profiled fit (`laplace`, or plain `focei`) lands
+            // more than `D_OFV` away. A dropped `n_agq` would pass the parity above as a
+            // one-node fit and fail here (#2561 review row 3).
+            let one_model = if method == "laplace" {
+                laplace_copy(model)
+            } else {
+                model.to_string()
+            };
+            let p1 = prep(&one_model, data, None);
+            let (one, _) = fit(&p1, &p1.init_params, false);
+            eprintln!(
+                "{method}: three nodes {:.9}, one node {:.9} (Δ {:.3e})",
+                prof.ofv,
+                one.ofv,
+                prof.ofv - one.ofv
+            );
+            assert!(one.converged && one.ofv.is_finite(), "{:?}", one.warnings);
+            assert!(
+                (prof.ofv - one.ofv).abs() > D_OFV,
+                "{method}: three nodes ≠ one: {} vs {}",
+                prof.ofv,
+                one.ofv
+            );
+        }
+    }
+}
+
+/// D1-A (#2107 PR-A): D1 at three nodes. F1 is linear in (η, κ), so every node's integrand
+/// is Gaussian and the solve takes one step. No node-count straddle here: on a Gaussian
+/// integrand three nodes give the one-node value exactly, so no OFV can tell them apart.
+/// D2-A carries the straddle.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn d1_agq_a_profiled_quadrature_fit_is_the_unprofiled_fit_linear_in_eta() {
+    agq3_degenerate_oracle(
+        "tests/data/profile_mbma/f1_profile.ferx",
+        "tests/data/mbma_placebo/mbma_placebo.csv",
+        4,
+        false,
+    );
+}
+
+/// D2-A (#2107 PR-A): D2 at three nodes, on the full 12-study F2, where three nodes are not
+/// one and the frozen-EBE straddle is widest. Realised (Linux aarch64): the unprofiled
+/// restart improved by −3.0e-11 (`laplace`) and −1.7e-10 (`focei`), structural θ 0 / 1.2e-7
+/// relative; D1-A 7.0e-10 / 2.6e-10, 1.0e-6 / 2.0e-7 (macOS arm64 within a factor 5 of
+/// each). D's bands, five decades above the worst.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn d2_agq_a_profiled_quadrature_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
+    agq3_degenerate_oracle(
+        "nonmem_anchor/profile_mbma_fit.ferx",
+        "nonmem_anchor/profile_mbma.csv",
+        3,
+        true,
+    );
+}
+
 /// The profiled F2 fit against NONMEM's own optimum, every level a `THETA` there.
 /// On #2280's inner BFGS without #2285's `xtol_rel` ceiling and verification leg, this
 /// start stopped `converged: true` (`XtolReached`) 1.584e-3 above it (Linux aarch64).
@@ -314,10 +484,60 @@ fn a2_a_profiled_fit_reaches_nonmems_optimum() {
     assert!((f.ofv - obj).abs() < A2_FIT_OFV, "{} vs {obj}", f.ofv);
 }
 
+/// A2-L fit (#2107): profiled `laplace` fits of F2 from the model file's start and from
+/// A2's two #2285 starts land on NONMEM's LAPLACE optimum (`profile_mbma_laplace.ext`),
+/// converged. The band is A2's: a stopping rule sets it, and it still fails FOCEI's
+/// optimum, 0.0626 away.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn a2_l_a_profiled_laplace_fit_reaches_nonmems_optimum() {
+    let obj = ext_final_ofv("profile_mbma_laplace.ext");
+    assert!(
+        (obj - a2_nonmem_ofv()).abs() > 1e3 * A2_FIT_OFV,
+        "the straddle"
+    );
+    let p = prep(
+        &laplace_copy("nonmem_anchor/profile_mbma_fit.ferx"),
+        "nonmem_anchor/profile_mbma.csv",
+        None,
+    );
+    assert_eq!(p.init_params.theta[..3], [45.0, 8.0, 2.0], "fixture moved");
+    for start in [[45.0, 8.0, 2.0], [45.0, 6.0, 2.0], [40.0, 6.0, 2.0]] {
+        let mut params = p.init_params.clone();
+        params.theta[..3].copy_from_slice(&start);
+        let (f, t) = fit(&p, &params, false);
+        eprintln!(
+            "A2-L from {start:?}: ferx {:.9} NONMEM {obj:.9} (Δ {:.3e}), converged {}, {} \
+             evals, {t:.1}s",
+            f.ofv,
+            f.ofv - obj,
+            f.converged,
+            f.n_iterations
+        );
+        assert!(
+            f.converged && f.ofv.is_finite(),
+            "{start:?}: {:?}",
+            f.warnings
+        );
+        assert!(
+            (f.ofv - obj).abs() < A2_FIT_OFV,
+            "{start:?}: converged at {} vs NONMEM {obj}",
+            f.ofv
+        );
+    }
+}
+
 /// NONMEM's minimum on the F2 anchor, from the `.ext` final row.
 fn a2_nonmem_ofv() -> f64 {
-    let text =
-        std::fs::read_to_string(root().join("nonmem_anchor/results/profile_mbma.ext")).unwrap();
+    ext_final_ofv("profile_mbma.ext")
+}
+
+/// The OBJ of a NONMEM run's `.ext` final row, `name` under `nonmem_anchor/results`.
+fn ext_final_ofv(name: &str) -> f64 {
+    let text = std::fs::read_to_string(root().join("nonmem_anchor/results").join(name)).unwrap();
     text.lines()
         .find(|l| l.trim_start().starts_with("-1000000000"))
         .and_then(|l| l.split_whitespace().last())

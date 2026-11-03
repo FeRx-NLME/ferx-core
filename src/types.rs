@@ -145,7 +145,7 @@ pub struct DoseEvent {
 /// the `TIME` and `OCC` `$PK` sees — from the **governing** record, the first record at
 /// or after the dose in (`TIME`, file order). The reader stores the governing record's
 /// covariates and `OCC` in the dose's own `Subject::dose_covariates` /
-/// `Subject::dose_occasions` entries, and the two fields here.
+/// `Subject::dose_occasions` entries, and the fields here.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ImpliedDose {
     /// Index in `Subject::doses` of the explicit dose whose `ADDL` implies this one. It
@@ -153,6 +153,11 @@ pub(crate) struct ImpliedDose {
     pub(crate) parent: usize,
     /// The `TIME` as written of the governing record.
     pub(crate) param_time: f64,
+    /// The engine time of the governing record as the subject holds it — after the reader's
+    /// one-ULP record-order moves (#614, #1810) — or the parent's when nothing governs the
+    /// dose. The adaptive path picks the dose's occasion (decision window) here, as the
+    /// static path takes the governing record's `OCC` (#2371).
+    pub(crate) gov_time: f64,
 }
 
 /// The derived rendering minus `evid4` and `implied`: ferx-tools' search journal hashes
@@ -1093,8 +1098,9 @@ pub struct Subject {
     /// A reset row is a data record, so NONMEM runs `$PK` at it under **that row's own**
     /// `OCC` — measured in `nonmem_anchor/reset_init_snapshot_J.ctl`, where a reset row
     /// carrying `OCC = 2` between `OCC = 1` records seeds `A_0` under occasion 2's
-    /// multiplier (42.0, against 14.0 for the preceding record's). Without this the
-    /// occasion has to be guessed from a neighbouring record (#1133).
+    /// multiplier (42.0, against 14.0 for the preceding record's) (#1133). An occasion
+    /// only reset rows carry is its own κ group (#1153); a reset with no label runs
+    /// under κ = 0.
     pub reset_occasions: Vec<u32>,
     /// Occasion index per pk-only record (EVID=2, or EVID=0/MDV=1; parallel to
     /// `pk_only_times`). Empty when no IOV column is present in the data.
@@ -1104,8 +1110,8 @@ pub struct Subject {
     /// ending at the row. Measured in `nonmem_anchor/iov_pk_only_*_X.ctl`: an `EVID=2` row
     /// carrying `OCC = 2` between `OCC = 1` records moves the objective away from both
     /// κ = 0 and the preceding record's occasion (#1876). A subject assembled in memory
-    /// without this falls back to the preceding record's occasion, as
-    /// `reset_occasions` does.
+    /// without this runs its pk-only rows under κ = 0, as an unlabelled reset or dose row
+    /// does (#1153).
     pub pk_only_occasions: Vec<u32>,
     /// FREM observation type per observation (parallel to `obs_times`).
     /// 0 = PK observation, 100/200/300/... = covariate observation.
@@ -1291,6 +1297,72 @@ impl Subject {
         self.obs_covariates.get(j).unwrap_or(&self.covariates)
     }
 
+    /// The reader's per-row covariate snapshot, **aligned with [`Self::obs_records`]**, or
+    /// `None` when there is none to align.
+    ///
+    /// [`Self::endpoint_covariates`] holds one LOCF snapshot per data row routed to a
+    /// non-Gaussian endpoint, in reading order, taken after the row's own cells are read, so
+    /// the snapshot of a state row carries that row's covariate values. It is empty when no
+    /// covariate varies within the subject, and the baseline map is then exact. A
+    /// discrete-state or count row yields exactly one record and one snapshot, so the two
+    /// lists are parallel, unless the subject also carries time-to-event rows, which can
+    /// yield zero or two records per row. Those subjects, and an in-memory subject whose
+    /// snapshot length does not match, return `None`. `crate::api::check_survival_tv_covariates`
+    /// refuses such a subject when a predictor covariate varies, so `None` only ever stands
+    /// for "the baseline is exact". Shared by the binary predictor (#2562) and the DTMM
+    /// probabilities (#2473).
+    pub(crate) fn record_covariate_snapshots(&self) -> Option<&[HashMap<String, f64>]> {
+        let snaps = &self.endpoint_covariates;
+        let aligned =
+            !snaps.is_empty() && snaps.len() == self.obs_records.len() && !self.has_event_records();
+        aligned.then_some(snaps.as_slice())
+    }
+
+    /// Whether any of [`Self::obs_records`] is a time-to-event record, the one kind a data
+    /// row can yield zero or two of.
+    pub(crate) fn has_event_records(&self) -> bool {
+        #[cfg(feature = "survival")]
+        {
+            self.obs_records
+                .iter()
+                .any(|r| matches!(r, ObsRecord::Event { .. }))
+        }
+        #[cfg(not(feature = "survival"))]
+        {
+            false
+        }
+    }
+
+    /// `Vec::retain_mut` on [`Self::obs_records`] that keeps the per-record covariate
+    /// snapshots aligned (#2562): when [`Self::record_covariate_snapshots`] lines up with
+    /// the records, a dropped record drops its snapshot too.
+    #[cfg(feature = "survival")]
+    pub(crate) fn retain_records(&mut self, mut keep: impl FnMut(&mut ObsRecord) -> bool) {
+        let aligned = self.record_covariate_snapshots().is_some();
+        let mut kept: Vec<bool> = Vec::with_capacity(self.obs_records.len());
+        self.obs_records.retain_mut(|rec| {
+            let k = keep(rec);
+            kept.push(k);
+            k
+        });
+        if aligned {
+            let mut k = kept.into_iter();
+            self.endpoint_covariates
+                .retain(|_| k.next().unwrap_or(true));
+        }
+    }
+
+    /// The covariate map record `r` of [`Self::obs_records`] is evaluated with: its own
+    /// snapshot when `snaps` (this subject's [`Self::record_covariate_snapshots`], taken
+    /// once per walk) aligns, else the baseline map.
+    pub(crate) fn record_cov<'a>(
+        &'a self,
+        snaps: Option<&'a [HashMap<String, f64>]>,
+        r: usize,
+    ) -> &'a HashMap<String, f64> {
+        snaps.and_then(|s| s.get(r)).unwrap_or(&self.covariates)
+    }
+
     /// Covariate snapshot at dose index `k`. Same fallback as `obs_cov`.
     pub fn dose_cov(&self, k: usize) -> &HashMap<String, f64> {
         self.dose_covariates.get(k).unwrap_or(&self.covariates)
@@ -1353,6 +1425,14 @@ impl Subject {
             Some(i) => i.param_time,
             None => self.param_time_at(d.time),
         }
+    }
+
+    /// The engine time whose occasion (decision window) dose `k` runs under on the adaptive
+    /// path: its own, or for an `ADDL`-implied dose the governing record's (#2371,
+    /// [`ImpliedDose::gov_time`]), as [`Self::dose_param_time`] reads that record's `TIME`.
+    pub(crate) fn dose_occasion_time(&self, k: usize) -> f64 {
+        let d = &self.doses[k];
+        d.implied.map_or(d.time, |i| i.gov_time)
     }
 
     /// The explicit dose whose `ADDL` implies dose `k` (#1909), whose `$PK` gives `k`
@@ -2779,6 +2859,9 @@ pub struct MixingExpr {
     pub is_logit: bool,
     /// Mixing expression over theta + covariates. Parser-private AST.
     pub(crate) expr: crate::parser::model_parser::Expression,
+    /// The same expression compiled once, at parse, to the θ-only program the exact mixing
+    /// gradient evaluates on its tape (`mixing_logp_grad_exact`).
+    pub(crate) program: crate::parser::model_parser::RuvMagDerivProgram,
 }
 
 /// A per-class Omega/Sigma override declared in a `[mixture]` block via
@@ -4192,6 +4275,15 @@ pub type GeneratorFn = Box<
     dyn Fn(&[f64], &[f64], &HashMap<String, f64>, &[f64]) -> nalgebra::DMatrix<f64> + Send + Sync,
 >;
 
+#[cfg(feature = "markov")]
+/// Closure evaluating every declared DTMM transition probability `P_jk(θ, η, covariates)`
+/// at one record, in the order of the endpoint's
+/// [`transitions`](EndpointLikelihood::Dtmm::transitions) list. Called under the record's
+/// model-time scope, so a `TIME` term in an expression reads that record's time. The stay
+/// probabilities are not returned — the endpoint fills `P_jj = 1 − Σ_{k≠j} P_jk`.
+pub type TransitionProbFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> Vec<f64> + Send + Sync>;
+
 #[cfg(feature = "survival")]
 /// Per-CMT endpoint likelihood specification.
 pub enum EndpointLikelihood {
@@ -4267,15 +4359,12 @@ pub enum EndpointLikelihood {
         /// Builds the generator `Q(θ,η,cov,state)` — see [`GeneratorFn`].
         generator_fn: GeneratorFn,
         /// Resolved, dual-evaluable form of the same intensities, for the **analytic**
-        /// gradient: it yields `∂Q/∂(θ,η)` exactly, which the endpoint chains through the
-        /// Van Loan Fréchet derivative of `expm` instead of finite-differencing the whole
-        /// matrix-exponential likelihood (#759).
+        /// derivatives: the likelihood evaluated on a dual number type (`expm(Q·Δt)` on it,
+        /// or for a time-**inhomogeneous** endpoint the occupancy ODE with the ODE states
+        /// from the dual state solve) instead of finite-differencing it (#759).
         ///
-        /// `None` — and the endpoint keeps its FD gradient — when the intensities are
-        /// time-**inhomogeneous** (an intensity reads an ODE state, so `Q` is a functional
-        /// of the PK trajectory and the likelihood is an occupancy ODE rather than an
-        /// `expm`), or when the program cannot be represented exactly (see
-        /// `build_ctmm_generator_program`).
+        /// `None` — and the endpoint keeps its FD gradient — when the program cannot be
+        /// represented exactly (see `build_ctmm_generator_program`).
         generator_program: Option<crate::parser::model_parser::CtmmGeneratorProgram>,
         /// Covariate names referenced by any transition intensity (including any
         /// reached transitively through `[individual_parameters]`). Evaluated at a
@@ -4296,7 +4385,45 @@ pub enum EndpointLikelihood {
         /// argument through this map.
         generator_states: Vec<(String, usize)>,
     },
-    // Ordinal, Poisson, NegBin, Dtmm deferred to Phase 4/4b
+    /// Discrete-time Markov model (DTMM) endpoint (Phase 4b, #2473) — the discrete state
+    /// `s ∈ {0..S−1}` is observed via [`ObsRecord::DiscreteState`], and the probability of
+    /// the state at scored record `k` depends on the state observed at record `k−1`:
+    /// the per-subject data term is `−Σ_{k≥1} log P_k[s_{k−1}, s_k]`, the NONMEM
+    /// `PREVIOUS`-DV `$PRED` likelihood. The subject's first scored record is conditioned
+    /// on (it contributes nothing). `P_k` is a **per-record** transition-probability
+    /// matrix, not a function of `Δt`: the `[markov_model] transition` expressions are
+    /// the off-diagonal probabilities `P_jk`, evaluated at record `k` (its `TIME` and its
+    /// covariates), and the stay probability `P_jj = 1 − Σ_{k≠j} P_jk` is filled in. A
+    /// probability that reads an ODE model state (a drug-driven DTMM) is refused at parse.
+    /// Gated behind `markov`.
+    #[cfg(feature = "markov")]
+    Dtmm {
+        /// Number of states `S`.
+        n_states: usize,
+        /// Data DV code per state, indexed by 0-based state index — as
+        /// [`Self::Ctmm`]'s `state_codes`.
+        state_codes: Vec<usize>,
+        /// `(from, to)` state indices of each declared off-diagonal transition, parallel
+        /// to the outputs of [`prob_fn`](Self::Dtmm::prob_fn) (and of `prob_program`).
+        /// `from != to`, pairs unique (checked at parse).
+        transitions: Vec<(usize, usize)>,
+        /// Evaluates every declared transition probability at one record — see
+        /// [`TransitionProbFn`].
+        prob_fn: TransitionProbFn,
+        /// Resolved, dual-evaluable form of the same probabilities (one output per
+        /// transition), for the **analytic** inner gradient: `∂P_jk/∂(θ,η)` exactly,
+        /// chained through `∂(−log P)/∂P` instead of finite-differencing the data term.
+        /// `None` — and the endpoint keeps its FD gradient — when an expression cannot be
+        /// represented exactly or the `(θ, η)` width is past the dual dispatch cap.
+        prob_program: Option<crate::parser::model_parser::EndpointExprProgram>,
+        /// Covariate names referenced by any transition probability (including those
+        /// reached through `[individual_parameters]`). Read at the **record being scored**,
+        /// from the reader's per-row snapshot (`Subject::endpoint_covariates`); a subject
+        /// whose snapshot cannot be aligned with its records while one of these varies is
+        /// refused at fit setup by `crate::api::check_survival_tv_covariates` (#741).
+        prob_covariates: Vec<String>,
+    },
+    // Ordinal, Poisson, NegBin deferred to Phase 4
 }
 
 #[cfg(feature = "survival")]
@@ -4316,6 +4443,16 @@ impl std::fmt::Debug for EndpointLikelihood {
                 state_codes,
                 ..
             } => write!(f, "Ctmm(n_states={n_states}, codes={state_codes:?})"),
+            #[cfg(feature = "markov")]
+            EndpointLikelihood::Dtmm {
+                n_states,
+                state_codes,
+                transitions,
+                ..
+            } => write!(
+                f,
+                "Dtmm(n_states={n_states}, codes={state_codes:?}, transitions={transitions:?})"
+            ),
         }
     }
 }
@@ -5436,6 +5573,28 @@ impl CompiledModel {
             .any(|e| matches!(e, EndpointLikelihood::Ctmm { .. }))
     }
 
+    /// True if any endpoint is a [`Dtmm`](EndpointLikelihood::Dtmm) (discrete-time Markov)
+    /// endpoint — Phase 4b (#2473).
+    #[cfg(feature = "markov")]
+    pub fn has_dtmm(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Dtmm { .. }))
+    }
+
+    /// CMTs routed to a `Dtmm` endpoint, sorted ascending. Like [`Self::ctmm_cmts`], these
+    /// rows route to [`ObsRecord::DiscreteState`].
+    #[cfg(feature = "markov")]
+    pub fn dtmm_cmts(&self) -> Vec<usize> {
+        let mut c: Vec<usize> = self
+            .endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| matches!(ep, EndpointLikelihood::Dtmm { .. }).then_some(*cmt))
+            .collect();
+        c.sort_unstable();
+        c
+    }
+
     /// CMTs routed to a `Ctmm` endpoint, sorted ascending. The datareader routes
     /// these rows to [`ObsRecord::DiscreteState`] via `ObsRouting.discrete`, the
     /// same discrete-state plumbing the `Binary` endpoint uses.
@@ -5450,17 +5609,21 @@ impl CompiledModel {
         c
     }
 
-    /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint — the
-    /// binary / Bernoulli family today; ordinal / Poisson / negative-binomial extend this
+    /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint scored
+    /// by `discrete_subject_nll` — the binary / Bernoulli family and the discrete-time
+    /// Markov (DTMM, #2473) endpoint; ordinal / Poisson / negative-binomial extend this
     /// match. This is the family-agnostic gate for the discrete data term and its η-Hessian
     /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
-    /// without editing a likelihood dispatch site. Equals [`has_binary`](Self::has_binary)
-    /// today.
+    /// without editing a likelihood dispatch site. (The CTMM is not in it: it has its own
+    /// `ctmm_subject_nll` dispatch.)
     #[cfg(feature = "survival")]
     pub fn has_discrete(&self) -> bool {
-        self.endpoints
-            .values()
-            .any(|e| matches!(e, EndpointLikelihood::Binary { .. }))
+        self.endpoints.values().any(|e| match e {
+            EndpointLikelihood::Binary { .. } => true,
+            #[cfg(feature = "markov")]
+            EndpointLikelihood::Dtmm { .. } => true,
+            _ => false,
+        })
     }
 
     /// True if the model carries **any non-Gaussian endpoint** (TTE/RTTE, the
@@ -6281,6 +6444,45 @@ pub struct DiscreteObsDiagnostic {
     pub iwres: f64,
 }
 
+/// One time-to-event record's post-fit residuals at the subject's EBE (#901), in the
+/// counting-process convention of R's `survival::residuals(…, collapse = FALSE)`.
+///
+/// `ΔH` is the cumulative-hazard increment the likelihood scored for the record, over
+/// its own risk interval: `H(T) − H(entry)` for a single event, `H(tₖ) − H(tₖ₋₁)` on a
+/// clock-forward recurrent stream, `H(Δₖ)` on a clock-reset gap. Every residual cell is
+/// NaN (an empty sdtab cell) for an interval-censored record, which has no single
+/// `ΔH`, and for a subject whose survival likelihood is the `1e20` sentinel at its EBE.
+///
+/// `ΔH` is the scored value, not a cleaned one. An ODE-accumulated hazard that is flat
+/// over the record can score it a solver round-off below 0 (the likelihood tolerates
+/// `abstol + reltol·|H|`), and then `coxsnell` is that tiny negative, `martingale` is
+/// `δ − ΔH` exactly, and `pit` is a hair above 1. Only `deviance` clamps `ΔH` at 0, which
+/// can leave it at `−0` against a tiny positive `martingale`.
+#[cfg(feature = "survival")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct TteObsDiagnostic {
+    /// CMT of the TTE endpoint that produced this record.
+    pub cmt: usize,
+    /// Data TIME as written (joins back to the input CSV).
+    pub time: f64,
+    /// Event indicator `δ`: 1 for an event, 0 for a right censor, NaN for an
+    /// interval-censored record.
+    pub dv: f64,
+    /// Cox–Snell residual `ΔH`: Exp(1), with censoring, under the model.
+    pub coxsnell: f64,
+    /// Martingale residual `δ − ΔH`: mean 0 under the model.
+    pub martingale: f64,
+    /// Deviance residual `sign(M)·√(2·[ΔH − δ − δ·ln ΔH])` (`−√(2ΔH)` for a censor):
+    /// a symmetrised martingale residual, roughly N(0, 1) for a large expected count.
+    pub deviance: f64,
+    /// Probability-integral transform `exp(−ΔH)`, the survival over the record's risk
+    /// interval conditional on its start. U(0, 1) over events under the model only when
+    /// nothing is censored: censoring keeps the events that came early, so their `pit`
+    /// leans high. Under censoring, check `coxsnell` against Exp(1) with a censored
+    /// estimate instead.
+    pub pit: f64,
+}
+
 /// Per-subject estimation results
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SubjectResult {
@@ -6338,6 +6540,12 @@ pub struct SubjectResult {
     #[cfg(feature = "survival")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discrete_rows: Vec<DiscreteObsDiagnostic>,
+    /// Post-fit residuals for this subject's **time-to-event** records, one entry per
+    /// record in ascending endpoint CMT (#901). Empty for models with no TTE endpoint, so
+    /// every existing `FitResult` serialization stays byte-identical.
+    #[cfg(feature = "survival")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tte_rows: Vec<TteObsDiagnostic>,
 }
 
 /// Per-subject conditional distribution of the random effects, produced by the
@@ -6478,7 +6686,7 @@ pub enum KappaTreatment {
 
 /// Result of the importance-sampling marginal log-likelihood step.
 ///
-/// Produced by the `Imp` stage in a method chain (`methods = [..., imp]`).
+/// Produced by the `Imp` stage in a method chain (`method = [..., imp]`).
 /// Surfaced on `FitResult.importance_sampling`.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ImportanceSamplingResult {
@@ -6574,7 +6782,7 @@ pub struct PosteriorSummary {
 /// the same variational family, and **not** comparable with a FOCE/FOCEI/SAEM
 /// OFV, with a `−2 log L`, or across families — a richer family raises the bound
 /// without the model fitting any better. Use [`FitOptions::vi_final_ofv`], or a
-/// `methods = vi, imp` chain, to obtain a genuine marginal likelihood.
+/// `method = [vi, imp]` chain, to obtain a genuine marginal likelihood.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[non_exhaustive]
 pub struct ViResult {
@@ -6674,10 +6882,10 @@ pub struct ViResult {
     /// The label of the later **estimating** stage that moved `(θ, Ω, σ)` after this VI
     /// stage ran, or `None` when nothing did.
     ///
-    /// A VI result survives the rest of a chain because `methods = [vi, laplace]` with
+    /// A VI result survives the rest of a chain because `method = [vi, laplace]` with
     /// `agq_eval_only` — a pure readout — is the recommended way to finish a VI fit, and
     /// dropping it there would discard the object exactly when it was produced correctly.
-    /// But `methods = [vi, focei]` re-estimates: the `FitResult`'s θ/Ω/σ and subject
+    /// But `method = [vi, focei]` re-estimates: the `FitResult`'s θ/Ω/σ and subject
     /// diagnostics then come from FOCEI, while everything here — `eta_means`, `eta_covs`,
     /// both ELBO halves and `elbo_tightness_ratio` — still describes the *pre-FOCEI*
     /// parameter point. That is a legitimate thing to report, but not without saying so.
@@ -7154,6 +7362,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
         )
+    } else if lower.starts_with("w_tte_solve_failed") {
+        // #2087: a simulated subject's ODE-accumulated event-time solve failed and the
+        // subject was censored. Ahead of every prose arm for the reason the arm above gives:
+        // the message interpolates the ODE solver's own failure text ("step budget",
+        // "non-finite", "stability-limited", "singular Jacobian", …), which prose arms below
+        // would claim as an estimation or solver-health problem.
+        (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("w_degenerate_cl_v") {
         // #2104: a non-positive or non-finite CL / V at the final estimates. A token arm ahead
         // of the generic "degenerate" → optimizer-health prose arm, which its wording would
@@ -7243,10 +7458,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // produced. Matched on its token, ahead of the prose arms: both forms say "covariance
         // step" and "not positive definite", which the `CovarianceFailed` prose arm below would
         // otherwise claim for the success form too.
+        //
+        // #2541 adds a third form: `R` was positive definite and returned, but the gradient
+        // says the estimate is not stationary. Nothing was floored or replaced, so it is a
+        // warning on the covariance route like `w_cov_quadrature_declined`, not
+        // `CovarianceRegularized`. Only the two #1781 forms say "eigenvalue floor".
         if lower.contains("covariance step failed") {
             (WarningSeverity::Critical, WarningCode::CovarianceFailed)
-        } else {
+        } else if lower.contains("eigenvalue floor") {
             (WarningSeverity::Warning, WarningCode::CovarianceRegularized)
+        } else {
+            (WarningSeverity::Warning, WarningCode::CovarianceStep)
         }
     } else if lower.contains("w_cov_quadrature_objective") {
         // #1781: a SAEM / IMP / IMPMAP estimate on a non-Gaussian model had its R and S taken
@@ -7739,7 +7961,7 @@ pub struct FitResult {
     /// Consumed by `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`.
     pub sir_resamples_packed: Option<Vec<Vec<f64>>>,
     /// Importance-sampling marginal log-likelihood result. `Some` when an
-    /// `Imp` stage ran in the method chain (`methods = [..., imp]`). The
+    /// `Imp` stage ran in the method chain (`method = [..., imp]`). The
     /// `−2 log L_IS` value is lower-bias than the FOCE/Laplace `ofv` for
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
@@ -7874,9 +8096,25 @@ pub struct FitResult {
     pub ebe_convergence_warnings: u32,
     /// Worst-case number of unconverged subjects in a single outer iteration.
     pub max_unconverged_subjects: u32,
-    /// Total number of times the Nelder-Mead fallback was invoked across all
-    /// subjects and all outer iterations.  Always `0` for SAEM.
+    /// How many times, summed over every inner loop (not a count of distinct subjects), an
+    /// inner solve returned a fallback's point (`EbeResult::used_fallback`): the recovery
+    /// after the primary search failed its certificate, or the runaway-EBE guard's. A solve
+    /// whose fallback point a multi-start candidate then replaced is not counted (#2589).
+    /// Counted only by the outer loop under an NLopt optimizer (`auto`, `bobyqa`, `slsqp`,
+    /// `mma`, and `nlopt_lbfgs` with its model-file aliases `lbfgs` / `bfgs`), for FOCE,
+    /// FOCEI, Laplace and AGQ alike; by a fit with a `profile`d level block; and by Bayes'
+    /// posterior-mean inner loop. Every other path reports `0` without counting, e.g.
+    /// `optimizer = trust_region`, SAEM, `gn` and `gn_hybrid` (whose FOCEI polish does not
+    /// carry its count over), VI, IMP / IMPMAP, an evaluation-only stage, and the built-in
+    /// optimizer a Rust caller reaches with [`Optimizer::Bfgs`] / [`Optimizer::Lbfgs`].
     pub total_ebe_fallbacks: u32,
+    /// Under `inner_optimizer = nelder_mead`: how many times, summed over every inner loop
+    /// like `total_ebe_fallbacks` (not a count of distinct subjects), a subject's Nelder–Mead
+    /// stop was not a mode and the stationarity certificate moved it there with the gradient.
+    /// The primary search's moved point is not a fallback. Always `0` under every other
+    /// `inner_optimizer`, and counted only on the paths that count `total_ebe_fallbacks`
+    /// (#2571).
+    pub total_ebe_nm_polished: u32,
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,
     /// Which estimator produced `covariance_matrix`, the standard errors,
@@ -8045,7 +8283,8 @@ pub struct FitResult {
     /// NLopt gradient-based runs (SLSQP, L-BFGS, MMA) when at least one
     /// gradient-requesting iteration improved the OFV, and for trust-region and
     /// GN. For a *derivative-free* NLopt run (BOBYQA) it is the post-fit
-    /// finite-difference gradient described under [`Self::final_gradient_source`];
+    /// analytic or finite-difference gradient described under
+    /// [`Self::final_gradient_source`];
     /// `None` for the built-in BFGS and SAEM.
     ///
     /// **It is always the gradient at the estimates reported beside it.** That is
@@ -8060,10 +8299,17 @@ pub struct FitResult {
     ///
     /// - `"optimizer"` — the optimizer's own gradient, evaluated during the fit
     ///   at the best-OFV point. Free: it had to be computed anyway.
+    /// - `"analytic"` — the exact gradient of the same (penalized) objective,
+    ///   computed **after** the fit at the reported estimates for a run whose
+    ///   optimizer supplied none: the analytic outer gradient at the final modes
+    ///   (EBE response included) plus the penalty gradients. Taken wherever every
+    ///   subject is in the analytic gradient's scope; gated by
+    ///   [`FitOptions::report_final_gradient`] like the stencil below, which it
+    ///   replaces at the cost of one gradient instead of `2·n_free` objectives.
     /// - `"finite_difference"` — a central-difference gradient of the same
     ///   (penalized) objective, computed **after** the fit at the reported
     ///   estimates purely so a derivative-free run has something to check
-    ///   `converged` against. Costs `2·n_free` extra objective evaluations —
+    ///   `converged` against, where the analytic one does not serve. Costs `2·n_free` extra objective evaluations —
     ///   one gradient's worth — and is gated by
     ///   [`FitOptions::report_final_gradient`]. The EBEs are re-solved
     ///   (warm-started) inside the stencil, so it is the gradient of the
@@ -8125,7 +8371,7 @@ pub struct FitResult {
     #[serde(default)]
     pub sir_settings: Option<crate::estimation::sir::SirSettings>,
     /// The inner-loop and ODE settings of the stage that produced the estimates (and ran
-    /// the inline covariance step) (#426): on a `methods = [..]` chain, the last stage that
+    /// the inline covariance step) (#426): on a `method = [..]` chain, the last stage that
     /// estimates, with its own `inner_tol` (a quadrature stage runs at 1e-8 or tighter)
     /// rather than the top-level one. A trailing evaluator (`agq_eval_only`,
     /// `imp_eval_only`) does not write it, though the reported OFV may be that evaluator's. Set by every `fit()`; `None`
@@ -8279,11 +8525,12 @@ pub struct FitResult {
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///
-    /// The checkpoint format does not round-trip per-record discrete-endpoint
-    /// diagnostics (`SubjectResult::discrete_rows`), so a restored fit of a binary /
-    /// categorical model has none. This flag lets [`crate::io::output::write_sdtab_csv`]
-    /// refuse a restored fit whose model declares a binary endpoint (rows genuinely
-    /// dropped) while still writing a live fit. It must be paired with the model's
+    /// The checkpoint format does not round-trip per-record discrete-endpoint or
+    /// time-to-event diagnostics (`SubjectResult::discrete_rows`, `SubjectResult::tte_rows`),
+    /// so a restored fit of a binary / categorical or TTE model has none. This flag lets
+    /// [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose model declares a
+    /// binary or a time-to-event endpoint (rows genuinely dropped) while still writing a
+    /// live fit. It must be paired with the model's
     /// declared endpoints — parsed from [`Self::model_text`] — because the *reconstructed
     /// population* is not a usable signal: `load_fit` re-reads the data with default
     /// (Gaussian) routing, so binary DVs come back as continuous observations and no
@@ -8372,6 +8619,20 @@ impl FitResult {
             );
         }
         v
+    }
+
+    /// Read a fit back from the JSON [`Self::to_json_value`] writes (a
+    /// `--output-format json` fit file).
+    ///
+    /// The inverse of that writer's one lossy step: a non-finite float was
+    /// written as `null`, and a `null` read into a plain `f64` comes back as
+    /// `NaN` (an `Option<f64>` reads it as `None`). A plain
+    /// `serde_json::from_str::<FitResult>` refuses such a file — any fit whose
+    /// diagnostics came out undefined, e.g. `dw_statistic` when no subject has
+    /// two IWRES values. The `schema_version` key is ignored.
+    pub fn from_json_str(text: &str) -> Result<FitResult, serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(text)?;
+        serde::Deserialize::deserialize(crate::io::serde_nan::NullAsNan(value))
     }
 }
 
@@ -9119,7 +9380,7 @@ pub struct FitOptions {
     /// terminal chain stage. The AGQ analogue of [`Self::imp_eval_only`].
     ///
     /// The point is a *deterministic* marginal likelihood at a point some other method
-    /// reached. `methods = vi, laplace` with `agq_eval_only = true` and `n_agq = 21` is the
+    /// reached. `method = [vi, laplace]` with `agq_eval_only = true` and `n_agq = 21` is the
     /// recommended way to turn a VI fit's ELBO — which is only a bound — into a real
     /// `−2 log L`, and unlike the `imp` route it carries no Monte-Carlo error, so two runs
     /// agree bit for bit. `vi_final_ofv = laplace` is the same idea fixed at one node.
@@ -10316,7 +10577,7 @@ pub enum ViFinalOfv {
     /// FOCE/FOCEI fit of the same data. Cheap and deterministic.
     ///
     /// For an importance-sampling `−2 log L` instead, chain the stages:
-    /// `methods = vi, imp` with `imp_eval_only = true`, which consumes VI's
+    /// `method = [vi, imp]` with `imp_eval_only = true`, which consumes VI's
     /// parameters, EBEs and Hessians and additionally reports the IS diagnostics.
     Laplace,
 }

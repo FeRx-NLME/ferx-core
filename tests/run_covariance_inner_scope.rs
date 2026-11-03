@@ -9,7 +9,7 @@
 //! made #1790's `run_covariance` bit-identity flake on `main` once a concurrent test fitted
 //! with another solver.
 //!
-//! Fixture: `mm_oral`, FOCEI, covariance step, analytic (`Dual2`) inner gradients,
+//! Fixture: `schnider`, FOCEI, covariance step, analytic (`Dual2`) inner gradients,
 //! measured via `gradient_method_inner` (fit A with `inner_optimizer = lbfgs`). Mutation: drop the inner half of the scope `run_covariance`
 //! opens (score under `FitOptions::default()`'s inner settings) → T4 (i) dies here, and the
 //! `inner_optimizer` row and T10 in `run_covariance_scoring_record.rs` (measured on #1847;
@@ -32,8 +32,24 @@
 //! | `mm_oral` | 49 / 49 | 49 / 49 |
 //! | `one_cpt_iv`, `emax_pkpd`, `one_cpt_infusion`, `bioavailability` | 0 | 0 |
 //!
-//! So `mm_oral`, the one that straddles on both: a straddle seen on one platform only would
+//! So `mm_oral`, the one that straddled on both: a straddle seen on one platform only would
 //! leave T4 (i) red on the other.
+//!
+//! #2557 certified the *primary* Nelder–Mead search's end point too, not only the fallback's,
+//! so under `inner_optimizer = nelder_mead` the inner solve now ends on the same certified
+//! mode L-BFGS reaches, and the straddle moved again. Entries that differ, Nelder–Mead vs
+//! L-BFGS, measured on #2557 (`run_covariance` from fit A's EBEs):
+//!
+//! | fixture | macOS arm64 | Linux aarch64 |
+//! |---|---|---|
+//! | `schnider` | 121 / 121 | 121 / 121 |
+//! | `warfarin` | 0 / 49 | 49 / 49 |
+//! | `mm_oral` | 0 / 49 | 0 / 49 |
+//! | `two_cpt_oral_cov`, `one_cpt_iv`, `emax_pkpd`, `bioavailability`, `mixed_absorption`, `mm_iv`, `warfarin_iov`, `three_cpt_iv` | 0 | 0 |
+//!
+//! On `mm_oral` no inner setting moves the covariance any more: `nelder_mead`, `bfgs` and
+//! `auto` against L-BFGS, at `cov_inner_tol` unset, 1e-3, 1e-4 and 1e-6, and `ebe_warm_start`
+//! flipped all reproduce its bits on both platforms. So `schnider` now.
 
 use ferx_core::{fit, prepare_run, run_covariance, FitOptions, FitResult, InnerOptimizer};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -48,7 +64,8 @@ struct Fixture {
 fn fixture() -> &'static Fixture {
     static F: OnceLock<Fixture> = OnceLock::new();
     F.get_or_init(|| {
-        let prep = prepare_run("examples/mm_oral.ferx", Some("data/mm_oral.csv")).expect("prepare");
+        let prep = prepare_run("examples/schnider.ferx", Some("data/schnider_propofol.csv"))
+            .expect("prepare");
         let lbfgs = FitOptions {
             verbose: false,
             method: ferx_core::EstimationMethod::FoceI,

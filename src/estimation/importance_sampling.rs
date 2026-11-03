@@ -111,19 +111,53 @@ fn owen_coordinate_seeds(dim: usize, seed: u64) -> Vec<u32> {
 /// coordinates without moving the normals. Each value is mapped to the centre
 /// of its 2⁻³² cell, which keeps it strictly inside (0, 1).
 pub(crate) fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
-    use sobol::Sobol;
+    let mut out = Vec::with_capacity(k_samples);
+    for_each_sobol_uniform(dim, k_samples, seed, |u| out.push(u.to_vec()));
+    out
+}
 
+/// [`sobol_uniforms`] one point at a time, into one reused buffer: `f` sees the
+/// same values in the same order, without a `Vec` per point. The points are the
+/// `sobol` crate's Gray-code walk (point 0 is the origin; point `i` flips, in
+/// every coordinate, the direction number at the rightmost zero bit of `i − 1`)
+/// over the crate's own direction numbers, held in [`sobol_directions`].
+pub(crate) fn for_each_sobol_uniform(
+    dim: usize,
+    k_samples: usize,
+    seed: u64,
+    mut f: impl FnMut(&[f64]),
+) {
+    assert!(
+        dim <= SOBOL_MAX_DIMS,
+        "Sobol draws support at most {SOBOL_MAX_DIMS} dimensions but {dim} were requested"
+    );
+    let dirs = &sobol_directions()[..dim];
     let seeds = owen_coordinate_seeds(dim, seed);
-    Sobol::<u32>::new(dim, sobol_params())
-        .take(k_samples)
-        .map(|point| {
-            point
-                .iter()
-                .zip(seeds.iter())
-                .map(|(&x, &s)| u32_to_open_unit(owen_scramble_u32(x, s)))
-                .collect()
-        })
-        .collect()
+    let mut x = vec![0u32; dim];
+    let mut u = vec![0.0f64; dim];
+    // The crate's sequence ends at 2³² − 1 points.
+    for i in 0..k_samples.min(u32::MAX as usize) {
+        if i > 0 {
+            let c = (!((i - 1) as u32)).trailing_zeros() as usize;
+            for (xj, d) in x.iter_mut().zip(dirs) {
+                *xj ^= d[c];
+            }
+        }
+        for ((uj, &xj), &s) in u.iter_mut().zip(&x).zip(&seeds) {
+            *uj = u32_to_open_unit(owen_scramble_u32(xj, s));
+        }
+        f(&u);
+    }
+}
+
+/// The 32-bit direction numbers of every coordinate [`sobol_params`] carries,
+/// built once. A coordinate's directions do not depend on how many follow it,
+/// so one table serves every dimension.
+fn sobol_directions() -> &'static [Vec<u32>] {
+    static DIRS: std::sync::OnceLock<Vec<Vec<u32>>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| {
+        sobol::Sobol::<u32>::init_direction_vals(SOBOL_MAX_DIMS, 32, sobol_params())
+    })
 }
 
 /// Largest Sobol dimension [`sobol_params`] supports. A quasi-random draw uses
@@ -1498,6 +1532,60 @@ pub(crate) fn subject_is_draws(
     use_sobol: bool,
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectDraws {
+    let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
+        obs_nll_subject_into(
+            model,
+            subject,
+            theta,
+            sigma,
+            model.residual_cov_theta(theta),
+            eta,
+            scratch,
+        )
+    };
+    subject_is_draws_with(
+        &obs_nll,
+        eta_hat,
+        h,
+        omega_inv,
+        log_det_omega,
+        d,
+        k_samples,
+        nu,
+        seed,
+        scratch,
+        iscale,
+        use_sobol,
+        mixture,
+    )
+}
+
+/// The observation NLL `−log p(yᵢ | b, θ, σ)` of one subject at a sampled
+/// random-effect vector `b`: η alone ([`subject_is_draws`]), or the stacked
+/// `[η, κ₁..κ_K]` of an IOV subject (the IMP/IMPMAP E-step, #2301).
+pub(crate) type SampleObsNll<'a> = dyn Fn(&[f64], &mut EventPkParams) -> f64 + 'a;
+
+/// [`subject_is_draws`] with the per-sample observation NLL supplied by the
+/// caller, so the same proposal, weighting and moment code serves the η-only
+/// and the joint (η, κ) sampling of an IOV subject (#2301). `omega_inv` /
+/// `log_det_omega` are the prior of the whole `d`-vector being sampled, and so
+/// is the defensive `mixture`'s broad component.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn subject_is_draws_with(
+    obs_nll: &SampleObsNll<'_>,
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    k_samples: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    iscale: f64,
+    use_sobol: bool,
+    mixture: Option<&DefensiveMixture>,
+) -> SubjectDraws {
     let mvn = !nu.is_finite();
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -1586,16 +1674,7 @@ pub(crate) fn subject_is_draws(
             }
         }
 
-        let obs_nll = obs_nll_subject_into(
-            model,
-            subject,
-            theta,
-            sigma,
-            model.residual_cov_theta(theta),
-            &eta_sample,
-            scratch,
-        );
-        let log_p_y = -obs_nll;
+        let log_p_y = -obs_nll(&eta_sample, scratch);
 
         let mut quad_form = 0.0_f64;
         for i in 0..d {
@@ -1716,13 +1795,53 @@ pub(crate) fn find_optimal_iscale(
     iscale_min: f64,
     iscale_max: f64,
 ) -> f64 {
-    const N_PILOT: usize = 50;
-    iscale_pilot_grid_search(iscale_min, iscale_max, seed, |scale, pilot_seed| {
-        let draws = subject_is_draws(
+    let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
+        obs_nll_subject_into(
             model,
             subject,
             theta,
             sigma,
+            model.residual_cov_theta(theta),
+            eta,
+            scratch,
+        )
+    };
+    find_optimal_iscale_with(
+        &obs_nll,
+        eta_hat,
+        h,
+        omega_inv,
+        log_det_omega,
+        d,
+        nu,
+        seed,
+        scratch,
+        iscale_min,
+        iscale_max,
+    )
+}
+
+/// [`find_optimal_iscale`] with the per-sample observation NLL supplied by the
+/// caller — the pilot twin of [`subject_is_draws_with`], so a joint (η, κ)
+/// proposal is tuned on the joint ESS (#2301).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_optimal_iscale_with(
+    obs_nll: &SampleObsNll<'_>,
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    iscale_min: f64,
+    iscale_max: f64,
+) -> f64 {
+    const N_PILOT: usize = 50;
+    iscale_pilot_grid_search(iscale_min, iscale_max, seed, |scale, pilot_seed| {
+        let draws = subject_is_draws_with(
+            obs_nll,
             eta_hat,
             h,
             omega_inv,
@@ -1800,13 +1919,28 @@ pub(crate) fn find_optimal_iscale_frem_rb(
 // Joint (eta, kappa) sampling for IOV models
 // ---------------------------------------------------------------------------
 
-/// Build the joint posterior Hessian for (eta, kappa) via finite differences.
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the κ columns' central difference even where the exact
+    /// Jacobian serves, for the test pinning the two against each other.
+    pub(crate) static KAPPA_FD_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn kappa_fd_forced() -> bool {
+    #[cfg(test)]
+    return KAPPA_FD_FORCE.with(|c| c.get());
+    #[cfg(not(test))]
+    false
+}
+
+/// Build the joint posterior Hessian for (eta, kappa): `H_post = J' R⁻¹ J + Ω_joint⁻¹`, the
+/// κ columns of `J` exact where the recorders serve the subject.
 ///
 /// The joint vector is b = [eta, kappa_1, ..., kappa_K] where K is n_occasions.
 /// The Hessian is H_post = J' R^{-1} J + Omega_joint^{-1} where J is the
 /// Jacobian of predictions w.r.t. b.
 #[allow(clippy::too_many_arguments)]
-fn compute_joint_posterior_hessian(
+pub(crate) fn compute_joint_posterior_hessian(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
@@ -1869,31 +2003,58 @@ fn compute_joint_posterior_hessian(
         }
     }
 
-    // FD for kappa columns using predict_iov for proper cross-occasion carryover
-    const EPS: f64 = 1e-6;
-    let mut kap_perturbed: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
+    // κ columns: exact, from the recording of the stacked `[η, κ_0, κ_1, …]` the inner
+    // search differentiates (`exact_kappa_jacobian`: its κ lanes only, the same layout
+    // `kappa_offset` indexes).
+    // The central difference over `predict_iov` remains where the recorders decline.
+    let stacked: Vec<f64> = eta_hat
+        .iter()
+        .chain(kappas.iter().flat_map(|k| k.iter()))
+        .copied()
+        .collect();
+    let exact = if kappa_fd_forced() {
+        None
+    } else {
+        crate::sens::ode_provider::adjoint::exact_kappa_jacobian(model, subject, theta, &stacked)
+            .filter(|jac| {
+                jac.nrows() == n_obs && jac.ncols() == n_b && jac.iter().all(|v| v.is_finite())
+            })
+    };
+    if let Some(jac) = exact {
+        for j in 0..n_obs {
+            for c in n_eta..n_b {
+                j_full[(j, c)] = jac[(j, c)];
+            }
+        }
+    } else {
+        // FD for kappa columns using predict_iov for proper cross-occasion carryover
+        const EPS: f64 = 1e-6;
+        let mut kap_perturbed: Vec<Vec<f64>> =
+            kappas.iter().map(|k| k.as_slice().to_vec()).collect();
 
-    for k in 0..n_occ {
-        let col_base = kappa_offset(n_eta, n_iov, k);
-        for ki in 0..n_iov {
-            let orig = kap_perturbed[k][ki];
-            let step = EPS * (1.0 + orig.abs());
+        for k in 0..n_occ {
+            let col_base = kappa_offset(n_eta, n_iov, k);
+            for ki in 0..n_iov {
+                let orig = kap_perturbed[k][ki];
+                let step = EPS * (1.0 + orig.abs());
 
-            // Forward perturbation
-            kap_perturbed[k][ki] = orig + step;
-            let preds_plus = predict_iov(model, subject, theta, eta_hat.as_slice(), &kap_perturbed);
+                // Forward perturbation
+                kap_perturbed[k][ki] = orig + step;
+                let preds_plus =
+                    predict_iov(model, subject, theta, eta_hat.as_slice(), &kap_perturbed);
 
-            // Backward perturbation
-            kap_perturbed[k][ki] = orig - step;
-            let preds_minus =
-                predict_iov(model, subject, theta, eta_hat.as_slice(), &kap_perturbed);
+                // Backward perturbation
+                kap_perturbed[k][ki] = orig - step;
+                let preds_minus =
+                    predict_iov(model, subject, theta, eta_hat.as_slice(), &kap_perturbed);
 
-            // Restore
-            kap_perturbed[k][ki] = orig;
+                // Restore
+                kap_perturbed[k][ki] = orig;
 
-            let inv_2step = 1.0 / (2.0 * step);
-            for j in 0..n_obs {
-                j_full[(j, col_base + ki)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
+                let inv_2step = 1.0 / (2.0 * step);
+                for j in 0..n_obs {
+                    j_full[(j, col_base + ki)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
+                }
             }
         }
     }
@@ -2095,6 +2256,21 @@ pub(crate) struct Proposal {
 }
 
 impl Proposal {
+    /// The proposal whose precision is `h` itself, unregularised: `None` when `h` is not
+    /// positive-definite (or `d = 0`).
+    pub(crate) fn from_precision(h: &DMatrix<f64>, d: usize) -> Option<Proposal> {
+        if d == 0 {
+            return None;
+        }
+        let l = h.clone().cholesky()?.l();
+        let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
+        Some(Proposal {
+            chol_h: l,
+            log_det_inv_scale: log_det,
+            d,
+        })
+    }
+
     /// Apply `scale · L_Σ z` into `out`, where `L_Σ` is the Cholesky factor of
     /// Σ = H⁻¹. Implementation: `L_Σ = L^{-T}` for the L from `H = L L^T`, so
     /// `L_Σ z = L^{-T} z` — one back-substitution.
@@ -2161,19 +2337,9 @@ pub(crate) fn build_proposal(
     for i in 0..d {
         h_reg[(i, i)] += (1e-6 * h[(i, i)].abs()).max(1e-10);
     }
-    if let Some(chol) = h_reg.clone().cholesky() {
-        let l = chol.l();
-        let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
-        return Some(Proposal {
-            chol_h: l,
-            log_det_inv_scale: log_det,
-            d,
-        });
-    }
-
     // Fallback: Σ = Ω (proposal scale = prior covariance). To keep the same
     // (L L' = Σ⁻¹) interface we Cholesky-factor Ω⁻¹ instead.
-    build_broad_proposal(omega_inv, d)
+    Proposal::from_precision(&h_reg, d).or_else(|| build_broad_proposal(omega_inv, d))
 }
 
 /// Build the prior-covariance proposal `Σ = Ω` (centred at 0) used as the
@@ -2187,17 +2353,7 @@ pub(crate) fn build_proposal(
 /// `None` only when `Ω⁻¹` is not positive-definite (then the mixture degrades to
 /// the narrow proposal alone).
 fn build_broad_proposal(omega_inv: &DMatrix<f64>, d: usize) -> Option<Proposal> {
-    if d == 0 {
-        return None;
-    }
-    let omega_inv_chol = omega_inv.clone().cholesky()?;
-    let l = omega_inv_chol.l();
-    let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
-    Some(Proposal {
-        chol_h: l,
-        log_det_inv_scale: log_det,
-        d,
-    })
+    Proposal::from_precision(omega_inv, d)
 }
 
 /// Defensive-mixture proposal component and precomputed log-mixing weights
@@ -2454,6 +2610,73 @@ fn add_ruv_posterior_curvature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The κ columns of the joint IS proposal's `J` are exact (the stacked recording),
+    /// replacing `2·K·n_κ` `predict_iov` solves: against the forced central difference the
+    /// joint posterior Hessian agrees to the quotient's accuracy, the η block is untouched
+    /// bit for bit, and the κ block differs in the bits (the exact branch ran).
+    #[test]
+    fn the_joint_proposal_takes_exact_kappa_columns() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_iov.ferx"),
+            Some(&format!("{root}/data/warfarin_iov.csv")),
+        )
+        .unwrap();
+        let model = &prep.parsed.model;
+        let params = &model.default_params;
+        let (n_eta, n_iov) = (model.n_eta, model.n_kappa);
+        assert!(n_iov > 0, "an IOV fixture");
+        let mut worst = 0.0f64;
+        for s in prep.population.subjects.iter().take(3) {
+            let n_occ = crate::stats::likelihood::iov_occasion_groups(s).len();
+            let n_b = crate::stats::stacked_layout::stacked_width(n_eta, n_iov, n_occ);
+            let eta = DVector::from_element(n_eta, 0.05);
+            let kappas: Vec<DVector<f64>> = (0..n_occ)
+                .map(|k| DVector::from_element(n_iov, 0.02 * (k as f64 + 1.0)))
+                .collect();
+            let jac_eta = DMatrix::from_element(s.observations.len(), n_eta, 0.3);
+            let prior = DMatrix::identity(n_b, n_b);
+            let mut scratch = EventPkParams::default();
+            let mut run = |force: bool| {
+                KAPPA_FD_FORCE.with(|c| c.set(force));
+                let h = compute_joint_posterior_hessian(
+                    model,
+                    s,
+                    &params.theta,
+                    &eta,
+                    &kappas,
+                    &params.sigma.values,
+                    &jac_eta,
+                    &prior,
+                    n_eta,
+                    n_iov,
+                    n_occ,
+                    &mut scratch,
+                );
+                KAPPA_FD_FORCE.with(|c| c.set(false));
+                h
+            };
+            let (he, hf) = (run(false), run(true));
+            for a in 0..n_eta {
+                for b in 0..n_eta {
+                    assert_eq!(he[(a, b)].to_bits(), hf[(a, b)].to_bits(), "η block");
+                }
+            }
+            assert!(
+                (n_eta..n_b).any(|a| he[(a, a)].to_bits() != hf[(a, a)].to_bits()),
+                "the exact κ branch did not run"
+            );
+            let scale = hf.iter().fold(1.0f64, |m, &v| m.max(v.abs()));
+            for (x, y) in he.iter().zip(hf.iter()) {
+                assert!(x.is_finite() && y.is_finite());
+                worst = worst.max((x - y).abs() / scale);
+            }
+        }
+        eprintln!("exact κ columns vs the central difference: worst {worst:.2e} of the Hessian");
+        // Measured 3.9e-10: the quotient's truncation at its `1e-6` step.
+        assert!(worst < 1e-6, "{worst:.2e}");
+    }
 
     /// IIV on residual error (#409): `add_ruv_posterior_curvature` injects the
     /// η_ruv data curvature `Σⱼ 2·res²/Rⱼ` into the proposal Hessian diagonal
@@ -2921,6 +3144,35 @@ mod tests {
         for dim in 0..d {
             let mean: f64 = draws.iter().map(|v| v[dim]).sum::<f64>() / k as f64;
             assert!(mean.abs() < 0.15, "dim {dim} mean = {mean}, expected ~0");
+        }
+    }
+
+    /// The buffered walker emits the `sobol` crate's own points: compared bit for
+    /// bit against `Sobol::<u32>` itself, scrambled the same way, over enough
+    /// points (1100) that the Gray-code flip reaches direction bit 10, and on
+    /// dimensions from one to past the 100-row `minimal()` table.
+    #[test]
+    fn the_sobol_walker_emits_the_crates_points() {
+        use sobol::Sobol;
+        for dim in [1usize, 2, 5, 137] {
+            let seeds = owen_coordinate_seeds(dim, 7);
+            let want: Vec<Vec<f64>> = Sobol::<u32>::new(dim, sobol_params())
+                .take(1100)
+                .map(|p| {
+                    p.iter()
+                        .zip(&seeds)
+                        .map(|(&x, &s)| u32_to_open_unit(owen_scramble_u32(x, s)))
+                        .collect()
+                })
+                .collect();
+            let got = sobol_uniforms(dim, 1100, 7);
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "dim {dim}, point {i}: {g:?} vs the crate's {w:?}"
+                );
+            }
         }
     }
 

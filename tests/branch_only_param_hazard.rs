@@ -95,15 +95,13 @@ fn all_arm_hazard_parameter_predicts_like_its_ternary_twin() {
 /// hazard is drug-driven, so the inner EBE search differentiates through it.
 /// The two spellings must give the same OFV and θ bit for bit.
 ///
-/// Which engine that search runs on: every subject here carries a TTE record,
-/// and a TTE term has no analytic η-channel yet (#2024 phase 3), so each
-/// subject's whole inner gradient is finite-differenced. This test used to
-/// assert "no subject on the FD fallback" — which held only because the
-/// fallback warning asked the Gaussian recorder alone, which serves the PK rows
-/// and never sees the hazard (#1861). The warning now counts the route that
-/// runs. Since #1861 the model-level label says so too: a TTE endpoint has no
-/// analytic η-channel, so it reports `finite differences`, and the warning still
-/// fires on the all-FD population to name the time-to-event record as the cause.
+/// Which engine that search runs on: every subject here carries a TTE record on a
+/// drug-driven hazard, which has an exact η-channel since #2482 (the dual walk reads
+/// `h` off the RHS at the saved state). So each subject runs the analytic inner
+/// gradient, the label reads `analytic (Dual2)` and no FD warning fires — where
+/// before #2482 the whole inner gradient was finite-differenced and the #1861
+/// warning named the time-to-event record as the cause (`tests/tte_inner_fd_warning.rs`
+/// keeps that warning pinned on the steady-state subject the walk still declines).
 #[test]
 fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin() {
     use ferx_core::{fit, FitOptions};
@@ -154,15 +152,17 @@ fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin() {
     let ternary = run(TERNARY_ETA);
     for (label, r) in [("all-arm", &all_arm), ("ternary", &ternary)] {
         assert!(r.ofv.is_finite(), "{label}: OFV {}", r.ofv);
+        // The drug-driven hazard has an exact η-channel (the dual walk, #2482), so both
+        // spellings run the analytic inner gradient and no subject warns of FD.
         assert_eq!(
-            r.gradient_method_inner, "finite differences",
-            "{label}: every TTE subject runs the FD inner gradient"
+            r.gradient_method_inner, "analytic (Dual2)",
+            "{label}: every TTE subject runs the exact inner gradient"
         );
         assert!(
-            r.warnings.iter().any(|w| w.contains(
-                "8 of 8 subjects use finite-difference inner gradients (8 carry a time-to-event"
-            )),
-            "{label}: every TTE subject runs the FD inner gradient, and the warning says why: {:?}",
+            !r.warnings
+                .iter()
+                .any(|w| w.contains("use finite-difference inner gradients")),
+            "{label}: no subject falls to FD: {:?}",
             r.warnings
         );
     }

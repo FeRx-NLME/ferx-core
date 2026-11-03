@@ -28,6 +28,11 @@ use std::path::Path;
 /// outer scope. That combination is exactly the shape this warning exists for: valid data,
 /// a model the report calls analytic, and one subject that quietly runs FD. (Until #486 the
 /// fixture was a rate-defined infusion under `F`, which the adjoint now serves.)
+/// The lag is 0.25, not the 0.5 it was: `data/warfarin.csv` samples at t = 0.5, where a
+/// 0.5 lag predicts exactly 0 and the proportional variance collapses to its guard, so
+/// the objective was 2.4e14 from the start (`W_NONFINITE_OBJECTIVE`). A line-search trial on
+/// that surface could legitimately carry a subject to where the adjoint declines, which
+/// is not what the in-scope control tests (#2549: the EBE warm-start predictor reached one).
 const WARFARIN_F: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -46,7 +51,7 @@ const WARFARIN_F: &str = r#"
   V  = TVV  * exp(ETA_V)
   KA = TVKA * exp(ETA_KA)
   F  = TVF
-  ALAG = 0.5
+  ALAG = 0.25
 
 [structural_model]
   pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=ALAG)

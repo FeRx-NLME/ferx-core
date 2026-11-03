@@ -260,45 +260,65 @@ pub(super) fn tv_refusal(model: &CompiledModel, pop: &Population, block: &str) -
     d.message.clone()
 }
 
-/// #741 analogue for the binary endpoint: a time-varying covariate in the `logit`
-/// predictor is rejected at fit setup — it would otherwise be silently frozen at the
-/// baseline snapshot (the bug the PR-807 review caught; the `types.rs` doc had claimed
-/// this was guarded when it was not).
+/// #741 analogue for the binary endpoint, narrowed by #2562: the `logit` predictor reads
+/// each record's own covariate snapshot, so a time-varying covariate is refused only for a
+/// subject whose snapshot does not line up with its binary records — here an in-memory
+/// subject with none, and one that also carries a time-to-event record — where it would
+/// otherwise be silently frozen at the baseline. Both sides of the gate in one test: the
+/// same `X` path on an aligned subject is accepted.
+///
+/// Mutations: leave the arm as it was before #2562 (refuse every time-varying covariate)
+/// and the aligned subject dies; drop the alignment test and the two unaligned ones do.
 #[cfg(feature = "survival")]
 #[test]
-fn binary_logit_time_varying_covariate_is_rejected() {
+fn binary_logit_time_varying_covariate_is_rejected_only_without_aligned_snapshots() {
     let model = parse_binary_lp_cov_model();
-    let pop = tte_cov_snapshot_pop(
-        "S1",
-        vec![
-            HashMap::from([("X".to_string(), 1.0)]),
-            HashMap::from([("X".to_string(), 2.0)]),
-        ],
-    );
+    let x = |v: f64| HashMap::from([("X".to_string(), v)]);
+    let pop = tte_cov_snapshot_pop("S1", vec![x(1.0), x(2.0)]);
     let msg = tv_refusal(&model, &pop, "binary_model");
     assert_eq!(
         msg,
         "[binary_model] on CMT=3: the logit predictor references covariate `X`, which is \
-         time-varying for subject `S1`. Time-varying covariates on the predictor are not yet \
-         supported — it is evaluated at the baseline covariate value, so the fit would silently \
-         use the wrong log-odds (#741). Use a time-constant (baseline) covariate for now.",
+         time-varying for subject `S1`, but that subject carries no per-record covariate \
+         snapshot aligned with its binary records (it also has time-to-event records, or was \
+         built in memory without `endpoint_covariates`), so the predictor could only read the \
+         baseline value (#741). Hold `X` constant within the subject, or fit the binary \
+         endpoint without the time-to-event endpoint.",
         "the whole text (#1774)"
     );
-    assert!(msg.contains("[binary_model]"), "must name the block: {msg}");
-    assert!(msg.contains('X'), "must name the covariate: {msg}");
-    assert!(msg.contains("#741"), "must cite the issue: {msg}");
     // A time-constant X is accepted.
-    let pop_ok = tte_cov_snapshot_pop(
-        "S1",
-        vec![
-            HashMap::from([("X".to_string(), 1.0)]),
-            HashMap::from([("X".to_string(), 1.0)]),
-        ],
-    );
+    let pop_ok = tte_cov_snapshot_pop("S1", vec![x(1.0), x(1.0)]);
     assert!(
         check_survival_tv_covariates(&model, &pop_ok).is_empty(),
         "a constant logit covariate must not be rejected"
     );
+    // The same varying X on binary records whose snapshots align: accepted (#2562).
+    let state = |time: f64| ObsRecord::DiscreteState {
+        time,
+        raw_time: time,
+        state: 1,
+        cmt: 3,
+    };
+    let mut aligned = tte_cov_snapshot_pop("S1", Vec::new());
+    let s = &mut aligned.subjects[0];
+    s.covariates = x(1.0);
+    s.obs_records = vec![state(0.0), state(1.0)];
+    s.endpoint_covariates = vec![x(1.0), x(2.0)];
+    assert!(
+        check_survival_tv_covariates(&model, &aligned).is_empty(),
+        "an aligned per-record snapshot must not be rejected (#2562)"
+    );
+    // A time-to-event record breaks the alignment: refused again, same text but the id.
+    let mut with_tte = aligned.clone();
+    let s = &mut with_tte.subjects[0];
+    s.obs_records.push(ObsRecord::Event {
+        time: 2.0,
+        event_type: crate::types::EventType::RightCensored,
+        entry_time: 0.0,
+        cmt: 9,
+    });
+    s.endpoint_covariates.push(x(2.0));
+    assert_eq!(tv_refusal(&model, &with_tte, "binary_model"), msg);
 }
 
 #[cfg(feature = "survival")]
@@ -718,6 +738,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         covariance_status: CovarianceStatus::Computed,
         covariance_method: Some(crate::types::CovarianceMethod::Hessian),
         shrinkage_eta: vec![],

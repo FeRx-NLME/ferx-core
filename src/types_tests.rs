@@ -567,6 +567,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
                 &crate::estimation::inner_optimizer::InnerLoopStats {
                     n_unconverged: 3,
                     n_fallback: 0,
+                    n_nm_polished: 0,
                     n_start_rejected: 0,
                 },
                 12,
@@ -580,6 +581,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
                 &crate::estimation::inner_optimizer::InnerLoopStats {
                     n_unconverged: 0,
                     n_fallback: 0,
+                    n_nm_polished: 0,
                     n_start_rejected: 1,
                 },
                 12,
@@ -595,6 +597,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
                 &crate::estimation::inner_optimizer::InnerLoopStats {
                     n_unconverged: 3,
                     n_fallback: 0,
+                    n_nm_polished: 0,
                     n_start_rejected: 0,
                 },
                 12,
@@ -639,14 +642,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
             "",
         ),
         // covariance.rs `S_SINGULAR_MSG`.
-        (
-            "Covariance step failed: the score cross-product matrix S is \
-             singular or rank-deficient (covariance_method = s); typically fewer subjects than \
-             free parameters, or collinear per-subject scores. Use covariance_method = r or \
-             rsr. SE estimates not available."
-                .into(),
-            "",
-        ),
+        (crate::estimation::covariance::S_SINGULAR_MSG.into(), ""),
         // covariance.rs quadrature score.
         (
             "Covariance step failed: could not obtain a converged, finite quadrature score \
@@ -4412,4 +4408,35 @@ fn requires_random_effects_is_exactly_saem_imp_impmap_bayes() {
     for m in [Foce, FoceI, FoceGn, FoceGnHybrid, Laplace, Vi] {
         assert!(!m.requires_random_effects(), "{m:?} must not be a member");
     }
+}
+
+/// `retain_records` drops a record's aligned covariate snapshot with it (#2562), so the
+/// snapshots still line up after the drop; a subject with no snapshot is left without.
+///
+/// Mutation: retain the records alone and the second record reads the third's `X`.
+#[cfg(feature = "survival")]
+#[test]
+fn retain_records_keeps_the_record_snapshots_aligned() {
+    let x = |v: f64| HashMap::from([("X".to_string(), v)]);
+    let rec = |t: f64| ObsRecord::DiscreteState {
+        time: t,
+        raw_time: t,
+        state: 0,
+        cmt: 1,
+    };
+    let mut s = Subject {
+        obs_records: vec![rec(0.0), rec(1.0), rec(2.0)],
+        endpoint_covariates: vec![x(0.0), x(1.0), x(2.0)],
+        ..Default::default()
+    };
+    s.retain_records(|r| !matches!(r, ObsRecord::DiscreteState { time, .. } if *time == 1.0));
+    let snaps = s.record_covariate_snapshots().expect("still aligned");
+    assert_eq!(snaps.iter().map(|m| m["X"]).collect::<Vec<_>>(), [0.0, 2.0]);
+
+    let mut bare = Subject {
+        obs_records: vec![rec(0.0), rec(1.0)],
+        ..Default::default()
+    };
+    bare.retain_records(|_| false);
+    assert!(bare.obs_records.is_empty() && bare.endpoint_covariates.is_empty());
 }

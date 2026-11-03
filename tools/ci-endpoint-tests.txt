@@ -13,13 +13,16 @@
 # `#[ignore]`d, so they cost one cheap compile each and keep the invariant a plain
 # set equality with no exemption rule to get wrong.
 agq
+binary_logit_levels
 branch_only_param_hazard
 categorical_convergence
 categorical_smoke
 cmt_data_selection_scope
 cmt_endpoint_scope
 ctmm_time_dependent_pk
+dcm_export_predict
 dose_compartment_routing
+dtmm_nonmem_anchor
 kappa_correlation_auto_lbfgs_fits
 lagged_zero_order_break_times
 level_no_gaussian_nonmem_anchor
@@ -45,6 +48,8 @@ survival_time_dependent_pk
 tte_convergence
 tte_exponential_ebe_nonmem_anchor
 tte_inner_fd_warning
+tte_ode_solve_failed
+tte_residuals_nonmem_anchor
 tte_smoke
 vi_dcm_omega_recovery
 zero_omega_fit
