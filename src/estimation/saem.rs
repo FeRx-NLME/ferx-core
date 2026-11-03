@@ -3817,10 +3817,19 @@ pub(crate) fn mixture_mu_ref_means(
 /// Whether the f-SAEM independent-MH kernel ([`crate::estimation::saem_imh`])
 /// can be used for this model.
 ///
-/// The first conditions are HMC's gate (analytical PK with an exact `Dual2`
-/// η-gradient, no IOV, no `iiv_on_ruv`, no mixture) plus the inner loop's own
-/// analytic-gradient scope, since the MAP refresh steps along that gradient.
-/// The rest are the shapes
+/// The refresh needs two exact η-derivatives: the individual-NLL η-gradient
+/// ([`crate::estimation::inner_optimizer::analytic_inner_grad_supported_model`],
+/// which the Gauss-Newton MAP steps follow) and the η-Jacobian of the
+/// predictions (`adjoint::exact_obs_grads`). Both come from the adjoint's unified
+/// recorder, so its scope (`recorder_in_scope`, read through the inner-gradient
+/// predicate) is the single structural gate: it admits analytical PK models and
+/// ODE models whose dual ODE walk serves the RHS and readout (#2639), and keeps
+/// out SDE (`[diffusion]`) and any ODE shape the recorder declines. There is no
+/// separate analytical-PK conjunct — a second gate rejecting the same inputs
+/// would leave one of them untestable.
+///
+/// The remaining conditions are no IOV, no `iiv_on_ruv`, no mixture, and the
+/// shapes
 /// [`crate::stats::likelihood::conditional_eta_precision`] deliberately does not
 /// score: the FREM covariate-row R-override, M3 censoring, a
 /// correlated (`block_sigma`) residual R, non-Gaussian endpoints, and LTBS.
@@ -3828,11 +3837,7 @@ pub(crate) fn mixture_mu_ref_means(
 /// proposal leaves the target invariant) but nothing was measured on those
 /// shapes, so they keep the random walk.
 pub(crate) fn imh_supported_model(model: &CompiledModel) -> bool {
-    // `tv_fn` is the analytical-PK predicate: the parser sets it for every
-    // non-ODE model and never for an ODE one, so it alone excludes ODE models
-    // (a separate `ode_spec.is_none()` would reject exactly the same inputs).
-    model.tv_fn.is_some()
-        && model.n_kappa == 0
+    model.n_kappa == 0
         && model.residual_error_eta.is_none()
         && model.mixture.is_none()
         && model.frem_config.is_none()
@@ -3969,9 +3974,9 @@ pub(crate) fn imh_decline_warning(
             "saem_n_leapfrog > 0 selected HMC, which owns the primary kernel".to_string()
         }
         ImhDecision::DeclinedScope => "the model is outside the scope the IMH proposal \
-             curvature covers (it needs an analytical PK model with an analytic eta-gradient \
-             and no IOV, iiv_on_ruv, mixture, FREM, SDE, block_sigma, M3 censoring, \
-             non-Gaussian endpoint or LTBS)"
+             curvature covers (it needs an analytical PK or ODE model whose eta-gradient and \
+             eta-Jacobian are analytic, and no IOV, iiv_on_ruv, mixture, FREM, SDE, \
+             block_sigma, M3 censoring, non-Gaussian endpoint or LTBS)"
             .to_string(),
     };
     Some(format!(

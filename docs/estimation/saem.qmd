@@ -153,7 +153,8 @@ $$
 
 centred on the subject's conditional mode $\hat\eta_i$ with the FOCEI curvature
 at that mode — assembled by the same code the FOCEI objective takes its
-log-determinant from, from the exact `Dual2` η-Jacobian. The mode is tracked
+log-determinant from, from the exact η-Jacobian (the closed form's, or the dual
+ODE walk's on an ODE model). The mode is tracked
 by warm-started Gauss-Newton steps and the proposal rebuilt every
 `saem_imh_refresh` (default 5) iterations; once the mode is tracked a rebuild
 costs one η-gradient and one η-Jacobian and no NLL evaluation. The search is
@@ -184,8 +185,10 @@ Three details carry the design:
   proposal accepts **0 of 200** moves from there. Mixing in the prior bounds the
   importance ratio and unsticks it. The main component is also inflated by a
   fixed $c = 1.2$.
-- **Two gates, decided before the run.** Scope: an analytical PK model with an
-  exact η-gradient, and none of ODE, IOV, `iiv_on_ruv`, mixture, FREM, SDE,
+- **Two gates, decided before the run.** Scope: an analytical PK or ODE model
+  whose η-gradient and η-Jacobian the adjoint's recorder serves exactly (an ODE
+  model whose right-hand side and readout the dual ODE walk covers; an SDE, or an
+  ODE the walk declines, is out), and none of IOV, `iiv_on_ruv`, mixture, FREM,
   `block_sigma`, M3, non-Gaussian endpoint or LTBS. Information: at least
   `saem_imh_min_obs_per_eta` (default 2.0) mean observations per subject per η —
   below that the conditional is barely narrower than the prior, and the
@@ -236,7 +239,48 @@ What this says:
   (+9…+25 %), which `score_sa` alone does too (+11…+37 %). A fit that runs
   `imh` with such a θ under `bobyqa` says so in its warnings.
 - **Where it does not run.** The information gate declines the sparse benches —
-  cefepime 0.51 obs/η, pembrolizumab 1.02 — and the scope gate the ODE ones.
+  cefepime 0.51 obs/η, pembrolizumab 1.02. ODE models were out of scope when
+  this table was measured; they are in scope since #2639, measured below.
+
+##### ODE models {#saem-imh-ode}
+
+Since #2639 the kernel runs on ODE models: the refresh's η-gradient and
+η-Jacobian come from the adjoint's dual ODE walk, the same recorder that gives
+FOCEI its exact inner gradient there. Same protocol as the table above (6
+seeds, 150 + 250 iterations, IS −2 log L at 3000 samples, fixed IS seed, Δ paired
+by seed against `rw`, negative is better), ferx `177e5877`, measured on
+**Linux** aarch64 (glibc 2.41, Docker): one lane, one thread, every arm
+interleaved per seed, nothing else running in the container VM (load average
+2.0–2.1 throughout). CPU is user+sys of the whole `[saem, imp]` run, so it
+includes the IS stage both arms share.
+
+| bench | Δ IS −2LL, `imh` | Δ, `imh` + `score_sa` | seed sd, `rw` → `imh` | CPU vs `rw` |
+|---|---|---|---|---|
+| busulfan first 100, closed form (control) | −2.25 ± 1.22 (6/6) | −3.06 ± 1.30 (6/6) | 1.27 → 0.39 | −1 % |
+| same, `[odes]`, `ode_method = rk45` | **−2.43 ± 1.69 (6/6)** | **−2.95 ± 0.62 (6/6)** | 1.44 → 0.36 | −3 % (19.5 → 18.9 s) |
+| TMDD QSS (60 subj, 1 η, 6 θ without η) | +0.05 ± 1.02 (4/6) | not comparable | 0.72 → 0.93 | −27 % |
+
+- **The busulfan ODE twin carries the analytic result over.** Integrated by
+  RK45, it gains as much as the closed form does, on every seed, at the same CPU.
+  Left on `ode_method = auto` the twin is solved exactly by the matrix
+  exponential and reproduces the closed form's numbers, so it is not an ODE bench.
+  ferx's IS −2 log L at NONMEM 7.5.1's own SAEM estimates on that model (three
+  seeds, #1449) is 7531.1, 7531.9 and 7532.1 on the RK45 twin; `imh` reaches
+  7531.5 ± 0.4, `rw` 7533.9 ± 1.4.
+- **TMDD is a tie, at three quarters of the CPU.** It is the θ-without-η case
+  on a genuinely nonlinear three-state model: six of its seven θ are moved by the
+  single-draw M-step, and the fit warns about running `imh` with them under
+  `bobyqa`, as it does on busulfan with `TVQ` free. A macOS run of the same arms
+  leaned the other way (+0.78, 2/6), so read the row as no gain rather than as a
+  win. The `score_sa` remedy does not apply here: on macOS it did not converge on
+  this model under either kernel (IS −2 log L 4830–9864 against 4762), so that
+  column was not repeated. NONMEM's SAEM (`ISAMPLE=2`, same starts) does not
+  converge on it either — V1 collapses to 0.01 and three θ end at their initial
+  values — so there is no external reference for this row.
+- **Cost.** The kernel's cost report (`imh_cost_warning`) fired on none of the
+  30 `imh` fits: one dual ODE sweep for the η-gradient and one for the
+  η-Jacobian amortise over the `saem_imh_refresh` interval as they do on the
+  closed form.
 
 The E-step sampling is parallelized across subjects using Rayon.
 

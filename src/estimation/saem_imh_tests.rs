@@ -461,10 +461,26 @@ fn conditional_precision_halves_match_their_closed_forms_under_proportional_erro
 
 fn chain_moments_imh(n_steps: usize, seed: u64, drop_q_ratio: bool) -> (Moments, Moments) {
     let model = parse_model_string(IV_MODEL).expect("parse");
+    chain_moments_imh_on(
+        &model,
+        &well_conditioned_subject(),
+        n_steps,
+        seed,
+        drop_q_ratio,
+    )
+}
+
+fn chain_moments_imh_on(
+    model: &CompiledModel,
+    subject: &Subject,
+    n_steps: usize,
+    seed: u64,
+    drop_q_ratio: bool,
+) -> (Moments, Moments) {
+    let (model, subject) = (model.clone(), subject.clone());
     let theta = model.default_params.theta.clone();
     let sigma = model.default_params.sigma.values.clone();
     let omega = omega2(0.09, 0.09);
-    let subject = well_conditioned_subject();
     let counters = ImhCounters::default();
     let prop = build(&model, &subject, &[0.0, 0.0], 30, 0.05, &counters);
 
@@ -514,10 +530,20 @@ fn chain_moments_imh(n_steps: usize, seed: u64, drop_q_ratio: bool) -> (Moments,
 
 fn chain_moments_rw(n_steps: usize, seed: u64) -> (Moments, Moments) {
     let model = parse_model_string(IV_MODEL).expect("parse");
+    chain_moments_rw_on(&model, &well_conditioned_subject(), n_steps, seed, 0.25)
+}
+
+fn chain_moments_rw_on(
+    model: &CompiledModel,
+    subject: &Subject,
+    n_steps: usize,
+    seed: u64,
+    rw_scale: f64,
+) -> (Moments, Moments) {
+    let (model, subject) = (model.clone(), subject.clone());
     let theta = model.default_params.theta.clone();
     let sigma = model.default_params.sigma.values.clone();
     let omega = omega2(0.09, 0.09);
-    let subject = well_conditioned_subject();
 
     let mut eta = vec![0.0, 0.0];
     let mut nll = individual_nll(&model, &subject, &theta, &eta, &omega, &sigma);
@@ -536,7 +562,7 @@ fn chain_moments_rw(n_steps: usize, seed: u64) -> (Moments, Moments) {
             &theta,
             &omega,
             &sigma,
-            0.25,
+            rw_scale,
             None,
             &mut rng,
             1,
@@ -1597,8 +1623,10 @@ fn every_scope_condition_declines_on_its_own() {
     let base = parse_model_string(IV_MODEL).expect("parse");
     assert!(imh_supported_model(&base));
 
-    let ode = parse_model_string(
-        "\
+    // An ODE model is in scope since #2639: its η-gradient and η-Jacobian come
+    // from the adjoint's dual ODE walk, as the analytical model's come from the
+    // closed form.
+    let ode_src = "\
 [parameters]
   theta TVCL(1.0, 0.01, 50.0)
   theta TVV(20.0, 1.0, 500.0)
@@ -1609,30 +1637,33 @@ fn every_scope_condition_declines_on_its_own() {
   CL = TVCL * exp(ETA_CL)
   V  = TVV  * exp(ETA_V)
 [structural_model]
-  ode(states=[central])
+  ode(obs_cmt=central, states=[central])
 [odes]
   d/dt(central) = -CL / V * central
-[scaling]
-  y = central / V
 [error_model]
   DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("ODE twin parses");
-    assert!(ode.ode_spec.is_some());
-    // The `tv_fn` conjunct is what excludes it: the parser builds no closed-form
-    // `tv_fn` for an ODE model.
-    assert!(ode.tv_fn.is_none());
+";
+    let ode = parse_model_string(ode_src).expect("ODE twin parses");
+    assert!(ode.ode_spec.is_some() && ode.tv_fn.is_none());
+    assert!(imh_supported_model(&ode), "an ODE model must be in scope");
+
+    // The same ODE with a `[diffusion]` block — an SDE, whose EKF likelihood the
+    // dual ODE walk does not record — differs in that one block.
+    let sde = parse_model_string(&format!("{ode_src}[diffusion]\n  central ~ 0.05 FIX\n"))
+        .expect("SDE twin parses");
+    assert!(sde.is_sde());
     assert!(
-        !imh_supported_model(&ode),
-        "an ODE model must be out of scope"
+        !imh_supported_model(&sde),
+        "an SDE model must be out of scope"
     );
 
-    let mut no_tv = parse_model_string(IV_MODEL).expect("parse");
-    no_tv.tv_fn = None;
+    // An ODE the recorder declines (no compiled RHS program to walk over duals),
+    // differing from the in-scope ODE in that one field.
+    let mut no_rhs = parse_model_string(ode_src).expect("parse");
+    no_rhs.ode_spec.as_mut().unwrap().rhs_program = None;
     assert!(
-        !imh_supported_model(&no_tv),
-        "no tv_fn must be out of scope"
+        !imh_supported_model(&no_rhs),
+        "an ODE the dual walk declines must be out of scope"
     );
 
     let mixture = parse_model_string(
@@ -1686,9 +1717,10 @@ fn the_scope_decline_warning_names_every_shape() {
     assert_eq!(
         imh_decline_warning(ImhDecision::DeclinedScope, 2.0, 2).unwrap(),
         "saem_kernel = imh requested but the model is outside the scope the IMH proposal \
-         curvature covers (it needs an analytical PK model with an analytic eta-gradient and \
-         no IOV, iiv_on_ruv, mixture, FREM, SDE, block_sigma, M3 censoring, non-Gaussian \
-         endpoint or LTBS); using the Metropolis-Hastings random walk"
+         curvature covers (it needs an analytical PK or ODE model whose eta-gradient and \
+         eta-Jacobian are analytic, and no IOV, iiv_on_ruv, mixture, FREM, SDE, block_sigma, \
+         M3 censoring, non-Gaussian endpoint or LTBS); using the Metropolis-Hastings random \
+         walk"
     );
     assert_eq!(
         imh_decline_warning(ImhDecision::DeclinedHmc, 2.0, 2).unwrap(),
@@ -1969,5 +2001,395 @@ fn the_stuck_warning_reaches_the_fit_result() {
     assert!(
         w.starts_with(&want),
         "{w}\nwanted the convergence window: {want}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ODE models (#2639)
+// ---------------------------------------------------------------------------
+
+/// A one-state Michaelis-Menten ODE: genuinely nonlinear in `η_VM` (the
+/// concentration sits near `KM`, so elimination is neither first- nor
+/// zero-order), and with no closed form, so every derivative below comes from
+/// the adjoint's dual ODE walk.
+const MM_ODE_MODEL: &str = "\
+[parameters]
+  theta TVVM(10.0, 0.1, 500.0)
+  theta TVKM(2.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_VM ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  VM = TVVM * exp(ETA_VM)
+  KM = TVKM
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -VM * (central / V) / (KM + central / V)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// [`MM_ODE_MODEL`] under an additive error, for the zero-residual Hessian.
+const MM_ODE_MODEL_ADDITIVE: &str = "\
+[parameters]
+  theta TVVM(10.0, 0.1, 500.0)
+  theta TVKM(2.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_VM ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma ADD_ERR ~ 0.04
+[individual_parameters]
+  VM = TVVM * exp(ETA_VM)
+  KM = TVKM
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -VM * (central / V) / (KM + central / V)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ additive(ADD_ERR)
+";
+
+/// Two bolus doses, the second at `t = 12` while drug from the first is still
+/// present, with observations on both sides of it — so the derivative through
+/// the second dose event carries a non-zero incoming state.
+const MM_OBS_TIMES: [f64; 10] = [0.5, 1.0, 2.0, 4.0, 8.0, 11.5, 12.5, 14.0, 18.0, 24.0];
+const MM_SECOND_DOSE: f64 = 12.0;
+
+/// Parse an MM ODE fixture with the solver tightened to `reltol = 1e-10`,
+/// `abstol = 1e-12`. At the default `1e-4` the `f64` value path's adaptive step
+/// sizes move with η, and a finite difference of it picks up that motion: the
+/// realised dual-vs-FD Jacobian gap on the last observation was 8.0e-5 relative —
+/// the solver tolerance, not a derivative defect. The oracle has to be more
+/// accurate than the difference it adjudicates, so the parity fixtures run tight.
+fn mm_model(src: &str) -> CompiledModel {
+    let mut model = parse_model_string(src).expect("parse");
+    let ode = model.ode_spec.as_mut().expect("MM fixture is an ODE model");
+    ode.solver_opts.reltol = 1e-10;
+    ode.solver_opts.abstol = 1e-12;
+    model
+}
+
+fn mm_subject(observations: Vec<f64>) -> Subject {
+    let n = MM_OBS_TIMES.len();
+    assert_eq!(n, observations.len());
+    Subject {
+        id: "1".to_string(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(MM_SECOND_DOSE, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: MM_OBS_TIMES.to_vec(),
+        observations,
+        obs_cmts: vec![1; n],
+        cens: vec![0; n],
+        occasions: vec![1; n],
+        ..Default::default()
+    }
+}
+
+/// The ODE twin of [`well_conditioned_subject`]: the model's own predictions at
+/// `η = (0.25, −0.15)` with a ±4 % ripple.
+fn mm_well_conditioned_subject() -> Subject {
+    let model = mm_model(MM_ODE_MODEL);
+    let theta = model.default_params.theta.clone();
+    let mut subject = mm_subject(vec![0.0; MM_OBS_TIMES.len()]);
+    let preds = predictions(&model, &subject, &theta, &[0.25, -0.15]);
+    assert!(preds.iter().all(|p| p.is_finite() && *p > 0.0));
+    let ripple = [1.04, 0.97, 1.02, 0.96, 1.03, 0.98, 1.02, 0.97, 1.03, 0.99];
+    subject.observations = preds.iter().zip(ripple).map(|(p, r)| p * r).collect();
+    subject
+}
+
+/// The fixture is what the parity tests below need it to be: an ODE model (so
+/// no closed form can supply the answer), in the IMH scope, nonlinear, and with
+/// drug on board when the second dose lands.
+#[test]
+fn the_ode_fixture_is_multi_dose_nonlinear_and_in_scope() {
+    let model = parse_model_string(MM_ODE_MODEL).expect("parse");
+    assert!(model.ode_spec.is_some() && model.tv_fn.is_none());
+    assert!(
+        imh_supported_model(&model),
+        "the MM ODE model must be in scope"
+    );
+    let theta = model.default_params.theta.clone();
+    let subject = mm_subject(vec![0.0; MM_OBS_TIMES.len()]);
+    let f = predictions(&model, &subject, &theta, &[0.0, 0.0]);
+    // Just before the second dose the concentration is still a sizeable share of
+    // the first dose's peak (100 / 20 = 5): the second dose's incoming side is live.
+    let before = f[MM_OBS_TIMES.iter().position(|&t| t == 11.5).unwrap()];
+    assert!(
+        before > 0.5,
+        "no residual drug at the second dose: C(11.5) = {before}"
+    );
+    // ... and near KM = 2, where MM elimination is far from linear.
+    assert!(f[0] > 2.0, "C(0.5) = {} never reaches KM", f[0]);
+    // The second dose raises the concentration above the residual.
+    let after = f[MM_OBS_TIMES.iter().position(|&t| t == 12.5).unwrap()];
+    assert!(
+        after > before + 3.0,
+        "second dose did not land: {before} → {after}"
+    );
+}
+
+/// Dual-vs-FD parity of the η-Jacobian on the ODE fixture: the production pair
+/// `(H, f)` from one dual sweep of the ODE walk against a central-FD Jacobian of
+/// the `f64` ODE predictor, and `f` against the predictor itself.
+#[test]
+fn ode_eta_jacobian_matches_fd_across_a_second_dose() {
+    let model = mm_model(MM_ODE_MODEL);
+    let theta = model.default_params.theta.clone();
+    let subject = mm_well_conditioned_subject();
+    let eta = [0.2, -0.1];
+    let (jac, f) = super::eta_jacobian_and_preds(&model, &subject, &theta, &eta)
+        .expect("ODE η-Jacobian in scope");
+    let jac_fd = fd_jacobian(&model, &subject, &theta, &eta);
+    let f_val = predictions(&model, &subject, &theta, &eta);
+    let mut worst_f = 0.0_f64;
+    let mut worst_j = 0.0_f64;
+    for j in 0..MM_OBS_TIMES.len() {
+        assert!(f[j].is_finite() && f_val[j].is_finite());
+        worst_f = worst_f.max((f[j] - f_val[j]).abs() / f_val[j].abs());
+        for a in 0..2 {
+            let (g, w) = (jac[(j, a)], jac_fd[(j, a)]);
+            assert!(g.is_finite() && w.is_finite(), "non-finite J[{j},{a}]");
+            worst_j = worst_j.max((g - w).abs() / w.abs().max(1e-3));
+        }
+    }
+    // Both sides of the second dose carry η-sensitivity in both coordinates.
+    for t in [11.5, 12.5] {
+        let j = MM_OBS_TIMES.iter().position(|&x| x == t).unwrap();
+        assert!(
+            jac[(j, 0)].abs() > 1e-2 && jac[(j, 1)].abs() > 1e-2,
+            "J row at t={t} dead"
+        );
+    }
+    // Realised: f bit-identical (0), worst J rel 1.2e-8 (FD truncation at
+    // h = 1e-6 over a 1e-10-tolerance solve). Bounds 1e-9 / 1e-6 (~80×); at the
+    // default `reltol = 1e-4` the same gap was 8e-5, which is what a
+    // tolerance-sized derivative defect would look like here.
+    assert!(worst_f < 1e-9, "dual f vs predictor rel {worst_f:e}");
+    assert!(worst_j < 1e-6, "dual J vs FD rel {worst_j:e}");
+}
+
+/// The ODE twin of [`conditional_precision_matches_the_fd_hessian_at_zero_residual`]:
+/// at a zero-residual point under additive error, `H̃` built from the dual ODE
+/// Jacobian must equal the central-FD Hessian of `individual_nll`.
+#[test]
+fn ode_conditional_precision_matches_the_fd_hessian_at_zero_residual() {
+    let model = mm_model(MM_ODE_MODEL_ADDITIVE);
+    let theta = model.default_params.theta.clone();
+    let sigma = model.default_params.sigma.values.clone();
+    let omega = omega2(0.09, 0.09);
+    let eta_star = [0.25, -0.15];
+    let mut subject = mm_subject(vec![0.0; MM_OBS_TIMES.len()]);
+    subject.observations = predictions(&model, &subject, &theta, &eta_star);
+
+    let (jac, f) = super::eta_jacobian_and_preds(&model, &subject, &theta, &eta_star)
+        .expect("ODE η-Jacobian in scope");
+    let h_tilde = crate::stats::likelihood::conditional_eta_precision(
+        &model, &subject, &theta, &eta_star, &f, &jac, &omega, &sigma, true,
+    )
+    .expect("curvature in scope");
+
+    let nll = |e: &[f64]| individual_nll(&model, &subject, &theta, e, &omega, &sigma);
+    let h = 1e-4;
+    let mut fd = DMatrix::zeros(2, 2);
+    for a in 0..2 {
+        for b in 0..2 {
+            let at = |da: f64, db: f64| {
+                let mut e = eta_star.to_vec();
+                e[a] += da;
+                e[b] += db;
+                nll(&e)
+            };
+            fd[(a, b)] = (at(h, h) - at(h, -h) - at(-h, h) + at(-h, -h)) / (4.0 * h * h);
+        }
+    }
+    let mut worst = 0.0_f64;
+    for a in 0..2 {
+        for b in 0..2 {
+            let (g, w) = (h_tilde[(a, b)], fd[(a, b)]);
+            assert!(g.is_finite() && w.is_finite(), "non-finite curvature entry");
+            worst = worst.max((g - w).abs() / w.abs());
+        }
+    }
+    // The data term must dominate the prior, or the check is of Ω⁻¹ alone.
+    assert!(
+        h_tilde[(0, 0)] > 2.0 * omega.inv[(0, 0)] && h_tilde[(1, 1)] > 2.0 * omega.inv[(1, 1)],
+        "curvature is mostly prior: {h_tilde}"
+    );
+    // Realised worst relative error 2.9e-8 (FD truncation at h = 1e-4). Bound
+    // 1e-6 (~34×); a dropped Ω⁻¹ is 11.1 on a ~2200 diagonal (5e-3).
+    assert!(worst < 1e-6, "H̃ vs FD Hessian rel {worst:e}");
+}
+
+/// Posterior moments of `p(η | y) ∝ exp(−individual_nll)` on a 2-D grid —
+/// the reference for the ODE chain test. Deterministic and independent of both
+/// MH kernels, so it adjudicates the IMH chain without a second sampler's
+/// Monte-Carlo error. Returns `(mean, sd)` per coordinate and the largest
+/// edge-to-peak density ratio, which must be negligible for the box to hold
+/// the mass.
+fn grid_posterior_moments(
+    model: &CompiledModel,
+    subject: &Subject,
+    lo: [f64; 2],
+    hi: [f64; 2],
+    n: [usize; 2],
+) -> ([(f64, f64); 2], f64) {
+    let theta = model.default_params.theta.clone();
+    let sigma = model.default_params.sigma.values.clone();
+    let omega = omega2(0.09, 0.09);
+    let step = |d: usize| (hi[d] - lo[d]) / (n[d] - 1) as f64;
+    let (na, nb) = (n[0], n[1]);
+    let mut nll = vec![0.0_f64; na * nb];
+    for a in 0..na {
+        for b in 0..nb {
+            let e = [lo[0] + a as f64 * step(0), lo[1] + b as f64 * step(1)];
+            let v = individual_nll(model, subject, &theta, &e, &omega, &sigma);
+            assert!(v.is_finite(), "non-finite NLL at {e:?}");
+            nll[a * nb + b] = v;
+        }
+    }
+    let min = nll.iter().copied().fold(f64::INFINITY, f64::min);
+    let w: Vec<f64> = nll.iter().map(|v| (min - v).exp()).collect();
+    let mut edge = 0.0_f64;
+    for a in 0..na {
+        for b in 0..nb {
+            if a == 0 || b == 0 || a == na - 1 || b == nb - 1 {
+                edge = edge.max(w[a * nb + b]);
+            }
+        }
+    }
+    let z: f64 = w.iter().sum();
+    let mut out = [(0.0, 0.0); 2];
+    for d in 0..2 {
+        let coord = |a: usize, b: usize| lo[d] + [a, b][d] as f64 * step(d);
+        let (mut m1, mut m2) = (0.0, 0.0);
+        for a in 0..na {
+            for b in 0..nb {
+                let x = coord(a, b);
+                m1 += w[a * nb + b] * x;
+                m2 += w[a * nb + b] * x * x;
+            }
+        }
+        let mean = m1 / z;
+        out[d] = (mean, (m2 / z - mean * mean).sqrt());
+    }
+    (out, edge)
+}
+
+/// The quadrature reference for [`mm_well_conditioned_subject`], computed once
+/// per test binary. The box is wide in `η_VM` because the MM conditional has an
+/// exponential, not Gaussian, left tail (low `VM` saturates elimination, so the
+/// profile NLL rises ~20 per unit of `η_VM` there rather than quadratically):
+/// it is still 1e-5 of the peak at `η_VM = −0.1`, eight conditional SDs out.
+/// A 0.02 step (~2 points per conditional SD) suffices: the trapezoid rule on
+/// this smooth integrand agrees with a 0.01 grid to 6e-7 in every moment.
+fn mm_quadrature_reference() -> [(f64, f64); 2] {
+    static REF: std::sync::OnceLock<[(f64, f64); 2]> = std::sync::OnceLock::new();
+    *REF.get_or_init(|| {
+        let model = parse_model_string(MM_ODE_MODEL).expect("parse");
+        let subject = mm_well_conditioned_subject();
+        let (want, edge) =
+            grid_posterior_moments(&model, &subject, [-1.6, -0.8], [0.6, 0.6], [111, 71]);
+        assert!(
+            edge < 1e-9,
+            "grid box truncates the posterior (edge/peak {edge:e})"
+        );
+        want
+    })
+}
+
+/// The IMH chain-invariance oracle on an ODE subject (#2639): the kernel built
+/// from the dual ODE walk's curvature must sample the multi-dose MM conditional,
+/// pinned against grid quadrature of `exp(−individual_nll)` — the same value
+/// path the acceptance ratio reads, integrated without any sampler.
+#[test]
+fn ode_imh_chain_matches_the_quadrature_posterior() {
+    let model = parse_model_string(MM_ODE_MODEL).expect("parse");
+    assert!(model.ode_spec.is_some());
+    let subject = mm_well_conditioned_subject();
+    let want = mm_quadrature_reference();
+    let (i0, i1) = chain_moments_imh_on(&model, &subject, 20_000, 11, false);
+    // Quadrature: η_VM 0.2496 ± 0.0409, η_V −0.1064 ± 0.0784. Realised over
+    // seeds 11–16: |Δmean| ≤ 0.025 conditional SDs, |Δsd|/sd ≤ 0.017; with the
+    // q-ratio dropped |Δsd|/sd = 0.34 (the control below). Bounds: mean 0.1 SD,
+    // sd 0.08 — ≥ 4× the realised worst and 4× below the defect.
+    for (imh, (mean, sd), name) in [(i0, want[0], "ETA_VM"), (i1, want[1], "ETA_V")] {
+        assert!(imh.mean.is_finite() && mean.is_finite() && sd > 0.0);
+        let dm = (imh.mean - mean).abs() / sd;
+        let ds = (imh.sd() - sd).abs() / sd;
+        assert!(
+            dm < 0.1,
+            "{name}: IMH mean {:.6} vs grid {mean:.6} ({dm:.3} sd)",
+            imh.mean
+        );
+        assert!(
+            ds < 0.08,
+            "{name}: IMH sd {:.6} vs grid {sd:.6} (rel {ds:.3})",
+            imh.sd()
+        );
+    }
+}
+
+/// [`ode_imh_chain_matches_the_quadrature_posterior`]'s control: the same chain
+/// with the `q`-ratio dropped must miss the quadrature SDs by far more than the
+/// bound there, or that test has stopped testing the acceptance ratio.
+#[test]
+fn ode_dropping_the_q_ratio_visibly_biases_the_chain() {
+    let model = parse_model_string(MM_ODE_MODEL).expect("parse");
+    let subject = mm_well_conditioned_subject();
+    let want = mm_quadrature_reference();
+    let (b0, b1) = chain_moments_imh_on(&model, &subject, 20_000, 11, true);
+    let worst = [(b0, want[0]), (b1, want[1])]
+        .iter()
+        .map(|(b, (_, sd))| {
+            assert!(b.sd().is_finite() && *sd > 0.0);
+            (b.sd() - sd).abs() / sd
+        })
+        .fold(0.0_f64, f64::max);
+    // Realised 0.34 (seed 11); the bound in the test above is 0.08.
+    assert!(
+        worst > 0.2,
+        "dropping the q-ratio did not move the chain (worst sd rel {worst:.3})"
+    );
+}
+
+/// An ODE fit takes the kernel end to end (#2639): every refresh is served by
+/// the dual ODE walk (no declines, so no subject silently falls back to the
+/// random walk), and the block random walk never runs.
+#[test]
+fn an_ode_fit_runs_the_kernel_without_declines() {
+    let model = parse_model_string(MM_ODE_MODEL).expect("parse");
+    let pop = population_of(&mm_well_conditioned_subject(), 4);
+    let r = run_saem(&model, &pop, &model.default_params, &imh_opts(7)).expect("SAEM runs");
+    let used = last_imh();
+    assert_eq!(used.proposals, 12 * 4 * 2, "{used:?}");
+    assert_eq!(used.refreshes, 6 * 4, "{used:?}");
+    assert_eq!(
+        used.declines, 0,
+        "an ODE subject declined its refresh: {used:?}"
+    );
+    assert!(used.accepts > 0, "{used:?}");
+    assert!(r.ofv.is_finite());
+    assert!(
+        !r.warnings
+            .iter()
+            .any(|w| w.contains("saem_kernel = imh requested")),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(
+        LAST_RW_BLOCK_CALLS.with(|c| c.get()),
+        0,
+        "the random walk ran under IMH"
     );
 }
