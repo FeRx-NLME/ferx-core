@@ -14,16 +14,21 @@
 //! `η*` is accepted with probability `π(η*) q(η) / (π(η) q(η*))`, where `π` is the same
 //! individual objective the random-walk kernels score. A poor `q` costs acceptance, never
 //! validity. Under mode 1, `q` is the prior factor of `π` itself, so the ratio is the
-//! likelihood ratio alone.
+//! likelihood ratio alone. Under IOV the target is `p(η | κ, θ, y)` with the subject's κ
+//! held fixed, as for the random walk; the κ have their own kernel.
 //!
 //! Mode 1B's moments are each subject's running mean and covariance of its draws, over
 //! every iteration so far ([`ConditionalMoments`]). An adaptive proposal of this kind keeps
 //! the chain's target because the adaptation diminishes: the `k`-th draw moves the
 //! moments by `O(1/k)` (Roberts & Rosenthal 2007, as for the Haario sampler). The kernel
 //! waits for more than `2·n_η` draws, so the covariance is not singular by construction.
+//!
+//! Not on a mixture model, where a subject's Ω and σ depend on its drawn class.
 
 use super::MhScratch;
-use crate::stats::likelihood::individual_nll_prepared;
+use crate::stats::likelihood::{
+    individual_nll_iov_with_scratch_and_schedule, individual_nll_prepared,
+};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::prelude::*;
@@ -142,6 +147,10 @@ pub(crate) fn independence_steps(
     n_steps: usize,
     scratch: &mut MhScratch,
     schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    // Under IOV, the subject's κ (held fixed) and `Ω_IOV`: the target is then
+    // `p(η | κ, θ, y)`, the conditional the random-walk kernels score, so the η block is
+    // proposed with the occasion terms in its NLL ([`super::mh_steps`]).
+    kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
 ) -> (usize, f64) {
     let n_eta = eta.len();
     let mut nll = nll_current;
@@ -159,17 +168,31 @@ pub(crate) fn independence_steps(
             *slot = rng.sample(StandardNormal);
         }
         prop.draw_into(z.as_slice(), &mut eta_prop[..n_eta]);
-        let nll_prop = individual_nll_prepared(
-            model,
-            subject,
-            theta,
-            eta_prop,
-            omega,
-            sigma_values,
-            prep,
-            schedule,
-            nll_scratch,
-        );
+        let nll_prop = match kappas_opt {
+            Some((kappas, omega_iov)) => individual_nll_iov_with_scratch_and_schedule(
+                model,
+                subject,
+                theta,
+                eta_prop,
+                kappas,
+                omega,
+                Some(omega_iov),
+                sigma_values,
+                &mut nll_scratch.pk,
+                schedule,
+            ),
+            None => individual_nll_prepared(
+                model,
+                subject,
+                theta,
+                eta_prop,
+                omega,
+                sigma_values,
+                prep,
+                schedule,
+                nll_scratch,
+            ),
+        };
         let log_q_prop = prop.quad(eta_prop);
         // π ∝ exp(−nll): log α = (nll − nll*) + (ln q(η) − ln q(η*)). A non-finite
         // proposal objective compares false and is rejected.

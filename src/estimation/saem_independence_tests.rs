@@ -192,6 +192,7 @@ fn the_independence_kernel_samples_the_conditional() {
                         1,
                         &mut scratch,
                         None,
+                        None,
                     ),
                     None => walk(&mut eta, nll, &mut rng, &mut scratch),
                 };
@@ -310,4 +311,240 @@ fn mode_ones_proposal_is_the_prior() {
     }
     eprintln!("prior quad vs −½ηᵀΩ⁻¹η: {worst:.3e}");
     assert!(worst < 1e-13, "prior quad vs −½ηᵀΩ⁻¹η: {worst:.3e}");
+}
+
+/// Under IOV the kernel's target is `p(η | κ, θ, y)` with κ held fixed, the conditional the
+/// random walk scores: on a `warfarin_iov` subject with non-zero κ, mode 1B composed with
+/// the walk matches a self-normalised importance-sampling reference under the same κ-aware
+/// objective. A kernel that scored the BSV-only objective instead would converge to a
+/// conditional without the occasion terms.
+#[test]
+fn the_independence_kernel_samples_the_iov_conditional() {
+    use super::super::{mh_steps, MhScratch};
+    use crate::stats::likelihood::individual_nll_iov_with_scratch_and_schedule;
+    use rand::SeedableRng;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let prep = crate::api::prepare_run(
+        &format!("{root}/examples/warfarin_iov.ferx"),
+        Some(&format!("{root}/data/warfarin_iov.csv")),
+    )
+    .unwrap();
+    let model = &prep.parsed.model;
+    assert!(model.n_kappa > 0, "premise: an IOV model");
+    let params = &model.default_params;
+    let omega_iov = params.omega_iov.as_ref().expect("Ω_IOV");
+    let n_eta = model.n_eta;
+    let subject = prep
+        .population
+        .subjects
+        .iter()
+        .find(|s| {
+            s.occasions
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                >= 2
+        })
+        .expect("a subject with two occasions");
+    let n_occ = subject
+        .occasions
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let kappas: Vec<Vec<f64>> = (0..n_occ)
+        .map(|o| {
+            (0..model.n_kappa)
+                .map(|k| 0.15 - 0.1 * (o + k) as f64)
+                .collect()
+        })
+        .collect();
+    let kap = Some((kappas.as_slice(), omega_iov));
+    let nll_at = |eta: &[f64], scratch: &mut crate::pk::EventPkParams| {
+        individual_nll_iov_with_scratch_and_schedule(
+            model,
+            subject,
+            &params.theta,
+            eta,
+            &kappas,
+            &params.omega,
+            Some(omega_iov),
+            &params.sigma.values,
+            scratch,
+            None,
+        )
+    };
+    let mut pk = crate::pk::EventPkParams::default();
+    let start = vec![0.0; n_eta];
+    let nll0 = nll_at(&start, &mut pk);
+    let chain = |prop: Option<&GaussianProposal>| -> (Vec<f64>, Vec<f64>, f64) {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(23);
+        let mut scratch = MhScratch::default();
+        scratch.begin_subject(model, subject, &params.theta, n_eta);
+        let mut eta = start.clone();
+        let mut nll = nll0;
+        let mut s1 = vec![0.0; n_eta];
+        let mut s2 = vec![0.0; n_eta];
+        let mut acc = 0usize;
+        let (burn, n) = (2_000, 60_000);
+        for k in 0..burn + n {
+            nll = mh_steps(
+                &mut eta,
+                nll,
+                subject,
+                model,
+                &params.theta,
+                &params.omega,
+                &params.sigma.values,
+                0.5,
+                None,
+                &mut rng,
+                1,
+                &mut scratch,
+                None,
+                kap,
+            )
+            .1;
+            if let Some(p) = prop {
+                let (a, l) = independence_steps(
+                    &mut eta,
+                    nll,
+                    subject,
+                    model,
+                    &params.theta,
+                    &params.omega,
+                    &params.sigma.values,
+                    p,
+                    &mut rng,
+                    1,
+                    &mut scratch,
+                    None,
+                    kap,
+                );
+                nll = l;
+                if k >= burn {
+                    acc += a;
+                }
+            }
+            if k >= burn {
+                for j in 0..n_eta {
+                    s1[j] += eta[j];
+                    s2[j] += eta[j] * eta[j];
+                }
+            }
+        }
+        let nf = n as f64;
+        let m: Vec<f64> = s1.iter().map(|v| v / nf).collect();
+        let v: Vec<f64> = s2.iter().zip(&m).map(|(q, mm)| q / nf - mm * mm).collect();
+        (m, v, acc as f64 / nf)
+    };
+    let (m_r, v_r, _) = chain(None);
+    let broad = GaussianProposal::from_covariance(
+        m_r.iter().zip(&v_r).map(|(m, v)| m + v.sqrt()).collect(),
+        DMatrix::from_fn(n_eta, n_eta, |a, b| if a == b { 4.0 * v_r[a] } else { 0.0 }),
+    )
+    .unwrap();
+    // The reference: self-normalised importance sampling under the κ-aware objective.
+    let (m_o, v_o) = {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let mut z = vec![0.0; n_eta];
+        let mut x = vec![0.0; n_eta];
+        let (mut lw, mut xs) = (Vec::new(), Vec::new());
+        for _ in 0..200_000 {
+            for v in z.iter_mut() {
+                *v = rng.sample(StandardNormal);
+            }
+            broad.draw_into(&z, &mut x);
+            lw.push(-nll_at(&x, &mut pk) - broad.quad(&x));
+            xs.push(x.clone());
+        }
+        let mx = lw.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let w: Vec<f64> = lw.iter().map(|l| (l - mx).exp()).collect();
+        let sw: f64 = w.iter().sum();
+        let m: Vec<f64> = (0..n_eta)
+            .map(|j| xs.iter().zip(&w).map(|(x, w)| w * x[j]).sum::<f64>() / sw)
+            .collect();
+        let v: Vec<f64> = (0..n_eta)
+            .map(|j| {
+                xs.iter()
+                    .zip(&w)
+                    .map(|(x, w)| w * (x[j] - m[j]).powi(2))
+                    .sum::<f64>()
+                    / sw
+            })
+            .collect();
+        (m, v)
+    };
+    let (m, v, a) = chain(Some(&broad));
+    eprintln!("IOV mode 1B: acc {a:.3}, means {m:.4?}, reference {m_o:.4?}");
+    assert!(
+        a > 0.02,
+        "the kernel accepted {a:.4}, too rarely to be tested"
+    );
+    let mut worst_mean = 0.0f64;
+    let mut worst_var = 0.0f64;
+    for j in 0..n_eta {
+        assert!(m[j].is_finite() && v[j].is_finite());
+        worst_mean = worst_mean.max((m[j] - m_o[j]).abs() / v_o[j].sqrt());
+        worst_var = worst_var.max((v[j] / v_o[j] - 1.0).abs());
+    }
+    eprintln!("IOV worst |Δmean|/sd {worst_mean:.4}, worst |Δvar|/var {worst_var:.4}");
+    // Measured 0.009 SD and 3.6% (Linux x86_64, these seeds). Mutation, run: the kernel
+    // scoring the BSV-only objective (`kappas_opt = None`) gives 0.29 SD and 58%.
+    assert!(
+        worst_mean < 0.1,
+        "conditional means differ by {worst_mean:.3} SD"
+    );
+    assert!(
+        worst_var < 0.2,
+        "conditional variances differ by {:.1}%",
+        100.0 * worst_var
+    );
+}
+
+/// The modes run only where the M-step is SAEM's (#2612). On a TTE model, which keeps the
+/// derivative-free single-draw fallback, the default fit is bit-identical to one with both
+/// modes off; on warfarin, whose M-step is the closed forms, the modes run and move the
+/// fit. Both halves, so the gate is seen from each side.
+#[cfg(feature = "survival")]
+#[test]
+fn the_modes_run_only_where_the_mstep_is_saems() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let fit_with = |m: &str, d: &str, modes: bool| -> Vec<u64> {
+        let prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        let mut opts = prep.parsed.fit_options.clone();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 20;
+        opts.saem_n_convergence = 20;
+        opts.saem_seed = Some(2612);
+        opts.run_covariance_step = false;
+        if !modes {
+            opts.saem_n_prior_proposals = 0;
+            opts.saem_n_conditional_proposals = 0;
+        }
+        let r = crate::api::fit(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.parsed.model.default_params,
+            &opts,
+        )
+        .expect("SAEM runs");
+        r.theta
+            .iter()
+            .chain(r.omega.iter())
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let (tte, tte_data) = ("examples/tte_exponential.ferx", "data/tte_exponential.csv");
+    assert_eq!(
+        fit_with(tte, tte_data, true),
+        fit_with(tte, tte_data, false),
+        "the modes ran on a model whose M-step is the derivative-free fallback"
+    );
+    let (warf, warf_data) = ("examples/warfarin_saem.ferx", "data/warfarin.csv");
+    assert_ne!(
+        fit_with(warf, warf_data, true),
+        fit_with(warf, warf_data, false),
+        "the modes did not run on a model whose M-step is SAEM's"
+    );
 }

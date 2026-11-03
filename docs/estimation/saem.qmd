@@ -80,14 +80,23 @@ is a Metropolis–Hastings kernel with the ratio
 $\pi(\eta^*)\,q(\eta) / (\pi(\eta)\,q(\eta^*))$, so a poor proposal costs acceptance,
 never validity. Mode 1B's proposal adapts, but by $O(1/k)$ at the $k$-th draw, which is
 the diminishing adaptation that keeps an adaptive chain's target (Roberts & Rosenthal
-2007). Both modes are BSV-only: an IOV subject's η conditional also reads its κ, and a
-mixture subject's its drawn class, so those keep the random-walk kernels alone.
+2007). Under IOV both modes propose the η block with the subject's κ held fixed, the
+conditional the random walk scores, and the κ keep their own kernel. A mixture subject's
+Ω and σ follow its drawn class, so a mixture keeps the random-walk kernels alone.
+
+The modes run only where the M-step is SAEM's: the closed forms, plus the [score
+M-step](#saem-mstep-score) for what has no sufficient statistic. Where the derivative-free
+single-draw fallback moves a parameter instead (a TTE or M3 model, for example), better
+mixing *raises* that rule's Jensen bias, and the modes measured worse there: on
+`examples/tte_exponential.ferx` the importance-sampled −2 log L over twelve seeds went
+from 166.720 ± 0.026 to 166.844 ± 0.046 with them. Such a model keeps the random walk.
 
 Validated in `saem_independence_tests.rs`: on warfarin subjects, a chain of mode 1B
 composed with the random walk matches the conditional mean and variance of every η to
 0.029 SD and 1.8% of a self-normalised importance-sampling reference of 200 000 iid
 draws. The random walk alone, at a step of 0.5, is 0.42 SD off on one η over the same
-run: it mixes too slowly to be the reference.
+run: it mixes too slowly to be the reference. On a `warfarin_iov` subject with κ fixed at non-zero values
+the same check under the κ-aware objective gives 0.009 SD and 3.6%.
 
 The defaults and their measured cost are in [Choosing the E-step kernels](#saem-kernel-defaults).
 
@@ -414,8 +423,9 @@ whole table):
 | `pk1` | 5219.606 ± 0.014 | 5219.583 ± 0.007 | 0.97× |
 | `pk2_big` (9 seeds) | −3501.2 ± 3.3 | −3505.7 ± 1.2 | 1.13× |
 
-A model outside its scope (IOV, a mixture, M3, a TTE endpoint, `block_sigma`, a
-`[covariate_nn]` θ, a residual magnitude) keeps the derivative-free fallback, `mstep_solver
+Under IOV the complete data are $(\eta, \kappa)$, and the score and information are the
+frozen-$(\eta, \kappa)$ ones. A model outside its scope (a mixture, M3, a TTE endpoint,
+`block_sigma`, a `[covariate_nn]` θ, a residual magnitude) keeps the derivative-free fallback, `mstep_solver
 = bobyqa`, and the fit says so in its warnings. That rule re-maximises the frozen-η
 objective at the single current draw with BOBYQA and adopts the maximiser, which carries
 the Jensen bias of [Averaging a maximiser is not maximising the

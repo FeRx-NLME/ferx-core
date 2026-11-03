@@ -316,6 +316,7 @@ fn run_score_sa(
                 model,
                 population,
                 d,
+                None,
                 &mut lt,
                 &mut ls,
                 &p.theta_lower,
@@ -473,6 +474,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &model,
         &population,
         &draws[0],
+        None,
         &mut lt,
         &mut ls,
         &p.theta_lower,
@@ -499,6 +501,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &model,
         &population,
         &draws[1],
+        None,
         &mut lt_b,
         &mut ls_b,
         &p.theta_lower,
@@ -518,6 +521,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &model,
         &population,
         &draws[1],
+        None,
         &mut lt_c,
         &mut ls_c,
         &p.theta_lower,
@@ -576,14 +580,16 @@ fn score_sa_leaves_a_pinned_coordinate_alone() {
 #[test]
 fn numerical_mstep_scope_gap_admits_a_plain_gaussian_model() {
     let model = no_eta_theta_model();
-    assert_eq!(numerical_mstep_scope_gap(&model, 0, false), None);
+    assert_eq!(numerical_mstep_scope_gap(&model, false), None);
 }
 
+/// A mixture is refused; IOV is in scope since #2612 (the frozen-(η, κ) score and
+/// information, `obs_nll_subject_grad_fisher_iov`).
 #[test]
-fn numerical_mstep_scope_gap_refuses_iov_and_mixtures() {
+fn numerical_mstep_scope_gap_refuses_mixtures_and_admits_iov() {
     let model = no_eta_theta_model();
-    assert!(numerical_mstep_scope_gap(&model, 2, false).is_some());
-    assert!(numerical_mstep_scope_gap(&model, 0, true).is_some());
+    assert!(numerical_mstep_scope_gap(&model, true).is_some());
+    assert_eq!(numerical_mstep_scope_gap(&model, false), None);
 }
 
 #[test]
@@ -614,7 +620,7 @@ fn numerical_mstep_scope_gap_refuses_a_correlated_residual() {
 ",
     )
     .expect("block_sigma fixture parses");
-    assert!(numerical_mstep_scope_gap(&model, 0, false).is_some());
+    assert!(numerical_mstep_scope_gap(&model, false).is_some());
 }
 
 #[test]
@@ -639,7 +645,7 @@ fn numerical_mstep_scope_gap_refuses_a_residual_magnitude() {
 ",
     )
     .expect("magnitude fixture parses");
-    assert!(numerical_mstep_scope_gap(&model, 0, false).is_some());
+    assert!(numerical_mstep_scope_gap(&model, false).is_some());
 }
 
 /// #1421: a FREM model is in scope — its covariate rows' score and information
@@ -672,7 +678,7 @@ fn numerical_mstep_scope_gap_admits_a_frem_model() {
     )
     .expect("FREM fixture parses");
     assert!(model.frem_config.is_some(), "the fixture must be FREM");
-    assert_eq!(numerical_mstep_scope_gap(&model, 0, false), None);
+    assert_eq!(numerical_mstep_scope_gap(&model, false), None);
 }
 
 // ── stored-draw re-centring ────────────────────────────────────────────────
@@ -809,6 +815,7 @@ fn every_failure_route_is_counted() {
         &model,
         &population,
         &draws[0],
+        None,
         &mut lt,
         &mut ls,
         &p.theta_lower,
@@ -841,6 +848,7 @@ fn every_failure_route_is_counted() {
         &model,
         &population,
         &draws[1],
+        None,
         &mut lt2,
         &mut ls2,
         &p.theta_lower,
@@ -865,6 +873,7 @@ fn every_failure_route_is_counted() {
         &model,
         &population,
         &draws[0],
+        None,
         &mut lt3,
         &mut ls3,
         &q.theta_lower,
@@ -1056,6 +1065,7 @@ fn one_step(gamma: f64, gamma_mstep: f64) -> (Vec<f64>, Vec<f64>) {
         &model,
         &population,
         &draws[0],
+        None,
         &mut lt,
         &mut ls,
         &p.theta_lower,

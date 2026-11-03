@@ -2973,3 +2973,71 @@ fn the_exact_theta_score_is_the_central_difference_of_the_production_objective()
         );
     }
 }
+
+/// The IOV score's expected information (`obs_nll_subject_grad_fisher_iov`, #2612) is the
+/// BSV one where the two objectives coincide: on a model without IOV (no occasions, no κ)
+/// the IOV path's predictions, variances and exact θ rows are the BSV path's, so the score
+/// and the information from the two must agree to rounding. Both take the exact rows here;
+/// on an IOV model the BSV path's would decline to forward differences, so that is not the
+/// comparison. The IOV path's stacked `[η | κ]` rows are pinned by
+/// `the_forward_theta_jacobian_is_the_reverse_one`.
+#[test]
+fn the_iov_information_without_occasions_is_the_bsv_one() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let prep = crate::api::prepare_run(
+        &format!("{root}/examples/warfarin.ferx"),
+        Some(&format!("{root}/data/warfarin.csv")),
+    )
+    .unwrap();
+    let model = &prep.parsed.model;
+    assert_eq!(model.n_kappa, 0, "premise: no IOV");
+    let p = &model.default_params;
+    let n_theta = p.theta.len();
+    let n_sigma = p.sigma.values.len();
+    let n = n_theta + n_sigma;
+    let mask = vec![true; n_theta];
+    let (lower, upper) = (vec![-1e9; n], vec![1e9; n]);
+    let mut worst = 0.0f64;
+    for s in prep.population.subjects.iter().take(4) {
+        let eta: Vec<f64> = (0..model.n_eta).map(|k| 0.1 - 0.07 * k as f64).collect();
+        let mut sc = EventPkParams::default();
+        let (_, g_iov, f_iov) = obs_nll_subject_grad_fisher_iov(
+            model,
+            s,
+            &p.theta,
+            &p.sigma.values,
+            &eta,
+            &[],
+            &mask,
+            &lower,
+            &upper,
+            n_theta,
+            n_sigma,
+            &mut sc,
+        );
+        let (_, g_bsv, f_bsv) = obs_nll_subject_grad_fisher(
+            model,
+            s,
+            &p.theta,
+            &p.sigma.values,
+            &eta,
+            &mask,
+            &lower,
+            &upper,
+            n_theta,
+            n_sigma,
+            &mut sc,
+        );
+        let (f_iov, f_bsv) = (
+            f_iov.expect("IOV information"),
+            f_bsv.expect("BSV information"),
+        );
+        for (a, b) in g_iov.iter().zip(&g_bsv).chain(f_iov.iter().zip(&f_bsv)) {
+            assert!(a.is_finite() && b.is_finite(), "{a} vs {b}");
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+        }
+    }
+    eprintln!("IOV vs BSV score and information without occasions: {worst:.3e}");
+    // Measured 1.3e-14 (Linux x86_64): the same quantities by two paths, in rounding.
+    assert!(worst < 1e-12, "IOV vs BSV without occasions: {worst:.3e}");
+}

@@ -27,6 +27,63 @@ use crate::stats::likelihood::{
 };
 use crate::types::*;
 
+/// The expected (Fisher) information of the frozen-η Gaussian objective in the packed
+/// coordinates, row-major `n × n`, from its per-observation parts (#1458):
+///
+/// `I_ab = Σ_j [ (∂f_j/∂a)(∂f_j/∂b)/V_j + ½ (∂V_j/∂a)(∂V_j/∂b)/V_j² ]`, with
+/// `∂V_j/∂θ_a = (dV_j/df_j)·(∂f_j/∂θ_a)` and `∂V_j/∂(log σ_k)` the analytic
+/// `dvar_dlogsigma`. `df_packed[a]` is θ coordinate `a`'s packed `∂f/∂θ_a` row and
+/// `dv_dlogsigma[a]` σ coordinate `a`'s `∂V/∂(log σ)` row; an empty row is a pinned
+/// coordinate, which keeps an all-zero row and column (the caller's solve drops it).
+/// Symmetric and PSD by construction. One implementation for the BSV and the IOV score.
+fn expected_information(
+    n: usize,
+    n_theta: usize,
+    df_packed: &[Vec<f64>],
+    dv_df_obs: &[f64],
+    dv_dlogsigma: &[Vec<f64>],
+    variances: &[f64],
+) -> Vec<f64> {
+    let n_obs = variances.len();
+    let mut fisher = vec![0.0f64; n * n];
+    // ∂V_j/∂x_a for every coordinate, so the σ and θ blocks assemble alike.
+    let dv: Vec<Vec<f64>> = (0..n)
+        .map(|a| {
+            if a < n_theta {
+                if df_packed[a].is_empty() {
+                    Vec::new()
+                } else {
+                    (0..n_obs).map(|j| dv_df_obs[j] * df_packed[a][j]).collect()
+                }
+            } else {
+                dv_dlogsigma[a].clone()
+            }
+        })
+        .collect();
+    for a in 0..n {
+        let fa = df_packed.get(a).map(|v| v.as_slice()).unwrap_or(&[]);
+        for b in a..n {
+            let fb = df_packed.get(b).map(|v| v.as_slice()).unwrap_or(&[]);
+            let mut acc = 0.0f64;
+            for j in 0..n_obs {
+                let v = variances[j];
+                let mean_term = match (fa.get(j), fb.get(j)) {
+                    (Some(&x), Some(&y)) => x * y / v,
+                    _ => 0.0,
+                };
+                let var_term = match (dv[a].get(j), dv[b].get(j)) {
+                    (Some(&x), Some(&y)) => 0.5 * x * y / (v * v),
+                    _ => 0.0,
+                };
+                acc += mean_term + var_term;
+            }
+            fisher[a * n + b] = acc;
+            fisher[b * n + a] = acc;
+        }
+    }
+    fisher
+}
+
 #[cfg(test)]
 #[path = "fixed_eta_gradient_tests.rs"]
 mod tests;
@@ -360,7 +417,7 @@ thread_local! {
 /// across all occasions' observations).  Theta gradient uses forward-FD of
 /// per-occasion predictions, chain-rule'd through the per-observation obs_nll.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn obs_nll_subject_grad_iov(
+fn obs_nll_subject_grad_iov_impl(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
@@ -373,7 +430,8 @@ pub(crate) fn obs_nll_subject_grad_iov(
     n_theta: usize,
     n_sigma: usize,
     pk_scratch: &mut crate::pk::EventPkParams,
-) -> (f64, Vec<f64>) {
+    want_fisher: bool,
+) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
     // IOV + block_sigma is fitted by FOCE/FOCEI only (#979); the estimators that reach
     // this path are refused it up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
@@ -413,7 +471,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
                     sigma_values[k] * d_sigma[k]
                 };
             }
-            return (nll_base, grad);
+            return (nll_base, grad, None);
         }
         let h = 1e-5;
         let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
@@ -467,7 +525,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
                 &mut grad,
             );
         }
-        return (nll_base, grad);
+        return (nll_base, grad, None);
     }
 
     // Non-M3 path: continuous per-occasion-aware base predictions (issue #104).
@@ -498,6 +556,8 @@ pub(crate) fn obs_nll_subject_grad_iov(
     let mut variances = vec![0.0f64; n_obs];
     let mut d_nll_d_f = vec![0.0f64; n_obs];
     let mut obs_var_scale = vec![1.0f64; n_obs];
+    // `dV_j/df_j` per observation, kept for the information only.
+    let mut dv_df_obs = vec![0.0f64; if want_fisher { n_obs } else { 0 }];
 
     for j in 0..n_obs {
         let cmt = err_keys[j];
@@ -523,6 +583,9 @@ pub(crate) fn obs_nll_subject_grad_iov(
             (None, None) => model.error_spec.dvar_df(cmt, f, sigma_values) * s,
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
+        if want_fisher {
+            dv_df_obs[j] = dv_df;
+        }
     }
 
     // #2440: predictions are no longer floored, so a non-finite prediction makes a
@@ -530,7 +593,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
     // returns, with the zero gradient its full-FD twin gives (`1e20 − 1e20`): a flat,
     // maximally bad subject, never a NaN that poisons the estimator.
     if !nll_base.is_finite() {
-        return (SUBJECT_SENTINEL_NLL, vec![0.0; n]);
+        return (SUBJECT_SENTINEL_NLL, vec![0.0; n], None);
     }
 
     let mut grad = vec![0.0f64; n];
@@ -541,6 +604,11 @@ pub(crate) fn obs_nll_subject_grad_iov(
     // are lifted out of this loop — see `nn_theta_gradient`.
     let h_fd = 1e-5;
     let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
+    // The information's closed form needs per-observation `∂f/∂θ` and a variance that θ
+    // reaches only through the prediction: not under a `[covariate_nn]` plan or a
+    // residual magnitude (as for the BSV score).
+    let fisher_ok = want_fisher && nn_plan.is_none() && ruv_mult.is_none();
+    let mut df_packed: Vec<Vec<f64>> = vec![Vec::new(); if fisher_ok { n } else { 0 }];
     let mut signed_theta_deriv = |i: usize, sign: f64| -> f64 {
         let delta = sign * theta_fd_step(model, h_fd, theta, i);
         let mut theta_p = theta.to_vec();
@@ -591,10 +659,29 @@ pub(crate) fn obs_nll_subject_grad_iov(
         lower,
         upper,
         &mut grad[..n_theta],
-        None,
+        fisher_ok.then(|| &mut df_packed[..n_theta]),
     );
     for i in 0..n_theta {
         if exact || lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+            continue;
+        }
+        if fisher_ok {
+            // The exact rows declined: the same forward difference, kept per observation,
+            // gives both the gradient and the information's row.
+            let delta = theta_fd_step(model, h_fd, theta, i);
+            let mut theta_p = theta.to_vec();
+            theta_p[i] += delta;
+            let preds_p = crate::pk::predict_iov(model, subject, &theta_p, eta, kappas);
+            let pack = if theta_packs_log_mask[i] {
+                theta[i]
+            } else {
+                1.0
+            };
+            let row: Vec<f64> = (0..n_obs)
+                .map(|j| pack * (preds_p[j] - all_preds_base[j]) / delta)
+                .collect();
+            grad[i] = (0..n_obs).map(|j| d_nll_d_f[j] * row[j]).sum();
+            df_packed[i] = row;
             continue;
         }
         let d_obs_nll = signed_theta_deriv(i, 1.0);
@@ -615,39 +702,125 @@ pub(crate) fn obs_nll_subject_grad_iov(
         );
     }
 
+    // `∂V_j/∂(log σ_k)` per free σ coordinate, kept for the information only.
+    let mut dv_dlogsigma: Vec<Vec<f64>> = vec![Vec::new(); if fisher_ok { n } else { 0 }];
     // Sigma gradient: analytical — same formula as non-IOV, summed over all obs.
     for k in 0..n_sigma {
         let i = n_theta + k;
         if lower[i] == upper[i] {
             continue;
         }
+        let ratio_at = |j: usize| -> f64 {
+            let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+            obs_dvar_dlogsigma(
+                model,
+                err_keys[j],
+                k,
+                all_preds_base[j],
+                sigma_values,
+                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                frem_vj,
+            ) * obs_var_scale[j]
+        };
+        if fisher_ok {
+            dv_dlogsigma[i] = (0..n_obs).map(ratio_at).collect();
+        }
+        // d(v_j)/d(log sigma_k) is zero unless sigma_k enters obs j's endpoint, so per-CMT
+        // each sigma picks up only its own endpoint's observations; the #484/#1029
+        // magnitude rides slot k's loading (the `_scaled` pairing V/∂V∂f take above).
         let g: f64 = (0..n_obs)
             .map(|j| {
-                let f = all_preds_base[j];
                 let v = variances[j];
                 let resid = residuals[j];
-                // d(v_j)/d(log sigma_k); zero unless sigma_k enters obs j's
-                // endpoint, so per-CMT each sigma picks up only its own
-                // endpoint's observations. The #484/#1029 magnitude rides slot
-                // k's loading, so it scales this derivative by m_k² — the same
-                // `_scaled` pairing V/∂V∂f already take above.
-                let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
-                let ratio = obs_dvar_dlogsigma(
-                    model,
-                    err_keys[j],
-                    k,
-                    f,
-                    sigma_values,
-                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                    frem_vj,
-                ) * obs_var_scale[j];
-                0.5 * ratio * (1.0 / v - resid * resid / (v * v))
+                0.5 * ratio_at(j) * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
         grad[i] = g;
     }
 
-    (nll_base, grad)
+    let fisher = fisher_ok.then(|| {
+        expected_information(
+            n,
+            n_theta,
+            &df_packed,
+            &dv_df_obs,
+            &dv_dlogsigma,
+            &variances,
+        )
+    });
+    (nll_base, grad, fisher)
+}
+
+/// Gradient of the IOV observation NLL w.r.t. the SAEM packed vector
+/// `[log_theta | log_sigma]` for one subject with ETAs and kappas fixed
+/// ([`obs_nll_subject_grad_iov_impl`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn obs_nll_subject_grad_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    kappas: &[Vec<f64>],
+    theta_packs_log_mask: &[bool],
+    lower: &[f64],
+    upper: &[f64],
+    n_theta: usize,
+    n_sigma: usize,
+    pk_scratch: &mut crate::pk::EventPkParams,
+) -> (f64, Vec<f64>) {
+    let (nll, grad, _) = obs_nll_subject_grad_iov_impl(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        eta,
+        kappas,
+        theta_packs_log_mask,
+        lower,
+        upper,
+        n_theta,
+        n_sigma,
+        pk_scratch,
+        false,
+    );
+    (nll, grad)
+}
+
+/// [`obs_nll_subject_grad_iov`] plus the expected information of the same frozen-(η, κ)
+/// objective ([`expected_information`]), for the score-SA M-step on an IOV model (#2612).
+/// `None` for the information where it has no closed form: M3 or a TTE endpoint (the
+/// whole-NLL path), a `[covariate_nn]` θ, a residual magnitude.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn obs_nll_subject_grad_fisher_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    kappas: &[Vec<f64>],
+    theta_packs_log_mask: &[bool],
+    lower: &[f64],
+    upper: &[f64],
+    n_theta: usize,
+    n_sigma: usize,
+    pk_scratch: &mut crate::pk::EventPkParams,
+) -> (f64, Vec<f64>, Option<Vec<f64>>) {
+    obs_nll_subject_grad_iov_impl(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        eta,
+        kappas,
+        theta_packs_log_mask,
+        lower,
+        upper,
+        n_theta,
+        n_sigma,
+        pk_scratch,
+        true,
+    )
 }
 
 /// Gradient of `obs_nll` w.r.t. the SAEM packed parameter vector
@@ -1232,47 +1405,13 @@ fn obs_nll_subject_grad_impl(
         return (nll_base, grad, None);
     }
 
-    // I_ab = Σ_j [ (∂f_j/∂a)(∂f_j/∂b)/V_j + ½ (∂V_j/∂a)(∂V_j/∂b)/V_j² ], with
-    // ∂V_j/∂θ_a = (dV_j/df_j)·(∂f_j/∂θ_a) and ∂V_j/∂(log σ_k) the analytic
-    // `dvar_dlogsigma` above. Symmetric and PSD by construction; a pinned
-    // coordinate keeps an all-zero row and column, which is what the caller's
-    // linear solve drops.
-    let mut fisher = vec![0.0f64; n * n];
-    // ∂V_j/∂x_a for every coordinate, so the σ and θ blocks assemble alike.
-    let dv: Vec<Vec<f64>> = (0..n)
-        .map(|a| {
-            if a < n_theta {
-                if df_packed[a].is_empty() {
-                    Vec::new()
-                } else {
-                    (0..n_obs).map(|j| dv_df_obs[j] * df_packed[a][j]).collect()
-                }
-            } else {
-                dv_dlogsigma[a].clone()
-            }
-        })
-        .collect();
-    for a in 0..n {
-        let fa = df_packed.get(a).map(|v| v.as_slice()).unwrap_or(&[]);
-        for b in a..n {
-            let fb = df_packed.get(b).map(|v| v.as_slice()).unwrap_or(&[]);
-            let mut acc = 0.0f64;
-            for j in 0..n_obs {
-                let v = variances[j];
-                let mean_term = match (fa.get(j), fb.get(j)) {
-                    (Some(&x), Some(&y)) => x * y / v,
-                    _ => 0.0,
-                };
-                let var_term = match (dv[a].get(j), dv[b].get(j)) {
-                    (Some(&x), Some(&y)) => 0.5 * x * y / (v * v),
-                    _ => 0.0,
-                };
-                acc += mean_term + var_term;
-            }
-            fisher[a * n + b] = acc;
-            fisher[b * n + a] = acc;
-        }
-    }
-
+    let fisher = expected_information(
+        n,
+        n_theta,
+        &df_packed,
+        &dv_df_obs,
+        &dv_dlogsigma,
+        &variances,
+    );
     (nll_base, grad, Some(fisher))
 }

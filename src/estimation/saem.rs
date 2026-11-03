@@ -987,14 +987,8 @@ fn sigma_log_se(
 /// the covariate σ — which the per-observation σ derivative now knows
 /// (`fixed_eta_gradient::obs_dvar_dlogsigma`). It was listed here while that
 /// derivative still read the PK error model on those rows.
-fn numerical_mstep_scope_gap(
-    model: &CompiledModel,
-    n_kappa: usize,
-    is_mixture: bool,
-) -> Option<&'static str> {
-    if n_kappa > 0 {
-        return Some("the model has IOV");
-    }
+fn numerical_mstep_scope_gap(model: &CompiledModel, is_mixture: bool) -> Option<&'static str> {
+    // IOV is in scope since #2612: the score and information are the frozen-(η, κ) ones.
     if is_mixture {
         return Some("the model is a mixture");
     }
@@ -1435,6 +1429,9 @@ impl MstepScoreSa {
         model: &CompiledModel,
         population: &Population,
         etas: &[Vec<f64>],
+        // Each subject's κ draws under IOV (`None` without): the complete data then holds
+        // `(η, κ)`, and the score and information are the frozen-(η, κ) ones (#2612).
+        kappas: Option<&[Vec<Vec<f64>>]>,
         log_theta: &mut [f64],
         log_sigma: &mut [f64],
         theta_lower: &[f64],
@@ -1481,21 +1478,37 @@ impl MstepScoreSa {
             .par_iter()
             .zip(etas.par_iter())
             .enumerate()
-            .map_init(EventPkParams::default, |scratch, (i, (subject, eta))| {
-                crate::estimation::fixed_eta_gradient::obs_nll_subject_grad_fisher_with_schedule(
+            .map_init(EventPkParams::default, |scratch, (i, (subject, eta))| match kappas {
+                Some(k) => crate::estimation::fixed_eta_gradient::obs_nll_subject_grad_fisher_iov(
                     model,
                     subject,
                     &theta_nat,
                     &sigma_nat,
                     eta,
+                    &k[i],
                     theta_packs_log_mask,
                     &lower,
                     &upper,
                     n_theta,
                     n_sigma,
                     scratch,
-                    schedules.get(i).and_then(Option::as_ref),
-                )
+                ),
+                None => {
+                    crate::estimation::fixed_eta_gradient::obs_nll_subject_grad_fisher_with_schedule(
+                        model,
+                        subject,
+                        &theta_nat,
+                        &sigma_nat,
+                        eta,
+                        theta_packs_log_mask,
+                        &lower,
+                        &upper,
+                        n_theta,
+                        n_sigma,
+                        scratch,
+                        schedules.get(i).and_then(Option::as_ref),
+                    )
+                }
             })
             .collect();
 
@@ -1562,7 +1575,10 @@ impl MstepScoreSa {
         let nll_at = |lt: &[f64], ls: &[f64]| -> f64 {
             let th = unpack(lt);
             let sg: Vec<f64> = ls.iter().map(|&v| v.exp()).collect();
-            obs_nll_sum(model, population, &th, &sg, etas, schedules)
+            match kappas {
+                Some(k) => obs_nll_sum_iov(model, population, &th, &sg, etas, k, schedules),
+                None => obs_nll_sum(model, population, &th, &sg, etas, schedules),
+            }
         };
         let mut scale = 1.0f64;
         for _ in 0..=SCORE_SA_MAX_BACKTRACK {
@@ -4905,7 +4921,7 @@ pub fn run_saem(
     // function of that draw, so its running average carries a Jensen-type bias.
     // Both need the plain Gaussian scope below; a model outside it keeps the
     // historical solver and is told so by name.
-    let numerical_mstep_scope_gap = numerical_mstep_scope_gap(model, n_kappa, saem_mix.is_some());
+    let numerical_mstep_scope_gap = numerical_mstep_scope_gap(model, saem_mix.is_some());
     // #1464: where the σ exploration cap may be lifted per component.
     let sigma_cap_release_gap = sigma_cap_release_scope_gap(model, numerical_mstep_scope_gap);
     let sigma_free: Vec<bool> = (0..n_sigma)
@@ -4986,10 +5002,20 @@ pub fn run_saem(
     // established rebuild-per-call behaviour.
     let schedules = saem_schedule_cache(model, population);
 
-    // NONMEM's independence modes 1 and 1B (`saem_independence`): BSV-only and
-    // non-mixture, where the η conditional the kernels score is `individual_nll_prepared`'s.
-    // Mode 1B proposes from each subject's draws accumulated over the iterations so far.
-    let independence_scope = n_kappa == 0 && model.mixture.is_none();
+    // NONMEM's independence modes 1 and 1B (`saem_independence`), on the η block: the
+    // conditional the random walks score, with κ held fixed under IOV. Not on a mixture,
+    // where Ω and σ follow each subject's drawn class. Mode 1B proposes from each subject's
+    // draws accumulated over the iterations so far.
+    //
+    // And only where the M-step is SAEM's: the closed forms, plus `score_sa` for whatever
+    // has no sufficient statistic. Where the derivative-free single-draw fallback moves a
+    // parameter instead, better mixing *raises* its Jensen bias (#1458), and the modes
+    // measured worse there: on `examples/tte_exponential.ferx` (TTE, outside `score_sa`'s
+    // scope) the importance-sampled −2 log L over twelve seeds went from 166.720 ± 0.026 to
+    // 166.844 ± 0.046 with them (#2612). The numerical M-step runs exactly when the residual
+    // has no closed-form update (`scalar_residual_model` is `None`).
+    let independence_scope =
+        model.mixture.is_none() && (use_score_sa || scalar_residual_model.is_some());
     let mut cond_moments: Vec<independence::ConditionalMoments> = (0..n_subjects)
         .map(|_| independence::ConditionalMoments::new(n_eta))
         .collect();
@@ -5297,6 +5323,7 @@ pub fn run_saem(
                                     options.saem_n_prior_proposals,
                                     mh_scratch,
                                     schedules[i].as_ref(),
+                                    kappas_mh_opt,
                                 )
                                 .1;
                             }
@@ -5315,6 +5342,7 @@ pub fn run_saem(
                                         options.saem_n_conditional_proposals,
                                         mh_scratch,
                                         schedules[i].as_ref(),
+                                        kappas_mh_opt,
                                     )
                                     .1;
                                 }
@@ -6014,6 +6042,7 @@ pub fn run_saem(
                             model,
                             population,
                             &state.etas,
+                            (n_kappa > 0).then_some(state.kappas.as_slice()),
                             &mut log_theta,
                             &mut log_sigma,
                             &temp_theta_lower,
@@ -6168,6 +6197,7 @@ pub fn run_saem(
                             model,
                             population,
                             &state.etas,
+                            (n_kappa > 0).then_some(state.kappas.as_slice()),
                             &mut log_theta,
                             &mut log_sigma,
                             &log_theta_lower,

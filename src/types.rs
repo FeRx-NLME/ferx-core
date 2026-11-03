@@ -10151,9 +10151,10 @@ pub enum SaemMstepSolver {
     /// estimate; there is no Jensen term.
     ///
     /// **Restricted to the plain Gaussian residual scope** the expected information has a
-    /// closed form on: no IOV, no mixture, no M3, no TTE endpoint, no `block_sigma`
-    /// residual correlation, no `[covariate_nn]` θ, no residual magnitude. A model outside
-    /// it falls back to [`SaemMstepSolver::Bobyqa`] with a warning naming the reason.
+    /// closed form on: no mixture, no M3, no TTE endpoint, no `block_sigma` residual
+    /// correlation, no `[covariate_nn]` θ, no residual magnitude. Under IOV the complete data
+    /// are `(η, κ)` and the score and information are the frozen-(η, κ) ones (#2612). A model
+    /// outside it falls back to [`SaemMstepSolver::Bobyqa`] with a warning naming the reason.
     ///
     /// A θ with no ETA converges at the rate the SA step allows, which on a θ whose
     /// information the ETAs mostly absorb is slow: on the `covmuref_power` fixture forced

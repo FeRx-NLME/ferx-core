@@ -489,10 +489,13 @@ fn imp_recovers_the_additive_renal_gradient() {
     ignore = "slow + NONMEM-anchored numerical M-step (#1458): opt in with --features slow-tests"
 )]
 fn the_k_draw_mstep_estimator_also_recovers_the_allometric_exponent() {
+    // The K-draw objective is an option of the derivative-free arm (`score_sa`, the default
+    // since #2612, already averages every past draw and ignores it), so that arm is named.
     assert_mstep_arm_recovers_th_wt(
         "mstep_draws=3",
         FitOptions {
             saem_mstep_draws: 3,
+            saem_mstep_solver: SaemMstepSolver::Bobyqa,
             ..saem_opts()
         },
     );

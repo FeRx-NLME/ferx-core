@@ -7552,6 +7552,16 @@ fn the_forward_theta_jacobian_is_the_reverse_one() {
     fs.fremtype = vec![0, 0, 0, 100];
     fs.observations = vec![0.8, 0.6, 0.3, 75.0];
     cases.push(("FREM".into(), frem, vec![fs]));
+    {
+        // An IOV subject, its η stacked with non-zero κ as the IOV score passes them.
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_iov.ferx"),
+            Some(&format!("{root}/data/warfarin_iov.csv")),
+        )
+        .unwrap();
+        let subjects = prep.population.subjects.iter().take(2).cloned().collect();
+        cases.push(("warfarin_iov".into(), prep.parsed.model, subjects));
+    }
     let mut worst = 0.0f64;
     let mut n_rows = 0;
     let mut frem_rows = 0;
@@ -7560,7 +7570,15 @@ fn the_forward_theta_jacobian_is_the_reverse_one() {
         let n_theta = params.theta.len();
         let free: Vec<usize> = (0..n_theta.min(8)).collect();
         for s in subjects {
-            let eta: Vec<f64> = (0..model.n_eta).map(|k| 0.1 - 0.05 * k as f64).collect();
+            let mut eta: Vec<f64> = (0..model.n_eta).map(|k| 0.1 - 0.05 * k as f64).collect();
+            if model.n_kappa > 0 {
+                let n_occ = s
+                    .occasions
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                eta.extend((0..n_occ * model.n_kappa).map(|k| 0.12 - 0.03 * k as f64));
+            }
             let w = vec![1.0; s.observations.len()];
             let rev = fixed_eta_theta_adjoint(model, s, &params.theta, &eta, true, &w)
                 .unwrap_or_else(|| panic!("{m}: the tape serves"));
@@ -7583,7 +7601,7 @@ fn the_forward_theta_jacobian_is_the_reverse_one() {
         frem_rows > 0,
         "premise: a FREM pseudo-observation row was compared"
     );
-    // Measured 1.15e-15 over 67 rows (Linux x86_64): two AD modes, in rounding; 1e-12
-    // keeps three decades.
+    // Measured 1.7e-15 over 111 rows, the stacked IOV ones included (Linux x86_64): two
+    // AD modes, in rounding; 1e-12 keeps two and a half decades.
     assert!(worst < 1e-12, "forward vs reverse θ-Jacobian {worst:.3e}");
 }
