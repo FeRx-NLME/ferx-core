@@ -9472,17 +9472,63 @@ fn the_basin_probe_runs_on_a_geometric_schedule() {
 #[test]
 fn the_basin_probe_restarts_on_a_material_share_and_absorbs_a_handful() {
     use BasinProbeAction::{Absorb, Restart};
-    assert_eq!(basin_probe_action(Some(1), 10), Restart);
+    assert_eq!(basin_probe_action(Some(1), 10, false), Restart);
     for k in [19, 9, 3, 5, 4] {
-        assert_eq!(basin_probe_action(Some(k), 5937), Absorb, "{k} of 5937");
+        assert_eq!(
+            basin_probe_action(Some(k), 5937, false),
+            Absorb,
+            "{k} of 5937"
+        );
     }
-    assert_eq!(basin_probe_action(Some(49), 5000), Absorb);
-    assert_eq!(basin_probe_action(Some(50), 5000), Restart);
-    assert_eq!(basin_probe_action(Some(1), 99), Restart);
-    assert_eq!(basin_probe_action(Some(0), 99), Absorb);
-    assert_eq!(basin_probe_action(Some(0), 5937), Absorb);
-    assert_eq!(basin_probe_action(None, 5937), Restart);
-    assert_eq!(basin_probe_action(None, 10), Restart);
+    assert_eq!(basin_probe_action(Some(49), 5000, false), Absorb);
+    assert_eq!(basin_probe_action(Some(50), 5000, false), Restart);
+    assert_eq!(basin_probe_action(Some(1), 99, false), Restart);
+    assert_eq!(basin_probe_action(Some(0), 99, false), Absorb);
+    assert_eq!(basin_probe_action(Some(0), 5937, false), Absorb);
+    assert_eq!(basin_probe_action(None, 5937, false), Restart);
+    assert_eq!(basin_probe_action(None, 10, false), Restart);
+}
+
+/// A cold probe solve the EBE guard rejects is never absorbed (#2600 review r3): it would
+/// become the incumbent every later valid evaluation must beat. The case: 5,937 subjects,
+/// 4 switched (absorbed when the solve is valid), and a finite, lower cold objective with
+/// 1,000 unconverged subjects (17 %, over the default `max_unconverged_frac` of 10 %) — or one start
+/// rejected, which the guard rejects whatever the fraction.
+#[test]
+fn a_guard_rejected_cold_probe_solve_is_not_absorbed() {
+    use crate::estimation::inner_optimizer::InnerLoopStats;
+    use BasinProbeAction::{Absorb, Restart};
+    let n = 5937;
+    let frac = FitOptions::default().max_unconverged_frac;
+    let unconverged = InnerLoopStats {
+        n_unconverged: 1000,
+        ..Default::default()
+    };
+    let start_rejected = InnerLoopStats {
+        n_start_rejected: 1,
+        ..Default::default()
+    };
+    let clean = InnerLoopStats::default();
+    let cold = 66_533.28;
+    assert!(
+        ebe_guard_rejects(&unconverged, n, cold, frac),
+        "1000 of 5937 trips {frac}"
+    );
+    assert!(ebe_guard_rejects(&start_rejected, n, cold, frac));
+    assert!(!ebe_guard_rejects(&clean, n, cold, frac));
+    for stats in [&unconverged, &start_rejected] {
+        let rejected = ebe_guard_rejects(stats, n, cold, frac);
+        assert_eq!(
+            basin_probe_action(Some(4), n, rejected),
+            Restart,
+            "{stats:?}"
+        );
+    }
+    // The straddle: the same count, a valid solve, absorbs.
+    assert_eq!(
+        basin_probe_action(Some(4), n, ebe_guard_rejects(&clean, n, cold, frac)),
+        Absorb
+    );
 }
 
 /// Inside a #2462 verification leg the basin probe scores against the leg's own incumbent,

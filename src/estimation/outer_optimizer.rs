@@ -3309,9 +3309,23 @@ const BASIN_PROBE_RESTART_SHARE: f64 = 0.01;
 ///
 /// `switched = None` — the count is not available (AGQ, whose per-subject term is not the
 /// one the count scores, or no held state at the incumbent) — restarts, as before #2600.
-fn basin_probe_action(switched: Option<usize>, n_subjects: usize) -> BasinProbeAction {
+///
+/// `cold_guard_rejected` — the cold solve fails the EBE guard an ordinary evaluation must
+/// pass ([`ebe_guard_rejects`]: too many unconverged subjects, or a start rejected) — also
+/// restarts, as before #2600. Absorbing makes the cold solve the incumbent in every tracker
+/// ([`absorb_cold_incumbent`]), and an objective the optimizer would have rejected must not
+/// become the bar every later valid evaluation has to beat, nor the EBE state the final
+/// restore scores. The restart's own first inner solve is guarded as usual.
+fn basin_probe_action(
+    switched: Option<usize>,
+    n_subjects: usize,
+    cold_guard_rejected: bool,
+) -> BasinProbeAction {
     match switched {
-        Some(k) if (k as f64) < basin_probe_restart_share() * n_subjects as f64 => {
+        Some(k)
+            if !cold_guard_rejected
+                && (k as f64) < basin_probe_restart_share() * n_subjects as f64 =>
+        {
             BasinProbeAction::Absorb
         }
         _ => BasinProbeAction::Restart,
@@ -6463,7 +6477,7 @@ fn optimize_nlopt_attempt(
                     let x_inc: Vec<f64> = xs_inc.iter().zip(&scale).map(|(v, s)| v * s).collect();
                     let p = unpack_params(&x_inc, init_params);
                     let mu_k = compute_mu_k(model, &p.theta, probe_options.mu_referencing);
-                    let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
+                    let (ehs, hms, cold_stats, kappas) = run_inner_loop_warm_seeded(
                         model,
                         population,
                         &p,
@@ -6506,7 +6520,18 @@ fn optimize_nlopt_attempt(
                         };
                         #[cfg(test)]
                         BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().push((gap, switched)));
-                        match basin_probe_action(switched, population.subjects.len()) {
+                        // The same EBE guard an ordinary evaluation passes (#2600 review r3).
+                        let cold_guard_rejected = ebe_guard_rejects(
+                            &cold_stats,
+                            population.subjects.len(),
+                            cold,
+                            options.max_unconverged_frac,
+                        );
+                        match basin_probe_action(
+                            switched,
+                            population.subjects.len(),
+                            cold_guard_rejected,
+                        ) {
                             BasinProbeAction::Restart => {
                                 state.stagnation_stopped = true;
                                 basin_probe_stopped = true;
