@@ -3916,6 +3916,90 @@ fn test_mstep_solver_and_draws_round_trip_and_validate() {
     assert_eq!(opts.saem_mstep_draws, 1);
 }
 
+/// The f-SAEM keys (#1449) round-trip, default to the random walk, reject what
+/// they cannot act on without clobbering the last good value, and warn under a
+/// non-SAEM method.
+#[test]
+fn test_saem_imh_options_round_trip_validate_and_warn() {
+    use crate::types::SaemKernel;
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.saem_kernel, SaemKernel::RandomWalk);
+    assert_eq!(
+        (opts.saem_imh_proposals, opts.saem_imh_refresh),
+        (2, 5),
+        "defaults moved"
+    );
+    assert_eq!(opts.saem_imh_defensive, 0.05);
+    assert_eq!(opts.saem_imh_min_obs_per_eta, 2.0);
+
+    assert_eq!(apply_fit_option(&mut opts, "saem_kernel", "IMH"), Ok(true));
+    assert_eq!(opts.saem_kernel, SaemKernel::Imh);
+    assert_eq!(apply_fit_option(&mut opts, "saem_kernel", "rw"), Ok(true));
+    assert_eq!(opts.saem_kernel, SaemKernel::RandomWalk);
+    let err = apply_fit_option(&mut opts, "saem_kernel", "hmc").expect_err("unknown kernel");
+    assert!(err.contains("rw/imh") && err.contains("hmc"), "got: {err}");
+
+    // Each message is asserted whole: every clause is something the user reads
+    // (what the key is, the bound, the value they wrote), so deleting any of them
+    // must redden this.
+    for (key, good, bad, msg) in [
+        (
+            "saem_imh_proposals",
+            "3",
+            "0",
+            "fit option `saem_imh_proposals` must be at least 1 — it is the number of \
+             independent-MH proposals per subject per SAEM iteration, got 0",
+        ),
+        (
+            "saem_imh_refresh",
+            "10",
+            "0",
+            "fit option `saem_imh_refresh` must be at least 1 — it is the number of SAEM \
+             iterations between rebuilds of a subject's IMH proposal, got 0",
+        ),
+        (
+            "saem_imh_defensive",
+            "0.1",
+            "0.6",
+            "fit option `saem_imh_defensive` must be in [0, 0.5] — it is the weight of the \
+             prior component mixed into the IMH proposal, got 0.6",
+        ),
+        (
+            "saem_imh_min_obs_per_eta",
+            "0",
+            "-1",
+            "fit option `saem_imh_min_obs_per_eta` must be a finite value >= 0 (0 disables \
+             the information gate), got -1",
+        ),
+    ] {
+        assert_eq!(apply_fit_option(&mut opts, key, good), Ok(true), "{key}");
+        let err = apply_fit_option(&mut opts, key, bad).expect_err(key);
+        assert_eq!(err, msg, "{key}");
+    }
+    assert_eq!(
+        (opts.saem_imh_proposals, opts.saem_imh_refresh),
+        (3, 10),
+        "a rejected value clobbered the last good one"
+    );
+    assert_eq!(opts.saem_imh_defensive, 0.1);
+    assert_eq!(opts.saem_imh_min_obs_per_eta, 0.0);
+    assert!(apply_fit_option(&mut opts, "saem_imh_defensive", "nan").is_err());
+
+    let focei = parse_fit_options(&[
+        "method = focei".to_string(),
+        "saem_kernel = imh".to_string(),
+        "saem_imh_refresh = 3".to_string(),
+    ])
+    .unwrap();
+    let warnings = focei.unsupported_keys_warnings();
+    for key in ["saem_kernel", "saem_imh_refresh"] {
+        assert!(
+            warnings.iter().any(|w| w.contains(key)),
+            "{key} under FOCEI must warn: {warnings:?}"
+        );
+    }
+}
+
 /// Both keys are advertised as SAEM-specific, so using them under FOCEI warns
 /// rather than silently doing nothing.
 #[test]

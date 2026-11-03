@@ -26,6 +26,7 @@ pub mod run_covariance;
 pub mod run_sir;
 pub mod saem;
 pub mod saem_conddist;
+pub(crate) mod saem_imh;
 pub(crate) mod saem_mixture;
 pub mod sens_outer_gradient;
 pub mod sir;
