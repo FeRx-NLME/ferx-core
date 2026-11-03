@@ -142,12 +142,11 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
     pop
 }
 
-#[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
-fn saem_block_omega_does_not_collapse_to_rank1() {
+/// The guard body, parameterised by E-step kernel so the same three assertions
+/// cover every kernel that can own the primary move. The componentwise sweep is
+/// one of the two fixes this test exists to protect, and the IMH kernel does not
+/// replace it (the sweep runs after either primary kernel) — this pins that.
+fn assert_no_rank1_collapse(kernel: ferx_core::types::SaemKernel, label: &str) {
     let model = parse_model_string(MODEL).expect("model must parse");
     let template = template_population(120);
     let population = simulate_into(&model, &template);
@@ -159,8 +158,22 @@ fn saem_block_omega_does_not_collapse_to_rank1() {
     opts.saem_seed = Some(12345);
     opts.run_covariance_step = false;
     opts.verbose = false;
+    opts.saem_kernel = kernel;
+    // This fixture carries 5 observations per subject for 3 random effects
+    // (1.67 per η), below the IMH information gate's default 2.0, which would
+    // quietly run the random walk under the `imh` label. The question here is
+    // whether the kernel reintroduces the collapse, not whether the gate fires.
+    opts.saem_imh_min_obs_per_eta = 0.0;
 
     let result = fit(&model, &population, &model.default_params, &opts).expect("SAEM fit succeeds");
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("saem_kernel = imh requested")),
+        "[{label}] the IMH kernel was declined, so this arm re-ran the random walk: {:?}",
+        result.warnings
+    );
 
     let om = &result.omega;
     let var = [om[(0, 0)], om[(1, 1)], om[(2, 2)]];
@@ -168,7 +181,7 @@ fn saem_block_omega_does_not_collapse_to_rank1() {
     let c = [corr(0, 1), corr(0, 2), corr(1, 2)];
 
     eprintln!(
-        "SAEM block Ω: var=[{:.4}, {:.4}, {:.4}]  corr=[CL,V1={:.3} CL,V2={:.3} V1,V2={:.3}]  (truth var={:?}, corr=[{:.2},{:.2},{:.2}])",
+        "[{label}] SAEM block Ω: var=[{:.4}, {:.4}, {:.4}]  corr=[CL,V1={:.3} CL,V2={:.3} V1,V2={:.3}]  (truth var={:?}, corr=[{:.2},{:.2},{:.2}])",
         var[0], var[1], var[2], c[0], c[1], c[2], TRUE_VAR, TRUE_CORR_CL_V1, TRUE_CORR_CL_V2, TRUE_CORR_V1_V2,
     );
 
@@ -177,7 +190,7 @@ fn saem_block_omega_does_not_collapse_to_rank1() {
     let max_abs_corr = c.iter().cloned().fold(0.0_f64, |a, x| a.max(x.abs()));
     assert!(
         max_abs_corr < 0.9,
-        "block Ω collapsed toward rank-1: |corr| max = {max_abs_corr:.3}, corr = {c:?}"
+        "[{label}] block Ω collapsed toward rank-1: |corr| max = {max_abs_corr:.3}, corr = {c:?}"
     );
 
     // 2. No variance collapse: each variance stays within a factor of the truth.
@@ -187,7 +200,7 @@ fn saem_block_omega_does_not_collapse_to_rank1() {
         let ratio = var[k] / TRUE_VAR[k];
         assert!(
             ratio > 0.3 && ratio < 3.0,
-            "Ω variance {k} not recovered: got {:.4}, truth {:.4} (ratio {ratio:.3})",
+            "[{label}] Ω variance {k} not recovered: got {:.4}, truth {:.4} (ratio {ratio:.3})",
             var[k],
             TRUE_VAR[k]
         );
@@ -202,6 +215,28 @@ fn saem_block_omega_does_not_collapse_to_rank1() {
     let max_corr = c.iter().cloned().fold(f64::MIN, f64::max);
     assert!(
         max_corr > 0.2,
-        "block Ω off-diagonals collapsed toward zero (no correlation structure recovered): corr = {c:?}"
+        "[{label}] block Ω off-diagonals collapsed toward zero (no correlation structure recovered): corr = {c:?}"
     );
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn saem_block_omega_does_not_collapse_to_rank1() {
+    assert_no_rank1_collapse(ferx_core::types::SaemKernel::RandomWalk, "rw");
+}
+
+/// The f-SAEM independent-MH kernel must not reintroduce the collapse. It
+/// replaces the *block* random walk, not the componentwise sweep — and the
+/// componentwise sweep is the anti-collapse device — so this is the test that
+/// would catch a future change that let the IMH proposal stand in for it.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn saem_block_omega_does_not_collapse_to_rank1_under_imh() {
+    assert_no_rank1_collapse(ferx_core::types::SaemKernel::Imh, "imh");
 }

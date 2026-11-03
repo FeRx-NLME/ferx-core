@@ -701,6 +701,15 @@ convention. Before that origin the state is its `init(...)` value and does not e
 so a decision placed earlier reads the `init` state. A dataset whose first record is at
 t = 6 is not integrated over a phantom `[0, 6]` window.
 
+A dose the controller gives at such an earlier decision moves the origin to that
+decision. The `init(...)` value is still computed from the first *data* record's
+covariates, because a controller dose has no row of its own. Running the same regimen
+through NONMEM, with the controller's doses written as dose rows carrying the first
+record's covariates, gives the same predictions (`nonmem_anchor/adaptive_prestart_decision`).
+The [verifier](#verification-on-by-default) starts its replay at the same origin. Up to
+#2125 it refused a run whose first decision came before the first record without a dose
+there: it started integrating at that decision instead.
+
 ### Dose clocks before the first dose
 
 A `[odes]` RHS may read the dose clocks `TAD` (time since the last dose) and `TAFD`

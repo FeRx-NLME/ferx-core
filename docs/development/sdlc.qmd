@@ -268,6 +268,7 @@ after each major feature) and not yet on GitHub — a known gap to formalize.
 | `ci.yml` | PR, merge queue, push to `main` | `Check` (compile-only, incl. the `survival` / `markov` / `slow-tests` feature combos), `Tests + coverage (core k/6)` (`--tests --features ci` split over six runners by `tools/ci-test-shard.py` — integration binaries whole, the lib unit tests by module, #2167; instrumented on `--profile ci-cov` — runs the Tier-1/2 suite with the `debug_assert!` guards live), `Tests + coverage (core)` (uploads the six shard reports as the one patch-coverage report), `Tests + coverage (TTE/CTMM endpoints k/4)` (`--features ci,markov,nn`: the lib unit tests and only the endpoint test binaries of `tools/ci-endpoint-tests.txt`, split the same way), `Tests + coverage (TTE/CTMM endpoints)` (uploads those four reports as one), `Tests (release semantics)` (`--lib` on the **`ci-fast`** profile, so the guards are compiled out and release overflow semantics are exercised — see below), `Clippy`, `Format`, `Public API baseline` (diffs `api/ferx-core-public-api.txt`), `Changelog` (validates `changelog.d/` fragments); **`Tests + coverage (full, slow-tests)`** on weekly schedule / manual |
 | `changelog.yml` | PR, incl. label changes | `Changelog fragment` — a PR touching user-facing source must add a `changelog.d/` fragment or carry the `no-changelog` label |
 | `slow-tests.yml` | nightly 06:00 UTC, Sundays 07:00 UTC (`full-nn`), manual, push to `main` touching the suite's inputs | Tier-3 fits to convergence on `--profile ci-test`: `Slow regression tests (core k/4)` (the whole workspace suite split over four runners by `tools/ci-test-shard.py`, #2182), `Slow regression tests (core)` (the one verdict over the four shards), `Slow regression tests (nn)` (the lib unit tests and `tools/slow-nn-tests.txt` with `nn` on), `Slow regression tests (nn test set)`; on Sundays `full-nn k/4` instead — see [Slow tests, sharded](#slow-tests-sharded) |
+| `mutants.yml` | nightly 01:30 UTC, manual | cargo-mutants over the previous UTC day's merges to `main`: `Plan mutants`, `Mutants (k/N)` (N sized from the selection), `Mutants summary` (survivors as `file:line` + mutation in the job summary; an untested tail goes to a follow-up pass on the same commit); report-only — see [Nightly mutants](#nightly-mutants) |
 | `docs.yml` | push to `main` touching `docs/**` | `quarto render` → deploy to `gh-pages` |
 | `release.yml` | tag `v*` or manual | GitHub release with generated notes |
 
@@ -340,6 +341,90 @@ Then regenerate the weights file from it:
 ```bash
 tools/ci-test-shard.py weights slow slow.log
 ```
+
+#### Nightly mutants {#nightly-mutants}
+
+AGENTS.md asks for mutation evidence on every new assertion. Done by hand, that is
+the step most often left incomplete (#1171 / #1174, #1223). Both of those survivors
+were function-body edits — dropping a call, deleting a fill — which is exactly the
+edit cargo-mutants makes. `mutants.yml` (#2633) runs it every night over the
+production `src/` lines that merged to `main` the previous UTC day, and lists every
+surviving mutant in the job summary. Run `tools/nightly-mutants.sh --help` for the
+subcommands it uses.
+
+The job is **report-only**. A survivor never turns it red; it fails only when the
+tool cannot run (a bad diff, or `main`'s own `--lib` tests failing in the unmutated
+baseline). Triage each survivor: add a test that kills it, or record why it cannot
+matter.
+
+##### What it runs {#nightly-mutants-selection}
+
+- **Every function-body replacement, with tuple products pruned.** cargo-mutants
+  generates one mutant per combination of default values for a tuple return. On
+  the 2026-11-02 merges that was 58,192 mutants, 34,848 of them from one 7-tuple
+  function. `select` splits each generated value into its innermost
+  comma-separated slots, and keeps the fewest variants in which every value of
+  every slot still appears. A scalar return has one slot, so all of its variants
+  run: `-> bool` runs both `true` and `false`. That day, the 7-tuple ran 12
+  variants and the whole day 1,261.
+- **Operator, match-arm and struct-field mutants** run only on a manual dispatch
+  with `all_genres`. Each of those is a distinct edit, so all of them run.
+- **`--lib` only, on `ci,markov,nn`.** Without `markov`/`nn`, a mutant in their
+  gated source builds, passes every test, and reads as a false survivor. `--lib`
+  is passed as `--cargo-arg`, not after `--`. Trailing args reach only the test
+  phase, so the build would compile every integration binary for each mutant.
+
+##### Shards and follow-up passes {#nightly-mutants-passes}
+
+The plan job sizes the shard matrix from the selection: one shard per `PER_SHARD`
+mutants, up to `MAX_SHARDS`. Each shard stops at its wall-clock budget. Any
+selected mutant without an outcome is not dropped. A shard that ran slow, or one
+that died, leaves a tail. The summary job hands that tail to a follow-up pass:
+the same workflow, dispatched on the same commit, carrying every outcome so far.
+The last pass's summary is the report for the whole window. After `MAX_PASSES`,
+anything still untested is listed by name under "Not examined", never dropped
+silently. Every summary prints the measured per-mutant time of its own run, so
+`PER_SHARD` can be re-derived from CI rather than from these local numbers.
+
+##### Measured cost {#nightly-mutants-cost}
+
+Per mutant, one body edit in `src/api/levels.rs`, `--lib --features ci,markov,nn`:
+
+| Platform | Profile | Rebuild | `--lib` tests | Per mutant |
+|---|---|---:|---:|---:|
+| macOS arm64, 10 cores | `ci-fast` | 419 s | 34 s | 453 s |
+| macOS arm64, 10 cores | `dev` | 24 s | 503 s | 527 s |
+| macOS arm64, 10 cores | `dev`, opt-level 1 | 247 s | 43 s | 290 s |
+| macOS arm64, 10 cores | `ci-fast` + incremental | 210 s | 37 s | 247 s |
+| Linux aarch64, Docker `--cpus 4` | `mutants` | 216–246 s | 61–257 s | 354 s mean, 485 s max |
+
+The Linux row is cargo-mutants itself on the four viable mutants of `src/api/levels.rs`, at
+the runner's 4-CPU size. One of them rebuilt in 35 s and is left out of the rebuild
+range. On the same machine, the unmutated baseline took 498 s to build cold and
+116 s to test. A caught mutant can test longer than the baseline: cargo-mutants
+runs the whole suite to completion.
+
+The job builds on `[profile.mutants]`, which is `ci-cov` plus `incremental`. The
+lib build dominates, as #2633 predicted. Release profiles turn incremental off,
+and turning it back on halves the rebuild.
+
+Selected mutants per day, for the merges of 2026-10-27 to 2026-11-02: 523, 160,
+276, 1,632, 477, 96 and 1,261 (median 477). At 6 minutes a mutant, a 300-minute shard finishes about 47.
+`PER_SHARD` is set to 40 for headroom, so the median day plans 12 shards and
+finishes in one pass. The heaviest day plans the 16-shard cap, and the follow-up
+passes take its tail: 1,632 mutants is three passes.
+
+##### What a clean summary does not mean {#nightly-mutants-limits}
+
+- **Message text was checked.** cargo-mutants never mutates string literals. A
+  false sentence in a diagnostic (#1405 / #1456) still needs the manual
+  sentence-deletion check described in AGENTS.md.
+- **Every combination of a tuple return ran.** A survivor needing two slots'
+  values *together*, where every variant carrying each value alone is caught, is
+  the one case the pruning does not test.
+- **Only the selection ran.** In cargo-mutants 27.1.0 (pinned), struct-field
+  deletions ignore both `examine_re` and `exclude_re`. A few run on every pass
+  regardless of the selection, and the plan step counts them in.
 
 #### Both build modes, every PR {#both-build-modes}
 

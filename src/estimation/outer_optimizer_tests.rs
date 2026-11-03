@@ -9632,6 +9632,278 @@ fn the_basin_probe_runs_on_a_geometric_schedule() {
     assert_eq!(due, vec![32, 64, 128, 256, 512]);
 }
 
+/// The mid-leg probe's restart-or-absorb gate (#2600), on both sides of
+/// `BASIN_PROBE_RESTART_SHARE` and at the sizes that motivated it.
+///
+/// - The `tests/ebe_basin_shift.rs` fixture: one of 10 subjects switches, a tenth of the
+///   objective, and the leg restarts as it did under #2093.
+/// - The #2600 JV fit: 19 / 9 / 3 / 5 / 4 of 5,937 subjects (0.32 % at most) — every leg was
+///   cut at evaluation 32; each of those is now absorbed.
+/// - The boundary itself: 1 % of 5,000 is 50, so 49 absorbs and 50 restarts; a population
+///   under 100 restarts on its first switched subject, and absorbs a gap no subject carries
+///   (a gap spread thinly over the population is noise-like, not a trap).
+/// - No count (AGQ, or no held state at the incumbent) restarts, the pre-#2600 behaviour.
+#[test]
+fn the_basin_probe_restarts_on_a_material_share_and_absorbs_a_handful() {
+    use BasinProbeAction::{Absorb, Restart};
+    assert_eq!(basin_probe_action(Some(1), 10, false), Restart);
+    for k in [19, 9, 3, 5, 4] {
+        assert_eq!(
+            basin_probe_action(Some(k), 5937, false),
+            Absorb,
+            "{k} of 5937"
+        );
+    }
+    assert_eq!(basin_probe_action(Some(49), 5000, false), Absorb);
+    assert_eq!(basin_probe_action(Some(50), 5000, false), Restart);
+    assert_eq!(basin_probe_action(Some(1), 99, false), Restart);
+    assert_eq!(basin_probe_action(Some(0), 99, false), Absorb);
+    assert_eq!(basin_probe_action(Some(0), 5937, false), Absorb);
+    assert_eq!(basin_probe_action(None, 5937, false), Restart);
+    assert_eq!(basin_probe_action(None, 10, false), Restart);
+}
+
+/// A cold probe solve the EBE guard rejects is never absorbed (#2600 review r3): it would
+/// become the incumbent every later valid evaluation must beat. The case: 5,937 subjects,
+/// 4 switched (absorbed when the solve is valid), and a finite, lower cold objective with
+/// 1,000 unconverged subjects (17 %, over the default `max_unconverged_frac` of 10 %) — or one start
+/// rejected, which the guard rejects whatever the fraction.
+#[test]
+fn a_guard_rejected_cold_probe_solve_is_not_absorbed() {
+    use crate::estimation::inner_optimizer::InnerLoopStats;
+    use BasinProbeAction::{Absorb, Restart};
+    let n = 5937;
+    let frac = FitOptions::default().max_unconverged_frac;
+    let unconverged = InnerLoopStats {
+        n_unconverged: 1000,
+        ..Default::default()
+    };
+    let start_rejected = InnerLoopStats {
+        n_start_rejected: 1,
+        ..Default::default()
+    };
+    let clean = InnerLoopStats::default();
+    let cold = 66_533.28;
+    assert!(
+        ebe_guard_rejects(&unconverged, n, cold, frac),
+        "1000 of 5937 trips {frac}"
+    );
+    assert!(ebe_guard_rejects(&start_rejected, n, cold, frac));
+    assert!(!ebe_guard_rejects(&clean, n, cold, frac));
+    for stats in [&unconverged, &start_rejected] {
+        let rejected = ebe_guard_rejects(stats, n, cold, frac);
+        assert_eq!(
+            basin_probe_action(Some(4), n, rejected),
+            Restart,
+            "{stats:?}"
+        );
+    }
+    // The straddle: the same count, a valid solve, absorbs.
+    assert_eq!(
+        basin_probe_action(Some(4), n, ebe_guard_rejects(&clean, n, cold, frac)),
+        Absorb
+    );
+}
+
+/// Inside a #2462 verification leg the basin probe scores against the leg's own incumbent,
+/// not the pre-leg `best_seen` (#2600 review round 2), and outside one against `best_seen`.
+/// The two hold different objectives on purpose (the leg's is at a tighter inner tolerance),
+/// so each side names the tracker it must read.
+#[test]
+fn the_basin_probe_reads_the_active_legs_incumbent() {
+    let mut leg = BestPoint::new();
+    let mut seen = BestPoint::new();
+    assert_eq!(basin_probe_reference(true, &leg, &seen), None);
+    seen.observe(1, &[0.0], 100.0, 99.0);
+    assert_eq!(
+        basin_probe_reference(true, &leg, &seen),
+        None,
+        "not best_seen in a leg"
+    );
+    leg.observe(2, &[0.1], 101.0, 100.5);
+    assert_eq!(
+        basin_probe_reference(true, &leg, &seen),
+        Some(100.5),
+        "the leg's own"
+    );
+    assert_eq!(
+        basin_probe_reference(false, &leg, &seen),
+        Some(99.0),
+        "best_seen outside"
+    );
+}
+
+/// The absorb arm records the cold solve as the incumbent (#2600 review): a warm incumbent
+/// at 100 whose cold re-solve scores 90, then a trial at 95, between the two. Before the
+/// fix only the warm-start cache moved, so `state.best_ofv` and `best_seen` stayed at 100,
+/// the 95 trial counted as an improvement, overwrote the held EBE state and became the
+/// restored point although 90 had been scored. Each tracker is asserted on its own, so a
+/// mutation dropping any one of the updates names it.
+#[test]
+fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
+    let xs_inc = vec![0.1, 0.2, 0.3];
+    let mut state = new_nlopt_state(2, 2, &xs_inc, SalvageGuardPolicy::Off);
+    state.best_ofv = 100.0;
+    state.n_evals = 32;
+    state.pred_jac = Some(vec![vec![DVector::zeros(2); 3]; 2]);
+    let mut best = BestPoint::new();
+    assert!(best.observe(31, &xs_inc, 100.0, 100.0));
+    let warm = |v: f64| IncumbentSolve {
+        xs: xs_inc.clone(),
+        etas: vec![DVector::from_element(2, v); 2],
+        h_mats: vec![DMatrix::identity(2, 2); 2],
+        kappas: vec![Vec::new(); 2],
+        scores: None,
+    };
+    let mut held = Some(warm(1.0));
+    let mut last_gradient = Some(vec![1.0, 2.0, 3.0]);
+    // Feasible baseline 100 last moved at feasible eval 20; 32 feasible evaluations so far.
+    let mut plateau = (100.0, 20usize, 32usize);
+    let cold_modes = vec![DVector::from_element(2, -0.5); 2];
+    absorb_cold_incumbent(
+        &mut state,
+        &mut best,
+        &mut held,
+        &mut last_gradient,
+        &mut plateau,
+        (90.0, 90.0),
+        cold_modes.clone(),
+        warm(-0.5),
+    );
+    assert_eq!(
+        state.cached_etas, cold_modes,
+        "warm starts are the cold modes"
+    );
+    assert!(
+        state.pred_jac.is_none(),
+        "the warm modes' response goes with them"
+    );
+    assert_eq!(
+        state.best_ofv, 90.0,
+        "the adoption bar is the cold objective"
+    );
+    assert!(
+        !adopt_warm_start(false, 95.0, state.best_ofv),
+        "95 does not beat 90"
+    );
+    assert_eq!(best.ofv(), 90.0, "best-seen is the cold objective");
+    assert!(
+        !best.observe(33, &[0.4, 0.5, 0.6], 95.0, 95.0),
+        "95 is not restored"
+    );
+    assert_eq!(best.get().map(|b| b.x.clone()), Some(xs_inc.clone()));
+    assert_eq!(
+        held.as_ref().map(|h| h.etas[0][0]),
+        Some(-0.5),
+        "the held EBE state is the cold solve's"
+    );
+    assert!(last_gradient.is_none(), "the warm modes' gradient is stale");
+    assert_eq!(plateau, (90.0, 32, 32), "the drop is progress");
+    // A point below the cold incumbent still wins, as any improvement does.
+    assert!(adopt_warm_start(false, 89.0, state.best_ofv));
+}
+
+/// The absorb arm end to end (#2600), as an A/B on one fit: the full 200-subject
+/// Michaelis–Menten population of `tests/ebe_basin_shift.rs`, warm-start predictor off (the
+/// trap is the unpredicted start's), once at the shipped share and once with the share
+/// raised so the same probe absorbs.
+///
+/// At the shipped 1 % the probe at the 32nd evaluation finds 5 of 200 subjects in a lower
+/// cold mode (2.5 %) and restarts, as under #2093. Raised to 5 %, the same probe absorbs
+/// those modes and the leg continues on its own L-BFGS memory. The arm under test must reach
+/// the restart arm's optimum with no basin-shift restart filed, and pass its own end-of-leg
+/// check (`converged`). The JV fit the issue reports is private; this is the closest
+/// committed fixture whose probe sees a switch at all.
+///
+/// Measured on native macOS arm64 (`ci-fast`; a Linux run is the reference for any band):
+/// restart arm 775.394246 converged in 102 evaluations over 2 attempts; absorb arm
+/// 775.394217 converged in 76 evaluations over 1 attempt, both probes at a 44.857 gap from
+/// 5 subjects. Mutation: absorbing without handing the cold modes to the warm-start cache
+/// re-trapped (a second probe found 4 subjects), the end-of-leg check filed a restart, and
+/// the fit took 119 evaluations to 775.394520 — red on the no-restart assertion.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_handful_of_switched_subjects_is_absorbed_into_the_running_leg() {
+    use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx").unwrap();
+    let parsed = parse_full_model(&text).unwrap();
+    let pop = read_nonmem_csv(
+        Path::new("tests/fixtures/mm_basin_shift/mm_n200.csv"),
+        None,
+        None,
+    )
+    .unwrap();
+    let opts = FitOptions {
+        verbose: false,
+        ..parsed.fit_options.clone()
+    };
+    let _off = WarmPredictorOff::new();
+    let run = |share: Option<f64>| {
+        BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.set(share));
+        BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().clear());
+        NLOPT_ATTEMPTS.with(|c| c.set(0));
+        let r = optimize_population(&parsed.model, &pop, &parsed.model.default_params, &opts);
+        BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.set(None));
+        let decisions = BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().split_off(0));
+        (r, decisions, NLOPT_ATTEMPTS.with(|c| c.get()))
+    };
+    let (restart, restart_probes, restart_attempts) = run(None);
+    let (absorb, absorb_probes, absorb_attempts) = run(Some(0.05));
+    eprintln!(
+        "restart arm: OFV {:.6} converged {} evals {} attempts {restart_attempts} probes \
+         {restart_probes:?}\nabsorb arm: OFV {:.6} converged {} evals {} attempts \
+         {absorb_attempts} probes {absorb_probes:?}",
+        restart.ofv,
+        restart.converged,
+        restart.n_iterations,
+        absorb.ofv,
+        absorb.converged,
+        absorb.n_iterations,
+    );
+    let restarted = |r: &OuterResult| {
+        r.warnings
+            .iter()
+            .any(|w| w.contains("resumed from the best point seen"))
+    };
+    // The straddle: both arms see the same probe, a switched share between 1 % and 5 %.
+    let first = |p: &[(f64, Option<usize>)]| p.first().and_then(|d| d.1);
+    assert!(
+        first(&restart_probes).is_some_and(|k| (2..10).contains(&k)),
+        "the shipped arm's probe must see 1–5 % of 200 switch: {restart_probes:?}"
+    );
+    assert_eq!(first(&restart_probes), first(&absorb_probes));
+    assert!(restarted(&restart), "at 1 % the probe restarts");
+    assert!(
+        !restarted(&absorb),
+        "at 5 % the probe absorbs: {:?}",
+        absorb.warnings
+    );
+    assert!(absorb.converged, "the absorbing leg reaches its own stop");
+    assert!(absorb.ofv.is_finite() && restart.ofv.is_finite());
+    // Measured −2.9e-5 (absorb lower); 1e-3 is ~30× that, and far below the 44.9 gap.
+    assert!(
+        (absorb.ofv - restart.ofv).abs() < 1e-3,
+        "absorbing must reach the restart's optimum: {} vs {}",
+        absorb.ofv,
+        restart.ofv
+    );
+    // The point of #2600: one leg, its memory kept, and fewer evaluations (measured 76
+    // against 102).
+    assert_eq!(absorb_attempts, 1, "no second attempt");
+    assert!(
+        absorb.n_iterations < restart.n_iterations,
+        "{} vs {}",
+        absorb.n_iterations,
+        restart.n_iterations
+    );
+}
+
 /// End to end on `examples/warfarin_dcm.ferx`: the DCM fit converges at −1173.559691 with no
 /// start-dependence gap left (#2204).
 ///

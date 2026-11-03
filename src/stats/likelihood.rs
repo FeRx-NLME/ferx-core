@@ -3642,6 +3642,64 @@ fn gaussian_foce_accum(
     })
 }
 
+/// Conditional η-precision at `eta_hat` — the FOCEI/Laplace approximation to
+/// `−∂² log p(η | y, θ) / ∂η²`, i.e. the Hessian of the halved objective
+/// [`individual_nll`] scores:
+///
+/// ```text
+///   H̃ = Hᵀ R⁻¹ H + ½·C̃ᵀC̃ + Ω⁻¹       (interaction = true)
+///   H̃ = Hᵀ R⁻¹ H + Ω⁻¹                (interaction = false)
+/// ```
+///
+/// This is the matrix whose log-determinant the FOCEI objective
+/// (`foce_subject_nll_interaction`) takes, assembled from the *same*
+/// `gaussian_foce_accum` loop, so a proposal built on this curvature and the
+/// FOCEI objective cannot drift apart. Consumed by the SAEM f-SAEM kernel
+/// (`estimation::saem_imh`, #1449).
+///
+/// Scope: the Gaussian observation rows of an analytical-PK subject with a
+/// diagonal residual R. SDE process noise, the FREM R-override, `block_sigma`
+/// correlations and IIV on the residual are deliberately **not** threaded
+/// through; the caller gates those model shapes out rather than score them with
+/// an approximation this function would silently supply. Returns `None` when
+/// any observation variance is non-finite or non-positive.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conditional_eta_precision(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &[f64],
+    ipreds: &[f64],
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    interaction: bool,
+) -> Option<DMatrix<f64>> {
+    let n_eta = eta_hat.len();
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
+    let terms = gaussian_foce_accum(
+        subject,
+        ipreds,
+        h_matrix,
+        &model.error_spec,
+        sigma_values,
+        model.bloq_in_force(),
+        &[],
+        n_eta,
+        None,
+        model.residual_error_eta,
+        ruv_scale_from(eta_hat, model.residual_error_eta),
+        ruv_mult.as_deref(),
+        None,
+        None,
+    )?;
+    let mut htilde = terms.hrh + terms.cens_hess + &omega.inv;
+    if interaction {
+        htilde += terms.ctc * 0.5;
+    }
+    htilde.iter().all(|v| v.is_finite()).then_some(htilde)
+}
+
 /// R_tilde = H * Omega * H' + diag(r_diag)
 pub(crate) fn compute_r_tilde(
     h: &DMatrix<f64>,

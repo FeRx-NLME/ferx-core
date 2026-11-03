@@ -169,6 +169,46 @@ const RM_SCALE_EXPONENT: f64 = 0.6;
 /// the scale during exploration, small enough not to fight Ω afterwards.
 const RM_SCALE_GAIN: f64 = 1.0;
 
+/// Whether this iteration carries evidence for the **block random walk's** step
+/// scale: the random walk ran (`n_proposals > 0`) and the f-SAEM kernel did not
+/// serve the subject instead. An IMH acceptance rate (~0.8) is not on the random
+/// walk's scale, and steering δ by it would inflate the step the block kernel is
+/// handed the next time this subject's refresh declines.
+pub(crate) fn rw_scale_has_evidence(used_imh: bool, n_proposals: usize) -> bool {
+    !used_imh && n_proposals > 0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The f-SAEM counters of the last [`run_saem`] on this thread, so a test can
+    /// read what one fit's kernel did without a process-global counter that a
+    /// concurrently running test would also move.
+    pub(crate) static LAST_IMH_SNAPSHOT:
+        std::cell::Cell<Option<crate::estimation::saem_imh::ImhSnapshot>> =
+        const { std::cell::Cell::new(None) };
+    /// The block random walk's per-subject step scales at the end of the last
+    /// [`run_saem`] on this thread, so a test can see which iterations steered them.
+    pub(crate) static LAST_BLOCK_STEP_SCALES: std::cell::RefCell<Vec<f64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Subject-iterations of the last [`run_saem`] on this thread that ran the
+    /// block random walk.
+    pub(crate) static LAST_RW_BLOCK_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// `(all, componentwise)` proposals the last [`run_saem`] on this thread fed
+    /// the end-of-run mixing tally, over every iteration.
+    pub(crate) static LAST_MH_TALLY: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+    /// Overrides the IMH stuck-acceptance threshold for [`run_saem`] calls on
+    /// this thread, so a test can reach the warning's call site with a fit that
+    /// mixes (a genuinely stuck fit is not constructible: θ adapts until it
+    /// moves).
+    pub(crate) static IMH_STUCK_OVERRIDE: std::cell::Cell<Option<f64>> =
+        const { std::cell::Cell::new(None) };
+    /// IMH `(accepted, proposed)` over the convergence phase of the last
+    /// [`run_saem`] on this thread — the window the stuck warning reads.
+    pub(crate) static LAST_IMH_CONV: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 /// One Robbins-Monro step on a log step-scale, clamped to `[lo, hi]`.
 ///
 /// `k` is the 1-based SAEM iteration, so the first step is
@@ -1946,6 +1986,34 @@ impl MhScratch {
     /// [`EventPkParams`] (the mixture class draw, the IOV NLL).
     pub(crate) fn pk(&mut self) -> &mut EventPkParams {
         &mut self.nll.pk
+    }
+
+    /// The individual NLL at `eta`, through the same prepared path
+    /// [`mh_steps_with_proposal`] scores its (non-IOV) proposals with. The f-SAEM
+    /// kernel (`estimation::saem_imh`) scores through here so that it and the
+    /// random walk target one conditional and can share one cached `nll`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn score(
+        &mut self,
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        eta: &[f64],
+        omega: &OmegaMatrix,
+        sigma_values: &[f64],
+        schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    ) -> f64 {
+        individual_nll_prepared(
+            model,
+            subject,
+            theta,
+            eta,
+            omega,
+            sigma_values,
+            &self.prep,
+            schedule,
+            &mut self.nll,
+        )
     }
 }
 
@@ -3746,6 +3814,217 @@ pub(crate) fn mixture_mu_ref_means(
         .collect()
 }
 
+/// Whether the f-SAEM independent-MH kernel ([`crate::estimation::saem_imh`])
+/// can be used for this model.
+///
+/// The refresh needs two exact η-derivatives: the individual-NLL η-gradient
+/// ([`crate::estimation::inner_optimizer::analytic_inner_grad_supported_model`],
+/// which the Gauss-Newton MAP steps follow) and the η-Jacobian of the
+/// predictions (`adjoint::exact_obs_grads`). Both come from the adjoint's unified
+/// recorder, so its scope (`recorder_in_scope`, read through the inner-gradient
+/// predicate) is the single structural gate: it admits analytical PK models and
+/// ODE models whose dual ODE walk serves the RHS and readout (#2639), and keeps
+/// out SDE (`[diffusion]`) and any ODE shape the recorder declines. There is no
+/// separate analytical-PK conjunct — a second gate rejecting the same inputs
+/// would leave one of them untestable.
+///
+/// The remaining conditions are no IOV, no `iiv_on_ruv`, no mixture, and the
+/// shapes
+/// [`crate::stats::likelihood::conditional_eta_precision`] deliberately does not
+/// score: the FREM covariate-row R-override, M3 censoring, a
+/// correlated (`block_sigma`) residual R, non-Gaussian endpoints, and LTBS.
+/// Building the proposal on a wrong `H̃` would not bias the chain (any fixed
+/// proposal leaves the target invariant) but nothing was measured on those
+/// shapes, so they keep the random walk.
+pub(crate) fn imh_supported_model(model: &CompiledModel) -> bool {
+    model.n_kappa == 0
+        && model.residual_error_eta.is_none()
+        && model.mixture.is_none()
+        && model.frem_config.is_none()
+        && !model.residual_is_dense()
+        && !matches!(model.bloq_in_force(), crate::types::BloqMethod::M3)
+        && !model.has_non_gaussian()
+        && !model.log_transform
+        && crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(model)
+}
+
+/// Mean observations per subject per random effect — the quantity the IMH
+/// information gate thresholds. `None` when there is nothing to divide by.
+pub(crate) fn obs_per_subject_per_eta(population: &Population, n_eta: usize) -> Option<f64> {
+    let n_subjects = population.subjects.len();
+    if n_subjects == 0 || n_eta == 0 {
+        return None;
+    }
+    Some(population.n_obs() as f64 / n_subjects as f64 / n_eta as f64)
+}
+
+/// The two real-valued IMH knobs as the run uses them, plus one warning per
+/// value that had to be replaced. The parser rejects these values in a model
+/// file; this is the backstop for a `FitOptions` built in code, where a `NaN`
+/// weight would make every mixture density `NaN` (and so reject every primary
+/// proposal without a word) and a `NaN`/`inf`/negative threshold would switch
+/// the information gate off. One function, read by the decision, the banner and
+/// the run, so they cannot disagree about the value in force.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ImhKnobs {
+    /// Weight of the prior component, in `[0, 0.5]`.
+    pub(crate) defensive: f64,
+    /// Information-gate threshold, finite and `>= 0` (`0` = gate off).
+    pub(crate) min_obs_per_eta: f64,
+}
+
+pub(crate) fn imh_knobs(options: &FitOptions) -> (ImhKnobs, Vec<String>) {
+    let defaults = FitOptions::default();
+    let mut warnings = Vec::new();
+    let raw_def = options.saem_imh_defensive;
+    let defensive = if (0.0..=0.5).contains(&raw_def) {
+        raw_def
+    } else {
+        let used = defaults.saem_imh_defensive;
+        warnings.push(format!(
+            "saem_imh_defensive = {raw_def} is outside [0, 0.5]; using {used}"
+        ));
+        used
+    };
+    let raw_min = options.saem_imh_min_obs_per_eta;
+    let min_obs_per_eta = if raw_min.is_finite() && raw_min >= 0.0 {
+        raw_min
+    } else {
+        let used = defaults.saem_imh_min_obs_per_eta;
+        warnings.push(format!(
+            "saem_imh_min_obs_per_eta = {raw_min} is not a finite value >= 0; using {used} \
+             (set it to 0 to switch the information gate off)"
+        ));
+        used
+    };
+    (
+        ImhKnobs {
+            defensive,
+            min_obs_per_eta,
+        },
+        warnings,
+    )
+}
+
+/// Whether, and if not why not, a run uses the f-SAEM kernel. One decision
+/// shared by [`run_saem`] and [`saem_sampler_summary`], so the banner cannot
+/// report a kernel the run does not take.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ImhDecision {
+    /// `saem_kernel = rw` (the default).
+    NotRequested,
+    /// The kernel runs.
+    On,
+    /// The model is outside [`imh_supported_model`].
+    DeclinedScope,
+    /// `saem_n_leapfrog > 0` selected HMC, which owns the primary kernel.
+    DeclinedHmc,
+    /// Too few observations per subject per random effect
+    /// ([`FitOptions::saem_imh_min_obs_per_eta`]); carries the measured ratio.
+    DeclinedInformation { ratio: f64 },
+}
+
+/// Decide the E-step kernel, in the order the gates apply: requested, in scope,
+/// not displaced by HMC, informative enough. Reads no clock — the decision is a
+/// function of the model, the data and the options alone, so a seeded fit is
+/// reproducible.
+pub(crate) fn imh_kernel_decision(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+    using_hmc: bool,
+) -> ImhDecision {
+    if options.saem_kernel != crate::types::SaemKernel::Imh {
+        return ImhDecision::NotRequested;
+    }
+    if !imh_supported_model(model) {
+        return ImhDecision::DeclinedScope;
+    }
+    if using_hmc {
+        return ImhDecision::DeclinedHmc;
+    }
+    let min_ratio = imh_knobs(options).0.min_obs_per_eta;
+    if min_ratio > 0.0 {
+        if let Some(ratio) = obs_per_subject_per_eta(population, model.n_eta) {
+            if ratio < min_ratio {
+                return ImhDecision::DeclinedInformation { ratio };
+            }
+        }
+    }
+    ImhDecision::On
+}
+
+/// The `FitResult.warnings` line for a declined kernel, or `None` when there is
+/// nothing to say (the kernel runs, or was never asked for).
+pub(crate) fn imh_decline_warning(
+    decision: ImhDecision,
+    min_ratio: f64,
+    n_eta: usize,
+) -> Option<String> {
+    let reason = match decision {
+        ImhDecision::On | ImhDecision::NotRequested => return None,
+        ImhDecision::DeclinedInformation { ratio } => format!(
+            "this population carries {ratio:.2} observations per subject per random effect \
+             ({n_eta} random effects), below `saem_imh_min_obs_per_eta = {min_ratio:.2}`. \
+             There the conditional p(eta_i | y_i) is barely narrower than the prior, so a \
+             mode-centred independent proposal costs as much as the random walk and samples \
+             no better. Set `saem_imh_min_obs_per_eta = 0` to force the kernel on"
+        ),
+        ImhDecision::DeclinedHmc => {
+            "saem_n_leapfrog > 0 selected HMC, which owns the primary kernel".to_string()
+        }
+        ImhDecision::DeclinedScope => "the model is outside the scope the IMH proposal \
+             curvature covers (it needs an analytical PK or ODE model whose eta-gradient and \
+             eta-Jacobian are analytic, and no IOV, iiv_on_ruv, mixture, FREM, SDE, \
+             block_sigma, M3 censoring, non-Gaussian endpoint or LTBS)"
+            .to_string(),
+    };
+    Some(format!(
+        "saem_kernel = imh requested but {reason}; using the Metropolis-Hastings random walk"
+    ))
+}
+
+/// The `FitResult.warnings` line for the one pairing #1449 measured the f-SAEM
+/// kernel to lose on: a θ with no η (or any θ the numerical M-step estimates)
+/// moved by the single-draw BOBYQA M-step. `None` otherwise.
+pub(crate) fn imh_noeta_theta_warning(
+    imh_on: bool,
+    numerically_estimated_theta: bool,
+    score_sa: bool,
+) -> Option<String> {
+    (imh_on && numerically_estimated_theta && !score_sa).then(|| {
+        "saem_kernel = imh with a theta the numerical M-step estimates (one with no eta, or a \
+         covariate effect) under the single-draw BOBYQA M-step: the kernel's near-independent \
+         draws move that maximiser further each iteration, which was measured to cost \
+         importance-sampled -2 log L (+5.2 over 6 seeds on a 600-subject busulfan model whose \
+         Q has no eta). `mstep_solver = score_sa`, which averages the score instead of the \
+         maximiser, removed the loss there."
+            .to_string()
+    })
+}
+
+/// Whether the SAEM E-step runs HMC: `saem_n_leapfrog > 0` on a model its
+/// `Dual2` η-gradient covers. The one predicate [`run_saem`], the banner and the
+/// IMH decision all read, so the banner cannot report a kernel the run does not
+/// take.
+///
+/// HMC is BSV-only (`hmc_step` and the AD NLL/gradient are kappa-unaware), so it
+/// is disabled for IOV models (`n_kappa > 0`); those subjects use the MH kernels,
+/// whose acceptance targets the IOV conditional p(η | κ, θ, data). IIV on
+/// residual error (#409) also disables it: the Dual2 gradient kernel carries no
+/// `exp(2·η_ruv)` variance-scaling rule. Mixture models (#985) sample the class
+/// indicator and run η-MCMC within the drawn class; the HMC gradient kernel is
+/// class-unaware, so they use the MH kernels, which honour the class
+/// thread-local set in the E-step closure.
+pub(crate) fn saem_uses_hmc(model: &CompiledModel, options: &FitOptions) -> bool {
+    options.saem_n_leapfrog > 0
+        && model.ode_spec.is_none()
+        && model.tv_fn.is_some()
+        && model.n_kappa == 0
+        && model.residual_error_eta.is_none()
+        && model.mixture.is_none()
+}
+
 /// One-line description of the SAEM E-step sampler kernel, for the startup
 /// banner. SAEM's estimation is sampling-based (not gradient-driven), so the
 /// banner reports the kernel here instead of a gradient route. HMC is used
@@ -3754,25 +4033,42 @@ pub(crate) fn mixture_mu_ref_means(
 /// that condition so the banner reflects what will actually run.
 pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) -> String {
     let n_leapfrog = options.saem_n_leapfrog;
-    // HMC is BSV-only (`hmc_step` and the AD NLL/gradient are kappa-unaware), so
-    // it is disabled for IOV models (`n_kappa > 0`); those subjects use the MH
-    // kernels, whose acceptance targets the IOV conditional p(η | κ, θ, data).
-    // IIV on residual error (#409) also disables HMC: the Dual2 gradient kernel
-    // carries no `exp(2·η_ruv)` variance-scaling rule, so these models fall back
-    // to MH (same gate as [`run_saem`]).
-    let using_hmc = n_leapfrog > 0
-        && model.ode_spec.is_none()
-        && model.tv_fn.is_some()
-        && model.n_kappa == 0
-        && model.residual_error_eta.is_none();
-    if using_hmc {
+    if saem_uses_hmc(model, options) {
         format!("HMC ({n_leapfrog} leapfrog steps, Dual2 analytic gradients)")
     } else if n_leapfrog > 0 {
         "Metropolis-Hastings random walk \
-         (HMC requested but unavailable — needs an analytical PK model, no IOV)"
+         (HMC requested but unavailable — needs an analytical PK model, no IOV, \
+         no iiv_on_ruv, no mixture)"
             .to_string()
     } else {
         "Metropolis-Hastings random walk".to_string()
+    }
+}
+
+/// [`saem_sampler_summary`] with the data in hand, so the banner can report the
+/// f-SAEM kernel through the same [`imh_kernel_decision`] the run takes —
+/// including its information gate, which needs the population.
+pub(crate) fn saem_sampler_summary_for(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+) -> String {
+    let base = saem_sampler_summary(model, options);
+    let using_hmc = saem_uses_hmc(model, options);
+    match imh_kernel_decision(model, population, options, using_hmc) {
+        ImhDecision::NotRequested => base,
+        ImhDecision::On => format!(
+            "f-SAEM independent Metropolis-Hastings ({} proposals per subject, proposal \
+             refreshed every {} iterations) + componentwise sweep",
+            options.saem_imh_proposals.max(1),
+            options.saem_imh_refresh.max(1),
+        ),
+        ImhDecision::DeclinedScope => format!("{base} (saem_kernel = imh: model out of scope)"),
+        ImhDecision::DeclinedHmc => format!("{base} (saem_kernel = imh: HMC owns the kernel)"),
+        ImhDecision::DeclinedInformation { ratio } => format!(
+            "{base} (saem_kernel = imh declined: {ratio:.2} obs/subject/eta < {:.2})",
+            imh_knobs(options).0.min_obs_per_eta
+        ),
     }
 }
 
@@ -4037,16 +4333,10 @@ pub fn run_saem(
     // so an HMC E-step would sample η against the unscaled conditional — η_ruv
     // sees no data curvature and collapses toward the prior. Disable HMC for
     // these models so the (correctly-scaled) MH kernels run instead.
-    let using_hmc: bool = n_leapfrog > 0
-        && model.ode_spec.is_none()
-        && model.tv_fn.is_some()
-        && n_kappa == 0
-        && model.residual_error_eta.is_none()
-        // Mixture models (#985): the E-step must sample the class indicator and
-        // run η-MCMC within the drawn class (per-subject `MIXNUM` guard). The HMC
-        // gradient kernel is class-unaware, so disable it and use the MH kernels,
-        // which honour the class thread-local set in the E-step closure.
-        && model.mixture.is_none();
+    //
+    // Mixture models (#985) likewise: see `saem_uses_hmc`, the one predicate the
+    // banner and the IMH decision also read.
+    let using_hmc: bool = saem_uses_hmc(model, options);
 
     let n_theta = init_params.theta.len();
     let n_sigma = init_params.sigma.values.len();
@@ -4110,6 +4400,36 @@ pub fn run_saem(
         ));
     }
     let target_accept_rate = if using_hmc { 0.65_f64 } else { 0.40_f64 };
+
+    // ---- f-SAEM independent-MH kernel (`saem_kernel = imh`, #1449) ----------
+    // Under the default `SaemKernel::RandomWalk` every IMH line below is inert:
+    // `imh_mode` is false, the cache stays empty, no proposal is built and no
+    // RNG draw is spent, so a default run is bit-identical to one without it.
+    let imh_decision = imh_kernel_decision(model, population, options, using_hmc);
+    let imh_mode = imh_decision == ImhDecision::On;
+    let (imh_knob, imh_knob_warnings) = imh_knobs(options);
+    if imh_decision != ImhDecision::NotRequested {
+        warnings.extend(imh_knob_warnings);
+    }
+    if let Some(w) = imh_decline_warning(imh_decision, imh_knob.min_obs_per_eta, n_eta) {
+        warnings.push(w);
+    }
+    let imh_m = options.saem_imh_proposals.max(1);
+    let imh_refresh = options.saem_imh_refresh.max(1);
+    let imh_defensive = imh_knob.defensive;
+    let imh_counters = crate::estimation::saem_imh::ImhCounters::default();
+    #[cfg(test)]
+    let rw_block_calls = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(test)]
+    let mut mh_tally: (u64, u64) = (0, 0);
+    // IMH `(accepted, proposed)` over the convergence phase, for the stuck
+    // warning (`imh_stuck_warning`).
+    let mut imh_conv: (u64, u64) = (0, 0);
+    // Per-subject cached proposal, carried across iterations. `None` = no usable
+    // proposal for this subject right now: it takes the block random walk this
+    // iteration, exactly like an HMC decline.
+    let mut imh_cache: Vec<crate::estimation::saem_imh::ImhSlot> =
+        vec![Default::default(); if imh_mode { n_subjects } else { 0 }];
 
     // Initialize state
     let theta_cur = init_params.theta.clone();
@@ -4912,6 +5232,9 @@ pub fn run_saem(
         numerical_mstep_scope_gap,
     );
     warnings.extend(mstep_option_warnings);
+    if let Some(w) = imh_noeta_theta_warning(imh_mode, numerically_estimated_theta, use_score_sa) {
+        warnings.push(w);
+    }
     let mut score_sa: Option<MstepScoreSa> = if use_score_sa {
         Some(MstepScoreSa::new(n_theta, n_sigma))
     } else {
@@ -5139,8 +5462,24 @@ pub fn run_saem(
             // can call individual_nll_iov with kappas held fixed.
             let omega_iov_for_eta_mh: Option<&OmegaMatrix> = omega_iov_cur_opt.as_ref();
 
+            // f-SAEM: hand each subject its slot. The zip needs one per subject
+            // even when the kernel is off; then they are empty, nothing reads
+            // them, and `repeat_n` yields them without allocating a buffer.
+            let imh_slots = if imh_mode {
+                rayon::iter::Either::Left(std::mem::take(&mut imh_cache).into_par_iter())
+            } else {
+                rayon::iter::Either::Right(rayon::iter::repeat_n(
+                    crate::estimation::saem_imh::ImhSlot::default(),
+                    n_subjects,
+                ))
+            };
+            let imh_counters_ref = &imh_counters;
+            #[cfg(test)]
+            let rw_block_calls_ref = &rw_block_calls;
+
             // Returns (eta_new, nll_after, n_acc_primary, n_prop_primary,
-            //          per_eta_acc_cw, n_sweeps_cw, used_hmc, mix_class)
+            //          per_eta_acc_cw, n_sweeps_cw, used_hmc, mix_class,
+            //          imh_slot)
             #[allow(clippy::type_complexity)]
             let results: Vec<(
                 Vec<f64>,
@@ -5151,6 +5490,7 @@ pub fn run_saem(
                 usize,
                 bool,
                 usize,
+                crate::estimation::saem_imh::ImhSlot,
             )> = state
                 .etas
                 .par_iter()
@@ -5158,6 +5498,7 @@ pub fn run_saem(
                 .zip(state.step_scales.par_iter())
                 .zip(state.cw_step_scales.par_iter())
                 .zip(state.kappas.par_iter())
+                .zip(imh_slots)
                 .enumerate()
                 // Per-rayon-worker `EventPkParams` scratch: allocated
                 // once per worker per outer iteration, reused across
@@ -5167,7 +5508,7 @@ pub fn run_saem(
                 // with it, n_workers × N_iter ≈ 10 × N_iter.
                 .map_init(
                     MhScratch::default,
-                    |mh_scratch, (i, ((((eta, &nll), &scale), cw_sc_i), kappas_i))| {
+                    |mh_scratch, (i, (((((eta, &nll), &scale), cw_sc_i), kappas_i), imh_slot))| {
                         let subject = &population.subjects[i];
                         let mut rng = StdRng::seed_from_u64(
                             master_seed
@@ -5269,7 +5610,55 @@ pub fn run_saem(
                         // (e.g. TV-cov subject with unsupported PK model); fall through
                         // to the block MH kernel. `did_hmc` doubles as the `used_hmc`
                         // flag reported back for diagnostics.
-                        let did_hmc = if using_hmc {
+                        // ---- f-SAEM independent-MH primary move (#1449) ----
+                        // Rebuild `(η̂_i, Γ_i)` every `saem_imh_refresh` iterations
+                        // (`ImhSlot::refresh_if_due`: never from the current η, and a
+                        // decline waits the same interval). A slot without a proposal
+                        // takes the block random walk below — the same per-subject
+                        // fallback shape as HMC.
+                        let mut imh_slot = imh_slot;
+                        if imh_mode {
+                            imh_slot.refresh_if_due(
+                                k,
+                                imh_refresh,
+                                model,
+                                subject,
+                                theta_ref,
+                                omega_ref,
+                                sigma_ref,
+                                imh_defensive,
+                                imh_counters_ref,
+                            );
+                        }
+                        // `imh_slot.prop` is `Some` only in `imh_mode` (the slots are
+                        // all empty otherwise and nothing refreshes them), so it alone
+                        // decides — one gate, not two that would cover for each other.
+                        let did_imh = match imh_slot.prop.as_ref() {
+                            Some(prop) => {
+                                let (n_acc, nll_new) = crate::estimation::saem_imh::imh_steps(
+                                    &mut eta_work,
+                                    nll_cur,
+                                    prop,
+                                    subject,
+                                    model,
+                                    theta_ref,
+                                    omega_ref,
+                                    sigma_ref,
+                                    &mut rng,
+                                    imh_m,
+                                    mh_scratch,
+                                    schedules[i].as_ref(),
+                                    imh_counters_ref,
+                                );
+                                nll_cur = nll_new;
+                                n_acc_primary = n_acc;
+                                n_prop_primary = imh_m;
+                                true
+                            }
+                            None => false,
+                        };
+
+                        let did_hmc = if using_hmc && !did_imh {
                             if let Some((new_eta, new_nll, accepted, _divergent)) =
                                 crate::estimation::hmc::hmc_step(
                                     subject, &eta_work, nll, model, theta_ref, omega_ref,
@@ -5288,7 +5677,9 @@ pub fn run_saem(
                             false
                         };
 
-                        if !did_hmc {
+                        if !did_hmc && !did_imh {
+                            #[cfg(test)]
+                            rw_block_calls_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let (n_acc, nll_new) = mh_steps(
                                 &mut eta_work,
                                 nll_cur,
@@ -5337,6 +5728,7 @@ pub fn run_saem(
                             n_prop_cw,
                             did_hmc,
                             mix_class,
+                            imh_slot,
                         )
                     },
                 )
@@ -5346,16 +5738,46 @@ pub fn run_saem(
             // posterior is recomputed at the converged parameters after the loop
             // (via `mixture_ofv`), matching what the FOCEI mixture path reports.
             let mut drawn_classes: Vec<usize> = vec![0; n_subjects];
+            let mut imh_next: Vec<crate::estimation::saem_imh::ImhSlot> =
+                Vec::with_capacity(if imh_mode { n_subjects } else { 0 });
             for (
                 i,
-                (eta_new, nll_new, n_acc, n_prop, per_eta_acc_cw, n_prop_cw, used_hmc, mix_class),
+                (
+                    eta_new,
+                    nll_new,
+                    n_acc,
+                    n_prop,
+                    per_eta_acc_cw,
+                    n_prop_cw,
+                    used_hmc,
+                    mix_class,
+                    imh_slot,
+                ),
             ) in results.into_iter().enumerate()
             {
+                // A proposal came back <=> the IMH kernel served this subject's
+                // primary move this iteration.
+                let used_imh = imh_slot.prop.is_some();
+                if imh_mode {
+                    imh_next.push(imh_slot);
+                }
+                if used_imh && k > k1 {
+                    imh_conv.0 += n_acc as u64;
+                    imh_conv.1 += n_prop as u64;
+                }
                 drawn_classes[i] = mix_class;
                 state.etas[i] = eta_new;
                 state.nll_cache[i] = nll_new;
-                state.accept_counts[i] += n_acc;
-                state.proposal_counts[i] += n_prop;
+                // Deliberately NOT fed from the IMH kernel: these counters drive
+                // the *random walk's* step scale toward its 0.40 target, and an
+                // independence sampler accepting ~0.8 would push that scale up
+                // every adaptation, chasing a target its own acceptance has
+                // nothing to do with — then hand the inflated scale to the block
+                // kernel the moment the subject's refresh declines.
+                if !used_imh {
+                    state.accept_counts[i] += n_acc;
+                    state.proposal_counts[i] += n_prop;
+                }
                 // Accumulate per-eta CW acceptance counts
                 let cw_acc_i: usize = per_eta_acc_cw.iter().sum();
                 for j in 0..n_eta {
@@ -5370,10 +5792,14 @@ pub fn run_saem(
                 // are still maintained under this rule: the interval block
                 // below resets them, and the trace reads them.
                 if rm_scale_adaptation {
-                    if n_prop > 0 || (n_cw_sweeps > 0 && !per_eta_acc_cw.is_empty()) {
+                    // `used_imh` gates the block half for the reason the counters
+                    // above skip it: this controller steers the random walk's
+                    // scale, and the IMH kernel's acceptance is not on that scale.
+                    let rw_block = rw_scale_has_evidence(used_imh, n_prop);
+                    if rw_block || (n_cw_sweeps > 0 && !per_eta_acc_cw.is_empty()) {
                         first_scale_adapt.get_or_insert(k);
                     }
-                    if n_prop > 0 {
+                    if rw_block {
                         let rate = n_acc as f64 / n_prop as f64;
                         // Inside the dead band the scale is left alone — no
                         // Robbins-Monro step, and no interval bump either,
@@ -5414,10 +5840,22 @@ pub fn run_saem(
                 // the honest E-step mixing metric (#895). The block kernel alone
                 // reads 0% for FREM-scale Ω even when the componentwise sweep is
                 // mixing fine, so a block-only rate is misleading.
-                iter_acc += n_acc + cw_acc_i;
-                iter_prop += n_prop + n_prop_cw;
+                //
+                // The IMH kernel's primary move stays out, for the reason the
+                // step-scale counters above skip it: the warning reads this rate
+                // against the random walk's 0.40 target, and an independence
+                // sampler's ~0.8 on that scale would make a badly mixing sweep look
+                // healthy. Its own acceptance is in the run's IMH counters.
+                let (blk_acc, blk_prop) = if used_imh { (0, 0) } else { (n_acc, n_prop) };
+                iter_acc += blk_acc + cw_acc_i;
+                iter_prop += blk_prop + n_prop_cw;
+                #[cfg(test)]
+                {
+                    mh_tally.0 += (blk_prop + n_prop_cw) as u64;
+                    mh_tally.1 += n_prop_cw as u64;
+                }
                 iter_target_weight +=
-                    n_prop as f64 * target_accept_rate + n_prop_cw as f64 * CW_TARGET_ACCEPT;
+                    blk_prop as f64 * target_accept_rate + n_prop_cw as f64 * CW_TARGET_ACCEPT;
             }
 
             // ---- Mixture bookkeeping (#985) ----
@@ -5427,6 +5865,9 @@ pub fn run_saem(
             if let Some(mix) = saem_mix.as_mut() {
                 mix.classes = drawn_classes;
                 mix.update_rbar(gamma);
+            }
+            if imh_mode {
+                imh_cache = imh_next;
             }
         }
 
@@ -6360,7 +6801,16 @@ pub fn run_saem(
                 // be a second, coarser controller fighting the first. The
                 // counters are still *reset* here under either rule, because the
                 // per-iteration trace reads them.
-                if !rm_scale_adaptation {
+                //
+                // Under the f-SAEM kernel a subject it served for the whole
+                // interval recorded no random-walk proposals, and the `max(1)`
+                // denominator above would read that as 0 % acceptance and ratchet
+                // its block scale down every interval — handing a collapsed step
+                // to the random walk the moment a refresh declines. So adapt only
+                // on evidence there; `imh_mode` is false by default, which keeps
+                // the default path's arithmetic untouched.
+                let rw_evidence = !imh_mode || state.proposal_counts[i] > 0;
+                if !rm_scale_adaptation && rw_evidence {
                     first_scale_adapt.get_or_insert(k);
                     state.step_scales[i] = interval_scale_update(
                         state.step_scales[i],
@@ -6533,6 +6983,48 @@ pub fn run_saem(
     ) {
         warnings.push(w);
     }
+
+    // f-SAEM: say what the kernel cost when it cost more than the random walk it
+    // replaced. A report, never a switch — see `imh_cost_warning`.
+    if imh_mode {
+        let used = imh_counters.snapshot();
+        if verbose {
+            eprintln!(
+                "SAEM f-SAEM kernel: {} proposals, acceptance {:.3}, {} refreshes, {} declined",
+                used.proposals,
+                used.accepts as f64 / used.proposals.max(1) as f64,
+                used.refreshes,
+                used.declines,
+            );
+        }
+        #[cfg(test)]
+        let stuck = IMH_STUCK_OVERRIDE
+            .with(|c| c.get())
+            .unwrap_or(SAEM_MH_STUCK_ACCEPT);
+        #[cfg(not(test))]
+        let stuck = SAEM_MH_STUCK_ACCEPT;
+        if let Some(w) =
+            crate::estimation::saem_imh::imh_stuck_warning(imh_conv.0, imh_conv.1, stuck)
+        {
+            warnings.push(w);
+        }
+        if let Some(w) =
+            crate::estimation::saem_imh::estimate_imh_cost(&used, imh_m, imh_refresh, n_mh_steps)
+                .and_then(|est| crate::estimation::saem_imh::imh_cost_warning(&est))
+        {
+            warnings.push(w);
+        }
+    }
+    #[cfg(test)]
+    LAST_IMH_SNAPSHOT.with(|c| c.set(Some(imh_counters.snapshot())));
+    #[cfg(test)]
+    LAST_BLOCK_STEP_SCALES.with(|c| c.replace(state.step_scales.clone()));
+    #[cfg(test)]
+    LAST_RW_BLOCK_CALLS.with(|c| c.set(rw_block_calls.into_inner()));
+    #[cfg(test)]
+    LAST_MH_TALLY.with(|c| c.set(mh_tally));
+    #[cfg(test)]
+    LAST_IMH_CONV.with(|c| c.set(imh_conv));
 
     // #1458: see `score_sa_failure_warning` for why every route is reported.
     if let Some(sa) = score_sa.as_ref() {

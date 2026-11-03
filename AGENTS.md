@@ -426,7 +426,12 @@ cannot expose the defect; these are ways the *assertion* cannot observe it, each
 
 For each new assertion, name the regression it exists to catch and check that regression can
 actually reach it. For a regression test that means mutation; for an anchor, feeding it the
-failure it exists to catch. Three things that "I mutation-tested it" does **not** cover:
+failure it exists to catch. The `Nightly mutants` workflow (`mutants.yml`, #2633) runs
+cargo-mutants' function-body replacement over each day's merged `src/` diff and lists the
+survivors in its job summary. It is a backstop for the hand check, not a substitute: it is
+`--lib`-only, prunes tuple-return combinations to their per-slot values, and never mutates
+string literals. Three things that "I
+mutation-tested it" does **not** cover:
 
 - **Mutating your own fix is not enough — ask what the *smallest* edit that removes it is, and
   which test dies.** On #1171 / PR #1174 sixteen tests across three tiers each died correctly
