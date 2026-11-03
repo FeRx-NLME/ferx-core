@@ -2615,9 +2615,8 @@ pub(crate) fn optimize_profiled_probed(
     };
     #[cfg(not(test))]
     let result = optimize_profiled(model, population, init_params, options);
-    let Some(layout) = ProfileLayout::build(model, population, init_params) else {
-        return result;
-    };
+    let layout = ProfileLayout::build(model, population, init_params)
+        .expect("optimize_profiled_probed is called for a model with a profiled block");
     let hold = hold_template(&layout, init_params);
     let per_iter = packed_fixed_mask(&hold).iter().filter(|&&f| !f).count() + 1;
     let budget = options

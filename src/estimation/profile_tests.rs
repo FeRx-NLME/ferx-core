@@ -6836,6 +6836,89 @@ fn a_profile_only_fit_is_converged_and_not_a_stall() {
     assert!(!eval_only.stationary_start);
 }
 
+/// #2591, the stall half per PR, with no convergence loop: F2 forced to stop at the
+/// file's inits (`forced_stop_at_start`), with `outer_maxiter = 3` bounding the probe to
+/// a few iterations, as `a_stall_at_the_inits_stays_flagged_when_the_probe_finds_lower`
+/// does for the unprofiled loop. With the probe's budget taken away (`whole_fit`) the
+/// stall is reported unprobed: no probe warning, nothing published. With it, the probe
+/// reruns the profiled loop from a perturbation of the inits, reaches a lower objective,
+/// and the stall is still reported — the inits' objective, `left_init = Some(false)`,
+/// the probe's warning, `W_STALLED_AT_INIT`, failing `Strictness::default()`. Dies when
+/// the probe is skipped (no warning, `left_init` stays `None`), and when it calls every
+/// start stationary (the probe's objective is reported).
+#[test]
+fn a_profiled_stall_at_the_inits_is_probed_and_stays_flagged() {
+    use crate::estimation::outer_optimizer::forced_stop_at_start;
+    let name = "profile_stall_probe_2591";
+    let mut p = prep(F2, F2_DATA, Some(2), |t| {
+        t.replace("kappa KAPPA_ARM ~ 1.0", "kappa KAPPA_ARM ~ 1.0 FIX")
+    });
+    p.parsed.model.name = name.to_string();
+    let model = &p.parsed.model;
+    let o = FitOptions {
+        run_covariance_step: false,
+        outer_maxiter: 3,
+        ..options(&p)
+    };
+    let has_probe_warning = |r: &crate::types::FitResult| {
+        r.warnings
+            .iter()
+            .any(|w| w.contains("stalled on its initial estimates"))
+    };
+
+    forced_stop_at_start::set(name, None, true);
+    let unprobed = crate::api::fit(model, &p.population, &p.init_params, &o).expect("unprobed");
+    assert!(!has_probe_warning(&unprobed), "{:?}", unprobed.warnings);
+    assert_eq!(
+        unprobed.left_init, None,
+        "no probe ran, so nothing is published"
+    );
+    assert!(!unprobed.converged);
+
+    forced_stop_at_start::set(name, None, false);
+    let r = crate::api::fit(model, &p.population, &p.init_params, &o).expect("probed");
+    let reached: f64 = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("stalled on its initial estimates"))
+        .and_then(|w| w.split("reached OFV = ").nth(1))
+        .and_then(|t| t.split(',').next())
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("no probe warning: {:?}", r.warnings));
+    eprintln!(
+        "profiled stall: OFV {:.6} (unprobed {:.6}), the 3-iteration probe reached {reached:.6}",
+        r.ofv, unprobed.ofv
+    );
+    assert_eq!(
+        r.ofv, unprobed.ofv,
+        "the stalled run is reported, not the probe's"
+    );
+    // Measured (Linux x86_64): the 3-iteration probe ends at 26.145018, 0.321 below the
+    // inits' 26.465827 — 32× the probe's 1e-2 tolerance; the bound is a third of that.
+    assert!(
+        reached < r.ofv - 0.1,
+        "the probe's lower objective: {reached} vs {}",
+        r.ofv
+    );
+    assert_eq!(r.left_init, Some(false));
+    assert!(!r.stationary_start && !r.converged);
+    assert!(
+        r.n_iterations > unprobed.n_iterations,
+        "the probe's evaluations count"
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("W_STALLED_AT_INIT")),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(crate::model_selection::stalled_at_init(&r), Some(true));
+    let v = crate::model_selection::check_strictness(
+        &r,
+        &crate::model_selection::Strictness::default(),
+    );
+    assert!(!v.passed, "{v:?}");
+}
+
 /// How far below the stalled inits both the cold optimum and the probe must end on the
 /// #2591 fixture: half the measured 0.744, fifty times the probe's own tolerance.
 const STALL_GAP_2591: f64 = 0.5;
