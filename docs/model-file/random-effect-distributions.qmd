@@ -91,6 +91,13 @@ including `∂/∂ω` and `∂/∂ν` / `∂/∂μ`.
   statistic, so they move by Fisher scoring on their exact score, one step per
   SAEM iteration (NONMEM's rule for such parameters) and to convergence per
   MCEM iteration. Gaussian ETAs keep their closed form.
+- **Bayes**: the η and θ moves score the exact prior (so ν and μ are sampled
+  against it). A density ETA's ω has no conjugate update, so it moves by a
+  Metropolis step on `ln ω` under the same inverse-gamma prior a Gaussian
+  variance gets.
+- **VI**: the KL term is sampled with the exact prior, and after each iteration
+  a density group's ω and shape θ maximise the prior half of the ELBO over the
+  variational draws (the MCEM objective).
 - **Simulation** draws each kind from its own distribution.
 
 A density ETA is not mu-referenced, and its omega row is labelled `custom`, with
@@ -98,9 +105,10 @@ no CV%.
 
 ### Not supported yet
 
-`method = bayes` and `method = vi`, a `[mixture]`, FREM, and FOCE without
-interaction on a correlated residual (`block_sigma`, `correlation`) are refused
-with `E_DENSITY_UNSUPPORTED`. An IOV `kappa` cannot carry a `density`
+A `[mixture]`, FREM, FOCE without interaction on a correlated residual
+(`block_sigma`, `correlation`), a multivariate t block under `method = bayes`,
+and `vi_omega_update = adam` are refused with `E_DENSITY_UNSUPPORTED`. An IOV
+`kappa` cannot carry a `density`
 ([#1717](https://github.com/FeRx-NLME/ferx-core/issues/1717)).
 
 ## Validation

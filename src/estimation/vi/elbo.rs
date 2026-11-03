@@ -358,7 +358,7 @@ struct SubjectTerms {
 /// makes the result independent of iteration order and thread count. The mixing
 /// below is SplitMix64's finalizer, which decorrelates the sequential inputs well
 /// enough that adjacent subjects do not get visibly related draws.
-fn crn_eps(seed: u64, iter: u64, subject: usize, sample: usize, d: usize) -> Vec<f64> {
+pub(crate) fn crn_eps(seed: u64, iter: u64, subject: usize, sample: usize, d: usize) -> Vec<f64> {
     let mut z = seed
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(iter.wrapping_mul(0xBF58_476D_1CE4_E5B9))
@@ -552,17 +552,26 @@ fn mc_kl_draw(
     phi: &[f64],
     eta: &[f64],
     omega: &OmegaMatrix,
+    densities: &[crate::stats::eta_density::EtaDensity],
+    theta: &[f64],
 ) -> McKlDraw {
     let d = eta.len();
     let eta_v = DVector::from_column_slice(eta);
     let oinv_eta = &omega.inv * &eta_v;
 
     let (log_q, d_log_q) = family.log_density(phi, eta);
-    // −log p(η | Ω) = ½(ηᵀΩ⁻¹η + log|Ω| + d·log 2π)
-    let neg_log_p =
+    // −log p(η | Ω) = ½(ηᵀΩ⁻¹η + log|Ω| + d·log 2π), plus a density group's `½c` (#1716).
+    let mut neg_log_p =
         0.5 * (eta_v.dot(&oinv_eta) + omega.log_det + (d as f64) * std::f64::consts::TAU.ln());
-
-    let d_eta = (0..d).map(|k| d_log_q[k] + oinv_eta[k]).collect();
+    let mut d_eta: Vec<f64> = (0..d).map(|k| d_log_q[k] + oinv_eta[k]).collect();
+    if !densities.is_empty() {
+        let (c, g, _) =
+            crate::stats::eta_density::correction_jets(densities, eta, &omega.inv, theta, false);
+        neg_log_p += 0.5 * c;
+        for (acc, gk) in d_eta.iter_mut().zip(&g) {
+            *acc += 0.5 * gk;
+        }
+    }
     let d_omega = (&omega.inv - &oinv_eta * oinv_eta.transpose()) * 0.5;
 
     McKlDraw {
@@ -730,11 +739,14 @@ fn subject_terms(
     // Resolve the KL route *before* the draw loop: the closed form is a property of
     // the family, not of the draw, so probing it once keeps the loop branch-free and
     // makes "asked for analytic, had to sample" a single decision to report.
+    // A density's prior (#1716) has no closed-form KL against a Gaussian family: it is
+    // sampled, by design rather than as a fallback.
+    let has_density = !model.eta_densities.is_empty();
     let closed_form = match cfg.kl {
-        KlMode::Analytic => family.kl_to_normal(phi, &prior),
-        KlMode::Mc => None,
+        KlMode::Analytic if !has_density => family.kl_to_normal(phi, &prior),
+        _ => None,
     };
-    let kl_fell_back = cfg.kl == KlMode::Analytic && closed_form.is_none();
+    let kl_fell_back = cfg.kl == KlMode::Analytic && closed_form.is_none() && !has_density;
     let sampling_kl = closed_form.is_none();
     let mut kl_value = 0.0;
     let mut kl_d_omega = DMatrix::<f64>::zeros(d, d);
@@ -811,7 +823,7 @@ fn subject_terms(
         // rather than a second gradient pass.
         let mut g_total = g_eta;
         if sampling_kl {
-            let draw = mc_kl_draw(family, phi, &z, &prior);
+            let draw = mc_kl_draw(family, phi, &z, &prior, &model.eta_densities, &params.theta);
             kl_value += inv_s * draw.integrand;
             kl_d_omega += draw.d_omega * inv_s;
             for (acc, g) in g_total.iter_mut().zip(draw.d_eta.iter()) {

@@ -177,6 +177,68 @@ impl DensityMstep {
     }
 }
 
+/// Bayes (#1716): one random-walk Metropolis move on `ln ω` of a univariate density
+/// group, for its full conditional `∝ Πᵢ p(zᵢ; ω, θ) · IG(ω; a₀, b₀)`. The prior is the
+/// inverse gamma the conjugate update gives a Gaussian variance, so the two kinds of ETA
+/// share one prior. Moves `omega` in place; returns whether the move was accepted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mh_log_omega(
+    d: &EtaDensity,
+    etas: &[Vec<f64>],
+    omega: &mut f64,
+    theta: &[f64],
+    a0: f64,
+    b0: f64,
+    step: f64,
+    rng: &mut impl rand::Rng,
+) -> bool {
+    use rand_distr::{Distribution, StandardNormal, Uniform};
+    debug_assert_eq!(d.etas.len(), 1, "univariate groups only");
+    let a = d.etas[0];
+    let local = EtaDensity {
+        kind: d.kind,
+        etas: vec![0],
+        shape_thetas: if d.shape_thetas.is_empty() {
+            vec![]
+        } else {
+            vec![0]
+        },
+    };
+    let shape = d.shape_thetas.first().map_or(0.0, |&k| theta[k]);
+    let ln_2pi = std::f64::consts::TAU.ln();
+    // ln of the full conditional at u = ln ω, the Jacobian `+u` included.
+    let log_target = |u: f64| -> f64 {
+        let w = u.exp();
+        let oi = DMatrix::from_element(1, 1, 1.0 / w);
+        let mut lp = -(a0 + 1.0) * u - b0 / w + u;
+        for e in etas {
+            let z = e[a];
+            let c = crate::stats::eta_density::correction(
+                std::slice::from_ref(&local),
+                &[z],
+                &oi,
+                &[shape],
+            );
+            lp += -0.5 * (z * z / w + u + ln_2pi + c);
+        }
+        lp
+    };
+    let u0 = omega.ln();
+    let n: f64 = StandardNormal.sample(rng);
+    let u1 = u0 + step * n;
+    let (l0, l1) = (log_target(u0), log_target(u1));
+    let log_u = Uniform::new(0.0f64, 1.0)
+        .map_or(0.0, |d| d.sample(rng))
+        .max(f64::MIN_POSITIVE)
+        .ln();
+    if l1.is_finite() && log_u < l1 - l0 {
+        *omega = u1.exp();
+        true
+    } else {
+        false
+    }
+}
+
 /// `ψ` of group `d` at the current `omega` and `theta`.
 fn pack(d: &EtaDensity, l: &GroupLayout, omega: &DMatrix<f64>, theta: &[f64]) -> DVector<f64> {
     let mut v = Vec::with_capacity(l.dim());

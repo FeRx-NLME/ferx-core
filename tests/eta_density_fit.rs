@@ -58,14 +58,22 @@ fn short(method: EstimationMethod, interaction: bool) -> FitOptions {
         saem_n_exploration: 5,
         saem_n_convergence: 5,
         imp_iterations: 2,
+        bayes_warmup: 40,
+        bayes_iters: 40,
+        bayes_chains: 1,
+        vi_iters: 20,
+        // VI's own `ofv` is NaN by design (the ELBO is a bound): report the Laplace
+        // objective at its estimate, which scores the density too.
+        vi_final_ofv: ferx_core::types::ViFinalOfv::Laplace,
         run_covariance_step: false,
         ..FitOptions::default()
     }
 }
 
 /// Each estimator that scores a density returns a finite objective after a few
-/// iterations, and SAEM's density M-step moves the shape θ ν off its initial value
-/// (it is owned by that step alone: the data M-step pins it).
+/// iterations. SAEM's density M-step and Bayes's Metropolis moves shift ν and the
+/// gamma's ω off their initial values (under SAEM the data M-step pins ν, so only the
+/// density step can move it).
 #[test]
 fn every_density_estimator_runs() {
     let (model, pop) = model_and_data();
@@ -75,6 +83,8 @@ fn every_density_estimator_runs() {
         (EstimationMethod::Laplace, true),
         (EstimationMethod::Saem, true),
         (EstimationMethod::Imp, true),
+        (EstimationMethod::Bayes, true),
+        (EstimationMethod::Vi, true),
     ] {
         let r = ferx_core::fit(
             &model,
@@ -88,26 +98,31 @@ fn every_density_estimator_runs() {
             "{method:?}: OFV {}",
             r.ofv
         );
-        if method == EstimationMethod::Saem {
-            assert_ne!(r.theta[3], model.default_params.theta[3], "SAEM moves ν");
+        if matches!(
+            method,
+            EstimationMethod::Saem | EstimationMethod::Bayes | EstimationMethod::Vi
+        ) {
+            assert_ne!(
+                r.theta[3], model.default_params.theta[3],
+                "{method:?} moves ν"
+            );
+            assert_ne!(r.omega[(0, 0)], 0.09, "{method:?} moves the gamma's ω");
         }
     }
 }
 
-/// The estimators that do not score a density yet refuse it by code.
+/// VI's Ω step under `vi_omega_update = adam` follows the Gaussian prior's gradient, so a
+/// density refuses it by code (the default closed-form route serves a density).
 #[test]
-fn bayes_and_vi_refuse_a_density() {
+fn vi_adam_omega_refuses_a_density() {
     let (model, pop) = model_and_data();
-    for method in [EstimationMethod::Bayes, EstimationMethod::Vi] {
-        let e = ferx_core::fit(&model, &pop, &model.default_params, &short(method, true))
-            .expect_err("refused");
-        let code = e.diagnostic().map(|d| d.code.clone());
-        assert_eq!(
-            code.as_deref(),
-            Some("E_DENSITY_UNSUPPORTED"),
-            "{method:?}: {e}"
-        );
-    }
+    let opts = FitOptions {
+        vi_omega_update: ferx_core::types::ViOmegaUpdate::Adam,
+        ..short(EstimationMethod::Vi, true)
+    };
+    let e = ferx_core::fit(&model, &pop, &model.default_params, &opts).expect_err("refused");
+    let code = e.diagnostic().map(|d| d.code.clone());
+    assert_eq!(code.as_deref(), Some("E_DENSITY_UNSUPPORTED"), "{e}");
 }
 
 /// Simulate 1000 subjects from known parameters with a Gamma clearance (ω = 0.16, so a

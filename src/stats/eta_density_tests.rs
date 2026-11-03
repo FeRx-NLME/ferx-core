@@ -1,7 +1,9 @@
 use super::*;
 use crate::sens::rtape::DualT;
 
-/// Euler–Mascheroni γ, for the closed-form digamma values.
+/// Euler–Mascheroni γ, for the closed-form digamma values. Written out: stable `std`
+/// has no `EULER_GAMMA` constant yet (`f64::consts::EGAMMA` is unstable).
+#[allow(clippy::approx_constant)]
 const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
 const LN_2PI: f64 = 1.837_877_066_409_345_5;
 

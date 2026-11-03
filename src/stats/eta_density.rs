@@ -523,9 +523,10 @@ pub(crate) fn redraw_latents(
 
 /// What a `density` random effect is not carried beside yet (#1716), as `fit()`'s refusal:
 /// a `[mixture]` (each class draws its own Ω), FREM (its covariate ETAs are Gaussian
-/// pseudo-observations), the estimators that do not score a density yet, and FOCE
-/// without interaction on a correlated residual (the conditional form FOCE takes under a
-/// density is the diagonal one). `None` when the fit can run.
+/// pseudo-observations), a multivariate t block under Bayes (its ω move is univariate),
+/// VI's Adam Ω step (the Gaussian prior's gradient), and FOCE without interaction on a
+/// correlated residual (the conditional form FOCE takes under a density is the diagonal
+/// one). `None` when the fit can run.
 pub(crate) fn fit_refusal(
     model: &crate::types::CompiledModel,
     options: &crate::types::FitOptions,
@@ -543,13 +544,23 @@ pub(crate) fn fit_refusal(
     }
     let methods = std::iter::once(options.method).chain(options.methods.iter().copied());
     for m in methods {
-        if matches!(m, M::Bayes | M::Vi) {
-            return Some(format!(
-                "`method = {m:?}` does not score a `density` random effect yet; use focei, \
-                 laplace, saem, imp or impmap"
-            ));
+        if m == M::Vi && options.vi_omega_update != crate::types::ViOmegaUpdate::ClosedForm {
+            return Some(
+                "`vi_omega_update = adam` steps Ω by the Gaussian prior's gradient; a `density` \
+                 random effect needs the default `vi_omega_update = closed_form`, whose density \
+                 groups take their own M-step"
+                    .into(),
+            );
         }
-        let foce = matches!(m, M::Foce | M::FoceGn | M::FoceGnHybrid) && !options.interaction;
+        if m == M::Bayes && model.eta_densities.iter().any(|d| d.etas.len() > 1) {
+            return Some(
+                "`method = bayes` samples a univariate `density`'s ω, not a multivariate t \
+                 block's: declare each ETA on its own `omega` line"
+                    .into(),
+            );
+        }
+        let foce = matches!(m, M::Foce | M::FoceGn | M::FoceGnHybrid)
+            && !crate::types::interaction_for(m, options.interaction);
         if foce && model.residual_cov_at(params).is_dense() {
             return Some(
                 "FOCE without interaction scores a `density` random effect in its conditional \

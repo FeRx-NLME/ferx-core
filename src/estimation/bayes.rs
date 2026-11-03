@@ -1145,6 +1145,10 @@ pub fn run_bayes(
             let mut rw_scales = vec![0.1_f64; n_pop];
             let mut acc_pop = vec![0u64; n_pop];
             let mut prop_pop = vec![0u64; n_pop];
+            // A density ETA's ln-ω random walk (#1716): its step, adapted in warmup.
+            let mut dens_step = vec![0.3f64; model.eta_densities.len()];
+            let mut dens_acc = vec![0u64; model.eta_densities.len()];
+            let mut dens_prop = vec![0u64; model.eta_densities.len()];
             // Global η step: the HMC leapfrog step and the mixture MH kernel.
             let mut eta_scale = 0.6_f64;
             let mut acc_eta = 0u64;
@@ -1382,6 +1386,9 @@ pub fn run_bayes(
                 }
 
                 // ---- 2. Ω block (conjugate full conditional) ----
+                // A density ETA's variance (#1716) has no conjugate update: it is put
+                // back after the conjugate draw and moved by Metropolis below.
+                let omega_before = omega_mat.clone();
                 if !omega_all_fixed {
                     if init_params.omega.diagonal {
                         // Diagonal Ω: each variance has an INDEPENDENT inverse-gamma
@@ -1437,6 +1444,39 @@ pub fn run_bayes(
                             );
                         }
                     }
+                }
+
+                // ---- 2d. a density ETA's ω (#1716): Metropolis on ln ω against its exact
+                // latent density, under the inverse-gamma prior the conjugate update uses.
+                if !model.eta_densities.is_empty() {
+                    let a0 = (nu0 - n_eta as f64 + 1.0) / 2.0;
+                    for (g, d) in model.eta_densities.iter().enumerate() {
+                        let j = d.etas[0];
+                        omega_mat[(j, j)] = omega_before[(j, j)];
+                        if init_params.omega_fixed.get(j).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        let mut w = omega_before[(j, j)];
+                        dens_prop[g] += 1;
+                        if crate::estimation::eta_density_mstep::mh_log_omega(
+                            d,
+                            &etas,
+                            &mut w,
+                            &theta,
+                            a0,
+                            lambda0[(j, j)] / 2.0,
+                            dens_step[g],
+                            &mut rng,
+                        ) {
+                            dens_acc[g] += 1;
+                        }
+                        omega_mat[(j, j)] = w.max(OMEGA_DIAG_FLOOR);
+                    }
+                    omega_cur = OmegaMatrix::from_matrix(
+                        omega_mat.clone(),
+                        init_params.omega.eta_names.clone(),
+                        init_params.omega.diagonal,
+                    );
                 }
 
                 // ---- 2c. Ω_iov block (conjugate inverse-Wishart over kappas) ----
@@ -1775,6 +1815,14 @@ pub fn run_bayes(
 
                 // ---- warmup adaptation of the step sizes ----
                 if sweep < n_warmup && (sweep + 1) % 50 == 0 {
+                    for g in 0..dens_step.len() {
+                        if dens_prop[g] > 0 {
+                            let r = dens_acc[g] as f64 / dens_prop[g] as f64;
+                            dens_step[g] = (dens_step[g] * (r - 0.44).exp()).clamp(1e-3, 10.0);
+                            dens_acc[g] = 0;
+                            dens_prop[g] = 0;
+                        }
+                    }
                     // Componentwise scales (bootstrap kernel).
                     for c in 0..n_pop {
                         if prop_pop[c] > 0 {
