@@ -260,45 +260,65 @@ pub(super) fn tv_refusal(model: &CompiledModel, pop: &Population, block: &str) -
     d.message.clone()
 }
 
-/// #741 analogue for the binary endpoint: a time-varying covariate in the `logit`
-/// predictor is rejected at fit setup — it would otherwise be silently frozen at the
-/// baseline snapshot (the bug the PR-807 review caught; the `types.rs` doc had claimed
-/// this was guarded when it was not).
+/// #741 analogue for the binary endpoint, narrowed by #2562: the `logit` predictor reads
+/// each record's own covariate snapshot, so a time-varying covariate is refused only for a
+/// subject whose snapshot does not line up with its binary records — here an in-memory
+/// subject with none, and one that also carries a time-to-event record — where it would
+/// otherwise be silently frozen at the baseline. Both sides of the gate in one test: the
+/// same `X` path on an aligned subject is accepted.
+///
+/// Mutations: leave the arm as it was before #2562 (refuse every time-varying covariate)
+/// and the aligned subject dies; drop the alignment test and the two unaligned ones do.
 #[cfg(feature = "survival")]
 #[test]
-fn binary_logit_time_varying_covariate_is_rejected() {
+fn binary_logit_time_varying_covariate_is_rejected_only_without_aligned_snapshots() {
     let model = parse_binary_lp_cov_model();
-    let pop = tte_cov_snapshot_pop(
-        "S1",
-        vec![
-            HashMap::from([("X".to_string(), 1.0)]),
-            HashMap::from([("X".to_string(), 2.0)]),
-        ],
-    );
+    let x = |v: f64| HashMap::from([("X".to_string(), v)]);
+    let pop = tte_cov_snapshot_pop("S1", vec![x(1.0), x(2.0)]);
     let msg = tv_refusal(&model, &pop, "binary_model");
     assert_eq!(
         msg,
         "[binary_model] on CMT=3: the logit predictor references covariate `X`, which is \
-         time-varying for subject `S1`. Time-varying covariates on the predictor are not yet \
-         supported — it is evaluated at the baseline covariate value, so the fit would silently \
-         use the wrong log-odds (#741). Use a time-constant (baseline) covariate for now.",
+         time-varying for subject `S1`, but that subject carries no per-record covariate \
+         snapshot aligned with its binary records (it also has time-to-event records, or was \
+         built in memory without `endpoint_covariates`), so the predictor could only read the \
+         baseline value (#741). Hold `X` constant within the subject, or fit the binary \
+         endpoint without the time-to-event endpoint.",
         "the whole text (#1774)"
     );
-    assert!(msg.contains("[binary_model]"), "must name the block: {msg}");
-    assert!(msg.contains('X'), "must name the covariate: {msg}");
-    assert!(msg.contains("#741"), "must cite the issue: {msg}");
     // A time-constant X is accepted.
-    let pop_ok = tte_cov_snapshot_pop(
-        "S1",
-        vec![
-            HashMap::from([("X".to_string(), 1.0)]),
-            HashMap::from([("X".to_string(), 1.0)]),
-        ],
-    );
+    let pop_ok = tte_cov_snapshot_pop("S1", vec![x(1.0), x(1.0)]);
     assert!(
         check_survival_tv_covariates(&model, &pop_ok).is_empty(),
         "a constant logit covariate must not be rejected"
     );
+    // The same varying X on binary records whose snapshots align: accepted (#2562).
+    let state = |time: f64| ObsRecord::DiscreteState {
+        time,
+        raw_time: time,
+        state: 1,
+        cmt: 3,
+    };
+    let mut aligned = tte_cov_snapshot_pop("S1", Vec::new());
+    let s = &mut aligned.subjects[0];
+    s.covariates = x(1.0);
+    s.obs_records = vec![state(0.0), state(1.0)];
+    s.endpoint_covariates = vec![x(1.0), x(2.0)];
+    assert!(
+        check_survival_tv_covariates(&model, &aligned).is_empty(),
+        "an aligned per-record snapshot must not be rejected (#2562)"
+    );
+    // A time-to-event record breaks the alignment: refused again, same text but the id.
+    let mut with_tte = aligned.clone();
+    let s = &mut with_tte.subjects[0];
+    s.obs_records.push(ObsRecord::Event {
+        time: 2.0,
+        event_type: crate::types::EventType::RightCensored,
+        entry_time: 0.0,
+        cmt: 9,
+    });
+    s.endpoint_covariates.push(x(2.0));
+    assert_eq!(tv_refusal(&model, &with_tte, "binary_model"), msg);
 }
 
 #[cfg(feature = "survival")]
@@ -377,6 +397,7 @@ fn ode_accumulated_hazard_rejects_any_time_varying_covariate() {
             hazard: crate::types::HazardSpec::OdeAccumulated { chz_state: 0 },
             recurrence: crate::types::TteRecurrence::Single,
             hazard_covariates: Vec::new(),
+            hazard_program: None,
         },
     );
     let pop = tte_cov_snapshot_pop(
@@ -717,6 +738,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         covariance_status: CovarianceStatus::Computed,
         covariance_method: Some(crate::types::CovarianceMethod::Hessian),
         shrinkage_eta: vec![],
@@ -3785,4 +3807,97 @@ fn fit_surfaces_the_npde_reference_flip_flop_count() {
     let res = crate::api::fit(&model, &tiny_population(), &model.default_params, &off)
         .expect("an in-domain fit evaluates");
     assert_eq!(flip_flop_warning(&res.warnings), None);
+}
+
+/// How many times the draw-independent half of the simulate preconditions ran on this
+/// thread while `f` ran (#1288).
+fn draw_independent_runs<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    use super::DRAW_INDEPENDENT_RUNS;
+    let before = DRAW_INDEPENDENT_RUNS.with(|n| n.get());
+    let out = f();
+    (out, DRAW_INDEPENDENT_RUNS.with(|n| n.get()) - before)
+}
+
+/// #1288: the θ-independent guards run once per uncertainty run, not once per draw. Before
+/// it, 30 draws ran them 30 times (24 on this fixture, which skips 6) — and
+/// `simulate_with_options_diag` twice, up front and again at the chokepoint.
+#[test]
+fn draw_independent_preconditions_run_once_per_call() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let mut fit = synthetic_fit(&model.default_params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = 4.0;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 30,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(7),
+    };
+    let (out, runs) =
+        draw_independent_runs(|| simulate_with_uncertainty_diag(&model, &pop, &fit, &opts));
+    let out = out.expect("uncertainty run");
+    let mut draws: Vec<usize> = out.results.iter().map(|r| r.draw).collect();
+    draws.dedup();
+    assert!(draws.len() > 1, "several draws must have run: {draws:?}");
+    assert_eq!(runs, 1, "once for {} simulated draws", draws.len());
+
+    let sim_opts = SimulateOptions {
+        seed: Some(7),
+        ..Default::default()
+    };
+    let (out, runs) = draw_independent_runs(|| {
+        simulate_with_options_diag(&model, &pop, &model.default_params, 3, &sim_opts)
+    });
+    out.expect("simulate_with_options_diag");
+    assert_eq!(
+        runs, 1,
+        "simulate_with_options_diag: once, not up front and again"
+    );
+
+    // `simulate` hands the chokepoint no proof, so it runs the list itself, once.
+    let (out, runs) =
+        draw_independent_runs(|| simulate_with_seed(&model, &pop, &model.default_params, 3, 7));
+    out.expect("simulate_with_seed");
+    assert_eq!(runs, 1, "simulate_with_seed");
+}
+
+/// #1288's trap: the hoisted checks must still run when draw 1 is the one skipped for
+/// flip-flop. A check keyed to `draw == 1` would never run on such a run, and a population
+/// whose only defect is a draw-independent one would simulate `Ok`.
+#[test]
+fn draw_independent_preconditions_run_when_draw_one_is_skipped() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    // A seed whose draw 1 lands in the flip-flop regime and is skipped, while later draws
+    // run — searched for, so the test does not lean on one RNG stream.
+    let seed = (0..200u64)
+        .find(|&seed| {
+            let (_, skipped) = skip_run(&model, 4.0, 10, seed);
+            skipped.first() == Some(&1) && skipped.len() < 10
+        })
+        .expect("some seed skips draw 1 and runs a later one");
+
+    // The same run on a population with a modeled-duration dose the model has no `D1`
+    // for: a draw-independent refusal (#324), and the skip predicate reads θ against the
+    // dosing structure, not the dose's rate mode, so draw 1 is skipped here too.
+    let mut pop = tiny_population();
+    for s in &mut pop.subjects {
+        for d in &mut s.doses {
+            d.rate_mode = crate::types::RateMode::ModeledDuration;
+        }
+    }
+    let mut fit = synthetic_fit(&model.default_params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = 4.0;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 10,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(seed),
+    };
+    let err = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
+        .expect_err("a modeled-duration dose with no `D1` is refused even with draw 1 skipped");
+    assert_eq!(err.code(), Some("E_MODELED_DURATION_NO_PARAM"), "{err}");
 }

@@ -891,10 +891,11 @@ fn test_dose_before_same_time_obs_stays_post_dose() {
 }
 
 #[test]
-fn test_obs_before_ss_dose_is_not_nudged() {
-    // An SS dose carries its own periodic pre-arrival tail; a sub-dose-time
-    // sample would read 0 instead of the SS trough, so SS doses are excluded
-    // from the record-order nudge even when the obs precedes them in the file.
+fn test_obs_before_ss_dose_is_nudged() {
+    // #2510: an observation listed before a same-TIME SS dose reads the amounts carried from
+    // the previous record, as before any other dose (NONMEM 7.5.1,
+    // `nonmem_anchor/dtmm_ss_record_order.ctl`), so it is nudged like one. Until #2510 SS
+    // doses were excluded and the observation read the steady state.
     let csv = "ID,TIME,DV,EVID,AMT,SS,II\n\
                    1,0,.,1,100,1,24\n\
                    1,24,5.0,0,.,.,.\n\
@@ -902,7 +903,21 @@ fn test_obs_before_ss_dose_is_not_nudged() {
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     let subj = &pop.subjects[0];
-    assert_eq!(subj.obs_times, vec![24.0]);
+    assert_eq!(subj.obs_times, vec![24.0_f64.next_down()]);
+    assert_eq!(subj.obs_raw_times, vec![24.0], "the written TIME is kept");
+}
+
+#[test]
+fn test_obs_after_ss_dose_is_not_nudged() {
+    // The control for `test_obs_before_ss_dose_is_nudged`: the dose row comes first, so the
+    // observation reads the steady state and stays at the tie.
+    let csv = "ID,TIME,DV,EVID,AMT,SS,II\n\
+                   1,0,.,1,100,1,24\n\
+                   1,24,.,1,100,1,24\n\
+                   1,24,5.0,0,.,.,.\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    assert_eq!(pop.subjects[0].obs_times, vec![24.0]);
 }
 
 // ── #1810: the first record at a shared TIME, when a pk-only row is in the tie ──────────
@@ -1017,17 +1032,21 @@ fn test_an_mdv1_row_is_a_pk_only_record_in_a_tie() {
 }
 
 #[test]
-fn test_a_tie_with_an_ss_dose_is_left_alone() {
-    // An SS=1 dose replaces the state at the tie, so which record governs the advance into
-    // it does not matter, and #614 keeps an observation at an SS dose's time on purpose
-    // (`test_obs_before_ss_dose_is_not_nudged`). obs, EVID=2, SS dose: nothing moves.
+fn test_a_tie_with_an_ss_dose_follows_record_order() {
+    // #2510: an SS=1 dose takes part in the tie rule like any other dose. A record listed
+    // before it reads the state carried from the previous record (NONMEM 7.5.1), so the
+    // record that advances the system into the tie matters. obs, EVID=2, SS dose: the
+    // observation is first and moves; the EVID=2 row advances by zero and stays.
     let s = tie_subject(
         "1,0,.,1,1,100,1,1,24\n1,24,5,0,0,.,1,.,.\n1,24,.,2,1,.,2,.,.\n1,24,.,1,1,100,2,1,24\n",
     );
-    assert_eq!(s.obs_times, vec![24.0]);
+    assert_eq!(s.obs_times, vec![24.0_f64.next_down()]);
     assert_eq!(s.pk_only_times, vec![24.0]);
-    // EVID=2 before an SS dose likewise.
+    // EVID=2 before an SS dose: the EVID=2 row is first, and moves below the dose.
     let s = tie_subject("1,0,.,1,1,100,1,1,24\n1,24,.,2,1,.,2,.,.\n1,24,.,1,1,100,2,1,24\n");
+    assert_eq!(s.pk_only_times, vec![24.0_f64.next_down()]);
+    // SS dose before EVID=2: the dose is first, nothing moves.
+    let s = tie_subject("1,0,.,1,1,100,1,1,24\n1,24,.,1,1,100,2,1,24\n1,24,.,2,1,.,2,.,.\n");
     assert_eq!(s.pk_only_times, vec![24.0]);
 }
 
@@ -1211,6 +1230,73 @@ fn an_implied_dose_is_marked_without_a_time_varying_covariate() {
     // the governing record's TIME and the lag still comes from the parent.
     let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,18,5,0,0,.,.,.,1\n");
     assert_eq!(implied(&s), vec![None, Some((0, 18.0))]);
+}
+
+/// `ImpliedDose::gov_time` of each dose; `None` for a dose record.
+fn gov_times(s: &crate::types::Subject) -> Vec<Option<f64>> {
+    s.doses
+        .iter()
+        .map(|d| d.implied.map(|i| i.gov_time))
+        .collect()
+}
+
+#[test]
+fn an_implied_dose_records_its_governing_records_engine_time() {
+    // #2371: the adaptive path picks an implied dose's decision window at this time, so it
+    // is the engine clock the walks order records on, not the written `TIME`.
+    // An observation governs the dose at 12, the observation co-timed at 24 the dose there,
+    // and nothing the dose at 36, which keeps its parent's time.
+    let s = addl_subject("1,0,.,1,1,100,3,12,1\n1,18,5,0,0,.,.,.,2\n1,24,5,0,0,.,.,.,3\n");
+    assert_eq!(gov_times(&s), vec![None, Some(18.0), Some(24.0), Some(0.0)]);
+    // Each governing time is that record's engine time as the subject finally holds it.
+    assert_eq!(s.dose_occasion_time(1).to_bits(), s.obs_times[0].to_bits());
+    assert_eq!(s.dose_occasion_time(2).to_bits(), s.obs_times[1].to_bits());
+    assert_eq!(s.dose_occasion_time(0), 0.0, "a dose record is its own");
+    // An explicit dose and an EVID=2 row govern with their own times.
+    let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,20,.,1,1,50,.,.,5\n1,30,5,0,0,.,.,.,6\n");
+    assert_eq!(gov_times(&s), vec![None, Some(20.0), None]);
+    let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,15,.,2,1,.,.,.,5\n1,30,5,0,0,.,.,.,6\n");
+    assert_eq!(gov_times(&s), vec![None, Some(15.0)]);
+    // A governing record listed before a co-timed dose row is moved one ULP below the tie
+    // (#614 for an observation, #1810 for an EVID=2 row) after the #1909 pass chose it;
+    // `gov_time` follows it there rather than keeping the written 18. The straddle is
+    // asserted: the record really moved.
+    for (row18, label) in [
+        ("1,18,5,0,0,.,.,.,2", "observation"),
+        ("1,18,.,2,1,.,.,.,2", "EVID=2 row"),
+    ] {
+        let s = addl_subject(&format!(
+            "1,0,.,1,1,100,1,12,1\n{row18}\n1,18,.,1,1,50,.,.,2\n1,30,5,0,0,.,.,.,6\n"
+        ));
+        let moved = if label == "observation" {
+            s.obs_times[0]
+        } else {
+            s.pk_only_times[0]
+        };
+        assert_eq!(
+            moved,
+            18.0f64.next_down(),
+            "{label}: moved below the dose row"
+        );
+        assert_eq!(
+            s.dose_occasion_time(1).to_bits(),
+            moved.to_bits(),
+            "{label}: gov_time is the record's time after the move"
+        );
+    }
+    // A reset written inside a train is moved past the train's end on the engine clock (the
+    // occasion shift), so the train's last dose (36), the only one it can govern, records the
+    // reset's engine time — not its written 20, which `param_time` keeps.
+    let s = addl_subject("1,0,.,1,1,100,3,12,1\n1,20,.,3,1,.,.,.,7\n");
+    assert_eq!(s.doses[3].time, 36.0);
+    let i = s.doses[3].implied.expect("implied");
+    assert_eq!(i.param_time, 20.0);
+    assert!(
+        s.reset_times[0] > 36.0,
+        "the shift moved the reset: {:?}",
+        s.reset_times
+    );
+    assert_eq!(i.gov_time.to_bits(), s.reset_times[0].to_bits());
 }
 
 #[test]
@@ -2104,9 +2190,9 @@ fn test_reset_rows_capture_their_own_occasion() {
 fn test_reset_occasions_skipped_without_an_iov_column() {
     // Gated exactly like `occasions` / `dose_occasions`: with no `iov_column` the reader
     // stores no occasion labels at all, and `reset_occasions` must be empty rather than a
-    // vector of zeros — `pk::reset_row_occasion` distinguishes "no label stored" (fall
-    // back to the neighbour scan) from "label is 0" by emptiness, so a zero-filled vector
-    // would silently pin every reset to occasion 0.
+    // vector of zeros — `pk::reset_row_occasion` distinguishes "no label stored" (κ = 0)
+    // from "label is 0" by emptiness, so a zero-filled vector would silently pin every
+    // reset to occasion 0.
     let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
                    1,0,.,1,1,100,1\n\
                    1,4,.,3,1,0,2\n\
@@ -3110,6 +3196,70 @@ fn routed_reader_never_places_an_endpoint_cmt_in_the_gaussian_grid() {
     assert_eq!(
         ev_routed, g3_unrouted,
         "every CMT-3 row moves from the Gaussian grid to obs_records, none is lost"
+    );
+}
+
+/// #2569: the trailing right-censored rows are flushed in the order of each CMT's
+/// *last* DV=0 row in the file — not hash order, not CMT order. CMT 3 is pended at
+/// t=5 (ahead of 4 and 2) and re-pended at t=10 (behind them), so the flush must read
+/// 4, 2, 3: a `swap_remove` in `take_tte_pending` would move 2 into 3's old slot and
+/// give 2, 4, 3, and a CMT sort gives 2, 3, 4. The t=5 row is flushed mid-subject
+/// when CMT 3 re-pends. Read 30 times, since a hash-order flush can land right by luck.
+#[cfg(feature = "survival")]
+#[test]
+fn trailing_censored_tte_rows_flush_in_file_row_order() {
+    use crate::types::{EventType, ObsRecord};
+    use std::collections::HashSet;
+    let mut f = NamedTempFile::new().expect("tempfile");
+    write!(
+        f,
+        "ID,TIME,DV,EVID,CMT\n1,5,0,0,3\n1,10,0,0,4\n1,10,0,0,2\n1,10,0,0,3\n"
+    )
+    .expect("write csv");
+    let tte: HashSet<usize> = [2, 3, 4].into_iter().collect();
+    let routing = ObsRouting::tte_and_discrete(&tte, &HashSet::new());
+    for read in 0..30 {
+        let (pop, _) = read_nonmem_csv_routed(f.path(), None, None, &[], None, None, &routing, &[])
+            .expect("fixture reads");
+        let got: Vec<(usize, f64)> = pop.subjects[0]
+            .obs_records
+            .iter()
+            .map(|r| match r {
+                ObsRecord::Event {
+                    cmt,
+                    time,
+                    event_type: EventType::RightCensored,
+                    ..
+                } => (*cmt, *time),
+                other => panic!("expected a right-censored Event, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![(3, 5.0), (4, 10.0), (2, 10.0), (3, 10.0)],
+            "read {read}: trailing censored records must follow each CMT's last DV=0 row"
+        );
+    }
+}
+
+/// A DV=2 right bound takes only its *own* CMT's pending DV=0 row: with a DV=0
+/// pending on CMT 3 alone, a DV=2 on CMT 2 has no left bound and is an error naming
+/// CMT 2. A `take_tte_pending` that ignored the CMT would pair it with CMT 3's row
+/// and silently read an interval-censored event on the wrong cause.
+#[cfg(feature = "survival")]
+#[test]
+fn interval_right_bound_without_its_own_cmt_left_bound_is_rejected() {
+    use std::collections::HashSet;
+    let mut f = NamedTempFile::new().expect("tempfile");
+    write!(f, "ID,TIME,DV,EVID,CMT\n1,5,0,0,3\n1,10,2,0,2\n").expect("write csv");
+    let tte: HashSet<usize> = [2, 3].into_iter().collect();
+    let routing = ObsRouting::tte_and_discrete(&tte, &HashSet::new());
+    let err = read_nonmem_csv_routed(f.path(), None, None, &[], None, None, &routing, &[])
+        .expect_err("a DV=2 with no DV=0 on its own CMT must be rejected");
+    assert!(
+        err.contains("DV=2 row at TIME=10 on CMT=2")
+            && err.contains("not preceded by a DV=0 row on the same CMT"),
+        "error must name the orphan DV=2 row and its CMT, got: {err}"
     );
 }
 

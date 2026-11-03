@@ -603,6 +603,14 @@ pub fn run_model_simulate_with_overrides(
     // to the "nothing to simulate" message (CTMM-only) or the all-zero Gaussian emitter
     // (with `times`); the library `simulate()` chokepoint panics on the same case.
     #[cfg(feature = "markov")]
+    if parsed.model.has_dtmm() {
+        return Err(super::entry_refusals::ctmm_unsupported(
+            "[simulation]: a [markov_model] `type = dtmm` endpoint cannot be simulated yet — \
+             sampling a discrete-time state chain is a later slice. fit() supports DTMM; \
+             --simulate does not.",
+        ));
+    }
+    #[cfg(feature = "markov")]
     if parsed.model.has_ctmm() {
         // `E_CTMM_UNSUPPORTED`, the code `simulate*` gives it (#2062 review N2).
         return Err(super::entry_refusals::ctmm_unsupported(
@@ -807,6 +815,7 @@ pub fn run_model_simulate_with_overrides(
     let SimulationOutput {
         results: sim_results,
         warnings: sim_warnings,
+        ..
     } = simulate_with_options_diag(
         &parsed.model,
         &template,
@@ -967,7 +976,8 @@ pub fn run_model_simulate_with_overrides(
             // observed 0). The loop now binds an empty `sims` instead of `continue`-ing,
             // so this drop reaches the all-NaN subject too.
             {
-                subject.obs_records.retain_mut(|rec| {
+                // `retain_records` drops a record's covariate snapshot with it (#2562).
+                subject.retain_records(|rec| {
                     let crate::types::ObsRecord::DiscreteState {
                         state,
                         cmt,
@@ -1243,7 +1253,11 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
     let discrete_cmts: std::collections::HashSet<usize> = {
         let discrete: std::collections::HashSet<usize> = model.binary_cmts().into_iter().collect();
         #[cfg(feature = "markov")]
-        let discrete = discrete.into_iter().chain(model.ctmm_cmts()).collect();
+        let discrete = discrete
+            .into_iter()
+            .chain(model.ctmm_cmts())
+            .chain(model.dtmm_cmts())
+            .collect();
         discrete
     };
     #[cfg(not(feature = "survival"))]
@@ -1262,7 +1276,8 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
         .endpoints
         .iter()
         .filter_map(|(&cmt, ep)| match ep {
-            EndpointLikelihood::Ctmm { state_codes, .. } => {
+            EndpointLikelihood::Ctmm { state_codes, .. }
+            | EndpointLikelihood::Dtmm { state_codes, .. } => {
                 state_codes.first().map(|&code| (cmt, code))
             }
             _ => None,

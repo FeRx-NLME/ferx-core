@@ -51,6 +51,15 @@ A CSV file with per-observation diagnostics, one row per observation per subject
 | `TAD` | Time after most recent dose (SS-aware) |
 | *`[derived]` names* | One column per expression in the `[derived]` block |
 | *`[output]` names* | Covariates and individual parameters declared in `[output]` |
+| `COXSNELL` | Time-to-event rows only: Cox–Snell residual `ΔH`; omitted without a TTE endpoint |
+| `MARTINGALE` | Time-to-event rows only: martingale residual `δ − ΔH` |
+| `DEVIANCE` | Time-to-event rows only: deviance residual |
+| `PIT` | Time-to-event rows only: probability-integral transform `exp(−ΔH)` |
+
+A fit with a binary endpoint adds one row per binary record after the Gaussian rows, and a fit
+with a time-to-event endpoint adds one row per TTE record after those, with `DV` the event
+indicator. The four TTE columns, their definitions and which cells are blank are in
+[Time-to-event residuals](estimation/tte.qmd#tte-residuals).
 
 ### Individual-parameter columns
 
@@ -298,7 +307,7 @@ absent when there is nothing to list.
   objective](warnings.qmd#non-finite-objective).
 - **final_gradient_max_abs** / **final_gradient_source**: |g|∞, the largest
   absolute component of the fit's `final_gradient`, and where that vector came
-  from (`optimizer` or `finite_difference`). The console prints the same thing
+  from (`optimizer`, `analytic` or `finite_difference`). The console prints the same thing
   as a `Final gradient:` line right under `Converged:` (#1934). It is measured in
   the packed optimizer coordinates and is a comparative figure, not a pass/fail
   test — see [What the reporting gradient
@@ -364,7 +373,7 @@ The `estimation:` block replaces the standalone `{model}-timing.txt` file
 covered the whole CLI run, so the two are not a like-for-like replacement,
 just the closest equivalent), and `n_threads_used` is the Rayon worker count
 used. `wall_time_secs` is further broken down (#713) into a `{method}_wall_time_secs`
-entry for each stage of `method = ...`/`methods = [...]` (e.g. `focei_wall_time_secs`,
+entry for each stage of `method = ...`/`method = [...]` (e.g. `focei_wall_time_secs`,
 `imp_wall_time_secs` for a `[focei, imp]` chain) plus `covariance_wall_time_secs`
 for the post-estimation FD-Hessian / SIR-fallback step, which only ever runs
 once, on the last estimating stage (#615). The per-stage keys measure
@@ -602,7 +611,8 @@ Counters from the inner-loop (EBE) optimizer, useful for diagnosing problematic 
 |-------|-------------|
 | `ebe_convergence_warnings` | Number of outer iterations in which at least one subject had an unconverged EBE |
 | `max_unconverged_subjects` | Worst-case unconverged-subject count seen in a single outer iteration |
-| `total_ebe_fallbacks` | Total number of times the Nelder-Mead fallback was invoked across all subjects and outer iterations |
+| `total_ebe_fallbacks` | Total number of times, summed over all subjects and outer iterations, that an inner solve returned a fallback's point (the Nelder–Mead recovery after the primary search failed, or the runaway-EBE guard's). A fallback point that a multi-start candidate replaced is not counted. Counted only by the outer loop under an NLopt optimizer (`auto`, `bobyqa`, `slsqp`, `mma`, and `nlopt_lbfgs` with its aliases `lbfgs` / `bfgs`) for FOCE, FOCEI, Laplace and AGQ, by a fit with a `profile`d level block, and by Bayes; every other path (e.g. `optimizer = trust_region`, SAEM, `gn` and `gn_hybrid`, VI, IMP / IMPMAP) reports 0 |
+| `total_ebe_nm_polished` | Under `inner_optimizer = nelder_mead`: total number of times, counted the same way, that a Nelder–Mead stop was not a mode and the stationarity certificate moved it there with the gradient. Never counted together with a fallback for the same solve. 0 under every other `inner_optimizer`, and on every path that does not count `total_ebe_fallbacks` |
 
 ## Optimizer Trace CSV
 

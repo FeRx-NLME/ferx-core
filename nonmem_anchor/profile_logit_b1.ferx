@@ -1,0 +1,28 @@
+# Fixture B1 of #2562 and of the binary half of #2111, and its NONMEM anchor: a binary
+# endpoint whose unstructured placebo block is read on the log-odds. Written by
+# `simulate_profile_logit_b1.py`. 10 studies x 4 visits x 2 arms x 30 Bernoulli rows,
+# 2400 rows, ID = study, synthetic (seed 2111): TVL -0.5, EMAX 1.0, SD of the study eta
+# 0.5, so the arm-visit probabilities run from about 0.2 to 0.8 and the link is live
+# everywhere. Data: `profile_logit_b1.csv` beside this file.
+#
+# The level changes at every visit and TRT between the arms of one study, so each record
+# is scored at its own level and its own arm. NONMEM codes this model with every level a
+# THETA (each study's last visit dependent, as ferx lays it out) in
+# `profile_logit_b1_laplace.ctl`, under `METHOD=COND LAPLACE LIKE`.
+
+[parameters]
+  theta TVL(-0.3, -5.0, 5.0)
+  theta EMAX(0.5, -5.0, 5.0)
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -10.0, 10.0)
+  omega ETA_S ~ 0.25
+
+[covariates]
+  STUDY categorical
+  TRT   continuous
+
+[binary_model]
+  cmt   = 1
+  logit = TVL + PLACEBO + ETA_S + EMAX * TRT
+
+[fit_options]
+  method     = laplace

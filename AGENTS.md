@@ -357,8 +357,8 @@ prose exactly the configuration that produced the defect. If two callers genuine
 share, record the asymmetry at the call site.
 
 **A green test is not evidence that it can fail.** The rule above is about a fixture that
-cannot expose the defect; these are three ways the *assertion* cannot observe it, all three
-found on #1166 in tests that had been written, run green and believed:
+cannot expose the defect; these are ways the *assertion* cannot observe it, each found
+(the first three on #1166) in tests that had been written, run green and believed:
 
 - **A differential pair must straddle the gate under the OLD behaviour.** A routing oracle
   compared `hazard = h` against `h * (1.0 + 0.0*TIME)` — the exact IEEE identity, so any
@@ -385,7 +385,29 @@ found on #1166 in tests that had been written, run green and believed:
   so the test pinning that the check excludes Σ could not fail. When a
   predicate has two conditions that reject the same inputs that is a test hole, not
   belt-and-braces: collapse to one gate and re-run the mutation. Reading the code missed this
-  twice; only mutation found it.
+  twice; only mutation found it. It is not a one-off: #1311 wrote the same shape fresh in
+  `sens/propagate.rs`, a `ss_seed_phase(dose, lag) > 0` clamp followed by an
+  `if phase.val() > 0.0` guard — both derived from `II − lag`, so they partition identically
+  and the test pinning the `ALAG ≥ II` clamp could not fail on either. The detector: when two
+  conditions derive from the same quantity, ask what inputs each *alone* rejects; if it is the
+  same set, it is one gate written twice. A predicate that cannot change the answer for any
+  input that **reaches** it is the degenerate case — #1229's `is_diagonal_omega_source` ran only
+  after the block arm had returned, so it always answered "diagonal" and a mutation to it
+  sailed through. Delete it rather than keep it as a second gate.
+- **A shared arm needs an assertion on what makes its inputs different.** When one branch
+  serves several inputs — deliberately, because the logic really is shared — every assertion
+  about the shared logic passes for all of them, so the test says nothing about the part that
+  differs: a keyword, a name, a unit. On #1229 `block_omega` and `block_kappa` correctly route to
+  one near-singular message arm, but the arm hardcoded `` `block_omega` ``, telling a
+  `block_kappa` user to fix a block that appears nowhere in their file. Both near-singular tests
+  asserted `contains("correlation")` and `!contains("≥ 1e-5")` — true of either message — and
+  the defect survived preflight, the full `ci,survival` suite and a slow-tests dispatch; it was
+  found by reading the diff. Do not un-share the arm; assert the discriminator explicitly **and
+  its negative** (`` contains("`block_kappa`") && !contains("block_omega") ``, as
+  `near_singular_block_kappa_is_reported_as_a_correlation_problem` now does), so a value naming
+  both cannot pass. Then mutate: swapping the discriminator must redden that input's test *and
+  only* that one. This is the mirror of the fast-path entry above — there the fixture never
+  reaches the code; here it reaches it and the assertion looks away.
 - **`is_finite()` cannot see a sentinel.** It is the right assertion for a *diverged* solve
   (`NaN`/`inf`) and the wrong one for a subject that was **repelled**: `tte_nll_from_curves`
   maps a `NaN` `H` to `1e20`, a perfectly finite `f64`, and #1223 measured an objective of

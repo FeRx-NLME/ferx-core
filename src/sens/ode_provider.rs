@@ -52,7 +52,12 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
-    if ode.rhs_program.is_none() {
+    let Some(program) = ode.rhs_program.as_ref() else {
+        return false;
+    };
+    // An `init(...)` seeds the walks through its compiled program (`init_seed`); one without
+    // it has no exact seed, so the model declines to the FD fallback.
+    if ode.init_fn.is_some() && !program.has_init_program() {
         return false;
     }
     // A `TIME`-built-in structural parameter is served ONLY via the event-driven TV walk
@@ -220,12 +225,6 @@ pub(crate) fn static_walk_subject_supported(model: &CompiledModel, subject: &Sub
     // `has_infusion_into_input_rate`): the f64 prediction is exact, but the dual walk's `+rate`
     // injection would double-count the mass the convolved `R_in_inf` already delivers.
     if has_infusion_into_input_rate(model, subject) {
-        return false;
-    }
-    // Joint PK-TTE under a steady-state dose (#1210) — see
-    // `ss_dual_equilibration_out_of_scope`. Declined on both ODE routes, so a subject cannot
-    // reach a dual SS equilibration by taking the other one.
-    if ss_dual_equilibration_out_of_scope(model, subject) {
         return false;
     }
     // Model-level scope + time-varying covariates (the static dual walk holds the PK
@@ -435,24 +434,6 @@ pub(crate) fn modeled_slot_for(
     }
 }
 
-/// A joint PK-TTE system (injected `d/dt(__chz_<cmt>)` accumulators) whose subject carries a
-/// steady-state dose is outside the dual providers' scope (#1210).
-///
-/// The dual SS equilibrations hold no accumulator rows still and restore none, so they would
-/// bank the run-in's hazard into the jet the way the f64 path did before #1210. The f64 path
-/// is fixed; FD differentiates *that*, so declining here is both correct and cheap — a joint
-/// model's inner gradient is FD regardless (`inner_optimizer`'s `has_tte` route).
-///
-/// Keyed on `chz_state_slots`, not on `has_tte()`: an analytic-family TTE model carries no
-/// accumulator and its SS dosing is served fine.
-pub(crate) fn ss_dual_equilibration_out_of_scope(model: &CompiledModel, subject: &Subject) -> bool {
-    model
-        .ode_spec
-        .as_ref()
-        .is_some_and(|o| !o.chz_state_slots.is_empty())
-        && subject.has_ss_doses()
-}
-
 /// Whether a steady-state subject's RHS reads a clock the dual SS run-in cannot mirror:
 /// `TIME`/`T` or `TAFD` (no periodic steady state to converge to — production's own values
 /// for them under `SS=1` are #1139's open half), or `TAD` together with a lagged SS dose,
@@ -461,9 +442,8 @@ pub(crate) fn ss_dual_equilibration_out_of_scope(model: &CompiledModel, subject:
 /// clocks (`ss_run_in_params`), the quiet window included.
 ///
 /// Asked of the **PK block** only. The wide (augmented-system) view differs from it only on a
-/// joint PK-TTE model, and every such subject with an SS dose has already been declined by
-/// [`ss_dual_equilibration_out_of_scope`] at both call sites; a wide check here would be a
-/// second gate rejecting the same inputs, so neither could be shown to work.
+/// joint PK-TTE model, whose accumulator rows the run-in holds still (`mask_chz`, #1210): a
+/// hazard line reading a clock never enters the equilibration.
 fn ss_clock_out_of_scope(
     program: &crate::parser::model_parser::OdeRhsProgram,
     model: &CompiledModel,
@@ -487,19 +467,6 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // prediction is exact; the dual walk would double-count the suppressed `+rate`). Same decline
     // as the static gate above — see `has_infusion_into_input_rate`.
     if has_infusion_into_input_rate(model, subject) {
-        return false;
-    }
-    // A joint PK-TTE system under a steady-state dose (#1210): the dual SS equilibration
-    // (`equilibrate_ss_state_g`) has no `d/dt(__chz_<cmt>)` handling, so it would cycle the
-    // accumulator through the run-in exactly as the f64 path did before #1210. Decline the
-    // subject so the walk falls back to FD, which runs on the *fixed* f64 predictor.
-    //
-    // The fit already routed here — `inner_optimizer` sends every `[event_model]` model to the
-    // FD inner gradient — but `fd_fallback_warning` probes `subject_eta_grad` to count the
-    // fallbacks, and that probe reached the dual SS equilibration for real. Without this the
-    // probe reports these subjects as analytic, which both mislabels the fit (the very drift
-    // the warning exists to catch) and, with the #1210 tripwire in place, panics.
-    if ss_dual_equilibration_out_of_scope(model, subject) {
         return false;
     }
     // The event-driven walk serves a subject with time-varying covariates, an estimated
@@ -687,8 +654,9 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // An EVID 3/4 **reset** also composes with `init` (#486): production re-applies
     // `init(&pk_at_reset[idx].values)` at each reset — the reset ROW's own snapshot, since an
     // EVID=3/4 row is a data record (#1133) — and the `K_RESET` branch of `integrate_tvcov_g`
-    // mirrors that by re-seeding the state from `pk_at_reset[idx]` (via the shared
-    // `init_taylor_seed_at`, carrying `∂init/∂(θ,η)` at that snapshot) instead of zeroing —
+    // mirrors that by re-seeding the state from `pk_at_reset[idx]` (the compiled init program
+    // on the walk's type, `init_seed`, carrying `∂init/∂(θ,η)` at that snapshot) instead of
+    // zeroing —
     // validated pre-#2093 by
     // `ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot`, whose covariate moves
     // at the reset row so the snapshot is observable.
@@ -782,72 +750,6 @@ pub(crate) fn ode_iov_model_scope(model: &CompiledModel) -> bool {
     model.n_kappa > 0 && model.frem_config.is_none() && ode_walk_model_scope(model)
 }
 
-/// Central finite differences of `init_fn` over the differentiated PK slots — the
-/// stencil behind `init_taylor_seed_at` (and through it `tvcov_init_state` and
-/// `init_seed`'s closure fallback), so the
-/// `he`/`h2` steps and the 2-/3-/4-point formulas live in **one** place. Returns
-/// `(base, d1, d2)` where `d1[s][i] = ∂init_s/∂p_{pk_indices[i]}` and, when `want_d2`, the
-/// symmetric `d2[s][i][j] = ∂²init_s/∂p_i∂p_j`; `d2` is empty otherwise (gradient-only
-/// callers). `init_fn` is a cheap HashMap eval, so the FD cost is negligible.
-fn init_fd_derivs(
-    init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
-    pk: &[f64],
-    pk_indices: &[usize],
-    n_states: usize,
-    want_d2: bool,
-) -> (Vec<f64>, Vec<Vec<f64>>, Vec<Vec<Vec<f64>>>) {
-    let he = 1e-6;
-    let h2 = 1e-4;
-    let np = pk_indices.len();
-    let base = init_fn(pk);
-    let mut d1 = vec![vec![0.0; np]; n_states];
-    for (i, &si) in pk_indices.iter().enumerate() {
-        let mut pp = pk.to_vec();
-        pp[si] += he;
-        let mut pm = pk.to_vec();
-        pm[si] -= he;
-        let (up, dn) = (init_fn(&pp), init_fn(&pm));
-        for s in 0..n_states {
-            d1[s][i] = (up[s] - dn[s]) / (2.0 * he);
-        }
-    }
-    let mut d2: Vec<Vec<Vec<f64>>> = Vec::new();
-    if want_d2 {
-        d2 = vec![vec![vec![0.0; np]; np]; n_states];
-        for (i, &si) in pk_indices.iter().enumerate() {
-            let mut pp = pk.to_vec();
-            pp[si] += h2;
-            let mut pm = pk.to_vec();
-            pm[si] -= h2;
-            let (up, dn) = (init_fn(&pp), init_fn(&pm));
-            for s in 0..n_states {
-                d2[s][i][i] = (up[s] - 2.0 * base[s] + dn[s]) / (h2 * h2);
-            }
-            for (j, &sj) in pk_indices.iter().enumerate().skip(i + 1) {
-                let mut a = pk.to_vec();
-                a[si] += h2;
-                a[sj] += h2;
-                let mut b = pk.to_vec();
-                b[si] += h2;
-                b[sj] -= h2;
-                let mut c = pk.to_vec();
-                c[si] -= h2;
-                c[sj] += h2;
-                let mut d = pk.to_vec();
-                d[si] -= h2;
-                d[sj] -= h2;
-                let (va, vb, vc, vd) = (init_fn(&a), init_fn(&b), init_fn(&c), init_fn(&d));
-                for s in 0..n_states {
-                    let v = (va[s] - vb[s] - vc[s] + vd[s]) / (4.0 * h2 * h2);
-                    d2[s][i][j] = v;
-                    d2[s][j][i] = v;
-                }
-            }
-        }
-    }
-    (base, d1, d2)
-}
-
 /// Seed the ODE `init(...)` initial state for the **event-driven TV-cov walk**, on the
 /// walk's own dual basis (whatever `T` the adjoint's recorder propagates). The TV-cov walk
 /// propagates its state on the recorder's basis directly (each event's taped parameter
@@ -857,27 +759,14 @@ fn init_fd_derivs(
 ///
 /// Production seeds `init` at the subject's **first record** covariate snapshot
 /// (`init_pk`, `predictions.rs`: smallest record time across dose / obs / pk-only), so
-/// we pick that snapshot's already-seeded PK duals `p` and expand `init` as a
-/// second-order Taylor series in the PK params, evaluated with `T` arithmetic:
-///
-/// ```text
-/// init_s ≈ init_fn(p̄)_s + Σ_i (∂init_s/∂p_i)·(p_i − p̄_i)
-///                       + ½ Σ_ij (∂²init_s/∂p_i∂p_j)·(p_i − p̄_i)(p_j − p̄_j)
-/// ```
-///
-/// The `∂init/∂p` derivatives come from the shared `init_fd_derivs` stencil. Each delta
-/// `(p_i − p̄_i)` has value 0 and carries the snapshot's θ/η jet, so `T`'s own product rule
-/// propagates it to the walk basis exactly. A `Dual1` inner walk (`T::SECOND_ORDER == false`)
-/// **skips the second-order block and term entirely** — its ε² is zero, so the quadratic
-/// term would contribute nothing — leaving the same first-order η-gradient the `Dual2` outer
-/// walk carries. All-zero when the subject has no records (defensive).
+/// this evaluates the compiled init program at that snapshot's already-seeded PK duals
+/// ([`init_seed`]). All-zero when the subject has no records (defensive).
 fn tvcov_init_state<T: crate::sens::num::vm::VmNum>(
     ode: &crate::ode::OdeSpec,
     subject: &Subject,
     pk_at_dose: &[Vec<T>],
     pk_at_obs: &[Vec<T>],
     pk_at_pk_only: &[Vec<T>],
-    pk_indices: &[usize],
     n_states: usize,
 ) -> Vec<T> {
     // First-record snapshot (smallest record time), matching production's `init_pk` selection.
@@ -885,7 +774,7 @@ fn tvcov_init_state<T: crate::sens::num::vm::VmNum>(
         Some(p) => p,
         None => return vec![T::from_f64(0.0); n_states],
     };
-    init_seed::<T>(ode, snap, pk_indices).unwrap_or_else(|| vec![T::from_f64(0.0); n_states])
+    init_seed::<T>(ode, snap).unwrap_or_else(|| vec![T::from_f64(0.0); n_states])
 }
 
 /// The PK-param snapshot at the subject's **first record**, [`crate::dosing::first_record`]
@@ -912,95 +801,24 @@ fn first_record_pk<'a, T: crate::sens::num::PkNum>(
 }
 
 /// The `init(...)` state at the PK-parameter snapshot `snap`, on the walk's own number
-/// type: the compiled init program evaluated on `T` — exact to every order `T` carries —
-/// or, only for an init the compiled form cannot express (a mixture's `MIXNUM`), the
-/// Taylor seed of the f64 closure (`init_taylor_seed_at`).
+/// type: the compiled init program evaluated on `T`, exact to every order `T` carries.
+/// `None` for a model without `init(...)`. [`ode_walk_model_scope`] admits an `init(...)` only
+/// where it compiled (`has_init_program`), so every walk that reaches here has the program;
+/// one that did not declines the whole model to the FD fallback before any walk runs.
 pub(crate) fn init_seed<T: crate::sens::num::vm::VmNum>(
     ode: &crate::ode::OdeSpec,
     snap: &[T],
-    pk_indices: &[usize],
 ) -> Option<Vec<T>> {
-    let n_states = ode.n_states;
-    if let Some(u) = ode
+    ode.init_fn.as_ref()?;
+    let seed = ode
         .rhs_program
         .as_ref()
-        .and_then(|p| p.init_state_g(snap, n_states))
-    {
-        return Some(u);
-    }
-    let f = ode.init_fn.as_ref()?;
-    Some(init_taylor_seed_at::<T>(
-        f.as_ref(),
-        snap,
-        pk_indices,
-        n_states,
-    ))
-}
-
-/// Seed the ODE `init(...)` state on the walk's own dual basis from a **given** PK-param
-/// snapshot `snap` (already seeded on `(θ, η[, κ])`), as a second-order Taylor of `init` in the
-/// PK params about `snap.val()`. Shared by `tvcov_init_state` (which selects the first-record
-/// snapshot, production's `init_pk`) and the event-driven walk's **EVID 3/4 reset** re-seed
-/// (which uses the reset ROW's own snapshot — production's `pk_at_reset[idx]`, #486 / #1133):
-/// production re-applies `init(...)` at each reset from the `$PK` that runs at that row, so the
-/// dual walk must rebuild the seed from those params, not carry the one subject-level jet.
-///
-/// The `∂init/∂p` derivatives come from the shared `init_fd_derivs` stencil. Each delta
-/// `(p_i − p̄_i)` has value 0 and carries the snapshot's θ/η[/κ] jet, so `T`'s own product rule
-/// propagates it to the walk basis exactly. A `Dual1` inner walk (`T::SECOND_ORDER == false`)
-/// **skips the second-order block and term entirely** — its ε² is zero, so the quadratic term
-/// contributes nothing — leaving the same first-order gradient the `Dual2` outer walk carries.
-fn init_taylor_seed_at<T: crate::sens::num::PkNum>(
-    init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
-    snap: &[T],
-    pk_indices: &[usize],
-    n_states: usize,
-) -> Vec<T> {
-    // Central FD of `init_fn` at that snapshot via the shared stencil. The inner `Dual1`
-    // walk (`T::SECOND_ORDER == false`) discards the quadratic term, so skip the `d2` block
-    // entirely there rather than build a Hessian it drops.
-    let want_2nd = T::SECOND_ORDER;
-    let pk_vals: Vec<f64> = snap.iter().map(|x| x.val()).collect();
-    let (base, d1, d2) = init_fd_derivs(init_fn, &pk_vals, pk_indices, n_states, want_2nd);
-    let np = pk_indices.len();
-
-    // Deltas δ_i = p_i − p̄_i (value 0, carry the snapshot's θ/η jets).
-    let deltas: Vec<T> = pk_indices
-        .iter()
-        .map(|&si| snap[si] - T::from_f64(pk_vals[si]))
-        .collect();
-
-    // Taylor-compose on the walk basis via `T` arithmetic:
-    //   init_s ≈ base_s + Σ_i d1_i·δ_i + ½ Σ_i d2_ii·δ_i² + Σ_{i<j} d2_ij·δ_iδ_j
-    // The linear term contributes `Σ_i d1_i H_i` to the Hessian; the diagonal ½·δ_i² gives
-    // `d2_ii g_i⊗g_i` and each off-diagonal `δ_iδ_j` gives `g_i⊗g_j + g_j⊗g_i` — visiting
-    // `i<j` once (with the full `d2_ij` coefficient, `d2` symmetric) yields the exact
-    // `Σ_ij d2_ij g_i⊗g_j` at half the O(np²·M²) Dual2 work of the all-ordered form.
-    let mut out = Vec::with_capacity(n_states);
-    for s in 0..n_states {
-        let mut acc = T::from_f64(base.get(s).copied().unwrap_or(0.0));
-        for i in 0..np {
-            if d1[s][i] != 0.0 {
-                acc = acc + T::from_f64(d1[s][i]) * deltas[i];
-            }
-        }
-        if want_2nd {
-            for i in 0..np {
-                let cd = 0.5 * d2[s][i][i];
-                if cd != 0.0 {
-                    acc = acc + T::from_f64(cd) * deltas[i] * deltas[i];
-                }
-                for j in (i + 1)..np {
-                    let c = d2[s][i][j];
-                    if c != 0.0 {
-                        acc = acc + T::from_f64(c) * deltas[i] * deltas[j];
-                    }
-                }
-            }
-        }
-        out.push(acc);
-    }
-    out
+        .and_then(|p| p.init_state_g(snap, ode.n_states));
+    debug_assert!(
+        seed.is_some(),
+        "the walks' scope admits only a compiled init(...)"
+    );
+    seed
 }
 
 /// Apply the model's output transforms to a dual prediction, in PK-parameter dual
@@ -1201,6 +1019,7 @@ pub(crate) fn integrate_seeded_duals<T: crate::sens::num::vm::VmNum>(
         program,
         ode.n_states,
         subject,
+        &subject.obs_times,
         ode,
         &prepared_forcings,
         params_dual,
@@ -1293,7 +1112,6 @@ fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
             pk_at_dose,
             pk_at_obs,
             pk_at_pk_only,
-            &model.pk_indices,
             ode.n_states,
         ),
         None => vec![T::from_f64(0.0); ode.n_states],
@@ -1337,13 +1155,13 @@ fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
         ode,
         ode.n_states,
         subject,
+        &subject.obs_times,
         pk_at_dose,
         pk_at_obs,
         pk_at_pk_only,
         pk_at_reset,
         &f_bio_at_dose,
         &init_state,
-        &model.pk_indices,
         first_dose_time,
         &dose_lag_slot,
         &dose_modeled_slot,
@@ -1537,7 +1355,7 @@ pub(crate) fn ode_iov_walk_scope(
 /// Read by the adjoint's `record_ode_iov`; before #2093 it was shared by the outer and
 /// inner IOV walks so their per-event seeding decisions could not desync (#637 round-2
 /// review #4).
-fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
+pub(crate) fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
     subject.has_tv_covariates()
         || !subject.pk_only_covariates.is_empty()
         // EVID=3/4 snapshots (#1133), mirroring production's `subject_needs_per_event_pk`.
@@ -1610,20 +1428,16 @@ fn seed_iov_events<T: Clone>(
                 }
             })
             .collect::<Option<_>>()?;
-        // EVID=3/4 reset rows (#1133): the reset row's own covariate snapshot, under the
-        // occasion [`crate::pk::reset_row_occasion`] resolves — the record `last_pk` held
-        // there before #1133, so the covariate fix does not also move κ. This must match
-        // production's `predict_iov` exactly: a twin that seeded the reset under a
-        // different κ would differentiate a different function than the one predicted, and
-        // `Dual2`-vs-FD parity could not see it (FD perturbs the twin's own value path).
-        // Falls back to the occasion-less seeder only when the subject has no record to
-        // take an occasion from, which is `predict_iov`'s fallback too.
+        // EVID=3/4 reset rows (#1133): the reset row's own covariate snapshot, under its own
+        // occasion's group (#1153). This must match production's `predict_iov` exactly: a
+        // twin that seeded the reset under a different κ would differentiate a different
+        // function than the one predicted, and `Dual2`-vs-FD parity could not see it (FD
+        // perturbs the twin's own value path). An unlabelled row falls to the κ = 0
+        // seeder, which is `predict_iov`'s `combined_for(u32::MAX)` there too.
         let pk_at_reset = (0..subject.reset_times.len())
             .map(|r| {
                 let t = subject.param_time_at(subject.reset_times[r]);
-                match crate::pk::reset_row_occasion(subject, r)
-                    .and_then(|occ| occ_to_k.get(&occ).copied())
-                {
+                match crate::pk::reset_row_group(subject, r, occ_to_k) {
                     Some(g) => seed_group_cov(g, subject.reset_cov(r), t),
                     None => seed_pk_only_cov(subject.reset_cov(r), t),
                 }
@@ -1644,8 +1458,8 @@ fn seed_iov_events<T: Clone>(
                 &owned
             }
         };
-        // A dose or pk-only row reads its group's seeding (#1876, #2065); one κ = 0
-        // seeding, built on first use, serves every one whose occasion has no group.
+        // A dose, pk-only or reset row reads its group's seeding (#1876, #2065, #1153); one
+        // κ = 0 seeding, built on first use, serves every one whose occasion has no group.
         let mut ungrouped: Option<Vec<T>> = None;
         let mut pk_at_dose = Vec::with_capacity(subject.doses.len());
         for d in 0..subject.doses.len() {
@@ -1672,18 +1486,20 @@ fn seed_iov_events<T: Clone>(
         }
         // Static branch, EVID=3/4 rows (#1133): covariates do not move, so `static_cov` IS
         // the reset row's own snapshot and the covariate question is vacuous — but κ is
-        // not. Read it from `group_dual` at the occasion [`crate::pk::reset_row_occasion`]
-        // resolves, exactly as the dose and obs vectors above do, so this branch matches
-        // `predict_iov`. Deliberately NOT routed through `seed_pk_only_cov`: that would
-        // both zero κ and make a fallible call on a path that previously could not make one
-        // (an IOV subject with resets and no EVID=2 rows would newly be able to decline to
-        // FD).
-        let pk_at_reset = (0..subject.reset_times.len())
-            .map(|r| {
-                let occ = crate::pk::reset_row_occasion(subject, r)?;
-                Some(group_dual[*occ_to_k.get(&occ)?].clone())
-            })
-            .collect::<Option<_>>()?;
+        // not. A labelled row reads its own occasion's group, which `iov_occasion_groups`
+        // always has (#1153); an unlabelled one the shared κ = 0 seeding, as the dose and
+        // pk-only rows above do. Before #1153 an occasion only a reset carried had no group
+        // and a `?` here declined the whole subject to FD, on this branch alone.
+        let mut pk_at_reset = Vec::with_capacity(subject.reset_times.len());
+        for r in 0..subject.reset_times.len() {
+            pk_at_reset.push(match crate::pk::reset_row_group(subject, r, occ_to_k) {
+                Some(g) => group_dual[g].clone(),
+                None => match &ungrouped {
+                    Some(seeded) => seeded.clone(),
+                    None => ungrouped.insert(seed_pk_only_cov(static_cov, 0.0)?).clone(),
+                },
+            });
+        }
         crate::pk::inherit_parent_dose_attrs_g(model, subject, &mut pk_at_dose);
         Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
     }
@@ -1917,6 +1733,20 @@ fn cross_rate_switch<T: crate::sens::num::PkNum>(
     }
 }
 
+/// The injected accumulators' values in `u` (`OdeSpec::chz_state_slots`), for
+/// [`restore_chz_rows`] after an SS equilibration replaces the state — the dual twin of the f64
+/// walk's `chz_snapshot` (#1210: the accumulator keeps the hazard accrued before the record).
+fn chz_rows<T: Copy>(ode: &OdeSpec, u: &[T]) -> Vec<T> {
+    ode.chz_state_slots.iter().map(|&k| u[k]).collect()
+}
+
+/// Write [`chz_rows`]' values back into an equilibrated state.
+fn restore_chz_rows<T: Copy>(ode: &OdeSpec, u: &mut [T], before: &[T]) {
+    for (&k, &v) in ode.chz_state_slots.iter().zip(before) {
+        u[k] = v;
+    }
+}
+
 /// Dual steady-state equilibration: the analytic-sensitivity counterpart of production's
 /// `equilibrate_ss_state`. NONMEM SS=1 loads the compartments with the steady-state
 /// amounts of an infinite-past pulse train of interval `II`. There is no closed form for
@@ -1939,6 +1769,9 @@ fn cross_rate_switch<T: crate::sens::num::PkNum>(
 fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
+    // The injected cumulative-hazard accumulators (`OdeSpec::chz_state_slots`), held still
+    // through the run-in and projected out of its fixed point as the f64 path does (#1210).
+    chz: &[usize],
     dose: &crate::types::DoseEvent,
     f_bio: T,
     params: &[T],
@@ -1953,13 +1786,6 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
     // — FOCE/FOCEI converging to the wrong optimum rather than failing. A debug-only tripwire
     // is absent from exactly the builds users fit in. One bool read on a path already running
     // ODE solves.
-    assert!(
-        !program.has_chz(),
-        "dual SS equilibration reached a joint PK-TTE system: it has no accumulator handling, \
-         so it would bank the run-in's hazard into the gradient (#1210). A joint model routes \
-         to FD end-to-end (`has_tte` in inner_optimizer, `has_non_gaussian` in the provider); \
-         if that routing is widened, the #1210 masking has to come with it."
-    );
     let mut u = vec![T::from_f64(0.0); n_states];
     if dose.ii <= 0.0 {
         return u;
@@ -1979,6 +1805,8 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
     // its clock at `0` a window `T_inf` after the pulse, reads `TAD = τ + T_inf` — and `TAFD`
     // `NaN` (it has no periodic steady state). `T_inf` keeps its jet (a modeled or
     // `F`-scaled window): it is where the quiet window's `TAD` starts.
+    // Every run-in evaluation holds the accumulators still (`mask_chz`), the f64 run-in's
+    // rule: it must not bank the run-in's own hazard.
     let rhs_anchored_at = |us: &[T], ps: &[T], t: f64, dt: T, pulse: T, du: &mut [T]| {
         eval_rhs_at_offset::<T>(
             program,
@@ -1992,6 +1820,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
             &mut vars_cell.borrow_mut(),
             &mut stack_cell.borrow_mut(),
         );
+        crate::ode::predictions::mask_chz(chz, du);
     };
     let bare_rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
         rhs_anchored_at(us, ps, t, T::from_f64(0.0), T::from_f64(0.0), du);
@@ -2076,7 +1905,8 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
             }
         }
     };
-    if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
+    if let Some(u_ss) = crate::ode::predictions::periodic_ss_fixed_point_pk::<T, _, _>(
+        chz,
         n_states,
         dose.ii,
         eq_opts.reltol,
@@ -2214,11 +2044,8 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
     params: &[T],
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Vec<T> {
-    assert!(
-        !program.has_chz(),
-        "dual SS equilibration reached a joint PK-TTE system: see `equilibrate_ss_state_g` (#1210)."
-    );
     let n = n_states;
+    let chz = &ode.chz_state_slots[..];
     let ii = dose.ii;
     // `CMT=0` equilibrates compartment 1 — the default dose compartment — like the f64 twin
     // `equilibrate_ss_input_rate` and the plain-disposition `equilibrate_ss_state_g` (#899). This
@@ -2251,6 +2078,8 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
             &mut vars_cell.borrow_mut(),
             &mut stack_cell.borrow_mut(),
         );
+        // The accumulators held still through the run-in, as the f64 twin holds them (#1210).
+        crate::ode::predictions::mask_chz(chz, du);
     };
 
     // ---- Fast path: closed-form fixed point (linear disposition). ----
@@ -2284,7 +2113,8 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
             .last()
             .map(|p| p.u.clone())
     };
-    if let Some(u_ss) = crate::ode::predictions::equilibrate_ss_input_rate_g::<T, _, _>(
+    if let Some(u_ss) = crate::ode::predictions::equilibrate_ss_input_rate_pk::<T, _, _>(
+        chz,
         n,
         ii,
         eq_opts.reltol,
@@ -2396,6 +2226,7 @@ fn extend_flow_by_dual_duration_g<T: crate::sens::num::vm::VmNum>(
 fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
+    chz: &[usize],
     dose: &crate::types::DoseEvent,
     f_bio: T,
     params: &[T],
@@ -2440,6 +2271,7 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
             &mut vars_cell.borrow_mut(),
             &mut stack_cell.borrow_mut(),
         );
+        crate::ode::predictions::mask_chz(chz, du);
     };
     if let Some((inf_rate, inf_window)) = inf {
         let t_inf_val = inf_window.val();
@@ -2538,6 +2370,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     ode: &OdeSpec,
     n_states: usize,
     subject: &Subject,
+    // The times to save the state at: the subject's observations, or a caller's own (an
+    // ODE-accumulated hazard's event times, a drug-driven CTMM's sub-grid).
+    obs_times: &[f64],
     pk_at_dose: &[Vec<T>],
     pk_at_obs: &[Vec<T>],
     pk_at_pk_only: &[Vec<T>],
@@ -2547,15 +2382,12 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     pk_at_reset: &[Vec<T>],
     f_bio_at_dose: &[T],
     init_state: &[T],
-    // Differentiated PK slots, for re-seeding `init(...)` at an EVID 3/4 reset (#486). Only
-    // read when `ode.init_fn` is present; a no-`init` model zeros the state at a reset as before.
-    pk_indices: &[usize],
     first_dose_time: f64,
     dose_lag_slot: &[usize],
     dose_modeled_slot: &[Option<(crate::types::RateMode, usize)>],
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Vec<Vec<T>> {
-    let n_obs = subject.obs_times.len();
+    let n_obs = obs_times.len();
     let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
 
     debug_assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
@@ -2921,7 +2753,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             tl.push((d.time, K_SS_SEED, k));
         }
     }
-    for (j, &t) in subject.obs_times.iter().enumerate() {
+    for (j, &t) in obs_times.iter().enumerate() {
         tl.push((t, K_OBS, j));
     }
     for (m, &t) in subject.pk_only_times.iter().enumerate() {
@@ -3517,6 +3349,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 // absorption (#719 gap-2), so this arm is bolus-record only. SS + lagtime into
                 // an absorption compartment is rejected upstream, so a dose reaching here is
                 // never one the seed branch would have claimed.
+                // The accumulators keep their record values through the run-in (#1210), as
+                // the f64 walk's `chz_snapshot`/`restore_chz` keep them.
+                let chz_before = chz_rows(ode, &u);
                 u = if has_input_rate && input_rate_consumes_cmt(ode, d.cmt_raw()) && !is_inf(d) {
                     equilibrate_ss_input_rate_state_g::<T>(
                         program,
@@ -3531,6 +3366,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                     equilibrate_ss_state_g::<T>(
                         program,
                         n_states,
+                        &ode.chz_state_slots,
                         d,
                         f_bio_at_dose[idx],
                         &pk_at_dose[idx],
@@ -3538,6 +3374,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                         opts,
                     )
                 };
+                restore_chz_rows(ode, &mut u, &chz_before);
             }
             // CMT is 1-based, and `CMT=0` is NONMEM's *default dose compartment*, which
             // resolves to state index 0 on both engines (#899). The `d.cmt >= 1` skip this
@@ -4122,9 +3959,11 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // The only SS equilibration this dose runs: since #1121 its `K_DOSE` event keeps
             // the state the walk flowed there rather than re-loading a trough, so there is no
             // second consumer to cache for.
+            let chz_before = chz_rows(ode, &u);
             let trough = equilibrate_ss_state_g::<T>(
                 program,
                 n_states,
+                &ode.chz_state_slots,
                 d,
                 f_bio_at_dose[idx],
                 &pk_at_dose[idx],
@@ -4134,6 +3973,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             u = ss_state_at_phase_g::<T>(
                 program,
                 n_states,
+                &ode.chz_state_slots,
                 d,
                 f_bio_at_dose[idx],
                 &pk_at_dose[idx],
@@ -4142,6 +3982,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 trough,
                 opts,
             );
+            restore_chz_rows(ode, &mut u, &chz_before);
             last_params = &pk_at_dose[idx];
         } else if kind == K_INF_END || kind == K_SS_INF_END {
             // Infusion window end: the rate turns off (the next segment's `active_inf`
@@ -4314,7 +4155,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // #2093); now it is the adjoint's `fd_oracle` (`sens/ode_adjoint_tests.rs`), which
             // differences the production objective, and beneath that the NONMEM anchor in
             // `tests/reset_init_snapshot_nonmem_anchor.rs`.
-            match init_seed::<T>(ode, &pk_at_reset[idx], pk_indices) {
+            match init_seed::<T>(ode, &pk_at_reset[idx]) {
                 Some(seed) => u = seed,
                 None => {
                     for x in u.iter_mut() {
@@ -4356,6 +4197,9 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
     subject: &Subject,
+    // The times to save the state at: the subject's observations, or a caller's own (an
+    // ODE-accumulated hazard's event times, a drug-driven CTMM's sub-grid).
+    obs_times: &[f64],
     ode: &OdeSpec,
     prepared_forcings: &PreparedForcings<T>,
     params_dual: &[T],
@@ -4364,7 +4208,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     first_dose_time: f64,
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Option<Vec<Vec<T>>> {
-    let n_obs = subject.obs_times.len();
+    let n_obs = obs_times.len();
     let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
     let mut recorded = vec![false; n_obs];
     let mut u = init_state.to_vec();
@@ -4378,9 +4222,17 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     // The shared index (`ode::predictions::RecordIndex`), not a private copy: its
     // `records_at_break` is the one spelling of the #1226 band rule, and the ODE engines
     // resolve their boundary records through the same type.
-    let obs_index = crate::ode::predictions::RecordIndex::new(&subject.obs_times);
+    let obs_index = crate::ode::predictions::RecordIndex::new(&obs_times);
     let sorted_obs = obs_index.sorted();
     // Record `src` at every not-yet-recorded observation whose time matches `q`.
+    //
+    // It does not take #2124's `band_read_state` rule; `record_at_break` below does, and
+    // that is enough, measured by mutation (#2485 review). At a break, every record this
+    // window can still write is either in the break's band, which `record_at_break`
+    // overwrites under the rule, or after the band, where it is never earlier than an event
+    // applied at the break. A record just before the break was already written by the
+    // previous segment's `t_end` save point, and nothing precedes the first break, which is
+    // the subject's first record. So passing the rule here could not change a single value.
     let record_at = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
         // Candidates lie within the relative tolerance band; widen slightly for the
         // binary-search bounds, then confirm each with the exact `obs_time_matches`.
@@ -4426,10 +4278,20 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     // the first (retired in #2093); without it no provider test placed an observation on the
     // mirror side at all.
     let mut band_scratch: Vec<usize> = Vec::new();
-    let mut record_at_break = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
+    let mut record_at_break = |q: f64,
+                               pre: Option<&[T]>,
+                               first_event: f64,
+                               src: &[T],
+                               states: &mut [Vec<T>],
+                               recorded: &mut [bool]| {
         obs_index.records_at_break(q, &mut band_scratch);
         for &j in &band_scratch {
-            states[j].copy_from_slice(src);
+            states[j].copy_from_slice(crate::ode::predictions::band_read_state(
+                obs_times[j],
+                first_event,
+                pre,
+                src,
+            ));
             recorded[j] = true;
         }
     };
@@ -4473,7 +4335,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     // Break the timeline at every dose time and — for infusions — the
     // infusion-end time, so each segment is fully inside or outside every
     // infusion window (the rate forcing is then constant over a segment).
-    let t_last = subject.obs_times.iter().cloned().fold(0.0_f64, f64::max);
+    let t_last = obs_times.iter().cloned().fold(0.0_f64, f64::max);
     // Start integration at the subject's first event (NONMEM semantics), not at a
     // fixed t = 0 — so an off-zero TIME column is not integrated over a phantom
     // `[0, first_record]` window. Mirrors the production dense walk and the
@@ -4612,16 +4474,29 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     for w in 0..break_times.len() {
         let t_start = break_times[w];
 
+        // #2124: the state before this break's events, kept only when an observation is
+        // close enough to be read here — the f64 walk's `u_before`. `first_event` is the
+        // earliest record time among the events applied below (`band_read_state`).
+        let slack = 2e-9 * (1.0 + t_start.abs());
+        let lo = sorted_obs.partition_point(|&(t, _)| t < t_start - slack);
+        let u_before = sorted_obs[lo..]
+            .first()
+            .is_some_and(|&(t, _)| t <= t_start + slack)
+            .then(|| u.clone());
+        let mut first_event = f64::INFINITY;
+
         // EVID 3/4 reset: re-seed the state to the initial conditions at this time, *before*
         // the same-time dose (EVID=4 = reset + dose), and record the reset time so an
         // infusion whose window straddles it is turned off below.
-        if subject
-            .reset_times
-            .iter()
-            .any(|&rt| (rt - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL)
-        {
+        let reset_here = crate::ode::predictions::earliest_reset_at_break(
+            &subject.reset_times,
+            t_start,
+            f64::INFINITY,
+        );
+        if reset_here.is_finite() {
             u.copy_from_slice(init_state);
             reset_floor = t_start;
+            first_event = reset_here;
         }
         // Uniformity with the `f64` twin (#1576, #1586): one gate per break, read by the
         // zero-order saltation, the infusion and zero-order windows and the forcing below.
@@ -4648,6 +4523,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
             // Marked for every dose matched at this break, infusion included — the
             // arrival is one event and fires at the first break inside the match (#1186).
             dose_applied[k] = true;
+            first_event = first_event.min(dose.time);
             if !dose.is_infusion() && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
                 let cmt_idx = dose.cmt_idx();
                 if cmt_idx < n_states {
@@ -4656,16 +4532,17 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
             }
         }
 
-        // Record any observation at t_start (after the dose). `t_start` is a break
-        // time built by arithmetic on dose/reset times, so an observation that
-        // coincides with it can be value-equal but bit-different — match by
-        // tolerance, not bit pattern (issue #410).
+        // Record any observation at t_start (after the dose, unless it precedes it —
+        // #2124). `t_start` is a break time built by arithmetic on dose/reset times, so an
+        // observation that coincides with it can be value-equal but bit-different — match
+        // by tolerance, not bit pattern (issue #410).
+        let pre = u_before.as_deref();
         record_at(t_start, &u, &mut states, &mut recorded);
         // …and force the post-event state onto this break's whole recording band, over
         // any pre-event write the previous segment's `t_end` save point already made
         // (#1226). Ordered after the tolerant catch-all above so that one still covers a
         // record the solver's save points missed, on either side.
-        record_at_break(t_start, &u, &mut states, &mut recorded);
+        record_at_break(t_start, pre, first_event, &u, &mut states, &mut recorded);
 
         // Last effective dose at or before the segment start (the TAD anchor). Shared by the
         // zero-order saltation below and the RHS forcing — one fold over `subject.doses` per
@@ -4785,8 +4662,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
         // found `recorded[j]` already set, so the pre-dose write won. `record_at` is
         // already tolerance-based, so removing the slack here is the whole change: the
         // band member is now recorded at the break, post-dose, matching production.
-        let mut saveat: Vec<f64> = subject
-            .obs_times
+        let mut saveat: Vec<f64> = obs_times
             .iter()
             .filter(|&&t| t > t_start + 1e-12 && t <= t_end)
             .cloned()

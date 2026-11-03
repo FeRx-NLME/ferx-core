@@ -125,8 +125,8 @@ pub(crate) use predict::predict_diag_undrained;
 pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{
-    predict_categorical, predict_survival, predict_survival_diag, SurvivalPredictionOutput,
-    SurvivalPredictionResult,
+    predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
+    SurvivalPredictionOutput, SurvivalPredictionResult,
 };
 pub(crate) use run::{
     log_transform_observations, read_population_as_fitted, read_population_routed_by,
@@ -139,12 +139,29 @@ pub use run::{
     run_model_with_overrides, PreparedRun, ReaderSettings, RunOverrides,
 };
 pub(crate) use simulate::check_theta_length;
+
+#[cfg(test)]
+thread_local! {
+    /// How many times the simulate chokepoint's draw-independent checks ran on this thread
+    /// — what pins that an uncertainty run checks once, not once per draw (#1288). Here, not
+    /// in `simulate.rs`, which a scan of its source pins free of `#[cfg(test)]`.
+    pub(crate) static DRAW_INDEPENDENT_RUNS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Count one run of the simulate chokepoint's draw-independent checks; a no-op outside tests.
+#[inline]
+fn note_draw_independent_run() {
+    #[cfg(test)]
+    DRAW_INDEPENDENT_RUNS.with(|n| n.set(n.get() + 1));
+}
 pub(crate) use simulate::obs_row_time;
 pub(crate) use simulate::{check_param_shape, ParamBlock};
 pub use simulate::{
     simulate, simulate_with_options, simulate_with_options_diag, simulate_with_seed,
     simulate_with_uncertainty, simulate_with_uncertainty_diag, SimulateOptions,
-    SimulateUncertaintyOptions, SimulationOutput, SimulationResult,
+    SimulateUncertaintyOptions, SimulatedParameters, SimulatedSubjectParameters, SimulationOutput,
+    SimulationResult,
 };
 
 // ── test-support re-exports (reached via `super::` from the relocated
@@ -504,9 +521,19 @@ mod tests_derived_iov_kappa;
 #[path = "tests/adaptive_sim_tests.rs"]
 mod adaptive_sim_tests;
 
+// ── Tests: `auc_target` under a time-varying covariate, `TIME` in the PK and IOV (#943) ──
+#[cfg(test)]
+#[path = "tests/adaptive_auc_tv_tests.rs"]
+mod adaptive_auc_tv_tests;
+
 #[cfg(test)]
 #[path = "tests/adaptive_obs_scale_tests.rs"]
 mod adaptive_obs_scale_tests;
+
+// #2559: a decision the reader's move of a reset put before that reset.
+#[cfg(test)]
+#[path = "tests/adaptive_moved_reset_tests.rs"]
+mod adaptive_moved_reset_tests;
 
 // #2156: FREM covariate rows on the adaptive path.
 #[cfg(test)]
@@ -546,3 +573,8 @@ mod param_shape_gate_tests;
 #[cfg(test)]
 #[path = "tests/nested_levels_output_tests.rs"]
 mod nested_levels_output_tests;
+
+// #2505: `SimulationOutput::parameters` reports each simulated subject's drawn parameters.
+#[cfg(test)]
+#[path = "tests/simulated_parameters_tests.rs"]
+mod simulated_parameters_tests;

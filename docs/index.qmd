@@ -25,6 +25,7 @@ NONMEM-compatible data through a command-line interface, Rust API, and
 - **Analytic gradients** -- One adjoint (reverse-mode) gradient for FOCE, FOCEI, Laplace and AGQ, exact and with a cost that does not grow with the parameter count, plus the exact covariance R-matrix
 - **Multiple error models** -- Additive, proportional, combined, and log-transform-both-sides (LTBS); per-CMT multi-endpoint models for joint PK/PD
 - **Inter-occasion variability (IOV)** -- `kappa` random effects with FOCE/FOCEI and SAEM support
+- **Model-based meta-analysis (MBMA)** -- Arm-level summary data with inverse-variance weighting, sample-size-weighted between-arm variability and placebo level blocks; see [MBMA: start here](model-file/mbma.qmd)
 - **Lagtime / ALAG** -- Absorption lag for analytical and ODE paths
 - **LOQ censoring** -- Beal M3 method for below-LLOQ and above-ULOQ observations
 - **NCA-based starting values** -- `inits_from_nca` for automatic theta initialization from the data
@@ -55,7 +56,7 @@ method and option; for ferx's own approach see
 [Gradient route (analytic vs FD)](estimation/foce.qmd#gradient-route-analytic-vs-fd).
 
 Sources:
-NONMEM — [Bauer, *NONMEM Tutorial Part II: Estimation Methods and Advanced Examples*, CPT:PSP 2019](https://ascpt.onlinelibrary.wiley.com/doi/10.1002/psp4.12422);
+NONMEM — [Bauer, *NONMEM Tutorial Part II: Estimation Methods and Advanced Examples*, CPT:PSP 2019](https://doi.org/10.1002/psp4.12422);
 nlmixr2 — [CRAN package page](https://cran.r-project.org/web/packages/nlmixr2/index.html) and [nlmixr2.org](https://nlmixr2.org/);
 Monolix — [SAEM task documentation](https://monolix.lixoft.com/tasks/population-parameter-estimation-using-saem/) and [licensing](https://monolixsuite.slp-software.com/getting-started/2024R1/licencing);
 Pumas — [estimation documentation](https://docs.pumas.ai/dev/basics/estimation/).

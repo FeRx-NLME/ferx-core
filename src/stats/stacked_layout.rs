@@ -101,9 +101,19 @@ pub(crate) struct StackedLayout {
     /// `(occasion label, observation indices)` per group, in stacked order.
     groups: Vec<(u32, Vec<usize>)>,
     occ_to_group: HashMap<u32, usize>,
+    /// `occ_to_group` as a label-sorted list, for [`Self::group_of`]: a binary search over a
+    /// subject's few occasions instead of a SipHash lookup per record (#2549).
+    occ_sorted: Vec<(u32, usize)>,
     /// The derivative axes of a model with nested levels (#1082 PR3), set only by
     /// [`Self::sens_of`]. See the *axes* methods below.
     nested: Option<NestedLayout>,
+}
+
+/// An occasion → group map as a label-sorted list (labels are unique keys).
+fn sorted_occasions(map: &HashMap<u32, usize>) -> Vec<(u32, usize)> {
+    let mut v: Vec<(u32, usize)> = map.iter().map(|(&o, &g)| (o, g)).collect();
+    v.sort_unstable_by_key(|&(o, _)| o);
+    v
 }
 
 impl StackedLayout {
@@ -112,11 +122,13 @@ impl StackedLayout {
         count_build();
         let groups = crate::stats::likelihood::iov_occasion_groups(subject);
         let occ_to_group = crate::stats::likelihood::iov_occ_to_k(&groups);
+        let occ_sorted = sorted_occasions(&occ_to_group);
         Self {
             n_eta,
             n_kappa,
             groups,
             occ_to_group,
+            occ_sorted,
             nested: None,
         }
     }
@@ -247,7 +259,10 @@ impl StackedLayout {
 
     /// The group of occasion label `occ`, or `None` for a label no group carries.
     pub(crate) fn group_of(&self, occ: u32) -> Option<usize> {
-        self.occ_to_group.get(&occ).copied()
+        self.occ_sorted
+            .binary_search_by_key(&occ, |&(o, _)| o)
+            .ok()
+            .map(|i| self.occ_sorted[i].1)
     }
 
     /// Stacked index of group `g`'s first κ entry.

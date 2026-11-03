@@ -10,6 +10,8 @@
 pub mod dual1;
 pub mod dual2;
 pub mod dual_mixed;
+#[cfg(feature = "survival")]
+pub(crate) mod eta_jets;
 pub(crate) mod focei_kernel;
 pub(crate) mod linsolve;
 pub mod num;
@@ -18,6 +20,7 @@ pub mod one_cpt;
 pub mod propagate;
 pub mod provider;
 pub(crate) mod rtape;
+pub(crate) mod taylor;
 pub mod three_cpt;
 pub mod two_cpt;
 pub(crate) mod vfree;

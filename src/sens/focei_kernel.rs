@@ -412,6 +412,41 @@ pub(crate) fn focei_f_grad<T: PkNum, const N: usize>(
     Some((fv, grad))
 }
 
+/// A subject's non-Gaussian data term at `η` for the FOCE/FOCEI objective — its value `q`
+/// (the raw `1×` NLL of every TTE / binary / CTMM endpoint), η-gradient and η-Hessian —
+/// as production folds it in (`foce_subject_nll_interaction_with_tte`): `2q` beside the
+/// Gaussian `data_ll`, `∇²q` into `H̃`, so `∇_η l` gains `∇q`.
+pub(crate) struct NonGauss<T, const N: usize> {
+    pub(crate) q: T,
+    pub(crate) g: [T; N],
+    pub(crate) h: [[T; N]; N],
+}
+
+/// `(F, ∇_η l)` of the objective of a subject carrying non-Gaussian records: production's
+/// one form for both interaction settings — the conditional Gaussian rows plus `ng`, with
+/// `H̃`'s `½·c̃ᵀc̃` and censored curvature only under `interaction` (FOCE omits them).
+/// `None` on a dense residual (production's non-Gaussian path is the diagonal one) or a
+/// failed factorisation.
+#[cfg(feature = "survival")]
+pub(crate) fn focei_f_grad_ng<T: PkNum, const N: usize>(
+    ctx: &LikCtx,
+    f: &[T],
+    g: &[[T; N]],
+    eta: &[T; N],
+    p: &ParT<T>,
+    ng: &NonGauss<T, N>,
+    interaction: bool,
+) -> Option<(T, [T; N])> {
+    if ctx.dense() {
+        return None;
+    }
+    let (fv, grad, _) = match ctx.model.residual_error_eta {
+        None => focei_rows::<T, N, 1>(ctx, f, g, eta, p, None, Some(ng), interaction),
+        Some(r) => focei_rows::<T, N, 2>(ctx, f, g, eta, p, Some(r), Some(ng), interaction),
+    }?;
+    Some((fv, grad))
+}
+
 /// FOCEI's Gauss–Newton Hessian `H̃` (the AGQ Gauss–Newton anchor).
 pub(crate) fn focei_htilde<T: PkNum, const N: usize>(
     ctx: &LikCtx,
@@ -437,15 +472,18 @@ fn focei_parts<T: PkNum, const N: usize>(
         return Some((fv, [T::from_f64(0.0); N], ht));
     }
     match ctx.model.residual_error_eta {
-        None => focei_rows::<T, N, 1>(ctx, f, g, eta, p, None),
-        Some(r) => focei_rows::<T, N, 2>(ctx, f, g, eta, p, Some(r)),
+        None => focei_rows::<T, N, 1>(ctx, f, g, eta, p, None, None, true),
+        Some(r) => focei_rows::<T, N, 2>(ctx, f, g, eta, p, Some(r), None, true),
     }
 }
 
 /// The diagonal-path row pass behind [`focei_f_grad`], over a `K`-direction dual:
 /// direction 0 is the row's prediction (or, on a FREM row, its `η_e`), direction 1 is
 /// `η_r` (`K = 2` only under RUV IIV). Mirrors `foce_subject_nll_interaction` /
-/// `gaussian_foce_accum` term for term, with `H̃ = Σ aᵀa/V + ½·c̃ᵀc̃ + cens_hess + Ω⁻¹`.
+/// `gaussian_foce_accum` term for term, with `H̃ = Σ aᵀa/V + ½·c̃ᵀc̃ + cens_hess + Ω⁻¹`;
+/// `interaction = false` drops `½·c̃ᵀc̃` and the censored curvature (production's FOCE form
+/// beside a non-Gaussian term), and `ng` adds that term (see [`NonGauss`]).
+#[allow(clippy::too_many_arguments)]
 fn focei_rows<T: PkNum, const N: usize, const K: usize>(
     ctx: &LikCtx,
     f: &[T],
@@ -453,6 +491,8 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
     eta: &[T; N],
     p: &ParT<T>,
     rr: Option<usize>,
+    ng: Option<&NonGauss<T, N>>,
+    interaction: bool,
 ) -> Option<(T, [T; N], Vec<Vec<T>>)> {
     let c = |x: f64| T::from_f64(x);
     let one = c(1.0);
@@ -510,9 +550,10 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
                 let iv = one / vd.v;
                 let cs = vd.g[0] / vd.v;
                 // g·gᵀ/V + ½·c̃c̃ᵀ with c̃ = (∂V/∂f / V)·g, whose η_r entry is 2 under RUV IIV.
-                match rr {
-                    None => terms.push((iv + c(0.5) * cs * cs, gj, gj)),
-                    Some(r) => {
+                match (rr, interaction) {
+                    (_, false) => terms.push((iv, gj, gj)),
+                    (None, true) => terms.push((iv + c(0.5) * cs * cs, gj, gj)),
+                    (Some(r), true) => {
                         let ck: [T; N] =
                             std::array::from_fn(|k| if k == r { c(2.0) } else { cs * gj[k] });
                         terms.push((iv, gj, gj));
@@ -539,13 +580,15 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
                 if let Some(r) = rr {
                     explicit[r] = explicit[r] + lj.g[1];
                 }
-                terms.push((g2, gj, gj));
-                if let Some(r) = rr {
-                    let mut go = gj;
-                    go[r] = c(0.0);
-                    terms.push((cz, unit(r), unit(r)));
-                    terms.push((cm, unit(r), go));
-                    terms.push((cm, go, unit(r)));
+                if interaction {
+                    terms.push((g2, gj, gj));
+                    if let Some(r) = rr {
+                        let mut go = gj;
+                        go[r] = c(0.0);
+                        terms.push((cz, unit(r), unit(r)));
+                        terms.push((cm, unit(r), go));
+                        terms.push((cm, go, unit(r)));
+                    }
                 }
             }
         }
@@ -563,9 +606,24 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
             ht[b][a] = e;
         }
     }
+    // The non-Gaussian term: `2q` in the data, `∇²q` in `H̃`, `∇q` in `∇l` (`l = ½·data`).
+    if let Some(ng) = ng {
+        data = data + c(2.0) * ng.q;
+        for a in 0..N {
+            for b in 0..N {
+                ht[a][b] = ht[a][b] + ng.h[a][b];
+            }
+        }
+    }
     let ld = chol(&ht).map(|l| chol_logdet(&l))?;
     let fv = c(0.5) * (data + ctx.prior(eta, p) + ld + bloq);
-    Some((fv, assemble_grad(oi, eta, g, &dl, &explicit), ht))
+    let mut grad = assemble_grad(oi, eta, g, &dl, &explicit);
+    if let Some(ng) = ng {
+        for k in 0..N {
+            grad[k] = grad[k] + ng.g[k];
+        }
+    }
+    Some((fv, grad, ht))
 }
 
 /// `∇_k l = Σ_l Ω⁻¹_kl η_l + ½·Σ_j (∂ℓ_j/∂f)·G_jk + ½·explicit_k`.
@@ -830,13 +888,13 @@ fn focei_f_dense<T: PkNum, const N: usize>(
 /// frozen population prediction). The single row definition behind both the value of `l`
 /// and its η-gradient.
 #[allow(clippy::too_many_arguments)]
-fn row_l<T: PkNum, const N: usize>(
+fn row_l<T: PkNum>(
     ctx: &LikCtx,
     j: usize,
     f: T,
     vf: T,
     ruv: T,
-    eta: &[T; N],
+    eta: &[T],
     p: &ParT<T>,
 ) -> Option<T> {
     let c = |x: f64| T::from_f64(x);
@@ -872,6 +930,21 @@ pub(crate) fn inner_l<T: PkNum, const N: usize>(
     p: &ParT<T>,
     frozen: Option<&[T]>,
 ) -> Option<T> {
+    let data = data_l(ctx, f, eta, p, frozen)?;
+    Some(T::from_f64(0.5) * (ctx.prior(eta, p) + data))
+}
+
+/// The data term of [`inner_l`], `−2 log p(y | f)` up to its constant: the residual
+/// likelihood at the predictions `f` (dense or per row, censored rows by M3, FREM rows by
+/// their own variance), with the random effects entering only through `f` and the
+/// residual-error η's scale. `inner_l` is `½(prior + data_l)`.
+pub(crate) fn data_l<T: PkNum>(
+    ctx: &LikCtx,
+    f: &[T],
+    eta: &[T],
+    p: &ParT<T>,
+    frozen: Option<&[T]>,
+) -> Option<T> {
     let c = |x: f64| T::from_f64(x);
     let ruv = if frozen.is_some() {
         c(1.0)
@@ -895,13 +968,13 @@ pub(crate) fn inner_l<T: PkNum, const N: usize>(
         for j in 0..n {
             data = data + res[j] * z[j];
         }
-        return Some(c(0.5) * (ctx.prior(eta, p) + data));
+        return Some(data);
     }
     let mut data = c(0.0);
     for j in 0..f.len() {
         data = data + row_l(ctx, j, f[j], vf[j], ruv, eta, p)?;
     }
-    Some(c(0.5) * (ctx.prior(eta, p) + data))
+    Some(data)
 }
 
 /// A 1-D second-order dual: value, first and second derivative along one direction.

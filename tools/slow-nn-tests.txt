@@ -10,6 +10,7 @@
 # A binary that only LOSES tests under `nn` (kappa_correlation_auto_lbfgs_fits and
 # profiled_levels_fits, `ignore`d there by #2138/#2144) is not listed: nothing new
 # would run. The weekly `full-nn` leg runs every binary with `nn`.
+dcm_export_predict
 nn_dcm_smoke
 nn_fit_convergence
 nn_fit_smoke

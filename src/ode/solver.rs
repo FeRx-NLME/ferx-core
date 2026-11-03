@@ -780,8 +780,9 @@ pub struct OdeSolverStats {
     /// warnings channel to carry it.
     ///
     /// The CHZ site was never "the one silent hole" it was described as before that correction:
-    /// its sole production caller (`survival::draw_ode_tte_latent`) `panic!`s on `SolveFailed`,
-    /// which is the loudest outcome of the eight.
+    /// its sole production caller (`survival::draw_ode_tte_latent`) turns `SolveFailed` into a
+    /// per-subject `W_TTE_SOLVE_FAILED` warning naming the cause (#2087), on a channel of its
+    /// own.
     ///
     /// What is still true of that site is narrower and lives in the *step* counters, not this
     /// one: `ode_solve_until_chz_threshold` runs on `solve_ode_until_threshold`, its own driver,
@@ -982,7 +983,7 @@ pub(crate) trait Stepper<T: PkNum> {
 /// than route silently into the Rosenbrock stepper and panic inside a fit's worker thread.
 pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Stepper<T>> {
     match method {
-        OdeMethod::Rk45 => Box::new(Rk45Stepper::new(n)),
+        OdeMethod::Rk45 => Box::new(PooledRk45::take(n)),
         OdeMethod::Vern7 => Box::new(super::explicit_rk::ErkStepper::new(
             n,
             &super::explicit_rk::VERN7,
@@ -995,7 +996,7 @@ pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Ste
         // from a caller that built a stepper straight from the options. Falling through to
         // the explicit default keeps such a caller integrating (correctly, if slowly on a
         // stiff system) rather than panicking inside a fit's worker thread.
-        OdeMethod::Auto => Box::new(Rk45Stepper::new(n)),
+        OdeMethod::Auto => Box::new(PooledRk45::take(n)),
         // `Linear` is not a stepper either: `integrate_resolved_g_inner` serves it exactly and
         // integrates a declined segment as `Auto`, so only a caller building a stepper straight
         // from the options lands here. Same reasoning as the `Auto` arm.
@@ -1039,7 +1040,126 @@ struct Rk45Stepper<T> {
     mark: usize,
 }
 
+/// A [`Rk45Stepper`] taken from this thread's pool and returned to it on drop (#1564). Every
+/// integration segment builds a stepper, and the RK45 one holds nine state-sized vectors: on
+/// an ODE fit that was the largest single source of heap allocations (a Michaelis–Menten fit
+/// allocates ~2.6M times a second). A reused stepper is reset to exactly what
+/// [`Rk45Stepper::new`] builds — zeroed stages, no carried `k1`, mark 0 — so the steps it
+/// takes are the fresh one's, bit for bit.
+struct PooledRk45<T: PkNum>(Option<Box<Rk45Stepper<T>>>);
+
+thread_local! {
+    static RK45_POOL: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Most steppers a thread keeps: the drivers hold one at a time, a nested solve one more.
+/// A full pool evicts its oldest entry, so steppers of a number type or state size the
+/// thread no longer uses (an R session moving between models, a model search across
+/// compartment counts) cannot fill it and stop the pooling of the ones it does use.
+const RK45_POOL_MAX: usize = 8;
+
+impl<T: PkNum> PooledRk45<T> {
+    fn take(n: usize) -> Self {
+        let pooled = RK45_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            p.iter()
+                .rposition(|b| b.downcast_ref::<Rk45Stepper<T>>().is_some_and(|s| s.n == n))
+                .map(|i| p.remove(i))
+        });
+        let stepper = match pooled.and_then(|b| b.downcast::<Rk45Stepper<T>>().ok()) {
+            Some(mut s) => {
+                s.reset();
+                s
+            }
+            None => Box::new(Rk45Stepper::new(n)),
+        };
+        PooledRk45(Some(stepper))
+    }
+
+    fn get(&self) -> &Rk45Stepper<T> {
+        self.0.as_ref().expect("held until drop")
+    }
+
+    fn get_mut(&mut self) -> &mut Rk45Stepper<T> {
+        self.0.as_mut().expect("held until drop")
+    }
+}
+
+impl<T: PkNum> Drop for PooledRk45<T> {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            RK45_POOL.with(|p| {
+                let mut p = p.borrow_mut();
+                // Oldest first: `take` reuses the newest match, a full pool drops the oldest.
+                if p.len() == RK45_POOL_MAX {
+                    p.remove(0);
+                }
+                p.push(s);
+            });
+        }
+    }
+}
+
+impl<T: PkNum> Stepper<T> for PooledRk45<T> {
+    fn attempt(
+        &mut self,
+        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        self.get_mut().attempt(rhs, u, params, t, dt, opts)
+    }
+    fn u_new(&self) -> &[T] {
+        self.get().u_new()
+    }
+    fn interpolate_component(&self, theta: f64, u_old: &[T], dt: f64, i: usize) -> T {
+        self.get().interpolate_component(theta, u_old, dt, i)
+    }
+    fn on_accept(&mut self) {
+        self.get_mut().on_accept()
+    }
+    fn on_reject(&mut self) {
+        self.get_mut().on_reject()
+    }
+    fn err_exp(&self) -> f64 {
+        self.get().err_exp()
+    }
+    fn set_dense_required(&mut self, yes: bool) {
+        self.get_mut().set_dense_required(yes)
+    }
+    fn attempt_usable(&self) -> bool {
+        self.get().attempt_usable()
+    }
+    fn stiffness_indicator(&self, dt: f64) -> Option<f64> {
+        self.get().stiffness_indicator(dt)
+    }
+}
+
 impl<T: PkNum> Rk45Stepper<T> {
+    /// Back to what [`Self::new`] builds, keeping the buffers.
+    fn reset(&mut self) {
+        let z = T::from_f64(0.0);
+        for v in [
+            &mut self.k1,
+            &mut self.k2,
+            &mut self.k3,
+            &mut self.k4,
+            &mut self.k5,
+            &mut self.k6,
+            &mut self.k7,
+            &mut self.u_tmp,
+            &mut self.u5,
+        ] {
+            v.fill(z);
+        }
+        self.have_k1 = false;
+        self.mark = 0;
+    }
+
     fn new(n: usize) -> Self {
         let z = T::from_f64(0.0);
         Self {
@@ -1059,14 +1179,49 @@ impl<T: PkNum> Rk45Stepper<T> {
     }
 }
 
-impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
+/// One stage's right-hand-side call, so a stepper body can be monomorphized over how it
+/// reaches the model: through the closure, or straight into its machine code
+/// ([`DirectCall`]), inlined.
+pub(crate) trait StageRhs<T> {
+    /// Calls reach the model's machine code directly ([`DirectCall`]).
+    const DIRECT: bool = false;
+    fn call(&self, u: &[T], params: &[T], t: f64, du: &mut [T]);
+}
+
+impl<T> StageRhs<T> for dyn Fn(&[T], &[T], f64, &mut [T]) + '_ {
+    #[inline(always)]
+    fn call(&self, u: &[T], params: &[T], t: f64, du: &mut [T]) {
+        self(u, params, t, du)
+    }
+}
+
+/// A registered `f64` right-hand side called directly
+/// ([`super::rosenbrock::registered_direct`]), with its closure for the calls the native
+/// code declines.
+pub(crate) struct DirectCall<'a, T> {
+    pub(crate) direct: &'a super::predictions::DirectStep<'a>,
+    pub(crate) rhs: &'a dyn Fn(&[T], &[T], f64, &mut [T]),
+}
+
+impl<T: PkNum> StageRhs<T> for DirectCall<'_, T> {
+    const DIRECT: bool = true;
+    #[inline(always)]
+    fn call(&self, u: &[T], params: &[T], t: f64, du: &mut [T]) {
+        super::rosenbrock::call_direct(self.direct, self.rhs, u, params, t, du)
+    }
+}
+
+impl<T: PkNum> Rk45Stepper<T> {
+    /// [`Stepper::attempt`] over any [`StageRhs`], so the direct path is monomorphized and
+    /// inlined.
     // The stage loops walk `u` alongside seven stage vectors at once; zipping them would
     // obscure the Butcher tableau they transcribe — and the exact association of these
     // expressions is what keeps `T = f64` bit-identical to the pre-refactor loop.
     #[allow(clippy::needless_range_loop)]
-    fn attempt(
+    #[inline(always)]
+    fn attempt_with<R: StageRhs<T> + ?Sized>(
         &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &R,
         u: &[T],
         params: &[T],
         t: f64,
@@ -1084,78 +1239,119 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
         // one of the two could survive being written once, and the predictor's is the one
         // worth keeping — the analytic sensitivities are now differentiating exactly the
         // trajectory `predict()` reports rather than one a few ULP away from it.
-        if !self.have_k1 {
-            rhs(u, params, t, &mut self.k1);
-            self.have_k1 = true;
+        //
+        // Every buffer is cut to `n` up front, so the loops index without bounds checks
+        // and the compiler keeps the stage pointers in registers across the calls.
+        let Self {
+            k1,
+            k2,
+            k3,
+            k4,
+            k5,
+            k6,
+            k7,
+            u_tmp,
+            u5,
+            have_k1,
+            mark,
+            ..
+        } = self;
+        let (k1, k2, k3, k4, k5, k6, k7) = (
+            &mut k1[..n],
+            &mut k2[..n],
+            &mut k3[..n],
+            &mut k4[..n],
+            &mut k5[..n],
+            &mut k6[..n],
+            &mut k7[..n],
+        );
+        let (u_tmp, u5, u) = (&mut u_tmp[..n], &mut u5[..n], &u[..n]);
+        if !*have_k1 {
+            rhs.call(u, params, t, k1);
+            *have_k1 = true;
         }
-        self.mark = T::tape_mark();
+        *mark = T::tape_mark();
 
         for i in 0..n {
-            self.u_tmp[i] = u[i] + T::from_f64(dt_eff * B21) * self.k1[i];
+            u_tmp[i] = u[i] + T::from_f64(dt_eff * B21) * k1[i];
         }
-        rhs(&self.u_tmp, params, t + A2 * dt_eff, &mut self.k2);
+        rhs.call(u_tmp, params, t + A2 * dt_eff, k2);
 
         for i in 0..n {
-            self.u_tmp[i] = T::lincomb(u[i], dt_eff, &[B31, B32], &[self.k1[i], self.k2[i]]);
+            u_tmp[i] = T::lincomb(u[i], dt_eff, &[B31, B32], &[k1[i], k2[i]]);
         }
-        rhs(&self.u_tmp, params, t + A3 * dt_eff, &mut self.k3);
+        rhs.call(u_tmp, params, t + A3 * dt_eff, k3);
 
         for i in 0..n {
-            self.u_tmp[i] = T::lincomb(
-                u[i],
-                dt_eff,
-                &[B41, B42, B43],
-                &[self.k1[i], self.k2[i], self.k3[i]],
-            );
+            u_tmp[i] = T::lincomb(u[i], dt_eff, &[B41, B42, B43], &[k1[i], k2[i], k3[i]]);
         }
-        rhs(&self.u_tmp, params, t + A4 * dt_eff, &mut self.k4);
+        rhs.call(u_tmp, params, t + A4 * dt_eff, k4);
 
         for i in 0..n {
-            self.u_tmp[i] = T::lincomb(
+            u_tmp[i] = T::lincomb(
                 u[i],
                 dt_eff,
                 &[B51, B52, B53, B54],
-                &[self.k1[i], self.k2[i], self.k3[i], self.k4[i]],
+                &[k1[i], k2[i], k3[i], k4[i]],
             );
         }
-        rhs(&self.u_tmp, params, t + A5 * dt_eff, &mut self.k5);
+        rhs.call(u_tmp, params, t + A5 * dt_eff, k5);
 
         for i in 0..n {
-            self.u_tmp[i] = T::lincomb(
+            u_tmp[i] = T::lincomb(
                 u[i],
                 dt_eff,
                 &[B61, B62, B63, B64, B65],
-                &[self.k1[i], self.k2[i], self.k3[i], self.k4[i], self.k5[i]],
+                &[k1[i], k2[i], k3[i], k4[i], k5[i]],
             );
         }
-        rhs(&self.u_tmp, params, t + dt_eff, &mut self.k6);
+        rhs.call(u_tmp, params, t + dt_eff, k6);
 
         // 5th-order solution.
         for i in 0..n {
-            self.u5[i] = T::lincomb(
+            u5[i] = T::lincomb(
                 u[i],
                 dt_eff,
                 &[B71, B73, B74, B75, B76],
-                &[self.k1[i], self.k3[i], self.k4[i], self.k5[i], self.k6[i]],
+                &[k1[i], k3[i], k4[i], k5[i], k6[i]],
             );
         }
 
         // Error estimate (5th − 4th). Computed on values only — the step sequence must not
         // depend on derivative components.
-        rhs(&self.u5, params, t + dt_eff, &mut self.k7);
+        rhs.call(u5, params, t + dt_eff, k7);
         let mut err_norm = 0.0;
         for i in 0..n {
             let err_i = dt_eff
-                * (E1 * self.k1[i].val()
-                    + E3 * self.k3[i].val()
-                    + E4 * self.k4[i].val()
-                    + E5 * self.k5[i].val()
-                    + E6 * self.k6[i].val()
-                    + E7 * self.k7[i].val());
-            let scale = scale_tol(opts.abstol, opts.reltol, self.u5[i].val(), u[i].val());
+                * (E1 * k1[i].val()
+                    + E3 * k3[i].val()
+                    + E4 * k4[i].val()
+                    + E5 * k5[i].val()
+                    + E6 * k6[i].val()
+                    + E7 * k7[i].val());
+            let scale = scale_tol(opts.abstol, opts.reltol, u5[i].val(), u[i].val());
             err_norm += (err_i / scale) * (err_i / scale);
         }
         (err_norm / n as f64).sqrt()
+    }
+}
+
+impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
+    fn attempt(
+        &mut self,
+        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt_eff: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        // A registered `f64` right-hand side runs its machine code directly at every stage:
+        // the same values, without the closures between the stepper and the model.
+        if let Some(direct) = super::rosenbrock::registered_direct(rhs) {
+            return self.attempt_with(&DirectCall { direct, rhs }, u, params, t, dt_eff, opts);
+        }
+        self.attempt_with(rhs, u, params, t, dt_eff, opts)
     }
 
     fn u_new(&self) -> &[T] {
@@ -1689,6 +1885,24 @@ pub fn solve_ode_until_threshold(
     monitor: usize,
     threshold: f64,
 ) -> ThresholdCrossing {
+    solve_ode_until_threshold_labelled(rhs, u, t_span, params, opts, monitor, threshold, None)
+}
+
+/// [`solve_ode_until_threshold`] with display labels for the states, used in a `Failed`
+/// message in place of the bare 0-based index (#2087). `labels[k]` is printed as given, so the
+/// caller decides the rendering (a backticked `[odes]` name, or a phrase for an injected
+/// accumulator). `None` is the public driver, byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_ode_until_threshold_labelled(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u: &mut [f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    opts: &OdeSolverOptions,
+    monitor: usize,
+    threshold: f64,
+    labels: Option<&[String]>,
+) -> ThresholdCrossing {
     // The crossing search bisects a step's continuous extension and has no exact counterpart,
     // so a linear model's search is stepped exactly as the default's is.
     let opts = &opts.for_integration();
@@ -1709,6 +1923,7 @@ pub fn solve_ode_until_threshold(
             monitor,
             threshold,
             OdeMethod::EXPLICIT_FALLBACK,
+            labels,
         )
         .outcome;
     }
@@ -1719,8 +1934,10 @@ pub fn solve_ode_until_threshold(
     if opts.method != OdeMethod::Auto
         || (method == OdeMethod::EXPLICIT_FALLBACK && !opts.auto_switch)
     {
-        return until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method)
-            .outcome;
+        return until_threshold_with(
+            rhs, u, t_span, params, opts, monitor, threshold, method, labels,
+        )
+        .outcome;
     }
     // Escalated by the probe — at the span's start, or by a mid-segment re-probe (#1080
     // Part C) — and so the same guard `integrate_resolved_g` applies, in the shape this driver
@@ -1730,7 +1947,9 @@ pub fn solve_ode_until_threshold(
     // draw laundered out of a diverged stiff solve would be the worst possible outcome here,
     // so the retry is not optional.
     let u_entry = u.to_vec();
-    let run = until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method);
+    let run = until_threshold_with(
+        rhs, u, t_span, params, opts, monitor, threshold, method, labels,
+    );
 
     // Both halves of the dense driver's guard, in the shape this driver reports outcomes in.
     //
@@ -1761,6 +1980,7 @@ pub fn solve_ode_until_threshold(
         monitor,
         threshold,
         OdeMethod::EXPLICIT_FALLBACK,
+        labels,
     )
     .outcome
 }
@@ -1817,6 +2037,7 @@ fn until_threshold_with(
     monitor: usize,
     threshold: f64,
     method: OdeMethod,
+    labels: Option<&[String]>,
 ) -> ThresholdRun {
     let (t0, tf) = t_span;
     let ended = |outcome, stiff_min_step_clamped, ran_stiff| ThresholdRun {
@@ -1895,7 +2116,8 @@ fn until_threshold_with(
             if !y1.is_finite() {
                 return failed(
                     format!(
-                        "monitored state {monitor} became non-finite at t={:.6}",
+                        "{} became non-finite at t={:.6}",
+                        monitored_label(labels, monitor),
                         t + dt_eff
                     ),
                     ran_stiff,
@@ -1907,8 +2129,9 @@ fn until_threshold_with(
             if y1 < y0 - mono_tol {
                 return failed(
                     format!(
-                        "monitored state {monitor} decreased ({y0:.6} → {y1:.6}) over \
+                        "{} decreased ({y0:.6} → {y1:.6}) over \
                          [{t:.6}, {:.6}]: non-monotone accumulator (negative rate / hazard)",
+                        monitored_label(labels, monitor),
                         t + dt_eff
                     ),
                     ran_stiff,
@@ -1981,6 +2204,7 @@ fn until_threshold_with(
                 with_nonfinite_state_note(
                     u,
                     t,
+                    labels,
                     format!(
                         "aborted at t={t:.6} after {clamps} min-dt clamp(s) \
                          (ode_stiff_abort_after): the segment is stability-limited"
@@ -2009,6 +2233,7 @@ fn until_threshold_with(
         with_nonfinite_state_note(
             u,
             t,
+            labels,
             format!(
                 "step budget ({}) exhausted before reaching t_end={tf:.6} (reached t={t:.6})",
                 opts.max_steps
@@ -2024,23 +2249,54 @@ fn until_threshold_with(
 /// out, and the message would then blame the budget or stiffness for a diverged right-hand
 /// side. The budget clause stays as the secondary fact. A finite `u` returns `clause`
 /// unchanged, byte for byte.
-fn with_nonfinite_state_note(u: &[f64], t: f64, clause: String) -> String {
+///
+/// With `labels` the states are named by their labels, comma-joined as the sentence's subject
+/// (#2087), instead of the `state(s) <k>` index form that `None` prints.
+fn with_nonfinite_state_note(
+    u: &[f64],
+    t: f64,
+    labels: Option<&[String]>,
+    clause: String,
+) -> String {
     let bad: Vec<String> = u
         .iter()
         .enumerate()
         .filter(|(_, x)| !x.is_finite())
-        .map(|(k, _)| k.to_string())
+        .map(|(k, _)| state_label(labels, k))
         .collect();
-    match bad.len() {
-        0 => clause,
-        1 => format!(
+    match (bad.len(), labels.is_some()) {
+        (0, _) => clause,
+        // A label is a full noun phrase (`` [odes] state `x` ``, "the cumulative hazard of
+        // CMT=3"), so the labelled form carries no "state(s)" prefix of its own.
+        (_, true) => format!(
+            "{} became non-finite before t={t:.6}; {clause}",
+            bad.join(", ")
+        ),
+        (1, false) => format!(
             "state {} became non-finite before t={t:.6}; {clause}",
             bad[0]
         ),
-        _ => format!(
+        (_, false) => format!(
             "states {} became non-finite before t={t:.6}; {clause}",
             bad.join(", ")
         ),
+    }
+}
+
+/// State `k` as a `Failed` message names it: its label when the caller supplied one, else the
+/// 0-based index.
+fn state_label(labels: Option<&[String]>, k: usize) -> String {
+    labels
+        .and_then(|l| l.get(k))
+        .map_or_else(|| k.to_string(), String::clone)
+}
+
+/// The monitored state as the subject of a `Failed` sentence: `monitored state <k>` without
+/// labels (the public driver's text), the bare label with them.
+fn monitored_label(labels: Option<&[String]>, monitor: usize) -> String {
+    match labels.and_then(|l| l.get(monitor)) {
+        Some(label) => label.clone(),
+        None => format!("monitored state {monitor}"),
     }
 }
 
@@ -3355,6 +3611,72 @@ mod tests {
         );
     }
 
+    /// #1564: a pooled RK45 stepper is a fresh one. A stepper that has stepped (and carried
+    /// `k7` into `k1`) goes back to the pool when dropped; the next `make_stepper` of that size
+    /// takes it, reset, and must take exactly the steps a never-used stepper takes. Mutation:
+    /// drop `have_k1 = false` from `reset` and the reused stepper reuses a stale `k1`.
+    #[test]
+    fn a_pooled_rk45_stepper_steps_as_a_fresh_one() {
+        let rhs = |u: &[f64], p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -p[0] * u[0];
+            du[1] = p[0] * u[0] - 0.2 * u[1];
+        };
+        let opts = OdeSolverOptions::default();
+        let run = |u0: [f64; 2], p: f64| -> Vec<u64> {
+            let mut s = make_stepper::<f64>(2, OdeMethod::Rk45);
+            let mut u = u0;
+            let mut bits = Vec::new();
+            for k in 0..3 {
+                let err = s.attempt(&rhs, &u, &[p], 0.1 * k as f64, 0.1, &opts);
+                bits.push(err.to_bits());
+                u.copy_from_slice(s.u_new());
+                bits.extend(u.iter().map(|x| x.to_bits()));
+                s.on_accept();
+            }
+            bits
+        };
+        RK45_POOL.with(|p| p.borrow_mut().clear());
+        let fresh = run([2.0, 0.0], 0.7);
+        assert!(
+            RK45_POOL.with(|p| !p.borrow().is_empty()),
+            "a dropped stepper goes back to the pool"
+        );
+        // A different solve in between leaves stale stages and a carried `k1` behind.
+        let _other = run([5.0, 1.0], 1.9);
+        assert_eq!(
+            run([2.0, 0.0], 0.7),
+            fresh,
+            "the reused stepper took other steps"
+        );
+    }
+
+    /// Review r1 #1: a pool filled with steppers of other state sizes still takes the one
+    /// just dropped, evicting its oldest entry; refusing the push instead would end the
+    /// pooling for good once a thread had seen eight other shapes.
+    #[test]
+    fn a_full_rk45_pool_evicts_its_oldest_stepper() {
+        RK45_POOL.with(|p| p.borrow_mut().clear());
+        let held: Vec<_> = (10..10 + RK45_POOL_MAX)
+            .map(PooledRk45::<f64>::take)
+            .collect();
+        drop(held);
+        assert_eq!(RK45_POOL.with(|p| p.borrow().len()), RK45_POOL_MAX);
+        drop(PooledRk45::<f64>::take(2));
+        let sizes: Vec<usize> = RK45_POOL.with(|p| {
+            p.borrow()
+                .iter()
+                .filter_map(|b| b.downcast_ref::<Rk45Stepper<f64>>().map(|s| s.n))
+                .collect()
+        });
+        assert_eq!(sizes.len(), RK45_POOL_MAX);
+        assert_eq!(
+            sizes.last(),
+            Some(&2),
+            "the newest stepper is kept: {sizes:?}"
+        );
+        assert!(!sizes.contains(&10), "the oldest one is evicted: {sizes:?}");
+    }
+
     /// `Auto` never reaches [`make_stepper`] through a driver — every one resolves it first —
     /// but the arm exists so a caller that builds a stepper straight from the options keeps
     /// integrating instead of panicking inside a fit's worker thread. Pin that it really is the
@@ -4656,12 +4978,99 @@ mod tests {
     fn nonfinite_state_note_lists_every_non_finite_state() {
         let clause = "step budget (5) exhausted".to_string();
         assert_eq!(
-            with_nonfinite_state_note(&[f64::NAN, 1.0, f64::INFINITY], 2.0, clause.clone()),
+            with_nonfinite_state_note(&[f64::NAN, 1.0, f64::INFINITY], 2.0, None, clause.clone()),
             "states 0, 2 became non-finite before t=2.000000; step budget (5) exhausted"
         );
         assert_eq!(
-            with_nonfinite_state_note(&[0.0, 1.0], 2.0, clause.clone()),
+            with_nonfinite_state_note(&[0.0, 1.0], 2.0, None, clause.clone()),
             clause
         );
+    }
+
+    /// #2087 T5: with labels the note names the states by label, in index order, singular and
+    /// plural, with no `state(s)` prefix of its own (a label is a full noun phrase); a finite
+    /// `u` is still the clause alone.
+    ///
+    /// Mutations that redden it: ignore `labels` (prints `0, 2`); index the labels by the
+    /// position in the non-finite list instead of the state index; keep the `state(s)` prefix
+    /// on the labelled form.
+    #[test]
+    fn nonfinite_state_note_names_states_by_label() {
+        let labels: Vec<String> = [
+            "[odes] state `a`",
+            "[odes] state `b`",
+            "the cumulative hazard of CMT=3",
+        ]
+        .map(String::from)
+        .to_vec();
+        let clause = "step budget (5) exhausted".to_string();
+        assert_eq!(
+            with_nonfinite_state_note(
+                &[f64::NAN, 1.0, f64::INFINITY],
+                2.0,
+                Some(&labels),
+                clause.clone()
+            ),
+            "[odes] state `a`, the cumulative hazard of CMT=3 became non-finite before \
+             t=2.000000; step budget (5) exhausted"
+        );
+        assert_eq!(
+            with_nonfinite_state_note(&[1.0, f64::NAN, 1.0], 2.0, Some(&labels), clause.clone()),
+            "[odes] state `b` became non-finite before t=2.000000; step budget (5) exhausted"
+        );
+        assert_eq!(
+            with_nonfinite_state_note(&[0.0, 1.0, 2.0], 2.0, Some(&labels), clause.clone()),
+            clause
+        );
+    }
+
+    /// #2087 T5b: the labelled driver names the **monitored** state by its label in both of its
+    /// own failure sentences (non-finite, decreasing), and the unlabelled driver keeps the
+    /// `monitored state <k>` text, so the pair straddles the `labels` gate on the same input.
+    ///
+    /// Engine: the `f64` threshold driver, `rk45`. Mutations that redden it: ignore `labels` in
+    /// either sentence (the labelled leg prints `monitored state 0`); print the label on the
+    /// public driver (the `None` leg loses `monitored state 0`).
+    #[test]
+    fn threshold_failed_names_the_monitored_state_by_label() {
+        let labels: Vec<String> = vec!["the cumulative hazard".into()];
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Rk45,
+            ..Default::default()
+        };
+        let run = |rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), l: Option<&[String]>| {
+            let mut u = [1.0];
+            failed_text(solve_ode_until_threshold_labelled(
+                rhs,
+                &mut u,
+                (0.0, 10.0),
+                &[],
+                &opts,
+                0,
+                1e300,
+                l,
+            ))
+        };
+        let blowup = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
+        let falling = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -1.0;
+
+        let named = run(&blowup, Some(&labels));
+        assert!(
+            named.starts_with("the cumulative hazard became non-finite at t="),
+            "{named}"
+        );
+        let bare = run(&blowup, None);
+        assert!(
+            bare.starts_with("monitored state 0 became non-finite at t="),
+            "{bare}"
+        );
+
+        let named = run(&falling, Some(&labels));
+        assert!(
+            named.starts_with("the cumulative hazard decreased ("),
+            "{named}"
+        );
+        let bare = run(&falling, None);
+        assert!(bare.starts_with("monitored state 0 decreased ("), "{bare}");
     }
 }

@@ -1,0 +1,35 @@
+# ferx twin of nonmem_anchor/reset_init_snapshot_K.ctl (#1153).
+#
+# The reset row at t = 8 carries OCC = 3, which no observation or dose carries. KAPPA sits
+# inside the init(...) seed only, so occasion 3's kappa is read by the reset re-seed alone.
+# NONMEM gives that occasion an ETA (arm K); ferx before #1153 gave it no kappa group and
+# seeded it under kappa = 0, which is arm K_k0, 40 OFV units away.
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVBASE(10.0, 0.0, 1e15)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA ~ 0.04
+  sigma PROP ~ 0.01
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  BASE = TVBASE * WT * exp(KAPPA)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central)  = BASE
+  d/dt(central)  = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

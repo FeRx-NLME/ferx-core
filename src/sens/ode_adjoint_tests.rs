@@ -433,7 +433,8 @@ fn reconverged_f_for(
             .chunks(model.n_kappa)
             .map(nalgebra::DVector::from_column_slice)
             .collect();
-        return crate::stats::likelihood::foce_subject_nll_iov(
+        // The fit's objective at the live `block_sigma` ρ (#979), as below.
+        return crate::stats::likelihood::foce_subject_nll_iov_cov(
             model,
             s,
             &params.theta,
@@ -441,6 +442,7 @@ fn reconverged_f_for(
             &hm,
             &params.omega,
             &params.sigma.values,
+            model.residual_cov_at(&params),
             interaction,
             &kap,
             params.omega_iov.as_ref().unwrap(),
@@ -855,6 +857,62 @@ fn ode_init_on_the_static_walk_matches_reconverged_fd() {
     assert!(worst < 1e-7, "worst relative difference {worst:.2e}");
 }
 
+/// #2124: the static dual walk (`integrate_g`) reads a record one ULP before a co-timed
+/// dose — where the reader puts an observation listed before the dose — pre-dose, as the
+/// production predictor does. Only `t = 0` is the live cell: there the record and the dose
+/// share the subject's first break, where the dose is applied before anything is read.
+/// `t = 4` is the control — its ULP is under the 1e-15 dedup too, but the record at
+/// `4.next_down()` is neither the first nor the last break, so it is read at the end of the
+/// previous segment before the dose, and passes without the fix as well. `init(...)` puts
+/// drug in the state before the first dose, so both sides of each dose are non-zero.
+///
+/// Regression caught: the dual walk recording the post-dose state over the break's whole
+/// band (either `record_at` or `record_at_break` ignoring `pre`) — the values part by a
+/// dose from production, and the adjoint gradient is then the derivative of a different
+/// objective from the one FD differences.
+#[test]
+fn ode_static_walk_reads_a_ulp_earlier_record_pre_dose_like_production() {
+    let model = tight(parse_model_string(ODE_INIT).unwrap());
+    let times = [0.0_f64.next_down(), 0.0, 2.0, 4.0_f64.next_down(), 4.0, 6.0];
+    let s = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(4.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &times,
+        &[0.1, -0.05],
+    );
+    assert!(
+        in_scope(&model, &s),
+        "the static walk must serve this subject"
+    );
+    let theta = &model.default_params.theta;
+    let eta = [0.1, -0.05];
+    let preds = crate::pk::compute_predictions_with_tv(&model, &s, theta, &eta);
+    // The fixture is live: each pre-dose row sits a whole dose (100 / V = 10) below its
+    // post-dose twin on production, so a walk reading post-dose there cannot agree.
+    for (pre, post) in [(0, 1), (3, 4)] {
+        assert!(
+            preds[post] - preds[pre] > 9.0,
+            "rows {pre}/{post}: production {} / {}",
+            preds[pre],
+            preds[post]
+        );
+    }
+    let rows = exact_obs_grads(&model, &s, theta, &eta).expect("in recorder scope");
+    for (j, (row, want)) in rows.iter().zip(&preds).enumerate() {
+        assert!(
+            (row.f - want).abs() <= 1e-9 * want.abs(),
+            "row {j} (t = {:e}): dual walk {} vs production {want}",
+            times[j],
+            row.f
+        );
+    }
+    let worst = parity(&model, &s);
+    assert!(worst < 1e-7, "worst relative difference {worst:.2e}");
+}
+
 #[test]
 fn ode_lagtime_on_the_event_walk_matches_reconverged_fd() {
     let model = tight(parse_model_string(ODE_LAG).unwrap());
@@ -961,6 +1019,7 @@ fn addl_implied_lag_subject(model: &CompiledModel, tv: bool) -> Subject {
     implied.implied = Some(crate::types::ImpliedDose {
         parent: 0,
         param_time: 13.0,
+        gov_time: 13.0,
     });
     let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), implied];
     let times = [1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0];
@@ -1049,6 +1108,203 @@ fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
             worst < bound,
             "{label}: worst relative difference {worst:.2e}"
         );
+    }
+}
+
+/// A closed-form model whose clearance reads `D` through `+ 0 * D`, which is `+0` for
+/// any finite `D` and leaves `CL` unchanged bit for bit, value and jets alike. `D` is
+/// still an input the sharing key sees, so a subject giving each record its own `D`
+/// shares nothing while computing the same numbers. Under `iov` the clearance carries a κ.
+fn shared_inputs_src(iov: bool) -> String {
+    let (kappa, kappa_term, fit) = if iov {
+        (
+            "  kappa KAPPA_CL ~ 0.04\n",
+            " + KAPPA_CL",
+            "[fit_options]\n  iov_column = OCC\n",
+        )
+    } else {
+        ("", "", "")
+    };
+    format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+         theta TVKA(1.2, 0.05, 20.0)\n  theta TVLAG(0.4, 0.01, 5.0)\n  omega ETA_CL ~ 0.09\n  \
+         omega ETA_LAG ~ 0.1\n{kappa}  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  \
+         CL = TVCL * sqrt(X) * exp(ETA_CL{kappa_term}) + 0 * D\n  V = TVV\n  KA = TVKA\n  \
+         LAGTIME = TVLAG * X * exp(ETA_LAG)\n[structural_model]\n  \
+         pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n{fit}"
+    )
+}
+
+/// Doses at 0 (X = 1) and 6 (X = 2), and one at 12 implied by the first and governed by
+/// a record with X = 2, so it reads the dose at 6's inputs but its parent's lag (#1909).
+/// X returns to 1 after 13, so observations also share with records that are not their
+/// neighbours. `distinct(i)` gives record `i` its own `D`, the doses being `0..3` and the
+/// observations `10 + j`. Under IOV the records before 12 sit on occasion 1 and the rest on
+/// occasion 2, so the X = 2 records straddle a κ.
+fn shared_inputs_subject(model: &CompiledModel, distinct: impl Fn(usize) -> bool) -> Subject {
+    let mut implied = DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0);
+    implied.implied = Some(crate::types::ImpliedDose {
+        parent: 0,
+        param_time: 13.0,
+        gov_time: 13.0,
+    });
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        implied,
+    ];
+    let times = [1.0, 2.0, 4.0, 7.0, 8.0, 13.0, 14.0, 18.0, 24.0];
+    let xs = [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0];
+    let cov = |x: f64, d: f64| HashMap::from([("X".to_string(), x), ("D".to_string(), d)]);
+    let d = |i: usize| {
+        if distinct(i) {
+            1.0 + 0.125 * i as f64
+        } else {
+            1.0
+        }
+    };
+    let mut s = subject_shell(doses, &times);
+    s.covariates = cov(1.0, 1.0);
+    s.dose_covariates = [1.0, 2.0, 2.0]
+        .iter()
+        .enumerate()
+        .map(|(k, &x)| cov(x, d(k)))
+        .collect();
+    s.obs_covariates = xs
+        .iter()
+        .enumerate()
+        .map(|(j, &x)| cov(x, d(10 + j)))
+        .collect();
+    if model.n_kappa > 0 {
+        s.occasions = times
+            .iter()
+            .map(|&t| if t < 12.0 { 1 } else { 2 })
+            .collect();
+        s.dose_occasions = vec![1, 1, 2];
+    }
+    let preds = crate::pk::compute_predictions_with_tv(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.15 * (1.3 * j as f64).sin()))
+        .collect();
+    s
+}
+
+/// The closed-form recorder evaluates `$PK` once per distinct record input on its untaped
+/// types (`f64`, the inner loop's `DualF`) and copies it to the rest. That must change no
+/// bit of the predictions, the η-Jacobian or the outer gradient, so the subject whose
+/// records share is compared against its twin whose records share nothing.
+///
+/// Regressions each comparison catches, run as mutations: sharing records of different κ
+/// groups (IOV); writing an implied dose's parent lag into an evaluation the dose at 6
+/// shares, both when other records read it too and when the two doses are its only
+/// readers; copying from the wrong record; and letting the taped `DualV` share (the
+/// gradient row).
+#[test]
+fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
+    for iov in [false, true] {
+        let model = parse_model_string(&shared_inputs_src(iov)).unwrap();
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == "D"),
+            "iov {iov}: `0 * D` must keep D an input, or the twin shares too"
+        );
+        let shared = shared_inputs_subject(&model, |_| false);
+        let twin = shared_inputs_subject(&model, |_| true);
+        // The X = 2 observations each their own, so without IOV the dose at 6 and the
+        // implied dose are the only two records reading their evaluation.
+        let dose_pair = shared_inputs_subject(&model, |i| (13..16).contains(&i));
+        assert!(
+            shared.has_tv_covariates(),
+            "iov {iov}: per-record evaluation"
+        );
+        // The straddle: the subject shares, its twin does not, and the dose at 6 shares
+        // with the implied dose at 12, so the parent-lag copy lands in a shared evaluation.
+        let group = |s: &Subject, occ: u32| {
+            (model.n_kappa > 0)
+                .then(|| crate::stats::stacked_layout::StackedLayout::sens_of(&model, s))
+                .flatten()
+                .and_then(|l| l.group_of(occ))
+        };
+        // The recorder's own record list, so this asserts the sharing production builds.
+        let first = |s: &Subject| {
+            let records = crate::pk::record_pk_inputs(s);
+            crate::pk::first_record_with_same_pk_inputs(
+                &model,
+                records.iter().map(|&(occ, cov, _)| (group(s, occ), cov)),
+            )
+            .expect("a parsed model that does not read TIME has a sharing index")
+        };
+        let (fs, ft) = (first(&shared), first(&twin));
+        assert!(
+            ft.iter().enumerate().all(|(i, &f)| f == i),
+            "iov {iov}: the twin must share nothing: {ft:?}"
+        );
+        // Doses 0..3, then the observations at 3 + j.
+        let want = if iov {
+            // The X = 2 records split at 12 by occasion, and so do the X = 1 ones.
+            [0, 1, 2, 0, 0, 0, 1, 1, 2, 9, 9, 9]
+        } else {
+            [0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0]
+        };
+        assert_eq!(fs, want, "iov {iov}: the subject's sharing");
+        let want_pair = if iov {
+            [0, 1, 2, 0, 0, 0, 6, 7, 8, 9, 9, 9]
+        } else {
+            [0, 1, 1, 0, 0, 0, 6, 7, 8, 0, 0, 0]
+        };
+        assert_eq!(
+            first(&dose_pair),
+            want_pair,
+            "iov {iov}: the dose pair's sharing"
+        );
+
+        let theta = &model.default_params.theta;
+        let w = subject_width(&model, &shared).unwrap();
+        assert_eq!(w, subject_width(&model, &twin).unwrap());
+        let eta: Vec<f64> = (0..w).map(|k| 0.1 - 0.07 * k as f64).collect();
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let pred = |s: &Subject| crate::pk::compute_predictions_with_tv(&model, s, theta, &eta);
+        let sharing = [("shared", &shared), ("dose pair", &dose_pair)];
+        for (name, s) in sharing {
+            assert_eq!(
+                bits(&pred(s)),
+                bits(&pred(&twin)),
+                "iov {iov}, {name}: predictions"
+            );
+        }
+        let jac = |s: &Subject| {
+            exact_obs_grads(&model, s, theta, &eta)
+                .expect("the closed-form recorder serves the subject")
+                .iter()
+                .flat_map(|r| std::iter::once(r.f).chain(r.df_deta.iter().copied()))
+                .collect::<Vec<_>>()
+        };
+        for (name, s) in sharing {
+            assert_eq!(
+                bits(&jac(s)),
+                bits(&jac(&twin)),
+                "iov {iov}, {name}: the DualF values and η-Jacobian"
+            );
+        }
+        let p = moved_params(&model);
+        let grad = |s: &Subject| {
+            subject_adjoint_packed_gradient(&model, s, &p, &pack_params(&p), &eta, true)
+                .expect("the adjoint serves the subject")
+        };
+        for (name, s) in sharing {
+            assert_eq!(
+                bits(&grad(s)),
+                bits(&grad(&twin)),
+                "iov {iov}, {name}: the taped outer gradient"
+            );
+        }
     }
 }
 
@@ -1824,6 +2080,144 @@ fn iov_foce_adjoint_matches_reconverged_fd() {
     assert!(worst < 4e-5, "IOV FOCE: {worst:.2e}");
 }
 
+/// The exact outer gradient of an IOV subject carrying a TTE record: the term reads BSV η
+/// only, so it rides the stacked system's leading block, in the objective (`2q`, `∇²q` in
+/// `H̃`) and in the mode system. Against the reconverged production IOV marginal (which
+/// scores the term since the marginal fix), under both interaction settings.
+#[cfg(feature = "survival")]
+#[test]
+fn the_iov_outer_gradient_is_exact_with_a_non_gaussian_term() {
+    use crate::types::{EventType, ObsRecord};
+    let src = ODE_IOV
+        .replace(
+            "  theta TVKA(1.2, 0.05, 20.0)\n",
+            "  theta TVKA(1.2, 0.05, 20.0)\n  theta TVLAM(0.05, 0.001, 10.0)\n",
+        )
+        .replace(
+            "[fit_options]",
+            "[event_model]\n  cmt    = 3\n  family = exponential\n  \
+             scale  = TVLAM * exp(0.5 * ETA_CL)\n[fit_options]",
+        );
+    let model = tight(parse_model_string(&src).unwrap());
+    assert!(model.n_kappa > 0 && model.has_tte());
+    assert!(outer_model_in_scope(&model), "the outer route is analytic");
+    let mut s = iov_subject(&model);
+    s.obs_records = vec![ObsRecord::Event {
+        time: 15.0,
+        event_type: EventType::Exact,
+        entry_time: 0.0,
+        cmt: 3,
+    }];
+    let mut worst = 0.0f64;
+    for interaction in [true, false] {
+        let w = fd_oracle(&model, &s, interaction);
+        eprintln!("IOV + TTE interaction={interaction}: worst {w:.2e}");
+        worst = worst.max(w);
+    }
+    // The quadrature over the stacked `[η, κ]`, the term on its BSV block: Laplace, and the
+    // Gauss–Newton anchor on a 2-node grid.
+    for (n_agq, exact) in [(1, true), (2, false)] {
+        let w = super::phenomena_tests::fd_oracle_agq_iov(&model, &s, n_agq, exact);
+        eprintln!("IOV + TTE n_agq={n_agq} exact={exact}: worst {w:.2e}");
+        worst = worst.max(w);
+    }
+    // The IOV fixtures' reconverged oracle floor is 3e-6 … 8e-6 (above).
+    assert!(worst < 5e-5, "{worst:.2e}");
+}
+
+/// #979: a two-endpoint model — total and unbound concentration, a per-CMT proportional
+/// error each — whose two sigmas form a `block_sigma`, with a κ on CL. The shape of the
+/// fluconazole total/unbound model that tripped `E_BLOCK_SIGMA_IOV_UNSUPPORTED`.
+pub(super) const ODE_IOV_BLOCK_SIGMA: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta FU(0.3, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  kappa KAPPA_CL ~ 0.04
+  block_sigma (PROP_TOT, PROP_UNB) = [0.01, 0.006, 0.0225]
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = FU * central / V
+[error_model]
+  CMT=1: DV ~ proportional(PROP_TOT)
+  CMT=2: DV ~ proportional(PROP_UNB)
+[fit_options]
+  iov_column = OCC
+"#;
+
+/// Three occasions, a dose at the start of each so every later occasion starts with
+/// residual drug (κ_g reaches the following occasions), and a total and an unbound
+/// sample at every sampling time — the rows `block_sigma` pairs.
+pub(super) fn iov_two_endpoint_subject(model: &CompiledModel) -> Subject {
+    let base = [1.0, 4.0, 10.0, 13.0, 16.0, 22.0, 25.0, 28.0, 34.0];
+    let times: Vec<f64> = base.iter().flat_map(|&t| [t, t]).collect();
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let mut s = subject_shell(doses, &times);
+    s.obs_cmts = (0..times.len()).map(|j| 1 + j % 2).collect();
+    s.occasions = times.iter().map(|&t| 1 + (t / 12.0) as u32).collect();
+    s.dose_occasions = vec![1, 2, 3];
+    let kappas = vec![vec![0.12], vec![-0.1], vec![0.05]];
+    let preds = crate::pk::predict_iov(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+        &kappas,
+    );
+    // Correlated noise: the unbound row of a pair shares most of its total row's error.
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| {
+            let e = 0.1 * (1.7 * (j / 2) as f64).sin();
+            p * (1.0 + if j % 2 == 0 { e } else { 0.8 * e + 0.04 })
+        })
+        .collect();
+    s
+}
+
+/// #979: the adjoint's exact outer gradient of the IOV marginal under a two-endpoint
+/// `block_sigma` — every θ, Ω, Ω_IOV, σ and the ρ coordinate — against the reconverged
+/// FD oracle, which scores `foce_subject_nll_iov_cov` at the live ρ with the EBE re-solved
+/// (`find_ebe_iov`, also at the live ρ) at every point. FOCEI and FOCE.
+///
+/// Kills: the IOV marginal or the IOV EBE objective reading the *declared* ρ
+/// (`residual_cov_theta`) instead of the live one — the FD column on ρ then sees no ρ,
+/// or a mode of a different objective, while the kernel differentiates the live one.
+#[test]
+fn iov_block_sigma_adjoint_matches_reconverged_fd() {
+    let model = tight(parse_model_string(ODE_IOV_BLOCK_SIGMA).unwrap());
+    assert!(model.n_kappa == 1 && !model.residual_correlations.is_empty());
+    let s = iov_two_endpoint_subject(&model);
+    // The pairs are live: every total row has an unbound partner, so `R` is dense.
+    assert!(
+        crate::stats::residual_error::has_cross_observation_residual(
+            &model.error_spec,
+            &s,
+            &model.default_params.sigma.values,
+            model.residual_cov_at(&model.default_params),
+        )
+    );
+    for (interaction, tol) in [(true, 2e-5), (false, 4e-5)] {
+        let worst = iov_parity(&model, &s, interaction);
+        eprintln!("interaction {interaction}: worst {worst:.2e}");
+        assert!(worst < tol, "interaction {interaction}: {worst:.2e}");
+    }
+}
+
 #[test]
 fn iov_linearization_uses_the_exact_kappa_jacobian() {
     // The IOV objective's κ columns come from the analytic stacked η-Jacobian, not finite
@@ -2388,15 +2782,9 @@ fn laplace_kernel<const N: usize, const M: usize>(
         None,
     )
     .unwrap();
-    // `½log|H_reg|` with production's proposal jitter (`build_proposal`).
-    let h = nalgebra::DMatrix::from_fn(N, N, |a, b| {
-        l.hess(a, b)
-            + if a == b {
-                (1e-6 * l.hess(a, a).abs()).max(1e-10)
-            } else {
-                0.0
-            }
-    });
+    // The Laplace approximation's own `½log|H|`, no jitter (#2538): this fixture's
+    // Hessian is positive-definite, where production factors it as is.
+    let h = nalgebra::DMatrix::from_fn(N, N, |a, b| l.hess(a, b));
     l.v + 0.5
         * h.cholesky()
             .unwrap()
@@ -2527,6 +2915,7 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         false,
         None,
         Some(&log),
+        None,
     )
     .expect("population gradient");
     for (k, (&gk, &hk)) in g.iter().zip(&held).enumerate() {
@@ -2559,6 +2948,8 @@ fn laplace_kernel_is_the_production_objective() {
     );
     eprintln!("kernel {k:.15e} production {p:.15e}");
     // Measured worst 0 (bit-identical) on Linux (#2093 review round 2); ~10× headroom.
+    // Under the old jittered `½log|H_reg|` production sat 2.6e-6 from this oracle
+    // (8.409368521 vs 8.409365935), so the bound also catches the jitter returning.
     assert!((k - p).abs() / (1.0 + p.abs()) < 1e-12, "{k} vs {p}");
 }
 
@@ -2879,6 +3270,61 @@ fn exact_inner_hessian_matches_fd_of_the_production_objective() {
     assert!(worst < 4e-9, "{worst:.2e}");
 }
 
+/// An `init(...)` that reads the mixture index compiles too (`Op::PushMixNum` reads the class
+/// thread-local, as the closure does), so a mixture's dual walk seeds its initial state
+/// exactly rather than through the closure's difference quotient: bit-identical to the
+/// closure under each class, and the class really changes it.
+#[test]
+fn a_compiled_init_program_reads_the_mixture_class() {
+    use crate::parser::model_parser::MixtureClassGuard;
+    let src = ODE_INIT
+        .replace(
+            "  sigma PROP_ERR ~ 0.1 (sd)\n",
+            "  theta P1(0.4, 0.01, 0.99)\n  sigma PROP_ERR ~ 0.1 (sd)\n[mixture]\n  nsub = 2\n  p(1) = P1\n",
+        )
+        .replace(
+            "init(central) = BASE * V",
+            "init(central) = if (MIXNUM == 1) BASE * V else 3 * BASE * V",
+        );
+    let model = parse_model_string(&src).unwrap();
+    let ode = model.ode_spec.as_ref().unwrap();
+    let prog = ode.rhs_program.as_ref().unwrap();
+    let theta = &model.default_params.theta;
+    let pk = (model.pk_param_fn)(theta, &[0.1, -0.05], &HashMap::new(), 0.0);
+    let mut seen = Vec::new();
+    for cls in [1, 2] {
+        let _g = MixtureClassGuard::enter(cls);
+        let u = prog
+            .init_state_g::<f64>(&pk.values, ode.n_states)
+            .expect("a MIXNUM init compiles");
+        let closure = (ode.init_fn.as_ref().unwrap())(&pk.values);
+        assert_eq!(u[0].to_bits(), closure[0].to_bits(), "class {cls}");
+        seen.push(u[0]);
+    }
+    assert!((seen[1] / seen[0] - 3.0).abs() < 1e-12, "{seen:?}");
+}
+
+/// An `init(...)` with no compiled program declines the walks at the model scope (the FD
+/// fallback serves it), rather than reaching `init_seed` without a seed.
+#[test]
+fn an_init_without_a_compiled_program_declines_the_walks() {
+    let mut model = parse_model_string(ODE_INIT).unwrap();
+    assert!(
+        crate::sens::ode_provider::ode_walk_model_scope(&model),
+        "control"
+    );
+    model
+        .ode_spec
+        .as_mut()
+        .unwrap()
+        .rhs_program
+        .as_mut()
+        .unwrap()
+        .drop_init_program_for_tests();
+    assert!(!crate::sens::ode_provider::ode_walk_model_scope(&model));
+    assert!(!recorder_in_scope(&model));
+}
+
 #[test]
 fn compiled_init_program_is_the_closure_and_differentiates_exactly() {
     use crate::sens::rtape::DualT;
@@ -2887,7 +3333,7 @@ fn compiled_init_program_is_the_closure_and_differentiates_exactly() {
     let prog = ode.rhs_program.as_ref().unwrap();
     let theta = &model.default_params.theta;
     let pk = (model.pk_param_fn)(theta, &[0.1, -0.05], &HashMap::new(), 0.0);
-    // The exact path must exist for this fixture, or the walks fall back to the Taylor seed.
+    // The exact path the walks seed from.
     let u = prog
         .init_state_g::<f64>(&pk.values, ode.n_states)
         .expect("compiled init program");
@@ -3345,7 +3791,7 @@ fn one_cpt_oral_n_eta(n: usize) -> String {
 /// exact anchor (order 3) shows it stood aside.
 #[test]
 fn the_pk_space_closed_form_is_the_generic_one() {
-    use super::{PK_SPACE_HITS, PK_SPACE_OFF};
+    use super::{PK_SPACE_FORCE, PK_SPACE_HITS, PK_SPACE_OFF};
     let two_doses = |rate: f64| {
         vec![
             DoseEvent::new(0.0, 100.0, 1, rate, false, 0.0),
@@ -3388,6 +3834,7 @@ fn the_pk_space_closed_form_is_the_generic_one() {
             let eta = ebe_for(model, &s, &params, 1e-10, interaction);
             let both = |off: bool| {
                 PK_SPACE_OFF.with(|c| c.set(off));
+                PK_SPACE_FORCE.with(|c| c.set(!off));
                 PK_SPACE_HITS.with(|c| c.set(0));
                 let g = subject_adjoint_packed_gradient(
                     model,
@@ -3403,6 +3850,7 @@ fn the_pk_space_closed_form_is_the_generic_one() {
                 let h = exact_inner_hessian(model, &s, &params, eta.as_slice()).expect("hessian");
                 let hits = PK_SPACE_HITS.with(|c| c.get());
                 PK_SPACE_OFF.with(|c| c.set(false));
+                PK_SPACE_FORCE.with(|c| c.set(false));
                 (g, j, h, hits)
             };
             let (g0, j0, h0, off_hits) = both(true);
@@ -3434,23 +3882,174 @@ fn the_pk_space_closed_form_is_the_generic_one() {
     // Measured 9.6e-15: rounding (the polynomial and the closed form associate
     // differently); 100× headroom, still ten orders below a misweighted Taylor term.
     assert!(worst < 1e-12, "PK-space vs generic: {worst:.2e}");
-    // The exact anchor's recording tapes the η-Hessian (order 3): the fast path stands aside.
+    // The exact anchor's recording tapes the η-Hessian (order 3), and the covariance
+    // step's nested duals observe three orders (four under the exact anchor): each takes
+    // the PK-space path at its own order now, and must agree with the generic one.
     let (_, model, doses, eta_ref) = &cases[0];
     let s = subject(model, doses.clone(), &TIMES, eta_ref);
+    let worst_hi = pk_space_twin_high_order(model, &s, "1-cpt oral");
+    eprintln!("PK-space vs generic closed form, orders 3–4: worst relative gap {worst_hi:.2e}");
+    assert!(worst_hi < 1e-10, "orders 3–4: {worst_hi:.2e}");
+}
+
+/// The Laplace gradient (its taped exact-anchor recording, order 3) and the FOCEI and
+/// Laplace covariance Hessians (the nested duals, orders 3 and 4) with the PK-space path
+/// on and off: the worst relative gap, after asserting the path ran each time.
+fn pk_space_twin_high_order(model: &CompiledModel, s: &Subject, label: &str) -> f64 {
+    use super::{PK_SPACE_FORCE, PK_SPACE_HITS, PK_SPACE_OFF};
     let params = moved_params(model);
     let x = pack_params(&params);
-    let eta = ebe_for(model, &s, &params, 1e-10, true);
-    PK_SPACE_HITS.with(|c| c.set(0));
     let laplace = Objective::Agq {
         n_agq: 1,
         exact: true,
     };
-    subject_adjoint_gradient(model, &s, &params, &x, eta.as_slice(), laplace).expect("in scope");
-    let taped_hits = PK_SPACE_HITS.with(|c| c.get());
-    let canonical = 1; // the untaped canonical pass at η̂ (`canonical_jets`) is order 2
-    assert_eq!(
-        taped_hits, canonical,
-        "the taped exact-anchor recording must take the generic path"
+    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
+    let mut worst = 0.0f64;
+    let eta = ebe_for(model, s, &params, 1e-10, true);
+    let run = |off: bool| {
+        PK_SPACE_OFF.with(|c| c.set(off));
+        PK_SPACE_FORCE.with(|c| c.set(!off));
+        PK_SPACE_HITS.with(|c| c.set(0));
+        let g = subject_adjoint_gradient(model, s, &params, &x, eta.as_slice(), laplace)
+            .expect("in scope");
+        let g_hits = PK_SPACE_HITS.with(|c| c.get());
+        let hf =
+            subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), Objective::Focei)
+                .expect("FOCEI covariance Hessian");
+        let hl = subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), laplace)
+            .expect("Laplace covariance Hessian");
+        let hits = PK_SPACE_HITS.with(|c| c.get());
+        PK_SPACE_OFF.with(|c| c.set(false));
+        PK_SPACE_FORCE.with(|c| c.set(false));
+        (g, hf, hl, g_hits, hits)
+    };
+    let (g0, hf0, hl0, _, off_hits) = run(true);
+    let (g1, hf1, hl1, g_hits, hits) = run(false);
+    assert_eq!(off_hits, 0, "{label}: the switch must turn the path off");
+    // The canonical pass (order 2) and the taped exact-anchor recording (order 3).
+    assert!(
+        g_hits >= 2,
+        "{label}: the exact anchor's recording did not lift ({g_hits})"
+    );
+    assert!(
+        hits > g_hits,
+        "{label}: the covariance passes did not lift ({hits})"
+    );
+    for (a, b) in g1
+        .iter()
+        .zip(&g0)
+        .chain(hf1.iter().zip(hf0.iter()))
+        .chain(hl1.iter().zip(hl0.iter()))
+    {
+        assert!(a.is_finite() && b.is_finite(), "{label}");
+        worst = worst.max(rel(*a, *b));
+    }
+    assert!(
+        hf0.iter().map(|v| v.abs()).fold(0.0, f64::max) > 1e-2,
+        "{label}: a vanishing Hessian tests nothing"
+    );
+    worst
+}
+
+/// The ODE engine's PK-space path against its generic recording: the FOCEI and FOCE
+/// gradients, the η-Jacobian and inner Hessian (order ≤ 2), then the Laplace gradient and
+/// both covariance Hessians (orders 3 and 4), on static ODE subjects — RK45 and Rosenbrock,
+/// multi-dose infusion, four η, a transit chain.
+#[test]
+fn the_pk_space_ode_walk_is_the_generic_one() {
+    use super::{PK_SPACE_FORCE, PK_SPACE_HITS, PK_SPACE_OFF};
+    let mut rodas = tight(parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap());
+    rodas.ode_spec.as_mut().unwrap().solver_opts.method = crate::ode::solver::OdeMethod::Rodas5P;
+    let infusions = vec![
+        DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(8.0, 100.0, 1, 50.0, false, 0.0),
+    ];
+    let bolus = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let cases: Vec<(&str, CompiledModel, Vec<DoseEvent>, Vec<f64>)> = vec![
+        (
+            "one_cpt_oral_ode",
+            tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap()),
+            bolus.clone(),
+            vec![0.1, -0.05],
+        ),
+        (
+            "two_cpt_infusion",
+            tight(parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap()),
+            infusions.clone(),
+            vec![0.1, -0.05, 0.08],
+        ),
+        ("two_cpt_rodas5p", rodas, infusions, vec![0.1, -0.05, 0.08]),
+        (
+            "additive_four_eta",
+            tight(parse_model_string(ADDITIVE_FOUR_ETA).unwrap()),
+            bolus.clone(),
+            vec![0.1, -0.05, 0.2, -0.1],
+        ),
+        (
+            "chain_4",
+            tight(parse_model_string(&chain_model(4)).unwrap()),
+            bolus,
+            vec![0.1, -0.05, 0.1],
+        ),
+    ];
+    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
+    let (mut worst2, mut worst_hi) = (0.0f64, 0.0f64);
+    for (label, model, doses, eta_ref) in &cases {
+        let s = subject(model, doses.clone(), &TIMES, eta_ref);
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        for interaction in [true, false] {
+            let eta = ebe_for(model, &s, &params, 1e-10, interaction);
+            let both = |off: bool| {
+                PK_SPACE_OFF.with(|c| c.set(off));
+                PK_SPACE_FORCE.with(|c| c.set(!off));
+                PK_SPACE_HITS.with(|c| c.set(0));
+                let g = subject_adjoint_packed_gradient(
+                    model,
+                    &s,
+                    &params,
+                    &x,
+                    eta.as_slice(),
+                    interaction,
+                )
+                .expect("in scope");
+                let j =
+                    exact_eta_jacobian(model, &s, &params.theta, eta.as_slice()).expect("jacobian");
+                let h = exact_inner_hessian(model, &s, &params, eta.as_slice()).expect("hessian");
+                let hits = PK_SPACE_HITS.with(|c| c.get());
+                PK_SPACE_OFF.with(|c| c.set(false));
+                PK_SPACE_FORCE.with(|c| c.set(false));
+                (g, j, h, hits)
+            };
+            let (g0, j0, h0, _) = both(true);
+            let (g1, j1, h1, hits) = both(false);
+            assert!(
+                hits >= 2,
+                "{label}: the PK-space path did not run ({hits} hits)"
+            );
+            for (a, b) in g1
+                .iter()
+                .zip(&g0)
+                .chain(j1.iter().zip(j0.iter()))
+                .chain(h1.iter().zip(h0.iter()))
+            {
+                assert!(a.is_finite() && b.is_finite(), "{label}");
+                worst2 = worst2.max(rel(*a, *b));
+            }
+        }
+        worst_hi = worst_hi.max(pk_space_twin_high_order(model, &s, label));
+        eprintln!("{label}: worst so far {worst2:.2e} (order 2), {worst_hi:.2e} (orders 3–4)");
+    }
+    assert!(
+        worst2 < 1e-10,
+        "PK-space vs generic ODE, order 2: {worst2:.2e}"
+    );
+    assert!(
+        worst_hi < 1e-9,
+        "PK-space vs generic ODE, orders 3–4: {worst_hi:.2e}"
     );
 }
 
@@ -3869,8 +4468,10 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
 #[test]
 fn cov_hessian_pass_width_follows_the_tape_budget() {
     use super::hessian::{pass_width, TAPE_NODE_BUDGET};
-    assert_eq!(pass_width(0), 8);
-    assert_eq!(pass_width(1000), 8);
+    // A small tape takes the full `K = 4` directions per pass (#1564: 4 measured faster
+    // than 8 on every bench fixture).
+    assert_eq!(pass_width(0), 4);
+    assert_eq!(pass_width(1000), 4);
     // 5 → (5 − 1)·4/5 = 3 directions: ~1 + 1.25·3 ≈ 4.75 × nodes, inside the budget.
     assert_eq!(pass_width(TAPE_NODE_BUDGET / 5), 3);
     assert_eq!(pass_width(TAPE_NODE_BUDGET), 1);
@@ -5005,16 +5606,16 @@ fn mode_solve_takes_an_indefinite_nonsingular_hessian() {
     );
     let b = DVector::from_column_slice(&[1.0, -3.0]);
     let stationary = [0.0, 3e-6];
-    let w = super::mode_solve(&h, &b, &stationary).expect("nonsingular");
+    let w = super::mode_solve::<0>(&h, &b, &stationary, || None).expect("nonsingular");
     let r = &h * &w - &b;
     assert!(r.norm() < 1e-14, "residual {:.2e}", r.norm());
     // A strict mode keeps the Cholesky solve.
     let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
-    let w = super::mode_solve(&spd, &b, &stationary).expect("definite");
+    let w = super::mode_solve::<0>(&spd, &b, &stationary, || None).expect("definite");
     assert!((&spd * &w - &b).norm() < 1e-14);
     // Singular: declined, not a non-finite `w`.
     let sing = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
-    assert!(super::mode_solve(&sing, &b, &stationary).is_none());
+    assert!(super::mode_solve::<0>(&sing, &b, &stationary, || None).is_none());
 }
 
 /// #2093 review (round 2, finding 14): the indefinite branch serves only a stationary `η̂`.
@@ -5027,11 +5628,148 @@ fn mode_solve_takes_an_indefinite_nonsingular_hessian() {
 fn mode_solve_declines_an_indefinite_hessian_off_the_mode() {
     let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
     let b = DVector::from_column_slice(&[1.0, -3.0]);
-    assert!(super::mode_solve(&h, &b, &[0.0, 5e-5]).is_some());
-    assert!(super::mode_solve(&h, &b, &[1e-2, 0.0]).is_none());
-    assert!(super::mode_solve(&h, &b, &[f64::NAN, 0.0]).is_none());
+    assert!(super::mode_solve::<0>(&h, &b, &[0.0, 5e-5], || None).is_some());
+    assert!(super::mode_solve::<0>(&h, &b, &[1e-2, 0.0], || None).is_none());
+    assert!(super::mode_solve::<0>(&h, &b, &[f64::NAN, 0.0], || None).is_none());
     let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
-    assert!(super::mode_solve(&spd, &b, &[1e-2, 0.0]).is_some());
+    assert!(super::mode_solve::<0>(&spd, &b, &[1e-2, 0.0], || None).is_some());
+}
+
+/// #2557: `MODE_STATIONARY_TOL` is a gradient gate of its own, and a point the inner
+/// search's certificate accepts can fail it. On a direction of curvature 1e4,
+/// `FallbackCertifier` certifies `η = (2e-8, 0)` by the Newton-step arm (`‖H⁻¹g‖ = 2e-8 <
+/// tol`) without moving it, at `‖g‖∞ = 2e-4`, twice the gate. That gradient on an indefinite
+/// `H` declines. Both halves are asserted, so the constant's doc (the certificate does not
+/// imply the gate) cannot silently go false in either direction: a certificate that starts
+/// bounding the gradient fails the first half, and a gate that starts accepting certified
+/// points fails the second. The control, the same `H` at a gradient under the gate, is taken.
+#[test]
+fn a_certified_point_can_fail_the_indefinite_stationarity_gate() {
+    use crate::estimation::inner_optimizer::FallbackCertifier;
+    let c = 1e4;
+    let obj = |x: &[f64]| 0.5 * (c * x[0] * x[0] + x[1] * x[1]);
+    let grad = |x: &[f64]| vec![c * x[0], x[1]];
+    let never = |_: &[f64]| false;
+    let cert = FallbackCertifier {
+        grad: &grad,
+        precond: None,
+        stop_precond: None,
+        stall_at: &never,
+        n: 2,
+        max_iter: 50,
+        tol: 1e-5,
+    };
+    let start = vec![2e-8, 0.0];
+    let mut x = start.clone();
+    assert!(
+        cert.certify(&obj, &mut x),
+        "the Newton-step arm certifies it"
+    );
+    assert_eq!(x, start, "certified in place, not polished");
+    let g = grad(&x);
+    let g_inf = g.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    assert!(
+        g_inf > super::MODE_STATIONARY_TOL,
+        "the certified point is above the gate: {g_inf:.2e}"
+    );
+    let indefinite = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+    let b = DVector::from_column_slice(&[1.0, -3.0]);
+    assert!(
+        super::mode_solve::<0>(&indefinite, &b, &g, || None).is_none(),
+        "a certified point above the gate declines"
+    );
+    let under: Vec<f64> = g.iter().map(|v| v * 0.4).collect();
+    assert!(super::mode_solve::<0>(&indefinite, &b, &under, || None).is_some());
+}
+
+/// A declined stationarity gate is judged again by the inner search's own gradient, which
+/// the definite branch never computes. The recording's `∇_η l` and the search's are exact
+/// derivatives of two floating-point solves that part at the solver's tolerance where the
+/// tangents are not error-controlled (`inner_search_gradient`), so an EBE the search drove
+/// to zero can read non-stationary on the recording.
+#[test]
+fn mode_solve_judges_a_declined_gate_by_the_inner_search_gradient() {
+    use std::cell::Cell;
+    let indefinite = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+    let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
+    let b = DVector::from_column_slice(&[1.0, -3.0]);
+    let calls = Cell::new(0);
+    let inner = |g: [f64; 2]| {
+        let calls = &calls;
+        move || {
+            calls.set(calls.get() + 1);
+            Some(g)
+        }
+    };
+    // The recording reads 1e-2, the search 5e-5: taken, by the search's gradient.
+    let w = super::mode_solve(&indefinite, &b, &[1e-2, 0.0], inner([5e-5, 0.0]));
+    assert!(w.is_some());
+    assert_eq!(calls.get(), 1);
+    // Both non-stationary: declined.
+    assert!(super::mode_solve(&indefinite, &b, &[1e-2, 0.0], inner([1e-2, 0.0])).is_none());
+    // No inner gradient: declined.
+    assert!(super::mode_solve::<2>(&indefinite, &b, &[1e-2, 0.0], || None).is_none());
+    // A definite Hessian and a stationary recording never ask.
+    calls.set(0);
+    assert!(super::mode_solve(&spd, &b, &[1e-2, 0.0], inner([1.0, 1.0])).is_some());
+    assert!(super::mode_solve(&indefinite, &b, &[0.0, 5e-5], inner([1.0, 1.0])).is_some());
+    // #2468 review: a singular `H` declines whatever the gradient, so a declined gate there
+    // never pays the inner search's recording.
+    let singular = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
+    let never = || -> Option<[f64; 2]> { panic!("a singular H must not re-judge the gate") };
+    assert!(super::mode_solve(&singular, &b, &[1e-2, 0.0], never).is_none());
+    assert_eq!(calls.get(), 0);
+}
+
+/// `inner_search_gradient` is the inner search's gradient: `exact_inner_gradient`, under
+/// FOCEI's conditional and FOCE's frozen variance alike.
+#[test]
+fn the_gate_gradient_is_the_inner_search_gradient() {
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = moved_params(&model);
+    let eta = [0.08, -0.03, 0.15];
+    let ctx = LikCtx::new(&model, &s, &params);
+    let pv = ParT::of(&model, &s, &params);
+    let mut pv = pv;
+    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
+        super::stacked_omega::<3>(&model, &s, &params, &params, 3).chol,
+    )
+    .unwrap();
+    let fpop: Vec<f64> = canonical_jets1::<3>(&model, &s, None, &params.theta, &[0.0; 3])
+        .unwrap()
+        .iter()
+        .map(|q| q.v)
+        .collect();
+    for frozen in [None, Some(fpop.as_slice())] {
+        let got = super::inner_search_gradient::<3>(
+            &model,
+            &s,
+            None,
+            &params.theta,
+            &eta,
+            &ctx,
+            &pv,
+            frozen,
+        )
+        .unwrap();
+        let want = exact_inner_gradient(&model, &s, &params, &eta, frozen).unwrap();
+        assert!(
+            got.iter().any(|g| g.abs() > 1e-3),
+            "a vanishing gradient tests nothing"
+        );
+        for (a, b) in got.iter().zip(&want) {
+            assert_eq!(a.to_bits(), b.to_bits(), "frozen = {}", frozen.is_some());
+        }
+    }
 }
 
 /// #2093 review (round 2, finding 13): the EBE warm-start predictor `dη̂/dx` serves 5- and
@@ -5094,6 +5832,76 @@ fn eta_dx_serves_a_five_effect_subject_and_matches_the_re_solved_ebe() {
             "eta_dx (interaction = {interaction}) vs re-solved EBE {worst:.2e}"
         );
     }
+}
+
+/// The EBE warm-start predictor `dη̂/dx` on subjects carrying non-Gaussian records (the
+/// outer optimizer now engages it on every model the outer gradient serves): the term's
+/// `∇q`/`∇²q` enter the pass's `g`, so the mode response is the full inner problem's.
+/// Against the central difference of the re-solved EBE, under both interaction settings.
+#[cfg(feature = "survival")]
+#[test]
+fn eta_dx_matches_the_re_solved_ebe_with_a_non_gaussian_term() {
+    use crate::estimation::parameterization::unpack_params;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut worst_all = 0.0f64;
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let mut prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let model = &prep.parsed.model;
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap();
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        for interaction in [true, false] {
+            let eta = ebe_for(model, s, &params, 1e-12, interaction);
+            let dx = std::thread::scope(|sc| {
+                std::thread::Builder::new()
+                    .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                    .spawn_scoped(sc, || {
+                        subject_adjoint_eta_dx(model, s, &params, &x, eta.as_slice(), interaction)
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            })
+            .unwrap_or_else(|| panic!("{m}: a non-Gaussian subject must be served"));
+            let mut worst = 0.0f64;
+            let mut live = 0.0f64;
+            for k in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                let at = |d: f64| {
+                    let mut xp = x.clone();
+                    xp[k] += d;
+                    ebe_for(model, s, &unpack_params(&xp, &params), 1e-12, interaction)
+                };
+                let (ep, em) = (at(h), at(-h));
+                for j in 0..model.n_eta {
+                    let fd = (ep[j] - em[j]) / (2.0 * h);
+                    assert!(fd.is_finite() && dx[k][j].is_finite(), "x[{k}] η[{j}]");
+                    worst = worst.max((dx[k][j] - fd).abs() / (1.0 + fd.abs()));
+                    live = live.max(fd.abs());
+                }
+            }
+            assert!(
+                live > 1e-2,
+                "{m}: the mode does not move — the test sees nothing"
+            );
+            eprintln!("{m} interaction={interaction}: eta_dx vs re-solved EBE {worst:.2e}");
+            worst_all = worst_all.max(worst);
+        }
+    }
+    assert!(worst_all < 2e-4, "eta_dx vs re-solved EBE {worst_all:.2e}");
 }
 
 /// The `tests/ss_fit_smoke.rs` model, subject 3 of `data/ss_oral_q24.csv` (#1498).
@@ -5691,4 +6499,1026 @@ fn exact_inner_hessian_matches_fd_on_m3_and_combined_rows() {
         let bound = if label.starts_with("M3") { 5e-6 } else { 3e-10 };
         assert!(worst < bound, "{label}: {worst:.2e} vs bound {bound:.0e}");
     }
+}
+
+/// `∂f_j/∂θ_m` at a fixed `eta` by forward mode: one recording per θ with that θ's unit
+/// tangent (`DualF<1, 0>`) — the same recorder, differentiated forwards, sharing no
+/// reverse-pass code with [`fixed_eta_theta_adjoint`].
+fn forward_theta_jacobian(
+    model: &CompiledModel,
+    s: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    n_axis: usize,
+) -> Vec<Vec<f64>> {
+    (0..n_axis)
+        .map(|m| {
+            let th: Vec<DualF<1, 0>> = theta
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| DualF::free(v, [if k == m { 1.0 } else { 0.0 }], []))
+                .collect();
+            let et: Vec<DualF<1, 0>> = eta.iter().map(|&e| DualF::constant(e)).collect();
+            record(model, s, None, theta, eta, &ThetaLeaves::theta(&th), &et)
+                .expect("in scope")
+                .iter()
+                .map(|q| q.g[0])
+                .collect()
+        })
+        .collect()
+}
+
+/// The fixed-η θ adjoint (SAEM's M-step and VI's score) against forward-mode tangents of
+/// the same recorder: the contracted gradient and every `∂f_j/∂θ_m` of the Jacobian, on
+/// ODE (RK45 and Rosenbrock), multi-dose infusion, a 14-parameter chain and closed-form
+/// models. Both are exact derivatives of the same discrete trajectory, so they agree to
+/// rounding; no finite difference anywhere.
+#[test]
+fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
+    let mut rodas = parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap();
+    rodas.ode_spec.as_mut().unwrap().solver_opts.method = crate::ode::solver::OdeMethod::Rodas5P;
+    let infusions = vec![
+        DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(8.0, 100.0, 1, 50.0, false, 0.0),
+    ];
+    let bolus = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let cases: Vec<(&str, CompiledModel, Vec<DoseEvent>, Vec<f64>)> = vec![
+        (
+            "one_cpt_oral_ode",
+            parse_model_string(ONE_CPT_ORAL_ODE).unwrap(),
+            bolus.clone(),
+            vec![0.1, -0.05],
+        ),
+        (
+            "two_cpt_infusion",
+            parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap(),
+            infusions.clone(),
+            vec![0.1, -0.05, 0.08],
+        ),
+        ("two_cpt_rodas5p", rodas, infusions, vec![0.1, -0.05, 0.08]),
+        (
+            "additive_four_eta",
+            parse_model_string(ADDITIVE_FOUR_ETA).unwrap(),
+            bolus.clone(),
+            vec![0.1, -0.05, 0.2, -0.1],
+        ),
+        (
+            "chain_12",
+            parse_model_string(&chain_model(12)).unwrap(),
+            bolus.clone(),
+            vec![0.1, -0.05, 0.1],
+        ),
+        (
+            "one_cpt_oral_closed_form",
+            parse_model_string(ONE_CPT_ORAL).unwrap(),
+            bolus.clone(),
+            vec![0.1, -0.05],
+        ),
+        (
+            "two_cpt_iv_closed_form",
+            parse_model_string(TWO_CPT_IV_COMBINED).unwrap(),
+            bolus.clone(),
+            vec![0.1, -0.05, 0.08],
+        ),
+        // Between-occasion variability: η then one occasion's κ, stacked.
+        (
+            "ode_iov",
+            parse_model_string(ODE_IOV).unwrap(),
+            bolus,
+            vec![0.1, -0.05, 0.08, -0.03],
+        ),
+    ];
+    let mut worst_all = 0.0f64;
+    for (name, model, doses, eta) in cases {
+        let mut worst = 0.0f64;
+        let width = model.n_eta + model.n_kappa;
+        let mut eta = eta[..width.min(eta.len())].to_vec();
+        eta.resize(width, 0.05);
+        let s = subject(&model, doses, &TIMES, &eta[..model.n_eta]);
+        let theta = model.default_params.theta.clone();
+        let weights: Vec<f64> = (0..s.observations.len())
+            .map(|j| (0.7 * j as f64 + 0.3).sin())
+            .collect();
+        let x = fixed_eta_theta_adjoint(&model, &s, &theta, &eta, true, &weights)
+            .unwrap_or_else(|| panic!("{name}: out of the recorders' scope"));
+        let n_axis = theta_axis(&model).unwrap().min(theta.len());
+        let fwd = forward_theta_jacobian(&model, &s, &theta, &eta, n_axis);
+        let jac = x.jac.as_ref().expect("asked for");
+        let n_theta = theta.len();
+        let mut live = 0;
+        for m in 0..n_axis {
+            let g_fwd: f64 = fwd[m].iter().zip(&weights).map(|(d, w)| d * w).sum();
+            assert!(g_fwd.is_finite() && x.grad[m].is_finite(), "{name}: θ{m}");
+            worst = worst.max((x.grad[m] - g_fwd).abs() / (1.0 + g_fwd.abs()));
+            for j in 0..s.observations.len() {
+                let (a, f) = (jac[j * n_theta + m], fwd[m][j]);
+                assert!(a.is_finite() && f.is_finite(), "{name}: ∂f{j}/∂θ{m}");
+                worst = worst.max((a - f).abs() / (1.0 + f.abs()));
+                live += (f != 0.0) as usize;
+            }
+        }
+        // Non-degenerate: the predictions really depend on the θ under test.
+        assert!(
+            live > s.observations.len(),
+            "{name}: only {live} live entries"
+        );
+        // Measured: 3.8e-16 on the explicit and closed-form engines; 1.2e-10 on Rodas5P,
+        // where the taped side solves `W` through the vector tape's block LU and the
+        // forward side element by element over the dual, and the stiff `W`'s conditioning
+        // amplifies that rounding difference. ~25× and ~9× headroom.
+        let bound = if name.contains("rodas") { 1e-9 } else { 1e-14 };
+        assert!(worst < bound, "{name}: worst relative difference {worst:e}");
+        worst_all = worst_all.max(worst);
+    }
+    eprintln!("fixed-η θ adjoint vs forward tangents: worst relative difference {worst_all:e}");
+}
+/// The lift is taken where its jet type is no more work per operation than the recording's
+/// (`pk_space_predictions`). Each case names the fit it decides: a taped FOCEI recording over
+/// as many PK slots lifts (the tape is what it drops); a two-η Michaelis–Menten fit over four
+/// live slots does not, at order 2 or under Laplace's directional order 3, where
+/// `Taylor<4, 3>`'s 165-term product was measured slower than the recording it replaced.
+#[test]
+fn the_lift_is_taken_where_it_is_less_work() {
+    use crate::sens::num::PkNum;
+    let lifts = |order: usize, n: usize, work: usize| {
+        super::pk_space_work(order, n).is_some_and(|w| w <= work)
+    };
+    // Five η over five slots, FOCEI's taped recording.
+    assert!(lifts(2, 5, <DualV<6, 21> as PkNum>::WORK));
+    // Two η over four slots: FOCEI, and Laplace's exact anchor (`DualV<N, N, true>`).
+    assert!(!lifts(2, 4, <DualV<2, 3> as PkNum>::WORK));
+    assert!(!lifts(3, 4, <DualV<2, 2, true> as PkNum>::WORK));
+    // The exact anchor's widths, counted at their stored lanes (`1 + 2N`, all taped): eight
+    // η over two slots lifts; four η over two, and 24 over four, do not. Four η over two
+    // slots was measured (a Laplace gradient, three η, two on PK slots): lifted 1.75× the
+    // generic recording's time, at a 4.5e-15 gap — so not lifting it is the faster choice.
+    assert_eq!(<DualV<4, 4, true> as PkNum>::WORK, 27);
+    assert!(lifts(3, 2, <DualV<8, 8, true> as PkNum>::WORK));
+    assert!(!lifts(3, 2, <DualV<4, 4, true> as PkNum>::WORK));
+    assert!(!lifts(3, 4, <DualV<24, 24, true> as PkNum>::WORK));
+    // Many η over few slots lifts even untaped.
+    assert!(lifts(2, 2, <DualF<8, 36> as PkNum>::WORK));
+    // Past the widest bucket there is no lift at all.
+    assert_eq!(super::pk_space_work(2, 9), None);
+    assert_eq!(super::pk_space_work(4, 7), None);
+    // The costs themselves: `1 + p + p(p+1)/2` at the bucket, and the Taylor product.
+    assert_eq!(super::pk_space_work(2, 5), Some(28));
+    assert_eq!(super::pk_space_work(3, 4), Some(165));
+}
+
+/// The exact outer gradient of a subject carrying non-Gaussian records: the term `q`
+/// folded into the FOCE/FOCEI objective (`2q` in the data, `∇²q` in `H̃`), its third-order
+/// η-jets in the mode system, its θ-derivatives contracted with the tape's adjoints. Against
+/// the Richardson-extrapolated, EBE-reconverged difference of the production objective
+/// (`fd_oracle`, which shares no derivative code with the adjoint), under both interaction
+/// settings, on a drug-driven (ODE-accumulated) hazard and on an analytic one.
+#[cfg(feature = "survival")]
+#[test]
+fn the_outer_gradient_is_exact_with_a_non_gaussian_term() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut worst = 0.0f64;
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let mut prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let model = &prep.parsed.model;
+        assert!(
+            outer_model_in_scope(model),
+            "{m}: the outer route is analytic"
+        );
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap();
+        for interaction in [true, false] {
+            let w = fd_oracle(model, s, interaction);
+            eprintln!("{m} interaction={interaction}: worst {w:.2e}");
+            worst = worst.max(w);
+        }
+    }
+    // Measured: 5.3e-9 / 1.7e-8 (FOCEI / FOCE) on the joint PK-TTE model at reltol 1e-12,
+    // 6.2e-13 on the analytic hazard — the reconverged oracle's own floor. A dropped
+    // `∇²q` in `H̃`, a missing third-order jet or the conditional-for-frozen `∇l` mix-up
+    // under FOCE (measured 2.3e-2 before it was fixed) misses by orders more.
+    assert!(worst < 5e-7, "worst relative difference {worst:.2e}");
+}
+
+/// The exact outer gradient on binary, CTMM and DTMM endpoints — endpoint-only and beside a PK
+/// model — against the reconverged oracle, under both interaction settings.
+#[cfg(all(feature = "survival", feature = "markov"))]
+#[test]
+fn the_outer_gradient_is_exact_on_binary_and_ctmm_endpoints() {
+    use crate::types::ObsRecord;
+    let states = |cmt: usize, rows: &[(f64, usize)]| -> Vec<ObsRecord> {
+        rows.iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                raw_time: time,
+                state,
+                cmt,
+            })
+            .collect()
+    };
+    let ctmm = parse_model_string(
+        "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  \
+         omega ETA_Q ~ 0.1\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
+         states = [awake=0, asleep=1]\n  transition awake  -> asleep = exp(LQ01 + ETA_Q)\n  \
+         transition asleep -> awake  = exp(LQ10 - 0.5 * ETA_Q)\n",
+    )
+    .unwrap();
+    let ctmm_s = Subject {
+        id: "1".into(),
+        obs_records: states(
+            5,
+            &[(0.0, 0), (1.0, 0), (2.3, 1), (3.1, 1), (5.0, 0), (7.5, 1)],
+        ),
+        ..Default::default()
+    };
+    // The discrete-time Markov endpoint (#2473) on the same chain: per-record transition
+    // probabilities, a stay step and a `TIME` term, through the discrete seam's term.
+    let dtmm = parse_model_string(
+        "[parameters]\n  theta A(-0.8, -6.0, 3.0)\n  theta B(-1.3, -6.0, 3.0)\n  \
+         omega ETA_Q ~ 0.1\n[markov_model]\n  type   = dtmm\n  cmt    = 5\n  \
+         states = [awake=0, asleep=1]\n  transition awake  -> asleep = inv_logit(A + ETA_Q)\n  \
+         transition asleep -> awake  = inv_logit(B - 0.5 * ETA_Q + 0.1 * TIME)\n",
+    )
+    .unwrap();
+    let binary = parse_model_string(
+        "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
+         omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  \
+         logit = TH0 + ETA_I + THT * TIME * exp(0.5 * ETA_I)\n",
+    )
+    .unwrap();
+    let binary_s = Subject {
+        id: "1".into(),
+        obs_records: states(3, &[(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)]),
+        ..Default::default()
+    };
+    // No random effects at all (`examples/binary_logistic.ferx`'s shape): the term's jets
+    // have width 0, the value alone.
+    let fixed = parse_model_string(
+        "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n\
+         [binary_model]\n  cmt   = 3\n  logit = TH0 + THT * TIME\n",
+    )
+    .unwrap();
+    assert_eq!(fixed.n_eta, 0);
+    let mut worst = 0.0f64;
+    for (tag, model, s) in [
+        ("ctmm", &ctmm, &ctmm_s),
+        ("dtmm", &dtmm, &ctmm_s),
+        ("binary", &binary, &binary_s),
+        ("binary, no η", &fixed, &binary_s),
+    ] {
+        assert!(
+            outer_model_in_scope(model),
+            "{tag}: the outer route is analytic"
+        );
+        for interaction in [true, false] {
+            let w = fd_oracle(model, s, interaction);
+            eprintln!("{tag} interaction={interaction}: worst {w:.2e}");
+            worst = worst.max(w);
+        }
+    }
+    eprintln!("binary / CTMM outer gradient vs the reconverged oracle: worst {worst:.2e}");
+    // Measured 1.5e-12: the oracle's floor on these closed-form terms.
+    assert!(worst < 5e-7, "{worst:.2e}");
+}
+
+/// The exact Laplace / AGQ gradient of a subject carrying non-Gaussian records: the term in
+/// the exact anchor (`∇²q`), at `η̂` (`q`, `∇q`, third-order jets for the mode system) and at
+/// every node (its value, linearised in `b` there). Against the Richardson difference of
+/// production's AGQ objective with the EBE re-solved at every point (`fd_oracle_agq`),
+/// at one node (Laplace) and three, on an ODE hazard beside PK and on an analytic hazard.
+#[cfg(feature = "survival")]
+#[test]
+fn the_agq_gradient_is_exact_with_a_non_gaussian_term() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut worst = 0.0f64;
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let mut prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let model = &prep.parsed.model;
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap();
+        // Both anchors: the Gauss–Newton one carries the term's `∇²q` in `H̃`, as
+        // production's `exact_htilde` does.
+        for (n_agq, exact) in [(1, true), (3, true), (3, false)] {
+            let w = fd_oracle_agq(model, s, n_agq, exact);
+            eprintln!("{m} n_agq={n_agq} exact={exact}: worst {w:.2e}");
+            worst = worst.max(w);
+        }
+    }
+    eprintln!("non-Gaussian AGQ gradient: worst {worst:.2e}");
+    assert!(worst < 5e-7, "worst relative difference {worst:.2e}");
+}
+
+/// The covariance step's exact Hessian on subjects carrying non-Gaussian records — a
+/// drug-driven (ODE) hazard beside PK, an analytic hazard, a binary and a CTMM endpoint —
+/// against Richardson differences of the exact gradient with the EBE re-solved at every
+/// point ([`hessian_gaps`]), under both interaction settings. The term's `q`, `∇q`, `∇²q`
+/// ride the pass's tape, so the profile Hessian sees their θ-, η- and mode-response
+/// derivatives; dropping any of them (or `objective_ng`'s FOCE frozen `∇l`) moves the gap
+/// to the size of that term's curvature.
+#[cfg(all(feature = "survival", feature = "markov"))]
+#[test]
+fn the_cov_hessian_is_exact_with_a_non_gaussian_term() {
+    use crate::types::ObsRecord;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut cases: Vec<(String, CompiledModel, Subject)> = Vec::new();
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let mut prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap()
+            .clone();
+        cases.push((m.to_string(), prep.parsed.model, s));
+    }
+    let states = |cmt: usize, rows: &[(f64, usize)]| -> Vec<ObsRecord> {
+        rows.iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                raw_time: time,
+                state,
+                cmt,
+            })
+            .collect()
+    };
+    let ctmm = parse_model_string(
+        "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  \
+         omega ETA_Q ~ 0.1\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
+         states = [awake=0, asleep=1]\n  transition awake  -> asleep = exp(LQ01 + ETA_Q)\n  \
+         transition asleep -> awake  = exp(LQ10 - 0.5 * ETA_Q)\n",
+    )
+    .unwrap();
+    let ctmm_s = Subject {
+        id: "1".into(),
+        obs_records: states(
+            5,
+            &[(0.0, 0), (1.0, 0), (2.3, 1), (3.1, 1), (5.0, 0), (7.5, 1)],
+        ),
+        ..Default::default()
+    };
+    // The discrete-time Markov endpoint (#2473) on the same chain: per-record transition
+    // probabilities, a stay step and a `TIME` term, through the discrete seam's term.
+    let dtmm = parse_model_string(
+        "[parameters]\n  theta A(-0.8, -6.0, 3.0)\n  theta B(-1.3, -6.0, 3.0)\n  \
+         omega ETA_Q ~ 0.1\n[markov_model]\n  type   = dtmm\n  cmt    = 5\n  \
+         states = [awake=0, asleep=1]\n  transition awake  -> asleep = inv_logit(A + ETA_Q)\n  \
+         transition asleep -> awake  = inv_logit(B - 0.5 * ETA_Q + 0.1 * TIME)\n",
+    )
+    .unwrap();
+    let binary = parse_model_string(
+        "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
+         omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  \
+         logit = TH0 + ETA_I + THT * TIME * exp(0.5 * ETA_I)\n",
+    )
+    .unwrap();
+    let binary_s = Subject {
+        id: "1".into(),
+        obs_records: states(3, &[(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)]),
+        ..Default::default()
+    };
+    cases.push(("dtmm".into(), dtmm, ctmm_s.clone()));
+    cases.push(("ctmm".into(), ctmm, ctmm_s));
+    cases.push(("binary".into(), binary, binary_s));
+    let mut worst = 0.0f64;
+    for (tag, model, s) in &cases {
+        for objective in [
+            Objective::Focei,
+            Objective::Foce,
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+            Objective::Agq {
+                n_agq: 3,
+                exact: true,
+            },
+            Objective::Agq {
+                n_agq: 3,
+                exact: false,
+            },
+        ] {
+            assert!(
+                super::cov_non_gaussian_served(model, objective),
+                "{tag}: the model-level gate serves it"
+            );
+            let (gap, _) = hessian_gaps_for(model, s, objective);
+            eprintln!("{tag} {objective:?}: cov Hessian vs FD of the exact gradient {gap:.2e}");
+            worst = worst.max(gap);
+        }
+    }
+    eprintln!("non-Gaussian cov Hessian: worst {worst:.2e}");
+    assert!(worst < 1e-5, "worst relative gap {worst:.2e}");
+}
+
+/// `factor_anchor` is production's `agq_proposal` rule on the tape's number type (#2538):
+/// the same branch and the same `log|·|` on an anchor that factorises (no jitter), on one
+/// only the jittered anchor factorises, and on one only `Ω⁻¹` does.
+#[test]
+fn the_tape_anchor_factor_is_productions() {
+    use nalgebra::DMatrix;
+    let omega_inv = DMatrix::from_row_slice(2, 2, &[4.0, 0.0, 0.0, 9.0]);
+    let rows = |m: &DMatrix<f64>| -> Vec<Vec<f64>> {
+        (0..m.nrows())
+            .map(|r| (0..m.ncols()).map(|c| m[(r, c)]).collect())
+            .collect()
+    };
+    let cases = [
+        // Positive-definite: `log|H|` itself.
+        (
+            DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 3.0]),
+            (5.75f64).ln(),
+        ),
+        // Singular PSD: only `H + jitter` factorises.
+        (
+            DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 0.0]),
+            (1.0f64 + 1e-6).ln() + (1e-10f64).ln(),
+        ),
+        // Indefinite: the prior precision.
+        (
+            DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, -1.0]),
+            (36.0f64).ln(),
+        ),
+    ];
+    for (h, want) in cases {
+        let prod = crate::estimation::agq::agq_proposal(&h, &omega_inv, 2)
+            .expect("a factor")
+            .log_det_inv_scale;
+        let mut ht = rows(&h);
+        let l = factor_anchor(&mut ht, &rows(&omega_inv)).expect("a factor");
+        let tape = crate::sens::focei_kernel::chol_logdet(&l);
+        assert!(
+            (prod - want).abs() < 1e-12,
+            "production {prod} vs {want} on {h}"
+        );
+        assert!((tape - want).abs() < 1e-12, "tape {tape} vs {want} on {h}");
+    }
+}
+
+/// #2549: the mode response fused into the outer gradient's own recording
+/// ([`subject_adjoint_gradient_with_eta_dx_at`]) is the standalone exact one
+/// ([`subject_adjoint_eta_dx`], itself pinned to the re-solved EBE above), on a Gaussian
+/// five-effect subject (width-6 bucket, so one padded lane and two sweep chunks) and on
+/// non-Gaussian subjects, under both interaction settings — and the gradient it rides on is
+/// unchanged bit for bit.
+#[test]
+fn the_fused_mode_response_is_the_standalone_one() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let five = parse_model_string(&one_cpt_oral_n_eta(5)).unwrap();
+    let s5 = subject(
+        &five,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2, 0.03, -0.02],
+    );
+    #[allow(unused_mut)]
+    let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("five".into(), five, s5)];
+    #[cfg(feature = "survival")]
+    {
+        let mut endpoint_cases = vec![
+            ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+            ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+            ("examples/binary_logistic.ferx", "data/binary_logistic.csv"),
+            (
+                "examples/tte_competing_risks.ferx",
+                "data/tte_competing_risks.csv",
+            ),
+        ];
+        if cfg!(feature = "markov") {
+            endpoint_cases.push(("examples/ctmm_pd_2state.ferx", "data/ctmm_pd_2state.csv"));
+        }
+        for (m, d) in endpoint_cases {
+            let prep =
+                crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}")))
+                    .unwrap();
+            let s = prep
+                .population
+                .subjects
+                .iter()
+                .find(|s| !s.obs_records.is_empty())
+                .unwrap()
+                .clone();
+            cases.push((m.into(), prep.parsed.model, s));
+        }
+    }
+    // A `[covariate_nn]` model: the network weights reach the response through the
+    // per-lane `add_nn_weight_adjoint`, as they reach the gradient through Ψ's.
+    #[cfg(feature = "nn")]
+    {
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_dcm.ferx"),
+            Some(&format!("{root}/data/warfarin_dcm.csv")),
+        )
+        .unwrap();
+        let s = prep.population.subjects[0].clone();
+        cases.push(("warfarin_dcm".into(), prep.parsed.model, s));
+    }
+    let _ = root;
+    let mut worst = 0.0f64;
+    let mut live = 0.0f64;
+    for (name, model, s) in &cases {
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        for interaction in [true, false] {
+            // The NN example is a FOCEI model; its FOCE adjoint declines the subject. A model
+            // without random effects has no mode to respond.
+            if (name == "warfarin_dcm" && !interaction) || model.n_eta == 0 {
+                continue;
+            }
+            let eta = ebe_for(model, s, &params, 1e-12, interaction);
+            let objective = if interaction {
+                Objective::Focei
+            } else {
+                Objective::Foce
+            };
+            let (plain, (fused_g, fused), want) = std::thread::scope(|sc| {
+                std::thread::Builder::new()
+                    .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                    .spawn_scoped(sc, || {
+                        let g = |_: ()| {
+                            subject_adjoint_gradient(
+                                model,
+                                s,
+                                &params,
+                                &x,
+                                eta.as_slice(),
+                                objective,
+                            )
+                        };
+                        let plain = g(());
+                        let pt = PackedPoint::new(&params, &x).unwrap();
+                        let fused = subject_adjoint_gradient_with_eta_dx_at(
+                            model,
+                            s,
+                            &pt,
+                            eta.as_slice(),
+                            interaction,
+                        );
+                        let want = subject_adjoint_eta_dx(
+                            model,
+                            s,
+                            &params,
+                            &x,
+                            eta.as_slice(),
+                            interaction,
+                        );
+                        (plain, fused, want)
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            });
+            let (plain, fused_g) = (plain.unwrap(), fused_g.unwrap());
+            for (a, b) in plain.iter().zip(&fused_g) {
+                assert_eq!(a.to_bits(), b.to_bits(), "{name}: the gradient moved");
+            }
+            let got = fused.unwrap_or_else(|| panic!("{name} {interaction}: no fused response"));
+            let want = want.unwrap();
+            assert_eq!(got.len(), want.len(), "{name}");
+            for (gk, wk) in got.iter().zip(&want) {
+                assert_eq!(gk.len(), wk.len(), "{name}");
+                for (a, b) in gk.iter().zip(wk.iter()) {
+                    assert!(a.is_finite() && b.is_finite(), "{name}");
+                    worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+                    live = live.max(b.abs());
+                }
+            }
+            eprintln!("{name} interaction={interaction}: fused vs standalone {worst:.2e}");
+        }
+    }
+    assert!(live > 1e-2, "the mode does not move: the test sees nothing");
+    // Measured 1.03e-15 (Linux x86_64): the two are one formula, swept in a different
+    // order; 1e-12 leaves three decades for another platform's rounding.
+    assert!(
+        worst < 1e-12,
+        "fused vs standalone mode response {worst:.2e}"
+    );
+}
+
+/// #2549: the fused mode response `dη̂/dx = −H⁻¹·∂(∇_η l)/∂x` on a `[covariate_nn]` model,
+/// against the same formula with both factors taken by mixed central differences of the
+/// conditional inner objective `l(η; x)` (`individual_nll`) at the same fixed `η`. No EBE is
+/// re-solved, so the oracle sees the network-weight coordinates smoothly — re-solved EBEs on
+/// this model jump by orders of magnitude between step sizes — and shares no derivative code
+/// with the response.
+#[cfg(feature = "nn")]
+#[test]
+fn the_fused_mode_response_matches_fd_of_the_inner_objective_on_a_covariate_nn_model() {
+    use crate::estimation::parameterization::unpack_params;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let prep = crate::api::prepare_run(
+        &format!("{root}/examples/warfarin_dcm.ferx"),
+        Some(&format!("{root}/data/warfarin_dcm.csv")),
+    )
+    .unwrap();
+    let model = &prep.parsed.model;
+    let params = moved_params(model);
+    let x = pack_params(&params);
+    let n = model.n_eta;
+    let s = &prep.population.subjects[0];
+    let eta = ebe_for(model, s, &params, 1e-12, true);
+    let pt = PackedPoint::new(&params, &x).unwrap();
+    let (_, dx) = std::thread::scope(|sc| {
+        std::thread::Builder::new()
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .spawn_scoped(sc, || {
+                subject_adjoint_gradient_with_eta_dx_at(model, s, &pt, eta.as_slice(), true)
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    });
+    let dx = dx.expect("an NN subject is served");
+    let l = |xv: &[f64], e: &[f64]| {
+        let p = unpack_params(xv, &params);
+        crate::stats::likelihood::individual_nll(model, s, &p.theta, e, &p.omega, &p.sigma.values)
+    };
+    let de = 1e-4;
+    let shift = |e: &[f64], j: usize, d: f64| {
+        let mut v = e.to_vec();
+        v[j] += d;
+        v
+    };
+    let h = nalgebra::DMatrix::from_fn(n, n, |a, b| {
+        let e = eta.as_slice();
+        (l(&x, &shift(&shift(e, a, de), b, de))
+            - l(&x, &shift(&shift(e, a, de), b, -de))
+            - l(&x, &shift(&shift(e, a, -de), b, de))
+            + l(&x, &shift(&shift(e, a, -de), b, -de)))
+            / (4.0 * de * de)
+    });
+    let hinv = h.clone().try_inverse().expect("H");
+    let mut worst = 0.0f64;
+    for k in 0..x.len() {
+        let hx = 1e-5 * (1.0 + x[k].abs());
+        let g = nalgebra::DVector::from_fn(n, |j, _| {
+            let e = eta.as_slice();
+            let xp = shift(&x, k, hx);
+            let xm = shift(&x, k, -hx);
+            (l(&xp, &shift(e, j, de)) - l(&xp, &shift(e, j, -de)) - l(&xm, &shift(e, j, de))
+                + l(&xm, &shift(e, j, -de)))
+                / (4.0 * de * hx)
+        });
+        let want = -(&hinv * g);
+        for j in 0..n {
+            // Finite before the fold: `f64::max` drops a `NaN`, so a response returning one
+            // would otherwise pass on the strength of the finite entries.
+            assert!(
+                dx[k][j].is_finite() && want[j].is_finite(),
+                "x[{k}] η[{j}]: response {} vs FD {}",
+                dx[k][j],
+                want[j]
+            );
+            worst = worst.max((dx[k][j] - want[j]).abs() / (1.0 + want[j].abs()));
+        }
+    }
+    eprintln!("NN response vs FD of the inner objective: {worst:.2e}");
+    // Measured 5.12e-6 (Linux x86_64): the FD side is a nested central difference
+    // (`hx = 1e-5`, `de` above) of an objective with ~1e-13 rounding, so its own error is of
+    // that order; 1e-4 leaves 20× headroom for another platform's rounding.
+    assert!(
+        worst < 1e-4,
+        "NN mode response vs FD of the inner objective {worst:.2e}"
+    );
+}
+
+/// A failed mode response leaves the gradient alone (#2549 review r2 #2). The response
+/// rows share the gradient's sweeps, and a failing lane fails the fused pass; the pass is
+/// then re-run as the gradient alone. Forced here by `FAIL_RESPONSE_LANES`: the fused call
+/// returns the plain gradient bit for bit and no response, where without the re-run it
+/// returned no gradient at all.
+#[test]
+fn a_failed_mode_response_keeps_the_gradient() {
+    let model = parse_model_string(&one_cpt_oral_n_eta(3)).unwrap();
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-12, true);
+    let (plain, fused, fused_resp) = std::thread::scope(|sc| {
+        std::thread::Builder::new()
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .spawn_scoped(sc, || {
+                let plain = subject_adjoint_gradient(
+                    &model,
+                    &s,
+                    &params,
+                    &x,
+                    eta.as_slice(),
+                    Objective::Focei,
+                );
+                let pt = PackedPoint::new(&params, &x).unwrap();
+                // The straddle: without the hook the fused pass carries a response.
+                let (_, live) =
+                    subject_adjoint_gradient_with_eta_dx_at(&model, &s, &pt, eta.as_slice(), true);
+                assert!(live.is_some(), "the fixture's fused pass forms a response");
+                super::FAIL_RESPONSE_LANES.with(|f| f.set(true));
+                let (g, r) =
+                    subject_adjoint_gradient_with_eta_dx_at(&model, &s, &pt, eta.as_slice(), true);
+                super::FAIL_RESPONSE_LANES.with(|f| f.set(false));
+                (plain, g, r)
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    });
+    let (plain, fused) = (
+        plain.unwrap(),
+        fused.expect("the gradient survives the failed response"),
+    );
+    assert!(
+        fused_resp.is_none(),
+        "a failed response is reported as none"
+    );
+    assert_eq!(plain.len(), fused.len());
+    for (a, b) in plain.iter().zip(&fused) {
+        assert!(a.is_finite(), "the gradient is finite");
+        assert_eq!(a.to_bits(), b.to_bits(), "the gradient moved");
+    }
+}
+
+/// Laplace/AGQ's mode response (#2549) is the FOCEI one: the quadrature is centred on the
+/// conditional mode `η̂ = argmin l`, the same inner problem FOCEI solves, so
+/// `dη̂/dx = −(∇²_η l)⁻¹ ∂(∇_η l)/∂x` with the exact inner Hessian under either anchor (the
+/// FOCEI anchor's `H̃` places the nodes; it is not the mode's derivative). The two come from
+/// different recordings — FOCEI's `run` and the quadrature's `agq_taped` — so their
+/// agreement checks each against the other; FOCEI's is pinned to the standalone response
+/// (`the_fused_mode_response_is_the_standalone_one`). Asking for the response leaves the
+/// quadrature gradient bit for bit.
+#[test]
+fn the_quadrature_mode_response_is_the_focei_one() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let three = parse_model_string(&one_cpt_oral_n_eta(3)).unwrap();
+    let s3 = subject(
+        &three,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    #[allow(unused_mut)]
+    let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("three".into(), three, s3)];
+    // An IOV subject: the stacked `[η, κ]` solve, whose exact Hessian the fused pass and
+    // `exact_inner_hessian` must also agree on (#2585 review #4).
+    {
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_iov.ferx"),
+            Some(&format!("{root}/data/warfarin_iov.csv")),
+        )
+        .unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.occasions.is_empty())
+            .expect("an IOV subject")
+            .clone();
+        assert!(prep.parsed.model.n_kappa > 0, "premise: the model has IOV");
+        cases.push(("examples/warfarin_iov.ferx".into(), prep.parsed.model, s));
+    }
+    #[cfg(feature = "survival")]
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        (
+            "examples/tte_competing_risks.ferx",
+            "data/tte_competing_risks.csv",
+        ),
+    ] {
+        let prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap()
+            .clone();
+        cases.push((m.into(), prep.parsed.model, s));
+    }
+    let _ = root;
+    let mut worst = 0.0f64;
+    let mut live = 0.0f64;
+    let mut n_checked = 0;
+    for (name, model, s) in &cases {
+        assert!(
+            model.n_eta > 0,
+            "{name}: a model with random effects has a mode to respond"
+        );
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        let eta = ebe_for(model, s, &params, 1e-12, true);
+        for (n_agq, exact) in [(1, true), (3, true), (1, false), (3, false)] {
+            let objective = Objective::Agq { n_agq, exact };
+            let (focei, (plain, (fused, dx))) = std::thread::scope(|sc| {
+                std::thread::Builder::new()
+                    .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                    .spawn_scoped(sc, || {
+                        let pt = PackedPoint::new(&params, &x).unwrap();
+                        let focei = subject_adjoint_gradient_with_eta_dx_at(
+                            model,
+                            s,
+                            &pt,
+                            eta.as_slice(),
+                            true,
+                        )
+                        .1;
+                        let plain =
+                            subject_adjoint_gradient_at(model, s, &pt, eta.as_slice(), objective);
+                        let fused = subject_adjoint_gradient_and_eta_dx_at(
+                            model,
+                            s,
+                            &pt,
+                            eta.as_slice(),
+                            objective,
+                        );
+                        (focei, (plain, fused))
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            });
+            let label = format!("{name} n_agq={n_agq} exact={exact}");
+            let (plain, fused) = (
+                plain.unwrap_or_else(|| panic!("{label}: no gradient")),
+                fused.unwrap_or_else(|| panic!("{label}: no fused gradient")),
+            );
+            for (a, b) in plain.iter().zip(&fused) {
+                assert_eq!(a.to_bits(), b.to_bits(), "{label}: the gradient moved");
+            }
+            let want = focei.unwrap_or_else(|| panic!("{label}: no FOCEI response"));
+            let got = dx.unwrap_or_else(|| panic!("{label}: no quadrature response"));
+            assert_eq!(got.len(), want.len(), "{label}");
+            for (gk, wk) in got.iter().zip(&want) {
+                assert_eq!(gk.len(), wk.len(), "{label}");
+                for (a, b) in gk.iter().zip(wk.iter()) {
+                    assert!(a.is_finite() && b.is_finite(), "{label}: {a} vs {b}");
+                    worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+                    live = live.max(b.abs());
+                }
+            }
+            n_checked += 1;
+            eprintln!("{label}: quadrature vs FOCEI mode response {worst:.2e}");
+        }
+    }
+    assert!(n_checked >= 4, "every anchor and node count was checked");
+    assert!(live > 1e-2, "the mode does not move: the test sees nothing");
+    assert!(
+        worst < 1e-10,
+        "quadrature vs FOCEI mode response {worst:.2e}"
+    );
+}
+
+/// The exact inner Hessian a quadrature gradient pass hands back (`ModeOut::hessian`, #2549)
+/// is the one `exact_inner_hessian` forms: the quadrature objective's exact anchor now takes
+/// it from the score's pass instead of recomputing it, and the next warm inner solve takes it
+/// as its seed. Gaussian, joint PK–TTE and competing-risks subjects, both anchors, 1 and 3
+/// nodes; asked for without the response too.
+#[test]
+fn the_quadrature_mode_hessian_is_the_exact_inner_hessian() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let three = parse_model_string(&one_cpt_oral_n_eta(3)).unwrap();
+    let s3 = subject(
+        &three,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    #[allow(unused_mut)]
+    let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("three".into(), three, s3)];
+    // An IOV subject: the stacked `[η, κ]` solve, whose exact Hessian the fused pass and
+    // `exact_inner_hessian` must also agree on (#2585 review #4).
+    {
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_iov.ferx"),
+            Some(&format!("{root}/data/warfarin_iov.csv")),
+        )
+        .unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.occasions.is_empty())
+            .expect("an IOV subject")
+            .clone();
+        assert!(prep.parsed.model.n_kappa > 0, "premise: the model has IOV");
+        cases.push(("examples/warfarin_iov.ferx".into(), prep.parsed.model, s));
+    }
+    #[cfg(feature = "survival")]
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        (
+            "examples/tte_competing_risks.ferx",
+            "data/tte_competing_risks.csv",
+        ),
+    ] {
+        let prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap()
+            .clone();
+        cases.push((m.into(), prep.parsed.model, s));
+    }
+    let _ = root;
+    let mut worst = 0.0f64;
+    let mut n_checked = 0;
+    for (name, model, s) in &cases {
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        let eta = ebe_for(model, s, &params, 1e-12, true);
+        let want = exact_inner_hessian(model, s, &params, eta.as_slice())
+            .unwrap_or_else(|| panic!("{name}: exact_inner_hessian"));
+        for (n_agq, exact) in [(1, true), (3, true), (1, false), (3, false)] {
+            for want_dx in [false, true] {
+                let objective = Objective::Agq { n_agq, exact };
+                let got = std::thread::scope(|sc| {
+                    std::thread::Builder::new()
+                        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                        .spawn_scoped(sc, || {
+                            let pt = PackedPoint::new(&params, &x).unwrap();
+                            let mut out = ModeOut {
+                                want_dx,
+                                want_hessian: true,
+                                ..ModeOut::default()
+                            };
+                            let g = subject_adjoint_gradient_and_mode_at(
+                                model,
+                                s,
+                                &pt,
+                                eta.as_slice(),
+                                objective,
+                                &mut out,
+                            );
+                            assert!(g.is_some(), "{name}: the gradient");
+                            assert_eq!(out.eta_dx.is_some(), want_dx, "{name}: the response");
+                            out.hessian
+                        })
+                        .unwrap()
+                        .join()
+                        .unwrap()
+                });
+                let label = format!("{name} n_agq={n_agq} exact={exact} dx={want_dx}");
+                let got = got.unwrap_or_else(|| panic!("{label}: no mode Hessian"));
+                assert_eq!(got.shape(), want.shape(), "{label}");
+                for (a, b) in got.iter().zip(want.iter()) {
+                    assert!(a.is_finite() && b.is_finite(), "{label}: {a} vs {b}");
+                    worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+                }
+                n_checked += 1;
+            }
+        }
+    }
+    eprintln!("mode Hessian vs exact_inner_hessian: {worst:.2e} over {n_checked} cases");
+    // Measured 4.34e-16 over the 32 cases, the IOV ones included (Linux x86_64): the same
+    // kernel on the same jets, differing in rounding only; 1e-12 leaves four decades.
+    assert!(
+        worst < 1e-12,
+        "mode Hessian vs exact_inner_hessian {worst:.2e}"
+    );
 }

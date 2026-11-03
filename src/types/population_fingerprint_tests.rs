@@ -18,6 +18,7 @@ fn subject() -> Subject {
     modeled.implied = Some(crate::types::ImpliedDose {
         parent: 0,
         param_time: 12.0,
+        gov_time: 12.0,
     });
     Subject {
         obs_rgroup: Vec::new(),

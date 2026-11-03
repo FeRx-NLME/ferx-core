@@ -99,50 +99,101 @@ impl<'a> AdaptiveInputs<'a> {
         let Some(etas) = self.etas else {
             return Ok(vec![None; population.subjects.len()]);
         };
-        // A mixture fit estimates each subject's η under its own class, but the adaptive
-        // run draws each subject's class from the mixing probabilities (#2163), so a
-        // class-2 η̂ could be simulated under class 1 (#2162 review, finding 1).
-        if model.mixture.is_some() {
-            return Err(refusal(
+        resolve_supplied_etas(
+            model,
+            population,
+            etas,
+            SuppliedEtasEntry::Adaptive(self.unmatched),
+        )
+    }
+}
+
+/// The entry point a [`SuppliedEtas`] is resolved for: it picks the refusal wording and
+/// whether an unmatched subject may be drawn.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SuppliedEtasEntry {
+    /// An adaptive run, with its policy for a subject the η do not cover.
+    Adaptive(UnmatchedSubjects),
+    /// `predict_survival_at_etas_diag` (#1885): an individual curve needs every
+    /// subject's η, so an unmatched subject is always refused.
+    #[cfg(feature = "survival")]
+    PredictSurvival,
+}
+
+/// Each population subject's supplied η, in population order (`None`: not supplied,
+/// which only an adaptive run under [`UnmatchedSubjects::Draw`] returns). Refuses a
+/// `[mixture]` model, η names that are not the model's, and (unless the entry may draw)
+/// a population subject with no row. A supplied ID the population lacks is ignored.
+pub(crate) fn resolve_supplied_etas(
+    model: &CompiledModel,
+    population: &Population,
+    etas: &SuppliedEtas,
+    entry: SuppliedEtasEntry,
+) -> Result<Vec<Option<Vec<f64>>>, EngineError> {
+    // A mixture fit estimates each subject's η under its own class, but the adaptive
+    // run draws each subject's class from the mixing probabilities (#2163), so a
+    // class-2 η̂ could be simulated under class 1 (#2162 review, finding 1). A survival
+    // prediction has no class at all to evaluate it under.
+    if model.mixture.is_some() {
+        return Err(refusal(match entry {
+            SuppliedEtasEntry::Adaptive(_) => {
                 "supplied η are not supported on a [mixture] model. Each subject's η was \
                  estimated under its own mixture class, and an adaptive run draws each \
                  subject's class from the mixing probabilities, so the η could be simulated \
                  under another class"
-                    .to_string(),
-            ));
-        }
-        if etas.names != model.eta_names {
-            return Err(refusal(format!(
-                "the supplied η are named [{}] but the model's are [{}]; supply every η of \
-                 the model, in the model's order",
-                etas.names.join(", "),
-                model.eta_names.join(", ")
-            )));
-        }
-        let resolved: Vec<Option<Vec<f64>>> = population
-            .subjects
-            .iter()
-            .map(|s| etas.get(&s.id).map(<[f64]>::to_vec))
-            .collect();
-        if self.unmatched == UnmatchedSubjects::Refuse {
-            let missing: Vec<&str> = population
-                .subjects
-                .iter()
-                .zip(&resolved)
-                .filter(|(_, r)| r.is_none())
-                .map(|(s, _)| s.id.as_str())
-                .collect();
-            if !missing.is_empty() {
-                return Err(refusal(format!(
-                    "{} simulated subject(s) have no supplied η: {}. Supply their η, or pass \
-                     `UnmatchedSubjects::Draw` to draw theirs from Ω",
-                    missing.len(),
-                    list_ids(&missing)
-                )));
+                    .to_string()
             }
-        }
-        Ok(resolved)
+            #[cfg(feature = "survival")]
+            SuppliedEtasEntry::PredictSurvival => {
+                "supplied η are not supported on a [mixture] model: each subject's η was \
+                 estimated under its own mixture class, and `predict_survival_at_etas_diag` \
+                 has no class to evaluate it under"
+                    .to_string()
+            }
+        }));
     }
+    if etas.names != model.eta_names {
+        return Err(refusal(format!(
+            "the supplied η are named [{}] but the model's are [{}]; supply every η of \
+             the model, in the model's order",
+            etas.names.join(", "),
+            model.eta_names.join(", ")
+        )));
+    }
+    let resolved: Vec<Option<Vec<f64>>> = population
+        .subjects
+        .iter()
+        .map(|s| etas.get(&s.id).map(<[f64]>::to_vec))
+        .collect();
+    if matches!(entry, SuppliedEtasEntry::Adaptive(UnmatchedSubjects::Draw)) {
+        return Ok(resolved);
+    }
+    let missing: Vec<&str> = population
+        .subjects
+        .iter()
+        .zip(&resolved)
+        .filter(|(_, r)| r.is_none())
+        .map(|(s, _)| s.id.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(refusal(match entry {
+            SuppliedEtasEntry::Adaptive(_) => format!(
+                "{} simulated subject(s) have no supplied η: {}. Supply their η, or pass \
+                 `UnmatchedSubjects::Draw` to draw theirs from Ω",
+                missing.len(),
+                list_ids(&missing)
+            ),
+            #[cfg(feature = "survival")]
+            SuppliedEtasEntry::PredictSurvival => format!(
+                "{} subject(s) in the population have no supplied η: {}. An individual \
+                 curve needs each subject's η: supply theirs, drop them from the population, \
+                 or call `predict_survival_diag` for the population (η = 0) curve",
+                missing.len(),
+                list_ids(&missing)
+            ),
+        }));
+    }
+    Ok(resolved)
 }
 
 impl SuppliedEtas {

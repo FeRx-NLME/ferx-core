@@ -227,6 +227,93 @@ fn theta_fd_step(model: &CompiledModel, h: f64, theta: &[f64], i: usize) -> f64 
     )
 }
 
+/// The exact fixed-η θ score by the adjoint
+/// ([`fixed_eta_theta_adjoint`](crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint)),
+/// shared by the IOV and non-IOV scores: one recording of the predictions with θ as tape
+/// leaves and one sweep seeded with `∂(obs_nll)/∂f_j`, whatever the number of θ. Writes the
+/// packed `grad` (one entry per θ) and, with `df_packed`, the packed `∂f_j/∂θ` rows the
+/// information is built from. Under a residual magnitude (`magnitude_sigma`, which moves `V`
+/// directly) the kernel's data score supplies the whole θ-derivative instead, without the
+/// rows. `false` on a decline or a non-finite result: the caller's per-θ path runs instead.
+#[allow(clippy::too_many_arguments)]
+fn exact_theta_score(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    d_nll_d_f: &[f64],
+    magnitude_sigma: Option<&[f64]>,
+    theta_packs_log_mask: &[bool],
+    lower: &[f64],
+    upper: &[f64],
+    grad: &mut [f64],
+    df_packed: Option<&mut [Vec<f64>]>,
+) -> bool {
+    let n_theta = grad.len();
+    // Under a residual magnitude θ also moves `V` directly: the kernel's data score carries
+    // that channel on its tape, so its θ-derivative is the whole one (no per-observation
+    // `∂f/∂θ`, so no information rows).
+    if let Some(sigma) = magnitude_sigma {
+        let Some((_, d_theta, _)) = exact_data_score(model, subject, theta, sigma, eta) else {
+            return false;
+        };
+        for i in 0..n_theta {
+            if lower[i] != upper[i] {
+                let pack = if theta_packs_log_mask[i] {
+                    theta[i]
+                } else {
+                    1.0
+                };
+                grad[i] = pack * d_theta[i];
+            }
+        }
+        return true;
+    }
+    let Some(x) = crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint(
+        model,
+        subject,
+        theta,
+        eta,
+        df_packed.is_some(),
+        d_nll_d_f,
+    )
+    .filter(|x| {
+        x.grad.len() == n_theta
+            && x.grad.iter().all(|g| g.is_finite())
+            && x.jac
+                .as_ref()
+                .is_none_or(|j| j.iter().all(|v| v.is_finite()))
+    }) else {
+        return false;
+    };
+    let n_obs = d_nll_d_f.len();
+    let mut df_packed = df_packed;
+    for i in 0..n_theta {
+        if lower[i] == upper[i] {
+            continue;
+        }
+        let pack = if theta_packs_log_mask[i] {
+            theta[i]
+        } else {
+            1.0
+        };
+        grad[i] = pack * x.grad[i];
+        if let (Some(rows), Some(jac)) = (df_packed.as_deref_mut(), x.jac.as_ref()) {
+            rows[i] = (0..n_obs).map(|j| pack * jac[j * n_theta + i]).collect();
+        }
+    }
+    #[cfg(test)]
+    EXACT_THETA_SCORES.with(|c| c.set(c.get() + 1));
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test counter: the scores [`exact_theta_score`] served, so a parity test can assert the
+    /// exact path ran rather than the per-θ fallback it would otherwise compare against.
+    pub(super) static EXACT_THETA_SCORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Gradient of the IOV observation NLL w.r.t. the SAEM packed vector
 /// `[log_theta | log_sigma]` for one subject with ETAs and kappas fixed.
 ///
@@ -249,12 +336,14 @@ pub(crate) fn obs_nll_subject_grad_iov(
     pk_scratch: &mut crate::pk::EventPkParams,
 ) -> (f64, Vec<f64>) {
     let n = n_theta + n_sigma;
-    // IOV + block_sigma is rejected up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
-    // `residual_correlations` is never set on this IOV path — only M3 (and TTE,
-    // under the `survival` feature) need the full-FD fallback here.
+    // IOV + block_sigma is fitted by FOCE/FOCEI only (#979); the estimators that reach
+    // this path are refused it up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
+    // `residual_correlations` is never set here — only M3 (and TTE, under the
+    // `survival` feature) need the full-FD fallback.
     let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3);
-    // Fall back to full FD when TTE endpoints are present: the analytic non-M3
-    // path is Gaussian-only and would silently zero hazard-parameter gradients.
+    // Non-Gaussian endpoints take this whole-NLL branch too: the per-prediction chain below
+    // is Gaussian-only and would zero the hazard parameters' gradients, while the exact
+    // score adds the records' own term.
     #[cfg(feature = "survival")]
     let fd_all = fd_all || !model.endpoints.is_empty();
 
@@ -263,6 +352,30 @@ pub(crate) fn obs_nll_subject_grad_iov(
         let nll_base =
             obs_nll_subject_into_iov(model, subject, theta, sigma_values, eta, kappas, pk_scratch);
         let mut grad = vec![0.0f64; n];
+        // The exact score of the analytic kernel's data term (M3 censoring and a dense or
+        // serial residual by construction): one scalar-tape sweep and one θ contraction.
+        // The forward difference below remains for a decline.
+        let stacked: Vec<f64> = eta.iter().chain(kappas.iter().flatten()).copied().collect();
+        if let Some((_, d_theta, d_sigma)) =
+            exact_data_score(model, subject, theta, sigma_values, &stacked)
+        {
+            for i in 0..n {
+                if lower[i] == upper[i] {
+                    continue;
+                }
+                grad[i] = if i < n_theta {
+                    if theta_packs_log_mask[i] {
+                        theta[i] * d_theta[i]
+                    } else {
+                        d_theta[i]
+                    }
+                } else {
+                    let k = i - n_theta;
+                    sigma_values[k] * d_sigma[k]
+                };
+            }
+            return (nll_base, grad);
+        }
         let h = 1e-5;
         let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
         let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
@@ -424,8 +537,25 @@ pub(crate) fn obs_nll_subject_grad_iov(
         }
         d_obs_nll
     };
+    // Exact θ-derivatives by the adjoint, as in the non-IOV score, at the stacked
+    // `[η | κ_0 | κ_1 …]` (under a residual magnitude, the kernel's data score); a decline
+    // keeps the per-θ path below.
+    let stacked: Vec<f64> = eta.iter().chain(kappas.iter().flatten()).copied().collect();
+    let exact = exact_theta_score(
+        model,
+        subject,
+        theta,
+        &stacked,
+        &d_nll_d_f,
+        ruv_mult.is_some().then_some(sigma_values),
+        theta_packs_log_mask,
+        lower,
+        upper,
+        &mut grad[..n_theta],
+        None,
+    );
     for i in 0..n_theta {
-        if lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+        if exact || lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
             continue;
         }
         let d_obs_nll = signed_theta_deriv(i, 1.0);
@@ -435,7 +565,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
             d_obs_nll
         };
     }
-    if let Some(plan) = nn_plan.as_ref() {
+    if let (false, Some(plan)) = (exact, nn_plan.as_ref()) {
         plan.accumulate(
             &mut signed_theta_deriv,
             theta,
@@ -591,6 +721,37 @@ pub(crate) fn obs_nll_subject_grad_fisher(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the whole-NLL difference quotient even where the exact data score
+    /// serves, for the test pinning the two against each other.
+    pub(crate) static DATA_SCORE_FD_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`fixed_eta_data_score`](crate::sens::ode_provider::adjoint::fixed_eta_data_score) where
+/// it serves — Gaussian and M3 rows by the kernel, TTE, binary and CTMM records by their own
+/// exact term: `None` on a decline, a θ/σ count it does not return, or under the test switch.
+fn exact_data_score(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>, Vec<f64>)> {
+    #[cfg(test)]
+    if DATA_SCORE_FD_FORCE.with(|c| c.get()) {
+        return None;
+    }
+    crate::sens::ode_provider::adjoint::fixed_eta_data_score(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        eta,
+    )
+    .filter(|(_, t, s)| t.len() == theta.len() && s.len() == sigma_values.len())
+}
+
 /// The one body behind [`obs_nll_subject_grad`] and
 /// [`obs_nll_subject_grad_fisher`]. `want_fisher` only *adds* the information
 /// block; with it `false` the returned `(nll, grad)` is bit-identical to what
@@ -612,8 +773,9 @@ fn obs_nll_subject_grad_impl(
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
     let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3) || model.residual_is_dense();
-    // Fall back to the full-FD path when TTE endpoints are present: the analytic
-    // non-M3 path is Gaussian-only and would silently zero hazard-parameter gradients.
+    // Non-Gaussian endpoints take this whole-NLL branch too: the per-prediction chain below
+    // is Gaussian-only and would zero the hazard parameters' gradients, while the exact
+    // score adds the records' own term.
     #[cfg(feature = "survival")]
     let fd_all = fd_all || !model.endpoints.is_empty();
 
@@ -634,6 +796,29 @@ fn obs_nll_subject_grad_impl(
             eta,
         );
         let mut grad = vec![0.0f64; n];
+        // The exact score of the analytic kernel's data term (M3 censoring and a dense or
+        // serial residual by construction): one scalar-tape sweep and one θ contraction.
+        // The forward difference below remains for a decline.
+        if let Some((_, d_theta, d_sigma)) =
+            exact_data_score(model, subject, theta, sigma_values, eta)
+        {
+            for i in 0..n {
+                if lower[i] == upper[i] {
+                    continue;
+                }
+                grad[i] = if i < n_theta {
+                    if theta_packs_log_mask[i] {
+                        theta[i] * d_theta[i]
+                    } else {
+                        d_theta[i]
+                    }
+                } else {
+                    let k = i - n_theta;
+                    sigma_values[k] * d_sigma[k]
+                };
+            }
+            return (nll_base, grad, None);
+        }
         let h = 1e-5;
         let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
         let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
@@ -840,8 +1025,25 @@ fn obs_nll_subject_grad_impl(
         }
     };
 
+    // Exact θ-derivatives by the adjoint (with the information's per-observation
+    // `∂f_j/∂θ` from the same recording; under a residual magnitude, the kernel's data
+    // score); a decline keeps the per-θ path below.
+    let exact = exact_theta_score(
+        model,
+        subject,
+        theta,
+        eta,
+        &d_nll_d_f,
+        ruv_mult.is_some().then_some(sigma_values),
+        theta_packs_log_mask,
+        lower,
+        upper,
+        &mut grad[..n_theta],
+        fisher_ok.then(|| &mut df_packed[..n_theta]),
+    );
+
     for i in 0..n_theta {
-        if lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+        if exact || lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
             continue;
         }
         if fisher_ok {
@@ -879,7 +1081,7 @@ fn obs_nll_subject_grad_impl(
         };
     }
 
-    if let Some(plan) = nn_plan.as_ref() {
+    if let (false, Some(plan)) = (exact, nn_plan.as_ref()) {
         plan.accumulate(
             |i, sign| signed_theta_deriv(i, sign, pk_scratch),
             theta,

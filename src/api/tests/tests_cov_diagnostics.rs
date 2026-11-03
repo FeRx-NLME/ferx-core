@@ -196,7 +196,7 @@ fn cov_stage_three_method_chain_estimating_imp() {
 
 #[test]
 fn gn_zero_eta_warning_dropped_when_a_later_stage_re_optimises() {
-    // `methods = [gn, focei]`: `run_foce_gn` sees `method = gn` and no chain
+    // `method = [gn, focei]`: `run_foce_gn` sees `method = gn` and no chain
     // (fit_inner blanks `stage_opts.methods`), so it pushes the #1006 warning
     // unconditionally. The FOCEI stage that follows recovers the optimum, so the
     // "result may be badly wrong" claim is false and must not reach FitResult.

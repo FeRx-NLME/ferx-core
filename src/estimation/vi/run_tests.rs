@@ -620,7 +620,7 @@ fn covariance_step_runs_at_the_vi_estimate() {
 }
 
 /// And the step honours its gate: `fit_inner` clears `run_covariance_step` on every
-/// non-terminal stage of a chain, so a `methods = vi, focei` run must not pay for a
+/// non-terminal stage of a chain, so a `method = [vi, focei]` run must not pay for a
 /// covariance matrix twice.
 #[test]
 fn covariance_step_is_skipped_when_not_requested() {

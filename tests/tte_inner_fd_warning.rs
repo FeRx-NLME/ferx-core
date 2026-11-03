@@ -1,7 +1,13 @@
-//! #1861 — a joint PK-TTE fit whose every subject carries a TTE record runs the FD inner
-//! gradient, and `fit()` must say so: `gradient_method_inner` reads `finite differences`
-//! and `FitResult::warnings` carries the "N of M subjects use finite-difference inner
-//! gradients" warning naming the time-to-event record as the cause.
+//! #1861 — a joint PK-TTE fit whose every subject carries a TTE record the inner gradient
+//! cannot differentiate runs the FD inner gradient, and `fit()` must say so:
+//! `FitResult::warnings` carries the "N of M subjects use finite-difference inner
+//! gradients" warning naming the time-to-event record as the cause. (`gradient_method_inner`
+//! read `finite differences` while no hazard had an η-channel; it is the model-level
+//! best case, so since #2482 it reads analytic and the warning carries the decline.)
+//!
+//! Since #2482 the drug-driven hazard has an exact η-channel (the dual walk) except beside
+//! a steady-state dose, which the walk declines (its value path is not the walk's). So the
+//! warning arms dose to steady state, and a fourth arm pins the exact route without one.
 //!
 //! Before the fix the label read `analytic (Dual2)` (it is model-level and the recorder
 //! serves the PK rows), and the warning, when it fired, listed only causes that did not
@@ -66,23 +72,28 @@ const MODEL: &str = r"
 const WARNING: &str = "use finite-difference inner gradients";
 
 /// Four subjects with two PK observations each; subjects `1..=n_events` also carry a TTE
-/// record (an event on odd IDs, censored on even).
-fn csv(n_events: usize) -> String {
-    let mut csv = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV\n");
+/// record (an event on odd IDs, censored on even). `ss` doses every subject to steady state
+/// (`SS = 1`, `II = 12`), the case the hazard's dual walk declines.
+fn csv(n_events: usize, ss: bool) -> String {
+    let mut csv = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,SS,II\n");
+    let (ss, ii) = if ss { (1, 12) } else { (0, 0) };
     for id in 1..=4usize {
         let (c2, c8) = (6.0 + id as f64 * 0.2, 3.0 + id as f64 * 0.1);
-        csv += &format!("{id},0,.,1,100,1,1\n{id},2,{c2},0,.,2,0\n{id},8,{c8},0,.,2,0\n");
+        csv += &format!(
+            "{id},0,.,1,100,1,1,{ss},{ii}\n{id},2,{c2},0,.,2,0,0,0\n{id},8,{c8},0,.,2,0,0,0\n"
+        );
         if id <= n_events {
-            csv += &format!("{id},{},{},0,.,3,0\n", 15 + id, id % 2);
+            csv += &format!("{id},{},{},0,.,3,0,0,0\n", 15 + id, id % 2);
         }
     }
     csv
 }
 
-fn run(model: &str, n_events: usize) -> FitResult {
+fn run(model: &str, n_events: usize, ss: bool) -> FitResult {
     let m = parse_model_string(model).expect("the model parses");
     let mut f = tempfile::NamedTempFile::new().expect("temp csv");
-    f.write_all(csv(n_events).as_bytes()).expect("write csv");
+    f.write_all(csv(n_events, ss).as_bytes())
+        .expect("write csv");
     let (pop, _) =
         read_population_for(&m, &None, f.path().to_str().unwrap(), None, None, None, &[])
             .expect("data loads");
@@ -97,8 +108,11 @@ fn run(model: &str, n_events: usize) -> FitResult {
 
 #[test]
 fn an_all_tte_population_warns_and_names_the_survival_cause() {
-    let r = run(MODEL, 4);
-    assert_eq!(r.gradient_method_inner, "finite differences");
+    let r = run(MODEL, 4, true);
+    // The label is the best-case, model-level route (`build_info::gradient_method_inner`):
+    // this hazard has an exact channel, so it reads analytic, and the per-subject decline is
+    // the warning's to report — as for any out-of-scope subject of an in-scope model.
+    assert_eq!(r.gradient_method_inner, "analytic (Dual2)");
     let w = r
         .warnings
         .iter()
@@ -116,7 +130,7 @@ fn an_all_tte_population_warns_and_names_the_survival_cause() {
 
 #[test]
 fn a_mixed_population_counts_only_its_tte_subjects() {
-    let r = run(MODEL, 2);
+    let r = run(MODEL, 2, true);
     let w = r
         .warnings
         .iter()
@@ -140,11 +154,26 @@ fn the_same_pk_rows_without_an_event_model_emit_no_fd_warning() {
         !pk_only.contains("[event_model]"),
         "fixture: the endpoint is removed"
     );
-    let r = run(&pk_only, 0);
+    let r = run(&pk_only, 0, true);
     assert_eq!(r.gradient_method_inner, "analytic (Dual2)");
     assert!(
         !r.warnings.iter().any(|w| w.contains(WARNING)),
         "PK-only subjects run the analytic recorder: {:?}",
+        r.warnings
+    );
+}
+
+/// The same TTE population without the steady-state dose: the dual walk serves every
+/// subject's hazard, so the inner gradient is exact and nothing warns. The pair with
+/// `an_all_tte_population_warns_and_names_the_survival_cause` straddles the walk's one
+/// remaining decline, so a scope that served SS (or declined everything) reddens one arm.
+#[test]
+fn a_drug_driven_hazard_without_steady_state_runs_the_exact_inner_gradient() {
+    let r = run(MODEL, 4, false);
+    assert_eq!(r.gradient_method_inner, "analytic (Dual2)");
+    assert!(
+        !r.warnings.iter().any(|w| w.contains(WARNING)),
+        "every subject's hazard is served: {:?}",
         r.warnings
     );
 }

@@ -11,7 +11,7 @@ appropriate marginal likelihood.
 
 | Method | Binary | Notes |
 |--------|:------:|-------|
-| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (see below); the `½ log\|H̃\|` correction uses a finite-difference Hessian of the data term w.r.t. η, and the outer θ-gradient is FD, as for TTE. |
+| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (see below); the `½ log\|H̃\|` correction uses the data term's **exact** η-Hessian ([Exact data-term curvature](tte.qmd#exact-data-term-curvature)), and the outer θ-gradient is the exact marginal gradient, as for [TTE](tte.qmd#outer-gradient-reconverged). |
 | **SAEM** | ✓ | Preferred for sparse binary data — no Laplace approximation. |
 | **IMP** (importance sampling) | ✓ | Unbiased marginal likelihood; use a larger `isample` for non-Gaussian endpoints. |
 | **FOCE** (no interaction) | — | Drops the log-det correction and is biased for a non-Gaussian data term; use `focei`. |
@@ -36,13 +36,13 @@ which is added to the Gaussian rows' gradient on a joint PK + binary model. The
 objective is unchanged — only the search direction is exact instead of differenced — so
 EBEs agree with the FD route to the inner tolerance.
 
-A subject keeps the FD inner gradient for its whole objective when any record it
-carries has no analytic term: a time-to-event or count record beside the binary ones,
-or a predictor that cannot be compiled exactly (more than 24 θ + η, or an identifier
-the compiler cannot bind). The "*N* of *M* subjects use finite-difference inner
-gradients" warning counts those subjects and names the cause. A model that also declares
-an `[event_model]` reports `gradient_method_inner: finite differences`, since every subject
-with a time-to-event record runs FD (#1861).
+The predictor is replayed on an η-only dual, so the number of θ does not cap it. A subject
+keeps the FD inner gradient for its whole objective when any record it carries has no
+analytic term: a count record beside the binary ones, or a predictor that cannot be
+compiled exactly (an identifier the compiler cannot bind). The "*N* of *M* subjects use
+finite-difference inner gradients" warning counts those subjects and names the cause. A
+time-to-event record beside the binary ones has an analytic term of its own
+([TTE](tte.qmd#estimation)), so a joint binary + TTE subject stays analytic.
 
 ## Objective function
 

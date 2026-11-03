@@ -278,9 +278,9 @@ mod ctmm_smoke {
         )))
         .is_ok());
 
-        // DTMM not yet supported (mCTMM is — see `mctmm_smoke`).
+        // An mCTMM derives its transitions; listing them is refused (more in `mctmm_smoke`).
         assert!(parse_model_string(&wrap(
-            "[markov_model]\n  type = dtmm\n  cmt = 5\n  states = [a=0, b=1]\n  transition a -> b = exp(LQ01)\n"
+            "[markov_model]\n  type = mctmm\n  cmt = 5\n  states = [a=0, b=1]\n  transition a -> b = exp(LQ01)\n"
         ))
         .is_err());
         // `init` not yet supported.
@@ -1600,9 +1600,11 @@ mod mctmm_smoke {
             }) => {
                 assert_eq!(generator_states.len(), 1, "central drives Q(t)");
                 assert_eq!(generator_states[0].0, "central");
+                // The occupancy-ODE path differentiates the intensities through the dual
+                // state solve, so a drug-driven mCTMM keeps a program too, as a CTMM does.
                 assert!(
-                    generator_program.is_none(),
-                    "Q(t) keeps the occupancy-ODE path"
+                    generator_program.is_some(),
+                    "Q(t) keeps a dual-evaluable program for the occupancy ODE"
                 );
             }
             other => panic!("expected a Ctmm endpoint, got {other:?}"),

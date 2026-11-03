@@ -519,4 +519,4 @@ let runner_up = &result.models["run2"];   // every fitted model's text, by id
 
 `ModelsearchRun` also takes a `threads` override, a `CancelFlag` that stops
 the search between layers with what it has, and a progress callback
-(`ModelsearchEvent`).
+(`ModelsearchEvent`). Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_tools::search::CandidateFinished`, #2512).

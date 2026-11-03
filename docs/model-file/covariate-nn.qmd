@@ -103,6 +103,14 @@ two-covariate DCM, unnormalized inputs pushed weights to ~1e11 and left the
 residual error at 15× its true value; the same model with standardized inputs
 kept every weight inside `[-1.3, 1.6]`.
 
+A fit warns when it is handed inputs like these. `W_NN_UNSCALED_INPUT` names every input
+whose values in the data, after the block's `center`/`scale`, reach past `3/a` (`6/a` for a
+sigmoid), where `a = √(6/(fan_in + fan_out))` is the first layer's Glorot weight scale: past
+that, one input alone drives a hidden unit into saturation at its initial weights. On such a
+network which optimum a fit reaches can depend on the path to it — without normalisation,
+`examples/warfarin_dcm.ferx` ends at very different objectives depending only on how the
+inner loop is warm-started (#2549).
+
 Use the covariate's mean and SD in your dataset, or any round numbers near them —
 the network does not care whether the standardization is exact, only that its
 inputs land in roughly `[-3, 3]`:
@@ -255,6 +263,17 @@ identical data and seed:
 | `init = [1.0, 10.0]` | **1061.0** | **0.0126** | **0.54** |
 
 The bare-head fit reported `converged: true`.
+
+The same happens under FOCEI. On the two-compartment DCM in
+`tests/fixtures/two_cpt_dcm_regularized.ferx` (5 outputs, `two_cpt_oral_cov` data), the
+unpenalized fit from a bare head reported `converged: true` at OFV −234. That is worse
+than setting every network weight to zero, a covariate-free model inside the same
+parameter space, which reaches −1185. With `init = [4, 40, 8, 80, 1]` the same fit
+reaches −1252
+([#1561](https://github.com/FeRx-NLME/ferx-core/issues/1561)).
+
+`fit()` and `ferx check` warn about a bare head (`W_NN_BARE_OUTPUT_START`). The warning
+reads the start the fit is given, so a warm start from an earlier fit does not trigger it.
 
 The realisation is exact: the output-layer weight block is zeroed alongside the biases,
 so the network emits exactly `init` for every subject at iteration 0, independent of
@@ -419,6 +438,162 @@ with the reported OFV. Two consequences to keep in mind:
 
 See [fit-options.qmd](fit-options.qmd#covariate-nn-regularization-nn_l2-nn_smooth)
 for the full reference.
+
+## Exporting a fitted DCM
+
+After the fit the weights are constants, and a network at fixed weights is an
+ordinary algebraic function of its covariates. `ferx export-dcm` writes it out as
+one: every `[covariate_nn]` block becomes plain `[individual_parameters]`
+equations at the fitted weights, and every `NAME.OUTPUT` reference becomes the
+variable holding that output.
+
+```bash
+ferx export-dcm run.fitrx -o run-analytic.ferx
+ferx export-dcm warfarin_dcm.ferx --fit run.json      # model + JSON fit
+ferx export-dcm run.fitrx --fixed-theta               # weights as FIXed thetas
+```
+
+The result has no `[covariate_nn]` block, so it loads in a build without the
+`nn` feature (the R package's default build), reads as equations a reviewer can
+check by hand, and is the starting point for a NONMEM `$PK` translation. For the
+2 → 3 → 2 → 2 network of `tests/data/dcm_export/model.ferx` (`tanh` hidden layers,
+`softplus` head):
+
+```
+[individual_parameters]
+  # --- [covariate_nn TYPICAL_PK] expanded: 2 -> 3 -> 2 -> 2, tanh hidden / softplus output ---
+  # Always taken: the `if` keeps the network's units out of the individual
+  # parameters, so an ODE model does not give each one a PK slot.
+  if (0 == 0) {
+    Z_TYPICAL_PK_WT = (WT - 70.0) / 12.0
+    Z_TYPICAL_PK_CRCL = (CRCL + 5.0) / 23.5
+    H1_TYPICAL_PK_1 = tanh(0.29552020666133955 * Z_TYPICAL_PK_WT
+                           + 1.0391970592293505 * Z_TYPICAL_PK_CRCL
+                           - 1.6337206970902447)
+    ...
+    TYPICAL_PK_CL = softplus(-2.739502212547247 * H2_TYPICAL_PK_1
+                             - 1.7619321248456368 * H2_TYPICAL_PK_2
+                             - 3.967115413772459)
+    ...
+  } else {
+    TYPICAL_PK_CL = 0
+    TYPICAL_PK_KA = 0
+  }
+  CL = TYPICAL_PK_CL * exp(ETA_CL)
+```
+
+The units sit inside an `if (0 == 0)` block that is always taken. A name
+assigned at the top level of `[individual_parameters]` is an individual
+parameter, and an ODE model gives each one a slot in a layout of fewer than 128,
+so a network with two 64-unit hidden layers would not fit. Inside the block the
+units stay local, and only the outputs are read afterwards.
+
+Each network input is written into the equations by name, so it has to read the
+data column there. `export-dcm` refuses an input that is not a plain identifier,
+one named like a built-in (`TIME`, `MIXNUM`, …), and one that shares its name
+with a parameter or variable of the model, which the equation would read
+instead.
+
+When the model file and the fit are given separately, `export-dcm` first checks
+that the fit was made with the same networks: the fit carries its own model text,
+and each `[covariate_nn]` block must declare the same inputs, outputs, layers,
+activations, `center` and `scale` in both (comments and `init` may differ). The
+weight names only record the block name and the shape, so without this check a
+fit of a different network of the same shape would export without complaint.
+The rest of the model has to be the fit's too — every equation, the error model,
+which parameters exist and which are `FIX` — or the estimates would be written
+into a model they were not made for. Comments, layout, the order (and key
+case) of a `[covariate_nn]` block's fields, the values in
+`[parameters]` (starting values, bounds and inline priors — not a kappa
+`weight` expression), `[data] path` and `[priors]` may differ; anything else is
+an error naming the first line that does.
+
+The library entry points are `ferx_core::nn::export::export_dcm_from_fit` (model
+text + fit, with that check and the fit's other estimates) and
+`export_dcm_as_analytic` (model text + the fit's `theta_names` / `theta`: the
+networks only, without the check). Both are compiled in every build, `nn` or not.
+
+### The fit's other estimates
+
+`export-dcm` writes the whole fitted model, not only the networks: every
+`theta`, `omega`, `sigma` and `kappa` declaration, `block_omega`, `block_sigma`
+and `block_kappa` included, is set to the fit's estimate, and the header of the
+exported file says so.
+
+```
+[parameters]
+  theta TVV(31.5, 1, 100)          # was theta TVV(30, 1, 100)
+  omega ETA_CL ~ 0.0912
+  sigma PROP_ERR ~ 0.1234 (sd)
+```
+
+Each declaration keeps the scale it is written on, so a `(sd)` tag, and an
+inline `prior(...)` declared on that scale, keep their meaning. A fit reports
+Ω and κ as variances and Σ as an SD; a value declared on the other scale goes
+through a square or a square root and reads back within a few ULP, every other
+value bit for bit. The export is parsed again and compared with the fit before
+it is written, so a declaration the estimate cannot be written into — a vector
+theta, a theta generated by `[covariate_model]`, a `[mixture]` class override —
+is an error naming the parameter, not a silent starting value. Pass
+`--network-only` (`DcmExportOptions::network_only` in the library) to write only
+the networks and keep every other value as the model file declares it.
+
+### Paths, priors and other blocks
+
+The `[data]` and `[priors]` blocks are copied exactly. A relative `[data] path`
+or `[priors] from_fit` then resolves against wherever the export is loaded from,
+so `export-dcm` prints a note when the export is written to a different
+directory than the model. A `.fitrx` does not record the original model's
+directory, so for a bundle the note asks you to check the path resolves from the
+export's directory. A `from_fit` prior was made for the network model; its
+network-weight entries match no free theta in the export and are skipped. When
+the prior source can be found (next to the model file, or by an absolute path),
+`export-dcm` loads the export with it, and refuses the export if nothing else
+would import — the export would otherwise fail to load. When it cannot be found,
+the note says the check was not made. `-o` naming the model or the fit is
+refused rather than overwriting it.
+
+A block this build of ferx cannot parse — `[event_model]` or `[binary_model]`
+without the `survival` feature, `[markov_model]` without `markov` — is copied
+like any other and left out of the validation parse, so a joint DCM exports from
+the default `ferx` binary. A `NAME.OUTPUT` reference in such a block is still
+rewritten, but nothing checks that block against the exported equations; load
+the export in a build with the feature to validate it.
+
+### Exactness
+
+The exported model predicts **exactly** what the fitted network does, bit for
+bit, not to a tolerance. The equations accumulate each unit in the order the
+network does, `tanh` and `softplus` are expression functions running the
+network's own code, and every weight is printed at full round-trip precision.
+
+The fit has to carry the weights at full precision, so `export-dcm` reads a
+`.fitrx` bundle or a `--output-format json` fit. It refuses the
+`{model}-fit.yaml` report, which rounds to 6 decimals and lists the network only
+as a summary.
+
+A covariate the data leaves blank is `NaN`, and the network's outputs are then
+`NaN`. The export keeps that: the normalisation is written as
+`(X - center) / scale` with no `present(X)` guard, so a subject the network
+cannot predict is not silently given finite predictions by the export.
+
+A model that reads a weight theta directly (`W_TYPICAL_PK_1_1_1` in an
+expression) keeps reading the same value: the default export writes the weight's
+value in its place, and `--fixed-theta` declares the theta again.
+
+A network output read anywhere but `[individual_parameters]` — a `kappa`
+`weight = TYPICAL_PK.CL` in `[parameters]`, say — is refused. The exported
+equations live in `[individual_parameters]`, so outside it `TYPICAL_PK_CL` would
+read a data column of that name instead. Move the read into
+`[individual_parameters]` before exporting.
+
+### Do not refit the export
+
+`--fixed-theta` declares each weight as `theta W_<NAME>_<l>_<i>_<j>(value, lo,
+hi) FIX` so the equations name it and a weight can be perturbed by hand. The
+weights stay fixed. Freeing them gives a model with as many thetas as the
+network has weights and no identifiability: the export is for reading,
+predicting and translating, not for estimating.
 
 ## What's not yet wired
 

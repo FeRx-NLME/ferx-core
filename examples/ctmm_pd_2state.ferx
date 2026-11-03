@@ -17,10 +17,12 @@
 # (LQ01 = -1.2, LQ10 = -0.7, SLOPE = 0.15, CL = 1, V = 10, ω²_CL = 0.09;
 # tools/sim_ctmm_pd.py, seed 20817 — balanced ~50/50 states, ~230 observed transitions).
 #
-# ferx recovers the transition structure well: LQ01 = -1.20, LQ10 = -0.60, SLOPE = 0.145
-# (OFV 712.23). Clearance and its IIV are only weakly identified (high η-shrinkage) because
-# the concentration is never *observed* here — it is inferred purely from the state
-# transitions; a real study would also observe the PK to pin CL down.
+# ferx recovers a clearly positive SLOPE. The baseline LQ01 is NOT identified: the
+# concentration is never *observed* here — it is inferred purely from the state transitions
+# — so LQ01, SLOPE, CL and V trade off along a ridge, and LQ10 moves with them. Profiling
+# LQ01 from -1.0 to its lower bound -6.0 lowers the OFV monotonically (712.69 to 709.07;
+# truth -1.2 at 711.79, #2437), and a free fit runs along that ridge, as far as the bound.
+# A real study would also observe the PK to pin CL and V down.
 #
 # Requires the `markov` cargo feature. Run:
 #   cargo run --release -p ferx-cli --features ferx-core/markov -- examples/ctmm_pd_2state.ferx --data data/ctmm_pd_2state.csv

@@ -71,6 +71,7 @@ website:
           - model-file/steady-state.qmd
           - model-file/error-model.qmd
           - model-file/residual-correlation.qmd
+          - model-file/mbma.qmd
           - model-file/bloq.qmd
           - model-file/ode-models.qmd
           - model-file/absorption.qmd
@@ -107,6 +108,7 @@ website:
           - estimation/tte.qmd
           - estimation/categorical.qmd
           - estimation/ctmm.qmd
+          - estimation/dtmm.qmd
           - estimation/mixture.qmd
           - estimation/priors.qmd
       - text: "Tools"

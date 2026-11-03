@@ -195,7 +195,7 @@ impl StepRunner for Scripted {
     fn fit_one(
         &self,
         index: usize,
-        tool: &str,
+        tool: &'static str,
         dir_name: &str,
         config: &SearchConfig,
         model: &ModelText,
@@ -906,6 +906,7 @@ fn progress_reports_the_plan_and_every_step() {
             AmdEvent::StepFinished { step, .. } => format!("done {}", step.label()),
             AmdEvent::RetriesStarted { .. } => "retries".into(),
             AmdEvent::RetriesFinished { .. } => "retries done".into(),
+            AmdEvent::CandidateFinished { candidate, .. } => format!("candidate {}", candidate.id),
         });
     };
     let config = config_with("ABSORPTION([INST,FO])", "");
@@ -1092,7 +1093,7 @@ fn a_starting_model_that_fails_the_gate_is_reported() {
         fn fit_one(
             &self,
             index: usize,
-            tool: &str,
+            tool: &'static str,
             dir_name: &str,
             config: &SearchConfig,
             model: &ModelText,
@@ -1205,7 +1206,7 @@ fn a_failed_retries_pass_keeps_the_selected_model() {
         fn fit_one(
             &self,
             index: usize,
-            tool: &str,
+            tool: &'static str,
             dir_name: &str,
             config: &SearchConfig,
             model: &ModelText,
@@ -1423,4 +1424,111 @@ fn cancellation_during_a_retries_pass_stops_the_pipeline() {
     );
     assert!(result.cancelled);
     assert_eq!(result.ran().count(), 6, "every step ran before the pass");
+}
+
+// ---------------------------------------------------------------------------
+// The production runner's per-candidate events (#2512)
+// ---------------------------------------------------------------------------
+
+/// The two-compartment model with a `WT` covariate and no covariate model, at
+/// `maxiter = 2` so its two fits are quick.
+const TWO_CPT_WT: &str = "\
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[covariates]
+  WT   continuous
+  CRCL continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+  maxiter = 2
+";
+
+/// Allometry has no event enum of its own, so its two fits reach AMD's sink
+/// straight from the runner rather than through a tool's `CandidateFinished`:
+/// this is the step a forwarding written only for the event-carrying tools
+/// would leave silent.
+#[test]
+fn the_production_allometry_step_reports_both_of_its_fits() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/two_cpt_oral_cov.csv");
+    let seen = Mutex::new(Vec::new());
+    let sink = |event: AmdEvent| seen.lock().unwrap().push(event);
+    let runner = ToolRunner {
+        dir: dir.path().to_path_buf(),
+        threads: Some(1),
+        cancel: None,
+        data_path: data.to_string_lossy().into_owned(),
+        progress: Some(&sink),
+    };
+    let model = ModelText::parse(TWO_CPT_WT).expect("model text");
+    let output = runner
+        .run_step(
+            5,
+            Step::Allometry,
+            "5-allometry",
+            &config_with("ALLOMETRY(WT,70)", ""),
+            &model,
+        )
+        .expect("the allometry step runs");
+
+    let mut heard: Vec<_> = seen
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|e| match e {
+            AmdEvent::CandidateFinished {
+                index,
+                tool,
+                candidate,
+            } => (index, tool, candidate),
+            other => panic!("only candidate events are forwarded, got {other:?}"),
+        })
+        .collect();
+    heard.sort_by(|a, b| a.2.id.cmp(&b.2.id));
+    assert_eq!(
+        heard
+            .iter()
+            .map(|(i, t, c)| (*i, *t, c.step.as_str(), c.id.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (5, "allometry", "5-allometry", "allometric"),
+            (5, "allometry", "5-allometry", "base"),
+        ]
+    );
+    // The events describe the fits the step's rows report.
+    for (_, _, c) in &heard {
+        let ofv = c.ofv.expect("a fitted candidate reports its OFV");
+        assert!(
+            output
+                .rows
+                .iter()
+                .any(|r| r.ofv.map(f64::to_bits) == Some(ofv.to_bits())),
+            "{} at {ofv} matches no row: {:?}",
+            c.id,
+            output.rows
+        );
+    }
+    assert!(heard[0].2.description.contains("WT"), "{:?}", heard[0].2);
 }

@@ -13,12 +13,12 @@ pub mod io;
 #[cfg(feature = "markov")]
 pub mod markov;
 pub mod model_selection;
-#[cfg(feature = "nn")]
 pub mod nn;
 pub mod ode;
 pub mod parser;
 pub mod pk;
 pub mod propensity_match;
+pub(crate) mod scratch;
 pub mod sens;
 pub(crate) mod serde_nalgebra;
 pub mod sim;
@@ -43,8 +43,8 @@ pub use api::{
     simulate_with_uncertainty_diag, theta_level_map, theta_level_values, validate_model_file,
     validate_model_file_with, AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
     PoolPlan, PredictionOutput, PredictionResult, PreparedRun, ReaderSettings, RunOverrides,
-    SimulateOptions, SimulateUncertaintyOptions, SimulationOutput, SimulationResult, SuppliedEtas,
-    UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
+    SimulateOptions, SimulateUncertaintyOptions, SimulatedParameters, SimulatedSubjectParameters,
+    SimulationOutput, SimulationResult, SuppliedEtas, UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, EngineError, Severity};
@@ -73,15 +73,15 @@ pub use propensity_match::MatchMethod;
 pub use sim::adaptive::{
     AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, AdaptiveSubjectMetrics,
     Comparison, ControllerCtx, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry,
-    DoseStep, MonitorSpec, ObserveMode, ObservedSignal,
+    DoseStep, IntervalStep, MonitorSpec, ObserveMode, ObservedSignal,
 };
 pub use suggest_start::{inits_from_nca, NcaInit, SuggestedStart};
 pub use types::*;
 
 #[cfg(feature = "survival")]
 pub use api::{
-    predict_categorical, predict_survival, predict_survival_diag, SurvivalPredictionOutput,
-    SurvivalPredictionResult,
+    predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
+    SurvivalPredictionOutput, SurvivalPredictionResult,
 };
 
 /// Positive proof that the `debug_assert!` guards in this crate are LIVE

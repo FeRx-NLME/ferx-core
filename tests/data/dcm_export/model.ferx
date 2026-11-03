@@ -1,0 +1,31 @@
+# Fixture for the DCM export (#1331): a [covariate_nn] model whose export is
+# committed next to it as `expected_analytic.ferx`. 2 -> 3 -> 2 -> 2, two hidden
+# layers, outputs routed to the non-adjacent CL and KA slots.
+model dcm_export_fixture
+
+[parameters]
+  theta TVV(30, 1, 100)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.05
+  omega ETA_KA ~ 0.2
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs     = [WT, CRCL]   # both normalised
+  outputs    = [CL, KA]
+  layers     = [3, 2]
+  activation = tanh
+  output     = softplus
+  center     = [70, -5]
+  scale      = [12, 23.5]
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)   # clearance from the network
+  V  = TVV * exp(ETA_V)
+  KA = TYPICAL_PK . KA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)

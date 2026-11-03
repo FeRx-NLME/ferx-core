@@ -344,7 +344,7 @@ fn check_model_options_rejects_saem_without_random_effects() {
 #[test]
 fn check_model_options_rejects_saem_anywhere_in_a_chain() {
     // The guard must fire on a chained fit too, up front — otherwise
-    // `methods = [saem, focei]` runs the whole SAEM stage before failing.
+    // `method = [saem, focei]` runs the whole SAEM stage before failing.
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
     model.n_eta = 0;
     let diags = check_model_options(
@@ -411,7 +411,7 @@ fn check_model_options_rejects_imp_impmap_bayes_without_random_effects() {
 
 #[test]
 fn check_model_options_rejects_imp_anywhere_in_a_chain() {
-    // `methods = [focei, imp]` previously ran the whole FOCEI stage before the
+    // `method = [focei, imp]` previously ran the whole FOCEI stage before the
     // IMP stage errored at run time (#1007); it must now fail up front.
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
     model.n_eta = 0;
@@ -437,6 +437,80 @@ fn check_model_options_allows_imp_impmap_bayes_with_random_effects() {
             "{method:?} at n_eta > 0 must not be rejected: {diags:?}"
         );
     }
+}
+
+// --- one membership rule for both layers (#1050) ------------------------------
+
+#[test]
+fn check_model_options_rejects_exactly_the_methods_that_require_random_effects() {
+    // Every variant, alone, at n_eta = 0: the up-front check must emit a
+    // no-random-effects error iff `requires_random_effects()` says so — and the
+    // right code: SAEM's stable one for `saem`, the shared one for the rest. A
+    // variant added without deciding its membership fails to compile in
+    // `requires_random_effects`; one decided wrong for the check fails here.
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    use EstimationMethod::*;
+    for method in [
+        Foce,
+        FoceI,
+        FoceGn,
+        FoceGnHybrid,
+        Saem,
+        Imp,
+        Impmap,
+        Bayes,
+        Laplace,
+        Vi,
+    ] {
+        let diags = check_model_options(&model, &opts_with_methods(vec![method]));
+        let codes: Vec<&str> = diags
+            .iter()
+            .map(|d| d.code.as_str())
+            .filter(|c| {
+                matches!(
+                    *c,
+                    "E_SAEM_NO_RANDOM_EFFECTS" | "E_METHOD_NO_RANDOM_EFFECTS"
+                )
+            })
+            .collect();
+        let want: &[&str] = match (method.requires_random_effects(), method) {
+            (false, _) => &[],
+            (true, EstimationMethod::Saem) => &["E_SAEM_NO_RANDOM_EFFECTS"],
+            (true, _) => &["E_METHOD_NO_RANDOM_EFFECTS"],
+        };
+        assert_eq!(codes, want, "{method:?} at n_eta = 0: {diags:?}");
+    }
+}
+
+#[test]
+fn check_model_options_reports_each_member_once_in_chain_order() {
+    // The rejection applies the predicate to the chain itself (#1050 review: a
+    // separate method list could omit a new variant), so diagnostics follow the
+    // chain's stage order and a method repeated in the chain is reported once.
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    let messages = |methods: Vec<EstimationMethod>| -> Vec<String> {
+        check_model_options(&model, &opts_with_methods(methods))
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    d.code.as_str(),
+                    "E_SAEM_NO_RANDOM_EFFECTS" | "E_METHOD_NO_RANDOM_EFFECTS"
+                )
+            })
+            .map(|d| d.message)
+            .collect()
+    };
+    let got = messages(vec![
+        EstimationMethod::Bayes,
+        EstimationMethod::FoceI,
+        EstimationMethod::Saem,
+        EstimationMethod::Bayes,
+    ]);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got[0].starts_with("method = bayes "), "{got:?}");
+    assert!(got[1].starts_with("method = saem "), "{got:?}");
 }
 
 // --- pure-GN warning (#1006) ---------------------------------------------------
@@ -482,7 +556,7 @@ fn check_model_options_does_not_warn_gn_hybrid_or_mixed_effects_gn() {
 
 #[test]
 fn check_model_options_rejects_imp_via_the_singular_method_field() {
-    // Every other guard test drives `methods = [...]`; a user writing
+    // Every other guard test drives `method = [...]`; a user writing
     // `method = imp` in `[fit_options]` reaches the same guard through
     // `method_chain()`'s *empty*-`methods` branch, which must be covered too.
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
@@ -529,7 +603,7 @@ fn check_model_options_rejects_eval_only_imp_without_random_effects() {
 
 #[test]
 fn check_model_options_does_not_warn_gn_polished_by_a_later_stage() {
-    // `methods = [gn, focei]` is `gn_hybrid` spelled out — the FOCEI stage
+    // `method = [gn, focei]` is `gn_hybrid` spelled out — the FOCEI stage
     // re-optimises the GN result, so the #1006 "may be badly wrong" advice does
     // not apply. The exemption keys off *last estimating stage*, not off the
     // `gn_hybrid` token, so both spellings behave the same.

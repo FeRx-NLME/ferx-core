@@ -1,0 +1,35 @@
+# #2544 control for saem_additive_mu_inline.ferx: the same line, with TVE0 also read
+# in [structural_model] (`+ 0 * TVE0`, so the likelihood is unchanged). TVE0 then
+# reaches the model through more than BASE, so the line is not a mu-reference, SAEM
+# moves TVE0 only through the eta-frozen numerical M-step, and lands several OFV
+# units above the MLE, as NONMEM SAEM without MU_ does (saem_additive_mu_nomu.ctl).
+# This is what the inline spelling gave before #2544.
+
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  theta EMAX(13.4506) FIX
+  theta ED50(31.4307) FIX
+  theta ET50(3.526) FIX
+
+  omega ETA_E0 ~ 4.0 (sd)
+
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[covariates]
+  DOSE   continuous
+  SE     continuous
+  PLAFIX continuous
+
+[individual_parameters]
+  BASE = TVE0 + PLAFIX + ETA_E0
+
+[structural_model]
+  DRUG = EMAX * DOSE / (ED50 + DOSE) * TIME / (TIME + ET50)
+  y    = BASE - DRUG + 0 * TVE0
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = SE
+
+[fit_options]
+  method     = saem
+  covariance = false

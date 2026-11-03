@@ -16,7 +16,7 @@
 //! a reference that profiles nothing.
 
 use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
-use ferx_core::types::{CovarianceMethod, FitOptions, FitResult, OmegaMatrix};
+use ferx_core::types::{CovarianceMethod, EstimationMethod, FitOptions, FitResult, OmegaMatrix};
 use nalgebra::DMatrix;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -170,7 +170,17 @@ fn at_nonmem_optimum(
     theta: Option<&[f64]>,
     step: Step,
 ) -> (ferx_core::PreparedRun, FitResult) {
-    let (est, _) = ext("profile_mbma.ext");
+    at_ext_optimum("profile_mbma.ext", profiled, theta, step)
+}
+
+/// [`at_nonmem_optimum`] at the structural optimum and Ω of the NONMEM run `ext_name`.
+fn at_ext_optimum(
+    ext_name: &str,
+    profiled: bool,
+    theta: Option<&[f64]>,
+    step: Step,
+) -> (ferx_core::PreparedRun, FitResult) {
+    let (est, _) = ext(ext_name);
     let p = prep(F2, F2_DATA, profiled);
     let mut params = p.init_params.clone();
     match theta {
@@ -239,7 +249,7 @@ fn a_profiled_evaluation_reproduces_nonmem_with_every_level_a_theta() {
         .unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
     let mut worst_struct = 0.0_f64;
     for (k, name) in ["TVE0", "EMAX", "ET50"].iter().enumerate() {
-        let want = profile_curvature_se(name);
+        let want = profile_curvature_se("profile_mbma_profiles.txt", name);
         let rel = (se_theta[k] - want).abs() / want;
         assert!(rel.is_finite(), "{name}");
         worst_struct = worst_struct.max(rel);
@@ -302,10 +312,8 @@ fn a_profiled_evaluation_reproduces_nonmem_with_every_level_a_theta() {
 /// 59% below the profile's 0.576; at `SIGL=12 NSIG=4` (the committed run) it gives 0.523,
 /// still 9% below, and EMAX moves from 8% to 2% below. The profile is the stable
 /// reference; ferx's `R` (profiled and unprofiled, which agree to 4.7e-3, C1) matches it.
-fn profile_curvature_se(name: &str) -> f64 {
-    let text =
-        std::fs::read_to_string(root().join("nonmem_anchor/results/profile_mbma_profiles.txt"))
-            .unwrap();
+fn profile_curvature_se(file: &str, name: &str) -> f64 {
+    let text = std::fs::read_to_string(root().join("nonmem_anchor/results").join(file)).unwrap();
     let rows: Vec<(f64, f64)> = text
         .lines()
         .filter(|l| l.starts_with(name))
@@ -1790,3 +1798,491 @@ fn a_bounded_profiled_cross_product_holds_the_level_as_fixed() {
 /// aarch64 and macOS arm64 alike), against 3.4e-10 for the held one against FIX (under `S_SE`). The floor is a
 /// third of it.
 const S_HELD_STRADDLE: f64 = 0.1;
+
+// ── #2107: the profiled covariance under `method = laplace` ──────────────────────────
+//
+// The same pairs as C1, C1b and C4, with `method = laplace` (one node) on both sides. The
+// profiled step's `D` and `B` come from the adjoint differentiating the profile's
+// objective (`ProfileCtx::objective`) and its `S` from the unprofiled assembly, which
+// dispatches Laplace itself. Each side is the exact Laplace R-matrix, so the gap is
+// rounding and inner-solve noise. The straddle: on F2 the Laplace SEs are not FOCEI's,
+// so a profiled step that read FOCEI's blocks would fail these.
+
+/// The warnings that report a subject falling back to finite differences anywhere in a fit:
+/// the inner gradient, the outer gradient, the profile solve, the covariance step's R-matrix
+/// or level blocks. Their wordings differ ("finite differences", "finite-difference outer
+/// gradients", "(finite-difference Hessian …)", "finite-differenced subjects"), so the match
+/// is on the hyphen-folded stem. A bare `contains("finite difference")` saw only the two
+/// profile warnings and missed the outer-gradient and covariance fallbacks (#2561 review
+/// row 1).
+fn fd_fallback_warnings(warnings: &[String]) -> Vec<&String> {
+    warnings
+        .iter()
+        .filter(|w| {
+            w.to_lowercase()
+                .replace('-', " ")
+                .contains("finite differen")
+        })
+        .collect()
+}
+
+/// `method = laplace`, as a step's edit: what `method = laplace` in the file gives, since
+/// the file's `interaction` (the default, `true`) is inherited by Laplace either way.
+fn laplace(o: FitOptions) -> FitOptions {
+    FitOptions {
+        method: EstimationMethod::Laplace,
+        ..o
+    }
+}
+
+fn laplace_r(o: FitOptions) -> FitOptions {
+    r(laplace(o))
+}
+
+fn laplace_rsr(o: FitOptions) -> FitOptions {
+    rsr(laplace(o))
+}
+
+fn laplace_s(o: FitOptions) -> FitOptions {
+    s(laplace(o))
+}
+
+/// Both sides ran Laplace, and on the adjoint: no FD fallback reported by either.
+fn assert_laplace_on_the_adjoint(prof: &FitResult, plain: &FitResult) {
+    for (side, f) in [("profiled", prof), ("unprofiled", plain)] {
+        assert_eq!(f.method, EstimationMethod::Laplace, "{side}");
+        assert!(
+            fd_fallback_warnings(&f.warnings).is_empty(),
+            "{side}: {:?}",
+            f.warnings
+        );
+    }
+}
+
+/// **C1-L.** At NONMEM's FOCEI structural optimum, the levels profiled there under
+/// `laplace`: the profiled `r` step gives the unprofiled Laplace `R⁻¹` — the same SEs for
+/// the structural θ, every level, ω and κ, and the same matrix. Dies when the profiled
+/// blocks differentiate FOCEI's objective (`ProfileCtx::objective` returning `Focei`):
+/// the structural SEs are then FOCEI's, which differ from Laplace's here by the straddle.
+#[test]
+fn c1_l_the_profiled_laplace_covariance_is_the_unprofiled_one() {
+    let (_, prof) = at_nonmem_optimum(true, None, laplace_r);
+    let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), laplace_r);
+    assert_laplace_on_the_adjoint(&prof, &plain);
+    let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2], laplace_r);
+    let (_, focei) = profiled_at_nonmem_optimum();
+    let off_focei = worst_rel(
+        prof.se_theta.as_ref().unwrap(),
+        focei.se_theta.as_ref().unwrap(),
+        0..3,
+    );
+    eprintln!(
+        "C1-L: structural SE {structural:.3e}, level SE {level:.3e}, variance SE \
+         {variance:.3e}, matrix {matrix:.3e}; Laplace against FOCEI {off_focei:.3e}"
+    );
+    assert!(structural < CL_BOUND, "{structural}");
+    assert!(level < CL_BOUND, "{level}");
+    assert!(variance < CL_BOUND, "{variance}");
+    assert!(matrix < CL_BOUND, "{matrix}");
+    assert!(
+        off_focei > C1L_STRADDLE,
+        "Laplace ≠ FOCEI here: {off_focei}"
+    );
+}
+
+/// The structural SEs under Laplace against FOCEI's: realised 7.40e-3 under `r` on F2 at
+/// NONMEM's FOCEI optimum, and 5.78e-2 under `s` on S1's visit block (macOS arm64). The
+/// floor is 7× under the smaller, so a step that computed FOCEI's covariance under
+/// `laplace` fails C1-L and C4-L.
+const C1L_STRADDLE: f64 = 1e-3;
+
+/// The profiled Laplace step against the unprofiled one, every gap C1-L, C3-L and C4-L
+/// read. Worst realised (macOS arm64): 2.9e-10 (C4-L `rsr`, matrix), then 1.2e-10 (its
+/// level SEs), 7.6e-11 (C1-L matrix), 4.4e-11 (C3-L matrix); the structural SEs 2e-11 or
+/// less. Two exact Laplace R-matrices (and one `S`) of one objective. ~3.4× headroom on
+/// the worst, and six decades under the FOCEI straddle.
+const CL_BOUND: f64 = 1e-9;
+
+/// **C3-L.** C1b under `laplace`: with THETA24 held on its bound, the profiled step is the
+/// unprofiled Laplace step with THETA24 FIXed. The held level's row is zero on both sides.
+#[test]
+fn c3_l_a_held_level_is_the_unprofiled_laplace_step_with_that_level_fixed() {
+    let (_, prof) = f2b_evaluated(true, None, &[], laplace_r);
+    assert_eq!(prof.profiled_levels_at_bound, [A3_PINNED]);
+    let (_, held) = f2b_evaluated(false, Some(&prof.theta), &[A3_PINNED], laplace_r);
+    assert_laplace_on_the_adjoint(&prof, &held);
+    let (a, b) = (
+        prof.se_theta.as_ref().expect("profiled SE"),
+        held.se_theta.as_ref().expect("unprofiled SE"),
+    );
+    assert_eq!((a[A3_PINNED], b[A3_PINNED]), (0.0, 0.0));
+    assert!(
+        (prof.ofv - held.ofv).abs() < 1e-6,
+        "{} vs {}",
+        prof.ofv,
+        held.ofv
+    );
+    let structural = worst_rel(a, b, 0..3);
+    let level = worst_rel(a, b, (3..a.len()).filter(|&k| k != A3_PINNED));
+    let var = |f: &FitResult| {
+        let mut v = f.se_omega.clone().unwrap();
+        v.extend(f.se_kappa.clone().unwrap_or_default());
+        v
+    };
+    let (va, vb) = (var(&prof), var(&held));
+    let variance = worst_rel(&va, &vb, 0..va.len());
+    // The held level's zero row and column are asserted zero on both sides inside.
+    let matrix = worst_cov_gap(
+        prof.covariance_matrix.as_ref().unwrap(),
+        held.covariance_matrix.as_ref().unwrap(),
+    );
+    eprintln!(
+        "C3-L: structural SE {structural:.3e}, level SE {level:.3e}, variance SE \
+         {variance:.3e}, matrix {matrix:.3e}"
+    );
+    assert!(structural < CL_BOUND, "{structural}");
+    assert!(level < CL_BOUND, "{level}");
+    assert!(variance < CL_BOUND, "{variance}");
+    assert!(matrix < CL_BOUND, "{matrix}");
+}
+
+/// **C4-L.** `rsr` (F2) and `s` (S1's visit block, where `S` has full rank) under
+/// `laplace`: the profiled sandwich and cross-product are the unprofiled Laplace ones.
+/// Dies when the profiled `S` is scored on FOCEI's objective.
+#[test]
+fn c4_l_the_profiled_laplace_sandwich_and_cross_product_are_the_unprofiled_ones() {
+    let (_, prof) = at_nonmem_optimum(true, None, laplace_rsr);
+    let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), laplace_rsr);
+    assert_laplace_on_the_adjoint(&prof, &plain);
+    let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2], laplace_rsr);
+    eprintln!(
+        "C4-L rsr: structural SE {structural:.3e}, level SE {level:.3e}, variance SE \
+         {variance:.3e}, matrix {matrix:.3e}"
+    );
+    assert!(structural < CL_BOUND, "{structural}");
+    assert!(level < CL_BOUND, "{level}");
+    assert!(variance < CL_BOUND, "{variance}");
+    assert!(matrix < CL_BOUND, "{matrix}");
+
+    let (_, prof) = s1_visit_evaluated(true, None, laplace_s);
+    let (_, plain) = s1_visit_evaluated(false, Some(&prof.theta), laplace_s);
+    assert_laplace_on_the_adjoint(&prof, &plain);
+    let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2], laplace_s);
+    let (_, focei) = profiled_s1_visit_s();
+    let off_focei = worst_rel(
+        prof.se_theta.as_ref().unwrap(),
+        focei.se_theta.as_ref().unwrap(),
+        0..3,
+    );
+    eprintln!(
+        "C4-L s: structural SE {structural:.3e}, level SE {level:.3e}, variance SE \
+         {variance:.3e}, matrix {matrix:.3e}; Laplace against FOCEI {off_focei:.3e}"
+    );
+    assert!(structural < S_SE, "{structural}");
+    assert!(level < S_SE, "{level}");
+    assert!(variance < S_SE, "{variance}");
+    assert!(matrix < S_SE, "{matrix}");
+    assert!(
+        off_focei > C1L_STRADDLE,
+        "Laplace ≠ FOCEI here: {off_focei}"
+    );
+}
+
+// ── #2107 PR-A: the profiled covariance under adaptive quadrature, `n_agq = 3` ────────
+//
+// C1-L, C3-L and C4-L at three nodes, at both anchors: `laplace` (the exact `H`) and
+// `focei` (the Gauss–Newton `H̃`). Each side is the exact R-matrix of one quadrature
+// objective, so the gap is rounding and inner-solve noise, and every side runs on the
+// adjoint (A0: the FD declines the plan measured were #2554's `off_mode` arm). The
+// straddle: the three-node SEs are not the one-node Laplace ones, so a profiled step that
+// read the wrong node count fails these.
+
+/// `n_agq = 3` on a step's options, `method` the stage's estimator.
+fn agq3(method: EstimationMethod, o: FitOptions) -> FitOptions {
+    FitOptions {
+        method,
+        n_agq: 3,
+        ..o
+    }
+}
+
+fn agq3_laplace_r(o: FitOptions) -> FitOptions {
+    r(agq3(EstimationMethod::Laplace, o))
+}
+fn agq3_focei_r(o: FitOptions) -> FitOptions {
+    r(agq3(EstimationMethod::FoceI, o))
+}
+fn agq3_laplace_rsr(o: FitOptions) -> FitOptions {
+    rsr(agq3(EstimationMethod::Laplace, o))
+}
+fn agq3_focei_rsr(o: FitOptions) -> FitOptions {
+    rsr(agq3(EstimationMethod::FoceI, o))
+}
+fn agq3_laplace_s(o: FitOptions) -> FitOptions {
+    s(agq3(EstimationMethod::Laplace, o))
+}
+fn agq3_focei_s(o: FitOptions) -> FitOptions {
+    s(agq3(EstimationMethod::FoceI, o))
+}
+
+/// Both sides ran the step's own method at three nodes, and on the adjoint: no FD fallback
+/// reported by either.
+fn assert_agq3_on_the_adjoint(prof: &FitResult, plain: &FitResult, method: EstimationMethod) {
+    for (side, f) in [("profiled", prof), ("unprofiled", plain)] {
+        assert_eq!(f.method, method, "{side}");
+        assert!(
+            fd_fallback_warnings(&f.warnings).is_empty(),
+            "{side}: {:?}",
+            f.warnings
+        );
+    }
+}
+
+/// **C1-A.** C1-L at three nodes, both anchors: at NONMEM's FOCEI structural optimum, the
+/// profiled `r` step gives the unprofiled quadrature `R⁻¹` — the same SEs for the
+/// structural θ, every level, ω and κ, and the same matrix. The straddle against the
+/// one-node Laplace step at the same point is asserted in the same test.
+#[test]
+fn c1_a_the_profiled_quadrature_covariance_is_the_unprofiled_one() {
+    let (_, one) = at_nonmem_optimum(true, None, laplace_r);
+    for (method, step) in [
+        (EstimationMethod::Laplace, agq3_laplace_r as Step),
+        (EstimationMethod::FoceI, agq3_focei_r as Step),
+    ] {
+        let (_, prof) = at_nonmem_optimum(true, None, step);
+        let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), step);
+        assert_agq3_on_the_adjoint(&prof, &plain, method);
+        let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2], step);
+        let off_one = worst_rel(
+            prof.se_theta.as_ref().unwrap(),
+            one.se_theta.as_ref().unwrap(),
+            0..3,
+        );
+        eprintln!(
+            "C1-A {method:?}: structural SE {structural:.3e}, level SE {level:.3e}, variance \
+             SE {variance:.3e}, matrix {matrix:.3e}; against one node {off_one:.3e}"
+        );
+        assert!(structural < CA_BOUND, "{method:?}: {structural}");
+        assert!(level < CA_BOUND, "{method:?}: {level}");
+        assert!(variance < CA_BOUND, "{method:?}: {variance}");
+        assert!(matrix < CA_BOUND, "{method:?}: {matrix}");
+        assert!(
+            off_one > CA_STRADDLE,
+            "{method:?}: three nodes ≠ one here: {off_one}"
+        );
+    }
+}
+
+/// The three-node structural SEs against the one-node Laplace ones at the same point:
+/// realised 1.05e-3 (`laplace`) and 1.13e-3 (`focei`) under `r` on F2 at NONMEM's FOCEI
+/// optimum (macOS arm64). The floor is 10× under both and five decades over `CA_BOUND`.
+const CA_STRADDLE: f64 = 1e-4;
+
+/// The profiled quadrature step against the unprofiled one, every gap C1-A, C3-A and C4-A
+/// read. Worst realised (macOS arm64): 5.9e-11 (C4-A `focei` `rsr`, matrix), then 3.1e-11
+/// (C3-A `focei`, matrix) and 2.6e-11 (C4-A `focei` `rsr`, level SEs); every structural SE
+/// 8.4e-12 or less. ~17× headroom on the worst: two exact quadrature R-matrices of one
+/// objective, every side on the adjoint.
+const CA_BOUND: f64 = 1e-9;
+
+/// **C3-A.** C3-L at three nodes, both anchors: with THETA24 held on its bound, the
+/// profiled step is the unprofiled quadrature step with THETA24 FIXed.
+#[test]
+fn c3_a_a_held_level_is_the_unprofiled_quadrature_step_with_that_level_fixed() {
+    for (method, step) in [
+        (EstimationMethod::Laplace, agq3_laplace_r as Step),
+        (EstimationMethod::FoceI, agq3_focei_r as Step),
+    ] {
+        let (_, prof) = f2b_evaluated(true, None, &[], step);
+        assert_eq!(prof.profiled_levels_at_bound, [A3_PINNED], "{method:?}");
+        let (_, held) = f2b_evaluated(false, Some(&prof.theta), &[A3_PINNED], step);
+        assert_agq3_on_the_adjoint(&prof, &held, method);
+        let (a, b) = (
+            prof.se_theta.as_ref().expect("profiled SE"),
+            held.se_theta.as_ref().expect("unprofiled SE"),
+        );
+        assert_eq!((a[A3_PINNED], b[A3_PINNED]), (0.0, 0.0));
+        assert!(
+            (prof.ofv - held.ofv).abs() < 1e-6,
+            "{method:?}: {} vs {}",
+            prof.ofv,
+            held.ofv
+        );
+        let structural = worst_rel(a, b, 0..3);
+        let level = worst_rel(a, b, (3..a.len()).filter(|&k| k != A3_PINNED));
+        let var = |f: &FitResult| {
+            let mut v = f.se_omega.clone().unwrap();
+            v.extend(f.se_kappa.clone().unwrap_or_default());
+            v
+        };
+        let (va, vb) = (var(&prof), var(&held));
+        let variance = worst_rel(&va, &vb, 0..va.len());
+        let matrix = worst_cov_gap(
+            prof.covariance_matrix.as_ref().unwrap(),
+            held.covariance_matrix.as_ref().unwrap(),
+        );
+        eprintln!(
+            "C3-A {method:?}: structural SE {structural:.3e}, level SE {level:.3e}, variance \
+             SE {variance:.3e}, matrix {matrix:.3e}"
+        );
+        assert!(structural < CA_BOUND, "{method:?}: {structural}");
+        assert!(level < CA_BOUND, "{method:?}: {level}");
+        assert!(variance < CA_BOUND, "{method:?}: {variance}");
+        assert!(matrix < CA_BOUND, "{method:?}: {matrix}");
+    }
+}
+
+/// **C4-A.** C4-L at three nodes, both anchors: `rsr` on F2 and `s` on S1's visit block,
+/// the profiled sandwich and cross-product against the unprofiled quadrature ones.
+#[test]
+fn c4_a_the_profiled_quadrature_sandwich_and_cross_product_are_the_unprofiled_ones() {
+    for (method, rsr_step, s_step) in [
+        (
+            EstimationMethod::Laplace,
+            agq3_laplace_rsr as Step,
+            agq3_laplace_s as Step,
+        ),
+        (
+            EstimationMethod::FoceI,
+            agq3_focei_rsr as Step,
+            agq3_focei_s as Step,
+        ),
+    ] {
+        let (_, prof) = at_nonmem_optimum(true, None, rsr_step);
+        let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), rsr_step);
+        assert_agq3_on_the_adjoint(&prof, &plain, method);
+        let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2], rsr_step);
+        eprintln!(
+            "C4-A {method:?} rsr: structural SE {structural:.3e}, level SE {level:.3e}, \
+             variance SE {variance:.3e}, matrix {matrix:.3e}"
+        );
+        assert!(structural < CA_BOUND, "{method:?}: {structural}");
+        assert!(level < CA_BOUND, "{method:?}: {level}");
+        assert!(variance < CA_BOUND, "{method:?}: {variance}");
+        assert!(matrix < CA_BOUND, "{method:?}: {matrix}");
+
+        let (_, prof) = s1_visit_evaluated(true, None, s_step);
+        let (_, plain) = s1_visit_evaluated(false, Some(&prof.theta), s_step);
+        assert_agq3_on_the_adjoint(&prof, &plain, method);
+        let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2], s_step);
+        eprintln!(
+            "C4-A {method:?} s: structural SE {structural:.3e}, level SE {level:.3e}, variance \
+             SE {variance:.3e}, matrix {matrix:.3e}"
+        );
+        assert!(structural < S_SE, "{method:?}: {structural}");
+        assert!(level < S_SE, "{method:?}: {level}");
+        assert!(variance < S_SE, "{method:?}: {variance}");
+        assert!(matrix < S_SE, "{method:?}: {matrix}");
+    }
+}
+
+// ── A2-L: NONMEM LAPLACE, every level a THETA (#2107) ────────────────────────────
+
+/// **A2-L.** `nonmem_anchor/profile_mbma_laplace.ctl` is A2's stream under
+/// `$ESTIMATION METHOD=1 LAPLACE INTER`. ferx, under `method = laplace`, is handed NONMEM's
+/// LAPLACE structural optimum and Ω only and **solves the 36 free levels itself**: its
+/// objective, levels and SEs against NONMEM's. The structural SEs are compared with
+/// NONMEM's own LAPLACE profile likelihood (`profile_mbma_laplace_profiles.txt`), as A2's
+/// are; the level SEs with its `$COV`. Laplace is live here: NONMEM's LAPLACE OBJ is 0.0626
+/// above its FOCEI one, so a solve scoring FOCEI's objective misses the OFV band by
+/// orders of magnitude. Dies when the profile solve minimises FOCEI's objective, when it
+/// holds the EBEs (the frozen point, ~1.2e-2 OFV per study), and on #2538's jitter coming
+/// back (+9.0e-5).
+#[test]
+fn a2_l_a_profiled_laplace_evaluation_reproduces_nonmem() {
+    let (est, se) = ext("profile_mbma_laplace.ext");
+    let (focei, _) = ext("profile_mbma.ext");
+    let cov = cov_thetas("profile_mbma_laplace.cov", 39);
+    let (p, f) = at_ext_optimum("profile_mbma_laplace.ext", true, None, laplace_r);
+    let model = &p.parsed.model;
+    assert_eq!(model.n_theta, 39, "3 structural θ and 36 free levels");
+    assert_eq!(f.method, EstimationMethod::Laplace);
+    assert!(
+        fd_fallback_warnings(&f.warnings).is_empty(),
+        "the adjoint serves every subject: {:?}",
+        f.warnings
+    );
+    assert!(f.ofv.is_finite());
+    let d_ofv = f.ofv - est["OBJ"];
+    // The straddle: Laplace against FOCEI on this data, in NONMEM's own objectives.
+    let laplace_vs_focei = est["OBJ"] - focei["OBJ"];
+
+    let mut worst_level = 0.0_f64;
+    for k in 3..39 {
+        let name = format!("THETA{}", k + 1);
+        let gap = ((f.theta[k] - est[&name]) / se[&name]).abs();
+        assert!(gap.is_finite(), "{name}");
+        worst_level = worst_level.max(gap);
+    }
+
+    let se_theta = f
+        .se_theta
+        .as_ref()
+        .unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
+    let mut worst_struct = 0.0_f64;
+    for (k, name) in ["TVE0", "EMAX", "ET50"].iter().enumerate() {
+        let want = profile_curvature_se("profile_mbma_laplace_profiles.txt", name);
+        let rel = (se_theta[k] - want).abs() / want;
+        assert!(rel.is_finite(), "{name}");
+        eprintln!(
+            "A2-L {name}: SE ferx {:.6} NONMEM profile {want:.6} $COV {:.6}",
+            se_theta[k],
+            se[&format!("THETA{}", k + 1)]
+        );
+        worst_struct = worst_struct.max(rel);
+    }
+
+    let c = f.covariance_matrix.as_ref().unwrap();
+    let levels = &ferx_core::theta_level_values(model, &f.theta, Some(c), None).unwrap()["PLACEBO"];
+    assert_eq!(levels.len(), 48);
+    let (mut worst_free, mut worst_dep, mut n_dep) = (0.0_f64, 0.0_f64, 0);
+    for (i, l) in levels.iter().enumerate() {
+        let got = l.se.unwrap_or_else(|| panic!("{}: no SE", l.label));
+        let want = match l.theta_index {
+            Some(k) => se[&format!("THETA{}", k + 1)],
+            None => {
+                n_dep += 1;
+                let s = i / 4;
+                let r = 3 + 3 * s..6 + 3 * s;
+                r.clone()
+                    .flat_map(|a| r.clone().map(move |b| (a, b)))
+                    .map(|(a, b)| cov[(a, b)])
+                    .sum::<f64>()
+                    .sqrt()
+            }
+        };
+        let rel = (got - want).abs() / want;
+        assert!(rel.is_finite(), "{}: {got} vs {want}", l.label);
+        if l.theta_index.is_some() {
+            worst_free = worst_free.max(rel);
+        } else {
+            worst_dep = worst_dep.max(rel);
+        }
+    }
+    assert_eq!(n_dep, 12, "each study's last visit is dependent");
+    eprintln!(
+        "A2-L: ΔOFV {d_ofv:.3e} (LAPLACE − FOCEI in NONMEM {laplace_vs_focei:.4e}), worst level \
+         {worst_level:.3e} SE, structural SE {worst_struct:.3e}, free-level SE {worst_free:.3e}, \
+         dependent-level SE {worst_dep:.3e}"
+    );
+    assert!(
+        d_ofv.abs() < A2L_OFV,
+        "OFV ferx {} vs NONMEM {}",
+        f.ofv,
+        est["OBJ"]
+    );
+    assert!(laplace_vs_focei > 1e4 * A2L_OFV, "{laplace_vs_focei}");
+    assert!(worst_level < A2_LEVEL, "{worst_level}");
+    assert!(worst_struct < A2_STRUCT_SE, "{worst_struct}");
+    assert!(worst_free < A2_LEVEL_SE, "{worst_free}");
+    assert!(worst_dep < A2_LEVEL_SE, "{worst_dep}");
+}
+
+/// ΔOFV realised 1.48e-8 (macOS arm64) against the anchor image's LAPLACE OBJ; NONMEM's
+/// own two images differ by 3.0e-8 here (101.974094188 / 101.974094158). Before #2538 the
+/// gap was 9.03e-5, all of it the `½log|H|` jitter. The other bands are A2's: realised
+/// worst level gap 2.45e-5 NONMEM SEs (`A2_LEVEL`, 4×), structural SE against the LAPLACE
+/// profile likelihood 5.3e-4 (`A2_STRUCT_SE`, whose floor is the reference's own δ
+/// extrapolation), free / dependent level SE against `$COV` 3.0e-3 / 4.2e-3
+/// (`A2_LEVEL_SE`, 4.7×). 3.3× over NONMEM's image spread.
+const A2L_OFV: f64 = 1e-7;

@@ -548,6 +548,9 @@ fn a_jet_rejection_says_the_derivatives_overflowed_not_that_the_method_failed() 
     // The count comes from a different sweep than the escalation counts, so the clause must
     // not phrase itself as a subset of them.
     assert!(!msg.contains("of those"), "{msg}");
+    // Beside an ordinary rejection (here also a failed fallback) the solver-knob advice is
+    // still true of those segments, so it stays — the other side of the #1347 gate.
+    assert!(msg.contains("consider a different ode_method"), "{msg}");
     // A clause literal wrapped without `\` continuations reaches the user as runs of
     // indentation. This is what caught it (#1207 review); every clause here is checked.
     assert!(
@@ -577,6 +580,11 @@ fn a_jet_rejection_alone_is_a_warning_not_an_info_note() {
     .expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning, "{msg}");
     assert!(msg.contains("analytic-sensitivity solve"), "{msg}");
+    // The jet clause says a different ode_method will not help; the general solver-knob
+    // advice must not follow it and say the opposite (#1347).
+    assert!(msg.contains("will not help"), "{msg}");
+    assert!(!msg.contains("consider a different ode_method"), "{msg}");
+    assert!(!msg.contains("ode_reltol"), "{msg}");
 }
 
 /// The clause stays out of the way of an ordinary rejection, which is the common case: a

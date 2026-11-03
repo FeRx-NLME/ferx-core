@@ -27,8 +27,8 @@ use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{individual_nll_into_with_schedule_cov, individual_nll_iov};
 use crate::types::{
-    BayesResult, CompiledModel, FitOptions, ModelParameters, OmegaMatrix, Population, SigmaVector,
-    Subject,
+    BayesResult, CompiledModel, EstimationMethod, FitOptions, ModelParameters, OmegaMatrix,
+    Population, SigmaVector, Subject,
 };
 use nalgebra::{Cholesky, DMatrix, DVector};
 use rand::rngs::StdRng;
@@ -863,7 +863,7 @@ pub fn run_bayes(
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
     let n_sigma = init_params.sigma.values.len();
-    if n_eta == 0 {
+    if EstimationMethod::Bayes.requires_random_effects() && n_eta == 0 {
         return Err("Bayesian estimation requires at least one random effect (eta)".to_string());
     }
 
@@ -2246,6 +2246,7 @@ pub fn run_bayes(
         ebe_convergence_warnings: ebe_stats.n_unconverged as u32,
         max_unconverged_subjects: ebe_stats.n_unconverged as u32,
         total_ebe_fallbacks: ebe_stats.n_fallback as u32,
+        total_ebe_nm_polished: ebe_stats.n_nm_polished as u32,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal: None,
@@ -2256,12 +2257,59 @@ pub fn run_bayes(
         left_init: None,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2588 (M13): a Bayes fit reports the posterior-mean inner loop's moved count in
+    /// `total_ebe_nm_polished` under `inner_optimizer = nelder_mead`. That loop is the only
+    /// inner solve the count reads (the sampler draws η by MH, not by a mode search), so it
+    /// is at most one per subject. Measured 9 of 10 at `inner_tol = 1e-5` (macOS arm64): the
+    /// loop is warm-started from the chains' η, and the tenth subject's stop was not moved
+    /// (with no fallback either), so the bound is `0 < n ≤ subjects`, not `n = subjects`.
+    /// Under the default optimizer it is 0. A short chain is enough: the count is about the
+    /// inner solve at the posterior mean, not the mixing.
+    #[test]
+    fn a_bayes_fit_reports_the_moved_subjects_under_nelder_mead() {
+        use crate::types::{FitOptions, InnerOptimizer};
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let run = |inner_optimizer| {
+            let opts = FitOptions {
+                method: EstimationMethod::Bayes,
+                inner_optimizer,
+                inner_tol: 1e-5,
+                bayes_warmup: 20,
+                bayes_iters: 20,
+                bayes_chains: 1,
+                bayes_seed: Some(1),
+                run_covariance_step: false,
+                verbose: false,
+                threads: Some(1),
+                ..Default::default()
+            };
+            crate::fit(&model, &pop, &model.default_params, &opts).expect("bayes runs")
+        };
+        let nm = run(InnerOptimizer::NelderMead);
+        eprintln!(
+            "bayes under nelder_mead: {} moved, {} fallbacks",
+            nm.total_ebe_nm_polished, nm.total_ebe_fallbacks
+        );
+        assert!(
+            nm.total_ebe_nm_polished > 0 && nm.total_ebe_nm_polished as usize <= pop.subjects.len(),
+            "{}",
+            nm.total_ebe_nm_polished
+        );
+        assert_eq!(run(InnerOptimizer::Auto).total_ebe_nm_polished, 0);
+    }
 
     #[test]
     fn kappa_block_sampled_iff_iov_present() {
