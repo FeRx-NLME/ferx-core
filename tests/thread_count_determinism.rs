@@ -89,9 +89,14 @@ fn assert_bit_identical_across_threads(label: &str, ofv_1: f64, ofv_4: f64, ofv_
 }
 
 fn run_saem_with_threads(n: usize) -> f64 {
+    run_saem_kernel_with_threads(n, ferx_core::types::SaemKernel::RandomWalk)
+}
+
+fn run_saem_kernel_with_threads(n: usize, kernel: ferx_core::types::SaemKernel) -> f64 {
     let (model, population) = warfarin();
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Saem;
+    opts.saem_kernel = kernel;
     // Small, fixed-length exploration/convergence phases (no adaptive stop) —
     // mirrors the fast SAEM setup in tests/importance_sampling_api.rs.
     opts.saem_n_exploration = 5;
@@ -116,6 +121,28 @@ fn saem_ofv_is_independent_of_thread_count() {
     let ofv_4 = run_saem_with_threads(4);
     let ofv_15 = run_saem_with_threads(15);
     assert_bit_identical_across_threads("SAEM", ofv_1, ofv_4, ofv_15);
+}
+
+/// The f-SAEM independent-MH kernel adds a per-subject MAP search and a cached
+/// proposal to the E-step, both carried through the rayon `map_init` fold. Its
+/// draws come from the same per-subject seeded RNG the random walk uses, so the
+/// same bit-identical-OFV guarantee has to hold — and the cache is the part that
+/// could plausibly break it, since it is threaded through the parallel iterator
+/// rather than rebuilt per subject.
+#[test]
+fn saem_imh_ofv_is_independent_of_thread_count() {
+    let kernel = ferx_core::types::SaemKernel::Imh;
+    let ofv_1 = run_saem_kernel_with_threads(1, kernel);
+    let ofv_4 = run_saem_kernel_with_threads(4, kernel);
+    let ofv_15 = run_saem_kernel_with_threads(15, kernel);
+    // Guard the fixture: if the IMH kernel silently declined this model we would
+    // be re-running the random walk three times and calling it a pass.
+    assert!(
+        (ofv_1 - run_saem_with_threads(1)).abs() > 1e-9,
+        "the IMH kernel produced the random walk's OFV exactly ({ofv_1}) — it is \
+         not engaging on this fixture, so this test is not testing it"
+    );
+    assert_bit_identical_across_threads("SAEM (imh)", ofv_1, ofv_4, ofv_15);
 }
 
 fn warfarin_iov() -> (

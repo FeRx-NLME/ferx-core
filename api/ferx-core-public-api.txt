@@ -2728,6 +2728,9 @@ pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
 pub enum ferx_core::types::RtteClock
 pub ferx_core::types::RtteClock::Forward
 pub ferx_core::types::RtteClock::Reset
+pub enum ferx_core::types::SaemKernel
+pub ferx_core::types::SaemKernel::Imh
+pub ferx_core::types::SaemKernel::RandomWalk
 pub enum ferx_core::types::SaemMstepSolver
 pub ferx_core::types::SaemMstepSolver::Bobyqa
 pub ferx_core::types::SaemMstepSolver::ScoreSa
@@ -3230,6 +3233,11 @@ pub ferx_core::types::FitOptions::saem_conddist: bool
 pub ferx_core::types::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::types::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::types::FitOptions::saem_conddist_nsamp: usize
+pub ferx_core::types::FitOptions::saem_imh_defensive: f64
+pub ferx_core::types::FitOptions::saem_imh_min_obs_per_eta: f64
+pub ferx_core::types::FitOptions::saem_imh_proposals: usize
+pub ferx_core::types::FitOptions::saem_imh_refresh: usize
+pub ferx_core::types::FitOptions::saem_kernel: ferx_core::SaemKernel
 pub ferx_core::types::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::types::FitOptions::saem_mstep_draws: usize
 pub ferx_core::types::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
@@ -4147,6 +4155,9 @@ pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
 pub enum ferx_core::RtteClock
 pub ferx_core::RtteClock::Forward
 pub ferx_core::RtteClock::Reset
+pub enum ferx_core::SaemKernel
+pub ferx_core::SaemKernel::Imh
+pub ferx_core::SaemKernel::RandomWalk
 pub enum ferx_core::SaemMstepSolver
 pub ferx_core::SaemMstepSolver::Bobyqa
 pub ferx_core::SaemMstepSolver::ScoreSa
@@ -4814,6 +4825,11 @@ pub ferx_core::FitOptions::saem_conddist: bool
 pub ferx_core::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::FitOptions::saem_conddist_nsamp: usize
+pub ferx_core::FitOptions::saem_imh_defensive: f64
+pub ferx_core::FitOptions::saem_imh_min_obs_per_eta: f64
+pub ferx_core::FitOptions::saem_imh_proposals: usize
+pub ferx_core::FitOptions::saem_imh_refresh: usize
+pub ferx_core::FitOptions::saem_kernel: ferx_core::SaemKernel
 pub ferx_core::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::FitOptions::saem_mstep_draws: usize
 pub ferx_core::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver

@@ -1419,7 +1419,7 @@ fn fit_inner(
         if chain.iter().any(|m| *m == EstimationMethod::Saem) {
             eprintln!(
                 "  sampler:  {}",
-                crate::estimation::saem::saem_sampler_summary(model, options)
+                crate::estimation::saem::saem_sampler_summary_for(model, population, options)
             );
         }
     }

@@ -12097,6 +12097,57 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.saem_mstep_draws = v;
         }
+        "saem_kernel" => {
+            opts.saem_kernel = match value.to_lowercase().as_str() {
+                "rw" | "random_walk" | "random-walk" | "mh" => crate::types::SaemKernel::RandomWalk,
+                "imh" | "fsaem" | "f-saem" => crate::types::SaemKernel::Imh,
+                other => {
+                    return Err(format!(
+                        "fit option `{key}`: unknown value `{other}` — expected rw/imh"
+                    ));
+                }
+            };
+        }
+        "saem_imh_proposals" => {
+            let v = parse_usize(key)?;
+            if v == 0 {
+                return Err(format!(
+                    "fit option `{key}` must be at least 1 — it is the number of \
+                     independent-MH proposals per subject per SAEM iteration, got {v}"
+                ));
+            }
+            opts.saem_imh_proposals = v;
+        }
+        "saem_imh_refresh" => {
+            let v = parse_usize(key)?;
+            if v == 0 {
+                return Err(format!(
+                    "fit option `{key}` must be at least 1 — it is the number of SAEM \
+                     iterations between rebuilds of a subject's IMH proposal, got {v}"
+                ));
+            }
+            opts.saem_imh_refresh = v;
+        }
+        "saem_imh_defensive" => {
+            let v = parse_f64(key)?;
+            if !(0.0..=0.5).contains(&v) {
+                return Err(format!(
+                    "fit option `{key}` must be in [0, 0.5] — it is the weight of the prior \
+                     component mixed into the IMH proposal, got {v}"
+                ));
+            }
+            opts.saem_imh_defensive = v;
+        }
+        "saem_imh_min_obs_per_eta" => {
+            let v = parse_f64(key)?;
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(format!(
+                    "fit option `{key}` must be a finite value >= 0 (0 disables the \
+                     information gate), got {v}"
+                ));
+            }
+            opts.saem_imh_min_obs_per_eta = v;
+        }
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "conddist" | "saem_conddist" => opts.saem_conddist = parse_bool("conddist")?,
         "conddist_nsamp" => opts.saem_conddist_nsamp = parse_usize("conddist_nsamp")?,
