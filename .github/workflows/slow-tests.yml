@@ -80,7 +80,8 @@ on:
       - 'Cargo.lock'                        # a nlopt/nalgebra/rand bump moves fit numbers and RNG streams
       - 'Cargo.toml'                        # the `ci-test` profile + the `slow-tests` / `survival` features
       - 'crates/**'                         # the workspace members — the job runs `--workspace`
-      - '!crates/docs-lint/**'              # ...except the one the command --excludes; see the run: step
+      - '!crates/docs-lint/**'              # ...except the ones the command --excludes; see the run: step
+      - '!crates/patterns-lint/**'          # (the test-code linter, #2634 — same reason as docs-lint)
       - 'data/**'                           # fixture CSVs the fits read by literal path
       - 'examples/**'                       # `.ferx` models the anchors load (e.g. the adaptive vanco suite)
       - 'nonmem_anchor/**'                  # committed NONMEM control streams, data and `.phi` references
@@ -239,13 +240,17 @@ jobs:
         # `--exclude` list, so adding or dropping one moves the path filter with it; and
         # the planner refuses build args whose `--exclude` disagrees with its suite's.
         #
+        # `--exclude patterns-lint` (#2634) for the same reasons: a test-code linter with
+        # its own seconds-long `Patterns lint` job, linking no workspace crate. Built here it
+        # would make a `crates/patterns-lint/**`-only push re-run the whole fit suite.
+        #
         # `timeout` is what makes an overrun visible. A job killed by `timeout-minutes` is
         # reported by GitHub as **`cancelled`, not `failure`** -- it does not read as a red
         # test. Exceeding the inner budget exits 124 and fails the step loudly instead.
         run: |
           timeout --signal=INT --kill-after=2m ${{ matrix.leg == 'core' && '60m' || '95m' }} \
             python3 tools/ci-test-shard.py run slow ${{ matrix.shard }} ${{ strategy.job-total }} --lib-parts 1 --manifest manifest -- \
-              --workspace --exclude docs-lint --no-default-features \
+              --workspace --exclude docs-lint --exclude patterns-lint --no-default-features \
               --features ${{ matrix.leg == 'core' && 'ferx-core/ci,ferx-core/survival,ferx-core/slow-tests,ferx-tools/slow-tests' || 'ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests' }} \
               --profile ci-test --no-fail-fast ${{ inputs.nocapture && '-- --nocapture' || '' }} \
             || { code=$?; \
@@ -320,7 +325,7 @@ jobs:
         run: |
           timeout --signal=INT --kill-after=2m 70m \
             python3 tools/ci-test-shard.py run slow-nn 1 1 --lib-parts 1 --list-all --manifest manifest -- \
-              --workspace --exclude docs-lint --no-default-features \
+              --workspace --exclude docs-lint --exclude patterns-lint --no-default-features \
               --features ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests \
               --profile ci-test --no-fail-fast ${{ inputs.nocapture && '-- --nocapture' || '' }} \
             || { code=$?; \

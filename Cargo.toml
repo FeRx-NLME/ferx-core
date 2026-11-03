@@ -13,8 +13,10 @@
 [workspace]
 # `crates/docs-lint` is dev tooling, not part of the boundary above: it is a
 # member so it gets rustfmt / clippy / `cargo test`, it depends on nothing (not
-# even `ferx-core`), and nothing depends on it. See #1163.
-members = ["crates/ferx-tools", "crates/ferx-cli", "crates/docs-lint"]
+# even `ferx-core`), and nothing depends on it. See #1163. `crates/patterns-lint`
+# (#2634) is the same kind of member: source-pattern lints over test code, which
+# depends on no workspace crate (only `syn`) and which nothing depends on.
+members = ["crates/ferx-tools", "crates/ferx-cli", "crates/docs-lint", "crates/patterns-lint"]
 # Required to PRESERVE existing behaviour, not to change it: a standalone
 # edition-2021 package gets resolver v2 implicitly, but inside a workspace the
 # root package's edition no longer implies it — cargo would warn and fall back
