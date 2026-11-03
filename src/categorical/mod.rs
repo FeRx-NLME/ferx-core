@@ -157,11 +157,10 @@ struct BinaryRecordLp<'a> {
 
 /// The binary endpoints of `model`, in ascending CMT order.
 ///
-/// **Never iterate `model.endpoints` directly when the result is observable.** It is a
-/// `HashMap`, so its iteration order is randomized per process — RNG consumption order,
+/// `model.endpoints` is a `BTreeMap` (#2531), so it already iterates in ascending CMT
+/// order; this helper exists to filter to the binary family. RNG consumption order,
 /// emitted row order, and therefore `simulate_with_seed`'s reproducibility all depend on
-/// visiting endpoints deterministically. `binary_cmts()` sorts, which is why the
-/// `--simulate` template builder already uses it.
+/// visiting endpoints in that fixed order.
 fn binary_endpoints(model: &CompiledModel) -> impl Iterator<Item = (usize, &EndpointLikelihood)> {
     model
         .binary_cmts()
@@ -296,11 +295,9 @@ pub(crate) fn binary_subject_nll(
         // changes. (Gaussian is scored by the residual path, TTE by the hazard dispatch.)
         if let EndpointLikelihood::Binary { link, lp_fn, .. } = endpoint {
             // `binary_data_term` filters `obs_records` by `cmt` itself, so no records
-            // are copied. `binary_endpoints` does allocate a small sorted `Vec` of CMTs
-            // per call — deliberate even on this hot path (the FD-Hessian closure): the
-            // sum below is over f64s, so a `HashMap`-order walk would make the OFV
-            // ULP-nondeterministic across processes for a multi-endpoint model. One
-            // 1-2 element Vec is the price of a reproducible objective.
+            // are copied. The sum below is over f64s, so its order must be fixed for the
+            // OFV to be bit-reproducible on a multi-endpoint model: `binary_endpoints`
+            // walks ascending CMT, the same order `model.endpoints` iterates (#2531).
             nll += binary_data_term(
                 *link,
                 lp_fn,

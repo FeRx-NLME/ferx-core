@@ -3855,7 +3855,7 @@ mod tests {
             output_columns: vec![],
             dose_attr_map: Default::default(),
             #[cfg(feature = "survival")]
-            endpoints: HashMap::new(),
+            endpoints: std::collections::BTreeMap::new(),
             frem_config: Some(FremConfig {
                 fremtype_to_indices: {
                     let mut m = HashMap::new();

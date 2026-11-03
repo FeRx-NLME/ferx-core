@@ -6064,7 +6064,7 @@ pub fn parse_full_model_with(
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta,
         // Populated below from the optional [initial_conditions] block (#521).
@@ -19738,7 +19738,7 @@ pub(crate) fn level_index_column(block: &str) -> String {
 /// block read through an individual parameter counts.
 #[cfg(feature = "survival")]
 fn level_record_cmts(
-    endpoints: &HashMap<usize, crate::types::EndpointLikelihood>,
+    endpoints: &std::collections::BTreeMap<usize, crate::types::EndpointLikelihood>,
     index: &str,
 ) -> Vec<usize> {
     let mut cmts: Vec<usize> = Vec::new();

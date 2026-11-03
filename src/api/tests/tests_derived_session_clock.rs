@@ -92,7 +92,7 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         derived_exprs,
         output_columns: Vec::new(),
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),

@@ -2029,7 +2029,7 @@ fn make_model() -> CompiledModel {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
@@ -2369,7 +2369,7 @@ fn test_outer_ad_gradient_block_omega() {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
@@ -2873,7 +2873,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
     };
 
     let n_subj = 6;

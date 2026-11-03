@@ -605,7 +605,9 @@ alongside the all-cause survival `S_all(t) = exp(−Σ_j H_j(t))`. In the presen
 of competing risks the naive `1 − exp(−H_k)` *over*-states a cause's incidence
 (it ignores that the other causes remove subjects from risk); the reported CIF is
 the correct quantity, and across all causes `Σ_k F_k(t) + S_all(t) = 1` exactly.
-For a single endpoint it reduces to `F(t) = 1 − S(t)`.
+For a single endpoint it reduces to `F(t) = 1 − S(t)`. Each subject's rows come
+in ascending CMT order, the same on every call, and so do the bits of `S_all` and
+the CIFs.
 
 **Estimation note.** The cause-specific *rates* are well-identified and recover
 tightly. The shared frailty variance ω² is weakly identified for TTE and reads

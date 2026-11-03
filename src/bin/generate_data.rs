@@ -265,7 +265,7 @@ fn build_warfarin_model() -> CompiledModel {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
@@ -409,7 +409,7 @@ fn generate_two_cpt_iv() {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
@@ -555,7 +555,7 @@ fn generate_two_cpt_oral_cov() {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
@@ -769,7 +769,7 @@ fn generate_mm_oral() {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),

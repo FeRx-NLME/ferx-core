@@ -1,6 +1,26 @@
 use super::*;
 use approx::assert_relative_eq;
 
+/// `CompiledModel.endpoints` iterates in ascending CMT order — not declaration order, not
+/// a hash order — on every compile (#2531): the contract every sum, row and message over
+/// endpoints rests on. The blocks are declared in descending CMT order so declaration
+/// order and CMT order disagree. Mutation: revert the field to a `HashMap` (which also
+/// reddens the per-site order tests).
+#[cfg(feature = "survival")]
+#[test]
+fn endpoints_iterate_in_ascending_cmt_order_on_every_compile() {
+    use crate::survival::endpoint_order_test_helpers::COMPILES;
+    let src = "[parameters]\n  theta TVA(0.10, 0.001, 10.0)\n\
+               [event_model c]\n  cmt = 4\n  family = exponential\n  scale = TVA\n\
+               [event_model b]\n  cmt = 3\n  family = exponential\n  scale = TVA\n\
+               [event_model a]\n  cmt = 2\n  family = exponential\n  scale = TVA\n";
+    for k in 0..COMPILES {
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let keys: Vec<usize> = m.endpoints.keys().copied().collect();
+        assert_eq!(keys, vec![2, 3, 4], "compile {k}");
+    }
+}
+
 /// Phase 4.0: the `Category` / `Count` `SimOutcome` variants compile
 /// unconditionally (shared categorical/count/Markov draw shapes) and derive
 /// Debug/Clone. The Gaussian path is unchanged.

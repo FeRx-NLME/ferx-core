@@ -642,7 +642,8 @@ pub(crate) fn tte_endpoint_nll_for_tests(
 /// in those two callees, touching no dispatch site.
 ///
 /// It accumulates **into `acc` per term** — one `factor * term` add per TTE endpoint (in
-/// `model.endpoints` iteration order), then one for the discrete term — rather than returning
+/// ascending CMT order, the `BTreeMap` order of `model.endpoints`, so the sum is the same on
+/// every compile — #2531), then one for the discrete term — rather than returning
 /// a folded sum, so a running `data_ll` that already holds the Gaussian residual term stays
 /// **bit-identical** to the previously-inlined loop. Returning `-> f64` and adding
 /// `factor * sum` once would reassociate the floating-point adds and perturb the FOCEI hot
@@ -669,7 +670,7 @@ pub(crate) fn accumulate_non_gaussian_nll(
 ) {
     // Callers gate on `!subject.obs_records.is_empty()`, so an empty subject never reaches
     // here; both loops below are also natural no-ops on one.
-    // TTE endpoints — one `factor * raw` add each, in endpoints iteration order.
+    // TTE endpoints — one `factor * raw` add each, in ascending CMT order.
     for (cmt, endpoint) in &model.endpoints {
         if let EndpointLikelihood::Tte {
             hazard, recurrence, ..
@@ -2159,10 +2160,12 @@ fn non_gaussian_mode_terms(
     // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
     // Iterate model.endpoints (typically 1–3 entries) rather than scanning
     // obs_records for unique CMTs — avoids the HashSet and one pass over records.
+    // It is a `BTreeMap`, so both sums below run in ascending CMT order and are
+    // bit-identical on every compile (#2531).
     let n_eta = eta_hat.len();
     let mut tte_nll_at_mode = 0.0_f64;
     let mut tte_h = DMatrix::<f64>::zeros(n_eta, n_eta);
-    // Per-CMT terms for the part sink, in CMT order (`endpoints` is a hash map).
+    // Per-CMT terms for the part sink, in CMT order.
     let mut tte_parts: Vec<(usize, f64)> = Vec::new();
 
     for (cmt, endpoint) in &model.endpoints {
@@ -5089,6 +5092,10 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
 #[path = "non_gaussian_eta_hessian_tests.rs"]
 mod non_gaussian_eta_hessian_tests;
 
+#[cfg(all(test, feature = "survival"))]
+#[path = "endpoint_order_tests.rs"]
+mod endpoint_order_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5405,7 +5412,7 @@ mod tests {
             derived_exprs: vec![],
             output_columns: vec![],
             #[cfg(feature = "survival")]
-            endpoints: std::collections::HashMap::new(),
+            endpoints: std::collections::BTreeMap::new(),
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),

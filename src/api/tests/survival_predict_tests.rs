@@ -633,3 +633,152 @@ fn supplied_eta_survival_without_etas_is_the_population_curve() {
         assert_eq!(all_bits(i), all_bits(q));
     }
 }
+
+// ── endpoint order (#2531) ───────────────────────────────────────────────────
+
+use crate::survival::endpoint_order_test_helpers::{EndpointOrderFixture, COMPILES};
+
+/// Each subject's CMT blocks, in the order `predict_survival` emitted them.
+fn cmt_blocks(rows: &[SurvivalPredictionResult]) -> Vec<(String, Vec<usize>)> {
+    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
+    for r in rows {
+        match out.last_mut() {
+            Some((id, cmts)) if *id == r.id => {
+                if cmts.last() != Some(&r.cmt) {
+                    cmts.push(r.cmt);
+                }
+            }
+            _ => out.push((r.id.clone(), vec![r.cmt])),
+        }
+    }
+    out
+}
+
+/// `predict_survival` emits each subject's CMT blocks in ascending CMT order, on every one
+/// of `COMPILES` compiles, for the two- and the three-cause model.
+///
+/// Straddle: the fixture has ≥ 2 TTE CMTs and some subject carries rows on all of them,
+/// so a block order that follows the map can be out of order. At `314b89fb` the two-cause
+/// model came out `[3, 2]` on 27 of 40 compiles. Mutation: walk a per-call
+/// `std::collections::HashMap` copy of `model.endpoints` in the subject loop.
+#[test]
+fn predict_survival_rows_are_in_ascending_cmt_order_on_every_compile() {
+    for (label, fx) in [
+        ("two-cause", EndpointOrderFixture::two_cause()),
+        ("three-cause", EndpointOrderFixture::three_cause()),
+    ] {
+        let cmts = fx.cmts();
+        assert!(cmts.len() >= 2, "{label}: {cmts:?}");
+        for k in 0..COMPILES {
+            let (m, pop) = fx.compile();
+            let rows = predict_survival(&m, &pop, &m.default_params, &GRID).expect("predict");
+            let blocks = cmt_blocks(&rows);
+            assert_eq!(
+                blocks.len(),
+                pop.subjects.len(),
+                "{label}: one run per subject"
+            );
+            assert!(
+                blocks.iter().any(|(_, b)| b.len() == cmts.len()),
+                "{label}: no subject carries rows on every CMT: the order is unobservable"
+            );
+            for (id, b) in &blocks {
+                assert!(
+                    b.windows(2).all(|w| w[0] < w[1]),
+                    "{label}, compile {k}, subject {id}: CMT blocks {b:?} are not ascending"
+                );
+            }
+        }
+    }
+}
+
+/// The competing-risks `survival_all` and `cif` (and each row's `cum_hazard`) are the same
+/// bits on every compile: `cif_curves` sums every cause's `H_j` in the order the rows
+/// were collected, so with a map-ordered walk the values moved too, not only the rows.
+/// At `314b89fb` 40 compiles gave 2 distinct bit patterns for two causes and 6 for three.
+///
+/// Mutation: as for the row-order test, at the same site.
+#[test]
+fn predict_survival_cif_bits_are_the_same_on_every_compile() {
+    let bits = |r: &SurvivalPredictionResult| {
+        (
+            r.id.clone(),
+            r.cmt,
+            r.survival_all.to_bits(),
+            r.cif.to_bits(),
+            r.cum_hazard.to_bits(),
+        )
+    };
+    for (label, fx) in [
+        ("two-cause", EndpointOrderFixture::two_cause()),
+        ("three-cause", EndpointOrderFixture::three_cause()),
+    ] {
+        let (m, pop) = fx.compile();
+        let first = predict_survival(&m, &pop, &m.default_params, &GRID).expect("predict");
+        assert!(
+            first
+                .iter()
+                .all(|r| r.cif.is_finite() && r.survival_all.is_finite()),
+            "{label}"
+        );
+        let mut want: Vec<_> = first.iter().map(bits).collect();
+        // Compare as sets of rows, so this test sees the values and not the row order.
+        want.sort_unstable();
+        for k in 0..COMPILES {
+            let (m, pop) = fx.compile();
+            let mut got: Vec<_> = predict_survival(&m, &pop, &m.default_params, &GRID)
+                .expect("predict")
+                .iter()
+                .map(bits)
+                .collect();
+            got.sort_unstable();
+            assert!(got == want, "{label}, compile {k}: the rows' bits moved");
+        }
+    }
+}
+
+/// The FOCEI objective of a three-cause model is the same bits on every compile
+/// (`outer_maxiter = 0`, so one objective evaluation at the initial estimates). At
+/// `314b89fb` 20 compiles gave two values, 62.27735612341481897 and …82607: 1 ULP.
+///
+/// **Negative control, same test:** the two-cause model's objective is asserted too, but
+/// it is order-free even under a map-ordered walk — its two TTE terms are added from
+/// zero, and `(0 + a) + b == (0 + b) + a` exactly — so it is the tautology this test
+/// does not rest on. The straddle is the three-cause leg's.
+#[test]
+fn focei_objective_of_a_three_cause_model_is_the_same_bits_on_every_compile() {
+    use crate::types::{EstimationMethod, FitOptions};
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    for (label, fx) in [
+        ("three-cause", EndpointOrderFixture::three_cause()),
+        (
+            "two-cause (negative control)",
+            EndpointOrderFixture::two_cause(),
+        ),
+    ] {
+        let mut ofvs: Vec<u64> = Vec::new();
+        for _ in 0..COMPILES {
+            let (m, pop) = fx.compile();
+            let r = super::fit(&m, &pop, &m.default_params, &opts).expect("fit");
+            assert!(r.ofv.is_finite(), "{label}: {}", r.ofv);
+            ofvs.push(r.ofv.to_bits());
+        }
+        ofvs.sort_unstable();
+        ofvs.dedup();
+        assert_eq!(
+            ofvs.len(),
+            1,
+            "{label}: the objective took {} distinct values over {COMPILES} compiles: {:?}",
+            ofvs.len(),
+            ofvs.iter().map(|&b| f64::from_bits(b)).collect::<Vec<_>>()
+        );
+    }
+}

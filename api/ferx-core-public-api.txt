@@ -2888,7 +2888,7 @@ pub ferx_core::types::CompiledModel::diffusion_state_indices: alloc::vec::Vec<us
 pub ferx_core::types::CompiledModel::diffusion_theta_start: core::option::Option<usize>
 pub ferx_core::types::CompiledModel::dose_attr_map: ferx_core::DoseAttrMap
 pub ferx_core::types::CompiledModel::dv_pre_logged: bool
-pub ferx_core::types::CompiledModel::endpoints: std::collections::hash::map::HashMap<usize, ferx_core::EndpointLikelihood>
+pub ferx_core::types::CompiledModel::endpoints: alloc::collections::btree::map::BTreeMap<usize, ferx_core::EndpointLikelihood>
 pub ferx_core::types::CompiledModel::error_model: ferx_core::ErrorModel
 pub ferx_core::types::CompiledModel::error_spec: ferx_core::ErrorSpec
 pub ferx_core::types::CompiledModel::eta_map: alloc::vec::Vec<i32>
@@ -4398,7 +4398,7 @@ pub ferx_core::CompiledModel::diffusion_state_indices: alloc::vec::Vec<usize>
 pub ferx_core::CompiledModel::diffusion_theta_start: core::option::Option<usize>
 pub ferx_core::CompiledModel::dose_attr_map: ferx_core::DoseAttrMap
 pub ferx_core::CompiledModel::dv_pre_logged: bool
-pub ferx_core::CompiledModel::endpoints: std::collections::hash::map::HashMap<usize, ferx_core::EndpointLikelihood>
+pub ferx_core::CompiledModel::endpoints: alloc::collections::btree::map::BTreeMap<usize, ferx_core::EndpointLikelihood>
 pub ferx_core::CompiledModel::error_model: ferx_core::ErrorModel
 pub ferx_core::CompiledModel::error_spec: ferx_core::ErrorSpec
 pub ferx_core::CompiledModel::eta_map: alloc::vec::Vec<i32>

@@ -236,7 +236,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         derived_exprs: Vec::new(),
         output_columns: Vec::new(),
         #[cfg(feature = "survival")]
-        endpoints: HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
