@@ -17,25 +17,26 @@ use std::io::Write;
 /// the simulation runs on the `DV = .` design template, the fit on the population it wrote
 /// back. `W_NEGATIVE_LAG_SCALE` is therefore the wrong choice — it reads `|DV|`, so it is
 /// inert on the template and fires only on the fit half (measured: the unfiltered-append
-/// mutation stayed green on it). `W_NEGATIVE_LAGTIME` reads the model at its typical values
-/// and nothing else, so both halves raise it in identical wording.
+/// mutation stayed green on it). `W_TRANSIT_FLIP_FLOP` reads the model at its typical values
+/// and the subjects' covariates, which the two halves share, so both raise it in identical
+/// wording. (This used `W_NEGATIVE_LAGTIME` until #1189 made a negative lag a fit error.)
 const MODEL: &str = r#"
 [parameters]
   theta TVCL(1.0, 0.001, 100.0)
-  theta TVV(20.0, 0.001, 500.0)
-  theta TVKA(1.0, 0.001, 50.0)
-  theta TVLAG(-0.5, -10.0, 10.0)
+  theta TVV(2.0, 0.001, 500.0)
+  theta TVNTR(3.0, 0.001, 20.0)
+  theta TVMTT(50.0, 0.001, 500.0)
   omega ETA_CL ~ 0.09
   sigma PROP ~ 0.1
 
 [individual_parameters]
-  CL      = TVCL * exp(ETA_CL)
-  V       = TVV
-  KA      = TVKA
-  lagtime = TVLAG
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  NTR = TVNTR
+  MTT = TVMTT
 
 [structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=lagtime)
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
 
 [error_model]
   DV ~ proportional(PROP)
@@ -64,7 +65,7 @@ const MODEL: &str = r#"
 /// the presence check has to come first and the message has to be one the bundle owns.
 #[test]
 fn a_simulate_run_reports_each_model_data_finding_exactly_once() {
-    const NEGATIVE_LAG: &str = "Negative lagtimes are physically nonsensical";
+    const FLIP_FLOP: &str = "the flip-flop regime";
 
     let dir = tempfile::tempdir().expect("tempdir");
     let model_path = dir.path().join("sim.ferx");
@@ -76,7 +77,7 @@ fn a_simulate_run_reports_each_model_data_finding_exactly_once() {
     let n = result
         .warnings
         .iter()
-        .filter(|w| w.contains(NEGATIVE_LAG))
+        .filter(|w| w.contains(FLIP_FLOP))
         .count();
     assert!(
         n > 0,
@@ -94,7 +95,7 @@ fn a_simulate_run_reports_each_model_data_finding_exactly_once() {
     let structured = result
         .warnings_structured
         .iter()
-        .filter(|e| e.message.contains(NEGATIVE_LAG))
+        .filter(|e| e.message.contains(FLIP_FLOP))
         .count();
     assert_eq!(
         structured, 1,

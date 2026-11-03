@@ -204,6 +204,9 @@ fn run_covsearch_command(args: &[String]) -> Result<i32, String> {
                 ),
                 None => eprintln!("Step {step} ({}): nothing accepted", phase.label()),
             },
+            // Per-candidate lines (#2512) are for log sinks; the CLI keeps to
+            // one line per step.
+            _ => {}
         }
     };
 

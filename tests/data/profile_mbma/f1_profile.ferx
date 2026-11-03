@@ -1,0 +1,40 @@
+# Fixture F1 of the #1065 profile tests: `tests/data/mbma_placebo/mbma_placebo.ferx`
+# with its placebo block declared `profile`. Linear in (eta, kappa) with a data-only
+# coefficient, so the profile solve takes one Newton step. Data:
+# `tests/data/mbma_placebo/mbma_placebo.csv`.
+#
+# The unprofiled twin is this file with the block line read as
+# `theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)`.
+
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  theta EMAX(8.0, 0.0, 100.0)
+  theta ED50(20.0, 0.1, 1000.0)
+  theta ET50(2.0, 0.01, 100.0)
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile
+
+  omega ETA_E0 ~ 4.0 (sd)
+  kappa KAPPA_ARM ~ 4.0 (sd) weight = NARM
+
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[covariates]
+  STUDY categorical
+  NARM  continuous
+  SE    continuous
+  DOSE  continuous
+
+[individual_parameters]
+  BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM
+
+[structural_model]
+  DRUG = EMAX * DOSE / (ED50 + DOSE) * TIME / (TIME + ET50)
+  y    = BASE - DRUG
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = SE
+
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  covariance = true

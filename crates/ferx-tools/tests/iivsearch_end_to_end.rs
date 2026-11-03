@@ -331,12 +331,14 @@ fn a_block_candidate_is_the_hand_written_block_seeded_from_the_ebes() {
     let ours = evaluate(&generated, &base);
     let theirs = evaluate(&hand_written, &base);
     // Two spellings of one number (`{:.15e}` versus the edit's 15
-    // significant digits) can differ in the last ULP; the objectives agree
-    // to well inside anything a search decides on.
+    // significant digits) can differ in the last ULP, and since #2093 each
+    // spelling's gradient is recorded on its own tape, so the two fits agree to
+    // rounding rather than to the bit. Measured |ΔOFV| = 2.3e-9 on Linux (1.0e-9
+    // on macOS arm64); ~10× headroom, far inside anything a search decides on.
     let gap = (ours.ofv - theirs.ofv).abs();
     eprintln!("block twin |ΔOFV| = {gap:.3e}");
     assert!(
-        gap < 1e-9,
+        gap < 2.5e-8,
         "generated {} vs hand-written {}",
         ours.ofv,
         theirs.ofv

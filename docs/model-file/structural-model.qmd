@@ -157,6 +157,8 @@ See [ODE Models](ode-models.qmd) for full ODE syntax and
 
 ## Compartment-Free Models (the `$PRED` equivalent)
 
+> **Maturity: beta** ([#811](https://github.com/FeRx-NLME/ferx-core/issues/811)).
+
 Not every structural model is a compartment system. A dose-response curve, a
 response time-course, or a published meta-regression equation is just an
 equation: given the parameters and the row's data, compute the prediction. That
@@ -304,9 +306,10 @@ rewriting the reference as `K / sqrt(NARM)`, which reaches the equation as an
 ordinary individual parameter.
 
 Finite differences are used — correctly, just more slowly, and reported as FD
-rather than claimed as analytic — past the axis caps: more than 24 estimated
-`(θ, η)` without `kappa`, more than 24 `(θ, η, kappa)` per occasion with it, or
-more than 96 stacked `(θ, η, kappa₁…kappa_K)` axes across a subject's occasions.
+rather than claimed as analytic — past the width cap: more than 48 random effects
+for a subject, counting the stacked `(η, kappa₁…kappa_K)` across its occasions
+under IOV (24 for Laplace's exact anchor).
+The number of θ does not count.
 
 See [Scaling](scaling.qmd) for the Form C readout on top of a *compartment*
 model, which shares this grammar.

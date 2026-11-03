@@ -962,21 +962,26 @@ fn dispatch_nocapture_input_is_boolean_and_conditional() {
          non-empty string and always true: {body:?}"
     );
 
-    // The cargo command carries the expression, after `--no-fail-fast`.
+    // Each cargo command carries the expression, after its own `--no-fail-fast`
+    // (since #2182 there are two: the sharded legs and the nn job).
     let stripped = lines.join("\n");
-    let at = stripped.find(EXPR).unwrap_or_else(|| {
-        panic!("the slow-tests cargo command must carry `{EXPR}` (outside comments)")
-    });
-    let nff = stripped
-        .find("--no-fail-fast")
-        .expect("the cargo command passes --no-fail-fast");
+    let ats: Vec<usize> = stripped.match_indices(EXPR).map(|(at, _)| at).collect();
     assert!(
-        nff < at,
-        "`{EXPR}` must come after `--no-fail-fast`: its `--` ends cargo's own arguments"
+        !ats.is_empty(),
+        "the slow-tests cargo command must carry `{EXPR}` (outside comments)"
     );
+    for at in ats {
+        // The command the expression ends: back to the step's `run: |`.
+        let start = stripped[..at].rfind("run: |").unwrap_or(0);
+        assert!(
+            stripped[start..at].contains("--no-fail-fast"),
+            "`{EXPR}` must come after `--no-fail-fast` in the same command: its `--` \
+             ends cargo's own arguments"
+        );
+    }
 
     // And nowhere is `--nocapture` passed unconditionally.
-    let rest = stripped.replacen(EXPR, "", 1);
+    let rest = stripped.replace(EXPR, "");
     assert!(
         !rest.contains("--nocapture"),
         "`--nocapture` appears outside the dispatch-gated expression — every nightly would \

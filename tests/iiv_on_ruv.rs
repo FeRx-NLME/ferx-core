@@ -89,7 +89,8 @@ fn iiv_on_ruv_rejects_an_eta_shared_inside_one_exp() {
         .expect("warfarin data must load");
     let opts = FitOptions::default();
     let err = fit(&shared, &population, &shared.default_params, &opts)
-        .expect_err("a shared iiv_on_ruv eta must be refused");
+        .expect_err("a shared iiv_on_ruv eta must be refused")
+        .to_string();
     assert!(
         err.contains("iiv_on_ruv = ETA_RUV")
             && err.contains("also used in [individual_parameters]"),
@@ -106,7 +107,8 @@ fn iiv_on_ruv_rejects_non_interaction_foce() {
     opts.method = EstimationMethod::Foce; // non-interaction
     opts.methods = vec![];
     let err = fit(&model, &population, &model.default_params, &opts)
-        .expect_err("non-interaction FOCE with iiv_on_ruv must be rejected");
+        .expect_err("non-interaction FOCE with iiv_on_ruv must be rejected")
+        .to_string();
     assert!(
         err.contains("iiv_on_ruv") && err.to_lowercase().contains("interaction"),
         "unexpected error: {err}"

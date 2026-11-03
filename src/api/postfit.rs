@@ -21,12 +21,10 @@ use crate::sim::adaptive::{
     DoseLedgerEntry, MonitorSpec,
 };
 use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
+    build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov_cov,
+    foce_subject_nll_iov_linearized, iov_linearization, population_variance_preds_iov,
 };
-use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
-    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
-};
+use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::{RngExt, SeedableRng};
@@ -389,7 +387,7 @@ pub(crate) fn is_last_estimating_stage(
 ///
 /// The #1006 post-fit warning says a fixed-effects-only GN result "may be badly
 /// wrong". That is only true if nothing re-optimises it. `run_foce_gn` exempts
-/// `gn_hybrid` itself, but it cannot exempt a hand-written `methods = [gn, focei]`
+/// `gn_hybrid` itself, but it cannot exempt a hand-written `method = [gn, focei]`
 /// chain — `fit_inner` blanks `stage_opts.methods` per stage, so the GN stage sees
 /// `method = gn` and no chain. This is the other half of that exemption, applied
 /// where the chain *is* visible: a GN stage followed by a further estimating stage
@@ -532,6 +530,10 @@ pub(crate) fn sir_unavailable_warning(
 /// unit test with a controlled (tame) proposal, rather than relying on a real
 /// non-PD fit — which the optimizer's fixed warmup budget cannot reach and a
 /// degenerate fixture cannot reliably survive in SIR (#264).
+///
+/// The draws re-solve from the fit's joint mode, `eta_hats` with `kappas`, as the normal
+/// SIR's do, so an IOV draw does not restart κ at 0 (#2261). Built here rather than by the
+/// caller, so the unit test that reaches this path sees the warm start the fit hands.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_sir_fallback(
     options: &FitOptions,
@@ -542,6 +544,7 @@ pub(crate) fn resolve_sir_fallback(
     population: &Population,
     params: &ModelParameters,
     eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
     ofv: f64,
     warnings: &mut Vec<String>,
 ) -> Option<crate::estimation::sir::SirResult> {
@@ -562,8 +565,9 @@ pub(crate) fn resolve_sir_fallback(
     if options.verbose {
         eprintln!("\nRunning SIR fallback (non-PD Hessian)...");
     }
+    let warm = crate::estimation::outer_optimizer::joint_warm_starts(eta_hats, kappas);
     match crate::estimation::sir::run_sir_core(
-        model, population, params, eta_hats, proposal, ofv, options,
+        model, population, params, &warm, proposal, ofv, options,
     ) {
         Ok(sir) => {
             for w in &sir.warnings {
@@ -576,6 +580,30 @@ pub(crate) fn resolve_sir_fallback(
             None
         }
     }
+}
+
+/// Copy a SIR run onto `out` (#1713): the one mapping from `SirResult` to the
+/// `FitResult` SIR fields, shared by `fit()` and `run_sir`.
+///
+/// `normal` is the SIR on the covariance-step proposal; `fallback` the one on
+/// the non-PD fallback proposal (`resolve_sir_fallback`). The normal run wins
+/// when both are present. With neither, every SIR field is cleared, so a fit
+/// whose SIR did not run reports `sir_seed = None` whatever seed it was handed
+/// (#1758).
+pub(crate) fn apply_sir_result(
+    out: &mut FitResult,
+    normal: Option<&crate::estimation::sir::SirResult>,
+    fallback: Option<&crate::estimation::sir::SirResult>,
+) {
+    let sir = normal.or(fallback);
+    out.sir_ci_theta = sir.map(|s| s.ci_theta.clone());
+    out.sir_ci_omega = sir.map(|s| s.ci_omega.clone());
+    out.sir_ci_sigma = sir.map(|s| s.ci_sigma.clone());
+    out.sir_ci_kappa = sir.and_then(|s| s.kappa_ci());
+    out.sir_ess = sir.map(|s| s.effective_sample_size);
+    out.sir_resamples_packed = sir.and_then(|s| s.resamples_packed.clone());
+    out.sir_seed = sir.map(|s| s.settings.seed);
+    out.sir_settings = sir.map(|s| s.settings.clone());
 }
 
 pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
@@ -614,7 +642,8 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
 /// handed in are the MIXEST-class EBEs, so building predictions from them with
 /// `MIXNUM` left at its class-1 default would pair a class-2 η̂ with class-1
 /// typical values and silently corrupt IPRED/PRED/IWRES/CWRES (and the per-subject
-/// OFV) for every subject the fit assigned to another class.
+/// OFV) for every subject the fit assigned to another class. For the same reason
+/// the subject's Ω and Σ are its class's (`mixture::class_params`), not the base.
 ///
 /// # Parallel over subjects, and why the stats come back as a value (#1329)
 ///
@@ -657,9 +686,18 @@ pub(crate) fn compute_subject_results(
             let stats_scope =
                 collect_solver_stats.then(crate::ode::solver::SolverStatsScope::enter);
             // Hold this subject's fitted class for the whole per-subject block.
-            let _mix_guard = mixest
-                .and_then(|m| m.get(i))
-                .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+            let class = mixest.and_then(|m| m.get(i)).copied();
+            let _mix_guard =
+                class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+            // ...and that class's Ω and Σ (#2266 review 3): the guard moves only
+            // `MIXNUM`, so scoring IWRES/CWRES and the OFV contribution with the base
+            // (class-1) Ω/Σ would describe a class-2 subject by class 1's residual
+            // model — and `name_nonfinite_subjects` selects on that contribution.
+            // Class 1's entries equal the base, so a class-1 subject is unchanged.
+            let class_params = class
+                .filter(|_| params.mixture.is_some())
+                .map(|c| crate::estimation::mixture::class_params(params, c));
+            let params = class_params.as_ref().unwrap_or(params);
             let eta = &eta_hats[i];
             let h = &h_matrices[i];
             let kappas: &[DVector<f64>] = if i < kappas_per_subject.len() {
@@ -686,7 +724,33 @@ pub(crate) fn compute_subject_results(
             // yet supported on the IOV path (tracked as follow-up), so they stay empty.
             // For all other subjects: compute_predictions_with_states returns both ipred
             // and the per-obs compartment state vector in one pass.
-            let (ipred, compartment_states) = if !kappas.is_empty() {
+            //
+            // An IOV subject's linearization is built once, here, and shared by IPRED,
+            // CWRES and the OFV contribution below — the same `[η, κ₁…κ_K]` system the
+            // fit's marginal scored (#1948).
+            let omega_iov = (!kappas.is_empty()).then(|| {
+                params
+                    .omega_iov
+                    .as_ref()
+                    .expect("omega_iov present when kappas non-empty")
+            });
+            let iov_lin = omega_iov.and_then(|omega_iov| {
+                iov_linearization(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta,
+                    h,
+                    &params.omega,
+                    kappas,
+                    omega_iov,
+                )
+            });
+            let (ipred, compartment_states) = if let Some(lin) = &iov_lin {
+                (lin.ipreds.clone(), vec![])
+            } else if !kappas.is_empty() {
+                // κ shape mismatch (never produced by the EBE pipeline): the OFV below
+                // is the marginal's sentinel and CWRES is NaN; IPRED is still f(η̂, κ̂).
                 let kappa_slices: Vec<Vec<f64>> =
                     kappas.iter().map(|k| k.as_slice().to_vec()).collect();
                 let iov_ipred = crate::pk::predict_iov(
@@ -748,7 +812,7 @@ pub(crate) fn compute_subject_results(
             // ordinary observation, so it keeps its IWRES (and its weight in
             // ε-shrinkage, which counts the finite ones) — #1499.
             for (j, c) in subject.cens.iter().enumerate() {
-                if model.bloq_method.is_censored_row(*c) {
+                if model.bloq_in_force().is_censored_row(*c) {
                     iwres[j] = f64::NAN;
                 }
             }
@@ -763,50 +827,85 @@ pub(crate) fn compute_subject_results(
             // fit, the population prediction f(η=0) under FOCE — which is what
             // NONMEM's `CWRES` does (pinned in `compute_cwres`'s doc comment).
             // Additive error keeps the linearized `f0` (bit-identical: `R` does
-            // not depend on the prediction).
+            // not depend on the prediction). An IOV subject's FOCE `R` is at η = 0 *and*
+            // κ = 0, read from the marginal's own helper so the two cannot part.
+            let iov_pop_preds = match &iov_lin {
+                Some(lin) if !interaction => population_variance_preds_iov(
+                    model,
+                    subject,
+                    &params.theta,
+                    lin.n_eta,
+                    lin.n_iov,
+                    lin.n_occasions,
+                ),
+                _ => None,
+            };
             let r_preds: Option<&[f64]> = if !model.error_spec.has_f_dependent_variance() {
                 None
             } else if interaction {
                 Some(ipred.as_slice())
+            } else if iov_lin.is_some() {
+                iov_pop_preds.as_deref()
             } else {
                 Some(pred.as_slice())
             };
-            let cwres = compute_cwres(
-                subject,
-                &ipred,
-                eta,
-                h,
-                &params.omega,
-                &params.sigma.values,
-                &model.error_spec,
-                &params.residual_correlations,
-                frem_r_override.as_deref(),
-                model.residual_error_eta,
-                ruv_mult.as_deref(),
-                r_preds,
-                model.bloq_method,
-            );
+            // Under IOV, CWRES linearizes over b = [η, κ₁…κ_K] with
+            // Σ_b = blkdiag(Ω, Ω_IOV × K), as NONMEM's does (#1948); `b̂` leads with η̂,
+            // so the IIV-on-RUV read of `b̂[residual_error_eta]` is unchanged.
+            let cwres = match (&iov_lin, kappas.is_empty()) {
+                (None, false) => vec![f64::NAN; subject.observations.len()],
+                (lin, _) => {
+                    let (b_hat, h_b, omega_b) = match lin {
+                        Some(lin) => (&lin.b_hat, &lin.h_full, &lin.sigma_b),
+                        None => (eta, h, &params.omega),
+                    };
+                    compute_cwres_cov(
+                        subject,
+                        &ipred,
+                        b_hat,
+                        h_b,
+                        omega_b,
+                        &params.sigma.values,
+                        &model.error_spec,
+                        model.residual_cov_at(params),
+                        frem_r_override.as_deref(),
+                        model.residual_error_eta,
+                        ruv_mult.as_deref(),
+                        r_preds,
+                        model.bloq_in_force(),
+                    )
+                }
+            };
 
             // OFV contribution
             let ofv_i = if !kappas.is_empty() {
-                let omega_iov = params
-                    .omega_iov
-                    .as_ref()
-                    .expect("omega_iov present when kappas non-empty");
-                foce_subject_nll_iov(
-                    model,
-                    subject,
-                    &params.theta,
-                    eta,
-                    h,
-                    &params.omega,
-                    &params.sigma.values,
-                    interaction,
-                    kappas,
-                    omega_iov,
-                )
+                match &iov_lin {
+                    Some(lin) => foce_subject_nll_iov_linearized(
+                        model,
+                        subject,
+                        &params.theta,
+                        &params.sigma.values,
+                        model.residual_cov_at(params),
+                        interaction,
+                        lin,
+                    ),
+                    // A κ shape mismatch: the marginal's own refusal (its sentinel).
+                    None => foce_subject_nll_iov_cov(
+                        model,
+                        subject,
+                        &params.theta,
+                        eta,
+                        h,
+                        &params.omega,
+                        &params.sigma.values,
+                        model.residual_cov_at(params),
+                        interaction,
+                        kappas,
+                        omega_iov.expect("kappas non-empty"),
+                    ),
+                }
             } else {
-                foce_subject_nll(
+                foce_subject_nll_cov(
                     model,
                     subject,
                     &params.theta,
@@ -814,7 +913,7 @@ pub(crate) fn compute_subject_results(
                     h,
                     &params.omega,
                     &params.sigma.values,
-                    &params.residual_correlations,
+                    model.residual_cov_at(params),
                     interaction,
                 )
             };
@@ -844,6 +943,15 @@ pub(crate) fn compute_subject_results(
                 // existing output is untouched.
                 #[cfg(feature = "survival")]
                 discrete_rows: crate::categorical::binary_diagnostics(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta.as_slice(),
+                ),
+                // TTE per-record residuals at the same EBE, off the curves the OFV
+                // contribution above scored (#901). Empty without a TTE endpoint.
+                #[cfg(feature = "survival")]
+                tte_rows: crate::stats::likelihood::tte_diagnostics(
                     model,
                     subject,
                     &params.theta,
@@ -886,16 +994,72 @@ pub(crate) fn kappa_weight_typicals(
     model
         .kappa_weights
         .iter()
-        .map(|w| {
+        .enumerate()
+        .map(|(k, w)| {
             let w = w.as_ref()?;
             let mut vals: Vec<f64> = Vec::new();
             for subj in &population.subjects {
-                for (_occ, obs_idx) in crate::stats::likelihood::iov_occasion_groups(subj) {
-                    let (cov, time) = match obs_idx.first() {
-                        Some(&j) => (subj.obs_cov(j), subj.obs_times.get(j).copied()),
-                        None => (&subj.covariates, None),
+                let cells = crate::stats::likelihood::iov_occasion_groups(subj);
+                // Under nested levels (#1082 PR4) a κ is drawn once per group of its own
+                // level, so one weight is taken per group: its first cell with an
+                // observation (`W` is constant within the group, or the data check
+                // warned). Without levels every cell is its own group.
+                let groups: Vec<Vec<usize>> =
+                    match crate::stats::nested_levels::NestedLayout::of(model, subj) {
+                        Some(layout) if layout.n_cells() == cells.len() => {
+                            let l = model.nested_levels().map_or(0, |n| n.kappa_level[k]);
+                            let mut groups = vec![Vec::new(); layout.level_count(l)];
+                            for g in 0..cells.len() {
+                                groups[layout.cell_group(g, l)].push(g);
+                            }
+                            groups
+                        }
+                        _ => (0..cells.len()).map(|g| vec![g]).collect(),
                     };
-                    let v = (w.eval)(theta, cov, time.unwrap_or(0.0));
+                for group in groups {
+                    let first_obs = group.iter().find_map(|&g| cells[g].1.first());
+                    // A group with no observation: under nested levels its own record — an
+                    // `MDV = 1` row, then a dose — since a whole study can be such a group
+                    // and the subject's covariates are another group's (review r1 #5).
+                    // One-level IOV keeps the subject's covariates, as before.
+                    let own_record = || {
+                        if !model.has_nested_levels() {
+                            return None;
+                        }
+                        let occs: Vec<u32> = group.iter().map(|&g| cells[g].0).collect();
+                        let pk_only = (0..subj.pk_only_times.len())
+                            .find(|&m| {
+                                subj.pk_only_occasions
+                                    .get(m)
+                                    .is_some_and(|o| occs.contains(o))
+                            })
+                            .map(|m| (subj.pk_only_cov(m), subj.param_time_pk_only(m)));
+                        pk_only
+                            .or_else(|| {
+                                (0..subj.doses.len())
+                                    .find(|&d| {
+                                        subj.dose_occasions.get(d).is_some_and(|o| occs.contains(o))
+                                    })
+                                    .map(|d| (subj.dose_cov(d), subj.dose_param_time(d)))
+                            })
+                            // A group only a reset row carries (#1153 review r1 #3).
+                            .or_else(|| {
+                                (0..subj.reset_times.len())
+                                    .find(|&r| {
+                                        subj.reset_occasions
+                                            .get(r)
+                                            .is_some_and(|o| occs.contains(o))
+                                    })
+                                    .map(|r| {
+                                        (subj.reset_cov(r), subj.param_time_at(subj.reset_times[r]))
+                                    })
+                            })
+                    };
+                    let (cov, time) = match first_obs {
+                        Some(&j) => (subj.obs_cov(j), subj.param_time_obs(j)),
+                        None => own_record().unwrap_or((&subj.covariates, 0.0)),
+                    };
+                    let v = (w.eval)(theta, cov, time);
                     if v.is_finite() {
                         vals.push(v);
                     }
@@ -910,39 +1074,190 @@ pub(crate) fn kappa_weight_typicals(
         .collect()
 }
 
-/// Kappa shrinkage pooled across all subject-occasion pairs.
+/// The informed κ̂ vectors of `kappas_per_subject`: each subject's groups filtered by
+/// `informed` (parallel per subject, from `iov_group_informed`), with the group's
+/// position in that subject's own list kept. A group with no mask entry is kept.
+fn informed_kappas<'a>(
+    kappas_per_subject: &'a [Vec<DVector<f64>>],
+    informed: &'a [Vec<bool>],
+) -> impl Iterator<Item = (usize, &'a DVector<f64>)> + 'a {
+    kappas_per_subject
+        .iter()
+        .enumerate()
+        .flat_map(move |(i, occ_kappas)| {
+            let mask = informed.get(i);
+            occ_kappas
+                .iter()
+                .enumerate()
+                .filter(move |(g, _)| mask.and_then(|m| m.get(*g)).copied().unwrap_or(true))
+        })
+}
+
+/// `1 - sqrt(mean(κ̂²)) / sqrt(var)` over `kappas` for kappa `k`; NaN when `var` is
+/// non-positive or fewer than two vectors are pooled.
+fn kappa_shrinkage_over(kappas: &[&DVector<f64>], var: f64, k: usize) -> f64 {
+    let vals: Vec<f64> = kappas.iter().map(|kv| kv[k]).collect();
+    shrinkage_of(&vals, var)
+}
+
+/// `1 - sqrt(mean(v²)) / sqrt(var)` over `vals`; NaN when `var` is non-positive or fewer
+/// than two values are pooled. The one shrinkage formula of the κ pools, per cell and
+/// per level (#1082 PR4).
+fn shrinkage_of(vals: &[f64], var: f64) -> f64 {
+    let n = vals.len();
+    if var <= 0.0 || n < 2 {
+        return f64::NAN;
+    }
+    let ms = vals.iter().map(|v| v.powi(2)).sum::<f64>() / n as f64;
+    1.0 - ms.sqrt() / var.sqrt()
+}
+
+/// Kappa shrinkage pooled across the informed subject-occasion pairs.
 ///
 /// `1 - sqrt(mean(κ̂²)) / sqrt(omega_iov_kk)` for each kappa k, where the mean
-/// runs over every (subject, occasion) pair.  Returns NaN for a given kappa when
-/// the corresponding diagonal of `omega_iov` is non-positive or when fewer than
-/// two (subject, occasion) observations are available.
+/// runs over every (subject, occasion group) pair that `informed` marks — a group no
+/// observation can read has κ̂ = 0 (the prior mode) and would push the shrinkage up
+/// while leaving the objective unchanged (#1911). A subject with no informed group
+/// contributes nothing. Returns NaN for a given kappa when the corresponding diagonal
+/// of `omega_iov` is non-positive or when fewer than two informed pairs remain.
 pub(crate) fn compute_kappa_shrinkage(
     kappas_per_subject: &[Vec<DVector<f64>>],
+    informed: &[Vec<bool>],
     omega_iov: &DMatrix<f64>,
 ) -> Vec<f64> {
     let n_kappa = omega_iov.nrows();
     if n_kappa == 0 {
         return vec![];
     }
-    // Flatten all per-subject per-occasion kappa vectors into one iterator.
-    let all_kappas: Vec<&DVector<f64>> = kappas_per_subject
-        .iter()
-        .flat_map(|occ_kappas| occ_kappas.iter())
+    let all_kappas: Vec<&DVector<f64>> = informed_kappas(kappas_per_subject, informed)
+        .map(|(_, kv)| kv)
         .collect();
-    let n = all_kappas.len();
-    if n < 2 {
-        return vec![f64::NAN; n_kappa];
-    }
     (0..n_kappa)
-        .map(|k| {
-            let var = omega_iov[(k, k)];
-            if var <= 0.0 {
-                return f64::NAN;
-            }
-            let ms = all_kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
-            1.0 - ms.sqrt() / var.sqrt()
-        })
+        .map(|k| kappa_shrinkage_over(&all_kappas, omega_iov[(k, k)], k))
         .collect()
+}
+
+/// `(shrinkage_kappa, shrinkage_kappa_by_occ)` of a fit over `population`: both pooled
+/// over the groups `iov_group_informed` marks, so the console, `format_summary`, the
+/// `.fitrx` bundle and `FitResult` all read one informed rule (#1911). A compartment-free
+/// `model` carries no state between records, so there only a group's own observations
+/// inform it.
+pub(crate) fn kappa_shrinkages(
+    model: &CompiledModel,
+    population: &Population,
+    kappas_per_subject: &[Vec<DVector<f64>>],
+    omega_iov: &DMatrix<f64>,
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let informed: Vec<Vec<bool>> = population
+        .subjects
+        .iter()
+        .map(|s| crate::stats::likelihood::iov_group_informed_for(model, s))
+        .collect();
+    (
+        compute_kappa_shrinkage(kappas_per_subject, &informed, omega_iov),
+        compute_kappa_shrinkage_by_occ(kappas_per_subject, &informed, omega_iov),
+    )
+}
+
+/// The per-level κ facts of a fit of a model with nested levels (#1082 PR4), read off
+/// the per-cell κ̂ (`kappas_per_subject`, parallel to each subject's cells):
+///
+/// - `kappa_levels`: each κ's level name, parallel to `kappa_names`;
+/// - `by_level`: each level's κ̂ once per group, with the group's labels
+///   ([`crate::LevelKappaEbes`]);
+/// - `shrinkage`: each κ's shrinkage pooled over the **groups of its own level**, not
+///   the cells. A study κ̂ is one value per study, read by every arm; pooled over cells
+///   it would be counted once per arm. Only informed groups count (#1911): a group is
+///   informed when one of its cells is ([`crate::stats::likelihood::iov_group_informed`]),
+///   since every cell of the group reads the same κ.
+///
+/// `None` for a model without nested levels; a subject without a layout or with a κ̂
+/// list of the wrong length contributes nothing.
+pub(crate) struct NestedKappaFacts {
+    pub(crate) kappa_levels: Vec<String>,
+    pub(crate) by_level: Vec<crate::types::LevelKappaEbes>,
+    pub(crate) shrinkage: Vec<f64>,
+}
+
+pub(crate) fn nested_kappa_facts(
+    model: &CompiledModel,
+    population: &Population,
+    kappas_per_subject: &[Vec<DVector<f64>>],
+    omega_iov: &DMatrix<f64>,
+) -> Option<NestedKappaFacts> {
+    use crate::stats::nested_levels::NestedLayout;
+    let levels = model.nested_levels()?;
+    let kappa_levels: Vec<String> = levels
+        .kappa_level
+        .iter()
+        .map(|&l| levels.levels[l].name.clone())
+        .collect();
+    let mut by_level: Vec<crate::types::LevelKappaEbes> = levels
+        .levels
+        .iter()
+        .enumerate()
+        .map(|(l, level)| crate::types::LevelKappaEbes {
+            level: level.name.clone(),
+            columns: levels.levels[..=l]
+                .iter()
+                .map(|x| x.column.clone())
+                .collect(),
+            kappa_names: (0..model.n_kappa)
+                .filter(|&k| levels.kappa_level[k] == l)
+                .map(|k| model.kappa_names[k].clone())
+                .collect(),
+            groups: Vec::with_capacity(population.subjects.len()),
+        })
+        .collect();
+    // Per κ, the informed groups' κ̂ of its level, pooled over subjects.
+    let mut pooled: Vec<Vec<f64>> = vec![Vec::new(); model.n_kappa];
+    for (i, subj) in population.subjects.iter().enumerate() {
+        let cells = kappas_per_subject.get(i);
+        let layout =
+            NestedLayout::of(model, subj).filter(|n| cells.is_some_and(|c| c.len() == n.n_cells()));
+        let (Some(layout), Some(cells)) = (layout, cells) else {
+            for entry in &mut by_level {
+                entry.groups.push(Vec::new());
+            }
+            continue;
+        };
+        let informed = crate::stats::likelihood::iov_group_informed_for(model, subj);
+        for (l, entry) in by_level.iter_mut().enumerate() {
+            let ks = layout.kappas_at(l);
+            let mut group_informed = vec![false; layout.level_count(l)];
+            for g in 0..layout.n_cells() {
+                if informed.get(g).copied().unwrap_or(true) {
+                    group_informed[layout.cell_group(g, l)] = true;
+                }
+            }
+            let groups = layout
+                .first_cells(l)
+                .into_iter()
+                .enumerate()
+                .map(|(gi, g)| {
+                    let kappa: Vec<f64> = ks.iter().map(|&k| cells[g][k]).collect();
+                    if group_informed[gi] {
+                        for (&k, &v) in ks.iter().zip(&kappa) {
+                            pooled[k].push(v);
+                        }
+                    }
+                    crate::types::LevelGroupEbe {
+                        labels: layout.labels(g, l),
+                        kappa,
+                    }
+                })
+                .collect();
+            entry.groups.push(groups);
+        }
+    }
+    let shrinkage = (0..model.n_kappa)
+        .map(|k| shrinkage_of(&pooled[k], omega_iov[(k, k)]))
+        .collect();
+    Some(NestedKappaFacts {
+        kappa_levels,
+        by_level,
+        shrinkage,
+    })
 }
 
 /// Kappa shrinkage broken out by occasion index.
@@ -950,7 +1265,9 @@ pub(crate) fn compute_kappa_shrinkage(
 /// Returns `shrinkage_by_occ[occ_idx][kappa_idx]` where `occ_idx` is the
 /// **0-based position within each subject's own occasion list** — i.e. the
 /// order in which distinct OCC values were first encountered in that subject's
-/// rows (matching `split_obs_by_occasion`).
+/// rows (matching `split_obs_by_occasion`). Only the groups `informed` marks enter a
+/// slot, as for [`compute_kappa_shrinkage`]; a slot with fewer than two informed pairs
+/// is NaN.
 ///
 /// **Important limitation for unbalanced designs:** `occ_idx` is a position
 /// index, *not* the raw OCC column value.  When subjects have different OCC
@@ -965,6 +1282,7 @@ pub(crate) fn compute_kappa_shrinkage(
 /// or no kappa parameters exist.
 pub(crate) fn compute_kappa_shrinkage_by_occ(
     kappas_per_subject: &[Vec<DVector<f64>>],
+    informed: &[Vec<bool>],
     omega_iov: &DMatrix<f64>,
 ) -> Vec<Vec<f64>> {
     let n_kappa = omega_iov.nrows();
@@ -982,20 +1300,12 @@ pub(crate) fn compute_kappa_shrinkage_by_occ(
     }
     (0..n_occ)
         .map(|occ_idx| {
-            let occ_kappas: Vec<&DVector<f64>> = kappas_per_subject
-                .iter()
-                .filter_map(|occ_vecs| occ_vecs.get(occ_idx))
+            let occ_kappas: Vec<&DVector<f64>> = informed_kappas(kappas_per_subject, informed)
+                .filter(|(g, _)| *g == occ_idx)
+                .map(|(_, kv)| kv)
                 .collect();
-            let n = occ_kappas.len();
             (0..n_kappa)
-                .map(|k| {
-                    let var = omega_iov[(k, k)];
-                    if var <= 0.0 || n < 2 {
-                        return f64::NAN;
-                    }
-                    let ms = occ_kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
-                    1.0 - ms.sqrt() / var.sqrt()
-                })
+                .map(|k| kappa_shrinkage_over(&occ_kappas, omega_iov[(k, k)], k))
                 .collect()
         })
         .collect()
@@ -1232,6 +1542,8 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
 /// guards. `estimate` is the ordinary reporting-scale value, while the packed
 /// values identify the literal optimizer guard that was reached.
 struct RunawayGuardHit {
+    /// The coordinate's position in the packed vector.
+    index: usize,
     name: String,
     estimate: f64,
     packed_estimate: f64,
@@ -1335,6 +1647,7 @@ fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
                         return None;
                     }
                     Some(RunawayGuardHit {
+                        index: i,
                         name: names[i].clone(),
                         estimate: estimates[i],
                         packed_estimate: packed[i],
@@ -1345,6 +1658,18 @@ fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
                 },
             )
         })
+        .collect()
+}
+
+/// The packed coordinates the post-fit guard warning calls a **collapse** — a free
+/// coordinate on a log-packed lower rail, a θ only where that floor is ferx's own — with
+/// their kinds, for the outer optimizer's floor escape (#2339). The same walk as the
+/// warning, so the escape and the warning cannot disagree on which coordinates collapsed.
+pub(crate) fn collapsed_coordinates(params: &ModelParameters) -> Vec<(usize, PackedCoordKind)> {
+    runaway_guard_estimates(params)
+        .into_iter()
+        .filter(|h| !h.is_runaway())
+        .map(|h| (h.index, h.kind))
         .collect()
 }
 
@@ -1483,6 +1808,171 @@ pub(crate) fn boundary_estimate_warning(
     )
 }
 
+/// The warning for profiled levels the bounded profile solve ended on a declared bound
+/// (#2112), from `hits` as [`crate::estimation::profile::ProfileLayout::at_bound`] lists
+/// them, or `None` when there are none. `BoundaryEstimate`, so every consumer of a
+/// boundary estimate (`estimate_near_boundary`, bootstrap's skip, strict mode) reads it
+/// unchanged; [`boundary_estimate_warning`] never sees these levels, whose template box
+/// is open.
+///
+/// It names the free coefficient only: a sum-to-zero dependent level has no bound and is
+/// not held. Not "optimizer bound": the box is the profile solve's, not NLopt's.
+///
+/// `with_se`: the covariance step produced a matrix, which held these levels at their
+/// bounds; the warning then says what that does to the standard errors.
+pub(crate) fn profiled_bound_warning(
+    theta_names: &[String],
+    hits: &[(usize, f64, bool)],
+    with_se: bool,
+) -> Option<(String, WarningEntry)> {
+    list_warning(
+        hits.to_vec(),
+        WarningCode::BoundaryEstimate,
+        |&(k, est, upper)| {
+            let side = if upper { "upper" } else { "lower" };
+            format!("{} ({est:.4} at {side} bound)", theta_names[k])
+        },
+        |list| {
+            let se = if with_se {
+                " Their standard errors are not available; the other estimates' standard \
+                 errors are computed with them held at the bound."
+            } else {
+                ""
+            };
+            format!(
+                "{PROFILED_BOUND_PREFIX} {list}. The profile solve holds each at its bound. \
+                 This often indicates non-identifiability or a too-tight bound; inspect the \
+                 affected level(s) and consider relaxing the bound.{se}"
+            )
+        },
+        |hits| {
+            let params_json: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|&(k, est, upper)| {
+                    serde_json::json!({
+                        "parameter": theta_names[k],
+                        "estimate": est,
+                        "bound": est,
+                        "side": if upper { "upper" } else { "lower" },
+                    })
+                })
+                .collect();
+            serde_json::json!({ "parameters": params_json })
+        },
+    )
+}
+
+/// The opening of [`profiled_bound_warning`]'s text, by which a refresh finds the copy it
+/// replaces.
+const PROFILED_BOUND_PREFIX: &str = "Profiled level(s) on a declared bound:";
+
+/// The profiled levels `params` sets on their block's declared box (#2112), as
+/// `FitResult.profiled_levels_at_bound` lists them (θ indices, ascending), with their
+/// at-bound warning ([`profiled_bound_warning`]; `with_se`: the covariance step produced a
+/// matrix). The covariance step holds exactly these levels, derived from the same
+/// `(θ̂, box)`, so `fit()` and `run_covariance` both report them through here.
+pub(crate) fn profiled_bound_report(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    with_se: bool,
+) -> (Vec<usize>, Option<(String, WarningEntry)>) {
+    let hits = crate::estimation::profile::ProfileLayout::build(model, population, params)
+        .map(|layout| layout.at_bound(&params.theta))
+        .unwrap_or_default();
+    (
+        sorted_indices(&hits),
+        profiled_bound_warning(&params.theta_names, &hits, with_se),
+    )
+}
+
+/// `run_covariance`'s refresh of the at-bound report on a re-run step: the incoming fit's
+/// field and at-bound warning describe a step this call replaced — one run without the
+/// step, a bundle saved before the field existed, or estimates the step's re-solve moved
+/// onto a bound — so both are rebuilt and the old warning dropped. From `held`, the levels
+/// the step itself held (`ProfileCtx::covariance_at_estimate`), when it got that far;
+/// otherwise from `params`, as [`profiled_bound_report`] reads the fit's estimates.
+pub(crate) fn refresh_profiled_bound_report(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    held: Option<Vec<(usize, f64, bool)>>,
+    result: &mut FitResult,
+) {
+    // The stale entry in `warnings_structured` goes with its message: `run_covariance`
+    // rebuilds the structured list from `warnings` (`rebuild_warnings_structured`).
+    result
+        .warnings
+        .retain(|w| !w.starts_with(PROFILED_BOUND_PREFIX));
+    let with_se = result.covariance_matrix.is_some();
+    let (held, warning) = match held {
+        Some(hits) => (
+            sorted_indices(&hits),
+            profiled_bound_warning(&params.theta_names, &hits, with_se),
+        ),
+        None => profiled_bound_report(model, population, params, with_se),
+    };
+    if let Some((msg, entry)) = warning {
+        result.warnings.push(msg);
+        result.warnings_structured.push(entry);
+    }
+    result.profiled_levels_at_bound = held;
+}
+
+/// `run_covariance`'s report of the profiled levels its step ran at (#2419). Handed level
+/// estimates that are not the profile solve's β̂ at the other estimates (edited after the
+/// fit), the step's re-solve moves them and computes its matrix there. The re-solved `levels` (`(θ index, value)`, from
+/// [`crate::estimation::profile::ResolvedLevels`]) are written into `params.theta`, from
+/// which the caller reports the estimates and their SEs (the delta method reads them), so
+/// the estimates, the matrix, the SEs and the at-bound report all describe one point; the
+/// returned warning says they moved and by how much. `None`, `params` untouched, when no
+/// level moved by a bit: a replay of the fit's own β̂ stays bit-identical.
+///
+/// Writing them, rather than only warning, is what keeps a held level's `estimate` equal
+/// to its `at_bound` value. The objective and the EBEs are not recomputed, and the warning
+/// says that too. `with_matrix`: the step produced a matrix.
+pub(crate) fn report_resolved_levels(
+    levels: &[(usize, f64)],
+    params: &mut crate::types::ModelParameters,
+    with_matrix: bool,
+) -> Option<String> {
+    let moved: Vec<(usize, f64, f64)> = levels
+        .iter()
+        .filter(|&&(k, v)| params.theta[k].to_bits() != v.to_bits())
+        .map(|&(k, v)| (k, params.theta[k], v))
+        .collect();
+    let &(k, from, to) = moved
+        .iter()
+        .max_by(|a, b| (a.2 - a.1).abs().total_cmp(&(b.2 - b.1).abs()))?;
+    for &(k, _, v) in &moved {
+        params.theta[k] = v;
+    }
+    let at = if with_matrix {
+        "The reported estimates are these re-solved levels, the point the covariance matrix \
+         and the standard errors are computed at."
+    } else {
+        "The reported estimates are these re-solved levels; the covariance step failed there \
+         and reports no standard errors."
+    };
+    Some(format!(
+        "W_COV_PROFILED_LEVELS_RESOLVED: the covariance step re-profiled {} of the {} \
+         profiled levels away from the estimates run_covariance was handed; the largest move \
+         is {}, from {from:.6} to {to:.6} ({:+.2e}). {at} The objective function value and \
+         the EBEs are still the incoming fit's.",
+        moved.len(),
+        levels.len(),
+        params.theta_names[k],
+        to - from,
+    ))
+}
+
+/// The θ indices of `hits`, ascending: `FitResult.profiled_levels_at_bound`'s order.
+fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
+    let mut held: Vec<usize> = hits.iter().map(|&(k, _, _)| k).collect();
+    held.sort_unstable();
+    held
+}
+
 /// **The user-facing half of #1303's gate.** Demote `converged` when the OFV
 /// `fit()` is about to publish is not a reportable objective, and build the
 /// typed warning saying why — `None` when the objective is sound.
@@ -1496,7 +1986,7 @@ pub(crate) fn boundary_estimate_warning(
 /// non-finite penalty — a prior whose density is zero at the estimate, an
 /// overflowing log-normal prior on a runaway θ — produces a `FitResult` whose
 /// published `ofv` no estimator ever saw. The chained case is the same shape:
-/// `methods = vi, focei` reports the last stage's objective, and a multi-start
+/// `method = [vi, focei]` reports the last stage's objective, and a multi-start
 /// splice re-homes warnings across runs.
 ///
 /// Severity is [`WarningSeverity::Critical`] and the code is
@@ -1531,7 +2021,7 @@ pub(crate) fn nonfinite_objective_warning(
     }
     let msg = crate::estimation::outer_optimizer::gate_converged_on_objective(converged, ofv)?;
     let details = serde_json::json!({
-        "ofv": if ofv.is_finite() { serde_json::json!(ofv) } else { serde_json::json!(ofv.to_string()) },
+        "ofv": json_value(ofv),
         "reason": crate::estimation::outer_optimizer::nonfinite_objective_reason(ofv),
         "divergence_cutoff": crate::estimation::outer_optimizer::DIVERGENCE_OFV,
         "method": method.label(),
@@ -1543,6 +2033,657 @@ pub(crate) fn nonfinite_objective_warning(
         Some(details),
     );
     Some((msg, entry))
+}
+
+/// How many subjects `W_NONFINITE_OBJECTIVE`'s message names before it says "and N
+/// more"; the `details` payload lists every one (#2038).
+pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
+
+/// How closely the subjects' contributions (non-finite ones at the estimator's
+/// `2·1e20` clamp) plus the prior must add up to the gated objective, relative to it,
+/// before [`name_nonfinite_subjects`] rereads the label from them (#2265). It tells
+/// "these subjects are this objective" apart from "the objective was evaluated at
+/// another point".
+///
+/// Measured on macOS arm64, `|clamped_total − ofv| / ofv` at the reread of a real
+/// `fit()` is **exactly 0**, under FOCEI and FOCE, at `1.44e20` (#2265's unclamped subject) and at
+/// `1.5e14` with a parameter prior of `72.4` / `2.83` folded in, where one ulp is
+/// `0.03`, so the prior is visible in the sum
+/// (`api::nonfinite_objective_tests::a_fit_rereads_an_unclamped_subject_past_1e20_as_too_large`).
+/// The subjects and the prior *are* the objective, so the agreement is an identity, and
+/// the bound only has to cover summation order: at most `n·ε`, `1.1e-10` at a million
+/// subjects. `1e-9` keeps 10× over that. The reread runs only past the `1e14` cutoff,
+/// so the bound is also at least `1e5` in absolute terms, beyond any difference between
+/// two scorings of an objective of ordinary size. The other side is far away: L1's
+/// "another point" row, `1.44e20` under `2e20`, is 28% out.
+///
+/// It was `1e-2`, which also accepted unclamped subjects summing to `1.99e20` under an
+/// objective clamped at `2e20`, 0.5% out, and relabelled that objective "too large".
+/// L1 brackets the value from both sides: a `1e-10` gap rereads, and a 0.5% gap does
+/// not. A miss costs only the reread: the label stays the total's reading.
+pub(crate) const REREAD_AGREEMENT: f64 = 1e-9;
+
+/// One separately scored part of a subject's objective contribution (#2267): a
+/// non-Gaussian data term at `η̂`, or the IOV marginal's refusal of FREM rows. `nll` is
+/// the raw value, not the OFV-scale `2·` the contribution carries.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContributionTerm {
+    pub(crate) name: String,
+    pub(crate) nll: f64,
+}
+
+/// What `SubjectResult::ofv_contribution` is, relative to the objective
+/// `W_NONFINITE_OBJECTIVE` gated (#2267).
+///
+/// `compute_subject_results` always scores the post-hoc FOCE or FOCEI marginal
+/// (`foce_subject_nll_cov` / the IOV form), under the fitted class for a mixture. The
+/// published objective is classified by what it *is*, not by the estimator's name: FOCE,
+/// FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP (estimating or `imp_eval_only`
+/// standalone) and VI's `vi_final_ofv = laplace` all publish `2·pop_nll` — the sum of
+/// these same scores at the same EBEs. Only three objectives are something else, and
+/// can be unusable while every score is usable or the reverse:
+///
+/// * quadrature — `laplace` at any `n_agq` (its exact-Hessian anchor already differs
+///   at one node) and `focei` with `n_agq > 1`, including an `agq_eval_only` readout;
+/// * `bayes`, whose `ofv` is `2·Σ` joint NLL at the posterior mean, not a marginal;
+/// * a mixture, whose objective is the class-marginal.
+///
+/// Plus the case where the objective's FOCE/FOCEI flag is not the one the scores were
+/// computed under. `prior` is the parameter-prior penalty `fit()` adds to the data
+/// objective, a population-level term no subject carries.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContributionSource {
+    /// `"FOCE"` or `"FOCEI"`: the marginal each contribution scores.
+    pub(crate) score: &'static str,
+    /// The objective's name when the contributions are not its terms, else `None`.
+    pub(crate) objective: Option<String>,
+    /// The parameter-prior penalty in the gated objective (`ofv_prior`; `0` unpriored).
+    pub(crate) prior: f64,
+}
+
+impl ContributionSource {
+    /// The source for the objective `method` published, with contributions scored under
+    /// `options.interaction` (the post-fit options), `mixture` when the fit is one, and
+    /// `prior` the penalty added to it.
+    pub(crate) fn of(
+        method: EstimationMethod,
+        options: &FitOptions,
+        mixture: bool,
+        prior: f64,
+    ) -> Self {
+        let score = if options.interaction { "FOCEI" } else { "FOCE" };
+        let agq = FitOptions::agq_nodes_for(method, options.n_agq);
+        let same = agq.is_none()
+            && method != EstimationMethod::Bayes
+            && !mixture
+            && crate::types::interaction_for(method, options.interaction) == options.interaction;
+        let objective = (!same).then(|| {
+            let mut name = method.label().to_string();
+            if let Some(n) = agq.filter(|&n| n > 1) {
+                name = format!("{name} (n_agq = {n})");
+            }
+            if method == EstimationMethod::Bayes {
+                name.push_str(" posterior-mean");
+            }
+            if mixture {
+                name.push_str(" mixture");
+            }
+            name
+        });
+        Self {
+            score,
+            objective,
+            prior,
+        }
+    }
+}
+
+/// The separately scored terms of `subject`'s contribution at `eta` (#2267), for
+/// [`name_nonfinite_subjects`], under the subject's fitted mixture class and that class's
+/// Ω and Σ. When `h_matrix` (its `∂f/∂η`, `n_obs × n_eta`) is given and shaped for it,
+/// these are the parts the marginal `compute_subject_results` scored records on the way,
+/// under the same `interaction` flag:
+///
+/// * a subject without κ (`kappas` empty): `stats::likelihood::foce_subject_contribution_parts`
+///   — the FOCE, row-wise FOCEI or dense-`R` FOCEI branch, or the joint form of a subject
+///   with time-to-event, categorical or CTMM records, whose curvature carries their
+///   Hessian;
+/// * an IOV subject: the same branches over the stacked `[η, κ]` linearization
+///   (`stats::likelihood::foce_subject_iov_contribution_parts`, review r6), or the FREM
+///   refusal alone, or — when its κ̂ do not line up with its occasion groups, which the
+///   marginal refuses — that mismatch.
+///
+/// Without a usable `h_matrix`, each non-Gaussian data term alone.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn contribution_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &DVector<f64>,
+    h_matrix: Option<&DMatrix<f64>>,
+    interaction: bool,
+    kappas: &[DVector<f64>],
+    mix_class: Option<usize>,
+) -> Vec<ContributionTerm> {
+    let iov = !kappas.is_empty();
+    if iov && crate::stats::likelihood::iov_refuses_frem(model, subject) {
+        return vec![ContributionTerm {
+            name: "IOV + FREM refusal".into(),
+            nll: crate::stats::likelihood::IOV_FREM_REFUSAL_NLL,
+        }];
+    }
+    let _mix_guard =
+        mix_class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+    // That class's Ω and Σ, as `compute_subject_results` scores the contribution (#2266).
+    let class_params = mix_class
+        .filter(|_| params.mixture.is_some())
+        .map(|c| crate::estimation::mixture::class_params(params, c));
+    let params = class_params.as_ref().unwrap_or(params);
+    let shaped = h_matrix.filter(|h| {
+        h.nrows() == subject.observations.len()
+            && h.ncols() == eta.len()
+            && params.omega.matrix.nrows() == eta.len()
+    });
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    let mut terms: Vec<(String, f64)> = Vec::new();
+    match (iov, shaped, params.omega_iov.as_ref()) {
+        (false, Some(h), _) => {
+            terms = crate::stats::likelihood::foce_subject_contribution_parts(
+                model,
+                subject,
+                &params.theta,
+                eta,
+                h,
+                &params.omega,
+                &params.sigma.values,
+                model.residual_cov_at(params),
+                interaction,
+            )
+        }
+        // The linearization `compute_subject_results` builds, from the same inputs.
+        (true, Some(h), Some(omega_iov)) => {
+            terms = match crate::stats::likelihood::iov_linearization(
+                model,
+                subject,
+                &params.theta,
+                eta,
+                h,
+                &params.omega,
+                kappas,
+                omega_iov,
+            ) {
+                Some(lin) => crate::stats::likelihood::foce_subject_iov_contribution_parts(
+                    model,
+                    subject,
+                    &params.theta,
+                    &params.sigma.values,
+                    model.residual_cov_at(params),
+                    interaction,
+                    &lin,
+                ),
+                None => vec![(
+                    "IOV random effects (κ̂ do not match the occasion groups)".to_string(),
+                    f64::NAN,
+                )],
+            }
+        }
+        #[cfg(feature = "survival")]
+        _ => terms.extend(crate::stats::likelihood::non_gaussian_terms(
+            model,
+            subject,
+            &params.theta,
+            eta.as_slice(),
+        )),
+        #[cfg(not(feature = "survival"))]
+        _ => {}
+    }
+    terms
+        .into_iter()
+        .map(|(name, nll)| ContributionTerm { name, nll })
+        .collect()
+}
+
+/// The per-subject term scorer `name_nonfinite_subjects` calls for each subject it
+/// names: population index, data, post-fit result.
+pub(crate) type TermScorer<'a> =
+    dyn Fn(usize, &Subject, &SubjectResult) -> Vec<ContributionTerm> + 'a;
+
+/// A non-finite value as JSON: a number when finite, else its `Debug` string, since
+/// JSON has no `NaN`.
+fn json_value(v: f64) -> serde_json::Value {
+    if v.is_finite() {
+        serde_json::json!(v)
+    } else {
+        serde_json::json!(v.to_string())
+    }
+}
+
+/// How many indices `it` yields, and the first: all a warning reads of a set of
+/// flagged observations, without collecting them (#2269).
+fn count_and_first(it: impl Iterator<Item = usize>) -> (usize, Option<usize>) {
+    it.fold((0, None), |(n, first), j| (n + 1, first.or(Some(j))))
+}
+
+/// Name the subjects behind a [`nonfinite_objective_warning`] (#2038): append one
+/// sentence to `msg` and to `entry.message`, and an `unusable_subjects` array to
+/// `entry.details` (not `subjects`, which `flip_flop` uses for an array of IDs).
+/// The `details` reach the Rust API, the JSON and YAML outputs (`warning_details:`)
+/// and a `.fitrx` reload (#2268), but not yet the R package, so the message says where
+/// the subjects beyond the first [`NONFINITE_SUBJECTS_NAMED`] are and where they are
+/// not.
+///
+/// A subject qualifies when its own post-fit objective contribution fails
+/// `ofv_is_valid` — `NaN`, infinite, or at least `DIVERGENCE_OFV`. That is the
+/// selector, and the per-record clauses only describe it; both score a mixture
+/// subject under its fitted class's Ω and Σ, so they cannot disagree on its class.
+/// Selecting on a non-finite
+/// `IPRED`/`PRED` instead would name every subject with no Gaussian observation,
+/// whose predictions are `NaN` by convention ("no prediction available") and which
+/// contribute nothing wrong. A `NaN` prediction on a scored record cannot hide the
+/// other way: the likelihood maps the subject's objective to the sentinel.
+///
+/// For each subject named, the sentence gives the contribution, then three clauses:
+///
+/// 1. **The records whose own likelihood term is unusable (#2266)**, with the
+///    written `TIME`, `DV` and `IPRED` of the first. The term is the record's own
+///    `−2 log L` in the FOCEI conditional data term at η̂, recorded off the scorer's
+///    own sweep (`conditional_obs_neg2ll_terms`): raw `IPRED`, unclamped `V`, the
+///    fitted correlations, an SDE's process-noise variance, an `iiv_on_ruv` scale
+///    and an M3 censored term are all in it. A mixture subject is evaluated under
+///    its fitted class (`mixest`, 0-based), with that class's Σ. The term is
+///    unusable when it fails the same `ofv_is_valid` test as the objective. This is
+///    the record to look at first. A runaway η̂ can leave an early record with a
+///    finite `IPRED` of 0 that a proportional error scores at `DV² × 1e12` (the
+///    variance floor), and the first non-finite *prediction* then names a later
+///    record, or none: on the same subject the closed form and the ODE disagree on
+///    the predictions but agree on this record. A runaway residual-error η makes `V`
+///    infinite, which `IWRES` (divided by `√V`) reports as `0` and the scorer
+///    rejects. A subject with no Gaussian observation has no such clause.
+/// 2. The observations whose `IPRED` or `PRED` is not finite, with the written
+///    `TIME` of the first, as #2038 wrote it. When none is, it says so ("no Gaussian
+///    observation" for a subject that has none).
+/// 3. Each term `terms` scores
+/// that is itself unusable (#2267): a Gaussian part — the residual term (a proportional
+/// error on a prediction of 0 scores `DV² × 1e12` per observation at the variance
+/// floor), a residual variance that is not finite and positive, the censored (M3) term,
+/// the random-effect prior, the curvature log-determinant or an `H̃` that is not
+/// positive definite — a time-to-event term at the `1e20` hazard sentinel, a
+/// categorical or CTMM term, or the IOV + FREM refusal. When every scored term is
+/// usable it says that, so a reader knows the failure is in how they combine (only
+/// their sum, FOCE's linearization, the non-Gaussian curvature) rather than in one of
+/// them.
+///
+/// A term is judged on the OFV scale the contribution carries, `2·nll`, against the
+/// same cutoff, and shown as its raw `nll`: a raw term of `6e13` makes a `1.2e14`
+/// contribution and is named.
+///
+/// The contributions are always the post-hoc FOCE/FOCEI score (`source`). When the
+/// objective is not their sum (see [`ContributionSource`]), the sentence says so after
+/// the list. An unusable parameter-prior penalty — a population-level term no subject
+/// carries — is named after the list too. And when no subject qualifies, the warning
+/// says why rather than ending silently (#2267), in the first of these that holds:
+/// the prior penalty is unusable; the objective is one the scores are not terms of
+/// (so they cannot locate its failure, and their sum is reported only as usable or not);
+/// the scores and the prior are each usable but their sum is past the cutoff; or their
+/// sum is usable, so the objective was evaluated at another point than the estimates
+/// and EBEs the subjects were scored at. When their sum is past the cutoff, it names
+/// the largest [`NONFINITE_SUBJECTS_NAMED`] contributions, largest first, as
+/// `largest_subjects` in the details too (#2265).
+///
+/// **The label is reread from the subjects (#2265)** when they can say more than the
+/// total: a finite objective, contributions that are its terms, and a sum, with the
+/// prior, that is past the cutoff and adds up to the objective
+/// ([`REREAD_AGREEMENT`]). Then the objective is "at the divergence sentinel" when a
+/// named subject's contribution is non-finite (the estimator clamped it), is `2·1e20`
+/// or `2·1e18` (the likelihood guards and the IOV + FREM refusal), or holds a term at
+/// one of those; otherwise "too large to be a fit". When that differs from the
+/// total's reading, the gate's sentence is rebuilt with it and `details["reason"]`
+/// follows; `reason_read_from` says which reading the label is.
+///
+/// `subjects` is `compute_subject_results`' output, in population order; a subject
+/// whose position does not match `population` gets no `TIME`, and since its `DV`s
+/// are then unknown, no likelihood clause and no terms either.
+pub(crate) fn name_nonfinite_subjects(
+    msg: String,
+    entry: &mut WarningEntry,
+    subjects: &[SubjectResult],
+    population: &Population,
+    model: &CompiledModel,
+    params: &ModelParameters,
+    mixest: Option<&[usize]>,
+    source: &ContributionSource,
+    terms: &TermScorer<'_>,
+) -> String {
+    use crate::estimation::outer_optimizer::ofv_is_valid;
+    // A term's `nll` is raw; the contribution it sits in is `2·nll`-scaled.
+    let term_failed = |t: &ContributionTerm| !ofv_is_valid(2.0 * t.nll);
+    let prior_failed = !ofv_is_valid(source.prior);
+    struct Named<'a> {
+        s: &'a SubjectResult,
+        /// Observations with a non-finite `IPRED` or `PRED`: count and first index.
+        n_bad: usize,
+        first_bad: Option<usize>,
+        /// Observations whose own likelihood term is unusable: count and first index.
+        n_unusable: usize,
+        first_unusable: Option<usize>,
+        data: Option<&'a Subject>,
+        terms: Vec<ContributionTerm>,
+    }
+    let named: Vec<Named<'_>> = subjects
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !ofv_is_valid(s.ofv_contribution))
+        .map(|(i, s)| {
+            let (n_bad, first_bad) = count_and_first((0..s.n_obs).filter(|&j| {
+                !(s.ipred.get(j).is_some_and(|v| v.is_finite())
+                    && s.pred.get(j).is_some_and(|v| v.is_finite()))
+            }));
+            let data = population.subjects.get(i).filter(|d| d.id == s.id);
+            let (n_unusable, first_unusable) = count_and_first(
+                data.map(|d| {
+                    // The subject's fitted class (#985): held for the evaluation, so
+                    // a `MIXNUM`-keyed residual selector or magnitude reads it, and
+                    // that class's Σ, as `compute_subject_results` holds the guard.
+                    let class = mixest.and_then(|m| m.get(i)).copied();
+                    let _mix_guard =
+                        class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let class_params = class
+                        .filter(|_| params.mixture.is_some())
+                        .map(|c| crate::estimation::mixture::class_params(params, c));
+                    let p = class_params.as_ref().unwrap_or(params);
+                    crate::stats::likelihood::conditional_obs_neg2ll_terms(
+                        model,
+                        d,
+                        &p.theta,
+                        &s.ipred,
+                        s.eta.as_slice(),
+                        &p.sigma.values,
+                        model.residual_cov_at(p),
+                    )
+                })
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .filter(|(_, &t)| !ofv_is_valid(t))
+                .map(|(j, _)| j),
+            );
+            let terms = data.map(|d| terms(i, d, s)).unwrap_or_default();
+            Named {
+                s,
+                n_bad,
+                first_bad,
+                n_unusable,
+                first_unusable,
+                data,
+                terms,
+            }
+        })
+        .collect();
+    let caveat = source.objective.as_deref().map(|objective| {
+        format!(
+            " These are post-hoc {} contributions at the EBEs, not terms of the {objective} \
+             objective, which ferx does not split by subject.",
+            source.score
+        )
+    });
+    let contributions = subjects.iter().map(|s| s.ofv_contribution).sum::<f64>();
+    let total = contributions + source.prior;
+    // The label, reread from the subjects (#2265). The gate drew it on the total, which
+    // misreads an unclamped subject past `1e20` as clamped and a subject refused at
+    // `1e18` as unclamped. The subjects can only correct it when they are the objective:
+    // its terms, and their sum with the prior fails the way the objective did and
+    // adds up to it. A `NaN` or infinite objective keeps its label: that one is
+    // read, not inferred.
+    use crate::stats::likelihood::{IOV_FREM_REFUSAL_NLL, SUBJECT_SENTINEL_NLL};
+    // The estimator clamps a non-finite subject to `1e20` and doubles it.
+    let clamped_total = subjects
+        .iter()
+        .map(|s| {
+            if s.ofv_contribution.is_finite() {
+                s.ofv_contribution
+            } else {
+                2.0 * SUBJECT_SENTINEL_NLL
+            }
+        })
+        .sum::<f64>()
+        + source.prior;
+    // A non-finite objective is carried as a string, so it reads as `None` here.
+    let gated_ofv = entry.details.as_ref().and_then(|d| d["ofv"].as_f64());
+    let reread = gated_ofv
+        .filter(|&ofv| {
+            source.objective.is_none()
+                && !ofv_is_valid(total)
+                && (clamped_total - ofv).abs() <= REREAD_AGREEMENT * ofv.abs()
+        })
+        .map(|_| {
+            let rail = |nll: f64| nll == SUBJECT_SENTINEL_NLL || nll == IOV_FREM_REFUSAL_NLL;
+            // A non-finite post-hoc contribution is one the estimator clamped.
+            let clamped = named.iter().any(|n| {
+                !n.s.ofv_contribution.is_finite()
+                    || rail(n.s.ofv_contribution / 2.0)
+                    || n.terms.iter().any(|t| rail(t.nll))
+            });
+            use crate::estimation::outer_optimizer::{REASON_AT_SENTINEL, REASON_TOO_LARGE};
+            if clamped {
+                REASON_AT_SENTINEL
+            } else {
+                REASON_TOO_LARGE
+            }
+        });
+    let msg = match (reread, gated_ofv) {
+        (Some(reason), Some(ofv))
+            if reason != crate::estimation::outer_optimizer::nonfinite_objective_reason(ofv) =>
+        {
+            crate::estimation::outer_optimizer::nonfinite_objective_message(ofv, reason)
+        }
+        _ => msg,
+    };
+    // Nobody is unusable on their own and the sum is the objective's failure: the
+    // largest contributions are where it comes from (#2265).
+    let mut largest: Vec<&SubjectResult> = Vec::new();
+    let full = if named.is_empty() {
+        let score = source.score;
+        let lead = format!(
+            "{msg} No subject can be named: every subject's post-hoc {score} contribution \
+             at these estimates is usable"
+        );
+        let prior = source.prior;
+        let and_prior = if prior != 0.0 {
+            format!(", and so is the parameter-prior penalty ({prior:?})")
+        } else {
+            String::new()
+        };
+        match (prior_failed, source.objective.as_deref()) {
+            (true, _) => format!(
+                "{lead}, and the parameter-prior penalty, a population-level term no \
+                 subject carries, is not ({prior:?})."
+            ),
+            // The scores are not terms of this objective, so they cannot say where it
+            // failed (review r6): their sum is reported for what it is, not as a cause.
+            (false, Some(objective)) => {
+                let sum = if ofv_is_valid(total) {
+                    format!("their sum ({total:?}) is usable")
+                } else {
+                    format!("their sum ({total:?}) is past the cutoff as well")
+                };
+                format!(
+                    "{lead}{and_prior}, but the {objective} objective is not their sum and \
+                     ferx does not split it by subject, so these scores cannot locate its \
+                     failure; {sum}."
+                )
+            }
+            (false, None) => {
+                if ofv_is_valid(total) {
+                    format!(
+                        "{lead}{and_prior}, and so is their sum ({total:?}), so the objective \
+                         was evaluated at another point than the estimates and EBEs the \
+                         subjects are scored at."
+                    )
+                } else {
+                    largest = subjects.iter().collect();
+                    largest.sort_by(|a, b| b.ofv_contribution.total_cmp(&a.ofv_contribution));
+                    largest.truncate(NONFINITE_SUBJECTS_NAMED);
+                    let list = largest
+                        .iter()
+                        .map(|s| format!("{} ({:?})", s.id, s.ofv_contribution))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let which = if largest.len() < subjects.len() {
+                        let share = 100.0 * largest.iter().map(|s| s.ofv_contribution).sum::<f64>()
+                            / contributions;
+                        format!(
+                            "the {} largest of {}, together {share:.0}% of the sum of the \
+                             contributions, are",
+                            largest.len(),
+                            subjects.len()
+                        )
+                    } else {
+                        "largest first, they are".to_string()
+                    };
+                    format!(
+                        "{lead}{and_prior}, but their sum ({total:?}) is past the cutoff. \
+                         The objective fails only as a sum; {which} {list}."
+                    )
+                }
+            }
+        }
+    } else {
+        let describe = |n: &Named<'_>| {
+            let records = match (n.first_bad, n.data) {
+                (None, _) if n.s.n_obs == 0 => "no Gaussian observation".to_string(),
+                (None, _) => "every IPRED and PRED finite".to_string(),
+                (Some(j), Some(d)) => format!(
+                    "a non-finite IPRED or PRED on {} of {} observations, the first at TIME {}",
+                    n.n_bad,
+                    n.s.n_obs,
+                    d.readout_time(j)
+                ),
+                (Some(_), None) => format!(
+                    "a non-finite IPRED or PRED on {} of {} observations",
+                    n.n_bad, n.s.n_obs
+                ),
+            };
+            let failed: Vec<String> = n
+                .terms
+                .iter()
+                .filter(|t| term_failed(t))
+                .map(|t| format!("{} = {:?}", t.name, t.nll))
+                .collect();
+            let terms = match failed.len() {
+                0 if n.terms.is_empty() => String::new(),
+                0 => ", every separately scored term usable".to_string(),
+                1 => format!(", failed term: {}", failed[0]),
+                _ => format!(", failed terms: {}", failed.join(", ")),
+            };
+            let residuals = match (n.first_unusable, n.data) {
+                (_, None) => Some("likelihood terms not checked".to_string()),
+                (_, Some(_)) if n.s.n_obs == 0 => None,
+                (None, Some(_)) => {
+                    Some("every observation's likelihood term usable on its own".to_string())
+                }
+                (Some(j), Some(d)) => Some(format!(
+                    "an unusable likelihood term on {} of {} observations, the first at TIME \
+                     {} (DV {}, IPRED {})",
+                    n.n_unusable,
+                    n.s.n_obs,
+                    d.readout_time(j),
+                    d.observations.get(j).copied().unwrap_or(f64::NAN),
+                    n.s.ipred.get(j).copied().unwrap_or(f64::NAN)
+                )),
+            };
+            let residuals = residuals.map(|r| format!("{r}; ")).unwrap_or_default();
+            format!(
+                "{} (contribution {:?}, {residuals}{records}{terms})",
+                n.s.id, n.s.ofv_contribution
+            )
+        };
+        let mut list = named
+            .iter()
+            .take(NONFINITE_SUBJECTS_NAMED)
+            .map(describe)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if named.len() > NONFINITE_SUBJECTS_NAMED {
+            list.push_str(&format!(
+                "; and {} more, listed as `unusable_subjects` in the structured warning's \
+                 details (Rust API, JSON and YAML output, .fitrx; not yet in the R package)",
+                named.len() - NONFINITE_SUBJECTS_NAMED
+            ));
+        }
+        let prior = if prior_failed {
+            format!(
+                " The parameter-prior penalty, a population-level term no subject carries, is \
+                 unusable as well ({:?}).",
+                source.prior
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "{msg} {} of {} subjects have an objective contribution that is itself unusable: \
+             {list}.{}{prior}",
+            named.len(),
+            subjects.len(),
+            caveat.unwrap_or_default()
+        )
+    };
+    let payload: Vec<serde_json::Value> = named
+        .iter()
+        .map(|n| {
+            let failed: Vec<serde_json::Value> = n
+                .terms
+                .iter()
+                .filter(|t| term_failed(t))
+                .map(|t| serde_json::json!({"term": t.name, "nll": json_value(t.nll)}))
+                .collect();
+            serde_json::json!({
+                "id": n.s.id,
+                "ofv_contribution": json_value(n.s.ofv_contribution),
+                "nonfinite_predictions": n.n_bad,
+                "n_obs": n.s.n_obs,
+                "first_time": n.first_bad.zip(n.data).map(|(j, d)| d.readout_time(j)),
+                "unusable_terms": n.data.map(|_| n.n_unusable),
+                "first_unusable_term_time": n.first_unusable.zip(n.data).map(|(j, d)| d.readout_time(j)),
+                "failed_terms": failed,
+            })
+        })
+        .collect();
+    if let Some(serde_json::Value::Object(map)) = entry.details.as_mut() {
+        map.insert(
+            "unusable_subjects".into(),
+            serde_json::Value::Array(payload),
+        );
+        map.insert("contribution_score".into(), serde_json::json!(source.score));
+        map.insert(
+            "contributions_are_objective_terms".into(),
+            serde_json::json!(source.objective.is_none()),
+        );
+        map.insert("ofv_prior".into(), json_value(source.prior));
+        if let Some(reason) = reread {
+            map.insert("reason".into(), serde_json::json!(reason));
+        }
+        map.insert(
+            "reason_read_from".into(),
+            serde_json::json!(if reread.is_some() {
+                "subjects"
+            } else {
+                "total"
+            }),
+        );
+        if !largest.is_empty() {
+            map.insert(
+                "largest_subjects".into(),
+                serde_json::Value::Array(
+                    largest
+                        .iter()
+                        .map(|s| serde_json::json!({"id": s.id, "ofv_contribution": s.ofv_contribution}))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    entry.message = full.clone();
+    full
 }
 
 /// Build the warning for parameter estimates pinned to an internal
@@ -1870,9 +3011,16 @@ pub(crate) fn stalled_at_init_warning(result: &FitResult) -> Option<(String, War
     } else {
         "a comparison against the initial estimates (no free THETA, OMEGA or SIGMA moved by 1%)"
     };
+    // A start the optimizer verified to be an optimum never reaches here (#2506:
+    // `stalled_at_init` clears it). Any other start may still have been one — the
+    // verification can be inconclusive or out of budget — so the message must not claim
+    // otherwise.
+    let meaning = "Unless the initial values were already an optimum (a warm start from a \
+                   previous fit's estimates, which this fit could not verify), the reported \
+                   objective is the objective *of the initial values* and says nothing about \
+                   the model";
     let msg = format!(
-        "W_STALLED_AT_INIT: the fit never left its initial estimates, by {basis}. The reported \
-         objective is the objective *of the initial values* and says nothing about the model, \
+        "W_STALLED_AT_INIT: the fit never left its initial estimates, by {basis}. {meaning}, \
          even though `converged` may be true — a fit that never moved has a flat objective \
          trace to plateau on. Unmoved free THETA: {list}. Check the optimizer's own diagnostics \
          (`final_gradient`), try different initial estimates, or a gradient-based \
@@ -1921,11 +3069,7 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
 ) -> Option<(String, WarningEntry)> {
     // Only a twin-less transit/IG closed form can degenerate this way: a twin-carrying
     // model reroutes per-eval, a non-absorption model has no flip-flop regime.
-    if !matches!(
-        model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
-    ) || model.absorption_ode_equivalent.is_some()
-    {
+    if !crate::api::twinless_absorption_closed_form(model) {
         return None;
     }
     // Twin-less transit/IG closed forms reject IOV up front, so `eta_hats` carry exactly
@@ -1984,6 +3128,113 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
     Some((msg, entry))
 }
 
+/// Build the human message + native structured entry for a closed-form fit whose final
+/// estimates put a non-positive or non-finite `CL` or `V` on any record, or `None` (#2104).
+///
+/// The closed-form engines give such a record one of two outcomes, and the message states
+/// whichever occurred — the two sentences are gated on their own record counts:
+///
+/// - **non-positive or infinite** — served a concentration of 0 (superposition drops the
+///   dose, the event-driven walk empties every compartment over the interval the record
+///   governs), so the fit completes and scores the subject against a confident, finite
+///   prediction;
+/// - **`NaN`** (an invalid covariate expression, say) — served `NaN` once a dose has
+///   arrived, so the subject's likelihood is repelled through the sentinel, and 0 before
+///   any dose. Which of the two a record got depends on the timeline, so the message states
+///   the rule rather than claiming an outcome per record.
+///
+/// NONMEM would not have made either prediction: PREDPP reports a non-positive PK parameter
+/// as a PRED error. `eta_hats` are the BSV EBEs and `kappas` the per-subject occasion κ, as
+/// [`compute_subject_results`] takes them; `mixest` evaluates a mixture subject under its
+/// own fitted class.
+pub(crate) fn degenerate_cl_v_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    mixest: Option<&[usize]>,
+) -> Option<(String, WarningEntry)> {
+    let no_kappas: Vec<DVector<f64>> = Vec::new();
+    let hits: Vec<(String, Vec<(f64, bool)>)> = population
+        .subjects
+        .iter()
+        .zip(eta_hats)
+        .enumerate()
+        .filter_map(|(si, (subject, eta))| {
+            // `MIXNUM` is 1-based; `mixest` is the 0-based fitted class.
+            let class = mixest.and_then(|m| m.get(si)).map(|&c| c + 1);
+            let _mix = class.map(crate::parser::model_parser::MixtureClassGuard::enter);
+            let ks = kappas.get(si).unwrap_or(&no_kappas);
+            let records = crate::pk::invalid_cl_v_records(
+                model,
+                subject,
+                theta,
+                eta.as_slice(),
+                ks.iter()
+                    .map(|k| k.as_slice())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            );
+            (!records.is_empty()).then(|| (subject.id.clone(), records))
+        })
+        .collect();
+    let (first_id, first_records) = hits.first()?;
+    let all = || hits.iter().flat_map(|(_, r)| r.iter());
+    let n_records = all().count();
+    let n_nan = all().filter(|&&(_, nan)| nan).count();
+    let n_zero = n_records - n_nan;
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    let mut msg = format!(
+        "W_DEGENERATE_CL_V: {} subject(s) [{}] have a non-positive or non-finite CL or V on {} \
+         record(s) at the final estimates (first at TIME {} in subject {}).",
+        hits.len(),
+        ids.join(", "),
+        n_records,
+        first_records[0].0,
+        first_id,
+    );
+    if n_zero > 0 {
+        msg.push_str(&format!(
+            " On {n_zero} of them CL or V is non-positive or infinite: the closed-form PK \
+             engines serve a concentration of 0 there and drop any drug in the body over an \
+             interval such a record governs, so the fit scored a confident, finite prediction."
+        ));
+    }
+    if n_nan > 0 {
+        msg.push_str(&format!(
+            " On {n_nan} of them CL or V is NaN: an observation there is predicted NaN once a \
+             dose has arrived, which repels that subject's likelihood, and 0 before any dose."
+        ));
+    }
+    msg.push_str(
+        " NONMEM would refuse these records: PREDPP rejects a non-positive PK parameter as an \
+         error. Check the individual-parameter model — a linear covariate term such as \
+         CL = TVCL * (1 + THETA * (AGE - 40)) can go negative on one record, and a covariate \
+         value the expression cannot use gives NaN — and prefer a form that keeps CL and V \
+         positive, such as an exponential or power model.",
+    );
+    let entry = warning_entry(
+        WarningCode::DegenerateClearanceOrVolume,
+        msg.clone(),
+        Some(serde_json::json!({
+            "model": model.pk_model.canonical_name(),
+            "n_records": n_records,
+            "n_zero_records": n_zero,
+            "n_nan_records": n_nan,
+            "subjects": hits
+                .iter()
+                .map(|(id, records)| serde_json::json!({
+                    "id": id,
+                    "times": records.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    "nan_times": records.iter().filter(|r| r.1).map(|r| r.0).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        })),
+    );
+    Some((msg, entry))
+}
+
 /// The `W_` token that opens the post-fit ODE-solver diagnostics message, and the string
 /// [`classify_warning`](crate::types::classify_warning) keys the `ode_solver` code off.
 const ODE_SOLVER_WARNING_TOKEN: &str = "W_ODE_SOLVER_DIAGNOSTICS";
@@ -2009,6 +3260,9 @@ pub(crate) enum SolverStatsPhase {
     PostfitPredictions,
     /// One [`crate::api::predict_diag`] pass.
     Predict,
+    /// One [`crate::api::predict_survival_diag`] pass (#2164).
+    #[cfg(feature = "survival")]
+    PredictSurvival,
     /// One [`crate::api::simulate_with_options_diag`] pass.
     Simulate,
     /// One [`crate::api::simulate_adaptive`] pass.
@@ -2023,6 +3277,8 @@ impl SolverStatsPhase {
         match self {
             Self::PostfitPredictions => "postfit_predictions",
             Self::Predict => "predict",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "predict_survival",
             Self::Simulate => "simulate",
             Self::SimulateAdaptive => "simulate_adaptive",
             Self::SimulateUncertainty => "simulate_with_uncertainty",
@@ -2039,6 +3295,8 @@ impl SolverStatsPhase {
         match self {
             Self::PostfitPredictions => "at the final estimates",
             Self::Predict | Self::Simulate | Self::SimulateAdaptive => "at the supplied parameters",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "at the supplied parameters",
             // Many parameter sets, none of them the caller's argument as such.
             Self::SimulateUncertainty => "at the drawn parameter sets",
         }
@@ -2056,6 +3314,8 @@ impl SolverStatsPhase {
         match self {
             Self::PostfitPredictions => "the fit",
             Self::Predict => "this predict() pass",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "this predict_survival() pass",
             Self::Simulate => "this simulate() pass",
             Self::SimulateAdaptive => "this simulate_adaptive() run",
             Self::SimulateUncertainty => "this simulate_with_uncertainty() run",
@@ -2074,6 +3334,10 @@ impl SolverStatsPhase {
                 "Counters are from the post-fit prediction pass over all subjects."
             }
             Self::Predict => "Counters are from this predict() pass over all subjects.",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => {
+                "Counters are from this predict_survival() pass over all subjects."
+            }
             Self::Simulate => {
                 "Counters are from this simulate() pass over all subjects and replicates."
             }
@@ -2144,10 +3408,10 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 
 /// Every diagnostic a non-`fit()` entry point can report (#1280 / #1304).
 ///
-/// **One implementation, four callers.** `predict_diag`, `simulate_with_options_diag`,
-/// `simulate_adaptive` and `simulate_with_uncertainty_diag` (#1645) all report exactly this
-/// list, so a diagnostic added to any source below reaches all four at once and none of them
-/// can carry a different subset than the others —
+/// **One implementation, five callers.** `predict_diag`, `predict_survival_diag` (#2164),
+/// `simulate_with_options_diag`, `simulate_adaptive` and `simulate_with_uncertainty_diag`
+/// (#1645) all report exactly this list, so a diagnostic added to any source below reaches all
+/// five at once and none of them can carry a different subset than the others —
 /// `every_diagnostic_carrying_entry_point_reports_the_same_bundle` asserts that equality across
 /// them on a fixture that trips both halves.
 ///
@@ -2175,13 +3439,16 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 ///    `AMT` column with dose rows) is not: the controller supplies the regimen, so a dose-free
 ///    dataset is the expected input on that entry point.
 /// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
-///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` / `W_COMPARTMENT_FREE_DOSES` /
+///    `W_MODELED_*` / `W_COMPARTMENT_FREE_DOSES` /
 ///    `W_PER_CMT_UNMATCHED` bundle. The last of those is the one whose membership was
 ///    argued rather than inherited (#1405 review): a declared per-CMT entry that no
 ///    observation matched is a statement about the model and the data the caller handed
 ///    in, and `predict()` dispatches through the same map, so the entry is exactly as
 ///    inert there as in a fit. `predict_and_simulate_report_it_too` pins it on both
 ///    paths.
+///    Followed by `W_NEGATIVE_LAGTIME`, the non-fit severity of `fit()`'s
+///    `E_NEGATIVE_LAGTIME` (#1189): one predicate, an error where data errors run and a
+///    warning where the lag is served.
 /// 4. [`crate::api::check_experimental_features`] — data-independent; a feature is
 ///    experimental whichever door you use it through.
 /// 5. The ODE-solver diagnostics of the pass that just ran.
@@ -2254,6 +3521,12 @@ pub(crate) fn non_fit_diagnostics(
             .into_iter()
             .map(|d| d.message),
     );
+    // `fit()` refuses a negative lag (`E_NEGATIVE_LAGTIME`, #1189); these entry points run no
+    // data errors and serve it, so they report the same predicate as a warning.
+    out.extend(
+        crate::api::validation::negative_lagtime_warning(model, population, &params.theta)
+            .map(|d| d.message),
+    );
     out.extend(
         crate::api::check_experimental_features(model)
             .into_iter()
@@ -2323,7 +3596,7 @@ pub(crate) fn with_solver_stats<T>(
 /// integration deposits in the scope.
 ///
 /// It must be the **same** provider the fit ran, for two reasons. The scope gates differ:
-/// `ode_inner_grad_supported_model` describes the ODE provider's analytical reach and says
+/// the adjoint's `recorder_in_scope` describes the ODE recorder's analytical reach and says
 /// nothing about `gradient_method = fd`, SDE, or the other escape hatches, so it alone would
 /// sweep a dual solve for a fit that computed every gradient by finite differences and report
 /// counters from a code path that fit never took. `analytic_inner_common_bail` is the
@@ -2332,14 +3605,13 @@ pub(crate) fn with_solver_stats<T>(
 /// And the *order* matters. The overflow this exists to observe reaches the Hessian first and
 /// the gradient only later — value `7.2e303`, gradient `1.4e306`, Hessian `NaN` on the #1204
 /// repro — so a first-order `Dual1` sweep would miss exactly the case the counter is named
-/// for. When the model has an analytic **outer** gradient the sweep runs the second-order
-/// [`crate::sens::provider::subject_sensitivities`] (`Dual2`, gradient *and* Hessian), which
-/// is what FOCEI differentiates; when only the inner loop is analytic it runs the light
-/// first-order [`crate::sens::provider::subject_eta_grad`], which is all that fit computes.
+/// for. When the model has an analytic **outer** gradient the sweep runs the unified
+/// recorder's second-order η-jets (`adjoint::exact_inner_hessian`), which is what FOCEI
+/// differentiates; when only the inner loop is analytic it runs the first-order
+/// `adjoint::exact_obs_grads`, which is all that fit computes.
 ///
 /// No-ops off the analytic ODE sensitivity path entirely: a closed-form model, an FD fit, or
-/// an IOV model (`ode_analytical_supported` declines `n_kappa != 0`) has no dual ODE solve to
-/// observe.
+/// a model outside the adjoint's `recorder_in_scope` has no dual ODE solve to observe.
 ///
 /// Like [`compute_subject_results`], this runs one independent task per subject on the fit's
 /// own pool and **returns** its counters rather than depositing them in a scope the caller
@@ -2355,7 +3627,8 @@ pub(crate) fn sweep_sensitivity_solver_stats(
     mixest: Option<&[usize]>,
 ) -> crate::ode::solver::OdeSolverStats {
     let mut merged = crate::ode::solver::OdeSolverStats::default();
-    if !crate::sens::provider::ode_inner_grad_supported_model(model)
+    if model.ode_spec.is_none()
+        || !crate::sens::ode_provider::adjoint::recorder_in_scope(model)
         || crate::estimation::inner_optimizer::analytic_inner_common_bail(model)
     {
         return merged;
@@ -2378,9 +3651,12 @@ pub(crate) fn sweep_sensitivity_solver_stats(
                 .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
             let (theta, eta) = (&params.theta, eta.as_slice());
             if second_order {
-                let _ = crate::sens::provider::subject_sensitivities(model, subject, theta, eta);
+                let _ = crate::sens::ode_provider::adjoint::exact_inner_hessian(
+                    model, subject, params, eta,
+                );
             } else {
-                let _ = crate::sens::provider::subject_eta_grad(model, subject, theta, eta);
+                let _ =
+                    crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, eta);
             }
             stats_scope.collected()
         })
@@ -2718,7 +3994,12 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // ("It is not an `ode_method` problem and no solver setting fixes it") — as the *last*
     // sentence of the message and the only one naming concrete knobs. So it is attached to
     // the counters it is true of, and an abandoned walk gets the advice that applies to it.
-    let solver_knob_advice = if unclean_integration && !only_diverged {
+    // A jet rejection is not one of them (#1347): it counts toward `unclean_integration`
+    // because a discard and re-solve did happen, but its own clause says naming a different
+    // `ode_method` will not help, so it must not reach this sentence on its own.
+    let knob_advice_applies =
+        clamped > 0 || rejected > 0 || fallback_failed > 0 || unfinished_kept > 0 || aborted > 0;
+    let solver_knob_advice = if knob_advice_applies && !only_diverged {
         " For the segments that did integrate, consider a different ode_method, a looser \
          ode_reltol / ode_abstol, or checking the parameter estimates that produce these \
          dynamics."
@@ -2751,6 +4032,16 @@ pub(crate) fn ode_solver_diagnostics_warning(
     );
     let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), details);
     Some((msg, entry))
+}
+
+/// A θ's standard error on its own scale from its packed-scale variance `var`: the
+/// packed SE (`0.0` for a non-positive variance, as every `se_*` vector reports it)
+/// times the packing Jacobian. The one rule behind `se_theta` and a free level's
+/// standard error in `theta_level_values` (#1890), so the two are equal by
+/// construction rather than by a second formula.
+pub(crate) fn theta_se_from_packed(var: f64, theta: f64, theta_lower: f64) -> f64 {
+    let se_packed = if var > 0.0 { var.sqrt() } else { 0.0 };
+    crate::estimation::parameterization::theta_packing_jacobian(theta, theta_lower) * se_packed
 }
 
 /// Extract standard errors from covariance matrix on the packed parameter scale,
@@ -2799,10 +4090,8 @@ pub(crate) fn extract_standard_errors(
             // panicking away an otherwise-converged fit.
             if i >= n {
                 0.0
-            } else if theta_packs_log(template.theta_lower[i]) {
-                template.theta[i] * se_packed[i]
             } else {
-                se_packed[i]
+                theta_se_from_packed(cov[(i, i)], template.theta[i], template.theta_lower[i])
             }
         })
         .collect();

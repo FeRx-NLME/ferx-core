@@ -2,15 +2,23 @@
 title: "Markov models ([markov_model])"
 ---
 
-A `[markov_model]` block declares a **continuous-time Markov model (CTMM)** endpoint:
-the observed variable is a discrete *state* recorded at irregular times, and the
-dynamics are the transition intensities between states. ferx builds the generator
-matrix `Q`, forms the transition-probability matrix `P(Δt) = expm(Q·Δt)`, and scores
-each consecutive pair of state observations — see
-[Continuous-time Markov models](../estimation/ctmm.qmd) for the estimation side.
+A `[markov_model]` block declares a Markov-chain endpoint: the observed variable is a
+discrete *state*, and the model describes how it moves between states. Two families are
+available:
+
+- **`type = ctmm`** (the default) — a **continuous-time Markov model**: the
+  dynamics are the transition intensities between states. ferx builds the generator
+  matrix `Q`, forms the transition-probability matrix `P(Δt) = expm(Q·Δt)`, and scores
+  each consecutive pair of state observations — see
+  [Continuous-time Markov models](../estimation/ctmm.qmd) for the estimation side.
+- **`type = dtmm`** — a **discrete-time Markov model**: each `transition` is the
+  *probability* of moving between states from one record to the next, the NONMEM
+  `PREVIOUS`-DV `$PRED` model. See
+  [Discrete-time Markov models](#discrete-time-markov-models-type-dtmm) below and
+  [the estimation page](../estimation/dtmm.qmd).
 
 ::: {.callout-note}
-The CTMM endpoint requires the `markov` cargo feature
+The `[markov_model]` endpoint requires the `markov` cargo feature
 (`cargo build --features markov`). It is opt-in while maturing; see the plan.
 :::
 
@@ -25,7 +33,7 @@ transition with its intensity:
   theta LQ10(-1.2, -6.0, 3.0)   # log intensity asleep -> awake
 
 [markov_model]
-  type   = ctmm                     # ctmm (only value for now)
+  type   = ctmm                     # ctmm (default), dtmm or mctmm
   cmt    = 5                        # data-file CMT for the state observations
   states = [awake=0, asleep=1]      # label = DV integer code (explicit, never positional)
   transition awake  -> asleep = exp(LQ01)   # intensity q_{awake→asleep} ≥ 0
@@ -43,9 +51,9 @@ transition with its intensity:
 - **`cmt`** — the CMT column value carrying the state observations. Rows on this CMT are
   read as integer states; the same CMT cannot also be a Gaussian (`[error_model]`)
   endpoint.
-- **`type`** — optional; **defaults to `ctmm`**, the only family available today. Omitting
-  the line parses as a CTMM. `mctmm` / `dtmm` are recognized but rejected as "not yet
-  supported".
+- **`type`** — optional; **defaults to `ctmm`**. Omitting the line parses as a CTMM.
+  `dtmm` selects the [discrete-time model](#discrete-time-markov-models-type-dtmm);
+  `mctmm` selects the [minimal CTMM](#minimal-ctmm-type-mctmm).
 
 ### Bare numeric states
 
@@ -59,6 +67,95 @@ Labels are optional. A purely numeric model reads:
   transition 0 -> 1 = exp(LQ01)
   transition 1 -> 0 = exp(LQ10)
 ```
+
+## Minimal CTMM (`type = mctmm`)
+
+The **minimal continuous-time Markov model** (mCTMM; Schindler & Karlsson, *AAPS J*
+2017;19:1424–1435) is a reduction of the CTMM for an **ordered** state scale — disease
+severity, a sleep stage, a toxicity grade. It is identifiable from sparse, irregularly
+timed observations where a full CTMM, with one free intensity per transition, often is
+not. Instead of listing intensities, the block declares two things:
+
+- the **steady-state distribution** `π` over the states, a proportional-odds model with
+  cut-points `α_k` and a linear predictor `lp` (covariates, a drug effect, η);
+- one **mean equilibration time** `τ`.
+
+```default
+[parameters]
+  theta LTAU(0.5, -5.0, 5.0)    # log mean equilibration time
+  theta C1(-0.3, -10.0, 10.0)   # first cut-point
+  theta LD2(0.2, -5.0, 5.0)     # log increment to the second cut-point
+  theta BX(0.3, -10.0, 10.0)    # effect on the linear predictor
+  omega ETA_TAU ~ 0.1
+
+[covariates]
+  X continuous
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [none=0, mild=1, severe=2]   # ordered: the list order is the scale
+  tau       = exp(LTAU + ETA_TAU)
+  cutpoints = [C1, C1 + exp(LD2)]
+  lp        = BX * X
+```
+
+### The generator
+
+For `K` ordered states (index `k = 0…K−1`, in list order):
+
+$$
+F_k = P(Y \le k) = \operatorname{logit}^{-1}(\alpha_k - \mathrm{lp}), \qquad
+\pi_k = F_k - F_{k-1} \quad (F_{-1} = 0,\ F_{K-1} = 1),
+$$
+
+and only **adjacent** states exchange, at
+
+$$
+q_{k \to k+1} = \frac{\pi_{k+1}}{\tau\,(\pi_k + \pi_{k+1})}, \qquad
+q_{k+1 \to k} = \frac{\pi_k}{\tau\,(\pi_k + \pi_{k+1})}.
+$$
+
+Each adjacent pair is a two-state chain that relaxes at rate `1/τ` toward its local
+equilibrium `π_k : π_{k+1}`. The generator is in detailed balance with `π`, so `π` is its
+stationary distribution. A **larger `lp` shifts mass to higher states**, the sign
+convention of `P(Y ≤ k) = logit⁻¹(α_k − lp)`.
+
+ferx expands the block into the equivalent `type = ctmm` transition list at parse time.
+The intensities above are written into `transition` lines, from your own `tau`,
+`cutpoints` and `lp` text. So an mCTMM is scored, differentiated and guarded exactly like
+the CTMM it expands to. That covers the `expm` likelihood, the exact η-gradient, and every
+CTMM rule on covariates, `TIME` and IOV below. It also covers the drug-driven route: an
+`lp` (or `tau`) that reads an ODE state makes `Q(t)` time-inhomogeneous and uses the
+occupancy-ODE path, described under *Drug- / PD-driven intensities* below.
+
+The expansion writes each intensity as a ratio of steady-state probabilities, so it stays
+exact to rounding however deep in a logit tail the scale sits. That holds whether the
+cut-points themselves are extreme or `lp` is far larger than their spacing.
+
+### Keys
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `states` | yes | The ordered scale. The **list order** defines adjacency, and the DV codes must **increase strictly** along it. A list whose codes disagree with its order is refused rather than guessed at. |
+| `tau` | yes | Mean equilibration time `τ > 0` (e.g. `exp(LTAU + ETA)`). A subject whose `τ` is zero, negative or below `1e-30` repels the optimizer rather than being scored. |
+| `cutpoints` | yes | Exactly `K − 1` cut-point expressions, in increasing order. |
+| `lp` | no | Linear predictor; defaults to `0`. |
+| `cmt` | yes | As for `ctmm`. |
+
+`transition` lines are refused under `type = mctmm`, since the block builds its own
+generator. `tau`, `cutpoints` and `lp` are refused under `type = ctmm`.
+
+The cut-points must stay **strictly increasing** or a `π_k` goes negative. Write the later
+ones as the previous plus a positive increment, as in `C1 + exp(LD2)`. ferx checks the
+ordering for each subject before using any rate. A subject whose cut-points decrease or
+tie repels the optimizer instead of being scored, as for any negative CTMM intensity. Any
+gap that double precision can represent is accepted and scored exactly, down to gaps of
+about `1e-30`. So a category that becomes rare, with nearly coincident cut-points, is still
+fitted rather than rejected.
+
+A complete runnable model is `examples/mctmm_3state.ferx` (with `data/mctmm_3state.csv`),
+which matches NONMEM — see [Continuous-time Markov models](../estimation/ctmm.qmd).
 
 ## Data format
 
@@ -149,15 +246,146 @@ no closed form once `Q` varies within the gap), scoring the same
 `transition` line. This requires an ODE (`[odes]`) model; the occupancy integration uses the
 model's ODE tolerance (`TOL`).
 
+The `[odes]` solve behind a drug-driven intensity runs under the individual parameters
+evaluated once, at `TIME = 0` (dose quantities — `F`, `ALAG`, `D{n}`, absorption — are read
+at each dose record). So an `[individual_parameters]` value that reads `TIME` and reaches a
+state the intensities read — through the `[odes]` right-hand side or an `init(...)` seed —
+would be frozen there while the Gaussian predictions read it at every record. `fit()`,
+`ferx check`, `run_covariance()` and `run_sir()` refuse such a model with `E_ENDPOINT_TIME_DEPENDENT_PK`, naming the parameter
+([#1918](https://github.com/FeRx-NLME/ferx-core/issues/1918)); a `TIME`-dependent parameter
+the intensities' states do not depend on, and a time-homogeneous CTMM, are unaffected.
+
+The same solve reads the **baseline** covariate snapshot, so a covariate that is
+time-varying in the data and reaches such a parameter — `CL = TVCL * (WT / 70)`, with `WT`
+changing within a subject — is refused the same way, with `E_ENDPOINT_TV_COVARIATE` on
+`[markov_model]`, naming the covariate and the parameter
+([#1854](https://github.com/FeRx-NLME/ferx-core/issues/1854)), although no intensity names
+the covariate. A time-varying covariate on a dose quantity (`KA`, `F`, …) or on a parameter
+the intensities' states do not depend on is accepted. A change counts wherever it is
+recorded, including on the `[markov_model]` state rows themselves — a subject whose first
+row is a state row at `WT = 1`, with every dose at `WT = 0`, has a baseline of `WT = 1`
+and is refused too. So does a row the reader drops: the baseline is the first value on
+any row, so a leading `WT = 1` row skipped for a missing `DV` (or removed by
+`[data_selection]`) still sets it, and a subject whose every kept row has `WT = 0` is
+refused.
+
 A complete runnable model is `examples/ctmm_pd_2state.ferx` (with `data/ctmm_pd_2state.csv`):
 a concentration-driven 2-state process where ferx recovers the transition intensities and the
 drug effect from the Gillespie-simulated data.
 
+## Discrete-time Markov models (`type = dtmm`)
+
+A DTMM uses the same `states` / `transition` grammar, but the right-hand side of each
+`transition` is a **transition probability**, not an intensity: the probability that the
+state observed at a record is `B`, given that the state observed at the subject's previous
+record was `A`. There is no generator and no `expm`:
+
+```default
+[parameters]
+  theta A_AS(-0.5, -10.0, 10.0)
+  theta B_DOSE(0.2, -10.0, 10.0)
+  theta A_SA(-0.5, -10.0, 10.0)
+  omega ETA_AS ~ 0.3
+  omega ETA_SA ~ 0.3
+
+[markov_model]
+  type   = dtmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = inv_logit(A_AS + B_DOSE * DOSE + ETA_AS)
+  transition asleep -> awake  = inv_logit(A_SA + ETA_SA)
+```
+
+- The **stay probability** `P_jj = 1 − Σ_{k≠j} P_jk` is filled in automatically — you
+  never write it.
+- Each probability must lie in `[0, 1]` and a row's off-diagonals must sum to at most `1`.
+  A parameter value that breaks this in **any** row of the matrix at a scored record — not
+  only the row being stepped from — is **penalized**: the subject repels the optimizer,
+  rather than scoring with a matrix that is not a valid transition matrix. Writing
+  each probability through `inv_logit(...)` (alias `expit`) keeps it in range; with more
+  than one transition out of a state, use the cumulative-logit form below so the row sum
+  stays below 1 too.
+- A change of state the data contain that no `transition` line declares has probability 0
+  for every parameter value. It is refused at fit setup (`E_CTMM_RECORDS`), naming the CMT,
+  the two states and the `TIME` of the step.
+
+### What is scored
+
+For each subject, the `DV` codes of its rows on `cmt`, in record order, form a chain
+`s_0, s_1, …`, and the data term is
+
+```default
+−Σ_{k ≥ 1} log P_k[s_{k−1}, s_k]
+```
+
+- **The first record is conditioned on** — it contributes nothing, as in a
+  `PREVIOUS`-DV `$PRED` where the first record of an individual has no previous value.
+  There is no `init` / stationary distribution.
+- **A step is a record, not a time unit.** `P_k` does not depend on the spacing of the
+  records; irregular intervals are accepted and each step uses the same per-record
+  probability. To make a probability depend on time, reference `TIME`.
+- **The probabilities are those of the current record.** `P_k` is evaluated at record
+  `k`, so a `TIME` term reads the time of the record being scored, not the previous one.
+- **A missing state links to the last observed one.** A row with a missing `DV` (or
+  `MDV = 1`) is not part of the chain; the next observed record steps from the last
+  observed state, which is what a `PREVIOUS`-DV `$PRED` reading the last observed `DV`
+  does.
+
+### More than two ordered states: cumulative logit
+
+For `K > 2` ordered states, write the probabilities of each previous state `j` as
+differences of a cumulative logit, `P(s ≤ k | prev = j) = inv_logit(α_k − γ_j)`, with
+monotone cut-points `α_k = α_{k−1} + exp(δ_k)` so every row is a valid distribution. The
+stay probability is the diagonal ferx fills in:
+
+```default
+[parameters]
+  theta A1(0.0, -10.0, 10.0)
+  theta D2(0.0, -10.0, 10.0)    # α_2 = α_1 + exp(D2)
+  theta G1(1.0, -10.0, 10.0)    # shift when the previous state was mild
+  theta G2(2.0, -10.0, 10.0)    # … severe
+  omega ETA ~ 0.3
+
+[markov_model]
+  type   = dtmm
+  cmt    = 5
+  states = [none=0, mild=1, severe=2]
+  transition none   -> mild   = inv_logit(A1 + exp(D2) + ETA) - inv_logit(A1 + ETA)
+  transition none   -> severe = 1 - inv_logit(A1 + exp(D2) + ETA)
+  transition mild   -> none   = inv_logit(A1 - G1 + ETA)
+  transition mild   -> severe = 1 - inv_logit(A1 + exp(D2) - G1 + ETA)
+  transition severe -> none   = inv_logit(A1 - G2 + ETA)
+  transition severe -> mild   = inv_logit(A1 + exp(D2) - G2 + ETA) - inv_logit(A1 - G2 + ETA)
+```
+
+### Covariates and `TIME`
+
+Everything a transition probability reads except the previous *state* comes from the
+**record being scored** — as in a `$PRED`, which runs at the current record:
+
+- **`TIME`** is that record's `TIME` as written — as a `$PRED` reads it, so it restarts
+  where the data restart it at a reset (`EVID = 3/4`).
+- **Covariates** are that record's values, so a covariate that changes within a subject
+  takes effect at the first step landing on a record that carries the new value. (A subject
+  whose state rows cannot be matched to per-record covariate values — one that also carries
+  `[event_model]` rows — is refused at fit setup with `E_ENDPOINT_TV_COVARIATE` when such a
+  covariate varies, rather than read at the baseline.)
+- **Drug effects** are not supported yet: a probability that names an ODE model state (e.g.
+  `central / V`) is refused at parse. Reading a drug amount at a record needs NONMEM's
+  same-`TIME` record order against doses, which ferx does not yet carry
+  ([#2510](https://github.com/FeRx-NLME/ferx-core/issues/2510)). Use a continuous-time
+  `type = ctmm` for a drug-driven transition model.
+
+As for the CTMM, IOV (κ) is not supported.
+
 ## Current limitations
 
-- `type = mctmm` / `type = dtmm` (minimal-CTMM and discrete-time Markov) — planned.
+- DTMM: drug-driven (state-dependent) transition probabilities (after
+  [#2510](https://github.com/FeRx-NLME/ferx-core/issues/2510)), simulation / prediction,
+  and an `init` / stationary distribution for the first record — planned.
 - The matrix (`q12 = …`) spelling and an `init` occupancy vector — planned.
-- Simulation / prediction of a CTMM endpoint — planned.
+- Simulation / prediction of a CTMM endpoint — planned (`simulate()` refuses both
+  families with `E_CTMM_UNSUPPORTED`).
 - A drug/PD-driven intensity requires an ODE model and a state referenced **directly** in the
   transition; analytic (closed-form) PK as a driver is planned.
 - Estimators: `focei` (default), `saem`, and `imp`. Gauss–Newton (`gn`/`gn_hybrid`) is

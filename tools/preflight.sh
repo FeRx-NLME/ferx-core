@@ -388,6 +388,23 @@ group_clippy() {
   # `rustup update nightly` before trusting a green result here.
   run cargo clippy --no-default-features --features ci,markov,nn --all-targets -- -Dunused
 
+  # The same gate on the feature set ferx-core SHIPS with (`default = []`, which is what
+  # ferx-r builds). The line above cannot see it: `markov` implies `survival`, so an item
+  # whose only reader is `#[cfg(feature = "survival")]` counts as used there and is dead
+  # here. `-Dunused` is not additive across feature sets — a superset build proves
+  # nothing about a subset — and the one `check` line without `survival` is a `cargo
+  # check`, which denies nothing. That is how four parser items from #1924 (read only by
+  # the survival-gated refusal in `api/validation.rs`) warned in every default build for
+  # weeks with every gate green (#2075). `ci` alone rather than a bare default build so
+  # it shares the `check` group's feature hash; `ci` adds no source of its own.
+  #
+  # `--lib`, NOT `--all-targets`, and that is the point of the line rather than a speed
+  # trade. Under `--all-targets` a `#[cfg(test)]` reader counts as a use, so a
+  # production helper that only a test calls still warns in ferx-r's build while this
+  # line passes. ferx-r compiles the lib alone; so does this. Test code is linted by
+  # the feature-rich `--all-targets` line above.
+  run cargo clippy --no-default-features --features ci --lib -- -Dunused
+
   # Same package-qualified-feature trick as `check`, so the members reuse the
   # `ferx-core` build the line above just produced. `--tests` here (unlike the
   # ferx-core line) because the members' test code is a meaningful share of their
@@ -469,7 +486,7 @@ group_public_api() {
 }
 
 group_debug_assertions() {
-  CI_JOB="Tests + coverage (core) / Tests + coverage (TTE/CTMM endpoints)"
+  CI_JOB="Tests + coverage (core k/4) / Tests + coverage (TTE/CTMM endpoints)"
   # #344, as folded into #1248. The `debug_assert!` guards used to be dead in
   # every CI job: `ci-test` and `ci-fast` both `inherits = "release"`, so all ~180
   # of them compiled to nothing. That was not theoretical — a real off-by-one in

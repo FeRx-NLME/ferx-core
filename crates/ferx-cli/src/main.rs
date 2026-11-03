@@ -3,6 +3,7 @@ mod amd_cmd;
 mod bootstrap_cmd;
 mod bootstrap_progress;
 mod covsearch_cmd;
+mod export_dcm_cmd;
 mod gam_cmd;
 mod globalsearch_cmd;
 mod iivsearch_cmd;
@@ -41,6 +42,8 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
                                                          (see `ferx amd --help`)
        ferx globalsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
                                                          (see `ferx globalsearch --help`)
+       ferx export-dcm <run.fitrx> [-o <out.ferx>] [--fixed-theta]
+                                                         (see `ferx export-dcm --help`)
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -135,6 +138,8 @@ const SUBCOMMANDS: &[(&str, fn(&[String]) -> i32)] = &[
     ("amd", amd_cmd::run),
     // #1185: GA / exhaustive over one grid, penalized fitness.
     ("globalsearch", globalsearch_cmd::run),
+    // #1331: a fitted `[covariate_nn]` model written out as plain equations.
+    ("export-dcm", export_dcm_cmd::run),
 ];
 
 /// The runner for `word`, when it names a subcommand.
@@ -152,7 +157,8 @@ enum FirstArg<'a> {
     /// A bare word — no dot, no path separator. The user meant a tool, and this
     /// build does not have it (a typo, or a tool that only exists in a later
     /// version). Reading it as a model path is what produced the misleading
-    /// "Failed to read model file: No such file or directory".
+    /// "Failed to read model file: No such file or directory" (now "cannot read the
+    /// model file …", #1752).
     UnknownTool(&'a str),
     /// Either the path is there, or the filesystem would not say: hand it to
     /// the fit/simulate path, which opens it and reports whatever the OS says.
@@ -232,6 +238,13 @@ fn edit_distance(a: &str, b: &str) -> usize {
     }
     prev[b.len()]
 }
+
+/// mimalloc rather than the system allocator: an estimation allocates many small,
+/// short-lived buffers per subject per evaluation, which is the pattern mimalloc's
+/// per-thread free lists serve well. The binary chooses its allocator; the `ferx-core`
+/// library leaves it to its embedder.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
@@ -361,7 +374,6 @@ fn main() {
             ferx_core::io::output::print_results(&fit_result);
             // Measurement only (no-op unless FERX_PROFILE=1).
             ferx_core::pk::event_driven::profile_report();
-            ferx_core::sens::provider::profile_report();
             ferx_core::estimation::inner_optimizer::profile_report();
 
             // Derive model name from model file path
@@ -406,7 +418,9 @@ fn main() {
             }
 
             if let Some(out) = &output_path {
-                let model_source = std::fs::read_to_string(model_path).unwrap_or_default();
+                // The text the fit parsed (#1752): reading the file again here would be a
+                // second open, and `save_fit` prefers `model_text` anyway.
+                let model_source = fit_result.model_text.clone().unwrap_or_default();
                 // Use the resolved data path from the fit result, not the raw
                 // `--data` flag: with a model-declared `[data]` block (#690)
                 // and no `--data`, the CSV that was actually fit is only known
@@ -636,6 +650,7 @@ fn print_check_human(report: &ferx_core::CheckReport) {
         let sev = match d.severity {
             ferx_core::Severity::Error => "error",
             ferx_core::Severity::Warning => "warning",
+            ferx_core::Severity::Info => "info",
         };
         let loc = match (&d.block, d.line) {
             (Some(b), Some(l)) => format!(" {}:{}", b, l),
@@ -657,19 +672,30 @@ fn print_check_human(report: &ferx_core::CheckReport) {
         }
         println!();
     }
+    println!("{}", check_summary_line(report));
+}
+
+/// The one-line summary closing `ferx check`'s human output. Informational rows
+/// (`Severity::Info`, #2387) are counted on their own and never as warnings; the
+/// count is left out when there are none, so a report without them reads as before.
+fn check_summary_line(report: &ferx_core::CheckReport) -> String {
+    let info = match report.info_count() {
+        0 => String::new(),
+        n => format!(", {n} info"),
+    };
     if report.valid {
-        println!(
-            "ok: {} — no errors ({} warning(s))",
+        format!(
+            "ok: {} — no errors ({} warning(s){info})",
             report.model,
             report.warning_count()
-        );
+        )
     } else {
-        println!(
-            "invalid: {} — {} error(s), {} warning(s)",
+        format!(
+            "invalid: {} — {} error(s), {} warning(s){info}",
             report.model,
             report.error_count(),
             report.warning_count()
-        );
+        )
     }
 }
 
@@ -783,10 +809,10 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_first_arg, edit_distance, is_help_flag, normalize_args, parse_check_args,
-        parse_inits_from_nca_flag, parse_output_flag, parse_output_format, parse_threads_flag,
-        print_check_human, run_check, run_summary, subcommand, unknown_tool_hint, CheckArgsError,
-        EstimatesFormat, FirstArg, SUBCOMMANDS,
+        check_summary_line, classify_first_arg, edit_distance, is_help_flag, normalize_args,
+        parse_check_args, parse_inits_from_nca_flag, parse_output_flag, parse_output_format,
+        parse_threads_flag, print_check_human, run_check, run_summary, subcommand,
+        unknown_tool_hint, CheckArgsError, EstimatesFormat, FirstArg, SUBCOMMANDS,
     };
     use ferx_core::NcaInit;
 
@@ -1311,5 +1337,37 @@ mod tests {
         let ok = CheckReport::new("m.ferx", None, vec![]);
         print_check_human(&ok);
         assert!(ok.valid);
+    }
+
+    /// #2387: an informational row is printed but counted apart from the warnings,
+    /// on both summary branches, and a report with none reads exactly as before.
+    #[test]
+    fn check_summary_counts_info_apart_from_warnings() {
+        use ferx_core::{CheckReport, Diagnostic};
+        let info = || Diagnostic::info("W_LEVEL_SUMMARY", "level `ARM`: 7 groups");
+        let ok = CheckReport::new("m", None, vec![info(), info()]);
+        print_check_human(&ok);
+        assert_eq!(
+            check_summary_line(&ok),
+            "ok: m — no errors (0 warning(s), 2 info)"
+        );
+        let bad = CheckReport::new(
+            "m",
+            None,
+            vec![
+                info(),
+                Diagnostic::warning("W_X", "w"),
+                Diagnostic::error("E_Y", "e"),
+            ],
+        );
+        assert_eq!(
+            check_summary_line(&bad),
+            "invalid: m — 1 error(s), 1 warning(s), 1 info"
+        );
+        let plain = CheckReport::new("m", None, vec![Diagnostic::warning("W_X", "w")]);
+        assert_eq!(
+            check_summary_line(&plain),
+            "ok: m — no errors (1 warning(s))"
+        );
     }
 }

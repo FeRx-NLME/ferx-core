@@ -1,0 +1,225 @@
+Fri Oct 30 01:42:26 PM UTC 2026
+$PROBLEM tte_exponential POSTHOC at the Laplace optimum -- EBE anchor for #1885
+; #1885: the analytic half of the individual-survival anchor. Same model and data as
+; tte_exponential_cov_focei.ctl, evaluated (MAXEVAL=0 POSTHOC) at that run's final
+; estimates, read from results/tte_exponential_cov_focei.ext (-1000000000 row):
+; THETA1 = 3.32303E-02, OMEGA(1,1) = 2.84734E-01. ETA1 is then each subject's conditional
+; mode and CHZ = LAMBDA*exp(ETA1)*TIME the individual cumulative hazard at its record.
+$INPUT ID TIME DV EVID AMT CMT RATE MDV
+$DATA tte_exponential_cov.csv IGNORE=@
+$PRED
+  LAMBDA = THETA(1)*EXP(ETA(1))
+  CHZ = LAMBDA*TIME
+  SUR = EXP(-CHZ)
+  IF (DV.EQ.1) Y = LAMBDA*SUR
+  IF (DV.EQ.0) Y = SUR
+$THETA 3.32303E-02 FIX
+$OMEGA 2.84734E-01 FIX
+$EST METHOD=COND LAPLACE LIKELIHOOD MAXEVAL=0 POSTHOC PRINT=1
+$TABLE ID TIME DV CHZ ETA1 NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE15.8
+       FILE=tte_exponential_ebe.tab
+
+NM-TRAN MESSAGES
+  
+ WARNINGS AND ERRORS (IF ANY) FOR PROBLEM    1
+             
+ (WARNING  2) NM-TRAN INFERS THAT THE DATA ARE POPULATION.
+             
+ (WARNING  3) THERE MAY BE AN ERROR IN THE ABBREVIATED CODE. THE FOLLOWING
+ ONE OR MORE RANDOM VARIABLES ARE DEFINED WITH "IF" STATEMENTS THAT DO NOT
+ PROVIDE DEFINITIONS FOR BOTH THE "THEN" AND "ELSE" CASES. IF ALL
+ CONDITIONS FAIL, THE VALUES OF THESE VARIABLES WILL BE ZERO.
+  
+   Y
+
+
+License Registered to:  InsightRX
+Expiration Date:    14 AUG 2027
+Current Date:       30 OCT 2026
+Days until program expires : 289
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.6.0 (nm760)
+ ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
+ CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
+ AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
+ PERFORMED BY NOUS INFOSYSTEMS.
+
+ PROBLEM NO.:         1
+ tte_exponential POSTHOC at the Laplace optimum -- EBE anchor for #1885
+0DATA CHECKOUT RUN:              NO
+ DATA SET LOCATED ON UNIT NO.:    2
+ THIS UNIT TO BE REWOUND:        NO
+ CREATE/ADD TO FDATA.csv:        YES
+ NO. OF DATA RECS IN DATA SET:       30
+ NO. OF DATA ITEMS IN DATA SET:   8
+ ID DATA ITEM IS DATA ITEM NO.:   1
+ DEP VARIABLE IS DATA ITEM NO.:   3
+ MDV DATA ITEM IS DATA ITEM NO.:  8
+0LABELS FOR DATA ITEMS:
+ ID TIME DV EVID AMT CMT RATE MDV
+0(NONBLANK) LABELS FOR PRED-DEFINED ITEMS:
+ CHZ
+0FORMAT FOR DATA:
+ (8E6.0)
+
+ TOT. NO. OF OBS RECS:       30
+ TOT. NO. OF INDIVIDUALS:       30
+0LENGTH OF THETA:   1
+0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
+0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT OMEGA BOUNDARY TEST OMITTED:    NO
+0INITIAL ESTIMATE OF THETA:
+ LOWER BOUND    INITIAL EST    UPPER BOUND
+  0.3323E-01     0.3323E-01     0.3323E-01
+0INITIAL ESTIMATE OF OMEGA:
+ 0.2847E+00
+0OMEGA CONSTRAINED TO BE THIS INITIAL ESTIMATE
+0TABLES STEP OMITTED:    NO
+ NO. OF TABLES:           1
+ SEED NUMBER (SEED):    11456
+ NPDTYPE:    0
+ INTERPTYPE:    0
+ RANMETHOD:             3U
+ MC SAMPLES (ESAMPLE):    300
+ WRES SQUARE ROOT TYPE (WRESCHOL): EIGENVALUE
+0-- TABLE   1 --
+0RECORDS ONLY:    ALL
+04 COLUMNS APPENDED:    NO
+ PRINTED:                NO
+ HEADER:                YES
+ FILE TO BE FORWARDED:   NO
+ FORMAT:                s1PE15.8
+ IDFORMAT:
+ LFORMAT:
+ RFORMAT:
+ FIXED_EFFECT_ETAS:
+0USER-CHOSEN ITEMS:
+ ID TIME DV CHZ ETA1
+1
+
+
+ #TBLN:      1
+ #METH: Laplacian Conditional Estimation (Evaluation)
+
+ ESTIMATION STEP OMITTED:                 YES
+ SHRINK INFO WITH EVALUATION (EVALSHRINK) NO
+ ANALYSIS TYPE:                           POPULATION
+ CONDITIONAL ESTIMATES USED:              YES
+ CENTERED ETA:                            NO
+ EPS-ETA INTERACTION:                     NO
+ LAPLACIAN OBJ. FUNC.:                    YES
+ NUMERICAL 2ND DERIVATIVES:               NO
+ PRED F SET TO A LIKELIHOOD:              YES
+ NUMERICAL DERIVATIVE
+       FILE REQUEST (NUMDER):               NONE
+ MAP (ETAHAT) ESTIMATION METHOD (OPTMAP):   0
+ ETA HESSIAN EVALUATION METHOD (ETADER):    0
+ INITIAL ETA FOR MAP ESTIMATION (MCETA):    0
+ SIGDIGITS FOR MAP ESTIMATION (SIGLO):      100
+ GRADIENT SIGDIGITS OF
+       FIXED EFFECTS PARAMETERS (SIGL):     100
+ NOPRIOR SETTING (NOPRIOR):                 0
+ NOCOV SETTING (NOCOV):                     OFF
+ DERCONT SETTING (DERCONT):                 OFF
+ FINAL ETA RE-EVALUATION (FNLETA):          1
+ EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
+       IN SHRINKAGE (ETASTYPE):             NO
+ NON-INFL. ETA CORRECTION (NONINFETA):      0
+ RAW OUTPUT FILE (FILE): tte_exponential_ebe.ext
+ EXCLUDE TITLE (NOTITLE):                   NO
+ EXCLUDE COLUMN LABELS (NOLABEL):           NO
+ FORMAT FOR ADDITIONAL FILES (FORMAT):      S1PE12.5
+ PARAMETER ORDER FOR OUTPUTS (ORDER):       TSOL
+ KNUTHSUMOFF:                               0
+ INCLUDE LNTWOPI:                           NO
+ INCLUDE CONSTANT TERM TO PRIOR (PRIORC):   NO
+ INCLUDE CONSTANT TERM TO OMEGA (ETA) (OLNTWOPI):NO
+ ADDITIONAL CONVERGENCE TEST (CTYPE=4)?:    NO
+ EM OR BAYESIAN METHOD USED:                 NONE
+
+
+ THE FOLLOWING LABELS ARE EQUIVALENT
+ PRED=NPRED
+ RES=NRES
+ WRES=NWRES
+ IWRS=NIWRES
+ IPRD=NIPRED
+ IRS=NIRES
+
+ Elapsed evaluation time in seconds:     0.01
+ Elapsed postprocess time in seconds:     0.00
+1
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                  LAPLACIAN CONDITIONAL ESTIMATION (EVALUATION)                 ********************
+ #OBJT:**************                       MINIMUM VALUE OF OBJECTIVE FUNCTION                      ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+
+
+
+ #OBJV:********************************************           166.440       *********************************************
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                  LAPLACIAN CONDITIONAL ESTIMATION (EVALUATION)                 ********************
+ ********************                             FINAL PARAMETER ESTIMATE                           ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+ THETA - VECTOR OF FIXED EFFECTS PARAMETERS   *********
+
+
+         TH 1     
+ 
+         3.32E-02
+ 
+
+
+ OMEGA - COV MATRIX FOR RANDOM EFFECTS - ETAS  ********
+
+
+         ETA1     
+ 
+ ETA1
++        2.85E-01
+ 
+1
+
+
+ OMEGA - CORR MATRIX FOR RANDOM EFFECTS - ETAS  *******
+
+
+         ETA1     
+ 
+ ETA1
++        5.34E-01
+ 
+ Elapsed finaloutput time in seconds:     0.00
+ #CPUT: Total CPU Time in Seconds,        0.042
+Stop Time:
+Fri Oct 30 01:42:29 PM UTC 2026

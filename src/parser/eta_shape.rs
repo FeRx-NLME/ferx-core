@@ -5,8 +5,8 @@
 //! NONMEM spelling `CL = TVCL * EXP(ETATR)`.
 //!
 //! Each transform is written **once**, as [`shape_g`] over [`PkNum`]: `T = f64`
-//! is the value every evaluator computes, and `T = Dual2` gives the exact
-//! `∂/∂η`, `∂/∂shape` the sensitivity providers consume. There is no second copy
+//! is the value every evaluator computes, and the dual and taped types give the
+//! exact `∂/∂η`, `∂/∂shape` the adjoint gradient consumes. There is no second copy
 //! of any formula — the symbolic partials ([`ShapeOut::DEta`] /
 //! [`ShapeOut::DShape`]) are the same kernel over `Dual1`.
 

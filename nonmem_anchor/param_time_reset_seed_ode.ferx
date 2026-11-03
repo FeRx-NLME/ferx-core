@@ -1,0 +1,39 @@
+# ferx twin (ode) of nonmem_anchor/param_time_reset_seed.ctl (#1969): the TIME that
+# [individual_parameters] reads is the TIME as written. Parameters at NONMEM's optimum
+# (results/param_time_reset_seed.ext), evaluated once (maxiter = 0) by
+# tests/param_time_written_nonmem_anchor.rs.
+[parameters]
+  theta TVCL(1.9815736704215268, 0.01, 100.0)
+  theta TVV(20.132496151595486, 1.0, 500.0)
+  theta TVBASE(40.062410826409234, 0.1, 1000.0)
+  theta BSTEP(3.0, FIX)
+  omega ETA_CL ~ 0.12264935457881193
+  omega ETA_V  ~ 0.04391214711269829
+  sigma PROP_ERR ~ 0.10365736991845893 (sd)
+  sigma ADD_ERR ~ 0.0001 (variance) FIX
+
+[individual_parameters]
+  BASE = if (TIME >= 24.0) TVBASE * BSTEP else TVBASE
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 0
+  inner_tol = 1e-8
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

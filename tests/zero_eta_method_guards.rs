@@ -108,7 +108,7 @@ fn the_gn_remedy_is_stated_exactly_once() {
 
 #[test]
 fn a_gn_focei_chain_at_zero_eta_drops_the_badly_wrong_claim() {
-    // `methods = [gn, focei]` is `gn_hybrid` spelled out: the FOCEI stage
+    // `method = [gn, focei]` is `gn_hybrid` spelled out: the FOCEI stage
     // re-optimises the GN result, so neither #1006 diagnostic applies. The GN
     // stage still reports its own non-convergence — only the targeted string is
     // suppressed, not every warning the stage produced.
@@ -147,7 +147,9 @@ fn an_imp_chain_at_zero_eta_fails_before_the_focei_stage_runs() {
         methods: vec![EstimationMethod::FoceI, EstimationMethod::Imp],
         ..Default::default()
     };
-    let err = fit(&model, &pop, &model.default_params, &opts).expect_err("must be rejected");
+    let err = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("must be rejected")
+        .to_string();
     assert!(
         err.contains("method = imp requires at least one random effect"),
         "expected the up-front check_model_options message, got: {err}"

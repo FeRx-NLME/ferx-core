@@ -70,7 +70,7 @@ use std::time::Instant;
 use ferx_core::cancel::is_cancelled;
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{
-    bind_theta_levels, check_strictness, fit, CancelFlag, FitResult, GradientMethod, PoolPlan,
+    bind_theta_levels, check_strictness, fit, BloqMethod, CancelFlag, FitResult, PoolPlan,
     Population, StrictnessVerdict,
 };
 
@@ -203,9 +203,35 @@ impl Runner {
         data: &Population,
         options: &RunOptions,
     ) -> Result<RunReport, String> {
-        self.run_with_fitter(candidates, data, options, |candidate, threads_per_fit| {
-            compile_and_fit(candidate, data, options, threads_per_fit, &self.cancel)
-        })
+        self.run_observed(candidates, data, options, &|_| {})
+    }
+
+    /// [`run`](Self::run), calling `on_finished` with each candidate's result
+    /// as soon as it is known (#2512).
+    ///
+    /// A fitted candidate is reported from the lane that fitted it, right
+    /// after its journal row is written — so in completion order, from
+    /// whichever thread finished it. A candidate that needed no fit (reused
+    /// from the journal or a [`reuse_from`](Self::reuse_from) directory, or a
+    /// duplicate) is reported after the fits, in submission order. Every
+    /// result the returned [`RunReport`] carries is reported exactly once;
+    /// candidates a cancelled run never reached are not reported.
+    pub fn run_observed(
+        &self,
+        candidates: &[Candidate],
+        data: &Population,
+        options: &RunOptions,
+        on_finished: &(dyn Fn(&CandidateResult) + Sync),
+    ) -> Result<RunReport, String> {
+        self.run_with_fitter_observed(
+            candidates,
+            data,
+            options,
+            |candidate, threads_per_fit| {
+                compile_and_fit(candidate, data, options, threads_per_fit, &self.cancel)
+            },
+            on_finished,
+        )
     }
 
     /// The body of [`run`](Self::run), with the fit itself injected.
@@ -216,12 +242,29 @@ impl Runner {
     /// tests in the slow tier and make the concurrency assertion untestable
     /// (there is no way to observe "two fits are in flight" from outside
     /// `fit()`).
+    #[cfg(test)]
     fn run_with_fitter<F>(
         &self,
         candidates: &[Candidate],
         data: &Population,
         options: &RunOptions,
         fitter: F,
+    ) -> Result<RunReport, String>
+    where
+        F: Fn(&Candidate, usize) -> Result<FitResult, CandidateError> + Sync,
+    {
+        self.run_with_fitter_observed(candidates, data, options, fitter, &|_| {})
+    }
+
+    /// [`run_with_fitter`](Self::run_with_fitter) with the
+    /// [`run_observed`](Self::run_observed) callback.
+    fn run_with_fitter_observed<F>(
+        &self,
+        candidates: &[Candidate],
+        data: &Population,
+        options: &RunOptions,
+        fitter: F,
+        on_finished: &(dyn Fn(&CandidateResult) + Sync),
     ) -> Result<RunReport, String>
     where
         F: Fn(&Candidate, usize) -> Result<FitResult, CandidateError> + Sync,
@@ -392,6 +435,7 @@ impl Runner {
             if let Some(j) = &journal {
                 j.append(&record_of(&result), result.fit.as_ref());
             }
+            on_finished(&result);
             n_fitted.fetch_add(1, Ordering::Relaxed);
             Some((i, result))
         };
@@ -450,14 +494,19 @@ impl Runner {
         let mut n_reused = 0usize;
         for i in (0..candidates.len()).filter(|i| duplicate_of[*i].is_none()) {
             if let Some(result) = by_index.remove(&i) {
-                n_reused += usize::from(result.reused);
+                // A foreign fit is reported here; one this run fitted already
+                // was, from its lane.
+                if result.reused {
+                    n_reused += 1;
+                    on_finished(&result);
+                }
                 outcomes.insert(i, result);
             } else if let Some(record) = reused.get(hashes[i].as_str()) {
                 n_reused += 1;
-                outcomes.insert(
-                    i,
-                    reused_result(&candidates[i], record, self.cache_dir.as_deref(), options),
-                );
+                let result =
+                    reused_result(&candidates[i], record, self.cache_dir.as_deref(), options);
+                on_finished(&result);
+                outcomes.insert(i, result);
             }
         }
 
@@ -475,7 +524,7 @@ impl Runner {
                 // worth. `duplicate_of` names where to find it.
                 Some(first) => {
                     if let Some(source) = outcomes.get(&first) {
-                        results.push(CandidateResult {
+                        let duplicate = CandidateResult {
                             id: candidates[i].id.clone(),
                             hash: hashes[i].clone(),
                             parent: candidates[i].parent.clone(),
@@ -489,7 +538,9 @@ impl Runner {
                             error: source.error.clone(),
                             duplicate_of: Some(source.id.clone()),
                             reused: source.reused,
-                        });
+                        };
+                        on_finished(&duplicate);
+                        results.push(duplicate);
                     }
                 }
             }
@@ -883,34 +934,24 @@ fn compile_and_fit(
     let mut population = Cow::Borrowed(data);
     if !parsed.model.theta_blocks().level_blocks().is_empty() {
         bind_theta_levels(&mut parsed, &text, population.to_mut())
-            .map_err(CandidateError::model)?;
+            .map_err(|e| CandidateError::model(e.to_string()))?;
     }
     ferx_core::api::bind_covariate_stats(&mut parsed, &text, &population)
-        .map_err(CandidateError::model)?;
+        .map_err(|e| CandidateError::model(e.to_string()))?;
 
     // The caller's settings replace the file's wholesale when given; the four
     // overrides below are the runner's own and always win.
-    let base = options
-        .fit_options
-        .clone()
-        .unwrap_or_else(|| parsed.fit_options.clone());
-
-    // Two `FitOptions` keys reach the engine through the *model* rather than
-    // through the options, so an override that only lands in `fit_options` is an
-    // override the fit does not see. `fit_from_files` stamps both; so does this.
     //
-    // `bloq_method` is the one that bites: the censored-data likelihood reads
-    // `model.bloq_method`, so a candidate run with an override from `drop` to
-    // `m3` (or back) would report the requested setting and score the other
-    // one's likelihood — a wrong ranking, silently. Parsing already stamps the
-    // *file's* value, which is why this is invisible until a caller supplies
-    // `RunOptions::fit_options`.
-    parsed.model.bloq_method = base.bloq_method;
-    // And the file's `gradient = ...`, with an SDE model forced to FD.
-    parsed.model.gradient_method = if parsed.model.is_sde() {
-        GradientMethod::Fd
-    } else {
-        base.gradient_method
+    // No model stamps: `fit` reads `gradient` (#1613) and `bloq_method` (#1824) from the
+    // options per call. Replacing the file's settings wholesale includes `bloq_method`, so a
+    // caller's options that set none mean the default `drop` — not the candidate file's key,
+    // which the parser also left on the model.
+    let base = match options.fit_options.clone() {
+        Some(mut given) => {
+            given.bloq_method = Some(given.bloq_method.unwrap_or(BloqMethod::Drop));
+            given
+        }
+        None => parsed.fit_options.clone(),
     };
 
     let init_params = parsed.model.default_params.clone();
@@ -924,7 +965,8 @@ fn compile_and_fit(
     // pool cannot be built, and the model-shaped bad outcome — a fit that
     // finishes without converging — is an `Ok` judged by the strictness gate,
     // not an error at all.
-    fit(&parsed.model, &population, &init_params, &fit_options).map_err(CandidateError::environment)
+    fit(&parsed.model, &population, &init_params, &fit_options)
+        .map_err(|e| CandidateError::environment(e.to_string()))
 }
 
 #[cfg(test)]

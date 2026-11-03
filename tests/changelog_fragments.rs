@@ -32,8 +32,16 @@ const TAIL: &str = "## [0.1.0] - 2026-01-01\n\n### Fixed\n- Old fix (#1).\n\n\
 
 /// A fresh scratch tree holding `CHANGELOG.md` (empty `[Unreleased]`) and the given
 /// fragments.
+///
+/// The directory is one no other call gets, in this process or another: `slot` alone
+/// named a fixed path under `CARGO_TARGET_TMPDIR`, removed and rewritten per call, so two
+/// runs of this binary sharing a target dir could read each other's fragments — one CI run
+/// judged `bad-category`'s twin on `no-reference`'s content (#2409; #2090 is the same bug).
 fn tree(slot: &str, fragments: &[(&str, &str)]) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("changelog-{slot}"));
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("changelog-{slot}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("changelog.d")).unwrap();
     std::fs::write(dir.join("CHANGELOG.md"), format!("{HEAD}{TAIL}")).unwrap();

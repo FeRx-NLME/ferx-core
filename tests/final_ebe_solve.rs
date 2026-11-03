@@ -60,7 +60,11 @@ fn a_fit_reports_the_objective_its_optimizer_reached() {
     let entry = starved
         .warnings_structured
         .iter()
-        .find(|w| w.category == WarningCode::EbeStartDependent);
+        // #833's message, not the #2013 screen's, which shares its code and also fires
+        // here (the screen moves one subject the starved cold descent stops short on).
+        .find(|w| {
+            w.category == WarningCode::EbeStartDependent && w.message.contains("vs the reported ")
+        });
     let cold = entry.map(|entry| {
         assert_eq!(entry.severity, WarningSeverity::Warning);
         // The message quotes `(<cold> vs the reported <ofv>)`. The reported OFV must be

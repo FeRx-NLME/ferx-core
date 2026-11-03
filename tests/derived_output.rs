@@ -471,6 +471,59 @@ fn derived_time_builtin_echoes_per_observation_time() {
     }
 }
 
+/// #2149: `x mod 0` is `0` in `[derived]` (the tree evaluator) exactly as in
+/// `[individual_parameters]` (the bytecode VM). Before the fix `ZD` was `NaN`
+/// on every row while `ZI`, the same expression read back from the VM, was `0`.
+#[test]
+fn derived_mod_zero_matches_individual_parameters() {
+    let src = "
+[parameters]
+  theta CL(1.0, 0, 100)
+  theta V(10.0, 0, 1000)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  Z  = TIME mod 0
+  CL = exp(log(CL) + ETA_CL) * (1 + Z)
+  V  = V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  ZD = TIME mod 0
+  ZI = Z
+";
+    let model = parse_model_string(src).expect("model with `mod 0` parses");
+    let pop = one_dose_population();
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    opts.outer_maxiter = 1;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("short fit must not error");
+
+    let sr = &result.subjects[0];
+    let col = |name: &str| {
+        sr.extra_columns
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("derived column {name} present"))
+            .1
+            .clone()
+    };
+    let (zd, zi) = (col("ZD"), col("ZI"));
+    assert_eq!(zd.len(), 4, "one ZD value per observation");
+    assert_eq!(zi.len(), 4, "one ZI value per observation");
+    for (d, i) in zd.iter().zip(&zi) {
+        assert_eq!(*i, 0.0, "[individual_parameters] `TIME mod 0` is 0");
+        assert_eq!(*d, *i, "[derived] `TIME mod 0` must equal the VM's value");
+    }
+}
+
 /// Parser must reject step=0 and step negative in [derived] integral().
 #[test]
 fn integral_step_zero_is_rejected_at_parse() {

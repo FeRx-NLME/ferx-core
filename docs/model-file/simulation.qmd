@@ -80,7 +80,9 @@ This will:
 1. For each subject, random effects are sampled from $\eta_i \sim N(0, \Omega)$.
    For IOV (`kappa`) models an independent occasion random effect
    $\kappa_{i,o} \sim N(0, \Omega_{\text{IOV}})$ is **also** drawn for each
-   occasion $o$ (grouped by the `iov_column`), so the simulated data reproduces
+   occasion $o$ (grouped by the `iov_column`, or by the occasions an
+   `iov_occasion = dose | time(...)` rule derives — see
+   [IOV: Simulation](iov.qmd#simulation)), so the simulated data reproduces
    the between-occasion variability the model parameterizes — matching NONMEM
    `$SIM`. The post-fit NPDE/NPD diagnostics are a separate code path that
    draws its own per-occasion kappas the same way; see

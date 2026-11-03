@@ -207,6 +207,7 @@ fn a_non_positive_exponent_is_refused_before_fitting() {
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("data");
     let err = fit(&m, &pop, &m.default_params, &FitOptions::default())
         .err()
-        .expect("a zero exponent must be rejected");
+        .expect("a zero exponent must be rejected")
+        .to_string();
     assert!(err.contains("power exponent"), "{err}");
 }

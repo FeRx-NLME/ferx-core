@@ -1,0 +1,18 @@
+[parameters]
+  theta TVCL(2.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.01
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * X * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[covariates]
+  X continuous
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method = foce
+  maxiter = 0
+  covariance = false

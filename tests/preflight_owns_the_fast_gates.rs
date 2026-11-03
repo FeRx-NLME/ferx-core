@@ -785,6 +785,47 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
         listed_commands("docs").join("\n  ")
     );
 
+    // `-Dunused` only proves "used" for the feature set it was compiled under, and that
+    // proof does not carry down to a subset: an item read only from a
+    // `#[cfg(feature = "survival")]` body is used under `ci,markov,nn` (`markov` implies
+    // `survival`) and dead in the default build ferx-r ships. #2075 — four parser items
+    // from #1924 warned in every default build while this group passed. So some ferx-core
+    // clippy line has to lint a feature set WITHOUT `survival`, transitively. Deleting the
+    // `--features ci` line leaves the count tripwire at 2 if the line is replaced rather
+    // than removed; this is what fires.
+    //
+    // And it has to lint the LIB ALONE, the target ferx-r compiles. Under `--all-targets`
+    // (or `--tests`) a `#[cfg(test)]` reader counts as a use, so a production helper only
+    // a test calls still warns in ferx-r's build while the line passes.
+    let survival_free = clippy.iter().any(|cmd| {
+        if !selects_ferx_core(cmd) {
+            return false;
+        }
+        let args: Vec<&str> = cmd.split_whitespace().collect();
+        if !args.contains(&"--lib") || args.contains(&"--all-targets") || args.contains(&"--tests")
+        {
+            return false;
+        }
+        let mut set = Vec::new();
+        let mut parts = cmd.split_whitespace();
+        while let Some(p) = parts.next() {
+            if p == "--features" {
+                if let Some(list) = parts.next() {
+                    set.extend(list.split(',').map(|f| f.to_string()));
+                }
+            }
+        }
+        !expand_features(&set).iter().any(|f| f == "survival")
+    });
+    assert!(
+        survival_free,
+        "no ferx-core clippy command lints the lib alone (`--lib`, no `--all-targets` / \
+         `--tests`) on a feature set without `survival`, so an item whose only reader is \
+         survival-gated or test-only is dead in the default build and no gate denies it \
+         (#2075).\n  {}",
+        clippy.join("\n  ")
+    );
+
     let fmt = listed_commands("fmt");
     assert!(
         fmt.iter().any(|c| c.contains(" --all")),
@@ -1091,7 +1132,7 @@ fn preflight_is_executable_and_lists_every_group() {
         ("changelog", 1),  // tools/changelog.sh check (#1545)
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
-        ("clippy", 2),     // ferx-core --all-targets · members
+        ("clippy", 3),     // ferx-core ci,markov,nn · ferx-core ci --lib (#2075) · members
         ("rustdoc", 2),    // ferx-core rustdoc · members
         ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
         ("public-api", 1), // tools/update-public-api.sh --check
@@ -1276,7 +1317,9 @@ fn the_coverage_jobs_build_the_guarded_profile() {
         let body = job_body(&yml, job);
         let cov: Vec<String> = run_commands(&body)
             .into_iter()
-            .filter(|c| c.contains("cargo llvm-cov"))
+            // Both jobs are sharded (#2167): `ci-test-shard.py run` gets the build
+            // arguments after its `--` and passes them to every `cargo llvm-cov`.
+            .filter(|c| c.contains("cargo llvm-cov") || c.contains("ci-test-shard.py run "))
             .collect();
         assert!(
             !cov.is_empty(),

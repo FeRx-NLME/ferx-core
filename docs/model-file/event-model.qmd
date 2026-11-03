@@ -37,6 +37,18 @@ including data format, hazard families, and comparison with nlmixr2 / NONMEM.
 > evaluation time; only the individual parameters the hazard actually uses are computed.
 > A referenced individual parameter may **not** depend on an inter-occasion (IOV/kappa)
 > random effect — the hazard has no occasion context, so that is rejected with an error.
+> Nor may a hazard parameter read the `TIME` built-in, directly or through a referenced
+> individual parameter: an analytic family's parameters are evaluated once per subject with
+> no time argument, so `TIME` would silently read 0, and the model is rejected at parse
+> ([#1919](https://github.com/FeRx-NLME/ferx-core/issues/1919)). The family's own time
+> dependence lives in its closed form; for a hazard that varies in `TIME` some other way,
+> write it as an [ODE-accumulated `hazard =`](#joint-pk-tte-ode-accumulated-hazard-hazard)
+> with the `TIME` term in that expression. The check follows the block path by path, and
+> recognises two separate `if` statements as testing the same condition when the conditions
+> are written identically and nothing they read is re-assigned in between. Equivalent
+> conditions written differently (`TVKT > 0` and `0 < TVKT`) are treated as independent, so
+> a `TIME` dependency on a path no execution takes can still be refused; the message says
+> so, and writing the conditions identically (or merging the `if` statements) resolves it.
 > Writing the full theta/eta expression directly (e.g. `TVLAMBDA * exp(ETA_LAMBDA)`) also
 > works.
 

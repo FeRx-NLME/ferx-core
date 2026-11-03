@@ -29,9 +29,9 @@
 //! so a full averaging window is collected *after* settling before breaking. Otherwise
 //! early stopping would simply trade under-convergence for a noisy last iterate.
 
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use nalgebra::DVector;
 
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::nn_reg::NnRegularizer;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{
@@ -448,7 +448,7 @@ fn build_families(
 ) -> Vec<Box<dyn VariationalFamily>> {
     k_occasions
         .iter()
-        .map(|&k| build_family(kind, n_eta + k * n_kappa))
+        .map(|&k| build_family(kind, stacked_width(n_eta, n_kappa, k)))
         .collect()
 }
 
@@ -543,6 +543,20 @@ fn restore_fixed(params: &mut ModelParameters, template: &ModelParameters) {
             params.sigma.values[k] = template.sigma.values[k];
         }
     }
+}
+
+/// Whether `template` FIXes any population parameter whose reported value VI keeps as declared.
+/// Structural zeros of a mixed Ω are not FIXes: their held `L[i,j] = 0` unpacks to an exact 0.
+fn declares_fix(template: &ModelParameters) -> bool {
+    [
+        &template.theta_fixed,
+        &template.sigma_fixed,
+        &template.omega_fixed,
+        &template.kappa_fixed,
+        &template.residual_correlation_fixed,
+    ]
+    .iter()
+    .any(|flags| flags.iter().any(|&f| f))
 }
 
 /// Run variational inference, stopping once the objective has settled or `vi_iters`
@@ -937,6 +951,19 @@ pub fn run_vi(
         }
     }
     restore_fixed(&mut final_params, init_params);
+    // Report exactly what the packed vector unpacks to. A closed-form Ω is written above as
+    // a matrix, and `L·Lᵀ` of its Cholesky factor lands a ULP away at some points and not
+    // at others, so the `packed_estimate` guard of a reloaded fit (`fit_packed_estimate`)
+    // held or failed according to where Adam happened to stop. Every later number — ELBO,
+    // EBEs, OFV, covariance step — is evaluated at this one point. Not under a FIX: a FIXed
+    // value is reported bit for bit as declared, which `exp(ln θ)` and `L·Lᵀ` need not
+    // reproduce, so such a fit keeps it and a reloaded one takes the guard's fallback.
+    let packed_final = pack_params(&final_params);
+    let final_params = if declares_fix(init_params) {
+        final_params
+    } else {
+        unpack_params(&packed_final, &final_params)
+    };
 
     // Re-evaluate at the averaged point with more draws: this number is reported,
     // so it should carry less Monte-Carlo noise than a training iteration.
@@ -948,7 +975,7 @@ pub fn run_vi(
         model,
         population,
         init_params,
-        &pack_params(&final_params),
+        &packed_final,
         fams,
         &phis_final,
         &report_cfg,
@@ -958,8 +985,9 @@ pub fn run_vi(
     // The variational moments — VI's own output, reported on `ViResult`.
     //
     // Under IOV `μ` spans the stacked vector, so the reported `η` moments are its BSV
-    // head and the per-occasion `κ` means are read off the blocks behind it. `warm` keeps
-    // only the `η` part: it seeds the EBE search below, whose own `κ` solve is separate.
+    // head and the per-occasion `κ` means are read off the blocks behind it. `warm` is both,
+    // `η` then each occasion's `κ` mean: it seeds the EBE search below, so an IOV subject's
+    // `κ` solve starts at its variational mean rather than at 0 (#2261).
     let mut eta_means: Vec<Vec<f64>> = Vec::with_capacity(n_subjects);
     let mut eta_covs: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_subjects);
     let mut kappa_means: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_subjects);
@@ -976,14 +1004,18 @@ pub fn run_vi(
         kappa_means.push(
             (0..k_occasions[i])
                 .map(|g| {
-                    let off = n_eta + g * n_kappa;
+                    let off = kappa_offset(n_eta, n_kappa, g);
                     (0..n_kappa).map(|c| mu[off + c]).collect()
                 })
                 .collect(),
         );
-        warm.push(DVector::from_iterator(
-            n_eta,
-            mu.iter().take(n_eta).copied(),
+        let kappa_cells: Vec<DVector<f64>> = kappa_means[i]
+            .iter()
+            .map(|k| DVector::from_column_slice(k))
+            .collect();
+        warm.push(crate::estimation::outer_optimizer::joint_warm_start(
+            &DVector::from_iterator(n_eta, mu.iter().take(n_eta).copied()),
+            &kappa_cells,
         ));
     }
 
@@ -995,17 +1027,21 @@ pub fn run_vi(
     // produces both. It is cheap: warm-starting from `μ` lands the EBE search
     // essentially on top of its answer.
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm(
-        model,
-        population,
-        &final_params,
-        options.inner_maxiter,
-        options.inner_tol,
-        Some(&warm),
-        Some(&final_mu_k),
-        0,
-        0,
-    );
+    // The convention of the marginal the post-fit diagnostics score (#1722).
+    let (eta_hats, h_matrices, _, kappas) =
+        crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
+            model,
+            population,
+            &final_params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&warm),
+            Some(&final_mu_k),
+            0,
+            0,
+            crate::estimation::inner_optimizer::InnerHessianSeed::None,
+            options,
+        );
 
     // Judged on the run that actually happened, not on the `vi_iters` ceiling — under
     // early stopping those differ, and windowing a 900-iteration trace as though it were
@@ -1100,7 +1136,7 @@ pub fn run_vi(
             warnings.push(
                 "VI: `ofv` is NaN because the ELBO is a lower bound on the log likelihood, not \
                  a −2 log L, and is not comparable with a FOCE/SAEM OFV. Set \
-                 `vi_final_ofv = laplace`, or chain `methods = vi, imp` with \
+                 `vi_final_ofv = laplace`, or chain `method = [vi, imp]` with \
                  `imp_eval_only = true`, to evaluate a genuine marginal likelihood at the VI \
                  estimate. The bound itself is on `vi.neg_two_elbo`."
                     .to_string(),
@@ -1135,9 +1171,8 @@ pub fn run_vi(
     // the Laplace objective, not of the ELBO, so it is well-defined even when the
     // reported `ofv` is deliberately left `NaN`. `run_covariance_step` gates itself
     // on `options.run_covariance_step`, which `fit_inner` clears on every
-    // non-terminal stage of a chain — so a `methods = vi, focei` run pays for it
+    // non-terminal stage of a chain — so a `method = [vi, focei]` run pays for it
     // once, at the end.
-    let packed_final = pack_params(&final_params);
     let cov_out = crate::estimation::covariance::run_covariance_step(
         &packed_final,
         &final_params,
@@ -1232,6 +1267,7 @@ pub fn run_vi(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        total_ebe_nm_polished: 0,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal,
@@ -1243,7 +1279,9 @@ pub fn run_vi(
         // re-deriving `chol(Ω)` from `L·Lᵀ` (#816 follow-up).
         packed_estimate: Some(packed_final),
         left_init: None,
+        stationary_start: false,
         vi: Some(vi_result),
+        start_eval: None,
         mixture_posteriors: None,
     })
 }

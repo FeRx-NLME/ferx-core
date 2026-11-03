@@ -1,0 +1,26 @@
+# #2163: the ferx twin of mixture_sim_class.ctl. Two classes, class 2 clearing 4x
+# faster with its own Ω and Σ; the class-1 probability depends on WT. Simulated, not
+# fitted: every parameter is the data-generating value.
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0, FIX)
+  theta TVV(10.0, 0.1, 1000.0, FIX)
+  theta MIXL(-0.85, -10.0, 10.0, FIX)
+  theta BWT(0.05, -1.0, 1.0, FIX)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL + BWT * (WT - 70)
+  omega(2) ETA_CL ~ 0.36
+  sigma(2) EPS ~ 0.09
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL * exp(ETA_CL) else 4 * TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)

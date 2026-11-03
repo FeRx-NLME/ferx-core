@@ -14,6 +14,14 @@
 # normalised input space, which is also what makes the fixture a non-degenerate
 # check of that: a grid built on raw covariates would probe the saturated region
 # and the penalty would silently read ≈ 0.
+#
+# `init` is load-bearing too (#1561). Without it every output-layer bias starts at
+# 0, so CL, V1, Q, V2 and KA all start at softplus(0) = 0.693. From there the
+# λ = 0 FOCEI fit reported `converged = true` at OFV −234, above the
+# covariate-free point (all weights 0) inside its own parameter space. The values
+# are `examples/two_cpt_oral_cov.ferx`'s initial estimates, not the simulation's
+# true values. `first_line_search_abort_is_avoided_or_resumed_not_reported`
+# strips this line on purpose to keep the bare start it was written against.
 
 [parameters]
   omega ETA_CL ~ 0.15
@@ -31,6 +39,7 @@
   output     = softplus
   center     = [70, 86]
   scale      = [12, 23]
+  init       = [4, 40, 8, 80, 1]
 
 [individual_parameters]
   CL = TYPICAL_PK.CL * exp(ETA_CL)

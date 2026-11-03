@@ -12,6 +12,8 @@
 //! - `crate::io::serde_nan::vec`     for `Vec<f64>`
 //! - `crate::io::serde_nan::vec_vec` for `Vec<Vec<f64>>`
 //! - `crate::io::serde_nan::opt`     for `Option<f64>`
+//! - `crate::io::serde_nan::opt_vec` for `Option<Vec<f64>>`
+//! - `crate::io::serde_nan::opt_present` for an `Option<f64>` whose `None` is an absent key
 
 use serde::{Serialize, Serializer};
 
@@ -110,5 +112,187 @@ pub mod opt {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<f64>, D::Error> {
         Option::<f64>::deserialize(de)
+    }
+}
+
+/// `Option<Vec<f64>>` field: `None` -> `null`, `Some(v)` -> `v` with each
+/// non-finite element -> `null`, and back. Pair it with
+/// `skip_serializing_if = "Option::is_none"` + `default` so an absent vector is
+/// an absent key rather than a `null` one.
+pub mod opt_vec {
+    use super::NanNullSlice;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<Vec<f64>>, ser: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => ser.serialize_some(&NanNullSlice(v.as_slice())),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Vec<f64>>, D::Error> {
+        let opts: Option<Vec<Option<f64>>> = Option::deserialize(de)?;
+        Ok(opts.map(|v| v.into_iter().map(|o| o.unwrap_or(f64::NAN)).collect()))
+    }
+}
+
+/// `Option<f64>` field whose `None` is an *absent key*, not a `null` value. Pair
+/// it with `default` + `skip_serializing_if = "Option::is_none"`: key presence
+/// then carries `Some`/`None`, so the value can use `null` for a non-finite
+/// `Some` and read it back as `Some(NaN)`. Under [`opt`], a `Some(NaN)` would come
+/// back as `None` — lossless only where `None` and `NaN` mean the same thing.
+pub mod opt_present {
+    use super::NanNull;
+    use serde::{Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<f64>, ser: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => NanNull(*v).serialize(ser),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<f64>, D::Error> {
+        super::scalar::deserialize(de).map(Some)
+    }
+}
+
+/// A JSON value read back with every `null` that lands on a plain `f64` (or
+/// `f32`) as `NaN` — the inverse of `serde_json` writing a non-finite float as
+/// `null`, for a whole type at once rather than one annotated field at a time.
+///
+/// Every other `null` reads as it would from the bare [`serde_json::Value`]: an
+/// `Option` becomes `None`, a unit becomes `()`, anything else is an error.
+/// Arrays, objects and newtypes are walked so a nested `f64` gets the same rule;
+/// an enum's payload is read by the bare `Value` (no NaN-able enum payload is
+/// written today).
+pub(crate) struct NullAsNan(pub(crate) serde_json::Value);
+
+impl<'de> serde::Deserializer<'de> for NullAsNan {
+    type Error = serde_json::Error;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        use serde_json::Value;
+        match self.0 {
+            Value::Array(items) => v.visit_seq(NullAsNanSeq(items.into_iter())),
+            Value::Object(map) => v.visit_map(NullAsNanMap {
+                entries: map.into_iter(),
+                value: None,
+            }),
+            other => serde::Deserializer::deserialize_any(other, v),
+        }
+    }
+
+    fn deserialize_f64<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Null => v.visit_f64(f64::NAN),
+            other => serde::Deserializer::deserialize_f64(other, v),
+        }
+    }
+
+    fn deserialize_f32<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        self.deserialize_f64(v)
+    }
+
+    fn deserialize_option<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Null => v.visit_none(),
+            other => v.visit_some(NullAsNan(other)),
+        }
+    }
+
+    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        v: V,
+    ) -> Result<V::Value, Self::Error> {
+        v.visit_newtype_struct(self)
+    }
+
+    fn deserialize_enum<V: serde::de::Visitor<'de>>(
+        self,
+        name: &'static str,
+        variants: &'static [&'static str],
+        v: V,
+    ) -> Result<V::Value, Self::Error> {
+        serde::Deserializer::deserialize_enum(self.0, name, variants, v)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 char str string bytes byte_buf
+        unit unit_struct seq tuple tuple_struct map struct identifier ignored_any
+    }
+}
+
+struct NullAsNanSeq(std::vec::IntoIter<serde_json::Value>);
+
+impl<'de> serde::de::SeqAccess<'de> for NullAsNanSeq {
+    type Error = serde_json::Error;
+
+    fn next_element_seed<T: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, Self::Error> {
+        self.0
+            .next()
+            .map(|v| seed.deserialize(NullAsNan(v)))
+            .transpose()
+    }
+}
+
+struct NullAsNanMap {
+    entries: serde_json::map::IntoIter,
+    value: Option<serde_json::Value>,
+}
+
+impl<'de> serde::de::MapAccess<'de> for NullAsNanMap {
+    type Error = serde_json::Error;
+
+    fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        let Some((key, value)) = self.entries.next() else {
+            return Ok(None);
+        };
+        self.value = Some(value);
+        seed.deserialize(serde_json::Value::String(key)).map(Some)
+    }
+
+    fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> Result<V::Value, Self::Error> {
+        let value = self.value.take().expect("next_key_seed runs first");
+        seed.deserialize(NullAsNan(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[derive(serde::Serialize, serde::Deserialize, Debug)]
+    struct Holder {
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "super::opt_present"
+        )]
+        x: Option<f64>,
+    }
+
+    /// `opt_present` keeps `Some(NaN)` as `Some(NaN)` where `opt` would return
+    /// `None`, and a finite value and an absent key each as themselves.
+    #[test]
+    fn opt_present_round_trips_some_nan_finite_and_none() {
+        let rt = |x: Option<f64>| -> (String, Option<f64>) {
+            let json = serde_json::to_string(&Holder { x }).unwrap();
+            let back: Holder = serde_json::from_str(&json).unwrap();
+            (json, back.x)
+        };
+        let (json, back) = rt(Some(f64::NAN));
+        assert_eq!(json, r#"{"x":null}"#);
+        assert!(back.is_some_and(f64::is_nan), "got {back:?}");
+        assert_eq!(rt(Some(2.5)), (r#"{"x":2.5}"#.into(), Some(2.5)));
+        assert_eq!(rt(None), ("{}".into(), None));
     }
 }

@@ -375,33 +375,34 @@ fn a_time_reading_hazard_alone_does_not_warn() {
     );
 }
 
-/// **An inherited false positive, pinned rather than fixed.** `pk_reads_absolute_time` is
-/// built on #1166's PK-row filter, which drops the injected `d/dt(__chz_*)` *derivative*
-/// lines. An `[odes]` intermediate is a top-level `AssignBc`, not one of those, so
-/// `TT = TIME` consumed only by the hazard still reads as a non-autonomous PK block — and
-/// this model is warned about although its PK block is autonomous.
+/// **The intermediate spelling of the #1210 case is silent too (#1279).** Factoring the
+/// hazard's `TIME` read out into an `[odes]` intermediate (`TT = TIME` … `hazard = f(TT)`)
+/// is not a property of the model, so it must agree with the inline spelling in
+/// `a_time_reading_hazard_alone_does_not_warn` — together they are the straddle.
 ///
-/// #1166 chose that over-decline as "conservative in the safe direction", which is free for
-/// its own consumer (a gate picking a gradient route) and is a false positive for a
-/// user-facing diagnostic. Narrowing it needs the dataflow cut #1166 deferred, so it is
-/// accepted here and asserted, so that the cut — whenever it lands — is a deliberate change
-/// to a known behaviour rather than an accidental one.
-///
-/// **Filed as #1279, and this test is expected to go red when it lands.** That is its
-/// purpose, so the correct response then is to flip the assertion to `is_none()` — not to
-/// weaken or delete it, and not to conclude the fix broke something. Its sibling
-/// `a_time_reading_hazard_alone_does_not_warn` (the time read written inline in `hazard =`)
-/// must stay green throughout; together they are the straddle, and #1279 is the statement
-/// that the two spellings should agree.
+/// Until #1279 this test was `…_still_warns` and asserted the opposite: #1166's PK-row filter
+/// dropped only the injected `d/dt(__chz_*)` lines, kept every intermediate, and so this
+/// autonomous PK block was warned about. The view is now a dataflow cut, and the guard that
+/// the cut did not go too far is the second half: the same intermediate read by the PK RHS
+/// still warns.
 #[cfg(feature = "survival")]
 #[test]
-fn a_time_reading_intermediate_used_only_by_the_hazard_still_warns() {
+fn a_time_reading_intermediate_used_only_by_the_hazard_does_not_warn() {
     let m =
         joint_model_with_intermediate("TT = TIME", "H0 * exp(0.05*TT) * exp(BETA * (central / V))");
+    assert_eq!(
+        warning_for(&m, &population(1, true, 12.0)),
+        None,
+        "an intermediate read only by the hazard leaves the PK block autonomous (#1279)"
+    );
+    let m = joint_src(
+        " * (1.0 + 0.003*TT)",
+        "TT = TIME",
+        "H0 * exp(BETA * (central / V))",
+    );
     assert!(
         warning_for(&m, &population(1, true, 12.0)).is_some(),
-        "documented over-decline inherited from #1166: an intermediate read only by the \
-         hazard still reads wide, so this warns although the PK block is autonomous"
+        "the same intermediate read by the PK RHS is a genuine absolute-clock read"
     );
 }
 

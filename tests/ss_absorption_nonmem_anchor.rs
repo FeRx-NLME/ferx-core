@@ -27,7 +27,13 @@
 //! `nonmem_anchor/results/ss_first_order.*`.
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::{fit, predict, read_nonmem_csv, simulate_with_options_diag, SimulateOptions};
+use ferx_core::pk::compute_predictions_with_states;
+use ferx_core::sim::adaptive::{ControllerCtx, DoseAction};
+use ferx_core::{
+    fit, predict, predict_diag, read_nonmem_csv, simulate_adaptive, simulate_with_options_diag,
+    AdaptiveSimulateOptions, AdaptiveSimulationResult, CompiledModel, Population, PredictionOutput,
+    SimulateOptions,
+};
 
 /// Serializes every test in this binary that runs an `SS=1` model (#1113).
 ///
@@ -401,5 +407,172 @@ fn simulate_stays_silent_for_benign_nonlinear_ss_absorption() {
             .any(|w| w.contains("Steady-state (SS=1) equilibration")),
         "benign fast-contracting nonlinear SS model must stay silent; got: {:?}",
         out.warnings
+    );
+}
+
+// ── #1652: predict_diag and the adaptive driver drain the SS sink ─────────────────────────────
+//
+// Both entry points return a `warnings` channel, so they report the steady-state non-convergence
+// note of the pass that just ran — the note `simulate_with_options_diag` already reports on the
+// same input (`simulate_surfaces_ss_nonconvergence_warning_when_no_steady_state`). The input space
+// is entry point × sink state: capped this pass (T1/T2), benign this pass after an earlier capped
+// call left a note behind (T3/T4), benign on a clean sink (T5).
+//
+// Engine: every fixture here is an `[odes]` model, so each pass runs the ODE value path
+// (`equilibrate_ss_state`'s capped pulse train); no gradient is computed, so FD vs dual does not
+// apply. Every test takes `ss_sink_guard()` — the sink is process-global (#1113).
+
+const SS_NOTE: &str = "Steady-state (SS=1) equilibration";
+
+fn capped_fixture() -> (CompiledModel, Population) {
+    let model = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL)
+        .expect("model parses")
+        .model;
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+    (model, population)
+}
+
+/// The `TVVMAX 500` variant `simulate_stays_silent_for_benign_nonlinear_ss_absorption` uses:
+/// nonlinear, so it still takes the pulse train, but it settles well inside the cycle budget.
+fn benign_fixture() -> (CompiledModel, Population) {
+    let src = SS_MM_NO_STEADY_STATE_MODEL.replace(
+        "theta TVVMAX(10.0, 1.0, 100.0)",
+        "theta TVVMAX(500.0, 1.0, 5000.0)",
+    );
+    let model = parse_full_model(&src).expect("model parses").model;
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+    (model, population)
+}
+
+fn has_ss_note(warnings: &[String]) -> bool {
+    warnings.iter().any(|w| w.contains(SS_NOTE))
+}
+
+fn run_predict_diag(model: &CompiledModel, population: &Population) -> PredictionOutput {
+    predict_diag(model, population, &model.default_params).expect("predict_diag returns Ok")
+}
+
+/// The adaptive driver with a controller that never doses, so the base `SS=1` regimen is all it
+/// integrates. η = 0 exactly: `omega ~ 0.0` is PD-regularised, so default parameters would draw
+/// a tiny η (#1603); zeroing it keeps the run identical to `predict`'s.
+fn run_adaptive(model: &CompiledModel, population: &Population) -> AdaptiveSimulationResult {
+    let mut opts = AdaptiveSimulateOptions::default();
+    opts.seed = Some(1);
+    opts.decision_times = vec![4.0];
+    let mut params = model.default_params.clone();
+    params.omega.chol.fill(0.0);
+    params.omega.matrix.fill(0.0);
+    let res = simulate_adaptive(
+        model,
+        population,
+        &params,
+        1,
+        || |_: &ControllerCtx| -> Vec<DoseAction> { Vec::new() },
+        &opts,
+    )
+    .expect("adaptive sim runs");
+    assert!(res.ledger.is_empty(), "the no-op controller dosed");
+    res
+}
+
+/// A public writer that never drains: it runs the capped equilibration and leaves the note in the
+/// sink. Bare `predict()` cannot play this role — after #1652 it drains (and discards), so T3/T4
+/// could not fail. That this writer really leaves a note is what the clear-dropping mutations
+/// measure: without the clear, T3/T4 report it.
+fn leave_capped_residue() {
+    let (model, population) = capped_fixture();
+    let theta = &model.default_params.theta;
+    let eta = vec![0.0; model.n_eta];
+    for subject in &population.subjects {
+        let (preds, _) = compute_predictions_with_states(&model, subject, theta, &eta);
+        assert!(!preds.is_empty(), "the residue writer produced no rows");
+    }
+}
+
+/// T1. Mutation: drop the `take` in `predict_diag` → no note.
+#[test]
+fn predict_diag_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
+    let _sink_guard = ss_sink_guard();
+    let (model, population) = capped_fixture();
+    let out = run_predict_diag(&model, &population);
+    assert!(
+        has_ss_note(&out.warnings),
+        "a saturable SS model dosed above capacity must surface the non-convergence note through \
+         PredictionOutput.warnings, as simulate does on the same input; got: {:?}",
+        out.warnings
+    );
+    assert!(
+        !out.results.is_empty(),
+        "predict_diag must still return rows"
+    );
+}
+
+/// T2. Mutation: drop the `take` in `run_adaptive_population` → no note.
+#[test]
+fn adaptive_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
+    let _sink_guard = ss_sink_guard();
+    let (model, population) = capped_fixture();
+    let res = run_adaptive(&model, &population);
+    assert!(
+        has_ss_note(&res.warnings),
+        "a saturable SS model dosed above capacity must surface the non-convergence note through \
+         AdaptiveSimulationResult.warnings; got: {:?}",
+        res.warnings
+    );
+    assert!(
+        !res.trajectories.is_empty(),
+        "the adaptive driver must still return trajectories"
+    );
+}
+
+/// T3. Mutation: drop the `clear` in `predict_diag` → the residue is reported as this pass's.
+#[test]
+fn predict_diag_does_not_report_a_previous_calls_note() {
+    let _sink_guard = ss_sink_guard();
+    leave_capped_residue();
+    let (model, population) = benign_fixture();
+    let out = run_predict_diag(&model, &population);
+    assert!(
+        !has_ss_note(&out.warnings),
+        "a benign predict_diag after a capped non-draining call must not report that call's \
+         note; got: {:?}",
+        out.warnings
+    );
+}
+
+/// T4. Mutation: drop the `clear` in `run_adaptive_population` → the residue is reported.
+#[test]
+fn adaptive_does_not_report_a_previous_calls_note() {
+    let _sink_guard = ss_sink_guard();
+    leave_capped_residue();
+    let (model, population) = benign_fixture();
+    let res = run_adaptive(&model, &population);
+    assert!(
+        !has_ss_note(&res.warnings),
+        "a benign adaptive run after a capped non-draining call must not report that call's \
+         note; got: {:?}",
+        res.warnings
+    );
+}
+
+/// T5. False-positive guard, the twin of `simulate_stays_silent_for_benign_nonlinear_ss_absorption`
+/// for the two new drains. Control mutation: a `take` that always yields the note reddens it.
+#[test]
+fn predict_diag_and_adaptive_stay_silent_for_benign_nonlinear_ss() {
+    let _sink_guard = ss_sink_guard();
+    let (model, population) = benign_fixture();
+    let out = run_predict_diag(&model, &population);
+    assert!(
+        !has_ss_note(&out.warnings),
+        "benign nonlinear SS model must stay silent through predict_diag; got: {:?}",
+        out.warnings
+    );
+    let res = run_adaptive(&model, &population);
+    assert!(
+        !has_ss_note(&res.warnings),
+        "benign nonlinear SS model must stay silent through the adaptive driver; got: {:?}",
+        res.warnings
     );
 }

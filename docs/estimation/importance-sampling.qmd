@@ -69,17 +69,35 @@ a final FOCE Laplace pass for AIC/BIC comparability.
 > (`impmap_proposal_df = normal`), it is replaced by a finite-`t` proposal for
 > this final marginal eval, so the heavier tails keep the importance weights bounded.
 
-### Rich data: prefer IMPMAP or warm-start
+### Rich data and cold starts
 
-Because IMP's proposal lags one iteration behind the parameters, it is
-**fragile on rich data**: when the conditional posterior of η is razor-sharp
-(many observations per subject), a large early M-step moves the posterior past
-the lagged proposal and the effective sample size collapses. This is the
-documented weakness of `METHOD=IMP` and the reason NONMEM offers IMPMAP. On
-rich data, either use [`impmap`](impmap.qmd) (re-centres every iteration, robust)
-or **warm-start IMP from FOCEI** (`methods = [focei, imp]`) so the per-iteration
-steps are small and the lagged proposal stays overlapped. IMP is well-suited to
-**sparse data**, where the broad posterior keeps the proposal overlapped.
+IMP's proposal lags one iteration behind the parameters, so the bookkeeping
+between iterations matters. The closed-form mu-ref step moves each packed θ by
+the population mean of η, and the posterior of η moves the other way by the same
+amount. ferx translates each subject's stored importance draws with it — the
+samples and their weighted mean, per class under a mixture — so the proposal stays on the
+posterior while the individual parameters do not change. Each #619 group step
+does the same with its own shift. The samples move as well as the moments
+because a later group step in the same iteration, under `impmap` too, scores
+them at the already-shifted θ.
+
+Until #1365 those stored means were left where they were. From a cold start the
+first step is several posterior SDs, so on iteration 2 every subject went
+low-ESS and the fit diverged. That collapse was read as IMP's inherent rich-data
+weakness, but it was this bookkeeping gap. Measured cold-start runs, as the
+importance-sampling −2 log L at the last iteration (macOS arm64):
+
+| Model, iterations | before | after | reference |
+|---|---|---|---|
+| `examples/warfarin.ferx`, 50 | 1.4e15, every subject low-ESS | −286.0 | NONMEM `METHOD=IMP` −285.69 |
+| `examples/two_cpt_oral_cov.ferx`, 30 | 4.8e14, every subject low-ESS | −1199.6 | `[focei, imp]` −1199.4 |
+| FREM warfarin fixture (`tests/frem_warfarin.rs`), 3 | +328.8 | −151.6 | 60 iterations reach −220.9; SAEM / IMPMAP −220.7 |
+
+A warm start (`method = [focei, imp]`) still saves iterations. A subject whose
+posterior is very sharp can still lose overlap after a large step in a parameter
+the shift does not own (a non-mu-referenced θ, σ, or Ω), and
+[`impmap`](impmap.qmd), which re-centres on the mode every iteration, is the
+robust choice when the low-ESS count stays high.
 
 ```
 [fit_options]
@@ -133,7 +151,7 @@ Rules for the **evaluation-only** mode:
   centre/scale) there via a FOCE inner loop. When chained after an estimator
   (`[focei, imp]`), it uses that stage's EBEs/Jacobian instead.
 - **Must appear at most once** (true for both modes).
-- **Must be terminal.** `methods = [imp, focei]` with `imp_eval_only` is rejected
+- **Must be terminal.** `method = [imp, focei]` with `imp_eval_only` is rejected
   — a following stage would overwrite the parameters and make the IS result
   meaningless. (The *estimating* `imp` has no such restriction; it may lead or
   sit mid-chain like any estimator.)
@@ -281,9 +299,13 @@ Practical notes:
   weakly-identified subject that would have been listed under
   `imp_low_ess_threshold` may no longer trip it — read the low-ESS diagnostic with
   that in mind when $\alpha > 0$.
-- **Sobol QMC is disabled** while the mixture is active (the per-sample
-  broad/narrow branch breaks the quasi-random sequence); IMPMAP emits a warning
-  if you set both `impmap_sobol = true` and `imp_defensive_alpha > 0`.
+- **Sobol QMC still applies** while the mixture is active (#1965): with
+  `impmap_sobol` / `imp_sobol` on, a dedicated quasi-random coordinate picks
+  each draw's component, so the broad fraction is stratified (within one draw
+  of αK when K is a power of two) instead of binomial, and both components take their normals from the
+  same Sobol point. Under `imp_sobol` the Student-t proposal is limited to
+  `imp_proposal_df ≤ 1000` (use `normal` beyond that) and a draw to 1000
+  quasi-random coordinates; both are checked when the fit starts.
 - For an IMPMAP stage the option may also be written `impmap_defensive_alpha`
   (an alias for the same field).
 
@@ -297,12 +319,12 @@ Laplace OFV on SDE models; IMP for SDE is tracked as a follow-up.
 
 ## IOV (inter-occasion variability)
 
-> IOV is supported only in **evaluation-only** mode (`imp_eval_only = true`). The
-> estimating `imp` (like `impmap`) refuses IOV models for now — the κ M-step is
-> a planned follow-up. Use SAEM or FOCEI to *estimate* IOV models, then score
-> with an evaluation-only `imp`.
+> Both the estimating `imp` and evaluation-only `imp` support IOV. The
+> estimating method samples the same joint (η, κ) vector each iteration and
+> updates Ω~IOV~ in closed form — see [IMPMAP: inter-occasion
+> variability](impmap.qmd#impmap-iov), whose E- and M-steps it shares (#2301).
 
-For models with `kappa` declarations, evaluation-only IMP performs
+For models with `kappa` declarations, IMP performs
 **joint sampling** of
 both η (between-subject variability) and κ (between-occasion variability).
 The proposal is built from the full (n_eta + n_kappa × n_occasions)
@@ -312,6 +334,14 @@ The result struct flags this via `kappa_treatment = "marginalized"`
 (YAML) and the CLI prints a notice. The reported `−2 log L` integrates
 over both η and κ uncertainty, making it directly comparable to
 NONMEM `$EST METHOD=IMP LAPLACIAN=1` on κ.
+
+## Standard errors on a non-Gaussian model
+
+With a TTE, `[binary_model]` or CTMM endpoint, the covariance step after `imp` differentiates
+the 7-node quadrature marginal (`method = laplace, n_agq = 7`) rather than the FOCEI objective,
+whose minimum can sit far from the `imp` estimate on such a model (#1781). See
+[SAEM: covariance step on a non-Gaussian model](saem.qmd#saem-covariance-non-gaussian) for
+when it applies, the measured effect, and the warnings it carries.
 
 ## Cost
 
@@ -358,7 +388,7 @@ typed as `Option<ImportanceSamplingResult>`.
 
 ferx's estimating `imp` is validated against NONMEM 7.5.1 `METHOD=IMP` on the
 warfarin example (10-subject extract, `data/warfarin.csv`). Both engines are
-warm-started from a FOCE/FOCEI pass (ferx `methods = [focei, imp]`; NONMEM
+warm-started from a FOCE/FOCEI pass (ferx `method = [focei, imp]`; NONMEM
 `$EST METHOD=COND INTERACTION` → `$EST METHOD=IMP INTERACTION NITER=100
 ISAMPLE=1000 SEED=12345`, control stream `tests/nonmem/warfarin_imp.ctl`).
 
@@ -393,7 +423,7 @@ lives in `tests/warfarin_imp_nonmem.rs`.
 
 ## See also
 
-- [SAEM](saem.qmd) — common upstream stage for `methods = [saem, imp]`.
+- [SAEM](saem.qmd) — common upstream stage for `method = [saem, imp]`.
 - [SIR](sir.qmd) — a different importance-sampling-flavoured procedure
   that targets *parameter uncertainty* (CIs on θ/Ω/σ), not the marginal
   likelihood. The name overlap is unfortunate; the two methods are

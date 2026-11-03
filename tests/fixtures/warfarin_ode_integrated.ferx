@@ -1,0 +1,36 @@
+# examples/warfarin_ode.ferx with the elimination made saturable at a KM (1e6 mg/L) far above
+# any concentration in data/warfarin.csv: numerically the same model to well under a solver
+# tolerance, but *structurally* nonlinear, so it is integrated rather than solved exactly by
+# the matrix exponential (#852). For tests that observe the integrator's settings
+# (`ode_reltol`, `ode_abstol`, `ode_max_steps`, `ode_auto_switch`, …), which a linear model no
+# longer reads.
+
+[parameters]
+  theta TVCL(0.2,  0.001, 10.0)
+  theta TVV(10.0,  0.1,  500.0)
+  theta TVKA(1.5,  0.01,  50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central / (1 + central / 1e6)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = foce
+  maxiter = 300

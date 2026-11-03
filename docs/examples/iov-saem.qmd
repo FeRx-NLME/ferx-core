@@ -95,7 +95,7 @@ SAEM produces the same output fields as FOCE for IOV: a `KAPPA (IOV) Estimates` 
 
 ```
 --- KAPPA (IOV) Estimates ---
-  KAPPA_CL = 0.038500  (CV% = 19.6)
+  KAPPA_CL = 0.038500  (CV% = 19.8)
 ```
 
 ## Tips

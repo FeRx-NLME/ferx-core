@@ -190,16 +190,18 @@ stays on the lag-free fast paths.
 - `lagtime` may carry a random effect like any other PK parameter
   (`LAGTIME = TVLAGTIME * exp(ETA_LAGTIME)`). The optimiser handles
   derivatives through the same machinery used for `CL`, `V`, `KA`, etc.
-- Negative `lagtime` is not clamped — if a user writes an expression that
-  yields a negative value, predictions will treat the dose as effective
-  before its record time. Prefer a log-link (`exp(...)`) or any other
-  parameterisation that keeps `lagtime ≥ 0`. ferx emits a warning in
-  `FitResult.warnings` when the initial typical-value lagtime is negative.
-  This is a deliberate divergence from NONMEM, which **aborts** on a negative
-  absorption lag (`PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE`, `PROGRAM
-  TERMINATED BY OBJ`); ferx warns and starts the subject's timeline at the
-  earlier onset, identically on every engine
-  ([#1189](https://github.com/FeRx-NLME/ferx-core/issues/1189)).
+- A **negative** `lagtime` (or `ALAG{n}`) at the initial estimates is
+  rejected: `fit()` and `ferx check` stop with `E_NEGATIVE_LAGTIME`, naming the
+  subject and the dose record, as NONMEM does (`PK PARAMETER FOR ABSORPTION LAG
+  IS NEGATIVE`). Like `E_DOSE_ATTR_NONFINITE` below, it is evaluated at typical
+  values at each dose record's own snapshot, so a lag that only turns negative
+  at a later dose is caught too
+  ([#1189](https://github.com/FeRx-NLME/ferx-core/issues/1189)). Prefer a
+  log-link (`exp(...)`) or a lower bound of 0 on the lag's `theta`. A lag driven
+  negative *mid-fit* by an η or θ excursion is not rejected: predictions treat
+  the dose as effective before its record time, identically on every engine.
+  `predict()` and `simulate()` run no data errors, so they serve a negative lag
+  the same way and report it as the warning `W_NEGATIVE_LAGTIME`.
 - A **non-finite** `lagtime` (`NaN`/`Inf`) is rejected, not warned. It makes
   `dose time + lagtime` — and every break derived from it — non-finite, so the
   subject's integration timeline cannot be ordered at all. One that is already

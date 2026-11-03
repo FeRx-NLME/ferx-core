@@ -156,6 +156,27 @@ $$
 
 **Damped σ step.** The residual σ that rides the numerical M-step gets its own capped step, $\gamma_k^\sigma = \min(\gamma_k,\,0.2,\,\gamma_k^\theta)$, applied to $\sigma^2$ rather than to $\log\sigma$ (issue #1445). Until then it was the one SAEM statistic with no stochastic approximation at all — assigned outright in both phases — so the reported σ was a single draw of the M-step maximiser rather than its average. The cap is on in **both** phases, which is what distinguishes it from the Ω step: Ω accepts the $\gamma=1$ assignment at the first convergence iteration because $(1/N)\sum_i \eta_i\eta_i^T$ over $N$ subjects is a well-determined statistic, while the σ maximiser of a *minority* variance component is not. The additive half of a `combined(PROP, ADD)` model on sparse data is exactly that: its single-draw conditional maximiser is boundary-heavy, so an assigned σ reports whichever value the last iteration happened to draw. Beyond $k-K_1 = 5$ the cap no longer binds and the full decaying $\gamma_k = 1/(k-K_1)$ takes over, which is what lets the SA estimate settle. Averaging on the variance scale is deliberate — it is the scale the [scalar residual sufficient statistic](#scalar-residual-error-update) already averages on, and a geometric mean of a sequence with mass near zero collapses where the arithmetic mean of $\sigma^2$ does not (measured: $\log\sigma$ averaging leaves the #1445 fixture's $\sigma_{\text{add}}$ at 0.47 against a truth of 1.8, where the $\sigma^2$ average reaches 1.4). The third term is one-sided: σ never steps *faster* than θ, but the two are not always equal. They are equal during **exploration** whenever `mstep_damping` is at or below 0.2 (the `iiv_on_ruv` default of 0.03 is), and from the fifth convergence iteration on, where $1/(k-K_1) \le 0.2$. They differ over the four hand-off iterations $k-K_1 \in \{1,2,3,4\}$ — θ takes 1, ½, ⅓, ¼ while σ takes 0.2 — and during exploration for any `mstep_damping` above 0.2, where σ is the slower of the two. So no configuration, `iiv_on_ruv` included, is bit-identical to before; what is preserved is that σ is never given a larger step than the θ it shares a maximiser with.
 
+#### Which σ components the exploration cap applies to {#saem-sigma-cap-release}
+
+Since issue #1464 the exploration half of that cap is **per component**. The cap protects a variance component that the data identify only weakly. For one the data pin down, it only slows σ's exploration trajectory. That trajectory reaches every θ without an ETA through the same frozen-η objective the numerical M-step maximises. At each exploration M-step ferx computes the standard error of $\log\sigma_k$ under that objective, from the inverse of the σ–σ block of its expected information at the current draw:
+
+$$
+I_{ab} = \tfrac12 \sum_j \frac{\partial V_j/\partial\log\sigma_a \;\, \partial V_j/\partial\log\sigma_b}{V_j^2}.
+$$
+
+The block is inverted rather than read off its diagonal, so two components the data cannot tell apart both read as weak. A component with $\mathrm{SE}(\log\sigma_k) \le 0.10$ takes θ's step, $\min(\gamma_k, \gamma_k^\theta)$, and keeps the guarantee that σ never steps faster than θ. Every other component keeps the 0.2 cap. The convergence hand-off is unchanged for every component.
+
+That standard error is how far one draw's maximiser of the component can wander, in log units. Measured along 6-seed fits, cefepime's additive term reads 0.15–0.24 throughout exploration. Busulfan's additive term starts at 0.64 from its 1.0 initial estimate (a minority at that point, so it is correctly held) and falls to 0.06 once it has grown to its converged ~28. Every proportional term reads 0.01–0.03. On importance-sampled −2 log L over the same 6 seeds, against the cap on every component:
+
+| | cefepime (run64) | busulfan, 600 subjects | busulfan, `TVQ` FIX |
+|---|---|---|---|
+| release at SE ≤ 0.10 (shipped) | −0.2 | **−15.6** | −5.9 |
+| release every component | +1.0 | −14.3 | −4.7 |
+
+The table hides the readout that fails. Releasing every component puts cefepime's `ADD_ERR` at 0.051 and 0.104 on two seeds in six, which is #1445 again. The shipped gate keeps all six at 1.22–1.41, up from 1.10–1.25 with the cap everywhere and closer to NONMEM FOCEI's 1.550 on the same data. On busulfan the no-ETA `TVQ` moves from 11.7–15.3 to 8.8–11.5; the `TVQ`-FIX control sits at 8.44.
+
+The release applies only in the plain Gaussian scope of [`mstep_solver = score_sa`](#saem-mstep-jensen), and not to `iiv_on_ruv` models. An `iiv_on_ruv` σ shares a ridge with ω_RUV, and the conditional standard error misreads that ridge. Outside that scope the schedule is the #1445 one unchanged.
+
 ### 3. M-Step for Omega (Closed Form)
 
 $$
@@ -191,13 +212,77 @@ What decides eligibility is therefore not the link but whether the **packed** th
 | `P = THETA * exp(ETA)`, `exp(log(THETA) + ETA)` | $\log \theta$ | yes (theta is log-packed) |
 | `P = inv_logit(THETA + ETA)` | $\theta$ | yes — a logit-scale theta has a negative lower bound, so it is packed as-is (#918) |
 | `P = inv_logit(logit(THETA) + ETA)` | $\mathrm{logit}\,\theta$ | no — no packing has that scale |
-| `P = THETA + ETA` | $\theta$ | no — routed to NLopt |
+| `P = THETA + ETA` | $\theta$ | yes, on the natural scale whatever the packing — see [additive mu-references](#saem-mstep-additive) (#2540) |
 
-The two excluded forms are still mu-referenced (they still centre the inner/E-step search); they just take the numeric M-step. This matters most for bounded $(0,1)$ parameters — bioavailability, pathway fractions, $E_{max}$ fractions — in models that also carry IIV on the residual error, where the numeric M-step works from noticeably noisier conditional samples: declare the theta on the logit scale (`theta LOGIT_F(-0.477, -10.0, 10.0)`) and write `F = inv_logit(LOGIT_F + ETA_F)`.
+The excluded form is still mu-referenced (it still centres the inner/E-step search); it just takes the numeric M-step. This matters most for bounded $(0,1)$ parameters — bioavailability, pathway fractions, $E_{max}$ fractions — in models that also carry IIV on the residual error, where the numeric M-step works from noticeably noisier conditional samples: declare the theta on the logit scale (`theta LOGIT_F(-0.477, -10.0, 10.0)`) and write `F = inv_logit(LOGIT_F + ETA_F)`.
 
 The packing rule cuts both ways, and a mismatch is reported rather than silently routed: a lognormal theta declared with a *negative* lower bound is packed on the identity scale, and a logit-scale theta declared with a *non-negative* lower bound (`theta LOGIT_F(0.5, 0.0, 5.0)`) is packed on the log scale. Neither packed value is the mu, so the closed form does not apply; SAEM and IMP/IMPMAP estimate such a theta through the numerical M-step and emit an advisory naming it, with the bound to change. Under `mu_referencing = false` **SAEM** runs no closed-form shift at all and suppresses the advisory; single-population IMP/IMPMAP is different — its shift is EM-mandatory, so it runs (and advises) independently of that option, as [the IMP/IMPMAP page](impmap.qmd) describes.
 
 A theta that anchors **more than one** eta (`F1 = inv_logit(LOGIT_F + ETA_F1)` *and* `F2 = inv_logit(LOGIT_F + ETA_F2)`, or the lognormal `CL = TVP*exp(ETA_CL)` / `V = TVP*exp(ETA_V)`) is also routed to the numerical M-step with an advisory: the closed form shifts a packed theta by one eta mean and pins it, and no single such shift is the joint maximiser. Give each eta its own typical value to get the closed-form update.
+
+#### Additive mu-references {#saem-mstep-additive}
+
+An additive typical value, `E0 = TVE0 + ETA_E0`, has $g = \mathrm{id}$, so its mu is
+the natural $\theta$. A theta with a non-negative lower bound is packed as
+$\log\theta$, so the packed value is not the mu. Since
+[#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540) SAEM shifts the natural
+value instead, $\theta \leftarrow \theta + \gamma_k\,\overline{\eta}$, clamps it to the
+bounds, repacks it, and re-centres the etas by the change it actually made. The same
+update applies to an identity-packed theta. This is single-population SAEM only. Under
+a `[mixture]` an additive anchor stays on the numerical M-step, since the class-aware
+shift has no additive arm, and SAEM names it in a warning
+(`the additive mu-referenced typical value(s) … are estimated by the numerical M-step in
+this [mixture] model`,
+[#2548](https://github.com/FeRx-NLME/ferx-core/issues/2548)). Check such a value against
+a FOCEI fit, or write the parameter log-normal with a non-negative lower bound, which the
+class-aware shift covers. A log-normal theta with a negative lower bound is identity-packed
+and stays on the numerical M-step as well. IMP and IMPMAP step the packed value, so for
+them an additive theta takes the numerical M-step too, which is why FOCEI is the check.
+
+The typical value can have a line of its own or share one with other terms. Since
+[#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544) these two are the same
+mu-reference:
+
+```
+E0   = TVE0 + ETA_E0
+BASE = E0 + PLACEBO + KAPPA_ARM
+
+BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM
+```
+
+A line is recognised when it adds one bare theta, one eta, and terms that read
+neither; the terms may read kappas, covariates and other thetas. NONMEM writes the
+same thing as `MU_1 = THETA(1)` with `E0 = MU_1 + ETA(1)` or
+`BASE = MU_1 + PLA + ETA(1)`; the two streams end bit-identical
+(`nonmem_anchor/saem_additive_mu_inline.ctl`). The theta and the eta must enter the
+model only through that line, in either spelling. When another block reads the theta,
+or another individual parameter that the model reads does, or another line reads the
+eta, the anchor is dropped and SAEM warns `not mu-referenced: BASE`: the shift sets the
+theta to the mean of $\theta + \eta_i$, which is the M-step only if nothing else
+moves with it. [Individual parameters](../model-file/individual-parameters.qmd#sec-typical-own-line)
+lists the shapes that are not recognised.
+
+Without the shift, an additive theta sits on a ridge. With the etas frozen, the data
+determine only $\theta + \overline{\eta}$. The split between the two is set only by
+the eta prior, which reaches $\theta$ only through later E-steps, and the offset in
+$\overline{\eta}$ is added to $\omega^2$. On `tests/data/mbma_placebo`, where the
+FOCEI objective is the exact likelihood (minimum 97.0700), SAEM stopped 1–11 OFV
+units above the minimum on five seeds, with TVE0 4.7 low and $\omega^2$ 30.3 against
+4.81. NONMEM SAEM without `MU_` does the same. With only TVE0 and $\omega^2$ free
+(`nonmem_anchor/saem_additive_mu.ferx`), measured on five seeds:
+
+| | OFV (MLE 165.8260) |
+|---|---|
+| ferx, `BASE = TVE0 + PLAFIX + ETA_E0` before #2544, or with TVE0 read elsewhere | 168.54 – 172.76 |
+| NONMEM, no `MU_` | 167.41 – 174.32 |
+| ferx, `E0 = TVE0 + ETA_E0`, and `BASE = TVE0 + PLAFIX + ETA_E0` since #2544 | 165.8260 – 165.8266 |
+| NONMEM, `MU_1` | 165.8260 – 165.8261 |
+
+On the full `mbma_placebo` model with the split spelling, SAEM lands at 97.33–98.39.
+The rest of the gap comes from the 21 thetas still on the numerical M-step
+([#2470](https://github.com/FeRx-NLME/ferx-core/issues/2470)). For a model that is
+linear in its etas, as this one is, FOCEI is the exact likelihood and the better
+estimator to report.
 
 NLopt still runs for any remaining thetas (non-mu-referenced); the closed-form-updated thetas are pinned at their new values for the NLopt call.
 
@@ -221,9 +306,17 @@ $$
 
 with $A_i$ the eta-free typical value at subject $i$'s covariates and $g$ the link (`log` or the logit-scale identity). The data term drops out — and the step is an exact nonlinear least-squares fit (Gauss–Newton) — when three things hold: every covariate the value reads is **constant within each subject**, no estimated theta of the group is read **anywhere else in the model**, and no *other* individual parameter reads the group's **eta**. Otherwise the term stays live and the sum is minimised numerically (BOBYQA), still in the $\phi$-frozen coordinates. A covariate that **varies within a subject** leaves a $\theta$-dependence through the within-subject ratio $A_i(t)/A_i(t_0)$; a theta the model reuses — `CL = (TVCL + TH_X*WT) * exp(ETA_CL)` alongside `V = TVV + TH_X` — leaves one through that other parameter, since preserving $\phi_{CL}$ pins `CL` but not `V`; an eta the model reuses — the same `CL` alongside `V = TVV * exp(0.5*ETA_CL)` — leaves one through the re-centring, which holds $\phi_{CL}$ fixed but moves `V`. ferx detects both kinds of reuse and says so in a fit warning naming the theta or the eta. The new estimate is blended with the same SA step $\gamma_k$ as the single-anchor shift, and each η is re-centred by the change in its own mu so $\phi_i$ is unchanged. This is NONMEM's `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))` — a MU that is nonlinear in THETA — done automatically.
 
+##### Typical values that share a theta
+
 Covariate mu-references that **share an estimated theta** are one group ([#1620](https://github.com/FeRx-NLME/ferx-core/issues/1620)). In `examples/two_cpt_oral_cov.ferx`, `CL` and `V1` both read `THETA_WT`. Stepping them one at a time cannot work: a step over CL's thetas alone holds $\eta_{V1}$ as drawn — the η-frozen coordinates #619 removed for a single typical value — so $\phi_{V1}$ absorbs V1's half of every move of `THETA_WT`, and the exponent drifts to its bound (SAEM put it at 0.0101 against NONMEM's 0.662). The joint step fits the union of the thetas to every member's $\phi_i$ under the full $\Omega^{-1}$ form and re-centres every member's eta. A theta read only by the members is not "read elsewhere", so such a group still takes the exact engine; one also read outside every group, or by a mu-reference that was itself declined, keeps the data term. A fit warning names the etas and the shared theta. A shared `FIX`ed theta links nothing.
 
-A covariate mu-reference is used by SAEM and IMP/IMPMAP only; `mu_refs` (inner-loop centring, `suggest_start`, reporting) is unchanged, so FOCE/FOCEI/Laplace fits are byte-identical with and without one. It is declined — with a warning naming the thetas, which then stay on the numerical M-step as before — when one of its thetas is also another eta's single anchor, when the eta's initial IIV is below `1e-3`, when every theta of the group is `FIX`ed, under a mixture model, and under `mu_referencing = false`. A group step also stands down for one iteration when the typical value is not finite for some subject at the current θ — an additive form such as `TVCL + (CRCL-90)*TH_CRCL` can go ≤ 0 for a low-covariate subject — and the fit reports how many iterations that happened on, since the thetas were then moved by the numerical M-step (or, under IMP/IMPMAP, left to it) rather than by the group. A value that reads `TIME`, `MIXNUM`, a second eta, or a local variable that is assigned conditionally is not recorded at all.
+##### A theta that anchors another eta
+
+A covariate mu-reference can also read the theta that **anchors another eta** on its own ([#1630](https://github.com/FeRx-NLME/ferx-core/issues/1630)) — `V1 = TVV2 * TH_R * (WT/70)^THETA_WT_V1 * exp(ETA_V1)` next to `V2 = TVV2 * exp(ETA_V2)`. Two channels moving `TVV2` in one iteration would have no joint optimum, and declining the group (as ferx did before #1630) left its covariate exponent on the η-frozen numerical M-step, where it wandered (`THETA_WT_V1` 0.68 / 1.07 / 0.63 over three seeds against FOCEI's 0.577). Instead the anchor joins the group as a one-theta member: its closed-form shift is dropped, and the joint step fits `TVV2` to both etas' $\phi_i$ and re-centres both. When nothing else reads `TVV2`, the exact engine still runs. If that other eta has a covariate mu-reference of its own, its anchor never runs, so there is nothing to collide with: the two groups simply share the theta and merge as above. A group is still declined when the anchor's eta has an IIV below `1e-3`, or when the anchor's typical value is not on a log or logit scale (`TVV2 + ETA_V2`), and the warning says which.
+
+##### Scope, and when a group is declined
+
+A covariate mu-reference is used by SAEM and IMP/IMPMAP only; `mu_refs` (inner-loop centring, `suggest_start`, reporting) is unchanged, so FOCE/FOCEI/Laplace fits are byte-identical with and without one. It is declined — with a warning naming the thetas, which are then estimated as if it were absent — when the eta's initial IIV is below `1e-3`, when every theta of the group is `FIX`ed, under a mixture model, and under `mu_referencing = false`. A group step also stands down for one iteration when the typical value is not finite for some subject at the current θ — an additive form such as `TVCL + (CRCL-90)*TH_CRCL` can go ≤ 0 for a low-covariate subject — and the fit reports how many iterations that happened on, since the thetas were then moved by the numerical M-step (or, under IMP/IMPMAP, left to it) rather than by the group. A value that reads `TIME`, `MIXNUM`, a second eta, or a local variable that an `if` assigns in only some of its arms (or from a theta) is not recorded at all; a covariate local every arm of an `if` / `else` assigns, and a `min` / `max` of one, are seen through ([#1422](https://github.com/FeRx-NLME/ferx-core/issues/1422)).
 
 #### Scalar residual-error update
 
@@ -260,16 +353,20 @@ can bias the estimate outright.
 ## Non-mu-referenced parameters slow SAEM convergence
 
 Whenever the estimation chain runs SAEM, ferx warns if any individual parameter's
-random effect is **not** mu-referenced — for example `CL = TVCL + ETA_CL` instead
-of `CL = TVCL * exp(ETA_CL)`. Such parameters cannot use the closed-form EM update
+random effect is **not** mu-referenced — for example
+`BASE = TVE0 + PLACEBO + ETA_E0` when TVE0 is also read in `[structural_model]`, so it
+does not enter only through that line
+([additive mu-references](#saem-mstep-additive)). Such parameters cannot use the closed-form EM update
 above and fall back to the slower NLopt M-step, which can strongly slow convergence.
 (A typical value that reads several thetas, such as an additive covariate model, is
 *not* in this class since #619 — see [covariate
 mu-references](#saem-mstep-covariate-mu-ref).) The warning fires independently of the `mu_referencing`
 fit option: turning the option off does not remove the risk — it removes the
 mu-centering that mitigates it — so the diagnostic is most warranted in exactly that
-case. Prefer log-mu-referenced forms (`P = TV * exp(ETA)`), or, for a parameter
-bounded to $(0,1)$, the logit-scale form `P = inv_logit(LOGIT_P + ETA_P)`.
+case. Prefer log-mu-referenced forms (`P = TV * exp(ETA)`), the additive form
+(`E0 = TVE0 + ETA_E0`, or a sum with one bare theta and one eta), or, for a parameter
+bounded to $(0,1)$, the
+logit-scale form `P = inv_logit(LOGIT_P + ETA_P)`.
 :::
 
 ::: {.callout-important}
@@ -317,9 +414,12 @@ FOCE approximation the fit YAML reports — see below):
 
 On thiotepa every no-ETA theta had ended within a few percent of its initial
 value; after the fix they land where FOCEI lands. The in-repo anchor is
-`covmuref_power` with the weight covariate routed through an `if` block so the
-#619 group detection does not apply and `TH_WT` rides this channel: NONMEM
-SAEM 0.921, ferx 0.332 before (its 0.3 start) and 0.961 after.
+`covmuref_power` with the weight covariate routed through a local assigned
+before an `if` with no `else` and again in its arm, so the #619 group detection
+does not apply and `TH_WT` rides this channel: NONMEM SAEM 0.921, ferx 0.332
+before (its 0.3 start) and 0.961 after. (The fixture wrote a plain `if` / `else`
+until [#1422](https://github.com/FeRx-NLME/ferx-core/issues/1422) made that form
+a group; the values it computes are unchanged.)
 
 Two structural remedies remain better than this channel where they apply:
 
@@ -327,12 +427,24 @@ Two structural remedies remain better than this channel where they apply:
   `FIX`). ferx then mu-references it automatically and the exact closed-form
   update takes over.
 * **Write a covariate model in a form #619 can see** — a covariate read from
-  the data directly, not through a conditionally assigned local — so the slope
-  joins the typical value's mu-reference group.
+  the data directly or through a local, including one every arm of an
+  `if` / `else` assigns, rather than one assigned in only some arms — so the
+  slope joins the typical value's mu-reference group.
 
 Otherwise cross-check against [FOCEI](foce.qmd) or [IMPMAP](impmap.qmd), which
 do not depend on this channel.
 :::
+
+##### A theta whose eta the shift cannot use
+
+The "NO associated ETA" advisory above lists only thetas that appear in no
+statement with an eta. A theta that *does* share a parameter with an eta in a
+form the shift cannot use, such as a Box-Cox
+`CL = TVCL * exp((exp(ETA_CL)^LAMBDA - 1) / LAMBDA)` (`log CL` is not linear in
+the eta) or a covariate coefficient no group owns, rides the same numerical
+M-step but gets its own message (#1715): it "carries an ETA, but not as a
+mu-referenced typical value". Keep the transform. Cross-check against
+FOCEI/IMPMAP, or hold it `FIX`. IMP/IMPMAP and FREM conversion split the same way.
 
 ### Averaging a maximiser is not maximising the average {#saem-mstep-jensen}
 
@@ -370,7 +482,11 @@ other **shrinks** it by averaging more draws into the one it forms. Both are
   the step, not the blend stacked on top of it (which really would move σ at
   `γ²`). One gradient sweep is cheaper than the `mstep_maxiter·(n+1)` population
   passes the derivative-free solve costs, so this M-step runs every iteration
-  rather than every third during exploration.
+  rather than every third during exploration. The score's θ block, and the
+  per-observation `∂f/∂θ` the expected information is built from, are exact: one
+  recording of the subject's predictions with θ on the adjoint's tape and one
+  reverse sweep, whatever the number of θ, in place of a forward difference per θ.
+  A model outside the adjoint recorder's scope keeps the forward difference.
 
 `mstep_draws = K`
 : Averages the *derivative-free* M-step objective over this iteration's η draw
@@ -383,8 +499,9 @@ other **shrinks** it by averaging more draws into the one it forms. Both are
 Both are restricted to the plain Gaussian residual scope the expected
 information has a closed form on: no IOV, no [mixture](mixture.qmd), no M3, no
 time-to-event endpoint, no `block_sigma` residual correlation, no
-`[covariate_nn]` θ, no residual magnitude, no FREM. A model outside it keeps the
-historical solver and says so by name in the fit's warnings.
+`[covariate_nn]` θ, no residual magnitude. FREM is in scope since #1421, which
+fixed the σ score of its covariate pseudo-observations. A model outside it keeps
+the historical solver and says so by name in the fit's warnings.
 
 #### Measured
 
@@ -450,7 +567,7 @@ is why `tests/saem_combined_error.rs` scores it against **simulation truth** rat
 against another estimator.
 
 **Against — the θ half, still open (#1480).** On the #619 `covmuref_power` anchor, whose
-`TH_WT` carries no ETA and therefore moves only through this channel, `score_sa` at the
+`TH_WT` anchors no mu-reference and therefore moves only through this channel, `score_sa` at the
 default 150/250 schedule reaches **0.746** against NONMEM SAEM's 0.921 — outside the
 0.12 window the default solver satisfies. It is slow rather than wrong: at 300/700 it
 lands at **0.9845** (|Δ| 0.063) while `bobyqa` at that same schedule *overshoots* to
@@ -524,25 +641,34 @@ M-step solver repaired:
   weights the early, still-crawling iterates most (`TH_WT` 0.637 with the
   average, 0.961 without).
 
-The FREM drift itself is real and is **not** fixed: undamped, that reprex
-settles near `TVFRD1` 0.18 from either start on the default schedule, keeps
-drifting on a 3× longer one (0.03), and 200 MH steps per iteration do not
-change it — so it is not plain E-step under-mixing. The importance-sampled
-objective cannot rank the two points on a 12-eta model (ESS/K = 0.001), but the
-FOCEI objective can: the drifted fit is 47 units worse than the held one
-(7492.7 against 7445.3), so on this model the hold is the better answer.
+#### Why the default is keyed to `iiv_on_ruv`
 
-The drift is the **`iiv_on_ruv` coupling**, not FREM and not the no-ETA
-channel as such: the same model with its `iiv_on_ruv` line and `ETA_RUV`
-omega removed lands undamped at `TVFRD1` 0.414, `TVMAT` 2.680, `TVV` 137.6 —
-on NONMEM IMP's 0.394 / 2.680 / 133.8 — where the 0.03 cap leaves it at 0.342
-/ 2.228 / 147.5. Under `iiv_on_ruv` the E-step is modified (`η_RUV` is
-re-centred into σ every iteration) and σ shares the numerical M-step with the
-no-ETA thetas; that is where the pathology lives, and it needs its own fix
-(#1421). So
-**the default is keyed to that shape**: a model with `iiv_on_ruv` keeps the
-0.03 cap, every other model runs undamped, and a value you set wins either
-way. `FIX` is the honest spelling of the same hold when the value is known.
+The FREM drift itself is real and is **not** fixed: undamped, that reprex
+settles near `TVFRD1` 0.15–0.18 from either start on the default schedule,
+keeps drifting on a 3× longer one (0.03), and 200 MH steps per iteration do
+not change it — so it is not plain E-step under-mixing. The importance-sampled
+objective ranks the drifted point worse, by 7–11 units — see [what #1421
+measured](#saem-1421-measured) below, which also shows that the FOCEI
+objective first used for this ranking is not a reliable one on an
+`iiv_on_ruv` model.
+
+It needs **both `iiv_on_ruv` and FREM**. The same model with its `iiv_on_ruv`
+line and `ETA_RUV` omega removed lands undamped at `TVFRD1` 0.414, `TVMAT`
+2.680, `TVV` 137.6 — on NONMEM IMP's 0.394 / 2.680 / 133.8 — where the 0.03
+cap leaves it at 0.342 / 2.228 / 147.5. With `iiv_on_ruv` but without the FREM
+covariate rows, every SAEM variant lands somewhere the objective cannot tell
+from the optimum. So **the default is keyed to `iiv_on_ruv`**: such a model
+keeps the 0.03 cap, every other model runs undamped, and a value you set wins
+either way. It is keyed to `iiv_on_ruv` alone, not to `iiv_on_ruv` *with*
+FREM, because that one non-FREM measurement cannot tell the cap from the
+undamped update: `TVFRD1` is barely identified there, so it shows the cap is
+harmless on that data, not that undamped is safe on a non-FREM `iiv_on_ruv`
+model whose no-ETA thetas are identified. If yours is such a model, set
+`mstep_damping = 1.0` and compare the two fits by importance sampling (see
+[below](#saem-1421-measured)). `FIX` is the honest spelling of the same hold
+when the value is known.
+
+#### Which fits it damps
 
 The option only acts on the channel it is about: a fit is damped when NLopt is
 left estimating a theta that is **not mu-referenced**, which is exactly the
@@ -556,15 +682,76 @@ on one component alone would be inconsistent. Under `mu_referencing = false` a
 theta written in a mu-referenceable form is not this channel either, so such a
 fit keeps the undamped update and the option reports no effect.
 
-[Mixture models](mixture.qmd) are excluded outright: a `MIXNUM`-switched
-typical value goes through the same numerical M-step, but its class typical
+[Mixture models](mixture.qmd) are excluded outright. A log-mu-referenced
+`MIXNUM`-switched typical value takes the closed-form shift (without IOV,
+#2458), but one without an orbit move (no mu-ref pair, `mu_referencing =
+false`, or IOV) goes through the same numerical M-step, where its class typical
 values must *separate* from a common start, and damping that excursion stalls
-the separation. For the same reason the mixture arm also keeps the pre-#1415
-M-step solver configuration: its class typical values come from a hard class
-draw, and the NONMEM-anchored mixture seed sweep was calibrated on the partial
-step that configuration returns — a converged per-class solve moves `TVCL2`
-from the NONMEM MLE 2.84 to 3.23. An exact M-step on a hard class draw is a
-different estimator, so that channel changes only with its own anchor.
+the separation. The mixture arm also keeps the pre-#1415 M-step solver
+configuration. On the NONMEM-anchored mixture seed sweep it no longer changes
+the answer (the switched θ there are closed-form), and for the mixtures without
+an orbit move no configuration has been anchored yet.
+
+#### What #1421 measured {#saem-1421-measured}
+
+On the #1011 reprex (`n_exploration = 1000`, `n_convergence = 1000`,
+`n_mh_steps = 50`, seed 12345), ranked by the importance-sampled −2 log L at
+K = 20000 with the covariate etas Rao-Blackwellised (`frem_rao_blackwell`, the
+default), evaluated at each point with `imp_eval_only`:
+
+| point | `TVFRD1` | IS −2 log L |
+|---|---:|---:|
+| IMPMAP | 0.318 | 6857.1 ± 1.8 |
+| SAEM, `mstep_solver = score_sa`, undamped | 0.147 | 6864.4 ± 1.4 |
+| the same, 3× schedule (3000 + 2000) | 0.063 | 6868.2 ± 1.6 |
+| IMPMAP with only `TVFRD1` moved to 0.15 | 0.150 | 6867.3 ± 1.6 |
+
+At K = 5000 the undamped `bobyqa` point (0.149) scores 6866.7 ± 1.9 against
+IMPMAP's 6856.0 ± 2.6; the order does not change with K. So on the FREM model
+the drift moves away from the marginal optimum, and keeps moving on a longer
+schedule. Every mechanism #1421 suggested was tested and **ruled out**, each by
+one run that changes it alone:
+
+* **η_RUV re-centring (#904)** — disabled, undamped still lands at 0.183.
+* **Ω feedback** — the 11-eta FREM block held `FIX` at IMPMAP's Ω, undamped
+  `bobyqa` still lands at 0.148 (0.149 with Ω free); `score_sa` at 0.230.
+* **σ** — it reaches IMPMAP's 0.18 by iteration 5 and stays there.
+* **The single-draw Jensen bias** — `score_sa`, which has no Jensen term, drifts
+  too (the table above).
+* **Declaration order** — `ETA_RUV` declared after the FREM block: 0.080.
+
+The same data without the FREM covariate rows (the PK block of 3 plus
+`ETA_RUV`, same schedule) shows no defect to fix: `bobyqa` undamped 0.242,
+`score_sa` 0.401, the 0.03 hold 0.359, and from a 0.2 start 0.229 (hold) and
+0.247 (`score_sa`) all score between −2276.8 and −2272.0 (MC SE 1.0–2.5) —
+`TVFRD1` is barely identified there, and no SAEM variant is distinguishable from
+another. What remains of #1421 is therefore the interaction of FREM's
+covariate rows with `iiv_on_ruv`, and the hold stays the default for it.
+
+#### The FOCEI objective cannot rank `iiv_on_ruv` fits
+
+#1415 ranked the reprex's drifted and held points by the FOCEI objective at
+each (47 units apart). That objective is not reliable at `ω_RUV ≈ 0.3`. On a
+covariate-conditional twin of the reprex — the FREM block replaced by the
+regression of the PK etas on the covariates implied by IMPMAP's Ω, so the
+covariates enter as fixed effects and IS needs no Rao-Blackwellisation — the
+FOCEI objective sits ~440 units from the IS −2 log L at every point, and it
+carries a slope in `TVFRD1` that the marginal likelihood does not. Moving
+`TVFRD1` alone at the IMPMAP point:
+
+| `TVFRD1` | FOCEI objective | IS −2 log L (K = 20000) |
+|---:|---:|---:|
+| 0.18 | −1950.7 | −2394.6 ± 1.4 |
+| 0.28 | −1961.4 | −2396.8 ± 1.2 |
+| 0.35 | −1965.9 | −2394.1 ± 1.2 |
+
+FOCEI prefers the larger value by 15 units; IS is flat to within its noise. At
+the fitted points the two disagree on the *sign*: FOCEI puts the `score_sa` fit
+(0.184) 13.5 units behind IMPMAP's (0.279), IS puts it 3.2 ± 2.4 ahead. The
+same holds for a FOCEI *fit*: on the no-FREM model above it estimates
+`TVFRD1` 0.413 but `ω_RUV` 0.058 against SAEM's 0.28, and scores 124–129 units
+worse than every SAEM point on the IS −2 log L (−2148.2 ± 0.2). Rank `iiv_on_ruv` fits by IS, as the
+next section recommends for SAEM in general.
 
 ### Comparing a SAEM fit to FOCEI: read the importance-sampled objective
 
@@ -579,6 +766,39 @@ single-method form always did. When you compare estimators, compare the
 importance-sampled −2 log L that an `imp_eval_only` stage prints (`IS done.
 −2 log L = …`) or `FitResult::importance_sampling`, evaluated at each fit's
 estimates.
+
+### One seed cannot compare two builds {#saem-seed-spread}
+
+SAEM is deterministic at a fixed `seed`: the same binary, model and data give the
+same estimates to the last digit. A different ferx version can still give a
+different number at that seed, because almost any change on the chain's path
+(an extra random draw, a reordered update) sends it down another trajectory. On
+the public stand-ins built for
+[#2602](https://github.com/FeRx-NLME/ferx-core/issues/2602) (450 subjects each:
+a two-compartment oral closed form with a block Ω, and the same model as a
+3-state ODE), `method = [saem, imp]` was run over 40 seeds. The IS −2 log L had a
+seed-to-seed sd of 1.5 and 3.4–4.1, and a range of 7 and 14–15. The
+importance-sampling draw alone, with the SAEM seed held fixed, accounts for an
+sd of only 0.55 and 0.9. Most of the spread is where the chain ends. So a +4 or
++7 between two builds at one seed is not evidence of a regression. Between the
+September build `e4743847` and `e1a05d1a`, the per-seed differences over the 40
+seeds averaged −0.05 ± 0.26 and +0.31 ± 0.66 (mean ± SE).
+
+To compare two builds, compare distributions:
+
+```bash
+tools/saem-seed-sweep.sh --model m.ferx --data d.csv \
+  --rev e4743847 --rev main --seeds "$(seq -s ' ' 1 10)"
+```
+
+The script builds each revision and runs the model once per seed, with
+`imp_seed = seed + 1000`. It replaces `seed`, its alias `saem_seed` and
+`imp_seed` in `[fit_options]`. It prints each build's mean and sd, and the shift
+against the first build. The shift is the mean of the per-seed differences, with
+its standard error. Every build runs the same seed pairs, so pairing is the right
+test. The model must end in an
+`imp_eval_only` stage. `--fixed-saem-seed` varies only the IS draw, to measure
+the Monte-Carlo noise floor by itself.
 
 The number of NLopt evaluations saved is stored in `FitResult::saem_mu_ref_m_step_evals_saved`, accumulated across SAEM iterations as `2 × mstep_maxiter × n_mu_ref_pairs` per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at `mstep_maxiter` NLopt gradient requests). The field is `None` when mu-referencing is off or method ≠ SAEM.
 
@@ -750,7 +970,7 @@ After the SAEM iterations complete:
    data prefer the importance-sampling −2LL over the Laplace OFV when judging
    whether the additive term is real.
 3. **FOCE OFV**: Compute the objective function using the FOCE/Laplace approximation, so AIC and BIC are directly comparable with FOCE results
-4. **Covariance Step**: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)
+4. **Covariance Step**: Optionally compute standard errors via the covariance step's Hessian (same method as FOCE: the exact R matrix in scope, the finite-difference stencil outside it) — on the FOCEI objective for an all-Gaussian model, and on the quadrature marginal when the model has a non-Gaussian endpoint (see [below](#saem-covariance-non-gaussian))
 5. **Diagnostics**: Compute PRED, IPRED, CWRES, IWRES for each subject
 
 For sparsely-sampled data where the Laplace OFV is biased, you can
@@ -762,6 +982,144 @@ method = [saem, imp]
 ```
 
 See [Importance Sampling (IMP)](importance-sampling.qmd).
+
+### Covariance step on a non-Gaussian model {#saem-covariance-non-gaussian}
+
+SAEM, IMP and IMPMAP estimate the *exact* marginal likelihood. The covariance step
+differentiates a deterministic objective at their estimate, and by default that objective is
+FOCEI's, a Laplace approximation. On an all-Gaussian model the two minima are close, which is
+what the NONMEM anchors of these methods pin. With a TTE, `[binary_model]` or CTMM endpoint
+they need not be: on `examples/tte_exponential.ferx` the exact minimum is at ω² = 0.071 and
+the FOCEI minimum at ω² = 0.29, so at the samplers' estimates the FOCEI R matrix was
+indefinite, and the eigenvalue floor turned it into standard errors of 4–10 under
+`covariance_method = r` and 1e4–4e4 under `rsr` (#1781).
+
+For `saem`, `imp` and `impmap` on such a model, R and S are now taken on the **7-node
+adaptive Gauss–Hermite marginal** — the objective of `method = laplace, n_agq = 7`, which is
+the exact marginal to quadrature accuracy — and the fit carries a `W_COV_QUADRATURE_OBJECTIVE`
+note saying so. Seven nodes per random effect: on the example above the ω² standard error
+moves by 2e-4 relative between seven and nine nodes, and is 11% low at three. The grid is
+`7^n_eta` nodes per subject, so the route takes up to three random effects. A mixture, a model
+with inter-occasion variability, or more than three random effects keeps the FOCEI objective
+and carries `W_COV_QUADRATURE_DECLINED`, whose remedy is to polish the estimate with a FOCEI
+stage.
+
+| `tte_exponential`, SE(λ) | `r` before | `r` after | `rsr` before | `rsr` after | `s` before | `s` after |
+|---|---|---|---|---|---|---|
+| SAEM (λ = 0.03876) | 4.24 | 0.00859 | 1.3e4 | 0.00863 | 0.00854 | 0.00856 |
+| IMP (λ = 0.03385) | 8.82 | 0.00818 | 3.6e4 | 0.00821 | 0.00830 | 0.00817 |
+| IMPMAP (λ = 0.03359) | 9.76 | 0.00819 | 4.1e4 | 0.00823 | 0.00829 | 0.00815 |
+| exact marginal, at its minimum | | 0.00818 | | 0.00823 | | 0.00813 |
+| NONMEM IMP (λ = 0.03370) | | 0.00840 | | 0.00835 | | 0.00847 |
+
+The exact-marginal row is computed outside ferx (brute-force quadrature over η); it is what
+`tests/sampler_covariance_non_gaussian.rs` bands each estimator against. `s` moves too,
+because its per-subject scores are now the quadrature marginal's rather than FOCEI's. Taken at
+each sampler's *own* estimate instead, the same oracle agrees with every routed `r`, `s` and
+`rsr` SE to about 2e-3 relative — the default `fd_hessian_step` sets that, not the node
+count. SAEM's
+row is the furthest off because its estimate is: its exact −2 log L is 166.879 against 166.527
+at the minimum, where IMP and IMPMAP are within 0.001.
+
+Separately, wherever R needs an eigenvalue floor (it is indefinite, or has an eigenvalue
+under `max(1e-10·λ_max, 1e-12)`) at an estimate its objective was never
+minimised at — a SAEM, IMP, IMPMAP or VI estimate — `r` and `rsr` no longer invert the
+floored matrix (`rsr` squared the floor): the step returns `S⁻¹` instead and says so in
+`W_COV_NON_STATIONARY_ESTIMATE`, or fails with that code when S is singular too. On
+`examples/ctmm_pd_2state.ferx`, whose clearance and volume are not separately identified,
+that is what happens after SAEM: no method gives that model usable standard errors, and the
+step now says why instead of reporting SEs of 1e2–5e7.
+The same fallback applies to an all-Gaussian SAEM, IMP or VI fit whose R needs the floor.
+There it is tested for which matrix it returns and how it is labelled, not yet against an
+external reference.
+
+### Is the estimate a stationary point? {#saem-stationarity}
+
+Whether R needs the floor does not say whether the estimate is stationary: R can be positive
+definite well away from the objective's minimum. So after a SAEM, IMP, IMPMAP or VI fit
+whose R was kept, the step also takes the gradient g of the objective R differentiates, at the
+estimate, and its Newton decrement ½·gᵀH⁻¹g, H the OFV Hessian
+([#2541](https://github.com/FeRx-NLME/ferx-core/issues/2541)). That is the OFV a Newton step
+would remove, and also the squared distance from the estimate to the objective's minimum,
+measured in the standard errors of R⁻¹ (under `covariance_method = rsr` the reported
+standard errors are the sandwich's, and the message says so). Above 1 OFV unit (one standard error) the step adds
+`W_COV_NON_STATIONARY_ESTIMATE`, giving the decrement and how to get SEs at a stationary
+point. It still returns the R-based standard errors: S⁻¹ is no better at that point, since
+its per-subject scores carry the non-zero mean gradient. The cost is one gradient evaluation,
+exact where the analytic outer gradient is and otherwise `2·n_free` objective evaluations.
+`report_final_gradient = false` does not skip it: that option turns off a reported number,
+and skipping this gradient would drop the warning instead.
+
+The threshold was measured on Linux, the reference platform for fit numbers:
+
+| model | fit | decrement (OFV units) | warns |
+|---|---|---|---|
+| `warfarin`, `two_cpt_oral_cov`, `mbma_placebo`, `warfarin_iov_saem`, `tte_exponential` | FOCE / FOCEI | ≤ 7e-9 | no |
+| `warfarin`, `two_cpt_oral_cov` | SAEM (4 seeds), IMP, IMPMAP | 8e-6 – 0.082 | no |
+| `tte_exponential` (7-node quadrature objective) | SAEM (2 seeds), IMP, IMPMAP | 3e-4 – 0.343 | no |
+| `warfarin_iov_saem` | SAEM, `seed = 2` (0.43 OFV above FOCEI) | 0.415 | no |
+| `two_cpt_oral_cov`, full 5×5 `block_omega` (23 free parameters) | SAEM 500 + 2000 iterations, IMPMAP (0.09 OFV above FOCEI) | 0.087 / 0.094 | no |
+| the same block model | SAEM, `seed = 3` (22.7 OFV above FOCEI) | 1.05 | yes |
+| `warfarin`, `two_cpt_oral_cov`, the block model | VI (1.3–3.2 OFV above FOCEI) | 1.43 / 3.24 / 3.44 | yes |
+| `tests/data/mbma_placebo` | SAEM, 5 runs with positive-definite R (1.3–3.6 OFV above FOCEI) | 1.46 – 5.35 | yes |
+
+macOS gives the same numbers on every model except `mbma_placebo`, where SAEM takes a
+different path and stops further from the optimum (decrements 4.0–14.9).
+
+On `mbma_placebo` this is what flags the `seed = 2` fit
+([below](#saem-standard-errors)).
+
+The test is local. An estimate at or near a *different* stationary point passes it: SAEM
+with `seed = 2` on `two_cpt_oral_cov` stops 39 OFV above the FOCEI minimum with a decrement
+of 0.25, and `seed = 12345` on the block model 29 OFV above with 0.41.
+
+### Standard errors at a SAEM estimate {#saem-standard-errors}
+
+The covariance step reads R and S off the FOCEI objective (or the quadrature marginal above)
+at SAEM's estimate. SAEM approximates its minimum stochastically, so on a weakly identified
+model the estimate can stop away from it even when both objectives share their minimum. On
+the 6-study `tests/data/mbma_placebo` model, η enters linearly with a fixed residual, so FOCEI
+*is* the exact likelihood (minimum −2 log L 97.07). Five SAEM runs (three seeds at the
+default length, two at 500 + 2000 iterations) stopped 1–11 units above that, all reporting
+`converged` ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536); macOS arm64; on Linux
+the same runs stop 1.3–11.6 units above, seed 2 at 98.35 with a decrement of 1.46, which warns
+too). The cause was
+that model's one-line `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`, which before
+[#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544) left TVE0 un-mu-referenced.
+With TVE0 mu-referenced, SAEM on seeds 12345, 2, 3, 7, 11 lands at 97.33–98.39 for
+`E0 = TVE0 + ETA_E0` on a line of its own and, since #2544, at 97.21–98.88 for the
+one-line spelling (macOS arm64; per seed the two differ, since the sums associate
+differently, but the spread is the same —
+[Additive mu-references](#saem-mstep-additive)). The rows below are the one-line model
+before #2544, the shape a line whose theta is also read elsewhere still has:
+
+| fit | −2 log L | TVE0 | ω² | covariance step |
+|---|---|---|---|---|
+| FOCEI | 97.07 | 48.58 ± 0.95 | 4.81 ± 2.99 | computed |
+| SAEM, default seed | 107.92 | 43.85 | 30.3 | fails, `W_COV_NON_STATIONARY_ESTIMATE` |
+| SAEM, `seed = 2` | 102.10 | 46.65 ± 2.82 | 10.7 ± 14.8 | computed, `W_COV_NON_STATIONARY_ESTIMATE` (decrement 14.9) |
+
+Whether R is positive definite at such a point decides only which form of
+`W_COV_NON_STATIONARY_ESTIMATE` the step gives, not whether the estimate is stationary: the
+two SAEM rows are equally far from it. The default seed fails; at `seed = 2` the SEs are
+reported, with the gradient form of the warning ([above](#saem-stationarity); before
+[#2541](https://github.com/FeRx-NLME/ferx-core/issues/2541) they came with none). They are 3×
+(TVE0) and 5× (ω²) the FOCEI ones; do not report them as SEs of the fit. What
+works:
+
+- **`method = [saem, focei]`.** The FOCEI stage finishes at the FOCEI minimum and takes R
+  there. Its estimates and SEs are FOCEI's (on the model above, equal to a plain FOCEI fit to
+  six figures), not the SAEM estimate's. For an all-Gaussian model this is the fit to report
+  SEs from.
+- **`sir = true`** samples a proposal built from R with its eigenvalues made positive,
+  weighted by the FOCEI objective (FOCE without interaction), whose minimum need not be the
+  SAEM estimate. On the model above it ran with an effective sample size of 21 of
+  1000, and its TVE0 interval [45.1, 51.2] excludes the SAEM estimate, because the weights pull
+  towards the FOCEI minimum.
+- **`covariance_method = s`** needs more subjects than free parameters: S is a sum of one
+  rank-one term per subject. With 6 subjects and 24 free parameters it is singular at every
+  estimate, which the failure message states. `rsr` never inverts S but needs R positive
+  definite.
 
 ## Conditional Distribution (conditional mode vs. distribution)
 
@@ -912,6 +1270,32 @@ compares the joint group's own coordinates. `tests/saem_covariate_mu_ref.rs`
 (slow-gated) pins the table's two "after" columns and the `score_sa` and 300/700
 runs against NONMEM; seeds 2 and 3 are reported here, not tested.
 
+### Validation of a group reading another eta's anchor (#1630)
+
+Two exact reparameterisations of `examples/two_cpt_oral_cov.ferx` on its bundled data,
+each against NONMEM 7.6.0 `METHOD=SAEM` on the same model
+(`nonmem_anchor/covmuref_anchor_{a,b}_saem.ctl`) and against ferx on the control that
+writes `V1 = TVV1 * (WT/70)^THETA_WT_V1 * exp(ETA_V1)` directly:
+
+- **A**: `V1 = TVCL * TH_R * (WT/70)^THETA_WT_V1 * exp(ETA_V1)` reads `TVCL`, whose eta
+  has its own covariate mu-reference;
+- **B**: `V1 = TVV2 * TH_R * (WT/70)^THETA_WT_V1 * exp(ETA_V1)` reads `TVV2`, the plain
+  anchor of `V2 = TVV2 * exp(ETA_V2)`.
+
+| Quantity | A before | A after | NONMEM A | B before | B after | NONMEM B |
+|---|---:|---:|---:|---:|---:|---:|
+| OFV (ferx, seed 1, 150/250) | **−1184.06** | −1199.28 | −1199.33 (IMP) | −1197.70 | −1199.28 | −1199.34 (IMP) |
+| `THETA_CRCL` | **0.2137** | 0.5566 | 0.5564 | 0.5568 | 0.5566 | 0.5563 |
+| typical V1 | **41.1** | 48.24 | 48.14 | 45.1 | 48.24 | 48.22 |
+| `THETA_WT_V1`, 300/700 | 0.338 | 0.597 | 0.586 | **0.402** | 0.597 | 0.591 |
+
+The control gives the same "after" numbers to every printed digit, on seeds 1, 2 and 3
+and at 300/700. That is expected: with the fix, each fixture's M-step is the control's
+written in other coordinates. Before the fix, A's OFV was −1184.06 / −1171.40 / −1189.06
+over seeds 1/2/3, and B's `THETA_WT_V1` at 150/250 was 0.68 / 1.07 / 0.63 against
+FOCEI's 0.577. `tests/saem_covariate_mu_ref.rs` (slow-gated) pins A at 150/250 and B at
+300/700 against NONMEM.
+
 ## Inter-Occasion Variability (IOV)
 
 `method = saem` supports models with `kappa` declarations (`n_kappa > 0`). IOV is handled with a per-occasion Gibbs Metropolis-Hastings step interleaved with the standard eta MH:
@@ -942,14 +1326,14 @@ focei, or laplace for a fixed-effects-only (naive-pooled) model.
 ```
 
 The check runs in the same validation pass as `ferx check`, and fires if `saem`
-appears **anywhere** in a `methods = [...]` chain — so `methods = [saem, focei]`
+appears **anywhere** in a `method = [...]` chain — so `method = [saem, focei]`
 fails up front rather than after the SAEM stage has already run.
 
 `imp`, `impmap` and `bayes` are rejected at `n_eta = 0` in the same pass, under the
 code `E_METHOD_NO_RANDOM_EFFECTS` (#1007) — each integrates over the random
 effects, and with none declared the marginal likelihood collapses to the
 observation likelihood FOCE/FOCEI already minimise exactly. Like the SAEM guard
-this fires anywhere in a chain, so `methods = [focei, imp]` fails up front instead
+this fires anywhere in a chain, so `method = [focei, imp]` fails up front instead
 of after the FOCEI stage has run. Each of the three still refuses at run time as
 well, which is what a direct `fit()` caller bypassing `ferx check` sees.
 
@@ -1093,7 +1477,7 @@ rather than assuming the estimator.
 
 With `iiv_on_ruv = ETA`, the residual is $Y = f + \varepsilon \exp(\eta_{\text{RUV}})$, so the residual variance is $\sigma^2 \exp(2\eta_{\text{RUV}})$. This form is invariant to $\eta_{\text{RUV}} \to \eta_{\text{RUV}} - c,\ \sigma \to \sigma\,e^{c}$ — $\sigma$ and a *shift* of $\eta_{\text{RUV}}$ are a degenerate pair. Unlike a mu-referenced structural $\eta$ (whose mean is folded into its typical value $\theta$ each M-step), $\eta_{\text{RUV}}$ has **no typical-value $\theta$**, so nothing absorbs its mean: it drifts along that degenerate direction, and because $\omega_{\text{RUV}}$ is estimated as $\overline{\eta_{\text{RUV}}^2}$ the drift injects a spurious $\text{mean}^2$ term that pumps $\sigma$ and $\omega_{\text{RUV}}$ **up together** — the runaway reported in issue #895 ($\omega_{\text{RUV}}$ toward ~49, $\sigma$ toward its e⁵ ceiling), worst on FREM models with an extreme $\Omega$-diagonal scale range.
 
-ferx fixes this by treating $\sigma$ as the residual-scale typical value: each iteration $\eta_{\text{RUV}}$ is **re-centred to zero mean**, absorbing the shift into $\sigma$ ($\eta_{\text{RUV}} \mathrel{-}= \overline{\eta_{\text{RUV}}}$, every RUV-scaled $\sigma \mathrel{\times}= e^{\overline{\eta_{\text{RUV}}}}$). Each subject's residual variance is exactly unchanged, so the likelihood is untouched, but $E[\eta_{\text{RUV}}]=0$ is restored and $\omega_{\text{RUV}}$ measures the true variance. On the 475-subject FREM reprex this converges to $\omega_{\text{RUV}} \approx 0.28$, $\sigma \approx 0.20$ from both a too-small and a too-large $\sigma$ start (NONMEM: 0.28 / 0.18), where it previously ran to $\omega_{\text{RUV}} \approx 49$. Re-centring is applied only when **every** RUV-scaled $\sigma$ component is free to absorb the shift — this keeps each subject's residual variance exactly unchanged. If any residual $\sigma$ component is FIXed (e.g. a fixed additive term of a combined error), scaling only the free component would leave the fixed part uncompensated, so re-centring is skipped and the growth caps below carry the load (a FIXed $\sigma$ already partially pins the mean).
+ferx fixes this by treating $\sigma$ as the residual-scale typical value: each iteration $\eta_{\text{RUV}}$ is **re-centred to zero mean**, absorbing the shift into $\sigma$ ($\eta_{\text{RUV}} \mathrel{-}= \overline{\eta_{\text{RUV}}}$, every RUV-scaled $\sigma \mathrel{\times}= e^{\overline{\eta_{\text{RUV}}}}$). Each subject's residual variance is exactly unchanged, so the likelihood is untouched, but $E[\eta_{\text{RUV}}]=0$ is restored and $\omega_{\text{RUV}}$ measures the true variance. On the 475-subject FREM reprex this converges from both a too-small and a too-large $\sigma$ start, where it previously ran to $\omega_{\text{RUV}} \approx 49$. Re-measured on 2026-10-16 from the 5.5×-low start, it reaches $\omega_{\text{RUV}} = 0.269$, $\sigma = 0.174$ and an importance-sampled −2 log L of 6866.6 ± 1.2. NONMEM IMP reports 0.279 / 0.177 / 6852 ([FREM: `iiv_on_ruv`](frem.qmd#frem-iiv-on-ruv), which also covers why FOCEI is not an alternative on that model). Re-centring is applied only when **every** RUV-scaled $\sigma$ component is free to absorb the shift — this keeps each subject's residual variance exactly unchanged. If any residual $\sigma$ component is FIXed (e.g. a fixed additive term of a combined error), scaling only the free component would leave the fixed part uncompensated, so re-centring is skipped and the growth caps below carry the load (a FIXed $\sigma$ already partially pins the mean).
 
 Two growth caps remain as belt-and-braces backstops, both no-ops on a well-behaved fit:
 

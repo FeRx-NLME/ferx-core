@@ -326,7 +326,7 @@ fn run_score_sa(
                 gamma,
                 // `mstep_damping` off, which is the shipped default, so γ_σ is
                 // `min(γ, SIGMA_SA_MAX_STEP)` exactly as in a production fit.
-                1.0,
+                &[sigma_mstep_sa_step(gamma, 1.0)],
                 &[],
             );
         }
@@ -481,7 +481,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &p.sigma_upper,
         &p.mask,
         1.0,
-        1.0,
+        &[sigma_mstep_sa_step(1.0, 1.0)],
         &[],
     );
     let i1 = sa.info.clone();
@@ -507,7 +507,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &p.sigma_upper,
         &p.mask,
         1.0,
-        1.0,
+        &[sigma_mstep_sa_step(1.0, 1.0)],
         &[],
     );
     let fresh = sa_b.info.clone();
@@ -526,7 +526,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &p.sigma_upper,
         &p.mask,
         0.5,
-        1.0,
+        &[sigma_mstep_sa_step(0.5, 1.0)],
         &[],
     );
 
@@ -642,6 +642,39 @@ fn numerical_mstep_scope_gap_refuses_a_residual_magnitude() {
     assert!(numerical_mstep_scope_gap(&model, 0, false).is_some());
 }
 
+/// #1421: a FREM model is in scope — its covariate rows' score and information
+/// are exact since `obs_dvar_dlogsigma` (see the FD-parity tests in
+/// `fixed_eta_gradient_tests.rs`), so `score_sa` and `mstep_draws` need not
+/// refuse it any more.
+#[test]
+fn numerical_mstep_scope_gap_admits_a_frem_model() {
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TV_WT(70.0, FIX)
+  omega ETA_CL ~ 0.04
+  omega ETA_WT_FREM ~ 100.0
+  sigma PROP_ERR ~ 0.10 (sd)
+  sigma EPSCOV ~ 1e-6 FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  frem_predictions = TV_WT/ETA_WT_FREM:100
+  frem_sigma = EPSCOV
+",
+    )
+    .expect("FREM fixture parses");
+    assert!(model.frem_config.is_some(), "the fixture must be FREM");
+    assert_eq!(numerical_mstep_scope_gap(&model, 0, false), None);
+}
+
 // ── stored-draw re-centring ────────────────────────────────────────────────
 
 /// A closed-form mu-reference shift moves `log TVP` and every subject's η
@@ -666,6 +699,80 @@ fn stored_draws_follow_the_mu_reference_shift() {
     recentre_eta_draws(&mut draws, 0, 0.0);
     recentre_eta_draws(&mut draws, 7, 1.0);
     assert_eq!(draws, before);
+}
+
+/// #2548 item 2: the closed-form shift keeps every subject's individual parameter where it
+/// was, `φᵢ = mu + ηᵢ` on the mu scale, even when the clamp bites. Each case drives θ into
+/// its upper bound (`γ·mean(η)` would carry it past) and starts one already on it, for an
+/// additive anchor (`P = θ + η`, natural scale) packed both ways and a log anchor
+/// (`log P = log θ + η`). The re-centre must use the change the clamp let through, so a
+/// mutation re-centring by the unclamped `γ·mean(η)` moves every φᵢ (by up to 2.0 here). The
+/// straddle is asserted per case: the clamp held θ on the bound and the realised change
+/// differs from `γ·mean(η)`, so the fixture can tell the two re-centres apart. The extra
+/// stored draws are checked the same way.
+#[test]
+fn the_mu_shift_keeps_phi_at_a_bound() {
+    let gamma = 1.0;
+    // Additive: natural θ, upper bound 10. Log: log θ, upper bound log 10.
+    for (case, additive, packs_log) in [
+        ("additive, log-packed", true, true),
+        ("additive, identity-packed", true, false),
+        ("log", false, true),
+    ] {
+        let to_packed = |t: f64| if packs_log { t.ln() } else { t };
+        let to_mu = |packed: f64| {
+            if additive && packs_log {
+                packed.exp()
+            } else {
+                packed
+            }
+        };
+        let bounds = (to_packed(0.5), to_packed(10.0));
+        // mean η 2.0 (additive) / 1.0 (log): both carry θ past the bound from 9.5. Realised
+        // change from 9.5 is 0.5 (additive) / ln(10/9.5) = 0.051 (log), so the straddle
+        // below clears its 0.4 bar by ≥ 0.55 in every case.
+        let eta_mean = if additive { 2.0 } else { 1.0 };
+        for start in [9.5, 10.0] {
+            let mut packed = to_packed(start);
+            let mut etas: Vec<Vec<f64>> = [-1.0, 0.0, 1.0]
+                .iter()
+                .map(|d| vec![eta_mean + 0.3 * d, 7.0])
+                .collect();
+            let mut draws: Vec<Vec<Vec<f64>>> = vec![etas.clone(), etas.clone()];
+            let mu_before = to_mu(packed);
+            let phi_before: Vec<f64> = etas.iter().map(|e| mu_before + e[0]).collect();
+            closed_form_mu_shift(
+                &mut packed,
+                bounds,
+                packs_log,
+                additive,
+                gamma,
+                &mut etas,
+                &mut draws,
+                0,
+            );
+            let mu_after = to_mu(packed);
+            let what = format!("{case}, θ from {start}");
+            assert!(
+                (mu_after - to_mu(bounds.1)).abs() < 1e-12,
+                "{what}: the clamp holds θ on its bound, got {mu_after}"
+            );
+            assert!(
+                ((mu_after - mu_before) - gamma * eta_mean).abs() > 0.4,
+                "{what}: the fixture cannot tell the realised change from γ·mean(η)"
+            );
+            for (d, set) in std::iter::once(&etas).chain(draws.iter()).enumerate() {
+                for (i, e) in set.iter().enumerate() {
+                    let gap = (mu_after + e[0]) - phi_before[i];
+                    assert!(
+                        gap.is_finite() && gap.abs() < 1e-12,
+                        "{what}: draw {d}, subject {i} moved by {gap:.3e}"
+                    );
+                    assert_eq!(e[1], 7.0, "{what}: the other η is untouched");
+                }
+            }
+        }
+    }
 }
 
 /// Every early return from `MstepScoreSa::step` must be **counted**, or a run
@@ -710,7 +817,7 @@ fn every_failure_route_is_counted() {
         &p.sigma_upper,
         &p.mask,
         1.0,
-        1.0,
+        &[sigma_mstep_sa_step(1.0, 1.0)],
         &[],
     );
     assert!(
@@ -742,7 +849,7 @@ fn every_failure_route_is_counted() {
         &p.sigma_upper,
         &p.mask,
         1.0,
-        1.0,
+        &[sigma_mstep_sa_step(1.0, 1.0)],
         &[],
     );
     assert_eq!(sa.failure_total(), 2, "the counter must accumulate");
@@ -766,7 +873,7 @@ fn every_failure_route_is_counted() {
         &q.sigma_upper,
         &q.mask,
         1.0,
-        1.0,
+        &[sigma_mstep_sa_step(1.0, 1.0)],
         &[],
     );
     assert!(moved_ok, "the free fixture must take a step");
@@ -957,7 +1064,7 @@ fn one_step(gamma: f64, gamma_mstep: f64) -> (Vec<f64>, Vec<f64>) {
         &p.sigma_upper,
         &p.mask,
         gamma,
-        gamma_mstep,
+        &[sigma_mstep_sa_step(gamma, gamma_mstep)],
         &[],
     );
     assert!(
@@ -1127,5 +1234,41 @@ fn score_sa_blends_sigma_on_the_variance_scale() {
         "σ² must be affine in γ_σ (a variance-scale blend): realised second difference \
          {second:.3e} over γ_σ = {gs:?}, σ = {sig:?}. The packed-log spelling this test \
          rejects would give {log_second:.3e} at the same points."
+    );
+}
+
+/// Score-SA's acceptance gate reads `obs_nll_sum`, whose per-subject scorers return
+/// the shared `SUBJECT_SENTINEL_NLL` for a subject that cannot be evaluated (#2269).
+/// One such subject (a NaN η makes its prediction NaN) puts the sum on the rail, and
+/// the gate must refuse it; the same population with a finite η must pass, else the
+/// refusal proves nothing. A gate with its own threshold below the sum would accept
+/// the failed point, and one above a lowered sentinel would too — the shared
+/// predicate is what keeps the two from drifting.
+#[test]
+fn score_sa_gate_refuses_a_population_holding_a_sentinel_subject() {
+    use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let theta: Vec<f64> = p.log_theta.iter().map(|v| v.exp()).collect();
+    let sigma: Vec<f64> = p.log_sigma.iter().map(|v| v.exp()).collect();
+
+    let ok_draws = eta_draws().remove(0);
+    let ok = obs_nll_sum(&model, &population, &theta, &sigma, &ok_draws, &[]);
+    assert!(
+        score_sa_objective_usable(ok),
+        "a finite population must pass: {ok}"
+    );
+
+    let mut bad_draws = ok_draws.clone();
+    bad_draws[0][0] = f64::NAN;
+    let bad = obs_nll_sum(&model, &population, &theta, &sigma, &bad_draws, &[]);
+    assert!(
+        bad >= SUBJECT_SENTINEL_NLL,
+        "one unevaluable subject must put the sum on the rail: {bad}"
+    );
+    assert!(
+        !score_sa_objective_usable(bad),
+        "the gate accepted a population holding a sentinel subject: {bad}"
     );
 }

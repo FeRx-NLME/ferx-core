@@ -1,0 +1,25 @@
+[parameters]
+  theta TVKOUT(0.25, 0.01, 5.0)
+  theta TVPLB(6.0, 0.1, 50.0)
+  theta TVTF(0.15, 0.001, 2.0)
+  theta TVEMAX(8.0, 0.1, 50.0)
+  theta TVEC50(2.0, 0.1, 50.0)
+  omega ETA_PLB ~ 0.04
+  sigma ADD ~ 0.5 (sd)
+[individual_parameters]
+  KOUT = TVKOUT
+  PLB  = TVPLB * exp(ETA_PLB)
+  TF   = TVTF
+  EFF  = TVEMAX * EXPO / (TVEC50 + EXPO)
+[structural_model]
+  ode(obs_cmt=resp, states=[resp])
+[odes]
+  d/dt(resp) = KOUT * ((PLB * exp(-TF * TIME) + EFF) - resp)
+[error_model]
+  DV ~ additive(ADD)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

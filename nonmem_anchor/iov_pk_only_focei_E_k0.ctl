@@ -1,0 +1,31 @@
+$PROBLEM #1876 warfarin_iov pk-only row occasion, data=E inter=True k0=E
+$INPUT ID TIME DV EVID AMT CMT RATE MDV OCC
+$DATA iov_pk_only_nm_E.csv IGNORE=@
+$SUBROUTINES ADVAN2 TRANS2
+$PK
+  KAPPA = 0
+  IF(OCC.EQ.1) KAPPA = ETA(4)
+  IF(OCC.EQ.2) KAPPA = ETA(5)
+  IF(EVID.EQ.2) KAPPA = 0   ; emulate ferx: pk-only row under kappa = 0
+  CL = THETA(1)*EXP(ETA(1) + KAPPA)
+  V  = THETA(2)*EXP(ETA(2))
+  KA = THETA(3)*EXP(ETA(3))
+  S2 = V
+$ERROR
+  IPRED = F
+  Y = F*(1 + EPS(1))
+$THETA
+  (0.001, 0.2, 10.0)  ; TVCL
+  (0.1, 10.0, 500.0)  ; TVV
+  (0.01, 1.5, 50.0)   ; TVKA
+$OMEGA
+  0.09  ; ETA_CL
+  0.04  ; ETA_V
+  0.30  ; ETA_KA
+$OMEGA BLOCK(1)
+  0.01  ; KAPPA_CL occ 1
+$OMEGA BLOCK(1) SAME  ; occ 2
+$SIGMA
+  0.04  ; PROP_ERR sd 0.2
+$EST METHOD=1 INTER MAXEVAL=0 PRINT=1 NOABORT
+$TABLE ID TIME OCC EVID MDV PRED IPRED ETA1 ETA2 ETA3 ETA4 ETA5 NOPRINT ONEHEADER NOAPPEND FILE=sdtab

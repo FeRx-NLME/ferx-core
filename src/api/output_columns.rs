@@ -94,9 +94,10 @@ pub fn tafd_tad_for_subject(
 /// Observation times are not guaranteed to be sorted (preserved in input row
 /// order), so sort by time before integrating to prevent negative dt windows.
 ///
-/// `pub(crate)` so the reactive-dosing signal-AUC pass
-/// ([`crate::ode::adaptive_window_signal_aucs`], #391 S2.5b) shares this one
-/// implementation rather than carrying a second copy of the rule.
+/// `pub(crate)` so the reactive driver's window AUC (`auc_target_attainment`, #391
+/// S2.5b, #943) shares this one implementation rather than carrying a second copy of
+/// the rule. The sort is stable, so two nodes at one time — the value a break found and
+/// the value it left — keep their order and form a zero-width panel.
 pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
     if points.len() < 2 {
         return f64::NAN;
@@ -154,17 +155,13 @@ pub(crate) fn compute_extra_output_columns(
             .get(si)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
-        let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(occ_groups.len());
-        for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
-            occ_to_k.insert(*occ_id, k);
-        }
+        let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
         let combined_for = |occ_id: u32| -> Vec<f64> {
             let mut c = Vec::with_capacity(eta_hat.len() + model.n_kappa);
             c.extend_from_slice(eta_hat);
             if model.n_kappa > 0 {
-                match occ_to_k.get(&occ_id) {
-                    Some(&k) if k < subj_kappas.len() => {
+                match layout.group_of(occ_id) {
+                    Some(k) if k < subj_kappas.len() => {
                         c.extend_from_slice(subj_kappas[k].as_slice())
                     }
                     _ => c.extend(std::iter::repeat_n(0.0, model.n_kappa)),
@@ -186,18 +183,29 @@ pub(crate) fn compute_extra_output_columns(
         // `dose_lagtimes` stays empty and `tad_at_time` falls back to zero lag,
         // so the common no-lag case pays nothing for this per-dose pass.
         let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
-            (0..subject.doses.len())
+            let mut pk_dose: Vec<_> = (0..subject.doses.len())
                 .map(|d| {
-                    let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
+                    let occ = crate::pk::dose_row_occasion(subject, d).unwrap_or(u32::MAX);
                     let eta_d = combined_for(occ);
                     // Evaluate at this dose's time so a `TIME`-dependent lag (or
-                    // any TIME-built-in parameter) is honoured per dose (#610).
-                    let pk_d = (model.pk_param_fn)(
+                    // any TIME-built-in parameter) is honoured per dose (#610), the
+                    // TIME as written, as the prediction reads it (#1969).
+                    (model.pk_param_fn)(
                         theta,
                         &eta_d,
                         subject.dose_cov(d),
-                        subject.doses[d].time,
-                    );
+                        subject.dose_param_time(d),
+                    )
+                })
+                .collect();
+            // An `ADDL`-implied dose is shifted by its parent row's lag (#1909): the
+            // same post-pass the prediction's per-dose builders run, so TAD follows
+            // `PARENT_DOSE_ATTRS` rather than a copy of it.
+            crate::pk::inherit_parent_dose_attrs(model, subject, &mut pk_dose);
+            pk_dose
+                .iter()
+                .enumerate()
+                .map(|(d, pk_d)| {
                     // On ODE models the lag is keyed by dose compartment (`ALAGn`;
                     // issue #369), so resolve through `dose_attr_map` — the same
                     // single source of truth the prediction paths use — rather than
@@ -225,7 +233,8 @@ pub(crate) fn compute_extra_output_columns(
         for (j, eta_full) in per_obs_eta_full.iter().enumerate() {
             let cov_j = subject.obs_cov(j);
             // Evaluate at this observation's time so the sdtab individual-parameter
-            // columns honour the `TIME` built-in per row, matching IPRED (#610).
+            // columns honour the `TIME` built-in per row, matching IPRED (#610): the
+            // TIME as written, the clock the prediction's parameters read (#1969).
             // The subject's own mixture class is passed explicitly rather than left to
             // the ambient guard above: `MIXNUM` defaults to class 1, so a lookup that
             // relies on the guard is one refactor away from reporting class-1 typical
@@ -234,7 +243,7 @@ pub(crate) fn compute_extra_output_columns(
                 theta,
                 eta_full,
                 cov_j,
-                subject.obs_times[j],
+                subject.param_time_obs(j),
                 mix_class,
             );
             let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, &dose_lagtimes);
@@ -269,13 +278,7 @@ pub(crate) fn compute_extra_output_columns(
         // For subjects with no resets (the common case) n_sessions=1, session_obs[0]
         // holds all observation indices, session_shift[0]=0, and obs_session[j]=0
         // for every j — zero overhead, identical downstream behaviour.
-        let raw_time_of = |j: usize| -> f64 {
-            subject
-                .obs_raw_times
-                .get(j)
-                .copied()
-                .unwrap_or(subject.obs_times[j])
-        };
+        let raw_time_of = |j: usize| -> f64 { subject.readout_time(j) };
         let n_sessions = subject.reset_times.len() + 1;
         let (session_obs, session_shift): (Vec<Vec<usize>>, Vec<f64>) = {
             let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_sessions];
@@ -626,14 +629,27 @@ pub(crate) fn compute_extra_output_columns(
                                 // `compartments[i]` column stayed finite.
                                 vec![]
                             } else if let Some(ref ode) = model.ode_spec {
-                                // Time-independent params: one snapshot (t=0) is exact
-                                // across the grid; the ODE solver supplies its own clock.
+                                // Time-independent params: the disposition is one snapshot
+                                // (t=0) across the grid; the ODE solver supplies its own clock.
+                                // Every dose-record quantity — absorption kernel, pathway
+                                // fraction, route lag, zero-order `dur`, compartment lag, `F`,
+                                // `D{n}`/`R{n}`, the SS run-in — is read at its own dose record
+                                // (#1575), as IPRED and the per-obs states read it: a
+                                // time-varying covariate on one of them is not frozen at
+                                // `grid_cov`.
                                 let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov, 0.0);
-                                crate::ode::ode_dense_solve_states(
-                                    ode,
-                                    &pk_j.values,
+                                let mut pk_at_dose = Vec::new();
+                                crate::pk::compute_dose_pk_params_into(
+                                    model,
+                                    subject,
                                     theta,
                                     grid_eta_full,
+                                    &mut pk_at_dose,
+                                );
+                                crate::ode::predictions::ode_dense_solve_states_reading(
+                                    ode,
+                                    &pk_j.values,
+                                    crate::ode::predictions::DoseReads::PerDose(&pk_at_dose),
                                     subject,
                                     &grid_times,
                                 )

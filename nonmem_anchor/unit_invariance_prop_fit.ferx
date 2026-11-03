@@ -1,0 +1,35 @@
+# #2441 — the ferx side of the unit-invariance anchor.
+#
+# A 1-cpt oral model with proportional error, evaluated at the initial estimates
+# (`maxiter = 0`, NONMEM `MAXEVAL=0`) on the same data in two units:
+# `unit_invariance_prop_k1.csv` and `unit_invariance_prop_k1e6.csv` (AMT and DV
+# both × 1e6). Under proportional error a change of units moves only `ln V`, so the
+# objective must shift by exactly 2·n·ln k — NONMEM's does. At k = 1 several rows
+# have IPRED below 1e-6, where `(0.2·f)²` used to sit under ferx's absolute 1e-12
+# residual-variance floor. The NONMEM twins are `unit_invariance_prop_{k1,k1e6}.ctl`.
+[parameters]
+  theta TVCL(4.0,  0.001, 100.0)
+  theta TVV(20.0,  0.1,  500.0)
+  theta TVKA(1.5,  0.01,  50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.2 (sd)   # NONMEM $SIGMA 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei          # NONMEM $ESTIMATION METHOD=1 INTERACTION
+  maxiter    = 0              # NONMEM MAXEVAL=0
+  covariance = false

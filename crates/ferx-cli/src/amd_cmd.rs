@@ -190,6 +190,9 @@ fn run_amd_command(args: &[String]) -> Result<i32, String> {
                 if improved { "improved" } else { "kept" },
                 ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into())
             ),
+            // Per-candidate lines (#2512) are for log sinks; the CLI keeps to
+            // one line per step.
+            _ => {}
         }
     };
 

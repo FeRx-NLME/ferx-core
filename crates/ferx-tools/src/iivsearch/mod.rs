@@ -841,6 +841,7 @@ pub struct StepRank {
 
 /// What a search reports as it runs, for a CLI progress line.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum IivsearchEvent {
     InputStarted,
     InputFinished {
@@ -869,6 +870,11 @@ pub enum IivsearchEvent {
     Reverted {
         criterion: f64,
     },
+    /// One candidate's fit finished (#2512): emitted from the worker as each
+    /// one completes, so a log gets a line per candidate rather than per step.
+    /// See [`CandidateFinished`](crate::search::CandidateFinished) for the
+    /// order and the cases that cost no fit.
+    CandidateFinished(crate::search::CandidateFinished),
 }
 
 /// A progress callback.
@@ -932,12 +938,19 @@ pub fn run_iivsearch(
     let options = IivsearchOptions::from_config(config)?;
     let mut run_options = config.run_options();
     run_options.criterion = options.criterion();
+    let sink = run.progress;
+    let on_candidate = move |c: crate::search::CandidateFinished| {
+        if let Some(p) = sink {
+            p(IivsearchEvent::CandidateFinished(c));
+        }
+    };
     let fitter = RunnerFitter {
         threads: run.threads.or(config.run.threads).unwrap_or(0),
         dir: run.dir.clone(),
         cancel: run.cancel.clone(),
         data: &base.prepared.population,
         options: run_options,
+        on_candidate: sink.map(|_| &on_candidate as crate::search::CandidateFn<'_>),
         reuse_from: config.reuse_dirs(),
     };
     let space = Space::from_config(config, base)?;

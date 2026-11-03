@@ -1,17 +1,19 @@
 //! Waterproofing matrix for the user-ODE analytic sensitivity fallback (#410).
 //!
 //! Arming the ODE analytic gradient is only safe if **every** out-of-scope model
-//! or subject declines cleanly (`subject_sensitivities` → `None`, or
-//! `sens_supported` → `false`) so the optimizer falls back to the FD/gradient-free
-//! path. A case that returned a *wrong* `Some` would silently corrupt the gradient.
-//! `population_gradient_sens` short-circuits to `None` if any subject declines, so
-//! a single declining subject routes the whole population to FD — correct, never
-//! partial. This test asserts the decline for each excluded feature, plus a
+//! or subject declines cleanly (`subject_eta_grad` → `None`, or
+//! `analytic_outer_gradient_available` → `false`, imported here as `sens_supported`) so
+//! the optimizer falls back to the FD/gradient-free path. A case that returned a *wrong*
+//! `Some` would silently corrupt the gradient. (When this matrix was written the
+//! pre-#2093 `population_gradient_sens` short-circuited to `None` if any subject
+//! declined; a declining subject is now salvaged per subject.) This test asserts the decline for each excluded feature, plus a
 //! positive control that the in-scope model *is* armed (guarding against the gates
 //! silently disabling everything).
 
 use ferx_core::parser::model_parser::parse_model_string;
-use ferx_core::sens::provider::{sens_supported, subject_sensitivities};
+use ferx_core::sens::provider::{
+    analytic_outer_gradient_available as sens_supported, subject_eta_grad,
+};
 use ferx_core::types::{CompiledModel, DoseEvent, RateMode};
 
 mod common;
@@ -69,7 +71,7 @@ fn parse(src: &str) -> CompiledModel {
     parse_model_string(src).expect("model parses")
 }
 
-/// Call the analytic provider at η = 0 / default θ; `Some` means "on the analytic
+/// Call `subject_eta_grad` at η = 0 / default θ; `Some` means "on the analytic
 /// path", `None` means "declined → FD fallback".
 fn declines(model: &CompiledModel, doses: Vec<DoseEvent>) -> bool {
     let times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
@@ -83,7 +85,7 @@ fn declines(model: &CompiledModel, doses: Vec<DoseEvent>) -> bool {
     );
     let theta = &model.default_params.theta;
     let eta = vec![0.0; model.n_eta];
-    subject_sensitivities(model, &s, theta, &eta).is_none()
+    subject_eta_grad(model, &s, theta, &eta).is_none()
 }
 
 #[test]
@@ -112,7 +114,8 @@ fn armed_baseline_is_on_the_analytic_path() {
 #[test]
 fn modeled_duration_dose_without_slot_declines() {
     // #530: a modeled-duration dose IS now analytic on the event-driven walk (see the
-    // `ode_provider_modeled_duration_matches_production` unit test) — BUT only when its
+    // pre-#2093 `ode_provider_modeled_duration_matches_production` unit test, retired in
+    // #2093) — BUT only when its
     // `D{cmt}` slot is declared. `ARMED` has no `D1` parameter, so this dose can't be
     // resolved; the gate must decline to FD rather than emit a wrong gradient. (A real
     // such model is rejected by `check_model_data`; this guards the defensive gate.)
@@ -227,9 +230,9 @@ const ODE_LTBS: &str = r"
 fn expression_obs_scale_is_armed_on_static_walk() {
     // `obs_scale = V1` references a parameter carrying IIV → η-dependent
     // `ExpressionScale`. As of #486 the divisor scale's quotient rule is applied
-    // post-walk on the `(θ,η)` jet, so a non-LTBS, non-TV-cov model IS on the
-    // analytic path (the static walk only — TV cov / LTBS still decline; see
-    // `ode_provider_expression_scale_combos_fall_back_to_fd`).
+    // post-walk on the tape (`adjoint::apply_expression_scale`), so a non-LTBS model IS on
+    // the analytic path (static and event-driven walks; LTBS still declines — pinned before
+    // #2093 by the retired `ode_provider_expression_scale_combos_fall_back_to_fd`).
     let model = parse(ODE_OBS_SCALE);
     assert!(
         sens_supported(&model),

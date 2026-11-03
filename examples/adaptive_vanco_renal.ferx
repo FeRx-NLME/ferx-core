@@ -18,11 +18,10 @@
 # segment, so a covariate that changes over the horizon correctly drives the
 # predictions, the monitored trough, and the dose ladder.
 #
-# `auc_target` is deliberately absent: the exposure metric integrates a dense grid
-# from a single frozen PK snapshot, which would be silently wrong under a changing
-# covariate, so `auc_target` is a typed error for a time-varying-covariate subject
-# (#700). `target_window` (the pct-in-band trough metric) stays — it is a decision-
-# grid summary and is fully per-event covariate-aware.
+# The block declares no `auc_target` (trough control is the scenario); it is supported
+# here since #943, and `tests/adaptive_vanco_renal_anchor.rs` adds one to check each
+# window's AUC24 against mrgsolve. `target_window` (the pct-in-band trough metric)
+# is the decision-grid summary this example reports.
 #
 # Run with `simulate_adaptive_from_spec()` (not the plain forward `simulate()`).
 # Validated dose-for-dose against an independent mrgsolve run (mrgsolve, not

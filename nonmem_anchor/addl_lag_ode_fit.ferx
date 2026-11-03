@@ -1,0 +1,31 @@
+# ferx twin (ODE) of nonmem_anchor/addl_lag.ctl (#1909), the same model as
+# addl_lag_fit.ferx on the ODE engines. Evaluated once (maxiter = 0) by
+# tests/record_clock_nonmem_anchor.rs, which compares PRED.
+[parameters]
+  theta TVCL(0.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.01
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  ALAG1 = 0.25 * X
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+[scaling]
+  y = central / V
+[covariates]
+  X continuous
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method = foce
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-12
+  ode_abstol = 1e-12

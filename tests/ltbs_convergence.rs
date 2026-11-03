@@ -146,8 +146,8 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
     );
 }
 
-/// LTBS cross-check driven through the **analytic sensitivity provider**: the
-/// built-in L-BFGS outer optimizer consumes the provider's `g = ln(f)` jet
+/// LTBS cross-check driven through the **analytic (adjoint) gradient**: the
+/// built-in L-BFGS outer optimizer consumes the exact gradient of the `g = ln(f)` objective
 /// (value + ∂g/∂η/∂θ + Hessian). The test above now runs the NLopt L-BFGS that
 /// `auto` resolves to; this one pins the built-in L-BFGS, so it guards the LTBS
 /// jet transform in `sens::provider` end-to-end against the same NONMEM 7.5.1 reference. (The
@@ -178,7 +178,7 @@ fn ltbs_warfarin_analytic_lbfgs_matches_nonmem() {
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data must load");
 
-    // Built-in L-BFGS outer + analytic inner η-gradient — the analytic provider
+    // Built-in L-BFGS outer + analytic inner η-gradient — the analytic gradient
     // path. The inner solver is left at the default (Auto/BFGS); the inner
     // optimizer choice doesn't change the EBE or the analytic gradient, only the
     // per-step solver, and pinning it mutates a process-global that would race

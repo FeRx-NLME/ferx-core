@@ -1,0 +1,42 @@
+# A level block read by the hazard of TTE-only subjects -- the ferx twin of
+# `nonmem_anchor/level_no_gaussian.ctl` (#1797). Consumed by
+# `tests/level_no_gaussian_nonmem_anchor.rs`.
+#
+# `PLACEBO[STUDY, contrast = ref]` is laid out on the data's Gaussian records (studies
+# 1-3). The test sets PLACEBO[STUDY=2] = 0.5 and PLACEBO[STUDY=3] = 1.0, the NONMEM
+# side's THETA(4) and THETA(5). No omega: NONMEM runs `$OMEGA 0 FIX`, so both sides are
+# evaluated at eta = 0 and `2 * individual_nll` carries no 1/2 ln(omega) term.
+
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVH0(0.05, 1e-5, 10.0)
+  theta PLACEBO[STUDY, contrast = ref](0.0, -10.0, 10.0)
+  sigma PROP ~ 0.01                # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  H0 = TVH0 * exp(PLACEBO)
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  obs_scale = V                    # the state is an AMOUNT; NONMEM's `$ERROR` divides by V
+
+[event_model]
+  cmt    = 2
+  hazard = H0
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

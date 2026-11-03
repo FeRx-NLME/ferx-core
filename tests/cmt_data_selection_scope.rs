@@ -535,7 +535,8 @@ fn ferx_check_and_the_fit_report_the_same_defaulted_row_sentence() {
 fn fit_from_files_reports_the_filter_its_own_read_applied() {
     // The #1423 review's second finding, and the sharper half of the defect: this
     // entry point — the one ferx-r calls — reads its population through
-    // `build_selection_filter_merged`, so the model file's `[data_selection]` DOES
+    // the merged selection (`ReaderSettings::with_call_selection`, #1685), so the model
+    // file's `[data_selection]` DOES
     // filter the fit, but it used to hand `fit()` only the *caller's* options, whose
     // clause lists are empty. `CmtConsumer::DataSelectionFilter` was therefore asked
     // about a filter that was not the one that ran, and withheld the warning on a fit

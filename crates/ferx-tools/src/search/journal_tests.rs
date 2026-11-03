@@ -366,6 +366,77 @@ fn the_fingerprint_sees_the_contents_and_not_only_the_shape() {
     }
 }
 
+/// #1876, both sides of the gate: a pk-only row's occasion moves the digest, and
+/// an empty `pk_only_occasions` (no IOV column, or no pk-only row) leaves it
+/// where it was before the field existed, so those journals still resume.
+///
+/// Mutations — drop the line: the labelled case is unmoved; write it
+/// unconditionally: the pinned digest moves.
+#[test]
+fn a_pk_only_occasion_moves_the_digest_only_when_present() {
+    let base = SearchManifest::new(&options(), &loaded_population());
+    // The digest of `loaded_population()` before #1876 added the field.
+    assert_eq!(
+        base.data_fingerprint,
+        "3bb0d1d43cb11acbb2791d9b735d06dec495226cea8cb1b1b26f9574d9450181"
+    );
+
+    let labelled = |occ: u32| {
+        let mut data = loaded_population();
+        data.subjects[0].pk_only_times = vec![2.0];
+        data.subjects[0].pk_only_covariates = vec![HashMap::new()];
+        data.subjects[0].pk_only_occasions = vec![occ];
+        SearchManifest::new(&options(), &data)
+    };
+    assert_ne!(
+        labelled(1).data_fingerprint,
+        labelled(2).data_fingerprint,
+        "a pk-only row's occasion left the fingerprint unmoved"
+    );
+}
+
+/// #2036 review r1: `ARM = 1, 2, 2` and `1, 2, <blank>` read without the model carry
+/// the same values into every snapshot, but `fit()` refuses the second's blank level
+/// cell, so a resume on it must not reuse the first's fits. The written-out file is the
+/// control: identical snapshots, a different digest, and a resume refused. A population
+/// with no filled cell keeps the pre-#2036 digest (pinned above).
+#[test]
+fn a_filled_cell_moves_the_digest() {
+    let read = |tag: &str, csv: &str| {
+        let path = std::env::temp_dir().join(format!(
+            "ferx_journal_filled_{}_{tag}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, csv).unwrap();
+        let pop = ferx_core::read_nonmem_csv(&path, None, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+        pop
+    };
+    let written = read(
+        "written",
+        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,2\n",
+    );
+    let blank = read(
+        "blank",
+        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,\n",
+    );
+    assert_eq!(
+        written.subjects[0].obs_covariates, blank.subjects[0].obs_covariates,
+        "the snapshots agree"
+    );
+    assert!(written.subjects[0].filled_cells.is_empty());
+    assert!(!blank.subjects[0].filled_cells.is_empty());
+    let (w, b) = (
+        SearchManifest::new(&options(), &written),
+        SearchManifest::new(&options(), &blank),
+    );
+    assert_ne!(w.data_fingerprint, b.data_fingerprint);
+    assert!(
+        w.check_compatible(&b, std::path::Path::new(".")).is_err(),
+        "a resume on the blank file reused the written-out file's fits"
+    );
+}
+
 #[test]
 fn the_fingerprint_is_stable_across_repeated_construction() {
     // Covariates live in `HashMap`s, whose iteration order varies per process.
@@ -422,7 +493,7 @@ fn the_fit_settings_fingerprint_moves_with_every_setting_that_changes_a_fit() {
             o.run_covariance_step = !o.run_covariance_step;
         }),
         ("the BLOQ convention", &|o: &mut FitOptions| {
-            o.bloq_method = BloqMethod::M3;
+            o.bloq_method = Some(BloqMethod::M3);
         }),
         ("the gradient method", &|o: &mut FitOptions| {
             o.gradient_method = GradientMethod::Fd;
@@ -445,6 +516,29 @@ fn the_fit_settings_fingerprint_moves_with_every_setting_that_changes_a_fit() {
             "a resume against changed {what} was accepted"
         );
     }
+}
+
+#[test]
+fn the_fit_settings_fingerprint_does_not_move_between_spellings_of_the_same_bloq_method() {
+    // #1824 review r1 #2: the runner pins caller options' `bloq_method: None` to
+    // `Some(Drop)` before fitting, so the two run the same fit and must fingerprint
+    // alike — a resume switching between them is the same run. The control: `Some(M3)`
+    // still moves it (also pinned above), so the equality is not a fingerprint that
+    // ignores the field.
+    let spelled = |bloq: Option<BloqMethod>| {
+        with_fit_options(Some(FitOptions {
+            bloq_method: bloq,
+            ..FitOptions::default()
+        }))
+    };
+    let none = spelled(None);
+    let drop = spelled(Some(BloqMethod::Drop));
+    let m3 = spelled(Some(BloqMethod::M3));
+    assert_eq!(none.fit_options_fingerprint, drop.fit_options_fingerprint);
+    assert!(none
+        .check_compatible(&drop, std::path::Path::new("."))
+        .is_ok());
+    assert_ne!(none.fit_options_fingerprint, m3.fit_options_fingerprint);
 }
 
 #[test]

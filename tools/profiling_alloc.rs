@@ -1,4 +1,6 @@
 //! Example-only Rust allocation counter and sampled stacks. Never linked into the engine.
+//! It wraps `System`, not the mimalloc the `ferx` binary ships (#2435): its allocation
+//! counts carry over to the CLI, its wall times do not.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::HashMap;

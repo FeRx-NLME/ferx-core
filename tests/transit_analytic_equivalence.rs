@@ -338,6 +338,19 @@ fn transit_flip_flop_routes_to_ode_twin() {
 /// loops evaluate the ODE twin, and at the optimum the two objectives coincide.
 /// Old behaviour: the shorthand's all-zero flip-flop predictions collapse a
 /// proportional objective, so it never tracks the ODE fit.
+///
+/// #2339: until the log-packing floor escape, **both** L-BFGS fits put TVNTR (declared
+/// `≥ 0`) on ferx's internal `1e-10` floor and stopped there at OFV −59.310873, so they
+/// agreed on a point that is not a minimum and the test passed on the shared defect. With
+/// the escape the shorthand reaches −228.539600 (θ 2.05 / 3.33 / 3.04 / 20.25, the
+/// simulated 2 / 4 / 3 / 20), while the hand ODE's L-BFGS, on fixed-EBE outer gradients for
+/// all four subjects, does not: started *at* that optimum it reports `converged` at
+/// −215.687 (Linux aarch64). That was a defect of its own (#2461: the EBE guard rejected the
+/// start, so it was never a candidate) and is pinned here only as its invariant — a
+/// converged verdict never sits above its own start. Otherwise the test pins the object
+/// directly: the two objectives are one function (equal at the shorthand's optimum), the
+/// shorthand's gradient fit converges off the floor, and the hand ODE fitted by BOBYQA
+/// (−228.192) lands on the same optimum within the band.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -403,10 +416,75 @@ fn transit_flip_flop_fit_matches_ode_twin() {
     opts.method = EstimationMethod::FoceI;
     opts.run_covariance_step = false;
 
-    // Fit both to convergence: the shorthand reroutes to an ODE textually identical
-    // to `hand_ode`, so they optimise the same objective and land on the same OFV.
+    // The shorthand on the gradient path, to convergence and off the TVNTR floor.
     let ra = fit(&sh, &pop, &sh.default_params, &opts).expect("flip-flop shorthand fit ok");
-    let ro = fit(&hd, &pop, &hd.default_params, &opts).expect("flip-flop ODE fit ok");
+    assert!(ra.converged, "shorthand fit: {:?}", ra.warnings);
+    assert!(ra.theta[2] > 0.1, "TVNTR on the floor: {}", ra.theta[2]);
+
+    // One objective: the hand ODE evaluated at the shorthand's optimum. Realised gap 0 to the
+    // printed 1e-6 (Linux aarch64); a reroute that stopped evaluating the ODE twin moves it
+    // by the flip-flop collapse, O(100) OFV.
+    let mut at = hd.default_params.clone();
+    at.theta = ra.theta.clone();
+    at.omega = ferx_core::types::OmegaMatrix::from_matrix(
+        ra.omega.clone(),
+        at.omega.eta_names.clone(),
+        at.omega.diagonal,
+    );
+    at.sigma.values = ra.sigma.clone();
+    let eval = FitOptions {
+        outer_maxiter: 0,
+        ..opts.clone()
+    };
+    let e = fit(&hd, &pop, &at, &eval).expect("ODE eval ok");
+    assert!(
+        e.ofv.is_finite() && (e.ofv - ra.ofv).abs() < 1e-4,
+        "hand ODE at the shorthand's optimum {} vs shorthand {}",
+        e.ofv,
+        ra.ofv
+    );
+
+    // #2461: the hand ODE's L-BFGS fit *started at* that optimum. Its first evaluation is
+    // rejected by the EBE guard (one of four subjects' inner loops falls back to
+    // Nelder–Mead there) on macOS arm64, so the start is never a candidate and the run walks
+    // off it, to the TVNTR floor at −59.31; at #2460's head on Linux aarch64 it reported
+    // `converged` at −215.687. On Linux x86_64 at b68c6731 the start is accepted and the
+    // fit stays at −228.7949 (`W_STALLED_AT_INIT`); at dad870c0 it reached the floor too,
+    // and the floor escape's restart reported `converged` at −191.927 — above the fit's
+    // start but below the restart's own, which is what the per-run check compared it to.
+    // Whatever it reaches, a converged verdict may not sit above the fit's start by more
+    // than the plateau bound, and a run that does carries `W_ABOVE_START`.
+    let from_opt = fit(&hd, &pop, &at, &opts).expect("ODE fit from the optimum ok");
+    let bound = e.ofv + 1e-3 * (1.0 + e.ofv.abs());
+    let above = from_opt
+        .warnings
+        .iter()
+        .any(|w| w.contains("W_ABOVE_START"));
+    eprintln!(
+        "hand ODE L-BFGS from the optimum: OFV {:.6} (start {:.6}), converged {}, W_ABOVE_START {}",
+        from_opt.ofv, e.ofv, from_opt.converged, above
+    );
+    assert!(
+        !from_opt.converged || from_opt.ofv <= bound,
+        "converged at {} above its start {}: {:?}",
+        from_opt.ofv,
+        e.ofv,
+        from_opt.warnings
+    );
+
+    // The hand ODE fitted on its own, by BOBYQA (see above for why not L-BFGS): the same
+    // optimum. Realised rel 1.5e-3 (−228.192 vs −228.540).
+    let ro = fit(
+        &hd,
+        &pop,
+        &hd.default_params,
+        &FitOptions {
+            optimizer: ferx_core::types::Optimizer::Bobyqa,
+            ..opts.clone()
+        },
+    )
+    .expect("flip-flop ODE fit ok");
+    assert!(ro.converged, "hand ODE BOBYQA fit: {:?}", ro.warnings);
     assert!(
         ra.ofv.is_finite() && ro.ofv.is_finite(),
         "OFVs must be finite: shorthand {} / ODE {}",
@@ -443,8 +521,8 @@ fn transit_with_bioavailability_matches_ode() {
 
 /// Fixed-parameter population OFV (FOCEI marginal NLL) at several eta values: the
 /// analytic transit and its ODE twin must agree. Unlike the eta=0 `predict()` sweep
-/// above, this drives the analytic **sensitivity** path (`run_obs` transit branch,
-/// the exact `∂f/∂{cl,v,n,mtt,η}` jets), and adds a likelihood-level anchor. (A
+/// above, this drives the analytic **sensitivity** path (the transit closed form as the
+/// adjoint records it, the exact `∂f/∂{cl,v,n,mtt,η}` jets), and adds a likelihood-level anchor. (A
 /// fixed-parameter NLL, not a converged fit, so optimizer path / solver noise can't
 /// confound it — mirrors `analytical_ode_equivalence::assert_ofv_equiv`.)
 #[test]
@@ -507,6 +585,7 @@ fn transit_fit_err(pop: &Population) -> String {
         .model;
     fit(&model, pop, &model.default_params, &FitOptions::default())
         .expect_err("fit should reject the unsupported transit configuration")
+        .to_string()
 }
 
 /// Steady-state (`SS=1`) dosing on a closed-form transit model now reroutes to its ODE twin
@@ -782,7 +861,8 @@ fn transit_iov_without_twin_rejected() {
     );
     let pop = iov_subject();
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("twin-less IOV transit should be rejected");
+        .expect_err("twin-less IOV transit should be rejected")
+        .to_string();
     assert!(
         e.contains("IOV"),
         "expected an IOV-rejection message, got: {e}"
@@ -824,7 +904,8 @@ fn transit_reset_rejected() {
     let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
     pop.subjects[0].reset_times = vec![2.0];
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("transit + system reset should be rejected");
+        .expect_err("transit + system reset should be rejected")
+        .to_string();
     assert!(
         e.contains("reset") && e.contains("EVID"),
         "expected a reset-rejection message, got: {e}"
@@ -973,13 +1054,12 @@ fn transit_depot_init_rejected_central_ok() {
         .expect("transit central init should parse");
 }
 
-/// Short FOCEI fit (a couple of outer iterations) — this is the test that actually
-/// drives the analytic **sensitivity** path for transit: `run_obs` / `run_obs_grad`'s
-/// transit branch, `one_cpt_transit_conc_g`, `slot_to_dim` for `n`/`mtt`, and the
-/// `ExKind` arm. (The fixed-eta OFV test above evaluates `individual_nll` and does *not*
-/// go through the sens provider, so those exact `∂f/∂{cl,v,n,mtt}` jets the estimator
-/// seeds were otherwise only exercised by an uncommitted benchmark.) Tier-2: returns
-/// after a handful of iterations with a finite OFV, not convergence.
+/// Short FOCEI fit (a couple of outer iterations) — this is the test that actually drives the
+/// analytic **sensitivity** path for transit: the adjoint's closed-form recording of
+/// `one_cpt_transit_conc_g`, and `slot_to_dim` for `n`/`mtt`. (The fixed-eta OFV test above
+/// evaluates `individual_nll` and does *not* go through the sens provider, so those exact
+/// `∂f/∂{cl,v,n,mtt}` jets the estimator seeds were otherwise only exercised by an uncommitted
+/// benchmark.) Tier-2: returns after a handful of iterations with a finite OFV, not convergence.
 #[test]
 fn transit_short_fit_drives_analytic_sens() {
     let (an_src, _) = build_pair(false, false);
@@ -1221,8 +1301,8 @@ fn two_cpt_transit_with_bioavailability_matches_ode() {
 }
 
 /// Fixed-parameter population OFV at several eta values — drives the analytic
-/// **sensitivity** path (`run_obs` two_cpt_transit branch, the exact
-/// `∂f/∂{cl,v1,q,v2,n,mtt,η}` jets), the 2-cpt counterpart of `transit_ofv_matches_ode`.
+/// **sensitivity** path (the `two_cpt_transit` closed form as the adjoint records it, the
+/// exact `∂f/∂{cl,v1,q,v2,n,mtt,η}` jets), the 2-cpt counterpart of `transit_ofv_matches_ode`.
 /// Regression (2-cpt asymmetry): a `two_cpt_transit` model with a mid-profile `TIME`
 /// switch used to be **rejected** — the ODE-equivalent desugar was 1-cpt only — while
 /// the identical 1-cpt model transparently rerouted (cf.
@@ -1345,8 +1425,8 @@ fn two_cpt_transit_ofv_matches_ode() {
 }
 
 /// Short FOCEI fit (a couple of outer iterations) — drives the 2-cpt analytic
-/// sensitivity provider end-to-end (`run_obs_grad` two_cpt_transit branch,
-/// `two_cpt_transit_conc_g`). Tier-2: returns with a finite OFV, not convergence.
+/// gradient end-to-end (the adjoint recording `two_cpt_transit_conc_g`; before
+/// #2093 the forward provider's `run_obs_grad` two_cpt_transit branch). Tier-2: returns with a finite OFV, not convergence.
 #[test]
 fn two_cpt_transit_short_fit_drives_analytic_sens() {
     let (an_src, _) = build_pair_2cpt(false, false);
@@ -1519,7 +1599,8 @@ fn transit_flip_flop_without_twin_is_rejected() {
 
     // fit() rejects it with a clear, actionable error (not a silent zero-degenerate fit).
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("twin-less flip-flop must be rejected");
+        .expect_err("twin-less flip-flop must be rejected")
+        .to_string();
     assert!(
         e.contains("flip-flop") && e.contains("no ODE twin"),
         "expected an actionable twin-less flip-flop error, got: {e}"
@@ -1544,7 +1625,10 @@ fn transit_flip_flop_without_twin_errs_in_predict() {
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("flip-flop regime"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// The reject also fires on the `simulate()` path — a panic through the
@@ -1558,7 +1642,10 @@ fn transit_flip_flop_without_twin_errs_in_simulate() {
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let err = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
         .expect_err("simulate_with_seed() must refuse this input");
-    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("flip-flop regime"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// #735: a FLIP-FLOP transit model carrying `lagtime=` and `f=` now auto-routes to its
@@ -1759,7 +1846,10 @@ V1 = TVF\n\n\
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(err.contains("flip-flop regime"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("flip-flop regime"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// #735 shadow guard, **stray reserved-name** case (exercises the `f` arm's decline branch): an
@@ -1820,7 +1910,8 @@ fn two_cpt_transit_reset_rejected() {
     let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
     pop.subjects[0].reset_times = vec![2.0];
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("2cpt transit + system reset should be rejected");
+        .expect_err("2cpt transit + system reset should be rejected")
+        .to_string();
     assert!(
         e.contains("two_cpt_transit") && e.contains("reset"),
         "expected a two_cpt_transit reset-rejection message, got: {e}"
@@ -1839,7 +1930,8 @@ fn two_cpt_transit_non_depot_dose_rejected() {
     let central_dose = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0); // CMT=2, plain bolus
     let pop = population(vec![central_dose], vec![1.0, 4.0, 8.0]);
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("2cpt transit + non-depot (CMT=2) dose should be rejected");
+        .expect_err("2cpt transit + non-depot (CMT=2) dose should be rejected")
+        .to_string();
     assert!(
         e.contains("two_cpt_transit") && e.contains("non-depot") && e.contains("CMT=2"),
         "expected a two_cpt_transit non-depot-dose rejection message, got: {e}"

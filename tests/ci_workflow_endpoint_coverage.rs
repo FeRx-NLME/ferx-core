@@ -1,17 +1,18 @@
 //! Guard: the `Tests + coverage (TTE/CTMM endpoints)` job in `.github/workflows/ci.yml`
-//! selects its integration-test binaries with an explicit `--test <name>` list rather
-//! than `--tests`, because re-running the whole 122-binary base suite under a second
+//! selects its integration-test binaries with an explicit list
+//! (`tools/ci-endpoint-tests.txt`, spread over the job's shards by
+//! `tools/ci-test-shard.py`, #2167) rather than `--tests`, because re-running the whole 122-binary base suite under a second
 //! feature set bought no coverage (Codecov merges flags by summing hits) and cost ~15
 //! minutes of instrumented compile per PR.
 //!
 //! The cost of that speed-up is a list that can drift: add `tests/foo.rs` using
-//! `#[cfg(feature = "survival")]`, forget the workflow, and its lines silently read as
+//! `#[cfg(feature = "survival")]`, forget the list, and its lines silently read as
 //! uncovered in the merged report — quietly failing the ≥90% patch gate for the very PR
 //! that added them, with nothing pointing at the cause.
 //!
 //! So the invariant is pinned here as a plain set equality:
 //!
-//! > the `--test` names in that job == every `tests/*.rs` mentioning a `survival`,
+//! > the names in `tools/ci-endpoint-tests.txt` == every `tests/*.rs` mentioning a `survival`,
 //! > `markov` or `nn` feature cfg.
 //!
 //! `nn` is in that set because the job builds `--features ci,markov,nn`: the covariate-NN
@@ -105,34 +106,35 @@ fn endpoint_test_files(tests_dir: &Path) -> BTreeSet<String> {
     found
 }
 
-/// The `--test <name>` arguments of the endpoint coverage step in `ci.yml`.
+/// The integration binaries the endpoint job runs: `tools/ci-endpoint-tests.txt`,
+/// which `tools/ci-test-shard.py run endpoints` spreads over the job's shards
+/// (`tests/ci_test_shards.rs` pins that every listed binary lands on exactly one).
 ///
-/// Scoped to that one step by scanning from its `- name:` line to the next step, so an
-/// unrelated `--test` elsewhere in the workflow (e.g. a future targeted job) cannot
-/// satisfy this assertion by accident.
-fn workflow_test_selection(workflow: &str) -> BTreeSet<String> {
+/// The list moved out of `ci.yml` when the job was sharded (#2167), so the step
+/// itself is pinned too: it must still hand the selection to the planner's
+/// `endpoints` suite, or the list below would be a file nothing reads.
+fn workflow_test_selection(workflow: &str, list: &str) -> BTreeSet<String> {
     const STEP: &str = "- name: Generate TTE/CTMM endpoint coverage report";
     let step_start = workflow
         .find(STEP)
         .expect("ci.yml still has the endpoint coverage step");
     let rest = &workflow[step_start + STEP.len()..];
     // The step's `run:` block ends at the next step in the same job.
-    let step_body = match rest.find("\n      - name:") {
+    let step_body = match rest.find("\n      - ") {
         Some(end) => &rest[..end],
         None => rest,
     };
+    assert!(
+        step_body.contains("tools/ci-test-shard.py run endpoints "),
+        "the endpoint coverage step no longer runs `tools/ci-test-shard.py run endpoints`, \
+         so tools/ci-endpoint-tests.txt no longer decides what it builds:\n{step_body}"
+    );
 
-    let mut selected = BTreeSet::new();
-    for (idx, _) in step_body.match_indices("--test ") {
-        let after = &step_body[idx + "--test ".len()..];
-        let name: String = after
-            .chars()
-            .take_while(|c| !c.is_whitespace() && *c != '\\')
-            .collect();
-        assert!(!name.is_empty(), "`--test` with no target name in ci.yml");
-        selected.insert(name);
-    }
-    selected
+    list.lines()
+        .map(|l| l.split('#').next().unwrap().trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test]
@@ -141,7 +143,9 @@ fn endpoint_coverage_job_lists_every_feature_gated_test_file() {
     let workflow = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
         .expect("ci.yml is readable from the repo root");
 
-    let selected = workflow_test_selection(&workflow);
+    let list = std::fs::read_to_string(root.join("tools/ci-endpoint-tests.txt"))
+        .expect("tools/ci-endpoint-tests.txt is readable from the repo root");
+    let selected = workflow_test_selection(&workflow, &list);
     let expected = endpoint_test_files(&root.join("tests"));
 
     assert!(
@@ -156,16 +160,16 @@ fn endpoint_coverage_job_lists_every_feature_gated_test_file() {
     assert!(
         missing.is_empty(),
         "these tests/*.rs use a `survival`/`markov`/`nn` feature cfg but are NOT built by the \
-         `Tests + coverage (TTE/CTMM endpoints)` job in .github/workflows/ci.yml: {missing:?}. \
-         Their feature-gated lines would read as uncovered in the merged Codecov report. \
-         Add `--test <name>` for each to that job's `cargo llvm-cov` invocation."
+         `Tests + coverage (TTE/CTMM endpoints)` job: {missing:?}. Their feature-gated \
+         lines would read as uncovered in the merged Codecov report. Add each name to \
+         tools/ci-endpoint-tests.txt."
     );
     assert!(
         extra.is_empty(),
         "the `Tests + coverage (TTE/CTMM endpoints)` job builds these test binaries, but they \
          no longer contain a `survival`/`markov`/`nn` feature cfg: {extra:?}. They are already run \
-         and measured by `Tests + coverage (core)`, so drop their `--test` flags rather than \
-         pay a second instrumented compile."
+         and measured by `Tests + coverage (core)`, so drop them from \
+         tools/ci-endpoint-tests.txt rather than pay a second instrumented compile."
     );
 }
 

@@ -1,0 +1,33 @@
+# ferx twin of `nested_levels_3.ctl` (#1082 PR2, anchor O1).
+#
+# Three nested levels: sponsor (the subject, ID) -> study -> arm, with visits inside
+# each arm. NONMEM writes the study and arm effects as occasion-style ETA slots with
+# $OMEGA SAME and the arm-size scaling by hand (KAR/SQRT(NARM)); ferx declares the
+# levels and puts the weight on the arm kappa. The initial estimates are NONMEM's
+# converged ones (nested_levels_3.ext), so `outer_maxiter = 0` evaluates both engines
+# at one point. ARM is numbered 1, 2 inside each study: the groups are nested by key.
+
+[parameters]
+  theta TVE0(10.1818, 0.0, 1000.0)
+  theta TVEMAX(22.0140, 0.0, 1000.0)
+  theta ED50(33.4048, 0.1, 10000.0)
+  theta ET50(3.20150, 0.01, 1000.0)
+  omega ETA_SP ~ 0.0699388
+  level STUDY by STUDY in ID
+  level ARM by ARM in STUDY
+  kappa K_ST ~ 0.0904362 at STUDY
+  kappa K_ARM ~ 3.75478 at ARM weight = NARM
+  sigma ADD ~ 0.255164
+
+[individual_parameters]
+  EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)
+
+[structural_model]
+  y = TVE0 + EMAX * DOSE / (ED50 + DOSE) * TIME / (TIME + ET50)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method     = focei
+  covariance = false

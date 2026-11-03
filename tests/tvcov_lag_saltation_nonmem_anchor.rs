@@ -23,7 +23,8 @@
 //! The `KA` term is load-bearing, not decoration. With a plain `KA` the depot
 //! compartment's own velocity carries no covariate, so the post-arrival field does
 //! not jump across the boundary and the defect does not reproduce — the same reason
-//! `sens/ode_provider_tests.rs` notes its oral variant "leaks only a few percent".
+//! the (since-deleted, pre-#2093) `sens/ode_provider_tests.rs` noted of its oral variant:
+//! it "leaks only a few percent".
 //! Putting a covariate where the dose lands is what makes the cell load-bearing.
 //!
 //! # A — single dose (`tvcov_lag_saltation.{ctl,csv}`)

@@ -881,7 +881,7 @@ fn m_step_objective_consumes_the_cached_schedule_on_both_arms() {
                 subject,
                 &p.theta,
                 &p.sigma.values,
-                &model.residual_correlations,
+                model.residual_cov_theta(&p.theta),
                 &eta,
                 &mut crate::pk::EventPkParams::default(),
                 sched,
@@ -953,8 +953,9 @@ fn m_step_objective_consumes_the_cached_schedule_on_both_arms() {
 /// number, because a fit also builds a handful of schedules **outside** the
 /// hot path and pinning a magic total would be pinning those too. Measured,
 /// for the analytic fixture: `build_schedule_cache` builds one per subject, and
-/// the post-loop final-EBE pass (`run_inner_loop_warm` → `find_ebe` →
-/// `sens::provider::run_obs_grad_tvcov`) builds two more per subject. All three
+/// the post-loop final-EBE pass (`run_inner_loop_warm` → `find_ebe` → the adjoint
+/// recorder; measured when that was the pre-#2093 `sens::provider::run_obs_grad_tvcov`)
+/// builds two more per subject. All three
 /// are once per fit. The E-step and M-step — the `n_iter`-proportional part —
 /// must contribute **zero**, and that is exactly what invariance across
 /// `n_iter` asserts, with no magic constant and no knowledge of how many
@@ -1049,10 +1050,12 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
 /// `[individual_parameters]` read `TIME` the event schedule is therefore rebuilt
 /// inside every M-step, where the derivative-free solver rebuilds none.
 ///
-/// Measured on this fixture: tripling the iteration count adds **168** builds,
-/// i.e. exactly `2 · extra_iters · n` (2 per subject per M-step, and the
-/// score-SA M-step runs every iteration), against **0** for the same fixture
-/// under `mstep_solver = bobyqa`.
+/// Measured on this fixture: tripling the iteration count adds **84** builds,
+/// i.e. exactly `extra_iters · n` (one per subject per M-step — the base
+/// prediction; the θ-derivatives come from the adjoint's own recording, which
+/// replaced a perturbed prediction per θ), against **0** for the same fixture
+/// under `mstep_solver = bobyqa`. It was `2 · extra_iters · n` while the θ
+/// derivative was a forward difference.
 ///
 /// This is an unrealised saving, not a regression — `score_sa` is 25–54 % less
 /// CPU than `bobyqa` across the #1449 benchmark suite *including* the
@@ -1082,15 +1085,15 @@ fn the_score_sa_mstep_rebuilds_the_event_schedule() {
         - short.saem_n_exploration
         - short.saem_n_convergence) as u64;
     let drift = b.saturating_sub(a);
-    // Two builds per subject per iteration, on the nose (measured 30 → 198 over
+    // One build per subject per iteration, on the nose (measured 67 → 151 over
     // 14 extra iterations on 6 subjects). Asserted as an equality rather than a
     // bound: a *smaller* number means someone started threading the cache
     // through and should delete this test, and a larger one is a new leak.
     assert_eq!(
         drift,
-        2 * extra_iters * n,
+        extra_iters * n,
         "score-SA M-step schedule builds {a} → {b} (drift {drift}) over {extra_iters} \
-         extra iterations on {n} subjects — expected exactly two rebuilds per subject \
+         extra iterations on {n} subjects — expected exactly one rebuild per subject \
          per iteration; if this is now lower, `obs_nll_subject_grad_fisher` has learnt \
          to take the cached schedule and this test should go"
     );
@@ -1159,7 +1162,7 @@ fn schedule_cache_covers_a_time_only_baseline_covariate_subject() {
             subject,
             &p.theta,
             &p.sigma.values,
-            &model.residual_correlations,
+            model.residual_cov_theta(&p.theta),
             &[0.0, 0.0],
             &mut crate::pk::EventPkParams::default(),
             None,

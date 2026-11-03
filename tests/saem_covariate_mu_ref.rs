@@ -159,6 +159,69 @@ fn saem_covariate_group_removes_the_not_mu_referenced_warning() {
     );
 }
 
+/// Tier-2, #1422: a weight ratio assigned in both arms of an `if`/`else` is the
+/// same covariate group as the direct `(WT/70)^TH_WT` form, so `TH_WT` gets
+/// the group step instead of an un-anchored-theta advisory. The pair
+/// straddles the fold: the #1415 fixture writes the same values through a
+/// local the fold does not resolve (assigned before an `if` with no `else`),
+/// and must still carry the advisory — so a test that passed because the
+/// advisory had stopped being emitted at all would fail here. Since #1715 that
+/// advisory is the carries-an-ETA one (`TH_WT` shares `CL` with `ETA_CL`), so
+/// the control also pins that it is not reported as ETA-less.
+#[test]
+fn an_if_else_assigned_covariate_local_joins_the_group() {
+    let (direct, _) = load("covmuref_power_saem_fit.ferx", "covmuref_power.csv");
+    let (ifelse, pop) = load("covmuref_power_ifelse_saem_fit.ferx", "covmuref_power.csv");
+    let (numeric, _) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
+    assert_eq!(
+        ifelse.covariate_mu_refs.len(),
+        1,
+        "{:?}",
+        ifelse.covariate_mu_refs
+    );
+    let (g, d) = (&ifelse.covariate_mu_refs[0], &direct.covariate_mu_refs[0]);
+    assert_eq!(g.eta_name, d.eta_name);
+    assert_eq!(g.theta_names, d.theta_names);
+    assert_eq!(g.covariate_names, d.covariate_names);
+    assert_eq!(g.transform, d.transform);
+    assert!(
+        numeric.covariate_mu_refs.is_empty(),
+        "{:?}",
+        numeric.covariate_mu_refs
+    );
+
+    let opts = FitOptions {
+        saem_n_exploration: 2,
+        saem_n_convergence: 1,
+        ..saem_opts()
+    };
+    // (named in the ETA-less advisory, named in the carries-an-ETA advisory)
+    let advisories_naming_th_wt = |model: &ferx_core::CompiledModel| {
+        let result = fit(model, &pop, &model.default_params, &opts).expect("short SAEM must run");
+        let names = |phrase: &str| {
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains(phrase) && w.contains("TH_WT"))
+        };
+        (
+            names("NO associated ETA"),
+            names("but not as a mu-referenced typical value"),
+        )
+    };
+    assert_eq!(
+        advisories_naming_th_wt(&numeric),
+        (false, true),
+        "control: the unresolved local must still leave TH_WT on the numerical M-step, \
+         reported as carrying an ETA (#1715)"
+    );
+    assert_eq!(
+        advisories_naming_th_wt(&ifelse),
+        (false, false),
+        "the if/else local must put TH_WT in the covariate group"
+    );
+}
+
 /// Tier-3: the additive renal gradient — NONMEM's *nonlinear* MU case — lands
 /// where NONMEM SAEM lands. Bounds are measured: realised |Δ| on the anchor run
 /// was 4e-3 (TVCL), 8e-6 (TH_CRCL), 3e-4 (TVV), 2e-4 (both ω²); each bound
@@ -227,10 +290,56 @@ fn saem_recovers_the_allometric_exponent() {
     );
 }
 
+/// Tier-3, #1422: the allometric exponent with the weight ratio assigned in
+/// both arms of an `if`/`else`, which is now the same group as the direct form
+/// above and lands on the same NONMEM SAEM anchor with the group's
+/// tolerances. Before #1422 this model was the #1415 numerical-M-step fixture
+/// and realised |Δ| 0.040 on `TH_WT`. Realised |Δ| on the anchor run (Linux,
+/// `ci-fast`): 2.2e-3 (TH_WT), 7.4e-3 (TVCL), 1.2e-2 (TVV), 3.0e-4 / 2.2e-4
+/// (ω²). Each bound keeps ≥ 4× headroom on that, and the TH_WT bound (0.01)
+/// also excludes the numerical channel's 0.040, so a fixture that silently
+/// fell back to it fails here as well as on the group-count assertion.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored covariate mu-referencing (#1422): opt in with --features slow-tests"
+)]
+fn saem_recovers_the_allometric_exponent_through_an_if_else_local() {
+    let (model, pop) = load("covmuref_power_ifelse_saem_fit.ferx", "covmuref_power.csv");
+    assert_eq!(
+        model.covariate_mu_refs.len(),
+        1,
+        "{:?}",
+        model.covariate_mu_refs
+    );
+    let result = fit(&model, &pop, &model.default_params, &saem_opts()).expect("SAEM must run");
+    let th_wt = theta(&result, "TH_WT");
+    assert_finite_close("TH_WT", th_wt, NM_POW_TH_WT, 0.01);
+    assert!(
+        (th_wt - BEFORE_TH_WT).abs() > 0.3,
+        "TH_WT = {th_wt:.4} must be clear of the pre-#619 stall at {BEFORE_TH_WT}"
+    );
+    assert_finite_close("TVCL", theta(&result, "TVCL"), NM_POW_TVCL, 0.05);
+    assert_finite_close("TVV", theta(&result, "TVV"), NM_POW_TVV, 0.1);
+    assert_finite_close(
+        "omega^2(ETA_CL)",
+        omega(&result, "ETA_CL"),
+        NM_POW_OMEGA_CL,
+        0.002,
+    );
+    assert_finite_close(
+        "omega^2(ETA_V)",
+        omega(&result, "ETA_V"),
+        NM_POW_OMEGA_V,
+        0.002,
+    );
+}
+
 /// Tier-3, #1415: the same allometric exponent with **no** mu-reference group —
-/// the weight covariate goes through a conditionally assigned local, which the
-/// #619 classifier rejects, so `TH_WT` carries no ETA and is moved only by the
-/// eta-frozen numerical M-step. Same data, same MLE, same NONMEM SAEM anchor as
+/// the weight covariate goes through a local assigned before an `if` with no
+/// `else` and again in its arm, which the #619 classifier cannot resolve (the
+/// `if`/`else` form this fixture used before #1422 is now a group), so `TH_WT`
+/// anchors no mu-reference and is moved only by the eta-frozen numerical M-step. Same data, same MLE, same NONMEM SAEM anchor as
 /// [`saem_recovers_the_allometric_exponent`].
 ///
 /// Before #1415 this fixture reproduced the issue exactly: the M-step's NLopt
@@ -265,8 +374,10 @@ fn saem_recovers_the_allometric_exponent_on_the_numerical_mstep() {
         result
             .warnings
             .iter()
-            .any(|w| w.contains("NO associated ETA") && w.contains("TH_WT")),
-        "TH_WT must be reported as the no-ETA numerical-M-step theta: {:?}",
+            // #1715: TH_WT shares `CL` with ETA_CL, so it is named in the
+            // carries-an-ETA advisory, not the ETA-less one.
+            .any(|w| w.contains("but not as a mu-referenced typical value") && w.contains("TH_WT")),
+        "TH_WT must be reported as the un-anchored numerical-M-step theta: {:?}",
         result.warnings
     );
     let th_wt = theta(&result, "TH_WT");
@@ -336,7 +447,7 @@ fn imp_recovers_the_additive_renal_gradient() {
 /// nightly runs behind `score_sa` (#1475).
 ///
 /// **Why this fixture is the right regression.** `TH_WT` here is the whole
-/// point of #1458: it carries no ETA, defeats covariate mu-reference detection
+/// point of #1458: it shares `CL` with `ETA_CL` but defeats covariate mu-reference detection
 /// (asserted below, as in the test above), and therefore moves *only* through
 /// the numerical M-step. NONMEM 7.5.1 `METHOD=SAEM` on the same data and the
 /// same start puts it at 0.921283, which is an external reference rather than
@@ -969,4 +1080,378 @@ fn imp_recovers_the_shared_exponent_coordinates() {
         "IMPMAP: THETA_CRCL {th_crcl:.4} / TVCL {tvcl:.4} must be clear of the pre-#1620 \
          {BEFORE_SHARED_IMPMAP_TH_CRCL} / {BEFORE_SHARED_IMPMAP_TVCL}"
     );
+}
+
+// ── #1630: a covariate mu-reference reading another eta's anchor ─────────────
+
+/// NONMEM 7.6.0 `METHOD=SAEM` finals, `nonmem_anchor/results/covmuref_anchor_a_saem.ext`
+/// (the `-1000000000` row). `V1 = TVCL·TH_R·(WT/70)^THETA_WT_V1`, so the
+/// typical V1 is the product `TVCL·TH_R`.
+const NM_ANCHOR_A_TVCL: f64 = 4.935_73;
+const NM_ANCHOR_A_TH_CRCL: f64 = 0.556_429;
+const NM_ANCHOR_A_TVV1: f64 = 4.935_73 * 9.753_24;
+
+/// NONMEM 7.6.0 `METHOD=SAEM` finals, `nonmem_anchor/results/covmuref_anchor_b_saem.ext`.
+/// `V1 = TVV2·TH_R·(WT/70)^THETA_WT_V1`, typical V1 `TVV2·TH_R`.
+const NM_ANCHOR_B_TH_WT_V1: f64 = 0.591_068;
+const NM_ANCHOR_B_TVV1: f64 = 94.477_4 * 0.510_426;
+
+/// Where ferx landed before #1630 on the same fixtures and options (`54deede9`,
+/// release CLI, Linux x86_64): case A at seed 1, 150/250, case B at seed 1,
+/// 300/700.
+const BEFORE_ANCHOR_A_TH_CRCL: f64 = 0.213_731;
+const BEFORE_ANCHOR_B_TH_WT_V1: f64 = 0.401_657;
+const BEFORE_ANCHOR_B_TVV1: f64 = 94.696_502 * 0.483_249;
+
+/// Bounds against the NONMEM anchors, from the realised errors (Linux x86_64,
+/// release) at the time of writing, seed 1 being the tested arm:
+///
+/// | arm | `THETA_CRCL` | `TVCL` | typical V1 | `THETA_WT_V1` |
+/// |---|---:|---:|---:|---:|
+/// | A, 150/250, seeds 1 / 2 / 3 | 0.0001 / 0.0005 / 0.0027 | 0.0011 / 0.0095 / 0.0052 | 0.10 / 0.42 / 0.03 | — |
+/// | B, 300/700, seeds 1 / 2 / 3 | — | — | 0.46 / 0.03 / 0.51 | 0.0063 / 0.0006 / 0.0143 |
+///
+/// `THETA_CRCL` and `TVCL` keep #1620's 0.015, ≥1.6× the worst seed. The typical
+/// V1 takes 1.0 for A and 1.2 for B, ≥2.4× theirs. `THETA_WT_V1` is asserted on
+/// B at 300/700 only: at 150/250 the pre-fix seed 1 (0.68) is closer to NONMEM
+/// than the post-fix seeds' spread, so that arm cannot tell the two apart; at
+/// 300/700 0.05 is 3.5× the worst seed and a quarter of the pre-fix 0.19. Both
+/// fixtures reproduce the reparameterised control (`V1 = TVV1·…`) to every
+/// printed digit of OFV, which no tolerance here needs to rely on.
+const ANCHOR_TH_CRCL_TOL: f64 = 0.015;
+const ANCHOR_TVCL_TOL: f64 = 0.015;
+const ANCHOR_A_TVV1_TOL: f64 = 1.0;
+const ANCHOR_B_TVV1_TOL: f64 = 1.2;
+const ANCHOR_B_TH_WT_V1_TOL: f64 = 0.05;
+
+/// `nonmem_anchor/<file>` on the bundled data through the CLI's file entry
+/// point, its own `[fit_options]` edited by `edit`. Returns the fit and its
+/// mu-reference notes, which each arm pins whole.
+fn fit_anchor_twin(file: &str, edit: impl FnOnce(&mut FitOptions)) -> (FitResult, Vec<String>) {
+    let model = Path::new("nonmem_anchor").join(file);
+    let src = std::fs::read_to_string(&model).expect("anchor model file");
+    let mut opts = parse_full_model(&src)
+        .expect("anchor model parses")
+        .fit_options;
+    edit(&mut opts);
+    let result = ferx_core::fit_from_files(
+        model.to_str().unwrap(),
+        Some("data/two_cpt_oral_cov.csv"),
+        None,
+        Some(opts),
+    )
+    .expect("the fit must run");
+    let notes = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("mu-reference"))
+        .cloned()
+        .collect();
+    (result, notes)
+}
+
+/// Tier-3, #1630 case A. `V1` reads `TVCL`, the anchor of `ETA_CL`, whose own
+/// covariate mu-reference supersedes that pair. Before #1630 `V1`'s group was
+/// declined over the non-running pair and SAEM landed 10–29 OFV units above
+/// the reparameterised control, `THETA_CRCL` at 0.214 here. Now the two groups
+/// share `TVCL` and take #1620's joint step, with the exact engine.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored covariate group on another eta's anchor (#1630): opt in with --features slow-tests"
+)]
+fn saem_merges_a_group_reading_a_superseded_anchor() {
+    let (result, notes) = fit_anchor_twin("covmuref_anchor_a_saem_fit.ferx", |_| {});
+    assert_eq!(
+        notes,
+        vec![
+            "SAEM: covariate mu-references on ETA_CL (reads TVCL, THETA_WT, THETA_CRCL) and \
+             ETA_V1 (reads TVCL, THETA_WT_V1, TH_R) share TVCL and take one joint M-step that \
+             re-centres both (#1620)."
+                .to_string()
+        ]
+    );
+    let th_crcl = theta(&result, "THETA_CRCL");
+    assert_finite_close(
+        "A: THETA_CRCL",
+        th_crcl,
+        NM_ANCHOR_A_TH_CRCL,
+        ANCHOR_TH_CRCL_TOL,
+    );
+    assert!(
+        (th_crcl - BEFORE_ANCHOR_A_TH_CRCL).abs() > 0.3,
+        "A: THETA_CRCL = {th_crcl:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_A_TH_CRCL}"
+    );
+    let tvcl = theta(&result, "TVCL");
+    assert_finite_close("A: TVCL", tvcl, NM_ANCHOR_A_TVCL, ANCHOR_TVCL_TOL);
+    assert_finite_close(
+        "A: TVCL·TH_R",
+        tvcl * theta(&result, "TH_R"),
+        NM_ANCHOR_A_TVV1,
+        ANCHOR_A_TVV1_TOL,
+    );
+}
+
+/// Tier-3, #1630 case B. `V1` reads `TVV2`, the plain anchor of `ETA_V2`,
+/// whose closed-form shift runs. Before #1630 `V1`'s group was declined and
+/// its covariate exponent sat on the η-frozen numerical M-step: 0.402 here, and
+/// 0.68 / 1.07 / 0.63 over seeds 1/2/3 at 150/250. Now the anchor joins the
+/// group as a one-theta member, and since nothing else reads `TVV2` the joint
+/// step takes the exact engine — the note list pins that no observation-term
+/// note fires.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored covariate group on another eta's anchor (#1630): opt in with --features slow-tests"
+)]
+fn saem_takes_a_colliding_plain_anchor_into_the_group() {
+    let (result, notes) = fit_anchor_twin("covmuref_anchor_b_saem_fit.ferx", |o| {
+        o.saem_n_exploration = 300;
+        o.saem_n_convergence = 700;
+    });
+    assert_eq!(
+        notes,
+        vec![
+            "SAEM: mu-references on ETA_V1 (reads TVV2, THETA_WT_V1, TH_R) and ETA_V2 (anchored \
+             on TVV2) share TVV2 and take one joint M-step that re-centres both (#1620, #1630)."
+                .to_string()
+        ]
+    );
+    let th_wt_v1 = theta(&result, "THETA_WT_V1");
+    assert_finite_close(
+        "B: THETA_WT_V1",
+        th_wt_v1,
+        NM_ANCHOR_B_TH_WT_V1,
+        ANCHOR_B_TH_WT_V1_TOL,
+    );
+    assert!(
+        (th_wt_v1 - BEFORE_ANCHOR_B_TH_WT_V1).abs() > 0.15,
+        "B: THETA_WT_V1 = {th_wt_v1:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TH_WT_V1}"
+    );
+    let tvv1 = theta(&result, "TVV2") * theta(&result, "TH_R");
+    assert_finite_close("B: TVV2·TH_R", tvv1, NM_ANCHOR_B_TVV1, ANCHOR_B_TVV1_TOL);
+    assert!(
+        (tvv1 - BEFORE_ANCHOR_B_TVV1).abs() > 2.0,
+        "B: TVV2·TH_R = {tvv1:.3} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TVV1:.3}"
+    );
+}
+
+/// #1365 review: the closed-form shift of a **plain** mu-reference (`TVV`) must
+/// translate the retained importance draws, not only their moments, because a
+/// #619 group on the **numerical** engine (`CL`'s renal group, made time-varying
+/// here so it needs the observation term) scores those same draws in the same
+/// iteration at a θ that already carries the `TVV` shift. With stale samples
+/// every draw's V is off by `exp(δ)`, and the group step fits TVCL/TH_CRCL to
+/// that wrong V.
+///
+/// `TVV` starts at 15 against ≈ 49 so the first shift is ≈ 1.2 log units. The
+/// fixture was confirmed to reach the data-term branch of the group step on
+/// every iteration of both methods. Measured (macOS arm64, `ci-fast`), 5
+/// iterations, K = 300, seed 619:
+///
+/// | | IMP `ofv` / TH_CRCL | IMPMAP `ofv` / TH_CRCL |
+/// |---|---|---|
+/// | samples translated | −1168.14 / 0.0318 | −1168.13 / 0.0318 |
+/// | moments only (the round-1 fix) | −1140.40 / 0.0116 | −1121.32 / 0.0007 |
+///
+/// The −1160 and 0.02 bounds sit between the two rows with ≥ 8 units and
+/// ≥ 0.008 of headroom either side. 30 iterations from the anchor's own start
+/// (`TVV` 40) give −1170.6 with or without the translation, so the bounds are
+/// not a statement about where the fit converges.
+#[test]
+fn a_plain_mu_ref_shift_translates_the_draws_a_numerical_group_step_scores() {
+    let src = std::fs::read_to_string("nonmem_anchor/covmuref_additive_saem_fit.ferx")
+        .expect("anchor model file")
+        .replace("theta TVV(40.0,", "theta TVV(15.0,");
+    let model = parse_full_model(&src).expect("model parses").model;
+    // Make CRCL drift within each subject (+0.5 per hour) so the group must
+    // keep the observation term in its M-step.
+    let csv = std::fs::read_to_string("data/covmuref_additive.csv").expect("anchor data");
+    let mut out = String::new();
+    for (i, line) in csv.lines().enumerate() {
+        if i > 0 {
+            let mut f: Vec<String> = line.split(',').map(String::from).collect();
+            let t: f64 = f[1].parse().unwrap();
+            let c: f64 = f[6].parse().unwrap();
+            f[6] = format!("{}", c + 0.5 * t);
+            out.push_str(&f.join(","));
+        } else {
+            assert!(line.ends_with(",CRCL"), "CRCL must be column 7: {line}");
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("covmuref_additive_tvcrcl.csv");
+    std::fs::write(&path, out).unwrap();
+    let pop = read_nonmem_csv(&path, None, None).expect("time-varying data loads");
+
+    for method in [EstimationMethod::Imp, EstimationMethod::Impmap] {
+        let opts = FitOptions {
+            method,
+            imp_iterations: 5,
+            impmap_iterations: 5,
+            imp_samples: 300,
+            impmap_samples: 300,
+            imp_auto: false,
+            impmap_auto: false,
+            imp_averaging: 1,
+            impmap_averaging: 1,
+            imp_seed: Some(619),
+            impmap_seed: Some(619),
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let r = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+        // `< -1160` is `false` for NaN.
+        assert!(
+            r.ofv < -1160.0,
+            "{method:?}: OFV {} — the group step scored stale draws (#1365)",
+            r.ofv
+        );
+        let th_crcl = theta(&r, "TH_CRCL");
+        assert!(
+            th_crcl > 0.02,
+            "{method:?}: TH_CRCL {th_crcl} collapsed toward its bound (#1365)"
+        );
+    }
+}
+
+/// Two #619 groups in one model — the renal `CL` group (constant CRCL, exact
+/// engine) and an allometric `V` group — started with `TVCL` far from its
+/// value, so the first group's step moves every subject's CL mu a long way
+/// before the second group runs in the same iteration. One IMP/IMPMAP
+/// iteration, K = 300, seed 619.
+fn fit_two_groups(method: EstimationMethod, block_omega: bool, time_varying_wt: bool) -> FitResult {
+    let omega = if block_omega {
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.06, 0.1]"
+    } else {
+        "  omega ETA_CL ~ 0.1\n  omega ETA_V  ~ 0.1"
+    };
+    let src = format!(
+        r"
+[parameters]
+  theta TVCL(1.5, 0.0, 100.0)
+  theta TH_CRCL(0.02, 0.0, 5.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TH_WT(0.5, -5.0, 5.0)
+{omega}
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV * (WT / 70.0)^TH_WT * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+    );
+    let model = parse_full_model(&src)
+        .expect("two-group model parses")
+        .model;
+    let csv = std::fs::read_to_string("data/covmuref_additive.csv").expect("anchor data");
+    let mut out = String::new();
+    for (i, line) in csv.lines().enumerate() {
+        if i == 0 {
+            out.push_str(line);
+            out.push_str(",WT\n");
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        let id: f64 = f[0].parse().unwrap();
+        let t: f64 = f[1].parse().unwrap();
+        // WT drifts within each subject only when asked, which is what puts
+        // the V group on the numerical (observation-term) engine.
+        let drift = if time_varying_wt { 0.5 * t } else { 0.0 };
+        let wt = 55.0 + 3.0 * (id % 10.0) + drift;
+        out.push_str(&format!("{line},{wt}\n"));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("covmuref_two_groups.csv");
+    std::fs::write(&path, out).unwrap();
+    let pop = read_nonmem_csv(&path, None, None).expect("two-group data loads");
+    let opts = FitOptions {
+        method,
+        imp_iterations: 1,
+        impmap_iterations: 1,
+        imp_samples: 300,
+        impmap_samples: 300,
+        imp_auto: false,
+        impmap_auto: false,
+        imp_averaging: 1,
+        impmap_averaging: 1,
+        imp_seed: Some(619),
+        impmap_seed: Some(619),
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    fit(&model, &pop, &model.default_params, &opts).expect("two-group fit runs")
+}
+
+/// #1365 review: after a #619 group step, the draws a **later** group reads
+/// must already be re-centred — the samples, not only their moments, and under
+/// IMPMAP as well as IMP. Here the second (V) group is on the numerical engine,
+/// so it scores every retained sample at a θ that carries the CL group's move.
+/// Confirmed by instrumenting the loop: group 0 (CL) exact, group 1 (V)
+/// numerical.
+///
+/// Measured (macOS arm64, `ci-fast`), `ofv` / TH_WT after one iteration:
+///
+/// | | IMP | IMPMAP |
+/// |---|---|---|
+/// | samples and moments translated | −953.98 / 0.672 | −953.51 / 0.670 |
+/// | moments only, samples stale | −538.34 / 5.0 | −539.87 / 5.0 |
+/// | translation gated on IMP (the old `SampleMoments` check) | −953.98 / 0.672 | −539.87 / 5.0 |
+///
+/// 5.0 is TH_WT's upper bound. The −900 bound sits ~54 above the fixed value and
+/// ~360 below the stale one.
+#[test]
+fn a_later_numerical_group_scores_draws_recentred_by_an_earlier_group() {
+    for method in [EstimationMethod::Imp, EstimationMethod::Impmap] {
+        let r = fit_two_groups(method, false, true);
+        assert!(
+            r.ofv < -900.0,
+            "{method:?}: OFV {} — the V group scored draws the CL group left stale",
+            r.ofv
+        );
+        let th_wt = theta(&r, "TH_WT");
+        assert!(
+            th_wt < 2.0,
+            "{method:?}: TH_WT {th_wt} ran to its bound on stale draws (#1365)"
+        );
+    }
+}
+
+/// #1365 review, exact-engine half: a later **exact** group folds every other
+/// eta's posterior mean into its target through Ω's cross terms, so with a
+/// correlated `block_omega` it must read the CL means *after* the CL group
+/// re-centred them, not a snapshot taken before the group loop. Both groups are
+/// exact here (WT constant within subject).
+///
+/// No external reference exists for one M-step's output, so this pins the
+/// measured value (macOS arm64, `ci-fast`) against the mutation: TVV after one
+/// iteration is 45.334 (IMP) / 45.362 (IMPMAP) with per-group means and 40.797
+/// / 40.810 with the pre-loop snapshot; the objective cannot tell the two apart
+/// (−911.08 vs −913.62). The ±1.5 band is a third of that gap. Five iterations
+/// on: −1167.90 vs −1163.93 (IMP), −1180.29 vs −1177.45 (IMPMAP). Gating the
+/// re-centring on IMP, as it was before, fails the IMPMAP arm here too (40.810).
+#[test]
+fn a_later_exact_group_reads_means_recentred_by_an_earlier_group() {
+    for (method, want) in [
+        (EstimationMethod::Imp, 45.334),
+        (EstimationMethod::Impmap, 45.362),
+    ] {
+        let r = fit_two_groups(method, true, false);
+        let tvv = theta(&r, "TVV");
+        assert!(
+            (tvv - want).abs() < 1.5,
+            "{method:?}: TVV {tvv} vs {want} — the V group read CL means from \
+             before the CL group's step (#1365)"
+        );
+    }
 }

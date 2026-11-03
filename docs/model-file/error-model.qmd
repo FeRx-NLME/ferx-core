@@ -76,6 +76,28 @@ $$
 
 where $f$ is the model prediction. Use when measurement error increases with concentration (most common in PK).
 
+The variance is scored as it is however small $f$ gets, so the objective does not depend
+on the units of `DV`: rescaling `DV` and the doses by $k$ shifts the OFV by exactly
+$2n\ln k$, as in NONMEM. Only a variance that cannot be scored — $f = 0$ exactly, which
+gives zero variance, or a `NaN` — is replaced by `1e-12`. Until #2441 every variance was
+clamped at `1e-12`, which scored a prediction below about $10^{-6}/\sigma$ at the clamp
+rather than at its own variance; fits with such predictions (or with an additive
+$\sigma \le 10^{-6}$) change their OFV, toward NONMEM's.
+
+::: {.callout-warning}
+**Observations with `DV = 0` cannot be scored by a proportional model.** At such a row the
+residual is $-f$, so $r^2/\text{Var} = 1/\sigma^2$ is constant while $\ln \text{Var}$ keeps
+falling as $f \to 0^+$, down to the subnormal guard (about $-708$ of $-2\log L$ per row).
+A fit can trade structural accuracy for those rows and stop at a wrong optimum that still
+reports converged: a one-subject, noise-free fixture with four pre-lag zeros stopped at
+OFV −389.78 with CL 5.2% off, where the true parameters score −1024.67. `fit()` and
+`ferx check` warn with `W_ZERO_DV_MAGNITUDE_ONLY` when any scored row has `DV = 0` under a
+variance that is zero at a zero prediction (this, a [`power`](#power) magnitude, or a
+`combined` model whose additive SD starts at 0). Add an additive component, remove the rows
+(pre-dose or pre-lag zeros), or code below-LLOQ rows as `CENS = 1` with `DV = LLOQ` under
+`bloq_method = m3`. `simulate()` does not warn: there `DV = 0` is a template placeholder.
+:::
+
 ### Combined
 
 ```
@@ -156,7 +178,7 @@ Internally the exponent travels on the residual-magnitude channel — the same
 per-observation plumbing `weight =` and the magnitude expressions use — so
 every estimator, IWRES, CWRES and the simulated draw see it, and the analytic
 FOCE/FOCEI gradients carry `∂R/∂P` exactly (pinned against finite differences
-in `sens_outer_gradient_tests.rs`). One consequence worth knowing: because the
+in `sens/ode_adjoint_tests.rs`, `custom_residual_magnitude_objective_and_gradients`). One consequence worth knowing: because the
 magnitude path assembles the variance as `((f·f)·σ)·σ` where the bare
 proportional path uses `(f·σ)·(f·σ)`, a `power(σ, 1)` fit agrees with the
 plain proportional one to about one ULP, not bit for bit.
@@ -349,10 +371,10 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   term in `∂R/∂θ`, since `mult(θ)` enters the residual variance independent of
   the prediction). For plain (non-interaction) **FOCE** the same magnitude enters
   the Sheiner–Beal marginal through its typical-value residual variance `R⁰`
-  (value and direct-θ derivative), on both the non-IOV and IOV paths. A few
-  combinations still fall back to finite differences (which remain
-  magnitude-aware, so fits stay correct, just slower): `block_sigma` correlated
-  residual error, `iiv_on_ruv`, an M3-BLOQ censored row, and more than 32 thetas.
+  (value and direct-θ derivative), on both the non-IOV and IOV paths. Since #2093
+  the outer gradient is exact under FOCE, FOCEI and Laplace with any number of θ.
+  With a correlated residual (`block_sigma`, `correlation`) the inner EBE gradient
+  is exact too: the dense-`R` kernel threads the same multiplier (#2209).
 - **The direct-θ channel and the other estimators.** When the magnitude
   expression names a θ, that θ moves the residual variance *directly* as well as
   through the prediction. SAEM's M-step carries both (it differences the whole
@@ -365,13 +387,14 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
 
 ## Residual weighting (`weight = ...`)
 
-> **Maturity: experimental** ([#1029](https://github.com/FeRx-NLME/ferx-core/issues/1029)).
+> **Maturity: beta** ([#1029](https://github.com/FeRx-NLME/ferx-core/issues/1029)).
 
 Meta-analysis data does not arrive one observation at a time. Each row is a
 *trial-arm summary* — a mean effect with its own reported standard error, or a
 responder proportion out of a known arm size — and rows differ enormously in how
 much they should count. Declaring that precision is what makes a model-based
-meta-analysis (MBMA) a meta-analysis rather than an unweighted curve fit.
+meta-analysis (MBMA) a meta-analysis rather than an unweighted curve fit. For how
+the other MBMA pieces fit around it, see [MBMA: start here](mbma.qmd).
 
 Add a `weight = <expr>` modifier to the error-model statement:
 
@@ -433,7 +456,11 @@ That stays your call, because both conventions are real:
   `DV = logit(p)` with `weight = 1/sqrt(N)`): **estimate** it. The
   $p(1-p)$ factor was never divided out, and sigma absorbs it —
   $1/\sqrt{p(1-p)} \approx 2.04$ at $p \approx 0.4$, which is most of a published
-  σ of 2.466.
+  σ of 2.466. That analysis (Bracis et al. 2026, Case Study 2) is an anchor:
+  `tests/mbma_canakinumab_case_study.rs` reproduces its published objective and
+  NONMEM's FOCE-I fit of the same model. Its data may not be redistributed, so
+  the nightly slow-test job downloads them; to run it locally, fetch them with
+  `python3 tools/mbma_canakinumab_fetch.py`.
 
 `weight =` does not silently fix or free sigma; it just makes the weighting
 explicit so the two cases are distinguishable in the model file.
@@ -491,6 +518,10 @@ The same modifier rides an IOV `kappa` declaration, where it weights the
 `kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM` declares
 `κ ~ N(0, Ω_IOV / N)` — the arm-level random effect of a longitudinal MBMA. See
 [Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-...).
+
+The visits of one arm can also be given correlated residuals —
+`correlation cs(RHO) by ARM` or `ar1(RHO)`, with the weights on both sides of
+the correlation. See [Within-group residual correlation](residual-correlation.qmd).
 
 ### Simulating an arm that is not in the data
 
@@ -626,8 +657,8 @@ to) is configured in the [`[scaling]`](scaling.qmd) block.
 ## Covariate-selected error models (`if/else`)
 
 Per-CMT dispatch keys on the dataset's `CMT` column. When two endpoints share
-the *same* compartment/readout but need different residual error — a classic
-example is a **free-vs-total** assay, where both measurements are the same
+the *same* compartment/readout but need different residual error — e.g. a
+**free-vs-total** assay, where both measurements are the same
 concentration readout but carry different proportional error — select the error
 model with an arbitrary covariate `if/else` instead, exactly as the
 [`[scaling]`](scaling.qmd) block selects a readout (Form C):
@@ -674,22 +705,23 @@ Rules and restrictions:
 
 - **Analytical *and* ODE models.** Unlike per-CMT error (ODE-only), covariate
   selection works on closed-form analytical PK models too — the selection is a
-  per-observation covariate constant, so it flows through the same analytic
-  FOCE/FOCEI σ-gradient channel once the endpoint is chosen.
+  per-observation constant, so the analytic FOCE/FOCEI σ-gradient applies once
+  the endpoint is chosen.
 - **A final `else` is required** so every observation maps to a declared error
   model (no silent fall-through).
 - **The selector covariate is a required data column.** A covariate named in a
   condition must be present in the data, or `fit()` fails with
-  `E_MISSING_COVARIATE` (it is never silently read as 0). Declaring it in
+  `E_MISSING_COVARIATE` (never read as 0). So do `predict_survival()` and
+  `predict_categorical()`, which never read it
+  ([why](../warnings.qmd#entry-point-covariates)). Declaring it in
   [`[covariates]`](covariates.qmd) is recommended.
 - **Estimation method.** Supported with FOCE/FOCEI, the Gauss-Newton
   optimizers, SAEM, and importance sampling — every likelihood/gradient path
   dispatches on the selected endpoint.
 - **`block_sigma` correlated residuals are supported** together with a
-  covariate-selected error model (#669). Each observation resolves to a branch
-  per row, loads that branch's sigmas, and rows sharing a subject time and
-  occasion pick up the `block_sigma` cross covariance in the dense residual `R`
-  — exactly the pairing rule used for per-CMT endpoints. Two co-temporal rows
+  covariate-selected error model (#669). Each row loads its branch's sigmas,
+  and rows sharing a subject time and occasion get the `block_sigma` cross
+  covariance in the dense residual `R`, as per-CMT endpoints do. Two co-temporal rows
   resolving to *different* branches (e.g. a total `FREE=0` and an unbound
   `FREE=1` measurement of the same sample) get the honest cross-branch
   covariance `ρ·σ_i·σ_j` from each row's own loadings. The method restrictions
@@ -909,9 +941,22 @@ assays receive the NONMEM-style covariance term
 Current scope: `block_sigma` is supported for the Gaussian `method = foce`,
 `method = focei`, `method = saem`, and `method = imp` fits. The Gauss-Newton
 optimizers (`gn` / `gn_hybrid`), M3 censored-observation likelihoods, FREM
-covariate pseudo-observations, `iiv_on_ruv`, TTE endpoints, and IOV reject
+covariate pseudo-observations, `iiv_on_ruv` and TTE endpoints reject
 correlated residual sigma blocks until their residual-error derivative code is
-extended beyond diagonal RUV. SDE/EKF process-noise models carry the correlation
+extended beyond diagonal RUV.
+
+**With IOV** (`kappa`), `block_sigma` is fitted by `method = foce` and
+`method = focei` (single node, `n_agq = 1`) only (#979). The IOV marginal
+linearizes over the stacked `[η, κ]` system, `R̃ = H Σ_b Hᵀ + R`, with `R` the
+dense residual covariance at the correlation the outer loop is proposing, and
+each subject's EBE search scores the same dense `R`. Both loops keep their exact
+analytic gradients. The other estimators' IOV objectives score each row on its
+own, so `saem`, `imp`, `laplace`, `vi` and `n_agq > 1` refuse the combination
+with `E_BLOCK_SIGMA_IOV_UNSUPPORTED`. A two-endpoint total/unbound model with a κ
+on CL matches NONMEM's FOCEI objective to 5e-8 and its η̂/κ̂ to 2e-7
+(`nonmem_anchor/block_sigma_iov.*`).
+
+SDE/EKF process-noise models carry the correlation
 under `method = foce` / `method = focei` (the EKF variance is added to the dense
 `R`) but are rejected under `method = saem`, whose M-step data term does not yet
 include the process-noise inflation.
@@ -1068,7 +1113,9 @@ Notes and constraints:
   `exp(2·ETA_RUV)`, contributing the Almquist interaction column to `H̃` and the
   matching `∂NLL/∂η_ruv = Σ(1−ε²/v)` data term. The inner EBE gradient is analytic
   too except under LTBS, where it keeps finite differences (the established LTBS
-  choice). IOV and M3-BLOQ `iiv_on_ruv` models keep the finite-difference gradient.
+  choice). Since #2093 IOV and M3-BLOQ `iiv_on_ruv` models are exact too: the
+  adjoint serves their outer gradient, and their inner gradient is the analytic
+  stacked one (pinned against FD, M3 × IOV × `iiv_on_ruv` included).
 
 **Identifiability.** A residual-error random effect is a *variance-of-variance*
 term and is only weakly identified when the data carry little per-subject

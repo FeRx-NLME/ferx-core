@@ -55,7 +55,7 @@
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::pk::compute_predictions_with_states;
-use ferx_core::sens::ode_provider::ode_subject_sensitivities;
+use ferx_core::sens::provider::subject_eta_grad;
 use ferx_core::sim::adaptive::{ControllerCtx, DoseAction};
 use ferx_core::{
     predict, read_nonmem_csv, simulate_adaptive, AdaptiveSimulateOptions, CompiledModel, Population,
@@ -252,16 +252,16 @@ fn via_with_states(model: &CompiledModel, pop: &Population) -> Vec<(String, f64,
     out
 }
 
-/// The dual ODE walk's value (`integrate_tvcov_g`). Asserts every subject stays on the
-/// analytic provider: an FD-routed subject would make this leg FD-of-f64 and blind to the
+/// The dual ODE walk's value (`integrate_tvcov_g`). Asserts every subject stays on
+/// `subject_eta_grad`'s dual walk: an FD-routed subject would make this leg FD-of-f64 and blind to the
 /// dual walk.
 fn via_dual(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let eta = vec![0.0; model.n_eta];
     let mut out = Vec::new();
     for s in &pop.subjects {
-        let sens = ode_subject_sensitivities(model, s, &model.default_params.theta, &eta)
+        let sens = subject_eta_grad(model, s, &model.default_params.theta, &eta)
             .unwrap_or_else(|| panic!("ID {}: routed to FD, the dual walk is not exercised", s.id));
-        for (t, o) in s.obs_times.iter().zip(sens.obs) {
+        for (t, o) in s.obs_times.iter().zip(sens) {
             out.push((s.id.clone(), *t, o.f));
         }
     }
@@ -270,21 +270,19 @@ fn via_dual(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> 
 
 /// `simulate_adaptive` with a controller that never doses: the base regimen through the
 /// adaptive driver, frozen-replay verifier on. One decision after the tie.
-/// It runs at η = 0 exactly, as the NONMEM `PRED` it is judged against does: `omega ~ 0.0`
-/// is PD-regularised to Ω = 1e-8 (`OmegaMatrix`), so the default parameters would draw η
-/// with sd 1e-4 and put the driver ~3e-4 off the table (#1603). η threading is pinned
-/// elsewhere (`adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
+/// It runs at η = 0 exactly, as the NONMEM `PRED` it is judged against does: a declared
+/// `omega ~ 0.0` draws η = 0 in every simulation (#1605). Until then it drew η with sd
+/// 1e-4 and put the driver ~3e-4 off the table (#1603), which this function worked around
+/// by zeroing `chol` by hand. η threading is pinned elsewhere
+/// (`adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
 fn via_adaptive(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let mut opts = AdaptiveSimulateOptions::default();
     opts.seed = Some(1);
     opts.decision_times = vec![25.0];
-    let mut params = model.default_params.clone();
-    params.omega.chol.fill(0.0);
-    params.omega.matrix.fill(0.0);
     let res = simulate_adaptive(
         model,
         pop,
-        &params,
+        &model.default_params,
         1,
         || |_: &ControllerCtx| -> Vec<DoseAction> { Vec::new() },
         &opts,

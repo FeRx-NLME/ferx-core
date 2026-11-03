@@ -89,3 +89,46 @@ fn an_extra_design_covariate_the_model_ignores_is_allowed() {
     assert_eq!(names, vec!["NARM".to_string()]);
     assert_eq!(per_subject[1].get("NARM"), Some(&25.0));
 }
+
+/// A nested-level model (#1082) whose `E0` also reads a body weight, so a design can
+/// leave out a level column, the weight, or both.
+const NESTED: &str = "[parameters]\n  theta TVE0(10.0)\n  omega ETA ~ 0.09\n  \
+     level STUDY by STUDY in ID\n  level ARM by ARM in STUDY\n  \
+     kappa K_ARM ~ 0.04 at ARM\n  sigma ADD ~ 0.25\n[individual_parameters]\n  \
+     E0 = TVE0 * WT / 70 * exp(ETA + K_ARM)\n[structural_model]\n  y = E0\n\
+     [error_model]\n  DV ~ additive(ADD)\n";
+
+/// A missing level column gets the nested advice (#2084), ahead of a missing ordinary
+/// covariate; once the level columns are stated, the ordinary covariate gets the generic
+/// one. Both sides of the gate in one test.
+#[test]
+fn a_missing_level_column_gets_the_nested_advice_and_a_missing_weight_the_generic() {
+    let model = parse_model_string(NESTED).expect("parse");
+    let err = simulation_design_covariates(&spec(2, vec![]), &model)
+        .expect_err("the level columns are missing");
+    assert!(
+        err.starts_with(
+            "[simulation]: the model's nested level(s) `STUDY` (column `STUDY`), `ARM` \
+             (column `ARM`) read their groups from column(s) that the simulation design \
+             does not supply."
+        ),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("Stating `covariate STUDY = <value>`"),
+        "got: {err}"
+    );
+    assert!(!err.contains("`WT`"), "got: {err}");
+
+    let levels = vec![
+        ("STUDY".to_string(), vec![1.0, 2.0]),
+        ("ARM".to_string(), vec![1.0, 1.0]),
+    ];
+    let err =
+        simulation_design_covariates(&spec(2, levels), &model).expect_err("the weight is missing");
+    assert!(
+        err.starts_with("[simulation]: the model references covariate(s) `WT`"),
+        "got: {err}"
+    );
+    assert!(!err.contains("nested level"), "got: {err}");
+}

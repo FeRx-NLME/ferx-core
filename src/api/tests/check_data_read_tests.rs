@@ -145,6 +145,10 @@ fn a_reader_warning_is_relayed_under_the_code_it_states() {
             "W_CENS_UNEXPECTED subject 1: CENS=7 is not -1, 0, or 1",
             "W_CENS_UNEXPECTED",
         ),
+        (
+            "W_COVARIATE_MISSING: covariate CRCL has no value for 1 of 10 subjects (3)",
+            "W_COVARIATE_MISSING",
+        ),
         // Nothing but a code. This is the `find(..) == None` arm — the whole
         // message is the run — and it is here because the arm it replaced
         // (`split(..).next().unwrap_or_default()`) was one `str::split` can never

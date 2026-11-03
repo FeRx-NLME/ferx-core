@@ -76,7 +76,8 @@ fn fit_without_data_anywhere_errors_clearly() {
     let model_path = write_model_and_data(dir.path(), false);
 
     let err = run_model_with_data_inits(model_path.to_str().unwrap(), None, None)
-        .expect_err("no [data] block and no external path must error");
+        .expect_err("no [data] block and no external path must error")
+        .to_string();
     assert!(
         err.contains("no dataset specified"),
         "unexpected error: {err}"
@@ -203,7 +204,8 @@ fn fit_errors_when_mapped_column_absent_from_dataset() {
     std::fs::write(&model_path, model_src).expect("write model file");
 
     let err = run_model_with_data_inits(model_path.to_str().unwrap(), None, None)
-        .expect_err("mapping to an absent column must error");
+        .expect_err("mapping to an absent column must error")
+        .to_string();
     assert!(
         err.contains("mapped column `NOPE`"),
         "unexpected error: {err}"

@@ -48,3 +48,17 @@ dose-for-dose and the troughs to a small cross-solver tolerance (RK45 vs LSODA).
 loading dose is integrated by ferx's base-regimen path under the declining per-segment
 clearance (#930), and the controller titrates on top of it -- exactly what this reference
 exercises.
+
+## Per-window AUC24
+
+The area under CENT/V over each closed inter-decision window, from an AUC compartment (dxdt_AUC = CENT/V) reset at the start of each window (mrgsolve 2.0.1). It is the external reference for `auc_target` (#943).
+
+| window | days [t0,t1] (h) | AUC24 (mg*h/L) |
+|---:|---:|---:|
+| 0 | [24, 48] | 261.270558 |
+| 1 | [48, 72] | 336.037198 |
+| 2 | [72, 96] | 459.171369 |
+| 3 | [96, 120] | 551.095341 |
+| 4 | [120, 144] | 548.295417 |
+| 5 | [144, 168] | 507.064148 |
+| 6 | [168, 192] | 450.456723 |

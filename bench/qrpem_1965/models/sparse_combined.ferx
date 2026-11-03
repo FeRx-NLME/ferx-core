@@ -1,0 +1,25 @@
+# Sparse cefepime-shaped 2-cpt IV, block omega(3), combined error.
+# Copied from tests/saem_combined_error.rs SPARSE_MODEL; data/saem_sparse_combined.csv.
+
+[parameters]
+  theta TVCL(4.0, 0.2, 40.0)
+  theta TVV1(22.0, 2.0, 200.0)
+  theta TVV2(13.0, 1.0, 200.0)
+  block_omega (ETA_CL, ETA_V1, ETA_V2) = [0.17, 0.02, 0.15, 0.02, 0.02, 0.69]
+  sigma PROP_ERR ~ 0.13 (sd)
+  sigma ADD_ERR  ~ 1.80 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = 12.0
+  V2 = TVV2 * exp(ETA_V2)
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+
+[fit_options]
+  method = focei

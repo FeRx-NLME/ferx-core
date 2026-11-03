@@ -98,6 +98,7 @@ fn linear_gaussian_model() -> CompiledModel {
 /// sets `dv_pre_logged`, so `fit()` must not transform them again.
 fn oracle_subject(id: &str, obs: &[f64]) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
         obs_times: TIMES.to_vec(),
@@ -108,6 +109,8 @@ fn oracle_subject(id: &str, obs: &[f64]) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -116,8 +119,12 @@ fn oracle_subject(id: &str, obs: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -426,7 +433,7 @@ fn closed_form_omega_matches_the_exact_posterior_moments() {
 /// affine function of `η` there, so the observation NLL stays quadratic in `η`.
 ///
 /// It did not, until the positivity floor that guards natural-scale concentrations was
-/// taught to stand down under LTBS ([`CompiledModel::floor_prediction`]). Once
+/// taught to stand down under LTBS (#1113; the floor was removed outright in #2440). Once
 /// `log f(t)` crossed zero the NLL behaved exactly as though the log-scale prediction
 /// were floored at `1e-12` — even though `compute_predictions_with_tv_into` returned the
 /// correct negative log-prediction to machine precision (verified to 4e-16). The
@@ -466,7 +473,7 @@ fn ltbs_data_term_is_quadratic_below_unit_predictions() {
                 &subj,
                 &template.theta,
                 &template.sigma.values,
-                &template.residual_correlations,
+                model.residual_cov_at(&template),
                 &[e],
                 &mut scratch,
             )
@@ -509,11 +516,18 @@ const IOV_OCCASIONS: [u32; 6] = [1, 1, 1, 2, 2, 2];
 /// Number of occasions, i.e. the number of `κ` blocks in the stacked vector.
 const K_OCC: usize = 2;
 
+/// `TVCL = 2`, not the non-IOV fixture's 1. `CL` is Gaussian here (`TVCL + η + κ`, prior SD
+/// `√(0.09 + 0.04) = 0.36`), and since #2104 a draw with `CL ≤ 0` is served a concentration
+/// of 0 — the floor of the log transform — where the affine closed form this oracle needs
+/// would keep going. At `TVCL = 1` that tail is 2.8 SD away and ~0.3% of the 64k draws land
+/// in it, which measured a `−2·ELBO` 87 units off the exact marginal. At 2 it is 5.5 SD
+/// away, while `log f(6) = ln 10 − 0.6·CL` stays positive (the quadratic regime, see
+/// [`TIMES`]) out to `CL = 3.84`, 5.1 SD the other side.
 fn linear_gaussian_iov_model() -> CompiledModel {
     crate::parser::model_parser::parse_model_string(
         r"
 [parameters]
-  theta TVCL(1.0, 0.01, 10.0)
+  theta TVCL(2.0, 0.01, 10.0)
   omega ETA_CL ~ 0.09
   kappa KAPPA_CL ~ 0.04
   sigma ADD_LOG ~ 0.2 (sd)
@@ -539,6 +553,7 @@ fn linear_gaussian_iov_model() -> CompiledModel {
 /// per occasion.
 fn iov_subject(id: &str, obs: &[f64]) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         // A **single** bolus, deliberately. A second dose would make the concentration a
         // sum of two exponentials, and `log(Σ exp)` is not affine in `z` — the affineness
@@ -554,6 +569,8 @@ fn iov_subject(id: &str, obs: &[f64]) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -562,8 +579,12 @@ fn iov_subject(id: &str, obs: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -829,7 +850,8 @@ fn full_rank_vi_is_exact_on_a_linear_gaussian_iov_model() {
 /// They did. Only the fixed-`η` family applied a `max(1e-12)` positivity floor to the
 /// prediction, which is right for a concentration and wrong for `log(concentration)`, so
 /// on any LTBS model with sub-unit predictions SAEM/IMP/VI were scoring a different
-/// objective from FOCE. The floor now defers to [`CompiledModel::floor_prediction`].
+/// objective from FOCE. The floor stood down under LTBS (#1113) and was then removed
+/// outright (#2440), since a negative prediction is legitimate on the natural scale too.
 ///
 /// At `η = 0` the prior term vanishes and `individual_nll_into` reduces to
 /// `0.5·(log|Ω| + data_ll)`, while `obs_nll_subject_into` is `0.5·data_ll` — hence the
@@ -872,7 +894,7 @@ fn fixed_eta_nll_agrees_with_the_conditional_mode_objective_under_ltbs() {
             &subj,
             &template.theta,
             &template.sigma.values,
-            &template.residual_correlations,
+            model.residual_cov_at(&template),
             &[eta],
             &mut scratch,
         );

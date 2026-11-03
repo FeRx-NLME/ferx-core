@@ -20,11 +20,10 @@
 # dose ladder reflects the two composed — the #700 per-event PK path and the #701
 # per-occasion kappa are each per-event correct, and correct TOGETHER.
 #
-# `auc_target` is deliberately absent: its exposure metric integrates a dense grid
-# from a single frozen PK snapshot, which is silently wrong when CL changes across
-# the horizon (a drifting covariate OR a per-occasion kappa), so it is a typed error
-# for a time-varying-covariate / IOV subject (#700/#701). `target_window` (the
-# pct-in-band trough metric) is per-event / per-occasion aware and retained.
+# The block declares no `auc_target` (trough control is the scenario); it is supported
+# here since #943, and `tests/adaptive_vanco_renal_iov_anchor.rs` adds one to check each
+# window's AUC24 against mrgsolve. `target_window` (the pct-in-band trough metric)
+# is the decision-grid summary this example reports.
 #
 # Run with `simulate_adaptive_from_spec()` (not the plain forward `simulate()`).
 # Validated dose-for-dose against an independent mrgsolve run (mrgsolve, not NONMEM,

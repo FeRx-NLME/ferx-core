@@ -1,0 +1,891 @@
+//! #2163: a simulated subject of a `[mixture]` model runs under a class drawn from the
+//! mixing probabilities, and that class's `MIXNUM`, Ω and Σ, on every simulation path:
+//! `simulate*`, `simulate_with_uncertainty`, `simulate_adaptive` and the NPDE reference.
+//!
+//! The oracle throughout is the **class twin**: the single-population model of one class,
+//! the mixture model with `MIXNUM` fixed. At a logit of ±1000 one class has probability 0
+//! in `f64`, so the mixture run must reproduce the twin bit for bit. That equality also
+//! pins that the class draw consumes nothing from the η stream: the twin draws no class,
+//! so a draw taken from the η stream would shift every η after it.
+
+use super::*;
+use crate::parser::model_parser::{current_mixture_class, parse_model_string};
+
+/// A model source. `mixl` is the `FIX`ed class-1 logit, `omega` Ω's variance and
+/// `overrides` extra `[mixture]` lines. `class = Some(k)` writes the class-`k` twin instead
+/// (no `[mixture]`, the class's CL, and `overrides` must be empty); `ode` writes the
+/// structural model as an ODE, which the adaptive driver requires.
+fn source(mixl: f64, omega: f64, overrides: &str, class: Option<usize>, ode: bool) -> String {
+    let cl = match class {
+        None => "if (MIXNUM == 1) TVCL * exp(ETA_CL) else 4 * TVCL * exp(ETA_CL)",
+        Some(1) => "TVCL * exp(ETA_CL) + 0 * MIXL",
+        Some(_) => "4 * TVCL * exp(ETA_CL) + 0 * MIXL",
+    };
+    let mixture = match class {
+        None => format!("[mixture]\n  nsub = 2\n  logit(1) = MIXL\n{overrides}\n"),
+        Some(_) => String::new(),
+    };
+    let structural = if ode {
+        "[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL / V) * central\n\
+         [scaling]\n  y = central / V\n"
+    } else {
+        "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n"
+    };
+    format!(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+         theta MIXL({mixl}, -2000.0, 2000.0, FIX)\n  omega ETA_CL ~ {omega}\n  \
+         sigma EPS ~ 0.04\n{mixture}[individual_parameters]\n  CL = {cl}\n  V  = TVV\n\
+         {structural}[error_model]\n  DV ~ proportional(EPS)\n"
+    )
+}
+
+fn parse(src: &str) -> CompiledModel {
+    parse_model_string(src).unwrap_or_else(|e| panic!("{e}\n{src}"))
+}
+
+/// Two classes; class 2 clears 4× faster, so a class mix-up is a 4× difference in CL.
+fn mixture_model(mixl: f64) -> CompiledModel {
+    parse(&source(mixl, 0.09, "", None, false))
+}
+
+/// The single-population model of class `class`, with the same θ, Ω and Σ.
+fn class_twin(class: usize, mixl: f64) -> CompiledModel {
+    parse(&source(mixl, 0.09, "", Some(class), false))
+}
+
+/// A dose of 100 at t = 0, observed at 0.5, 1, 2, 4 and 8, for subjects `1..=n`.
+fn population(n: usize) -> Population {
+    use std::io::Write;
+    let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT\n");
+    for id in 1..=n {
+        csv.push_str(&format!("{id},0,0,100,1,1\n"));
+        for t in [0.5, 1.0, 2.0, 4.0, 8.0] {
+            csv.push_str(&format!("{id},{t},1.0,0,0,1\n"));
+        }
+    }
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(csv.as_bytes()).unwrap();
+    crate::read_nonmem_csv(f.path(), None, None).unwrap()
+}
+
+type Row = (String, usize, usize, f64, f64, f64);
+
+/// `(id, draw, sim, time, ipred, value)` of each row.
+fn tuples(rows: &[SimulationResult]) -> Vec<Row> {
+    rows.iter()
+        .map(|r| {
+            let SimOutcome::Continuous { value } = r.outcome else {
+                panic!("a Gaussian endpoint")
+            };
+            (r.id.clone(), r.draw, r.sim, r.time, r.ipred, value)
+        })
+        .collect()
+}
+
+fn rows(model: &CompiledModel, pop: &Population) -> Vec<Row> {
+    tuples(&simulate_with_seed(model, pop, &model.default_params, 3, 2163).unwrap())
+}
+
+/// The `mixnum` of every row `simulate_with_seed` returns (#2372).
+fn mixnums(model: &CompiledModel, pop: &Population) -> Vec<Option<usize>> {
+    simulate_with_seed(model, pop, &model.default_params, 3, 2163)
+        .unwrap()
+        .iter()
+        .map(|r| r.mixnum)
+        .collect()
+}
+
+/// With `logit(1) = -1000` class 1 has probability `exp(-1000) = 0` in `f64`, so every
+/// subject is class 2 and `simulate_with_seed` must reproduce the class-2 single-population
+/// model row for row. Before #2163 it reproduced class 1: `MIXNUM` read its default.
+#[test]
+fn a_certain_class_2_is_simulated_as_the_class_2_model() {
+    let pop = population(4);
+    let got = rows(&mixture_model(-1000.0), &pop);
+    assert_eq!(got, rows(&class_twin(2, -1000.0), &pop));
+    assert_ne!(got, rows(&class_twin(1, -1000.0), &pop));
+    // #2372: every row reports the class it ran under; the twin, with no `[mixture]`, none.
+    assert_eq!(
+        mixnums(&mixture_model(-1000.0), &pop),
+        vec![Some(2); got.len()]
+    );
+    assert_eq!(
+        mixnums(&class_twin(2, -1000.0), &pop),
+        vec![None; got.len()]
+    );
+}
+
+/// The other side: at `logit(1) = +1000` every subject is class 1. Without it, a draw
+/// that always picked the last class would pass the test above.
+#[test]
+fn a_certain_class_1_is_simulated_as_the_class_1_model() {
+    let pop = population(4);
+    let got = rows(&mixture_model(1000.0), &pop);
+    assert_eq!(got, rows(&class_twin(1, 1000.0), &pop));
+    assert_ne!(got, rows(&class_twin(2, 1000.0), &pop));
+    assert_eq!(
+        mixnums(&mixture_model(1000.0), &pop),
+        vec![Some(1); got.len()]
+    );
+}
+
+/// Class 2's own Ω and Σ.
+const OVERRIDES: &str = "  omega(2) ETA_CL ~ 0.36\n  sigma(2) EPS ~ 0.09";
+
+/// The class-2 twin of a mixture carrying [`OVERRIDES`]: their Ω and Σ as its only ones.
+fn override_twin(ode: bool) -> String {
+    source(-1000.0, 0.36, "", Some(2), ode).replace("EPS ~ 0.04", "EPS ~ 0.09")
+}
+
+/// A class's `omega(2)` / `sigma(2)` override is what its subjects draw η and ε from. The
+/// twin declares the override as its only Ω and Σ, so drawing either from the base would
+/// change η (and IPRED) or the residual (and DV) and fail the equality; the straddle with
+/// the override-free mixture shows the override is live.
+#[test]
+fn a_class_draws_eta_and_eps_from_its_own_omega_and_sigma() {
+    let pop = population(4);
+    let overridden = parse(&source(-1000.0, 0.09, OVERRIDES, None, false));
+    let got = rows(&overridden, &pop);
+    assert_eq!(got, rows(&parse(&override_twin(false)), &pop));
+    assert_ne!(got, rows(&mixture_model(-1000.0), &pop));
+}
+
+/// The class 2 IPRED at t = 8 is `10·exp(-3.2) ≈ 0.41` and class 1's `10·exp(-0.8) ≈ 4.5`;
+/// at Ω = 1e-4 (η's SD 0.01) the two never overlap, so the IPRED names the class.
+/// A fit carries a class's `FIX`-ed zero `omega(2)` as the regularised `1e-8`, and the
+/// draw recovers it as exactly 0 from that class's declaration (#1605), which takes its
+/// FIX flag from the override and not from the base η. The twin declares the zero as its
+/// only Ω, so its η is exactly 0. A carried `1e-8` drawn as is gives η = 1e-4·z instead,
+/// which changes IPRED, so the rows are not equal.
+///
+/// The flag is checked on both sides. A FIX override on an estimated base η is
+/// recovered. An estimated override on a FIX base η is not: the base flag must not
+/// leak into it. Taking the class's declared Ω, or its FIX flags, from the base breaks
+/// one of the two equalities. Both `simulate` and the NPDE reference run.
+///
+/// NPDE ranks the observation among the reference draws, so a draw that moves by
+/// η = 1e-4·z must be able to cross the observation. Each observation therefore sits a
+/// relative 1e-5 above the class-2 typical curve 10·exp(−0.4·t), and Σ is negligible
+/// (EPS variance 1e-14, a relative SD of 1e-7). With η exactly 0, every draw falls
+/// below the observation. With η = 1e-4·z, the relative spread at t = 0.5 is already
+/// 2e-5, and some draws land above it.
+#[test]
+fn a_fit_carried_class_zero_is_recovered_from_the_class_declaration() {
+    let mut pop = population(4);
+    for s in &mut pop.subjects {
+        for (dv, t) in s.observations.iter_mut().zip(&s.obs_times) {
+            *dv = 10.0 * (-0.4 * t).exp() * (1.0 + 1e-5);
+        }
+    }
+    let tiny = |src: String| parse(&src.replace("EPS ~ 0.04", "EPS ~ 1e-14"));
+    let twin = tiny(
+        source(-1000.0, 0.09, "", Some(2), false)
+            .replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.0 FIX"),
+    );
+    let fit_carried = |m: &CompiledModel| {
+        let mut p = m.default_params.clone();
+        let names = p.omega.eta_names.clone();
+        let carried = DMatrix::from_row_slice(1, 1, &[1e-8]);
+        p.mixture.as_mut().unwrap().omega[1] = OmegaMatrix::from_matrix(carried, names, true);
+        assert!(p.mixture.as_ref().unwrap().omega[1].sim_chol.is_none());
+        p
+    };
+    let sim = |m: &CompiledModel, p: &ModelParameters| {
+        tuples(&simulate_with_seed(m, &pop, p, 3, 2163).unwrap())
+    };
+    let npde = |m: &CompiledModel, p: &ModelParameters| {
+        let r = crate::stats::npde::compute_npde_npd(m, &pop, p, 50, Some(7), None).unwrap();
+        r.iter()
+            .map(|s| {
+                s.npd
+                    .iter()
+                    .chain(&s.npde)
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let want = (
+        sim(&twin, &twin.default_params),
+        npde(&twin, &twin.default_params),
+    );
+
+    let fixed = tiny(source(
+        -1000.0,
+        0.09,
+        "  omega(2) ETA_CL ~ 0.0 FIX",
+        None,
+        false,
+    ));
+    let p = fit_carried(&fixed);
+    assert!(
+        want.0 == sim(&fixed, &p),
+        "simulate: a FIX-0 omega(2) drew a nonzero η"
+    );
+    assert!(
+        want.1 == npde(&fixed, &p),
+        "NPDE: a FIX-0 omega(2) drew a nonzero η"
+    );
+
+    let estimated = tiny(
+        source(-1000.0, 0.09, "  omega(2) ETA_CL ~ 0.0", None, false)
+            .replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.09 FIX"),
+    );
+    let p = fit_carried(&estimated);
+    assert!(
+        want.0 != sim(&estimated, &p),
+        "simulate: the base FIX leaked into omega(2)"
+    );
+    assert!(
+        want.1 != npde(&estimated, &p),
+        "NPDE: the base FIX leaked into omega(2)"
+    );
+
+    // The override's flag is class 2's alone: class 1 keeps the base `0.0 FIX` and still
+    // recovers its zero, although `omega(2)` declares the same η estimated.
+    let class_1 = |src: String| {
+        let m = tiny(src.replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.0 FIX"));
+        let mut p = m.default_params.clone();
+        let names = p.omega.eta_names.clone();
+        let carried = || {
+            OmegaMatrix::from_matrix(DMatrix::from_row_slice(1, 1, &[1e-8]), names.clone(), true)
+        };
+        p.omega = carried();
+        if let Some(mx) = p.mixture.as_mut() {
+            mx.omega.iter_mut().for_each(|o| *o = carried());
+        }
+        (m, p)
+    };
+    let (twin_1, _) = class_1(source(1000.0, 0.09, "", Some(1), false));
+    let (shared, p) = class_1(source(1000.0, 0.09, "  omega(2) ETA_CL ~ 0.0", None, false));
+    assert!(
+        sim(&twin_1, &twin_1.default_params) == sim(&shared, &p),
+        "simulate: omega(2)'s FIX flag leaked into class 1"
+    );
+}
+
+/// A class copies the base Ω from its regularised matrix, where a declared `~ 0.0` is
+/// already `1e-8`. The class must still simulate that η as exactly 0, as the base model
+/// does (#1605): at default parameters with no `FIX`, for a class with no `omega(k)` and
+/// for one whose override touches only another η. Read as `1e-8`, the zero η draws
+/// 1e-4·z and moves IPRED, so the rows differ from the class twin's. With the override
+/// present, class 1 must also keep the base ETA_CL: the override is class 2's alone.
+#[test]
+fn a_declared_base_zero_stays_zero_in_every_class() {
+    let pop = population(4);
+    let with_v = |src: String| {
+        parse(
+            &src.replace("sigma EPS", "omega ETA_V ~ 0.0\n  sigma EPS")
+                .replace("V  = TVV", "V  = TVV * exp(ETA_V)"),
+        )
+    };
+    let sim = |m: &CompiledModel| {
+        tuples(&simulate_with_seed(m, &pop, &m.default_params, 3, 2163).unwrap())
+    };
+    for (class, mixl) in [(1, 1000.0), (2, -1000.0)] {
+        let twin = with_v(source(mixl, 0.09, "", Some(class), false));
+        let mixture = with_v(source(mixl, 0.09, "", None, false));
+        assert!(
+            sim(&twin) == sim(&mixture),
+            "class {class} without overrides drew the base zero η from 1e-8"
+        );
+        let class_omega = if class == 1 { 0.09 } else { 0.36 };
+        let twin = with_v(source(mixl, class_omega, "", Some(class), false));
+        let mixture = with_v(source(mixl, 0.09, "  omega(2) ETA_CL ~ 0.36", None, false));
+        assert!(
+            sim(&twin) == sim(&mixture),
+            "class {class} under an omega(2) on ETA_CL is not its twin"
+        );
+    }
+}
+
+/// `(id, draw, sim, class)` of each subject-replicate, read from the rows' reported
+/// `mixnum` (#2372). Every row of one subject in one replicate reports the same class, and
+/// it is the class the rows were simulated under: at Ω = 1e-4 class 1's IPRED at t = 8 is
+/// 4.49 and class 2's 0.41, so the reported class is checked against that IPRED too.
+fn class_at_t8(rows: &[SimulationResult]) -> Vec<(String, usize, usize, usize)> {
+    let reported = |r: &SimulationResult| {
+        r.mixnum
+            .unwrap_or_else(|| panic!("a mixture row without a class: {r:?}"))
+    };
+    let mut per_replicate = std::collections::HashMap::new();
+    for r in rows {
+        let first = *per_replicate
+            .entry((r.id.as_str(), r.draw, r.sim))
+            .or_insert(r.mixnum);
+        assert_eq!(r.mixnum, first, "one class per subject-replicate: {r:?}");
+    }
+    rows.iter()
+        .filter(|r| r.time == 8.0)
+        .map(|r| {
+            let simulated = if r.ipred > 1.5 { 1 } else { 2 };
+            assert_eq!(reported(r), simulated, "reported vs simulated class: {r:?}");
+            (r.id.clone(), r.draw, r.sim, reported(r))
+        })
+        .collect()
+}
+
+/// The share of class 1 in `classes`.
+fn share_of_class_1(classes: &[(String, usize, usize, usize)]) -> f64 {
+    classes.iter().filter(|c| c.3 == 1).count() as f64 / classes.len() as f64
+}
+
+/// Under `p(1) = 0.3` the class-1 share of 50 subjects × 40 replicates is 0.3: the
+/// seeded run measures 0.2985, and the bound of 0.035 is 3.4 binomial SDs (0.0102). The
+/// draw is keyed by replicate, so each subject changes class across replicates; a draw
+/// keyed by subject only would give each subject one class in all 40. The unseeded
+/// `simulate` draws classes too, from an entropy root; its share is random, so its bound
+/// is 0.1, 9.8 SDs.
+#[test]
+fn classes_are_drawn_at_the_mixing_probabilities_per_replicate() {
+    let model = parse(&source((0.3f64 / 0.7).ln(), 1e-4, "", None, false));
+    let pop = population(50);
+    let seeded =
+        class_at_t8(&simulate_with_seed(&model, &pop, &model.default_params, 40, 2163).unwrap());
+    assert_eq!(seeded.len(), 2000);
+    let share = share_of_class_1(&seeded);
+    assert!(
+        (share - 0.3).abs() < 0.035,
+        "class-1 share {share}, want 0.3"
+    );
+    for id in 1..=50 {
+        let mine: Vec<usize> = seeded
+            .iter()
+            .filter(|c| c.0 == id.to_string())
+            .map(|c| c.3)
+            .collect();
+        assert!(
+            mine.contains(&1) && mine.contains(&2),
+            "subject {id} kept one class in all 40 replicates: {mine:?}"
+        );
+    }
+    let unseeded = class_at_t8(&simulate(&model, &pop, &model.default_params, 40).unwrap());
+    let share = share_of_class_1(&unseeded);
+    assert!((share - 0.3).abs() < 0.1, "unseeded class-1 share {share}");
+}
+
+/// A subject (cloned from [`population`]) with id `id` and covariates `covariates`.
+fn subject_with(id: &str, covariates: &[(&str, f64)]) -> Subject {
+    let mut s = population(1).subjects.remove(0);
+    s.id = id.to_string();
+    s.covariates = covariates
+        .iter()
+        .map(|&(k, v)| (k.to_string(), v))
+        .collect();
+    s
+}
+
+/// The mixing probabilities are each subject's own, at its baseline covariates: under
+/// `logit(1) = 1000·(GRP − 0.5)` a subject of `GRP = 1` is class 1 and one of `GRP = 0`
+/// class 2, in every replicate. `MIXNUM` holds the class while the guard lives and is
+/// back at its default once it drops.
+#[test]
+fn a_subject_draws_its_class_at_its_own_covariates() {
+    let src = source(0.0, 0.09, "", None, false)
+        .replace("logit(1) = MIXL", "logit(1) = MIXL + 1000 * (GRP - 0.5)");
+    let model = parse(&src);
+    let classes = super::simulate::SimClasses::new(&model, &model.default_params, 7).unwrap();
+    for (grp, want) in [(1.0, 1), (0.0, 2)] {
+        let subject = subject_with(&format!("g{grp}"), &[("GRP", grp)]);
+        for sim in 1..=20 {
+            let class = classes.enter(&subject, 1, sim);
+            assert_eq!(
+                current_mixture_class(),
+                want,
+                "GRP = {grp}, replicate {sim}"
+            );
+            drop(class);
+            assert_eq!(current_mixture_class(), 1, "the guard restores MIXNUM");
+        }
+    }
+}
+
+/// The class uniform is a pure function of `(root, id, draw, sim)`: the same key gives
+/// the same class whatever was drawn before it, and each coordinate of the key moves it.
+#[test]
+fn the_class_uniform_is_keyed_by_root_id_draw_and_sim() {
+    use super::simulate::mixture_class_uniform as u;
+    let base = u(7, "1", 1, 1);
+    assert_eq!(base.to_bits(), u(7, "1", 1, 1).to_bits());
+    assert!((0.0..1.0).contains(&base));
+    for (what, other) in [
+        ("root", u(8, "1", 1, 1)),
+        ("id", u(7, "2", 1, 1)),
+        ("draw", u(7, "1", 2, 1)),
+        ("sim", u(7, "1", 1, 2)),
+    ] {
+        assert_ne!(
+            base.to_bits(),
+            other.to_bits(),
+            "{what} does not key the draw"
+        );
+    }
+    // Draw and sim are not interchangeable.
+    assert_ne!(u(7, "1", 1, 2).to_bits(), u(7, "1", 2, 1).to_bits());
+}
+
+/// The first class whose cumulative probability exceeds `u`; a class of probability 0 is
+/// never selected, at `u = 0` or past rounding.
+#[test]
+fn pick_mixture_class_selects_by_cumulative_probability() {
+    use super::simulate::pick_mixture_class as pick;
+    let (a, b) = (0.3f64.ln(), 0.7f64.ln());
+    assert_eq!(pick(&[a, b], 0.0), 0);
+    assert_eq!(pick(&[a, b], 0.29), 0);
+    assert_eq!(pick(&[a, b], 0.31), 1);
+    assert_eq!(pick(&[a, b], 0.999), 1);
+    // p(1) = 0: `u = 0` is not below a cumulative 0, so class 1 is skipped.
+    assert_eq!(pick(&[f64::NEG_INFINITY, 0.0], 0.0), 1);
+    // A cumulative sum that rounding left at or below `u` falls back to the last class
+    // of positive probability, not to a trailing class of probability 0.
+    assert_eq!(pick(&[a, a, f64::NEG_INFINITY], 0.9), 1);
+    assert_eq!(pick(&[f64::NEG_INFINITY, a, a], 0.9), 2);
+}
+
+/// Propensity matching estimates every subject's posthoc η under class 1, so it is refused
+/// on a `[mixture]` model, by code and full text; the class twin is matched as before.
+#[test]
+fn propensity_matching_is_refused_on_a_mixture_model() {
+    let pop = population(3);
+    let opts = SimulateOptions {
+        seed: Some(1),
+        match_method: Some(crate::propensity_match::MatchMethod::Optimal),
+        ..Default::default()
+    };
+    let run = |m: &CompiledModel| simulate_with_options(m, &pop, &m.default_params, 1, &opts);
+    let model = mixture_model(0.0);
+    let err = run(&model).expect_err("refused");
+    assert_eq!(
+        err.diagnostic().map(|d| d.code.as_str()),
+        Some("E_PROPENSITY_INPUT")
+    );
+    assert_eq!(
+        err.to_string(),
+        "propensity-score matching is not supported on a [mixture] model: each subject's \
+         posthoc eta would be estimated under class 1 rather than its own class. Simulate \
+         without `match_method`; each subject then draws its class from the mixing \
+         probabilities"
+    );
+    assert!(run(&class_twin(1, 0.0)).is_ok(), "the twin is matched");
+    // Without matching, the mixture model simulates through `simulate_with_options`.
+    let plain = SimulateOptions {
+        seed: Some(2163),
+        ..Default::default()
+    };
+    let got = simulate_with_options(&model, &pop, &model.default_params, 3, &plain).unwrap();
+    assert_eq!(tuples(&got), rows(&model, &pop));
+}
+
+/// `simulate_with_uncertainty`: every draw's subjects run under their class. At a certain
+/// class 2 the rows equal the class-2 twin's; at `p(1) = 0.5` with one replicate per draw
+/// the draw is the only coordinate that varies, so a subject changing class across the
+/// 30 draws pins that the draw keys the class.
+#[test]
+fn uncertainty_draws_simulate_each_subject_under_its_class() {
+    let pop = population(4);
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 3,
+        n_sim_per_draw: 2,
+        seed: Some(2163),
+        ..Default::default()
+    };
+    let raw = |m: &CompiledModel, o: &SimulateUncertaintyOptions| {
+        let fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
+        simulate_with_uncertainty(m, &pop, &fit, o).unwrap()
+    };
+    let run = |m: &CompiledModel, o: &SimulateUncertaintyOptions| tuples(&raw(m, o));
+    let got = run(&mixture_model(-1000.0), &opts);
+    assert_eq!(got, run(&class_twin(2, -1000.0), &opts));
+    assert_ne!(got, run(&class_twin(1, -1000.0), &opts));
+    assert!(raw(&mixture_model(-1000.0), &opts)
+        .iter()
+        .all(|r| r.mixnum == Some(2)));
+
+    let even = parse(&source(0.0, 1e-4, "", None, false));
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 30,
+        n_sim_per_draw: 1,
+        seed: Some(2163),
+        ..Default::default()
+    };
+    let classes = class_at_t8(&raw(&even, &opts));
+    for id in 1..=4 {
+        let mine: Vec<usize> = classes
+            .iter()
+            .filter(|c| c.0 == id.to_string())
+            .map(|c| c.3)
+            .collect();
+        assert_eq!(mine.len(), 30);
+        assert!(
+            mine.contains(&1) && mine.contains(&2),
+            "subject {id} kept one class in all 30 draws: {mine:?}"
+        );
+    }
+}
+
+/// `simulate_adaptive`: the reactive driver runs each (subject, replicate) under its
+/// class and that class's Ω and Σ, the frozen-schedule replay verifier (on by default)
+/// under the same one; and the replicate keys the class.
+#[test]
+fn adaptive_runs_each_subject_under_its_class() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction, MonitorSpec, ObserveMode};
+    let pop = population(3);
+    let mut opts = AdaptiveSimulateOptions::default();
+    opts.seed = Some(2163);
+    // The assay `Dv` read at t = 2 is the only place the driver uses Σ: the trajectories
+    // carry IPRED. So the run also returns the bits of every reading the controller saw.
+    opts.decision_times = vec![0.0, 2.0];
+    opts.monitors = vec![MonitorSpec::new("dv", 1, ObserveMode::Dv)];
+    let hold = || |_: &ControllerCtx| vec![DoseAction::Hold];
+    let trajectories = |src: String, n_sim: usize| {
+        let m = parse(&src);
+        simulate_adaptive(&m, &pop, &m.default_params, n_sim, hold, &opts)
+            .unwrap()
+            .trajectories
+    };
+    let run = |src: String, n_sim: usize| {
+        let m = parse(&src);
+        let res = simulate_adaptive(&m, &pop, &m.default_params, n_sim, hold, &opts).unwrap();
+        let read: Vec<u64> = res
+            .decisions
+            .iter()
+            .flat_map(|d| d.observed_signals.iter().map(|s| s.value.to_bits()))
+            .collect();
+        assert_eq!(read.len(), 3 * 2 * n_sim);
+        (tuples(&res.trajectories), read)
+    };
+    assert!(trajectories(source(-1000.0, 0.09, "", None, true), 2)
+        .iter()
+        .all(|r| r.mixnum == Some(2)));
+    assert!(trajectories(source(-1000.0, 0.09, "", Some(2), true), 2)
+        .iter()
+        .all(|r| r.mixnum.is_none()));
+    let got = run(source(-1000.0, 0.09, "", None, true), 2);
+    assert_eq!(got, run(source(-1000.0, 0.09, "", Some(2), true), 2));
+    assert_ne!(got.0, run(source(-1000.0, 0.09, "", Some(1), true), 2).0);
+
+    // The class's own Ω and Σ: η from `omega(2)`, the assay ε from `sigma(2)`. The
+    // σ-only control shows the readings see Σ, so the equality above it does too.
+    let overridden = run(source(-1000.0, 0.09, OVERRIDES, None, true), 2);
+    assert_eq!(overridden, run(override_twin(true), 2));
+    let base_sigma = run(override_twin(true).replace("EPS ~ 0.09", "EPS ~ 0.04"), 2);
+    assert_eq!(overridden.0, base_sigma.0);
+    assert_ne!(overridden.1, base_sigma.1);
+
+    let classes = class_at_t8(&trajectories(source(0.0, 1e-4, "", None, true), 20));
+    for id in 1..=3 {
+        let mine: Vec<usize> = classes
+            .iter()
+            .filter(|c| c.0 == id.to_string())
+            .map(|c| c.3)
+            .collect();
+        assert_eq!(mine.len(), 20);
+        assert!(
+            mine.contains(&1) && mine.contains(&2),
+            "subject {id} kept one class in all 20 replicates: {mine:?}"
+        );
+    }
+}
+
+fn npde_bits(model: &CompiledModel, pop: &Population) -> Vec<Vec<u64>> {
+    crate::stats::npde::compute_npde_npd(model, pop, &model.default_params, 50, Some(7), None)
+        .unwrap()
+        .iter()
+        .map(|s| s.npd.iter().chain(&s.npde).map(|x| x.to_bits()).collect())
+        .collect()
+}
+
+/// The NPDE reference simulation draws each replicate's class. At a certain class 2 the
+/// scores equal the class-2 twin's, with and without class 2's own Ω and Σ.
+///
+/// At `p(1) = 0.5`, an observation sitting on the class-1 typical curve (Ω, σ small)
+/// has half the class-1 replicates below it and every class-2 one (4× the clearance)
+/// below it too: `pd = 0.75`, `npd = Φ⁻¹(0.75) = 0.674`. A reference drawn under one class
+/// per subject gives `pd ≈ 0.5` (`npd ≈ 0`, class 1) or `pd ≈ 1` (class 2) instead. Over
+/// the 30 observations at 1000 replicates the worst `|npd − 0.674|` measures 0.055; the
+/// bound is 0.15.
+#[test]
+fn the_npde_reference_draws_each_replicates_class() {
+    let pop = population(3);
+    let got = npde_bits(&mixture_model(-1000.0), &pop);
+    assert_eq!(got, npde_bits(&class_twin(2, -1000.0), &pop));
+    assert_ne!(got, npde_bits(&class_twin(1, -1000.0), &pop));
+    // The class's own Ω and Σ: η from `omega(2)`, the reference ε from `sigma(2)`.
+    assert_eq!(
+        npde_bits(&parse(&source(-1000.0, 0.09, OVERRIDES, None, false)), &pop),
+        npde_bits(&parse(&override_twin(false)), &pop)
+    );
+
+    // The class-1 typical concentration 10·exp(-0.1·t) at each observation time.
+    let mut on_class_1 = population(6);
+    for s in &mut on_class_1.subjects {
+        for (dv, t) in s.observations.iter_mut().zip(&s.obs_times) {
+            *dv = 10.0 * (-0.1 * t).exp();
+        }
+    }
+    let model = parse(&source(0.0, 1e-4, "", None, false).replace("EPS ~ 0.04", "EPS ~ 0.0001"));
+    let scores = crate::stats::npde::compute_npde_npd(
+        &model,
+        &on_class_1,
+        &model.default_params,
+        1000,
+        Some(7),
+        None,
+    )
+    .unwrap();
+    for (i, s) in scores.iter().enumerate() {
+        for &npd in &s.npd {
+            assert!(
+                (npd - 0.674).abs() < 0.15,
+                "subject {}: npd {npd}, want Φ⁻¹(0.75) = 0.674",
+                i + 1
+            );
+        }
+    }
+}
+
+/// Parameters for a `[mixture]` model that do not carry one Ω and one Σ of the model's shape
+/// per class are refused as `E_PARAM_SHAPE` on every simulate path (#2163 review), by code
+/// and full text. Before the gate, `mixture: None` simulated every class at the base Ω and
+/// Σ with `Ok`, and a short per-class list panicked indexing it in `class_params`.
+#[test]
+fn mixture_params_of_another_shape_are_refused_on_every_path() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction};
+    let pop = population(2);
+    // ODE, so the adaptive driver accepts it; an `omega(2)` override, so `mixture: None`
+    // would drop a real per-class Ω.
+    let model = parse(&source(0.0, 0.09, "  omega(2) ETA_CL ~ 0.36\n", None, true));
+    let ok = model.default_params.clone();
+
+    let mut none = ok.clone();
+    none.mixture = None;
+    let mut short = ok.clone();
+    short.mixture.as_mut().unwrap().omega.truncate(1);
+    let mut wide = ok.clone();
+    wide.mixture.as_mut().unwrap().omega[1] =
+        crate::types::OmegaMatrix::from_diagonal(&[0.36, 0.1], vec!["ETA_CL".into(), "X".into()]);
+    let mut sigma_long = ok.clone();
+    sigma_long.mixture.as_mut().unwrap().sigma[1]
+        .values
+        .push(0.1);
+    let cases = [
+        (
+            &none,
+            "this model declares a [mixture] of 2 classes, but the supplied parameters carry \
+             no per-class omega/sigma (`mixture: None`); every class would be simulated at the \
+             base omega and sigma, dropping any omega(k)/sigma(k) override. Pass the parsed \
+             model's `default_params`, or the fit's parameters, which carry them",
+        ),
+        (
+            &short,
+            "this model declares a [mixture] of 2 classes, but the supplied parameters carry \
+             1 per-class omega and 2 per-class sigma; each class needs one of each",
+        ),
+        (
+            &wide,
+            "the supplied omega of mixture class 2 is 2×2 but this model has 1 eta; the model \
+             reads it by position",
+        ),
+        (
+            &sigma_long,
+            "the supplied sigma of mixture class 2 has 2 values but this model has 1; the \
+             model reads it by position",
+        ),
+    ];
+    let check = |path: &str, err: crate::diagnostics::EngineError, want: &str| {
+        assert_eq!(
+            err.diagnostic().map(|d| d.code.as_str()),
+            Some("E_PARAM_SHAPE"),
+            "{path}: {err}"
+        );
+        assert_eq!(err.to_string(), want, "{path}");
+    };
+    for (params, want) in cases {
+        check(
+            "simulate_with_seed",
+            simulate_with_seed(&model, &pop, params, 1, 1).expect_err("refused"),
+            want,
+        );
+        let opts = SimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        check(
+            "simulate_with_options",
+            simulate_with_options(&model, &pop, params, 1, &opts).expect_err("refused"),
+            want,
+        );
+        let mut aopts = AdaptiveSimulateOptions::default();
+        aopts.seed = Some(1);
+        aopts.decision_times = vec![0.0];
+        let hold = || |_: &ControllerCtx| vec![DoseAction::Hold];
+        check(
+            "simulate_adaptive",
+            simulate_adaptive(&model, &pop, params, 1, hold, &aopts)
+                .err()
+                .expect("refused"),
+            want,
+        );
+        check(
+            "compute_npde_npd",
+            crate::stats::npde::compute_npde_npd(&model, &pop, params, 20, Some(1), None)
+                .expect_err("refused"),
+            want,
+        );
+    }
+    // The control: the parser's parameters pass every path.
+    assert!(simulate_with_seed(&model, &pop, &ok, 1, 1).is_ok());
+    assert!(crate::stats::npde::compute_npde_npd(&model, &pop, &ok, 20, Some(1), None).is_ok());
+}
+
+/// A residual magnitude may read `MIXNUM` (#2163 review): the NPDE reference and
+/// `simulate()` evaluate it under each replicate's class. At a certain class 2 the
+/// mixture's `EPS * (1 + 0.5 * (MIXNUM - 1))` must score and simulate as the class-2 twin's
+/// `EPS * 1.5`, and not as the class-1 twin's `EPS * 1`, the multiplier the NPDE reference
+/// used when it built the magnitude once, before the class guard.
+#[test]
+fn a_residual_magnitude_reading_mixnum_is_evaluated_under_the_drawn_class() {
+    let pop = population(3);
+    let with_err = |src: String, mult: &str| {
+        parse(&src.replace(
+            "DV ~ proportional(EPS)",
+            &format!("DV ~ proportional(EPS * {mult})"),
+        ))
+    };
+    let mixture = with_err(
+        source(-1000.0, 0.09, "", None, false),
+        "(1 + 0.5 * (MIXNUM - 1))",
+    );
+    let twin =
+        |class: usize, mult: &str| with_err(source(-1000.0, 0.09, "", Some(class), false), mult);
+    let class_2 = twin(2, "1.5");
+    // The straddle: the class-2 twin under class 1's multiplier is a different reference,
+    // so the equality below cannot hold by a multiplier that never mattered.
+    let class_2_at_class_1_mult = twin(2, "1");
+    assert_ne!(
+        npde_bits(&class_2, &pop),
+        npde_bits(&class_2_at_class_1_mult, &pop)
+    );
+    assert_eq!(npde_bits(&mixture, &pop), npde_bits(&class_2, &pop));
+    assert_eq!(rows(&mixture, &pop), rows(&class_2, &pop));
+}
+
+/// An `omega(2)` override that replaces the base's only declared zero leaves class 2 with
+/// no zero, and must still draw every inherited variance as declared (#2163 review). The
+/// class's `chol` comes from the base's regularised matrix, `+1e-8` on every diagonal, so
+/// a `1e-12 FIX` η drawn from it is 10⁴× too wide; the parser keeps the rebuilt factor
+/// instead. At a certain class 2 the rows equal the twin that declares the override and the
+/// `1e-12` as its own Ω, which factors exactly, with no regularisation.
+#[test]
+fn an_override_replacing_the_last_zero_keeps_inherited_variances() {
+    let pop = population(4);
+    let src = |cl_omega: &str, mixture: bool| {
+        let (mix, cl, mixl_use) = if mixture {
+            (
+                "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.09\n",
+                "if (MIXNUM == 1) TVCL * exp(ETA_CL) else 4 * TVCL * exp(ETA_CL)",
+                "",
+            )
+        } else {
+            ("", "4 * TVCL * exp(ETA_CL)", " + 0 * MIXL")
+        };
+        format!(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+             theta MIXL(-1000.0, -2000.0, 2000.0, FIX)\n  omega ETA_CL ~ {cl_omega}\n  \
+             omega ETA_V ~ 1e-12 FIX\n  sigma EPS ~ 0.04\n{mix}[individual_parameters]\n  \
+             CL = {cl}\n  V  = TVV * exp(ETA_V){mixl_use}\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [error_model]\n  DV ~ proportional(EPS)\n"
+        )
+    };
+    let mixture = parse(&src("0 FIX", true));
+    let twin = parse(&src("0.09", false));
+    assert_eq!(rows(&mixture, &pop), rows(&twin, &pop));
+    // The straddle: the twin with ETA_V at the regularised `1e-12 + 1e-8` gives other rows,
+    // so the equality above sees how wide ETA_V is drawn.
+    let wide = parse(&src("0.09", false).replace("ETA_V ~ 1e-12 FIX", "ETA_V ~ 1.0001e-8 FIX"));
+    assert_ne!(rows(&wide, &pop), rows(&twin, &pop));
+}
+
+/// A residual magnitude that reads `MIXNUM` is checked under every class (#2163 review).
+/// `EPS * (2 - MIXNUM)` is 1 under class 1 and 0 under class 2: checked at class 1 alone it
+/// passed, and a certain-class-2 simulation then collapsed every residual onto the variance
+/// floor with `Ok`. It is refused, naming class 2; `EPS * (3 - MIXNUM)`, positive under
+/// both, is the control.
+#[test]
+fn a_residual_magnitude_reading_mixnum_is_checked_under_every_class() {
+    let pop = population(2);
+    let with_mult = |mult: &str| {
+        parse(&source(-1000.0, 0.09, "", None, false).replace(
+            "DV ~ proportional(EPS)",
+            &format!("DV ~ proportional(EPS * {mult})"),
+        ))
+    };
+    let model = with_mult("(2 - MIXNUM)");
+    let err = simulate_with_seed(&model, &pop, &model.default_params, 1, 1).expect_err("refused");
+    assert_eq!(
+        err.diagnostic().map(|d| d.code.as_str()),
+        Some("E_RUV_MAGNITUDE_NONPOSITIVE")
+    );
+    assert_eq!(
+        err.to_string(),
+        "[error_model] residual-error magnitude for sigma slot 0 evaluates to 0 at subject \
+         `1`, TIME 0.5 under mixture class 2 — it must be strictly positive and finite. The \
+         variance is proportional to its square, so a zero magnitude collapses that \
+         observation's variance onto the floor and lets one row dominate the fit. The usual \
+         cause is a missing or non-numeric cell in a covariate the magnitude (or a `weight = \
+         ...` modifier) references."
+    );
+    let control = with_mult("(3 - MIXNUM)");
+    assert!(simulate_with_seed(&control, &pop, &control.default_params, 1, 1).is_ok());
+}
+
+/// The twin-less closed-form flip-flop refusal is checked under every class (#2163
+/// review). A twin-less transit model (`[scaling]` declines the ODE twin) whose class 1
+/// has `ke = 0.5/4 = 0.125 < KTR = 4/20 = 0.2` but whose certain class 2 clears `mult`×
+/// faster: at `mult = 4`, `ke = 0.5 ≥ KTR`, so every class-2 subject's dose-driven profile
+/// would clamp to zero. Checked at class 1 alone it passed, and `simulate_with_seed`
+/// returned those zero profiles with `Ok`. Now it is refused, naming class 2, and the same
+/// predicate makes `simulate_with_uncertainty` skip such a draw. `mult = 1.2`
+/// (`ke = 0.15`) is the in-domain control.
+#[test]
+fn the_flip_flop_refusal_is_checked_under_every_class() {
+    let pop = population(2);
+    let model = |mult: &str| {
+        parse(&format!(
+            "[parameters]\n  theta TVCL(0.5, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+             theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  \
+             theta MIXL(-1000.0, -2000.0, 2000.0, FIX)\n  omega ETA_CL ~ 0.09\n  \
+             sigma PROP ~ 0.01 (sd)\n[mixture]\n  nsub = 2\n  logit(1) = MIXL\n\
+             [individual_parameters]\n  \
+             CL = if (MIXNUM == 1) TVCL * exp(ETA_CL) else {mult} * TVCL * exp(ETA_CL)\n  \
+             V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n\
+             [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\
+             [scaling]\n  obs_scale = 1\n[error_model]\n  DV ~ proportional(PROP)\n"
+        ))
+    };
+    let crossing = model("4");
+    let err =
+        simulate_with_seed(&crossing, &pop, &crossing.default_params, 1, 1).expect_err("refused");
+    assert_eq!(
+        err.diagnostic().map(|d| d.code.as_str()),
+        Some("E_TRANSIT_FLIP_FLOP")
+    );
+    assert!(
+        err.to_string().starts_with(
+            "one_cpt_transit starts outside the analytic absorption closed form's convergence \
+             domain at typical values (subject 1 under mixture class 2) — the flip-flop regime"
+        ),
+        "{err}"
+    );
+    assert!(
+        check_absorption_flip_flop_no_twin(&crossing, &pop, &crossing.default_params.theta)
+            .is_some()
+    );
+
+    let control = model("1.2");
+    assert!(simulate_with_seed(&control, &pop, &control.default_params, 1, 1).is_ok());
+    assert!(
+        check_absorption_flip_flop_no_twin(&control, &pop, &control.default_params.theta).is_none()
+    );
+}

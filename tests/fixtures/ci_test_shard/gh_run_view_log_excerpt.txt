@@ -1,0 +1,38 @@
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8159724Z ^[[1m^[[92m     Running^[[0m unittests src/lib.rs (target/ci-test/build/ferx-core/ea057ae3eabdb293/out/ferx_core-ea057ae3eabdb293)
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8266279Z 
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8266438Z running 6835 tests
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8290243Z test api::adaptive_inputs_tests::from_table_keeps_order_and_looks_up_by_id ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8715675Z test api::adaptive_inputs_tests::supplied_eta_is_the_eta_the_run_uses ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8723739Z test api::adaptive_inputs_tests::supplied_eta_is_fixed_across_replicates_and_the_assay_reads_params_sigma ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8724680Z test api::adaptive_inputs_tests::supplied_eta_leaves_the_kappa_stream_alone ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8748234Z test api::adaptive_inputs_tests::supplied_eta_on_a_mixture_model_is_refused ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8850852Z test api::adaptive_inputs_tests::unmatched_list_is_capped_at_ten ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8851729Z test api::adaptive_inputs_tests::supplied_subject_keeps_the_eta_stream_of_the_others ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.8953729Z test api::adaptive_inputs_tests::supplied_eta_refusals_carry_their_code_and_text ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.9093346Z test api::adaptive_obs_scale_tests::log_transformed_error_model_is_refused ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.9163075Z test api::adaptive_obs_scale_tests::assay_signal_and_auc_target_use_the_scaled_readout ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.9263353Z test api::adaptive_obs_scale_tests::observe_expression_is_not_divided_by_obs_scale ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:02:53.9393505Z test api::adaptive_sim_tests::adaptive_auc_pass_holds_init_before_the_origin ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:35.9406998Z test estimation::agq::tests::agq_one_node_gauss_newton_is_the_focei_marginal_up_to_the_proposal_jitter ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:35.9933027Z test estimation::agq::tests::an_event_only_subject_keeps_its_theta_score ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.0043350Z test estimation::agq::tests::analytic_grid_response_matches_the_fd_route ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.0413118Z test estimation::agq::tests::analytic_score_no_longer_gates_the_focei_scope ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.0563090Z test estimation::agq::tests::audit_invalid_perturbed_anchor_declines_the_gradient ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.0612914Z test estimation::agq::tests::cached_gauss_hermite_reuses_the_exact_rule_storage ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.0762955Z test estimation::agq::tests::cached_schedule_agq_population_matches_uncached ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.0853048Z test estimation::agq::tests::fixed_b_score_is_analytic_and_exact_under_iiv_on_ruv ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.0993079Z test estimation::agq::tests::fixed_b_score_is_analytic_and_exact_under_ltbs ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.1140919Z test estimation::agq::tests::fixed_b_score_is_analytic_and_exact_under_m3 ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.1262909Z test estimation::agq::tests::frem_pseudo_obs_rows_get_the_right_analytic_score ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.1423187Z test estimation::agq::tests::fused_iov_node_reuses_the_jet_without_changing_value_or_score ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.1502886Z test estimation::agq::tests::fused_node_preserves_raw_negative_prediction_likelihood ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:03:36.1653016Z test estimation::agq::tests::fused_objective_work_reproduces_objective_and_gradient ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:14:26.6953567Z test result: ok. 6820 passed; 0 failed; 15 ignored; 0 measured; 0 filtered out; finished in 692.87s
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:14:26.6953970Z 
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:14:32.0090398Z ^[[1m^[[92m     Running^[[0m tests/agq.rs (target/ci-test/build/ferx-core/521dede3cf5d3b85/out/agq-521dede3cf5d3b85)
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:14:32.0174180Z 
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:14:32.0174502Z running 40 tests
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:14:32.2512891Z test agq_eval_only_is_bit_reproducible ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:14:32.2803128Z test agq_eval_only_parses_from_the_model_file ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:14:32.3651554Z test agq_eval_only_preserves_the_preceding_stages_parameters ... ok
+Slow regression tests (core)	cargo test (ci-test profile + slow-tests)	2026-10-20T14:15:03.6144070Z test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.60s

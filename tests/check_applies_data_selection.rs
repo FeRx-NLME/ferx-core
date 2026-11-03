@@ -186,7 +186,9 @@ fn check_and_fit(model_src: &str, data: &str) -> (CheckReport, Result<FitResult,
     let mp = m.path().to_str().expect("utf-8 temp path").to_string();
     let dp = d.path().to_str().expect("utf-8 temp path").to_string();
     let report = validate_model_file(&mp, Some(&dp));
-    let fit = run_model_with_data(&mp, Some(&dp)).map(|(r, _)| r);
+    let fit = run_model_with_data(&mp, Some(&dp))
+        .map(|(r, _)| r)
+        .map_err(|e| e.to_string());
     (report, fit)
 }
 

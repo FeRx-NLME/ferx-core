@@ -1,0 +1,62 @@
+# Model-based meta-analysis: ACR20 response in rheumatoid arthritis, with
+# canakinumab, adalimumab and abatacept against placebo.
+#
+# The final model (run r03) of Case Study 2 in Bracis C et al., "Model-Based
+# Meta-Analysis With MonolixSuite: A Tutorial for Longitudinal Categorical and
+# Continuous Data", CPT:PSP 2026;15:e70158 (doi:10.1002/psp4.70158), written
+# fresh in the ferx DSL from the model's equations. 9 studies, 15 arms, 140
+# longitudinal ACR20 responder proportions.
+#
+# THE DATA ARE NOT IN THIS REPOSITORY and may not be redistributed (the article
+# is CC BY-NC-ND 4.0; #1913). Provision them locally with
+#   python3 tools/mbma_canakinumab_fetch.py
+# which writes the git-ignored data/external/mbma_canakinumab.csv. The anchor
+# test is tests/mbma_canakinumab_case_study.rs.
+#
+# The bounded-endpoint MBMA weighting, three pieces:
+#
+#   DV = logit(p) on the natural scale, residual weight = 1/sqrt(NARM), sigma
+#       ESTIMATED. The p(1-p) factor of the logit's sampling variance is never
+#       divided out, so sigma absorbs it (docs/model-file/error-model.qmd,
+#       "Is sigma fixed?"). Fixing sigma to 1 would be a different model.
+#
+#   kappa KAPPA_EMAX ... weight = NARM: between-arm variability on logit(Emax)
+#       with variance gamma^2 / NARM — the published `etaBTVAEmax / sqrt(Narm)`.
+#
+#   clamp(ACR20, 0.01, 0.99) before the logit, as published: the readout must
+#       stay inside (0, 1) at t -> 0.
+
+[parameters]
+  theta EMAX_POP(0.40, 0.001, 0.999)    # placebo Emax, a probability (logit-normal typical)
+  theta B_EMAX_ABA(1.5, -10.0, 10.0)    # abatacept on logit(Emax)
+  theta B_EMAX_ADA(1.0, -10.0, 10.0)    # adalimumab on logit(Emax)
+  theta B_EMAX_CAN(1.0, -10.0, 10.0)    # canakinumab on logit(Emax)
+  theta T50_POP(4.0, 0.1, 100.0)        # weeks to half-maximal response
+  theta B_T50_ADA(-0.5, -10.0, 10.0)    # adalimumab on log(T50)
+
+  omega ETA_BSV_EMAX ~ 0.3 (sd)                       # between-study, logit(Emax)
+  kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM           # between-arm, var gamma^2/NARM
+
+  sigma ADD_ERR ~ 2.5 (sd)                            # ESTIMATED; scaled by 1/sqrt(NARM)
+
+[covariates]
+  NARM   continuous
+  ABATA  categorical
+  ADALI  categorical
+  CANAKI categorical
+
+[individual_parameters]
+  LEMAX = logit(EMAX_POP) + B_EMAX_ABA * ABATA + B_EMAX_ADA * ADALI + B_EMAX_CAN * CANAKI + ETA_BSV_EMAX + KAPPA_EMAX
+  T50   = T50_POP * exp(B_T50_ADA * ADALI)
+
+[structural_model]
+  ACR20 = clamp(inv_logit(LEMAX) * TIME / (TIME + T50), 0.01, 0.99)
+  y     = logit(ACR20)
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = 1 / sqrt(NARM)
+
+[fit_options]
+  method     = focei
+  iov_column = ARM
+  covariance = true

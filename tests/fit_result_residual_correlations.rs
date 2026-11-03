@@ -168,20 +168,24 @@ fn block_sigma_chain_before_focei_is_allowed() {
         .any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
 }
 
-/// #847 / review finding: AGQ's score assembles theta/omega/sigma/omega_iov and
-/// never writes the trailing rho slot, so a model with a **free** block_sigma must
-/// decline the analytic gradient and fall to `reconverged_fd_gradient`, which
-/// differences every free packed coordinate. A hard zero there would leave the
-/// optimizer no reason to move rho while the objective genuinely depends on it.
+/// #847: a **free** block_sigma once had to decline AGQ's analytic score, because the
+/// pre-#486 fixed-η score never wrote the trailing ρ slot and a hard zero there would leave
+/// the optimizer no reason to move ρ. The adjoint writes it — its ρ coordinate is checked
+/// against reconverged FD at 1 and 3 nodes in `sens::ode_adjoint_tests::
+/// dense_residual_agq_gradient_and_hessians_match_fd` — so the free block now stays on the
+/// analytic score, and the AGQ gradient is available for it.
 #[test]
-fn agq_declines_the_analytic_gradient_for_a_free_block_sigma() {
+fn agq_keeps_the_analytic_gradient_for_a_free_block_sigma() {
     let src = MODEL.replace("1.00] FIX", "1.00]");
     let model = parse_model_string(&src).expect("free block_sigma model must parse");
     assert_eq!(model.default_params.residual_correlation_fixed, vec![false]);
     assert!(
-        !ferx_core::estimation::agq::analytic_gradient_available(&model),
-        "a free block_sigma must route AGQ/Laplace to the reconverged-FD gradient"
+        ferx_core::estimation::agq::analytic_score_supported(&model),
+        "a free block_sigma must stay on the analytic AGQ/Laplace score"
     );
+    assert!(ferx_core::estimation::agq::analytic_gradient_available(
+        &model
+    ));
 }
 
 /// A `FIX`ed block carries no free rho coordinate for the score to miss, so the

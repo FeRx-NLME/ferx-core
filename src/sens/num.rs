@@ -7,6 +7,40 @@ use super::dual1::Dual1;
 use super::dual_mixed::DualMixed;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
+/// Size above which a dual's arithmetic is called out of line rather than inlined at every
+/// use. A wide dual's operation is a loop over tens to hundreds of lanes, far more work
+/// than a call, while inlining it into every closed form, event walk and ODE step was most
+/// of the binary (#486); narrow duals — small models' hot path — stay inlined. Decided
+/// per type at compile time from `size_of::<Self>()`, so nested duals are covered too.
+/// The narrow duals' operations are `#[inline]` hints, not `#[inline(always)]`: forcing them
+/// into every kernel made LLVM's optimisation of the recorders most of the crate's compile
+/// time (610 s vs 298 s for the lib, and 84 vs 37 MB of text, measured on #2093).
+pub(crate) const OUTLINE_BYTES: usize = 256;
+
+/// Direction count from which a dual is outlined whatever its size: every `N ≥ 8` bucket
+/// serves a rare wide fit, and inlining its lane loops cost 4–7 MB of binary per
+/// instantiation where the outlined copy costs ~0.5 MB (measured on the release binary,
+/// #2093 review). Below it, [`OUTLINE_BYTES`] decides.
+pub(crate) const OUTLINE_DIRECTIONS: usize = 8;
+
+/// Whether a dual with `n` directions and `size` bytes runs its arithmetic out of line.
+pub(crate) const fn outlined(n: usize, size: usize) -> bool {
+    n >= OUTLINE_DIRECTIONS || size > OUTLINE_BYTES
+}
+
+/// The largest `|x|` over `xs`, or `NaN` when any is `NaN` — the fold behind every
+/// [`PkNum::jet_max_abs`] override, so a `NaN` jet fails the comparison it feeds rather than
+/// being discarded by `f64::max`.
+pub(crate) fn nan_max_abs(xs: impl IntoIterator<Item = f64>) -> f64 {
+    xs.into_iter().fold(0.0_f64, |m, x| {
+        if x.is_nan() || m.is_nan() {
+            f64::NAN
+        } else {
+            m.max(x.abs())
+        }
+    })
+}
+
 pub trait PkNum:
     Copy
     // Every implementor is a plain numeric value type (`f64`, `Dual1`, `Dual2`, `DualMixed`)
@@ -24,6 +58,49 @@ pub trait PkNum:
     /// gradient-only `Dual1`, `true` for the `Dual2`/`DualMixed` outer type. Lets a caller
     /// skip building a Hessian it would discard (e.g. `tvcov_init_state` on the inner walk).
     const SECOND_ORDER: bool;
+    /// Whether every derivative this type carries is of total order ≤ 2 in its inputs, so a
+    /// function of a few intermediates may be replaced by its second-order Taylor polynomial
+    /// in them without changing any jet (the adjoint's PK-space closed form,
+    /// `sens::ode_adjoint`). `false` unless an implementor opts in; a type whose taped or
+    /// nested parts differentiate a second-order jet again must not.
+    const TAYLOR2_EXACT: bool = false;
+    /// The highest total derivative order this type can observe of a function it is
+    /// evaluated through — its own jet's order, plus one for each tape that differentiates
+    /// it again. A function of a few intermediates may be replaced by its Taylor polynomial
+    /// of this order in them without changing anything the type carries (the adjoint's
+    /// PK-space lift, `sens::ode_adjoint`). `0` for a plain number.
+    const JET_ORDER: usize = 0;
+    /// The `f64` work one arithmetic operation on this type costs, in lanes: the lanes it
+    /// carries, plus two for each lane a tape records (the node, and its sweep). A cost proxy
+    /// for choosing between two recordings of one function (the adjoint's PK-space lift), not
+    /// a timing; `1` for a plain number.
+    const WORK: usize = 1;
+    /// Whether the forward jet carries second derivatives in its own directions (the
+    /// adjoint's η-Hessian payload): what a [`Self::TAYLOR2_EXACT`] stand-in has to reproduce
+    /// besides the tape's first θ-derivatives. Defaults to [`Self::SECOND_ORDER`].
+    const ETA_HESSIAN: bool = Self::SECOND_ORDER;
+    /// Whether this value is on a reverse tape, i.e. something downstream differentiates
+    /// it once more. `false` for every type without one.
+    #[inline]
+    fn is_taped(self) -> bool {
+        false
+    }
+    /// Whether this value carries no derivative at all (no jet, no tape), so a function of
+    /// it may be evaluated on `f64` and lifted with [`Self::from_f64`]. Conservative:
+    /// `false` unless an implementor can tell cheaply.
+    #[inline]
+    fn is_constant(self) -> bool {
+        false
+    }
+    /// Whether `self` and `other` are the same number bit for bit (value and every jet entry),
+    /// for a type that carries no tape; `None` for one that can, whose results a caller must
+    /// recompute rather than reuse (a reused result drops the tape records the recomputation
+    /// writes). Keys the exact linear path's reuse of a Padé approximant: a deterministic
+    /// function of equal bits gives equal bits.
+    #[inline]
+    fn same_bits_untaped(&self, _other: &Self) -> Option<bool> {
+        None
+    }
     /// Lift a constant into the numeric type (zero derivatives for duals).
     fn from_f64(x: f64) -> Self;
     /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
@@ -73,10 +150,190 @@ pub trait PkNum:
     /// therefore inert on the prediction path and only ever fires on a dual instantiation
     /// (see `crate::ode::solver`'s escalation guard for why that asymmetry is deliberate).
     fn jets_finite(self) -> bool;
+
+    /// The largest absolute **derivative** component — gradient, and the Hessian block when
+    /// the type carries one; `0.0` for `f64`. Like [`jets_finite`](Self::jets_finite) it
+    /// ignores [`val`](Self::val).
+    ///
+    /// For a check that has to hold in every component, not just the value: the exact linear
+    /// propagator (#852) reads `A` off differences of the RHS, and a cancellation can wipe a
+    /// derivative component while the value survives intact, so its self-check compares the
+    /// jets of `f(x)` and `A·x + b` too, against a scale built from these magnitudes.
+    ///
+    /// Provided, returning `0.0`, so adding it did not break an implementor outside this
+    /// crate. That default is only correct for a jet-free type; every dual in this crate
+    /// overrides it. An external type cannot reach the exact propagator (only a parser-certified
+    /// spec does, and that runs on this crate's types), so the default cannot weaken its check.
+    fn jet_max_abs(self) -> f64 {
+        0.0
+    }
+
+    /// `φ(self)` for a scalar function known through its value and first two derivatives
+    /// at `self.val()` (`v = φ(x)`, `d1 = φ′(x)`, `d2 = φ″(x)`): the special functions the
+    /// likelihood needs (e.g. `log Φ` for M3 rows) and a residual variance as a function of
+    /// the prediction. Exact to second order on every dual and tape type.
+    ///
+    /// Provided, as the second-order Taylor polynomial in `δ = self − self.val()` (value `0`,
+    /// `self`'s jet), so an implementor outside this crate keeps compiling (#2093 review): it is
+    /// exact for every type tracking at most second derivatives, which every external `PkNum`
+    /// predating this member is. Every type in this crate overrides it.
+    fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
+        let dx = self - Self::from_f64(self.val());
+        Self::from_f64(v) + dx * Self::from_f64(d1) + dx * dx * Self::from_f64(0.5 * d2)
+    }
+
+    /// [`Self::lift2`] with the third derivative `d3 = φ‴` too, for types that carry a
+    /// second-order jet over a differentiable base (`sens::rtape::DualH`): their
+    /// `φ″` factor needs its own derivative. The default drops `d3`, which is exact for
+    /// every type tracking fewer orders.
+    #[inline]
+    fn lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self {
+        self.lift2(v, d1, d2)
+    }
+
+    /// [`Self::lift3`] with the fourth derivative `d4 = φ⁗` too, for the covariance step's
+    /// nested dual (`sens::rtape::DualH` over `DualT` over the reverse tape), which carries
+    /// four orders: a Laplace exact-anchor R-matrix differentiates `∂²f/∂η²` twice more.
+    /// The default drops `d4`, which is exact for every type tracking fewer orders.
+    #[inline]
+    fn lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self {
+        self.lift3(v, d1, d2, d3)
+    }
+
+    /// `u + h·(c₀k₀ + c₁k₁ + …)` with exactly this association (left-to-right sum,
+    /// then `h·`, then `u +`): an explicit RK stage combination. The default *is* that
+    /// expression, so `f64` and the forward duals keep their trajectories bit for bit.
+    /// The adjoint tape type (`sens::vtape::DualV`) overrides it to record one
+    /// node instead of `~3j` binary ones.
+    #[inline]
+    fn lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self {
+        let mut s = Self::from_f64(cs[0]) * ks[0];
+        for j in 1..cs.len() {
+            s = s + Self::from_f64(cs[j]) * ks[j];
+        }
+        u + Self::from_f64(h) * s
+    }
+
+    /// `((acc + x₀·w₀) + x₁·w₁) + …`, each term `xⱼ · from_f64(wⱼ)`, left to right: a
+    /// Rosenbrock stage combination. The default *is* that expression; the adjoint tape type
+    /// (`sens::vtape::DualV`) computes the same values and records one linear node instead
+    /// of two per term.
+    #[inline]
+    fn axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self {
+        let mut a = acc;
+        for &(x, w) in terms {
+            a = a + x * Self::from_f64(w);
+        }
+        a
+    }
+
+    /// `((acc + from_f64(w₀)·x₀) + from_f64(w₁)·x₁) + …`: [`Self::axpy_fold`] with the
+    /// constant on the left, as a matrix combination `Σ cₖ·Mₖ` writes it.
+    #[inline]
+    fn caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self {
+        let mut a = acc;
+        for &(w, x) in terms {
+            a = a + Self::from_f64(w) * x;
+        }
+        a
+    }
+
+    /// Whether this type's folds ([`Self::dot_fold`], [`Self::caxpy_fold`],
+    /// [`Self::axpy_fold`]) record fewer tape nodes than the per-operation expressions, so a
+    /// kernel should call them per entry; otherwise it keeps its own loop (same values).
+    const FUSED_FOLDS: bool = false;
+
+    /// `((acc + a₀·b₀) + a₁·b₁) + …`, left to right: one entry of a matrix product. The
+    /// default *is* that expression; `DualV` computes the same values and records one node
+    /// whose rule is the product rule per pair, instead of two nodes per term.
+    #[inline]
+    fn dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self {
+        let mut r = acc;
+        for &(a, b) in pairs {
+            r = r + a * b;
+        }
+        r
+    }
+
+    /// The same number off any tape: a value-only check computed on it records nothing.
+    #[inline]
+    fn detach(self) -> Self {
+        self
+    }
+
+    /// `(a − b) · from_f64(s)`: a forward-difference quotient. The default *is* that
+    /// expression; `DualV` computes the same values and records one linear node.
+    #[inline]
+    fn scaled_diff(a: Self, b: Self, s: f64) -> Self {
+        (a - b) * Self::from_f64(s)
+    }
+
+    /// `base + Σ αₜ·xₜ·yₜ`, left to right: one entry of a weighted Gram sum such as the
+    /// FOCEI `H̃ = Ω⁻¹ + Σ_j α_j g_j g_jᵀ`. The reverse tape (`sens::rtape::R`)
+    /// overrides it to record one node instead of three per term.
+    #[inline]
+    fn wsum3(base: f64, terms: impl Iterator<Item = (Self, Self, Self)>) -> Self {
+        let mut s = Self::from_f64(base);
+        for (a, x, y) in terms {
+            s = s + a * x * y;
+        }
+        s
+    }
+
+    /// `x₁·y₁ + x₂·y₂`: a product rule's tangent (`g·v′ + v·g′`). The reverse tape
+    /// (`sens::rtape::R`) overrides it to record **one** node with the four partials instead
+    /// of three (two products and a sum, #2481 §2.2); every other type keeps exactly this
+    /// arithmetic, so its values do not move.
+    #[inline]
+    fn dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self {
+        x1 * y1 + x2 * y2
+    }
+
+    /// `((x₁·y₁ + x₂·y₂) + x₃·y₃) + x₄·y₄`, left to right: a second-order product rule's
+    /// Hessian entry. As [`Self::dot2`]: one node on the reverse tape, this arithmetic
+    /// everywhere else.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self {
+        x1 * y1 + x2 * y2 + x3 * y3 + x4 * y4
+    }
+
+    /// Tape position for [`Self::tape_rollback`]; `0` for types that record nothing.
+    #[inline]
+    fn tape_mark() -> usize {
+        0
+    }
+
+    /// Discard every record made after `mark` (a rejected ODE step attempt). No-op for
+    /// types that record nothing.
+    #[inline]
+    fn tape_rollback(_mark: usize) {}
+
+    /// LU factorisation hook for a taping type: `Some(ok)` when the type factored `m`
+    /// itself (it may leave `m` unfactored and keep its state behind `piv`), `None` to
+    /// run the generic elimination (`sens::linsolve`).
+    #[inline]
+    fn lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> Option<bool> {
+        None
+    }
+
+    /// Solve hook paired with [`Self::lu_factor_hook`]; `true` when handled.
+    #[inline]
+    fn lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool {
+        false
+    }
 }
 
 impl PkNum for f64 {
     const SECOND_ORDER: bool = false;
+    #[inline]
+    fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
+        Some(self.to_bits() == other.to_bits())
+    }
+    #[inline]
+    fn is_constant(self) -> bool {
+        true
+    }
     #[inline]
     fn from_f64(x: f64) -> Self {
         x
@@ -134,6 +391,10 @@ impl PkNum for f64 {
         crate::stats::special::ln_gamma(self)
     }
     #[inline]
+    fn lift2(self, v: f64, _d1: f64, _d2: f64) -> Self {
+        v
+    }
+    #[inline]
     fn jets_finite(self) -> bool {
         // No derivative components to be non-finite. Const-folds away in the guard, so the
         // `f64` prediction path pays nothing for a check only the dual paths can fail.
@@ -152,6 +413,11 @@ macro_rules! impl_pknum_delegate {
     ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr) => {
         impl<$(const $c: usize),+> PkNum for $ty<$($c),+> {
             const SECOND_ORDER: bool = $so;
+            const JET_ORDER: usize = if $so { 2 } else { 1 };
+            #[inline]
+            fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
+                Some($ty::same_bits(self, other))
+            }
             #[inline]
             fn from_f64(x: f64) -> Self {
                 $ty::constant(x)
@@ -221,12 +487,455 @@ macro_rules! impl_pknum_delegate {
             fn jets_finite(self) -> bool {
                 $ty::jets_finite(self)
             }
+            #[inline]
+            fn jet_max_abs(self) -> f64 {
+                $ty::jet_max_abs(self)
+            }
+            #[inline]
+            fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
+                $ty::lift2(self, v, d1, d2)
+            }
         }
     };
 }
 
 impl_pknum_delegate!(Dual1<const N: usize>, second_order = false);
 impl_pknum_delegate!(DualMixed<const NA: usize, const N: usize>, second_order = true);
+
+/// In-place arithmetic for the generic bytecode VM (`eval_bytecode_g`).
+///
+/// The VM keeps its operands on a `Vec<T>` stack. For the outer `DualMixed<NA, N>`
+/// type a value is several KB (`N + NA·N + 1` doubles), so the by-value
+/// `pop, pop, push(a ∘ b)` shape spent about a third of a busulfan ODE+IOV FOCEI fit
+/// in `memmove`/`memset` — moving operands and materialising all-zero jets for
+/// constants. These update the left operand where it sits on the stack and take the
+/// right one by reference, or as a bare `f64` when it is a constant, covariate or
+/// `TIME`.
+///
+/// **Every method is bit-identical to the by-value operator it replaces**, the scalar
+/// ones included: they evaluate the formula the operator would apply to a
+/// `from_f64(c)` operand term by term — `x·0.0`, `+ 0.0` and all — just without
+/// building that operand. So signed zeros and `inf · 0 = NaN` come out exactly as
+/// before. `f64` and `Dual1` (small enough that moves are cheap) use the operators
+/// themselves; `DualMixed` writes the same formulas as in-place loops.
+///
+/// In a crate-private module, so it is not public API and does not constrain
+/// `PkNum`: the VM and the generic code that drives it bound on [`vm::VmNum`]
+/// (`PkNum + VmArith`) instead.
+pub(crate) mod vm {
+    use super::{Dual1, DualMixed};
+
+    /// A number type's lanes as the RHS's native code sees them (`parser::rhs_ir`): `f64`
+    /// (`n = m = 0`), or a dual of `n` tangents and an `m`-entry second-order payload,
+    /// laid out `[value, g_0 … g_{n−1}, h_0 … h_{m−1}]`.
+    ///
+    /// `th` is `DualV`'s directional mode (`m = n`, `h_k = ∂²/∂t_k²`); otherwise a
+    /// non-empty payload is the packed lower triangle (`m = n(n+1)/2`). `wide` is
+    /// [`super::outlined`]: such a dual applies a constant operand of `×`/`÷` as a full
+    /// product with the constant dual, a different operation order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct Layout {
+        pub(crate) n: u16,
+        pub(crate) m: u16,
+        pub(crate) th: bool,
+        pub(crate) wide: bool,
+    }
+
+    impl Layout {
+        pub(crate) const F64: Layout = Layout {
+            n: 0,
+            m: 0,
+            th: false,
+            wide: false,
+        };
+        pub(crate) const fn lanes(&self) -> usize {
+            1 + self.n as usize + self.m as usize
+        }
+    }
+
+    /// A compiled RHS a tape can record whole and differentiate later (`parser::rhs_jit`):
+    /// its native forward and reverse pass over a [`Layout`]'s lanes, `fn(u, params, seeds,
+    /// du)` and `fn(u, params, seeds, du, ū, p̄, s̄, dū)`.
+    pub(crate) trait RhsKernel: Send + Sync {
+        /// How many elements of `u`, `params` and `du` the program touches.
+        fn extent(&self) -> (usize, usize, usize);
+        /// Whether every derivative below the extent is written, so an output never
+        /// depends on what `du` held before the call.
+        fn writes_every_du(&self) -> bool;
+        /// Whether a native forward exists (or can be built) for `layout`.
+        fn has_forward(&self, layout: Layout) -> bool;
+        /// Whether a reverse pass exists (or can be built) for `layout`.
+        fn has_reverse(&self, layout: Layout) -> bool;
+        /// The forward over `layout`.
+        ///
+        /// # Safety
+        /// Each pointer covers [`Self::extent`]'s elements (4 seeds) of `layout`'s lanes,
+        /// and `du` does not overlap the inputs; [`Self::has_forward`] holds.
+        unsafe fn forward(
+            &self,
+            layout: Layout,
+            u: *const f64,
+            params: *const f64,
+            seeds: *const f64,
+            du: *mut f64,
+        );
+        /// Add `dūᵀ·∂du/∂(u, params, seeds)` into `ū`, `p̄`, `s̄`.
+        ///
+        /// # Safety
+        /// As [`Self::forward`] for the primal inputs; each adjoint buffer is laid out like
+        /// its primal; [`Self::has_reverse`] holds.
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn reverse(
+            &self,
+            layout: Layout,
+            u: *const f64,
+            params: *const f64,
+            seeds: *const f64,
+            u_bar: *mut f64,
+            p_bar: *mut f64,
+            s_bar: *mut f64,
+            du_bar: *const f64,
+        );
+    }
+
+    pub trait VmArith: Sized {
+        /// Whether a value of this type can carry a tape node, so evaluating the same
+        /// expression twice records it twice. Code that reuses a value instead of
+        /// recomputing it (the ODE RHS's hoist) changes such a type's tape.
+        const RECORDS_TAPE: bool = false;
+        /// This type's lanes for the RHS's native code, when it has them: `f64`, and the
+        /// duals whose every part is an `f64` and whose arithmetic is the lane arithmetic
+        /// `parser::rhs_ir` transcribes.
+        const LANES: Option<Layout> = None;
+        /// Whether a value sits in memory as exactly its lanes (`#[repr(C)]`, value first),
+        /// so a slice of them passes to native code as it is. Otherwise the lanes are
+        /// copied out and back ([`Self::put_lanes`], [`Self::from_lanes`]).
+        const CONTIGUOUS: bool = false;
+        /// Whether this value may run through native code: it is not on a tape.
+        #[inline]
+        fn native_ok(&self) -> bool {
+            true
+        }
+        /// Write this value's [`Self::LANES`] into `out` (a non-contiguous type).
+        fn put_lanes(&self, _out: &mut [f64]) {
+            unreachable!("only a non-contiguous type with LANES copies its lanes")
+        }
+        /// A value, off any tape, from its lanes (a non-contiguous type).
+        fn from_lanes(_lanes: &[f64]) -> Self {
+            unreachable!("only a non-contiguous type with LANES copies its lanes")
+        }
+        /// Record one whole RHS call on this type's tape: `du` from `kernel`'s native
+        /// forward, as tape nodes whose reverse rule is `kernel`'s reverse pass, instead of
+        /// one node per operation. `false`, with nothing written or recorded, when the type
+        /// has no such record or the kernel cannot serve it.
+        fn tape_rhs(
+            _kernel: &std::sync::Arc<dyn RhsKernel>,
+            _u: &[Self],
+            _params: &[Self],
+            _seeds: &[Self; 4],
+            _du: &mut [Self],
+        ) -> bool {
+            false
+        }
+        /// `self = self + rhs`.
+        fn add_in(&mut self, rhs: &Self);
+        /// `self = self - rhs`.
+        fn sub_in(&mut self, rhs: &Self);
+        /// `self = rhs - self` (the bytecode `RSub`).
+        fn rsub_in(&mut self, rhs: &Self);
+        /// `self = self * rhs`.
+        fn mul_in(&mut self, rhs: &Self);
+        /// `self = self / rhs` (no zero guard — the caller owns it).
+        fn div_in(&mut self, rhs: &Self);
+        /// `self = self + from_f64(c)`.
+        fn add_scalar_in(&mut self, c: f64);
+        /// `self = self - from_f64(c)`.
+        fn sub_scalar_in(&mut self, c: f64);
+        /// `self = from_f64(c) - self`.
+        fn rsub_scalar_in(&mut self, c: f64);
+        /// `self = self * from_f64(c)`.
+        fn mul_scalar_in(&mut self, c: f64);
+        /// `self = self / from_f64(c)` (no zero guard — the caller owns it).
+        fn div_scalar_in(&mut self, c: f64);
+        /// Whether `self` and `other` are the same number bit for bit — the value
+        /// and, for a dual, every jet entry. Keys the ODE RHS's lifted-subexpression
+        /// cache (`RhsHoist` in the parser): a lifted value is a pure function of the
+        /// inputs it reads, so bit-identical inputs give a bit-identical value.
+        fn same_bits(&self, other: &Self) -> bool;
+    }
+
+    /// [`super::PkNum`] plus the VM's in-place arithmetic: the bound for code that runs
+    /// the bytecode VM over a generic numeric type. Kept off `PkNum` itself so `PkNum`
+    /// stays implementable outside the crate; every in-crate `PkNum` type has it.
+    pub trait VmNum: super::PkNum + VmArith + 'static {}
+    impl<T: super::PkNum + VmArith + 'static> VmNum for T {}
+
+    /// `VmArith` as the by-value operators, for types small enough that moving them
+    /// costs nothing worth saving.
+    macro_rules! impl_vm_by_value {
+        ($ty:ty, $lift:expr, $same:expr $(, $c:ident)* $(; $($extra:item)*)?) => {
+            impl<$(const $c: usize),*> VmArith for $ty {
+                $($($extra)*)?
+                #[inline]
+                fn add_in(&mut self, rhs: &Self) {
+                    *self = *self + *rhs;
+                }
+                #[inline]
+                fn sub_in(&mut self, rhs: &Self) {
+                    *self = *self - *rhs;
+                }
+                #[inline]
+                fn rsub_in(&mut self, rhs: &Self) {
+                    *self = *rhs - *self;
+                }
+                #[inline]
+                fn mul_in(&mut self, rhs: &Self) {
+                    *self = *self * *rhs;
+                }
+                #[inline]
+                fn div_in(&mut self, rhs: &Self) {
+                    *self = *self / *rhs;
+                }
+                #[inline]
+                fn add_scalar_in(&mut self, c: f64) {
+                    *self = *self + $lift(c);
+                }
+                #[inline]
+                fn sub_scalar_in(&mut self, c: f64) {
+                    *self = *self - $lift(c);
+                }
+                #[inline]
+                fn rsub_scalar_in(&mut self, c: f64) {
+                    *self = $lift(c) - *self;
+                }
+                #[inline]
+                fn mul_scalar_in(&mut self, c: f64) {
+                    *self = *self * $lift(c);
+                }
+                #[inline]
+                fn div_scalar_in(&mut self, c: f64) {
+                    *self = *self / $lift(c);
+                }
+                #[inline]
+                fn same_bits(&self, other: &Self) -> bool {
+                    $same(self, other)
+                }
+            }
+        };
+    }
+
+    impl_vm_by_value!(f64, |c: f64| c, |a: &f64, b: &f64| a.to_bits()
+        == b.to_bits();
+        const LANES: Option<Layout> = Some(Layout::F64);
+        const CONTIGUOUS: bool = true;
+    );
+    impl_vm_by_value!(Dual1<N>, Dual1::<N>::constant, Dual1::<N>::same_bits, N);
+    /// By-value `VmArith` for a type whose operators and `from_f64` are its own.
+    macro_rules! vm_ops_body {
+        ($same:expr) => {
+            #[inline]
+            fn add_in(&mut self, rhs: &Self) {
+                *self = *self + *rhs;
+            }
+            #[inline]
+            fn sub_in(&mut self, rhs: &Self) {
+                *self = *self - *rhs;
+            }
+            #[inline]
+            fn rsub_in(&mut self, rhs: &Self) {
+                *self = *rhs - *self;
+            }
+            #[inline]
+            fn mul_in(&mut self, rhs: &Self) {
+                *self = *self * *rhs;
+            }
+            #[inline]
+            fn div_in(&mut self, rhs: &Self) {
+                *self = *self / *rhs;
+            }
+            #[inline]
+            fn add_scalar_in(&mut self, c: f64) {
+                *self = *self + <Self as super::PkNum>::from_f64(c);
+            }
+            #[inline]
+            fn sub_scalar_in(&mut self, c: f64) {
+                *self = *self - <Self as super::PkNum>::from_f64(c);
+            }
+            #[inline]
+            fn rsub_scalar_in(&mut self, c: f64) {
+                *self = <Self as super::PkNum>::from_f64(c) - *self;
+            }
+            #[inline]
+            fn mul_scalar_in(&mut self, c: f64) {
+                *self = *self * <Self as super::PkNum>::from_f64(c);
+            }
+            #[inline]
+            fn div_scalar_in(&mut self, c: f64) {
+                *self = *self / <Self as super::PkNum>::from_f64(c);
+            }
+            #[inline]
+            fn same_bits(&self, other: &Self) -> bool {
+                ($same)(self, other)
+            }
+        };
+    }
+
+    /// The scalar reverse tape: the same value *and* the same tape node.
+    impl VmArith for crate::sens::rtape::R {
+        const RECORDS_TAPE: bool = true;
+        vm_ops_body!(
+            |a: &crate::sens::rtape::R, b: &crate::sens::rtape::R| a.v.to_bits() == b.v.to_bits()
+                && a.i == b.i
+        );
+    }
+
+    impl<const N: usize, B: VmNum> VmArith for crate::sens::rtape::DualT<N, B> {
+        const RECORDS_TAPE: bool = B::RECORDS_TAPE;
+        vm_ops_body!(|a: &Self, b: &Self| a.v.same_bits(&b.v)
+            && a.g.iter().zip(&b.g).all(|(x, y)| x.same_bits(y)));
+    }
+
+    impl<const N: usize, const M: usize, B: VmNum, const D: bool> VmArith
+        for crate::sens::rtape::DualH<N, M, B, D>
+    {
+        const RECORDS_TAPE: bool = B::RECORDS_TAPE;
+        vm_ops_body!(|a: &Self, b: &Self| a.v.same_bits(&b.v)
+            && a.g.iter().zip(&b.g).all(|(x, y)| x.same_bits(y))
+            && a.h.iter().zip(&b.h).all(|(x, y)| x.same_bits(y)));
+    }
+
+    /// Both tape modes of [`crate::sens::vtape::DualV`] (the macro takes `usize` consts only).
+    impl<const N: usize, const M: usize, const TH: bool> VmArith
+        for crate::sens::vtape::DualV<N, M, TH>
+    {
+        const RECORDS_TAPE: bool = true;
+        const LANES: Option<Layout> = Some(Layout {
+            n: N as u16,
+            m: M as u16,
+            th: TH,
+            wide: crate::sens::vtape::DualV::<N, M, TH>::WIDE,
+        });
+        #[inline]
+        fn native_ok(&self) -> bool {
+            !<Self as super::PkNum>::is_taped(*self)
+        }
+        #[inline]
+        fn put_lanes(&self, out: &mut [f64]) {
+            out[0] = self.v;
+            out[1..1 + N].copy_from_slice(&self.g);
+            out[1 + N..1 + N + M].copy_from_slice(&self.h);
+        }
+        #[inline]
+        fn from_lanes(l: &[f64]) -> Self {
+            let mut g = [0.0; N];
+            let mut h = [0.0; M];
+            g.copy_from_slice(&l[1..1 + N]);
+            h.copy_from_slice(&l[1 + N..1 + N + M]);
+            crate::sens::vtape::DualV::free(l[0], g, h)
+        }
+        #[inline]
+        fn tape_rhs(
+            kernel: &std::sync::Arc<dyn RhsKernel>,
+            u: &[Self],
+            params: &[Self],
+            seeds: &[Self; 4],
+            du: &mut [Self],
+        ) -> bool {
+            crate::sens::vtape::record_rhs(kernel, u, params, seeds, du)
+        }
+        #[inline]
+        fn add_in(&mut self, rhs: &Self) {
+            *self = *self + *rhs;
+        }
+        #[inline]
+        fn sub_in(&mut self, rhs: &Self) {
+            *self = *self - *rhs;
+        }
+        #[inline]
+        fn rsub_in(&mut self, rhs: &Self) {
+            *self = *rhs - *self;
+        }
+        #[inline]
+        fn mul_in(&mut self, rhs: &Self) {
+            *self = *self * *rhs;
+        }
+        #[inline]
+        fn div_in(&mut self, rhs: &Self) {
+            *self = *self / *rhs;
+        }
+        #[inline]
+        fn add_scalar_in(&mut self, c: f64) {
+            *self = self.add_c(c);
+        }
+        #[inline]
+        fn sub_scalar_in(&mut self, c: f64) {
+            *self = self.sub_c(c);
+        }
+        #[inline]
+        fn rsub_scalar_in(&mut self, c: f64) {
+            *self = self.rsub_c(c);
+        }
+        #[inline]
+        fn mul_scalar_in(&mut self, c: f64) {
+            *self = self.mul_c(c);
+        }
+        #[inline]
+        fn div_scalar_in(&mut self, c: f64) {
+            *self = self.div_c(c);
+        }
+        #[inline]
+        fn same_bits(&self, other: &Self) -> bool {
+            crate::sens::vtape::DualV::same_bits(self, other)
+        }
+    }
+
+    impl<const NA: usize, const N: usize> VmArith for DualMixed<NA, N> {
+        #[inline]
+        fn add_in(&mut self, rhs: &Self) {
+            DualMixed::add_in(self, rhs)
+        }
+        #[inline]
+        fn sub_in(&mut self, rhs: &Self) {
+            DualMixed::sub_in(self, rhs)
+        }
+        #[inline]
+        fn rsub_in(&mut self, rhs: &Self) {
+            DualMixed::rsub_in(self, rhs)
+        }
+        #[inline]
+        fn mul_in(&mut self, rhs: &Self) {
+            DualMixed::mul_in(self, rhs)
+        }
+        #[inline]
+        fn div_in(&mut self, rhs: &Self) {
+            DualMixed::div_in(self, rhs)
+        }
+        #[inline]
+        fn add_scalar_in(&mut self, c: f64) {
+            DualMixed::add_scalar_in(self, c)
+        }
+        #[inline]
+        fn sub_scalar_in(&mut self, c: f64) {
+            DualMixed::sub_scalar_in(self, c)
+        }
+        #[inline]
+        fn rsub_scalar_in(&mut self, c: f64) {
+            DualMixed::rsub_scalar_in(self, c)
+        }
+        #[inline]
+        fn mul_scalar_in(&mut self, c: f64) {
+            DualMixed::mul_scalar_in(self, c)
+        }
+        #[inline]
+        fn div_scalar_in(&mut self, c: f64) {
+            DualMixed::div_scalar_in(self, c)
+        }
+        #[inline]
+        fn same_bits(&self, other: &Self) -> bool {
+            DualMixed::same_bits(self, other)
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -346,5 +1055,80 @@ mod tests {
         // caller checks `val()` separately.
         assert!(PkNum::jets_finite(f64::NAN));
         assert!(PkNum::jets_finite(f64::INFINITY));
+    }
+
+    /// `PkNum::lift2`'s provided default (the second-order Taylor polynomial) for an
+    /// implementor outside this crate, which supplies only the required members: on a
+    /// second-order dual it reproduces the crate's own exact `lift2` (value, gradient and
+    /// Hessian), so adding the member broke no external implementor (#2093 review).
+    #[test]
+    fn lift2_default_is_exact_for_an_external_second_order_type() {
+        #[derive(Clone, Copy, Debug)]
+        struct Ext(Dual2<1>);
+        macro_rules! op {
+            ($tr:ident, $f:ident) => {
+                impl std::ops::$tr for Ext {
+                    type Output = Ext;
+                    fn $f(self, o: Ext) -> Ext {
+                        Ext(std::ops::$tr::$f(self.0, o.0))
+                    }
+                }
+            };
+        }
+        op!(Add, add);
+        op!(Sub, sub);
+        op!(Mul, mul);
+        op!(Div, div);
+        impl std::ops::Neg for Ext {
+            type Output = Ext;
+            fn neg(self) -> Ext {
+                Ext(-self.0)
+            }
+        }
+        macro_rules! un {
+            ($($f:ident),*) => { $(fn $f(self) -> Self { Ext(PkNum::$f(self.0)) })* };
+        }
+        impl PkNum for Ext {
+            const SECOND_ORDER: bool = true;
+            fn from_f64(x: f64) -> Self {
+                Ext(<Dual2<1> as PkNum>::from_f64(x))
+            }
+            fn var(x: f64, dim: usize) -> Self {
+                Ext(<Dual2<1> as PkNum>::var(x, dim))
+            }
+            fn val(self) -> f64 {
+                PkNum::val(self.0)
+            }
+            un!(exp, ln, sqrt, abs, inv_logit, logit, cos, acos, ln_gamma);
+            fn pow(self, e: Self) -> Self {
+                Ext(PkNum::pow(self.0, e.0))
+            }
+            fn guard_floor(self, lo: f64) -> Self {
+                Ext(PkNum::guard_floor(self.0, lo))
+            }
+            fn jets_finite(self) -> bool {
+                PkNum::jets_finite(self.0)
+            }
+        }
+        let x = <Dual2<1> as PkNum>::var(0.7, 0) * <Dual2<1> as PkNum>::var(0.7, 0);
+        let (v, d1, d2) = (0.3, -1.7, 2.9);
+        let want = PkNum::lift2(x, v, d1, d2);
+        let got = PkNum::lift2(Ext(x), v, d1, d2).0;
+        assert!(
+            (got.value - want.value).abs() < 1e-15,
+            "{got:?} vs {want:?}"
+        );
+        assert!(
+            (got.grad[0] - want.grad[0]).abs() < 1e-14,
+            "{got:?} vs {want:?}"
+        );
+        assert!(
+            (got.hess[0][0] - want.hess[0][0]).abs() < 1e-13,
+            "{got:?} vs {want:?}"
+        );
+        assert!(
+            want.hess[0][0].abs() > 1.0,
+            "a curved jet, so the d2 term is live"
+        );
     }
 }

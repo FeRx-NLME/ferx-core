@@ -3,16 +3,14 @@
 //!
 //! Tier 2 (fast, default PR job): wire-up and validation — estimating IMP runs,
 //! moves parameters (vs the evaluation-only path which leaves them fixed), may
-//! sit mid-chain, and refuses IOV models.
+//! sit mid-chain, and fits IOV models.
 //!
 //! Tier 3 (slow): warm-started end-to-end convergence on rich data. Plain IMP
 //! uses a one-iteration-*lagged* proposal (mode/variance found only on the first
-//! iteration), so on rich data — where the conditional posterior is razor-sharp
-//! — a cold start that takes large early steps moves the posterior past the
-//! lagged proposal and the ESS collapses. This is the documented rich-data
-//! weakness of `METHOD=IMP` (the reason NONMEM offers IMPMAP). The estimator is
-//! therefore exercised for convergence in its robust regime: sparse data, or
-//! warm-started from FOCEI where the per-iteration steps are tiny.
+//! iteration). A cold start on rich data used to collapse the ESS on iteration
+//! 2, which was read as the rich-data weakness of `METHOD=IMP`; it was the stale
+//! proposal mean after the mu-ref θ shift (#1365), pinned by
+//! `imp_cold_start_on_rich_data_does_not_collapse` below.
 //!
 //! The evaluation-only path (`imp_eval_only = true`, NONMEM `EONLY=1`) is covered
 //! in `importance_sampling_api.rs`.
@@ -135,6 +133,52 @@ fn imp_standalone_is_an_estimator_and_moves_parameters() {
     );
 }
 
+/// #1365: a **cold-start** IMP on rich warfarin must not collapse after the
+/// first moment update. IMP centres iteration k+1's proposal on iteration k's
+/// weighted η mean; the closed-form mu-ref step moves the packed θ by that
+/// population mean, so the posterior of η moves the other way. While the stored
+/// means were left stale the proposal sat several posterior SDs off from
+/// iteration 2 on and every subject went low-ESS.
+///
+/// Measured (macOS arm64, `ci-fast`) at these settings — 3 iterations, K = 300,
+/// seed 7: fixed, the marginal −2 log L at the final estimates is −286.23 and
+/// the Laplace `ofv` −285.93; with the recentre reverted they are +350.66 and
+/// +355.92. NONMEM `METHOD=IMP` on this model is −285.69
+/// (`warfarin_imp_nonmem.rs`). The −250 bound sits ~36 above the fixed result
+/// and ~600 below the collapsed one.
+#[test]
+fn imp_cold_start_on_rich_data_does_not_collapse() {
+    let (model, population) = warfarin();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    opts.run_covariance_step = false;
+    opts.method = EstimationMethod::Imp;
+    opts.imp_iterations = 3;
+    opts.imp_samples = 300;
+    opts.imp_averaging = 1;
+    opts.imp_seed = Some(7);
+    opts.imp_auto = false;
+
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("cold-start imp on warfarin must produce a fit");
+    let is = result
+        .importance_sampling
+        .as_ref()
+        .expect("estimating imp surfaces the marginal −2 log L");
+    // `< -250` is `false` for NaN, so a non-finite collapse fails here too.
+    assert!(
+        is.minus2_log_likelihood < -250.0,
+        "marginal −2 log L {} after 3 cold-start IMP iterations — the proposal \
+         recentre collapsed (#1365)",
+        is.minus2_log_likelihood
+    );
+    assert!(
+        result.ofv < -250.0,
+        "Laplace OFV {} after 3 cold-start IMP iterations (#1365)",
+        result.ofv
+    );
+}
+
 #[test]
 fn imp_eval_only_leaves_parameters_unchanged() {
     // The contrast case: `imp_eval_only = true` evaluates −2 log L at the fixed
@@ -171,7 +215,7 @@ fn imp_estimator_may_lead_a_chain() {
     opts.methods = vec![EstimationMethod::Imp, EstimationMethod::FoceI];
     opts.outer_maxiter = 25;
     let result = fit(&model, &population, &model.default_params, &opts)
-        .expect("methods = [imp, focei] must be allowed for estimating imp");
+        .expect("method = [imp, focei] must be allowed for estimating imp");
     assert_eq!(
         result.method_chain,
         vec![EstimationMethod::Imp, EstimationMethod::FoceI]
@@ -200,25 +244,26 @@ fn saem_then_imp_chain_runs() {
     assert!(result.ofv.is_finite());
 }
 
+/// Estimating IMP on an IOV model through the public `fit()` (#2301).
 #[test]
-fn imp_estimator_rejects_iov_models() {
+fn imp_estimator_fits_iov_models() {
     let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
         .expect("warfarin_iov model must parse");
-    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, None)
+    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
         .expect("warfarin_iov data must load");
     let mut opts = FitOptions::default();
     opts.verbose = false;
     opts.run_covariance_step = false;
     opts.method = EstimationMethod::Imp;
     opts.imp_iterations = 3;
+    opts.imp_samples = 100;
+    opts.imp_seed = Some(1);
 
-    let err = fit(&model, &population, &model.default_params, &opts)
-        .err()
-        .expect("estimating imp on an IOV model must be rejected (v1)");
-    assert!(
-        err.to_lowercase().contains("inter-occasion") || err.contains("IOV"),
-        "expected IOV-not-supported error, got: {err}"
-    );
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .unwrap_or_else(|e| panic!("estimating imp on an IOV model: {e}"));
+    let iov = result.omega_iov.as_ref().expect("Ω_IOV in the result");
+    assert!(iov[(0, 0)].is_finite() && iov[(0, 0)] > 0.0);
+    assert!(result.ofv.is_finite());
 }
 
 #[test]
@@ -231,7 +276,8 @@ fn imp_estimator_rejects_invalid_proposal_df() {
     opts.imp_proposal_df = 0.0;
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
-        .expect("imp_proposal_df = 0 must be rejected");
+        .expect("imp_proposal_df = 0 must be rejected")
+        .to_string();
     assert!(
         err.contains("proposal_df"),
         "expected proposal_df error, got: {err}"

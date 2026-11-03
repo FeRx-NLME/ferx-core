@@ -188,7 +188,8 @@ mod ctmm_smoke {
         // DV = 2 is not a declared state (states are coded 0/1).
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 2)])], 5);
         let err = fit(&model, &pop, &model.default_params, &smoke_opts())
-            .expect_err("DV = 2 on a CTMM CMT must be rejected");
+            .expect_err("DV = 2 on a CTMM CMT must be rejected")
+            .to_string();
         assert!(
             err.contains("cmt = 5"),
             "message should name the CMT, got: {err}"
@@ -277,7 +278,7 @@ mod ctmm_smoke {
         )))
         .is_ok());
 
-        // mCTMM / DTMM not yet supported.
+        // An mCTMM derives its transitions; listing them is refused (more in `mctmm_smoke`).
         assert!(parse_model_string(&wrap(
             "[markov_model]\n  type = mctmm\n  cmt = 5\n  states = [a=0, b=1]\n  transition a -> b = exp(LQ01)\n"
         ))
@@ -424,7 +425,35 @@ mod ctmm_smoke {
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
         let err = simulate(&model, &pop, &model.default_params, 1)
             .expect_err("simulate() must refuse this input");
-        assert!(err.contains("CTMM"), "unexpected Err: {err}");
+        assert!(err.to_string().contains("CTMM"), "unexpected Err: {err}");
+    }
+
+    /// `run_model_simulate` (`ferx --simulate`) refuses a CTMM model with the code
+    /// `simulate()` gives it, `E_CTMM_UNSUPPORTED` on `markov_model`, and its own text
+    /// (#1772, #2062 review N2). Mutation: put that refusal back on
+    /// `EngineError::uncoded` → `None`.
+    #[test]
+    fn ctmm_run_model_simulate_errs_with_the_ctmm_code() {
+        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        std::fs::write(
+            f.path(),
+            format!(
+                "{FIXED_MODEL}\n[simulation]\n  n_subjects = 2\n  dose_amt = 0\n  \
+                 dose_cmt = 1\n  seed = 7\n  times = [1, 2]\n"
+            ),
+        )
+        .unwrap();
+        let err = ferx_core::run_model_simulate(f.path().to_str().unwrap())
+            .err()
+            .expect("--simulate must refuse a CTMM model");
+        assert_eq!(err.code(), Some("E_CTMM_UNSUPPORTED"), "{err}");
+        assert_eq!(err.block(), Some("markov_model"));
+        assert!(
+            err.to_string().starts_with(
+                "[simulation]: a [markov_model] (CTMM) endpoint cannot be simulated yet"
+            ),
+            "{err}"
+        );
     }
 
     /// A live CTMM fit must still write an sdtab. CTMM observations are
@@ -466,7 +495,7 @@ mod ctmm_smoke {
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
         let err = predict(&model, &pop, &model.default_params)
             .expect_err("predict() must refuse this input");
-        assert!(err.contains("CTMM"), "unexpected Err: {err}");
+        assert!(err.to_string().contains("CTMM"), "unexpected Err: {err}");
     }
 
     /// #898: on the `_diag` / `_with_options` entry points the same two CTMM refusals are an
@@ -488,10 +517,11 @@ mod ctmm_smoke {
             Ok(out) => panic!("predict_diag accepted CTMM: {} rows", out.results.len()),
         };
         assert!(
-            err.contains("predict() does not support a [markov_model] (CTMM)"),
+            err.to_string()
+                .contains("predict() does not support a [markov_model] (CTMM)"),
             "{err}"
         );
-        assert!(err.contains("#820"), "{err}");
+        assert!(err.to_string().contains("#820"), "{err}");
 
         let opts = SimulateOptions {
             seed: Some(1),
@@ -500,11 +530,16 @@ mod ctmm_smoke {
         let err = simulate_with_options(&model, &pop, params, 1, &opts)
             .expect_err("simulate_with_options must refuse CTMM");
         assert!(
-            err.contains("does not support a [markov_model] (CTMM)"),
+            err.to_string()
+                .contains("does not support a [markov_model] (CTMM)"),
             "{err}"
         );
-        assert!(err.contains("no simulation path"), "{err}");
-        assert!(err.contains("CTMM simulation is a later slice."), "{err}");
+        assert!(err.to_string().contains("no simulation path"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("CTMM simulation is a later slice."),
+            "{err}"
+        );
     }
 
     /// Out-of-order CTMM observation times are rejected at fit setup (the datareader sorts
@@ -516,7 +551,8 @@ mod ctmm_smoke {
         // Times 2.0 then 1.0 on CMT 5 — decreasing.
         let pop = common::binary_pop(&[(0.0, vec![(2.0, 0), (1.0, 1)])], 5);
         let err = fit(&model, &pop, &model.default_params, &smoke_opts())
-            .expect_err("out-of-order CTMM times must be rejected");
+            .expect_err("out-of-order CTMM times must be rejected")
+            .to_string();
         assert!(
             err.contains("cmt = 5") && err.contains("non-decreasing"),
             "message should name the CMT and the constraint, got: {err}"
@@ -1402,5 +1438,192 @@ mod ctmm_smoke {
             }
             other => panic!("expected a Ctmm endpoint, got {other:?}"),
         }
+    }
+}
+
+/// Tier-2 tests for the minimal CTMM (`type = mctmm`, #2474): the parse surface and a short
+/// fit. The generator construction, the hand-written-CTMM reduction oracle and the dual-vs-FD
+/// parity are Tier-1 (`src/markov/endpoint.rs`); the NONMEM anchor is `tests/markov_nonmem.rs`.
+#[cfg(feature = "markov")]
+mod mctmm_smoke {
+    use ferx_core::parser::model_parser::parse_model_string;
+    use ferx_core::{fit_from_files, EndpointLikelihood, FitOptions};
+
+    const PARAMS: &str = "[parameters]\n  theta LTAU(0.5, -5.0, 5.0)\n  theta C1(-0.3, -10.0, 10.0)\n  theta LD2(0.2, -5.0, 5.0)\n";
+
+    fn block(body: &str) -> String {
+        format!("{PARAMS}\n[markov_model]\n  type = mctmm\n  cmt = 5\n{body}")
+    }
+
+    const GOOD: &str = "  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n  cutpoints = [C1, C1 + exp(LD2)]\n";
+
+    fn err_of(src: &str) -> String {
+        match parse_model_string(src) {
+            Ok(_) => panic!("expected a parse error for:\n{src}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// An mCTMM parses to a `Ctmm` endpoint with the adjacent-only generator: 2·(K−1)
+    /// transitions on K states, so the CTMM machinery serves it unchanged.
+    #[test]
+    fn mctmm_parses_to_a_tridiagonal_ctmm() {
+        let model = parse_model_string(&block(GOOD)).expect("mctmm parses");
+        match model.endpoints.get(&5) {
+            Some(EndpointLikelihood::Ctmm {
+                n_states,
+                state_codes,
+                generator_fn,
+                generator_program,
+                generator_states,
+                ..
+            }) => {
+                assert_eq!(*n_states, 3);
+                assert_eq!(state_codes, &vec![0, 1, 2]);
+                assert!(generator_states.is_empty(), "no ODE state ⇒ homogeneous");
+                assert!(
+                    generator_program.is_some(),
+                    "θ-only generator is dual-evaluable"
+                );
+                let q = generator_fn(&model.default_params.theta, &[], &Default::default(), &[]);
+                assert_eq!(q[(0, 2)], 0.0);
+                assert_eq!(q[(2, 0)], 0.0);
+                for j in 0..3 {
+                    assert!(q.row(j).sum().abs() < 1e-14, "row {j} must sum to zero");
+                    for k in 0..3 {
+                        if j != k && j.abs_diff(k) == 1 {
+                            assert!(q[(j, k)] > 0.0, "adjacent rate q[{j},{k}] must be live");
+                        }
+                    }
+                }
+            }
+            other => panic!("expected a Ctmm endpoint, got {other:?}"),
+        }
+        // Key order does not matter: `type` may come last.
+        let reordered = format!("{PARAMS}\n[markov_model]\n  cmt = 5\n{GOOD}  type = mctmm\n");
+        assert!(parse_model_string(&reordered).is_ok());
+    }
+
+    /// Every malformed mCTMM block is rejected with a message naming the problem.
+    #[test]
+    fn mctmm_parser_rejections() {
+        let e = err_of(&block(&format!(
+            "{GOOD}  transition none -> mild = exp(LTAU)\n"
+        )));
+        assert!(e.contains("remove the `transition` lines"), "{e}");
+
+        let e = err_of(&block(
+            "  states = [none=0, mild=1, severe=2]\n  cutpoints = [C1, C1 + exp(LD2)]\n",
+        ));
+        assert!(e.contains("requires `tau"), "{e}");
+
+        let e = err_of(&block(
+            "  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n",
+        ));
+        assert!(e.contains("requires `cutpoints"), "{e}");
+
+        let e = err_of(&block(
+            "  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n  cutpoints = [C1]\n",
+        ));
+        assert!(e.contains("3 states needs 2 cut-points; got 1"), "{e}");
+
+        // List order defines adjacency; codes that disagree with it are refused.
+        let e = err_of(&block(
+            "  states = [none=0, severe=2, mild=1]\n  tau = exp(LTAU)\n  cutpoints = [C1, C1 + exp(LD2)]\n",
+        ));
+        assert!(
+            e.contains("increasing code order") && e.contains("severe=2"),
+            "{e}"
+        );
+
+        let e = err_of(&block(
+            "  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n  cutpoints = C1\n",
+        ));
+        assert!(e.contains("bracketed list"), "{e}");
+
+        // mCTMM keys are refused on a plain CTMM, so they can never be silently ignored.
+        for (key, line) in [
+            ("tau", "  tau = exp(LTAU)\n"),
+            ("cutpoints", "  cutpoints = [C1]\n"),
+            ("lp", "  lp = C1\n"),
+        ] {
+            let src = format!(
+                "{PARAMS}\n[markov_model]\n  type = ctmm\n  cmt = 5\n  states = [a=0, b=1]\n  \
+                 transition a -> b = exp(LTAU)\n{line}"
+            );
+            let e = err_of(&src);
+            assert!(e.contains(&format!("`{key}` is a minimal-CTMM key")), "{e}");
+        }
+    }
+
+    /// A linear predictor reading an ODE state routes the mCTMM to the drug-driven `Q(t)`
+    /// occupancy-ODE path, exactly as the hand-written CTMM would.
+    #[test]
+    fn mctmm_drug_driven_lp_routes_to_the_inhomogeneous_path() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta LTAU(0.5, -5.0, 5.0)
+  theta C1(-0.3, -10.0, 10.0)
+  theta EMAX(0.5, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [s0=0, s1=1]
+  tau       = exp(LTAU)
+  cutpoints = [C1]
+  lp        = EMAX * central / V
+";
+        let model = parse_model_string(src).expect("drug-driven mctmm parses");
+        match model.endpoints.get(&5) {
+            Some(EndpointLikelihood::Ctmm {
+                generator_states,
+                generator_program,
+                ..
+            }) => {
+                assert_eq!(generator_states.len(), 1, "central drives Q(t)");
+                assert_eq!(generator_states[0].0, "central");
+                // The occupancy-ODE path differentiates the intensities through the dual
+                // state solve, so a drug-driven mCTMM keeps a program too, as a CTMM does.
+                assert!(
+                    generator_program.is_some(),
+                    "Q(t) keeps a dual-evaluable program for the occupancy ODE"
+                );
+            }
+            other => panic!("expected a Ctmm endpoint, got {other:?}"),
+        }
+    }
+
+    /// The example model reads its dataset and runs a short fit to a finite OFV.
+    #[test]
+    fn mctmm_example_fits() {
+        let res = fit_from_files(
+            "examples/mctmm_3state.ferx",
+            Some("data/mctmm_3state.csv"),
+            None,
+            Some(FitOptions {
+                outer_maxiter: 3,
+                ..Default::default()
+            }),
+        )
+        .expect("mctmm fit must return Ok");
+        assert!(res.ofv.is_finite(), "OFV must be finite, got {}", res.ofv);
     }
 }

@@ -87,9 +87,9 @@ The block refuses, by name:
 ## Estimation and reporting
 
 The transforms keep a model on ferx's analytic sensitivities: the kernel is one
-generic function, differentiated exactly by the same `Dual2` machinery as the
-closed-form PK, so FOCE/FOCEI get exact `∂/∂η` and `∂/∂θ` — including `∂/∂λ` —
-with no finite-difference fallback. A shaped ETA is not mu-referenced
+generic function, differentiated exactly by the same dual-number and reverse-tape
+machinery as the closed-form PK, so the FOCE/FOCEI adjoint gradient gets exact
+`∂/∂η` and `∂/∂θ` — including `∂/∂λ` — with no finite-difference fallback. A shaped ETA is not mu-referenced
 (`log CL = log TVCL + h(η)` has no closed-form typical-value shift), so SAEM
 updates its typical value and the shape θ in the numerical M-step.
 

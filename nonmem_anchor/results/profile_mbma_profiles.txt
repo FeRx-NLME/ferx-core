@@ -1,0 +1,26 @@
+# #1065 A2: NONMEM profile likelihood of the structural THETAs of profile_mbma.ctl.
+# Each row is a NONMEM FOCEI fit (anchor image nonmem:7.6.0-anchor) with that THETA FIXed
+# at the value shown and every other parameter re-estimated; `$COV` removed. The centre
+# row of each THETA is the first (SIGDIGITS=4) unconstrained fit. Runs:
+# ~/NONMEMruns/ferx-1065-profile-mbma/{et50_profile,profiles}.
+#
+# These are the reference for the structural standard errors. NONMEM's `$COV MATRIX=R`
+# is an FD R whose accuracy follows the estimation precision: at SIGDIGITS=4 it was 59%
+# below this curvature on ET50, at SIGL=12 (results/profile_mbma.ext) 9%. The centre
+# rows are the SIGDIGITS=4 fit's OBJ; the committed SIGL=12 fit's is 1.6e-8 lower.
+# theta value ofv
+TVE0 45.0461154 102.78492862188622
+TVE0 45.1961154 102.13312825984538
+TVE0 45.3461154 101.91151412167316
+TVE0 45.4961154 102.13176810997051
+TVE0 45.6461154 102.77388903618920
+EMAX 5.5541363 102.78519963656474
+EMAX 5.9541363 102.12752701954362
+EMAX 6.3541363 101.91151412167316
+EMAX 6.7541363 102.11727799362838
+EMAX 7.1541363 102.70384529672158
+ET50 1.4881645 102.05018724623642
+ET50 1.5881645 101.94381700651800
+ET50 1.6881645 101.91151415582489
+ET50 1.7881645 101.93974424694596
+ET50 1.8881645 102.01740594703865

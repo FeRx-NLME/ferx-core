@@ -428,39 +428,503 @@ fn time_varying_covariate_keeps_the_data_term() {
     assert!(g.needs_data_term);
 }
 
-#[test]
-fn resolve_drops_a_group_sharing_a_theta_with_another_etas_anchor() {
-    let src = r"
+// ── a group colliding with another eta's single-anchor pair (#1630) ─────────
+
+/// `CL`'s typical value reads `TVV1`, the plain single-anchor mu-reference of
+/// `ETA_V1` (sub-case B of #1630). Both mu's are linear in
+/// `β = (log TVV1, log TH_R, TH_WT)`: `mu_V1 = log TVV1`,
+/// `mu_CL = log TVV1 + log TH_R + TH_WT·log(WT/70)` — so the joint step has a
+/// closed-form answer to check against. `{tvv1_lo}` is `TVV1`'s lower bound,
+/// `{v1}` the right-hand side of `V1`.
+fn anchor_collision_model(tvv1_lo: &str, v1: &str) -> CompiledModel {
+    model(&format!(
+        r"
 [parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TH_WT(0.01, 0.0, 1.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V ~ 0.04
+  theta TVV1(40.0, {tvv1_lo}, 500.0)
+  theta TH_R(0.1, 0.001, 10.0)
+  theta TH_WT(0.6, -5.0, 5.0)
+  omega ETA_V1 ~ 0.15
+  omega ETA_CL ~ 0.2
   sigma EPS ~ 0.04 FIX
 
 [individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = (TVCL + TH_WT * CRCL) * exp(ETA_V)
+  V1 = {v1}
+  CL = TVV1 * TH_R * (WT / 70)^TH_WT * exp(ETA_CL)
 
 [structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
+  pk one_cpt_oral(cl=CL, v=V1, ka=1.0)
 
 [error_model]
   DV ~ proportional(EPS)
-";
-    let m = model(src);
-    assert_eq!(m.covariate_mu_refs.len(), 1, "the parser records the group");
-    let pop = pop_with_crcl(&[60.0, 90.0]);
-    let fixed = [false, false];
-    // (TVCL, ETA_CL) is the single-anchor pair of the *other* eta.
-    let (groups, notes) =
-        resolve_covariate_mu_groups(&m, &pop, &[(0, 0)], &fixed, &diag_omega(&[0.09, 0.04]));
-    assert!(groups.is_empty());
-    assert_eq!(notes.len(), 1);
+"
+    ))
+}
+
+/// The plain model of [`anchor_collision_model`].
+fn plain_anchor_collision_model() -> CompiledModel {
+    anchor_collision_model("1.0", "TVV1 * exp(ETA_V1)")
+}
+
+/// The pairs SAEM and IMP/IMPMAP hand the resolver, built the way they build
+/// them — not written by hand, so a change to the pair classification that
+/// stops listing the collision fails the premise assertions below instead of
+/// making these tests vacuous.
+fn estimator_pairs(m: &CompiledModel) -> Vec<(usize, usize)> {
+    let split = crate::estimation::saem::classify_mu_ref_pairs(m, &m.default_params.theta_lower);
+    crate::estimation::saem::mu_ref_pairs_for_cov_groups(&split)
+}
+
+const ABSORBED_JOINT_NOTE: &str = "mu-references on ETA_CL (reads TVV1, TH_R, TH_WT) and ETA_V1 \
+                                   (anchored on TVV1) share TVV1 and take one joint M-step that \
+                                   re-centres both (#1620, #1630).";
+
+/// Sub-case B of #1630. The collision is with a pair that **runs**, so the
+/// group does not decline any more: the pair joins it as a one-theta member,
+/// its closed-form shift is dropped (`group_etas` lists `ETA_V1`), and the one
+/// step moves `TVV1` with both etas re-centred. Before #1630 the group was
+/// declined and its covariate exponent sat on the η-frozen numerical M-step —
+/// measured on `two_cpt_oral_cov` at 150/250, `THETA_WT_V1` 0.68 / 1.07 / 0.63
+/// over three seeds against FOCEI's 0.577.
+///
+/// `TVV1` reaches the data through the two members only, so once both `φ_i`
+/// are frozen the data are constant in the group's thetas and the **exact**
+/// engine runs: the parser stops its reachability walk at the anchor's
+/// statement too (`read_outside_groups_and_anchors`). On `two_cpt_oral_cov`
+/// that reproduces the reparameterised control (`V1 = TVV1·…`) to every printed
+/// digit of OFV, where the prior-plus-data engine left `THETA_WT_V1` ~0.05 low.
+/// The notes are pinned whole: the generic "reaches the data outside these
+/// typical values" note would be false here, so it must not fire.
+#[test]
+fn a_running_anchor_sharing_a_theta_joins_the_group() {
+    let m = plain_anchor_collision_model();
+    let pairs = estimator_pairs(&m);
     assert!(
-        notes[0].contains("TVCL") && notes[0].contains("ETA_CL"),
+        pairs.contains(&(0, 0)),
+        "premise: (TVV1, ETA_V1) is a declared pair, got {pairs:?}"
+    );
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&m, &pop, &pairs, &[false; 3], &diag_omega(&[0.15, 0.2]));
+    assert_eq!(groups.len(), 1, "{notes:?}");
+    let g = &groups[0];
+    assert_eq!(g.eta_indices(), vec![1, 0]);
+    assert_eq!(group_etas(&groups), vec![1, 0]);
+    assert_eq!(g.theta_idx, vec![0, 1, 2]);
+    assert!(!g.needs_data_term, "{notes:?}");
+    assert_eq!(notes, vec![ABSORBED_JOINT_NOTE.to_string()]);
+    // The absorbed member's mu is `log TVV1`, whatever the covariates.
+    let theta = [37.0, 0.2, 0.7];
+    for s in &pop.subjects {
+        assert_eq!(g.members[1].mu(&theta, s), 37.0f64.ln());
+    }
+}
+
+/// The joint step with an absorbed anchor, against the generalised-least-
+/// squares optimum of the two prior terms computed here from the normal
+/// equations — a third computation, outside the engine. The group takes the
+/// exact engine (see [`a_running_anchor_sharing_a_theta_joins_the_group`]),
+/// which *is* that GLS fit. A step without the absorbed member's prior term (the group
+/// alone, as before #1630) cannot tell `log TVV1` from `log TH_R` — they enter
+/// `mu_CL` only as a sum — and lands elsewhere.
+#[test]
+fn the_absorbed_anchor_takes_the_joint_gls_step() {
+    let m = plain_anchor_collision_model();
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let omega = diag_omega(&[0.15, 0.2]);
+    let fixed = [false; 3];
+    let (groups, _) = resolve_covariate_mu_groups(&m, &pop, &estimator_pairs(&m), &fixed, &omega);
+    let g = &groups[0];
+    let start: [f64; 3] = [40.0, 0.1, 0.6];
+    let etas: Vec<Vec<f64>> = (0..pop.subjects.len())
+        .map(|i| {
+            let x = i as f64;
+            vec![
+                0.3 * (x + 1.0).sin() + 0.1,
+                0.25 * (2.0 * x + 1.0).cos() - 0.2,
+            ]
+        })
+        .collect();
+    // GLS over β = (log TVV1, log TH_R, TH_WT), rows (V1, CL), W = diag(1/ω²).
+    let (w_v, w_c) = (1.0 / 0.15, 1.0 / 0.2);
+    let mut a = DMatrix::<f64>::zeros(3, 3);
+    let mut b = nalgebra::DVector::<f64>::zeros(3);
+    for (s, eta) in pop.subjects.iter().zip(&etas) {
+        let wl = (s.covariates["WT"] / 70.0).ln();
+        let phi_v = start[0].ln() + eta[0];
+        let phi_c = start[0].ln() + start[1].ln() + start[2] * wl + eta[1];
+        let xv = nalgebra::DVector::from_vec(vec![1.0, 0.0, 0.0]);
+        let xc = nalgebra::DVector::from_vec(vec![1.0, 1.0, wl]);
+        a += w_v * &xv * xv.transpose() + w_c * &xc * xc.transpose();
+        b += w_v * phi_v * &xv + w_c * phi_c * &xc;
+    }
+    let beta = a.cholesky().unwrap().solve(&b);
+    let want = [beta[0].exp(), beta[1].exp(), beta[2]];
+    assert!(
+        (want[0] - start[0]).abs() > 1.0 && (want[2] - start[2]).abs() > 0.05,
+        "premise: the optimum is away from the start, got {want:?}"
+    );
+    let input = GroupStepInput {
+        theta: &start,
+        theta_lower: &m.default_params.theta_lower,
+        theta_upper: &m.default_params.theta_upper,
+        theta_fixed: &fixed,
+        theta_packs_log: &[true, true, false],
+        omega: &omega,
+        etas: &etas,
+    };
+    let got = g.solve_exact(&pop, &input).expect("solvable");
+    for (j, name) in ["TVV1", "TH_R", "TH_WT"].iter().enumerate() {
+        assert!(got[j].is_finite(), "{name} is not finite: {}", got[j]);
+        let rel = (got[j] - want[j]).abs() / want[j].abs().max(1.0);
+        assert!(
+            rel < ABSORBED_GLS_REL,
+            "{name}: step {} vs GLS {} (rel {rel:.2e})",
+            got[j],
+            want[j]
+        );
+    }
+}
+
+/// Relative agreement of the exact engine with the closed-form GLS optimum in
+/// [`the_absorbed_anchor_takes_the_joint_gls_step`]. Measured worst at the time
+/// of writing: 1.9e-11 (`TH_WT`; `TVV1` 8.9e-13, `TH_R` 3.6e-14), so 1e-9 keeps
+/// ~50× headroom. The pre-#1630 alternative of no anchor member is
+/// unidentified in `log TVV1` vs `log TH_R`, orders of magnitude outside it.
+const ABSORBED_GLS_REL: f64 = 1e-9;
+
+/// Sub-case A of #1630. `V1` reads `TVCL`, the anchor of `ETA_CL` — but
+/// `ETA_CL` has a covariate mu-reference of its own, which supersedes that
+/// pair, so the pair never runs and there is nothing to collide with. The two
+/// groups share the free `TVCL` and #1620's merge makes them one joint step
+/// with the exact engine (`TVCL` reaches the data through the two members
+/// only). Before #1630 the `V1` group was declined over the non-running pair
+/// and the `CL` group's step moved `TVCL` with `ETA_V1` frozen — 10–29 OFV
+/// units on `two_cpt_oral_cov`, `THETA_CRCL` 0.16–0.24 against 0.556.
+///
+/// The member list pins that the superseded pair is not also absorbed: a
+/// second `ETA_CL` member would re-centre that eta twice.
+#[test]
+fn a_superseded_anchor_is_not_a_collision() {
+    let m = model(
+        r"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TH_WT(0.6, 0.01, 5.0)
+  theta TH_R(10.0, 0.01, 500.0)
+  theta TH_WTV(0.6, 0.01, 5.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^TH_WT * exp(ETA_CL)
+  V1 = TVCL * TH_R * (WT / 70)^TH_WTV * exp(ETA_V1)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V1, ka=1.0)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+    );
+    let pairs = estimator_pairs(&m);
+    assert!(
+        pairs.contains(&(0, 0)),
+        "premise: (TVCL, ETA_CL) is a declared pair, got {pairs:?}"
+    );
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&m, &pop, &pairs, &[false; 4], &diag_omega(&[0.15, 0.15]));
+    assert_eq!(groups.len(), 1, "{notes:?}");
+    assert_eq!(groups[0].eta_indices(), vec![0, 1]);
+    assert_eq!(groups[0].theta_idx, vec![0, 1, 2, 3]);
+    assert!(!groups[0].needs_data_term, "{notes:?}");
+    assert_eq!(
+        notes,
+        vec![
+            "covariate mu-references on ETA_CL (reads TVCL, TH_WT) and ETA_V1 (reads TVCL, \
+             TH_R, TH_WTV) share TVCL and take one joint M-step that re-centres both (#1620)."
+                .to_string()
+        ]
+    );
+}
+
+/// A running pair that cannot join still declines the group, and says why —
+/// each reason on both sides of its gate, so a reason stuck on or off fails:
+///
+/// - `ETA_V1`'s variance below the floor declines; on the floor's other side
+///   the pair joins ([`a_running_anchor_sharing_a_theta_joins_the_group`]);
+/// - an additive anchor (`TVV1 + ETA_V1`, no log or logit scale, so the parser
+///   records no anchor for it) declines;
+/// - a `FIX`ed shared theta is no collision at all: no step moves it, so the
+///   group runs alone and nothing is absorbed.
+#[test]
+fn an_anchor_that_cannot_join_declines_the_group() {
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let m = plain_anchor_collision_model();
+    let pairs = estimator_pairs(&m);
+
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&m, &pop, &pairs, &[false; 3], &diag_omega(&[1e-4, 0.2]));
+    assert!(groups.is_empty(), "{notes:?}");
+    assert_eq!(
+        notes,
+        vec![
+            "covariate mu-reference on ETA_CL (typical value of CL reads TVV1, TH_R, TH_WT) is \
+             not used: TVV1 is also the mu-reference anchor of ETA_V1, whose random effect has \
+             negligible variance (ω² < 1e-3), so the two cannot take one joint M-step; TVV1, \
+             TH_R, TH_WT are estimated as if this mu-reference were absent (#619, #1630)."
+                .to_string()
+        ]
+    );
+
+    let additive = anchor_collision_model("1.0", "TVV1 + ETA_V1");
+    assert!(
+        additive.covariate_mu_refs[0].colliding_anchors.is_empty(),
+        "premise: no anchor is recorded for the additive form"
+    );
+    let (groups, notes) = resolve_covariate_mu_groups(
+        &additive,
+        &pop,
+        &[(0, 0)],
+        &[false; 3],
+        &diag_omega(&[0.15, 0.2]),
+    );
+    assert!(groups.is_empty(), "{notes:?}");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains(
+            "TVV1 is also the mu-reference anchor of ETA_V1, whose typical value is not a log- \
+             or logit-scale function of TVV1 alone, so the two cannot take one joint M-step"
+        ),
         "{}",
         notes[0]
+    );
+
+    // FIXed `TVV1`, on both sides of the anchor's own admissibility: with a
+    // joinable anchor nothing is absorbed, and with an unjoinable one (weak IIV)
+    // nothing is declined. Each cell kills a different one of the two FIX gates.
+    for var_v1 in [0.15, 1e-4] {
+        let (groups, notes) = resolve_covariate_mu_groups(
+            &m,
+            &pop,
+            &pairs,
+            &[true, false, false],
+            &diag_omega(&[var_v1, 0.2]),
+        );
+        assert_eq!(groups.len(), 1, "ω²(V1) = {var_v1}: {notes:?}");
+        assert_eq!(groups[0].eta_indices(), vec![1], "ω²(V1) = {var_v1}");
+        assert!(notes.is_empty(), "ω²(V1) = {var_v1}: {notes:?}");
+    }
+}
+
+/// Declines cascade. `V`'s group reads `TH_VWT`, which is also `KA`'s plain
+/// anchor, and `ETA_KA` has negligible IIV, so the group is declined — and that un-supersedes `ETA_V`'s own
+/// pair on `TVV`, which now runs. `CL`'s group reads `TVV` too, and the pair
+/// it now collides with cannot join (its statement is `V`'s two-theta typical
+/// value, not a single anchor), so `CL` must decline as well. Deciding
+/// collisions in one pass against the *initial* group set keeps `CL` and leaves
+/// `TVV` moved by both the group and the closed-form shift.
+#[test]
+fn a_declined_group_can_decline_another() {
+    let m = model(
+        r"
+[parameters]
+  theta TVV(40.0, 1.0, 500.0)
+  theta TH_VWT(0.6, 0.01, 5.0)
+  theta TH_C(0.1, 0.001, 10.0)
+  theta TH_CR(0.5, 0.01, 5.0)
+  omega ETA_V ~ 0.15
+  omega ETA_KA ~ 0.0001
+  omega ETA_CL ~ 0.15
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  V  = TVV * (WT / 70)^TH_VWT * exp(ETA_V)
+  KA = TH_VWT * exp(ETA_KA)
+  CL = TVV * TH_C * (CRCL / 100)^TH_CR * exp(ETA_CL)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+    );
+    let pairs = estimator_pairs(&m);
+    assert!(
+        pairs.contains(&(0, 0)) && pairs.contains(&(1, 1)),
+        "premise: (TVV, ETA_V) and (TH_VWT, ETA_KA) are declared pairs, got {pairs:?}"
+    );
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, notes) = resolve_covariate_mu_groups(
+        &m,
+        &pop,
+        &pairs,
+        &[false; 4],
+        &diag_omega(&[0.15, 1e-4, 0.15]),
+    );
+    assert!(
+        groups.is_empty(),
+        "both groups decline: {:?}",
+        groups.iter().map(|g| g.eta_indices()).collect::<Vec<_>>()
+    );
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(
+        notes[0].starts_with("covariate mu-reference on ETA_V ")
+            && notes[0].contains(
+                "TH_VWT is also the mu-reference anchor of ETA_KA, whose random \
+                                  effect has negligible variance"
+            ),
+        "{}",
+        notes[0]
+    );
+    assert!(
+        notes[1].starts_with("covariate mu-reference on ETA_CL ")
+            && notes[1].contains(
+                "TVV is also the mu-reference anchor of ETA_V, whose typical \
+                                  value is not a log- or logit-scale function of TVV alone"
+            ),
+        "{}",
+        notes[1]
+    );
+}
+
+/// Two covariate mu-references that both read the plain anchor's theta: one
+/// joint group of three, with the anchor taken in **once** — a second copy
+/// would re-centre `ETA_V2` twice per step.
+#[test]
+fn an_anchor_two_groups_collide_with_joins_once() {
+    let m = model(
+        r"
+[parameters]
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TH_R(0.5, 0.01, 50.0)
+  theta TH_WT(0.6, 0.01, 5.0)
+  theta TH_C(0.05, 0.001, 5.0)
+  theta TH_CR(0.5, 0.01, 5.0)
+  omega ETA_V2 ~ 0.08
+  omega ETA_V1 ~ 0.15
+  omega ETA_CL ~ 0.15
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  V2 = TVV2 * exp(ETA_V2)
+  V1 = TVV2 * TH_R * (WT / 70)^TH_WT * exp(ETA_V1)
+  CL = TVV2 * TH_C * (CRCL / 100)^TH_CR * exp(ETA_CL)
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=1.0, v2=V2)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+    );
+    let pairs = estimator_pairs(&m);
+    assert!(pairs.contains(&(0, 0)), "premise: {pairs:?}");
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, notes) = resolve_covariate_mu_groups(
+        &m,
+        &pop,
+        &pairs,
+        &[false; 5],
+        &diag_omega(&[0.08, 0.15, 0.15]),
+    );
+    assert_eq!(groups.len(), 1, "{notes:?}");
+    assert_eq!(groups[0].eta_indices(), vec![1, 2, 0]);
+    assert!(!groups[0].needs_data_term, "{notes:?}");
+}
+
+/// An absorbed anchor whose eta a second parameter also reads keeps the data
+/// term — re-centring `ETA_V1` to hold `φ_V1` moves `KA` — and the note names
+/// it as the anchor it is, not as a covariate mu-reference.
+#[test]
+fn an_absorbed_anchor_with_a_shared_eta_keeps_the_data_term() {
+    let m = model(
+        r"
+[parameters]
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TH_R(0.1, 0.001, 10.0)
+  theta TH_WT(0.6, -5.0, 5.0)
+  omega ETA_V1 ~ 0.15
+  omega ETA_CL ~ 0.2
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  V1 = TVV1 * exp(ETA_V1)
+  CL = TVV1 * TH_R * (WT / 70)^TH_WT * exp(ETA_CL)
+  KA = 1.0 * exp(0.5 * ETA_V1)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V1, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+    );
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, notes) = resolve_covariate_mu_groups(
+        &m,
+        &pop,
+        &estimator_pairs(&m),
+        &[false; 3],
+        &diag_omega(&[0.15, 0.2]),
+    );
+    assert_eq!(groups.len(), 1, "{notes:?}");
+    assert_eq!(groups[0].eta_indices(), vec![1, 0]);
+    assert!(groups[0].needs_data_term, "{notes:?}");
+    assert_eq!(
+        notes,
+        vec![
+            ABSORBED_JOINT_NOTE.to_string(),
+            "mu-reference on ETA_V1 (anchored on TVV1) keeps the observation term in its \
+             M-step: ETA_V1 is also read by another individual parameter, so re-centring it to \
+             hold this typical value's φ fixed changes that parameter's prediction (#619)."
+                .to_string()
+        ]
+    );
+}
+
+/// The add-back half of the reachability rule. `TVV1` declared with a negative
+/// lower bound is identity-packed, so its lognormal pair is not eligible for the
+/// closed form and SAEM / IMP never hand it to the resolver: no collision, no
+/// absorption, and the `CL` group runs alone. Then `V1`'s statement is **not**
+/// held by any frozen `φ_i`, `TVV1` reaches the data through it, and the group
+/// must keep the data term — although the parser's anchor-stopped walk
+/// (`read_outside_groups_and_anchors`) does not list `TVV1`. Without the
+/// add-back the group would take the exact engine and drop a live term.
+#[test]
+fn an_anchor_left_out_of_the_group_keeps_the_data_term() {
+    let m = anchor_collision_model("-1.0", "TVV1 * exp(ETA_V1)");
+    let spec = &m.covariate_mu_refs[0];
+    assert!(
+        spec.read_outside_groups_and_anchors.is_empty(),
+        "premise: the anchor-stopped walk sees no other route"
+    );
+    assert_eq!(
+        spec.colliding_anchors.len(),
+        1,
+        "premise: the anchor is recorded"
+    );
+    let pairs = estimator_pairs(&m);
+    assert!(
+        !pairs.iter().any(|&(_, e)| e == 0),
+        "premise: the identity-packed pair is not handed over, got {pairs:?}"
+    );
+    let pop = pop_with_wt_crcl(&wt_crcl_grid());
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&m, &pop, &pairs, &[false; 3], &diag_omega(&[0.15, 0.2]));
+    assert_eq!(groups.len(), 1, "{notes:?}");
+    assert_eq!(groups[0].eta_indices(), vec![1]);
+    assert!(groups[0].needs_data_term, "{notes:?}");
+    assert_eq!(
+        notes,
+        vec![
+            "covariate mu-reference on ETA_CL (reads TVV1, TH_R, TH_WT) keeps the observation \
+             term in its M-step: TVV1 also appear(s) elsewhere in the model, so freezing the \
+             individual parameter does not make the data independent of them (#619)."
+                .to_string()
+        ]
     );
 }
 

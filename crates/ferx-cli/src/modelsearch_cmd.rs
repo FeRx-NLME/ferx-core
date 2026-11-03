@@ -131,6 +131,9 @@ fn run_modelsearch_command(args: &[String]) -> Result<i32, String> {
                 }
                 None => eprintln!("Layer {layer}: no candidate passed the gate"),
             },
+            // Per-candidate lines (#2512) are for log sinks; the CLI keeps to
+            // one line per step.
+            _ => {}
         }
     };
 

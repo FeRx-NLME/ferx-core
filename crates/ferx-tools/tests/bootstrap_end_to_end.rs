@@ -15,7 +15,7 @@ use std::path::Path;
 use ferx_core::{fit, prepare_run, CancelFlag, FitOptions, PreparedRun};
 use ferx_tools::bootstrap::{
     flatten_estimates, params_from_estimates, resample, run_bootstrap, run_bootstrap_with_progress,
-    BootstrapError, BootstrapEvent, BootstrapOptions, Replicate, SampleSize,
+    BootstrapError, BootstrapEvent, BootstrapOptions, Replicate, ReplicateOutcome, SampleSize,
 };
 
 const MODEL: &str = "../../examples/warfarin.ferx";
@@ -212,7 +212,8 @@ fn a_replicate_that_railed_still_gets_a_delta_ofv() {
     let mut fitting = options.clone();
     fitting.outer_maxiter = 5;
     let err = fit(&p.parsed.model, &p.population, &rebuilt, &fitting)
-        .expect_err("a fitting run must still reject a start on the rail");
+        .expect_err("a fitting run must still reject a start on the rail")
+        .to_string();
     assert!(err.contains("ETA_CL"), "{err}");
 }
 
@@ -654,6 +655,111 @@ fn a_cancelled_run_stops_scheduling_and_resumes_into_the_uninterrupted_run() {
         raw_results_without_timings(whole_dir.path()),
         "a cancelled-and-resumed run is not the uninterrupted run"
     );
+}
+
+/// Each `ReplicateDone` names its sample and carries that sample's OFV and
+/// outcome, and each `DeltaOfvDone` its sample's Δofv (#2512) — the detail a
+/// line-per-sample log prints.
+///
+/// Run as a resume of a run cancelled after its first replicate, so the
+/// samples this run fits (2 and 3) are not its completion counts (1 and 2): a
+/// `sample` that reported the count instead of the index fails here, where on
+/// a fresh single-threaded run the two coincide.
+#[test]
+fn replicate_events_carry_the_sample_its_ofv_and_its_outcome() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let flag = CancelFlag::new();
+    let stop = |event: BootstrapEvent| {
+        if matches!(event, BootstrapEvent::ReplicateDone { .. }) {
+            flag.cancel();
+        }
+    };
+    let _ = run_bootstrap_with_progress(
+        &p,
+        &BootstrapOptions {
+            cancel: Some(flag.clone()),
+            dofv: true,
+            ..resume_options(dir.path())
+        },
+        Some(&stop),
+    )
+    .expect_err("cancelled");
+
+    let seen: std::sync::Mutex<Vec<BootstrapEvent>> = std::sync::Mutex::new(Vec::new());
+    let sink = |event: BootstrapEvent| seen.lock().unwrap().push(event);
+    let resumed = run_bootstrap_with_progress(
+        &p,
+        &BootstrapOptions {
+            resume: true,
+            dofv: true,
+            ..resume_options(dir.path())
+        },
+        Some(&sink),
+    )
+    .expect("the resume runs");
+    assert_eq!(resumed.n_reused, 1, "premise: sample 1 is reused");
+    let by_sample = |sample: usize| {
+        resumed
+            .replicates
+            .iter()
+            .find(|r| r.index == sample)
+            .unwrap_or_else(|| panic!("no replicate {sample}"))
+    };
+
+    let seen = seen.lock().unwrap().clone();
+    let replicates: Vec<_> = seen
+        .iter()
+        .filter_map(|e| match *e {
+            BootstrapEvent::ReplicateDone {
+                completed,
+                sample,
+                ofv,
+                outcome,
+                skipped,
+                ..
+            } => Some((completed, sample, ofv, outcome, skipped)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replicates.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(),
+        [(1, 2), (2, 3)],
+        "one event per fitted sample, named by index rather than by count"
+    );
+    for &(_, sample, ofv, outcome, skipped) in &replicates {
+        let r = by_sample(sample);
+        assert!(r.error.is_none(), "premise: sample {sample} fitted");
+        let ofv = ofv.expect("a fitted replicate reports its OFV");
+        assert!(ofv.is_finite());
+        assert_eq!(ofv.to_bits(), r.ofv.to_bits(), "sample {sample}");
+        // The outcome agrees with the row `raw_results.csv` writes: a
+        // two-iteration fit has not converged, and has moved off its start.
+        assert!(!r.converged, "premise: sample {sample} did not converge");
+        assert_eq!(outcome, ReplicateOutcome::NotConverged, "sample {sample}");
+        // …and the default `skip_minimization_terminated` leaves it out of the
+        // summary, which the event says rather than leaving the sink to guess.
+        assert_eq!(skipped, Some("minimization terminated"), "sample {sample}");
+    }
+
+    let mut deltas: Vec<(usize, Option<f64>)> = seen
+        .iter()
+        .filter_map(|e| match *e {
+            BootstrapEvent::DeltaOfvDone { sample, dofv, .. } => Some((sample, dofv)),
+            _ => None,
+        })
+        .collect();
+    deltas.sort_by_key(|d| d.0);
+    // The Δofv sweep covers every replicate, the reused one included.
+    assert_eq!(deltas.iter().map(|d| d.0).collect::<Vec<_>>(), [1, 2, 3]);
+    for (sample, dofv) in deltas {
+        let want = by_sample(sample).delta_ofv.expect("a Δofv");
+        let got = dofv.expect("an evaluated replicate reports its Δofv");
+        assert!(got.is_finite());
+        assert_eq!(got.to_bits(), want.to_bits(), "sample {sample}");
+    }
 }
 
 /// A cancel that lands *during* the base fit is a cancellation, not a failure.
@@ -1359,4 +1465,117 @@ fn dofv_is_non_negative_and_written_out() {
     let written = std::fs::read_to_string(dir.path().join("delta_ofv.csv")).expect("delta_ofv.csv");
     assert!(written.starts_with("sample,delta_ofv"));
     assert_eq!(written.lines().count(), 3, "header + one row per replicate");
+}
+
+/// #2506: a bootstrap replicate started at the base fit's estimates (`update_inits`,
+/// PsN's default) that sits at the optimum itself must be kept, not dropped as
+/// "minimization terminated". The identity resample is that replicate exactly: its
+/// population is the original, so the base estimates are its MLE and the fit cannot
+/// move. Before #2506 the warm BOBYQA fit came back `converged = false` (its plateau
+/// check required the fit to have left its start), so `skip_minimization_terminated`
+/// threw it out. The replicate is built the way `run_bootstrap` builds one — the
+/// start through `flatten_estimates` → `params_from_estimates`, the population through
+/// `resample::build_population` — and judged by the bootstrap's own filter.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: two FOCEI fits to convergence; opt in with --features slow-tests"
+)]
+fn a_replicate_started_at_its_own_optimum_is_not_excluded() {
+    use ferx_core::Optimizer;
+    use ferx_tools::bootstrap::{summary::exclusion_reason, ReplicateResult};
+
+    let p = prepare_run(
+        "../../examples/two_cpt_iv.ferx",
+        Some("../../data/two_cpt_iv.csv"),
+    )
+    .expect("two_cpt_iv model + data load");
+    let mut options = p.parsed.fit_options.clone();
+    options.optimizer = Optimizer::Bobyqa;
+    options.run_covariance_step = false;
+    options.verbose = false;
+    options.threads = Some(1);
+    options.checkpoint = false;
+
+    let base = fit(&p.parsed.model, &p.population, &p.init_params, &options).expect("base fit");
+    assert!(
+        base.converged,
+        "fixture precondition: the base fit converges"
+    );
+
+    let start = params_from_estimates(&p.init_params, &flatten_estimates(&p.init_params, &base));
+    let identity = Replicate {
+        index: 1,
+        keys: (0..p.population.subjects.len()).collect(),
+    };
+    let population = resample::build_population(&p.population, &identity);
+    let warm = fit(&p.parsed.model, &population, &start, &options).expect("replicate fit");
+
+    assert_eq!(
+        warm.left_init,
+        Some(false),
+        "fixture precondition: a replicate started at its own optimum does not move"
+    );
+    assert!(warm.stationary_start, "{:?}", warm.warnings);
+    assert!(
+        (warm.ofv - base.ofv).abs() < 1e-3,
+        "replicate {} vs base {}",
+        warm.ofv,
+        base.ofv
+    );
+    let replicate = ReplicateResult {
+        index: 1,
+        estimates: flatten_estimates(&p.init_params, &warm),
+        standard_errors: None,
+        ofv: warm.ofv,
+        converged: warm.converged,
+        estimate_near_boundary: ferx_core::estimate_near_boundary(&warm),
+        covariance_step_successful: false,
+        covariance_step_warnings: false,
+        seconds: 0.0,
+        error: None,
+        delta_ofv: None,
+    };
+    assert_eq!(
+        exclusion_reason(&replicate, &BootstrapOptions::default()),
+        None,
+        "the replicate must be kept; warnings {:?}",
+        warm.warnings
+    );
+}
+
+/// The other side of the `skipped` gate: the same non-converged replicate,
+/// under options that keep non-converged fits, is not skipped. Without this
+/// half, an event that always said "minimization terminated" for an
+/// unconverged fit would pass the test above.
+#[test]
+fn a_replicate_is_skipped_only_when_the_exclusion_filters_say_so() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let seen: std::sync::Mutex<Vec<BootstrapEvent>> = std::sync::Mutex::new(Vec::new());
+    let sink = |event: BootstrapEvent| seen.lock().unwrap().push(event);
+    run_bootstrap_with_progress(
+        &p,
+        &BootstrapOptions {
+            samples: 1,
+            run_base_model: false,
+            skip_minimization_terminated: false,
+            ..resume_options(dir.path())
+        },
+        Some(&sink),
+    )
+    .expect("the run succeeds");
+    let done: Vec<_> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match *e {
+            BootstrapEvent::ReplicateDone {
+                outcome, skipped, ..
+            } => Some((outcome, skipped)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(done, [(ReplicateOutcome::NotConverged, None)]);
 }

@@ -1,0 +1,32 @@
+# ferx twin of init_seed_tie_ofv_{a,b}.ctl (#2121): η on the `init()` seed, evaluated at
+# NONMEM's fixed parameters (`maxiter = 0`). Every subject starts with an EVID=2 row and
+# then a co-timed observation carrying a different WT; arm a's NONMEM objective needs the
+# EVID=2 row's WT in the seed, arm b (both rows 2·WT) is the control.
+
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVBASE(10.0, 0.0, 1e15)
+  omega ETA_B ~ 0.09
+  sigma PROP ~ 0.01
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  BASE = TVBASE * WT * exp(ETA_B)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central)  = BASE
+  d/dt(central)  = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

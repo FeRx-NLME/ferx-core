@@ -69,7 +69,7 @@ fn tracked_files(root: &Path, extension: &str) -> Vec<PathBuf> {
 }
 
 /// The `[fit_options]` spellings of each method, as the parser accepts them.
-/// A copy of `parse_method_token`'s arms, which is private — so
+/// A copy of `parse_method_token`'s arms, so
 /// `the_method_aliases_are_the_parsers` pins the copy against the parser.
 const IMP_TOKENS: [&str; 3] = ["imp", "importance_sampling", "importance-sampling"];
 const IMPMAP_TOKENS: [&str; 3] = [

@@ -461,7 +461,8 @@ fn multiple_zero_order_rejected_on_simulate_path() {
     let path = tmp.path().join("biphasic_zero_order_sim.ferx");
     std::fs::write(&path, src).expect("write model");
     let err = ferx_core::run_model_simulate(path.to_str().unwrap())
-        .expect_err("biphasic zero-order must be rejected on the simulate path");
+        .expect_err("biphasic zero-order must be rejected on the simulate path")
+        .to_string();
     assert!(
         err.contains("zero-order input-rate terms") && err.contains("compartment 1"),
         "the simulate path must surface the biphasic-zero-order rejection, got: {err}"

@@ -273,9 +273,9 @@ impl NnGradPlan {
 /// snapshot.
 ///
 /// Comparing `Option<f64>` rather than `f64` is deliberate — a name present in
-/// one snapshot and absent from another is a genuine difference, because
-/// `NamedMlpMapper::forward_raw` substitutes the centered origin for an absent
-/// input. Exact `f64` equality is the right test for the same reason
+/// one snapshot and absent from another is treated as a difference. It need not
+/// be one (`NamedMlpMapper::forward_raw` reads an absent input as `0.0`, so absent
+/// and an explicit `0.0` agree), but treating it as one is only conservative. Exact `f64` equality is the right test for the same reason
 /// [`Subject::time_varying_covariate_names`] uses it: snapshots are LOCF copies
 /// of one parsed value, so an unchanged covariate is bit-identical.
 ///
@@ -283,7 +283,7 @@ impl NnGradPlan {
 /// `subject_needs_per_event_pk`, is what keeps this predicate honest: it stays
 /// correct regardless of which prediction path the subject ends up on.
 #[cfg(feature = "nn")]
-fn static_nn_input_map<'a>(
+pub(crate) fn static_nn_input_map<'a>(
     subject: &'a Subject,
     input_names: &[String],
 ) -> Option<&'a HashMap<String, f64>> {

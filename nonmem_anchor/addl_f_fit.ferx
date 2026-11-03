@@ -1,0 +1,24 @@
+# ferx twin (analytic) of nonmem_anchor/addl_f.ctl (#1909): an ADDL-implied dose takes F
+# from the record that ends its interval. Parameters fixed at the .ctl's values, evaluated
+# once (maxiter = 0) by tests/record_clock_nonmem_anchor.rs, which compares PRED.
+[parameters]
+  theta TVCL(0.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.01
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = 1 / X
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+[covariates]
+  X continuous
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method = foce
+  maxiter = 0
+  covariance = false

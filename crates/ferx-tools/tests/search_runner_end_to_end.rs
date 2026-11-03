@@ -336,7 +336,7 @@ const BLOQ_DATA: &str = "../../data/warfarin_bloq.csv";
 
 fn bloq_options(base: &FitOptions, bloq: BloqMethod) -> FitOptions {
     let mut o = eval_options(base);
-    o.bloq_method = bloq;
+    o.bloq_method = Some(bloq);
     o
 }
 
@@ -353,11 +353,11 @@ fn direct_bloq_ofv(bloq: BloqMethod) -> f64 {
 
 #[test]
 fn a_bloq_override_reaches_the_censored_likelihood_in_both_directions() {
-    // `bloq_method` is one of the two keys the engine reads off the *model*
-    // rather than off `FitOptions`, and parsing stamps the candidate file's
-    // value there. A `RunOptions::fit_options` override that only landed in the
-    // options would report the requested convention and score the other one's
-    // likelihood — a wrong ranking, silently.
+    // Parsing stamps the candidate file's `bloq_method` onto the model. Before
+    // #1824 the engine read it there, so a `RunOptions::fit_options` override
+    // that only landed in the options would report the requested convention and
+    // score the other one's likelihood — a wrong ranking, silently. `fit` now
+    // honours the options' value per call; this pins that it wins either way.
     let p = prepare_run(BLOQ_MODEL, Some(BLOQ_DATA)).expect("bloq model + data load");
     let m3 = direct_bloq_ofv(BloqMethod::M3);
     let dropped = direct_bloq_ofv(BloqMethod::Drop);
@@ -418,6 +418,62 @@ fn a_bloq_override_reaches_the_censored_likelihood_in_both_directions() {
             "{label}: the fit scored OFV {got}, the requested convention gives {want}"
         );
     }
+}
+
+/// #1824: caller options that set **no** `bloq_method` still replace the file's
+/// settings wholesale, so an `m3` candidate runs under the default `drop` — what
+/// the runner did when it stamped `base.bloq_method` (then a plain `Drop`) onto
+/// the model. `None` alone would mean "the model's own method", and the parser
+/// leaves the file's `m3` there; the runner's pin is what keeps the old answer.
+///
+/// Mutation: delete the pin in `compile_and_fit` → the fit scores M3.
+#[test]
+fn caller_options_with_no_bloq_method_replace_the_files_m3_with_drop() {
+    let p = prepare_run(BLOQ_MODEL, Some(BLOQ_DATA)).expect("bloq model + data load");
+    assert_eq!(
+        p.parsed.fit_options.bloq_method,
+        Some(BloqMethod::M3),
+        "the candidate file must say m3, or the pin is not exercised"
+    );
+    let dropped = direct_bloq_ofv(BloqMethod::Drop);
+    let m3 = direct_bloq_ofv(BloqMethod::M3);
+    assert_ne!(
+        m3.to_bits(),
+        dropped.to_bits(),
+        "M3 and drop agree on this data"
+    );
+
+    // The file's own settings with the key removed, so the drop reference — the
+    // same settings with `drop` stamped — differs from this run in nothing else.
+    let mut given = eval_options(&p.parsed.fit_options);
+    given.bloq_method = None;
+    let text = ModelText::parse(&std::fs::read_to_string(BLOQ_MODEL).expect("read the model"))
+        .expect("parse the model");
+    let report = Runner::new()
+        .threads(1)
+        .run(
+            &[Candidate::new("candidate", text)],
+            &p.population,
+            &RunOptions {
+                criterion: Criterion::Ofv,
+                strictness: Strictness::none(),
+                n_starts: 1,
+                resume: false,
+                fit_options: Some(given),
+            },
+        )
+        .expect("run");
+    let fit = report.results[0]
+        .fit
+        .as_ref()
+        .unwrap_or_else(|| panic!("no fit — {:?}", report.results[0].error));
+    assert_eq!(fit.bloq_method, "drop", "reported method");
+    assert_eq!(
+        fit.ofv.to_bits(),
+        dropped.to_bits(),
+        "the fit scored OFV {}, drop gives {dropped}, m3 gives {m3}",
+        fit.ofv
+    );
 }
 
 #[test]

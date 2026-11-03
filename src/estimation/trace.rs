@@ -285,15 +285,30 @@ pub fn finish() -> Option<String> {
     })
 }
 
-/// Write one FOCE/FOCEI trace row.
+/// The `method` column of a FOCE-family outer-loop row: the objective that row scores,
+/// not the method's name alone. `laplace` at one quadrature node, `agq` above one (a
+/// `laplace` or `focei` fit with `n_agq > 1`), otherwise `focei` / `foce` by the
+/// interaction the stage resolves. The one label the unprofiled NLopt and BFGS loops and
+/// the profiled loop all write (#2552).
+pub(crate) fn method_label(options: &crate::types::FitOptions) -> &'static str {
+    match options.agq_nodes() {
+        Some(1) => "laplace",
+        Some(_) => "agq",
+        None if crate::types::interaction_for(options.method, options.interaction) => "focei",
+        None => "foce",
+    }
+}
+
+/// Write one FOCE/FOCEI/Laplace/AGQ trace row.
 ///
-/// `method`           — "foce" or "focei" (may be overridden by `set_overrides`)
+/// `method`           — `method_label`'s "foce", "focei", "laplace" or "agq" (may be
+///                      overridden by `set_overrides`)
 /// `ofv`              — current OFV
 /// `grad_norm`        — L2 norm of the gradient (None for derivative-free optimizers)
 /// `step_norm`        — L2 norm of the parameter step (None when unavailable)
 /// `optimizer`        — optimizer name string, e.g. "slsqp", "bobyqa", "bfgs"
 /// `n_ebe_unconverged`— subjects that did not meet EBE tolerance (None = unavailable)
-/// `n_ebe_fallback`   — subjects that used Nelder-Mead fallback (None = unavailable)
+/// `n_ebe_fallback`   — subjects whose returned EBE is a fallback's point (None = unavailable)
 ///
 /// `values`           — per-coordinate estimates, natural scale (packed order)
 /// `grads`            — per-coordinate gradient, scaled space (None for
@@ -338,7 +353,7 @@ pub fn write_foce(
 /// `method`           — "gn" or "gn_hybrid"
 /// `phase`            — "" for pure GN, "gn" for GN phase of hybrid
 /// `n_ebe_unconverged`— subjects that did not meet EBE tolerance (None = unavailable)
-/// `n_ebe_fallback`   — subjects that used Nelder-Mead fallback (None = unavailable)
+/// `n_ebe_fallback`   — subjects whose returned EBE is a fallback's point (None = unavailable)
 #[allow(clippy::too_many_arguments)]
 pub fn write_gn(
     iter: usize,

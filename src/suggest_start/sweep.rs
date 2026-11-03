@@ -6,7 +6,8 @@
 use nalgebra::DVector;
 use rayon::prelude::*;
 
-use crate::api::predict;
+use crate::api::predict_diag_undrained;
+use crate::diagnostics::EngineError;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::suggest_start::find_theta_for_slot;
 use crate::types::{CompiledModel, ModelParameters, Population};
@@ -18,12 +19,17 @@ use crate::types::{CompiledModel, ModelParameters, Population};
 ///
 /// `Err` is `predict()`'s precondition refusal, passed up so `inits_from_nca` returns it
 /// rather than panicking mid-sweep (#898).
+///
+/// Predicts through the non-draining `predict_diag_undrained`, not `predict()`: the sweep runs
+/// inside `fit()`'s SS-sink window, once per start of a multi-start fit and concurrently with
+/// the other starts' objective passes, so a draining `predict()` would delete their
+/// steady-state non-convergence notes (#1652 review r1 #1).
 fn rrmse(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Result<f64, String> {
-    let preds = predict(model, population, params)?;
+) -> Result<f64, EngineError> {
+    let preds = predict_diag_undrained(model, population, params)?.results;
 
     // Build (pred, obs) pairs — preds are returned in the same subject/time order as
     // population.subjects[i].obs_times.
@@ -78,7 +84,7 @@ pub fn sweep_slots(
     n_pts: usize,
     factor: f64,
     label: &str,
-) -> Result<(ModelParameters, Vec<String>), String> {
+) -> Result<(ModelParameters, Vec<String>), EngineError> {
     let mut warnings = Vec::new();
 
     let idx_a = find_theta_for_slot(model, slot_a);
@@ -139,7 +145,7 @@ pub fn sweep_unwritten_thetas(
     targets: &[usize],
     n_pts: usize,
     factor: f64,
-) -> Result<(ModelParameters, Vec<String>), String> {
+) -> Result<(ModelParameters, Vec<String>), EngineError> {
     if targets.is_empty() {
         return Ok((base.clone(), Vec::new()));
     }
@@ -400,6 +406,42 @@ mod tests {
         assert!(
             r.is_infinite() && r > 0.0,
             "empty population must give +∞ rRMSE, got {r}"
+        );
+    }
+
+    /// #1652 review r1 #1: the sweep runs inside `fit()`'s SS-sink window, once per start of a
+    /// multi-start fit and concurrently with the other starts' objective passes, so it must not
+    /// clear or drain the process-global sink — a note already there when `rrmse` runs must
+    /// still be there for `fit()`'s own take.
+    ///
+    /// Asserted on this thread's drain counter, not on the sink (#2071): a note written into the
+    /// sink and read back after `rrmse` races every concurrently-running lib test that calls a
+    /// draining `api` entry point, since each clears the sink on entry. Every draining entry
+    /// point clears on the thread that called it, so the counter sees exactly the drains `rrmse`
+    /// itself caused.
+    ///
+    /// Mutation: `rrmse` predicting through `crate::api::predict` (which clears and drains) kills
+    /// this.
+    #[test]
+    fn rrmse_does_not_drain_the_ss_nonconvergence_sink() {
+        let (model, population) = warfarin();
+        let before = crate::dosing::ss_sink_drains_on_this_thread();
+        rrmse(&model, &population, &model.default_params).expect("rrmse runs");
+        let drains = crate::dosing::ss_sink_drains_on_this_thread() - before;
+        assert_eq!(
+            drains, 0,
+            "the sweep's predictor cleared or drained the SS sink {drains} time(s), deleting any \
+             note the enclosing fit had written"
+        );
+
+        // The other side of the gate: the draining entry point the mutation would route
+        // through does move the counter on this thread, so a zero above is not vacuous.
+        let before = crate::dosing::ss_sink_drains_on_this_thread();
+        crate::api::predict(&model, &population, &model.default_params).expect("predict runs");
+        assert!(
+            crate::dosing::ss_sink_drains_on_this_thread() > before,
+            "`api::predict` must register its clear on the calling thread, or this test cannot \
+             see a draining predictor"
         );
     }
 

@@ -1,0 +1,75 @@
+$PROBLEM ferx #1081 naproxen MBMA, combined error, within-arm correlation ar1 rho=-0.4 EVAL FOCEI
+; Data: napx1081.csv. R_jk = C_jk (f_j f_k THETA(9)^2 + WPSE_j WPSE_k)
+$INPUT ID ARM TIME DV TRT FLARE WPSE MDV L2 VIS T1 T2 T3 T4 T5
+$DATA napx1081.csv IGNORE=@
+$PRED
+  E0   = THETA(1) + THETA(4)*FLARE + ETA(1)
+  EMAX = THETA(2) + THETA(5)*FLARE + THETA(6)*TRT + ETA(2)
+  ET50 = THETA(3)*EXP(THETA(7)*TRT)
+  EFF  = EMAX*TIME/(TIME + ET50)
+  F    = E0 - EFF
+  RHO  = THETA(8)
+
+; discrete AR(1) on the visit index: L[j,k] = rho^(j-k) * s_k, s_1 = 1, s_k = sqrt(1-rho^2)
+  SR = SQRT(1 - RHO*RHO)
+  P1 = RHO
+  P2 = RHO*RHO
+  P3 = P2*RHO
+  P4 = P3*RHO
+  L1=0
+  L2C=0
+  L3=0
+  L4=0
+  L5=0
+  IF (VIS.EQ.1) L1 = 1
+  IF (VIS.EQ.2) THEN
+    L1 = P1
+    L2C = SR
+  ENDIF
+  IF (VIS.EQ.3) THEN
+    L1 = P2
+    L2C = P1*SR
+    L3 = SR
+  ENDIF
+  IF (VIS.EQ.4) THEN
+    L1 = P3
+    L2C = P2*SR
+    L3 = P1*SR
+    L4 = SR
+  ENDIF
+  IF (VIS.EQ.5) THEN
+    L1 = P4
+    L2C = P3*SR
+    L3 = P2*SR
+    L4 = P1*SR
+    L5 = SR
+  ENDIF
+
+  RESP = L1*EPS(1) + L2C*EPS(2) + L3*EPS(3) + L4*EPS(4) + L5*EPS(5)
+  RESA = L1*EPS(6) + L2C*EPS(7) + L3*EPS(8) + L4*EPS(9) + L5*EPS(10)
+  IPRED = F
+  Y = F + F*THETA(9)*RESP + WPSE*RESA
+$THETA
+  5.1972 FIX
+  1.158 FIX
+  0.6901 FIX
+  0.9629 FIX
+  0.8197 FIX
+  0.793 FIX
+  -1.1747 FIX
+  (-0.99, -0.4, 0.99) FIX
+  0.03 FIX
+$OMEGA 0.3862622500000001 FIX
+$OMEGA 0.54567769 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$ESTIMATION METHOD=1 INTER MAXEVAL=0 NOABORT POSTHOC PRINT=1
+$TABLE ID ARM TIME DV IPRED L2 VIS ONEHEADER NOAPPEND NOPRINT FORMAT=s1PE23.16 FILE=comb.tab

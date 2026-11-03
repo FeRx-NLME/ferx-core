@@ -29,10 +29,15 @@ the other estimators already build, so it needs no population-level gradient.
 Each sweep, for each chain, cycles these blocks:
 
 1. **η block** — samples $\eta_i \mid \theta, \Omega, \Sigma, \kappa, y$ for
-   every subject with a $\mathrm{chol}(\Omega)$-preconditioned block
-   Metropolis kernel, or gradient-guided **HMC** when available (`n_leapfrog > 0`,
-   an analytical-PK subject, no IOV). The HMC gradient is the exact analytic
-   `Dual2` η-gradient — the same one FOCEI uses.
+   every subject. The default is a Metropolis kernel that adapts **per subject**:
+   block random-walk moves with the subject's own step size, shaped from
+   mid-warmup by the subject's own running η covariance (rather than by the
+   prior's $\mathrm{chol}(\Omega)$), followed by componentwise sweeps with a
+   step per η. Gradient-guided **HMC** replaces it when requested
+   (`n_leapfrog > 0`, an analytical-PK model, no IOV, no mixture). The HMC
+   gradient is the exact analytic `Dual2` η-gradient — the same one FOCEI uses.
+   Every chain starts each subject's η at its empirical Bayes estimate (EBE) at
+   the initial parameters; see [Why the chains start at the EBEs](#why-the-chains-start-at-the-ebes).
 
 1b. **κ block** (IOV models) — samples each per-occasion
    $\kappa_{ik} \mid \eta, \theta, \Omega, \Omega_{iov}, y$ holding η fixed.
@@ -50,16 +55,136 @@ Each sweep, for each chain, cycles these blocks:
    $\mu \sim \mathcal{N}(\mu_{\text{old}} + \bar\eta,\ \Omega/N)$. The draw
    is applied as a shift $s$: $\theta \leftarrow \theta\,e^{s}$ and
    $\eta_i \leftarrow \eta_i - s$, which leaves each individual parameter
-   $\log\varphi_i = \mu + \eta_i$ unchanged (only the η-prior moves). This
-   always-accepted Gibbs move is what gives the sampler good mixing.
+   $\log\varphi_i = \mu + \eta_i$ unchanged (only the η-prior moves). The
+   draw is accepted by a Metropolis–Hastings step scored on the real
+   likelihood. That step makes the move exact for any model, and when the
+   assumptions above hold it accepts every draw, so the move is the Gibbs
+   draw. This move is what gives the sampler good mixing. Covariate coefficients
+   that enter $\log P_i$ linearly join it; see
+   [Covariate coefficients](#covariate-coefficients). The move runs when every η
+   is covered by a log mu-reference or such a covariate mu-reference.
 
 4. **(remaining θ, σ) block** — a random-walk Metropolis step in unconstrained
-   space (log where the lower bound is ≥ 0) for any non-mu-referenced θ and for
-   σ, with objective $\sum_i \mathrm{nll}_i$ (η and Ω fixed, so the η-prior
-   term cancels in the acceptance ratio).
+   space (log where the lower bound is ≥ 0) for any θ the conjugate move does
+   not draw and for σ, with objective $\sum_i \mathrm{nll}_i$ (η and Ω fixed,
+   so the η-prior term cancels in the acceptance ratio).
 
-Step sizes adapt during warmup toward a ~0.234 acceptance rate. Post-warmup
-draws are thinned by `bayes_thin` and summarized.
+Step sizes adapt during warmup toward a ~0.234 acceptance rate (0.44 for the
+componentwise η moves). Post-warmup draws are thinned by `bayes_thin` and
+summarized.
+
+### Bounds
+
+Every θ draw stays inside its declared `(lower, upper)` bounds. A random-walk
+proposal or a conjugate draw that lands outside is rejected, and the chain
+keeps its current value. The posterior density is zero outside the bounds, so
+this is an exact Metropolis–Hastings step, and the prior stays the documented
+one truncated to the bounds. Sampling on a transform of `(lower, upper)` would
+also be exact, provided the change-of-variables Jacobian is included. It is
+not used because rejection needs no transform at all, and it leaves the
+proposal scales and the prior on the scale they are documented on. Until
+issue #1626 the random-walk block ignored the bounds. A covariate exponent declared
+`(0.75, 0.01, 5.0)` could then drift to 5e-9, where `(WT/70)^θ ≈ 1` leaves the
+likelihood flat.
+
+### Covariate coefficients
+
+A covariate coefficient whose typical value is linear on the log scale has a
+Gaussian full conditional, like the typical value itself:
+
+```
+CL = TVCL * (WT/70)^THETA_WT * (CRCL/100)^THETA_CRCL * exp(ETA_CL)
+log CL_i = log TVCL + THETA_WT*log(WT_i/70) + THETA_CRCL*log(CRCL_i/100) + ETA_CL_i
+```
+
+That is a linear regression of the individual log-parameters on the
+covariates. The conjugate move draws `log TVCL`, `THETA_WT` and `THETA_CRCL`
+jointly from it, as it draws the typical values. A coefficient shared by
+several parameters (`THETA_WT` on CL and V1) is one coordinate of that
+regression. The move re-centres every η so the individual parameters are
+unchanged. With a flat prior on the coordinates (log θ for a typical value, θ
+for an exponent or slope), the precision is
+$P = \sum_i X_i^\top \Omega^{-1} X_i$ and the mean is
+$\beta + P^{-1}\sum_i X_i^\top\Omega^{-1}\eta_i$.
+
+The Gaussian is exactly the full conditional only when the typical values
+are linear in these coordinates and the data depend on the θ through the
+individual parameters alone. The move does not rely on that. Each draw is a
+proposal, accepted or rejected by a Metropolis–Hastings step that scores the
+real likelihood with the same per-subject function every other block uses, so
+the move targets the right posterior for any model. When the conditions hold,
+the acceptance ratio is 1 to rounding (measured: |log α| ≤ 5e-12), and the
+move is the exact Gibbs draw. When they do not, some draws are rejected; the
+cost is mixing, not correctness. To keep acceptance high, a coefficient stays
+on the random walk when any of these holds:
+
+- a covariate it reads changes within a subject;
+- the θ is read elsewhere in the model;
+- the η is read by a second parameter;
+- the typical value is not one of the recognised linear forms, e.g.
+  `(TVCL + (CRCL - 90)*TH_CRCL) * exp(ETA_CL)`;
+- the data cannot identify the coefficient through the individual parameters.
+  This happens when every subject is at the covariate's reference value, or
+  when the covariate is constant across subjects and so duplicates the
+  typical value.
+
+Linearity is judged from the written form of the typical value, not by
+probing it numerically. An odd term such as `(θ - θ₀)^3` passes every
+symmetric check about θ₀. The recognised forms are products and quotients of
+θ and constants, powers with a constant base or a constant exponent, and
+`exp()` of a linear term. Under the logit and identity links they are sums of
+constant multiples of θ. `log`, `ln` and `sqrt` of a θ-dependent argument are
+not recognised. The DSL evaluates them clamped (`ln(max(x, 1e-30))` and
+`sqrt(max(x, 0))`), so `log(exp(θ·c))` is flat below the floor rather than
+linear.
+
+**Prior.** Moving a coefficient onto this move changes its prior. On the
+random walk it has the default N(init, sd = 10) on log θ, truncated to its
+bounds. On the conjugate move it has a flat prior on θ itself, truncated to
+its bounds. The posteriors are comparable whenever the data dominate. A
+coefficient the data barely inform will show the difference.
+
+**Acceptance is reported.** Because rejection is harmless to correctness, a
+move that is rejected every sweep looks exactly like one that is working. It
+is not: a θ this move draws is taken out of the random-walk (θ, σ) block, so
+nothing else proposes it, and a chain that never accepts leaves that θ at its
+initial value for the whole run. The fit therefore warns when the move
+accepted fewer than half of its post-warmup draws, and names the largest group
+of rejections — a draw outside a declared bound, a Metropolis rejection, or a
+conditional that could not be formed at all.
+
+The rate is judged **per chain**, and the chain with the worst rate decides.
+Pooling would hide the case worth reporting: one dead chain among four pools
+to 75% and says nothing, while a quarter of the posterior sample holds a
+frozen coordinate. On a recognised linear form with no active bound every
+chain accepts every draw.
+
+Mixture models draw only the plain typical values.
+
+### Why the chains start at the EBEs
+
+On `two_cpt_oral_base`, one subject's posterior has a second mode: the KA ↔
+distribution flip-flop, $e^{-19.6}$ times less probable than the main mode.
+The ratio comes from a Laplace approximation at the posterior means. Started
+from η = 0, a chain could fall into the second mode in warmup. No random-walk
+kernel climbs back out, so the run reported max R̂ ≈ 1.2 at 1,000, 6,000 and
+20,000 draws per chain alike. On this example, starting at the EBE (here the
+main mode) removed the trap: R̂ ≤ 1.008 across four seeds. Like the shared
+initial θ, the start does not change the target distribution, only where the
+chains begin. Mixture models keep η = 0, because their EBE is per class.
+
+The start has a diagnostic cost:
+
+- **An EBE is a local optimum.** It is not guaranteed to be the dominant
+  mode.
+- **The chains all start in the same place.** Every chain begins at the same
+  EBEs and the same initial θ. If they all stay in one mode, R̂ and ESS can
+  look reassuring while every chain misses another mode.
+
+A max R̂ near 1 from common starts therefore shows the chains agree. It does
+not show they have explored the whole posterior. For a model where a second
+mode is plausible, refit from different initial estimates and compare the
+posteriors.
 
 ## Options
 
@@ -70,7 +195,8 @@ draws are thinned by `bayes_thin` and summarized.
 | `bayes_chains` | 4 | Independent chains (distinct seeds; used for split-R̂). |
 | `bayes_thin`   | 1 | Keep every `bayes_thin`-th sampling draw. |
 | `bayes_seed`   | — | Base RNG seed; chain `c` derives its own. |
-| `n_leapfrog`   | 0 | Leapfrog steps for the HMC η kernel (analytical-PK models; `0` ⇒ block MH). |
+| `n_leapfrog`   | 0 | Leapfrog steps for the HMC η kernel (analytical-PK models; `0` ⇒ the adaptive Metropolis kernel). |
+| `n_mh_steps`   | auto | Block Metropolis moves per subject per sweep; the componentwise sweeps are sized from it. |
 
 ## Output
 
@@ -81,9 +207,19 @@ split-`rhat`, `ess_bulk` / `ess_tail`, and `mcse`; plus `n_chains`, `n_warmup`,
 (`theta`/`omega`/`sigma`) carry the posterior means; the covariance / SIR steps
 are skipped (posterior credible intervals replace the Hessian covariance).
 
-A `max_rhat` above ~1.01 indicates the chains have not converged — increase
-`bayes_warmup` / `bayes_iters`. This is also the threshold for the reported
-`converged` flag. Use **at least 2 chains** (`bayes_chains >= 2`): split-R̂ on a
+A `max_rhat` above ~1.01 indicates the chains have not converged. This is also
+the threshold for the reported `converged` flag. The warning names the
+parameter with the worst R̂ and gives advice for the block that samples it:
+
+- **A random-walk θ** (a θ the conjugate move does not draw). Longer chains
+  rarely help, because the data pin such a θ at fixed η. The warning suggests
+  mu-referencing it, or writing its covariate effect linearly on the log scale.
+  If it already is log mu-referenced, the conjugate move is off because some
+  other η is not covered.
+- **An Ω entry or a conjugate-drawn θ, under the Metropolis η kernel, on a
+  model HMC can serve.** The warning suggests `n_leapfrog`.
+- **Anything else.** The warning suggests increasing `bayes_warmup` /
+  `bayes_iters`. Use **at least 2 chains** (`bayes_chains >= 2`): split-R̂ on a
 single chain only compares the two halves of one trajectory and cannot detect
 between-chain non-convergence, so a near-1 `max_rhat` from one chain is weak
 evidence; a single-chain run is warned about for this reason.
@@ -113,9 +249,55 @@ evidence; a single-chain run is warned about for this reason.
 Defaults are weakly-informative (≈ flat given typical data): $\Omega \sim
 \mathcal{W}^{-1}(n_\eta + 2,\ \Omega_0)$ centred at the initial Ω, and
 $\theta,\ \log\sigma \sim \mathcal{N}(\text{init},\ \mathrm{sd}=10)$ on the
-unconstrained scale. User-specifiable priors in the `.ferx` DSL are planned.
+unconstrained scale. The θ the conjugate mu-reference move draws have a flat
+prior on their linear scale (log θ for a typical value, θ for a covariate
+coefficient). All θ priors are truncated to the declared bounds.
+User-specifiable priors in the `.ferx` DSL are planned.
 
 ## Validation
+
+### Two-compartment examples (#1626)
+
+On the ferx-r examples `two_cpt_oral_base` and `two_cpt_oral_cov` (30 subjects,
+`data/two_cpt_oral_cov.csv`), with 4 chains on Linux:
+
+| model, draws per chain | before: max R̂ / min bulk ESS | after: max R̂ / min bulk ESS |
+|---|---|---|
+| base, 1,000 (defaults) | 1.194 / 7 | 1.006 / 609 |
+| base, 6,000 | 1.197 / 7 | 1.001 / 2,694 |
+| cov, 1,000 (defaults) | 2.735 / 3 | 1.017 / 482 |
+| cov, 6,000 | 7.158 / 2 | 1.002 / 2,951 |
+
+At the defaults, the base model gives max R̂ 1.005–1.008 across the default
+seed and seeds 1–3 (before: 1.19–2.04), and none of them warns. The covariate
+model varies more between seeds in these short runs:
+
+| seed | max R̂ / min bulk ESS |
+|---|---|
+| default | 1.017 / 482 |
+| 1 | 1.004 |
+| 2 | 1.005 |
+| 3 | 1.014 / 505 |
+
+Two of the four seeds warn. If you are warned, run longer chains. At 6,000
+draws per chain the default seed gives 1.002 with ESS 2,951 and no warning.
+The worst parameter is usually σ (`PROP_ERR`), which the random-walk block
+samples. The
+posterior means sit within 0.12 posterior SD of the FOCEI estimates for every
+θ and σ, for example:
+
+| parameter | FOCEI | Bayes mean (6,000 per chain) |
+|---|---:|---:|
+| base TVV1 | 48.32 | 48.07 |
+| base TVKA | 1.257 | 1.253 |
+| cov THETA_WT | 0.654 | 0.665 |
+| cov THETA_CRCL | 0.565 | 0.571 |
+
+The Ω means sit above the MLE, as on warfarin. Warfarin itself is unchanged:
+max R̂ 1.002–1.004 and min bulk ESS 847–986 across four seeds (before:
+1.001–1.008, 619–862).
+
+### Warfarin
 
 On the bundled warfarin model the posterior means match the FOCEI point estimate
 and NONMEM `METHOD=BAYES` (TVCL ≈ 0.133, TVV ≈ 7.74, TVKA ≈ 0.83), with

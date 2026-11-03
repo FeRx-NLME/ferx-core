@@ -91,6 +91,26 @@ $z = (F - \text{ULOQ}) / W = 1$. NONMEM reports OFV
 
 `bloq` is accepted as an alias for `bloq_method`.
 
+### Setting it from code
+
+From Rust the key is `FitOptions::bloq_method`, an `Option<BloqMethod>`, and
+`fit()` honours it on every call:
+
+- `None` (the default) fits under the model's own method. That is the file's
+  `bloq_method` key, or `drop` when the file has none. A model parsed from an
+  `m3` file and fitted with `FitOptions::default()` therefore stays on M3.
+- `Some(BloqMethod::M3)` or `Some(BloqMethod::Drop)` overrides the model for
+  that call only. An explicit `Drop` turns M3 off on a model parsed from an `m3`
+  file.
+
+The method a fit used is reported as `FitResult::bloq_method`. `run_covariance`
+and `run_sir` read it from there, so a post-hoc step scores the same likelihood
+as the fit. Up to 0.4.0 a direct `fit()` read only the model, and an M3
+request placed in the options was ignored without a warning
+([#1824](https://github.com/FeRx-NLME/ferx-core/issues/1824)).
+`fit_from_files` ignores the file's `[fit_options]` by design, so a caller that
+gives it no `bloq_method` gets `drop`, as before.
+
 ---
 
 ## When to use M3

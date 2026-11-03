@@ -54,6 +54,16 @@ const NM_LQ01: f64 = -0.540113;
 const NM_LQ10: f64 = -1.215660;
 const NM_OFV: f64 = 606.98181;
 
+// `examples/ctmm_pd_2state.ferx` at its data-generating initial estimates, one evaluation.
+// Since #2482 the drug-driven η-Hessian in `½ log|H̃|` is exact (the occupancy ODE on dual
+// numbers) rather than #2437's 0.1-posterior-SD stencil, which #2437 measured holding only to
+// 0.5%: the objective moved by −1.25e-3, from 715.6644417808 (Linux x86_64 measurement).
+const OFV_AT_TRUTH: f64 = 715.6631881368;
+const OFV_AT_TRUTH_TOL: f64 = 1e-7;
+// More than the 3.88 that refitting everything but LQ01 at its true value buys; 2.1 below
+// the measured 6.59.
+const MIN_IMPROVEMENT: f64 = 4.5;
+
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -94,6 +104,42 @@ fn ferx_ctmm_matches_nonmem_2state() {
     );
 }
 
+/// The objective of `examples/ctmm_pd_2state.ferx` at its own initial estimates, which are
+/// the data-generating parameters (`outer_maxiter = 0`, so one evaluation and no optimizer).
+fn drug_driven_ctmm_ofv_at_truth() -> f64 {
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let res = fit_from_files(
+        "examples/ctmm_pd_2state.ferx",
+        Some("data/ctmm_pd_2state.csv"),
+        None,
+        Some(opts),
+    )
+    .expect("drug-driven CTMM evaluates at its initial estimates");
+    assert!(res.ofv.is_finite(), "OFV at truth {}", res.ofv);
+    res.ofv
+}
+
+/// Drug-driven (time-inhomogeneous) CTMM, objective pin (#817, #2437).
+///
+/// One evaluation at the data-generating parameters, so it pins the occupancy integration
+/// and the exact η-Hessian without depending on where an optimizer stops. Measured:
+/// 715.6631881368 on Linux x86_64 (#2482). The bound is 1e-7
+/// because a CTMM occupancy integration is not reproducible to the last digit across
+/// platforms in general: on the previous step the same evaluation differed by 1.4e-9.
+#[test]
+fn drug_driven_ctmm_objective_at_truth() {
+    let ofv = drug_driven_ctmm_ofv_at_truth();
+    eprintln!("drug-driven CTMM OFV at truth: {ofv:.10}");
+    assert!(
+        (ofv - OFV_AT_TRUTH).abs() < OFV_AT_TRUTH_TOL,
+        "OFV at truth {ofv} vs recorded {OFV_AT_TRUTH}"
+    );
+}
+
 /// Drug-driven (time-inhomogeneous) CTMM recovery test (#817).
 ///
 /// A NONMEM `$DES` anchor is impractical for a PK-coupled CTMM: the PK must integrate
@@ -104,9 +150,22 @@ fn ferx_ctmm_matches_nonmem_2state() {
 /// anchor** — a commuting generator `Q(t)=C(t)·Q₀` matches `expm(Q₀·∫C)`
 /// (`tests/markov_smoke.rs::ctmm_drug_driven_matches_closed_form_commuting_generator`),
 /// and (b) **reduction** — `SLOPE=0` reduces to the homogeneous CTMM, which *is*
-/// NONMEM-anchored above. This test adds a **simulate → fit self-consistency** check:
-/// fitting the Gillespie-simulated example recovers the data-generating transition
-/// structure (the drug effect `SLOPE`, and both baseline log-intensities).
+/// NONMEM-anchored above. This test adds a **simulate → fit self-consistency** check on
+/// what these data identify.
+///
+/// They identify the sign of the drug effect, **not** `LQ01`. No PK is observed, so
+/// `LQ01`, `SLOPE`, `CL` and `V` trade off along a ridge in the concentration, and `LQ10`
+/// rides it too. Profile (#2437, macOS arm64, `LQ01` FIX, the rest refitted with BOBYQA):
+/// OFV 712.69 / 711.79 / 710.94 / 710.45 / 710.08 / 709.45 / 709.07 at `LQ01` = −1.0 /
+/// −1.2 (truth) / −1.6 / −2.3 / −3.0 / −4.5 / −6.0 (the lower bound), with `SLOPE`
+/// 0.11–0.99 and `LQ10` −0.51…−0.59 along it; the free fits land anywhere from `LQ01`
+/// −1.6 to the bound, `LQ10` −0.48…−0.69. An `|LQ01 − truth| < 0.12` bound held only
+/// while the optimizer stopped near its start, which is the truth.
+///
+/// What the test can assert is that the fit **descends the ridge**. Refitting everything
+/// but `LQ01` at the truth's `LQ01` gets 3.88 below the start (715.66 → 711.79), so a fit
+/// that only re-solves the other parameters cannot clear `MIN_IMPROVEMENT`. Measured: 6.59
+/// on macOS arm64 and 6.59 on Linux x86_64 (BOBYQA to the bound, 709.07).
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -125,24 +184,106 @@ fn ferx_drug_driven_ctmm_recovers_simulated_params() {
     )
     .expect("drug-driven CTMM fit must converge");
 
-    // theta = [TVCL, TVV, LQ01, LQ10, SLOPE]. Data-generating: LQ01=-1.2, LQ10=-0.7,
-    // SLOPE=0.15. The transition structure (baseline intensities + concentration effect) is
-    // well identified from 60 subjects; CL and its IIV are only weakly informed (no PK is
-    // observed), so they are not asserted here.
-    let (lq01, lq10, slope) = (res.theta[2], res.theta[3], res.theta[4]);
-    assert!((lq01 - (-1.2)).abs() < 0.12, "LQ01 {lq01} vs truth -1.2");
-    assert!((lq10 - (-0.7)).abs() < 0.15, "LQ10 {lq10} vs truth -0.7");
-    assert!((slope - 0.15).abs() < 0.06, "SLOPE {slope} vs truth 0.15");
-    // The concentration effect is resolved as clearly positive (not merely near 0).
+    // theta = [TVCL, TVV, LQ01, LQ10, SLOPE]. Data-generating: SLOPE = 0.15. The
+    // concentration effect is resolved as clearly positive (not merely near 0) all along the
+    // ridge (≥ 0.11 on the profile above); its size rides the ridge.
+    let slope = res.theta[4];
     assert!(
         slope > 0.05,
         "SLOPE {slope} must be a clear positive drug effect"
     );
-
-    // Regression pin on the objective (catches numerical drift in the occupancy integration).
     assert!(
-        (res.ofv - 712.226).abs() < 0.5,
-        "OFV {} vs recorded 712.226",
+        res.converged,
+        "drug-driven CTMM fit must report convergence"
+    );
+    // The start is the truth, so a fit that barely moves would pass the bound above. It must
+    // descend the ridge, past what refitting at the truth's LQ01 reaches (see above).
+    let at_truth = drug_driven_ctmm_ofv_at_truth();
+    eprintln!("fitted OFV {:.6}, at truth {at_truth:.6}", res.ofv);
+    assert!(
+        res.ofv.is_finite() && at_truth - res.ofv > MIN_IMPROVEMENT,
+        "fitted OFV {} must improve on the objective at its start (the truth, {at_truth}) by \
+         more than {MIN_IMPROVEMENT}",
         res.ofv
     );
 }
+
+// ── Minimal CTMM (mCTMM, `type = mctmm`, #2474) ─────────────────────────────────────
+//
+// `examples/mctmm_3state.ferx` + `data/mctmm_3state.csv`: a 3-state mCTMM (Schindler &
+// Karlsson 2017) with a proportional-odds steady state, two cut-points and a subject
+// covariate on the linear predictor. The data were simulated by
+// `tests/nonmem/mctmm_3state_sim.R` (LTAU = ln 2, C1 = −0.5, LD2 = ln 1.5, BX = 0.8).
+//
+// NONMEM scores the identical fixed-effects panel likelihood through `F_FLAG=1`, with the
+// 3×3 `expm(Q·Δt)` written in closed form (Sylvester's formula on the eigenvalues
+// 0, λ₁, λ₂ of the tridiagonal generator) — `tests/nonmem/mctmm_3state.ctl`. A three-state
+// chain is the smallest that tests the construction: a two-state mCTMM has no interior
+// state, so it cannot tell a pairwise rate from a single shared one.
+//
+// NONMEM 7.5.1 `METHOD=0` ends with ERROR=134 (rounding errors) but the objective is flat to
+// 1e-9 over its last 20 iterations, and a third, independent minimisation — R `nlminb` on
+// `expm::expm` (`tests/nonmem/mctmm_3state_refit.R`) — lands on
+// (0.637929, −0.440238, 0.506227, 1.064568) at OFV 966.4469312412, agreeing with NONMEM's
+// 966.4469312446 to 3e-9 and its estimates to 1e-5. So the reference is the optimum, not an
+// artefact of the early stop.
+//
+// | Parameter | NONMEM | R nlminb |
+// |-----------|-------:|---------:|
+// | LTAU | 0.637932 | 0.637929 |
+// | C1   | −0.440228 | −0.440238 |
+// | LD2  | 0.506227 | 0.506227 |
+// | BX   | 1.06458 | 1.064568 |
+// | OFV  | 966.446931 | 966.446931 |
+
+const NM_MCTMM_THETA: [f64; 4] = [0.637932, -0.440228, 0.506227, 1.06458];
+const NM_MCTMM_OFV: f64 = 966.44693124;
+
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn ferx_mctmm_matches_nonmem_3state() {
+    let opts = FitOptions {
+        outer_maxiter: 300,
+        ..Default::default()
+    };
+    let res = fit_from_files(
+        "examples/mctmm_3state.ferx",
+        Some("data/mctmm_3state.csv"),
+        None,
+        Some(opts),
+    )
+    .expect("3-state mCTMM fit must converge");
+
+    eprintln!("mCTMM ferx theta = {:?}, OFV = {:.10}", res.theta, res.ofv);
+    for (i, (got, want)) in res.theta.iter().zip(NM_MCTMM_THETA).enumerate() {
+        assert!(got.is_finite(), "theta[{i}] = {got}");
+        assert!(
+            (got - want).abs() < MCTMM_THETA_TOL,
+            "theta[{i}] {got} vs NONMEM {want}"
+        );
+    }
+    assert!(
+        (res.ofv - NM_MCTMM_OFV).abs() < MCTMM_OFV_TOL,
+        "OFV {} vs NONMEM {NM_MCTMM_OFV}",
+        res.ofv
+    );
+}
+
+// Measured on the Linux reference platform (`tools/linux-test.sh`, `ferx-platform:
+// Linux/x86_64 … GLIBC 2.41`); native macOS arm64 prints the same digits. ferx θ =
+// (0.6379674, −0.4401577, 0.5062020, 1.0647260), worst |Δθ| = 1.46e-4 (BX) against NONMEM —
+// under 1e-3 of every SE (0.08–0.31) — and OFV 966.4469319355, 7.0e-7 above NONMEM. The
+// likelihood is flat near the optimum (ferx sits 1e-4 off in θ yet within 7e-7 in OFV), so
+// the optimizers stop at sub-tolerance-different points of one objective. Bounds: ~10× the
+// θ gap, ~14× the OFV gap.
+//
+// Since the #2474 review rounds 4–5 rewrote the rate expressions (exact `lp` cancellation,
+// `expm1`-stable gap factors), native macOS arm64 lands on (0.6379290, −0.4402377,
+// 0.5062267, 1.0645676) at OFV 966.4469312412 — R `nlminb`'s optimum to 1e-9, worst |Δθ|
+// 1.24e-5 against NONMEM, OFV 3.4e-9 below it. That is a macOS number; the bounds above
+// stay the Linux-measured ones until the Linux run is repeated.
+const MCTMM_THETA_TOL: f64 = 1.5e-3;
+const MCTMM_OFV_TOL: f64 = 1e-5;

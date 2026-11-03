@@ -1,0 +1,43 @@
+# ferx twin of nonmem_anchor/reset_clock_tte_eval.ctl (#1978): a joint PK-TTE hazard reading
+# TIME on data whose period 2 restarts TIME at an EVID=4 row. NONMEM's optimum
+# (results/reset_clock_tte.ext) at eta = 0 -- no omega, as the NONMEM arm runs $OMEGA 0 FIX
+# (see make_reset_clock_arms.py for why). Evaluated once (maxiter = 0) by
+# tests/reset_clock_nonmem_anchor.rs.
+[parameters]
+  theta TVCL(0.98985186495244781, 0.01, 100.0)
+  theta TVV(9.8660788744458685, 0.1, 500.0)
+  theta TVH0(0.019846376447344233, 0.0001, 10.0)
+  theta TVBETA(0.14887686935395772, -5.0, 5.0)
+  theta TVGAM(0.041821685439565881, -1.0, 1.0)
+  sigma PROP_ERR ~ 0.0099705285412552691 (variance)
+
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  H0   = TVH0
+  BETA = TVBETA
+  GAM  = TVGAM
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  obs_scale = V
+
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(GAM * TIME) * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 0
+  inner_tol = 1e-8
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

@@ -50,6 +50,7 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
 /// Three concentration observations after a single bolus, scaled per subject.
 fn subject(id: &str, scale: f64) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
@@ -60,6 +61,8 @@ fn subject(id: &str, scale: f64) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -68,8 +71,12 @@ fn subject(id: &str, scale: f64) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -314,7 +321,7 @@ fn data_term_collapses_to_fixed_eta_nll_as_q_degenerates() {
                 s,
                 &params.theta,
                 &params.sigma.values,
-                &params.residual_correlations,
+                model.residual_cov_at(&params),
                 &mu,
                 &mut scratch,
             )
@@ -1433,6 +1440,7 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
     .expect("IOV fixture parses");
 
     let subject = |id: &str, occ: Vec<u32>, scale: f64| Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: (0..occ.len()).map(|k| 1.0 + 2.0 * k as f64).collect(),
@@ -1445,6 +1453,8 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -1453,8 +1463,12 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let population = Population {
@@ -1597,9 +1611,9 @@ fn iov_neg_elbo_gradient_matches_central_fd() {
 /// differentiate — and that is the point. The analytic IOV scope is very wide: probing it
 /// while writing this test, closed-form 1-cpt, **ODE**, `iiv_on_ruv`, and ODE +
 /// `iiv_on_ruv` IOV models are *all* served analytically, despite comments in
-/// `iov_analytical_supported` suggesting some are not (that predicate gates the outer
-/// assembly; the inner gradient reaches ODE subjects through
-/// `ode_subject_eta_grad_iov`). Picking any of those as the "out of scope" fixture would
+/// the pre-#2093 `iov_analytical_supported` suggesting some were not (that predicate gated
+/// the outer assembly; the adjoint, `model_in_scope` / `recorder_in_scope`, now serves both
+/// loops). Picking any of those as the "out of scope" fixture would
 /// have produced a test that passed for the wrong reason today and silently stopped
 /// testing anything tomorrow. A model with nothing to differentiate cannot drift into
 /// scope.
@@ -1616,12 +1630,12 @@ fn iov_shell_fixture() -> (CompiledModel, Population, ModelParameters) {
     (shell, population, params)
 }
 
-/// VI_PLAN §10.5(4): an IOV model the analytic provider declines must fall back to
+/// VI_PLAN §10.5(4): an IOV model the analytic (adjoint) gradient declines must fall back to
 /// finite differences **loudly**, and `vi_eta_grad = analytic` must refuse it.
 ///
 /// [`eta_grad_probe_agrees_with_evaluation_and_falls_back_loudly`] pins this for the
 /// non-IOV path, but the IOV path reaches its gradient through a different function
-/// (`analytic_eta_nll_gradient_iov` → `subject_eta_grad_iov`) with its own `None` branch.
+/// (`analytic_eta_nll_gradient_iov` → `adjoint::exact_obs_grads_in`) with its own `None` branch.
 /// Without this test the IOV coverage is entirely positive-direction — every other IOV
 /// test asserts `n_fd_subjects == 0` — so a scope gap that silently returned a *wrong*
 /// stacked gradient rather than declining would go unnoticed. That failure mode is worse
@@ -1893,6 +1907,7 @@ fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
         }
         let n_obs = obs_times.len();
         Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses,
             obs_times,
@@ -1903,6 +1918,8 @@ fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -1911,8 +1928,12 @@ fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
             obs_l2: Vec::new(),
             dose_occasions,
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     };
 
@@ -2381,4 +2402,91 @@ fn closed_form_sigma_support_refuses_models_outside_its_scope() {
     fixed.sigma_fixed = vec![true];
     let err = closed_form_sigma_support(&model, &fixed).expect_err("FIXed σ must be refused");
     assert!(err.contains("FIX"), "unhelpful reason: {err}");
+}
+
+/// VI's data η-gradient is exact past the closed forms (`fixed_theta_data_eta_grad`):
+/// on a Gaussian model it equals the analytic provider's (joint gradient less the prior)
+/// to rounding — exact against exact — and under M3 censoring and a dense residual the
+/// `Auto` route takes it (no FD flag) and agrees with the `Fd` route's central difference
+/// to that quotient's accuracy.
+#[test]
+fn the_data_eta_gradient_is_exact_past_the_closed_forms() {
+    use crate::sens::ode_provider::adjoint::fixed_theta_data_eta_grad;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let load = |m: &str, d: &str| {
+        crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap()
+    };
+    // Gaussian: exact against exact.
+    let prep = load("examples/warfarin.ferx", "data/warfarin.csv");
+    let model = &prep.parsed.model;
+    let params = &model.default_params;
+    let (theta, sigma) = (&params.theta, &params.sigma.values);
+    let mut worst_exact = 0.0f64;
+    for s in prep.population.subjects.iter().take(4) {
+        let z = vec![0.07; model.n_eta];
+        let joint = crate::estimation::inner_optimizer::analytic_eta_nll_gradient(
+            model,
+            s,
+            theta,
+            &z,
+            &params.omega,
+            sigma,
+        )
+        .expect("closed form serves warfarin");
+        let prior = &params.omega.inv * DVector::from_column_slice(&z);
+        let want: Vec<f64> = joint.iter().zip(prior.iter()).map(|(j, p)| j - p).collect();
+        let got = fixed_theta_data_eta_grad(model, s, theta, sigma, &z).unwrap();
+        let scale = want.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+        for (a, b) in got.iter().zip(&want) {
+            worst_exact = worst_exact.max((a - b).abs() / scale);
+        }
+    }
+    eprintln!("kernel data η-gradient vs the closed form: worst {worst_exact:.2e} of the row");
+    // Measured 4.2e-16: rounding.
+    assert!(worst_exact < 1e-10, "{worst_exact:.2e}");
+
+    // M3 and a dense residual: the Auto route is exact, the Fd route the quotient.
+    let mut worst = 0.0f64;
+    for (m, d) in [
+        ("examples/warfarin_bloq.ferx", "data/warfarin_bloq.csv"),
+        (
+            "examples/correlated_residual_combined.ferx",
+            "data/correlated_residual_combined.csv",
+        ),
+    ] {
+        let prep = load(m, d);
+        let model = &prep.parsed.model;
+        let params = &model.default_params;
+        let mut scratch = EventPkParams::default();
+        for s in prep.population.subjects.iter().take(3) {
+            let z = vec![0.07; model.n_eta];
+            let run = |mode: EtaGradMode, scratch: &mut EventPkParams| {
+                super::eta_data_grad(
+                    model,
+                    s,
+                    &params.theta,
+                    params,
+                    &params.omega,
+                    &params.sigma.values,
+                    &z,
+                    &[],
+                    0,
+                    mode,
+                    scratch,
+                )
+            };
+            let (g_e, fd_e) = run(EtaGradMode::Auto, &mut scratch);
+            let (g_f, fd_f) = run(EtaGradMode::Fd, &mut scratch);
+            assert!(!fd_e && fd_f, "{m}: Auto must be exact, Fd the quotient");
+            let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+            for (a, b) in g_e.iter().zip(&g_f) {
+                assert!(a.is_finite() && b.is_finite(), "{m}");
+                worst = worst.max((a - b).abs() / scale);
+            }
+        }
+    }
+    eprintln!("exact data η-gradient vs the central quotient: worst {worst:.2e} of the row");
+    // Measured 6.8e-10: the central quotient's truncation at its `1e-5` step. A dropped
+    // censored-row weight or residual-η channel misses by O(1).
+    assert!(worst < 1e-6, "{worst:.2e}");
 }

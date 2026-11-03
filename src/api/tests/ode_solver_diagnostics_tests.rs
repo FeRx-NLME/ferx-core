@@ -13,6 +13,11 @@ use std::collections::HashMap;
 
 /// A rapid-equilibrium two-state model: the exchange rate `KFAST` sets `|Re λ|max`, so the
 /// same source is a stiff or a benign fixture depending on one theta.
+///
+/// The elimination saturates at a `Km` (1e6) far above any amount the dose produces, keeping the
+/// system structurally nonlinear: these tests observe the *integrator's* decisions, and a linear
+/// RHS is propagated exactly by the matrix exponential instead (#852), with no stiffness to
+/// detect and no steps to count.
 fn two_state_model(kfast: f64) -> CompiledModel {
     let src = format!(
         r#"
@@ -29,7 +34,7 @@ fn two_state_model(kfast: f64) -> CompiledModel {
 [structural_model]
   ode(obs_cmt=central, states=[central, periph])
 [odes]
-  d/dt(central) = -(CL / V) * central - KF * central + KF * periph
+  d/dt(central) = -(CL / V) * central / (1 + central / 1e6) - KF * central + KF * periph
   d/dt(periph)  = KF * central - KF * periph
 [error_model]
   DV ~ proportional(PROP)
@@ -42,6 +47,7 @@ fn subject(id: &str, scale: f64) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
     let observations = obs_times.iter().map(|t| scale * 50.0 / (1.0 + t)).collect();
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
@@ -52,6 +58,8 @@ fn subject(id: &str, scale: f64) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -60,8 +68,12 @@ fn subject(id: &str, scale: f64) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -536,6 +548,9 @@ fn a_jet_rejection_says_the_derivatives_overflowed_not_that_the_method_failed() 
     // The count comes from a different sweep than the escalation counts, so the clause must
     // not phrase itself as a subset of them.
     assert!(!msg.contains("of those"), "{msg}");
+    // Beside an ordinary rejection (here also a failed fallback) the solver-knob advice is
+    // still true of those segments, so it stays — the other side of the #1347 gate.
+    assert!(msg.contains("consider a different ode_method"), "{msg}");
     // A clause literal wrapped without `\` continuations reaches the user as runs of
     // indentation. This is what caught it (#1207 review); every clause here is checked.
     assert!(
@@ -565,6 +580,11 @@ fn a_jet_rejection_alone_is_a_warning_not_an_info_note() {
     .expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning, "{msg}");
     assert!(msg.contains("analytic-sensitivity solve"), "{msg}");
+    // The jet clause says a different ode_method will not help; the general solver-knob
+    // advice must not follow it and say the opposite (#1347).
+    assert!(msg.contains("will not help"), "{msg}");
+    assert!(!msg.contains("consider a different ode_method"), "{msg}");
+    assert!(!msg.contains("ode_reltol"), "{msg}");
 }
 
 /// The clause stays out of the way of an ordinary rejection, which is the common case: a
@@ -736,7 +756,7 @@ fn the_sensitivity_sweep_is_a_no_op_off_the_analytic_ode_path() {
 }
 
 /// A one-compartment closed-form twin of [`two_state_model`]: no `[odes]`, so
-/// `ode_inner_grad_supported_model` is false and the sweep has nothing to do.
+/// the sweep's `model.ode_spec.is_none()` guard fires and it has nothing to do.
 fn closed_form_model() -> CompiledModel {
     parse_model_string(
         r#"
@@ -757,7 +777,7 @@ fn closed_form_model() -> CompiledModel {
     .expect("parse")
 }
 
-/// An **FD fit** must sweep nothing (#1207 review). `ode_inner_grad_supported_model` describes
+/// An **FD fit** must sweep nothing (#1207 review). `adjoint::recorder_in_scope` describes
 /// the ODE provider's analytical reach and says nothing about `gradient_method`, so gating on
 /// it alone swept a dual solve for a fit that computed every gradient by finite differences —
 /// and then reported solver counters from a code path that fit never took.

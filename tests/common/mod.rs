@@ -31,6 +31,7 @@ pub fn subject(
 ) -> Subject {
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses,
         obs_times,
@@ -41,6 +42,8 @@ pub fn subject(
         dose_covariates: vec![],
         obs_covariates: vec![],
         pk_only_times: vec![],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: vec![],
@@ -49,8 +52,12 @@ pub fn subject(
         obs_l2: Vec::new(),
         dose_occasions: vec![],
         reset_occasions: vec![],
+        pk_only_occasions: Vec::new(),
         fremtype: vec![],
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -165,4 +172,95 @@ pub fn binary_pop(subjects: &[(f64, Vec<(f64, u8)>)], cmt: usize) -> ferx_core::
         warnings: vec![],
         subjects,
     }
+}
+
+/// Each window AUC of an adaptive run matches `refs[i]` to `tol` relative (#943).
+///
+/// `windows_in(band)` runs the scenario with `auc_target = band` and returns how many
+/// realized windows fall in it — the only view of the window AUCs the public API gives.
+/// The bands are first checked pairwise disjoint, so a count of 1 in band `i` is window `i`
+/// and no other; tightening the reference spacing or widening the band past that point
+/// fails here, by name, instead of quietly letting two windows swap.
+pub fn assert_window_aucs_match(
+    windows_in: &dyn Fn((f64, f64)) -> usize,
+    refs: &[f64],
+    tol: f64,
+    label: &str,
+) {
+    let band_of = |r: f64| (r * (1.0 - tol), r * (1.0 + tol));
+    for (i, &a) in refs.iter().enumerate() {
+        for (j, &b) in refs.iter().enumerate().skip(i + 1) {
+            let (ba, bb) = (band_of(a), band_of(b));
+            assert!(
+                ba.1 < bb.0 || bb.1 < ba.0,
+                "{label}: windows {i} and {j}: references {a} and {b} are closer than the \
+                 band ({tol:e}), so a count of 1 no longer identifies the window"
+            );
+        }
+    }
+    assert_eq!(
+        windows_in((0.0, f64::MAX)),
+        refs.len(),
+        "{label}: number of realized windows"
+    );
+    for (i, &r) in refs.iter().enumerate() {
+        assert_eq!(
+            windows_in(band_of(r)),
+            1,
+            "{label}: window {i}: ferx's AUC24 is not within {tol:e} of mrgsolve's {r}"
+        );
+    }
+}
+
+/// The number of realized windows `res` scores in its `auc_target` band.
+pub fn windows_in_band(res: &ferx_core::AdaptiveSimulationResult) -> usize {
+    let n_windows = res.decisions.len() - 1;
+    let attain = res.metrics[0]
+        .auc_target_attainment
+        .expect("auc_target declared");
+    let n = attain * n_windows as f64;
+    assert!(
+        (n - n.round()).abs() < 1e-9,
+        "attainment {attain} is k/{n_windows}"
+    );
+    n.round() as usize
+}
+
+/// η = 0 for every subject of `pop` (#2580, #2583): the typical-value patient an mrgsolve
+/// kit simulates. A model's `omega ~ 1e-10` still draws an η of order 1e-5, which offsets
+/// every trough and AUC one-sidedly against such a kit — the whole of the gap the vanco
+/// anchors once attributed to the solvers. The one η = 0 builder: every adaptive kit anchor
+/// that runs at η = 0 uses it, whichever entry point it then calls. The renal and platelet
+/// anchors still draw η (#2580's out-of-scope table): renal CL never reads `ETA_CL`, and
+/// the platelet gap has another cause.
+///
+/// η only: on an IOV model κ is still drawn, so the run is not the typical-value patient
+/// there. None of its callers (the vanco, vanco-loading and vanco-interval anchors) has κ.
+pub fn typical_value_etas(
+    model: &ferx_core::CompiledModel,
+    pop: &ferx_core::types::Population,
+) -> ferx_core::SuppliedEtas {
+    let ids: Vec<String> = pop.subjects.iter().map(|s| s.id.clone()).collect();
+    let n = ids.len();
+    ferx_core::SuppliedEtas::from_table(
+        ids,
+        model.eta_names.clone(),
+        vec![vec![0.0; model.n_eta]; n],
+    )
+    .expect("η = 0 table")
+}
+
+/// Run `spec` at [`typical_value_etas`]. Seed 1, as every kit run uses.
+pub fn simulate_from_spec_at_typical_value(
+    model: &ferx_core::CompiledModel,
+    pop: &ferx_core::types::Population,
+    spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec,
+) -> ferx_core::AdaptiveSimulationResult {
+    let etas = typical_value_etas(model, pop);
+    let inputs = ferx_core::AdaptiveInputs::new(&model.default_params).with_etas(&etas);
+    // `AdaptiveSimulateOptions` is `#[non_exhaustive]`: build from `default()`.
+    let mut opts = ferx_core::AdaptiveSimulateOptions::default();
+    opts.seed = Some(1);
+    ferx_core::simulate_adaptive_from_spec_with_inputs(model, pop, &inputs, 1, spec, &opts)
+        .expect("adaptive run at η = 0 passes the default verifier")
 }

@@ -1,5 +1,5 @@
 //! Convergence + NONMEM cross-check for constant output scaling (`[scaling]
-//! obs_scale = k`) on the analytic sensitivity provider (issue #367).
+//! obs_scale = k`) on the analytic gradient path (issue #367).
 //!
 //! The provider applies the constant divisor to the prediction *and* its η/θ jet
 //! in closed form (`pk::apply_scaling` does `pred /= k`; the provider divides

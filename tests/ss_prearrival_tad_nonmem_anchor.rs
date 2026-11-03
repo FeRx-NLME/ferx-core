@@ -541,11 +541,16 @@ fn a_zero_coefficient_tad_term_returns_the_autonomous_steady_state() {
         // be 0.0, and the assertion below would pass while comparing a model with itself —
         // and this is the file's only plumbing discriminator, so nothing else would notice.
         let inert_src = src.replace("0.03*TAD", "0.0*TAD");
-        let autonomous_src = src.replace(" * (1.0 + 0.03*TAD)", "");
+        // With the term removed the RHS is linear, and `auto` would solve it exactly by the
+        // matrix exponential (#852) while the inert twin still integrates — so the twin names
+        // the integrator, keeping this a comparison of the `TAD` plumbing, not of two engines.
+        let autonomous_src = src
+            .replace(" * (1.0 + 0.03*TAD)", "")
+            .replace("[fit_options]\n", "[fit_options]\n  ode_method = rk45\n");
         assert_ne!(inert_src, src, "{tag}: `0.03*TAD` not found in {twin}");
-        assert_ne!(
-            autonomous_src, src,
-            "{tag}: ` * (1.0 + 0.03*TAD)` not found in {twin}"
+        assert!(
+            !autonomous_src.contains("0.03*TAD") && autonomous_src.contains("ode_method = rk45"),
+            "{tag}: ` * (1.0 + 0.03*TAD)` or `[fit_options]` not found in {twin}"
         );
         let inert = parse_full_model(&inert_src).expect("parses").model;
         let autonomous = parse_full_model(&autonomous_src).expect("parses").model;
