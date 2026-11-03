@@ -6610,6 +6610,15 @@ pub struct DerivedExprSpec {
     /// named ODE state variable.  Used to gate `W_DERIVED_CMT_*` warnings so
     /// they fire only when compartment states are actually requested.
     pub uses_compartments: bool,
+    /// The names the expression looks up at evaluation time, other than the
+    /// built-ins (`IPRED`, `DV`, `TIME`, …) and earlier `[derived]` columns: an
+    /// individual parameter, a named compartment, or a data column. A covariate
+    /// overrides the first two on a clash, so each name here reads the dataset
+    /// column of that name whenever one exists. The model-aware reader raises
+    /// `W_COVARIATE_MISSING` for these columns as well as for
+    /// [`CompiledModel::referenced_covariates`] — a `[derived]`-only read is not
+    /// registered there, since it is not a required column (#2599).
+    pub reads: Vec<String>,
 }
 
 pub enum DerivedKind {

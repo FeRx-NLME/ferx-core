@@ -1296,9 +1296,26 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
         .with_no_carry_forward(no_carry_forward)
-        // `W_COVARIATE_MISSING` only for a column the model reads (#2599); the
-        // policy reader widens this with the caller's own covariate list.
-        .with_warn_missing_covariates(referenced_columns(model).into_iter().collect())
+        // `W_COVARIATE_MISSING` only for a column a relation reads (#2599).
+        .with_warn_missing_covariates(columns_read_by_relations(model))
+}
+
+/// Every data column a relation of `model` reads, the set `W_COVARIATE_MISSING`
+/// is raised for (#2599): the required [`referenced_columns`] plus the names a
+/// `[derived]` expression looks up at evaluation time, which are not required
+/// columns and so are not in `referenced_covariates`. A column that is only
+/// declared in `[covariates]` or listed in `covariate_columns`, with no relation
+/// reading it, is not here — a gap in it cannot reach the objective or an output.
+fn columns_read_by_relations(model: &CompiledModel) -> std::collections::HashSet<String> {
+    referenced_columns(model)
+        .into_iter()
+        .chain(
+            model
+                .derived_exprs
+                .iter()
+                .flat_map(|d| d.reads.iter().cloned()),
+        )
+        .collect()
 }
 
 /// Whether this model routes any observation row to its endpoint **by CMT** (#1409).
@@ -1678,20 +1695,7 @@ fn read_population_for_policy(
     column_map: &[(String, String)],
     missing_dv: MissingDvPolicy,
 ) -> Result<(Population, Option<CovariateTable>), String> {
-    let mut routing = obs_routing_for(model, missing_dv);
-    // A column the caller named as a covariate — declared in `[covariates]`, or
-    // listed in `fallback_columns` — is one they asked about, so a gap in it is
-    // still reported even if no relation reads it yet. Only an auto-detected
-    // column the model never reads is left quiet (#2599).
-    if let Some(warn) = routing.warn_missing_covariates.as_mut() {
-        warn.extend(covariate_decls.iter().flatten().map(|d| d.name.clone()));
-        warn.extend(
-            fallback_columns
-                .into_iter()
-                .flatten()
-                .map(|c| c.to_string()),
-        );
-    }
+    let routing = obs_routing_for(model, missing_dv);
     let (decls, extra) = match covariate_decls {
         Some(d) => (Some(d.as_slice()), undeclared_referenced(model, d)),
         // No block: still read every column the model references (#1936).

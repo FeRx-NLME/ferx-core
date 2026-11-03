@@ -186,6 +186,7 @@ fn derived_and_indiv_use_per_occasion_kappa() {
                 }),
             },
             uses_compartments: false,
+            reads: vec![],
         },
         // K_OUT exercises DerivedContext.eta threading (eta[1] = occasion κ).
         DerivedExprSpec {
@@ -194,6 +195,7 @@ fn derived_and_indiv_use_per_occasion_kappa() {
                 eval: Box::new(|ctx: &DerivedContext| ctx.eta.get(1).copied().unwrap_or(-1.0)),
             },
             uses_compartments: false,
+            reads: vec![],
         },
     ];
 
@@ -257,6 +259,7 @@ fn missing_kappa_falls_back_to_zero() {
             }),
         },
         uses_compartments: false,
+        reads: vec![],
     }];
     let model = minimal_iov_model(derived_exprs);
     let population = Population {

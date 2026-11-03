@@ -7644,8 +7644,14 @@ fn tokens_contain_comparison(tokens: &[Token]) -> bool {
     false
 }
 
-/// Parse a token slice as a fully-consuming arithmetic expression.
-fn parse_derived_expr(tokens: &[Token], ctx: ParseCtx<'_>) -> Result<Expression, String> {
+/// Parse a token slice as a fully-consuming arithmetic expression, recording
+/// every name it looks up at evaluation time in `reads` (see
+/// [`note_derived_reads`]).
+fn parse_derived_expr(
+    tokens: &[Token],
+    ctx: ParseCtx<'_>,
+    reads: &mut Vec<String>,
+) -> Result<Expression, String> {
     if tokens.is_empty() {
         return Err("expected expression, got empty token list".into());
     }
@@ -7656,11 +7662,17 @@ fn parse_derived_expr(tokens: &[Token], ctx: ParseCtx<'_>) -> Result<Expression,
             &tokens[pos..]
         ));
     }
+    visit_expr_nodes(&expr, &mut |e| note_derived_reads(e, reads));
     Ok(expr)
 }
 
-/// Parse a token slice as a fully-consuming boolean condition.
-fn parse_derived_cond(tokens: &[Token], ctx: ParseCtx<'_>) -> Result<Condition, String> {
+/// Parse a token slice as a fully-consuming boolean condition, recording every
+/// name it looks up at evaluation time in `reads`.
+fn parse_derived_cond(
+    tokens: &[Token],
+    ctx: ParseCtx<'_>,
+    reads: &mut Vec<String>,
+) -> Result<Condition, String> {
     if tokens.is_empty() {
         return Err("expected condition, got empty token list".into());
     }
@@ -7671,7 +7683,22 @@ fn parse_derived_cond(tokens: &[Token], ctx: ParseCtx<'_>) -> Result<Condition, 
             &tokens[pos..]
         ));
     }
+    visit_condition_nodes(&cond, &mut |e| note_derived_reads(e, reads));
     Ok(cond)
+}
+
+/// Record a name node of a `[derived]` expression in `reads`. Every such name is
+/// looked up in `build_derived_vars`' map at evaluation time, where a covariate
+/// overrides an individual parameter or compartment of the same name, so it is a
+/// read of the data column it names whenever one exists (#2599). `compartments[i]`
+/// (`__cmt_i`) never names a column; the built-ins and prior derived columns, which
+/// shadow a covariate, are dropped by the caller.
+fn note_derived_reads(e: &Expression, reads: &mut Vec<String>) {
+    if let Expression::Variable(name) | Expression::Covariate(name) = e {
+        if !name.starts_with("__cmt_") && !reads.contains(name) {
+            reads.push(name.clone());
+        }
+    }
 }
 
 /// Build a DerivedEvalFn closure from a parsed Expression.
@@ -7854,6 +7881,7 @@ fn parse_integral_kind(
     args: &[&[Token]],
     ctx: ParseCtx<'_>,
     parse_warnings: &mut Vec<String>,
+    reads: &mut Vec<String>,
 ) -> Result<DerivedKind, String> {
     if args.is_empty() {
         return Err(
@@ -7861,7 +7889,7 @@ fn parse_integral_kind(
         );
     }
 
-    let integrand_expr = parse_derived_expr(args[0], ctx)?;
+    let integrand_expr = parse_derived_expr(args[0], ctx, reads)?;
     let data_based = expr_refs_dv(&integrand_expr);
     // Also checked against condition below — must be `mut` so we can OR in
     // the condition's compartment references before the struct is built.
@@ -7877,7 +7905,7 @@ fn parse_integral_kind(
     let mut i = 1;
     // Second positional arg is a condition if it contains comparison operators.
     if i < args.len() && !is_keyword_arg_tokens(args[i]) && tokens_contain_comparison(args[i]) {
-        let cond = parse_derived_cond(args[i], ctx)?;
+        let cond = parse_derived_cond(args[i], ctx, reads)?;
         // If the filter condition references a compartment (e.g.
         // `integral(IPRED, compartments[0] > threshold, from=0, to=24)`),
         // we must set uses_compartments so the grid path populates the state
@@ -8072,6 +8100,9 @@ fn parse_derived_block(
             return Err(format!("[derived] `{name}` has an empty right-hand side"));
         }
 
+        // Every name the expression looks up at evaluation time (#2599).
+        let mut reads: Vec<String> = Vec::new();
+
         // ── Detect form ───────────────────────────────────────────────────────
         // `spec_uses_compartments` tracks whether this derived expression
         // references compartments[i] or named ODE state variables anywhere.
@@ -8108,7 +8139,7 @@ fn parse_derived_block(
                 let args = split_top_level_commas(interior);
 
                 if fname_lc == "integral" {
-                    let kind = parse_integral_kind(&args, ctx, parse_warnings)?;
+                    let kind = parse_integral_kind(&args, ctx, parse_warnings, &mut reads)?;
                     let uses = matches!(
                         kind,
                         DerivedKind::Integral {
@@ -8128,7 +8159,7 @@ fn parse_derived_block(
                     // filter, so this is the numeric form. Parsed as a plain expression
                     // over the *whole* statement, so it means the same thing at
                     // statement top level as it does nested one level in.
-                    let expr = parse_derived_expr(&tokens, ctx)?;
+                    let expr = parse_derived_expr(&tokens, ctx, &mut reads)?;
                     let uses = expr_refs_compartments(&expr, ctx.ode_state_names);
                     (
                         DerivedKind::PerRow {
@@ -8175,10 +8206,10 @@ fn parse_derived_block(
                     };
                     let value_tokens = args.first().copied().unwrap_or(&[]);
                     let filter_tokens = if args.len() >= 2 { Some(args[1]) } else { None };
-                    let value_expr = parse_derived_expr(value_tokens, ctx)?;
+                    let value_expr = parse_derived_expr(value_tokens, ctx, &mut reads)?;
                     let value_uses = expr_refs_compartments(&value_expr, ctx.ode_state_names);
                     let (filter, filter_uses) = if let Some(ft) = filter_tokens {
-                        let cond = parse_derived_cond(ft, ctx)?;
+                        let cond = parse_derived_cond(ft, ctx, &mut reads)?;
                         let uses = cond_refs_compartments(&cond, ctx.ode_state_names);
                         (Some(build_derived_filter_fn(cond)), uses)
                     } else {
@@ -8193,7 +8224,7 @@ fn parse_derived_block(
                 }
             } else {
                 // Plain expression → PerRow
-                let expr = parse_derived_expr(&tokens, ctx)?;
+                let expr = parse_derived_expr(&tokens, ctx, &mut reads)?;
                 let uses = expr_refs_compartments(&expr, ctx.ode_state_names);
                 (
                     DerivedKind::PerRow {
@@ -8204,7 +8235,7 @@ fn parse_derived_block(
             }
         } else {
             // Starts with a literal or unary minus
-            let expr = parse_derived_expr(&tokens, ctx)?;
+            let expr = parse_derived_expr(&tokens, ctx, &mut reads)?;
             let uses = expr_refs_compartments(&expr, ctx.ode_state_names);
             (
                 DerivedKind::PerRow {
@@ -8214,11 +8245,18 @@ fn parse_derived_block(
             )
         };
 
+        // A built-in or an earlier derived column shadows a covariate of the same
+        // name in `build_derived_vars`, so it is not a read of the data.
+        reads.retain(|r| {
+            !BUILTIN_SPECIALS.iter().any(|b| b.eq_ignore_ascii_case(r))
+                && !defined_derived.iter().any(|d| d.eq_ignore_ascii_case(r))
+        });
         defined_derived.push(name.clone());
         specs.push(DerivedExprSpec {
             name,
             kind,
             uses_compartments: spec_uses_compartments,
+            reads,
         });
     }
 
