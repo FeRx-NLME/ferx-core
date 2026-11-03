@@ -605,14 +605,14 @@ alongside the all-cause survival `S_all(t) = exp(−Σ_j H_j(t))`. With competin
 risks the naive `1 − exp(−H_k)` *over*-states a cause's incidence
 (it ignores that the other causes remove subjects from risk); the reported CIF is
 correct, and across all causes `Σ_k F_k(t) + S_all(t) = 1` exactly.
-For a single endpoint it reduces to `F(t) = 1 − S(t)`. Rows come in ascending
-CMT order per subject, identically on every call.
+For a single endpoint it reduces to `F(t) = 1 − S(t)`. Rows: ascending CMT per
+subject.
 
 **Estimation note.** The cause-specific *rates* are well-identified and recover
 tightly. The shared frailty variance ω² is weakly identified for TTE and reads
 high under FOCEI-Laplace at higher event rates (the same approximation limit as
 single-endpoint frailty; see below) — prefer SAEM/IMP for the variance component.
-Subdistribution-hazard (Fine–Gray) modelling is not provided;
+Subdistribution-hazard (Fine–Gray) modelling is not currently provided;
 cause-specific hazard covers the standard pharmacometric use case.
 
 **Validation of the cumulative incidence.** The CIF is anchored at three levels:
@@ -629,7 +629,7 @@ cause-specific hazard covers the standard pharmacometric use case.
 3. *Nonparametric reference (R `cmprsk::cuminc`).* Simulating the example's two
    exponential causes (`λ_A = 0.10`, `λ_B = 0.06`, administrative censoring at
    `t = 14`, `N = 200 000`) and estimating the cumulative incidence with the
-   `cmprsk::cuminc` reproduces ferx's analytic CIF (max absolute
+   license-free `cmprsk::cuminc` reproduces ferx's analytic CIF (max absolute
    difference `≈ 2·10⁻³`, i.e. Monte-Carlo noise):
 
    | t | cause A — `cmprsk` | cause A — ferx | cause B — `cmprsk` | cause B — ferx |
