@@ -900,8 +900,12 @@ the restart above was adopted because it beat the floored run, and was still 36.
 where the fit began. In a chained fit (`method = [foce, focei]`) each stage is its own fit
 for this purpose: it is measured against its own first evaluation, at the previous stage's
 estimates, not against your initial values. The check covers the FOCE-family NLopt outer
-loop only; `gn`, `gn_hybrid` (including its FOCE-I polish) and the profiled loop do not run
-it.
+loop and the outer loop of a fit with a
+[profiled level block](../model-file/parameters.qmd#profiled-level-blocks) (#2519). There
+both objectives are the profiled one, the levels solved at the point: the start's is what
+`maxiter = 0` reports, plus any covariate-network penalty. On the profile tests' MBMA fixture with `inner_maxiter = 2`, the guard
+rejects the start (OFV 26.47) and the run ends at 66.02, which is now reported not
+converged. `gn` and `gn_hybrid` (including its FOCE-I polish) do not run the check.
 
 On that transit fit, `max_unconverged_frac = 0.3` lets the optimizer rank the start: the
 same L-BFGS fit then stays at OFV −228.8107 (macOS), reported with `W_STALLED_AT_INIT`,

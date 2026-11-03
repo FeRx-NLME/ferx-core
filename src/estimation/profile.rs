@@ -60,7 +60,8 @@ use crate::estimation::outer_optimizer::{
     flat_theta_candidates, flat_theta_probe_moves, flat_theta_probe_value, flat_theta_warning,
     joint_warm_start, joint_warm_starts, max_scaled_deviation, population_gradient,
     resolve_outer_ftol, runs_outer_optimizer, subject_nll, OuterFdDeclineLog, OuterResult,
-    OuterTrial, PolishEnd, INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS, POLISH_FTOL_REL, POLISH_XTOL_REL,
+    OuterTrial, PolishEnd, StartEval, INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS, POLISH_FTOL_REL,
+    POLISH_XTOL_REL,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_params,
@@ -2733,12 +2734,49 @@ pub(crate) fn optimize_profiled(
     let ebe_accum = Mutex::new(EbeAccum::default());
     // The subjects whose profile-solve level gradient fell back to FD at any evaluation.
     let fd_gradients = Mutex::new(std::collections::BTreeSet::new());
+    // The run's first evaluation, unguarded: the reference `escape_floor` holds the reported
+    // objective against (#2519, the unprofiled loop's #2461). NLopt's first call is `x0`.
+    // It is the profiled objective — the levels re-solved at the start, what an
+    // `outer_maxiter = 0` fit reports — plus the NN penalty `escape_floor` ranks with.
+    let start_eval: Mutex<Option<StartEval>> = Mutex::new(None);
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
     let evaluate_once = |x: &[f64]| -> Option<ProfileSolve> {
-        n_evals.fetch_add(1, Ordering::Relaxed);
+        let first_call = n_evals.fetch_add(1, Ordering::Relaxed) == 0;
         let params = unpack_params(x, &hold);
         let warm = best.lock().unwrap().warm.clone();
         let mut work = ProfileCounts::default();
         let solved = ctx.solve_counted(&params, &warm, &mut work);
+        // The unprofiled loop's EBE guard, on the same counts: too many unconverged
+        // subjects (or one hard-rejected at its start) and the trial is a wall.
+        let guarded = solved.as_ref().is_ok_and(|s| {
+            ebe_guard_rejects(
+                &s.ebe,
+                population.subjects.len(),
+                s.ofv,
+                options.max_unconverged_frac,
+            )
+        });
+        // Recorded before the guard returns, so a rejected start carries its verdict; a
+        // failed solve records `∞`, which `above_start_warning` skips. `n_start_rejected`
+        // is copied for parity with the unprofiled loop: the inner start reject needs a
+        // non-zero warm η (#2212), which this cold first call never has.
+        if first_call {
+            let start = match &solved {
+                Ok(s) => StartEval {
+                    ofv: s.ofv + nn_reg.penalty_value(&params.theta),
+                    guard_rejected: guarded,
+                    n_unconverged: s.ebe.n_unconverged,
+                    n_start_rejected: s.ebe.n_start_rejected,
+                },
+                Err(_) => StartEval {
+                    ofv: f64::INFINITY,
+                    guard_rejected: false,
+                    n_unconverged: 0,
+                    n_start_rejected: 0,
+                },
+            };
+            *start_eval.lock().unwrap() = Some(start);
+        }
         {
             let mut acc = ebe_accum.lock().unwrap();
             acc.work.add(&work);
@@ -2754,14 +2792,7 @@ pub(crate) fn optimize_profiled(
             acc.max_unconverged = acc.max_unconverged.max(solve.ebe.n_unconverged);
             acc.total_fallback += solve.ebe.n_fallback;
             acc.total_nm_polished += solve.ebe.n_nm_polished;
-            // The unprofiled loop's EBE guard, on the same counts: too many unconverged
-            // subjects (or one hard-rejected at its start) and the trial is a wall.
-            if ebe_guard_rejects(
-                &solve.ebe,
-                population.subjects.len(),
-                solve.ofv,
-                options.max_unconverged_frac,
-            ) {
+            if guarded {
                 acc.n_guarded += 1;
                 return None;
             }
@@ -3103,7 +3134,7 @@ pub(crate) fn optimize_profiled(
         stationary_start: start_verdict.1,
         mixture_posteriors: None,
         vi: None,
-        start_eval: None,
+        start_eval: start_eval.into_inner().unwrap(),
     }
 }
 
