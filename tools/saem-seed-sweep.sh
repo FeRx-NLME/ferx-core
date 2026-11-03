@@ -73,10 +73,20 @@ done
 if [ -z "$model" ] || [ -z "$data" ] || [ ${#revs[@]} -eq 0 ]; then
   usage >&2; exit 2
 fi
+# Seeds become run-directory names that are `rm -rf`-ed before each run, so they
+# must be plain non-negative integers: anything else (`../..`, a slash) could name
+# a directory outside the sweep.
+is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
+for v in $seeds $imp_seed $fixed_saem; do
+  is_uint "$v" || { echo "error: seed '$v' is not a non-negative integer" >&2; exit 2; }
+done
+for v in "$jobs" "$threads"; do
+  is_uint "$v" || { echo "error: '$v' is not a non-negative integer" >&2; exit 2; }
+done
 grep -Eq '^[[:space:]]*\[fit_options\]' "$model" || {
   echo "error: $model has no [fit_options] block to put the seeds in" >&2; exit 2; }
 
-repo=$(git rev-parse --show-toplevel)
+repo=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 workdir=${workdir:-${CARGO_TARGET_DIR:-$repo/target}/saem-seed-sweep}
 mkdir -p "$workdir"
 workdir=$(cd "$workdir" && pwd)
@@ -103,6 +113,8 @@ done
 # One fit. Arguments: sha seed imp_seed. Writes <rundir>/objective.
 run_one() {
   local sha=$1 s=$2 is=$3
+  [[ $sha =~ ^[0-9a-f]{40}$ && $s =~ ^[0-9]+$ && $is =~ ^[0-9]+$ ]] ||
+    { echo "error: refusing run directory for '$sha' '$s' '$is'" >&2; return 1; }
   local d=$workdir/runs/$sha/s$s-i$is
   rm -rf "$d"; mkdir -p "$d"
   # Drop any existing seed / imp_seed line, then add both right under [fit_options].
@@ -111,9 +123,17 @@ run_one() {
     { print }
     /^[[:space:]]*\[fit_options\]/ { print "  seed = " s; print "  imp_seed = " is }
   ' "$model" > "$d/model.ferx"
-  "$workdir/target-$sha/ci-test/ferx" "$d/model.ferx" --data "$data" \
-    --threads "$threads" --clean > "$d/stdout.log" 2>&1 || true
-  sed -n 's/.*-2 log L (IS): *\([^ ]*\).*/\1/p' "$d/stdout.log" | head -1 > "$d/objective"
+  # The CLI writes model-fit.yaml, model-sdtab.csv and its model.tmp checkpoint to
+  # its WORKING directory, so each run has to start in its own: run from the
+  # caller's directory, parallel fits overwrite one another's outputs, race on
+  # one checkpoint file, and clobber any model-* files the caller already had.
+  (cd "$d" && "$workdir/target-$sha/ci-test/ferx" "$d/model.ferx" --data "$data" \
+    --threads "$threads" --clean) > "$d/stdout.log" 2>&1 || true
+  # Keep only a finite decimal number. A collapsed IS run can print `inf` or
+  # `NaN`, which awk reads as 0 and would fold into the mean as a real value;
+  # those, like a run with no IS line at all, become NA.
+  sed -n 's/.*-2 log L (IS): *\([^ ]*\).*/\1/p' "$d/stdout.log" | head -1 |
+    grep -E '^[-+]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][-+]?[0-9]+)?$' > "$d/objective" || true
 }
 export -f run_one
 export workdir model data threads
