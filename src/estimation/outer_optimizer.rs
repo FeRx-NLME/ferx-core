@@ -3810,8 +3810,9 @@ type StartProbe<'a> = dyn Fn(&ModelParameters, f64, usize) + 'a;
 ///   other.
 /// - `Some(true)` — the probe's result as well, through [`verified_start_result`]: the
 ///   probe is a complete fit whose own stop rule, checks and warnings stand as they are,
-///   so nothing of the first attempt's verdict is carried over or rewritten. No retry —
-///   there is no stall to retry.
+///   so nothing of the first attempt's verdict is carried over or rewritten — at the first
+///   attempt's point when `penalized` puts it at or below the probe's. No retry — there
+///   is no stall to retry.
 /// - `None` — the first attempt, retried exactly when it did not leave its start.
 ///
 /// The probe's evaluations count in the reported `n_iterations` whichever result is
@@ -3821,6 +3822,7 @@ fn settle_start_probe(
     first: (OuterResult, Option<RestartCause>),
     first_left_init: bool,
     probed: Option<ProbedAttempt>,
+    penalized: impl Fn(&OuterResult) -> f64,
 ) -> ((OuterResult, Option<RestartCause>), bool) {
     let (mut first, first_cause) = first;
     match probed {
@@ -3836,8 +3838,12 @@ fn settle_start_probe(
         }
         Some((found, found_cause, Some(true))) => {
             let left = found.left_init != Some(false);
+            let start_wins = penalized(&first) <= penalized(&found);
             (
-                (verified_start_result(found, left, &first), found_cause),
+                (
+                    verified_start_result(found, left, first, start_wins),
+                    found_cause,
+                ),
                 true,
             )
         }
@@ -3849,17 +3855,46 @@ fn settle_start_probe(
     }
 }
 
-/// The probe's result, reported for a start the probe verified (#2506): its own estimates,
-/// objective, `converged` verdict and warnings, as the probe produced them. `left` is
-/// whether those estimates are off the user's start by [`INIT_ESCAPE_STEP_S`]; within it
-/// the result is published `left_init = Some(false)` with `stationary_start = true`, which
+/// The result reported for a start the probe verified (#2506): the probe's `converged`
+/// verdict and warnings, as the probe produced them, at the **lower** of the two points.
+/// `start_wins` says the unmoved run's penalized objective is at or below the probe's;
+/// the probe stops on its own `ftol`, which on an OFV near 1000 lets it end ~1e-3 above
+/// a start that was already the optimum (measured on `two_cpt_iv`, Linux), and a fit
+/// must not publish a point worse than one it already evaluated. When the start wins,
+/// everything tied to the point — estimates, objective, EBEs, covariance, final gradient
+/// — is the unmoved run's. `left` is whether the reported estimates are off the user's
+/// start by [`INIT_ESCAPE_STEP_S`] (never, when the start wins); within it the result is
+/// published `left_init = Some(false)` with `stationary_start = true`, which
 /// `model_selection::stalled_at_init` reads as a warm start rather than a stall. The
-/// unmoved run's evaluations count in `n_iterations`, and its `start_eval` — the fit's first evaluation, at the user's start — is the one published (#2461).
-fn verified_start_result(mut probe: OuterResult, left: bool, unmoved: &OuterResult) -> OuterResult {
+/// unmoved run's evaluations count in `n_iterations`, and its `start_eval` — the fit's
+/// first evaluation, at the user's start — is the one published (#2461).
+fn verified_start_result(
+    mut probe: OuterResult,
+    left: bool,
+    unmoved: OuterResult,
+    start_wins: bool,
+) -> OuterResult {
+    let left = left && !start_wins;
     probe.start_eval = unmoved.start_eval;
     probe.left_init = Some(left);
     probe.stationary_start = !left;
     probe.n_iterations += unmoved.n_iterations;
+    if start_wins {
+        probe.params = unmoved.params;
+        probe.ofv = unmoved.ofv;
+        probe.eta_hats = unmoved.eta_hats;
+        probe.h_matrices = unmoved.h_matrices;
+        probe.kappas = unmoved.kappas;
+        probe.covariance_matrix = unmoved.covariance_matrix;
+        probe.covariance_method = unmoved.covariance_method;
+        probe.covariance_wall_time_secs = unmoved.covariance_wall_time_secs;
+        probe.sir_fallback_proposal = unmoved.sir_fallback_proposal;
+        probe.final_gradient = unmoved.final_gradient;
+        probe.final_gradient_source = unmoved.final_gradient_source;
+        probe.cond_dist = unmoved.cond_dist;
+        probe.packed_estimate = unmoved.packed_estimate;
+        probe.mixture_posteriors = unmoved.mixture_posteriors;
+    }
     probe
 }
 
@@ -3899,7 +3934,8 @@ fn start_probe_stall_warning(
 ///
 /// - `Some(true)` — the start is verified, and the probe's result is reported through
 ///   [`verified_start_result`]: a complete fit, whose own verdict and warnings stand, so
-///   nothing about the unmoved run is rewritten;
+///   nothing about the unmoved run is rewritten — at the start's point when the probe
+///   ended above it;
 /// - `Some(false)` — the start was a stall: `result` is reported, published
 ///   `left_init = Some(false)` so it is flagged as one, with [`start_probe_stall_warning`];
 /// - `None` — `result` is reported unchanged, and the displacement check judges it.
@@ -3996,7 +4032,7 @@ pub(crate) fn verify_unmoved_start(
         }
         Some(true) => {
             let left = off_start(&probe);
-            verified_start_result(probe, left, &result)
+            verified_start_result(probe, left, result, start_ofv <= probe_ofv)
         }
         None => OuterResult {
             n_iterations: result.n_iterations + probe.n_iterations,
@@ -4840,6 +4876,7 @@ fn optimize_nlopt(
         probed
             .take()
             .map(|(found, outcome, verdict)| (found, outcome.restart_cause(), verdict)),
+        &penalized,
     );
     let (first, restart_cause) = resolve_stall_retry(
         options.optimizer,
