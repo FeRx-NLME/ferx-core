@@ -3879,6 +3879,12 @@ fn verified_start_result(
     probe.left_init = Some(left);
     probe.stationary_start = !left;
     probe.n_iterations += unmoved.n_iterations;
+    // The covariance quartet goes with `packed_estimate`, which names the vector the
+    // inline covariance step used (#816); the covariance step's warnings cannot be told
+    // apart from the probe's other warnings, so off NLopt (where each run ran its own step)
+    // they stay the probe's, from a point within `START_PROBE_TOL` of this one. On NLopt
+    // the step is deferred and runs once, on the point reported. The probe's restart cause
+    // also stays: a restart it triggers is adopted only when lower (PR #2625 review 4, 7).
     if start_wins {
         probe.params = unmoved.params;
         probe.ofv = unmoved.ofv;
