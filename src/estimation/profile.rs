@@ -2744,18 +2744,25 @@ pub(crate) fn optimize_profiled(
         let warm = best.lock().unwrap().warm.clone();
         let mut work = ProfileCounts::default();
         let solved = ctx.solve_counted(&params, &warm, &mut work);
+        // The unprofiled loop's EBE guard, on the same counts: too many unconverged
+        // subjects (or one hard-rejected at its start) and the trial is a wall.
+        let guarded = solved.as_ref().is_ok_and(|s| {
+            ebe_guard_rejects(
+                &s.ebe,
+                population.subjects.len(),
+                s.ofv,
+                options.max_unconverged_frac,
+            )
+        });
         // Recorded before the guard returns, so a rejected start carries its verdict; a
-        // failed solve records `∞`, which `above_start_warning` skips.
+        // failed solve records `∞`, which `above_start_warning` skips. `n_start_rejected`
+        // is copied for parity with the unprofiled loop: the inner start reject needs a
+        // non-zero warm η (#2212), which this cold first call never has.
         if first_call {
             let start = match &solved {
                 Ok(s) => StartEval {
                     ofv: s.ofv + nn_reg.penalty_value(&params.theta),
-                    guard_rejected: ebe_guard_rejects(
-                        &s.ebe,
-                        population.subjects.len(),
-                        s.ofv,
-                        options.max_unconverged_frac,
-                    ),
+                    guard_rejected: guarded,
                     n_unconverged: s.ebe.n_unconverged,
                     n_start_rejected: s.ebe.n_start_rejected,
                 },
@@ -2783,14 +2790,7 @@ pub(crate) fn optimize_profiled(
             acc.max_unconverged = acc.max_unconverged.max(solve.ebe.n_unconverged);
             acc.total_fallback += solve.ebe.n_fallback;
             acc.total_nm_polished += solve.ebe.n_nm_polished;
-            // The unprofiled loop's EBE guard, on the same counts: too many unconverged
-            // subjects (or one hard-rejected at its start) and the trial is a wall.
-            if ebe_guard_rejects(
-                &solve.ebe,
-                population.subjects.len(),
-                solve.ofv,
-                options.max_unconverged_frac,
-            ) {
+            if guarded {
                 acc.n_guarded += 1;
                 return None;
             }
