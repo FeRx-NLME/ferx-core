@@ -821,7 +821,8 @@ the unprofiled one (#2136):
   BFGS solve does (#2539). `W_PROFILE_FD_GRADIENT` gives the number of such subjects,
   once for the fit and once for the covariance step (#2109, #2405). The covariance step's exact level Hessians
   fall back the same way, with a warning of their own. A subject with fewer
-  observations than `min_obs_for_convergence_check` whose inner solve stopped short
+  rows (Gaussian observations plus time-to-event, binary and Markov records, #2111)
+  than `min_obs_for_convergence_check` whose inner solve stopped short
   (an uncertified Nelder–Mead fallback included) still takes the re-solved differences, but these
   warnings do not count it, as the fit's unconverged-EBE count does not (#2408).
 - **The log-packing floor.** A structural θ that the optimizer drives onto ferx's

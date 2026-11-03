@@ -1297,9 +1297,11 @@ impl Subject {
         self.obs_covariates.get(j).unwrap_or(&self.covariates)
     }
 
-    /// The rows that enter this subject's likelihood: its Gaussian observations plus its
-    /// non-Gaussian records (time-to-event, discrete-state, count), which are disjoint. The
-    /// count `min_obs_for_convergence_check` compares against (#2111): measured on the
+    /// This subject's Gaussian observations plus its non-Gaussian records (time-to-event,
+    /// discrete-state, count), which are disjoint: the count `min_obs_for_convergence_check`
+    /// compares against (#2111). A Markov chain's first record is counted although no term
+    /// scores it (the likelihood scores transitions), so a two-record Markov subject counts
+    /// two for one scored transition. Measured on the
     /// Gaussian observations alone, a binary-only or time-to-event-only subject counted as
     /// having none, so its unconverged EBE was never counted and never warned about.
     pub(crate) fn n_scored_rows(&self) -> usize {

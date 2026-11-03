@@ -881,6 +881,29 @@ fn profile_refuses_a_global_search_and_a_prior() {
     );
 }
 
+/// With two refused endpoints the refusal names one, by the order `profile_refused_endpoint`
+/// documents: time-to-event before Markov (DTMM). Mutation: rank time-to-event after the
+/// Markov kinds and the message names the DTMM (#2604 review r2, row N3).
+#[cfg(feature = "markov")]
+#[test]
+fn with_two_refused_endpoints_the_refusal_names_time_to_event_first() {
+    let text = counted()
+        .replace(
+            "  omega ETA_E0",
+            "  theta TVLAMBDA(0.05, 0.001, 10.0)\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  omega ETA_E0",
+        )
+        .replace(
+            "[error_model]",
+            "[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA\n\n[markov_model]\n  type   = dtmm\n  cmt    = 5\n  states = [awake=0, asleep=1]\n  transition awake  -> asleep = inv_logit(LQ01)\n  transition asleep -> awake  = inv_logit(LQ10)\n\n[error_model]",
+        );
+    let msg = one_refusal(
+        &scope(&model_of(&text), &FitOptions::default()),
+        &format!("{SCORES}this model has a time-to-event endpoint."),
+        REMOVE,
+    );
+    assert!(!msg.contains("Markov"), "{msg}");
+}
+
 /// Review #6: the time-to-event arm, named, and no "also".
 #[cfg(feature = "survival")]
 #[test]
