@@ -3680,7 +3680,7 @@ pub(crate) fn conditional_eta_precision(
         h_matrix,
         &model.error_spec,
         sigma_values,
-        model.bloq_method,
+        model.bloq_in_force(),
         &[],
         n_eta,
         None,

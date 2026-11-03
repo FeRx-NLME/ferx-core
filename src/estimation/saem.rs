@@ -3827,8 +3827,8 @@ pub(crate) fn imh_supported_model(model: &CompiledModel) -> bool {
         && model.mixture.is_none()
         && model.frem_config.is_none()
         && !model.is_sde()
-        && model.residual_correlations.is_empty()
-        && !matches!(model.bloq_method, crate::types::BloqMethod::M3)
+        && !model.residual_is_dense()
+        && !matches!(model.bloq_in_force(), crate::types::BloqMethod::M3)
         && !model.has_non_gaussian()
         && !model.log_transform
         && crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(model)
