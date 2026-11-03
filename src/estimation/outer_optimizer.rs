@@ -3328,6 +3328,21 @@ fn basin_probe_restart_share() -> f64 {
     BASIN_PROBE_RESTART_SHARE
 }
 
+/// The objective the mid-leg basin probe compares its cold solve against: the active leg's
+/// incumbent (#2600 review). A #2462 verification leg evaluates at a tighter inner tolerance
+/// and ranks in its own `leg_best`, so its probe solves at that leg's options
+/// (`eval_options`) and is scored against `leg_best`. Against the pre-leg `best_seen`, at
+/// the fit's tolerance, it would compare two objective surfaces, and an absorb would copy a
+/// loose objective into the leg's incumbent.
+fn basin_probe_reference(
+    in_verify_leg: bool,
+    leg_best: &BestPoint,
+    best_seen: &BestPoint,
+) -> Option<f64> {
+    let best = if in_verify_leg { leg_best } else { best_seen };
+    best.get().map(|b| b.ofv_clean)
+}
+
 /// Make the mid-leg probe's cold solve the leg's incumbent when it absorbs it (#2600):
 /// `ofv = (penalized, clean)` at `solve.xs`, its EBE state `solve`, and `modes` (the warm
 /// starts built from it).
@@ -6436,26 +6451,33 @@ fn optimize_nlopt_attempt(
                     .unwrap()
                     .as_ref()
                     .map(|inc| inc.xs.clone());
-                let best = best_seen_cl.lock().unwrap().get().map(|b| b.ofv_clean);
+                // The active leg's objective: inside a #2462 verification leg, its own
+                // incumbent at its own tolerance, never `best_seen`'s loose one (#2600 review).
+                let best = {
+                    let leg = leg_best.borrow();
+                    let seen = best_seen_cl.lock().unwrap();
+                    basin_probe_reference(in_verify_leg, &leg, &seen)
+                };
+                let probe_options = eval_options;
                 if let Some(xs_inc) = incumbent {
                     let x_inc: Vec<f64> = xs_inc.iter().zip(&scale).map(|(v, s)| v * s).collect();
                     let p = unpack_params(&x_inc, init_params);
-                    let mu_k = compute_mu_k(model, &p.theta, options.mu_referencing);
+                    let mu_k = compute_mu_k(model, &p.theta, probe_options.mu_referencing);
                     let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
                         model,
                         population,
                         &p,
-                        options.inner_maxiter,
-                        options.inner_tol,
+                        probe_options.inner_maxiter,
+                        probe_options.inner_tol,
                         None,
                         Some(&mu_k),
-                        options.min_obs_for_convergence_check as usize,
-                        options.inner_restarts,
-                        InnerHessianSeed::for_options(options),
-                        options,
+                        probe_options.min_obs_for_convergence_check as usize,
+                        probe_options.inner_restarts,
+                        InnerHessianSeed::for_options(probe_options),
+                        probe_options,
                     );
-                    let cold =
-                        2.0 * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, options);
+                    let cold = 2.0
+                        * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, probe_options);
                     if let Some(gap) = cold_solve_beats_best_seen(Some(cold), best) {
                         // #2600: how many subjects the gap is, which decides between ending
                         // the leg and absorbing the cold modes into it.

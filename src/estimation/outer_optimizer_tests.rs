@@ -9485,6 +9485,34 @@ fn the_basin_probe_restarts_on_a_material_share_and_absorbs_a_handful() {
     assert_eq!(basin_probe_action(None, 10), Restart);
 }
 
+/// Inside a #2462 verification leg the basin probe scores against the leg's own incumbent,
+/// not the pre-leg `best_seen` (#2600 review round 2), and outside one against `best_seen`.
+/// The two hold different objectives on purpose (the leg's is at a tighter inner tolerance),
+/// so each side names the tracker it must read.
+#[test]
+fn the_basin_probe_reads_the_active_legs_incumbent() {
+    let mut leg = BestPoint::new();
+    let mut seen = BestPoint::new();
+    assert_eq!(basin_probe_reference(true, &leg, &seen), None);
+    seen.observe(1, &[0.0], 100.0, 99.0);
+    assert_eq!(
+        basin_probe_reference(true, &leg, &seen),
+        None,
+        "not best_seen in a leg"
+    );
+    leg.observe(2, &[0.1], 101.0, 100.5);
+    assert_eq!(
+        basin_probe_reference(true, &leg, &seen),
+        Some(100.5),
+        "the leg's own"
+    );
+    assert_eq!(
+        basin_probe_reference(false, &leg, &seen),
+        Some(99.0),
+        "best_seen outside"
+    );
+}
+
 /// The absorb arm records the cold solve as the incumbent (#2600 review): a warm incumbent
 /// at 100 whose cold re-solve scores 90, then a trial at 95, between the two. Before the
 /// fix only the warm-start cache moved, so `state.best_ofv` and `best_seen` stayed at 100,
