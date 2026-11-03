@@ -2323,6 +2323,16 @@ pub fn ferx_core::stats::convergence::ess_bulk(chains: &[alloc::vec::Vec<f64>]) 
 pub fn ferx_core::stats::convergence::ess_tail(chains: &[alloc::vec::Vec<f64>]) -> f64
 pub fn ferx_core::stats::convergence::quantile_sorted(sorted: &[f64], q: f64) -> f64
 pub fn ferx_core::stats::convergence::split_rhat(chains: &[alloc::vec::Vec<f64>]) -> f64
+pub mod ferx_core::stats::eta_density
+pub enum ferx_core::stats::eta_density::DensityKind
+pub ferx_core::stats::eta_density::DensityKind::Beta
+pub ferx_core::stats::eta_density::DensityKind::Gamma
+pub ferx_core::stats::eta_density::DensityKind::InvGamma
+pub ferx_core::stats::eta_density::DensityKind::LogNormal
+pub ferx_core::stats::eta_density::DensityKind::Logistic
+pub ferx_core::stats::eta_density::DensityKind::LogitNormal
+pub ferx_core::stats::eta_density::DensityKind::StudentT
+pub struct ferx_core::stats::eta_density::EtaDensity
 pub mod ferx_core::stats::likelihood
 pub fn ferx_core::stats::likelihood::apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[core::option::Option<f64>])
 pub fn ferx_core::stats::likelihood::build_block_diag_omega(omega_bsv: &nalgebra::base::alias::DMatrix<f64>, omega_iov: &nalgebra::base::alias::DMatrix<f64>, n_occasions: usize) -> nalgebra::base::alias::DMatrix<f64>
@@ -2891,6 +2901,7 @@ pub ferx_core::types::CompiledModel::dv_pre_logged: bool
 pub ferx_core::types::CompiledModel::endpoints: std::collections::hash::map::HashMap<usize, ferx_core::EndpointLikelihood>
 pub ferx_core::types::CompiledModel::error_model: ferx_core::ErrorModel
 pub ferx_core::types::CompiledModel::error_spec: ferx_core::ErrorSpec
+pub ferx_core::types::CompiledModel::eta_densities: alloc::vec::Vec<ferx_core::stats::eta_density::EtaDensity>
 pub ferx_core::types::CompiledModel::eta_map: alloc::vec::Vec<i32>
 pub ferx_core::types::CompiledModel::eta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CompiledModel::eta_param_info: alloc::vec::Vec<ferx_core::EtaParamInfo>
@@ -4401,6 +4412,7 @@ pub ferx_core::CompiledModel::dv_pre_logged: bool
 pub ferx_core::CompiledModel::endpoints: std::collections::hash::map::HashMap<usize, ferx_core::EndpointLikelihood>
 pub ferx_core::CompiledModel::error_model: ferx_core::ErrorModel
 pub ferx_core::CompiledModel::error_spec: ferx_core::ErrorSpec
+pub ferx_core::CompiledModel::eta_densities: alloc::vec::Vec<ferx_core::stats::eta_density::EtaDensity>
 pub ferx_core::CompiledModel::eta_map: alloc::vec::Vec<i32>
 pub ferx_core::CompiledModel::eta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CompiledModel::eta_param_info: alloc::vec::Vec<ferx_core::EtaParamInfo>

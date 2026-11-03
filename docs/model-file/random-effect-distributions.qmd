@@ -1,0 +1,119 @@
+---
+title: "Random-effect distributions"
+---
+
+> **Maturity: experimental** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+By default every ETA is Gaussian, `η ~ N(0, Ω)`. A `density` clause on its
+`omega` line gives it another distribution instead
+([#1716](https://github.com/FeRx-NLME/ferx-core/issues/1716)):
+
+```
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVF(0.6, 0.01, 0.99)
+  theta NU(10.0, 2.5, 100.0)
+  omega ETA_CL ~ 0.09 density gamma
+  omega ETA_F  ~ 0.02 density beta(TVF)
+  omega ETA_V  ~ 0.06 density t(NU)
+
+[individual_parameters]
+  CL = TVCL * ETA_CL      # Gamma-distributed clearance, mean TVCL
+  F  = ETA_F              # Beta-distributed bioavailability, mean TVF
+  V  = TVV * exp(ETA_V)   # heavy-tailed log volume
+```
+
+As in Pumas's `@random` block, the ETA *is* the distributed quantity: under
+`density gamma`, `ETA_CL` is a positive random variable with mean 1, so
+`CL = TVCL * ETA_CL` has mean `TVCL` exactly. There is none of the mean bias of
+`TVCL * exp(η)` or of a logit-normal fraction.
+
+## Distributions
+
+| `density` | support | mean | spread | shape θ |
+|---|---|---|---|---|
+| `t(ν)` | ℝ | 0 | scale² ω (variance `ω·ν/(ν−2)`) | ν, bounded above 0 |
+| `logistic` | ℝ | 0 | variance ω | — |
+| `gamma` | (0, ∞) | 1 | variance ω | — |
+| `invgamma` | (0, ∞) | 1 | variance ω | — |
+| `lognormal` | (0, ∞) | 1 | variance ω | — |
+| `beta(μ)` | (0, 1) | μ | variance ω (needs ω < μ(1 − μ)) | μ, bounded in [0, 1] |
+| `logitnormal(μ)` | (0, 1) | — | `logit η ~ N(logit μ, ω)` | μ, bounded in [0, 1] |
+
+The value on the `omega` line is always ω. A shape θ is named inside the
+parentheses, or declared automatically by empty ones: `density t()` declares
+`NU_ETA_V` (init 80, bounds 3–100) and `density beta()` declares `MU_ETA_F`
+(init 0.5, bounds 0.001–0.999).
+
+A `block_omega` can carry `density t(ν)`, which makes the block a multivariate
+t with one ν. The other kinds are univariate, and a block of them is refused:
+correlating them needs a copula, which is not supported.
+
+## Transforms
+
+`transform KIND(SHAPE)` is the other form: η stays `N(0, ω)` and the model reads
+`h(η)` wherever it reads the ETA. It is exactly the
+[`[eta_shape]` block](eta-shape.qmd):
+
+```
+  omega ETA_CL ~ 0.09 transform boxcox(LAMBDA)
+```
+
+is `ETA_CL ~ boxcox(LAMBDA)` in `[eta_shape]`. `density boxcox(λ)` means the
+same: on its latent scale the Box-Cox density is the Box-Cox transform, so the
+two spellings are one model.
+
+## How it is estimated
+
+The estimators work on an unconstrained **latent** `z` for each density ETA,
+and the model reads the random effect `m(z)`. The map is the identity on ℝ,
+`exp` on (0, ∞) and `inv_logit` on (0, 1). The parser applies it to every read
+of the ETA in `[individual_parameters]`. The prior is the exact latent density
+`p_z(z) = p_η(m(z))·|m′(z)|`. So a constrained effect never leaves its support,
+and the Laplace and FOCE machinery runs where the posterior is smooth.
+
+Pumas maps a constrained random effect the same way. The ETA columns of the
+sdtab and the EBEs report `z`, so for `gamma` the effect itself is `exp(ETA)`.
+
+The prior's value, gradient and Hessian are exact, from dual numbers over one
+implementation. That makes the FOCEI and Laplace adjoint gradients exact too,
+including `∂/∂ω` and `∂/∂ν` / `∂/∂μ`.
+
+- **FOCEI / Laplace / AGQ**: the conditional objective, with the density's
+  curvature in `H̃`.
+- **FOCE** (no interaction): the Sheiner–Beal marginal integrates η as a
+  Gaussian, so a density model takes the conditional form FOCE uses beside a
+  non-Gaussian endpoint (variance at the EBE, no interaction term). On a
+  Gaussian model it is unchanged.
+- **IMP / IMPMAP**: importance weights use the exact prior; the Gaussian
+  defensive proposal stays a proposal.
+- **SAEM / MCEM**: a density group's ω and shape θ have no sufficient
+  statistic, so they move by Fisher scoring on their exact score, one step per
+  SAEM iteration (NONMEM's rule for such parameters) and to convergence per
+  MCEM iteration. Gaussian ETAs keep their closed form.
+- **Simulation** draws each kind from its own distribution.
+
+A density ETA is not mu-referenced, and its omega row is labelled `custom`, with
+no CV%.
+
+### Not supported yet
+
+`method = bayes` and `method = vi`, a `[mixture]`, FREM, and FOCE without
+interaction on a correlated residual (`block_sigma`, `correlation`) are refused
+with `E_DENSITY_UNSUPPORTED`. An IOV `kappa` cannot carry a `density`
+([#1717](https://github.com/FeRx-NLME/ferx-core/issues/1717)).
+
+## Validation
+
+NONMEM has no non-Gaussian random-effect prior, so there is no NONMEM run to
+anchor against. The checks are:
+
+- **Closed forms and quadrature.** Each latent density integrates to 1, the
+  random effect has the documented mean and variance (quadrature to 3e-14), the
+  bivariate t matches the textbook log-density, and the gradients and Hessians
+  match their hand-derived closed forms.
+- **Reduction to an anchored model.** A `logitnormal(μ)` density is a Gaussian
+  translated by `logit μ`, so its FOCEI objective and adjoint gradient equal the
+  Gaussian model `inv_logit(logit(MU) + ETA)`, to 1e-15.
+- **One objective.** The adjoint kernel's objective is the production
+  objective exactly, and its inner gradient vanishes at production's EBE.
