@@ -133,27 +133,50 @@ def extract(fit: dict) -> dict:
     for k, name in enumerate(fit.get("theta_names", [])):
         put(f"theta:{name}", num(fit["theta"][k]), num(se_theta[k]) if se_theta else None)
 
-    def omega_block(prefix, mat, names, se):
+    def omega_block(prefix, mat, names, se, is_diagonal):
         if mat is None:
             return
         om = matrix(mat)
         n = len(om)
+        if is_diagonal is None:
+            # Not recorded (a pre-field artifact): a packed lower-triangle SE says block.
+            # Without one, a nonzero off-diagonal is the only evidence there is.
+            n_lt = n * (n + 1) // 2
+            packed = se is not None and len(se) == n_lt and n_lt != n
         for i in range(n):
             for j in range(i + 1):
-                if i != j and om[i][j] == 0.0:
-                    continue  # a structural zero of a diagonal omega is not an estimate
+                if i != j:
+                    # The fit's own flag says which off-diagonals are estimates: a block
+                    # covariance estimated AT zero is still a parameter, with an SE.
+                    if is_diagonal is True:
+                        continue
+                    if is_diagonal is None and not packed and om[i][j] == 0.0:
+                        continue
                 ni = names[i] if i < len(names) else str(i)
                 nj = names[j] if j < len(names) else str(j)
                 key = f"{prefix}:{ni}" if i == j else f"{prefix}:{ni},{nj}"
                 put(key, om[i][j], lower_tri_se(se, n, i, j))
 
-    omega_block("omega", fit.get("omega"), fit.get("eta_names", []), fit.get("se_omega"))
-    omega_block("kappa", fit.get("omega_iov"), fit.get("kappa_names", []), fit.get("se_kappa"))
+    omega_block("omega", fit.get("omega"), fit.get("eta_names", []), fit.get("se_omega"),
+                fit.get("omega_is_diagonal"))
+    omega_block("kappa", fit.get("omega_iov"), fit.get("kappa_names", []), fit.get("se_kappa"),
+                fit.get("kappa_is_diagonal"))
 
+    sigma_names = fit.get("sigma_names", [])
     se_sigma = fit.get("se_sigma")
-    for k, name in enumerate(fit.get("sigma_names", [])):
+    for k, name in enumerate(sigma_names):
         put(f"sigma:{name}", num(fit["sigma"][k]),
             num(se_sigma[k]) if se_sigma and k < len(se_sigma) else None)
+
+    # The off-diagonal of residual Σ: `block_sigma` correlations on the ρ scale, with
+    # `se_residual_correlations` parallel to them (0.0 for a FIXed one).
+    se_rho = fit.get("se_residual_correlations")
+    for k, rc in enumerate(fit.get("residual_correlations") or []):
+        i, j = rc["sigma_i"], rc["sigma_j"]
+        ni = sigma_names[i] if i < len(sigma_names) else str(i)
+        nj = sigma_names[j] if j < len(sigma_names) else str(j)
+        put(f"sigma_corr:{ni},{nj}", num(rc["rho"]),
+            num(se_rho[k]) if se_rho and k < len(se_rho) else None)
 
     cov = fit.get("covariance_status")
     return {

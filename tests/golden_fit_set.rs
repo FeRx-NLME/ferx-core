@@ -820,6 +820,136 @@ fn run_extracts_block_omega_and_reports_a_failed_fit() {
     );
 }
 
+/// Which Ω off-diagonals are parameters is the fit's own `omega_is_diagonal` /
+/// `kappa_is_diagonal`, never the value: a `block_omega` covariance estimated at exactly
+/// zero is an estimate with an SE, and drift in it must be tracked. Each case pairs with
+/// a twin that has the SAME zero off-diagonal on the other side of the flag. The
+/// `block_sigma` correlations — residual Σ's off-diagonal — are tracked with their SEs.
+#[cfg(unix)]
+#[test]
+fn run_records_every_estimated_covariance_including_one_at_zero() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("run-cov");
+    std::fs::create_dir_all(dir.join("examples")).unwrap();
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    std::fs::write(dir.join("data/d.csv"), "x").unwrap();
+    let fit = |omega_flag: &str, se_omega: &str, kappa_flag: &str, rho: &str| {
+        format!(
+            r#"{{"ofv": 10.0, "converged": true, "n_iterations": 3, "method": "Focei",
+            "covariance_status": "Computed", "warnings": [], "n_threads_used": 1,
+            "theta": [1.0], "theta_names": ["CL"], "se_theta": [0.1],
+            "eta_names": ["ETA_CL", "ETA_V"],
+            "omega": {{"rows": 2, "cols": 2, "data": [0.1, 0.0, 0.0, 0.2]}},
+            "se_omega": {se_omega} {omega_flag}
+            "kappa_names": ["K_CL", "K_V"],
+            "omega_iov": {{"rows": 2, "cols": 2, "data": [0.01, 0.0, 0.0, 0.02]}},
+            "se_kappa": [0.001, 0.0004, 0.002] {kappa_flag}
+            "sigma": [0.04, 0.5], "sigma_names": ["PROP", "ADD"], "se_sigma": [0.004, 0.05]
+            {rho}}}"#
+        )
+    };
+    let cases = [
+        // Estimated block at zero: the off-diagonals are parameters.
+        (
+            "block",
+            fit(
+                r#", "omega_is_diagonal": false,"#,
+                "[0.01, 0.003, 0.02]",
+                r#", "kappa_is_diagonal": false,"#,
+                r#", "residual_correlations": [{"sigma_i": 1, "sigma_j": 0, "rho": 0.3}],
+                   "se_residual_correlations": [0.05]"#,
+            ),
+        ),
+        // The same zeros under a diagonal flag are structure, not estimates.
+        (
+            "diag",
+            fit(
+                r#", "omega_is_diagonal": true,"#,
+                "[0.01, 0.02]",
+                r#", "kappa_is_diagonal": true,"#,
+                "",
+            ),
+        ),
+        // No flag (an artifact predating it): the packed SE layout says block ...
+        ("legacy_block", fit(",", "[0.01, 0.003, 0.02]", ",", "")),
+        // ... and a diagonal-only SE with a zero says diagonal.
+        ("legacy_diag", fit(",", "[0.01, 0.02]", ",", "")),
+    ];
+    let mut tsv = String::from("id\tmodel\tdata\tfamily\n");
+    let mut sh = String::from("#!/bin/sh\n");
+    for (id, json) in &cases {
+        let src = dir.join(format!("{id}.json"));
+        std::fs::write(&src, json).unwrap();
+        std::fs::write(dir.join(format!("examples/{id}.ferx")), "x").unwrap();
+        tsv += &format!("{id}\texamples/{id}.ferx\tdata/d.csv\t{id}\n");
+        sh += &format!(
+            "case \"$1\" in */{id}.ferx) cp '{}' ./{id}-fit.json; exit 0;; esac\n",
+            src.display()
+        );
+    }
+    let fake = dir.join("ferx");
+    std::fs::write(&fake, sh + "exit 7\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let manifest = write(&dir, "models.tsv", &tsv);
+    let out_path = dir.join("results.json");
+    let out = golden(&[
+        "run",
+        "--ferx",
+        fake.to_str().unwrap(),
+        "--root",
+        dir.to_str().unwrap(),
+        "--manifest",
+        &manifest,
+        "--out",
+        out_path.to_str().unwrap(),
+        "--label",
+        "t",
+    ]);
+    assert!(out.status.success(), "{}", text(&out));
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let params = |id: &str| {
+        let m = &r["models"][id];
+        assert_eq!(m["status"], "ok", "{id}: {m}");
+        m["params"].as_object().unwrap().clone()
+    };
+
+    let block = params("block");
+    let off = &block["omega:ETA_V,ETA_CL"];
+    assert_eq!(
+        (off["est"].as_f64(), off["se"].as_f64()),
+        (Some(0.0), Some(0.003)),
+        "a block covariance estimated at zero is a parameter: {block:?}"
+    );
+    assert_eq!(block["kappa:K_V,K_CL"]["se"], 0.0004, "{block:?}");
+    let rho = &block["sigma_corr:ADD,PROP"];
+    assert_eq!(
+        (rho["est"].as_f64(), rho["se"].as_f64()),
+        (Some(0.3), Some(0.05)),
+        "residual Σ's off-diagonal is tracked: {block:?}"
+    );
+
+    let diag = params("diag");
+    for key in ["omega:ETA_V,ETA_CL", "kappa:K_V,K_CL"] {
+        assert!(
+            !diag.contains_key(key),
+            "{key}: a diagonal Ω's zero is structure: {diag:?}"
+        );
+    }
+    assert!(diag.contains_key("omega:ETA_V") && diag.contains_key("kappa:K_V"));
+    assert!(
+        !diag.keys().any(|k| k.starts_with("sigma_corr:")),
+        "{diag:?}"
+    );
+
+    assert_eq!(
+        params("legacy_block")["omega:ETA_V,ETA_CL"]["se"],
+        0.003,
+        "unflagged, the packed SE says block"
+    );
+    assert!(!params("legacy_diag").contains_key("omega:ETA_V,ETA_CL"));
+}
+
 // -------------------------------------------------------------------------------------
 // The manifest, the workflow, the docs
 // -------------------------------------------------------------------------------------
@@ -929,6 +1059,13 @@ fn workflow_is_a_linux_nightly_that_posts_the_table() {
     assert!(wf.contains("--ferx ../release/target/ci-test/ferx --root ../release"));
     assert!(wf.contains("--ferx target/ci-test/ferx --root ."));
     assert!(wf.contains("golden.py report") && wf.contains("--summary \"$GITHUB_STEP_SUMMARY\""));
+    // "Δ OFV prev" diffs against the previous NIGHT, red or green: in fail-on-band mode
+    // the night a drift lands is red, and a `success` filter would skip exactly it.
+    assert!(
+        wf.contains("--event schedule \\\n                 --status completed"),
+        "previous nightly must be the last completed run, not the last green one"
+    );
+    assert!(!wf.contains("--status success"));
     assert!(wf.contains("name: golden-fits-results") && wf.contains("retention-days: 90"));
 }
 

@@ -109,12 +109,16 @@ jobs:
 
       # The previous scheduled run on main, for the "Δ OFV prev" column that attributes a
       # change to one day's merges. Absent on the first night or after an artifact expires.
+      # `completed`, not `success`: once fail-on-band is on, the night a drift lands is red
+      # and still uploads its results, and the next night must diff against THAT night,
+      # not the last green one. A run that died before uploading has no artifact; the
+      # download then fails soft and the column is empty for one night.
       - name: Previous nightly
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           id=$(gh run list --workflow golden-fits.yml --branch main --event schedule \
-                 --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+                 --status completed --limit 1 --json databaseId --jq '.[0].databaseId // empty')
           if [ -n "$id" ]; then
             gh run download "$id" --name golden-fits-results --dir prev || true
           fi

@@ -25,7 +25,7 @@ gap (#2635). It sits beside the anchors and does not replace any of them.
    `examples/` and `data/`, then caches the result under the tag. That fit runs
    once per release. On every other night the cache supplies it.
 2. Builds `ferx` at the head of `main` and fits the same models.
-3. Downloads the previous scheduled run's results, if one is available.
+3. Downloads the previous scheduled run's results, if one is available, whether that run passed or failed: a red night is the one a drift lands on.
 4. Writes the table to the job summary.
 
 Each row records OFV, every θ, ω (including off-diagonals of a block), κ and σ
