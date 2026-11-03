@@ -3616,14 +3616,16 @@ fn failure_is_converged_plateau(
 /// verdict is the ordinary #751 one rather than another no-move case.
 const START_PROBE_STEP_S: f64 = 10.0 * INIT_ESCAPE_STEP_S;
 
-/// The start probe's objective tolerance: the same [`LATCH_MAX_PREDICTED_GAIN`] the
-/// stagnation guard uses to call a fit with nothing left in it converged. A probe that
-/// ends more than this below the start found a descent the fit missed; one that converged
-/// to within it found none. Measured on the #2506 warm refits (macOS arm64), the probe
-/// ends within 1.3e-6 OFV of the start at every optimum — `two_cpt_iv` FOCEI under
-/// L-BFGS and BOBYQA, its AGQ twin, `mixture_iv` — five orders of magnitude inside the
-/// tolerance; from `two_cpt_iv`'s stalled model-file inits it ends 90 OFV below them.
-const START_PROBE_TOL: f64 = LATCH_MAX_PREDICTED_GAIN;
+/// The start probe's objective tolerance (#2506): a probe that ends more than this below
+/// the start found a descent the fit missed; one that converged to within it found none.
+/// Measured on the #2506 warm refits (Linux aarch64), the probe ends between 1.7e-7 below
+/// the start (`two_cpt_iv` AGQ) and 1.08e-3 above it (`method = gn`) — L-BFGS, BOBYQA,
+/// AGQ, `mixture_iv`, built-in BFGS and trust-region all within 1e-5. The bound is 9× the
+/// largest of those, and about ten times what a relative `ftol` of 1e-6 lets a cold fit
+/// stop short of its optimum on an OFV near 1000, so a warm start from such a fit is not
+/// read as a stall. From `two_cpt_iv`'s stalled model-file inits the probe ends 90 OFV
+/// below them.
+const START_PROBE_TOL: f64 = 1e-2;
 
 /// The start probe's verdict (#2506) on a fit that never left its start, from the
 /// penalized objective at that start and the probe's own result:

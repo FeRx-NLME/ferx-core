@@ -245,8 +245,8 @@ around at a bound; a tight box may shorten a coordinate's move, and the restart 
 as long as some coordinate moves at least 0.01) on what is left of the fit's `maxiter` budget, and compares where that
 restart ends with the objective at the start.
 
-- **It converges back**, to within 0.1 OFV (the threshold the stagnation guard uses to call a
-  fit finished): the start was an optimum, and **the restart's result is what is
+- **It converges back**, to within 0.01 OFV (about ten times the largest gap measured on
+  warm refits, 1.1e-3 under Gauss–Newton): the start was an optimum, and **the restart's result is what is
   reported** — its estimates, objective, `converged` verdict and warnings, as for any fit.
   Nothing of the run that did not move is carried over, so every check that run would
   have failed (the plateau rule, the EBE start-dependence check, the objective gate) is
@@ -255,8 +255,8 @@ restart ends with the objective at the start.
   the start, `FitResult::stationary_start` is `true` and no `stalled_at_init` warning is
   raised, so `Strictness::default()` passes a converged restart. Measured on warm refits of
   `two_cpt_iv` (L-BFGS, BOBYQA, AGQ) and a two-class mixture, the restart ends within
-  `1e-6` OFV of the start.
-- **It finds a lower objective**, by more than 0.1: the start was a stall, and it is
+  `1e-5` OFV of the start (Linux).
+- **It finds a lower objective**, by more than 0.01: the start was a stall, and it is
   **reported as one**: the run that did not move, with `W_STALLED_AT_INIT`, so a bootstrap
   drops the sample and `Strictness::default()` fails it, however far the restart got. A
   warning names the lower objective the restart reached, so you know better estimates are
