@@ -212,10 +212,9 @@ fn profiled_at_nonmem(
 /// level moves the objective by hundreds. macOS arm64 and Linux aarch64 agree in every
 /// printed digit.
 ///
-/// The warning check sees a declined adjoint gradient, not an off-mode one: every B1
-/// subject has no Gaussian observation, so `min_obs_for_convergence_check` excuses an
-/// off-mode subject from the FD-fallback warning. The Tier-1 tests
-/// (`profile_binary_tests.rs`) assert `fd_gradients == 0` from the solve's own counts. No level gradient or Newton matrix may come from finite
+/// Each B1 subject has 240 binary records and no Gaussian observation; since #2111 its
+/// records count toward `min_obs_for_convergence_check`, so an off-mode subject would be
+/// named by the FD-fallback warning rather than excused. No level gradient or Newton matrix may come from finite
 /// differences, so no warning may name them.
 fn assert_profiled_reproduces(method: EstimationMethod, interaction: bool) {
     let (f, theta, obj) = profiled_at_nonmem(method, interaction, false);

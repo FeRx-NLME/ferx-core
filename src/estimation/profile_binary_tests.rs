@@ -152,6 +152,48 @@ fn the_rsr_one_subject_note_counts_binary_records() {
     .is_none());
 }
 
+/// `min_obs_for_convergence_check` counts a subject's binary records (#2111). Each B1
+/// subject has 240 of them and no Gaussian observation. With the inner loop stopped after
+/// one iteration some EBEs are unconverged, and every one of them counts at `min_obs = 2`,
+/// while at `min_obs = 241` none does: both sides of the gate in one test. The profile's FD-warning
+/// excuse (`below_min_obs`) reads the same count, at the same two thresholds.
+///
+/// Mutations: compare `observations.len()` in the inner loop and the first count is 0;
+/// in `below_min_obs` and the profile excuses every B1 subject.
+#[test]
+fn a_binary_only_subject_counts_its_records_toward_min_obs() {
+    let p = b1(None, ARMS[0].1);
+    let model = &p.parsed.model;
+    let pop = &p.population;
+    assert!(pop
+        .subjects
+        .iter()
+        .all(|s| s.observations.is_empty() && s.n_scored_rows() == 240));
+    let count = |min_obs: usize| {
+        let (_, _, stats, _) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            model,
+            pop,
+            &p.init_params,
+            1,
+            1e-12,
+            None,
+            None,
+            min_obs,
+            0,
+        );
+        stats.n_unconverged
+    };
+    // Measured 3 of 10 unconverged after one inner iteration.
+    let (all, two) = (count(1), count(2));
+    assert!(all > 0, "the fixture must leave some EBE unconverged");
+    assert_eq!(two, all, "every unconverged binary-only subject counts");
+    assert_eq!(count(241), 0, "none reaches 241 scored rows");
+    for s in &pop.subjects {
+        assert!(!below_min_obs(s, 2), "subject {}", s.id);
+        assert!(below_min_obs(s, 241), "subject {}", s.id);
+    }
+}
+
 /// L0, the counted form: `theta PLACEBO[4]` read as `PLACEBO[VISIT]` has no level
 /// declaration of its own, so the records that read it are the endpoints whose predictor
 /// reads `VISIT`. Study 1 drops its last visit, so its set (`[0, 1, 2]`) differs from the

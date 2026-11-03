@@ -1297,6 +1297,15 @@ impl Subject {
         self.obs_covariates.get(j).unwrap_or(&self.covariates)
     }
 
+    /// The rows that enter this subject's likelihood: its Gaussian observations plus its
+    /// non-Gaussian records (time-to-event, discrete-state, count), which are disjoint. The
+    /// count `min_obs_for_convergence_check` compares against (#2111): measured on the
+    /// Gaussian observations alone, a binary-only or time-to-event-only subject counted as
+    /// having none, so its unconverged EBE was never counted and never warned about.
+    pub(crate) fn n_scored_rows(&self) -> usize {
+        self.observations.len() + self.obs_records.len()
+    }
+
     /// The reader's per-row covariate snapshot, **aligned with [`Self::obs_records`]**, or
     /// `None` when there is none to align.
     ///
@@ -9595,7 +9604,9 @@ pub struct FitOptions {
     pub max_unconverged_frac: f64,
     /// Minimum number of observations a subject must have for its EBE to count
     /// toward `max_unconverged_frac`.  Subjects below this threshold are
-    /// excluded from the convergence fraction but still run normally.
+    /// excluded from the convergence fraction but still run normally. A
+    /// subject's count is its Gaussian observations plus its non-Gaussian
+    /// records (time-to-event, binary, Markov, count), #2111.
     /// Default: `2`.
     pub min_obs_for_convergence_check: u32,
     /// Enable the outer-loop stagnation guard. When `true` (default), the
