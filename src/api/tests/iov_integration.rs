@@ -2508,7 +2508,6 @@ fn iov_with_compartments_derived_emits_unsupported_warning() {
             eval: Box::new(|ctx| ctx.compartments.first().copied().unwrap_or(f64::NAN)),
         },
         uses_compartments: true,
-        reads: vec![],
     });
     let pop = make_iov_population();
     let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
@@ -2576,7 +2575,6 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
             eval: Box::new(|ctx| ctx.compartments.first().copied().unwrap_or(f64::NAN)),
         },
         uses_compartments: true,
-        reads: vec![],
     });
 
     // One subject with an explicit zero-order infusion into the depot (cmt 1):

@@ -183,7 +183,6 @@ fn derived_per_row_time_is_raw_clock() {
             eval: Box::new(|ctx: &DerivedContext| ctx.time),
         },
         uses_compartments: false,
-        reads: vec![],
     }];
     let model = minimal_model(derived_exprs);
     let subject = two_session_subject();
@@ -226,7 +225,6 @@ fn derived_aggregate_tmax_returns_raw_time() {
             filter: None,
         },
         uses_compartments: false,
-        reads: vec![],
     }];
     let model = minimal_model(derived_exprs);
     let subject = two_session_subject();
@@ -274,7 +272,6 @@ fn derived_integral_obs_per_session_explicit_window() {
             step: IntegralStep::ObsTimes,
         },
         uses_compartments: false,
-        reads: vec![],
     }];
     let model = minimal_model(derived_exprs);
     let subject = two_session_subject();
@@ -326,7 +323,6 @@ fn derived_integral_periodic_uses_raw_clock() {
             step: IntegralStep::ObsTimes,
         },
         uses_compartments: false,
-        reads: vec![],
     }];
     let model = minimal_model(derived_exprs);
     let subject = two_session_subject();
@@ -368,7 +364,6 @@ fn derived_integral_single_session_unchanged() {
             step: IntegralStep::ObsTimes,
         },
         uses_compartments: false,
-        reads: vec![],
     }];
     let model = minimal_model(derived_exprs);
     let subject = Subject {

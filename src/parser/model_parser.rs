@@ -6981,7 +6981,7 @@ pub fn parse_full_model_with(
             .as_ref()
             .map(|s| s.state_names.clone())
             .unwrap_or_else(|| model.analytical_compartment_names().to_vec());
-        let derived_exprs = parse_derived_block(
+        let (derived_exprs, derived_reads) = parse_derived_block(
             derived_lines,
             &model.theta_names.clone(),
             &model.eta_names.clone(),
@@ -6991,6 +6991,7 @@ pub fn parse_full_model_with(
             &mut derived_warnings,
         )?;
         model.derived_exprs = derived_exprs;
+        model.indiv_param_partials.derived_reads = derived_reads;
         model.parse_warnings.extend(derived_warnings);
     }
 
@@ -8009,8 +8010,10 @@ fn parse_derived_block(
     covariate_names: &[String],
     ode_state_names: &[String],
     parse_warnings: &mut Vec<String>,
-) -> Result<Vec<DerivedExprSpec>, String> {
+) -> Result<(Vec<DerivedExprSpec>, Vec<String>), String> {
     let mut specs: Vec<DerivedExprSpec> = Vec::new();
+    // Every name the block reads from the data (#2599): see `derived_reads`.
+    let mut block_reads: Vec<String> = Vec::new();
     let mut defined_derived: Vec<String> = Vec::new();
 
     // Names that resolve to Variable (not Theta/Eta) at parse time; these are
@@ -8251,16 +8254,20 @@ fn parse_derived_block(
             !BUILTIN_SPECIALS.iter().any(|b| b.eq_ignore_ascii_case(r))
                 && !defined_derived.iter().any(|d| d.eq_ignore_ascii_case(r))
         });
+        for r in reads {
+            if !block_reads.contains(&r) {
+                block_reads.push(r);
+            }
+        }
         defined_derived.push(name.clone());
         specs.push(DerivedExprSpec {
             name,
             kind,
             uses_compartments: spec_uses_compartments,
-            reads,
         });
     }
 
-    Ok(specs)
+    Ok((specs, block_reads))
 }
 
 /// Parse an `[output]` block: whitespace-separated column names.
@@ -33532,6 +33539,12 @@ pub struct IndivParamPartials {
     /// mu-reference *belongs to* rather than a guess from the η's name (#1930).
     /// Empty for hand-built fixtures.
     pub(crate) mu_ref_owners: std::collections::BTreeMap<String, String>,
+    /// The names a `[derived]` expression looks up at evaluation time (#2599),
+    /// read through [`crate::CompiledModel::derived_reads`]. Parser bookkeeping
+    /// kept here rather than on the public `DerivedExprSpec`, whose fields are
+    /// all public, so recording it does not break a downstream struct literal.
+    /// Empty without a `[derived]` block, and for hand-built fixtures.
+    pub(crate) derived_reads: Vec<String>,
 }
 
 impl IndivParamPartials {
@@ -33556,6 +33569,7 @@ impl IndivParamPartials {
             lognormal_eta_chain: None,
             nested_levels: None,
             mu_ref_owners: std::collections::BTreeMap::new(),
+            derived_reads: Vec::new(),
         }
     }
 
@@ -33628,6 +33642,7 @@ fn build_indiv_param_partials(
         lognormal_eta_chain: None,
         nested_levels: None,
         mu_ref_owners: std::collections::BTreeMap::new(),
+        derived_reads: Vec::new(),
     }
 }
 

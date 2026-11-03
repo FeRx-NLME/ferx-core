@@ -3068,7 +3068,6 @@ pub ferx_core::types::DerivedContext::time: f64
 pub struct ferx_core::types::DerivedExprSpec
 pub ferx_core::types::DerivedExprSpec::kind: ferx_core::DerivedKind
 pub ferx_core::types::DerivedExprSpec::name: alloc::string::String
-pub ferx_core::types::DerivedExprSpec::reads: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::DerivedExprSpec::uses_compartments: bool
 pub struct ferx_core::types::DiscreteObsDiagnostic
 pub ferx_core::types::DiscreteObsDiagnostic::cmt: usize
@@ -4605,7 +4604,6 @@ pub ferx_core::DerivedContext::time: f64
 pub struct ferx_core::DerivedExprSpec
 pub ferx_core::DerivedExprSpec::kind: ferx_core::DerivedKind
 pub ferx_core::DerivedExprSpec::name: alloc::string::String
-pub ferx_core::DerivedExprSpec::reads: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::DerivedExprSpec::uses_compartments: bool
 pub struct ferx_core::Diagnostic
 pub ferx_core::Diagnostic::block: core::option::Option<alloc::string::String>

@@ -1301,20 +1301,17 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
 }
 
 /// Every data column a relation of `model` reads, the set `W_COVARIATE_MISSING`
-/// is raised for (#2599): the required [`referenced_columns`] plus the names a
-/// `[derived]` expression looks up at evaluation time, which are not required
-/// columns and so are not in `referenced_covariates`. A column that is only
-/// declared in `[covariates]` or listed in `covariate_columns`, with no relation
-/// reading it, is not here — a gap in it cannot reach the objective or an output.
+/// is raised for (#2599): the required [`referenced_columns`], the names a
+/// `[derived]` expression looks up at evaluation time (not required columns, so
+/// not in `referenced_covariates`), and the `[output]` columns echoed from the
+/// data. A column only declared in `[covariates]` or listed in
+/// `covariate_columns`, with nothing reading it, is not here — a gap in it reaches
+/// neither the objective nor an output.
 fn columns_read_by_relations(model: &CompiledModel) -> std::collections::HashSet<String> {
     referenced_columns(model)
         .into_iter()
-        .chain(
-            model
-                .derived_exprs
-                .iter()
-                .flat_map(|d| d.reads.iter().cloned()),
-        )
+        .chain(model.derived_reads().iter().cloned())
+        .chain(super::output_columns::output_echo_columns(model).cloned())
         .collect()
 }
 

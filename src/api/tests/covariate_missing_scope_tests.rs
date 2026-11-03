@@ -7,12 +7,15 @@
 //! model never touched, burying the warnings that matter.
 //!
 //! One fixture holds both sides of the gate. Read, with gaps, must warn:
-//! `WT` (`[individual_parameters]`), `CRCL` (`[scaling]` only) and `LAB` (`[derived]`
+//! `WT` (`[individual_parameters]`), `CRCL` (`[scaling]` only), `LAB` (`[derived]`
 //! only — a name `referenced_covariates` deliberately does not hold, since a
-//! `[derived]` read is not a required column). Unread, with gaps, must not:
-//! `UNUSED_ALL` (every cell `.`) and `UNUSED_SOME` (filled for subject 1 only) — not
-//! even when the caller declares or lists them, since no relation reads them either
-//! way. The model-blind reader on the same file warns for all five, which is what
+//! `[derived]` read is not a required column) and `OUT` (`[output]` only, echoed
+//! into the sdtab). Unread, with gaps, must not: `UNUSED_ALL` (every cell `.`),
+//! `UNUSED_SOME` (filled for subject 1 only) — not even when the caller declares or
+//! lists them, since no relation reads them either way — and `LAB_RATIO`, which
+//! `[output]` names but the `[derived]` column of that name fills, so the echo never
+//! reads the data column. The model-blind reader on the same file warns for all of
+//! them, which is what
 //! proves the unread columns are read as covariate columns with gaps: the silence on
 //! the model-aware read is the gate, not a fixture that never had a gap.
 //!
@@ -20,7 +23,8 @@
 //! in the reader (unread columns warn again); making it return `false` (read
 //! covariates go silent); not registering `[scaling]` covariates (`CRCL` goes silent);
 //! dropping the `[derived]` reads from `columns_read_by_relations` (`LAB` goes silent);
-//! re-adding the declared / `covariate_columns` widening (the last two tests).
+//! dropping the `[output]` echo columns (`OUT` goes silent); dropping the `[derived]`
+//! shadow from `output_echo_columns` (`LAB_RATIO` warns); re-adding the declared / `covariate_columns` widening (the last two tests).
 
 use crate::api::read_population_for;
 use crate::parser::model_parser::parse_full_model;
@@ -29,7 +33,8 @@ use crate::types::Population;
 use std::io::Write;
 
 /// `WT` is read in `[individual_parameters]`, `CRCL` only in `[scaling]`, `LAB` only
-/// in `[derived]`.
+/// in `[derived]`, `OUT` only in `[output]`; `[output]`'s `LAB_RATIO` is the derived
+/// column, not the data column of that name.
 const MODEL: &str = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  \
     theta TVV(40.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.02\n\
     [individual_parameters]\n  CL = TVCL * (WT / 70)^0.75 * exp(ETA_CL)\n  V  = TVV\n\
@@ -37,26 +42,27 @@ const MODEL: &str = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  \
     [odes]\n  d/dt(central) = -(CL / V) * central\n\
     [scaling]\n  y = central / V * CRCL / 100\n\
     [error_model]\n  DV ~ proportional(PROP)\n\
-    [derived]\n  LAB_RATIO = LAB / IPRED\n";
+    [derived]\n  LAB_RATIO = LAB / IPRED\n\
+    [output]\n  OUT LAB_RATIO\n";
 
 /// The same model with the never-read `UNUSED_SOME` declared in `[covariates]`.
 fn model_declaring_unused() -> String {
     MODEL.replace(
         "[error_model]",
-        "[covariates]\n  WT continuous\n  CRCL continuous\n  LAB continuous\n  UNUSED_SOME continuous\n\
+        "[covariates]\n  WT continuous\n  CRCL continuous\n  LAB continuous\n  OUT continuous\n  UNUSED_SOME continuous\n\
          [error_model]",
     )
 }
 
-/// Subject 2 has no `WT`, `CRCL` or `LAB`; `UNUSED_ALL` is `.` everywhere,
-/// `UNUSED_SOME` is filled for subject 1 only.
-const DATA: &str = "ID,TIME,DV,EVID,AMT,CMT,WT,CRCL,LAB,UNUSED_ALL,UNUSED_SOME\n\
-    1,0,.,1,100,1,70,100,5,.,3\n\
-    1,1,5.0,0,.,1,70,100,5,.,3\n\
-    1,4,3.0,0,.,1,70,100,5,.,3\n\
-    2,0,.,1,100,1,.,.,.,.,.\n\
-    2,1,4.0,0,.,1,.,.,.,.,.\n\
-    2,4,2.5,0,.,1,.,.,.,.,.\n";
+/// Subject 2 has no value in any covariate column; `UNUSED_ALL` is `.` everywhere,
+/// the rest are filled for subject 1.
+const DATA: &str = "ID,TIME,DV,EVID,AMT,CMT,WT,CRCL,LAB,OUT,LAB_RATIO,UNUSED_ALL,UNUSED_SOME\n\
+    1,0,.,1,100,1,70,100,5,1,9,.,3\n\
+    1,1,5.0,0,.,1,70,100,5,1,9,.,3\n\
+    1,4,3.0,0,.,1,70,100,5,1,9,.,3\n\
+    2,0,.,1,100,1,.,.,.,.,.,.,.\n\
+    2,1,4.0,0,.,1,.,.,.,.,.,.,.\n\
+    2,4,2.5,0,.,1,.,.,.,.,.,.,.\n";
 
 fn data_file() -> tempfile::NamedTempFile {
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -100,7 +106,15 @@ fn the_model_blind_reader_warns_for_every_gapped_column() {
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     assert_eq!(
         warned(&pop),
-        ["CRCL", "LAB", "UNUSED_ALL", "UNUSED_SOME", "WT"],
+        [
+            "CRCL",
+            "LAB",
+            "LAB_RATIO",
+            "OUT",
+            "UNUSED_ALL",
+            "UNUSED_SOME",
+            "WT"
+        ],
         "{:?}",
         pop.warnings
     );
@@ -111,7 +125,12 @@ fn the_model_blind_reader_warns_for_every_gapped_column() {
 #[test]
 fn an_unread_column_with_gaps_does_not_warn() {
     let pop = read(MODEL, None);
-    assert_eq!(warned(&pop), ["CRCL", "LAB", "WT"], "{:?}", pop.warnings);
+    assert_eq!(
+        warned(&pop),
+        ["CRCL", "LAB", "OUT", "WT"],
+        "{:?}",
+        pop.warnings
+    );
     // The unread columns are still in the population with their gaps, so the silence
     // is the gate and not a column the reader dropped.
     assert!(pop.subjects[1].covariates["UNUSED_SOME"].is_nan());
@@ -120,8 +139,11 @@ fn an_unread_column_with_gaps_does_not_warn() {
         .subjects
         .iter()
         .all(|s| s.covariates["UNUSED_ALL"].is_nan()));
+    assert!(pop.subjects[1].covariates["LAB_RATIO"].is_nan());
     assert!(
-        !pop.warnings.iter().any(|w| w.contains("UNUSED")),
+        !pop.warnings
+            .iter()
+            .any(|w| w.contains("UNUSED") || w.contains("LAB_RATIO")),
         "no warning may name an unread column: {:?}",
         pop.warnings
     );
@@ -129,27 +151,39 @@ fn an_unread_column_with_gaps_does_not_warn() {
 
 /// The parser records `[derived]`'s reads, minus its built-ins — the input the
 /// reader's gate takes them from, since `referenced_covariates` does not hold them.
+/// Hand-built fixtures (`IndivParamPartials::empty()`) record none.
 #[test]
 fn a_derived_expression_records_the_names_it_reads() {
     let parsed = parse_full_model(MODEL).expect("model parses");
-    let spec = &parsed.model.derived_exprs[0];
-    assert_eq!(spec.reads, ["LAB"], "IPRED is a built-in, not a column");
+    assert_eq!(
+        parsed.model.derived_reads(),
+        ["LAB"],
+        "IPRED is a built-in, not a column"
+    );
     assert!(
         !parsed
             .model
             .referenced_covariates
             .iter()
             .any(|c| c == "LAB"),
-        "a [derived]-only read is not a required column, so the reader needs `reads`"
+        "a [derived]-only read is not a required column, so the reader needs `derived_reads`"
     );
+    assert!(crate::types::IndivParamPartials::empty()
+        .derived_reads
+        .is_empty());
 }
 
 /// Listing an unread column in `covariate_columns` does not make a relation read it,
 /// so its gap is still not reported.
 #[test]
 fn a_caller_listed_but_unread_column_does_not_warn() {
-    let pop = read(MODEL, Some(&["WT", "CRCL", "LAB", "UNUSED_SOME"]));
-    assert_eq!(warned(&pop), ["CRCL", "LAB", "WT"], "{:?}", pop.warnings);
+    let pop = read(MODEL, Some(&["WT", "CRCL", "LAB", "OUT", "UNUSED_SOME"]));
+    assert_eq!(
+        warned(&pop),
+        ["CRCL", "LAB", "OUT", "WT"],
+        "{:?}",
+        pop.warnings
+    );
     assert!(pop.subjects[1].covariates["UNUSED_SOME"].is_nan());
 }
 
@@ -157,6 +191,11 @@ fn a_caller_listed_but_unread_column_does_not_warn() {
 #[test]
 fn a_declared_but_unread_column_does_not_warn() {
     let pop = read(&model_declaring_unused(), None);
-    assert_eq!(warned(&pop), ["CRCL", "LAB", "WT"], "{:?}", pop.warnings);
+    assert_eq!(
+        warned(&pop),
+        ["CRCL", "LAB", "OUT", "WT"],
+        "{:?}",
+        pop.warnings
+    );
     assert!(pop.subjects[1].covariates["UNUSED_SOME"].is_nan());
 }
