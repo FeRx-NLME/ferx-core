@@ -3532,14 +3532,18 @@ const NON_PARAM_CONSUMER_BLOCKS: &[&str] = &[
 /// and named (`[event_model NAME]`).
 fn param_consumer_identifiers(
     unnamed: &HashMap<String, Vec<String>>,
-    named: &HashMap<String, HashMap<String, Vec<String>>>,
+    named: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<String>>>,
 ) -> HashSet<String> {
     let mut out = HashSet::new();
     for key in PARAM_CONSUMER_BLOCKS {
         if let Some(lines) = unnamed.get(*key) {
             collect_referenced_identifiers(lines, &mut out);
         }
-        for lines in named.get(*key).into_iter().flat_map(HashMap::values) {
+        for lines in named
+            .get(*key)
+            .into_iter()
+            .flat_map(std::collections::BTreeMap::values)
+        {
             collect_referenced_identifiers(lines, &mut out);
         }
     }
@@ -4502,7 +4506,7 @@ pub fn parse_full_model_with(
             .named
             .get("event_model")
             .into_iter()
-            .flat_map(HashMap::values),
+            .flat_map(std::collections::BTreeMap::values),
     ) {
         collect_referenced_identifiers(lines, &mut downstream_refs);
     }
@@ -17726,7 +17730,10 @@ fn parse_model_name(content: &str) -> Result<String, String> {
 #[derive(Default, Debug)]
 struct ExtractedBlocks {
     unnamed: HashMap<String, Vec<String>>,
-    named: HashMap<String, HashMap<String, Vec<String>>>,
+    /// Named blocks (`[event_model LABEL]`), keyed block type → label. Ordered, so every
+    /// walk over them — the `__chz_<cmt>` ODE state layout, first-wins parse errors —
+    /// is the same on every compile (#2531).
+    named: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<String>>>,
     /// 1-based source line of each unnamed block's header line, keyed by block
     /// type. First occurrence wins. Used to give `ferx check` diagnostics a
     /// block-level location.
@@ -25198,7 +25205,7 @@ pub(crate) const BINARY_READOUT: &str = "the `[binary_model]` predictor";
 /// that parse reports it.
 fn binary_predictor_exprs(
     blocks: &HashMap<String, Vec<String>>,
-    named: &HashMap<String, HashMap<String, Vec<String>>>,
+    named: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<String>>>,
     theta_names: &[String],
     eta_names: &[String],
     indiv_stmts: &[Statement],

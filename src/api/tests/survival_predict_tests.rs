@@ -866,3 +866,105 @@ fn focei_objective_of_a_three_cause_model_is_the_same_bits_on_every_compile() {
         );
     }
 }
+
+/// Named `[event_model LABEL]` blocks are parsed in the same order on every compile
+/// (#2531), so a joint PK-TTE model with three ODE-driven hazards gets one ODE state
+/// layout, one objective and one first-wins parse error.
+///
+/// The parser appends a `__chz_<cmt>` accumulator state per ODE hazard in the order it
+/// walks the named blocks. With that walk in hash order, 40 compiles at `8daf2b42` gave all
+/// six layouts, and 20 FOCEI fits (`outer_maxiter = 0`, analytic Dual2) gave two objectives
+/// 1 ULP apart (184.14099983047574938 / …77780): the order reaches the solver. A model
+/// with two bad named blocks reported `bogus_key` on 16 compiles, `other_bogus` on 24.
+///
+/// Mutation: make `ExtractedBlocks.named` (`model_parser.rs`) a `HashMap` again.
+#[test]
+fn named_event_model_blocks_parse_in_the_same_order_on_every_compile() {
+    use crate::types::{EstimationMethod, FitOptions};
+    let head = "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+                theta TVKA(1.0, 0.01, 50.0)\n  theta TH3(0.01, 1e-5, 10.0)\n  \
+                theta TH4(0.0037, 1e-5, 10.0)\n  theta TH5(0.023, 1e-5, 10.0)\n  \
+                theta TVBETA(0.5, -10.0, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.05 (sd)\n\
+                [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = TVKA\n  \
+                BETA = TVBETA\n  H3 = TH3\n  H4 = TH4\n  H5 = TH5\n\
+                [structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n\
+                [odes]\n  d/dt(depot) = -KA * depot\n  d/dt(central) = KA * depot - (CL/V) * central\n";
+    let block = |name: &str, cmt: usize, extra: &str| {
+        format!(
+            "[event_model {name}]\n  cmt = {cmt}\n  hazard = H{cmt} * exp(BETA * (central / V)){extra}\n"
+        )
+    };
+    let tail = "[error_model]\n  DV ~ proportional(PROP_ERR)\n";
+    let src = format!(
+        "{head}{}{}{}{tail}",
+        block("a", 3, ""),
+        block("b", 4, ""),
+        block("c", 5, "")
+    );
+    let bad = format!(
+        "{head}{}{}{}{tail}",
+        block("a", 3, "\n  bogus_key = 1"),
+        block("b", 4, "\n  other_bogus = 2"),
+        block("c", 5, "")
+    );
+    // The bundled joint PK-TTE data, its one TTE row per subject split into three causes.
+    let mut csv = String::new();
+    let data =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/data/pktte_joint.csv"))
+            .expect("data");
+    for line in data.lines() {
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() > 5 && f[5] == "3" {
+            let id: usize = f[0].parse().expect("id");
+            for c in 3..=5 {
+                let dv = u8::from(f[2] == "1" && c == 3 + id % 3);
+                csv.push_str(&format!("{},{},{dv},0,0,{c},0,0\n", f[0], f[1]));
+            }
+        } else {
+            csv.push_str(line);
+            csv.push('\n');
+        }
+    }
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    let first = parse_model_string(&src).expect("parse");
+    let pop = read(&first, &csv);
+    let layout = first.ode_spec.as_ref().expect("ode").state_names.clone();
+    let chz: Vec<&String> = layout.iter().filter(|s| s.starts_with("__chz_")).collect();
+    assert_eq!(chz.len(), 3, "three hazard accumulators: {layout:?}");
+    let ofv = super::fit(&first, &pop, &first.default_params, &opts)
+        .expect("fit")
+        .ofv;
+    assert!(ofv.is_finite(), "{ofv}");
+    for k in 0..COMPILES {
+        let m = parse_model_string(&src).expect("parse");
+        assert_eq!(
+            m.ode_spec.as_ref().expect("ode").state_names,
+            layout,
+            "compile {k}: the ODE state layout moved"
+        );
+        let err = parse_model_string(&bad)
+            .err()
+            .expect("bad model must not parse");
+        assert!(
+            err.contains("`bogus_key`") && !err.contains("other_bogus"),
+            "compile {k}: the first error must be block `a`'s: {err}"
+        );
+        if k < COMPILES / 2 {
+            let r = super::fit(&m, &pop, &m.default_params, &opts).expect("fit");
+            assert_eq!(
+                r.ofv.to_bits(),
+                ofv.to_bits(),
+                "compile {k}: objective {:.17} vs {ofv:.17}",
+                r.ofv
+            );
+        }
+    }
+}
