@@ -7171,3 +7171,119 @@ fn the_profiled_start_carries_the_nn_penalty() {
         "gap {gap} vs penalty {penalty}"
     );
 }
+
+// ── #2629: a floor restart that leaves a θ just above the floor ─────────────────────
+
+const F2_PROFILED_BLOCK: &str =
+    "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile";
+
+/// F2 with its block read as an ordinary bounded θ block, so the unprofiled loop runs.
+fn f2_unprofiled(t: String) -> String {
+    assert!(t.contains(F2_PROFILED_BLOCK), "fixture moved");
+    t.replace(
+        F2_PROFILED_BLOCK,
+        "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)",
+    )
+}
+
+/// `fit()` on F2 cut to `studies`, `max_unconverged_frac = 0`, no covariance step, at
+/// `inner_maxiter = im`, with the optimizer the file leaves at `auto` (L-BFGS here).
+fn f2_fit(studies: Option<usize>, edit: fn(String) -> String, im: usize) -> crate::FitResult {
+    let p = prep(F2, F2_DATA, studies, edit);
+    let o = FitOptions {
+        run_covariance_step: false,
+        inner_maxiter: im,
+        max_unconverged_frac: 0.0,
+        ..options(&p)
+    };
+    crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o).unwrap()
+}
+
+/// The floor-escape warning of a fit, if it has one.
+fn floor_warning(f: &crate::FitResult) -> Option<&String> {
+    f.warnings.iter().find(|w| w.contains("log-packing floor"))
+}
+
+/// T4. F2, two studies, unprofiled, `inner_maxiter = 1` (#2629): the first L-BFGS run puts
+/// TVE0 on the floor, the floor escape restarts it, and the restart stops at 42.788001 with
+/// EMAX = 3.309e-10 — 1.197 ln-units above the floor, so not on it, where raising EMAX to
+/// its probe point 0.008 still drops the OFV by 0.021. The optimum is 22.139638. Before the
+/// fix this was reported `converged: true` with the restart's success warning. The
+/// re-scored reported point is the same 42.788001 at any inner budget, so the budget is not
+/// the mechanism; the point is kept (it is the lowest found) and demoted.
+///
+/// The `inner_maxiter = 3` twin reaches the optimum, converged, with no refloored clause.
+#[test]
+fn a_restart_left_just_above_the_floor_is_not_reported_converged() {
+    let trapped = f2_fit(Some(2), f2_unprofiled, 1);
+    assert!(
+        (trapped.ofv - 42.788001).abs() < 1e-5,
+        "{} {:?}",
+        trapped.ofv,
+        trapped.warnings
+    );
+    assert!(!trapped.converged, "{:?}", trapped.warnings);
+    let w = floor_warning(&trapped).expect("a floor-escape warning");
+    assert!(
+        w.contains("but stopped with EMAX just above the floor (EMAX = 3.309e-10)")
+            && w.contains("(OFV 42.766729 with it at EMAX = 8.000e-3, against 42.788001")
+            && w.contains("the fit is not reported as converged")
+            && !w.contains("on the floor again")
+            && !w.contains("TVE0 just above"),
+        "{w}"
+    );
+
+    let healthy = f2_fit(Some(2), f2_unprofiled, 3);
+    assert!(
+        (healthy.ofv - 22.1396).abs() < 1e-4,
+        "{} {:?}",
+        healthy.ofv,
+        healthy.warnings
+    );
+    assert!(healthy.converged, "{:?}", healthy.warnings);
+    assert!(
+        floor_warning(&healthy).is_none_or(|w| !w.contains("but stopped with")),
+        "{:?}",
+        healthy.warnings
+    );
+}
+
+/// T5. All twelve studies at `inner_maxiter = 2`: the restart stops at 170.266229 (the
+/// optimum is 101.911514) with EMAX just above the floor, and is not reported converged.
+/// The profiled twin was already demoted by `W_ABOVE_START` (#2626) at 310.367564, with no
+/// floor restart adopted, and does not move.
+#[test]
+fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
+    let unprofiled = f2_fit(None, f2_unprofiled, 2);
+    assert!(
+        (unprofiled.ofv - 170.266229).abs() < 1e-5,
+        "{} {:?}",
+        unprofiled.ofv,
+        unprofiled.warnings
+    );
+    assert!(!unprofiled.converged, "{:?}", unprofiled.warnings);
+    let w = floor_warning(&unprofiled).expect("a floor-escape warning");
+    assert!(w.contains("EMAX just above the floor"), "{w}");
+
+    let profiled = f2_fit(None, |t| t, 2);
+    assert!(
+        (profiled.ofv - 310.367564).abs() < 1e-5,
+        "{} {:?}",
+        profiled.ofv,
+        profiled.warnings
+    );
+    assert!(!profiled.converged, "{:?}", profiled.warnings);
+    assert!(
+        profiled
+            .warnings
+            .iter()
+            .any(|w| w.contains(crate::estimation::outer_optimizer::ABOVE_START_TOKEN)),
+        "{:?}",
+        profiled.warnings
+    );
+    assert!(
+        floor_warning(&profiled).is_none(),
+        "{:?}",
+        profiled.warnings
+    );
+}

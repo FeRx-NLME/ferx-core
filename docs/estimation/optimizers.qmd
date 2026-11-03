@@ -311,7 +311,9 @@ the fit is restarted from its own estimates with that THETA back at its start. A
 coordinate that collapsed onto its lower rail is reset along with it, since a collapsed THETA drags
 one with it. The restart is reported only if it ends lower (an `optimizer_health` warning names the
 THETA and both objectives). If it ends no lower, or on the floor again, the fit is reported
-`converged = false` with a `convergence` warning. A THETA whose objective rises off the floor is a
+`converged = false` with a `convergence` warning. The same holds when the restart leaves a THETA
+just above the floor, below 1/1000 of its start, where one more evaluation shows the objective
+still falling as it rises ([#2629](https://github.com/FeRx-NLME/ferx-core/issues/2629)). A THETA whose objective rises off the floor is a
 genuine boundary estimate and is left alone. The check costs one evaluation on a fit that ended on
 the floor and nothing on any other. The restart gets a fresh `maxiter` budget, so `n_iterations` on
 such a fit can exceed it.
