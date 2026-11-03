@@ -1095,7 +1095,8 @@ pub(crate) struct DataTermLowerBound {
 /// * an M3-censored row contributes `−2·log Φ(·) ≥ 0`, bounded by `0`;
 /// * a non-Gaussian-endpoint row the loop skips (`#905`) contributes nothing.
 ///
-/// It declines (`None`) the contributions it does not bound: an SDE model's
+/// It declines (`None`) a subject whose bound overflows (an observation so large
+/// that `y²` is not finite), and the contributions it does not bound: an SDE model's
 /// process noise, `iiv_on_ruv` (the variance scale depends on η), a dense
 /// residual covariance (`block_sigma` / serial correlation — the cross terms can
 /// lower the variance), FREM covariate rows, a `power(...)` magnitude exponent,
@@ -1166,6 +1167,16 @@ pub(crate) fn prepared_data_term_lower_bound(
             }
         }
         let row = gaussian_row_term_lower_bound(y, a, b);
+        // A finite row can still overflow the bound's own arithmetic: `y²` is `∞`
+        // for `|y| > ~1.3e154` while the scored `b·f²` stays finite for a small
+        // enough `b`. An infinite bound is not a bound — the gate would read
+        // `∞ ≥ ∞` and reject a proposal the full evaluation accepts — so the
+        // subject is declined. A `NaN` row bound cannot arise (the floor is
+        // finite and `f64::max` drops a `NaN` split), but declining it costs
+        // nothing.
+        if !row.is_finite() {
+            return None;
+        }
         out.lb += row;
         out.abs += row.abs();
     }

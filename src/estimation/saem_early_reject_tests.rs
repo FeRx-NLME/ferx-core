@@ -133,6 +133,17 @@ fn run_chain(
     seed: u64,
     gate_off: bool,
 ) -> (Vec<u64>, usize) {
+    run_chain_scaled(model, subject, seed, gate_off, 1.0)
+}
+
+/// [`run_chain`] with every step scale multiplied by `scale`.
+fn run_chain_scaled(
+    model: &CompiledModel,
+    subject: &Subject,
+    seed: u64,
+    gate_off: bool,
+    scale: f64,
+) -> (Vec<u64>, usize) {
     let p = &model.default_params;
     let (theta, omega, sigma) = (&p.theta, &p.omega, &p.sigma.values);
     let n_eta = model.n_eta;
@@ -150,7 +161,7 @@ fn run_chain(
         theta,
         omega,
         sigma,
-        3.0,
+        3.0 * scale,
         None,
         &mut rng,
         40,
@@ -167,7 +178,7 @@ fn run_chain(
         theta,
         omega,
         sigma,
-        &[3.5, 2.5],
+        &[3.5 * scale, 2.5 * scale],
         &cw_sd,
         &mut rng,
         15,
@@ -461,4 +472,60 @@ fn the_gate_declines_the_rail_and_respects_its_margin() {
     // Non-finite log|Ω|.
     assert!(!mh_early_rejects(&bound, 30.0, f64::INFINITY, 5.0, -1.0));
     assert!(!mh_early_rejects(&bound, 30.0, f64::NAN, 5.0, -1.0));
+}
+
+/// Review of #2608: a finite observation large enough that `y²` overflows made the
+/// row bound `∞`, and the gate then read `∞ ≥ ∞` and rejected **every** proposal —
+/// while the full evaluation, whose `b·f²` stays finite for a tiny proportional
+/// `b`, accepted them. The fixture is that regime: a dose of `2e156` puts the
+/// predictions near `1e155`, the observations sit exactly on the η = 0 profile, the
+/// proportional SD is `3.16e-4` (`b = 1e-7`, so `v ≈ 1e303` is finite) and the
+/// steps are tiny, so the gate-off chain accepts most proposals. Without the
+/// overflow decline in `prepared_data_term_lower_bound` the gate-on arm accepts
+/// none and the A/B reddens; the acceptance assertion keeps the fixture from
+/// degenerating into "both arms reject everything", where it could not see that.
+#[test]
+fn an_overflowing_bound_declines_instead_of_rejecting_everything() {
+    let model = model("DV ~ proportional(PROP)", "  sigma PROP ~ 0.000316 (sd)\n");
+    let mut subject = sparse_population(1).subjects.remove(0);
+    subject.doses = vec![DoseEvent::new(0.0, 2e156, 1, 0.0, false, 0.0)];
+    let p = &model.default_params;
+    let zeros = vec![0.0; model.n_eta];
+    subject.observations =
+        crate::pk::compute_predictions_with_tv(&model, &subject, &p.theta, &zeros);
+    let y_max = subject.observations.iter().cloned().fold(0.0, f64::max);
+    assert!(
+        (y_max * y_max).is_infinite() && y_max.is_finite(),
+        "fixture must overflow y² with a finite y (y_max = {y_max})"
+    );
+    let nll0 = individual_nll(
+        &model,
+        &subject,
+        &p.theta,
+        &zeros,
+        &p.omega,
+        &p.sigma.values,
+    );
+    assert!(
+        nll0.is_finite() && nll0 < 1e19,
+        "the full objective must be finite here (got {nll0})"
+    );
+
+    let mut scratch = MhScratch::default();
+    scratch.begin_subject(&model, &subject, &p.theta, model.n_eta);
+    assert_eq!(
+        prepared_data_term_lower_bound(&model, &subject, &p.theta, &p.sigma.values, &scratch.prep),
+        None,
+        "an overflowing bound must decline the subject"
+    );
+
+    let (on, _) = run_chain_scaled(&model, &subject, 77, false, 1e-4);
+    let (off, _) = run_chain_scaled(&model, &subject, 77, true, 1e-4);
+    // bits = [η…, acc_block, nll_block, …]: the gate-off chain must actually accept.
+    let acc_block = off[model.n_eta];
+    assert!(
+        acc_block > 0,
+        "fixture degenerate: the full kernel accepted nothing"
+    );
+    assert_eq!(on, off, "the gate changed a chain whose bound overflows");
 }
