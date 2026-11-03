@@ -9719,3 +9719,108 @@ fn set_interval_off_grid_names_the_subject_and_decision() {
     assert!(msg.contains("t=36"), "{msg}");
     assert!(msg.contains("t=24 and t=48"), "{msg}");
 }
+
+// #2125: a decision before the subject's first record, on the IOV path. The replay drops that
+// decision from its timeline (nothing evolves before the first record) but still resolves
+// occasions from the full schedule, so window 0 opens at the decision and the record at 1 is
+// in it. `init` makes the pre-record state non-zero, or a replay integrating from the
+// decision would decay nothing and agree.
+const ODE_IOV_INIT_2125: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = 100
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+#[test]
+fn iov_decision_before_the_first_record_verifies_and_matches_predict_iov_2125() {
+    // Before the fix the replay integrated from the hold at 0.5, so the run was refused with
+    // IPRED@1 100 (reactive) against 100·e^{−k₀/2} (replay). Degenerate oracle: the realized
+    // regimen (one bolus at 2) through `predict_iov` with the run's own η and κ.
+    let model = parse_model_string(ODE_IOV_INIT_2125).expect("parse IOV ODE model");
+    let seed = 7u64;
+    let decisions = [0.5, 2.0];
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(
+        &mut f,
+        b"ID,TIME,DV,EVID,AMT,CMT,MDV\n1,1,0,0,0,1,0\n1,3,0,0,0,1,0\n1,5,0,0,0,1,0\n",
+    )
+    .unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let make = move || {
+        let sink = sink.clone();
+        move |c: &ControllerCtx| {
+            sink.lock().unwrap().push((c.t, c.state[0]));
+            if c.t == 2.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        }
+    };
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: decisions.to_vec(),
+        ..Default::default() // verify = true: the frozen replay must agree
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, make, &opts)
+        .expect("a decision before the first record passes the replay verifier");
+    assert_eq!(res.ledger.len(), 1, "one bolus, at 2");
+
+    let eta_bsv = reconstruct_eta_bsv(&model, seed);
+    let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
+    assert!(
+        (kappas[0][0] - kappas[1][0]).abs() > 1e-3,
+        "the two windows' κ must differ, else the occasion is unobserved"
+    );
+    let mut static_subject = pop.subjects[0].clone();
+    static_subject
+        .doses
+        .push(crate::types::DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0));
+    static_subject.occasions = static_subject
+        .obs_times
+        .iter()
+        .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
+        .collect();
+    static_subject.dose_occasions = vec![1];
+    assert_eq!(static_subject.occasions, vec![0, 1, 1]);
+    let preds = crate::pk::predict_iov(
+        &model,
+        &static_subject,
+        &model.default_params.theta,
+        &eta_bsv,
+        &kappas,
+    );
+    assert_eq!(res.trajectories.len(), 3);
+    // Nothing acts before the first record: IPRED@1 is the seed, exactly.
+    assert_eq!(res.trajectories[0].ipred, 100.0, "IPRED@1 is init");
+    // Bit for bit: measured, all three observations are bit-identical to `predict_iov`.
+    for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(traj.ipred.is_finite(), "IPRED at t={}", traj.time);
+        assert_eq!(
+            traj.ipred.to_bits(),
+            pred.to_bits(),
+            "adaptive IOV IPRED {} != predict_iov {} at t={}",
+            traj.ipred,
+            pred,
+            traj.time
+        );
+    }
+    // The hold at 0.5 read the seeded state, not a decayed one.
+    let reads = seen.lock().unwrap().clone();
+    assert_eq!(reads[0], (0.5, 100.0));
+}

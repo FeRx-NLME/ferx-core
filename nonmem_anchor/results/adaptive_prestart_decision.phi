@@ -1,0 +1,9 @@
+TABLE NO.     1: First Order Conditional Estimation with Interaction (Evaluation): Problem=1 Subproblem=0 Superproblem1=0 Iteration1=0 Superproblem2=0 Iteration2=0
+ SUBJECT_NO   ID           ETA(1)       ETC(1,1)     OBJ
+            1           21  0.00000E+00  0.00000E+00    339.09923686219031
+            2           22  0.00000E+00  0.00000E+00    344.26454038754747
+            3           23  0.00000E+00  0.00000E+00    349.07105665952719
+            4           24  0.00000E+00  0.00000E+00    344.58365813520874
+            5           25  0.00000E+00  0.00000E+00    344.26454038754747
+            6           26  0.00000E+00  0.00000E+00    258.86438634705792
+            7           27  0.00000E+00  0.00000E+00    339.09923686219031

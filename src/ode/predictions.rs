@@ -518,6 +518,32 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
     }
 }
 
+/// Add the no-op breaks `extra_breaks` (the reactive driver's decision times) to a static
+/// replay's timeline, dropping every one at or before the integration `origin` — the
+/// timeline's first break, [`subject_integration_start`] of the replayed subject.
+///
+/// Nothing evolves before the origin, so a break there is not a segment boundary but the
+/// start of a phantom `[break, origin]` window: kept, it became the timeline's first break
+/// and the replay integrated from it (#2125). The reactive driver visits such a decision —
+/// the controller is consulted there — but holds the state at `init` until the origin
+/// (`started`, #936), so the two meet only if the replay drops it. The driver cannot use this
+/// helper: a break it dropped would be a decision it never made. The two origins agree
+/// because the replayed subject is base ∪ ledger, and its first record or realized dose is
+/// the driver's `min(t_base0, first realized controller dose)`.
+///
+/// Shared by both replays (the constant path's [`ode_predictions_with_extra_breaks`] and
+/// the time-varying / IOV `adaptive_frozen_replay_tv`), which each carried a `> 0.0` copy of
+/// this filter from when every timeline started at 0. A break exactly at the origin is
+/// dropped as a duplicate of the origin break itself.
+fn push_breaks_after_origin(break_times: &mut Vec<f64>, extra_breaks: &[f64], origin: f64) {
+    break_times.extend(
+        extra_breaks
+            .iter()
+            .copied()
+            .filter(|b| b.is_finite() && *b > origin),
+    );
+}
+
 /// Fill every requested sample time that falls **before the first break** with the seeded
 /// initial state `u`.
 ///
@@ -4668,7 +4694,8 @@ fn ode_predictions_with_extra_breaks_and_stats(
         .chain(chz_times.iter())
         .cloned()
         .fold(0.0f64, f64::max);
-    let mut break_times: Vec<f64> = vec![subject_integration_start(subject)];
+    let origin = subject_integration_start(subject);
+    let mut break_times: Vec<f64> = vec![origin];
     // Every pre-scheduled dose's breaks — the lag-shifted dose time, a real infusion's
     // F-scaled end, the SS+lag record time, per-route absorption-lag onsets, and
     // zero-order window ends. Shared with the reactive driver's base regimen (#702) so
@@ -4688,15 +4715,9 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // on the reset-aware adaptive frozen-replay constant path (#716), which drives
     // this engine with a reset-carrying static subject.
     break_times.extend(subject.reset_times.iter().copied());
-    // No-event break points (e.g. the reactive driver's decision times) — they
-    // only re-segment the integration, never change state. Drop non-positive /
-    // non-finite entries (0.0 is already present; the timeline starts at 0).
-    break_times.extend(
-        extra_breaks
-            .iter()
-            .copied()
-            .filter(|b| b.is_finite() && *b > 0.0),
-    );
+    // No-event break points (the reactive driver's decision times) — they only
+    // re-segment the integration, never change state, and none before the origin (#2125).
+    push_breaks_after_origin(&mut break_times, extra_breaks, origin);
     break_times.sort_by(|a, b| a.total_cmp(b));
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
@@ -5882,6 +5903,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // seed's VALUE below the first decision is immaterial — `0.0` is an equivalent mutation,
     // since a decision is already a break and nothing before the origin is integrated — so
     // the fold is simply "the first decision, or `t_base0` when none precedes it".
+    //
+    // A decision before the origin therefore stays on this timeline, where the replays drop it
+    // (`push_breaks_after_origin`, #2125): here it is a controller consultation, there it would
+    // only be the start of a window nothing evolves over. The `started` gate is what makes the
+    // two agree, so it is this driver's half of that one rule, not a second copy of it.
     let t_base0 = subject_integration_start(&shadow);
     let t_seed = decision_times.iter().cloned().fold(t_base0, f64::min);
     let mut break_times: Vec<f64> = vec![t_seed, t_last];
@@ -7164,7 +7190,8 @@ fn adaptive_frozen_replay_tv(
         .fold(0.0_f64, f64::max);
     // #936: start where the static engine starts — this subject is base ∪ ledger, so its
     // first record or realized dose is the reactive run's origin too.
-    let mut break_times: Vec<f64> = vec![subject_integration_start(subject), t_last];
+    let origin = subject_integration_start(subject);
+    let mut break_times: Vec<f64> = vec![origin, t_last];
     // Every break a dose list contributes, through the SAME builder the reactive driver
     // folds its base regimen in with (#1188). The hand-rolled loop this replaces pushed
     // only `d.time` and a real infusion's F-scaled end, so it emitted neither a per-route
@@ -7216,12 +7243,9 @@ fn adaptive_frozen_replay_tv(
     // added, so the replay zeros the state at the identical instants and stays
     // aligned. Empty for a reset-free subject.
     break_times.extend(subject.reset_times.iter().copied());
-    break_times.extend(
-        extra_breaks
-            .iter()
-            .copied()
-            .filter(|b| b.is_finite() && *b > 0.0),
-    );
+    // The decision breaks, none before the origin (#2125). Occasions still resolve from the
+    // full `extra_breaks` (`record_occ`, `decision_index_of` above); only the timeline drops it.
+    push_breaks_after_origin(&mut break_times, extra_breaks, origin);
     break_times.sort_by(|a, b| a.total_cmp(b));
     // #2123: the driver's record set — decisions, obs, pk-only and dose rows (a ledger
     // dose's row is its decision time).
