@@ -2218,3 +2218,133 @@ fn a_covariance_step_whose_tight_scope_fails_runs_at_the_fit_tolerance_and_says_
         "control — the tightened step of the same inputs must be told apart"
     );
 }
+
+/// #2597: the analytic R-matrix differentiates along the **free** packed axes only. A held
+/// coordinate — here a `FIX` θ and the two structural-zero Cholesky entries a `2 × 2`
+/// `block_omega` beside a diagonal ω leaves in the 3 × 3 lower triangle — is never read by the
+/// covariance step (`hess_free` over `free_idx`), yet the full Hessian paid a quarter-pass per
+/// subject for each one: 34 packed axes for 18 free on the issue's 6-η model, a 1.8× slower
+/// step. Three claims, each with its own failure:
+///
+/// - `analytic_cov_axes` names exactly the free axes, and `None` (the full Hessian) on the
+///   twin with nothing held — dies if the gate is dropped or inverted;
+/// - the assembled `R` is zero on every held row and column, where the full Hessian is not
+///   (asserted, so the zero is a value that can move) — dies when the assembly goes back to
+///   `subject_adjoint_cov_hessian_at`;
+/// - on the free block it is the summed full Hessian **to the bit**: each entry is the same
+///   lane of a sweep along the same direction — dies on a mis-embedded block (axes order).
+#[test]
+fn the_analytic_r_matrix_skips_held_axes_and_keeps_the_free_block_bit_identical() {
+    use crate::estimation::covariance::{
+        analytic_cov_assembly, analytic_cov_axes, AnalyticCovAssembly,
+    };
+    use crate::estimation::parameterization::packed_fixed_mask;
+    use crate::sens::ode_provider::adjoint::{subject_adjoint_cov_hessian, Objective};
+    use crate::types::{EstimationMethod, FitOptions};
+
+    let source = WARFARIN
+        .replace(
+            "theta TVKA(1.5, 0.01, 50.0)",
+            "theta TVKA(1.5, 0.01, 50.0)\n  theta TVF(1.0, 0.5, 2.0) FIX",
+        )
+        .replace(
+            "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
+            "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]",
+        )
+        .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * TVF * exp(ETA_CL)");
+    let model = parse_model_string(&source).expect("parse");
+    let params = model.default_params.clone();
+    let x_hat = pack_params(&params);
+    let n = x_hat.len();
+    let held: Vec<usize> = packed_fixed_mask(&params)
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &h)| h.then_some(i))
+        .collect();
+    // 4 θ + 6 Ω (3 × 3 lower triangle) + 1 σ; held: the FIX θ and the two off-block entries.
+    assert_eq!(n, 11);
+    assert_eq!(held.len(), 3, "held axes {held:?}");
+    let free: Vec<usize> = (0..n).filter(|i| !held.contains(i)).collect();
+    assert_eq!(analytic_cov_axes(&model, &params, n), Some(free.clone()));
+    let plain = parse_model_string(WARFARIN).expect("parse");
+    assert_eq!(
+        analytic_cov_axes(
+            &plain,
+            &plain.default_params,
+            pack_params(&plain.default_params).len()
+        ),
+        None,
+        "nothing held: the full Hessian"
+    );
+
+    let pop = salvage_population(&model, &params, 4, "held-axes-");
+    let eta_hats: Vec<DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+        .collect();
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        analytic_cov_hessian: true,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let AnalyticCovAssembly::Full(r) =
+        analytic_cov_assembly(&model, &pop, &params, &x_hat, &eta_hats, &[], &opts)
+    else {
+        panic!("every subject must take the analytic R-matrix");
+    };
+    // The reference: the full per-subject Hessian, summed ×2 in subject order as the assembly
+    // sums, on a fit-pool-sized stack.
+    let reference = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .spawn_scoped(scope, || {
+                let mut acc = DMatrix::<f64>::zeros(n, n);
+                for (s, e) in pop.subjects.iter().zip(&eta_hats) {
+                    let h = subject_adjoint_cov_hessian(
+                        &model,
+                        s,
+                        &params,
+                        &x_hat,
+                        e.as_slice(),
+                        Objective::Focei,
+                    )
+                    .expect("full Hessian served");
+                    acc += 2.0 * h;
+                }
+                acc
+            })
+            .expect("spawn")
+            .join()
+            .expect("join")
+    });
+    let held_mass: f64 = held
+        .iter()
+        .flat_map(|&i| (0..n).map(move |j| (i, j)))
+        .map(|(i, j)| reference[(i, j)].abs())
+        .sum();
+    assert!(
+        held_mass > 0.0,
+        "premise: the full Hessian is non-zero on the held rows, so the zeros below can fail"
+    );
+    for &i in &held {
+        for j in 0..n {
+            assert_eq!(r[(i, j)], 0.0, "held row {i}, column {j}");
+            assert_eq!(r[(j, i)], 0.0, "held column {i}, row {j}");
+        }
+    }
+    for &i in &free {
+        for &j in &free {
+            assert!(r[(i, j)].is_finite(), "[{i}, {j}] {}", r[(i, j)]);
+            assert_eq!(
+                r[(i, j)].to_bits(),
+                reference[(i, j)].to_bits(),
+                "free block [{i}, {j}]: {} vs the full Hessian's {}",
+                r[(i, j)],
+                reference[(i, j)]
+            );
+        }
+    }
+}

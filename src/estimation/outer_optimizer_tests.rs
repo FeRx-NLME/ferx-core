@@ -1025,6 +1025,44 @@ fn test_stagnation_window_sizes() {
     assert_eq!(stagnation_window(20, true), 21);
 }
 
+/// #2597: the window is sized in the coordinates the optimizer can move. The issue's model —
+/// 9 θ, a `2 × 2` `block_omega` beside four diagonal ω (two `0 FIX`), four σ — packs 34
+/// coordinates (the 6 × 6 lower triangle is 21) of which 18 are free, so its short window was
+/// 35 evaluations instead of 19. This fixture has the same Ω and a `FIX` θ, with two σ: the 14
+/// structural-zero Cholesky entries off the block, the two `FIX` diagonals and the `FIX` θ are
+/// held at `lower == upper`. Dies if the dimension counts held coordinates again.
+#[test]
+fn stagnation_window_is_sized_in_free_coordinates() {
+    let src = "[parameters]\n\
+        theta T1(1.0, 0.01, 100.0)\n  theta T2(1.0, 0.01, 100.0)\n\
+        theta T3(1.0, 0.01, 100.0)\n  theta T4(1.0, 0.01, 100.0)\n\
+        theta T5(1.0, 0.01, 100.0)\n  theta T6(1.0, 0.01, 100.0)\n\
+        theta T7(1.0, 0.01, 100.0)\n  theta T8(1.0, 0.01, 100.0)\n\
+        theta T9(1.0, 0.5, 2.0) FIX\n\
+        block_omega (E1, E2) = [0.2, 0.05, 0.2]\n\
+        omega E3 ~ 0.1\n  omega E4 ~ 0.1\n  omega E5 ~ 0 FIX\n  omega E6 ~ 0 FIX\n\
+        sigma S1 ~ 0.2 (sd)\n  sigma S2 ~ 0.1 (sd)\n\
+        [individual_parameters]\n\
+        CL = T1 * T9 * exp(E1)\n  V = T2 * T6 * exp(E2)\n  KA = T3 * exp(E3 + E6)\n\
+        Q = T4 * T7 * exp(E4)\n  V2 = T5 * T8 * exp(E5)\n\
+        [structural_model]\n  pk two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA)\n\
+        [error_model]\n  DV ~ combined(S1, S2)\n";
+    let model = crate::parser::model_parser::parse_model_string(src).expect("model parses");
+    let start = pack_with_bounds(&model.default_params);
+    assert_eq!(start.packed.len(), 9 + 21 + 2, "every packed coordinate");
+    // 8 free θ + the block's 3 entries + 2 free diagonals + 2 σ.
+    assert_eq!(stagnation_dimension(&start.fixed), 15);
+    assert_eq!(
+        stagnation_window(stagnation_dimension(&start.fixed), true),
+        16
+    );
+    assert_eq!(
+        stagnation_window(start.packed.len(), true),
+        33,
+        "the padded window"
+    );
+}
+
 /// The short window needs all three parts of its gate: a gradient optimizer,
 /// unreachable stops (not Laplace/AGQ), and a significant feasible improvement *after*
 /// the first feasible eval (#1530).
@@ -13094,20 +13132,23 @@ fn with_verify_leg<R>(on: bool, f: impl FnOnce() -> R) -> (R, Vec<UnprofiledLeg>
     )
 }
 
-/// #2462, the stuck side. From (TVE0, EMAX, ET50) = (55, 4, 3.2), A2's unprofiled fit
-/// stops converged 4.07e-4 above NONMEM, and a warm-seeded leg from that incumbent
+/// #2462, the stuck side. From (TVE0, EMAX, ET50) = (60, 6, 3.2), A2's unprofiled fit
+/// stops converged 4.10e-4 above NONMEM, and a warm-seeded leg from that incumbent
 /// fails its first line search on a Nelder–Mead fallback dip. With the leg the fit ends in
 /// NONMEM's band; with it switched off the same fit still reports the stuck stop
 /// converged, so the pair straddles the leg.
 ///
 /// The start was (55, 5, 3.2) until #2549's EBE warm-start predictor carried that start's
-/// leg-less fit into the band (+2.76e-7). Re-measured (Linux x86_64) from a scan of nearby
-/// starts: (55, 4, 3.2) +2.747e-7 with the leg, +4.070e-4 without.
+/// leg-less fit into the band (+2.76e-7), then (55, 4, 3.2) until #2597 sized the
+/// stagnation window in free coordinates and that start's leg-less fit landed in the band
+/// too (+3.08e-7). Re-measured from a 3 × 4 × 3 scan of nearby starts, 21 of 36 of which
+/// still stop stuck: (60, 6, 3.2) +2.747e-7 with the leg, +4.101e-4 without (macOS arm64
+/// and Linux, see the PR); three of its four grid neighbours stop stuck too.
 #[test]
 fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
     let (prep, nm) = a2_unprofiled();
     let mut init = prep.init_params.clone();
-    init.theta[..3].copy_from_slice(&[55.0, 4.0, 3.2]);
+    init.theta[..3].copy_from_slice(&[60.0, 6.0, 3.2]);
     let opts = FitOptions {
         verbose: false,
         run_covariance_step: false,
@@ -13138,7 +13179,7 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
     let (with, legs) = fit(true);
     let (without, none) = fit(false);
     eprintln!(
-        "A2 (55, 4, 3.2): with the leg Δ {:+.3e} converged {} (leg gains {:?}); without Δ \
+        "A2 (60, 6, 3.2): with the leg Δ {:+.3e} converged {} (leg gains {:?}); without Δ \
          {:+.3e} converged {}",
         with.ofv - nm,
         with.converged,
@@ -13147,7 +13188,7 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
         without.converged
     );
     assert!(none.is_empty(), "the switch turns the leg off");
-    // The leg itself does the work: its gain is the stuck gap, measured 4.07e-4.
+    // The leg itself does the work: its gain is the stuck gap, measured 4.10e-4.
     assert!(
         legs.first().is_some_and(|l| l.gain > 1e-4),
         "the restart's first leg must descend from the stuck stop: {legs:?}"
@@ -13160,7 +13201,7 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
         with.converged,
         with.warnings
     );
-    // The control: without the leg the stop is the 4.07e-4 one, reported converged.
+    // The control: without the leg the stop is the 4.10e-4 one, reported converged.
     assert!(
         without.converged && without.ofv - nm > 1e-4,
         "the fixture must still stop stuck without the leg: Δ {:+.3e}, converged {}",

@@ -9626,7 +9626,8 @@ pub struct FitOptions {
     /// NLopt-based outer optimizers short-circuit once recent evals show
     /// no OFV improvement above 1e-3 over a window of `max(3·(n+1), 50)`
     /// evals — `max(n+1, 10)` for a FOCE/FOCEI gradient-based optimizer once the fit has
-    /// improved on its first evaluation and its steps are not growing (#1530) —
+    /// improved on its first evaluation and its steps are not growing (#1530), `n` the free
+    /// (not `FIX`, not structural-zero Ω) parameters (#2597) —
     /// letting SLSQP / L-BFGS terminate in microseconds via their
     /// own xtol/ftol instead of burning through the remaining maxeval
     /// budget at full inner-loop cost. Set to `false` to disable when

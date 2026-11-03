@@ -2017,6 +2017,15 @@ fn detect_stagnation(
     }
 }
 
+/// The dimension [`stagnation_window`] is sized in: the packed coordinates the optimizer can
+/// move, i.e. those `fixed` (the `PackedStart::fixed` mask) does not hold at `lower ==
+/// upper`. A `FIX` parameter or a structural-zero Ω entry is no search direction, so a window
+/// counted over every packed coordinate ran `n_held` evaluations longer than the same model
+/// written without them (#2597).
+fn stagnation_dimension(fixed: &[bool]) -> usize {
+    fixed.iter().filter(|&&held| !held).count()
+}
+
 /// Evals without a significant OFV improvement after which the stagnation
 /// guard latches.
 ///
@@ -5901,10 +5910,16 @@ fn optimize_nlopt_attempt_probed(
     let PackedStart {
         packed: mut x0,
         bounds,
+        fixed,
         ..
     } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x0, &bounds);
     let n = x0.len();
+    // The coordinates the optimizer can move: a held one (`FIX`, or a structural-zero Ω entry)
+    // sits at `lower == upper`. The stagnation window is sized in these (#2597): a held
+    // coordinate is no search direction, so counting it padded the window — 35 evaluations
+    // instead of 19 on a 6-η model with one 2 × 2 block, 16 of them spent flat.
+    let n_free = stagnation_dimension(&fixed);
     let n_subj = population.subjects.len();
     let n_eta = model.n_eta;
 
@@ -6737,7 +6752,7 @@ fn optimize_nlopt_attempt_probed(
         if !in_verify_leg
             && stagnation_after_eval(
                 state,
-                n,
+                n_free,
                 options.stagnation_guard,
                 algo,
                 gradient_run_has_reachable_stops(options),

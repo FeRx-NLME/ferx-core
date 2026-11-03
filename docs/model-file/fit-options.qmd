@@ -895,7 +895,9 @@ The guard short-circuits the NLopt-based outer optimizers once recent evals show
 improvement above 1e-3 over a window of evals: `max(3·(n+1), 50)` in general, shortened
 to `max(n+1, 10)` for a FOCE/FOCEI gradient-based optimizer (L-BFGS, SLSQP, MMA; not
 Laplace/AGQ, which have reachable `outer_xtol`/`outer_ftol` stops) once the fit has
-improved on its first evaluation (#1530). A gradient fit can otherwise spin on a flat
+improved on its first evaluation (#1530). `n` counts the parameters the optimizer can
+move: a `FIX` parameter, or an Ω entry that is a structural zero beside a `block_omega`,
+is not a search direction and does not lengthen the window (#2597). A gradient fit can otherwise spin on a flat
 objective whose outer gradient does not vanish. This lets SLSQP / L-BFGS terminate quickly
 on numerically-flat plateaus (e.g. γ-bearing FOCEI problems) instead of grinding through
 the remaining `outer_maxiter` budget at full inner-loop cost.
