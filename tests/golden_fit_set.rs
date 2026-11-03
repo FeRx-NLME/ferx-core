@@ -326,7 +326,7 @@ fn report_only_ends_on_the_date_and_a_missing_bands_file_fails() {
 
 fn bands(cl_band: f64) -> String {
     format!(
-        r#"{{"n_nightlies": 30, "accepted": {{}}, "models": {{"warfarin": {{
+        r#"{{"n_nightlies": 30, "abs_scale": 1e-6, "accepted": {{}}, "models": {{"warfarin": {{
             "ofv": 0.001, "n_iterations": 2,
             "est": {{"theta:CL": {cl_band:e}, "theta:V": 1e-6, "omega:ETA_CL": 1e-6}},
             "se": {{"theta:CL": 1e-6, "theta:V": 1e-6, "omega:ETA_CL": 1e-6}}}}}}}}"#
@@ -696,6 +696,101 @@ fn bands_is_headroom_times_the_spread_and_refuses_a_short_window() {
         text(&out).contains("3 nightlies given, 30 required"),
         "{}",
         text(&out)
+    );
+}
+
+/// A quantity that sits at zero — a block covariance estimated at 0, a FIXed SE — is
+/// banded and checked on the same `|x − ref| / max(|ref|, abs_scale)` scale. Two
+/// measured windows, each straddled by a head that moves 0 → 1e-15 (noise: passes) and
+/// 0 → 5 (a real change: fails). Under the old pure ratio, the mostly-zero window
+/// measured a band of ~2e288 that passed 0 → 5, and the all-zero window's floor failed
+/// 0 → 1e-15, because any move off zero read exactly 1.
+#[test]
+fn a_quantity_at_zero_is_banded_and_checked_on_one_scale() {
+    const KEY: &str = "omega:ETA_V,ETA_CL";
+    let with_cov = |est: f64| {
+        let mut p = BASE_PARAMS.to_vec();
+        p.push((KEY, est, 0.0));
+        p
+    };
+    let measure = |slot: &str, nightly: &dyn Fn(usize) -> f64| -> String {
+        let dir = scratch(slot);
+        let hist: Vec<String> = (0..30)
+            .map(|k| {
+                write(
+                    &dir,
+                    &format!("n{k}.json"),
+                    &results(
+                        &format!("n{k}"),
+                        &[("warfarin", model_rec("1234.5", 20, &with_cov(nightly(k))))],
+                    ),
+                )
+            })
+            .collect();
+        let out_path = dir.join("bands.json");
+        let mut args = vec!["bands", "--out", out_path.to_str().unwrap()];
+        args.extend(hist.iter().map(String::as_str));
+        let out = golden(&args);
+        assert!(out.status.success(), "{}", text(&out));
+        std::fs::read_to_string(&out_path).unwrap()
+    };
+    let band_of = |b: &str| -> f64 {
+        let v: serde_json::Value = serde_json::from_str(b).unwrap();
+        v["models"]["warfarin"]["est"][KEY].as_f64().unwrap()
+    };
+    let date = fail_date();
+
+    // 29 nights at 0 and one at 1e-12: spread 1e-12 / abs_scale 1e-6 = 1e-6, × 2.
+    let mostly_zero = measure("zero-mostly", &|k| if k == 7 { 1e-12 } else { 0.0 });
+    let tol = band_of(&mostly_zero);
+    assert!(
+        (tol - 2e-6).abs() < 1e-15,
+        "a finite band, not ÷1e-300: {tol}"
+    );
+    // Every night at 0: no spread, so the 1e-6 floor.
+    let all_zero = measure("zero-all", &|_| 0.0);
+    assert_eq!(band_of(&all_zero), 1e-6);
+
+    for (name, bands) in [("mostly", &mostly_zero), ("all", &all_zero)] {
+        let run = |slot: &str, head: f64| {
+            report_recs(
+                &format!("zero-{name}-{slot}"),
+                model_rec("1234.5", 20, &with_cov(0.0)),
+                model_rec("1234.5", 20, &with_cov(head)),
+                Some((bands, None)),
+                &date,
+            )
+        };
+        let (out, md) = run("tiny", 1e-15);
+        assert!(
+            out.status.success(),
+            "{name}: 0 → 1e-15 is noise, inside the band:\n{md}"
+        );
+        let (out, md) = run("large", 5.0);
+        assert!(
+            !out.status.success(),
+            "{name}: 0 → 5 must leave the band:\n{md}"
+        );
+        assert!(
+            md.contains(&format!("est({KEY}): 5e+06 > band")),
+            "{name}:\n{md}"
+        );
+    }
+
+    // A band in other units bounds nothing: bands.json on another abs_scale is refused.
+    let other = mostly_zero.replace(r#""abs_scale": 1e-06"#, r#""abs_scale": 1e-09"#);
+    assert_ne!(other, mostly_zero, "fixture must carry the recorded scale");
+    let (out, md) = report_recs(
+        "zero-other-scale",
+        model_rec("1234.5", 20, &with_cov(0.0)),
+        model_rec("1234.5", 20, &with_cov(0.0)),
+        Some((&other, None)),
+        &date,
+    );
+    assert!(!out.status.success(), "{md}");
+    assert!(
+        md.contains("measured with abs_scale 1e-09, not 1e-06 — re-measure"),
+        "{md}"
     );
 }
 
@@ -1094,4 +1189,9 @@ fn the_fail_on_band_date_is_set_and_documented() {
             "{page} must state the date {date}"
         );
     }
+    // The band-collection loop takes red nights too: in fail-on-band mode a new or
+    // drifted model's nights are red by design, and are the ones its band is measured on.
+    let guide = std::fs::read_to_string(dev_docs.join("golden-fits.qmd")).unwrap();
+    assert!(guide.contains("--event schedule \\\n              --status completed --limit 30"));
+    assert!(!guide.contains("--status success"));
 }

@@ -31,7 +31,7 @@ gap (#2635). It sits beside the anchors and does not replace any of them.
 Each row records OFV, every θ, ω (including off-diagonals of a block), κ and σ
 with its SE, the iteration count, the convergence flag and the covariance status.
 The columns show the change against the release: ΔOFV as an absolute value, the
-largest relative change (`|head − release| / |release|`) over the estimates
+largest scaled change (`|head − release| / max(|release|, 1e-6)`) over the estimates
 and over the SEs together with the parameter it occurs on, and the change in iterations. A `Δ OFV prev` column
 compares against the previous nightly, which ties a change to one day's merges.
 For every model that changed, a collapsible block lists each parameter that
@@ -73,17 +73,24 @@ date. To move the date, change both in the same commit.
 ### Measuring the bands
 
 ```bash
-# the last 30 scheduled runs' results, one directory each
+# the last 30 scheduled runs' results, one directory each. `completed`, not
+# `success`: once fail-on-band is on, a night with a new or drifted model is red
+# and still uploads its results. A run that died before uploading has none.
 for id in $(gh run list --workflow golden-fits.yml --branch main --event schedule \
-              --status success --limit 30 --json databaseId --jq '.[].databaseId'); do
-  gh run download "$id" --name golden-fits-results --dir "hist/$id"
+              --status completed --limit 30 --json databaseId --jq '.[].databaseId'); do
+  gh run download "$id" --name golden-fits-results --dir "hist/$id" || true
 done
 python3 tools/golden-fits/golden.py bands hist/*/head.json   # writes tools/golden-fits/bands.json
 ```
 
 A band is `headroom × max |x − median|` over the nightlies, with a default
-headroom of 2. It is relative for estimates and SEs and absolute for OFV and
-iterations. If the spread of a quantity is exactly zero, the band falls back to
+headroom of 2. It is absolute for OFV and iterations. For estimates and SEs it is
+on the same scale the report measures a change on, `|x − median| / max(|median|,
+1e-6)`: relative for an ordinary value, and absolute (in units of 1e-6) for one
+at or near zero, such as a block covariance estimated at 0 or a fixed SE. A pure
+ratio would score every move off zero as exactly 1, however small, and divide a
+zero median's spread into a band no change can leave. `bands.json` records the
+scale as `abs_scale`, and the report refuses bands measured on a different one. If the spread of a quantity is exactly zero, the band falls back to
 a floor (1e-6 relative, 1e-3 OFV, 2 iterations), because a band of 0 would fail
 on the last bit. The floors are a choice, not a measurement, and `bands.json`
 records them. `bands` refuses to run on fewer than 30 nightlies. A quantity

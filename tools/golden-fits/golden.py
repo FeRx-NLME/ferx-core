@@ -59,6 +59,15 @@ FLOOR_REL = 1e-6
 FLOOR_OFV = 1e-3
 FLOOR_ITER = 2
 
+# Estimates and SEs are compared on ONE scale, by `scaled_dev`, in both `report` and
+# `bands`: |x − ref| / max(|ref|, ABS_SCALE). Far from zero that is the relative
+# change; within ABS_SCALE of zero it becomes the absolute change in units of
+# ABS_SCALE, so a quantity that sits at 0 (a block covariance estimated at zero, a
+# FIXed coordinate's SE) has a finite, magnitude-aware deviation instead of the
+# "always 1" or "÷ 1e-300" a pure ratio gives. Like the floors, it is a choice, and
+# bands.json records it: bands measured on another scale are not used.
+ABS_SCALE = 1e-6
+
 RESULTS_SCHEMA = 1
 
 # Every fit runs on exactly one worker. Since #1460 ferx sizes its own pool from
@@ -276,16 +285,20 @@ def load(path: str | None) -> dict | None:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def rel(h: float, b: float) -> float:
-    """|h − b| / |b|: a 1% move reads 1.00e-02 and a 10× move reads 9. A base of
-    exactly 0 falls back to the head's magnitude. NaN on EITHER side — including
-    both — is NaN: never folded away, so a fit returning NaN is never a pass, even
-    when the release returned NaN too."""
-    if math.isnan(h) or math.isnan(b):
+def scaled_dev(x: float, ref: float) -> float:
+    """|x − ref| / max(|ref|, ABS_SCALE): a 1% move reads 1.00e-02 and a 10× move
+    reads 9; near zero it is the absolute move in units of ABS_SCALE, so 0 → 1e-15
+    reads 1e-9 and 0 → 5 reads 5e6. NaN on EITHER side — including both — is NaN:
+    never folded away, so a fit returning NaN is never a pass, even when the
+    release returned NaN too."""
+    if math.isnan(x) or math.isnan(ref):
         return float("nan")
-    if h == b:
+    if x == ref:
         return 0.0
-    return abs(h - b) / (abs(b) if b != 0.0 else abs(h))
+    return abs(x - ref) / max(abs(ref), ABS_SCALE)
+
+
+rel = scaled_dev  # head against its reference, in the report
 
 
 def absd(h: float, b: float) -> float:
@@ -372,6 +385,10 @@ def out_of_band(model_id: str, d: dict, bands: dict) -> list[str]:
     b = bands.get("models", {}).get(model_id)
     if b is None:
         return ["no measured band for this model"]
+    if bands.get("abs_scale") != ABS_SCALE:
+        # A band is a number in `scaled_dev` units; on another scale it bounds nothing.
+        return [f"bands.json was measured with abs_scale {bands.get('abs_scale')}, "
+                f"not {ABS_SCALE} — re-measure"]
     bad = []
 
     def check(name, v, tol):
@@ -597,8 +614,11 @@ def spread(values: list[float], relative: bool) -> float:
     if any(math.isnan(v) for v in values):
         return float("nan")
     med = statistics.median(values)
-    dev = max(abs(v - med) for v in values)
-    return dev / max(abs(med), 1e-300) if relative else dev
+    if relative:
+        # The same metric `report` measures a head against, with the median as the
+        # reference — so a band and the deviation it bounds are in the same units.
+        return max(scaled_dev(v, med) for v in values)
+    return max(abs(v - med) for v in values)
 
 
 def cmd_bands(a) -> int:
@@ -634,6 +654,7 @@ def cmd_bands(a) -> int:
            "measured_over": [r.get("label") for r in runs],
            "headroom": a.headroom,
            "floors": {"rel": FLOOR_REL, "ofv": FLOOR_OFV, "iterations": FLOOR_ITER},
+           "abs_scale": ABS_SCALE,
            "accepted": {},
            "models": out_models}
     Path(a.out).write_text(json.dumps(out, indent=1, sort_keys=True) + "\n", encoding="utf-8")
