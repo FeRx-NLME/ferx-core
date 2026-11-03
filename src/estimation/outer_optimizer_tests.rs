@@ -9458,6 +9458,134 @@ fn the_basin_probe_runs_on_a_geometric_schedule() {
     assert_eq!(due, vec![32, 64, 128, 256, 512]);
 }
 
+/// The mid-leg probe's restart-or-absorb gate (#2600), on both sides of
+/// `BASIN_PROBE_RESTART_SHARE` and at the sizes that motivated it.
+///
+/// - The `tests/ebe_basin_shift.rs` fixture: one of 10 subjects switches, a tenth of the
+///   objective, and the leg restarts as it did under #2093.
+/// - The #2600 JV fit: 19 / 9 / 3 / 5 / 4 of 5,937 subjects (0.32 % at most) — every leg was
+///   cut at evaluation 32; each of those is now absorbed.
+/// - The boundary itself: 1 % of 5,000 is 50, so 49 absorbs and 50 restarts; a population
+///   under 100 restarts on its first switched subject, and absorbs a gap no subject carries
+///   (a gap spread thinly over the population is noise-like, not a trap).
+/// - No count (AGQ, or no held state at the incumbent) restarts, the pre-#2600 behaviour.
+#[test]
+fn the_basin_probe_restarts_on_a_material_share_and_absorbs_a_handful() {
+    use BasinProbeAction::{Absorb, Restart};
+    assert_eq!(basin_probe_action(Some(1), 10), Restart);
+    for k in [19, 9, 3, 5, 4] {
+        assert_eq!(basin_probe_action(Some(k), 5937), Absorb, "{k} of 5937");
+    }
+    assert_eq!(basin_probe_action(Some(49), 5000), Absorb);
+    assert_eq!(basin_probe_action(Some(50), 5000), Restart);
+    assert_eq!(basin_probe_action(Some(1), 99), Restart);
+    assert_eq!(basin_probe_action(Some(0), 99), Absorb);
+    assert_eq!(basin_probe_action(Some(0), 5937), Absorb);
+    assert_eq!(basin_probe_action(None, 5937), Restart);
+    assert_eq!(basin_probe_action(None, 10), Restart);
+}
+
+/// The absorb arm end to end (#2600), as an A/B on one fit: the full 200-subject
+/// Michaelis–Menten population of `tests/ebe_basin_shift.rs`, warm-start predictor off (the
+/// trap is the unpredicted start's), once at the shipped share and once with the share
+/// raised so the same probe absorbs.
+///
+/// At the shipped 1 % the probe at the 32nd evaluation finds 5 of 200 subjects in a lower
+/// cold mode (2.5 %) and restarts, as under #2093. Raised to 5 %, the same probe absorbs
+/// those modes and the leg continues on its own L-BFGS memory. The arm under test must reach
+/// the restart arm's optimum with no basin-shift restart filed, and pass its own end-of-leg
+/// check (`converged`). The JV fit the issue reports is private; this is the closest
+/// committed fixture whose probe sees a switch at all.
+///
+/// Measured on native macOS arm64 (`ci-fast`; a Linux run is the reference for any band):
+/// restart arm 775.394246 converged in 102 evaluations over 2 attempts; absorb arm
+/// 775.394203 converged in 76 evaluations over 1 attempt, both probes at a 44.857 gap from
+/// 5 subjects. Mutation: absorbing without handing the cold modes to the warm-start cache
+/// re-trapped (a second probe found 4 subjects), the end-of-leg check filed a restart, and
+/// the fit took 119 evaluations to 775.394520 — red on the no-restart assertion.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_handful_of_switched_subjects_is_absorbed_into_the_running_leg() {
+    use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx").unwrap();
+    let parsed = parse_full_model(&text).unwrap();
+    let pop = read_nonmem_csv(
+        Path::new("tests/fixtures/mm_basin_shift/mm_n200.csv"),
+        None,
+        None,
+    )
+    .unwrap();
+    let opts = FitOptions {
+        verbose: false,
+        ..parsed.fit_options.clone()
+    };
+    let _off = WarmPredictorOff::new();
+    let run = |share: Option<f64>| {
+        BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.set(share));
+        BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().clear());
+        NLOPT_ATTEMPTS.with(|c| c.set(0));
+        let r = optimize_population(&parsed.model, &pop, &parsed.model.default_params, &opts);
+        BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.set(None));
+        let decisions = BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().split_off(0));
+        (r, decisions, NLOPT_ATTEMPTS.with(|c| c.get()))
+    };
+    let (restart, restart_probes, restart_attempts) = run(None);
+    let (absorb, absorb_probes, absorb_attempts) = run(Some(0.05));
+    eprintln!(
+        "restart arm: OFV {:.6} converged {} evals {} attempts {restart_attempts} probes \
+         {restart_probes:?}\nabsorb arm: OFV {:.6} converged {} evals {} attempts \
+         {absorb_attempts} probes {absorb_probes:?}",
+        restart.ofv,
+        restart.converged,
+        restart.n_iterations,
+        absorb.ofv,
+        absorb.converged,
+        absorb.n_iterations,
+    );
+    let restarted = |r: &OuterResult| {
+        r.warnings
+            .iter()
+            .any(|w| w.contains("resumed from the best point seen"))
+    };
+    // The straddle: both arms see the same probe, a switched share between 1 % and 5 %.
+    let first = |p: &[(f64, Option<usize>)]| p.first().and_then(|d| d.1);
+    assert!(
+        first(&restart_probes).is_some_and(|k| (2..10).contains(&k)),
+        "the shipped arm's probe must see 1–5 % of 200 switch: {restart_probes:?}"
+    );
+    assert_eq!(first(&restart_probes), first(&absorb_probes));
+    assert!(restarted(&restart), "at 1 % the probe restarts");
+    assert!(
+        !restarted(&absorb),
+        "at 5 % the probe absorbs: {:?}",
+        absorb.warnings
+    );
+    assert!(absorb.converged, "the absorbing leg reaches its own stop");
+    assert!(absorb.ofv.is_finite() && restart.ofv.is_finite());
+    // Measured −4.3e-5 (absorb lower); 1e-3 is ~20× that, and far below the 44.9 gap.
+    assert!(
+        (absorb.ofv - restart.ofv).abs() < 1e-3,
+        "absorbing must reach the restart's optimum: {} vs {}",
+        absorb.ofv,
+        restart.ofv
+    );
+    // The point of #2600: one leg, its memory kept, and fewer evaluations (measured 76
+    // against 102).
+    assert_eq!(absorb_attempts, 1, "no second attempt");
+    assert!(
+        absorb.n_iterations < restart.n_iterations,
+        "{} vs {}",
+        absorb.n_iterations,
+        restart.n_iterations
+    );
+}
+
 /// End to end on `examples/warfarin_dcm.ferx`: the DCM fit converges at −1173.559691 with no
 /// start-dependence gap left (#2204).
 ///

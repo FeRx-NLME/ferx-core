@@ -3265,6 +3265,69 @@ pub(crate) fn ebe_screen_moved_warning(ids: &[String]) -> Option<String> {
 /// two orders of magnitude below the 88-unit gap it exists to catch.
 const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
 
+/// Whether the mid-leg basin probe runs at this feasible-evaluation count: 32, 64, 128, …
+/// — a logarithmic number of cold passes per leg, none before the trajectory has had a
+/// chance to settle (#2093).
+fn basin_probe_due(feasible_evals: usize) -> bool {
+    feasible_evals >= BASIN_PROBE_FIRST && feasible_evals.is_power_of_two()
+}
+
+/// The first feasible evaluation at which [`basin_probe_due`] fires.
+const BASIN_PROBE_FIRST: usize = 32;
+
+/// What the mid-leg basin probe does with a cold re-solve that beat the best seen (#2600).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BasinProbeAction {
+    /// End the leg for a basin-shift restart: a fresh optimizer from the incumbent, its
+    /// first inner solve cold (#2093).
+    Restart,
+    /// Keep the leg running, with the cold re-solve's modes as the next evaluation's warm
+    /// starts. The optimizer's curvature memory survives; the surface it minimises from
+    /// here on is the one the cold modes define.
+    Absorb,
+}
+
+/// The share of the population that has to sit in a lower cold mode before the mid-leg
+/// probe restarts the leg rather than absorbing the modes into it ([`basin_probe_action`]).
+const BASIN_PROBE_RESTART_SHARE: f64 = 0.01;
+
+/// Restart or absorb, from how many subjects the probe's cold re-solve put in a lower
+/// individual mode (`switched`, [`subjects_in_a_lower_cold_mode`]) out of `n_subjects`
+/// (#2600).
+///
+/// The #2093 probe restarted on any gap above [`BASIN_SHIFT_ABS_TOL`]. On a 10-subject
+/// fixture one subject switching is a tenth of the objective, and the curvature pairs the
+/// optimizer collected on the trapped surface are worth little afterwards. On a
+/// 5,937-subject FOCEI fit a handful of the subjects will almost always sit in a lower cold
+/// mode, so every leg was cut at its 32nd evaluation — five legs, gains 33.5 / 14.3 / 0.99 /
+/// 1.14 / 0.55 from 19 / 9 / 3 / 5 / 4 switched subjects — no leg reached its own stopping
+/// rule, and the fit ended with |g|∞ = 16.3. Restarting throws the L-BFGS memory away,
+/// and 19 of 5,937 terms changing leaves most of it describing the same surface; so below
+/// [`BASIN_PROBE_RESTART_SHARE`] of the population the switch is absorbed into the running
+/// leg instead. The end-of-leg check (#1565) still runs on every leg, so a gap that
+/// survives to the leg's own stop still files its restart and its warning.
+///
+/// `switched = None` — the count is not available (AGQ, whose per-subject term is not the
+/// one the count scores, or no held state at the incumbent) — restarts, as before #2600.
+fn basin_probe_action(switched: Option<usize>, n_subjects: usize) -> BasinProbeAction {
+    match switched {
+        Some(k) if (k as f64) < basin_probe_restart_share() * n_subjects as f64 => {
+            BasinProbeAction::Absorb
+        }
+        _ => BasinProbeAction::Restart,
+    }
+}
+
+/// [`BASIN_PROBE_RESTART_SHARE`], or this thread's `BASIN_PROBE_RESTART_SHARE_TEST`
+/// override (tests only, for the A/B of the two arms on one fit).
+fn basin_probe_restart_share() -> f64 {
+    #[cfg(test)]
+    if let Some(share) = BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.get()) {
+        return share;
+    }
+    BASIN_PROBE_RESTART_SHARE
+}
+
 /// By how much a cold re-solve at the restored point *beat* the objective the optimizer
 /// minimised there, when it beat it by more than [`BASIN_SHIFT_ABS_TOL`] (#1565).
 ///
@@ -3282,16 +3345,6 @@ const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
 /// path has no cold solve; a run with no feasible evaluation has no best-seen) or a
 /// non-finite one, which [`ColdSolveVerdict::NonFinite`] and
 /// [`gate_converged_on_objective`] already own.
-/// Whether the mid-leg basin probe runs at this feasible-evaluation count: 32, 64, 128, …
-/// — a logarithmic number of cold passes per leg, none before the trajectory has had a
-/// chance to settle (#2093).
-fn basin_probe_due(feasible_evals: usize) -> bool {
-    feasible_evals >= BASIN_PROBE_FIRST && feasible_evals.is_power_of_two()
-}
-
-/// The first feasible evaluation at which [`basin_probe_due`] fires.
-const BASIN_PROBE_FIRST: usize = 32;
-
 fn cold_solve_beats_best_seen(cold_ofv: Option<f64>, best_seen_ofv: Option<f64>) -> Option<f64> {
     let (cold, best) = (cold_ofv?, best_seen_ofv?);
     if !cold.is_finite() || !best.is_finite() {
@@ -5345,6 +5398,13 @@ thread_local! {
     /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Each mid-leg basin probe that found a gap on this thread (#2600): the gap and the
+    /// switched-subject count [`basin_probe_action`] decided on.
+    pub(crate) static BASIN_PROBE_DECISIONS: std::cell::RefCell<Vec<(f64, Option<usize>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Overrides `BASIN_PROBE_RESTART_SHARE` on this thread (#2600).
+    pub(crate) static BASIN_PROBE_RESTART_SHARE_TEST: std::cell::Cell<Option<f64>> =
+        const { std::cell::Cell::new(None) };
     /// Makes no #2462 leg settle on this thread, so every stop runs `MAX_POLISH_LEGS` legs —
     /// for the #2507 test of the kept leg's state.
     pub(crate) static UNPROFILED_VERIFY_NEVER_SETTLE: std::cell::Cell<bool> =
@@ -6315,6 +6375,9 @@ fn optimize_nlopt_attempt(
         // that check's own margin ([`cold_solve_beats_best_seen`]), the leg stops through
         // the stagnation early-return and the end-of-leg check files the basin-shift
         // restart. A leg whose probe finds nothing continues on a bit-identical trajectory.
+        // #2600: a gap carried by under `BASIN_PROBE_RESTART_SHARE` of the subjects does not
+        // end the leg; their cold modes become the warm starts and the leg keeps its L-BFGS
+        // memory ([`basin_probe_action`]).
         let mut basin_probe_stopped = false;
         if !state.stagnation_stopped && !guarded && init_params.mixture.is_none() {
             let feasible = plateau_tracker_cl.lock().unwrap().2;
@@ -6345,16 +6408,71 @@ fn optimize_nlopt_attempt(
                     let cold =
                         2.0 * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, options);
                     if let Some(gap) = cold_solve_beats_best_seen(Some(cold), best) {
-                        state.stagnation_stopped = true;
-                        basin_probe_stopped = true;
-                        basin_probe_fired.set(true);
-                        if verbose {
-                            eprintln!(
-                                "Eval {:>4}: basin probe — a cold re-solve at the best point \
-                                 scores {cold:.6}, {gap:.4} below the best seen; ending this \
-                                 leg for a basin-shift restart.",
-                                state.n_evals,
-                            );
+                        // #2600: how many subjects the gap is, which decides between ending
+                        // the leg and absorbing the cold modes into it.
+                        let switched = if options.agq_nodes().is_none() {
+                            best_solve_cl
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .filter(|inc| {
+                                    inc.xs == xs_inc && inc.etas.len() == population.subjects.len()
+                                })
+                                .map(|inc| {
+                                    subjects_in_a_lower_cold_mode(
+                                        model,
+                                        population,
+                                        &p,
+                                        (&inc.etas, &inc.h_mats, &inc.kappas),
+                                        &ehs,
+                                        &hms,
+                                        &kappas,
+                                        options.interaction,
+                                    )
+                                })
+                        } else {
+                            None
+                        };
+                        #[cfg(test)]
+                        BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().push((gap, switched)));
+                        match basin_probe_action(switched, population.subjects.len()) {
+                            BasinProbeAction::Restart => {
+                                state.stagnation_stopped = true;
+                                basin_probe_stopped = true;
+                                basin_probe_fired.set(true);
+                                if verbose {
+                                    eprintln!(
+                                        "Eval {:>4}: basin probe — a cold re-solve at the best \
+                                         point scores {cold:.6}, {gap:.4} below the best seen \
+                                         ({switched:?} subjects in a lower cold mode); ending \
+                                         this leg for a basin-shift restart.",
+                                        state.n_evals,
+                                    );
+                                }
+                            }
+                            BasinProbeAction::Absorb => {
+                                // The next evaluation starts every subject at its cold mode.
+                                // The mode response and the inner-Hessian seeds belong to the
+                                // modes they were taken at, so they go with them, as on a
+                                // verification leg's start; the next improving gradient
+                                // evaluation forms them again.
+                                state.reset_to_cold_start();
+                                let modes = outer_cache_warm_starts(model, &ehs, &kappas);
+                                if modes.len() == state.cached_etas.len() {
+                                    state.cached_etas = modes;
+                                }
+                                if verbose {
+                                    eprintln!(
+                                        "Eval {:>4}: basin probe — a cold re-solve at the best \
+                                         point scores {cold:.6}, {gap:.4} below the best seen, \
+                                         from {} of {} subjects; continuing this leg from \
+                                         their cold modes.",
+                                        state.n_evals,
+                                        switched.unwrap_or(0),
+                                        population.subjects.len(),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
