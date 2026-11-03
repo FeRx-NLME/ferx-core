@@ -4408,11 +4408,17 @@ fn no_analytic_inner_forced() -> bool {
 
 /// Print the accumulated inner-loop attribution profile (no-op unless `FERX_PROFILE=1`).
 pub fn profile_report() {
-    if !inner_profile_enabled() {
+    write_profile_report(inner_profile_enabled(), &mut std::io::stderr().lock());
+}
+
+/// Write the [`profile_report`] lines to `out` when `enabled`; nothing otherwise.
+fn write_profile_report(enabled: bool, out: &mut impl std::io::Write) {
+    if !enabled {
         return;
     }
     for line in profile_report_lines() {
-        eprintln!("{line}");
+        // A diagnostic on stderr: a failed write has nowhere better to go.
+        let _ = writeln!(out, "{line}");
     }
 }
 

@@ -1608,3 +1608,36 @@ fn the_multistart_profile_counts_which_search_moved_the_ebe() {
         "{line}"
     );
 }
+
+/// `profile_report` writes nothing unless `FERX_PROFILE=1`, and then exactly the report
+/// lines, one per line — the inner-solve attribution included once an inner solve has
+/// been counted (#2601).
+#[test]
+fn the_profile_report_writes_its_lines_only_when_enabled() {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The inner-solve counters only advance under `FERX_PROFILE=1`; bump them directly so
+    // the attribution line is live. Process-wide and only ever added to, so another test
+    // can at most raise the counts this one reads.
+    PROFILE_INNER_SOLVES.fetch_add(1, Relaxed);
+    PROFILE_INNER_ANALYTIC_GRAD.fetch_add(1, Relaxed);
+
+    let mut off = Vec::new();
+    write_profile_report(false, &mut off);
+    assert!(off.is_empty(), "disabled report wrote {off:?}");
+
+    let mut on = Vec::new();
+    write_profile_report(true, &mut on);
+    let text = String::from_utf8(on).expect("utf-8 report");
+    let inner = text
+        .lines()
+        .find(|l| l.starts_with("[profile] inner: "))
+        .unwrap_or_else(|| panic!("no inner-solve line in {text:?}"));
+    assert!(
+        inner.contains(" EBE solves; ")
+            && inner.contains(" analytic-grad steps, ")
+            && inner.contains(" FD-fallback steps (")
+            && inner.ends_with("% fallback)"),
+        "{inner}"
+    );
+    assert!(text.ends_with('\n'), "each line is terminated: {text:?}");
+}
