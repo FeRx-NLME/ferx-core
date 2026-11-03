@@ -218,9 +218,11 @@ pub(crate) fn escape_floor<T: StoppedFit>(
 /// divergence sentinel there), so in practice this re-scores profiled starts only.
 ///
 /// Skipped, leaving the start unscored as before, when the default budget is no larger than
-/// the run's own (the re-score would repeat the same deterministic failure) and for an
-/// evaluation-only fit. A re-score that is itself `∞`, or that records no start (the
-/// unprofiled evaluation-only path records none), leaves it unscored too.
+/// the run's own (the re-score would repeat the same deterministic failure) or the fit was
+/// cancelled. A re-score that is itself `∞`, or that records no start (the unprofiled
+/// evaluation-only path records none), leaves it unscored too. An evaluation-only fit never
+/// gets here with an `∞` start: its report is that same failed evaluation, `∞`, which the
+/// caller's finite-report gate declines (#2626 review, row 3).
 fn rescored_start<T: StoppedFit>(
     fit_start: Option<StartEval>,
     start: &ModelParameters,
@@ -230,7 +232,6 @@ fn rescored_start<T: StoppedFit>(
     let budget = FitOptions::default().inner_maxiter;
     if fit_start.is_none_or(|s| s.ofv.is_finite())
         || budget <= options.inner_maxiter
-        || !runs_outer_optimizer(options)
         || crate::cancel::is_cancelled(&options.cancel)
     {
         return fit_start;

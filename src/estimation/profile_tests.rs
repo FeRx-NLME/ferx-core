@@ -7078,8 +7078,10 @@ fn a_failed_start_solve_is_recorded_as_infinite() {
 /// longer reported converged. Measured at `8d4af547`, identical in every printed digit on
 /// macOS arm64 and Linux aarch64: the start re-scored at `inner_maxiter = 200` is 26.465827,
 /// the run ends at 66.022863 — 39.557 above it, against a bound of 0.0275 — and the
-/// `inner_maxiter = 3` control converges to 22.139638. The assertions are the relations, with
-/// a 30 OFV floor on the gap (x86_64 not measured).
+/// `inner_maxiter = 3` control converges to 22.139638. The assertions are the relations: the
+/// demotion and the message, and a 30 OFV floor on the gap between the demoted report and the
+/// control's optimum (43.883 measured), so the fixture cannot drift to a run that ends near
+/// the optimum (x86_64 not measured).
 #[test]
 fn fit_rescores_a_failed_start_and_demotes_a_run_above_it() {
     use crate::estimation::outer_optimizer::ABOVE_START_TOKEN;

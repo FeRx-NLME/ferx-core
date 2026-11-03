@@ -811,6 +811,24 @@ fn a_start_that_scored_infinite_is_rescored_once_and_judged_against_that() {
     assert_eq!(calls.len(), 2);
     assert!(f.converged && tagged(&f).is_empty(), "{:?}", f.warnings);
 
+    // E, with the re-score itself guard-rejected: its own guard verdict and counts reach the
+    // message beside the re-score sentence (#2626 review, row 1).
+    let guarded = Some(StartEval {
+        guard_rejected: true,
+        n_unconverged: 1,
+        ..at(26.465827)
+    });
+    let (eg, _) = case(&im1, inf, 66.022863, guarded, 0.0);
+    let w = tagged(&eg);
+    assert_eq!(w.len(), 1, "{:?}", eg.warnings);
+    assert!(
+        w[0].contains("failed outright at `inner_maxiter` = 1")
+            && w[0].contains("EBE convergence guard rejected")
+            && w[0].contains("1 of 2 subjects"),
+        "{}",
+        w[0]
+    );
+
     // G / I: a re-score that is ∞, records no start, or is hard-rejected leaves the start
     // unscored — no comparison, the verdict kept.
     let hard = Some(StartEval {
@@ -837,7 +855,9 @@ fn a_start_that_scored_infinite_is_rescored_once_and_judged_against_that() {
     }
 
     // No re-score at all: a finite start (C, A), no start, a default or larger budget (the
-    // same deterministic failure again), an evaluation-only fit, a non-finite report.
+    // same deterministic failure again), a non-finite report — which is what an
+    // evaluation-only fit with a failed start reports, its one evaluation (#2626 review,
+    // row 3) — and a cancelled fit.
     for (label, options, first, report) in [
         ("finite start", with_im(1), healthy, 20.0),
         ("finite start, above", with_im(1), healthy, 66.022863),
@@ -851,7 +871,7 @@ fn a_start_that_scored_infinite_is_rescored_once_and_judged_against_that() {
                 ..with_im(1)
             },
             inf,
-            66.022863,
+            f64::INFINITY,
         ),
         ("non-finite report", with_im(1), inf, f64::INFINITY),
         (
