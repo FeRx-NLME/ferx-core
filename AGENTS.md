@@ -40,13 +40,16 @@ ferx-core/                       # repo root = ferx-core package + workspace roo
 └─ crates/
    ├─ ferx-tools/                # depends on ferx-core
    ├─ ferx-cli/                  # depends on ferx-core; [[bin]] name = "ferx"
-   └─ docs-lint/                 # dev tooling; depends on NOTHING (see Documentation)
+   ├─ docs-lint/                 # dev tooling; depends on NOTHING (see Documentation)
+   └─ patterns-lint/             # dev tooling; test-code lints, depends only on `syn` (#2634)
 ```
 
 `docs-lint` sits outside the layering above: it is a structural linter for
 `docs/**/*.qmd`, it depends on no crate in the workspace (not even `ferx-core`),
 and nothing may depend on it. Keeping it dependency-free is what lets its CI job
 be seconds of compile instead of landing on the `ferx-core` compile path (#969).
+`patterns-lint` is the same kind of member: source-pattern lints over test code
+(rule files and baseline in `tools/lint-rules/`), depending on no workspace crate.
 
 **The root package must stay `ferx-core`.** `ferx-r/src/rust/.cargo/config.toml`
 patches `ferx-core = { path = "../../../ferx-core" }` — the repo *root*. Moving
@@ -112,7 +115,7 @@ local run of 158 binaries / 4634 tests reported clean.
 So run the fast gates before pushing:
 
 ```bash
-tools/preflight.sh            # fmt, the 5 cargo check feature sets, clippy, rustdoc, docs, public-API
+tools/preflight.sh            # fmt, the 5 cargo check feature sets, clippy, rustdoc, docs, patterns, public-API
 tools/preflight.sh check      # just the check matrix, for a tight edit loop
 tools/preflight.sh --list     # show the commands without running them
 ```
@@ -378,7 +381,12 @@ cannot expose the defect; these are ways the *assertion* cannot observe it, each
   the likeliest way to break the thing being anchored — would have gone green. Assert
   `is_finite()` before folding. That anchor's one *direct* `(total - want).abs() < tol` was
   already safe, since any comparison against `NaN` is `false`; only the fold hides it.
-  `filter_map(…ok())` and `unwrap_or(0.0)` absorb failures the same way.
+  `filter_map(…ok())` and `unwrap_or(0.0)` absorb failures the same way. The fold is
+  now **linted** in test code (`nan-fold`, `tools/preflight.sh patterns`, #2634): a new
+  `x = x.max(…)` / `.fold(…, f64::max)` in a test fails unless the function asserts the
+  operand `is_finite()` or the line carries `// nan-ok: <reason>`. The sites that predate
+  the rule sit in the shrink-only `tools/lint-rules/baseline.txt` — pay them down, never
+  add to it. Rule text: `tools/lint-rules/nan-fold.md`.
 - **Two redundant gates cover for each other.** A #1229 check filtered on the coordinate's
   *kind* inside the loop and on a second, derived per-coordinate table right after — both
   correct, both excluding exactly the same inputs. Deleting either left the whole suite green,

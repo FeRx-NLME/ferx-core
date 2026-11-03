@@ -1,0 +1,34 @@
+# Dev tooling, not engine code (#2634). Like `crates/docs-lint`, this crate is a
+# workspace member for rustfmt / clippy / `cargo test`, and sits OUTSIDE the
+# ferx-core / ferx-tools / ferx-cli layering: it depends on no workspace crate
+# (not even `ferx-core` — it reads the tree as source text) and nothing may
+# depend on it. Its `cargo test` and `cargo clippy` are the `patterns` group of
+# `tools/preflight.sh`.
+#
+# Unlike docs-lint it does take two registry dependencies, because the rules are
+# about Rust syntax and a line regex cannot see a fold that rustfmt wrapped over
+# three lines, or tell a `#[cfg(test)]` module from production code. `syn` is
+# already in the lock (2.0.117), so this adds no new crate to it. `span-locations`
+# is what gives every finding a line number and is how a `// nan-ok:` comment is
+# matched to the expression it excuses. The rule files and the ratchet baseline
+# live under `tools/lint-rules/`.
+[package]
+name = "patterns-lint"
+version = "0.1.0"
+edition = "2021"
+description = "Source-pattern lints over the test code of the workspace (#2634)"
+license = "MIT"
+publish = false
+
+[dependencies]
+syn = { version = "2", default-features = false, features = ["full", "visit", "parsing", "printing"] }
+proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+quote = { version = "1", default-features = false }
+
+[lib]
+name = "patterns_lint"
+path = "src/lib.rs"
+
+[[bin]]
+name = "patterns-lint"
+path = "src/main.rs"
