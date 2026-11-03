@@ -203,6 +203,10 @@ thread_local! {
     /// moves).
     pub(crate) static IMH_STUCK_OVERRIDE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
+    /// IMH `(accepted, proposed)` over the convergence phase of the last
+    /// [`run_saem`] on this thread — the window the stuck warning reads.
+    pub(crate) static LAST_IMH_CONV: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 /// One Robbins-Monro step on a log step-scale, clamped to `[lo, hi]`.
@@ -4413,6 +4417,9 @@ pub fn run_saem(
     let rw_block_calls = std::sync::atomic::AtomicU64::new(0);
     #[cfg(test)]
     let mut mh_tally: (u64, u64) = (0, 0);
+    // IMH `(accepted, proposed)` over the convergence phase, for the stuck
+    // warning (`imh_stuck_warning`).
+    let mut imh_conv: (u64, u64) = (0, 0);
     // Per-subject cached proposal, carried across iterations. `None` = no usable
     // proposal for this subject right now: it takes the block random walk this
     // iteration, exactly like an HMC decline.
@@ -5749,6 +5756,10 @@ pub fn run_saem(
                 if imh_mode {
                     imh_next.push(imh_slot);
                 }
+                if used_imh && k > k1 {
+                    imh_conv.0 += n_acc as u64;
+                    imh_conv.1 += n_prop as u64;
+                }
                 drawn_classes[i] = mix_class;
                 state.etas[i] = eta_new;
                 state.nll_cache[i] = nll_new;
@@ -6987,7 +6998,9 @@ pub fn run_saem(
             .unwrap_or(SAEM_MH_STUCK_ACCEPT);
         #[cfg(not(test))]
         let stuck = SAEM_MH_STUCK_ACCEPT;
-        if let Some(w) = crate::estimation::saem_imh::imh_stuck_warning(&used, stuck) {
+        if let Some(w) =
+            crate::estimation::saem_imh::imh_stuck_warning(imh_conv.0, imh_conv.1, stuck)
+        {
             warnings.push(w);
         }
         if let Some(w) =
@@ -7005,6 +7018,8 @@ pub fn run_saem(
     LAST_RW_BLOCK_CALLS.with(|c| c.set(rw_block_calls.into_inner()));
     #[cfg(test)]
     LAST_MH_TALLY.with(|c| c.set(mh_tally));
+    #[cfg(test)]
+    LAST_IMH_CONV.with(|c| c.set(imh_conv));
 
     // #1458: see `score_sa_failure_warning` for why every route is reported.
     if let Some(sa) = score_sa.as_ref() {

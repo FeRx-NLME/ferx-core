@@ -795,24 +795,28 @@ pub(crate) fn imh_cost_warning(est: &ImhCostEstimate) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// The `FitResult.warnings` line for an IMH kernel that almost never moved the
-/// chain: run-wide acceptance below `stuck` (the random walk's own "not mixing"
-/// threshold). The mixing tally reads only the random-walk kernels against
-/// their targets, so without this a stuck independence sampler — on a one-η
-/// model, with no componentwise sweep, the only primary move there is — would
-/// pass silently. Measured healthy acceptance on the #1449 benches is ~0.8.
-pub(crate) fn imh_stuck_warning(d: &ImhSnapshot, stuck: f64) -> Option<String> {
-    if d.proposals == 0 {
+/// chain over the **convergence phase** — the iterations whose draws the
+/// estimates average — with acceptance below `stuck` (the random walk's own
+/// "not mixing" threshold). A run-wide rate would let a healthy exploration
+/// phase hide a frozen convergence phase. The mixing tally reads only the
+/// random-walk kernels against their targets, so without this a stuck
+/// independence sampler — on a one-η model, with no componentwise sweep, the
+/// only move there is — would pass silently. Measured healthy acceptance on the
+/// #1449 benches is ~0.8.
+pub(crate) fn imh_stuck_warning(accepts: u64, proposals: u64, stuck: f64) -> Option<String> {
+    if proposals == 0 {
         return None;
     }
-    let rate = d.accepts as f64 / d.proposals as f64;
+    let rate = accepts as f64 / proposals as f64;
     (rate < stuck).then(|| {
         format!(
-            "saem_kernel = imh accepted {:.2}% of its {} proposals — the independent \
-             proposal sits where the conditional has almost no mass, so the IMH move did \
-             not mix and the componentwise sweep carried the E-step alone. \
-             `saem_kernel = rw` is the safer kernel for this model.",
+            "saem_kernel = imh accepted {:.2}% of its {} proposals over the convergence \
+             phase — the independent proposal sits where the conditional has almost no \
+             mass, so its draws barely moved the chain and the estimates rest on whatever \
+             mixing the rest of the E-step managed. `saem_kernel = rw` is the safer kernel \
+             for this model.",
             rate * 100.0,
-            d.proposals
+            proposals
         )
     })
 }

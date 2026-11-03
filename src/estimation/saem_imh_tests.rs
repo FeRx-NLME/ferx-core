@@ -1254,6 +1254,10 @@ fn the_kernel_runs_inside_a_fit_and_a_declined_fit_runs_none_of_it() {
     assert_eq!(used.proposals, 12 * 6 * 2, "{used:?}");
     // Refresh every 2 iterations → 6 refreshes per subject.
     assert_eq!(used.refreshes + used.declines, 6 * 6, "{used:?}");
+    // The stuck warning reads the convergence phase only: 6 of the 12 iterations.
+    let conv = crate::estimation::saem::LAST_IMH_CONV.with(|c| c.get());
+    assert_eq!(conv.1, 6 * 6 * 2, "stuck-warning window: {conv:?}");
+    assert!(conv.0 > 0 && conv.0 <= conv.1, "{conv:?}");
     assert_eq!(used.declines, 0, "{used:?}");
     // The per-call NLL clock is folded into the counters (once per subject call).
     assert!(used.imh_nll_ns > 0, "IMH NLL time never recorded: {used:?}");
@@ -1858,28 +1862,69 @@ fn a_non_gaussian_endpoint_declines_the_kernel() {
     );
 }
 
-/// A stuck independence sampler is reported on its own scale; a healthy one,
-/// and a run that never proposed, say nothing.
+/// A stuck independence sampler is reported on its own scale, in a sentence
+/// that holds for a one-η model too (no componentwise sweep to fall back on);
+/// a healthy one, and a phase that never proposed, say nothing.
 #[test]
 fn a_stuck_imh_kernel_is_reported() {
-    let stuck = ImhSnapshot {
-        proposals: 1000,
-        accepts: 5,
-        ..Default::default()
-    };
     assert_eq!(
-        imh_stuck_warning(&stuck, 0.01).unwrap(),
-        "saem_kernel = imh accepted 0.50% of its 1000 proposals — the independent proposal \
-         sits where the conditional has almost no mass, so the IMH move did not mix and the \
-         componentwise sweep carried the E-step alone. `saem_kernel = rw` is the safer kernel \
-         for this model."
+        imh_stuck_warning(5, 1000, 0.01).unwrap(),
+        "saem_kernel = imh accepted 0.50% of its 1000 proposals over the convergence phase \
+         — the independent proposal sits where the conditional has almost no mass, so its \
+         draws barely moved the chain and the estimates rest on whatever mixing the rest of \
+         the E-step managed. `saem_kernel = rw` is the safer kernel for this model."
     );
-    let healthy = ImhSnapshot {
-        accepts: 800,
-        ..stuck
+    assert_eq!(imh_stuck_warning(800, 1000, 0.01), None);
+    assert_eq!(imh_stuck_warning(0, 0, 0.01), None);
+}
+
+/// The production wrapper seeds the refresh where the rule says: a cold
+/// `refresh_if_due` on the stress subject builds exactly the proposal a
+/// `refresh_proposal` from `0` builds (5 capped GN steps stop far short of the
+/// mode at `η_CL ≈ 1.5`, so any other seed lands elsewhere), and a warm one
+/// exactly the proposal from the previous centre.
+#[test]
+fn the_production_refresh_seeds_from_zero_then_the_previous_centre() {
+    let model = parse_model_string(IV_MODEL).expect("parse");
+    let subject = stress_subject();
+    let theta = model.default_params.theta.clone();
+    let sigma = model.default_params.sigma.values.clone();
+    let omega = omega2(0.09, 0.09);
+    let c = ImhCounters::default();
+    let from = |warm: &[f64]| {
+        refresh_proposal(
+            &model,
+            &subject,
+            &theta,
+            &omega,
+            &sigma,
+            warm,
+            IMH_GN_MAX_STEPS,
+            0.05,
+            &c,
+        )
+        .unwrap()
+        .eta_hat
     };
-    assert_eq!(imh_stuck_warning(&healthy, 0.01), None);
-    assert_eq!(imh_stuck_warning(&ImhSnapshot::default(), 0.01), None);
+    let mut slot = ImhSlot::default();
+    slot.refresh_if_due(0, 2, &model, &subject, &theta, &omega, &sigma, 0.05, &c);
+    let cold = slot.prop.as_ref().unwrap().eta_hat.clone();
+    assert_eq!(cold, from(&[0.0, 0.0]), "the cold build did not start at 0");
+    assert!(
+        cold[0] < 1.4,
+        "five steps reached the mode, so the seed is not observable: {cold:?}"
+    );
+    slot.refresh_if_due(2, 2, &model, &subject, &theta, &omega, &sigma, 0.05, &c);
+    let warm = slot.prop.as_ref().unwrap().eta_hat.clone();
+    assert_eq!(
+        warm,
+        from(&cold),
+        "the warm build did not start at the previous centre"
+    );
+    assert_ne!(
+        warm, cold,
+        "the warm build did not step, so it is not observable"
+    );
 }
 
 /// The stuck warning is wired into the run: with the threshold raised above
