@@ -903,7 +903,7 @@ estimates, not against your initial values. The check covers the FOCE-family NLo
 loop and the outer loop of a fit with a
 [profiled level block](../model-file/parameters.qmd#profiled-level-blocks) (#2519). There
 both objectives are the profiled one, the levels solved at the point: the start's is what
-`maxiter = 0` reports. On the profile tests' MBMA fixture with `inner_maxiter = 2`, the guard
+`maxiter = 0` reports, plus any covariate-network penalty. On the profile tests' MBMA fixture with `inner_maxiter = 2`, the guard
 rejects the start (OFV 26.47) and the run ends at 66.02, which is now reported not
 converged. `gn` and `gn_hybrid` (including its FOCE-I polish) do not run the check.
 
