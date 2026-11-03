@@ -136,7 +136,7 @@ there is nothing to assert.
 
 ## The baseline
 
-The sites that predate the rule (448, in 324 functions, when it landed) are
+The sites that predate the rule (456, in 331 functions, when it landed) are
 recorded per function in
 [`baseline.txt`](baseline.txt). The ratchet works like `docs/.lint-baseline`:
 

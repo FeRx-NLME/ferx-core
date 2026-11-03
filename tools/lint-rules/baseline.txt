@@ -105,6 +105,11 @@ nan-fold 1 src/estimation/profile_tests.rs::under_nelder_mead_a_state_on_the_adj
 nan-fold 1 src/estimation/run_covariance.rs::tests::run_covariance_fallback_without_packed_estimate
 nan-fold 1 src/estimation/run_covariance.rs::tests::run_covariance_matches_inline_covariance
 nan-fold 1 src/estimation/run_covariance.rs::tests::run_covariance_matches_inline_covariance_iov
+nan-fold 1 src/estimation/saem_imh_tests.rs::dropping_the_q_ratio_visibly_biases_the_chain
+nan-fold 2 src/estimation/saem_imh_tests.rs::grid_posterior_moments
+nan-fold 1 src/estimation/saem_imh_tests.rs::ode_conditional_precision_matches_the_fd_hessian_at_zero_residual
+nan-fold 1 src/estimation/saem_imh_tests.rs::ode_dropping_the_q_ratio_visibly_biases_the_chain
+nan-fold 1 src/estimation/saem_imh_tests.rs::ode_eta_jacobian_matches_fd_across_a_second_dose
 nan-fold 1 src/estimation/saem_mstep_sa_tests.rs::k_draw_objective_moves_when_the_second_draw_differs
 nan-fold 1 src/estimation/saem_mstep_sa_tests.rs::score_sa_information_is_a_robbins_monro_blend
 nan-fold 1 src/estimation/sir.rs::tests::worst_gap_to_rescaled
@@ -210,6 +215,8 @@ nan-fold 2 src/survival/mod.rs::ode_hazard_exact_tests::the_ode_hazard_eta_hessi
 nan-fold 3 tests/absorption_fixed_at_dose_quadrature.rs::walk_and_twin_match_the_fixed_at_dose_quadrature_under_iov_and_a_tv_covariate
 nan-fold 1 tests/absorption_iov_carryover_nonmem_anchor.rs::ipred_at_nonmem_ebes_matches_nonmem
 nan-fold 1 tests/absorption_iov_carryover_nonmem_anchor.rs::objective_at_nonmem_optimum_matches_nonmem
+nan-fold 1 tests/adaptive_prestart_decision.rs::adaptive
+nan-fold 1 tests/adaptive_prestart_decision.rs::assert_matches_nonmem
 nan-fold 1 tests/adaptive_vanco_anchor.rs::vanco_titration_matches_mrgsolve
 nan-fold 1 tests/adaptive_vanco_interval_anchor.rs::vanco_interval_extension_matches_mrgsolve
 nan-fold 2 tests/adaptive_vanco_iov_anchor.rs::vanco_iov_titration_matches_mrgsolve
@@ -280,7 +287,7 @@ nan-fold 1 tests/residual_correlation_nonmem_anchor.rs::combined_error_correlati
 nan-fold 1 tests/residual_correlation_nonmem_anchor.rs::residual_correlation_matches_nonmem_at_fixed_parameters
 nan-fold 1 tests/run_covariance_fitrx_roundtrip.rs::max_gap
 nan-fold 1 tests/run_covariance_per_engine.rs::max_rel_gap
-nan-fold 2 tests/saem_block_omega_collapse.rs::saem_block_omega_does_not_collapse_to_rank1
+nan-fold 2 tests/saem_block_omega_collapse.rs::assert_no_rank1_collapse
 nan-fold 1 tests/simulate_iov_kappa.rs::simulate_samples_inter_occasion_kappa
 nan-fold 1 tests/sir_ci_kappa.rs::mbma_placebo_kappa_sir_interval_is_shared_brackets_and_matches_wald
 nan-fold 1 tests/sir_proposal_identity_theta_units.rs::sir_intervals_do_not_move_with_an_identity_thetas_units
