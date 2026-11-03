@@ -7730,7 +7730,7 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
         n_unconverged: results
             .iter()
             .zip(population.subjects.iter())
-            .filter(|((r, _), s)| !r.converged && s.observations.len() >= min_obs.max(1))
+            .filter(|((r, _), s)| !r.converged && s.n_scored_rows() >= min_obs.max(1))
             .count(),
         n_fallback: results.iter().filter(|(r, _)| r.used_fallback).count(),
         n_nm_polished: results.iter().filter(|(r, _)| r.nm_polished).count(),

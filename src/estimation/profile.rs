@@ -1019,10 +1019,12 @@ fn off_mode(ebe: &crate::estimation::inner_optimizer::EbeResult) -> bool {
     !ebe.converged
 }
 
-/// Whether `subject` has fewer observations than `min_obs_for_convergence_check`, the
-/// filter the inner loop's `n_unconverged` count applies (`run_inner_loop_warm_map`).
+/// Whether `subject` has fewer scored rows than `min_obs_for_convergence_check`, the
+/// filter the inner loop's `n_unconverged` count applies (`run_inner_loop_warm_map`):
+/// Gaussian observations and non-Gaussian records alike (`Subject::n_scored_rows`, #2111),
+/// so a binary-only subject is not excused for having no Gaussian row.
 fn below_min_obs(subject: &crate::types::Subject, min_obs: u32) -> bool {
-    subject.observations.len() < (min_obs as usize).max(1)
+    subject.n_scored_rows() < (min_obs as usize).max(1)
 }
 
 /// Whether an off-mode solve is excused from the FD-fallback warnings (#2408): its subject
