@@ -1,4 +1,4 @@
-Tue Nov  3 04:15:40 PM UTC 2026
+Tue Nov  3 05:45:14 PM UTC 2026
 $PROBLEM ferx #2125 adaptive regimens whose first decision precedes the first record
 $INPUT ID TIME DV MDV EVID AMT CMT WT
 $DATA adaptive_prestart_decision.csv IGNORE=@
@@ -53,7 +53,7 @@ Days until program expires : 286
  DATA SET LOCATED ON UNIT NO.:    2
  THIS UNIT TO BE REWOUND:        NO
  CREATE/ADD TO FDATA.csv:        YES
- NO. OF DATA RECS IN DATA SET:       33
+ NO. OF DATA RECS IN DATA SET:       38
  NO. OF DATA ITEMS IN DATA SET:   8
  ID DATA ITEM IS DATA ITEM NO.:   1
  DEP VARIABLE IS DATA ITEM NO.:   3
@@ -67,8 +67,8 @@ Days until program expires : 286
 0FORMAT FOR DATA:
  (8E4.0)
 
- TOT. NO. OF OBS RECS:       27
- TOT. NO. OF INDIVIDUALS:        7
+ TOT. NO. OF OBS RECS:       31
+ TOT. NO. OF INDIVIDUALS:        8
 0LENGTH OF THETA:   3
 0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
 0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
@@ -234,7 +234,7 @@ Days until program expires : 286
 
 
 
- #OBJV:********************************************          2319.247       *********************************************
+ #OBJV:********************************************          2663.830       *********************************************
 1
  ************************************************************************************************************************
  ********************                                                                                ********************
@@ -296,4 +296,4 @@ Days until program expires : 286
  Elapsed finaloutput time in seconds:     0.00
  #CPUT: Total CPU Time in Seconds,        0.043
 Stop Time:
-Tue Nov  3 04:15:44 PM UTC 2026
+Tue Nov  3 05:45:17 PM UTC 2026

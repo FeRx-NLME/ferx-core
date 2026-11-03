@@ -9722,8 +9722,8 @@ fn set_interval_off_grid_names_the_subject_and_decision() {
 
 // #2125: a decision before the subject's first record, on the IOV path. The replay drops that
 // decision from its timeline (nothing evolves before the first record) but still resolves
-// occasions from the full schedule, so window 0 opens at the decision and the record at 1 is
-// in it. `init` makes the pre-record state non-zero, or a replay integrating from the
+// occasions from the full schedule, so window 0 opens at the decision and the records at 1 and
+// 1.5 are in it. `init` makes the pre-record state non-zero, or a replay integrating from the
 // decision would decay nothing and agree.
 const ODE_IOV_INIT_2125: &str = r#"
 [parameters]
@@ -9748,14 +9748,17 @@ const ODE_IOV_INIT_2125: &str = r#"
 fn iov_decision_before_the_first_record_verifies_and_matches_predict_iov_2125() {
     // Before the fix the replay integrated from the hold at 0.5, so the run was refused with
     // IPRED@1 100 (reactive) against 100·e^{−k₀/2} (replay). Degenerate oracle: the realized
-    // regimen (one bolus at 2) through `predict_iov` with the run's own η and κ.
+    // regimen (one bolus at 2) through `predict_iov` with the run's own η and κ. The observation
+    // at 1.5 is what makes window 0's κ observable: the segment (1, 1.5] is governed by that
+    // occasion-0 record. Without it the readout at 1 is `init` (no κ) and (1, 2] is governed by
+    // the occasion-1 record at 3, so forcing every record into window 1 went unseen (#2630 r1).
     let model = parse_model_string(ODE_IOV_INIT_2125).expect("parse IOV ODE model");
     let seed = 7u64;
     let decisions = [0.5, 2.0];
     let mut f = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(
         &mut f,
-        b"ID,TIME,DV,EVID,AMT,CMT,MDV\n1,1,0,0,0,1,0\n1,3,0,0,0,1,0\n1,5,0,0,0,1,0\n",
+        b"ID,TIME,DV,EVID,AMT,CMT,MDV\n1,1,0,0,0,1,0\n1,1.5,0,0,0,1,0\n1,3,0,0,0,1,0\n1,5,0,0,0,1,0\n",
     )
     .unwrap();
     let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
@@ -9797,7 +9800,7 @@ fn iov_decision_before_the_first_record_verifies_and_matches_predict_iov_2125() 
         .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
         .collect();
     static_subject.dose_occasions = vec![1];
-    assert_eq!(static_subject.occasions, vec![0, 1, 1]);
+    assert_eq!(static_subject.occasions, vec![0, 0, 1, 1]);
     let preds = crate::pk::predict_iov(
         &model,
         &static_subject,
@@ -9805,10 +9808,26 @@ fn iov_decision_before_the_first_record_verifies_and_matches_predict_iov_2125() 
         &eta_bsv,
         &kappas,
     );
-    assert_eq!(res.trajectories.len(), 3);
+    assert_eq!(res.trajectories.len(), 4);
     // Nothing acts before the first record: IPRED@1 is the seed, exactly.
     assert_eq!(res.trajectories[0].ipred, 100.0, "IPRED@1 is init");
-    // Bit for bit: measured, all three observations are bit-identical to `predict_iov`.
+    // A third value, outside both engines: (1, 1.5] decays under window 0's κ. The straddle is
+    // asserted too — under window 1's κ the value moves by far more than the bound — so the
+    // check cannot pass whichever occasion the segment reads.
+    let k = |g: usize| 0.1 * (eta_bsv[0] + kappas[g][0]).exp();
+    let at_1_5 = |g: usize| 100.0 * (-0.5 * k(g)).exp();
+    assert!(
+        (at_1_5(0) - at_1_5(1)).abs() > 1e-3,
+        "fixture premise: windows 0 and 1 give different IPRED@1.5"
+    );
+    let got = res.trajectories[1].ipred;
+    assert!(
+        (got - at_1_5(0)).abs() < 1e-6,
+        "IPRED@1.5 {got} must decay under window 0's κ ({}), not window 1's ({})",
+        at_1_5(0),
+        at_1_5(1)
+    );
+    // Bit for bit: measured, all four observations are bit-identical to `predict_iov`.
     for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
         assert!(traj.ipred.is_finite(), "IPRED at t={}", traj.time);
         assert_eq!(

@@ -535,6 +535,12 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
 /// the time-varying / IOV `adaptive_frozen_replay_tv`), which each carried a `> 0.0` copy of
 /// this filter from when every timeline started at 0. A break exactly at the origin is
 /// dropped as a duplicate of the origin break itself.
+///
+/// The two halves draw the boundary with different tolerances. This drops every break at
+/// or before `origin`, with no band, while the driver counts itself started from `t_base0 −
+/// EVENT_MATCH_TOL`. A decision within 1e-12 *below* the origin therefore starts the driver
+/// there but is dropped here, and the two integrate from points under 1e-12 apart: the run
+/// still verifies, sitting ~1e-13 from `predict()` instead of bit-identical (measured on #2630).
 fn push_breaks_after_origin(break_times: &mut Vec<f64>, extra_breaks: &[f64], origin: f64) {
     break_times.extend(
         extra_breaks

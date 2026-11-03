@@ -54,6 +54,12 @@ const CONSTANT: &[Schedule] = &[
         decisions: &[0.5, 2.0],
         doses: &[2.0],
     },
+    // A hold, then a dose, both before the first record (ID 24's constant twin, #2630 r1).
+    Schedule {
+        id: "28",
+        decisions: &[0.25, 0.5],
+        doses: &[0.5],
+    },
 ];
 
 /// WT 70 → 140 within the first instant: the time-varying replay.
@@ -90,7 +96,7 @@ const TIME_VARYING: &[Schedule] = &[
     },
 ];
 
-// Measured worst |ferx − NONMEM| on macOS arm64: 3.1e-8 (constant, 8 observations) and
+// Measured worst |ferx − NONMEM| on macOS arm64: 3.1e-8 (constant, 12 observations) and
 // 4.5e-8 (time-varying, 19), so 22× headroom. NONMEM's `.tab` prints 11 significant figures
 // at values ≈ 15; the rest is the two ODE solves. The smallest defect guarded is one segment
 // of decay, 0.33 (ID 24).
@@ -146,7 +152,7 @@ fn base_population() -> Population {
             out.push(l.to_string());
         }
     }
-    assert_eq!(removed, 5, "controller dose rows in the anchor dataset");
+    assert_eq!(removed, 6, "controller dose rows in the anchor dataset");
     let path: PathBuf =
         std::env::temp_dir().join(format!("ferx_2125_base_{}.csv", std::process::id()));
     std::fs::write(&path, out.join("\n") + "\n").expect("write base csv");
@@ -252,7 +258,7 @@ fn assert_matches_nonmem(leg: &str, got: &[(String, f64, f64)], schedules: &[Sch
     );
 }
 
-/// The constant-covariate replay (`ode_predictions_with_extra_breaks`), IDs 21–22.
+/// The constant-covariate replay (`ode_predictions_with_extra_breaks`), IDs 21, 22 and 28.
 #[test]
 fn constant_path_decision_before_the_first_record_verifies_and_matches_nonmem() {
     let m = model();
@@ -269,7 +275,7 @@ fn time_varying_path_decision_before_the_first_record_verifies_and_matches_nonme
 }
 
 /// The degenerate oracle: re-emitting a fixed regimen must equal `predict()` on that regimen
-/// written as data, bit for bit (measured: every one of the 27 observations is bit-identical).
+/// written as data, bit for bit (measured: every one of the 31 observations is bit-identical).
 /// `predict()` reads the full anchor dataset, the controller's doses as rows.
 #[test]
 fn re_emitting_the_regimen_equals_predict_on_it_as_data() {
@@ -304,5 +310,5 @@ fn re_emitting_the_regimen_equals_predict_on_it_as_data() {
             n += 1;
         }
     }
-    assert_eq!(n, 27, "observations compared");
+    assert_eq!(n, 31, "observations compared");
 }
