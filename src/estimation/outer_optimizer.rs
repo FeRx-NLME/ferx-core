@@ -139,8 +139,8 @@ pub struct OuterResult {
     /// `FitResult.vi` through the same generic path `bayes` uses.
     pub vi: Option<crate::types::ViResult>,
     /// The fit's first evaluation, unguarded — the reference [`above_start_warning`] holds
-    /// the reported objective against (#2461). `Some` for the NLopt outer loop, `None` for
-    /// every other estimator. It is the **fit's** start, not the last leg's: a restart leg
+    /// the reported objective against (#2461). `Some` for the NLopt outer loop and the
+    /// profiled loop (#2519), `None` for every other estimator. It is the **fit's** start, not the last leg's: a restart leg
     /// (#1277 mid-descent, #2093 basin shift) inherits it through [`RestartLeg`], and the
     /// floor escape (#2339) hands the first run's to whichever run it reports, so a restart
     /// that lands above the user's start cannot pass by comparing against its own.
