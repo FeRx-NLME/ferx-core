@@ -417,6 +417,60 @@ fn dtmm_records_define_the_levels_of_a_block_their_probabilities_read() {
     }
 }
 
+/// The levels a subject's objective reads skip a DTMM chain's first record (#2111): the
+/// likelihood scores each transition into a record from the one before, so the first
+/// record names a level (it defines one, above) that no term reads. Each study's chain
+/// here starts with the only record at visit 0, and a Gaussian `y` reads the block at
+/// visit 3. So the visit-0 level is defined but read by no subject, and the `rsr`
+/// single-subject count names the other nine levels, each read by its own study alone.
+/// The Gaussian reader is what makes the count reachable: a block read only by a DTMM has
+/// no plain index column (`read_index`), so every subject is given every level.
+///
+/// Mutations: count the chain's first record and all twelve are named; leave DTMM records
+/// out of the count and only the three visit-3 levels are.
+#[cfg(feature = "markov")]
+#[test]
+fn a_dtmm_chains_first_record_reads_no_level() {
+    let text = r"
+[parameters]
+  theta A(-0.8, -10.0, 10.0)
+  theta B(1.0, -10.0, 10.0)
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0)
+  sigma ADD ~ 1.0
+[covariates]
+  STUDY categorical
+[individual_parameters]
+  BASE = B + PLACEBO
+[structural_model]
+  y = BASE
+[error_model]
+  DV ~ additive(ADD)
+[markov_model]
+  type   = dtmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = inv_logit(A + PLACEBO)
+  transition asleep -> awake  = inv_logit(A)
+";
+    let mut parsed = parse_full_model(text).unwrap();
+    let mut pop = state_population();
+    for s in &mut pop.subjects {
+        s.obs_records.remove(0);
+        s.obs_times = vec![3.0];
+        s.observations = vec![1.0];
+        s.obs_cmts = vec![1];
+        s.cens = vec![0];
+    }
+    crate::api::bind_theta_levels(&mut parsed, text, &mut pop)
+        .unwrap_or_else(|e| panic!("DTMM records define the levels: {e}"));
+    let found = crate::api::levels::one_subject_levels(&parsed.model, &pop);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let (block, single, n) = &found[0];
+    assert_eq!((block.as_str(), *n), ("PLACEBO", 12));
+    assert_eq!(single.len(), 9, "{single:?}");
+    assert!(single.iter().all(|l| !l.ends_with("TIME=0")), "{single:?}");
+}
+
 /// A CTMM generator is built once per subject from the baseline, so its records define
 /// no levels (#2562), and a block whose index changes within a subject (here between two
 /// Gaussian observations) is refused by `E_ENDPOINT_TV_COVARIATE`, naming the block

@@ -5874,11 +5874,43 @@ pub(crate) fn check_ode_method_linear(
         .collect()
 }
 
+/// The endpoint kind `check_profiled_levels` refuses, by name, or `None` when every
+/// endpoint is one the profile solve scores (Gaussian, binary, #2111). An exhaustive match,
+/// so a new endpoint likelihood must be placed here before it compiles: an `if` chain over
+/// `has_*` predicates would let it through silently. Time-to-event is named first, then
+/// DTMM, then CTMM, when a model has several. Without the `survival` feature no such
+/// endpoint parses.
+#[cfg(not(feature = "survival"))]
+fn profile_refused_endpoint(_model: &CompiledModel) -> Option<&'static str> {
+    None
+}
+
+#[cfg(feature = "survival")]
+fn profile_refused_endpoint(model: &CompiledModel) -> Option<&'static str> {
+    use crate::types::EndpointLikelihood as E;
+    let rank = |e: &E| -> Option<(u8, &'static str)> {
+        match e {
+            E::Gaussian(_) | E::Binary { .. } => None,
+            E::Tte { .. } => Some((0, "time-to-event")),
+            #[cfg(feature = "markov")]
+            E::Dtmm { .. } => Some((1, "Markov (DTMM)")),
+            #[cfg(feature = "markov")]
+            E::Ctmm { .. } => Some((2, "Markov (CTMM)")),
+        }
+    };
+    model
+        .endpoints
+        .values()
+        .filter_map(rank)
+        .min_by_key(|&(r, _)| r)
+        .map(|(_, kind)| kind)
+}
+
 /// The estimation half of `E_PROFILE_SCOPE` (#1065): what a `profile`d θ level block
 /// can be fitted with. The profile solve minimises the fit's own objective — FOCE, FOCEI,
 /// or the quadrature marginal of a `laplace` / `focei` stage at any `n_agq` (#2107) — with
-/// a least-squares Newton step, so it needs one of those, Gaussian rows, and a residual
-/// variance that does not read the prediction. A grid too large to evaluate is
+/// a Newton step, so it needs one of those, Gaussian or binary rows (#2111), and a
+/// residual variance that does not read the prediction. A grid too large to evaluate is
 /// `E_AGQ_GRID_TOO_LARGE`'s, raised for every quadrature fit, profiled or not. Each refusal names the block and what it saw; none
 /// falls back to fitting the levels another way, since the user asked for `profile`.
 ///
@@ -5930,22 +5962,15 @@ pub(crate) fn check_profiled_levels(
             ));
         }
     }
-    let endpoint = if model.has_tte() {
-        Some("time-to-event")
-    } else if model.has_binary() {
-        Some("binary")
-    } else if cfg!(feature = "markov") && model.has_discrete() {
-        // Only a DTMM (#2473) reaches here: binary was matched above.
-        Some("Markov (DTMM)")
-    } else if model.has_non_gaussian() {
-        Some("Markov (CTMM)")
-    } else {
-        None
-    };
-    if let Some(kind) = endpoint {
+    // A binary endpoint is in scope (#2111): its rows are scored by the Laplace form under
+    // every method here, the predictor reads the block through its implicit logit link,
+    // and the linked solve takes the exact Newton matrix. `has_discrete` and
+    // `has_non_gaussian` are true of a binary endpoint too, so each refused kind is named
+    // by its own variant.
+    if let Some(kind) = profile_refused_endpoint(model) {
         out.push(refuse(
             format!(
-                "which needs a Gaussian likelihood on every row; this model has a {kind} endpoint."
+                "which scores Gaussian and binary rows only; this model has a {kind} endpoint."
             ),
             REMOVE,
         ));
@@ -5979,7 +6004,7 @@ pub(crate) fn check_profiled_levels(
     }
     if model.bloq_in_force() == crate::types::BloqMethod::M3 {
         out.push(refuse(
-            "which needs a Gaussian likelihood on every row; this fit scores censored rows \
+            "which scores each Gaussian row by its density; this fit scores censored rows \
              by M3, a normal-tail probability."
                 .to_string(),
             REMOVE,

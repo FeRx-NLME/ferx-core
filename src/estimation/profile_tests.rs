@@ -6926,3 +6926,202 @@ const STALL_GAP_2591: f64 = 0.5;
 /// #2111: a block read through a logit link.
 #[path = "profile_logit_tests.rs"]
 mod logit;
+
+/// #2519: whether `r` carries the #2461 above-start warning.
+fn warns_above_start(warnings: &[String]) -> bool {
+    warnings
+        .iter()
+        .any(|w| w.starts_with(crate::estimation::outer_optimizer::ABOVE_START_TOKEN))
+}
+
+/// #2519: the profiled loop publishes its first evaluation — the structural start with the
+/// levels re-solved there, bit-equal to what an evaluation-only fit (`outer_maxiter = 0`)
+/// reports (measured: 26.465827492925 both on F2's first two studies, final 22.139638).
+/// Not the last evaluation, which sits at the optimum 4.33 lower.
+#[test]
+fn optimize_profiled_publishes_its_first_evaluation() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let o = FitOptions {
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    let at_start = optimize_profiled(
+        &p.parsed.model,
+        &p.population,
+        &p.init_params,
+        &FitOptions {
+            outer_maxiter: 0,
+            ..o.clone()
+        },
+    );
+    let start = r.start_eval.expect("the profiled loop records its start");
+    assert!(!start.guard_rejected, "{start:?}");
+    assert_eq!((start.n_unconverged, start.n_start_rejected), (0, 0));
+    assert!(at_start.ofv.is_finite() && r.ofv.is_finite());
+    assert_eq!(
+        start.ofv, at_start.ofv,
+        "the start is the evaluation-only objective"
+    );
+    assert!(start.ofv > r.ofv + 1.0, "{} vs {}", start.ofv, r.ofv);
+}
+
+/// #2519: `fit()`'s composition — `escape_floor` around `optimize_profiled_probed` — holds a
+/// profiled fit against its published start. The start is shifted to 1000 below the
+/// reported objective; the unshifted control is converged with no warning (L-BFGS, the
+/// default `auto`; BOBYQA's unshifted run is not converged on this fixture, so is no control).
+#[test]
+fn escape_floor_holds_a_profiled_fit_against_its_start() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let o = FitOptions {
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    let run = |shift: Option<f64>| {
+        crate::estimation::floor_escape::escape_floor(
+            &p.init_params,
+            &o,
+            p.population.subjects.len(),
+            |pp, oo| {
+                let mut r = optimize_profiled_probed(&p.parsed.model, &p.population, pp, oo);
+                if let (Some(sh), Some(s)) = (shift, r.start_eval.as_mut()) {
+                    s.ofv = r.ofv - sh;
+                }
+                r
+            },
+            |_| 0.0,
+        )
+    };
+    let plain = run(None);
+    assert!(plain.start_eval.is_some(), "the start reaches escape_floor");
+    assert!(plain.converged, "{:?}", plain.warnings);
+    assert!(!warns_above_start(&plain.warnings), "{:?}", plain.warnings);
+    let moved = run(Some(1000.0));
+    assert!(!moved.converged);
+    let w = moved
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_ABOVE_START"))
+        .unwrap_or_else(|| panic!("{:?}", moved.warnings));
+    assert!(w.contains("1000.0000 above"), "{w}");
+    // An accepted start: no guard sentence.
+    assert!(!w.contains("EBE convergence guard"), "{w}");
+    assert_eq!(moved.ofv, plain.ofv);
+}
+
+/// #2519, the natural case (the #2461 failure on a profiled fit, no shift): at
+/// `inner_maxiter = 2` the EBE guard rejects F2's start (2 of 2 subjects unconverged at the
+/// default `max_unconverged_frac = 0.1`), so the optimizer never ranks it and walks to
+/// 66.022863, 39.5570 above the start's 26.465827 — which `optimize_profiled` alone reports
+/// converged. Control in the same test: at `inner_maxiter = 3` the start is accepted and the
+/// fit converges at 22.139638 with no warning.
+#[test]
+fn a_profiled_fit_pushed_off_a_rejected_start_is_not_converged() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let fit_at = |inner_maxiter: usize| {
+        let o = FitOptions {
+            run_covariance_step: false,
+            inner_maxiter,
+            ..options(&p)
+        };
+        assert_eq!(o.max_unconverged_frac, 0.1, "the default the message names");
+        crate::fit(&p.parsed.model, &p.population, &p.init_params, &o).unwrap()
+    };
+    let starved = fit_at(2);
+    assert!(!starved.converged, "{:?}", starved.warnings);
+    let w = starved
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_ABOVE_START"))
+        .unwrap_or_else(|| panic!("{:?}", starved.warnings));
+    assert!(w.contains("26.465827 its starting estimates scored"), "{w}");
+    assert!(w.contains("2 of 2 subjects"), "{w}");
+    assert!(w.contains("`max_unconverged_frac` = 0.1"), "{w}");
+    assert!(
+        starved
+            .warnings
+            .iter()
+            .any(|w| w == "Outer optimization did not converge"),
+        "{:?}",
+        starved.warnings
+    );
+    let control = fit_at(3);
+    assert!(control.converged, "{:?}", control.warnings);
+    assert!(
+        !warns_above_start(&control.warnings),
+        "{:?}",
+        control.warnings
+    );
+    assert!(control.ofv < starved.ofv - 1.0);
+}
+
+/// #2519: the start is the **first** call, whatever its solve did. At `inner_maxiter = 1`
+/// F2's start solve fails, so the recorded start is `∞` (which `above_start_warning` skips)
+/// rather than a later evaluation that solved.
+#[test]
+fn a_failed_start_solve_is_recorded_as_infinite() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let o = FitOptions {
+        run_covariance_step: false,
+        inner_maxiter: 1,
+        max_unconverged_frac: 0.0,
+        ..options(&p)
+    };
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    assert!(r.ofv.is_finite(), "a later evaluation solved: {}", r.ofv);
+    let start = r.start_eval.expect("recorded");
+    assert_eq!(start.ofv, f64::INFINITY, "{start:?}");
+    assert!(!start.guard_rejected);
+}
+
+/// #2519: with a covariate-NN penalty on, the recorded start carries it, as the objective
+/// `escape_floor` ranks does; the evaluation-only fit reports the unpenalized one. Measured
+/// on all 12 F2 studies with `nn_l2 = 0.5`: start 238.673539, evaluation-only 238.165038,
+/// penalty 0.508501, gap − penalty 1.3e-15 (rounding of `a + p − a`); the bound is 1e-9
+/// relative, ~1e6 headroom, and far below the penalty itself.
+#[cfg(feature = "nn")]
+#[test]
+fn the_profiled_start_carries_the_nn_penalty() {
+    let p = prep(F2, F2_DATA, None, |t| {
+        t.replace(
+            "[individual_parameters]",
+            "[covariate_nn NNE]\n  inputs = [SE]\n  outputs = [CL]\n  layers = [1]\n  \
+             activation = tanh\n  output = softplus\n\n[individual_parameters]",
+        )
+        // The network replaces `EMAX`, which would alias its output scale.
+        .replace("  theta EMAX(8.0, 0.0, 100.0)\n", "")
+        .replace("EMAX * exp(ETA_EM)", "NNE.CL * exp(ETA_EM)")
+        .replace("covariance = true", "covariance = true\n  nn_l2 = 0.5")
+    });
+    let refused: Vec<_> = crate::api::check_model_options(&p.parsed.model, &options(&p))
+        .into_iter()
+        .filter(|d| d.code == "E_PROFILE_SCOPE")
+        .collect();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(p.parsed.model.covariate_nns.len(), 1);
+    let o = FitOptions {
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    assert!(o.nn_l2_lambda > 0.0);
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    let at_start = optimize_profiled(
+        &p.parsed.model,
+        &p.population,
+        &p.init_params,
+        &FitOptions {
+            outer_maxiter: 0,
+            ..o.clone()
+        },
+    );
+    let penalty =
+        crate::estimation::nn_reg::NnRegularizer::build(&p.parsed.model, &p.population, &o)
+            .penalty_value(&p.init_params.theta);
+    assert!(penalty > 0.0, "{penalty}");
+    let start = r.start_eval.expect("recorded");
+    let gap = start.ofv - at_start.ofv;
+    assert!(
+        (gap - penalty).abs() <= 1e-9 * start.ofv.abs().max(1.0),
+        "gap {gap} vs penalty {penalty}"
+    );
+}
