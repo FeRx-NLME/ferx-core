@@ -4327,7 +4327,12 @@ impl Drop for InnerSettingsGuard {
 /// several), process-wide (#2601). They count unconditionally — four relaxed atomic adds
 /// per multi-start, against its dozens of descents — and [`profile_report`] prints them
 /// under `FERX_PROFILE=1`. Crate-private: not part of the public API.
-pub(crate) static MULTISTART_PROFILE: MultistartProfile = MultistartProfile::new();
+pub(crate) static MULTISTART_PROFILE: MultistartProfile = MultistartProfile {
+    run: std::sync::atomic::AtomicU64::new(0),
+    twin_moved: std::sync::atomic::AtomicU64::new(0),
+    screen_moved: std::sync::atomic::AtomicU64::new(0),
+    axis_moved: std::sync::atomic::AtomicU64::new(0),
+};
 
 /// The counters behind [`MULTISTART_PROFILE`].
 pub(crate) struct MultistartProfile {
@@ -4338,16 +4343,6 @@ pub(crate) struct MultistartProfile {
 }
 
 impl MultistartProfile {
-    const fn new() -> Self {
-        use std::sync::atomic::AtomicU64;
-        Self {
-            run: AtomicU64::new(0),
-            twin_moved: AtomicU64::new(0),
-            screen_moved: AtomicU64::new(0),
-            axis_moved: AtomicU64::new(0),
-        }
-    }
-
     /// Record one multi-start and which of its searches moved the incumbent.
     fn record(&self, twin: bool, screen: bool, axis: bool) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -4416,23 +4411,31 @@ pub fn profile_report() {
     if !inner_profile_enabled() {
         return;
     }
+    for line in profile_report_lines() {
+        eprintln!("{line}");
+    }
+}
+
+/// The lines [`profile_report`] prints: the inner-solve gradient attribution and the guarded
+/// multi-start's counts (#2601), each only once something was counted.
+fn profile_report_lines() -> Vec<String> {
     use std::sync::atomic::Ordering::Relaxed;
+    let mut lines = Vec::new();
     let solves = PROFILE_INNER_SOLVES.load(Relaxed);
     let ana = PROFILE_INNER_ANALYTIC_GRAD.load(Relaxed);
     let fd = PROFILE_INNER_FD_FALLBACK.load(Relaxed);
     if solves > 0 {
         let tot = (ana + fd).max(1);
-        eprintln!(
+        lines.push(format!(
             "[profile] inner: {} EBE solves; {} analytic-grad steps, {} FD-fallback steps ({:.2}% fallback)",
             solves,
             ana,
             fd,
             100.0 * fd as f64 / tot as f64
-        );
+        ));
     }
-    if let Some(line) = MULTISTART_PROFILE.report_line() {
-        eprintln!("{line}");
-    }
+    lines.extend(MULTISTART_PROFILE.report_line());
+    lines
 }
 
 /// The model-level inner-gradient bails that are independent of which analytic inner

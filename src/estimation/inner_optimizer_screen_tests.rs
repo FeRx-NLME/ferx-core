@@ -1591,6 +1591,15 @@ fn the_multistart_profile_counts_which_search_moved_the_ebe() {
         }
     }
     let line = MULTISTART_PROFILE.report_line().expect("multi-starts ran");
+    // `profile_report` prints exactly what `profile_report_lines` returns; the multi-start
+    // line is among them once a multi-start has run (the counters are process-wide, so
+    // another test's later solves can only append to the counts, not remove the line).
+    assert!(
+        profile_report_lines()
+            .iter()
+            .any(|l| l.starts_with("[profile] inner multi-start: ")),
+        "the report carries the multi-start line"
+    );
     assert!(
         line.starts_with("[profile] inner multi-start: ")
             && line.contains(" run; moved the EBE by twin seed ")
