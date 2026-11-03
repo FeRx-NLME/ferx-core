@@ -7225,7 +7225,7 @@ fn a_restart_left_just_above_the_floor_is_not_reported_converged() {
     assert!(!trapped.converged, "{:?}", trapped.warnings);
     let w = floor_warning(&trapped).expect("a floor-escape warning");
     assert!(
-        w.contains("but stopped with EMAX just above the floor (EMAX = 3.309e-10)")
+        w.contains("but stopped with EMAX below 1/1000 of its start (EMAX = 3.309e-10)")
             && w.contains("(OFV 42.766729 with it at EMAX = 8.000e-3, against 42.788001")
             && w.contains("the fit is not reported as converged")
             && !w.contains("on the floor again")
@@ -7263,7 +7263,7 @@ fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
     );
     assert!(!unprofiled.converged, "{:?}", unprofiled.warnings);
     let w = floor_warning(&unprofiled).expect("a floor-escape warning");
-    assert!(w.contains("EMAX just above the floor"), "{w}");
+    assert!(w.contains("EMAX below 1/1000 of its start"), "{w}");
 
     let profiled = f2_fit(None, |t| t, 2);
     assert!(

@@ -112,19 +112,18 @@ fn resolve_probe(first: Stub, probe: Stub, restart: impl FnOnce(&Stub) -> Stub) 
 /// The stub's `near_floor` hook: its near-floor θ, the restart's point re-scored (the same
 /// fit, at `near_at_ofv` when set) and the probe as the same fit at `near_probe_ofv` (penalty kept, so the gate ranks
 /// like the real one).
-fn near_probe(s: &Stub) -> Option<(Vec<NearFloorTheta>, Stub, Stub)> {
-    (!s.near.is_empty()).then(|| {
-        (
-            s.near.clone(),
-            Stub {
-                ofv: s.near_at_ofv.unwrap_or(s.ofv),
-                ..s.clone()
-            },
-            Stub {
-                ofv: s.near_probe_ofv,
-                ..s.clone()
-            },
-        )
+fn near_probe(s: &Stub) -> Option<NearFloorProbe<Stub>> {
+    (!s.near.is_empty()).then(|| NearFloorProbe {
+        thetas: s.near.clone(),
+        inner_maxiter: FitOptions::default().inner_maxiter,
+        at: Stub {
+            ofv: s.near_at_ofv.unwrap_or(s.ofv),
+            ..s.clone()
+        },
+        probe: Stub {
+            ofv: s.near_probe_ofv,
+            ..s.clone()
+        },
     })
 }
 
@@ -993,7 +992,7 @@ fn near_emax() -> Vec<NearFloorTheta> {
 
 /// T2. The near-floor gate, both sides in one test: the restart lands lower with EMAX just
 /// above the floor, and its probe drops by 2e-6 (over `FLOOR_PROBE_GAIN`) → not converged,
-/// the refloored warning naming EMAX "just above the floor"; the same restart with a drop of
+/// the refloored warning naming EMAX "below 1/1000 of its start"; the same restart with a drop of
 /// 0.5e-6 → converged, the success warning. Before #2629 both were converged, so the pair
 /// straddles the old behaviour. A probe that is non-finite is no evidence. The probe is an
 /// evaluation either way.
@@ -1026,7 +1025,7 @@ fn a_restart_left_just_above_the_floor_is_converged_only_when_its_probe_is_flat(
         "{w}"
     );
     for part in [
-        "but stopped with EMAX just above the floor (EMAX = 3.310e-10)",
+        "but stopped with EMAX below 1/1000 of its start (EMAX = 3.310e-10)",
         "where the objective still falls as it rises (OFV 42.787999 with it at EMAX = 8.000e-3, \
          against 42.788001 where it stopped).",
         "The reported estimates are from the resumed run",
@@ -1035,7 +1034,7 @@ fn a_restart_left_just_above_the_floor_is_converged_only_when_its_probe_is_flat(
         assert!(w.contains(part), "missing {part:?} in {w}");
     }
     assert!(
-        !w.contains("on the floor again") && !w.contains("TVE0 just above"),
+        !w.contains("on the floor again") && !w.contains("TVE0 below"),
         "{w}"
     );
 
@@ -1076,6 +1075,29 @@ fn a_restart_left_just_above_the_floor_is_converged_only_when_its_probe_is_flat(
         ..landed()
     });
     assert!(up.converged, "{:?}", up.warnings);
+    // Re-scored at 44 against the run's 42.788001, probe at 43.9: demoted, and the message
+    // names the budget of the two re-scores, since one point now carries two OFVs (#2632
+    // review, row 1). Where they print alike (above, and on F2) it does not.
+    let down = resolve(floor_stop(), 273.790, |_| Stub {
+        ofv: 42.788001,
+        near: near_emax(),
+        near_at_ofv: Some(44.0),
+        near_probe_ofv: 43.9,
+        ..landed()
+    });
+    assert!(!down.converged, "{:?}", down.warnings);
+    let budget = FitOptions::default().inner_maxiter;
+    assert!(
+        down.warnings[0].contains(&format!(
+            "reached OFV = 42.788001 but stopped with EMAX below 1/1000 of its start \
+             (EMAX = 3.310e-10), where the objective still falls as it rises (OFV 43.900000 \
+             with it at EMAX = 8.000e-3, against 44.000000 where it stopped, both scored at \
+             `inner_maxiter = {budget}`)."
+        )),
+        "{}",
+        down.warnings[0]
+    );
+    assert!(!w.contains("both scored"), "{w}");
 }
 
 /// The gate ranks the near probe on the penalized objective, as the first stop's does: a
@@ -1098,7 +1120,15 @@ fn the_near_floor_gate_ranks_on_the_penalized_objective() {
         restart,
         |s| s.ofv + s.penalty,
         |s| s.floored.clone(),
-        |s| near_probe(s).map(|(t, a, p)| (t, a, Stub { penalty: 1.0, ..p })),
+        |s| {
+            near_probe(s).map(|p| NearFloorProbe {
+                probe: Stub {
+                    penalty: 1.0,
+                    ..p.probe
+                },
+                ..p
+            })
+        },
         false,
     );
     assert!(r.converged, "{:?}", r.warnings);
@@ -1110,6 +1140,7 @@ fn the_near_floor_gate_ranks_on_the_penalized_objective() {
 fn the_refloored_message_gives_each_kind_its_own_clause() {
     let near = NearFloorStop {
         thetas: near_emax(),
+        inner_maxiter: 1000,
         at_ofv: 42.788001,
         probe_ofv: 42.766729,
     };
@@ -1123,7 +1154,7 @@ fn the_refloored_message_gives_each_kind_its_own_clause() {
     );
     assert!(
         both.contains(
-            "but stopped with TVE0 on the floor again, and with EMAX just above the floor \
+            "but stopped with TVE0 on the floor again, and with EMAX below 1/1000 of its start \
              (EMAX = 3.310e-10), where the objective still falls as it rises \
              (OFV 42.766729 with it at EMAX = 8.000e-3, against 42.788001 where it stopped). \
              The reported"
@@ -1133,7 +1164,7 @@ fn the_refloored_message_gives_each_kind_its_own_clause() {
     let on = floor_refloored_warning(&names(), 66.0, 65.0, &["TVE0".into()], None, 42.0);
     assert!(
         on.contains("but stopped with TVE0 on the floor again. The reported")
-            && !on.contains("just above the floor ("),
+            && !on.contains("below 1/1000 of"),
         "{on}"
     );
     let two = NearFloorStop {
@@ -1145,13 +1176,14 @@ fn the_refloored_message_gives_each_kind_its_own_clause() {
                 probe: 0.002,
             },
         ],
+        inner_maxiter: 1000,
         at_ofv: 42.0,
         probe_ofv: 40.0,
     };
     let w = floor_refloored_warning(&names(), 66.0, 65.0, &[], Some(&two), 42.0);
     assert!(
         w.contains(
-            "but stopped with EMAX, ET50 just above the floor (EMAX = 3.310e-10, \
+            "but stopped with EMAX, ET50 below 1/1000 of their starts (EMAX = 3.310e-10, \
              ET50 = 1.000e-9), where the objective still falls as they rise \
              (OFV 40.000000 with them at EMAX = 8.000e-3, ET50 = 2.000e-3, against \
              42.000000 where it stopped). The reported"
@@ -1169,7 +1201,13 @@ fn the_refloored_message_gives_each_kind_its_own_clause() {
 fn escape_floor_probes_only_the_near_floor_theta_of_the_restart() {
     use std::cell::RefCell;
     let start = template();
-    let options = FitOptions::default();
+    // A run budget below the default, so "both at one budget" is not the run's own
+    // (#2632 review, row 3).
+    let options = FitOptions {
+        inner_maxiter: 1,
+        ..FitOptions::default()
+    };
+    assert!(FitOptions::default().inner_maxiter > 1);
     let mut stop = start.clone();
     stop.theta = vec![LOG_PACK_FLOOR, 6.67, 1.47];
     let mut restarted = start.clone();
@@ -1189,9 +1227,15 @@ fn escape_floor_probes_only_the_near_floor_theta_of_the_restart() {
                 ofv: 273.79,
                 ..floor_stop()
             },
-            3 | 4 => Stub {
+            3 => Stub {
                 params: restarted.clone(),
                 ofv: 42.788001,
+                ..landed()
+            },
+            // The re-score at the default budget differs from the run's 42.788001.
+            4 => Stub {
+                params: restarted.clone(),
+                ofv: 42.79,
                 ..landed()
             },
             _ => Stub {
@@ -1218,7 +1262,7 @@ fn escape_floor_probes_only_the_near_floor_theta_of_the_restart() {
         assert_eq!(
             (c.1, c.2),
             (0, FitOptions::default().inner_maxiter),
-            "both are evaluations, at one budget"
+            "both are evaluations, at the default budget, not the run's 1"
         );
     }
     assert_eq!(r.ofv, 42.788001);
@@ -1230,13 +1274,52 @@ fn escape_floor_probes_only_the_near_floor_theta_of_the_restart() {
         .unwrap();
     assert!(
         w.contains(
-            "but stopped with TVE0 on the floor again, and with EMAX just above the floor \
+            "but stopped with TVE0 on the floor again, and with EMAX below 1/1000 of its start \
              (EMAX = 3.310e-10)"
-        ) && w.contains(
-            "(OFV 42.766729 with it at EMAX = 8.000e-3, against 42.788001 where it stopped)"
-        ),
+        ) && w.contains(&format!(
+            "(OFV 42.766729 with it at EMAX = 8.000e-3, against 42.790000 where it stopped, \
+             both scored at `inner_maxiter = {}`)",
+            FitOptions::default().inner_maxiter
+        )),
         "{w}"
     );
+
+    // Cancelled during the restart: no re-score and no probe after it (#2632 review, row 6).
+    let cancel = crate::cancel::CancelFlag::new();
+    let cancelling = FitOptions {
+        cancel: Some(cancel.clone()),
+        ..options.clone()
+    };
+    let n = RefCell::new(0);
+    escape_floor(
+        &start,
+        &cancelling,
+        2,
+        |p, _| {
+            *n.borrow_mut() += 1;
+            match *n.borrow() {
+                1 => Stub {
+                    params: stop.clone(),
+                    ..floor_stop()
+                },
+                2 => Stub {
+                    params: p.clone(),
+                    ofv: 273.79,
+                    ..floor_stop()
+                },
+                _ => {
+                    cancel.cancel();
+                    Stub {
+                        params: restarted.clone(),
+                        ofv: 42.788001,
+                        ..landed()
+                    }
+                }
+            }
+        },
+        |_| 0.0,
+    );
+    assert_eq!(*n.borrow(), 3, "no near-floor evaluations after a cancel");
 
     // A restart off the floor entirely: three calls, as before #2629.
     let n = RefCell::new(0);

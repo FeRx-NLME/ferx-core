@@ -21,8 +21,9 @@
 //! at their starts. Measured on A2, that restart lands on NONMEM's optimum (Δ ≈ 2.5e-8)
 //! from every start that collapses. A restart that ends no lower, or on the floor again,
 //! leaves a fit that is **not** reported as converged: a point on the floor with a downhill
-//! probe is not a minimum. Nor is a restart that leaves a θ just above the floor with a
-//! downhill probe there ([`near_floor_thetas`], #2629).
+//! probe is not a minimum. Nor is a restart that leaves a θ below 1/1000 of its start —
+//! in practice just above the floor — with a downhill probe there ([`near_floor_thetas`],
+//! #2629).
 
 use crate::estimation::outer_optimizer::{
     above_start_warning, ofv_is_valid, runs_outer_optimizer, OuterResult, StartEval, StartRescore,
@@ -141,7 +142,7 @@ pub(crate) fn floor_restart_warning(
     )
 }
 
-/// A θ a floor restart left just above the floor ([`near_floor_thetas`]), as the warning
+/// A θ a floor restart left below its probe point ([`near_floor_thetas`]), as the warning
 /// names it: its value there and its probe point.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NearFloorTheta {
@@ -151,18 +152,33 @@ pub(crate) struct NearFloorTheta {
 }
 
 /// The restart's near-floor θ whose probe was downhill (#2629), with the OFV of the
-/// restart's point and of the probe, both scored evaluation-only at one inner budget.
+/// restart's point and of the probe, both scored evaluation-only at `inner_maxiter`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NearFloorStop {
     pub(crate) thetas: Vec<NearFloorTheta>,
+    pub(crate) inner_maxiter: usize,
     pub(crate) at_ofv: f64,
     pub(crate) probe_ofv: f64,
 }
 
-/// The warning of an adopted restart that ended on the floor again, or just above it with
-/// the objective still falling there (#2629): lower than the first stop, so it is the one
-/// reported, but no more a minimum than the first. It names the θ the *restart* left on or
-/// near the floor, which need not be the first stop's, each kind in its own clause. Filed
+/// What `resolve_floor_escape`'s `near_floor` hook returns for a restart with near-floor θ:
+/// them, and the restart's point and the probe, both scored evaluation-only at
+/// `inner_maxiter`.
+pub(crate) struct NearFloorProbe<T> {
+    pub(crate) thetas: Vec<NearFloorTheta>,
+    pub(crate) inner_maxiter: usize,
+    pub(crate) at: T,
+    pub(crate) probe: T,
+}
+
+/// The warning of an adopted restart that ended on the floor again, or with a θ below its
+/// probe point and the objective still falling there (#2629): lower than the first stop, so
+/// it is the one reported, but no more a minimum than the first. It names the θ the
+/// *restart* left on the floor or below its probe point, which need not be the first
+/// stop's, each kind in its own clause. The second is worded by what was tested, "below
+/// 1/1000 of its start", not "just above the floor": the predicate is relative to the
+/// start, so a θ started at 1e4 and left at 5 meets it 24 ln-units off the floor (#2632
+/// review, row 2). Filed
 /// under `convergence` on "not reported as converged", which `classify_warning` tests before
 /// "resumed from the best point seen".
 pub(crate) fn floor_refloored_warning(
@@ -186,14 +202,24 @@ pub(crate) fn floor_refloored_warning(
                 .join(", ")
         };
         let n = near.thetas.len();
+        // The re-score runs at its own budget (`NearFloorStop::inner_maxiter`); when it does
+        // not print as the run's OFV, the budget is named so the two figures for one point do
+        // not read as a contradiction (#2632 review, row 1).
+        let budget = if format!("{:.6}", near.at_ofv) == format!("{restarted_ofv:.6}") {
+            String::new()
+        } else {
+            format!(", both scored at `inner_maxiter = {}`", near.inner_maxiter)
+        };
         clauses.push(format!(
-            "{} just above the floor ({}), where the objective still falls as {} rise{} \
-             (OFV {:.6} with {} at {}, against {:.6} where it stopped)",
+            "{} below 1/1000 of {} start{} ({}), where the objective still falls as {} rise{} \
+             (OFV {:.6} with {} at {}, against {:.6} where it stopped{budget})",
             near.thetas
                 .iter()
                 .map(|t| t.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
+            if n == 1 { "its" } else { "their" },
+            if n == 1 { "" } else { "s" },
             list(|t| t.value),
             if n == 1 { "it" } else { "they" },
             if n == 1 { "s" } else { "" },
@@ -237,9 +263,10 @@ pub(crate) fn floor_not_converged_warning(
 
 /// Run `run` from `start`, then escape the log-packing floor as described in the module
 /// doc. `run(params, options)` is the outer optimizer — the profiled or the unprofiled one
-/// — and is called at most five times: the fit, the evaluation-only probe
-/// (`outer_maxiter = 0`, no covariance step), the restart, the probe of any θ the restart
-/// left just above the floor (#2629), and the start's re-score below.
+/// — and is called at most six times: the fit, the evaluation-only probe
+/// (`outer_maxiter = 0`, no covariance step), the restart, the re-score of the restart's
+/// point and the probe of any θ it left below its probe point (#2629, two calls), and the
+/// start's re-score below.
 /// `penalty` is added to `OuterResult::ofv` when the two fits are ranked (priors, NN
 /// regularisation), as `optimize_nlopt` ranks its attempts.
 ///
@@ -377,7 +404,7 @@ fn escape_floor_from<T: StoppedFit>(
         |r| names_of(&floored_thetas(r.params(), start)),
         |r| {
             let near = near_floor_thetas(r.params(), start);
-            if near.is_empty() {
+            if near.is_empty() || crate::cancel::is_cancelled(&options.cancel) {
                 return None;
             }
             let thetas = names_of(&near)
@@ -395,18 +422,20 @@ fn escape_floor_from<T: StoppedFit>(
             // run's budget is 42.790440, above the restart's 42.788001, so the gate declined;
             // at the default budget the point is the same 42.788001 and the probe 42.766729.
             // The same rule as `rescored_start` (#2619).
+            let inner_maxiter = options
+                .inner_maxiter
+                .max(FitOptions::default().inner_maxiter);
             let scored = FitOptions {
-                inner_maxiter: options
-                    .inner_maxiter
-                    .max(FitOptions::default().inner_maxiter),
+                inner_maxiter,
                 optimizer_trace: false,
                 ..eval_only.clone()
             };
-            Some((
+            Some(NearFloorProbe {
                 thetas,
-                run(r.params(), &scored),
-                run(&probe_params(r.params(), start, &near), &scored),
-            ))
+                inner_maxiter,
+                at: run(r.params(), &scored),
+                probe: run(&probe_params(r.params(), start, &near), &scored),
+            })
         },
         options.verbose,
     )
@@ -464,8 +493,9 @@ impl StoppedFit for OuterResult {
 /// reports a higher one. `floored_in` names the θ a result left on the floor, so a restart
 /// that collapses again is caught and named. The probe counts as one evaluation.
 ///
-/// `near_floor` asks the same of an adopted restart's θ left just above the floor
-/// ([`near_floor_thetas`], #2629): `None` when there are none, else them and two
+/// `near_floor` asks the same of an adopted restart's θ left below its probe point
+/// ([`near_floor_thetas`], #2629): `None` when there are none (or the fit was cancelled),
+/// else them and two
 /// evaluation-only scores at one inner budget — the restart's own point, and the probe with
 /// them at their probe points (two more evaluations). They count only when the probe's
 /// `ranked` objective is lower than the point's by more than [`FLOOR_PROBE_GAIN`] — the gate
@@ -485,7 +515,7 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
     restart: impl FnOnce(&T) -> T,
     ranked: impl Fn(&T) -> f64,
     floored_in: impl Fn(&T) -> Vec<String>,
-    near_floor: impl FnOnce(&T) -> Option<(Vec<NearFloorTheta>, T, T)>,
+    near_floor: impl FnOnce(&T) -> Option<NearFloorProbe<T>>,
     verbose: bool,
 ) -> T {
     let probe_ofv = probe.ofv();
@@ -514,15 +544,16 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
     *second.evals_mut() += *first.evals_mut() + 1;
     *second.covariance_secs_mut() += *first.covariance_secs_mut();
     let again = floored_in(&second);
-    let near = near_floor(&second).and_then(|(thetas, at, probe)| {
+    let near = near_floor(&second).and_then(|p| {
         *second.evals_mut() += 2;
-        (ofv_is_valid(at.ofv())
-            && ofv_is_valid(probe.ofv())
-            && ranked(&at) - ranked(&probe) > FLOOR_PROBE_GAIN)
+        (ofv_is_valid(p.at.ofv())
+            && ofv_is_valid(p.probe.ofv())
+            && ranked(&p.at) - ranked(&p.probe) > FLOOR_PROBE_GAIN)
             .then(|| NearFloorStop {
-                thetas,
-                at_ofv: at.ofv(),
-                probe_ofv: probe.ofv(),
+                inner_maxiter: p.inner_maxiter,
+                at_ofv: p.at.ofv(),
+                probe_ofv: p.probe.ofv(),
+                thetas: p.thetas,
             })
     });
     let w = if again.is_empty() && near.is_none() {
