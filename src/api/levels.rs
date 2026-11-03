@@ -6735,11 +6735,12 @@ fn levels_read(
                 (None, Some(c)) => record_cmts_reading(model, c),
                 (None, None) => Vec::new(),
             };
+            let chained = chained_cmts(model, &record_cmts);
             let per_subject = population
                 .subjects
                 .iter()
                 .map(|s| match &column {
-                    Some(c) => subject_levels(&record_cmts, s, c, n_levels),
+                    Some(c) => subject_levels(&record_cmts, &chained, s, c, n_levels),
                     None => (0..n_levels).collect(),
                 })
                 .collect();
@@ -6844,7 +6845,10 @@ pub(crate) fn rsr_one_subject_levels_warning(
 }
 
 /// The CMTs of the per-record discrete-state endpoints whose expression reads `column`
-/// ([`LevelBlockDecl::record_cmts`]'s rule, for a block keyed on a plain column).
+/// ([`LevelBlockDecl::record_cmts`]'s rule, for a block keyed on a plain column). An
+/// endpoint that reads the column for another reason than the block (`STUDY` in a second
+/// term) is counted too; that over-includes levels, which [`active_levels`] documents as
+/// safe.
 fn record_cmts_reading(model: &CompiledModel, column: &str) -> Vec<usize> {
     #[cfg(feature = "survival")]
     return crate::parser::model_parser::level_record_cmts(&model.endpoints, column);
@@ -6855,18 +6859,61 @@ fn record_cmts_reading(model: &CompiledModel, column: &str) -> Vec<usize> {
     }
 }
 
+/// Of `record_cmts`, those of a DTMM endpoint: its likelihood scores the transitions into
+/// each record from the one before, so a chain's first record reads no level.
+fn chained_cmts(model: &CompiledModel, record_cmts: &[usize]) -> Vec<usize> {
+    #[cfg(feature = "markov")]
+    return record_cmts
+        .iter()
+        .copied()
+        .filter(|c| {
+            matches!(
+                model.endpoints.get(c),
+                Some(crate::types::EndpointLikelihood::Dtmm { .. })
+            )
+        })
+        .collect();
+    #[cfg(not(feature = "markov"))]
+    {
+        let _ = (model, record_cmts);
+        Vec::new()
+    }
+}
+
 /// The 0-based levels `subject` reads from index column `column`: on its Gaussian
 /// observation rows and on its discrete-state records on `record_cmts` (#2111; a profiled
-/// block read only by a `[binary_model]` predictor would otherwise read no level). A
-/// row's own snapshot wins over the baseline, as in the prediction.
+/// block read only by a `[binary_model]` predictor would otherwise read no level), less
+/// the first record of each chain on a `chained` CMT, which the likelihood does not score.
+/// A row's own snapshot wins over the baseline, as in the prediction.
+///
+/// Unlike [`level_rows`], whose records *define* levels (a chain's first record names a
+/// level the data hold), these are the levels the subject's objective *reads*.
 fn subject_levels(
     record_cmts: &[usize],
+    chained: &[usize],
     subject: &Subject,
     column: &str,
     n_levels: usize,
 ) -> Vec<usize> {
     let snaps = subject.record_covariate_snapshots();
+    let mut started: Vec<usize> = Vec::new();
     let mut out: Vec<usize> = rows_on(record_cmts, subject)
+        .filter(|&row| {
+            let LevelRow::Record(r) = row else {
+                return true;
+            };
+            match subject.obs_records.get(r) {
+                Some(ObsRecord::DiscreteState { cmt, .. }) if chained.contains(cmt) => {
+                    if started.contains(cmt) {
+                        true
+                    } else {
+                        started.push(*cmt);
+                        false
+                    }
+                }
+                _ => true,
+            }
+        })
         .filter_map(|row| row_index(subject, snaps, column, row))
         .filter(|v| v.is_finite() && *v >= 1.0 && (v.round() as usize) <= n_levels)
         .map(|v| v.round() as usize - 1)

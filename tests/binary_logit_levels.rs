@@ -209,7 +209,13 @@ fn profiled_at_nonmem(
 /// 4-significant-digit levels), levels within 7.0e-6 of NONMEM's (absolute; NONMEM's
 /// `$COV` is singular here, so there is no NONMEM SE to scale by). macOS arm64. The bounds
 /// are [`A_B1_OFV`] (11× headroom) and 1e-4. A record scored at its subject's baseline
-/// level moves the objective by hundreds. No level gradient or Newton matrix may come from finite
+/// level moves the objective by hundreds. macOS arm64 and Linux aarch64 agree in every
+/// printed digit.
+///
+/// The warning check sees a declined adjoint gradient, not an off-mode one: every B1
+/// subject has no Gaussian observation, so `min_obs_for_convergence_check` excuses an
+/// off-mode subject from the FD-fallback warning. The Tier-1 tests
+/// (`profile_binary_tests.rs`) assert `fd_gradients == 0` from the solve's own counts. No level gradient or Newton matrix may come from finite
 /// differences, so no warning may name them.
 fn assert_profiled_reproduces(method: EstimationMethod, interaction: bool) {
     let (f, theta, obj) = profiled_at_nonmem(method, interaction, false);
@@ -273,6 +279,7 @@ fn the_profiled_binary_covariance_is_the_unprofiled_one_at_the_same_point() {
         .se_theta
         .as_ref()
         .unwrap_or_else(|| panic!("unprofiled covariance: {:?}", fu.warnings));
+    assert_eq!(sp.len(), su.len(), "one SE per θ on both sides");
     let mut worst = 0.0_f64;
     for (a, b) in sp.iter().zip(su) {
         let rel = ((a - b) / b).abs();

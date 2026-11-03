@@ -5874,26 +5874,36 @@ pub(crate) fn check_ode_method_linear(
         .collect()
 }
 
-/// Whether `model` has a DTMM endpoint; never without the `markov` feature.
-fn has_dtmm(model: &CompiledModel) -> bool {
-    #[cfg(feature = "markov")]
-    return model.has_dtmm();
-    #[cfg(not(feature = "markov"))]
-    {
-        let _ = model;
-        false
-    }
+/// The endpoint kind `check_profiled_levels` refuses, by name, or `None` when every
+/// endpoint is one the profile solve scores (Gaussian, binary, #2111). An exhaustive match,
+/// so a new endpoint likelihood must be placed here before it compiles: an `if` chain over
+/// `has_*` predicates would let it through silently. Time-to-event is named first, then
+/// DTMM, then CTMM, when a model has several. Without the `survival` feature no such
+/// endpoint parses.
+#[cfg(not(feature = "survival"))]
+fn profile_refused_endpoint(_model: &CompiledModel) -> Option<&'static str> {
+    None
 }
 
-/// Whether `model` has a CTMM endpoint; never without the `markov` feature.
-fn has_ctmm(model: &CompiledModel) -> bool {
-    #[cfg(feature = "markov")]
-    return model.has_ctmm();
-    #[cfg(not(feature = "markov"))]
-    {
-        let _ = model;
-        false
-    }
+#[cfg(feature = "survival")]
+fn profile_refused_endpoint(model: &CompiledModel) -> Option<&'static str> {
+    use crate::types::EndpointLikelihood as E;
+    let rank = |e: &E| -> Option<(u8, &'static str)> {
+        match e {
+            E::Gaussian(_) | E::Binary { .. } => None,
+            E::Tte { .. } => Some((0, "time-to-event")),
+            #[cfg(feature = "markov")]
+            E::Dtmm { .. } => Some((1, "Markov (DTMM)")),
+            #[cfg(feature = "markov")]
+            E::Ctmm { .. } => Some((2, "Markov (CTMM)")),
+        }
+    };
+    model
+        .endpoints
+        .values()
+        .filter_map(rank)
+        .min_by_key(|&(r, _)| r)
+        .map(|(_, kind)| kind)
 }
 
 /// The estimation half of `E_PROFILE_SCOPE` (#1065): what a `profile`d θ level block
@@ -5954,19 +5964,10 @@ pub(crate) fn check_profiled_levels(
     }
     // A binary endpoint is in scope (#2111): its rows are scored by the Laplace form under
     // every method here, the predictor reads the block through its implicit logit link,
-    // and the linked solve takes the exact Newton matrix. Each arm below asks for its own
-    // endpoint by name, since `has_discrete` and `has_non_gaussian` are true of a binary
-    // endpoint too.
-    let endpoint = if model.has_tte() {
-        Some("time-to-event")
-    } else if has_dtmm(model) {
-        Some("Markov (DTMM)")
-    } else if has_ctmm(model) {
-        Some("Markov (CTMM)")
-    } else {
-        None
-    };
-    if let Some(kind) = endpoint {
+    // and the linked solve takes the exact Newton matrix. `has_discrete` and
+    // `has_non_gaussian` are true of a binary endpoint too, so each refused kind is named
+    // by its own variant.
+    if let Some(kind) = profile_refused_endpoint(model) {
         out.push(refuse(
             format!(
                 "which scores Gaussian and binary rows only; this model has a {kind} endpoint."

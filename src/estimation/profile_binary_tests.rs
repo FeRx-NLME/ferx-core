@@ -14,7 +14,8 @@
 //! frozen-EBE shortcut lands within 4.4e-8 of the minimum. D3 uses [`b1_unbalanced`], where
 //! η absorbs a shift.
 //!
-//! Every number below is measured on macOS arm64 unless marked.
+//! Every number below was measured on macOS arm64 and again on Linux aarch64
+//! (`tools/linux-test.sh`), which agreed in every printed digit.
 
 use super::*;
 
@@ -352,6 +353,114 @@ fn the_binary_solve_is_the_minimum_and_the_frozen_shortcut_is_not() {
             eprintln!("{name}: frozen − oracle {:.3e}", frozen - omin);
             assert!(frozen - omin > 1.1e-3, "{name}: the straddle collapsed");
         }
+    }
+}
+
+/// B2 (the observed proportions, Gaussian rows on CMT 1, `y = inv_logit(LP)`) and B1's
+/// Bernoulli rows (on CMT 2, `[binary_model] logit = LP`) in one model, `max_study`
+/// studies: each subject carries both kinds of row at every visit, so one subject's term
+/// sums a Gaussian and a binary likelihood over the same levels. Under `method`.
+fn mixed(method: &'static str, max_study: usize) -> crate::api::PreparedRun {
+    let text = std::fs::read_to_string(root().join("nonmem_anchor/profile_logit_b2.ferx")).unwrap();
+    for from in ["[fit_options]\n", "  method     = focei\n"] {
+        assert!(text.contains(from), "the fixture moved: {from:?}");
+    }
+    let text = text
+        .replace(
+            "[fit_options]\n",
+            "[binary_model]\n  cmt   = 2\n  logit = LP\n\n[fit_options]\n",
+        )
+        .replace("  method     = focei\n", method);
+    let b2 = std::fs::read_to_string(root().join("nonmem_anchor/profile_logit_b2.csv")).unwrap();
+    let b1 = std::fs::read_to_string(root().join(B1_DATA)).unwrap();
+    let mut b2 = b2.lines();
+    let header = b2.next().unwrap();
+    assert_eq!(
+        header, "ID,STUDY,TIME,DV,CMT,EVID,MDV,TRT,NARM",
+        "the data moved"
+    );
+    let mut rows: Vec<(usize, f64, usize, String)> = Vec::new();
+    for (lines, cmt) in [
+        (b2.collect::<Vec<_>>(), 1usize),
+        (b1.lines().skip(1).collect(), 2),
+    ] {
+        for l in lines {
+            let f: Vec<&str> = l.split(',').collect();
+            let study: usize = f[1].parse().unwrap();
+            if study > max_study {
+                continue;
+            }
+            let time: f64 = f[2].parse().unwrap();
+            let narm = f.get(8).copied().unwrap_or("30");
+            let row = format!(
+                "{},{},{},{},{cmt},{},{},{},{narm}\n",
+                f[0], f[1], f[2], f[3], f[5], f[6], f[7]
+            );
+            rows.push((study, time, cmt, row));
+        }
+    }
+    rows.sort_by(|a, b| (a.0, a.1, a.2).partial_cmp(&(b.0, b.1, b.2)).unwrap());
+    let data = temp("mixed.csv");
+    std::fs::write(
+        &data,
+        std::iter::once(format!("{header}\n"))
+            .chain(rows.into_iter().map(|r| r.3))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let model = temp("mixed.ferx");
+    std::fs::write(&model, text).unwrap();
+    crate::api::prepare_run(model.to_str().unwrap(), Some(data.to_str().unwrap()))
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// A model mixing Gaussian and binary rows, every subject reading the levels through
+/// both: the solve is the minimum of the cold re-solved objective, on the exact matrix,
+/// and the binary rows move it, so the minimum is not the Gaussian rows' alone (B2 on the
+/// same studies). Under FOCEI and Laplace, which differ on the Gaussian rows. Dies when a
+/// subject's term or matrix drops either kind of row (the oracle, the straddle), and when
+/// the mixed group leaves the exact route (the counts).
+#[test]
+fn a_block_read_by_gaussian_and_binary_rows_is_solved_to_the_minimum() {
+    for (name, method) in [ARMS[1], ARMS[0]] {
+        let p = mixed(method, 2);
+        assert!(p.parsed.model.has_binary(), "{name}");
+        let layout = layout_of(&p);
+        assert!(layout.groups.iter().all(|g| g.linked), "{name}");
+        let o = options(&p);
+        let c = ctx(&p, &layout, &o);
+        let warm = ProfileWarm::from_template(&layout, &p.init_params);
+        let mut counts = ProfileCounts::default();
+        let s = c.solve_counted(&p.init_params, &warm, &mut counts).unwrap();
+        let (omin, _) = oracle_min(&c, &p.init_params, &warm.beta);
+        let gaussian = {
+            let g = prep(
+                "nonmem_anchor/profile_logit_b2.ferx",
+                "nonmem_anchor/profile_logit_b2.csv",
+                Some(2),
+                move |t| t.replace("  method     = focei\n", method),
+            );
+            solve_b2(&g, &options(&g)).0
+        };
+        let shift = beta_gap_se(&layout, &s, &gaussian);
+        eprintln!(
+            "{name}: {} it {counts:?}, solve − oracle {:.3e}, levels vs Gaussian rows alone \
+             {shift:.3e} SE",
+            s.iterations,
+            s.ofv - omin
+        );
+        assert!((s.ofv - omin).abs() < 1e-8, "{name}");
+        assert!(
+            counts.exact_matrices > 0 && counts.fd_matrices == 0 && counts.fd_gradients == 0,
+            "{name}: {counts:?}"
+        );
+        // Measured 6.0e-2 / 5.5e-2 SE (FOCEI / Laplace), solve − oracle 1e-11: B2 aggregates B1's draws, so the two kinds of
+        // row agree closely, but the shift is four decades above the 1e-6 SE the solve
+        // reaches levels to, which is what a dropped binary row would leave.
+        assert!(
+            shift > 1e-2,
+            "{name}: the binary rows do not move the levels"
+        );
     }
 }
 
