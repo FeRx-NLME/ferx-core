@@ -204,3 +204,16 @@ lto = "off"
 inherits = "ci-fast"
 debug-assertions = true
 overflow-checks = true
+
+# Used by the nightly cargo-mutants job only (`.github/workflows/mutants.yml`, #2633).
+# `ci-cov` — so a mutant a `debug_assert!` kills reads as caught, as it would be in
+# the per-PR coverage jobs that run the same `--lib` tests — plus `incremental`.
+# Every mutant is a one-function edit to the same crate, so incremental reuse is the
+# whole game: measured locally (macOS arm64, 10 cores, `--lib --features
+# ci,markov,nn`, one body edit in `src/api/levels.rs`) the rebuild + `--lib` run was
+# `ci-fast` 419 s + 34 s, `dev` 24 s + 503 s (debug fits), `dev` at opt-level 1
+# 247 s + 43 s, and `ci-fast` + incremental 210 s + 37 s. Release profiles default
+# `incremental = false`, which is why no existing profile has it.
+[profile.mutants]
+inherits = "ci-cov"
+incremental = true
