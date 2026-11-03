@@ -108,20 +108,24 @@ pub(crate) fn fold(acc0: f64, terms: &[f64]) -> f64 {
 /// the straddle a differential test needs, or the order-pin cannot fail.
 pub(crate) fn order_sensitive(acc0: f64, terms: &[f64]) -> bool {
     let want = fold(acc0, terms).to_bits();
-    let mut idx: Vec<usize> = (0..terms.len()).collect();
-    permutations(&mut idx, 0)
+    permutations(terms.len())
         .iter()
         .any(|p| fold(acc0, &p.iter().map(|&i| terms[i]).collect::<Vec<_>>()).to_bits() != want)
 }
 
-fn permutations(idx: &mut Vec<usize>, k: usize) -> Vec<Vec<usize>> {
+/// Every ordering of `0..n`.
+pub(crate) fn permutations(n: usize) -> Vec<Vec<usize>> {
+    permute(&mut (0..n).collect(), 0)
+}
+
+fn permute(idx: &mut Vec<usize>, k: usize) -> Vec<Vec<usize>> {
     if k == idx.len() {
         return vec![idx.clone()];
     }
     let mut out = Vec::new();
     for i in k..idx.len() {
         idx.swap(k, i);
-        out.extend(permutations(idx, k + 1));
+        out.extend(permute(idx, k + 1));
         idx.swap(k, i);
     }
     out

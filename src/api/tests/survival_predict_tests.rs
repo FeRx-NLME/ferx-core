@@ -699,13 +699,17 @@ fn predict_survival_rows_are_in_ascending_cmt_order_on_every_compile() {
 /// Only the three-cause model can show it: a two-term `f64` sum commutes exactly, so the
 /// two-cause values are order-free (only its row order moved). And the three-cause sums
 /// must be order-sensitive on the grid — on `GRID` = 1, 5, 10, 30 every order of
-/// `0.10·t + 0.06·t + 0.0037·t` rounds to the same bits, so this test uses 0.7 and 1.3,
-/// where it does not, and asserts that straddle.
+/// `0.10·t + 0.06·t + 0.0037·t` rounds to the same bits, so this test uses 0.7 and 1.3.
+///
+/// Straddle, on the compared quantity itself: for some subject, `cif_curves` fed the causes
+/// in another order returns other `survival_all` or `cif` bits (mapped back to their
+/// CMT). A difference in `Σ H_j` alone would not do — one ULP there can round away in
+/// `exp(−ΣH)`.
 ///
 /// Mutation: as for the row-order test, at the same site.
 #[test]
 fn predict_survival_cif_bits_are_the_same_on_every_compile() {
-    use crate::survival::endpoint_order_test_helpers::order_sensitive;
+    use crate::survival::endpoint_order_test_helpers::permutations;
     const CIF_GRID: [f64; 4] = [0.7, 1.3, 5.0, 14.0];
     let bits = |r: &SurvivalPredictionResult| {
         (
@@ -724,18 +728,37 @@ fn predict_survival_cif_bits_are_the_same_on_every_compile() {
             .all(|r| r.cif.is_finite() && r.survival_all.is_finite()),
         "{first:?}"
     );
-    // Straddle: at some (subject, time) the causes' `H_j` sum to other bits in another order.
-    let straddles = first.iter().any(|r0| {
-        let h: Vec<f64> = first
-            .iter()
-            .filter(|r| r.id == r0.id && r.time == r0.time)
-            .map(|r| r.cum_hazard)
-            .collect();
-        h.len() == 3 && order_sensitive(0.0, &h)
+    // Straddle: some subject's `(S_all, CIF)` bits depend on the order of the causes.
+    let straddles = pop.subjects.iter().any(|s| {
+        // The subject's per-cause H(t) curves, ascending CMT (the emitted order).
+        let mut chz: Vec<(usize, Vec<f64>)> = Vec::new();
+        for r in first.iter().filter(|r| r.id == s.id) {
+            match chz.last_mut() {
+                Some((c, h)) if *c == r.cmt => h.push(r.cum_hazard),
+                _ => chz.push((r.cmt, vec![r.cum_hazard])),
+            }
+        }
+        assert_eq!(chz.len(), 3, "subject {}: rows on every cause", s.id);
+        let curve_bits = |order: &[usize]| {
+            let (cif, s_all) = crate::survival::cif_curves(
+                &order.iter().map(|&i| chz[i].1.clone()).collect::<Vec<_>>(),
+            );
+            // Each cause's CIF back under its own index, so only the values are compared.
+            let mut by_cause = vec![Vec::new(); order.len()];
+            for (k, &i) in order.iter().enumerate() {
+                by_cause[i] = cif[k].iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            }
+            (
+                s_all.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                by_cause,
+            )
+        };
+        let ascending = curve_bits(&[0, 1, 2]);
+        permutations(3).iter().any(|p| curve_bits(p) != ascending)
     });
     assert!(
         straddles,
-        "no H_j sum depends on the order: the pin cannot fail"
+        "no subject's S_all / CIF depends on the cause order: the pin cannot fail"
     );
     let mut want: Vec<_> = first.iter().map(bits).collect();
     // Compared as sets of rows, so this test sees the values and not the row order.
@@ -756,12 +779,19 @@ fn predict_survival_cif_bits_are_the_same_on_every_compile() {
 /// (`outer_maxiter = 0`, so one objective evaluation at the initial estimates). At
 /// `314b89fb` 20 compiles gave two values, 62.27735612341481897 and …82607: 1 ULP.
 ///
-/// **Negative control, same test:** the two-cause model's objective is asserted too, but
-/// it is order-free even under a map-ordered walk — its two TTE terms are added from
-/// zero, and `(0 + a) + b == (0 + b) + a` exactly — so it is the tautology this test
-/// does not rest on. The straddle is the three-cause leg's.
+/// Straddle: at the fit's η̂, some subject's per-endpoint data terms `q_j` — the terms the
+/// FOCEI marginal sums (`non_gaussian_mode_terms`), each taken from a compile holding that
+/// endpoint alone — give other bits in another order. If the objective stopped reading
+/// that sum, the straddle would still hold but the pin would be vacuous; the mutation
+/// sweep is what ties T6 to `non_gaussian_mode_terms`.
+///
+/// **Negative control, same test:** the two-cause model, whose two terms are added from
+/// zero and so commute exactly (`(0 + a) + b == (0 + b) + a`): asserted order-free at η̂
+/// for every subject, the reason its objective was already reproducible before #2531.
 #[test]
 fn focei_objective_of_a_three_cause_model_is_the_same_bits_on_every_compile() {
+    use crate::stats::likelihood::accumulate_non_gaussian_nll;
+    use crate::survival::endpoint_order_test_helpers::order_sensitive;
     use crate::types::{EstimationMethod, FitOptions};
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
@@ -772,20 +802,59 @@ fn focei_objective_of_a_three_cause_model_is_the_same_bits_on_every_compile() {
         threads: Some(1),
         ..Default::default()
     };
-    for (label, fx) in [
-        ("three-cause", EndpointOrderFixture::three_cause()),
+    for (label, fx, order_matters) in [
+        ("three-cause", EndpointOrderFixture::three_cause(), true),
         (
             "two-cause (negative control)",
             EndpointOrderFixture::two_cause(),
+            false,
         ),
     ] {
         let mut ofvs: Vec<u64> = Vec::new();
+        let mut last = None;
         for _ in 0..COMPILES {
             let (m, pop) = fx.compile();
             let r = super::fit(&m, &pop, &m.default_params, &opts).expect("fit");
             assert!(r.ofv.is_finite(), "{label}: {}", r.ofv);
             ofvs.push(r.ofv.to_bits());
+            last = Some((m, pop, r));
         }
+        // Per subject, each endpoint's raw data term at the fit's η̂ (θ is the start:
+        // `outer_maxiter = 0`).
+        let (m, pop, r) = last.expect("COMPILES > 0");
+        let singles: Vec<_> = fx.cmts().iter().map(|&c| fx.compile_only(c)).collect();
+        let sensitive: Vec<bool> = pop
+            .subjects
+            .iter()
+            .zip(&r.subjects)
+            .map(|(s, sr)| {
+                assert_eq!(s.id, sr.id);
+                let q: Vec<f64> = singles
+                    .iter()
+                    .map(|ms| {
+                        let mut a = 0.0;
+                        let theta = &m.default_params.theta;
+                        accumulate_non_gaussian_nll(
+                            ms,
+                            s,
+                            theta,
+                            sr.eta.as_slice(),
+                            None,
+                            1.0,
+                            &mut a,
+                        );
+                        a
+                    })
+                    .collect();
+                assert!(q.iter().all(|x| x.is_finite()), "{label}: {q:?}");
+                order_sensitive(0.0, &q)
+            })
+            .collect();
+        assert_eq!(
+            sensitive.iter().any(|&b| b),
+            order_matters,
+            "{label}: whether some subject's data-term sum at η̂ depends on the order"
+        );
         ofvs.sort_unstable();
         ofvs.dedup();
         assert_eq!(
