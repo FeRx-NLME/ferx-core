@@ -71,7 +71,10 @@ parameter or loop pattern of the same name hides it.
      value might be written: an assignment, `+=`, `&mut e`, a call of a method
      that might mutate it, such as `xs.push(…)`, or passing it as-is to a
      function or such a method (`overwrite(e)`), since it may itself be a
-     `&mut`. `f(*e)` and `f(&e)` are not writes. It also lapses inside a loop body
+     `&mut`. `f(*e)` and `f(&e)` are not writes. The write counts from where it
+     is evaluated, so `if refresh(&mut e) { w = w.max(e) }` is not guarded, and
+     neither is a fold in the body of a `for` or `match` whose iterator or
+     scrutinee writes the value. It also lapses inside a loop body
      that writes the value, because the next iteration runs after the write. It
      doesn't reach code where the name is rebound: a `let e`, a closure
      parameter `|e|`, or a `for e` / `match` / `if let` pattern.

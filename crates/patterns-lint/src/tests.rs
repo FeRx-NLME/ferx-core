@@ -425,3 +425,37 @@ fn integer_locals_are_lexically_scoped() {
     let src = t("let mut k = 0usize; { let mut j = 0.0; } k = k.max(x);");
     assert!(findings(&src).is_empty());
 }
+
+#[test]
+fn a_write_invalidates_the_fact_where_it_is_evaluated_not_at_statement_end() {
+    for body in [
+        // The condition runs before either branch (review 4).
+        "assert!(e.is_finite()); if refresh(&mut e) { w = w.max(e); }",
+        "assert!(e.is_finite()); if refresh(&mut e) { } else { w = w.max(e); }",
+        "assert!(e.is_finite()); if let Some(_) = s.reload(e) { w = w.max(*e); }",
+        "assert!(e.is_finite()); if ok { } else if refresh(&mut e) { w = w.max(e); }",
+        // The iterator expression and the scrutinee run before the body.
+        "assert!(e.is_finite()); for _ in steps(&mut e) { w = w.max(e); }",
+        "assert!(e.is_finite()); match refresh(&mut e) { _ => w = w.max(e) }",
+        // Within one expression, a left operand runs before the right.
+        "assert!(e.is_finite()); let _ = refresh(&mut e) && { w = w.max(e); true };",
+    ] {
+        assert_eq!(
+            findings(&t(body)).len(),
+            1,
+            "stale fact survived a write: {body}"
+        );
+    }
+    for body in [
+        // A read-only condition, or a write to something else, keeps the fact.
+        "assert!(e.is_finite()); if e > 0.0 { w = w.max(e); }",
+        "assert!(e.is_finite()); if refresh(&mut other) { w = w.max(e); }",
+        "assert!(e.is_finite()); for _ in steps(&mut other) { w = w.max(e); }",
+        "assert!(e.is_finite()); match refresh(&mut other) { _ => w = w.max(e) }",
+    ] {
+        assert!(
+            findings(&t(body)).is_empty(),
+            "flagged although not written: {body}"
+        );
+    }
+}

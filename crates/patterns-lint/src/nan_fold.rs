@@ -382,6 +382,35 @@ const READ_ONLY_METHODS: &[&str] = &[
     "values",
 ];
 
+/// The locals `e` ITSELF writes, not counting its subexpressions; see
+/// [`mutated_roots`] for the cases.
+fn direct_writes(e: &Expr) -> Vec<String> {
+    let mut out = Vec::new();
+    match e {
+        Expr::Assign(a) => out.extend(place_root(&a.left)),
+        Expr::Binary(b)
+            if matches!(
+                b.op,
+                syn::BinOp::AddAssign(_)
+                    | syn::BinOp::SubAssign(_)
+                    | syn::BinOp::MulAssign(_)
+                    | syn::BinOp::DivAssign(_)
+                    | syn::BinOp::RemAssign(_)
+            ) =>
+        {
+            out.extend(place_root(&b.left));
+        }
+        Expr::Reference(r) if r.mutability.is_some() => out.extend(place_root(&r.expr)),
+        Expr::MethodCall(m) if !READ_ONLY_METHODS.contains(&m.method.to_string().as_str()) => {
+            out.extend(place_root(&m.receiver));
+            out.extend(m.args.iter().filter_map(bare_place_root));
+        }
+        Expr::Call(c) => out.extend(c.args.iter().filter_map(bare_place_root)),
+        _ => {}
+    }
+    out
+}
+
 /// Every local a statement (at any depth) writes: assignment and compound
 /// assignment targets, `&mut x` borrows, the receiver of any method call not in
 /// [`READ_ONLY_METHODS`], and any local passed BARE as an argument to a function
@@ -392,32 +421,7 @@ fn mutated_roots<'a>(visit_fn: impl FnOnce(&mut dyn Visit<'a>)) -> BTreeSet<Stri
     struct M(BTreeSet<String>);
     impl<'ast> Visit<'ast> for M {
         fn visit_expr(&mut self, e: &'ast Expr) {
-            match e {
-                Expr::Assign(a) => self.0.extend(place_root(&a.left)),
-                Expr::Binary(b)
-                    if matches!(
-                        b.op,
-                        syn::BinOp::AddAssign(_)
-                            | syn::BinOp::SubAssign(_)
-                            | syn::BinOp::MulAssign(_)
-                            | syn::BinOp::DivAssign(_)
-                            | syn::BinOp::RemAssign(_)
-                    ) =>
-                {
-                    self.0.extend(place_root(&b.left));
-                }
-                Expr::Reference(r) if r.mutability.is_some() => {
-                    self.0.extend(place_root(&r.expr));
-                }
-                Expr::MethodCall(m)
-                    if !READ_ONLY_METHODS.contains(&m.method.to_string().as_str()) =>
-                {
-                    self.0.extend(place_root(&m.receiver));
-                    self.0.extend(m.args.iter().filter_map(bare_place_root));
-                }
-                Expr::Call(c) => self.0.extend(c.args.iter().filter_map(bare_place_root)),
-                _ => {}
-            }
+            self.0.extend(direct_writes(e));
             visit::visit_expr(self, e);
         }
     }
@@ -1197,6 +1201,16 @@ impl<'ast> Visit<'ast> for Linter<'_> {
             }
         }
         visit::visit_expr(self, e);
+        // A write takes effect where it is evaluated, not at the end of the
+        // statement: `if refresh(&mut e) { w = w.max(e) }` must not see the
+        // fact `refresh` may have broken (review 4). Children are visited
+        // first, in syn's (left-to-right, i.e. evaluation) order, so the
+        // invalidation lands before any later operand or body is checked.
+        if self.in_test() {
+            if let Some(ctx) = self.ctx.last_mut() {
+                ctx.invalidate(&direct_writes(e).into_iter().collect());
+            }
+        }
     }
 
     /// `syn` leaves macro bodies as tokens, and the defect lives *inside*
