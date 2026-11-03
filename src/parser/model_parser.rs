@@ -4209,6 +4209,10 @@ pub fn parse_full_model_with(
     // reads the blocks. Also the single point where every [structural_model] line
     // is classified, so an unrecognized one errors instead of being dropped.
     apply_algebraic_structural(&mut extracted)?;
+    // Omega-line distributions (#1716): a `transform` clause becomes an `[eta_shape]`
+    // line, a `density KIND()` gets its shape θ named. Before every other reader of
+    // `[parameters]` (the `[covariate_model]` desugaring parses it next).
+    apply_omega_dist_block(&mut extracted)?;
     // Prepare the absorption ODE-equivalent (#486; IG #790): the transit / IG closed forms
     // assume constant parameters over each absorption window, so they cannot serve a subject
     // whose parameters switch mid-profile (a `TIME`-dependent parameter or time-varying
@@ -4254,6 +4258,7 @@ pub fn parse_full_model_with(
         unbound_level_blocks,
         declared_priors,
     ) = parse_parameters(param_lines, level_bindings)?;
+    let eta_densities = resolve_eta_densities(param_lines, &eta_names_bsv, &thetas)?;
     // Install the θ level table for the remainder of this parse so a
     // gather (`PLACEBO[IDX]`) resolves identically in every block that parses
     // expressions. Dropped at the end of `parse_full_model`, restoring whatever
@@ -4710,6 +4715,46 @@ pub fn parse_full_model_with(
                 }
             }
         }
+    }
+    // #1716: a constrained density's domain map. The estimators hold the latent `z`; the
+    // model reads the random effect `m(z)` (`exp`, `inv_logit`), so every read in
+    // `[individual_parameters]` is wrapped, on the AST, before mu-reference detection.
+    // A read in any other block would see the latent instead, a plausible wrong answer,
+    // so it is refused, as a weighted kappa's is.
+    let density_maps: HashMap<usize, &'static str> = eta_densities
+        .iter()
+        .filter_map(|d| d.kind.map().function().map(|f| (d.etas[0], f)))
+        .collect();
+    if !density_maps.is_empty() {
+        let named_blocks = extracted
+            .named
+            .iter()
+            .flat_map(|(ty, m)| m.keys().map(move |inst| (format!("{ty} {inst}"), &m[inst])));
+        for (block, lines) in blocks
+            .iter()
+            .filter(|(b, _)| b.as_str() != "parameters" && b.as_str() != "individual_parameters")
+            .map(|(b, l)| (b.clone(), l))
+            .chain(named_blocks)
+        {
+            let mut refs: HashSet<String> = HashSet::new();
+            collect_referenced_identifiers(lines, &mut refs);
+            for &slot in density_maps.keys() {
+                let name = &eta_names_bsv[slot];
+                if refs.contains(&name.to_ascii_uppercase()) {
+                    return Err(format!(
+                        "[{block}] reads `{name}`, whose `density` puts the random effect on a \
+                         bounded scale: only `[individual_parameters]` reads it as the random \
+                         effect itself, so a read here would see the unconstrained latent \
+                         instead. Assign it to an individual parameter and read that name."
+                    ));
+                }
+            }
+        }
+        rewrite_eta_leaves(&mut indiv_stmts, &|i| {
+            density_maps
+                .get(&i)
+                .map(|f| Expression::UnaryFn((*f).to_string(), Box::new(Expression::Eta(i))))
+        });
     }
     if !weighted_kappa_slots.is_empty() {
         // Mu-reference detection (further down) runs on the *rewritten*
@@ -5781,7 +5826,15 @@ pub fn parse_full_model_with(
         outside_idents: &outside_idents,
         nn_specs: &nn_specs_for_ctx,
     };
-    let all_mu_refs_owned = detect_mu_refs_with_owners(&indiv_stmts, &mu_ref_scan);
+    let mut all_mu_refs_owned = detect_mu_refs_with_owners(&indiv_stmts, &mu_ref_scan);
+    // #1716: a density ETA is not mu-referenced. Mu-referencing is a Gaussian location
+    // shift (SAEM's closed-form typical value, Bayes's conjugate block), and the domain
+    // map's `TVCL * exp(ETA)` would otherwise read as one.
+    let density_eta_names: Vec<&String> = eta_densities
+        .iter()
+        .flat_map(|d| d.etas.iter().map(|&k| &eta_names_bsv[k]))
+        .collect();
+    all_mu_refs_owned.retain(|eta, _| !density_eta_names.contains(&eta));
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     // Owners of the BSV mu-refs, kept crate-private behind `indiv_param_partials`
     // (#1930): see `IndivParamPartials::mu_ref_owners`.
@@ -5805,13 +5858,14 @@ pub fn parse_full_model_with(
         .collect();
     // Multi-theta typical values (#619): a separate list, never a substitute
     // for `mu_refs` — see `detect_covariate_mu_refs`.
-    let covariate_mu_refs = detect_covariate_mu_refs(
+    let mut covariate_mu_refs = detect_covariate_mu_refs(
         &indiv_stmts,
         &theta_names,
         &all_eta_names,
         eta_names_bsv.len(),
         &outside_idents,
     );
+    covariate_mu_refs.retain(|c| !density_eta_names.contains(&&c.eta_name));
 
     // Build pk_indices: maps each individual parameter (by declaration order)
     // to its PK parameter index. Needed for AD to place values in correct slots.
@@ -5900,6 +5954,13 @@ pub fn parse_full_model_with(
         &mut eta_param_info,
         &mut kappa_param_types,
     );
+    // #1716: a density ETA's spread is not `ω` on any of the Gaussian scales the labels
+    // describe, so it prints no CV%.
+    for info in eta_param_info.iter_mut() {
+        if density_eta_names.contains(&&info.eta_name) {
+            info.param_type = crate::types::EtaParamType::Custom;
+        }
+    }
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
@@ -6008,6 +6069,7 @@ pub fn parse_full_model_with(
     indiv_param_partials.nested_levels = nested_levels;
 
     let model = CompiledModel {
+        eta_densities,
         residual_serial: residual_serial.clone(),
         priors: declared_priors,
         // `[priors] from_fit` is read further down, once `extract_blocks` output
@@ -8358,6 +8420,103 @@ fn push_covariate_decl(
         levels,
     });
     Ok(())
+}
+
+/// The omega-line distribution pre-pass (#1716,
+/// `crate::parser::eta_shape::apply_omega_dist_clauses`): rewrites `[parameters]` and
+/// appends the `transform` clauses to `[eta_shape]`, which is desugared below.
+fn apply_omega_dist_block(extracted: &mut ExtractedBlocks) -> Result<(), String> {
+    let Some(params) = extracted.unnamed.get_mut("parameters") else {
+        return Ok(());
+    };
+    let shape_lines = crate::parser::eta_shape::apply_omega_dist_clauses(params)?;
+    if !shape_lines.is_empty() {
+        extracted
+            .unnamed
+            .entry("eta_shape".to_string())
+            .or_default()
+            .extend(shape_lines);
+    }
+    Ok(())
+}
+
+/// The omega-line `density` declarations (#1716) as [`crate::stats::eta_density::EtaDensity`]
+/// groups: ETA positions and shape-θ indices, checked against the declared parameters.
+fn resolve_eta_densities(
+    param_lines: &[String],
+    eta_names: &[String],
+    thetas: &[ThetaSpec],
+) -> Result<Vec<crate::stats::eta_density::EtaDensity>, String> {
+    use crate::stats::eta_density::{DensityKind, EtaDensity};
+    let mut out = Vec::new();
+    for d in crate::parser::eta_shape::omega_density_decls(param_lines)? {
+        let kind = DensityKind::from_name(&d.kind)
+            .ok_or_else(|| crate::parser::eta_shape::unknown_density(&d.kind, &d.line))?;
+        if d.etas.len() > 1 && !kind.allows_block() {
+            return Err(format!(
+                "[parameters] `density {}` is univariate: a block of correlated ETAs can be \
+                 Gaussian or `density t(ν)` (a multivariate t); correlating other kinds needs \
+                 a copula, which is not supported. Declare each ETA on its own `omega` line: `{}`",
+                d.kind, d.line
+            ));
+        }
+        let mut etas = Vec::with_capacity(d.etas.len());
+        for e in &d.etas {
+            etas.push(
+                eta_names.iter().position(|n| n == e).ok_or_else(|| {
+                    format!("[parameters] `{e}` in `{}` is not a BSV ETA", d.line)
+                })?,
+            );
+        }
+        etas.sort_unstable();
+        let want = usize::from(kind.shape_theta().is_some());
+        if d.args.len() != want {
+            return Err(format!(
+                "[parameters] `density {}` takes {} (got {}): `{}`",
+                d.kind,
+                if want == 1 {
+                    "one shape θ, or `()` to declare it"
+                } else {
+                    "no shape θ"
+                },
+                d.args.len(),
+                d.line
+            ));
+        }
+        let mut shape_thetas = Vec::with_capacity(want);
+        for a in &d.args {
+            let k = thetas.iter().position(|t| &t.name == a).ok_or_else(|| {
+                format!(
+                    "[parameters] `{a}` in `{}` is not a declared θ — declare it, or write \
+                     `density {}()` to declare it automatically",
+                    d.line, d.kind
+                )
+            })?;
+            let t = &thetas[k];
+            let bad_bounds = match kind {
+                DensityKind::StudentT => (!(t.lower > 0.0)).then_some("bounded above 0"),
+                DensityKind::Beta | DensityKind::LogitNormal => {
+                    (!(t.lower >= 0.0 && t.upper <= 1.0 && t.lower < t.upper))
+                        .then_some("bounded inside [0, 1]")
+                }
+                _ => None,
+            };
+            if let Some(what) = bad_bounds {
+                return Err(format!(
+                    "[parameters] the shape θ `{a}` of `density {}` must be {what} (its bounds \
+                     are {}, {}): `{}`",
+                    d.kind, t.lower, t.upper, d.line
+                ));
+            }
+            shape_thetas.push(k);
+        }
+        out.push(EtaDensity {
+            kind,
+            etas,
+            shape_thetas,
+        });
+    }
+    Ok(out)
 }
 
 /// Desugar the optional `[eta_shape]` block (#1716) into inline shape calls,
@@ -19124,6 +19283,28 @@ fn parse_parameters(
         // so on `kappa K ~ 0.1 weight = NARM prior(0.1, rse = 30%)` the weight
         // would otherwise swallow the prior and the model would fit unpenalized.
         let (line, prior_decl) = split_prior_modifier(source_line, "parameters")?;
+        // #1716: a `density` tail (a `transform` one was desugared by
+        // `apply_omega_dist_block`); `crate::parser::eta_shape::omega_density_decls`
+        // reads it, here it is only peeled, and refused on any other declaration.
+        let (line, dist_clause) = crate::parser::eta_shape::split_dist_clause(&line)?;
+        if let Some(c) = &dist_clause {
+            let kw = crate::parser::eta_shape::decl_keyword(&line);
+            if c.transform || !(kw == "omega" || kw == "block_omega") {
+                return Err(format!(
+                    "[parameters] a `{}` clause belongs on an `omega` or `block_omega` \
+                     declaration{}: `{}`",
+                    if c.transform { "transform" } else { "density" },
+                    if kw == "kappa" || kw == "block_kappa" {
+                        " (an IOV kappa is not supported yet, #1717)"
+                    } else if c.transform {
+                        ", and on a standalone `omega` for a transform"
+                    } else {
+                        ""
+                    },
+                    source_line.trim()
+                ));
+            }
+        }
         let (line, weight_expr) =
             split_weight_modifier(&line, "parameters", "a `kappa NAME ~ VALUE` declaration")?;
         // #1082: `kappa NAME ~ VALUE at LEVEL` — peeled after the weight, which takes
@@ -25742,57 +25923,72 @@ fn rewrite_weighted_kappas(
     stmts: &mut [Statement],
     weights: &HashMap<usize, Expression>,
 ) -> HashSet<usize> {
+    rewrite_eta_leaves(stmts, &|i| {
+        weights.get(&i).map(|w| {
+            Expression::BinOp(
+                Box::new(Expression::Eta(i)),
+                BinOp::Div,
+                Box::new(Expression::UnaryFn("sqrt".to_string(), Box::new(w.clone()))),
+            )
+        })
+    })
+}
+
+/// Replace every `Expression::Eta(i)` leaf for which `with(i)` is `Some` by that
+/// expression, in statements, conditions and nested `if` bodies alike. Returns the slots
+/// rewritten. The one walker behind the weighted-kappa scaling and the density domain
+/// maps (#1716).
+fn rewrite_eta_leaves(
+    stmts: &mut [Statement],
+    with: &dyn Fn(usize) -> Option<Expression>,
+) -> HashSet<usize> {
     fn walk_expr(
         expr: &mut Expression,
-        weights: &HashMap<usize, Expression>,
+        with: &dyn Fn(usize) -> Option<Expression>,
         hit: &mut HashSet<usize>,
     ) {
         if let Expression::Eta(i) = expr {
-            if let Some(w) = weights.get(i) {
+            if let Some(e) = with(*i) {
                 hit.insert(*i);
-                *expr = Expression::BinOp(
-                    Box::new(Expression::Eta(*i)),
-                    BinOp::Div,
-                    Box::new(Expression::UnaryFn("sqrt".to_string(), Box::new(w.clone()))),
-                );
+                *expr = e;
             }
             return;
         }
         match expr {
             Expression::BinOp(l, _, r) => {
-                walk_expr(l, weights, hit);
-                walk_expr(r, weights, hit);
+                walk_expr(l, with, hit);
+                walk_expr(r, with, hit);
             }
-            Expression::UnaryFn(_, a) => walk_expr(a, weights, hit),
-            Expression::ThetaGather { idx, .. } => walk_expr(idx, weights, hit),
+            Expression::UnaryFn(_, a) => walk_expr(a, with, hit),
+            Expression::ThetaGather { idx, .. } => walk_expr(idx, with, hit),
             Expression::Power(b, e) => {
-                walk_expr(b, weights, hit);
-                walk_expr(e, weights, hit);
+                walk_expr(b, with, hit);
+                walk_expr(e, with, hit);
             }
             Expression::Conditional(c, t, e) => {
-                walk_cond(c, weights, hit);
-                walk_expr(t, weights, hit);
-                walk_expr(e, weights, hit);
+                walk_cond(c, with, hit);
+                walk_expr(t, with, hit);
+                walk_expr(e, with, hit);
             }
             _ => {}
         }
     }
     fn walk_cond(
         cond: &mut Condition,
-        weights: &HashMap<usize, Expression>,
+        with: &dyn Fn(usize) -> Option<Expression>,
         hit: &mut HashSet<usize>,
     ) {
         match cond {
             Condition::Compare(l, _, r) => {
-                walk_expr(l, weights, hit);
-                walk_expr(r, weights, hit);
+                walk_expr(l, with, hit);
+                walk_expr(r, with, hit);
             }
             Condition::And(l, r) | Condition::Or(l, r) => {
-                walk_cond(l, weights, hit);
-                walk_cond(r, weights, hit);
+                walk_cond(l, with, hit);
+                walk_cond(r, with, hit);
             }
-            Condition::Not(c) => walk_cond(c, weights, hit),
-            Condition::Present(e) => walk_expr(e, weights, hit),
+            Condition::Not(c) => walk_cond(c, with, hit),
+            Condition::Present(e) => walk_expr(e, with, hit),
         }
     }
     let mut hit: HashSet<usize> = HashSet::new();
@@ -25801,7 +25997,7 @@ fn rewrite_weighted_kappas(
             Statement::Assign(_, e)
             | Statement::AssignIdx(_, e)
             | Statement::DiffEq(_, e)
-            | Statement::DiffEqIdx(_, e) => walk_expr(e, weights, &mut hit),
+            | Statement::DiffEqIdx(_, e) => walk_expr(e, with, &mut hit),
             // Bytecode forms only exist after `resolve_variable_indices`, which
             // runs long after this rewrite.
             Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {}
@@ -25810,11 +26006,11 @@ fn rewrite_weighted_kappas(
                 else_body,
             } => {
                 for (cond, body) in branches {
-                    walk_cond(cond, weights, &mut hit);
-                    hit.extend(rewrite_weighted_kappas(body, weights));
+                    walk_cond(cond, with, &mut hit);
+                    hit.extend(rewrite_eta_leaves(body, with));
                 }
                 if let Some(eb) = else_body {
-                    hit.extend(rewrite_weighted_kappas(eb, weights));
+                    hit.extend(rewrite_eta_leaves(eb, with));
                 }
             }
         }

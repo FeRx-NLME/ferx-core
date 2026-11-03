@@ -1143,7 +1143,16 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     // Eta prior: eta' * Omega_inv * eta
     eta_work.as_mut_slice().copy_from_slice(eta);
     prior_work.gemv(1.0, omega_inv, eta_work, 0.0);
-    let eta_prior = eta_work.dot(prior_work);
+    let mut eta_prior = eta_work.dot(prior_work);
+    // #1716: a non-Gaussian density group's correction to the Gaussian prior; `+∞`
+    // outside a Box-Cox support.
+    if !model.eta_densities.is_empty() {
+        eta_prior +=
+            crate::stats::eta_density::correction(&model.eta_densities, eta, omega_inv, theta);
+        if !eta_prior.is_finite() {
+            return SUBJECT_SENTINEL_NLL;
+        }
+    }
 
     // #570: a joint PK-TTE subject otherwise integrates the augmented PK+CHZ system
     // twice per eval (Gaussian preds, then `ode_cumhaz_hazard` for `H`/`h`). When the
@@ -2345,6 +2354,13 @@ fn foce_subject_nll_cov_split(
     // Per-observation custom residual magnitude (#484). η-independent, so one
     // evaluation here feeds both the data term and the Laplace curvature term.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
+    // A density group's correction at η̂ (#1716), into the prior and `H̃` of every form.
+    let density = crate::stats::eta_density::DensityAtMode::at(
+        &model.eta_densities,
+        eta_hat.as_slice(),
+        &omega.inv,
+        theta,
+    );
 
     // For SDE models, inflate R with the EKF process-noise variance.
     let p_obs = if model.is_sde() {
@@ -2400,6 +2416,33 @@ fn foce_subject_nll_cov_split(
             interaction,
             model.residual_error_eta,
             ruv_mult.as_deref(),
+            density.as_ref(),
+            parts,
+        );
+    }
+    // FOCE (no interaction) under a density: the Sheiner–Beal marginal integrates η as
+    // `N(0, Ω)`, so it has no density form. It takes the conditional form FOCE takes beside
+    // a non-Gaussian endpoint instead (the variance at η̂, `½·c̃ᵀc̃` and the censored
+    // curvature left out of `H̃`), with no endpoint term. Fit validation refuses the
+    // combinations that form does not carry (a dense residual, FREM).
+    if density.is_some() && !interaction {
+        let n = eta_hat.len();
+        return foce_subject_nll_interaction_with_tte(
+            subject,
+            &ipreds,
+            eta_hat,
+            h_matrix,
+            omega,
+            sigma_values,
+            &model.error_spec,
+            model.bloq_in_force(),
+            &p_obs,
+            0.0,
+            DMatrix::zeros(n, n),
+            false,
+            model.residual_error_eta,
+            ruv_mult.as_deref(),
+            density.as_ref(),
             parts,
         );
     }
@@ -2437,6 +2480,7 @@ fn foce_subject_nll_cov_split(
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
                 residual_cov.pairs,
+                density.as_ref(),
                 parts,
             )
         } else {
@@ -2452,6 +2496,7 @@ fn foce_subject_nll_cov_split(
                 &p_obs,
                 ruv_mult.as_deref(),
                 model.residual_error_eta,
+                density.as_ref(),
                 parts,
             )
         }
@@ -2895,6 +2940,7 @@ pub(crate) fn foce_subject_nll_interaction_corr(
         residual_error_eta,
         ruv_mult,
         correlations,
+        None, // no density: the wrapper's callers are Gaussian
         None,
     )
 }
@@ -2916,8 +2962,11 @@ fn foce_subject_nll_interaction_split(
     residual_error_eta: Option<usize>,
     ruv_mult: Option<&[Vec<f64>]>,
     correlations: &[ResidualCorrelation],
+    // A density group's correction at η̂ (#1716): `c` into the prior, `½∇²c` into `H̃`.
+    density: Option<&crate::stats::eta_density::DensityAtMode>,
     mut parts: PartSink<'_>,
 ) -> f64 {
+    let prior_curv = crate::stats::eta_density::prior_curvature(&omega.inv, density);
     let n_eta = eta_hat.len();
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
     let Some(g) = gaussian_foce_accum(
@@ -2941,7 +2990,7 @@ fn foce_subject_nll_interaction_split(
     };
 
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
-    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat)) + density.map_or(0.0, |d| d.c);
     note_gaussian_data(&mut parts, subject, bloq_method, g.data_ll, g.bloq_term);
     note(
         &mut parts,
@@ -2950,7 +2999,7 @@ fn foce_subject_nll_interaction_split(
     );
     // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + cens_hess + Ω⁻¹.  log|H̃| via Cholesky.
     // (`cens_hess` = 0 unless the subject has M3-censored rows.)
-    let htilde = g.hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv;
+    let htilde = g.hrh + 0.5 * g.ctc + &g.cens_hess + &*prior_curv;
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
         None => {
@@ -3080,6 +3129,7 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
         p_obs,
         ruv_mult,
         residual_error_eta,
+        None, // no density: the wrapper's callers are Gaussian
         None,
     )
 }
@@ -3099,8 +3149,11 @@ fn foce_subject_nll_interaction_dense_split(
     p_obs: &[f64],
     ruv_mult: Option<&[Vec<f64>]>,
     residual_error_eta: Option<usize>,
+    // A density group's correction at η̂ (#1716): `c` into the prior, `½∇²c` into `H̃`.
+    density: Option<&crate::stats::eta_density::DensityAtMode>,
     mut parts: PartSink<'_>,
 ) -> f64 {
+    let prior_curv = crate::stats::eta_density::prior_curvature(&omega.inv, density);
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
@@ -3209,8 +3262,8 @@ fn foce_subject_nll_interaction_dense_split(
         }
     }
 
-    let htilde = term1 + 0.5 * b + &omega.inv;
-    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    let htilde = term1 + 0.5 * b + &*prior_curv;
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat)) + density.map_or(0.0, |d| d.c);
     note(&mut parts, "Gaussian residual term", 0.5 * data_ll);
     note(
         &mut parts,
@@ -3247,7 +3300,6 @@ fn foce_subject_nll_interaction_dense_split(
 ///   variance is ignored: the `½·CᵀC` interaction term is dropped from `H̃`.
 ///   For pure-TTE subjects CᵀC is all-zero, so this only matters for mixed
 ///   PK+TTE models run under FOCE.
-#[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_interaction_with_tte(
     subject: &Subject,
@@ -3268,8 +3320,11 @@ fn foce_subject_nll_interaction_with_tte(
     // rows carry no residual variance so the multiplier never touches them.
     ruv_mult: Option<&[Vec<f64>]>,
     // The part sink (#2267); the caller has recorded the non-Gaussian data terms.
+    // A density group's correction at η̂ (#1716): `c` into the prior, `½∇²c` into `H̃`.
+    density: Option<&crate::stats::eta_density::DensityAtMode>,
     mut parts: PartSink<'_>,
 ) -> f64 {
+    let prior_curv = crate::stats::eta_density::prior_curvature(&omega.inv, density);
     let n_eta = eta_hat.len();
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
     let Some(g) = gaussian_foce_accum(
@@ -3300,7 +3355,7 @@ fn foce_subject_nll_interaction_with_tte(
     // The part sink classifies a failed `H̃` by whether the non-Gaussian Hessian is what
     // broke it, so it keeps the Gaussian side and that Hessian's finiteness before the sum.
     let gaussian_htilde = parts.is_some().then(|| {
-        let mut h = g.hrh.clone() + &omega.inv;
+        let mut h = g.hrh.clone() + &*prior_curv;
         if interaction {
             h += 0.5 * &g.ctc + &g.cens_hess;
         }
@@ -3309,7 +3364,7 @@ fn foce_subject_nll_interaction_with_tte(
     // Accumulate TTE Hessian into the Gaussian Jacobian outer-product matrix.
     let hrh = g.hrh + tte_hessian;
 
-    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat)) + density.map_or(0.0, |d| d.c);
     note(
         &mut parts,
         "random-effect prior",
@@ -3322,9 +3377,9 @@ fn foce_subject_nll_interaction_with_tte(
     // as `½·g.ctc` is. Plain FOCE (non-interaction) leaves censored rows out of `H̃`,
     // matching `foce_subject_nll_standard`.
     let htilde = if interaction {
-        hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv
+        hrh + 0.5 * g.ctc + &g.cens_hess + &*prior_curv
     } else {
-        hrh + &omega.inv
+        hrh + &*prior_curv
     };
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
@@ -4155,6 +4210,15 @@ fn foce_subject_nll_iov_linearized_split(
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
+    // A density group's correction at b̂ (#1716). The stacked `Σ_b = Ω_BSV ⊕ Ω_IOV…` puts
+    // the BSV block first, and a density reads BSV η only, so its inverse's BSV block is
+    // `Ω_BSV⁻¹`.
+    let density = crate::stats::eta_density::DensityAtMode::at(
+        &model.eta_densities,
+        b_hat.as_slice(),
+        &sigma_b.inv,
+        theta,
+    );
     // A subject's non-Gaussian records (TTE, the discrete family): their data term and their
     // curvature, which read BSV η only, enter the stacked marginal over the BSV block — the
     // non-IOV marginal's `with_tte` form over `[η, κ]`. Before, the IOV marginal dropped
@@ -4186,6 +4250,30 @@ fn foce_subject_nll_iov_linearized_split(
             interaction,
             model.residual_error_eta,
             ruv_mult.as_deref(),
+            density.as_ref(),
+            parts,
+        );
+    }
+    // FOCE (no interaction) under a density: the conditional form, as in the non-IOV
+    // dispatcher (`foce_subject_nll_cov_split`).
+    if density.is_some() && !interaction {
+        let n_b = b_hat.len();
+        return foce_subject_nll_interaction_with_tte(
+            subject,
+            &ipreds,
+            &b_hat,
+            &h_full,
+            &sigma_b,
+            sigma_values,
+            &model.error_spec,
+            model.bloq_in_force(),
+            &p_obs_iov,
+            0.0,
+            DMatrix::zeros(n_b, n_b),
+            false,
+            model.residual_error_eta,
+            ruv_mult.as_deref(),
+            density.as_ref(),
             parts,
         );
     }
@@ -4214,6 +4302,7 @@ fn foce_subject_nll_iov_linearized_split(
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
                 &[],
+                density.as_ref(),
                 parts,
             )
         } else {
@@ -4229,6 +4318,7 @@ fn foce_subject_nll_iov_linearized_split(
                 &p_obs_iov,
                 ruv_mult.as_deref(),
                 model.residual_error_eta,
+                density.as_ref(),
                 parts,
             )
         }
@@ -4966,7 +5056,15 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     // BSV eta prior
     let omega_inv = &omega.inv;
     let log_det_omega = omega.log_det;
-    let eta_prior = quad_form(omega_inv, eta);
+    let mut eta_prior = quad_form(omega_inv, eta);
+    // #1716: the BSV η's density correction, as in the BSV objective.
+    if !model.eta_densities.is_empty() {
+        eta_prior +=
+            crate::stats::eta_density::correction(&model.eta_densities, eta, omega_inv, theta);
+        if !eta_prior.is_finite() {
+            return SUBJECT_SENTINEL_NLL;
+        }
+    }
 
     // Kappa priors and IOV log-det
     let Some(iov) = omega_iov else {
@@ -5410,6 +5508,7 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             analytic_readout: None,
+            eta_densities: Vec::new(),
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
             mixture: None,

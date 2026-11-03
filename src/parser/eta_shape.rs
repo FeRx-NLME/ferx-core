@@ -346,6 +346,352 @@ pub(crate) fn apply_eta_shape(
     Ok(())
 }
 
+// ── `density` / `transform` on the omega line ───────────────────────────────
+
+/// A `density KIND(ARGS)` or `transform KIND(ARGS)` tail on an `omega` /
+/// `block_omega` declaration (#1716): what the ETA's distribution is.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DistClause {
+    /// `transform` (η ~ N, the model reads `h(η)`) rather than `density` (η itself
+    /// has the density).
+    pub(crate) transform: bool,
+    /// The kind, lower-cased (`t`, `boxcox`, …), unchecked.
+    pub(crate) kind: String,
+    /// The comma-separated arguments, trimmed; empty for `kind()`.
+    pub(crate) args: Vec<String>,
+}
+
+/// A `density` clause and the ETAs of the declaration it sits on.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OmegaDensityDecl {
+    pub(crate) etas: Vec<String>,
+    pub(crate) kind: String,
+    pub(crate) args: Vec<String>,
+    /// The declaration, for messages.
+    pub(crate) line: String,
+}
+
+/// The byte range `[start, end)` of a `density …(…)` / `transform …(…)` tail in a
+/// `[parameters]` line, and the clause. The keyword is matched as a whole word at
+/// bracket depth 0, and not in a declaration's name slot (`omega density ~ 0.1` is an
+/// ETA named `density`). Only a `prior(...)` tail may follow it.
+pub(crate) fn find_dist_clause(line: &str) -> Result<Option<(usize, usize, DistClause)>, String> {
+    let bytes = line.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut depth = 0i32;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            _ => {}
+        }
+        if depth != 0 || (i > 0 && is_ident(bytes[i - 1])) {
+            continue;
+        }
+        let Some(kw) = ["density", "transform"].into_iter().find(|kw| {
+            bytes.len() >= i + kw.len()
+                && bytes[i..i + kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+                && !bytes.get(i + kw.len()).copied().is_some_and(is_ident)
+        }) else {
+            continue;
+        };
+        // In the name slot (right after the declaration keyword), it is a name.
+        let before = line[..i].trim_end();
+        let prev_word = before
+            .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        if before.len() == line[..i].len()
+            || ["theta", "omega", "sigma", "kappa"]
+                .contains(&prev_word.to_ascii_lowercase().as_str())
+        {
+            continue;
+        }
+        let bad = || {
+            format!(
+                "[parameters] cannot read the `{kw}` clause in `{}` — write `{kw} KIND`, or \
+                 `{kw} KIND(SHAPE)` for a kind with a shape θ, e.g. \
+                 `omega ETA_CL ~ 0.09 density gamma`, `density t(NU)` or `transform boxcox(LAMBDA)`; \
+                 `KIND()` declares the shape θ automatically",
+                line.trim()
+            )
+        };
+        let rest = &line[i + kw.len()..];
+        // A kind without a shape may be written bare: `density gamma`.
+        let word_end = rest
+            .trim_start()
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(rest.len(), |e| e + (rest.len() - rest.trim_start().len()));
+        let kind = rest[..word_end].trim();
+        if kind.is_empty() || !kind.bytes().all(is_ident) {
+            return Err(bad());
+        }
+        let after_kind = rest[word_end..].trim_start();
+        if !after_kind.starts_with('(') {
+            let prior_follows = after_kind.len() >= 5
+                && after_kind[..5].eq_ignore_ascii_case("prior")
+                && !after_kind.as_bytes().get(5).copied().is_some_and(is_ident);
+            if !after_kind.is_empty() && !prior_follows {
+                return Err(bad());
+            }
+            let end = i + kw.len() + word_end;
+            let clause = DistClause {
+                transform: kw == "transform",
+                kind: kind.to_ascii_lowercase(),
+                args: Vec::new(),
+            };
+            return Ok(Some((i, end, clause)));
+        }
+        let open_rel = rest.find('(').ok_or_else(bad)?;
+        let open = i + kw.len() + open_rel;
+        let mut d = 0i32;
+        let mut close = None;
+        for (j, &b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'(' => d += 1,
+                b')' => {
+                    d -= 1;
+                    if d == 0 {
+                        close = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.ok_or_else(bad)?;
+        let after = line[close + 1..].trim_start();
+        let prior_follows = after.len() >= 5
+            && after[..5].eq_ignore_ascii_case("prior")
+            && !after.as_bytes().get(5).copied().is_some_and(is_ident);
+        if !after.is_empty() && !prior_follows {
+            return Err(format!(
+                "[parameters] the `{kw}` clause must end the declaration (only a `prior(...)` \
+                 may follow it); found `{after}` after it in `{}`",
+                line.trim()
+            ));
+        }
+        let inner = line[open + 1..close].trim();
+        let args = if inner.is_empty() {
+            Vec::new()
+        } else {
+            inner.split(',').map(|a| a.trim().to_string()).collect()
+        };
+        if args
+            .iter()
+            .any(|a| a.is_empty() || !a.bytes().all(is_ident))
+        {
+            return Err(format!(
+                "[parameters] the `{kw}` clause takes θ names, comma-separated: `{}`",
+                line.trim()
+            ));
+        }
+        let clause = DistClause {
+            transform: kw == "transform",
+            kind: kind.to_ascii_lowercase(),
+            args,
+        };
+        return Ok(Some((i, close + 1, clause)));
+    }
+    Ok(None)
+}
+
+/// `line` without its distribution clause, and the clause.
+pub(crate) fn split_dist_clause(line: &str) -> Result<(String, Option<DistClause>), String> {
+    Ok(match find_dist_clause(line)? {
+        Some((s, e, c)) => (format!("{}{}", line[..s].trim_end(), &line[e..]), Some(c)),
+        None => (line.to_string(), None),
+    })
+}
+
+/// The ETA names an `omega` / `block_omega` declaration line declares, or `None` for
+/// any other line.
+fn declared_etas(line: &str) -> Option<(bool, Vec<String>)> {
+    let t = line.trim_start();
+    let lower = t.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("block_omega") {
+        let open = rest.find('(')?;
+        let close = rest.find(')')?;
+        let names = t["block_omega".len() + open + 1.."block_omega".len() + close]
+            .split(',')
+            .map(|n| n.trim().to_string())
+            .collect();
+        return Some((true, names));
+    }
+    let rest = lower.strip_prefix("omega")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let name = t["omega".len()..]
+        .trim_start()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .next()?;
+    Some((false, vec![name.to_string()]))
+}
+
+/// The keyword of a `[parameters]` line (`theta`, `kappa`, …), lower-cased.
+pub(crate) fn decl_keyword(line: &str) -> String {
+    line.trim_start()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// The text pre-pass for omega-line distributions (#1716), run on `[parameters]` before
+/// anything parses it:
+///
+/// - `omega ETA ~ ω transform KIND(ARGS)` loses the clause, and `ETA ~ KIND(ARGS)` is
+///   appended to the `[eta_shape]` lines, so the transform takes exactly the desugaring
+///   path (and NONMEM anchor) the block has.
+/// - `density KIND()` gets its shape θ named (`NU_<ETA>` / `LAMBDA_<ETA>`), and a
+///   `theta` line is appended at [`crate::stats::eta_density::DensityKind::default_theta`].
+///   The clause stays on the line, explicit, so every later parse of the text (the
+///   absorption twin's included) reads the same density.
+///
+/// Returns the generated `[eta_shape]` lines.
+/// The message for an unknown `density` kind, listing the kinds.
+pub(crate) fn unknown_density(kind: &str, line: &str) -> String {
+    let kinds: Vec<&str> = crate::stats::eta_density::DensityKind::ALL
+        .iter()
+        .map(|k| k.name())
+        .collect();
+    format!(
+        "[parameters] unknown density `{kind}` in `{}` — the densities are {} (and \
+         `boxcox`, which is the Box-Cox transform)",
+        line.trim(),
+        kinds.join(", ")
+    )
+}
+
+pub(crate) fn apply_omega_dist_clauses(
+    parameters: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
+    use crate::stats::eta_density::DensityKind;
+    let theta_names: Vec<String> = parameters
+        .iter()
+        .filter(|l| decl_keyword(l) == "theta")
+        .filter_map(|l| {
+            l.trim_start()[5..]
+                .trim_start()
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .map(str::to_string)
+        })
+        .collect();
+    let mut shape_lines = Vec::new();
+    let mut new_thetas = Vec::new();
+    for line in parameters.iter_mut() {
+        let Some((s, e, clause)) = find_dist_clause(line)? else {
+            continue;
+        };
+        let kw = if clause.transform {
+            "transform"
+        } else {
+            "density"
+        };
+        let Some((is_block, etas)) = declared_etas(line) else {
+            let decl = decl_keyword(line);
+            return Err(if decl == "kappa" || decl == "block_kappa" {
+                format!(
+                    "[parameters] a `{kw}` clause on an IOV kappa is not supported yet (#1717): `{}`",
+                    line.trim()
+                )
+            } else {
+                format!(
+                    "[parameters] a `{kw}` clause belongs on an `omega` or `block_omega` \
+                     declaration: `{}`",
+                    line.trim()
+                )
+            });
+        };
+        // On its latent scale a Box-Cox density is exactly the Box-Cox transform, so
+        // `density boxcox(λ)` is that transform (`crate::stats::eta_density`).
+        let as_transform = clause.transform || clause.kind == "boxcox";
+        if as_transform {
+            if is_block {
+                return Err(format!(
+                    "[parameters] a `transform` applies to one ETA, so it goes on a standalone \
+                     `omega` line (or in [eta_shape]), not on `{}`",
+                    line.trim()
+                ));
+            }
+            if ShapeKind::from_name(&clause.kind).is_none() {
+                return Err(format!(
+                    "[parameters] unknown transform `{}` in `{}` — the transforms are `boxcox`, \
+                     `tdist` and `johndraper`",
+                    clause.kind,
+                    line.trim()
+                ));
+            }
+            shape_lines.push(format!(
+                "{} ~ {}({})",
+                etas[0],
+                clause.kind,
+                clause.args.join(", ")
+            ));
+            *line = format!("{}{}", line[..s].trim_end(), &line[e..]);
+            continue;
+        }
+        let kind = DensityKind::from_name(&clause.kind)
+            .ok_or_else(|| unknown_density(&clause.kind, line))?;
+        let Some((prefix, init, lo, hi)) = kind.shape_theta() else {
+            continue;
+        };
+        if !clause.args.is_empty() {
+            continue;
+        }
+        let names = vec![format!("{prefix}_{}", etas[0])];
+        for name in &names {
+            if theta_names.contains(name)
+                || new_thetas
+                    .iter()
+                    .any(|t: &String| t.contains(&format!(" {name}(")))
+            {
+                return Err(format!(
+                    "[parameters] `density {}()` would declare θ `{name}`, which [parameters] \
+                     already declares — name it inside the parentheses: `{}`",
+                    clause.kind,
+                    line.trim()
+                ));
+            }
+            new_thetas.push(format!("theta {name}({init}, {lo}, {hi})"));
+        }
+        *line = format!(
+            "{} density {}({}){}",
+            line[..s].trim_end(),
+            clause.kind,
+            names.join(", "),
+            &line[e..]
+        );
+    }
+    parameters.extend(new_thetas);
+    Ok(shape_lines)
+}
+
+/// Every `density` clause in `[parameters]`, with the ETAs of its declaration. Run after
+/// [`apply_omega_dist_clauses`], so a `transform` is gone and every argument is named.
+pub(crate) fn omega_density_decls(parameters: &[String]) -> Result<Vec<OmegaDensityDecl>, String> {
+    let mut out = Vec::new();
+    for line in parameters {
+        let Some((_, _, clause)) = find_dist_clause(line)? else {
+            continue;
+        };
+        if clause.transform {
+            continue;
+        }
+        if let Some((_, etas)) = declared_etas(line) {
+            out.push(OmegaDensityDecl {
+                etas,
+                kind: clause.kind,
+                args: clause.args,
+                line: line.trim().to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 #[path = "eta_shape_tests.rs"]
 mod tests;

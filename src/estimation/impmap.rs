@@ -1361,8 +1361,15 @@ fn run_mcem(
                     };
                     let theta = &params_k.theta;
                     let sigma = &params_k.sigma.values;
+                    // #1716: a density's `½c` joins the per-draw data term.
                     let obs_nll = |b: &[f64], sc: &mut EventPkParams| {
                         draw_obs_nll(model, subject, theta, sigma, b, sc)
+                            + crate::stats::eta_density::half_correction(
+                                &model.eta_densities,
+                                b,
+                                omega_joint_inv,
+                                theta,
+                            )
                     };
                     let iscale = find_optimal_iscale_with(
                         &obs_nll,
@@ -1615,6 +1622,51 @@ fn run_mcem(
         }
         floor_omega_diagonal(&mut new_omega, &init_params.omega_fixed, OMEGA_DIAG_FLOOR);
         omega_mat = new_omega;
+        // #1716: a density group's Ω block and shape θ maximise its weighted prior over
+        // this iteration's draws (the closed form above is the Gaussian statistic).
+        let density_mstep = crate::estimation::eta_density_mstep::DensityMstep::new(
+            model,
+            &init_params.omega_fixed,
+            &init_params.theta_fixed,
+            &init_params
+                .theta_lower
+                .iter()
+                .zip(&init_params.theta_upper)
+                .map(|(&lo, &hi)| (lo, hi))
+                .collect::<Vec<_>>(),
+        );
+        let density_owned: Vec<usize> = density_mstep
+            .as_ref()
+            .map(|d| d.owned_thetas())
+            .unwrap_or_default();
+        if let Some(dm) = &density_mstep {
+            let weighted: Vec<(&[f64], f64)> = draws
+                .iter()
+                .flat_map(|d| {
+                    d.etas
+                        .iter()
+                        .zip(&d.weights)
+                        .map(|(e, &w)| (e.as_slice(), w / n_subjects as f64))
+                })
+                .collect();
+            let mut theta_nat: Vec<f64> = (0..n_theta)
+                .map(|i| {
+                    if theta_packs_log_mask[i] {
+                        log_theta[i].exp()
+                    } else {
+                        log_theta[i]
+                    }
+                })
+                .collect();
+            dm.maximise(model, &weighted, &mut omega_mat, &mut theta_nat);
+            for &t in &density_owned {
+                log_theta[t] = if theta_packs_log_mask[t] {
+                    theta_nat[t].ln()
+                } else {
+                    theta_nat[t]
+                };
+            }
+        }
 
         // ---- M-step Ω_iov (#2301): weighted κ second moment over every occasion ----
         if let (Some(cur), Some(template)) = (omega_iov_mat.as_mut(), omega_iov_init) {
@@ -1630,6 +1682,11 @@ fn run_mcem(
         // optimizes only σ and any non-mu-ref θ, using the θ_old-centered samples.
         let mut mstep_theta_lower = log_theta_lower.clone();
         let mut mstep_theta_upper = log_theta_upper.clone();
+        // #1716: a density's shape θ was set by its prior M-step above.
+        for &t in &density_owned {
+            mstep_theta_lower[t] = log_theta[t];
+            mstep_theta_upper[t] = log_theta[t];
+        }
         if use_closed_form {
             for &(t, _e) in &mu_ref_pairs {
                 // Weak-IIV mu-ref θ are estimated by this M-step, not the shift,

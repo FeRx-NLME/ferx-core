@@ -4113,6 +4113,23 @@ pub fn run_saem(
 
     // Initialize state
     let theta_cur = init_params.theta.clone();
+    // #1716: the density groups' M-step (their Ω blocks and shape θs, by SA on the score).
+    let theta_bounds_nat: Vec<(f64, f64)> = init_params
+        .theta_lower
+        .iter()
+        .zip(&init_params.theta_upper)
+        .map(|(&lo, &hi)| (lo, hi))
+        .collect();
+    let mut density_mstep = crate::estimation::eta_density_mstep::DensityMstep::new(
+        model,
+        &init_params.omega_fixed,
+        &init_params.theta_fixed,
+        &theta_bounds_nat,
+    );
+    let density_owned_thetas: Vec<usize> = density_mstep
+        .as_ref()
+        .map(|d| d.owned_thetas())
+        .unwrap_or_default();
     let omega_cur = init_params.omega.matrix.clone();
     let sigma_cur = init_params.sigma.values.clone();
     let s2 = omega_cur.clone();
@@ -5730,6 +5747,28 @@ pub fn run_saem(
             }
         }
 
+        // ---- Step 3c: density groups (#1716) ----
+        // Their Ω blocks replace the closed form just taken from `s2` (which is the
+        // Gaussian statistic), on the same burn-in gate and gain. Their shape θs move here
+        // and nowhere else: they enter the prior only.
+        if k > omega_burnin {
+            if let Some(dm) = density_mstep.as_mut() {
+                let mut theta_nat: Vec<f64> = (0..n_theta)
+                    .map(|i| unpack_theta(i, log_theta[i]))
+                    .collect();
+                dm.sa_step(
+                    model,
+                    &state.etas,
+                    &mut state.omega_mat,
+                    &mut theta_nat,
+                    gamma_omega,
+                );
+                for &t in &density_owned_thetas {
+                    log_theta[t] = pack_theta(t, theta_nat[t]);
+                }
+            }
+        }
+
         // ---- Step 4: M-step theta, sigma (lightweight NLopt, warm-started) ----
         // Only run every few iterations during exploration to save time
         // The exploration throttle exists because a BOBYQA re-maximisation costs
@@ -5801,6 +5840,11 @@ pub fn run_saem(
                 // for the rest of this iteration's NLL cache refresh).
                 let mut temp_theta_lower = log_theta_lower.clone();
                 let mut temp_theta_upper = log_theta_upper.clone();
+                // #1716: a density's shape θ is the prior M-step's (Step 3c), not the data's.
+                for &t in &density_owned_thetas {
+                    temp_theta_lower[t] = log_theta[t];
+                    temp_theta_upper[t] = log_theta[t];
+                }
                 let mut n_pinned: u64 = 0;
                 for &(theta_idx, eta_idx) in &mu_ref_pairs {
                     if init_params
@@ -6017,6 +6061,11 @@ pub fn run_saem(
                     .collect();
                 let mut temp_theta_lower = log_theta_lower.clone();
                 let mut temp_theta_upper = log_theta_upper.clone();
+                // #1716: a density's shape θ is the prior M-step's (Step 3c), not the data's.
+                for &t in &density_owned_thetas {
+                    temp_theta_lower[t] = log_theta[t];
+                    temp_theta_upper[t] = log_theta[t];
+                }
                 let mut n_pinned: u64 = 0;
                 for pair in &mix_mu_ref_pairs {
                     let eta_idx = pair.eta_idx;

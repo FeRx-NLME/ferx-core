@@ -730,6 +730,14 @@ fn analytic_inner_seed_hessian(
                 for (g, p) in gradient.iter_mut().zip(prior.iter()) {
                     *g += p;
                 }
+                crate::stats::eta_density::add_half_grad_hess(
+                    &model.eta_densities,
+                    eta,
+                    &params.omega.inv,
+                    &params.theta,
+                    &mut gradient,
+                    &mut htilde,
+                );
                 for (g, q) in gradient.iter_mut().zip(&endpoints) {
                     *g += q;
                 }
@@ -5082,6 +5090,13 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     if subject.obs_times.is_empty() {
         eta_work.as_mut_slice().copy_from_slice(eta);
         prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
+        crate::stats::eta_density::add_half_grad(
+            &model.eta_densities,
+            eta,
+            &omega.inv,
+            theta,
+            prior_work.as_mut_slice(),
+        );
         // `mut` is only exercised by the non-Gaussian fold below.
         #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
         let mut grad: Vec<f64> = crate::scratch::take_with_capacity(prior_work.len());
@@ -5118,6 +5133,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         let result = dense_residual_inner_gradient(
             model,
             subject,
+            theta,
             eta,
             omega,
             sigma,
@@ -5199,9 +5215,16 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;
     }
-    // Prior: ∂/∂η ½ η'Ω⁻¹η = Ω⁻¹η.
+    // Prior: ∂/∂η ½ η'Ω⁻¹η = Ω⁻¹η, plus a density group's ½∇c (#1716).
     eta_work.as_mut_slice().copy_from_slice(eta);
     prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
+    crate::stats::eta_density::add_half_grad(
+        &model.eta_densities,
+        eta,
+        &omega.inv,
+        theta,
+        prior_work.as_mut_slice(),
+    );
     for (k, g) in grad.iter_mut().enumerate() {
         *g += prior_work[k];
     }
@@ -5231,6 +5254,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
 fn dense_residual_inner_gradient(
     model: &CompiledModel,
     subject: &Subject,
+    theta: &[f64],
     eta: &[f64],
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
@@ -5246,6 +5270,13 @@ fn dense_residual_inner_gradient(
     let n_eta = model.n_eta;
     eta_work.as_mut_slice().copy_from_slice(eta);
     prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
+    crate::stats::eta_density::add_half_grad(
+        &model.eta_densities,
+        eta,
+        &omega.inv,
+        theta,
+        prior_work.as_mut_slice(),
+    );
     let n_obs = sens.len();
     if n_obs == 0 {
         return Some(prior_work.as_slice().to_vec());
@@ -5506,7 +5537,14 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // one block per occasion group (the κ-variance shared across occasions, SAME), or under
     // nested levels one per group of each level, `Ω_L` the rows and columns of its κs.
     let eta_bsv = DVector::from_column_slice(&axes[..n_eta]);
-    let prior_bsv = &omega_bsv.inv * &eta_bsv;
+    let mut prior_bsv = &omega_bsv.inv * &eta_bsv;
+    crate::stats::eta_density::add_half_grad(
+        &model.eta_densities,
+        &axes[..n_eta],
+        &omega_bsv.inv,
+        theta,
+        prior_bsv.as_mut_slice(),
+    );
     for (k, g) in grad.iter_mut().take(n_eta).enumerate() {
         *g += prior_bsv[k];
     }

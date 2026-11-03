@@ -4615,6 +4615,11 @@ pub struct CompiledModel {
     /// θ is `FIX`ed at 0 (the parser drops the line, as it drops a `FIX` zero
     /// `block_sigma` off-diagonal).
     pub residual_serial: Option<ResidualSerial>,
+    /// Non-Gaussian random-effect densities (#1716): each group is one Ω block whose ETAs
+    /// follow `density t(ν)` or `density boxcox(λ)` instead of `N(0, Ω)`. Empty for a
+    /// Gaussian model. Every prior consumer adds
+    /// [`crate::stats::eta_density::correction_g`] to its Gaussian term.
+    pub eta_densities: Vec<crate::stats::eta_density::EtaDensity>,
     pub pk_param_fn: PkParamFn,
     pub n_theta: usize,
     /// Number of between-subject variability (BSV) ETAs.

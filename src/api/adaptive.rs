@@ -824,10 +824,21 @@ where
             let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
             let mut eta_slice: Vec<f64> = match supplied {
                 Some(eta) => eta.clone(),
-                None => (eta_factor * DVector::from_column_slice(&z))
-                    .iter()
-                    .copied()
-                    .collect(),
+                None => {
+                    let mut e: Vec<f64> = (eta_factor * DVector::from_column_slice(&z))
+                        .iter()
+                        .copied()
+                        .collect();
+                    // #1716: a density group draws its own latent.
+                    crate::stats::eta_density::redraw_latents(
+                        &model.eta_densities,
+                        &params.omega.matrix,
+                        &params.theta,
+                        &mut e,
+                        &mut rng,
+                    );
+                    e
+                }
             };
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
