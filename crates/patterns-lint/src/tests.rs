@@ -236,3 +236,128 @@ impl Foo {
     // The same text as a whole-file test flags all of it.
     assert_eq!(lint_source("tests/x.rs", src, true).unwrap().len(), 8);
 }
+
+/// Review round 2 (#2634): a fact holds only where its assert DOMINATES the
+/// fold, and only until the value is written or rebound.
+#[test]
+fn a_finite_assert_guards_only_the_code_it_dominates() {
+    for body in [
+        // Straight-line, and inside the loop body before the fold.
+        "assert!(err.is_finite()); w = w.max(err);",
+        "for e in errs { assert!(e.is_finite()); w = w.max(e); }",
+        // An outer fact reaches into nested blocks it dominates.
+        "assert!(err.is_finite()); if c { w = w.max(err); }",
+        "assert!(err.is_finite()); for _ in 0..3 { w = w.max(err); }",
+        // Asserted again after the write.
+        "assert!(e.is_finite()); e = f(); assert!(e.is_finite()); w = w.max(e);",
+        // A write to something else does not touch the fact.
+        "assert!(e.is_finite()); other = 1.0; w = w.max(e);",
+        "assert!(xs.iter().all(|e| e.is_finite())); let n = xs.len(); let m = xs.iter().cloned().fold(0.0, f64::max);",
+    ] {
+        assert!(findings(&t(body)).is_empty(), "flagged although guarded: {body}");
+    }
+    for body in [
+        // The reviewer's case: the assert is conditional.
+        "if check { assert!(err.is_finite()); } w = w.max(err);",
+        "match k { 0 => assert!(err.is_finite()), _ => {} } w = w.max(err);",
+        "{ assert!(err.is_finite()); } w = w.max(err);",
+        // After, not before.
+        "w = w.max(err); assert!(err.is_finite());",
+        // Written between the assert and the fold.
+        "assert!(e.is_finite()); e = f(); w = w.max(e);",
+        "assert!(e.is_finite()); e += g; w = w.max(e);",
+        "assert!(r.got.is_finite()); r.got = f(); w = w.max(r.got);",
+        "assert!(e.is_finite()); poke(&mut e); w = w.max(e);",
+        "assert!(e.is_finite()); if c { e = f(); } w = w.max(e);",
+        "assert!(xs.iter().all(|e| e.is_finite())); xs.push(f64::NAN); let m = xs.iter().cloned().fold(0.0, f64::max);",
+        // A loop body that writes the value: the second iteration is unguarded.
+        "assert!(e.is_finite()); for _ in 0..3 { w = w.max(e); e = f(); }",
+        "assert!(e.is_finite()); while c { w = w.max(e); e = f(); }",
+        "assert!(e.is_finite()); loop { w = w.max(e); e = f(); }",
+        // Rebound by a pattern: the fold reads a DIFFERENT `e`.
+        "assert!(e.is_finite()); let e = f(); w = w.max(e);",
+        "assert!(e.is_finite()); for e in errs { w = w.max(e); }",
+        "assert!(e.is_finite()); errs.iter().for_each(|e| { w = w.max(*e); });",
+        "assert!(e.is_finite()); if let Some(e) = o { w = w.max(e); }",
+        "assert!(e.is_finite()); match o { Some(e) => { w = w.max(e); } None => {} }",
+    ] {
+        assert_eq!(findings(&t(body)).len(), 1, "not flagged although unguarded: {body}");
+    }
+    // A shadow is scoped: after the inner block the outer `e` and its fact return.
+    let ok = t("assert!(e.is_finite()); { let e = f(); x = e; } w = w.max(e);");
+    assert!(findings(&ok).is_empty());
+}
+
+/// Review round 2 (#2634): finite inputs do not make every combination NaN-free.
+/// Two possibly-infinite intermediates can meet in `inf - inf`, `inf * 0.0` or
+/// `inf / inf`.
+#[test]
+fn overflow_to_infinity_is_tracked_through_the_arithmetic() {
+    let g = "assert!(a.is_finite() && b.is_finite());";
+    for expr in [
+        "(a * b) * 0.0",
+        "a * b - a * b",
+        "(a + b) - (a + b)",
+        "(a * b) / (a * b + 1.0)",
+        "(a - b).abs() / (1e300 + b.abs())",
+        "a * b * a",
+        // `a * 0.5` is finite, but `… - b` can still overflow before the `* 0.0`.
+        "(a * 0.5 - b) * 0.0",
+    ] {
+        let src = t(&format!("{g} w = w.max({expr});"));
+        assert_eq!(findings(&src).len(), 1, "not flagged: {expr}");
+    }
+    for expr in [
+        // One possibly-infinite value: inf ± finite = inf, inf * 2.0 = inf.
+        "a * b",
+        "a * b + 1.0",
+        "(a * b) * 2.0",
+        // A small addend cannot overflow, so `1.0 + |b|` is finite and nonzero.
+        "(a - b).abs() / (1.0 + b.abs())",
+        "(a - b).abs() / b.abs().max(1e-12)",
+        // `|x| <= 1` factors cannot grow a value.
+        "(a * 0.5) * 0.0",
+        "a / 2.0",
+    ] {
+        let src = t(&format!("{g} w = w.max({expr});"));
+        assert!(
+            findings(&src).is_empty(),
+            "flagged although NaN-free: {expr}"
+        );
+    }
+}
+
+/// Review round 2 (#2634): `nan-ok` must be a real comment with the exact marker.
+#[test]
+fn nan_ok_is_lexed_not_searched() {
+    // Inside a string literal on the line.
+    for body in [
+        "w = w.max(e); assert!(w < 1.0, \"// nan-ok: not a comment\");",
+        "w = w.max(e); let s = r#\"// nan-ok: raw string\"#;",
+        "w = w.max(e); let s = r\"// nan-ok: raw\";",
+        "w = w.max(e); let c = '\"'; let s = \"// nan-ok: after a char\";",
+        "w = w.max(e); /* // nan-ok: in a block comment */",
+    ] {
+        assert_eq!(
+            findings(&t(body)).len(),
+            1,
+            "excused by a non-comment: {body}"
+        );
+    }
+    // A string that spans lines does not leak comment state.
+    let multi = t("let s = \"line one\n// nan-ok: inside the string\";\nw = w.max(e);");
+    assert_eq!(findings(&multi).len(), 1);
+    // Without the colon.
+    let f = findings(&t("w = w.max(e); // nan-ok e is fine"));
+    assert_eq!(f.len(), 1);
+    assert!(
+        f[0].message.contains("lacks the `nan-ok:` colon"),
+        "{}",
+        f[0].message
+    );
+    // A real comment after a string still counts; so does a lifetime nearby.
+    let ok = t("w = w.max(e); let s = \"x\"; // nan-ok: e is an integer count");
+    assert!(findings(&ok).is_empty());
+    let ok = "#[test]\nfn t<'a>(e: &'a f64) {\nw = w.max(*e); // nan-ok: reason\n}\n";
+    assert!(findings(ok).is_empty());
+}

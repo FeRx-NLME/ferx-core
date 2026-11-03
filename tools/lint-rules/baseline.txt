@@ -99,6 +99,7 @@ nan-fold 1 src/estimation/profile_logit_tests.rs::beta_gap_se
 nan-fold 1 src/estimation/profile_logit_tests.rs::the_exact_newton_matrix_matches_second_differences_of_the_resolved_objective
 nan-fold 2 src/estimation/profile_tests.rs::certified_and_short_gaps
 nan-fold 2 src/estimation/profile_tests.rs::level_blocks_over_levels_are_the_theta_hessian
+nan-fold 1 src/estimation/profile_tests.rs::level_gradient_gaps
 nan-fold 1 src/estimation/profile_tests.rs::the_box_qp_is_the_kkt_point_not_the_clamped_newton_step
 nan-fold 1 src/estimation/profile_tests.rs::under_nelder_mead_a_state_on_the_adjoint_is_a_mode
 nan-fold 1 src/estimation/run_covariance.rs::tests::run_covariance_fallback_without_packed_estimate

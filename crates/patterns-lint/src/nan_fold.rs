@@ -28,18 +28,19 @@
 //!
 //! Escape hatches:
 //!
-//! 1. an `assert!` / `debug_assert!` / `prop_assert!` in the same function whose
-//!    condition GUARANTEES the folded value finite. Only positive conjuncts of
-//!    the condition count (`a && b`; never under `!` or `||`): `X.is_finite()`
-//!    or `f64::is_finite(X)` guarantees `X`. An accumulator operand is guarded
-//!    when it is such an `X`, or is built from guarded values and literals by
-//!    `-x`, `+`, `-`, `*`, `.abs()`, `.max`/`.min`, or `/` by a provably nonzero
-//!    divisor (`c + x.abs()`, `x.max(c)`, `c > 0`) — so `(got - want).abs()`
-//!    needs BOTH `got` and `want` asserted. A fold is guarded by
+//! 1. an `assert!` / `debug_assert!` / `prop_assert!` that DOMINATES the fold
+//!    (an earlier statement of the fold's block or an enclosing one, with the
+//!    value not written or rebound in between — see [`Scope`]) and whose
+//!    condition guarantees the folded value finite. Only positive conjuncts
+//!    count (`a && b`; never under `!` or `||`): `X.is_finite()` or
+//!    `f64::is_finite(X)` guarantees `X`. An accumulator operand is guarded when
+//!    it is such an `X`, or is built from guarded values and literals so that no
+//!    NaN can arise even after overflow — see [`Class`]. A fold is guarded by
 //!    `C.all(|e| e.is_finite())` / `C.all(f64::is_finite)` over the same
 //!    iterator chain `C` it folds (`iter`/`cloned`/`copied` aside);
-//! 2. `// nan-ok: <reason>` on any line of the flagged expression, or alone on
-//!    the line above it. The reason is required.
+//! 2. `// nan-ok: <reason>` — a real `//` comment (lexed, so not text inside a
+//!    string), with the exact `nan-ok:` marker and a non-empty reason — on any
+//!    line of the flagged expression, or alone on the line above it.
 
 use std::collections::BTreeSet;
 
@@ -59,7 +60,8 @@ pub const RULE: &str = "nan-fold";
 pub const ESCAPES: &str =
     "f64::max/min discard NaN, so a NaN operand leaves the accumulator at the \
 finite rows' value and the assertion passes green. Either assert the folded value \
-itself `.is_finite()` in this function (e.g. `assert!(err.is_finite())` before \
+itself `.is_finite()` before the fold, in the same block or an enclosing one \
+(e.g. `assert!(err.is_finite())` before \
 `w = w.max(err)`; for `(a - b).abs()` assert both `a` and `b`; for a `.fold` over \
 `xs`, `assert!(xs.iter().all(|e| e.is_finite()))`), or put `// nan-ok: <reason>` \
 on the line. See tools/lint-rules/nan-fold.md.";
@@ -84,6 +86,7 @@ pub fn lint_file(rel: &str, text: &str, ast: &syn::File, whole_test: bool) -> Ve
     let mut l = Linter {
         rel,
         lines: text.lines().collect(),
+        comments: line_comments(text),
         test_depth: usize::from(whole_test),
         path: Vec::new(),
         ctx: Vec::new(),
@@ -93,45 +96,73 @@ pub fn lint_file(rel: &str, text: &str, ast: &syn::File, whole_test: bool) -> Ve
     l.out
 }
 
+/// A fact an `assert!` established: `key` is finite (or, for a chain, every
+/// element is), stated in terms of the locals in `roots`.
+#[derive(Clone)]
+struct Fact {
+    chain: bool,
+    key: String,
+    roots: BTreeSet<String>,
+}
+
+/// One lexical scope's worth of guard state.
+///
+/// A fact lives in the scope of the block whose statement asserted it, so it is
+/// visible only to code that statement DOMINATES: the later statements of that
+/// block and everything nested in them. `if c { assert!(e.is_finite()); }`
+/// therefore guards nothing after the `if`. `masked` names locals that are
+/// rebound in this scope (a `let`, a closure parameter, a `for`/`match`/`if let`
+/// pattern) or that a loop body mutates, so facts from OUTER scopes about them
+/// do not apply here.
+#[derive(Default)]
+struct Scope {
+    facts: Vec<Fact>,
+    masked: BTreeSet<String>,
+}
+
 /// What the escape-hatch and integer checks need to know about the enclosing fn.
 #[derive(Default)]
 struct FnCtx {
-    /// Expressions an assert's condition guarantees finite — `X` of a positive
-    /// `X.is_finite()` / `f64::is_finite(X)` conjunct — as [`value_key`]s.
-    finite_values: BTreeSet<String>,
-    /// Iterator chains an assert guarantees all-finite — `C` of a positive
-    /// `C.all(|e| e.is_finite())` / `C.all(f64::is_finite)` conjunct — as
-    /// [`chain_key`]s.
-    finite_chains: BTreeSet<String>,
+    /// The guard scopes, outermost first; see [`Scope`].
+    scopes: Vec<Scope>,
     /// Locals visibly declared as integers.
     int_locals: BTreeSet<String>,
+}
+
+impl FnCtx {
+    fn has(&self, chain: bool, key: &str) -> bool {
+        let mut blocked: BTreeSet<&String> = BTreeSet::new();
+        for scope in self.scopes.iter().rev() {
+            if scope.facts.iter().any(|f| {
+                f.chain == chain && f.key == key && f.roots.iter().all(|r| !blocked.contains(r))
+            }) {
+                return true;
+            }
+            blocked.extend(scope.masked.iter());
+        }
+        false
+    }
+
+    /// A local was written: no fact about it survives, in any scope.
+    fn invalidate(&mut self, roots: &BTreeSet<String>) {
+        for scope in &mut self.scopes {
+            scope.facts.retain(|f| f.roots.is_disjoint(roots));
+        }
+    }
+
+    /// A local was rebound by a `let` in the innermost scope.
+    fn shadow(&mut self, names: BTreeSet<String>) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.facts.retain(|f| f.roots.is_disjoint(&names));
+            scope.masked.extend(names);
+        }
+    }
 }
 
 impl FnCtx {
     fn scan(block: &syn::Block) -> Self {
         struct Scan(FnCtx);
         impl<'ast> Visit<'ast> for Scan {
-            fn visit_macro(&mut self, m: &'ast syn::Macro) {
-                let name = m
-                    .path
-                    .segments
-                    .last()
-                    .map(|s| s.ident.to_string())
-                    .unwrap_or_default();
-                // `assert!`-shaped macros only: the first argument is a boolean
-                // that the test fails on. `assert_eq!(x.is_finite(), false)` and
-                // friends are not a guarantee of anything, so they do not count.
-                if matches!(name.as_str(), "assert" | "debug_assert" | "prop_assert") {
-                    if let Ok(args) =
-                        m.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
-                    {
-                        if let Some(cond) = args.first() {
-                            collect_finite(cond, &mut self.0);
-                        }
-                    }
-                }
-                visit::visit_macro(self, m);
-            }
             fn visit_local(&mut self, local: &'ast syn::Local) {
                 let (name, ty) = match &local.pat {
                     syn::Pat::Ident(p) => (Some(p.ident.to_string()), None),
@@ -202,31 +233,185 @@ fn expr_is_int(e: &Expr, int_locals: &BTreeSet<String>) -> bool {
     }
 }
 
+/// The facts an `assert!`-shaped statement establishes, if it is one.
+///
+/// `assert!` / `debug_assert!` / `prop_assert!` only: their first argument is
+/// a boolean the test fails on. `assert_eq!(x.is_finite(), false)` and friends
+/// guarantee nothing, so they do not count.
+fn assert_facts(m: &syn::Macro) -> Vec<Fact> {
+    let name = m
+        .path
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    if matches!(name.as_str(), "assert" | "debug_assert" | "prop_assert") {
+        if let Ok(args) = m.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
+            if let Some(cond) = args.first() {
+                collect_finite(cond, &mut out);
+            }
+        }
+    }
+    out
+}
+
 /// Walk an assert condition and record what it guarantees finite.
 ///
 /// Only POSITIVE conjuncts guarantee anything: `a && b` guarantees both, a
 /// parenthesised term is itself, and `!x.is_finite()`, `x.is_finite() || y`,
 /// or an `is_finite` buried in any other expression guarantee nothing.
-fn collect_finite(cond: &Expr, ctx: &mut FnCtx) {
+fn collect_finite(cond: &Expr, out: &mut Vec<Fact>) {
+    let value = |e: &Expr| Fact {
+        chain: false,
+        key: value_key(e),
+        roots: roots_of(e),
+    };
     match cond {
-        Expr::Paren(p) => collect_finite(&p.expr, ctx),
+        Expr::Paren(p) => collect_finite(&p.expr, out),
         Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
-            collect_finite(&b.left, ctx);
-            collect_finite(&b.right, ctx);
+            collect_finite(&b.left, out);
+            collect_finite(&b.right, out);
         }
         Expr::MethodCall(m) if m.method == "is_finite" && m.args.is_empty() => {
-            ctx.finite_values.insert(value_key(&m.receiver));
+            out.push(value(&m.receiver));
         }
         Expr::Call(c) if c.args.len() == 1 && is_float_assoc_path(&c.func, "is_finite") => {
-            ctx.finite_values.insert(value_key(&c.args[0]));
+            out.push(value(&c.args[0]));
         }
         Expr::MethodCall(m)
             if m.method == "all" && m.args.len() == 1 && predicate_is_finite(&m.args[0]) =>
         {
-            ctx.finite_chains.insert(chain_key(&m.receiver));
+            out.push(Fact {
+                chain: true,
+                key: chain_key(&m.receiver),
+                roots: roots_of(&m.receiver),
+            });
         }
         _ => {}
     }
+}
+
+/// Every single-identifier path in `e` — the locals a fact about `e` depends on.
+fn roots_of(e: &Expr) -> BTreeSet<String> {
+    struct R(BTreeSet<String>);
+    impl<'ast> Visit<'ast> for R {
+        fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+            if let Some(i) = p.path.get_ident() {
+                self.0.insert(i.to_string());
+            }
+        }
+    }
+    let mut r = R(BTreeSet::new());
+    r.visit_expr(e);
+    r.0
+}
+
+/// Every identifier a pattern binds.
+fn pat_bindings(p: &syn::Pat) -> BTreeSet<String> {
+    struct B(BTreeSet<String>);
+    impl<'ast> Visit<'ast> for B {
+        fn visit_pat_ident(&mut self, i: &'ast syn::PatIdent) {
+            self.0.insert(i.ident.to_string());
+            visit::visit_pat_ident(self, i);
+        }
+    }
+    let mut b = B(BTreeSet::new());
+    b.visit_pat(p);
+    b.0
+}
+
+/// The local a place expression writes through: `a` for `a`, `a.b`, `a[i]`,
+/// `*a`, `(a)`. `None` for a temporary (`f().x`, `v.iter()`).
+fn place_root(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Path(p) => p.path.get_ident().map(|i| i.to_string()),
+        Expr::Field(f) => place_root(&f.base),
+        Expr::Index(i) => place_root(&i.expr),
+        Expr::Paren(p) => place_root(&p.expr),
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => place_root(&u.expr),
+        Expr::Reference(r) => place_root(&r.expr),
+        _ => None,
+    }
+}
+
+/// Methods that do not mutate a place they are called on directly. Any other
+/// method called on a local counts as a write to it — conservative, since a
+/// missed write would let a stale fact excuse a fold.
+const READ_ONLY_METHODS: &[&str] = &[
+    "abs",
+    "all",
+    "any",
+    "as_ref",
+    "as_slice",
+    "clone",
+    "cloned",
+    "column",
+    "contains",
+    "copied",
+    "exp",
+    "expect",
+    "first",
+    "get",
+    "is_empty",
+    "is_finite",
+    "is_nan",
+    "iter",
+    "keys",
+    "last",
+    "len",
+    "ln",
+    "max",
+    "min",
+    "ncols",
+    "nrows",
+    "powf",
+    "powi",
+    "row",
+    "sqrt",
+    "to_string",
+    "to_vec",
+    "unwrap",
+    "values",
+];
+
+/// Every local a statement (at any depth) writes: assignment and compound
+/// assignment targets, `&mut x` borrows, and the receiver of any method call
+/// not in [`READ_ONLY_METHODS`].
+fn mutated_roots<'a>(visit_fn: impl FnOnce(&mut dyn Visit<'a>)) -> BTreeSet<String> {
+    struct M(BTreeSet<String>);
+    impl<'ast> Visit<'ast> for M {
+        fn visit_expr(&mut self, e: &'ast Expr) {
+            match e {
+                Expr::Assign(a) => self.0.extend(place_root(&a.left)),
+                Expr::Binary(b)
+                    if matches!(
+                        b.op,
+                        syn::BinOp::AddAssign(_)
+                            | syn::BinOp::SubAssign(_)
+                            | syn::BinOp::MulAssign(_)
+                            | syn::BinOp::DivAssign(_)
+                            | syn::BinOp::RemAssign(_)
+                    ) =>
+                {
+                    self.0.extend(place_root(&b.left));
+                }
+                Expr::Reference(r) if r.mutability.is_some() => {
+                    self.0.extend(place_root(&r.expr));
+                }
+                Expr::MethodCall(m)
+                    if !READ_ONLY_METHODS.contains(&m.method.to_string().as_str()) =>
+                {
+                    self.0.extend(place_root(&m.receiver));
+                }
+                _ => {}
+            }
+            visit::visit_expr(self, e);
+        }
+    }
+    let mut m = M(BTreeSet::new());
+    visit_fn(&mut m);
+    m.0
 }
 
 /// `f64::is_finite`, or a closure `|e| e.is_finite()` (any of `|&e|`, `|e: &f64|`)
@@ -264,6 +449,20 @@ fn pat_ident(p: &syn::Pat) -> Option<String> {
     }
 }
 
+/// Identifiers bound by `let` patterns in an `if`/`while` condition.
+fn let_bindings(cond: &Expr) -> BTreeSet<String> {
+    struct L(BTreeSet<String>);
+    impl<'ast> Visit<'ast> for L {
+        fn visit_expr_let(&mut self, l: &'ast syn::ExprLet) {
+            self.0.extend(pat_bindings(&l.pat));
+            visit::visit_expr_let(self, l);
+        }
+    }
+    let mut l = L(BTreeSet::new());
+    l.visit_expr(cond);
+    l.0
+}
+
 fn is_float_assoc_path(e: &Expr, name: &str) -> bool {
     let Expr::Path(p) = e else { return false };
     let segs: Vec<String> = p
@@ -289,79 +488,129 @@ fn value_key(e: &Expr) -> String {
     }
 }
 
-/// Is `e` NaN-free given what the function asserts finite?
+/// What the assert facts in scope prove about an expression's value.
 ///
-/// True when `e` itself is asserted finite, or is built from asserted-finite
-/// values and literals by operations that cannot make a NaN out of finite
-/// inputs: unary `-`, `+`, `-`, `*` (overflow gives ±inf, never NaN, and an inf
-/// fails a `< tol` assertion rather than vanishing), `.abs()`, `.max`/`.min`,
-/// and `/` only by a divisor that is provably nonzero (`0.0 / 0.0` is NaN).
-/// Anything else — a call, a field nobody asserted, `sqrt`, `ln` — is unguarded.
-fn value_is_guarded(e: &Expr, ctx: &FnCtx) -> bool {
-    if ctx.finite_values.contains(&value_key(e)) {
-        return true;
+/// `Finite` and `NotNan` are both safe to fold — an infinity reaches the
+/// accumulator and fails a `< tol` assertion instead of vanishing — but they
+/// are tracked apart, because combining two values that may be infinite CAN
+/// make a NaN: `inf - inf`, `inf * 0.0`, `inf / inf`. With `a`, `b` asserted
+/// finite, `a * b` may overflow, so `(a * b) * 0.0` is `Unknown` (review 2).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Class {
+    Finite,
+    NotNan,
+    Unknown,
+}
+
+/// A literal small enough that adding it to any finite `f64` cannot round to
+/// infinity: the spacing of doubles at `f64::MAX` is ~2e292, so a sum moves past
+/// `MAX` only if the addend exceeds half of that.
+const SAFE_ADDEND: f64 = 1e280;
+
+fn lit_value(e: &Expr) -> Option<f64> {
+    match e {
+        Expr::Lit(l) => match &l.lit {
+            syn::Lit::Float(f) => f.base10_parse::<f64>().ok(),
+            syn::Lit::Int(i) => i.base10_parse::<u64>().ok().map(|v| v as f64),
+            _ => None,
+        },
+        Expr::Paren(p) => lit_value(&p.expr),
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => lit_value(&u.expr).map(|v| -v),
+        _ => None,
+    }
+}
+
+fn classify(e: &Expr, ctx: &FnCtx) -> Class {
+    use Class::*;
+    if ctx.has(false, &value_key(e)) {
+        return Finite;
+    }
+    if let Some(v) = lit_value(e) {
+        return if v.is_finite() { Finite } else { NotNan };
     }
     match e {
-        Expr::Lit(l) => matches!(l.lit, syn::Lit::Float(_) | syn::Lit::Int(_)),
-        Expr::Paren(p) => value_is_guarded(&p.expr, ctx),
-        Expr::Reference(r) => value_is_guarded(&r.expr, ctx),
-        Expr::Unary(u) => {
-            matches!(u.op, syn::UnOp::Neg(_) | syn::UnOp::Deref(_))
-                && value_is_guarded(&u.expr, ctx)
+        Expr::Paren(p) => classify(&p.expr, ctx),
+        Expr::Reference(r) => classify(&r.expr, ctx),
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_) | syn::UnOp::Deref(_)) => {
+            classify(&u.expr, ctx)
         }
         Expr::MethodCall(m) => match (m.method.to_string().as_str(), m.args.len()) {
-            ("abs", 0) => value_is_guarded(&m.receiver, ctx),
-            ("max" | "min", 1) => {
-                value_is_guarded(&m.receiver, ctx) && value_is_guarded(&m.args[0], ctx)
-            }
-            _ => false,
+            ("abs", 0) => classify(&m.receiver, ctx),
+            ("max" | "min", 1) => classify(&m.receiver, ctx).max(classify(&m.args[0], ctx)),
+            _ => Unknown,
         },
-        Expr::Binary(b) => match b.op {
-            syn::BinOp::Add(_) | syn::BinOp::Sub(_) | syn::BinOp::Mul(_) => {
-                value_is_guarded(&b.left, ctx) && value_is_guarded(&b.right, ctx)
+        Expr::Binary(b) => {
+            let (l, r) = (classify(&b.left, ctx), classify(&b.right, ctx));
+            let (lv, rv) = (lit_value(&b.left), lit_value(&b.right));
+            match b.op {
+                syn::BinOp::Add(_) | syn::BinOp::Sub(_) => match (l, r) {
+                    (Unknown, _) | (_, Unknown) | (NotNan, NotNan) => Unknown,
+                    (Finite, Finite) => {
+                        let small = |v: Option<f64>| v.is_some_and(|v| v.abs() <= SAFE_ADDEND);
+                        if small(lv) || small(rv) {
+                            Finite
+                        } else {
+                            NotNan
+                        }
+                    }
+                    _ => NotNan,
+                },
+                syn::BinOp::Mul(_) => {
+                    let unit = |v: Option<f64>| v.is_some_and(|v| v.abs() <= 1.0);
+                    let nonzero = |v: Option<f64>| v.is_some_and(|v| v != 0.0 && v.is_finite());
+                    match (l, r) {
+                        (Unknown, _) | (_, Unknown) => Unknown,
+                        (Finite, Finite) if unit(lv) || unit(rv) => Finite,
+                        (Finite, Finite) => NotNan,
+                        // inf * 0.0 is NaN: a possibly-infinite factor is safe
+                        // only against a nonzero literal.
+                        (NotNan, Finite) if nonzero(rv) => NotNan,
+                        (Finite, NotNan) if nonzero(lv) => NotNan,
+                        _ => Unknown,
+                    }
+                }
+                syn::BinOp::Div(_) => match (l, nonzero_divisor(&b.right, ctx)) {
+                    // finite / nonzero (even infinite) is never NaN.
+                    (Finite, Some(_)) => NotNan,
+                    // inf / finite-nonzero is inf; inf / inf is NaN.
+                    (NotNan, Some(Finite)) => NotNan,
+                    _ => Unknown,
+                },
+                _ => Unknown,
             }
-            syn::BinOp::Div(_) => value_is_guarded(&b.left, ctx) && nonzero_finite(&b.right, ctx),
-            _ => false,
-        },
-        _ => false,
+        }
+        _ => Unknown,
     }
 }
 
-/// A divisor that is finite and provably nonzero: a positive literal,
-/// `c + |x|` / `|x| + c` with `c > 0`, or `x.max(c)` with `c > 0` — each with
-/// `x` itself guarded.
-fn nonzero_finite(e: &Expr, ctx: &FnCtx) -> bool {
+/// `Some(class)` when `e` is provably nonzero (and not NaN): a nonzero literal,
+/// `c + |x|` / `|x| + c` with `c > 0`, or `x.max(c)` with `c > 0`.
+fn nonzero_divisor(e: &Expr, ctx: &FnCtx) -> Option<Class> {
+    let positive = |x: &Expr| lit_value(x).is_some_and(|v| v > 0.0 && v.is_finite());
+    if let Some(v) = lit_value(e) {
+        return (v != 0.0 && v.is_finite()).then_some(Class::Finite);
+    }
+    let class = classify(e, ctx);
+    if class == Class::Unknown {
+        return None;
+    }
     match e {
-        Expr::Paren(p) => nonzero_finite(&p.expr, ctx),
-        _ if positive_lit(e) => true,
+        Expr::Paren(p) => nonzero_divisor(&p.expr, ctx),
         Expr::Binary(b) if matches!(b.op, syn::BinOp::Add(_)) => {
-            (positive_lit(&b.left) && nonneg_guarded(&b.right, ctx))
-                || (positive_lit(&b.right) && nonneg_guarded(&b.left, ctx))
+            ((positive(&b.left) && is_abs(&b.right)) || (positive(&b.right) && is_abs(&b.left)))
+                .then_some(class)
         }
         Expr::MethodCall(m) if m.method == "max" && m.args.len() == 1 => {
-            positive_lit(&m.args[0]) && value_is_guarded(&m.receiver, ctx)
+            positive(&m.args[0]).then_some(class)
         }
-        _ => false,
+        _ => None,
     }
 }
 
-fn nonneg_guarded(e: &Expr, ctx: &FnCtx) -> bool {
+fn is_abs(e: &Expr) -> bool {
     match e {
-        Expr::Paren(p) => nonneg_guarded(&p.expr, ctx),
-        Expr::MethodCall(m) if m.method == "abs" && m.args.is_empty() => {
-            value_is_guarded(&m.receiver, ctx)
-        }
-        _ => false,
-    }
-}
-
-fn positive_lit(e: &Expr) -> bool {
-    let Expr::Lit(l) = e else { return false };
-    match &l.lit {
-        syn::Lit::Float(f) => f
-            .base10_parse::<f64>()
-            .is_ok_and(|v| v > 0.0 && v.is_finite()),
-        syn::Lit::Int(i) => i.base10_parse::<u128>().is_ok_and(|v| v > 0),
+        Expr::Paren(p) => is_abs(&p.expr),
+        Expr::MethodCall(m) => m.method == "abs" && m.args.is_empty(),
         _ => false,
     }
 }
@@ -455,6 +704,7 @@ fn reducer_swallows_nan(r: &Expr) -> bool {
 struct Linter<'a> {
     rel: &'a str,
     lines: Vec<&'a str>,
+    comments: Vec<LineComment>,
     test_depth: usize,
     path: Vec<String>,
     ctx: Vec<FnCtx>,
@@ -473,6 +723,137 @@ enum NanOk {
     Absent,
     Excused,
     MissingReason(usize),
+    MissingColon(usize),
+}
+
+/// The `//` comment on one source line, found by lexing — so `"// nan-ok: x"`
+/// inside a string literal is not a comment — and whether the line holds any
+/// code outside comments.
+#[derive(Default, Clone)]
+struct LineComment {
+    text: Option<String>,
+    has_code: bool,
+}
+
+/// Lex `text` just far enough to find line comments: string, raw-string, byte-
+/// string and char literals are skipped, as are (nested) block comments.
+fn line_comments(text: &str) -> Vec<LineComment> {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = vec![LineComment::default(); text.lines().count() + 1];
+    let (mut i, mut line) = (0usize, 0usize);
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mark = |out: &mut Vec<LineComment>, line: usize| {
+        if let Some(l) = out.get_mut(line) {
+            l.has_code = true;
+        }
+    };
+    while i < c.len() {
+        let ch = c[i];
+        let next = c.get(i + 1).copied();
+        match ch {
+            '\n' => {
+                line += 1;
+                i += 1;
+            }
+            '/' if next == Some('/') => {
+                let start = i + 2;
+                let mut j = start;
+                while j < c.len() && c[j] != '\n' {
+                    j += 1;
+                }
+                if let Some(l) = out.get_mut(line) {
+                    l.text = Some(c[start..j].iter().collect());
+                }
+                i = j;
+            }
+            '/' if next == Some('*') => {
+                let mut depth = 1;
+                i += 2;
+                while i < c.len() && depth > 0 {
+                    if c[i] == '\n' {
+                        line += 1;
+                    } else if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 1;
+                    } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            'r' if (i == 0
+                || !ident(c[i - 1])
+                || (c[i - 1] == 'b' && (i < 2 || !ident(c[i - 2]))))
+                && matches!(next, Some('"') | Some('#')) =>
+            {
+                // A raw string `r"…"` / `r#"…"#` (or `br…`); `r#ident` is not one.
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while c.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if c.get(j) != Some(&'"') {
+                    mark(&mut out, line);
+                    i += 1;
+                    continue;
+                }
+                mark(&mut out, line);
+                j += 1;
+                loop {
+                    match c.get(j) {
+                        None => break,
+                        Some('\n') => line += 1,
+                        Some('"') if (1..=hashes).all(|k| c.get(j + k) == Some(&'#')) => {
+                            j += 1 + hashes;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    mark(&mut out, line);
+                    j += 1;
+                }
+                i = j;
+            }
+            '"' => {
+                mark(&mut out, line);
+                i += 1;
+                while i < c.len() && c[i] != '"' {
+                    if c[i] == '\\' {
+                        i += 1;
+                    }
+                    if c.get(i) == Some(&'\n') {
+                        line += 1;
+                    }
+                    mark(&mut out, line);
+                    i += 1;
+                }
+                i += 1;
+            }
+            '\'' => {
+                mark(&mut out, line);
+                // A char literal `'x'` / `'\n'`, or else a lifetime `'a`.
+                if next == Some('\\') {
+                    i += 2;
+                    while i < c.len() && c[i] != '\'' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if c.get(i + 2) == Some(&'\'') {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            ch if ch.is_whitespace() => i += 1,
+            _ => {
+                mark(&mut out, line);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 impl Linter<'_> {
@@ -488,34 +869,32 @@ impl Linter<'_> {
         }
     }
 
-    /// `// nan-ok: <reason>` on a line of `[first, last]`, or alone on the line above.
+    /// `// nan-ok: <reason>` on a line of `[first, last]`, or alone on the line
+    /// above. Only a real comment counts (see [`line_comments`]), and only with
+    /// the exact `nan-ok:` marker.
     fn nan_ok(&self, first: usize, last: usize) -> NanOk {
-        let comment_reason = |line: &str| -> Option<String> {
-            let at = line.find("//")?;
-            let rest = line[at + 2..].trim_start();
-            let rest = rest.strip_prefix("nan-ok")?;
-            let rest = rest.trim_start().strip_prefix(':').unwrap_or(rest);
-            Some(rest.trim().to_string())
-        };
+        let comment = |n: usize| self.comments.get(n.wrapping_sub(1));
         let mut candidates: Vec<usize> = (first..=last).collect();
-        if first > 1 {
-            let above = self.lines.get(first - 2).copied().unwrap_or_default();
-            if above.trim_start().starts_with("//") {
-                candidates.push(first - 1);
-            }
+        if first > 1 && comment(first - 1).is_some_and(|c| c.text.is_some() && !c.has_code) {
+            candidates.push(first - 1);
         }
-        let mut missing = None;
+        let mut problem = NanOk::Absent;
         for n in candidates {
-            let Some(line) = self.lines.get(n - 1) else {
+            let Some(text) = comment(n).and_then(|c| c.text.as_deref()) else {
                 continue;
             };
-            match comment_reason(line) {
-                Some(reason) if !reason.is_empty() => return NanOk::Excused,
-                Some(_) => missing = Some(n),
-                None => {}
+            // `/// nan-ok:` and `//! nan-ok:` too.
+            let body = text.trim_start_matches(['/', '!']).trim_start();
+            let Some(rest) = body.strip_prefix("nan-ok") else {
+                continue;
+            };
+            match rest.strip_prefix(':') {
+                Some(reason) if !reason.trim().is_empty() => return NanOk::Excused,
+                Some(_) => problem = NanOk::MissingReason(n),
+                None => problem = NanOk::MissingColon(n),
             }
         }
-        missing.map_or(NanOk::Absent, NanOk::MissingReason)
+        problem
     }
 
     fn guarded(&self, guard: &Guard) -> bool {
@@ -525,8 +904,8 @@ impl Linter<'_> {
         match guard {
             // EVERY operand must be asserted finite itself: `w.max(a).max(b)`
             // with only `a` asserted still swallows a NaN `b`.
-            Guard::Values(ops) => ops.iter().all(|e| value_is_guarded(e, ctx)),
-            Guard::Chain(c) => ctx.finite_chains.contains(&chain_key(c)),
+            Guard::Values(ops) => ops.iter().all(|e| classify(e, ctx) != Class::Unknown),
+            Guard::Chain(c) => ctx.has(true, &chain_key(c)),
         }
     }
 
@@ -548,6 +927,9 @@ impl Linter<'_> {
             NanOk::Absent => String::new(),
             NanOk::MissingReason(n) => {
                 format!(" (the `// nan-ok` on line {n} has no reason after the colon, so it excuses nothing)")
+            }
+            NanOk::MissingColon(n) => {
+                format!(" (the `// nan-ok` on line {n} lacks the `nan-ok:` colon, so it excuses nothing)")
             }
         };
         let snippet = self
@@ -639,6 +1021,40 @@ impl Linter<'_> {
         }
     }
 
+    fn push_scope(&mut self, masked: BTreeSet<String>) {
+        if let Some(ctx) = self.ctx.last_mut() {
+            ctx.scopes.push(Scope {
+                facts: Vec::new(),
+                masked,
+            });
+        }
+    }
+
+    fn pop_scope(&mut self) {
+        if let Some(ctx) = self.ctx.last_mut() {
+            ctx.scopes.pop();
+        }
+    }
+
+    fn after_stmt(&mut self, stmt: &syn::Stmt) {
+        let Some(ctx) = self.ctx.last_mut() else {
+            return;
+        };
+        ctx.invalidate(&mutated_roots(|v| v.visit_stmt(stmt)));
+        let mac = match stmt {
+            syn::Stmt::Local(l) => {
+                ctx.shadow(pat_bindings(&l.pat));
+                None
+            }
+            syn::Stmt::Macro(m) => Some(&m.mac),
+            syn::Stmt::Expr(Expr::Macro(m), _) => Some(&m.mac),
+            _ => None,
+        };
+        if let (Some(mac), Some(scope)) = (mac, ctx.scopes.last_mut()) {
+            scope.facts.extend(assert_facts(mac));
+        }
+    }
+
     fn leave(&mut self, was_test: bool) {
         self.path.pop();
         if was_test {
@@ -692,6 +1108,69 @@ impl<'ast> Visit<'ast> for Linter<'_> {
         visit::visit_trait_item_fn(self, i);
         self.ctx.pop();
         self.leave(t);
+    }
+
+    /// Statements in order, each followed by its effect on the guard facts:
+    /// writes invalidate, `let` shadows, and an assert adds what it proves —
+    /// for the rest of THIS block only.
+    fn visit_block(&mut self, b: &'ast syn::Block) {
+        if !self.in_test() || self.ctx.is_empty() {
+            return visit::visit_block(self, b);
+        }
+        self.push_scope(BTreeSet::new());
+        for stmt in &b.stmts {
+            self.visit_stmt(stmt);
+            self.after_stmt(stmt);
+        }
+        self.pop_scope();
+    }
+
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        let params = c.inputs.iter().flat_map(pat_bindings).collect();
+        self.push_scope(params);
+        visit::visit_expr_closure(self, c);
+        self.pop_scope();
+    }
+
+    /// A loop body runs again after its own writes, so facts from outside about
+    /// anything the body writes — or the loop pattern binds — do not hold in it.
+    fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
+        self.visit_expr(&f.expr);
+        let mut masked = pat_bindings(&f.pat);
+        masked.extend(mutated_roots(|v| v.visit_block(&f.body)));
+        self.push_scope(masked);
+        self.visit_block(&f.body);
+        self.pop_scope();
+    }
+
+    fn visit_expr_while(&mut self, w: &'ast syn::ExprWhile) {
+        let mut masked = mutated_roots(|v| v.visit_block(&w.body));
+        masked.extend(let_bindings(&w.cond));
+        masked.extend(mutated_roots(|v| v.visit_expr(&w.cond)));
+        self.push_scope(masked);
+        self.visit_expr(&w.cond);
+        self.visit_block(&w.body);
+        self.pop_scope();
+    }
+
+    fn visit_expr_loop(&mut self, l: &'ast syn::ExprLoop) {
+        let masked = mutated_roots(|v| v.visit_block(&l.body));
+        self.push_scope(masked);
+        self.visit_block(&l.body);
+        self.pop_scope();
+    }
+
+    fn visit_expr_if(&mut self, i: &'ast syn::ExprIf) {
+        let masked = let_bindings(&i.cond);
+        self.push_scope(masked);
+        visit::visit_expr_if(self, i);
+        self.pop_scope();
+    }
+
+    fn visit_arm(&mut self, a: &'ast syn::Arm) {
+        self.push_scope(pat_bindings(&a.pat));
+        visit::visit_arm(self, a);
+        self.pop_scope();
     }
 
     fn visit_expr(&mut self, e: &'ast Expr) {

@@ -52,18 +52,31 @@ integer literal. A `fold` whose initial value is an integer literal also counts.
 ## Escape hatches
 
 1. **Assert the folded value is finite.** Put an `assert!` (or
-   `debug_assert!`, `prop_assert!`) in the same function whose condition
+   `debug_assert!`, `prop_assert!`) *before* the fold whose condition
    *guarantees* the value the fold reads. Only positive conjuncts count: in
    `assert!(a.is_finite() && b.is_finite())` both are guaranteed, while
    `!x.is_finite()`, `x.is_finite() || y` and `assert_eq!(x.is_finite(), …)`
    guarantee nothing.
 
-   - An accumulator operand is guarded when it is the asserted expression
-     itself, or is built from asserted values and literals with operations that
-     cannot make a `NaN` from finite inputs: `-x`, `+`, `-`, `*`, `.abs()`,
-     `.max`/`.min`, and `/` only by a provably nonzero divisor (`1.0 + x.abs()`,
-     `x.abs().max(1e-12)`), because `0.0 / 0.0` is `NaN`. Anything else, such as
-     a call, `sqrt`, `ln` or an unasserted field, is unguarded.
+   - **Where it holds.** The assert has to *dominate* the fold. It must be an
+     earlier statement of the same block, or of a block that encloses the fold.
+     `if check { assert!(e.is_finite()); }` guards nothing after the `if`, and
+     an assert after the fold guards nothing. The guarantee is dropped when the
+     value is written: an assignment, `+=`, `&mut e`, or a call of a method that
+     might mutate it, such as `xs.push(…)`. It also lapses inside a loop body
+     that writes the value, because the next iteration runs after the write. It
+     doesn't reach code where the name is rebound: a `let e`, a closure
+     parameter `|e|`, or a `for e` / `match` / `if let` pattern.
+   - **What it proves.** An accumulator operand is guarded when it is the
+     asserted expression itself, or is built from asserted values and literals
+     so that no `NaN` can come out. Finite inputs can still overflow to
+     infinity, and two infinities can make a `NaN` (`inf - inf`, `inf * 0.0`,
+     `inf / inf`). So the lint tracks which intermediates might be infinite.
+     `(a - b).abs()`, `a * b + 1.0` and `(a - b).abs() / (1.0 + b.abs())` pass.
+     `(a * b) * 0.0` and `a * b - a * b` don't. Division needs a divisor that is
+     provably nonzero: a nonzero literal, `c + x.abs()` or `x.max(c)` with
+     `c > 0`, because `0.0 / 0.0` is `NaN`. Anything else, such as a call,
+     `sqrt`, `ln` or an unasserted field, is unguarded.
    - A `.fold`/`.reduce` is guarded by `C.all(|e| e.is_finite())` or
      `C.all(f64::is_finite)` over the **same** iterator chain `C` it folds.
      Element-preserving `iter`/`into_iter`/`cloned`/`copied` are ignored, but a
@@ -87,8 +100,10 @@ integer literal. A `fold` whose initial value is an integer literal also counts.
    (2).
 
 2. **`// nan-ok: <reason>`** on any line of the flagged expression, or alone on
-   the line directly above it. The reason is required, because a bare
-   `// nan-ok:` excuses nothing:
+   the line directly above it. It has to be a real `//` comment, so the same
+   text inside a string literal doesn't count. The marker has to be exactly
+   `nan-ok:` with the colon, and the reason is required. A bare `// nan-ok:` or
+   `// nan-ok reason` excuses nothing:
 
    ```rust
    hi = hi.max(t); // nan-ok: t is a dataset TIME, validated finite by the reader
@@ -102,7 +117,7 @@ there is nothing to assert.
 
 ## The baseline
 
-The sites that predate the rule (447, in 323 functions, when it landed) are
+The sites that predate the rule (448, in 324 functions, when it landed) are
 recorded per function in
 [`baseline.txt`](baseline.txt). The ratchet works like `docs/.lint-baseline`:
 
