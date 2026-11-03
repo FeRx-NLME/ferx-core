@@ -37,7 +37,8 @@ compares against the previous nightly, which ties a change to one day's merges.
 For every model that changed, a collapsible block lists each parameter that
 moved.
 
-A `NaN` anywhere counts as a change. The report never folds a `NaN` away the
+A `NaN` anywhere counts as a change, even when the release had `NaN` in the
+same place. The report never folds a `NaN` away the
 way `max` would (see AGENTS.md on `f64::max`). A row whose model or data file
 differs from the release's copy is marked as such, so an edited example does not
 read as engine drift. All fits run single-threaded (`RAYON_NUM_THREADS=1`).
@@ -79,20 +80,31 @@ headroom of 2. It is relative for estimates and SEs and absolute for OFV and
 iterations. If the spread of a quantity is exactly zero, the band falls back to
 a floor (1e-6 relative, 1e-3 OFV, 2 iterations), because a band of 0 would fail
 on the last bit. The floors are a choice, not a measurement, and `bands.json`
-records them. `bands` refuses to run on fewer than 30 nightlies.
+records them. `bands` refuses to run on fewer than 30 nightlies. A quantity
+that went `NaN` during the window gets a `NaN` band. The report treats a
+non-finite band as missing, so the quantity fails until the bands are
+re-measured.
 
 ### An intentional change
 
 When a pull request moves a golden model on purpose (a new default, or a fixed
-likelihood), add an entry for the model under `accepted` in `bands.json`, with
-the reason and the PR:
+likelihood), dispatch the workflow on the branch, download its
+`golden-fits-results` artifact, and pin the model's new state together with the
+reason and the PR:
 
-```json
-"accepted": { "warfarin_saem": { "reason": "#1234: SAEM burn-in default 150 → 200" } }
+```bash
+python3 tools/golden-fits/golden.py accept warfarin_saem --head head.json \
+  --reason "#1234: SAEM burn-in default 150 → 200"
 ```
 
-The row still shows its change, marked `✔︎`, but it does not fail the job. At
-each release the baseline absorbs the change, so clear `accepted` then. The
+This writes an entry under `accepted` in `bands.json` that holds the model's
+OFV, iterations, estimates and SEs at that point. The model is **not exempted**.
+From then on it is banded against the accepted state instead of the release. The
+row still shows its change against the release, marked `✔︎`, but a later,
+unrelated drift away from the accepted state fails the job as usual (`🔺`). An
+entry without a pinned state also fails the job.
+
+At each release the baseline absorbs the change, so clear `accepted` then. The
 `accepted` entries for a release are also its list of "estimates changed for
 model X" lines for the release notes.
 

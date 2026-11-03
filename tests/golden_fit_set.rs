@@ -117,25 +117,48 @@ fn report(
     bands: Option<&str>,
     today: &str,
 ) -> (Output, String) {
+    report_recs(
+        slot,
+        model_rec("1234.5", 20, &BASE_PARAMS),
+        model_rec(head_ofv, 20, head_params),
+        bands.map(|b| (b, None)),
+        today,
+    )
+}
+
+/// `report` over arbitrary `warfarin` records. `bands` is the bands.json body and,
+/// optionally, `(head results, reason)` to pin with `golden.py accept` first — the
+/// real path a contributor takes, so the test exercises what `accept` writes.
+fn report_recs(
+    slot: &str,
+    base_rec: String,
+    head_rec: String,
+    bands: Option<(&str, Option<(String, &str)>)>,
+    today: &str,
+) -> (Output, String) {
     let dir = scratch(slot);
     let base = write(
         &dir,
         "base.json",
-        &results(
-            "v0.4.0",
-            &[("warfarin", model_rec("1234.5", 20, &BASE_PARAMS))],
-        ),
+        &results("v0.4.0", &[("warfarin", base_rec)]),
     );
     let head = write(
         &dir,
         "head.json",
-        &results(
-            "main@abc",
-            &[("warfarin", model_rec(head_ofv, 20, head_params))],
-        ),
+        &results("main@abc", &[("warfarin", head_rec)]),
     );
     let bands_path = match bands {
-        Some(b) => write(&dir, "bands.json", b),
+        Some((b, accept)) => {
+            let path = write(&dir, "bands.json", b);
+            if let Some((accepted_results, reason)) = accept {
+                let acc = write(&dir, "accepted.json", &accepted_results);
+                let out = golden(&[
+                    "accept", "warfarin", "--head", &acc, "--reason", reason, "--bands", &path,
+                ]);
+                assert!(out.status.success(), "accept: {}", text(&out));
+            }
+            path
+        }
         None => dir.join("no-bands.json").to_string_lossy().into_owned(),
     };
     let summary = dir.join("summary.md");
@@ -301,14 +324,9 @@ fn report_only_ends_on_the_date_and_a_missing_bands_file_fails() {
     );
 }
 
-fn bands(cl_band: f64, accepted: bool) -> String {
-    let acc = if accepted {
-        r##"{"warfarin": {"reason": "#9999 deliberate"}}"##
-    } else {
-        "{}"
-    };
+fn bands(cl_band: f64) -> String {
     format!(
-        r#"{{"n_nightlies": 30, "accepted": {acc}, "models": {{"warfarin": {{
+        r#"{{"n_nightlies": 30, "accepted": {{}}, "models": {{"warfarin": {{
             "ofv": 0.001, "n_iterations": 2,
             "est": {{"theta:CL": {cl_band:e}, "theta:V": 1e-6, "omega:ETA_CL": 1e-6}},
             "se": {{"theta:CL": 1e-6, "theta:V": 1e-6, "omega:ETA_CL": 1e-6}}}}}}}}"#
@@ -324,7 +342,7 @@ fn fail_on_band_straddles_the_band_and_honours_accepted() {
         "in-band",
         "1234.5",
         &perturbed_cl(),
-        Some(&bands(0.02, false)),
+        Some(&bands(0.02)),
         &date,
     );
     assert!(out.status.success(), "1% inside a 2% band must pass:\n{md}");
@@ -334,7 +352,7 @@ fn fail_on_band_straddles_the_band_and_honours_accepted() {
         "out-band",
         "1234.5",
         &perturbed_cl(),
-        Some(&bands(0.005, false)),
+        Some(&bands(0.005)),
         &date,
     );
     assert!(
@@ -351,11 +369,18 @@ fn fail_on_band_straddles_the_band_and_honours_accepted() {
         "only the quantity that moved fails:\n{md}"
     );
 
-    let (out, md) = report(
+    // Accepted at exactly this state: outside the band vs the release, yet green.
+    let state = || {
+        results(
+            "pr",
+            &[("warfarin", model_rec("1234.5", 20, &perturbed_cl()))],
+        )
+    };
+    let (out, md) = report_recs(
         "accepted",
-        "1234.5",
-        &perturbed_cl(),
-        Some(&bands(0.005, true)),
+        model_rec("1234.5", 20, &BASE_PARAMS),
+        model_rec("1234.5", 20, &perturbed_cl()),
+        Some((&bands(0.005), Some((state(), "#9999 deliberate")))),
         &date,
     );
     assert!(
@@ -364,6 +389,46 @@ fn fail_on_band_straddles_the_band_and_honours_accepted() {
     );
     assert!(warfarin_row(&md).starts_with("| ✔︎ |"), "{md}");
     assert!(md.contains("#9999 deliberate"), "{md}");
+
+    // Accepted, then drifts again on an UNRELATED quantity: the acceptance pins a state,
+    // it does not exempt the model, so this must fail and name the new drift.
+    let mut drifted = perturbed_cl();
+    drifted[1].1 *= 1.01;
+    let (out, md) = report_recs(
+        "accepted-drift",
+        model_rec("1234.5", 20, &BASE_PARAMS),
+        model_rec("1234.5", 20, &drifted),
+        Some((&bands(0.005), Some((state(), "#9999 deliberate")))),
+        &date,
+    );
+    assert!(
+        !out.status.success(),
+        "drift after acceptance must fail:\n{md}"
+    );
+    assert!(warfarin_row(&md).starts_with("| 🔺 |"), "{md}");
+    assert!(
+        md.contains("- warfarin: drifted from its accepted state: est(theta:V): 0.01 > band 1e-06"),
+        "{md}"
+    );
+    assert!(
+        !md.contains("accepted state: est(theta:CL)"),
+        "the accepted θ_CL move is not a drift from the accepted state:\n{md}"
+    );
+
+    // An entry with no pinned state (the old, exempt-everything shape) fails.
+    let b = bands(0.005).replace(
+        r#""accepted": {}"#,
+        r##""accepted": {"warfarin": {"reason": "#9999 deliberate"}}"##,
+    );
+    let (out, md) = report(
+        "accepted-no-state",
+        "1234.5",
+        &perturbed_cl(),
+        Some(&b),
+        &date,
+    );
+    assert!(!out.status.success(), "{md}");
+    assert!(md.contains("accepted entry pins no state"), "{md}");
 }
 
 /// In fail-on-band mode a NaN estimate fails even inside a generous band: `NaN > tol`
@@ -373,7 +438,7 @@ fn fail_on_band_fails_a_nan_estimate() {
     let date = fail_date();
     let mut p = BASE_PARAMS.to_vec();
     p[1].1 = f64::NAN;
-    let (out, md) = report("nan-band", "1234.5", &p, Some(&bands(0.02, false)), &date);
+    let (out, md) = report("nan-band", "1234.5", &p, Some(&bands(0.02)), &date);
     assert!(
         !out.status.success(),
         "a NaN θ must fail in band mode:\n{md}"
@@ -400,7 +465,7 @@ fn a_fit_that_broke_since_the_release_fails_the_band_mode() {
             "head.json",
             &results("h", &[("warfarin", failed.to_string())]),
         );
-        let bands_path = write(&dir, "bands.json", &bands(0.02, false));
+        let bands_path = write(&dir, "bands.json", &bands(0.02));
         let out = golden(&[
             "report",
             "--head",
@@ -423,12 +488,68 @@ fn a_fit_that_broke_since_the_release_fails_the_band_mode() {
     }
 }
 
+/// A NaN band — what `bands` writes for a quantity that went NaN in its window — is
+/// no band: `v > NaN` is false for every v, so it must not let a finite drift pass.
+#[test]
+fn a_non_finite_band_is_no_band() {
+    let date = fail_date();
+    let b = bands(0.02).replace(r#""theta:CL": 2e-2"#, r#""theta:CL": NaN"#);
+    assert!(b.contains(r#""theta:CL": NaN"#), "{b}");
+    let (out, md) = report("nan-tol", "1234.5", &perturbed_cl(), Some(&b), &date);
+    assert!(
+        !out.status.success(),
+        "a finite drift against a NaN band must fail:\n{md}"
+    );
+    assert!(md.contains("est(theta:CL): band is not finite"), "{md}");
+    // Twin: the same drift against the finite 2% band passes (straddle).
+    let (out, _) = report(
+        "nan-tol-twin",
+        "1234.5",
+        &perturbed_cl(),
+        Some(&bands(0.02)),
+        &date,
+    );
+    assert!(out.status.success());
+}
+
+/// NaN at the release AND at head is still NaN, not "unchanged": a quantity that has
+/// been NaN since the release must not read as a stable pass.
+#[test]
+fn nan_on_both_sides_is_a_change_and_fails_the_band_mode() {
+    let date = fail_date();
+    let mut p = BASE_PARAMS.to_vec();
+    p[1].1 = f64::NAN;
+    let (out, md) = report_recs(
+        "nan-both",
+        model_rec("NaN", 20, &p),
+        model_rec("NaN", 20, &p),
+        Some((&bands(0.02), None)),
+        &date,
+    );
+    assert!(!out.status.success(), "{md}");
+    assert!(md.contains("OFV: nan > band"), "{md}");
+    assert!(md.contains("est(theta:V): nan > band"), "{md}");
+    let (out, md) = report_recs(
+        "nan-both-report-only",
+        model_rec("1.0", 20, &p),
+        model_rec("1.0", 20, &p),
+        None,
+        BEFORE,
+    );
+    assert!(out.status.success());
+    let row = warfarin_row(&md);
+    assert!(
+        row.starts_with("| ≠ |") && row.contains("**NaN** `theta:V`"),
+        "{row}"
+    );
+}
+
 /// A parameter with no measured band fails rather than being skipped: a new θ must
 /// force a re-measure, not slip through.
 #[test]
 fn a_quantity_without_a_band_is_out_of_band() {
     let date = fail_date();
-    let b = bands(0.02, false).replace(r#""theta:V": 1e-6, "omega"#, r#""omega"#);
+    let b = bands(0.02).replace(r#""theta:V": 1e-6, "omega"#, r#""omega"#);
     let (out, md) = report("unbanded", "1234.5", &BASE_PARAMS, Some(&b), &date);
     assert!(!out.status.success(), "{md}");
     assert!(md.contains("est(theta:V): no measured band"), "{md}");

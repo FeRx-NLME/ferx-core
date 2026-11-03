@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Golden fit set: fit the reference models, diff against the last release (#2635).
 
-Three subcommands, all stdlib-only so the workflow needs no `pip install`:
+Four subcommands, all stdlib-only so the workflow needs no `pip install`:
 
   run     fit every model in models.tsv with one `ferx` binary and write results.json
   report  diff a head results.json against a base (the last release) and, optionally,
           the previous nightly; write the Markdown table for the job summary
   bands   measure the per-model, per-quantity spread from a set of nightly results.json
           files and write bands.json, the input of the fail-on-band mode
+  accept  pin one model's head state in bands.json as an intentional change
 
 The workflow (.github/workflows/golden-fits.yml) runs `run` twice — once with the
 release tag's binary on the release tag's tree, once with HEAD's — then `report`.
@@ -238,18 +239,20 @@ def load(path: str | None) -> dict | None:
 
 def rel(h: float, b: float) -> float:
     """|h − b| / |b|: a 1% move reads 1.00e-02 and a 10× move reads 9. A base of
-    exactly 0 falls back to the head's magnitude. NaN on either side is NaN — never
-    folded away, so a fit that started returning NaN is a change, not a pass."""
+    exactly 0 falls back to the head's magnitude. NaN on EITHER side — including
+    both — is NaN: never folded away, so a fit returning NaN is never a pass, even
+    when the release returned NaN too."""
     if math.isnan(h) or math.isnan(b):
-        return float("nan") if not (math.isnan(h) and math.isnan(b)) else 0.0
+        return float("nan")
     if h == b:
         return 0.0
     return abs(h - b) / (abs(b) if b != 0.0 else abs(h))
 
 
 def absd(h: float, b: float) -> float:
+    """|h − b|; NaN when either side is NaN, as in `rel`."""
     if math.isnan(h) or math.isnan(b):
-        return float("nan") if not (math.isnan(h) and math.isnan(b)) else 0.0
+        return float("nan")
     return abs(h - b)
 
 
@@ -333,8 +336,11 @@ def out_of_band(model_id: str, d: dict, bands: dict) -> list[str]:
     bad = []
 
     def check(name, v, tol):
-        if tol is None:
-            bad.append(f"{name}: no measured band")
+        # `bands` writes NaN for a quantity that went NaN in its window, and
+        # `v > NaN` is false for every v — so a non-finite band is no band.
+        if tol is None or not math.isfinite(float(tol)):
+            bad.append(f"{name}: no measured band" if tol is None
+                       else f"{name}: band is not finite ({tol}) — re-measure")
         elif math.isnan(v) or v > tol:
             bad.append(f"{name}: {v:.3g} > band {tol:.3g}")
 
@@ -345,6 +351,17 @@ def out_of_band(model_id: str, d: dict, bands: dict) -> list[str]:
             check(f"{kind}({k})", v, b.get(kind, {}).get(k))
     bad.extend(f"structure: {s}" for s in d["structure"])
     return bad
+
+
+def accepted_drift(mid: str, h: dict, entry: dict, bands: dict) -> list[str]:
+    """An accepted model is banded against the state it was ACCEPTED at, not exempted:
+    a later, unrelated drift on the same model must still fail. An entry that pins no
+    state is itself a failure — there is nothing to hold the model to."""
+    state = entry.get("state") if isinstance(entry, dict) else None
+    if not isinstance(state, dict) or "params" not in state or "ofv" not in state:
+        return ["accepted entry pins no state — record it with `golden.py accept`"]
+    pinned = dict(state, ofv=num(state["ofv"]))
+    return out_of_band(mid, compare(h, pinned), bands)
 
 
 def cmd_report(a) -> int:
@@ -400,8 +417,11 @@ def cmd_report(a) -> int:
             lines.append(f"| 🆕 | `{mid}` | {fam} | {ofv} | {why} | | | {iters} | "
                          f"{signed_ofv(h['ofv'], p['ofv']) if p and p.get('status') == 'ok' else ''}"
                          f" | {h.get('wall_s', '')} |")
-            if fail_mode and bands is not None and mid not in accepted:
-                failures.append(f"{mid}: no release baseline to band against ({why})")
+            if fail_mode and bands is not None:
+                if mid not in accepted:
+                    failures.append(f"{mid}: no release baseline to band against ({why})")
+                elif bad := accepted_drift(mid, h, accepted[mid], bands):
+                    failures.append(f"{mid}: drifted from its accepted state: " + "; ".join(bad))
             continue
         d = compare(h, b)
         glyph = "≠" if changed(d) else "="
@@ -410,8 +430,12 @@ def cmd_report(a) -> int:
         oob = []
         if fail_mode and bands is not None:
             oob = out_of_band(mid, d, bands)
-            if oob and mid in accepted:
-                glyph = "✔︎"  # outside the band, but accepted in bands.json
+            drift = accepted_drift(mid, h, accepted[mid], bands) if mid in accepted else []
+            if drift:
+                glyph = "🔺"
+                failures.append(f"{mid}: drifted from its accepted state: " + "; ".join(drift))
+            elif oob and mid in accepted:
+                glyph = "✔︎"  # outside the band vs the release, at its accepted state
             elif oob:
                 glyph = "🔺"
                 failures.append(f"{mid}: " + "; ".join(oob))
@@ -437,7 +461,7 @@ def cmd_report(a) -> int:
     if failures:
         lines += ["", "### Failing", ""] + [f"- {f}" for f in failures]
     lines += ["", "Legend: `=` unchanged · `≠` changed (report-only) · `🔺` outside the measured "
-              "band · `✔︎` outside the band but accepted in bands.json · `🆕` no release value · "
+              "band · `✔︎` outside the band, at the state accepted in bands.json · `🆕` no release value · "
               "`❌` fit failed or OFV not finite."]
 
     text = "\n".join(lines) + "\n"
@@ -532,6 +556,24 @@ def cmd_bands(a) -> int:
     return 0
 
 
+def cmd_accept(a) -> int:
+    """Record `id`'s head state as an intentional change in bands.json."""
+    head = load(a.head)
+    rec = (head or {}).get("models", {}).get(a.id)
+    if rec is None or rec.get("status") != "ok":
+        raise SystemExit(f"{a.id}: no ok record in {a.head} to accept")
+    bands = load(a.bands)
+    if bands is None:
+        raise SystemExit(f"no bands file at {a.bands}: accept pins a state against bands")
+    state = {k: rec[k] for k in ("ofv", "n_iterations", "converged",
+                                 "covariance_status", "params")}
+    bands.setdefault("accepted", {})[a.id] = {
+        "reason": a.reason, "label": head.get("label"), "state": state}
+    Path(a.bands).write_text(json.dumps(bands, indent=1, sort_keys=True) + "\n")
+    print(f"[accept] {a.id} pinned at {head.get('label')} OFV {num(rec['ofv']):.6f}")
+    return 0
+
+
 def main(argv=None) -> int:
     here = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -562,6 +604,13 @@ def main(argv=None) -> int:
     b.add_argument("--headroom", type=float, default=DEFAULT_HEADROOM)
     b.add_argument("--min-nightlies", type=int, default=DEFAULT_MIN_NIGHTLIES)
     b.set_defaults(fn=cmd_bands)
+
+    c = sub.add_parser("accept", help="pin a model's head state as an intentional change")
+    c.add_argument("id")
+    c.add_argument("--head", required=True, help="results.json holding the accepted state")
+    c.add_argument("--reason", required=True, help="issue/PR and what changed")
+    c.add_argument("--bands", default=str(here / "bands.json"))
+    c.set_defaults(fn=cmd_accept)
 
     a = ap.parse_args(argv)
     return a.fn(a)
