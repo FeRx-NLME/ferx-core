@@ -95,10 +95,54 @@ fn an_is_finite_assert_on_the_operand_is_an_escape_hatch() {
     assert!(findings(&guarded).is_empty());
     let guarded = t("assert!(errs.iter().copied().all(f64::is_finite));\nlet m = errs.iter().cloned().fold(0.0, f64::max);");
     assert!(findings(&guarded).is_empty());
-    // A field operand is guarded through its base.
-    let guarded =
-        t("for r in rows { assert!(r.got.is_finite()); w = w.max((r.got - r.want).abs()); }");
-    assert!(findings(&guarded).is_empty());
+    // An operand composed of asserted values by NaN-free arithmetic.
+    for body in [
+        "assert!(a.is_finite() && b.is_finite()); w = w.max((a - b).abs());",
+        "assert!(r.got.is_finite() && r.want.is_finite()); w = w.max((r.got - r.want).abs());",
+        "assert!(g.is_finite() && fd.is_finite()); w = w.max((g - fd).abs() / (1.0 + fd.abs()));",
+        "assert!(g.is_finite() && fd.is_finite()); w = w.max((g - fd).abs() / fd.abs().max(1e-12));",
+        "assert!((got - want).is_finite()); w = w.max((got - want).abs());",
+        "assert!(f64::is_finite(rel)); w = w.max(rel);",
+        "assert!((e.is_finite())); w = w.max(-e * 2.0);",
+        "assert!(a.is_finite() && b.is_finite()); w = w.max(a).max(b);",
+        "assert!(errs.iter().all(|&e| e.is_finite())); let m = errs.iter().copied().fold(0.0, f64::max);",
+        "assert!(xs.iter().map(|r| r.v).all(|v| v.is_finite())); let m = xs.iter().map(|r| r.v).fold(0.0, f64::max);",
+    ] {
+        assert!(findings(&t(body)).is_empty(), "flagged although guarded: {body}");
+    }
+
+    // Review round 1 (#2634): the guard must cover the VALUE that is folded, not
+    // merely share a name with it, and must be asserted with positive polarity.
+    for body in [
+        // Only one side of the difference is asserted: `r.want = NaN` still vanishes.
+        "for r in rows { assert!(r.got.is_finite()); w = w.max((r.got - r.want).abs()); }",
+        "assert!(ferx.is_finite()); w = w.max((ferx - reference).abs());",
+        // Negated: the assert guarantees the operand is NOT finite.
+        "assert!(!err.is_finite()); w = w.max(err);",
+        "assert!(!(err.is_finite())); w = w.max(err);",
+        // A disjunction guarantees neither side.
+        "assert!(err.is_finite() || other); w = w.max(err);",
+        // `is_finite` buried in a non-conjunct expression.
+        "assert!(err.is_finite() == flag); w = w.max(err);",
+        // `assert_eq!(x.is_finite(), false)` is not an assert-on-the-condition.
+        "assert_eq!(err.is_finite(), false); w = w.max(err);",
+        // Division by a value that may be zero: 0/0 is NaN from finite inputs.
+        "assert!(a.is_finite() && b.is_finite()); w = w.max(a / b);",
+        // `sqrt` can make NaN from a finite negative.
+        "assert!(a.is_finite()); w = w.max(a.sqrt());",
+        // A chain with one operand unguarded.
+        "assert!(a.is_finite()); w = w.max(a).max(b);",
+        // The collection guard must check the same elements the fold reads.
+        "assert!(xs.iter().all(|e| e.is_finite())); let m = xs.iter().map(|r| r.v).fold(0.0, f64::max);",
+        "assert!(ys.iter().all(|e| e.is_finite())); let m = xs.iter().cloned().fold(0.0, f64::max);",
+        // A predicate that checks something other than its parameter.
+        "assert!(xs.iter().all(|e| other.is_finite())); let m = xs.iter().cloned().fold(0.0, f64::max);",
+        "assert!(xs.iter().all(|e| !e.is_finite())); let m = xs.iter().cloned().fold(0.0, f64::max);",
+        // `any` is not `all`.
+        "assert!(xs.iter().any(|e| e.is_finite())); let m = xs.iter().cloned().fold(0.0, f64::max);",
+    ] {
+        assert_eq!(findings(&t(body)).len(), 1, "not flagged although unguarded: {body}");
+    }
 
     // The assert must name the operand: asserting the ACCUMULATOR finite is no
     // guard at all — `max` already threw the NaN away.

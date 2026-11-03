@@ -51,13 +51,27 @@ integer literal. A `fold` whose initial value is an integer literal also counts.
 
 ## Escape hatches
 
-1. **Assert the operand is finite.** Put an assert-family macro (`assert!`,
-   `assert_eq!`, `debug_assert!`, `prop_assert!`, …) in the same function. Its
-   arguments must call `is_finite` and name an identifier of the folded operand:
+1. **Assert the folded value is finite.** Put an `assert!` (or
+   `debug_assert!`, `prop_assert!`) in the same function whose condition
+   *guarantees* the value the fold reads. Only positive conjuncts count: in
+   `assert!(a.is_finite() && b.is_finite())` both are guaranteed, while
+   `!x.is_finite()`, `x.is_finite() || y` and `assert_eq!(x.is_finite(), …)`
+   guarantee nothing.
+
+   - An accumulator operand is guarded when it is the asserted expression
+     itself, or is built from asserted values and literals with operations that
+     cannot make a `NaN` from finite inputs: `-x`, `+`, `-`, `*`, `.abs()`,
+     `.max`/`.min`, and `/` only by a provably nonzero divisor (`1.0 + x.abs()`,
+     `x.abs().max(1e-12)`), because `0.0 / 0.0` is `NaN`. Anything else, such as
+     a call, `sqrt`, `ln` or an unasserted field, is unguarded.
+   - A `.fold`/`.reduce` is guarded by `C.all(|e| e.is_finite())` or
+     `C.all(f64::is_finite)` over the **same** iterator chain `C` it folds.
+     Element-preserving `iter`/`into_iter`/`cloned`/`copied` are ignored, but a
+     `map` has to appear on both sides.
 
    ```rust
    for (got, want) in rows {
-       assert!(got.is_finite(), "row {got} is not finite");
+       assert!(got.is_finite() && want.is_finite(), "row {got} vs {want}");
        worst = worst.max((got - want).abs());
    }
    // or, for a fold over a collection:
@@ -65,8 +79,12 @@ integer literal. A `fold` whose initial value is an integer literal also counts.
    let worst = errs.iter().cloned().fold(0.0, f64::max);
    ```
 
-   Asserting the **accumulator** is not a guard. `max` has already thrown the
-   `NaN` away, so `assert!(worst.is_finite())` after the loop still passes.
+   Asserting only **one side** of a difference is not a guard: with
+   `assert!(got.is_finite())`, a `NaN` `want` still vanishes into `max`.
+   Asserting the **accumulator** is not a guard either. `max` has already
+   thrown the `NaN` away, so `assert!(worst.is_finite())` after the loop still
+   passes. If the other side is a committed reference you trust, say so with
+   (2).
 
 2. **`// nan-ok: <reason>`** on any line of the flagged expression, or alone on
    the line directly above it. The reason is required, because a bare
@@ -84,7 +102,7 @@ there is nothing to assert.
 
 ## The baseline
 
-The sites that predate the rule (307, in 238 functions, when it landed) are
+The sites that predate the rule (447, in 323 functions, when it landed) are
 recorded per function in
 [`baseline.txt`](baseline.txt). The ratchet works like `docs/.lint-baseline`:
 

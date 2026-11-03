@@ -28,17 +28,22 @@
 //!
 //! Escape hatches:
 //!
-//! 1. an assert-family macro (`assert!`, `assert_eq!`, `debug_assert!`,
-//!    `prop_assert!`, …) in the same function whose arguments call `is_finite`
-//!    and name an identifier of the folded operand — `assert!(err.is_finite())`
-//!    before `worst = worst.max(err)`, or
-//!    `assert!(errs.iter().all(|e| e.is_finite()))` before folding `errs`;
+//! 1. an `assert!` / `debug_assert!` / `prop_assert!` in the same function whose
+//!    condition GUARANTEES the folded value finite. Only positive conjuncts of
+//!    the condition count (`a && b`; never under `!` or `||`): `X.is_finite()`
+//!    or `f64::is_finite(X)` guarantees `X`. An accumulator operand is guarded
+//!    when it is such an `X`, or is built from guarded values and literals by
+//!    `-x`, `+`, `-`, `*`, `.abs()`, `.max`/`.min`, or `/` by a provably nonzero
+//!    divisor (`c + x.abs()`, `x.max(c)`, `c > 0`) — so `(got - want).abs()`
+//!    needs BOTH `got` and `want` asserted. A fold is guarded by
+//!    `C.all(|e| e.is_finite())` / `C.all(f64::is_finite)` over the same
+//!    iterator chain `C` it folds (`iter`/`cloned`/`copied` aside);
 //! 2. `// nan-ok: <reason>` on any line of the flagged expression, or alone on
 //!    the line above it. The reason is required.
 
 use std::collections::BTreeSet;
 
-use proc_macro2::{TokenStream, TokenTree};
+use proc_macro2::TokenStream;
 use quote::ToTokens;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -53,9 +58,11 @@ pub const RULE: &str = "nan-fold";
 /// The text every finding ends with: the rule's id and both ways out.
 pub const ESCAPES: &str =
     "f64::max/min discard NaN, so a NaN operand leaves the accumulator at the \
-finite rows' value and the assertion passes green. Either assert the operand \
-`.is_finite()` in this function (e.g. `assert!(err.is_finite())` before the fold), \
-or put `// nan-ok: <reason>` on the line. See tools/lint-rules/nan-fold.md.";
+finite rows' value and the assertion passes green. Either assert the folded value \
+itself `.is_finite()` in this function (e.g. `assert!(err.is_finite())` before \
+`w = w.max(err)`; for `(a - b).abs()` assert both `a` and `b`; for a `.fold` over \
+`xs`, `assert!(xs.iter().all(|e| e.is_finite()))`), or put `// nan-ok: <reason>` \
+on the line. See tools/lint-rules/nan-fold.md.";
 
 const INT_TYPES: &[&str] = &[
     "usize", "isize", "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128",
@@ -89,8 +96,13 @@ pub fn lint_file(rel: &str, text: &str, ast: &syn::File, whole_test: bool) -> Ve
 /// What the escape-hatch and integer checks need to know about the enclosing fn.
 #[derive(Default)]
 struct FnCtx {
-    /// One identifier set per assert-family macro that calls `is_finite`.
-    finite_asserts: Vec<BTreeSet<String>>,
+    /// Expressions an assert's condition guarantees finite — `X` of a positive
+    /// `X.is_finite()` / `f64::is_finite(X)` conjunct — as [`value_key`]s.
+    finite_values: BTreeSet<String>,
+    /// Iterator chains an assert guarantees all-finite — `C` of a positive
+    /// `C.all(|e| e.is_finite())` / `C.all(f64::is_finite)` conjunct — as
+    /// [`chain_key`]s.
+    finite_chains: BTreeSet<String>,
     /// Locals visibly declared as integers.
     int_locals: BTreeSet<String>,
 }
@@ -106,10 +118,16 @@ impl FnCtx {
                     .last()
                     .map(|s| s.ident.to_string())
                     .unwrap_or_default();
-                if name.contains("assert") {
-                    let idents = idents_of(&m.tokens, false);
-                    if idents.contains("is_finite") {
-                        self.0.finite_asserts.push(idents);
+                // `assert!`-shaped macros only: the first argument is a boolean
+                // that the test fails on. `assert_eq!(x.is_finite(), false)` and
+                // friends are not a guarantee of anything, so they do not count.
+                if matches!(name.as_str(), "assert" | "debug_assert" | "prop_assert") {
+                    if let Ok(args) =
+                        m.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+                    {
+                        if let Some(cond) = args.first() {
+                            collect_finite(cond, &mut self.0);
+                        }
                     }
                 }
                 visit::visit_macro(self, m);
@@ -184,39 +202,190 @@ fn expr_is_int(e: &Expr, int_locals: &BTreeSet<String>) -> bool {
     }
 }
 
-/// Identifiers in a token stream. With `skip_members`, an identifier directly
-/// after a `.` (a method or field name) is not counted: for the folded operand
-/// `(r.got - r.want).abs()` the identifiers that can carry a guard are `r`, not
-/// `abs`.
-fn idents_of(tokens: &TokenStream, skip_members: bool) -> BTreeSet<String> {
-    fn walk(tokens: TokenStream, skip_members: bool, out: &mut BTreeSet<String>) {
-        let mut after_dot = false;
-        for tt in tokens {
-            match tt {
-                TokenTree::Ident(i) => {
-                    if !(skip_members && after_dot) {
-                        out.insert(i.to_string());
-                    }
-                    after_dot = false;
-                }
-                TokenTree::Punct(p) => after_dot = p.as_char() == '.',
-                TokenTree::Group(g) => {
-                    walk(g.stream(), skip_members, out);
-                    after_dot = false;
-                }
-                TokenTree::Literal(_) => after_dot = false,
-            }
+/// Walk an assert condition and record what it guarantees finite.
+///
+/// Only POSITIVE conjuncts guarantee anything: `a && b` guarantees both, a
+/// parenthesised term is itself, and `!x.is_finite()`, `x.is_finite() || y`,
+/// or an `is_finite` buried in any other expression guarantee nothing.
+fn collect_finite(cond: &Expr, ctx: &mut FnCtx) {
+    match cond {
+        Expr::Paren(p) => collect_finite(&p.expr, ctx),
+        Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
+            collect_finite(&b.left, ctx);
+            collect_finite(&b.right, ctx);
         }
+        Expr::MethodCall(m) if m.method == "is_finite" && m.args.is_empty() => {
+            ctx.finite_values.insert(value_key(&m.receiver));
+        }
+        Expr::Call(c) if c.args.len() == 1 && is_float_assoc_path(&c.func, "is_finite") => {
+            ctx.finite_values.insert(value_key(&c.args[0]));
+        }
+        Expr::MethodCall(m)
+            if m.method == "all" && m.args.len() == 1 && predicate_is_finite(&m.args[0]) =>
+        {
+            ctx.finite_chains.insert(chain_key(&m.receiver));
+        }
+        _ => {}
     }
-    let mut out = BTreeSet::new();
-    walk(tokens.clone(), skip_members, &mut out);
-    out
 }
 
-fn expr_idents(e: &Expr) -> BTreeSet<String> {
-    let mut ts = TokenStream::new();
-    quote_into(e, &mut ts);
-    idents_of(&ts, true)
+/// `f64::is_finite`, or a closure `|e| e.is_finite()` (any of `|&e|`, `|e: &f64|`)
+/// whose body checks exactly its own parameter.
+fn predicate_is_finite(p: &Expr) -> bool {
+    if is_float_assoc_path(p, "is_finite") {
+        return true;
+    }
+    let Expr::Closure(c) = p else { return false };
+    let [param] = c.inputs.iter().collect::<Vec<_>>()[..] else {
+        return false;
+    };
+    let Some(name) = pat_ident(param) else {
+        return false;
+    };
+    match strip_block(&c.body) {
+        Expr::MethodCall(m) if m.method == "is_finite" && m.args.is_empty() => {
+            value_key(&m.receiver) == name
+        }
+        Expr::Call(call)
+            if call.args.len() == 1 && is_float_assoc_path(&call.func, "is_finite") =>
+        {
+            value_key(&call.args[0]) == name
+        }
+        _ => false,
+    }
+}
+
+fn pat_ident(p: &syn::Pat) -> Option<String> {
+    match p {
+        syn::Pat::Ident(i) => Some(i.ident.to_string()),
+        syn::Pat::Reference(r) => pat_ident(&r.pat),
+        syn::Pat::Type(t) => pat_ident(&t.pat),
+        _ => None,
+    }
+}
+
+fn is_float_assoc_path(e: &Expr, name: &str) -> bool {
+    let Expr::Path(p) = e else { return false };
+    let segs: Vec<String> = p
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    segs.len() == 2 && (segs[0] == "f64" || segs[0] == "f32") && segs[1] == name
+}
+
+/// The identity of a VALUE for the finite guard: [`place_key`] with `.abs()`
+/// peeled too, since `x.abs()` is finite exactly when `x` is. Nothing else is
+/// peeled — `(got - want).abs()` is guarded by `got`'s assert only if `want`
+/// cannot be NaN, which is not something this lint can see.
+fn value_key(e: &Expr) -> String {
+    match e {
+        Expr::MethodCall(m) if m.method == "abs" && m.args.is_empty() => value_key(&m.receiver),
+        Expr::Paren(p) => value_key(&p.expr),
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => value_key(&u.expr),
+        Expr::Reference(r) => value_key(&r.expr),
+        other => place_key(other),
+    }
+}
+
+/// Is `e` NaN-free given what the function asserts finite?
+///
+/// True when `e` itself is asserted finite, or is built from asserted-finite
+/// values and literals by operations that cannot make a NaN out of finite
+/// inputs: unary `-`, `+`, `-`, `*` (overflow gives ±inf, never NaN, and an inf
+/// fails a `< tol` assertion rather than vanishing), `.abs()`, `.max`/`.min`,
+/// and `/` only by a divisor that is provably nonzero (`0.0 / 0.0` is NaN).
+/// Anything else — a call, a field nobody asserted, `sqrt`, `ln` — is unguarded.
+fn value_is_guarded(e: &Expr, ctx: &FnCtx) -> bool {
+    if ctx.finite_values.contains(&value_key(e)) {
+        return true;
+    }
+    match e {
+        Expr::Lit(l) => matches!(l.lit, syn::Lit::Float(_) | syn::Lit::Int(_)),
+        Expr::Paren(p) => value_is_guarded(&p.expr, ctx),
+        Expr::Reference(r) => value_is_guarded(&r.expr, ctx),
+        Expr::Unary(u) => {
+            matches!(u.op, syn::UnOp::Neg(_) | syn::UnOp::Deref(_))
+                && value_is_guarded(&u.expr, ctx)
+        }
+        Expr::MethodCall(m) => match (m.method.to_string().as_str(), m.args.len()) {
+            ("abs", 0) => value_is_guarded(&m.receiver, ctx),
+            ("max" | "min", 1) => {
+                value_is_guarded(&m.receiver, ctx) && value_is_guarded(&m.args[0], ctx)
+            }
+            _ => false,
+        },
+        Expr::Binary(b) => match b.op {
+            syn::BinOp::Add(_) | syn::BinOp::Sub(_) | syn::BinOp::Mul(_) => {
+                value_is_guarded(&b.left, ctx) && value_is_guarded(&b.right, ctx)
+            }
+            syn::BinOp::Div(_) => value_is_guarded(&b.left, ctx) && nonzero_finite(&b.right, ctx),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// A divisor that is finite and provably nonzero: a positive literal,
+/// `c + |x|` / `|x| + c` with `c > 0`, or `x.max(c)` with `c > 0` — each with
+/// `x` itself guarded.
+fn nonzero_finite(e: &Expr, ctx: &FnCtx) -> bool {
+    match e {
+        Expr::Paren(p) => nonzero_finite(&p.expr, ctx),
+        _ if positive_lit(e) => true,
+        Expr::Binary(b) if matches!(b.op, syn::BinOp::Add(_)) => {
+            (positive_lit(&b.left) && nonneg_guarded(&b.right, ctx))
+                || (positive_lit(&b.right) && nonneg_guarded(&b.left, ctx))
+        }
+        Expr::MethodCall(m) if m.method == "max" && m.args.len() == 1 => {
+            positive_lit(&m.args[0]) && value_is_guarded(&m.receiver, ctx)
+        }
+        _ => false,
+    }
+}
+
+fn nonneg_guarded(e: &Expr, ctx: &FnCtx) -> bool {
+    match e {
+        Expr::Paren(p) => nonneg_guarded(&p.expr, ctx),
+        Expr::MethodCall(m) if m.method == "abs" && m.args.is_empty() => {
+            value_is_guarded(&m.receiver, ctx)
+        }
+        _ => false,
+    }
+}
+
+fn positive_lit(e: &Expr) -> bool {
+    let Expr::Lit(l) = e else { return false };
+    match &l.lit {
+        syn::Lit::Float(f) => f
+            .base10_parse::<f64>()
+            .is_ok_and(|v| v > 0.0 && v.is_finite()),
+        syn::Lit::Int(i) => i.base10_parse::<u128>().is_ok_and(|v| v > 0),
+        _ => false,
+    }
+}
+
+/// The identity of an ITERATOR CHAIN for the collection guard: element-
+/// preserving adapters (`iter`, `into_iter`, `cloned`, `copied`, `by_ref`) are
+/// peeled from the end, so `errs.iter().all(…)` guards `errs.iter().cloned()
+/// .fold(…)`. An adapter that CHANGES the elements (`map`, `zip`, …) is kept,
+/// so the assert has to check the same mapped values the fold reads.
+fn chain_key(e: &Expr) -> String {
+    match e {
+        Expr::MethodCall(m)
+            if m.args.is_empty()
+                && matches!(
+                    m.method.to_string().as_str(),
+                    "iter" | "into_iter" | "cloned" | "copied" | "by_ref"
+                ) =>
+        {
+            chain_key(&m.receiver)
+        }
+        Expr::Paren(p) => chain_key(&p.expr),
+        Expr::Reference(r) => chain_key(&r.expr),
+        other => place_key(other),
+    }
 }
 
 fn quote_into(e: &Expr, ts: &mut TokenStream) {
@@ -292,6 +461,14 @@ struct Linter<'a> {
     out: Vec<Finding>,
 }
 
+/// What a finite assert has to cover for a finding to be excused.
+enum Guard<'e> {
+    /// An accumulator's operands, each of which must be asserted finite.
+    Values(Vec<&'e Expr>),
+    /// A fold's receiver chain, which must be asserted all-finite.
+    Chain(&'e Expr),
+}
+
 enum NanOk {
     Absent,
     Excused,
@@ -341,14 +518,16 @@ impl Linter<'_> {
         missing.map_or(NanOk::Absent, NanOk::MissingReason)
     }
 
-    fn guarded(&self, operands: &[&Expr]) -> bool {
+    fn guarded(&self, guard: &Guard) -> bool {
         let Some(ctx) = self.ctx.last() else {
             return false;
         };
-        let wanted: BTreeSet<String> = operands.iter().flat_map(|e| expr_idents(e)).collect();
-        ctx.finite_asserts
-            .iter()
-            .any(|set| set.iter().any(|i| wanted.contains(i)))
+        match guard {
+            // EVERY operand must be asserted finite itself: `w.max(a).max(b)`
+            // with only `a` asserted still swallows a NaN `b`.
+            Guard::Values(ops) => ops.iter().all(|e| value_is_guarded(e, ctx)),
+            Guard::Chain(c) => ctx.finite_chains.contains(&chain_key(c)),
+        }
     }
 
     fn int_locals(&self) -> BTreeSet<String> {
@@ -358,8 +537,8 @@ impl Linter<'_> {
             .unwrap_or_default()
     }
 
-    fn report(&mut self, whole: &dyn Spanned, at_line: usize, shape: &str, operands: &[&Expr]) {
-        if self.guarded(operands) {
+    fn report(&mut self, whole: &dyn Spanned, at_line: usize, shape: &str, guard: Guard) {
+        if self.guarded(&guard) {
             return;
         }
         let span = whole.span();
@@ -420,7 +599,7 @@ impl Linter<'_> {
             return;
         }
         let line = a.span().start().line;
-        self.report(a, line, "`max`/`min` accumulator", &operands);
+        self.report(a, line, "`max`/`min` accumulator", Guard::Values(operands));
     }
 
     fn check_fold(&mut self, m: &syn::ExprMethodCall) {
@@ -438,7 +617,7 @@ impl Linter<'_> {
         }
         let line = m.method.span().start().line;
         let shape = format!("`.{method}(…)` with a `max`/`min` reducer");
-        self.report(m, line, &shape, &[&m.receiver]);
+        self.report(m, line, &shape, Guard::Chain(&m.receiver));
     }
 
     fn enter(&mut self, name: String, attrs: &[syn::Attribute]) -> bool {
