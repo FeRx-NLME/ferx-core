@@ -541,6 +541,14 @@ pub(crate) struct ObsRouting {
     /// cell must be seen as missing rather than silently joining the group before it.
     /// Empty for every other model, which keeps the ordinary carry-forward.
     pub no_carry_forward: HashSet<String>,
+    /// The covariate columns `W_COVARIATE_MISSING` may be raised for (#2599).
+    /// `None` — a model-blind read — warns for every covariate column with a
+    /// missing value, since the reader cannot tell which ones a relation reads.
+    /// `Some(set)` — a model-aware read — warns only for the columns in `set`
+    /// (matched ignoring ASCII case, as the reader resolves names): a column no
+    /// relation reads cannot make the objective `NaN`, so a warning that says it
+    /// does is false and buries the ones that matter.
+    pub warn_missing_covariates: Option<HashSet<String>>,
 }
 
 impl ObsRouting {
@@ -571,6 +579,20 @@ impl ObsRouting {
     pub(crate) fn with_no_carry_forward(mut self, columns: HashSet<String>) -> Self {
         self.no_carry_forward = columns;
         self
+    }
+
+    /// Restrict `W_COVARIATE_MISSING` to the covariates `columns` (builder form;
+    /// see [`ObsRouting::warn_missing_covariates`]).
+    pub(crate) fn with_warn_missing_covariates(mut self, columns: HashSet<String>) -> Self {
+        self.warn_missing_covariates = Some(columns);
+        self
+    }
+
+    /// Whether `W_COVARIATE_MISSING` may be raised for covariate column `name`.
+    fn warns_missing_covariate(&self, name: &str) -> bool {
+        self.warn_missing_covariates
+            .as_ref()
+            .map_or(true, |set| set.iter().any(|c| c.eq_ignore_ascii_case(name)))
     }
 
     /// Set the missing-DV policy (builder form), leaving the routing sets alone.
@@ -1528,7 +1550,12 @@ fn read_nonmem_csv_impl(
     // `min` / `max` / comparisons return a finite value, so for those relations
     // this warning is the only sign anything is wrong (#2041).
     let mut population_warnings = population_warnings;
-    for name in &existing_cov_names {
+    // Only for a column a relation reads (#2599): on a model-aware read an unread
+    // column with gaps is not a problem, and the warning's claim would be false.
+    for name in existing_cov_names
+        .iter()
+        .filter(|n| routing.warns_missing_covariate(n))
+    {
         let missing: Vec<&str> = subjects
             .iter()
             .filter(|s| s.covariates.get(name).is_some_and(|v| v.is_nan()))

@@ -1296,6 +1296,9 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
         .with_no_carry_forward(no_carry_forward)
+        // `W_COVARIATE_MISSING` only for a column the model reads (#2599); the
+        // policy reader widens this with the caller's own covariate list.
+        .with_warn_missing_covariates(referenced_columns(model).into_iter().collect())
 }
 
 /// Whether this model routes any observation row to its endpoint **by CMT** (#1409).
@@ -1675,7 +1678,20 @@ fn read_population_for_policy(
     column_map: &[(String, String)],
     missing_dv: MissingDvPolicy,
 ) -> Result<(Population, Option<CovariateTable>), String> {
-    let routing = obs_routing_for(model, missing_dv);
+    let mut routing = obs_routing_for(model, missing_dv);
+    // A column the caller named as a covariate — declared in `[covariates]`, or
+    // listed in `fallback_columns` — is one they asked about, so a gap in it is
+    // still reported even if no relation reads it yet. Only an auto-detected
+    // column the model never reads is left quiet (#2599).
+    if let Some(warn) = routing.warn_missing_covariates.as_mut() {
+        warn.extend(covariate_decls.iter().flatten().map(|d| d.name.clone()));
+        warn.extend(
+            fallback_columns
+                .into_iter()
+                .flatten()
+                .map(|c| c.to_string()),
+        );
+    }
     let (decls, extra) = match covariate_decls {
         Some(d) => (Some(d.as_slice()), undeclared_referenced(model, d)),
         // No block: still read every column the model references (#1936).
