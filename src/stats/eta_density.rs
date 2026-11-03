@@ -38,8 +38,8 @@
 //! objective is unchanged bit for bit. Ω is block-diagonal across declared blocks, so
 //! `Ω_g⁻¹` is `Ω⁻¹` restricted to the group, and for a univariate group `ω = 1/Ω⁻¹_aa`.
 //!
-//! The correction is written **once**, as [`correction_g`] over [`PkNum`]. `T = f64` is
-//! the value, the hyper-dual seeds of [`correction_jets_g`] give its exact η-gradient and
+//! The correction is written **once**, as `correction_g` over `PkNum`. `T = f64` is
+//! the value, the hyper-dual seeds of `correction_jets_g` give its exact η-gradient and
 //! η-Hessian, and the AD kernel's outer types carry `∂/∂θ` (the shape) and `∂/∂Ω` through
 //! the same function.
 
