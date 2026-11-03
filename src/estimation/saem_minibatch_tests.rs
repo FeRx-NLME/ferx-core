@@ -274,3 +274,182 @@ fn run_saem_rejects_a_programmatic_zero_fraction() {
         .expect("α = 0 runs no E-step and must be refused");
     assert!(e.contains("batch_fraction"), "{e}");
 }
+
+// ─── Robbins-Monro gain under a mini-batch ────────────────────────────────
+
+/// One η on CL, twenty observations per subject at a 2% residual: the
+/// conditional of η is ~30× narrower than Ω, so the starting block step is far
+/// too large and the default Robbins-Monro controller has to walk the scale
+/// down by orders of magnitude. That walk is what the gain index decides.
+const RICH_MODEL: &str = r"
+[parameters]
+  theta TVCL(3.0, 0.5, 30.0)
+  theta TVV(20.0, 2.0, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.0001
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+fn rich_population() -> Population {
+    let times: Vec<f64> = (1..=20).map(|j| 0.6 * j as f64).collect();
+    let subjects = (0..16usize)
+        .map(|i| {
+            let cl = 3.0 * (0.3 * ((i as f64) - 7.5) / 7.5).exp();
+            let v = 20.0;
+            Subject {
+                id: format!("{}", i + 1),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: times.clone(),
+                observations: times
+                    .iter()
+                    .enumerate()
+                    // ±~1% deterministic residual, so σ stays away from zero
+                    // and the conditional of η has a stable width.
+                    .map(|(j, &t)| {
+                        let e = 0.01 * (((7 * i + 3 * j) % 5) as f64 - 2.0) / 2.0;
+                        100.0 / v * (-cl / v * t).exp() * (1.0 + e)
+                    })
+                    .collect(),
+                obs_cmts: vec![1; times.len()],
+                cens: vec![0; times.len()],
+                ..Default::default()
+            }
+        })
+        .collect();
+    Population {
+        subjects,
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    }
+}
+
+fn tail_acceptance(batch_fraction: f64, k1: usize, k2: usize) -> f64 {
+    let model = parse_model_string(RICH_MODEL).expect("parses");
+    let o = FitOptions {
+        saem_n_exploration: k1,
+        saem_n_convergence: k2,
+        saem_n_mh_steps: 4,
+        saem_omega_burnin: 0,
+        saem_seed: Some(2_607),
+        // The default controller, without the dead band, so every iteration's
+        // rate takes a step and the gain sequence is the only thing compared.
+        saem_scale_adaptation: ScaleAdaptation::RobbinsMonro,
+        saem_scale_deadband: None,
+        saem_batch_fraction: batch_fraction,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let r = run_saem(&model, &rich_population(), &model.default_params, &o).expect("SAEM run");
+    r.saem_mh_accept_tail.expect("a post-burn-in tail")
+}
+
+/// Same number of moves per chain → the same adaptation (#2607 review).
+///
+/// The fixture starts the block step ~30× too large (one η, twenty 1%-noise
+/// observations per subject, start scale 0.3), so the default Robbins-Monro
+/// controller has to walk `log δ` down by ~3 before the chain mixes.
+///
+/// The full-batch run moves each chain 80 times. The α = 0.1 and α = 0.25
+/// runs get 1/α times the iterations, so each chain moves about as often. With
+/// the gain indexed by the subject's own move count, every chain walks the
+/// same `Σ j^-0.6`, and the mini-batch tail acceptance matches full batch.
+/// Indexed by the global iteration `k` instead, the j-th move of a chain gets
+/// the gain of iteration ≈ j/α, a factor `α^0.6` smaller. The chain is then
+/// still far off target when the tail window is read.
+///
+/// Measured (macOS arm64) tail acceptance:
+///
+/// | arm | per-subject index | global `k` |
+/// |---|---|---|
+/// | full batch, K = 80 | 0.221 | 0.221 |
+/// | α = 0.1, K = 800 | 0.274 | 0.071 |
+/// | α = 0.25, K = 320 | 0.269 | 0.127 |
+///
+/// The full-batch tail is the lowest of the three because its 100-iteration
+/// window still holds the opening transient. The mini-batch windows sit later
+/// in each chain's life.
+///
+/// Mutation, run: passing `k` instead of `rm_index` to both `rm_scale_update`
+/// calls in `run_saem` reddens both mini-batch assertions.
+#[test]
+fn minibatch_robbins_monro_gain_follows_the_subjects_own_moves() {
+    let full = tail_acceptance(1.0, 40, 40);
+    assert!(full.is_finite());
+    // The fixture must need the controller and the controller must have
+    // delivered: from a ~0% start, the full-batch chain mixes by the tail.
+    assert!(
+        full > 0.15,
+        "full-batch tail {full:.4}: controller did not adapt"
+    );
+    for (alpha, k) in [(0.1, 400), (0.25, 160)] {
+        let mini = tail_acceptance(alpha, k, k);
+        assert!(mini.is_finite());
+        assert!(
+            mini > full - 0.05,
+            "α = {alpha}: mini-batch tail {mini:.4} vs full-batch {full:.4} at equal moves per \
+             chain — the Robbins-Monro gain is not indexed by the subject's own moves"
+        );
+    }
+}
+
+// ─── Frozen pre-#2607 result ──────────────────────────────────────────────
+
+/// FNV-1a over every bit [`run_bits`] collects, for the analytic and the IOV
+/// fixture at default options.
+fn default_options_fingerprint() -> u64 {
+    let analytic = parse_model_string(MODEL).expect("parses");
+    let iov = parse_model_string(IOV_MODEL).expect("parses");
+    let mut bits = run_bits(&analytic, &population(false), &opts(None));
+    bits.extend(run_bits(&iov, &population(true), &opts(None)));
+    bits.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
+        (h ^ b).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The default (`batch_fraction = 1`) run equals the **pre-#2607** `run_saem`
+/// bit for bit, against a fingerprint frozen from `main` at `f8955c24`.
+///
+/// The constants were produced by this exact function compiled against the
+/// pre-change `run_saem`, which has no `saem_batch_fraction` field and no batch
+/// code at all, so they are an independent oracle rather than a second run of
+/// the new path. Linux is the reference platform. The macOS value is pinned too
+/// because fits differ there through the OS math library (`AGENTS.md`). On any
+/// other platform the test only checks that the fingerprint is stable across
+/// two runs.
+///
+/// A deliberate numerical change to SAEM's default path will redden this test.
+/// Regenerate both constants from the new `main` in that PR, and say so there.
+#[test]
+fn default_run_matches_the_frozen_pre_2607_fingerprint() {
+    let got = default_options_fingerprint();
+    let frozen: Option<u64> = if cfg!(target_os = "linux") {
+        Some(LINUX_FINGERPRINT)
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some(MACOS_ARM64_FINGERPRINT)
+    } else {
+        None
+    };
+    match frozen {
+        Some(want) => assert_eq!(
+            got, want,
+            "default-options SAEM no longer matches the pre-#2607 run: got {got:#018x}"
+        ),
+        None => assert_eq!(got, default_options_fingerprint()),
+    }
+}
+
+const LINUX_FINGERPRINT: u64 = 0x0b30_8cc4_b0d3_21ec;
+const MACOS_ARM64_FINGERPRINT: u64 = 0x77dd_a54e_d9a4_2e1d;

@@ -5060,6 +5060,14 @@ pub fn run_saem(
     // established rebuild-per-call behaviour.
     let schedules = saem_schedule_cache(model, population);
 
+    // Per-subject count of iterations whose E-step kernels actually ran — the
+    // Robbins-Monro gain index (#2607 review). Under full batch every subject
+    // runs every iteration, so this equals `k` exactly and the controller is
+    // unchanged; under a mini-batch it is the subject's own move count, so a
+    // chain idle for `(1 − α)` of the iterations is not handed the smaller,
+    // `k`-decayed gain of a chain that has moved `k` times.
+    let mut kernel_visits: Vec<usize> = vec![0; n_subjects];
+
     // Main loop
     for k in 1..=n_iter {
         // Per-iteration combined (block + componentwise) accept / proposal
@@ -5463,6 +5471,10 @@ pub fn run_saem(
                 // (#2607): it must not count componentwise proposals, and must
                 // not take a Robbins-Monro step from a rate it never produced.
                 let ran = in_batch(batch_ref, i);
+                if ran {
+                    kernel_visits[i] += 1;
+                }
+                let rm_index = kernel_visits[i];
                 // Accumulate per-eta CW acceptance counts
                 let cw_acc_i: usize = per_eta_acc_cw.iter().sum();
                 if ran {
@@ -5493,7 +5505,7 @@ pub fn run_saem(
                                 state.step_scales[i],
                                 rate,
                                 target_accept_rate,
-                                k,
+                                rm_index,
                                 MH_BLOCK_SCALE_MIN,
                                 MH_BLOCK_SCALE_MAX,
                             );
@@ -5512,7 +5524,7 @@ pub fn run_saem(
                                 state.cw_step_scales[i][j],
                                 rate,
                                 CW_TARGET_ACCEPT,
-                                k,
+                                rm_index,
                                 MH_CW_SCALE_MIN,
                                 MH_CW_SCALE_MAX,
                             );

@@ -944,8 +944,14 @@ the same CPU.
 - The cached NLL used as the MH baseline is refreshed for every subject after
   each M-step, as before, so a subject re-entering the batch is scored at the
   current θ, Ω and σ.
-- The step-scale controllers see only the subjects that ran. A subject that
-  went a whole `adapt_interval` undrawn has no acceptance rate, and its
+- The step-scale controllers see only the subjects that ran. The
+  Robbins-Monro gain `c·j^-0.6` is indexed by the subject's own move count
+  `j`, not by the iteration `k`. Under full batch the two are equal. Indexed
+  by `k`, a chain drawn a fraction `α` of the time would get gains `α^0.6`
+  smaller per move: at α = 0.1 on a chain started 30× too wide, that left
+  the tail acceptance at 7% against 27% (unit test
+  `minibatch_robbins_monro_gain_follows_the_subjects_own_moves`). A subject
+  that went a whole `adapt_interval` undrawn has no acceptance rate, and its
   interval-rule scales are left alone.
 - The batch is drawn from `(seed, iteration)` alone, so it is reproducible and
   independent of the thread count. At `α = 1`, or any `α` whose `⌈α·N⌉ = N`,
