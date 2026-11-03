@@ -11,9 +11,9 @@
 
 use super::*;
 use crate::estimation::saem::{
-    imh_decline_warning, imh_kernel_decision, imh_supported_model, mh_steps,
+    imh_decline_warning, imh_kernel_decision, imh_knobs, imh_supported_model, mh_steps,
     obs_per_subject_per_eta, run_saem, rw_scale_has_evidence, saem_sampler_summary_for,
-    ImhDecision, MhScratch, LAST_IMH_SNAPSHOT, LAST_RW_BLOCK_CALLS,
+    ImhDecision, ImhKnobs, MhScratch, LAST_IMH_SNAPSHOT, LAST_RW_BLOCK_CALLS,
 };
 use crate::parser::model_parser::parse_model_string;
 use crate::stats::likelihood::individual_nll;
@@ -143,7 +143,6 @@ fn build(
         warm,
         steps,
         defensive,
-        0,
         counters,
     )
     .expect("analytic 1-cpt IV subject must be in IMH scope")
@@ -360,12 +359,11 @@ fn conditional_precision_matches_the_fd_hessian_at_zero_residual() {
     let mut subject = iv_subject(vec![0.0; 6]);
     subject.observations = predictions(&model, &subject, &theta, &eta_star);
 
-    let n_obs = subject.obs_times.len();
-    let jac = crate::sens::provider::subject_eta_jacobian(&model, &subject, &theta, &eta_star)
-        .map(|j| DMatrix::from_row_slice(n_obs, 2, &j))
+    // The production pair: `J` and the `f` it rides with, from one dual sweep.
+    let (jac, f) = super::eta_jacobian_and_preds(&model, &subject, &theta, &eta_star)
         .expect("analytic Jacobian in scope");
     let h_tilde = crate::stats::likelihood::conditional_eta_precision(
-        &model, &subject, &theta, &eta_star, &jac, &omega, &sigma, true,
+        &model, &subject, &theta, &eta_star, &f, &jac, &omega, &sigma, true,
     )
     .expect("curvature in scope");
 
@@ -415,20 +413,21 @@ fn conditional_precision_halves_match_their_closed_forms_under_proportional_erro
     let subject = well_conditioned_subject();
     let eta = [0.2, -0.1];
     let n_obs = subject.obs_times.len();
-    let jac_dual = crate::sens::provider::subject_eta_jacobian(&model, &subject, &theta, &eta)
-        .map(|j| DMatrix::from_row_slice(n_obs, 2, &j))
+    let (jac_dual, f_dual) = super::eta_jacobian_and_preds(&model, &subject, &theta, &eta)
         .expect("analytic Jacobian in scope");
     let jac_fd = fd_jacobian(&model, &subject, &theta, &eta);
+    // The closed forms below use the value path's `f`; the curvature gets the
+    // dual sweep's. Equal to the last bit is not required, only to the bound.
     let f = predictions(&model, &subject, &theta, &eta);
     // `sigma_values` carries SDs: `PROP_ERR ~ 0.04` is a variance, stored as 0.2.
     let sigma2 = sigma[0] * sigma[0];
 
     let with = crate::stats::likelihood::conditional_eta_precision(
-        &model, &subject, &theta, &eta, &jac_dual, &omega, &sigma, true,
+        &model, &subject, &theta, &eta, &f_dual, &jac_dual, &omega, &sigma, true,
     )
     .unwrap();
     let without = crate::stats::likelihood::conditional_eta_precision(
-        &model, &subject, &theta, &eta, &jac_dual, &omega, &sigma, false,
+        &model, &subject, &theta, &eta, &f_dual, &jac_dual, &omega, &sigma, false,
     )
     .unwrap();
 
@@ -844,15 +843,12 @@ fn one_gn_step_is_capped_by_the_trust_region() {
     let sigma = model.default_params.sigma.values.clone();
     let omega = omega2(0.09, 0.09);
     let subject = stress_subject();
-    let n_obs = subject.obs_times.len();
     // Far on the other side of the prior from the stress fixture's mode
     // (η_CL ≈ 1.5), where the first Newton step is long.
     const START: [f64; 2] = [-1.0, 0.0];
-    let jac = crate::sens::provider::subject_eta_jacobian(&model, &subject, &theta, &START)
-        .map(|j| DMatrix::from_row_slice(n_obs, 2, &j))
-        .unwrap();
+    let (jac, f) = super::eta_jacobian_and_preds(&model, &subject, &theta, &START).unwrap();
     let h0 = crate::stats::likelihood::conditional_eta_precision(
-        &model, &subject, &theta, &START, &jac, &omega, &sigma, true,
+        &model, &subject, &theta, &START, &f, &jac, &omega, &sigma, true,
     )
     .unwrap();
     let g0 = analytic_eta_nll_gradient(&model, &subject, &theta, &START, &omega, &sigma).unwrap();
@@ -1060,6 +1056,24 @@ fn the_cost_estimate_needs_a_complete_measurement() {
     assert!(at(1) > at(5) && at(5) > at(10));
 }
 
+/// The eval counters include declined refresh attempts, so they are priced per
+/// *attempt*: moving half the refreshes to declines (same evals, same attempts)
+/// must not change the cost. Dividing by successful refreshes alone would price
+/// it at double the refresh cost and could fire the warning on a cheap run.
+#[test]
+fn the_cost_estimate_prices_declined_attempts_too() {
+    let all_ok = snap(200, 445, 250, 100, 385, 2316, 3235);
+    let half_declined = ImhSnapshot {
+        refreshes: 50,
+        declines: 50,
+        ..all_ok
+    };
+    let a = estimate_imh_cost(&all_ok, 2, 5, 6).unwrap().imh_cost;
+    let b = estimate_imh_cost(&half_declined, 2, 5, 6).unwrap().imh_cost;
+    assert!(a.is_finite() && b.is_finite());
+    assert_eq!(a, b, "declined attempts priced differently: {a} vs {b}");
+}
+
 // ---------------------------------------------------------------------------
 // The gates, and the kernel inside a fit
 // ---------------------------------------------------------------------------
@@ -1241,6 +1255,8 @@ fn the_kernel_runs_inside_a_fit_and_a_declined_fit_runs_none_of_it() {
     // Refresh every 2 iterations → 6 refreshes per subject.
     assert_eq!(used.refreshes + used.declines, 6 * 6, "{used:?}");
     assert_eq!(used.declines, 0, "{used:?}");
+    // The per-call NLL clock is folded into the counters (once per subject call).
+    assert!(used.imh_nll_ns > 0, "IMH NLL time never recorded: {used:?}");
     let rate = used.accepts as f64 / used.proposals as f64;
     // Realised 0.80 (seed 7); the random walk targets 0.40.
     assert!(rate > 0.6, "IMH acceptance {rate:.3} inside a fit");
@@ -1367,5 +1383,473 @@ fn default_fit_options_leave_the_imh_kernel_untouched() {
         last_imh(),
         ImhSnapshot::default(),
         "a default SAEM run touched the IMH kernel"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review round 1 (PR #2613): the proposal's state-independence, the decline
+// retry interval, the trust-region rejection, the options backstop, the full
+// scope gate, and the default path frozen against `main`.
+// ---------------------------------------------------------------------------
+
+/// A sentinel proposal whose centre records the warm start it was built from.
+fn sentinel_prop(warm: &[f64]) -> ImhProposal {
+    let n = warm.len();
+    ImhProposal::from_precision(warm.to_vec(), &DMatrix::identity(n, n), 1.0, 0.05, None).unwrap()
+}
+
+/// The proposal is never built from the chain's current state: the first build
+/// starts at the prior mean `0`, later ones at the previous centre — and the
+/// rule is not *handed* the current η, so no caller can thread it in. A
+/// Gauss-Newton search capped short of the mode would otherwise make `q` a
+/// function of the state it is about to be compared against (review round 1).
+#[test]
+fn a_refresh_starts_from_the_previous_centre_or_the_prior_mean() {
+    let mut slot = ImhSlot::default();
+    let mut seen: Vec<Vec<f64>> = Vec::new();
+    slot.refresh_if_due(0, 3, 2, |warm| {
+        seen.push(warm.to_vec());
+        Some(sentinel_prop(&[0.7, -0.4]))
+    });
+    assert_eq!(seen, vec![vec![0.0, 0.0]], "a cold build must start at 0");
+    slot.refresh_if_due(3, 3, 2, |warm| {
+        seen.push(warm.to_vec());
+        Some(sentinel_prop(&[0.9, -0.2]))
+    });
+    assert_eq!(
+        seen[1],
+        vec![0.7, -0.4],
+        "a warm build must start at the previous centre"
+    );
+    // A decline drops the centre: the next build is cold again.
+    slot.refresh_if_due(6, 3, 2, |_| None);
+    assert!(slot.prop.is_none());
+    slot.refresh_if_due(9, 3, 2, |warm| {
+        seen.push(warm.to_vec());
+        None
+    });
+    assert_eq!(seen[2], vec![0.0, 0.0], "after a decline the build is cold");
+}
+
+/// A declined refresh waits the same interval as a successful one, instead of
+/// re-running the full refresh every iteration on top of the random walk; a
+/// successful one is reused until it is due.
+#[test]
+fn a_declined_refresh_waits_its_interval() {
+    let mut slot = ImhSlot::default();
+    let mut calls: Vec<usize> = Vec::new();
+    for k in 0..11 {
+        slot.refresh_if_due(k, 5, 2, |_| {
+            calls.push(k);
+            None
+        });
+    }
+    assert_eq!(calls, vec![0, 5, 10], "declines retried off-interval");
+
+    let mut slot = ImhSlot::default();
+    let mut calls: Vec<usize> = Vec::new();
+    for k in 0..11 {
+        slot.refresh_if_due(k, 5, 2, |w| {
+            calls.push(k);
+            Some(sentinel_prop(w))
+        });
+        assert!(slot.prop.is_some(), "a built proposal was dropped at {k}");
+    }
+    assert_eq!(calls, vec![0, 5, 10], "successful builds off-interval");
+}
+
+/// The prior-ball rejection, reached directly: a quadratic objective whose mode
+/// sits far outside the ball, started just inside its edge, so the very first
+/// (trust-region-capped) step crosses it. The step must be rejected — the
+/// centre stays at the start — while the same objective started further in
+/// does move, so the assertion is not of a search that never steps.
+#[test]
+fn the_prior_ball_rejects_the_step_that_crosses_it() {
+    let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["E".into()]);
+    let mode = 50.0_f64; // ηᵀΩ⁻¹η = 2500 ≫ the ball's 100
+    let gradient_at = |e: &[f64]| Some(vec![e[0] - mode]);
+    let curvature_at = |_: &[f64]| Some(DMatrix::from_element(1, 1, 1.0));
+    let edge = GN_RUNAWAY_MAHA_PER_ETA.sqrt() - 1.0; // 9: one capped step lands at 12
+    let (eta, _) = gn_map_refine(&gradient_at, &curvature_at, &[edge], &omega, 5).unwrap();
+    assert_eq!(eta, vec![edge], "the step out of the prior ball was taken");
+
+    let (eta, _) = gn_map_refine(&gradient_at, &curvature_at, &[0.0], &omega, 5).unwrap();
+    assert!(
+        eta[0] > 0.0 && quad_form(&omega.inv, &eta) <= GN_RUNAWAY_MAHA_PER_ETA,
+        "from inside the ball the search must step and stay inside: {eta:?}"
+    );
+}
+
+/// `FitOptions` built in code bypass the parser: the run's backstop replaces an
+/// unusable knob with its default and says so, in a sentence naming the value.
+#[test]
+fn unusable_imh_knobs_fall_back_to_their_defaults_with_a_warning() {
+    let ok = imh_opts(1);
+    let (k, w) = imh_knobs(&ok);
+    assert_eq!(
+        k,
+        ImhKnobs {
+            defensive: 0.05,
+            min_obs_per_eta: 2.0
+        }
+    );
+    assert!(w.is_empty(), "{w:?}");
+    let edge = FitOptions {
+        saem_imh_defensive: 0.5,
+        saem_imh_min_obs_per_eta: 0.0,
+        ..ok.clone()
+    };
+    let (k, w) = imh_knobs(&edge);
+    assert_eq!((k.defensive, k.min_obs_per_eta), (0.5, 0.0));
+    assert!(w.is_empty(), "{w:?}");
+
+    for bad in [f64::NAN, -0.1, 0.6] {
+        let o = FitOptions {
+            saem_imh_defensive: bad,
+            ..ok.clone()
+        };
+        let (k, w) = imh_knobs(&o);
+        assert_eq!(k.defensive, 0.05, "{bad}");
+        assert_eq!(
+            w,
+            vec![format!(
+                "saem_imh_defensive = {bad} is outside [0, 0.5]; using 0.05"
+            )]
+        );
+    }
+    for bad in [f64::NAN, f64::INFINITY, -1.0] {
+        let o = FitOptions {
+            saem_imh_min_obs_per_eta: bad,
+            ..ok.clone()
+        };
+        let (k, w) = imh_knobs(&o);
+        assert_eq!(k.min_obs_per_eta, 2.0, "{bad}");
+        assert_eq!(
+            w,
+            vec![format!(
+                "saem_imh_min_obs_per_eta = {bad} is not a finite value >= 0; using 2 \
+                 (set it to 0 to switch the information gate off)"
+            )]
+        );
+    }
+}
+
+/// End to end: a NaN threshold no longer switches the information gate off (the
+/// sparse population is declined, as under the default), a NaN weight no longer
+/// rejects every proposal (the kernel accepts), each with its warning — and a
+/// random-walk fit carrying the same bad knobs says nothing about them.
+#[test]
+fn a_fit_with_unusable_imh_knobs_runs_on_the_defaults() {
+    let model = parse_model_string(IV_MODEL).expect("parse");
+    let rich = population_of(&well_conditioned_subject(), 3);
+    let mut sparse = rich.clone();
+    for s in sparse.subjects.iter_mut() {
+        s.obs_times.truncate(2);
+        s.observations.truncate(2);
+        s.obs_cmts.truncate(2);
+        s.cens.truncate(2);
+        s.occasions.truncate(2);
+    }
+    let bad = FitOptions {
+        saem_imh_defensive: f64::NAN,
+        saem_imh_min_obs_per_eta: f64::NAN,
+        ..imh_opts(3)
+    };
+    assert_eq!(
+        imh_kernel_decision(&model, &sparse, &bad, false),
+        ImhDecision::DeclinedInformation { ratio: 1.0 },
+        "a NaN threshold switched the information gate off"
+    );
+
+    let r = run_saem(&model, &rich, &model.default_params, &bad).expect("SAEM runs");
+    let used = last_imh();
+    assert!(
+        used.proposals > 0 && used.accepts > 0,
+        "a NaN weight rejected every proposal: {used:?}"
+    );
+    for key in ["saem_imh_defensive = NaN", "saem_imh_min_obs_per_eta = NaN"] {
+        assert!(
+            r.warnings.iter().any(|w| w.starts_with(key)),
+            "no `{key}` warning: {:?}",
+            r.warnings
+        );
+    }
+    let rw = FitOptions {
+        saem_kernel: SaemKernel::RandomWalk,
+        ..bad
+    };
+    let r = run_saem(&model, &rich, &model.default_params, &rw).expect("SAEM runs");
+    assert!(
+        !r.warnings.iter().any(|w| w.contains("saem_imh_")),
+        "a random-walk fit warned about IMH knobs: {:?}",
+        r.warnings
+    );
+}
+
+/// Every conjunct of the scope gate on its own: each fixture differs from the
+/// in-scope model in exactly the one property its line names.
+#[test]
+fn every_scope_condition_declines_on_its_own() {
+    let base = parse_model_string(IV_MODEL).expect("parse");
+    assert!(imh_supported_model(&base));
+
+    let ode = parse_model_string(
+        "\
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -CL / V * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("ODE twin parses");
+    assert!(ode.ode_spec.is_some());
+    // The `tv_fn` conjunct is what excludes it: the parser builds no closed-form
+    // `tv_fn` for an ODE model.
+    assert!(ode.tv_fn.is_none());
+    assert!(
+        !imh_supported_model(&ode),
+        "an ODE model must be out of scope"
+    );
+
+    let mut no_tv = parse_model_string(IV_MODEL).expect("parse");
+    no_tv.tv_fn = None;
+    assert!(
+        !imh_supported_model(&no_tv),
+        "no tv_fn must be out of scope"
+    );
+
+    let mixture = parse_model_string(
+        "\
+[parameters]
+  theta TVCL1(1.0, 0.01, 50.0)
+  theta TVCL2(3.0, 0.01, 50.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("mixture twin parses");
+    assert!(mixture.mixture.is_some());
+    assert!(
+        !imh_supported_model(&mixture),
+        "a mixture must be out of scope"
+    );
+
+    let mut frem = parse_model_string(IV_MODEL).expect("parse");
+    frem.frem_config = Some(crate::types::FremConfig {
+        fremtype_to_indices: std::collections::HashMap::from([(100u16, (0usize, 0usize))]),
+        covariate_sigma_index: 0,
+    });
+    assert!(!imh_supported_model(&frem), "FREM must be out of scope");
+
+    let mut fd = parse_model_string(IV_MODEL).expect("parse");
+    fd.gradient_method = crate::types::GradientMethod::Fd;
+    assert!(
+        !imh_supported_model(&fd),
+        "a model without the analytic η-gradient must be out of scope"
+    );
+}
+
+/// The scope decline names every shape it covers, so a user whose model is one
+/// of them finds it in the sentence.
+#[test]
+fn the_scope_decline_warning_names_every_shape() {
+    assert_eq!(
+        imh_decline_warning(ImhDecision::DeclinedScope, 2.0, 2).unwrap(),
+        "saem_kernel = imh requested but the model is outside the scope the IMH proposal \
+         curvature covers (it needs an analytical PK model with an analytic eta-gradient and \
+         no IOV, iiv_on_ruv, mixture, FREM, SDE, block_sigma, M3 censoring, non-Gaussian \
+         endpoint or LTBS); using the Metropolis-Hastings random walk"
+    );
+    assert_eq!(
+        imh_decline_warning(ImhDecision::DeclinedHmc, 2.0, 2).unwrap(),
+        "saem_kernel = imh requested but saem_n_leapfrog > 0 selected HMC, which owns the \
+         primary kernel; using the Metropolis-Hastings random walk"
+    );
+}
+
+/// The banner and the run ask one HMC predicate: a mixture model with
+/// `saem_n_leapfrog > 0` runs the MH kernels, and the banner says so (it used to
+/// announce HMC).
+#[test]
+fn the_banner_and_the_run_agree_on_hmc_for_a_mixture() {
+    let mixture = parse_model_string(
+        "\
+[parameters]
+  theta TVCL1(1.0, 0.01, 50.0)
+  theta TVCL2(3.0, 0.01, 50.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("mixture twin parses");
+    let plain = parse_model_string(IV_MODEL).expect("parse");
+    let opts = FitOptions {
+        saem_n_leapfrog: 5,
+        ..imh_opts(1)
+    };
+    assert!(crate::estimation::saem::saem_uses_hmc(&plain, &opts));
+    assert!(!crate::estimation::saem::saem_uses_hmc(&mixture, &opts));
+    let banner = crate::estimation::saem::saem_sampler_summary(&mixture, &opts);
+    assert!(banner.starts_with("Metropolis-Hastings"), "{banner}");
+    // And the IMH banner reads the same predicate: HMC displaces the kernel on
+    // the plain model, not on the mixture (which IMH's scope declines instead).
+    let pop = population_of(&well_conditioned_subject(), 3);
+    assert_eq!(
+        saem_sampler_summary_for(&plain, &pop, &opts),
+        "HMC (5 leapfrog steps, Dual2 analytic gradients) (saem_kernel = imh: HMC owns the kernel)"
+    );
+    assert!(saem_sampler_summary_for(&mixture, &pop, &opts)
+        .ends_with("(saem_kernel = imh: model out of scope)"));
+}
+
+/// Under `saem_kernel = imh` the end-of-run mixing tally holds only the random
+/// walk's kernels, read against their own targets: with every primary move
+/// served by IMH, the tallied proposals are exactly the componentwise sweep's.
+#[test]
+fn the_mixing_tally_leaves_the_imh_move_out() {
+    use crate::estimation::saem::LAST_MH_TALLY;
+    let model = parse_model_string(IV_MODEL).expect("parse");
+    let pop = population_of(&well_conditioned_subject(), 3);
+    let opts = FitOptions {
+        saem_n_exploration: 10,
+        saem_n_convergence: 10,
+        saem_omega_burnin: 0,
+        ..imh_opts(9)
+    };
+    run_saem(&model, &pop, &model.default_params, &opts).expect("SAEM runs");
+    assert_eq!(last_imh().declines, 0);
+    let (prop, cw_prop) = LAST_MH_TALLY.with(|c| c.get());
+    assert!(cw_prop > 0, "the sweep never ran");
+    assert_eq!(prop, cw_prop, "IMH proposals reached the mixing tally");
+}
+
+/// Captured on `main` f8955c24 (macOS arm64) by running this test's body there:
+/// θ (2), Ω (2×2, column-major), σ (1), the SAEM objective.
+const FROZEN_LEN: usize = 8;
+const FROZEN_MAIN: [f64; FROZEN_LEN] = [
+    f64::from_bits(0x4005b9e068362eda),
+    f64::from_bits(0x403308f6f0f08f9c),
+    f64::from_bits(0x3fba2eb62a8bc775),
+    0.0,
+    0.0,
+    f64::from_bits(0x3f6e0970b0407fdd),
+    f64::from_bits(0x3fa543cf2f825db8),
+    f64::from_bits(0xc049b5cf65530c04),
+];
+
+/// The default path frozen against `main` (f8955c24): a seeded random-walk fit's
+/// estimates and objective, captured there with this exact fixture. Any change
+/// to the default E-step — an extra RNG draw, a reordered proposal, a scale
+/// controller fed differently — moves these far past the tolerance (one extra
+/// draw moves θ in the third figure), while the tolerance absorbs a last-bit
+/// libm difference between platforms.
+#[test]
+fn the_default_random_walk_fit_matches_main() {
+    use crate::types::DoseEvent;
+    let model = parse_model_string(IV_MODEL).expect("parse");
+    let obs = [
+        [4.6, 3.9, 3.1, 2.0, 0.9, 0.4],
+        [5.4, 4.8, 4.2, 3.3, 2.1, 1.3],
+        [4.9, 4.5, 3.6, 2.6, 1.4, 0.8],
+        [5.9, 5.1, 4.6, 3.6, 2.4, 1.6],
+    ];
+    let pop = Population {
+        subjects: obs
+            .iter()
+            .enumerate()
+            .map(|(i, o)| Subject {
+                id: format!("{}", i + 1),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
+                observations: o.to_vec(),
+                obs_cmts: vec![1; 6],
+                cens: vec![0; 6],
+                occasions: vec![1; 6],
+                ..Default::default()
+            })
+            .collect(),
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let opts = FitOptions {
+        method: EstimationMethod::Saem,
+        saem_n_exploration: 8,
+        saem_n_convergence: 8,
+        saem_seed: Some(11),
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let r = run_saem(&model, &pop, &model.default_params, &opts).expect("SAEM runs");
+    let mut got: Vec<f64> = r.params.theta.clone();
+    got.extend(r.params.omega.matrix.iter().copied());
+    got.extend(r.params.sigma.values.iter().copied());
+    got.push(r.ofv);
+    let want: [f64; FROZEN_LEN] = FROZEN_MAIN;
+    assert_eq!(got.len(), want.len());
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert!(g.is_finite(), "entry {i} non-finite: {g}");
+        let rel = (g - w).abs() / w.abs().max(1e-12);
+        assert!(
+            rel < 1e-9,
+            "default SAEM drifted from main at entry {i}: {g:e} vs {w:e} (rel {rel:e})"
+        );
+    }
+}
+
+/// The non-Gaussian conjunct on its own: the in-scope PK model plus a
+/// time-to-event endpoint (only parseable with `survival`).
+#[cfg(feature = "survival")]
+#[test]
+fn a_non_gaussian_endpoint_declines_the_kernel() {
+    let src = format!(
+        "{IV_MODEL}[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVCL * exp(ETA_CL)\n"
+    );
+    let tte = parse_model_string(&src).expect("joint PK + TTE parses");
+    assert!(tte.has_non_gaussian());
+    assert!(
+        !imh_supported_model(&tte),
+        "a non-Gaussian endpoint must be out of scope"
     );
 }

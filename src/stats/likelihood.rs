@@ -3666,17 +3666,17 @@ pub(crate) fn conditional_eta_precision(
     subject: &Subject,
     theta: &[f64],
     eta_hat: &[f64],
+    ipreds: &[f64],
     h_matrix: &DMatrix<f64>,
     omega: &OmegaMatrix,
     sigma_values: &[f64],
     interaction: bool,
 ) -> Option<DMatrix<f64>> {
     let n_eta = eta_hat.len();
-    let ipreds = model_predictions(model, subject, theta, eta_hat);
     let ruv_mult = model.ruv_obs_mult(subject, theta);
     let terms = gaussian_foce_accum(
         subject,
-        &ipreds,
+        ipreds,
         h_matrix,
         &model.error_spec,
         sigma_values,

@@ -156,13 +156,17 @@ at that mode — assembled by the same code the FOCEI objective takes its
 log-determinant from, from the exact `Dual2` η-Jacobian. The mode is tracked
 by warm-started Gauss-Newton steps and the proposal rebuilt every
 `saem_imh_refresh` (default 5) iterations; once the mode is tracked a rebuild
-costs one η-gradient and one η-Jacobian and no NLL evaluation. Because the
-proposal does not depend on the chain's current state, the proposal density no
-longer cancels, and the acceptance ratio carries it:
+costs one η-gradient and one η-Jacobian and no NLL evaluation. The search is
+seeded from the previous centre, or from the prior mean $\eta = 0$ on the
+first build, and never from the chain's current state: Gauss-Newton is capped
+at five steps and can stop short of the mode, and a centre that depended on
+the current $\eta$ would void the correction below. Because the proposal does
+not depend on the chain's current state, the proposal density no longer
+cancels, and the acceptance ratio carries it:
 $\log\alpha = [\text{NLL}(\eta) - \text{NLL}(\eta')] + [\log q(\eta) - \log q(\eta')]$.
 Both NLLs come from the same evaluation the random walk scores, so the two
 kernels target the same conditional, and a subject whose curvature cannot be
-built at the current point simply takes the random walk that iteration.
+built takes the random walk until its next scheduled refresh.
 
 The componentwise sweep (kernel 2) still runs after it — it is the
 anti-collapse device for a block Ω, and an IMH proposal is not a substitute

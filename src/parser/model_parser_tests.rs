@@ -3939,15 +3939,42 @@ fn test_saem_imh_options_round_trip_validate_and_warn() {
     let err = apply_fit_option(&mut opts, "saem_kernel", "hmc").expect_err("unknown kernel");
     assert!(err.contains("rw/imh") && err.contains("hmc"), "got: {err}");
 
+    // Each message is asserted whole: every clause is something the user reads
+    // (what the key is, the bound, the value they wrote), so deleting any of them
+    // must redden this.
     for (key, good, bad, msg) in [
-        ("saem_imh_proposals", "3", "0", "at least 1"),
-        ("saem_imh_refresh", "10", "0", "at least 1"),
-        ("saem_imh_defensive", "0.1", "0.6", "[0, 0.5]"),
-        ("saem_imh_min_obs_per_eta", "0", "-1", ">= 0"),
+        (
+            "saem_imh_proposals",
+            "3",
+            "0",
+            "fit option `saem_imh_proposals` must be at least 1 — it is the number of \
+             independent-MH proposals per subject per SAEM iteration, got 0",
+        ),
+        (
+            "saem_imh_refresh",
+            "10",
+            "0",
+            "fit option `saem_imh_refresh` must be at least 1 — it is the number of SAEM \
+             iterations between rebuilds of a subject's IMH proposal, got 0",
+        ),
+        (
+            "saem_imh_defensive",
+            "0.1",
+            "0.6",
+            "fit option `saem_imh_defensive` must be in [0, 0.5] — it is the weight of the \
+             prior component mixed into the IMH proposal, got 0.6",
+        ),
+        (
+            "saem_imh_min_obs_per_eta",
+            "0",
+            "-1",
+            "fit option `saem_imh_min_obs_per_eta` must be a finite value >= 0 (0 disables \
+             the information gate), got -1",
+        ),
     ] {
         assert_eq!(apply_fit_option(&mut opts, key, good), Ok(true), "{key}");
         let err = apply_fit_option(&mut opts, key, bad).expect_err(key);
-        assert!(err.contains(msg), "{key}: got {err}");
+        assert_eq!(err, msg, "{key}");
     }
     assert_eq!(
         (opts.saem_imh_proposals, opts.saem_imh_refresh),

@@ -33,7 +33,12 @@
 //!   curvature itself, not a second copy of the formula;
 //! * `(η̂_i, H̃_i)` are cached across iterations and refreshed only every
 //!   `saem_imh_refresh` iterations. A stale proposal costs *efficiency*, never
-//!   correctness: IMH targets the current conditional for **any** fixed `q`.
+//!   correctness: IMH targets the current conditional for **any** `q` fixed
+//!   before the move. That is why a refresh starts from the previous centre or
+//!   the prior mean and is never handed the chain's current η
+//!   ([`ImhSlot::refresh_if_due`]): the Gauss-Newton search is capped and can
+//!   stop short of the mode, so a search seeded at the current state would make
+//!   `q` a function of that state and void the `q(η)/q(η')` correction.
 //!
 //! The target density is scored by the same prepared individual NLL the
 //! random-walk kernels use ([`MhScratch::score`]), so the two kernels share one
@@ -230,8 +235,6 @@ pub(crate) struct ImhProposal {
     log_norm_main: f64,
     /// The same for the prior component.
     log_norm_prior: f64,
-    /// SAEM iteration at which this proposal was built.
-    pub built_at: usize,
 }
 
 impl ImhProposal {
@@ -244,18 +247,19 @@ impl ImhProposal {
         inflate: f64,
         defensive: f64,
         omega: &OmegaMatrix,
-        built_at: usize,
     ) -> Self {
+        // One gate for the weight: `saem::imh_knobs` sanitises it before a run
+        // starts, so a value outside [0, 0.5] here is a caller bug, not input.
+        debug_assert!((0.0..=0.5).contains(&defensive), "defensive = {defensive}");
         Self {
             eta_hat,
             log_norm_main: log_norm_main_component(&chol_l, inflate),
             chol_l,
             inflate,
-            defensive: defensive.clamp(0.0, 0.5),
+            defensive,
             omega_chol: omega.chol.clone(),
             omega_inv: omega.inv.clone(),
             log_norm_prior: -0.5 * omega.log_det,
-            built_at,
         }
     }
 
@@ -439,7 +443,6 @@ pub(crate) fn refresh_proposal(
     eta_warm: &[f64],
     max_steps: usize,
     defensive: f64,
-    iteration: usize,
     counters: &ImhCounters,
 ) -> Option<ImhProposal> {
     let n_eta = eta_warm.len();
@@ -453,13 +456,19 @@ pub(crate) fn refresh_proposal(
     // the residual variance, so the curvature is the interaction form.
     let curvature_at = |eta: &[f64]| -> Option<DMatrix<f64>> {
         let t0 = std::time::Instant::now();
-        let n_obs = subject.obs_times.len();
-        let out = crate::sens::provider::subject_eta_jacobian(model, subject, theta, eta)
-            .map(|j| DMatrix::from_row_slice(n_obs, n_eta, &j))
-            .filter(|j| j.iter().all(|v| v.is_finite()))
-            .and_then(|h| {
-                conditional_eta_precision(model, subject, theta, eta, &h, omega, sigma_values, true)
-            });
+        let out = eta_jacobian_and_preds(model, subject, theta, eta).and_then(|(h, f)| {
+            conditional_eta_precision(
+                model,
+                subject,
+                theta,
+                eta,
+                &f,
+                &h,
+                omega,
+                sigma_values,
+                true,
+            )
+        });
         bump(&counters.map_jac_ns, t0.elapsed().as_nanos() as u64);
         bump(&counters.map_jac_evals, 1);
         out
@@ -495,8 +504,78 @@ pub(crate) fn refresh_proposal(
         IMH_INFLATE,
         defensive,
         omega,
-        iteration,
     ))
+}
+
+/// One subject's IMH state, carried across SAEM iterations: the cached proposal
+/// (`None` = the subject takes the block random walk this iteration) and when a
+/// refresh was last *attempted*, successful or not.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ImhSlot {
+    pub(crate) prop: Option<ImhProposal>,
+    attempted_at: Option<usize>,
+}
+
+impl ImhSlot {
+    /// Rebuild the proposal if `refresh` iterations have passed since the last
+    /// attempt (or there has been none), via `build(warm_start)`.
+    ///
+    /// Two properties the chain's correctness and cost rest on, both here so a
+    /// test reaches them without a fit:
+    ///
+    /// * **The proposal never depends on the chain's current state.** An
+    ///   independence sampler's `q(η)/q(η')` correction is exact only for a `q`
+    ///   fixed before the move; the Gauss-Newton search stops after
+    ///   `IMH_GN_MAX_STEPS`, short of the mode on a far start, so seeding it from
+    ///   the current η would make `q` a function of that η. It starts from the
+    ///   previous proposal's centre — a function of θ and of *past* draws only,
+    ///   the usual adaptive-MCMC dependence, like the random walk's scale — and,
+    ///   with none, from the prior mean `0`. This function is not handed the
+    ///   current η at all.
+    /// * **A declined refresh waits its turn.** A decline counts as an attempt,
+    ///   so a subject whose curvature is unavailable retries every `refresh`
+    ///   iterations, not every iteration on top of its random-walk fallback.
+    pub(crate) fn refresh_if_due(
+        &mut self,
+        k: usize,
+        refresh: usize,
+        n_eta: usize,
+        build: impl FnOnce(&[f64]) -> Option<ImhProposal>,
+    ) {
+        let due = self
+            .attempted_at
+            .is_none_or(|a| k.saturating_sub(a) >= refresh.max(1));
+        if !due {
+            return;
+        }
+        let warm = self
+            .prop
+            .as_ref()
+            .map_or_else(|| vec![0.0; n_eta], |p| p.eta_hat.clone());
+        self.prop = build(&warm);
+        self.attempted_at = Some(k);
+    }
+}
+
+/// The η-Jacobian `H` (`n_obs × n_eta`) and the predictions `f` it was taken at,
+/// from one exact dual sweep. The curvature needs both; reading `f` off the same
+/// sweep spares the refresh a second full predictor evaluation. `None` when the
+/// sweep is out of scope or any entry is non-finite.
+pub(crate) fn eta_jacobian_and_preds(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(DMatrix<f64>, Vec<f64>)> {
+    let grads = crate::sens::provider::subject_eta_grad(model, subject, theta, eta)?;
+    let n_eta = eta.len();
+    let f: Vec<f64> = grads.iter().map(|o| o.f).collect();
+    let h = DMatrix::from_row_iterator(
+        grads.len(),
+        n_eta,
+        grads.iter().flat_map(|o| o.df_deta.iter().copied()),
+    );
+    (h.iter().chain(f.iter()).all(|v| v.is_finite())).then_some((h, f))
 }
 
 /// Solve `H̃ δ = g` given the lower Cholesky factor `L` of `H̃` (forward then
@@ -640,10 +719,12 @@ pub(crate) fn estimate_imh_cost(
     if !(grad_ratio.is_finite() && jac_ratio.is_finite()) {
         return None;
     }
-    // Gradient and Jacobian calls per refresh EVENT, amortised over the
-    // `refresh_interval` subject-iterations each event serves.
+    // Gradient and Jacobian calls per refresh ATTEMPT — the eval counters include
+    // the declined ones — amortised over the `refresh_interval` subject-iterations
+    // each attempt serves (`ImhSlot::refresh_if_due` retries a decline on the
+    // same interval).
     let refresh = refresh_interval.max(1) as f64;
-    let events = d.refreshes as f64;
+    let events = (d.refreshes + d.declines) as f64;
     let grad_per_si = d.map_grad_evals as f64 / events / refresh;
     let jac_per_si = d.map_jac_evals as f64 / events / refresh;
     Some(ImhCostEstimate {
@@ -718,6 +799,9 @@ pub(crate) fn imh_steps(
     let mut n_accepted = 0;
     let mut z = vec![0.0_f64; n];
     let mut eta_prop = vec![0.0_f64; n];
+    // Accumulated locally and folded into the shared counters once per call, so
+    // the rayon workers do not contend on the atomics per proposal.
+    let mut nll_ns: u64 = 0;
 
     for _ in 0..n_steps {
         prop.draw_into(rng, &mut z, &mut eta_prop);
@@ -731,7 +815,7 @@ pub(crate) fn imh_steps(
             sigma_values,
             schedule,
         );
-        bump(&counters.imh_nll_ns, t0.elapsed().as_nanos() as u64);
+        nll_ns += t0.elapsed().as_nanos() as u64;
         let log_q_prop = prop.log_q(&eta_prop);
         let log_alpha = (nll - nll_prop) + (log_q_cur - log_q_prop);
         let log_u: f64 = rng.random::<f64>().ln();
@@ -743,6 +827,7 @@ pub(crate) fn imh_steps(
         }
     }
 
+    bump(&counters.imh_nll_ns, nll_ns);
     bump(&counters.proposals, n_steps as u64);
     bump(&counters.accepts, n_accepted as u64);
     (n_accepted, nll)
@@ -770,7 +855,6 @@ impl ImhProposal {
             inflate,
             defensive,
             omega.unwrap_or(&identity),
-            0,
         ))
     }
 

@@ -9153,9 +9153,11 @@ pub struct FitOptions {
     /// SAEM iterations between rebuilds of a subject's cached IMH proposal
     /// `(η̂_i, Γ_i)` (`[fit_options] saem_imh_refresh`). Default 5. A stale
     /// proposal costs sampling efficiency, never correctness — an
-    /// independence sampler targets the current conditional for any fixed
-    /// proposal — while a refresh costs one analytic η-gradient and one
-    /// η-Jacobian. Rebuilding every iteration (`1`) was measured to be a net
+    /// independence sampler targets the current conditional for any proposal
+    /// fixed before the move, and a refresh starts from the previous centre (or
+    /// the prior mean), never from the chain's current η — while a refresh costs
+    /// one analytic η-gradient and one η-Jacobian. A subject whose refresh
+    /// declines takes the random walk and retries after the same interval. Rebuilding every iteration (`1`) was measured to be a net
     /// loss; 5–10 is the win. Must be ≥ 1.
     pub saem_imh_refresh: usize,
     /// Weight `α` of the **defensive** prior component of the IMH proposal,
