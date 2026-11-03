@@ -173,6 +173,7 @@ website:
           - development/contributing.qmd
           - development/sdlc.qmd
           - development/docs-lint.qmd
+          - development/golden-fits.qmd
 
   page-footer:
     background: light
