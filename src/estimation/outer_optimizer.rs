@@ -3019,6 +3019,17 @@ pub(crate) struct StartEval {
     pub n_unconverged: usize,
     /// Subjects rejected at their inner start, whose `(η, H)` is a placeholder.
     pub n_start_rejected: usize,
+    /// Set when the run's own start scored `∞` and this is that start re-scored at a larger
+    /// inner budget (#2619, `floor_escape::escape_floor`); `None` for a start scored first time.
+    pub rescored: Option<StartRescore>,
+}
+
+/// The inner budgets of a re-scored start (#2619): the run's own, at which the starting
+/// evaluation failed, and the one it was re-scored at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StartRescore {
+    pub run_inner_maxiter: usize,
+    pub rescore_inner_maxiter: usize,
 }
 
 /// Demote `converged` and say why when an outer run reports an objective materially above
@@ -3039,7 +3050,8 @@ pub(crate) struct StartEval {
 /// carries. "Materially" is the plateau rule's own bound,
 /// [`PLATEAU_CONSISTENCY_REL_TOL`]·(1 + |start|), so a fit started at its optimum may land a
 /// solver's noise above it. A start with a hard-rejected subject is not compared: its
-/// objective was scored on a placeholder `(η, H)`.
+/// objective was scored on a placeholder `(η, H)`. Nor is a start that scored `∞`: the
+/// caller re-scores one first where it can (#2619), and says so through `start.rescored`.
 pub(crate) fn above_start_warning(
     converged: &mut bool,
     start: Option<StartEval>,
@@ -3056,6 +3068,14 @@ pub(crate) fn above_start_warning(
         return None;
     }
     *converged = false;
+    let rescored = match start.rescored {
+        Some(r) => format!(
+            " The starting evaluation failed outright at `inner_maxiter` = {}, so that figure is \
+             the start re-scored once, evaluation-only, at `inner_maxiter` = {}.",
+            r.run_inner_maxiter, r.rescore_inner_maxiter,
+        ),
+        None => String::new(),
+    };
     let cause = if start.guard_rejected {
         format!(
             " The EBE convergence guard rejected that starting evaluation: {} of {} subjects' \
@@ -3070,7 +3090,8 @@ pub(crate) fn above_start_warning(
     };
     Some(format!(
         "{ABOVE_START_TOKEN}: the outer optimizer reported OFV {reported:.6}, {:.4} above the \
-         {:.6} its starting estimates scored, so the fit is not reported as converged.{cause}",
+         {:.6} its starting estimates scored, so the fit is not reported as converged.\
+         {rescored}{cause}",
         reported - start.ofv,
         start.ofv,
     ))
@@ -6431,6 +6452,7 @@ fn optimize_nlopt_attempt_probed(
                 guard_rejected: ebe_guard_triggered,
                 n_unconverged: ebe_stats.n_unconverged,
                 n_start_rejected: ebe_stats.n_start_rejected,
+                rescored: None,
             }));
         }
         let ofv = if guarded {

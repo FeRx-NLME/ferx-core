@@ -2757,9 +2757,10 @@ pub(crate) fn optimize_profiled(
             )
         });
         // Recorded before the guard returns, so a rejected start carries its verdict; a
-        // failed solve records `∞`, which `above_start_warning` skips. `n_start_rejected`
-        // is copied for parity with the unprofiled loop: the inner start reject needs a
-        // non-zero warm η (#2212), which this cold first call never has.
+        // failed solve records `∞`, which `floor_escape::escape_floor` re-scores at a
+        // larger inner budget (#2619). `n_start_rejected` is copied for parity with the
+        // unprofiled loop: the inner start reject needs a non-zero warm η (#2212), which
+        // this cold first call never has.
         if first_call {
             let start = match &solved {
                 Ok(s) => StartEval {
@@ -2767,12 +2768,14 @@ pub(crate) fn optimize_profiled(
                     guard_rejected: guarded,
                     n_unconverged: s.ebe.n_unconverged,
                     n_start_rejected: s.ebe.n_start_rejected,
+                    rescored: None,
                 },
                 Err(_) => StartEval {
                     ofv: f64::INFINITY,
                     guard_rejected: false,
                     n_unconverged: 0,
                     n_start_rejected: 0,
+                    rescored: None,
                 },
             };
             *start_eval.lock().unwrap() = Some(start);

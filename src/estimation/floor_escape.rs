@@ -24,7 +24,7 @@
 //! probe is not a minimum.
 
 use crate::estimation::outer_optimizer::{
-    above_start_warning, ofv_is_valid, runs_outer_optimizer, OuterResult, StartEval,
+    above_start_warning, ofv_is_valid, runs_outer_optimizer, OuterResult, StartEval, StartRescore,
 };
 use crate::estimation::parameterization::{pack_params, unpack_params, PackedCoordKind};
 use crate::types::{FitOptions, ModelParameters};
@@ -160,10 +160,10 @@ pub(crate) fn floor_not_converged_warning(
 
 /// Run `run` from `start`, then escape the log-packing floor as described in the module
 /// doc. `run(params, options)` is the outer optimizer — the profiled or the unprofiled one
-/// — and is called at most three times: the fit, the evaluation-only probe
-/// (`outer_maxiter = 0`, no covariance step), and the restart. `penalty` is added to
-/// `OuterResult::ofv` when the two fits are ranked (priors, NN regularisation), as
-/// `optimize_nlopt` ranks its attempts.
+/// — and is called at most four times: the fit, the evaluation-only probe
+/// (`outer_maxiter = 0`, no covariance step), the restart, and the start's re-score below.
+/// `penalty` is added to `OuterResult::ofv` when the two fits are ranked (priors, NN
+/// regularisation), as `optimize_nlopt` ranks its attempts.
 ///
 /// Last, whatever it reports is held against the **first** run's starting objective by
 /// [`above_start_warning`] (#2461) — the one place that check runs. The restart starts from
@@ -171,6 +171,8 @@ pub(crate) fn floor_not_converged_warning(
 /// start; measured against that, the hand-written transit ODE of
 /// `transit_flip_flop_fit_matches_ode_twin` walked from −228.71 to the floor at −59.31, was
 /// restarted, and was reported `converged` at −191.93. `n_subj` only sizes the message.
+///
+/// A start that scored `∞` is first re-scored by [`rescored_start`] (#2619).
 pub(crate) fn escape_floor<T: StoppedFit>(
     start: &ModelParameters,
     options: &FitOptions,
@@ -179,10 +181,13 @@ pub(crate) fn escape_floor<T: StoppedFit>(
     penalty: impl Fn(&ModelParameters) -> f64,
 ) -> T {
     let first = run(start, options);
-    let fit_start = *first.start_eval();
-    let mut reported = escape_floor_from(first, start, options, run, &penalty);
-    *reported.start_eval_mut() = fit_start;
+    let mut fit_start = *first.start_eval();
+    let mut reported = escape_floor_from(first, start, options, &run, &penalty);
     let ranked = reported.ofv() + penalty(reported.params());
+    if ranked.is_finite() {
+        fit_start = rescored_start(fit_start, start, options, &run);
+    }
+    *reported.start_eval_mut() = fit_start;
     let was_converged = *reported.converged_mut();
     if let Some(w) = above_start_warning(
         reported.converged_mut(),
@@ -198,6 +203,56 @@ pub(crate) fn escape_floor<T: StoppedFit>(
         }
     }
     reported
+}
+
+/// The start [`escape_floor`] holds the report against: `fit_start`, unless it scored `∞`,
+/// in which case it is re-scored once, evaluation-only, at the default inner budget (#2619).
+///
+/// A profiled fit records `∞` when its first profile solve fails outright, which a small
+/// `inner_maxiter` does: on the profile tests' F2 (two studies, `max_unconverged_frac = 0`)
+/// at `inner_maxiter = 1` the start scored `∞` and the run was reported `converged` at
+/// 66.022863, while at `inner_maxiter = 2` the same start scored 26.465827, was rejected by
+/// the guard, and the same 66.022863 was not converged. Re-scored at 3, 50 or 200 the start is
+/// 26.465827 in every printed digit (macOS arm64 and Linux aarch64), so the two runs now get
+/// one verdict. The unprofiled loop never records `∞` (a non-finite objective is a finite
+/// divergence sentinel there), so in practice this re-scores profiled starts only.
+///
+/// Skipped, leaving the start unscored as before, when the default budget is no larger than
+/// the run's own (the re-score would repeat the same deterministic failure) or the fit was
+/// cancelled. A re-score that is itself `∞`, or that records no start (the unprofiled
+/// evaluation-only path records none), leaves it unscored too. An evaluation-only fit never
+/// gets here with an `∞` start: its report is that same failed evaluation, `∞`, which the
+/// caller's finite-report gate declines (#2626 review, row 3).
+fn rescored_start<T: StoppedFit>(
+    fit_start: Option<StartEval>,
+    start: &ModelParameters,
+    options: &FitOptions,
+    run: impl Fn(&ModelParameters, &FitOptions) -> T,
+) -> Option<StartEval> {
+    let budget = FitOptions::default().inner_maxiter;
+    if fit_start.is_none_or(|s| s.ofv.is_finite())
+        || budget <= options.inner_maxiter
+        || crate::cancel::is_cancelled(&options.cancel)
+    {
+        return fit_start;
+    }
+    let eval_only = FitOptions {
+        outer_maxiter: 0,
+        inner_maxiter: budget,
+        run_covariance_step: false,
+        optimizer_trace: false,
+        ..options.clone()
+    };
+    match *run(start, &eval_only).start_eval() {
+        Some(s) if s.ofv.is_finite() => Some(StartEval {
+            rescored: Some(StartRescore {
+                run_inner_maxiter: options.inner_maxiter,
+                rescore_inner_maxiter: budget,
+            }),
+            ..s
+        }),
+        _ => fit_start,
+    }
 }
 
 /// [`escape_floor`] after its first run: the probe and the restart.

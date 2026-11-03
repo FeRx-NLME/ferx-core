@@ -911,6 +911,23 @@ On that transit fit, `max_unconverged_frac = 0.3` lets the optimizer rank the st
 same L-BFGS fit then stays at OFV −228.8107 (macOS), reported with `W_STALLED_AT_INIT`,
 which is the honest verdict for a fit handed its own optimum.
 
+#### When the start cannot be scored {#above-start-unscored}
+
+A profiled fit's first evaluation can fail outright instead of being rejected: its profile
+solve needs the subjects' inner loops, and with too small an `inner_maxiter` it returns no
+objective at all. Such a start is **re-scored once**, at your starting estimates, as an
+evaluation-only run at the default `inner_maxiter = 200`, and the fit is held against that
+([#2619](https://github.com/FeRx-NLME/ferx-core/issues/2619)). The `W_ABOVE_START` message
+then says the start failed at your `inner_maxiter` and names the budget it was re-scored
+at. On the MBMA fixture above with `inner_maxiter = 1` the start fails, the re-score gives
+26.47 (the same at budgets 3, 50 and 200), and the run ends at the same 66.02 as with
+`inner_maxiter = 2`, so it is now reported not converged too.
+
+The start is left unscored, and not compared, when it fails at `inner_maxiter` of 200 or
+more (a re-score would repeat the same solve), when the re-score fails as well, and in an
+evaluation-only fit. The unprofiled loop never needs this: an inner loop that runs out of
+iterations still scores, and the guard rejects the start as above.
+
 ## Warm Starting
 
 The inner loop warm-starts EBE estimation from the previous outer iteration's EBEs. This significantly reduces computation time, especially in later iterations when parameters change slowly.

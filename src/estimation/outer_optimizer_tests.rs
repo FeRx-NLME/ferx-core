@@ -13422,6 +13422,7 @@ mod above_start {
             guard_rejected,
             n_unconverged: if guard_rejected { 1 } else { 0 },
             n_start_rejected: 0,
+            rescored: None,
         }
     }
 
@@ -13471,6 +13472,50 @@ mod above_start {
         assert_eq!(
             classify_warning(&accepted).category,
             WarningCode::Convergence
+        );
+    }
+
+    /// #2619: a start re-scored after its own evaluation failed says so, naming both inner
+    /// budgets, and only then; the guard sentence still follows the re-score's own guard flag.
+    /// The figures are the profile tests' F2 at `inner_maxiter = 1` (start re-scored 26.465827,
+    /// reported 66.022863).
+    #[test]
+    fn a_rescored_start_names_both_budgets_and_only_a_rescored_one_does() {
+        let rescore = "failed outright";
+        let rescored = |guard_rejected: bool| StartEval {
+            rescored: Some(StartRescore {
+                run_inner_maxiter: 1,
+                rescore_inner_maxiter: 200,
+            }),
+            ..start(26.465827, guard_rejected)
+        };
+        let (mut a, mut b, mut c) = (true, true, true);
+        let w = above_start_warning(&mut a, Some(rescored(false)), 66.022863, 2, 0.0).unwrap();
+        let both = above_start_warning(&mut b, Some(rescored(true)), 66.022863, 2, 0.0).unwrap();
+        let plain =
+            above_start_warning(&mut c, Some(start(26.465827, false)), 66.022863, 2, 0.0).unwrap();
+        assert!(!a && !b && !c);
+        assert!(
+            w.contains("failed outright at `inner_maxiter` = 1")
+                && w.contains("re-scored once, evaluation-only, at `inner_maxiter` = 200"),
+            "{w}"
+        );
+        assert!(w.contains("66.022863") && w.contains("26.465827"), "{w}");
+        assert!(
+            !w.contains("guard"),
+            "the re-score was not guard-rejected: {w}"
+        );
+        assert!(
+            both.contains(rescore) && both.contains("EBE convergence guard rejected"),
+            "{both}"
+        );
+        assert!(!plain.contains(rescore), "{plain}");
+        let entry = classify_warning(&w);
+        assert_eq!(entry.category, WarningCode::Convergence, "{w}");
+        assert_eq!(
+            entry.severity,
+            crate::types::WarningSeverity::Critical,
+            "{w}"
         );
     }
 

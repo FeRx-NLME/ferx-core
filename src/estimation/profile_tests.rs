@@ -7074,6 +7074,52 @@ fn a_failed_start_solve_is_recorded_as_infinite() {
     assert!(!start.guard_rejected);
 }
 
+/// #2619: that `∞` start is re-scored by `fit` before the #2461 check, so the run is no
+/// longer reported converged. Measured at `8d4af547`, identical in every printed digit on
+/// macOS arm64 and Linux aarch64: the start re-scored at `inner_maxiter = 200` is 26.465827,
+/// the run ends at 66.022863 — 39.557 above it, against a bound of 0.0275 — and the
+/// `inner_maxiter = 3` control converges to 22.139638. The assertions are the relations: the
+/// demotion and the message, and a 30 OFV floor on the gap between the demoted report and the
+/// control's optimum (43.883 measured), so the fixture cannot drift to a run that ends near
+/// the optimum (x86_64 not measured).
+#[test]
+fn fit_rescores_a_failed_start_and_demotes_a_run_above_it() {
+    use crate::estimation::outer_optimizer::ABOVE_START_TOKEN;
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let fit_at = |inner_maxiter: usize| {
+        let o = FitOptions {
+            run_covariance_step: false,
+            inner_maxiter,
+            max_unconverged_frac: 0.0,
+            ..options(&p)
+        };
+        crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o).expect("fit")
+    };
+    let f = fit_at(1);
+    let tagged: Vec<&String> = f
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with(ABOVE_START_TOKEN))
+        .collect();
+    assert!(!f.converged, "{:?}", f.warnings);
+    assert_eq!(tagged.len(), 1, "{:?}", f.warnings);
+    assert!(
+        tagged[0].contains("failed outright at `inner_maxiter` = 1")
+            && tagged[0].contains("at `inner_maxiter` = 200"),
+        "{}",
+        tagged[0]
+    );
+    let control = fit_at(3);
+    assert!(control.converged, "{:?}", control.warnings);
+    assert!(f.ofv.is_finite() && control.ofv.is_finite());
+    assert!(
+        f.ofv - control.ofv > 30.0,
+        "the demoted run sits far above the optimum: {} vs {}",
+        f.ofv,
+        control.ofv
+    );
+}
+
 /// #2519: with a covariate-NN penalty on, the recorded start carries it, as the objective
 /// `escape_floor` ranks does; the evaluation-only fit reports the unpenalized one. Measured
 /// on all 12 F2 studies with `nn_l2 = 0.5`: start 238.673539, evaluation-only 238.165038,
