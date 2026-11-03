@@ -1068,6 +1068,16 @@ cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` (Linux) t
 catches a trapped first leg at its 64th evaluation instead of the 96th, and the restart
 converges at −1173.56 either way (#2204).
 
+A probe ends the leg only when the gap comes from at least **1 % of the subjects** (#2600).
+On a large population a handful of subjects almost always sits in a lower cold mode: a
+5,937-subject FOCEI fit had every leg cut at its 32nd evaluation, by 3 to 19 subjects, and
+ended with |g|∞ = 16. A restart throws away the optimizer's curvature memory, so below that
+share the leg keeps running instead, with the cold modes as its next warm starts. The
+end-of-leg check above still runs on every leg. On the 200-subject benchmark below, without
+the warm-start predictor, 5 subjects (2.5 %) switch at the 32nd evaluation, so the probe
+restarts. In a test that raises the share to 5 % so the same probe absorbs them, the fit
+reaches the same optimum in 76 evaluations instead of 102.
+
 On the Michaelis–Menten ODE benchmark from the #1564 kit (200 subjects, perturbed initial
 estimates), ferx used to report OFV 784.33 as converged, with the optimizer's own objective
 at that point 872.70. Four subjects held a high-V<sub>max</sub> / low-V / low-k<sub>a</sub>
