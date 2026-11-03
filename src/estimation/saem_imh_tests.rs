@@ -2291,13 +2291,15 @@ fn grid_posterior_moments(
 /// exponential, not Gaussian, left tail (low `VM` saturates elimination, so the
 /// profile NLL rises ~20 per unit of `η_VM` there rather than quadratically):
 /// it is still 1e-5 of the peak at `η_VM = −0.1`, eight conditional SDs out.
+/// A 0.02 step (~2 points per conditional SD) suffices: the trapezoid rule on
+/// this smooth integrand agrees with a 0.01 grid to 6e-7 in every moment.
 fn mm_quadrature_reference() -> [(f64, f64); 2] {
     static REF: std::sync::OnceLock<[(f64, f64); 2]> = std::sync::OnceLock::new();
     *REF.get_or_init(|| {
         let model = parse_model_string(MM_ODE_MODEL).expect("parse");
         let subject = mm_well_conditioned_subject();
         let (want, edge) =
-            grid_posterior_moments(&model, &subject, [-1.6, -0.8], [0.6, 0.6], [221, 141]);
+            grid_posterior_moments(&model, &subject, [-1.6, -0.8], [0.6, 0.6], [111, 71]);
         assert!(
             edge < 1e-9,
             "grid box truncates the posterior (edge/peak {edge:e})"

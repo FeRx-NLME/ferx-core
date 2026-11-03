@@ -10232,9 +10232,10 @@ pub enum SaemKernel {
     /// autocorrelated random walk. The componentwise sweep still runs.
     ///
     /// Opt-in, and **gated twice before the run**: on scope (an analytical PK
-    /// model with an exact `Dual2` η-gradient; no ODE, IOV, `iiv_on_ruv`,
-    /// mixture, FREM, SDE, `block_sigma`, M3, non-Gaussian endpoint or LTBS)
-    /// and on information
+    /// or ODE model whose η-gradient and η-Jacobian the adjoint's recorder
+    /// serves exactly — ODE models since #2639, through the dual ODE walk; no
+    /// IOV, `iiv_on_ruv`, mixture, FREM, SDE, `block_sigma`, M3, non-Gaussian
+    /// endpoint or LTBS) and on information
     /// ([`FitOptions::saem_imh_min_obs_per_eta`]). A fit outside either gate
     /// runs the random walk with a warning naming the reason; a subject whose
     /// curvature cannot be built takes the random walk until its next
