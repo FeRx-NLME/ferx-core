@@ -229,9 +229,10 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
         ("src/estimation/impmap.rs", (2, 2)),
         // The NLopt exit, the built-in-BFGS exit, the `outer_maxiter = 0`
         // evaluation exit, and `optimize_nlopt`'s one covariance step on the attempt it
-        // reports (#1564) — plus `CovStepOutcome`'s constructions live in
-        // `covariance.rs`, not here.
-        ("src/estimation/outer_optimizer.rs", (4, 4)),
+        // reports (#1564), and a verified warm start that reports the unmoved run's
+        // point with its covariance (#2506) — plus `CovStepOutcome`'s constructions
+        // live in `covariance.rs`, not here.
+        ("src/estimation/outer_optimizer.rs", (5, 5)),
         // The profiled outer loop (#1065) and its never-solved exit.
         ("src/estimation/profile.rs", (2, 2)),
         ("src/estimation/saem.rs", (1, 1)),
