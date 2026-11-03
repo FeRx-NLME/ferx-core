@@ -179,19 +179,32 @@ fn diff_leaves_test_files_out() {
     assert!(std::fs::read_to_string(&out_path).unwrap().is_empty());
 }
 
+// One function per selection case. `pair` is a 2-slot tuple whose 2 × 3 product
+// cargo-mutants lists in full; `wrapped` nests a tuple inside `Ok(..)`; `is_ok`,
+// `go` and `scale` are scalar returns whose every variant is a distinct edit.
 const LIST: &str = "\
-src/a.rs:10:5: replace pair -> (Vec<f64>, f64) with (vec![], 0.0)
-src/a.rs:10:5: replace pair -> (Vec<f64>, f64) with (vec![], 1.0)
-src/a.rs:10:5: replace pair -> (Vec<f64>, f64) with (vec![0.0], -1.0)
+src/a.rs:10:5: replace pair -> (u8, f64) with (0, 0.0)
+src/a.rs:10:5: replace pair -> (u8, f64) with (0, 1.0)
+src/a.rs:10:5: replace pair -> (u8, f64) with (0, -1.0)
+src/a.rs:10:5: replace pair -> (u8, f64) with (1, 0.0)
+src/a.rs:10:5: replace pair -> (u8, f64) with (1, 1.0)
+src/a.rs:10:5: replace pair -> (u8, f64) with (1, -1.0)
 src/a.rs:12:9: replace + with - in pair
 src/a.rs:12:9: replace + with * in pair
 src/a.rs:14:20: delete ! in pair
 src/a.rs:20:5: replace fill with ()
 src/a.rs:21:12: replace match guard x.is_empty() with true in fill
+src/a.rs:25:5: replace is_ok -> bool with true
+src/a.rs:25:5: replace is_ok -> bool with false
 src/a.rs:30:5: replace <impl Foo for Bar<'_>>::go -> Result<Option<u32>> with Ok(None)
 src/a.rs:30:5: replace <impl Foo for Bar<'_>>::go -> Result<Option<u32>> with Ok(Some(0))
+src/a.rs:40:5: replace wrapped -> Result<(Vec<u8>, f64)> with Ok((vec![], 0.0))
+src/a.rs:40:5: replace wrapped -> Result<(Vec<u8>, f64)> with Ok((vec![], 1.0))
+src/a.rs:40:5: replace wrapped -> Result<(Vec<u8>, f64)> with Ok((vec![0], 0.0))
+src/a.rs:40:5: replace wrapped -> Result<(Vec<u8>, f64)> with Ok((vec![0], 1.0))
 src/b.rs:7:13: delete field want_dx from struct ModeOut expression in go
 src/b.rs:9:5: replace scale -> f64 with 0.0
+src/b.rs:9:5: replace scale -> f64 with 1.0
 ";
 
 /// The `examine_re` array of the generated config, decoded as TOML basic strings.
@@ -258,30 +271,46 @@ fn selected(tmp: &Path, extra: &[&str]) -> (usize, Vec<String>) {
     (n, hit)
 }
 
+/// The function-body (FnValue) lines of [`LIST`] that `select` must keep by default.
+const FN_BODIES: [&str; 11] = [
+    // `pair`: the greedy cover of its 2 × 3 product. Every slot value — `0`, `1`
+    // for the u8 and `0.0`, `1.0`, `-1.0` for the f64 — appears in some kept
+    // variant, in 3 rebuilds instead of 6.
+    "src/a.rs:10:5: replace pair -> (u8, f64) with (0, 0.0)",
+    "src/a.rs:10:5: replace pair -> (u8, f64) with (0, -1.0)",
+    "src/a.rs:10:5: replace pair -> (u8, f64) with (1, 1.0)",
+    "src/a.rs:20:5: replace fill with ()",
+    // Scalar returns: every variant. The review case for #2633: `true` caught and
+    // `false` surviving must surface the `false` survivor.
+    "src/a.rs:25:5: replace is_ok -> bool with true",
+    "src/a.rs:25:5: replace is_ok -> bool with false",
+    "src/a.rs:30:5: replace <impl Foo for Bar<'_>>::go -> Result<Option<u32>> with Ok(None)",
+    "src/a.rs:30:5: replace <impl Foo for Bar<'_>>::go -> Result<Option<u32>> with Ok(Some(0))",
+    // `wrapped`: the tuple inside `Ok(..)` is found and covered — 2 of 4.
+    "src/a.rs:40:5: replace wrapped -> Result<(Vec<u8>, f64)> with Ok((vec![], 0.0))",
+    "src/a.rs:40:5: replace wrapped -> Result<(Vec<u8>, f64)> with Ok((vec![0], 1.0))",
+    "src/b.rs:9:5: replace scale -> f64 with 0.0",
+];
+
 #[test]
-fn select_keeps_one_function_body_replacement_per_function() {
+fn select_keeps_every_scalar_variant_and_covers_every_tuple_slot_value() {
     let tmp = tempfile::tempdir().unwrap();
-    let (n, hit) = selected(tmp.path(), &[]);
-    assert_eq!(
-        hit,
-        [
-            "src/a.rs:10:5: replace pair -> (Vec<f64>, f64) with (vec![], 0.0)",
-            "src/a.rs:20:5: replace fill with ()",
-            "src/a.rs:30:5: replace <impl Foo for Bar<'_>>::go -> Result<Option<u32>> with Ok(None)",
-            "src/b.rs:9:5: replace scale -> f64 with 0.0",
-        ],
-        "one FnValue per function, first listed; no operator, guard or field mutant"
-    );
-    assert_eq!(n, 4);
+    let (n, mut hit) = selected(tmp.path(), &[]);
+    hit.sort();
+    let mut want: Vec<String> = FN_BODIES.iter().map(|s| s.to_string()).collect();
+    want.push("src/b.rs:9:5: replace scale -> f64 with 1.0".into());
+    want.sort();
+    assert_eq!(hit, want, "no operator, guard or field mutant by default");
+    assert_eq!(n, 12);
 }
 
 #[test]
 fn select_all_genres_adds_every_other_mutant_once() {
     let tmp = tempfile::tempdir().unwrap();
     let (n, hit) = selected(tmp.path(), &["--all-genres"]);
-    // 4 FnValue representatives + all 5 non-FnValue mutants; the two `+`
-    // replacements at one position are distinct edits and both stay.
-    assert_eq!(n, 9, "{hit:#?}");
+    // 12 function-body mutants + all 5 others; the two `+` replacements at one
+    // position are distinct edits and both stay.
+    assert_eq!(n, 17, "{hit:#?}");
     for must in [
         "src/a.rs:12:9: replace + with - in pair",
         "src/a.rs:12:9: replace + with * in pair",
@@ -291,7 +320,52 @@ fn select_all_genres_adds_every_other_mutant_once() {
     ] {
         assert!(hit.iter().any(|h| h == must), "missing {must}");
     }
-    assert!(!hit.iter().any(|h| h.ends_with("with (vec![], 1.0)")));
+    assert!(!hit.iter().any(|h| h.ends_with("with (1, -1.0)")));
+}
+
+#[test]
+fn select_exact_names_every_listed_mutant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (n, hit) = selected(tmp.path(), &["--exact"]);
+    assert_eq!(n, LIST.lines().count());
+    assert_eq!(hit, LIST.lines().collect::<Vec<_>>());
+}
+
+#[test]
+fn untested_is_the_selection_minus_every_recorded_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sel = tmp.path().join("selected.txt");
+    std::fs::write(&sel, "m:1:1: a\nm:2:1: b\nm:3:1: c\nm:4:1: d\nm:5:1: e\n").unwrap();
+    let s0 = shard(
+        tmp.path(),
+        "s0",
+        &[("caught.txt", "m:1:1: a\n"), ("missed.txt", "m:2:1: b\n")],
+    );
+    let s1 = shard(
+        tmp.path(),
+        "s1",
+        &[
+            ("timeout.txt", "m:3:1: c\n"),
+            ("unviable.txt", "m:9:1: z\n"),
+        ],
+    );
+    let out = tmp.path().join("untested.txt");
+    let args = [
+        "untested",
+        sel.to_str().unwrap(),
+        out.to_str().unwrap(),
+        s0.to_str().unwrap(),
+        s1.to_str().unwrap(),
+    ];
+    assert_eq!(ok_stdout(run(tmp.path(), &args)).trim(), "2");
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "m:4:1: d\nm:5:1: e\n"
+    );
+
+    // No shard output at all (every shard died): the whole selection is untested.
+    let args = ["untested", sel.to_str().unwrap(), out.to_str().unwrap()];
+    assert_eq!(ok_stdout(run(tmp.path(), &args)).trim(), "5");
 }
 
 fn shard(root: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
@@ -383,6 +457,77 @@ fn summary_lists_every_survivor_across_shards_and_flags_a_budget_hit() {
     assert!(md.contains("Examined all 1 selected"), "{md}");
     assert!(
         !md.contains("Surviving mutants") && !md.contains("Budget hit"),
+        "{md}"
+    );
+    assert!(
+        !md.contains("Measured on this run"),
+        "no outcomes.json, no timing: {md}"
+    );
+}
+
+/// The two endings of a budget-hit pass, asserted together so a gate stuck on
+/// either branch fails: handed on (`--continued`) the tail is promised to the next
+/// pass and not listed; on the last pass it is listed by name, never dropped.
+#[test]
+fn summary_lists_the_untested_tail_unless_a_follow_up_pass_takes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Two mutant outcomes and the baseline, in cargo-mutants 27's outcomes.json shape.
+    let outcomes = r#"{"outcomes": [
+        {"scenario": "Baseline", "summary": "Success",
+         "phase_results": [{"phase": "Build", "duration": 900.0}, {"phase": "Test", "duration": 40.0}]},
+        {"scenario": {"Mutant": {"name": "m:1:1: a"}}, "summary": "CaughtMutant",
+         "phase_results": [{"phase": "Build", "duration": 200.0}, {"phase": "Test", "duration": 30.0}]},
+        {"scenario": {"Mutant": {"name": "m:2:1: b"}}, "summary": "MissedMutant",
+         "phase_results": [{"phase": "Build", "duration": 220.0}, {"phase": "Test", "duration": 50.0}]}
+    ]}"#;
+    let s0 = shard(
+        tmp.path(),
+        "s0",
+        &[
+            ("caught.txt", "m:1:1: a\n"),
+            ("missed.txt", "m:2:1: b\n"),
+            ("outcomes.json", outcomes),
+        ],
+    );
+    let untested = tmp.path().join("untested.txt");
+    std::fs::write(&untested, "src/q.rs:9:5: replace late -> u8 with 0\n").unwrap();
+    let base = [
+        "summary",
+        "--selected",
+        "3",
+        "--untested",
+        untested.to_str().unwrap(),
+    ];
+
+    let mut last = base.to_vec();
+    last.push(s0.to_str().unwrap());
+    let md = ok_stdout(run(tmp.path(), &last));
+    assert!(
+        md.contains("other 1 were not tested and are listed below"),
+        "{md}"
+    );
+    assert!(md.contains("#### Not examined"), "{md}");
+    assert!(
+        md.contains("src/q.rs:9:5: replace late -> u8 with 0"),
+        "{md}"
+    );
+    assert!(!md.contains("follow-up pass"), "{md}");
+    // The baseline is not a mutant: medians over the two mutants only.
+    assert!(
+        md.contains("Measured on this run: 2 mutants, median 210 s build + 40 s test = 250 s per mutant (max 270 s)."),
+        "{md}"
+    );
+
+    let mut handed_on = base.to_vec();
+    handed_on.push("--continued");
+    handed_on.push(s0.to_str().unwrap());
+    let md = ok_stdout(run(tmp.path(), &handed_on));
+    assert!(
+        md.contains("other 1 carry over to a follow-up pass"),
+        "{md}"
+    );
+    assert!(
+        !md.contains("Not examined") && !md.contains("src/q.rs"),
         "{md}"
     );
 }

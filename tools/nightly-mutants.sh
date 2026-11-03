@@ -25,15 +25,19 @@
 #                                     commits bounding the window (until-N h, until].
 #   diff   BASE HEAD OUT              write `git diff BASE HEAD -- src/` minus test
 #                                     files to OUT; print the number of changed files.
-#   select LIST OUT [--all-genres]   reduce a `cargo mutants --list` to the mutants
+#   select LIST OUT [--all-genres|--exact]
+#                                     reduce a `cargo mutants --list` to the mutants
 #                                     worth a rebuild each (see `cmd_select`); write
 #                                     them to OUT as a cargo-mutants config whose
 #                                     `examine_re` names each one exactly; print the
 #                                     count.
-#   summary [--selected N] [--window R] DIR...
+#   untested SELECTED OUT DIR...      write the names in SELECTED that no DIR has an
+#                                     outcome for to OUT; print the count.
+#   summary [--selected N] [--window R] [--untested FILE [--continued]] DIR...
 #                                     merge one or more `mutants.out` dirs (one per
-#                                     shard) into a markdown report on stdout; with
-#                                     --selected, say how many the budget left untested.
+#                                     shard, plus earlier passes) into a markdown
+#                                     report on stdout: survivors, timeouts, measured
+#                                     per-mutant time, and any mutant left untested.
 set -euo pipefail
 
 usage() {
@@ -119,63 +123,147 @@ cmd_diff() {
 # *combination* of default values for a function's return type, so a tuple return
 # multiplies. Measured on the 2026-11-02 merges (#2633): 58,192 mutants listed, of
 # which 34,848 were ONE function (`run_inner_loop_and_nll_prepared`, a 7-tuple) and
-# another 17,424 were six more tuple-returning functions. Every one of those is a
-# lib rebuild. The variants differ only in which default each tuple slot gets;
-# the question the issue asks — "is this body pinned at all?" — is answered by the
-# first. So:
+# another 17,424 were six more tuple-returning functions. Every one is a lib rebuild.
 #
-#   - function-body replacements (FnValue): ONE per function body, the first listed;
-#   - everything else (operators, match arms/guards, struct fields): only with
-#     --all-genres, and then every one, since each is a distinct edit.
+# The rule (`cover`), applied per function body (one source location):
 #
-# The default is FnValue only because that is the class #1171 and #1223 survived
-# (dropping a call, deleting a fill) and because the day measured above still had
-# 2,365 mutants with operators included against 423 without.
+#   Split each generated value into its SLOTS — the innermost comma-separated
+#   elements, keyed by position, so `Ok((vec![], 0.0))` has slots `vec![]` and
+#   `0.0` — and keep the fewest variants (greedy, list order on ties) such that
+#   every value cargo-mutants generated for every slot appears in at least one.
+#
+# For a non-tuple return the whole value is the one slot, so EVERY variant is kept:
+# `-> bool` runs both `true` and `false`, `-> Option<f64>` all of `None`, `Some(0.0)`,
+# `Some(1.0)`, `Some(-1.0)`. Only tuple products are pruned, and then to the
+# per-slot alternatives: `run_inner_loop_and_nll_prepared` runs 12 variants instead
+# of 34,848, and every replacement of each of its slots still runs at least once.
+# The 2026-11-02 merges select 1,261 mutants this way (447 function bodies).
+# A survivor hidden by the pruning would need a tuple combination to survive while
+# every variant carrying each of its slot values is caught — a cross-slot
+# interaction, which is the one thing this does not test.
+#
+# Operators, match arms/guards and struct fields: only with --all-genres (then
+# every one, since each is a distinct edit). The default is function bodies because
+# that is the class #1171 and #1223 survived (dropping a call, deleting a fill).
 #
 # A FnValue line reads `FILE:LINE:COL: replace FN[ -> T] with VALUE`; every other
 # genre's line ends ` in FN` (or names a struct field), which is how they are told
 # apart — `VALUE` is a Rust expression and never contains ` in `.
+#
+# --exact skips all of that and names every line of LIST verbatim: the follow-up
+# pass uses it for the mutants a budget-hit pass left untested.
 cmd_select() {
-  local list="" out="" all=0
+  local list="" out="" mode=default
   while (($#)); do
     case "$1" in
-      --all-genres) all=1; shift ;;
+      --all-genres) mode=all; shift ;;
+      --exact) mode=exact; shift ;;
       *) if [[ -z "$list" ]]; then list="$1"; elif [[ -z "$out" ]]; then out="$1"; else die "select: unexpected '$1'"; fi; shift ;;
     esac
   done
-  [[ -n "$list" && -n "$out" ]] || die "select: usage: select LIST OUT [--all-genres]"
+  [[ -n "$list" && -n "$out" ]] || die "select: usage: select LIST OUT [--all-genres|--exact]"
   [[ -f "$list" ]] || die "select: no such list '$list'"
-  python3 -I - "$list" "$out" "$all" <<'PY'
+  python3 -I - "$list" "$out" "$mode" <<'PY'
 import re, sys
 
-list_path, out_path, all_genres = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+list_path, out_path, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 fn_value = re.compile(r"^([^:]+:\d+:\d+): replace (.+?) (?:-> .+ )?with (.+)$")
+OPEN, CLOSE = "([{", ")]}"
 
 def is_fn_value(line):
     m = fn_value.match(line)
     return m if m and " in " not in m.group(3) and not m.group(2).startswith("match ") else None
+
+def split_top(s, sep=","):
+    """Split at depth-0 separators; None if the brackets do not balance."""
+    parts, depth, cur = [], 0, ""
+    for c in s:
+        if c in OPEN:
+            depth += 1
+        elif c in CLOSE:
+            depth -= 1
+            if depth < 0:
+                return None
+        if c == sep and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += c
+    if depth != 0:
+        return None
+    parts.append(cur.strip())
+    return parts
+
+def groups(s):
+    """Contents of the depth-0 bracket groups of s, in order."""
+    out, depth, start = [], 0, 0
+    for i, c in enumerate(s):
+        if c in OPEN:
+            if depth == 0:
+                start = i + 1
+            depth += 1
+        elif c in CLOSE:
+            depth -= 1
+            if depth == 0:
+                out.append(s[start:i])
+    return out
+
+def has_comma(s):
+    parts = split_top(s)
+    if parts is None:
+        return False
+    return len(parts) > 1 or any(has_comma(g) for g in groups(s))
+
+def slots(s, path=()):
+    """(position, text) of the innermost comma-separated elements of a value."""
+    parts = split_top(s)
+    if parts is None:
+        return {(path, s)}
+    if len(parts) > 1:
+        out = set()
+        for i, p in enumerate(parts):
+            out |= slots(p, path + (i,))
+        return out
+    for j, g in enumerate(groups(s)):
+        if has_comma(g):
+            return slots(g, path + ("g", j))
+    return {(path, s)}
+
+def cover(variants):
+    """Fewest variants (greedy, list order on ties) covering every slot value."""
+    sl = [slots(v) for _, v in variants]
+    need = set().union(*sl)
+    picked = []
+    while need:
+        best = max(range(len(variants)), key=lambda i: (len(sl[i] & need), -i))
+        picked.append(best)
+        need -= sl[best]
+    return [variants[i][0] for i in sorted(picked)]
 
 # The Rust `regex` crate's own escape set (regex_syntax::is_meta_character). Python's
 # re.escape escapes more (e.g. space), and Rust rejects an escaped space.
 def rust_escape(s):
     return "".join("\\" + c if c in "\\.+*?()|[]{}^$#&-~" else c for c in s)
 
-seen, picked = set(), []
-for raw in open(list_path, encoding="utf-8"):
-    line = raw.rstrip("\n")
-    if not line:
-        continue
-    m = is_fn_value(line)
-    if m:
-        key = m.group(1)
-    elif all_genres:
-        key = line
-    else:
-        continue
-    if key in seen:
-        continue
-    seen.add(key)
-    picked.append(line)
+lines = [l.rstrip("\n") for l in open(list_path, encoding="utf-8")]
+lines = list(dict.fromkeys(l for l in lines if l))
+if mode == "exact":
+    picked = lines
+else:
+    by_loc, order, others = {}, [], []
+    for line in lines:
+        m = is_fn_value(line)
+        if m:
+            if m.group(1) not in by_loc:
+                by_loc[m.group(1)] = []
+                order.append(m.group(1))
+            by_loc[m.group(1)].append((line, m.group(3)))
+        elif mode == "all":
+            others.append(line)
+    keep = set(others)
+    for loc in order:
+        keep.update(cover(by_loc[loc]))
+    picked = [l for l in lines if l in keep]
 
 with open(out_path, "w", encoding="utf-8") as f:
     f.write("# Generated by tools/nightly-mutants.sh select; do not edit.\n")
@@ -210,24 +298,73 @@ cat_in() {
   done | LC_ALL=C sort -t: -k1,1 -k2,2n -u
 }
 
+# The mutants of SELECTED (a `cargo mutants --list` output, one name per line) that
+# no shard dir records an outcome for: what a budget-hit pass left untested. Written
+# to OUT; the count is printed. The workflow hands OUT to the next pass.
+cmd_untested() {
+  (($# >= 2)) || die "untested: usage: untested SELECTED OUT [MUTANTS_OUT_DIR...]"
+  local selected="$1" out="$2"
+  shift 2
+  [[ -f "$selected" ]] || die "untested: no such list '$selected'"
+  local d
+  for d in "$@"; do
+    for f in caught.txt missed.txt timeout.txt unviable.txt; do
+      [[ -f "$d/$f" ]] && grep . "$d/$f" || true
+    done
+  done | LC_ALL=C sort -u >"$out.examined"
+  grep . "$selected" | LC_ALL=C sort -u | LC_ALL=C comm -23 - "$out.examined" >"$out" || true
+  rm -f "$out.examined"
+  grep -c . "$out" || true
+}
+
+# Per-mutant wall time from each shard's outcomes.json, so every run records its own
+# measured CI cost in the summary (#2633 asks for it; the budget is sized from it).
+timing_line() {
+  python3 -I - "$@" <<'PY'
+import json, os, statistics, sys
+build, test = [], []
+for d in sys.argv[1:]:
+    p = os.path.join(d, "outcomes.json")
+    try:
+        doc = json.load(open(p, encoding="utf-8"))
+    except (OSError, ValueError):
+        continue
+    for o in doc.get("outcomes", []):
+        if not isinstance(o.get("scenario"), dict):
+            continue  # the baseline
+        ph = {r["phase"]: r["duration"] for r in o.get("phase_results", [])}
+        if "Build" in ph:
+            build.append(ph["Build"])
+            test.append(ph.get("Test", 0.0))
+if build:
+    tot = [b + t for b, t in zip(build, test)]
+    print(f"Measured on this run: {len(build)} mutants, median {statistics.median(build):.0f} s build "
+          f"+ {statistics.median(test):.0f} s test = {statistics.median(tot):.0f} s per mutant "
+          f"(max {max(tot):.0f} s).")
+PY
+}
+
 cmd_summary() {
-  local selected="" window="" dirs=()
+  local selected="" window="" untested="" continued=0 dirs=()
   while (($#)); do
     case "$1" in
       --selected) selected="$2"; shift 2 ;;
       --window) window="$2"; shift 2 ;;
+      --untested) untested="$2"; shift 2 ;;
+      --continued) continued=1; shift ;;
       *) dirs+=("$1"); shift ;;
     esac
   done
-  ((${#dirs[@]} >= 1)) || die "summary: usage: summary [--selected N] [--window RANGE] MUTANTS_OUT_DIR..."
+  ((${#dirs[@]} >= 1)) || die "summary: usage: summary [--selected N] [--window RANGE] [--untested FILE [--continued]] MUTANTS_OUT_DIR..."
   [[ -z "$selected" || "$selected" =~ ^[0-9]+$ ]] || die "summary: --selected must be a count, got '$selected'"
   set -- "${dirs[@]}"
-  local caught missed timeout unviable total
+  local caught missed timeout unviable total n_untested=0
   caught="$(count_in caught.txt "$@")"
   missed="$(count_in missed.txt "$@")"
   timeout="$(count_in timeout.txt "$@")"
   unviable="$(count_in unviable.txt "$@")"
   total=$((caught + missed + timeout + unviable))
+  [[ -n "$untested" && -f "$untested" ]] && n_untested="$(grep -c . "$untested" || true)"
 
   echo "### Mutants: ${missed} survived of ${total} examined"
   echo
@@ -236,7 +373,12 @@ cmd_summary() {
   # numbers, not in a log: "0 survived" over half the selection is not a clean day.
   if [[ -n "$selected" ]]; then
     if ((total < selected)); then
-      echo "**Budget hit: examined ${total} of ${selected} selected mutants;** the other $((selected - total)) were not tested."
+      echo -n "**Budget hit: examined ${total} of ${selected} selected mutants;** the other $((selected - total))"
+      if ((continued)); then
+        echo " carry over to a follow-up pass on the same commit, whose summary includes this one's."
+      else
+        echo " were not tested and are listed below."
+      fi
     else
       echo "Examined all ${selected} selected mutants."
     fi
@@ -245,6 +387,8 @@ cmd_summary() {
   echo "| caught | missed | timeout | unviable | total |"
   echo "|---:|---:|---:|---:|---:|"
   echo "| ${caught} | ${missed} | ${timeout} | ${unviable} | ${total} |"
+  echo
+  timing_line "$@"
   echo
   if ((missed > 0)); then
     echo "#### Surviving mutants"
@@ -267,6 +411,16 @@ cmd_summary() {
     echo '```'
     echo
   fi
+  if ((n_untested > 0 && !continued)); then
+    echo "#### Not examined"
+    echo
+    echo "Selected but never run: the passes ran out. Re-dispatch this window to test them."
+    echo
+    echo '```'
+    LC_ALL=C sort -t: -k1,1 -k2,2n "$untested"
+    echo '```'
+    echo
+  fi
   echo "_cargo-mutants does not mutate string literals: a false diagnostic sentence"
   echo "still needs the manual sentence-deletion check (AGENTS.md, #1405)._"
 }
@@ -280,6 +434,7 @@ main() {
     range) cmd_range "$@" ;;
     diff) cmd_diff "$@" ;;
     select) cmd_select "$@" ;;
+    untested) cmd_untested "$@" ;;
     summary) cmd_summary "$@" ;;
     *) die "unknown subcommand '$sub' (try --help)" ;;
   esac

@@ -6,17 +6,21 @@ name: Nightly mutants
 # tool itself cannot run (a broken diff, or a red baseline — `main`'s `--lib`
 # tests failing before any mutation). The why is in the header of
 # `tools/nightly-mutants.sh`; the measured per-mutant cost and mutants-per-day that
-# set the budget below are in docs/development/sdlc.qmd (#nightly-mutants).
+# size the shards below are in docs/development/sdlc.qmd (#nightly-mutants).
 #
 # Layout:
 #   - `plan`: find the window's first-parent bounds on `main`, write the diff of
 #     production `src/` files, list the mutants cargo-mutants generates for it, and
-#     reduce them (`select`) to one function-body replacement per function. Cheap:
-#     listing parses source and builds nothing.
-#   - `mutants`: N shards, each testing its round-robin slice of the selection
-#     inside a wall-clock budget. A slice that does not finish is not a failure —
-#     the summary says how many of the selected mutants were examined.
-#   - `summary`: merge the shards' `mutants.out` into one job summary.
+#     reduce them (`select`: every function-body replacement, tuple products pruned
+#     to their per-slot alternatives). Size the shard matrix from that count.
+#   - `mutants`: one job per shard, each testing its round-robin slice inside a
+#     wall-clock budget.
+#   - `summary`: merge the shards' `mutants.out` into one job summary. If any
+#     selected mutant was not examined (a shard hit its budget, or a shard died),
+#     hand exactly those to a FOLLOW-UP PASS — this workflow, dispatched with
+#     `backlog_run` = this run — on the same commit, carrying this pass's outcomes.
+#     The last pass's summary is the whole window's report. A mutant still
+#     untested after MAX_PASSES is listed by name, never dropped silently.
 #
 # Not covered, by construction: cargo-mutants never mutates string literals, so a
 # false diagnostic sentence (#1405 / #1456) still needs AGENTS.md's manual
@@ -39,12 +43,17 @@ on:
         description: 'Also test operator / match-arm / field mutants (many more rebuilds)'
         type: boolean
         default: false
+      backlog_run:
+        description: 'Follow-up pass: the run id whose untested mutants to test (set by the summary job)'
+        type: string
+        default: ''
+      pass:
+        description: 'Follow-up pass number (set by the summary job)'
+        type: string
+        default: '1'
 
-# One nightly at a time: two overlapping runs would split the runner pool for no
-# extra information.
-concurrency:
-  group: nightly-mutants
-  cancel-in-progress: false
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -65,75 +74,118 @@ env:
   # integration-test binaries per mutant — measured on #2633's first local run.
   # `--cargo-arg` goes to every cargo invocation, build and test alike.
   MUTANTS_ARGS: -p ferx-core --no-default-features --features ci,markov,nn --profile mutants --cargo-arg=--lib
+  # Sizing (sdlc.qmd#nightly-mutants). PER_SHARD is how many mutants one shard is
+  # planned to finish in BUDGET_MINUTES; it is a planning number, not a cap — a
+  # shard that is slower than planned leaves a tail, and the tail goes to the next
+  # pass. Every summary prints the measured per-mutant time to re-derive it from.
+  # Measured (sdlc.qmd#nightly-mutants): ~354 s per mutant on Linux at 4 CPUs, so a
+  # 300-minute shard finishes ~47 after its baseline; 40 leaves headroom.
+  PER_SHARD: 40
+  MAX_SHARDS: 16
+  MAX_PASSES: 4
+  BUDGET_MINUTES: 300
 
 jobs:
   plan:
-    name: Plan mutants
+    name: Plan mutants (pass ${{ inputs.pass || '1' }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read   # `gh run download` of the previous pass's backlog
     outputs:
-      head: ${{ steps.range.outputs.head }}
-      base: ${{ steps.range.outputs.base }}
+      head: ${{ steps.window.outputs.head }}
+      base: ${{ steps.window.outputs.base }}
       selected: ${{ steps.select.outputs.selected }}
+      shards: ${{ steps.select.outputs.shards }}
+      matrix: ${{ steps.select.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # the window is found by walking `main`'s first-parent history
 
       - name: Find the window
-        id: range
+        id: window
         env:
+          GH_TOKEN: ${{ github.token }}
+          BACKLOG_RUN: ${{ inputs.backlog_run }}
           UNTIL: ${{ inputs.until }}
           HOURS: ${{ inputs.hours || '24' }}
           MUTANTS_MAIN_REF: origin/main
         run: |
-          args=(--hours "$HOURS")
-          [[ -n "$UNTIL" ]] && args+=(--until "$UNTIL")
-          read -r base head < <(tools/nightly-mutants.sh range "${args[@]}")
+          mkdir -p plan
+          if [[ -n "$BACKLOG_RUN" ]]; then
+            # A follow-up pass: same window, same commit, only the untested mutants.
+            gh run download "$BACKLOG_RUN" --repo "$GITHUB_REPOSITORY" -n mutants-backlog -D prev
+            # shellcheck disable=SC1091
+            source prev/window.env
+            cp prev/day.diff plan/day.diff
+            cp -r prev/prior plan/prior
+            echo "Follow-up pass of run $BACKLOG_RUN" >> "$GITHUB_STEP_SUMMARY"
+          else
+            args=(--hours "$HOURS")
+            [[ -n "$UNTIL" ]] && args+=(--until "$UNTIL")
+            read -r base head < <(tools/nightly-mutants.sh range "${args[@]}")
+            total=""
+          fi
           echo "base=$base" >> "$GITHUB_OUTPUT"
           echo "head=$head" >> "$GITHUB_OUTPUT"
+          printf 'base=%s\nhead=%s\n' "$base" "$head" > plan/window.env
           echo "Window: \`${base:0:10}..${head:0:10}\`" >> "$GITHUB_STEP_SUMMARY"
-
-      # cargo-mutants checks the diff against the tree it mutates, so the tree is
-      # the window's head, not whatever `main` is by the time this runs.
-      - name: Check out the window's head
-        run: git checkout --detach ${{ steps.range.outputs.head }}
-
-      - name: Write the diff
-        id: diff
-        run: |
-          mkdir -p plan
-          n="$(tools/nightly-mutants.sh diff ${{ steps.range.outputs.base }} ${{ steps.range.outputs.head }} plan/day.diff)"
-          echo "files=$n" >> "$GITHUB_OUTPUT"
-          echo "Production files changed: $n" >> "$GITHUB_STEP_SUMMARY"
+          # cargo-mutants checks the diff against the tree it mutates, so the tree is
+          # the window's head, not whatever `main` is by the time this runs.
+          git checkout --detach "$head"
+          if [[ -z "$BACKLOG_RUN" ]]; then
+            n="$(tools/nightly-mutants.sh diff "$base" "$head" plan/day.diff)"
+            echo "Production files changed: $n" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "total=$total" >> "$GITHUB_OUTPUT"
 
       - name: Install cargo-mutants
-        if: steps.diff.outputs.files != '0'
+        if: hashFiles('plan/day.diff') != ''
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants@27.1.0
 
-      - name: List and select mutants
+      - name: List, select and size
         id: select
         env:
+          BACKLOG_RUN: ${{ inputs.backlog_run }}
           ALL_GENRES: ${{ inputs.all_genres && '--all-genres' || '' }}
+          TOTAL: ${{ steps.window.outputs.total }}
         run: |
-          if [[ "${{ steps.diff.outputs.files }}" == "0" ]]; then
+          if [[ ! -s plan/day.diff ]]; then
             echo "selected=0" >> "$GITHUB_OUTPUT"
             echo "No production source changed in the window; nothing to mutate." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          # shellcheck disable=SC2086  # MUTANTS_ARGS is a word list
-          cargo mutants --list --in-diff plan/day.diff $MUTANTS_ARGS > plan/list.txt
-          tools/nightly-mutants.sh select plan/list.txt plan/select.toml $ALL_GENRES
+          if [[ -n "$BACKLOG_RUN" ]]; then
+            tools/nightly-mutants.sh select prev/untested.txt plan/select.toml --exact
+          else
+            # shellcheck disable=SC2086  # MUTANTS_ARGS is a word list
+            cargo mutants --list --in-diff plan/day.diff $MUTANTS_ARGS > plan/list.txt
+            tools/nightly-mutants.sh select plan/list.txt plan/select.toml $ALL_GENRES
+            echo "Mutants generated: $(wc -l < plan/list.txt)" >> "$GITHUB_STEP_SUMMARY"
+          fi
           # The count is what cargo-mutants will actually run under that config, not
           # what `select` wrote: in 27.1.0 struct-field deletions ignore both
           # `examine_re` and `exclude_re`, so they ride along (a handful a day).
           # shellcheck disable=SC2086
           cargo mutants --list --config plan/select.toml --in-diff plan/day.diff $MUTANTS_ARGS > plan/selected.txt
           n="$(grep -c . plan/selected.txt || true)"
-          echo "selected=$n" >> "$GITHUB_OUTPUT"
-          echo "Mutants generated: $(wc -l < plan/list.txt); selected: $n" >> "$GITHUB_STEP_SUMMARY"
+          # The whole window's selection, fixed by pass 1 and carried by every later
+          # pass, so the last summary reports examined-of-total for the window.
+          echo "total=${TOTAL:-$n}" >> plan/window.env
+          shards=$(( (n + PER_SHARD - 1) / PER_SHARD ))
+          (( shards < 1 )) && shards=1
+          (( shards > MAX_SHARDS )) && shards=$MAX_SHARDS
+          matrix="[$(seq 0 $((shards - 1)) | paste -sd, -)]"
+          {
+            echo "selected=$n"
+            echo "shards=$shards"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+          echo "Selected this pass: $n, over $shards shard(s)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v7
         if: steps.select.outputs.selected != '0'
@@ -144,22 +196,17 @@ jobs:
           retention-days: 14
 
   mutants:
-    name: Mutants (${{ matrix.shard }}/${{ strategy.job-total }})
+    name: Mutants (${{ matrix.shard }}/${{ needs.plan.outputs.shards }})
     needs: plan
     if: needs.plan.outputs.selected != '0'
     runs-on: ubuntu-latest
-    # The budget: BUDGET_MINUTES of mutant testing, plus headroom for the cold dep
-    # build and the baseline run. ~250 s per mutant measured on 10 local cores, ~8
-    # min estimated on a 4-vCPU runner: ~33 mutants per shard, ~135 a night, against
-    # a median of ~200 selected per day (sdlc.qmd#nightly-mutants). Re-size from
-    # the first real runs' timings, which the job log records per mutant.
-    timeout-minutes: 330
-    env:
-      BUDGET_MINUTES: 270
+    # BUDGET_MINUTES of mutant testing, plus headroom for the cold dep build and the
+    # baseline run; under GitHub's 360-minute job cap.
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -191,14 +238,15 @@ jobs:
       # all three are a report, not a failure. 4 is a red baseline and anything else
       # is the tool failing; both fail the job. `timeout` sends SIGINT at the budget,
       # which cargo-mutants handles by stopping cleanly; the outcomes so far are
-      # already written, so an interrupted shard still reports (124 = budget hit).
+      # already written, so an interrupted shard still reports (124 = budget hit) and
+      # the summary hands its untested tail to the next pass.
       - name: Run mutants
         run: |
           set +e
           # shellcheck disable=SC2086
           timeout --signal=INT --kill-after=5m "${BUDGET_MINUTES}m" \
             cargo mutants --config plan/select.toml --in-diff plan/day.diff $MUTANTS_ARGS \
-              --shard ${{ matrix.shard }}/${{ strategy.job-total }} --sharding round-robin \
+              --shard ${{ matrix.shard }}/${{ needs.plan.outputs.shards }} --sharding round-robin \
               --in-place \
               --output out
           rc=$?
@@ -219,10 +267,13 @@ jobs:
           retention-days: 14
 
   summary:
-    name: Mutants summary
+    name: Mutants summary (pass ${{ inputs.pass || '1' }})
     needs: [plan, mutants]
-    if: always() && needs.plan.outputs.selected != '0' && needs.plan.result == 'success'
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.selected != '0'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write   # dispatch the follow-up pass
     steps:
       - uses: actions/checkout@v7
         with:
@@ -230,17 +281,66 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
+          name: mutants-plan
+          path: plan
+
+      - uses: actions/download-artifact@v8
+        with:
           pattern: mutants-out-*
           path: shards
+
+      - name: Carry the untested tail to the next pass
+        id: carry
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PASS: ${{ inputs.pass || '1' }}
+        run: |
+          shopt -s nullglob
+          dirs=(shards/*/)
+          n="$(tools/nightly-mutants.sh untested plan/selected.txt untested.txt "${dirs[@]}")"
+          echo "untested=$n" >> "$GITHUB_OUTPUT"
+          if (( n == 0 )) || (( PASS >= MAX_PASSES )); then
+            exit 0
+          fi
+          # The backlog: same window and diff, the untested names, and every outcome
+          # so far (earlier passes + this one) for the next summary to include.
+          mkdir -p backlog/prior
+          cp plan/window.env plan/day.diff backlog/
+          cp untested.txt backlog/untested.txt
+          for f in caught.txt missed.txt timeout.txt unviable.txt; do
+            cat plan/prior/"$f" "${dirs[@]/%/$f}" 2>/dev/null > backlog/prior/"$f" || true
+          done
+          echo "dispatch=1" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        if: steps.carry.outputs.dispatch == '1'
+        with:
+          name: mutants-backlog
+          path: backlog/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Dispatch the follow-up pass
+        if: steps.carry.outputs.dispatch == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PASS: ${{ inputs.pass || '1' }}
+        run: |
+          gh workflow run mutants.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f backlog_run="$GITHUB_RUN_ID" -f pass="$((PASS + 1))"
 
       - name: Write the summary
         run: |
           shopt -s nullglob
           dirs=(shards/*/)
+          [[ -d plan/prior ]] && dirs+=(plan/prior)
+          # shellcheck disable=SC1091
+          source plan/window.env
+          continued=()
+          [[ "${{ steps.carry.outputs.dispatch }}" == "1" ]] && continued=(--continued)
           if ((${#dirs[@]} == 0)); then
             echo "No shard produced outcomes (see the shard logs)." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
           fi
-          tools/nightly-mutants.sh summary --selected "${{ needs.plan.outputs.selected }}" \
-            --window "${{ needs.plan.outputs.base }}..${{ needs.plan.outputs.head }}" \
-            "${dirs[@]}" >> "$GITHUB_STEP_SUMMARY"
+          tools/nightly-mutants.sh summary --selected "$total" --window "$base..$head" \
+            --untested untested.txt "${continued[@]}" "${dirs[@]}" >> "$GITHUB_STEP_SUMMARY"
+          if ((${#dirs[@]} == 0)); then exit 1; fi

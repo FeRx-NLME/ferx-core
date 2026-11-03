@@ -421,7 +421,8 @@ actually reach it. For a regression test that means mutation; for an anchor, fee
 failure it exists to catch. The `Nightly mutants` workflow (`mutants.yml`, #2633) runs
 cargo-mutants' function-body replacement over each day's merged `src/` diff and lists the
 survivors in its job summary. It is a backstop for the hand check, not a substitute: it is
-`--lib`-only, budget-capped, and never mutates string literals. Three things that "I
+`--lib`-only, prunes tuple-return combinations to their per-slot values, and never mutates
+string literals. Three things that "I
 mutation-tested it" does **not** cover:
 
 - **Mutating your own fix is not enough — ask what the *smallest* edit that removes it is, and
