@@ -837,7 +837,9 @@ the unprofiled one (#2136):
 - **Ending above its start.** A fit whose reported objective is materially above the
   one its first evaluation scored is reported not converged, with `W_ABOVE_START` (#2519,
   [When the fit ends above its start](../estimation/foce.qmd#above-start)). Both are
-  profile objectives, with the levels solved.
+  profile objectives, with the levels solved. A start whose profile solve fails outright
+  at a small `inner_maxiter` is first re-scored at `inner_maxiter = 200` (#2619,
+  [When the start cannot be scored](../estimation/foce.qmd#above-start-unscored)).
 
 ##### Agreement with the unprofiled fit
 
