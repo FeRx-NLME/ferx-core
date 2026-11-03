@@ -10196,8 +10196,8 @@ pub enum SaemKernel {
     /// and on information
     /// ([`FitOptions::saem_imh_min_obs_per_eta`]). A fit outside either gate
     /// runs the random walk with a warning naming the reason; a subject whose
-    /// curvature cannot be built at the current point takes the random walk
-    /// for that iteration. Neither gate reads a clock, so a seeded fit is
+    /// curvature cannot be built takes the random walk until its next
+    /// scheduled refresh (`saem_imh_refresh` iterations later). Neither gate reads a clock, so a seeded fit is
     /// reproducible whichever kernel it ran.
     Imh,
 }

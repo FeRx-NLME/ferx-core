@@ -197,6 +197,12 @@ thread_local! {
     /// the end-of-run mixing tally, over every iteration.
     pub(crate) static LAST_MH_TALLY: std::cell::Cell<(u64, u64)> =
         const { std::cell::Cell::new((0, 0)) };
+    /// Overrides the IMH stuck-acceptance threshold for [`run_saem`] calls on
+    /// this thread, so a test can reach the warning's call site with a fit that
+    /// mixes (a genuinely stuck fit is not constructible: θ adapts until it
+    /// moves).
+    pub(crate) static IMH_STUCK_OVERRIDE: std::cell::Cell<Option<f64>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// One Robbins-Monro step on a log step-scale, clamped to `[lo, hi]`.
@@ -4022,7 +4028,8 @@ pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) 
         format!("HMC ({n_leapfrog} leapfrog steps, Dual2 analytic gradients)")
     } else if n_leapfrog > 0 {
         "Metropolis-Hastings random walk \
-         (HMC requested but unavailable — needs an analytical PK model, no IOV)"
+         (HMC requested but unavailable — needs an analytical PK model, no IOV, \
+         no iiv_on_ruv, no mixture)"
             .to_string()
     } else {
         "Metropolis-Hastings random walk".to_string()
@@ -5599,19 +5606,17 @@ pub fn run_saem(
                         // fallback shape as HMC.
                         let mut imh_slot = imh_slot;
                         if imh_mode {
-                            imh_slot.refresh_if_due(k, imh_refresh, n_eta, |warm| {
-                                crate::estimation::saem_imh::refresh_proposal(
-                                    model,
-                                    subject,
-                                    theta_ref,
-                                    omega_ref,
-                                    sigma_ref,
-                                    warm,
-                                    crate::estimation::saem_imh::IMH_GN_MAX_STEPS,
-                                    imh_defensive,
-                                    imh_counters_ref,
-                                )
-                            });
+                            imh_slot.refresh_if_due(
+                                k,
+                                imh_refresh,
+                                model,
+                                subject,
+                                theta_ref,
+                                omega_ref,
+                                sigma_ref,
+                                imh_defensive,
+                                imh_counters_ref,
+                            );
                         }
                         // `imh_slot.prop` is `Some` only in `imh_mode` (the slots are
                         // all empty otherwise and nothing refreshes them), so it alone
@@ -6975,6 +6980,15 @@ pub fn run_saem(
                 used.refreshes,
                 used.declines,
             );
+        }
+        #[cfg(test)]
+        let stuck = IMH_STUCK_OVERRIDE
+            .with(|c| c.get())
+            .unwrap_or(SAEM_MH_STUCK_ACCEPT);
+        #[cfg(not(test))]
+        let stuck = SAEM_MH_STUCK_ACCEPT;
+        if let Some(w) = crate::estimation::saem_imh::imh_stuck_warning(&used, stuck) {
+            warnings.push(w);
         }
         if let Some(w) =
             crate::estimation::saem_imh::estimate_imh_cost(&used, imh_m, imh_refresh, n_mh_steps)

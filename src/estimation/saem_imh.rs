@@ -535,7 +535,38 @@ impl ImhSlot {
     /// * **A declined refresh waits its turn.** A decline counts as an attempt,
     ///   so a subject whose curvature is unavailable retries every `refresh`
     ///   iterations, not every iteration on top of its random-walk fallback.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn refresh_if_due(
+        &mut self,
+        k: usize,
+        refresh: usize,
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        omega: &OmegaMatrix,
+        sigma_values: &[f64],
+        defensive: f64,
+        counters: &ImhCounters,
+    ) {
+        self.refresh_if_due_with(k, refresh, model.n_eta, |warm| {
+            refresh_proposal(
+                model,
+                subject,
+                theta,
+                omega,
+                sigma_values,
+                warm,
+                IMH_GN_MAX_STEPS,
+                defensive,
+                counters,
+            )
+        });
+    }
+
+    /// [`Self::refresh_if_due`] with the build injected, so a test can see the
+    /// warm start without a model. Production reaches it only through
+    /// `refresh_if_due`, whose signature carries no η of the chain.
+    pub(crate) fn refresh_if_due_with(
         &mut self,
         k: usize,
         refresh: usize,
@@ -762,6 +793,29 @@ pub(crate) fn imh_cost_warning(est: &ImhCostEstimate) -> Option<String> {
 // ---------------------------------------------------------------------------
 // The kernel
 // ---------------------------------------------------------------------------
+
+/// The `FitResult.warnings` line for an IMH kernel that almost never moved the
+/// chain: run-wide acceptance below `stuck` (the random walk's own "not mixing"
+/// threshold). The mixing tally reads only the random-walk kernels against
+/// their targets, so without this a stuck independence sampler — on a one-η
+/// model, with no componentwise sweep, the only primary move there is — would
+/// pass silently. Measured healthy acceptance on the #1449 benches is ~0.8.
+pub(crate) fn imh_stuck_warning(d: &ImhSnapshot, stuck: f64) -> Option<String> {
+    if d.proposals == 0 {
+        return None;
+    }
+    let rate = d.accepts as f64 / d.proposals as f64;
+    (rate < stuck).then(|| {
+        format!(
+            "saem_kernel = imh accepted {:.2}% of its {} proposals — the independent \
+             proposal sits where the conditional has almost no mass, so the IMH move did \
+             not mix and the componentwise sweep carried the E-step alone. \
+             `saem_kernel = rw` is the safer kernel for this model.",
+            rate * 100.0,
+            d.proposals
+        )
+    })
+}
 
 /// Run `n_steps` independent-Metropolis–Hastings proposals for one subject
 /// in-place. Returns `(n_accepted, updated_nll)`.

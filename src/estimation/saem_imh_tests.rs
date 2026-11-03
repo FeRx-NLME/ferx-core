@@ -1407,12 +1407,12 @@ fn sentinel_prop(warm: &[f64]) -> ImhProposal {
 fn a_refresh_starts_from_the_previous_centre_or_the_prior_mean() {
     let mut slot = ImhSlot::default();
     let mut seen: Vec<Vec<f64>> = Vec::new();
-    slot.refresh_if_due(0, 3, 2, |warm| {
+    slot.refresh_if_due_with(0, 3, 2, |warm| {
         seen.push(warm.to_vec());
         Some(sentinel_prop(&[0.7, -0.4]))
     });
     assert_eq!(seen, vec![vec![0.0, 0.0]], "a cold build must start at 0");
-    slot.refresh_if_due(3, 3, 2, |warm| {
+    slot.refresh_if_due_with(3, 3, 2, |warm| {
         seen.push(warm.to_vec());
         Some(sentinel_prop(&[0.9, -0.2]))
     });
@@ -1422,9 +1422,9 @@ fn a_refresh_starts_from_the_previous_centre_or_the_prior_mean() {
         "a warm build must start at the previous centre"
     );
     // A decline drops the centre: the next build is cold again.
-    slot.refresh_if_due(6, 3, 2, |_| None);
+    slot.refresh_if_due_with(6, 3, 2, |_| None);
     assert!(slot.prop.is_none());
-    slot.refresh_if_due(9, 3, 2, |warm| {
+    slot.refresh_if_due_with(9, 3, 2, |warm| {
         seen.push(warm.to_vec());
         None
     });
@@ -1439,7 +1439,7 @@ fn a_declined_refresh_waits_its_interval() {
     let mut slot = ImhSlot::default();
     let mut calls: Vec<usize> = Vec::new();
     for k in 0..11 {
-        slot.refresh_if_due(k, 5, 2, |_| {
+        slot.refresh_if_due_with(k, 5, 2, |_| {
             calls.push(k);
             None
         });
@@ -1449,7 +1449,7 @@ fn a_declined_refresh_waits_its_interval() {
     let mut slot = ImhSlot::default();
     let mut calls: Vec<usize> = Vec::new();
     for k in 0..11 {
-        slot.refresh_if_due(k, 5, 2, |w| {
+        slot.refresh_if_due_with(k, 5, 2, |w| {
             calls.push(k);
             Some(sentinel_prop(w))
         });
@@ -1729,7 +1729,11 @@ fn the_banner_and_the_run_agree_on_hmc_for_a_mixture() {
     assert!(crate::estimation::saem::saem_uses_hmc(&plain, &opts));
     assert!(!crate::estimation::saem::saem_uses_hmc(&mixture, &opts));
     let banner = crate::estimation::saem::saem_sampler_summary(&mixture, &opts);
-    assert!(banner.starts_with("Metropolis-Hastings"), "{banner}");
+    assert_eq!(
+        banner,
+        "Metropolis-Hastings random walk (HMC requested but unavailable — needs an \
+         analytical PK model, no IOV, no iiv_on_ruv, no mixture)"
+    );
     // And the IMH banner reads the same predicate: HMC displaces the kernel on
     // the plain model, not on the mixture (which IMH's scope declines instead).
     let pop = population_of(&well_conditioned_subject(), 3);
@@ -1851,5 +1855,56 @@ fn a_non_gaussian_endpoint_declines_the_kernel() {
     assert!(
         !imh_supported_model(&tte),
         "a non-Gaussian endpoint must be out of scope"
+    );
+}
+
+/// A stuck independence sampler is reported on its own scale; a healthy one,
+/// and a run that never proposed, say nothing.
+#[test]
+fn a_stuck_imh_kernel_is_reported() {
+    let stuck = ImhSnapshot {
+        proposals: 1000,
+        accepts: 5,
+        ..Default::default()
+    };
+    assert_eq!(
+        imh_stuck_warning(&stuck, 0.01).unwrap(),
+        "saem_kernel = imh accepted 0.50% of its 1000 proposals — the independent proposal \
+         sits where the conditional has almost no mass, so the IMH move did not mix and the \
+         componentwise sweep carried the E-step alone. `saem_kernel = rw` is the safer kernel \
+         for this model."
+    );
+    let healthy = ImhSnapshot {
+        accepts: 800,
+        ..stuck
+    };
+    assert_eq!(imh_stuck_warning(&healthy, 0.01), None);
+    assert_eq!(imh_stuck_warning(&ImhSnapshot::default(), 0.01), None);
+}
+
+/// The stuck warning is wired into the run: with the threshold raised above
+/// any attainable rate the same mixing fit reports it, and at the production
+/// threshold it does not.
+#[test]
+fn the_stuck_warning_reaches_the_fit_result() {
+    use crate::estimation::saem::IMH_STUCK_OVERRIDE;
+    let model = parse_model_string(IV_MODEL).expect("parse");
+    let pop = population_of(&well_conditioned_subject(), 3);
+    let has = |r: &crate::estimation::outer_optimizer::OuterResult| {
+        r.warnings
+            .iter()
+            .any(|w| w.starts_with("saem_kernel = imh accepted"))
+    };
+    let r = run_saem(&model, &pop, &model.default_params, &imh_opts(6)).expect("SAEM runs");
+    assert!(last_imh().accepts > 0);
+    assert!(!has(&r), "a mixing fit warned stuck: {:?}", r.warnings);
+    IMH_STUCK_OVERRIDE.with(|c| c.set(Some(1.01)));
+    let r = run_saem(&model, &pop, &model.default_params, &imh_opts(6));
+    IMH_STUCK_OVERRIDE.with(|c| c.set(None));
+    let r = r.expect("SAEM runs");
+    assert!(
+        has(&r),
+        "the stuck warning never reached the result: {:?}",
+        r.warnings
     );
 }
