@@ -64,6 +64,8 @@ name from quietly reading as zero and collapsing the formula.
 | Logical (in `if` conditions) | `&&` (and), `\|\|` (or), `!` (not) |
 | Inline conditional | `if (SEX == 1) TVCL * 1.5 else TVCL` |
 
+### Arguments of `min`, `max` and `clamp`
+
 `min` / `max` take **exactly two** arguments and desugar to the inline
 conditional (`max(a, b)` → `if (a >= b) a else b`), so they differentiate and
 compile identically to the hand-written form. A one-argument `max(x)` is a parse
@@ -79,6 +81,8 @@ arity is a parse error, and literal bounds the wrong way round
 (`clamp(x, 0.9, 0.1)`) are rejected rather than silently returning `0.9` for
 every `x`; bounds that are not both literals are not checked
 ([#1092](https://github.com/FeRx-NLME/ferx-core/issues/1092)).
+
+### Unknown functions
 
 The table above is the **complete** list. Calling anything else is a parse error
 naming the call and listing what is available:
