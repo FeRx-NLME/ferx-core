@@ -2607,10 +2607,9 @@ pub(crate) fn optimize_profiled_probed(
                 outer_maxiter: 0,
                 ..options.clone()
             };
-            OuterResult {
-                converged: stop.status.is_some(),
-                ..optimize_profiled(model, population, init_params, &at_start)
-            }
+            let mut stopped = optimize_profiled(model, population, init_params, &at_start);
+            stopped.converged = stop.status.is_some();
+            stopped
         }
         None => optimize_profiled(model, population, init_params, options),
     };
