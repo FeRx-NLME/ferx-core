@@ -767,6 +767,39 @@ importance-sampled −2 log L that an `imp_eval_only` stage prints (`IS done.
 −2 log L = …`) or `FitResult::importance_sampling`, evaluated at each fit's
 estimates.
 
+### One seed cannot compare two builds {#saem-seed-spread}
+
+SAEM is deterministic at a fixed `seed`: the same binary, model and data give the
+same estimates to the last digit. A different ferx version can still give a
+different number at that seed, because almost any change on the chain's path
+(an extra random draw, a reordered update) sends it down another trajectory. On
+the public stand-ins built for
+[#2602](https://github.com/FeRx-NLME/ferx-core/issues/2602) (450 subjects each:
+a two-compartment oral closed form with a block Ω, and the same model as a
+3-state ODE), `method = [saem, imp]` was run over 40 seeds. The IS −2 log L had a
+seed-to-seed sd of 1.5 and 3.4–4.1, and a range of 7 and 14–15. The
+importance-sampling draw alone, with the SAEM seed held fixed, accounts for an
+sd of only 0.55 and 0.9. Most of the spread is where the chain ends. So a +4 or
++7 between two builds at one seed is not evidence of a regression. Between the
+September build `e4743847` and `e1a05d1a`, the per-seed differences over the 40
+seeds averaged −0.05 ± 0.26 and +0.31 ± 0.66 (mean ± SE).
+
+To compare two builds, compare distributions:
+
+```bash
+tools/saem-seed-sweep.sh --model m.ferx --data d.csv \
+  --rev e4743847 --rev main --seeds "$(seq -s ' ' 1 10)"
+```
+
+The script builds each revision and runs the model once per seed, with
+`imp_seed = seed + 1000`. It replaces `seed`, its alias `saem_seed` and
+`imp_seed` in `[fit_options]`. It prints each build's mean and sd, and the shift
+against the first build. The shift is the mean of the per-seed differences, with
+its standard error. Every build runs the same seed pairs, so pairing is the right
+test. The model must end in an
+`imp_eval_only` stage. `--fixed-saem-seed` varies only the IS draw, to measure
+the Monte-Carlo noise floor by itself.
+
 The number of NLopt evaluations saved is stored in `FitResult::saem_mu_ref_m_step_evals_saved`, accumulated across SAEM iterations as `2 × mstep_maxiter × n_mu_ref_pairs` per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at `mstep_maxiter` NLopt gradient requests). The field is `None` when mu-referencing is off or method ≠ SAEM.
 
 When `n_leapfrog > 0`, `FitResult::saem_n_subjects_hmc` records how many subjects used HMC at least once during the E-step (the remainder used MH fallback). The field is `None` for MH-only runs. The fit YAML also emits `saem_n_subjects_hmc` and `saem_n_subjects_mh` when the field is `Some`.
