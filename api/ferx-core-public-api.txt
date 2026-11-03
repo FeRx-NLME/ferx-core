@@ -3226,7 +3226,6 @@ pub ferx_core::types::FitOptions::reconverge_gradient_interval: usize
 pub ferx_core::types::FitOptions::report_final_gradient: bool
 pub ferx_core::types::FitOptions::run_covariance_step: bool
 pub ferx_core::types::FitOptions::saem_adapt_interval: usize
-pub ferx_core::types::FitOptions::saem_batch_fraction: f64
 pub ferx_core::types::FitOptions::saem_conddist: bool
 pub ferx_core::types::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::types::FitOptions::saem_conddist_keep_samples: bool
@@ -4811,7 +4810,6 @@ pub ferx_core::FitOptions::reconverge_gradient_interval: usize
 pub ferx_core::FitOptions::report_final_gradient: bool
 pub ferx_core::FitOptions::run_covariance_step: bool
 pub ferx_core::FitOptions::saem_adapt_interval: usize
-pub ferx_core::FitOptions::saem_batch_fraction: f64
 pub ferx_core::FitOptions::saem_conddist: bool
 pub ferx_core::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::FitOptions::saem_conddist_keep_samples: bool

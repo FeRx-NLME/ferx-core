@@ -916,109 +916,6 @@ so a script can check mixing without matching on the warning text.
   runs with fewer than 25 post-burn-in iterations, where the realised rate
   describes the starting scale rather than a failure to reach target.
 
-## Mini-batch E-step (`batch_fraction`) {#saem-minibatch}
-
-`[fit_options] batch_fraction = α`, `α ∈ (0, 1]`, **default `1`**, runs the
-E-step on a uniformly drawn `⌈α·N⌉` subjects per iteration instead of all `N`
-(mini-batch, or incremental, SAEM — Kuhn, Matias & Rebafka 2020, *Statistics
-and Computing* 30, 1725–1739). It is **opt-in and not recommended**: on the
-benchmark below it never beat simply running fewer full-batch iterations at
-the same CPU.
-
-### What it does
-
-- The block, componentwise, HMC and κ (IOV) kernels run only for subjects in
-  the iteration's batch. Every other subject keeps its η, κ and drawn mixture
-  class, and makes no proposal.
-- Every sufficient statistic is still summed over **all** `N`: the Ω outer
-  products, the closed-form mu-reference means, the scalar-residual SSE, the
-  `score_sa` terms, the mixture class statistics. For a subject outside the
-  batch, its stored contribution is its contribution at the η it kept. That is
-  the paper's scheme, and it needs no extra per-subject storage.
-- The numerical θ/σ M-step re-maximises over all `N` at the current η, stale
-  draws included. This is arm (a) of #2607. A batch-only M-step (arm b) would
-  estimate θ from `αN` subjects per iteration. It also has no stored-statistic
-  reading for a population objective. It is not implemented.
-- The SA step `γ` and the `K1`/`K2` schedule are unchanged. With `α < 1` each
-  subject's chain moves about `α·K` times per run.
-- The cached NLL used as the MH baseline is refreshed for every subject after
-  each M-step, as before, so a subject re-entering the batch is scored at the
-  current θ, Ω and σ.
-- The step-scale controllers see only the subjects that ran. The
-  Robbins-Monro gain `c·j^-0.6` is indexed by the subject's own move count
-  `j`, not by the iteration `k`. Under full batch the two are equal. Indexed
-  by `k`, a chain drawn a fraction `α` of the time would get gains `α^0.6`
-  smaller per move: at α = 0.1 on a chain started 30× too wide, that left
-  the tail acceptance at 7% against 27% (unit test
-  `minibatch_robbins_monro_gain_follows_the_subjects_own_moves`). A subject
-  that went a whole `adapt_interval` undrawn has no acceptance rate, and its
-  interval-rule scales are left alone.
-- The batch is drawn from `(seed, iteration)` alone, so it is reproducible and
-  independent of the thread count. At `α = 1`, or any `α` whose `⌈α·N⌉ = N`,
-  no batch is drawn. The run is then bit-identical to full-batch SAEM, and a
-  unit test pins this.
-
-### Measured (#2607)
-
-The benchmark was a simulated one-compartment oral model with three diagonal
-η and proportional error, 6 observations per subject, auto `n_mh_steps`, and
-`N` = 100, 600, 1200 and 4800. Each cell ran 6 seeds on 1 thread, measuring
-user+sys CPU of the SAEM stage alone.
-
-The metric is the change in importance-sampled −2 log L
-(`imp_eval_only`, 10 000 samples, fixed IS seed) against the default
-full-batch run (`α = 1`, `K = 150 + 250`), seed for seed. Lower is better. The
-CPU column is relative to that default run. These are **macOS arm64** numbers,
-so they are not a Linux band; read them as ratios.
-
-| arm | CPU, N=600 | ΔIS, N=600 | CPU, N=4800 | ΔIS, N=4800 |
-|---|---|---|---|---|
-| `α = 1`, K = 400 (default) | 1.00 | 0 | 1.00 | 0 |
-| `α = 1`, K = 200 | 0.52 | +0.01 ± 0.04 | 0.52 | +0.02 ± 0.02 |
-| `α = 1`, K = 100 | 0.27 | +0.06 ± 0.06 | 0.28 | +0.09 ± 0.07 |
-| `α = 0.5`, K = 400 | 0.59 | +0.01 ± 0.03 | 0.59 | +0.03 ± 0.03 |
-| `α = 0.5`, K = 800 | 1.11 | −0.00 ± 0.02 | 1.14 | +0.01 ± 0.02 |
-| `α = 0.25`, K = 400 | 0.36 | +0.03 ± 0.04 | 0.38 | +0.14 ± 0.10 |
-| `α = 0.25`, K = 1600 | 1.35 | −0.01 ± 0.03 | 1.41 | +0.02 ± 0.03 |
-| `α = 0.1`, K = 400 | 0.23 | +0.69 ± 0.33 | 0.24 | +6.39 ± 2.32 |
-
-`N` = 100 and 1200 follow the same pattern. Their α = 0.1 cells are +1.03 and
-+1.13.
-
-### What the numbers say
-
-1. **Payoff vs N.** The precision bought is set by the total E-step budget
-   (`α·K`), as the paper predicts, not by `α` or `K` alone. Mini-batching
-   is never cheaper than spending the same budget as fewer full-batch
-   iterations.
-   - `α = 0.5, K = 400` costs more than `α = 1, K = 200` (0.59 against
-     0.52) and does no better.
-   - `α = 0.25, K = 400` costs more than `α = 1, K = 100` (0.36–0.38 against
-     0.27–0.28). It is no better beyond seed noise: +0.03 against +0.06 at
-     N = 600, and +0.14 against +0.09 at N = 4800.
-
-   The extra cost is the part of an iteration that does not batch: the NLL
-   refresh and the M-step over all `N`. That is about 18% of an iteration
-   here, so `α` buys `1 − 0.82·(1 − α)` of the per-iteration CPU, not `α`.
-   This held at every `N` tried, up to 4800, so no large-N regime appeared
-   where batching wins.
-2. **Schedule.** Reaching the full-batch result needs `K` scaled by roughly
-   `1/α`. At that point the mini-batch run costs *more* than the default
-   (1.11–1.41×).
-3. **Small batches break exploration.** At `α = 0.1` each subject moves only
-   about 15 times in the 150 exploration iterations, and the fit has not
-   settled by the end of the run. It loses 0.7–6.4 IS units, and the loss
-   grows with `N`.
-4. **Default.** It stays opt-in, with no per-model auto rule. To cut SAEM
-   cost, lower `n_exploration`/`n_convergence` instead.
-
-**Not covered:** this is one easy, rich-data model on one platform. Hard
-benches were not re-run under `α < 1`: the busulfan and vanco-peds data, the
-#1445 σ cap, `iiv_on_ruv` recentring, FREM, mixtures and IOV. Those code paths
-are exercised only by unit tests (IOV + mini-batch runs and stays finite). The
-NONMEM-anchored SAEM slow tests run with the option off. NONMEM has no
-mini-batch SAEM to compare against.
-
 ## Post-SAEM Finalization
 
 After the SAEM iterations complete:
@@ -1418,7 +1315,6 @@ well, which is what a direct `fit()` caller bypassing `ferx check` sees.
   n_leapfrog    = 0        # Set > 0 (e.g. 3) to use HMC instead of MH
   adapt_interval = 50      # Step-size adaptation frequency (interval rule)
   scale_adaptation = interval  # or robbins_monro
-  batch_fraction = 1       # fraction of subjects whose E-step runs per iteration (opt-in, see above)
   omega_burnin  = 20       # Iterations to hold Ω fixed while the chain warms up
   seed          = 12345    # RNG seed for reproducibility
   covariance    = true     # Compute standard errors
