@@ -12,8 +12,8 @@ use crate::io::data_source::DataSource;
 use crate::io::datareader::{
     read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped, read_nonmem_csv_routed,
     read_nonmem_csv_routed_from, read_nonmem_csv_with_covariates_filtered_mapped,
-    read_nonmem_csv_with_covariates_mapped, CsvInput, MissingDvPolicy, ObsRouting, SelectionFilter,
-    ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
+    read_nonmem_csv_with_covariates_mapped, CovariateReads, CsvInput, MissingDvPolicy, ObsRouting,
+    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -1301,18 +1301,24 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
 }
 
 /// Every data column a relation of `model` reads, the set `W_COVARIATE_MISSING`
-/// is raised for (#2599): the required [`referenced_columns`], the names a
-/// `[derived]` expression looks up at evaluation time (not required columns, so
-/// not in `referenced_covariates`), and the `[output]` columns echoed from the
-/// data. A column only declared in `[covariates]` or listed in
-/// `covariate_columns`, with nothing reading it, is not here — a gap in it reaches
-/// neither the objective nor an output.
-fn columns_read_by_relations(model: &CompiledModel) -> std::collections::HashSet<String> {
-    referenced_columns(model)
-        .into_iter()
-        .chain(model.derived_reads().iter().cloned())
-        .chain(super::output_columns::output_echo_columns(model).cloned())
-        .collect()
+/// is raised for (#2599); the reader adds the columns its `[data_selection]`
+/// filter reads. Matched exactly: the required [`referenced_columns`], which are
+/// case-sensitive. Matched in any case: the names a `[derived]` expression looks
+/// up at evaluation time (not required columns, so not in
+/// `referenced_covariates`) and the `[output]` columns echoed from the data, both
+/// resolved case-insensitively. A column only declared in `[covariates]` or
+/// listed in `covariate_columns`, with nothing reading it, is in neither — a gap
+/// in it reaches neither the objective nor an output.
+fn columns_read_by_relations(model: &CompiledModel) -> CovariateReads {
+    CovariateReads {
+        exact: referenced_columns(model).into_iter().collect(),
+        any_case: model
+            .derived_reads()
+            .iter()
+            .chain(super::output_columns::output_echo_columns(model))
+            .cloned()
+            .collect(),
+    }
 }
 
 /// Whether this model routes any observation row to its endpoint **by CMT** (#1409).

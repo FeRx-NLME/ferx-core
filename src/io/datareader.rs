@@ -544,11 +544,30 @@ pub(crate) struct ObsRouting {
     /// The covariate columns `W_COVARIATE_MISSING` may be raised for (#2599).
     /// `None` — a model-blind read — warns for every covariate column with a
     /// missing value, since the reader cannot tell which ones a relation reads.
-    /// `Some(set)` — a model-aware read — warns only for the columns in `set`
-    /// (matched ignoring ASCII case, as the reader resolves names): a column no
-    /// relation reads cannot make the objective `NaN`, so a warning that says it
-    /// does is false and buries the ones that matter.
-    pub warn_missing_covariates: Option<HashSet<String>>,
+    /// `Some(reads)` — a model-aware read — warns only for a column `reads` names,
+    /// or one the `[data_selection]` filter reads: a column nothing reads cannot
+    /// make the objective `NaN`, so a warning that says it does is false and
+    /// buries the ones that matter.
+    pub warn_missing_covariates: Option<CovariateReads>,
+}
+
+/// The data columns a model reads, for the `W_COVARIATE_MISSING` gate (#2599), split
+/// by how each consumer resolves a name against the dataset header.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CovariateReads {
+    /// Matched exactly: a model covariate is case-sensitive, so reading `WT` says
+    /// nothing about an unread `wt` column beside it.
+    pub exact: HashSet<String>,
+    /// Matched ignoring ASCII case: consumers that look a name up case-insensitively
+    /// (`[derived]`'s variable map, the `[output]` echo).
+    pub any_case: HashSet<String>,
+}
+
+impl CovariateReads {
+    /// Whether a consumer reads the dataset column `name`.
+    fn reads(&self, name: &str) -> bool {
+        self.exact.contains(name) || self.any_case.iter().any(|c| c.eq_ignore_ascii_case(name))
+    }
 }
 
 impl ObsRouting {
@@ -583,16 +602,18 @@ impl ObsRouting {
 
     /// Restrict `W_COVARIATE_MISSING` to the covariates `columns` (builder form;
     /// see [`ObsRouting::warn_missing_covariates`]).
-    pub(crate) fn with_warn_missing_covariates(mut self, columns: HashSet<String>) -> Self {
-        self.warn_missing_covariates = Some(columns);
+    pub(crate) fn with_warn_missing_covariates(mut self, reads: CovariateReads) -> Self {
+        self.warn_missing_covariates = Some(reads);
         self
     }
 
     /// Whether `W_COVARIATE_MISSING` may be raised for covariate column `name`.
-    fn warns_missing_covariate(&self, name: &str) -> bool {
-        self.warn_missing_covariates
-            .as_ref()
-            .map_or(true, |set| set.iter().any(|c| c.eq_ignore_ascii_case(name)))
+    /// `filter` is the read's `[data_selection]` filter, itself a reader of the
+    /// columns its clauses name — resolved case-insensitively, as the reader does.
+    fn warns_missing_covariate(&self, name: &str, filter: Option<&SelectionFilter>) -> bool {
+        self.warn_missing_covariates.as_ref().map_or(true, |reads| {
+            reads.reads(name) || filter.is_some_and(|f| f.references_column(name))
+        })
     }
 
     /// Set the missing-DV policy (builder form), leaving the routing sets alone.
@@ -1550,11 +1571,11 @@ fn read_nonmem_csv_impl(
     // `min` / `max` / comparisons return a finite value, so for those relations
     // this warning is the only sign anything is wrong (#2041).
     let mut population_warnings = population_warnings;
-    // Only for a column a relation reads (#2599): on a model-aware read an unread
+    // Only for a column the model reads (#2599): on a model-aware read an unread
     // column with gaps is not a problem, and the warning's claim would be false.
     for name in existing_cov_names
         .iter()
-        .filter(|n| routing.warns_missing_covariate(n))
+        .filter(|n| routing.warns_missing_covariate(n, filter))
     {
         let missing: Vec<&str> = subjects
             .iter()

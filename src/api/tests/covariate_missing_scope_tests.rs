@@ -23,10 +23,13 @@
 //! in the reader (unread columns warn again); making it return `false` (read
 //! covariates go silent); not registering `[scaling]` covariates (`CRCL` goes silent);
 //! dropping the `[derived]` reads from `columns_read_by_relations` (`LAB` goes silent);
-//! dropping the `[output]` echo columns (`OUT` goes silent); dropping the `[derived]`
+//! dropping the `[output]` echo columns (`OUT` goes silent); dropping the filter
+//! check (`KEEP` goes silent); matching `referenced_columns` ignoring case (`wt`
+//! warns); dropping the `[derived]`
 //! shadow from `output_echo_columns` (`LAB_RATIO` warns); re-adding the declared / `covariate_columns` widening (the last two tests).
 
 use crate::api::read_population_for;
+use crate::io::datareader::SelectionFilter;
 use crate::parser::model_parser::parse_full_model;
 use crate::read_nonmem_csv;
 use crate::types::Population;
@@ -56,13 +59,19 @@ fn model_declaring_unused() -> String {
 
 /// Subject 2 has no value in any covariate column; `UNUSED_ALL` is `.` everywhere,
 /// the rest are filled for subject 1.
-const DATA: &str = "ID,TIME,DV,EVID,AMT,CMT,WT,CRCL,LAB,OUT,LAB_RATIO,UNUSED_ALL,UNUSED_SOME\n\
-    1,0,.,1,100,1,70,100,5,1,9,.,3\n\
-    1,1,5.0,0,.,1,70,100,5,1,9,.,3\n\
-    1,4,3.0,0,.,1,70,100,5,1,9,.,3\n\
-    2,0,.,1,100,1,.,.,.,.,.,.,.\n\
-    2,1,4.0,0,.,1,.,.,.,.,.,.,.\n\
-    2,4,2.5,0,.,1,.,.,.,.,.,.,.\n";
+///
+/// `KEEP` is read only by the `[data_selection]` filter of
+/// [`an_unread_column_read_by_the_row_filter_warns`]; `wt` is an unread column whose
+/// name differs from the read `WT` only in case — a model covariate is matched
+/// case-sensitively, so reading `WT` must not make `wt` warn.
+const DATA: &str =
+    "ID,TIME,DV,EVID,AMT,CMT,WT,CRCL,LAB,OUT,LAB_RATIO,KEEP,wt,UNUSED_ALL,UNUSED_SOME\n\
+    1,0,.,1,100,1,70,100,5,1,9,0,70,.,3\n\
+    1,1,5.0,0,.,1,70,100,5,1,9,0,70,.,3\n\
+    1,4,3.0,0,.,1,70,100,5,1,9,0,70,.,3\n\
+    2,0,.,1,100,1,.,.,.,.,.,.,.,.,.\n\
+    2,1,4.0,0,.,1,.,.,.,.,.,.,.,.,.\n\
+    2,4,2.5,0,.,1,.,.,.,.,.,.,.,.,.\n";
 
 fn data_file() -> tempfile::NamedTempFile {
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -83,6 +92,14 @@ fn warned(pop: &Population) -> Vec<String> {
 }
 
 fn read(model_src: &str, fallback: Option<&[&str]>) -> Population {
+    read_filtered(model_src, fallback, None)
+}
+
+fn read_filtered(
+    model_src: &str,
+    fallback: Option<&[&str]>,
+    filter: Option<&SelectionFilter>,
+) -> Population {
     let parsed = parse_full_model(model_src).expect("model parses");
     let f = data_file();
     read_population_for(
@@ -91,7 +108,7 @@ fn read(model_src: &str, fallback: Option<&[&str]>) -> Population {
         f.path().to_str().unwrap(),
         fallback,
         None,
-        None,
+        filter,
         &[],
     )
     .expect("model-aware read")
@@ -108,12 +125,14 @@ fn the_model_blind_reader_warns_for_every_gapped_column() {
         warned(&pop),
         [
             "CRCL",
+            "KEEP",
             "LAB",
             "LAB_RATIO",
             "OUT",
             "UNUSED_ALL",
             "UNUSED_SOME",
-            "WT"
+            "WT",
+            "wt"
         ],
         "{:?}",
         pop.warnings
@@ -141,9 +160,10 @@ fn an_unread_column_with_gaps_does_not_warn() {
         .all(|s| s.covariates["UNUSED_ALL"].is_nan()));
     assert!(pop.subjects[1].covariates["LAB_RATIO"].is_nan());
     assert!(
-        !pop.warnings
-            .iter()
-            .any(|w| w.contains("UNUSED") || w.contains("LAB_RATIO")),
+        !pop.warnings.iter().any(|w| w.contains("UNUSED")
+            || w.contains("LAB_RATIO")
+            || w.contains("KEEP")
+            || w.contains("covariate wt ")),
         "no warning may name an unread column: {:?}",
         pop.warnings
     );
@@ -198,4 +218,20 @@ fn a_declared_but_unread_column_does_not_warn() {
         pop.warnings
     );
     assert!(pop.subjects[1].covariates["UNUSED_SOME"].is_nan());
+}
+
+/// A `[data_selection]` clause reads its column too: `KEEP == 1` is false for a
+/// `NaN` cell, so subject 2 is silently kept. Both sides in one fixture — the same
+/// read without the filter (every other test here) leaves `KEEP` quiet.
+#[test]
+fn an_unread_column_read_by_the_row_filter_warns() {
+    let filter = SelectionFilter::from_opts(&["KEEP == 1".to_string()], &[], &[]).unwrap();
+    let pop = read_filtered(MODEL, None, Some(&filter));
+    assert_eq!(
+        warned(&pop),
+        ["CRCL", "KEEP", "LAB", "OUT", "WT"],
+        "{:?}",
+        pop.warnings
+    );
+    assert_eq!(pop.subjects.len(), 2, "the NaN cell keeps subject 2");
 }
