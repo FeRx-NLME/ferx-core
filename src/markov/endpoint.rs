@@ -1073,27 +1073,33 @@ mod tests {
     #[test]
     fn mctmm_equals_handwritten_ctmm_bitwise() {
         // The tail-stable spelling the expansion documents: rates as π-ratios, the σ ratios
-        // in the log domain via the softplus sp(v) = (v + |v|)/2 + log(1 + e^{−|v|}).
-        let sp = |v: &str| format!("(({v} + abs({v})) / 2 + log(1 + exp(-abs({v}))))");
+        // in the log domain as softplus differences sp(u) − sp(v) taken from the exact gap
+        // d = u − v of the raw cut-points, so the common `lp` cancels analytically.
+        let spd = |u: &str, v: &str, d: &str| {
+            format!(
+                "({d} / 2 * (1 + ({u} + {v}) / (abs({u}) + abs({v}))) \
+                 + log(1 + exp(-abs({u}))) - log(1 + exp(-abs({v}))))"
+            )
+        };
         let x0 = "((C1 + ETA_C) - (BX * X))";
         let x1 = "((C1 + ETA_C + exp(LD2)) - (BX * X))";
+        let g01 = "((C1 + ETA_C) - (C1 + ETA_C + exp(LD2)))";
         let tau = "exp(LTAU + ETA_TAU)";
         // Each rate is `ratio / τ`, repelled (−1) unless τ clears the division floor.
         // …and unless the cut-point gap is resolvable (`1 − e^{α₀ − α₁} > 1e-30`).
         let rate = |r: &str| {
             format!(
-                "(if (1e-30 < ({tau}) && 1e-30 < (1 - exp((C1 + ETA_C) - (C1 + ETA_C + exp(LD2))))) \
+                "(if (1e-30 < ({tau}) && 1e-30 < (1 - exp({g01}))) \
                  (({r}) / ({tau})) else (-1))"
             )
         };
-        let up01 = format!("inv_logit((-{x0})) * (1 - exp({x0} - {x1}))");
+        let up01 = format!("inv_logit((-{x0})) * (1 - exp({g01}))");
         let down01 = format!(
-            "exp({} - {})",
-            sp(&format!("(-{x1})")),
-            sp(&format!("(-{x0})"))
+            "exp({})",
+            spd(&format!("(-{x1})"), &format!("(-{x0})"), g01)
         );
-        let up12 = format!("exp({} - {})", sp(x0), sp(x1));
-        let down12 = format!("inv_logit({x1}) * (1 - exp({x0} - {x1}))");
+        let up12 = format!("exp({})", spd(x0, x1, g01));
+        let down12 = format!("inv_logit({x1}) * (1 - exp({g01}))");
         let hand = MCTMM_3
             .replace("type      = mctmm", "type      = ctmm")
             .replace("  tau       = exp(LTAU + ETA_TAU)\n", "")
@@ -1252,6 +1258,66 @@ mod tests {
         let q = generator_of(&model)(&[0.3, 800.0], &[], &HashMap::new(), &[]);
         assert!(q.iter().all(|v| v.is_finite()), "C1 = 800: generator {q}");
         assert!(((q[(1, 2)] + q[(2, 1)]) * 0.3_f64.exp() - 1.0).abs() < 1e-14);
+    }
+
+    /// Regression (#2474 review): the cut-point spacing must survive a linear predictor that
+    /// dwarfs it. Forming `x_k = α_k − lp` and *then* subtracting rounds the spacing away —
+    /// with `[0, 1]` at `lp = 1e16` both `x_k` are `−1e16`, the first pair read
+    /// `(q01, q10) = (0, 1/τ)` and state 0 became absorbing, so a panel that stays there
+    /// scored as a perfect fit. Here `lp` (not the cut-points) is moved into both tails.
+    /// The limits are exact closed forms (with `e = e¹`, `τ = 1`):
+    ///   `lp → +∞`: pair 0 = `(1 − e^{−1}, e^{−1})`, pair 1 = `(1, 0)`
+    ///   `lp → −∞`: pair 0 = `(0, 1)`,               pair 1 = `(e^{−1}, 1 − e^{−1})`
+    /// with the "0" entries `O(e^{−|lp|})`.
+    #[test]
+    fn mctmm_rates_stay_exact_when_lp_dwarfs_the_cutpoints() {
+        let src = r"
+[parameters]
+  theta L(0.0, -1e17, 1e17)
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [a=0, b=1, c=2]
+  tau       = 1
+  cutpoints = [0, 1]
+  lp        = L
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let e1 = (-1.0_f64).exp();
+        let high = [(1.0 - e1, e1), (1.0, 0.0)];
+        let low = [(0.0, 1.0), (e1, 1.0 - e1)];
+        for (lp, want) in [
+            (40.0, high),
+            (800.0, high),
+            (1e16, high),
+            (-40.0, low),
+            (-800.0, low),
+            (-1e16, low),
+        ] {
+            let q = generator_of(&model)(&[lp], &[], &HashMap::new(), &[]);
+            for (k, (up, down)) in want.into_iter().enumerate() {
+                for (got, want, dir) in [(q[(k, k + 1)], up, "up"), (q[(k + 1, k)], down, "down")] {
+                    assert!(got.is_finite(), "lp = {lp}: pair {k} {dir} = {got}");
+                    let ok = if want == 0.0 {
+                        (0.0..1e-15).contains(&got)
+                    } else {
+                        (got / want - 1.0).abs() < 1e-12
+                    };
+                    assert!(ok, "lp = {lp}: pair {k} {dir} rate {got}, want {want}");
+                }
+            }
+            // A panel that never leaves the bottom (or top) state is scored, not rewarded:
+            // only the state the steady state favours can be near-absorbing.
+            let stay = if lp > 0.0 { 0 } else { 2 };
+            let subject = ctmm_subject(&[(0.0, stay), (1.0, stay), (2.0, stay)]);
+            let v = ctmm_subject_nll(&model, &subject, &[lp], &[]);
+            assert!(
+                v.is_finite() && v > 0.5 && v < 1e6,
+                "lp = {lp}: staying in state {stay} must cost probability, NLL {v} \
+                 (sentinel {SUBJECT_SENTINEL_NLL})"
+            );
+        }
     }
 
     /// Regression (#2474 review): `τ` is a time, and the evaluators' `/` returns `0` for a

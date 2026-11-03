@@ -121,6 +121,10 @@ CTMM rule on covariates, `TIME` and IOV below. It also covers the drug-driven ro
 `lp` (or `tau`) that reads an ODE state makes `Q(t)` time-inhomogeneous and uses the
 occupancy-ODE path, described under *Drug- / PD-driven intensities* below.
 
+The expansion writes each intensity as a ratio of steady-state probabilities, so it stays
+exact to rounding however deep in a logit tail the scale sits. That holds whether the
+cut-points themselves are extreme or `lp` is far larger than their spacing.
+
 ### Keys
 
 | Key | Required | Meaning |

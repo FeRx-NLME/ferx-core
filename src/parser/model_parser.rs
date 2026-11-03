@@ -9923,6 +9923,9 @@ const MCTMM_TAU_FLOOR: &str = "1e-30";
 /// `(x + |x|)/2 + log(1 + e^{−|x|})`. The naive `π_{k+1} / (π_k + π_{k+1})` loses every
 /// digit once the cut-points sit deep in a tail — at `[40, 41]` both `F_k` round to `1`
 /// and the last pair is `0/0` — while this form stays exact to rounding at any logit.
+/// Every gap `x_i − x_j` is formed from the raw cut-points and every softplus difference
+/// from that exact gap, so a common `lp` far beyond the cut-point spacing (`|lp| = 1e16`
+/// against `[0, 1]`) cancels analytically instead of rounding the spacing away.
 /// Each rate is the ratio divided by `τ`. A `τ` at or below `MCTMM_TAU_FLOOR` (zero,
 /// negative, or too small for the evaluators' division), or cut-points that are not
 /// strictly and resolvably increasing, give every rate the value `−1`, so the subject is
@@ -9936,8 +9939,21 @@ fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize,
             None => format!("({c})"),
         })
         .collect();
-    // Overflow-free softplus log(1 + eᵛ).
-    let sp = |v: &str| format!("(({v} + abs({v})) / 2 + log(1 + exp(-abs({v}))))");
+    // Gaps between shifted cut-points, `x_i − x_j`, taken from the **raw** cut-points so
+    // the common `lp` cancels analytically: `(α_i − lp) − (α_j − lp)` rounded would lose
+    // the whole spacing once `|lp|` dwarfs it (`[0, 1]` at `lp = 1e16` reads `0`).
+    let gap = |i: usize, j: usize| format!("(({}) - ({}))", cuts[i], cuts[j]);
+    // `sp(u) − sp(v)` for the overflow-free softplus `sp(v) = log(1 + eᵛ)`, given the
+    // exact gap `d = u − v`. The hinge part `max(u, 0) − max(v, 0)` is
+    // `d/2 · (1 + (u + v)/(|u| + |v|))` — `d` on the positive side, `0` on the negative,
+    // `u` across zero — so the shift never enters a difference of two large numbers; the
+    // remaining `log(1 + e^{−|·|})` terms are bounded and absolutely accurate.
+    let spd = |u: &str, v: &str, d: &str| {
+        format!(
+            "({d} / 2 * (1 + ({u} + {v}) / (abs({u}) + abs({v}))) \
+             + log(1 + exp(-abs({u}))) - log(1 + exp(-abs({v}))))"
+        )
+    };
     let neg = |v: &str| format!("(-{v})");
     // `ratio / τ`, repelled when `τ` is not a usable positive time. The evaluators' `/`
     // returns `0.0` for `|τ| < 1e-30`, so `τ = 0` (or a value below that floor) would
@@ -9970,23 +9986,25 @@ fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize,
         let (up, down) = match (a, c) {
             (Some(a), Some(c)) => (
                 format!(
-                    "exp({} - {}) * (1 - exp({b} - {c})) / (1 - exp({a} - {c}))",
-                    sp(a),
-                    sp(b)
+                    "exp({}) * (1 - exp({})) / (1 - exp({}))",
+                    spd(a, b, &gap(k - 1, k)),
+                    gap(k, k + 1),
+                    gap(k - 1, k + 1)
                 ),
                 format!(
-                    "exp({} - {}) * (1 - exp({a} - {b})) / (1 - exp({a} - {c}))",
-                    sp(&neg(c)),
-                    sp(&neg(b))
+                    "exp({}) * (1 - exp({})) / (1 - exp({}))",
+                    spd(&neg(c), &neg(b), &gap(k, k + 1)),
+                    gap(k - 1, k),
+                    gap(k - 1, k + 1)
                 ),
             ),
             (None, Some(c)) => (
-                format!("inv_logit({}) * (1 - exp({b} - {c}))", neg(b)),
-                format!("exp({} - {})", sp(&neg(c)), sp(&neg(b))),
+                format!("inv_logit({}) * (1 - exp({}))", neg(b), gap(k, k + 1)),
+                format!("exp({})", spd(&neg(c), &neg(b), &gap(k, k + 1))),
             ),
             (Some(a), None) => (
-                format!("exp({} - {})", sp(a), sp(b)),
-                format!("inv_logit({b}) * (1 - exp({a} - {b}))"),
+                format!("exp({})", spd(a, b, &gap(k - 1, k))),
+                format!("inv_logit({b}) * (1 - exp({}))", gap(k - 1, k)),
             ),
             (None, None) => (format!("inv_logit({})", neg(b)), format!("inv_logit({b})")),
         };
