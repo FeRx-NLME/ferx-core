@@ -3168,6 +3168,7 @@ pub ferx_core::types::FitOptions::gn_lambda: f64
 pub ferx_core::types::FitOptions::gradient_method: ferx_core::GradientMethod
 pub ferx_core::types::FitOptions::ignore_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitOptions::ignore_subjects: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::FitOptions::imp_adapt_passes: usize
 pub ferx_core::types::FitOptions::imp_auto: bool
 pub ferx_core::types::FitOptions::imp_averaging: usize
 pub ferx_core::types::FitOptions::imp_defensive_alpha: f64
@@ -3450,6 +3451,7 @@ pub ferx_core::types::ImpmapTraceRow::omega_lower_tri: alloc::vec::Vec<f64>
 pub ferx_core::types::ImpmapTraceRow::sigma: alloc::vec::Vec<f64>
 pub ferx_core::types::ImpmapTraceRow::theta: alloc::vec::Vec<f64>
 pub struct ferx_core::types::ImportanceSamplingResult
+pub ferx_core::types::ImportanceSamplingResult::adapt_passes: usize
 pub ferx_core::types::ImportanceSamplingResult::ess_median: f64
 pub ferx_core::types::ImportanceSamplingResult::ess_min: f64
 pub ferx_core::types::ImportanceSamplingResult::kappa_treatment: ferx_core::KappaTreatment
@@ -4761,6 +4763,7 @@ pub ferx_core::FitOptions::gn_lambda: f64
 pub ferx_core::FitOptions::gradient_method: ferx_core::GradientMethod
 pub ferx_core::FitOptions::ignore_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitOptions::ignore_subjects: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::FitOptions::imp_adapt_passes: usize
 pub ferx_core::FitOptions::imp_auto: bool
 pub ferx_core::FitOptions::imp_averaging: usize
 pub ferx_core::FitOptions::imp_defensive_alpha: f64
@@ -5061,6 +5064,7 @@ pub ferx_core::ImpmapTraceRow::omega_lower_tri: alloc::vec::Vec<f64>
 pub ferx_core::ImpmapTraceRow::sigma: alloc::vec::Vec<f64>
 pub ferx_core::ImpmapTraceRow::theta: alloc::vec::Vec<f64>
 pub struct ferx_core::ImportanceSamplingResult
+pub ferx_core::ImportanceSamplingResult::adapt_passes: usize
 pub ferx_core::ImportanceSamplingResult::ess_median: f64
 pub ferx_core::ImportanceSamplingResult::ess_min: f64
 pub ferx_core::ImportanceSamplingResult::kappa_treatment: ferx_core::KappaTreatment

@@ -6844,16 +6844,6 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        if model.residual_error_eta.is_some() {
-            diags.push(
-                Diagnostic::error(
-                    "E_BLOCK_SIGMA_IIV_ON_RUV_UNSUPPORTED",
-                    "block_sigma correlated residual errors are not yet supported with \
-                     iiv_on_ruv residual-error scaling.",
-                )
-                .with_block("fit_options"),
-            );
-        }
         // #979: FOCE/FOCEI score an IOV subject's dense `R` through the stacked `[η, κ]`
         // marginal (`foce_subject_nll_iov_cov`) and its EBE search (`find_ebe_iov`), both
         // at the live ρ. The other estimators' IOV data terms (SAEM's M-step and E-step,

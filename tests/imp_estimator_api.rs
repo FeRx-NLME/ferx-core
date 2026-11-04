@@ -266,6 +266,33 @@ fn imp_estimator_fits_iov_models() {
     assert!(result.ofv.is_finite());
 }
 
+/// #2651: the final marginal of an estimating run goes through the evaluator, so
+/// a normal proposal used to lose it even when the iterations themselves were
+/// healthy.
+#[test]
+fn imp_estimator_keeps_its_final_marginal_under_a_normal_proposal() {
+    let (model, mut population) = warfarin();
+    downsample(&mut population, 4);
+    let mut opts = sparse_opts();
+    opts.method = EstimationMethod::Imp;
+    opts.methods = vec![EstimationMethod::Imp];
+    opts.imp_iterations = 5;
+    opts.imp_averaging = 2;
+    opts.imp_proposal_df = f64::INFINITY;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("estimating imp with a normal proposal must produce a fit");
+    let imp = result
+        .importance_sampling
+        .as_ref()
+        .expect("an estimating imp run reports its final marginal");
+    assert!(
+        imp.minus2_log_likelihood.is_finite(),
+        "-2 LL must be finite, got {}",
+        imp.minus2_log_likelihood
+    );
+    assert!(imp.ess_min > 0.0, "ess_min {}", imp.ess_min);
+}
+
 #[test]
 fn imp_estimator_rejects_invalid_proposal_df() {
     // A programmatic caller can set imp_proposal_df directly, bypassing the

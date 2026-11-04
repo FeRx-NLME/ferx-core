@@ -194,18 +194,103 @@ fn per_cmt_and_selected_error_models_are_refused() {
     );
 }
 
+/// `iiv_on_ruv` scales `R` as a whole and leaves its correlations alone, so it sits next
+/// to a `correlation` line in either order (#2656), both resolved to what they name.
 #[test]
-fn iiv_on_ruv_and_block_sigma_are_refused() {
-    let line = "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation ar1(RHO) by ARM";
-    let e = err(
-        &format!("{RHO}  omega ETA_RUV ~ 0.1\n"),
-        &format!("{line}\n  iiv_on_ruv = ETA_RUV"),
-    );
+fn a_correlation_line_composes_with_iiv_on_ruv_in_either_order() {
+    let corr = "  correlation ar1(RHO) by ARM";
+    let ruv = "  iiv_on_ruv = ETA_RUV";
+    let statement = "  DV ~ combined(PROP_ERR, ADD_ERR)";
+    for body in [
+        format!("{statement}\n{corr}\n{ruv}"),
+        format!("{statement}\n{ruv}\n{corr}"),
+    ] {
+        let m = parse_model_string(&text(&format!("{RHO}  omega ETA_RUV ~ 0.1\n"), "", &body))
+            .expect("parses");
+        assert_eq!(m.residual_error_eta, Some(0), "{body}");
+        assert_eq!(
+            m.residual_serial.as_ref().map(|c| c.kind),
+            Some(ResidualSerialKind::Ar1),
+            "{body}"
+        );
+    }
+}
+
+/// `iiv_on_ruv` is a block-level modifier, so it sits beside an `if … else` selected
+/// error model too (#2656), before or after it. That is the only way a `block_sigma`
+/// across paired rows, whose two rows take different sigmas, can carry it.
+#[test]
+fn iiv_on_ruv_sits_beside_a_selected_error_model() {
+    let selected = "  if (FREE == 0) {\n    DV ~ proportional(PROP_ERR)\n  } else {\n    \
+                    DV ~ proportional(ADD_ERR)\n  }";
+    let ruv = "  iiv_on_ruv = ETA_RUV  # on both branches";
+    for body in [format!("{selected}\n{ruv}"), format!("{ruv}\n{selected}")] {
+        let src = text("  omega ETA_RUV ~ 0.1\n", "", &body).replace(
+            "  sigma PROP_ERR ~ 0.2 (sd)\n  sigma ADD_ERR ~ 1.0 (sd)\n",
+            "  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.01, 1.0]\n",
+        );
+        let m = parse_model_string(&src).expect("parses");
+        assert_eq!(m.residual_error_eta, Some(0), "{body}");
+        assert!(
+            matches!(m.error_spec, crate::types::ErrorSpec::Selected { .. }),
+            "{body}"
+        );
+        assert_eq!(m.residual_correlations.len(), 1, "{body}");
+    }
+    let twice = format!("{selected}\n{ruv}\n  iiv_on_ruv = ETA_CL");
     assert_eq!(
-        e,
-        "[error_model] `correlation ar1(RHO)` is not supported together with `iiv_on_ruv = \
-         ETA_RUV`."
+        err("  omega ETA_RUV ~ 0.1\n", &twice),
+        "[error_model] has more than one `iiv_on_ruv = ...` entry"
     );
+    // A name that is no omega is refused the same way on this form.
+    assert_eq!(
+        err("", &format!("{selected}\n{ruv}")),
+        "[error_model] iiv_on_ruv = ETA_RUV: no `omega ETA_RUV ~ ...` declared in [parameters] \
+         (the residual-error random effect must be a declared omega)"
+    );
+}
+
+/// #2656 review: the line scales every branch, so inside one branch it would fit a model
+/// other than the one written. Refused in the `if` branch, the `else` branch and a nested
+/// `else if`, each naming the η, with the same line after the closing brace still accepted.
+#[test]
+fn iiv_on_ruv_inside_a_selected_branch_is_refused() {
+    let want = "[error_model] `iiv_on_ruv = ETA_RUV` is inside an `if/else` branch. It scales \
+                every branch, so write it after the closing `}`.";
+    let (a, b) = (
+        "    DV ~ proportional(PROP_ERR)\n",
+        "    DV ~ proportional(ADD_ERR)\n",
+    );
+    let ruv = "    iiv_on_ruv = ETA_RUV  # meant for this branch\n";
+    for (label, body) in [
+        (
+            "if",
+            format!("  if (FREE == 0) {{\n{a}{ruv}  }} else {{\n{b}  }}"),
+        ),
+        (
+            "else",
+            format!("  if (FREE == 0) {{\n{a}  }} else {{\n{b}{ruv}  }}"),
+        ),
+        (
+            "else if",
+            format!(
+                "  if (FREE == 0) {{\n{a}  }} else if (FREE == 1) {{\n{ruv}{b}  }} else {{\n{a}  }}"
+            ),
+        ),
+    ] {
+        assert_eq!(err("  omega ETA_RUV ~ 0.1\n", &body), want, "{label}");
+    }
+    // The depth returns to 0 at the closing brace, so the same line right after it parses.
+    let beside = format!("  if (FREE == 0) {{\n{a}  }} else {{\n{b}  }}\n{ruv}");
+    let src = text("  omega ETA_RUV ~ 0.1\n", "", &beside);
+    assert_eq!(
+        parse_model_string(&src).expect("beside").residual_error_eta,
+        Some(0)
+    );
+}
+
+#[test]
+fn a_correlation_line_next_to_block_sigma_is_refused() {
     let src = text(
         RHO,
         "",

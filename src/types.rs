@@ -6726,9 +6726,12 @@ pub struct ImportanceSamplingResult {
     /// size fraction fell below `FitOptions::imp_low_ess_threshold`. Empty list
     /// means every subject's proposal matched its posterior well.
     pub low_ess_subjects: Vec<(String, f64)>,
-    /// Number of importance samples drawn per subject (`FitOptions::imp_samples`).
+    /// Number of importance samples drawn per subject (`FitOptions::imp_samples`,
+    /// or `impmap_samples` for IMPMAP). This is the configured count: the final
+    /// evaluation does not inherit a count ramped up by `imp_auto`/`impmap_auto`.
     pub n_samples: usize,
-    /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`).
+    /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`);
+    /// `f64::INFINITY` for a multivariate-normal proposal.
     pub proposal_df: f64,
     /// Minimum across-subject normalized ESS fraction (ESS / K). 1.0 = ideal,
     /// near 0 = degenerate proposal for at least one subject.
@@ -6737,6 +6740,12 @@ pub struct ImportanceSamplingResult {
     pub ess_median: f64,
     /// Treatment of per-occasion kappa random effects.  See [`KappaTreatment`].
     pub kappa_treatment: KappaTreatment,
+    /// The pilot passes configured to adapt each subject's proposal before these
+    /// draws (`FitOptions::imp_adapt_passes`), which is a maximum: a subject stops
+    /// early at a pass with unusable moments, and a FREM Rao-Blackwellised
+    /// subject runs none. `0` is the single Laplace proposal.
+    #[serde(default)]
+    pub adapt_passes: usize,
 }
 
 /// One row of the IMPMAP per-iteration parameter trace.
@@ -9432,6 +9441,13 @@ pub struct FitOptions {
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
     pub imp_low_ess_threshold: f64,
+    /// Pilot passes that adapt each subject's proposal before a marginal
+    /// `−2 log L` is evaluated: `imp_eval_only`, and the marginal reported after
+    /// an estimating `imp` / `impmap` stage. Not the MCEM iterations. Default 5,
+    /// matching NONMEM `EONLY=1 NITER=5`; each pass costs one more `imp_samples`
+    /// draws per subject. `0` keeps the single Laplace proposal, which reads high
+    /// on sparse subjects (#2653).
+    pub imp_adapt_passes: usize,
     /// Number of MCEM iterations for the estimating `imp` path (ignored when
     /// `imp_eval_only`). Default 200.
     pub imp_iterations: usize,
@@ -9503,13 +9519,14 @@ pub struct FitOptions {
     /// covariate dimensions has very poor ESS. Set `false` only to diagnose the
     /// RB path against the full-dimensional sampler.
     pub frem_rao_blackwell: bool,
-    /// Adaptive importance-sample count for IMP (NONMEM `AUTO`/`STDOBJ`). When
-    /// `true` (the default), `imp_samples` is the *starting* count and is ramped
-    /// up (×2 per iteration, capped at 10000) whenever the objective's Monte-Carlo
-    /// standard deviation exceeds 1.0, so high-dimensional / FREM fits reach a
-    /// low-noise objective automatically instead of carrying a sample-count-
-    /// dependent M-step bias. Low-dimensional, well-sampled fits never trip the
-    /// threshold, so there is no cost there. Set `false` to pin the sample count.
+    /// Adaptive importance-sample count for IMP (NONMEM `AUTO`). When `true` (the
+    /// default), `imp_samples` is the *starting* count and is doubled after each
+    /// iteration, up to 10000, while the **per-subject** objective Monte-Carlo SE
+    /// (the total SE over √N) exceeds 0.05. K never comes back down. High-dimensional
+    /// / FREM fits then reach a low-noise objective instead of carrying a sample-count-
+    /// dependent M-step bias, but a fit that stays above the target runs at the cap,
+    /// at about ten times the per-iteration cost of K = 1000. Set `false` to pin the
+    /// sample count.
     pub imp_auto: bool,
     /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
     /// [`FitOptions::imp_auto`] but ramps `impmap_samples`. Default `true`.
@@ -9903,6 +9920,7 @@ impl Default for FitOptions {
             imp_proposal_df: 5.0,
             imp_seed: None,
             imp_low_ess_threshold: 0.1,
+            imp_adapt_passes: 5,
             imp_iterations: 200,
             imp_averaging: 50,
             imp_eval_only: false,
@@ -11394,6 +11412,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "imp_proposal_df",
             "imp_seed",
             "imp_low_ess_threshold",
+            "imp_adapt_passes",
             "imp_iterations",
             "imp_averaging",
             "imp_eval_only",
@@ -11416,6 +11435,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_seed",
             "impmap_averaging",
             "impmap_low_ess_threshold",
+            "imp_adapt_passes",
             "impmap_trace",
             "impmap_mceta",
             "impmap_sobol",

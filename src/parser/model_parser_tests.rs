@@ -4350,6 +4350,7 @@ fn test_imp_method_and_imp_options_parse() {
         "imp_proposal_df = 4.0".to_string(),
         "imp_seed = 99".to_string(),
         "imp_low_ess_threshold = 0.2".to_string(),
+        "imp_adapt_passes = 2".to_string(),
         "imp_sobol = true".to_string(),
         "covariance = false".to_string(),
         "verbose = false".to_string(),
@@ -4365,6 +4366,7 @@ fn test_imp_method_and_imp_options_parse() {
     assert_eq!(opts.imp_proposal_df, 4.0);
     assert_eq!(opts.imp_seed, Some(99));
     assert_eq!(opts.imp_low_ess_threshold, 0.2);
+    assert_eq!(opts.imp_adapt_passes, 2);
     // No "ignored option" warnings — keys are method-specific to Imp,
     // and Imp is in the chain.
     assert!(opts.unsupported_keys_warnings().is_empty());
@@ -4377,6 +4379,7 @@ fn test_imp_options_validate_ranges() {
     assert!(apply_fit_option(&mut opts, "imp_proposal_df", "0.5").is_err()); // < 1
     assert!(apply_fit_option(&mut opts, "imp_low_ess_threshold", "1.5").is_err()); // > 1
     assert!(apply_fit_option(&mut opts, "imp_low_ess_threshold", "-0.1").is_err()); // < 0
+    assert!(apply_fit_option(&mut opts, "imp_adapt_passes", "-1").is_err());
     assert!(apply_fit_option(&mut opts, "imp_iterations", "0").is_err()); // < 1
                                                                           // Defaults preserved after a failed apply.
     assert_eq!(opts.imp_samples, 1000);

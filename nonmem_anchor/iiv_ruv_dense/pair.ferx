@@ -1,0 +1,35 @@
+# ferx twin of nonmem_anchor/iiv_ruv_dense/bs_*.ctl (#2656): a block_sigma across a
+# total (FREE = 0) / unbound (FREE = 1) pair sharing an L2 id, with iiv_on_ruv scaling
+# both rows' residual SD. Every parameter is FIX: the anchor is a MAXEVAL=0 evaluation.
+# tests/iiv_ruv_dense_nonmem_anchor.rs swaps in rho and omega_ruv per probe.
+
+[parameters]
+  theta TVCL(1.05, 0.1, 10.0) FIX
+  theta TVV(9.5, 1.0, 100.0) FIX
+
+  omega ETA_CL ~ 0.08 FIX
+  omega ETA_V ~ 0.05 FIX
+  omega ETA_RUV ~ 0.25 FIX
+
+  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.0144, 0.0144, 0.04] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+  iiv_on_ruv = ETA_RUV
+
+[covariates]
+  FREE continuous
+
+[fit_options]
+  method = focei

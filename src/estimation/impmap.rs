@@ -235,11 +235,18 @@ impl ProposalRecenter {
 /// the prior term `−½ηᵀΩ⁻¹η` of the resulting far samples explodes the −2 log L
 /// and the next Ω M-step. We therefore **cap** the proposal-covariance diagonal
 /// at the prior `Ωᵢᵢ` — the conditional variance of a well-identified η is
-/// bounded above by its prior variance. The diagonal is floored only at a tiny
-/// absolute value to avoid a singular matrix (NOT at a fraction of Ω — see
-/// [`IMP_PROPOSAL_COV_FLOOR`]). If the result is still not Cholesky-invertible a
-/// zero matrix is returned, which makes `build_proposal` take its Ω fallback — a
-/// broad but valid proposal.
+/// bounded above by its prior variance. A capped dimension's covariances are
+/// rescaled by the same factor, so the correlations survive: `D C D` stays
+/// positive semi-definite, whereas capping the diagonal alone leaves a strongly
+/// correlated covariance indefinite (#2650). A non-finite variance carries no
+/// usable correlation, so its covariances are dropped. The diagonal is floored
+/// only at a tiny absolute value to avoid a singular matrix (NOT at a fraction of
+/// Ω — see [`IMP_PROPOSAL_COV_FLOOR`]). If the result is still not
+/// Cholesky-invertible the prior precision `Ω⁻¹` is returned — a broad but valid
+/// proposal. It has to be returned here: a zero matrix does not reach
+/// `build_proposal`'s Ω fallback, because the jitter turns it into a
+/// positive-definite `1e−10·I`, a proposal SD of 1e5 (#2650). A zero matrix remains
+/// only for an Ω that is itself not positive-definite.
 fn covariance_to_proposal_hessian(
     cov: &DMatrix<f64>,
     omega: &DMatrix<f64>,
@@ -247,19 +254,33 @@ fn covariance_to_proposal_hessian(
 ) -> DMatrix<f64> {
     let n = cov.nrows();
     let mut c = cov.clone();
+    let mut sd_scale = vec![1.0_f64; n];
     for i in 0..n {
         let hi = omega[(i, i)].max(floor);
         let v = c[(i, i)];
-        if !v.is_finite() || v > hi {
+        if !v.is_finite() {
             c[(i, i)] = hi;
+            sd_scale[i] = 0.0;
+        } else if v > hi {
+            c[(i, i)] = hi;
+            sd_scale[i] = (hi / v).sqrt();
         } else if v < floor {
             c[(i, i)] = floor;
         }
     }
-    match c.cholesky() {
-        Some(ch) => ch.inverse(),
-        None => DMatrix::zeros(n, n),
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            // Assign rather than multiply on a dropped dimension: `0 · NaN` is NaN.
+            let s = sd_scale[i] * sd_scale[j];
+            c[(i, j)] = if s == 0.0 { 0.0 } else { c[(i, j)] * s };
+        }
     }
+    c.cholesky()
+        .or_else(|| omega.clone().cholesky())
+        .map_or_else(|| DMatrix::zeros(n, n), |ch| ch.inverse())
 }
 
 /// Translate one subject's importance draws by `−shift` in η-space: every
@@ -915,11 +936,12 @@ fn run_mcem(
     // `k_samples` is mutable so the adaptive (`auto`) path can ramp it up between
     // iterations when the objective is too Monte-Carlo-noisy (NONMEM `AUTO`).
     let mut k_samples = k_opt.max(2);
-    // `INFINITY` selects the multivariate-normal proposal; any finite value must
-    // be a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
+    // `INFINITY` selects the multivariate-normal proposal; anything else must be
+    // a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
     // bypasses the parser's range check can't reach the `ChiSquared::new(nu)`
-    // panic in `subject_is_draws`. Mirrors `run_importance_sampling`.
-    if nu.is_finite() && nu < 1.0 {
+    // panic in `subject_is_draws`, and a NaN can't pass for a normal proposal by
+    // being non-finite. Mirrors `run_importance_sampling`.
+    if nu.is_nan() || nu < 1.0 {
         return Err(format!(
             "{label}: {df_key} must be >= 1.0 (or +inf for a normal proposal), got {nu}"
         ));
@@ -3367,7 +3389,7 @@ fn split_kappas(kappa_part: &[f64], n_kappa: usize, buf: &mut Vec<Vec<f64>>) -> 
 /// alone (scored exactly as before #2301), or an IOV subject's stacked
 /// `[η, κ₁..κ_K]`, scored with per-occasion predictions — the observation NLL
 /// SAEM's IOV M-step uses.
-fn draw_obs_nll(
+pub(crate) fn draw_obs_nll(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
@@ -5111,6 +5133,78 @@ mod tests {
         );
     }
 
+    /// Correlation between dimensions `i` and `j` of a covariance matrix.
+    fn corr(c: &DMatrix<f64>, i: usize, j: usize) -> f64 {
+        c[(i, j)] / (c[(i, i)] * c[(j, j)]).sqrt()
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_keeps_a_capped_correlated_covariance_pd() {
+        // #2650. Both variances sit just above Ωii and the correlation is about
+        // −0.98, so capping the diagonal alone gives
+        // 0.034·0.031 − 0.0335² < 0: indefinite, a failed Cholesky, a zero matrix.
+        let cov = DMatrix::from_row_slice(2, 2, &[0.0362, -0.0335, -0.0335, 0.0322]);
+        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[0.034, 0.031]));
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        let capped = h
+            .try_inverse()
+            .expect("capped covariance must stay invertible");
+        assert!((capped[(0, 0)] - 0.034).abs() < 1e-12);
+        assert!((capped[(1, 1)] - 0.031).abs() < 1e-12);
+        assert!(
+            (corr(&capped, 0, 1) - corr(&cov, 0, 1)).abs() < 1e-9,
+            "the cap must keep the correlation: {} vs {}",
+            corr(&capped, 0, 1),
+            corr(&cov, 0, 1)
+        );
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_rescales_only_what_the_cap_touched() {
+        // Dimension 0 is capped, 1 and 2 are not. Every correlation survives, and
+        // the covariance between the two uncapped dimensions is left exactly alone,
+        // so a scale applied to all off-diagonals, or squared, cannot pass.
+        let cov = DMatrix::from_row_slice(3, 3, &[4.0, 0.3, 0.2, 0.3, 0.25, 0.05, 0.2, 0.05, 0.16]);
+        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0, 10.0, 10.0]));
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        let capped = h.try_inverse().expect("must stay invertible");
+        assert!((capped[(0, 0)] - 1.0).abs() < 1e-9);
+        assert!((capped[(1, 2)] - 0.05).abs() < 1e-9);
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            assert!(
+                (corr(&capped, i, j) - corr(&cov, i, j)).abs() < 1e-9,
+                "correlation ({i},{j}) must survive the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_drops_covariances_of_a_non_finite_variance() {
+        // A NaN variance usually arrives with NaN covariances. They must not reach
+        // the Cholesky, or a dimension that could be capped costs the whole matrix.
+        let cov = DMatrix::from_row_slice(2, 2, &[f64::NAN, f64::NAN, f64::NAN, 0.2]);
+        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[0.5, 1.0]));
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        assert!((h[(0, 0)] - 2.0).abs() < 1e-9, "got {}", h[(0, 0)]);
+        assert!((h[(1, 1)] - 5.0).abs() < 1e-9, "got {}", h[(1, 1)]);
+        assert_eq!(h[(0, 1)], 0.0);
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_returns_the_prior_precision_when_indefinite() {
+        // An in-bounds but indefinite covariance gets past the cap and fails the
+        // Cholesky. The answer is Ω⁻¹ itself, not a zero matrix for `build_proposal`
+        // to jitter into a proposal of SD 1e5 (#2650).
+        let cov = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+        let omega = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 4.0]);
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        let want = omega.clone().try_inverse().expect("Ω is invertible");
+        assert!(
+            (&h - &want).abs().max() < 1e-12,
+            "got {h}, want Ω⁻¹ = {want}"
+        );
+    }
+
     #[test]
     fn covariance_to_proposal_hessian_caps_exploding_diagonal() {
         // A heavy-tailed-outlier-inflated covariance is capped at Ωii so the
@@ -5123,15 +5217,14 @@ mod tests {
     }
 
     #[test]
-    fn covariance_to_proposal_hessian_falls_back_on_non_pd() {
-        // An indefinite covariance is not Cholesky-invertible → zero matrix,
-        // signalling `build_proposal` to use its Ω fallback.
+    fn covariance_to_proposal_hessian_is_zero_only_when_omega_is_not_pd() {
+        // With no usable covariance and no usable Ω there is nothing left to return.
         let cov = DMatrix::from_row_slice(2, 2, &[1.0, 5.0, 5.0, 1.0]);
-        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0, 1.0]));
+        let omega = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
         assert!(
             h.iter().all(|&v| v == 0.0),
-            "non-PD covariance must yield the zero fallback"
+            "a non-PD Ω must yield the zero matrix, got {h}"
         );
     }
 
@@ -5952,9 +6045,23 @@ mod tests {
         pop: &Population,
         params: &ModelParameters,
     ) -> ImportanceSamplingResult {
+        // Adapting routes through the E-step's own draw code; this check needs
+        // `subject_is_estimate_joint`, the separate estimator.
+        joint_is_with(model, pop, params, 0, 0.0)
+    }
+
+    fn joint_is_with(
+        model: &CompiledModel,
+        pop: &Population,
+        params: &ModelParameters,
+        passes: usize,
+        alpha: f64,
+    ) -> ImportanceSamplingResult {
         let mut opts = FitOptions::default();
         opts.imp_samples = 2000;
         opts.imp_seed = Some(5);
+        opts.imp_adapt_passes = passes;
+        opts.imp_defensive_alpha = alpha;
         let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
         let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
             model,
@@ -5978,6 +6085,19 @@ mod tests {
             &opts,
         )
         .expect("joint IS on an IOV model")
+    }
+
+    /// An adaptive evaluation of a joint (η, κ) subject samples through
+    /// `subject_is_draws_with`, so `subject_is_estimate_joint` is an independent
+    /// check on it: separate likelihood code, separate proposal.
+    #[test]
+    fn adapted_joint_marginal_agrees_with_the_single_proposal_estimator() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = &model.default_params;
+        crate::estimation::importance_sampling::assert_adaptive_evaluation_is_wired(
+            |passes, alpha| joint_is_with(&model, &pop, params, passes, alpha),
+        );
     }
 
     /// The trace −2LL of an IOV fit is the joint (η, κ) marginal. Iteration 1's
