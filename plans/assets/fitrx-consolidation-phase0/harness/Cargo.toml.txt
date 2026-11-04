@@ -1,0 +1,10 @@
+[package]
+name = "fitrx-cost"
+version = "0.0.0"
+edition = "2021"
+[dependencies]
+ferx-core = { path = "../../../..", features = ["survival", "nn"] }
+[workspace]
+[profile.release]
+lto = "off"
+codegen-units = 16
