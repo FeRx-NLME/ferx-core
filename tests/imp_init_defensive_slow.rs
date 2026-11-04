@@ -27,38 +27,19 @@
 //!    (`run14`, SAEM→IMP, OFV −249.23) lives with the cross-repo
 //!    `ferx-testdata/thioguanine_mmc` model and is reported in the PR.
 //!
-//! 2. **Mixture-vs-legacy discrimination (#961, re-based in #1113).** The
-//!    discrimination is the *negative* half of the test: legacy
-//!    (`imp_defensive_alpha = 0`) must run the population parameters away on a
-//!    fixture the mixture recovers, or the fixture has stopped reproducing the
-//!    defect the option exists for.
+//! 2. **Legacy recovers too (#2650).** This used to be a *negative* control:
+//!    legacy (`imp_defensive_alpha = 0`) had to run the population parameters away
+//!    on a fixture the mixture recovers, and the fixture was re-based twice to keep
+//!    that contrast (#961 against ISCALE, #1113 against a prediction clamp).
 //!
-//!    Two safeguards have masked that contrast in turn, and the fixture has been
-//!    re-based once for each:
-//!
-//!    * #961 — the per-subject **ISCALE scalar pilot search** (a *separate*,
-//!      general rescue that isotropically rebroadens a too-narrow proposal until
-//!      the ESS recovers) alone kept legacy bounded on the original fixture. That
-//!      was worked around by **pinning ISCALE to 1.0** (its documented "disabled"
-//!      setting) for the discrimination arm.
-//!    * #1113 — #1017's LTBS prediction floor (`floor_prediction`, since removed by #2440)
-//!      then removed the *fabricated* residuals that were doing much of the work:
-//!      the old `f.max(1e-12)` clamp was replacing a legitimately negative
-//!      log-prediction (this fixture's error model is `log_additive`, so `f` is
-//!      `log(c)` and is negative for any concentration below one unit) with ~0.
-//!      With that fixed, legacy landed `V = 19.84` — 1 % off truth — and the
-//!      contrast was gone even with ISCALE pinned. The floor fix is
-//!      unconditionally correct and stays.
-//!
-//!    So the fixture itself was re-based on the mechanism rather than on either
-//!    safeguard: **three quarters** of the subjects are now the weakly-identified
-//!    baseline case (was one half) and `ETA_V`'s prior is wider (variance 0.25,
-//!    was 0.09), so the single-proposal sampler faces the collapse #528 reported
-//!    without help from a clamp artefact. On that fixture the runaway returns in
-//!    the **shipped default config** — ISCALE on — which is a strictly stronger
-//!    statement than #961's pinned-only contrast: the defensive mixture is not
-//!    redundant with the ISCALE search, it is what keeps this fit identifiable.
-//!    The pinned-ISCALE arm is kept as a second, independent reading.
+//!    #2650 found what the runaway was. Capping the proposal covariance's diagonal
+//!    left a correlated subject indefinite, the zero matrix returned for it was
+//!    jittered to `1e−10·I`, and that proposal of SD 1e5 hijacked the M-step. Either
+//!    half of the fix alone ends the runaway here, measured on Linux with the other
+//!    half reverted; with both reverted legacy reaches `CL 90, V 334`, 3341% off. So
+//!    there is no longer a contrast to re-base onto: both arms now reach the optimum,
+//!    in both ISCALE settings, and the negative control has become the end-to-end
+//!    regression test for #2650.
 //!
 //!    The mixture's answer is anchored *within the test* against a deterministic
 //!    **FOCEI** fit of the same model and data (`CL 2.618, V 16.963`): the
@@ -67,15 +48,9 @@
 //!    and "near truth" alone would not distinguish a real fit from a fit stuck at
 //!    its starting values.
 //!
-//!    The failure guard is deliberately **relative** and taken over *both* `CL`
-//!    and `V`: the runaway's magnitude and which coordinate absorbs it are
-//!    chaotic and libm-dependent (a seed sweep put legacy anywhere from
-//!    `V +160%` with `CL +684%` to `V +9%` with `CL +1903%`), so an absolute
-//!    multiple-of-truth threshold on one coordinate reads as a platform-dependent
-//!    failure rather than a lost contrast (#751). Across the five seeds swept,
-//!    legacy's worse coordinate was off by at least 90% in every default-config
-//!    run and 160% in every pinned run, while the mixture stayed at 13-15% (the
-//!    FOCEI optimum) throughout. The fast branch-coverage smoke test is
+//!    The guard is taken over *both* `CL` and `V`: a runaway's magnitude and which
+//!    coordinate absorbs it were chaotic and libm-dependent (#751). The fast
+//!    branch-coverage smoke test is
 //!    `importance_sampling_api::imp_defensive_mixture_runs_for_both_alpha_branches`.
 //!
 //! Data is simulated from the model (fixed seed) so the test is self-contained.
@@ -308,60 +283,36 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
         imp.minus2_log_likelihood
     );
 
-    // --- Part 2: mixture-vs-legacy discrimination in the **default** config
-    // (#1113). On the re-based fixture the ISCALE scalar pilot search no longer
-    // rescues the legacy single-proposal sampler, so the contrast the defensive
-    // mixture exists for is visible on the shipped path — no knob has to be turned
-    // off to see it:
-    //
-    //   * legacy single-proposal (alpha = 0): weights collapse on the baseline
-    //     subjects, the importance-weighted M-step is hijacked, and CL/V run away.
-    //   * defensive mixture (alpha = 0.1): the broad `N(0, Ω)` component bounds
-    //     every weight, so no single collapsed-weight subject can dominate and θ
-    //     stays identifiable.
+    // --- Part 2: the legacy single-proposal sampler (alpha = 0) in the **default**
+    // config. It reaches the same optimum as the mixture (#2650).
     let legacy_default = fit(
         &model,
         &pop,
         &model.default_params,
         &saem_imp_opts(0.0, false),
     )
-    .expect("legacy imp (default ISCALE) still returns a (bad) fit");
-    let err_legacy_default = max_rel_err(&legacy_default.theta, TRUE_CL, TRUE_V);
+    .expect("legacy imp (default ISCALE) must produce a fit");
+    let err_legacy_default = max_rel_err(&legacy_default.theta, ref_cl, ref_v);
     assert!(
-        err_legacy_default > 0.5,
-        "legacy sampler (default config) is expected to run CL/V far off truth (>50% error); \
-         got CL {} / V {} ({:.0}% off) — if this fails the fixture no longer reproduces the \
-         collapse and the negative control must be re-based, not weakened (#961 / #1113)",
+        err_legacy_default < 0.10,
+        "legacy sampler must land on the FOCEI optimum (CL {ref_cl:.3}, V {ref_v:.3}), got \
+         CL {} / V {} ({:.0}% off) — a runaway here is the #2650 proposal collapse",
         legacy_default.theta[0],
         legacy_default.theta[1],
         err_legacy_default * 100.0
     );
-    let err_mix_vs_truth = max_rel_err(&with_mix.theta, TRUE_CL, TRUE_V);
-    assert!(
-        err_legacy_default > 3.0 * err_mix_vs_truth,
-        "defensive mixture must beat legacy by a wide margin in the default config: mixture \
-         CL {} / V {} ({:.0}% off truth) vs legacy CL {} / V {} ({:.0}% off) — only {:.1}× better",
-        with_mix.theta[0],
-        with_mix.theta[1],
-        err_mix_vs_truth * 100.0,
-        legacy_default.theta[0],
-        legacy_default.theta[1],
-        err_legacy_default * 100.0,
-        err_legacy_default / err_mix_vs_truth
-    );
 
-    // --- Part 3: the same contrast with the ISCALE scalar pilot search pinned off
+    // --- Part 3: both arms again with the ISCALE scalar pilot search pinned off
     // (#961). ISCALE is a *separate*, general safeguard; pinning it to 1.0 (its
-    // documented "disabled" setting) reads the discrimination with that overlapping
-    // rescue removed, so a future ISCALE change cannot silently become the reason
-    // Part 2 passes.
+    // documented "disabled" setting) removes that overlapping rescue, so a future
+    // ISCALE change cannot silently become the reason Part 2 passes.
     let no_mix = fit(
         &model,
         &pop,
         &model.default_params,
         &saem_imp_opts(0.0, true),
     )
-    .expect("legacy imp still returns a (bad) fit");
+    .expect("legacy imp (ISCALE pinned) must produce a fit");
     let with_mix_pinned = fit(
         &model,
         &pop,
@@ -390,35 +341,14 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
         with_mix_pinned.theta[1],
         err_mixture * 100.0
     );
-    // ...and the legacy sampler does not: with ISCALE unable to rebroaden the
-    // collapsed proposal, its worse coordinate runs far outside the band the
-    // mixture stays inside. Stated as *relative* discrimination rather than an
-    // absolute multiple of truth on purpose — how far the runaway travels, and in
-    // which coordinate, is a chaotic property of the collapsed weights and differs
-    // by libm; pinning the absolute magnitude turned a real, reproducible contrast
-    // into a platform-dependent red (#751 / #961). What the test needs is that
-    // legacy is *badly* wrong and the mixture is not.
-    let err_legacy = max_rel_err(&no_mix.theta, TRUE_CL, TRUE_V);
-    let err_mixture_vs_truth = max_rel_err(&with_mix_pinned.theta, TRUE_CL, TRUE_V);
+    let err_legacy = max_rel_err(&no_mix.theta, ref_cl, ref_v);
     assert!(
-        err_legacy > 0.5,
-        "legacy sampler (ISCALE pinned) is expected to run CL/V far off truth (>50% error); \
-         got CL {} / V {} ({:.0}% off) — if this fails the fixture no longer reproduces the \
+        err_legacy < 0.10,
+        "legacy sampler (ISCALE pinned) must land on the FOCEI optimum (CL {ref_cl:.3}, \
+         V {ref_v:.3}), got CL {} / V {} ({:.0}% off) — a runaway here is the #2650 proposal \
          collapse",
         no_mix.theta[0],
         no_mix.theta[1],
         err_legacy * 100.0
-    );
-    assert!(
-        err_legacy > 3.0 * err_mixture_vs_truth,
-        "defensive mixture must beat legacy by a wide margin: mixture CL {} / V {} \
-         ({:.0}% off truth) vs legacy CL {} / V {} ({:.0}% off) — only {:.1}× better",
-        with_mix_pinned.theta[0],
-        with_mix_pinned.theta[1],
-        err_mixture_vs_truth * 100.0,
-        no_mix.theta[0],
-        no_mix.theta[1],
-        err_legacy * 100.0,
-        err_legacy / err_mixture_vs_truth
     );
 }
