@@ -2040,8 +2040,8 @@ pub(crate) fn nonfinite_objective_warning(
 ///
 /// `ofv` is not the number at stake here. Under IMP / IMPMAP it is a Laplace pass, so
 /// `nonfinite_objective_warning` never saw the two fits this exists for: cefepime with
-/// a marginal of `inf`, and cefepime with a marginal of 12,446.9 against NONMEM's
-/// 4282.9. Both reported `converged: true`.
+/// a marginal of `inf`, and cefepime with a marginal of 13,354.7 (Linux) against
+/// NONMEM's 4282.9. Both reported `converged: true`.
 ///
 /// * **Unusable marginal.** The same two rules as
 ///   `impmap::gate_converged_on_mcem_objective`. This arm also covers an

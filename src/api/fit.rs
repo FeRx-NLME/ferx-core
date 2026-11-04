@@ -1887,7 +1887,6 @@ fn fit_inner(
         }
         crate::io::checkpoint::set_stage(stage_idx);
         let stage_start = std::time::Instant::now();
-        let is_last = stage_idx + 1 == n_stages;
         let mut stage_opts = options.clone();
         stage_opts.method = method;
         stage_opts.methods = Vec::new();
@@ -2350,7 +2349,13 @@ fn fit_inner(
         // on `FitResult.importance_sampling`, so callers comparing to NONMEM read
         // the matching number. Best-effort: a failure (e.g. SDE, IOV without
         // Ω_iov, n_eta = 0) leaves the field unset with a warning, never aborts.
-        if is_last && matches!(method, EstimationMethod::Imp | EstimationMethod::Impmap) {
+        //
+        // Keyed on the last *estimating* stage: a trailing evaluator leaves these
+        // parameters reported, and an `agq_eval_only` stage replaces only `ofv`, so
+        // the marginal is still what shows whether they collapsed (#2652). A trailing
+        // `imp_eval_only` stage repeats the evaluation and its result wins.
+        if is_last_estimating && matches!(method, EstimationMethod::Imp | EstimationMethod::Impmap)
+        {
             let r = result.as_ref().expect("stage result was just set");
             let mut marg_opts = stage_opts.clone();
             // `run_importance_sampling` reads the `imp_*` knobs; for IMPMAP map the

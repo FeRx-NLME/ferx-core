@@ -264,13 +264,15 @@ two cases (#2652):
 
 An EM iteration should not raise the objective, so the only legitimate gap
 between the lowest iteration and the final marginal is Monte-Carlo noise. In a
-seven-model comparison with NONMEM the widest gap on a healthy run was 0.6% of that
-scale, and the narrowest on a collapsed run was 28%. The baseline is the lowest
-iteration and not the first because a cold start begins far above the optimum: a
+seven-model comparison with NONMEM, measured on Linux, the widest gap on a healthy
+run was 0.6% of that scale and the narrowest on a collapsed run was 51%. The
+baseline is the lowest iteration and not the first because a cold start begins far above the optimum: a
 collapse can end below where it started and still be nowhere near the optimum.
 
 The rise check needs an estimating IMP / IMPMAP stage and a published marginal. If
-the marginal pass was skipped, a warning says so and this check does not run.
+the marginal pass was skipped, a warning says so and this check does not run. The
+marginal is computed after the last estimating stage, so a trailing `agq_eval_only`
+readout replaces `ofv` and leaves both checks in force.
 
 ## Defensive mixture {#defensive-mixture}
 

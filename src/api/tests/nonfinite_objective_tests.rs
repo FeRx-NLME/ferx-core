@@ -3643,19 +3643,20 @@ fn an_unusable_marginal_demotes_the_fit_and_names_itself() {
 fn a_marginal_far_above_the_lowest_iteration_demotes_the_fit() {
     use crate::api::postfit::MCEM_OBJECTIVE_ROSE_TOKEN;
     let mut converged = true;
-    let (msg, entry) = mcem_marginal_warning(&mut converged, Some(12446.9), Some(4315.4), 702)
-        .expect("the cefepime collapse passed");
+    let (msg, entry) =
+        mcem_marginal_warning(&mut converged, Some(13354.7091), Some(4313.3406), 702)
+            .expect("the cefepime collapse passed");
     assert!(!converged);
     assert!(msg.starts_with(MCEM_OBJECTIVE_ROSE_TOKEN), "{msg}");
-    assert!(msg.contains("(12446.9000) is 8131.5000 above"), "{msg}");
-    assert!(msg.contains("reached (4315.4000)"), "{msg}");
+    assert!(msg.contains("(13354.7091) is 9041.3685 above"), "{msg}");
+    assert!(msg.contains("reached (4313.3406)"), "{msg}");
     assert!(msg.contains("converged: false"), "{msg}");
     assert!(msg.contains("did not return"), "{msg}");
     assert_eq!(entry.severity, WarningSeverity::Critical);
     assert_eq!(entry.category, WarningCode::Convergence);
     let details = entry.details.as_ref().unwrap();
-    assert_eq!(details["marginal"], 12446.9);
-    assert_eq!(details["lowest_iteration_objective"], 4315.4);
+    assert_eq!(details["marginal"], 13354.7091);
+    assert_eq!(details["lowest_iteration_objective"], 4313.3406);
 }
 
 /// The inputs that must leave a good verdict alone, and a bad one bad: the gate only
@@ -3663,10 +3664,10 @@ fn a_marginal_far_above_the_lowest_iteration_demotes_the_fit() {
 #[test]
 fn a_usable_marginal_leaves_the_verdict_alone() {
     for (marginal, lowest) in [
-        (Some(4299.6), Some(4275.1)), // healthy, within noise of the lowest iteration
-        (Some(12446.9), None),        // no iterations to have risen from
-        (None, Some(4315.4)),         // the marginal pass was skipped
-        (None, None),                 // not an IS fit at all
+        (Some(4300.1209), Some(4276.0932)), // healthy, within noise of the lowest iteration
+        (Some(13354.7091), None),           // no iterations to have risen from
+        (None, Some(4313.3406)),            // the marginal pass was skipped
+        (None, None),                       // not an IS fit at all
     ] {
         for verdict in [true, false] {
             let mut converged = verdict;
@@ -3707,7 +3708,18 @@ fn a_non_finite_marginal_reaches_the_published_verdict() {
         imp_eval_only: true,
         ..estimating.clone()
     };
-    for (name, opts) in [("estimating", estimating), ("readout", readout)] {
+    // AGQ replaces `ofv` and nothing else, so IMP's parameters are still the ones
+    // reported and IMP is still the stage whose marginal has to be read.
+    let agq_readout = FitOptions {
+        methods: vec![EstimationMethod::Imp, EstimationMethod::Laplace],
+        agq_eval_only: true,
+        ..estimating.clone()
+    };
+    for (name, opts) in [
+        ("estimating", estimating),
+        ("readout", readout),
+        ("agq readout", agq_readout),
+    ] {
         let with_df = |df: f64| {
             let o = FitOptions {
                 imp_proposal_df: df,
