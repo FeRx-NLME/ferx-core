@@ -98,8 +98,12 @@ fn vanco_mgkg_matches_mrgsolve() {
         for ((d, e), (t, trough, fired, amt)) in got.iter().zip(&ledger).zip(want) {
             assert_eq!((d.time, e.time), (*t, *t), "subject {id}");
             let sig = d.observed_signals[0].value;
-            assert!(sig.is_finite(), "subject {id} t={t}: trough {sig}");
+            assert!(
+                sig.is_finite() && trough.is_finite(),
+                "subject {id} t={t}: trough {sig} vs {trough}"
+            );
             let gap = (sig - trough).abs();
+            assert!(gap.is_finite(), "subject {id} t={t}: gap {gap}");
             worst = worst.max(gap);
             assert!(
                 gap < TROUGH_TOL,
@@ -132,7 +136,10 @@ fn vanco_mgkg_kit_is_non_degenerate() {
         (15.0 * 50.0, 15.0 * 150.0),
         "start doses"
     );
-    let cap = |s: &Vec<RefRow>| s.iter().map(|row| row.3).fold(0.0, f64::max);
+    let cap = |s: &Vec<RefRow>| {
+        assert!(s.iter().map(|row| row.3).all(f64::is_finite));
+        s.iter().map(|row| row.3).fold(0.0, f64::max)
+    };
     assert_eq!(cap(s1), 30.0 * 50.0, "subject 1 capped at 30 mg/kg");
     assert_eq!(cap(s2), 4000.0, "subject 2 capped at 4000 mg");
     assert!(4000.0 < 30.0 * 150.0, "the min binds for subject 2 only");
