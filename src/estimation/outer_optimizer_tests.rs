@@ -857,7 +857,7 @@ fn test_invert_psd_with_floor_empty() {
 fn fresh_state() -> NloptState {
     NloptState {
         cached_etas: Vec::new(),
-        cached_etas_are_modes: false,
+        cached_etas_kind: PrevEtas::Placeholder,
         cached_h_mats: Vec::new(),
         cached_etas_by_class: Vec::new(),
         best_ofv: 0.0,
@@ -4079,6 +4079,7 @@ fn global_presearch_probes_skip_the_inner_multistart() {
             init,
             &opts,
             Some(&zeros),
+            PrevEtas::Placeholder,
             Some(&mu_k),
             None,
             None,
@@ -8795,6 +8796,7 @@ fn predicted_remaining_gain_is_withheld_when_the_tight_integration_is_unfinished
             0,
             InnerHessianSeed::for_options(&opts),
             &opts,
+            PrevEtas::Solved,
         );
         let gradients = |strict| {
             per_subject_outer_gradients_checked(&m, &pop, p, &x, &e, &k, &opts, strict).is_some()
@@ -10579,6 +10581,190 @@ fn an_exactly_zero_preflight_mode_still_skips_the_first_eval_multistart() {
     }
 }
 
+/// `make_population(4)` with distinct ids and its last subject, `EMPTY`, stripped of every
+/// observation, so its mode is exactly η = 0. Returns the population and an informed
+/// subject's id.
+fn population_with_an_empty_subject() -> (Population, String) {
+    let mut pop = make_population(4);
+    // `make_population` names every subject alike; the tests count per subject.
+    for (i, s) in pop.subjects.iter_mut().enumerate() {
+        s.id = format!("S{}", i + 1);
+    }
+    let empty = &mut pop.subjects[3];
+    empty.id = "EMPTY".into();
+    empty.obs_times.clear();
+    empty.observations.clear();
+    empty.obs_cmts.clear();
+    empty.cens.clear();
+    empty.occasions.clear();
+    let informed = pop.subjects[0].id.clone();
+    (pop, informed)
+}
+
+/// An EBE a solve returned as exactly zero — the prior mode of a subject with no
+/// observations, or of an η the model never reads — is that subject's warm start like any
+/// other: once one pass has solved it, the next pass does not run its cold multi-start
+/// again. The value test alone reads it as the cold placeholder, so before the cache kind
+/// ([`PrevEtas`]) every outer evaluation re-ran it: on `examples/mm_iv.ferx` with an inert
+/// `ETA_DUMMY` as the only η, 920 multi-starts against 60.
+///
+/// Per driver, from a cold cache: the empty subject is multi-started exactly as often as
+/// an informed one, whose nonzero mode is warm after its first solve. The straddle: the
+/// empty subject is solved more often than that, so the old behaviour (a multi-start at
+/// every solve) cannot pass.
+#[test]
+fn an_exactly_zero_solved_ebe_is_not_multistarted_at_every_evaluation() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::types::{EstimationMethod, FitOptions};
+    let (pop, informed) = population_with_an_empty_subject();
+    let model = make_model();
+    let init = &model.default_params;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    for (label, optimizer, method) in [
+        ("nlopt bobyqa", Optimizer::Bobyqa, EstimationMethod::Foce),
+        ("nlopt slsqp", Optimizer::Slsqp, EstimationMethod::Foce),
+        ("built-in bfgs", Optimizer::Bfgs, EstimationMethod::Foce),
+        (
+            "trust region",
+            Optimizer::TrustRegion,
+            EstimationMethod::Foce,
+        ),
+        ("gauss-newton", Optimizer::Bobyqa, EstimationMethod::FoceGn),
+    ] {
+        let opts = FitOptions {
+            method,
+            optimizer,
+            outer_maxiter: 4,
+            inner_restarts: 1,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let declines = OuterFdDeclineLog::new(pop.subjects.len());
+        let (ofv, rec) = pool.install(|| {
+            record_inner_solves(|| {
+                match (method, optimizer) {
+                    (EstimationMethod::FoceGn, _) => {
+                        crate::estimation::gauss_newton::run_foce_gn(&model, &pop, init, &opts)
+                    }
+                    (_, Optimizer::Bfgs) => {
+                        optimize_bfgs(&model, &pop, init, &opts, &declines, None)
+                    }
+                    (_, Optimizer::TrustRegion) => {
+                        crate::estimation::trust_region::optimize_trust_region(
+                            &model, &pop, init, &opts,
+                        )
+                    }
+                    _ => optimize_nlopt(&model, &pop, init, &opts, &declines, None, &[]),
+                }
+                .ofv
+            })
+        });
+        assert!(ofv.is_finite(), "{label}: OFV {ofv}");
+        let count =
+            |ids: &mut dyn Iterator<Item = &String>, id: &str| ids.filter(|s| *s == id).count();
+        let (ms_empty, ms_informed) = (
+            count(&mut rec.multistarts.iter(), "EMPTY"),
+            count(&mut rec.multistarts.iter(), &informed),
+        );
+        let solves_empty = count(&mut rec.solve_tols.iter().map(|(id, _)| id), "EMPTY");
+        assert!(
+            ms_informed >= 1,
+            "{label}: fixture must reach the multi-start gate"
+        );
+        assert!(
+            solves_empty > ms_informed,
+            "{label}: fixture must solve the empty subject warm at least once \
+             ({solves_empty} solves, {ms_informed} cold passes)"
+        );
+        assert_eq!(
+            ms_empty, ms_informed,
+            "{label}: the exactly-zero EBE was multi-started as a cold start \
+             ({ms_empty} times, the informed subject {ms_informed}, in {solves_empty} solves)"
+        );
+    }
+}
+
+/// The two re-solving FD stencils warm every probe from the modes the gradient is taken at,
+/// so an exactly-zero mode among them is no cold start either: no probe multi-starts any
+/// subject. Both `2·n_free` probes deep — the reconverged gradient at every outer
+/// evaluation of an IOV or TTE model, the reporting one once per derivative-free fit.
+#[test]
+fn the_fd_stencils_take_an_exactly_zero_mode_as_warm() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::types::FitOptions;
+    let (pop, _) = population_with_an_empty_subject();
+    let model = make_model();
+    let init = &model.default_params;
+    let opts = FitOptions {
+        inner_restarts: 1,
+        ..FitOptions::default()
+    };
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(init);
+    let params = unpack_params(&x, init);
+    let mu_k = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    let (ehs, _, _, kappas) = pool.install(|| {
+        run_inner_loop_warm_seeded(
+            &model,
+            &pop,
+            &params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            Some(&mu_k),
+            opts.min_obs_for_convergence_check as usize,
+            opts.inner_restarts,
+            InnerHessianSeed::for_options(&opts),
+            &opts,
+            PrevEtas::Placeholder,
+        )
+    });
+    assert!(
+        ehs[3].iter().all(|&v| v == 0.0) && ehs[0].iter().any(|&v| v != 0.0),
+        "fixture: the empty subject's mode is exactly zero, an informed one's is not"
+    );
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+    let priors = build_prior_set(&model, init);
+    for label in ["reconverged_fd_gradient", "reporting_fd_gradient"] {
+        let (g, rec) = pool.install(|| {
+            record_inner_solves(|| match label {
+                "reconverged_fd_gradient" => {
+                    reconverged_fd_gradient(&x, init, &model, &pop, &ehs, &kappas, &bounds, &opts)
+                }
+                _ => reporting_fd_gradient(
+                    &x, init, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                ),
+            })
+        });
+        assert!(g.iter().all(|v| v.is_finite()), "{label}: gradient {g:?}");
+        let empty_solves = rec
+            .solve_tols
+            .iter()
+            .filter(|(id, _)| id == "EMPTY")
+            .count();
+        assert!(
+            empty_solves >= 2,
+            "{label}: fixture must re-solve the empty subject ({empty_solves} solves)"
+        );
+        assert!(
+            rec.multistarts.is_empty(),
+            "{label}: a probe warm from the modes ran a cold multi-start: {:?}",
+            rec.multistarts
+        );
+    }
+}
+
 /// #2076 review: a pre-flight subject that exhausts `inner_maxiter` stopped on a partial
 /// descent, not a mode. Handing it over would make the first evaluation warm — no second
 /// Hessian metric, no multi-start, a fresh iteration budget — and change the first
@@ -10646,6 +10832,7 @@ fn preflight_start_modes(
             opts.inner_restarts,
             InnerHessianSeed::for_options(opts),
             opts,
+            PrevEtas::Placeholder,
         )
     });
     PreflightStart {
@@ -10712,7 +10899,7 @@ fn assert_first_eval_starts_at_preflight_mode(
                     Some(&mu_k),
                     None,
                     None,
-                    true,
+                    PrevEtas::ModesHere,
                     None,
                 )
                 .4;
@@ -11503,6 +11690,7 @@ fn identity_exact_derivatives_match_fd_of_the_probed_objective() {
                 opts.inner_restarts,
                 InnerHessianSeed::for_options(&opts),
                 &opts,
+                PrevEtas::Placeholder,
             )
         };
         // The production input: the pre-flight's cold solve at the fit's own `inner_tol`.
@@ -11612,6 +11800,7 @@ fn exact_candidate_derivatives_decline_off_the_mode_and_when_switched_off() {
         base.inner_restarts,
         InnerHessianSeed::for_options(&base),
         &base,
+        PrevEtas::Placeholder,
     );
     let off_mode: Vec<DVector<f64>> = modes.iter().map(|e| e.map(|v| v + 0.2)).collect();
     let at = |opts: &FitOptions, warm: &[DVector<f64>]| {
@@ -15522,7 +15711,7 @@ fn the_lower_cold_mode_count_is_the_subjects_the_held_state_scores_worse() {
 fn a_cold_start_drops_the_mode_response() {
     let mut state = new_nlopt_state(2, 2, &[0.0; 3], SalvageGuardPolicy::Off);
     state.cached_etas = vec![DVector::from_vec(vec![0.3, -0.1]); 2];
-    state.cached_etas_are_modes = true;
+    state.cached_etas_kind = PrevEtas::Solved;
     state.pred_jac = Some(vec![vec![DVector::from_vec(vec![1.0, 2.0]); 3]; 2]);
     state.pred_anchor = vec![0.5; 3];
     state.reset_to_cold_start();
@@ -15530,7 +15719,9 @@ fn a_cold_start_drops_the_mode_response() {
         .cached_etas
         .iter()
         .all(|e| e.len() == 2 && e.iter().all(|&v| v == 0.0)));
-    assert!(!state.cached_etas_are_modes);
+    // The zero fill is the cold placeholder again: kept as `Solved`, the next pass would
+    // take it for a solve's output and skip every subject's cold multi-start.
+    assert_eq!(state.cached_etas_kind, PrevEtas::Placeholder);
     assert!(state.pred_jac.is_none(), "the response went with the modes");
     assert!(state.pred_anchor.is_empty());
 }

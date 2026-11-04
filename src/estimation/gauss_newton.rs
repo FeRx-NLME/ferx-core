@@ -13,7 +13,10 @@
 ///
 /// This approach mirrors NONMEM's modified Gauss-Newton algorithm and typically
 /// converges in 10-30 iterations vs 100+ for first-order methods.
-use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
+use crate::estimation::inner_optimizer::{
+    run_inner_loop_warm_map, run_inner_loop_warm_seeded, InnerHessianSeed, InnerSolvePolicy,
+    PrevEtas,
+};
 use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::parameterization::{compute_mu_k, *};
@@ -143,6 +146,7 @@ pub fn run_foce_gn(
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
         options,
+        PrevEtas::Placeholder,
     );
 
     let mut ofv_clean = 2.0
@@ -296,9 +300,10 @@ pub fn run_foce_gn(
 
         let params_try = unpack_params(&x_try, init_params);
         let try_mu_k = compute_mu_k(model, &params_try.theta, options.mu_referencing);
-        // Warm from the accepted point's whole mode, κ̂ with η̂ (#2261).
+        // Warm from the accepted point's whole mode, κ̂ with η̂ (#2261) — a solve's output,
+        // so an exactly-zero EBE among them is not re-solved as a cold start.
         let warm = crate::estimation::outer_optimizer::joint_warm_starts(&eta_hats, &kappas);
-        let (eta_try, h_try, _, kap_try) = run_inner_loop_warm_seeded(
+        let (eta_try, h_try, _, kap_try, _) = run_inner_loop_warm_map(
             model,
             population,
             &params_try,
@@ -308,8 +313,14 @@ pub fn run_foce_gn(
             Some(&try_mu_k),
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
-            InnerHessianSeed::for_options(options),
-            options,
+            InnerSolvePolicy {
+                seed: InnerHessianSeed::for_options(options),
+                ..InnerSolvePolicy::for_stage(options, model)
+            }
+            .with_prev_etas(PrevEtas::Solved),
+            // Not cancellable mid-pass (#574), as `run_inner_loop_warm_seeded`.
+            None,
+            |_, _| (),
         );
         let ofv_try_clean = 2.0
             * pop_nll(
