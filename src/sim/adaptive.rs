@@ -978,7 +978,8 @@ pub(crate) enum DosePlanViolation {
     /// in [`validate_increasing_finite`]'s words.
     LevelsOrder(String),
     StartNotALevel,
-    LevelOutsideBounds(f64),
+    /// The first rung outside the bounds: its index in `levels` and its value.
+    LevelOutsideBounds(usize, f64),
 }
 
 /// The first dose invariant `plan` breaks, if any.
@@ -1002,8 +1003,8 @@ pub(crate) fn dose_plan_violation(plan: &SubjectDosePlan) -> Option<DosePlanViol
         if !l.contains(&d) {
             return Some(DosePlanViolation::StartNotALevel);
         }
-        if let Some(&bad) = l.iter().find(|&&x| x < lo || x > hi) {
-            return Some(DosePlanViolation::LevelOutsideBounds(bad));
+        if let Some((i, &bad)) = l.iter().enumerate().find(|(_, &x)| x < lo || x > hi) {
+            return Some(DosePlanViolation::LevelOutsideBounds(i, bad));
         }
     }
     None
@@ -1029,13 +1030,13 @@ impl DosePlanViolation {
                 "[adaptive_dosing]: start_dose {d} must be one of the declared levels {:?}",
                 plan.levels.as_deref().unwrap_or(&[])
             ),
-            DosePlanViolation::LevelOutsideBounds(bad) => {
+            DosePlanViolation::LevelOutsideBounds(_, bad) => {
                 format!("[adaptive_dosing]: level {bad} is outside dose_bounds [{lo}, {hi}]")
             }
         }
     }
 
-    /// The per-subject text (#944): the subject, the values as written and as
+    /// The per-subject text (#944): the subject, each value involved as written and as
     /// evaluated, and — when the expressions read any — the covariate values they read.
     pub(crate) fn subject_message(
         &self,
@@ -1047,31 +1048,49 @@ impl DosePlanViolation {
         let (lo, hi) = plan.dose_bounds;
         let d = plan.start_dose;
         let head = format!("[adaptive_dosing] subject {subject_id}:");
+        let start = spec.start_dose.source();
+        let bounds = format!(
+            "[{}, {}]",
+            spec.dose_bounds.0.source(),
+            spec.dose_bounds.1.source()
+        );
+        let rungs = spec.levels.as_deref().unwrap_or(&[]);
+        let ladder = format!(
+            "[{}]",
+            rungs
+                .iter()
+                .map(DoseValue::source)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let values = plan.levels.as_deref().unwrap_or(&[]);
         let body = match self {
             DosePlanViolation::Bounds => format!(
-                "dose_bounds = [{}, {}] evaluate to [{lo}, {hi}]; they must be finite with \
-                 0 <= low <= high.",
-                spec.dose_bounds.0.source(),
-                spec.dose_bounds.1.source()
+                "dose_bounds = {bounds} evaluate to [{lo}, {hi}]; they must be finite with \
+                 0 <= low <= high."
             ),
-            DosePlanViolation::StartNotFinite => format!(
-                "start_dose = {} evaluates to {d}; a dose must be finite and >= 0.",
-                spec.start_dose.source()
-            ),
-            DosePlanViolation::StartOutsideBounds => {
-                format!("start_dose {d} is outside dose_bounds [{lo}, {hi}].")
+            DosePlanViolation::StartNotFinite => {
+                format!("start_dose = {start} evaluates to {d}; a dose must be finite and >= 0.")
             }
+            DosePlanViolation::StartOutsideBounds => format!(
+                "start_dose = {start} evaluates to {d}, outside dose_bounds = {bounds}, which \
+                 evaluate to [{lo}, {hi}]."
+            ),
             DosePlanViolation::LevelsOrder(_) => format!(
-                "levels evaluate to {:?}; they must be finite and strictly increasing.",
-                plan.levels.as_deref().unwrap_or(&[])
+                "levels = {ladder} evaluate to {values:?}; they must be finite and strictly \
+                 increasing."
             ),
             DosePlanViolation::StartNotALevel => format!(
-                "start_dose {d:?} must be one of the levels {:?}.",
-                plan.levels.as_deref().unwrap_or(&[])
+                "start_dose = {start} evaluates to {d:?}, which is not one of levels = \
+                 {ladder}, which evaluate to {values:?}."
             ),
-            DosePlanViolation::LevelOutsideBounds(bad) => {
-                format!("level {bad} is outside dose_bounds [{lo}, {hi}].")
-            }
+            DosePlanViolation::LevelOutsideBounds(i, bad) => format!(
+                "level {} evaluates to {bad}, outside dose_bounds = {bounds}, which evaluate \
+                 to [{lo}, {hi}].",
+                rungs
+                    .get(*i)
+                    .map_or_else(|| bad.to_string(), DoseValue::source)
+            ),
         };
         if reads.is_empty() {
             return format!("{head} {body}");
@@ -1650,6 +1669,47 @@ mod tests {
         s.levels = crate::sim::adaptive::literal_levels(&[100.0, 150.0]);
         s.rules = level_rule();
         assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
+    }
+
+    /// A block of numbers that breaks two invariants names the one it named before
+    /// #944 (#2667 review r1 row 3): `validate` finds the violation once, through
+    /// `dose_plan_violation`, but reports each at its pre-#944 position — the bounds and
+    /// start checks first, the ladder order before the percent-step refusal, and
+    /// start-not-a-rung / rung-outside-bounds after it.
+    ///
+    /// Regressions: the `LevelsOrder` return moved below the percent refusal (case 1);
+    /// the start-not-a-rung return moved above it (case 2); the phase-A return moved
+    /// below the percent refusal (case 3).
+    #[test]
+    fn validate_reports_two_violations_in_the_pre_944_order() {
+        // 1. A descending ladder with a percent rule: the ladder order wins.
+        let mut s = base_spec();
+        s.start_dose = (200.0).into();
+        s.levels = crate::sim::adaptive::literal_levels(&[200.0, 100.0]);
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "[adaptive_dosing]: levels must be strictly increasing"
+        );
+        // 2. A start off the ladder with a percent rule: the percent refusal wins.
+        let mut s = base_spec();
+        s.start_dose = (150.0).into();
+        s.levels = crate::sim::adaptive::literal_levels(&[100.0, 200.0]);
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "[adaptive_dosing]: percentage actions (`increase N%`) are not allowed with \
+             `levels`; use bare `increase`/`decrease` to step one level"
+        );
+        // 3. A start outside the bounds and off the ladder, with a percent rule: the
+        //    bounds check wins over the percent refusal. (Without the percent rule the
+        //    first violation is the same wherever it is reported, so that case could
+        //    not see the order.)
+        let mut s = base_spec();
+        s.start_dose = (500.0).into();
+        s.levels = crate::sim::adaptive::literal_levels(&[100.0, 200.0]);
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "[adaptive_dosing]: start_dose 500 is outside dose_bounds [0, 400]"
+        );
     }
 
     #[test]

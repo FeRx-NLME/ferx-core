@@ -74,7 +74,8 @@ fn run() -> AdaptiveSimulationResult {
 
 /// Cross-solver trough band (mg/L), ferx (RK45 at the model's default tolerances) against
 /// mrgsolve (LSODA at 1e-10) at η = 0. The worst gap over all 26 decisions is printed by
-/// the test: 1.435e-9 mg/L on macOS arm64, so 1e-7 is ~70× headroom, and `expected.md`'s 9
+/// the test: 1.435e-9 mg/L on Linux aarch64 (`tools/linux-test.sh`, the reference
+/// platform, #1688) and the same on macOS arm64, so 1e-7 is ~70× headroom, and `expected.md`'s 9
 /// decimals floor the comparison at 5e-10. A dosing defect worth naming moves a trough
 /// by far more (one subject dosed at the other's weight is a factor of 3), and the
 /// smallest decision margin is 1.37 mg/L.

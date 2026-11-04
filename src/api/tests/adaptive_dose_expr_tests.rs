@@ -100,9 +100,11 @@ const GRID: [f64; 5] = [0.0, 12.0, 24.0, 36.0, 48.0];
 
 /// Rules that never fire, so every decision re-issues `15 * WT`: each subject's ledger
 /// holds its own weight's dose, and its trajectory equals `predict()` on that frozen
-/// regimen. The realized gap is exactly 0 (macOS arm64, printed by the test); the bound
-/// is the 1e-9 relative band every adaptive degenerate oracle uses (#1151). One subject
-/// dosed at the other's weight moves its trajectory by tens of percent.
+/// regimen **bit for bit**. The gap was measured exactly 0 on Linux aarch64 (the
+/// reference platform, #1688) and on macOS arm64 before the 1e-9 relative band the
+/// other adaptive degenerate oracles use (#1151) was tightened to bits (#2667 review r1
+/// row 4). One subject dosed at the other's weight moves its trajectory by tens of
+/// percent.
 ///
 /// Regressions: the plan evaluated once per run (both subjects get one subject's
 /// dose); the wrong subject's covariates read; a template plan shared across subjects.
@@ -144,13 +146,12 @@ fn each_subject_is_dosed_from_its_own_weight_and_matches_the_static_engine() {
     let preds = predict(&p.model, &static_pop, &p.model.default_params).expect("predict");
     let traj: Vec<_> = res.trajectories.iter().filter(|t| t.sim == 1).collect();
     assert_eq!(traj.len(), preds.len());
-    let mut worst = 0.0f64;
     for (t, pr) in traj.iter().zip(&preds) {
         assert_eq!((t.id.as_str(), t.time), (pr.id.as_str(), pr.time));
         assert!(t.ipred.is_finite() && pr.pred.is_finite());
-        worst = worst.max((t.ipred - pr.pred).abs() / pr.pred.abs().max(1e-300));
-        assert!(
-            (t.ipred - pr.pred).abs() <= 1e-9 + 1e-9 * pr.pred.abs(),
+        assert_eq!(
+            t.ipred.to_bits(),
+            pr.pred.to_bits(),
             "subject {} t={}: adaptive {} vs static {}",
             t.id,
             t.time,
@@ -158,7 +159,6 @@ fn each_subject_is_dosed_from_its_own_weight_and_matches_the_static_engine() {
             pr.pred
         );
     }
-    eprintln!("D3 worst relative gap: {worst:.3e}");
 }
 
 // ── D1: a constant expression is the literal, bit for bit ───────────────────────
@@ -349,10 +349,12 @@ const RULE: &str = "  when signal > 1000000 : decrease 25%";
 
 /// One block per invariant, each with a passing subject beside the failing one. The
 /// whole message is asserted, so deleting any sentence of it, or naming the wrong
-/// subject, fails here; the passing subject's ID must be absent.
+/// subject, fails here; the passing subject's ID must be absent. Each message names the
+/// value as written (#2667 review r1 row 5); the rung case's bad rung is the second, an
+/// expression, so naming the first rung instead fails here too.
 ///
 /// Regressions: the check run on the first subject only (subject 2 is the bad one);
-/// the passing subject named; a sentence of a message lost.
+/// the passing subject named; a sentence of a message lost; the wrong rung named.
 #[test]
 fn each_dose_invariant_is_refused_per_subject_naming_that_subject() {
     let head =
@@ -380,8 +382,9 @@ fn each_dose_invariant_is_refused_per_subject_naming_that_subject() {
             format!("{head}  start_dose = 15 * WT\n  dose_bounds = [0, 1000]\n{RULE}"),
             ("1", 50.0),
             ("2", 100.0),
-            "[adaptive_dosing] subject 2: start_dose 1500 is outside dose_bounds [0, 1000]. \
-             The dose expressions read WT = 100, at the first decision (t = 0)."
+            "[adaptive_dosing] subject 2: start_dose = 15 * WT evaluates to 1500, outside \
+             dose_bounds = [0, 1000], which evaluate to [0, 1000]. The dose expressions read \
+             WT = 100, at the first decision (t = 0)."
                 .to_string(),
         ),
         (
@@ -391,8 +394,9 @@ fn each_dose_invariant_is_refused_per_subject_naming_that_subject() {
             ),
             ("1", 50.0),
             ("2", 60.0),
-            "[adaptive_dosing] subject 2: start_dose 600.0 must be one of the levels [500.0, \
-             1000.0, 1500.0]. The dose expressions read WT = 60, at the first decision (t = 0)."
+            "[adaptive_dosing] subject 2: start_dose = 10 * WT evaluates to 600.0, which is \
+             not one of levels = [500, 1000, 1500], which evaluate to [500.0, 1000.0, 1500.0]. \
+             The dose expressions read WT = 60, at the first decision (t = 0)."
                 .to_string(),
         ),
         (
@@ -402,8 +406,9 @@ fn each_dose_invariant_is_refused_per_subject_naming_that_subject() {
             ),
             ("1", 50.0),
             ("2", 100.0),
-            "[adaptive_dosing] subject 2: level 2000 is outside dose_bounds [0, 1500]. The \
-             dose expressions read WT = 100, at the first decision (t = 0)."
+            "[adaptive_dosing] subject 2: level 20 * WT evaluates to 2000, outside \
+             dose_bounds = [0, 1500], which evaluate to [0, 1500]. The dose expressions read \
+             WT = 100, at the first decision (t = 0)."
                 .to_string(),
         ),
         (
@@ -413,9 +418,9 @@ fn each_dose_invariant_is_refused_per_subject_naming_that_subject() {
             ),
             ("1", 50.0),
             ("2", 20.0),
-            "[adaptive_dosing] subject 2: levels evaluate to [500.0, 400.0]; they must be \
-             finite and strictly increasing. The dose expressions read WT = 20, at the first \
-             decision (t = 0)."
+            "[adaptive_dosing] subject 2: levels = [500, 20 * WT] evaluate to [500.0, \
+             400.0]; they must be finite and strictly increasing. The dose expressions read \
+             WT = 20, at the first decision (t = 0)."
                 .to_string(),
         ),
     ];
@@ -443,8 +448,46 @@ fn a_dose_expression_reading_no_covariate_has_no_reads_sentence() {
     let e = run(&parsed(block), &population).expect_err("refused");
     assert_eq!(
         e.message(),
-        "[adaptive_dosing] subject 1: start_dose 6000 is outside dose_bounds [0, 4000]."
+        "[adaptive_dosing] subject 1: start_dose = TVCL * 1000 evaluates to 6000, outside \
+         dose_bounds = [0, 4000], which evaluate to [0, 4000]."
     );
+}
+
+/// Both bounds and every rung as expressions (#2667 review r1 row 2): `resolve` pairs
+/// compiled values with slots in `dose_expressions()` order (start, low, high, rungs),
+/// so this pins that order. Percent steps that clamp to the expression lower bound, and
+/// a level ladder stepped down to its expression bottom rung, per subject.
+///
+/// Regressions: the two bounds evaluated in the other order (every subject refused,
+/// `low > high`); the rungs evaluated in another order (refused, not increasing); a
+/// clamp to a bound taken from another subject.
+#[test]
+fn every_dose_slot_can_be_an_expression_and_keeps_its_slot() {
+    let population = pop(&csv_const(&[("1", 50.0), ("2", 80.0)], &GRID));
+    let head =
+        "  observe = CENT / V\n  at = every 12 from 0 to 48\n  route = infuse(cmt=1, over=1)\n";
+    let percent = parsed(&format!(
+        "{head}  start_dose = 15 * WT\n  dose_bounds = [10 * WT, 30 * WT]\n  when signal < \
+         1000000 : decrease 50%"
+    ));
+    let ladder = parsed(&format!(
+        "{head}  start_dose = 15 * WT\n  dose_bounds = [5 * WT, 30 * WT]\n  levels = [10 * WT, \
+         15 * WT, 20 * WT]\n  when signal < 1000000 : decrease"
+    ));
+    for (label, p) in [("percent", &percent), ("ladder", &ladder)] {
+        let res = run_typical(p, &population);
+        for (id, wt) in [("1", 50.0f64), ("2", 80.0)] {
+            let amts: Vec<f64> = res
+                .ledger
+                .iter()
+                .filter(|e| e.subject == id)
+                .map(|e| e.amt)
+                .collect();
+            // 15·WT stepped down at the first decision: to the 10·WT lower bound (7.5·WT
+            // clamped), or to the 10·WT bottom rung; then held there.
+            assert_eq!(amts, vec![10.0 * wt; GRID.len()], "{label}, subject {id}");
+        }
+    }
 }
 
 // ── Run-start refusals ───────────────────────────────────────────────────────────

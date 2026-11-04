@@ -162,7 +162,8 @@ when the run starts.
 
 On a FREM model, a dose expression that reads a covariate doses from the value in the
 data, while a subject whose η is drawn has PK that follows its drawn covariate η. The
-`W_FREM_DRAWN_ETA` warning then names each key and the covariate it reads.
+`W_FREM_DRAWN_ETA` warning then names the covariates the dose expressions read, each
+with the first key that reads it.
 
 ### Rules — `when signal <op> <value> : <action>`
 
