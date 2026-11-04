@@ -9,9 +9,9 @@
 //!
 //! **It is the register code's translation, lane for lane.** The program over a layout is
 //! first written out as scalar straight-line code (`super::ir`), each dual operation as
-//! the IEEE operations of that type's own body in its own order, and that is lowered here
-//! one instruction each. Cranelift never contracts a multiply and an add into a fused one
-//! and never folds `x·0`, so the arithmetic is IEEE's. `exp`, `ln`, `powf` and `round`
+//! the IEEE operations of that type's own body in its own order (an inline `if` as both arms
+//! and a select), and that is lowered here one instruction each. Cranelift never contracts a
+//! multiply and an add into a fused one and never folds `x·0`, so the arithmetic is IEEE's. `exp`, `ln`, `powf` and `round`
 //! call the Rust functions the interpreter calls, through `extern "C"` shims; `floor`,
 //! `ceil`, `abs` and `neg` are exact IEEE operations either way. The one thing not pinned is
 //! a `NaN`'s payload, which LLVM leaves unspecified for the Rust side too.
@@ -112,6 +112,9 @@ fn extent(code: &[Flat]) -> Extent {
 /// A caller that keeps a cache runs `prep` once and `main` per call: `main` loads those
 /// values instead of recomputing them. The operations and their inputs are the same, so
 /// the values are bit for bit the full function's.
+///
+/// Nothing inside an `if` is hoisted, nor the `if` itself: `prep` is straight-line code
+/// with no arms to select between. What an arm reads from before it still can be.
 #[derive(Debug, Default)]
 struct HoistPlan {
     /// Per instruction: computed by `prep` rather than `main`.
@@ -137,6 +140,15 @@ fn hoist_plan(code: &[Flat]) -> HoistPlan {
         .map_or(0, |m| m + 1);
     let mut producer = vec![usize::MAX; n_regs];
     let mut invariant = vec![false; code.len()];
+    // Every instruction from an `if`'s `Branch` to its end.
+    let mut in_if = vec![false; code.len()];
+    for (i, f) in code.iter().enumerate() {
+        if let Flat::Branch { to, .. } = *f {
+            if let Some(&Flat::Jump { to: end }) = code.get((to as usize).wrapping_sub(1)) {
+                in_if[i..end as usize].fill(true);
+            }
+        }
+    }
     let mut read_by_main = vec![false; code.len()];
     let mut param_slots = Vec::new();
     for (i, f) in code.iter().enumerate() {
@@ -148,6 +160,7 @@ fn hoist_plan(code: &[Flat]) -> HoistPlan {
             .map(|r| producer[*r as usize])
             .collect();
         invariant[i] = match *f {
+            _ if in_if[i] => false,
             Flat::LoadParam { slot, .. } => {
                 param_slots.push(slot);
                 true
@@ -212,7 +225,7 @@ fn emit(code: &[Flat], n_regs: usize, layout: Layout, part: Part<'_>) -> Func {
                 if !plan.invariant[i] {
                     continue;
                 }
-                l.flat(x, [0, 0, 1, 2]);
+                l.flat(i, x, [0, 0, 1, 2]);
                 if let (Some(slot), Some(d)) = (plan.slot[i], def_of(x)) {
                     let lanes = l.reg(d);
                     l.store(2, slot as usize, &lanes);
@@ -225,12 +238,17 @@ fn emit(code: &[Flat], n_regs: usize, layout: Layout, part: Part<'_>) -> Func {
             let mut l = ir::Lower::new(&mut f, layout, n_regs);
             for (i, x) in code.iter().enumerate() {
                 if !plan.invariant[i] {
-                    l.flat(x, [0, 1, 2, 3]);
-                } else if let (Some(slot), Some(d)) = (plan.slot[i], def_of(x)) {
-                    let lanes = l.load(4, slot as usize);
-                    l.set(d, lanes);
+                    l.flat(i, x, [0, 1, 2, 3]);
+                } else {
+                    // An `if` ending here closes before the cached value lands.
+                    l.reach(i);
+                    if let (Some(slot), Some(d)) = (plan.slot[i], def_of(x)) {
+                        let lanes = l.load(4, slot as usize);
+                        l.set(d, lanes);
+                    }
                 }
             }
+            l.reach(code.len());
             f
         }
     }
@@ -403,13 +421,17 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
                 Inst::Cmp(cc, x, y) => {
                     let cc = match cc {
                         Cc::Lt => FloatCC::LessThan,
+                        Cc::Le => FloatCC::LessThanOrEqual,
                         Cc::Gt => FloatCC::GreaterThan,
                         Cc::Ge => FloatCC::GreaterThanOrEqual,
                         Cc::Eq => FloatCC::Equal,
+                        // `UN | LT | GT`: Rust's `!=`, true when either side is `NaN`.
+                        Cc::Ne => FloatCC::NotEqual,
                     };
                     b.ins().fcmp(cc, r(x), r(y))
                 }
                 Inst::And(x, y) => b.ins().band(r(x), r(y)),
+                Inst::Or(x, y) => b.ins().bor(r(x), r(y)),
                 Inst::Select(c, x, y) => b.ins().select(r(c), r(x), r(y)),
                 Inst::Store { arg, off, v: x } => {
                     b.ins()

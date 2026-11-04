@@ -34,7 +34,8 @@ fn model(rhs: &str) -> CompiledModel {
 }
 
 const COMPILED: &str = "-(CL / V) * central";
-const INTERPRETED: &str = "-(CL / V) * (if (central > 0) central else 0)";
+// `sqrt` keeps the interpreter (an inline `if` no longer does, #2680).
+const INTERPRETED: &str = "-(CL / V) * sqrt(central)";
 
 fn subject(id: &str) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
@@ -112,7 +113,7 @@ fn a_fit_reports_an_interpreted_rhs_once_and_a_compiled_one_not_at_all() {
         "{}",
         e.message
     );
-    assert!(e.message.contains("an inline `if`"), "{}", e.message);
+    assert!(e.message.contains("`sqrt`"), "{}", e.message);
     assert!(e.message.contains("`d/dt(central)`"), "{}", e.message);
     assert_eq!(
         r.warnings.iter().filter(|w| **w == e.message).count(),
