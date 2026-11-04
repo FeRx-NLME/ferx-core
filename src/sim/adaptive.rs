@@ -1034,9 +1034,18 @@ fn known_dose_violation(
                 return Some(DosePlanViolation::LevelsOrder(e));
             }
         }
-        // An expression rung could equal the start dose, so membership needs them all.
+        // The start dose must be a rung. A known start that is no known rung can still be
+        // an expression rung, but only one strictly between its known neighbours (±∞ at
+        // the ends): the ladder increases, which the order check above has established
+        // among the known rungs (#2667 review r2 N3). With every rung known that leaves
+        // plain membership.
         if let Some(d) = d {
-            if known.len() == l.len() && !known.contains(&d) {
+            let expression_rung_can_be_d = (0..l.len()).any(|i| {
+                l[i].is_none()
+                    && l[..i].iter().rev().flatten().next().is_none_or(|&p| p < d)
+                    && l[i + 1..].iter().flatten().next().is_none_or(|&n| d < n)
+            });
+            if !known.contains(&d) && !expression_rung_can_be_d {
                 return Some(DosePlanViolation::StartNotALevel);
             }
         }
@@ -1070,15 +1079,29 @@ impl DosePlanViolation {
                 format!("[adaptive_dosing]: start_dose {d} is outside dose_bounds [{lo}, {hi}]")
             }
             DosePlanViolation::LevelsOrder(e) => e.clone(),
-            // Reached only when every rung is a number.
-            DosePlanViolation::StartNotALevel => format!(
-                "[adaptive_dosing]: start_dose {d} must be one of the declared levels {:?}",
-                spec.levels
-                    .iter()
-                    .flatten()
-                    .filter_map(DoseValue::as_literal)
-                    .collect::<Vec<f64>>()
-            ),
+            DosePlanViolation::StartNotALevel => {
+                let rungs = spec.levels.as_deref().unwrap_or(&[]);
+                let numbers: Option<Vec<f64>> = rungs.iter().map(DoseValue::as_literal).collect();
+                match numbers {
+                    // Every rung a number: the pre-#944 text.
+                    Some(n) => format!(
+                        "[adaptive_dosing]: start_dose {d} must be one of the declared levels {n:?}"
+                    ),
+                    // A mixed ladder (#2667 review r2 N3): the rungs as written, and why
+                    // no expression rung can take the value.
+                    None => format!(
+                        "[adaptive_dosing]: start_dose {d} must be one of the declared levels \
+                         [{}]. It is none of the numbers, and the ladder increases, so no \
+                         expression rung can equal it: none lies between numbers on either \
+                         side of {d}.",
+                        rungs
+                            .iter()
+                            .map(DoseValue::source)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            }
             DosePlanViolation::LevelOutsideBounds(_, bad) => {
                 format!("[adaptive_dosing]: level {bad} is outside dose_bounds [{lo}, {hi}]")
             }

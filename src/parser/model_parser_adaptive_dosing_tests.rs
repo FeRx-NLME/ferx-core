@@ -1144,7 +1144,34 @@ fn a_mixed_block_is_checked_among_its_numbers_at_parse_time() {
         }
         b
     };
-    let refused: [(&str, &str, Option<&str>, &str); 7] = [
+    let refused: [(&str, &str, Option<&str>, &str); 10] = [
+        // A start no expression rung can reach (#2667 review r2 N3): the only expression
+        // rung is above 200, or between 100 and 200 while the start is 250 (only its
+        // upper neighbour rules it out) or 50 (only its lower neighbour does).
+        (
+            "50",
+            "[0, 30 * WT]",
+            Some("[100, 10 * WT, 200]"),
+            "[adaptive_dosing]: start_dose 50 must be one of the declared levels [100, 10 * \
+             WT, 200]. It is none of the numbers, and the ladder increases, so no expression \
+             rung can equal it: none lies between numbers on either side of 50.",
+        ),
+        (
+            "150",
+            "[0, 30 * WT]",
+            Some("[100, 200, 20 * WT]"),
+            "[adaptive_dosing]: start_dose 150 must be one of the declared levels [100, 200, \
+             20 * WT]. It is none of the numbers, and the ladder increases, so no expression \
+             rung can equal it: none lies between numbers on either side of 150.",
+        ),
+        (
+            "250",
+            "[0, 30 * WT]",
+            Some("[100, 10 * WT, 200]"),
+            "[adaptive_dosing]: start_dose 250 must be one of the declared levels [100, 10 * \
+             WT, 200]. It is none of the numbers, and the ladder increases, so no expression \
+             rung can equal it: none lies between numbers on either side of 250.",
+        ),
         (
             "500",
             "[-1, 30 * WT]",
@@ -1197,7 +1224,12 @@ fn a_mixed_block_is_checked_among_its_numbers_at_parse_time() {
         assert_eq!(got, want, "{lines:?}");
     }
     // The same pairs with one side an expression: accepted here, checked per subject.
-    let parses: [(&str, &str, Option<&str>); 6] = [
+    let parses: [(&str, &str, Option<&str>); 9] = [
+        // An expression rung that can take the start dose: between its numeric
+        // neighbours, below the first number, above the last (#2667 review r2 N3).
+        ("150", "[0, 30 * WT]", Some("[100, 20 * WT, 200]")),
+        ("50", "[0, 30 * WT]", Some("[10 * WT, 100, 200]")),
+        ("250", "[0, 30 * WT]", Some("[100, 200, 20 * WT]")),
         ("500", "[0, 30 * WT]", None),
         ("5 * WT", "[10, 30 * WT]", None),
         ("500", "[0, 30 * WT]", Some("[400, 500, 20 * WT]")),
