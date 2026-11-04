@@ -318,6 +318,17 @@ impl FilterClause {
         self.exprs.iter().map(|e| e.col.as_str())
     }
 
+    /// The columns this clause compares as **numbers**, lowercased — every
+    /// sub-expression with a numeric right-hand side. A string comparison reads the
+    /// raw cell instead (`RowContext::str_covariates`), so a label column the numeric
+    /// map holds as `NaN` is not a missing value to it (#2599).
+    pub(crate) fn numeric_columns(&self) -> impl Iterator<Item = &str> {
+        self.exprs
+            .iter()
+            .filter(|e| matches!(e.rhs, FilterValue::Num(_)))
+            .map(|e| e.col.as_str())
+    }
+
     /// True when any sub-expression compares a covariate column as a raw string
     /// (NONMEM `IGNORE(C.EQ.C)` style). Only then must the reader build the
     /// per-row `str_covariates` map; numeric-only clauses (the common case) skip

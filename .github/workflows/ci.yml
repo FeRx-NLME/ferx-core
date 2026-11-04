@@ -425,6 +425,30 @@ jobs:
       - name: cargo test -p docs-lint (via tools/preflight.sh)
         run: tools/preflight.sh docs
 
+  patterns:
+    name: Patterns lint
+    runs-on: ubuntu-latest
+    # Source-pattern lints over test code (#2634): the first rule, `nan-fold`,
+    # fails a test that folds with `f64::max`/`min`, which discards NaN. Rule
+    # files and the shrink-only baseline live in `tools/lint-rules/`. Like
+    # `docs-lint`, `patterns-lint` links no workspace crate (only `syn`), so this
+    # job compiles in seconds and stays off the `ferx-core` path.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        # `-c clippy`: the `patterns` group lints the crate itself, which no
+        # other job covers.
+        run: rustup toolchain install stable --profile minimal -c clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: patterns-lint
+
+      - name: cargo test -p patterns-lint (via tools/preflight.sh)
+        run: tools/preflight.sh patterns
+
   coverage:
     name: Tests + coverage (full, slow-tests)
     runs-on: ubuntu-latest

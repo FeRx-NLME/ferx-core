@@ -239,6 +239,51 @@ fn iiv_on_ruv_model() -> String {
     std::fs::read_to_string("examples/iiv_on_ruv.ferx").expect("example")
 }
 
+/// #2656: `iiv_on_ruv` next to a dense `R` carries each correlation's estimators and no
+/// more, and whatever is left over refuses on its own code: `gn` on `block_sigma`'s method
+/// gate, everything but FOCE/FOCEI on `correlation`'s scope, and a non-interaction stage on
+/// `iiv_on_ruv`'s. `ferx check` reports what `fit()` refuses.
+#[test]
+fn iiv_on_ruv_with_a_dense_r_refuses_only_what_each_half_refuses() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let twin = |name: &str| {
+        std::fs::read_to_string(format!("{root}/nonmem_anchor/iiv_ruv_dense/{name}.ferx")).unwrap()
+    };
+    let with_method = |src: &str, m: &str| src.replace("method = focei", &format!("method = {m}"));
+    let errors = |src: &str| -> Vec<String> {
+        check_codes(src)
+            .into_iter()
+            .filter(|c| c.starts_with("E_"))
+            .collect()
+    };
+    let block = twin("pair");
+    for m in ["focei", "saem", "imp", "laplace", "vi"] {
+        assert_eq!(errors(&with_method(&block, m)), Vec::<String>::new(), "{m}");
+    }
+    assert_eq!(
+        errors(&with_method(&block, "gn")),
+        ["E_BLOCK_SIGMA_METHOD_UNSUPPORTED"],
+    );
+    assert_eq!(
+        errors(&with_method(&block, "foce")),
+        ["E_IIV_ON_RUV_METHOD"]
+    );
+
+    let serial = twin("triple");
+    assert_eq!(errors(&serial), Vec::<String>::new());
+    for m in ["saem", "imp", "laplace", "vi"] {
+        assert_eq!(
+            errors(&with_method(&serial, m)),
+            ["E_RESIDUAL_CORRELATION_SCOPE"],
+            "{m}"
+        );
+    }
+    assert_eq!(
+        errors(&with_method(&serial, "foce")),
+        ["E_IIV_ON_RUV_METHOD"]
+    );
+}
+
 /// A shared η is `E_IIV_ON_RUV_SHARED_ETA` on `error_model`; a non-interaction method
 /// is `E_IIV_ON_RUV_METHOD` on `fit_options`. Both are reported by `ferx check`, which
 /// before #1788 called both files valid.
@@ -525,6 +570,70 @@ fn rtte_records_out_of_order_are_coded() {
         check.iter().any(|d| d.code == "E_RTTE_RECORDS"),
         "{check:?}"
     );
+}
+
+/// With two repeated-event endpoints both out of time order, `E_RTTE_RECORDS` names the
+/// **lower** CMT, and not the higher one, on every compile (#2531): the check returns
+/// the first bad endpoint it walks, so the walk order is the message.
+///
+/// Straddle: each CMT alone is refused, so either could be named. Mutation: walk a
+/// per-call `std::collections::HashMap` copy of `model.endpoints` in `check_rtte_records`.
+#[cfg(feature = "survival")]
+#[test]
+fn rtte_records_refusal_names_the_lowest_bad_cmt_on_every_compile() {
+    use crate::survival::endpoint_order_test_helpers::COMPILES;
+    use crate::types::{EventType, ObsRecord};
+    let src = "[parameters]\n  theta TVA(0.15, 0.001, 10.0)\n  theta TVB(0.10, 0.001, 10.0)\n\
+               [event_model a]\n  cmt = 2\n  type = rtte\n  family = exponential\n  scale = TVA\n\
+               [event_model b]\n  cmt = 3\n  type = rtte\n  family = exponential\n  scale = TVB\n";
+    let event = |time: f64, event_type: EventType, cmt: usize| ObsRecord::Event {
+        time,
+        event_type,
+        entry_time: 0.0,
+        cmt,
+    };
+    let out_of_order = |cmts: &[usize]| {
+        let obs_records = cmts
+            .iter()
+            .flat_map(|&c| {
+                [
+                    event(5.0, EventType::Exact, c),
+                    event(3.0, EventType::Exact, c),
+                    event(20.0, EventType::RightCensored, c),
+                ]
+            })
+            .collect();
+        population_of(vec![Subject {
+            id: "1".to_string(),
+            obs_records,
+            ..Default::default()
+        }])
+    };
+    let message = |model: &crate::types::CompiledModel, pop: &Population| {
+        let check = crate::api::check_model_data(model, pop);
+        check
+            .iter()
+            .find(|d| d.code == "E_RTTE_RECORDS")
+            .unwrap_or_else(|| panic!("no E_RTTE_RECORDS: {check:?}"))
+            .message
+            .clone()
+    };
+    let model = parse_model_string(src).expect("parse");
+    for c in [2, 3] {
+        assert!(
+            message(&model, &out_of_order(&[c])).contains(&format!("CMT={c} ")),
+            "CMT {c} alone must be refused"
+        );
+    }
+    let both = out_of_order(&[2, 3]);
+    for k in 0..COMPILES {
+        let model = parse_model_string(src).expect("parse");
+        let msg = message(&model, &both);
+        assert!(
+            msg.contains("CMT=2 ") && !msg.contains("CMT=3"),
+            "compile {k}: the refusal must name CMT 2, not 3: {msg}"
+        );
+    }
 }
 
 /// A binary record with DV 2 is `E_BINARY_STATE` on `binary_model`.

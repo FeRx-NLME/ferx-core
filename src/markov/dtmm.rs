@@ -166,8 +166,8 @@ fn dtmm_endpoint_nll(
     nll
 }
 
-/// The `Dtmm` endpoints of `model`, in ascending CMT order, so a multi-endpoint sum is
-/// reproducible across processes (`model.endpoints` is a `HashMap`).
+/// The `Dtmm` endpoints of `model`, in ascending CMT order (the order `model.endpoints`,
+/// a `BTreeMap`, iterates in — #2531), so a multi-endpoint sum is reproducible.
 fn dtmm_endpoints(model: &CompiledModel) -> impl Iterator<Item = (usize, &EndpointLikelihood)> {
     model
         .dtmm_cmts()

@@ -590,6 +590,7 @@ pub fn run_foce_gn(
             mixture_posteriors: None,
             vi: None,
             start_eval: None,
+            mcem_lowest_objective: None,
         };
     }
 
@@ -768,6 +769,7 @@ pub fn run_foce_gn(
         mixture_posteriors: None,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: None,
     }
 }
 
@@ -2704,7 +2706,7 @@ mod tests {
             derived_exprs: vec![],
             output_columns: vec![],
             #[cfg(feature = "survival")]
-            endpoints: std::collections::HashMap::new(),
+            endpoints: std::collections::BTreeMap::new(),
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
@@ -4281,7 +4283,7 @@ mod tests {
             derived_exprs: vec![],
             output_columns: vec![],
             #[cfg(feature = "survival")]
-            endpoints: std::collections::HashMap::new(),
+            endpoints: std::collections::BTreeMap::new(),
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
@@ -4581,7 +4583,7 @@ mod tests {
             derived_exprs: vec![],
             output_columns: vec![],
             #[cfg(feature = "survival")]
-            endpoints: std::collections::HashMap::new(),
+            endpoints: std::collections::BTreeMap::new(),
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),

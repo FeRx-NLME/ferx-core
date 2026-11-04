@@ -401,7 +401,7 @@ fn profile_refuses_m3_censoring() {
     };
     one_refusal(
         &scope(&model_of(&counted()), &opts),
-        "which needs a Gaussian likelihood on every row; this fit scores censored rows by M3, \
+        "which scores each Gaussian row by its density; this fit scores censored rows by M3, \
          a normal-tail probability.",
         REMOVE,
     );
@@ -590,24 +590,91 @@ fn every_profiled_block_is_named() {
     );
 }
 
-/// A binary endpoint beside the Gaussian rows.
+/// The endpoint refusal's "needs" clause: what the profile solve scores.
+#[cfg(feature = "survival")]
+const SCORES: &str = "which scores Gaussian and binary rows only; ";
+
+/// `text` with a binary endpoint whose predictor is `logit`, beside the Gaussian rows.
+#[cfg(feature = "survival")]
+fn with_binary(text: &str, logit: &str) -> String {
+    text.replace(
+        "  omega ETA_E0",
+        "  theta TH0(0.0, -10.0, 10.0)\n  omega ETA_E0",
+    )
+    .replace(
+        "[error_model]",
+        &format!("[binary_model]\n  cmt   = 3\n  logit = {logit}\n\n[error_model]"),
+    )
+}
+
+/// A binary endpoint is in scope (#2111), whether the block is read only by the Gaussian
+/// `y` or by the `[binary_model]` predictor as well. Mutation: restore the binary arm and
+/// both models are refused.
 #[cfg(feature = "survival")]
 #[test]
-fn profile_refuses_a_model_with_a_non_gaussian_endpoint() {
-    let text = counted()
-        .replace(
-            "  omega ETA_E0",
-            "  theta TH0(0.0, -10.0, 10.0)\n  omega ETA_E0",
-        )
-        .replace(
-            "[error_model]",
-            "[binary_model]\n  cmt   = 3\n  logit = TH0\n\n[error_model]",
+fn a_binary_endpoint_beside_the_gaussian_rows_is_in_scope() {
+    for logit in ["TH0", "TH0 + PLACEBO[STUDY]"] {
+        let msgs = scope(
+            &model_of(&with_binary(&counted(), logit)),
+            &FitOptions::default(),
         );
-    one_refusal(
-        &scope(&model_of(&text), &FitOptions::default()),
-        "which needs a Gaussian likelihood on every row; this model has a binary endpoint.",
-        REMOVE,
-    );
+        assert!(msgs.is_empty(), "logit = {logit}: {msgs:#?}");
+    }
+}
+
+/// Beside a binary endpoint, an endpoint the solve does not score is refused naming
+/// **that** endpoint, never the binary one, while the binary endpoint alone stays in
+/// scope: both sides of each arm's gate in one test. `has_discrete` and
+/// `has_non_gaussian` are true of a binary endpoint, so the DTMM and CTMM arms ask for
+/// their own kind.
+///
+/// Mutations: guard the DTMM arm by `has_discrete` or the CTMM arm by
+/// `has_non_gaussian` and the binary-only control is refused as Markov; drop either arm
+/// and its model passes.
+#[cfg(feature = "survival")]
+#[test]
+fn beside_a_binary_endpoint_the_refusal_names_the_other_endpoint() {
+    let binary = with_binary(&counted(), "TH0");
+    let control = scope(&model_of(&binary), &FitOptions::default());
+    assert!(control.is_empty(), "{control:#?}");
+    let mut cases = vec![(
+        binary
+            .replace(
+                "  omega ETA_E0",
+                "  theta TVLAMBDA(0.05, 0.001, 10.0)\n  omega ETA_E0",
+            )
+            .replace(
+                "[error_model]",
+                "[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA\n\n[error_model]",
+            ),
+        "time-to-event",
+    )];
+    if cfg!(feature = "markov") {
+        let q = "  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  omega ETA_E0";
+        cases.push((
+            binary.replace("  omega ETA_E0", q).replace(
+                "[error_model]",
+                "[markov_model]\n  type   = dtmm\n  cmt    = 5\n  states = [awake=0, asleep=1]\n  transition awake  -> asleep = inv_logit(LQ01)\n  transition asleep -> awake  = inv_logit(LQ10)\n\n[error_model]",
+            ),
+            "Markov (DTMM)",
+        ));
+        cases.push((
+            binary.replace("  omega ETA_E0", q).replace(
+                "[error_model]",
+                "[markov_model]\n  type   = ctmm\n  cmt    = 5\n  states = [awake=0, asleep=1]\n  transition awake  -> asleep = exp(LQ01)\n  transition asleep -> awake  = exp(LQ10)\n\n[error_model]",
+            ),
+            "Markov (CTMM)",
+        ));
+    }
+    for (text, kind) in cases {
+        let msg = one_refusal(
+            &scope(&model_of(&text), &FitOptions::default()),
+            &format!("{SCORES}this model has a {kind} endpoint."),
+            REMOVE,
+        );
+        assert!(!msg.contains("binary endpoint"), "{kind}: {msg}");
+        assert!(!msg.contains("on every row"), "{kind}: {msg}");
+    }
 }
 
 /// The parse-time codes reach the check report as their own code, on `[parameters]`.
@@ -814,6 +881,29 @@ fn profile_refuses_a_global_search_and_a_prior() {
     );
 }
 
+/// With two refused endpoints the refusal names one, by the order `profile_refused_endpoint`
+/// documents: time-to-event before Markov (DTMM). Mutation: rank time-to-event after the
+/// Markov kinds and the message names the DTMM (#2604 review r2, row N3).
+#[cfg(feature = "markov")]
+#[test]
+fn with_two_refused_endpoints_the_refusal_names_time_to_event_first() {
+    let text = counted()
+        .replace(
+            "  omega ETA_E0",
+            "  theta TVLAMBDA(0.05, 0.001, 10.0)\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  omega ETA_E0",
+        )
+        .replace(
+            "[error_model]",
+            "[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA\n\n[markov_model]\n  type   = dtmm\n  cmt    = 5\n  states = [awake=0, asleep=1]\n  transition awake  -> asleep = inv_logit(LQ01)\n  transition asleep -> awake  = inv_logit(LQ10)\n\n[error_model]",
+        );
+    let msg = one_refusal(
+        &scope(&model_of(&text), &FitOptions::default()),
+        &format!("{SCORES}this model has a time-to-event endpoint."),
+        REMOVE,
+    );
+    assert!(!msg.contains("Markov"), "{msg}");
+}
+
 /// Review #6: the time-to-event arm, named, and no "also".
 #[cfg(feature = "survival")]
 #[test]
@@ -826,7 +916,7 @@ fn profile_refuses_a_model_with_a_time_to_event_endpoint() {
         );
     let msg = one_refusal(
         &scope(&model_of(&text), &FitOptions::default()),
-        "which needs a Gaussian likelihood on every row; this model has a time-to-event endpoint.",
+        &format!("{SCORES}this model has a time-to-event endpoint."),
         REMOVE,
     );
     assert!(!msg.contains("also"), "{msg}");
@@ -844,7 +934,7 @@ fn profile_refuses_a_model_with_a_markov_endpoint() {
         );
     one_refusal(
         &scope(&model_of(&text), &FitOptions::default()),
-        "which needs a Gaussian likelihood on every row; this model has a Markov (CTMM) endpoint.",
+        &format!("{SCORES}this model has a Markov (CTMM) endpoint."),
         REMOVE,
     );
 }
@@ -1121,8 +1211,8 @@ fn binary_reading(read: &str) -> String {
 
 /// The route walk sees the `[binary_model]` predictor (#2562). An affine read there
 /// passes the walk, marks the block `linked` (the predictor's logit link is implicit,
-/// which #2111's binary half reads), and reaches `E_PROFILE_SCOPE`'s binary refusal —
-/// not the false "no prediction reads it". A non-affine read is refused by the walk,
+/// which the linked solve reads) and is in scope (#2111), not refused as the false "no
+/// prediction reads it". A non-affine read is refused by the walk,
 /// naming the construct and the predictor, not `y`. Both sides of the walk in one test.
 ///
 /// Mutations: leave the predictor out of the walk's readouts and the affine model is
@@ -1141,12 +1231,8 @@ fn a_profiled_block_in_the_binary_predictor_is_walked_as_a_linked_readout() {
         .find(|d| d.name == "PLACEBO")
         .unwrap();
     assert!(decl.linked, "the binary predictor's link is implicit");
-    let msg = one_refusal(
-        &scope(&parsed.model, &FitOptions::default()),
-        "which needs a Gaussian likelihood on every row; this model has a binary endpoint.",
-        REMOVE,
-    );
-    assert!(!msg.contains("no prediction reads it"), "{msg}");
+    let msgs = scope(&parsed.model, &FitOptions::default());
+    assert!(msgs.is_empty(), "in scope since #2111: {msgs:#?}");
 
     let err = parse_full_model(&binary_reading("exp(PLACEBO[STUDY])"))
         .err()
@@ -1185,7 +1271,7 @@ fn a_profiled_block_read_only_in_a_hazard_reaches_the_endpoint_refusal() {
         );
     let msg = one_refusal(
         &scope(&model_of(&text), &FitOptions::default()),
-        "which needs a Gaussian likelihood on every row; this model has a time-to-event endpoint.",
+        &format!("{SCORES}this model has a time-to-event endpoint."),
         REMOVE,
     );
     assert!(!msg.contains("no prediction reads it"), "{msg}");

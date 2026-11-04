@@ -6926,3 +6926,364 @@ const STALL_GAP_2591: f64 = 0.5;
 /// #2111: a block read through a logit link.
 #[path = "profile_logit_tests.rs"]
 mod logit;
+
+/// #2519: whether `r` carries the #2461 above-start warning.
+fn warns_above_start(warnings: &[String]) -> bool {
+    warnings
+        .iter()
+        .any(|w| w.starts_with(crate::estimation::outer_optimizer::ABOVE_START_TOKEN))
+}
+
+/// #2519: the profiled loop publishes its first evaluation — the structural start with the
+/// levels re-solved there, bit-equal to what an evaluation-only fit (`outer_maxiter = 0`)
+/// reports (measured: 26.465827492925 both on F2's first two studies, final 22.139638).
+/// Not the last evaluation, which sits at the optimum 4.33 lower.
+#[test]
+fn optimize_profiled_publishes_its_first_evaluation() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let o = FitOptions {
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    let at_start = optimize_profiled(
+        &p.parsed.model,
+        &p.population,
+        &p.init_params,
+        &FitOptions {
+            outer_maxiter: 0,
+            ..o.clone()
+        },
+    );
+    let start = r.start_eval.expect("the profiled loop records its start");
+    assert!(!start.guard_rejected, "{start:?}");
+    assert_eq!((start.n_unconverged, start.n_start_rejected), (0, 0));
+    assert!(at_start.ofv.is_finite() && r.ofv.is_finite());
+    assert_eq!(
+        start.ofv, at_start.ofv,
+        "the start is the evaluation-only objective"
+    );
+    assert!(start.ofv > r.ofv + 1.0, "{} vs {}", start.ofv, r.ofv);
+}
+
+/// #2519: `fit()`'s composition — `escape_floor` around `optimize_profiled_probed` — holds a
+/// profiled fit against its published start. The start is shifted to 1000 below the
+/// reported objective; the unshifted control is converged with no warning (L-BFGS, the
+/// default `auto`; BOBYQA's unshifted run is not converged on this fixture, so is no control).
+#[test]
+fn escape_floor_holds_a_profiled_fit_against_its_start() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let o = FitOptions {
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    let run = |shift: Option<f64>| {
+        crate::estimation::floor_escape::escape_floor(
+            &p.init_params,
+            &o,
+            p.population.subjects.len(),
+            |pp, oo| {
+                let mut r = optimize_profiled_probed(&p.parsed.model, &p.population, pp, oo);
+                if let (Some(sh), Some(s)) = (shift, r.start_eval.as_mut()) {
+                    s.ofv = r.ofv - sh;
+                }
+                r
+            },
+            |_| 0.0,
+        )
+    };
+    let plain = run(None);
+    assert!(plain.start_eval.is_some(), "the start reaches escape_floor");
+    assert!(plain.converged, "{:?}", plain.warnings);
+    assert!(!warns_above_start(&plain.warnings), "{:?}", plain.warnings);
+    let moved = run(Some(1000.0));
+    assert!(!moved.converged);
+    let w = moved
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_ABOVE_START"))
+        .unwrap_or_else(|| panic!("{:?}", moved.warnings));
+    assert!(w.contains("1000.0000 above"), "{w}");
+    // An accepted start: no guard sentence.
+    assert!(!w.contains("EBE convergence guard"), "{w}");
+    assert_eq!(moved.ofv, plain.ofv);
+}
+
+/// #2519, the natural case (the #2461 failure on a profiled fit, no shift): at
+/// `inner_maxiter = 2` the EBE guard rejects F2's start (2 of 2 subjects unconverged at the
+/// default `max_unconverged_frac = 0.1`), so the optimizer never ranks it and walks to
+/// 66.022863, 39.5570 above the start's 26.465827 — which `optimize_profiled` alone reports
+/// converged. Control in the same test: at `inner_maxiter = 3` the start is accepted and the
+/// fit converges at 22.139638 with no warning.
+#[test]
+fn a_profiled_fit_pushed_off_a_rejected_start_is_not_converged() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let fit_at = |inner_maxiter: usize| {
+        let o = FitOptions {
+            run_covariance_step: false,
+            inner_maxiter,
+            ..options(&p)
+        };
+        assert_eq!(o.max_unconverged_frac, 0.1, "the default the message names");
+        crate::fit(&p.parsed.model, &p.population, &p.init_params, &o).unwrap()
+    };
+    let starved = fit_at(2);
+    assert!(!starved.converged, "{:?}", starved.warnings);
+    let w = starved
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_ABOVE_START"))
+        .unwrap_or_else(|| panic!("{:?}", starved.warnings));
+    assert!(w.contains("26.465827 its starting estimates scored"), "{w}");
+    assert!(w.contains("2 of 2 subjects"), "{w}");
+    assert!(w.contains("`max_unconverged_frac` = 0.1"), "{w}");
+    assert!(
+        starved
+            .warnings
+            .iter()
+            .any(|w| w == "Outer optimization did not converge"),
+        "{:?}",
+        starved.warnings
+    );
+    let control = fit_at(3);
+    assert!(control.converged, "{:?}", control.warnings);
+    assert!(
+        !warns_above_start(&control.warnings),
+        "{:?}",
+        control.warnings
+    );
+    assert!(control.ofv < starved.ofv - 1.0);
+}
+
+/// #2519: the start is the **first** call, whatever its solve did. At `inner_maxiter = 1`
+/// F2's start solve fails, so the recorded start is `∞` (which `above_start_warning` skips)
+/// rather than a later evaluation that solved.
+#[test]
+fn a_failed_start_solve_is_recorded_as_infinite() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let o = FitOptions {
+        run_covariance_step: false,
+        inner_maxiter: 1,
+        max_unconverged_frac: 0.0,
+        ..options(&p)
+    };
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    assert!(r.ofv.is_finite(), "a later evaluation solved: {}", r.ofv);
+    let start = r.start_eval.expect("recorded");
+    assert_eq!(start.ofv, f64::INFINITY, "{start:?}");
+    assert!(!start.guard_rejected);
+}
+
+/// #2619: that `∞` start is re-scored by `fit` before the #2461 check, so the run is no
+/// longer reported converged. Measured at `8d4af547`, identical in every printed digit on
+/// macOS arm64 and Linux aarch64: the start re-scored at `inner_maxiter = 200` is 26.465827,
+/// the run ends at 66.022863 — 39.557 above it, against a bound of 0.0275 — and the
+/// `inner_maxiter = 3` control converges to 22.139638. The assertions are the relations: the
+/// demotion and the message, and a 30 OFV floor on the gap between the demoted report and the
+/// control's optimum (43.883 measured), so the fixture cannot drift to a run that ends near
+/// the optimum (x86_64 not measured).
+#[test]
+fn fit_rescores_a_failed_start_and_demotes_a_run_above_it() {
+    use crate::estimation::outer_optimizer::ABOVE_START_TOKEN;
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let fit_at = |inner_maxiter: usize| {
+        let o = FitOptions {
+            run_covariance_step: false,
+            inner_maxiter,
+            max_unconverged_frac: 0.0,
+            ..options(&p)
+        };
+        crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o).expect("fit")
+    };
+    let f = fit_at(1);
+    let tagged: Vec<&String> = f
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with(ABOVE_START_TOKEN))
+        .collect();
+    assert!(!f.converged, "{:?}", f.warnings);
+    assert_eq!(tagged.len(), 1, "{:?}", f.warnings);
+    assert!(
+        tagged[0].contains("failed outright at `inner_maxiter` = 1")
+            && tagged[0].contains("at `inner_maxiter` = 200"),
+        "{}",
+        tagged[0]
+    );
+    let control = fit_at(3);
+    assert!(control.converged, "{:?}", control.warnings);
+    assert!(f.ofv.is_finite() && control.ofv.is_finite());
+    assert!(
+        f.ofv - control.ofv > 30.0,
+        "the demoted run sits far above the optimum: {} vs {}",
+        f.ofv,
+        control.ofv
+    );
+}
+
+/// #2519: with a covariate-NN penalty on, the recorded start carries it, as the objective
+/// `escape_floor` ranks does; the evaluation-only fit reports the unpenalized one. Measured
+/// on all 12 F2 studies with `nn_l2 = 0.5`: start 238.673539, evaluation-only 238.165038,
+/// penalty 0.508501, gap − penalty 1.3e-15 (rounding of `a + p − a`); the bound is 1e-9
+/// relative, ~1e6 headroom, and far below the penalty itself.
+#[cfg(feature = "nn")]
+#[test]
+fn the_profiled_start_carries_the_nn_penalty() {
+    let p = prep(F2, F2_DATA, None, |t| {
+        t.replace(
+            "[individual_parameters]",
+            "[covariate_nn NNE]\n  inputs = [SE]\n  outputs = [CL]\n  layers = [1]\n  \
+             activation = tanh\n  output = softplus\n\n[individual_parameters]",
+        )
+        // The network replaces `EMAX`, which would alias its output scale.
+        .replace("  theta EMAX(8.0, 0.0, 100.0)\n", "")
+        .replace("EMAX * exp(ETA_EM)", "NNE.CL * exp(ETA_EM)")
+        .replace("covariance = true", "covariance = true\n  nn_l2 = 0.5")
+    });
+    let refused: Vec<_> = crate::api::check_model_options(&p.parsed.model, &options(&p))
+        .into_iter()
+        .filter(|d| d.code == "E_PROFILE_SCOPE")
+        .collect();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(p.parsed.model.covariate_nns.len(), 1);
+    let o = FitOptions {
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    assert!(o.nn_l2_lambda > 0.0);
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    let at_start = optimize_profiled(
+        &p.parsed.model,
+        &p.population,
+        &p.init_params,
+        &FitOptions {
+            outer_maxiter: 0,
+            ..o.clone()
+        },
+    );
+    let penalty =
+        crate::estimation::nn_reg::NnRegularizer::build(&p.parsed.model, &p.population, &o)
+            .penalty_value(&p.init_params.theta);
+    assert!(penalty > 0.0, "{penalty}");
+    let start = r.start_eval.expect("recorded");
+    let gap = start.ofv - at_start.ofv;
+    assert!(
+        (gap - penalty).abs() <= 1e-9 * start.ofv.abs().max(1.0),
+        "gap {gap} vs penalty {penalty}"
+    );
+}
+
+// ── #2629: a floor restart that leaves a θ just above the floor ─────────────────────
+
+const F2_PROFILED_BLOCK: &str =
+    "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile";
+
+/// F2 with its block read as an ordinary bounded θ block, so the unprofiled loop runs.
+fn f2_unprofiled(t: String) -> String {
+    assert!(t.contains(F2_PROFILED_BLOCK), "fixture moved");
+    t.replace(
+        F2_PROFILED_BLOCK,
+        "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)",
+    )
+}
+
+/// `fit()` on F2 cut to `studies`, `max_unconverged_frac = 0`, no covariance step, at
+/// `inner_maxiter = im`, with the optimizer the file leaves at `auto` (L-BFGS here).
+fn f2_fit(studies: Option<usize>, edit: fn(String) -> String, im: usize) -> crate::FitResult {
+    let p = prep(F2, F2_DATA, studies, edit);
+    let o = FitOptions {
+        run_covariance_step: false,
+        inner_maxiter: im,
+        max_unconverged_frac: 0.0,
+        ..options(&p)
+    };
+    crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o).unwrap()
+}
+
+/// The floor-escape warning of a fit, if it has one.
+fn floor_warning(f: &crate::FitResult) -> Option<&String> {
+    f.warnings.iter().find(|w| w.contains("log-packing floor"))
+}
+
+/// T4. F2, two studies, unprofiled, `inner_maxiter = 1` (#2629): the first L-BFGS run puts
+/// TVE0 on the floor, the floor escape restarts it, and the restart stops at 42.788001 with
+/// EMAX = 3.309e-10 — 1.197 ln-units above the floor, so not on it, where raising EMAX to
+/// its probe point 0.008 still drops the OFV by 0.021. The optimum is 22.139638. Before the
+/// fix this was reported `converged: true` with the restart's success warning. The
+/// re-scored reported point is the same 42.788001 at any inner budget, so the budget is not
+/// the mechanism; the point is kept (it is the lowest found) and demoted.
+///
+/// The `inner_maxiter = 3` twin reaches the optimum, converged, with no refloored clause.
+#[test]
+fn a_restart_left_just_above_the_floor_is_not_reported_converged() {
+    let trapped = f2_fit(Some(2), f2_unprofiled, 1);
+    assert!(
+        (trapped.ofv - 42.788001).abs() < 1e-5,
+        "{} {:?}",
+        trapped.ofv,
+        trapped.warnings
+    );
+    assert!(!trapped.converged, "{:?}", trapped.warnings);
+    let w = floor_warning(&trapped).expect("a floor-escape warning");
+    assert!(
+        w.contains("but stopped with EMAX below 1/1000 of its start (EMAX = 3.309e-10)")
+            && w.contains("(OFV 42.766729 with it at EMAX = 8.000e-3, against 42.788001")
+            && w.contains("the fit is not reported as converged")
+            && !w.contains("on the floor again")
+            && !w.contains("TVE0 just above"),
+        "{w}"
+    );
+
+    let healthy = f2_fit(Some(2), f2_unprofiled, 3);
+    assert!(
+        (healthy.ofv - 22.1396).abs() < 1e-4,
+        "{} {:?}",
+        healthy.ofv,
+        healthy.warnings
+    );
+    assert!(healthy.converged, "{:?}", healthy.warnings);
+    assert!(
+        floor_warning(&healthy).is_none_or(|w| !w.contains("but stopped with")),
+        "{:?}",
+        healthy.warnings
+    );
+}
+
+/// T5. All twelve studies at `inner_maxiter = 2`: the restart stops at 170.266229 (the
+/// optimum is 101.911514) with EMAX just above the floor, and is not reported converged.
+/// The profiled twin was already demoted by `W_ABOVE_START` (#2626) at 310.367564, with no
+/// floor restart adopted, and does not move.
+#[test]
+fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
+    let unprofiled = f2_fit(None, f2_unprofiled, 2);
+    assert!(
+        (unprofiled.ofv - 170.266229).abs() < 1e-5,
+        "{} {:?}",
+        unprofiled.ofv,
+        unprofiled.warnings
+    );
+    assert!(!unprofiled.converged, "{:?}", unprofiled.warnings);
+    let w = floor_warning(&unprofiled).expect("a floor-escape warning");
+    assert!(w.contains("EMAX below 1/1000 of its start"), "{w}");
+
+    let profiled = f2_fit(None, |t| t, 2);
+    assert!(
+        (profiled.ofv - 310.367564).abs() < 1e-5,
+        "{} {:?}",
+        profiled.ofv,
+        profiled.warnings
+    );
+    assert!(!profiled.converged, "{:?}", profiled.warnings);
+    assert!(
+        profiled
+            .warnings
+            .iter()
+            .any(|w| w.contains(crate::estimation::outer_optimizer::ABOVE_START_TOKEN)),
+        "{:?}",
+        profiled.warnings
+    );
+    assert!(
+        floor_warning(&profiled).is_none(),
+        "{:?}",
+        profiled.warnings
+    );
+}

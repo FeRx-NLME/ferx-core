@@ -348,6 +348,8 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
         ("rustdoc", "rustdoc"),
         // #1545. Runs no cargo, so (1a) is vacuous for it; (1b) and (2) are not.
         ("changelog", "changelog"),
+        // #2634. Same shape as `docs`: its gate is its own test run.
+        ("patterns", "patterns"),
         // NOT `debug-assertions`. It had a job of its own under #344; #1248
         // retired it, because `[profile.ci-cov]` puts the guards inside the two
         // coverage jobs that had to run anyway. Those jobs cannot delegate here —
@@ -440,6 +442,7 @@ fn a_failing_gate_fails_the_script_from_every_position() {
         "clippy",
         "rustdoc",
         "docs",
+        "patterns",
         "debug-assertions",
         "release-semantics",
     ] {
@@ -785,6 +788,28 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
         listed_commands("docs").join("\n  ")
     );
 
+    // Same hole for `crates/patterns-lint` (#2634), and the same reason it needs its own
+    // assertion: the count tripwire cannot see a clippy line replaced by a second
+    // `cargo test`. And the `patterns` group must keep RUNNING the corpus check — a
+    // group of two clippy lines counts 2 too, and gates nothing about test code.
+    let patterns = listed_commands("patterns");
+    for (needle, why) in [
+        (
+            "cargo clippy -p patterns-lint",
+            "lints `crates/patterns-lint` — the `clippy` group's package list does not",
+        ),
+        (
+            "cargo test -p patterns-lint",
+            "runs the corpus check in `crates/patterns-lint/tests/patterns_corpus.rs`, which IS the gate",
+        ),
+    ] {
+        assert!(
+            patterns.iter().any(|c| c.starts_with(needle)),
+            "the `patterns` group no longer runs `{needle}…`; nothing else {why}.\n  {}",
+            patterns.join("\n  ")
+        );
+    }
+
     // `-Dunused` only proves "used" for the feature set it was compiled under, and that
     // proof does not carry down to a subset: an item read only from a
     // `#[cfg(feature = "survival")]` body is used under `ci,markov,nn` (`markov` implies
@@ -1128,13 +1153,14 @@ fn preflight_is_executable_and_lists_every_group() {
     // commands are actually *enforced* is
     // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
     // can never show it.
-    let expected: [(&str, usize); 9] = [
+    let expected: [(&str, usize); 10] = [
         ("changelog", 1),  // tools/changelog.sh check (#1545)
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
         ("clippy", 3),     // ferx-core ci,markov,nn · ferx-core ci --lib (#2075) · members
         ("rustdoc", 2),    // ferx-core rustdoc · members
         ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
+        ("patterns", 2),   // cargo test -p patterns-lint · cargo clippy -p patterns-lint (#2634)
         ("public-api", 1), // tools/update-public-api.sh --check
         // #344: `--features ci` · `--features ci,markov,nn`. The second line is
         // not padding — `ci` compiles neither `src/survival`, `src/markov`,

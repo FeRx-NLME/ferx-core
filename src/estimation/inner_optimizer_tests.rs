@@ -2121,7 +2121,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         output_columns: vec![],
         dose_attr_map: Default::default(),
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: Some(crate::types::FremConfig {
             fremtype_to_indices: {
                 let mut m = std::collections::HashMap::new();
@@ -3364,6 +3364,78 @@ mod frozen_ebe_variance {
                 "iov {}: frozen vs conditional gradient {sep:e}",
                 s.id
             );
+        }
+    }
+
+    /// The #2656 anchor twin `twin` on its data, with its first subject's residual blocks.
+    fn ruv_dense_twin(twin: &str) -> (CompiledModel, Subject) {
+        let dir = format!("{}/nonmem_anchor/iiv_ruv_dense", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(format!("{dir}/{twin}.ferx")).unwrap();
+        let parsed = crate::parser::model_parser::parse_full_model(&src).unwrap();
+        let (pop, _) = crate::api::read_population_for(
+            &parsed.model,
+            &parsed.covariate_decls,
+            &format!("{dir}/{twin}.csv"),
+            None,
+            None,
+            None,
+            &parsed.column_map,
+        )
+        .unwrap();
+        let mut s = pop.subjects[0].clone();
+        s.obs_rgroup = crate::stats::residual_error::residual_groups(&parsed.model, &s);
+        (parsed.model, s)
+    }
+
+    /// #2656: the dense-`R` inner gradient under `iiv_on_ruv`, against central FD of the
+    /// objective it steers, at an `η_r` far from 0. `R` couples rows on both fixtures, and
+    /// proportional error keeps `∂R/∂f` live, so the scale reaches `R⁻¹`, `∂R/∂η_k` and the
+    /// `η_r` column separately. A frozen `R` is `R⁰`, with no scale and no `η_r` data term.
+    #[test]
+    fn dense_residual_inner_gradient_carries_iiv_on_ruv() {
+        for twin in ["pair", "triple"] {
+            let (model, s) = ruv_dense_twin(twin);
+            let p = model.default_params.clone();
+            let r_idx = model.residual_error_eta.expect("iiv_on_ruv");
+            let eta = [0.12, -0.08, 0.55];
+            let keys = model.error_spec.obs_keys(&s);
+            let f0 = population_variance_preds(&model, &s, &p.theta, 3).unwrap();
+            let grad = |frozen: Option<&[f64]>| {
+                analytic_eta_nll_gradient_with_schedule(
+                    &model,
+                    &s,
+                    &p.theta,
+                    &eta,
+                    &p.omega,
+                    &p.sigma.values,
+                    model.residual_cov_at(&p),
+                    None,
+                    None,
+                    keys.as_ref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(3),
+                    &mut DVector::zeros(3),
+                    frozen,
+                )
+                .expect("dense in scope")
+            };
+            let got = grad(None);
+            assert_close(
+                twin,
+                &got,
+                &fd(|e| nll(&model, &s, &p, e, None), &eta),
+                1e-5,
+            );
+            let frozen = grad(Some(&f0));
+            assert_close(
+                twin,
+                &frozen,
+                &fd(|e| nll(&model, &s, &p, e, Some(&f0)), &eta),
+                1e-5,
+            );
+            // Under a frozen `R` only the prior reads `η_r`.
+            let prior = p.omega.inv[(r_idx, r_idx)] * eta[r_idx];
+            assert!((frozen[r_idx] - prior).abs() < 1e-10, "{twin}: {frozen:?}");
         }
     }
 

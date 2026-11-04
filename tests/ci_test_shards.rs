@@ -588,7 +588,7 @@ const SLOW_YML: &str = ".github/workflows/slow-tests.yml";
 /// The packages `slow-tests.yml` builds with `--exclude`; their tests are not the
 /// slow suite's. Kept literal here: `slow_test_path_filter.rs` reads the yml's own
 /// list, and the planner refuses build args that disagree with its suite.
-const SLOW_EXCLUDED_MEMBERS: &[&str] = &["docs-lint"];
+const SLOW_EXCLUDED_MEMBERS: &[&str] = &["docs-lint", "patterns-lint"];
 
 /// [`every_test_target`] without the members `slow-tests.yml` excludes.
 fn slow_test_targets() -> Vec<String> {
@@ -622,7 +622,7 @@ fn the_slow_shards_run_every_test_exactly_once() {
     let all = slow_test_targets();
     assert!(
         all.len() > 100 && all.len() < every_test_target().len(),
-        "slow discovery found {} targets of {} — is the docs-lint exclusion applied?",
+        "slow discovery found {} targets of {} — are the docs-lint / patterns-lint exclusions applied?",
         all.len(),
         every_test_target().len()
     );
@@ -672,7 +672,13 @@ fn the_slow_lib_runs_unfiltered() {
     );
     let out = refused_run(
         &["slow", "1", "4", "--lib-parts", "2"],
-        &["--workspace", "--exclude", "docs-lint"],
+        &[
+            "--workspace",
+            "--exclude",
+            "docs-lint",
+            "--exclude",
+            "patterns-lint",
+        ],
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -817,6 +823,8 @@ fn run_writes_a_manifest_and_fails_if_any_did() {
             "--workspace",
             "--exclude",
             "docs-lint",
+            "--exclude",
+            "patterns-lint",
             "--profile",
             "ci-test",
             "--no-fail-fast",
@@ -844,7 +852,8 @@ fn run_writes_a_manifest_and_fails_if_any_did() {
     for call in &calls {
         assert!(
             call.starts_with(
-                "test --workspace --exclude docs-lint --profile ci-test --no-fail-fast "
+                "test --workspace --exclude docs-lint --exclude patterns-lint --profile ci-test \
+                 --no-fail-fast "
             ),
             "`{call}` is not a `cargo test` over the build args"
         );

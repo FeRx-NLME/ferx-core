@@ -587,7 +587,7 @@ the standard *cause-specific hazard* approach:
 
 **Data format.** Each subject has one row per cause CMT. The cause that occurred
 is `DV=1` on its CMT; every other cause is right-censored (`DV=0`) at the *same*
-time, because experiencing one event removes the subject from risk of the others:
+time, because one event removes the subject from risk of the others:
 
 ```
 ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
@@ -601,11 +601,12 @@ See `examples/tte_competing_risks.ferx` and `data/tte_competing_risks.csv`.
 
 **Prediction — cumulative incidence.** `predict_survival()` reports, per cause,
 the cause-specific cumulative incidence `F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du`
-alongside the all-cause survival `S_all(t) = exp(−Σ_j H_j(t))`. In the presence
-of competing risks the naive `1 − exp(−H_k)` *over*-states a cause's incidence
+alongside the all-cause survival `S_all(t) = exp(−Σ_j H_j(t))`. With competing
+risks the naive `1 − exp(−H_k)` *over*-states a cause's incidence
 (it ignores that the other causes remove subjects from risk); the reported CIF is
-the correct quantity, and across all causes `Σ_k F_k(t) + S_all(t) = 1` exactly.
-For a single endpoint it reduces to `F(t) = 1 − S(t)`.
+correct, and across all causes `Σ_k F_k(t) + S_all(t) = 1` exactly.
+For a single endpoint it reduces to `F(t) = 1 − S(t)`. Rows: ascending CMT per
+subject.
 
 **Estimation note.** The cause-specific *rates* are well-identified and recover
 tightly. The shared frailty variance ω² is weakly identified for TTE and reads
@@ -623,7 +624,7 @@ cause-specific hazard covers the standard pharmacometric use case.
 2. *Independent quadrature (time-varying hazards).* For a Weibull + Gompertz pair
    the per-cause `F_k(t)` from `cif_curves` matches a high-resolution
    composite-Simpson integration of the defining integral
-   `F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du` — a different numerical scheme — to within
+   `F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du` — a different scheme — to within
    `1e-3` (`cif_time_varying_matches_independent_quadrature`).
 3. *Nonparametric reference (R `cmprsk::cuminc`).* Simulating the example's two
    exponential causes (`λ_A = 0.10`, `λ_B = 0.06`, administrative censoring at

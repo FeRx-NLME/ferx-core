@@ -2729,6 +2729,9 @@ pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
 pub enum ferx_core::types::RtteClock
 pub ferx_core::types::RtteClock::Forward
 pub ferx_core::types::RtteClock::Reset
+pub enum ferx_core::types::SaemKernel
+pub ferx_core::types::SaemKernel::Imh
+pub ferx_core::types::SaemKernel::RandomWalk
 pub enum ferx_core::types::SaemMstepSolver
 pub ferx_core::types::SaemMstepSolver::Bobyqa
 pub ferx_core::types::SaemMstepSolver::ScoreSa
@@ -2888,7 +2891,7 @@ pub ferx_core::types::CompiledModel::diffusion_state_indices: alloc::vec::Vec<us
 pub ferx_core::types::CompiledModel::diffusion_theta_start: core::option::Option<usize>
 pub ferx_core::types::CompiledModel::dose_attr_map: ferx_core::DoseAttrMap
 pub ferx_core::types::CompiledModel::dv_pre_logged: bool
-pub ferx_core::types::CompiledModel::endpoints: std::collections::hash::map::HashMap<usize, ferx_core::EndpointLikelihood>
+pub ferx_core::types::CompiledModel::endpoints: alloc::collections::btree::map::BTreeMap<usize, ferx_core::EndpointLikelihood>
 pub ferx_core::types::CompiledModel::error_model: ferx_core::ErrorModel
 pub ferx_core::types::CompiledModel::error_spec: ferx_core::ErrorSpec
 pub ferx_core::types::CompiledModel::eta_map: alloc::vec::Vec<i32>
@@ -3165,6 +3168,7 @@ pub ferx_core::types::FitOptions::gn_lambda: f64
 pub ferx_core::types::FitOptions::gradient_method: ferx_core::GradientMethod
 pub ferx_core::types::FitOptions::ignore_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitOptions::ignore_subjects: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::FitOptions::imp_adapt_passes: usize
 pub ferx_core::types::FitOptions::imp_auto: bool
 pub ferx_core::types::FitOptions::imp_averaging: usize
 pub ferx_core::types::FitOptions::imp_defensive_alpha: f64
@@ -3231,6 +3235,11 @@ pub ferx_core::types::FitOptions::saem_conddist: bool
 pub ferx_core::types::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::types::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::types::FitOptions::saem_conddist_nsamp: usize
+pub ferx_core::types::FitOptions::saem_imh_defensive: f64
+pub ferx_core::types::FitOptions::saem_imh_min_obs_per_eta: f64
+pub ferx_core::types::FitOptions::saem_imh_proposals: usize
+pub ferx_core::types::FitOptions::saem_imh_refresh: usize
+pub ferx_core::types::FitOptions::saem_kernel: ferx_core::SaemKernel
 pub ferx_core::types::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::types::FitOptions::saem_mstep_draws: usize
 pub ferx_core::types::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
@@ -3442,6 +3451,7 @@ pub ferx_core::types::ImpmapTraceRow::omega_lower_tri: alloc::vec::Vec<f64>
 pub ferx_core::types::ImpmapTraceRow::sigma: alloc::vec::Vec<f64>
 pub ferx_core::types::ImpmapTraceRow::theta: alloc::vec::Vec<f64>
 pub struct ferx_core::types::ImportanceSamplingResult
+pub ferx_core::types::ImportanceSamplingResult::adapt_passes: usize
 pub ferx_core::types::ImportanceSamplingResult::ess_median: f64
 pub ferx_core::types::ImportanceSamplingResult::ess_min: f64
 pub ferx_core::types::ImportanceSamplingResult::kappa_treatment: ferx_core::KappaTreatment
@@ -4149,6 +4159,9 @@ pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
 pub enum ferx_core::RtteClock
 pub ferx_core::RtteClock::Forward
 pub ferx_core::RtteClock::Reset
+pub enum ferx_core::SaemKernel
+pub ferx_core::SaemKernel::Imh
+pub ferx_core::SaemKernel::RandomWalk
 pub enum ferx_core::SaemMstepSolver
 pub ferx_core::SaemMstepSolver::Bobyqa
 pub ferx_core::SaemMstepSolver::ScoreSa
@@ -4398,7 +4411,7 @@ pub ferx_core::CompiledModel::diffusion_state_indices: alloc::vec::Vec<usize>
 pub ferx_core::CompiledModel::diffusion_theta_start: core::option::Option<usize>
 pub ferx_core::CompiledModel::dose_attr_map: ferx_core::DoseAttrMap
 pub ferx_core::CompiledModel::dv_pre_logged: bool
-pub ferx_core::CompiledModel::endpoints: std::collections::hash::map::HashMap<usize, ferx_core::EndpointLikelihood>
+pub ferx_core::CompiledModel::endpoints: alloc::collections::btree::map::BTreeMap<usize, ferx_core::EndpointLikelihood>
 pub ferx_core::CompiledModel::error_model: ferx_core::ErrorModel
 pub ferx_core::CompiledModel::error_spec: ferx_core::ErrorSpec
 pub ferx_core::CompiledModel::eta_map: alloc::vec::Vec<i32>
@@ -4750,6 +4763,7 @@ pub ferx_core::FitOptions::gn_lambda: f64
 pub ferx_core::FitOptions::gradient_method: ferx_core::GradientMethod
 pub ferx_core::FitOptions::ignore_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitOptions::ignore_subjects: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::FitOptions::imp_adapt_passes: usize
 pub ferx_core::FitOptions::imp_auto: bool
 pub ferx_core::FitOptions::imp_averaging: usize
 pub ferx_core::FitOptions::imp_defensive_alpha: f64
@@ -4816,6 +4830,11 @@ pub ferx_core::FitOptions::saem_conddist: bool
 pub ferx_core::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::FitOptions::saem_conddist_nsamp: usize
+pub ferx_core::FitOptions::saem_imh_defensive: f64
+pub ferx_core::FitOptions::saem_imh_min_obs_per_eta: f64
+pub ferx_core::FitOptions::saem_imh_proposals: usize
+pub ferx_core::FitOptions::saem_imh_refresh: usize
+pub ferx_core::FitOptions::saem_kernel: ferx_core::SaemKernel
 pub ferx_core::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::FitOptions::saem_mstep_draws: usize
 pub ferx_core::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
@@ -5045,6 +5064,7 @@ pub ferx_core::ImpmapTraceRow::omega_lower_tri: alloc::vec::Vec<f64>
 pub ferx_core::ImpmapTraceRow::sigma: alloc::vec::Vec<f64>
 pub ferx_core::ImpmapTraceRow::theta: alloc::vec::Vec<f64>
 pub struct ferx_core::ImportanceSamplingResult
+pub ferx_core::ImportanceSamplingResult::adapt_passes: usize
 pub ferx_core::ImportanceSamplingResult::ess_median: f64
 pub ferx_core::ImportanceSamplingResult::ess_min: f64
 pub ferx_core::ImportanceSamplingResult::kappa_treatment: ferx_core::KappaTreatment

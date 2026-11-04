@@ -90,7 +90,7 @@ fn tiny_model() -> CompiledModel {
         derived_exprs: vec![],
         output_columns: vec![],
         #[cfg(feature = "survival")]
-        endpoints: std::collections::HashMap::new(),
+        endpoints: std::collections::BTreeMap::new(),
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
@@ -258,6 +258,42 @@ pub(super) fn tv_refusal(model: &CompiledModel, pop: &Population, block: &str) -
     assert_eq!(d.code, "E_ENDPOINT_TV_COVARIATE", "{d:?}");
     assert_eq!(d.block.as_deref(), Some(block), "{d:?}");
     d.message.clone()
+}
+
+/// With two binary endpoints whose `logit`s both read a time-varying `X`, the
+/// `E_ENDPOINT_TV_COVARIATE` refusal names the **lower** CMT, and not the higher one, on
+/// every compile (#2531): the check returns the first endpoint it walks, so the walk
+/// order is the message. The blocks are declared in descending CMT order.
+///
+/// Straddle: each endpoint alone is refused, so either could be named. Mutation: walk a
+/// per-call `std::collections::HashMap` copy of `model.endpoints` in
+/// `check_survival_tv_covariates`.
+#[cfg(feature = "survival")]
+#[test]
+fn binary_tv_covariate_refusal_names_the_lowest_cmt_on_every_compile() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::survival::endpoint_order_test_helpers::COMPILES;
+    let block = |name: &str, cmt: usize| {
+        format!("[binary_model {name}]\n  cmt   = {cmt}\n  logit = TH0 + THX * X\n")
+    };
+    let head = "[parameters]\n  theta TH0(0.0, -10.0, 10.0)\n  theta THX(0.0, -10.0, 10.0)\n";
+    let x = |v: f64| HashMap::from([("X".to_string(), v)]);
+    let pop = tte_cov_snapshot_pop("S1", vec![x(1.0), x(2.0)]);
+    for cmt in [3, 4] {
+        let alone = parse_model_string(&format!("{head}{}", block("only", cmt))).expect("parse");
+        let msg = tv_refusal(&alone, &pop, "binary_model");
+        assert!(msg.contains(&format!("CMT={cmt}:")), "{msg}");
+    }
+    let src = format!("{head}{}{}", block("hi", 4), block("lo", 3));
+    for k in 0..COMPILES {
+        let model = parse_model_string(&src).expect("parse");
+        assert_eq!(model.endpoints.len(), 2);
+        let msg = tv_refusal(&model, &pop, "binary_model");
+        assert!(
+            msg.contains("CMT=3:") && !msg.contains("CMT=4"),
+            "compile {k}: the refusal must name CMT 3, not 4: {msg}"
+        );
+    }
 }
 
 /// #741 analogue for the binary endpoint, narrowed by #2562: the `logit` predictor reads

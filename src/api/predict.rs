@@ -478,6 +478,11 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 /// `S_all(t) = exp(−Σ_j H_j(t))`, computed together so that
 /// `Σ_k F_k(t) + S_all(t) = 1` holds at every grid point (see `cif_curves`).
 ///
+/// **Row order.** Rows are grouped by subject (population order), and within a subject by
+/// TTE CMT in **ascending CMT order**, each CMT's block in grid order. The order, and the
+/// bits of the competing-risks `survival_all` / `cif` sums, are the same on every call and
+/// every compile of the model (#2531).
+///
 /// **RTTE (`type = rtte`) semantics.** This computes single-event quantities from the
 /// hazard curve, so for a repeated-event endpoint `survival`, `median_survival`,
 /// `mean_survival` and `cif` describe **time to the *first* event**, not the recurrent
