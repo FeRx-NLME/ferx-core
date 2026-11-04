@@ -13,13 +13,21 @@
 //! measured via `gradient_method_inner` (fit A with `inner_optimizer = lbfgs`). Mutation: drop the inner half of the scope `run_covariance`
 //! opens (score under `FitOptions::default()`'s inner settings) → T4 (i) dies here, and the
 //! `inner_optimizer` row and T10 in `run_covariance_scoring_record.rs` (measured on #1847;
-//! before #1847 it was T4 (ii) and T5, which since then start from the fit's own EBEs, where
-//! the default dense BFGS and L-BFGS reconverge to the same bits, see T4); write a fit's inner
-//! settings to a process global again → T4 (iii) dies, and T5; set [`DISPLACEMENT`] to 0, or
-//! have `run_covariance` start from the cold solve whatever the fit reports → T4's
-//! start-straddle assertion dies (each measured on #2570).
+//! before #1847 T4 (ii) and T5 died too); write a fit's inner settings to a process global
+//! again → T4 (iii) dies, and T5; set [`DISPLACEMENT`] to 0, or have `run_covariance` start from
+//! the cold solve whatever the fit reports → the fixture's start-straddle assertion dies, in
+//! both tests (each measured on #2570).
 //!
-//! # Why (i) and (iii) start from displaced EBEs (#2570)
+//! Why only (i) sees the first mutation: since #1847 the step starts from the EBEs the fit
+//! reports, and from there the default dense BFGS (`Auto`) and L-BFGS reconverge to the same
+//! bits. Measured on warfarin on #2092: the analytic-Hessian route reconverges once, at the
+//! centre; 8 of 10 warm starts already meet the tolerance, and the other 2 move by ≤1.9e-9 with
+//! identical steps under both solvers. The same holds from the displaced start below (0 of 121
+//! entries differ, `Auto` vs L-BFGS, macOS arm64 probe). So a step scored under the default inner settings
+//! reproduces the caller's L-BFGS step, in (ii), (iii) and T5 alike, and only a materially
+//! different solver, Nelder–Mead in (i), can move the covariance.
+//!
+//! # Why (i), (iii) and T5 start from displaced EBEs (#2570)
 //!
 //! The inner solver can only reach the covariance through the step's centre re-solve, and on
 //! `schnider` that is the only re-solve there is: the step takes the analytic-Hessian route,
@@ -39,18 +47,23 @@
 //! So (i), (iii) and T5 run from a copy of fit A whose every EBE is moved by
 //! [`DISPLACEMENT`]. That start is off every subject's mode, so no warm start is certified in
 //! place and each solver has to search to the mode; Nelder–Mead's simplex and L-BFGS's
-//! quasi-Newton path end on different bits. Measured on macOS arm64 (probe, not committed):
+//! quasi-Newton path end on different bits. Measured with a probe (not committed) on macOS
+//! arm64; the Linux aarch64 column is this test's own printout under `tools/linux-test.sh`:
 //!
-//! | η displacement | warm starts searched (NM / L-BFGS) | subjects ending on different bits | covariance entries that differ, NM vs L-BFGS |
-//! |---|---|---|---|
-//! | 0 (fit A's EBEs) | 0 / 0 moved | 0 / 24 | 0 / 121 |
-//! | 0.01 | 24 / 24 | 24 / 24 | 121 / 121 (max relative 2.5e-5) |
-//! | 0.05 | 24 / 24 | 24 / 24 | 121 / 121 (max relative 1.7e-5) |
+//! | η displacement | warm starts searched (NM / L-BFGS) | subjects ending on different bits | entries that differ, NM vs L-BFGS, macOS arm64 | same, Linux aarch64 |
+//! |---|---|---|---|---|
+//! | 0 (fit A's EBEs) | 0 / 0 moved | 0 / 24 | 0 / 121 | not measured (CI straddled) |
+//! | 0.01 | 24 / 24 | 24 / 24 | 121 / 121 (max relative 2.5e-5) | 121 / 121 (max relative 7.9e-6) |
+//! | 0.05 | 24 / 24 | 24 / 24 | 121 / 121 (max relative 1.7e-5) | not measured |
 //!
-//! L-BFGS and the default `Auto` (dense BFGS) reach the same bits from the displaced start too,
-//! so the mutation that scores under `FitOptions::default()`'s inner settings still collapses
-//! (i). (ii) and (iv) stay on fit A's own EBEs: they pin bit-identity with the inline step,
-//! which ran from those.
+//! Every subject stays in its basin: the L-BFGS step from the displaced start lands back on fit
+//! A's mode, its covariance within a maximum relative difference of 6.0e-7 (macOS arm64) and
+//! 9.3e-7 (Linux aarch64) of fit A's inline one, while differing from it in all 121 entries'
+//! bits on both. The fixture prints that start straddle and T4 prints (i)'s count and gap on
+//! stderr, so `--nocapture` (or any failing run) shows the margin on whatever platform runs it.
+//!
+//! (ii) and (iv) stay on fit A's own EBEs: they pin bit-identity with the inline step, which
+//! ran from those.
 
 use ferx_core::{fit, prepare_run, run_covariance, FitOptions, FitResult, InnerOptimizer};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -58,7 +71,8 @@ use std::sync::OnceLock;
 
 /// Added to every EBE of fit A to build the start (i), (iii) and T5 run from. Far above the
 /// certificate's stationarity tolerance, so no warm start is accepted in place; small enough
-/// that every subject stays in its basin (measured, see the module doc).
+/// that every subject stays in its basin (the L-BFGS step lands within 6.0e-7 / 9.3e-7 relative
+/// of fit A's inline covariance on macOS arm64 / Linux aarch64, see the module doc).
 const DISPLACEMENT: f64 = 0.01;
 
 struct Fixture {
@@ -107,6 +121,23 @@ fn fixture() -> &'static Fixture {
             )
             .expect("run_covariance"),
         );
+        // The displaced EBEs must be the step's start, or (i), (iii) and T5 would run from fit
+        // A's own EBEs, where the solver need not matter (module doc). `reported_ebe_inputs`
+        // takes the reported EBEs whenever they are not the cold solve's. Checked here, so both
+        // tests carry it, run together or alone.
+        let inline = bits(&fit_a);
+        let n = n_differing(&displaced_lbfgs, &inline);
+        eprintln!(
+            "start straddle: {n} of {} entries differ from fit A's inline covariance \
+             (max relative {:.2e})",
+            inline.len(),
+            max_relative(&displaced_lbfgs, &inline)
+        );
+        assert!(
+            n > 0,
+            "(i) premise: the step must start from the displaced EBEs, but it reproduced fit A's \
+             inline covariance"
+        );
         Fixture {
             prep,
             lbfgs,
@@ -139,6 +170,18 @@ fn cov_from(f: &Fixture, start: &FitResult, options: &FitOptions) -> Vec<u64> {
 fn n_differing(a: &[u64], b: &[u64]) -> usize {
     assert_eq!(a.len(), b.len(), "covariance shapes differ");
     a.iter().zip(b).filter(|(x, y)| x != y).count()
+}
+
+/// The largest relative difference between two covariances given as bits.
+fn max_relative(a: &[u64], b: &[u64]) -> f64 {
+    let mut worst = 0.0_f64;
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (f64::from_bits(*x), f64::from_bits(*y));
+        let rel = ((x - y) / x.abs().max(y.abs()).max(f64::MIN_POSITIVE)).abs();
+        assert!(rel.is_finite(), "non-finite relative gap: {x} vs {y}");
+        worst = worst.max(rel);
+    }
+    worst
 }
 
 /// A short fit with another inner solver: the writer that used to move the global.
@@ -174,23 +217,22 @@ fn run_covariance_scores_with_the_callers_inner_solver() {
         inline,
         "(ii) run_covariance under the fit's own options must reproduce its inline step"
     );
+    // The fixture has already checked that the displaced EBEs are the step's start.
     let displaced_lbfgs = &f.displaced_lbfgs;
-    // The displaced EBEs must be the step's start, or (i) and (iii) would run from fit A's
-    // own EBEs, where the solver need not matter (module doc). `reported_ebe_inputs` takes the
-    // reported EBEs whenever they are not the cold solve's.
-    assert_ne!(
-        n_differing(displaced_lbfgs, &inline),
-        0,
-        "(i) premise: the step must start from the displaced EBEs, but it reproduced fit A's \
-         inline covariance"
-    );
     // The premise uses the solver the leak would bring in. A non-default caller value is
     // scored as given, so the scoring record does not replace it.
     let nelder_mead = FitOptions {
         inner_optimizer: InnerOptimizer::NelderMead,
         ..f.lbfgs.clone()
     };
-    let n = n_differing(&cov_from(f, &f.displaced, &nelder_mead), displaced_lbfgs);
+    let displaced_nm = cov_from(f, &f.displaced, &nelder_mead);
+    let n = n_differing(&displaced_nm, displaced_lbfgs);
+    eprintln!(
+        "(i) premise: {n} of {} entries differ, Nelder–Mead vs L-BFGS from the displaced start \
+         (max relative {:.2e})",
+        inline.len(),
+        max_relative(&displaced_nm, displaced_lbfgs)
+    );
     assert!(
         n > 0,
         "(i) premise: from EBEs displaced by {DISPLACEMENT}, Nelder–Mead and L-BFGS must end the \
