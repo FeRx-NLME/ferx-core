@@ -274,6 +274,8 @@ fn imp_defensive_mixture_runs_for_both_alpha_branches() {
     // degenerate. This exercises both sampler branches in the fast PR job.
     let (model, population, mut opts) = warfarin_setup();
     opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
+    // An adaptive evaluation floors alpha, which would make the arms one arm.
+    opts.imp_adapt_passes = 0;
 
     opts.imp_defensive_alpha = 0.1;
     let with_mix = fit(&model, &population, &model.default_params, &opts)

@@ -2221,6 +2221,15 @@ fn fit_inner(
                             msg
                         });
                     }
+                    if let Some(msg) =
+                        crate::estimation::importance_sampling::marginal_reliability_warning(&r)
+                    {
+                        accumulated_warnings.push(if n_stages > 1 {
+                            format!("[IMP] {}", msg)
+                        } else {
+                            msg
+                        });
+                    }
                     is_result = Some(r);
                 }
                 Err(e) => {
@@ -2383,7 +2392,18 @@ fn fit_inner(
                 )
             };
             match marg_call {
-                Ok(is) => is_result = Some(is),
+                Ok(is) => {
+                    if let Some(msg) =
+                        crate::estimation::importance_sampling::marginal_reliability_warning(&is)
+                    {
+                        accumulated_warnings.push(if n_stages > 1 {
+                            format!("[{}] {}", method.label(), msg)
+                        } else {
+                            msg
+                        });
+                    }
+                    is_result = Some(is);
+                }
                 Err(e) => accumulated_warnings.push(if n_stages > 1 {
                     format!("[{}] marginal −2 log L eval skipped: {}", method.label(), e)
                 } else {

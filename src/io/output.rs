@@ -1457,6 +1457,12 @@ pub fn print_results(result: &FitResult) {
             "  ESS / K: min = {:.3}, median = {:.3}",
             imp.ess_min, imp.ess_median
         );
+        if imp.adapt_passes > 0 {
+            eprintln!(
+                "  Proposal adaptation: up to {} pilot passes",
+                imp.adapt_passes
+            );
+        }
         match imp.kappa_treatment {
             KappaTreatment::FixedAtMode => {
                 eprintln!(
@@ -3532,6 +3538,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             .map_err(|e| e.to_string())?;
         writeln!(f, "  ess_min: {:.4}", imp.ess_min).map_err(|e| e.to_string())?;
         writeln!(f, "  ess_median: {:.4}", imp.ess_median).map_err(|e| e.to_string())?;
+        writeln!(f, "  adapt_passes: {}", imp.adapt_passes).map_err(|e| e.to_string())?;
         let kt = match imp.kappa_treatment {
             KappaTreatment::NotApplicable => "not_applicable",
             KappaTreatment::FixedAtMode => "fixed_at_mode",
@@ -6793,6 +6800,7 @@ mod tests {
             proposal_df: 5.0,
             ess_min: 0.05,
             ess_median: 0.6,
+            adapt_passes: 5,
             kappa_treatment: KappaTreatment::FixedAtMode,
         });
         // SIR CIs for theta/omega/sigma.
@@ -6893,6 +6901,7 @@ mod tests {
         assert!(yaml.contains("\nimportance_sampling:"));
         assert!(yaml.contains("  kappa_treatment: fixed_at_mode"));
         assert!(yaml.contains("  low_ess_subjects:") && yaml.contains("- id: \"S3\""));
+        assert!(yaml.contains("  adapt_passes: 5\n"));
         // Bayesian posterior block.
         assert!(yaml.contains("\nbayes:"));
         assert!(yaml.contains("  max_rhat: 1.0100"));
@@ -7314,6 +7323,7 @@ mod tests {
             ess_min: 0.5,
             ess_median: 0.8,
             kappa_treatment,
+            adapt_passes: 0,
         });
         r
     }
@@ -7482,6 +7492,7 @@ mod tests {
             proposal_df: 4.0,
             ess_min: 0.9,
             ess_median: 0.95,
+            adapt_passes: 0,
             kappa_treatment: KappaTreatment::Marginalized,
         });
         r.covariance_status = CovarianceStatus::Failed;
@@ -8276,6 +8287,7 @@ mod tests {
             ess_min: 0.9,
             ess_median: 0.95,
             kappa_treatment: KappaTreatment::NotApplicable,
+            adapt_passes: 0,
         };
         let mut r = classified_result();
         r.importance_sampling = Some(is_with(f64::INFINITY));

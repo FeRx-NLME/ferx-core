@@ -6740,6 +6740,12 @@ pub struct ImportanceSamplingResult {
     pub ess_median: f64,
     /// Treatment of per-occasion kappa random effects.  See [`KappaTreatment`].
     pub kappa_treatment: KappaTreatment,
+    /// The pilot passes configured to adapt each subject's proposal before these
+    /// draws (`FitOptions::imp_adapt_passes`), which is a maximum: a subject stops
+    /// early at a pass with unusable moments, and a FREM Rao-Blackwellised
+    /// subject runs none. `0` is the single Laplace proposal.
+    #[serde(default)]
+    pub adapt_passes: usize,
 }
 
 /// One row of the IMPMAP per-iteration parameter trace.
@@ -9435,6 +9441,13 @@ pub struct FitOptions {
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
     pub imp_low_ess_threshold: f64,
+    /// Pilot passes that adapt each subject's proposal before a marginal
+    /// `−2 log L` is evaluated: `imp_eval_only`, and the marginal reported after
+    /// an estimating `imp` / `impmap` stage. Not the MCEM iterations. Default 5,
+    /// matching NONMEM `EONLY=1 NITER=5`; each pass costs one more `imp_samples`
+    /// draws per subject. `0` keeps the single Laplace proposal, which reads high
+    /// on sparse subjects (#2653).
+    pub imp_adapt_passes: usize,
     /// Number of MCEM iterations for the estimating `imp` path (ignored when
     /// `imp_eval_only`). Default 200.
     pub imp_iterations: usize,
@@ -9907,6 +9920,7 @@ impl Default for FitOptions {
             imp_proposal_df: 5.0,
             imp_seed: None,
             imp_low_ess_threshold: 0.1,
+            imp_adapt_passes: 5,
             imp_iterations: 200,
             imp_averaging: 50,
             imp_eval_only: false,
@@ -11398,6 +11412,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "imp_proposal_df",
             "imp_seed",
             "imp_low_ess_threshold",
+            "imp_adapt_passes",
             "imp_iterations",
             "imp_averaging",
             "imp_eval_only",
@@ -11420,6 +11435,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_seed",
             "impmap_averaging",
             "impmap_low_ess_threshold",
+            "imp_adapt_passes",
             "impmap_trace",
             "impmap_mceta",
             "impmap_sobol",

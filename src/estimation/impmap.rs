@@ -3335,7 +3335,7 @@ fn split_kappas(kappa_part: &[f64], n_kappa: usize, buf: &mut Vec<Vec<f64>>) -> 
 /// alone (scored exactly as before #2301), or an IOV subject's stacked
 /// `[η, κ₁..κ_K]`, scored with per-occasion predictions — the observation NLL
 /// SAEM's IOV M-step uses.
-fn draw_obs_nll(
+pub(crate) fn draw_obs_nll(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
@@ -5894,9 +5894,23 @@ mod tests {
         pop: &Population,
         params: &ModelParameters,
     ) -> ImportanceSamplingResult {
+        // Adapting routes through the E-step's own draw code; this check needs
+        // `subject_is_estimate_joint`, the separate estimator.
+        joint_is_with(model, pop, params, 0, 0.0)
+    }
+
+    fn joint_is_with(
+        model: &CompiledModel,
+        pop: &Population,
+        params: &ModelParameters,
+        passes: usize,
+        alpha: f64,
+    ) -> ImportanceSamplingResult {
         let mut opts = FitOptions::default();
         opts.imp_samples = 2000;
         opts.imp_seed = Some(5);
+        opts.imp_adapt_passes = passes;
+        opts.imp_defensive_alpha = alpha;
         let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
         let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
             model,
@@ -5920,6 +5934,19 @@ mod tests {
             &opts,
         )
         .expect("joint IS on an IOV model")
+    }
+
+    /// An adaptive evaluation of a joint (η, κ) subject samples through
+    /// `subject_is_draws_with`, so `subject_is_estimate_joint` is an independent
+    /// check on it: separate likelihood code, separate proposal.
+    #[test]
+    fn adapted_joint_marginal_agrees_with_the_single_proposal_estimator() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = &model.default_params;
+        crate::estimation::importance_sampling::assert_adaptive_evaluation_is_wired(
+            |passes, alpha| joint_is_with(&model, &pop, params, passes, alpha),
+        );
     }
 
     /// The trace −2LL of an IOV fit is the joint (η, κ) marginal. Iteration 1's

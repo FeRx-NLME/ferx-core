@@ -12675,6 +12675,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "imp_low_ess_threshold" => {
             opts.imp_low_ess_threshold = parse_unit_interval("imp_low_ess_threshold")?
         }
+        "imp_adapt_passes" => opts.imp_adapt_passes = parse_usize("imp_adapt_passes")?,
         "imp_iterations" => {
             let v = parse_usize("imp_iterations")?;
             if v < 1 {
