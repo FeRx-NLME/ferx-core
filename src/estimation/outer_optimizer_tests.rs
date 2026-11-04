@@ -15561,3 +15561,102 @@ fn a_quadrature_polish_that_cannot_take_its_predicted_gain_is_stalled() {
         "{w}"
     );
 }
+
+/// #2675: `outer_cache_warm_starts` hands an ODE + IOV model `η̂` alone (each inner solve
+/// restarts κ at 0, #2508) and every other model the joint `η̂ ++ κ̂` start (#2261).
+/// Three models differ only in the structural engine — same ω/κ/σ, same κ on CL — and
+/// cover both engine disjuncts of `is_ode_iov` plus its negative: a user `[odes]` model
+/// (`ode_spec`), a closed-form transit model whose IOV routes to an ODE twin
+/// (`absorption_ode_equivalent`, #814), and a closed-form oral model (neither). Each
+/// leg's routing is asserted, so the set cannot silently collapse onto one arm.
+/// Mutations this kills (checked by hand on the PR): the ODE + IOV arm returning
+/// `joint_warm_starts`; the joint arm returning `ehs.to_vec()`; and the helper's
+/// `is_ode_iov(model)` narrowed to `n_kappa > 0 && ode_spec.is_some()` (transit leg).
+#[test]
+fn outer_cache_warm_starts_drops_kappa_only_on_an_ode_iov_model() {
+    use crate::estimation::inner_optimizer::is_ode_iov;
+    use crate::parser::model_parser::parse_model_string;
+
+    const THETAS: &str = "[parameters]\n\
+        theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+        theta TVKA(1.5, 0.01, 50.0)\n";
+    const HEAD: &str = "\
+        omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n\
+        kappa KAPPA_CL ~ 0.01\n\
+        sigma PROP_ERR ~ 0.1 (sd)\n\
+        [individual_parameters]\n\
+        CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n";
+    const TAIL: &str = "[error_model]\n  DV ~ proportional(PROP_ERR)\n\
+        [fit_options]\n  iov_column = OCC\n";
+    let ode = parse_model_string(&format!(
+        "{THETAS}{HEAD}[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n\
+         [odes]\n  d/dt(depot) = -KA * depot\n\
+         d/dt(central) = KA * depot / V - (CL/V) * central\n{TAIL}"
+    ))
+    .expect("ODE + IOV model parses");
+    // Transit: KA's slot carries the mean transit time; the extra θ is the chain length.
+    let transit = parse_model_string(&format!(
+        "{THETAS}  theta TVN(3.0, 0.5, 20.0)\n{HEAD}  NTR = TVN\n\
+         [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=KA)\n{TAIL}"
+    ))
+    .expect("transit + IOV model parses");
+    let closed = parse_model_string(&format!(
+        "{THETAS}{HEAD}[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n{TAIL}"
+    ))
+    .expect("closed-form IOV model parses");
+
+    // The routing of each leg: κ live on all three; `ode` reaches `is_ode_iov` through
+    // `ode_spec`, `transit` only through `absorption_ode_equivalent`, `closed` through neither.
+    assert_eq!(
+        (ode.n_kappa, transit.n_kappa, closed.n_kappa),
+        (1, 1, 1),
+        "κ live on every leg"
+    );
+    assert!(
+        ode.ode_spec.is_some() && is_ode_iov(&ode),
+        "ODE + κ model must be ODE + IOV via `ode_spec`"
+    );
+    assert!(
+        transit.ode_spec.is_none()
+            && transit.absorption_ode_equivalent.is_some()
+            && is_ode_iov(&transit),
+        "transit + κ model must be ODE + IOV via `absorption_ode_equivalent` alone"
+    );
+    assert!(
+        !is_ode_iov(&closed),
+        "closed-form + κ model must not be ODE + IOV"
+    );
+
+    // Distinct per subject and per cell, so a dropped, reordered or misattributed κ
+    // cell cannot coincide with the right answer; subject 1 has two occasions.
+    let ehs = vec![
+        DVector::from_vec(vec![0.11, -0.12, 0.13]),
+        DVector::from_vec(vec![-0.21, 0.22, -0.23]),
+    ];
+    let kappas = vec![
+        vec![DVector::from_vec(vec![0.31])],
+        vec![
+            DVector::from_vec(vec![-0.41]),
+            DVector::from_vec(vec![0.42]),
+        ],
+    ];
+
+    assert_eq!(
+        outer_cache_warm_starts(&ode, &ehs, &kappas),
+        ehs,
+        "ODE + IOV: warm start is η̂ alone (κ restarts at 0, #2508)"
+    );
+    assert_eq!(
+        outer_cache_warm_starts(&transit, &ehs, &kappas),
+        ehs,
+        "transit + IOV (ODE twin): warm start is η̂ alone (κ restarts at 0, #2508)"
+    );
+    assert_eq!(
+        outer_cache_warm_starts(&closed, &ehs, &kappas),
+        vec![
+            DVector::from_vec(vec![0.11, -0.12, 0.13, 0.31]),
+            DVector::from_vec(vec![-0.21, 0.22, -0.23, -0.41, 0.42]),
+        ],
+        "closed-form IOV: warm start is η̂ then every cell's κ̂ (#2261)"
+    );
+}
