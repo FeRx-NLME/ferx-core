@@ -119,6 +119,13 @@ A rise waits until one of two things is true:
 Each rise aims for the K the SE asks for, since SE² scales as 1/K, plus 10% headroom,
 and at most doubles K. When the SE falls below 0.025, K halves.
 
+K also stops rising when samples stop paying for themselves. If SE² scales as 1/K,
+then SE²·K stays constant, so once it has doubled since the first rise that
+assumption has failed and following the SE would only walk K to the cap. On
+`cefepime_jordan` the SE was 0.071 at K = 1000 and 0.083 at K = 6912. If the
+product falls back, rises resume. A fit that ends noisy after this stop says so in
+its warnings, and a larger `imp_samples` is unlikely to help it.
+
 The per-subject form keeps the rule from ramping a large
 dataset purely because it has more subjects, since the total SE grows as √N. NONMEM's
 `AUTO` targets the total: `STDOBJ = 1.0` corresponds to 0.05 only near N = 400. With

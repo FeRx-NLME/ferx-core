@@ -93,6 +93,10 @@ const AUTO_SETTLE_WINDOW: usize = 5;
 /// itself noisy, so an exact aim would land on the target and raise again.
 const AUTO_RAISE_HEADROOM: f64 = 1.1;
 
+/// How far `SE²·K` may grow past its value at the first raise before [`raises_pay`]
+/// refuses further raises.
+const AUTO_SCALE_GROWTH_LIMIT: f64 = 2.0;
+
 /// Whether the MCEM objective has stopped moving, as far as Monte-Carlo noise
 /// can tell: the means of the last two [`AUTO_SETTLE_WINDOW`]-iteration windows
 /// differ by no more than two standard errors of that difference, taken from the
@@ -144,6 +148,27 @@ fn windowed_se(se_times_k: &[(f64, usize)], k: usize) -> f64 {
     }
 }
 
+/// Whether raising K is still doing what a raise assumes.
+///
+/// `SE² ∝ 1/K` makes `SE²·K` constant, so a raise sized from it lands on the
+/// target. Once that product has grown by [`AUTO_SCALE_GROWTH_LIMIT`] since the
+/// first raise the assumption has failed, and following the SE only walks K to the
+/// cap: on cefepime the SE was 0.071 at K = 1000 and 0.083 at K = 6912, and K = 10000
+/// cost ten times as much per iteration for no lower SE (#2687). The limit leaves
+/// a run whose SE does scale untouched, since its product stays where it was and its
+/// target K sits below the largest K this allows, about `2.2 ×` the one the first
+/// raise asked for.
+///
+/// The baseline is the window before K first left `k_start`. It holds across a later
+/// lowering, and a product that falls back under the limit allows raises again.
+fn raises_pay(se_history: &[(f64, usize)], k_start: usize) -> bool {
+    let Some(first_raise) = se_history.iter().position(|&(_, k)| k > k_start) else {
+        return true;
+    };
+    let scale_at = |history: &[(f64, usize)]| windowed_se(history, 1).powi(2);
+    scale_at(se_history) < AUTO_SCALE_GROWTH_LIMIT * scale_at(&se_history[..first_raise])
+}
+
 /// The sample count for the next iteration under `auto` (#2687).
 ///
 /// Above [`AUTO_STDOBJ_TARGET`], and only when `may_raise`, K rises to what the
@@ -169,13 +194,26 @@ fn next_sample_count(k: usize, k_start: usize, se_per_subject: f64, may_raise: b
 }
 
 /// The closing advice of the under-sampling warning. Under `auto`, a final count
-/// below the cap means the run ran out of iterations rather than out of samples,
-/// which the hold on raising makes a real case (#2687).
-fn under_sampling_advice(auto: bool, final_k: usize, sample_opt: &str, auto_opt: &str) -> String {
+/// below the cap means either [`raises_pay`] stopped the ramp (`raises_stopped`) or
+/// the run ran out of iterations rather than out of samples, which the hold on
+/// raising makes a real case (#2687).
+fn under_sampling_advice(
+    auto: bool,
+    final_k: usize,
+    raises_stopped: bool,
+    sample_opt: &str,
+    auto_opt: &str,
+) -> String {
     if auto && final_k >= AUTO_SAMPLES_MAX {
         format!(
             "`{auto_opt}` is enabled but the sample count {final_k} (cap {AUTO_SAMPLES_MAX}) \
              was not enough to reach the MC-SE target."
+        )
+    } else if auto && raises_stopped {
+        format!(
+            "`{auto_opt}` stopped raising the sample count at {final_k}, below the cap of \
+             {AUTO_SAMPLES_MAX}, because extra samples were not lowering the MC SE as they \
+             should. A larger `{sample_opt}` is unlikely to help."
         )
     } else if auto {
         format!(
@@ -204,7 +242,8 @@ fn auto_step(
     let k = se_history.last().map_or(k_start, |&(_, k)| k);
     let se = windowed_se(se_history, k);
     let total_se = se * (n_subjects.max(1) as f64).sqrt();
-    let may_raise = hold_over || objective_settled(objectives, total_se);
+    let may_raise =
+        (hold_over || objective_settled(objectives, total_se)) && raises_pay(se_history, k_start);
     (next_sample_count(k, k_start, se, may_raise), se)
 }
 
@@ -2263,7 +2302,9 @@ fn run_mcem(
         } else {
             String::new()
         };
-        let advice = under_sampling_advice(auto, final_k_samples, sample_opt, auto_opt);
+        let raises_stopped = !raises_pay(&iteration_se, k_start);
+        let advice =
+            under_sampling_advice(auto, final_k_samples, raises_stopped, sample_opt, auto_opt);
         warnings.push(format!(
             "{label}: {} importance samples for {} give a noisy objective \
              (per-subject MC SE = {:.3}, target {:.2}; median ESS/K = {:.2}). The weighted M-step \
@@ -6935,9 +6976,23 @@ mod tests {
 
     #[test]
     fn under_sampling_advice_names_what_ran_out() {
-        let at_cap = under_sampling_advice(true, AUTO_SAMPLES_MAX, "imp_samples", "imp_auto");
+        let advice =
+            |auto, k, stopped| under_sampling_advice(auto, k, stopped, "imp_samples", "imp_auto");
+        let at_cap = advice(true, AUTO_SAMPLES_MAX, false);
         assert!(at_cap.contains("was not enough") && !at_cap.contains("below the cap"));
-        let short = under_sampling_advice(true, 2000, "imp_samples", "imp_auto");
+        // Reaching the cap is the story even if the last raises were refused.
+        assert_eq!(advice(true, AUTO_SAMPLES_MAX, true), at_cap);
+        let stopped = advice(true, 2000, true);
+        assert!(
+            stopped.contains("stopped raising the sample count at 2000")
+                && stopped.contains("not lowering the MC SE")
+                && stopped.contains("larger `imp_samples` is unlikely to help")
+                && !stopped.contains("more iterations"),
+            "{stopped}"
+        );
+        // The flag only means something under `auto`.
+        assert_eq!(advice(false, 2000, true), advice(false, 2000, false));
+        let short = advice(true, 2000, false);
         assert!(
             short.contains("ended at 2000 samples")
                 && short.contains("`imp_samples`")
@@ -6945,8 +7000,77 @@ mod tests {
                 && !short.contains("was not enough"),
             "{short}"
         );
-        let fixed = under_sampling_advice(false, 2000, "imp_samples", "imp_auto");
+        let fixed = advice(false, 2000, false);
         assert!(fixed.contains("`imp_auto = true`") && !fixed.contains("is enabled"));
+    }
+
+    /// `n` iterations at `k` with a constant `SE²·K` of `scale`.
+    fn at_scale(scale: f64, k: usize, n: usize) -> Vec<(f64, usize)> {
+        vec![((scale / k as f64).sqrt(), k); n]
+    }
+
+    #[test]
+    fn raises_pay_while_the_scale_stays_under_the_limit() {
+        // No raise yet: nothing to compare against, whatever the SE.
+        assert!(raises_pay(&at_scale(50.0, 1000, 5), 1000));
+        let mut h = at_scale(5.0, 1000, 5);
+        // SE² ∝ 1/K holds: the SE fell with the raise.
+        h.extend(at_scale(5.0, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+        h.extend(at_scale(9.9, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+        h.extend(at_scale(10.1, 2000, 5));
+        assert!(!raises_pay(&h, 1000));
+    }
+
+    #[test]
+    fn raises_pay_measures_from_the_first_raise_and_keeps_that_baseline() {
+        // Scale 5 before the first raise, 8 after, then K back at the start. The
+        // baseline stays 5, so 11 is over the limit, and against the 8 of the second
+        // visit to K = 2000 it would not be.
+        let mut h = at_scale(5.0, 1000, 5);
+        h.extend(at_scale(8.0, 2000, 5));
+        h.extend(at_scale(8.0, 1000, 5));
+        h.extend(at_scale(8.0, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+        h.extend(at_scale(11.0, 2000, 5));
+        assert!(!raises_pay(&h, 1000));
+        // The product falling back reopens raising.
+        h.extend(at_scale(6.0, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+    }
+
+    #[test]
+    fn raises_pay_baseline_is_a_window_not_the_last_iteration() {
+        // The last iteration before the raise spiked to 100; the window median is 5.
+        let mut h = at_scale(5.0, 1000, 4);
+        h.extend(at_scale(100.0, 1000, 1));
+        h.extend(at_scale(11.0, 2000, 5));
+        assert!(!raises_pay(&h, 1000));
+    }
+
+    #[test]
+    fn auto_step_stops_raising_when_the_se_does_not_fall_with_k() {
+        // The cefepime shape: SE 0.071 at K = 1000 and still 0.072 at K = 2000.
+        let flat = vec![4276.0; 20];
+        let mut h = vec![(0.071, 1000); 5];
+        h.extend(vec![(0.072, 2000); 5]);
+        assert_eq!(auto_step(&flat, &h, 1000, 458, true).0, 2000);
+        // The twin whose SE did fall with K, still over target, keeps ramping.
+        let mut paying = vec![(0.071, 1000); 5];
+        paying.extend(vec![(0.0515, 2000); 5]);
+        assert!(auto_step(&flat, &paying, 1000, 458, true).0 > 2000);
+    }
+
+    #[test]
+    fn auto_step_still_lowers_after_raises_stopped() {
+        let flat = vec![4276.0; 20];
+        // Scale 1.25 at K = 500, then 4.84 at the cap: raises stopped, SE under half
+        // the target.
+        let mut h = vec![(0.05, 500); 5];
+        h.extend(vec![(0.022, AUTO_SAMPLES_MAX); 5]);
+        assert!(!raises_pay(&h, 500));
+        assert_eq!(auto_step(&flat, &h, 500, 458, true).0, AUTO_SAMPLES_MAX / 2);
     }
 
     /// `WT` changes within each subject, so scoring takes the event-driven walk,

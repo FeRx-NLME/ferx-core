@@ -9529,10 +9529,12 @@ pub struct FitOptions {
     /// exceeds 0.05, but only once the objective
     /// has settled or the averaging window is about to start, so the descent of a
     /// cold start cannot set K for the whole run. K halves again when the SE falls
-    /// below 0.025. High-dimensional / FREM fits then reach a low-noise objective
-    /// instead of carrying a sample-count-dependent M-step bias, but a fit that stays
-    /// above the target runs at the cap, at about ten times the per-iteration cost of
-    /// K = 1000. Set `false` to pin the sample count.
+    /// below 0.025, and stops rising once `SE²·K` has doubled since the first rise,
+    /// which means extra samples are not lowering the SE. High-dimensional / FREM fits
+    /// then reach a low-noise objective instead of carrying a sample-count-dependent
+    /// M-step bias, but a fit that stays above the target while its SE does scale runs
+    /// at the cap, at about ten times the per-iteration cost of K = 1000. Set `false`
+    /// to pin the sample count.
     pub imp_auto: bool,
     /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
     /// [`FitOptions::imp_auto`] but moves `impmap_samples`. Default `true`.
