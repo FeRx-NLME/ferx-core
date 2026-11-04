@@ -6728,7 +6728,8 @@ pub struct ImportanceSamplingResult {
     pub low_ess_subjects: Vec<(String, f64)>,
     /// Number of importance samples drawn per subject (`FitOptions::imp_samples`).
     pub n_samples: usize,
-    /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`).
+    /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`);
+    /// `f64::INFINITY` for a multivariate-normal proposal.
     pub proposal_df: f64,
     /// Minimum across-subject normalized ESS fraction (ESS / K). 1.0 = ideal,
     /// near 0 = degenerate proposal for at least one subject.

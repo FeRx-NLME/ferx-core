@@ -869,11 +869,12 @@ fn run_mcem(
     // `k_samples` is mutable so the adaptive (`auto`) path can ramp it up between
     // iterations when the objective is too Monte-Carlo-noisy (NONMEM `AUTO`).
     let mut k_samples = k_opt.max(2);
-    // `INFINITY` selects the multivariate-normal proposal; any finite value must
-    // be a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
+    // `INFINITY` selects the multivariate-normal proposal; anything else must be
+    // a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
     // bypasses the parser's range check can't reach the `ChiSquared::new(nu)`
-    // panic in `subject_is_draws`. Mirrors `run_importance_sampling`.
-    if nu.is_finite() && nu < 1.0 {
+    // panic in `subject_is_draws`, and a NaN can't pass for a normal proposal by
+    // being non-finite. Mirrors `run_importance_sampling`.
+    if nu.is_nan() || nu < 1.0 {
         return Err(format!(
             "{label}: {df_key} must be >= 1.0 (or +inf for a normal proposal), got {nu}"
         ));
