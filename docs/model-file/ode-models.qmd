@@ -393,8 +393,8 @@ The solver automatically adapts step sizes based on local error estimates.
 ### Native right-hand side {#native-rhs}
 
 The equations in `[odes]` are evaluated at every stage of every step of every solve, so their
-cost is most of an ODE fit's time. When a model is loaded, ferx compiles a straight-line
-`[odes]` block to machine code with [Cranelift](https://cranelift.dev). The program is first
+cost is most of an ODE fit's time. When a model is loaded, ferx compiles the `[odes]`
+block to machine code with [Cranelift](https://cranelift.dev). The program is first
 written out per number type as scalar code — the value and every derivative part as plain
 arithmetic, each type's own operations in its own order — and that one form is compiled two
 ways:
@@ -421,9 +421,9 @@ adjoints in a different order than a node-per-operation tape, so the outer gradi
 in the last bits (measured: within `4e-15` relative on random programs). An optimizer that
 reads it can then take a slightly different path: on the benchmarks below the objective
 values agree to five or more significant digits, some with one or two iterations more or
-fewer. A block keeps the interpreter if it uses an inline `if`, `sqrt`, `inv_logit`, `logit`
-or `mod`, or reads anything other than the states, the individual parameters, its own
-intermediate variables, literals and the time variables.
+fewer. A block keeps the interpreter if it uses a statement-level `if (cond) { ... }` block,
+`sqrt`, `inv_logit`, `logit` or `mod`, or reads anything other than the states, the individual
+parameters, its own intermediate variables, literals and the time variables.
 
 Whole fits (FOCEI with the covariance step, one thread) with forward native code alone
 ("before") and with the direct stepper calls, the compiled reverse pass and the PK-space
@@ -451,6 +451,29 @@ A fit whose outer gradient changed in the last bits can take a different path: f
 on `two_cpt_oral_ode` ran 48 iterations instead of 39 here, and the same fit started from
 four perturbed initial estimates came out 0.91× to 1.21× either way — the spread of the
 path, not of the per-evaluation cost.
+
+#### Inline conditionals
+
+An inline `if (cond) a else b` — and `min`, `max` and `clamp`, which are written as one — is
+compiled (#2680). The native code computes both arms and keeps the taken one, which gives the
+same bits as running the taken arm alone; where the untaken arm produces a `NaN` or an
+infinity (a negative base under a fractional power, say), its derivatives are masked to an
+exact zero, so it cannot reach a gradient. A taped evaluation records the taken arm only, as
+the interpreter does. The condition itself carries no derivative; a parameter that moves *when*
+a condition switches is handled separately (see the conditional-logic notes above). The
+block form of the saturable-elimination example above therefore runs on the interpreter, and
+the same model written inline runs native:
+`d/dt(central) = KA * depot - (if (central > KM_THRESHOLD) VMAX * central / (KM + central) else CL_LIN * central)`.
+
+Before and after, one thread, Linux, the mean of two interleaved runs:
+
+| Model | Fit | Before (s) | After (s) | Speed-up | OFV |
+|---|---|---:|---:|---:|---|
+| `warfarin_ode_time` (two inline `if`s) | FOCE to convergence | 63.2 | 18.2 | 3.5× | identical, same iterations |
+| 8-state Friberg neutropenia, `if (rb < CIRC0)` feedback, 512 subjects | FOCEI, `maxiter = 0` | 146.9 | 34.9 | 4.2× | identical |
+
+The neutropenia model written jump-free with `abs` ran in 32–36 s on both builds, so the
+inline `if` now costs what the hand rewrite did.
 
 ### Sensitivities in PK space {#pk-space-sensitivities}
 
