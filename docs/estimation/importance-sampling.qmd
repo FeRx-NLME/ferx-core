@@ -99,7 +99,8 @@ marginal, and the label is dropped for the same reason.
 `imp_auto` and `impmap_auto` are on by default, so `imp_samples` and
 `impmap_samples` are starting counts, and K never goes below them. After each
 iteration K may rise, up to 10000, while the **per-subject** objective Monte-Carlo
-SE exceeds 0.05:
+SE exceeds 0.05. The SE used is the median of the last five iterations, rescaled to
+the current K, because a single iteration's SE follows the few worst-sampled subjects:
 
 $$
 \frac{\operatorname{SE}(-2 \log L_{IS})}{\sqrt{N}} \;>\; 0.05
@@ -108,7 +109,7 @@ $$
 A rise waits until one of two things is true:
 
 - **The objective has settled.** The means of the last two 5-iteration windows differ
-  by no more than two standard errors of that difference, taken from the current total
+  by no more than two standard errors of that difference, taken from the total
   MC SE. Early in a run the proposal lags the parameters, so the SE reflects that lag
   and says little about what the converged fit needs.
 - **The averaging window is about to start**, so the iterations behind the reported

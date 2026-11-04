@@ -9525,7 +9525,8 @@ pub struct FitOptions {
     /// Adaptive importance-sample count for IMP (NONMEM `AUTO`). When `true` (the
     /// default), `imp_samples` is the *starting* count and the floor. K rises, up to
     /// 10000 and at most doubling per iteration, while the **per-subject** objective
-    /// Monte-Carlo SE (the total SE over √N) exceeds 0.05, but only once the objective
+    /// Monte-Carlo SE (the total SE over √N, as a median of the last five iterations)
+    /// exceeds 0.05, but only once the objective
     /// has settled or the averaging window is about to start, so the descent of a
     /// cold start cannot set K for the whole run. K halves again when the SE falls
     /// below 0.025. High-dimensional / FREM fits then reach a low-noise objective

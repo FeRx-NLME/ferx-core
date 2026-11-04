@@ -126,6 +126,24 @@ fn auto_hold_ends(n_iter: usize, n_avg: usize) -> usize {
     n_iter - n_avg.clamp(n_iter / 4, n_iter / 2)
 }
 
+/// The per-subject SE `auto` acts on at a sample count of `k`: the median of
+/// `SE²·K` over the last [`AUTO_SETTLE_WINDOW`] iterations, which `SE² ∝ 1/K` makes
+/// comparable across a change of K, rescaled to `k`.
+///
+/// One iteration's SE is not enough to act on. It is dominated by the few subjects
+/// with the worst ESS, and on cefepime it swung between 0.018 and 0.094 from one
+/// iteration to the next, which halved K on one iteration and doubled it on the
+/// following one (#2687).
+fn windowed_se(se_times_k: &[(f64, usize)], k: usize) -> f64 {
+    let tail = &se_times_k[se_times_k.len().saturating_sub(AUTO_SETTLE_WINDOW)..];
+    let mut scaled: Vec<f64> = tail.iter().map(|&(se, n)| se * se * n as f64).collect();
+    scaled.sort_by(f64::total_cmp);
+    match scaled.get(scaled.len() / 2) {
+        Some(&median) => (median / k as f64).sqrt(),
+        None => f64::NAN,
+    }
+}
+
 /// The sample count for the next iteration under `auto` (#2687).
 ///
 /// Above [`AUTO_STDOBJ_TARGET`], and only when `may_raise`, K rises to what the
@@ -133,8 +151,8 @@ fn auto_hold_ends(n_iter: usize, n_avg: usize) -> usize {
 /// most [`AUTO_SAMPLES_MAX`]; sizing the step keeps an SE that only just misses
 /// the target from doubling the cost of every later iteration. Below half the
 /// target K halves, but never below the configured `k_start`. Halving a count
-/// that sits under half the target predicts an SE of `0.71 ×` target, so a raise
-/// and a lowering cannot chase each other.
+/// that sits under half the target predicts an SE of `0.71 ×` target, so on a
+/// stable [`windowed_se`] a lowering does not call for a raise.
 fn next_sample_count(k: usize, k_start: usize, se_per_subject: f64, may_raise: bool) -> usize {
     if se_per_subject > AUTO_STDOBJ_TARGET {
         if !may_raise {
@@ -171,6 +189,23 @@ fn under_sampling_advice(auto: bool, final_k: usize, sample_opt: &str, auto_opt:
              thousand) or set `{auto_opt} = true` to ramp it automatically."
         )
     }
+}
+
+/// One `auto` decision after an iteration: the next K, and the [`windowed_se`] it
+/// was made on. `se_history` ends with the iteration just run, whose K is current;
+/// `hold_over` is whether [`auto_hold_ends`] has passed.
+fn auto_step(
+    objectives: &[f64],
+    se_history: &[(f64, usize)],
+    k_start: usize,
+    n_subjects: usize,
+    hold_over: bool,
+) -> (usize, f64) {
+    let k = se_history.last().map_or(k_start, |&(_, k)| k);
+    let se = windowed_se(se_history, k);
+    let total_se = se * (n_subjects.max(1) as f64).sqrt();
+    let may_raise = hold_over || objective_settled(objectives, total_se);
+    (next_sample_count(k, k_start, se, may_raise), se)
 }
 
 /// Refuse an unusable wall-clock limit rather than let a `NaN` never trip it.
@@ -1436,8 +1471,9 @@ fn run_mcem(
 
     // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
     let mut lowest_iteration_objective: Option<f64> = None;
-    // Every iteration's −2 log L, for `auto`'s settled test.
+    // Every iteration's −2 log L and (per-subject SE, K), for `auto`.
     let mut iteration_objectives: Vec<f64> = Vec::with_capacity(n_iter);
+    let mut iteration_se: Vec<(f64, usize)> = Vec::with_capacity(n_iter);
     // Iterations actually run, and the seconds at which `max_time` stopped them.
     let mut iterations_done = 0usize;
     let mut stopped_after: Option<f64> = None;
@@ -1799,8 +1835,14 @@ fn run_mcem(
         // early in a run the proposal lags the parameters and the SE reflects that
         // lag, not what the converged fit needs (#2687).
         if auto {
-            let may_raise = k >= auto_hold_end || objective_settled(&iteration_objectives, mc_se);
-            let new_k = next_sample_count(k_samples, k_start, mc_se_per_subject, may_raise);
+            iteration_se.push((mc_se_per_subject, k_samples));
+            let (new_k, se) = auto_step(
+                &iteration_objectives,
+                &iteration_se,
+                k_start,
+                ess_fracs.len(),
+                k >= auto_hold_end,
+            );
             if verbose && new_k != k_samples {
                 let verb = if new_k > k_samples {
                     "raising"
@@ -1809,8 +1851,7 @@ fn run_mcem(
                 };
                 eprintln!(
                     "{label}: auto-sampling — iteration {k}, per-subject objective MC SE \
-                     {mc_se_per_subject:.3} (target {AUTO_STDOBJ_TARGET:.2}), {verb} K \
-                     {k_samples} → {new_k}"
+                     {se:.3} (target {AUTO_STDOBJ_TARGET:.2}), {verb} K {k_samples} → {new_k}"
                 );
             }
             k_samples = new_k;
@@ -6779,6 +6820,84 @@ mod tests {
     }
 
     #[test]
+    fn windowed_se_takes_the_median_over_the_window() {
+        // A spike in either direction does not move it.
+        let spike = [
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.5, 1000),
+            (0.05, 1000),
+            (0.001, 1000),
+        ];
+        assert!((windowed_se(&spike, 1000) - 0.05).abs() < 1e-12);
+        // Only the last window counts.
+        let old = [
+            (9.0, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+        ];
+        assert!((windowed_se(&old, 1000) - 0.05).abs() < 1e-12);
+        // A short history still answers, and an empty one reads as no signal.
+        assert!((windowed_se(&[(0.2, 100)], 100) - 0.2).abs() < 1e-12);
+        assert!(windowed_se(&[], 100).is_nan());
+    }
+
+    #[test]
+    fn windowed_se_rescales_across_a_change_of_k() {
+        // The same per-draw variance, sampled at K and then 4K: the SE halves, and
+        // the window reads one value at each count.
+        let h = [
+            (0.2, 1000),
+            (0.2, 1000),
+            (0.1, 4000),
+            (0.1, 4000),
+            (0.1, 4000),
+        ];
+        assert!((windowed_se(&h, 4000) - 0.1).abs() < 1e-12);
+        assert!((windowed_se(&h, 1000) - 0.2).abs() < 1e-12);
+    }
+
+    /// Cefepime's trace at iterations 30-35: neither the one quiet iteration among
+    /// noisy ones nor the one noisy iteration among quiet ones moves K. Read off the
+    /// last iteration's SE, the first would halve K and the second double it.
+    #[test]
+    fn auto_step_does_not_act_on_a_single_iteration() {
+        let flat = vec![4290.0; 10];
+        let k = 4000;
+        let quiet = [(0.04, k), (0.04, k), (0.04, k), (0.04, k), (0.02, k)];
+        assert_eq!(auto_step(&flat, &quiet, 1000, 458, true).0, k);
+        let noisy = [(0.04, k), (0.04, k), (0.04, k), (0.04, k), (0.09, k)];
+        assert_eq!(auto_step(&flat, &noisy, 1000, 458, true).0, k);
+    }
+
+    /// The hold, through the same decision the loop makes: above the target K waits
+    /// for a settled objective or the end of the hold, and takes either.
+    #[test]
+    fn auto_step_raises_once_settled_or_once_the_hold_is_over() {
+        let k = 1000;
+        let se = [(0.1, k); 5];
+        let descending: Vec<f64> = (0..10).map(|i| 1000.0 - 50.0 * i as f64).collect();
+        let settled = vec![500.0; 10];
+        assert_eq!(auto_step(&descending, &se, k, 100, false).0, k);
+        assert_eq!(auto_step(&settled, &se, k, 100, false).0, 2 * k);
+        assert_eq!(auto_step(&descending, &se, k, 100, true).0, 2 * k);
+    }
+
+    /// The settled test reads the total SE, √N times the per-subject one: this step
+    /// of 1 is inside the noise of 100 subjects at 0.1 and outside that of one.
+    #[test]
+    fn auto_step_scales_the_settled_test_by_the_subject_count() {
+        let k = 1000;
+        let se = [(0.1, k); 5];
+        let step: Vec<f64> = [[0.0; 5], [1.0; 5]].concat();
+        assert_eq!(auto_step(&step, &se, k, 100, false).0, 2 * k);
+        assert_eq!(auto_step(&step, &se, k, 1, false).0, k);
+    }
+
+    #[test]
     fn next_sample_count_raises_only_when_allowed() {
         assert_eq!(next_sample_count(1000, 1000, 0.5, false), 1000);
         assert_eq!(next_sample_count(1000, 1000, 0.5, true), 2000);
@@ -6996,10 +7115,35 @@ mod tests {
             .unwrap_or_else(|| panic!("no stop warning: {:?}", res.warnings));
         assert!(warning.contains("at iteration 1 of 5"), "{warning}");
         assert!(warning.contains("unaveraged"), "{warning}");
+        assert!(warning.contains("reported as not converged"), "{warning}");
 
         let classified = crate::types::classify_warning(warning);
         assert_eq!(classified.severity, WarningSeverity::Warning);
         assert_eq!(classified.category, WarningCode::Convergence);
+    }
+
+    /// What the user reads: the published verdict of a stopped fit, on its own and
+    /// as the last stage of a chain, whose FOCEI stage the limit must not touch.
+    #[test]
+    fn a_fit_stopped_by_imp_max_time_publishes_not_converged() {
+        let (model, pop) = tv_fixture();
+        for methods in [vec![], vec![EstimationMethod::FoceI, EstimationMethod::Imp]] {
+            let opts = FitOptions {
+                methods: methods.clone(),
+                imp_max_time: Some(1e-9),
+                ..tv_imp_options(5)
+            };
+            let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit Ok");
+            assert!(!res.converged, "{methods:?}");
+            assert!(res.ofv.is_finite(), "{methods:?}");
+            assert!(
+                res.warnings
+                    .iter()
+                    .any(|w| w.contains("stopped by `imp_max_time`")),
+                "{methods:?}: {:?}",
+                res.warnings
+            );
+        }
     }
 
     #[test]
