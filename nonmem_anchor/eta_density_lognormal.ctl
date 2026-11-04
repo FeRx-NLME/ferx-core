@@ -6,14 +6,16 @@ $PROBLEM #1716 density anchor: `density lognormal` as its affine Gaussian twin
 ; ferx's latent z = SQRT(S)*ETA(1) - S/2 is an affine map of ETA(1), and the
 ; Laplace/FOCEI objective is invariant under an affine map of eta, so the two engines
 ; must agree on the OFV to arithmetic, and ETA1 = (z + S/2)/SQRT(S).
+; SLN, not S: NM-TRAN reads `S` as a compartment scale (WARNING 7). results/ was run
+; with the name S; the arithmetic is the same.
 ; MAXEVAL=0 POSTHOC INTERACTION, the dataset and the rest of the model as
 ; eta_shape_null.ctl.
 $INPUT ID TIME DV EVID AMT CMT MDV
 $DATA eta_shape.csv IGNORE=@
 $SUBROUTINE ADVAN1 TRANS2
 $PK
-  S  = THETA(3)
-  CL = THETA(1)*EXP(SQRT(S)*ETA(1) - S/2)
+  SLN = THETA(3)
+  CL  = THETA(1)*EXP(SQRT(SLN)*ETA(1) - SLN/2)
   V  = THETA(2)*EXP(ETA(2))
   S1 = V
 $ERROR
