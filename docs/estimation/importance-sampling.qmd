@@ -378,6 +378,31 @@ $$
   `imp_*` defaults is listed in the
   [`[fit_options]` reference](../model-file/fit-options.qmd#importance-sampling-imp).
 
+## When the marginal shows a collapse {#marginal-collapse}
+
+IMP and IMPMAP run a fixed iteration schedule, so `converged` has no stopping
+test to report. It rests on the objectives instead. `ofv` is a Laplace pass, which
+can look sane on a run that has collapsed, so `fit()` also checks the marginal
+in `importance_sampling.minus2_log_likelihood` and reports `converged: false` in
+two cases (#2652):
+
+| Warning | Fires when |
+|---|---|
+| `W_NONFINITE_MARGINAL` | The marginal is `NaN`, infinite, or past the divergence cutoffs. This covers an `imp_eval_only` readout too, whatever the stage before it reported. |
+| `W_MCEM_OBJECTIVE_ROSE` | The marginal sits above the lowest objective any iteration reached by more than 10% of that objective's magnitude, or of the observation count if that is larger. |
+
+An EM iteration should not raise the objective, so the only legitimate gap
+between the lowest iteration and the final marginal is Monte-Carlo noise. In a
+seven-model comparison with NONMEM, measured on Linux, the widest gap on a healthy
+run was 0.13% of that scale. The narrowest on a collapsed run, from before the
+proposal-covariance fix of #2650 removed those collapses, was 51%. The baseline is the lowest iteration and not the first because a cold start begins far above the optimum: a
+collapse can end below where it started and still be nowhere near the optimum.
+
+The rise check needs an estimating IMP / IMPMAP stage and a published marginal. If
+the marginal pass was skipped, a warning says so and this check does not run. The
+marginal is computed after the last estimating stage, so a trailing `agq_eval_only`
+readout replaces `ofv` and leaves both checks in force.
+
 ## Defensive mixture {#defensive-mixture}
 
 A weakly-identified subject — e.g. an analytical `[initial_conditions]` baseline
