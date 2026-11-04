@@ -54,12 +54,14 @@ Expressions can reference:
   that aren't assigned in the firing branch this step receive a derivative
   of `0`.
 
-  An `if` whose condition reads an estimated parameter *and* a state or clock,
-  such as `if (tau > LAGT)`, switches at a time that moves with that parameter.
-  Exact derivatives cannot see that, so the model runs on finite-difference
-  gradients and the fit carries a warning naming the parameter. `min`, `max` and
-  `clamp` are continuous and stay analytic, as does a parameter fixed with `FIX`
-  or computed from covariates alone.
+  An `if` that switches during the integration at a time a model parameter can
+  move runs on finite-difference gradients, because exact derivatives cannot see
+  the switching time move. The fit carries a warning naming a parameter. That
+  covers `if (tau > LAGT)`, and also the example above, since `central` depends
+  on the parameters in its equation. A `FIX` parameter counts too. `TAD` and
+  `TAFD` move with an estimated lag. These stay analytic: a clock or a state that
+  no parameter reaches against a literal (`if (TIME > 24)`), a threshold computed
+  from covariates alone, `min`, `max`, and `clamp` with literal bounds.
 
 ### `TAD` before the first dose arrives
 

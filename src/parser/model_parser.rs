@@ -7341,13 +7341,12 @@ pub fn parse_full_model_with(
         .ode_spec
         .as_ref()
         .and_then(|o| o.rhs_program.as_ref())
-        .and_then(|p| p.moving_switch(&model.default_params.theta_fixed))
+        .and_then(|p| p.moving_switch())
     {
         model.parse_warnings.push(format!(
-            "[odes]: `{}` depends on an estimated parameter and sets an `if` condition that \
-             switches during the integration, so the switching time moves with it. Exact \
-             derivatives cannot see that, so this model uses finite-difference gradients.",
-            switch.param
+            "[odes]: `{switch}` depends on a model parameter and reaches an `if` condition \
+             that switches during the integration, so the switching time moves with it. Exact \
+             derivatives cannot see that, so this model uses finite-difference gradients."
         ));
     }
 
@@ -16548,8 +16547,50 @@ fn build_ode_spec(
     // Linearity is decided on names, so before the rewrite below turns them into slots (#852).
     let affine_in_states = ode_linearity::stmts_affine_in_states(&stmts_owned, &state_names_owned);
     // Also on names, for the same reason (#2649).
-    let condition_reads =
-        ode_switch::conditions_reading_params(&stmts_owned, &state_names_owned, &indiv_names_owned);
+    let name_of_slot = |slot: &usize| {
+        indiv_slots_owned
+            .iter()
+            .position(|s| s == slot)
+            .map(|i| indiv_names_owned[i].clone())
+    };
+    let is_dose_attr = |attr: Option<crate::types::DoseAttr>, i: usize, slot: usize| {
+        let indexed = crate::types::DoseAttr::from_indexed_name(&indiv_names_owned[i]);
+        match attr {
+            Some(a) => {
+                slot == crate::types::PK_IDX_LAGTIME || indexed.is_some_and(|(found, _)| found == a)
+            }
+            None => {
+                slot == crate::types::PK_IDX_F
+                    || slot == crate::types::PK_IDX_LAGTIME
+                    || indexed.is_some()
+            }
+        }
+    };
+    let params_where = |attr: Option<crate::types::DoseAttr>| -> Vec<String> {
+        indiv_slots_owned
+            .iter()
+            .enumerate()
+            .filter(|&(i, &slot)| is_dose_attr(attr, i, slot))
+            .map(|(i, _)| indiv_names_owned[i].clone())
+            .collect()
+    };
+    let condition_reads = ode_switch::conditions_reading_params(
+        &stmts_owned,
+        &ode_switch::SwitchInputs {
+            states: &state_names_owned,
+            params: &indiv_names_owned,
+            dose_params: params_where(None),
+            lag_params: params_where(Some(crate::types::DoseAttr::Lag)),
+            forcing_params: input_rate
+                .iter()
+                .map(|f| {
+                    let slots = f.arg_slots.iter().chain(&f.frac_slot).chain(&f.lag_slot);
+                    (f.cmt, slots.filter_map(name_of_slot).collect())
+                })
+                .collect(),
+            inits: &init_specs,
+        },
+    );
 
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
@@ -30961,13 +31002,12 @@ pub struct OdeRhsProgram {
     /// read through [`Self::is_affine_in_states`] (#852). Decided on the unresolved program by
     /// `ode_linearity::stmts_affine_in_states`.
     affine_in_states: bool,
-    /// The `if` conditions that read an individual parameter, as written (#2649). Decided on
-    /// the unresolved program; [`Self::moving_switches`] is what a gate should ask.
+    /// The `if` conditions an individual parameter reaches (#2649). Decided on the unresolved
+    /// program; [`Self::moving_switch`] is what a gate should ask.
     condition_reads: Vec<ode_switch::ConditionReads>,
-    /// The parameters behind each `if` whose switching time moves with an estimated parameter
-    /// (#2649). Filled once `[individual_parameters]` is known; see
-    /// [`Self::resolve_moving_switches`].
-    moving_switches: Vec<MovingSwitch>,
+    /// The parameters that move an `if` switch (#2649). Filled once `[individual_parameters]`
+    /// is known; see [`Self::resolve_moving_switches`].
+    moving_switches: Vec<String>,
     /// The parameter-only subexpressions lifted out of the RK stages, and the
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
@@ -31056,22 +31096,14 @@ impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
     }
 }
 
-/// The individual parameter behind an `[odes]` `if` whose switching time moves with an
-/// estimated parameter (#2649): its θ reads, and whether an η reaches it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MovingSwitch {
-    pub(crate) param: String,
-    thetas: Vec<usize>,
-    has_eta: bool,
-}
-
 impl OdeRhsProgram {
     /// Fill [`Self::moving_switches`] from `deps`, the `[individual_parameters]` dependencies.
     /// A condition counts when something in it varies during the integration (a state, a
-    /// clock, or a parameter that reads `TIME`). Whether anything estimated reaches the
-    /// parameter is [`Self::moving_switch`]'s question.
+    /// clock, or a parameter that reads `TIME`). A parameter counts when a θ or η reaches it,
+    /// FIX or not: `ModelParameters::theta_fixed` is the caller's to change at `fit()`, which
+    /// the model-level scope cannot see. A covariate-only `LAGT = WT / 10` is left alone.
     fn resolve_moving_switches(&mut self, deps: &std::collections::HashMap<String, IndivVarDeps>) {
-        let mut out: Vec<MovingSwitch> = Vec::new();
+        let mut out: Vec<String> = Vec::new();
         for c in &self.condition_reads {
             let moves = c.moves
                 || c.params
@@ -31082,28 +31114,17 @@ impl OdeRhsProgram {
             }
             for p in &c.params {
                 let Some(d) = deps.get(p) else { continue };
-                if !out.iter().any(|m| &m.param == p) {
-                    out.push(MovingSwitch {
-                        param: p.clone(),
-                        thetas: d.thetas.iter().copied().collect(),
-                        has_eta: d.has_eta,
-                    });
+                if (d.has_eta || !d.thetas.is_empty()) && !out.contains(p) {
+                    out.push(p.clone());
                 }
             }
         }
         self.moving_switches = out;
     }
 
-    /// The first parameter whose `if` switch moves with something the fit estimates, given the
-    /// model's FIX flags. A FIX θ does not move the switch, so a parameter reached only by
-    /// FIX θ's keeps the exact derivatives, as does a covariate-only `LAGT = WT / 10` (#2649).
-    pub(crate) fn moving_switch(&self, theta_fixed: &[bool]) -> Option<&MovingSwitch> {
-        self.moving_switches.iter().find(|m| {
-            m.has_eta
-                || m.thetas
-                    .iter()
-                    .any(|&i| !theta_fixed.get(i).copied().unwrap_or(false))
-        })
+    /// The first parameter whose `if` switch moves with it (#2649), if any.
+    pub(crate) fn moving_switch(&self) -> Option<&str> {
+        self.moving_switches.first().map(String::as_str)
     }
 
     /// `rhs` as direct native calls ([`DirectRhsF64`]): `Some` only when `rhs` is the very
