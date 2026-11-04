@@ -4947,8 +4947,7 @@ fn a_diverged_candidate_never_displaces_a_finite_one() {
 
 #[test]
 fn the_cold_verdict_separates_reproduction_from_a_material_gap() {
-    // Measured FREM gap: 6.96 on a reported -174.91 → the tolerance is
-    // 1e-3 * (1 + 174.91) = 0.176, so this is ~40x over.
+    // Measured FREM gap: 6.96 on a reported -174.91, well over `BASIN_SHIFT_ABS_TOL`.
     match cold_solve_verdict(-167.95, -174.91) {
         ColdSolveVerdict::Worse(gap) => assert!((gap - 6.96).abs() < 1e-9, "gap = {gap}"),
         other => panic!("expected a material gap, got {other:?}"),
@@ -4962,9 +4961,9 @@ fn the_cold_verdict_separates_reproduction_from_a_material_gap() {
         cold_solve_verdict(-200.0, -174.91),
         ColdSolveVerdict::Reproduces
     );
-    // The threshold itself: 1e-3 * (1 + 100) = 0.101, so 0.05 is inside and 0.5 is not.
+    // A gap inside the bound is noise, and 0.5 is not.
     assert_eq!(
-        cold_solve_verdict(-99.95, -100.0),
+        cold_solve_verdict(-99.96, -100.0),
         ColdSolveVerdict::Reproduces
     );
     assert!(matches!(
@@ -4974,6 +4973,173 @@ fn the_cold_verdict_separates_reproduction_from_a_material_gap() {
     // `missed()` is what gates the extra candidates.
     assert!(!cold_solve_verdict(-174.91, -174.91).missed());
     assert!(cold_solve_verdict(-99.5, -100.0).missed());
+}
+
+/// #2646: the bound is absolute. A differential pair straddling it at the OFV magnitudes
+/// the issue measured, each of which a relative `1e-3·(1 + |OFV|)` calls a reproduction:
+/// that rule's tolerance is 4.3 at CJ's OFV and 186 at VE's.
+#[test]
+fn a_cold_gap_is_material_at_the_same_size_at_any_ofv() {
+    let tol = BASIN_SHIFT_ABS_TOL;
+    for best in [-3038.980203, 4309.773713, 186184.281524] {
+        let (above, below) = (best + tol + 1e-6, best + tol - 1e-6);
+        assert!(above - best > tol && below - best < tol, "the straddle");
+        assert!(
+            matches!(cold_solve_verdict(above, best), ColdSolveVerdict::Worse(_)),
+            "a gap just above {tol} at OFV {best} is material"
+        );
+        assert_eq!(
+            cold_solve_verdict(below, best),
+            ColdSolveVerdict::Reproduces,
+            "a gap just below {tol} at OFV {best} is noise"
+        );
+    }
+    // The issue's three rows.
+    for (best, cold) in [
+        (4309.773713, 4312.092713),
+        (186184.281524, 186184.649359),
+        (-3038.980203, -3038.866194),
+    ] {
+        assert!(cold_solve_verdict(cold, best).missed(), "{cold} vs {best}");
+    }
+}
+
+/// `lowest_per_subject` on three subjects and two candidates: each candidate wins one
+/// subject, one subject ties, and the winner's η̂, `H` and κ̂ all travel together.
+#[test]
+fn each_subject_takes_its_own_lowest_candidate_whole() {
+    let candidate = |tag: f64| -> EbeCandidate {
+        (
+            vec![DVector::from_element(1, tag); 3],
+            vec![DMatrix::from_element(1, 1, tag + 0.5); 3],
+            vec![vec![DVector::from_element(1, tag + 0.25)]; 3],
+            0.0,
+        )
+    };
+    let candidates = [candidate(1.0), candidate(2.0)];
+    let terms = [vec![5.0, 7.0, 3.0], vec![6.0, 4.0, 3.0]];
+    let ((etas, h_mats, kappas), source) = lowest_per_subject(&candidates, &terms, 0);
+    assert_eq!(source, [0, 1, 0], "a tie stays on the base");
+    let tags: Vec<f64> = etas.iter().map(|e| e[0]).collect();
+    assert_eq!(tags, [1.0, 2.0, 1.0]);
+    let hs: Vec<f64> = h_mats.iter().map(|h| h[(0, 0)]).collect();
+    assert_eq!(hs, [1.5, 2.5, 1.5], "`H` stays with its η̂");
+    let ks: Vec<f64> = kappas.iter().map(|k| k[0][0]).collect();
+    assert_eq!(ks, [1.25, 2.25, 1.25], "κ̂ stays with its η̂");
+    assert_eq!(
+        lowest_per_subject(&candidates, &terms, 1).1,
+        [0, 1, 1],
+        "a tie stays on whichever candidate is the base"
+    );
+
+    // A subject moves only for a material gain. Terms are `nll`s and the bound is on `−2LL`,
+    // so the pair straddles it at half its size.
+    let half = BASIN_SHIFT_ABS_TOL / 2.0;
+    let terms = [
+        vec![10.0 + half + 1e-6, 10.0 + half - 1e-6, 10.0],
+        vec![10.0, 10.0, 10.0],
+    ];
+    assert_eq!(lowest_per_subject(&candidates, &terms, 0).1, [1, 0, 0]);
+
+    // A non-finite term never wins, and a non-finite base term always gives way.
+    let terms = [
+        vec![f64::NAN, 1.0, f64::NEG_INFINITY],
+        vec![2.0, f64::NAN, 3.0],
+    ];
+    assert_eq!(lowest_per_subject(&candidates, &terms, 0).1, [1, 0, 1]);
+
+    // No κ̂ at all stays no κ̂ at all: postfit branches on `kappas.is_empty()`.
+    let bare = |tag: f64| -> EbeCandidate {
+        let (etas, h_mats, _, ofv) = candidate(tag);
+        (etas, h_mats, Vec::new(), ofv)
+    };
+    let terms = [vec![1.0, 2.0, 3.0], vec![3.0, 1.0, 1.0]];
+    let ((_, _, kappas), _) = lowest_per_subject(&[bare(1.0), bare(2.0)], &terms, 0);
+    assert!(kappas.is_empty());
+}
+
+/// Terms are `nll`s and the bound is on `−2LL`, so the pair straddles it at half its size.
+/// A subject the cold solve wins is never named, and the largest gap comes first.
+#[test]
+fn the_subjects_a_cold_solve_lost_are_the_material_ones_largest_first() {
+    let population = Population {
+        subjects: ["small", "big", "noise", "cold-wins", "nan"]
+            .map(|id| Subject {
+                id: id.into(),
+                ..Subject::default()
+            })
+            .to_vec(),
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let half = BASIN_SHIFT_ABS_TOL / 2.0;
+    let cold = [10.0 + half + 1e-6, 12.0, 10.0 + half - 1e-6, 9.0, f64::NAN];
+    let other = [10.0, 10.0, 10.0, 11.0, 1.0];
+    assert_eq!(
+        subjects_cold_lost(&population, &cold, &other),
+        ["big", "small"]
+    );
+}
+
+/// #2646: the message names who the cold solve missed on, and only when there is someone
+/// to name. Each clause is pinned by the assertion beside it.
+#[test]
+fn the_start_dependence_warning_names_the_subjects() {
+    let ids: Vec<String> = ["53", "250"].map(String::from).to_vec();
+    let w = ebe_start_dependence_warning(4312.0927, 4309.7737, &ids).expect("2.3 is material");
+    assert!(w.contains("2.3190 OFV units worse"), "{w}");
+    assert!(
+        w.contains("(4312.0927 vs the reported 4309.7737), on 2 subjects (53, 250)."),
+        "{w}"
+    );
+    assert!(
+        w.contains("lowest-scoring candidate, subject by subject"),
+        "{w}"
+    );
+
+    let one = ebe_start_dependence_warning(4312.0927, 4309.7737, &ids[..1]).unwrap();
+    assert!(one.contains("on 1 subject (53)."), "{one}");
+
+    let nobody = ebe_start_dependence_warning(4312.0927, 4309.7737, &[]).unwrap();
+    assert!(nobody.contains("4309.7737). The reported fit"), "{nobody}");
+    assert!(!nobody.contains(", on "), "{nobody}");
+
+    // The list is capped, and the count still covers everyone.
+    let many: Vec<String> = (0..12).map(|i| i.to_string()).collect();
+    let w = ebe_start_dependence_warning(4312.0927, 4309.7737, &many).unwrap();
+    assert!(
+        w.contains("on 12 subjects (0, 1, 2, 3, 4, 5, 6, 7, 8, 9 and 2 more)."),
+        "{w}"
+    );
+
+    // A reproduction stays silent even with names in hand.
+    assert!(ebe_start_dependence_warning(4309.7737, 4309.7737, &ids).is_none());
+}
+
+/// The #2013 warning names EBEs the cold solve moved. A subject another candidate
+/// materially beat is dropped; one that merely came from another candidate by solver noise
+/// keeps its name, since `cold_lost_ids` does not list it. Under AGQ a whole other
+/// candidate's win drops everyone, and with no win nobody.
+#[test]
+fn the_screen_warning_keeps_every_subject_still_on_its_cold_ebes() {
+    let pick = |lost: &[&str], cold_replaced: bool| FinalPick {
+        reported: (Vec::new(), Vec::new(), Vec::new(), 0.0),
+        cold_lost_ids: lost.iter().map(|s| s.to_string()).collect(),
+        cold_replaced,
+    };
+    let moved = || vec!["53".to_string(), "504".to_string()];
+    let mut ids = moved();
+    pick(&["53", "250"], false).retain_cold_reported(&mut ids);
+    assert_eq!(ids, ["504"]);
+    let mut ids = moved();
+    pick(&[], false).retain_cold_reported(&mut ids);
+    assert_eq!(ids, ["53", "504"]);
+    let mut ids = moved();
+    pick(&[], true).retain_cold_reported(&mut ids);
+    assert!(ids.is_empty());
 }
 
 #[test]
@@ -4995,10 +5161,10 @@ fn a_non_finite_cold_solve_is_its_own_verdict() {
 fn the_start_dependence_warning_reports_what_was_measured() {
     // Silent when the cold solve reproduces the reported objective — this is what keeps
     // the warning off ordinary fits.
-    assert!(ebe_start_dependence_warning(-174.91, -174.91).is_none());
-    assert!(ebe_start_dependence_warning(-200.0, -174.91).is_none());
+    assert!(ebe_start_dependence_warning(-174.91, -174.91, &[]).is_none());
+    assert!(ebe_start_dependence_warning(-200.0, -174.91, &[]).is_none());
 
-    let w = ebe_start_dependence_warning(-167.95, -174.91).expect("6.96 is material");
+    let w = ebe_start_dependence_warning(-167.95, -174.91, &[]).expect("6.96 is material");
     assert!(w.contains("6.9600"), "the gap belongs in the message: {w}");
     assert!(w.contains("-167.9500") && w.contains("-174.9100"), "{w}");
     // It must not diagnose multimodality on its own: the regression fixture for this
@@ -5011,7 +5177,7 @@ fn the_start_dependence_warning_reports_what_was_measured() {
     );
 
     // The non-finite arm gets its own message, and it is not silent.
-    let nf = ebe_start_dependence_warning(f64::NAN, -174.91).expect("NaN must be reported");
+    let nf = ebe_start_dependence_warning(f64::NAN, -174.91, &[]).expect("NaN must be reported");
     assert!(nf.contains("non-finite objective"), "{nf}");
 
     // Both arms carry the token that classifies them, so a consumer branching on
@@ -5283,7 +5449,7 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
     assert!(two.contains("of 2 subjects (S1, S2) to"), "{two}");
 
     // At the cap every ID is listed; one past it, the last is counted instead.
-    let cap = SCREEN_MOVED_ID_LIST_CAP;
+    let cap = WARNING_ID_LIST_CAP;
     let at = ebe_screen_moved_warning(&ids(cap)).unwrap();
     assert!(
         at.contains(&format!("S{cap})")) && !at.contains(" more)"),

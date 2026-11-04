@@ -13,6 +13,7 @@ use nalgebra::{DMatrix, DVector};
 #[cfg(test)]
 use nalgebra::SymmetricEigen;
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1462,6 +1463,32 @@ pub(crate) fn pop_nll(
     kappas: &[Vec<DVector<f64>>],
     interaction: bool,
 ) -> f64 {
+    // Preserve the existing subject-index summation order, including at width 1.
+    subject_nlls(
+        model,
+        population,
+        params,
+        eta_hats,
+        h_matrices,
+        kappas,
+        interaction,
+    )
+    .iter()
+    .sum()
+}
+
+/// Each subject's term of [`pop_nll`], in subject order. Because the population objective
+/// is exactly their sum, a subject's EBEs can be chosen without reference to anyone
+/// else's, which is what [`lowest_per_subject`] relies on.
+fn subject_nlls(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    interaction: bool,
+) -> Vec<f64> {
     let eval = |(i, subject): (usize, &Subject)| {
         subject_nll(
             model,
@@ -1473,19 +1500,16 @@ pub(crate) fn pop_nll(
             interaction,
         )
     };
-    let per_subject: Vec<f64> =
-        if crate::api::parallelize_cheap_subject_pass(population.subjects.len()) {
-            population
-                .subjects
-                .par_iter()
-                .enumerate()
-                .map(eval)
-                .collect()
-        } else {
-            population.subjects.iter().enumerate().map(eval).collect()
-        };
-    // Preserve the existing subject-index summation order, including at width 1.
-    per_subject.iter().sum()
+    if crate::api::parallelize_cheap_subject_pass(population.subjects.len()) {
+        population
+            .subjects
+            .par_iter()
+            .enumerate()
+            .map(eval)
+            .collect()
+    } else {
+        population.subjects.iter().enumerate().map(eval).collect()
+    }
 }
 
 /// Shared subject dispatch for separate and fused population evaluations, and the
@@ -3227,8 +3251,13 @@ impl ColdSolveVerdict {
     }
 }
 
-/// Compare a cold re-solve against `reference_ofv` on the same relative scale as the
-/// plateau self-consistency check, so "materially worse" means one thing in this file.
+/// Compare a cold re-solve against `reference_ofv` on [`BASIN_SHIFT_ABS_TOL`], the bound
+/// the opposite direction uses, so a gap means the same thing either way round.
+///
+/// Absolute, for the reason that constant gives. This rule used to be the plateau check's
+/// relative `1e-3·(1 + |OFV|)`, which is 4.3 units at OFV 4,310 and 186 at OFV 186,000: on
+/// #2646's benchmarks a cold solve 2.3 and 0.37 above best-seen counted as a reproduction,
+/// so the optimizer's better EBEs were thrown away with no warning.
 ///
 /// Two callers, one rule. Against `best_seen_ofv` it is the *trigger*: only a cold solve
 /// that failed to reproduce the objective the optimizer measured is worth scoring the
@@ -3239,7 +3268,7 @@ fn cold_solve_verdict(cold_ofv: f64, reference_ofv: f64) -> ColdSolveVerdict {
         return ColdSolveVerdict::NonFinite;
     }
     let gap = cold_ofv - reference_ofv;
-    if gap > PLATEAU_CONSISTENCY_REL_TOL * (1.0 + reference_ofv.abs()) {
+    if gap > BASIN_SHIFT_ABS_TOL {
         ColdSolveVerdict::Worse(gap)
     } else {
         ColdSolveVerdict::Reproduces
@@ -3255,20 +3284,33 @@ fn cold_solve_verdict(cold_ofv: f64, reference_ofv: f64) -> ColdSolveVerdict {
 /// — the regression fixture for this very code path is the second kind. Naming both, in
 /// that order, is what keeps the warning a report of what was measured rather than a
 /// claim about the model.
-fn ebe_start_dependence_warning(cold_ofv: f64, reported_ofv: f64) -> Option<String> {
+///
+/// `ids` are the subjects a cold start missed by themselves (see [`subjects_cold_lost`]),
+/// largest gap first. It is empty when the gap is diffuse or cannot be split by subject
+/// (AGQ), and the message then names nobody.
+fn ebe_start_dependence_warning(
+    cold_ofv: f64,
+    reported_ofv: f64,
+    ids: &[String],
+) -> Option<String> {
     match cold_solve_verdict(cold_ofv, reported_ofv) {
         ColdSolveVerdict::Reproduces => None,
         ColdSolveVerdict::Worse(gap) => Some(format!(
             "W_EBE_START_DEPENDENT: empirical Bayes estimates at the final parameters \
              depend on the inner loop's starting point — re-solving them cold scores \
              {gap:.4} OFV units worse than the EBEs the optimizer minimised against \
-             ({cold_ofv:.4} vs the reported {reported_ofv:.4}). The reported fit uses the \
-             best of the candidates. Either the individual objective has more than one \
+             ({cold_ofv:.4} vs the reported {reported_ofv:.4}){named}. The reported fit \
+             keeps the lowest-scoring candidate, subject by subject. Either the individual objective has more than one \
              mode at these estimates, or the inner loop cannot reach it from a cold start \
              within `inner_maxiter`; in both cases the EBEs — and the diagnostics built on \
              them (IPRED, IWRES, CWRES, shrinkage) and the covariance step — depend on \
              where the inner loop starts. Raising `inner_maxiter`, or `inner_restarts` for \
-             a suspected second mode, tells the two apart."
+             a suspected second mode, tells the two apart.",
+            named = if ids.is_empty() {
+                String::new()
+            } else {
+                format!(", on {}", counted_subjects(ids))
+            },
         )),
         ColdSolveVerdict::NonFinite => Some(format!(
             "W_EBE_START_DEPENDENT: re-solving the empirical Bayes estimates cold at the \
@@ -3283,8 +3325,24 @@ fn ebe_start_dependence_warning(cold_ofv: f64, reported_ofv: f64) -> Option<Stri
     }
 }
 
-/// How many subject IDs [`ebe_screen_moved_warning`] lists before it counts the rest.
-const SCREEN_MOVED_ID_LIST_CAP: usize = 10;
+/// How many subject IDs a warning lists before it counts the rest.
+const WARNING_ID_LIST_CAP: usize = 10;
+
+/// `ids` for a warning: "1 subject (A)", or "12 subjects (A, B, … and 2 more)".
+fn counted_subjects(ids: &[String]) -> String {
+    let n = ids.len();
+    let listed = ids[..n.min(WARNING_ID_LIST_CAP)].join(", ");
+    let list = if n > WARNING_ID_LIST_CAP {
+        format!("{listed} and {} more", n - WARNING_ID_LIST_CAP)
+    } else {
+        listed
+    };
+    if n == 1 {
+        format!("1 subject ({list})")
+    } else {
+        format!("{n} subjects ({list})")
+    }
+}
 
 /// The user-facing message for subjects whose EBE the cold final re-solve's Sobol screen
 /// (#2013) or flip-flop twin seed (#2095) moved, or `None` when they moved none.
@@ -3296,25 +3354,14 @@ const SCREEN_MOVED_ID_LIST_CAP: usize = 10;
 /// multimodality, since a cold descent that stops short of the mode moves the same way.
 /// It names no candidate either: the reported EBEs may still be the #833 incumbent's.
 pub(crate) fn ebe_screen_moved_warning(ids: &[String]) -> Option<String> {
-    let n = ids.len();
-    if n == 0 {
+    if ids.is_empty() {
         return None;
     }
-    let listed = ids[..n.min(SCREEN_MOVED_ID_LIST_CAP)].join(", ");
-    let list = if n > SCREEN_MOVED_ID_LIST_CAP {
-        format!("{listed} and {} more", n - SCREEN_MOVED_ID_LIST_CAP)
-    } else {
-        listed
-    };
-    let who = if n == 1 {
-        "1 subject".to_string()
-    } else {
-        format!("{n} subjects")
-    };
+    let who = counted_subjects(ids);
     Some(format!(
         "W_EBE_START_DEPENDENT: at the final parameters, the inner loop's Sobol screen \
          (`inner_screen`) or flip-flop twin seed (`inner_twin_seed`) moved the empirical \
-         Bayes estimates of {who} ({list}) to a lower \
+         Bayes estimates of {who} to a lower \
          individual objective than the descent from η = 0 reached. Either the individual \
          objective has more than one mode there, or that descent stopped short of it; in \
          both cases these EBEs, and the diagnostics built on them (IPRED, IWRES, CWRES, \
@@ -3616,6 +3663,13 @@ pub(crate) type EbeCandidate = (
     f64,
 );
 
+/// A borrowed EBE triple: the η̂, `H` and κ̂ `pop_nll_opts` consumes.
+type EbeTriple<'a> = (
+    &'a [DVector<f64>],
+    &'a [DMatrix<f64>],
+    &'a [Vec<DVector<f64>>],
+);
+
 /// Score an EBE triple on the fit's objective at `params` (#833).
 pub(crate) fn score_final_ebes(
     model: &CompiledModel,
@@ -3628,18 +3682,141 @@ pub(crate) fn score_final_ebes(
     (etas, h_mats, kappas, 2.0 * nll)
 }
 
+/// The `base` candidate, with each subject another candidate beats by more than
+/// [`BASIN_SHIFT_ABS_TOL`] in `−2LL` moved onto its lowest, and which candidate each subject
+/// came from. `terms[c][i]` is subject `i`'s objective term under candidate `c`.
+///
+/// The bound is what keeps this a choice between modes. Without it a subject moves for any
+/// gain at all, and a candidate an inner budget stopped short can score a few `1e-3` below
+/// the converged one: on `tests/run_covariance_reported_ebes.rs`'s starved row a plain
+/// minimum reported −1199.3302, below the fixture's optimum of −1199.3264.
+///
+/// A subject's `(η̂, H, κ̂)` move together: `H` is the curvature at that η̂, so splitting
+/// them would score a `log|H|` belonging to another point. The lowest is
+/// [`reported_candidate`]'s, so a non-finite term never wins, and a subject whose `base`
+/// term is itself non-finite always moves if anything finite exists.
+fn lowest_per_subject(
+    candidates: &[EbeCandidate],
+    terms: &[Vec<f64>],
+    base: usize,
+) -> (
+    (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>),
+    Vec<usize>,
+) {
+    let source: Vec<usize> = (0..terms[0].len())
+        .map(|i| {
+            let column: Vec<f64> = terms.iter().map(|t| t[i]).collect();
+            let lowest = reported_candidate(&column);
+            let moves = !column[base].is_finite()
+                || 2.0 * (column[base] - column[lowest]) > BASIN_SHIFT_ABS_TOL;
+            if moves {
+                lowest
+            } else {
+                base
+            }
+        })
+        .collect();
+    let pick = |i: usize| &candidates[source[i]];
+    let etas = (0..source.len()).map(|i| pick(i).0[i].clone()).collect();
+    let h_mats = (0..source.len()).map(|i| pick(i).1[i].clone()).collect();
+    // A model without IOV may carry no κ̂ at all; that shape is kept, since postfit branches
+    // on `kappas.is_empty()`.
+    let kappas = if candidates[0].2.is_empty() {
+        Vec::new()
+    } else {
+        (0..source.len())
+            .map(|i| pick(i).2.get(i).cloned().unwrap_or_default())
+            .collect()
+    };
+    ((etas, h_mats, kappas), source)
+}
+
+/// The subjects `other` beats the cold solve on by more than [`BASIN_SHIFT_ABS_TOL`] in
+/// `−2LL`, largest gap first: the ones a cold start cannot be said to reproduce (#2646).
+/// Terms are the `nll`s of [`subject_nlls`]; the `>` means a `NaN` side never counts.
+fn subjects_cold_lost(population: &Population, cold: &[f64], other: &[f64]) -> Vec<String> {
+    let mut lost: Vec<(f64, &str)> = population
+        .subjects
+        .iter()
+        .zip(cold.iter().zip(other))
+        .map(|(subject, (c, o))| (2.0 * (c - o), subject.id.as_str()))
+        .filter(|&(gap, _)| gap > BASIN_SHIFT_ABS_TOL)
+        .collect();
+    lost.sort_by(|a, b| b.0.total_cmp(&a.0));
+    lost.into_iter().map(|(_, id)| id.to_string()).collect()
+}
+
+/// [`subjects_cold_lost`] between two EBE triples at `params`. Empty under AGQ, whose
+/// per-subject term is not the one [`subject_nll`] computes. This is the per-subject half
+/// of the trigger for [`best_final_candidate`]: population totals can agree while subjects
+/// differ both ways, one held in a lower mode and another in a higher one.
+fn subjects_cold_lost_to(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    cold: EbeTriple<'_>,
+    other: EbeTriple<'_>,
+    options: &FitOptions,
+) -> Vec<String> {
+    if options.agq_nodes().is_some() {
+        return Vec::new();
+    }
+    let terms = |(etas, h_mats, kappas): EbeTriple<'_>| {
+        subject_nlls(
+            model,
+            population,
+            params,
+            etas,
+            h_mats,
+            kappas,
+            options.interaction,
+        )
+    };
+    subjects_cold_lost(population, &terms(cold), &terms(other))
+}
+
+/// What [`best_final_candidate`] decided.
+pub(crate) struct FinalPick {
+    pub(crate) reported: EbeCandidate,
+    /// [`subjects_cold_lost`] against the reported EBEs. Empty under AGQ.
+    cold_lost_ids: Vec<String>,
+    /// Under AGQ, which has no per-subject term: did a whole other candidate win?
+    pub(crate) cold_replaced: bool,
+}
+
+impl FinalPick {
+    /// Drop the #2013 subjects whose reported EBEs are no longer the cold solve's: the
+    /// warning names EBEs the cold solve moved, and another candidate's were not.
+    ///
+    /// Read off [`Self::cold_lost_ids`], not off which candidate each subject came from.
+    /// Candidates at one mode differ by solver noise, so on #2646's CJ 224 of 458 subjects
+    /// came from the seeded re-solve by ~1e-6, and those are still the cold solve's EBEs.
+    fn retain_cold_reported(&self, ids: &mut Vec<String>) {
+        if self.cold_replaced {
+            ids.clear();
+        }
+        let lost: HashSet<&str> = self.cold_lost_ids.iter().map(String::as_str).collect();
+        ids.retain(|id| !lost.contains(id.as_str()));
+    }
+}
+
 /// #833's recovery once a cold re-solve has missed the optimizer's own objective: a
 /// re-solve seeded from `seed` (the optimizer's EBEs), scored beside the cold solve and,
-/// when it belongs to this point, the optimizer's own `held` state as it left it. Returns
-/// the [`reported_candidate`] and its index — 0 is the cold solve, which callers pass
-/// first so that ties keep reporting it.
+/// when it belongs to this point, the optimizer's own `held` state as it left it. The
+/// cold solve comes first, so that ties keep reporting it.
 ///
 /// The held state is scored rather than merely used as a seed because the inner solve
 /// is *not* monotone from its seed (#1365), so the seeded re-solve alone could come back
 /// above the objective its own seed already had. Shared by the NLopt leg and the trust
 /// region (#2097).
+///
+/// The objective is a sum over subjects, so a fourth candidate starts from the best of the
+/// others and moves each subject that another beats materially (#2646,
+/// [`lowest_per_subject`]): no whole candidate need hold every subject's best, and picking
+/// one would give up what the others found. AGQ's per-subject term is not the one
+/// [`subject_nll`] computes, so there the whole candidates compete alone.
 #[allow(clippy::too_many_arguments)]
-fn best_final_candidate(
+pub(crate) fn best_final_candidate(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -3648,7 +3825,7 @@ fn best_final_candidate(
     cold: EbeCandidate,
     seed: &[DVector<f64>],
     held: Option<EbeCandidate>,
-) -> (EbeCandidate, usize) {
+) -> FinalPick {
     let s = final_inner_solve(model, population, params, mu_k, Some(seed), options);
     let warm = score_final_ebes(
         model,
@@ -3659,9 +3836,85 @@ fn best_final_candidate(
     );
     let mut candidates = vec![cold, warm];
     candidates.extend(held);
+    let mut terms = None;
+    if options.agq_nodes().is_none() {
+        let per_candidate: Vec<Vec<f64>> = candidates
+            .iter()
+            .map(|(etas, h_mats, kappas, _)| {
+                subject_nlls(
+                    model,
+                    population,
+                    params,
+                    etas,
+                    h_mats,
+                    kappas,
+                    options.interaction,
+                )
+            })
+            .collect();
+        let whole: Vec<f64> = candidates.iter().map(|c| c.3).collect();
+        let (parts, source) =
+            lowest_per_subject(&candidates, &per_candidate, reported_candidate(&whole));
+        candidates.push(score_final_ebes(model, population, params, parts, options));
+        let lowest = source
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| per_candidate[c][i])
+            .collect();
+        terms = Some((per_candidate, lowest));
+    }
     let objectives: Vec<f64> = candidates.iter().map(|c| c.3).collect();
     let pick = reported_candidate(&objectives);
-    (candidates.swap_remove(pick), pick)
+    let cold_lost_ids = terms
+        .as_ref()
+        .map_or_else(Vec::new, |(per_candidate, lowest)| {
+            let reported = per_candidate.get(pick).unwrap_or(lowest);
+            subjects_cold_lost(population, &per_candidate[0], reported)
+        });
+    FinalPick {
+        reported: candidates.swap_remove(pick),
+        cold_lost_ids,
+        cold_replaced: terms.is_none() && pick != 0,
+    }
+}
+
+/// Which EBEs a final cold solve hands on: the cold ones, unless they missed the optimizer's
+/// own. `cold_missed` is the population verdict; the per-subject test beside it is here
+/// because the totals can agree while subjects differ both ways (#2646). The one trigger
+/// for the NLopt leg and the trust region. A fit whose cold solve misses on neither keeps
+/// it, with no further solve, so such a fit is bit-identical to before.
+#[allow(clippy::too_many_arguments)]
+fn recover_final_ebes(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    mu_k: &[f64],
+    options: &FitOptions,
+    cold: EbeCandidate,
+    seed: &[DVector<f64>],
+    held: Option<EbeCandidate>,
+    cold_missed: bool,
+) -> FinalPick {
+    let a_subject_missed = held.as_ref().is_some_and(|h| {
+        !subjects_cold_lost_to(
+            model,
+            population,
+            params,
+            (&cold.0, &cold.1, &cold.2),
+            (&h.0, &h.1, &h.2),
+            options,
+        )
+        .is_empty()
+    });
+    if cold_missed || a_subject_missed {
+        best_final_candidate(model, population, params, mu_k, options, cold, seed, held)
+    } else {
+        FinalPick {
+            reported: cold,
+            cold_lost_ids: Vec::new(),
+            cold_replaced: false,
+        }
+    }
 }
 
 /// A final inner solve at `params` and what its Sobol screen (#2013) and flip-flop twin
@@ -3726,7 +3979,8 @@ pub(crate) fn final_inner_solve(
 /// - cold **materially better** — the optimizer's EBEs sat in a higher mode, so the
 ///   estimates minimise a surrogate above the objective; `converged` is demoted and
 ///   [`ebe_basin_shift_warning`] says so (#1565);
-/// - cold **materially worse**, or non-finite — [`ebe_start_dependence_warning`] (#833);
+/// - cold **materially worse**, or non-finite — [`ebe_start_dependence_warning`] (#833),
+///   naming the subjects it missed on (#2646);
 /// - the cold solve's screen moved some subjects — [`ebe_screen_moved_warning`] (#2013).
 ///
 /// What is reported depends on `adopt`. With `adopt` (the trust region, which has always
@@ -3735,8 +3989,8 @@ pub(crate) fn final_inner_solve(
 /// and the incumbent itself, exactly as on the NLopt leg — so a fit whose cold solve
 /// reproduces its optimizer's EBEs is unchanged. Without it (Gauss–Newton) the incumbent
 /// is always reported and the check is diagnostic only. The screen-moved warning, like
-/// the NLopt leg's, is dropped when the reported EBEs came from another candidate the
-/// helper chose; Gauss–Newton keeps it, since its incumbent is the only candidate and the
+/// the NLopt leg's, drops the subjects whose reported EBEs came from another candidate
+/// the helper chose; Gauss–Newton keeps them, since its incumbent is the only candidate and the
 /// fact it reports — η = 0 does not descend to those subjects' mode — holds either way.
 ///
 /// On a cancelled run nothing is solved and the incumbent comes back as it was.
@@ -3796,11 +4050,10 @@ pub(crate) fn final_ebe_check(
             report,
         ));
     }
-    let reported = if !adopt {
-        incumbent
-    } else if cold_solve_verdict(cold_ofv, incumbent_ofv).missed() {
+    let (reported, cold_lost_ids) = if adopt {
         let seed = joint_warm_starts(&incumbent.0, &incumbent.2);
-        let (reported, pick) = best_final_candidate(
+        let cold_missed = cold_solve_verdict(cold_ofv, incumbent_ofv).missed();
+        let pick = recover_final_ebes(
             model,
             population,
             params,
@@ -3809,15 +4062,26 @@ pub(crate) fn final_ebe_check(
             cold,
             &seed,
             Some(incumbent),
+            cold_missed,
         );
-        if pick != 0 {
-            screen_moved_ids.clear();
-        }
-        reported
+        pick.retain_cold_reported(&mut screen_moved_ids);
+        (pick.reported, pick.cold_lost_ids)
     } else {
-        cold
+        let ids = subjects_cold_lost_to(
+            model,
+            population,
+            params,
+            (&cold.0, &cold.1, &cold.2),
+            (&incumbent.0, &incumbent.1, &incumbent.2),
+            options,
+        );
+        (incumbent, ids)
     };
-    warnings.extend(ebe_start_dependence_warning(cold_ofv, reported.3));
+    warnings.extend(ebe_start_dependence_warning(
+        cold_ofv,
+        reported.3,
+        &cold_lost_ids,
+    ));
     warnings.extend(ebe_screen_moved_warning(&screen_moved_ids));
     (reported, warnings)
 }
@@ -4949,7 +5213,7 @@ pub(crate) enum RestartCause {
 /// dropping by hundreds per eval, and the existing retry, gated on `left_init`,
 /// never sees it. Then the optimizer is simply restarted from the best point it
 /// reached, which resets L-BFGS's `(s, y)` memory and the trust region with it.
-fn optimize_nlopt(
+pub(crate) fn optimize_nlopt(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -5974,6 +6238,11 @@ thread_local! {
     /// Whether the held `best_solve` at the final restore belonged to the restored point
     /// (`None` with none held), for the #2507 tests.
     pub(crate) static HELD_SOLVE_AT_RESTORED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    /// Scales the first subject's held `H` at the final restore, for the #2646 test of this
+    /// leg: a natural gap between a cold and a warm EBE needs a fixture the next search-path
+    /// change retires, as `tests/ebe_basin_shift.rs` records four times over.
+    pub(crate) static HELD_FIRST_H_SCALE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -7798,6 +8067,9 @@ fn optimize_nlopt_attempt_probed(
     // #2013: the IDs of the subjects whose EBE the cold solve's Sobol screen moved off the
     // mode the cold descent found. Feeds the warning only.
     let mut screen_moved_ids: Vec<String> = Vec::new();
+    // #2646: the subjects whose reported EBEs score materially below their cold ones.
+    // Feeds the warning only.
+    let mut cold_lost_ids: Vec<String> = Vec::new();
 
     // Final inner loop at converged parameters. Mixture (#977 Phase 3): the OFV
     // is the K-fold log-sum-exp and the reported EBEs are the MIXEST class.
@@ -7866,10 +8138,11 @@ fn optimize_nlopt_attempt_probed(
             // for would not hold on precisely the path that motivated it. Scoring the
             // incumbent costs one `pop_nll_opts` pass and no inner loop.
             //
-            // The extra work is *conditional* on the cold solve having failed to
-            // reproduce `best_seen_ofv`. On a unimodal inner problem — most fits — it
-            // reproduces it, there is nothing to recover, and the fit stays
-            // bit-identical to the pre-#833 behaviour at exactly the old cost. A
+            // The re-solve is *conditional* on the cold solve having failed to reproduce
+            // `best_seen_ofv`, in total or on some subject (#2646). On a unimodal inner
+            // problem — most fits — it reproduces it, there is nothing to recover, and
+            // the fit stays bit-identical to the pre-#833 behaviour, at the cost of the
+            // population passes that comparison takes and no inner solve. A
             // non-finite cold objective asks for the retry too; that is `NonFinite`'s
             // own arm rather than a gap test, because every comparison against `NaN` is
             // false.
@@ -7883,6 +8156,13 @@ fn optimize_nlopt_attempt_probed(
                 .filter(|inc| inc.etas.len() == population.subjects.len());
             #[cfg(test)]
             HELD_SOLVE_AT_RESTORED.with(|c| c.set(held.as_ref().map(|inc| inc.xs == restored_xs)));
+            #[cfg(test)]
+            let held = held.map(|mut inc| {
+                if let Some(scale) = HELD_FIRST_H_SCALE.with(|c| c.get()) {
+                    inc.h_mats[0] *= scale;
+                }
+                inc
+            });
             // #1565: the opposite direction. Counting is a diagnostic for the warning,
             // and it reads the held state as *this point's*, so it needs the same
             // `xs` match as scoring it does below; AGQ's per-subject term is not the
@@ -7906,8 +8186,8 @@ fn optimize_nlopt_attempt_probed(
                         )
                     });
             }
-            let incumbent = held.filter(|_| cold_missed_the_incumbent);
-            let (ehs, hms, kappas, ofv) = match incumbent {
+            let cold_candidate = (cold_ehs, cold_hms, cold_kappas, cold);
+            let (ehs, hms, kappas, ofv) = match held {
                 Some(inc) => {
                     // Scoring the held state is only sound when it belongs to the point
                     // that was restored — its `h_mats` are that point's curvature. When
@@ -7924,24 +8204,22 @@ fn optimize_nlopt_attempt_probed(
                             options,
                         )
                     });
-                    let (reported, pick) = best_final_candidate(
+                    let pick = recover_final_ebes(
                         model,
                         population,
                         &final_params,
                         &final_mu_k,
                         options,
-                        (cold_ehs, cold_hms, cold_kappas, cold),
+                        cold_candidate,
                         &seed,
                         held,
+                        cold_missed_the_incumbent,
                     );
-                    // The #2013 warning names EBEs the cold solve moved; reported EBEs
-                    // from another candidate were not.
-                    if pick != 0 {
-                        screen_moved_ids.clear();
-                    }
-                    reported
+                    pick.retain_cold_reported(&mut screen_moved_ids);
+                    cold_lost_ids = pick.cold_lost_ids;
+                    pick.reported
                 }
-                None => (cold_ehs, cold_hms, cold_kappas, cold),
+                None => cold_candidate,
             };
             (ehs, hms, kappas, ofv, None)
         };
@@ -8106,7 +8384,9 @@ fn optimize_nlopt_attempt_probed(
     // estimates depend on where the inner loop starts, and so does every diagnostic
     // built on them. Surface it rather than silently reporting the best candidate
     // (#833). [`ebe_start_dependence_warning`] owns both arms and the wording.
-    if let Some(w) = cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv)) {
+    if let Some(w) =
+        cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv, &cold_lost_ids))
+    {
         warnings.push(w);
     }
     if let Some(w) = ebe_screen_moved_warning(&screen_moved_ids) {
