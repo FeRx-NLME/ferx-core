@@ -9995,12 +9995,19 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
 /// fast per-PR twin of the 200-subject A/B below: it pins that the absorb arm is wired into
 /// the probe (making the arm a no-op re-traps the leg, a second probe fires and the end-of-leg
 /// check files a restart: red on the no-restart assertion). What the arm does to the cache and
-/// trackers is pinned by `an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two`;
-/// dropping either update leaves this test green.
+/// trackers is pinned by `an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two`:
+/// dropping the cache hand-off or the best-point update leaves this test green (measured on
+/// Linux).
 ///
-/// Measured (`ci-test`): Linux aarch64 (`tools/linux-test.sh`) restart 63.287990 in 82
-/// evaluations over 2 attempts, absorb 63.287839 in 142 over 1, probe gap 7.0741; macOS arm64
-/// restart 91 / absorb 128 evaluations, same OFVs to 1e-5. 3.5 s on Linux.
+/// Measured on Linux aarch64 (`tools/linux-test.sh`), identical under `ci-test` and `ci-cov`
+/// (the coverage job's profile): probe gap 7.0741 from 1 subject; restart 63.287990 in 82
+/// evaluations over 2 attempts, absorb 63.287839 in 142 over 1; 3.7 s. Mutation, same setup:
+/// the absorb arm a no-op → absorb arm 2 attempts, a second probe at 7.0723, red.
+///
+/// It fits to convergence yet is ungated: it is seconds, `tests/ebe_basin_shift.rs` already
+/// fits this fixture ungated, and it has to be a lib test because the share override and
+/// the probe's decision log are `cfg(test)` thread-locals. It is the only per-PR test that
+/// reaches the absorb arm; without it the arm is covered only by the slow A/B below.
 #[test]
 fn the_basin_probe_absorbs_one_switched_subject_of_ten() {
     use crate::parser::model_parser::parse_full_model;
