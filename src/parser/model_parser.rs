@@ -31068,8 +31068,8 @@ pub(crate) struct MovingSwitch {
 impl OdeRhsProgram {
     /// Fill [`Self::moving_switches`] from `deps`, the `[individual_parameters]` dependencies.
     /// A condition counts when something in it varies during the integration (a state, a
-    /// clock, or a parameter that reads `TIME`). A parameter counts when a θ or η reaches it,
-    /// so a covariate-only `LAGT = WT / 10` is left alone: its switch cannot move.
+    /// clock, or a parameter that reads `TIME`). Whether anything estimated reaches the
+    /// parameter is [`Self::moving_switch`]'s question.
     fn resolve_moving_switches(&mut self, deps: &std::collections::HashMap<String, IndivVarDeps>) {
         let mut out: Vec<MovingSwitch> = Vec::new();
         for c in &self.condition_reads {
@@ -31082,7 +31082,7 @@ impl OdeRhsProgram {
             }
             for p in &c.params {
                 let Some(d) = deps.get(p) else { continue };
-                if (d.has_eta || !d.thetas.is_empty()) && !out.iter().any(|m| &m.param == p) {
+                if !out.iter().any(|m| &m.param == p) {
                     out.push(MovingSwitch {
                         param: p.clone(),
                         thetas: d.thetas.iter().copied().collect(),
@@ -31096,7 +31096,7 @@ impl OdeRhsProgram {
 
     /// The first parameter whose `if` switch moves with something the fit estimates, given the
     /// model's FIX flags. A FIX θ does not move the switch, so a parameter reached only by
-    /// FIX θ's keeps the exact derivatives (#2649).
+    /// FIX θ's keeps the exact derivatives, as does a covariate-only `LAGT = WT / 10` (#2649).
     pub(crate) fn moving_switch(&self, theta_fixed: &[bool]) -> Option<&MovingSwitch> {
         self.moving_switches.iter().find(|m| {
             m.has_eta
