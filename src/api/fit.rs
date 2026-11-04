@@ -2358,11 +2358,12 @@ fn fit_inner(
                 marg_opts.imp_samples = stage_opts.impmap_samples;
                 marg_opts.imp_seed = stage_opts.impmap_seed;
                 marg_opts.imp_low_ess_threshold = stage_opts.impmap_low_ess_threshold;
-                // A Gaussian IMPMAP proposal (`impmap_proposal_df = ∞`, opt-in)
-                // cannot be sampled by the finite-t IS evaluator. The marginal is
-                // proposal-independent in expectation, so fall back to a finite-t
-                // eval proposal (heavier tails ⇒ bounded weights). The default
-                // `impmap_proposal_df = 4` passes through unchanged.
+                // A Gaussian IMPMAP proposal (`impmap_proposal_df = ∞`, opt-in) is
+                // swapped for a t₅ in this final readout: the marginal is
+                // proposal-independent in expectation, and the heavier tails bound
+                // the weights. The default `impmap_proposal_df = 4` passes through
+                // unchanged. (The evaluator itself samples a normal proposal too —
+                // that is what `imp_proposal_df = normal` gets.)
                 let df = stage_opts.impmap_proposal_df;
                 marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
             }

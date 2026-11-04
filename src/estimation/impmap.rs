@@ -3313,7 +3313,7 @@ fn split_kappas(kappa_part: &[f64], n_kappa: usize, buf: &mut Vec<Vec<f64>>) -> 
 /// alone (scored exactly as before #2301), or an IOV subject's stacked
 /// `[η, κ₁..κ_K]`, scored with per-occasion predictions — the observation NLL
 /// SAEM's IOV M-step uses.
-fn draw_obs_nll(
+pub(crate) fn draw_obs_nll(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
@@ -5829,10 +5829,131 @@ mod tests {
         .expect("joint IS on an IOV model")
     }
 
+    /// `run_importance_sampling` at `params` with 2000 samples around the EBEs
+    /// found there, after `tweak` has adjusted the evaluator's options.
+    fn is_at_with(
+        model: &CompiledModel,
+        pop: &Population,
+        params: &ModelParameters,
+        tweak: impl Fn(&mut FitOptions),
+    ) -> ImportanceSamplingResult {
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 2000;
+        opts.imp_seed = Some(5);
+        tweak(&mut opts);
+        let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
+        let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
+            model,
+            pop,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            &mu_k,
+            0,
+            11,
+            1,
+        );
+        crate::estimation::importance_sampling::run_importance_sampling(
+            model,
+            pop,
+            params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &opts,
+        )
+        .expect("IS evaluation")
+    }
+
+    /// warfarin_iov with its κ removed: the same data, scored by the η-only
+    /// evaluator kernel.
+    fn eta_only_model() -> CompiledModel {
+        let src = include_str!("../../examples/warfarin_iov.ferx")
+            .replace("  kappa KAPPA_CL ~ 0.01\n", "")
+            .replace(" + KAPPA_CL", "");
+        let model = crate::parser::model_parser::parse_full_model(&src)
+            .expect("parses")
+            .model;
+        assert_eq!(model.n_kappa, 0, "the κ edit must take");
+        model
+    }
+
+    /// `imp_eval_only` with `imp_proposal_df = normal` (parsed to `f64::INFINITY`)
+    /// is a documented setting. The evaluator once carried its own Student-t-only
+    /// sampler, whose density constant at ν = ∞ is `lnΓ(∞) − lnΓ(∞) = NaN`, so the
+    /// readout was not a number. Both kernels are covered — η-only, and the joint
+    /// (η, κ) one an IOV subject takes — each against its own t₅ readout, which
+    /// estimates the same marginal from a different proposal.
+    #[test]
+    fn imp_eval_with_a_normal_proposal_agrees_with_the_student_t_readout() {
+        let pop = iov_pop();
+        for (name, model) in [("eta-only", eta_only_model()), ("iov", iov_model())] {
+            let params = model.default_params.clone();
+            let t5 = is_at_with(&model, &pop, &params, |o| o.imp_proposal_df = 5.0);
+            let mvn = is_at_with(&model, &pop, &params, |o| o.imp_proposal_df = f64::INFINITY);
+            assert!(
+                mvn.minus2_log_likelihood.is_finite() && mvn.mc_standard_error.is_finite(),
+                "{name}: normal-proposal readout {} ± {}",
+                mvn.minus2_log_likelihood,
+                mvn.mc_standard_error
+            );
+            assert!(t5.minus2_log_likelihood.is_finite(), "{name}: t5 readout");
+            let gap = (mvn.minus2_log_likelihood - t5.minus2_log_likelihood).abs();
+            eprintln!(
+                "{name}: normal {} ± {} (ess_min {}), t5 {} ± {}; gap {gap}",
+                mvn.minus2_log_likelihood,
+                mvn.mc_standard_error,
+                mvn.ess_min,
+                t5.minus2_log_likelihood,
+                t5.mc_standard_error
+            );
+            assert!(mvn.ess_min > 0.0, "{name}: ess_min {}", mvn.ess_min);
+            assert!(gap < GAP_BOUND, "{name}: gap {gap}");
+        }
+    }
+    /// Two IS readouts of one marginal from different proposals, at warfarin_iov's
+    /// start values. Measured (Linux x86_64, K = 2000): normal vs t₅ 0.319 (η-only)
+    /// and 0.495 (IOV); α = 0.2 vs 0 0.059. The normal-vs-t₅ gaps are 3–4 combined
+    /// MC SEs: at the start values the light-tailed normal proposal under-covers the
+    /// posterior, which biases its readout up and makes its ESS-based SE optimistic
+    /// (at SAEM's estimates the CLI gap is 0.01–0.05). 1.0 is 2× the worst; the
+    /// pre-fix normal readout was not finite at all.
+    const GAP_BOUND: f64 = 1.0;
+
+    /// `imp_defensive_alpha` reaches the joint (η, κ) evaluator. The IOV kernel
+    /// once had its own sampler that took no mixture, so α changed nothing for an
+    /// IOV subject. α > 0 must move the readout (a different proposal) and stay
+    /// within Monte-Carlo error of α = 0 (the same marginal).
+    #[test]
+    fn imp_eval_defensive_mixture_reaches_iov_subjects() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = model.default_params.clone();
+        let plain = is_at_with(&model, &pop, &params, |_| {});
+        let mixed = is_at_with(&model, &pop, &params, |o| o.imp_defensive_alpha = 0.2);
+        let gap = (mixed.minus2_log_likelihood - plain.minus2_log_likelihood).abs();
+        eprintln!(
+            "α=0 {} ± {}, α=0.2 {} ± {}; gap {gap}",
+            plain.minus2_log_likelihood,
+            plain.mc_standard_error,
+            mixed.minus2_log_likelihood,
+            mixed.mc_standard_error
+        );
+        assert_ne!(
+            mixed.minus2_log_likelihood.to_bits(),
+            plain.minus2_log_likelihood.to_bits(),
+            "α = 0.2 left the IOV readout unchanged"
+        );
+        assert!(gap < GAP_BOUND, "gap {gap}");
+    }
+
     /// The trace −2LL of an IOV fit is the joint (η, κ) marginal. Iteration 1's
     /// E-step runs at the start values, so its row must agree with
-    /// `run_importance_sampling`, a separate joint estimator
-    /// (`subject_is_estimate_joint`), at the same parameters. Dropping the
+    /// `run_importance_sampling` at the same parameters. The two share the
+    /// sampler and the per-draw scorer, so this pins the joint *prior* each one
+    /// assembles for itself (`JointPriors` here, `build_joint_omega_inv` there),
+    /// not the kernel. Dropping the
     /// `n_occ · log det Ω_iov` term from `log_det_joint` moves the trace by
     /// `Σᵢ Kᵢ · |ln det Ω_iov|`, far outside the bound below.
     #[test]

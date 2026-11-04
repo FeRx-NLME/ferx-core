@@ -975,13 +975,28 @@ After the SAEM iterations complete:
 
 For sparsely-sampled data where the Laplace OFV is biased, you can
 append an importance-sampling stage that estimates `−2 log L` by Monte
-Carlo:
+Carlo at the SAEM estimates — the equivalent of NONMEM `$EST METHOD=SAEM`
+followed by `$EST METHOD=IMP EONLY=1`:
 
 ```
-method = [saem, imp]
+[fit_options]
+  method        = [saem, imp]
+  imp_eval_only = true
+  imp_samples   = 3000      # default 1000; 2000–5000 for a reported value
 ```
 
-See [Importance Sampling (IMP)](importance-sampling.qmd).
+`imp_eval_only = true` is required. Without it the `imp` stage is an
+estimator (NONMEM `METHOD=IMP`): it re-fits θ/Ω/σ by Monte-Carlo EM, so the
+reported estimates are no longer SAEM's.
+
+The importance-sampled `−2 log L` and its Monte-Carlo standard error are on
+`FitResult.importance_sampling` (`fit$importance_sampling` in R; the
+`IS done. −2 log L = …` line in verbose output). `ofv` remains the FOCE
+approximation at the SAEM estimates described above, and AIC/BIC are built from
+it. The `imp` stage takes its proposal centres and scales from the final EBE
+refinement in step 1, so a subject listed under `low_ess_subjects` usually points
+at that refinement rather than at SAEM itself. See
+[Importance Sampling (IMP)](importance-sampling.qmd#evaluation-only-mode-imp_eval_only-true).
 
 ### Covariance step on a non-Gaussian model {#saem-covariance-non-gaussian}
 

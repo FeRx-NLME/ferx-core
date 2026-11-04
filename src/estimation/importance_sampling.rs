@@ -24,7 +24,7 @@
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
-use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into, SUBJECT_SENTINEL_NLL};
+use crate::stats::likelihood::obs_nll_subject_into;
 use crate::stats::special::ln_gamma;
 use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::stats::util::{
@@ -496,6 +496,9 @@ pub fn run_importance_sampling(
                     }
                 }
 
+                // The defensive broad component is the joint prior N(0, Ω ⊕ I ⊗ Ω_iov),
+                // as in the MCEM E-step's `JointPriors`.
+                let joint_mixture = DefensiveMixture::new(&omega_joint_inv, n_b, defensive_alpha);
                 subject_is_estimate_joint(
                     model,
                     subject,
@@ -506,13 +509,11 @@ pub fn run_importance_sampling(
                     &omega_joint_inv,
                     log_det_omega_joint,
                     n_b,
-                    n_eta,
-                    n_iov,
-                    n_occ,
                     k_samples,
                     nu,
                     subj_seed,
                     scratch,
+                    joint_mixture.as_ref(),
                 )
             } else {
                 // Non-IOV path: eta-only sampling
@@ -676,7 +677,7 @@ pub(crate) const MIX_ESS_PMIX_FLOOR: f64 = 1e-3;
 /// ```
 ///
 /// via [`crate::estimation::mixture::combine_subject`]. This is the true marginal likelihood a chained
-/// `[saem, imp]` / `[focei, imp]` fit reports for a mixture. The per-class solves
+/// `[saem, imp]` / `[focei, imp]` fit with `imp_eval_only` reports for a mixture. The per-class solves
 /// run inside each subject's rayon task (the guard is entered per class on the
 /// worker thread), so subject-level parallelism is preserved while the
 /// thread-local class index stays correct. IOV is not yet supported here.
@@ -939,8 +940,29 @@ impl SubjectIsOutput {
             ess_fraction: 0.0,
         }
     }
+
+    /// The evaluator's view of one subject's draws: the marginal and ESS as drawn,
+    /// plus the Geweke MC variance of `log p̂(yᵢ)` the population SE is built from.
+    fn from_draws(draws: &SubjectDraws, k_samples: usize) -> Self {
+        Self {
+            log_marginal: draws.log_marginal,
+            var_log_marginal: var_log_marginal_from_ess_fraction(
+                draws.ess_fraction,
+                k_samples as f64,
+            ),
+            ess_fraction: draws.ess_fraction,
+        }
+    }
 }
 
+/// One subject's evaluation-only IS estimate: the marginal, its MC variance and the
+/// ESS fraction, from the same draws the MCEM E-step takes ([`subject_is_draws`]).
+///
+/// This used to be a second copy of the sampler without the multivariate-normal
+/// branch, so `imp_eval_only` with `imp_proposal_df = normal` scored every draw
+/// with a `NaN` Student-t density at `ν = ∞` — one implementation now serves both.
+/// Pseudo-random only: the evaluator keeps its documented, seed-reproducible
+/// stream (`imp_sobol` does not apply to it).
 #[allow(clippy::too_many_arguments)]
 fn subject_is_estimate(
     model: &CompiledModel,
@@ -959,128 +981,27 @@ fn subject_is_estimate(
     iscale: f64,
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectIsOutput {
-    let mut rng = StdRng::seed_from_u64(seed);
-
-    // Build proposal: t_ν(η̂, Σ) with Σ = (H + λI)⁻¹.
-    let proposal = match build_proposal(h, omega_inv, d) {
-        Some(p) => p,
-        None => {
-            // Even the omega-scale fallback failed (n_eta = 0?). Treat as a
-            // degenerate proposal with all weight at the prior mode.
-            return SubjectIsOutput {
-                log_marginal: 0.0,
-                var_log_marginal: 0.0,
-                ess_fraction: 0.0,
-            };
-        }
-    };
-
-    // Defensive-mixture component q_broad = N(0, Ω); see `subject_is_draws` and
-    // issue #528. `mixture == None` reproduces the single-proposal estimator
-    // exactly. The broad component is built once by the caller and shared.
-
-    let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
-
-    // Constant pieces of log q (Student-t) and log p_η (Gaussian) pulled out
-    // of the per-sample loop. ISCALE adjusts the proposal: Σ_prop = iscale² · Σ.
-    let half_d = 0.5 * d as f64;
-    let iscale_log_adj = -(d as f64) * iscale.ln();
-    let inv_iscale_sq = 1.0 / (iscale * iscale);
-    let log_t_const = student_t_gamma_ratio(nu, d) - half_d * (nu * std::f64::consts::PI).ln()
-        + 0.5 * proposal.log_det_inv_scale
-        + iscale_log_adj;
-    let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
-
-    // Preallocate every per-sample buffer once. With K typically in the
-    // thousands per subject and n_subjects in the hundreds, repeated
-    // allocation of `z`, `eta_sample`, `diff` and the implicit `DVector`
-    // for the prior quadratic form would dominate the inner loop.
-    let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
-    let mut z = vec![0.0_f64; d];
-    let mut eta_sample = vec![0.0_f64; d];
-    let mut diff = vec![0.0_f64; d];
-
-    for sample_idx in 0..k_samples {
-        match draw_inputs(
-            sample_idx,
-            None,
-            mixture,
-            Some(&chi_sq),
-            nu,
-            &mut rng,
-            &mut z,
-        ) {
-            // Defensive draw η ~ N(0, Ω): centred at the prior mean (0), not η̂.
-            DrawInputs::Broad => mixture
-                .expect("mixture set when from_broad")
-                .broad_from_z(&z, &mut eta_sample),
-            // η = η̂ + iscale·sqrt(ν/c) · L_Σ z, via the precomputed factor.
-            DrawInputs::Narrow { t_scale } => {
-                proposal.apply_l_sigma(&z, &mut eta_sample, t_scale * iscale);
-                for (j, e) in eta_sample.iter_mut().enumerate() {
-                    *e += eta_hat[j];
-                }
-            }
-        }
-
-        let obs_nll = obs_nll_subject_into(
+    SubjectIsOutput::from_draws(
+        &subject_is_draws(
             model,
             subject,
             theta,
             sigma,
-            model.residual_cov_theta(theta),
-            &eta_sample,
+            eta_hat,
+            h,
+            omega_inv,
+            log_det_omega,
+            d,
+            k_samples,
+            nu,
+            seed,
             scratch,
-        );
-        let log_p_y = -obs_nll;
-
-        // log p(η | θ): multivariate-normal quadratic form `η' Ω⁻¹ η`,
-        // computed allocation-free on slices. For d ≈ 2–10 the O(d²) double
-        // loop is far cheaper than building a `DVector` and a fresh
-        // `omega_inv * eta` allocation per sample.
-        let mut quad_form = 0.0_f64;
-        for i in 0..d {
-            let mut row = 0.0_f64;
-            for j in 0..d {
-                row += omega_inv[(i, j)] * eta_sample[j];
-            }
-            quad_form += row * eta_sample[i];
-        }
-        let log_p_eta = log_p_eta_const - 0.5 * quad_form;
-
-        // log q(η): multivariate t at (η̂, iscale²·Σ, ν).
-        for (k, d_slot) in diff.iter_mut().enumerate() {
-            *d_slot = eta_sample[k] - eta_hat[k];
-        }
-        let mahal = proposal.mahalanobis(&diff);
-        let log_q_narrow =
-            log_t_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln();
-        // Defensive mixture q = (1−α)·q_narrow + α·N(0,Ω); the broad component's
-        // log-density is the prior `log_p_eta`. Scored for every sample.
-        let log_q = match mixture {
-            Some(m) => m.log_q(log_q_narrow, log_p_eta),
-            None => log_q_narrow,
-        };
-
-        log_w.push(log_p_y + log_p_eta - log_q);
-    }
-
-    // logsumexp + ESS.
-    let (lse, weights_norm) = logsumexp_with_normalised(&log_w);
-    let log_marginal = lse - (k_samples as f64).ln();
-    let ess = ess_from_weights(&weights_norm);
-    let ess_fraction = ess / (k_samples as f64);
-
-    // Asymptotic variance of log p̂(yᵢ) for a self-normalised IS estimator:
-    //   Var(log p̂) ≈ (K · Σ wₖ² − 1) / K = (1/ESS_fraction − 1) / K
-    // (Geweke 1989; equivalent to the standard "1/ESS − 1/K" relation.)
-    let var_log_marginal = var_log_marginal_from_ess_fraction(ess_fraction, k_samples as f64);
-
-    SubjectIsOutput {
-        log_marginal,
-        var_log_marginal,
-        ess_fraction,
-    }
+            iscale,
+            false,
+            mixture,
+        ),
+        k_samples,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2092,7 +2013,15 @@ pub(crate) fn build_joint_omega_inv(
     crate::stats::stacked_layout::block_diag_stack(omega_inv, omega_iov_inv, n_occ)
 }
 
-/// Joint (eta, kappa) IS estimate for IOV models.
+/// Joint (η, κ) IS estimate for an IOV subject: the stacked `[η, κ₁..κ_K]` is
+/// sampled and scored exactly as the IMP/IMPMAP E-step does it (#2301) — the same
+/// draws ([`subject_is_draws_with`]) and the same per-sample observation NLL
+/// (`impmap::draw_obs_nll`, i.e. `obs_nll_subject_into_iov`).
+///
+/// It used to inline its own copy of that NLL, which had drifted: no FREM
+/// covariate-σ override, no non-Gaussian (TTE / binary / categorical) data term,
+/// no multivariate-normal proposal and no defensive mixture. An `imp_eval_only`
+/// readout then scored a different likelihood than the one IMP/IMPMAP estimate.
 #[allow(clippy::too_many_arguments)]
 fn subject_is_estimate_joint(
     model: &CompiledModel,
@@ -2104,134 +2033,33 @@ fn subject_is_estimate_joint(
     omega_joint_inv: &DMatrix<f64>,
     log_det_omega_joint: f64,
     n_b: usize,
-    n_eta: usize,
-    n_iov: usize,
-    n_occ: usize,
     k_samples: usize,
     nu: f64,
     seed: u64,
-    _scratch: &mut EventPkParams,
+    scratch: &mut EventPkParams,
+    mixture: Option<&DefensiveMixture>,
 ) -> SubjectIsOutput {
-    let mut rng = StdRng::seed_from_u64(seed);
-
-    // Build joint proposal
-    let proposal = match build_proposal(h_joint, omega_joint_inv, n_b) {
-        Some(p) => p,
-        None => {
-            return SubjectIsOutput {
-                log_marginal: 0.0,
-                var_log_marginal: 0.0,
-                ess_fraction: 0.0,
-            };
-        }
+    let obs_nll = |b: &[f64], sc: &mut EventPkParams| {
+        crate::estimation::impmap::draw_obs_nll(model, subject, theta, sigma, b, sc)
     };
-
-    let normal = StandardNormal;
-    let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
-
-    let half_d = 0.5 * n_b as f64;
-    let log_t_const = student_t_gamma_ratio(nu, n_b) - half_d * (nu * std::f64::consts::PI).ln()
-        + 0.5 * proposal.log_det_inv_scale;
-    let log_p_joint_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega_joint;
-
-    let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
-    let mut z = vec![0.0_f64; n_b];
-    let mut sample_joint = vec![0.0_f64; n_b];
-    let mut diff = vec![0.0_f64; n_b];
-    // Reused across draws: overwriting in place avoids K allocations of the
-    // outer `Vec` plus its per-occasion κ vectors (a hot-loop allocator cost
-    // at K in the thousands).
-    let mut kappas_sampled: Vec<Vec<f64>> = (0..n_occ).map(|_| vec![0.0_f64; n_iov]).collect();
-    // #484/#1029: per-observation residual-magnitude multiplier. η-independent
-    // (θ / covariates / TIME only), so it is hoisted out of the draw loop and
-    // shared by every importance sample.
-    let ruv_mult = model.ruv_obs_mult(subject, theta);
-
-    for _ in 0..k_samples {
-        // Draw from joint proposal
-        for zi in z.iter_mut() {
-            *zi = normal.sample(&mut rng);
-        }
-        let c: f64 = chi_sq.sample(&mut rng).max(1e-300);
-        let scale = (nu / c).sqrt();
-        proposal.apply_l_sigma(&z, &mut sample_joint, scale);
-        for (j, e) in sample_joint.iter_mut().enumerate() {
-            *e += mode_joint[j];
-        }
-
-        // Split into eta and kappa parts (κ buffer reused across draws).
-        let eta_sample = &sample_joint[..n_eta];
-        for (k, kappa_occ) in kappas_sampled.iter_mut().enumerate() {
-            let start = kappa_offset(n_eta, n_iov, k);
-            kappa_occ.copy_from_slice(&sample_joint[start..start + n_iov]);
-        }
-
-        // Compute obs NLL with sampled eta and kappa using predict_iov
-        let ipreds = predict_iov(model, subject, theta, eta_sample, &kappas_sampled);
-
-        let m3 = matches!(model.bloq_in_force(), BloqMethod::M3);
-        // IIV on residual error (#409): scale by exp(2·η_ruv) for this draw's eta.
-        let ruv_scale = model.residual_var_scale(eta_sample);
-        // #658: per-observation residual endpoint keys (covariate selector or CMT).
-        let err_keys = model.error_spec.obs_keys(subject);
-        let mut obs_nll = 0.0_f64;
-        for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
-            let v = crate::stats::residual_error::guard_variance(
-                model.residual_variance_at_scaled(
-                    err_keys[j],
-                    f,
-                    sigma,
-                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                ) * ruv_scale,
-            );
-            let cens = subject.cens.get(j).copied().unwrap_or(0);
-            if m3 && cens != 0 {
-                obs_nll += -m3_logcdf(y, f, v.sqrt(), cens);
-            } else {
-                obs_nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
-            }
-        }
-        // #2440: the prediction is unfloored, so a NaN prediction makes a NaN NLL —
-        // map it to the 1e20 sentinel so the draw gets zero weight, not a NaN one.
-        if !obs_nll.is_finite() {
-            obs_nll = SUBJECT_SENTINEL_NLL;
-        }
-        let log_p_y = -obs_nll;
-
-        // Compute joint prior: eta' Omega^{-1} eta + sum_k kappa_k' Omega_iov^{-1} kappa_k
-        let mut quad_form = 0.0_f64;
-        for i in 0..n_b {
-            let mut row = 0.0_f64;
-            for j in 0..n_b {
-                row += omega_joint_inv[(i, j)] * sample_joint[j];
-            }
-            quad_form += row * sample_joint[i];
-        }
-        let log_p_joint = log_p_joint_const - 0.5 * quad_form;
-
-        // Compute proposal log-density
-        for (k, d_slot) in diff.iter_mut().enumerate() {
-            *d_slot = sample_joint[k] - mode_joint[k];
-        }
-        let mahal = proposal.mahalanobis(&diff);
-        let log_q = log_t_const - 0.5 * (nu + n_b as f64) * (1.0 + mahal / nu).ln();
-
-        log_w.push(log_p_y + log_p_joint - log_q);
-    }
-
-    // logsumexp + ESS
-    let (lse, weights_norm) = logsumexp_with_normalised(&log_w);
-    let log_marginal = lse - (k_samples as f64).ln();
-    let ess = ess_from_weights(&weights_norm);
-    let ess_fraction = ess / (k_samples as f64);
-
-    let var_log_marginal = var_log_marginal_from_ess_fraction(ess_fraction, k_samples as f64);
-
-    SubjectIsOutput {
-        log_marginal,
-        var_log_marginal,
-        ess_fraction,
-    }
+    SubjectIsOutput::from_draws(
+        &subject_is_draws_with(
+            &obs_nll,
+            &DVector::from_column_slice(mode_joint),
+            h_joint,
+            omega_joint_inv,
+            log_det_omega_joint,
+            n_b,
+            k_samples,
+            nu,
+            seed,
+            scratch,
+            1.0,
+            false,
+            mixture,
+        ),
+        k_samples,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4344,6 +4172,156 @@ mod tests {
         assert!(
             (reference(true) - reference(false)).abs() > 1e-6,
             "the weight must move the proposal precision, else this test proves nothing"
+        );
+    }
+}
+
+/// The joint (η, κ) evaluator scores each draw with the IOV observation NLL the
+/// MCEM E-step uses (`impmap::draw_obs_nll`). Its former inline copy left out the
+/// FREM covariate σ and the non-Gaussian data term (#2627). Each test holds the
+/// proposal — centre, Hessian, seed — fixed and changes only what the scorer
+/// reads, so the old copy returned the same bits on both legs.
+#[cfg(test)]
+mod joint_eval_scorer_tests {
+    use super::*;
+
+    fn iov_subject() -> Subject {
+        let pop = crate::read_nonmem_csv(
+            std::path::Path::new("data/warfarin_iov.csv"),
+            None,
+            Some("OCC"),
+        )
+        .expect("warfarin_iov.csv reads");
+        let s = pop.subjects[0].clone();
+        assert_eq!(
+            crate::stats::stacked_layout::group_count(&s),
+            2,
+            "fixture subject has two occasions"
+        );
+        s
+    }
+
+    /// `subject_is_estimate_joint` at the prior mode with a fixed proposal
+    /// precision (4 · the joint prior precision): the same draws on every call.
+    fn joint_readout(model: &CompiledModel, subject: &Subject, sigma: &[f64]) -> SubjectIsOutput {
+        let params = &model.default_params;
+        let n_occ = crate::stats::stacked_layout::group_count(subject);
+        let (n_eta, n_iov) = (model.n_eta, model.n_kappa);
+        let n_b = stacked_width(n_eta, n_iov, n_occ);
+        let iov = params.omega_iov.as_ref().expect("IOV model");
+        let omega_joint_inv =
+            build_joint_omega_inv(&params.omega.inv, &iov.inv, n_eta, n_iov, n_occ);
+        let log_det = params.omega.log_det + n_occ as f64 * iov.log_det;
+        let h_joint = &omega_joint_inv * 4.0;
+        subject_is_estimate_joint(
+            model,
+            subject,
+            &params.theta,
+            sigma,
+            &vec![0.0; n_b],
+            &h_joint,
+            &omega_joint_inv,
+            log_det,
+            n_b,
+            500,
+            5.0,
+            17,
+            &mut EventPkParams::default(),
+            None,
+        )
+    }
+
+    /// FREM rows are scored with the covariate σ (EPSCOV), not the PK error. The
+    /// old copy never read EPSCOV, so doubling it left the readout bit-identical.
+    #[test]
+    fn joint_eval_scores_frem_rows_with_the_covariate_sigma() {
+        let src = include_str!("../../examples/warfarin_frem.ferx")
+            .replace(
+                "  sigma PROP_ERR ~ 0.02",
+                "  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.02",
+            )
+            .replace("exp(ETA_CL)", "exp(ETA_CL + KAPPA_CL)");
+        let model = crate::parser::model_parser::parse_full_model(&src)
+            .expect("FREM + IOV parses")
+            .model;
+        assert_eq!(model.n_kappa, 1, "the κ edit must take");
+        let fc = model.frem_config.as_ref().expect("FREM config");
+        let cov_sigma = fc.covariate_sigma_index;
+        // One observation becomes a WT pseudo-observation near its typical value.
+        let mut subject = iov_subject();
+        let j = subject.observations.len() - 1;
+        subject.fremtype = vec![0; subject.observations.len()];
+        subject.fremtype[j] = 100;
+        subject.observations[j] = 72.5;
+
+        let sigma = model.default_params.sigma.values.clone();
+        let mut wider = sigma.clone();
+        wider[cov_sigma] *= 2.0;
+        let base = joint_readout(&model, &subject, &sigma);
+        let moved = joint_readout(&model, &subject, &wider);
+        eprintln!(
+            "EPSCOV {} → {}: log p̂ {} → {}",
+            sigma[cov_sigma], wider[cov_sigma], base.log_marginal, moved.log_marginal
+        );
+        assert!(base.log_marginal.is_finite() && moved.log_marginal.is_finite());
+        assert_ne!(
+            base.log_marginal.to_bits(),
+            moved.log_marginal.to_bits(),
+            "EPSCOV did not reach the FREM row"
+        );
+        // Control: without the FREMTYPE row, EPSCOV is read nowhere, so the same
+        // change must leave the readout bit-identical — the pair above moves
+        // because of the FREM row, not because σ moved some other term.
+        subject.fremtype[j] = 0;
+        assert_eq!(
+            joint_readout(&model, &subject, &sigma)
+                .log_marginal
+                .to_bits(),
+            joint_readout(&model, &subject, &wider)
+                .log_marginal
+                .to_bits(),
+            "EPSCOV moved a readout with no FREM row"
+        );
+    }
+
+    /// A `[binary_model]` record adds `log P(state)` < 0 to every draw, so the
+    /// readout with the records must sit strictly below the one without. The
+    /// old copy scored Gaussian rows only, so the two legs were bit-identical.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn joint_eval_scores_the_binary_endpoint_of_an_iov_subject() {
+        let src = format!(
+            "{}\n[binary_model]\n  cmt   = 9\n  logit = -0.5 + 2.0 * ETA_V\n",
+            include_str!("../../examples/warfarin_iov.ferx")
+        );
+        let model = crate::parser::model_parser::parse_full_model(&src)
+            .expect("IOV + binary parses")
+            .model;
+        assert_eq!(model.n_kappa, 1);
+        let plain = iov_subject();
+        let mut with_binary = plain.clone();
+        with_binary.obs_records = [(1.0, 1), (24.0, 0), (72.0, 1)]
+            .iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                raw_time: time,
+                state,
+                cmt: 9,
+            })
+            .collect();
+        let sigma = model.default_params.sigma.values.clone();
+        let without = joint_readout(&model, &plain, &sigma);
+        let with = joint_readout(&model, &with_binary, &sigma);
+        eprintln!(
+            "log p̂ without binary {}, with {}",
+            without.log_marginal, with.log_marginal
+        );
+        assert!(without.log_marginal.is_finite() && with.log_marginal.is_finite());
+        assert!(
+            with.log_marginal < without.log_marginal,
+            "binary records must lower the marginal: {} vs {}",
+            with.log_marginal,
+            without.log_marginal
         );
     }
 }

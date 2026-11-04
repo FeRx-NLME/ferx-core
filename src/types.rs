@@ -6795,7 +6795,8 @@ pub struct PosteriorSummary {
 /// the same variational family, and **not** comparable with a FOCE/FOCEI/SAEM
 /// OFV, with a `−2 log L`, or across families — a richer family raises the bound
 /// without the model fitting any better. Use [`FitOptions::vi_final_ofv`], or a
-/// `method = [vi, imp]` chain, to obtain a genuine marginal likelihood.
+/// `method = [vi, imp]` chain with [`FitOptions::imp_eval_only`], to obtain a
+/// genuine marginal likelihood.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[non_exhaustive]
 pub struct ViResult {
