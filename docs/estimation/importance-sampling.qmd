@@ -69,7 +69,8 @@ a final FOCE Laplace pass for AIC/BIC comparability.
 > (`impmap_proposal_df = normal`), it is replaced by a finite-`t` proposal for
 > this final marginal eval, so the heavier tails keep the importance weights bounded.
 
-Both numbers are labelled where you read them. AIC and BIC come from `ofv`, so
+The console report and the fit YAML label both numbers. In R, the marginal is
+`fit$importance_sampling$minus2_log_likelihood`. AIC and BIC come from `ofv`, so
 they differ from NONMEM's IMP objective in the same way. The console report prints:
 
 ```
