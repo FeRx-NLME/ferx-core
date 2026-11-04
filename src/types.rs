@@ -6726,7 +6726,9 @@ pub struct ImportanceSamplingResult {
     /// size fraction fell below `FitOptions::imp_low_ess_threshold`. Empty list
     /// means every subject's proposal matched its posterior well.
     pub low_ess_subjects: Vec<(String, f64)>,
-    /// Number of importance samples drawn per subject (`FitOptions::imp_samples`).
+    /// Number of importance samples drawn per subject (`FitOptions::imp_samples`,
+    /// or `impmap_samples` for IMPMAP). This is the configured count: the final
+    /// evaluation does not inherit a count ramped up by `imp_auto`/`impmap_auto`.
     pub n_samples: usize,
     /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`);
     /// `f64::INFINITY` for a multivariate-normal proposal.
@@ -9504,13 +9506,14 @@ pub struct FitOptions {
     /// covariate dimensions has very poor ESS. Set `false` only to diagnose the
     /// RB path against the full-dimensional sampler.
     pub frem_rao_blackwell: bool,
-    /// Adaptive importance-sample count for IMP (NONMEM `AUTO`/`STDOBJ`). When
-    /// `true` (the default), `imp_samples` is the *starting* count and is ramped
-    /// up (×2 per iteration, capped at 10000) whenever the objective's Monte-Carlo
-    /// standard deviation exceeds 1.0, so high-dimensional / FREM fits reach a
-    /// low-noise objective automatically instead of carrying a sample-count-
-    /// dependent M-step bias. Low-dimensional, well-sampled fits never trip the
-    /// threshold, so there is no cost there. Set `false` to pin the sample count.
+    /// Adaptive importance-sample count for IMP (NONMEM `AUTO`). When `true` (the
+    /// default), `imp_samples` is the *starting* count and is doubled after each
+    /// iteration, up to 10000, while the **per-subject** objective Monte-Carlo SE
+    /// (the total SE over √N) exceeds 0.05. K never comes back down. High-dimensional
+    /// / FREM fits then reach a low-noise objective instead of carrying a sample-count-
+    /// dependent M-step bias, but a fit that stays above the target runs at the cap,
+    /// at about ten times the per-iteration cost of K = 1000. Set `false` to pin the
+    /// sample count.
     pub imp_auto: bool,
     /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
     /// [`FitOptions::imp_auto`] but ramps `impmap_samples`. Default `true`.
