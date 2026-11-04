@@ -9927,11 +9927,22 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
     let mut plateau = (100.0, 20usize, 32usize);
     // The cold solve carries a κ cell per subject, so its warm starts (η then κ, #2674)
     // differ from its bare η: the cache must be built from this solve, κ included.
+    // Subject 1 differs from subject 0 in both η and κ, so cross-wiring subjects reddens it.
     let cold = IncumbentSolve {
-        kappas: vec![vec![DVector::from_element(1, 0.7)]; 2],
+        etas: vec![
+            DVector::from_element(2, -0.5),
+            DVector::from_vec(vec![-0.4, -0.3]),
+        ],
+        kappas: vec![
+            vec![DVector::from_element(1, 0.7)],
+            vec![DVector::from_element(1, 0.8)],
+        ],
         ..warm(-0.5)
     };
-    let cold_modes = vec![DVector::from_vec(vec![-0.5, -0.5, 0.7]); 2];
+    let cold_modes = vec![
+        DVector::from_vec(vec![-0.5, -0.5, 0.7]),
+        DVector::from_vec(vec![-0.4, -0.3, 0.8]),
+    ];
     let model = make_model();
     absorb_cold_incumbent(
         &mut state,
@@ -10001,9 +10012,9 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
 /// reddened the no-restart assertion, but on Linux it still finishes in one leg (169
 /// evaluations to 775.394259). That hand-off is pinned at Tier 1 instead, by
 /// `an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two`: the helper
-/// builds the warm starts from the solve it records (η then κ), so the call site passes no
-/// separate modes to get wrong (#2674). Note also that the probe's share on Linux is not off
-/// its gate: 2 of 200 sits exactly on the 1 % boundary.
+/// builds the warm starts from the solve it records, so the call site passes no
+/// separate modes to get wrong (#2674). Note also that on Linux the probe's 2 of 200 sits
+/// exactly on the 1 % boundary: a one-subject drift would flip the restart arm.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),

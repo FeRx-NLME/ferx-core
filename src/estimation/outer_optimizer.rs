@@ -3482,7 +3482,8 @@ fn basin_probe_reference(
 
 /// Make the mid-leg probe's cold solve the leg's incumbent when it absorbs it (#2600):
 /// `ofv = (penalized, clean)` at `solve.xs` and its EBE state `solve`. The warm starts are
-/// built here from `solve` itself ([`outer_cache_warm_starts`]: η then κ cells), so the
+/// built here from `solve` itself ([`outer_cache_warm_starts`]: η then κ cells, or η alone
+/// on ODE+IOV), so the
 /// cache cannot be handed modes from any other solve than the one recorded (#2674).
 ///
 /// Every tracker an evaluation's improvement is measured against moves to the cold
