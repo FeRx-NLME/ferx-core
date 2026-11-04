@@ -3780,6 +3780,11 @@ fn a_diverged_marginal_reaches_the_published_verdict() {
     }
 }
 
+/// A published marginal, for the settling tests.
+fn final_marginal(value: f64, mc_se: f64) -> Option<crate::estimation::impmap::FinalMarginal> {
+    Some(crate::estimation::impmap::FinalMarginal { value, mc_se })
+}
+
 /// A trail of `n` iterations: a first third that is never read, then two windows whose
 /// floors are `previous` and `last`.
 fn settling_trail(
@@ -3819,8 +3824,9 @@ fn a_falling_objective_demotes_the_fit_and_asks_for_iterations() {
     use crate::api::postfit::MCEM_NOT_SETTLED_TOKEN;
     let trail = settling_trail(150, 1036.04, 1005.52, 0.29, "IMP");
     let mut converged = true;
-    let (msg, entry) = mcem_settling_warning(&mut converged, Some(&trail), Some(1004.72))
-        .expect("the vancomycin run passed");
+    let (msg, entry) =
+        mcem_settling_warning(&mut converged, Some(&trail), final_marginal(1004.72, 0.23))
+            .expect("the vancomycin run passed");
     assert!(!converged);
     assert!(
         msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")),
@@ -3859,8 +3865,9 @@ fn a_floor_above_the_marginal_demotes_the_fit_and_asks_for_better_sampling() {
     use crate::api::postfit::MCEM_NOT_SETTLED_TOKEN;
     let trail = settling_trail(150, 4327.48, 4330.41, 2.54, "IMP");
     let mut converged = true;
-    let (msg, entry) = mcem_settling_warning(&mut converged, Some(&trail), Some(4288.06))
-        .expect("the cefepime run passed");
+    let (msg, entry) =
+        mcem_settling_warning(&mut converged, Some(&trail), final_marginal(4288.06, 1.09))
+            .expect("the cefepime run passed");
     assert!(!converged);
     assert!(
         msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")),
@@ -3872,6 +3879,7 @@ fn a_floor_above_the_marginal_demotes_the_fit_and_asks_for_better_sampling() {
     assert!(msg.contains("floor was 4330.41"), "{msg}");
     assert!(msg.contains("marginal of 4288.06"), "{msg}");
     assert!(msg.contains("Monte-Carlo SE 2.54"), "{msg}");
+    assert!(msg.contains("(SE 1.09)"), "{msg}");
     assert!(msg.contains("not sampling the posterior well"), "{msg}");
     assert!(msg.contains("short of the optimum"), "{msg}");
     assert!(msg.contains("Raise `imp_samples`"), "{msg}");
@@ -3889,11 +3897,12 @@ fn a_floor_above_the_marginal_demotes_the_fit_and_asks_for_better_sampling() {
     assert_eq!(details["window"], 50);
     assert_eq!(details["floor"], 4330.41);
     assert_eq!(details["marginal"], 4288.06);
+    assert_eq!(details["marginal_mc_se"], 1.09);
     assert_eq!(details["mc_se"], 2.54);
 
     let trail = settling_trail(150, 4327.48, 4330.41, 2.54, "IMPMAP");
-    let (msg, _) =
-        mcem_settling_warning(&mut true, Some(&trail), Some(4288.06)).expect("IMPMAP passed");
+    let (msg, _) = mcem_settling_warning(&mut true, Some(&trail), final_marginal(4288.06, 1.09))
+        .expect("IMPMAP passed");
     assert!(msg.contains("Raise `impmap_samples`"), "{msg}");
     assert!(msg.contains("(`impmap_proposal_df`)"), "{msg}");
     assert!(!msg.contains("`imp_samples`"), "{msg}");
@@ -3932,8 +3941,11 @@ fn a_settled_run_and_a_non_mcem_fit_are_left_alone() {
     let settled = settling_trail(150, 100.0, 100.0, 0.1, "IMP");
     for verdict in [true, false] {
         let mut converged = verdict;
-        assert!(mcem_settling_warning(&mut converged, Some(&settled), Some(100.0)).is_none());
-        assert!(mcem_settling_warning(&mut converged, None, Some(1.0)).is_none());
+        assert!(
+            mcem_settling_warning(&mut converged, Some(&settled), final_marginal(100.0, 0.1))
+                .is_none()
+        );
+        assert!(mcem_settling_warning(&mut converged, None, final_marginal(1.0, 0.1)).is_none());
         assert_eq!(converged, verdict);
     }
 }
@@ -4090,12 +4102,12 @@ fn a_run_stopped_while_falling_reaches_the_published_verdict() {
         .unwrap_or_else(|| panic!("{:?}", bad.warnings));
     let details = entry.details.as_ref().unwrap();
     assert_eq!(details["reason"], "above_marginal");
-    let marginal = bad
+    let published = bad
         .importance_sampling
         .as_ref()
-        .expect("marginal published")
-        .minus2_log_likelihood;
-    assert_eq!(details["marginal"], marginal);
+        .expect("marginal published");
+    assert_eq!(details["marginal"], published.minus2_log_likelihood);
+    assert_eq!(details["marginal_mc_se"], published.mc_standard_error);
 }
 
 /// The rise arm through `fit()`: `mcem_lowest_objective` has to survive from the loop to

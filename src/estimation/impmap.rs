@@ -232,6 +232,15 @@ pub(crate) struct McemObjectiveTrail {
     pub(crate) proposal_option: &'static str,
 }
 
+/// The final marginal [`McemObjectiveTrail::settling`] compares the floor with. Its SE
+/// is its own: the final pass draws the configured sample count, which `imp_auto` can
+/// leave far below what the iterations ramped to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FinalMarginal {
+    pub(crate) value: f64,
+    pub(crate) mc_se: f64,
+}
+
 /// What [`McemObjectiveTrail::settling`] found.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum McemSettling {
@@ -249,7 +258,7 @@ pub(crate) enum McemSettling {
     AboveMarginal {
         window: usize,
         floor: f64,
-        marginal: f64,
+        marginal: FinalMarginal,
         mc_se: f64,
     },
 }
@@ -271,13 +280,16 @@ impl McemObjectiveTrail {
     /// run a fixed schedule, so every run ends at the iteration limit.
     ///
     /// Reads the floor of the last window, and asks two things of it. A gap counts when
-    /// it exceeds both [`MCEM_SETTLE_MIN_GAP`] and [`MCEM_SETTLE_NOISE_RATIO`] MC SEs.
+    /// it exceeds both [`MCEM_SETTLE_MIN_GAP`] and [`MCEM_SETTLE_NOISE_RATIO`] MC SEs of
+    /// what it compares: the window's for two floors, and that combined with the
+    /// marginal's for a floor and a marginal, which are independent estimates.
     ///
     /// * **Is it still falling?** Against the floor of the window before. This is the
     ///   run that needs more iterations.
     /// * **Is it above the marginal?** `marginal` is scored at the final estimates with
     ///   a fresh proposal. Iterations that never come near it were not sampling the
-    ///   posterior, so nothing in the trace shows the run reached an optimum.
+    ///   posterior, so nothing in the trace shows the run reached an optimum. A marginal
+    ///   without a finite value and SE cannot convict a run of this.
     ///
     /// **The floor, not the spread.** A failed proposal misses posterior mass, so it
     /// only ever raises an iteration's objective. A normal proposal makes these
@@ -295,11 +307,11 @@ impl McemObjectiveTrail {
     /// | Gap | Widest on a healthy run | On a run short of the optimum |
     /// |---|---|---|
     /// | floor fell | 1.78 (infliximab) | 30.5 (vancomycin at 1004.72, best 996.75) |
-    /// | floor above marginal | 3.86 at 1.7 SEs (chained cefepime) | 42.4 and 69.2 (cefepime at 4288.06 and 4298.55, best 4277) |
+    /// | floor above marginal | 3.86 at 1.5 SEs (chained cefepime) | 42.4 and 69.2 (cefepime at 4288.06 and 4298.55, best 4277) |
     ///
     /// The noise term decides that 3.86, which the minimum alone would convict. It sits
     /// on a good estimate: cefepime's low-ESS subjects keep its objective noisy.
-    pub(crate) fn settling(&self, marginal: Option<f64>) -> McemSettling {
+    pub(crate) fn settling(&self, marginal: Option<FinalMarginal>) -> McemSettling {
         use crate::estimation::vi::run::median_and_mad;
         let n = self.objectives.len();
         let window = MCEM_SETTLE_WINDOW.min(n / 3);
@@ -314,8 +326,8 @@ impl McemObjectiveTrail {
         ) else {
             return McemSettling::TooShort;
         };
-        let material = MCEM_SETTLE_MIN_GAP.max(MCEM_SETTLE_NOISE_RATIO * mc_se);
-        if previous_floor - floor > material {
+        let material = |se: f64| MCEM_SETTLE_MIN_GAP.max(MCEM_SETTLE_NOISE_RATIO * se);
+        if previous_floor - floor > material(mc_se) {
             return McemSettling::Falling {
                 window,
                 previous_floor,
@@ -323,13 +335,16 @@ impl McemObjectiveTrail {
                 mc_se,
             };
         }
-        match marginal.filter(|m| m.is_finite()) {
-            Some(marginal) if floor - marginal > material => McemSettling::AboveMarginal {
-                window,
-                floor,
-                marginal,
-                mc_se,
-            },
+        // Filtered first: `f64::max` would discard a `NaN` SE and leave the bare minimum.
+        match marginal.filter(|m| m.value.is_finite() && m.mc_se.is_finite()) {
+            Some(marginal) if floor - marginal.value > material(mc_se.hypot(marginal.mc_se)) => {
+                McemSettling::AboveMarginal {
+                    window,
+                    floor,
+                    marginal,
+                    mc_se,
+                }
+            }
             _ => McemSettling::Settled,
         }
     }
@@ -5004,6 +5019,11 @@ mod tests {
         ProposalRecenter::SampleMoments.objective_trail(objectives, vec![mc_se; 150], "IMP")
     }
 
+    /// A marginal with no noise of its own, for tests about the floor.
+    fn exact(value: f64) -> Option<FinalMarginal> {
+        Some(FinalMarginal { value, mc_se: 0.0 })
+    }
+
     /// Two windows of 50, at the two floors given. Most of each window sits 10 above its
     /// floor, so the floor is what the test has to read.
     fn two_windows(previous_floor: f64, floor: f64, mc_se: f64) -> McemObjectiveTrail {
@@ -5020,21 +5040,23 @@ mod tests {
     /// thioguanine run swings by more than either, and chained cefepime is noisy.
     #[test]
     fn settling_separates_the_measured_runs() {
-        let settling = |tail: &[f64], se, marginal| trail_ending_in(tail, se).settling(marginal);
+        let settling = |tail: &[f64], se, value, mc_se| {
+            trail_ending_in(tail, se).settling(Some(FinalMarginal { value, mc_se }))
+        };
         assert!(matches!(
-            settling(&VANCOMYCIN_NORMAL, 0.29, Some(1004.72)),
+            settling(&VANCOMYCIN_NORMAL, 0.29, 1004.72, 0.23),
             McemSettling::Falling { window: 50, .. }
         ));
         assert!(matches!(
-            settling(&CEFEPIME_NORMAL, 2.54, Some(4288.06)),
+            settling(&CEFEPIME_NORMAL, 2.54, 4288.06, 1.09),
             McemSettling::AboveMarginal { window: 50, .. }
         ));
         assert_eq!(
-            settling(&THIOGUANINE_NORMAL_S777, 0.69, Some(-249.82)),
+            settling(&THIOGUANINE_NORMAL_S777, 0.69, -249.82, 0.23),
             McemSettling::Settled
         );
         assert_eq!(
-            settling(&CEFEPIME_CHAINED, 2.24, Some(4277.29)),
+            settling(&CEFEPIME_CHAINED, 2.24, 4277.29, 1.26),
             McemSettling::Settled
         );
     }
@@ -5065,12 +5087,12 @@ mod tests {
         );
         // Marginal arm, the same three cases.
         let flat = |se| two_windows(100.0, 100.0, se);
-        assert_eq!(flat(0.1).settling(Some(97.0)), McemSettling::Settled);
+        assert_eq!(flat(0.1).settling(exact(97.0)), McemSettling::Settled);
         assert!(matches!(
-            flat(0.1).settling(Some(95.0)),
+            flat(0.1).settling(exact(95.0)),
             McemSettling::AboveMarginal { .. }
         ));
-        assert_eq!(flat(2.0).settling(Some(95.0)), McemSettling::Settled);
+        assert_eq!(flat(2.0).settling(exact(95.0)), McemSettling::Settled);
     }
 
     /// The reported values, each distinct so that swapping two fails.
@@ -5086,11 +5108,17 @@ mod tests {
             }
         );
         assert_eq!(
-            two_windows(100.0, 100.0, 0.5).settling(Some(90.0)),
+            two_windows(100.0, 100.0, 0.5).settling(Some(FinalMarginal {
+                value: 90.0,
+                mc_se: 0.25,
+            })),
             McemSettling::AboveMarginal {
                 window: 50,
                 floor: 100.0,
-                marginal: 90.0,
+                marginal: FinalMarginal {
+                    value: 90.0,
+                    mc_se: 0.25,
+                },
                 mc_se: 0.5,
             }
         );
@@ -5105,7 +5133,7 @@ mod tests {
             McemSettling::Settled
         );
         assert_eq!(
-            two_windows(100.0, 100.0, 0.1).settling(Some(120.0)),
+            two_windows(100.0, 100.0, 0.1).settling(exact(120.0)),
             McemSettling::Settled
         );
     }
@@ -5169,7 +5197,12 @@ mod tests {
         assert_eq!(t.settling(None), McemSettling::TooShort);
         let flat = two_windows(100.0, 100.0, 0.1);
         for marginal in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
-            assert_eq!(flat.settling(Some(marginal)), McemSettling::Settled);
+            assert_eq!(flat.settling(exact(marginal)), McemSettling::Settled);
+        }
+        // A marginal whose own SE is unusable cannot convict either, even at a gap of 50.
+        for mc_se in [f64::NAN, f64::INFINITY] {
+            let marginal = Some(FinalMarginal { value: 50.0, mc_se });
+            assert_eq!(flat.settling(marginal), McemSettling::Settled);
         }
     }
 
@@ -5183,6 +5216,45 @@ mod tests {
         assert!(matches!(
             t.settling(None),
             McemSettling::Falling { mc_se, .. } if mc_se == 0.5
+        ));
+    }
+
+    /// The final pass draws the configured count while `imp_auto` ramps the iterations,
+    /// so the marginal can be the noisier of the two. The gap here is 20: far past 4 of
+    /// the window's SEs, and within 4 of the marginal's. The SEs combine, so a gap that
+    /// clears each alone (5.0 > 4 · 1) can still fall short of both (4 · √2 = 5.66).
+    #[test]
+    fn a_noisy_marginal_cannot_convict_a_settled_trace() {
+        let flat = |se| two_windows(100.0, 100.0, se);
+        let marginal = |value, mc_se| Some(FinalMarginal { value, mc_se });
+        assert!(matches!(
+            flat(0.1).settling(marginal(80.0, 0.1)),
+            McemSettling::AboveMarginal { .. }
+        ));
+        assert_eq!(
+            flat(0.1).settling(marginal(80.0, 6.0)),
+            McemSettling::Settled
+        );
+        assert_eq!(
+            flat(1.0).settling(marginal(95.0, 1.0)),
+            McemSettling::Settled
+        );
+        assert!(matches!(
+            flat(1.0).settling(marginal(94.0, 1.0)),
+            McemSettling::AboveMarginal { .. }
+        ));
+    }
+
+    /// The marginal's SE judges only the marginal: two floors share no such noise.
+    #[test]
+    fn a_noisy_marginal_does_not_excuse_a_falling_floor() {
+        let noisy = Some(FinalMarginal {
+            value: 100.0,
+            mc_se: 50.0,
+        });
+        assert!(matches!(
+            two_windows(120.0, 100.0, 0.1).settling(noisy),
+            McemSettling::Falling { .. }
         ));
     }
 

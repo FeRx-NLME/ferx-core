@@ -3063,7 +3063,12 @@ fn fit_inner(
     if let Some((msg, entry)) = mcem_settling_warning(
         &mut converged,
         result.mcem_objective_trail.as_ref(),
-        is_result.as_ref().map(|r| r.minus2_log_likelihood),
+        is_result
+            .as_ref()
+            .map(|r| crate::estimation::impmap::FinalMarginal {
+                value: r.minus2_log_likelihood,
+                mc_se: r.mc_standard_error,
+            }),
     ) {
         warnings.push(msg);
         native_warnings.push(entry);

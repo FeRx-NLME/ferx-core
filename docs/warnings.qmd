@@ -805,7 +805,7 @@ The checks on an IMP / IMPMAP fit carry these keys under the `convergence` code.
 |------|----------------|
 | `convergence` (`W_NONFINITE_MARGINAL` only) | `marginal`, `reason` |
 | `convergence` (`W_MCEM_OBJECTIVE_ROSE` only) | `marginal`, `lowest_iteration_objective`, `rise`, `tolerance` |
-| `convergence` (`W_MCEM_NOT_SETTLED` only) | `reason` (`falling` or `above_marginal`), `window`, `floor`, `mc_se`, and `previous_floor` or `marginal` |
+| `convergence` (`W_MCEM_NOT_SETTLED` only) | `reason` (`falling` or `above_marginal`), `window`, `floor`, `mc_se`, and either `previous_floor` or `marginal` and `marginal_mc_se` |
 | `convergence` (`W_MCEM_SETTLING_UNTESTED` only) | `iterations`, `needed` |
 
 ### When `details` is absent

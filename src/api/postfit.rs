@@ -2132,7 +2132,7 @@ pub(crate) fn mcem_marginal_warning(
 pub(crate) fn mcem_settling_warning(
     converged: &mut bool,
     trail: Option<&crate::estimation::impmap::McemObjectiveTrail>,
-    marginal: Option<f64>,
+    marginal: Option<crate::estimation::impmap::FinalMarginal>,
 ) -> Option<(String, WarningEntry)> {
     use crate::estimation::impmap::{McemSettling, MCEM_SETTLE_MIN_WINDOW};
     let trail = trail?;
@@ -2185,17 +2185,18 @@ pub(crate) fn mcem_settling_warning(
             let msg = format!(
                 "{MCEM_NOT_SETTLED_TOKEN}: {label}: the iteration objective stayed well above \
                  the final marginal, so the fit is reported converged: false. Over the last \
-                 {window} iterations its floor was {floor:.2} against a marginal of \
-                 {marginal:.2} (Monte-Carlo SE {mc_se:.2}), so the iterations were not sampling \
+                 {window} iterations its floor was {floor:.2} (Monte-Carlo SE {mc_se:.2}) \
+                 against a marginal of {:.2} (SE {:.2}), so the iterations were not sampling \
                  the posterior well and the estimates may be short of the optimum. Raise `{}`, \
                  use a heavy-tailed proposal (`{}`), or chain a FOCE/FOCEI stage first.",
-                trail.samples_option, trail.proposal_option
+                marginal.value, marginal.mc_se, trail.samples_option, trail.proposal_option
             );
             let details = serde_json::json!({
                 "reason": "above_marginal",
                 "window": window,
                 "floor": floor,
-                "marginal": marginal,
+                "marginal": marginal.value,
+                "marginal_mc_se": marginal.mc_se,
                 "mc_se": mc_se,
             });
             (WarningSeverity::Critical, msg, details)

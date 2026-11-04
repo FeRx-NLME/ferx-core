@@ -413,7 +413,9 @@ checks the end of the iteration trace, and reports `converged: false` with
 The check reads the objective's *floor*: the lower 10% point of the last 50 iterations.
 A shorter run uses windows of a third of its length, so it never reads the first third,
 where a cold start descends. A gap counts when it exceeds both 3.84, one likelihood-ratio
-step, and 4 times the window's median Monte-Carlo SE.
+step, and 4 Monte-Carlo SEs. For two floors that is the window's median SE. For a floor
+against the marginal it also includes the marginal's own SE, since the final pass does
+not inherit a sample count ramped up by `imp_auto`.
 
 | What the floor shows | What it means | What to do |
 |---|---|---|
@@ -428,7 +430,7 @@ upward excursions on runs whose estimates are fine, so a wide trace alone proves
 
 The bounds were measured on Linux, on the six models of a comparison with NONMEM, at
 K = 1000 and 200 iterations. On healthy runs the floor fell by at most 1.78, and sat at
-most 3.86 above the marginal, which is 1.7 Monte-Carlo SEs. The two cold runs that
+most 3.86 above the marginal, which is 1.5 Monte-Carlo SEs. The two cold runs that
 NONMEM's own evaluator scored short of the optimum read 30.5 (vancomycin, falling) and
 42.4 (cefepime, above the marginal).
 
