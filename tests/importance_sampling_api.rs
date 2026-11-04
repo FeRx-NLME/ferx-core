@@ -105,6 +105,27 @@ fn imp_duplicated_in_chain_is_rejected() {
     );
 }
 
+/// #2651: every subject used to come back with ESS 0 and −2 log L = inf.
+#[test]
+fn imp_eval_only_evaluates_a_normal_proposal() {
+    let (model, population, mut opts) = warfarin_setup();
+    opts.methods = vec![EstimationMethod::Imp];
+    opts.imp_proposal_df = f64::INFINITY;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("method = [imp] with a normal proposal must produce a fit");
+    let imp = result
+        .importance_sampling
+        .as_ref()
+        .expect("importance_sampling field should be populated");
+    assert!(
+        imp.minus2_log_likelihood.is_finite(),
+        "-2 LL must be finite, got {}",
+        imp.minus2_log_likelihood
+    );
+    assert!(imp.ess_min > 0.0, "ess_min {}", imp.ess_min);
+    assert!(imp.proposal_df.is_infinite());
+}
+
 #[test]
 fn imp_after_focei_populates_field() {
     let (model, population, mut opts) = warfarin_setup();
@@ -253,6 +274,8 @@ fn imp_defensive_mixture_runs_for_both_alpha_branches() {
     // degenerate. This exercises both sampler branches in the fast PR job.
     let (model, population, mut opts) = warfarin_setup();
     opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
+    // An adaptive evaluation floors alpha, which would make the arms one arm.
+    opts.imp_adapt_passes = 0;
 
     opts.imp_defensive_alpha = 0.1;
     let with_mix = fit(&model, &population, &model.default_params, &opts)

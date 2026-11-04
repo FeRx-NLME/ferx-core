@@ -1700,6 +1700,25 @@ fn warning_entry_with_severity(
     }
 }
 
+/// The `[odes]` RHS-route note (#2681) as a fit warning, once per fit: informational,
+/// with the construct that kept the interpreter (or why no native code) in `details`.
+/// `None` for a model with no `[odes]` block or one whose RHS runs as native code.
+pub(crate) fn ode_rhs_route_warning(model: &CompiledModel) -> Option<(String, WarningEntry)> {
+    let (_, msg, details) = model
+        .ode_spec
+        .as_ref()?
+        .rhs_program
+        .as_ref()?
+        .route_note()?;
+    let entry = warning_entry_with_severity(
+        WarningSeverity::Info,
+        WarningCode::OdeRhsRoute,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
+}
+
 /// Shared scaffold for the list-style fit-end warnings: given a set of `hits`,
 /// return `None` when empty, otherwise join a human `list` string (`line` per
 /// hit), format the message (`msg` over the joined list), build the structured
@@ -2034,6 +2053,79 @@ pub(crate) fn nonfinite_objective_warning(
     );
     Some((msg, entry))
 }
+
+/// Demote a fit whose importance-sampling marginal shows the run failed, and say
+/// which way (#2652).
+///
+/// `ofv` is not the number at stake here. Under IMP / IMPMAP it is a Laplace pass, so
+/// `nonfinite_objective_warning` never saw the two fits this exists for: cefepime with
+/// a marginal of `inf` (before #2651), and cefepime with a marginal of 13,354.7 (Linux,
+/// before #2650) against NONMEM's 4282.9. Both reported `converged: true`.
+///
+/// * **Unusable marginal.** The same two rules as
+///   `impmap::gate_converged_on_mcem_objective`. This arm also covers an
+///   `imp_eval_only` readout, where the estimates are another stage's: the fit still
+///   publishes a marginal it cannot stand behind.
+/// * **Risen marginal.** See `impmap::mcem_objective_rise`. `lowest` is `None` when
+///   no MCEM stage produced the reported estimates, so this arm needs an estimating
+///   IMP / IMPMAP stage.
+///
+/// `marginal` is `None` when no marginal was published, which leaves the verdict alone:
+/// an estimating stage whose marginal pass was skipped is not checked for a rise.
+pub(crate) fn mcem_marginal_warning(
+    converged: &mut bool,
+    marginal: Option<f64>,
+    lowest: Option<f64>,
+    n_obs: usize,
+) -> Option<(String, WarningEntry)> {
+    use crate::estimation::impmap::{
+        mcem_objective_rise, objective_converged, MCEM_RISE_TOLERANCE,
+    };
+    use crate::estimation::outer_optimizer::{nonfinite_objective_reason, ofv_is_valid};
+    let marginal = marginal?;
+    let (msg, details) = if !(ofv_is_valid(marginal) && objective_converged(marginal)) {
+        let reason = nonfinite_objective_reason(marginal);
+        let msg = format!(
+            "{NONFINITE_MARGINAL_TOKEN}: the importance-sampling marginal −2 log L at the final \
+             estimates is {reason} ({marginal:?}), so the fit is reported converged: false."
+        );
+        let details = serde_json::json!({
+            "marginal": json_value(marginal),
+            "reason": reason,
+        });
+        (msg, details)
+    } else {
+        let lowest = lowest?;
+        let rise = mcem_objective_rise(marginal, lowest, n_obs)?;
+        let msg = format!(
+            "{MCEM_OBJECTIVE_ROSE_TOKEN}: the importance-sampling marginal −2 log L at the final \
+             estimates ({marginal:.4}) is {rise:.4} above the lowest value the iterations \
+             reached ({lowest:.4}), so the fit is reported converged: false. An EM iteration \
+             should not raise the objective, so the run left that point and did not return."
+        );
+        let details = serde_json::json!({
+            "marginal": marginal,
+            "lowest_iteration_objective": lowest,
+            "rise": rise,
+            "tolerance": MCEM_RISE_TOLERANCE,
+        });
+        (msg, details)
+    };
+    *converged = false;
+    let entry = warning_entry_with_severity(
+        WarningSeverity::Critical,
+        WarningCode::Convergence,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
+}
+
+/// Stable token of [`mcem_marginal_warning`]'s unusable-marginal arm.
+pub(crate) const NONFINITE_MARGINAL_TOKEN: &str = "W_NONFINITE_MARGINAL";
+
+/// Stable token of [`mcem_marginal_warning`]'s risen-marginal arm.
+pub(crate) const MCEM_OBJECTIVE_ROSE_TOKEN: &str = "W_MCEM_OBJECTIVE_ROSE";
 
 /// How many subjects `W_NONFINITE_OBJECTIVE`'s message names before it says "and N
 /// more"; the `details` payload lists every one (#2038).

@@ -264,6 +264,7 @@ above.
 | `input_rate` forcing + SDE `[diffusion]` | both | both | stochastic dynamics have no recorder |
 | `weibull` + estimated lagtime | both | both | the onset can diverge for shape `β < 1` |
 | SS + an RHS reading `TIME`/`T`/`TAFD`, or `TAD` with a lagged SS dose | ODE | both | an absolute clock has no periodic steady state; the lagged pre-arrival window's `TAD` convention is open (#1126). A `TAD`-only RHS under unlagged SS is analytic |
+| an `[odes]` `if` that switches at a time a parameter moves, directly (`if (tau > LAGT)`) or through a state (`if (central > 20)`) | ODE | both | the walk knows lagged doses and windows as events, not a boundary written in the equations, so the state's sensitivity jump at the switch is missing (#2649). A parse warning names a parameter |
 | a reset or covariate change exactly on a moving boundary (a lagged arrival, a moving window end), or two moving boundaries coinciding | closed-form | both | the walk resolves one dual position per break time. An *observation* on a moving boundary is analytic ([below](#sampling-on-a-moving-boundary)) |
 | more than 48 random effects (stacked `[η, κ]` under IOV; 24 for Laplace's exact anchor, 8 for its exact R-matrix) | both | both | the widest dispatch bucket of the adjoint |
 | a TTE hazard built through the Rust API without a compiled program | both | both | no dual-evaluable hazard program to differentiate |
@@ -853,6 +854,34 @@ reproductions, and they land differently:
 Neither is a general escape: starve the inner loop harder and BOBYQA is rejected at every
 trial too, carrying `W_NO_FEASIBLE_EVAL` like any other route.
 
+#### A start rejected cold is re-solved warm {#no-feasible-evaluation-start}
+
+The guard exists to reject a *step*: the optimizer backs away from it to the best point it
+has. Its very first evaluation has no such point, and the EBE warm-start cache stays at
+η = 0 until an evaluation is accepted, so a start whose cold inner solve leaves more than
+`max_unconverged_frac` of the subjects unconverged used to be re-solved cold at every later
+trial as well — each rejected the same way, the fit walking toward the box centre
+([#2682](https://github.com/FeRx-NLME/ferx-core/issues/2682)).
+
+So when the guard rejects the **first** evaluation on its unconverged fraction, the inner
+loop is run once more at the same parameters, warm from the EBEs the cold solve just found,
+and that second solve is what the guard judges. If it is accepted the fit proceeds from it;
+if it is still rejected, the evaluation is reported exactly as before, from the cold solve.
+A start rejected because a subject was rejected at its inner start, or because the
+objective is not finite, is not re-solved. Fits with a profiled θ level block do the same
+with their first profile solve, re-solving the levels and EBEs from the ones it found. On `examples/two_cpt_oral_cov.ferx` at
+`inner_maxiter = 3`, 17 of 30 subjects are unconverged from the cold start; re-solved warm,
+none are, and the start scores −1040.033385, the objective the default inner budget gives
+it in one cold solve (−1040.033394).
+
+With `verbose = true` a rejected evaluation prints as a rejection, with the count behind it,
+rather than as the rejection penalty in an `OFV =` line:
+
+```text
+Eval    1: start rejected by the EBE convergence guard (17 of 30 subjects unconverged from the cold start); re-solved warm from its own EBEs: 0 unconverged, accepted
+Eval    1: OFV = -1040.033385
+```
+
 ### When the fit ends above its start {#above-start}
 
 The best-seen restore ranks only the evaluations the EBE guard accepted, so a **starting
@@ -910,6 +939,23 @@ converged. `gn` and `gn_hybrid` (including its FOCE-I polish) do not run the che
 On that transit fit, `max_unconverged_frac = 0.3` lets the optimizer rank the start: the
 same L-BFGS fit then stays at OFV −228.8107 (macOS), reported with `W_STALLED_AT_INIT`,
 which is the honest verdict for a fit handed its own optimum.
+
+#### When the start cannot be scored {#above-start-unscored}
+
+A profiled fit's first evaluation can fail outright instead of being rejected: its profile
+solve needs the subjects' inner loops, and with too small an `inner_maxiter` it returns no
+objective at all. Such a start is **re-scored once**, at your starting estimates, as an
+evaluation-only run at the default `inner_maxiter = 200`, and the fit is held against that
+([#2619](https://github.com/FeRx-NLME/ferx-core/issues/2619)). The `W_ABOVE_START` message
+then says the start failed at your `inner_maxiter` and names the budget it was re-scored
+at. On the MBMA fixture above with `inner_maxiter = 1` the start fails, the re-score gives
+26.47 (the same at budgets 3, 50 and 200), and the run ends at the same 66.02 as with
+`inner_maxiter = 2`, so it is now reported not converged too.
+
+The start is left unscored, and not compared, when it fails at `inner_maxiter` of 200 or
+more (a re-score would repeat the same solve), when the re-score fails as well, and in an
+evaluation-only fit. The unprofiled loop never needs this: an inner loop that runs out of
+iterations still scores, and the guard rejects the start as above.
 
 ## Warm Starting
 
@@ -987,13 +1033,14 @@ When the outer optimizer stops, ferx restores the best point it saw
 the EBEs that reach the sdtab, the covariance step and the reported objective come from that
 solve, not from the trajectory.
 
-That solve runs **cold**, from η = 0. When its objective reproduces the best value the
-optimizer saw, it is what the fit reports and nothing else runs — which is the ordinary case,
-and it costs exactly what it always did.
+That solve runs **cold**, from η = 0. When it reproduces the best value the optimizer saw, in
+total and for every subject, to within **0.05 OFV units**, it is what the fit reports and no
+further solve runs. That is the ordinary case.
 
 When it does **not** reproduce that value, two more candidates are scored on the same
 objective: the EBEs the optimizer was minimising against, exactly as it left them, and a
-re-solve seeded from those. The lowest of the three is reported. Before
+re-solve seeded from those. Each subject then keeps its lowest (see
+[below](#final-ebes-per-subject)). Before
 [#833](https://github.com/FeRx-NLME/ferx-core/issues/833) only the cold solve ran, so where it
 settled at a different η̂ than the trajectory had, the reported OFV came out *above* the
 best-seen value the point had just been restored for (+3.5 on a fluconazole 2-cpt binding
@@ -1001,9 +1048,38 @@ model), and the covariance step ran at those different EBEs. The held EBEs are s
 candidate in their own right, not merely used as a seed, because a re-solve is not guaranteed
 to improve on the point it starts from.
 
-The comparison is also a diagnostic. A cold re-solve that lands materially worse — or returns
-no usable number at all — raises the `ebe_start_dependent` warning (see
-[Warnings](../warnings.qmd#codes-convergence-fit)), which quotes both objectives. The estimates are
+#### Each subject keeps its lowest objective {#final-ebes-per-subject}
+
+The population objective is a sum over subjects, so the choice is made per subject, with a
+subject's η̂, `H` and κ̂ moving together
+([#2646](https://github.com/FeRx-NLME/ferx-core/issues/2646)). The best whole candidate is the
+start, and a subject leaves it only for another that scores more than 0.05 lower, so solver
+noise moves nobody. No single candidate need hold every subject's best: on a 15,660-subject
+vancomycin model (macOS arm64) the cold solve scored 186184.57 and the optimizer's EBEs
+186184.23, and the per-subject choice reported 186183.74, below both. Under `laplace` and AGQ the objective has no per-subject term of this
+form, so the whole candidates compete and the lowest total is reported.
+
+The 0.05 bound is absolute, like the [opposite direction's](#cold-solve-better). It used to be
+relative, `1e-3·(1 + |OFV|)`, which is 4.3 units at OFV 4,310 and 186 at OFV 186,000, so a cold
+solve 2.3 units above the best-seen value was reported as it stood, with no warning. It is
+also tested per subject, because the totals can agree while one subject is lower under the
+cold solve and another under the optimizer's EBEs. On the three benchmark models measured,
+every subject outside the named few agreed to better than `1e-3`, so the gap is a handful of
+subjects and not accumulated solver noise.
+
+**The lowest objective is not always the deepest individual mode.** The inner loop minimises
+the individual objective, and the OFV adds the `log|H|` term on top, which favours a wide mode
+over a narrow one. In all seven subjects behind those gaps the cold solve had found the *lower*
+individual objective, and the EBEs the fit keeps scored lower on the OFV only through `log|H|`.
+So a reported η̂ can be a mode the Sobol screen would have moved a subject away from. Those
+subjects are the ones the warning names; read their `IPRED` and `IWRES` with that in mind.
+
+#### The comparison as a diagnostic {#final-ebes-diagnostic}
+
+A cold re-solve that lands materially worse — or returns no usable number at all — raises the
+`ebe_start_dependent` warning (see [Warnings](../warnings.qmd#codes-convergence-fit)), which
+quotes both objectives and names the subjects the cold solve missed on, largest gap first (the
+first ten, then a count). The estimates are
 unaffected; what depends on the starting point is the EBEs at them, and so every diagnostic
 built on those (IPRED, IWRES, CWRES, shrinkage) plus the covariance step. Two things produce
 it, and the warning names both rather than guessing: an individual objective with more than one
@@ -1012,7 +1088,9 @@ mode at these estimates, and an `inner_maxiter` a cold start cannot converge wit
 
 The cold number is also what the convergence self-consistency check reads
 ([#751](https://github.com/FeRx-NLME/ferx-core/issues/751)); a fit whose "optimum" exists only
-under a warm start is still rejected.
+under a warm start is still rejected. That check keeps its relative `1e-3·(1 + |OFV|)` bound: it
+asks whether the fit converged, not which EBEs to report, so a fit can raise this warning and
+still be `converged: true`.
 
 #### When the cold solve is *better* {#cold-solve-better}
 
@@ -1050,6 +1128,16 @@ the probe stops the trapped first leg at its 33rd evaluation, where a cold solve
 cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` (Linux) the probe
 catches a trapped first leg at its 64th evaluation instead of the 96th, and the restart
 converges at −1173.56 either way (#2204).
+
+A probe ends the leg only when the gap comes from at least **1 % of the subjects** (#2600).
+On a large population a handful of subjects almost always sits in a lower cold mode: a
+5,937-subject FOCEI fit had every leg cut at its 32nd evaluation, by 3 to 19 subjects, and
+ended with |g|∞ = 16. A restart throws away the optimizer's curvature memory, so below that
+share the leg keeps running instead, with the cold modes as its next warm starts. The
+end-of-leg check above still runs on every leg. On the 200-subject benchmark below, without
+the warm-start predictor, 5 subjects (2.5 %) switch at the 32nd evaluation, so the probe
+restarts. In a test that raises the share to 5 % so the same probe absorbs them, the fit
+reaches the same optimum in 76 evaluations instead of 102.
 
 On the Michaelis–Menten ODE benchmark from the #1564 kit (200 subjects, perturbed initial
 estimates), ferx used to report OFV 784.33 as converged, with the optimizer's own objective

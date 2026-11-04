@@ -1554,6 +1554,137 @@ fn kernel_block_sigma_matches_reconverged_fd() {
     assert!(worst < 1e-6, "worst relative difference {worst:.2e}");
 }
 
+// ---- IIV on the residual with a dense `R` (#2656) ---------------------------------------
+
+/// The #2656 anchor twin named `twin`, with every `FIX` dropped so each coordinate is live,
+/// and one of its subjects, its residual blocks assigned. Real cross-row `R`: `pair` is a
+/// `block_sigma` across a total/unbound pair, `triple` a `correlation` over three rows, and
+/// the data carry a clear per-subject residual scale.
+fn ruv_dense_twin(
+    twin: &str,
+    data: &str,
+    edit: impl Fn(String) -> String,
+) -> (CompiledModel, Subject) {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let dir = format!("{root}/nonmem_anchor/iiv_ruv_dense");
+    let src = std::fs::read_to_string(format!("{dir}/{twin}.ferx")).unwrap();
+    let parsed =
+        crate::parser::model_parser::parse_full_model(&edit(src.replace(" FIX", ""))).unwrap();
+    let (pop, _) = crate::api::read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        &format!("{dir}/{data}.csv"),
+        None,
+        None,
+        None,
+        &parsed.column_map,
+    )
+    .unwrap();
+    let mut s = pop.subjects[1].clone();
+    s.obs_rgroup = crate::stats::residual_error::residual_groups(&parsed.model, &s);
+    assert!(parsed.model.residual_error_eta.is_some(), "{twin}");
+    assert!(
+        crate::stats::residual_error::has_cross_observation_residual(
+            &parsed.model.error_spec,
+            &s,
+            &parsed.model.default_params.sigma.values,
+            parsed.model.residual_cov_at(&parsed.model.default_params),
+        ),
+        "{twin}: rows must be coupled"
+    );
+    (parsed.model, s)
+}
+
+/// Every dense shape the anchor pins: `block_sigma` across rows, and each serial kind.
+fn ruv_dense_fixtures() -> Vec<(&'static str, CompiledModel, Subject)> {
+    let mut out = Vec::new();
+    let (m, s) = ruv_dense_twin("pair", "pair", |t| t);
+    out.push(("block_sigma", m, s));
+    for kind in ["cs", "ar1", "car1"] {
+        let line = format!("correlation {kind}(RHO)");
+        let (m, s) = ruv_dense_twin("triple", "triple", |t| {
+            t.replace("correlation cs(RHO)", &line)
+        });
+        out.push((kind, m, s));
+    }
+    out
+}
+
+/// `F` and `l` of the kernel against production's dense-`R` marginal and EBE objective, at a
+/// point where `η_r` is far from 0. Kills: either side dropping `exp(2η_r)`.
+#[test]
+fn dense_r_with_iiv_on_ruv_kernel_objective_matches_production() {
+    for (name, m, s) in ruv_dense_fixtures() {
+        let g = objective_gaps::<3>(&m, &s, &m.default_params, &[0.08, -0.06, 0.45]);
+        eprintln!("{name}: {g:?}");
+        assert!(g.0 < 1e-10 && g.1 < 1e-10, "{name}: {g:?}");
+    }
+}
+
+/// The exact outer gradient under `iiv_on_ruv` × a dense `R` (`Ψ = F − wᵀ∇_η l`, every θ, Ω,
+/// σ and ρ coordinate) against the reconverged FD oracle, FOCEI.
+#[test]
+fn dense_r_with_iiv_on_ruv_gradient_matches_reconverged_fd() {
+    for (name, m, s) in ruv_dense_fixtures() {
+        assert!(in_scope(&m, &s), "{name} must be served");
+        let worst = parity(&m, &s);
+        eprintln!("{name}: FOCEI gradient {worst:.2e}");
+        // Measured worst 2.1e-9 (car1, macOS arm64); ~10×.
+        assert!(worst < 2e-8, "{name}: {worst:.2e}");
+    }
+}
+
+/// The same under Laplace and AGQ (exact and Gauss–Newton anchors), and the FOCEI R-matrix.
+#[test]
+fn dense_r_with_iiv_on_ruv_agq_and_hessian_match_fd() {
+    for (name, m, s) in ruv_dense_fixtures() {
+        for (n_agq, exact) in [(1, true), (3, false)] {
+            let worst = fd_oracle_agq(&m, &s, n_agq, exact);
+            eprintln!("{name}: AGQ n={n_agq} exact={exact} gradient {worst:.2e}");
+            // Measured worst 4.3e-11 (cs, macOS arm64); ~10×.
+            assert!(worst < 5e-10, "{name} n={n_agq}: {worst:.2e}");
+        }
+        let (h, _) = hessian_gaps(&m, &s, true);
+        eprintln!("{name}: FOCEI hessian {h:.2e}");
+        // Measured worst 8.9e-11 (block_sigma, macOS arm64). The reference's own floor on
+        // the other dense fixtures reaches 1e-7 (`dense_residual_agq_gradient_and_hessians_match_fd`).
+        assert!(h < 3e-7, "{name}: hessian {h:.2e}");
+    }
+}
+
+/// With a κ the marginal runs over the stacked `[η, κ]` system and the EBE search takes the
+/// kernel's gradient (`iov_inner_residual_correlation`), so `η_r` is one stacked coordinate
+/// among several, and it must still be the one `R` reads.
+#[test]
+fn dense_r_with_iiv_on_ruv_and_kappa_matches_reconverged_fd() {
+    let src = ODE_IOV_BLOCK_SIGMA
+        .replace(
+            "  block_sigma (PROP_TOT, PROP_UNB) = [0.01, 0.006, 0.0225]\n",
+            "  sigma PROP_TOT ~ 0.1 (sd)\n",
+        )
+        .replace(
+            "  omega ETA_V ~ 0.06\n",
+            "  omega ETA_V ~ 0.06\n  omega ETA_RUV ~ 0.2\n",
+        )
+        .replace(
+            "  theta FU(0.3, 0.01, 1.0)\n",
+            "  theta FU(0.3, 0.01, 1.0)\n  theta RHO(0.45, -0.4, 0.95)\n",
+        )
+        .replace(
+            "  CMT=1: DV ~ proportional(PROP_TOT)\n  CMT=2: DV ~ proportional(PROP_UNB)\n",
+            "  DV ~ proportional(PROP_TOT)\n  correlation cs(RHO) by ARM\n  iiv_on_ruv = ETA_RUV\n",
+        );
+    let model = tight(parse_model_string(&src).unwrap());
+    assert!(model.n_kappa == 1 && model.residual_error_eta == Some(2));
+    let mut s = iov_two_endpoint_subject(&model);
+    s.obs_rgroup = (0..s.obs_times.len()).map(|j| 1 + (j / 2) as u32).collect();
+    assert!(crate::estimation::inner_optimizer::iov_inner_residual_correlation(&model, &s));
+    let worst = iov_parity(&model, &s, true);
+    eprintln!("κ × cs × iiv_on_ruv: {worst:.2e}");
+    // Measured 2.5e-6 (macOS arm64); ~8×.
+    assert!(worst < 2e-5, "{worst:.2e}");
+}
+
 // ---- FREM covariate pseudo-observations through the kernel ------------------------------
 
 const FREM_MODEL: &str = r#"
@@ -1735,8 +1866,8 @@ fn focei_objective_is_inner_plus_log_det_across_residual_structures() {
     let g = objective_gaps::<2>(&sm, &ss, &sm.default_params, &eta);
     assert!(g.0 < 1e-10 && g.1 < 1e-10, "serial: {g:?}");
 
-    // 4. block_sigma + IIV on the residual: F scales R by exp(2η_r) like l does. (A serial
-    // `correlation` with `iiv_on_ruv` is rejected by the parser.)
+    // 4. block_sigma + IIV on the residual: F scales R by exp(2η_r) like l does. The
+    // cross-row and serial forms are in `dense_r_with_iiv_on_ruv_*` below (#2656).
     let src = dense_src("  iiv_on_ruv = ETA_RUV\n", true).replace(
         "  omega ETA_V ~ 0.04\n",
         "  omega ETA_V ~ 0.04\n  omega ETA_RUV ~ 0.1\n",

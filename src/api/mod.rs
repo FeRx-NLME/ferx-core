@@ -110,10 +110,10 @@ pub(crate) use postfit::{
     eps_shrinkage_warning, eta_shrinkage_warning, extract_residual_correlation_se,
     extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
     is_last_estimating_stage, kappa_shrinkages, kappa_weight_typicals, keep_gn_zero_eta_warning,
-    name_nonfinite_subjects, non_fit_diagnostics, nonfinite_objective_warning,
-    ode_solver_diagnostics_warning, probe_nlopt_algorithms, profiled_bound_report,
-    rebuild_warnings_structured, refresh_profiled_bound_report, report_resolved_levels,
-    resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
+    mcem_marginal_warning, name_nonfinite_subjects, non_fit_diagnostics,
+    nonfinite_objective_warning, ode_solver_diagnostics_warning, probe_nlopt_algorithms,
+    profiled_bound_report, rebuild_warnings_structured, refresh_profiled_bound_report,
+    report_resolved_levels, resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
     sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
     sweep_sensitivity_solver_stats, with_solver_stats, ContributionSource, SolverStatsPhase,
 };
@@ -410,6 +410,10 @@ mod stalled_at_init_warning_tests;
 mod degenerate_cl_v_warning_tests;
 
 #[cfg(test)]
+#[path = "tests/ode_rhs_route_tests.rs"]
+mod ode_rhs_route_tests;
+
+#[cfg(test)]
 #[path = "tests/nonfinite_objective_tests.rs"]
 mod nonfinite_objective_tests;
 
@@ -460,6 +464,10 @@ mod fit_refusal_codes_tests;
 #[cfg(test)]
 #[path = "tests/covariate_presence_tests.rs"]
 mod covariate_presence_tests;
+
+#[cfg(test)]
+#[path = "tests/covariate_missing_scope_tests.rs"]
+mod covariate_missing_scope_tests;
 
 // #1614: every `simulate*` entry refuses a θ vector whose length is not the model's.
 #[cfg(test)]
@@ -544,6 +552,11 @@ mod adaptive_frem_tests;
 #[cfg(test)]
 #[path = "tests/frem_ode_sdtab_tests.rs"]
 mod frem_ode_sdtab_tests;
+
+// #944: per-subject dose expressions in `[adaptive_dosing]`.
+#[cfg(test)]
+#[path = "tests/adaptive_dose_expr_tests.rs"]
+mod adaptive_dose_expr_tests;
 
 // #1594: supplied per-subject η on the adaptive path.
 #[cfg(test)]

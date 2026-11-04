@@ -6260,6 +6260,16 @@ impl CompiledModel {
         self.indiv_param_partials.nested_levels.as_ref()
     }
 
+    /// The names a `[derived]` expression looks up at evaluation time, other than
+    /// its built-ins (`IPRED`, `DV`, `TIME`, …) and earlier `[derived]` columns (#2599).
+    /// A covariate overrides an individual parameter or a compartment of the same
+    /// name there, so each is a read of the dataset column it names whenever one
+    /// exists. Not in [`CompiledModel::referenced_covariates`], since a
+    /// `[derived]`-only name is not a required column.
+    pub(crate) fn derived_reads(&self) -> &[String] {
+        &self.indiv_param_partials.derived_reads
+    }
+
     /// Whether an *active* custom residual magnitude depends on `θ`
     /// (see [`RuvMagnitude::theta_dependent`]).
     ///
@@ -6716,9 +6726,12 @@ pub struct ImportanceSamplingResult {
     /// size fraction fell below `FitOptions::imp_low_ess_threshold`. Empty list
     /// means every subject's proposal matched its posterior well.
     pub low_ess_subjects: Vec<(String, f64)>,
-    /// Number of importance samples drawn per subject (`FitOptions::imp_samples`).
+    /// Number of importance samples drawn per subject (`FitOptions::imp_samples`,
+    /// or `impmap_samples` for IMPMAP). This is the configured count: the final
+    /// evaluation does not inherit a count ramped up by `imp_auto`/`impmap_auto`.
     pub n_samples: usize,
-    /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`).
+    /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`);
+    /// `f64::INFINITY` for a multivariate-normal proposal.
     pub proposal_df: f64,
     /// Minimum across-subject normalized ESS fraction (ESS / K). 1.0 = ideal,
     /// near 0 = degenerate proposal for at least one subject.
@@ -6727,6 +6740,12 @@ pub struct ImportanceSamplingResult {
     pub ess_median: f64,
     /// Treatment of per-occasion kappa random effects.  See [`KappaTreatment`].
     pub kappa_treatment: KappaTreatment,
+    /// The pilot passes configured to adapt each subject's proposal before these
+    /// draws (`FitOptions::imp_adapt_passes`), which is a maximum: a subject stops
+    /// early at a pass with unusable moments, and a FREM Rao-Blackwellised
+    /// subject runs none. `0` is the single Laplace proposal.
+    #[serde(default)]
+    pub adapt_passes: usize,
 }
 
 /// One row of the IMPMAP per-iteration parameter trace.
@@ -7233,6 +7252,11 @@ pub enum WarningCode {
     /// — the dose is dropped — and a `NaN` a `NaN`; NONMEM would refuse either record:
     /// PREDPP treats a non-positive PK parameter as an error.
     DegenerateClearanceOrVolume,
+    /// Informational: the `[odes]` right-hand side does not run as native code — a
+    /// construct keeps it on the bytecode interpreter (`W_ODE_RHS_INTERPRETED`), or the
+    /// host has no native code for it (`W_ODE_RHS_NOT_NATIVE`), #2681. The results are
+    /// unchanged; the fit is slower.
+    OdeRhsRoute,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -7280,6 +7304,7 @@ impl WarningCode {
             WarningCode::OdeSolver => "ode_solver",
             WarningCode::UncertaintyDrawsSkipped => "uncertainty_draws_skipped",
             WarningCode::DegenerateClearanceOrVolume => "degenerate_clearance_or_volume",
+            WarningCode::OdeRhsRoute => "ode_rhs_route",
             WarningCode::General => "general",
         }
     }
@@ -7383,6 +7408,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // "non-finite", "stability-limited", "singular Jacobian", …), which prose arms below
         // would claim as an estimation or solver-health problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
+    } else if lower.starts_with("w_ode_rhs_") {
+        // #2681: which engine runs the `[odes]` RHS. Informational, and a token arm ahead of
+        // the prose ones: the message names the construct, and "interpreter" or a function
+        // name must not reach an estimation arm.
+        (WarningSeverity::Info, WarningCode::OdeRhsRoute)
     } else if lower.contains("w_degenerate_cl_v") {
         // #2104: a non-positive or non-finite CL / V at the final estimates. A token arm ahead
         // of the generic "degenerate" → optimizer-health prose arm, which its wording would
@@ -9168,6 +9198,52 @@ pub struct FitOptions {
     /// model (the HMC `∂NLL/∂η` is the `Dual2` analytic gradient) — falls
     /// back to MH otherwise.
     pub saem_n_leapfrog: usize,
+    /// The SAEM E-step's primary kernel, set via `[fit_options] saem_kernel`
+    /// (#1449). Defaults to [`SaemKernel::RandomWalk`], the historical block
+    /// random walk; [`SaemKernel::Imh`] is the opt-in f-SAEM independent
+    /// Metropolis-Hastings kernel. See [`SaemKernel`] for when it pays.
+    pub saem_kernel: SaemKernel,
+    /// Independent-MH proposals per subject per SAEM iteration under
+    /// [`SaemKernel::Imh`] (`[fit_options] saem_imh_proposals`). Each costs one
+    /// individual-NLL evaluation; they **replace** the `n_mh_steps` block
+    /// random-walk proposals, while the componentwise sweep still runs. Default
+    /// 2. Must be ≥ 1.
+    pub saem_imh_proposals: usize,
+    /// SAEM iterations between rebuilds of a subject's cached IMH proposal
+    /// `(η̂_i, Γ_i)` (`[fit_options] saem_imh_refresh`). Default 5. A stale
+    /// proposal costs sampling efficiency, never correctness — an
+    /// independence sampler targets the current conditional for any proposal
+    /// fixed before the move, and a refresh starts from the previous centre (or
+    /// the prior mean), never from the chain's current η — while a refresh costs
+    /// one analytic η-gradient and one η-Jacobian. A subject whose refresh
+    /// declines takes the random walk and retries after the same interval. Rebuilding every iteration (`1`) was measured to be a net
+    /// loss; 5–10 is the win. Must be ≥ 1.
+    pub saem_imh_refresh: usize,
+    /// Weight `α` of the **defensive** prior component of the IMH proposal,
+    /// `q = (1 − α)·N(η̂, c·Γ) + α·N(0, Ω)` (`[fit_options]
+    /// saem_imh_defensive`). Default 0.05; must lie in `[0, 0.5]`.
+    ///
+    /// Without it a pure Laplace proposal can be *correctly* stuck: when
+    /// `CL = TVCL·e^η` meets informative data the conditional is far flatter
+    /// than its own curvature at the mode, the chain's starting point `η = 0`
+    /// can sit 20 proposal SDs out while scoring only ~15 objective units above
+    /// the mode, and the sampler rejects every proposal for the whole run
+    /// (measured: 0 of 200 accepted). Mixing in the prior bounds the importance
+    /// ratio and restores acceptance. `0` disables it.
+    pub saem_imh_defensive: f64,
+    /// Information gate on [`SaemKernel::Imh`]: the fewest mean observations
+    /// per subject **per random effect** at which the kernel runs
+    /// (`[fit_options] saem_imh_min_obs_per_eta`). Default 2.0; `0` disables
+    /// the gate. Below it the fit uses the random walk, with a warning.
+    ///
+    /// f-SAEM's premise is a conditional `p(η_i | y_i)` much narrower than the
+    /// prior. With fewer observations than random effects it barely is, and the
+    /// kernel is affordable but unhelpful: measured at 0.9 obs/η (vancomycin) it
+    /// moved the estimate further from a long-run reference, while at 2.3–3.7
+    /// (busulfan, warfarin) it helped. It is a population mean on purpose: one
+    /// kernel for the whole run, not one per subject depending on how many
+    /// samples each happened to give.
+    pub saem_imh_min_obs_per_eta: f64,
     // Bayes (Gibbs-within-HMC) options — see EstimationMethod::Bayes.
     /// Number of warmup (burn-in + adaptation) sweeps per chain, discarded from
     /// the reported posterior. HMC step size / leapfrog count adapt during this
@@ -9377,6 +9453,13 @@ pub struct FitOptions {
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
     pub imp_low_ess_threshold: f64,
+    /// Pilot passes that adapt each subject's proposal before a marginal
+    /// `−2 log L` is evaluated: `imp_eval_only`, and the marginal reported after
+    /// an estimating `imp` / `impmap` stage. Not the MCEM iterations. Default 5,
+    /// matching NONMEM `EONLY=1 NITER=5`; each pass costs one more `imp_samples`
+    /// draws per subject. `0` keeps the single Laplace proposal, which reads high
+    /// on sparse subjects (#2653).
+    pub imp_adapt_passes: usize,
     /// Number of MCEM iterations for the estimating `imp` path (ignored when
     /// `imp_eval_only`). Default 200.
     pub imp_iterations: usize,
@@ -9448,13 +9531,14 @@ pub struct FitOptions {
     /// covariate dimensions has very poor ESS. Set `false` only to diagnose the
     /// RB path against the full-dimensional sampler.
     pub frem_rao_blackwell: bool,
-    /// Adaptive importance-sample count for IMP (NONMEM `AUTO`/`STDOBJ`). When
-    /// `true` (the default), `imp_samples` is the *starting* count and is ramped
-    /// up (×2 per iteration, capped at 10000) whenever the objective's Monte-Carlo
-    /// standard deviation exceeds 1.0, so high-dimensional / FREM fits reach a
-    /// low-noise objective automatically instead of carrying a sample-count-
-    /// dependent M-step bias. Low-dimensional, well-sampled fits never trip the
-    /// threshold, so there is no cost there. Set `false` to pin the sample count.
+    /// Adaptive importance-sample count for IMP (NONMEM `AUTO`). When `true` (the
+    /// default), `imp_samples` is the *starting* count and is doubled after each
+    /// iteration, up to 10000, while the **per-subject** objective Monte-Carlo SE
+    /// (the total SE over √N) exceeds 0.05. K never comes back down. High-dimensional
+    /// / FREM fits then reach a low-noise objective instead of carrying a sample-count-
+    /// dependent M-step bias, but a fit that stays above the target runs at the cap,
+    /// at about ten times the per-iteration cost of K = 1000. Set `false` to pin the
+    /// sample count.
     pub imp_auto: bool,
     /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
     /// [`FitOptions::imp_auto`] but ramps `impmap_samples`. Default `true`.
@@ -9813,6 +9897,11 @@ impl Default for FitOptions {
             saem_conddist_burnin: 20,
             saem_conddist_keep_samples: false,
             saem_n_leapfrog: 0,
+            saem_kernel: SaemKernel::default(),
+            saem_imh_proposals: 2,
+            saem_imh_refresh: 5,
+            saem_imh_defensive: 0.05,
+            saem_imh_min_obs_per_eta: 2.0,
             bayes_warmup: 1000,
             bayes_iters: 1000,
             bayes_chains: 4,
@@ -9843,6 +9932,7 @@ impl Default for FitOptions {
             imp_proposal_df: 5.0,
             imp_seed: None,
             imp_low_ess_threshold: 0.1,
+            imp_adapt_passes: 5,
             imp_iterations: 200,
             imp_averaging: 50,
             imp_eval_only: false,
@@ -10151,6 +10241,37 @@ pub enum ScaleAdaptation {
     /// case — see the SAEM docs page for the six-seed measurement behind both.
     #[default]
     RobbinsMonro,
+}
+
+/// The SAEM E-step's primary kernel, set via `[fit_options] saem_kernel`
+/// (#1449).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaemKernel {
+    /// The historical block random walk `η + δ_i·chol(Ω)·z`, `n_mh_steps`
+    /// proposals per subject per iteration, and **the default**.
+    #[default]
+    RandomWalk,
+    /// The f-SAEM independent Metropolis-Hastings kernel (Karimi, Lavielle &
+    /// Moulines, *CSDA* 2020): `saem_imh_proposals` draws per subject per
+    /// iteration from `N(η̂_i, c·Γ_i)`, centred on the subject's conditional
+    /// mode with `Γ_i⁻¹ = HᵀR⁻¹H + ½C̃ᵀC̃ + Ω⁻¹` — the FOCEI curvature, assembled
+    /// by the same code the FOCEI objective uses — mixed with a small
+    /// defensive prior component. Because the proposal does not depend on the
+    /// current state, accepted draws are close to independent wherever the
+    /// model is near-linear in η, so two of them replace the block kernel's
+    /// autocorrelated random walk. The componentwise sweep still runs.
+    ///
+    /// Opt-in, and **gated twice before the run**: on scope (an analytical PK
+    /// or ODE model whose η-gradient and η-Jacobian the adjoint's recorder
+    /// serves exactly — ODE models since #2639, through the dual ODE walk; no
+    /// IOV, `iiv_on_ruv`, mixture, FREM, SDE, `block_sigma`, M3, non-Gaussian
+    /// endpoint or LTBS) and on information
+    /// ([`FitOptions::saem_imh_min_obs_per_eta`]). A fit outside either gate
+    /// runs the random walk with a warning naming the reason; a subject whose
+    /// curvature cannot be built takes the random walk until its next
+    /// scheduled refresh (`saem_imh_refresh` iterations later). Neither gate reads a clock, so a seeded fit is
+    /// reproducible whichever kernel it ran.
+    Imh,
 }
 
 /// Which solver moves the SAEM numerical θ/σ M-step, set via
@@ -11284,6 +11405,11 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_mstep_solver",
             "mstep_draws",
             "saem_mstep_draws",
+            "saem_kernel",
+            "saem_imh_proposals",
+            "saem_imh_refresh",
+            "saem_imh_defensive",
+            "saem_imh_min_obs_per_eta",
             "omega_burnin",
             "conddist",
             "saem_conddist",
@@ -11298,6 +11424,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "imp_proposal_df",
             "imp_seed",
             "imp_low_ess_threshold",
+            "imp_adapt_passes",
             "imp_iterations",
             "imp_averaging",
             "imp_eval_only",
@@ -11320,6 +11447,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_seed",
             "impmap_averaging",
             "impmap_low_ess_threshold",
+            "imp_adapt_passes",
             "impmap_trace",
             "impmap_mceta",
             "impmap_sobol",

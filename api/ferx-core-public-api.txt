@@ -2220,6 +2220,16 @@ pub fn ferx_core::sim::adaptive::DoseAction::validate(&self) -> core::result::Re
 pub enum ferx_core::sim::adaptive::DoseStep
 pub ferx_core::sim::adaptive::DoseStep::Level
 pub ferx_core::sim::adaptive::DoseStep::Percent(f64)
+#[non_exhaustive] pub enum ferx_core::sim::adaptive::DoseValue
+pub ferx_core::sim::adaptive::DoseValue::Expr(alloc::string::String)
+pub ferx_core::sim::adaptive::DoseValue::Literal(f64)
+impl ferx_core::sim::adaptive::DoseValue
+pub fn ferx_core::sim::adaptive::DoseValue::as_expr(&self) -> core::option::Option<&str>
+pub fn ferx_core::sim::adaptive::DoseValue::as_literal(&self) -> core::option::Option<f64>
+impl core::cmp::PartialEq<f64> for ferx_core::sim::adaptive::DoseValue
+pub fn ferx_core::sim::adaptive::DoseValue::eq(&self, other: &f64) -> bool
+impl core::convert::From<f64> for ferx_core::sim::adaptive::DoseValue
+pub fn ferx_core::sim::adaptive::DoseValue::from(x: f64) -> Self
 #[non_exhaustive] pub enum ferx_core::sim::adaptive::IntervalStep
 pub ferx_core::sim::adaptive::IntervalStep::Lengthen
 pub ferx_core::sim::adaptive::IntervalStep::Shorten
@@ -2231,14 +2241,14 @@ pub ferx_core::sim::adaptive::AdaptiveDosingSpec::assay_cmt: core::option::Optio
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::confirm: u32
-pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_bounds: (f64, f64)
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_bounds: (ferx_core::sim::adaptive::DoseValue, ferx_core::sim::adaptive::DoseValue)
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
-pub ferx_core::sim::adaptive::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<ferx_core::sim::adaptive::DoseValue>>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe_declared_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::route: ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::rules: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveRule>
-pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_dose: f64
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_dose: ferx_core::sim::adaptive::DoseValue
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_interval: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::target_window: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::with_assay_error: bool
@@ -2729,6 +2739,9 @@ pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
 pub enum ferx_core::types::RtteClock
 pub ferx_core::types::RtteClock::Forward
 pub ferx_core::types::RtteClock::Reset
+pub enum ferx_core::types::SaemKernel
+pub ferx_core::types::SaemKernel::Imh
+pub ferx_core::types::SaemKernel::RandomWalk
 pub enum ferx_core::types::SaemMstepSolver
 pub ferx_core::types::SaemMstepSolver::Bobyqa
 pub ferx_core::types::SaemMstepSolver::ScoreSa
@@ -2826,6 +2839,7 @@ pub ferx_core::types::WarningCode::InitNotRepresentable
 pub ferx_core::types::WarningCode::InitOutsideBounds
 pub ferx_core::types::WarningCode::MuReferencing
 pub ferx_core::types::WarningCode::MultiStart
+pub ferx_core::types::WarningCode::OdeRhsRoute
 pub ferx_core::types::WarningCode::OdeSolver
 pub ferx_core::types::WarningCode::OmegaStructure
 pub ferx_core::types::WarningCode::OptimizerConfig
@@ -3165,6 +3179,7 @@ pub ferx_core::types::FitOptions::gn_lambda: f64
 pub ferx_core::types::FitOptions::gradient_method: ferx_core::GradientMethod
 pub ferx_core::types::FitOptions::ignore_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitOptions::ignore_subjects: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::FitOptions::imp_adapt_passes: usize
 pub ferx_core::types::FitOptions::imp_auto: bool
 pub ferx_core::types::FitOptions::imp_averaging: usize
 pub ferx_core::types::FitOptions::imp_defensive_alpha: f64
@@ -3231,6 +3246,11 @@ pub ferx_core::types::FitOptions::saem_conddist: bool
 pub ferx_core::types::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::types::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::types::FitOptions::saem_conddist_nsamp: usize
+pub ferx_core::types::FitOptions::saem_imh_defensive: f64
+pub ferx_core::types::FitOptions::saem_imh_min_obs_per_eta: f64
+pub ferx_core::types::FitOptions::saem_imh_proposals: usize
+pub ferx_core::types::FitOptions::saem_imh_refresh: usize
+pub ferx_core::types::FitOptions::saem_kernel: ferx_core::SaemKernel
 pub ferx_core::types::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::types::FitOptions::saem_mstep_draws: usize
 pub ferx_core::types::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
@@ -3442,6 +3462,7 @@ pub ferx_core::types::ImpmapTraceRow::omega_lower_tri: alloc::vec::Vec<f64>
 pub ferx_core::types::ImpmapTraceRow::sigma: alloc::vec::Vec<f64>
 pub ferx_core::types::ImpmapTraceRow::theta: alloc::vec::Vec<f64>
 pub struct ferx_core::types::ImportanceSamplingResult
+pub ferx_core::types::ImportanceSamplingResult::adapt_passes: usize
 pub ferx_core::types::ImportanceSamplingResult::ess_median: f64
 pub ferx_core::types::ImportanceSamplingResult::ess_min: f64
 pub ferx_core::types::ImportanceSamplingResult::kappa_treatment: ferx_core::KappaTreatment
@@ -4149,6 +4170,9 @@ pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
 pub enum ferx_core::RtteClock
 pub ferx_core::RtteClock::Forward
 pub ferx_core::RtteClock::Reset
+pub enum ferx_core::SaemKernel
+pub ferx_core::SaemKernel::Imh
+pub ferx_core::SaemKernel::RandomWalk
 pub enum ferx_core::SaemMstepSolver
 pub ferx_core::SaemMstepSolver::Bobyqa
 pub ferx_core::SaemMstepSolver::ScoreSa
@@ -4256,6 +4280,7 @@ pub ferx_core::WarningCode::InitNotRepresentable
 pub ferx_core::WarningCode::InitOutsideBounds
 pub ferx_core::WarningCode::MuReferencing
 pub ferx_core::WarningCode::MultiStart
+pub ferx_core::WarningCode::OdeRhsRoute
 pub ferx_core::WarningCode::OdeSolver
 pub ferx_core::WarningCode::OmegaStructure
 pub ferx_core::WarningCode::OptimizerConfig
@@ -4281,14 +4306,14 @@ pub ferx_core::AdaptiveDosingSpec::assay_cmt: core::option::Option<usize>
 pub ferx_core::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::confirm: u32
-pub ferx_core::AdaptiveDosingSpec::dose_bounds: (f64, f64)
+pub ferx_core::AdaptiveDosingSpec::dose_bounds: (ferx_core::sim::adaptive::DoseValue, ferx_core::sim::adaptive::DoseValue)
 pub ferx_core::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
-pub ferx_core::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<ferx_core::sim::adaptive::DoseValue>>
 pub ferx_core::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
 pub ferx_core::AdaptiveDosingSpec::observe_declared_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::AdaptiveDosingSpec::route: ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::AdaptiveDosingSpec::rules: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveRule>
-pub ferx_core::AdaptiveDosingSpec::start_dose: f64
+pub ferx_core::AdaptiveDosingSpec::start_dose: ferx_core::sim::adaptive::DoseValue
 pub ferx_core::AdaptiveDosingSpec::start_interval: core::option::Option<f64>
 pub ferx_core::AdaptiveDosingSpec::target_window: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::with_assay_error: bool
@@ -4750,6 +4775,7 @@ pub ferx_core::FitOptions::gn_lambda: f64
 pub ferx_core::FitOptions::gradient_method: ferx_core::GradientMethod
 pub ferx_core::FitOptions::ignore_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitOptions::ignore_subjects: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::FitOptions::imp_adapt_passes: usize
 pub ferx_core::FitOptions::imp_auto: bool
 pub ferx_core::FitOptions::imp_averaging: usize
 pub ferx_core::FitOptions::imp_defensive_alpha: f64
@@ -4816,6 +4842,11 @@ pub ferx_core::FitOptions::saem_conddist: bool
 pub ferx_core::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::FitOptions::saem_conddist_nsamp: usize
+pub ferx_core::FitOptions::saem_imh_defensive: f64
+pub ferx_core::FitOptions::saem_imh_min_obs_per_eta: f64
+pub ferx_core::FitOptions::saem_imh_proposals: usize
+pub ferx_core::FitOptions::saem_imh_refresh: usize
+pub ferx_core::FitOptions::saem_kernel: ferx_core::SaemKernel
 pub ferx_core::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::FitOptions::saem_mstep_draws: usize
 pub ferx_core::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
@@ -5045,6 +5076,7 @@ pub ferx_core::ImpmapTraceRow::omega_lower_tri: alloc::vec::Vec<f64>
 pub ferx_core::ImpmapTraceRow::sigma: alloc::vec::Vec<f64>
 pub ferx_core::ImpmapTraceRow::theta: alloc::vec::Vec<f64>
 pub struct ferx_core::ImportanceSamplingResult
+pub ferx_core::ImportanceSamplingResult::adapt_passes: usize
 pub ferx_core::ImportanceSamplingResult::ess_median: f64
 pub ferx_core::ImportanceSamplingResult::ess_min: f64
 pub ferx_core::ImportanceSamplingResult::kappa_treatment: ferx_core::KappaTreatment

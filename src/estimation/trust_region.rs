@@ -1089,6 +1089,7 @@ pub(crate) fn optimize_trust_region_seeded(
         mixture_posteriors: None,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: None,
     }
 }
 

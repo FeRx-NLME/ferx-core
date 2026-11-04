@@ -47,8 +47,11 @@ const REQUIRED_CHECKS: [&str; 10] = [
 ];
 
 /// Jobs that must run in the queue, by `name:`. The required fast gates plus
-/// `Changelog`, which is not required but is a fast gate the issue puts in the queue.
-const QUEUE_GATES: [&str; 7] = [
+/// `Changelog`, which is not required but is a fast gate the issue puts in the queue,
+/// and `Patterns lint` (#2634), a fast gate for the same reason: two queued PRs can
+/// combine into an unguarded NaN-swallowing fold that neither contained alone (one
+/// deletes a test's `is_finite` assert, the other adds a fold the assert guarded).
+const QUEUE_GATES: [&str; 8] = [
     "Check",
     "Clippy",
     "Docs lint",
@@ -56,6 +59,7 @@ const QUEUE_GATES: [&str; 7] = [
     "Public API baseline",
     "Rustdoc",
     "Changelog",
+    "Patterns lint",
 ];
 
 /// The job that posts `codecov/patch` in the queue.

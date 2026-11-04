@@ -247,14 +247,17 @@ as long as some coordinate moves at least 0.01) on what is left of the fit's `ma
 restart ends with the objective at the start.
 
 - **It converges back**, to within 0.01 OFV (about ten times the largest gap measured on
-  warm refits, 1.1e-3 under Gauss–Newton): the start was an optimum, and **the restart's result is what is
-  reported** — its estimates, objective, `converged` verdict and warnings, as for any fit.
-  Nothing of the run that did not move is carried over, so every check that run would
+  warm refits, 1.1e-3 under Gauss–Newton): the start was an optimum, and **the restart's
+  verdict is what is reported** — its `converged` flag and warnings, as for any fit. None of
+  the verdict of the run that did not move is carried over, so every check that run would
   have failed (the plateau rule, the EBE start-dependence check, the objective gate) is
-  asked again of the restart and answered on its own merits. The estimates differ from the
-  warm start by the optimizer's tolerance. While they are still within the escape step of
-  the start, `FitResult::stationary_start` is `true` and no `stalled_at_init` warning is
-  raised, so `Strictness::default()` passes a converged restart. Measured on warm refits of
+  asked again of the restart and answered on its own merits. The reported **point** is the
+  lower of the two: the restart's estimates and objective, or the start's when the restart
+  ended above it (it stops on its own tolerance, so it can end slightly above a start that
+  was already the optimum; a fit never reports a point worse than one it evaluated). While
+  the reported estimates are still within the escape step of the start,
+  `FitResult::stationary_start` is `true` and no `stalled_at_init` warning is raised, so
+  `Strictness::default()` passes a converged restart. Measured on warm refits of
   `two_cpt_iv` (L-BFGS, BOBYQA, AGQ) and a two-class mixture, the restart ends within
   `1e-5` OFV of the start (Linux).
 - **It finds a lower objective**, by more than 0.01: the start was a stall, and it is
@@ -308,10 +311,13 @@ the fit is restarted from its own estimates with that THETA back at its start. A
 coordinate that collapsed onto its lower rail is reset along with it, since a collapsed THETA drags
 one with it. The restart is reported only if it ends lower (an `optimizer_health` warning names the
 THETA and both objectives). If it ends no lower, or on the floor again, the fit is reported
-`converged = false` with a `convergence` warning. A THETA whose objective rises off the floor is a
-genuine boundary estimate and is left alone. The check costs one evaluation on a fit that ended on
-the floor and nothing on any other. The restart gets a fresh `maxiter` budget, so `n_iterations` on
-such a fit can exceed it.
+`converged = false` with a `convergence` warning. The same holds when the restart leaves a THETA
+just above the floor, below 1/1000 of its start, where two more evaluations (that point, and the
+THETA at 1/1000 of its start) show the objective still falling as it rises
+([#2629](https://github.com/FeRx-NLME/ferx-core/issues/2629)). A THETA whose objective rises off
+the floor is a genuine boundary estimate and is left alone. The check costs one evaluation on a fit
+that ended on the floor, two more after a restart that left a THETA that low, and nothing on any
+other. The restart gets a fresh `maxiter` budget, so `n_iterations` on such a fit can exceed it.
 
 The same model has a genuine second mode, which this check rightly does not touch. At OFV ≈ 104.68,
 ω(ETA_EM) has collapsed onto its variance rail, 2.77 above the optimum, and both ferx and NONMEM stop

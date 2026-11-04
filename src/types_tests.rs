@@ -1279,6 +1279,7 @@ fn warning_code_tokens_are_stable() {
             DegenerateClearanceOrVolume,
             "degenerate_clearance_or_volume",
         ),
+        (OdeRhsRoute, "ode_rhs_route"),
     ];
     // The list is hand-maintained, and had silently fallen four variants behind
     // when `StalledAtInit` was added (#997) — `FlipFlop`, `AbsorptionTwinDeclined`,
@@ -1329,11 +1330,12 @@ fn warning_code_tokens_are_stable() {
             InitNotRepresentable => 36,
             UncertaintyDrawsSkipped => 37,
             DegenerateClearanceOrVolume => 38,
+            OdeRhsRoute => 39,
         }
     }
     assert_eq!(
         expected.len(),
-        39,
+        40,
         "every arm of `_every_variant_is_listed_above` needs a row in `expected`"
     );
     for (i, (code, _)) in expected.iter().enumerate() {

@@ -150,6 +150,50 @@ pub(crate) fn gate_converged_on_mcem_objective(converged: &mut bool, ofv: f64) -
     ))
 }
 
+/// How far above the lowest iteration objective, as a fraction of the objective's
+/// scale, a final marginal may sit before [`mcem_objective_rise`] calls the run
+/// collapsed (#2652).
+///
+/// An EM iteration should not raise the objective, so the only legitimate gap is
+/// Monte-Carlo noise. Measured on Linux aarch64 (glibc 2.41, release without LTO) over
+/// the seven models of the 2026-11 IMP-vs-NONMEM evaluation, K = 1000, `[focei, imp]`
+/// and cold `imp`, reading every iteration's objective. With #2650, #2651 and #2653 in,
+/// all eleven runs are healthy and the widest gap is 0.13 % of the scale (thioguanine:
+/// lowest -250.89, marginal -250.57). Collapses need the tree before #2650: there the
+/// narrowest is 50.7 % (cold cefepime: lowest 4300.70, marginal 6480.15). 10 % sits 77×
+/// above the first and 5× below the second. macOS arm64, measured on its own before
+/// #2650, gave a narrowest collapse of 28 %, also above the bound.
+pub(crate) const MCEM_RISE_TOLERANCE: f64 = 0.10;
+
+/// The rise of the final marginal `marginal` over `lowest`, the lowest objective the
+/// MCEM iterations reached, when it is too large to be Monte-Carlo noise (#2652);
+/// `None` otherwise.
+///
+/// A collapse on the first recentre can sit below the 1e14 / 1e15 cutoffs of
+/// [`gate_converged_on_mcem_objective`] for good: before #2650, on Linux, cefepime read
+/// 4313.3 at iteration 1, 4.4e7 at iteration 2, and ended at a marginal of 13,354.7
+/// against NONMEM's 4282.9.
+///
+/// * The baseline is the **lowest** iteration, not the first, because a cold start
+///   makes the first a poor reference: infliximab read 3087.4, reached 703.1, blew up
+///   to 5e5 and ended at 1545.6, below where it began.
+/// * The scale is `max(|lowest|, n_obs)`, because −2 log L has no natural zero: an
+///   objective near 0 would make a purely relative test fire on noise.
+pub(crate) fn mcem_objective_rise(marginal: f64, lowest: f64, n_obs: usize) -> Option<f64> {
+    let rise = marginal - lowest;
+    (rise > MCEM_RISE_TOLERANCE * lowest.abs().max(n_obs as f64)).then_some(rise)
+}
+
+/// Fold one iteration's objective into the lowest seen so far. A non-finite value is
+/// skipped explicitly: `f64::min` would do it silently for `NaN`, and for `-inf` it
+/// would keep a baseline nothing can rise above.
+fn lowest_objective(lowest: Option<f64>, objective: f64) -> Option<f64> {
+    if !objective.is_finite() {
+        return lowest;
+    }
+    Some(lowest.map_or(objective, |l| l.min(objective)))
+}
+
 /// How each MCEM iteration positions the per-subject importance-sampling
 /// proposal — the one piece that distinguishes IMP from IMPMAP. Everything else
 /// (M-step, sufficient statistics, averaging, ESS diagnostics, final objective)
@@ -189,11 +233,18 @@ impl ProposalRecenter {
 /// the prior term `−½ηᵀΩ⁻¹η` of the resulting far samples explodes the −2 log L
 /// and the next Ω M-step. We therefore **cap** the proposal-covariance diagonal
 /// at the prior `Ωᵢᵢ` — the conditional variance of a well-identified η is
-/// bounded above by its prior variance. The diagonal is floored only at a tiny
-/// absolute value to avoid a singular matrix (NOT at a fraction of Ω — see
-/// [`IMP_PROPOSAL_COV_FLOOR`]). If the result is still not Cholesky-invertible a
-/// zero matrix is returned, which makes `build_proposal` take its Ω fallback — a
-/// broad but valid proposal.
+/// bounded above by its prior variance. A capped dimension's covariances are
+/// rescaled by the same factor, so the correlations survive: `D C D` stays
+/// positive semi-definite, whereas capping the diagonal alone leaves a strongly
+/// correlated covariance indefinite (#2650). A non-finite variance carries no
+/// usable correlation, so its covariances are dropped. The diagonal is floored
+/// only at a tiny absolute value to avoid a singular matrix (NOT at a fraction of
+/// Ω — see [`IMP_PROPOSAL_COV_FLOOR`]). If the result is still not
+/// Cholesky-invertible the prior precision `Ω⁻¹` is returned — a broad but valid
+/// proposal. It has to be returned here: a zero matrix does not reach
+/// `build_proposal`'s Ω fallback, because the jitter turns it into a
+/// positive-definite `1e−10·I`, a proposal SD of 1e5 (#2650). A zero matrix remains
+/// only for an Ω that is itself not positive-definite.
 fn covariance_to_proposal_hessian(
     cov: &DMatrix<f64>,
     omega: &DMatrix<f64>,
@@ -201,19 +252,33 @@ fn covariance_to_proposal_hessian(
 ) -> DMatrix<f64> {
     let n = cov.nrows();
     let mut c = cov.clone();
+    let mut sd_scale = vec![1.0_f64; n];
     for i in 0..n {
         let hi = omega[(i, i)].max(floor);
         let v = c[(i, i)];
-        if !v.is_finite() || v > hi {
+        if !v.is_finite() {
             c[(i, i)] = hi;
+            sd_scale[i] = 0.0;
+        } else if v > hi {
+            c[(i, i)] = hi;
+            sd_scale[i] = (hi / v).sqrt();
         } else if v < floor {
             c[(i, i)] = floor;
         }
     }
-    match c.cholesky() {
-        Some(ch) => ch.inverse(),
-        None => DMatrix::zeros(n, n),
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            // Assign rather than multiply on a dropped dimension: `0 · NaN` is NaN.
+            let s = sd_scale[i] * sd_scale[j];
+            c[(i, j)] = if s == 0.0 { 0.0 } else { c[(i, j)] * s };
+        }
     }
+    c.cholesky()
+        .or_else(|| omega.clone().cholesky())
+        .map_or_else(|| DMatrix::zeros(n, n), |ch| ch.inverse())
 }
 
 /// Translate one subject's importance draws by `−shift` in η-space: every
@@ -869,11 +934,12 @@ fn run_mcem(
     // `k_samples` is mutable so the adaptive (`auto`) path can ramp it up between
     // iterations when the objective is too Monte-Carlo-noisy (NONMEM `AUTO`).
     let mut k_samples = k_opt.max(2);
-    // `INFINITY` selects the multivariate-normal proposal; any finite value must
-    // be a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
+    // `INFINITY` selects the multivariate-normal proposal; anything else must be
+    // a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
     // bypasses the parser's range check can't reach the `ChiSquared::new(nu)`
-    // panic in `subject_is_draws`. Mirrors `run_importance_sampling`.
-    if nu.is_finite() && nu < 1.0 {
+    // panic in `subject_is_draws`, and a NaN can't pass for a normal proposal by
+    // being non-finite. Mirrors `run_importance_sampling`.
+    if nu.is_nan() || nu < 1.0 {
         return Err(format!(
             "{label}: {df_key} must be >= 1.0 (or +inf for a normal proposal), got {nu}"
         ));
@@ -1216,6 +1282,8 @@ fn run_mcem(
     // left its initial value (#918 review).
     let mut cov_group_skipped = vec![0usize; cov_mu_groups.len()];
 
+    // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
+    let mut lowest_iteration_objective: Option<f64> = None;
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             if verbose {
@@ -1547,6 +1615,7 @@ fn run_mcem(
             ess_fracs.push(d.ess_fraction);
         }
         let minus2ll = -2.0 * ll;
+        lowest_iteration_objective = lowest_objective(lowest_iteration_objective, minus2ll);
         // Objective Monte-Carlo standard error from the self-normalized ESS
         // (Geweke: Var(log p̂ᵢ) ≈ (1/ESS_frac − 1)/K; degenerate subjects get a
         // finite fallback). −2 log L scales this by 2.
@@ -2227,6 +2296,7 @@ fn run_mcem(
         mixture_posteriors: None,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: lowest_iteration_objective,
     })
 }
 
@@ -2639,6 +2709,8 @@ fn run_mcem_mixture(
         );
     }
 
+    // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
+    let mut lowest_iteration_objective: Option<f64> = None;
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             break;
@@ -2825,6 +2897,7 @@ fn run_mcem_mixture(
             pmix.push(pmix_i);
             ofv += contribution;
         }
+        lowest_iteration_objective = lowest_objective(lowest_iteration_objective, ofv);
         if verbose {
             // Per-subject ESS: the worst per-class proposal among the classes the
             // subject actually contributes to (a collapsed proposal in a class
@@ -3168,6 +3241,7 @@ fn run_mcem_mixture(
         mixture_posteriors,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: lowest_iteration_objective,
     })
 }
 
@@ -4600,6 +4674,103 @@ mod tests {
         assert!(!objective_converged(OFV_DIVERGENCE_CAP));
     }
 
+    /// #2652: every row is a run from the 2026-11 evaluation (lowest iteration, final
+    /// objective, observations), so the bound is pinned to what separated them.
+    #[test]
+    fn mcem_objective_rise_separates_the_measured_collapses_from_healthy_runs() {
+        // Linux aarch64 (glibc 2.41): (lowest iteration, final marginal, n_obs). See
+        // `MCEM_RISE_TOLERANCE` for the setup. The collapses are from the tree before
+        // #2650, which removed their cause.
+        for (lowest, end, n_obs) in [
+            (4313.3406, 13354.7091, 702), // cefepime, warm: the issue's fit
+            (4300.6956, 6480.1505, 702),  // cefepime, cold: the narrowest collapse
+            (661.4346, 1589.4539, 183),   // infliximab, warm
+            (703.0588, 1545.6446, 183),   // infliximab, cold: ends below its 3087.4 start
+            (998.0913, 3814.4033, 274),   // vancomycin, warm
+            (-79.8594, 2126.9567, 132),   // thioguanine, cold
+        ] {
+            assert!(
+                mcem_objective_rise(end, lowest, n_obs).is_some(),
+                "a collapse passed: {lowest} → {end}"
+            );
+        }
+        for (lowest, end, n_obs) in [
+            (4276.0932, 4279.2241, 702),    // cefepime, cold
+            (4279.0421, 4281.7779, 702),    // cefepime, warm
+            (665.3862, 665.4009, 183),      // infliximab, cold
+            (660.8735, 661.1218, 183),      // infliximab, warm
+            (995.9150, 996.7820, 274),      // vancomycin, warm
+            (5963.0649, 5966.0838, 1231),   // pembrolizumab, warm
+            (-3054.2406, -3053.8571, 1006), // propofol, warm
+            (-250.8932, -250.5679, 132),    // thioguanine, cold: the widest gap
+            (-250.8932, -250.5775, 132),    // thioguanine, warm
+            (-286.1552, -286.0387, 110),    // warfarin, cold
+            (-286.1552, -286.0393, 110),    // warfarin, warm
+        ] {
+            assert_eq!(
+                mcem_objective_rise(end, lowest, n_obs),
+                None,
+                "a healthy run fired: {lowest} → {end}"
+            );
+        }
+    }
+
+    /// The scale's two halves, each on the input only it decides. Dropping `abs()` makes
+    /// a negative objective's tolerance negative, so a tiny rise fires; dropping the
+    /// `n_obs` floor makes noise around zero a 1000 % rise.
+    #[test]
+    fn mcem_objective_rise_scales_on_the_magnitude_and_the_observation_count() {
+        assert_eq!(mcem_objective_rise(-990.0, -1000.0, 10), None);
+        assert_eq!(mcem_objective_rise(-850.0, -1000.0, 10), Some(150.0));
+        assert_eq!(mcem_objective_rise(5.0, 0.4, 100), None);
+        assert!(mcem_objective_rise(11.0, 0.4, 100).is_some());
+        // A fall is never a rise, however large.
+        assert_eq!(mcem_objective_rise(-5000.0, 4000.0, 100), None);
+    }
+
+    /// A non-finite iteration must neither become the baseline nor erase it. `-inf`
+    /// is the case `f64::min` gets wrong: nothing could ever rise above it.
+    #[test]
+    fn lowest_objective_keeps_the_lowest_finite_iteration() {
+        assert_eq!(lowest_objective(None, f64::NAN), None);
+        assert_eq!(lowest_objective(None, f64::INFINITY), None);
+        assert_eq!(lowest_objective(None, 7.0), Some(7.0));
+        assert_eq!(lowest_objective(Some(7.0), 9.0), Some(7.0));
+        assert_eq!(lowest_objective(Some(7.0), 5.0), Some(5.0));
+        assert_eq!(lowest_objective(Some(7.0), f64::NAN), Some(7.0));
+        assert_eq!(lowest_objective(Some(7.0), f64::NEG_INFINITY), Some(7.0));
+    }
+
+    /// The baseline `fit()` reads is the lowest iteration row, and not simply the first:
+    /// the premise asserts this fixture's objective falls, or the two would coincide.
+    #[test]
+    fn run_mcem_publishes_the_lowest_iteration_objective() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 4;
+        opts.impmap_samples = 200;
+        opts.impmap_seed = Some(11);
+        opts.impmap_trace = true;
+        opts.run_covariance_step = false;
+        let res = run_impmap(&model, &pop, &model.default_params, None, &opts).expect("impmap");
+        let trace = res.impmap_trace.as_ref().expect("impmap_trace requested");
+        let rows: Vec<f64> = trace
+            .rows
+            .iter()
+            .filter(|r| r.iteration > 0)
+            .map(|r| r.ofv)
+            .collect();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|v| v.is_finite()), "rows {rows:?}");
+        let lowest = rows.iter().copied().fold(f64::INFINITY, f64::min); // nan-ok: asserted finite above
+        assert!(
+            lowest < rows[0],
+            "premise: the objective falls, rows {rows:?}"
+        );
+        assert_eq!(res.mcem_lowest_objective, Some(lowest));
+    }
+
     /// #1303: the MCEM exits apply **two** objective rules, and this pins that
     /// neither is redundant — the trap being that two conditions rejecting the
     /// same inputs cover for each other, so deleting either leaves the suite
@@ -4967,6 +5138,78 @@ mod tests {
         );
     }
 
+    /// Correlation between dimensions `i` and `j` of a covariance matrix.
+    fn corr(c: &DMatrix<f64>, i: usize, j: usize) -> f64 {
+        c[(i, j)] / (c[(i, i)] * c[(j, j)]).sqrt()
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_keeps_a_capped_correlated_covariance_pd() {
+        // #2650. Both variances sit just above Ωii and the correlation is about
+        // −0.98, so capping the diagonal alone gives
+        // 0.034·0.031 − 0.0335² < 0: indefinite, a failed Cholesky, a zero matrix.
+        let cov = DMatrix::from_row_slice(2, 2, &[0.0362, -0.0335, -0.0335, 0.0322]);
+        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[0.034, 0.031]));
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        let capped = h
+            .try_inverse()
+            .expect("capped covariance must stay invertible");
+        assert!((capped[(0, 0)] - 0.034).abs() < 1e-12);
+        assert!((capped[(1, 1)] - 0.031).abs() < 1e-12);
+        assert!(
+            (corr(&capped, 0, 1) - corr(&cov, 0, 1)).abs() < 1e-9,
+            "the cap must keep the correlation: {} vs {}",
+            corr(&capped, 0, 1),
+            corr(&cov, 0, 1)
+        );
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_rescales_only_what_the_cap_touched() {
+        // Dimension 0 is capped, 1 and 2 are not. Every correlation survives, and
+        // the covariance between the two uncapped dimensions is left exactly alone,
+        // so a scale applied to all off-diagonals, or squared, cannot pass.
+        let cov = DMatrix::from_row_slice(3, 3, &[4.0, 0.3, 0.2, 0.3, 0.25, 0.05, 0.2, 0.05, 0.16]);
+        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0, 10.0, 10.0]));
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        let capped = h.try_inverse().expect("must stay invertible");
+        assert!((capped[(0, 0)] - 1.0).abs() < 1e-9);
+        assert!((capped[(1, 2)] - 0.05).abs() < 1e-9);
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            assert!(
+                (corr(&capped, i, j) - corr(&cov, i, j)).abs() < 1e-9,
+                "correlation ({i},{j}) must survive the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_drops_covariances_of_a_non_finite_variance() {
+        // A NaN variance usually arrives with NaN covariances. They must not reach
+        // the Cholesky, or a dimension that could be capped costs the whole matrix.
+        let cov = DMatrix::from_row_slice(2, 2, &[f64::NAN, f64::NAN, f64::NAN, 0.2]);
+        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[0.5, 1.0]));
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        assert!((h[(0, 0)] - 2.0).abs() < 1e-9, "got {}", h[(0, 0)]);
+        assert!((h[(1, 1)] - 5.0).abs() < 1e-9, "got {}", h[(1, 1)]);
+        assert_eq!(h[(0, 1)], 0.0);
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_returns_the_prior_precision_when_indefinite() {
+        // An in-bounds but indefinite covariance gets past the cap and fails the
+        // Cholesky. The answer is Ω⁻¹ itself, not a zero matrix for `build_proposal`
+        // to jitter into a proposal of SD 1e5 (#2650).
+        let cov = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+        let omega = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 4.0]);
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        let want = omega.clone().try_inverse().expect("Ω is invertible");
+        assert!(
+            (&h - &want).abs().max() < 1e-12,
+            "got {h}, want Ω⁻¹ = {want}"
+        );
+    }
+
     #[test]
     fn covariance_to_proposal_hessian_caps_exploding_diagonal() {
         // A heavy-tailed-outlier-inflated covariance is capped at Ωii so the
@@ -4979,15 +5222,14 @@ mod tests {
     }
 
     #[test]
-    fn covariance_to_proposal_hessian_falls_back_on_non_pd() {
-        // An indefinite covariance is not Cholesky-invertible → zero matrix,
-        // signalling `build_proposal` to use its Ω fallback.
+    fn covariance_to_proposal_hessian_is_zero_only_when_omega_is_not_pd() {
+        // With no usable covariance and no usable Ω there is nothing left to return.
         let cov = DMatrix::from_row_slice(2, 2, &[1.0, 5.0, 5.0, 1.0]);
-        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0, 1.0]));
+        let omega = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
         assert!(
             h.iter().all(|&v| v == 0.0),
-            "non-PD covariance must yield the zero fallback"
+            "a non-PD Ω must yield the zero matrix, got {h}"
         );
     }
 
@@ -5066,6 +5308,8 @@ mod tests {
         let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("imp mixture");
         assert!(res.ofv.is_finite());
         assert!(res.mixture_posteriors.is_some());
+        // The mixture loop keeps its own objective, so it records its own baseline (#2652).
+        assert!(res.mcem_lowest_objective.is_some_and(f64::is_finite));
     }
 
     /// Estimating IMP/IMPMAP rejects a mixture with per-class Ω/Σ overrides.
@@ -5806,9 +6050,23 @@ mod tests {
         pop: &Population,
         params: &ModelParameters,
     ) -> ImportanceSamplingResult {
+        // Adapting routes through the E-step's own draw code; this check needs
+        // `subject_is_estimate_joint`, the separate estimator.
+        joint_is_with(model, pop, params, 0, 0.0)
+    }
+
+    fn joint_is_with(
+        model: &CompiledModel,
+        pop: &Population,
+        params: &ModelParameters,
+        passes: usize,
+        alpha: f64,
+    ) -> ImportanceSamplingResult {
         let mut opts = FitOptions::default();
         opts.imp_samples = 2000;
         opts.imp_seed = Some(5);
+        opts.imp_adapt_passes = passes;
+        opts.imp_defensive_alpha = alpha;
         let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
         let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
             model,
@@ -5845,6 +6103,9 @@ mod tests {
         let mut opts = FitOptions::default();
         opts.imp_samples = 2000;
         opts.imp_seed = Some(5);
+        // The single-proposal evaluator: what the kernels under test run with no
+        // adaptive pilots (#2653) in front of them.
+        opts.imp_adapt_passes = 0;
         tweak(&mut opts);
         let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
         let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
@@ -5965,6 +6226,20 @@ mod tests {
             "α = 0.2 left the IOV readout unchanged"
         );
         assert!(gap < ALPHA_GAP_BOUND, "gap {gap}");
+    }
+
+    /// The adaptive and the single-proposal evaluation of a joint (η, κ) subject
+    /// draw from different proposals, so their marginals must agree within MC
+    /// error. Since #2627 both share the sampler and the per-draw scorer, so this
+    /// pins the adaptation's wiring, not a second likelihood implementation.
+    #[test]
+    fn adapted_joint_marginal_agrees_with_the_single_proposal_estimator() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = &model.default_params;
+        crate::estimation::importance_sampling::assert_adaptive_evaluation_is_wired(
+            |passes, alpha| joint_is_with(&model, &pop, params, passes, alpha),
+        );
     }
 
     /// The trace −2LL of an IOV fit is the joint (η, κ) marginal. Iteration 1's

@@ -717,6 +717,15 @@ fn a2_a_start_that_floors_tve0_reaches_nonmems_optimum() {
             "{label} {start:?}: {:?}",
             f.warnings
         );
+        // #2629: a restart that leaves EMAX below its probe point (1e-3 of its start) is
+        // probed and demoted; this anchor's restart lands on the optimum, EMAX far above it.
+        assert!(
+            f.theta[1] > 1e-3 * start[1]
+                && !f.warnings.iter().any(|w| w.contains("below 1/1000 of")),
+            "{label} {start:?}: EMAX {} near the floor: {:?}",
+            f.theta[1],
+            f.warnings
+        );
         assert!(
             (f.ofv - obj).abs() < band,
             "{label} {start:?}: converged at {} vs NONMEM {obj}",

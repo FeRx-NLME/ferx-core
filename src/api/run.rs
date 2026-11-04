@@ -12,8 +12,8 @@ use crate::io::data_source::DataSource;
 use crate::io::datareader::{
     read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped, read_nonmem_csv_routed,
     read_nonmem_csv_routed_from, read_nonmem_csv_with_covariates_filtered_mapped,
-    read_nonmem_csv_with_covariates_mapped, CsvInput, MissingDvPolicy, ObsRouting, SelectionFilter,
-    ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
+    read_nonmem_csv_with_covariates_mapped, CovariateReads, CsvInput, MissingDvPolicy, ObsRouting,
+    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -1296,6 +1296,28 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
         .with_no_carry_forward(no_carry_forward)
+        // `W_COVARIATE_MISSING` only for a column a relation reads (#2599).
+        .with_warn_missing_covariates(columns_read_by_relations(model))
+}
+
+/// Every data column a relation of `model` reads, the set `W_COVARIATE_MISSING`
+/// is raised for (#2599); the reader adds the columns its `[data_selection]`
+/// filter reads. Matched exactly: the required [`referenced_columns`], which are
+/// case-sensitive. Matched in any case: the `[output]` columns echoed from the
+/// data, resolved case-insensitively. Matched as `[derived]` resolves them (the
+/// verbatim, uppercase or lowercase spelling of the column): the names a
+/// `[derived]` expression looks up at evaluation time (not required columns, so
+/// not in `referenced_covariates`). A column only declared in `[covariates]` or
+/// listed in `covariate_columns`, with nothing reading it, is in neither — a gap
+/// in it reaches neither the objective nor an output.
+fn columns_read_by_relations(model: &CompiledModel) -> CovariateReads {
+    CovariateReads {
+        exact: referenced_columns(model).into_iter().collect(),
+        any_case: super::output_columns::output_echo_columns(model)
+            .cloned()
+            .collect(),
+        derived: model.derived_reads().iter().cloned().collect(),
+    }
 }
 
 /// Whether this model routes any observation row to its endpoint **by CMT** (#1409).

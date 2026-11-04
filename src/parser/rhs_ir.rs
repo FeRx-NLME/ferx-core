@@ -19,6 +19,16 @@
 //! [`Lanes`]): the operand association, `0 − g` for a reversed subtraction, `ib = 1/b`
 //! computed once, the out-of-line duals' full product for a constant operand. Lowered
 //! without contraction or folding, the native code is bit for bit the register code.
+//!
+//! **An inline `if` is computed on both arms and selected.** The register code branches
+//! ([`Flat::Branch`]); here both arms are straight-line code and each value the arms write is
+//! a [`Inst::Select`] on the condition, so every lane is the taken arm's, bit for bit. The
+//! dead arm may compute a `NaN` or an infinity (a `powf` of a negative base, an `exp`
+//! overflow) that the select discards — but a reverse pass that merely sent it a zero adjoint
+//! would still multiply that zero by its values (`0·∞ = NaN`) into the inputs' adjoints. So
+//! every instruction an arm emits carries the condition under which it is live
+//! ([`Func::live`]), and the reverse pass selects each of its local derivatives against that
+//! condition: a dead arm contributes an exact zero, whatever it computed.
 use super::{Arith, Flat, Unary};
 
 /// An instruction's index in its [`Func`].
@@ -32,17 +42,35 @@ pub(super) enum Shim1 {
     Round,
 }
 
-/// A comparison, producing a condition for [`Inst::Select`].
+/// A comparison, producing a condition for [`Inst::Select`]: Rust's (and IEEE's) ordered
+/// comparisons, and `!=`, which holds when either side is `NaN`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Cc {
     Lt,
+    Le,
     Gt,
     Ge,
     Eq,
+    Ne,
+}
+
+impl Cc {
+    /// `a cc b`, as the interpreter's `Cmp*` ops decide it.
+    #[inline(always)]
+    pub(super) fn holds(self, a: f64, b: f64) -> bool {
+        match self {
+            Cc::Lt => a < b,
+            Cc::Le => a <= b,
+            Cc::Gt => a > b,
+            Cc::Ge => a >= b,
+            Cc::Eq => a == b,
+            Cc::Ne => a != b,
+        }
+    }
 }
 
 /// One scalar instruction. `f64`-valued unless it is a condition ([`Inst::Cmp`],
-/// [`Inst::And`]).
+/// [`Inst::And`], [`Inst::Or`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Inst {
     /// `arg[off]`.
@@ -65,6 +93,7 @@ pub(super) enum Inst {
     Powf(V, V),
     Cmp(Cc, V, V),
     And(V, V),
+    Or(V, V),
     /// `cond ? a : b`.
     Select(V, V, V),
     /// `arg[off] = v`.
@@ -80,6 +109,12 @@ pub(super) enum Inst {
 pub(super) struct Func {
     pub(super) insts: Vec<Inst>,
     pub(super) n_args: u8,
+    /// Per instruction: the condition under which its value is used — the arm of an `if` it
+    /// was emitted in (the conjunction, for nested ones), or `None` outside every arm. What
+    /// [`reverse`] masks a dead arm's derivatives with.
+    pub(super) live: Vec<Option<V>>,
+    /// The condition the next instruction is emitted under.
+    cur: Option<V>,
 }
 
 impl Func {
@@ -87,10 +122,13 @@ impl Func {
         Func {
             insts: Vec::new(),
             n_args,
+            live: Vec::new(),
+            cur: None,
         }
     }
     fn push(&mut self, i: Inst) -> V {
         self.insts.push(i);
+        self.live.push(self.cur);
         (self.insts.len() - 1) as V
     }
     fn k(&mut self, c: f64) -> V {
@@ -153,11 +191,25 @@ pub(super) const fn slot(l: Layout) -> Option<usize> {
 /// One value's lanes.
 type Lanes = Vec<V>;
 
+/// An `if` [`Lower`] is inside: its condition, and each arm's results so far.
+struct Arm {
+    /// The condition's value is `0`: the else arm is taken.
+    is_else: V,
+    /// The conditions the else arm and the code around the `if` are live under.
+    else_live: Option<V>,
+    outer: Option<V>,
+    /// Where the `if` ends, known once the then arm's [`Flat::Jump`] is reached.
+    end: Option<usize>,
+    then_vals: Vec<(u16, Lanes)>,
+    else_vals: Vec<(u16, Lanes)>,
+}
+
 /// Emits [`Flat`] instructions over a [`Layout`]'s lanes into a [`Func`].
 pub(super) struct Lower<'a> {
     pub(super) f: &'a mut Func,
     pub(super) layout: Layout,
     regs: Vec<Lanes>,
+    arms: Vec<Arm>,
 }
 
 impl<'a> Lower<'a> {
@@ -166,6 +218,73 @@ impl<'a> Lower<'a> {
             f,
             layout,
             regs: vec![Vec::new(); n_regs],
+            arms: Vec::new(),
+        }
+    }
+    /// Close every `if` that ends at instruction `at`: each value its arms write becomes the
+    /// select of the else arm's lanes on `is_else` over the then arm's. A caller that walks
+    /// the program calls it at every instruction index, whether or not it emits that
+    /// instruction, and once at the end.
+    pub(super) fn reach(&mut self, at: usize) {
+        while self.arms.last().is_some_and(|a| a.end == Some(at)) {
+            let arm = self.arms.pop().expect("checked");
+            self.f.cur = arm.outer;
+            for (d, t) in &arm.then_vals {
+                let e = &arm
+                    .else_vals
+                    .iter()
+                    .find(|(x, _)| x == d)
+                    .expect("both arms write an `if`'s value")
+                    .1;
+                let l = Alg::select(self, arm.is_else, e, t);
+                self.set(*d, l);
+            }
+        }
+    }
+    /// The conjunction of the current condition with `c`.
+    fn within(&mut self, c: V) -> Option<V> {
+        Some(match self.f.cur {
+            None => c,
+            Some(o) => self.f.push(Inst::And(o, c)),
+        })
+    }
+    /// An `if`'s control instruction: open it, switch to its else arm, or record an arm's
+    /// result.
+    fn control(&mut self, f: &Flat) {
+        match *f {
+            Flat::Branch { c, .. } => {
+                let c0 = self.regs[c as usize][0];
+                let z = self.k(0.0);
+                let is_else = self.ins(Inst::Cmp(Cc::Eq, c0, z));
+                let is_then = self.ins(Inst::Cmp(Cc::Ne, c0, z));
+                let outer = self.f.cur;
+                let then_live = self.within(is_then);
+                let else_live = self.within(is_else);
+                self.arms.push(Arm {
+                    is_else,
+                    else_live,
+                    outer,
+                    end: None,
+                    then_vals: Vec::new(),
+                    else_vals: Vec::new(),
+                });
+                self.f.cur = then_live;
+            }
+            Flat::Jump { to } => {
+                let arm = self.arms.last_mut().expect("a `Jump` closes a then arm");
+                arm.end = Some(to as usize);
+                self.f.cur = arm.else_live;
+            }
+            Flat::Move { d, a } => {
+                let l = self.regs[a as usize].clone();
+                let arm = self.arms.last_mut().expect("a `Move` ends an arm");
+                if arm.end.is_none() {
+                    arm.then_vals.push((d, l));
+                } else {
+                    arm.else_vals.push((d, l));
+                }
+            }
+            _ => unreachable!("not a control instruction"),
         }
     }
     fn lanes(&self) -> usize {
@@ -436,10 +555,14 @@ impl<'a> Lower<'a> {
         self.select(cond, &const_exp, &general)
     }
 
-    /// Emit one register instruction; `args` are the argument indices of `u`, `params`,
-    /// `seeds` and `du`.
-    pub(super) fn flat(&mut self, f: &Flat, args: [u8; 4]) {
-        emit(self, f, args)
+    /// Emit register instruction `at` (after [`Self::reach`]ing it); `args` are the argument
+    /// indices of `u`, `params`, `seeds` and `du`.
+    pub(super) fn flat(&mut self, at: usize, f: &Flat, args: [u8; 4]) {
+        self.reach(at);
+        match f {
+            Flat::Branch { .. } | Flat::Jump { .. } | Flat::Move { .. } => self.control(f),
+            _ => emit(self, f, args),
+        }
     }
     fn abs(&mut self, a: &[V]) -> Lanes {
         // `f64::abs` on one lane; `DualV::abs`'s `v ≥ 0` select on a dual.
@@ -676,16 +799,61 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
             let x = al.reg(a);
             al.store(du, state as usize, &x);
         }
+        // A condition is the dual constant `0` or `1`, as the interpreter pushes it.
+        Flat::Cmp { d, cc, a, b } => {
+            let (x, y) = (al.reg(a)[0], al.reg(b)[0]);
+            let c = al.ins(Inst::Cmp(cc, x, y));
+            let l = bool01(al, c);
+            al.set(d, l);
+        }
+        Flat::And { d, a, b } | Flat::Or { d, a, b } => {
+            let z = al.k(0.0);
+            let (x, y) = (al.reg(a)[0], al.reg(b)[0]);
+            let x = al.ins(Inst::Cmp(Cc::Ne, x, z));
+            let y = al.ins(Inst::Cmp(Cc::Ne, y, z));
+            let c = al.ins(match *f {
+                Flat::And { .. } => Inst::And(x, y),
+                _ => Inst::Or(x, y),
+            });
+            let l = bool01(al, c);
+            al.set(d, l);
+        }
+        Flat::Not { d, a } => {
+            let z = al.k(0.0);
+            let x = al.reg(a)[0];
+            let c = al.ins(Inst::Cmp(Cc::Eq, x, z));
+            let l = bool01(al, c);
+            al.set(d, l);
+        }
+        // Ordered equality is false exactly for a `NaN`.
+        Flat::Present { d, a } => {
+            let x = al.reg(a)[0];
+            let c = al.ins(Inst::Cmp(Cc::Eq, x, x));
+            let l = bool01(al, c);
+            al.set(d, l);
+        }
+        Flat::Branch { .. } | Flat::Jump { .. } | Flat::Move { .. } => {
+            unreachable!("`Lower::flat` handles an `if`'s control instructions")
+        }
     }
+}
+
+/// `T::from_f64(if c { 1 } else { 0 })`.
+fn bool01<A: Alg>(al: &mut A, c: V) -> Lanes {
+    let one = al.k(1.0);
+    let z = al.k(0.0);
+    let v = al.ins(Inst::Select(c, one, z));
+    al.constant(v)
 }
 
 /// The whole program over `layout`: `fn(u, params, seeds, du)`.
 pub(super) fn forward(code: &[Flat], n_regs: usize, layout: Layout) -> Func {
     let mut f = Func::new(4);
     let mut l = Lower::new(&mut f, layout, n_regs);
-    for i in code {
-        l.flat(i, [0, 1, 2, 3]);
+    for (at, i) in code.iter().enumerate() {
+        l.flat(at, i, [0, 1, 2, 3]);
     }
+    l.reach(code.len());
     f
 }
 
@@ -696,7 +864,8 @@ pub(super) fn forward(code: &[Flat], n_regs: usize, layout: Layout) -> Func {
 /// adjoint buffer (the last store to a location is the one that counts), applies every
 /// instruction's local derivative in reverse order, and adds each loaded location's
 /// adjoint into its input's adjoint buffer. Conditions carry no derivative; a select
-/// passes the adjoint to the operand it chose.
+/// passes the adjoint to the operand it chose; an instruction emitted in an `if` arm
+/// contributes its local derivatives only where that arm is live ([`Func::live`]).
 pub(super) fn reverse(fwd: &Func) -> Func {
     let n = fwd.n_args;
     let mut b = Func::new(2 * n);
@@ -723,13 +892,24 @@ pub(super) fn reverse(fwd: &Func) -> Func {
             Inst::Powf(x, y) => Inst::Powf(r(x), r(y)),
             Inst::Cmp(c, x, y) => Inst::Cmp(c, r(x), r(y)),
             Inst::And(x, y) => Inst::And(r(x), r(y)),
+            Inst::Or(x, y) => Inst::Or(r(x), r(y)),
             Inst::Select(c, x, y) => Inst::Select(r(c), r(x), r(y)),
         };
         map[i] = b.push(m);
     }
     // Adjoints, indexed by forward instruction.
     let mut adj: Vec<Option<V>> = vec![None; fwd.insts.len()];
-    fn acc(b: &mut Func, adj: &mut [Option<V>], x: V, d: V, negate: bool) {
+    // The condition the instruction being differentiated is live under, in `b`.
+    let mut live: Option<V> = None;
+    fn acc(b: &mut Func, adj: &mut [Option<V>], live: Option<V>, x: V, d: V, negate: bool) {
+        // A dead arm's derivative is an exact zero, whatever its values were.
+        let d = match live {
+            Some(c) => {
+                let z = b.k(0.0);
+                b.push(Inst::Select(c, d, z))
+            }
+            None => d,
+        };
         let slot = &mut adj[x as usize];
         *slot = Some(match (*slot, negate) {
             (None, false) => d,
@@ -742,53 +922,55 @@ pub(super) fn reverse(fwd: &Func) -> Func {
     stores.sort_unstable_by_key(|&((a, o), _)| (a, o));
     for ((arg, off), v) in stores {
         let seed = b.push(Inst::Load { arg: n + arg, off });
-        acc(&mut b, &mut adj, v, seed, false);
+        acc(&mut b, &mut adj, live, v, seed, false);
     }
     let mut loads: Vec<((u8, u32), V)> = Vec::new();
     for i in (0..fwd.insts.len()).rev() {
         let Some(g) = adj[i] else { continue };
         let fw = |x: V| map[x as usize];
+        live = fwd.live.get(i).copied().flatten().map(fw);
         match fwd.insts[i] {
+            // A load is never emitted in an arm (the prologue loads every input).
             Inst::Load { arg, off } => loads.push(((arg, off), g)),
-            Inst::Const(_) | Inst::Store { .. } | Inst::Cmp(..) | Inst::And(..) => {}
+            Inst::Const(_) | Inst::Store { .. } | Inst::Cmp(..) | Inst::And(..) | Inst::Or(..) => {}
             Inst::Floor(_) | Inst::Ceil(_) | Inst::Call1(Shim1::Round, _) => {}
             Inst::Add(x, y) => {
-                acc(&mut b, &mut adj, x, g, false);
-                acc(&mut b, &mut adj, y, g, false);
+                acc(&mut b, &mut adj, live, x, g, false);
+                acc(&mut b, &mut adj, live, y, g, false);
             }
             Inst::Sub(x, y) => {
-                acc(&mut b, &mut adj, x, g, false);
-                acc(&mut b, &mut adj, y, g, true);
+                acc(&mut b, &mut adj, live, x, g, false);
+                acc(&mut b, &mut adj, live, y, g, true);
             }
             Inst::Mul(x, y) => {
                 let dx = b.push(Inst::Mul(g, fw(y)));
-                acc(&mut b, &mut adj, x, dx, false);
+                acc(&mut b, &mut adj, live, x, dx, false);
                 let dy = b.push(Inst::Mul(g, fw(x)));
-                acc(&mut b, &mut adj, y, dy, false);
+                acc(&mut b, &mut adj, live, y, dy, false);
             }
             Inst::Div(x, y) => {
                 // `q = x/y`: `dx = g/y`, `dy = −(g/y)·q`.
                 let t = b.push(Inst::Div(g, fw(y)));
-                acc(&mut b, &mut adj, x, t, false);
+                acc(&mut b, &mut adj, live, x, t, false);
                 let dy = b.push(Inst::Mul(t, map[i]));
-                acc(&mut b, &mut adj, y, dy, true);
+                acc(&mut b, &mut adj, live, y, dy, true);
             }
-            Inst::Neg(x) => acc(&mut b, &mut adj, x, g, true),
+            Inst::Neg(x) => acc(&mut b, &mut adj, live, x, g, true),
             Inst::Abs(x) => {
                 // `|x|′` as the duals take it: `+1` for `x ≥ 0`.
                 let z = b.k(0.0);
                 let nonneg = b.push(Inst::Cmp(Cc::Ge, fw(x), z));
                 let ng = b.push(Inst::Neg(g));
                 let d = b.push(Inst::Select(nonneg, g, ng));
-                acc(&mut b, &mut adj, x, d, false);
+                acc(&mut b, &mut adj, live, x, d, false);
             }
             Inst::Call1(Shim1::Exp, x) => {
                 let d = b.push(Inst::Mul(g, map[i]));
-                acc(&mut b, &mut adj, x, d, false);
+                acc(&mut b, &mut adj, live, x, d, false);
             }
             Inst::Call1(Shim1::Ln, x) => {
                 let d = b.push(Inst::Div(g, fw(x)));
-                acc(&mut b, &mut adj, x, d, false);
+                acc(&mut b, &mut adj, live, x, d, false);
             }
             Inst::Powf(x, y) => {
                 // `r = xʸ`: `dx = g·y·x^(y−1)`; `dy = g·r·ln x` for `x > 0`, and `0` where
@@ -798,21 +980,21 @@ pub(super) fn reverse(fwd: &Func) -> Func {
                 let p = b.push(Inst::Powf(fw(x), ym1));
                 let yp = b.push(Inst::Mul(fw(y), p));
                 let dx = b.push(Inst::Mul(g, yp));
-                acc(&mut b, &mut adj, x, dx, false);
+                acc(&mut b, &mut adj, live, x, dx, false);
                 let lx = b.push(Inst::Call1(Shim1::Ln, fw(x)));
                 let rl = b.push(Inst::Mul(map[i], lx));
                 let dy = b.push(Inst::Mul(g, rl));
                 let z = b.k(0.0);
                 let pos = b.push(Inst::Cmp(Cc::Gt, fw(x), z));
                 let dy = b.push(Inst::Select(pos, dy, z));
-                acc(&mut b, &mut adj, y, dy, false);
+                acc(&mut b, &mut adj, live, y, dy, false);
             }
             Inst::Select(c, x, y) => {
                 let z = b.k(0.0);
                 let dx = b.push(Inst::Select(fw(c), g, z));
-                acc(&mut b, &mut adj, x, dx, false);
+                acc(&mut b, &mut adj, live, x, dx, false);
                 let dy = b.push(Inst::Select(fw(c), z, g));
-                acc(&mut b, &mut adj, y, dy, false);
+                acc(&mut b, &mut adj, live, y, dy, false);
             }
         }
     }
@@ -863,16 +1045,15 @@ pub(super) fn interpret(f: &Func, args: &mut [&mut [f64]]) {
             Inst::Call1(Shim1::Round, a) => r(a).round(),
             Inst::Powf(a, b) => r(a).powf(r(b)),
             Inst::Cmp(cc, a, b) => {
-                c[i] = match cc {
-                    Cc::Lt => r(a) < r(b),
-                    Cc::Gt => r(a) > r(b),
-                    Cc::Ge => r(a) >= r(b),
-                    Cc::Eq => r(a) == r(b),
-                };
+                c[i] = cc.holds(r(a), r(b));
                 0.0
             }
             Inst::And(a, b) => {
                 c[i] = c[a as usize] && c[b as usize];
+                0.0
+            }
+            Inst::Or(a, b) => {
+                c[i] = c[a as usize] || c[b as usize];
                 0.0
             }
             Inst::Select(k, a, b) => {
@@ -936,16 +1117,15 @@ pub(super) fn interpret_tangent(f: &Func, args: &[&[f64]], dargs: &mut [Vec<f64>
                 (p, da + db)
             }
             Inst::Cmp(cc, a, b) => {
-                c[i] = match cc {
-                    Cc::Lt => r(a) < r(b),
-                    Cc::Gt => r(a) > r(b),
-                    Cc::Ge => r(a) >= r(b),
-                    Cc::Eq => r(a) == r(b),
-                };
+                c[i] = cc.holds(r(a), r(b));
                 (0.0, 0.0)
             }
             Inst::And(a, b) => {
                 c[i] = c[a as usize] && c[b as usize];
+                (0.0, 0.0)
+            }
+            Inst::Or(a, b) => {
+                c[i] = c[a as usize] || c[b as usize];
                 (0.0, 0.0)
             }
             Inst::Select(k, a, b) => {

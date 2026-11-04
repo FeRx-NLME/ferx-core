@@ -2259,6 +2259,7 @@ pub fn run_bayes(
         mixture_posteriors,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: None,
     })
 }
 

@@ -239,6 +239,51 @@ fn iiv_on_ruv_model() -> String {
     std::fs::read_to_string("examples/iiv_on_ruv.ferx").expect("example")
 }
 
+/// #2656: `iiv_on_ruv` next to a dense `R` carries each correlation's estimators and no
+/// more, and whatever is left over refuses on its own code: `gn` on `block_sigma`'s method
+/// gate, everything but FOCE/FOCEI on `correlation`'s scope, and a non-interaction stage on
+/// `iiv_on_ruv`'s. `ferx check` reports what `fit()` refuses.
+#[test]
+fn iiv_on_ruv_with_a_dense_r_refuses_only_what_each_half_refuses() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let twin = |name: &str| {
+        std::fs::read_to_string(format!("{root}/nonmem_anchor/iiv_ruv_dense/{name}.ferx")).unwrap()
+    };
+    let with_method = |src: &str, m: &str| src.replace("method = focei", &format!("method = {m}"));
+    let errors = |src: &str| -> Vec<String> {
+        check_codes(src)
+            .into_iter()
+            .filter(|c| c.starts_with("E_"))
+            .collect()
+    };
+    let block = twin("pair");
+    for m in ["focei", "saem", "imp", "laplace", "vi"] {
+        assert_eq!(errors(&with_method(&block, m)), Vec::<String>::new(), "{m}");
+    }
+    assert_eq!(
+        errors(&with_method(&block, "gn")),
+        ["E_BLOCK_SIGMA_METHOD_UNSUPPORTED"],
+    );
+    assert_eq!(
+        errors(&with_method(&block, "foce")),
+        ["E_IIV_ON_RUV_METHOD"]
+    );
+
+    let serial = twin("triple");
+    assert_eq!(errors(&serial), Vec::<String>::new());
+    for m in ["saem", "imp", "laplace", "vi"] {
+        assert_eq!(
+            errors(&with_method(&serial, m)),
+            ["E_RESIDUAL_CORRELATION_SCOPE"],
+            "{m}"
+        );
+    }
+    assert_eq!(
+        errors(&with_method(&serial, "foce")),
+        ["E_IIV_ON_RUV_METHOD"]
+    );
+}
+
 /// A shared η is `E_IIV_ON_RUV_SHARED_ETA` on `error_model`; a non-interaction method
 /// is `E_IIV_ON_RUV_METHOD` on `fit_options`. Both are reported by `ferx check`, which
 /// before #1788 called both files valid.

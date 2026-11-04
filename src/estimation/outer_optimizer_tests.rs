@@ -4947,8 +4947,7 @@ fn a_diverged_candidate_never_displaces_a_finite_one() {
 
 #[test]
 fn the_cold_verdict_separates_reproduction_from_a_material_gap() {
-    // Measured FREM gap: 6.96 on a reported -174.91 → the tolerance is
-    // 1e-3 * (1 + 174.91) = 0.176, so this is ~40x over.
+    // Measured FREM gap: 6.96 on a reported -174.91, well over `BASIN_SHIFT_ABS_TOL`.
     match cold_solve_verdict(-167.95, -174.91) {
         ColdSolveVerdict::Worse(gap) => assert!((gap - 6.96).abs() < 1e-9, "gap = {gap}"),
         other => panic!("expected a material gap, got {other:?}"),
@@ -4962,9 +4961,9 @@ fn the_cold_verdict_separates_reproduction_from_a_material_gap() {
         cold_solve_verdict(-200.0, -174.91),
         ColdSolveVerdict::Reproduces
     );
-    // The threshold itself: 1e-3 * (1 + 100) = 0.101, so 0.05 is inside and 0.5 is not.
+    // A gap inside the bound is noise, and 0.5 is not.
     assert_eq!(
-        cold_solve_verdict(-99.95, -100.0),
+        cold_solve_verdict(-99.96, -100.0),
         ColdSolveVerdict::Reproduces
     );
     assert!(matches!(
@@ -4974,6 +4973,173 @@ fn the_cold_verdict_separates_reproduction_from_a_material_gap() {
     // `missed()` is what gates the extra candidates.
     assert!(!cold_solve_verdict(-174.91, -174.91).missed());
     assert!(cold_solve_verdict(-99.5, -100.0).missed());
+}
+
+/// #2646: the bound is absolute. A differential pair straddling it at the OFV magnitudes
+/// the issue measured, each of which a relative `1e-3·(1 + |OFV|)` calls a reproduction:
+/// that rule's tolerance is 4.3 at CJ's OFV and 186 at VE's.
+#[test]
+fn a_cold_gap_is_material_at_the_same_size_at_any_ofv() {
+    let tol = BASIN_SHIFT_ABS_TOL;
+    for best in [-3038.980203, 4309.773713, 186184.281524] {
+        let (above, below) = (best + tol + 1e-6, best + tol - 1e-6);
+        assert!(above - best > tol && below - best < tol, "the straddle");
+        assert!(
+            matches!(cold_solve_verdict(above, best), ColdSolveVerdict::Worse(_)),
+            "a gap just above {tol} at OFV {best} is material"
+        );
+        assert_eq!(
+            cold_solve_verdict(below, best),
+            ColdSolveVerdict::Reproduces,
+            "a gap just below {tol} at OFV {best} is noise"
+        );
+    }
+    // The issue's three rows.
+    for (best, cold) in [
+        (4309.773713, 4312.092713),
+        (186184.281524, 186184.649359),
+        (-3038.980203, -3038.866194),
+    ] {
+        assert!(cold_solve_verdict(cold, best).missed(), "{cold} vs {best}");
+    }
+}
+
+/// `lowest_per_subject` on three subjects and two candidates: each candidate wins one
+/// subject, one subject ties, and the winner's η̂, `H` and κ̂ all travel together.
+#[test]
+fn each_subject_takes_its_own_lowest_candidate_whole() {
+    let candidate = |tag: f64| -> EbeCandidate {
+        (
+            vec![DVector::from_element(1, tag); 3],
+            vec![DMatrix::from_element(1, 1, tag + 0.5); 3],
+            vec![vec![DVector::from_element(1, tag + 0.25)]; 3],
+            0.0,
+        )
+    };
+    let candidates = [candidate(1.0), candidate(2.0)];
+    let terms = [vec![5.0, 7.0, 3.0], vec![6.0, 4.0, 3.0]];
+    let ((etas, h_mats, kappas), source) = lowest_per_subject(&candidates, &terms, 0);
+    assert_eq!(source, [0, 1, 0], "a tie stays on the base");
+    let tags: Vec<f64> = etas.iter().map(|e| e[0]).collect();
+    assert_eq!(tags, [1.0, 2.0, 1.0]);
+    let hs: Vec<f64> = h_mats.iter().map(|h| h[(0, 0)]).collect();
+    assert_eq!(hs, [1.5, 2.5, 1.5], "`H` stays with its η̂");
+    let ks: Vec<f64> = kappas.iter().map(|k| k[0][0]).collect();
+    assert_eq!(ks, [1.25, 2.25, 1.25], "κ̂ stays with its η̂");
+    assert_eq!(
+        lowest_per_subject(&candidates, &terms, 1).1,
+        [0, 1, 1],
+        "a tie stays on whichever candidate is the base"
+    );
+
+    // A subject moves only for a material gain. Terms are `nll`s and the bound is on `−2LL`,
+    // so the pair straddles it at half its size.
+    let half = BASIN_SHIFT_ABS_TOL / 2.0;
+    let terms = [
+        vec![10.0 + half + 1e-6, 10.0 + half - 1e-6, 10.0],
+        vec![10.0, 10.0, 10.0],
+    ];
+    assert_eq!(lowest_per_subject(&candidates, &terms, 0).1, [1, 0, 0]);
+
+    // A non-finite term never wins, and a non-finite base term always gives way.
+    let terms = [
+        vec![f64::NAN, 1.0, f64::NEG_INFINITY],
+        vec![2.0, f64::NAN, 3.0],
+    ];
+    assert_eq!(lowest_per_subject(&candidates, &terms, 0).1, [1, 0, 1]);
+
+    // No κ̂ at all stays no κ̂ at all: postfit branches on `kappas.is_empty()`.
+    let bare = |tag: f64| -> EbeCandidate {
+        let (etas, h_mats, _, ofv) = candidate(tag);
+        (etas, h_mats, Vec::new(), ofv)
+    };
+    let terms = [vec![1.0, 2.0, 3.0], vec![3.0, 1.0, 1.0]];
+    let ((_, _, kappas), _) = lowest_per_subject(&[bare(1.0), bare(2.0)], &terms, 0);
+    assert!(kappas.is_empty());
+}
+
+/// Terms are `nll`s and the bound is on `−2LL`, so the pair straddles it at half its size.
+/// A subject the cold solve wins is never named, and the largest gap comes first.
+#[test]
+fn the_subjects_a_cold_solve_lost_are_the_material_ones_largest_first() {
+    let population = Population {
+        subjects: ["small", "big", "noise", "cold-wins", "nan"]
+            .map(|id| Subject {
+                id: id.into(),
+                ..Subject::default()
+            })
+            .to_vec(),
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let half = BASIN_SHIFT_ABS_TOL / 2.0;
+    let cold = [10.0 + half + 1e-6, 12.0, 10.0 + half - 1e-6, 9.0, f64::NAN];
+    let other = [10.0, 10.0, 10.0, 11.0, 1.0];
+    assert_eq!(
+        subjects_cold_lost(&population, &cold, &other),
+        ["big", "small"]
+    );
+}
+
+/// #2646: the message names who the cold solve missed on, and only when there is someone
+/// to name. Each clause is pinned by the assertion beside it.
+#[test]
+fn the_start_dependence_warning_names_the_subjects() {
+    let ids: Vec<String> = ["53", "250"].map(String::from).to_vec();
+    let w = ebe_start_dependence_warning(4312.0927, 4309.7737, &ids).expect("2.3 is material");
+    assert!(w.contains("2.3190 OFV units worse"), "{w}");
+    assert!(
+        w.contains("(4312.0927 vs the reported 4309.7737), on 2 subjects (53, 250)."),
+        "{w}"
+    );
+    assert!(
+        w.contains("lowest-scoring candidate, subject by subject"),
+        "{w}"
+    );
+
+    let one = ebe_start_dependence_warning(4312.0927, 4309.7737, &ids[..1]).unwrap();
+    assert!(one.contains("on 1 subject (53)."), "{one}");
+
+    let nobody = ebe_start_dependence_warning(4312.0927, 4309.7737, &[]).unwrap();
+    assert!(nobody.contains("4309.7737). The reported fit"), "{nobody}");
+    assert!(!nobody.contains(", on "), "{nobody}");
+
+    // The list is capped, and the count still covers everyone.
+    let many: Vec<String> = (0..12).map(|i| i.to_string()).collect();
+    let w = ebe_start_dependence_warning(4312.0927, 4309.7737, &many).unwrap();
+    assert!(
+        w.contains("on 12 subjects (0, 1, 2, 3, 4, 5, 6, 7, 8, 9 and 2 more)."),
+        "{w}"
+    );
+
+    // A reproduction stays silent even with names in hand.
+    assert!(ebe_start_dependence_warning(4309.7737, 4309.7737, &ids).is_none());
+}
+
+/// The #2013 warning names EBEs the cold solve moved. A subject another candidate
+/// materially beat is dropped; one that merely came from another candidate by solver noise
+/// keeps its name, since `cold_lost_ids` does not list it. Under AGQ a whole other
+/// candidate's win drops everyone, and with no win nobody.
+#[test]
+fn the_screen_warning_keeps_every_subject_still_on_its_cold_ebes() {
+    let pick = |lost: &[&str], cold_replaced: bool| FinalPick {
+        reported: (Vec::new(), Vec::new(), Vec::new(), 0.0),
+        cold_lost_ids: lost.iter().map(|s| s.to_string()).collect(),
+        cold_replaced,
+    };
+    let moved = || vec!["53".to_string(), "504".to_string()];
+    let mut ids = moved();
+    pick(&["53", "250"], false).retain_cold_reported(&mut ids);
+    assert_eq!(ids, ["504"]);
+    let mut ids = moved();
+    pick(&[], false).retain_cold_reported(&mut ids);
+    assert_eq!(ids, ["53", "504"]);
+    let mut ids = moved();
+    pick(&[], true).retain_cold_reported(&mut ids);
+    assert!(ids.is_empty());
 }
 
 #[test]
@@ -4995,10 +5161,10 @@ fn a_non_finite_cold_solve_is_its_own_verdict() {
 fn the_start_dependence_warning_reports_what_was_measured() {
     // Silent when the cold solve reproduces the reported objective — this is what keeps
     // the warning off ordinary fits.
-    assert!(ebe_start_dependence_warning(-174.91, -174.91).is_none());
-    assert!(ebe_start_dependence_warning(-200.0, -174.91).is_none());
+    assert!(ebe_start_dependence_warning(-174.91, -174.91, &[]).is_none());
+    assert!(ebe_start_dependence_warning(-200.0, -174.91, &[]).is_none());
 
-    let w = ebe_start_dependence_warning(-167.95, -174.91).expect("6.96 is material");
+    let w = ebe_start_dependence_warning(-167.95, -174.91, &[]).expect("6.96 is material");
     assert!(w.contains("6.9600"), "the gap belongs in the message: {w}");
     assert!(w.contains("-167.9500") && w.contains("-174.9100"), "{w}");
     // It must not diagnose multimodality on its own: the regression fixture for this
@@ -5011,7 +5177,7 @@ fn the_start_dependence_warning_reports_what_was_measured() {
     );
 
     // The non-finite arm gets its own message, and it is not silent.
-    let nf = ebe_start_dependence_warning(f64::NAN, -174.91).expect("NaN must be reported");
+    let nf = ebe_start_dependence_warning(f64::NAN, -174.91, &[]).expect("NaN must be reported");
     assert!(nf.contains("non-finite objective"), "{nf}");
 
     // Both arms carry the token that classifies them, so a consumer branching on
@@ -5283,7 +5449,7 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
     assert!(two.contains("of 2 subjects (S1, S2) to"), "{two}");
 
     // At the cap every ID is listed; one past it, the last is counted instead.
-    let cap = SCREEN_MOVED_ID_LIST_CAP;
+    let cap = WARNING_ID_LIST_CAP;
     let at = ebe_screen_moved_warning(&ids(cap)).unwrap();
     assert!(
         at.contains(&format!("S{cap})")) && !at.contains(" more)"),
@@ -9632,6 +9798,396 @@ fn the_basin_probe_runs_on_a_geometric_schedule() {
     assert_eq!(due, vec![32, 64, 128, 256, 512]);
 }
 
+/// The mid-leg probe's restart-or-absorb gate (#2600), on both sides of
+/// `BASIN_PROBE_RESTART_SHARE` and at the sizes that motivated it.
+///
+/// - The `tests/ebe_basin_shift.rs` fixture: one of 10 subjects switches, a tenth of the
+///   objective, and the leg restarts as it did under #2093.
+/// - The #2600 JV fit: 19 / 9 / 3 / 5 / 4 of 5,937 subjects (0.32 % at most) — every leg was
+///   cut at evaluation 32; each of those is now absorbed.
+/// - The boundary itself: 1 % of 5,000 is 50, so 49 absorbs and 50 restarts; a population
+///   under 100 restarts on its first switched subject, and absorbs a gap no subject carries
+///   (a gap spread thinly over the population is noise-like, not a trap).
+/// - No count (AGQ, or no held state at the incumbent) restarts, the pre-#2600 behaviour.
+#[test]
+fn the_basin_probe_restarts_on_a_material_share_and_absorbs_a_handful() {
+    use BasinProbeAction::{Absorb, Restart};
+    assert_eq!(basin_probe_action(Some(1), 10, false), Restart);
+    for k in [19, 9, 3, 5, 4] {
+        assert_eq!(
+            basin_probe_action(Some(k), 5937, false),
+            Absorb,
+            "{k} of 5937"
+        );
+    }
+    assert_eq!(basin_probe_action(Some(49), 5000, false), Absorb);
+    assert_eq!(basin_probe_action(Some(50), 5000, false), Restart);
+    assert_eq!(basin_probe_action(Some(1), 99, false), Restart);
+    assert_eq!(basin_probe_action(Some(0), 99, false), Absorb);
+    assert_eq!(basin_probe_action(Some(0), 5937, false), Absorb);
+    assert_eq!(basin_probe_action(None, 5937, false), Restart);
+    assert_eq!(basin_probe_action(None, 10, false), Restart);
+}
+
+/// A cold probe solve the EBE guard rejects is never absorbed (#2600 review r3): it would
+/// become the incumbent every later valid evaluation must beat. The case: 5,937 subjects,
+/// 4 switched (absorbed when the solve is valid), and a finite, lower cold objective with
+/// 1,000 unconverged subjects (17 %, over the default `max_unconverged_frac` of 10 %) — or one start
+/// rejected, which the guard rejects whatever the fraction.
+#[test]
+fn a_guard_rejected_cold_probe_solve_is_not_absorbed() {
+    use crate::estimation::inner_optimizer::InnerLoopStats;
+    use BasinProbeAction::{Absorb, Restart};
+    let n = 5937;
+    let frac = FitOptions::default().max_unconverged_frac;
+    let unconverged = InnerLoopStats {
+        n_unconverged: 1000,
+        ..Default::default()
+    };
+    let start_rejected = InnerLoopStats {
+        n_start_rejected: 1,
+        ..Default::default()
+    };
+    let clean = InnerLoopStats::default();
+    let cold = 66_533.28;
+    assert!(
+        ebe_guard_rejects(&unconverged, n, cold, frac),
+        "1000 of 5937 trips {frac}"
+    );
+    assert!(ebe_guard_rejects(&start_rejected, n, cold, frac));
+    assert!(!ebe_guard_rejects(&clean, n, cold, frac));
+    for stats in [&unconverged, &start_rejected] {
+        let rejected = ebe_guard_rejects(stats, n, cold, frac);
+        assert_eq!(
+            basin_probe_action(Some(4), n, rejected),
+            Restart,
+            "{stats:?}"
+        );
+    }
+    // The straddle: the same count, a valid solve, absorbs.
+    assert_eq!(
+        basin_probe_action(Some(4), n, ebe_guard_rejects(&clean, n, cold, frac)),
+        Absorb
+    );
+}
+
+/// Inside a #2462 verification leg the basin probe scores against the leg's own incumbent,
+/// not the pre-leg `best_seen` (#2600 review round 2), and outside one against `best_seen`.
+/// The two hold different objectives on purpose (the leg's is at a tighter inner tolerance),
+/// so each side names the tracker it must read.
+#[test]
+fn the_basin_probe_reads_the_active_legs_incumbent() {
+    let mut leg = BestPoint::new();
+    let mut seen = BestPoint::new();
+    assert_eq!(basin_probe_reference(true, &leg, &seen), None);
+    seen.observe(1, &[0.0], 100.0, 99.0);
+    assert_eq!(
+        basin_probe_reference(true, &leg, &seen),
+        None,
+        "not best_seen in a leg"
+    );
+    leg.observe(2, &[0.1], 101.0, 100.5);
+    assert_eq!(
+        basin_probe_reference(true, &leg, &seen),
+        Some(100.5),
+        "the leg's own"
+    );
+    assert_eq!(
+        basin_probe_reference(false, &leg, &seen),
+        Some(99.0),
+        "best_seen outside"
+    );
+}
+
+/// The absorb arm records the cold solve as the incumbent (#2600 review): a warm incumbent
+/// at 100 whose cold re-solve scores 90, then a trial at 95, between the two. Before the
+/// fix only the warm-start cache moved, so `state.best_ofv` and `best_seen` stayed at 100,
+/// the 95 trial counted as an improvement, overwrote the held EBE state and became the
+/// restored point although 90 had been scored. Each tracker is asserted on its own, so a
+/// mutation dropping any one of the updates names it.
+#[test]
+fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
+    let xs_inc = vec![0.1, 0.2, 0.3];
+    let mut state = new_nlopt_state(2, 2, &xs_inc, SalvageGuardPolicy::Off);
+    state.best_ofv = 100.0;
+    state.n_evals = 32;
+    state.pred_jac = Some(vec![vec![DVector::zeros(2); 3]; 2]);
+    let mut best = BestPoint::new();
+    assert!(best.observe(31, &xs_inc, 100.0, 100.0));
+    let warm = |v: f64| IncumbentSolve {
+        xs: xs_inc.clone(),
+        etas: vec![DVector::from_element(2, v); 2],
+        h_mats: vec![DMatrix::identity(2, 2); 2],
+        kappas: vec![Vec::new(); 2],
+        scores: None,
+    };
+    let mut held = Some(warm(1.0));
+    let mut last_gradient = Some(vec![1.0, 2.0, 3.0]);
+    // Feasible baseline 100 last moved at feasible eval 20; 32 feasible evaluations so far.
+    let mut plateau = (100.0, 20usize, 32usize);
+    // The cold solve carries a κ cell per subject, so its warm starts (η then κ, #2674)
+    // differ from its bare η: the cache must be built from this solve, κ included.
+    // Subject 1 differs from subject 0 in both η and κ, so cross-wiring subjects reddens it.
+    let cold = IncumbentSolve {
+        etas: vec![
+            DVector::from_element(2, -0.5),
+            DVector::from_vec(vec![-0.4, -0.3]),
+        ],
+        kappas: vec![
+            vec![DVector::from_element(1, 0.7)],
+            vec![DVector::from_element(1, 0.8)],
+        ],
+        ..warm(-0.5)
+    };
+    let cold_modes = vec![
+        DVector::from_vec(vec![-0.5, -0.5, 0.7]),
+        DVector::from_vec(vec![-0.4, -0.3, 0.8]),
+    ];
+    let model = make_model();
+    absorb_cold_incumbent(
+        &mut state,
+        &mut best,
+        &mut held,
+        &mut last_gradient,
+        &mut plateau,
+        (90.0, 90.0),
+        &model,
+        cold,
+    );
+    assert_eq!(
+        state.cached_etas, cold_modes,
+        "warm starts are the cold solve's η then κ"
+    );
+    assert!(
+        state.pred_jac.is_none(),
+        "the warm modes' response goes with them"
+    );
+    assert_eq!(
+        state.best_ofv, 90.0,
+        "the adoption bar is the cold objective"
+    );
+    assert!(
+        !adopt_warm_start(false, 95.0, state.best_ofv),
+        "95 does not beat 90"
+    );
+    assert_eq!(best.ofv(), 90.0, "best-seen is the cold objective");
+    assert!(
+        !best.observe(33, &[0.4, 0.5, 0.6], 95.0, 95.0),
+        "95 is not restored"
+    );
+    assert_eq!(best.get().map(|b| b.x.clone()), Some(xs_inc.clone()));
+    assert_eq!(
+        held.as_ref().map(|h| h.etas[0][0]),
+        Some(-0.5),
+        "the held EBE state is the cold solve's"
+    );
+    assert!(last_gradient.is_none(), "the warm modes' gradient is stale");
+    assert_eq!(plateau, (90.0, 32, 32), "the drop is progress");
+    // A point below the cold incumbent still wins, as any improvement does.
+    assert!(adopt_warm_start(false, 89.0, state.best_ofv));
+}
+
+/// The basin probe's absorb arm on a real fit, fast enough for every PR (#2674): the
+/// 10-subject Michaelis–Menten trap `tests/fixtures/mm_basin_shift/mm_basin10.csv` with the
+/// warm-start predictor off, once at the shipped share and once at 20 %. The
+/// probe at the 32nd evaluation finds 1 of 10 subjects in a lower cold mode: at the shipped
+/// 1 % it restarts (a second attempt), at 20 % it absorbs and the leg runs on. This is the
+/// fast per-PR twin of the 200-subject A/B below: it pins that the absorb arm is wired into
+/// the probe (making the arm a no-op re-traps the leg, a second probe fires and the end-of-leg
+/// check files a restart: red on the no-restart assertion). What the arm does to the cache and
+/// trackers is pinned by `an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two`:
+/// dropping the cache hand-off or the best-point update leaves this test green (measured on
+/// Linux).
+///
+/// Measured on Linux aarch64 (`tools/linux-test.sh`), identical under `ci-test` and `ci-cov`
+/// (the coverage job's profile): probe gap 7.0741 from 1 subject; restart 63.287990 in 82
+/// evaluations over 2 attempts, absorb 63.287839 in 142 over 1; 3.7 s. Mutation, same setup:
+/// the absorb arm a no-op → absorb arm 2 attempts, a second probe at 7.0723, red.
+///
+/// It fits to convergence yet is ungated: it is seconds, `tests/ebe_basin_shift.rs` already
+/// fits this fixture ungated, and it has to be a lib test because the share override and
+/// the probe's decision log are `cfg(test)` thread-locals. It is the only per-PR test that
+/// reaches the absorb arm; without it the arm is covered only by the slow A/B below.
+#[test]
+fn the_basin_probe_absorbs_one_switched_subject_of_ten() {
+    use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx").unwrap();
+    let parsed = parse_full_model(&text).unwrap();
+    let pop = read_nonmem_csv(
+        Path::new("tests/fixtures/mm_basin_shift/mm_basin10.csv"),
+        None,
+        None,
+    )
+    .unwrap();
+    let opts = FitOptions {
+        verbose: false,
+        ..parsed.fit_options.clone()
+    };
+    let _off = WarmPredictorOff::new();
+    let run = |share: Option<f64>| {
+        BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.set(share));
+        BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().clear());
+        NLOPT_ATTEMPTS.with(|c| c.set(0));
+        let r = optimize_population(&parsed.model, &pop, &parsed.model.default_params, &opts);
+        BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.set(None));
+        let decisions = BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().split_off(0));
+        (r, decisions, NLOPT_ATTEMPTS.with(|c| c.get()))
+    };
+    let (restart, restart_probes, restart_attempts) = run(None);
+    let (absorb, absorb_probes, absorb_attempts) = run(Some(0.2));
+    eprintln!(
+        "restart arm: OFV {:.6} converged {} evals {} attempts {restart_attempts} probes \
+         {restart_probes:?}\nabsorb arm: OFV {:.6} converged {} evals {} attempts \
+         {absorb_attempts} probes {absorb_probes:?}",
+        restart.ofv,
+        restart.converged,
+        restart.n_iterations,
+        absorb.ofv,
+        absorb.converged,
+        absorb.n_iterations,
+    );
+    let restarted = |r: &OuterResult| {
+        r.warnings
+            .iter()
+            .any(|w| w.contains("resumed from the best point seen"))
+    };
+    // The straddle: both arms' first probe sees the same single switched subject, 10 % of
+    // the population: over the shipped 1 %, under the raised 20 %.
+    let first = |p: &[(f64, Option<usize>)]| p.first().and_then(|d| d.1);
+    assert_eq!(
+        first(&restart_probes),
+        Some(1),
+        "the probe must see one subject switch: {restart_probes:?}"
+    );
+    assert_eq!(first(&absorb_probes), Some(1), "{absorb_probes:?}");
+    assert!(restarted(&restart), "at 1 % the probe restarts");
+    assert_eq!(restart_attempts, 2, "the restart is a second attempt");
+    assert!(
+        !restarted(&absorb),
+        "at 20 % the probe absorbs: {:?}",
+        absorb.warnings
+    );
+    assert_eq!(absorb_attempts, 1, "absorbing keeps the one leg");
+    assert!(absorb.converged, "the absorbing leg reaches its own stop");
+    assert!(absorb.ofv.is_finite() && restart.ofv.is_finite());
+    // Measured −1.51e-4 on Linux (−1.43e-4 macOS); 2e-3 is ~13× that, far below the 7.07 gap.
+    assert!(
+        (absorb.ofv - restart.ofv).abs() < 2e-3,
+        "absorbing must reach the restart's optimum: {} vs {}",
+        absorb.ofv,
+        restart.ofv
+    );
+}
+
+/// The absorb arm end to end (#2600), as an A/B on one fit: the full 200-subject
+/// Michaelis–Menten population of `tests/ebe_basin_shift.rs`, warm-start predictor off (the
+/// trap is the unpredicted start's), once at the shipped share and once with the share
+/// raised so the same probe absorbs.
+///
+/// At the shipped 1 % the probe at the 32nd evaluation finds a few of 200 subjects in a lower
+/// cold mode and restarts, as under #2093. Raised to 5 %, the same probe absorbs those modes
+/// and the leg continues on its own L-BFGS memory. The arm under test must reach the restart
+/// arm's optimum with no basin-shift restart filed, and pass its own end-of-leg check
+/// (`converged`). The JV fit the issue reports is private; this is the closest committed
+/// fixture whose probe sees a switch at all.
+///
+/// Measured on Linux (`ci-test`, aarch64 via `tools/linux-test.sh` and x86_64 in
+/// `slow-tests.yml`, identical digits): both probes at an 18.654 gap from 2 subjects (1 %);
+/// restart arm 775.394696 converged in 137 evaluations over 2 attempts; absorb arm
+/// 775.394591 converged in 193 evaluations over 1 attempt. Native macOS arm64 takes another
+/// trajectory (a 44.857 gap from 5 subjects; restart 102 evaluations, absorb 76), which is
+/// why the evaluation count is not asserted: the shipped version asserted `absorb < restart`
+/// from the macOS figures and was red on every Linux run (#2610).
+///
+/// What this test does not see on Linux: absorbing without handing the cold modes to the
+/// warm-start cache (`absorb_cold_incumbent`'s `cached_etas = modes`) re-trapped on macOS and
+/// reddened the no-restart assertion, but on Linux it still finishes in one leg (169
+/// evaluations to 775.394259). That hand-off is pinned at Tier 1 instead, by
+/// `an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two`: the helper
+/// builds the warm starts from the solve it records, so the call site passes no
+/// separate modes to get wrong (#2674). Note also that on Linux the probe's 2 of 200 sits
+/// exactly on the 1 % boundary: a one-subject drift would flip the restart arm.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_handful_of_switched_subjects_is_absorbed_into_the_running_leg() {
+    use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx").unwrap();
+    let parsed = parse_full_model(&text).unwrap();
+    let pop = read_nonmem_csv(
+        Path::new("tests/fixtures/mm_basin_shift/mm_n200.csv"),
+        None,
+        None,
+    )
+    .unwrap();
+    let opts = FitOptions {
+        verbose: false,
+        ..parsed.fit_options.clone()
+    };
+    let _off = WarmPredictorOff::new();
+    let run = |share: Option<f64>| {
+        BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.set(share));
+        BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().clear());
+        NLOPT_ATTEMPTS.with(|c| c.set(0));
+        let r = optimize_population(&parsed.model, &pop, &parsed.model.default_params, &opts);
+        BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.set(None));
+        let decisions = BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().split_off(0));
+        (r, decisions, NLOPT_ATTEMPTS.with(|c| c.get()))
+    };
+    let (restart, restart_probes, restart_attempts) = run(None);
+    let (absorb, absorb_probes, absorb_attempts) = run(Some(0.05));
+    eprintln!(
+        "restart arm: OFV {:.6} converged {} evals {} attempts {restart_attempts} probes \
+         {restart_probes:?}\nabsorb arm: OFV {:.6} converged {} evals {} attempts \
+         {absorb_attempts} probes {absorb_probes:?}",
+        restart.ofv,
+        restart.converged,
+        restart.n_iterations,
+        absorb.ofv,
+        absorb.converged,
+        absorb.n_iterations,
+    );
+    let restarted = |r: &OuterResult| {
+        r.warnings
+            .iter()
+            .any(|w| w.contains("resumed from the best point seen"))
+    };
+    // The straddle: both arms see the same probe, a switched share between 1 % and 5 %.
+    let first = |p: &[(f64, Option<usize>)]| p.first().and_then(|d| d.1);
+    assert!(
+        first(&restart_probes).is_some_and(|k| (2..10).contains(&k)),
+        "the shipped arm's probe must see 1–5 % of 200 switch: {restart_probes:?}"
+    );
+    assert_eq!(first(&restart_probes), first(&absorb_probes));
+    assert!(restarted(&restart), "at 1 % the probe restarts");
+    assert!(
+        !restarted(&absorb),
+        "at 5 % the probe absorbs: {:?}",
+        absorb.warnings
+    );
+    assert!(absorb.converged, "the absorbing leg reaches its own stop");
+    assert!(absorb.ofv.is_finite() && restart.ofv.is_finite());
+    // Measured −1.05e-4 on Linux (absorb lower; −2.9e-5 on macOS); 1e-3 is ~10× that, and
+    // far below the probe's 18.65 gap.
+    assert!(
+        (absorb.ofv - restart.ofv).abs() < 1e-3,
+        "absorbing must reach the restart's optimum: {} vs {}",
+        absorb.ofv,
+        restart.ofv
+    );
+    // One leg, no second attempt. The evaluation count is deliberately not compared: it is
+    // trajectory-dependent, and on Linux the absorb arm takes more (193 against 137).
+    assert_eq!(absorb_attempts, 1, "no second attempt");
+}
+
 /// End to end on `examples/warfarin_dcm.ferx`: the DCM fit converges at −1173.559691 with no
 /// start-dependence gap left (#2204).
 ///
@@ -13422,6 +13978,8 @@ mod above_start {
             guard_rejected,
             n_unconverged: if guard_rejected { 1 } else { 0 },
             n_start_rejected: 0,
+            rescored: None,
+            warm_rescored_from: None,
         }
     }
 
@@ -13471,6 +14029,50 @@ mod above_start {
         assert_eq!(
             classify_warning(&accepted).category,
             WarningCode::Convergence
+        );
+    }
+
+    /// #2619: a start re-scored after its own evaluation failed says so, naming both inner
+    /// budgets, and only then; the guard sentence still follows the re-score's own guard flag.
+    /// The figures are the profile tests' F2 at `inner_maxiter = 1` (start re-scored 26.465827,
+    /// reported 66.022863).
+    #[test]
+    fn a_rescored_start_names_both_budgets_and_only_a_rescored_one_does() {
+        let rescore = "failed outright";
+        let rescored = |guard_rejected: bool| StartEval {
+            rescored: Some(StartRescore {
+                run_inner_maxiter: 1,
+                rescore_inner_maxiter: 200,
+            }),
+            ..start(26.465827, guard_rejected)
+        };
+        let (mut a, mut b, mut c) = (true, true, true);
+        let w = above_start_warning(&mut a, Some(rescored(false)), 66.022863, 2, 0.0).unwrap();
+        let both = above_start_warning(&mut b, Some(rescored(true)), 66.022863, 2, 0.0).unwrap();
+        let plain =
+            above_start_warning(&mut c, Some(start(26.465827, false)), 66.022863, 2, 0.0).unwrap();
+        assert!(!a && !b && !c);
+        assert!(
+            w.contains("failed outright at `inner_maxiter` = 1")
+                && w.contains("re-scored once, evaluation-only, at `inner_maxiter` = 200"),
+            "{w}"
+        );
+        assert!(w.contains("66.022863") && w.contains("26.465827"), "{w}");
+        assert!(
+            !w.contains("guard"),
+            "the re-score was not guard-rejected: {w}"
+        );
+        assert!(
+            both.contains(rescore) && both.contains("EBE convergence guard rejected"),
+            "{both}"
+        );
+        assert!(!plain.contains(rescore), "{plain}");
+        let entry = classify_warning(&w);
+        assert_eq!(entry.category, WarningCode::Convergence, "{w}");
+        assert_eq!(
+            entry.severity,
+            crate::types::WarningSeverity::Critical,
+            "{w}"
         );
     }
 
@@ -13669,13 +14271,15 @@ mod above_start {
     }
 
     /// The recorded start carries the guard's verdict and counts: with
-    /// `max_unconverged_frac = 0` and a one-iteration inner budget, the first evaluation
-    /// leaves subjects unconverged and is guard-rejected, with a finite objective.
+    /// `max_unconverged_frac = 0` and no inner budget, the first evaluation leaves subjects
+    /// unconverged and is guard-rejected, with a finite objective. The budget was 1 until
+    /// #2682, whose warm re-solve of a rejected start spends a second iteration there and
+    /// converges every subject; at 0 neither solve moves the start.
     #[test]
     fn the_recorded_start_carries_the_guard_verdict() {
         let (model, pop, opts) = one_cpt_iv();
         let starved = FitOptions {
-            inner_maxiter: 1,
+            inner_maxiter: 0,
             max_unconverged_frac: 0.0,
             ..opts
         };
@@ -13845,10 +14449,10 @@ fn the_attempt_hands_an_unmoved_start_to_the_probe() {
 /// #2506 for the optimizers outside NLopt, per PR and with no convergence loop:
 /// [`verify_unmoved_start`] hands a run that did not move to `rerun` once, from a start
 /// perturbed in the rerun optimizer's **scaled** space and on `budget`, and acts on each
-/// verdict. A verified start reports **the probe's own result** — its estimates,
-/// objective, verdict and warnings, none of the unmoved run's — and one still within the
-/// escape step of the start is published `left_init = Some(false)` with
-/// `stationary_start`. A lower probe reports the unmoved run, published a stall
+/// verdict. A verified start reports **the probe's own verdict and warnings**, none of the
+/// unmoved run's, at the lower of the two points — the probe's estimates and objective, or
+/// the start's when the probe ended above it — and one still within the escape step of the
+/// start is published `left_init = Some(false)` with `stationary_start`. A lower probe reports the unmoved run, published a stall
 /// (`left_init = Some(false)`) with the warning naming the probe's objective. No verdict
 /// reports the unmoved run, left to the displacement check. The rerun is a stub whose
 /// result is tagged with a warning of its own, so which run is reported is read off the
@@ -13884,12 +14488,20 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
         (start_ofv + 0.5 * tol, true, true, Some(true), true),
         // Lower, but within the tolerance: verified, and the lower result is reported.
         (start_ofv - 0.5 * tol, true, true, Some(true), true),
-        // Verified, but the probe's estimates ended off the start: they left it.
-        (start_ofv + 0.5 * tol, true, false, Some(true), false),
+        // Verified, and the probe's lower estimates ended off the start: they left it.
+        (start_ofv - 0.5 * tol, true, false, Some(true), false),
+        // Verified, the probe ended off the start but above it: the start's point is
+        // reported, so it did not leave.
+        (start_ofv + 0.5 * tol, true, false, Some(true), true),
+        // A tie goes to the start.
+        (start_ofv, true, false, Some(true), true),
         (start_ofv - 2.0 * tol, false, false, Some(false), false),
         (start_ofv + 0.5 * tol, false, true, None, false),
     ] {
-        let label = format!("{verdict:?}, probe back at start = {back_at_start}");
+        let label = format!(
+            "{verdict:?}, probe back at start = {back_at_start}, probe − start = {:+.0e}",
+            probe_ofv - start_ofv
+        );
         let calls = std::cell::RefCell::new(Vec::new());
         let result = verify_unmoved_start(
             &model,
@@ -13938,7 +14550,16 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
             result.warnings
         );
         if reports_probe {
-            assert_eq!(result.ofv, probe_ofv, "{label}");
+            assert_eq!(
+                result.ofv,
+                probe_ofv.min(start_ofv),
+                "{label}: the lower point's objective"
+            );
+            assert_eq!(
+                pack_params(&result.params) == init_packed,
+                back_at_start || start_ofv <= probe_ofv,
+                "{label}: the lower point's estimates"
+            );
             assert_eq!(
                 result.converged, probe_converged,
                 "{label}: the probe's verdict"
@@ -14036,12 +14657,14 @@ fn an_unmoved_run_off_nlopt_is_probed_and_reported_by_its_verdict() {
 }
 
 /// #2506: what the NLopt fit carries out of a probed first attempt, and whether the
-/// #751 held-cap retry still runs. A verified start reports the probe's own result and
-/// skips the retry — there is no stall to retry — and is published a stationary start
-/// while the probe's estimates are still within the escape step of the user's start. A
-/// lower probe reports the first attempt, still a stall, with the warning naming the
-/// probe's objective, and leaves the retry to `left_init` like no verdict does. The
-/// probe's evaluations count every time.
+/// #751 held-cap retry still runs. A verified start reports the probe's own verdict and
+/// warnings and skips the retry — there is no stall to retry — at the probe's point when
+/// it is lower, published a stationary start while that point is still within the escape
+/// step of the user's start. A verified probe that ended *above* the start reports the
+/// start's point instead, always stationary: a fit never publishes a point worse than one
+/// it evaluated. A probe lower by more than the tolerance reports the first attempt,
+/// still a stall, with the warning naming the probe's objective, and leaves the retry to
+/// `left_init` like no verdict does. The probe's evaluations count every time.
 #[test]
 fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
     let (model, pop) = two_cpt_iv_fixture();
@@ -14055,27 +14678,64 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
         ..evaluate_at_initial_params(&model, &pop, p, &opts)
     };
     let init_packed = pack_params(&init);
-    // (verdict, probe left the user's start) → retry skipped, probe reported, stationary.
-    for (verdict, probe_left, skip_retry, reports_probe, stationary) in [
-        (Some(true), false, true, true, true),
-        (Some(true), true, true, true, false),
-        (Some(false), true, false, false, false),
-        (None, false, false, false, false),
+    let (first_tag, probe_tag) = ("the first attempt's own warning", "the probe's own warning");
+    let first = || OuterResult {
+        converged: false,
+        warnings: vec![first_tag.to_string()],
+        ..at(&init, 1, false)
+    };
+    let start_ofv = first().ofv;
+    // (verdict, probe left the user's start, probe − start) → retry skipped, the probe's
+    // point reported, stationary. Within `START_PROBE_TOL` of the start either way, as a
+    // verified probe is.
+    for (verdict, probe_left, probe_delta, skip_retry, reports_probe, stationary) in [
+        (Some(true), false, -1e-3, true, true, true),
+        (Some(true), true, -1e-3, true, true, false),
+        // Verified but higher: the start's point, whether or not the probe left it.
+        (Some(true), false, 1e-3, true, false, true),
+        (Some(true), true, 1e-3, true, false, true),
+        // A tie goes to the start: the probe left it, yet the fit did not.
+        (Some(true), true, 0.0, true, false, true),
+        (Some(false), true, -1e-3, false, false, false),
+        (None, false, -1e-3, false, false, false),
     ] {
-        let label = format!("{verdict:?}, probe left = {probe_left}");
-        let ((result, _), skip) = settle_start_probe(
-            (at(&init, 1, false), None),
-            false,
-            Some((at(&off, 4, probe_left), None, verdict)),
-        );
+        let label =
+            format!("{verdict:?}, probe left = {probe_left}, probe − start = {probe_delta:+e}");
+        let probe_ofv = start_ofv + probe_delta;
+        let probe = OuterResult {
+            ofv: probe_ofv,
+            converged: true,
+            warnings: vec![probe_tag.to_string()],
+            ..at(&off, 4, probe_left)
+        };
+        let ((result, _), skip) =
+            settle_start_probe((first(), None), false, Some((probe, None, verdict)), |r| {
+                r.ofv
+            });
         assert_eq!(skip, skip_retry, "{label}: retry skipped");
         assert_eq!(
             pack_params(&result.params) != init_packed,
             reports_probe,
-            "{label}: which attempt is reported"
+            "{label}: which point is reported"
+        );
+        assert_eq!(
+            result.ofv,
+            if reports_probe { probe_ofv } else { start_ofv },
+            "{label}: the reported point's own objective"
+        );
+        let verified = verdict == Some(true);
+        assert_eq!(
+            (
+                result.converged,
+                result.warnings.iter().any(|w| w == probe_tag),
+                result.warnings.iter().any(|w| w == first_tag),
+            ),
+            (verified, verified, !verified),
+            "{label}: a verified start carries the probe's verdict and warnings, whichever \
+             point it reports: {:?}",
+            result.warnings
         );
         assert_eq!(result.n_iterations, 5, "{label}: both legs count");
-        let probe_ofv = at(&off, 4, probe_left).ofv;
         assert_eq!(
             result.warnings.iter().any(|w| {
                 w.contains("stalled on its initial estimates")
@@ -14093,10 +14753,168 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
             "{label}"
         );
     }
+    // The comparison is on the objective `penalized` returns, not the clean OFV: a probe
+    // above the start by the clean OFV but below it once penalized is the point reported.
+    let probe = OuterResult {
+        ofv: start_ofv + 1e-3,
+        converged: true,
+        ..at(&off, 4, true)
+    };
+    let ((result, _), _) = settle_start_probe(
+        (first(), None),
+        false,
+        Some((probe, None, Some(true))),
+        |r| {
+            r.ofv
+                - if pack_params(&r.params) == init_packed {
+                    0.0
+                } else {
+                    1.0
+                }
+        },
+    );
+    assert_eq!(
+        result.ofv,
+        start_ofv + 1e-3,
+        "the penalized objective decides which point is reported"
+    );
     // Unprobed, the retry follows `left_init` alone.
     for left in [false, true] {
-        let (_, skip) = settle_start_probe((at(&init, 1, left), None), left, None);
+        let (_, skip) = settle_start_probe((at(&init, 1, left), None), left, None, |r| r.ofv);
         assert_eq!(skip, left);
+    }
+}
+
+/// #2506 (PR #2625 review): which fields a verified start takes from which run. Every
+/// field tied to the reported **point** — estimates, objective, EBEs and their Hessians,
+/// κ, the covariance step's output, the final gradient, the conditional distribution,
+/// the packed estimate, the mixture posteriors — is the unmoved run's when the start wins
+/// and the probe's otherwise; every field describing the **run** — its verdict, warnings
+/// and EBE counters — is the probe's either way. Each run carries its own tag in every
+/// field, so a field left out of the copy (or copied when it should not be) is named by
+/// the failure.
+#[test]
+fn a_verified_start_takes_every_point_field_from_the_lower_run() {
+    let (model, pop) = two_cpt_iv_fixture();
+    let opts = options_2506(crate::types::Optimizer::NloptLbfgs);
+    let base = evaluate_at_initial_params(&model, &pop, &model.default_params, &opts);
+    let tagged = |tag: f64, method: crate::types::CovarianceMethod| {
+        let m = DMatrix::from_element(1, 1, tag);
+        let v = DVector::from_element(1, tag);
+        OuterResult {
+            ofv: tag,
+            eta_hats: vec![v.clone()],
+            h_matrices: vec![m.clone()],
+            kappas: vec![vec![v]],
+            covariance_matrix: Some(m.clone()),
+            covariance_method: Some(method),
+            covariance_wall_time_secs: tag,
+            sir_fallback_proposal: Some(m),
+            final_gradient: Some(vec![tag]),
+            final_gradient_source: Some(format!("{tag}")),
+            cond_dist: Some(crate::types::CondDist {
+                cond_mean: vec![vec![tag]],
+                cond_sd: vec![],
+                samples: vec![],
+                shrinkage: vec![],
+                nsamp: 0,
+                burnin: 0,
+            }),
+            packed_estimate: Some(vec![tag]),
+            mixture_posteriors: Some(MixturePosteriors {
+                pmix: vec![vec![tag]],
+                mixest: vec![],
+            }),
+            converged: tag == 2.0,
+            warnings: vec![format!("{tag}")],
+            ebe_convergence_warnings: tag as u32,
+            max_unconverged_subjects: tag as u32,
+            total_ebe_fallbacks: tag as u32,
+            total_ebe_nm_polished: tag as u32,
+            n_iterations: 1,
+            ..evaluate_at_initial_params(&model, &pop, &model.default_params, &opts)
+        }
+    };
+    // (field, tag read off the result) for every field the test pins.
+    let point = |r: &OuterResult| {
+        vec![
+            ("ofv", r.ofv),
+            ("eta_hats", r.eta_hats[0][0]),
+            ("h_matrices", r.h_matrices[0][(0, 0)]),
+            ("kappas", r.kappas[0][0][0]),
+            (
+                "covariance_matrix",
+                r.covariance_matrix.as_ref().unwrap()[(0, 0)],
+            ),
+            (
+                "covariance_method",
+                if r.covariance_method == Some(crate::types::CovarianceMethod::Hessian) {
+                    1.0
+                } else {
+                    2.0
+                },
+            ),
+            ("covariance_wall_time_secs", r.covariance_wall_time_secs),
+            (
+                "sir_fallback_proposal",
+                r.sir_fallback_proposal.as_ref().unwrap()[(0, 0)],
+            ),
+            ("final_gradient", r.final_gradient.as_ref().unwrap()[0]),
+            (
+                "final_gradient_source",
+                r.final_gradient_source.as_ref().unwrap().parse().unwrap(),
+            ),
+            ("cond_dist", r.cond_dist.as_ref().unwrap().cond_mean[0][0]),
+            ("packed_estimate", r.packed_estimate.as_ref().unwrap()[0]),
+            (
+                "mixture_posteriors",
+                r.mixture_posteriors.as_ref().unwrap().pmix[0][0],
+            ),
+        ]
+    };
+    let run = |r: &OuterResult| {
+        vec![
+            ("converged", if r.converged { 2.0 } else { 1.0 }),
+            ("warnings", r.warnings[0].parse().unwrap()),
+            (
+                "ebe_convergence_warnings",
+                f64::from(r.ebe_convergence_warnings),
+            ),
+            (
+                "max_unconverged_subjects",
+                f64::from(r.max_unconverged_subjects),
+            ),
+            ("total_ebe_fallbacks", f64::from(r.total_ebe_fallbacks)),
+            ("total_ebe_nm_polished", f64::from(r.total_ebe_nm_polished)),
+        ]
+    };
+    let mut off = base.params.clone();
+    off.theta = base.params.theta.iter().map(|t| 1.1 * t).collect();
+    for start_wins in [true, false] {
+        let unmoved = tagged(1.0, crate::types::CovarianceMethod::Hessian);
+        let probe = OuterResult {
+            params: off.clone(),
+            ..tagged(2.0, crate::types::CovarianceMethod::Sandwich)
+        };
+        let result = verified_start_result(probe, true, unmoved, start_wins);
+        let want = if start_wins { 1.0 } else { 2.0 };
+        for (field, got) in point(&result) {
+            assert_eq!(got, want, "start wins = {start_wins}: `{field}`");
+        }
+        assert_eq!(
+            result.params.theta == base.params.theta,
+            start_wins,
+            "start wins = {start_wins}: `params`"
+        );
+        for (field, got) in run(&result) {
+            assert_eq!(
+                got, 2.0,
+                "start wins = {start_wins}: `{field}` is the probe's"
+            );
+        }
+        assert_eq!(result.n_iterations, 2, "both runs' evaluations count");
+        assert_eq!(result.stationary_start, start_wins);
+        assert_eq!(result.left_init, Some(!start_wins));
     }
 }
 
@@ -14257,9 +15075,16 @@ pub(crate) fn assert_warm_refit_verified(
     assert_eq!(warm.left_init, Some(false), "{label}: fixture precondition");
     assert!(warm.stationary_start, "{label}: {:?}", warm.warnings);
     assert!(warm.converged, "{label}: {:?}", warm.warnings);
+    // One-sided: a verified warm refit never reports an objective above the cold fit's
+    // (#2506, PR #2625). It may report one below it. The cold fit's OFV is scored on EBEs
+    // warm-started along its whole path, and a fresh EBE solve at the same estimates can
+    // land lower: `gn` measured −1.283e-3 on Linux x86_64 and aarch64 alike, with the start
+    // winning over the probe. Upward, the largest realised gap over every warm-refit row
+    // (L-BFGS, BOBYQA, BFGS, trust-region, AGQ, mixture, profiled) is +5.7e-10; the bound
+    // is 1e-6, over 1000× that.
     assert!(
-        (warm.ofv - cold.ofv).abs() < 1e-3,
-        "{label}: the warm refit reports the warm start, at the cold fit's objective: {} vs {}",
+        warm.ofv - cold.ofv <= 1e-6,
+        "{label}: the warm refit reports a point no worse than the cold fit's: {} vs {}",
         warm.ofv,
         cold.ofv
     );
@@ -14856,4 +15681,256 @@ fn a_quadrature_polish_that_cannot_take_its_predicted_gain_is_stalled() {
         w.contains("3.830e1") && w.contains("not reported as converged"),
         "{w}"
     );
+}
+
+/// #2675: `outer_cache_warm_starts` hands an ODE + IOV model `η̂` alone (each inner solve
+/// restarts κ at 0, #2508) and every other model the joint `η̂ ++ κ̂` start (#2261).
+/// Three models differ only in the structural engine — same ω/κ/σ, same κ on CL — and
+/// cover both engine disjuncts of `is_ode_iov` plus its negative: a user `[odes]` model
+/// (`ode_spec`), a closed-form transit model whose IOV routes to an ODE twin
+/// (`absorption_ode_equivalent`, #814), and a closed-form oral model (neither). Each
+/// leg's routing is asserted, so the set cannot silently collapse onto one arm.
+/// Mutations this kills (checked by hand on the PR): the ODE + IOV arm returning
+/// `joint_warm_starts`; the joint arm returning `ehs.to_vec()`; and the helper's
+/// `is_ode_iov(model)` narrowed to `n_kappa > 0 && ode_spec.is_some()` (transit leg).
+#[test]
+fn outer_cache_warm_starts_drops_kappa_only_on_an_ode_iov_model() {
+    use crate::estimation::inner_optimizer::is_ode_iov;
+    use crate::parser::model_parser::parse_model_string;
+
+    const THETAS: &str = "[parameters]\n\
+        theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+        theta TVKA(1.5, 0.01, 50.0)\n";
+    const HEAD: &str = "\
+        omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n\
+        kappa KAPPA_CL ~ 0.01\n\
+        sigma PROP_ERR ~ 0.1 (sd)\n\
+        [individual_parameters]\n\
+        CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n";
+    const TAIL: &str = "[error_model]\n  DV ~ proportional(PROP_ERR)\n\
+        [fit_options]\n  iov_column = OCC\n";
+    let ode = parse_model_string(&format!(
+        "{THETAS}{HEAD}[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n\
+         [odes]\n  d/dt(depot) = -KA * depot\n\
+         d/dt(central) = KA * depot / V - (CL/V) * central\n{TAIL}"
+    ))
+    .expect("ODE + IOV model parses");
+    // Transit: KA's slot carries the mean transit time; the extra θ is the chain length.
+    let transit = parse_model_string(&format!(
+        "{THETAS}  theta TVN(3.0, 0.5, 20.0)\n{HEAD}  NTR = TVN\n\
+         [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=KA)\n{TAIL}"
+    ))
+    .expect("transit + IOV model parses");
+    let closed = parse_model_string(&format!(
+        "{THETAS}{HEAD}[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n{TAIL}"
+    ))
+    .expect("closed-form IOV model parses");
+
+    // The routing of each leg: κ live on all three; `ode` reaches `is_ode_iov` through
+    // `ode_spec`, `transit` only through `absorption_ode_equivalent`, `closed` through neither.
+    assert_eq!(
+        (ode.n_kappa, transit.n_kappa, closed.n_kappa),
+        (1, 1, 1),
+        "κ live on every leg"
+    );
+    assert!(
+        ode.ode_spec.is_some() && is_ode_iov(&ode),
+        "ODE + κ model must be ODE + IOV via `ode_spec`"
+    );
+    assert!(
+        transit.ode_spec.is_none()
+            && transit.absorption_ode_equivalent.is_some()
+            && is_ode_iov(&transit),
+        "transit + κ model must be ODE + IOV via `absorption_ode_equivalent` alone"
+    );
+    assert!(
+        !is_ode_iov(&closed),
+        "closed-form + κ model must not be ODE + IOV"
+    );
+
+    // Distinct per subject and per cell, so a dropped, reordered or misattributed κ
+    // cell cannot coincide with the right answer; subject 1 has two occasions.
+    let ehs = vec![
+        DVector::from_vec(vec![0.11, -0.12, 0.13]),
+        DVector::from_vec(vec![-0.21, 0.22, -0.23]),
+    ];
+    let kappas = vec![
+        vec![DVector::from_vec(vec![0.31])],
+        vec![
+            DVector::from_vec(vec![-0.41]),
+            DVector::from_vec(vec![0.42]),
+        ],
+    ];
+
+    assert_eq!(
+        outer_cache_warm_starts(&ode, &ehs, &kappas),
+        ehs,
+        "ODE + IOV: warm start is η̂ alone (κ restarts at 0, #2508)"
+    );
+    assert_eq!(
+        outer_cache_warm_starts(&transit, &ehs, &kappas),
+        ehs,
+        "transit + IOV (ODE twin): warm start is η̂ alone (κ restarts at 0, #2508)"
+    );
+    assert_eq!(
+        outer_cache_warm_starts(&closed, &ehs, &kappas),
+        vec![
+            DVector::from_vec(vec![0.11, -0.12, 0.13, 0.31]),
+            DVector::from_vec(vec![-0.21, 0.22, -0.23, -0.41, 0.42]),
+        ],
+        "closed-form IOV: warm start is η̂ then every cell's κ̂ (#2261)"
+    );
+}
+
+/// #2682: a first evaluation the EBE guard rejects on its unconverged fraction is solved
+/// again warm from its own EBEs before it is judged ([`wants_start_warm_rescore`]).
+mod start_warm_rescore {
+    use super::*;
+
+    fn stats(n_unconverged: usize, n_start_rejected: usize) -> InnerLoopStats {
+        InnerLoopStats {
+            n_unconverged,
+            n_start_rejected,
+            ..Default::default()
+        }
+    }
+
+    /// Only the fraction trigger earns a re-solve: a hard start rejection holds a placeholder
+    /// `(η, H)`, a non-finite objective is not an inner-budget problem, and an accepted start
+    /// needs nothing. Each row is the one input that flips the answer from the first.
+    #[test]
+    fn only_the_fraction_trigger_is_rescored() {
+        assert!(wants_start_warm_rescore(&stats(17, 0), 30, -1000.0, 0.1));
+        assert!(!wants_start_warm_rescore(&stats(17, 1), 30, -1000.0, 0.1));
+        assert!(!wants_start_warm_rescore(&stats(17, 0), 30, f64::NAN, 0.1));
+        assert!(!wants_start_warm_rescore(&stats(17, 0), 30, -1000.0, 1.0));
+        assert!(!wants_start_warm_rescore(&stats(3, 0), 30, -1000.0, 0.1));
+    }
+
+    /// A warm re-solve replaces the cold one only when the guard accepts it **and** its
+    /// objective is finite (#2682 review r3). `ebe_guard_rejects` answers `false` for a
+    /// non-finite objective, so the `NaN` / `∞` rows straddle the guard: accepted by it,
+    /// refused here. Mutation: drop `raw_ofv.is_finite()` → those two rows go `true`.
+    #[test]
+    fn a_non_finite_warm_resolve_is_not_accepted() {
+        for bad in [f64::NAN, f64::INFINITY] {
+            assert!(
+                !ebe_guard_rejects(&stats(0, 0), 30, bad, 0.1),
+                "premise: the guard alone accepts a non-finite objective ({bad})"
+            );
+            assert!(
+                !warm_rescore_accepted(&stats(0, 0), 30, bad, 0.1),
+                "a {bad} re-solve must not replace the cold solve"
+            );
+        }
+        assert!(warm_rescore_accepted(&stats(0, 0), 30, -1040.0, 0.1));
+        assert!(!warm_rescore_accepted(&stats(6, 0), 30, -1040.0, 0.1));
+        assert!(!warm_rescore_accepted(&stats(0, 1), 30, -1040.0, 0.1));
+    }
+
+    /// The verbose line for a guarded evaluation names its trigger and the count behind it,
+    /// one arm per trigger, and never prints the penalty as an `OFV =` (the issue's
+    /// `Eval 1: OFV = 1000000050451.003662`).
+    #[test]
+    fn a_guarded_eval_line_names_its_trigger() {
+        let frac = guarded_eval_line(&stats(17, 0), 30, -1040.5, 0.1);
+        assert!(
+            frac.contains("17 of 30 subjects' inner loops did not converge")
+                && frac.contains("`max_unconverged_frac` = 0.1")
+                && frac.contains("-1040.500000")
+                && !frac.contains("OFV ="),
+            "{frac}"
+        );
+        let hard = guarded_eval_line(&stats(17, 2), 30, -1040.5, 0.1);
+        assert!(
+            hard.contains("2 of 30 subjects rejected at their inner start")
+                && !hard.contains("did not converge"),
+            "{hard}"
+        );
+        let nonfinite = guarded_eval_line(&stats(17, 0), 30, f64::INFINITY, 0.1);
+        assert!(
+            nonfinite.contains("not finite") && !nonfinite.contains("EBE convergence guard"),
+            "{nonfinite}"
+        );
+    }
+
+    fn run(inner_maxiter: usize) -> (StartEval, usize) {
+        let prep = crate::api::prepare_run(
+            "examples/two_cpt_oral_cov.ferx",
+            Some("data/two_cpt_oral_cov.csv"),
+        )
+        .expect("prepare two_cpt_oral_cov");
+        let n_subj = prep.population.subjects.len();
+        let opts = FitOptions {
+            inner_maxiter,
+            outer_maxiter: 1,
+            run_covariance_step: false,
+            verbose: false,
+            ..prep.parsed.fit_options.clone()
+        };
+        let r = optimize_nlopt(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &opts,
+            &OuterFdDeclineLog::new(n_subj),
+            None,
+            &[],
+        );
+        (
+            r.start_eval.expect("the unprofiled loop records its start"),
+            n_subj,
+        )
+    }
+
+    /// The straddle, on `two_cpt_oral_cov` at `inner_maxiter = 3`: the cold first solve
+    /// leaves 17 of 30 subjects unconverged, over `max_unconverged_frac = 0.1`, and before
+    /// #2682 the guard rejected the start and every trial after it re-solved from the same
+    /// zero cache. Re-solved warm, all 30 converge and the start is accepted at the
+    /// objective the default inner budget gives it with no re-solve at all — measured
+    /// −1040.033385 against −1040.033394 (Linux x86_64), a 9.1e-6 gap, bounded at 1e-4.
+    ///
+    /// Mutations: `wants_start_warm_rescore` → `false` reddens the `warm_rescored_from`
+    /// assertion (the start is then `guard_rejected` with 17); the control's
+    /// `is_none()` dies if the re-solve runs on an accepted start.
+    #[test]
+    fn a_start_rejected_cold_is_accepted_when_its_warm_resolve_converges() {
+        let (start, n_subj) = run(3);
+        let cold = start.warm_rescored_from.unwrap_or_else(|| {
+            panic!("the cold start must be rejected and then re-solved warm: {start:?}")
+        });
+        assert!(
+            cold as f64 / n_subj as f64 > 0.1,
+            "non-degeneracy: the cold solve must exceed the guard's fraction ({cold} of \
+             {n_subj}), or this fixture tests an accepted start"
+        );
+        assert!(
+            !start.guard_rejected && start.n_unconverged == 0,
+            "the warm re-solve is what is judged: {start:?}"
+        );
+        let (control, _) = run(200);
+        assert!(
+            control.warm_rescored_from.is_none() && !control.guard_rejected,
+            "an accepted cold start is not re-solved: {control:?}"
+        );
+        assert!(start.ofv.is_finite() && control.ofv.is_finite());
+        assert!(
+            (start.ofv - control.ofv).abs() < 1e-4,
+            "the warm re-solve scores the start the converged inner loop does: {} vs {}",
+            start.ofv,
+            control.ofv
+        );
+    }
+
+    /// At `inner_maxiter = 2` the warm re-solve still leaves 6 of 30 unconverged, so the
+    /// start stays rejected — and it is the **cold** solve that is reported (27), as before
+    /// #2682, not the re-solve. Mutation: break with the re-solve when it is rejected too →
+    /// `n_unconverged` reads 6.
+    #[test]
+    fn a_start_still_rejected_warm_keeps_its_cold_solve() {
+        let (start, _) = run(2);
+        assert!(start.guard_rejected, "{start:?}");
+        assert_eq!(start.warm_rescored_from, None, "{start:?}");
+        assert_eq!(start.n_unconverged, 27, "{start:?}");
+    }
 }
