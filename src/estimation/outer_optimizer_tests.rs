@@ -9925,7 +9925,14 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
     let mut last_gradient = Some(vec![1.0, 2.0, 3.0]);
     // Feasible baseline 100 last moved at feasible eval 20; 32 feasible evaluations so far.
     let mut plateau = (100.0, 20usize, 32usize);
-    let cold_modes = vec![DVector::from_element(2, -0.5); 2];
+    // The cold solve carries a κ cell per subject, so its warm starts (η then κ, #2674)
+    // differ from its bare η: the cache must be built from this solve, κ included.
+    let cold = IncumbentSolve {
+        kappas: vec![vec![DVector::from_element(1, 0.7)]; 2],
+        ..warm(-0.5)
+    };
+    let cold_modes = vec![DVector::from_vec(vec![-0.5, -0.5, 0.7]); 2];
+    let model = make_model();
     absorb_cold_incumbent(
         &mut state,
         &mut best,
@@ -9933,12 +9940,12 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
         &mut last_gradient,
         &mut plateau,
         (90.0, 90.0),
-        cold_modes.clone(),
-        warm(-0.5),
+        &model,
+        cold,
     );
     assert_eq!(
         state.cached_etas, cold_modes,
-        "warm starts are the cold modes"
+        "warm starts are the cold solve's η then κ"
     );
     assert!(
         state.pred_jac.is_none(),
@@ -9992,11 +9999,11 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
 /// What this test does not see on Linux: absorbing without handing the cold modes to the
 /// warm-start cache (`absorb_cold_incumbent`'s `cached_etas = modes`) re-trapped on macOS and
 /// reddened the no-restart assertion, but on Linux it still finishes in one leg (169
-/// evaluations to 775.394259). The write inside the helper is pinned at Tier 1 by
-/// `an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two`; the `modes` the
-/// probe's absorb arm passes it (`outer_cache_warm_starts` of the cold solve) is not pinned
-/// by any test, and a wrong-length vector would skip the write silently. Nor is the probe's
-/// share on Linux off its gate: 2 of 200 sits exactly on the 1 % boundary.
+/// evaluations to 775.394259). That hand-off is pinned at Tier 1 instead, by
+/// `an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two`: the helper
+/// builds the warm starts from the solve it records (η then κ), so the call site passes no
+/// separate modes to get wrong (#2674). Note also that the probe's share on Linux is not off
+/// its gate: 2 of 200 sits exactly on the 1 % boundary.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
