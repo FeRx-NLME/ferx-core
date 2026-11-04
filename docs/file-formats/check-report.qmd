@@ -508,6 +508,14 @@ The model runs, but on a path that is experimental or that quietly drops a capab
 
 A missing Ω~IOV~ on `simulate()` reuses an existing code, since the cause is the same: it is `E_PARAM_SHAPE`, the parameter-shape code the other entry points return (see [matching on the code](../warnings.qmd#entry-point-error-codes)).
 
+#### Fit refusals {#codes-fit-refusals}
+
+Refusals only `fit()` raises, from the model and options it is handed.
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `E_DENSITY_UNSUPPORTED` | error | A `density` random effect ([Random-effect distributions](../model-file/random-effect-distributions.qmd), [#1716](https://github.com/FeRx-NLME/ferx-core/issues/1716)) on IOV κs that span two nested levels in one block. Raised by `fit()`. Block `parameters`. |
+
 #### File entry points {#codes-file-entry-points}
 
 Refusals of the file entry points (`fit_from_files()`, `prepare_run()`, `run_model_with_data()`, `run_model_simulate()` and their variants, which `ferx` runs) and of `fit()` itself, for inputs `ferx check` does not read ([#1788](https://github.com/FeRx-NLME/ferx-core/issues/1788)).

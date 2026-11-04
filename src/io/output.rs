@@ -225,6 +225,65 @@ fn typical_cv_yaml_line(t: Option<EtaParamType>, var_at: f64) -> Option<String> 
 /// `eta_param_info`: that list is in statement order, not `eta_names` order,
 /// and holds one entry per individual parameter the ETA appears in. All
 /// entries agree → that type; any disagreement → `Custom`; none → `None`.
+/// What a non-Gaussian ETA follows (#1716), from `FitResult::eta_param_info`: the
+/// `distribution` of the first entry for the ETA called `name` that has one, `None` for a
+/// Gaussian ETA.
+pub fn eta_distribution<'a>(
+    result: &'a FitResult,
+    name: &str,
+) -> Option<&'a crate::types::EtaDistribution> {
+    result
+        .eta_param_info
+        .iter()
+        .filter(|i| i.eta_name == name)
+        .find_map(|i| i.distribution.as_ref())
+}
+
+/// The 5th, 50th and 95th percentiles of BSV ETA `i`'s random effect at the fit's
+/// estimates (#1716), or `None` for a Gaussian ETA (whose CV%/SD the labels give) or a
+/// distribution whose parameters admit none. A density's percentiles are of the effect
+/// the model reads (`m(z)`: a Gamma clearance's multiplier, not its latent); a
+/// transform's are of `h(η)`. The shapes are read from `theta` by name.
+pub fn eta_effect_quantiles(result: &FitResult, i: usize) -> Option<[f64; 3]> {
+    let d = eta_distribution(result, eta_name(result, i))?;
+    let shapes: Option<Vec<f64>> = d
+        .shape_thetas
+        .iter()
+        .map(|n| {
+            let k = result.theta_names.iter().position(|t| t == n)?;
+            result.theta.get(k).copied()
+        })
+        .collect();
+    crate::stats::eta_density::effect_quantiles(d, result.omega[(i, i)], &shapes?)
+}
+
+/// The console note for BSV ETA `i` when it is non-Gaussian (#1716): its distribution
+/// and the percentiles of its effect, e.g. `density gamma: 5/50/95% = 0.7328 / 0.9900 /
+/// 1.3013`. `None` for a Gaussian ETA. [`OmegaRowsInput::from_result`] prints it in
+/// place of the CV%/SD; ferx-r passes it back through [`OmegaRowsInput`].
+pub fn eta_distribution_note(result: &FitResult, i: usize) -> Option<String> {
+    let d = eta_distribution(result, eta_name(result, i))?;
+    let mut note = format!("{} {}", d.form, d.kind);
+    if !d.shape_thetas.is_empty() {
+        note.push_str(&format!("({})", d.shape_thetas.join(", ")));
+    }
+    if let Some((lo, hi)) = d.truncation {
+        let side = |b: Option<f64>, inf: &str| b.map_or(inf.to_string(), |v| format!("{v}"));
+        note.push_str(&format!(
+            " truncated to [{}, {}]",
+            side(lo, "-inf"),
+            side(hi, "inf")
+        ));
+    }
+    if let Some([a, b, c]) = eta_effect_quantiles(result, i) {
+        // A bisected median of a symmetric kind lands a hair below 0: print `0.0000`.
+        let z = |v: f64| if v.abs() < 5e-5 { 0.0 } else { v };
+        let (a, b, c) = (z(a), z(b), z(c));
+        note.push_str(&format!(": 5/50/95% = {a:.4} / {b:.4} / {c:.4}"));
+    }
+    Some(note)
+}
+
 fn eta_type(result: &FitResult, name: &str) -> Option<EtaParamType> {
     let mut types = result
         .eta_param_info
@@ -314,6 +373,9 @@ pub struct OmegaRowsInput<'a> {
     /// The covariance step's status: a failed or SIR-fallback step suppresses
     /// every CV%/SD (#1698).
     pub covariance_status: CovarianceStatus,
+    /// Per-ETA note for a non-Gaussian ETA (#1716): its distribution and the percentiles
+    /// of its effect, printed in place of the CV%/SD a Gaussian label gives.
+    pub eta_distribution_notes: Vec<Option<String>>,
 }
 
 impl<'a> OmegaRowsInput<'a> {
@@ -333,6 +395,7 @@ impl<'a> OmegaRowsInput<'a> {
                 .map(|i| eta_linked_theta(r, eta_name(r, i)))
                 .collect(),
             covariance_status: r.covariance_status.clone(),
+            eta_distribution_notes: (0..n_eta).map(|i| eta_distribution_note(r, i)).collect(),
         }
     }
 }
@@ -483,6 +546,9 @@ pub fn format_omega_rows_from(input: &OmegaRowsInput, opts: OmegaRowsOptions) ->
         };
         let eta_type = input.eta_param_types.get(i).copied().flatten();
         let mut note = variance_note(eta_type, var, false);
+        if let Some(d) = input.eta_distribution_notes.get(i).cloned().flatten() {
+            note = Some(d);
+        }
         if typical_value_spread {
             let clause = input
                 .eta_linked_thetas
@@ -3281,6 +3347,27 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "    variance: {:.6}", var).map_err(|e| e.to_string())?;
         if let Some(line) = variance_yaml_line(eta_type(result, &key), var) {
             writeln!(f, "{}", line).map_err(|e| e.to_string())?;
+        }
+        if let Some(d) = eta_distribution(result, &key) {
+            writeln!(f, "    distribution: {}", d.kind).map_err(|e| e.to_string())?;
+            writeln!(f, "    distribution_form: {}", d.form).map_err(|e| e.to_string())?;
+            if !d.shape_thetas.is_empty() {
+                writeln!(
+                    f,
+                    "    distribution_shapes: [{}]",
+                    d.shape_thetas.join(", ")
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            if let Some((lo, hi)) = d.truncation {
+                let side = |b: Option<f64>| b.map_or("~".to_string(), |v| format!("{v:.6}"));
+                writeln!(f, "    truncation: [{}, {}]", side(lo), side(hi))
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some([a, b, c]) = eta_effect_quantiles(result, i) {
+                writeln!(f, "    effect_quantiles_5_50_95: [{a:.6}, {b:.6}, {c:.6}]")
+                    .map_err(|e| e.to_string())?;
+            }
         }
         if is_fixed {
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
@@ -8153,6 +8240,7 @@ mod tests {
             param_type: t,
             linked_theta: None,
             individual_param_name: n.to_uppercase(),
+            distribution: None,
         };
         r.eta_param_info = vec![
             info("eta_V", EtaParamType::Additive),
@@ -8241,6 +8329,7 @@ mod tests {
             param_type: EtaParamType::LogNormal,
             linked_theta: None,
             individual_param_name: "Q".into(),
+            distribution: None,
         });
         assert_eq!(eta_type(&both, "eta_V"), Some(EtaParamType::Custom));
         assert_eq!(eta_type(&both, "eta_CL"), Some(EtaParamType::LogNormal));
@@ -8636,6 +8725,7 @@ mod tests {
             param_type: t,
             linked_theta: th.map(String::from),
             individual_param_name: n.to_uppercase(),
+            distribution: None,
         };
         // Statement order, not `eta_names` order: the type is found by name.
         // Linked θs (#1884 extras) for the additive and both logit ETAs; the
@@ -8834,6 +8924,7 @@ mod tests {
                                 .map(|i| names.get(i).and_then(|n| linked(n)))
                                 .collect(),
                             covariance_status: status,
+                            eta_distribution_notes: Vec::new(),
                         };
                         let via_result = OmegaRowsInput::from_result(&r);
                         assert_eq!(via_result.eta_param_types, input.eta_param_types, "{cell}");
@@ -9026,6 +9117,7 @@ mod tests {
             param_type: Additive,
             linked_theta: Some(th.into()),
             individual_param_name: "Q".into(),
+            distribution: None,
         };
         r.eta_param_info.push(info("eta_ADD", "TVV"));
         assert_eq!(eta_linked_theta(&r, "eta_ADD").map(|t| t.value), Some(62.5));
@@ -9054,6 +9146,7 @@ mod tests {
             omega_init_as_sd: &[],
             eta_linked_thetas: Vec::new(),
             covariance_status: CovarianceStatus::Computed,
+            eta_distribution_notes: Vec::new(),
         };
         let want = "  ETA                  = 0.200000  (SD = 0.4472)  SE = 0.010000\n  \
                     ETA                  = 0.500000  (CV% = 80.5)  SE = N/A\n";

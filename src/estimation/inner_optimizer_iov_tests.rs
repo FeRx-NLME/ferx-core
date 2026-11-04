@@ -638,6 +638,8 @@ fn make_iov_model() -> CompiledModel {
         residual_error_eta: None,
         analytical_init: Vec::new(),
         analytic_readout: None,
+        eta_densities: Vec::new(),
+        kappa_densities: Vec::new(),
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
         mixture: None,
@@ -2338,6 +2340,8 @@ fn no_iov_1cpt_model() -> CompiledModel {
         residual_error_eta: None,
         analytical_init: Vec::new(),
         analytic_readout: None,
+        eta_densities: Vec::new(),
+        kappa_densities: Vec::new(),
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
         mixture: None,
@@ -2447,6 +2451,8 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         residual_error_eta: None,
         analytical_init: Vec::new(),
         analytic_readout: None,
+        eta_densities: Vec::new(),
+        kappa_densities: Vec::new(),
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
         mixture: None,
@@ -2653,6 +2659,7 @@ fn analytical_ad_unsupported_flags_each_class() {
         param_type: crate::types::EtaParamType::Additive,
         linked_theta: None,
         individual_param_name: "CL".into(),
+        distribution: None,
     }];
     assert!(analytical_ad_unsupported(&model).is_some());
     model.eta_param_info.clear();

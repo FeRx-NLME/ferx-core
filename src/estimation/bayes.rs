@@ -1145,6 +1145,19 @@ pub fn run_bayes(
             let mut rw_scales = vec![0.1_f64; n_pop];
             let mut acc_pop = vec![0u64; n_pop];
             let mut prop_pop = vec![0u64; n_pop];
+            // A density ETA's ln-ω random walk (#1716): its step, adapted in warmup.
+            // Per Ω / Ω_IOV block of the Metropolis move (#1716): its step, adapted in warmup.
+            let conjugate0 = options.bayes_omega_prior == crate::types::OmegaPrior::InverseWishart;
+            let n_blk = bayes_blocks(model, &init_params.omega.free_mask, conjugate0).len();
+            let n_kblk = init_params.omega_iov.as_ref().map_or(0, |o| {
+                bayes_kappa_blocks(model, &o.free_mask, conjugate0).len()
+            });
+            let mut dens_step = vec![0.3f64; n_blk];
+            let mut dens_acc = vec![0u64; n_blk];
+            let mut dens_prop = vec![0u64; n_blk];
+            let mut kdens_step = vec![0.3f64; n_kblk];
+            let mut kdens_acc = vec![0u64; n_kblk];
+            let mut kdens_prop = vec![0u64; n_kblk];
             // Global η step: the HMC leapfrog step and the mixture MH kernel.
             let mut eta_scale = 0.6_f64;
             let mut acc_eta = 0u64;
@@ -1382,7 +1395,12 @@ pub fn run_bayes(
                 }
 
                 // ---- 2. Ω block (conjugate full conditional) ----
-                if !omega_all_fixed {
+                // A density ETA's variance (#1716) has no conjugate update: it is put
+                // back after the conjugate draw and moved by Metropolis below.
+                let omega_before = omega_mat.clone();
+                let conjugate =
+                    options.bayes_omega_prior == crate::types::OmegaPrior::InverseWishart;
+                if !omega_all_fixed && conjugate {
                     if init_params.omega.diagonal {
                         // Diagonal Ω: each variance has an INDEPENDENT inverse-gamma
                         // full conditional. Drawing a dense inverse-Wishart and then
@@ -1439,11 +1457,55 @@ pub fn run_bayes(
                     }
                 }
 
+                // ---- 2d. Metropolis on Ω blocks (#1716): a density group's always (its
+                // block has no conjugate update), every block under a non-conjugate prior
+                // (`bayes_omega_prior = wishart | lkj`). Each against its exact latent
+                // density (a Gaussian block as a copula of normal margins), under the prior's
+                // marginal on the block.
+                let blocks = bayes_blocks(model, &init_params.omega.free_mask, conjugate);
+                if !blocks.is_empty() {
+                    for (g, d) in blocks.iter().enumerate() {
+                        for &a in &d.etas {
+                            for &b in &d.etas {
+                                omega_mat[(a, b)] = omega_before[(a, b)];
+                            }
+                        }
+                        if d.etas
+                            .iter()
+                            .any(|&a| init_params.omega_fixed.get(a).copied().unwrap_or(false))
+                        {
+                            continue;
+                        }
+                        let prior =
+                            block_prior(options.bayes_omega_prior, &d.etas, &lambda0, nu0, n_eta);
+                        dens_prop[g] += 1;
+                        if crate::estimation::eta_density_mstep::mh_group_omega_prior(
+                            d,
+                            &etas,
+                            &mut omega_mat,
+                            &theta,
+                            &prior,
+                            dens_step[g],
+                            &mut rng,
+                        ) {
+                            dens_acc[g] += 1;
+                        }
+                    }
+                    omega_cur = OmegaMatrix::from_matrix(
+                        omega_mat.clone(),
+                        init_params.omega.eta_names.clone(),
+                        init_params.omega.diagonal,
+                    );
+                }
+
+                // A κ density group's Ω_IOV block (#1716) is put back after the conjugate
+                // draw below and moved by Metropolis after it.
+                let omega_iov_before = omega_iov_cur.as_ref().map(|o| o.matrix.clone());
                 // ---- 2c. Ω_iov block (conjugate inverse-Wishart over kappas) ----
                 // Posterior IW(ν0 + N_occ, Λ0_iov + Σᵢ Σₖ κᵢₖκᵢₖᵀ); the structural
                 // template (free_mask, fixed rows, OMEGA_IOV_DIAG_FLOOR) is re-imposed
                 // via impose_omega_structure, the same helper the Ω block uses.
-                if n_kappa > 0 && !omega_iov_all_fixed {
+                if n_kappa > 0 && !omega_iov_all_fixed && conjugate {
                     if let (Some(oi_ref), Some(lam)) =
                         (init_params.omega_iov.as_ref(), lambda0_iov.as_ref())
                     {
@@ -1468,6 +1530,60 @@ pub fn run_bayes(
                                 &oi_ref.matrix,
                                 OMEGA_IOV_DIAG_FLOOR,
                             );
+                            omega_iov_cur = Some(OmegaMatrix::from_matrix_with_mask(
+                                m,
+                                oi_ref.eta_names.clone(),
+                                oi_ref.diagonal,
+                                oi_ref.free_mask.clone(),
+                            ));
+                        }
+                    }
+                }
+
+                // ---- 2e. Metropolis on Ω_IOV blocks (#1716), as on Ω's above, against
+                // every occasion's κ.
+                if n_kappa > 0 {
+                    if let (Some(before), Some(cur), Some(lam0), Some(oi_ref)) = (
+                        omega_iov_before.as_ref(),
+                        omega_iov_cur.as_ref(),
+                        lambda0_iov.as_ref(),
+                        init_params.omega_iov.as_ref(),
+                    ) {
+                        let kblocks = bayes_kappa_blocks(model, &oi_ref.free_mask, conjugate);
+                        if !kblocks.is_empty() {
+                            let mut m = cur.matrix.clone();
+                            let kdraws: Vec<Vec<f64>> = kappas.iter().flatten().cloned().collect();
+                            for (g, d) in kblocks.iter().enumerate() {
+                                for &a in &d.etas {
+                                    for &b in &d.etas {
+                                        m[(a, b)] = before[(a, b)];
+                                    }
+                                }
+                                if d.etas.iter().any(|&a| {
+                                    init_params.kappa_fixed.get(a).copied().unwrap_or(false)
+                                }) {
+                                    continue;
+                                }
+                                let prior = block_prior(
+                                    options.bayes_omega_prior,
+                                    &d.etas,
+                                    lam0,
+                                    nu0_iov,
+                                    n_kappa,
+                                );
+                                kdens_prop[g] += 1;
+                                if crate::estimation::eta_density_mstep::mh_group_omega_prior(
+                                    d,
+                                    &kdraws,
+                                    &mut m,
+                                    &theta,
+                                    &prior,
+                                    kdens_step[g],
+                                    &mut rng,
+                                ) {
+                                    kdens_acc[g] += 1;
+                                }
+                            }
                             omega_iov_cur = Some(OmegaMatrix::from_matrix_with_mask(
                                 m,
                                 oi_ref.eta_names.clone(),
@@ -1775,6 +1891,22 @@ pub fn run_bayes(
 
                 // ---- warmup adaptation of the step sizes ----
                 if sweep < n_warmup && (sweep + 1) % 50 == 0 {
+                    for g in 0..kdens_step.len() {
+                        if kdens_prop[g] > 0 {
+                            let r = kdens_acc[g] as f64 / kdens_prop[g] as f64;
+                            kdens_step[g] = (kdens_step[g] * (r - 0.44).exp()).clamp(1e-3, 10.0);
+                            kdens_acc[g] = 0;
+                            kdens_prop[g] = 0;
+                        }
+                    }
+                    for g in 0..dens_step.len() {
+                        if dens_prop[g] > 0 {
+                            let r = dens_acc[g] as f64 / dens_prop[g] as f64;
+                            dens_step[g] = (dens_step[g] * (r - 0.44).exp()).clamp(1e-3, 10.0);
+                            dens_acc[g] = 0;
+                            dens_prop[g] = 0;
+                        }
+                    }
                     // Componentwise scales (bootstrap kernel).
                     for c in 0..n_pop {
                         if prop_pop[c] > 0 {
@@ -2261,6 +2393,98 @@ pub fn run_bayes(
         start_eval: None,
         mcem_lowest_objective: None,
     })
+}
+
+/// The Ω blocks the Metropolis move updates (#1716): the density groups, and under a
+/// non-conjugate prior also every Gaussian block of `free_mask` (as a copula of normal
+/// margins, which is exactly the multivariate normal).
+fn bayes_blocks(
+    model: &CompiledModel,
+    free_mask: &DMatrix<bool>,
+    conjugate: bool,
+) -> Vec<crate::stats::eta_density::EtaDensity> {
+    blocks_with(&model.eta_densities, free_mask, conjugate)
+}
+
+/// [`bayes_blocks`] for Ω_IOV and the κ density groups.
+fn bayes_kappa_blocks(
+    model: &CompiledModel,
+    free_mask: &DMatrix<bool>,
+    conjugate: bool,
+) -> Vec<crate::stats::eta_density::EtaDensity> {
+    blocks_with(&model.kappa_densities, free_mask, conjugate)
+}
+
+fn blocks_with(
+    groups: &[crate::stats::eta_density::EtaDensity],
+    free_mask: &DMatrix<bool>,
+    conjugate: bool,
+) -> Vec<crate::stats::eta_density::EtaDensity> {
+    use crate::stats::eta_density::{DensityKind, EtaDensity};
+    let mut out: Vec<EtaDensity> = groups.to_vec();
+    if conjugate {
+        return out;
+    }
+    let n = free_mask.nrows();
+    let mut seen = vec![false; n];
+    for d in groups {
+        for &a in &d.etas {
+            seen[a] = true;
+        }
+    }
+    for i in 0..n {
+        if seen[i] {
+            continue;
+        }
+        // The block of `i`: every coordinate linked to it through free entries.
+        let mut blk = vec![i];
+        let mut k = 0;
+        while k < blk.len() {
+            let a = blk[k];
+            for b in 0..n {
+                if !blk.contains(&b) && (free_mask[(a, b)] || free_mask[(b, a)]) {
+                    blk.push(b);
+                }
+            }
+            k += 1;
+        }
+        blk.sort_unstable();
+        for &b in &blk {
+            seen[b] = true;
+        }
+        let m = blk.len();
+        out.push(EtaDensity {
+            kind: DensityKind::Copula,
+            etas: blk,
+            shape_thetas: vec![],
+            trunc: None,
+            margins: vec![DensityKind::Normal; m],
+        });
+    }
+    out
+}
+
+/// The prior an Ω block takes under `prior`, centred on the declared Ω's block `Λ₀`.
+fn block_prior(
+    prior: crate::types::OmegaPrior,
+    etas: &[usize],
+    lambda0: &DMatrix<f64>,
+    nu0: f64,
+    p: usize,
+) -> crate::estimation::eta_density_mstep::BlockPrior {
+    use crate::estimation::eta_density_mstep::BlockPrior;
+    let n = etas.len();
+    let lam = DMatrix::from_fn(n, n, |i, j| lambda0[(etas[i], etas[j])]);
+    let nu = nu0 - (p - n) as f64;
+    match prior {
+        crate::types::OmegaPrior::InverseWishart => BlockPrior::InverseWishart { nu, lambda: lam },
+        crate::types::OmegaPrior::Wishart => BlockPrior::Wishart { nu, lambda: lam },
+        crate::types::OmegaPrior::Lkj { eta } => BlockPrior::Lkj {
+            eta,
+            a: (nu0 - p as f64 + 1.0) / 2.0,
+            b: (0..n).map(|i| lam[(i, i)] / 2.0).collect(),
+        },
+    }
 }
 
 #[cfg(test)]

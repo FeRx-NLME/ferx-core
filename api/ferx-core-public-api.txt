@@ -1034,6 +1034,7 @@ pub ferx_core::io::output::OffDiagCorr::name_i: &'a str
 pub ferx_core::io::output::OffDiagCorr::name_j: &'a str
 pub struct ferx_core::io::output::OmegaRowsInput<'a>
 pub ferx_core::io::output::OmegaRowsInput::covariance_status: ferx_core::CovarianceStatus
+pub ferx_core::io::output::OmegaRowsInput::eta_distribution_notes: alloc::vec::Vec<core::option::Option<alloc::string::String>>
 pub ferx_core::io::output::OmegaRowsInput::eta_linked_thetas: alloc::vec::Vec<core::option::Option<ferx_core::io::output::EtaLinkedTheta>>
 pub ferx_core::io::output::OmegaRowsInput::eta_names: &'a [alloc::string::String]
 pub ferx_core::io::output::OmegaRowsInput::eta_param_types: alloc::vec::Vec<core::option::Option<ferx_core::EtaParamType>>
@@ -1050,6 +1051,9 @@ pub ferx_core::io::output::OmegaRowsOptions::typical_value_spread: bool
 pub const ferx_core::io::output::THETA_BLOCK_COMPACT_MIN: usize
 pub fn ferx_core::io::output::block_summary(values: &[f64]) -> (f64, f64, f64)
 pub fn ferx_core::io::output::compact_theta_blocks(names: &[alloc::string::String]) -> alloc::vec::Vec<(alloc::string::String, core::ops::range::Range<usize>)>
+pub fn ferx_core::io::output::eta_distribution<'a>(result: &'a ferx_core::FitResult, name: &str) -> core::option::Option<&'a ferx_core::EtaDistribution>
+pub fn ferx_core::io::output::eta_distribution_note(result: &ferx_core::FitResult, i: usize) -> core::option::Option<alloc::string::String>
+pub fn ferx_core::io::output::eta_effect_quantiles(result: &ferx_core::FitResult, i: usize) -> core::option::Option<[f64; 3]>
 pub fn ferx_core::io::output::format_comparison(runs: &[(alloc::string::String, &ferx_core::FitResult)]) -> alloc::string::String
 pub fn ferx_core::io::output::format_kappa_rows_from(input: &ferx_core::io::output::KappaRowsInput<'_>, opts: ferx_core::io::output::KappaRowsOptions) -> alloc::string::String
 pub fn ferx_core::io::output::format_omega_rows_from(input: &ferx_core::io::output::OmegaRowsInput<'_>, opts: ferx_core::io::output::OmegaRowsOptions) -> alloc::string::String
@@ -2323,6 +2327,47 @@ pub fn ferx_core::stats::convergence::ess_bulk(chains: &[alloc::vec::Vec<f64>]) 
 pub fn ferx_core::stats::convergence::ess_tail(chains: &[alloc::vec::Vec<f64>]) -> f64
 pub fn ferx_core::stats::convergence::quantile_sorted(sorted: &[f64], q: f64) -> f64
 pub fn ferx_core::stats::convergence::split_rhat(chains: &[alloc::vec::Vec<f64>]) -> f64
+pub mod ferx_core::stats::eta_density
+pub enum ferx_core::stats::eta_density::DensityKind
+pub ferx_core::stats::eta_density::DensityKind::Arcsine
+pub ferx_core::stats::eta_density::DensityKind::Beta
+pub ferx_core::stats::eta_density::DensityKind::BetaPrime
+pub ferx_core::stats::eta_density::DensityKind::Biweight
+pub ferx_core::stats::eta_density::DensityKind::Cauchy
+pub ferx_core::stats::eta_density::DensityKind::Chi
+pub ferx_core::stats::eta_density::DensityKind::ChiSq
+pub ferx_core::stats::eta_density::DensityKind::Copula
+pub ferx_core::stats::eta_density::DensityKind::Cosine
+pub ferx_core::stats::eta_density::DensityKind::Epanechnikov
+pub ferx_core::stats::eta_density::DensityKind::Erlang
+pub ferx_core::stats::eta_density::DensityKind::Exponential
+pub ferx_core::stats::eta_density::DensityKind::Frechet
+pub ferx_core::stats::eta_density::DensityKind::Gamma
+pub ferx_core::stats::eta_density::DensityKind::GeneralizedExtremeValue
+pub ferx_core::stats::eta_density::DensityKind::GeneralizedPareto
+pub ferx_core::stats::eta_density::DensityKind::Gumbel
+pub ferx_core::stats::eta_density::DensityKind::InvGamma
+pub ferx_core::stats::eta_density::DensityKind::InverseGaussian
+pub ferx_core::stats::eta_density::DensityKind::Kolmogorov
+pub ferx_core::stats::eta_density::DensityKind::Laplace
+pub ferx_core::stats::eta_density::DensityKind::Levy
+pub ferx_core::stats::eta_density::DensityKind::LogNormal
+pub ferx_core::stats::eta_density::DensityKind::LogUniform
+pub ferx_core::stats::eta_density::DensityKind::Logistic
+pub ferx_core::stats::eta_density::DensityKind::LogitNormal
+pub ferx_core::stats::eta_density::DensityKind::NoncentralChiSq
+pub ferx_core::stats::eta_density::DensityKind::Normal
+pub ferx_core::stats::eta_density::DensityKind::NormalInverseGaussian
+pub ferx_core::stats::eta_density::DensityKind::PGeneralizedGaussian
+pub ferx_core::stats::eta_density::DensityKind::Pareto
+pub ferx_core::stats::eta_density::DensityKind::Rayleigh
+pub ferx_core::stats::eta_density::DensityKind::Semicircle
+pub ferx_core::stats::eta_density::DensityKind::StudentT
+pub ferx_core::stats::eta_density::DensityKind::SymTriangular
+pub ferx_core::stats::eta_density::DensityKind::Triweight
+pub ferx_core::stats::eta_density::DensityKind::Uniform
+pub ferx_core::stats::eta_density::DensityKind::Weibull
+pub struct ferx_core::stats::eta_density::EtaDensity
 pub mod ferx_core::stats::likelihood
 pub fn ferx_core::stats::likelihood::apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[core::option::Option<f64>])
 pub fn ferx_core::stats::likelihood::build_block_diag_omega(omega_bsv: &nalgebra::base::alias::DMatrix<f64>, omega_iov: &nalgebra::base::alias::DMatrix<f64>, n_occasions: usize) -> nalgebra::base::alias::DMatrix<f64>
@@ -2671,6 +2716,11 @@ pub ferx_core::types::ObsRecord::Event::cmt: usize
 pub ferx_core::types::ObsRecord::Event::entry_time: f64
 pub ferx_core::types::ObsRecord::Event::event_type: ferx_core::EventType
 pub ferx_core::types::ObsRecord::Event::time: f64
+pub enum ferx_core::types::OmegaPrior
+pub ferx_core::types::OmegaPrior::InverseWishart
+pub ferx_core::types::OmegaPrior::Lkj
+pub ferx_core::types::OmegaPrior::Lkj::eta: f64
+pub ferx_core::types::OmegaPrior::Wishart
 pub enum ferx_core::types::Optimizer
 pub ferx_core::types::Optimizer::Auto
 pub ferx_core::types::Optimizer::Bfgs
@@ -2894,6 +2944,7 @@ pub ferx_core::types::CompiledModel::dv_pre_logged: bool
 pub ferx_core::types::CompiledModel::endpoints: alloc::collections::btree::map::BTreeMap<usize, ferx_core::EndpointLikelihood>
 pub ferx_core::types::CompiledModel::error_model: ferx_core::ErrorModel
 pub ferx_core::types::CompiledModel::error_spec: ferx_core::ErrorSpec
+pub ferx_core::types::CompiledModel::eta_densities: alloc::vec::Vec<ferx_core::stats::eta_density::EtaDensity>
 pub ferx_core::types::CompiledModel::eta_map: alloc::vec::Vec<i32>
 pub ferx_core::types::CompiledModel::eta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CompiledModel::eta_param_info: alloc::vec::Vec<ferx_core::EtaParamInfo>
@@ -2902,6 +2953,7 @@ pub ferx_core::types::CompiledModel::gradient_method: ferx_core::GradientMethod
 pub ferx_core::types::CompiledModel::has_conditional_eta_params: bool
 pub ferx_core::types::CompiledModel::indiv_param_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CompiledModel::indiv_param_partials: ferx_core::parser::model_parser::IndivParamPartials
+pub ferx_core::types::CompiledModel::kappa_densities: alloc::vec::Vec<ferx_core::stats::eta_density::EtaDensity>
 pub ferx_core::types::CompiledModel::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::types::CompiledModel::kappa_mu_refs: std::collections::hash::map::HashMap<alloc::string::String, ferx_core::MuRef>
 pub ferx_core::types::CompiledModel::kappa_names: alloc::vec::Vec<alloc::string::String>
@@ -3122,7 +3174,13 @@ pub ferx_core::types::ErrorSelector::branch_labels: alloc::vec::Vec<alloc::strin
 pub ferx_core::types::ErrorSelector::eval: ferx_core::ErrorSelectFn
 impl core::fmt::Debug for ferx_core::ErrorSelector
 pub fn ferx_core::ErrorSelector::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::types::EtaDistribution
+pub ferx_core::types::EtaDistribution::form: alloc::string::String
+pub ferx_core::types::EtaDistribution::kind: alloc::string::String
+pub ferx_core::types::EtaDistribution::shape_thetas: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::EtaDistribution::truncation: core::option::Option<(core::option::Option<f64>, core::option::Option<f64>)>
 pub struct ferx_core::types::EtaParamInfo
+pub ferx_core::types::EtaParamInfo::distribution: core::option::Option<ferx_core::EtaDistribution>
 pub ferx_core::types::EtaParamInfo::eta_name: alloc::string::String
 pub ferx_core::types::EtaParamInfo::individual_param_name: alloc::string::String
 pub ferx_core::types::EtaParamInfo::linked_theta: core::option::Option<alloc::string::String>
@@ -3142,6 +3200,7 @@ pub ferx_core::types::FitOptions::agq_eval_only: bool
 pub ferx_core::types::FitOptions::analytic_cov_hessian: bool
 pub ferx_core::types::FitOptions::bayes_chains: usize
 pub ferx_core::types::FitOptions::bayes_iters: usize
+pub ferx_core::types::FitOptions::bayes_omega_prior: ferx_core::OmegaPrior
 pub ferx_core::types::FitOptions::bayes_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::bayes_thin: usize
 pub ferx_core::types::FitOptions::bayes_warmup: usize
@@ -4101,6 +4160,11 @@ pub ferx_core::ObsRecord::Event::time: f64
 pub enum ferx_core::ObserveMode
 pub ferx_core::ObserveMode::Dv
 pub ferx_core::ObserveMode::Ipred
+pub enum ferx_core::OmegaPrior
+pub ferx_core::OmegaPrior::InverseWishart
+pub ferx_core::OmegaPrior::Lkj
+pub ferx_core::OmegaPrior::Lkj::eta: f64
+pub ferx_core::OmegaPrior::Wishart
 pub enum ferx_core::Optimizer
 pub ferx_core::Optimizer::Auto
 pub ferx_core::Optimizer::Bfgs
@@ -4414,6 +4478,7 @@ pub ferx_core::CompiledModel::dv_pre_logged: bool
 pub ferx_core::CompiledModel::endpoints: alloc::collections::btree::map::BTreeMap<usize, ferx_core::EndpointLikelihood>
 pub ferx_core::CompiledModel::error_model: ferx_core::ErrorModel
 pub ferx_core::CompiledModel::error_spec: ferx_core::ErrorSpec
+pub ferx_core::CompiledModel::eta_densities: alloc::vec::Vec<ferx_core::stats::eta_density::EtaDensity>
 pub ferx_core::CompiledModel::eta_map: alloc::vec::Vec<i32>
 pub ferx_core::CompiledModel::eta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CompiledModel::eta_param_info: alloc::vec::Vec<ferx_core::EtaParamInfo>
@@ -4422,6 +4487,7 @@ pub ferx_core::CompiledModel::gradient_method: ferx_core::GradientMethod
 pub ferx_core::CompiledModel::has_conditional_eta_params: bool
 pub ferx_core::CompiledModel::indiv_param_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CompiledModel::indiv_param_partials: ferx_core::parser::model_parser::IndivParamPartials
+pub ferx_core::CompiledModel::kappa_densities: alloc::vec::Vec<ferx_core::stats::eta_density::EtaDensity>
 pub ferx_core::CompiledModel::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::CompiledModel::kappa_mu_refs: std::collections::hash::map::HashMap<alloc::string::String, ferx_core::MuRef>
 pub ferx_core::CompiledModel::kappa_names: alloc::vec::Vec<alloc::string::String>
@@ -4717,7 +4783,13 @@ pub ferx_core::ErrorSelector::branch_labels: alloc::vec::Vec<alloc::string::Stri
 pub ferx_core::ErrorSelector::eval: ferx_core::ErrorSelectFn
 impl core::fmt::Debug for ferx_core::ErrorSelector
 pub fn ferx_core::ErrorSelector::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::EtaDistribution
+pub ferx_core::EtaDistribution::form: alloc::string::String
+pub ferx_core::EtaDistribution::kind: alloc::string::String
+pub ferx_core::EtaDistribution::shape_thetas: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::EtaDistribution::truncation: core::option::Option<(core::option::Option<f64>, core::option::Option<f64>)>
 pub struct ferx_core::EtaParamInfo
+pub ferx_core::EtaParamInfo::distribution: core::option::Option<ferx_core::EtaDistribution>
 pub ferx_core::EtaParamInfo::eta_name: alloc::string::String
 pub ferx_core::EtaParamInfo::individual_param_name: alloc::string::String
 pub ferx_core::EtaParamInfo::linked_theta: core::option::Option<alloc::string::String>
@@ -4737,6 +4809,7 @@ pub ferx_core::FitOptions::agq_eval_only: bool
 pub ferx_core::FitOptions::analytic_cov_hessian: bool
 pub ferx_core::FitOptions::bayes_chains: usize
 pub ferx_core::FitOptions::bayes_iters: usize
+pub ferx_core::FitOptions::bayes_omega_prior: ferx_core::OmegaPrior
 pub ferx_core::FitOptions::bayes_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::bayes_thin: usize
 pub ferx_core::FitOptions::bayes_warmup: usize

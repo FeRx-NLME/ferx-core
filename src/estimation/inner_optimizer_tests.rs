@@ -2133,6 +2133,8 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         residual_error_eta: None,
         analytical_init: Vec::new(),
         analytic_readout: None,
+        eta_densities: Vec::new(),
+        kappa_densities: Vec::new(),
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
         mixture: None,

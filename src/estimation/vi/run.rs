@@ -512,6 +512,92 @@ fn write_omega_block(
 ///
 /// `Ω_iov` is `None` for a model without IOV, in which case only the BSV block moves and
 /// the (empty) IOV range is untouched.
+/// #1716: a density group's Ω block and shape θ maximise `E_q[ln p(z; ψ)]`, the prior
+/// half of the ELBO, over draws from the variational posteriors (the same objective
+/// MCEM maximises over its importance draws); `x` gets the result. The closed form
+/// before it is the Gaussian statistic, which a density group does not have.
+#[allow(clippy::too_many_arguments)]
+fn density_vi_mstep(
+    model: &CompiledModel,
+    fams: Families<'_>,
+    phis: &[Vec<f64>],
+    x: &mut Vec<f64>,
+    template: &ModelParameters,
+    seed: u64,
+    iter: u64,
+    n_draws: usize,
+) {
+    let bounds: Vec<(f64, f64)> = template
+        .theta_lower
+        .iter()
+        .zip(&template.theta_upper)
+        .map(|(&lo, &hi)| (lo, hi))
+        .collect();
+    let bsv = crate::estimation::eta_density_mstep::DensityMstep::new(
+        model,
+        &template.omega_fixed,
+        &template.theta_fixed,
+        &bounds,
+    );
+    let kap = crate::estimation::eta_density_mstep::DensityMstep::for_kappas(
+        model,
+        &template.kappa_fixed,
+        &template.theta_fixed,
+        &bounds,
+    );
+    if bsv.is_none() && kap.is_none() {
+        return;
+    }
+    let mut draws: Vec<Vec<f64>> = Vec::with_capacity(phis.len() * n_draws);
+    for (i, phi) in phis.iter().enumerate() {
+        let family = fams.for_subject(i);
+        for s in 0..n_draws {
+            let eps = super::elbo::crn_eps(seed, iter, i, s, family.n_eta());
+            draws.push(family.sample(phi, &eps));
+        }
+    }
+    let w = 1.0 / draws.len().max(1) as f64;
+    let weighted: Vec<(&[f64], f64)> = draws.iter().map(|z| (z.as_slice(), w)).collect();
+    let mut params = unpack_params(x, template);
+    if let Some(dm) = &bsv {
+        let mut omega = params.omega.matrix.clone();
+        dm.maximise(model, &weighted, &mut omega, &mut params.theta);
+        params.omega = crate::types::OmegaMatrix::from_matrix(
+            omega,
+            template.omega.eta_names.clone(),
+            template.omega.diagonal,
+        );
+    }
+    // Every occasion's κ segment of the stacked draws, against Ω_IOV.
+    if let (Some(dm), Some(oiv)) = (&kap, params.omega_iov.as_ref()) {
+        let (ne, nk) = (model.n_eta, model.n_kappa);
+        let segs: Vec<Vec<f64>> = draws
+            .iter()
+            .flat_map(|z| {
+                let k = if nk > 0 && z.len() > ne {
+                    (z.len() - ne) / nk
+                } else {
+                    0
+                };
+                (0..k).map(move |g| z[ne + g * nk..ne + (g + 1) * nk].to_vec())
+            })
+            .collect();
+        if !segs.is_empty() {
+            let wk = 1.0 / segs.len() as f64;
+            let kw: Vec<(&[f64], f64)> = segs.iter().map(|e| (e.as_slice(), wk)).collect();
+            let mut m = oiv.matrix.clone();
+            dm.maximise(model, &kw, &mut m, &mut params.theta);
+            params.omega_iov = Some(crate::types::OmegaMatrix::from_matrix_with_mask(
+                m,
+                oiv.eta_names.clone(),
+                oiv.diagonal,
+                oiv.free_mask.clone(),
+            ));
+        }
+    }
+    *x = crate::estimation::parameterization::pack_params(&params);
+}
+
 fn write_closed_form_omegas(
     x: &mut [f64],
     omega: &crate::types::OmegaMatrix,
@@ -617,6 +703,33 @@ pub fn run_vi(
     // One family per subject, sized to `n_eta + K_i * n_kappa`.
     let families = build_families(options.vi_family, n_eta, model.n_kappa, &k_occasions);
     let fams = Families::PerSubject(&families);
+    // The θs a density's M-step owns (#1716); Adam leaves them alone.
+    let vi_bounds: Vec<(f64, f64)> = init_params
+        .theta_lower
+        .iter()
+        .zip(&init_params.theta_upper)
+        .map(|(&lo, &hi)| (lo, hi))
+        .collect();
+    let density_owned: Vec<usize> = crate::estimation::eta_density_mstep::DensityMstep::new(
+        model,
+        &init_params.omega_fixed,
+        &init_params.theta_fixed,
+        &vi_bounds,
+    )
+    .map(|d| d.owned_thetas())
+    .unwrap_or_default()
+    .into_iter()
+    .chain(
+        crate::estimation::eta_density_mstep::DensityMstep::for_kappas(
+            model,
+            &init_params.kappa_fixed,
+            &init_params.theta_fixed,
+            &vi_bounds,
+        )
+        .map(|d| d.owned_thetas())
+        .unwrap_or_default(),
+    )
+    .collect();
 
     // Start q at the prior and Θ at the model file's initial estimates: no
     // randomization, so the fit is reproducible by default. The initial estimates
@@ -772,6 +885,10 @@ pub fn run_vi(
         let penalty = fold_nn_penalty(&nn_reg, &x, &mut grad_x, &mut grad_pen);
         obj_trace.push(2.0 * eval.neg_elbo + penalty);
         zero_fixed_coords(&mut grad_x, init_params, &layout);
+        // A density's shape θ (#1716) is the prior M-step's below, not Adam's.
+        for &t in &density_owned {
+            grad_x[t] = 0.0;
+        }
         if options.vi_omega_update == ViOmegaUpdate::ClosedForm {
             // Ω is set analytically below; stepping it here as well would apply the
             // same information twice and fight the closed form.
@@ -824,6 +941,16 @@ pub fn run_vi(
             let (omega, omega_iov) = closed_form_omega(fams, &phis, &k_occasions, init_params);
             write_closed_form_omegas(&mut x, &omega, omega_iov.as_ref(), init_params, &layout);
         }
+        density_vi_mstep(
+            model,
+            fams,
+            &phis,
+            &mut x,
+            init_params,
+            cfg.seed,
+            iter as u64,
+            cfg.n_mc_samples,
+        );
 
         if iter >= avg_start {
             avg_x.accumulate(&x);
@@ -949,6 +1076,22 @@ pub fn run_vi(
         if omega_iov.is_some() {
             final_params.omega_iov = omega_iov;
         }
+    }
+    // #1716: the density groups' Ω blocks at the averaged posteriors, as each iteration
+    // set them (θ, including a density's shape θ, is already `x_final`'s).
+    if model.has_densities() {
+        let mut xf = crate::estimation::parameterization::pack_params(&final_params);
+        density_vi_mstep(
+            model,
+            fams,
+            &phis_final,
+            &mut xf,
+            init_params,
+            cfg.seed,
+            n_iters as u64,
+            cfg.n_mc_samples,
+        );
+        final_params = unpack_params(&xf, init_params);
     }
     restore_fixed(&mut final_params, init_params);
     // Report exactly what the packed vector unpacks to. A closed-form Ω is written above as
