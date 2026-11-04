@@ -1649,8 +1649,9 @@ pub(crate) fn compute_dose_pk_params_into(
 /// the buffer is allocated once per subject and reused across many
 /// `eta` evaluations, so the snapshot vectors are not reallocated per
 /// call. On the TV-cov path each call still allocates the per-record input
-/// lists, and builds the sharing index of `first_record_with_same_pk_inputs` unless an
-/// open `SharingScope` already holds it (#2558).
+/// lists and builds the index of which records can share one `$PK` evaluation. Inside
+/// the crate an EBE search keeps that index for its subject (#2558); a call from outside
+/// the crate builds it every time.
 ///
 /// Resizes `out`'s `Vec`s to the exact lengths required by `subject`,
 /// then overwrites the contents. If the existing capacity already
@@ -4355,8 +4356,50 @@ mod tests {
         assert_eq!(builds(), b, "re-entering the open pair keeps its index");
     }
 
-    /// An EBE search opens the scope: across all its evaluations each site builds at most
-    /// once. Without it a search of two evaluations already builds four f64 indices.
+    /// A guard that closes while one opened after it is still open must not hand back its
+    /// own predecessor: the later guard would then reinstall a scope whose borrows have
+    /// ended. A debug build fails at the out-of-order drop, and every scope is closed, so a
+    /// release build only loses the index. Catches a `Drop` that restores unconditionally.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn an_out_of_order_sharing_scope_closes_every_scope() {
+        use sharing_scope::{first_record_with_same_pk_inputs as scoped, ShareSite, SharingScope};
+        let model = wt_age_model(true);
+        let (s, other) = (
+            wt_varying_subject([70.0, 95.0, 95.0, 80.0, 70.0]),
+            wt_varying_subject([70.0, 70.0, 95.0, 95.0, 95.0]),
+        );
+        let ask = |sub: &Subject| {
+            let r: Vec<_> = (0..5).map(|j| (None, sub.obs_cov(j))).collect();
+            scoped(&model, sub, ShareSite::Dose, r.into_iter());
+        };
+        let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let first = SharingScope::enter(&model, &s);
+            let second = SharingScope::enter(&model, &other);
+            drop(first);
+            drop(second);
+        }));
+        let msg = closed.expect_err("an out-of-order drop must fail a debug build");
+        assert!(
+            msg.downcast_ref::<&str>()
+                .is_some_and(|m| m.contains("closed before one opened after it")),
+            "the panic names the out-of-order close"
+        );
+        // Nothing is left open: neither subject's index is kept.
+        for sub in [&s, &other] {
+            let b = sharing_scope::builds();
+            ask(sub);
+            ask(sub);
+            assert_eq!(
+                sharing_scope::builds(),
+                b + 2,
+                "no scope may outlive its guard"
+            );
+        }
+    }
+
+    /// An EBE search opens the scope: across all its evaluations each site builds once.
+    /// Without it a search of two evaluations already builds four f64 indices.
     #[test]
     fn an_ebe_search_builds_each_sharing_index_once() {
         let model = wt_age_model(true);
@@ -4374,11 +4417,13 @@ mod tests {
             0,
         );
         assert!(ebe.nll.is_finite());
-        // Measured: 3, the f64 dose and rest indices and the inner gradient's recorder.
+        // Exactly one per site, so a site the search stops reaching (the inner gradient
+        // routed to FD, say) fails as surely as a site that rebuilds.
         let built = sharing_scope::builds() - b;
-        assert!(
-            (1..=3).contains(&built),
-            "{built} indices built across one EBE search; at most one per site"
+        assert_eq!(
+            built, 3,
+            "indices built across one EBE search: want the f64 dose index, the f64 \
+             obs/PK-only/reset index and the inner gradient's recorder index, one each"
         );
     }
 

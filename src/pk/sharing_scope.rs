@@ -63,6 +63,8 @@ struct Slot {
 }
 
 struct Scope {
+    /// Which guard installed it, so a guard closing out of order is caught.
+    id: u64,
     model: *const CompiledModel,
     subject: *const Subject,
     slots: [Option<Slot>; ShareSite::COUNT],
@@ -70,6 +72,7 @@ struct Scope {
 
 thread_local! {
     static SCOPE: RefCell<Option<Scope>> = const { RefCell::new(None) };
+    static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -86,41 +89,63 @@ pub(crate) fn builds() -> usize {
 
 /// While this lives, the sharing indices of `(model, subject)` are built once and reused.
 /// Bind it to a local (`let _share = SharingScope::enter(..)`) so scopes close in the
-/// order they opened. Not `Send`: the state it restores is this thread's.
+/// order they opened; `let _ = ..` closes it at once. Not `Send`: the state it restores
+/// is this thread's.
+#[must_use = "bind to a local; dropping closes the scope"]
 pub(crate) struct SharingScope<'a> {
-    /// The scope this one replaced, restored on drop; `None` when this guard re-entered
-    /// the scope already open for the same pair and changes nothing.
-    prev: Option<Option<Scope>>,
+    /// The id of the scope this guard installed and the scope it replaced, restored on
+    /// drop; `None` when this guard re-entered the scope already open for the same pair
+    /// and changes nothing.
+    installed: Option<(u64, Option<Scope>)>,
     _borrow: PhantomData<(&'a CompiledModel, &'a Subject, *const ())>,
 }
 
 impl<'a> SharingScope<'a> {
+    #[must_use = "bind to a local; dropping closes the scope"]
     pub(crate) fn enter(model: &'a CompiledModel, subject: &'a Subject) -> Self {
         let (model, subject) = (model as *const _, subject as *const _);
-        let prev = SCOPE.with(|s| {
+        let installed = SCOPE.with(|s| {
             let mut s = s.borrow_mut();
             if s.as_ref()
                 .is_some_and(|sc| sc.model == model && sc.subject == subject)
             {
                 return None;
             }
-            Some(s.replace(Scope {
+            let id = NEXT_ID.with(|n| n.replace(n.get() + 1));
+            let prev = s.replace(Scope {
+                id,
                 model,
                 subject,
                 slots: Default::default(),
-            }))
+            });
+            Some((id, prev))
         });
         Self {
-            prev,
+            installed,
             _borrow: PhantomData,
         }
     }
 }
 
 impl Drop for SharingScope<'_> {
+    /// Restores the scope this guard replaced, when the open one is still this guard's.
+    /// When it is not, a guard opened later is still open, and restoring would reinstall
+    /// a scope whose borrows may have ended, so a later subject at a freed address would
+    /// hit its index. That closes every scope instead, which costs only speed, and fails
+    /// a debug build.
     fn drop(&mut self) {
-        if let Some(prev) = self.prev.take() {
-            SCOPE.with(|s| *s.borrow_mut() = prev);
+        let Some((id, prev)) = self.installed.take() else {
+            return;
+        };
+        let in_order = SCOPE.with(|s| {
+            let mut s = s.borrow_mut();
+            let in_order = s.as_ref().is_some_and(|sc| sc.id == id);
+            *s = if in_order { prev } else { None };
+            in_order
+        });
+        // Not while unwinding: the guards a panic drops may be out of order already.
+        if !std::thread::panicking() {
+            debug_assert!(in_order, "a SharingScope closed before one opened after it");
         }
     }
 }
@@ -136,37 +161,50 @@ pub(crate) fn first_record_with_same_pk_inputs<'r>(
     records: impl Iterator<Item = (Option<usize>, &'r HashMap<String, f64>)> + Clone,
 ) -> Option<Rc<[usize]>> {
     let (m, s) = (model as *const CompiledModel, subject as *const Subject);
-    let in_scope = SCOPE.with(|sc| {
+    let lookup = SCOPE.with(|sc| {
         let sc = sc.borrow();
-        let sc = sc.as_ref().filter(|sc| sc.model == m && sc.subject == s)?;
-        Some(match &sc.slots[site.slot()] {
+        let Some(sc) = sc.as_ref().filter(|sc| sc.model == m && sc.subject == s) else {
+            return Lookup::Unscoped;
+        };
+        match &sc.slots[site.slot()] {
             Some(slot)
                 if records
                     .clone()
                     .map(|(g, _)| g)
                     .eq(slot.groups.iter().copied()) =>
             {
-                Ok(slot.first.clone())
+                Lookup::Hit(slot.first.clone())
             }
-            _ => Err(()),
-        })
+            _ => Lookup::Miss,
+        }
     });
-    if let Some(Ok(hit)) = in_scope {
-        return hit;
+    if let Lookup::Hit(first) = lookup {
+        return first;
     }
     #[cfg(test)]
     BUILDS.with(|b| b.set(b.get() + 1));
     let first: Option<Rc<[usize]>> =
         super::first_record_with_same_pk_inputs(model, records.clone()).map(Rc::from);
-    if in_scope.is_some() {
+    if let Lookup::Miss = lookup {
         SCOPE.with(|sc| {
-            if let Some(sc) = sc.borrow_mut().as_mut() {
-                sc.slots[site.slot()] = Some(Slot {
-                    groups: records.map(|(g, _)| g).collect(),
-                    first: first.clone(),
-                });
-            }
+            let mut sc = sc.borrow_mut();
+            // The build opens no scope, so the one the lookup found is still open.
+            let sc = sc.as_mut().expect("the scope a miss found is still open");
+            sc.slots[site.slot()] = Some(Slot {
+                groups: records.map(|(g, _)| g).collect(),
+                first: first.clone(),
+            });
         });
     }
     first
+}
+
+/// What the open scope holds for one request.
+enum Lookup {
+    /// No scope is open for this model and subject: build, keep nothing.
+    Unscoped,
+    /// The scope's index for this site and groups.
+    Hit(Option<Rc<[usize]>>),
+    /// The scope is for this pair but has no index for this site and groups: build, keep.
+    Miss,
 }
