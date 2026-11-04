@@ -1939,6 +1939,10 @@ pub(crate) fn check_model_data_rule_at(
 
 /// The `[odes]` RHS-route note (#2681) as an informational `ferx check` row: the text
 /// `fit()` reports, under the code that opens it.
+///
+/// Each code is spelled as a literal at its `Diagnostic::info` call, not passed through
+/// `code`: the registry test finds an informational code by the literal there, and checks
+/// the docs' `info` severity column against it (#2387).
 pub(crate) fn check_ode_rhs_route(model: &CompiledModel) -> Option<Diagnostic> {
     let (code, msg, _) = model
         .ode_spec
@@ -1946,7 +1950,13 @@ pub(crate) fn check_ode_rhs_route(model: &CompiledModel) -> Option<Diagnostic> {
         .rhs_program
         .as_ref()?
         .route_note()?;
-    Some(Diagnostic::info(code, msg).with_block("odes"))
+    let d = if code == "W_ODE_RHS_NOT_NATIVE" {
+        Diagnostic::info("W_ODE_RHS_NOT_NATIVE", msg)
+    } else {
+        debug_assert_eq!(code, "W_ODE_RHS_INTERPRETED");
+        Diagnostic::info("W_ODE_RHS_INTERPRETED", msg)
+    };
+    Some(d.with_block("odes"))
 }
 
 /// `E_IOV_SINGLE_OCCASION` when a derived `iov_occasion` rule (`dose` / `time(...)`) gives
