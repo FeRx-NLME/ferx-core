@@ -1111,7 +1111,8 @@ Notes and constraints:
   individual parameter.
 - Not supported with per-CMT (multi-endpoint) error models. An `if/else`
   [selected error model](#covariate-selected-error-models-ifelse) takes it: the
-  line sits beside the `if/else` and scales every branch.
+  line sits after the closing `}` and scales every branch. Inside a branch it is
+  refused, since one branch cannot be scaled on its own.
 - **With a correlated residual.** `iiv_on_ruv` composes with `block_sigma` and with
   a [`correlation` line](residual-correlation.qmd#with-iiv-on-the-residual). The
   random effect scales the subject's whole `R`, so the correlation is unchanged:

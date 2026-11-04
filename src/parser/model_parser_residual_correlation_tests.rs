@@ -250,6 +250,45 @@ fn iiv_on_ruv_sits_beside_a_selected_error_model() {
     );
 }
 
+/// #2656 review: the line scales every branch, so inside one branch it would fit a model
+/// other than the one written. Refused in the `if` branch, the `else` branch and a nested
+/// `else if`, each naming the η, with the same line after the closing brace still accepted.
+#[test]
+fn iiv_on_ruv_inside_a_selected_branch_is_refused() {
+    let want = "[error_model] `iiv_on_ruv = ETA_RUV` is inside an `if/else` branch. It scales \
+                every branch, so write it after the closing `}`.";
+    let (a, b) = (
+        "    DV ~ proportional(PROP_ERR)\n",
+        "    DV ~ proportional(ADD_ERR)\n",
+    );
+    let ruv = "    iiv_on_ruv = ETA_RUV  # meant for this branch\n";
+    for (label, body) in [
+        (
+            "if",
+            format!("  if (FREE == 0) {{\n{a}{ruv}  }} else {{\n{b}  }}"),
+        ),
+        (
+            "else",
+            format!("  if (FREE == 0) {{\n{a}  }} else {{\n{b}{ruv}  }}"),
+        ),
+        (
+            "else if",
+            format!(
+                "  if (FREE == 0) {{\n{a}  }} else if (FREE == 1) {{\n{ruv}{b}  }} else {{\n{a}  }}"
+            ),
+        ),
+    ] {
+        assert_eq!(err("  omega ETA_RUV ~ 0.1\n", &body), want, "{label}");
+    }
+    // The depth returns to 0 at the closing brace, so the same line right after it parses.
+    let beside = format!("  if (FREE == 0) {{\n{a}  }} else {{\n{b}  }}\n{ruv}");
+    let src = text("  omega ETA_RUV ~ 0.1\n", "", &beside);
+    assert_eq!(
+        parse_model_string(&src).expect("beside").residual_error_eta,
+        Some(0)
+    );
+}
+
 #[test]
 fn a_correlation_line_next_to_block_sigma_is_refused() {
     let src = text(

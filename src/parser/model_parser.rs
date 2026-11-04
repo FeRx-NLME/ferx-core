@@ -21591,18 +21591,38 @@ fn parse_error_model_inner(
 ) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
     // IIV on residual error: `iiv_on_ruv = ETA_NAME` (NONMEM `Y=IPRED+EPS*EXP(ETA)`). It
     // modifies the whole block rather than one statement, so it is taken out first: it
-    // sits beside a plain, per-CMT or if/else block alike (#2656).
+    // sits beside a plain, per-CMT or if/else block alike (#2656). Inside an if/else
+    // branch it would read as scaling that branch alone, which no model here can do, so
+    // only a line outside every brace counts and one inside is refused.
     static IIV_RE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap());
     let mut iiv_on_ruv: Option<String> = None;
     let mut statements: Vec<String> = Vec::with_capacity(lines.len());
+    let mut depth = 0_usize;
     for line in lines {
-        match IIV_RE.captures(line.split('#').next().unwrap_or("").trim()) {
+        let code = line.split('#').next().unwrap_or("").trim();
+        match IIV_RE.captures(code) {
+            Some(c) if depth > 0 => {
+                return Err(format!(
+                    "[error_model] `iiv_on_ruv = {}` is inside an `if/else` branch. It scales \
+                     every branch, so write it after the closing `}}`.",
+                    &c[1]
+                ));
+            }
             Some(_) if iiv_on_ruv.is_some() => {
                 return Err("[error_model] has more than one `iiv_on_ruv = ...` entry".to_string());
             }
             Some(c) => iiv_on_ruv = Some(c[1].to_string()),
-            None => statements.push(line.clone()),
+            None => {
+                for ch in code.chars() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                statements.push(line.clone());
+            }
         }
     }
     // Covariate-selected if/else form (issue #658) — detected and parsed first;
