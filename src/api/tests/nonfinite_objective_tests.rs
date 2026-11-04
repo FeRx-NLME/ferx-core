@@ -3780,6 +3780,324 @@ fn a_diverged_marginal_reaches_the_published_verdict() {
     }
 }
 
+/// A trail of `n` iterations: a first third that is never read, then two windows whose
+/// floors are `previous` and `last`.
+fn settling_trail(
+    n: usize,
+    previous: f64,
+    last: f64,
+    mc_se: f64,
+    label: &str,
+) -> crate::estimation::impmap::McemObjectiveTrail {
+    let third = n / 3;
+    let mut objectives = vec![1e9; n - 2 * third];
+    objectives.extend(vec![previous; third]);
+    objectives.extend(vec![last; third]);
+    let map = label == "IMPMAP";
+    crate::estimation::impmap::McemObjectiveTrail {
+        objectives,
+        mc_se: vec![mc_se; n],
+        label: label.to_string(),
+        iterations_option: if map {
+            "impmap_iterations"
+        } else {
+            "imp_iterations"
+        },
+        samples_option: if map { "impmap_samples" } else { "imp_samples" },
+        proposal_option: if map {
+            "impmap_proposal_df"
+        } else {
+            "imp_proposal_df"
+        },
+    }
+}
+
+/// Each sentence of the falling arm, and its discriminators with their negatives: the
+/// advice is "more iterations", not the plateau arm's, and IMPMAP's option is its own.
+#[test]
+fn a_falling_objective_demotes_the_fit_and_asks_for_iterations() {
+    use crate::api::postfit::MCEM_NOT_SETTLED_TOKEN;
+    let trail = settling_trail(150, 1036.04, 1005.52, 0.29, "IMP");
+    let mut converged = true;
+    let (msg, entry) = mcem_settling_warning(&mut converged, Some(&trail), Some(1004.72))
+        .expect("the vancomycin run passed");
+    assert!(!converged);
+    assert!(
+        msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")),
+        "{msg}"
+    );
+    assert!(msg.contains("still falling"), "{msg}");
+    assert!(msg.contains("limit of 150 iterations"), "{msg}");
+    assert!(msg.contains("converged: false"), "{msg}");
+    assert!(msg.contains("from 1036.04 to 1005.52"), "{msg}");
+    assert!(msg.contains("two windows of 50 iterations"), "{msg}");
+    assert!(msg.contains("Monte-Carlo SE 0.29"), "{msg}");
+    assert!(msg.contains("short of the optimum"), "{msg}");
+    assert!(msg.contains("Raise `imp_iterations`"), "{msg}");
+    assert!(!msg.contains("imp_samples"), "{msg}");
+    assert!(!msg.contains("impmap"), "{msg}");
+    assert_eq!(entry.severity, WarningSeverity::Critical);
+    assert_eq!(entry.category, WarningCode::Convergence);
+    let details = entry.details.as_ref().unwrap();
+    assert_eq!(details["reason"], "falling");
+    assert_eq!(details["window"], 50);
+    assert_eq!(details["previous_floor"], 1036.04);
+    assert_eq!(details["floor"], 1005.52);
+    assert_eq!(details["mc_se"], 0.29);
+
+    let trail = settling_trail(150, 1036.04, 1005.52, 0.29, "IMPMAP");
+    let (msg, _) = mcem_settling_warning(&mut true, Some(&trail), None).expect("IMPMAP passed");
+    assert!(msg.contains(": IMPMAP: "), "{msg}");
+    assert!(msg.contains("Raise `impmap_iterations`"), "{msg}");
+    assert!(!msg.contains("`imp_iterations`"), "{msg}");
+}
+
+/// Each sentence of the marginal arm. Its advice is about sampling, and more iterations
+/// would not help: cefepime's floor is flat.
+#[test]
+fn a_floor_above_the_marginal_demotes_the_fit_and_asks_for_better_sampling() {
+    use crate::api::postfit::MCEM_NOT_SETTLED_TOKEN;
+    let trail = settling_trail(150, 4327.48, 4330.41, 2.54, "IMP");
+    let mut converged = true;
+    let (msg, entry) = mcem_settling_warning(&mut converged, Some(&trail), Some(4288.06))
+        .expect("the cefepime run passed");
+    assert!(!converged);
+    assert!(
+        msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")),
+        "{msg}"
+    );
+    assert!(msg.contains("stayed well above"), "{msg}");
+    assert!(msg.contains("converged: false"), "{msg}");
+    assert!(msg.contains("last 50 iterations"), "{msg}");
+    assert!(msg.contains("floor was 4330.41"), "{msg}");
+    assert!(msg.contains("marginal of 4288.06"), "{msg}");
+    assert!(msg.contains("Monte-Carlo SE 2.54"), "{msg}");
+    assert!(msg.contains("not sampling the posterior well"), "{msg}");
+    assert!(msg.contains("short of the optimum"), "{msg}");
+    assert!(msg.contains("Raise `imp_samples`"), "{msg}");
+    assert!(
+        msg.contains("heavy-tailed proposal (`imp_proposal_df`)"),
+        "{msg}"
+    );
+    assert!(msg.contains("chain a FOCE/FOCEI stage first"), "{msg}");
+    assert!(!msg.contains("imp_iterations"), "{msg}");
+    assert!(!msg.contains("impmap"), "{msg}");
+    assert_eq!(entry.severity, WarningSeverity::Critical);
+    assert_eq!(entry.category, WarningCode::Convergence);
+    let details = entry.details.as_ref().unwrap();
+    assert_eq!(details["reason"], "above_marginal");
+    assert_eq!(details["window"], 50);
+    assert_eq!(details["floor"], 4330.41);
+    assert_eq!(details["marginal"], 4288.06);
+    assert_eq!(details["mc_se"], 2.54);
+
+    let trail = settling_trail(150, 4327.48, 4330.41, 2.54, "IMPMAP");
+    let (msg, _) =
+        mcem_settling_warning(&mut true, Some(&trail), Some(4288.06)).expect("IMPMAP passed");
+    assert!(msg.contains("Raise `impmap_samples`"), "{msg}");
+    assert!(msg.contains("(`impmap_proposal_df`)"), "{msg}");
+    assert!(!msg.contains("`imp_samples`"), "{msg}");
+}
+
+/// A run too short to test is told so and keeps its verdict, good or bad.
+#[test]
+fn a_run_too_short_to_test_keeps_its_verdict_and_hears_why() {
+    use crate::api::postfit::MCEM_SETTLING_UNTESTED_TOKEN;
+    let trail = settling_trail(29, 200.0, 100.0, 0.1, "IMP");
+    let mut converged = true;
+    let (msg, entry) = mcem_settling_warning(&mut converged, Some(&trail), None).expect("no note");
+    assert!(converged);
+    assert!(
+        msg.starts_with(&format!(
+            "{MCEM_SETTLING_UNTESTED_TOKEN}: IMP: 29 iteration(s)"
+        )),
+        "{msg}"
+    );
+    assert!(msg.contains("only says the run did not diverge"), "{msg}");
+    assert!(msg.contains("`imp_iterations` of at least 30"), "{msg}");
+    assert_eq!(entry.severity, WarningSeverity::Warning);
+    assert_eq!(entry.category, WarningCode::Convergence);
+    let details = entry.details.as_ref().unwrap();
+    assert_eq!(details["iterations"], 29);
+    assert_eq!(details["needed"], 30);
+
+    let mut converged = false;
+    assert!(mcem_settling_warning(&mut converged, Some(&trail), None).is_some());
+    assert!(!converged);
+}
+
+/// A settled run, and a fit with no MCEM stage, leave the verdict alone either way.
+#[test]
+fn a_settled_run_and_a_non_mcem_fit_are_left_alone() {
+    let settled = settling_trail(150, 100.0, 100.0, 0.1, "IMP");
+    for verdict in [true, false] {
+        let mut converged = verdict;
+        assert!(mcem_settling_warning(&mut converged, Some(&settled), Some(100.0)).is_none());
+        assert!(mcem_settling_warning(&mut converged, None, Some(1.0)).is_none());
+        assert_eq!(converged, verdict);
+    }
+}
+
+/// The trail has to survive from the loop to the gate. Without it, this note is missing.
+#[test]
+fn a_short_mcem_fit_is_told_its_verdict_was_not_tested() {
+    use crate::api::postfit::MCEM_SETTLING_UNTESTED_TOKEN;
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma ADD ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD)
+"#,
+    )
+    .expect("parse");
+    let subject = |id: &str| {
+        let mut s = subject_with_dose_time(id, 0.0, 1.0);
+        s.observations = s
+            .obs_times
+            .iter()
+            .map(|t| 10.0 * (-0.1 * t).exp())
+            .collect();
+        s
+    };
+    let pop = population_of(vec![subject("1"), subject("2"), subject("3")]);
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::Imp],
+        imp_iterations: 3,
+        imp_samples: 50,
+        imp_auto: false,
+        imp_seed: Some(7),
+        run_covariance_step: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+    let note = res
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.starts_with(MCEM_SETTLING_UNTESTED_TOKEN))
+        .unwrap_or_else(|| panic!("{:?}", res.warnings));
+    assert!(
+        note.message.contains("IMP: 3 iteration(s)"),
+        "{}",
+        note.message
+    );
+    assert_eq!(note.severity, WarningSeverity::Warning);
+    assert!(res.converged, "{:?}", res.warnings);
+
+    let focei = FitOptions {
+        methods: vec![EstimationMethod::FoceI],
+        ..opts
+    };
+    let res = fit(&model, &pop, &model.default_params, &focei).expect("fit");
+    assert!(
+        !res.warnings
+            .iter()
+            .any(|w| w.contains(MCEM_SETTLING_UNTESTED_TOKEN)),
+        "{:?}",
+        res.warnings
+    );
+}
+
+/// The falling arm through `fit()`. EM grows a far-too-small Ω slowly, so 30 iterations
+/// end with the objective still dropping. The twin differs only in starting Ω near its
+/// estimate, so it settles on the same data and schedule.
+#[test]
+fn a_run_stopped_while_falling_reaches_the_published_verdict() {
+    use crate::api::postfit::MCEM_NOT_SETTLED_TOKEN;
+    let model = |omega: f64| {
+        parse_model_string(&format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0, FIX)
+  omega ETA_CL ~ {omega}
+  sigma PROP ~ 0.01 FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#
+        ))
+        .expect("parse")
+    };
+    let subject = |i: usize| {
+        let mut s = subject_with_dose_time(&i.to_string(), 0.0, 1.0);
+        let cl = (2.4 * (((i * 37 % 101) as f64) / 101.0 - 0.5)).exp();
+        s.observations = s
+            .obs_times
+            .iter()
+            .map(|t| 10.0 * (-cl / 10.0 * t).exp())
+            .collect();
+        s
+    };
+    let pop = population_of((0..20).map(subject).collect());
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::Imp],
+        imp_iterations: 30,
+        imp_samples: 100,
+        imp_auto: false,
+        imp_seed: Some(7),
+        run_covariance_step: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    let has_token = |w: &String| w.starts_with(MCEM_NOT_SETTLED_TOKEN);
+
+    let tiny = model(0.001);
+    let bad = fit(&tiny, &pop, &tiny.default_params, &opts).expect("fit");
+    assert!(bad.warnings.iter().any(has_token), "{:?}", bad.warnings);
+    assert!(!bad.converged, "{:?}", bad.warnings);
+    let entry = bad
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.starts_with(MCEM_NOT_SETTLED_TOKEN))
+        .expect("typed entry");
+    assert_eq!(entry.severity, WarningSeverity::Critical);
+    assert_eq!(entry.details.as_ref().unwrap()["reason"], "falling");
+
+    let near = model(0.4);
+    let good = fit(&near, &pop, &near.default_params, &opts).expect("fit");
+    assert!(!good.warnings.iter().any(has_token), "{:?}", good.warnings);
+    assert!(good.converged, "{:?}", good.warnings);
+
+    // The marginal arm, on the settled model. Five normal draws per subject miss the
+    // posterior every iteration, and the final marginal, with its fresh proposal, does
+    // not. The entry has to quote the marginal `fit()` publishes.
+    let starved = FitOptions {
+        imp_samples: 5,
+        imp_proposal_df: f64::INFINITY,
+        imp_averaging: 1,
+        ..opts
+    };
+    let bad = fit(&near, &pop, &near.default_params, &starved).expect("fit");
+    assert!(!bad.converged, "{:?}", bad.warnings);
+    let entry = bad
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.starts_with(MCEM_NOT_SETTLED_TOKEN))
+        .unwrap_or_else(|| panic!("{:?}", bad.warnings));
+    let details = entry.details.as_ref().unwrap();
+    assert_eq!(details["reason"], "above_marginal");
+    let marginal = bad
+        .importance_sampling
+        .as_ref()
+        .expect("marginal published")
+        .minus2_log_likelihood;
+    assert_eq!(details["marginal"], marginal);
+}
+
 /// The rise arm through `fit()`: `mcem_lowest_objective` has to survive from the loop to
 /// the gate. The fit starts at the truth of noiseless additive-error data, so iteration 1
 /// sets a low baseline; once the first M-step moves TVCL the model predicts nothing, no

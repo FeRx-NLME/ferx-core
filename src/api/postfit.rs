@@ -2121,6 +2121,101 @@ pub(crate) fn mcem_marginal_warning(
     Some((msg, entry))
 }
 
+/// Demote a fit whose IMP / IMPMAP objective had not settled when the iteration limit
+/// stopped it, and say which way (#2686). See `impmap::McemObjectiveTrail::settling`.
+///
+/// `trail` is `None` when no MCEM stage produced the estimates. `marginal` is `None`
+/// when no marginal was published, which leaves only the falling-floor test.
+///
+/// A run too short to test keeps its verdict, and hears that the verdict then only says
+/// the run did not diverge.
+pub(crate) fn mcem_settling_warning(
+    converged: &mut bool,
+    trail: Option<&crate::estimation::impmap::McemObjectiveTrail>,
+    marginal: Option<f64>,
+) -> Option<(String, WarningEntry)> {
+    use crate::estimation::impmap::{McemSettling, MCEM_SETTLE_MIN_WINDOW};
+    let trail = trail?;
+    let label = &trail.label;
+    let n = trail.objectives.len();
+    let (severity, msg, details) = match trail.settling(marginal) {
+        McemSettling::Settled => return None,
+        McemSettling::TooShort => {
+            let needed = 3 * MCEM_SETTLE_MIN_WINDOW;
+            let msg = format!(
+                "{MCEM_SETTLING_UNTESTED_TOKEN}: {label}: {n} iteration(s) are too few to test \
+                 whether the objective settled, so `converged` only says the run did not \
+                 diverge. The test needs `{}` of at least {needed}.",
+                trail.iterations_option
+            );
+            let details = serde_json::json!({ "iterations": n, "needed": needed });
+            (WarningSeverity::Warning, msg, details)
+        }
+        McemSettling::Falling {
+            window,
+            previous_floor,
+            floor,
+            mc_se,
+        } => {
+            *converged = false;
+            let msg = format!(
+                "{MCEM_NOT_SETTLED_TOKEN}: {label}: the objective was still falling when the \
+                 run reached its limit of {n} iterations, so the fit is reported converged: \
+                 false. Its floor fell from {previous_floor:.2} to {floor:.2} over the last \
+                 two windows of {window} iterations (Monte-Carlo SE {mc_se:.2}), so the \
+                 estimates are likely short of the optimum. Raise `{}`.",
+                trail.iterations_option
+            );
+            let details = serde_json::json!({
+                "reason": "falling",
+                "window": window,
+                "previous_floor": previous_floor,
+                "floor": floor,
+                "mc_se": mc_se,
+            });
+            (WarningSeverity::Critical, msg, details)
+        }
+        McemSettling::AboveMarginal {
+            window,
+            floor,
+            marginal,
+            mc_se,
+        } => {
+            *converged = false;
+            let msg = format!(
+                "{MCEM_NOT_SETTLED_TOKEN}: {label}: the iteration objective stayed well above \
+                 the final marginal, so the fit is reported converged: false. Over the last \
+                 {window} iterations its floor was {floor:.2} against a marginal of \
+                 {marginal:.2} (Monte-Carlo SE {mc_se:.2}), so the iterations were not sampling \
+                 the posterior well and the estimates may be short of the optimum. Raise `{}`, \
+                 use a heavy-tailed proposal (`{}`), or chain a FOCE/FOCEI stage first.",
+                trail.samples_option, trail.proposal_option
+            );
+            let details = serde_json::json!({
+                "reason": "above_marginal",
+                "window": window,
+                "floor": floor,
+                "marginal": marginal,
+                "mc_se": mc_se,
+            });
+            (WarningSeverity::Critical, msg, details)
+        }
+    };
+    let entry = warning_entry_with_severity(
+        severity,
+        WarningCode::Convergence,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
+}
+
+/// Stable token of [`mcem_settling_warning`]'s demoting arms.
+pub(crate) const MCEM_NOT_SETTLED_TOKEN: &str = "W_MCEM_NOT_SETTLED";
+
+/// Stable token of [`mcem_settling_warning`]'s note on a run too short to test.
+pub(crate) const MCEM_SETTLING_UNTESTED_TOKEN: &str = "W_MCEM_SETTLING_UNTESTED";
+
 /// Stable token of [`mcem_marginal_warning`]'s unusable-marginal arm.
 pub(crate) const NONFINITE_MARGINAL_TOKEN: &str = "W_NONFINITE_MARGINAL";
 

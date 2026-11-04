@@ -2061,6 +2061,7 @@ fn fit_inner(
                         vi: None,
                         start_eval: None,
                         mcem_lowest_objective: None,
+                        mcem_objective_trail: None,
                         mixture_posteriors: None,
                     });
                 }
@@ -2160,6 +2161,7 @@ fn fit_inner(
                     vi: None,
                     start_eval: None,
                     mcem_lowest_objective: None,
+                    mcem_objective_trail: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -3053,6 +3055,15 @@ fn fit_inner(
         is_result.as_ref().map(|r| r.minus2_log_likelihood),
         result.mcem_lowest_objective,
         population.n_obs(),
+    ) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+    // Every IMP / IMPMAP run stops at its iteration limit, finished or not (#2686).
+    if let Some((msg, entry)) = mcem_settling_warning(
+        &mut converged,
+        result.mcem_objective_trail.as_ref(),
+        is_result.as_ref().map(|r| r.minus2_log_likelihood),
     ) {
         warnings.push(msg);
         native_warnings.push(entry);
