@@ -1700,6 +1700,25 @@ fn warning_entry_with_severity(
     }
 }
 
+/// The `[odes]` RHS-route note (#2681) as a fit warning, once per fit: informational,
+/// with the construct that kept the interpreter (or why no native code) in `details`.
+/// `None` for a model with no `[odes]` block or one whose RHS runs as native code.
+pub(crate) fn ode_rhs_route_warning(model: &CompiledModel) -> Option<(String, WarningEntry)> {
+    let (_, msg, details) = model
+        .ode_spec
+        .as_ref()?
+        .rhs_program
+        .as_ref()?
+        .route_note()?;
+    let entry = warning_entry_with_severity(
+        WarningSeverity::Info,
+        WarningCode::OdeRhsRoute,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
+}
+
 /// Shared scaffold for the list-style fit-end warnings: given a set of `hits`,
 /// return `None` when empty, otherwise join a human `list` string (`line` per
 /// hit), format the message (`msg` over the joined list), build the structured

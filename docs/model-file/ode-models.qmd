@@ -452,7 +452,7 @@ on `two_cpt_oral_ode` ran 48 iterations instead of 39 here, and the same fit sta
 four perturbed initial estimates came out 0.91× to 1.21× either way — the spread of the
 path, not of the per-evaluation cost.
 
-#### Inline conditionals
+#### Inline conditionals {#inline-conditionals}
 
 An inline `if (cond) a else b` — and `min`, `max` and `clamp`, which are written as one — is
 compiled (#2680). The native code computes both arms and keeps the taken one, which gives the
@@ -474,6 +474,25 @@ Before and after, one thread, Linux, the mean of two interleaved runs:
 
 The neutropenia model written jump-free with `abs` ran in 32–36 s on both builds, so the
 inline `if` now costs what the hand rewrite did.
+
+#### Which engine ran it {#rhs-route-note}
+
+A fit reports the right-hand side's engine when it is not native code, once, as an
+informational entry in `warnings` / `warning_details` (category `ode_rhs_route`), and
+`ferx check` reports the same text as an `info` row
+([#2681](https://github.com/FeRx-NLME/ferx-core/issues/2681)):
+
+- `W_ODE_RHS_INTERPRETED`: the block keeps the interpreter. The message names the
+  construct (an `if (…) { … }` statement, `sqrt`, a read of `L` before it is assigned, …)
+  and the statement it is in (`d/dt(sm)`, the assignment to `E`).
+- `W_ODE_RHS_NOT_NATIVE`: the block compiled, but runs as register code, because
+  `FERX_NO_RHS_JIT=1` is set, Cranelift cannot target the host, or the native compiler did
+  not build the program.
+
+A compiled block that runs as native code gets no entry. To keep a block compiled, rewrite
+the construct the message names: an `if (…) { … }` statement as inline `if`s (see
+[Inline conditionals](#inline-conditionals)); a `sqrt` of individual parameters only moves
+to `[individual_parameters]`.
 
 ### Sensitivities in PK space {#pk-space-sensitivities}
 

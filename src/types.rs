@@ -7251,6 +7251,11 @@ pub enum WarningCode {
     /// — the dose is dropped — and a `NaN` a `NaN`; NONMEM would refuse either record:
     /// PREDPP treats a non-positive PK parameter as an error.
     DegenerateClearanceOrVolume,
+    /// Informational: the `[odes]` right-hand side does not run as native code — a
+    /// construct keeps it on the bytecode interpreter (`W_ODE_RHS_INTERPRETED`), or the
+    /// host has no native code for it (`W_ODE_RHS_NOT_NATIVE`), #2681. The results are
+    /// unchanged; the fit is slower.
+    OdeRhsRoute,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -7298,6 +7303,7 @@ impl WarningCode {
             WarningCode::OdeSolver => "ode_solver",
             WarningCode::UncertaintyDrawsSkipped => "uncertainty_draws_skipped",
             WarningCode::DegenerateClearanceOrVolume => "degenerate_clearance_or_volume",
+            WarningCode::OdeRhsRoute => "ode_rhs_route",
             WarningCode::General => "general",
         }
     }
@@ -7401,6 +7407,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // "non-finite", "stability-limited", "singular Jacobian", …), which prose arms below
         // would claim as an estimation or solver-health problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
+    } else if lower.starts_with("w_ode_rhs_") {
+        // #2681: which engine runs the `[odes]` RHS. Informational, and a token arm ahead of
+        // the prose ones: the message names the construct, and "interpreter" or a function
+        // name must not reach an estimation arm.
+        (WarningSeverity::Info, WarningCode::OdeRhsRoute)
     } else if lower.contains("w_degenerate_cl_v") {
         // #2104: a non-positive or non-finite CL / V at the final estimates. A token arm ahead
         // of the generic "degenerate" → optimizer-health prose arm, which its wording would

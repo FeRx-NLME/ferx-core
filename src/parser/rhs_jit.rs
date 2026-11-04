@@ -284,6 +284,12 @@ pub(super) fn enabled_by(no_jit: Option<&str>) -> bool {
     no_jit != Some("1")
 }
 
+/// Why this process has no native function for a program (#2681): see
+/// [`super::NativeCause::of`].
+pub(super) fn native_cause() -> super::NativeCause {
+    super::NativeCause::of(jit_enabled(), cranelift_native::builder().is_ok())
+}
+
 /// A JIT module for the host, or `None` when Cranelift cannot target it (or the native code
 /// is switched off, [`jit_enabled`]).
 fn new_module(fast_alloc: bool) -> Option<JITModule> {
