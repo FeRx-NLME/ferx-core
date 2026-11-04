@@ -1937,6 +1937,18 @@ pub(crate) fn check_model_data_rule_at(
     diags
 }
 
+/// The `[odes]` RHS-route note (#2681) as an informational `ferx check` row: the text
+/// `fit()` reports, under the code that opens it.
+pub(crate) fn check_ode_rhs_route(model: &CompiledModel) -> Option<Diagnostic> {
+    let (code, msg, _) = model
+        .ode_spec
+        .as_ref()?
+        .rhs_program
+        .as_ref()?
+        .route_note()?;
+    Some(Diagnostic::info(code, msg).with_block("odes"))
+}
+
 /// `E_IOV_SINGLE_OCCASION` when a derived `iov_occasion` rule (`dose` / `time(...)`) gives
 /// every subject at most one occasion (#757, #1788): the per-occasion κ is then added once
 /// per subject, exactly like an η, so it is confounded with between-subject variability
@@ -10583,6 +10595,9 @@ pub fn validate_model_file_with(
     //    the model, so they surface from `ferx check model.ferx` even without a
     //    `--data` file.
     diags.extend(check_experimental_features(&parsed.model));
+    // Which engine will run the `[odes]` RHS (#2681): the same note `fit()` reports, so a
+    // user finds an interpreted RHS before a long run.
+    diags.extend(check_ode_rhs_route(&parsed.model));
     // A `[covariate_nn]` with no `init` (#1561): a property of the model's own starting
     // values, so it needs no `--data` either.
     #[cfg(feature = "nn")]

@@ -191,7 +191,7 @@ fn check_on<T: VmNum>(
     seeds: &[T; 4],
     label: &str,
 ) -> bool {
-    let Some(reg) = RhsRegProgram::compile(&prog.stmts, &layout(prog)) else {
+    let Ok(reg) = RhsRegProgram::compile(&prog.stmts, &layout(prog)) else {
         return false;
     };
     let mut vars = bind(prog, u, params, seeds);
@@ -230,7 +230,7 @@ fn compiled_rhs_is_the_interpreter_bit_for_bit_on_random_programs() {
 
         // f64 against the production `f64` interpreter (`eval_bytecode`'s lane VM), which
         // is the evaluator the scalar RHS replaced.
-        if let Some(reg) = RhsRegProgram::compile(&prog.stmts, &layout(&prog)) {
+        if let Ok(reg) = RhsRegProgram::compile(&prog.stmts, &layout(&prog)) {
             let mut vars = bind(&prog, &raw_u, &raw_p, &raw_s);
             let (mut du_ref, mut du_reg) = (vec![9.0; 3], vec![9.0; 3]);
             let mut stack = Vec::new();
@@ -323,7 +323,7 @@ fn a_program_outside_the_translatable_shape_is_not_compiled() {
     ] {
         let prog = program(odes);
         assert!(
-            RhsRegProgram::compile(&prog.stmts, &layout(&prog)).is_none(),
+            RhsRegProgram::compile(&prog.stmts, &layout(&prog)).is_err(),
             "{odes}"
         );
         assert!(prog.reg.is_none(), "{odes}");
@@ -416,7 +416,7 @@ fn native_rhs_is_the_register_code_bit_for_bit_on_random_programs() {
         let odes = random_odes(&mut rng);
         let prog = program(&odes);
         let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog))
-            .unwrap_or_else(|| panic!("case {case} did not compile:\n{odes}"));
+            .unwrap_or_else(|e| panic!("case {case} did not compile ({e:?}):\n{odes}"));
         let raw_u = seed_values(&mut rng, 3);
         let raw_p = seed_values(&mut rng, n_params);
         let raw_s = [1.75, rng.unit() * 5.0, rng.unit() * 2.0, f64::EPSILON];
@@ -704,7 +704,7 @@ fn the_reverse_pass_is_the_forward_tangents_transposed_on_random_programs() {
         let odes = random_odes(&mut rng);
         let prog = program(&odes);
         let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog))
-            .unwrap_or_else(|| panic!("case {case} did not compile:\n{odes}"));
+            .unwrap_or_else(|e| panic!("case {case} did not compile ({e:?}):\n{odes}"));
         for &l in &layouts {
             let label = format!("case {case} {l:?}:\n{odes}");
             worst = worst.max(check_reverse(&reg, l, &mut rng, &label));
@@ -858,7 +858,7 @@ fn a_taped_rhs_block_is_the_per_operation_tape_to_rounding() {
         let odes = random_odes(&mut rng);
         let prog = program(&odes);
         let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog))
-            .unwrap_or_else(|| panic!("case {case} did not compile:\n{odes}"));
+            .unwrap_or_else(|e| panic!("case {case} did not compile ({e:?}):\n{odes}"));
         // Inputs away from the guards: the two tapes take the same branch everywhere.
         let raw_u: Vec<f64> = (0..3).map(|_| rng.unit() * 3.0 + 0.2).collect();
         let raw_p: Vec<f64> = (0..n_params).map(|_| rng.unit() * 3.0 + 0.2).collect();
@@ -975,4 +975,237 @@ fn the_jit_switch_reads_the_environment_value() {
     assert!(enabled_by(None));
     assert!(enabled_by(Some("0")));
     assert!(!enabled_by(Some("1")));
+}
+
+// ---- The RHS-route note (#2681) ---------------------------------------------------------
+
+use super::super::{Bytecode, Op, Statement};
+use super::{rhs_route_note, NativeCause, RhsConstruct, RhsRefusal, RhsRoute, RhsSite};
+
+/// The note `program(odes)` reports, which must exist.
+fn note(odes: &str) -> String {
+    let prog = program(odes);
+    assert!(prog.reg.is_none(), "{odes}");
+    let (code, msg, _) = prog
+        .route_note()
+        .unwrap_or_else(|| panic!("no note: {odes}"));
+    assert_eq!(code, "W_ODE_RHS_INTERPRETED");
+    assert!(msg.starts_with("W_ODE_RHS_INTERPRETED: "), "{msg}");
+    msg
+}
+
+const REST: &str = "\n  d/dt(x2) = -x2\n  d/dt(x3) = 0";
+
+/// One refusal per construct the `[odes]` parser can write, each named in the note with
+/// the statement it is in — and, in the same test, a compiled program, which has none.
+#[test]
+fn each_parsable_refusal_names_its_construct_and_statement() {
+    for (odes, construct, site) in [
+        (
+            "  d/dt(x1) = if (x1 < 1) A else B",
+            "an inline `if`",
+            "`d/dt(x1)`",
+        ),
+        ("  d/dt(x1) = sqrt(x1)", "`sqrt`", "`d/dt(x1)`"),
+        ("  d/dt(x1) = inv_logit(x1)", "`inv_logit`", "`d/dt(x1)`"),
+        ("  d/dt(x1) = logit(x1)", "`logit`", "`d/dt(x1)`"),
+        ("  d/dt(x1) = tanh(x1)", "`tanh`", "`d/dt(x1)`"),
+        ("  d/dt(x1) = softplus(x1)", "`softplus`", "`d/dt(x1)`"),
+        // The site is the assignment, not the derivative that reads it.
+        (
+            "  E = sqrt(A)\n  d/dt(x1) = -E * x1",
+            "`sqrt`",
+            "the assignment to `E`",
+        ),
+        // A later statement: the first refusal in program order is the one named.
+        (
+            "  d/dt(x1) = -x1\n  d/dt(x2) = logit(x2) + sqrt(x1)\n  d/dt(x3) = 0",
+            "`logit`",
+            "`d/dt(x2)`",
+        ),
+        (
+            "  if (A > 1) {\n    d/dt(x1) = -x1\n  } else {\n    d/dt(x1) = x1\n  }",
+            "an `if (…) { … }` statement",
+            "the [odes] block",
+        ),
+    ] {
+        let odes = if odes.contains("d/dt(x3)") {
+            odes.to_string()
+        } else {
+            format!("{odes}{REST}")
+        };
+        let msg = note(&odes);
+        assert!(
+            msg.contains(&format!("because of {construct} in {site}.")),
+            "{odes}\n{msg}"
+        );
+    }
+    // The other side of the gate.
+    let prog = program(&format!("  d/dt(x1) = -A * x1{REST}"));
+    assert!(prog.reg.is_some());
+    assert!(
+        prog.route_note().is_none(),
+        "a compiled RHS with native code has no note"
+    );
+}
+
+/// The refusals no `[odes]` block the parser accepts can write (θ, η and covariates are
+/// rejected as undefined names there), on hand-built bytecode: each names its construct.
+#[test]
+fn each_unparsable_refusal_names_its_construct() {
+    let prog = program(&format!("  d/dt(x1) = -A * x1{REST}"));
+    let lay = layout(&prog);
+    let refusal = |ops: Vec<Op>, constants: Vec<f64>| -> RhsRefusal {
+        let mut bc = Bytecode::new();
+        bc.max_stack = ops.len() + 1;
+        bc.ops = ops;
+        bc.constants = constants;
+        RhsRegProgram::compile(&[Statement::DiffEqBc(0, bc)], &lay).expect_err("declined")
+    };
+    let x1 = Op::PushVar(0);
+    for (ops, construct) in [
+        (vec![x1, Op::PushConst(0), Op::Mod], "`mod`"),
+        (vec![Op::PushTheta(0)], "a read of a θ"),
+        (vec![Op::PushThetaGather(0)], "a read of a θ level"),
+        (vec![Op::PushEta(0)], "a read of an η"),
+        (vec![Op::PushCov(0)], "a read of a covariate"),
+        (vec![Op::PushMixNum], "a read of the mixture class `MIXNUM`"),
+        (
+            vec![Op::PushNnOutput(0, 0)],
+            "a read of a neural-network output",
+        ),
+        (vec![Op::PushTime], "a read of the `TIME` built-in"),
+        (
+            vec![Op::PushVar(10_000)],
+            "a read of a variable outside the RHS's slots",
+        ),
+        (vec![x1, Op::PushConst(0), Op::CmpLt], "an inline `if`"),
+        // Unbalanced: nothing left on the stack.
+        (vec![], "a statement the RHS compiler does not translate"),
+    ] {
+        let r = refusal(ops.clone(), vec![2.0]);
+        assert_eq!(r.site, RhsSite::Deriv(0), "{ops:?}");
+        let named = r.named(|s| format!("v{s}"));
+        assert_eq!(named.construct, construct, "{ops:?}");
+        assert_eq!(named.site, "`d/dt(v0)`");
+        let (_, msg, details) = rhs_route_note(RhsRoute::Interpreter(&named)).unwrap();
+        assert!(
+            msg.contains(&format!("because of {construct} in `d/dt(v0)`.")),
+            "{msg}"
+        );
+        assert_eq!(details["construct"], construct);
+    }
+}
+
+/// A local read before the program assigns it is declined in `lower`, and named by the
+/// local's own name.
+#[test]
+fn a_local_read_before_its_assignment_is_named() {
+    let msg = note(&format!("  d/dt(x1) = -L * x1\n  L = A{REST}"));
+    assert!(
+        msg.contains("because of a read of `L` before it is assigned in `d/dt(x1)`."),
+        "{msg}"
+    );
+}
+
+/// Each sentence of the interpreter note, deleted in turn, reddens one assertion here. The
+/// cost sentence is gated on the construct it was measured for, so both sides are asserted.
+#[test]
+fn every_sentence_of_the_interpreter_note_is_pinned() {
+    let if_msg = note(&format!("  d/dt(x1) = if (x1 < 1) A else B{REST}"));
+    let sqrt_msg = note(&format!("  d/dt(x1) = sqrt(x1){REST}"));
+    for msg in [&if_msg, &sqrt_msg] {
+        assert!(
+            msg.contains(
+                "the [odes] right-hand side runs on the bytecode interpreter, not compiled \
+                 code, because of "
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "The constructs that keep the interpreter are listed in the ODE models \
+                 page of the documentation, under \"Native right-hand side\"."
+            ),
+            "{msg}"
+        );
+    }
+    let cost = " Measured on one 8-state model, a fit took 2.4× as long with an inline `if` \
+                as with a jump-free rewrite of it (#2680).";
+    assert!(if_msg.contains(cost), "{if_msg}");
+    assert!(
+        !sqrt_msg.contains(cost),
+        "no measurement for `sqrt`: {sqrt_msg}"
+    );
+}
+
+/// The register-code note: the cause decided in order (switch, host, program), one
+/// sentence per cause, and the shared lead and closing sentences.
+#[test]
+fn every_native_cause_has_its_own_sentence() {
+    assert_eq!(NativeCause::of(false, false), NativeCause::Disabled);
+    assert_eq!(NativeCause::of(false, true), NativeCause::Disabled);
+    assert_eq!(NativeCause::of(true, false), NativeCause::Host);
+    assert_eq!(NativeCause::of(true, true), NativeCause::Declined);
+    let causes = [
+        (
+            NativeCause::Disabled,
+            "the environment variable `FERX_NO_RHS_JIT=1` switches native code off",
+            "disabled",
+        ),
+        (
+            NativeCause::Host,
+            "Cranelift cannot generate code for this host",
+            "host",
+        ),
+        (
+            NativeCause::Declined,
+            "the native compiler did not build this program (it builds programs up to a \
+             size limit)",
+            "declined",
+        ),
+    ];
+    for (cause, why, token) in causes {
+        let (code, msg, details) = rhs_route_note(RhsRoute::RegisterCode(cause)).unwrap();
+        assert_eq!(code, "W_ODE_RHS_NOT_NATIVE");
+        assert!(
+            msg.starts_with(
+                "W_ODE_RHS_NOT_NATIVE: the [odes] right-hand side runs as register code \
+                 rather than native code, because "
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains(&format!("because {why}.")), "{msg}");
+        for (other, other_why, _) in causes {
+            if other != cause {
+                assert!(!msg.contains(other_why), "{msg}");
+            }
+        }
+        assert!(
+            msg.ends_with(" The results are identical; only the speed differs."),
+            "{msg}"
+        );
+        assert_eq!(details["cause"], token);
+        assert_eq!(details["route"], "register_code");
+    }
+    assert!(rhs_route_note(RhsRoute::Native).is_none());
+}
+
+/// A compiled program without its `f64` native function reports the register-code note;
+/// with it, none — both sides on one program.
+#[test]
+fn a_compiled_rhs_without_native_code_reports_the_register_code() {
+    let prog = program(&format!("  d/dt(x1) = -A * x1{REST}"));
+    assert!(prog.route_note().is_none());
+    let was = super::RHS_JIT_DISABLED.with(|c| c.replace(true));
+    let note = prog.route_note();
+    super::RHS_JIT_DISABLED.with(|c| c.set(was));
+    let (code, _, details) = note.expect("no native code is reported");
+    assert_eq!(code, "W_ODE_RHS_NOT_NATIVE");
+    // The test switch is neither the environment variable nor the host.
+    assert_eq!(details["cause"], "declined");
+    assert!(matches!(
+        RhsConstruct::Function("sqrt"),
+        RhsConstruct::Function(_)
+    ));
 }
