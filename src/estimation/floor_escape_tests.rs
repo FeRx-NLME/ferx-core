@@ -597,6 +597,7 @@ fn the_report_is_held_against_the_first_runs_start() {
         n_unconverged: 0,
         n_start_rejected: 0,
         rescored: None,
+        warm_rescored_from: None,
     };
     let fit_start = at(-228.712965);
     let escape = |restart_ofv: f64| {
@@ -735,6 +736,7 @@ fn a_start_that_scored_infinite_is_rescored_once_and_judged_against_that() {
         n_unconverged: 0,
         n_start_rejected: 0,
         rescored: None,
+        warm_rescored_from: None,
     };
     let with_im = |inner_maxiter: usize| FitOptions {
         inner_maxiter,

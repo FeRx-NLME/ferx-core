@@ -854,6 +854,33 @@ reproductions, and they land differently:
 Neither is a general escape: starve the inner loop harder and BOBYQA is rejected at every
 trial too, carrying `W_NO_FEASIBLE_EVAL` like any other route.
 
+#### A start rejected cold is re-solved warm {#no-feasible-evaluation-start}
+
+The guard exists to reject a *step*: the optimizer backs away from it to the best point it
+has. Its very first evaluation has no such point, and the EBE warm-start cache stays at
+η = 0 until an evaluation is accepted, so a start whose cold inner solve leaves more than
+`max_unconverged_frac` of the subjects unconverged used to be re-solved cold at every later
+trial as well — each rejected the same way, the fit walking toward the box centre
+([#2682](https://github.com/FeRx-NLME/ferx-core/issues/2682)).
+
+So when the guard rejects the **first** evaluation on its unconverged fraction, the inner
+loop is run once more at the same parameters, warm from the EBEs the cold solve just found,
+and that second solve is what the guard judges. If it is accepted the fit proceeds from it;
+if it is still rejected, the evaluation is reported exactly as before, from the cold solve.
+A start rejected because a subject was rejected at its inner start, or because the
+objective is not finite, is not re-solved. On `examples/two_cpt_oral_cov.ferx` at
+`inner_maxiter = 3`, 17 of 30 subjects are unconverged from the cold start; re-solved warm,
+none are, and the start scores −1040.033385, the objective the default inner budget gives
+it in one cold solve (−1040.033394).
+
+With `verbose = true` a rejected evaluation prints as a rejection, with the count behind it,
+rather than as the rejection penalty in an `OFV =` line:
+
+```text
+Eval    1: start rejected by the EBE convergence guard (17 of 30 subjects unconverged from the cold start); re-solved warm from its own EBEs: 0 unconverged, accepted
+Eval    1: OFV = -1040.033385
+```
+
 ### When the fit ends above its start {#above-start}
 
 The best-seen restore ranks only the evaluations the EBE guard accepted, so a **starting

@@ -7248,13 +7248,29 @@ fn a_restart_left_just_above_the_floor_is_not_reported_converged() {
     );
 }
 
-/// T5. All twelve studies at `inner_maxiter = 2`: the restart stops at 170.266229 (the
-/// optimum is 101.911514) with EMAX just above the floor, and is not reported converged.
-/// The profiled twin was already demoted by `W_ABOVE_START` (#2626) at 310.367564, with no
-/// floor restart adopted, and does not move.
+/// T5. All twelve studies, unprofiled, at `inner_maxiter = 1`: the restart stops at
+/// 170.266229 (the optimum is 101.911514) with EMAX just above the floor, and is not
+/// reported converged. The profiled twin at `inner_maxiter = 2` was already demoted by
+/// `W_ABOVE_START` (#2626) at 310.367564, with no floor restart adopted, and does not move.
+///
+/// The unprofiled leg ran at `inner_maxiter = 2` too until #2682, and stopped at the same
+/// 170.266229: `max_unconverged_frac = 0` rejected its cold start, and every trial after it
+/// re-solved from the same zero EBEs. Re-solved warm, that start is accepted, and the fit
+/// reaches the optimum, converged and without a floor warning (101.911143, Linux x86_64) —
+/// asserted below as the #2682 half of the pair.
 #[test]
 fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
-    let unprofiled = f2_fit(None, f2_unprofiled, 2);
+    let rescued = f2_fit(None, f2_unprofiled, 2);
+    assert!(
+        (rescued.ofv - 101.911143).abs() < 1e-4 && rescued.converged,
+        "#2682: the warm re-solve of the rejected start must let this fit reach the optimum: \
+         {} {:?}",
+        rescued.ofv,
+        rescued.warnings
+    );
+    assert!(floor_warning(&rescued).is_none(), "{:?}", rescued.warnings);
+
+    let unprofiled = f2_fit(None, f2_unprofiled, 1);
     assert!(
         (unprofiled.ofv - 170.266229).abs() < 1e-5,
         "{} {:?}",

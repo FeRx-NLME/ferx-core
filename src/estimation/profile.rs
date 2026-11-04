@@ -2769,6 +2769,7 @@ pub(crate) fn optimize_profiled(
                     n_unconverged: s.ebe.n_unconverged,
                     n_start_rejected: s.ebe.n_start_rejected,
                     rescored: None,
+                    warm_rescored_from: None,
                 },
                 Err(_) => StartEval {
                     ofv: f64::INFINITY,
@@ -2776,6 +2777,7 @@ pub(crate) fn optimize_profiled(
                     n_unconverged: 0,
                     n_start_rejected: 0,
                     rescored: None,
+                    warm_rescored_from: None,
                 },
             };
             *start_eval.lock().unwrap() = Some(start);
