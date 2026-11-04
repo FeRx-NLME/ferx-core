@@ -60,8 +60,12 @@ fn box_cox_is_exact_through_lambda_zero() {
                 let lambda: f64 = sign * x / eta;
                 let want = (lambda * eta).exp_m1() / lambda;
                 let got = shape_g(ShapeKind::BoxCox, eta, lambda);
-                assert!(got.is_finite(), "boxcox({eta}, {lambda}) = {got}");
-                worst = worst.max(((got - want) / want).abs());
+                assert!(
+                    got.is_finite() && want.is_finite(),
+                    "boxcox({eta}, {lambda}) = {got} vs {want}"
+                );
+                // `want` is `expm1(λη)/λ` with `λη ≠ 0`, so never 0.
+                worst = worst.max((got - want).abs() / want.abs().max(1e-300));
             }
         }
     }

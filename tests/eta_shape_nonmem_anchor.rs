@@ -148,7 +148,10 @@ fn worst_errors(result: &FitResult, pop: &Population, stem: &str) -> (f64, f64) 
         let row = phi.iter().find(|r| r["ID"] == id).expect("a .phi row");
         for k in 0..2 {
             let (got, want) = (s.eta[k], row[&format!("ETA({})", k + 1)]);
-            assert!(got.is_finite(), "subject {id} η{k} = {got}");
+            assert!(
+                got.is_finite() && want.is_finite(),
+                "subject {id} η{k} = {got} vs NONMEM {want}"
+            );
             worst_eta = worst_eta.max((got - want).abs());
         }
         for (j, &t) in subj.obs_times.iter().enumerate() {
@@ -157,8 +160,11 @@ fn worst_errors(result: &FitResult, pop: &Population, stem: &str) -> (f64, f64) 
                 .find(|r| r["ID"] == id && (r["TIME"] - t).abs() < 1e-9)
                 .unwrap_or_else(|| panic!("no $TABLE row for {id} at {t}"))["IPRED"];
             let got = s.ipred[j];
-            assert!(got.is_finite(), "subject {id} IPRED at {t} = {got}");
-            worst_ipred = worst_ipred.max((got - want).abs() / want.abs());
+            assert!(
+                got.is_finite() && want.is_finite(),
+                "subject {id} IPRED at {t} = {got} vs NONMEM {want}"
+            );
+            worst_ipred = worst_ipred.max((got - want).abs() / want.abs().max(1e-300));
             n_obs += 1;
         }
     }
