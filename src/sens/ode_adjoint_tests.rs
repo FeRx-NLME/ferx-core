@@ -1111,6 +1111,60 @@ fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
     }
 }
 
+/// [`addl_lag_src`]'s ODE model with the lag written as the route's own (#2367): the dose
+/// into central is absorbed by `first_order(ka=KA, lag=LAGR)`, with no compartment lag.
+fn addl_route_lag_src(iov: bool) -> String {
+    addl_lag_src(true, iov)
+        .replace("LAGTIME =", "LAGR =")
+        .replace(
+            "ode(states=[depot, central])\n[odes]\n  d/dt(depot) = -KA * depot\n  \
+             d/dt(central) = KA * depot - (CL/V) * central",
+            "ode(states=[central])\n[odes]\n  \
+             d/dt(central) = first_order(ka=KA, lag=LAGR) - (CL/V) * central",
+        )
+}
+
+#[test]
+fn an_addl_implied_dose_route_lag_from_its_parent_matches_reconverged_fd() {
+    // (IOV, time-varying X, bound): the ODE rows of the test above, with the lag on the
+    // route. Measured vs reconverged FD on macOS arm64: 2.6e-7, 2.7e-7 and 2.1e-7. Each
+    // bound is 5× that. If the walks' seed vectors do not copy the route lag while the
+    // predictor's snapshots do, the gaps are 52, 1.1 and 2.0.
+    let cases = [
+        (false, true, 1.3e-6),
+        (true, true, 1.4e-6),
+        (true, false, 1.1e-6),
+    ];
+    for (iov, tv, bound) in cases {
+        let label = format!("route lag, iov {iov}, tv {tv}");
+        let src = addl_route_lag_src(iov);
+        let model = with_tol(parse_model_string(&src).unwrap(), 1e-8, 1e-10);
+        let ode = model.ode_spec.as_ref().expect("ode model");
+        assert!(ode.n_states == 1 && !model.has_lagtime(), "{label}: {src}");
+        let lag = ode.input_rate[0].lag_slot.expect("a lagged route");
+        let s = addl_implied_lag_subject(&model, tv);
+        if !iov {
+            // The copy is live: the parent's route lag is half the governing record's.
+            let mut dose = Vec::new();
+            let theta = &model.default_params.theta;
+            crate::pk::compute_dose_pk_params_into(&model, &s, theta, &[0.0, 0.0], &mut dose);
+            assert_eq!(dose[1].values[lag], dose[0].values[lag], "{label}");
+            let params = moved_params(&model);
+            let (gf, gl) = objective_gaps::<2>(&model, &s, &params, &[0.1, -0.05]);
+            assert!(
+                gf < 1e-10 && gl < 1e-10,
+                "{label}: kernel vs production {gf:.2e}, {gl:.2e}"
+            );
+        }
+        let worst = parity(&model, &s);
+        eprintln!("addl implied lag ({label}) vs reconverged FD {worst:.2e}");
+        assert!(
+            worst < bound,
+            "{label}: worst relative difference {worst:.2e}"
+        );
+    }
+}
+
 /// A closed-form model whose clearance reads `D` through `+ 0 * D`, which is `+0` for
 /// any finite `D` and leaves `CL` unchanged bit for bit, value and jets alike. `D` is
 /// still an input the sharing key sees, so a subject giving each record its own `D`

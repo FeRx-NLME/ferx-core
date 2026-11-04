@@ -148,6 +148,71 @@ fn the_adaptive_event_builder_takes_an_implied_doses_lag_from_its_parent() {
     }
 }
 
+/// #2367: two lagged routes, one per compartment, on the fixture's data. The lags differ
+/// between the dose rows (X = 1) and the observation at 18 that governs both implied doses
+/// (X = 4).
+const ROUTE_LAG_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.01
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  LA = 0.25 * X
+  LC = 0.1 * X
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot)   = first_order(ka=KA, lag=LA) - KA*depot
+  d/dt(central) = first_order(ka=KA, lag=LC) + KA*depot - CL/V*central
+[scaling]
+  y = central / V
+[covariates]
+  X continuous
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+#[test]
+fn an_implied_dose_takes_its_own_routes_lag_from_its_parent() {
+    let (_, mut pop) = fixture_population();
+    let subject = pop.subjects.remove(0);
+    let model = crate::parser::model_parser::parse_full_model(ROUTE_LAG_MODEL)
+        .expect("route-lag fixture parses")
+        .model;
+    let forcings = &model.ode_spec.as_ref().expect("ode model").input_rate;
+    let route_lag = |cmt: usize| {
+        forcings
+            .iter()
+            .find(|f| f.cmt == cmt)
+            .and_then(|f| f.lag_slot)
+            .unwrap_or_else(|| panic!("a lagged route into compartment {cmt}"))
+    };
+    let (la, lc) = (route_lag(0), route_lag(1));
+    let lag_slot = |cmt: usize| model.active_dose_attr_map().lag_slot(cmt);
+    assert!(la != lc && ![lag_slot(1), lag_slot(2)].contains(&la));
+
+    // Each implied dose copies its own route's lag, and not the other route's.
+    let copies: Vec<_> = parent_dose_attr_copies(&model, &subject).collect();
+    assert!(copies.contains(&(2, 0, la)) && copies.contains(&(3, 1, lc)));
+    assert!(!copies.contains(&(2, 0, lc)) && !copies.contains(&(3, 1, la)));
+
+    let theta = &model.default_params.theta;
+    let eta = vec![0.0; model.n_eta];
+    let mut dose = Vec::new();
+    compute_dose_pk_params_into(&model, &subject, theta, &eta, &mut dose);
+    let v = |k: usize, slot: usize| dose[k].values[slot];
+    // The dose at 12 (into depot): LA from the parent (X = 1). LC is not its route's, so it
+    // stays the governing record's (X = 4).
+    assert_eq!((v(2, la), v(2, lc)), (0.25, 0.4));
+    // The dose at 13 (into central): LC from its parent; LA is the governing record's.
+    assert_eq!((v(3, lc), v(3, la)), (0.1, 1.0));
+}
+
 #[test]
 fn a_parent_that_is_not_an_earlier_dose_record_is_ignored() {
     // Only a dose list edited after the read can hold one; the copy must not reach it.

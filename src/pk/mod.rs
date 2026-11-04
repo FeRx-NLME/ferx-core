@@ -1516,33 +1516,56 @@ fn fill_per_record_pk_params(
 /// The dose attributes an `ADDL`-implied dose takes from its parent row's `$PK` rather
 /// than from the governing record's (#1909, [`crate::types::ImpliedDose`]). Measured
 /// against NONMEM 7.5.1: the lag is fixed when the parent row schedules the train, while
-/// `F` and the disposition follow the governing record (`nonmem_anchor/addl_*`).
+/// `F` and the disposition follow the governing record (`nonmem_anchor/addl_*`). A
+/// route's own lag (`first_order(ka=…, lag=L)`) is a lag too and follows the parent with
+/// it (#2367); it is a per-forcing slot rather than a `DoseAttr`, so
+/// [`parent_dose_attr_copies`] adds it.
 const PARENT_DOSE_ATTRS: [crate::types::DoseAttr; 1] = [crate::types::DoseAttr::Lag];
 
 /// `(k, parent, slot)` for every `ADDL`-implied dose `k` and every slot of
-/// [`PARENT_DOSE_ATTRS`] its compartment reads: the copies that turn per-dose snapshots
-/// built at each dose's own inputs into NONMEM's. The slot is the one the engine resolves
-/// for that dose (`ALAG{cmt}`, else the bare lag), so no other dose's attribute moves.
+/// [`PARENT_DOSE_ATTRS`] its compartment reads, then the route lag of every input-rate
+/// forcing its dose feeds: the copies that turn per-dose snapshots built at each dose's
+/// own inputs into NONMEM's. The slot is the one the engine resolves for that dose
+/// (`ALAG{cmt}`, else the bare lag; the forcing's `lag_slot`), so no other dose's
+/// attribute moves.
+///
+/// The route lag follows the parent because a first-order route with `lag = L` is a
+/// depot dosed with `ALAG = L`, and NONMEM fixes that `ALAG` at the parent row
+/// (`nonmem_anchor/addl_lag`, which `addl_lag_route_fit.ferx` spells as a route lag).
+/// Reading it at the governing record put the two lags of one dose on different
+/// records.
 pub(crate) fn parent_dose_attr_copies<'a>(
     model: &'a CompiledModel,
     subject: &'a Subject,
 ) -> impl Iterator<Item = (usize, usize, usize)> + 'a {
+    let map = model.active_dose_attr_map();
+    let forcings = model
+        .ode_spec
+        .as_ref()
+        .map_or(&[][..], |o| &o.input_rate[..]);
     (0..subject.doses.len()).flat_map(move |k| {
         let parent = subject.implied_dose_parent(k);
-        let cmt = subject.doses[k].cmt_1based();
-        PARENT_DOSE_ATTRS.iter().filter_map(move |&attr| {
-            let p = parent?;
-            let map = model.active_dose_attr_map();
-            let slot = match attr {
+        let dose = &subject.doses[k];
+        let cmt = dose.cmt_1based();
+        let attrs = PARENT_DOSE_ATTRS
+            .iter()
+            .filter_map(move |&attr| match attr {
                 crate::types::DoseAttr::Lag => Some(map.lag_slot(cmt)),
                 other => map.indexed_slot(other, cmt),
-            }?;
-            Some((k, p, slot))
-        })
+            });
+        let route_lags = forcings
+            .iter()
+            .filter(move |f| f.cmt == dose.cmt_idx())
+            .filter_map(|f| f.lag_slot);
+        parent
+            .map(move |p| attrs.chain(route_lags).map(move |s| (k, p, s)))
+            .into_iter()
+            .flatten()
     })
 }
 
-/// Give each `ADDL`-implied dose its parent's [`PARENT_DOSE_ATTRS`] (#1909): the one
+/// Give each `ADDL`-implied dose its parent's [`PARENT_DOSE_ATTRS`] (#1909) and route lags
+/// (#2367), the slots [`parent_dose_attr_copies`] lists: the one
 /// post-pass every per-dose builder runs after evaluating each dose at its own inputs,
 /// so the engines read the parent's lag at the implied dose without a second `$PK` call.
 pub(crate) fn inherit_parent_dose_attrs(
