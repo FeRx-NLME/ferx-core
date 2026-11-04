@@ -2220,6 +2220,16 @@ pub fn ferx_core::sim::adaptive::DoseAction::validate(&self) -> core::result::Re
 pub enum ferx_core::sim::adaptive::DoseStep
 pub ferx_core::sim::adaptive::DoseStep::Level
 pub ferx_core::sim::adaptive::DoseStep::Percent(f64)
+#[non_exhaustive] pub enum ferx_core::sim::adaptive::DoseValue
+pub ferx_core::sim::adaptive::DoseValue::Expr(alloc::string::String)
+pub ferx_core::sim::adaptive::DoseValue::Literal(f64)
+impl ferx_core::sim::adaptive::DoseValue
+pub fn ferx_core::sim::adaptive::DoseValue::as_expr(&self) -> core::option::Option<&str>
+pub fn ferx_core::sim::adaptive::DoseValue::as_literal(&self) -> core::option::Option<f64>
+impl core::cmp::PartialEq<f64> for ferx_core::sim::adaptive::DoseValue
+pub fn ferx_core::sim::adaptive::DoseValue::eq(&self, other: &f64) -> bool
+impl core::convert::From<f64> for ferx_core::sim::adaptive::DoseValue
+pub fn ferx_core::sim::adaptive::DoseValue::from(x: f64) -> Self
 #[non_exhaustive] pub enum ferx_core::sim::adaptive::IntervalStep
 pub ferx_core::sim::adaptive::IntervalStep::Lengthen
 pub ferx_core::sim::adaptive::IntervalStep::Shorten
@@ -2231,14 +2241,14 @@ pub ferx_core::sim::adaptive::AdaptiveDosingSpec::assay_cmt: core::option::Optio
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::confirm: u32
-pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_bounds: (f64, f64)
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_bounds: (ferx_core::sim::adaptive::DoseValue, ferx_core::sim::adaptive::DoseValue)
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
-pub ferx_core::sim::adaptive::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<ferx_core::sim::adaptive::DoseValue>>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe_declared_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::route: ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::rules: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveRule>
-pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_dose: f64
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_dose: ferx_core::sim::adaptive::DoseValue
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_interval: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::target_window: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::with_assay_error: bool
@@ -4294,14 +4304,14 @@ pub ferx_core::AdaptiveDosingSpec::assay_cmt: core::option::Option<usize>
 pub ferx_core::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::confirm: u32
-pub ferx_core::AdaptiveDosingSpec::dose_bounds: (f64, f64)
+pub ferx_core::AdaptiveDosingSpec::dose_bounds: (ferx_core::sim::adaptive::DoseValue, ferx_core::sim::adaptive::DoseValue)
 pub ferx_core::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
-pub ferx_core::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<ferx_core::sim::adaptive::DoseValue>>
 pub ferx_core::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
 pub ferx_core::AdaptiveDosingSpec::observe_declared_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::AdaptiveDosingSpec::route: ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::AdaptiveDosingSpec::rules: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveRule>
-pub ferx_core::AdaptiveDosingSpec::start_dose: f64
+pub ferx_core::AdaptiveDosingSpec::start_dose: ferx_core::sim::adaptive::DoseValue
 pub ferx_core::AdaptiveDosingSpec::start_interval: core::option::Option<f64>
 pub ferx_core::AdaptiveDosingSpec::target_window: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::with_assay_error: bool

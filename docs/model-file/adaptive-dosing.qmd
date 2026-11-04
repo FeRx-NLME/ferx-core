@@ -51,11 +51,11 @@ with the run, never with a fitted model's parameters.
 |-----|:--------:|---------|
 | `observe` | signal¹ | The **latent** monitored signal — a free-form expression over states + individual parameters (e.g. `central / V` for concentration), titrated on with **no** measurement noise. Provide this *or* `with_assay_error`, never both. The `when` rules compare the keyword `signal` to its value. |
 | `at` | ✓ | Decision schedule on the subject clock: an explicit list `[0, 24, 48]` or an arithmetic sequence `every <Δ> from <t0> to <t1>` (inclusive). |
-| `start_dose` | ✓ | The dose issued at the first decision; seeds the running dose. |
+| `start_dose` | ✓ | The dose issued at the first decision; seeds the running dose. A number, or an expression over θ and data covariates evaluated per subject (e.g. `15 * WT`); see [Dose expressions](#dose-expressions). |
 | `route` | ✓ | `bolus(cmt=N)` or `infuse(cmt=N, over=T)` (zero-order over duration `T`). |
-| `dose_bounds` | ✓ | Inclusive `[low, high]` clamp applied to every emitted dose. |
+| `dose_bounds` | ✓ | Inclusive `[low, high]` clamp applied to every emitted dose. Each side is a number or a per-subject expression (e.g. `[0, min(30 * WT, 4000)]`). |
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
-| `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. |
+| `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. Each rung is a number or a per-subject expression. |
 | `intervals` | | Dosing-interval ladder `[d1, d2, …]`, strictly increasing and positive. Rules step it with `lengthen` / `shorten`. Requires `start_interval`. See [Changing the dosing interval](#changing-the-dosing-interval). |
 | `start_interval` | | The dosing interval in force from the first decision; one of `intervals`, and required with it. |
 | `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
@@ -101,6 +101,72 @@ one model can never read the column in one block and the clock in the other. Whe
 `T` does fold into the built-in, the warning is reported at parse time — `observe`
 itself is compiled at simulate time, where there is no warnings channel. See
 [Scaling](scaling.qmd#if-your-dataset-has-a-column-named-t).
+
+### Dose expressions
+
+`start_dose`, each side of `dose_bounds` and each rung of `levels` can be an
+expression instead of a number, so one block can dose by weight, by renal function
+or by any other column in the data
+([#944](https://github.com/FeRx-NLME/ferx-core/issues/944)):
+
+```
+  start_dose  = 15 * WT                  # 15 mg/kg
+  dose_bounds = [0, min(30 * WT, 4000)]  # at most 30 mg/kg, never above 4000 mg
+```
+
+A value that reads as a number is a number, checked when the file is parsed, exactly
+as before — also against the other numbers of a block that mixes in expressions, so
+`start_dose = 5` with `dose_bounds = [10, 30 * WT]` is a parse error, not a refusal of
+the first subject. Anything else is an expression, compiled with the same expression language
+as `observe` (`min`, `max`, `exp`, `if (…) … else …`, …).
+
+Each expression is evaluated **once per subject, at the first decision** (`at[0]`),
+from θ and the covariates in force there: the row of the record in force at `at[0]`,
+the same row a programmatic controller reads in `ctx.covariates` at that decision. A
+covariate that changes before `at[0]` is read at its new value; one that changes after
+`at[0]` does not change the plan. When `at[0]` is before the subject's first record,
+it is the subject's first value of each covariate, as in the driver. The resulting
+start dose, bounds and ladder then work exactly as the numbers would: rules step from
+that start dose and clamp to those bounds.
+
+Every subject's values are checked before any subject is simulated, with the same
+rules as the numbers: finite and `>= 0`, `low <= high`, the start dose inside the
+bounds (and on the ladder, with `levels`), every rung inside the bounds, and the ladder
+strictly increasing. The first subject that fails is refused with
+`E_ADAPTIVE_DOSE_VALUE`, naming the subject, the expression, the values it evaluated to
+and the covariate values it read:
+
+```
+[adaptive_dosing] subject 2: start_dose = 15 * WT - 1000 evaluates to -250; a dose
+must be finite and >= 0. The dose expressions read WT = 50, at the first decision
+(t = 0).
+```
+
+A covariate the data lack is refused when the run starts, with
+`E_MISSING_COVARIATE`, as for `observe`. Example:
+`examples/adaptive_vanco_mgkg.ferx`.
+
+### What a dose expression may read
+
+| Name | Allowed | Why |
+|---|---|---|
+| A number, θ | yes | The same for every subject. |
+| A data covariate | yes | Known when the dose is written. Read at `at[0]`. |
+| A state (`CENT`) | no | The expression runs once; to follow the drug level, write a `when signal …` rule. |
+| `TIME` (or `T`) | no | It would always be `at[0]`; write the value. |
+| An individual parameter (`CL`) or a random effect (`ETA_CL`) | not yet | A subject's own parameter values are not known at dosing time unless they are supplied; this is the next step of #944. Today, carry a known value as a data column (e.g. `CL_KNOWN`) and read that. |
+| A κ (IOV) | no | Drawn for each occasion, so never known at dosing time. |
+| `MIXNUM` | no | The simulation draws the class. |
+
+These are refused when the model is parsed, so `ferx check` reports them, with a
+message that names the key and the name read. A spec built in code is checked again
+when the run starts.
+
+On a FREM model, a dose expression that reads a covariate doses from the value in the
+data, while a subject whose η is drawn has PK that follows its drawn covariate η — unless
+the model's own expressions read that column directly. The `W_FREM_DRAWN_ETA` warning
+then names the covariates the dose expressions read and the model does not, each with
+the first key that reads it.
 
 ### Rules — `when signal <op> <value> : <action>`
 
@@ -671,6 +737,24 @@ would otherwise draw an η large enough to show as a one-sided trough drift. The
 `[adaptive_dosing]` block (`intervals = [12, 24, 36, 48]`, `hold, lengthen`,
 `lengthen`, `shorten`) reproduces the programmatic run bit for bit: ledger,
 decision log and trajectories.
+
+### The weight-based (mg/kg) vancomycin anchor
+
+Dose expressions are cross-checked against **mrgsolve** on a 1-compartment IV
+vancomycin model whose clearance and volume both scale with weight
+(`examples/adaptive_vanco_mgkg.ferx`). One block doses every patient by weight:
+`start_dose = 15 * WT` and `dose_bounds = [0, min(30 * WT, 4000)]`, with ±25% steps on
+the second consecutive breach of a 15–25 mg/L trough band. The R loop computes each
+subject's start dose and bounds from its own weight. The 50 kg patient starts at
+750 mg and is capped at 30 mg/kg (1500 mg); the 150 kg patient starts at 2250 mg and is
+capped at 4000 mg, below its 30 mg/kg, so the `min` binds for that patient only and
+the two ledgers part again at t = 60 h. At the cap an increase is absorbed: the rule
+fires and the dose stays. Every dose matches mrgsolve exactly, and the troughs agree
+within the cross-solver band at a supplied η = 0. The kit lives in
+`tests/reference/vanco_mgkg_mrgsolve/`, exercised on every PR by
+`tests/adaptive_vanco_mgkg_anchor.rs`. Beside it, a constant expression (`25 * WT` at
+`WT = 40`) reproduces the literal block (`1000`) bit for bit, and a block whose rules
+never fire matches `predict()` on each subject's frozen weight-based regimen.
 
 ## Model time in a reactive run
 

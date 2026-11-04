@@ -92,7 +92,7 @@ fn vanco_renal_loading_example_parses_and_pins_the_scenario() {
         .as_ref()
         .expect("[adaptive_dosing] block present");
     assert_eq!(spec.start_dose, 750.0, "empiric maintenance start dose");
-    assert_eq!(spec.dose_bounds, (250.0, 4000.0));
+    assert_eq!(spec.dose_bounds, (250.0.into(), 4000.0.into()));
     assert_eq!(
         spec.target_window,
         Some((10.0, 15.0)),

@@ -1,7 +1,7 @@
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::sim::adaptive::{
     validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, DoseStep, IntervalStep,
+    Comparison, DoseStep, DoseValue, IntervalStep,
 };
 use crate::types::*;
 use regex::Regex;
@@ -6335,6 +6335,23 @@ pub fn parse_full_model_with(
         }
     }
 
+    // #944: the `[adaptive_dosing]` dose expressions are stored as source and compiled
+    // at simulate time, like `observe`. Check them against the model here, so a syntax
+    // error or a read a dose expression may not make (a state, `TIME`, κ, an individual
+    // parameter, η, `MIXNUM`) is a parse error that `ferx check` reports. A covariate
+    // absent from the data needs the data, so that stays at simulate time.
+    if let Some(spec) = adaptive_dosing.as_ref() {
+        for (key, src) in spec.dose_expressions() {
+            check_adaptive_dose_expression(
+                src,
+                key,
+                &model,
+                &declared_covariate_names,
+                spec.at[0],
+            )?;
+        }
+    }
+
     // #993, the `[adaptive_dosing]` half. `observe` is compiled through the very
     // same `build_y_output_fn` as a Form-C `y` readout (`compile_observe`), so it
     // sees individual parameters — and it is the *controller's* signal, not a
@@ -11143,11 +11160,11 @@ fn parse_adaptive_dosing_block(
     let mut with_assay_error = false;
     let mut assay_cmt: Option<usize> = None;
     let mut at: Option<Vec<f64>> = None;
-    let mut start_dose: Option<f64> = None;
+    let mut start_dose: Option<DoseValue> = None;
     let mut route: Option<AdaptiveRoute> = None;
-    let mut dose_bounds: Option<(f64, f64)> = None;
+    let mut dose_bounds: Option<(DoseValue, DoseValue)> = None;
     let mut confirm: u32 = 1;
-    let mut levels: Option<Vec<f64>> = None;
+    let mut levels: Option<Vec<DoseValue>> = None;
     let mut intervals: Option<Vec<f64>> = None;
     let mut start_interval: Option<f64> = None;
     // The `every` step of `at`, kept for the intervals-on-the-grid check (#945).
@@ -11205,30 +11222,36 @@ fn parse_adaptive_dosing_block(
                 at_step = step;
             }
             "start_dose" => {
-                let d: f64 = val
-                    .parse()
-                    .map_err(|_| format!("[adaptive_dosing]: bad start_dose: {val}"))?;
-                if !d.is_finite() || d < 0.0 {
-                    return Err(format!(
-                        "[adaptive_dosing]: start_dose must be finite and >= 0: {val}"
-                    ));
+                // A number is checked here, as before #944; an expression is checked
+                // per subject once it is evaluated.
+                let d = parse_dose_value("start_dose", val)?;
+                if let Some(x) = d.as_literal() {
+                    if !x.is_finite() || x < 0.0 {
+                        return Err(format!(
+                            "[adaptive_dosing]: start_dose must be finite and >= 0: {val}"
+                        ));
+                    }
                 }
                 start_dose = Some(d);
             }
             "route" => route = Some(parse_adaptive_route(val)?),
             "dose_bounds" => {
-                let b = parse_float_array(val)
-                    .map_err(|e| format!("[adaptive_dosing]: bad dose_bounds: {e}"))?;
+                let b = parse_dose_list("dose_bounds", val)?;
                 if b.len() != 2 {
                     return Err(format!(
                         "[adaptive_dosing]: dose_bounds must be `[low, high]`: {val}"
                     ));
                 }
-                let (lo, hi) = (b[0], b[1]);
-                if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi < lo {
-                    return Err(format!(
-                        "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: {val}"
-                    ));
+                let mut b = b.into_iter();
+                let (lo, hi) = (b.next().unwrap(), b.next().unwrap());
+                // Two numbers are checked here, as before #944; with an expression on
+                // either side the pair is checked per subject.
+                if let (Some(l), Some(h)) = (lo.as_literal(), hi.as_literal()) {
+                    if !l.is_finite() || !h.is_finite() || l < 0.0 || h < l {
+                        return Err(format!(
+                            "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: {val}"
+                        ));
+                    }
                 }
                 dose_bounds = Some((lo, hi));
             }
@@ -11245,9 +11268,11 @@ fn parse_adaptive_dosing_block(
                 confirm = n;
             }
             "levels" => {
-                let l = parse_float_array(val)
-                    .map_err(|e| format!("[adaptive_dosing]: bad levels: {e}"))?;
-                validate_increasing_finite(&l, "levels")?;
+                let l = parse_dose_list("levels", val)?;
+                let numbers: Option<Vec<f64>> = l.iter().map(DoseValue::as_literal).collect();
+                if let Some(numbers) = numbers {
+                    validate_increasing_finite(&numbers, "levels")?;
+                }
                 levels = Some(l);
             }
             "intervals" => {
@@ -11343,6 +11368,41 @@ fn parse_adaptive_dosing_block(
         check_intervals_on_every_grid(ladder, step)?;
     }
     Ok(spec)
+}
+
+/// One `[adaptive_dosing]` dose value (#944): a number stays a
+/// [`DoseValue::Literal`], read exactly as before; anything else is kept as a
+/// [`DoseValue::Expr`] and checked against the model once the whole file is parsed
+/// (`check_adaptive_dose_expression`).
+fn parse_dose_value(key: &str, val: &str) -> Result<DoseValue, String> {
+    let v = val.trim();
+    if v.is_empty() {
+        return Err(format!(
+            "[adaptive_dosing]: {key} requires a number or an expression"
+        ));
+    }
+    Ok(match v.parse::<f64>() {
+        Ok(x) => DoseValue::Literal(x),
+        Err(_) => DoseValue::Expr(v.to_string()),
+    })
+}
+
+/// A bracketed list of dose values (`dose_bounds`, `levels`; #944). A list of numbers
+/// goes through `parse_float_array`, exactly as before; otherwise the items are split
+/// on the commas outside parentheses, so `[0, min(30 * WT, 4000)]` is two items.
+fn parse_dose_list(key: &str, val: &str) -> Result<Vec<DoseValue>, String> {
+    if let Ok(xs) = parse_float_array(val) {
+        return Ok(xs.into_iter().map(DoseValue::Literal).collect());
+    }
+    let inner = val
+        .trim()
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .ok_or_else(|| format!("[adaptive_dosing]: {key} must be a list `[...]`: {val}"))?;
+    split_top_level_args(inner)
+        .iter()
+        .map(|item| parse_dose_value(key, item))
+        .collect()
 }
 
 /// On an `at = every S …` grid, every due time an interval produces lands on the grid
@@ -13526,6 +13586,87 @@ fn warn_if_time_alias_folds(
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     if let Ok(mut expr) = parse_scalar_expression(src, ctx) {
         rewrite_scaling_time_alias(&mut expr, context, declared_covariates, parse_warnings);
+    }
+}
+
+/// Refuse what an `[adaptive_dosing]` dose expression (`start_dose`, a side of
+/// `dose_bounds`, a rung of `levels`; #944) may not read.
+///
+/// A dose expression is evaluated once per subject, at the first decision, from θ and
+/// the data covariates in force there. The shared output compiler would accept more —
+/// a state compiles and reads the (zero) state slice, `TIME` reads 0.0 outside the
+/// driver, an individual parameter reads the (zero) PK slice — so each is refused here,
+/// by name, rather than silently evaluated to a number that means nothing. The
+/// parser runs it at model level, so `ferx check` reports it;
+/// `compile_dose_exprs` runs it again on a spec built in code. A syntax error is
+/// reported with the key as its context. Individual parameters and random effects are
+/// refused outright here: which subjects' values are known at dosing time is #944's
+/// next step.
+pub(crate) fn check_adaptive_dose_expression(
+    src: &str,
+    key: &str,
+    model: &CompiledModel,
+    declared_covariates: &[String],
+    at0: f64,
+) -> Result<(), String> {
+    let ctx = ParseCtx::new(
+        &model.theta_names,
+        &model.eta_names,
+        &model.indiv_param_names,
+    );
+    let expr =
+        parse_scalar_expression(src, ctx).map_err(|e| format!("[adaptive_dosing] {key}: {e}"))?;
+    if expr_references_time_builtin(&expr, declared_covariates) {
+        return Err(format!(
+            "[adaptive_dosing] {key} reads TIME. A dose expression is evaluated once, at the \
+             first decision (t = {at0}), so TIME is always {at0}; write the value instead."
+        ));
+    }
+    if let Some(k) = expr_references_kappa(&expr, &model.kappa_names) {
+        return Err(format!(
+            "[adaptive_dosing] {key} reads {k}, an inter-occasion random effect. It is drawn \
+             for each occasion, so it is never known at dosing time, even for a subject whose \
+             random effects are supplied."
+        ));
+    }
+    let states: &[String] = model
+        .ode_spec
+        .as_ref()
+        .map_or(&[], |o| o.state_names.as_slice());
+    // A subject's own parameter value: not known at dosing time unless supplied, and
+    // supplied values are #944's next step, so refused with the route that works today.
+    const OWN_VALUE: &str = " A dose expression may read data covariates and θ; it \
+        cannot read a subject's own parameter values yet. To dose from a known value, carry \
+        it as a data column (e.g. CL_KNOWN) and read that.";
+    let mut refusal: Option<String> = None;
+    visit_expr_nodes(&expr, &mut |e: &Expression| {
+        if refusal.is_some() {
+            return;
+        }
+        refusal = match e {
+            Expression::Variable(n) | Expression::Covariate(n) if states.contains(n) => {
+                Some(format!(
+                    "{n}, a state of the model. A dose expression is evaluated once per \
+                     subject, at the first decision; it may read data covariates and θ. To \
+                     respond to the drug level, write a `when signal …` rule."
+                ))
+            }
+            Expression::Variable(n) => Some(format!("{n}, an individual parameter.{OWN_VALUE}")),
+            Expression::Eta(i) => Some(format!(
+                "{}, a random effect.{OWN_VALUE}",
+                model.eta_names.get(*i).map_or("an η", String::as_str)
+            )),
+            Expression::MixNum => Some(
+                "MIXNUM, the subject's mixture class, which the simulation draws; no \
+                 prescriber knows it at dosing time."
+                    .to_string(),
+            ),
+            _ => None,
+        };
+    });
+    match refusal {
+        Some(what) => Err(format!("[adaptive_dosing] {key} reads {what}")),
+        None => Ok(()),
     }
 }
 

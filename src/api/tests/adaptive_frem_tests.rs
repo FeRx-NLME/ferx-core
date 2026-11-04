@@ -165,9 +165,9 @@ fn spec_hold() -> AdaptiveDosingSpec {
         with_assay_error: false,
         assay_cmt: None,
         at: DECISIONS.to_vec(),
-        start_dose: 0.0,
+        start_dose: (0.0).into(),
         route: AdaptiveRoute::Bolus { cmt: 1 },
-        dose_bounds: (0.0, 0.0),
+        dose_bounds: ((0.0).into(), (0.0).into()),
         confirm: 1,
         levels: None,
         target_window: None,
@@ -625,4 +625,72 @@ fn adaptive_reports_only_the_subjects_whose_frem_eta_was_drawn() {
         simulate_adaptive_with_inputs(&m, &mixed_pop, &inputs, 1, hold, &opts()).expect("mixed");
     let want = format!("{}{ADAPTIVE_REMEDY}", drawn_head(1, 2, false));
     assert_eq!(drawn_warnings(&mixed.warnings), vec![&want]);
+}
+
+/// A dose expression reading a data covariate on a FREM model (#944): the warning first
+/// says the dose comes from the data while the drawn subjects' PK does not follow it,
+/// naming the key and the column. Both sides in one test, on one population: the same
+/// block with a literal dose has no such sentence.
+///
+/// Regressions: drop the dose-key sentence → the expression case fails; emit it
+/// unconditionally → the literal case fails; name the wrong key → the expression case
+/// fails.
+#[test]
+fn adaptive_frem_warning_names_a_dose_expression_that_reads_the_data() {
+    let m = model("  obs_scale = V", false, [1; 6]);
+    let mut pop = population([1; 6]);
+    pop.subjects[0].covariates.insert("WT".to_string(), 70.0);
+    pop.covariate_names = vec!["WT".to_string()];
+
+    let literal =
+        simulate_adaptive_from_spec(&m, &pop, &m.default_params, 1, &spec_hold(), &spec_opts())
+            .expect("literal block runs");
+    let want = format!("{}{ADAPTIVE_REMEDY}", drawn_head(1, 1, true));
+    assert_eq!(drawn_warnings(&literal.warnings), vec![&want]);
+
+    let mut spec = spec_hold();
+    spec.start_dose = crate::sim::adaptive::DoseValue::Expr("0 * WT".to_string());
+    let expr = simulate_adaptive_from_spec(&m, &pop, &m.default_params, 1, &spec, &spec_opts())
+        .expect("expression block runs");
+    let want = format!(
+        "{}The [adaptive_dosing] dose expressions compute each subject's doses from the \
+         covariate values in the data (start_dose reads WT), which these subjects' PK does \
+         not follow. {ADAPTIVE_REMEDY}",
+        drawn_head(1, 1, true)
+    );
+    assert_eq!(drawn_warnings(&expr.warnings), vec![&want]);
+}
+
+/// A covariate the model's own expressions read directly is not named (#2667 review r1
+/// row 6b): there a drawn subject's PK does follow the data, so "which these subjects'
+/// PK does not follow" would be false. Both sides in one run: CL reads `WT`, nothing in
+/// the model reads `HT`, and the dose expression reads both — only `HT` is named.
+///
+/// Regressions: the filter dropped → `WT` named too; the filter inverted → only `WT`
+/// named; the filter applied to the wrong list → no sentence at all.
+#[test]
+fn adaptive_frem_warning_skips_a_dose_covariate_the_model_reads_directly() {
+    let src = model_src("  obs_scale = V", false, PROP);
+    assert_eq!(src.matches("  CL = TVCL\n").count(), 1, "fixture CL line");
+    let m = parse_model_string(&src.replace("  CL = TVCL\n", "  CL = TVCL * WT / 70\n"))
+        .expect("parse");
+    assert!(m.frem_config.is_some(), "fixture is a FREM model");
+    assert!(m.referenced_covariates.iter().any(|c| c == "WT"));
+    assert!(!m.referenced_covariates.iter().any(|c| c == "HT"));
+    let mut pop = population([1; 6]);
+    pop.subjects[0].covariates.insert("WT".to_string(), 70.0);
+    pop.subjects[0].covariates.insert("HT".to_string(), 170.0);
+    pop.covariate_names = vec!["WT".to_string(), "HT".to_string()];
+
+    let mut spec = spec_hold();
+    spec.start_dose = crate::sim::adaptive::DoseValue::Expr("0 * WT * HT".to_string());
+    let r = simulate_adaptive_from_spec(&m, &pop, &m.default_params, 1, &spec, &spec_opts())
+        .expect("expression block runs");
+    let want = format!(
+        "{}The [adaptive_dosing] dose expressions compute each subject's doses from the \
+         covariate values in the data (start_dose reads HT), which these subjects' PK does \
+         not follow. {ADAPTIVE_REMEDY}",
+        drawn_head(1, 1, true)
+    );
+    assert_eq!(drawn_warnings(&r.warnings), vec![&want]);
 }
