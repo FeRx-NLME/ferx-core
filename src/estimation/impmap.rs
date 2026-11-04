@@ -3241,23 +3241,28 @@ fn stack_eta_kappa(eta: &DVector<f64>, kappas: &[DVector<f64>]) -> DVector<f64> 
 
 /// The joint prior `Ω ⊕ I_K ⊗ Ω_iov` of an IOV subject with `K` occasions, the
 /// pieces of it the E-step reads, and its defensive component (#2301).
-struct JointPrior {
+pub(crate) struct JointPrior {
     /// `(Ω ⊕ I_K ⊗ Ω_iov)⁻¹`.
-    inv: DMatrix<f64>,
+    pub(crate) inv: DMatrix<f64>,
     /// `log det Ω + K · log det Ω_iov`.
-    log_det: f64,
+    pub(crate) log_det: f64,
     /// `Ω ⊕ I_K ⊗ Ω_iov`, the IMP proposal-covariance cap.
     matrix: DMatrix<f64>,
-    mixture: Option<crate::estimation::importance_sampling::DefensiveMixture>,
+    pub(crate) mixture: Option<crate::estimation::importance_sampling::DefensiveMixture>,
 }
 
 /// One [`JointPrior`] per distinct occasion count in the population, built once
 /// per MCEM iteration — the IOV twin of sharing the η-only defensive component
 /// across subjects (#528).
-struct JointPriors(std::collections::BTreeMap<usize, JointPrior>);
+pub(crate) struct JointPriors(std::collections::BTreeMap<usize, JointPrior>);
 
 impl JointPriors {
-    fn build(omega: &OmegaMatrix, iov: &OmegaMatrix, n_occ_of: &[usize], alpha: f64) -> Self {
+    pub(crate) fn build(
+        omega: &OmegaMatrix,
+        iov: &OmegaMatrix,
+        n_occ_of: &[usize],
+        alpha: f64,
+    ) -> Self {
         let (n_eta, n_kappa) = (omega.matrix.nrows(), iov.matrix.nrows());
         let mut map = std::collections::BTreeMap::new();
         for &n_occ in n_occ_of.iter().filter(|&&k| k > 0) {
@@ -3283,7 +3288,7 @@ impl JointPriors {
         Self(map)
     }
 
-    fn get(&self, n_occ: usize) -> &JointPrior {
+    pub(crate) fn get(&self, n_occ: usize) -> &JointPrior {
         &self.0[&n_occ]
     }
 }
@@ -5908,18 +5913,32 @@ mod tests {
                 t5.minus2_log_likelihood,
                 t5.mc_standard_error
             );
+            // A ν = ∞ quietly mapped to a finite df would make the "normal" readout
+            // the t₅ one: gap 0, inside the bound. The normal branch draws no χ², so
+            // the two streams always differ.
+            assert_ne!(
+                mvn.minus2_log_likelihood.to_bits(),
+                t5.minus2_log_likelihood.to_bits(),
+                "{name}: the normal readout is the t5 one — ν = ∞ never reached the sampler"
+            );
             assert!(mvn.ess_min > 0.0, "{name}: ess_min {}", mvn.ess_min);
-            assert!(gap < GAP_BOUND, "{name}: gap {gap}");
+            assert!(gap < NORMAL_VS_T5_GAP_BOUND, "{name}: gap {gap}");
         }
     }
-    /// Two IS readouts of one marginal from different proposals, at warfarin_iov's
-    /// start values. Measured (Linux x86_64, K = 2000): normal vs t₅ 0.319 (η-only)
-    /// and 0.495 (IOV); α = 0.2 vs 0 0.059. The normal-vs-t₅ gaps are 3–4 combined
-    /// MC SEs: at the start values the light-tailed normal proposal under-covers the
-    /// posterior, which biases its readout up and makes its ESS-based SE optimistic
-    /// (at SAEM's estimates the CLI gap is 0.01–0.05). 1.0 is 2× the worst; the
-    /// pre-fix normal readout was not finite at all.
-    const GAP_BOUND: f64 = 1.0;
+
+    /// Normal vs t₅ readouts of one marginal, at warfarin_iov's start values.
+    /// Measured (Linux x86_64, K = 2000): 0.319 (η-only) and 0.495 (IOV), 3–4
+    /// combined MC SEs: at the start values the light-tailed normal proposal
+    /// under-covers the posterior, which biases its readout up and makes its
+    /// ESS-based SE optimistic (at SAEM's estimates the CLI gap is 0.01–0.05). 1.0
+    /// is 2× the worst; the pre-fix normal readout was not finite at all.
+    const NORMAL_VS_T5_GAP_BOUND: f64 = 1.0;
+
+    /// α = 0.2 vs α = 0 on warfarin_iov at the start values. Measured (Linux
+    /// x86_64, K = 2000): 0.059, against MC SEs of 0.10 / 0.13. 0.15 is 2.5× that,
+    /// and still well below a mis-scored mixture (the `assert_ne` alone passes on
+    /// the changed RNG stream, so this bound is what checks the mixture density).
+    const ALPHA_GAP_BOUND: f64 = 0.15;
 
     /// `imp_defensive_alpha` reaches the joint (η, κ) evaluator. The IOV kernel
     /// once had its own sampler that took no mixture, so α changed nothing for an
@@ -5945,17 +5964,18 @@ mod tests {
             plain.minus2_log_likelihood.to_bits(),
             "α = 0.2 left the IOV readout unchanged"
         );
-        assert!(gap < GAP_BOUND, "gap {gap}");
+        assert!(gap < ALPHA_GAP_BOUND, "gap {gap}");
     }
 
     /// The trace −2LL of an IOV fit is the joint (η, κ) marginal. Iteration 1's
     /// E-step runs at the start values, so its row must agree with
-    /// `run_importance_sampling` at the same parameters. The two share the
-    /// sampler and the per-draw scorer, so this pins the joint *prior* each one
-    /// assembles for itself (`JointPriors` here, `build_joint_omega_inv` there),
-    /// not the kernel. Dropping the
-    /// `n_occ · log det Ω_iov` term from `log_det_joint` moves the trace by
-    /// `Σᵢ Kᵢ · |ln det Ω_iov|`, far outside the bound below.
+    /// `run_importance_sampling` at the same parameters. The two share the sampler,
+    /// the per-draw scorer and the joint prior (`JointPriors`), so what this pins
+    /// is the rest of the wiring: each side's own MAP solve, proposal Hessian and
+    /// (E-step) ISCALE search must land on the same marginal. The prior's
+    /// `K · log det Ω_iov` term is pinned directly by
+    /// `joint_priors_match_the_per_subject_construction_for_each_occasion_count`;
+    /// the `m1_shift` check below only confirms the fixture would make it visible.
     #[test]
     fn impmap_iov_trace_ofv_matches_the_joint_is_marginal() {
         let model = iov_model();

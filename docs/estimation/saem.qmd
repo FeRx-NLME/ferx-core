@@ -776,7 +776,7 @@ different number at that seed, because almost any change on the chain's path
 the public stand-ins built for
 [#2602](https://github.com/FeRx-NLME/ferx-core/issues/2602) (450 subjects each:
 a two-compartment oral closed form with a block Ω, and the same model as a
-3-state ODE), `method = [saem, imp]` was run over 40 seeds. The IS −2 log L had a
+3-state ODE), `method = [saem, imp]` with `imp_eval_only = true` was run over 40 seeds. The IS −2 log L had a
 seed-to-seed sd of 1.5 and 3.4–4.1, and a range of 7 and 14–15. The
 importance-sampling draw alone, with the SAEM seed held fixed, accounts for an
 sd of only 0.55 and 0.9. Most of the spread is where the chain ends. So a +4 or
@@ -994,8 +994,8 @@ The importance-sampled `−2 log L` and its Monte-Carlo standard error are on
 `IS done. −2 log L = …` line in verbose output). `ofv` remains the FOCE
 approximation at the SAEM estimates described above, and AIC/BIC are built from
 it. The `imp` stage takes its proposal centres and scales from the final EBE
-refinement in step 1, so a subject listed under `low_ess_subjects` usually points
-at that refinement rather than at SAEM itself. See
+refinement in step 1, so for a subject listed under `low_ess_subjects`, check
+that refinement's EBE and Hessian first. See
 [Importance Sampling (IMP)](importance-sampling.qmd#evaluation-only-mode-imp_eval_only-true).
 
 ### Covariance step on a non-Gaussian model {#saem-covariance-non-gaussian}
