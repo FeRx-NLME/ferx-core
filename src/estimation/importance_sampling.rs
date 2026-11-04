@@ -15,6 +15,18 @@
 //! from `options.imp_seed.wrapping_add(i as u64)` so the result is
 //! deterministic for a given seed.
 //!
+//! ## Adaptive evaluation (#2653)
+//!
+//! The Laplace proposal above is a poor match on a very sparse subject: its
+//! posterior can run along a long ridge, or hold a second mode, that a proposal
+//! built at the mode never reaches. `log p̂` then misses that mass, so the
+//! marginal reads high and the ESS-based MC SE does not show it. So unless
+//! `imp_adapt_passes = 0`, `adapt_proposal` first re-centres each subject's
+//! proposal on the weighted moments of pilot draws, and the estimate itself
+//! comes from fresh draws, of a proposal that also keeps at least
+//! `IS_EVAL_DEFENSIVE_ALPHA` of the prior. Fresh draws keep `p̂` unbiased: the
+//! pilot only chooses `q`.
+//!
 //! ## IOV (v2: joint sampling)
 //!
 //! For models with inter-occasion variability, we perform joint sampling of
@@ -23,6 +35,7 @@
 //! IS weights include both the η and κ priors. This makes the IS -2LL directly
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
+use crate::estimation::impmap::draw_obs_nll;
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
 use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into, SUBJECT_SENTINEL_NLL};
 use crate::stats::special::ln_gamma;
@@ -267,6 +280,215 @@ fn sobol_qmc_draws(d: usize, k_samples: usize, seed: u64, nu: f64, mixture: bool
     QmcDraws { z, chi_sq, u_mix }
 }
 
+/// Smallest prior fraction of the proposal of an adaptive evaluation
+/// (`imp_adapt_passes > 0`); a larger `imp_defensive_alpha` is kept. Re-centring
+/// alone cannot reach a second posterior mode, and the prior's bounded weights
+/// can. On cefepime (#2653, K = 1000, reference 4297.2 / 4275.0 at two parameter
+/// points) adapting alone read 4299.1 / 4278.8 and adding this read 4298.1 / 4275.6.
+pub(crate) const IS_EVAL_DEFENSIVE_ALPHA: f64 = 0.1;
+
+/// Effective draws per sampled dimension (plus one) a pilot pass needs before
+/// its weighted covariance is used: `d + 1` points span a `d`-dimensional
+/// covariance at all, and a few draws that dominate the weights give one far
+/// too narrow.
+const IS_ADAPT_MIN_ESS_PER_DIM: f64 = 2.0;
+
+/// Below this many effective draws on its worst subject, a marginal is reported
+/// with a warning ([`marginal_reliability_warning`]).
+pub(crate) const IS_RELIABLE_MIN_ESS: f64 = 10.0;
+
+/// Separates the pilot streams of [`adapt_proposal`] from the final draws, which
+/// keep the subject's plain seed.
+const IS_ADAPT_SEED_TAG: u64 = 0x4144_4150_5400_0000;
+
+/// The stream of one pilot pass of the subject whose final draws use `seed`.
+fn pilot_seed(seed: u64, pass: usize) -> u64 {
+    splitmix64(seed ^ IS_ADAPT_SEED_TAG ^ pass as u64)
+}
+
+/// The defensive weight an evaluation runs with: the user's, raised to
+/// [`IS_EVAL_DEFENSIVE_ALPHA`] when it adapts. `imp_adapt_passes = 0` is the
+/// single-proposal evaluator, unchanged.
+fn eval_defensive_alpha(options: &FitOptions) -> f64 {
+    if options.imp_adapt_passes > 0 {
+        options.imp_defensive_alpha.max(IS_EVAL_DEFENSIVE_ALPHA)
+    } else {
+        options.imp_defensive_alpha
+    }
+}
+
+/// The proposal centre and precision a pilot's weighted moments give, or `None`
+/// when they cannot be used: too few effective draws, a non-finite moment, or a
+/// covariance that is not positive-definite.
+fn proposal_from_moments(draws: &SubjectDraws, k: usize) -> Option<(DVector<f64>, DMatrix<f64>)> {
+    let d = draws.mean.len();
+    let min_ess = IS_ADAPT_MIN_ESS_PER_DIM * (d + 1) as f64;
+    if !(draws.ess_fraction * k as f64 >= min_ess) {
+        return None;
+    }
+    let mean = DVector::from_row_slice(&draws.mean);
+    let cov = &draws.second_moment - &mean * mean.transpose();
+    if !mean.iter().chain(cov.iter()).all(|x| x.is_finite()) {
+        return None;
+    }
+    Some((mean, cov.cholesky()?.inverse()))
+}
+
+/// Move one subject's proposal onto its posterior: each of `passes` pilot passes
+/// draws `k_samples` from the current proposal and re-centres it on their
+/// weighted mean and covariance, as IMP does across iterations and NONMEM
+/// `EONLY=1` across `NITER` (#2653). A pass whose moments are unusable
+/// ([`proposal_from_moments`]) ends the adaptation at the last good proposal, so
+/// a subject no pilot can improve keeps the one it came in with.
+///
+/// The covariance is used as the Student-t *scale*, a little wider than the
+/// posterior, which suits a proposal. It is not capped at Ω as in the MCEM
+/// E-step: there a wide proposal feeds the Ω update, here it only costs ESS.
+#[allow(clippy::too_many_arguments)]
+fn adapt_proposal(
+    obs_nll: &SampleObsNll<'_>,
+    center: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    k_samples: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    passes: usize,
+    mixture: Option<&DefensiveMixture>,
+    cancel: &Option<crate::cancel::CancelFlag>,
+) -> (DVector<f64>, DMatrix<f64>) {
+    let mut center = center.clone();
+    let mut h = h.clone();
+    for pass in 0..passes {
+        if crate::cancel::is_cancelled(cancel) {
+            break;
+        }
+        let draws = subject_is_draws_with(
+            obs_nll,
+            &center,
+            &h,
+            omega_inv,
+            log_det_omega,
+            d,
+            k_samples,
+            nu,
+            pilot_seed(seed, pass),
+            scratch,
+            1.0,
+            false,
+            mixture,
+        );
+        match proposal_from_moments(&draws, k_samples) {
+            Some((m, p)) => (center, h) = (m, p),
+            None => break,
+        }
+    }
+    (center, h)
+}
+
+/// [`adapt_proposal`] for an η-only subject, or the inputs unchanged at
+/// `passes = 0`.
+#[allow(clippy::too_many_arguments)]
+fn adapted_eta_proposal(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    k_samples: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    passes: usize,
+    mixture: Option<&DefensiveMixture>,
+    cancel: &Option<crate::cancel::CancelFlag>,
+) -> (DVector<f64>, DMatrix<f64>) {
+    let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
+        obs_nll_subject_into(
+            model,
+            subject,
+            theta,
+            sigma,
+            model.residual_cov_theta(theta),
+            eta,
+            scratch,
+        )
+    };
+    adapt_proposal(
+        &obs_nll,
+        eta_hat,
+        h,
+        omega_inv,
+        log_det_omega,
+        d,
+        k_samples,
+        nu,
+        seed,
+        scratch,
+        passes,
+        mixture,
+        cancel,
+    )
+}
+
+/// The warning for a marginal whose worst subject has too few effective draws
+/// to trust, or `None`. Too few draws under-sample the tails of `p(y|η)p(η)/q`,
+/// so `log p̂` falls short: the marginal reads high, and the MC SE, computed from
+/// the same draws, does not show it (#2653).
+pub(crate) fn marginal_reliability_warning(r: &ImportanceSamplingResult) -> Option<String> {
+    let worst = r.ess_min * r.n_samples as f64;
+    if worst >= IS_RELIABLE_MIN_ESS {
+        return None;
+    }
+    let fix = if r.adapt_passes == 0 {
+        "Set `imp_adapt_passes` above 0 or raise `imp_samples`."
+    } else {
+        "Raise `imp_samples`."
+    };
+    Some(format!(
+        "IMP: the marginal −2 log L is unreliable: the worst subject has {worst:.1} effective \
+         draws of K = {}. With so few, the marginal tends to read high and its MC SE \
+         understates the error. {fix}",
+        r.n_samples
+    ))
+}
+
+/// What every evaluator path must do with `imp_adapt_passes`, given `run(passes,
+/// alpha)` on a fixture. Each assertion fails on a different disconnection:
+/// the prior floor must reach the sampler, the adapted proposal must reach the
+/// final draws (else the pass count could not change them), and the marginal must
+/// not move beyond Monte-Carlo error.
+#[cfg(test)]
+pub(crate) fn assert_adaptive_evaluation_is_wired(
+    run: impl Fn(usize, f64) -> ImportanceSamplingResult,
+) {
+    let adapted = run(5, 0.0);
+    assert_eq!(adapted.adapt_passes, 5);
+    assert_eq!(
+        adapted.minus2_log_likelihood,
+        run(5, IS_EVAL_DEFENSIVE_ALPHA).minus2_log_likelihood,
+        "alpha 0 must run at the floor"
+    );
+    assert_ne!(
+        adapted.minus2_log_likelihood,
+        run(1, 0.0).minus2_log_likelihood,
+        "the adapted proposal did not reach the final draws"
+    );
+
+    let single = run(0, 0.0);
+    assert_eq!(single.adapt_passes, 0);
+    let gap = (adapted.minus2_log_likelihood - single.minus2_log_likelihood).abs();
+    let se = adapted.mc_standard_error.hypot(single.mc_standard_error);
+    assert!(gap < 4.0 * se.max(0.02), "gap {gap}, combined SE {se}");
+}
+
 /// Estimate `−2 log L` by importance sampling. See module docstring for the
 /// algorithm and IOV caveats.
 pub fn run_importance_sampling(
@@ -366,7 +588,8 @@ pub fn run_importance_sampling(
     let nu = options.imp_proposal_df;
     let seed = options.imp_seed.unwrap_or(42);
     let threshold = options.imp_low_ess_threshold;
-    let defensive_alpha = options.imp_defensive_alpha;
+    let defensive_alpha = eval_defensive_alpha(options);
+    let adapt_passes = options.imp_adapt_passes;
     let cancel = &options.cancel;
 
     if k_samples < 2 {
@@ -496,6 +719,53 @@ pub fn run_importance_sampling(
                     }
                 }
 
+                if adapt_passes > 0 {
+                    let theta = &params.theta;
+                    let sigma = &params.sigma.values;
+                    let obs_nll = |b: &[f64], sc: &mut EventPkParams| {
+                        draw_obs_nll(model, subject, theta, sigma, b, sc)
+                    };
+                    let mixture = DefensiveMixture::new(&omega_joint_inv, n_b, defensive_alpha);
+                    let (center, h) = adapt_proposal(
+                        &obs_nll,
+                        &DVector::from_row_slice(&mode_joint),
+                        &h_joint,
+                        &omega_joint_inv,
+                        log_det_omega_joint,
+                        n_b,
+                        k_samples,
+                        nu,
+                        subj_seed,
+                        scratch,
+                        adapt_passes,
+                        mixture.as_ref(),
+                        cancel,
+                    );
+                    let draws = subject_is_draws_with(
+                        &obs_nll,
+                        &center,
+                        &h,
+                        &omega_joint_inv,
+                        log_det_omega_joint,
+                        n_b,
+                        k_samples,
+                        nu,
+                        subj_seed,
+                        scratch,
+                        1.0,
+                        false,
+                        mixture.as_ref(),
+                    );
+                    return SubjectIsOutput {
+                        log_marginal: draws.log_marginal,
+                        var_log_marginal: var_log_marginal_from_ess_fraction(
+                            draws.ess_fraction,
+                            k_samples as f64,
+                        ),
+                        ess_fraction: draws.ess_fraction,
+                    };
+                }
+
                 subject_is_estimate_joint(
                     model,
                     subject,
@@ -532,9 +802,9 @@ pub fn run_importance_sampling(
                 // draws routine and keep only its marginal-LL / ESS diagnostics.
                 // Fixed iscale=1.0, matching the non-RB branch below: this is the
                 // eval-only / final-marginal path (`imp_eval_only` and the
-                // post-convergence IS report), which intentionally does not
-                // retune the proposal so the reported metric stays reproducible
-                // and comparable run-to-run. Adaptive ISCALE for the RB path is
+                // post-convergence IS report). Its conditional PK proposal is
+                // well matched, so it takes the prior component of an adaptive
+                // evaluation but not the pilots. Adaptive ISCALE for the RB path is
                 // applied in the iterative MCEM E-step (`impmap.rs`) instead,
                 // where ESS quality actually drives the M-step (issue #406
                 // follow-up).
@@ -578,13 +848,31 @@ pub fn run_importance_sampling(
                         }
                     }
                 }
-                subject_is_estimate(
+                let (center, h_final) = adapted_eta_proposal(
                     model,
                     subject,
                     &params.theta,
                     &params.sigma.values,
                     eta_hat,
                     &h_post,
+                    &omega_inv,
+                    log_det_omega,
+                    n_eta,
+                    k_samples,
+                    nu,
+                    subj_seed,
+                    scratch,
+                    adapt_passes,
+                    defensive_mixture.as_ref(),
+                    cancel,
+                );
+                subject_is_estimate(
+                    model,
+                    subject,
+                    &params.theta,
+                    &params.sigma.values,
+                    &center,
+                    &h_final,
                     &omega_inv,
                     log_det_omega,
                     n_eta,
@@ -653,6 +941,7 @@ pub fn run_importance_sampling(
         ess_min,
         ess_median,
         kappa_treatment,
+        adapt_passes,
     })
 }
 
@@ -728,7 +1017,8 @@ pub fn run_importance_sampling_mixture(
     let nu = options.imp_proposal_df;
     let seed = options.imp_seed.unwrap_or(42);
     let threshold = options.imp_low_ess_threshold;
-    let defensive_alpha = options.imp_defensive_alpha;
+    let defensive_alpha = eval_defensive_alpha(options);
+    let adapt_passes = options.imp_adapt_passes;
     let cancel = &options.cancel;
     if k_samples < 2 {
         return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
@@ -808,13 +1098,31 @@ pub fn run_importance_sampling_mixture(
                 let subj_seed = seed
                     .wrapping_add(i as u64)
                     .wrapping_add((c as u64).wrapping_shl(40));
-                let out = subject_is_estimate(
+                let (center, h_final) = adapted_eta_proposal(
                     model,
                     subject,
                     &cp.theta,
                     &cp.sigma.values,
                     &ebe.eta,
                     &h_post,
+                    &omega_inv,
+                    cp.omega.log_det,
+                    n_eta,
+                    k_samples,
+                    nu,
+                    subj_seed,
+                    scratch,
+                    adapt_passes,
+                    defensive.as_ref(),
+                    cancel,
+                );
+                let out = subject_is_estimate(
+                    model,
+                    subject,
+                    &cp.theta,
+                    &cp.sigma.values,
+                    &center,
+                    &h_final,
                     &omega_inv,
                     cp.omega.log_det,
                     n_eta,
@@ -914,6 +1222,7 @@ pub fn run_importance_sampling_mixture(
         ess_min,
         ess_median,
         kappa_treatment: KappaTreatment::NotApplicable,
+        adapt_passes,
     })
 }
 
@@ -4345,5 +4654,335 @@ mod tests {
             (reference(true) - reference(false)).abs() > 1e-6,
             "the weight must move the proposal precision, else this test proves nothing"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Adaptive evaluation (#2653)
+    // -----------------------------------------------------------------------
+
+    /// `−log N(η; m, s²)` of a 1-D sample, as an observation NLL.
+    fn normal_nll(m: f64, s: f64) -> impl Fn(&[f64], &mut EventPkParams) -> f64 {
+        move |eta, _| {
+            let z = (eta[0] - m) / s;
+            0.5 * z * z + s.ln() + 0.5 * TWO_PI.ln()
+        }
+    }
+
+    /// `−log[½N(η; −a, s²) + ½N(η; a, s²)]`: two modes, the shape a mode-centred
+    /// proposal cannot see. Under a N(0, 1) prior the marginal is exactly
+    /// `N(a; 0, 1 + s²)`, whatever the sampler.
+    fn two_mode_nll(a: f64, s: f64) -> impl Fn(&[f64], &mut EventPkParams) -> f64 {
+        move |eta, _| {
+            let lobe = |m: f64| {
+                let z = (eta[0] - m) / s;
+                -0.5 * z * z - s.ln() - 0.5 * TWO_PI.ln() + 0.5_f64.ln()
+            };
+            -logsumexp2(lobe(-a), lobe(a))
+        }
+    }
+
+    fn log_normal_pdf(x: f64, var: f64) -> f64 {
+        -0.5 * x * x / var - 0.5 * var.ln() - 0.5 * TWO_PI.ln()
+    }
+
+    fn scalar(x: f64) -> DMatrix<f64> {
+        DMatrix::from_element(1, 1, x)
+    }
+
+    /// Run [`adapt_proposal`] on a 1-D subject with a N(0, 1) prior.
+    fn adapt_1d(
+        obs_nll: &SampleObsNll<'_>,
+        center: f64,
+        precision: f64,
+        k: usize,
+        passes: usize,
+        mixture: Option<&DefensiveMixture>,
+    ) -> (DVector<f64>, DMatrix<f64>) {
+        adapt_proposal(
+            obs_nll,
+            &DVector::from_element(1, center),
+            &scalar(precision),
+            &scalar(1.0),
+            0.0,
+            1,
+            k,
+            5.0,
+            17,
+            &mut EventPkParams::default(),
+            passes,
+            mixture,
+            &None,
+        )
+    }
+
+    /// The exact posterior of a conjugate subject is the target: prior N(0, 1)
+    /// and likelihood N(y; η, 0.25) give N(0.8·y, 0.2). The start is three
+    /// posterior SDs off and four times too narrow, so the assertions fail if the
+    /// passes do not run or if either moment is dropped. Measured at K = 4000:
+    /// centre 1.5965 against 1.6, variance 0.1986 against 0.2; the bound is about
+    /// 5× the worse of those errors.
+    #[test]
+    fn adapt_proposal_moves_a_misplaced_proposal_onto_the_posterior() {
+        let nll = normal_nll(2.0, 0.5);
+        let (center, h) = adapt_1d(&nll, 0.26, 20.0, 4000, 3, None);
+        assert!((center[0] - 1.6).abs() < 0.02, "centre {}", center[0]);
+        assert!(
+            (1.0 / h[(0, 0)] - 0.2).abs() < 0.02,
+            "precision {}",
+            h[(0, 0)]
+        );
+    }
+
+    #[test]
+    fn adapt_proposal_with_no_passes_returns_its_input() {
+        let nll = normal_nll(2.0, 0.5);
+        let (center, h) = adapt_1d(&nll, 0.26, 20.0, 100, 0, None);
+        assert_eq!((center[0], h[(0, 0)]), (0.26, 20.0));
+    }
+
+    /// A likelihood far sharper than anything the pilot can land on leaves one
+    /// draw holding the weight, whose covariance is not positive-definite. The
+    /// input must survive whole. The ESS floor is pinned separately, by
+    /// `proposal_from_moments_needs_enough_effective_draws`: this fixture stops
+    /// at the Cholesky with or without it.
+    #[test]
+    fn adapt_proposal_keeps_the_proposal_when_one_draw_holds_the_weight() {
+        let nll = normal_nll(0.3, 1e-7);
+        let (center, h) = adapt_1d(&nll, 0.0, 1.0, 200, 3, None);
+        assert_eq!((center[0], h[(0, 0)]), (0.0, 1.0));
+    }
+
+    #[test]
+    fn adapt_proposal_stops_when_cancelled() {
+        let nll = normal_nll(2.0, 0.5);
+        let cancel = Some(crate::cancel::CancelFlag::new());
+        cancel.as_ref().unwrap().cancel();
+        let (center, _) = adapt_proposal(
+            &nll,
+            &DVector::from_element(1, 0.26),
+            &scalar(20.0),
+            &scalar(1.0),
+            0.0,
+            1,
+            500,
+            5.0,
+            17,
+            &mut EventPkParams::default(),
+            3,
+            None,
+            &cancel,
+        );
+        assert_eq!(center[0], 0.26);
+    }
+
+    fn pilot(ess_fraction: f64, mean: f64, second_moment: f64) -> SubjectDraws {
+        SubjectDraws {
+            log_marginal: 0.0,
+            ess_fraction,
+            etas: Vec::new(),
+            weights: Vec::new(),
+            mean: vec![mean],
+            second_moment: scalar(second_moment),
+        }
+    }
+
+    #[test]
+    fn proposal_from_moments_inverts_the_weighted_covariance() {
+        let (m, h) = proposal_from_moments(&pilot(1.0, 1.0, 1.25), 100).expect("usable moments");
+        assert_eq!(m[0], 1.0);
+        approx::assert_relative_eq!(h[(0, 0)], 4.0, epsilon = 1e-12);
+    }
+
+    /// At d = 1 the floor is 4 effective draws: both sides of it, on K = 100.
+    #[test]
+    fn proposal_from_moments_needs_enough_effective_draws() {
+        assert!(proposal_from_moments(&pilot(0.04, 1.0, 1.25), 100).is_some());
+        assert!(proposal_from_moments(&pilot(0.0399, 1.0, 1.25), 100).is_none());
+        assert!(proposal_from_moments(&pilot(f64::NAN, 1.0, 1.25), 100).is_none());
+    }
+
+    #[test]
+    fn proposal_from_moments_refuses_unusable_moments() {
+        // Variance 1 − 1 = 0: not positive-definite.
+        assert!(proposal_from_moments(&pilot(1.0, 1.0, 1.0), 100).is_none());
+        assert!(proposal_from_moments(&pilot(1.0, f64::NAN, 1.25), 100).is_none());
+        assert!(proposal_from_moments(&pilot(1.0, 1.0, f64::INFINITY), 100).is_none());
+    }
+
+    #[test]
+    fn pilot_streams_differ_from_the_final_draws_and_each_other() {
+        let seed = 42;
+        let (a, b) = (pilot_seed(seed, 0), pilot_seed(seed, 1));
+        assert!(a != b && a != seed && b != seed);
+    }
+
+    #[test]
+    fn evaluation_alpha_floors_only_an_adaptive_evaluation() {
+        let mut opts = FitOptions::default();
+        opts.imp_adapt_passes = 0;
+        assert_eq!(eval_defensive_alpha(&opts), 0.0);
+        opts.imp_defensive_alpha = 0.03;
+        assert_eq!(eval_defensive_alpha(&opts), 0.03);
+        opts.imp_adapt_passes = 1;
+        assert_eq!(eval_defensive_alpha(&opts), IS_EVAL_DEFENSIVE_ALPHA);
+        opts.imp_defensive_alpha = 0.3;
+        assert_eq!(eval_defensive_alpha(&opts), 0.3);
+    }
+
+    /// The defect of #2653 in its smallest form, against an exact marginal: a
+    /// proposal built at one of two equal modes reports half the likelihood, so
+    /// `−2 log L` reads high by `2·ln 2 = 1.386`. Measured 1.387 at ESS/K = 0.91,
+    /// so the ESS gives no hint. Adapting with the prior component finds both:
+    /// measured −0.041 at ESS/K = 0.057, whose MC SE on this scale is about 0.13.
+    #[test]
+    fn adaptive_evaluation_recovers_the_mode_a_laplace_proposal_misses() {
+        let (a, s, k) = (2.5, 0.1, 4000);
+        let nll = two_mode_nll(a, s);
+        let exact = log_normal_pdf(a, 1.0 + s * s);
+        let prior = scalar(1.0);
+        let run = |center: &DVector<f64>, h: &DMatrix<f64>, mix: Option<&DefensiveMixture>| {
+            subject_is_draws_with(
+                &nll,
+                center,
+                h,
+                &prior,
+                0.0,
+                1,
+                k,
+                5.0,
+                29,
+                &mut EventPkParams::default(),
+                1.0,
+                false,
+                mix,
+            )
+        };
+
+        let laplace = run(
+            &DVector::from_element(1, a),
+            &scalar(1.0 / (s * s) + 1.0),
+            None,
+        );
+        let gap = 2.0 * (exact - laplace.log_marginal);
+        assert!(gap > 1.0, "the mode-centred proposal must read high: {gap}");
+
+        let mix = DefensiveMixture::new(&prior, 1, IS_EVAL_DEFENSIVE_ALPHA).unwrap();
+        let (center, h) = adapt_1d(&nll, a, 1.0 / (s * s) + 1.0, k, 5, Some(&mix));
+        let adapted = run(&center, &h, Some(&mix));
+        let gap = 2.0 * (exact - adapted.log_marginal);
+        assert!(
+            gap.abs() < 0.15,
+            "the adapted marginal must be exact: {gap}"
+        );
+    }
+
+    fn is_result(ess_min: f64, n_samples: usize, adapt_passes: usize) -> ImportanceSamplingResult {
+        ImportanceSamplingResult {
+            minus2_log_likelihood: 0.0,
+            mc_standard_error: 0.0,
+            low_ess_subjects: Vec::new(),
+            n_samples,
+            proposal_df: 5.0,
+            ess_min,
+            ess_median: 0.5,
+            kappa_treatment: KappaTreatment::NotApplicable,
+            adapt_passes,
+        }
+    }
+
+    /// Both sides of the gate, on the count of draws rather than the fraction:
+    /// the same fraction clears it at a larger K.
+    #[test]
+    fn reliability_warning_gates_on_effective_draws() {
+        assert!(marginal_reliability_warning(&is_result(0.01, 1000, 5)).is_none());
+        assert!(marginal_reliability_warning(&is_result(0.0099, 1000, 5)).is_some());
+        assert!(marginal_reliability_warning(&is_result(0.0099, 2000, 5)).is_none());
+    }
+
+    #[test]
+    fn reliability_warning_states_the_count_and_what_it_means() {
+        let msg = marginal_reliability_warning(&is_result(0.0035, 1000, 5)).unwrap();
+        assert!(msg.contains("has 3.5 effective draws of K = 1000"), "{msg}");
+        assert!(msg.contains("tends to read high"), "{msg}");
+        assert!(msg.contains("MC SE understates the error"), "{msg}");
+    }
+
+    /// The advice is the one sentence that depends on the input, so assert the
+    /// discriminator and its negative: asking a user already adapting to adapt
+    /// would send them nowhere.
+    #[test]
+    fn reliability_warning_advice_follows_the_adaptation_state() {
+        let adapted = marginal_reliability_warning(&is_result(0.001, 1000, 5)).unwrap();
+        assert!(adapted.contains("Raise `imp_samples`."), "{adapted}");
+        assert!(!adapted.contains("imp_adapt_passes"), "{adapted}");
+
+        let single = marginal_reliability_warning(&is_result(0.001, 1000, 0)).unwrap();
+        assert!(
+            single.contains("Set `imp_adapt_passes` above 0 or raise `imp_samples`."),
+            "{single}"
+        );
+    }
+
+    #[test]
+    fn mixture_marginal_adapts_each_class_proposal() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 1000;
+        opts.imp_seed = Some(7);
+        assert_adaptive_evaluation_is_wired(|passes, alpha| {
+            let mut opts = opts.clone();
+            opts.imp_adapt_passes = passes;
+            opts.imp_defensive_alpha = alpha;
+            run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+                .expect("mixture IS")
+        });
+    }
+
+    #[test]
+    fn eta_only_marginal_adapts_each_subject_proposal() {
+        let model = crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL(2.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+        )
+        .unwrap();
+        let pop = mix_pop();
+        let params = &model.default_params;
+        let ebes: Vec<_> = pop
+            .subjects
+            .iter()
+            .map(|s| {
+                crate::estimation::inner_optimizer::find_ebe(
+                    &model, s, params, 100, 1e-6, None, None, 0,
+                )
+            })
+            .collect();
+        let eta_hats: Vec<_> = ebes.iter().map(|e| e.eta.clone()).collect();
+        let jacobians: Vec<_> = ebes.iter().map(|e| e.h_matrix.clone()).collect();
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 1000;
+        opts.imp_seed = Some(7);
+        assert_adaptive_evaluation_is_wired(|passes, alpha| {
+            let mut opts = opts.clone();
+            opts.imp_adapt_passes = passes;
+            opts.imp_defensive_alpha = alpha;
+            run_importance_sampling(&model, &pop, params, &eta_hats, &jacobians, &[], &opts)
+                .expect("IS on a one-η model")
+        });
     }
 }
