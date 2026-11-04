@@ -2061,6 +2061,7 @@ fn fit_inner(
                         stationary_start: false,
                         vi: None,
                         start_eval: None,
+                        mcem_lowest_objective: None,
                         mixture_posteriors: None,
                     });
                 }
@@ -2159,6 +2160,7 @@ fn fit_inner(
                     mixture_posteriors: None,
                     vi: None,
                     start_eval: None,
+                    mcem_lowest_objective: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -3015,6 +3017,17 @@ fn fit_inner(
     // Imprecisely estimated thetas (high relative standard error) — likewise
     // emitted typed at source with `details` (#781).
     if let Some((msg, entry)) = inflated_rse_warning(&se_theta, &result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+    // The marginal is published beside `ofv`, and under IMP / IMPMAP it is the objective
+    // that shows a collapse: the gate above read the Laplace `ofv` (#2652).
+    if let Some((msg, entry)) = mcem_marginal_warning(
+        &mut converged,
+        is_result.as_ref().map(|r| r.minus2_log_likelihood),
+        result.mcem_lowest_objective,
+        population.n_obs(),
+    ) {
         warnings.push(msg);
         native_warnings.push(entry);
     }

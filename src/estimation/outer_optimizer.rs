@@ -147,6 +147,10 @@ pub struct OuterResult {
     /// whichever run it reports, so a restart that lands above the user's start cannot pass
     /// by comparing against its own.
     pub(crate) start_eval: Option<StartEval>,
+    /// The lowest −2 log L an IMP / IMPMAP iteration reached; `None` for every other
+    /// estimator, and when no iteration was finite. `fit()` compares the final marginal
+    /// against it (`crate::api::postfit::mcem_marginal_warning`, #2652).
+    pub(crate) mcem_lowest_objective: Option<f64>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1209,6 +1213,7 @@ fn evaluate_at_initial_params(
         mixture_posteriors,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: None,
         params,
         ofv,
         converged: false,
@@ -8558,6 +8563,7 @@ fn optimize_nlopt_attempt_probed(
         vi: None,
         // A restart leg publishes the fit's start, not its own (see `OuterResult::start_eval`).
         start_eval: inherited_start.unwrap_or(start_eval.get()),
+        mcem_lowest_objective: None,
     };
     (
         result,
@@ -9194,6 +9200,7 @@ fn optimize_bfgs(
         mixture_posteriors: None,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: None,
         params: final_params,
         ofv: final_ofv,
         converged,

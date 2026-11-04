@@ -150,6 +150,47 @@ pub(crate) fn gate_converged_on_mcem_objective(converged: &mut bool, ofv: f64) -
     ))
 }
 
+/// How far above the lowest iteration objective, as a fraction of the objective's
+/// scale, a final marginal may sit before [`mcem_objective_rise`] calls the run
+/// collapsed (#2652).
+///
+/// An EM iteration should not raise the objective, so the only legitimate gap is
+/// Monte-Carlo noise. Measured on the 2026-11 IMP-vs-NONMEM evaluation (macOS arm64,
+/// K = 1000, `[focei, imp]` and cold `imp`): the widest healthy gap is 0.57 % of the
+/// scale (cefepime with #2650's cap repaired: lowest 4275.1, marginal 4299.6) and the
+/// narrowest collapse is 28 % (infliximab from a cold start: lowest 929.2, last
+/// iteration 1190.1, NONMEM 664). 10 % sits about 17× above the first and 3× below
+/// the second.
+pub(crate) const MCEM_RISE_TOLERANCE: f64 = 0.10;
+
+/// The rise of the final marginal `marginal` over `lowest`, the lowest objective the
+/// MCEM iterations reached, when it is too large to be Monte-Carlo noise (#2652);
+/// `None` otherwise.
+///
+/// A collapse on the first recentre can sit below the 1e14 / 1e15 cutoffs of
+/// [`gate_converged_on_mcem_objective`] for good: cefepime read 4315.4 at iteration 1,
+/// 4.4e7 at iteration 2, and ended at a marginal of 12,446.9 against NONMEM's 4282.9.
+///
+/// * The baseline is the **lowest** iteration, not the first, because a cold start
+///   makes the first a poor reference: infliximab read 3095.9, reached 929.2, blew up
+///   to 5e6 and ended at 1190.1, below where it began.
+/// * The scale is `max(|lowest|, n_obs)`, because −2 log L has no natural zero: an
+///   objective near 0 would make a purely relative test fire on noise.
+pub(crate) fn mcem_objective_rise(marginal: f64, lowest: f64, n_obs: usize) -> Option<f64> {
+    let rise = marginal - lowest;
+    (rise > MCEM_RISE_TOLERANCE * lowest.abs().max(n_obs as f64)).then_some(rise)
+}
+
+/// Fold one iteration's objective into the lowest seen so far. A non-finite value is
+/// skipped explicitly: `f64::min` would do it silently for `NaN`, and for `-inf` it
+/// would keep a baseline nothing can rise above.
+fn lowest_objective(lowest: Option<f64>, objective: f64) -> Option<f64> {
+    if !objective.is_finite() {
+        return lowest;
+    }
+    Some(lowest.map_or(objective, |l| l.min(objective)))
+}
+
 /// How each MCEM iteration positions the per-subject importance-sampling
 /// proposal — the one piece that distinguishes IMP from IMPMAP. Everything else
 /// (M-step, sufficient statistics, averaging, ESS diagnostics, final objective)
@@ -1216,6 +1257,8 @@ fn run_mcem(
     // left its initial value (#918 review).
     let mut cov_group_skipped = vec![0usize; cov_mu_groups.len()];
 
+    // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
+    let mut lowest_iteration_objective: Option<f64> = None;
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             if verbose {
@@ -1547,6 +1590,7 @@ fn run_mcem(
             ess_fracs.push(d.ess_fraction);
         }
         let minus2ll = -2.0 * ll;
+        lowest_iteration_objective = lowest_objective(lowest_iteration_objective, minus2ll);
         // Objective Monte-Carlo standard error from the self-normalized ESS
         // (Geweke: Var(log p̂ᵢ) ≈ (1/ESS_frac − 1)/K; degenerate subjects get a
         // finite fallback). −2 log L scales this by 2.
@@ -2227,6 +2271,7 @@ fn run_mcem(
         mixture_posteriors: None,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: lowest_iteration_objective,
     })
 }
 
@@ -2639,6 +2684,8 @@ fn run_mcem_mixture(
         );
     }
 
+    // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
+    let mut lowest_iteration_objective: Option<f64> = None;
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             break;
@@ -2825,6 +2872,7 @@ fn run_mcem_mixture(
             pmix.push(pmix_i);
             ofv += contribution;
         }
+        lowest_iteration_objective = lowest_objective(lowest_iteration_objective, ofv);
         if verbose {
             // Per-subject ESS: the worst per-class proposal among the classes the
             // subject actually contributes to (a collapsed proposal in a class
@@ -3168,6 +3216,7 @@ fn run_mcem_mixture(
         mixture_posteriors,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: lowest_iteration_objective,
     })
 }
 
@@ -4595,6 +4644,90 @@ mod tests {
         assert!(!objective_converged(OFV_DIVERGENCE_CAP));
     }
 
+    /// #2652: every row is a run from the 2026-11 evaluation (lowest iteration, final
+    /// objective, observations), so the bound is pinned to what separated them.
+    #[test]
+    fn mcem_objective_rise_separates_the_measured_collapses_from_healthy_runs() {
+        for (lowest, end, n_obs) in [
+            (4315.4, 12446.9, 702), // cefepime, the issue's fit
+            (661.4, 1699.0, 183),   // infliximab, warm
+            (929.2, 1190.1, 183),   // infliximab, cold: ends below its 3095.9 start
+        ] {
+            assert!(
+                mcem_objective_rise(end, lowest, n_obs).is_some(),
+                "a collapse passed: {lowest} → {end}"
+            );
+        }
+        for (lowest, end, n_obs) in [
+            (4275.1, 4299.6, 702),     // cefepime with #2650's cap repaired
+            (-3053.9, -3053.06, 1006), // propofol
+            (-250.7, -249.95, 132),    // thioguanine
+            (-286.2, -285.93, 110),    // warfarin
+        ] {
+            assert_eq!(
+                mcem_objective_rise(end, lowest, n_obs),
+                None,
+                "a healthy run fired: {lowest} → {end}"
+            );
+        }
+    }
+
+    /// The scale's two halves, each on the input only it decides. Dropping `abs()` makes
+    /// a negative objective's tolerance negative, so a tiny rise fires; dropping the
+    /// `n_obs` floor makes noise around zero a 1000 % rise.
+    #[test]
+    fn mcem_objective_rise_scales_on_the_magnitude_and_the_observation_count() {
+        assert_eq!(mcem_objective_rise(-990.0, -1000.0, 10), None);
+        assert_eq!(mcem_objective_rise(-850.0, -1000.0, 10), Some(150.0));
+        assert_eq!(mcem_objective_rise(5.0, 0.4, 100), None);
+        assert!(mcem_objective_rise(11.0, 0.4, 100).is_some());
+        // A fall is never a rise, however large.
+        assert_eq!(mcem_objective_rise(-5000.0, 4000.0, 100), None);
+    }
+
+    /// A non-finite iteration must neither become the baseline nor erase it. `-inf`
+    /// is the case `f64::min` gets wrong: nothing could ever rise above it.
+    #[test]
+    fn lowest_objective_keeps_the_lowest_finite_iteration() {
+        assert_eq!(lowest_objective(None, f64::NAN), None);
+        assert_eq!(lowest_objective(None, f64::INFINITY), None);
+        assert_eq!(lowest_objective(None, 7.0), Some(7.0));
+        assert_eq!(lowest_objective(Some(7.0), 9.0), Some(7.0));
+        assert_eq!(lowest_objective(Some(7.0), 5.0), Some(5.0));
+        assert_eq!(lowest_objective(Some(7.0), f64::NAN), Some(7.0));
+        assert_eq!(lowest_objective(Some(7.0), f64::NEG_INFINITY), Some(7.0));
+    }
+
+    /// The baseline `fit()` reads is the lowest iteration row, and not simply the first:
+    /// the premise asserts this fixture's objective falls, or the two would coincide.
+    #[test]
+    fn run_mcem_publishes_the_lowest_iteration_objective() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 4;
+        opts.impmap_samples = 200;
+        opts.impmap_seed = Some(11);
+        opts.impmap_trace = true;
+        opts.run_covariance_step = false;
+        let res = run_impmap(&model, &pop, &model.default_params, None, &opts).expect("impmap");
+        let trace = res.impmap_trace.as_ref().expect("impmap_trace requested");
+        let rows: Vec<f64> = trace
+            .rows
+            .iter()
+            .filter(|r| r.iteration > 0)
+            .map(|r| r.ofv)
+            .collect();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|v| v.is_finite()), "rows {rows:?}");
+        let lowest = rows.iter().copied().fold(f64::INFINITY, f64::min); // nan-ok: asserted finite above
+        assert!(
+            lowest < rows[0],
+            "premise: the objective falls, rows {rows:?}"
+        );
+        assert_eq!(res.mcem_lowest_objective, Some(lowest));
+    }
+
     /// #1303: the MCEM exits apply **two** objective rules, and this pins that
     /// neither is redundant — the trap being that two conditions rejecting the
     /// same inputs cover for each other, so deleting either leaves the suite
@@ -5061,6 +5194,8 @@ mod tests {
         let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("imp mixture");
         assert!(res.ofv.is_finite());
         assert!(res.mixture_posteriors.is_some());
+        // The mixture loop keeps its own objective, so it records its own baseline (#2652).
+        assert!(res.mcem_lowest_objective.is_some_and(f64::is_finite));
     }
 
     /// Estimating IMP/IMPMAP rejects a mixture with per-class Ω/Σ overrides.

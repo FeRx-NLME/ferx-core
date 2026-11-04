@@ -3604,3 +3604,154 @@ fn a_sum_past_the_cutoff_names_its_largest_contributions() {
     );
     assert_eq!(details["reason_read_from"], "subjects", "{details}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  #2652 — the gate on the importance-sampling marginal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every kind of unusable marginal demotes, each past a different rule: the two finite
+/// ones are the disjoint witnesses of `the_two_mcem_objective_rules_reject_different_runs`.
+/// `lowest` is `None` throughout, because an `imp_eval_only` readout has no iterations.
+#[test]
+fn an_unusable_marginal_demotes_the_fit_and_names_itself() {
+    use crate::api::postfit::NONFINITE_MARGINAL_TOKEN;
+    for (marginal, reason) in [
+        (f64::NAN, "NaN"),
+        (f64::INFINITY, "infinite"),
+        (f64::NEG_INFINITY, "infinite"),
+        (5e14, "too large to be a fit"),
+        (-1e16, "too large to be a fit"),
+    ] {
+        let mut converged = true;
+        let (msg, entry) = mcem_marginal_warning(&mut converged, Some(marginal), None, 100)
+            .unwrap_or_else(|| panic!("{marginal:?} passed"));
+        assert!(!converged, "{marginal:?}");
+        assert!(msg.starts_with(NONFINITE_MARGINAL_TOKEN), "{msg}");
+        assert!(msg.contains("importance-sampling marginal"), "{msg}");
+        assert!(msg.contains(reason), "{msg}");
+        assert!(msg.contains(&format!("{marginal:?}")), "{msg}");
+        assert!(msg.contains("converged: false"), "{msg}");
+        assert_eq!(entry.severity, WarningSeverity::Critical);
+        assert_eq!(entry.category, WarningCode::Convergence);
+        assert_eq!(entry.details.as_ref().unwrap()["reason"], reason);
+    }
+}
+
+/// The issue's second fit, by its measured numbers. Each number the message quotes
+/// is a distinct value, so swapping two of them fails here.
+#[test]
+fn a_marginal_far_above_the_lowest_iteration_demotes_the_fit() {
+    use crate::api::postfit::MCEM_OBJECTIVE_ROSE_TOKEN;
+    let mut converged = true;
+    let (msg, entry) = mcem_marginal_warning(&mut converged, Some(12446.9), Some(4315.4), 702)
+        .expect("the cefepime collapse passed");
+    assert!(!converged);
+    assert!(msg.starts_with(MCEM_OBJECTIVE_ROSE_TOKEN), "{msg}");
+    assert!(msg.contains("(12446.9000) is 8131.5000 above"), "{msg}");
+    assert!(msg.contains("reached (4315.4000)"), "{msg}");
+    assert!(msg.contains("converged: false"), "{msg}");
+    assert!(msg.contains("did not return"), "{msg}");
+    assert_eq!(entry.severity, WarningSeverity::Critical);
+    assert_eq!(entry.category, WarningCode::Convergence);
+    let details = entry.details.as_ref().unwrap();
+    assert_eq!(details["marginal"], 12446.9);
+    assert_eq!(details["lowest_iteration_objective"], 4315.4);
+}
+
+/// The inputs that must leave a good verdict alone, and a bad one bad: the gate only
+/// ever demotes.
+#[test]
+fn a_usable_marginal_leaves_the_verdict_alone() {
+    for (marginal, lowest) in [
+        (Some(4299.6), Some(4275.1)), // healthy, within noise of the lowest iteration
+        (Some(12446.9), None),        // no iterations to have risen from
+        (None, Some(4315.4)),         // the marginal pass was skipped
+        (None, None),                 // not an IS fit at all
+    ] {
+        for verdict in [true, false] {
+            let mut converged = verdict;
+            assert!(mcem_marginal_warning(&mut converged, marginal, lowest, 702).is_none());
+            assert_eq!(converged, verdict, "{marginal:?} {lowest:?}");
+        }
+    }
+}
+
+/// **The wiring, end to end.** `imp_proposal_df = normal` scores `inf` on the evaluation
+/// path (#2651), the first fit of this issue, while `ofv` stays finite and the
+/// estimator's own gate is satisfied. Each arm has a t-proposal twin differing only in
+/// `imp_proposal_df`, so the verdict is shown to turn on the marginal.
+///
+/// When #2651 lands the `premise` below goes red: that is this fixture losing its
+/// non-finite marginal, not the gate breaking, and it needs another way to reach one.
+#[test]
+fn a_non_finite_marginal_reaches_the_published_verdict() {
+    use crate::api::postfit::NONFINITE_MARGINAL_TOKEN;
+    let model = one_cpt_model();
+    let pop = population_of(vec![
+        subject_with_dose_time("1", 0.0, 1.0),
+        subject_with_dose_time("2", 0.0, 1.2),
+        subject_with_dose_time("3", 0.0, 0.9),
+    ]);
+    let estimating = FitOptions {
+        methods: vec![EstimationMethod::Imp],
+        imp_iterations: 3,
+        imp_samples: 50,
+        imp_auto: false,
+        imp_seed: Some(7),
+        run_covariance_step: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    let readout = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Imp],
+        imp_eval_only: true,
+        ..estimating.clone()
+    };
+    for (name, opts) in [("estimating", estimating), ("readout", readout)] {
+        let with_df = |df: f64| {
+            let o = FitOptions {
+                imp_proposal_df: df,
+                ..opts.clone()
+            };
+            fit(&model, &pop, &model.default_params, &o).expect("fit")
+        };
+
+        let bad = with_df(f64::INFINITY);
+        let is = bad
+            .importance_sampling
+            .as_ref()
+            .expect("marginal published");
+        assert!(
+            !is.minus2_log_likelihood.is_finite(),
+            "premise ({name}): #2651's `inf`, got {}",
+            is.minus2_log_likelihood
+        );
+        assert!(bad.ofv.is_finite(), "premise ({name}): ofv {}", bad.ofv);
+        assert!(!bad.converged, "{name}: {:?}", bad.warnings);
+        let has_token = |w: &String| w.starts_with(NONFINITE_MARGINAL_TOKEN);
+        assert!(
+            bad.warnings.iter().any(has_token),
+            "{name}: {:?}",
+            bad.warnings
+        );
+        assert!(
+            bad.warnings_structured
+                .iter()
+                .any(|e| e.message.starts_with(NONFINITE_MARGINAL_TOKEN)),
+            "{name}: the typed entry was dropped"
+        );
+
+        let good = with_df(5.0);
+        let is = good
+            .importance_sampling
+            .as_ref()
+            .expect("marginal published");
+        assert!(is.minus2_log_likelihood.is_finite(), "{name}: t proposal");
+        assert!(
+            !good.warnings.iter().any(has_token),
+            "{name}: {:?}",
+            good.warnings
+        );
+        assert!(good.converged, "{name}: {:?}", good.warnings);
+    }
+}
