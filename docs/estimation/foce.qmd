@@ -868,7 +868,8 @@ loop is run once more at the same parameters, warm from the EBEs the cold solve 
 and that second solve is what the guard judges. If it is accepted the fit proceeds from it;
 if it is still rejected, the evaluation is reported exactly as before, from the cold solve.
 A start rejected because a subject was rejected at its inner start, or because the
-objective is not finite, is not re-solved. On `examples/two_cpt_oral_cov.ferx` at
+objective is not finite, is not re-solved. Fits with a profiled θ level block do the same
+with their first profile solve, re-solving the levels and EBEs from the ones it found. On `examples/two_cpt_oral_cov.ferx` at
 `inner_maxiter = 3`, 17 of 30 subjects are unconverged from the cold start; re-solved warm,
 none are, and the start scores −1040.033385, the objective the default inner budget gives
 it in one cold solve (−1040.033394).

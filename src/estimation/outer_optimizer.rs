@@ -1988,10 +1988,13 @@ pub(crate) fn ebe_guard_rejects(
 /// subjects the budget a warm start would have, at the one point where no warm start
 /// exists.
 ///
+/// The profiled loop (`profile::optimize_profiled`) applies the same rule to its first
+/// profile solve, re-solving from `ProfileWarm::from_solve`.
+///
 /// Only the fraction trigger qualifies. A hard start rejection holds a placeholder
 /// `(η, H)` that is no warm start, and a non-finite objective is not something more inner
 /// iterations repair.
-fn wants_start_warm_rescore(
+pub(crate) fn wants_start_warm_rescore(
     stats: &InnerLoopStats,
     n_subj: usize,
     raw_ofv: f64,
