@@ -7478,9 +7478,13 @@ mod outer_fd_fallback {
     /// #2406: the resolution gate is entered only for a coordinate whose floor is below 1 —
     /// a floor-1 coordinate takes the ungated difference bit for bit and never calls the tight
     /// twin — and a floored coordinate whose twin agrees keeps its #2187 step: on a clean
-    /// objective it is accepted at the first step, from two twin probes.
+    /// objective it is accepted at the first step, from two twin probes, and takes the twin's
+    /// difference there. The twin is the objective plus a constant, so each of its probes
+    /// differs from its τ probe (a twin that reproduces them measured nothing) while its slope
+    /// is the same.
     #[test]
     fn the_gradient_gate_leaves_floor_one_and_resolved_coordinates_alone() {
+        use crate::estimation::parameterization::fd_step;
         let x = [2e-3, 1.5];
         let fixed = [false, false];
         let bounds = PackedBounds {
@@ -7496,18 +7500,27 @@ mod outer_fd_fallback {
 
         let floor = [2e-3, 1.0];
         let calls = std::cell::Cell::new(0usize);
+        let shifted = |v: &[f64]| f(v) + 0.25;
         let twin = |v: &[f64]| {
             calls.set(calls.get() + 1);
-            Some(f(v))
+            Some(shifted(v))
         };
         let gated = central_diff_packed_gated(&x, &fixed, &floor, &bounds, f, Some(&twin));
         let ungated = central_diff_packed(&x, &fixed, &floor, &bounds, f);
-        assert_eq!(bits(&gated), bits(&ungated));
         assert_eq!(
             calls.get(),
             2,
             "accepted at the first step, on its two twin probes"
         );
+        let h = fd_step(1e-4, x[0], floor[0]);
+        let at = |x0: f64| shifted(&[x0, x[1]]);
+        let twin_diff = (at(x[0] + h) - at(x[0] - h)) / ((x[0] + h) - (x[0] - h));
+        assert_eq!(gated[0].to_bits(), twin_diff.to_bits());
+        assert!(
+            (gated[0] - ungated[0]).abs() < 1e-9,
+            "{gated:?} vs {ungated:?}"
+        );
+        assert_eq!(gated[1].to_bits(), ungated[1].to_bits());
     }
 
     /// #2406: a floored coordinate whose τ probes *stall* — warm-started at the mode, they stop

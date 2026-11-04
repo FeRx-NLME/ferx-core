@@ -1840,6 +1840,7 @@ fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
             numer: numer.abs(),
             scale: f0.abs(),
             span: 2.0 * h,
+            probes: [fp, fm],
         })
     };
     gated
@@ -7088,12 +7089,14 @@ mod tests {
 
     /// #2406: the gate is entered only for a coordinate whose floor is below 1. With every
     /// floor 1 the gated stencil is the ungated one bit for bit and the twin is never called;
-    /// with coordinate 0 floored and a twin that agrees, it is accepted at the first step and
-    /// the stencil is again the ungated one, from three twin objectives (its centre and two
-    /// probes).
+    /// with coordinate 0 floored and a twin that agrees, it is accepted at the first step, from
+    /// three twin objectives (its centre and two probes): its diagonal is the twin's second
+    /// difference at the #2187 step and every other entry is the ungated stencil's bit for bit.
+    /// The twin is the objective plus a constant, so each probe differs from its τ probe (a twin
+    /// that reproduces them measured nothing) while its curvature is the same.
     #[test]
     fn the_hessian_gate_leaves_floor_one_and_resolved_coordinates_alone() {
-        use super::{fd_ofv_hessian, fd_ofv_hessian_gated};
+        use super::{fd_ofv_hessian, fd_ofv_hessian_gated, fd_step};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let opts = crate::types::FitOptions::default();
@@ -7119,9 +7122,10 @@ mod tests {
 
         let floor = [0.0077, 1.0];
         let calls = AtomicUsize::new(0);
+        let shifted = |x: &[f64]| gate_fixture(x) + 0.25;
         let twin = |x: &[f64]| {
             calls.fetch_add(1, Ordering::Relaxed);
-            Some(gate_fixture(x))
+            Some(shifted(x))
         };
         let gated = fd_ofv_hessian_gated(
             2,
@@ -7137,8 +7141,25 @@ mod tests {
         .unwrap();
         let ungated =
             fd_ofv_hessian(2, &x_hat, &[0, 1], &floor, eps, f0, &gate_fixture, &opts).unwrap();
-        assert_eq!(hess_bits(&gated), hess_bits(&ungated));
         assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let h = fd_step(eps, x_hat[0], floor[0]);
+        let twin_diag = (shifted(&[x_hat[0] + h, x_hat[1]]) - 2.0 * shifted(&x_hat)
+            + shifted(&[x_hat[0] - h, x_hat[1]]))
+            / (h * h);
+        assert_eq!(gated.hess[(0, 0)].to_bits(), twin_diag.to_bits());
+        assert!(
+            (gated.hess[(0, 0)] - ungated.hess[(0, 0)]).abs() < 1e-3,
+            "{} vs {}",
+            gated.hess[(0, 0)],
+            ungated.hess[(0, 0)]
+        );
+        for ij in [(0, 1), (1, 0), (1, 1)] {
+            assert_eq!(
+                gated.hess[ij].to_bits(),
+                ungated.hess[ij].to_bits(),
+                "H{ij:?}"
+            );
+        }
     }
 
     /// #2406: a floored coordinate whose τ objective *stalls* near `x̂` — modelled as
