@@ -3481,8 +3481,10 @@ fn basin_probe_reference(
 }
 
 /// Make the mid-leg probe's cold solve the leg's incumbent when it absorbs it (#2600):
-/// `ofv = (penalized, clean)` at `solve.xs`, its EBE state `solve`, and `modes` (the warm
-/// starts built from it).
+/// `ofv = (penalized, clean)` at `solve.xs` and its EBE state `solve`. The warm starts are
+/// built here from `solve` itself ([`outer_cache_warm_starts`]: η then κ cells, or η alone
+/// on ODE+IOV), so the
+/// cache cannot be handed modes from any other solve than the one recorded (#2674).
 ///
 /// Every tracker an evaluation's improvement is measured against moves to the cold
 /// objective, or a later trial scoring between it and the warm one would count as an
@@ -3509,10 +3511,11 @@ fn absorb_cold_incumbent(
     last_gradient: &mut Option<Vec<f64>>,
     plateau: &mut (f64, usize, usize),
     (ofv, ofv_clean): (f64, f64),
-    modes: Vec<DVector<f64>>,
+    model: &CompiledModel,
     solve: IncumbentSolve,
 ) {
     state.reset_to_cold_start();
+    let modes = outer_cache_warm_starts(model, &solve.etas, &solve.kappas);
     if modes.len() == state.cached_etas.len() {
         state.cached_etas = modes;
     }
@@ -7351,7 +7354,6 @@ fn optimize_nlopt_attempt_probed(
                                 // evaluation's improvement is measured against.
                                 let cold_penalized =
                                     cold + nn_reg.penalty_value(&p.theta) + priors.penalty(&x_inc);
-                                let modes = outer_cache_warm_starts(model, &ehs, &kappas);
                                 let solve = IncumbentSolve {
                                     xs: xs_inc.clone(),
                                     etas: ehs,
@@ -7372,7 +7374,7 @@ fn optimize_nlopt_attempt_probed(
                                     &mut last_gradient_cl.lock().unwrap(),
                                     &mut plateau_tracker_cl.lock().unwrap(),
                                     (cold_penalized, cold),
-                                    modes,
+                                    model,
                                     solve,
                                 );
                                 if verbose {
