@@ -14,6 +14,7 @@ fn group(kind: DensityKind, etas: Vec<usize>, shape: Vec<usize>) -> EtaDensity {
         shape_thetas: shape,
         trunc: None,
         margins: vec![],
+        log_anchors: Vec::new(),
     }
 }
 
@@ -388,6 +389,7 @@ fn a_truncated_density_is_the_renormalised_kind() {
             shape_thetas: (0..sh.len()).collect(),
             trunc: Some(Truncation { lo, hi }),
             margins: vec![],
+            log_anchors: Vec::new(),
         };
         let val = |b: Bound, open: f64| match b {
             Bound::Value(v) => v,
@@ -470,6 +472,7 @@ fn a_gaussian_copula_is_the_multivariate_normal() {
         shape_thetas: vec![],
         trunc: None,
         margins: vec![DensityKind::Normal; 3],
+        log_anchors: Vec::new(),
     };
     let mut worst = 0.0f64;
     for z in [[0.1, -0.2, 0.3], [-0.5, 0.4, 0.05], [0.0, 0.0, 0.0]] {
@@ -497,6 +500,7 @@ fn a_copula_integrates_to_one_and_keeps_its_margins() {
         shape_thetas: vec![0],
         trunc: None,
         margins: vec![DensityKind::Gamma, DensityKind::Beta],
+        log_anchors: Vec::new(),
     };
     let theta = [0.3];
     let p = |z0: f64, z1: f64| {
@@ -557,6 +561,7 @@ fn the_block_lognormal_is_the_multivariate_lognormal() {
         shape_thetas: vec![],
         trunc: None,
         margins: vec![],
+        log_anchors: Vec::new(),
     };
     let s = DMatrix::from_fn(2, 2, |i, j| f64::ln_1p(omega[(i, j)]));
     let si = s.clone().try_inverse().unwrap();

@@ -40,6 +40,7 @@ fn the_mcem_mstep_recovers_the_simulation_truth() {
             shape_thetas: vec![],
             trunc: None,
             margins: vec![],
+            log_anchors: Vec::new(),
         },
         EtaDensity {
             kind: DensityKind::Beta,
@@ -47,6 +48,7 @@ fn the_mcem_mstep_recovers_the_simulation_truth() {
             shape_thetas: vec![0],
             trunc: None,
             margins: vec![],
+            log_anchors: Vec::new(),
         },
         EtaDensity {
             kind: DensityKind::StudentT,
@@ -54,6 +56,7 @@ fn the_mcem_mstep_recovers_the_simulation_truth() {
             shape_thetas: vec![1],
             trunc: None,
             margins: vec![],
+            log_anchors: Vec::new(),
         },
     ]);
     let truth_omega = DMatrix::from_diagonal(&DVector::from_vec(vec![0.15, 0.02, 0.09]));
@@ -100,6 +103,7 @@ fn a_fixed_parameter_is_not_moved() {
         shape_thetas: vec![0],
         trunc: None,
         margins: vec![],
+        log_anchors: Vec::new(),
     }]);
     let omega0 = DMatrix::from_element(1, 1, 0.03);
     let zs = draws(&model, &DMatrix::from_element(1, 1, 0.02), &[0.3], 2_000);

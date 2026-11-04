@@ -395,6 +395,12 @@ pub struct EtaDensity {
     /// A copula's margin per ETA (in `etas` order); their shape θs sit in `shape_thetas`
     /// one margin after another. Empty for every other kind.
     pub(crate) margins: Vec<DensityKind>,
+    /// Per ETA of the group, the θ whose log the latent shifts with (#1716): `Some(t)`
+    /// when the model reads the ETA as `THETA_t * m(z)` with `m = exp` (or
+    /// `THETA_t * exp(z)` on ℝ), the log mu-reference the parser finds on the rewritten
+    /// AST and does not keep as a Gaussian mu-reference. Bayes's θ–z shift move
+    /// (`log θ_t + δ`, `z − δ`) reads it; empty for a group with none.
+    pub(crate) log_anchors: Vec<Option<usize>>,
 }
 
 /// One end of a truncation.

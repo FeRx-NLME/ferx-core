@@ -443,6 +443,7 @@ fn group_log_density<T: PkNum>(
         shape_thetas: (0..d.shape_thetas.len()).collect(),
         trunc: d.trunc,
         margins: d.margins.clone(),
+        log_anchors: Vec::new(),
     };
     let mut free = 0;
     let shape_vals: Vec<T> = l

@@ -1,0 +1,4 @@
+# cmdstanpy build products
+warfarin_gamma_cl
+warfarin_gamma_cl.hpp
+*.o

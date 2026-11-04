@@ -1145,6 +1145,42 @@ pub fn run_bayes(
             let mut rw_scales = vec![0.1_f64; n_pop];
             let mut acc_pop = vec![0u64; n_pop];
             let mut prop_pop = vec![0u64; n_pop];
+            // #1716: θ–z shift moves. A density ETA is not mu-referenced, so the
+            // conjugate θ move is off and, at fixed η, `CL = TVCL·exp(z)` pins TVCL: the
+            // random walk alone mixed with ESS ≈ 3 in 40 000 draws (the Stan anchor,
+            // `tests/eta_density_stan_anchor.rs`). Each density ETA with a log anchor θ on
+            // the random walk gets a move `log θ + δ`, `z_i − δ` for every subject, which
+            // leaves each individual parameter where it was. It is volume-preserving in
+            // (log θ, z), so it is accepted on the exact posterior ratio. A θ the
+            // conjugate move draws is not on the random walk and gets none.
+            let shift_pairs: Vec<(usize, usize, usize)> = model
+                .eta_densities
+                .iter()
+                .flat_map(|d| {
+                    d.etas
+                        .iter()
+                        .zip(&d.log_anchors)
+                        .filter_map(|(&k, &a)| a.map(|t| (k, t)))
+                })
+                // ... and every Gaussian η whose log mu-reference θ the conjugate move
+                // does not take (partial mu-referencing turns it off model-wide), which
+                // is pinned the same way.
+                .chain(
+                    mu_pairs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, t)| t.map(|t| (k, t))),
+                )
+                .filter_map(|(k, t)| {
+                    pop_coords
+                        .iter()
+                        .position(|c| matches!(*c, PopCoord::Theta { idx, log: true } if idx == t))
+                        .map(|c| (k, t, c))
+                })
+                .collect();
+            let mut shift_scales = vec![0.1_f64; shift_pairs.len()];
+            let mut shift_acc = vec![0u64; shift_pairs.len()];
+            let mut shift_prop = vec![0u64; shift_pairs.len()];
             // A density ETA's ln-ω random walk (#1716): its step, adapted in warmup.
             // Per Ω / Ω_IOV block of the Metropolis move (#1716): its step, adapted in warmup.
             let conjugate0 = options.bayes_omega_prior == crate::types::OmegaPrior::InverseWishart;
@@ -1790,6 +1826,58 @@ pub fn run_bayes(
                         }
                     }
 
+                    // (a′) θ–z shift moves for density ETAs (#1716), see `shift_pairs`.
+                    for (p, &(k, t, c)) in shift_pairs.iter().enumerate() {
+                        let delta = shift_scales[p] * rng.sample::<f64, _>(StandardNormal);
+                        let u_old = theta[t].max(TINY).ln();
+                        let u_new = u_old + delta;
+                        shift_prop[p] += 1;
+                        if !within_bounds(
+                            u_new.exp(),
+                            t,
+                            &init_params.theta_lower,
+                            &init_params.theta_upper,
+                        ) {
+                            continue;
+                        }
+                        let old_theta = theta[t];
+                        theta[t] = u_new.exp();
+                        for e in etas.iter_mut() {
+                            e[k] -= delta;
+                        }
+                        let nll_prop: Vec<f64> = (0..n_subjects)
+                            .map(|i| {
+                                subject_nll(
+                                    model,
+                                    &population.subjects[i],
+                                    &theta,
+                                    &etas[i],
+                                    &kappas[i],
+                                    &omega_cur,
+                                    omega_iov_cur.as_ref(),
+                                    &sigma,
+                                    &mut scratch,
+                                    schedules[i].as_ref(),
+                                )
+                            })
+                            .collect();
+                        let sum_cur: f64 = nll.iter().sum();
+                        let sum_prop: f64 = nll_prop.iter().sum();
+                        let d_nlp =
+                            0.5 * ((u_new - u0[c]).powi(2) - (u_old - u0[c]).powi(2)) * inv_var;
+                        if sum_prop.is_finite()
+                            && rng.random::<f64>().ln() < (sum_cur - sum_prop) - d_nlp
+                        {
+                            nll = nll_prop;
+                            shift_acc[p] += 1;
+                        } else {
+                            theta[t] = old_theta;
+                            for e in etas.iter_mut() {
+                                e[k] += delta;
+                            }
+                        }
+                    }
+
                     // (b) Joint adaptive-covariance (Haario) proposal — an ADDITIONAL
                     // move, available once `prop_chol` is built. Proposes all
                     // coordinates together along the estimated posterior covariance,
@@ -1905,6 +1993,16 @@ pub fn run_bayes(
                             dens_step[g] = (dens_step[g] * (r - 0.44).exp()).clamp(1e-3, 10.0);
                             dens_acc[g] = 0;
                             dens_prop[g] = 0;
+                        }
+                    }
+                    // θ–z shift steps (#1716): a one-dimensional move, ≈0.44 target.
+                    for p in 0..shift_scales.len() {
+                        if shift_prop[p] > 0 {
+                            let r = shift_acc[p] as f64 / shift_prop[p] as f64;
+                            shift_scales[p] =
+                                (shift_scales[p] * (r - 0.44).exp()).clamp(1e-4, 10.0);
+                            shift_acc[p] = 0;
+                            shift_prop[p] = 0;
                         }
                     }
                     // Componentwise scales (bootstrap kernel).
@@ -2459,6 +2557,7 @@ fn blocks_with(
             shape_thetas: vec![],
             trunc: None,
             margins: vec![DensityKind::Normal; m],
+            log_anchors: Vec::new(),
         });
     }
     out
@@ -4180,6 +4279,10 @@ mod tests {
     /// against them. TVV of the bioavailability model is a non-mu-referenced
     /// θ (random walk), its posterior sits near 50, and the bounds here cut
     /// through it on both sides.
+    /// TVCL's R̂ in `run_bayes_random_walk_theta_respects_its_bounds`: measured 1.062 with the
+    /// θ–η shift move; without it TVCL was the worst parameter, above THETA_F's 1.555.
+    const SHIFT_TVCL_RHAT_MAX: f64 = 1.2;
+
     #[test]
     fn run_bayes_random_walk_theta_respects_its_bounds() {
         use std::path::Path;
@@ -4237,9 +4340,21 @@ mod tests {
             .find(|w| w.starts_with("Bayes: max split-R-hat"))
             .expect("non-convergence warning");
         assert!(w.contains(&format!(" on {} — ", worst.name)), "{w}");
-        // Measured: the worst is TVCL, a log mu-reference left to the random
-        // walk because ETA_F (logit) is not covered.
-        assert_eq!(worst.name, "TVCL", "{w}");
-        assert!(w.contains("It is already log mu-referenced"), "{w}");
+        // Measured: the worst is THETA_F, the logit θ the conjugate move cannot take.
+        // Before #1716's θ–η shift move it was TVCL: a log mu-reference left to the
+        // random walk because ETA_F (logit) is not covered, pinned there at fixed η.
+        // The shift moves it now, so TVCL's R̂ sits far below THETA_F's.
+        assert_eq!(worst.name, "THETA_F", "{w}");
+        assert!(
+            w.contains("make it a log mu-referenced typical value"),
+            "{w}"
+        );
+        let tvcl = b.summaries.iter().find(|s| s.name == "TVCL").expect("TVCL");
+        eprintln!("R̂: THETA_F {:.3}, TVCL {:.3}", worst.rhat, tvcl.rhat);
+        assert!(
+            tvcl.rhat.is_finite() && tvcl.rhat < SHIFT_TVCL_RHAT_MAX,
+            "TVCL R̂ {}: the shift move no longer mixes it",
+            tvcl.rhat
+        );
     }
 }

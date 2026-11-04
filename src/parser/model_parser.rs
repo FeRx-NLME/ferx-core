@@ -5922,6 +5922,22 @@ pub fn parse_full_model_with(
                 .flat_map(|d| d.etas.iter().map(|&k| &kappa_names[k])),
         )
         .collect();
+    // ... but a density ETA read as `THETA * exp(z)` keeps that pair as its log anchor,
+    // for Bayes's θ–z shift move (`EtaDensity::log_anchors`).
+    let mut eta_densities = eta_densities;
+    for d in eta_densities.iter_mut() {
+        d.log_anchors = d
+            .etas
+            .iter()
+            .map(|&k| {
+                let (mr, _) = all_mu_refs_owned.get(&eta_names_bsv[k])?;
+                if !mr.log_transformed() {
+                    return None;
+                }
+                theta_names.iter().position(|t| t == &mr.theta_name)
+            })
+            .collect();
+    }
     all_mu_refs_owned.retain(|eta, _| !density_eta_names.contains(&eta));
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     // Owners of the BSV mu-refs, kept crate-private behind `indiv_param_partials`
@@ -8914,6 +8930,7 @@ fn resolve_eta_densities(
             shape_thetas,
             trunc,
             margins,
+            log_anchors: Vec::new(),
         });
     }
     Ok(out)
