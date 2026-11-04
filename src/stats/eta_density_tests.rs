@@ -13,6 +13,7 @@ fn group(kind: DensityKind, etas: Vec<usize>, shape: Vec<usize>) -> EtaDensity {
         etas,
         shape_thetas: shape,
         trunc: None,
+        margins: vec![],
     }
 }
 
@@ -57,7 +58,7 @@ fn latent_expectation(
         },
         -40.0,
         40.0,
-        400_000,
+        40_000,
     )
 }
 
@@ -381,6 +382,7 @@ fn a_truncated_density_is_the_renormalised_kind() {
             etas: vec![0],
             shape_thetas: (0..sh.len()).collect(),
             trunc: Some(Truncation { lo, hi }),
+            margins: vec![],
         };
         let val = |b: Bound, open: f64| match b {
             Bound::Value(v) => v,
@@ -428,8 +430,8 @@ fn a_truncated_density_is_the_renormalised_kind() {
             }),
             xb,
         );
-        let den = simpson(p, xa, xb, 2_000_000);
-        let want = simpson(|x| x * p(x), xa, xb, 2_000_000) / den;
+        let den = simpson(p, xa, xb, 200_000);
+        let want = simpson(|x| x * p(x), xa, xb, 200_000) / den;
         eprintln!(
             "{kind:?}: mass − 1 {:.2e}, mean {mean:.6} vs {want:.6}",
             mass - 1.0
@@ -437,6 +439,201 @@ fn a_truncated_density_is_the_renormalised_kind() {
         assert!(mass.is_finite() && mean.is_finite(), "{kind:?}");
         worst = worst.max((mass - 1.0).abs()).max((mean - want).abs());
     }
-    // Placeholder until measured.
-    assert!(worst < 1e-6, "worst {worst:.2e}");
+    eprintln!("truncated: worst {worst:.2e}");
+    // Measured 3.99e-12 (the 200 000-panel Simpson reference); 25× headroom.
+    assert!(worst < 1e-10, "worst {worst:.2e}");
+}
+
+/// A Gaussian copula whose margins are all `normal` is the multivariate normal, exactly:
+/// its correction vanishes for every latent and correlation.
+/// Dies under: a wrong copula term (`ln|R|`, `R⁻¹ − I`) or the margins' variances not
+/// read off Ω's diagonal.
+#[test]
+fn a_gaussian_copula_is_the_multivariate_normal() {
+    let omega = DMatrix::from_row_slice(
+        3,
+        3,
+        &[0.09, 0.02, -0.01, 0.02, 0.05, 0.01, -0.01, 0.01, 0.04],
+    );
+    let oi = omega.clone().try_inverse().unwrap();
+    let d = EtaDensity {
+        kind: DensityKind::Copula,
+        etas: vec![0, 1, 2],
+        shape_thetas: vec![],
+        trunc: None,
+        margins: vec![DensityKind::Normal; 3],
+    };
+    let mut worst = 0.0f64;
+    for z in [[0.1, -0.2, 0.3], [-0.5, 0.4, 0.05], [0.0, 0.0, 0.0]] {
+        worst = worst.max(correction(std::slice::from_ref(&d), &z, &oi, &[]).abs());
+    }
+    eprintln!("copula of normals vs MVN: worst {worst:.2e}");
+    // Measured 4.44e-15 (rounding: the correction is identically 0); 20× headroom.
+    assert!(worst < 1e-13, "worst {worst:.2e}");
+}
+
+/// A copula of a gamma and a beta margin integrates to 1 over the latent plane (2-D
+/// Simpson), and each margin keeps its own documented mean: the copula couples the
+/// margins without changing them.
+/// Dies under: the copula density's Jacobian (`Σ −2 ln pₖ`) or its normaliser wrong.
+#[test]
+fn a_copula_integrates_to_one_and_keeps_its_margins() {
+    let omega = DMatrix::from_row_slice(2, 2, &[0.12, 0.02, 0.02, 0.02]);
+    let oi = omega.clone().try_inverse().unwrap();
+    let ld = omega.determinant().ln();
+    let d = EtaDensity {
+        kind: DensityKind::Copula,
+        etas: vec![0, 1],
+        shape_thetas: vec![0],
+        trunc: None,
+        margins: vec![DensityKind::Gamma, DensityKind::Beta],
+    };
+    let theta = [0.3];
+    let p = |z0: f64, z1: f64| {
+        let z = [z0, z1];
+        let q = oi[(0, 0)] * z0 * z0 + 2.0 * oi[(0, 1)] * z0 * z1 + oi[(1, 1)] * z1 * z1;
+        let v = q + ld + 2.0 * LN_2PI + correction(std::slice::from_ref(&d), &z, &oi, &theta);
+        if v.is_finite() {
+            (-0.5 * v).exp()
+        } else {
+            0.0
+        }
+    };
+    let n = 800;
+    let (a, b) = (-12.0, 12.0);
+    let h = (b - a) / n as f64;
+    let wgt = |i: usize| {
+        if i == 0 || i == n {
+            1.0
+        } else if i % 2 == 1 {
+            4.0
+        } else {
+            2.0
+        }
+    };
+    let (mut mass, mut m0, mut m1) = (0.0, 0.0, 0.0);
+    for i in 0..=n {
+        for j in 0..=n {
+            let (z0, z1) = (a + i as f64 * h, a + j as f64 * h);
+            let w = wgt(i) * wgt(j) * p(z0, z1);
+            mass += w;
+            m0 += w * z0.exp();
+            m1 += w * 1.0 / (1.0 + (-z1).exp());
+        }
+    }
+    let k = h * h / 9.0;
+    let (mass, m0, m1) = (mass * k, m0 * k / (mass * k), m1 * k / (mass * k));
+    eprintln!(
+        "copula: mass − 1 {:.2e}, gamma mean {m0:.8}, beta mean {m1:.8}",
+        mass - 1.0
+    );
+    // Measured: mass − 1 = −1.44e-13, both margins' means at 1e-8 printed precision;
+    // bounds with ≥ 100× headroom on the mass.
+    assert!((mass - 1.0).abs() < 1e-11 && (m0 - 1.0).abs() < 1e-8 && (m1 - 0.3).abs() < 1e-8);
+}
+
+/// `lognormal` on a block is the multivariate log-normal of mean 1 and covariance Ω:
+/// the sampler's draws have that mean and covariance, and its latent density at a point
+/// is the textbook `N(ln η; −diag(S)/2, S)` with `S = ln(1 + Ω)`.
+/// Dies under: `S` taken as Ω, or the mean shift dropped.
+#[test]
+fn the_block_lognormal_is_the_multivariate_lognormal() {
+    use rand::SeedableRng;
+    let omega: DMatrix<f64> = DMatrix::from_row_slice(2, 2, &[0.09, 0.03, 0.03, 0.05]);
+    let oi = omega.clone().try_inverse().unwrap();
+    let d = EtaDensity {
+        kind: DensityKind::LogNormal,
+        etas: vec![0, 1],
+        shape_thetas: vec![],
+        trunc: None,
+        margins: vec![],
+    };
+    let s = DMatrix::from_fn(2, 2, |i, j| f64::ln_1p(omega[(i, j)]));
+    let si = s.clone().try_inverse().unwrap();
+    let z = [0.1, -0.2];
+    let r = nalgebra::DVector::from_vec(vec![z[0] + s[(0, 0)] / 2.0, z[1] + s[(1, 1)] / 2.0]);
+    let want = (r.transpose() * &si * &r)[(0, 0)] + s.determinant().ln() + 2.0 * LN_2PI;
+    let q = oi[(0, 0)] * z[0] * z[0] + 2.0 * oi[(0, 1)] * z[0] * z[1] + oi[(1, 1)] * z[1] * z[1];
+    let got = q
+        + omega.determinant().ln()
+        + 2.0 * LN_2PI
+        + correction(std::slice::from_ref(&d), &z, &oi, &[]);
+    assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1716);
+    let chol = omega.clone().cholesky().unwrap().l();
+    let n = 100_000;
+    let (mut m, mut c) = ([0.0f64; 2], [[0.0f64; 2]; 2]);
+    let mut xs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let zz = nalgebra::DVector::from_fn(2, |_, _| {
+            rand_distr::Distribution::sample(&rand_distr::StandardNormal, &mut rng)
+        });
+        let mut e: Vec<f64> = (&chol * zz).iter().copied().collect();
+        redraw_latents(std::slice::from_ref(&d), &omega, &[], &mut e, &mut rng);
+        let x = [e[0].exp(), e[1].exp()];
+        m[0] += x[0];
+        m[1] += x[1];
+        xs.push(x);
+    }
+    m = [m[0] / n as f64, m[1] / n as f64];
+    for x in &xs {
+        for i in 0..2 {
+            for j in 0..2 {
+                c[i][j] += (x[i] - m[i]) * (x[j] - m[j]) / (n - 1) as f64;
+            }
+        }
+    }
+    eprintln!("mvlognormal: mean {m:?}, cov {c:?}");
+    // 100 000 draws: the mean's SE is ≈ 1e-3, the covariance's ≈ 5e-4.
+    assert!((m[0] - 1.0).abs() < 5e-3 && (m[1] - 1.0).abs() < 5e-3);
+    assert!((c[0][1] - 0.03).abs() < 3e-3 && (c[0][0] - 0.09).abs() < 5e-3);
+}
+
+/// The reported percentiles of a density's effect (#1716) against closed forms: a
+/// normal, a log-normal (mean 1, variance ω: `ln η ~ N(−s/2, s)`, `s = ln(1 + ω)`), a
+/// Cauchy, whose 95th percentile at `ω = 4` (`2·tan(0.45π) = 12.6`) lies outside the
+/// first ±40·√ω bracket only after the CDF's slow tail is searched — the widening is
+/// what reaches it — and a normal truncated to `[0, ∞)`, the half-normal.
+#[test]
+fn effect_quantiles_are_the_closed_forms() {
+    use crate::stats::special::normal_inv_cdf as zq;
+    let dist = |kind: &str, trunc| crate::types::EtaDistribution {
+        form: "density".into(),
+        kind: kind.into(),
+        shape_thetas: vec![],
+        truncation: trunc,
+    };
+    let p = [0.05, 0.5, 0.95];
+    let mut worst = 0.0f64;
+    let mut check = |got: Option<[f64; 3]>, want: [f64; 3]| {
+        let got = got.expect("a distribution");
+        for (g, w) in got.iter().zip(want) {
+            assert!(g.is_finite(), "{got:?}");
+            worst = worst.max(((g - w) / w.abs().max(1.0)).abs());
+        }
+    };
+    let w = 0.09;
+    check(
+        effect_quantiles(&dist("normal", None), w, &[]),
+        p.map(|p| w.sqrt() * zq(p)),
+    );
+    let s = (1.0f64 + w).ln();
+    check(
+        effect_quantiles(&dist("lognormal", None), w, &[]),
+        p.map(|p| (-s / 2.0 + s.sqrt() * zq(p)).exp()),
+    );
+    check(
+        effect_quantiles(&dist("cauchy", None), 4.0, &[]),
+        p.map(|p| 2.0 * (std::f64::consts::PI * (p - 0.5)).tan()),
+    );
+    check(
+        effect_quantiles(&dist("normal", Some((Some(0.0), None))), w, &[]),
+        p.map(|p| w.sqrt() * zq(0.5 + 0.5 * p)),
+    );
+    // Measured: 4.6e-9 worst (normal_inv_cdf's own accuracy); bound with 20× headroom.
+    eprintln!("effect_quantiles worst relative error {worst:e}");
+    assert!(worst < 1e-7, "{worst:e}");
+    // No distribution: an unknown kind, a non-positive ω.
+    assert!(effect_quantiles(&dist("nope", None), w, &[]).is_none());
+    assert!(effect_quantiles(&dist("normal", None), 0.0, &[]).is_none());
 }

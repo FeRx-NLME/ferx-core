@@ -2290,7 +2290,7 @@ fn objective<T: crate::sens::num::PkNum, const N: usize>(
 ) -> Option<(T, [T; N])> {
     if interaction {
         focei_f_grad(ctx, f, g, eta, p)
-    } else if !ctx.model.eta_densities.is_empty() {
+    } else if !ctx.densities.is_empty() {
         // FOCE under a density (#1716): the conditional form, and the EBE's inner gradient
         // under FOCE's frozen variance where it has one (as `objective_ng`).
         let (fv, lg) = crate::sens::focei_kernel::foce_f_grad_density(ctx, f, g, eta, p)?;
@@ -3700,7 +3700,7 @@ fn tape_params(
 /// random-effect density's shape θ (ν, μ), which only the prior reads (#1716).
 fn theta_read_directly(model: &CompiledModel) -> bool {
     model.frem_config.is_some()
-        || !model.eta_densities.is_empty()
+        || model.has_densities()
         || model
             .ruv_magnitude
             .as_ref()

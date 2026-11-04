@@ -3211,6 +3211,7 @@ fn emit_eta_infos(
             param_type: scale(ei),
             linked_theta: None,
             individual_param_name: param_name.to_owned(),
+            distribution: None,
         });
     }
 }
@@ -3922,6 +3923,7 @@ fn apply_class(
         param_type: c.param_type,
         linked_theta: linked,
         individual_param_name: param_name.to_owned(),
+        distribution: None,
     });
 }
 
@@ -4258,12 +4260,32 @@ pub fn parse_full_model_with(
         unbound_level_blocks,
         declared_priors,
     ) = parse_parameters(param_lines, level_bindings)?;
-    let eta_densities = resolve_eta_densities(param_lines, &eta_names_bsv, &thetas, |e| {
-        omegas.iter().any(|o| o.name == e && o.fixed)
-            || block_omegas
-                .iter()
-                .any(|b| b.fixed && b.names.iter().any(|n| n == e))
-    })?;
+    let eta_densities = resolve_eta_densities(
+        param_lines,
+        &eta_names_bsv,
+        &thetas,
+        |e| {
+            omegas.iter().any(|o| o.name == e && o.fixed)
+                || block_omegas
+                    .iter()
+                    .any(|b| b.fixed && b.names.iter().any(|n| n == e))
+        },
+        false,
+    )?;
+    // #1716: the IOV κ densities, over κ positions `0..n_kappa` against Ω_IOV.
+    let kappa_densities = resolve_eta_densities(
+        param_lines,
+        &kappa_info.names_ordered,
+        &thetas,
+        |e| {
+            kappa_info.diagonal.iter().any(|k| k.name == e && k.fixed)
+                || kappa_info
+                    .block
+                    .iter()
+                    .any(|b| b.fixed && b.names.iter().any(|n| n == e))
+        },
+        true,
+    )?;
     // Install the θ level table for the remainder of this parse so a
     // gather (`PLACEBO[IDX]`) resolves identically in every block that parses
     // expressions. Dropped at the end of `parse_full_model`, restoring whatever
@@ -4726,13 +4748,30 @@ pub fn parse_full_model_with(
     // `[individual_parameters]` is wrapped, on the AST, before mu-reference detection.
     // A read in any other block would see the latent instead, a plausible wrong answer,
     // so it is refused, as a weighted kappa's is.
+    // A κ is the leaf `Eta(n_eta + k)` here, so a κ group's slots are offset.
+    let n_bsv = eta_names_bsv.len();
     let density_maps: HashMap<usize, Expression> = eta_densities
         .iter()
-        .filter_map(|d| {
-            d.read_expr(Expression::Eta(d.etas[0]))
-                .map(|e| (d.etas[0], e))
+        .map(|d| (d, 0))
+        .chain(kappa_densities.iter().map(|d| (d, n_bsv)))
+        .flat_map(|(d, off)| {
+            d.etas.iter().enumerate().filter_map(move |(i, &k)| {
+                d.read_expr(i, Expression::Eta(off + k))
+                    .map(|e| (off + k, e))
+            })
         })
         .collect();
+    for d in &kappa_densities {
+        for &k in &d.etas {
+            if weighted_kappa_slots.contains_key(&(n_bsv + k)) {
+                return Err(format!(
+                    "[parameters] kappa `{}` carries both a `weight = …` and a `density`: a \
+                     weight scales a Gaussian κ's variance, which a density does not have",
+                    kappa_names[k]
+                ));
+            }
+        }
+    }
     if !density_maps.is_empty() {
         let named_blocks = extracted
             .named
@@ -4744,10 +4783,25 @@ pub fn parse_full_model_with(
             .map(|(b, l)| (b.clone(), l))
             .chain(named_blocks)
         {
+            // A `[mixture]` class's `omega(k) ETA ~ v` names the ETA's variance, not
+            // its value, so it is no read.
+            let read_lines: Vec<String> = lines
+                .iter()
+                .filter(|l| {
+                    let t = l.trim_start().to_ascii_lowercase();
+                    block != "mixture"
+                        || !(t.starts_with("omega") && t[5..].trim_start().starts_with('('))
+                })
+                .cloned()
+                .collect();
             let mut refs: HashSet<String> = HashSet::new();
-            collect_referenced_identifiers(lines, &mut refs);
+            collect_referenced_identifiers(&read_lines, &mut refs);
             for &slot in density_maps.keys() {
-                let name = &eta_names_bsv[slot];
+                let name = if slot < n_bsv {
+                    &eta_names_bsv[slot]
+                } else {
+                    &kappa_names[slot - n_bsv]
+                };
                 if refs.contains(&name.to_ascii_uppercase()) {
                     return Err(format!(
                         "[{block}] reads `{name}`, whose `density` puts the random effect on a \
@@ -5837,6 +5891,11 @@ pub fn parse_full_model_with(
     let density_eta_names: Vec<&String> = eta_densities
         .iter()
         .flat_map(|d| d.etas.iter().map(|&k| &eta_names_bsv[k]))
+        .chain(
+            kappa_densities
+                .iter()
+                .flat_map(|d| d.etas.iter().map(|&k| &kappa_names[k])),
+        )
         .collect();
     all_mu_refs_owned.retain(|eta, _| !density_eta_names.contains(&eta));
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
@@ -5965,6 +6024,82 @@ pub fn parse_full_model_with(
             info.param_type = crate::types::EtaParamType::Custom;
         }
     }
+    // #1716: what each non-Gaussian ETA follows, for reporting.
+    {
+        use crate::stats::eta_density::{Bound, DensityKind};
+        let mut dist: HashMap<usize, crate::types::EtaDistribution> = HashMap::new();
+        for d in &eta_densities {
+            let copula = d.kind == DensityKind::Copula;
+            let bound = |b: Bound| match b {
+                Bound::Open => None,
+                Bound::Value(v) => Some(v),
+                Bound::Shape(p) => Some(default_params.theta[d.shape_thetas[p]]),
+            };
+            // A copula's margins own consecutive runs of `shape_thetas`; every other
+            // group's ETAs share its leading `kind.shapes()` (a truncation's bound θs
+            // follow them).
+            let mut at = 0;
+            for (i, &k) in d.etas.iter().enumerate() {
+                let kind = if copula { d.margins[i] } else { d.kind };
+                let m = kind.shapes().len();
+                let start = if copula { at } else { 0 };
+                let shapes = d.shape_thetas[start..start + m]
+                    .iter()
+                    .map(|&t| theta_names[t].clone())
+                    .collect();
+                if copula {
+                    at += m;
+                }
+                dist.insert(
+                    k,
+                    crate::types::EtaDistribution {
+                        form: "density".into(),
+                        kind: kind.name().to_string(),
+                        shape_thetas: shapes,
+                        truncation: d.trunc.map(|t| (bound(t.lo), bound(t.hi))),
+                    },
+                );
+            }
+        }
+        // Shape transforms: every `BinOp::Shape(kind, Value)` whose η side is one ETA.
+        for st in &indiv_stmts {
+            visit_stmt_nodes(std::slice::from_ref(st), &mut |e: &Expression| {
+                if let Expression::BinOp(
+                    l,
+                    BinOp::Shape(kind, crate::parser::eta_shape::ShapeOut::Value),
+                    r,
+                ) = e
+                {
+                    if let Expression::Eta(k) = **l {
+                        if k < eta_names_bsv.len() {
+                            let shapes = match **r {
+                                Expression::Theta(t) => vec![theta_names[t].clone()],
+                                _ => vec![],
+                            };
+                            dist.entry(k).or_insert(crate::types::EtaDistribution {
+                                form: "transform".into(),
+                                kind: kind.name().to_string(),
+                                shape_thetas: shapes,
+                                truncation: None,
+                            });
+                        }
+                    }
+                }
+            });
+        }
+        for info in eta_param_info.iter_mut() {
+            if let Some(k) = eta_names_bsv.iter().position(|n| n == &info.eta_name) {
+                info.distribution = dist.remove(&k);
+            }
+        }
+    }
+    for d in &kappa_densities {
+        for &k in &d.etas {
+            if let Some(t) = kappa_param_types.get_mut(k) {
+                *t = crate::types::EtaParamType::Custom;
+            }
+        }
+    }
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
@@ -6074,6 +6209,7 @@ pub fn parse_full_model_with(
 
     let model = CompiledModel {
         eta_densities,
+        kappa_densities,
         residual_serial: residual_serial.clone(),
         priors: declared_priors,
         // `[priors] from_fit` is read further down, once `extract_blocks` output
@@ -8451,10 +8587,14 @@ fn resolve_eta_densities(
     eta_names: &[String],
     thetas: &[ThetaSpec],
     omega_fixed: impl Fn(&str) -> bool,
+    kappas: bool,
 ) -> Result<Vec<crate::stats::eta_density::EtaDensity>, String> {
     use crate::stats::eta_density::{Bound, DensityKind, EtaDensity, Truncation};
     let mut out = Vec::new();
-    for mut d in crate::parser::eta_shape::omega_density_decls(param_lines)? {
+    for mut d in crate::parser::eta_shape::omega_density_decls(param_lines)?
+        .into_iter()
+        .filter(|d| d.kappa == kappas)
+    {
         // `truncated(KIND[(SHAPES)], LO, HI)`: the inner kind and its shapes take the place
         // of the clause's, and the bounds are read last.
         let mut trunc_args: Option<(String, String)> = None;
@@ -8473,6 +8613,45 @@ fn resolve_eta_densities(
                 d.line
             ));
         }
+        // `normal` is the default Gaussian: no density group.
+        if kind == DensityKind::Normal {
+            continue;
+        }
+        // A copula's margins, one per ETA in declaration order, and their shape arguments.
+        let mut margins: Vec<DensityKind> = Vec::new();
+        let mut margin_args: Vec<(String, DensityKind, Vec<String>)> = Vec::new();
+        if kind == DensityKind::Copula {
+            if d.args.len() != d.etas.len() {
+                return Err(format!(
+                    "[parameters] `density copula(…)` takes one margin per ETA of its block: `{}`",
+                    d.line
+                ));
+            }
+            for (spec, e) in d.args.iter().zip(&d.etas) {
+                let (name, sh) =
+                    crate::parser::eta_shape::parse_kind_spec(spec).ok_or_else(|| {
+                        format!(
+                            "[parameters] cannot read the copula margin `{spec}`: `{}`",
+                            d.line
+                        )
+                    })?;
+                let mk = DensityKind::from_name(&name)
+                    .ok_or_else(|| crate::parser::eta_shape::unknown_density(&name, &d.line))?;
+                if mk == DensityKind::Copula || mk.omega_unused() && !omega_fixed(e) {
+                    return Err(format!(
+                        "[parameters] the copula margin `{name}` of `{e}` is {}: `{}`",
+                        if mk == DensityKind::Copula {
+                            "a copula"
+                        } else {
+                            "fixed-spread, so its omega must be FIX"
+                        },
+                        d.line
+                    ));
+                }
+                margins.push(mk);
+                margin_args.push((name, mk, sh.unwrap_or_default()));
+            }
+        }
         if d.etas.len() > 1 && !kind.allows_block() {
             return Err(format!(
                 "[parameters] `density {}` is univariate: a block of correlated ETAs can be \
@@ -8483,14 +8662,35 @@ fn resolve_eta_densities(
         }
         let mut etas = Vec::with_capacity(d.etas.len());
         for e in &d.etas {
-            etas.push(
-                eta_names.iter().position(|n| n == e).ok_or_else(|| {
-                    format!("[parameters] `{e}` in `{}` is not a BSV ETA", d.line)
-                })?,
-            );
+            etas.push(eta_names.iter().position(|n| n == e).ok_or_else(|| {
+                format!(
+                    "[parameters] `{e}` in `{}` is not a declared random effect",
+                    d.line
+                )
+            })?);
         }
         etas.sort_unstable();
-        let specs = kind.shapes();
+        let specs: Vec<crate::stats::eta_density::ShapeSpec> = if kind == DensityKind::Copula {
+            let mut v = Vec::new();
+            for (name, mk, sh) in &margin_args {
+                if sh.len() != mk.shapes().len() {
+                    return Err(format!(
+                        "[parameters] the copula margin `{name}` takes {} shape θ (got {}): `{}`",
+                        mk.shapes().len(),
+                        sh.len(),
+                        d.line
+                    ));
+                }
+                v.extend_from_slice(mk.shapes());
+            }
+            d.args = margin_args
+                .iter()
+                .flat_map(|(_, _, sh)| sh.clone())
+                .collect();
+            v
+        } else {
+            kind.shapes().to_vec()
+        };
         let want = specs.len();
         if d.args.len() != want {
             return Err(format!(
@@ -8512,7 +8712,10 @@ fn resolve_eta_densities(
                 d.line
             ));
         }
-        if kind.omega_unused() && !d.etas.iter().all(|e| omega_fixed(e)) {
+        if kind != DensityKind::Copula
+            && kind.omega_unused()
+            && !d.etas.iter().all(|e| omega_fixed(e))
+        {
             return Err(format!(
                 "[parameters] `density {}` has no free spread, so its omega value is unused: \
                  declare it `FIX` (e.g. `omega {} ~ 1 FIX density {}`): `{}`",
@@ -8520,7 +8723,7 @@ fn resolve_eta_densities(
             ));
         }
         let mut shape_thetas = Vec::with_capacity(want);
-        for (a, sp) in d.args.iter().zip(specs) {
+        for (a, sp) in d.args.iter().zip(specs.iter()) {
             let k = thetas.iter().position(|t| &t.name == a).ok_or_else(|| {
                 format!(
                     "[parameters] `{a}` in `{}` is not a declared θ — declare it, or write \
@@ -8604,6 +8807,7 @@ fn resolve_eta_densities(
             etas,
             shape_thetas,
             trunc,
+            margins,
         });
     }
     Ok(out)
@@ -12685,6 +12889,29 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "seed" | "saem_seed" => opts.saem_seed = parse_u64_opt("seed")?,
         "bayes_warmup" => opts.bayes_warmup = parse_usize("bayes_warmup")?,
+        "bayes_omega_prior" | "omega_prior" => {
+            let v = value.trim().to_ascii_lowercase();
+            opts.bayes_omega_prior = match v.as_str() {
+                "inversewishart" | "iw" => crate::types::OmegaPrior::InverseWishart,
+                "wishart" => crate::types::OmegaPrior::Wishart,
+                "lkj" | "lkjcholesky" => crate::types::OmegaPrior::Lkj { eta: 1.0 },
+                _ => {
+                    let inner = v
+                        .strip_prefix("lkjcholesky(")
+                        .or_else(|| v.strip_prefix("lkj("))
+                        .and_then(|r| r.strip_suffix(')'))
+                        .and_then(|r| r.trim().parse::<f64>().ok())
+                        .filter(|e| *e > 0.0)
+                        .ok_or_else(|| {
+                            format!(
+                                "bayes_omega_prior: expected `inversewishart`, `wishart` or \
+                                 `lkj(η)` with η > 0, got `{value}`"
+                            )
+                        })?;
+                    crate::types::OmegaPrior::Lkj { eta: inner }
+                }
+            };
+        }
         "bayes_iters" => opts.bayes_iters = parse_usize("bayes_iters")?,
         "bayes_chains" => opts.bayes_chains = parse_usize("bayes_chains")?,
         "bayes_thin" => opts.bayes_thin = parse_usize("bayes_thin")?,
@@ -19379,7 +19606,12 @@ fn parse_parameters(
         let (line, dist_clause) = crate::parser::eta_shape::split_dist_clause(&line)?;
         if let Some(c) = &dist_clause {
             let kw = crate::parser::eta_shape::decl_keyword(&line);
-            if c.transform || !(kw == "omega" || kw == "block_omega") {
+            if c.transform
+                || !matches!(
+                    kw.as_str(),
+                    "omega" | "block_omega" | "kappa" | "block_kappa"
+                )
+            {
                 return Err(format!(
                     "[parameters] a `{}` clause belongs on an `omega` or `block_omega` \
                      declaration{}: `{}`",

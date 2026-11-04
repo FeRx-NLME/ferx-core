@@ -2,7 +2,8 @@
 //! `simulate()` entry points.
 //!
 //! Tier 2: every estimator that scores a density runs a few iterations on one and returns
-//! a finite objective, and the ones that do not yet refuse with `E_DENSITY_UNSUPPORTED`.
+//! a finite objective, on every omega-line form (copula, multivariate log-normal,
+//! truncation, a `[mixture]` override, an IOV κ) and under each Bayes Ω prior.
 //! Tier 3 (`slow-tests`): simulate a population with a Gamma clearance with ferx's own
 //! sampler, refit it, and recover the generating parameters, which is the only check that
 //! the sampler and the likelihood describe the same distribution.
@@ -111,18 +112,192 @@ fn every_density_estimator_runs() {
     }
 }
 
-/// VI's Ω step under `vi_omega_update = adam` follows the Gaussian prior's gradient, so a
-/// density refuses it by code (the default closed-form route serves a density).
+/// VI's Ω step under `vi_omega_update = adam` follows the Gaussian prior's gradient; a
+/// density group's ω and shape θ are the density M-step's instead, so Adam runs on a
+/// density model and the gamma's ω still moves.
 #[test]
-fn vi_adam_omega_refuses_a_density() {
+fn vi_adam_omega_runs_a_density() {
     let (model, pop) = model_and_data();
     let opts = FitOptions {
         vi_omega_update: ferx_core::types::ViOmegaUpdate::Adam,
         ..short(EstimationMethod::Vi, true)
     };
-    let e = ferx_core::fit(&model, &pop, &model.default_params, &opts).expect_err("refused");
-    let code = e.diagnostic().map(|d| d.code.clone());
-    assert_eq!(code.as_deref(), Some("E_DENSITY_UNSUPPORTED"), "{e}");
+    let r = ferx_core::fit(&model, &pop, &model.default_params, &opts).expect("VI + Adam");
+    assert!(r.ofv.is_finite(), "OFV {}", r.ofv);
+    assert_ne!(r.omega[(0, 0)], 0.09, "the gamma's ω moves");
+}
+
+/// `DENSITY_WARFARIN` with its omega lines and individual parameters replaced.
+fn variant(omegas: &str, indiv: &str, extra: &str) -> ferx_core::types::CompiledModel {
+    let src = DENSITY_WARFARIN
+        .replace(
+            "  omega ETA_CL ~ 0.09 density gamma\n  omega ETA_V  ~ 0.04 density t(NU)\n  omega ETA_KA ~ 0.30\n",
+            omegas,
+        )
+        .replace(
+            "  CL = TVCL * ETA_CL\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n",
+            indiv,
+        )
+        + extra;
+    parse_full_model(&src)
+        .unwrap_or_else(|e| panic!("{e}\n{src}"))
+        .model
+}
+
+/// The omega-line forms beyond a single kind — a Gaussian copula of two margins, a
+/// multivariate log-normal block, a truncated gamma, and a `[mixture]` class overriding a
+/// density ETA's ω — each fit under FOCEI and SAEM to a finite objective, SAEM moving the
+/// density's ω (only its density M-step can).
+#[test]
+fn every_omega_line_form_fits() {
+    let (_, pop) = model_and_data();
+    let plain = "  CL = TVCL * ETA_CL\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n";
+    let cases = [
+        (
+            "copula",
+            variant(
+                "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] density copula(gamma, t(NU))\n  omega ETA_KA ~ 0.30\n",
+                plain,
+                "",
+            ),
+        ),
+        (
+            "mvlognormal",
+            variant(
+                "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] density lognormal\n  omega ETA_KA ~ 0.30 density t(NU)\n",
+                "  CL = TVCL * ETA_CL\n  V  = TVV  * ETA_V\n  KA = TVKA * exp(ETA_KA)\n",
+                "",
+            ),
+        ),
+        (
+            "truncated",
+            variant(
+                "  omega ETA_CL ~ 0.09 density truncated(gamma, 0.2, 5)\n  omega ETA_V  ~ 0.04 density t(NU)\n  omega ETA_KA ~ 0.30\n",
+                plain,
+                "",
+            ),
+        ),
+        (
+            "mixture",
+            variant(
+                "  omega ETA_CL ~ 0.09 density gamma\n  omega ETA_V  ~ 0.04 density t(NU)\n  omega ETA_KA ~ 0.30\n",
+                "  CL = if (MIXNUM == 1) TVCL * ETA_CL else 2 * TVCL * ETA_CL\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n",
+                "\n[mixture]\n  nsub = 2\n  logit(1) = 0\n  omega(2) ETA_CL ~ 0.2\n",
+            ),
+        ),
+    ];
+    for (name, model) in &cases {
+        for method in [EstimationMethod::FoceI, EstimationMethod::Saem] {
+            let r = ferx_core::fit(model, &pop, &model.default_params, &short(method, true))
+                .unwrap_or_else(|e| panic!("{name} {method:?}: {e}"));
+            assert!(
+                r.ofv.is_finite() && r.ofv.abs() < 1e10,
+                "{name} {method:?}: OFV {}",
+                r.ofv
+            );
+            if method == EstimationMethod::Saem {
+                assert_ne!(r.omega[(0, 0)], 0.09, "{name}: SAEM moves the density's ω");
+            }
+        }
+    }
+}
+
+/// An IOV `kappa` with a density: FOCEI and SAEM fit it on warfarin's occasions, and SAEM's
+/// κ density M-step moves its ω.
+#[test]
+fn a_kappa_density_fits() {
+    let src = DENSITY_WARFARIN
+        .replace(
+            "  omega ETA_KA ~ 0.30\n",
+            "  omega ETA_KA ~ 0.30\n  kappa K_CL ~ 0.04 density gamma\n",
+        )
+        .replace("  CL = TVCL * ETA_CL\n", "  CL = TVCL * ETA_CL * K_CL\n")
+        + "\n[fit_options]\n  iov_column = OCC\n";
+    let parsed = parse_full_model(&src).expect("kappa density model parses");
+    let (pop, _) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        "data/warfarin_iov.csv",
+        None,
+        Some("OCC"),
+        None,
+        &[],
+    )
+    .expect("warfarin IOV data reads");
+    let model = parsed.model;
+    assert_eq!(model.kappa_densities.len(), 1);
+    for method in [EstimationMethod::FoceI, EstimationMethod::Saem] {
+        let opts = FitOptions {
+            iov_column: Some("OCC".into()),
+            ..short(method, true)
+        };
+        let r = ferx_core::fit(&model, &pop, &model.default_params, &opts)
+            .unwrap_or_else(|e| panic!("{method:?}: {e}"));
+        assert!(
+            r.ofv.is_finite() && r.ofv.abs() < 1e10,
+            "{method:?}: OFV {}",
+            r.ofv
+        );
+        if method == EstimationMethod::Saem {
+            let k = r.omega_iov.as_ref().expect("an IOV Ω")[(0, 0)];
+            assert_ne!(k, 0.04, "SAEM moves the κ density's ω");
+        }
+    }
+}
+
+/// `bayes_omega_prior = wishart | lkj(η)`: Bayes runs under each, every block moving by
+/// the Metropolis step, so the Gaussian ETA_KA's ω moves too.
+#[test]
+fn bayes_omega_priors_run() {
+    let (model, pop) = model_and_data();
+    for prior in [
+        ferx_core::types::OmegaPrior::Wishart,
+        ferx_core::types::OmegaPrior::Lkj { eta: 2.0 },
+    ] {
+        let opts = FitOptions {
+            bayes_omega_prior: prior,
+            ..short(EstimationMethod::Bayes, true)
+        };
+        let r = ferx_core::fit(&model, &pop, &model.default_params, &opts)
+            .unwrap_or_else(|e| panic!("{prior:?}: {e}"));
+        assert!(r.ofv.is_finite(), "{prior:?}: OFV {}", r.ofv);
+        assert_ne!(r.omega[(2, 2)], 0.30, "{prior:?} moves ETA_KA's ω");
+    }
+}
+
+/// A density ETA's omega row and YAML entry report its distribution and the percentiles
+/// of its effect; a Gaussian ETA's do not. The gamma's percentiles are those of a mean-1
+/// effect, so they straddle 1.
+#[test]
+fn a_density_eta_reports_its_distribution() {
+    let (model, pop) = model_and_data();
+    let r = ferx_core::fit(
+        &model,
+        &pop,
+        &model.default_params,
+        &short(EstimationMethod::FoceI, true),
+    )
+    .expect("FOCEI fit");
+    let note = ferx_core::io::output::eta_distribution_note(&r, 0).expect("ETA_CL's note");
+    assert!(note.starts_with("density gamma: 5/50/95% = "), "{note}");
+    let [lo, mid, hi] = ferx_core::io::output::eta_effect_quantiles(&r, 0).expect("quantiles");
+    assert!(lo < mid && mid < 1.0 && 1.0 < hi, "{lo} {mid} {hi}");
+    assert!(ferx_core::io::output::eta_distribution_note(&r, 1)
+        .expect("ETA_V's note")
+        .starts_with("density t(NU): "));
+    assert_eq!(ferx_core::io::output::eta_distribution_note(&r, 2), None);
+    let rows = ferx_core::io::output::format_omega_rows_from(
+        &ferx_core::io::output::OmegaRowsInput::from_result(&r),
+        Default::default(),
+    );
+    assert!(rows.contains(&note), "{rows}");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fit.yaml");
+    ferx_core::io::output::write_estimates_yaml(&r, path.to_str().unwrap()).unwrap();
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    assert!(yaml.contains("    distribution: gamma\n"), "{yaml}");
+    assert!(yaml.contains("    effect_quantiles_5_50_95: ["), "{yaml}");
+    eprintln!("{rows}");
 }
 
 /// Simulate 1000 subjects from known parameters with a Gamma clearance (ω = 0.16, so a

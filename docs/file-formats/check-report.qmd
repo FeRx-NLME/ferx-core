@@ -513,7 +513,7 @@ Refusals only `fit()` raises, from the model and options it is handed.
 
 | Code | Severity | Meaning |
 |------|----------|---------|
-| `E_DENSITY_UNSUPPORTED` | error | A `density` random effect ([Random-effect distributions](../model-file/random-effect-distributions.qmd), [#1716](https://github.com/FeRx-NLME/ferx-core/issues/1716)) beside a `[mixture]` or FREM, a multivariate t block under `method = bayes`, `vi_omega_update = adam`, or FOCE without interaction on a correlated residual. Raised by `fit()`. Block `parameters`. |
+| `E_DENSITY_UNSUPPORTED` | error | A `density` random effect ([Random-effect distributions](../model-file/random-effect-distributions.qmd), [#1716](https://github.com/FeRx-NLME/ferx-core/issues/1716)) on IOV κs that span two nested levels in one block. Raised by `fit()`. Block `parameters`. |
 
 #### File entry points {#codes-file-entry-points}
 

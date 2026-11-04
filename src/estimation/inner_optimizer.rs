@@ -5553,11 +5553,25 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
         let kappa_g = DVector::from_column_slice(&axes[base..base + w]);
         // A block carrying every κ in order (each one-level group) reads `Ω_iov⁻¹` as is;
         // only a nested level's subset is copied out (#2037).
-        let prior_kg = if ks.iter().copied().eq(0..omega_iov.inv.nrows()) {
+        let mut prior_kg = if ks.iter().copied().eq(0..omega_iov.inv.nrows()) {
             &omega_iov.inv * &kappa_g
         } else {
             &omega_iov.inv.select_rows(&ks).select_columns(&ks) * &kappa_g
         };
+        // #1716: the block's κ under the κ density groups it holds (every κ of a one-level
+        // occasion, a level's κs under nested levels).
+        if !model.kappa_densities.is_empty() {
+            let groups = crate::stats::eta_density::layout_groups(model, &[(ks.clone(), 0)]);
+            let local: Vec<_> = groups[model.eta_densities.len()..].to_vec();
+            let inv = omega_iov.inv.select_rows(&ks).select_columns(&ks);
+            crate::stats::eta_density::add_half_grad(
+                &local,
+                kappa_g.as_slice(),
+                &inv,
+                theta,
+                prior_kg.as_mut_slice(),
+            );
+        }
         for c in 0..w {
             grad[base + c] += prior_kg[c];
         }

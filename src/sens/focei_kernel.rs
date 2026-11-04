@@ -161,6 +161,9 @@ pub(crate) struct LikCtx<'a> {
     /// (`ErrorSpec::sigma_loading_shape`), read on access, so building the context allocates
     /// nothing per row — it is built for every subject at every gradient.
     keys: std::borrow::Cow<'a, [usize]>,
+    /// The density groups over the vector the kernel's prior reads (#1716): the BSV groups,
+    /// and under IOV each κ group per occasion of this subject (`stacked_groups`).
+    pub(crate) densities: std::borrow::Cow<'a, [crate::stats::eta_density::EtaDensity]>,
 }
 
 /// The most σ loadings one row has: the residual-error owner's bound.
@@ -174,12 +177,25 @@ impl<'a> LikCtx<'a> {
     ) -> Self {
         let keys = model.error_spec.obs_keys(subject);
         let cov = model.residual_cov_with(&params.residual_correlations, &params.theta);
+        // The κ groups over this subject's stacked (or, under nested levels, compact) axes.
+        let densities = if model.n_kappa > 0 && !model.kappa_densities.is_empty() {
+            match crate::stats::stacked_layout::StackedLayout::sens_of(model, subject) {
+                Some(l) => std::borrow::Cow::Owned(crate::stats::eta_density::layout_groups(
+                    model,
+                    &l.kappa_blocks(),
+                )),
+                None => std::borrow::Cow::Borrowed(model.eta_densities.as_slice()),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(model.eta_densities.as_slice())
+        };
         LikCtx {
             model,
             subject,
             params,
             cov,
             keys,
+            densities,
         }
     }
 
@@ -318,12 +334,12 @@ impl<'a> LikCtx<'a> {
                 .flat_map(|k| (0..n).map(move |l| (k, l)))
                 .map(|(k, l)| (oi[k][l], eta[k], eta[l])),
         ) + p.omega.log_det;
-        if self.model.eta_densities.is_empty() {
+        if self.densities.is_empty() {
             return gauss;
         }
         gauss
             + crate::stats::eta_density::correction_g(
-                &self.model.eta_densities,
+                &self.densities,
                 eta,
                 |a, b| oi[a][b],
                 |k| p.theta[k],
@@ -337,12 +353,12 @@ impl<'a> LikCtx<'a> {
         eta: &[T; N],
         p: &ParT<T>,
     ) -> Option<([T; N], [[T; N]; N])> {
-        if self.model.eta_densities.is_empty() {
+        if self.densities.is_empty() {
             return None;
         }
         let oi = &p.omega.inv;
         let (_, g, h) = crate::stats::eta_density::correction_jets_g(
-            &self.model.eta_densities,
+            &self.densities,
             eta,
             |a, b| oi[a][b],
             |k| p.theta[k],
@@ -1146,7 +1162,7 @@ pub(crate) fn exact_inner_hessian_kernel<T: PkNum, const N: usize, const M: usiz
     debug_assert!(active <= N, "active width {active} above the bucket {N}");
     // A density's prior curvature depends on η, which the through-predictions form does not
     // read: the generic route differentiates the prior, density included, by duals (#1716).
-    if reads_eta_directly(ctx) || !ctx.model.eta_densities.is_empty() {
+    if reads_eta_directly(ctx) || !ctx.densities.is_empty() {
         inner_hessian_generic(ctx, f, g, q, eta, p)
     } else {
         inner_hessian_through_predictions(ctx, f, g.as_flattened(), q.as_flattened(), N, active, p)

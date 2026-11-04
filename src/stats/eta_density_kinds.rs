@@ -323,6 +323,8 @@ pub(super) fn latent_neg2_logpdf<T: PkNum>(kind: DensityKind, z: T, w: T, s: &[T
     let pos = |lp: T| -> T { c::<T>(-2.0) * (lp + z) };
     match kind {
         K::StudentT => unreachable!("the t is scored over its block"),
+        K::Copula => unreachable!("a copula is scored over its block"),
+        K::Normal => z * z / w + w.ln() + ln2pi,
         K::Logistic => {
             let sc = (c::<T>(3.0) * w).sqrt() * c(1.0 / PI);
             let u = z / sc;
@@ -529,65 +531,34 @@ pub(super) fn latent_neg2_logpdf<T: PkNum>(kind: DensityKind, z: T, w: T, s: &[T
             }
             let sc = one / (k + lam);
             let y = z.exp() / sc;
-            let hl = lam * c(0.5);
-            // ln f_Y(y) = ln Σ_j Pois(j; λ/2) f_{χ²_{k+2j}}(y), to `e^{−40}` of its peak.
-            let mut terms = Vec::new();
-            let peak_j = hl.val().floor() as usize;
-            let mut j = 0usize;
-            loop {
-                let jf = j as f64;
-                let kk = k + c(2.0 * jf);
-                let lpois = -hl
-                    + c::<T>(jf)
-                        * if hl.val() > 0.0 {
-                            hl.ln()
-                        } else {
-                            c(f64::NEG_INFINITY)
-                        }
-                    - c::<T>(jf + 1.0).ln_gamma();
-                let lchi = (kk * c(0.5) - one) * y.ln()
-                    - y * c(0.5)
-                    - kk * c(0.5 * 2f64.ln())
-                    - (kk * c(0.5)).ln_gamma();
-                let t = if j == 0 && hl.val() == 0.0 {
-                    lchi
-                } else {
-                    lpois + lchi
-                };
-                let small = j > peak_j + 5
-                    && t.val()
-                        < terms
-                            .iter()
-                            .map(|v: &T| v.val())
-                            .fold(f64::NEG_INFINITY, f64::max)
-                            - 40.0;
-                terms.push(t);
-                if small || j > 100_000 || hl.val() == 0.0 {
-                    break;
-                }
-                j += 1;
-            }
-            pos(log_sum_exp(&terms) - sc.ln())
+            pos(ln_ncx2_pdf(y, k, lam) - sc.ln())
         }
         K::Kolmogorov => {
             let x = z.exp();
             // f(x) = 8x Σ (−1)^{k−1} k² e^{−2k²x²} for x ≥ 1, the theta-transformed series
             // below, each to rounding.
             let lf = if x.val() >= 1.0 {
+                // The leading `e^{−2x²}` factored out, as for x < 1: summed as is, it is
+                // subnormal by x ≈ 19.
                 let mut s = c::<T>(0.0);
                 for k in 1..=20 {
                     let kf = k as f64;
                     let sign = if k % 2 == 1 { 1.0 } else { -1.0 };
-                    s = s + c::<T>(sign * kf * kf) * (c::<T>(-2.0 * kf * kf) * x * x).exp();
+                    s = s + c::<T>(sign * kf * kf) * (c::<T>(-2.0 * (kf * kf - 1.0)) * x * x).exp();
                 }
-                (c::<T>(8.0) * x * s).ln()
+                (c::<T>(8.0) * x).ln() - c::<T>(2.0) * x * x + s.ln()
             } else {
+                // In log space, the leading `e^{−π²/(8x²)}` factored out: summed as is, it
+                // is subnormal by x ≈ 0.04 (its derivative overflowing) and 0 below.
+                let a1 = PI * PI;
                 let mut s = c::<T>(0.0);
                 for k in 1..=20 {
                     let a = ((2 * k - 1) as f64).powi(2) * PI * PI;
-                    s = s + (c::<T>(a / 4.0) / (x * x) - one) * (c::<T>(-a / 8.0) / (x * x)).exp();
+                    s = s
+                        + (c::<T>(a / 4.0) / (x * x) - one)
+                            * (c::<T>(-(a - a1) / 8.0) / (x * x)).exp();
                 }
-                c::<T>((2.0 * PI).sqrt()).ln() - two * x.ln() + s.ln()
+                c::<T>((2.0 * PI).sqrt()).ln() - two * x.ln() - c::<T>(a1 / 8.0) / (x * x) + s.ln()
             };
             pos(lf)
         }
@@ -657,6 +628,11 @@ pub(super) fn sample_eta(kind: DensityKind, w: f64, s: &[f64], rng: &mut impl ra
     }
     match kind {
         K::StudentT => unreachable!("the t is drawn over its block"),
+        K::Copula => unreachable!("a copula is drawn over its block"),
+        K::Normal => {
+            let n: f64 = StandardNormal.sample(rng);
+            w.sqrt() * n
+        }
         K::Logistic => {
             let u = draw_u(rng);
             (3.0 * w).sqrt() / PI * (u / (1.0 - u)).ln()
@@ -918,6 +894,95 @@ pub(super) fn eta_log_pdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> T
     c::<T>(-0.5) * latent_neg2_logpdf(kind, z, w, s) - log_jac
 }
 
+/// `ln f(y)` of the noncentral χ²(k, λ) density, over `T`. The Poisson-mixture series
+/// `Σ_j Pois(j; λ/2) f_{χ²_{k+2j}}(y)` costs ~√j* terms around its peak `j* ≈ √(λy)/2`,
+/// so far in the tail (`√(λy)` past [`NCX2_ASYMPTOTIC_FROM`]) it uses the Bessel form
+/// `f = ½ e^{−(y+λ)/2} (y/λ)^{k/4−½} I_{k/2−1}(√(λy))` with `I`'s large-argument
+/// expansion instead, which is exact to rounding there; the two are pinned against each
+/// other across the switch.
+pub(super) fn ln_ncx2_pdf<T: PkNum>(y: T, k: T, lam: T) -> T {
+    let x = (lam * y).sqrt();
+    if x.val() > NCX2_ASYMPTOTIC_FROM {
+        ln_ncx2_asymptotic(y, k, lam)
+    } else {
+        ln_ncx2_series(y, k, lam)
+    }
+}
+
+/// Where [`ln_ncx2_pdf`] switches to the Bessel asymptotic. Its m-th term shrinks the
+/// last by `|4ν² − (2m − 1)²| / (8mx)`, about `m/(2x)` for the small ν (`k/2 − 1`) the
+/// density meets, so at `x = 1000` sixteen terms leave a remainder far below rounding.
+pub(super) const NCX2_ASYMPTOTIC_FROM: f64 = 1000.0;
+
+/// The series form of [`ln_ncx2_pdf`]: the terms are unimodal in j, with ratio
+/// `t_{j+1}/t_j = (λ/2)(y/2) / ((j + 1)(j + k/2))`, so it sums outward from
+/// `j* = √(λy/4)` both ways until a side has fallen `e^{−40}` below the largest term.
+pub(super) fn ln_ncx2_series<T: PkNum>(y: T, k: T, lam: T) -> T {
+    let one = c::<T>(1.0);
+    let hl = lam * c(0.5);
+    let lchi = |kk: T| {
+        (kk * c(0.5) - one) * y.ln()
+            - y * c(0.5)
+            - kk * c(0.5 * 2f64.ln())
+            - (kk * c(0.5)).ln_gamma()
+    };
+    if hl.val() == 0.0 {
+        return lchi(k);
+    }
+    let term = |j: usize| -> T {
+        let jf = j as f64;
+        -hl + c::<T>(jf) * hl.ln() - c::<T>(jf + 1.0).ln_gamma() + lchi(k + c(2.0 * jf))
+    };
+    let j_star = (0.5 * (hl.val() * y.val()).sqrt()).floor();
+    let j_star = if j_star.is_finite() {
+        j_star as usize
+    } else {
+        0
+    };
+    let mut terms = vec![term(j_star)];
+    let mut top = terms[0].val();
+    for dir in [1i64, -1] {
+        let mut prev = terms[0].val();
+        let mut j = j_star as i64;
+        loop {
+            j += dir;
+            if j < 0 {
+                break;
+            }
+            let t = term(j as usize);
+            let tv = t.val();
+            terms.push(t);
+            if tv > top {
+                top = tv;
+            }
+            if !tv.is_finite() || (tv < prev && tv < top - 40.0) {
+                break;
+            }
+            prev = tv;
+        }
+    }
+    log_sum_exp(&terms)
+}
+
+/// The Bessel asymptotic form of [`ln_ncx2_pdf`]:
+/// `ln I_ν(x) = x − ½ ln(2πx) + ln Σ_m (−1)^m a_m(ν) x^{−m}`,
+/// `a_m = Π_{i ≤ m} (4ν² − (2i − 1)²) / (m! 8^m)`, to 16 terms.
+pub(super) fn ln_ncx2_asymptotic<T: PkNum>(y: T, k: T, lam: T) -> T {
+    let half = c::<T>(0.5);
+    let nu = k * half - c(1.0);
+    let x = (lam * y).sqrt();
+    let mu4 = c::<T>(4.0) * nu * nu;
+    let mut a = c::<T>(1.0);
+    let mut sum = c::<T>(1.0);
+    for m in 1..=16 {
+        let odd = (2 * m - 1) as f64;
+        a = a * (mu4 - c(odd * odd)) / (c::<T>(8.0 * m as f64) * x);
+        sum = if m % 2 == 1 { sum - a } else { sum + a };
+    }
+    let ln_i = x - half * (c::<T>(std::f64::consts::TAU) * x).ln() + sum.ln();
+    half.ln() - (y + lam) * half + (k * c(0.25) - half) * (y.ln() - lam.ln()) + ln_i
+}
+
 /// `F_η(x)`, the CDF of a univariate kind at the random effect `x`, over `T`; `None` for a
 /// kind with no CDF here (none at present). The NIG has no closed form and is integrated
 /// numerically (the trapezoid rule in `u = ln(x − t)` over its exponential tails).
@@ -929,6 +994,8 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
     let zero = c::<T>(0.0);
     let pos = x.val() > 0.0;
     Some(match kind {
+        K::Copula => return None,
+        K::Normal => normal_cdf_g(x / w.sqrt()),
         K::StudentT => {
             let nu = s[0];
             let t2 = x * x / w;

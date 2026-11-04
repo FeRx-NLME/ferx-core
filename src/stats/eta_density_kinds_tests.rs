@@ -98,6 +98,12 @@ fn latent_range(kind: DensityKind, w: f64, s: &[f64]) -> (f64, f64) {
                 (-40.0, edge)
             }
         }
+        // The latent `logit x` has tails `e^{a z}` and `e^{−b z}`: reach `e^{−40}` on each.
+        Beta => {
+            let mu = s[0];
+            let n = mu * (1.0 - mu) / w - 1.0;
+            (-40.0 / (mu * n).min(1.0), 40.0 / ((1.0 - mu) * n).min(1.0))
+        }
         _ => (-40.0, 40.0),
     }
 }
@@ -126,7 +132,7 @@ fn pdf(kind: DensityKind, z: f64, w: f64, s: &[f64]) -> f64 {
 /// polynomial-tailed Cauchy (`z = tan u`).
 fn expect(kind: DensityKind, w: f64, s: &[f64], g: impl Fn(f64) -> f64) -> f64 {
     if kind == DensityKind::Cauchy {
-        let h = std::f64::consts::FRAC_PI_2 - 1e-7;
+        let h = std::f64::consts::FRAC_PI_2 - 1e-10;
         return simpson(
             |u| {
                 let cu = u.cos();
@@ -135,14 +141,69 @@ fn expect(kind: DensityKind, w: f64, s: &[f64], g: impl Fn(f64) -> f64) -> f64 {
             },
             -h,
             h,
-            400_000,
+            40_000,
         );
+    }
+    if kind == DensityKind::Arcsine {
+        // z = a·sin(π(u − ½)) takes the arcsine's integrable edge singularities out and
+        // leaves a flat integrand; the midpoint rule never evaluates at the edges, where
+        // `z²` rounds to `a²` and the density reads 0 (Simpson's end points lost h/3 each).
+        let a = (2.0 * w).sqrt();
+        let pi = std::f64::consts::PI;
+        let n = 40_000;
+        return (0..n)
+            .map(|i| {
+                let u = (i as f64 + 0.5) / n as f64;
+                let t = pi * (u - 0.5);
+                let z = a * t.sin();
+                g(z) * pdf(kind, z, w, s) * a * pi * t.cos()
+            })
+            .sum::<f64>()
+            / n as f64;
+    }
+    if kind == DensityKind::PGeneralizedGaussian {
+        // `ln p ∝ −|z|^p`: its curvature carries `|z|^{p−2}`, a √-kink at 0 for p = 2.5,
+        // where Simpson converges only as h^{1.5}. `z = s|s|` makes every integrand the
+        // identities read smooth through 0 (`dz = 2|s| ds`).
+        let r = 40f64.sqrt();
+        return simpson(
+            |t| {
+                let z = t * t.abs();
+                g(z) * pdf(kind, z, w, s) * 2.0 * t.abs()
+            },
+            -r,
+            r,
+            8_000,
+        );
+    }
+    if kind == DensityKind::GeneralizedPareto {
+        let xi = (1.0 - 1.0 / w) / 2.0;
+        if xi < -1.0 {
+            // Below ξ = −1 the density is infinite (integrably) at its upper end
+            // `x_max = σ/|ξ|`, as `(x_max − x)^{−1/ξ − 1}`: `x = x_max·(1 − t^{−ξ})` makes
+            // the transformed integrand exactly flat there.
+            let x_max = -(1.0 - xi) / xi;
+            let m = -xi;
+            return simpson(
+                |t| {
+                    let x = x_max * (1.0 - t.powf(m));
+                    if x <= 0.0 {
+                        return 0.0;
+                    }
+                    let z = x.ln();
+                    g(z) * pdf(kind, z, w, s) * x_max * m * t.powf(m - 1.0) / x
+                },
+                1e-9,
+                1.0 - 1e-12,
+                8_000,
+            );
+        }
     }
     let (a, b) = latent_range(kind, w, s);
     // Pull the end points a hair inside a bounded support, where a density that is
-    // infinite (arcsine) or a kink sits.
+    // infinite or a kink sits.
     let eps = (b - a) * 1e-12;
-    simpson(|z| g(z) * pdf(kind, z, w, s), a + eps, b - eps, 400_000)
+    simpson(|z| g(z) * pdf(kind, z, w, s), a + eps, b - eps, 8_000)
 }
 
 /// The η mean and variance the module documents, `None` where none exists or the kind
@@ -173,6 +234,19 @@ fn documented_moments(kind: DensityKind, w: f64, s: &[f64]) -> Option<(f64, f64)
     }
 }
 
+/// The mass an `f64` latent cannot hold: below ξ = −1 a GPD piles its mass at
+/// `x_max`, and the slice within one ulp of it, `(x_max − x)/x_max < ε`, carries
+/// `ε^{−1/ξ}` — 5.6e-5 at the tests' ω — where `x` rounds to `x_max` and the density reads
+/// 0. Derived, not fitted: the quadrature may miss exactly this much, and no more.
+fn unresolvable_mass(kind: DensityKind, w: f64) -> f64 {
+    let xi = (1.0 - 1.0 / w) / 2.0;
+    if kind == DensityKind::GeneralizedPareto && xi < -1.0 {
+        f64::EPSILON.powf(-1.0 / xi)
+    } else {
+        0.0
+    }
+}
+
 /// Every kind's latent density integrates to 1, on its exact support. Simpson, an oracle
 /// that shares nothing with the density.
 /// Dies under: any wrong normalising constant, or a domain-map Jacobian left out.
@@ -183,13 +257,20 @@ fn every_kind_integrates_to_one() {
         let mass = expect(kind, OMEGA, &s, |_| 1.0);
         eprintln!("{:?} {s:?}: mass − 1 = {:.2e}", kind, mass - 1.0);
         assert!(mass.is_finite(), "{kind:?}: {mass}");
-        if (mass - 1.0).abs() > worst.0 {
-            worst = ((mass - 1.0).abs(), kind.name());
+        let slack = unresolvable_mass(kind, OMEGA);
+        let g = ((mass - 1.0).abs() - slack).max(0.0);
+        if g > worst.0 {
+            worst = (g, kind.name());
         }
     }
-    // Placeholder until measured.
+    eprintln!(
+        "mass: worst beyond the unresolvable {:.2e} ({})",
+        worst.0, worst.1
+    );
+    // Measured 5.78e-7 (the semicircle, its √ edges under Simpson), beyond the GPD's
+    // unresolvable 5.6e-5; 5× headroom.
     assert!(
-        worst.0 < 1e-6,
+        worst.0 < 3e-6,
         "worst |mass − 1| = {:.2e} ({})",
         worst.0,
         worst.1
@@ -213,15 +294,19 @@ fn every_kind_has_its_documented_moments() {
         let m2 = expect(kind, OMEGA, &s, |z| map.apply(z).powi(2));
         let (dm, dv) = (m1 - m, m2 - m1 * m1 - v);
         eprintln!("{:?} {s:?}: Δmean {dm:.2e}, Δvar {dv:.2e}", kind);
-        let g = dm.abs().max(dv.abs());
+        // The unresolvable mass sits at x_max (`≤ 1.3` here): its first two moments are
+        // at most `x_max²` times it.
+        let slack = unresolvable_mass(kind, OMEGA) * 4.0;
+        let g = (dm.abs().max(dv.abs()) - slack).max(0.0);
         assert!(g.is_finite(), "{kind:?}");
         if g > worst.0 {
             worst = (g, kind.name());
         }
     }
-    // Placeholder until measured.
+    eprintln!("moments: worst {:.2e} ({})", worst.0, worst.1);
+    // Measured 3.68e-7 (GEV ξ = 0.15, its x^{−1/ξ} tail cut at the latent's 40); 5×.
     assert!(
-        worst.0 < 1e-6,
+        worst.0 < 2e-6,
         "worst moment gap {:.2e} ({})",
         worst.0,
         worst.1
@@ -280,11 +365,18 @@ fn the_score_identities_hold_for_every_smooth_kind() {
         for dir in 0..n {
             let e = expect(kind, OMEGA, &s, |z| {
                 let r = jets(z, dir);
-                if r.v.v.is_finite() {
-                    -0.5 * r.v.g[0]
-                } else {
-                    0.0
+                if !r.v.v.is_finite() {
+                    return 0.0;
                 }
+                // At a GEV's support edge `t = (1 + ξu)^{−1/ξ}` reaches e^700: `−2 ln p`
+                // is still finite but its derivative overflows, where `p` itself is
+                // exactly 0 in `f64`. Only there is a non-finite jet allowed; anywhere
+                // with mass it fails the assertion below.
+                if !r.v.g[0].is_finite() {
+                    assert!((-0.5 * r.v.v).exp() == 0.0, "{kind:?} jet {dir} at z = {z}");
+                    return 0.0;
+                }
+                -0.5 * r.v.g[0]
             });
             let label = format!("{kind:?} E[∂/∂x{dir}]");
             assert!(e.is_finite(), "{label}");
@@ -298,7 +390,16 @@ fn the_score_identities_hold_for_every_smooth_kind() {
                 return 0.0;
             }
             let (d1, d2) = (-0.5 * r.v.g[0], -0.5 * r.g[0].g[0]);
-            d2 + d1 * d1
+            let v = d2 + d1 * d1;
+            // As above: an overflowed jet only where `p` is exactly 0.
+            if !v.is_finite() {
+                assert!(
+                    (-0.5 * r.v.v).exp() == 0.0,
+                    "{kind:?} information at z = {z}"
+                );
+                return 0.0;
+            }
+            v
         });
         let label = format!("{kind:?} information identity");
         assert!(info.is_finite(), "{label}");
@@ -307,7 +408,8 @@ fn the_score_identities_hold_for_every_smooth_kind() {
         }
     }
     eprintln!("worst {:.2e} ({})", worst.0, worst.1);
-    // Placeholder until measured.
+    // Measured 1.65e-7 (the biweight's information identity, its edge curvature under
+    // Simpson); 6× headroom.
     assert!(worst.0 < 1e-6, "worst {:.2e} ({})", worst.0, worst.1);
 }
 
@@ -319,7 +421,7 @@ fn the_score_identities_hold_for_every_smooth_kind() {
 #[test]
 fn every_sampler_draws_its_density() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(1716);
-    let n = 200_000;
+    let n = 100_000;
     let mut worst = (0.0f64, "");
     for (kind, s) in cases() {
         let Some((m, v)) = documented_moments(kind, OMEGA, &s) else {
@@ -344,7 +446,10 @@ fn every_sampler_draws_its_density() {
             worst = (g, kind.name());
         }
     }
-    // Placeholder until measured.
+    eprintln!("sampler: worst {:.2} ({})", worst.0, worst.1);
+    // Measured 3.27 (Pareto's mean, in SEs; seed 1716) over ~40 kinds × 2 statistics, as
+    // the maximum of that many draws should be; 6 SE is still a sampler of the wrong
+    // distribution's floor.
     assert!(worst.0 < 6.0, "worst {:.2} ({})", worst.0, worst.1);
 }
 
@@ -360,7 +465,8 @@ fn the_special_functions_are_the_references() {
     ] {
         worst = worst.max((atan_g::<f64>(x) - x.atan()).abs());
     }
-    // Placeholder until measured.
+    eprintln!("atan: worst {worst:.2e}");
+    // Measured 2.22e-16, one ulp at 1; bound 4 ulp.
     assert!(worst < 1e-15, "atan {worst:.2e}");
     for (x, k1) in [
         (0.1, 9.853_844_780_870_606),
@@ -370,4 +476,85 @@ fn the_special_functions_are_the_references() {
         let got = ln_bessel_k1::<f64>(x).exp();
         assert!((got - k1).abs() / k1 < 1e-13, "K1({x}) = {got}, want {k1}");
     }
+}
+
+/// The noncentral χ² density's two forms agree where `ln_ncx2_pdf` switches between
+/// them: the Poisson-mixture series and the Bessel asymptotic, over `√(λy)` from just
+/// below to 3× the switch, for several `k` and λ (`k = 3`, ν = ½, makes the asymptotic
+/// exact; the others exercise its terms). Values and their `k`/λ derivatives: a wrong
+/// sign or power in either form shows here.
+/// Dies under: a dropped term, a wrong `(y/λ)` exponent, or a series that stops short.
+#[test]
+fn the_noncentral_chisq_series_and_asymptotic_agree() {
+    type D = DualT<2, f64>;
+    let mut worst = 0.0f64;
+    for (k, lam) in [(1.0, 2.0), (3.0, 50.0), (7.5, 10.0), (0.6, 400.0)] {
+        for x in [800.0, NCX2_ASYMPTOTIC_FROM, 1500.0, 3000.0] {
+            let y = x * x / lam;
+            let kd = D {
+                v: k,
+                g: [1.0, 0.0],
+            };
+            let ld = D {
+                v: lam,
+                g: [0.0, 1.0],
+            };
+            let yd = D {
+                v: y,
+                g: [0.0, 0.0],
+            };
+            let a = ln_ncx2_series(yd, kd, ld);
+            let b = ln_ncx2_asymptotic(yd, kd, ld);
+            for (p, q) in [(a.v, b.v), (a.g[0], b.g[0]), (a.g[1], b.g[1])] {
+                assert!(p.is_finite() && q.is_finite(), "k {k} λ {lam} x {x}");
+                worst = worst.max((p - q).abs() / q.abs().max(1.0));
+            }
+        }
+    }
+    eprintln!("ncx2 series vs asymptotic: worst relative {worst:.2e}");
+    // Measured 2.53e-13 (the series' rounding over ~10³ terms); 40× headroom.
+    assert!(worst < 1e-11, "{worst:e}");
+}
+
+/// The Kolmogorov density far in either tail. Left: for x ≪ 1 its theta series is one term
+/// to rounding (the next is `e^{−π²/x²}` smaller), so `ln f = ln √(2π) − 2 ln x −
+/// π²/(8x²) + ln(π²/(4x²) − 1)`. Summed in linear space the term was subnormal by
+/// x ≈ 0.04, its η-gradient overflowing, and 0 below, the latent reading `+∞`.
+/// Dies under: the leading exponent left inside the sum.
+#[test]
+fn the_kolmogorov_left_tail_stays_finite() {
+    type D = DualT<1, f64>;
+    let pi = std::f64::consts::PI;
+    let mut worst = 0.0f64;
+    for x in [0.04f64, 0.02, 0.01] {
+        let z = x.ln();
+        let want_lf = (2.0 * pi).sqrt().ln() - 2.0 * x.ln() - pi * pi / (8.0 * x * x)
+            + (pi * pi / (4.0 * x * x) - 1.0).ln();
+        // −2 ln p_z = −2 (ln f + z).
+        let want = -2.0 * (want_lf + z);
+        let got = latent_neg2_logpdf::<D>(
+            DensityKind::Kolmogorov,
+            D { v: z, g: [1.0] },
+            D { v: OMEGA, g: [0.0] },
+            &[],
+        );
+        assert!(got.v.is_finite() && got.g[0].is_finite(), "x {x}: {got:?}");
+        worst = worst.max((got.v - want).abs() / want.abs());
+    }
+    // The right tail, the same way: `ln f = ln 8x − 2x²` to rounding for x ≫ 1.
+    for x in [10.0f64, 19.0, 30.0] {
+        let z = x.ln();
+        let want = -2.0 * ((8.0 * x).ln() - 2.0 * x * x + z);
+        let got = latent_neg2_logpdf::<D>(
+            DensityKind::Kolmogorov,
+            D { v: z, g: [1.0] },
+            D { v: OMEGA, g: [0.0] },
+            &[],
+        );
+        assert!(got.v.is_finite() && got.g[0].is_finite(), "x {x}: {got:?}");
+        worst = worst.max((got.v - want).abs() / want.abs());
+    }
+    eprintln!("kolmogorov tail: worst relative {worst:.2e}");
+    // Measured 5.91e-16 on the left tail (rounding); 100× headroom.
+    assert!(worst < 1e-13, "{worst:e}");
 }

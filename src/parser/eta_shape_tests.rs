@@ -851,7 +851,7 @@ fn the_omega_line_transform_is_the_eta_shape_block() {
     }
 }
 
-/// Each refusal names its cause: a density on a kappa (#1717), a transform on a block, a
+/// Each refusal names its cause: a shape transform on a kappa (#1717), a transform on a block, a
 /// non-t kind on a block, an unknown kind, a wrong shape-θ count, a t whose ν may reach 0,
 /// a μ bounded outside [0, 1], a clause on a θ, trailing text after the clause, a mapped
 /// ETA read raw outside `[individual_parameters]`, and a kind without a free spread whose
@@ -863,7 +863,7 @@ fn omega_line_distribution_refusals() {
     let err = |omegas: &str, extra: &str| densed(omegas, indiv, extra).unwrap_err();
     let cases: [(&str, &str, &str); 10] = [
         (
-            "  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  kappa K ~ 0.04 density t(NU)",
+            "  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  kappa K ~ 0.04 transform boxcox(L)",
             "",
             "#1717",
         ),
@@ -917,4 +917,171 @@ fn omega_line_distribution_refusals() {
         let e = err(omegas, extra);
         assert!(e.contains(says), "`{omegas}` should say `{says}`: {e}");
     }
+}
+
+/// The omega-line forms beyond a single kind: `truncated(…)` reads the effect through its
+/// bounded map, a `block_omega … density copula(…)` gives each ETA its own margin (and
+/// `beta()` declares its μ), `lognormal` on a block is MvLogNormal, a κ takes a
+/// `density` read through its map, and `density normal` is the plain Gaussian.
+/// Dies under: any of the forms resolved to the wrong kind, map or shape layout.
+#[test]
+fn the_omega_line_forms_resolve() {
+    use crate::stats::eta_density::{Bound, DensityKind};
+    let tr = densed(
+        "  omega ETA_CL ~ 0.1 density truncated(gamma, 0.5, 2)\n  omega ETA_V ~ 0.1 density normal",
+        "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)",
+        "",
+    )
+    .unwrap();
+    assert_eq!(tr.eta_densities.len(), 1, "`density normal` makes no group");
+    let t = tr.eta_densities[0].trunc.expect("truncated");
+    assert_eq!((t.lo, t.hi), (Bound::Value(0.5), Bound::Value(2.0)));
+    let hand = densed(
+        "  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1",
+        "  CL = TVCL * (0.5 + (2 - 0.5) * inv_logit(ETA_CL))\n  V = TVV * exp(ETA_V)",
+        "",
+    )
+    .unwrap();
+    let th = tr.default_params.theta.clone();
+    for z in [[0.3, -0.2], [-1.4, 0.6]] {
+        assert_eq!(
+            params_at(&tr, &th, &z),
+            params_at(&hand, &th, &z),
+            "truncated map"
+        );
+    }
+    let cop = densed(
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density copula(gamma, beta())",
+        "  CL = TVCL * ETA_CL\n  V = TVV * (0.5 + ETA_V)",
+        "",
+    )
+    .unwrap();
+    let g = &cop.eta_densities[0];
+    assert_eq!(g.kind, DensityKind::Copula);
+    assert_eq!(g.margins, vec![DensityKind::Gamma, DensityKind::Beta]);
+    assert_eq!(cop.theta_names[g.shape_thetas[0]], "MU_ETA_V");
+    let cop_hand = densed(
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02]\n  theta MU_ETA_V(0.5, 0.001, 0.999)",
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * (0.5 + inv_logit(ETA_V))",
+        "",
+    )
+    .unwrap();
+    let th = cop.default_params.theta.clone();
+    assert_eq!(
+        params_at(&cop, &th, &[0.2, -0.4]),
+        params_at(&cop_hand, &th, &[0.2, -0.4])
+    );
+    let mvln = densed(
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density lognormal",
+        "  CL = TVCL * ETA_CL\n  V = TVV * ETA_V",
+        "",
+    )
+    .unwrap();
+    assert_eq!(mvln.eta_densities[0].kind, DensityKind::LogNormal);
+    assert_eq!(mvln.eta_densities[0].etas, vec![0, 1]);
+    // A κ density: the model reads `exp(K)` where it wrote `K`.
+    let kmodel = |kappa_line: &str, cl: &str| {
+        parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+             omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  {kappa_line}\n  sigma EPS ~ 0.01\n\n\
+             [individual_parameters]\n  CL = {cl}\n  V = TVV * exp(ETA_V)\n\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+             [error_model]\n  DV ~ proportional(EPS)\n\n[fit_options]\n  iov_column = OCC\n"
+        ))
+        .unwrap()
+    };
+    let kd = kmodel("kappa K ~ 0.04 density gamma", "TVCL * exp(ETA_CL) * K");
+    let kh = kmodel("kappa K ~ 0.04", "TVCL * exp(ETA_CL) * exp(K)");
+    assert_eq!(kd.kappa_densities.len(), 1);
+    assert_eq!(kd.kappa_densities[0].kind, DensityKind::Gamma);
+    assert!(kd.eta_densities.is_empty());
+    let th = kd.default_params.theta.clone();
+    assert_eq!(
+        params_at(&kd, &th, &[0.1, -0.2, 0.3]),
+        params_at(&kh, &th, &[0.1, -0.2, 0.3])
+    );
+}
+
+/// What each non-Gaussian ETA follows reaches `eta_param_info` for reporting (#1716): a
+/// density's kind and shape θ names, each copula margin's own kind and shapes, a
+/// truncation's bounds, and a transform's kind, with `None` on a Gaussian ETA.
+/// Dies under: the metadata left unset, a copula ETA given the group's kind or another
+/// margin's shapes, the truncation dropped, or a transform reported as a density.
+#[test]
+fn eta_param_info_carries_each_distribution() {
+    let dist = |m: &CompiledModel, eta: &str| {
+        m.eta_param_info
+            .iter()
+            .find(|i| i.eta_name == eta)
+            .and_then(|i| i.distribution.clone())
+            .map(|d| (d.form, d.kind, d.shape_thetas, d.truncation))
+    };
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let m = densed(
+        "  omega ETA_CL ~ 0.1 density truncated(t(NU), -1, inf)\n  \
+         omega ETA_V ~ 0.1 transform boxcox(L)",
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)",
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        dist(&m, "ETA_CL"),
+        Some((
+            "density".into(),
+            "t".into(),
+            s(&["NU"]),
+            Some((Some(-1.0), None))
+        ))
+    );
+    assert_eq!(
+        dist(&m, "ETA_V"),
+        Some(("transform".into(), "boxcox".into(), s(&["L"]), None))
+    );
+    let cop = densed(
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density copula(t(NU), beta(MU))",
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * (0.5 + ETA_V)",
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        dist(&cop, "ETA_CL"),
+        Some(("density".into(), "t".into(), s(&["NU"]), None))
+    );
+    assert_eq!(
+        dist(&cop, "ETA_V"),
+        Some(("density".into(), "beta".into(), s(&["MU"]), None))
+    );
+    let gauss = densed(
+        "  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1",
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)",
+        "",
+    )
+    .unwrap();
+    assert_eq!(dist(&gauss, "ETA_CL"), None);
+}
+
+/// A `[mixture]` class's `omega(2) ETA_CL ~ v` override names a mapped density ETA's
+/// variance, not its value, so it parses; a mixing-probability expression that reads the
+/// ETA is still a read of the latent and is refused.
+/// Dies under: the override line counted as a read, or the exemption widened to every
+/// `[mixture]` line.
+#[test]
+fn a_mixture_override_of_a_density_eta_is_no_read() {
+    let indiv =
+        "  CL = if (MIXNUM == 1) TVCL * ETA_CL else 2 * TVCL * ETA_CL\n  V = TVV * exp(ETA_V)";
+    let omegas = "  omega ETA_CL ~ 0.1 density gamma\n  omega ETA_V ~ 0.1";
+    let m = densed(
+        omegas,
+        indiv,
+        "[mixture]\n  nsub = 2\n  logit(1) = 0\n  omega(2) ETA_CL ~ 0.2\n",
+    )
+    .expect("an override parses");
+    assert_eq!(m.eta_densities.len(), 1);
+    let e = densed(
+        omegas,
+        indiv,
+        "[mixture]\n  nsub = 2\n  logit(1) = ETA_CL\n",
+    )
+    .unwrap_err();
+    assert!(e.contains("[mixture] reads `ETA_CL`"), "{e}");
 }

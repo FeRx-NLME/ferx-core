@@ -365,6 +365,8 @@ pub(crate) struct DistClause {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OmegaDensityDecl {
     pub(crate) etas: Vec<String>,
+    /// The names are IOV κs (a `kappa` / `block_kappa` line), not BSV ETAs.
+    pub(crate) kappa: bool,
     pub(crate) kind: String,
     pub(crate) args: Vec<String>,
     /// The declaration, for messages.
@@ -479,7 +481,8 @@ pub(crate) fn find_dist_clause(line: &str) -> Result<Option<(usize, usize, DistC
         };
         // `truncated(KIND[(…)], LO, HI)` takes a kind and two bounds (numbers, `inf` or
         // θ names), read by `parse_truncated`; every other kind takes θ names.
-        let truncated = kind.eq_ignore_ascii_case("truncated");
+        let truncated =
+            kind.eq_ignore_ascii_case("truncated") || kind.eq_ignore_ascii_case("copula");
         if !truncated
             && args
                 .iter()
@@ -518,6 +521,24 @@ fn split_top_level(s: &str) -> Vec<String> {
     }
     out.push(s[start..].trim().to_string());
     out
+}
+
+/// A kind spec `KIND` or `KIND(SHAPES)`: its (lower-cased) name and its shape arguments,
+/// `None` without parentheses.
+pub(crate) fn parse_kind_spec(spec: &str) -> Option<(String, Option<Vec<String>>)> {
+    let spec = spec.trim();
+    match spec.find('(') {
+        Some(o) => {
+            let inner = spec[o + 1..].strip_suffix(')')?.trim();
+            let sh = if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner.split(',').map(|a| a.trim().to_string()).collect()
+            };
+            Some((spec[..o].trim().to_ascii_lowercase(), Some(sh)))
+        }
+        None => Some((spec.to_ascii_lowercase(), None)),
+    }
 }
 
 /// A `truncated(KIND[(SHAPES)], LO, HI)` clause's parts: the inner kind's name, its shape
@@ -565,27 +586,35 @@ pub(crate) fn split_dist_clause(line: &str) -> Result<(String, Option<DistClause
 
 /// The ETA names an `omega` / `block_omega` declaration line declares, or `None` for
 /// any other line.
-fn declared_etas(line: &str) -> Option<(bool, Vec<String>)> {
+/// The random-effect names an `omega` / `block_omega` / `kappa` / `block_kappa`
+/// declaration declares: whether it is a block, the names, and whether they are IOV κs.
+fn declared_random_effects(line: &str) -> Option<(bool, Vec<String>, bool)> {
     let t = line.trim_start();
     let lower = t.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix("block_omega") {
-        let open = rest.find('(')?;
-        let close = rest.find(')')?;
-        let names = t["block_omega".len() + open + 1.."block_omega".len() + close]
-            .split(',')
-            .map(|n| n.trim().to_string())
-            .collect();
-        return Some((true, names));
+    for (kw, kappa) in [("block_omega", false), ("block_kappa", true)] {
+        if let Some(rest) = lower.strip_prefix(kw) {
+            let open = rest.find('(')?;
+            let close = rest.find(')')?;
+            let names = t[kw.len() + open + 1..kw.len() + close]
+                .split(',')
+                .map(|n| n.trim().to_string())
+                .collect();
+            return Some((true, names, kappa));
+        }
     }
-    let rest = lower.strip_prefix("omega")?;
-    if !rest.starts_with(char::is_whitespace) {
-        return None;
+    for (kw, kappa) in [("omega", false), ("kappa", true)] {
+        if let Some(rest) = lower.strip_prefix(kw) {
+            if !rest.starts_with(char::is_whitespace) {
+                continue;
+            }
+            let name = t[kw.len()..]
+                .trim_start()
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()?;
+            return Some((false, vec![name.to_string()], kappa));
+        }
     }
-    let name = t["omega".len()..]
-        .trim_start()
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .next()?;
-    Some((false, vec![name.to_string()]))
+    None
 }
 
 /// The keyword of a `[parameters]` line (`theta`, `kappa`, …), lower-cased.
@@ -649,24 +678,23 @@ pub(crate) fn apply_omega_dist_clauses(
         } else {
             "density"
         };
-        let Some((is_block, etas)) = declared_etas(line) else {
-            let decl = decl_keyword(line);
-            return Err(if decl == "kappa" || decl == "block_kappa" {
-                format!(
-                    "[parameters] a `{kw}` clause on an IOV kappa is not supported yet (#1717): `{}`",
-                    line.trim()
-                )
-            } else {
-                format!(
-                    "[parameters] a `{kw}` clause belongs on an `omega` or `block_omega` \
-                     declaration: `{}`",
-                    line.trim()
-                )
-            });
+        let Some((is_block, etas, is_kappa)) = declared_random_effects(line) else {
+            return Err(format!(
+                "[parameters] a `{kw}` clause belongs on an `omega`, `block_omega`, `kappa` or \
+                 `block_kappa` declaration: `{}`",
+                line.trim()
+            ));
         };
         // On its latent scale a Box-Cox density is exactly the Box-Cox transform, so
         // `density boxcox(λ)` is that transform (`crate::stats::eta_density`).
         let as_transform = clause.transform || clause.kind == "boxcox";
+        if as_transform && is_kappa {
+            return Err(format!(
+                "[parameters] a shape `transform` on an IOV kappa is not supported (#1717); a \
+                 kappa takes a `density`: `{}`",
+                line.trim()
+            ));
+        }
         if as_transform {
             if is_block {
                 return Err(format!(
@@ -690,6 +718,60 @@ pub(crate) fn apply_omega_dist_clauses(
                 clause.args.join(", ")
             ));
             *line = format!("{}{}", line[..s].trim_end(), &line[e..]);
+            continue;
+        }
+        if clause.kind == "copula" {
+            if etas.len() != clause.args.len() {
+                return Err(format!(
+                    "[parameters] `density copula(…)` takes one margin per ETA of its block \
+                     ({} here, {} given): `{}`",
+                    etas.len(),
+                    clause.args.len(),
+                    line.trim()
+                ));
+            }
+            let mut rewritten = Vec::new();
+            let mut changed = false;
+            for (spec, eta) in clause.args.iter().zip(&etas) {
+                let (name, shapes) = parse_kind_spec(spec).ok_or_else(|| {
+                    format!(
+                        "[parameters] cannot read the copula margin `{spec}`: `{}`",
+                        line.trim()
+                    )
+                })?;
+                let kind =
+                    DensityKind::from_name(&name).ok_or_else(|| unknown_density(&name, line))?;
+                if kind.shapes().is_empty() || shapes.as_ref().is_some_and(|v| !v.is_empty()) {
+                    rewritten.push(spec.clone());
+                    continue;
+                }
+                let mut names = Vec::new();
+                for sp in kind.shapes() {
+                    let n = format!("{}_{eta}", sp.prefix);
+                    if theta_names.contains(&n) {
+                        return Err(format!(
+                            "[parameters] the copula margin `{name}()` would declare θ `{n}`, \
+                             which [parameters] already declares — name it: `{}`",
+                            line.trim()
+                        ));
+                    }
+                    new_thetas.push(format!(
+                        "theta {n}({}, {}, {})",
+                        sp.init, sp.lower, sp.upper
+                    ));
+                    names.push(n);
+                }
+                rewritten.push(format!("{name}({})", names.join(", ")));
+                changed = true;
+            }
+            if changed {
+                *line = format!(
+                    "{} density copula({}){}",
+                    line[..s].trim_end(),
+                    rewritten.join(", "),
+                    &line[e..]
+                );
+            }
             continue;
         }
         if clause.kind == "truncated" {
@@ -773,9 +855,10 @@ pub(crate) fn omega_density_decls(parameters: &[String]) -> Result<Vec<OmegaDens
         if clause.transform {
             continue;
         }
-        if let Some((_, etas)) = declared_etas(line) {
+        if let Some((_, etas, kappa)) = declared_random_effects(line) {
             out.push(OmegaDensityDecl {
                 etas,
+                kappa,
                 kind: clause.kind,
                 args: clause.args,
                 line: line.trim().to_string(),

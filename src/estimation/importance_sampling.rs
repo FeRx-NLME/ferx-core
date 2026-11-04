@@ -425,16 +425,19 @@ pub fn run_importance_sampling(
 
     // FREM: Rao-Blackwellise (integrate covariate etas, sample only PK etas) when
     // a clean PK/cov partition exists. `None` → full-dimensional IS (unchanged).
-    let frem_rb: Option<(Vec<usize>, Vec<usize>)> = if !options.frem_rao_blackwell {
-        None
-    } else {
-        model
-            .frem_config
-            .as_ref()
-            .filter(|_| model.n_kappa == 0)
-            .map(|fc| frem_pk_cov_partition(fc, n_eta))
-            .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
-    };
+    // A density (#1716) makes the covariate block's conditional prior non-Gaussian, which
+    // the Rao–Blackwell split integrates in closed form: full-dimensional IS instead.
+    let frem_rb: Option<(Vec<usize>, Vec<usize>)> =
+        if !options.frem_rao_blackwell || model.has_densities() {
+            None
+        } else {
+            model
+                .frem_config
+                .as_ref()
+                .filter(|_| model.n_kappa == 0)
+                .map(|fc| frem_pk_cov_partition(fc, n_eta))
+                .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
+        };
 
     let per_subject: Vec<SubjectIsOutput> = population
         .subjects
@@ -1035,8 +1038,8 @@ fn subject_is_estimate(
         // #1716: a density group's `½c` makes `p(y | η)·N(η; 0, Ω)·e^{−c/2}` the target,
         // and leaves the defensive mixture's `N(0, Ω)` the proposal density it is.
         let log_p_y = -(obs_nll
-            + crate::stats::eta_density::half_correction(
-                &model.eta_densities,
+            + crate::stats::eta_density::half_correction_stacked(
+                model,
                 &eta_sample,
                 omega_inv,
                 theta,
@@ -1550,7 +1553,7 @@ pub(crate) fn subject_is_draws(
             model.residual_cov_theta(theta),
             eta,
             scratch,
-        ) + crate::stats::eta_density::half_correction(&model.eta_densities, eta, omega_inv, theta)
+        ) + crate::stats::eta_density::half_correction_stacked(model, eta, omega_inv, theta)
     };
     subject_is_draws_with(
         &obs_nll,
@@ -1814,7 +1817,7 @@ pub(crate) fn find_optimal_iscale(
             model.residual_cov_theta(theta),
             eta,
             scratch,
-        ) + crate::stats::eta_density::half_correction(&model.eta_densities, eta, omega_inv, theta)
+        ) + crate::stats::eta_density::half_correction_stacked(model, eta, omega_inv, theta)
     };
     find_optimal_iscale_with(
         &obs_nll,
@@ -2208,8 +2211,8 @@ fn subject_is_estimate_joint(
         }
         // #1716: the density's `½c`, over the BSV block of the joint sample.
         let log_p_y = -(obs_nll
-            + crate::stats::eta_density::half_correction(
-                &model.eta_densities,
+            + crate::stats::eta_density::half_correction_stacked(
+                model,
                 &sample_joint,
                 omega_joint_inv,
                 theta,
@@ -3885,6 +3888,7 @@ mod tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             eta_densities: Vec::new(),
+            kappa_densities: Vec::new(),
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
             mixture: None,

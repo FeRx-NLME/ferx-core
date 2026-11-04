@@ -242,6 +242,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         analytical_init: Vec::new(),
         analytic_readout: None,
         eta_densities: Vec::new(),
+        kappa_densities: Vec::new(),
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
         mixture: None,

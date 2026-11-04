@@ -4244,7 +4244,10 @@ fn foce_subject_nll_iov_linearized_split(
     // the BSV block first, and a density reads BSV η only, so its inverse's BSV block is
     // `Ω_BSV⁻¹`.
     let density = crate::stats::eta_density::DensityAtMode::at(
-        &model.eta_densities,
+        &match crate::stats::stacked_layout::StackedLayout::sens_of(model, subject) {
+            Some(l) => crate::stats::eta_density::layout_groups(model, &l.kappa_blocks()),
+            None => crate::stats::eta_density::stacked_groups(model, k_occ).into_owned(),
+        },
         b_hat.as_slice(),
         &sigma_b.inv,
         theta,
@@ -5135,13 +5138,41 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     // The two terms stay separate summands so the one-level sum keeps its association.
     let (kappa_prior, kappa_log_det) = match nested {
         Some(nested) => match nested.compact(eta, kappas) {
-            Some(b) => (nested.kappa_prior(&b, iov_inv, &iov.chol), 0.0),
+            Some(b) => {
+                let mut kp = nested.kappa_prior(&b, iov_inv, &iov.chol);
+                // #1716: the κ density groups in each level block of the compact vector.
+                if !model.kappa_densities.is_empty() {
+                    kp += crate::stats::eta_density::nested_kappa_correction(
+                        model,
+                        &nested.kappa_blocks(),
+                        &b,
+                        iov_inv,
+                        theta,
+                    );
+                    if !kp.is_finite() {
+                        return SUBJECT_SENTINEL_NLL;
+                    }
+                }
+                (kp, 0.0)
+            }
             None => return SUBJECT_SENTINEL_NLL,
         },
         None => {
             let mut kappa_prior = 0.0;
             for kap in kappas {
                 kappa_prior += quad_form(iov_inv, kap.as_ref());
+                // #1716: an occasion's κ under a density group.
+                if !model.kappa_densities.is_empty() {
+                    kappa_prior += crate::stats::eta_density::correction(
+                        &model.kappa_densities,
+                        kap.as_ref(),
+                        iov_inv,
+                        theta,
+                    );
+                }
+            }
+            if !kappa_prior.is_finite() {
+                return SUBJECT_SENTINEL_NLL;
             }
             let k_occasions = kappas.len();
             (kappa_prior, (k_occasions as f64) * log_det_iov)
@@ -5558,6 +5589,7 @@ mod tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             eta_densities: Vec::new(),
+            kappa_densities: Vec::new(),
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
             mixture: None,

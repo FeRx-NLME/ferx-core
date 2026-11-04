@@ -7962,3 +7962,69 @@ fn the_adjoint_of_a_logit_normal_density_is_its_translated_gaussian() {
     // Measured 1.1e-15 (rounding: the two models run different arithmetic); 10× headroom.
     assert!(worst < 1e-14, "worst relative gap {worst:.2e}");
 }
+
+/// #1716, IOV: a logit-normal κ density is a translated Gaussian κ, so the FOCEI adjoint
+/// gradient of `KA = TVKA·2·KAPPA_KA` under `density logitnormal(MU)` equals that of the
+/// Gaussian twin `KA = TVKA·2·inv_logit(logit(MU) + KAPPA_KA)`, with every occasion's κ
+/// shifted by `logit μ`. Checks the stacked κ groups through the kernel, the IOV
+/// objective and the adjoint (including `∂/∂MU`) without FD.
+/// Dies under: a κ group left out of the stacked prior, or its θ jets dropped.
+#[test]
+fn the_iov_adjoint_of_a_logit_normal_kappa_is_its_translated_gaussian() {
+    let dens_src = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta MU(0.4, 0.01, 0.99)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  kappa KAPPA_CL ~ 0.03
+  kappa KAPPA_KA ~ 0.2 density logitnormal(MU)
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA * 2 * KAPPA_KA
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+"#;
+    let twin_src = dens_src.replace(" density logitnormal(MU)", "").replace(
+        "KA = TVKA * 2 * KAPPA_KA",
+        "KA = TVKA * 2 * inv_logit(logit(MU) + KAPPA_KA)",
+    );
+    let dens = parse_model_string(dens_src).unwrap();
+    let twin = parse_model_string(&twin_src).unwrap();
+    assert_eq!(dens.kappa_densities.len(), 1);
+    let s = iov_subject(&twin);
+    let params = moved_params(&dens);
+    let x = pack_params(&params);
+    let mu = params.theta[3];
+    let shift = (mu / (1.0 - mu)).ln();
+    let b = ebe_for(&dens, &s, &params, 1e-12, true);
+    // Stacked [η_CL, η_V, κ_CL⁰, κ_KA⁰, κ_CL¹, κ_KA¹, …]: shift every κ_KA.
+    let mut bt: Vec<f64> = b.iter().copied().collect();
+    for g in 0..(bt.len() - 2) / 2 {
+        bt[2 + 2 * g + 1] -= shift;
+    }
+    let a = subject_adjoint_packed_gradient(&dens, &s, &params, &x, b.as_slice(), true)
+        .expect("the κ-density model is in adjoint scope");
+    let t =
+        subject_adjoint_packed_gradient(&twin, &s, &params, &x, &bt, true).expect("twin in scope");
+    let worst = a
+        .iter()
+        .zip(&t)
+        .map(|(p, q)| {
+            assert!(p.is_finite() && q.is_finite());
+            (p - q).abs() / (1.0 + q.abs())
+        })
+        .fold(0.0f64, f64::max);
+    eprintln!("IOV κ twin: worst {worst:.2e}, ∂/∂MU {}", a[3]);
+    assert!(a[3].abs() > 1e-6, "∂/∂MU is live");
+    // Measured 2.39e-15 (the twin is the same arithmetic up to association); 400×.
+    assert!(worst < 1e-12, "worst {worst:.2e}");
+}

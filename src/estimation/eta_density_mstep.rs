@@ -49,6 +49,8 @@ impl GroupLayout {
 /// The density groups' M-step state: per group, the SA-averaged information.
 #[derive(Debug, Clone)]
 pub(crate) struct DensityMstep {
+    /// The density groups this M-step serves (the BSV ones, or the κ ones against Ω_IOV).
+    groups: Vec<EtaDensity>,
     layouts: Vec<GroupLayout>,
     info: Vec<Option<DMatrix<f64>>>,
 }
@@ -73,11 +75,36 @@ impl DensityMstep {
         theta_fixed: &[bool],
         theta_bounds: &[(f64, f64)],
     ) -> Option<Self> {
-        if model.eta_densities.is_empty() {
+        Self::for_groups(&model.eta_densities, omega_fixed, theta_fixed, theta_bounds)
+    }
+
+    /// [`Self::new`] for κ: the model's κ density groups, against Ω_IOV, `kappa_fixed`
+    /// per κ.
+    pub(crate) fn for_kappas(
+        model: &CompiledModel,
+        kappa_fixed: &[bool],
+        theta_fixed: &[bool],
+        theta_bounds: &[(f64, f64)],
+    ) -> Option<Self> {
+        Self::for_groups(
+            &model.kappa_densities,
+            kappa_fixed,
+            theta_fixed,
+            theta_bounds,
+        )
+    }
+
+    /// The state for `groups`, `None` without any.
+    pub(crate) fn for_groups(
+        groups: &[EtaDensity],
+        omega_fixed: &[bool],
+        theta_fixed: &[bool],
+        theta_bounds: &[(f64, f64)],
+    ) -> Option<Self> {
+        if groups.is_empty() {
             return None;
         }
-        let layouts: Vec<GroupLayout> = model
-            .eta_densities
+        let layouts: Vec<GroupLayout> = groups
             .iter()
             .map(|d| {
                 let n = d.etas.len();
@@ -102,7 +129,11 @@ impl DensityMstep {
             })
             .collect();
         let info = vec![None; layouts.len()];
-        Some(Self { layouts, info })
+        Some(Self {
+            groups: groups.to_vec(),
+            layouts,
+            info,
+        })
     }
 
     /// The θ indices this M-step owns: every free shape θ. The data M-step must leave them
@@ -119,7 +150,7 @@ impl DensityMstep {
     /// (natural scale).
     pub(crate) fn sa_step(
         &mut self,
-        model: &CompiledModel,
+        _model: &CompiledModel,
         etas: &[Vec<f64>],
         omega: &mut DMatrix<f64>,
         theta: &mut [f64],
@@ -131,7 +162,7 @@ impl DensityMstep {
             if layout.dim() == 0 {
                 continue;
             }
-            let d = &model.eta_densities[g];
+            let d = &self.groups[g];
             let psi = pack(d, &layout, omega, theta);
             let Some((s, j)) = score_and_info(d, &layout, &psi, &draws, omega, theta) else {
                 continue;
@@ -153,7 +184,7 @@ impl DensityMstep {
     /// (`(z, w)`, the weights of each subject summing to 1) by Fisher scoring.
     pub(crate) fn maximise(
         &self,
-        model: &CompiledModel,
+        _model: &CompiledModel,
         draws: &[(&[f64], f64)],
         omega: &mut DMatrix<f64>,
         theta: &mut [f64],
@@ -162,7 +193,7 @@ impl DensityMstep {
             if layout.dim() == 0 {
                 continue;
             }
-            let d = &model.eta_densities[g];
+            let d = &self.groups[g];
             for _ in 0..100 {
                 let psi = pack(d, layout, omega, theta);
                 let Some((s, j)) = score_and_info(d, layout, &psi, draws, omega, theta) else {
@@ -182,6 +213,51 @@ impl DensityMstep {
     }
 }
 
+/// The prior on one Ω block for [`mh_group_omega_prior`] (#1716).
+#[derive(Debug, Clone)]
+pub(crate) enum BlockPrior {
+    /// `IW(ν, Λ)`: `−(ν + n + 1)/2 ln|Ω| − ½ tr(ΛΩ⁻¹)`.
+    InverseWishart { nu: f64, lambda: DMatrix<f64> },
+    /// `W(ν, Λ/ν)` (mean Λ): `(ν − n − 1)/2 ln|Ω| − ½ ν tr(Λ⁻¹Ω)`.
+    Wishart { nu: f64, lambda: DMatrix<f64> },
+    /// LKJ(η) on the correlation `R`, `IG(a, bᵢ)` on each variance `ωᵢ`, with the
+    /// Jacobian `|∂Ω/∂(ω, R)| = Πᵢ ωᵢ^{(n−1)/2}`: `(η − 1) ln|R| + Σᵢ ln IG(ωᵢ) −
+    /// ((n − 1)/2) Σᵢ ln ωᵢ`.
+    Lkj { eta: f64, a: f64, b: Vec<f64> },
+}
+
+impl BlockPrior {
+    /// `ln p(Ω)` up to a constant, `−∞` for a non-PD block.
+    pub(crate) fn log_density(&self, om: &DMatrix<f64>) -> f64 {
+        let n = om.nrows() as f64;
+        let Some(ch) = om.clone().cholesky() else {
+            return f64::NEG_INFINITY;
+        };
+        let log_det = 2.0 * ch.l().diagonal().iter().map(|v| v.ln()).sum::<f64>();
+        match self {
+            BlockPrior::InverseWishart { nu, lambda } => {
+                let oi = ch.inverse();
+                -0.5 * (nu + n + 1.0) * log_det - 0.5 * (lambda * oi).trace()
+            }
+            BlockPrior::Wishart { nu, lambda } => {
+                let Some(li) = lambda.clone().try_inverse() else {
+                    return f64::NEG_INFINITY;
+                };
+                0.5 * (nu - n - 1.0) * log_det - 0.5 * nu * (li * om).trace()
+            }
+            BlockPrior::Lkj { eta, a, b } => {
+                let d: Vec<f64> = (0..om.nrows()).map(|i| om[(i, i)]).collect();
+                let log_det_r = log_det - d.iter().map(|v| v.ln()).sum::<f64>();
+                let mut lp = (eta - 1.0) * log_det_r;
+                for (i, &w) in d.iter().enumerate() {
+                    lp += -(a + 1.0) * w.ln() - b[i] / w;
+                }
+                lp - 0.5 * (n - 1.0) * d.iter().map(|v| v.ln()).sum::<f64>()
+            }
+        }
+    }
+}
+
 /// Bayes (#1716): one random-walk Metropolis move on a density group's Ω block, for its
 /// full conditional `∝ Πᵢ p(zᵢ; Ω_g, θ) · IW(Ω_g; ν, Λ)`. The prior is the marginal the
 /// conjugate update's inverse Wishart puts on the block (`ν = ν₀ − (p − n_g)`,
@@ -189,14 +265,14 @@ impl DensityMstep {
 /// the inverse gamma `IG(ν/2, Λ/2)`. The walk is on the block's log-Cholesky `ψ`, with the
 /// Jacobian `|∂Ω/∂ψ| ∝ Πᵢ L_iiⁿ⁻ⁱ⁺²` in the target. Moves `omega`'s block in place;
 /// returns whether the move was accepted.
+/// Under any [`BlockPrior`]; the inverse Wishart is the conjugate update's own.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn mh_group_omega(
+pub(crate) fn mh_group_omega_prior(
     d: &EtaDensity,
     etas: &[Vec<f64>],
     omega: &mut DMatrix<f64>,
     theta: &[f64],
-    nu: f64,
-    lambda: &DMatrix<f64>,
+    prior: &BlockPrior,
     step: f64,
     rng: &mut impl rand::Rng,
 ) -> bool {
@@ -217,11 +293,8 @@ pub(crate) fn mh_group_omega(
         }
         let lm = DMatrix::from_fn(n, n, |i, j| l[i][j]);
         let om = &lm * lm.transpose();
-        let Some(oi) = om.clone().try_inverse() else {
-            return f64::NEG_INFINITY;
-        };
-        let tr = (lambda * &oi).trace();
-        let mut lp = -0.5 * (nu + n as f64 + 1.0) * log_det - 0.5 * tr + log_jac;
+        let _ = log_det;
+        let mut lp = prior.log_density(&om) + log_jac;
         for e in etas {
             lp += group_log_density(d, &layout, psi.as_slice(), &group_z(d, e), omega, theta);
         }
@@ -369,6 +442,7 @@ fn group_log_density<T: PkNum>(
         etas: (0..n).collect(),
         shape_thetas: (0..d.shape_thetas.len()).collect(),
         trunc: d.trunc,
+        margins: d.margins.clone(),
     };
     let mut free = 0;
     let shape_vals: Vec<T> = l

@@ -39,18 +39,21 @@ fn the_mcem_mstep_recovers_the_simulation_truth() {
             etas: vec![0],
             shape_thetas: vec![],
             trunc: None,
+            margins: vec![],
         },
         EtaDensity {
             kind: DensityKind::Beta,
             etas: vec![1],
             shape_thetas: vec![0],
             trunc: None,
+            margins: vec![],
         },
         EtaDensity {
             kind: DensityKind::StudentT,
             etas: vec![2],
             shape_thetas: vec![1],
             trunc: None,
+            margins: vec![],
         },
     ]);
     let truth_omega = DMatrix::from_diagonal(&DVector::from_vec(vec![0.15, 0.02, 0.09]));
@@ -96,6 +99,7 @@ fn a_fixed_parameter_is_not_moved() {
         etas: vec![0],
         shape_thetas: vec![0],
         trunc: None,
+        margins: vec![],
     }]);
     let omega0 = DMatrix::from_element(1, 1, 0.03);
     let zs = draws(&model, &DMatrix::from_element(1, 1, 0.02), &[0.3], 2_000);
@@ -106,4 +110,82 @@ fn a_fixed_parameter_is_not_moved() {
     assert_eq!(omega, omega0);
     assert_eq!(theta, vec![0.5]);
     assert!(ms.owned_thetas().is_empty(), "a FIXed shape θ is not owned");
+}
+
+/// Each Ω prior's log-density, up to its constant, matches its textbook form: the
+/// inverse Wishart and Wishart on a 2×2 block, and LKJ(η) with inverse-gamma variances,
+/// whose 1×1 case is the inverse gamma alone. Differences between two blocks, so the
+/// dropped constants cancel.
+/// Dies under: a wrong exponent on `ln|Ω|`, the trace term transposed, or LKJ's
+/// `(ω, R) → Ω` Jacobian dropped.
+#[test]
+fn every_omega_prior_is_its_textbook_density() {
+    let lam = DMatrix::from_row_slice(2, 2, &[0.09, 0.02, 0.02, 0.05]);
+    let (o1, o2) = (
+        DMatrix::from_row_slice(2, 2, &[0.11, 0.01, 0.01, 0.04]),
+        DMatrix::from_row_slice(2, 2, &[0.07, 0.025, 0.025, 0.06]),
+    );
+    let nu = 4.0;
+    let n = 2.0;
+    let iw = |o: &DMatrix<f64>| {
+        -0.5 * (nu + n + 1.0) * o.determinant().ln()
+            - 0.5 * (&lam * o.clone().try_inverse().unwrap()).trace()
+    };
+    let wi = |o: &DMatrix<f64>| {
+        0.5 * (nu - n - 1.0) * o.determinant().ln()
+            - 0.5 * nu * (lam.clone().try_inverse().unwrap() * o).trace()
+    };
+    let lkj = |o: &DMatrix<f64>, eta: f64, a: f64, b: &[f64]| {
+        let d = [o[(0, 0)], o[(1, 1)]];
+        let r = o[(0, 1)] / (d[0] * d[1]).sqrt();
+        (eta - 1.0) * (1.0 - r * r).ln()
+            + d.iter()
+                .zip(b)
+                .map(|(&w, &bi)| -(a + 1.0) * w.ln() - bi / w)
+                .sum::<f64>()
+            - 0.5 * (d[0].ln() + d[1].ln())
+    };
+    let pri = [
+        (
+            BlockPrior::InverseWishart {
+                nu,
+                lambda: lam.clone(),
+            },
+            iw(&o1) - iw(&o2),
+        ),
+        (
+            BlockPrior::Wishart {
+                nu,
+                lambda: lam.clone(),
+            },
+            wi(&o1) - wi(&o2),
+        ),
+        (
+            BlockPrior::Lkj {
+                eta: 2.5,
+                a: 1.5,
+                b: vec![0.045, 0.025],
+            },
+            lkj(&o1, 2.5, 1.5, &[0.045, 0.025]) - lkj(&o2, 2.5, 1.5, &[0.045, 0.025]),
+        ),
+    ];
+    for (p, want) in pri {
+        let got = p.log_density(&o1) - p.log_density(&o2);
+        assert!((got - want).abs() < 1e-12, "{p:?}: {got} vs {want}");
+    }
+    // LKJ on one variance is its inverse gamma.
+    let one = DMatrix::from_element(1, 1, 0.08);
+    let ig = BlockPrior::InverseWishart {
+        nu: 1.0,
+        lambda: DMatrix::from_element(1, 1, 0.1),
+    };
+    let lk = BlockPrior::Lkj {
+        eta: 3.0,
+        a: 0.5,
+        b: vec![0.05],
+    };
+    let two = DMatrix::from_element(1, 1, 0.15);
+    let d_ig = ig.log_density(&one) - ig.log_density(&two);
+    let d_lk = lk.log_density(&one) - lk.log_density(&two);
+    assert!((d_ig - d_lk).abs() < 1e-12, "{d_ig} vs {d_lk}");
 }

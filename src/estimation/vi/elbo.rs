@@ -741,7 +741,7 @@ fn subject_terms(
     // makes "asked for analytic, had to sample" a single decision to report.
     // A density's prior (#1716) has no closed-form KL against a Gaussian family: it is
     // sampled, by design rather than as a fallback.
-    let has_density = !model.eta_densities.is_empty();
+    let has_density = model.has_densities();
     let closed_form = match cfg.kl {
         KlMode::Analytic if !has_density => family.kl_to_normal(phi, &prior),
         _ => None,
@@ -823,7 +823,8 @@ fn subject_terms(
         // rather than a second gradient pass.
         let mut g_total = g_eta;
         if sampling_kl {
-            let draw = mc_kl_draw(family, phi, &z, &prior, &model.eta_densities, &params.theta);
+            let groups = crate::stats::eta_density::stacked_groups(model, k_occasions);
+            let draw = mc_kl_draw(family, phi, &z, &prior, &groups, &params.theta);
             kl_value += inv_s * draw.integrand;
             kl_d_omega += draw.d_omega * inv_s;
             for (acc, g) in g_total.iter_mut().zip(draw.d_eta.iter()) {

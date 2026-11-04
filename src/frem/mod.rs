@@ -597,23 +597,70 @@ pub fn generate_frem_model(
         }
     }
 
-    // Write block_omega as lower triangle.
+    // Write block_omega as lower triangle. #1716: a base model with `density` ETAs makes the
+    // joined block a Gaussian copula: each PK ETA keeps its own margin (`normal` for a
+    // Gaussian one) and every covariate ETA is a `normal` margin, the Gaussian
+    // pseudo-observation FREM reads. On one line, so the clause sits on the declaration.
     let eta_names_str = all_eta_names.join(", ");
-    model.push_str(&format!("  block_omega ({}) = [\n", eta_names_str));
-    for i in 0..n_total {
-        model.push_str("    ");
-        for j in 0..=i {
-            if j > 0 {
-                model.push_str(", ");
+    if !base_model.eta_densities.is_empty() {
+        let mut margins = Vec::with_capacity(n_total);
+        for &i in &block_base {
+            let d = base_model
+                .eta_densities
+                .iter()
+                .find(|d| d.etas.contains(&i));
+            margins.push(match d {
+                None => "normal".to_string(),
+                Some(d) => {
+                    if d.etas.len() > 1 || d.trunc.is_some() || !d.margins.is_empty() {
+                        return Err(format!(
+                            "prepare_frem: `{}` follows a `{}` block, truncation or copula; FREM \
+                             joins its ETA into a copula, so it takes a univariate `density`",
+                            base_model.eta_names[i],
+                            d.kind.name()
+                        ));
+                    }
+                    let names: Vec<&str> = d
+                        .shape_thetas
+                        .iter()
+                        .map(|&k| base_model.theta_names[k].as_str())
+                        .collect();
+                    if names.is_empty() {
+                        d.kind.name().to_string()
+                    } else {
+                        format!("{}({})", d.kind.name(), names.join(", "))
+                    }
+                }
+            });
+        }
+        margins.extend((0..n_cov).map(|_| "normal".to_string()));
+        let vals: Vec<String> = (0..n_total)
+            .flat_map(|i| (0..=i).map(move |j| (i, j)))
+            .map(|(i, j)| format!("{:.6e}", omega_matrix[i][j]))
+            .collect();
+        model.push_str(&format!(
+            "  block_omega ({}) = [{}] density copula({})\n\n",
+            eta_names_str,
+            vals.join(", "),
+            margins.join(", ")
+        ));
+    } else {
+        model.push_str(&format!("  block_omega ({}) = [\n", eta_names_str));
+        for i in 0..n_total {
+            model.push_str("    ");
+            for j in 0..=i {
+                if j > 0 {
+                    model.push_str(", ");
+                }
+                model.push_str(&format!("{:.6e}", omega_matrix[i][j]));
             }
-            model.push_str(&format!("{:.6e}", omega_matrix[i][j]));
+            if i < n_total - 1 {
+                model.push(',');
+            }
+            model.push('\n');
         }
-        if i < n_total - 1 {
-            model.push(',');
-        }
-        model.push('\n');
+        model.push_str("  ]\n\n");
     }
-    model.push_str("  ]\n\n");
 
     // Copy base sigmas.
     if let Some(params_lines) = blocks.get("parameters") {
@@ -1424,6 +1471,7 @@ mod tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             eta_densities: Vec::new(),
+            kappa_densities: Vec::new(),
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
             mixture: None,

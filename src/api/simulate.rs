@@ -1102,6 +1102,16 @@ fn emit_subject_rows<R: rand::Rng>(
         kappas = kappa_draw
             .expect("simulate_inner_with_draw builds a KappaDraw per subject of a kappa model")
             .draw(&kappa_factor, normal, rng);
+        // #1716: each occasion's κ under the model's κ density groups.
+        for kap in kappas.iter_mut() {
+            crate::stats::eta_density::redraw_latents(
+                &model.kappa_densities,
+                &omega_iov.matrix,
+                &params.theta,
+                kap,
+                rng,
+            );
+        }
         pk::predict_iov(
             model,
             subject,
