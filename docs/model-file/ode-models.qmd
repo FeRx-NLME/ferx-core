@@ -452,6 +452,35 @@ on `two_cpt_oral_ode` ran 48 iterations instead of 39 here, and the same fit sta
 four perturbed initial estimates came out 0.91× to 1.21× either way — the spread of the
 path, not of the per-evaluation cost.
 
+#### Which engine ran it {#rhs-route-note}
+
+A fit reports the right-hand side's engine when it is not native code, once, as an
+informational entry in `warnings` / `warning_details` (category `ode_rhs_route`), and
+`ferx check` reports the same text as an `info` row
+([#2681](https://github.com/FeRx-NLME/ferx-core/issues/2681)):
+
+- `W_ODE_RHS_INTERPRETED`: the block keeps the interpreter. The message names the
+  construct (an inline `if`, `sqrt`, a read of `L` before it is assigned, …) and the
+  statement it is in (`d/dt(sm)`, the assignment to `E`). For an inline `if` it also gives
+  the measured cost below; no other construct has been measured.
+- `W_ODE_RHS_NOT_NATIVE`: the block compiled, but runs as register code, because
+  `FERX_NO_RHS_JIT=1` is set, Cranelift cannot target the host, or the native compiler did
+  not build the program.
+
+A compiled block that runs as native code gets no entry. To keep a block compiled, rewrite
+the construct the message names: an `if` that clamps a ratio to 1, as in a Friberg
+feedback term, is `0.5 * (x + 1.0 + abs(x - 1.0))`; a `sqrt` of individual parameters
+only moves to `[individual_parameters]`.
+
+The inline `if` measurement: `covs8_focei` from the `neutropenia_msk` test model (8 states,
+the Friberg feedback above) on a tenth of its subjects (512), FOCEI with `maxiter = 0`, one
+thread, and `gradient = fd` on both versions so that only the right-hand side's engine
+differs. With the `if` the run took 193.1 s; with the `abs` rewrite, 81.7 s (2.4×; Linux
+x86_64, one run each, on a shared machine). The two objectives were not identical
+(−269.44 and −261.89), so the inner solves did not do exactly the same work; read the ratio
+as approximate. [#2680](https://github.com/FeRx-NLME/ferx-core/issues/2680) measured 3.3× on
+an 8-state model with about 5,000 subjects on macOS arm64.
+
 ### Sensitivities in PK space {#pk-space-sensitivities}
 
 A subject whose individual parameters are constant over time has predictions that depend on
