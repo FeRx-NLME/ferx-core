@@ -15807,6 +15807,27 @@ mod start_warm_rescore {
         assert!(!wants_start_warm_rescore(&stats(3, 0), 30, -1000.0, 0.1));
     }
 
+    /// A warm re-solve replaces the cold one only when the guard accepts it **and** its
+    /// objective is finite (#2682 review r3). `ebe_guard_rejects` answers `false` for a
+    /// non-finite objective, so the `NaN` / `∞` rows straddle the guard: accepted by it,
+    /// refused here. Mutation: drop `raw_ofv.is_finite()` → those two rows go `true`.
+    #[test]
+    fn a_non_finite_warm_resolve_is_not_accepted() {
+        for bad in [f64::NAN, f64::INFINITY] {
+            assert!(
+                !ebe_guard_rejects(&stats(0, 0), 30, bad, 0.1),
+                "premise: the guard alone accepts a non-finite objective ({bad})"
+            );
+            assert!(
+                !warm_rescore_accepted(&stats(0, 0), 30, bad, 0.1),
+                "a {bad} re-solve must not replace the cold solve"
+            );
+        }
+        assert!(warm_rescore_accepted(&stats(0, 0), 30, -1040.0, 0.1));
+        assert!(!warm_rescore_accepted(&stats(6, 0), 30, -1040.0, 0.1));
+        assert!(!warm_rescore_accepted(&stats(0, 1), 30, -1040.0, 0.1));
+    }
+
     /// The verbose line for a guarded evaluation names its trigger and the count behind it,
     /// one arm per trigger, and never prints the penalty as an `OFV =` (the issue's
     /// `Eval 1: OFV = 1000000050451.003662`).

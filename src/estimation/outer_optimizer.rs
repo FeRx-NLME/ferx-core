@@ -2014,6 +2014,23 @@ type StartSolve = (
     Option<crate::estimation::agq::PopulationEvaluation>,
 );
 
+/// Whether [`wants_start_warm_rescore`]'s warm re-solve replaces the cold solve it was run
+/// from: the guard accepts it **and** its objective is finite.
+///
+/// The second half is not implied by the first. [`ebe_guard_rejects`] answers `false` for a
+/// non-finite objective — the fraction trigger only judges a finite one — so on the guard
+/// alone a re-solve that returned `NaN` or `∞` would replace a finite, fraction-rejected
+/// cold solve and be published as an unguarded start, which `above_start_warning` then
+/// skips (#2682 review r3). Kept, the cold solve stays the evaluation, rejected as before.
+pub(crate) fn warm_rescore_accepted(
+    stats: &InnerLoopStats,
+    n_subj: usize,
+    raw_ofv: f64,
+    max_unconverged_frac: f64,
+) -> bool {
+    raw_ofv.is_finite() && !ebe_guard_rejects(stats, n_subj, raw_ofv, max_unconverged_frac)
+}
+
 /// The verbose line for an evaluation the optimizer was handed a penalty for instead of
 /// its objective (#2682): which trigger rejected it, with the count behind it.
 fn guarded_eval_line(
@@ -6930,8 +6947,12 @@ fn optimize_nlopt_attempt_probed(
                 // evaluation is the cold one, as it was before #2682, and so is the warm-start
                 // cache — no incumbent exists yet to have earned a non-zero one (#1290).
                 state.cached_etas = cold.cached_etas;
-                let accepted =
-                    !ebe_guard_rejects(&solved.2, n_subj, solved.4, options.max_unconverged_frac);
+                let accepted = warm_rescore_accepted(
+                    &solved.2,
+                    n_subj,
+                    solved.4,
+                    options.max_unconverged_frac,
+                );
                 if verbose {
                     eprintln!(
                         "Eval {:>4}: start rejected by the EBE convergence guard ({} of {} \

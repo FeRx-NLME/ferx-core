@@ -60,8 +60,8 @@ use crate::estimation::outer_optimizer::{
     flat_theta_candidates, flat_theta_probe_moves, flat_theta_probe_value, flat_theta_warning,
     joint_warm_start, joint_warm_starts, max_scaled_deviation, population_gradient,
     resolve_outer_ftol, runs_outer_optimizer, subject_nll, wants_start_warm_rescore,
-    OuterFdDeclineLog, OuterResult, OuterTrial, PolishEnd, StartEval, INIT_ESCAPE_STEP_S,
-    MAX_POLISH_LEGS, POLISH_FTOL_REL, POLISH_XTOL_REL,
+    warm_rescore_accepted, OuterFdDeclineLog, OuterResult, OuterTrial, PolishEnd, StartEval,
+    INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS, POLISH_FTOL_REL, POLISH_XTOL_REL,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_params,
@@ -2765,7 +2765,7 @@ pub(crate) fn optimize_profiled(
                     let rewarm = ProfileWarm::from_solve(&layout, cold);
                     let resolved = ctx.solve_counted(&params, &rewarm, &mut work);
                     let accepted = resolved.as_ref().is_ok_and(|w| {
-                        !ebe_guard_rejects(&w.ebe, n_subj, w.ofv, options.max_unconverged_frac)
+                        warm_rescore_accepted(&w.ebe, n_subj, w.ofv, options.max_unconverged_frac)
                     });
                     if options.verbose {
                         eprintln!(
