@@ -115,7 +115,9 @@ or by any other column in the data
 ```
 
 A value that reads as a number is a number, checked when the file is parsed, exactly
-as before. Anything else is an expression, compiled with the same expression language
+as before — also against the other numbers of a block that mixes in expressions, so
+`start_dose = 5` with `dose_bounds = [10, 30 * WT]` is a parse error, not a refusal of
+the first subject. Anything else is an expression, compiled with the same expression language
 as `observe` (`min`, `max`, `exp`, `if (…) … else …`, …).
 
 Each expression is evaluated **once per subject, at the first decision** (`at[0]`),
@@ -161,9 +163,10 @@ message that names the key and the name read. A spec built in code is checked ag
 when the run starts.
 
 On a FREM model, a dose expression that reads a covariate doses from the value in the
-data, while a subject whose η is drawn has PK that follows its drawn covariate η. The
-`W_FREM_DRAWN_ETA` warning then names the covariates the dose expressions read, each
-with the first key that reads it.
+data, while a subject whose η is drawn has PK that follows its drawn covariate η — unless
+the model's own expressions read that column directly. The `W_FREM_DRAWN_ETA` warning
+then names the covariates the dose expressions read and the model does not, each with
+the first key that reads it.
 
 ### Rules — `when signal <op> <value> : <action>`
 

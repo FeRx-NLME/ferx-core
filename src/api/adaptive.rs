@@ -2000,6 +2000,23 @@ pub fn simulate_adaptive_from_spec_with_inputs(
                 | crate::sim::adaptive::AdaptiveRoute::Infuse { cmt, .. } => cmt,
             },
         },
-        &dose_covs,
+        // `W_FREM_DRAWN_ETA` names only the covariates the model's own expressions do
+        // not read: a drawn subject's PK follows the data for a column the model reads
+        // directly, so the clause would be false for it (#2667 review r1 row 6b).
+        &frem_only_dose_covariates(model, &dose_covs),
     )
+}
+
+/// The dose-expression covariates (key, name) that the model's own expressions do not
+/// read (`referenced_covariates`): on a FREM model those reach a drawn subject's PK only
+/// through its drawn covariate η.
+fn frem_only_dose_covariates<'a>(
+    model: &CompiledModel,
+    dose_covariates: &[(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str)> {
+    dose_covariates
+        .iter()
+        .filter(|(_, name)| !model.referenced_covariates.iter().any(|r| r == name))
+        .copied()
+        .collect()
 }

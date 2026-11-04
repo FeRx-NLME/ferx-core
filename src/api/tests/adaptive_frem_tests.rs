@@ -660,3 +660,37 @@ fn adaptive_frem_warning_names_a_dose_expression_that_reads_the_data() {
     );
     assert_eq!(drawn_warnings(&expr.warnings), vec![&want]);
 }
+
+/// A covariate the model's own expressions read directly is not named (#2667 review r1
+/// row 6b): there a drawn subject's PK does follow the data, so "which these subjects'
+/// PK does not follow" would be false. Both sides in one run: CL reads `WT`, nothing in
+/// the model reads `HT`, and the dose expression reads both — only `HT` is named.
+///
+/// Regressions: the filter dropped → `WT` named too; the filter inverted → only `WT`
+/// named; the filter applied to the wrong list → no sentence at all.
+#[test]
+fn adaptive_frem_warning_skips_a_dose_covariate_the_model_reads_directly() {
+    let src = model_src("  obs_scale = V", false, PROP);
+    assert_eq!(src.matches("  CL = TVCL\n").count(), 1, "fixture CL line");
+    let m = parse_model_string(&src.replace("  CL = TVCL\n", "  CL = TVCL * WT / 70\n"))
+        .expect("parse");
+    assert!(m.frem_config.is_some(), "fixture is a FREM model");
+    assert!(m.referenced_covariates.iter().any(|c| c == "WT"));
+    assert!(!m.referenced_covariates.iter().any(|c| c == "HT"));
+    let mut pop = population([1; 6]);
+    pop.subjects[0].covariates.insert("WT".to_string(), 70.0);
+    pop.subjects[0].covariates.insert("HT".to_string(), 170.0);
+    pop.covariate_names = vec!["WT".to_string(), "HT".to_string()];
+
+    let mut spec = spec_hold();
+    spec.start_dose = crate::sim::adaptive::DoseValue::Expr("0 * WT * HT".to_string());
+    let r = simulate_adaptive_from_spec(&m, &pop, &m.default_params, 1, &spec, &spec_opts())
+        .expect("expression block runs");
+    let want = format!(
+        "{}The [adaptive_dosing] dose expressions compute each subject's doses from the \
+         covariate values in the data (start_dose reads HT), which these subjects' PK does \
+         not follow. {ADAPTIVE_REMEDY}",
+        drawn_head(1, 1, true)
+    );
+    assert_eq!(drawn_warnings(&r.warnings), vec![&want]);
+}

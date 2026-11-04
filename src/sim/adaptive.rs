@@ -983,27 +983,68 @@ pub(crate) enum DosePlanViolation {
 }
 
 /// The first dose invariant `plan` breaks, if any.
-#[allow(clippy::float_cmp)] // `start_dose ∈ levels` is exact membership
 pub(crate) fn dose_plan_violation(plan: &SubjectDosePlan) -> Option<DosePlanViolation> {
-    let (lo, hi) = plan.dose_bounds;
-    if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi < lo {
+    let levels: Option<Vec<Option<f64>>> = plan
+        .levels
+        .as_ref()
+        .map(|l| l.iter().copied().map(Some).collect());
+    known_dose_violation(
+        Some(plan.start_dose),
+        Some(plan.dose_bounds.0),
+        Some(plan.dose_bounds.1),
+        levels.as_deref(),
+    )
+}
+
+/// The first dose invariant broken by the values that are **known** (`None` is an
+/// expression, not yet evaluated), in the order [`AdaptiveDosingSpec::validate`] has
+/// always checked them. Each check runs only when every value it compares is known, so
+/// a block that mixes numbers and expressions is checked among its numbers when it is
+/// parsed (#2667 review r1 row 1), and a subject's plan — every value known — gets
+/// exactly the full check. The one implementation of each dose invariant.
+#[allow(clippy::float_cmp)] // `start_dose ∈ levels` is exact membership
+fn known_dose_violation(
+    d: Option<f64>,
+    lo: Option<f64>,
+    hi: Option<f64>,
+    levels: Option<&[Option<f64>]>,
+) -> Option<DosePlanViolation> {
+    // `low >= 0` and `low <= high` make a negative `high` invalid on its own.
+    let bad = |x: Option<f64>| x.is_some_and(|x| !x.is_finite() || x < 0.0);
+    let inverted = matches!((lo, hi), (Some(l), Some(h)) if h < l);
+    if bad(lo) || bad(hi) || inverted {
         return Some(DosePlanViolation::Bounds);
     }
-    let d = plan.start_dose;
-    if !d.is_finite() || d < 0.0 {
-        return Some(DosePlanViolation::StartNotFinite);
-    }
-    if d < lo || d > hi {
-        return Some(DosePlanViolation::StartOutsideBounds);
-    }
-    if let Some(l) = &plan.levels {
-        if let Err(e) = validate_increasing_finite(l, "levels") {
-            return Some(DosePlanViolation::LevelsOrder(e));
+    let below = |x: f64| lo.is_some_and(|l| x < l);
+    let above = |x: f64| hi.is_some_and(|h| x > h);
+    if let Some(d) = d {
+        if !d.is_finite() || d < 0.0 {
+            return Some(DosePlanViolation::StartNotFinite);
         }
-        if !l.contains(&d) {
-            return Some(DosePlanViolation::StartNotALevel);
+        if below(d) || above(d) {
+            return Some(DosePlanViolation::StartOutsideBounds);
         }
-        if let Some((i, &bad)) = l.iter().enumerate().find(|(_, &x)| x < lo || x > hi) {
+    }
+    if let Some(l) = levels {
+        // The known rungs, in order, must increase: for strictly increasing values a
+        // known pair out of order is a violation whatever lies between them.
+        let known: Vec<f64> = l.iter().flatten().copied().collect();
+        if l.is_empty() || !known.is_empty() {
+            if let Err(e) = validate_increasing_finite(&known, "levels") {
+                return Some(DosePlanViolation::LevelsOrder(e));
+            }
+        }
+        // An expression rung could equal the start dose, so membership needs them all.
+        if let Some(d) = d {
+            if known.len() == l.len() && !known.contains(&d) {
+                return Some(DosePlanViolation::StartNotALevel);
+            }
+        }
+        let outside = l
+            .iter()
+            .enumerate()
+            .find_map(|(i, x)| x.filter(|&x| below(x) || above(x)).map(|x| (i, x)));
+        if let Some((i, bad)) = outside {
             return Some(DosePlanViolation::LevelOutsideBounds(i, bad));
         }
     }
@@ -1011,10 +1052,13 @@ pub(crate) fn dose_plan_violation(plan: &SubjectDosePlan) -> Option<DosePlanViol
 }
 
 impl DosePlanViolation {
-    /// The pre-#944 parse-time text, for a block whose dose values are all numbers.
-    fn literal_message(&self, plan: &SubjectDosePlan) -> String {
-        let (lo, hi) = plan.dose_bounds;
-        let d = plan.start_dose;
+    /// The parse-time text, from the spec as written: the pre-#944 text, byte for byte,
+    /// for a block whose dose values are all numbers (a literal's source is its
+    /// `Display`), and the same sentence with the expression in place of an unknown
+    /// value otherwise. Only the checks whose values are all known reach here.
+    fn literal_message(&self, spec: &AdaptiveDosingSpec) -> String {
+        let d = spec.start_dose.source();
+        let (lo, hi) = (spec.dose_bounds.0.source(), spec.dose_bounds.1.source());
         match self {
             DosePlanViolation::Bounds => format!(
                 "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: [{lo}, {hi}]"
@@ -1026,9 +1070,14 @@ impl DosePlanViolation {
                 format!("[adaptive_dosing]: start_dose {d} is outside dose_bounds [{lo}, {hi}]")
             }
             DosePlanViolation::LevelsOrder(e) => e.clone(),
+            // Reached only when every rung is a number.
             DosePlanViolation::StartNotALevel => format!(
                 "[adaptive_dosing]: start_dose {d} must be one of the declared levels {:?}",
-                plan.levels.as_deref().unwrap_or(&[])
+                spec.levels
+                    .iter()
+                    .flatten()
+                    .filter_map(DoseValue::as_literal)
+                    .collect::<Vec<f64>>()
             ),
             DosePlanViolation::LevelOutsideBounds(_, bad) => {
                 format!("[adaptive_dosing]: level {bad} is outside dose_bounds [{lo}, {hi}]")
@@ -1178,20 +1227,24 @@ impl AdaptiveDosingSpec {
                 "[adaptive_dosing]: at least one `when … : …` rule is required".to_string(),
             );
         }
-        // The dose invariants, on a block whose dose values are all numbers (#944). With
-        // an expression among them they are checked per subject instead, before any
-        // subject runs (`resolve_dose_plans`). The violation is found once, here, and
-        // reported at the position each check has always had in this function, so a
-        // block breaking several invariants names the same one it did before #944.
-        let literal = self.literal_dose_plan();
-        let violation = literal.as_ref().and_then(dose_plan_violation);
-        let literal_err = |v: &DosePlanViolation| {
-            v.literal_message(
-                literal
-                    .as_ref()
-                    .expect("a violation implies a literal plan"),
-            )
-        };
+        // The dose invariants among the values written as numbers (#944): all of them
+        // on a block of numbers, and every check whose values are all numbers on a block
+        // that mixes in expressions (#2667 review r1 row 1). The checks that involve an
+        // expression run per subject, before any subject runs (`resolve_dose_plans`).
+        // The violation is found once, here, and reported at the position each check has
+        // always had in this function, so a block breaking several invariants names the
+        // same one it did before #944.
+        let levels: Option<Vec<Option<f64>>> = self
+            .levels
+            .as_ref()
+            .map(|l| l.iter().map(DoseValue::as_literal).collect());
+        let violation = known_dose_violation(
+            self.start_dose.as_literal(),
+            self.dose_bounds.0.as_literal(),
+            self.dose_bounds.1.as_literal(),
+            levels.as_deref(),
+        );
+        let literal_err = |v: &DosePlanViolation| v.literal_message(self);
         if let Some(
             v @ (DosePlanViolation::Bounds
             | DosePlanViolation::StartNotFinite
