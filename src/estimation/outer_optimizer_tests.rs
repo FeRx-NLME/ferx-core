@@ -9992,8 +9992,11 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
 /// What this test does not see on Linux: absorbing without handing the cold modes to the
 /// warm-start cache (`absorb_cold_incumbent`'s `cached_etas = modes`) re-trapped on macOS and
 /// reddened the no-restart assertion, but on Linux it still finishes in one leg (169
-/// evaluations to 775.394259). That hand-off is pinned at Tier 1 by
-/// `an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two`.
+/// evaluations to 775.394259). The write inside the helper is pinned at Tier 1 by
+/// `an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two`; the `modes` the
+/// probe's absorb arm passes it (`outer_cache_warm_starts` of the cold solve) is not pinned
+/// by any test, and a wrong-length vector would skip the write silently. Nor is the probe's
+/// share on Linux off its gate: 2 of 200 sits exactly on the 1 % boundary.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
