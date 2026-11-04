@@ -2751,18 +2751,48 @@ fn classify_theta_eta_linked(
     n_theta: usize,
     nn_theta_deps: &[Vec<Vec<usize>>],
 ) -> Vec<bool> {
+    let mut linked = vec![false; n_theta];
+    for deps in indiv_var_deps(stmts, nn_theta_deps).values() {
+        if deps.has_eta {
+            for &i in &deps.thetas {
+                if i < n_theta {
+                    linked[i] = true;
+                }
+            }
+        }
+    }
+    linked
+}
+
+/// What one `[individual_parameters]` variable depends on, through every intermediate.
+#[derive(Debug, Clone, Default)]
+struct IndivVarDeps {
+    thetas: std::collections::BTreeSet<usize>,
+    has_eta: bool,
+    reads_time: bool,
+}
+
+/// [`IndivVarDeps`] of every variable assigned in `stmts`. An `if`/`else` contributes its
+/// condition's reads to every variable assigned inside it. Runs before index resolution, so
+/// it sees `Expression::Variable`, never `VariableIdx`.
+fn indiv_var_deps(
+    stmts: &[Statement],
+    nn_theta_deps: &[Vec<Vec<usize>>],
+) -> std::collections::HashMap<String, IndivVarDeps> {
     use std::collections::{HashMap, HashSet};
 
     #[derive(Default, Clone)]
     struct Deps {
         thetas: HashSet<usize>,
         has_eta: bool,
+        reads_time: bool,
         vars: HashSet<String>,
     }
     impl Deps {
         fn merge(&mut self, other: &Deps) {
             self.thetas.extend(other.thetas.iter().copied());
             self.has_eta |= other.has_eta;
+            self.reads_time |= other.reads_time;
             self.vars.extend(other.vars.iter().cloned());
         }
     }
@@ -2780,6 +2810,7 @@ fn classify_theta_eta_linked(
                 d.thetas.extend(spec.theta_indices());
             }
             Expression::Eta(_) => d.has_eta = true,
+            Expression::Time => d.reads_time = true,
             Expression::Variable(v) => {
                 d.vars.insert(v.clone());
             }
@@ -2824,31 +2855,25 @@ fn classify_theta_eta_linked(
     let mut map: HashMap<String, Deps> = HashMap::new();
     walk(stmts, &Deps::default(), &mut map, nn_theta_deps);
 
-    let mut linked = vec![false; n_theta];
-    for name in map.keys() {
-        // Transitive closure over referenced variables (cycle-safe).
-        let mut thetas: HashSet<usize> = HashSet::new();
-        let mut has_eta = false;
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut stack: Vec<&str> = vec![name.as_str()];
-        while let Some(v) = stack.pop() {
-            if !seen.insert(v) {
-                continue;
-            }
-            let Some(d) = map.get(v) else { continue };
-            thetas.extend(d.thetas.iter().copied());
-            has_eta |= d.has_eta;
-            stack.extend(d.vars.iter().map(String::as_str));
-        }
-        if has_eta {
-            for i in thetas {
-                if i < n_theta {
-                    linked[i] = true;
+    map.keys()
+        .map(|name| {
+            // Transitive closure over referenced variables (cycle-safe).
+            let mut out = IndivVarDeps::default();
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut stack: Vec<&str> = vec![name.as_str()];
+            while let Some(v) = stack.pop() {
+                if !seen.insert(v) {
+                    continue;
                 }
+                let Some(d) = map.get(v) else { continue };
+                out.thetas.extend(d.thetas.iter().copied());
+                out.has_eta |= d.has_eta;
+                out.reads_time |= d.reads_time;
+                stack.extend(d.vars.iter().map(String::as_str));
             }
-        }
-    }
-    linked
+            (name.clone(), out)
+        })
+        .collect()
 }
 
 /// Classify each top-level [individual_parameters] assignment and return
@@ -5912,6 +5937,11 @@ pub fn parse_full_model_with(
     // desugared statements, so `[covariate_model]` thetas are classified too.
     let theta_eta_linked =
         classify_theta_eta_linked(&indiv_stmts, theta_names.len(), &nn_theta_deps);
+    // Which `[odes]` conditions move with an estimated parameter (#2649). Needs the same
+    // desugared statements, so the dependencies a condition's parameters carry are complete.
+    if let Some(program) = ode_spec.as_mut().and_then(|o| o.rhs_program.as_mut()) {
+        program.resolve_moving_switches(&indiv_var_deps(&indiv_stmts, &nn_theta_deps));
+    }
     debug_assert_eq!(
         theta_transform.len(),
         theta_names.len(),
@@ -7304,6 +7334,20 @@ pub fn parse_full_model_with(
     // desugared because the PK-slot layout was full (see the headroom check above).
     if let Some(note) = readout_fd_fallback_note.take() {
         model.parse_warnings.push(note);
+    }
+
+    // The route change below the scope gate is otherwise invisible (#2649).
+    if let Some(switch) = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .and_then(|p| p.moving_switch())
+    {
+        model.parse_warnings.push(format!(
+            "[odes]: `{switch}` depends on a model parameter and reaches an `if` condition \
+             that switches during the integration, so the switching time moves with it. Exact \
+             derivatives cannot see that, so this model uses finite-difference gradients."
+        ));
     }
 
     model.parse_warnings.extend(check_unused_parameters(
@@ -16502,6 +16546,51 @@ fn build_ode_spec(
 
     // Linearity is decided on names, so before the rewrite below turns them into slots (#852).
     let affine_in_states = ode_linearity::stmts_affine_in_states(&stmts_owned, &state_names_owned);
+    // Also on names, for the same reason (#2649).
+    let name_of_slot = |slot: &usize| {
+        indiv_slots_owned
+            .iter()
+            .position(|s| s == slot)
+            .map(|i| indiv_names_owned[i].clone())
+    };
+    let is_dose_attr = |attr: Option<crate::types::DoseAttr>, i: usize, slot: usize| {
+        let indexed = crate::types::DoseAttr::from_indexed_name(&indiv_names_owned[i]);
+        match attr {
+            Some(a) => {
+                slot == crate::types::PK_IDX_LAGTIME || indexed.is_some_and(|(found, _)| found == a)
+            }
+            None => {
+                slot == crate::types::PK_IDX_F
+                    || slot == crate::types::PK_IDX_LAGTIME
+                    || indexed.is_some()
+            }
+        }
+    };
+    let params_where = |attr: Option<crate::types::DoseAttr>| -> Vec<String> {
+        indiv_slots_owned
+            .iter()
+            .enumerate()
+            .filter(|&(i, &slot)| is_dose_attr(attr, i, slot))
+            .map(|(i, _)| indiv_names_owned[i].clone())
+            .collect()
+    };
+    let condition_reads = ode_switch::conditions_reading_params(
+        &stmts_owned,
+        &ode_switch::SwitchInputs {
+            states: &state_names_owned,
+            params: &indiv_names_owned,
+            dose_params: params_where(None),
+            lag_params: params_where(Some(crate::types::DoseAttr::Lag)),
+            forcing_params: input_rate
+                .iter()
+                .map(|f| {
+                    let slots = f.arg_slots.iter().chain(&f.frac_slot).chain(&f.lag_slot);
+                    (f.cmt, slots.filter_map(name_of_slot).collect())
+                })
+                .collect(),
+            inits: &init_specs,
+        },
+    );
 
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
@@ -16765,6 +16854,8 @@ fn build_ode_spec(
         pk_reads_tad,
         pk_reads_solver_time,
         affine_in_states,
+        condition_reads,
+        moving_switches: Vec::new(),
         #[cfg(feature = "survival")]
         init_indiv_reads,
         init_program,
@@ -30911,6 +31002,12 @@ pub struct OdeRhsProgram {
     /// read through [`Self::is_affine_in_states`] (#852). Decided on the unresolved program by
     /// `ode_linearity::stmts_affine_in_states`.
     affine_in_states: bool,
+    /// The `if` conditions an individual parameter reaches (#2649). Decided on the unresolved
+    /// program; [`Self::moving_switch`] is what a gate should ask.
+    condition_reads: Vec<ode_switch::ConditionReads>,
+    /// The parameters that move an `if` switch (#2649). Filled once `[individual_parameters]`
+    /// is known; see [`Self::resolve_moving_switches`].
+    moving_switches: Vec<String>,
     /// The parameter-only subexpressions lifted out of the RK stages, and the
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
@@ -31000,6 +31097,36 @@ impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
 }
 
 impl OdeRhsProgram {
+    /// Fill [`Self::moving_switches`] from `deps`, the `[individual_parameters]` dependencies.
+    /// A condition counts when something in it varies during the integration (a state, a
+    /// clock, or a parameter that reads `TIME`). A parameter counts when a θ or η reaches it,
+    /// FIX or not: `ModelParameters::theta_fixed` is the caller's to change at `fit()`, which
+    /// the model-level scope cannot see. A covariate-only `LAGT = WT / 10` is left alone.
+    fn resolve_moving_switches(&mut self, deps: &std::collections::HashMap<String, IndivVarDeps>) {
+        let mut out: Vec<String> = Vec::new();
+        for c in &self.condition_reads {
+            let moves = c.moves
+                || c.params
+                    .iter()
+                    .any(|p| deps.get(p).is_some_and(|d| d.reads_time));
+            if !moves {
+                continue;
+            }
+            for p in &c.params {
+                let Some(d) = deps.get(p) else { continue };
+                if (d.has_eta || !d.thetas.is_empty()) && !out.contains(p) {
+                    out.push(p.clone());
+                }
+            }
+        }
+        self.moving_switches = out;
+    }
+
+    /// The first parameter whose `if` switch moves with it (#2649), if any.
+    pub(crate) fn moving_switch(&self) -> Option<&str> {
+        self.moving_switches.first().map(String::as_str)
+    }
+
     /// `rhs` as direct native calls ([`DirectRhsF64`]): `Some` only when `rhs` is the very
     /// closure this program was built with (same address) and the program has an `f64`
     /// native function.
@@ -35131,6 +35258,9 @@ fn parse_if_statement(
 
 #[path = "ode_linearity.rs"]
 mod ode_linearity;
+
+#[path = "ode_switch.rs"]
+mod ode_switch;
 
 #[path = "rhs_regcode.rs"]
 mod rhs_regcode;
