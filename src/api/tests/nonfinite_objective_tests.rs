@@ -4019,15 +4019,10 @@ fn a_short_mcem_fit_is_told_its_verdict_was_not_tested() {
     );
 }
 
-/// The falling arm through `fit()`. EM grows a far-too-small Ω slowly, so 30 iterations
-/// end with the objective still dropping. The twin differs only in starting Ω near its
-/// estimate, so it settles on the same data and schedule.
-#[test]
-fn a_run_stopped_while_falling_reaches_the_published_verdict() {
-    use crate::api::postfit::MCEM_NOT_SETTLED_TOKEN;
-    let model = |omega: f64| {
-        parse_model_string(&format!(
-            r#"
+/// A one-compartment model, starting from Ω = `omega`.
+fn slow_em_model(omega: f64) -> CompiledModel {
+    parse_model_string(&format!(
+        r#"
 [parameters]
   theta TVCL(1.0, 0.1, 50.0)
   theta TVV(10.0, 1.0, 500.0, FIX)
@@ -4041,9 +4036,12 @@ fn a_run_stopped_while_falling_reaches_the_published_verdict() {
 [error_model]
   DV ~ proportional(PROP)
 "#
-        ))
-        .expect("parse")
-    };
+    ))
+    .expect("parse")
+}
+
+/// Twenty subjects whose clearances spread widely, for [`slow_em_model`].
+fn slow_em_pop() -> Population {
     let subject = |i: usize| {
         let mut s = subject_with_dose_time(&i.to_string(), 0.0, 1.0);
         let cl = (2.4 * (((i * 37 % 101) as f64) / 101.0 - 0.5)).exp();
@@ -4054,7 +4052,17 @@ fn a_run_stopped_while_falling_reaches_the_published_verdict() {
             .collect();
         s
     };
-    let pop = population_of((0..20).map(subject).collect());
+    population_of((0..20).map(subject).collect())
+}
+
+/// The falling arm through `fit()`. EM grows a far-too-small Ω slowly, so 30 iterations
+/// end with the objective still dropping. The twin differs only in starting Ω near its
+/// estimate, so it settles on the same data and schedule.
+#[test]
+fn a_run_stopped_while_falling_reaches_the_published_verdict() {
+    use crate::api::postfit::MCEM_NOT_SETTLED_TOKEN;
+    let model = slow_em_model;
+    let pop = slow_em_pop();
     let opts = FitOptions {
         methods: vec![EstimationMethod::Imp],
         imp_iterations: 30,
@@ -4108,6 +4116,55 @@ fn a_run_stopped_while_falling_reaches_the_published_verdict() {
         .expect("marginal published");
     assert_eq!(details["marginal"], published.minus2_log_likelihood);
     assert_eq!(details["marginal_mc_se"], published.mc_standard_error);
+}
+
+/// `run_imp` and `run_impmap` are public, so a direct caller reads `converged` with no
+/// `fit()` behind it. Both arms, on the fixtures of the `fit()` test above. `run_impmap`
+/// shares the verdict; `each_mcem_driver_publishes_its_trail` pins that it gets there.
+#[test]
+fn a_direct_estimator_call_gets_the_settling_verdict() {
+    use crate::api::postfit::MCEM_NOT_SETTLED_TOKEN;
+    use crate::estimation::impmap::run_imp;
+    let pop = slow_em_pop();
+    let opts = FitOptions {
+        imp_iterations: 30,
+        imp_samples: 100,
+        imp_auto: false,
+        imp_seed: Some(7),
+        run_covariance_step: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    let notice = |r: &crate::estimation::outer_optimizer::OuterResult| {
+        r.warnings
+            .iter()
+            .find(|w| w.starts_with(MCEM_NOT_SETTLED_TOKEN))
+            .cloned()
+    };
+
+    let tiny = slow_em_model(0.001);
+    let bad = run_imp(&tiny, &pop, &tiny.default_params, None, &opts).expect("imp");
+    assert!(!bad.converged, "{:?}", bad.warnings);
+    let msg = notice(&bad).unwrap_or_else(|| panic!("{:?}", bad.warnings));
+    assert!(msg.contains("still falling"), "{msg}");
+    assert!(msg.contains("`imp_iterations`"), "{msg}");
+
+    let near = slow_em_model(0.4);
+    let good = run_imp(&near, &pop, &near.default_params, None, &opts).expect("imp");
+    assert!(good.converged, "{:?}", good.warnings);
+    assert_eq!(notice(&good), None);
+
+    // The marginal arm needs the marginal, which a stage does not compute.
+    let starved = FitOptions {
+        imp_samples: 5,
+        imp_proposal_df: f64::INFINITY,
+        imp_averaging: 1,
+        ..opts.clone()
+    };
+    let bad = run_imp(&near, &pop, &near.default_params, None, &starved).expect("imp");
+    assert!(!bad.converged, "{:?}", bad.warnings);
+    let msg = notice(&bad).unwrap_or_else(|| panic!("{:?}", bad.warnings));
+    assert!(msg.contains("stayed well above"), "{msg}");
 }
 
 /// The rise arm through `fit()`: `mcem_lowest_objective` has to survive from the loop to

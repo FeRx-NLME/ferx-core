@@ -406,9 +406,10 @@ readout replaces `ofv` and leaves both checks in force.
 
 ## When the objective has not settled {#not-settled}
 
-Every IMP and IMPMAP run stops at its iteration limit, finished or not. So `fit()`
-checks the end of the iteration trace, and reports `converged: false` with
-`W_MCEM_NOT_SETTLED` when it shows the run had not finished (#2686).
+Every IMP and IMPMAP run stops at its iteration limit, finished or not. So `fit()`, and
+a direct `run_imp` or `run_impmap` call, check the end of the iteration trace, and report
+`converged: false` with `W_MCEM_NOT_SETTLED` when it shows the run had not finished
+(#2686).
 
 The check reads the objective's *floor*: the lower 10% point of the last 50 iterations.
 A shorter run uses windows of a third of its length, so it never reads the first third,

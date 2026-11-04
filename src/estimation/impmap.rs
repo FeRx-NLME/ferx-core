@@ -905,11 +905,107 @@ fn run_map_multistart(
     (eta_hats, h_matrices, kappas, stats)
 }
 
-/// Run IMPMAP. `warm_etas`, when supplied by a preceding chain stage, seed the
-/// first MAP inner loop; otherwise the inner loop cold-starts from η = 0.
-/// Run IMPMAP (NONMEM `METHOD=IMPMAP`). Thin wrapper over the shared MCEM core
-/// with mode re-centering on every iteration; resolves the `impmap_*` options.
+/// The importance-sampling marginal −2 log L at a finished stage's estimates, as NONMEM
+/// reports it. `fit()` publishes it, and a direct [`run_imp`] / [`run_impmap`] call reads
+/// it for its verdict. `options` are the stage's. A mixture uses its own evaluator.
+pub(crate) fn evaluate_final_marginal(
+    model: &CompiledModel,
+    population: &Population,
+    result: &OuterResult,
+    options: &FitOptions,
+    method: EstimationMethod,
+) -> Result<crate::types::ImportanceSamplingResult, String> {
+    use crate::estimation::importance_sampling::{
+        run_importance_sampling, run_importance_sampling_mixture,
+    };
+    let mut marg_opts = options.clone();
+    // `run_importance_sampling` reads the `imp_*` knobs; for IMPMAP map the
+    // `impmap_*` knobs onto them so the final eval mirrors the method's
+    // own sample count / proposal df / seed.
+    if method == EstimationMethod::Impmap {
+        marg_opts.imp_samples = options.impmap_samples;
+        marg_opts.imp_seed = options.impmap_seed;
+        marg_opts.imp_low_ess_threshold = options.impmap_low_ess_threshold;
+        // A Gaussian IMPMAP proposal (`impmap_proposal_df = ∞`, opt-in)
+        // is one the IS evaluator could sample (#2651), but its light
+        // tails leave the weights unbounded. The marginal is
+        // proposal-independent in expectation, so evaluate under a
+        // finite-t proposal instead (heavier tails ⇒ bounded weights).
+        // The default `impmap_proposal_df = 4` passes through unchanged.
+        let df = options.impmap_proposal_df;
+        marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
+    }
+    if model.mixture.is_some() {
+        run_importance_sampling_mixture(model, population, &result.params, &marg_opts)
+    } else {
+        run_importance_sampling(
+            model,
+            population,
+            &result.params,
+            &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            &marg_opts,
+        )
+    }
+}
+
+/// Give a direct [`run_imp`] / [`run_impmap`] caller the settling verdict `fit()` gives
+/// its stages (#2686), which needs the final marginal a stage does not compute. If the
+/// marginal fails, the falling-floor test still runs and a warning says so.
+fn apply_settling_verdict(
+    mut result: OuterResult,
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+    method: EstimationMethod,
+) -> OuterResult {
+    use crate::api::postfit::mcem_settling_warning;
+    let marginal = match evaluate_final_marginal(model, population, &result, options, method) {
+        Ok(is) => Some(FinalMarginal {
+            value: is.minus2_log_likelihood,
+            mc_se: is.mc_standard_error,
+        }),
+        Err(e) => {
+            result
+                .warnings
+                .push(format!("marginal −2 log L eval skipped: {e}"));
+            None
+        }
+    };
+    let trail = result.mcem_objective_trail.take();
+    if let Some((msg, _)) = mcem_settling_warning(&mut result.converged, trail.as_ref(), marginal) {
+        result.warnings.push(msg);
+    }
+    result.mcem_objective_trail = trail;
+    result
+}
+
+/// Run IMPMAP (NONMEM `METHOD=IMPMAP`), as a complete estimation. `warm_etas`, when
+/// supplied, seed the first MAP inner loop; otherwise it cold-starts from η = 0.
+///
+/// `converged` includes the settling verdict, so this also scores the final marginal.
 pub fn run_impmap(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>,
+    options: &FitOptions,
+) -> Result<OuterResult, String> {
+    let result = run_impmap_stage(model, population, init_params, warm_etas, options)?;
+    Ok(apply_settling_verdict(
+        result,
+        model,
+        population,
+        options,
+        EstimationMethod::Impmap,
+    ))
+}
+
+/// One IMPMAP stage of a `fit()`, which scores the marginal and gives the settling
+/// verdict itself. Thin wrapper over the shared MCEM core with mode re-centering on
+/// every iteration; resolves the `impmap_*` options.
+pub(crate) fn run_impmap_stage(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -941,11 +1037,31 @@ pub fn run_impmap(
     )
 }
 
-/// Run IMP as an estimator (NONMEM `METHOD=IMP`). Thin wrapper over the shared
-/// MCEM core with sample-moment re-centering (conditional mode found only on the
-/// first iteration); resolves the `imp_*` options. The evaluation-only
-/// `imp_eval_only` path lives in `importance_sampling.rs`.
+/// Run IMP as an estimator (NONMEM `METHOD=IMP`), as a complete estimation. The
+/// evaluation-only `imp_eval_only` path lives in `importance_sampling.rs`.
+///
+/// `converged` includes the settling verdict, so this also scores the final marginal.
 pub fn run_imp(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>,
+    options: &FitOptions,
+) -> Result<OuterResult, String> {
+    let result = run_imp_stage(model, population, init_params, warm_etas, options)?;
+    Ok(apply_settling_verdict(
+        result,
+        model,
+        population,
+        options,
+        EstimationMethod::Imp,
+    ))
+}
+
+/// One IMP stage of a `fit()`, which scores the marginal and gives the settling verdict
+/// itself. Thin wrapper over the shared MCEM core with sample-moment re-centering
+/// (conditional mode found only on the first iteration); resolves the `imp_*` options.
+pub(crate) fn run_imp_stage(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -5295,7 +5411,7 @@ mod tests {
         let pop = iov_pop();
         let mut opts = FitOptions::default();
         opts.impmap_iterations = 3;
-        opts.impmap_samples = 100;
+        opts.impmap_samples = 120;
         opts.impmap_seed = Some(11);
         opts.imp_iterations = 4;
         opts.imp_samples = 100;
@@ -5312,6 +5428,14 @@ mod tests {
         let params = &model.default_params;
         let mixture = run_impmap(&model, &pop, params, None, &opts).expect("mixture impmap");
         check(&mixture, 3, "IMPMAP", "impmap");
+        // The wrapper reaches the mixture too: too short to test, and saying so.
+        let told = |w: &String| w.starts_with("W_MCEM_SETTLING_UNTESTED: IMPMAP: 3 iteration(s)");
+        assert!(mixture.warnings.iter().any(told), "{:?}", mixture.warnings);
+        let marginal =
+            evaluate_final_marginal(&model, &pop, &mixture, &opts, EstimationMethod::Impmap)
+                .expect("mixture marginal");
+        assert!(marginal.minus2_log_likelihood.is_finite());
+        assert_eq!(marginal.n_samples, opts.impmap_samples);
     }
 
     /// The baseline `fit()` reads is the lowest iteration row, and not simply the first:
