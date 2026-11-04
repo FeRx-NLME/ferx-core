@@ -590,6 +590,7 @@ pub fn run_foce_gn(
             mixture_posteriors: None,
             vi: None,
             start_eval: None,
+            mcem_lowest_objective: None,
         };
     }
 
@@ -768,6 +769,7 @@ pub fn run_foce_gn(
         mixture_posteriors: None,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: None,
     }
 }
 

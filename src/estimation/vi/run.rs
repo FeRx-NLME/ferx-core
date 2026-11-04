@@ -1282,6 +1282,7 @@ pub fn run_vi(
         stationary_start: false,
         vi: Some(vi_result),
         start_eval: None,
+        mcem_lowest_objective: None,
         mixture_posteriors: None,
     })
 }

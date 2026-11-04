@@ -7299,6 +7299,7 @@ pub fn run_saem(
         mixture_posteriors,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: None,
     })
 }
 
