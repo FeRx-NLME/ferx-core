@@ -3185,6 +3185,7 @@ pub ferx_core::types::FitOptions::imp_defensive_alpha: f64
 pub ferx_core::types::FitOptions::imp_eval_only: bool
 pub ferx_core::types::FitOptions::imp_iterations: usize
 pub ferx_core::types::FitOptions::imp_low_ess_threshold: f64
+pub ferx_core::types::FitOptions::imp_max_time: core::option::Option<f64>
 pub ferx_core::types::FitOptions::imp_proposal_df: f64
 pub ferx_core::types::FitOptions::imp_samples: usize
 pub ferx_core::types::FitOptions::imp_seed: core::option::Option<u64>
@@ -3193,6 +3194,7 @@ pub ferx_core::types::FitOptions::impmap_auto: bool
 pub ferx_core::types::FitOptions::impmap_averaging: usize
 pub ferx_core::types::FitOptions::impmap_iterations: usize
 pub ferx_core::types::FitOptions::impmap_low_ess_threshold: f64
+pub ferx_core::types::FitOptions::impmap_max_time: core::option::Option<f64>
 pub ferx_core::types::FitOptions::impmap_mceta: usize
 pub ferx_core::types::FitOptions::impmap_proposal_df: f64
 pub ferx_core::types::FitOptions::impmap_samples: usize
@@ -4780,6 +4782,7 @@ pub ferx_core::FitOptions::imp_defensive_alpha: f64
 pub ferx_core::FitOptions::imp_eval_only: bool
 pub ferx_core::FitOptions::imp_iterations: usize
 pub ferx_core::FitOptions::imp_low_ess_threshold: f64
+pub ferx_core::FitOptions::imp_max_time: core::option::Option<f64>
 pub ferx_core::FitOptions::imp_proposal_df: f64
 pub ferx_core::FitOptions::imp_samples: usize
 pub ferx_core::FitOptions::imp_seed: core::option::Option<u64>
@@ -4788,6 +4791,7 @@ pub ferx_core::FitOptions::impmap_auto: bool
 pub ferx_core::FitOptions::impmap_averaging: usize
 pub ferx_core::FitOptions::impmap_iterations: usize
 pub ferx_core::FitOptions::impmap_low_ess_threshold: f64
+pub ferx_core::FitOptions::impmap_max_time: core::option::Option<f64>
 pub ferx_core::FitOptions::impmap_mceta: usize
 pub ferx_core::FitOptions::impmap_proposal_df: f64
 pub ferx_core::FitOptions::impmap_samples: usize

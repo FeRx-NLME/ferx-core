@@ -36,8 +36,11 @@
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
 use crate::estimation::impmap::draw_obs_nll;
+use crate::pk::event_driven::EventSchedule;
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
-use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into, SUBJECT_SENTINEL_NLL};
+use crate::stats::likelihood::{
+    m3_logcdf, obs_nll_subject_into, obs_nll_subject_into_with_schedule, SUBJECT_SENTINEL_NLL,
+};
 use crate::stats::special::ln_gamma;
 use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::stats::util::{
@@ -733,7 +736,7 @@ pub fn run_importance_sampling(
                     let theta = &params.theta;
                     let sigma = &params.sigma.values;
                     let obs_nll = |b: &[f64], sc: &mut EventPkParams| {
-                        draw_obs_nll(model, subject, theta, sigma, b, sc)
+                        draw_obs_nll(model, subject, theta, sigma, b, None, sc)
                     };
                     let mixture = DefensiveMixture::new(&omega_joint_inv, n_b, defensive_alpha);
                     let (center, h) = adapt_proposal(
@@ -1847,9 +1850,10 @@ pub(crate) fn subject_is_draws(
     iscale: f64,
     use_sobol: bool,
     mixture: Option<&DefensiveMixture>,
+    schedule: Option<&EventSchedule>,
 ) -> SubjectDraws {
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
-        obs_nll_subject_into(
+        obs_nll_subject_into_with_schedule(
             model,
             subject,
             theta,
@@ -1857,6 +1861,7 @@ pub(crate) fn subject_is_draws(
             model.residual_cov_theta(theta),
             eta,
             scratch,
+            schedule,
         )
     };
     subject_is_draws_with(
@@ -2100,9 +2105,10 @@ pub(crate) fn find_optimal_iscale(
     scratch: &mut EventPkParams,
     iscale_min: f64,
     iscale_max: f64,
+    schedule: Option<&EventSchedule>,
 ) -> f64 {
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
-        obs_nll_subject_into(
+        obs_nll_subject_into_with_schedule(
             model,
             subject,
             theta,
@@ -2110,6 +2116,7 @@ pub(crate) fn find_optimal_iscale(
             model.residual_cov_theta(theta),
             eta,
             scratch,
+            schedule,
         )
     };
     find_optimal_iscale_with(
@@ -3955,6 +3962,7 @@ mod tests {
             1.0,
             true,
             Some(&mix),
+            None,
         );
         let q = sobol_qmc_draws(3, k, seed, nu, true);
         let mut n_broad = 0;
@@ -4153,6 +4161,7 @@ mod tests {
                     1.0,
                     sobol,
                     mixture,
+                    None,
                 )
                 .etas
             };

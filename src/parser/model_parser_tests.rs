@@ -4571,6 +4571,25 @@ fn test_apply_fit_option_adaptive_sampling_flags() {
     assert!(!opts.imp_auto);
     assert_eq!(apply_fit_option(&mut opts, "impmap_auto", "no"), Ok(true));
     assert!(!opts.impmap_auto);
+
+    assert_eq!(opts.imp_max_time, None, "no limit by default");
+    assert_eq!(opts.impmap_max_time, None, "no limit by default");
+    assert_eq!(
+        apply_fit_option(&mut opts, "imp_max_time", "3000"),
+        Ok(true)
+    );
+    assert_eq!(opts.imp_max_time, Some(3000.0));
+    assert_eq!(opts.impmap_max_time, None);
+    assert_eq!(
+        apply_fit_option(&mut opts, "impmap_max_time", "60.5"),
+        Ok(true)
+    );
+    assert_eq!(opts.impmap_max_time, Some(60.5));
+    assert_eq!(opts.imp_max_time, Some(3000.0));
+    for bad in ["0", "-1", "inf", "NaN"] {
+        let err = apply_fit_option(&mut opts, "imp_max_time", bad).unwrap_err();
+        assert!(err.contains("`imp_max_time`"), "{bad}: {err}");
+    }
 }
 
 #[test]

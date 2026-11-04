@@ -7802,6 +7802,9 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Info, WarningCode::MultiStart)
     } else if lower.contains("cancelled by user") {
         (WarningSeverity::Info, WarningCode::Cancelled)
+    } else if lower.contains("_max_time`") {
+        // #2687: the fit stopped on its wall-clock limit, so `converged` is false.
+        (WarningSeverity::Warning, WarningCode::Convergence)
     } else if lower.contains("thread count overridden") {
         // #1416: a front end's explicit `--threads` beat the model file's
         // `[fit_options] threads`. A Warning, not Info, for the same reason the
@@ -9520,17 +9523,28 @@ pub struct FitOptions {
     /// RB path against the full-dimensional sampler.
     pub frem_rao_blackwell: bool,
     /// Adaptive importance-sample count for IMP (NONMEM `AUTO`). When `true` (the
-    /// default), `imp_samples` is the *starting* count and is doubled after each
-    /// iteration, up to 10000, while the **per-subject** objective Monte-Carlo SE
-    /// (the total SE over √N) exceeds 0.05. K never comes back down. High-dimensional
-    /// / FREM fits then reach a low-noise objective instead of carrying a sample-count-
-    /// dependent M-step bias, but a fit that stays above the target runs at the cap,
-    /// at about ten times the per-iteration cost of K = 1000. Set `false` to pin the
-    /// sample count.
+    /// default), `imp_samples` is the *starting* count and the floor. K rises, up to
+    /// 10000 and at most doubling per iteration, while the **per-subject** objective
+    /// Monte-Carlo SE (the total SE over √N) exceeds 0.05, but only once the objective
+    /// has settled or the averaging window is about to start, so the descent of a
+    /// cold start cannot set K for the whole run. K halves again when the SE falls
+    /// below 0.025. High-dimensional / FREM fits then reach a low-noise objective
+    /// instead of carrying a sample-count-dependent M-step bias, but a fit that stays
+    /// above the target runs at the cap, at about ten times the per-iteration cost of
+    /// K = 1000. Set `false` to pin the sample count.
     pub imp_auto: bool,
     /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
-    /// [`FitOptions::imp_auto`] but ramps `impmap_samples`. Default `true`.
+    /// [`FitOptions::imp_auto`] but moves `impmap_samples`. Default `true`.
     pub impmap_auto: bool,
+    /// Wall-clock limit in seconds on the IMP iterations. Checked after each
+    /// iteration, so the last one always completes. A fit that reaches it stops
+    /// there, keeps its current estimate, finishes the usual post-fit work (final
+    /// EBEs, covariance step, marginal) and reports `converged = false` with a
+    /// warning. In a chain it covers the IMP stage alone. `None` (the default) means
+    /// no limit.
+    pub imp_max_time: Option<f64>,
+    /// As [`FitOptions::imp_max_time`], for IMPMAP.
+    pub impmap_max_time: Option<f64>,
     /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
     /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
     /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
@@ -9938,6 +9952,8 @@ impl Default for FitOptions {
             frem_rao_blackwell: true,
             imp_auto: true,
             impmap_auto: true,
+            imp_max_time: None,
+            impmap_max_time: None,
             iscale_min: 0.1,
             iscale_max: 10.0,
             imp_defensive_alpha: 0.0,
@@ -11423,6 +11439,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_max",
             "frem_rao_blackwell",
             "imp_auto",
+            "imp_max_time",
             "imp_defensive_alpha",
         ],
         EstimationMethod::Impmap => &[
@@ -11443,6 +11460,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_max",
             "frem_rao_blackwell",
             "impmap_auto",
+            "impmap_max_time",
             // Both spellings write the same field; `impmap_*` is the canonical
             // IMPMAP form, `imp_*` is accepted so neither is wrongly flagged
             // "unsupported" (issue #528).
