@@ -291,6 +291,11 @@ Off-diagonal Cholesky entries appear as `chol_<eta_row>_<eta_col>` (`L_ij`,
 not log-transformed). See [Packed Parameter
 Space](estimation/parameterization.qmd) for the full layout and bounds.
 
+On an IMP or IMPMAP fit, `objective_function` also carries `ofv_type: laplace`,
+and any fit with an importance-sampling marginal carries
+`marginal_minus2_log_likelihood` and `marginal_mc_standard_error`. See
+[which number matches NONMEM](estimation/importance-sampling.qmd#how-the-estimator-works).
+
 `warnings:` lists the warning messages. `warning_details:` follows it with
 every warning that carries a structured `details` payload — see [Where
 `details` is written](warnings.qmd#where-details-is-written). Both blocks are
