@@ -194,13 +194,13 @@ fn next_sample_count(k: usize, k_start: usize, se_per_subject: f64, may_raise: b
 }
 
 /// The closing advice of the under-sampling warning. Under `auto`, a final count
-/// below the cap means either [`raises_pay`] stopped the ramp (`raises_stopped`) or
-/// the run ran out of iterations rather than out of samples, which the hold on
+/// below the cap means either [`raises_pay`] stopped the ramp or the run ran out of iterations rather than out of samples, which the hold on
 /// raising makes a real case (#2687).
 fn under_sampling_advice(
     auto: bool,
     final_k: usize,
-    raises_stopped: bool,
+    se_history: &[(f64, usize)],
+    k_start: usize,
     sample_opt: &str,
     auto_opt: &str,
 ) -> String {
@@ -209,7 +209,7 @@ fn under_sampling_advice(
             "`{auto_opt}` is enabled but the sample count {final_k} (cap {AUTO_SAMPLES_MAX}) \
              was not enough to reach the MC-SE target."
         )
-    } else if auto && raises_stopped {
+    } else if auto && !raises_pay(se_history, k_start) {
         format!(
             "`{auto_opt}` stopped raising the sample count at {final_k}, below the cap of \
              {AUTO_SAMPLES_MAX}, because extra samples were not lowering the MC SE as they \
@@ -2302,9 +2302,14 @@ fn run_mcem(
         } else {
             String::new()
         };
-        let raises_stopped = !raises_pay(&iteration_se, k_start);
-        let advice =
-            under_sampling_advice(auto, final_k_samples, raises_stopped, sample_opt, auto_opt);
+        let advice = under_sampling_advice(
+            auto,
+            final_k_samples,
+            &iteration_se,
+            k_start,
+            sample_opt,
+            auto_opt,
+        );
         warnings.push(format!(
             "{label}: {} importance samples for {} give a noisy objective \
              (per-subject MC SE = {:.3}, target {:.2}; median ESS/K = {:.2}). The weighted M-step \
@@ -6976,8 +6981,11 @@ mod tests {
 
     #[test]
     fn under_sampling_advice_names_what_ran_out() {
-        let advice =
-            |auto, k, stopped| under_sampling_advice(auto, k, stopped, "imp_samples", "imp_auto");
+        let advice = |auto, k, stopped| {
+            let mut history = at_scale(5.0, 1000, 5);
+            history.extend(at_scale(if stopped { 11.0 } else { 5.0 }, 2000, 5));
+            under_sampling_advice(auto, k, &history, 1000, "imp_samples", "imp_auto")
+        };
         let at_cap = advice(true, AUTO_SAMPLES_MAX, false);
         assert!(at_cap.contains("was not enough") && !at_cap.contains("below the cap"));
         // Reaching the cap is the story even if the last raises were refused.
