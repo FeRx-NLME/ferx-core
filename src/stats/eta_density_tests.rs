@@ -109,6 +109,7 @@ fn each_density_integrates_to_one() {
     for (d, th, omega) in univariate_kinds() {
         let mass = latent_expectation(&d, omega, &th, |_, _| 1.0);
         eprintln!("{:?}: mass − 1 = {:.3e}", d.kind, mass - 1.0);
+        assert!(mass.is_finite(), "{:?}: mass {mass}", d.kind);
         worst = worst.max((mass - 1.0).abs());
     }
     // Measured 4.5e-14 (Simpson on 2e4 / 4e5 panels); 10× headroom.
@@ -142,6 +143,7 @@ fn each_density_has_its_documented_moments() {
             (m1 - want_mean, m2 - m1 * m1 - omega)
         };
         eprintln!("{:?}: Δmean {dmean:.3e}, Δvar {dvar:.3e}", d.kind);
+        assert!(dmean.is_finite() && dvar.is_finite(), "{:?}", d.kind);
         worst = worst.max(dmean.abs()).max(dvar.abs());
     }
     // Measured 3.0e-14 (Simpson on 4e5 panels); 10× headroom.
@@ -240,7 +242,10 @@ fn the_eta_jets_are_the_closed_forms() {
     let mut worst = 0.0f64;
     for i in 0..4 {
         assert!(
-            g[i].is_finite() && h[(i, i)].is_finite(),
+            g[i].is_finite()
+                && h[(i, i)].is_finite()
+                && want_g[i].is_finite()
+                && want_h[i].is_finite(),
             "η{i}: {} {}",
             g[i],
             h[(i, i)]
@@ -436,7 +441,10 @@ fn a_truncated_density_is_the_renormalised_kind() {
             "{kind:?}: mass − 1 {:.2e}, mean {mean:.6} vs {want:.6}",
             mass - 1.0
         );
-        assert!(mass.is_finite() && mean.is_finite(), "{kind:?}");
+        assert!(
+            mass.is_finite() && mean.is_finite() && want.is_finite(),
+            "{kind:?}"
+        );
         worst = worst.max((mass - 1.0).abs()).max((mean - want).abs());
     }
     eprintln!("truncated: worst {worst:.2e}");
@@ -465,7 +473,9 @@ fn a_gaussian_copula_is_the_multivariate_normal() {
     };
     let mut worst = 0.0f64;
     for z in [[0.1, -0.2, 0.3], [-0.5, 0.4, 0.05], [0.0, 0.0, 0.0]] {
-        worst = worst.max(correction(std::slice::from_ref(&d), &z, &oi, &[]).abs());
+        let c = correction(std::slice::from_ref(&d), &z, &oi, &[]);
+        assert!(c.is_finite(), "{z:?}: {c}");
+        worst = worst.max(c.abs());
     }
     eprintln!("copula of normals vs MVN: worst {worst:.2e}");
     // Measured 4.44e-15 (rounding: the correction is identically 0); 20× headroom.
@@ -608,8 +618,8 @@ fn effect_quantiles_are_the_closed_forms() {
     let mut check = |got: Option<[f64; 3]>, want: [f64; 3]| {
         let got = got.expect("a distribution");
         for (g, w) in got.iter().zip(want) {
-            assert!(g.is_finite(), "{got:?}");
-            worst = worst.max(((g - w) / w.abs().max(1.0)).abs());
+            assert!(g.is_finite() && w.is_finite(), "{got:?} vs {want:?}");
+            worst = worst.max((g - w).abs() / w.abs().max(1.0));
         }
     };
     let w = 0.09;

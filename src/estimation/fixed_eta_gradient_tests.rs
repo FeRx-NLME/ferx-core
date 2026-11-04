@@ -226,6 +226,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         kappa_param_types: Vec::new(),
+        kappa_distributions: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]

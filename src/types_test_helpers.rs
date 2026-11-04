@@ -113,6 +113,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         kappa_param_types: Vec::new(),
+        kappa_distributions: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
@@ -216,6 +217,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         kappa_param_types: Vec::new(),
+        kappa_distributions: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
@@ -379,6 +381,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         environment: crate::environment::detect(),
         eta_param_info: Vec::new(),
         kappa_param_types: Vec::new(),
+        kappa_distributions: Vec::new(),
         data_bindings: Default::default(),
         theta_transform: Vec::new(),
         sigma_types: Vec::new(),
@@ -548,6 +551,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
             },
         ],
         kappa_param_types: Vec::new(),
+        kappa_distributions: Vec::new(),
         data_bindings: Default::default(),
         theta_transform: vec![
             ThetaTransform::Log,

@@ -4647,7 +4647,7 @@ pub struct CompiledModel {
     /// `block_sigma` off-diagonal).
     pub residual_serial: Option<ResidualSerial>,
     /// Non-Gaussian random-effect densities (#1716): each group is one Ω block whose ETAs
-    /// follow `density t(ν)` or `density boxcox(λ)` instead of `N(0, Ω)`. Empty for a
+    /// follow a `density KIND(…)` (`gamma`, `t(ν)`, `copula(…)`, …) instead of `N(0, Ω)`. Empty for a
     /// Gaussian model. Every prior consumer adds
     /// `crate::stats::eta_density::correction_g` to its Gaussian term.
     pub eta_densities: Vec<crate::stats::eta_density::EtaDensity>,
@@ -4940,6 +4940,10 @@ pub struct CompiledModel {
     /// assignment, `Custom` otherwise (or when its uses disagree). Never
     /// `LogitProbability`. Forwarded into `FitResult`.
     pub kappa_param_types: Vec<EtaParamType>,
+    /// What each IOV kappa follows when it carries a `density` (#1716), parallel to
+    /// `kappa_names`; `None` for a Gaussian κ, empty for a model with none. Forwarded into
+    /// `FitResult` for the KAPPA rows' notes.
+    pub kappa_distributions: Vec<Option<EtaDistribution>>,
     /// Per-theta transformation: `theta_transform[i]` describes whether theta i
     /// is used on the natural (Identity), log, or logit scale. Length == n_theta.
     pub theta_transform: Vec<ThetaTransform>,
@@ -8246,6 +8250,11 @@ pub struct FitResult {
     /// saved before #1643, and on a hand-built result; consumers then fall
     /// back to the log-normal CV%.
     pub kappa_param_types: Vec<EtaParamType>,
+    /// What each IOV kappa follows when it carries a `density` (#1716), parallel to
+    /// `kappa_names` (`CompiledModel::kappa_distributions`): the KAPPA rows' distribution
+    /// notes. Empty on a result from before it.
+    #[serde(default)]
+    pub kappa_distributions: Vec<Option<EtaDistribution>>,
     /// The data-derived bindings the fitted model was compiled from (#1621):
     /// each θ level block's observed levels and contrast, and the covariate
     /// statistics behind symbolic `[covariate_model]` centres. Rebuilding the
@@ -11513,6 +11522,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "bayes_chains",
             "bayes_thin",
             "bayes_seed",
+            "bayes_omega_prior",
         ],
         EstimationMethod::Vi => &[
             // `inner_maxiter` / `inner_tol` are meaningful only for the optional

@@ -239,6 +239,24 @@ pub fn eta_distribution<'a>(
         .find_map(|i| i.distribution.as_ref())
 }
 
+/// What IOV kappa `k` follows (#1716): `FitResult::kappa_distributions`, `None` for a
+/// Gaussian κ (or a result from before the field).
+pub fn kappa_distribution(result: &FitResult, k: usize) -> Option<&crate::types::EtaDistribution> {
+    result.kappa_distributions.get(k).and_then(Option::as_ref)
+}
+
+/// The fitted values of a distribution's shape θs, read from `theta` by name; `None`
+/// when a name is not in the fit.
+fn distribution_shapes(result: &FitResult, d: &crate::types::EtaDistribution) -> Option<Vec<f64>> {
+    d.shape_thetas
+        .iter()
+        .map(|n| {
+            let k = result.theta_names.iter().position(|t| t == n)?;
+            result.theta.get(k).copied()
+        })
+        .collect()
+}
+
 /// The 5th, 50th and 95th percentiles of BSV ETA `i`'s random effect at the fit's
 /// estimates (#1716), or `None` for a Gaussian ETA (whose CV%/SD the labels give) or a
 /// distribution whose parameters admit none. A density's percentiles are of the effect
@@ -246,23 +264,46 @@ pub fn eta_distribution<'a>(
 /// transform's are of `h(η)`. The shapes are read from `theta` by name.
 pub fn eta_effect_quantiles(result: &FitResult, i: usize) -> Option<[f64; 3]> {
     let d = eta_distribution(result, eta_name(result, i))?;
-    let shapes: Option<Vec<f64>> = d
-        .shape_thetas
-        .iter()
-        .map(|n| {
-            let k = result.theta_names.iter().position(|t| t == n)?;
-            result.theta.get(k).copied()
-        })
-        .collect();
-    crate::stats::eta_density::effect_quantiles(d, result.omega[(i, i)], &shapes?)
+    crate::stats::eta_density::effect_quantiles(
+        d,
+        result.omega[(i, i)],
+        &distribution_shapes(result, d)?,
+    )
 }
 
-/// The console note for BSV ETA `i` when it is non-Gaussian (#1716): its distribution
-/// and the percentiles of its effect, e.g. `density gamma: 5/50/95% = 0.7328 / 0.9900 /
-/// 1.3013`. `None` for a Gaussian ETA. [`OmegaRowsInput::from_result`] prints it in
-/// place of the CV%/SD; ferx-r passes it back through [`OmegaRowsInput`].
-pub fn eta_distribution_note(result: &FitResult, i: usize) -> Option<String> {
-    let d = eta_distribution(result, eta_name(result, i))?;
+/// The effect the model reads for every subject's EBE (#1721 review): `m(ẑ)` for a
+/// density ETA, the EBE itself for a Gaussian or transform one. `SubjectResult::eta`
+/// holds the latent `ẑ`, the coordinates every estimator works in and the ones
+/// `predict(etas = …)` takes back; this is the same table on the effect's scale. One row
+/// per subject, one column per BSV ETA.
+pub fn eta_effects(result: &FitResult) -> Vec<Vec<f64>> {
+    let dists: Vec<Option<&crate::types::EtaDistribution>> = (0..result.omega.nrows())
+        .map(|i| eta_distribution(result, eta_name(result, i)))
+        .collect();
+    result
+        .subjects
+        .iter()
+        .map(|s| {
+            s.eta
+                .iter()
+                .enumerate()
+                .map(|(i, &z)| match dists.get(i).copied().flatten() {
+                    Some(d) => crate::stats::eta_density::effect_of_latent(d, z),
+                    None => z,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The note for one non-Gaussian random effect of variance or scale `omega`: its
+/// distribution, its exact mean with the CV% (a nonzero mean) or SD (a zero mean) where
+/// both moments exist in closed form, and the 5/50/95% percentiles of its effect.
+fn distribution_note_for(
+    result: &FitResult,
+    d: &crate::types::EtaDistribution,
+    omega: f64,
+) -> String {
     let mut note = format!("{} {}", d.form, d.kind);
     if !d.shape_thetas.is_empty() {
         note.push_str(&format!("({})", d.shape_thetas.join(", ")));
@@ -275,13 +316,59 @@ pub fn eta_distribution_note(result: &FitResult, i: usize) -> Option<String> {
             side(hi, "inf")
         ));
     }
-    if let Some([a, b, c]) = eta_effect_quantiles(result, i) {
+    let shapes = distribution_shapes(result, d);
+    // The mean pins the scale: `density lognormal` has mean 1, where `TV·exp(η)` has
+    // median 1 (#1721 review, finding 5), and ω is the effect's variance.
+    if let Some((m, v)) = shapes
+        .as_deref()
+        .and_then(|s| crate::stats::eta_density::effect_moments_of(d, omega, s))
+    {
+        if m.abs() > 1e-12 {
+            note.push_str(&format!(
+                " (mean {}, CV% = {})",
+                fmt_mean(m),
+                console_cv_pct(100.0 * v.sqrt() / m.abs())
+            ));
+        } else {
+            note.push_str(&format!(" (mean 0, SD = {:.4})", v.sqrt()));
+        }
+    }
+    if let Some([a, b, c]) = shapes
+        .as_deref()
+        .and_then(|s| crate::stats::eta_density::effect_quantiles(d, omega, s))
+    {
         // A bisected median of a symmetric kind lands a hair below 0: print `0.0000`.
         let z = |v: f64| if v.abs() < 5e-5 { 0.0 } else { v };
         let (a, b, c) = (z(a), z(b), z(c));
         note.push_str(&format!(": 5/50/95% = {a:.4} / {b:.4} / {c:.4}"));
     }
-    Some(note)
+    note
+}
+
+/// A mean of exactly 1 prints as `1`; another (a beta's μ) to four decimals.
+fn fmt_mean(m: f64) -> String {
+    if m == 1.0 {
+        "1".to_string()
+    } else {
+        format!("{m:.4}")
+    }
+}
+
+/// The console note for BSV ETA `i` when it is non-Gaussian (#1716): its distribution,
+/// its exact mean with CV% or SD where those exist, and the percentiles of its effect,
+/// e.g. `density gamma (mean 1, CV% = 17.3): 5/50/95% = 0.7328 / 0.9900 / 1.3013`.
+/// `None` for a Gaussian ETA. [`OmegaRowsInput::from_result`] prints it in place of the
+/// CV%/SD; ferx-r passes it back through [`OmegaRowsInput`].
+pub fn eta_distribution_note(result: &FitResult, i: usize) -> Option<String> {
+    let d = eta_distribution(result, eta_name(result, i))?;
+    Some(distribution_note_for(result, d, result.omega[(i, i)]))
+}
+
+/// [`eta_distribution_note`] for IOV kappa `k`, at its `omega_iov` variance.
+pub fn kappa_distribution_note(result: &FitResult, k: usize) -> Option<String> {
+    let d = kappa_distribution(result, k)?;
+    let w = result.omega_iov.as_ref()?.get((k, k)).copied()?;
+    Some(distribution_note_for(result, d, w))
 }
 
 fn eta_type(result: &FitResult, name: &str) -> Option<EtaParamType> {
@@ -662,6 +749,10 @@ pub struct KappaRowsInput<'a> {
     /// Per-kappa scale (#1643). Empty means unknown (a fit saved before #1643)
     /// and prints the log-normal CV%.
     pub kappa_param_types: &'a [EtaParamType],
+    /// Per-κ note for a κ with a `density` (#1716), parallel to `kappa_names`: its
+    /// distribution and effect percentiles, printed in place of the CV%/SD. Empty (or a
+    /// `None` entry) prints the type's spread.
+    pub kappa_distribution_notes: Vec<Option<String>>,
     /// Per-kappa weight column of a sample-size-weighted kappa (#1031); `None`
     /// for an unweighted one.
     pub kappa_weights: &'a [Option<String>],
@@ -685,6 +776,9 @@ impl<'a> KappaRowsInput<'a> {
             kappa_fixed: &r.kappa_fixed,
             se_kappa: r.se_kappa.as_deref(),
             kappa_param_types: &r.kappa_param_types,
+            kappa_distribution_notes: (0..r.kappa_names.len())
+                .map(|k| kappa_distribution_note(r, k))
+                .collect(),
             kappa_weights: &r.kappa_weights,
             kappa_weight_typical: &r.kappa_weight_typical,
             kappa_levels: &r.kappa_levels,
@@ -748,7 +842,11 @@ pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) ->
         };
         let weight = kappa_weight_facts(input.kappa_weights, input.kappa_weight_typical, i, var);
         let kappa_type = input.kappa_param_types.get(i).copied();
-        let note = note_suffix(variance_note(kappa_type, var, weight.is_some()), show_cv);
+        let dist_note = input.kappa_distribution_notes.get(i).cloned().flatten();
+        let note = note_suffix(
+            dist_note.or_else(|| variance_note(kappa_type, var, weight.is_some())),
+            show_cv,
+        );
         let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
         // Sample-size-weighted IOV (#1031): the estimate above is the
         // *unweighted* γ² — the quantity a published MBMA reports — so
@@ -3368,6 +3466,20 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 writeln!(f, "    effect_quantiles_5_50_95: [{a:.6}, {b:.6}, {c:.6}]")
                     .map_err(|e| e.to_string())?;
             }
+            if let Some((m, v)) = distribution_shapes(result, d)
+                .and_then(|sh| crate::stats::eta_density::effect_moments_of(d, var, &sh))
+            {
+                writeln!(f, "    effect_mean: {m:.6}").map_err(|e| e.to_string())?;
+                writeln!(f, "    effect_sd: {:.6}", v.sqrt()).map_err(|e| e.to_string())?;
+                if m.abs() > 1e-12 {
+                    writeln!(
+                        f,
+                        "    effect_cv_pct: {}",
+                        yaml_cv_pct(100.0 * v.sqrt() / m.abs())
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
         }
         if is_fixed {
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
@@ -4224,6 +4336,7 @@ mod tests {
             environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: Vec::new(),
             kappa_param_types: Vec::new(),
+            kappa_distributions: Vec::new(),
             data_bindings: Default::default(),
             theta_transform: Vec::new(),
             sigma_types,
@@ -5410,6 +5523,7 @@ mod tests {
             environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: Vec::new(),
             kappa_param_types: Vec::new(),
+            kappa_distributions: Vec::new(),
             data_bindings: Default::default(),
             theta_transform: Vec::new(),
             sigma_types,
@@ -8124,6 +8238,7 @@ mod tests {
                             kappa_fixed: &r.kappa_fixed,
                             se_kappa: r.se_kappa.as_deref(),
                             kappa_param_types: &r.kappa_param_types,
+                            kappa_distribution_notes: Vec::new(),
                             kappa_weights: &r.kappa_weights,
                             kappa_weight_typical: &r.kappa_weight_typical,
                             kappa_levels: &r.kappa_levels,
@@ -9248,6 +9363,7 @@ mod tests {
             kappa_fixed: &[],
             se_kappa: Some(&se),
             kappa_param_types: &[],
+            kappa_distribution_notes: Vec::new(),
             kappa_weights: &[],
             kappa_weight_typical: &[],
             kappa_levels: &[],

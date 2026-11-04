@@ -514,7 +514,7 @@ Refusals only `fit()` raises, from the model and options it is handed.
 
 | Code | Severity | Meaning |
 |------|----------|---------|
-| `E_DENSITY_UNSUPPORTED` | error | A `density` random effect ([Random-effect distributions](../model-file/random-effect-distributions.qmd), [#1716](https://github.com/FeRx-NLME/ferx-core/issues/1716)) on IOV κs that span two nested levels in one block. Raised by `fit()`. Block `parameters`. |
+| `E_DENSITY_UNSUPPORTED` | error | A `density` random effect ([Random-effect distributions](../model-file/random-effect-distributions.qmd), [#1716](https://github.com/FeRx-NLME/ferx-core/issues/1716)) with a kink or a positive-density edge (`laplace`, `symtriangular`, `uniform`, `arcsine`, `loguniform`, `pareto`, `gpd`) under FOCE, FOCEI, FOCE-GN, Laplace or VI's Laplace objective, or on IOV κs that span two nested levels in one block. Raised by `fit()`. Block `parameters`. |
 
 #### File entry points {#codes-file-entry-points}
 

@@ -858,6 +858,10 @@ struct IovWire {
     /// back to the log-normal CV%.
     #[serde(default)]
     kappa_param_types: Vec<String>,
+    /// What each kappa follows when it carries a `density` (#1716), parallel to
+    /// `kappa_names`. Not written when no κ has one; defaulted for older bundles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kappa_distributions: Vec<Option<crate::types::EtaDistribution>>,
     /// Each kappa's level, parallel to `kappa_names`, for a model with nested levels
     /// (#1082 PR4). Empty otherwise, and then not written, so every other bundle is
     /// byte-identical; defaulted so a bundle written before #1082 PR4 still reads.
@@ -1309,6 +1313,11 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 .iter()
                 .map(|&t| eta_param_type_to_str(t).into())
                 .collect(),
+            kappa_distributions: if r.kappa_distributions.iter().any(Option::is_some) {
+                r.kappa_distributions.clone()
+            } else {
+                Vec::new()
+            },
             kappa_levels: r.kappa_levels.clone(),
             levels: r
                 .ebe_kappas_by_level
@@ -2768,6 +2777,11 @@ fn wire_to_fit_result(
     };
     let covariance_matrix = w.covariance_matrix.map(|m| m.into_dmatrix()).transpose()?;
 
+    let kappa_distributions = w
+        .iov
+        .as_ref()
+        .map(|i| i.kappa_distributions.clone())
+        .unwrap_or_default();
     let (
         omega_iov,
         kappa_names,
@@ -3010,6 +3024,7 @@ fn wire_to_fit_result(
         environment: w.environment.unwrap_or_default(),
         eta_param_info,
         kappa_param_types,
+        kappa_distributions,
         theta_transform,
         sigma_types,
         cov_eigenvalues: w.cov_eigenvalues,

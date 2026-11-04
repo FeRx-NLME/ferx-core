@@ -2110,6 +2110,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         parse_warnings: Vec::new(),
         eta_param_info: Vec::new(),
         kappa_param_types: Vec::new(),
+        kappa_distributions: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]

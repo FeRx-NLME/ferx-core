@@ -23,7 +23,7 @@
 //! are univariate; `lognormal` on a block is the multivariate log-normal, and `copula(…)`
 //! correlates any univariate margins through a Gaussian copula. A Box-Cox
 //! "density" needs no kind of its own: on its latent scale it is exactly the Box-Cox
-//! transform, so `density boxcox(λ)` is spelled as `transform boxcox(λ)`.
+//! transform, which `[eta_shape]` declares (`density boxcox` is refused).
 //!
 //! Every consumer keeps its Gaussian prior `zᵀΩ⁻¹z + ln|Ω|` (ferx's `−2 ln p` convention,
 //! which drops `n ln 2π`) and adds this module's **correction**, for each group `g`:
@@ -152,7 +152,6 @@ impl DomainMap {
     }
 
     /// `m(z)`.
-    #[cfg(test)]
     pub(crate) fn apply(self, z: f64) -> f64 {
         match self {
             DomainMap::Identity => z,
@@ -316,6 +315,20 @@ impl DensityKind {
         }
     }
 
+    /// Whether its latent density has a kink or a hard edge where the density is still
+    /// positive (Laplace's and the triangle's peak, the uniform's, arcsine's,
+    /// log-uniform's and Pareto's edges, the GPD's upper edge for ω < 1). The
+    /// FOCE-family curvature reads the prior's Hessian at the EBE, which is undefined at
+    /// a kink and blind to an edge, so those methods refuse such a kind (#1721 review);
+    /// IMP, SAEM, Bayes and VI score it exactly.
+    pub(crate) fn has_kink_or_edge(self) -> bool {
+        use DensityKind::*;
+        matches!(
+            self,
+            Laplace | SymTriangular | Uniform | Arcsine | LogUniform | Pareto | GeneralizedPareto
+        )
+    }
+
     /// Whether a block of several ETAs can follow it: the multivariate t, the
     /// multivariate log-normal (`lognormal` on a block, Pumas's `MvLogNormal`) and the
     /// copula.
@@ -443,6 +456,92 @@ use kinds::ln1p_g;
 
 #[path = "eta_density_kinds.rs"]
 mod kinds;
+
+/// The random effect `m(z)` a reported distribution's model reads at latent `z`: the
+/// kind's domain map, or a truncation's bounded map (`lo + (hi − lo)·inv_logit(z)`,
+/// `lo + exp(z)`, `hi − exp(z)`), as the parser rewrites the reads. A transform's ETA is
+/// itself Gaussian, so it maps to itself; an unknown kind gives `NaN`.
+pub(crate) fn effect_of_latent(d: &crate::types::EtaDistribution, z: f64) -> f64 {
+    if d.form != "density" {
+        return z;
+    }
+    let Some(kind) = DensityKind::from_name(&d.kind) else {
+        return f64::NAN;
+    };
+    match d.truncation {
+        Some((Some(lo), Some(hi))) => lo + (hi - lo) / (1.0 + (-z).exp()),
+        Some((Some(lo), None)) => lo + z.exp(),
+        Some((None, Some(hi))) => hi - z.exp(),
+        _ => kind.map().apply(z),
+    }
+}
+
+/// The exact mean and variance of a reported distribution's effect (#1721 review), at
+/// variance or scale `omega` and the kind's shape values: `kinds::effect_moments`.
+/// `None` for a transform, a truncation (renormalised moments are not closed-form here)
+/// and a kind without them.
+pub(crate) fn effect_moments_of(
+    d: &crate::types::EtaDistribution,
+    omega: f64,
+    shapes: &[f64],
+) -> Option<(f64, f64)> {
+    if d.form != "density" || d.truncation.is_some() {
+        return None;
+    }
+    let kind = DensityKind::from_name(&d.kind)?;
+    kinds::effect_moments(kind, omega, shapes).filter(|(m, v)| m.is_finite() && v.is_finite())
+}
+
+/// Effect-scale shrinkage for every density ETA (#1721 review), written over
+/// `shrinkage[k]`: `1 − RMS(m(ẑ) − μ) / σ`, with `μ` and `σ²` the effect's exact prior
+/// mean and variance (`effect_moments_of`). The Gaussian formula `1 − RMS(ẑ)/√ω` reads
+/// the latent against the effect's variance and assumes a centred latent, neither of
+/// which holds for a density. `NaN` when the moments have no closed form (a truncation, a
+/// t with ν ≤ 2, …) or fewer than two subjects. Gaussian ETAs are left as they are.
+pub(crate) fn effect_shrinkage(
+    model: &crate::types::CompiledModel,
+    theta: &[f64],
+    omega: &DMatrix<f64>,
+    subjects: &[crate::types::SubjectResult],
+    shrinkage: &mut [f64],
+) {
+    for (k, name) in model.eta_names.iter().enumerate() {
+        let Some(d) = model
+            .eta_param_info
+            .iter()
+            .filter(|i| &i.eta_name == name)
+            .find_map(|i| i.distribution.as_ref())
+        else {
+            continue;
+        };
+        if d.form != "density" || k >= shrinkage.len() || k >= omega.nrows() {
+            continue;
+        }
+        let shapes: Option<Vec<f64>> = d
+            .shape_thetas
+            .iter()
+            .map(|n| {
+                let t = model.theta_names.iter().position(|x| x == n)?;
+                theta.get(t).copied()
+            })
+            .collect();
+        let moments = shapes
+            .as_deref()
+            .and_then(|s| effect_moments_of(d, omega[(k, k)], s))
+            .filter(|&(_, v)| v > 0.0);
+        shrinkage[k] = match moments {
+            Some((mu, v)) if subjects.len() >= 2 => {
+                let ms = subjects
+                    .iter()
+                    .map(|s| (effect_of_latent(d, s.eta[k]) - mu).powi(2))
+                    .sum::<f64>()
+                    / subjects.len() as f64;
+                1.0 - ms.sqrt() / v.sqrt()
+            }
+            _ => f64::NAN,
+        };
+    }
+}
 
 /// The 5th, 50th and 95th percentiles of the random effect a reported distribution
 /// describes, at variance (or scale²) `omega` and shape values `shapes` (the kind's own,
@@ -1205,15 +1304,44 @@ pub(crate) fn redraw_latents(
 }
 
 /// What a `density` random effect is not carried beside (#1716), as `fit()`'s refusal: a
-/// κ density under nested IOV levels (which share κs across cells). `None` when the fit
-/// can run.
+/// kink or edge kind (`DensityKind::has_kink_or_edge`) under a FOCE-family or Laplace
+/// method, and a κ density under nested IOV levels (which share κs across cells). `None`
+/// when the fit can run.
 pub(crate) fn fit_refusal(
     model: &crate::types::CompiledModel,
-    _options: &crate::types::FitOptions,
+    options: &crate::types::FitOptions,
     _params: &crate::types::ModelParameters,
 ) -> Option<String> {
     if model.eta_densities.is_empty() && model.kappa_densities.is_empty() {
         return None;
+    }
+    // A kink or an edge under a method that reads the prior's curvature at the EBE.
+    use crate::types::EstimationMethod as M;
+    // VI's `vi_final_ofv = laplace` reports a Laplace objective too.
+    let curvature = options.method_chain().into_iter().find(|m| {
+        matches!(
+            m,
+            M::Foce | M::FoceI | M::FoceGn | M::FoceGnHybrid | M::Laplace
+        ) || (*m == M::Vi && options.vi_final_ofv == crate::types::ViFinalOfv::Laplace)
+    });
+    if let Some(m) = curvature {
+        for d in model.eta_densities.iter().chain(&model.kappa_densities) {
+            let kinds = if d.kind == DensityKind::Copula {
+                d.margins.clone()
+            } else {
+                vec![d.kind]
+            };
+            if let Some(k) = kinds.into_iter().find(|k| k.has_kink_or_edge()) {
+                return Some(format!(
+                    "`density {}` has a kink or an edge where its density is positive, \
+                     so {} would read a prior curvature that does not exist there and \
+                     print an objective that may be wrong; fit it with `method = imp`, \
+                     `saem` or `bayes`, which score it exactly",
+                    k.name(),
+                    m.label()
+                ));
+            }
+        }
     }
     // A κ density group spanning two nested levels is never placed in one block: refuse.
     if let Some(nl) = model.nested_levels() {

@@ -105,6 +105,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         kappa_param_types: Vec::new(),
+        kappa_distributions: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
@@ -472,6 +473,7 @@ fn test_simulate_honours_tv_covariates() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         kappa_param_types: Vec::new(),
+        kappa_distributions: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]

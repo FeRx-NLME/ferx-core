@@ -40,12 +40,6 @@ use std::path::{Path, PathBuf};
 /// `tests/` as a repo-relative input, so an `api/…` entry would name a top-level `api/`.
 const ALLOWED: &[(&str, usize, &str)] = &[
     (
-        "src/stats/eta_density.rs",
-        1,
-        "`fit_refusal` passes the caller's flag straight to `interaction_for` with each \
-         method of the chain, so the refusal sees FOCE's resolved `false`",
-    ),
-    (
         "src/api/fit.rs",
         9,
         "the stage loop resolves `stage_opts.interaction` through `interaction_for`; the \

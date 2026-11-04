@@ -634,6 +634,12 @@ pub fn generate_frem_model(
             });
         }
         margins.extend((0..n_cov).map(|_| "normal".to_string()));
+        // Named, as `copula(…)` requires: margin k belongs to block ETA k.
+        let margins: Vec<String> = all_eta_names
+            .iter()
+            .zip(&margins)
+            .map(|(e, m)| format!("{e} = {m}"))
+            .collect();
         let vals: Vec<String> = (0..n_total)
             .flat_map(|i| (0..=i).map(move |j| (i, j)))
             .map(|(i, j)| format!("{:.6e}", omega_matrix[i][j]))
@@ -1455,6 +1461,7 @@ mod tests {
             parse_warnings: Vec::new(),
             eta_param_info: Vec::new(),
             kappa_param_types: Vec::new(),
+            kappa_distributions: Vec::new(),
             theta_transform: Vec::new(),
             theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]

@@ -983,6 +983,56 @@ pub(super) fn ln_ncx2_asymptotic<T: PkNum>(y: T, k: T, lam: T) -> T {
     half.ln() - (y + lam) * half + (k * c(0.25) - half) * (y.ln() - lam.ln()) + ln_i
 }
 
+/// The mean and variance of the random effect a univariate `kind` describes, at
+/// variance or scale `w` and shapes `s`: the module's parameterisation (mean 0 / 1 / μ and
+/// variance ω where the family has them), stated per kind. `None` where a moment does not
+/// exist (Cauchy, Lévy, log-uniform's is not ω, a t with ν ≤ 2) or has no closed form
+/// (logit-normal, Kolmogorov). The kinds tests check every entry against quadrature of the
+/// density itself. Consumers: the exact CV% of a reported effect and effect-scale
+/// shrinkage.
+pub(super) fn effect_moments(kind: DensityKind, w: f64, s: &[f64]) -> Option<(f64, f64)> {
+    use DensityKind as K;
+    match kind {
+        K::Cauchy | K::Levy | K::LogitNormal | K::Kolmogorov | K::LogUniform | K::Copula => None,
+        // Scale² ω: Var = ω ν / (ν − 2), for ν > 2.
+        K::StudentT => {
+            let nu = *s.first()?;
+            (nu > 2.0).then(|| (0.0, w * nu / (nu - 2.0)))
+        }
+        K::Normal => Some((0.0, w)),
+        K::Exponential => Some((1.0, 1.0)),
+        K::Erlang => Some((1.0, 1.0 / s.first()?)),
+        K::Rayleigh => Some((1.0, 4.0 / PI - 1.0)),
+        K::Beta => Some((*s.first()?, w)),
+        K::Logistic
+        | K::Laplace
+        | K::Gumbel
+        | K::NormalInverseGaussian
+        | K::PGeneralizedGaussian
+        | K::GeneralizedExtremeValue
+        | K::Arcsine
+        | K::Uniform
+        | K::Biweight
+        | K::Triweight
+        | K::Epanechnikov
+        | K::Cosine
+        | K::Semicircle
+        | K::SymTriangular => Some((0.0, w)),
+        K::Gamma
+        | K::InvGamma
+        | K::LogNormal
+        | K::ChiSq
+        | K::Chi
+        | K::Weibull
+        | K::Frechet
+        | K::InverseGaussian
+        | K::BetaPrime
+        | K::NoncentralChiSq
+        | K::Pareto
+        | K::GeneralizedPareto => Some((1.0, w)),
+    }
+}
+
 /// `F_η(x)`, the CDF of a univariate kind at the random effect `x`, over `T`; `None` for a
 /// kind with no CDF here (none at present). The NIG has no closed form and is integrated
 /// numerically (the trapezoid rule in `u = ln(x − t)` over its exponential tails).

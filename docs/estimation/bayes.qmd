@@ -195,6 +195,7 @@ posteriors.
 | `bayes_chains` | 4 | Independent chains (distinct seeds; used for split-R̂). |
 | `bayes_thin`   | 1 | Keep every `bayes_thin`-th sampling draw. |
 | `bayes_seed`   | — | Base RNG seed; chain `c` derives its own. |
+| `bayes_omega_prior` | `inversewishart` | The prior on each Ω block: `inversewishart` (conjugate Gibbs update for a Gaussian block), `wishart`, or `lkj(η)` (LKJ(η) correlations, inverse-gamma variances). Under the last two, and for a [non-Gaussian](../model-file/random-effect-distributions.qmd) block, the block moves by a Metropolis step on its log-Cholesky factor. |
 | `n_leapfrog`   | 0 | Leapfrog steps for the HMC η kernel (analytical-PK models; `0` ⇒ the adaptive Metropolis kernel). |
 | `n_mh_steps`   | auto | Block Metropolis moves per subject per sweep; the componentwise sweeps are sized from it. |
 

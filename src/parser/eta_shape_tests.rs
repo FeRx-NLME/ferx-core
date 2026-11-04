@@ -820,42 +820,36 @@ fn empty_parentheses_declare_the_density_theta() {
     assert_eq!(m.eta_densities[1].shape_thetas, vec![mu]);
 }
 
-/// `transform KIND(SHAPE)` on the omega line, and `density boxcox(λ)` (the Box-Cox
-/// density *is* the transform on its latent scale), are `[eta_shape]` exactly: the same θ
-/// layout and bit-identical individual parameters.
-/// Dies under: the transform clause not desugared, or `density boxcox` taken as a density.
+/// A shape transform has one declarative home, `[eta_shape]` (#1721 review): the
+/// omega-line `transform KIND(…)` and the `density boxcox(λ)` alias are refused with the
+/// `[eta_shape]` spelling to write instead, which itself still parses.
+/// Dies under: either omega-line spelling accepted again, or a refusal that does not name
+/// the `[eta_shape]` line.
 #[test]
-fn the_omega_line_transform_is_the_eta_shape_block() {
-    let block = densed(
+fn a_transform_is_declared_in_eta_shape_only() {
+    let indiv = "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)";
+    assert!(densed(
         "  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1",
-        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)",
-        "[eta_shape]\n  ETA_CL ~ boxcox(L)\n  ETA_V ~ tdist(NU)\n",
+        indiv,
+        "[eta_shape]\n  ETA_CL ~ boxcox(L)\n",
     )
-    .unwrap();
+    .is_ok());
     for spelling in ["transform boxcox(L)", "density boxcox(L)"] {
-        let line = densed(
-            &format!("  omega ETA_CL ~ 0.1 {spelling}\n  omega ETA_V ~ 0.1 transform tdist(NU)"),
-            "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)",
+        let e = densed(
+            &format!("  omega ETA_CL ~ 0.1 {spelling}\n  omega ETA_V ~ 0.1"),
+            indiv,
             "",
         )
-        .unwrap();
+        .unwrap_err();
         assert!(
-            line.eta_densities.is_empty(),
-            "{spelling}: a transform, not a density"
+            e.contains("declared in [eta_shape]") && e.contains("`ETA_CL ~ boxcox(L)`"),
+            "{spelling}: {e}"
         );
-        assert_eq!(line.theta_names, block.theta_names);
-        for eta in [[0.4, -0.2], [-0.7, 0.5]] {
-            let th = block.default_params.theta.clone();
-            assert_eq!(
-                params_at(&line, &th, &eta),
-                params_at(&block, &th, &eta),
-                "{spelling}"
-            );
-        }
     }
 }
 
-/// Each refusal names its cause: a shape transform on a kappa (#1717), a transform on a block, a
+/// Each refusal names its cause: an omega-line transform on a kappa or on a block (both
+/// pointed at [eta_shape]), a
 /// non-t kind on a block, an unknown kind, a wrong shape-θ count, a t whose ν may reach 0,
 /// a μ bounded outside [0, 1], a clause on a θ, trailing text after the clause, a mapped
 /// ETA read raw outside `[individual_parameters]`, and a kind without a free spread whose
@@ -869,12 +863,12 @@ fn omega_line_distribution_refusals() {
         (
             "  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  kappa K ~ 0.04 transform boxcox(L)",
             "",
-            "#1717",
+            "declared in [eta_shape]",
         ),
         (
             "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.1] transform boxcox(L)",
             "",
-            "one ETA",
+            "declared in [eta_shape]",
         ),
         (
             "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.1] density gamma",
@@ -955,7 +949,7 @@ fn the_omega_line_forms_resolve() {
         );
     }
     let cop = densed(
-        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density copula(gamma, beta())",
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density copula(ETA_CL = gamma, ETA_V = beta())",
         "  CL = TVCL * ETA_CL\n  V = TVV * (0.5 + ETA_V)",
         "",
     )
@@ -1022,10 +1016,9 @@ fn eta_param_info_carries_each_distribution() {
     };
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     let m = densed(
-        "  omega ETA_CL ~ 0.1 density truncated(t(NU), -1, inf)\n  \
-         omega ETA_V ~ 0.1 transform boxcox(L)",
+        "  omega ETA_CL ~ 0.1 density truncated(t(NU), -1, inf)\n  omega ETA_V ~ 0.1",
         "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)",
-        "",
+        "[eta_shape]\n  ETA_V ~ boxcox(L)\n",
     )
     .unwrap();
     assert_eq!(
@@ -1042,7 +1035,7 @@ fn eta_param_info_carries_each_distribution() {
         Some(("transform".into(), "boxcox".into(), s(&["L"]), None))
     );
     let cop = densed(
-        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density copula(t(NU), beta(MU))",
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density copula(ETA_V = beta(MU), ETA_CL = t(NU))",
         "  CL = TVCL * exp(ETA_CL)\n  V = TVV * (0.5 + ETA_V)",
         "",
     )
@@ -1088,4 +1081,76 @@ fn a_mixture_override_of_a_density_eta_is_no_read() {
     )
     .unwrap_err();
     assert!(e.contains("[mixture] reads `ETA_CL`"), "{e}");
+}
+
+/// Copula margins are named (#1721 review), so reordering the clause cannot re-bind them:
+/// the same margins written in the other order resolve to the same groups, and a
+/// positional margin, a name outside the block, a name given twice and an ETA left
+/// without a margin are each refused with their own message.
+/// Dies under: margins bound by position, or any of the four refusals removed.
+#[test]
+fn copula_margins_are_named() {
+    use crate::stats::eta_density::DensityKind;
+    let indiv = "  CL = TVCL * exp(ETA_CL)\n  V = TVV * (0.5 + ETA_V)";
+    let block = |clause: &str| {
+        densed(
+            &format!("  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density copula({clause})"),
+            indiv,
+            "",
+        )
+    };
+    let a = block("ETA_CL = gamma, ETA_V = beta(MU)").unwrap();
+    let b = block("ETA_V = beta(MU), ETA_CL = gamma").unwrap();
+    assert_eq!(a.eta_densities[0].margins, b.eta_densities[0].margins);
+    assert_eq!(
+        a.eta_densities[0].margins,
+        vec![DensityKind::Gamma, DensityKind::Beta]
+    );
+    assert_eq!(
+        a.eta_densities[0].shape_thetas,
+        b.eta_densities[0].shape_thetas
+    );
+    for (clause, want) in [
+        ("gamma, beta(MU)", "copula margins are named"),
+        (
+            "ETA_CL = gamma, ETA_KA = beta(MU)",
+            "not an ETA of this block",
+        ),
+        ("ETA_CL = gamma, ETA_CL = beta(MU)", "names `ETA_CL` twice"),
+        ("ETA_CL = gamma", "gives `ETA_V` no margin"),
+    ] {
+        let e = block(clause).unwrap_err();
+        assert!(e.contains(want), "{clause}: {e}");
+    }
+}
+
+/// #1731: an `[eta_shape]` `tdist` shape θ whose bounds let ν fall below 3 is refused at
+/// parse time, naming the bound and the fix; both sides of the gate (3 and 2.9), an
+/// unbounded θ, and a FIXed θ judged by its value.
+/// Dies under: the check removed, the bound moved, or a FIXed value ignored.
+#[test]
+fn a_tdist_shape_theta_must_keep_nu_at_least_3() {
+    let model = |nu_line: &str| {
+        parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+             {nu_line}\n  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma EPS ~ 0.01\n\n\
+             [eta_shape]\n  ETA_V ~ tdist(NU)\n\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+             [error_model]\n  DV ~ proportional(EPS)\n"
+        ))
+    };
+    assert!(model("theta NU(10, 3, 100)").is_ok());
+    assert!(model("theta NU(4) FIX").is_ok());
+    for (line, reach) in [
+        ("theta NU(10, 2.9, 100)", "2.9"),
+        ("theta NU(10)", "-inf"),
+        ("theta NU(2) FIX", "2"),
+    ] {
+        let e = model(line).unwrap_err();
+        assert!(
+            e.contains("needs ν ≥ 3") && e.contains(&format!("may reach {reach}")),
+            "{line}: {e}"
+        );
+    }
 }

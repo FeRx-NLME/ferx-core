@@ -6049,11 +6049,11 @@ pub fn parse_full_model_with(
             info.param_type = crate::types::EtaParamType::Custom;
         }
     }
-    // #1716: what each non-Gaussian ETA follows, for reporting.
-    {
+    // #1716: what each non-Gaussian ETA and κ follows, for reporting.
+    let group_distributions = |groups: &[crate::stats::eta_density::EtaDensity]| {
         use crate::stats::eta_density::{Bound, DensityKind};
         let mut dist: HashMap<usize, crate::types::EtaDistribution> = HashMap::new();
-        for d in &eta_densities {
+        for d in groups {
             let copula = d.kind == DensityKind::Copula;
             let bound = |b: Bound| match b {
                 Bound::Open => None,
@@ -6086,6 +6086,17 @@ pub fn parse_full_model_with(
                 );
             }
         }
+        dist
+    };
+    let kappa_distributions: Vec<Option<crate::types::EtaDistribution>> =
+        if kappa_densities.is_empty() {
+            Vec::new()
+        } else {
+            let mut kd = group_distributions(&kappa_densities);
+            (0..kappa_names.len()).map(|k| kd.remove(&k)).collect()
+        };
+    {
+        let mut dist = group_distributions(&eta_densities);
         // Shape transforms: every `BinOp::Shape(kind, Value)` whose η side is one ETA.
         for st in &indiv_stmts {
             visit_stmt_nodes(std::slice::from_ref(st), &mut |e: &Expression| {
@@ -6293,6 +6304,7 @@ pub fn parse_full_model_with(
         has_conditional_eta_params: false,
         eta_param_info,
         kappa_param_types,
+        kappa_distributions,
         theta_transform,
         theta_eta_linked,
         scaling: ScalingSpec::None,
@@ -8715,17 +8727,13 @@ fn resolve_eta_densities(
         if kind == DensityKind::Normal {
             continue;
         }
-        // A copula's margins, one per ETA in declaration order, and their shape arguments.
+        // A copula's margins, named per ETA and put in declaration order, and their shape
+        // arguments.
         let mut margins: Vec<DensityKind> = Vec::new();
         let mut margin_args: Vec<(String, DensityKind, Vec<String>)> = Vec::new();
         if kind == DensityKind::Copula {
-            if d.args.len() != d.etas.len() {
-                return Err(format!(
-                    "[parameters] `density copula(…)` takes one margin per ETA of its block: `{}`",
-                    d.line
-                ));
-            }
-            for (spec, e) in d.args.iter().zip(&d.etas) {
+            let specs = crate::parser::eta_shape::named_copula_margins(&d.args, &d.etas, &d.line)?;
+            for (spec, e) in specs.iter().zip(&d.etas) {
                 let (name, sh) =
                     crate::parser::eta_shape::parse_kind_spec(spec).ok_or_else(|| {
                         format!(
@@ -13038,7 +13046,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "seed" | "saem_seed" => opts.saem_seed = parse_u64_opt("seed")?,
         "bayes_warmup" => opts.bayes_warmup = parse_usize("bayes_warmup")?,
-        "bayes_omega_prior" | "omega_prior" => {
+        "bayes_omega_prior" => {
             let v = value.trim().to_ascii_lowercase();
             opts.bayes_omega_prior = match v.as_str() {
                 "inversewishart" | "iw" => crate::types::OmegaPrior::InverseWishart,

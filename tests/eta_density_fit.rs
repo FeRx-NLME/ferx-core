@@ -156,7 +156,7 @@ fn every_omega_line_form_fits() {
         (
             "copula",
             variant(
-                "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] density copula(gamma, t(NU))\n  omega ETA_KA ~ 0.30\n",
+                "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] density copula(ETA_CL = gamma, ETA_V = t(NU))\n  omega ETA_KA ~ 0.30\n",
                 plain,
                 "",
             ),
@@ -242,6 +242,14 @@ fn a_kappa_density_fits() {
             let k = r.omega_iov.as_ref().expect("an IOV Ω")[(0, 0)];
             assert_ne!(k, 0.04, "SAEM moves the κ density's ω");
         }
+        // The KAPPA row carries the κ's distribution note.
+        let note = ferx_core::io::output::kappa_distribution_note(&r, 0).expect("K_CL's note");
+        assert!(note.starts_with("density gamma (mean 1, CV% = "), "{note}");
+        let rows = ferx_core::io::output::format_kappa_rows_from(
+            &ferx_core::io::output::KappaRowsInput::from_result(&r).expect("IOV"),
+            Default::default(),
+        );
+        assert!(rows.contains(&note), "{rows}");
     }
 }
 
@@ -279,12 +287,49 @@ fn a_density_eta_reports_its_distribution() {
     )
     .expect("FOCEI fit");
     let note = ferx_core::io::output::eta_distribution_note(&r, 0).expect("ETA_CL's note");
-    assert!(note.starts_with("density gamma: 5/50/95% = "), "{note}");
+    // The gamma's effect has mean 1 and variance ω exactly, so its CV is 100·√ω.
+    let cv = 100.0 * r.omega[(0, 0)].sqrt();
+    assert!(
+        note.starts_with(&format!(
+            "density gamma (mean 1, CV% = {cv:.1}): 5/50/95% = "
+        )),
+        "{note} (CV {cv})"
+    );
     let [lo, mid, hi] = ferx_core::io::output::eta_effect_quantiles(&r, 0).expect("quantiles");
     assert!(lo < mid && mid < 1.0 && 1.0 < hi, "{lo} {mid} {hi}");
-    assert!(ferx_core::io::output::eta_distribution_note(&r, 1)
-        .expect("ETA_V's note")
-        .starts_with("density t(NU): "));
+    // The t's effect: mean 0, variance ω ν/(ν − 2) (ω is its scale²).
+    let nu = r.theta[3];
+    let sd = (r.omega[(1, 1)] * nu / (nu - 2.0)).sqrt();
+    let t_note = ferx_core::io::output::eta_distribution_note(&r, 1).expect("ETA_V's note");
+    assert!(
+        t_note.starts_with(&format!("density t(NU) (mean 0, SD = {sd:.4}): ")),
+        "{t_note} (SD {sd})"
+    );
+    // The EBE table on the effect's scale: `exp(ẑ)` for the gamma, the EBE itself for
+    // the t (identity map) and the Gaussian ETA_KA.
+    let effects = ferx_core::io::output::eta_effects(&r);
+    for (s, e) in r.subjects.iter().zip(&effects) {
+        assert!(s.eta.iter().chain(e).all(|v| v.is_finite()), "{e:?}");
+        assert_eq!(e[0], s.eta[0].exp());
+        assert_eq!((e[1], e[2]), (s.eta[1], s.eta[2]));
+    }
+    // Effect-scale shrinkage for the gamma: `1 − RMS(exp(ẑ) − 1)/√ω`, not the Gaussian
+    // `1 − RMS(ẑ)/√ω`; the two differ because the latent is not centred.
+    let n = r.subjects.len() as f64;
+    let rms = (effects.iter().map(|e| (e[0] - 1.0).powi(2)).sum::<f64>() / n).sqrt();
+    let want = 1.0 - rms / r.omega[(0, 0)].sqrt();
+    let latent = (r.subjects.iter().map(|s| s.eta[0].powi(2)).sum::<f64>() / n).sqrt();
+    let gaussian = 1.0 - latent / r.omega[(0, 0)].sqrt();
+    assert!(r.shrinkage_eta[0].is_finite() && want.is_finite() && gaussian.is_finite());
+    assert!(
+        (r.shrinkage_eta[0] - want).abs() < 1e-12,
+        "{} vs {want}",
+        r.shrinkage_eta[0]
+    );
+    assert!(
+        (r.shrinkage_eta[0] - gaussian).abs() > 1e-6,
+        "the scale matters here"
+    );
     assert_eq!(ferx_core::io::output::eta_distribution_note(&r, 2), None);
     let rows = ferx_core::io::output::format_omega_rows_from(
         &ferx_core::io::output::OmegaRowsInput::from_result(&r),
@@ -297,6 +342,11 @@ fn a_density_eta_reports_its_distribution() {
     let yaml = std::fs::read_to_string(&path).unwrap();
     assert!(yaml.contains("    distribution: gamma\n"), "{yaml}");
     assert!(yaml.contains("    effect_quantiles_5_50_95: ["), "{yaml}");
+    assert!(yaml.contains("    effect_mean: 1.000000\n"), "{yaml}");
+    assert!(
+        yaml.contains(&format!("    effect_cv_pct: {cv:.2}\n")),
+        "{yaml}"
+    );
     eprintln!("{rows}");
 }
 
@@ -360,4 +410,61 @@ fn a_simulated_gamma_clearance_is_recovered() {
     for ((name, g), b) in gaps.into_iter().zip(bounds) {
         assert!(g.is_finite() && g < b, "{name}: {g}");
     }
+}
+
+/// A kind with a kink or a positive-density edge (`laplace`, `uniform`, `pareto`, …) is
+/// refused under every method that reads the prior's curvature at the EBE — FOCE, FOCEI,
+/// the GN pair, Laplace, and VI's Laplace objective — with `E_DENSITY_UNSUPPORTED` naming
+/// IMP / SAEM / Bayes, which score it exactly and run. A smooth kind (`gamma`) is not
+/// refused under FOCEI: the gate is the kind, not the presence of a density.
+#[test]
+fn a_kink_kind_is_refused_where_curvature_is_read() {
+    let (_, pop) = model_and_data();
+    let plain = "  CL = TVCL * ETA_CL\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n";
+    let kink = variant(
+        "  omega ETA_CL ~ 0.09 density gamma\n  omega ETA_V  ~ 0.04 density laplace\n  omega ETA_KA ~ 0.30\n",
+        plain,
+        "",
+    );
+    for method in [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::FoceGn,
+        EstimationMethod::FoceGnHybrid,
+        EstimationMethod::Laplace,
+        EstimationMethod::Vi,
+    ] {
+        let e = ferx_core::fit(&kink, &pop, &kink.default_params, &short(method, true))
+            .expect_err(&format!("{method:?} refuses a kink kind"));
+        let code = e.diagnostic().map(|d| d.code.clone());
+        assert_eq!(
+            code.as_deref(),
+            Some("E_DENSITY_UNSUPPORTED"),
+            "{method:?}: {e}"
+        );
+        let msg = e.to_string();
+        assert!(
+            msg.contains("density laplace") && msg.contains("method = imp"),
+            "{msg}"
+        );
+    }
+    for method in [
+        EstimationMethod::Imp,
+        EstimationMethod::Saem,
+        EstimationMethod::Bayes,
+    ] {
+        let r = ferx_core::fit(&kink, &pop, &kink.default_params, &short(method, true))
+            .unwrap_or_else(|e| panic!("{method:?} scores a kink kind exactly: {e}"));
+        assert!(r.ofv.is_finite(), "{method:?}: OFV {}", r.ofv);
+    }
+    // The other side of the gate: a smooth kind under FOCEI runs (`every_density_
+    // estimator_runs` uses gamma and t).
+    let (smooth, _) = model_and_data();
+    assert!(ferx_core::fit(
+        &smooth,
+        &pop,
+        &smooth.default_params,
+        &short(EstimationMethod::FoceI, true)
+    )
+    .is_ok());
 }

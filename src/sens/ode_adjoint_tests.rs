@@ -7966,10 +7966,10 @@ fn the_kernel_objective_under_densities_is_production() {
         let gap = (fk - f_prod).abs() / (1.0 + f_prod.abs());
         eprintln!("interaction = {interaction}: F = {f_prod}, gap {gap:.2e}");
         assert!(
-            f_prod.is_finite() && f_prod < 1e10,
-            "a real objective: {f_prod}"
+            f_prod.is_finite() && f_prod < 1e10 && fk.is_finite(),
+            "a real objective: {f_prod} (kernel {fk})"
         );
-        worst = worst.max(gap);
+        worst = worst.max((fk - f_prod).abs() / (1.0 + f_prod.abs()));
     }
     // Measured 0 (the same arithmetic on both sides); dropping the correction from
     // production's prior gives 2.3e-2.
@@ -8146,14 +8146,12 @@ fn the_iov_adjoint_of_a_logit_normal_kappa_is_its_translated_gaussian() {
         .expect("the κ-density model is in adjoint scope");
     let t =
         subject_adjoint_packed_gradient(&twin, &s, &params, &x, &bt, true).expect("twin in scope");
-    let worst = a
-        .iter()
-        .zip(&t)
-        .map(|(p, q)| {
-            assert!(p.is_finite() && q.is_finite());
-            (p - q).abs() / (1.0 + q.abs())
-        })
-        .fold(0.0f64, f64::max);
+    assert!(a.iter().chain(&t).all(|v| v.is_finite()), "{a:?} vs {t:?}");
+    let mut worst = 0.0f64;
+    for (p, q) in a.iter().zip(&t) {
+        assert!(p.is_finite() && q.is_finite());
+        worst = worst.max((p - q).abs() / (1.0 + q.abs()));
+    }
     eprintln!("IOV κ twin: worst {worst:.2e}, ∂/∂MU {}", a[3]);
     assert!(a[3].abs() > 1e-6, "∂/∂MU is live");
     // Measured 2.39e-15 (the twin is the same arithmetic up to association); 400×.

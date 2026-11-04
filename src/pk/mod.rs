@@ -4979,6 +4979,7 @@ mod tests {
             has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             kappa_param_types: Vec::new(),
+            kappa_distributions: Vec::new(),
             indiv_param_names: Vec::new(),
             indiv_param_partials: crate::types::IndivParamPartials::empty(),
             theta_transform: Vec::new(),

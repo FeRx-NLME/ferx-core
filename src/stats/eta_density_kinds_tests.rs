@@ -209,29 +209,8 @@ fn expect(kind: DensityKind, w: f64, s: &[f64], g: impl Fn(f64) -> f64) -> f64 {
 /// The η mean and variance the module documents, `None` where none exists or the kind
 /// is not parameterised by them.
 fn documented_moments(kind: DensityKind, w: f64, s: &[f64]) -> Option<(f64, f64)> {
-    use DensityKind::*;
-    match kind {
-        Cauchy | Levy | StudentT | LogitNormal | Kolmogorov | LogUniform => None,
-        Exponential => Some((1.0, 1.0)),
-        Erlang => Some((1.0, 1.0 / s[0])),
-        Rayleigh => Some((1.0, 4.0 / std::f64::consts::PI - 1.0)),
-        Beta => Some((s[0], w)),
-        Logistic
-        | Laplace
-        | Gumbel
-        | NormalInverseGaussian
-        | PGeneralizedGaussian
-        | GeneralizedExtremeValue
-        | Arcsine
-        | Uniform
-        | Biweight
-        | Triweight
-        | Epanechnikov
-        | Cosine
-        | Semicircle
-        | SymTriangular => Some((0.0, w)),
-        _ => Some((1.0, w)),
-    }
+    // The production table, under test here against quadrature of each density.
+    effect_moments(kind, w, s)
 }
 
 /// The mass an `f64` latent cannot hold: below ξ = −1 a GPD piles its mass at
@@ -463,7 +442,9 @@ fn the_special_functions_are_the_references() {
     for x in [
         -37.0, -1.5, -1.0, -0.3, 0.0, 1e-8, 0.2, 0.999, 1.0, 4.0, 1e6,
     ] {
-        worst = worst.max((atan_g::<f64>(x) - x.atan()).abs());
+        let (got, want) = (atan_g::<f64>(x), x.atan());
+        assert!(got.is_finite() && want.is_finite(), "atan({x})");
+        worst = worst.max((got - want).abs());
     }
     eprintln!("atan: worst {worst:.2e}");
     // Measured 2.22e-16, one ulp at 1; bound 4 ulp.
@@ -538,8 +519,11 @@ fn the_kolmogorov_left_tail_stays_finite() {
             D { v: OMEGA, g: [0.0] },
             &[],
         );
-        assert!(got.v.is_finite() && got.g[0].is_finite(), "x {x}: {got:?}");
-        worst = worst.max((got.v - want).abs() / want.abs());
+        assert!(
+            got.v.is_finite() && got.g[0].is_finite() && want.is_finite(),
+            "x {x}: {got:?} vs {want}"
+        );
+        worst = worst.max((got.v - want).abs() / want.abs().max(1e-300));
     }
     // The right tail, the same way: `ln f = ln 8x − 2x²` to rounding for x ≫ 1.
     for x in [10.0f64, 19.0, 30.0] {
@@ -551,10 +535,52 @@ fn the_kolmogorov_left_tail_stays_finite() {
             D { v: OMEGA, g: [0.0] },
             &[],
         );
-        assert!(got.v.is_finite() && got.g[0].is_finite(), "x {x}: {got:?}");
-        worst = worst.max((got.v - want).abs() / want.abs());
+        assert!(
+            got.v.is_finite() && got.g[0].is_finite() && want.is_finite(),
+            "x {x}: {got:?} vs {want}"
+        );
+        worst = worst.max((got.v - want).abs() / want.abs().max(1e-300));
     }
     eprintln!("kolmogorov tail: worst relative {worst:.2e}");
     // Measured 5.91e-16 on the left tail (rounding); 100× headroom.
     assert!(worst < 1e-13, "{worst:e}");
+}
+
+/// `effect_moments`' t entry (mean 0, variance `ω ν/(ν − 2)` for ν > 2, `None` below),
+/// against Simpson quadrature of the textbook scaled-t density `Γ((ν+1)/2) / (Γ(ν/2)
+/// √(νπω)) · (1 + x²/(νω))^{−(ν+1)/2}`, written here independently of the kinds module (the
+/// t is scored over its block, not by the univariate kernels).
+/// Dies under: a wrong variance factor, or a variance reported for ν ≤ 2.
+#[test]
+fn the_t_moment_entry_is_the_textbook_variance() {
+    let lg = |x: f64| crate::stats::special::ln_gamma(x);
+    let mut worst = 0.0f64;
+    for nu in [5.0f64, 8.0, 30.0] {
+        let w = OMEGA;
+        let c = lg((nu + 1.0) / 2.0) - lg(nu / 2.0) - 0.5 * (nu * std::f64::consts::PI * w).ln();
+        let pdf = |x: f64| (c - (nu + 1.0) / 2.0 * (x * x / (nu * w)).ln_1p()).exp();
+        // z = tan u takes the polynomial tails onto a finite interval.
+        let h = std::f64::consts::FRAC_PI_2 - 1e-9;
+        let e = |g: &dyn Fn(f64) -> f64| {
+            simpson(
+                |u| {
+                    let cu = u.cos();
+                    let z = u.tan();
+                    g(z) * pdf(z) / (cu * cu)
+                },
+                -h,
+                h,
+                200_000,
+            )
+        };
+        let mass = e(&|_| 1.0);
+        let var = e(&|z| z * z) / mass;
+        let (m, v) = effect_moments(DensityKind::StudentT, w, &[nu]).expect("ν > 2");
+        assert!(var.is_finite() && v.is_finite() && m == 0.0, "ν {nu}");
+        worst = worst.max((v - var).abs() / var.abs().max(1e-300));
+    }
+    assert_eq!(effect_moments(DensityKind::StudentT, OMEGA, &[2.0]), None);
+    eprintln!("t variance vs quadrature: worst relative {worst:.2e}");
+    // Measured 3.69e-14; bound 1e-12.
+    assert!(worst < 1e-12, "{worst:e}");
 }

@@ -100,12 +100,12 @@ Three distributions take a `block_omega`:
 - `density t(ν)` is a multivariate t with one ν and scale matrix Ω.
 - `density lognormal` is Pumas's `MvLogNormal`: each effect has mean 1, and Ω is
   their covariance.
-- `density copula(KIND, KIND, …)` gives each ETA its own univariate margin,
+- `density copula(ETA = KIND, …)` gives each ETA its own univariate margin,
   joined by a Gaussian copula. Ω's diagonal holds each margin's ω, and its
   off-diagonal holds the correlations of the margins' normal scores:
 
 ```
-  block_omega (ETA_CL, ETA_F) = [0.09, 0.01, 0.02] density copula(gamma, beta(TVF))
+  block_omega (ETA_CL, ETA_F) = [0.09, 0.01, 0.02] density copula(ETA_CL = gamma, ETA_F = beta(TVF))
 ```
 
 A copula of `normal` margins is the multivariate normal. Every other kind is
@@ -129,17 +129,20 @@ own ω. The class's density M-step moves it, as it does the shared ω.
 
 ## Transforms
 
-`transform KIND(SHAPE)` is the other form: η stays `N(0, ω)` and the model reads
-`h(η)` wherever it reads the ETA. It is exactly the
-[`[eta_shape]` block](eta-shape.qmd):
+The other way to get a non-Gaussian random effect keeps η ~ N(0, ω) and has the
+model read a transform `h(η)`. That is declared in the
+[`[eta_shape]` block](eta-shape.qmd), not on the `omega` line:
 
 ```
-  omega ETA_CL ~ 0.09 transform boxcox(LAMBDA)
+[eta_shape]
+  ETA_CL ~ boxcox(LAMBDA)
 ```
 
-is `ETA_CL ~ boxcox(LAMBDA)` in `[eta_shape]`. `density boxcox(λ)` means the
-same: on its latent scale the Box-Cox density is the Box-Cox transform, so the
-two spellings are one model.
+`[eta_shape]` is the one declarative home for a transform. An omega-line
+`transform KIND(…)` and `density boxcox(λ)` are refused with the `[eta_shape]`
+line to write instead. On its latent scale a Box-Cox density *is* the Box-Cox
+transform, so `density boxcox` would only have been a second spelling of the
+same model.
 
 ## How it is estimated
 
@@ -150,8 +153,8 @@ of the ETA in `[individual_parameters]`. The prior is the exact latent density
 `p_z(z) = p_η(m(z))·|m′(z)|`. So a constrained effect never leaves its support,
 and the Laplace and FOCE machinery runs where the posterior is smooth.
 
-Pumas maps a constrained random effect the same way. The ETA columns of the
-sdtab and the EBEs report `z`, so for `gamma` the effect itself is `exp(ETA)`.
+Pumas maps a constrained random effect the same way. See
+[Reporting](#reporting) for which scale each output reports.
 
 The prior's value, gradient and Hessian are exact, from dual numbers over one
 implementation. That makes the FOCEI and Laplace adjoint gradients exact too,
@@ -188,29 +191,60 @@ A density ETA is not mu-referenced.
 
 ## Reporting
 
-A CV% or SD on ω does not describe a non-Gaussian effect, and some kinds
-(Cauchy, Lévy, t with ν ≤ 2) have no SD at all. So the omega row of a density
-or transform ETA reports, in place of a CV%, the distribution and the 5th, 50th
-and 95th percentiles of the effect the model reads, at the estimates:
+A CV% or SD on ω does not describe a non-Gaussian effect the way it describes a
+Gaussian one, and some kinds (Cauchy, Lévy, t with ν ≤ 2) have no SD at all. So
+the omega row of a density ETA reports its distribution, its exact mean with the
+CV% (or the SD when the mean is 0) where both moments exist in closed form, and
+the 5th, 50th and 95th percentiles of the effect the model reads, at the
+estimates:
 
 ```
-  ETA_CL               = 0.030083  (density gamma: 5/50/95% = 0.7328 / 0.9900 / 1.3013)  SE = N/A
-  ETA_V                = 0.010632  (density t(NU): 5/50/95% = -0.1858 / 0.0000 / 0.1858)  SE = N/A
+  ETA_CL               = 0.030083  (density gamma (mean 1, CV% = 17.3): 5/50/95% = 0.7328 / 0.9900 / 1.3013)  SE = N/A
+  ETA_V                = 0.010632  (density t(NU) (mean 0, SD = 0.1145): 5/50/95% = -0.1858 / 0.0000 / 0.1858)  SE = N/A
 ```
 
-For a transform these are percentiles of `h(η)`. They come from inverting the
-exact CDF, not from sampling. The fit YAML carries the same thing per omega
+The percentiles come from inverting the exact CDF, not from sampling. A κ with a
+density gets the same note on its KAPPA row. The fit YAML carries it per omega
 entry: `distribution`, `distribution_form`, `distribution_shapes`,
-`truncation` and `effect_quantiles_5_50_95`. In code,
-`FitResult::eta_param_info[..].distribution` holds the metadata, and
-`ferx_core::io::output::eta_effect_quantiles` holds the percentiles.
+`truncation`, `effect_quantiles_5_50_95`, `effect_mean`, `effect_sd` and
+`effect_cv_pct`.
+
+::: {.callout-important}
+## The same name means a different scale
+
+`density lognormal` pins the effect's **mean** at 1, so `CL = TVCL * ETA_CL`
+has mean `TVCL`. The classic `TVCL * exp(η)` pins the **median** at `TVCL`
+instead. For a density, ω is the variance of the effect itself, so the CV is
+exactly `√ω`. For the classic form, ω is the variance of `log CL`, and the CV
+is `√(exp(ω) − 1)`. The two `ω`s are not interchangeable between the forms.
+:::
+
+**Which scale each output reports.** The EBEs (`SubjectResult::eta`,
+`fit$ebe_etas` in R) hold the latent `z`: the coordinates every estimator works
+in, and the ones `predict(etas = …)` takes back. The same table on the
+effect's scale, `m(ẑ)` (`exp(ẑ)` for a gamma), is
+`ferx_core::io::output::eta_effects` (`fit$ebe_effects` in R). A Gaussian ETA
+reads the same in both. A density ETA's **shrinkage** is computed on the
+effect, `1 − RMS(m(ẑ) − μ)/σ`, with the kind's exact prior mean μ and SD σ. The
+Gaussian formula `1 − RMS(ẑ)/√ω` would compare the latent with the effect's
+variance and assume a centred latent. Shrinkage is `NaN` where those moments
+have no closed form, such as a truncation or a t with ν ≤ 2.
+
+In code, `FitResult::eta_param_info[..].distribution` and
+`FitResult::kappa_distributions` hold the metadata, and
+`ferx_core::io::output::{eta_distribution_note, kappa_distribution_note,
+eta_effect_quantiles, eta_effects}` give the rest.
 
 ## Limits
 
-A kink or an edge inside the support (Laplace's at 0, the triangular kernel's,
-the uniform's and arcsine's edges) gives the Laplace and FOCE curvature nothing
-to read there. IMP, SAEM and Bayes score such kinds exactly; FOCE and Laplace
-run, but rely on the data for their curvature.
+Seven kinds have a kink or a hard edge where their density is still positive:
+`laplace` and `symtriangular` (the peak), `uniform`, `arcsine`, `loguniform`
+and `pareto` (the edges), and `gpd` (its upper edge for ω < 1). FOCE, FOCEI,
+the Gauss–Newton pair and Laplace read the prior's curvature at the EBE, which
+does not exist at a kink and cannot see an edge, so they **refuse** these kinds
+with `E_DENSITY_UNSUPPORTED`, as does VI under `vi_final_ofv = laplace`. A
+warning would still print a number that may be wrong. IMP, SAEM and Bayes
+score them exactly and run.
 
 ## Validation
 
