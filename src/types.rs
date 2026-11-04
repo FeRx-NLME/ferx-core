@@ -6728,7 +6728,8 @@ pub struct ImportanceSamplingResult {
     pub low_ess_subjects: Vec<(String, f64)>,
     /// Number of importance samples drawn per subject (`FitOptions::imp_samples`).
     pub n_samples: usize,
-    /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`).
+    /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`);
+    /// `f64::INFINITY` for a multivariate-normal proposal.
     pub proposal_df: f64,
     /// Minimum across-subject normalized ESS fraction (ESS / K). 1.0 = ideal,
     /// near 0 = degenerate proposal for at least one subject.
@@ -6737,8 +6738,10 @@ pub struct ImportanceSamplingResult {
     pub ess_median: f64,
     /// Treatment of per-occasion kappa random effects.  See [`KappaTreatment`].
     pub kappa_treatment: KappaTreatment,
-    /// Pilot passes that adapted each subject's proposal before these draws
-    /// (`FitOptions::imp_adapt_passes`). `0` is the single Laplace proposal.
+    /// The pilot passes configured to adapt each subject's proposal before these
+    /// draws (`FitOptions::imp_adapt_passes`), which is a maximum: a subject stops
+    /// early at a pass with unusable moments, and a FREM Rao-Blackwellised
+    /// subject runs none. `0` is the single Laplace proposal.
     #[serde(default)]
     pub adapt_passes: usize,
 }

@@ -98,6 +98,17 @@ fn yaml_cv_pct(cv: f64) -> String {
     }
 }
 
+/// The IS proposal's degrees of freedom as a YAML scalar: `{:.4}` when finite,
+/// else `.inf`, for the same reason as [`yaml_cv_pct`] — `imp_proposal_df =
+/// normal` is ν = ∞ on an otherwise healthy result (#2651).
+fn yaml_proposal_df(nu: f64) -> String {
+    if nu.is_finite() {
+        format!("{:.4}", nu)
+    } else {
+        ".inf".to_string()
+    }
+}
+
 /// Largest absolute component of [`FitResult::final_gradient`], or `None` when
 /// the fit reported no gradient (#1934). A non-finite component makes the whole
 /// norm `NaN` rather than being dropped — `f64::max` discards `NaN`, so a plain
@@ -1374,7 +1385,10 @@ pub fn print_results(result: &FitResult) {
             imp.ess_min, imp.ess_median
         );
         if imp.adapt_passes > 0 {
-            eprintln!("  Proposal adapted over {} pilot passes", imp.adapt_passes);
+            eprintln!(
+                "  Proposal adaptation: up to {} pilot passes",
+                imp.adapt_passes
+            );
         }
         match imp.kappa_treatment {
             KappaTreatment::FixedAtMode => {
@@ -3435,7 +3449,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  mc_standard_error: {:.6}", imp.mc_standard_error)
             .map_err(|e| e.to_string())?;
         writeln!(f, "  n_samples: {}", imp.n_samples).map_err(|e| e.to_string())?;
-        writeln!(f, "  proposal_df: {:.4}", imp.proposal_df).map_err(|e| e.to_string())?;
+        writeln!(f, "  proposal_df: {}", yaml_proposal_df(imp.proposal_df))
+            .map_err(|e| e.to_string())?;
         writeln!(f, "  ess_min: {:.4}", imp.ess_min).map_err(|e| e.to_string())?;
         writeln!(f, "  ess_median: {:.4}", imp.ess_median).map_err(|e| e.to_string())?;
         writeln!(f, "  adapt_passes: {}", imp.adapt_passes).map_err(|e| e.to_string())?;
@@ -8019,6 +8034,28 @@ mod tests {
         let path = dir.path().join("fit.yaml");
         write_estimates_yaml(r, path.to_str().unwrap()).expect("yaml write");
         std::fs::read_to_string(&path).expect("yaml read")
+    }
+
+    /// #2651: `imp_proposal_df = normal` reports ν = ∞ on a healthy result, which
+    /// a YAML reader must get back as a number, not Rust's string `inf`.
+    #[test]
+    fn yaml_writes_an_infinite_proposal_df_as_yaml_infinity() {
+        let is_with = |proposal_df| ImportanceSamplingResult {
+            minus2_log_likelihood: -10.0,
+            mc_standard_error: 0.5,
+            low_ess_subjects: Vec::new(),
+            n_samples: 100,
+            proposal_df,
+            ess_min: 0.9,
+            ess_median: 0.95,
+            kappa_treatment: KappaTreatment::NotApplicable,
+            adapt_passes: 0,
+        };
+        let mut r = classified_result();
+        r.importance_sampling = Some(is_with(f64::INFINITY));
+        assert!(yaml_of(&r).contains("\n  proposal_df: .inf\n"));
+        r.importance_sampling = Some(is_with(5.0));
+        assert!(yaml_of(&r).contains("\n  proposal_df: 5.0000\n"));
     }
 
     /// `classified_result` with `K_ADD` weighted by `NARM`, typical arm 4.
