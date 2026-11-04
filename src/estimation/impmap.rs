@@ -157,14 +157,12 @@ pub(crate) fn gate_converged_on_mcem_objective(converged: &mut bool, ofv: f64) -
 /// An EM iteration should not raise the objective, so the only legitimate gap is
 /// Monte-Carlo noise. Measured on Linux aarch64 (glibc 2.41, release without LTO) over
 /// the seven models of the 2026-11 IMP-vs-NONMEM evaluation, K = 1000, `[focei, imp]`
-/// and cold `imp`, reading every iteration's objective: the widest healthy gap is
-/// 0.56 % of the scale (cold cefepime with #2650's cap repaired: lowest 4276.09,
-/// marginal 4300.12) and the narrowest collapse is 50.7 % (cold cefepime without it:
-/// lowest 4300.70, marginal 6480.15). 10 % sits 18× above the first and 5× below the
-/// second. The separation holds on macOS arm64 too, measured on its own: 0.57 % and
-/// 28 %. Cefepime, infliximab, vancomycin and pembrolizumab are only healthy with
-/// that cap repaired (PR #2657 applied for the measurement); on this tree alone the
-/// widest healthy gap is thioguanine's 0.38 %.
+/// and cold `imp`, reading every iteration's objective. With #2650, #2651 and #2653 in,
+/// all eleven runs are healthy and the widest gap is 0.13 % of the scale (thioguanine:
+/// lowest -250.89, marginal -250.57). Collapses need the tree before #2650: there the
+/// narrowest is 50.7 % (cold cefepime: lowest 4300.70, marginal 6480.15). 10 % sits 77×
+/// above the first and 5× below the second. macOS arm64, measured on its own before
+/// #2650, gave a narrowest collapse of 28 %, also above the bound.
 pub(crate) const MCEM_RISE_TOLERANCE: f64 = 0.10;
 
 /// The rise of the final marginal `marginal` over `lowest`, the lowest objective the
@@ -172,9 +170,9 @@ pub(crate) const MCEM_RISE_TOLERANCE: f64 = 0.10;
 /// `None` otherwise.
 ///
 /// A collapse on the first recentre can sit below the 1e14 / 1e15 cutoffs of
-/// [`gate_converged_on_mcem_objective`] for good: on Linux cefepime read 4313.3 at
-/// iteration 1, 4.4e7 at iteration 2, and ended at a marginal of 13,354.7 against
-/// NONMEM's 4282.9.
+/// [`gate_converged_on_mcem_objective`] for good: before #2650, on Linux, cefepime read
+/// 4313.3 at iteration 1, 4.4e7 at iteration 2, and ended at a marginal of 13,354.7
+/// against NONMEM's 4282.9.
 ///
 /// * The baseline is the **lowest** iteration, not the first, because a cold start
 ///   makes the first a poor reference: infliximab read 3087.4, reached 703.1, blew up
@@ -4676,7 +4674,8 @@ mod tests {
     #[test]
     fn mcem_objective_rise_separates_the_measured_collapses_from_healthy_runs() {
         // Linux aarch64 (glibc 2.41): (lowest iteration, final marginal, n_obs). See
-        // `MCEM_RISE_TOLERANCE` for the setup.
+        // `MCEM_RISE_TOLERANCE` for the setup. The collapses are from the tree before
+        // #2650, which removed their cause.
         for (lowest, end, n_obs) in [
             (4313.3406, 13354.7091, 702), // cefepime, warm: the issue's fit
             (4300.6956, 6480.1505, 702),  // cefepime, cold: the narrowest collapse
@@ -4691,16 +4690,17 @@ mod tests {
             );
         }
         for (lowest, end, n_obs) in [
-            (4276.0932, 4300.1209, 702), // cefepime, cold, cap repaired: the widest gap
-            (4279.0421, 4302.2761, 702), // cefepime, warm, cap repaired
-            (665.3862, 665.3173, 183),   // infliximab, cold, cap repaired
-            (660.8735, 661.0470, 183),   // infliximab, warm, cap repaired
-            (995.9150, 996.8586, 274),   // vancomycin, warm, cap repaired
-            (5963.0649, 5969.7756, 1231), // pembrolizumab, warm, cap repaired
-            (-3054.2406, -3053.0554, 1006), // propofol, warm
-            (-250.8952, -249.9505, 132), // thioguanine, warm
-            (-286.1552, -285.9332, 110), // warfarin, cold
-            (-286.1552, -285.9338, 110), // warfarin, warm
+            (4276.0932, 4279.2241, 702),    // cefepime, cold
+            (4279.0421, 4281.7779, 702),    // cefepime, warm
+            (665.3862, 665.4009, 183),      // infliximab, cold
+            (660.8735, 661.1218, 183),      // infliximab, warm
+            (995.9150, 996.7820, 274),      // vancomycin, warm
+            (5963.0649, 5966.0838, 1231),   // pembrolizumab, warm
+            (-3054.2406, -3053.8571, 1006), // propofol, warm
+            (-250.8932, -250.5679, 132),    // thioguanine, cold: the widest gap
+            (-250.8932, -250.5775, 132),    // thioguanine, warm
+            (-286.1552, -286.0387, 110),    // warfarin, cold
+            (-286.1552, -286.0393, 110),    // warfarin, warm
         ] {
             assert_eq!(
                 mcem_objective_rise(end, lowest, n_obs),

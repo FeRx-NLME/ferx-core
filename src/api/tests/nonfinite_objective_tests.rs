@@ -3664,7 +3664,7 @@ fn a_marginal_far_above_the_lowest_iteration_demotes_the_fit() {
 #[test]
 fn a_usable_marginal_leaves_the_verdict_alone() {
     for (marginal, lowest) in [
-        (Some(4300.1209), Some(4276.0932)), // healthy, within noise of the lowest iteration
+        (Some(4279.2241), Some(4276.0932)), // healthy, within noise of the lowest iteration
         (Some(13354.7091), None),           // no iterations to have risen from
         (None, Some(4313.3406)),            // the marginal pass was skipped
         (None, None),                       // not an IS fit at all
@@ -3677,17 +3677,37 @@ fn a_usable_marginal_leaves_the_verdict_alone() {
     }
 }
 
-/// **The wiring, end to end.** `imp_proposal_df = normal` scores `inf` on the evaluation
-/// path (#2651), the first fit of this issue, while `ofv` stays finite and the
-/// estimator's own gate is satisfied. Each arm has a t-proposal twin differing only in
-/// `imp_proposal_df`, so the verdict is shown to turn on the marginal.
-///
-/// When #2651 lands the `premise` below goes red: that is this fixture losing its
-/// non-finite marginal, not the gate breaking, and it needs another way to reach one.
+/// `model` with `poison` applied to its PK parameters at each `(theta, eta)`.
+fn poisoned(
+    mut model: CompiledModel,
+    poison: impl Fn(&[f64], &[f64], &mut crate::types::PkParams) + Send + Sync + 'static,
+) -> CompiledModel {
+    let base = std::mem::replace(
+        &mut model.pk_param_fn,
+        Box::new(|_, _, _, _| unreachable!()),
+    );
+    model.pk_param_fn = Box::new(move |theta, eta, cov, time| {
+        let mut pk = base(theta, eta, cov, time);
+        poison(theta, eta, &mut pk);
+        pk
+    });
+    model
+}
+
+/// **The wiring, end to end.** The model predicts only within 1e-6 of η = 0, so a Laplace
+/// pass at the mode stays finite while every importance draw lands on a `NaN` prediction,
+/// takes the 1e20 subject sentinel and leaves a marginal past the divergence cutoff: the
+/// first fit of this issue, a usable `ofv` over an unusable marginal. Each arm has a twin
+/// on the plain model, so the verdict is shown to turn on the marginal.
 #[test]
-fn a_non_finite_marginal_reaches_the_published_verdict() {
+fn a_diverged_marginal_reaches_the_published_verdict() {
     use crate::api::postfit::NONFINITE_MARGINAL_TOKEN;
-    let model = one_cpt_model();
+    let spiked = poisoned(one_cpt_model(), |_, eta, pk| {
+        if eta[0].abs() > 1e-6 {
+            pk.values[0] = f64::NAN;
+        }
+    });
+    let plain = one_cpt_model();
     let pop = population_of(vec![
         subject_with_dose_time("1", 0.0, 1.0),
         subject_with_dose_time("2", 0.0, 1.2),
@@ -3720,22 +3740,14 @@ fn a_non_finite_marginal_reaches_the_published_verdict() {
         ("readout", readout),
         ("agq readout", agq_readout),
     ] {
-        let with_df = |df: f64| {
-            let o = FitOptions {
-                imp_proposal_df: df,
-                ..opts.clone()
-            };
-            fit(&model, &pop, &model.default_params, &o).expect("fit")
-        };
-
-        let bad = with_df(f64::INFINITY);
+        let bad = fit(&spiked, &pop, &spiked.default_params, &opts).expect("fit");
         let is = bad
             .importance_sampling
             .as_ref()
             .expect("marginal published");
         assert!(
-            !is.minus2_log_likelihood.is_finite(),
-            "premise ({name}): #2651's `inf`, got {}",
+            is.minus2_log_likelihood >= 1e14,
+            "premise ({name}): a diverged marginal, got {}",
             is.minus2_log_likelihood
         );
         assert!(bad.ofv.is_finite(), "premise ({name}): ofv {}", bad.ofv);
@@ -3753,12 +3765,12 @@ fn a_non_finite_marginal_reaches_the_published_verdict() {
             "{name}: the typed entry was dropped"
         );
 
-        let good = with_df(5.0);
+        let good = fit(&plain, &pop, &plain.default_params, &opts).expect("fit");
         let is = good
             .importance_sampling
             .as_ref()
             .expect("marginal published");
-        assert!(is.minus2_log_likelihood.is_finite(), "{name}: t proposal");
+        assert!(is.minus2_log_likelihood < 1e14, "{name}: plain model");
         assert!(
             !good.warnings.iter().any(has_token),
             "{name}: {:?}",
@@ -3766,4 +3778,82 @@ fn a_non_finite_marginal_reaches_the_published_verdict() {
         );
         assert!(good.converged, "{name}: {:?}", good.warnings);
     }
+}
+
+/// The rise arm through `fit()`: `mcem_lowest_objective` has to survive from the loop to
+/// the gate. The fit starts at the truth of noiseless additive-error data, so iteration 1
+/// sets a low baseline; once the first M-step moves TVCL the model predicts nothing, no
+/// parameter can win that back, and the marginal ends far above it without nearing the
+/// divergence cutoffs. An additive σ matters: a proportional one absorbs the change of
+/// scale. The plain model is the twin.
+#[test]
+fn a_risen_marginal_reaches_the_published_verdict() {
+    use crate::api::postfit::{MCEM_OBJECTIVE_ROSE_TOKEN, NONFINITE_MARGINAL_TOKEN};
+    let additive = || {
+        parse_model_string(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma ADD ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD)
+"#,
+        )
+        .expect("parse")
+    };
+    let worsening = poisoned(additive(), |theta, _, pk| {
+        if (theta[0] - 1.0).abs() > 1e-6 {
+            pk.values[1] = 1e6;
+        }
+    });
+    let plain = additive();
+    let subject = |id: &str| {
+        let mut s = subject_with_dose_time(id, 0.0, 1.0);
+        s.observations = s
+            .obs_times
+            .iter()
+            .map(|t| 10.0 * (-0.1 * t).exp())
+            .collect();
+        s
+    };
+    let pop = population_of(vec![subject("1"), subject("2"), subject("3")]);
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::Imp],
+        imp_iterations: 3,
+        imp_samples: 50,
+        imp_auto: false,
+        imp_seed: Some(7),
+        run_covariance_step: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    let has_token = |w: &String| w.starts_with(MCEM_OBJECTIVE_ROSE_TOKEN);
+
+    let bad = fit(&worsening, &pop, &worsening.default_params, &opts).expect("fit");
+    let marginal = bad
+        .importance_sampling
+        .as_ref()
+        .expect("marginal published")
+        .minus2_log_likelihood;
+    assert!(marginal < 1e14, "premise: below the cutoff, got {marginal}");
+    assert!(bad.warnings.iter().any(has_token), "{:?}", bad.warnings);
+    assert!(
+        !bad.warnings
+            .iter()
+            .any(|w| w.starts_with(NONFINITE_MARGINAL_TOKEN)),
+        "{:?}",
+        bad.warnings
+    );
+    assert!(!bad.converged, "{:?}", bad.warnings);
+
+    let good = fit(&plain, &pop, &plain.default_params, &opts).expect("fit");
+    assert!(!good.warnings.iter().any(has_token), "{:?}", good.warnings);
+    assert!(good.converged, "{:?}", good.warnings);
 }
