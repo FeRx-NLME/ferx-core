@@ -91,6 +91,9 @@ impl Classifier<'_> {
                     BinOp::Div => l,
                     BinOp::Mod if l.max(r) >= Affine => Nonlinear,
                     BinOp::Mod => Const,
+                    // A shape transform is nonlinear in its η argument and in its shape.
+                    BinOp::Shape(..) if l.max(r) >= Affine => Nonlinear,
+                    BinOp::Shape(..) => Const,
                 }
             }
             Expression::UnaryFn(_, x) => match self.expr(x, scope) {

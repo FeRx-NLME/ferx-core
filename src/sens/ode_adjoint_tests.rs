@@ -7653,3 +7653,234 @@ fn the_quadrature_mode_hessian_is_the_exact_inner_hessian() {
         "mode Hessian vs exact_inner_hessian {worst:.2e}"
     );
 }
+
+// ---- #1716: random-effect shape transforms ---------------------------------------------
+
+/// The worst relative gap `|a − b| / (1 + |b|)` between the adjoint gradients of `shaped`
+/// and of `twin`, the same model with every shape transform spelled out in ordinary DSL
+/// arithmetic. Both are taken at `shaped`'s EBE and parameters. One function, two jet paths:
+/// the `shape_g` kernel behind `Op::Shape` against the VM's generic `exp` / `/` / `^` / `if`.
+/// Neither is FD, so a gap above rounding is a defect in one of them. Also returns the
+/// shaped gradient, so a caller can check that the shape θ is live.
+fn shape_twin_gap(
+    shaped: &CompiledModel,
+    twin: &CompiledModel,
+    s: &Subject,
+    interaction: bool,
+) -> (f64, Vec<f64>, nalgebra::DVector<f64>) {
+    let params = moved_params(shaped);
+    let x = pack_params(&params);
+    let eta = ebe_for(shaped, s, &params, 1e-12, interaction);
+    let a = subject_adjoint_packed_gradient(shaped, s, &params, &x, eta.as_slice(), interaction)
+        .expect("a shaped model is in adjoint scope");
+    let b = subject_adjoint_packed_gradient(twin, s, &params, &x, eta.as_slice(), interaction)
+        .expect("the hand-written twin is in adjoint scope");
+    assert_eq!(a.len(), b.len());
+    let mut worst = 0.0f64;
+    for (k, (ak, bk)) in a.iter().zip(&b).enumerate() {
+        assert!(
+            ak.is_finite() && bk.is_finite(),
+            "x[{k}] shaped={ak} twin={bk}"
+        );
+        worst = worst.max((ak - bk).abs() / (1.0 + bk.abs()));
+    }
+    (worst, a, eta)
+}
+
+/// `boxcox`, `tdist` and `johndraper` on a closed-form 2-cpt IV model, each with its own
+/// shape θ (θ₃..θ₅).
+const SHAPED_2CPT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta LAMBDA(0.8, -3.0, 3.0)
+  theta NU(4.0, 3.0, 100.0)
+  theta LJD(0.6, -3.0, 3.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  omega ETA_V2 ~ 0.09
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(boxcox(ETA_CL, LAMBDA))
+  V1 = TVV1 * exp(tdist(ETA_V1, NU))
+  V2 = TVV2 * exp(johndraper(ETA_V2, LJD))
+  Q = CL * 0.5
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// [`SHAPED_2CPT`] with each transform written out: Box-Cox as `(exp(λη) − 1)/λ`, the
+/// t-distribution's series term by term, John-Draper on its two branches.
+const SHAPED_2CPT_TWIN: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta LAMBDA(0.8, -3.0, 3.0)
+  theta NU(4.0, 3.0, 100.0)
+  theta LJD(0.6, -3.0, 3.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  omega ETA_V2 ~ 0.09
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  HCL = (exp(LAMBDA * ETA_CL) - 1) / LAMBDA
+  E2 = ETA_V1 * ETA_V1
+  HV1 = ETA_V1 * (1 + (E2 + 1) / (4 * NU) + (5 * E2 * E2 + 16 * E2 + 3) / (96 * NU * NU) + (3 * E2 * E2 * E2 + 19 * E2 * E2 + 17 * E2 - 15) / (384 * NU * NU * NU))
+  HV2 = if (ETA_V2 >= 0) ((ETA_V2 + 1)^LJD - 1) / LJD else 0 - ((1 - ETA_V2)^LJD - 1) / LJD
+  CL = TVCL * exp(HCL)
+  V1 = TVV1 * exp(HV1)
+  V2 = TVV2 * exp(HV2)
+  Q = CL * 0.5
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #1716: the adjoint gradient through every shape transform on the closed-form engine,
+/// FOCEI and FOCE, is its hand-written twin's. Multi-dose (the 12 h dose lands on residual
+/// drug). The two subjects put the John-Draper η's EBE on opposite sides of 0, so both
+/// branches are checked, and every shape θ's gradient is asserted non-zero.
+/// Dies under: the generic VM lifting `Op::Shape` as a constant (drops its jets), or a
+/// kernel term dropped from `shape_g`'s jets but not its value.
+#[test]
+fn the_adjoint_through_shape_transforms_is_the_hand_written_ones() {
+    let shaped = parse_model_string(SHAPED_2CPT).expect("parse shaped model");
+    let twin = parse_model_string(SHAPED_2CPT_TWIN).expect("parse twin");
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [1.0, 4.0, 11.0, 13.0, 16.0, 24.0, 48.0];
+    let mut jd_signs = Vec::new();
+    for eta_ref in [[0.25, -0.3, 0.4], [-0.35, 0.2, -0.3]] {
+        let s = subject(&shaped, doses.clone(), &times, &eta_ref);
+        for interaction in [true, false] {
+            let (worst, g, eta) = shape_twin_gap(&shaped, &twin, &s, interaction);
+            eprintln!("closed form, η_ref={eta_ref:?}, interaction={interaction}: {worst:.2e}");
+            assert!(worst < SHAPE_TWIN_TOL, "closed form: {worst:.2e}");
+            for (k, name) in [(3, "LAMBDA"), (4, "NU"), (5, "LJD")] {
+                assert!(g[k].abs() > 1e-6, "∂/∂{name} is live: {}", g[k]);
+            }
+            jd_signs.push(eta[2] > 0.0);
+        }
+    }
+    assert!(
+        jd_signs.contains(&true) && jd_signs.contains(&false),
+        "both John-Draper branches: {jd_signs:?}"
+    );
+}
+
+/// #1716: the IOV adjoint through shape transforms, with the occasion κ inside each
+/// transform, so `∂/∂κ` runs through `h′` too. Three occasions, a dose in each, so a later
+/// occasion starts on residual drug.
+/// Dies under: the generic VM lifting `Op::Shape` as a constant.
+#[test]
+fn the_iov_adjoint_through_shape_transforms_is_the_hand_written_ones() {
+    const IOV_SHAPED: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta LAMBDA(0.8, -3.0, 3.0)
+  theta NU(5.0, 3.0, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  kappa KAPPA_CL ~ 0.03
+  kappa KAPPA_V ~ 0.02
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(boxcox(ETA_CL + KAPPA_CL, LAMBDA))
+  V = TVV * exp(tdist(ETA_V + KAPPA_V, NU))
+  KA = TVKA
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+"#;
+    let twin_src = IOV_SHAPED
+        .replace(
+            "  CL = TVCL * exp(boxcox(ETA_CL + KAPPA_CL, LAMBDA))",
+            "  U = ETA_CL + KAPPA_CL\n  CL = TVCL * exp((exp(LAMBDA * U) - 1) / LAMBDA)",
+        )
+        .replace(
+            "  V = TVV * exp(tdist(ETA_V + KAPPA_V, NU))",
+            "  W = ETA_V + KAPPA_V\n  E2 = W * W\n  HV = W * (1 + (E2 + 1) / (4 * NU) + (5 * E2 * E2 + 16 * E2 + 3) / (96 * NU * NU) + (3 * E2 * E2 * E2 + 19 * E2 * E2 + 17 * E2 - 15) / (384 * NU * NU * NU))\n  V = TVV * exp(HV)",
+        );
+    let shaped = parse_model_string(IOV_SHAPED).expect("parse shaped IOV");
+    let twin = parse_model_string(&twin_src).expect("parse IOV twin");
+    assert_eq!(shaped.n_kappa, 2);
+    let s = iov_subject(&shaped);
+    for interaction in [true, false] {
+        let (worst, g, _) = shape_twin_gap(&shaped, &twin, &s, interaction);
+        eprintln!("IOV, interaction={interaction}: {worst:.2e}");
+        assert!(worst < SHAPE_TWIN_TOL, "IOV: {worst:.2e}");
+        for (k, name) in [(3, "LAMBDA"), (4, "NU")] {
+            assert!(g[k].abs() > 1e-6, "∂/∂{name} is live: {}", g[k]);
+        }
+    }
+}
+
+/// #1716: the ODE engine's adjoint through shape transforms (Box-Cox and John-Draper).
+/// Multi-dose, the 12 h dose on residual drug.
+/// Dies under: the generic VM lifting `Op::Shape` as a constant.
+#[test]
+fn the_ode_adjoint_through_shape_transforms_is_the_hand_written_ones() {
+    const ODE_SHAPED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta LAMBDA(0.8, -3.0, 3.0)
+  theta LJD(0.6, -3.0, 3.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(boxcox(ETA_CL, LAMBDA))
+  V  = TVV * exp(johndraper(ETA_V, LJD))
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let twin_src = ODE_SHAPED
+        .replace(
+            "  CL = TVCL * exp(boxcox(ETA_CL, LAMBDA))",
+            "  CL = TVCL * exp((exp(LAMBDA * ETA_CL) - 1) / LAMBDA)",
+        )
+        .replace(
+            "  V  = TVV * exp(johndraper(ETA_V, LJD))",
+            "  HV = if (ETA_V >= 0) ((ETA_V + 1)^LJD - 1) / LJD else 0 - ((1 - ETA_V)^LJD - 1) / LJD\n  V  = TVV * exp(HV)",
+        );
+    let shaped = tight(parse_model_string(ODE_SHAPED).expect("parse shaped ODE"));
+    let twin = tight(parse_model_string(&twin_src).expect("parse ODE twin"));
+    assert!(shaped.ode_spec.is_some(), "the ODE engine");
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [0.5, 2.0, 6.0, 11.5, 12.5, 16.0, 24.0];
+    for eta_ref in [[0.25, -0.3], [-0.35, 0.2]] {
+        let s = subject(&shaped, doses.clone(), &times, &eta_ref);
+        let (worst, g, _) = shape_twin_gap(&shaped, &twin, &s, true);
+        eprintln!("ODE, η_ref={eta_ref:?}: {worst:.2e}");
+        assert!(worst < SHAPE_TWIN_TOL, "ODE: {worst:.2e}");
+        for (k, name) in [(2, "LAMBDA"), (3, "LJD")] {
+            assert!(g[k].abs() > 1e-6, "∂/∂{name} is live: {}", g[k]);
+        }
+    }
+}
+
+/// Measured worst 9.5e-15 over the ten cases above (closed form, IOV and ODE; FOCEI and
+/// FOCE): rounding, since neither side is FD. About 10× headroom.
+const SHAPE_TWIN_TOL: f64 = 1e-13;

@@ -895,7 +895,8 @@ impl Builder {
                 // handed (θ, η, covariates, gathers, network outputs, the mixture class),
                 // an out-of-range variable, and the ops whose `f64` meaning the generic
                 // primitives do not reproduce bit for bit (`Sqrt`'s `-0.0` guard,
-                // `InvLogit`, `Logit`, `Tanh`, `Softplus`, `Mod`). Listed one by one: a new `Op` must be
+                // `InvLogit`, `Logit`, `Tanh`, `Softplus`, `Mod`, and `Shape`, whose kernel is
+                // `shape_g`). Listed one by one: a new `Op` must be
                 // decided here, not swallowed by a wildcard.
                 (
                     Op::PushVar(_)
@@ -912,6 +913,7 @@ impl Builder {
                     | Op::Tanh
                     | Op::Softplus
                     | Op::Mod
+                    | Op::Shape(_)
                     | Op::CmpLt
                     | Op::CmpLe
                     | Op::CmpGt
