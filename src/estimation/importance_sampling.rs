@@ -2908,13 +2908,19 @@ mod tests {
     }
 
     #[test]
-    fn build_proposal_falls_back_when_h_is_singular() {
-        // H = zero matrix — not positive-definite even with default jitter.
-        // Fallback uses Ω⁻¹'s Cholesky.
-        let h = DMatrix::zeros(2, 2);
-        let omega_inv = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]);
-        let p = build_proposal(&h, &omega_inv, 2);
-        assert!(p.is_some(), "fallback to Ω-scale proposal should succeed");
+    fn build_proposal_falls_back_when_h_is_indefinite() {
+        // Only a matrix the jitter cannot rescue reaches Ω: Σ = Ω, so log|Σ⁻¹| = log 36.
+        // A singular PSD H is not one. Its zero curvature jitters to 1e−10, which
+        // factorises (#2538 pins that branch for AGQ, tape included), so a caller that
+        // wants Ω must not signal it with a zero matrix (#2650).
+        let h = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, -1.0]);
+        let omega_inv = DMatrix::from_row_slice(2, 2, &[4.0, 0.0, 0.0, 9.0]);
+        let p = build_proposal(&h, &omega_inv, 2).expect("Ω-scale fallback");
+        assert!(
+            (p.log_det_inv_scale - 36.0_f64.ln()).abs() < 1e-9,
+            "log|Σ⁻¹| = {}",
+            p.log_det_inv_scale
+        );
     }
 
     #[test]
