@@ -800,7 +800,9 @@ pub(crate) struct AssayNoise<'a> {
 /// non-empty and strictly increasing; `dose_bounds.0 <= dose_bounds.1` with
 /// `0 <= dose_bounds.0`; `start_dose` lies within `dose_bounds`; `confirm >= 1`;
 /// `rules` is non-empty; `levels`, when present, is non-empty and strictly
-/// increasing and contains `start_dose`; and the rule ladder uses percentage
+/// increasing and contains `start_dose` — the dose invariants checked at parse time
+/// when every dose value is a number, and per subject, before any subject runs, when
+/// one is an expression (#944); and the rule ladder uses percentage
 /// dose steps iff `levels` is `None` and one-level steps iff `levels` is `Some`
 /// (never mixed). Exactly one signal source: `observe` (a latent expression, with
 /// `with_assay_error = false`) **or** `with_assay_error = true` naming a model
@@ -839,18 +841,22 @@ pub struct AdaptiveDosingSpec {
     /// Decision schedule (subject clock), expanded to explicit times at parse
     /// time — the times the controller is consulted.
     pub at: Vec<f64>,
-    /// Dose issued at the first decision; seeds the controller's running dose.
-    pub start_dose: f64,
+    /// Dose issued at the first decision; seeds the controller's running dose. A
+    /// number, or an expression over θ and data covariates evaluated once per subject
+    /// at the first decision (#944).
+    pub start_dose: DoseValue,
     /// How an emitted dose is delivered.
     pub route: AdaptiveRoute,
-    /// Inclusive `(low, high)` clamp applied to every emitted dose.
-    pub dose_bounds: (f64, f64),
+    /// Inclusive `(low, high)` clamp applied to every emitted dose. Each side is a
+    /// number or a per-subject expression, like `start_dose` (#944).
+    pub dose_bounds: (DoseValue, DoseValue),
     /// Debounce: act only after this many *consecutive* matches of the same rule.
     /// `1` acts on the first breach.
     pub confirm: u32,
     /// Discrete titration levels (oncology). When set, `increase`/`decrease` step
-    /// one level; mutually exclusive with percentage steps.
-    pub levels: Option<Vec<f64>>,
+    /// one level; mutually exclusive with percentage steps. Each rung is a number
+    /// or a per-subject expression, like `start_dose` (#944).
+    pub levels: Option<Vec<DoseValue>>,
     /// Optional therapeutic target band `[low, high]` (inclusive) for the
     /// monitored signal. It feeds **only** the `pct_time_in_window` outcome metric
     /// (#391 S2.4) — it never influences dosing (the `when` rules do). `high` may
@@ -883,6 +889,205 @@ pub struct AdaptiveDosingSpec {
     pub rules: Vec<AdaptiveRule>,
 }
 
+/// One dose value of an `[adaptive_dosing]` block (#944): `start_dose`, a side of
+/// `dose_bounds`, or a rung of `levels`.
+///
+/// A value written as a number is a [`Literal`](DoseValue::Literal), checked when the
+/// block is parsed, exactly as before #944. Anything else is an
+/// [`Expr`](DoseValue::Expr): source text over θ and data covariates (e.g.
+/// `15 * WT`, `min(30 * WT, 4000)`), evaluated once per subject at the first decision
+/// (`at[0]`), with the covariates in force there. Its values are checked per subject
+/// before any subject is simulated.
+///
+/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum DoseValue {
+    /// A number, the same for every subject.
+    Literal(f64),
+    /// An expression, evaluated per subject.
+    Expr(String),
+}
+
+impl From<f64> for DoseValue {
+    fn from(x: f64) -> Self {
+        DoseValue::Literal(x)
+    }
+}
+
+/// Compares a [`DoseValue::Literal`] with a number; an expression equals no number.
+impl PartialEq<f64> for DoseValue {
+    #[allow(clippy::float_cmp)] // a literal is compared as written
+    fn eq(&self, other: &f64) -> bool {
+        matches!(self, DoseValue::Literal(x) if x == other)
+    }
+}
+
+impl DoseValue {
+    /// The number, for a literal; `None` for an expression.
+    pub fn as_literal(&self) -> Option<f64> {
+        match self {
+            DoseValue::Literal(x) => Some(*x),
+            DoseValue::Expr(_) => None,
+        }
+    }
+
+    /// The source text, for an expression; `None` for a literal.
+    pub fn as_expr(&self) -> Option<&str> {
+        match self {
+            DoseValue::Literal(_) => None,
+            DoseValue::Expr(s) => Some(s),
+        }
+    }
+
+    /// As written: the number for a literal, the source for an expression.
+    pub(crate) fn source(&self) -> String {
+        match self {
+            DoseValue::Literal(x) => x.to_string(),
+            DoseValue::Expr(s) => s.clone(),
+        }
+    }
+}
+
+/// A `levels` ladder of numbers, as the spec holds it (test fixtures).
+#[cfg(test)]
+pub(crate) fn literal_levels(xs: &[f64]) -> Option<Vec<DoseValue>> {
+    Some(xs.iter().map(|&x| DoseValue::Literal(x)).collect())
+}
+
+/// The dose values of one subject, every expression evaluated (#944): what the
+/// controller runs from.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SubjectDosePlan {
+    pub start_dose: f64,
+    pub dose_bounds: (f64, f64),
+    pub levels: Option<Vec<f64>>,
+}
+
+/// The first dose invariant a [`SubjectDosePlan`] breaks, in the order
+/// [`AdaptiveDosingSpec::validate`] has always checked them. One check serves the
+/// parse-time literal block and the per-subject plan, so the two cannot drift; only
+/// the wording differs ([`DosePlanViolation::literal_message`] keeps the pre-#944
+/// text, [`DosePlanViolation::subject_message`] names the subject).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DosePlanViolation {
+    Bounds,
+    StartNotFinite,
+    StartOutsideBounds,
+    /// `levels` is empty, not finite, or not strictly increasing; carries the reason
+    /// in [`validate_increasing_finite`]'s words.
+    LevelsOrder(String),
+    StartNotALevel,
+    LevelOutsideBounds(f64),
+}
+
+/// The first dose invariant `plan` breaks, if any.
+#[allow(clippy::float_cmp)] // `start_dose ∈ levels` is exact membership
+pub(crate) fn dose_plan_violation(plan: &SubjectDosePlan) -> Option<DosePlanViolation> {
+    let (lo, hi) = plan.dose_bounds;
+    if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi < lo {
+        return Some(DosePlanViolation::Bounds);
+    }
+    let d = plan.start_dose;
+    if !d.is_finite() || d < 0.0 {
+        return Some(DosePlanViolation::StartNotFinite);
+    }
+    if d < lo || d > hi {
+        return Some(DosePlanViolation::StartOutsideBounds);
+    }
+    if let Some(l) = &plan.levels {
+        if let Err(e) = validate_increasing_finite(l, "levels") {
+            return Some(DosePlanViolation::LevelsOrder(e));
+        }
+        if !l.contains(&d) {
+            return Some(DosePlanViolation::StartNotALevel);
+        }
+        if let Some(&bad) = l.iter().find(|&&x| x < lo || x > hi) {
+            return Some(DosePlanViolation::LevelOutsideBounds(bad));
+        }
+    }
+    None
+}
+
+impl DosePlanViolation {
+    /// The pre-#944 parse-time text, for a block whose dose values are all numbers.
+    fn literal_message(&self, plan: &SubjectDosePlan) -> String {
+        let (lo, hi) = plan.dose_bounds;
+        let d = plan.start_dose;
+        match self {
+            DosePlanViolation::Bounds => format!(
+                "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: [{lo}, {hi}]"
+            ),
+            DosePlanViolation::StartNotFinite => {
+                format!("[adaptive_dosing]: start_dose must be finite and >= 0: {d}")
+            }
+            DosePlanViolation::StartOutsideBounds => {
+                format!("[adaptive_dosing]: start_dose {d} is outside dose_bounds [{lo}, {hi}]")
+            }
+            DosePlanViolation::LevelsOrder(e) => e.clone(),
+            DosePlanViolation::StartNotALevel => format!(
+                "[adaptive_dosing]: start_dose {d} must be one of the declared levels {:?}",
+                plan.levels.as_deref().unwrap_or(&[])
+            ),
+            DosePlanViolation::LevelOutsideBounds(bad) => {
+                format!("[adaptive_dosing]: level {bad} is outside dose_bounds [{lo}, {hi}]")
+            }
+        }
+    }
+
+    /// The per-subject text (#944): the subject, the values as written and as
+    /// evaluated, and — when the expressions read any — the covariate values they read.
+    pub(crate) fn subject_message(
+        &self,
+        spec: &AdaptiveDosingSpec,
+        plan: &SubjectDosePlan,
+        subject_id: &str,
+        reads: &[(String, f64)],
+    ) -> String {
+        let (lo, hi) = plan.dose_bounds;
+        let d = plan.start_dose;
+        let head = format!("[adaptive_dosing] subject {subject_id}:");
+        let body = match self {
+            DosePlanViolation::Bounds => format!(
+                "dose_bounds = [{}, {}] evaluate to [{lo}, {hi}]; they must be finite with \
+                 0 <= low <= high.",
+                spec.dose_bounds.0.source(),
+                spec.dose_bounds.1.source()
+            ),
+            DosePlanViolation::StartNotFinite => format!(
+                "start_dose = {} evaluates to {d}; a dose must be finite and >= 0.",
+                spec.start_dose.source()
+            ),
+            DosePlanViolation::StartOutsideBounds => {
+                format!("start_dose {d} is outside dose_bounds [{lo}, {hi}].")
+            }
+            DosePlanViolation::LevelsOrder(_) => format!(
+                "levels evaluate to {:?}; they must be finite and strictly increasing.",
+                plan.levels.as_deref().unwrap_or(&[])
+            ),
+            DosePlanViolation::StartNotALevel => format!(
+                "start_dose {d:?} must be one of the levels {:?}.",
+                plan.levels.as_deref().unwrap_or(&[])
+            ),
+            DosePlanViolation::LevelOutsideBounds(bad) => {
+                format!("level {bad} is outside dose_bounds [{lo}, {hi}].")
+            }
+        };
+        if reads.is_empty() {
+            return format!("{head} {body}");
+        }
+        let read = reads
+            .iter()
+            .map(|(n, v)| format!("{n} = {v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{head} {body} The dose expressions read {read}, at the first decision (t = {}).",
+            spec.at[0]
+        )
+    }
+}
+
 /// Validate a `[adaptive_dosing]` float list is non-empty, all-finite, and
 /// strictly increasing — the shared contract of the `levels` ladder and an
 /// explicit `at` decision list. Called from BOTH the block parser and
@@ -907,6 +1112,36 @@ pub(crate) fn validate_increasing_finite(xs: &[f64], what: &str) -> Result<(), S
 }
 
 impl AdaptiveDosingSpec {
+    /// The dose plan every subject shares when every dose value is a number; `None`
+    /// when one is an expression (#944).
+    pub(crate) fn literal_dose_plan(&self) -> Option<SubjectDosePlan> {
+        Some(SubjectDosePlan {
+            start_dose: self.start_dose.as_literal()?,
+            dose_bounds: (
+                self.dose_bounds.0.as_literal()?,
+                self.dose_bounds.1.as_literal()?,
+            ),
+            levels: match &self.levels {
+                Some(l) => Some(l.iter().map(DoseValue::as_literal).collect::<Option<_>>()?),
+                None => None,
+            },
+        })
+    }
+
+    /// Every dose expression, with the key it is written under (#944).
+    pub(crate) fn dose_expressions(&self) -> Vec<(&'static str, &str)> {
+        let levels = self.levels.iter().flatten().map(|v| ("levels", v));
+        [
+            ("start_dose", &self.start_dose),
+            ("dose_bounds", &self.dose_bounds.0),
+            ("dose_bounds", &self.dose_bounds.1),
+        ]
+        .into_iter()
+        .chain(levels)
+        .filter_map(|(k, v)| v.as_expr().map(|s| (k, s)))
+        .collect()
+    }
+
     /// Enforce every invariant the block parser checks, in one place.
     ///
     /// The struct is `pub` with `pub` fields, so a programmatically-built spec can
@@ -924,23 +1159,27 @@ impl AdaptiveDosingSpec {
                 "[adaptive_dosing]: at least one `when … : …` rule is required".to_string(),
             );
         }
-        let (lo, hi) = self.dose_bounds;
-        if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi < lo {
-            return Err(format!(
-                "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: [{lo}, {hi}]"
-            ));
-        }
-        if !self.start_dose.is_finite() || self.start_dose < 0.0 {
-            return Err(format!(
-                "[adaptive_dosing]: start_dose must be finite and >= 0: {}",
-                self.start_dose
-            ));
-        }
-        if self.start_dose < lo || self.start_dose > hi {
-            return Err(format!(
-                "[adaptive_dosing]: start_dose {} is outside dose_bounds [{lo}, {hi}]",
-                self.start_dose
-            ));
+        // The dose invariants, on a block whose dose values are all numbers (#944). With
+        // an expression among them they are checked per subject instead, before any
+        // subject runs (`resolve_dose_plans`). The violation is found once, here, and
+        // reported at the position each check has always had in this function, so a
+        // block breaking several invariants names the same one it did before #944.
+        let literal = self.literal_dose_plan();
+        let violation = literal.as_ref().and_then(dose_plan_violation);
+        let literal_err = |v: &DosePlanViolation| {
+            v.literal_message(
+                literal
+                    .as_ref()
+                    .expect("a violation implies a literal plan"),
+            )
+        };
+        if let Some(
+            v @ (DosePlanViolation::Bounds
+            | DosePlanViolation::StartNotFinite
+            | DosePlanViolation::StartOutsideBounds),
+        ) = &violation
+        {
+            return Err(literal_err(v));
         }
         // `target_window` (metrics only): low must be finite and low <= high; high
         // may be +∞ (a one-sided "at or above low" target). Checked here too, not
@@ -1041,30 +1280,25 @@ impl AdaptiveDosingSpec {
             )
         });
         match &self.levels {
-            Some(l) => {
+            Some(_) => {
                 // Non-empty, finite, strictly increasing: a `Level` step indexes
                 // this ladder and assumes ascending order — on a descending list
                 // `increase` would *lower* the dose. The parser checks this on the
                 // way in; re-check for hand-built specs.
-                validate_increasing_finite(l, "levels")?;
+                if let Some(v @ DosePlanViolation::LevelsOrder(_)) = &violation {
+                    return Err(literal_err(v));
+                }
                 if has_percent {
                     return Err("[adaptive_dosing]: percentage actions (`increase N%`) are not \
                                 allowed with `levels`; use bare `increase`/`decrease` to step one level"
                         .to_string());
                 }
-                if !l.contains(&self.start_dose) {
-                    return Err(format!(
-                        "[adaptive_dosing]: start_dose {} must be one of the declared levels {l:?}",
-                        self.start_dose
-                    ));
-                }
-                // Every rung must lie within `dose_bounds`; otherwise `step_dose`
-                // clamps the emitted dose while the rung index keeps advancing,
-                // decoupling the decision log from the realized dose.
-                if let Some(bad) = l.iter().find(|&&x| x < lo || x > hi) {
-                    return Err(format!(
-                        "[adaptive_dosing]: level {bad} is outside dose_bounds [{lo}, {hi}]"
-                    ));
+                // `start_dose` must be a rung, and every rung must lie within
+                // `dose_bounds`; otherwise `step_dose` clamps the emitted dose while the
+                // rung index keeps advancing, decoupling the decision log from the
+                // realized dose.
+                if let Some(v) = &violation {
+                    return Err(literal_err(v));
                 }
             }
             None => {
@@ -1359,9 +1593,9 @@ mod tests {
             with_assay_error: false,
             assay_cmt: None,
             at: vec![24.0],
-            start_dose: 100.0,
+            start_dose: (100.0).into(),
             route: AdaptiveRoute::Bolus { cmt: 1 },
-            dose_bounds: (0.0, 400.0),
+            dose_bounds: ((0.0).into(), (400.0).into()),
             confirm: 1,
             levels: None,
             target_window: None,
@@ -1397,7 +1631,7 @@ mod tests {
 
         // start_dose outside dose_bounds.
         let mut s = base_spec();
-        s.start_dose = 500.0;
+        s.start_dose = (500.0).into();
         assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
 
         // no rules.
@@ -1412,8 +1646,8 @@ mod tests {
 
         // a level rung outside dose_bounds.
         let mut s = base_spec();
-        s.dose_bounds = (0.0, 120.0);
-        s.levels = Some(vec![100.0, 150.0]);
+        s.dose_bounds = ((0.0).into(), (120.0).into());
+        s.levels = crate::sim::adaptive::literal_levels(&[100.0, 150.0]);
         s.rules = level_rule();
         assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
     }
@@ -1449,8 +1683,8 @@ mod tests {
         // on a non-ascending ladder makes `increase` *lower* the dose. `validate`
         // must reject it rather than let the controller silently invert.
         let mut s = base_spec();
-        s.start_dose = 200.0;
-        s.levels = Some(vec![200.0, 100.0, 50.0]);
+        s.start_dose = (200.0).into();
+        s.levels = crate::sim::adaptive::literal_levels(&[200.0, 100.0, 50.0]);
         s.rules = vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: 10.0,

@@ -154,7 +154,7 @@ fn vanco_iov_example_parses_and_runs_the_verifier() {
         .as_ref()
         .expect("[adaptive_dosing] block present");
     assert_eq!(spec.start_dose, 500.0, "empiric start dose");
-    assert_eq!(spec.dose_bounds, (250.0, 4000.0));
+    assert_eq!(spec.dose_bounds, (250.0.into(), 4000.0.into()));
     assert_eq!(
         spec.target_window,
         Some((10.0, 15.0)),

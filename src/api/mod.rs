@@ -549,6 +549,11 @@ mod adaptive_frem_tests;
 #[path = "tests/frem_ode_sdtab_tests.rs"]
 mod frem_ode_sdtab_tests;
 
+// #944: per-subject dose expressions in `[adaptive_dosing]`.
+#[cfg(test)]
+#[path = "tests/adaptive_dose_expr_tests.rs"]
+mod adaptive_dose_expr_tests;
+
 // #1594: supplied per-subject η on the adaptive path.
 #[cfg(test)]
 #[path = "tests/adaptive_inputs_tests.rs"]

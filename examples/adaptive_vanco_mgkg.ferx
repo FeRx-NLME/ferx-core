@@ -1,0 +1,55 @@
+# Adaptive (feedback) dosing — weight-based (mg/kg) vancomycin trough titration (#944)
+#
+# One `[adaptive_dosing]` block doses every patient by weight: the starting dose is
+# 15 mg/kg (`start_dose = 15 * WT`) and the dose is capped at 30 mg/kg, never above
+# 4000 mg (`dose_bounds = [0, min(30 * WT, 4000)]`). Each dose expression is evaluated
+# once per subject, at the first decision, from that subject's WT column, so a 50 kg
+# and a 150 kg patient start at 750 mg and 2250 mg and are capped at 1500 mg and 4000 mg.
+# The `min` binds only for the heavier patient (30 * 150 = 4500 > 4000).
+#
+# 1-cpt IV vancomycin, a 1-h infusion every 12 h. Clearance and volume both scale with
+# weight (CL = 6 L/h at 70 kg, V = 0.7 L/kg), so a mg/kg dose gives every patient the
+# same trough until a cap binds. The trough (CENT / V) is titrated +/-25% towards a
+# 15-25 mg/L band, acting on two consecutive breaches (`confirm = 2`).
+#
+# Run with `simulate_adaptive_from_spec()`. Validated dose-for-dose against an
+# independent mrgsolve run (mrgsolve, not NONMEM, is the feedback-dosing comparator):
+# tests/reference/vanco_mgkg_mrgsolve/, checked by tests/adaptive_vanco_mgkg_anchor.rs.
+#
+# Negligible IIV: ETA_CL carries a vanishing variance (the engine requires one omega);
+# the anchor supplies eta = 0 so each patient is the typical-value patient mrgsolve runs.
+#
+# See docs/model-file/adaptive-dosing.qmd for the block reference.
+
+[parameters]
+  theta TVCL(6.0,  0.1,  50.0)   # clearance at 70 kg (L/h)
+  theta TVV(0.7,  0.05,   5.0)   # volume per kg (L/kg); CENT/V is the concentration
+  omega ETA_CL ~ 1e-10
+  sigma ADD ~ 1.0                # nominal; the latent `observe` signal is un-noised
+
+[individual_parameters]
+  CL = TVCL * (WT / 70) * exp(ETA_CL)
+  V  = TVV * WT
+
+[structural_model]
+  ode(states=[CENT])
+
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT
+
+[scaling]
+  y = CENT / V                   # concentration (mg/L)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[adaptive_dosing]
+  observe     = CENT / V                  # titrate on the latent trough
+  at          = every 12 from 0 to 144    # a decision before each q12h dose
+  start_dose  = 15 * WT                   # 15 mg/kg, evaluated per subject
+  route       = infuse(cmt=1, over=1)     # 1-h IV infusion
+  dose_bounds = [0, min(30 * WT, 4000)]   # at most 30 mg/kg and 4000 mg
+  confirm     = 2                         # act on two consecutive breaches
+  target_window = [15, 25]
+  when signal < 15 : increase 25%
+  when signal > 25 : decrease 25%

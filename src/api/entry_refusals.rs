@@ -226,6 +226,19 @@ pub(crate) fn adaptive_spec(message: impl Into<String>) -> Diagnostic {
     diag("E_ADAPTIVE_SPEC", Some("adaptive_dosing"), message.into())
 }
 
+/// `E_ADAPTIVE_DOSE_VALUE`: an `[adaptive_dosing]` dose expression (`start_dose`,
+/// `dose_bounds`, `levels`) whose value for one subject breaks a dose invariant — not
+/// finite, negative, a `start_dose` outside the bounds or off the ladder, a rung outside
+/// the bounds, a ladder that does not increase (#944). Checked for every subject before
+/// any subject runs; the message names the subject and the values read.
+pub(crate) fn adaptive_dose_value(message: impl Into<String>) -> EngineError {
+    coded(
+        "E_ADAPTIVE_DOSE_VALUE",
+        Some("adaptive_dosing"),
+        message.into(),
+    )
+}
+
 /// `E_THETA_LENGTH`: a θ whose length is not the model's (#1614, #1615) — a
 /// parameter vector handed to a `simulate*` / `predict*` entry point, or the fit's θ
 /// against the model `run_sir` / `run_covariance` run on (#1774).

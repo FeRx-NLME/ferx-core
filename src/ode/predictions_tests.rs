@@ -8683,7 +8683,8 @@ fn adaptive_observe_expression_flows_through_driver() {
     let eta = vec![0.0; model.n_eta + model.n_kappa];
     let pk = (model.pk_param_fn)(&theta, &eta, &HashMap::new(), 0.0);
     let subject = make_subject(vec![], spec.at.clone());
-    let mut controller = (compiled.make_controller)();
+    let plan = spec.literal_dose_plan().expect("a block of numbers");
+    let mut controller = (compiled.make_controller)(&plan);
     let monitors = vec![crate::sim::adaptive::AdaptiveMonitor {
         spec: &compiled.monitors[0],
         observe: compiled.observe.as_ref(),
@@ -8715,7 +8716,7 @@ fn adaptive_observe_expression_flows_through_driver() {
     // raw `central`), so this pins the expression path.
     let ke = theta[0] / theta[1]; // CL/V at eta = 0
     let dt = spec.at[1] - spec.at[0];
-    let expected_conc = spec.start_dose * (-ke * dt).exp() / theta[1];
+    let expected_conc = plan.start_dose * (-ke * dt).exp() / theta[1];
     let got = run.decisions[1].observed_signals[0].value;
     assert!(
         (got - expected_conc).abs() < 1e-3,
