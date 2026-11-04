@@ -2001,8 +2001,12 @@ pub fn simulate_adaptive_from_spec_with_inputs(
             },
         },
         // `W_FREM_DRAWN_ETA` names only the covariates the model's own expressions do
-        // not read: a drawn subject's PK follows the data for a column the model reads
-        // directly, so the clause would be false for it (#2667 review r1 row 6b).
+        // not read (#2667 review r1 row 6b). For a column the PK reads directly the
+        // clause "which these subjects' PK does not follow" would be false.
+        // `referenced_covariates` is wider than the PK (error magnitudes, endpoint and
+        // mixture expressions, level columns), so a covariate read only there is left
+        // out too (review r2 N4): the warning stays silent rather than say something
+        // false.
         &frem_only_dose_covariates(model, &dose_covs),
     )
 }

@@ -1144,12 +1144,21 @@ fn a_mixed_block_is_checked_among_its_numbers_at_parse_time() {
         }
         b
     };
-    let refused: [(&str, &str, Option<&str>, &str); 6] = [
+    let refused: [(&str, &str, Option<&str>, &str); 7] = [
         (
             "500",
             "[-1, 30 * WT]",
             None,
             "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: [-1, 30 * WT]",
+        ),
+        // A negative numeric high beside an expression low: invalid on its own, since
+        // `0 <= low <= high` (#2667 review r2 N1). Without that check it would be reported
+        // as the start being outside the bounds.
+        (
+            "500",
+            "[5 * WT, -1]",
+            None,
+            "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: [5 * WT, -1]",
         ),
         (
             "5",

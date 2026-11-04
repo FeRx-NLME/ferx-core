@@ -1724,6 +1724,36 @@ mod tests {
         assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
     }
 
+    /// The two arms of `known_dose_violation` no other test reaches (#2667 review r2 N1,
+    /// N2), on a spec built in code: an infinite upper bound (neither below the lower
+    /// bound nor negative, so only the upper bound's own finiteness check refuses it) and
+    /// an empty ladder (with no known rung, only the empty-list arm checks the order).
+    ///
+    /// Regressions: `bad(hi)` dropped (the `[0, inf]` spec validates); the `l.is_empty()`
+    /// arm dropped (the empty ladder is refused as "must be one of the declared levels
+    /// []" instead).
+    #[test]
+    fn validate_refuses_an_infinite_high_bound_and_an_empty_ladder() {
+        let mut s = base_spec();
+        s.dose_bounds = ((0.0).into(), f64::INFINITY.into());
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: [0, inf]"
+        );
+        let mut s = base_spec();
+        s.levels = Some(Vec::new());
+        s.rules = vec![AdaptiveRule {
+            op: Comparison::Lt,
+            threshold: 10.0,
+            action: AdaptiveAction::Increase(DoseStep::Level),
+            interval: None,
+        }];
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "[adaptive_dosing]: levels must be a non-empty list"
+        );
+    }
+
     /// A block of numbers that breaks two invariants names the one it named before
     /// #944 (#2667 review r1 row 3): `validate` finds the violation once, through
     /// `dose_plan_violation`, but reports each at its pre-#944 position — the bounds and
