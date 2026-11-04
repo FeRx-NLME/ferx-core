@@ -100,8 +100,9 @@ Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽�
 > ETAs) and can bias the typical-value and Ω estimates (e.g. the absorption
 > parameter on a 13-ETA FREM model drifts at `K = 300` and recovers as `K` grows
 > into the thousands). Two options address this: set **`impmap_auto = true`**
-> (NONMEM `AUTO`) to ramp the sample count automatically until the objective's
-> Monte-Carlo SE drops below 1.0 — on the 13-ETA FREM model this ramps
+> (NONMEM `AUTO`) to ramp the sample count automatically until the per-subject
+> objective Monte-Carlo SE drops to 0.05
+> ([the rule](importance-sampling.qmd#adaptive-sample-count)) — on the 13-ETA FREM model this ramps
 > `300 → 10000` and brings the absorption typical value from ~4.6 to ~3.0
 > (matching NONMEM); or raise `impmap_samples` manually (several thousand for
 > FREM). IMPMAP also warns when the objective is left under-sampled. FOCEI is

@@ -69,6 +69,54 @@ a final FOCE Laplace pass for AIC/BIC comparability.
 > (`impmap_proposal_df = normal`), it is replaced by a finite-`t` proposal for
 > this final marginal eval, so the heavier tails keep the importance weights bounded.
 
+Both numbers are labelled where you read them. AIC and BIC come from `ofv`, so
+they differ from NONMEM's IMP objective in the same way. The console report prints:
+
+```
+OFV (Laplace):  4326.6000
+IS marginal -2LL:  4299.6000  (MC SE = 0.7500, K = 1000)
+AIC:  4340.6000
+BIC:  4371.2000
+OFV, AIC and BIC come from a final Laplace pass, not the IS marginal.
+Compare NONMEM METHOD=IMP objectives with the IS marginal, not OFV.
+```
+
+and the YAML `objective_function` block adds `ofv_type: laplace`,
+`marginal_minus2_log_likelihood` and `marginal_mc_standard_error`. `ofv` itself
+keeps its value and key. If the marginal evaluation was skipped, a warning gives
+the reason and the marginal rows are absent. `ferx summary` labels `ofv` the same
+way but shows no marginal, because a `.fitrx` file does not store it.
+
+An `imp_eval_only` stage after an estimator leaves that estimator's objective in
+`ofv`, so `ofv` gets no Laplace label there, and the marginal is printed beside it
+all the same. A trailing `agq_eval_only` stage replaces `ofv` with its quadrature
+marginal, and the label is dropped for the same reason.
+
+### Adaptive sample count
+
+`imp_auto` and `impmap_auto` are on by default, so `imp_samples` and
+`impmap_samples` are starting counts. After each iteration K doubles, up to
+10000, while the **per-subject** objective Monte-Carlo SE exceeds 0.05:
+
+$$
+\frac{\operatorname{SE}(-2 \log L_{IS})}{\sqrt{N}} \;>\; 0.05
+$$
+
+K never comes back down. The per-subject form keeps the rule from ramping a large
+dataset purely because it has more subjects, since the total SE grows as √N. NONMEM's
+`AUTO` targets the total: `STDOBJ = 1.0` corresponds to 0.05 only near N = 400. With
+100 subjects the ferx rule asks for a total SE of 0.5, half of NONMEM's target, so
+it can sample far more than NONMEM would on the same model.
+
+A model that stays above the target ramps to the cap and runs there, at about ten
+times the per-iteration cost of K = 1000. If a run is too slow, set
+`imp_auto = false` to pin `imp_samples`. The fit then warns if the final per-subject
+MC SE is above 0.1. The cap and target are fixed.
+
+The final marginal uses the configured `imp_samples` / `impmap_samples`, not the
+ramped K, so its `K` and MC SE describe that one evaluation. To tighten the MC SE
+of the reported marginal, raise the starting count.
+
 ### Rich data and cold starts
 
 IMP's proposal lags one iteration behind the parameters, so the bookkeeping
