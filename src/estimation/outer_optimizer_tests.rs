@@ -15561,3 +15561,77 @@ fn a_quadrature_polish_that_cannot_take_its_predicted_gain_is_stalled() {
         "{w}"
     );
 }
+
+/// #2675: `outer_cache_warm_starts` hands an ODE + IOV model `η̂` alone (each inner solve
+/// restarts κ at 0, #2508) and every other model the joint `η̂ ++ κ̂` start (#2261).
+/// The two models differ only in the structural engine — same θ/ω/κ/σ, same κ on CL —
+/// so the pair straddles `is_ode_iov` on its ODE half; the straddle is asserted, so the
+/// pair cannot silently collapse onto one arm. Mutations this kills (checked by hand on
+/// the PR): the ODE + IOV arm returning `joint_warm_starts`, and the joint arm returning
+/// `ehs.to_vec()`.
+#[test]
+fn outer_cache_warm_starts_drops_kappa_only_on_an_ode_iov_model() {
+    use crate::estimation::inner_optimizer::is_ode_iov;
+    use crate::parser::model_parser::parse_model_string;
+
+    const HEAD: &str = "[parameters]\n\
+        theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+        theta TVKA(1.5, 0.01, 50.0)\n\
+        omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n\
+        kappa KAPPA_CL ~ 0.01\n\
+        sigma PROP_ERR ~ 0.1 (sd)\n\
+        [individual_parameters]\n\
+        CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n";
+    const TAIL: &str = "[error_model]\n  DV ~ proportional(PROP_ERR)\n\
+        [fit_options]\n  iov_column = OCC\n";
+    let ode = parse_model_string(&format!(
+        "{HEAD}[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n\
+         [odes]\n  d/dt(depot) = -KA * depot\n\
+         d/dt(central) = KA * depot / V - (CL/V) * central\n{TAIL}"
+    ))
+    .expect("ODE + IOV model parses");
+    let closed = parse_model_string(&format!(
+        "{HEAD}[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n{TAIL}"
+    ))
+    .expect("closed-form IOV model parses");
+
+    // The straddle: same κ structure on both, only the ODE half routes η-only.
+    assert_eq!(
+        (ode.n_kappa, closed.n_kappa),
+        (1, 1),
+        "κ live on both sides"
+    );
+    assert!(is_ode_iov(&ode), "ODE + κ model must be ODE + IOV");
+    assert!(
+        !is_ode_iov(&closed),
+        "closed-form + κ model must not be ODE + IOV"
+    );
+
+    // Distinct per subject and per cell, so a dropped, reordered or misattributed κ
+    // cell cannot coincide with the right answer; subject 1 has two occasions.
+    let ehs = vec![
+        DVector::from_vec(vec![0.11, -0.12, 0.13]),
+        DVector::from_vec(vec![-0.21, 0.22, -0.23]),
+    ];
+    let kappas = vec![
+        vec![DVector::from_vec(vec![0.31])],
+        vec![
+            DVector::from_vec(vec![-0.41]),
+            DVector::from_vec(vec![0.42]),
+        ],
+    ];
+
+    assert_eq!(
+        outer_cache_warm_starts(&ode, &ehs, &kappas),
+        ehs,
+        "ODE + IOV: warm start is η̂ alone (κ restarts at 0, #2508)"
+    );
+    assert_eq!(
+        outer_cache_warm_starts(&closed, &ehs, &kappas),
+        vec![
+            DVector::from_vec(vec![0.11, -0.12, 0.13, 0.31]),
+            DVector::from_vec(vec![-0.21, 0.22, -0.23, -0.41, 0.42]),
+        ],
+        "closed-form IOV: warm start is η̂ then every cell's κ̂ (#2261)"
+    );
+}
