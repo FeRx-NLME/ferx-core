@@ -372,8 +372,11 @@ pub fn run_importance_sampling(
     if k_samples < 2 {
         return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
     }
-    if nu < 1.0 {
-        return Err(format!("IS: imp_proposal_df must be >= 1.0, got {}", nu));
+    if nu.is_nan() || nu < 1.0 {
+        return Err(format!(
+            "IS: imp_proposal_df must be >= 1.0 or `normal`, got {}",
+            nu
+        ));
     }
 
     let kappa_treatment = if model.n_kappa > 0 {
@@ -418,8 +421,15 @@ pub fn run_importance_sampling(
 
     if options.verbose {
         eprintln!(
-            "Importance sampling: {} subjects, K={} per subject, t_{} proposal, seed={}",
-            n_subjects, k_samples, nu, seed
+            "Importance sampling: {} subjects, K={} per subject, {} proposal, seed={}",
+            n_subjects,
+            k_samples,
+            if nu.is_finite() {
+                format!("t_{nu}")
+            } else {
+                "normal".to_string()
+            },
+            seed
         );
     }
 
@@ -733,8 +743,11 @@ pub fn run_importance_sampling_mixture(
     if k_samples < 2 {
         return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
     }
-    if nu < 1.0 {
-        return Err(format!("IS: imp_proposal_df must be >= 1.0, got {}", nu));
+    if nu.is_nan() || nu < 1.0 {
+        return Err(format!(
+            "IS: imp_proposal_df must be >= 1.0 or `normal`, got {}",
+            nu
+        ));
     }
     // Every class's Ω must admit a finite log-determinant before any sampling:
     // the single-population entry point rejects a degenerate Ω up front, and
@@ -961,7 +974,7 @@ fn subject_is_estimate(
 ) -> SubjectIsOutput {
     let mut rng = StdRng::seed_from_u64(seed);
 
-    // Build proposal: t_ν(η̂, Σ) with Σ = (H + λI)⁻¹.
+    // Build proposal: t_ν(η̂, Σ) with Σ = (H + λI)⁻¹, or N(η̂, Σ) when ν = ∞.
     let proposal = match build_proposal(h, omega_inv, d) {
         Some(p) => p,
         None => {
@@ -979,16 +992,20 @@ fn subject_is_estimate(
     // issue #528. `mixture == None` reproduces the single-proposal estimator
     // exactly. The broad component is built once by the caller and shared.
 
-    let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
+    let chi_sq = proposal_chi_sq(nu);
 
-    // Constant pieces of log q (Student-t) and log p_η (Gaussian) pulled out
-    // of the per-sample loop. ISCALE adjusts the proposal: Σ_prop = iscale² · Σ.
+    // Constant pieces of log q and log p_η (Gaussian) pulled out of the
+    // per-sample loop. ISCALE adjusts the proposal: Σ_prop = iscale² · Σ.
     let half_d = 0.5 * d as f64;
     let iscale_log_adj = -(d as f64) * iscale.ln();
     let inv_iscale_sq = 1.0 / (iscale * iscale);
-    let log_t_const = student_t_gamma_ratio(nu, d) - half_d * (nu * std::f64::consts::PI).ln()
-        + 0.5 * proposal.log_det_inv_scale
-        + iscale_log_adj;
+    let log_q_const = if nu.is_finite() {
+        student_t_gamma_ratio(nu, d) - half_d * (nu * std::f64::consts::PI).ln()
+            + 0.5 * proposal.log_det_inv_scale
+            + iscale_log_adj
+    } else {
+        mvn_log_q_const(d, proposal.log_det_inv_scale, iscale_log_adj)
+    };
     let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
 
     // Preallocate every per-sample buffer once. With K typically in the
@@ -1005,7 +1022,7 @@ fn subject_is_estimate(
             sample_idx,
             None,
             mixture,
-            Some(&chi_sq),
+            chi_sq.as_ref(),
             nu,
             &mut rng,
             &mut z,
@@ -1048,13 +1065,12 @@ fn subject_is_estimate(
         }
         let log_p_eta = log_p_eta_const - 0.5 * quad_form;
 
-        // log q(η): multivariate t at (η̂, iscale²·Σ, ν).
+        // log q(η): multivariate t (normal at ν = ∞) at (η̂, iscale²·Σ, ν).
         for (k, d_slot) in diff.iter_mut().enumerate() {
             *d_slot = eta_sample[k] - eta_hat[k];
         }
         let mahal = proposal.mahalanobis(&diff);
-        let log_q_narrow =
-            log_t_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln();
+        let log_q_narrow = narrow_log_q(log_q_const, inv_iscale_sq * mahal, nu, d);
         // Defensive mixture q = (1−α)·q_narrow + α·N(0,Ω); the broad component's
         // log-density is the prior `log_p_eta`. Scored for every sample.
         let log_q = match mixture {
@@ -1285,7 +1301,6 @@ pub(crate) fn subject_is_draws_frem_rb(
         return None;
     }
     let fc = model.frem_config.as_ref()?;
-    let mvn = !nu.is_finite();
     let mut rng = StdRng::seed_from_u64(seed);
 
     // Conditional PK prior: precision P_pp, mean μ = −P_pp⁻¹ P_pc d.
@@ -1345,18 +1360,14 @@ pub(crate) fn subject_is_draws_frem_rb(
     let log_prior_const = -half_np * TWO_PI.ln() + 0.5 * logdet_p_pp;
     let iscale_log_adj = -(np as f64) * iscale.ln();
     let inv_iscale_sq = 1.0 / (iscale * iscale);
-    let log_q_const = if mvn {
-        -half_np * TWO_PI.ln() + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
-    } else {
+    let log_q_const = if nu.is_finite() {
         student_t_gamma_ratio(nu, np) + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
             - half_np * (nu * std::f64::consts::PI).ln()
+    } else {
+        mvn_log_q_const(np, proposal.log_det_inv_scale, iscale_log_adj)
     };
 
-    let chi_sq = if mvn {
-        None
-    } else {
-        Some(ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller"))
-    };
+    let chi_sq = proposal_chi_sq(nu);
     let qmc = use_sobol.then(|| sobol_qmc_draws(np, k_samples, seed, nu, mixture.is_some()));
 
     let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
@@ -1428,11 +1439,7 @@ pub(crate) fn subject_is_draws_frem_rb(
             *dq = eta_p[j] - eta_hat_pk[j];
         }
         let mahal = proposal.mahalanobis(&diff_q);
-        let log_q_narrow = if mvn {
-            log_q_const - 0.5 * inv_iscale_sq * mahal
-        } else {
-            log_q_const - 0.5 * (nu + np as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln()
-        };
+        let log_q_narrow = narrow_log_q(log_q_const, inv_iscale_sq * mahal, nu, np);
         // Mixture denominator q = (1−α)·q_narrow + α·q_cond_prior; the broad
         // component's log-density is the conditional prior `log_prior`.
         let log_q = match mixture.as_ref() {
@@ -1586,7 +1593,6 @@ pub(crate) fn subject_is_draws_with(
     use_sobol: bool,
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectDraws {
-    let mvn = !nu.is_finite();
     let mut rng = StdRng::seed_from_u64(seed);
 
     let proposal = match build_proposal(h, omega_inv, d) {
@@ -1619,12 +1625,7 @@ pub(crate) fn subject_is_draws_with(
     // so the α fraction is stratified across the point set rather than broken
     // out of it.
 
-    // Student-t scale mixing variable; unused for the MVN branch.
-    let chi_sq = if mvn {
-        None
-    } else {
-        Some(ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller"))
-    };
+    let chi_sq = proposal_chi_sq(nu);
 
     let half_d = 0.5 * d as f64;
     let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
@@ -1635,11 +1636,11 @@ pub(crate) fn subject_is_draws_with(
     // Student-t: Γ-ratio + ½log|Σ⁻¹| − d·log(iscale) − d/2·log(ν·π).
     let iscale_log_adj = -(d as f64) * iscale.ln();
     let inv_iscale_sq = 1.0 / (iscale * iscale);
-    let log_q_const = if mvn {
-        -half_d * TWO_PI.ln() + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
-    } else {
+    let log_q_const = if nu.is_finite() {
         student_t_gamma_ratio(nu, d) + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
             - half_d * (nu * std::f64::consts::PI).ln()
+    } else {
+        mvn_log_q_const(d, proposal.log_det_inv_scale, iscale_log_adj)
     };
 
     let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
@@ -1690,11 +1691,7 @@ pub(crate) fn subject_is_draws_with(
             *d_slot = eta_sample[k] - eta_hat[k];
         }
         let mahal = proposal.mahalanobis(&diff);
-        let log_q_narrow = if mvn {
-            log_q_const - 0.5 * inv_iscale_sq * mahal
-        } else {
-            log_q_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln()
-        };
+        let log_q_narrow = narrow_log_q(log_q_const, inv_iscale_sq * mahal, nu, d);
         // Mixture denominator: q = (1−α)·q_narrow + α·q_broad, with the broad
         // component's log-density equal to the Gaussian prior `log_p_eta`
         // (q_broad = N(0,Ω)). Evaluated for every sample (balance heuristic),
@@ -2126,12 +2123,15 @@ fn subject_is_estimate_joint(
         }
     };
 
-    let normal = StandardNormal;
-    let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
+    let chi_sq = proposal_chi_sq(nu);
 
     let half_d = 0.5 * n_b as f64;
-    let log_t_const = student_t_gamma_ratio(nu, n_b) - half_d * (nu * std::f64::consts::PI).ln()
-        + 0.5 * proposal.log_det_inv_scale;
+    let log_q_const = if nu.is_finite() {
+        student_t_gamma_ratio(nu, n_b) - half_d * (nu * std::f64::consts::PI).ln()
+            + 0.5 * proposal.log_det_inv_scale
+    } else {
+        mvn_log_q_const(n_b, proposal.log_det_inv_scale, 0.0)
+    };
     let log_p_joint_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega_joint;
 
     let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
@@ -2147,14 +2147,20 @@ fn subject_is_estimate_joint(
     // shared by every importance sample.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
 
-    for _ in 0..k_samples {
+    for sample_idx in 0..k_samples {
         // Draw from joint proposal
-        for zi in z.iter_mut() {
-            *zi = normal.sample(&mut rng);
-        }
-        let c: f64 = chi_sq.sample(&mut rng).max(1e-300);
-        let scale = (nu / c).sqrt();
-        proposal.apply_l_sigma(&z, &mut sample_joint, scale);
+        let DrawInputs::Narrow { t_scale } = draw_inputs(
+            sample_idx,
+            None,
+            None,
+            chi_sq.as_ref(),
+            nu,
+            &mut rng,
+            &mut z,
+        ) else {
+            unreachable!("a broad draw needs a defensive mixture, and this sampler has none");
+        };
+        proposal.apply_l_sigma(&z, &mut sample_joint, t_scale);
         for (j, e) in sample_joint.iter_mut().enumerate() {
             *e += mode_joint[j];
         }
@@ -2214,7 +2220,7 @@ fn subject_is_estimate_joint(
             *d_slot = sample_joint[k] - mode_joint[k];
         }
         let mahal = proposal.mahalanobis(&diff);
-        let log_q = log_t_const - 0.5 * (nu + n_b as f64) * (1.0 + mahal / nu).ln();
+        let log_q = narrow_log_q(log_q_const, mahal, nu, n_b);
 
         log_w.push(log_p_y + log_p_joint - log_q);
     }
@@ -2454,6 +2460,35 @@ impl DefensiveMixture {
 #[inline]
 fn student_t_gamma_ratio(nu: f64, d: usize) -> f64 {
     ln_gamma(0.5 * (nu + d as f64)) - ln_gamma(0.5 * nu)
+}
+
+/// The χ²_ν scale-mixing variable of a Student-t proposal, or `None` for the
+/// multivariate normal that `ν = ∞` selects (#2651). Every sampler in this module
+/// takes its mixing variable from here, so none can build a χ² at `ν = ∞`.
+fn proposal_chi_sq(nu: f64) -> Option<ChiSquared<f64>> {
+    nu.is_finite()
+        .then(|| ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller"))
+}
+
+/// `log q` constant of the `ν = ∞` proposal in `d` dimensions:
+/// `−d/2·log(2π) + ½·log|Σ⁻¹|` plus the ISCALE adjustment. The Student-t
+/// constant has no such shared form (see [`student_t_gamma_ratio`]) and is `∞ − ∞`
+/// at `ν = ∞`, so the two must never be mixed.
+#[inline]
+fn mvn_log_q_const(d: usize, log_det_inv_scale: f64, iscale_log_adj: f64) -> f64 {
+    -0.5 * d as f64 * TWO_PI.ln() + 0.5 * log_det_inv_scale + iscale_log_adj
+}
+
+/// `log q` of one draw under the narrow proposal, from its constant and its
+/// squared Mahalanobis distance `mahal` in the proposal's own (ISCALE-applied)
+/// metric: the multivariate-t kernel for finite `ν`, its `ν → ∞` limit otherwise.
+#[inline]
+fn narrow_log_q(log_q_const: f64, mahal: f64, nu: f64, d: usize) -> f64 {
+    if nu.is_finite() {
+        log_q_const - 0.5 * (nu + d as f64) * (1.0 + mahal / nu).ln()
+    } else {
+        log_q_const - 0.5 * mahal
+    }
 }
 
 /// Asymptotic variance of `log p̂(yᵢ)` for a self-normalised IS estimator:
@@ -4032,6 +4067,278 @@ mod tests {
             baseline.ess_fraction,
             improved.ess_fraction
         );
+    }
+
+    // ── ν = ∞ on the evaluation path (#2651) ──
+
+    /// `y = A + ETA_I + ETA_S·TIME + S·TIME`, additive error: linear in η, so the
+    /// posterior *is* the Gaussian `N(η̂, H⁻¹)` and the marginal is closed-form.
+    /// An MVN proposal then has constant importance weights, which a t proposal
+    /// cannot reach; that is what makes the ν = ∞ density checkable exactly.
+    const LINEAR_MODEL: &str = r"
+[parameters]
+  theta A(2.0, -10.0, 10.0)
+  theta S(0.5, -10.0, 10.0)
+  omega ETA_I ~ 0.5
+  omega ETA_S ~ 0.2
+  sigma EPS ~ 0.4 (sd)
+
+[individual_parameters]
+  B0 = A + ETA_I
+  B1 = S + ETA_S
+
+[structural_model]
+  y = B0 + B1 * TIME
+
+[error_model]
+  DV ~ additive(EPS)
+";
+
+    /// [`LINEAR_MODEL`] with one κ on the intercept, for the joint (η, κ) sampler.
+    fn linear_iov_model() -> CompiledModel {
+        crate::parser::model_parser::parse_model_string(
+            &LINEAR_MODEL
+                .replace("  sigma EPS", "  kappa KAPPA_I ~ 0.3\n  sigma EPS")
+                .replace("B0 = A + ETA_I", "B0 = A + ETA_I + KAPPA_I"),
+        )
+        .unwrap()
+    }
+
+    const LINEAR_TIMES: [f64; 4] = [0.0, 1.0, 2.0, 4.0];
+    const LINEAR_DV: [[f64; 4]; 2] = [[2.6, 2.4, 3.9, 4.1], [1.1, 2.3, 2.2, 3.7]];
+
+    /// Two subjects on [`LINEAR_TIMES`]; occasion 1 is the first two records and
+    /// occasion 2 the last two.
+    fn linear_pop() -> crate::types::Population {
+        use std::io::Write;
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,OCC\n");
+        for (s, dv) in LINEAR_DV.iter().enumerate() {
+            for (j, (t, y)) in LINEAR_TIMES.iter().zip(dv).enumerate() {
+                csv.push_str(&format!("{},{t},{y},0,0,1,{}\n", s + 1, 1 + j / 2));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::read_nonmem_csv(f.path(), None, Some("OCC")).unwrap()
+    }
+
+    /// Design of the random effects: `[1, t]`, plus one occasion indicator column
+    /// per occasion when `iov`.
+    fn linear_design(iov: bool) -> DMatrix<f64> {
+        let cols = if iov { 4 } else { 2 };
+        DMatrix::from_fn(4, cols, |j, c| match c {
+            0 => 1.0,
+            1 => LINEAR_TIMES[j],
+            _ => f64::from(u8::from(c - 2 == j / 2)),
+        })
+    }
+
+    /// Prior variances of [`linear_design`]'s columns, and the residual variance.
+    fn linear_variances(iov: bool) -> (DVector<f64>, f64) {
+        let prior = if iov {
+            vec![0.5, 0.2, 0.3, 0.3]
+        } else {
+            vec![0.5, 0.2]
+        };
+        (DVector::from_vec(prior), 0.4 * 0.4)
+    }
+
+    fn linear_residual(s: usize) -> DVector<f64> {
+        DVector::from_fn(4, |j, _| LINEAR_DV[s][j] - (2.0 + 0.5 * LINEAR_TIMES[j]))
+    }
+
+    /// Exact `−2 log L` in the module's convention, which drops the `n·log 2π` of
+    /// the observation density: `Σᵢ log|V| + rᵀV⁻¹r`, `V = ZGZᵀ + σ²I`.
+    fn linear_exact_m2ll(iov: bool) -> f64 {
+        let z = linear_design(iov);
+        let (prior, s2) = linear_variances(iov);
+        let v = &z * DMatrix::from_diagonal(&prior) * z.transpose()
+            + DMatrix::<f64>::identity(4, 4) * s2;
+        let chol = v.cholesky().unwrap();
+        let log_det: f64 = 2.0 * chol.l().diagonal().iter().map(|x| x.ln()).sum::<f64>();
+        (0..2)
+            .map(|s| {
+                let r = linear_residual(s);
+                log_det + r.dot(&chol.solve(&r))
+            })
+            .sum()
+    }
+
+    /// The exact posterior modes `H⁻¹ZᵀR⁻¹r` of every subject, as `(η̂, κ̂)`.
+    fn linear_modes(iov: bool) -> (Vec<DVector<f64>>, Vec<Vec<DVector<f64>>>) {
+        let z = linear_design(iov);
+        let (prior, s2) = linear_variances(iov);
+        let h = z.transpose() * &z / s2 + DMatrix::from_diagonal(&prior.map(|p| 1.0 / p));
+        let chol = h.cholesky().unwrap();
+        let modes: Vec<DVector<f64>> = (0..2)
+            .map(|s| chol.solve(&(z.transpose() * linear_residual(s) / s2)))
+            .collect();
+        let etas = modes.iter().map(|m| m.rows(0, 2).into_owned()).collect();
+        let kappas = modes
+            .iter()
+            .map(|m| {
+                if iov {
+                    vec![
+                        DVector::from_element(1, m[2]),
+                        DVector::from_element(1, m[3]),
+                    ]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        (etas, kappas)
+    }
+
+    /// `run_importance_sampling` on the linear fixture at its exact modes.
+    fn linear_is(
+        model: &CompiledModel,
+        iov: bool,
+        nu: f64,
+        alpha: f64,
+    ) -> ImportanceSamplingResult {
+        let (etas, kappas) = linear_modes(iov);
+        let j = linear_design(false);
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 2000;
+        opts.imp_seed = Some(3);
+        opts.imp_proposal_df = nu;
+        opts.imp_defensive_alpha = alpha;
+        run_importance_sampling(
+            model,
+            &linear_pop(),
+            &model.default_params,
+            &etas,
+            &[j.clone(), j],
+            &kappas,
+            &opts,
+        )
+        .expect("IS on the linear fixture")
+    }
+
+    /// Both ν = ∞ samplers against the closed form. Constant weights pin the
+    /// kernel (a wrong quadratic term spreads them, so ESS falls) and the marginal
+    /// pins the normaliser (a constant error leaves ESS at 1 and moves only the
+    /// value), so neither assertion covers for the other. The t control straddles
+    /// the gate: it is what shows ESS can fall below the MVN bound on this fixture.
+    #[test]
+    fn normal_proposal_reproduces_the_closed_form_marginal() {
+        let eta_only = crate::parser::model_parser::parse_model_string(LINEAR_MODEL).unwrap();
+        let joint = linear_iov_model();
+        assert_eq!(joint.n_kappa, 1);
+        for (label, model, iov) in [("η", &eta_only, false), ("(η, κ)", &joint, true)] {
+            let exact = linear_exact_m2ll(iov);
+            let mvn = linear_is(model, iov, f64::INFINITY, 0.0);
+            let t = linear_is(model, iov, 5.0, 0.0);
+            eprintln!(
+                "{label}: exact {exact}, mvn {} (ess {}), t {} ± {} (ess {})",
+                mvn.minus2_log_likelihood,
+                mvn.ess_min,
+                t.minus2_log_likelihood,
+                t.mc_standard_error,
+                t.ess_min
+            );
+            assert!(mvn.proposal_df.is_infinite(), "{label}");
+            // Measured (macOS arm64): gaps 3.7e-8 (η) and 2.7e-7 (η, κ), ESS short
+            // of 1 by 7e-12 and 5e-11, all from `build_proposal`'s 1e-6 diagonal
+            // jitter. The t controls sit at ESS 0.916 and 0.858. Dropping the
+            // kernel's ½ gives ESS 9e-4, and dropping 2π from the constant moves
+            // the marginal by 7.4 with ESS unchanged.
+            assert!(
+                (mvn.minus2_log_likelihood - exact).abs() < 1e-5,
+                "{label}: mvn {} vs exact {exact}",
+                mvn.minus2_log_likelihood
+            );
+            assert!(mvn.ess_min > 1.0 - 1e-8, "{label}: mvn ess {}", mvn.ess_min);
+            assert!(t.ess_min < 0.99, "{label}: t ess {}", t.ess_min);
+            assert!(
+                (t.minus2_log_likelihood - exact).abs() < 5.0 * t.mc_standard_error,
+                "{label}: t {} ± {} vs exact {exact}",
+                t.minus2_log_likelihood,
+                t.mc_standard_error
+            );
+        }
+    }
+
+    /// The defensive mixture scores ν = ∞ draws too: its denominator takes the
+    /// narrow log-density, so a NaN there would survive into every weight.
+    #[test]
+    fn normal_proposal_composes_with_the_defensive_mixture() {
+        let model = crate::parser::model_parser::parse_model_string(LINEAR_MODEL).unwrap();
+        let exact = linear_exact_m2ll(false);
+        let r = linear_is(&model, false, f64::INFINITY, 0.1);
+        eprintln!(
+            "exact {exact}, mixture {} ± {} (ess {})",
+            r.minus2_log_likelihood, r.mc_standard_error, r.ess_min
+        );
+        assert!(r.ess_min > 0.0 && r.mc_standard_error > 0.0);
+        assert!(
+            (r.minus2_log_likelihood - exact).abs() < 5.0 * r.mc_standard_error,
+            "{} ± {} vs exact {exact}",
+            r.minus2_log_likelihood,
+            r.mc_standard_error
+        );
+    }
+
+    /// The class-marginal entry point shares `subject_is_estimate`, so it takes
+    /// ν = ∞ as well, and agrees with its own t evaluation.
+    #[test]
+    fn mixture_is_evaluates_a_normal_proposal() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 2000;
+        opts.imp_seed = Some(7);
+        let t = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect("mixture IS, t proposal");
+        opts.imp_proposal_df = f64::INFINITY;
+        let mvn = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect("mixture IS, normal proposal");
+        eprintln!(
+            "t {} ± {}, mvn {} ± {} (ess {})",
+            t.minus2_log_likelihood,
+            t.mc_standard_error,
+            mvn.minus2_log_likelihood,
+            mvn.mc_standard_error,
+            mvn.ess_min
+        );
+        assert!(mvn.minus2_log_likelihood.is_finite() && mvn.ess_min > 0.0);
+        let se = t.mc_standard_error.hypot(mvn.mc_standard_error);
+        assert!(
+            (t.minus2_log_likelihood - mvn.minus2_log_likelihood).abs() < 5.0 * se,
+            "t {} vs mvn {} (combined SE {se})",
+            t.minus2_log_likelihood,
+            mvn.minus2_log_likelihood
+        );
+    }
+
+    /// NaN compares false with `nu < 1.0` and is non-finite, so without its own
+    /// check it would pass validation and be scored as a normal proposal.
+    #[test]
+    fn nan_proposal_df_is_refused_not_read_as_normal() {
+        let model = crate::parser::model_parser::parse_model_string(LINEAR_MODEL).unwrap();
+        let (etas, kappas) = linear_modes(false);
+        let j = linear_design(false);
+        let mut opts = FitOptions::default();
+        opts.imp_proposal_df = f64::NAN;
+        let err = run_importance_sampling(
+            &model,
+            &linear_pop(),
+            &model.default_params,
+            &etas,
+            &[j.clone(), j],
+            &kappas,
+            &opts,
+        )
+        .err()
+        .expect("NaN df must be refused");
+        assert!(err.contains("imp_proposal_df"), "{err}");
+
+        let mix = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let err = run_importance_sampling_mixture(&mix, &mix_pop(), &mix.default_params, &opts)
+            .err()
+            .expect("NaN df must be refused");
+        assert!(err.contains("imp_proposal_df"), "{err}");
     }
 
     // ── Mixture class-marginal IS objective (#985) ──

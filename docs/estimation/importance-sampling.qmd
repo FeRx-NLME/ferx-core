@@ -68,6 +68,7 @@ a final FOCE Laplace pass for AIC/BIC comparability.
 > the evaluation-only path. If IMPMAP is configured with a Gaussian proposal
 > (`impmap_proposal_df = normal`), it is replaced by a finite-`t` proposal for
 > this final marginal eval, so the heavier tails keep the importance weights bounded.
+> `imp` makes no such substitution: `imp_proposal_df = normal` is used as given.
 
 ### Rich data and cold starts
 
@@ -237,7 +238,10 @@ $$
 - **ν = `imp_proposal_df`** controls the proposal tails. The default of 5
   is robust to mild proposal misspecification (Geweke 1989); raise
   toward 30+ to recover a near-Gaussian proposal when the posterior is
-  known to be light-tailed.
+  known to be light-tailed. `normal` (or `mvn`) uses a true
+  multivariate-normal proposal, which is the closest match to NONMEM. Its
+  light tails make it the less forgiving choice when the posterior is not
+  close to Gaussian, so watch ESS and the MC SE.
 - **Low-ESS subjects** signal a proposal that doesn't match the
   posterior well — usually a sign the EBE didn't converge or the
   Hessian was near-singular. The IS estimate is still unbiased, just
