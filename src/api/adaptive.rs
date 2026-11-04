@@ -824,21 +824,10 @@ where
             let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
             let mut eta_slice: Vec<f64> = match supplied {
                 Some(eta) => eta.clone(),
-                None => {
-                    let mut e: Vec<f64> = (eta_factor * DVector::from_column_slice(&z))
-                        .iter()
-                        .copied()
-                        .collect();
-                    // #1716: a density group draws its own latent.
-                    crate::stats::eta_density::redraw_latents(
-                        &model.eta_densities,
-                        &params.omega.matrix,
-                        &params.theta,
-                        &mut e,
-                        &mut rng,
-                    );
-                    e
-                }
+                None => (eta_factor * DVector::from_column_slice(&z))
+                    .iter()
+                    .copied()
+                    .collect(),
             };
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
@@ -874,15 +863,7 @@ where
                     let zk: Vec<f64> = (0..model.n_kappa)
                         .map(|k| crate::sim::adaptive::kappa_standard_normal(kappa_base, g, k))
                         .collect();
-                    let mut kappa_g = &*kappa_factor * DVector::from_column_slice(&zk);
-                    crate::sim::adaptive::kappa_density_redraw(
-                        model,
-                        &omega_iov.matrix,
-                        &params.theta,
-                        kappa_base,
-                        g,
-                        kappa_g.as_mut_slice(),
-                    );
+                    let kappa_g = &*kappa_factor * DVector::from_column_slice(&zk);
                     let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
                     e.extend(kappa_g.iter().copied());
                     // PK at decision g under occasion g's κ, at the covariate the
@@ -1396,15 +1377,7 @@ pub(crate) fn verify_adaptive_snapshots(
             let zk: Vec<f64> = (0..model.n_kappa)
                 .map(|k| crate::sim::adaptive::kappa_standard_normal(kappa_base, g, k))
                 .collect();
-            let mut kappa_g = &*kappa_factor * DVector::from_column_slice(&zk);
-            crate::sim::adaptive::kappa_density_redraw(
-                model,
-                &omega_iov.matrix,
-                &params.theta,
-                kappa_base,
-                g,
-                kappa_g.as_mut_slice(),
-            );
+            let kappa_g = &*kappa_factor * DVector::from_column_slice(&zk);
             let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
             e.extend(kappa_g.iter().copied());
 

@@ -1102,16 +1102,6 @@ fn emit_subject_rows<R: rand::Rng>(
         kappas = kappa_draw
             .expect("simulate_inner_with_draw builds a KappaDraw per subject of a kappa model")
             .draw(&kappa_factor, normal, rng);
-        // #1716: each occasion's κ under the model's κ density groups.
-        for kap in kappas.iter_mut() {
-            crate::stats::eta_density::redraw_latents(
-                &model.kappa_densities,
-                &omega_iov.matrix,
-                &params.theta,
-                kap,
-                rng,
-            );
-        }
         pk::predict_iov(
             model,
             subject,
@@ -1759,16 +1749,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                 let pool: Vec<DVector<f64>> = (0..n)
                     .map(|_| {
                         let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-                        let mut eta = &**eta_factor * DVector::from_column_slice(&z);
-                        // #1716: a density group draws its own latent.
-                        crate::stats::eta_density::redraw_latents(
-                            &model.eta_densities,
-                            &params.omega.matrix,
-                            &params.theta,
-                            eta.as_mut_slice(),
-                            rng,
-                        );
-                        eta
+                        &**eta_factor * DVector::from_column_slice(&z)
                     })
                     .collect();
                 let assign = crate::propensity_match::match_draws_to_fitted(
@@ -1819,14 +1800,6 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     let z_vec = DVector::from_column_slice(&z);
                     let eta = class.eta_factor * z_vec;
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
-                    // #1716: a density group draws its own latent.
-                    crate::stats::eta_density::redraw_latents(
-                        &model.eta_densities,
-                        &class.params.omega.matrix,
-                        &class.params.theta,
-                        &mut eta_slice,
-                        rng,
-                    );
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
                     flip_flop.observe(model, subject, &params.theta, &eta_slice);
                     let predicted = emit_subject_rows(

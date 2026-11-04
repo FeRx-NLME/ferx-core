@@ -2290,14 +2290,6 @@ fn objective<T: crate::sens::num::PkNum, const N: usize>(
 ) -> Option<(T, [T; N])> {
     if interaction {
         focei_f_grad(ctx, f, g, eta, p)
-    } else if !ctx.densities.is_empty() {
-        // FOCE under a density (#1716): the conditional form, and the EBE's inner gradient
-        // under FOCE's frozen variance where it has one (as `objective_ng`).
-        let (fv, lg) = crate::sens::focei_kernel::foce_f_grad_density(ctx, f, g, eta, p)?;
-        match fpop {
-            Some(_) => Some((fv, inner_grad(ctx, f, g, eta, p, fpop)?)),
-            None => Some((fv, lg)),
-        }
     } else {
         Some((
             foce_f(ctx, f, g, eta, fpop, p)?,
@@ -3696,11 +3688,9 @@ fn tape_params(
 }
 
 /// Whether the likelihood reads θ directly, not only through the predictions: FREM
-/// pseudo-observations (`θ_i + η_e`), a θ-dependent custom residual magnitude, and a
-/// random-effect density's shape θ (ν, μ), which only the prior reads (#1716).
+/// pseudo-observations (`θ_i + η_e`) and a θ-dependent custom residual magnitude.
 fn theta_read_directly(model: &CompiledModel) -> bool {
     model.frem_config.is_some()
-        || model.has_densities()
         || model
             .ruv_magnitude
             .as_ref()

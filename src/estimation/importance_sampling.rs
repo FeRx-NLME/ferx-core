@@ -425,19 +425,16 @@ pub fn run_importance_sampling(
 
     // FREM: Rao-Blackwellise (integrate covariate etas, sample only PK etas) when
     // a clean PK/cov partition exists. `None` → full-dimensional IS (unchanged).
-    // A density (#1716) makes the covariate block's conditional prior non-Gaussian, which
-    // the Rao–Blackwell split integrates in closed form: full-dimensional IS instead.
-    let frem_rb: Option<(Vec<usize>, Vec<usize>)> =
-        if !options.frem_rao_blackwell || model.has_densities() {
-            None
-        } else {
-            model
-                .frem_config
-                .as_ref()
-                .filter(|_| model.n_kappa == 0)
-                .map(|fc| frem_pk_cov_partition(fc, n_eta))
-                .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
-        };
+    let frem_rb: Option<(Vec<usize>, Vec<usize>)> = if !options.frem_rao_blackwell {
+        None
+    } else {
+        model
+            .frem_config
+            .as_ref()
+            .filter(|_| model.n_kappa == 0)
+            .map(|fc| frem_pk_cov_partition(fc, n_eta))
+            .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
+    };
 
     let per_subject: Vec<SubjectIsOutput> = population
         .subjects
@@ -1035,15 +1032,7 @@ fn subject_is_estimate(
             &eta_sample,
             scratch,
         );
-        // #1716: a density group's `½c` makes `p(y | η)·N(η; 0, Ω)·e^{−c/2}` the target,
-        // and leaves the defensive mixture's `N(0, Ω)` the proposal density it is.
-        let log_p_y = -(obs_nll
-            + crate::stats::eta_density::half_correction_stacked(
-                model,
-                &eta_sample,
-                omega_inv,
-                theta,
-            ));
+        let log_p_y = -obs_nll;
 
         // log p(η | θ): multivariate-normal quadratic form `η' Ω⁻¹ η`,
         // computed allocation-free on slices. For d ≈ 2–10 the O(d²) double
@@ -1543,7 +1532,6 @@ pub(crate) fn subject_is_draws(
     use_sobol: bool,
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectDraws {
-    // #1716: a density group's `½c` joins the per-draw data term (see `subject_is_estimate`).
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
         obs_nll_subject_into(
             model,
@@ -1553,7 +1541,7 @@ pub(crate) fn subject_is_draws(
             model.residual_cov_theta(theta),
             eta,
             scratch,
-        ) + crate::stats::eta_density::half_correction_stacked(model, eta, omega_inv, theta)
+        )
     };
     subject_is_draws_with(
         &obs_nll,
@@ -1807,7 +1795,6 @@ pub(crate) fn find_optimal_iscale(
     iscale_min: f64,
     iscale_max: f64,
 ) -> f64 {
-    // #1716: a density group's `½c` joins the per-draw data term (see `subject_is_estimate`).
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
         obs_nll_subject_into(
             model,
@@ -1817,7 +1804,7 @@ pub(crate) fn find_optimal_iscale(
             model.residual_cov_theta(theta),
             eta,
             scratch,
-        ) + crate::stats::eta_density::half_correction_stacked(model, eta, omega_inv, theta)
+        )
     };
     find_optimal_iscale_with(
         &obs_nll,
@@ -2209,14 +2196,7 @@ fn subject_is_estimate_joint(
         if !obs_nll.is_finite() {
             obs_nll = SUBJECT_SENTINEL_NLL;
         }
-        // #1716: the density's `½c`, over the BSV block of the joint sample.
-        let log_p_y = -(obs_nll
-            + crate::stats::eta_density::half_correction_stacked(
-                model,
-                &sample_joint,
-                omega_joint_inv,
-                theta,
-            ));
+        let log_p_y = -obs_nll;
 
         // Compute joint prior: eta' Omega^{-1} eta + sum_k kappa_k' Omega_iov^{-1} kappa_k
         let mut quad_form = 0.0_f64;
@@ -3887,8 +3867,6 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             analytic_readout: None,
-            eta_densities: Vec::new(),
-            kappa_densities: Vec::new(),
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
             mixture: None,

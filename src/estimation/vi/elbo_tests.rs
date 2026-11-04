@@ -993,7 +993,7 @@ fn mc_kl_kernel_converges_to_the_closed_form() {
     for _ in 0..n {
         let eps: Vec<f64> = (0..d).map(|_| StandardNormal.sample(&mut rng)).collect();
         let eta = family.sample(&phi, &eps);
-        let draw = mc_kl_draw(&family, &phi, &eta, &params.omega, &[], &params.theta);
+        let draw = mc_kl_draw(&family, &phi, &eta, &params.omega);
 
         value += inv_n * draw.integrand;
         d_omega += draw.d_omega * inv_n;

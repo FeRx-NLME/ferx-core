@@ -7,7 +7,6 @@ pub(crate) mod bayes_mu_design;
 pub(crate) mod cov_diagnostics;
 pub(crate) mod covariance;
 pub(crate) mod covariate_mu_ref;
-pub(crate) mod eta_density_mstep;
 pub(crate) mod fit_inputs;
 pub(crate) mod fixed_eta_gradient;
 pub(crate) mod floor_escape;

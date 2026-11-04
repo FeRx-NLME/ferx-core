@@ -67,7 +67,6 @@ website:
           - model-file/covariates.qmd
           - model-file/covariate-model.qmd
           - model-file/eta-shape.qmd
-          - model-file/random-effect-distributions.qmd
           - model-file/structural-model.qmd
           - model-file/lagtime.qmd
           - model-file/steady-state.qmd

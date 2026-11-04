@@ -718,10 +718,6 @@ fn fit_unstamped(
     // gradient or the inner solve, and a long σ was carried into the result unused.
     // The same checks the post-fit entry points run; `fit` returns their message.
     crate::api::check_theta_length(model, &init_params.theta)?;
-    // #1716: the combinations a `density` random effect is not carried beside yet.
-    if let Some(m) = crate::stats::eta_density::fit_refusal(model, options, init_params) {
-        return Err(crate::api::entry_refusals::density_unsupported(m));
-    }
     crate::api::check_param_shape(model, &crate::api::ParamBlock::all_of(init_params))?;
     // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
     // objective via the derivative-free (BOBYQA) outer optimizer. Estimators the mixture

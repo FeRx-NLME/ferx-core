@@ -65,9 +65,6 @@ pub(crate) struct SaemMixture {
     /// Per-class per-eta SA sufficient statistic for the Ω-override diagonals,
     /// `s2_diag[class][eta]`.
     pub s2_diag: Vec<Vec<f64>>,
-    /// The ETAs a density group covers (#1716), whose class overrides take the density
-    /// M-step instead of the Gaussian statistic.
-    pub density_etas: Vec<usize>,
     /// Held (initial) values of the σ overrides, keyed `(class, sigma_index)`.
     pub sigma_override_init: HashMap<(usize, usize), f64>,
     /// Initial values of the Ω-override diagonals, keyed `(class, eta_index)`.
@@ -169,11 +166,6 @@ impl SaemMixture {
             classes: vec![0usize; n_subjects],
             rbar,
             s2_diag,
-            density_etas: model
-                .eta_densities
-                .iter()
-                .flat_map(|d| d.etas.clone())
-                .collect(),
             sigma_override_init,
             omega_override_init,
             omega_stat_active: false,
@@ -247,9 +239,7 @@ impl SaemMixture {
         let addrs = self.mp.omega_override_addr.clone();
         let fixed = self.mp.omega_override_fixed.clone();
         for (idx, &(c, j)) in addrs.iter().enumerate() {
-            // A density ETA's class ω (#1716) has no Gaussian statistic: its own M-step
-            // (`saem` Step 3c) sets `s2_diag` for it.
-            if fixed[idx] || self.density_etas.contains(&j) {
+            if fixed[idx] {
                 continue;
             }
             let mut sum = 0.0;

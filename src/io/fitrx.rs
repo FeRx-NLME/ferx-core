@@ -889,9 +889,6 @@ struct EtaParamInfoWire {
     param_type: String,
     linked_theta: Option<String>,
     individual_param_name: String,
-    /// #1716; absent from a fit saved before it.
-    #[serde(default)]
-    distribution: Option<crate::types::EtaDistribution>,
 }
 
 /// Row-major dense matrix serialization. `data.len() == rows * cols`.
@@ -1328,7 +1325,6 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 param_type: eta_param_type_to_str(i.param_type).into(),
                 linked_theta: i.linked_theta.clone(),
                 individual_param_name: i.individual_param_name.clone(),
-                distribution: i.distribution.clone(),
             })
             .collect(),
         model_name: r.model_name.clone(),
@@ -2750,7 +2746,6 @@ fn wire_to_fit_result(
                 param_type: eta_param_type_from_str(&i.param_type)?,
                 linked_theta: i.linked_theta,
                 individual_param_name: i.individual_param_name,
-                distribution: i.distribution,
             })
         })
         .collect::<Result<_, _>>()?;
