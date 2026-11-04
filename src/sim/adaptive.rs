@@ -1088,18 +1088,34 @@ impl DosePlanViolation {
                         "[adaptive_dosing]: start_dose {d} must be one of the declared levels {n:?}"
                     ),
                     // A mixed ladder (#2667 review r2 N3): the rungs as written, and why
-                    // no expression rung can take the value.
-                    None => format!(
-                        "[adaptive_dosing]: start_dose {d} must be one of the declared levels \
-                         [{}]. It is none of the numbers, and the ladder increases, so no \
-                         expression rung can equal it: none lies between numbers on either \
-                         side of {d}.",
-                        rungs
-                            .iter()
-                            .map(DoseValue::source)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+                    // no expression rung can take the value, naming the numbers around the
+                    // start dose (review N3 M2). Reached only with a numeric start that is
+                    // none of the numbers, and with at least one number: with none, every
+                    // expression rung could take it.
+                    None => {
+                        let start = spec.start_dose.as_literal().unwrap_or(f64::NAN);
+                        let nums = rungs.iter().filter_map(DoseValue::as_literal);
+                        let below = nums.clone().filter(|&x| x < start).reduce(f64::max);
+                        let above = nums.filter(|&x| x > start).reduce(f64::min);
+                        let gap = match (below, above) {
+                            (Some(b), Some(a)) => {
+                                format!("between {b} and {a}, the numbers either side of {d}")
+                            }
+                            (None, Some(a)) => format!("below {a}, the lowest number"),
+                            (Some(b), None) => format!("above {b}, the highest number"),
+                            (None, None) => "where it could".to_string(),
+                        };
+                        format!(
+                            "[adaptive_dosing]: start_dose {d} must be one of the declared \
+                             levels [{}]. It is none of the numbers, and the ladder increases, \
+                             so no expression rung can equal it: none lies {gap}.",
+                            rungs
+                                .iter()
+                                .map(DoseValue::source)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
                 }
             }
             DosePlanViolation::LevelOutsideBounds(_, bad) => {

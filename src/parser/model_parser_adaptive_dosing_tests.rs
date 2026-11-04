@@ -1144,7 +1144,7 @@ fn a_mixed_block_is_checked_among_its_numbers_at_parse_time() {
         }
         b
     };
-    let refused: [(&str, &str, Option<&str>, &str); 10] = [
+    let refused: [(&str, &str, Option<&str>, &str); 11] = [
         // A start no expression rung can reach (#2667 review r2 N3): the only expression
         // rung is above 200, or between 100 and 200 while the start is 250 (only its
         // upper neighbour rules it out) or 50 (only its lower neighbour does).
@@ -1154,7 +1154,7 @@ fn a_mixed_block_is_checked_among_its_numbers_at_parse_time() {
             Some("[100, 10 * WT, 200]"),
             "[adaptive_dosing]: start_dose 50 must be one of the declared levels [100, 10 * \
              WT, 200]. It is none of the numbers, and the ladder increases, so no expression \
-             rung can equal it: none lies between numbers on either side of 50.",
+             rung can equal it: none lies below 100, the lowest number.",
         ),
         (
             "150",
@@ -1162,7 +1162,17 @@ fn a_mixed_block_is_checked_among_its_numbers_at_parse_time() {
             Some("[100, 200, 20 * WT]"),
             "[adaptive_dosing]: start_dose 150 must be one of the declared levels [100, 200, \
              20 * WT]. It is none of the numbers, and the ladder increases, so no expression \
-             rung can equal it: none lies between numbers on either side of 150.",
+             rung can equal it: none lies between 100 and 200, the numbers either side of 150.",
+        ),
+        // Two numbers above the expression rung: only the nearest one, 100, rules it out
+        // (#2667 N3 review M1 — comparing against the farthest, 200, would let it parse).
+        (
+            "150",
+            "[0, 30 * WT]",
+            Some("[20 * WT, 100, 200]"),
+            "[adaptive_dosing]: start_dose 150 must be one of the declared levels [20 * WT, \
+             100, 200]. It is none of the numbers, and the ladder increases, so no expression \
+             rung can equal it: none lies between 100 and 200, the numbers either side of 150.",
         ),
         (
             "250",
@@ -1170,7 +1180,7 @@ fn a_mixed_block_is_checked_among_its_numbers_at_parse_time() {
             Some("[100, 10 * WT, 200]"),
             "[adaptive_dosing]: start_dose 250 must be one of the declared levels [100, 10 * \
              WT, 200]. It is none of the numbers, and the ladder increases, so no expression \
-             rung can equal it: none lies between numbers on either side of 250.",
+             rung can equal it: none lies above 200, the highest number.",
         ),
         (
             "500",
