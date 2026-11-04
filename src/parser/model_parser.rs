@@ -5621,13 +5621,9 @@ pub fn parse_full_model_with(
         _ => Vec::new(),
     };
     let residual_serial = match &correlation_decl {
-        Some(decl) => resolve_correlation(
-            decl,
-            &parsed_error_model,
-            iiv_on_ruv_name.as_deref(),
-            !block_sigmas.is_empty(),
-            &thetas,
-        )?,
+        Some(decl) => {
+            resolve_correlation(decl, &parsed_error_model, !block_sigmas.is_empty(), &thetas)?
+        }
         None => None,
     };
     let (error_model, error_spec) =
@@ -21629,7 +21625,6 @@ fn correlation_kind_list() -> String {
 fn resolve_correlation(
     decl: &CorrelationDecl,
     parsed: &ParsedErrorModel,
-    iiv_on_ruv: Option<&str>,
     has_block_sigma: bool,
     thetas: &[ThetaSpec],
 ) -> Result<Option<crate::types::ResidualSerial>, String> {
@@ -21648,11 +21643,6 @@ fn resolve_correlation(
                  (`if … else`) error model."
             ))
         }
-    }
-    if let Some(eta) = iiv_on_ruv {
-        return Err(format!(
-            "[error_model] `{line}` is not supported together with `iiv_on_ruv = {eta}`."
-        ));
     }
     if has_block_sigma {
         return Err(format!(
@@ -21690,9 +21680,45 @@ fn parse_error_model(
 fn parse_error_model_inner(
     lines: &[String],
 ) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
+    // IIV on residual error: `iiv_on_ruv = ETA_NAME` (NONMEM `Y=IPRED+EPS*EXP(ETA)`). It
+    // modifies the whole block rather than one statement, so it is taken out first: it
+    // sits beside a plain, per-CMT or if/else block alike (#2656). Inside an if/else
+    // branch it would read as scaling that branch alone, which no model here can do, so
+    // only a line outside every brace counts and one inside is refused.
+    static IIV_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap());
+    let mut iiv_on_ruv: Option<String> = None;
+    let mut statements: Vec<String> = Vec::with_capacity(lines.len());
+    let mut depth = 0_usize;
+    for line in lines {
+        let code = line.split('#').next().unwrap_or("").trim();
+        match IIV_RE.captures(code) {
+            Some(c) if depth > 0 => {
+                return Err(format!(
+                    "[error_model] `iiv_on_ruv = {}` is inside an `if/else` branch. It scales \
+                     every branch, so write it after the closing `}}`.",
+                    &c[1]
+                ));
+            }
+            Some(_) if iiv_on_ruv.is_some() => {
+                return Err("[error_model] has more than one `iiv_on_ruv = ...` entry".to_string());
+            }
+            Some(c) => iiv_on_ruv = Some(c[1].to_string()),
+            None => {
+                for ch in code.chars() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                statements.push(line.clone());
+            }
+        }
+    }
     // Covariate-selected if/else form (issue #658) — detected and parsed first;
     // falls through to the line-based single / per-CMT grammar when absent.
-    if let Some((branches, default, covariates)) = parse_selected_error_model(lines)? {
+    if let Some((branches, default, covariates)) = parse_selected_error_model(&statements)? {
         return Ok((
             ParsedErrorModel::Selected {
                 branches,
@@ -21700,7 +21726,7 @@ fn parse_error_model_inner(
                 covariates,
             },
             LtbsFlags::default(),
-            None,
+            iiv_on_ruv,
         ));
     }
     // Single-endpoint:
@@ -21734,27 +21760,12 @@ fn parse_error_model_inner(
     // and the `power(...)` exponent expression when the line is that form.
     let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
-    // IIV on residual error: `iiv_on_ruv = ETA_NAME` (NONMEM `Y=IPRED+EPS*EXP(ETA)`).
-    static IIV_RE: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap());
-    let iiv_re = &*IIV_RE;
-    let mut iiv_on_ruv: Option<String> = None;
-
-    for line in lines {
+    for line in &statements {
         // Strip inline `# ...` comments so the anchored statement regex sees a
         // clean `LHS ~ TYPE(args)` (a trailing comment would otherwise defeat
         // the `$` anchor and the statement would be silently ignored).
         let trimmed = line.split('#').next().unwrap_or("").trim();
         if trimmed.is_empty() {
-            continue;
-        }
-
-        // `iiv_on_ruv = ETA_NAME` declares a random effect on the residual error.
-        if let Some(c) = iiv_re.captures(trimmed) {
-            if iiv_on_ruv.is_some() {
-                return Err("[error_model] has more than one `iiv_on_ruv = ...` entry".to_string());
-            }
-            iiv_on_ruv = Some(c[1].to_string());
             continue;
         }
 

@@ -2268,11 +2268,9 @@ fn test_simulate_singular_rho_one_does_not_panic() {
 }
 
 // Cover the custom-magnitude (`Some(mult)`) R-build branch and the
-// `ruv_scale != 1.0` scaling inside `emit_correlated_residual_rows`. The
-// model-driven simulate() path can't reach these for a supported
-// `block_sigma` model (block_sigma + iiv_on_ruv is rejected at fit), so call
-// the helper directly with a hand-built per-observation multiplier and a
-// non-unit scale and assert it draws both rows without panicking.
+// `ruv_scale != 1.0` scaling inside `emit_correlated_residual_rows`: call the
+// helper directly with a hand-built per-observation multiplier and a non-unit
+// scale and assert it draws both rows without panicking.
 #[test]
 fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
     use rand::SeedableRng;

@@ -2533,9 +2533,8 @@ pub(crate) fn compute_posterior_hessian(
     // `H_post = Ω⁻¹ + Jᵀ R⁻¹ J`, so the Student-t proposal reflects the correlated
     // posterior shape (a diagonal-R proposal still yields correct importance
     // weights — those use the dense data term — but inflates the weight variance /
-    // lowers ESS). block_sigma is rejected with FREM and iiv_on_ruv, so no R
-    // overrides or residual-eta curvature apply. A non-PD R falls through to the
-    // diagonal approximation below.
+    // lowers ESS). block_sigma is rejected with FREM, so no R overrides apply. A non-PD
+    // R falls through to the diagonal approximation below.
     // #484/#1029: the per-observation magnitude multiplier rides the sigma
     // loadings, so the proposal precision is built from the same `R` the
     // importance weights score against.
@@ -2554,9 +2553,25 @@ pub(crate) fn compute_posterior_hessian(
             model.residual_cov_theta(theta),
             ruv_mult.as_deref(),
         );
+        // IIV on residual error (#2656): `R = exp(2·η̂_ruv)·R₀`, so the mode's precision
+        // reads the subject's own residual scale, and η_ruv — whose Jacobian column is
+        // zero — gets the curvature of `½·exp(−2η)·rᵀR₀⁻¹r`, which is `2·rᵀR⁻¹r`.
+        let r = r * model.residual_var_scale(eta_hat.as_slice());
         if let Some(chol) = r.cholesky() {
             let r_inv = chol.inverse();
-            return omega_inv + jacobian.transpose() * &r_inv * jacobian;
+            let mut h_post = omega_inv + jacobian.transpose() * &r_inv * jacobian;
+            if let Some(k) = model.residual_error_eta.filter(|&k| k < n_eta) {
+                let res = DVector::from_iterator(
+                    n_obs,
+                    subject
+                        .observations
+                        .iter()
+                        .zip(ipreds.iter())
+                        .map(|(&y, &f)| y - f),
+                );
+                h_post[(k, k)] += 2.0 * res.dot(&chol.solve(&res));
+            }
+            return h_post;
         }
     }
     let mut r_diag = crate::stats::residual_error::compute_r_diag_maybe_scaled(
@@ -2645,6 +2660,75 @@ fn add_ruv_posterior_curvature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2656: the dense proposal precision under `iiv_on_ruv`. At ρ = 0 the dense `R` is
+    /// the diagonal one, so a model with a free ρ at 0 must return what the same model with
+    /// no `correlation` line returns from the diagonal branch, whose `exp(2η̂_ruv)` scale and
+    /// `η_ruv` curvature are the reference. And ρ ≠ 0 must then move it.
+    #[test]
+    fn the_dense_proposal_carries_the_residual_scale_and_curvature() {
+        let dir = format!("{}/nonmem_anchor/iiv_ruv_dense", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(format!("{dir}/triple.ferx")).unwrap();
+        let free = |rho: &str| src.replace("theta RHO(0.5, -0.9, 0.99) FIX", rho);
+        let load = |text: &str| {
+            let parsed = crate::parser::model_parser::parse_full_model(text).unwrap();
+            let (pop, _) = crate::api::read_population_for(
+                &parsed.model,
+                &parsed.covariate_decls,
+                &format!("{dir}/triple.csv"),
+                None,
+                None,
+                None,
+                &parsed.column_map,
+            )
+            .unwrap();
+            let mut s = pop.subjects[0].clone();
+            s.obs_rgroup = crate::stats::residual_error::residual_groups(&parsed.model, &s);
+            (parsed.model, s)
+        };
+        let precision = |model: &CompiledModel, s: &Subject| {
+            let p = &model.default_params;
+            let n_obs = s.observations.len();
+            let jac = DMatrix::from_fn(n_obs, 3, |j, k| {
+                if k == 2 {
+                    0.0
+                } else {
+                    0.4 + 0.1 * (j + k) as f64
+                }
+            });
+            compute_posterior_hessian(
+                model,
+                s,
+                &p.theta,
+                &DVector::from_vec(vec![0.1, -0.05, 0.6]),
+                &p.sigma.values,
+                &jac,
+                &p.omega.inv,
+                3,
+                &mut EventPkParams::default(),
+            )
+        };
+        let (dense, s_dense) = load(&free("theta RHO(0.0, -0.9, 0.99)"));
+        assert!(dense.residual_is_dense());
+        let diagonal_src = free("theta RHO(0.0, -0.9, 0.99) FIX");
+        let (diagonal, s_diag) = load(&diagonal_src);
+        assert!(!diagonal.residual_is_dense(), "`FIX` 0 drops the line");
+        let (h_dense, h_diag) = (precision(&dense, &s_dense), precision(&diagonal, &s_diag));
+        let gap = (&h_dense - &h_diag).abs().max();
+        eprintln!("ρ = 0 dense vs diagonal proposal: {gap:.3e}");
+        assert!(
+            gap.is_finite() && gap < 1e-9 * h_diag.abs().max(),
+            "{gap:e}"
+        );
+        // Both halves are live: the scale on the structural block, the curvature on `η_ruv`.
+        assert!(h_diag[(0, 0)] > 2.0 * dense.default_params.omega.inv[(0, 0)]);
+        assert!(h_diag[(2, 2)] > 1.5 * dense.default_params.omega.inv[(2, 2)]);
+
+        let (correlated, s_corr) = load(&src);
+        assert!(correlated.residual_is_dense());
+        let moved = (&precision(&correlated, &s_corr) - &h_diag).abs().max();
+        assert!(moved > 1e-3 * h_diag.abs().max(), "{moved:e}");
+    }
 
     /// The κ columns of the joint IS proposal's `J` are exact (the stacked recording),
     /// replacing `2·K·n_κ` `predict_iov` solves: against the forced central difference the

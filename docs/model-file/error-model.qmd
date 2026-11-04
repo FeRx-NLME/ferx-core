@@ -228,7 +228,7 @@ The restriction is on the plain form only. A block that genuinely carries severa
 statements writes them with [`CMT=N:` prefixes](#multiple-endpoints-per-cmt-error-models)
 or as an [`if/else` selector](#covariate-selected-error-models-ifelse), both of
 which bind every line. `iiv_on_ruv = ETA` is not a statement line and may accompany
-any single-endpoint model.
+any single-endpoint model or an `if/else` selector, but not `CMT=N:` lines.
 
 ## Sigma order {#sigma-order}
 
@@ -941,9 +941,12 @@ assays receive the NONMEM-style covariance term
 Current scope: `block_sigma` is supported for the Gaussian `method = foce`,
 `method = focei`, `method = saem`, and `method = imp` fits. The Gauss-Newton
 optimizers (`gn` / `gn_hybrid`), M3 censored-observation likelihoods, FREM
-covariate pseudo-observations, `iiv_on_ruv` and TTE endpoints reject
-correlated residual sigma blocks until their residual-error derivative code is
-extended beyond diagonal RUV.
+covariate pseudo-observations and TTE endpoints reject correlated residual
+sigma blocks until their residual-error derivative code is extended beyond
+diagonal RUV.
+
+**With `iiv_on_ruv`**, the random effect scales the subject's whole `R`, so the
+correlation is unchanged. See [IIV on residual error](#iiv-on-residual-error-iiv_on_ruv).
 
 **With IOV** (`kappa`), `block_sigma` is fitted by `method = foce` and
 `method = focei` (single node, `n_agq = 1`) only (#979). The IOV marginal
@@ -1106,7 +1109,17 @@ Notes and constraints:
   combination with a clear error.
 - The named eta must be a dedicated `omega` not shared with a structural
   individual parameter.
-- Not supported with per-CMT (multi-endpoint) error models.
+- Not supported with per-CMT (multi-endpoint) error models. An `if/else`
+  [selected error model](#covariate-selected-error-models-ifelse) takes it: the
+  line sits after the closing `}` and scales every branch. Inside a branch it is
+  refused, since one branch cannot be scaled on its own.
+- **With a correlated residual.** `iiv_on_ruv` composes with `block_sigma` and with
+  a [`correlation` line](residual-correlation.qmd#with-iiv-on-the-residual). The
+  random effect scales the subject's whole `R`, so the correlation is unchanged:
+  `R_i(η) = exp(2·ETA_RUV_i)·R_i(η = 0)`. Each correlation keeps its own estimators,
+  less any non-interaction stage: `block_sigma` under `focei`, `saem`, `imp`,
+  `laplace` and `vi`, and a `correlation` line under `focei`. The objective, the EBEs
+  and CWRES match NONMEM at `MAXEVAL=0` (`nonmem_anchor/iiv_ruv_dense/`).
 - **Exact analytic FOCE/FOCEI gradient.** For analytical 1-/2-/3-cpt, **ODE
   (`[odes]`)**, and **LTBS (`log_additive`)** models, `iiv_on_ruv` fits use the
   exact outer θ/Ω/σ gradient — the residual-eta enters through the variance scale

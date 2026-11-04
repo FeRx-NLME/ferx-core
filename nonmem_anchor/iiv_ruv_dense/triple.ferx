@@ -1,0 +1,30 @@
+# ferx twin of nonmem_anchor/iiv_ruv_dense/{cs,ar1}_*.ctl (#2656): three rows per block
+# correlated by a `correlation` line, with iiv_on_ruv scaling every residual SD of the
+# subject. Every parameter is FIX: the anchor is a MAXEVAL=0 evaluation.
+# tests/iiv_ruv_dense_nonmem_anchor.rs swaps in the structure and rho per probe.
+
+[parameters]
+  theta TVCL(1.05, 0.1, 10.0) FIX
+  theta TVV(9.5, 1.0, 100.0) FIX
+  theta RHO(0.5, -0.9, 0.99) FIX
+
+  omega ETA_CL ~ 0.08 FIX
+  omega ETA_V ~ 0.05 FIX
+  omega ETA_RUV ~ 0.25 FIX
+
+  sigma PROP_ERR ~ 0.16 (sd) FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  correlation cs(RHO) by BLK
+  iiv_on_ruv = ETA_RUV
+
+[fit_options]
+  method = focei
