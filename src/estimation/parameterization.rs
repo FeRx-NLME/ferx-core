@@ -67,48 +67,80 @@ pub(crate) fn theta_packing_jacobian(theta: f64, theta_lower: f64) -> f64 {
 /// the minus point evaluates a negative volume. Scaling the floor by `|θ₀|` makes the step
 /// relative to the coordinate's declared magnitude, as NONMEM's UCP scaling does.
 ///
-/// The floor is `θ₀` (the model's declared value, `declared`) rather than the estimate, so a θ
-/// estimated at or near zero — a covariate effect — still gets a usable step. A log-packed θ,
-/// whose coordinate is `log θ`, is already stepped relatively; Ω, σ and every other
-/// coordinate keep `1`. `template` supplies the packing (θ lower bounds) and `declared` the
-/// initial values; a `k` past either θ vector is not a θ and gets `1`.
-pub(crate) fn fd_step_floor(
+/// The floor is `θ₀` (the model's declared value, `model.default_params`) rather than the
+/// estimate, so a θ estimated at or near zero — a covariate effect — still gets a usable step.
+/// A log-packed θ, whose coordinate is `log θ`, is already stepped relatively; Ω, σ and every
+/// other coordinate keep `1`. `template` supplies the packing (θ lower bounds); a `k` past
+/// either θ vector is not a θ and gets `1`.
+///
+/// A `[covariate_nn]` weight keeps `1` too (#2406). It is identity-packed, but its θ₀ is a
+/// Glorot draw (or the zero output init), not a magnitude anyone declared, and its sensitivity
+/// does not scale with it: on `two_cpt_oral_cov`'s CRCL/WT network a first-layer weight drawn
+/// at 1e-4 got a reconverged-FD gradient 5.5e-2 off under the `|θ₀|` floor and 1.3e-7 under 1.
+pub(crate) fn fd_step_floor(template: &ModelParameters, model: &CompiledModel, k: usize) -> f64 {
+    fd_step_floor_of(
+        template,
+        &model.default_params,
+        &model.nn_weight_theta_ranges(),
+        k,
+    )
+}
+
+/// [`fd_step_floor`] over explicit parts: `declared` the initial values and `nn_weights` the θ
+/// ranges of the `[covariate_nn]` weights (`CompiledModel::nn_weight_theta_ranges`).
+fn fd_step_floor_of(
     template: &ModelParameters,
     declared: &ModelParameters,
+    nn_weights: &[std::ops::Range<usize>],
     k: usize,
 ) -> f64 {
-    match (template.theta_lower.get(k), declared.theta.get(k)) {
-        (Some(&lo), Some(&t0)) if !theta_packs_log(lo) && t0 != 0.0 && t0.abs() < 1.0 => t0.abs(),
+    match template.theta_lower.get(k) {
+        Some(&lo) if !theta_packs_log(lo) => theta0_floor(declared, nn_weights, k),
+        _ => 1.0,
+    }
+}
+
+/// The declared-magnitude floor of θ `i`: `|θ₀ᵢ|` when `0 < |θ₀ᵢ| < 1` and θ `i` is not a
+/// `[covariate_nn]` weight, else 1 — including for an `i` past the declared θ vector.
+fn theta0_floor(
+    declared: &ModelParameters,
+    nn_weights: &[std::ops::Range<usize>],
+    i: usize,
+) -> f64 {
+    match declared.theta.get(i) {
+        Some(&t0) if t0 != 0.0 && t0.abs() < 1.0 && !nn_weights.iter().any(|w| w.contains(&i)) => {
+            t0.abs()
+        }
         _ => 1.0,
     }
 }
 
 /// [`fd_step_floor`] for every packed coordinate of `template`, in packed order.
-pub(crate) fn fd_step_floors(template: &ModelParameters, declared: &ModelParameters) -> Vec<f64> {
+pub(crate) fn fd_step_floors(template: &ModelParameters, model: &CompiledModel) -> Vec<f64> {
+    let nn_weights = model.nn_weight_theta_ranges();
     (0..packed_len(template))
-        .map(|k| fd_step_floor(template, declared, k))
+        .map(|k| fd_step_floor_of(template, &model.default_params, &nn_weights, k))
         .collect()
 }
 
 /// The per-θ floor of a finite difference taken in **θ's own units** rather than the packed
 /// coordinate — the mixing-probability derivatives (`mixing_logp_grad{,_fd}`), which step
 /// `1e-6·max(|θⱼ|, floorⱼ)` (#2147). `floorⱼ = |θ₀ⱼ|` when `0 < |θ₀ⱼ| < 1`, else 1 (the
-/// pre-#2147 step). Unlike [`fd_step_floor`] this does not depend on the packing: in θ units a
-/// log-packed θ is as exposed as an identity-packed one, since neither step is relative there.
-pub(crate) fn fd_theta_step_floors(declared: &ModelParameters) -> Vec<f64> {
-    (0..declared.theta.len())
-        .map(|i| fd_theta_step_floor(declared, i))
+/// pre-#2147 step), and 1 on a `[covariate_nn]` weight as in [`fd_step_floor`]. Unlike
+/// [`fd_step_floor`] this does not depend on the packing: in θ units a log-packed θ is as
+/// exposed as an identity-packed one, since neither step is relative there.
+pub(crate) fn fd_theta_step_floors(model: &CompiledModel) -> Vec<f64> {
+    let nn_weights = model.nn_weight_theta_ranges();
+    (0..model.default_params.theta.len())
+        .map(|i| theta0_floor(&model.default_params, &nn_weights, i))
         .collect()
 }
 
-/// [`fd_theta_step_floors`] for the single θ `i`: `|θ₀ᵢ|` when `0 < |θ₀ᵢ| < 1`, else 1 —
-/// including for an `i` past the declared θ vector. The floor of the θ-unit forward
-/// differences of the SAEM M-step and the VI ELBO (`fixed_eta_gradient`, #2187).
-pub(crate) fn fd_theta_step_floor(declared: &ModelParameters, i: usize) -> f64 {
-    match declared.theta.get(i) {
-        Some(&t0) if t0 != 0.0 && t0.abs() < 1.0 => t0.abs(),
-        _ => 1.0,
-    }
+/// [`fd_theta_step_floors`] for the single θ `i`, including an `i` past the declared θ vector
+/// (floor 1). The floor of the θ-unit forward differences of the SAEM M-step and the VI ELBO
+/// (`fixed_eta_gradient`, #2187).
+pub(crate) fn fd_theta_step_floor(model: &CompiledModel, i: usize) -> f64 {
+    theta0_floor(&model.default_params, &model.nn_weight_theta_ranges(), i)
 }
 
 /// The finite-difference step of a packed coordinate at `x` with floor `floor`
@@ -2257,14 +2289,96 @@ mod tests {
         let mut template = declared.clone();
         template.theta[0] = 0.001;
 
-        let floors = fd_step_floors(&template, &declared);
-        assert_eq!(floors.len(), packed_len(&template));
+        let floors: Vec<f64> = (0..packed_len(&template))
+            .map(|k| fd_step_floor_of(&template, &declared, &[], k))
+            .collect();
         assert_eq!(&floors[..5], &[0.0077, 1.0, 1.0, 1.0, 0.3]);
         assert!(floors[5..].iter().all(|&s| s == 1.0), "Ω/σ: {floors:?}");
         // A declared θ vector shorter than the template's is not read past its end.
         let mut short = declared.clone();
         short.theta.truncate(1);
-        assert_eq!(fd_step_floor(&template, &short, 4), 1.0);
+        assert_eq!(fd_step_floor_of(&template, &short, &[], 4), 1.0);
+    }
+
+    /// #2406: a `[covariate_nn]` weight keeps floor 1 whatever its draw, on both the packed and
+    /// the θ-unit floor, while the identity-packed θ beside it still takes `|θ₀|`. θ 0 and θ 4
+    /// are the same kind of θ (identity-packed, `0 < |θ₀| < 1`) and differ only in membership,
+    /// so dropping the exemption from either helper reddens one row here.
+    #[test]
+    fn a_covariate_nn_weight_keeps_the_unit_fd_step_floor() {
+        let mut declared = make_template();
+        declared.theta = vec![0.0077, 7.7, 0.0, 0.5, -0.3];
+        declared.theta_lower = vec![-0.77, -770.0, -1.0, 0.0, f64::NEG_INFINITY];
+        declared.theta_upper = vec![0.77, 770.0, 1.0, 1.0, f64::INFINITY];
+        declared.theta_names = (0..5).map(|i| format!("t{i}")).collect();
+        declared.theta_fixed = vec![false; 5];
+        let nn = [4..5];
+        let packed: Vec<f64> = (0..5)
+            .map(|k| fd_step_floor_of(&declared, &declared, &nn, k))
+            .collect();
+        assert_eq!(packed, [0.0077, 1.0, 1.0, 1.0, 1.0]);
+        let natural: Vec<f64> = (0..5).map(|i| theta0_floor(&declared, &nn, i)).collect();
+        assert_eq!(natural, [0.0077, 1.0, 1.0, 0.5, 1.0]);
+        // Without the network the same θ 4 is an ordinary small identity θ.
+        assert_eq!(fd_step_floor_of(&declared, &declared, &[], 4), 0.3);
+        assert_eq!(theta0_floor(&declared, &[], 4), 0.3);
+    }
+
+    /// #2406: the three public-to-the-crate wrappers read the network's θ ranges from the
+    /// model, not an empty list. On a parsed `[covariate_nn]` with a first-layer weight set to
+    /// `1e-3`, every wrapper gives that weight floor 1, while `TVKA = 0.5` (outside the network)
+    /// keeps `|θ₀|` on the θ-unit floor. A wrapper passing `&[]` gives the weight `1e-3`.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn the_fd_step_floor_wrappers_read_the_covariate_nn_ranges_from_the_model() {
+        let mut model = crate::parser::model_parser::parse_model_string(
+            "[parameters]
+  theta TVQ(6.0, 0.1, 50.0)
+  theta TVKA(0.5, 0.05, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma PROP ~ 0.1 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs     = [CRCL, WT]
+  center     = [90, 70]
+  scale      = [30, 15]
+  outputs    = [CL, V1, V2]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+  init       = [4.0, 40.0, 80.0]
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V1 = TYPICAL_PK.V1
+  Q  = TVQ
+  V2 = TYPICAL_PK.V2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+        )
+        .expect("model parses");
+        let ranges = model.nn_weight_theta_ranges();
+        let w = ranges.first().expect("the network has weights").start;
+        assert!(w >= 2, "TVQ and TVKA come first: {ranges:?}");
+        model.default_params.theta[w] = 1e-3;
+        assert!(
+            !theta_packs_log(model.default_params.theta_lower[w]),
+            "fixture: the weight is identity-packed, so the |θ₀| floor would apply to it"
+        );
+        assert_eq!(fd_step_floor(&model.default_params, &model, w), 1.0);
+        assert_eq!(fd_step_floors(&model.default_params, &model)[w], 1.0);
+        assert_eq!(fd_theta_step_floor(&model, w), 1.0);
+        assert_eq!(fd_theta_step_floors(&model)[w], 1.0);
+        assert_eq!(fd_theta_step_floor(&model, 1), 0.5);
+        assert_eq!(fd_theta_step_floors(&model)[1], 0.5);
+        // The same θ without the exemption — what a wrapper passing `&[]` would return.
+        assert_eq!(theta0_floor(&model.default_params, &[], w), 1e-3);
     }
 
     /// With floor 1, `fd_step` is the pre-#2147 `eps·(1 + |x|)` bit for bit — the property

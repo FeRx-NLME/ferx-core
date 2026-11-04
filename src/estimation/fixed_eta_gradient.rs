@@ -223,8 +223,22 @@ fn theta_fd_step(model: &CompiledModel, h: f64, theta: &[f64], i: usize) -> f64 
     crate::estimation::parameterization::fd_step(
         h,
         theta[i],
-        crate::estimation::parameterization::fd_theta_step_floor(&model.default_params, i),
+        crate::estimation::parameterization::fd_theta_step_floor(model, i),
     )
+}
+
+/// The forward-difference step of σ `s` in the M3 / dense-`R` fixed-η score: `h·|s|`, and `h`
+/// at `s = 0`. σ is log-packed, so the step is relative to σ like every other log-packed
+/// coordinate's; the earlier `h·(1 + |s|)` was an absolute `h` on a σ below 1, and its
+/// first-order error in the log-σ score grows as `1/σ` — 5.0e-3 relative at an sd of 0.003
+/// against the exact score, 1.5e-5 at 1 (#2406).
+#[inline]
+fn sigma_fd_step(h: f64, s: f64) -> f64 {
+    if s != 0.0 {
+        h * s.abs()
+    } else {
+        h
+    }
 }
 
 /// The exact fixed-η θ score by the adjoint
@@ -410,7 +424,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
             } else {
                 let k = i - n_theta;
                 let mut sigma_p = sigma_values.to_vec();
-                let delta = h * (1.0 + sigma_values[k].abs());
+                let delta = sigma_fd_step(h, sigma_values[k]);
                 sigma_p[k] += delta;
                 let nll_p = obs_nll_subject_into_iov(
                     model, subject, theta, &sigma_p, eta, kappas, pk_scratch,
@@ -855,7 +869,7 @@ fn obs_nll_subject_grad_impl(
             } else {
                 let k = i - n_theta;
                 let mut sigma_p = sigma_values.to_vec();
-                let delta = h * (1.0 + sigma_values[k].abs());
+                let delta = sigma_fd_step(h, sigma_values[k]);
                 sigma_p[k] += delta;
                 let nll_p = obs_nll_subject_from_preds(
                     model,

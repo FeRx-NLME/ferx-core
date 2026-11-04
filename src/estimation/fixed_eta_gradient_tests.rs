@@ -2122,14 +2122,14 @@ fn the_natural_theta_step_floor_ignores_the_packing() {
     let (model, _) = scaled_v_fixture(1e-4, false, false);
     let declared = &model.default_params;
     // TVCL 0.2 (log-packed), TVV_S 1e-3 (identity-packed), TVKA 1.5.
-    assert_eq!(fd_theta_step_floor(declared, 0), 0.2);
-    assert_eq!(fd_theta_step_floor(declared, 1), declared.theta[1].abs());
-    assert_eq!(fd_theta_step_floor(declared, 2), 1.0);
-    assert_eq!(fd_theta_step_floor(declared, 99), 1.0);
+    assert_eq!(fd_theta_step_floor(&model, 0), 0.2);
+    assert_eq!(fd_theta_step_floor(&model, 1), declared.theta[1].abs());
+    assert_eq!(fd_theta_step_floor(&model, 2), 1.0);
+    assert_eq!(fd_theta_step_floor(&model, 99), 1.0);
     assert_eq!(
-        fd_theta_step_floors(declared),
+        fd_theta_step_floors(&model),
         (0..3)
-            .map(|i| fd_theta_step_floor(declared, i))
+            .map(|i| fd_theta_step_floor(&model, i))
             .collect::<Vec<_>>()
     );
     assert_eq!(
@@ -2140,6 +2140,83 @@ fn the_natural_theta_step_floor_ignores_the_packing() {
         theta_fd_step(&model, 1e-5, &[0.2, 1e-3, 7.7], 1),
         1e-5 * (1e-3 + 1e-3)
     );
+}
+
+/// #2406: the forward-differenced σ score of the M3 path (`DATA_SCORE_FD_FORCE`), IOV and
+/// non-IOV, against the exact data score, for a σ sd from 0.3 down to 0.003. The step is
+/// `h·σ`, so the relative error does not grow as σ shrinks. Under the old `h·(1 + σ)` it was
+/// about `1.5e-5/σ`: 5.0e-3 at 0.003, 1.5e-3 at 0.01.
+#[test]
+fn the_m3_sigma_forward_difference_is_relative_to_sigma() {
+    assert_eq!(sigma_fd_step(1e-5, 0.003), 1e-5 * 0.003);
+    assert_eq!(sigma_fd_step(1e-5, 0.0), 1e-5);
+    for iov in [false, true] {
+        let (model, subjects) = scaled_v_fixture(1.0, iov, true);
+        let theta = model.default_params.theta.clone();
+        let n_theta = theta.len();
+        let mask: Vec<bool> = (0..n_theta).map(|i| i != 1).collect();
+        let n = n_theta + 1;
+        let (lo, hi) = (vec![-1e30; n], vec![1e30; n]);
+        let mut scratch = EventPkParams::default();
+        for sd in [0.3, 0.1, 0.03, 0.01, 0.003] {
+            let sigma = vec![sd];
+            let mut worst = 0.0f64;
+            for s in &subjects {
+                let eta = vec![0.05; model.n_eta];
+                let mut score = |force: bool| -> f64 {
+                    DATA_SCORE_FD_FORCE.with(|c| c.set(force));
+                    let g = if iov {
+                        let kappas = vec![
+                            vec![0.0; model.n_kappa];
+                            crate::stats::likelihood::iov_occasion_groups(s).len()
+                        ];
+                        obs_nll_subject_grad_iov(
+                            &model,
+                            s,
+                            &theta,
+                            &sigma,
+                            &eta,
+                            &kappas,
+                            &mask,
+                            &lo,
+                            &hi,
+                            n_theta,
+                            1,
+                            &mut scratch,
+                        )
+                        .1
+                    } else {
+                        obs_nll_subject_grad(
+                            &model,
+                            s,
+                            &theta,
+                            &sigma,
+                            &eta,
+                            &mask,
+                            &lo,
+                            &hi,
+                            n_theta,
+                            1,
+                            &mut scratch,
+                        )
+                        .1
+                    };
+                    DATA_SCORE_FD_FORCE.with(|c| c.set(false));
+                    g[n_theta]
+                };
+                let (exact, fd) = (score(false), score(true));
+                assert!(exact.is_finite() && fd.is_finite(), "iov={iov} sd={sd}");
+                assert!(exact.abs() > 1e-3, "fixture: the σ score is live ({exact})");
+                let rel = (fd - exact).abs() / exact.abs();
+                assert!(rel.is_finite());
+                worst = worst.max(rel);
+            }
+            eprintln!("MEASURE #2406 iov={iov} sd={sd:e}: worst rel {worst:.2e}");
+            // Measured (macOS arm64): 1.5e-5..2.0e-5 at every sd, both paths; the bound is 2×
+            // the worst. Reverting either path's step to `h·(1 + σ)` fails it at sd = 0.3 (8.7e-5).
+            assert!(worst < 4e-5, "iov={iov} sd={sd:e}: worst rel {worst:e}");
+        }
+    }
 }
 
 // ── #2440: LTBS + a θ-dependent residual magnitude, below a unit concentration ──

@@ -404,7 +404,7 @@ pub(crate) fn mixture_gradient_with_modes(
     }
 
     // Softmax mixing gradient: −2 Σ_i Σ_k w_ik ∂ln p_ik/∂θ_j (theta slots).
-    let theta_floor = fd_theta_step_floors(&model.default_params);
+    let theta_floor = fd_theta_step_floors(model);
     for (i, subject) in population.subjects.iter().enumerate() {
         let dlnp = mixing_logp_grad(spec, &params.theta, &subject.covariates, &theta_floor)?;
         for (cls, dlnp_c) in dlnp.iter().enumerate() {
@@ -742,7 +742,7 @@ impl MixtureScoreContext {
         let covariates = &population.subjects[i].covariates;
         // The p-form has no analytic mixing gradient; S, unlike the outer gradient, has no
         // whole-objective FD to fall back to, so difference the mixing map itself.
-        let floor = fd_theta_step_floors(&model.default_params);
+        let floor = fd_theta_step_floors(&model);
         let dlnp = mixing_logp_grad(spec, &self.params.theta, covariates, &floor)
             .unwrap_or_else(|| mixing_logp_grad_fd(spec, &self.params.theta, covariates, &floor));
         let mut g = vec![0.0f64; packed_segments(&self.params).total()];
@@ -795,7 +795,7 @@ pub fn mixture_gradient_fd(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     let bounds = crate::estimation::parameterization::compute_bounds(init_params);
     let n = x.len();
     let mut g = vec![0.0f64; n];
@@ -917,7 +917,7 @@ mod tests {
             let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
             let spec = model.mixture.as_ref().unwrap();
             let theta = &model.default_params.theta;
-            let floor = fd_theta_step_floors(&model.default_params);
+            let floor = fd_theta_step_floors(&model);
             assert_eq!(floor, vec![1.0, tiny], "{mixing}: floors");
             // The closed form: softmax with logit g, or the p form p₁ = g (both unclamped
             // here, p₁ = 2.8e-4).
