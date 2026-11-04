@@ -9987,6 +9987,94 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
     assert!(adopt_warm_start(false, 89.0, state.best_ofv));
 }
 
+/// The basin probe's absorb arm on a real fit, fast enough for every PR (#2674): the
+/// 10-subject Michaelis–Menten trap `tests/fixtures/mm_basin_shift/mm_basin10.csv` with the
+/// warm-start predictor off, once at the shipped share and once at 20 %. The
+/// probe at the 32nd evaluation finds 1 of 10 subjects in a lower cold mode: at the shipped
+/// 1 % it restarts (a second attempt), at 20 % it absorbs and the leg runs on. This is the
+/// fast per-PR twin of the 200-subject A/B below: it pins that the absorb arm is wired into
+/// the probe (making the arm a no-op re-traps the leg, a second probe fires and the end-of-leg
+/// check files a restart: red on the no-restart assertion). What the arm does to the cache and
+/// trackers is pinned by `an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two`;
+/// dropping either update leaves this test green.
+///
+/// Measured (`ci-test`): Linux aarch64 (`tools/linux-test.sh`) restart 63.287990 in 82
+/// evaluations over 2 attempts, absorb 63.287839 in 142 over 1, probe gap 7.0741; macOS arm64
+/// restart 91 / absorb 128 evaluations, same OFVs to 1e-5. 3.5 s on Linux.
+#[test]
+fn the_basin_probe_absorbs_one_switched_subject_of_ten() {
+    use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx").unwrap();
+    let parsed = parse_full_model(&text).unwrap();
+    let pop = read_nonmem_csv(
+        Path::new("tests/fixtures/mm_basin_shift/mm_basin10.csv"),
+        None,
+        None,
+    )
+    .unwrap();
+    let opts = FitOptions {
+        verbose: false,
+        ..parsed.fit_options.clone()
+    };
+    let _off = WarmPredictorOff::new();
+    let run = |share: Option<f64>| {
+        BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.set(share));
+        BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().clear());
+        NLOPT_ATTEMPTS.with(|c| c.set(0));
+        let r = optimize_population(&parsed.model, &pop, &parsed.model.default_params, &opts);
+        BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.set(None));
+        let decisions = BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().split_off(0));
+        (r, decisions, NLOPT_ATTEMPTS.with(|c| c.get()))
+    };
+    let (restart, restart_probes, restart_attempts) = run(None);
+    let (absorb, absorb_probes, absorb_attempts) = run(Some(0.2));
+    eprintln!(
+        "restart arm: OFV {:.6} converged {} evals {} attempts {restart_attempts} probes \
+         {restart_probes:?}\nabsorb arm: OFV {:.6} converged {} evals {} attempts \
+         {absorb_attempts} probes {absorb_probes:?}",
+        restart.ofv,
+        restart.converged,
+        restart.n_iterations,
+        absorb.ofv,
+        absorb.converged,
+        absorb.n_iterations,
+    );
+    let restarted = |r: &OuterResult| {
+        r.warnings
+            .iter()
+            .any(|w| w.contains("resumed from the best point seen"))
+    };
+    // The straddle: both arms' first probe sees the same single switched subject, 10 % of
+    // the population: over the shipped 1 %, under the raised 20 %.
+    let first = |p: &[(f64, Option<usize>)]| p.first().and_then(|d| d.1);
+    assert_eq!(
+        first(&restart_probes),
+        Some(1),
+        "the probe must see one subject switch: {restart_probes:?}"
+    );
+    assert_eq!(first(&absorb_probes), Some(1), "{absorb_probes:?}");
+    assert!(restarted(&restart), "at 1 % the probe restarts");
+    assert_eq!(restart_attempts, 2, "the restart is a second attempt");
+    assert!(
+        !restarted(&absorb),
+        "at 20 % the probe absorbs: {:?}",
+        absorb.warnings
+    );
+    assert_eq!(absorb_attempts, 1, "absorbing keeps the one leg");
+    assert!(absorb.converged, "the absorbing leg reaches its own stop");
+    assert!(absorb.ofv.is_finite() && restart.ofv.is_finite());
+    // Measured −1.51e-4 on Linux (−1.43e-4 macOS); 2e-3 is ~13× that, far below the 7.07 gap.
+    assert!(
+        (absorb.ofv - restart.ofv).abs() < 2e-3,
+        "absorbing must reach the restart's optimum: {} vs {}",
+        absorb.ofv,
+        restart.ofv
+    );
+}
+
 /// The absorb arm end to end (#2600), as an A/B on one fit: the full 200-subject
 /// Michaelis–Menten population of `tests/ebe_basin_shift.rs`, warm-start predictor off (the
 /// trap is the unpredicted start's), once at the shipped share and once with the share
