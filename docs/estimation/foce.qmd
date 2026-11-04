@@ -264,6 +264,7 @@ above.
 | `input_rate` forcing + SDE `[diffusion]` | both | both | stochastic dynamics have no recorder |
 | `weibull` + estimated lagtime | both | both | the onset can diverge for shape `β < 1` |
 | SS + an RHS reading `TIME`/`T`/`TAFD`, or `TAD` with a lagged SS dose | ODE | both | an absolute clock has no periodic steady state; the lagged pre-arrival window's `TAD` convention is open (#1126). A `TAD`-only RHS under unlagged SS is analytic |
+| an `[odes]` `if` whose condition reads an estimated parameter and a state or clock (`if (tau > LAGT)`) | ODE | both | the walk knows lagged doses and windows as events, not a boundary written in the equations, so the state's sensitivity jump at the switch is missing (#2649). A parse warning names the parameter |
 | a reset or covariate change exactly on a moving boundary (a lagged arrival, a moving window end), or two moving boundaries coinciding | closed-form | both | the walk resolves one dual position per break time. An *observation* on a moving boundary is analytic ([below](#sampling-on-a-moving-boundary)) |
 | more than 48 random effects (stacked `[η, κ]` under IOV; 24 for Laplace's exact anchor, 8 for its exact R-matrix) | both | both | the widest dispatch bucket of the adjoint |
 | a TTE hazard built through the Rust API without a compiled program | both | both | no dual-evaluable hazard program to differentiate |

@@ -60,6 +60,15 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
     if ode.init_fn.is_some() && !program.has_init_program() {
         return false;
     }
+    // A switch that moves with a parameter puts a jump in the state's sensitivity that the
+    // branch-wise RHS does not contain: the derivative of such a parameter would be silently
+    // wrong, and exactly zero when it reaches the equations only there (#2649).
+    if program
+        .moving_switch(&model.default_params.theta_fixed)
+        .is_some()
+    {
+        return false;
+    }
     // A `TIME`-built-in structural parameter is served ONLY via the event-driven TV walk
     // (`static_walk_subject_supported` declines it so it can't take the static superposition
     // path).
