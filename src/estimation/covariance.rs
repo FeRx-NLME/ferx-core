@@ -354,7 +354,7 @@ fn fd_diag_specs(x_hat: &[f64], free_idx: &[usize], eps: f64, floor: &[f64]) -> 
 
 /// Evaluate `ofv` at one perturbed point. Each call clones `x_hat` once, so a `par_iter` over
 /// specs keeps only ~n_threads vectors live instead of all ~2·nf² perturbed points (#298).
-fn eval_fd_point<F: Fn(&[f64]) -> f64>(x_hat: &[f64], p: FdPert, ofv: &F) -> f64 {
+fn eval_fd_point<R, F: Fn(&[f64]) -> R>(x_hat: &[f64], p: FdPert, ofv: &F) -> R {
     let mut xv = x_hat.to_vec();
     match p {
         FdPert::Single { i, di } => xv[i] += di,
@@ -1326,7 +1326,7 @@ pub(crate) fn exact_candidate_derivatives(
         return None;
     }
     let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
-    let (_, ehs, _, kaps, all_converged) = reconverge_population_checked(
+    let (_, ehs, _, kaps, all_converged, _) = reconverge_population_checked(
         x,
         model,
         population,
@@ -1709,6 +1709,41 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     ofv: &F,
     options: &FitOptions,
 ) -> Option<FdStencil> {
+    fd_ofv_hessian_gated(
+        n,
+        x_hat,
+        free_idx,
+        floor,
+        initial_eps,
+        f0,
+        ofv,
+        None,
+        options,
+    )
+}
+
+/// The objective re-solved at τ/100 — the tight twin of [`fd_ofv_hessian_gated`]'s `ofv` —
+/// `None` where a solve fell to Nelder–Mead or did not converge.
+pub(super) type TightOfv<'a> = &'a (dyn Fn(&[f64]) -> Option<f64> + Sync);
+
+/// [`fd_ofv_hessian`], with the resolution gate of
+/// [`resolve_floored_step`](crate::estimation::fd_resolution::resolve_floored_step) on the
+/// diagonal of every free coordinate whose floor is below 1 (#2406); without `tight` no
+/// coordinate is gated. A gated coordinate's step grows until its second difference is
+/// resolved, the off-diagonal pairs it enters are taken at that grown step, and its diagonal
+/// entry is the τ/100 second difference.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fd_ofv_hessian_gated<F: Fn(&[f64]) -> f64 + Sync>(
+    n: usize,
+    x_hat: &[f64],
+    free_idx: &[usize],
+    floor: &[f64],
+    initial_eps: f64,
+    f0: f64,
+    ofv: &F,
+    tight: Option<TightOfv<'_>>,
+    options: &FitOptions,
+) -> Option<FdStencil> {
     #[cfg(test)]
     reconverge_log::record_fd_hessian(initial_eps);
     // Adaptively select the FD step: halve up to 8× until all free-parameter diagonal stencils
@@ -1727,17 +1762,114 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
             if step.n_halvings == 1 { "" } else { "s" }
         );
     }
-    fd_ofv_stencil(
+    let mut diag = step.diag;
+    let mut floor = floor.to_vec();
+    let mut resolved_diag: Vec<(usize, f64)> = Vec::new();
+    if let (Some(tight), Some(d)) = (tight, diag.as_mut()) {
+        for (a, i, r, (fp, fm)) in
+            resolve_fd_diag(x_hat, free_idx, &floor, step.eps, f0, d, ofv, tight)
+        {
+            floor[i] = r.floor;
+            d[2 * a] = fp;
+            d[2 * a + 1] = fm;
+            resolved_diag.push((i, r.value));
+        }
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return None;
+        }
+    }
+    let mut stencil = fd_ofv_stencil(
         n,
         x_hat,
         free_idx,
-        floor,
+        &floor,
         step.eps,
         f0,
-        step.diag.as_deref(),
+        diag.as_deref(),
         ofv,
         options,
-    )
+    )?;
+    for (i, v) in resolved_diag {
+        if v.is_finite() {
+            stencil.hess[(i, i)] = v;
+            stencil.diag_nan.remove(&i);
+        }
+    }
+    Some(stencil)
+}
+
+/// The gated diagonal of [`fd_ofv_hessian_gated`]: for each free coordinate `a` (packed `i`)
+/// whose floor is below 1, where its step settled, as `(a, i, resolved, (f₊, f₋))` — `f₊, f₋`
+/// the τ objectives at the settled step, which replace the coordinate's points in `diag` so
+/// the stencil's off-diagonal pairs and its diagonal agree on one step. `diag` is the accepted
+/// pass of [`select_fd_step`], reused as the τ side of the first step. The τ/100 side's centre
+/// is `tight(x̂)`, evaluated once and only when some coordinate is floored, so all three points
+/// of its second difference share a tolerance.
+#[allow(clippy::too_many_arguments)]
+fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
+    x_hat: &[f64],
+    free_idx: &[usize],
+    floor: &[f64],
+    eps: f64,
+    f0: f64,
+    diag: &[f64],
+    ofv: &F,
+    tight: TightOfv<'_>,
+) -> Vec<(
+    usize,
+    usize,
+    crate::estimation::fd_resolution::Resolved,
+    (f64, f64),
+)> {
+    use crate::estimation::fd_resolution::{resolve_floored_step, Difference};
+    let gated: Vec<(usize, usize)> = free_idx
+        .iter()
+        .enumerate()
+        .filter(|&(_, &i)| floor[i] < 1.0)
+        .map(|(a, &i)| (a, i))
+        .collect();
+    if gated.is_empty() {
+        return Vec::new();
+    }
+    let f0_tight = tight(x_hat);
+    let second = |fp: f64, f0: f64, fm: f64, h: f64| {
+        let numer = fp - 2.0 * f0 + fm;
+        let value = numer / (h * h);
+        value.is_finite().then_some(Difference {
+            value,
+            numer: numer.abs(),
+            scale: f0.abs(),
+            span: 2.0 * h,
+        })
+    };
+    gated
+        .par_iter()
+        .filter_map(|&(a, i)| {
+            let mut loose_pts = (diag[2 * a], diag[2 * a + 1]);
+            let r = resolve_floored_step(floor[i], |fl, at_tight| {
+                let h = fd_step(eps, x_hat[i], fl);
+                let plus = FdPert::Single { i, di: h };
+                let minus = FdPert::Single { i, di: -h };
+                if at_tight {
+                    let f0t = f0_tight?;
+                    let (fp, fm) = rayon::join(
+                        || eval_fd_point(x_hat, plus, &tight),
+                        || eval_fd_point(x_hat, minus, &tight),
+                    );
+                    second(fp?, f0t, fm?, h)
+                } else {
+                    if fl != floor[i] {
+                        loose_pts = rayon::join(
+                            || eval_fd_point(x_hat, plus, ofv),
+                            || eval_fd_point(x_hat, minus, ofv),
+                        );
+                    }
+                    second(loose_pts.0, f0, loose_pts.1, h)
+                }
+            })?;
+            Some((a, i, r, loose_pts))
+        })
+        .collect()
 }
 
 /// Test-only record of every [`reconverge_population`] call (#1935), written by
@@ -1867,7 +1999,7 @@ pub(super) fn reconverge_population(
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
 ) {
-    let (params, ehs, hms, kaps, _) = reconverge_population_checked(
+    let (params, ehs, hms, kaps, _, _) = reconverge_population_checked(
         xv,
         model,
         pop,
@@ -1880,7 +2012,10 @@ pub(super) fn reconverge_population(
     (params, ehs, hms, kaps)
 }
 
-/// [`reconverge_population`], and whether every subject's inner solve converged.
+/// [`reconverge_population`], whether every subject's inner solve converged, and whether every
+/// one is resolved in the sense of
+/// [`ebe_resolved`](crate::estimation::fd_resolution::ebe_resolved) — converged without a
+/// Nelder–Mead fallback or polish, which the FD resolution gate's tight twin requires (#2406).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn reconverge_population_checked(
     xv: &[f64],
@@ -1896,6 +2031,7 @@ fn reconverge_population_checked(
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
+    bool,
     bool,
 ) {
     let params = unpack_params(xv, template);
@@ -1918,13 +2054,15 @@ fn reconverge_population_checked(
     let mut hms = Vec::with_capacity(n);
     let mut kaps = Vec::with_capacity(n);
     let mut all_converged = true;
+    let mut all_resolved = true;
     for ebe in ebes {
         all_converged &= ebe.converged;
+        all_resolved &= crate::estimation::fd_resolution::ebe_resolved(&ebe);
         ehs.push(ebe.eta);
         hms.push(ebe.h_matrix);
         kaps.push(ebe.kappas);
     }
-    (params, ehs, hms, kaps, all_converged)
+    (params, ehs, hms, kaps, all_converged, all_resolved)
 }
 
 /// [`compute_covariance_for`] for an estimate the step's own objective produced — the form
@@ -2605,8 +2743,48 @@ fn covariance_step(
             FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm, true),
         };
 
+        // The resolution gate's tight twin (#2406): `fd_ofv` re-solved at `cov_inner_tol`/100,
+        // `None` when any subject's solve is unresolved. Built on the same subject set and warm
+        // starts as `fd_ofv`, so it differs from it only in the tolerance.
+        let tight_inner_tol = crate::estimation::fd_resolution::tight_tol(cov_inner_tol);
+        let tight_mixture_options = FitOptions {
+            inner_tol: tight_inner_tol,
+            ..options.clone()
+        };
+        let subset_tight_ofv = |xv: &[f64], pop: &Population, warm: &[DVector<f64>]| {
+            let (params, ehs, hms, kaps, _, resolved) = reconverge_population_checked(
+                xv,
+                model,
+                pop,
+                template,
+                warm,
+                options,
+                tight_inner_tol,
+                false,
+            );
+            resolved.then(|| 2.0 * pop_nll_opts(model, pop, &params, &ehs, &hms, &kaps, options))
+        };
+        let tight_ofv = |xv: &[f64]| -> Option<f64> {
+            #[cfg(test)]
+            fd_evals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match scope {
+                FdScope::Whole if is_mixture => {
+                    let m = crate::estimation::mixture::mixture_ofv(
+                        model,
+                        population,
+                        &unpack_params(xv, template),
+                        &tight_mixture_options,
+                        None,
+                    );
+                    crate::estimation::fd_resolution::inner_resolved(&m.ebe_stats).then_some(m.ofv)
+                }
+                FdScope::Whole => subset_tight_ofv(xv, population, &warm),
+                FdScope::Subset { pop, warm } => subset_tight_ofv(xv, pop, warm),
+            }
+        };
+
         let fd_floor = fd_step_floors(template, model);
-        let stencil = fd_ofv_hessian(
+        let stencil = fd_ofv_hessian_gated(
             n,
             x_hat,
             &free_idx,
@@ -2614,6 +2792,7 @@ fn covariance_step(
             initial_eps,
             f0_fd,
             &fd_ofv,
+            Some(&tight_ofv),
             options,
         );
         // Read here, on the thread the stencil ran on: inside a tightened step it is the
@@ -6895,6 +7074,139 @@ mod tests {
         assert!(legacy.hess[(0, 0)] > 1e19, "H00 = {}", legacy.hess[(0, 0)]);
     }
 
+    /// The R-matrix fixtures of the #2406 gate: `f = 3x₀² + 0.2x₀x₁ + 0.5x₁² + x₀³x₁` at
+    /// `x̂ = (0.0077, 7.7)`, coordinate 0 floored at `|θ₀|`. The cubic makes the central
+    /// mixed difference read `0.2 + 3x₀² + h₀²`, so an off-diagonal pair shows which step it
+    /// was taken at.
+    fn gate_fixture(x: &[f64]) -> f64 {
+        3.0 * x[0] * x[0] + 0.2 * x[0] * x[1] + 0.5 * x[1] * x[1] + x[0].powi(3) * x[1]
+    }
+
+    fn hess_bits(s: &super::FdStencil) -> Vec<u64> {
+        s.hess.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// #2406: the gate is entered only for a coordinate whose floor is below 1. With every
+    /// floor 1 the gated stencil is the ungated one bit for bit and the twin is never called;
+    /// with coordinate 0 floored and a twin that agrees, it is accepted at the first step and
+    /// the stencil is again the ungated one, from three twin objectives (its centre and two
+    /// probes).
+    #[test]
+    fn the_hessian_gate_leaves_floor_one_and_resolved_coordinates_alone() {
+        use super::{fd_ofv_hessian, fd_ofv_hessian_gated};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let opts = crate::types::FitOptions::default();
+        let x_hat = [0.0077f64, 7.7];
+        let f0 = gate_fixture(&x_hat);
+        let eps = 1e-2;
+        let panics = |_: &[f64]| -> Option<f64> { panic!("a floor-1 coordinate reached the gate") };
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &[1.0; 2],
+            eps,
+            f0,
+            &gate_fixture,
+            Some(&panics),
+            &opts,
+        )
+        .unwrap();
+        let ungated =
+            fd_ofv_hessian(2, &x_hat, &[0, 1], &[1.0; 2], eps, f0, &gate_fixture, &opts).unwrap();
+        assert_eq!(hess_bits(&gated), hess_bits(&ungated));
+
+        let floor = [0.0077, 1.0];
+        let calls = AtomicUsize::new(0);
+        let twin = |x: &[f64]| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some(gate_fixture(x))
+        };
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &floor,
+            eps,
+            f0,
+            &gate_fixture,
+            Some(&twin),
+            &opts,
+        )
+        .unwrap();
+        let ungated =
+            fd_ofv_hessian(2, &x_hat, &[0, 1], &floor, eps, f0, &gate_fixture, &opts).unwrap();
+        assert_eq!(hess_bits(&gated), hess_bits(&ungated));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    /// #2406: a floored coordinate whose τ objective *stalls* near `x̂` — modelled as
+    /// `−min(d₀², s²)` with `s = 1e-5`, which biases its second difference by `−2s²/h²` once
+    /// `h > s` — is grown until the exact τ/100 twin agrees: a bias of 1.4e-3 relative at the
+    /// #2187 step `h = 1.54e-4`, 4.6e-5 at floor 0.077, and 5.5e-7 at floor 0.77, the first
+    /// inside `RESOLVED_REL`. Its diagonal is the twin's there, and every other entry is the
+    /// ungated stencil's **at the grown floor**, bit for bit — so the pair it enters was taken
+    /// at the grown step, which the cubic's `h₀²` makes visible.
+    #[test]
+    fn the_hessian_gate_grows_a_stalled_diagonal_and_takes_its_pairs_there() {
+        use super::{fd_ofv_hessian, fd_ofv_hessian_gated, fd_step};
+        use crate::estimation::fd_resolution::{RESOLVED_REL, STEP_GROWTH};
+
+        let opts = crate::types::FitOptions::default();
+        let x_hat = [0.0077f64, 7.7];
+        let s = 1e-5;
+        let stalled = |x: &[f64]| gate_fixture(x) - (x[0] - x_hat[0]).powi(2).min(s * s);
+        let twin = |x: &[f64]| Some(gate_fixture(x));
+        let f0 = stalled(&x_hat);
+        let eps = 1e-2;
+        let floor = [0.0077, 1.0];
+        let want = 6.0 + 6.0 * x_hat[0] * x_hat[1];
+
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &floor,
+            eps,
+            f0,
+            &stalled,
+            Some(&twin),
+            &opts,
+        )
+        .unwrap();
+        let ungated = fd_ofv_hessian(2, &x_hat, &[0, 1], &floor, eps, f0, &stalled, &opts).unwrap();
+        let rel = |h: f64| (h - want).abs() / want;
+        let (rel_gated, rel_ungated) = (rel(gated.hess[(0, 0)]), rel(ungated.hess[(0, 0)]));
+        eprintln!("MEASURE #2406 stalled H00: gated {rel_gated:e}, ungated {rel_ungated:e}");
+        assert!(
+            rel_ungated > 1e-3,
+            "fixture: the τ objective stalls ({rel_ungated:e})"
+        );
+        assert!(rel_gated < RESOLVED_REL, "{rel_gated:e}");
+
+        let grown = [floor[0] * STEP_GROWTH * STEP_GROWTH, 1.0];
+        let h = fd_step(eps, x_hat[0], grown[0]);
+        let twin_diag = (gate_fixture(&[x_hat[0] + h, x_hat[1]]) - 2.0 * gate_fixture(&x_hat)
+            + gate_fixture(&[x_hat[0] - h, x_hat[1]]))
+            / (h * h);
+        assert_eq!(gated.hess[(0, 0)].to_bits(), twin_diag.to_bits());
+        let at_grown =
+            fd_ofv_hessian(2, &x_hat, &[0, 1], &grown, eps, f0, &stalled, &opts).unwrap();
+        for ij in [(0, 1), (1, 0), (1, 1)] {
+            assert_eq!(
+                gated.hess[ij].to_bits(),
+                at_grown.hess[ij].to_bits(),
+                "H{ij:?}"
+            );
+        }
+        assert_ne!(
+            at_grown.hess[(0, 1)],
+            ungated.hess[(0, 1)],
+            "fixture: the pair reads its step"
+        );
+    }
+
     /// #1935: `map_subjects` with `parallel = true` really re-solves subjects concurrently,
     /// and with `false` really does not — both sides of the flag in one test, so a branch
     /// stuck on either arm fails it. Combined with the production test that reads the log
@@ -7021,8 +7333,12 @@ mod tests {
         let (etas, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
             &model, &pop, p, 200, 1e-8, None, None, 0, 0,
         );
+        // `cov_inner_tol` is set so that neither it nor the #2406 gate's twin, at a hundredth
+        // of it, is the stencil tolerance: at an inner tolerance of 1e-5 the twin's 1e-7 *is*
+        // `STENCIL_INNER_TOL`, and a twin solve would read as the defect below.
         let opts = FitOptions {
             analytic_cov_hessian: false,
+            cov_inner_tol: Some(1e-6),
             ..opts
         };
         let x = crate::estimation::parameterization::pack_params(p);
@@ -7038,17 +7354,27 @@ mod tests {
         );
         assert_starts_at_modes(label, &rec, |_| true, &pop, &etas, &kappas);
         // The base reconvergence and every stencil point keep `cov_inner_tol`, not the FD
-        // gradients' stencil tolerance (#2261), so a user's `cov_inner_tol` is what runs.
+        // gradients' stencil tolerance (#2261), so a user's `cov_inner_tol` is what runs. A
+        // floored θ's twin re-solves at `tight_tol(cov_inner_tol)` (#2406).
         let cov_tol = opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+        let twin_tol = crate::estimation::fd_resolution::tight_tol(cov_tol);
+        let stencil = crate::estimation::inner_optimizer::STENCIL_INNER_TOL;
         assert!(
-            cov_tol > crate::estimation::inner_optimizer::STENCIL_INNER_TOL,
-            "{label}: fixture: cov_inner_tol must differ from the stencil tolerance"
+            cov_tol > stencil && twin_tol.to_bits() != stencil.to_bits(),
+            "{label}: fixture: cov_inner_tol and its twin must differ from the stencil tolerance"
         );
         assert!(
             rec.solve_tols
                 .iter()
-                .all(|(_, t)| t.to_bits() == cov_tol.to_bits()),
-            "{label}: the covariance step re-solved at {:?}, not cov_inner_tol {cov_tol:e}",
+                .any(|(_, t)| t.to_bits() == cov_tol.to_bits()),
+            "{label}: no solve of the covariance step ran at cov_inner_tol {cov_tol:e}"
+        );
+        assert!(
+            rec.solve_tols.iter().all(|(_, t)| [cov_tol, twin_tol]
+                .iter()
+                .any(|w| t.to_bits() == w.to_bits())),
+            "{label}: the covariance step re-solved at {:?}, not cov_inner_tol {cov_tol:e} \
+             (or its twin's {twin_tol:e})",
             rec.solve_tols
                 .iter()
                 .map(|(_, t)| format!("{t:e}"))

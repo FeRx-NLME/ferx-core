@@ -9258,19 +9258,27 @@ pub(crate) fn reconverged_fd_gradient(
 ) -> Vec<f64> {
     let fixed = packed_fixed_mask(init_params);
     let warm = joint_warm_starts(warm_etas, warm_kappas);
-    let eval =
-        |xv: &[f64]| reconverged_probe_ofv(xv, init_params, model, population, &warm, options);
+    let probe = |xv: &[f64], tol: f64| {
+        reconverged_probe_ofv(xv, init_params, model, population, &warm, options, tol)
+    };
+    let tol = stencil_inner_tol(options.inner_tol);
+    let eval = |xv: &[f64]| probe(xv, tol).0;
+    let tight = |xv: &[f64]| {
+        let (v, stats) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
+        crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
+    };
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
     let floor = fd_step_floors(init_params, model);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
 }
 
 /// One probe of [`reconverged_fd_gradient`]: the OFV at packed `xv`, re-solving the inner
 /// loop warm from `warm` at the stencil tolerance. Matches the objective closure's
 /// definition, 2·pop_nll, and its guard: a probe the objective would reject (non-finite,
-/// or excess EBE non-convergence) is the same `1e20` wall, which [`central_diff_packed`]
-/// treats as missing rather than as a value (#2378).
+/// or excess EBE non-convergence) is the same `1e20` wall, which [`central_diff_packed_gated`]
+/// treats as missing rather than as a value (#2378). `tol` is the inner tolerance — the
+/// stencil's, or its tight twin's — and the inner loop's stats come back with the value.
 fn reconverged_probe_ofv(
     xv: &[f64],
     init_params: &ModelParameters,
@@ -9278,7 +9286,8 @@ fn reconverged_probe_ofv(
     population: &Population,
     warm: &[DVector<f64>],
     options: &FitOptions,
-) -> f64 {
+    tol: f64,
+) -> (f64, InnerLoopStats) {
     let params = unpack_params(xv, init_params);
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
@@ -9286,7 +9295,7 @@ fn reconverged_probe_ofv(
         population,
         &params,
         options.inner_maxiter,
-        stencil_inner_tol(options.inner_tol),
+        tol,
         Some(warm),
         Some(&mu_k),
         options.min_obs_for_convergence_check as usize,
@@ -9296,12 +9305,14 @@ fn reconverged_probe_ofv(
     );
     let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
     let n_subj = population.subjects.len();
-    if !raw.is_finite() || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
+    let v = if !raw.is_finite()
+        || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
     {
         1e20
     } else {
         raw
-    }
+    };
+    (v, ebe_stats)
 }
 
 /// The gradient of the objective the covariance step's `R` is the Hessian of, at `x` (#2541):
@@ -9526,14 +9537,27 @@ fn reporting_fd_gradient(
     let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
     let warm = joint_warm_starts(warm_etas, warm_kappas);
-    let eval = |xv: &[f64]| -> f64 {
+    // `tight` re-solves at the gate's τ/100 (#2406): the mixture branch reads its inner
+    // tolerance from the options it is handed, so it takes an override clone.
+    let tight_options = FitOptions {
+        inner_tol: crate::estimation::fd_resolution::tight_tol(options.inner_tol),
+        ..options.clone()
+    };
+    let stencil_tol = stencil_inner_tol(options.inner_tol);
+    let probe = |xv: &[f64], tight: bool| -> (f64, InnerLoopStats) {
         let params = unpack_params(xv, init_params);
         // Mirror the objective closure's own two branches, so the mixture path
         // differentiates the K-fold log-sum-exp it minimised rather than a
         // single-class stand-in for it.
         let (raw, stats) = if params.mixture.is_some() {
-            let m =
-                crate::estimation::mixture::mixture_ofv(model, population, &params, options, None);
+            let mixture_options = if tight { &tight_options } else { options };
+            let m = crate::estimation::mixture::mixture_ofv(
+                model,
+                population,
+                &params,
+                mixture_options,
+                None,
+            );
             let stats = InnerLoopStats {
                 n_unconverged: m.ebe_stats.n_unconverged,
                 n_fallback: m.ebe_stats.n_fallback,
@@ -9548,7 +9572,11 @@ fn reporting_fd_gradient(
                 population,
                 &params,
                 options.inner_maxiter,
-                stencil_inner_tol(options.inner_tol),
+                if tight {
+                    crate::estimation::fd_resolution::tight_tol(stencil_tol)
+                } else {
+                    stencil_tol
+                },
                 Some(&warm),
                 Some(&mu_k),
                 options.min_obs_for_convergence_check as usize,
@@ -9560,15 +9588,22 @@ fn reporting_fd_gradient(
             (2.0 * nll, ebe_stats)
         };
         let raw = raw + nn_reg.penalty_value(&params.theta) + priors.penalty(xv);
-        if !raw.is_finite() || ebe_guard_rejects(&stats, n_subj, raw, options.max_unconverged_frac)
+        let v = if !raw.is_finite()
+            || ebe_guard_rejects(&stats, n_subj, raw, options.max_unconverged_frac)
         {
             1e20
         } else {
             raw
-        }
+        };
+        (v, stats)
+    };
+    let eval = |xv: &[f64]| probe(xv, false).0;
+    let tight = |xv: &[f64]| {
+        let (v, stats) = probe(xv, true);
+        crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
     };
     let floor = fd_step_floors(init_params, model);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
@@ -9587,12 +9622,22 @@ fn reporting_fd_gradient(
 /// [`fd_step_floors`]: `1e-4·(1 + |xₖ|)` on every coordinate but a small identity-packed θ,
 /// which is stepped relative to its declared magnitude rather than by an absolute `1e-4` in
 /// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187).
-fn central_diff_packed(
+///
+/// That relative step is only as good as the probes resolve it, so a coordinate whose floor is
+/// below 1 goes through the resolution gate of
+/// [`resolve_floored_step`](crate::estimation::fd_resolution::resolve_floored_step) (#2406):
+/// `tight` is `eval` re-solved at τ/100, `None` where a solve fell to Nelder–Mead or did not
+/// converge, and the step grows ×10 until the two agree. Without `tight` no coordinate is
+/// gated, and a floor-1 coordinate takes the ungated difference either way. A floored one whose
+/// probes stay missing up to the cap takes the ungated difference at floor 1, the pre-#2187
+/// step, with its one-sided fallback.
+fn central_diff_packed_gated(
     x: &[f64],
     fixed: &[bool],
     floor: &[f64],
     bounds: &PackedBounds,
     eval: impl Fn(&[f64]) -> f64,
+    tight: Option<&dyn Fn(&[f64]) -> Option<f64>>,
 ) -> Vec<f64> {
     let n = x.len();
     let eps = 1e-4;
@@ -9604,7 +9649,44 @@ fn central_diff_packed(
         if fixed[k] {
             continue;
         }
-        let h = fd_step(eps, x[k], floor[k]);
+        let mut floor_k = floor[k];
+        if let Some(tight) = tight.filter(|_| floor_k < 1.0) {
+            let resolved =
+                crate::estimation::fd_resolution::resolve_floored_step(floor_k, |fl, at_tight| {
+                    let h = fd_step(eps, x[k], fl);
+                    let xp = (x[k] + h).min(bounds.upper[k]);
+                    let xm = (x[k] - h).max(bounds.lower[k]);
+                    if xp <= xm {
+                        return None;
+                    }
+                    let mut probe = |xk: f64| {
+                        xw[k] = xk;
+                        let v = if at_tight {
+                            tight(&xw)
+                        } else {
+                            Some(eval(&xw))
+                        };
+                        xw[k] = x[k];
+                        v.filter(|&v| usable(v))
+                    };
+                    let fp = probe(xp)?;
+                    let fm = probe(xm)?;
+                    Some(crate::estimation::fd_resolution::Difference {
+                        value: (fp - fm) / (xp - xm),
+                        numer: (fp - fm).abs(),
+                        scale: fp.abs().max(fm.abs()),
+                        span: xp - xm,
+                    })
+                });
+            if let Some(r) = resolved {
+                if r.value.is_finite() {
+                    grad[k] = r.value;
+                }
+                continue;
+            }
+            floor_k = 1.0;
+        }
+        let h = fd_step(eps, x[k], floor_k);
         let xp = (x[k] + h).min(bounds.upper[k]);
         let xm = (x[k] - h).max(bounds.lower[k]);
         // Skip only probes that collapsed onto one point (a box pinned to `x`). The span is
@@ -9639,6 +9721,19 @@ fn central_diff_packed(
         }
     }
     grad
+}
+
+/// [`central_diff_packed_gated`] without the gate: the difference every coordinate took before
+/// #2406, which the tests pin the shared policy on.
+#[cfg(test)]
+fn central_diff_packed(
+    x: &[f64],
+    fixed: &[bool],
+    floor: &[f64],
+    bounds: &PackedBounds,
+    eval: impl Fn(&[f64]) -> f64,
+) -> Vec<f64> {
+    central_diff_packed_gated(x, fixed, floor, bounds, eval, None)
 }
 
 /// Per-subject packed gradient `dᵢ = d(nllᵢ)/dx` at the **held** EBE `η̂ᵢ` and held
@@ -9919,12 +10014,11 @@ pub(crate) fn subject_reconverged_fd_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let fixed = packed_fixed_mask(init_params);
     // Subject marginal NLL at a packed point, re-solving this subject's EBE
     // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
     // (`foce_subject_nll`, summed by `pop_nll`); a non-finite or sentinel side is missing
-    // to `central_diff_packed`, which takes the one-sided difference (#2378).
-    let eval = |xv: &[f64]| -> f64 {
+    // to `central_diff_packed_gated`, which takes the one-sided difference (#2378).
+    let probe = |xv: &[f64], tol: f64| -> (f64, bool) {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let ebe = find_ebe_for_stage(
@@ -9932,13 +10026,13 @@ pub(crate) fn subject_reconverged_fd_gradient(
             subject,
             &params,
             options.inner_maxiter,
-            stencil_inner_tol(options.inner_tol),
+            tol,
             Some(warm_eta.as_slice()),
             Some(&mu_k),
             0,
             options,
         );
-        crate::stats::likelihood::foce_subject_nll_cov(
+        let nll = crate::stats::likelihood::foce_subject_nll_cov(
             model,
             subject,
             &params.theta,
@@ -9948,10 +10042,32 @@ pub(crate) fn subject_reconverged_fd_gradient(
             &params.sigma.values,
             model.residual_cov_at(&params),
             options.interaction,
-        )
+        );
+        (nll, crate::estimation::fd_resolution::ebe_resolved(&ebe))
+    };
+    subject_central_diff(x, init_params, model, bounds, options, probe)
+}
+
+/// The per-subject reconverged-FD gradients' shared difference: `probe(x, tol)` is the
+/// subject's objective re-solved at `tol` and whether that solve counts as resolved, taken at
+/// the stencil tolerance and, on a floored coordinate, at its tight twin (#2406).
+fn subject_central_diff(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    probe: impl Fn(&[f64], f64) -> (f64, bool),
+) -> Vec<f64> {
+    let fixed = packed_fixed_mask(init_params);
+    let tol = stencil_inner_tol(options.inner_tol);
+    let eval = |xv: &[f64]| probe(xv, tol).0;
+    let tight = |xv: &[f64]| {
+        let (v, resolved) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
+        resolved.then_some(v)
     };
     let floor = fd_step_floors(init_params, model);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
 }
 
 /// Per-subject reconverged-FD packed gradient for an **IOV** subject: **re-converges that
@@ -9973,8 +10089,7 @@ fn subject_reconverged_fd_gradient_iov(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let fixed = packed_fixed_mask(init_params);
-    let eval = |xv: &[f64]| -> f64 {
+    let probe = |xv: &[f64], tol: f64| -> (f64, bool) {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let ebe = find_ebe_for_stage(
@@ -9982,13 +10097,13 @@ fn subject_reconverged_fd_gradient_iov(
             subject,
             &params,
             options.inner_maxiter,
-            stencil_inner_tol(options.inner_tol),
+            tol,
             Some(warm.as_slice()),
             Some(&mu_k),
             0,
             options,
         );
-        crate::stats::likelihood::foce_subject_nll_iov_cov(
+        let nll = crate::stats::likelihood::foce_subject_nll_iov_cov(
             model,
             subject,
             &params.theta,
@@ -10003,10 +10118,10 @@ fn subject_reconverged_fd_gradient_iov(
                 .omega_iov
                 .as_ref()
                 .expect("IOV model (n_kappa > 0) has omega_iov"),
-        )
+        );
+        (nll, crate::estimation::fd_resolution::ebe_resolved(&ebe))
     };
-    let floor = fd_step_floors(init_params, model);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    subject_central_diff(x, init_params, model, bounds, options, probe)
 }
 
 /// The exact analytic per-subject packed **outer** gradient at the packed point `pt` the
