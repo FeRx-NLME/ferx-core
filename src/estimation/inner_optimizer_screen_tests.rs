@@ -825,6 +825,305 @@ fn final_ebe_check_reports_both_directions_and_the_screen() {
     }
 }
 
+/// #2646: a subject the optimizer's EBEs win and one the cold solve wins, in one fixture.
+///
+/// S1 and S2 are the same bimodal subject, and the cold solve's screen puts both in the
+/// deeper mode. The incumbent holds S1 in the trapped mode, so the cold solve wins S1 by
+/// Δ. It holds S2 at the cold η̂ with `H` scaled down, so it wins S2, by a margin the
+/// fixture bisects to Δ: the population totals tie. The scaled `H` is what stands in for
+/// #2646's measured case, an EBE that loses on the inner objective and wins on `log|H|`,
+/// and it is also what keeps the seeded re-solve from holding S2's best, so no whole
+/// candidate holds both subjects'.
+///
+/// Mutations: the per-subject trigger dropped (the totals tie, so the cold solve is kept),
+/// the merged candidate dropped (a whole candidate is reported, Δ too high), and
+/// `retain_cold_reported` clearing every subject (S1 loses its screen warning) each fail
+/// the first arm. The second arm is the straddle: at `H` unscaled the incumbent wins
+/// nobody, and the cold solve stands.
+#[test]
+fn final_ebe_check_takes_each_subjects_lowest_when_the_totals_tie() {
+    use crate::estimation::outer_optimizer::{
+        final_ebe_check, final_inner_solve, score_final_ebes, EbeCandidate,
+    };
+    use crate::estimation::parameterization::compute_mu_k;
+
+    let (m, opts) = model(CONFIGS[0].omega);
+    let mut population = flip_flop_population();
+    population
+        .subjects
+        .insert(1, flip_flop_subject("S2", &CONFIGS[0]));
+    let params = &m.default_params;
+    let with_screen = |screen: usize| FitOptions {
+        inner_screen: screen,
+        inner_twin_seed: false,
+        threads: Some(1),
+        ..opts.clone()
+    };
+    let mu_k = compute_mu_k(&m, &params.theta, opts.mu_referencing);
+    let solve = |screen: usize| {
+        let s = final_inner_solve(&m, &population, params, &mu_k, None, &with_screen(screen));
+        (
+            s.screen_moved_ids,
+            score_final_ebes(&m, &population, params, (s.etas, s.h_mats, s.kappas), &opts),
+        )
+    };
+    let (_, trapped) = solve(0);
+    let (moved, cold) = solve(100);
+    assert_eq!(moved, ["S1", "S2"], "premise: the screen moves both");
+
+    let incumbent_at = |scale: f64| -> EbeCandidate {
+        let (mut etas, mut h_mats, kappas, _) = cold.clone();
+        etas[0] = trapped.0[0].clone();
+        h_mats[0] = trapped.1[0].clone();
+        h_mats[1] *= scale;
+        score_final_ebes(&m, &population, params, (etas, h_mats, kappas), &opts)
+    };
+    let gap = |scale: f64| incumbent_at(scale).3 - cold.3;
+    assert!(gap(1.0) > 5.0, "premise: S1's modes differ ({})", gap(1.0));
+    let (mut lo, mut hi) = (1e-3, 1.0);
+    assert!(gap(lo) < 0.0, "premise: a small `H` wins S2 ({})", gap(lo));
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if gap(mid) < 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let tied = incumbent_at(hi);
+    assert!(
+        (tied.3 - cold.3).abs() < 1e-6,
+        "premise: the totals tie ({} vs {})",
+        tied.3,
+        cold.3
+    );
+
+    let check = |incumbent: &EbeCandidate, adopt: bool| {
+        let mut converged = true;
+        let (reported, warnings) = final_ebe_check(
+            &m,
+            &population,
+            params,
+            incumbent.clone(),
+            adopt,
+            &with_screen(100),
+            &mut converged,
+        );
+        (reported, warnings, converged)
+    };
+
+    let (reported, w, converged) = check(&tied, true);
+    assert!(converged, "a tie is no basin shift: {w:?}");
+    assert!(
+        reported.3 < cold.3 - 5.0,
+        "the sum of each subject's lowest beats both totals: {} vs {}",
+        reported.3,
+        cold.3
+    );
+    assert_eq!(reported.0[0], cold.0[0], "S1 keeps the cold η̂");
+    assert_eq!(reported.1[0], cold.1[0], "and the cold `H`");
+    assert_eq!(reported.1[1], tied.1[1], "S2 takes the incumbent's `H`");
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].contains("units worse"), "{}", w[0]);
+    assert!(
+        w[0].contains("on 1 subject (S2)") && !w[0].contains("S1"),
+        "the cold solve missed on S2 alone: {}",
+        w[0]
+    );
+    assert!(
+        w[1].contains("Sobol screen") && w[1].contains("of 1 subject (S1)") && !w[1].contains("S2"),
+        "the reported EBEs the screen moved are S1's alone: {}",
+        w[1]
+    );
+
+    // Gauss–Newton keeps its own EBEs, and its totals tie, so nothing is said of them.
+    let (reported, w, _) = check(&tied, false);
+    assert_eq!(reported.3, tied.3);
+    assert!(!w.iter().any(|w| w.contains("units worse")), "{w:?}");
+
+    // The straddle: an incumbent that wins no subject leaves the cold solve reported.
+    let (reported, w, _) = check(&incumbent_at(1.0), true);
+    assert_eq!(reported.3, cold.3);
+    assert!(!w.iter().any(|w| w.contains("units worse")), "{w:?}");
+    assert!(
+        w.iter().any(|w| w.contains("of 2 subjects (S1, S2)")),
+        "both reported EBEs are the ones the screen moved: {w:?}"
+    );
+}
+
+/// #2646 under AGQ: the objective has no per-subject term to compare, so the whole
+/// candidates compete as before #2646 and the warning names nobody. Both `adopt` arms,
+/// since the trust region reaches the gate through `best_final_candidate` and Gauss–Newton
+/// through `subjects_cold_lost_to`. The straddle is the FOCEI run of the same inputs,
+/// which does name the subject.
+#[test]
+fn the_cold_gap_names_nobody_under_agq() {
+    use crate::estimation::outer_optimizer::{
+        final_ebe_check, final_inner_solve, score_final_ebes,
+    };
+    use crate::estimation::parameterization::compute_mu_k;
+
+    let (m, opts) = model(CONFIGS[0].omega);
+    let population = flip_flop_population();
+    let params = &m.default_params;
+    let mu_k = compute_mu_k(&m, &params.theta, opts.mu_referencing);
+    for (method, names) in [
+        (EstimationMethod::Laplace, false),
+        (EstimationMethod::FoceI, true),
+    ] {
+        let at = |screen: usize| FitOptions {
+            method,
+            inner_screen: screen,
+            inner_twin_seed: false,
+            threads: Some(1),
+            ..opts.clone()
+        };
+        let s = final_inner_solve(&m, &population, params, &mu_k, None, &at(100));
+        let deeper = score_final_ebes(
+            &m,
+            &population,
+            params,
+            (s.etas, s.h_mats, s.kappas),
+            &at(100),
+        );
+        for adopt in [false, true] {
+            let mut converged = true;
+            let (_, w) = final_ebe_check(
+                &m,
+                &population,
+                params,
+                deeper.clone(),
+                adopt,
+                &at(0),
+                &mut converged,
+            );
+            let worse = w
+                .iter()
+                .find(|w| w.contains("units worse"))
+                .unwrap_or_else(|| {
+                    panic!("{method:?} adopt {adopt}: the cold solve missed: {w:?}")
+                });
+            assert_eq!(
+                worse.contains("on 1 subject (S1)"),
+                names,
+                "{method:?} adopt {adopt}: {worse}"
+            );
+        }
+    }
+}
+
+/// `cold_replaced` is AGQ's alone: there the whole candidates compete, so a win by any
+/// other one replaces the cold solve for everybody. A tie keeps it, and FOCEI, which can
+/// say per subject, never sets it.
+#[test]
+fn only_agq_replaces_the_cold_solve_wholesale() {
+    use crate::estimation::outer_optimizer::{
+        best_final_candidate, final_inner_solve, score_final_ebes,
+    };
+    use crate::estimation::parameterization::compute_mu_k;
+
+    let (m, opts) = model(CONFIGS[0].omega);
+    let population = flip_flop_population();
+    let params = &m.default_params;
+    let mu_k = compute_mu_k(&m, &params.theta, opts.mu_referencing);
+    for (method, replaced) in [
+        (EstimationMethod::Laplace, true),
+        (EstimationMethod::FoceI, false),
+    ] {
+        let at = FitOptions {
+            method,
+            threads: Some(1),
+            ..opts.clone()
+        };
+        let s = final_inner_solve(&m, &population, params, &mu_k, None, &at);
+        let good = score_final_ebes(&m, &population, params, (s.etas, s.h_mats, s.kappas), &at);
+        let shifted = good.0.iter().map(|e| e.add_scalar(0.5)).collect();
+        let bad = score_final_ebes(
+            &m,
+            &population,
+            params,
+            (shifted, good.1.clone(), good.2.clone()),
+            &at,
+        );
+        assert!(bad.3 > good.3 + 1.0, "premise: {} vs {}", bad.3, good.3);
+        let pick = |cold, held| {
+            best_final_candidate(&m, &population, params, &mu_k, &at, cold, &good.0, held)
+        };
+        let won = pick(bad.clone(), Some(good.clone()));
+        assert!(won.reported.3 < bad.3, "{method:?}: the cold solve lost");
+        assert_eq!(won.cold_replaced, replaced, "{method:?}");
+        let tied = pick(good.clone(), Some(good.clone()));
+        assert!(
+            !tied.cold_replaced,
+            "{method:?}: a tie keeps the cold solve"
+        );
+    }
+}
+
+/// #2646 on the NLopt leg, which `final_ebe_check` does not run: the optimizer's held state
+/// beats the cold solve on S1, the subject the cold solve's screen moved, so the #833
+/// warning names S1 and the #2013 warning, whose EBEs are no longer the reported ones, goes.
+/// `HELD_FIRST_H_SCALE` makes the held state win. Without it the screen warning stands and
+/// no subject is named, the straddle that keeps both assertions from being constants.
+///
+/// Mutations: dropping this leg's `cold_lost_ids` hand-off fails the first assertion, and
+/// its `retain_cold_reported` call the second.
+#[test]
+fn the_nlopt_leg_names_the_subject_it_kept_off_the_cold_solve() {
+    use crate::estimation::outer_optimizer::{
+        optimize_nlopt, OuterFdDeclineLog, HELD_FIRST_H_SCALE, HELD_SOLVE_AT_RESTORED,
+    };
+
+    let (m, opts) = model(CONFIGS[0].omega);
+    let population = flip_flop_population();
+    let options = FitOptions {
+        inner_screen: 100,
+        inner_twin_seed: false,
+        // As in `a_fit_names_the_subjects_the_screen_moved`: stopped short, so the final
+        // cold solve still needs the screen to reach S1's deeper mode. L-BFGS because
+        // `auto` resolves to BOBYQA here, which reaches the optimum in one call, and the
+        // screen moves nobody there.
+        optimizer: crate::types::Optimizer::NloptLbfgs,
+        outer_maxiter: 3,
+        run_covariance_step: false,
+        threads: Some(1),
+        ..opts.clone()
+    };
+    let run = |scale: Option<f64>| {
+        HELD_FIRST_H_SCALE.with(|c| c.set(scale));
+        HELD_SOLVE_AT_RESTORED.with(|c| c.set(None));
+        let result = optimize_nlopt(
+            &m,
+            &population,
+            &m.default_params,
+            &options,
+            &OuterFdDeclineLog::new(population.subjects.len()),
+            None,
+            &[],
+        );
+        HELD_FIRST_H_SCALE.with(|c| c.set(None));
+        let at_restored = HELD_SOLVE_AT_RESTORED.with(|c| c.get());
+        assert_eq!(at_restored, Some(true), "premise: the held state is scored");
+        result.warnings
+    };
+    let worse = |w: &[String]| w.iter().find(|w| w.contains("units worse")).cloned();
+    let screen = |w: &[String]| w.iter().find(|w| w.contains("Sobol screen")).cloned();
+
+    let plain = run(None);
+    let named = screen(&plain).unwrap_or_else(|| panic!("premise: S1 moved: {plain:?}"));
+    assert!(named.contains("of 1 subject (S1)"), "{named}");
+    assert_eq!(worse(&plain), None, "{plain:?}");
+
+    let kept = run(Some(0.01));
+    let w = worse(&kept).unwrap_or_else(|| panic!("the cold solve missed S1: {kept:?}"));
+    assert!(w.contains("on 1 subject (S1)"), "{w}");
+    assert_eq!(
+        screen(&kept),
+        None,
+        "S1's reported EBEs are not the screen's"
+    );
+}
+
 // ── #2095: the flip-flop twin seed ───────────────────────────────────────────────────────
 
 /// The flip-flop model's `[individual_parameters]`, with `KA` spelled `ka`.
