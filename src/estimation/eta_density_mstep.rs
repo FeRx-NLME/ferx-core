@@ -33,6 +33,9 @@ use nalgebra::{DMatrix, DVector};
 struct GroupLayout {
     /// Whether Ω's block is free (not FIX).
     omega_free: bool,
+    /// The block is diagonal (`EtaDensity::diagonal_omega`): its packed entries are the
+    /// `n` log-diagonal Cholesky entries alone, and the off-diagonals stay 0.
+    diag: bool,
     /// Per shape θ of the group (in `shape_thetas` order): its index and bounds when free,
     /// `None` when FIXed (read from θ).
     shapes: Vec<Option<(usize, f64, f64)>>,
@@ -121,10 +124,16 @@ impl DensityMstep {
                             .then_some((k, lo, hi))
                     })
                     .collect();
+                let diag = d.diagonal_omega();
                 GroupLayout {
                     omega_free,
+                    diag,
                     shapes,
-                    n_chol: if omega_free { n * (n + 1) / 2 } else { 0 },
+                    n_chol: match (omega_free, diag) {
+                        (false, _) => 0,
+                        (true, true) => n,
+                        (true, false) => n * (n + 1) / 2,
+                    },
                 }
             })
             .collect();
@@ -224,11 +233,21 @@ pub(crate) enum BlockPrior {
     /// Jacobian `|∂Ω/∂(ω, R)| = Πᵢ ωᵢ^{(n−1)/2}`: `(η − 1) ln|R| + Σᵢ ln IG(ωᵢ) −
     /// ((n − 1)/2) Σᵢ ln ωᵢ`.
     Lkj { eta: f64, a: f64, b: Vec<f64> },
+    /// A diagonal block (`EtaDensity::diagonal_omega`, #1716): each variance under its own
+    /// 1×1 prior, the marginal each ETA would carry on its own `omega` line.
+    Diagonal(Vec<BlockPrior>),
 }
 
 impl BlockPrior {
     /// `ln p(Ω)` up to a constant, `−∞` for a non-PD block.
     pub(crate) fn log_density(&self, om: &DMatrix<f64>) -> f64 {
+        if let BlockPrior::Diagonal(ps) = self {
+            return ps
+                .iter()
+                .enumerate()
+                .map(|(i, p)| p.log_density(&DMatrix::from_element(1, 1, om[(i, i)])))
+                .sum();
+        }
         let n = om.nrows() as f64;
         let Some(ch) = om.clone().cholesky() else {
             return f64::NEG_INFINITY;
@@ -254,6 +273,7 @@ impl BlockPrior {
                 }
                 lp - 0.5 * (n - 1.0) * d.iter().map(|v| v.ln()).sum::<f64>()
             }
+            BlockPrior::Diagonal(_) => unreachable!("returned above"),
         }
     }
 }
@@ -278,18 +298,21 @@ pub(crate) fn mh_group_omega_prior(
 ) -> bool {
     use rand_distr::{Distribution, StandardNormal, Uniform};
     let n = d.etas.len();
+    let diag = d.diagonal_omega();
     let layout = GroupLayout {
         omega_free: true,
+        diag,
         shapes: vec![None; d.shape_thetas.len()],
-        n_chol: n * (n + 1) / 2,
+        n_chol: if diag { n } else { n * (n + 1) / 2 },
     };
     let log_target = |psi: &DVector<f64>| -> f64 {
-        let l = chol_of(n, psi.as_slice());
+        let l = chol_from(&layout, n, psi.as_slice());
         let mut log_det = 0.0;
         let mut log_jac = 0.0;
         for (i, row) in l.iter().enumerate() {
             log_det += 2.0 * row[i].ln();
-            log_jac += (n - i + 1) as f64 * row[i].ln();
+            // ψ → Ω: the log-Cholesky Jacobian, or for a diagonal block ωᵢ = e^{2ψᵢ}'s.
+            log_jac += if diag { 2.0 } else { (n - i + 1) as f64 } * row[i].ln();
         }
         let lm = DMatrix::from_fn(n, n, |i, j| l[i][j]);
         let om = &lm * lm.transpose();
@@ -333,11 +356,11 @@ fn pack(d: &EtaDensity, l: &GroupLayout, omega: &DMatrix<f64>, theta: &[f64]) ->
         });
         for i in 0..n {
             for j in 0..=i {
-                v.push(if i == j {
-                    chol[(i, i)].ln()
-                } else {
-                    chol[(i, j)]
-                });
+                if i == j {
+                    v.push(chol[(i, i)].ln());
+                } else if !l.diag {
+                    v.push(chol[(i, j)]);
+                }
             }
         }
     }
@@ -357,7 +380,7 @@ fn unpack(
 ) {
     if l.omega_free {
         let n = d.etas.len();
-        let lch = chol_of(n, &psi.as_slice()[..l.n_chol]);
+        let lch = chol_from(l, n, &psi.as_slice()[..l.n_chol]);
         for (i, &a) in d.etas.iter().enumerate() {
             for (j, &b) in d.etas.iter().enumerate() {
                 omega[(a, b)] = (0..n).map(|k| lch[i][k] * lch[j][k]).sum();
@@ -367,6 +390,19 @@ fn unpack(
     for (j, &(k, lo, hi)) in l.shapes.iter().flatten().enumerate() {
         theta[k] = from_unit(psi[l.n_chol + j], lo, hi);
     }
+}
+
+/// The lower Cholesky factor from a layout's packed entries: [`chol_of`]'s, or for a
+/// diagonal block the diagonal alone.
+fn chol_from<T: PkNum>(l: &GroupLayout, n: usize, p: &[T]) -> Vec<Vec<T>> {
+    if !l.diag {
+        return chol_of(n, p);
+    }
+    let mut m = vec![vec![T::from_f64(0.0); n]; n];
+    for (i, row) in m.iter_mut().enumerate() {
+        row[i] = p[i].exp();
+    }
+    m
 }
 
 /// The lower Cholesky factor from its packed entries (log diagonal).
@@ -395,7 +431,7 @@ fn group_log_density<T: PkNum>(
     let c = |v: f64| T::from_f64(v);
     // L of the block: from ψ when free, from Ω when FIXed.
     let lch: Vec<Vec<T>> = if l.omega_free {
-        chol_of(n, &psi[..l.n_chol])
+        chol_from(l, n, &psi[..l.n_chol])
     } else {
         let block = DMatrix::from_fn(n, n, |i, j| omega[(d.etas[i], d.etas[j])]);
         let lf = block.clone().cholesky().map(|ch| ch.l()).unwrap_or(block);
@@ -444,6 +480,7 @@ fn group_log_density<T: PkNum>(
         trunc: d.trunc,
         margins: d.margins.clone(),
         log_anchors: Vec::new(),
+        family: d.family.clone(),
     };
     let mut free = 0;
     let shape_vals: Vec<T> = l

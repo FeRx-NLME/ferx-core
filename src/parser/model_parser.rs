@@ -4301,6 +4301,19 @@ pub fn parse_full_model_with(
         },
         false,
     )?;
+    // #1716: each `copula (…) ~ FAMILY(θ)` line joins its ETAs' margins into one group.
+    let eta_densities = merge_copula_lines(
+        eta_densities,
+        param_lines,
+        &eta_names_bsv,
+        &kappa_info.names_ordered,
+        &thetas,
+        |e| {
+            block_omegas
+                .iter()
+                .any(|b| b.names.len() > 1 && b.names.iter().any(|n| n == e))
+        },
+    )?;
     // #1716: the IOV κ densities, over κ positions `0..n_kappa` against Ω_IOV.
     let kappa_densities = resolve_eta_densities(
         param_lines,
@@ -8708,6 +8721,351 @@ fn apply_omega_dist_block(extracted: &mut ExtractedBlocks) -> Result<(), String>
 
 /// The omega-line `density` declarations (#1716) as [`crate::stats::eta_density::EtaDensity`]
 /// groups: ETA positions and shape-θ indices, checked against the declared parameters.
+/// Join the ETAs of every `copula (…) ~ COPULA` line (#1716) into one copula group:
+/// each ETA's own univariate `density` (or the Gaussian) is its margin, in the line's
+/// order, and the copula's θs follow the margins' shapes. The ETAs keep the diagonal Ω of
+/// their own `omega` lines, so an ETA inside a `block_omega` is refused, as is one already
+/// in another multivariate group.
+fn merge_copula_lines(
+    mut groups: Vec<crate::stats::eta_density::EtaDensity>,
+    param_lines: &[String],
+    eta_names: &[String],
+    kappa_names: &[String],
+    thetas: &[ThetaSpec],
+    in_block: impl Fn(&str) -> bool,
+) -> Result<Vec<crate::stats::eta_density::EtaDensity>, String> {
+    use crate::stats::eta_density::copula::MAX_COPULA_DIM;
+    use crate::stats::eta_density::{DensityKind, EtaDensity};
+    for c in crate::parser::eta_shape::copula_decls(param_lines)? {
+        let d = c.etas.len();
+        if d > MAX_COPULA_DIM {
+            return Err(format!(
+                "[parameters] a copula joins at most {MAX_COPULA_DIM} ETAs (its density has 2^d \
+                 terms): `{}`",
+                c.line
+            ));
+        }
+        let mut etas = Vec::with_capacity(d);
+        for e in &c.etas {
+            if kappa_names.iter().any(|k| k == e) {
+                return Err(format!(
+                    "[parameters] `{e}` is an IOV kappa; a copula line joins BSV ETAs: `{}`",
+                    c.line
+                ));
+            }
+            let k = eta_names.iter().position(|n| n == e).ok_or_else(|| {
+                format!("[parameters] `{e}` in `{}` is not a declared ETA", c.line)
+            })?;
+            if etas.contains(&k) {
+                return Err(format!(
+                    "[parameters] the copula names `{e}` twice: `{}`",
+                    c.line
+                ));
+            }
+            if in_block(e) {
+                return Err(format!(
+                    "[parameters] `{e}` is in a `block_omega`: a non-elliptical copula's \
+                     dependence is its own θs, so its ETAs are declared on their own `omega` \
+                     lines (an elliptical copula goes on the block: `density copula(…, family = \
+                     t(NU))`): `{}`",
+                    c.line
+                ));
+            }
+            etas.push(k);
+        }
+        let (spec, params) = build_copula_spec(&c.spec, &c.etas, &c.line)?;
+        let mut margins = Vec::with_capacity(d);
+        let mut shape_thetas = Vec::new();
+        for &k in &etas {
+            match groups.iter().position(|g| g.etas.contains(&k)) {
+                None => margins.push(DensityKind::Normal),
+                Some(gi) => {
+                    let g = &groups[gi];
+                    if g.etas.len() > 1 || g.kind == DensityKind::Copula || g.trunc.is_some() {
+                        return Err(format!(
+                            "[parameters] `{}` already {} — a copula's margin is one ETA's own \
+                             univariate `density`: `{}`",
+                            eta_names[k],
+                            if g.trunc.is_some() {
+                                "has a `truncated` density, which a copula does not take as a margin"
+                            } else {
+                                "belongs to a multivariate density"
+                            },
+                            c.line
+                        ));
+                    }
+                    margins.push(g.kind);
+                    shape_thetas.extend_from_slice(&g.shape_thetas);
+                    groups.remove(gi);
+                }
+            }
+        }
+        for (a, (lo, hi), what) in params {
+            let k = thetas.iter().position(|t| t.name == a).ok_or_else(|| {
+                format!(
+                    "[parameters] `{a}` in `{}` is not a declared θ — declare it, or write a \
+                     plain family's `FAMILY()` to declare it",
+                    c.line
+                )
+            })?;
+            let t = &thetas[k];
+            if !(t.fixed || (t.lower >= lo && t.upper <= hi && t.lower < t.upper)) {
+                return Err(format!(
+                    "[parameters] the copula θ `{a}` ({what}) must be bounded inside [{lo}, {hi}] \
+                     for {d} ETAs (its bounds are {}, {}): `{}`",
+                    t.lower, t.upper, c.line
+                ));
+            }
+            shape_thetas.push(k);
+        }
+        groups.push(EtaDensity {
+            kind: DensityKind::Copula,
+            etas,
+            shape_thetas,
+            trunc: None,
+            margins,
+            log_anchors: Vec::new(),
+            family: Some(spec),
+        });
+    }
+    Ok(groups)
+}
+
+/// A `copula` line's copula and its θ names in parameter order, each with the closed
+/// interval its bounds must sit in and what it is (for messages). `etas` are the line's
+/// ETAs, which a reflection names and a nested tree's leaves must cover once each.
+fn build_copula_spec(
+    ast: &crate::parser::eta_shape::CopulaAst,
+    etas: &[String],
+    line: &str,
+) -> Result<
+    (
+        crate::stats::eta_density::copula::CopulaSpec,
+        Vec<(String, (f64, f64), String)>,
+    ),
+    String,
+> {
+    use crate::parser::eta_shape::CopulaAst;
+    use crate::stats::eta_density::copula::{CopulaFamily, CopulaSpec, NestNode};
+    let d = etas.len();
+    let bad = |what: &str| format!("[parameters] {what}: `{line}`");
+    let word = |a: &CopulaAst| -> Result<String, String> {
+        match a {
+            CopulaAst::Word(w) => Ok(w.clone()),
+            CopulaAst::Call { .. } => Err(bad("expected a θ or ETA name, found a call")),
+        }
+    };
+    let CopulaAst::Call { name, args, apply } = ast else {
+        return Err(bad(
+            "a copula is `FAMILY(THETA, …)` or a construction over families",
+        ));
+    };
+    let eta_pos = |e: &str| -> Result<usize, String> {
+        etas.iter()
+            .position(|x| x == e)
+            .ok_or_else(|| bad(&format!("`{e}` is not one of the copula's ETAs")))
+    };
+    let mut out = Vec::new();
+    let spec = match name.as_str() {
+        "survival" | "rotated90" | "rotated180" | "rotated270" => {
+            let base = args
+                .first()
+                .ok_or_else(|| bad(&format!("`{name}` takes the copula it reflects")))?;
+            let (b, ps) = build_copula_spec(base, etas, line)?;
+            out.extend(ps);
+            let flip = match name.as_str() {
+                "survival" if args.len() == 1 => vec![true; d],
+                "survival" => {
+                    let mut f = vec![false; d];
+                    for a in &args[1..] {
+                        f[eta_pos(&word(a)?)?] = true;
+                    }
+                    f
+                }
+                r => {
+                    if d != 2 {
+                        return Err(bad(&format!("`{r}` is a bivariate rotation")));
+                    }
+                    match r {
+                        "rotated90" => vec![true, false],
+                        "rotated180" => vec![true, true],
+                        _ => vec![false, true],
+                    }
+                }
+            };
+            CopulaSpec::Reflect {
+                base: Box::new(b),
+                flip,
+            }
+        }
+        "khoudraji" | "liebscher" => {
+            let (copulas, weights): (Vec<&CopulaAst>, Vec<String>) = if name == "khoudraji" {
+                let n_c = args
+                    .iter()
+                    .take_while(|a| matches!(a, CopulaAst::Call { .. }))
+                    .count();
+                if !(n_c == 1 || n_c == 2) || args.len() != n_c + d {
+                    return Err(bad(&format!(
+                        "`khoudraji(C₂, A…)` or `khoudraji(C₁, C₂, A…)` takes one or two copulas \
+                         and {d} shape θs, one per ETA"
+                    )));
+                }
+                let ws = args[n_c..].iter().map(word).collect::<Result<_, _>>()?;
+                (args[..n_c].iter().collect(), ws)
+            } else {
+                let Some(CopulaAst::Call {
+                    name: wn, args: wa, ..
+                }) = args.last()
+                else {
+                    return Err(bad(
+                        "`liebscher(C₁, …, C_K, weights(…))` ends with its weights",
+                    ));
+                };
+                if wn != "weights" {
+                    return Err(bad(
+                        "`liebscher(C₁, …, C_K, weights(…))` ends with its weights",
+                    ));
+                }
+                let ws = wa.iter().map(word).collect::<Result<_, _>>()?;
+                (args[..args.len() - 1].iter().collect(), ws)
+            };
+            let mut parts = Vec::new();
+            if name == "khoudraji" && copulas.len() == 1 {
+                parts.push(CopulaSpec::Family(CopulaFamily::Independent));
+            }
+            for cp in copulas {
+                let (b, ps) = build_copula_spec(cp, etas, line)?;
+                out.extend(ps);
+                parts.push(b);
+            }
+            if parts.len() < 2 || weights.len() != (parts.len() - 1) * d {
+                return Err(bad(&format!(
+                    "a Liebscher copula of {} parts takes {} weights, {d} per part after the first",
+                    parts.len(),
+                    (parts.len().max(1) - 1) * d
+                )));
+            }
+            for w in weights {
+                out.push((w, (0.0, 1.0), "a weight".to_string()));
+            }
+            CopulaSpec::Liebscher { parts }
+        }
+        "nested" => {
+            let Some(CopulaAst::Call {
+                name: g,
+                args: ga,
+                apply: None,
+            }) = args.first()
+            else {
+                return Err(bad(
+                    "`nested(FAMILY(THETA), children…)` starts with its root generator",
+                ));
+            };
+            let family = CopulaFamily::from_name(g)
+                .filter(|f| f.params(2).len() == 1 && !f.elliptical() && f.max_dim() > 2)
+                .ok_or_else(|| {
+                    bad(&format!(
+                        "`{g}` is not a one-parameter Archimedean family to nest"
+                    ))
+                })?;
+            let mut covered = vec![false; d];
+            // Pre-order: a node's θ, then its children's.
+            fn node(
+                family: CopulaFamily,
+                theta: &CopulaAst,
+                children: &[CopulaAst],
+                covered: &mut [bool],
+                out: &mut Vec<(String, (f64, f64), String)>,
+                eta_pos: &dyn Fn(&str) -> Result<usize, String>,
+                bad: &dyn Fn(&str) -> String,
+            ) -> Result<NestNode, String> {
+                let CopulaAst::Word(t) = theta else {
+                    return Err(bad("a nested node takes one θ name"));
+                };
+                let p = family.params(2)[0];
+                out.push((t.clone(), p.domain, format!("a `{}` node", family.name())));
+                let mut ch = Vec::new();
+                for c in children {
+                    ch.push(match c {
+                        CopulaAst::Word(e) => {
+                            let i = eta_pos(e)?;
+                            if std::mem::replace(&mut covered[i], true) {
+                                return Err(bad(&format!("`{e}` appears twice in the tree")));
+                            }
+                            NestNode::Leaf(i)
+                        }
+                        CopulaAst::Call { name, args, apply: Some(sub) } => {
+                            if CopulaFamily::from_name(name) != Some(family) || args.len() != 1 {
+                                return Err(bad("every node of a nested copula is the root's family, `FAMILY(THETA)(children…)`"));
+                            }
+                            node(family, &args[0], sub, covered, out, eta_pos, bad)?
+                        }
+                        CopulaAst::Call { .. } => {
+                            return Err(bad("a nested child is an ETA or `FAMILY(THETA)(children…)`"));
+                        }
+                    });
+                }
+                if ch.len() < 2 {
+                    return Err(bad("a nested node joins at least two children"));
+                }
+                Ok(NestNode::Node(ch))
+            }
+            if ga.len() != 1 {
+                return Err(bad("the root generator takes one θ"));
+            }
+            let root = node(
+                family,
+                &ga[0],
+                &args[1..],
+                &mut covered,
+                &mut out,
+                &eta_pos,
+                &bad,
+            )?;
+            if covered.iter().any(|c| !c) {
+                return Err(bad(
+                    "a nested copula's tree covers every ETA of the line once",
+                ));
+            }
+            CopulaSpec::Nested { family, root }
+        }
+        _ => {
+            if apply.is_some() {
+                return Err(bad("a family is applied to ETAs only inside `nested(…)`"));
+            }
+            let f = CopulaFamily::from_name(name)
+                .ok_or_else(|| bad(&format!("unknown copula family `{name}`")))?;
+            if f.elliptical() {
+                return Err(bad(&format!(
+                    "`{name}` is elliptical: its dependence is a correlation, so it goes on a \
+                     `block_omega` (`density copula(…, family = {name}(NU))`)"
+                )));
+            }
+            if d > f.max_dim() {
+                return Err(bad(&format!(
+                    "the `{name}` copula is bivariate in Copulas.jl (beyond two ETAs it needs a \
+                     multivariate normal or t CDF, or has no d-variate form)"
+                )));
+            }
+            let ps = f.params(d);
+            if args.len() != ps.len() {
+                return Err(bad(&format!(
+                    "the `{name}` copula takes {} θ ({}) for {d} ETAs, or `{name}()` on a plain \
+                     `copula` line to declare {}",
+                    ps.len(),
+                    ps.iter().map(|p| p.prefix).collect::<Vec<_>>().join(", "),
+                    if ps.len() == 1 { "it" } else { "them" }
+                )));
+            }
+            for (a, p) in args.iter().zip(&ps) {
+                out.push((word(a)?, p.domain, format!("of `{name}`")));
+            }
+            CopulaSpec::Family(f)
+        }
+    };
+    Ok((spec, out))
+}
+
 fn resolve_eta_densities(
     param_lines: &[String],
     eta_names: &[String],
@@ -8747,6 +9105,8 @@ fn resolve_eta_densities(
         // arguments.
         let mut margins: Vec<DensityKind> = Vec::new();
         let mut margin_args: Vec<(String, DensityKind, Vec<String>)> = Vec::new();
+        let mut copula_family = None;
+        let raw_copula_args = d.args.clone();
         if kind == DensityKind::Copula {
             let specs = crate::parser::eta_shape::named_copula_margins(&d.args, &d.etas, &d.line)?;
             for (spec, e) in specs.iter().zip(&d.etas) {
@@ -8809,6 +9169,38 @@ fn resolve_eta_densities(
                 .iter()
                 .flat_map(|(_, _, sh)| sh.clone())
                 .collect();
+            // The block's `family = t(NU)` (#1716): its θs follow the margins'.
+            if let (Some(fam), _) = crate::parser::eta_shape::split_copula_family(&raw_copula_args)
+            {
+                let (fname, fargs) =
+                    crate::parser::eta_shape::parse_kind_spec(&fam).ok_or_else(|| {
+                        format!(
+                            "[parameters] cannot read the copula family `{fam}`: `{}`",
+                            d.line
+                        )
+                    })?;
+                let f = crate::stats::eta_density::copula::CopulaFamily::from_name(&fname)
+                    .filter(|f| f.elliptical())
+                    .ok_or_else(|| {
+                        format!(
+                            "[parameters] `family = {fname}` on a `block_omega` copula takes an \
+                             elliptical family (`t(NU)`): `{}`",
+                            d.line
+                        )
+                    })?;
+                for p in f.params(d.etas.len()) {
+                    v.push(crate::stats::eta_density::ShapeSpec {
+                        prefix: p.prefix,
+                        init: p.init,
+                        lower: p.lower,
+                        upper: p.upper,
+                        domain: p.domain,
+                        strict: true,
+                    });
+                }
+                d.args.extend(fargs.unwrap_or_default());
+                copula_family = Some(crate::stats::eta_density::copula::CopulaSpec::Family(f));
+            }
             v
         } else {
             kind.shapes().to_vec()
@@ -8931,6 +9323,7 @@ fn resolve_eta_densities(
             trunc,
             margins,
             log_anchors: Vec::new(),
+            family: copula_family,
         });
     }
     Ok(out)
@@ -19809,6 +20202,11 @@ fn parse_parameters(
     // Rejoin multi-line `block_*` declarations before matching.
     let lines = join_bracketed_lines(lines);
     for source_line in &lines {
+        // #1716: a `copula (…) ~ FAMILY(…)` line joins ETAs declared elsewhere; it
+        // declares nothing itself, and `crate::parser::eta_shape::copula_decls` reads it.
+        if crate::parser::eta_shape::decl_keyword(source_line) == "copula" {
+            continue;
+        }
         // #1031: a `kappa` declaration may carry a trailing `weight = <expr>`
         // (sample-size-weighted IOV). It is peeled off before the declaration
         // regexes run because it is no part of any declaration grammar. Before

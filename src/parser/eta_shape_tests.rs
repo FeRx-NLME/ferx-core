@@ -1154,3 +1154,148 @@ fn a_tdist_shape_theta_must_keep_nu_at_least_3() {
         );
     }
 }
+
+/// A `copula (…) ~ FAMILY(…)` line (#1716) joins ETAs declared on their own `omega`
+/// lines into one copula group: each ETA's own density (or the Gaussian) is its margin, in
+/// the line's order, `FAMILY()` declares the family's θ at its init, and the family's θs
+/// follow the margins' shapes. A block takes an elliptical `family = t()` the same way.
+/// Dies under: the margins taken in another order, the family θ not appended, or a
+/// margin's own group left behind beside the copula.
+#[test]
+fn a_copula_line_joins_its_etas() {
+    use crate::stats::eta_density::copula::{CopulaFamily, CopulaSpec};
+    use crate::stats::eta_density::DensityKind;
+    let indiv = "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)";
+    let m = densed(
+        "  omega ETA_CL ~ 0.1 density gamma\n  omega ETA_V ~ 0.1\n  copula (ETA_V, ETA_CL) ~ clayton()",
+        indiv,
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        m.eta_densities.len(),
+        1,
+        "one copula group, not gamma + copula"
+    );
+    let g = &m.eta_densities[0];
+    assert_eq!(g.kind, DensityKind::Copula);
+    assert_eq!(g.family, Some(CopulaSpec::Family(CopulaFamily::Clayton)));
+    let cl = m.eta_names.iter().position(|n| n == "ETA_CL").unwrap();
+    let v = m.eta_names.iter().position(|n| n == "ETA_V").unwrap();
+    assert_eq!(g.etas, vec![v, cl], "the line's order");
+    assert_eq!(g.margins, vec![DensityKind::Normal, DensityKind::Gamma]);
+    let t = *g.shape_thetas.last().unwrap();
+    assert_eq!(m.theta_names[t], "THETA_COP_ETA_V");
+    assert_eq!(m.default_params.theta[t], 1.0);
+    assert!(g.diagonal_omega());
+    // An elliptical family on a block: `family = t()` declares its ν after the margins'.
+    let b = densed(
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.1] density copula(ETA_CL = gamma, ETA_V = normal, family = t())",
+        indiv,
+        "",
+    )
+    .unwrap();
+    let g = &b.eta_densities[0];
+    assert_eq!(g.family, Some(CopulaSpec::Family(CopulaFamily::StudentT)));
+    assert_eq!(
+        b.theta_names[*g.shape_thetas.last().unwrap()],
+        "NU_COP_ETA_CL"
+    );
+    assert!(!g.diagonal_omega());
+}
+
+/// Each copula refusal names its cause: an elliptical family on a line, an unknown family,
+/// an ETA inside a `block_omega`, an ETA named twice, a wrong θ count, a θ bounded outside
+/// the family's domain, a truncated margin, and a non-elliptical `family =` on a block.
+/// Dies under: any one refusal removed (each asserts its own message).
+#[test]
+fn copula_refusals() {
+    let indiv = "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)";
+    let cases = [
+        ("  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_V) ~ t()", "is elliptical"),
+        ("  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_V) ~ banana()", "unknown copula family"),
+        ("  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.1]\n  copula (ETA_CL, ETA_V) ~ clayton()", "is in a `block_omega`"),
+        ("  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_CL) ~ clayton()", "names `ETA_CL` twice"),
+        ("  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_V) ~ clayton(L, NU)", "takes 1 θ"),
+        ("  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_V) ~ gumbel(L)", "must be bounded inside [1"),
+        ("  omega ETA_CL ~ 0.1 density truncated(gamma, 0.5, 2)\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_V) ~ clayton()", "`truncated` density"),
+        ("  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.1] density copula(ETA_CL = gamma, ETA_V = normal, family = clayton())", "takes an elliptical family"),
+    ];
+    for (omegas, want) in cases {
+        let e = densed(omegas, indiv, "").unwrap_err();
+        assert!(e.contains(want), "{omegas}: {e}");
+    }
+}
+
+/// The constructions a `copula` line composes (#1716), each to its `CopulaSpec` with its
+/// θs in parameter order: a survival copula (all, and one named ETA), a rotation,
+/// Khoudraji over one and two copulas, a Liebscher with weights, and a nested tree; and
+/// their refusals (a nested tree that misses an ETA, a rotation of three ETAs, a
+/// Liebscher with too few weights, a composite's `FAMILY()` left unnamed).
+/// Dies under: a construction built as another, its θs out of order, or a refusal removed.
+#[test]
+fn copula_constructions_parse() {
+    use crate::stats::eta_density::copula::{CopulaFamily as F, CopulaSpec as S, NestNode as N};
+    let indiv = "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)\n  KA = exp(ETA_KA)";
+    let model = |line: &str| {
+        densed(
+            &format!(
+                "  theta A1(0.3, 0.0, 1.0)\n  theta A2(0.6, 0.0, 1.0)\n  theta C1(1.0, 0.01, 20.0)\n  \
+                 theta C2(2.0, 1.0, 20.0)\n  theta C3(3.0, 0.01, 20.0)\n  \
+                 omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  omega ETA_KA ~ 0.1\n  {line}"
+            ),
+            indiv,
+            "",
+        )
+    };
+    let fam = |f| Box::new(S::Family(f));
+    let cases: Vec<(&str, S, Vec<&str>)> = vec![
+        ("copula (ETA_CL, ETA_V) ~ survival(clayton(C1))", S::Reflect { base: fam(F::Clayton), flip: vec![true, true] }, vec!["C1"]),
+        ("copula (ETA_CL, ETA_V, ETA_KA) ~ survival(clayton(C1), ETA_V)", S::Reflect { base: fam(F::Clayton), flip: vec![false, true, false] }, vec!["C1"]),
+        ("copula (ETA_CL, ETA_V) ~ rotated90(gumbel(C2))", S::Reflect { base: fam(F::Gumbel), flip: vec![true, false] }, vec!["C2"]),
+        ("copula (ETA_CL, ETA_V) ~ khoudraji(gumbel(C2), A1, A2)", S::Liebscher { parts: vec![S::Family(F::Independent), S::Family(F::Gumbel)] }, vec!["C2", "A1", "A2"]),
+        ("copula (ETA_CL, ETA_V) ~ khoudraji(clayton(C1), gumbel(C2), A1, A2)", S::Liebscher { parts: vec![S::Family(F::Clayton), S::Family(F::Gumbel)] }, vec!["C1", "C2", "A1", "A2"]),
+        ("copula (ETA_CL, ETA_V) ~ liebscher(clayton(C1), gumbel(C2), weights(A1, A2))", S::Liebscher { parts: vec![S::Family(F::Clayton), S::Family(F::Gumbel)] }, vec!["C1", "C2", "A1", "A2"]),
+        ("copula (ETA_CL, ETA_V, ETA_KA) ~ nested(clayton(C1), ETA_KA, clayton(C3)(ETA_CL, ETA_V))", S::Nested { family: F::Clayton, root: N::Node(vec![N::Leaf(2), N::Node(vec![N::Leaf(0), N::Leaf(1)])]) }, vec!["C1", "C3"]),
+    ];
+    for (line, want, thetas) in cases {
+        let m = model(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+        let g = m
+            .eta_densities
+            .iter()
+            .find(|g| g.family.is_some())
+            .expect("a copula group");
+        assert_eq!(g.family.as_ref(), Some(&want), "{line}");
+        let names: Vec<&str> = g
+            .shape_thetas
+            .iter()
+            .map(|&k| m.theta_names[k].as_str())
+            .collect();
+        assert_eq!(names, thetas, "{line}: θ order");
+    }
+    for (line, msg) in [
+        (
+            "copula (ETA_CL, ETA_V, ETA_KA) ~ nested(clayton(C1), ETA_KA, clayton(C3)(ETA_CL))",
+            "at least two children",
+        ),
+        (
+            "copula (ETA_CL, ETA_V, ETA_KA) ~ nested(clayton(C1), ETA_CL, ETA_V)",
+            "covers every ETA",
+        ),
+        (
+            "copula (ETA_CL, ETA_V, ETA_KA) ~ rotated90(clayton(C1))",
+            "bivariate rotation",
+        ),
+        (
+            "copula (ETA_CL, ETA_V) ~ liebscher(clayton(C1), gumbel(C2), weights(A1))",
+            "takes 2 weights",
+        ),
+        (
+            "copula (ETA_CL, ETA_V) ~ survival(clayton())",
+            "on a plain `copula` line to declare",
+        ),
+    ] {
+        let e = model(line).unwrap_err();
+        assert!(e.contains(msg), "{line}: {e}");
+    }
+}

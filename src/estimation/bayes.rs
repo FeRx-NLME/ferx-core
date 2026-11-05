@@ -1512,8 +1512,7 @@ pub fn run_bayes(
                         {
                             continue;
                         }
-                        let prior =
-                            block_prior(options.bayes_omega_prior, &d.etas, &lambda0, nu0, n_eta);
+                        let prior = block_prior(options.bayes_omega_prior, d, &lambda0, nu0, n_eta);
                         dens_prop[g] += 1;
                         if crate::estimation::eta_density_mstep::mh_group_omega_prior(
                             d,
@@ -1602,7 +1601,7 @@ pub fn run_bayes(
                                 }
                                 let prior = block_prior(
                                     options.bayes_omega_prior,
-                                    &d.etas,
+                                    d,
                                     lam0,
                                     nu0_iov,
                                     n_kappa,
@@ -2558,6 +2557,7 @@ fn blocks_with(
             trunc: None,
             margins: vec![DensityKind::Normal; m],
             log_anchors: Vec::new(),
+            family: None,
         });
     }
     out
@@ -2566,12 +2566,29 @@ fn blocks_with(
 /// The prior an Ω block takes under `prior`, centred on the declared Ω's block `Λ₀`.
 fn block_prior(
     prior: crate::types::OmegaPrior,
-    etas: &[usize],
+    d: &crate::stats::eta_density::EtaDensity,
     lambda0: &DMatrix<f64>,
     nu0: f64,
     p: usize,
 ) -> crate::estimation::eta_density_mstep::BlockPrior {
     use crate::estimation::eta_density_mstep::BlockPrior;
+    // A diagonal block (a non-elliptical copula, #1716): each ETA's own 1×1 prior.
+    if d.diagonal_omega() {
+        return BlockPrior::Diagonal(
+            d.etas
+                .iter()
+                .map(|&a| {
+                    let one = crate::stats::eta_density::EtaDensity {
+                        etas: vec![a],
+                        family: None,
+                        ..d.clone()
+                    };
+                    block_prior(prior, &one, lambda0, nu0, p)
+                })
+                .collect(),
+        );
+    }
+    let etas = &d.etas;
     let n = etas.len();
     let lam = DMatrix::from_fn(n, n, |i, j| lambda0[(etas[i], etas[j])]);
     let nu = nu0 - (p - n) as f64;

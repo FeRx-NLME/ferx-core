@@ -15,6 +15,7 @@ fn group(kind: DensityKind, etas: Vec<usize>, shape: Vec<usize>) -> EtaDensity {
         trunc: None,
         margins: vec![],
         log_anchors: Vec::new(),
+        family: None,
     }
 }
 
@@ -390,6 +391,7 @@ fn a_truncated_density_is_the_renormalised_kind() {
             trunc: Some(Truncation { lo, hi }),
             margins: vec![],
             log_anchors: Vec::new(),
+            family: None,
         };
         let val = |b: Bound, open: f64| match b {
             Bound::Value(v) => v,
@@ -473,6 +475,7 @@ fn a_gaussian_copula_is_the_multivariate_normal() {
         trunc: None,
         margins: vec![DensityKind::Normal; 3],
         log_anchors: Vec::new(),
+        family: None,
     };
     let mut worst = 0.0f64;
     for z in [[0.1, -0.2, 0.3], [-0.5, 0.4, 0.05], [0.0, 0.0, 0.0]] {
@@ -501,6 +504,7 @@ fn a_copula_integrates_to_one_and_keeps_its_margins() {
         trunc: None,
         margins: vec![DensityKind::Gamma, DensityKind::Beta],
         log_anchors: Vec::new(),
+        family: None,
     };
     let theta = [0.3];
     let p = |z0: f64, z1: f64| {
@@ -562,6 +566,7 @@ fn the_block_lognormal_is_the_multivariate_lognormal() {
         trunc: None,
         margins: vec![],
         log_anchors: Vec::new(),
+        family: None,
     };
     let s = DMatrix::from_fn(2, 2, |i, j| f64::ln_1p(omega[(i, j)]));
     let si = s.clone().try_inverse().unwrap();
@@ -651,4 +656,59 @@ fn effect_quantiles_are_the_closed_forms() {
     // No distribution: an unknown kind, a non-positive ω.
     assert!(effect_quantiles(&dist("nope", None), w, &[]).is_none());
     assert!(effect_quantiles(&dist("normal", None), 0.0, &[]).is_none());
+}
+
+/// A Clayton copula group (#1716) with a gamma and a Gaussian margin: the correction is
+/// its definition, `−2[ln p_γ(z₁) + ln p_N(z₂) + ln c(u₁, u₂)] − (zᵀΩ⁻¹z + ln|Ω| + 2 ln 2π)`
+/// with `uₖ = Fₖ(m(zₖ))`, assembled here from the margins' own kernels and Copulas.jl-pinned
+/// `log_density`. With the family's θ at its independence point it is the two univariate
+/// corrections' sum.
+/// Dies under: the family's density not added, the Gaussian copula's term left in, or the
+/// family θ read from a margin's slot.
+#[test]
+fn a_clayton_group_is_its_margins_and_its_copula() {
+    use copula::CopulaFamily;
+    let omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.0, 0.0, 0.04]);
+    let oi = omega.clone().try_inverse().unwrap();
+    let d = EtaDensity {
+        kind: DensityKind::Copula,
+        etas: vec![0, 1],
+        shape_thetas: vec![0],
+        trunc: None,
+        margins: vec![DensityKind::Gamma, DensityKind::Normal],
+        log_anchors: Vec::new(),
+        family: Some(copula::CopulaSpec::Family(CopulaFamily::Clayton)),
+    };
+    let mut worst = 0.0f64;
+    for (z, th) in [([0.1, -0.2], 1.7), ([-0.4, 0.15], 0.6), ([0.05, 0.3], 4.0)] {
+        let got = correction(std::slice::from_ref(&d), &z, &oi, &[th]);
+        let u1 = kinds::eta_cdf::<f64>(DensityKind::Gamma, z[0].exp(), 0.09, &[]).unwrap();
+        let u2 = kinds::eta_cdf::<f64>(DensityKind::Normal, z[1], 0.04, &[]).unwrap();
+        let lc = CopulaFamily::Clayton.log_density::<f64>(&[u1, u2], &[th]);
+        let neg2 = kinds::latent_neg2_logpdf::<f64>(DensityKind::Gamma, z[0], 0.09, &[])
+            + kinds::latent_neg2_logpdf::<f64>(DensityKind::Normal, z[1], 0.04, &[]);
+        let gauss = z[0] * z[0] / 0.09
+            + z[1] * z[1] / 0.04
+            + (0.09f64 * 0.04).ln()
+            + 2.0 * std::f64::consts::TAU.ln();
+        let want = neg2 - 2.0 * lc - gauss;
+        assert!(got.is_finite() && want.is_finite(), "{got} vs {want}");
+        worst = worst.max((got - want).abs() / want.abs().max(1.0));
+    }
+    // θ = 0: independence, so the group is its two univariate corrections.
+    let z = [0.1, -0.2];
+    let indep = correction(std::slice::from_ref(&d), &z, &oi, &[0.0]);
+    let gamma = EtaDensity {
+        kind: DensityKind::Gamma,
+        etas: vec![0],
+        shape_thetas: vec![],
+        margins: vec![],
+        family: None,
+        ..d.clone()
+    };
+    let sum = correction(std::slice::from_ref(&gamma), &z, &oi, &[]);
+    assert!(indep.is_finite() && sum.is_finite());
+    worst = worst.max((indep - sum).abs() / sum.abs().max(1.0));
+    eprintln!("Clayton group correction: worst relative {worst:.2e}");
+    assert!(worst < 1e-12, "{worst:e}");
 }

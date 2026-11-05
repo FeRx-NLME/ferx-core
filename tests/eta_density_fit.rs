@@ -468,3 +468,173 @@ fn a_kink_kind_is_refused_where_curvature_is_read() {
     )
     .is_ok());
 }
+
+/// Every kind of copula (#1716) fits: one representative of each class on a `copula`
+/// line over a gamma clearance and a t volume under FOCEI — an Archimedean family of one
+/// and of two parameters, an extreme-value family, an Archimax, FGM, Plackett, a survival
+/// copula, Khoudraji, and a nested tree over all three ETAs — and the Clayton under SAEM
+/// and Bayes, whose density M-step / Metropolis moves its θ. The non-elliptical group's Ω
+/// block stays diagonal through every update; the block t copula fits under FOCEI and
+/// SAEM.
+#[test]
+fn every_copula_family_fits() {
+    let (_, pop) = model_and_data();
+    let indiv = "  CL = TVCL * ETA_CL\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n";
+    let line = |copula: &str| {
+        variant(
+            &format!(
+                "  theta CA(1.0, 0.01, 20.0)\n  theta CB(1.5, 1.0, 20.0)\n  theta WA(0.4, 0.0, 1.0)\n  \
+                 theta WB(0.6, 0.0, 1.0)\n  theta CC(2.0, 0.01, 20.0)\n  \
+                 omega ETA_CL ~ 0.09 density gamma\n  omega ETA_V  ~ 0.04 density t(NU)\n  omega ETA_KA ~ 0.30\n  {copula}\n"
+            ),
+            indiv,
+            "",
+        )
+    };
+    for c in [
+        "copula (ETA_CL, ETA_V) ~ clayton(CA)",
+        "copula (ETA_CL, ETA_V) ~ bb1(CA, CB)",
+        "copula (ETA_CL, ETA_V) ~ galambos(CA)",
+        "copula (ETA_CL, ETA_V) ~ bb4(CA, CA)",
+        "copula (ETA_CL, ETA_V) ~ fgm(WA)",
+        "copula (ETA_CL, ETA_V) ~ plackett(CC)",
+        "copula (ETA_CL, ETA_V) ~ survival(gumbel(CB))",
+        "copula (ETA_CL, ETA_V) ~ khoudraji(gumbel(CB), WA, WB)",
+        "copula (ETA_CL, ETA_V, ETA_KA) ~ nested(clayton(CA), ETA_KA, clayton(CC)(ETA_CL, ETA_V))",
+    ] {
+        let model = line(c);
+        let r = ferx_core::fit(
+            &model,
+            &pop,
+            &model.default_params,
+            &short(EstimationMethod::FoceI, true),
+        )
+        .unwrap_or_else(|e| panic!("{c} FOCEI: {e}"));
+        assert!(
+            r.ofv.is_finite() && r.ofv.abs() < 1e10,
+            "{c}: OFV {}",
+            r.ofv
+        );
+        assert_eq!(r.omega[(0, 1)], 0.0, "{c}: the copula block stays diagonal");
+    }
+    let clayton = line("copula (ETA_CL, ETA_V) ~ clayton(CA)");
+    let th = clayton
+        .theta_names
+        .iter()
+        .position(|n| n == "CA")
+        .expect("θ");
+    for method in [EstimationMethod::Saem, EstimationMethod::Bayes] {
+        let r = ferx_core::fit(
+            &clayton,
+            &pop,
+            &clayton.default_params,
+            &short(method, true),
+        )
+        .unwrap_or_else(|e| panic!("clayton {method:?}: {e}"));
+        assert!(
+            r.ofv.is_finite() && r.ofv.abs() < 1e10,
+            "{method:?}: OFV {}",
+            r.ofv
+        );
+        assert_eq!(
+            r.omega[(0, 1)],
+            0.0,
+            "{method:?}: the copula block stays diagonal"
+        );
+        assert_ne!(
+            r.theta[th], clayton.default_params.theta[th],
+            "{method:?} moves the copula θ"
+        );
+    }
+    let t_block = variant(
+        "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] density copula(ETA_CL = gamma, ETA_V = normal, family = t())\n  omega ETA_KA ~ 0.30\n",
+        indiv,
+        "",
+    );
+    for method in [EstimationMethod::FoceI, EstimationMethod::Saem] {
+        let r = ferx_core::fit(
+            &t_block,
+            &pop,
+            &t_block.default_params,
+            &short(method, true),
+        )
+        .unwrap_or_else(|e| panic!("t copula {method:?}: {e}"));
+        assert!(
+            r.ofv.is_finite() && r.ofv.abs() < 1e10,
+            "t copula {method:?}: OFV {}",
+            r.ofv
+        );
+    }
+}
+
+/// Simulate 1000 subjects with a Clayton copula (θ = 3, Kendall's τ = 0.6) between a Gamma
+/// clearance and a Gaussian volume, and refit with FOCEI: θ, ω_CL and TVCL come back. The
+/// sampler (conditional inversion, then each margin's quantile) and the likelihood (the
+/// copula's density off its CDF) are separate code, so only a round trip sees them
+/// describe different copulas.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_simulated_clayton_copula_is_recovered() {
+    let (base, template) = model_and_data();
+    let _ = base;
+    let model = variant(
+        "  omega ETA_CL ~ 0.09 density gamma\n  omega ETA_V  ~ 0.04\n  omega ETA_KA ~ 0.30\n  theta THC(1.0, 0.01, 20.0)\n  copula (ETA_CL, ETA_V) ~ clayton(THC)\n",
+        "  CL = TVCL * ETA_CL\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n",
+        "",
+    );
+    let th = model.theta_names.iter().position(|n| n == "THC").unwrap();
+    let mut truth = model.default_params.clone();
+    truth.theta[0] = 0.15;
+    truth.theta[1] = 9.0;
+    truth.theta[2] = 1.2;
+    truth.theta[th] = 3.0;
+    truth.omega = ferx_core::types::OmegaMatrix::from_matrix(
+        nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.16, 0.06, 0.2])),
+        truth.omega.eta_names.clone(),
+        true,
+    );
+    let n_rep = 100;
+    let sims = ferx_core::simulate_with_seed(&model, &template, &truth, n_rep, 1716).unwrap();
+    let mut pop = template.clone();
+    pop.subjects.clear();
+    for k in 0..n_rep {
+        let mut rows = sims.iter().filter(|r| r.sim == k + 1);
+        for subj in &template.subjects {
+            let mut s = subj.clone();
+            s.id = format!("{}_{}", subj.id, k + 1);
+            for y in s.observations.iter_mut() {
+                match rows.next().expect("one row per observation").outcome {
+                    SimOutcome::Continuous { value } => *y = value,
+                    ref o => panic!("expected a continuous outcome, got {o:?}"),
+                }
+            }
+            pop.subjects.push(s);
+        }
+    }
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let r = ferx_core::fit(&model, &pop, &model.default_params, &opts).expect("FOCEI fit");
+    let rel = |got: f64, want: f64| (got - want).abs() / want;
+    let gaps = [
+        ("TVCL", rel(r.theta[0], 0.15)),
+        ("ω_CL", rel(r.omega[(0, 0)], 0.16)),
+        ("θ_Clayton", rel(r.theta[th], 3.0)),
+    ];
+    eprintln!("copula recovery: {gaps:?}, θ = {}", r.theta[th]);
+    // Measured (seed 1716): TVCL 0.0072, ω_CL 0.040, θ 0.061 (θ̂ = 2.82), each about 1 SE
+    // by the asymptotic SEs: TVCL √(ω/n) ≈ 1.3%, ω_CL √(2/n) ≈ 4.5%, and θ through
+    // Kendall's τ = 0.6 (SE(τ) ≈ 0.015 over 1000 pairs, dθ/dτ = 2/(1 − τ)² = 12.5, so
+    // ≈ 6%). The bounds are 3 SE. A sampler and a likelihood describing different
+    // copulas move θ̂ on the scale of θ itself (independence is θ = 0, a gap of 1).
+    let bounds = [0.04, 0.15, 0.2];
+    for ((name, g), b) in gaps.into_iter().zip(bounds) {
+        assert!(g.is_finite() && g < b, "{name}: {g}");
+    }
+}
