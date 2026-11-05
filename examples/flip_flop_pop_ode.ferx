@@ -1,0 +1,38 @@
+# One-compartment oral population with flip-flop subjects (ODE twin)
+#
+# The ODE twin of examples/flip_flop_pop.ferx, on the same data (data/flip_flop_pop.csv,
+# tools/sim_flip_flop_pop.py). The flip-flop twin seed (`inner_twin_seed`) applies only to
+# the closed form, so here a flip-flop subject's second mode is reached by the Sobol
+# screen (`inner_screen`) alone. The fixture for #2096's descent-budget ablation.
+
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(0.2, 0.001, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 1.0
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  # depot: the oral dose (mg); central: concentration (mg/L)
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot / V - CL / V * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true

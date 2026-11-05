@@ -1,0 +1,37 @@
+# One-compartment oral population with flip-flop subjects (closed form)
+#
+# Data: data/flip_flop_pop.csv, simulated by tools/sim_flip_flop_pop.py (seed 2096):
+# 80 subjects, one 100 mg oral dose each, 12 samples to 96 h. True values TVCL = 1,
+# TVV = 10, TVKA = 0.2, omega_CL = omega_V = 0.09, omega_KA = 1, proportional SD 0.1.
+# A subject with KA < CL/V is flip-flop: (KA, k) and the swapped pair fit its curve
+# equally well, so its individual objective has a second mode off every random-effect
+# axis. The twin seed (`inner_twin_seed`) reaches it on this closed form; the ODE twin,
+# examples/flip_flop_pop_ode.ferx, depends on the Sobol screen (`inner_screen`) alone.
+# The fixture for #2096's descent-budget ablation.
+
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(0.2, 0.001, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 1.0
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
