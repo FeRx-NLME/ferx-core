@@ -485,6 +485,35 @@ fn solves_during<R: Send>(pool: &rayon::ThreadPool, f: impl FnOnce() -> R + Send
     })
 }
 
+/// #2645 review: the cold solve that opens a verification round polls the cancel flag, unlike
+/// the final readouts, and what a cancel left behind seeds no leg. Uncancelled, it solves every
+/// subject and returns; cancelled, it starts no solve and returns nothing.
+#[test]
+fn a_cancelled_cold_round_solve_starts_nothing_and_seeds_no_leg() {
+    let pool = single_thread_pool();
+    let (model, pop) = cancel_fixture(false);
+    let params = &model.default_params;
+    let mu_k = compute_mu_k(&model, &params.theta, true);
+    let flag = crate::cancel::CancelFlag::new();
+    let options = FitOptions {
+        cancel: Some(flag.clone()),
+        ..FitOptions::default()
+    };
+    let solve = || {
+        let (cold, solves) = solves_during(&pool, || {
+            cold_modes_solve(&model, &pop, params, &mu_k, &options)
+        });
+        (cold.is_some(), solves)
+    };
+    assert_eq!(
+        solve(),
+        (true, pop.subjects.len()),
+        "the uncancelled control"
+    );
+    flag.cancel();
+    assert_eq!(solve(), (false, 0));
+}
+
 /// A cancel flipped by the first subject's finish skips every later subject: their solve
 /// never starts (counted at `find_ebe_cached`, not at the finish). One worker thread makes
 /// "later" deterministic. The same run with the flag present but never flipped is the
