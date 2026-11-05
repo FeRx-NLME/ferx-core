@@ -3751,6 +3751,37 @@ pub(crate) fn non_fit_diagnostics(
     out
 }
 
+/// The token of [`fd_h_not_tightened_warning`]; `classify_warning` matches it.
+const FD_H_NOT_TIGHTENED_TOKEN: &str = "W_FD_JACOBIAN_NOT_TIGHTENED";
+
+/// The warning for `redone` of `n_subjects` subjects whose finite-difference `H` at the final
+/// estimates fell back to the fit's own ODE settings (#2701), or `None` when none did. The
+/// wording holds for a fit tighter than the Jacobian's target too, whose tolerances are its own.
+pub(crate) fn fd_h_not_tightened_warning(
+    redone: usize,
+    n_subjects: usize,
+) -> Option<(String, WarningEntry)> {
+    use crate::estimation::inner_optimizer::{
+        ODE_FD_JACOBIAN_ABSTOL, ODE_FD_JACOBIAN_MAX_STEPS_FACTOR, ODE_FD_JACOBIAN_RELTOL,
+    };
+    if redone == 0 {
+        return None;
+    }
+    let msg = format!(
+        "{FD_H_NOT_TIGHTENED_TOKEN}: {redone} of {n_subjects} subjects' finite-difference \
+         Jacobian could not be integrated cleanly at the final estimates, at no looser than \
+         ode_reltol = {ODE_FD_JACOBIAN_RELTOL:.0e} / ode_abstol = \
+         {ODE_FD_JACOBIAN_ABSTOL:.0e} with {ODE_FD_JACOBIAN_MAX_STEPS_FACTOR} times \
+         ode_max_steps, and was taken at the fit's own ODE settings instead. Integration \
+         error enters the objective's determinant term through this Jacobian, so the OFV \
+         may be off. Raise ode_max_steps or ode_stiff_abort_after, or name a stiff \
+         ode_method, so the solve can finish (#2701)."
+    );
+    let details = serde_json::json!({ "subjects": redone, "n_subjects": n_subjects });
+    let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), Some(details));
+    Some((msg, entry))
+}
+
 /// The one place a non-`fit()` entry point decides whether to open a
 /// [`crate::ode::solver::SolverStatsScope`] (#1304).
 ///
@@ -3928,9 +3959,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // clause below. They are reported through `auto_stiff_rejected` instead. A stall *is* the
     // rejection trigger, so without this subtraction every rejected escalation would be told
     // its predictions were padded when the guard had just repaired them.
-    let clamped = stats
-        .min_step_clamped_steps
-        .saturating_sub(stats.discarded_clamped_steps);
+    let clamped = stats.kept_clamped_steps();
     let rejected = stats.auto_stiff_rejected;
     // The rejections only a dual solve could have taken (#1204), carried here from the
     // post-fit *sensitivity* sweep — `fit_inner` collects that sweep in its own scope and
@@ -3943,9 +3972,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // Like clamps, an unfinished stiff attempt that the guard discarded did not reach the
     // caller. Only the explicit fallback (or a named/kept method) belongs in the returned-
     // trajectory clause.
-    let unfinished_kept = stats
-        .unfinished_segments
-        .saturating_sub(stats.discarded_unfinished_segments);
+    let unfinished_kept = stats.kept_unfinished_segments();
     let aborted = stats.stiff_aborted_segments;
     // `unfinished_kept` is a roll-up: a segment abandoned by `ode_stiff_abort_after` stops
     // while `t < tf`, so it is *also* an unfinished segment, and the abort clause below already

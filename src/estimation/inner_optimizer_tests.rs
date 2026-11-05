@@ -1399,6 +1399,7 @@ fn test_ebe_result_converged_flag() {
     let r = EbeResult {
         eta: nalgebra::DVector::zeros(2),
         h_matrix: nalgebra::DMatrix::identity(2, 2),
+        fd_h_redone: false,
         terminal_hessian: None,
         converged: true,
         used_fallback: false,
@@ -1941,6 +1942,7 @@ fn test_inner_loop_stats_min_obs_filter() {
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
             h_matrix: nalgebra::DMatrix::identity(1, 1),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false, // unconverged
             used_fallback: false,
@@ -1955,6 +1957,7 @@ fn test_inner_loop_stats_min_obs_filter() {
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
             h_matrix: nalgebra::DMatrix::identity(1, 1),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false, // also unconverged
             used_fallback: true,
@@ -1990,6 +1993,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
     let make = |hard_reject: bool| EbeResult {
         eta: nalgebra::DVector::zeros(1),
         h_matrix: nalgebra::DMatrix::zeros(1, 1),
+        fd_h_redone: false,
         terminal_hessian: None,
         converged: false,
         used_fallback: false,
@@ -7284,6 +7288,7 @@ fn an_unusable_predicted_start_or_end_takes_the_mode() {
         let end = EbeResult {
             eta: DVector::from_vec(vec![0.0; 2]),
             h_matrix: DMatrix::zeros(0, 2),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false,
             used_fallback: true,

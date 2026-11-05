@@ -529,6 +529,9 @@ pub(crate) static GRADIENT_TIMINGS: GradientTimings = GradientTimings::new();
 pub struct EbeResult {
     pub eta: DVector<f64>,
     pub h_matrix: DMatrix<f64>,
+    /// This candidate's `h_matrix` is an FD Jacobian that fell back to the fit's own ODE
+    /// settings (#2701). On the candidate so a discarded one's fallback leaves with it.
+    pub(crate) fd_h_redone: bool,
     /// Exact conditional eta Hessian at the returned mode when the adjoint
     /// (`exact_inner_hessian`) can produce it.  Laplace/AGQ may reuse this instead
     /// of immediately repeating the same evaluation.
@@ -2372,6 +2375,7 @@ fn find_ebe_impl_from(
         return EbeResult {
             eta: DVector::zeros(model.n_eta),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
@@ -2695,6 +2699,7 @@ fn find_ebe_solve(
         return Some(EbeResult {
             eta: DVector::zeros(0),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), 0),
+            fd_h_redone: false,
             terminal_hessian: policy
                 .capture_terminal_hessian
                 .then(|| DMatrix::zeros(0, 0)),
@@ -3293,6 +3298,7 @@ fn find_ebe_solve(
                 .then(|| DMatrix::from_fn(rows.len(), n_eta, |j, k| rows[j].df_deta[k]))
             })
     };
+    let redone_before = fd_h_redone_on_this_thread();
     let h_matrix = ebe_h_matrix(
         model,
         subject,
@@ -3302,10 +3308,12 @@ fn find_ebe_solve(
         &mut pk_scratch_cell.borrow_mut(),
         schedule,
     );
+    let fd_h_redone = fd_h_redone_on_this_thread() > redone_before;
 
     Some(EbeResult {
         eta: DVector::from_column_slice(&eta_true),
         h_matrix,
+        fd_h_redone,
         terminal_hessian,
         converged: ebe_exit.converged(),
         used_fallback,
@@ -3420,24 +3428,38 @@ pub(crate) fn ebe_h_matrices_at(
         .subjects
         .par_iter()
         .enumerate()
-        .map(|(i, subject)| {
-            // The same branch `find_ebe_impl` takes.
-            if model.n_kappa > 0 && !subject.occasions.is_empty() {
-                iov_ebe_h_matrix(model, subject, params, etas[i].as_slice(), &kappas[i])
-            } else {
-                let schedule = cacheable_schedule(model, subject);
-                ebe_h_matrix(
-                    model,
-                    subject,
-                    params,
-                    etas[i].as_slice(),
-                    None,
-                    &mut pk::EventPkParams::default(),
-                    schedule.as_ref(),
-                )
-            }
-        })
+        .map(|(i, subject)| ebe_h_matrix_of(model, subject, params, etas[i].as_slice(), &kappas[i]))
         .collect()
+}
+
+/// Whether `subject`'s `H` is the IOV one: the same branch `find_ebe_impl` takes.
+fn iov_h_route(model: &CompiledModel, subject: &Subject) -> bool {
+    model.n_kappa > 0 && !subject.occasions.is_empty()
+}
+
+/// One subject's `H` at its EBE, by the rule the inner loop finishes with and with no captured
+/// Jacobian. `kappas` is read on the IOV route only.
+fn ebe_h_matrix_of(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+    kappas: &[DVector<f64>],
+) -> DMatrix<f64> {
+    if iov_h_route(model, subject) {
+        iov_ebe_h_matrix(model, subject, params, eta, kappas)
+    } else {
+        let schedule = cacheable_schedule(model, subject);
+        ebe_h_matrix(
+            model,
+            subject,
+            params,
+            eta,
+            None,
+            &mut pk::EventPkParams::default(),
+            schedule.as_ref(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -3840,6 +3862,7 @@ fn find_ebe_iov_seeded(
         return EbeResult {
             eta: DVector::from_column_slice(&bsv_eta),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), n_eta),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
@@ -4001,11 +4024,14 @@ fn find_ebe_iov_seeded(
         .map(|k| DVector::from_column_slice(k))
         .collect();
 
+    let redone_before = fd_h_redone_on_this_thread();
     let h_matrix = iov_ebe_h_matrix(model, subject, params, &bsv_eta, &kappas_vec);
+    let fd_h_redone = fd_h_redone_on_this_thread() > redone_before;
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
         h_matrix,
+        fd_h_redone,
         terminal_hessian: None,
         converged: ebe_exit.converged() && nll.is_finite(),
         used_fallback,
@@ -4127,23 +4153,26 @@ fn compute_jacobian_fd_iov(
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
-    let eps = 1e-6;
-    let mut h = DMatrix::zeros(n_obs, n_eta);
-    let mut eta_pert = eta.to_vec();
 
-    for col in 0..n_eta {
-        let h_step = eps * (1.0 + eta[col].abs());
-        eta_pert[col] = eta[col] + h_step;
-        let preds_plus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
-        eta_pert[col] = eta[col] - h_step;
-        let preds_minus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
-        eta_pert[col] = eta[col];
+    let mut h = with_fd_jacobian_integration(model, |eps| {
+        let mut h = DMatrix::zeros(n_obs, n_eta);
+        let mut eta_pert = eta.to_vec();
 
-        let inv = 1.0 / (2.0 * h_step);
-        for j in 0..n_obs {
-            h[(j, col)] = (preds_plus[j] - preds_minus[j]) * inv;
+        for col in 0..n_eta {
+            let h_step = eps * (1.0 + eta[col].abs());
+            eta_pert[col] = eta[col] + h_step;
+            let preds_plus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
+            eta_pert[col] = eta[col] - h_step;
+            let preds_minus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
+            eta_pert[col] = eta[col];
+
+            let inv = 1.0 / (2.0 * h_step);
+            for j in 0..n_obs {
+                h[(j, col)] = (preds_plus[j] - preds_minus[j]) * inv;
+            }
         }
-    }
+        h
+    });
 
     // Overwrite FREM pseudo-observation rows with exact analytical Jacobian.
     overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
@@ -7280,6 +7309,150 @@ fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
     g
 }
 
+/// Central-difference step of the FD Jacobian on a model that never integrates, where only
+/// roundoff limits the difference.
+const FD_JACOBIAN_STEP: f64 = 1e-6;
+
+/// Central-difference step of the FD Jacobian on a model with an integrator (#2701), per unit
+/// of `1 + |η|`. Integration error reaches `H` as `error / step`, so a step sized for roundoff
+/// lets the integrator set the determinant term. On the 8-state neutropenia model (6 worst
+/// subjects, OFV −3.6510 once `H` is resolved) the step alone, at the fit's `1e-4` / `1e-6`,
+/// measured 71.6 at `1e-6`, 44.3 at `1e-5`, 17.5 at `1e-4` and −2.2 at `1e-3`. Truncation is
+/// `O(step²)`: `1e-3` and `3e-3` agree to 1e-4 OFV at every tolerance from `1e-7` down.
+const ODE_FD_JACOBIAN_STEP: f64 = 1e-3;
+
+/// `ode_reltol` / `ode_abstol` the FD Jacobian integrates at, at most (#2701). Unlike the
+/// covariance plateau (`1e-6` / `1e-8`) this one is measured against a difference of step
+/// [`ODE_FD_JACOBIAN_STEP`]: at that step on the same model (256 subjects, `H` resolved at
+/// −289.8764), `1e-7` / `1e-9` left 1.2e-2 OFV, this 5.3e-3, `1e-9` / `1e-12` 2.4e-4.
+pub(crate) const ODE_FD_JACOBIAN_RELTOL: f64 = 1e-8;
+pub(crate) const ODE_FD_JACOBIAN_ABSTOL: f64 = 1e-10;
+
+/// How much the step budget grows under [`fd_jacobian_ode_override`]. Tightening the default
+/// `ode_reltol` 10⁴× costs an order-`p` stepper 10^(4/p) more steps: ~6× for rk45, ~22× for
+/// rosenbrock23. A cap, paid only by a solve that needs it.
+pub(crate) const ODE_FD_JACOBIAN_MAX_STEPS_FACTOR: usize = 32;
+
+/// The ODE solver override the FD Jacobian integrates under, or `None` when the model has no
+/// integrator. A fit already at least that tight keeps its tolerances and still gets the
+/// budget and [`with_fd_jacobian_integration`]'s health check: a perturbed solve can fail where
+/// the prediction pass at η̂ does not, and no other diagnostic sees it. Every field is pinned,
+/// so the fit's `ode_method` and budgets reach the Jacobian. Read on the thread that solves,
+/// where the fit's override is in force.
+fn fd_jacobian_ode_override(
+    model: &CompiledModel,
+) -> Option<crate::ode::solver::OdeSolverOverride> {
+    let eff = model.integrator_spec()?.effective_solver_opts();
+    Some(crate::ode::solver::OdeSolverOverride {
+        reltol: Some(eff.reltol.min(ODE_FD_JACOBIAN_RELTOL)),
+        abstol: Some(eff.abstol.min(ODE_FD_JACOBIAN_ABSTOL)),
+        max_steps: Some(
+            eff.max_steps
+                .saturating_mul(ODE_FD_JACOBIAN_MAX_STEPS_FACTOR),
+        ),
+        method: Some(eff.method),
+        stiff_abort_after: Some(eff.stiff_abort_after),
+        auto_switch: Some(eff.auto_switch),
+    })
+}
+
+/// The step `difference` takes per unit of `1 + |η|`, and the tolerance it runs at (#2701).
+///
+/// `H` enters FOCE/FOCEI through `log|Ω⁻¹ + HᵀR⁻¹H|`, so integration error in `H` raises the
+/// objective at an unchanged mode and residuals: on the neutropenia model, `H` differenced at
+/// the fit's tolerance cost 30 OFV on 256 subjects and about 1450 on 5111. The predictions
+/// and the EBE search keep the fit's tolerance, exactly as beside an exact analytic Jacobian.
+///
+/// The override reaches this thread alone, which is all the differences use: they run inside
+/// one subject's work, on one worker.
+///
+/// A tighter solve can fail where the fit's own does not, and a failed one need not look
+/// failed: a segment that runs out of `ode_max_steps` or `ode_stiff_abort_after` is padded with
+/// its last state, and a step force-accepted at `min_dt` finishes the segment over the error
+/// test, so either way the difference stays finite without meeting the tolerance. So the pass
+/// is accepted only if it is finite and the trajectories it **kept** have no unfinished segment
+/// and no clamped step. An `auto` attempt the guard discarded and re-solved cleanly does not
+/// count against it. Otherwise it is redone at the fit's own settings with the same step, and
+/// counted in [`FD_H_REDONE`], which is how the fit reports it to the user.
+fn with_fd_jacobian_integration(
+    model: &CompiledModel,
+    mut difference: impl FnMut(f64) -> DMatrix<f64>,
+) -> DMatrix<f64> {
+    let step = if model.integrator_spec().is_some() {
+        ODE_FD_JACOBIAN_STEP
+    } else {
+        FD_JACOBIAN_STEP
+    };
+    if let Some(tight) = fd_jacobian_ode_override(model) {
+        let stats = crate::ode::solver::SolverStatsScope::enter();
+        let h = {
+            let _tight = crate::ode::solver::arm_ode_solver_override(tight);
+            difference(step)
+        };
+        let solved = stats.collected();
+        let met_tolerance =
+            solved.kept_unfinished_segments() == 0 && solved.kept_clamped_steps() == 0;
+        if met_tolerance && h.iter().all(|v| v.is_finite()) {
+            return h;
+        }
+        FD_H_REDONE.with(|c| c.set(c.get() + 1));
+    }
+    difference(step)
+}
+
+thread_local! {
+    /// FD Jacobians on this thread that [`with_fd_jacobian_integration`] redid at the fit's
+    /// tolerance. Read as a difference around one subject's `H`, on the thread that built it.
+    static FD_H_REDONE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// FD Jacobians redone on this thread so far, read on either side of building one `H`.
+fn fd_h_redone_on_this_thread() -> usize {
+    FD_H_REDONE.with(|c| c.get())
+}
+
+/// How many subjects' `H` at the final estimates fell back to the fit's own settings because
+/// the Jacobian's pass could not meet its tolerance (#2701). Not for a `[mixture]` fit, whose
+/// objective reads every contributing class's `H`: `mixture_ofv` reads
+/// [`EbeResult::fd_h_redone`] for those.
+///
+/// A second pass over the subjects, because no objective evaluation carries a report out of
+/// the inner loop, and because the reported objective reads this `H` and no earlier one. It
+/// builds `H` through [`ebe_h_matrix_of`], the route the fit took, so a subject on an exact
+/// Jacobian counts nothing, at the cost of one first-order sweep per subject.
+///
+/// `0` without building anything on a model that never integrates. A subject the fit reported
+/// no EBE or no κ̂ for is skipped.
+pub(crate) fn fd_h_subjects_redone(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    etas: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> usize {
+    use rayon::prelude::*;
+    if fd_jacobian_ode_override(model).is_none() {
+        return 0;
+    }
+    population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .filter(|&(i, subject)| {
+            let Some(eta) = etas.get(i) else {
+                return false;
+            };
+            let subject_kappas = kappas.get(i).map_or(&[][..], Vec::as_slice);
+            if iov_h_route(model, subject) && subject_kappas.is_empty() {
+                return false;
+            }
+            let before = fd_h_redone_on_this_thread();
+            ebe_h_matrix_of(model, subject, params, eta.as_slice(), subject_kappas);
+            fd_h_redone_on_this_thread() > before
+        })
+        .count()
+}
+
 /// Compute Jacobian H = d(predictions)/d(eta) via finite differences.
 /// H is n_obs x n_eta.
 ///
@@ -7297,30 +7470,32 @@ fn compute_jacobian_fd(
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
-    let eps = 1e-6;
 
-    let mut h = DMatrix::zeros(n_obs, n_eta);
-    let mut eta_pert = eta.to_vec();
+    let mut h = with_fd_jacobian_integration(model, |eps| {
+        let mut h = DMatrix::zeros(n_obs, n_eta);
+        let mut eta_pert = eta.to_vec();
 
-    for j in 0..n_eta {
-        let h_step = eps * (1.0 + eta[j].abs());
+        for j in 0..n_eta {
+            let h_step = eps * (1.0 + eta[j].abs());
 
-        eta_pert[j] = eta[j] + h_step;
-        let preds_plus = pk::compute_predictions_with_tv_into_with_schedule(
-            model, subject, theta, &eta_pert, scratch, schedule,
-        );
+            eta_pert[j] = eta[j] + h_step;
+            let preds_plus = pk::compute_predictions_with_tv_into_with_schedule(
+                model, subject, theta, &eta_pert, scratch, schedule,
+            );
 
-        eta_pert[j] = eta[j] - h_step;
-        let preds_minus = pk::compute_predictions_with_tv_into_with_schedule(
-            model, subject, theta, &eta_pert, scratch, schedule,
-        );
+            eta_pert[j] = eta[j] - h_step;
+            let preds_minus = pk::compute_predictions_with_tv_into_with_schedule(
+                model, subject, theta, &eta_pert, scratch, schedule,
+            );
 
-        for i in 0..n_obs {
-            h[(i, j)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
+            for i in 0..n_obs {
+                h[(i, j)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
+            }
+
+            eta_pert[j] = eta[j];
         }
-
-        eta_pert[j] = eta[j];
-    }
+        h
+    });
 
     // Overwrite FREM pseudo-observation rows with exact analytical Jacobian.
     // For FREMTYPE > 0 observations, prediction = theta[k] + eta[m], so
@@ -7626,6 +7801,7 @@ fn cancelled_ebe_placeholder(
     EbeResult {
         eta,
         h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+        fd_h_redone: false,
         terminal_hessian: None,
         converged: false,
         used_fallback: false,
@@ -7783,6 +7959,10 @@ mod tests;
 #[cfg(test)]
 #[path = "inner_optimizer_iov_tests.rs"]
 mod iov_tests;
+
+#[cfg(test)]
+#[path = "inner_optimizer_fd_jacobian_tests.rs"]
+mod fd_jacobian_tests;
 
 #[cfg(test)]
 #[path = "inner_optimizer_screen_tests.rs"]

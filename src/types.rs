@@ -5339,6 +5339,18 @@ impl CompiledModel {
         self.ode_spec.is_some() || self.absorption_ode_equivalent.is_some()
     }
 
+    /// The spec this model integrates on: its own, or for a closed form its absorption twin's
+    /// (a model has one or the other). `None` for a model that never integrates. The twin
+    /// counts even when no current subject reaches it, since the flip-flop reroute is decided
+    /// per `(θ, η)` and can reach it at a perturbed point only (#520 review).
+    pub(crate) fn integrator_spec(&self) -> Option<&crate::ode::predictions::OdeSpec> {
+        self.ode_spec.as_ref().or_else(|| {
+            self.absorption_ode_equivalent
+                .as_ref()
+                .and_then(|eq| eq.built().ode_spec.as_ref())
+        })
+    }
+
     /// Returns true for a **compartment-free** (`$PRED`-equivalent) model — one
     /// whose `[structural_model]` declares its prediction as an equation with no
     /// compartments underneath (issue #811).
@@ -7575,6 +7587,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // placed with the other token arm, ahead of the prose ones — the message names
         // methods and quotes counters, and "did not converge" style prose could plausibly be
         // added to it later without anyone remembering this chain exists.
+        (WarningSeverity::Warning, WarningCode::OdeSolver)
+    } else if lower.contains("w_fd_jacobian_not_tightened") {
+        // #2701: a finite-difference `H` at the final estimates ran at the fit's tolerance
+        // because the Jacobian's tighter solve could not finish. Its own token, ahead of the
+        // prose arms: the message says "finite-difference" and "objective".
         (WarningSeverity::Warning, WarningCode::OdeSolver)
     } else if lower.contains("w_nonfinite_objective") {
         // #1303: the convergence verdict was demoted because the objective at

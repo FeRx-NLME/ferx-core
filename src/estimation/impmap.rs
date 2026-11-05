@@ -4034,6 +4034,7 @@ fn run_mcem_mixture(
     let mixture_posteriors = Some(crate::estimation::outer_optimizer::MixturePosteriors {
         pmix: meval.pmix,
         mixest: meval.mixest,
+        n_fd_h_redone: meval.n_fd_h_redone,
     });
 
     // ---- Covariance step (mixture-aware) ----

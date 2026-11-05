@@ -287,6 +287,22 @@ upstream with a clear error rather than silently falling back.
 
 Other per-subject FD fallbacks include an `input_rate` forcing combined with an SDE `[diffusion]` block, or `weibull` combined with an estimated lagtime (its onset can diverge for shape `β < 1`). IIV-on-residual-error combined with **M3 BLOQ** is analytic on both loops on ODE models too (`ode_iiv_on_ruv_with_m3_and_closed_form_ss_with_lag_are_analytic`).
 
+### The FD Jacobian of an integrated model {#fd-jacobian-tolerance}
+
+The objective's $H = \partial f / \partial \eta$ comes from an exact Jacobian wherever one serves the model. Otherwise, under `gradient = fd` or for a model the recorders decline, it is a central difference. Integration error reaches that difference as error divided by the step, and from there the determinant term, so it raises the objective at an unchanged mode and residuals.
+
+So on a model with an integrator, $H$ is differenced with a step of `1e-3` per unit of $1 + |\eta|$, at no looser than `ode_reltol = 1e-8` / `ode_abstol = 1e-10`, with a step budget 32 times `ode_max_steps`. A closed form keeps a step of `1e-6`. Predictions and the EBE search stay at the fit's tolerance, so a fit's cost barely moves: $H$ is built once per subject per objective, not per inner step. This pass runs on a fit already that tight too, at the fit's own tolerances. If it gives a non-finite $H$, leaves a segment unfinished, or force-accepts a step at the minimum step size, it is redone at the fit's own settings with the same step, and `W_FD_JACOBIAN_NOT_TIGHTENED` reports how many subjects that happened to at the final estimates, counting every class that contributes to a `[mixture]` subject. A redo earlier in the fit is not reported, since the OFV does not read that $H$.
+
+Measured on an 8-state neutropenia model with an `if` in `[odes]`, 5112 subjects, FOCEI, `maxiter = 0`, macOS arm64 ([#2701](https://github.com/FeRx-NLME/ferx-core/issues/2701)). The analytic route scores the same model at −5732.82, and NONMEM 7.5.1 at −5790.14 with its own EBE modes:
+
+| `ode_reltol` / `ode_abstol` | FD route before | FD route now |
+|---|---|---|
+| `1e-4` / `1e-6` (default) | −4283.31 | −5743.79 |
+| `1e-6` / `1e-8` | −617.77 | −5722.75 |
+| `1e-9` / `1e-12` | −5724.52 | −5738.92 |
+
+The spread that remains is the fit's own tolerance acting on predictions and on which EBE mode a subject lands in. It is not specific to the FD route. A state far below `ode_abstol`, as in `log(state + c)` at its floor, has no usable derivative on any route.
+
 ### Moving boundaries and one-sided derivatives {#moving-boundaries}
 
 A moving boundary — a lagged dose arrival, the rate-on of a lagged infusion, an infusion or zero-order window end — is **not a data record**, so it supplies no parameters of its own: it subdivides the interval that the next record terminates, and every piece of that interval runs on that record's snapshot (#1073). A boundary falling *strictly inside* a record interval therefore has the same covariate snapshot on both sides, and the covariate field jump that used to be injected there is simply absent. Any forcing that straddles the instant — another dose's infusion, a zero-order window, a built-in `R_in` — is still carried in both velocities, so the rate and mass jumps stay exact.

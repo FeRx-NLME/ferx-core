@@ -35,6 +35,9 @@ pub struct MixturePosteriors {
     /// `MIXEST_i` — argmax-posterior class per subject, **0-based** (converted to
     /// the 1-based NONMEM convention when written onto `SubjectResult`).
     pub mixest: Vec<usize>,
+    /// [`MixtureEval::n_fd_h_redone`](crate::estimation::mixture::MixtureEval) of the
+    /// evaluation that scored the reported objective.
+    pub(crate) n_fd_h_redone: usize,
 }
 
 pub struct OuterResult {
@@ -1126,6 +1129,7 @@ fn evaluate_at_initial_params(
         let posteriors = MixturePosteriors {
             pmix: m.pmix,
             mixest: m.mixest,
+            n_fd_h_redone: m.n_fd_h_redone,
         };
         (
             m.mixest_etas,
@@ -4907,13 +4911,7 @@ fn decrement_ode_override(
     model: &CompiledModel,
     options: &FitOptions,
 ) -> Option<crate::ode::solver::OdeSolverOverride> {
-    let spec = model.ode_spec.as_ref().or_else(|| {
-        model
-            .absorption_ode_equivalent
-            .as_ref()
-            .and_then(|eq| eq.built().ode_spec.as_ref())
-    })?;
-    let eff = spec.effective_solver_opts();
+    let eff = model.integrator_spec()?.effective_solver_opts();
     if eff.method == crate::ode::OdeMethod::Linear {
         return None;
     }
@@ -8668,6 +8666,7 @@ fn optimize_nlopt_attempt_probed(
                 Some(MixturePosteriors {
                     pmix: m.pmix,
                     mixest: m.mixest,
+                    n_fd_h_redone: m.n_fd_h_redone,
                 }),
             )
         } else {
