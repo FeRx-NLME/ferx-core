@@ -36,8 +36,9 @@
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
 use crate::estimation::impmap::draw_obs_nll;
+use crate::pk::event_driven::EventSchedule;
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
-use crate::stats::likelihood::obs_nll_subject_into;
+use crate::stats::likelihood::{obs_nll_subject_into, obs_nll_subject_into_with_schedule};
 use crate::stats::special::ln_gamma;
 use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::stats::util::{
@@ -747,7 +748,7 @@ pub fn run_importance_sampling(
                     let theta = &params.theta;
                     let sigma = &params.sigma.values;
                     let obs_nll = |b: &[f64], sc: &mut EventPkParams| {
-                        draw_obs_nll(model, subject, theta, sigma, b, sc)
+                        draw_obs_nll(model, subject, theta, sigma, b, None, sc)
                     };
                     adapt_proposal(
                         &obs_nll,
@@ -1752,9 +1753,10 @@ pub(crate) fn subject_is_draws(
     iscale: f64,
     use_sobol: bool,
     mixture: Option<&DefensiveMixture>,
+    schedule: Option<&EventSchedule>,
 ) -> SubjectDraws {
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
-        obs_nll_subject_into(
+        obs_nll_subject_into_with_schedule(
             model,
             subject,
             theta,
@@ -1762,6 +1764,7 @@ pub(crate) fn subject_is_draws(
             model.residual_cov_theta(theta),
             eta,
             scratch,
+            schedule,
         )
     };
     subject_is_draws_with(
@@ -2097,9 +2100,10 @@ pub(crate) fn find_optimal_iscale(
     scratch: &mut EventPkParams,
     iscale_min: f64,
     iscale_max: f64,
+    schedule: Option<&EventSchedule>,
 ) -> f64 {
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
-        obs_nll_subject_into(
+        obs_nll_subject_into_with_schedule(
             model,
             subject,
             theta,
@@ -2107,6 +2111,7 @@ pub(crate) fn find_optimal_iscale(
             model.residual_cov_theta(theta),
             eta,
             scratch,
+            schedule,
         )
     };
     find_optimal_iscale_with(
@@ -2422,7 +2427,7 @@ fn subject_is_estimate_joint(
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectIsOutput {
     let obs_nll =
-        |b: &[f64], sc: &mut EventPkParams| draw_obs_nll(model, subject, theta, sigma, b, sc);
+        |b: &[f64], sc: &mut EventPkParams| draw_obs_nll(model, subject, theta, sigma, b, None, sc);
     subject_is_marginal_with(
         &obs_nll,
         &DVector::from_column_slice(mode_joint),
@@ -3844,6 +3849,7 @@ mod tests {
             1.0,
             true,
             Some(&mix),
+            None,
         );
         let q = sobol_qmc_draws(3, k, seed, nu, true);
         let mut n_broad = 0;
@@ -4042,6 +4048,7 @@ mod tests {
                     1.0,
                     sobol,
                     mixture,
+                    None,
                 )
                 .etas
             };

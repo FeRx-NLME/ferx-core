@@ -12778,6 +12778,19 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "frem_rao_blackwell" => opts.frem_rao_blackwell = parse_bool("frem_rao_blackwell")?,
         "imp_auto" => opts.imp_auto = parse_bool("imp_auto")?,
         "impmap_auto" => opts.impmap_auto = parse_bool("impmap_auto")?,
+        "imp_max_time" | "impmap_max_time" => {
+            let v = parse_f64(key)?;
+            if !(v.is_finite() && v > 0.0) {
+                return Err(format!(
+                    "fit option `{key}` must be a positive number of seconds"
+                ));
+            }
+            if key == "imp_max_time" {
+                opts.imp_max_time = Some(v);
+            } else {
+                opts.impmap_max_time = Some(v);
+            }
+        }
         "iscale_min" => {
             let v = parse_f64("iscale_min")?;
             if v <= 0.0 {
