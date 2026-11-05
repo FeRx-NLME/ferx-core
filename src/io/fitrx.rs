@@ -1060,8 +1060,9 @@ str_enum_map!(
 /// `sir_settings.seed` (see `build_fit_wire`).
 ///
 /// The fields a caller can set by hand get the same treatment: the covariate table's
-/// shape, and `interface_extras`, which is opaque to core but has to be the JSON its
-/// entry's name promises to every other reader of the bundle. The wire's own invariants
+/// shape, each subject's `n_obs` against the prediction rows it heads, and
+/// `interface_extras`, which is opaque to core but has to be the JSON its entry's name
+/// promises to every other reader of the bundle. The wire's own invariants
 /// are checked by `save_fit` on the wire it builds.
 fn check_writable(r: &FitResult) -> Result<(), FitrxError> {
     let refuse = |block: &str, e: crate::estimation::fit_inputs::OutOfDomain| {
@@ -1094,6 +1095,16 @@ fn check_writable(r: &FitResult) -> Result<(), FitrxError> {
                 table.names.len()
             )));
         }
+    }
+    // `ebes.csv` states `n_obs` and `predictions.csv` writes `ipred.len()` rows, and the
+    // reader requires the two to agree.
+    if let Some(s) = r.subjects.iter().find(|s| s.n_obs != s.ipred.len()) {
+        return Err(FitrxError::Unwritable(format!(
+            "subject {:?} has n_obs = {} and {} predictions",
+            s.id,
+            s.n_obs,
+            s.ipred.len()
+        )));
     }
     if let Some(extras) = &r.interface_extras {
         check_interface_extras(extras)?;
@@ -1164,6 +1175,27 @@ fn parent_dir(target: &Path) -> &Path {
     }
 }
 
+/// The file a write to `path` lands in: `path` with any symlink at it followed, including
+/// one whose referent does not exist yet, which `canonicalize` cannot resolve. Only the
+/// last component needs following, as the OS resolves the directories on the way to it.
+fn follow_symlinks(path: &Path) -> std::io::Result<PathBuf> {
+    // Linux's own limit on links in one path resolution.
+    const MAX_LINKS: usize = 40;
+    let mut target = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match std::fs::read_link(&target) {
+            // `join` keeps an absolute link as it is, and puts a relative one where the
+            // OS reads it: against the directory the link is in.
+            Ok(link) => target = parent_dir(&target).join(link),
+            Err(_) => return Ok(target),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "{}: too many levels of symbolic links",
+        path.display()
+    )))
+}
+
 /// Replace the file at `path` with what `write` produces, or leave it as it was.
 ///
 /// `write` fills a temporary file in the target's directory, which is renamed over the
@@ -1175,7 +1207,7 @@ fn replace_file(
     path: &Path,
     write: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> Result<(), FitrxError> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = follow_symlinks(path)?;
     let existing = std::fs::metadata(&target).ok().map(|m| m.permissions());
     if existing.as_ref().is_some_and(|p| p.readonly()) {
         return Err(FitrxError::Io(std::io::Error::new(
@@ -7897,6 +7929,52 @@ mod tests {
         assert_eq!(std::fs::read(&shared).unwrap(), b"via link");
     }
 
+    /// The link stays a link and its referent appears, as with `File::create`, through a
+    /// chain and a relative link. A link into a missing directory and a cycle both fail
+    /// with the link untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_creates_its_referent() {
+        use std::os::unix::fs::symlink;
+        let is_link = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        let referent = sub.join("real.fitrx");
+        let inner = sub.join("inner.fitrx");
+        let outer = dir.path().join("outer.fitrx");
+        // Relative to `sub`, where the link is, not to the working directory.
+        symlink("real.fitrx", &inner).unwrap();
+        symlink(&inner, &outer).unwrap();
+        replace_file(&outer, |file| file.write_all(b"new")).unwrap();
+        assert_eq!(std::fs::read(&referent).unwrap(), b"new");
+        assert!(is_link(&inner) && is_link(&outer));
+        assert_eq!(
+            dir_names_2696(&sub),
+            ["inner.fitrx", "real.fitrx"],
+            "no temporary file left, and nothing written beside the outer link"
+        );
+
+        let nowhere = dir.path().join("nowhere.fitrx");
+        symlink(dir.path().join("missing/real.fitrx"), &nowhere).unwrap();
+        let err = replace_file(&nowhere, |file| file.write_all(b"x")).unwrap_err();
+        assert!(matches!(err, FitrxError::Io(_)), "{err:?}");
+        assert!(is_link(&nowhere));
+
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+        let err = replace_file(&a, |file| file.write_all(b"x")).unwrap_err();
+        assert!(err.to_string().contains("too many levels"), "{err}");
+        assert!(is_link(&a) && is_link(&b));
+    }
+
     /// An edited file is refused by name with the bundle untouched, the file it hashes
     /// to is accepted, and a fit with no hash has nothing to check against.
     #[test]
@@ -8265,6 +8343,30 @@ mod tests {
             let want = format!("subject 2 (\"S1\") has a different {column} ");
             assert_refused_2696(err, &[&want]);
         }
+    }
+
+    /// `n_obs` alone edited passes every per-observation comparison, and the writer would
+    /// state it in `ebes.csv` above a different number of `predictions.csv` rows. Both
+    /// save paths, since the bundle `load_fit` calls corrupt was reachable through each.
+    #[test]
+    fn an_n_obs_that_is_not_the_prediction_count_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.fitrx");
+        let (r, p) = fixture_2696();
+        let bundle = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
+        let mut fit = load_fit_from_bytes(&bundle).unwrap().fit;
+        fit.subjects[1].n_obs += 1;
+        let want = "subject \"S2\" has n_obs = 3 and 2 predictions";
+
+        let err = save_fit_from_bundle(&fit, &bundle, &out, SaveFitOptions::default());
+        assert_refused_2696(err.unwrap_err(), &[want]);
+        let err = save_fit(&fit, &p, "src\n", &out, SaveFitOptions::default());
+        assert_refused_2696(err.unwrap_err(), &[want]);
+        assert!(!out.exists());
+
+        fit.subjects[1].n_obs -= 1;
+        save_fit_from_bundle(&fit, &bundle, &out, SaveFitOptions::default()).unwrap();
+        load_fit(&out).expect("the unedited count loads");
     }
 
     #[test]
