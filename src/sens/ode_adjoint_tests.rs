@@ -4896,6 +4896,77 @@ fn algebraic_model_matches_reconverged_fd() {
     assert!(fd < FOCE_FD_TOL, "FOCE vs FD {fd:.2e}");
 }
 
+/// #2720: a circadian baseline with the phase random effect inside `cos` and `sin`.
+const CIRCADIAN: &str = r#"
+[parameters]
+  theta TVBASE(120.0, 1.0, 1000.0)
+  theta TVAMP1(0.12, 0.001, 1.0)
+  theta PHS1(0.9, -5.0, 5.0)
+  theta TVAMP2(0.04, 0.001, 1.0)
+  omega ETA_BASE ~ 0.03
+  omega ETA_AMP1 ~ 0.08
+  omega ETA_SHIFT ~ 0.5
+  sigma PROP ~ 0.03 (sd)
+[individual_parameters]
+  BASE  = TVBASE * exp(ETA_BASE)
+  AMP1  = TVAMP1 * exp(ETA_AMP1)
+  SHIFT = ETA_SHIFT
+[structural_model]
+  CIRC = AMP1 * cos(2 * 3.141592653589793 * (TIME + SHIFT) / 24 - PHS1) + TVAMP2 * sin(4 * 3.141592653589793 * (TIME + SHIFT) / 24 - 0.5)
+  y = BASE * (1 + CIRC)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// #2720: `sin`/`cos` with a random effect in the argument, through every order the
+/// recorders read. The FOCE/FOCEI gradient differentiates the lifted `φ′`, the Laplace
+/// exact anchor's taped-Hessian sweep `φ″` (`DualV::lift3`), and the covariance step's
+/// nested dual `φ‴`/`φ⁗` (`DualT::lift3`, `DualH::lift4`) — each against the reconverged
+/// FD of the production objective, which shares no derivative code with the adjoint.
+///
+/// `ω(SHIFT)` is kept small on purpose. The inner objective is periodic in a phase η,
+/// so it can have several modes, and at `ω = 3 h²` the FOCE oracle's re-solve at
+/// `x[0] + 1e-3` landed on a second one (`η̂_SHIFT` 1.71 → 6.11, measured): a 31% "gap"
+/// that was the oracle switching basins, not the adjoint. At `ω = 0.5` the mode is
+/// unique over the stencil.
+#[test]
+fn circadian_sin_cos_matches_reconverged_fd() {
+    let model = crate::parser::model_parser::parse_full_model(CIRCADIAN)
+        .unwrap()
+        .model;
+    assert!(model.is_algebraic());
+    let s = subject(&model, vec![], &TIMES, &[0.1, -0.2, 0.6]);
+    assert!(
+        in_scope(&model, &s),
+        "the compartment-free recorder must serve a sin/cos subject"
+    );
+    // Measured (Linux): FOCEI 6.7e-9, FOCE 7.4e-9, Laplace 3.3e-11, Hessians FOCEI 8.8e-11
+    // and Laplace 1.3e-10 — the oracles' floor; the bounds are this file's shared ones.
+    let g = fd_oracle(&model, &s, true);
+    eprintln!("circadian FOCEI gradient vs reconverged FD {g:.2e}");
+    assert!(g < 1e-5, "FOCEI gradient vs FD {g:.2e}");
+    let g = fd_oracle(&model, &s, false);
+    eprintln!("circadian FOCE gradient vs reconverged FD {g:.2e}");
+    assert!(g < FOCE_FD_TOL, "FOCE gradient vs FD {g:.2e}");
+    let g = fd_oracle_agq(&model, &s, 1, true);
+    eprintln!("circadian Laplace gradient vs reconverged FD {g:.2e}");
+    assert!(g < 1e-5, "Laplace gradient vs FD {g:.2e}");
+    for (objective, name) in [
+        (Objective::Focei, "FOCEI"),
+        (
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+            "Laplace",
+        ),
+    ] {
+        let (fd, _) = hessian_gaps_for(&model, &s, objective);
+        eprintln!("circadian {name} Hessian vs reconverged FD {fd:.2e}");
+        assert!(fd < 1e-5, "{name} Hessian vs FD {fd:.2e}");
+    }
+}
+
 #[test]
 fn mixture_class_gradient_matches_reconverged_fd_under_the_class_guard() {
     let src = r#"

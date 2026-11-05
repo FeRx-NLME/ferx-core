@@ -504,6 +504,8 @@ fn refused_construct(op: Op) -> Option<RhsConstruct> {
         Op::Logit => RhsConstruct::Function("logit"),
         Op::Tanh => RhsConstruct::Function("tanh"),
         Op::Softplus => RhsConstruct::Function("softplus"),
+        Op::Sin => RhsConstruct::Function("sin"),
+        Op::Cos => RhsConstruct::Function("cos"),
         Op::Mod => RhsConstruct::Function("mod"),
         Op::PushTheta(_) => RhsConstruct::Read("a θ"),
         Op::PushThetaGather(_) => RhsConstruct::Read("a θ level"),
@@ -1425,7 +1427,7 @@ impl Builder {
             // reads the RHS is not handed (θ, η, covariates, gathers, network outputs, the
             // mixture class), an out-of-range variable, and the ops whose `f64` meaning the
             // generic primitives do not reproduce bit for bit (`Sqrt`'s `-0.0` guard,
-            // `InvLogit`, `Logit`, `Tanh`, `Softplus`, `Mod`). Listed one by one: a new `Op`
+            // `InvLogit`, `Logit`, `Tanh`, `Softplus`, `Sin`, `Cos`, `Mod`). Listed one by one: a new `Op`
             // must be decided here, not swallowed by a wildcard.
             (
                 Op::PushVar(_)
@@ -1441,6 +1443,8 @@ impl Builder {
                 | Op::Logit
                 | Op::Tanh
                 | Op::Softplus
+                | Op::Sin
+                | Op::Cos
                 | Op::Mod
                 | Op::Jump(_),
                 _,

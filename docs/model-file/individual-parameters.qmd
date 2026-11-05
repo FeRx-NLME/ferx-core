@@ -55,6 +55,7 @@ name from quietly reading as zero and collapsing the formula.
 | `inv_logit()`, `expit()` | `inv_logit(logit(THETA_F) + ETA_F)` |
 | `tanh()` | `tanh(0.4 * (WT - 70) / 12)` |
 | `softplus()` | `softplus(Z_CL)` |
+| `sin()`, `cos()` (radians) | `AMP * cos(2 * 3.141592653589793 * (TIME - PHS) / 24)` |
 | `min(a, b)`, `max(a, b)` | `max(TVCL * WT / 70, 0.1)` |
 | `clamp(x, lo, hi)` | `clamp(ACR20, 0.01, 0.99)` |
 | `present(x)` (condition only) | `if (present(WT)) (WT/70)^0.75 else 1.0` |
@@ -84,8 +85,8 @@ naming the call and listing what is available:
 
 ```
 unknown function `sinh`. Supported: exp, log, ln, sqrt, abs, floor, ceil, round,
-logit, inv_logit, expit, tanh, softplus, min(a, b), max(a, b), clamp(x, lo, hi),
-present(x) (conditions only)
+logit, inv_logit, expit, tanh, softplus, sin, cos, min(a, b), max(a, b),
+clamp(x, lo, hi), present(x) (conditions only)
 ```
 
 Before ferx 0.5 an unrecognised name was silently the **identity**, so
@@ -107,6 +108,46 @@ They run the network's own code. `softplus(x)` is `ln(1 + exp(x))` between
 for `x` above about `709`, and for `x` below about `-37` the `exp(x)` is lost
 when it is added to `1`, so the result is exactly `0` where softplus is the small
 positive `exp(x)`.
+
+### Trigonometric functions: `sin` and `cos` {#trigonometric-functions}
+
+`sin(x)` and `cos(x)` take their argument in **radians**, as NONMEM's `SIN`/`COS`
+and rxode2's do ([#2720](https://github.com/FeRx-NLME/ferx-core/issues/2720)). They
+work wherever the other functions do: `[individual_parameters]`,
+`[structural_model]`, `[scaling]`, `[odes]` and the residual-error expressions. The
+usual use is a circadian rhythm: a baseline with one or more cosine terms, with
+random effects on the amplitude and on the phase:
+
+```
+[individual_parameters]
+  BASE  = TVBASE * exp(ETA_BASE)
+  AMP1  = TVAMP1 * exp(ETA_AMP1)
+  SHIFT = ETA_SHIFT                      # phase shift, hours
+
+[structural_model]
+  CIRC = AMP1 * cos(2 * 3.141592653589793 * (TIME + SHIFT) / 24 - PHS1)
+       + TVAMP2 * sin(4 * 3.141592653589793 * (TIME + SHIFT) / 24 - PHS2)
+  y = BASE * (1 + CIRC)
+```
+
+There is no `PI` constant, so spell π as a literal. A random effect inside the argument is differentiated exactly
+on both loops and in the covariance step, like any other. This model is anchored
+against the same model in NONMEM's `$PRED` (`nonmem_anchor/circadian_cos*.ctl`):
+at fixed parameters the FOCE-I objective agrees to 6e-8 and every η̂ to NONMEM's
+printed precision; fitted to convergence from the same start, estimates agree to
+within 6e-4 and the R-matrix SEs to within 3 % of a NONMEM `$COV` run at tight
+precision (its default-precision `$COV` was up to 30 % off on the phase SEs, against
+ferx's exact and finite-difference Hessians alike).
+
+A phase random effect makes the per-subject (inner) problem periodic in that η, so
+it can have **more than one mode**: with a phase variance of several h², a subject
+can fit about as well shifted by a different amount. Keep the phase ω at a size the
+data supports, and when an η̂ for the phase lands far out in the tail, check that
+subject's fit before trusting it. In `[odes]`, `sin` and `cos` run on the
+right-hand-side interpreter rather than native code, and the fit says so
+([which engine ran it](ode-models.qmd#rhs-route-note)); the results are the same.
+
+### Piecewise-constant functions and `mod` {#piecewise-constant-functions}
 
 `floor`, `ceil` and `round` are piecewise constant, so their analytic derivative
 is **0** away from a step (the integer boundaries are undefined and ignored). A
