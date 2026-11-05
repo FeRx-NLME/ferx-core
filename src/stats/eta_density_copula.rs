@@ -58,6 +58,7 @@ impl<T: PkNum> Mlin<T> {
     }
 
     /// The coefficient of the subset `mask`.
+    #[cfg(test)]
     pub(crate) fn coeff(&self, mask: usize) -> T {
         self.c[mask]
     }
@@ -920,11 +921,13 @@ impl CopulaFamily {
 
     /// `ln c(u)` of a non-elliptical family at `u ∈ (0, 1)^d`, over `T`; `−∞` where the
     /// density is not positive, or not representable (below `≈ e^{−700}`).
+    #[cfg(test)]
     pub(crate) fn log_density<T: PkNum>(self, u: &[T], p: &[T]) -> T {
         CopulaSpec::Family(self).log_density(u, p)
     }
 
     /// One draw of a non-elliptical family ([`CopulaSpec::sample`]).
+    #[cfg(test)]
     pub(crate) fn sample(self, d: usize, p: &[f64], rng: &mut impl rand::Rng) -> Vec<f64> {
         CopulaSpec::Family(self).sample(d, p, rng)
     }

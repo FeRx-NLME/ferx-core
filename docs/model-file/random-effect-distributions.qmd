@@ -111,6 +111,114 @@ Three distributions take a `block_omega`:
 A copula of `normal` margins is the multivariate normal. Every other kind is
 univariate, and a block of it is refused.
 
+## Other copulas
+
+The Gaussian copula above is one of the copulas in
+[Copulas.jl](https://github.com/lrnv/Copulas.jl) 1.0.1, which is what Pumas's
+`@random` block takes through `SklarDist`. ferx supports the rest of that
+catalogue that can be a random-effect prior.
+
+### Two spellings
+
+An **elliptical** copula has its dependence in a correlation matrix, so it stays
+on a `block_omega`. The t copula is `family = t(NU)` on the block's copula, and
+`t()` declares ν:
+
+```
+  block_omega (ETA_CL, ETA_F) = [0.09, 0.01, 0.02] density copula(ETA_CL = gamma, ETA_F = beta(TVF), family = t())
+```
+
+Any **other** copula has its dependence in its own θs. It joins ETAs declared on
+their own `omega` lines, and each ETA keeps its own `density` (or the Gaussian)
+as its margin:
+
+```
+  omega ETA_CL ~ 0.09 density gamma
+  omega ETA_V  ~ 0.04
+  copula (ETA_CL, ETA_V) ~ clayton()        # declares THETA_COP_ETA_CL
+  copula (ETA_KA, ETA_Q) ~ gumbel(THETA_G)
+```
+
+The margins follow the line's order. The ETAs' Ω block stays diagonal, so every
+estimator keeps the off-diagonals at 0. An ETA inside a `block_omega`, an IOV κ,
+and a `truncated` margin are refused.
+
+### Families
+
+The names are Copulas.jl's, lower-cased and without `Copula`. A family is
+`d`-variate up to 8 ETAs unless marked bivariate.
+
+| family | θs | notes |
+|---|---|---|
+| `clayton` | θ > 0 | |
+| `frank` | θ > 0 (any θ ≠ 0 bivariate) | |
+| `gumbel` (`logistic`) | θ ≥ 1 | also the logistic extreme-value copula |
+| `joe` | θ ≥ 1 | |
+| `amh` | θ ∈ [0, 1) ([−1, 1) bivariate) | |
+| `invgaussian` | θ ≥ 0 | |
+| `gumbelbarnett` | θ ∈ [0, θ_d], θ₂ = 1 | θ_d shrinks with d |
+| `bb1`, `bb2`, `bb3`, `bb6`–`bb10` | θ, δ | Joe's two-parameter families |
+| `galambos` | θ > 0 | extreme value |
+| `mixed` | θ ∈ [0, 1] | extreme value |
+| `huslerreiss` | θ > 0 | extreme value, bivariate |
+| `tev` | ν > 0, ρ ∈ (−1, 1) | extremal-t, bivariate |
+| `asymlog` (`tawn`), `asymgalambos` | α, θ₁, θ₂ | extreme value, bivariate |
+| `asymmixed` | θ₁, θ₂ | extreme value, bivariate |
+| `bb4`, `bb5` | θ, δ | Archimax (Clayton / Gumbel over Galambos), bivariate |
+| `fgm` | 2^d − d − 1 interaction θs | ordered by size, then lexicographically |
+| `plackett` | θ > 0 | bivariate |
+| `independent` | — | |
+
+### Constructions
+
+Copulas.jl's constructions over families take the same line. Their θs are named
+explicitly:
+
+```
+  copula (A, B)    ~ survival(clayton(T))             # every coordinate reflected
+  copula (A, B, C) ~ survival(clayton(T), B)          # only B reflected
+  copula (A, B)    ~ rotated90(gumbel(T))             # also rotated180, rotated270
+  copula (A, B)    ~ khoudraji(gumbel(T), W_A, W_B)   # or khoudraji(C₁, C₂, W_A, W_B)
+  copula (A, B)    ~ liebscher(clayton(T1), gumbel(T2), weights(W_A, W_B))
+  copula (A, B, C) ~ nested(clayton(T0), C, clayton(T1)(A, B))
+```
+
+A Liebscher copula of K parts takes the weights of parts 2..K, d each. The first
+part's weight is 1 minus their sum. A nested tree uses one one-parameter family
+throughout, and each node's θ must be at least its parent's (the sufficient
+nesting condition).
+
+### Not supported
+
+Some Copulas.jl copulas cannot be a random-effect prior, because they have no
+density to score:
+
+- the Fréchet bounds (`MCopula`, `WCopula`);
+- Marshall–Olkin, Cuadras–Augé and Raftery, which have singular parts;
+- BC2 and the discrete-spectral extreme-value copulas.
+
+The nonparametric ones (empirical, beta, Bernstein, checkerboard, empirical EV)
+and the generic `WilliamsonGenerator` / `FrailtyGenerator` are estimators of a
+copula or are defined by an arbitrary distribution. They are not parametric
+priors to estimate. `LiouvilleCopula` is not built yet: its density needs
+Williamson transforms of fractional order.
+
+### How it is computed
+
+A copula is written once, as its CDF, over a multilinear dual number with one
+direction per ETA. Its density is the exact mixed partial `∂ᵈC/∂u₁⋯∂u_d`, and
+the same evaluation carries the exact η- and θ-derivatives the estimators use.
+Each family and construction is checked against Copulas.jl 1.0.1 at fixed points
+(`copula_anchor/refs.jl`). The worst relative error is 6.1e-7, for Galambos under
+strong dependence; the Archimedean families alone are within 1.4e-13.
+
+Where the density cannot be represented from the CDF, the copula reads as a wall,
+an infinite objective. That happens below about `e^{−700}`, which BB2 and BB3
+reach at moderate `u`. It also happens far off the diagonal under strong
+dependence, where a tiny density is a difference of O(1) terms: Hüsler–Reiss
+θ = 4 at (0.97, 0.02) has `ln c = −46`. Two of the 630 non-elliptical reference
+points hit a wall, one Hüsler–Reiss and one BB2, both at densities below `e^{−30}`.
+
 ### IOV kappas
 
 A `kappa` line takes the same clause: `kappa K_CL ~ 0.04 density t(NU)`. One
