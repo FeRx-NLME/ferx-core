@@ -6449,7 +6449,9 @@ impl std::fmt::Debug for CompiledModel {
 /// CWRES, and its `ipred` is a probability rather than a concentration. Every column
 /// the Gaussian rows carry but a discrete row cannot define is emitted as an empty
 /// sdtab cell.
-#[cfg(feature = "survival")]
+///
+/// Not behind `survival`, unlike the code that computes it: a `.fitrx` bundle read by a
+/// build without that feature keeps these rows, and writes them back when it is re-saved.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct DiscreteObsDiagnostic {
     /// CMT of the endpoint that produced this record.
@@ -6560,7 +6562,6 @@ pub struct SubjectResult {
     /// Post-fit diagnostics for this subject's **discrete** (binary) endpoint records,
     /// one entry per record (§8.8.5). Empty for models with no discrete endpoint, which
     /// keeps every existing `FitResult` serialization byte-identical.
-    #[cfg(feature = "survival")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discrete_rows: Vec<DiscreteObsDiagnostic>,
     /// Post-fit residuals for this subject's **time-to-event** records, one entry per
@@ -8138,6 +8139,11 @@ pub struct FitResult {
     /// Path to the per-iteration optimizer trace CSV, present when
     /// `FitOptions::optimizer_trace = true`.
     pub trace_path: Option<String>,
+    /// The text of that trace file, read when the fit finished. The file is a
+    /// temporary one, so this is what `.fitrx` carries (as `trace.csv`) and what
+    /// outlives it; `None` when no trace was asked for or the file could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_csv: Option<String>,
     /// Number of outer iterations in which at least one subject had an
     /// unconverged EBE.  Always `0` for SAEM (which uses MH sampling).
     pub ebe_convergence_warnings: u32,
@@ -8222,17 +8228,15 @@ pub struct FitResult {
     pub eta_param_info: Vec<EtaParamInfo>,
     /// Scale of each IOV kappa, parallel to `kappa_names` (see
     /// `CompiledModel::kappa_param_types`, #1643). Picks CV% (log-normal) vs
-    /// SD (additive, logit) for the KAPPA rows. Empty on a `.fitrx` bundle
-    /// saved before #1643, and on a hand-built result; consumers then fall
-    /// back to the log-normal CV%.
+    /// SD (additive, logit) for the KAPPA rows. Empty on a hand-built result;
+    /// consumers then fall back to the log-normal CV%.
     pub kappa_param_types: Vec<EtaParamType>,
     /// The data-derived bindings the fitted model was compiled from (#1621):
     /// each θ level block's observed levels and contrast, and the covariate
     /// statistics behind symbolic `[covariate_model]` centres. Rebuilding the
     /// fitted model on other data — a design for `simulate`, a reloaded
     /// `.fitrx` — needs exactly these, not ones re-resolved from that data.
-    /// Empty for a model with no data-derived binding, and on a `.fitrx`
-    /// bundle saved before #1621; omitted from JSON when empty.
+    /// Empty for a model with no data-derived binding; omitted from JSON when empty.
     #[serde(
         default,
         skip_serializing_if = "crate::parser::model_parser::DataBindings::is_empty"
@@ -8252,6 +8256,12 @@ pub struct FitResult {
     /// non-positive (signals a near-singular parameter space). `None` when
     /// `cov_eigenvalues` is `None`.
     pub cov_condition_number: Option<f64>,
+    /// Which coordinates of [`Self::covariance_matrix`] the step held, parallel to its
+    /// rows (#424), so a held row is told from a degenerate one without reading it off a
+    /// zero diagonal. Empty when there is no matrix, or when the packed layout does not
+    /// have the matrix's dimension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cov_fixed: Vec<bool>,
     /// Whether each BSV eta is lognormally parameterised (`true`) or
     /// additive/unknown (`false`). Parallel to `eta_names` / omega diagonal.
     pub eta_log_transformed: Vec<bool>,
@@ -8290,23 +8300,21 @@ pub struct FitResult {
     /// `[covariates]`, `iov_column`, and the `[data_selection]` clauses with any a
     /// caller added. `run_sir`, `run_covariance` and `load_fit` re-read
     /// `data_path` with these. `Some` when the fit was launched from a data file
-    /// (`fit_from_files`, `prepare_run`, the CLI); `None` for an in-memory `fit()`
-    /// and on a `.fitrx` bundle saved before #1685.
+    /// (`fit_from_files`, `prepare_run`, the CLI); `None` for an in-memory `fit()`.
     #[serde(default)]
     pub reader_settings: Option<crate::api::ReaderSettings>,
     /// A fingerprint of the population `fit()` was given (#1685). Every post-hoc
-    /// step refuses a population that does not match it. `None` on a `.fitrx`
-    /// bundle saved before #1685; a fingerprint from another encoding scheme is
-    /// treated as absent, with a warning.
+    /// step refuses a population that does not match it. `None` on a hand-built
+    /// result; a fingerprint from another encoding scheme is treated as absent, with a
+    /// warning.
     #[serde(default)]
     pub population_fingerprint: Option<PopulationFingerprint>,
     /// The IOV occasion rule the fit derived its occasions under (#1783): the
     /// `iov_occasion` of the options `fit()` ran with, which a file entry point
     /// takes from the caller, not from the model file's `[fit_options]`.
     /// `run_sir` and `run_covariance` derive the population's occasions with it,
-    /// as `fit()` did. `Some` for every fit; `None` on a `.fitrx` bundle saved
-    /// before #1783, for which the post-hoc steps fall back to the model file's
-    /// rule when they read the file.
+    /// as `fit()` did. `Some` for every fit; `None` on a hand-built result, for which
+    /// the post-hoc steps fall back to the model file's rule when they read the file.
     #[serde(default)]
     pub iov_occasion: Option<IovOccasionRule>,
     /// Initial theta values as supplied to the optimizer, parallel to `theta`
@@ -8409,8 +8417,7 @@ pub struct FitResult {
     pub sir_seed: Option<u64>,
     /// Every setting the reported SIR draws were scored under (#1758): the
     /// scale, degrees of freedom, draw counts, seed, inner-loop and ODE
-    /// settings. `None` exactly when SIR did not run, and on a fit fitted or
-    /// loaded from a `.fitrx` written before #1758.
+    /// settings. `None` exactly when SIR did not run.
     ///
     /// [`run_sir`](crate::run_sir) reads it: a setting its caller leaves at the
     /// default is taken from here, so `run_sir` on this fit with default options
@@ -8422,7 +8429,7 @@ pub struct FitResult {
     /// estimates, with its own `inner_tol` (a quadrature stage runs at 1e-8 or tighter)
     /// rather than the top-level one. A trailing evaluator (`agq_eval_only`,
     /// `imp_eval_only`) does not write it, though the reported OFV may be that evaluator's. Set by every `fit()`; `None`
-    /// only on a fit loaded from a `.fitrx` written before #426.
+    /// only on a hand-built result.
     ///
     /// [`run_covariance`](crate::run_covariance) reads it: a setting its caller leaves
     /// at the default is taken from here, so `run_covariance` on this fit with
@@ -8474,6 +8481,12 @@ pub struct FitResult {
     /// (which has no raw rows) or when no `[covariates]` block is declared.
     /// Missing values are `f64::NAN`. See [`CovariateTable`].
     pub covariate_table: Option<CovariateTable>,
+    /// A JSON document holding an interface's own data: the R package's call settings,
+    /// objects a user added beside the fit, and so on. Core stores and returns the text
+    /// byte for byte and never reads it. [`crate::io::fitrx::save_fit`] requires only that
+    /// it is well-formed JSON. `None` until an interface sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_extras: Option<String>,
     /// Echo of the `[covariate_model]` relations with the estimate and SE of
     /// each θ they generated (#1111). Empty when the model declares no
     /// `[covariate_model]` block.
@@ -8505,8 +8518,7 @@ pub struct FitResult {
     /// writes it as `fit.json`'s `packed_estimate` key and
     /// [`load_fit`](crate::io::fitrx::load_fit) reads it back bit-for-bit, so a
     /// `run_covariance` on a reloaded fit repeats the inline step. `FitResult`'s own
-    /// serde still skips it (`#[serde(skip)]`): that is not the bundle format. A
-    /// bundle saved before #1815, or written by ferx-r, loads `None`. Every consumer
+    /// serde still skips it (`#[serde(skip)]`): that is not the bundle format. Every consumer
     /// reads it only when it unpacks bit-for-bit to this result's `theta` / `omega` /
     /// `sigma` / `omega_iov` / `residual_correlations` under the supplied model, so
     /// estimates edited after the fit are evaluated where they now say, never at this
@@ -8526,8 +8538,7 @@ pub struct FitResult {
     /// [`crate::simulate_with_uncertainty`] read it (ahead of `packed_estimate`) to
     /// rebuild the per-class matrices the fit had. `Some` for every estimator that
     /// produces a `[mixture]` fit with at least one override — SAEM included, which
-    /// carries no `packed_estimate`; `None` otherwise, for hand-built results, and
-    /// for a `.fitrx` bundle saved before it was recorded.
+    /// carries no `packed_estimate`; `None` otherwise and for hand-built results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixture_overrides: Option<Vec<f64>>,
     /// The outer optimizer's own verdict on whether the fit left its initial
@@ -8538,8 +8549,7 @@ pub struct FitResult {
     /// loop (BOBYQA, SLSQP, L-BFGS, MMA), and for the built-in BFGS, the trust
     /// region and Gauss-Newton when they report a #2506 start-probe result;
     /// otherwise `None` for those three, and for SAEM / IMP / Bayes / VI, an
-    /// `outer_maxiter = 0` evaluation, hand-built results, and a `.fitrx`
-    /// bundle saved before it was recorded.
+    /// `outer_maxiter = 0` evaluation and hand-built results.
     #[serde(default)]
     pub left_init: Option<bool>,
     /// The fit did not leave its initial estimates (`left_init == Some(false)`),
@@ -8551,16 +8561,14 @@ pub struct FitResult {
     /// previous fit's estimates), which `crate::stalled_at_init` does not call a
     /// stall. `false` whenever that was not shown: the fit left its start, the
     /// restart was inconclusive or had no budget left, the estimator does not run
-    /// the restart (SAEM, IMP, Bayes, VI), or the `.fitrx` bundle predates the
-    /// field. A stall the restart *improved on* is reported
+    /// the restart (SAEM, IMP, Bayes, VI). A stall the restart *improved on* is reported
     /// as the restart's own estimates, which left the start.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stationary_start: bool,
     /// Whether the BSV Ω was estimated as a diagonal (`omega NAME ~ v`, one
     /// packed coordinate per η) or a full Cholesky block (`block_omega`, a
     /// lower triangle) — the packed layout of `covariance_matrix`, which the
-    /// result otherwise does not record. `None` on a `.fitrx` bundle saved
-    /// before it was recorded and on hand-built results; consumers that need
+    /// result otherwise does not record. `None` on hand-built results; consumers that need
     /// the layout (`crate::natural_scale_covariance`) then leave the matrix as
     /// stored rather than guess it from the matrix size.
     #[serde(default)]
@@ -8572,39 +8580,32 @@ pub struct FitResult {
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///
-    /// The checkpoint format does not round-trip per-record discrete-endpoint or
-    /// time-to-event diagnostics (`SubjectResult::discrete_rows`, `SubjectResult::tte_rows`),
-    /// so a restored fit of a binary / categorical or TTE model has none. This flag lets
-    /// [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose model declares a
-    /// binary or a time-to-event endpoint (rows genuinely dropped) while still writing a
-    /// live fit. It must be paired with the model's
-    /// declared endpoints — parsed from [`Self::model_text`] — because the *reconstructed
-    /// population* is not a usable signal: `load_fit` re-reads the data with default
-    /// (Gaussian) routing, so binary DVs come back as continuous observations and no
-    /// [`ObsRecord::DiscreteState`] survives. Runtime-only: `#[serde(skip)]`, so no
-    /// `.fitrx` / JSON / ferx-r format change, and a live fit always carries `false`.
-    /// Removed once diagnostics round-trip (#911).
+    /// The checkpoint format does not round-trip per-record time-to-event diagnostics
+    /// (`SubjectResult::tte_rows`), so a restored fit of a TTE model has none. This flag
+    /// lets [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose model
+    /// declares a time-to-event endpoint (rows genuinely dropped) while still writing a
+    /// live fit. It is paired with the model's declared endpoints, parsed from
+    /// [`Self::model_text`]. Runtime-only: `#[serde(skip)]`, so no `.fitrx` / JSON / ferx-r
+    /// format change, and a live fit always carries `false`. Removed once diagnostics
+    /// round-trip (#911).
     #[serde(skip)]
     pub restored_from_checkpoint: bool,
     /// Free-parameter tally by Delattre class, the inputs to the BIC variants
-    /// (`crate::bic`, #1177). Absent on `.fitrx` bundles saved before this field
-    /// existed; such bundles load with an all-zero tally, for which `bic()`
+    /// (`crate::bic`, #1177). All zero on a hand-built result, for which `bic()`
     /// returns `NaN`.
     #[serde(default)]
     pub bic_inputs: BicInputs,
     /// The θ level blocks declared `profile` (#1065), in declaration order. Their
     /// levels are solved for at every outer evaluation rather than searched by the
     /// optimizer; they still sit in `theta` / `theta_names` and still count in
-    /// `n_parameters` and `bic_inputs`. Empty for a model without one, and on
-    /// `.fitrx` bundles saved before the field existed.
+    /// `n_parameters` and `bic_inputs`. Empty for a model without one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiled_blocks: Vec<String>,
     /// The θ indices of the profiled levels the bounded profile solve ended exactly on
     /// their block's declared box (#2112), ascending. The covariance step holds each at
     /// its bound: its row and column of `covariance_matrix` are zero, its `se_theta` is
     /// `0.0` and printed as not available, as a FIX θ's is, and every other standard error
-    /// is conditional on it. Empty when no level sits on a bound, and on `.fitrx` bundles
-    /// saved before the field existed.
+    /// is conditional on it. Empty when no level sits on a bound.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiled_levels_at_bound: Vec<usize>,
 }
@@ -8761,15 +8762,9 @@ pub struct NeuralNetworkInfo {
     /// vectors. `init` is deliberately **not** recorded — it is a starting value
     /// for the optimizer, superseded by the fitted weights, and says nothing
     /// about what the converged network computes.
-    ///
-    /// `serde(default)` so a `.fitrx` bundle written before this field existed still
-    /// deserialises; such a bundle predates `center`/`scale` entirely, so the empty
-    /// vector it yields means "no transform" and should be read as the identity.
-    #[serde(default)]
     pub input_center: Vec<f64>,
     /// Per-input `scale`, in `input_names` order (all-one when the model declares
     /// no normalisation). See [`NeuralNetworkInfo::input_center`].
-    #[serde(default)]
     pub input_scale: Vec<f64>,
 }
 

@@ -21,7 +21,7 @@ pub struct EnvironmentInfo {
 }
 
 impl Default for EnvironmentInfo {
-    /// Placeholder for `.fitrx` bundles saved before this field existed —
+    /// Placeholder for a result that recorded no environment, such as a hand-built one —
     /// distinguishable from a real detection, which never returns "unknown" arch/OS.
     fn default() -> Self {
         EnvironmentInfo {

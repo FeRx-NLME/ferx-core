@@ -982,11 +982,16 @@ pub ferx_core::io::fitrx::FitrxError::Json(serde_json::error::Error)
 pub ferx_core::io::fitrx::FitrxError::UnsupportedVersion(alloc::string::String)
 pub ferx_core::io::fitrx::FitrxError::Unwritable(alloc::string::String)
 pub ferx_core::io::fitrx::FitrxError::Zip(zip::result::ZipError)
+pub struct ferx_core::io::fitrx::FitVerdicts
+pub ferx_core::io::fitrx::FitVerdicts::estimate_near_boundary: bool
+pub ferx_core::io::fitrx::FitVerdicts::max_abs_correlation: core::option::Option<f64>
+pub ferx_core::io::fitrx::FitVerdicts::stalled_at_init: core::option::Option<bool>
 pub struct ferx_core::io::fitrx::LoadedFit
 pub ferx_core::io::fitrx::LoadedFit::fit: ferx_core::FitResult
 pub ferx_core::io::fitrx::LoadedFit::manifest: ferx_core::io::fitrx::Manifest
 pub ferx_core::io::fitrx::LoadedFit::model_source: alloc::string::String
 pub ferx_core::io::fitrx::LoadedFit::population: core::option::Option<ferx_core::Population>
+pub ferx_core::io::fitrx::LoadedFit::verdicts: ferx_core::io::fitrx::FitVerdicts
 pub struct ferx_core::io::fitrx::Manifest
 pub ferx_core::io::fitrx::Manifest::created_at: alloc::string::String
 pub ferx_core::io::fitrx::Manifest::entries: alloc::vec::Vec<alloc::string::String>
@@ -3314,6 +3319,7 @@ pub ferx_core::types::FitResult::cond_dist: core::option::Option<ferx_core::Cond
 pub ferx_core::types::FitResult::converged: bool
 pub ferx_core::types::FitResult::cov_condition_number: core::option::Option<f64>
 pub ferx_core::types::FitResult::cov_eigenvalues: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::types::FitResult::cov_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::covariance_matrix: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::types::FitResult::covariance_method: core::option::Option<ferx_core::CovarianceMethod>
 pub ferx_core::types::FitResult::covariance_n_evals_estimated: core::option::Option<usize>
@@ -3346,6 +3352,7 @@ pub ferx_core::types::FitResult::importance_sampling: core::option::Option<ferx_
 pub ferx_core::types::FitResult::inits_from_nca: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::input_columns: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::interaction: bool
+pub ferx_core::types::FitResult::interface_extras: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::iov_occasion: core::option::Option<ferx_core::IovOccasionRule>
 pub ferx_core::types::FitResult::iwres_lag1_r: f64
 pub ferx_core::types::FitResult::kappa_fixed: alloc::vec::Vec<bool>
@@ -3438,6 +3445,7 @@ pub ferx_core::types::FitResult::theta_names: alloc::vec::Vec<alloc::string::Str
 pub ferx_core::types::FitResult::theta_transform: alloc::vec::Vec<ferx_core::ThetaTransform>
 pub ferx_core::types::FitResult::total_ebe_fallbacks: u32
 pub ferx_core::types::FitResult::total_ebe_nm_polished: u32
+pub ferx_core::types::FitResult::trace_csv: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::trace_path: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::uses_ode_solver: bool
 pub ferx_core::types::FitResult::uses_sde: bool
@@ -4912,6 +4920,7 @@ pub ferx_core::FitResult::cond_dist: core::option::Option<ferx_core::CondDist>
 pub ferx_core::FitResult::converged: bool
 pub ferx_core::FitResult::cov_condition_number: core::option::Option<f64>
 pub ferx_core::FitResult::cov_eigenvalues: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::FitResult::cov_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::covariance_matrix: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::FitResult::covariance_method: core::option::Option<ferx_core::CovarianceMethod>
 pub ferx_core::FitResult::covariance_n_evals_estimated: core::option::Option<usize>
@@ -4944,6 +4953,7 @@ pub ferx_core::FitResult::importance_sampling: core::option::Option<ferx_core::I
 pub ferx_core::FitResult::inits_from_nca: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::input_columns: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::interaction: bool
+pub ferx_core::FitResult::interface_extras: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::iov_occasion: core::option::Option<ferx_core::IovOccasionRule>
 pub ferx_core::FitResult::iwres_lag1_r: f64
 pub ferx_core::FitResult::kappa_fixed: alloc::vec::Vec<bool>
@@ -5036,6 +5046,7 @@ pub ferx_core::FitResult::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::theta_transform: alloc::vec::Vec<ferx_core::ThetaTransform>
 pub ferx_core::FitResult::total_ebe_fallbacks: u32
 pub ferx_core::FitResult::total_ebe_nm_polished: u32
+pub ferx_core::FitResult::trace_csv: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::trace_path: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::uses_ode_solver: bool
 pub ferx_core::FitResult::uses_sde: bool

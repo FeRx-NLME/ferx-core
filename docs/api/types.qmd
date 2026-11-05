@@ -156,8 +156,11 @@ pub struct FitResult {
     pub n_parameters: usize,      // free packed coordinates (FIX and structural zeros excluded)
     pub bic_inputs: BicInputs,    // free-parameter tally by Delattre class, for `bic()`
     pub left_init: Option<bool>,  // the outer optimizer's own init-escape verdict (#751); NLopt loop only
-    pub omega_is_diagonal: Option<bool>, // packed layout of Ω (diagonal vs `block_omega`); None on older bundles
+    pub omega_is_diagonal: Option<bool>, // packed layout of Ω (diagonal vs `block_omega`); None on hand-built results
     pub kappa_is_diagonal: Option<bool>, // same for the IOV κ block
+    pub cov_fixed: Vec<bool>,     // rows of `covariance_matrix` the step held; empty without a matrix
+    pub trace_csv: Option<String>, // the optimizer trace's text, when `optimizer_trace = true`
+    pub interface_extras: Option<String>, // an interface's own JSON, stored and returned byte for byte
     pub n_iterations: usize,
     pub interaction: bool,
     pub warnings: Vec<String>,

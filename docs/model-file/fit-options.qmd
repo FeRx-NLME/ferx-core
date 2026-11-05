@@ -1073,7 +1073,7 @@ Enable optimizer trace and EBE guard:
 
 ## Optimizer Trace
 
-When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.csv` and the path is stored in `FitResult::trace_path`. Each row is one outer iteration.
+When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.csv` and the path is stored in `FitResult::trace_path`, with the text in `FitResult::trace_csv`. Each row is one outer iteration.
 
 | Column | Populated by | Description |
 |--------|-------------|-------------|

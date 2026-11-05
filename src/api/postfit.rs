@@ -948,6 +948,8 @@ pub(crate) fn compute_subject_results(
                     &params.theta,
                     eta.as_slice(),
                 ),
+                #[cfg(not(feature = "survival"))]
+                discrete_rows: Vec::new(),
                 // TTE per-record residuals at the same EBE, off the curves the OFV
                 // contribution above scored (#901). Empty without a TTE endpoint.
                 #[cfg(feature = "survival")]
