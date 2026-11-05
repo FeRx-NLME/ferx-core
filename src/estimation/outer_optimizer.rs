@@ -4052,7 +4052,8 @@ pub(crate) fn final_inner_solve(
     inner_solve_polled(model, population, params, mu_k, seed, options, None)
 }
 
-/// The cold solve that opens a [`LegStart::ColdModes`] round, or `None` if the fit was
+/// The cold solve at a verified stop ([`verified_stop_owes_a_restart`]), which also seeds a
+/// [`LegStart::ColdModes`] round, or `None` if the fit was
 /// cancelled during it. Unlike a final readout it polls the cancel flag per subject (#574),
 /// and a subject the cancel skipped holds a placeholder, which must not seed a leg.
 fn cold_modes_solve(
@@ -6449,6 +6450,20 @@ pub(crate) fn leg_pass_applies(
     matches!(end, PolishEnd::Settled) && !basin_probe_fired && !cancelled
 }
 
+/// Does a verified stop already belong to a restart, and so take no [`LegStart`] pass? True
+/// when the end of the attempt, were it at this stop, would restart it: a cold solve that
+/// fails the consistency check (#1277) or beats the objective (#1565). A pass could lower the
+/// incumbent just enough to pass those checks, and the restart that would have gone further
+/// would never run. On a simulated 80-subject dataset (`restart_wins.csv`) rounds took a stop at
+/// 778.06, cold 781.31, down to 777.17, consistent and reported converged, where the restarts
+/// from 778.06 reach 775.45. A stop that takes passes is one nothing was going to restart, so
+/// passes never replace a restart. `best` and `cold` are at the attempt's final check's own
+/// terms: `cold` at the fit's `inner_tol`, not the legs'.
+pub(crate) fn verified_stop_owes_a_restart(best: f64, cold: f64) -> bool {
+    !cold_solve_is_consistent(Some(best), cold)
+        || cold_solve_beats_best_seen(Some(cold), Some(best)).is_some()
+}
+
 /// The fit's own state a pass can leave behind, restored when the pass is discarded.
 pub(crate) struct PassState<'a> {
     pub(crate) basin_probe_fired: &'a std::cell::Cell<bool>,
@@ -6462,18 +6477,26 @@ pub(crate) struct PassState<'a> {
 /// leaves nothing behind. Its latch and its #2093 probe describe the point it explored, not
 /// the incumbent, so they go back: a cold round's probe would otherwise stop the Newton round
 /// and send a verified stop to a restart on another point's evidence.
+///
+/// `stop_is_free` is asked once, before the first pass, whether the verified stop may take
+/// passes at all ([`verified_stop_owes_a_restart`]).
 pub(crate) fn drive_leg_passes<V>(
     warm: V,
     end_of: impl Fn(&V) -> PolishEnd,
     cancelled: impl Fn() -> bool,
     state: PassState<'_>,
+    stop_is_free: impl FnOnce() -> bool,
     mut pass: impl FnMut(LegStart, &V) -> V,
 ) -> V {
     let mut verdict = warm;
+    let mut stop_is_free = Some(stop_is_free);
     for start in [LegStart::ColdModes, LegStart::NewtonStep] {
         let probe_fired = state.basin_probe_fired.get();
         if !leg_pass_applies(start, end_of(&verdict), probe_fired, cancelled()) {
             continue;
+        }
+        if stop_is_free.take().is_some_and(|free| !free()) {
+            break;
         }
         let verified_best = state.kept_best.get();
         let verified_latched = state.stagnation_latched.load(Ordering::Relaxed);
@@ -8029,6 +8052,8 @@ fn optimize_nlopt_attempt_probed(
                     true,
                 )
         };
+        // The cold solve at the verified stop: judges the stop, then seeds the cold round.
+        let cold_at_stop = std::cell::RefCell::new(None::<FinalInnerSolve>);
         // Set for the first leg of a pass ([`leg_pass_applies`]).
         let next_start = std::cell::Cell::new(LegStart::Incumbent);
         let mut run_leg = |left: u32| {
@@ -8049,8 +8074,7 @@ fn optimize_nlopt_attempt_probed(
                 LegStart::ColdModes => {
                     let x_inc: Vec<f64> = best_x.iter().zip(&scale).map(|(v, s)| v * s).collect();
                     let p = unpack_params(&x_inc, init_params);
-                    let mu_k = compute_mu_k(model, &p.theta, leg_options.mu_referencing);
-                    let cold = cold_modes_solve(model, population, &p, &mu_k, &leg_options)?;
+                    let cold = cold_at_stop.take()?;
                     let incumbent = best_solve_cl.lock().unwrap();
                     let inc = incumbent.as_ref().filter(|inc| inc.xs == best_x)?;
                     let terms = |etas: &[DVector<f64>],
@@ -8207,6 +8231,42 @@ fn optimize_nlopt_attempt_probed(
                 basin_probe_fired: &basin_probe_fired,
                 stagnation_latched: &stagnation_latched,
                 kept_best: &kept_best_seen,
+            },
+            || {
+                // Clean, as the final check reads it: the cold objective carries no penalty.
+                let incumbent = best_seen
+                    .lock()
+                    .unwrap()
+                    .get()
+                    .map(|b| (b.x.clone(), b.ofv_clean));
+                let Some((best_x, best)) = incumbent.filter(|(x, _)| x.len() == n) else {
+                    return false;
+                };
+                let x_inc: Vec<f64> = best_x.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                let p = unpack_params(&x_inc, init_params);
+                let mu_k = compute_mu_k(model, &p.theta, options.mu_referencing);
+                let Some(cold) = cold_modes_solve(model, population, &p, &mu_k, options) else {
+                    return false;
+                };
+                let cold_ofv = 2.0
+                    * pop_nll_opts(
+                        model,
+                        population,
+                        &p,
+                        &cold.etas,
+                        &cold.h_mats,
+                        &cold.kappas,
+                        options,
+                    );
+                let owed = verified_stop_owes_a_restart(best, cold_ofv);
+                if verbose && owed {
+                    eprintln!(
+                        "Verified stop at OFV {best:.6}, cold {cold_ofv:.6}: left to its \
+                         restart, no further rounds."
+                    );
+                }
+                *cold_at_stop.borrow_mut() = Some(cold);
+                !owed
             },
             |start, verified| {
                 next_start.set(start);

@@ -450,9 +450,12 @@ round ended several OFV above the incumbent.
 
 On a fit whose modes do not depend on the start and which sits at its optimum, the two checks cost
 one inner pass and one gradient pass, and no leg. That was every bundled example that reached a
-leg. Over 60 simulated sparse datasets, 13 to 15 ended lower
-and one ended higher: its passes lowered the incumbent enough for the stop to be accepted, so the
-#1277 restart that would have reached a lower point did not run.
+leg.
+
+A stop that a restart would take takes no round: one whose cold solve is inconsistent with it, or
+beats it. A round could lower such a stop just enough to pass those checks, and the restart that
+would have gone further would never run. On one simulated dataset, rounds took a stop at 778.06
+(cold 781.31) to 777.17, reported converged, where the restarts reach 775.45.
 
 #### Inner searches stuck at their mode {#inner-search-stuck-at-mode}
 

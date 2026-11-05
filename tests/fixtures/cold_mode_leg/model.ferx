@@ -3,7 +3,8 @@
 #   cold_wins.csv    a leg from the cold modes ends below the verified incumbent
 #   cold_loses.csv   it ends far above it
 #   newton_wins.csv  a leg from the capped Newton step ends below it
-#   both_rounds.csv  15 subjects, both rounds run: the one fit of these a PR pays for
+#   restart_wins.csv rounds would reach less than the restart they would suppress
+#   both_rounds.csv  20 subjects, both rounds run: the one fit of these a PR pays for
 
 [parameters]
   theta TVCL(4.0, 0.1, 30.0)

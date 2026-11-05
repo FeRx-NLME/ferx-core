@@ -15485,8 +15485,9 @@ fn cold_mode_fit(csv: &str, off: &'static [LegStart]) -> (OuterResult, Vec<Unpro
     )
 }
 
-/// #2645, the one fit a PR runs: both rounds open and run legs of their own, on the cheapest
-/// of 160 simulated datasets that takes both (15 subjects). What the rounds gain, and what a
+/// #2645, the one fit a PR runs: both rounds open and run legs of their own, on the simulated
+/// dataset that did so most steadily of twelve tried on both platforms (20 subjects, six legs
+/// and 196.7247 on Linux aarch64 and macOS arm64, ~0.5 s). What the rounds gain, and what a
 /// losing round leaves, is pinned by the `slow-tests` pairs below.
 #[test]
 fn a_verified_stop_runs_both_rounds() {
@@ -15542,6 +15543,7 @@ fn a_discarded_round_leaves_its_probe_and_latch_behind() {
                 stagnation_latched: &latched,
                 kept_best: &kept,
             },
+            || true,
             |start, _| fake.run(start, start == LegStart::ColdModes && cold_wins),
         );
         let ran = fake.ran.borrow().clone();
@@ -15554,6 +15556,70 @@ fn a_discarded_round_leaves_its_probe_and_latch_behind() {
         (vec![LegStart::ColdModes], true, true),
         "a kept round's probe stands, and goes to the restart"
     );
+}
+
+/// #2645 review r2: a stop that owes a restart takes no round, and the question costs its
+/// cold solve only where a round would otherwise run: not on a stop the legs did not settle.
+#[test]
+fn a_stop_that_owes_a_restart_takes_no_round() {
+    let run = |end: PolishEnd, free: bool| {
+        let (probe, latched) = (
+            std::cell::Cell::new(false),
+            std::sync::atomic::AtomicBool::new(false),
+        );
+        let kept = std::cell::Cell::new(None);
+        let (asked, ran) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        drive_leg_passes(
+            end,
+            |v| *v,
+            || false,
+            PassState {
+                basin_probe_fired: &probe,
+                stagnation_latched: &latched,
+                kept_best: &kept,
+            },
+            || {
+                asked.set(asked.get() + 1);
+                free
+            },
+            |_, v| {
+                ran.set(ran.get() + 1);
+                *v
+            },
+        );
+        (asked.get(), ran.get())
+    };
+    assert_eq!(
+        run(PolishEnd::Settled, true),
+        (1, 2),
+        "asked once, both rounds"
+    );
+    assert_eq!(run(PolishEnd::Settled, false), (1, 0));
+    assert_eq!(run(PolishEnd::BudgetSpent, true), (0, 0));
+}
+
+/// #2645 review r2: the two restarts the final check can file, each on its own side, at the
+/// `restart_wins.csv` numbers and at the rules' own edges.
+#[test]
+fn verified_stop_owes_a_restart_reads_both_restart_causes() {
+    // #1277: a cold solve materially worse, on the consistency check's relative bound.
+    assert!(verified_stop_owes_a_restart(778.06, 781.31));
+    let bound = PLATEAU_CONSISTENCY_REL_TOL * (1.0 + 778.06);
+    assert!(!verified_stop_owes_a_restart(778.06, 778.06 + 0.9 * bound));
+    assert!(verified_stop_owes_a_restart(778.06, 778.06 + 1.1 * bound));
+    // #1565: a cold solve better by more than the basin tolerance.
+    assert!(!verified_stop_owes_a_restart(
+        778.06,
+        778.06 - 0.9 * BASIN_SHIFT_ABS_TOL
+    ));
+    assert!(verified_stop_owes_a_restart(
+        778.06,
+        778.06 - 1.1 * BASIN_SHIFT_ABS_TOL
+    ));
+    // The stop nothing would restart.
+    assert!(!verified_stop_owes_a_restart(778.06, 778.06));
+    // A cold solve with no usable objective is the final check's, not a round's.
+    assert!(verified_stop_owes_a_restart(778.06, f64::NAN));
 }
 
 /// #2645 review: a cancel stops the rounds, between them as at the first. The flag is read
@@ -15576,6 +15642,7 @@ fn a_cancel_starts_no_further_round() {
             stagnation_latched: &latched,
             kept_best: &kept,
         },
+        || true,
         |start, v| {
             ran.borrow_mut().push(start);
             cancelled.set(true);
@@ -15583,6 +15650,32 @@ fn a_cancel_starts_no_further_round() {
         },
     );
     assert_eq!(*ran.borrow(), vec![LegStart::ColdModes]);
+}
+
+/// #2645 review r2, "a round improves, the restart improves more". Rounds would take this
+/// stop from 778.06 (cold 781.31) to 777.17 and report that converged, suppressing the
+/// restarts that reach 775.45. A stop that owes a restart takes no round, so the fit with them
+/// on ends no higher than the fit with them off. Not equal: once the restart has run, its own
+/// stop is free to take rounds, which on Linux end 0.91 lower. Without the gate this reads
+/// +0.79 (Linux aarch64) and +1.72 (macOS arm64).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: two fits to convergence; opt in with --features slow-tests"
+)]
+fn a_round_does_not_take_a_stop_from_its_restart() {
+    let (off, off_legs) = cold_mode_fit("restart_wins.csv", BOTH_PASSES);
+    let (on, on_legs) = cold_mode_fit("restart_wins.csv", &[]);
+    eprintln!("off {} on {}", off.ofv, on.ofv);
+    assert!(on.ofv.is_finite(), "{}", on.ofv);
+    assert!(
+        on.ofv <= off.ofv,
+        "a round must not cost the fit its restart: on {} off {} ({} and {} legs)",
+        on.ofv,
+        off.ofv,
+        on_legs.len(),
+        off_legs.len()
+    );
 }
 
 /// #2645, the side where the cold modes win. Warm legs alone verify the stop on the modes the
@@ -15664,7 +15757,7 @@ fn a_cold_mode_leg_above_the_verified_incumbent_changes_nothing() {
         .fold(f64::INFINITY, f64::min); // nan-ok: `filter_map` keeps only a feasible leg's best
     assert!(verified.is_finite(), "the warm legs ran: {off_legs:?}");
     assert!(
-        on_legs[off_legs.len()..]
+        on_legs
             .iter()
             .filter_map(|l| l.best)
             .any(|b| b > verified + 1.0),
