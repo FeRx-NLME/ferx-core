@@ -96,7 +96,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/outer_optimizer.rs",
-        16,
+        17,
         "the outer optimizer and objective, run on a stage's options; \
          `warm_ebe_start_check` (#2097) runs on the Gauss–Newton stage's options \
          (#2549: the built-in BFGS loop's two standalone `population_eta_dx` reads went \
