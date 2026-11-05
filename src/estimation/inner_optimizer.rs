@@ -3420,24 +3420,38 @@ pub(crate) fn ebe_h_matrices_at(
         .subjects
         .par_iter()
         .enumerate()
-        .map(|(i, subject)| {
-            // The same branch `find_ebe_impl` takes.
-            if model.n_kappa > 0 && !subject.occasions.is_empty() {
-                iov_ebe_h_matrix(model, subject, params, etas[i].as_slice(), &kappas[i])
-            } else {
-                let schedule = cacheable_schedule(model, subject);
-                ebe_h_matrix(
-                    model,
-                    subject,
-                    params,
-                    etas[i].as_slice(),
-                    None,
-                    &mut pk::EventPkParams::default(),
-                    schedule.as_ref(),
-                )
-            }
-        })
+        .map(|(i, subject)| ebe_h_matrix_of(model, subject, params, etas[i].as_slice(), &kappas[i]))
         .collect()
+}
+
+/// Whether `subject`'s `H` is the IOV one: the same branch `find_ebe_impl` takes.
+fn iov_h_route(model: &CompiledModel, subject: &Subject) -> bool {
+    model.n_kappa > 0 && !subject.occasions.is_empty()
+}
+
+/// One subject's `H` at its EBE, by the rule the inner loop finishes with and with no captured
+/// Jacobian. `kappas` is read on the IOV route only.
+fn ebe_h_matrix_of(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+    kappas: &[DVector<f64>],
+) -> DMatrix<f64> {
+    if iov_h_route(model, subject) {
+        iov_ebe_h_matrix(model, subject, params, eta, kappas)
+    } else {
+        let schedule = cacheable_schedule(model, subject);
+        ebe_h_matrix(
+            model,
+            subject,
+            params,
+            eta,
+            None,
+            &mut pk::EventPkParams::default(),
+            schedule.as_ref(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -7299,8 +7313,8 @@ const ODE_FD_JACOBIAN_STEP: f64 = 1e-3;
 /// covariance plateau (`1e-6` / `1e-8`) this one is measured against a difference of step
 /// [`ODE_FD_JACOBIAN_STEP`]: at that step on the same model (256 subjects, `H` resolved at
 /// −289.8764), `1e-7` / `1e-9` left 1.2e-2 OFV, this 5.3e-3, `1e-9` / `1e-12` 2.4e-4.
-const ODE_FD_JACOBIAN_RELTOL: f64 = 1e-8;
-const ODE_FD_JACOBIAN_ABSTOL: f64 = 1e-10;
+pub(crate) const ODE_FD_JACOBIAN_RELTOL: f64 = 1e-8;
+pub(crate) const ODE_FD_JACOBIAN_ABSTOL: f64 = 1e-10;
 
 /// How much the step budget grows under [`fd_jacobian_ode_override`]. Tightening the default
 /// `ode_reltol` 10⁴× costs an order-`p` stepper 10^(4/p) more steps: ~6× for rk45, ~22× for
@@ -7341,8 +7355,12 @@ fn fd_jacobian_ode_override(
 /// The override reaches this thread alone, which is all the differences use: they run inside
 /// one subject's work, on one worker.
 ///
-/// A tighter solve can fail where the fit's own does not: a non-finite result is redone at the
-/// fit's tolerance, with the same step, rather than handing the subject a non-finite `H`.
+/// A tighter solve can fail where the fit's own does not, and a failed one need not look
+/// failed: a segment that runs out of `ode_max_steps` or `ode_stiff_abort_after` is padded with
+/// its last state, so the difference stays finite. So the pass is accepted only if it is finite
+/// **and** its solver counters show every segment finished. Otherwise it is redone at the fit's
+/// tolerance with the same step, and counted in [`FD_H_REDONE`], which is how
+/// [`fd_h_subjects_redone`] reports it to the user.
 fn with_fd_jacobian_integration(
     model: &CompiledModel,
     mut difference: impl FnMut(f64) -> DMatrix<f64>,
@@ -7353,15 +7371,68 @@ fn with_fd_jacobian_integration(
         FD_JACOBIAN_STEP
     };
     if let Some(tight) = fd_jacobian_ode_override(model) {
+        let stats = crate::ode::solver::SolverStatsScope::enter();
         let h = {
             let _tight = crate::ode::solver::arm_ode_solver_override(tight);
             difference(step)
         };
-        if h.iter().all(|v| v.is_finite()) {
+        let finished = stats.collected().unfinished_segments == 0;
+        if finished && h.iter().all(|v| v.is_finite()) {
             return h;
         }
+        FD_H_REDONE.with(|c| c.set(c.get() + 1));
     }
     difference(step)
+}
+
+thread_local! {
+    /// FD Jacobians on this thread that [`with_fd_jacobian_integration`] redid at the fit's
+    /// tolerance. Read as a difference around one subject's `H`, on the thread that built it.
+    static FD_H_REDONE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many subjects' `H` at the final estimates ran at the fit's tolerance because the
+/// Jacobian's own could not finish (#2701).
+///
+/// A second pass over the subjects, because no objective evaluation carries a report out of
+/// the inner loop, and because the reported objective reads this `H` and no earlier one. It
+/// builds `H` through [`ebe_h_matrix_of`], the route the fit took, so a subject on an exact
+/// Jacobian counts nothing, at the cost of one first-order sweep per subject.
+///
+/// `0` without building anything when no tightening applies. `mixest` binds each subject's
+/// fitted class. A subject the fit reported no EBE or no κ̂ for is skipped.
+pub(crate) fn fd_h_subjects_redone(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    etas: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    mixest: Option<&[usize]>,
+) -> usize {
+    use rayon::prelude::*;
+    if fd_jacobian_ode_override(model).is_none() {
+        return 0;
+    }
+    population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .filter(|&(i, subject)| {
+            let Some(eta) = etas.get(i) else {
+                return false;
+            };
+            let subject_kappas = kappas.get(i).map_or(&[][..], Vec::as_slice);
+            if iov_h_route(model, subject) && subject_kappas.is_empty() {
+                return false;
+            }
+            let _class = mixest
+                .and_then(|m| m.get(i))
+                .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+            let before = FD_H_REDONE.with(|c| c.get());
+            ebe_h_matrix_of(model, subject, params, eta.as_slice(), subject_kappas);
+            FD_H_REDONE.with(|c| c.get()) > before
+        })
+        .count()
 }
 
 /// Compute Jacobian H = d(predictions)/d(eta) via finite differences.

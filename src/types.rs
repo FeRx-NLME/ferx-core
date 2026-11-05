@@ -7587,6 +7587,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // methods and quotes counters, and "did not converge" style prose could plausibly be
         // added to it later without anyone remembering this chain exists.
         (WarningSeverity::Warning, WarningCode::OdeSolver)
+    } else if lower.contains("w_fd_jacobian_not_tightened") {
+        // #2701: a finite-difference `H` at the final estimates ran at the fit's tolerance
+        // because the Jacobian's tighter solve could not finish. Its own token, ahead of the
+        // prose arms: the message says "finite-difference" and "objective".
+        (WarningSeverity::Warning, WarningCode::OdeSolver)
     } else if lower.contains("w_nonfinite_objective") {
         // #1303: the convergence verdict was demoted because the objective at
         // the final estimates is `NaN`, infinite, or the clamped divergence

@@ -3060,6 +3060,23 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
+    // The final `H` of an integrated model on the FD route, where the tighter solve the
+    // Jacobian runs at could not finish (#2701). That solve is no part of the prediction
+    // pass, so `ode_solver_stats` above cannot see it.
+    if let Some((msg, entry)) = super::postfit::fd_h_not_tightened_warning(
+        crate::estimation::inner_optimizer::fd_h_subjects_redone(
+            model,
+            population,
+            &result.params,
+            &result.eta_hats,
+            &result.kappas,
+            mixest_classes.as_deref(),
+        ),
+        population.subjects.len(),
+    ) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
     // Twin-less transit/IG absorption closed form whose fitted per-subject EBE crosses
     // into the flip-flop regime — a silently degenerate subject the η = 0 fit-start
     // reject could not catch (#785). Emitted typed at source.

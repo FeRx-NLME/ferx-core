@@ -358,13 +358,14 @@ fn fd_h_of_a_closed_form_is_unchanged() {
     assert!(fd_jacobian_ode_override(&twin).is_some());
 }
 
-/// A difference the tighter solve cannot finish is redone at the fit's tolerance with the same
-/// step; a finite one is not redone.
+/// A tight pass that is non-finite is redone at the fit's tolerance with the same step, and
+/// counted; a clean one is neither.
 #[test]
 fn a_non_finite_tight_jacobian_is_redone_at_the_fits_tolerance() {
     let model = chain_model();
     let spec = model.ode_spec.as_ref().unwrap();
     let fit_reltol = spec.effective_solver_opts().reltol;
+    let redone_before = FD_H_REDONE.with(|c| c.get());
 
     let mut calls = Vec::new();
     let h = with_fd_jacobian_integration(&model, |step| {
@@ -381,6 +382,7 @@ fn a_non_finite_tight_jacobian_is_redone_at_the_fits_tolerance() {
             (ODE_FD_JACOBIAN_STEP, fit_reltol),
         ]
     );
+    assert_eq!(FD_H_REDONE.with(|c| c.get()), redone_before + 1);
 
     let mut calls = 0;
     with_fd_jacobian_integration(&model, |_| {
@@ -388,4 +390,210 @@ fn a_non_finite_tight_jacobian_is_redone_at_the_fits_tolerance() {
         DMatrix::from_element(1, 1, 1.0)
     });
     assert_eq!(calls, 1);
+    assert_eq!(FD_H_REDONE.with(|c| c.get()), redone_before + 1);
+}
+
+/// #2701 review: a tight pass truncated by its step budget stays **finite**, freeze-padded, so
+/// finiteness alone would accept it. The solves here are real ones, cut to 3 steps a segment
+/// while the Jacobian's tolerance is armed.
+#[test]
+fn a_truncated_but_finite_tight_jacobian_is_redone() {
+    let model = chain_model();
+    let spec = model.ode_spec.as_ref().unwrap();
+    let fit_reltol = spec.effective_solver_opts().reltol;
+    let pop = chain_population(1);
+    let s = &pop.subjects[0];
+    let theta = &model.default_params.theta;
+    let eta = eta_of(0);
+    let mut scratch = pk::EventPkParams::default();
+
+    let mut tight_pass = None;
+    let h = with_fd_jacobian_integration(&model, |step| {
+        let tight = spec.effective_solver_opts().reltol < fit_reltol;
+        let _cut = tight.then(|| {
+            arm_ode_solver_override(OdeSolverOverride {
+                max_steps: Some(3),
+                ..Default::default()
+            })
+        });
+        let preds = pk::compute_predictions_with_tv_into_with_schedule(
+            &model,
+            s,
+            theta,
+            &eta,
+            &mut scratch,
+            None,
+        );
+        let m = DMatrix::from_vec(preds.len(), 1, preds) * step;
+        if tight {
+            tight_pass = Some(m.clone());
+        }
+        m
+    });
+    let truncated = tight_pass.expect("the tight pass ran");
+    assert!(
+        truncated.iter().all(|v| v.is_finite()),
+        "this fixture needs a finite truncated pass"
+    );
+    assert_ne!(h, truncated, "the truncated pass must not be returned");
+}
+
+/// A chain model pinned where its fit-tolerance solves fit the step budget and the Jacobian's
+/// tighter ones do not, on a stepper whose steps grow fastest with tolerance.
+fn budget_starved_chain() -> CompiledModel {
+    let mut model = pinned_chain(1e-1, 1e-1, STARVED_MAX_STEPS);
+    model.ode_spec.as_mut().unwrap().solver_opts.method = OdeMethod::Rosenbrock23;
+    model
+}
+
+/// Measured on this fixture at `1e-1` / `1e-1`: the fit's tolerance finishes from 25 steps a
+/// segment, and the Jacobian's, at 32 times this, leaves every subject unfinished up to 40,
+/// under IOV and at η = 0 alike.
+const STARVED_MAX_STEPS: usize = 30;
+
+/// #2701 review: the report. On real solves, the fit's tolerance finishes and the Jacobian's
+/// does not, so every subject is counted and the fit carries the warning; with the budget
+/// raised, no subject is.
+#[test]
+fn a_redone_final_h_is_reported_by_the_fit() {
+    let pop = chain_population(4);
+    let etas: Vec<DVector<f64>> = (0..4)
+        .map(|i| DVector::from_column_slice(&eta_of(i)))
+        .collect();
+
+    let mut model = budget_starved_chain();
+    model.gradient_method = GradientMethod::Fd;
+    let params = model.default_params.clone();
+
+    // The straddle the fixture needs: finished at the fit's tolerance.
+    let scope = crate::ode::solver::SolverStatsScope::enter();
+    let mut scratch = pk::EventPkParams::default();
+    for (s, eta) in pop.subjects.iter().zip(&etas) {
+        pk::compute_predictions_with_tv_into_with_schedule(
+            &model,
+            s,
+            &params.theta,
+            eta.as_slice(),
+            &mut scratch,
+            None,
+        );
+    }
+    assert_eq!(scope.collected().unfinished_segments, 0);
+    drop(scope);
+
+    assert_eq!(
+        fd_h_subjects_redone(&model, &pop, &params, &etas, &[], None),
+        4
+    );
+    // A subject with no reported EBE is skipped rather than read out of bounds.
+    assert_eq!(
+        fd_h_subjects_redone(&model, &pop, &params, &etas[..1], &[], None),
+        1
+    );
+
+    let mut roomy = pinned_chain(1e-1, 1e-1, 100_000);
+    roomy.ode_spec.as_mut().unwrap().solver_opts.method = OdeMethod::Rosenbrock23;
+    roomy.gradient_method = GradientMethod::Fd;
+    assert_eq!(
+        fd_h_subjects_redone(&roomy, &pop, &params, &etas, &[], None),
+        0
+    );
+
+    // Already at the Jacobian's tolerance: nothing to redo, and nothing is built.
+    let mut tight = pinned_chain(1e-9, 1e-11, STARVED_MAX_STEPS);
+    tight.gradient_method = GradientMethod::Fd;
+    assert_eq!(
+        fd_h_subjects_redone(&tight, &pop, &params, &etas, &[], None),
+        0
+    );
+}
+
+/// Under IOV the count runs on the IOV `H`, and a subject with no κ̂ is skipped.
+#[test]
+fn a_redone_final_h_is_counted_under_iov() {
+    let mut model = chain_iov_model();
+    let opts = &mut model.ode_spec.as_mut().unwrap().solver_opts;
+    opts.reltol = 1e-1;
+    opts.abstol = 1e-1;
+    opts.max_steps = STARVED_MAX_STEPS;
+    opts.method = OdeMethod::Rosenbrock23;
+    model.gradient_method = GradientMethod::Fd;
+    let pop = chain_population(2);
+    let params = model.default_params.clone();
+    let etas: Vec<DVector<f64>> = (0..2)
+        .map(|i| DVector::from_column_slice(&eta_of(i)))
+        .collect();
+    let kappas: Vec<Vec<DVector<f64>>> = (0..2)
+        .map(|i| {
+            kappas_of(i)
+                .iter()
+                .map(|k| DVector::from_column_slice(k))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        fd_h_subjects_redone(&model, &pop, &params, &etas, &kappas, None),
+        2
+    );
+    assert_eq!(
+        fd_h_subjects_redone(&model, &pop, &params, &etas, &kappas[..1], None),
+        1
+    );
+}
+
+/// A subject on the exact Jacobian takes no FD pass, so it cannot be counted, whatever the
+/// budget. The mutation this catches is a report that forgets the route.
+#[test]
+fn an_exact_h_is_never_counted_as_redone() {
+    let model = budget_starved_chain();
+    assert!(!inner_analytic_opted_out(&model));
+    let pop = chain_population(2);
+    let params = model.default_params.clone();
+    let etas: Vec<DVector<f64>> = (0..2)
+        .map(|i| DVector::from_column_slice(&eta_of(i)))
+        .collect();
+    assert_eq!(
+        fd_h_subjects_redone(&model, &pop, &params, &etas, &[], None),
+        0
+    );
+}
+
+/// End to end: `fit()` carries the warning, typed, in both its channels, and each sentence of
+/// it says what it should.
+#[test]
+fn the_fit_warns_when_its_final_h_ran_at_the_fits_tolerance() {
+    use crate::types::{FitOptions, WarningCode, WarningSeverity};
+    let mut pop = chain_population(4);
+    for s in &mut pop.subjects {
+        s.occasions = Vec::new();
+        s.dose_occasions = Vec::new();
+        s.observations = vec![1.0; s.obs_times.len()];
+    }
+    let mut model = budget_starved_chain();
+    model.gradient_method = GradientMethod::Fd;
+    let params = model.default_params.clone();
+    let options = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    let result = crate::fit(&model, &pop, &params, &options).expect("the evaluation runs");
+    let msg = result
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_FD_JACOBIAN_NOT_TIGHTENED:"))
+        .unwrap_or_else(|| panic!("no FD Jacobian warning in {:?}", result.warnings));
+    for clause in [
+        "4 of 4 subjects' finite-difference Jacobian",
+        "ode_reltol = 1e-8 / ode_abstol = 1e-10",
+        "ran at the fit's own ODE tolerance",
+        "so the OFV may be too high",
+        "Raise ode_max_steps or ode_stiff_abort_after, or name a stiff ode_method",
+    ] {
+        assert!(msg.contains(clause), "missing {clause:?} in {msg}");
+    }
+    let classified = crate::types::classify_warning(msg);
+    assert_eq!(classified.category, WarningCode::OdeSolver);
+    assert_eq!(classified.severity, WarningSeverity::Warning);
 }
