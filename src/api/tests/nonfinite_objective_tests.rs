@@ -3822,7 +3822,8 @@ fn settling_trail(
 #[test]
 fn a_falling_objective_demotes_the_fit_and_asks_for_iterations() {
     use crate::api::postfit::MCEM_NOT_SETTLED_TOKEN;
-    let trail = settling_trail(150, 1036.04, 1005.52, 0.29, "IMP");
+    let mut trail = settling_trail(150, 1036.04, 1005.52, 0.29, "IMP");
+    trail.mc_se[50..100].fill(0.4);
     let mut converged = true;
     let (msg, entry) =
         mcem_settling_warning(&mut converged, Some(&trail), final_marginal(1004.72, 0.23))
@@ -3837,7 +3838,7 @@ fn a_falling_objective_demotes_the_fit_and_asks_for_iterations() {
     assert!(msg.contains("converged: false"), "{msg}");
     assert!(msg.contains("from 1036.04 to 1005.52"), "{msg}");
     assert!(msg.contains("two windows of 50 iterations"), "{msg}");
-    assert!(msg.contains("Monte-Carlo SE 0.29"), "{msg}");
+    assert!(msg.contains("Monte-Carlo SEs 0.40 and 0.29"), "{msg}");
     assert!(msg.contains("short of the optimum"), "{msg}");
     assert!(msg.contains("Raise `imp_iterations`"), "{msg}");
     assert!(!msg.contains("imp_samples"), "{msg}");
@@ -3849,6 +3850,7 @@ fn a_falling_objective_demotes_the_fit_and_asks_for_iterations() {
     assert_eq!(details["window"], 50);
     assert_eq!(details["previous_floor"], 1036.04);
     assert_eq!(details["floor"], 1005.52);
+    assert_eq!(details["previous_mc_se"], 0.4);
     assert_eq!(details["mc_se"], 0.29);
 
     let trail = settling_trail(150, 1036.04, 1005.52, 0.29, "IMPMAP");
@@ -3933,6 +3935,39 @@ fn a_run_too_short_to_test_keeps_its_verdict_and_hears_why() {
     let mut converged = false;
     assert!(mcem_settling_warning(&mut converged, Some(&trail), None).is_some());
     assert!(!converged);
+}
+
+/// A run long enough to test whose trace cannot be read is a different case from a short
+/// one: it is demoted, and it is not told to raise its iterations.
+#[test]
+fn an_unreadable_trace_is_demoted_and_not_blamed_on_its_length() {
+    use crate::api::postfit::{MCEM_NOT_SETTLED_TOKEN, MCEM_SETTLING_UNTESTED_TOKEN};
+    let mut trail = settling_trail(150, 100.0, 100.0, 0.1, "IMP");
+    trail.objectives[100..145].fill(f64::NAN);
+    let mut converged = true;
+    let (msg, entry) = mcem_settling_warning(&mut converged, Some(&trail), None).expect("no note");
+    assert!(!converged);
+    assert!(
+        msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")),
+        "{msg}"
+    );
+    assert!(!msg.contains(MCEM_SETTLING_UNTESTED_TOKEN), "{msg}");
+    assert!(msg.contains("trace cannot be read"), "{msg}");
+    assert!(msg.contains("converged: false"), "{msg}");
+    assert!(msg.contains("last two windows of 50 iterations"), "{msg}");
+    assert!(msg.contains("only 5 finite value(s)"), "{msg}");
+    assert!(msg.contains("reading a window takes 10"), "{msg}");
+    assert!(msg.contains("no usable likelihood"), "{msg}");
+    assert!(msg.contains("before relying on the estimates"), "{msg}");
+    assert!(!msg.contains("imp_iterations"), "{msg}");
+    assert!(!msg.contains("too few to test"), "{msg}");
+    assert_eq!(entry.severity, WarningSeverity::Critical);
+    assert_eq!(entry.category, WarningCode::Convergence);
+    let details = entry.details.as_ref().unwrap();
+    assert_eq!(details["reason"], "unusable_trace");
+    assert_eq!(details["window"], 50);
+    assert_eq!(details["usable"], 5);
+    assert_eq!(details["needed"], 10);
 }
 
 /// A settled run, and a fit with no MCEM stage, leave the verdict alone either way.

@@ -2128,7 +2128,8 @@ pub(crate) fn mcem_marginal_warning(
 /// when no marginal was published, which leaves only the falling-floor test.
 ///
 /// A run too short to test keeps its verdict, and hears that the verdict then only says
-/// the run did not diverge.
+/// the run did not diverge. A run long enough whose trace cannot be read is demoted:
+/// nothing in it shows the run settled.
 pub(crate) fn mcem_settling_warning(
     converged: &mut bool,
     trail: Option<&crate::estimation::impmap::McemObjectiveTrail>,
@@ -2151,10 +2152,29 @@ pub(crate) fn mcem_settling_warning(
             let details = serde_json::json!({ "iterations": n, "needed": needed });
             (WarningSeverity::Warning, msg, details)
         }
+        McemSettling::Unusable { window, usable } => {
+            *converged = false;
+            let msg = format!(
+                "{MCEM_NOT_SETTLED_TOKEN}: {label}: the run's objective trace cannot be read, \
+                 so the fit is reported converged: false. One of its last two windows of \
+                 {window} iterations has only {usable} finite value(s) of objective or \
+                 Monte-Carlo SE, and reading a window takes {MCEM_SETTLE_MIN_WINDOW}. Those \
+                 iterations produced no usable likelihood, so find out why before relying on \
+                 the estimates."
+            );
+            let details = serde_json::json!({
+                "reason": "unusable_trace",
+                "window": window,
+                "usable": usable,
+                "needed": MCEM_SETTLE_MIN_WINDOW,
+            });
+            (WarningSeverity::Critical, msg, details)
+        }
         McemSettling::Falling {
             window,
             previous_floor,
             floor,
+            previous_mc_se,
             mc_se,
         } => {
             *converged = false;
@@ -2162,8 +2182,8 @@ pub(crate) fn mcem_settling_warning(
                 "{MCEM_NOT_SETTLED_TOKEN}: {label}: the objective was still falling when the \
                  run reached its limit of {n} iterations, so the fit is reported converged: \
                  false. Its floor fell from {previous_floor:.2} to {floor:.2} over the last \
-                 two windows of {window} iterations (Monte-Carlo SE {mc_se:.2}), so the \
-                 estimates are likely short of the optimum. Raise `{}`.",
+                 two windows of {window} iterations (Monte-Carlo SEs {previous_mc_se:.2} and \
+                 {mc_se:.2}), so the estimates are likely short of the optimum. Raise `{}`.",
                 trail.iterations_option
             );
             let details = serde_json::json!({
@@ -2171,6 +2191,7 @@ pub(crate) fn mcem_settling_warning(
                 "window": window,
                 "previous_floor": previous_floor,
                 "floor": floor,
+                "previous_mc_se": previous_mc_se,
                 "mc_se": mc_se,
             });
             (WarningSeverity::Critical, msg, details)

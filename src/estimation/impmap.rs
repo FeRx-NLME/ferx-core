@@ -246,12 +246,19 @@ pub(crate) struct FinalMarginal {
 pub(crate) enum McemSettling {
     /// Too few iterations to judge. The verdict stays as it was.
     TooShort,
+    /// Enough iterations, but too few of them finite to read a window. `usable` is the
+    /// count in the worse of the two windows, each `window` iterations long.
+    Unusable {
+        window: usize,
+        usable: usize,
+    },
     Settled,
     /// The objective's floor was still falling at the iteration limit.
     Falling {
         window: usize,
         previous_floor: f64,
         floor: f64,
+        previous_mc_se: f64,
         mc_se: f64,
     },
     /// The iterations stayed well above the marginal of their own final estimates.
@@ -263,16 +270,25 @@ pub(crate) enum McemSettling {
     },
 }
 
-/// The floor of a window of iteration objectives: its lower 10% point, or `None` with
-/// too few finite values to read one. A non-finite iteration is dropped, as
-/// [`lowest_objective`] drops it.
-fn objective_floor(window: &[f64]) -> Option<f64> {
-    let mut finite: Vec<f64> = window.iter().copied().filter(|v| v.is_finite()).collect();
-    if finite.len() < MCEM_SETTLE_MIN_WINDOW {
-        return None;
-    }
+/// The floor of a window of iteration objectives: its lower 10% point. Takes the
+/// window's finite values, so a non-finite iteration is dropped, as [`lowest_objective`]
+/// drops it.
+fn objective_floor(mut finite: Vec<f64>) -> f64 {
     finite.sort_by(f64::total_cmp);
-    Some(finite[(MCEM_FLOOR_QUANTILE * finite.len() as f64) as usize])
+    finite[(MCEM_FLOOR_QUANTILE * finite.len() as f64) as usize]
+}
+
+/// The finite entries of `window`.
+fn finite_values(window: &[f64]) -> Vec<f64> {
+    window.iter().copied().filter(|v| v.is_finite()).collect()
+}
+
+/// How far the objective of a window with MC SE `previous_mc_se` sits above that of one
+/// with `mc_se`, from sampling alone. `log p̂` runs low by half its variance, so −2 log L
+/// runs high by `Σᵢ Var(log p̂ᵢ) = se²/4`. It counts only against the earlier window:
+/// that is the direction `imp_auto` ramps, and the direction that fakes a fall.
+fn sampling_bias_excess(previous_mc_se: f64, mc_se: f64) -> f64 {
+    ((previous_mc_se * previous_mc_se - mc_se * mc_se) / 4.0).max(0.0)
 }
 
 impl McemObjectiveTrail {
@@ -281,11 +297,14 @@ impl McemObjectiveTrail {
     ///
     /// Reads the floor of the last window, and asks two things of it. A gap counts when
     /// it exceeds both [`MCEM_SETTLE_MIN_GAP`] and [`MCEM_SETTLE_NOISE_RATIO`] MC SEs of
-    /// what it compares: the window's for two floors, and that combined with the
-    /// marginal's for a floor and a marginal, which are independent estimates.
+    /// what it compares. Each side brings its own SE, and they combine as independent
+    /// estimates: the two windows' for two floors, the last window's and the marginal's
+    /// for a floor and a marginal.
     ///
     /// * **Is it still falling?** Against the floor of the window before. This is the
-    ///   run that needs more iterations.
+    ///   run that needs more iterations. `imp_auto` can leave that window on fewer
+    ///   samples, which raises its objective with no change in the estimates, so
+    ///   [`sampling_bias_excess`] comes off the fall first.
     /// * **Is it above the marginal?** `marginal` is scored at the final estimates with
     ///   a fresh proposal. Iterations that never come near it were not sampling the
     ///   posterior, so nothing in the trace shows the run reached an optimum. A marginal
@@ -311,6 +330,11 @@ impl McemObjectiveTrail {
     ///
     /// The noise term decides that 3.86, which the minimum alone would convict. It sits
     /// on a good estimate: cefepime's low-ESS subjects keep its objective noisy.
+    ///
+    /// Those runs fix K. Six cold `imp_auto` runs, on warfarin and thioguanine from K =
+    /// 100, 300 and 1000 over 200 iterations, finished ramping by iteration 7, before
+    /// either window, and their floors moved by at most 0.06. So the second window's SE
+    /// and the bias term rest on the derivation, and no real run has exercised a late ramp.
     pub(crate) fn settling(&self, marginal: Option<FinalMarginal>) -> McemSettling {
         use crate::estimation::vi::run::median_and_mad;
         let n = self.objectives.len();
@@ -319,19 +343,34 @@ impl McemObjectiveTrail {
             return McemSettling::TooShort;
         }
         let start = n - window;
-        let (Some(previous_floor), Some(floor), Some((mc_se, _))) = (
-            objective_floor(&self.objectives[start - window..start]),
-            objective_floor(&self.objectives[start..]),
-            median_and_mad(&self.mc_se[start..]),
-        ) else {
-            return McemSettling::TooShort;
+        let previous = start - window..start;
+        let last = start..n;
+        let columns = [
+            finite_values(&self.objectives[previous.clone()]),
+            finite_values(&self.objectives[last.clone()]),
+            finite_values(&self.mc_se[previous]),
+            finite_values(&self.mc_se[last]),
+        ];
+        let usable = columns.iter().map(Vec::len).min().unwrap_or(0);
+        if usable < MCEM_SETTLE_MIN_WINDOW {
+            return McemSettling::Unusable { window, usable };
+        }
+        let [previous_objectives, objectives, previous_se, se] = columns;
+        let (Some((previous_mc_se, _)), Some((mc_se, _))) =
+            (median_and_mad(&previous_se), median_and_mad(&se))
+        else {
+            return McemSettling::Unusable { window, usable };
         };
+        let previous_floor = objective_floor(previous_objectives);
+        let floor = objective_floor(objectives);
         let material = |se: f64| MCEM_SETTLE_MIN_GAP.max(MCEM_SETTLE_NOISE_RATIO * se);
-        if previous_floor - floor > material(mc_se) {
+        let fall = previous_floor - floor - sampling_bias_excess(previous_mc_se, mc_se);
+        if fall > material(mc_se.hypot(previous_mc_se)) {
             return McemSettling::Falling {
                 window,
                 previous_floor,
                 floor,
+                previous_mc_se,
                 mc_se,
             };
         }
@@ -5218,12 +5257,15 @@ mod tests {
     /// The reported values, each distinct so that swapping two fails.
     #[test]
     fn settling_reports_the_floors_it_compared() {
+        let mut falling = two_windows(120.0, 100.0, 0.5);
+        falling.mc_se[50..100].fill(0.75);
         assert_eq!(
-            two_windows(120.0, 100.0, 0.5).settling(None),
+            falling.settling(None),
             McemSettling::Falling {
                 window: 50,
                 previous_floor: 120.0,
                 floor: 100.0,
+                previous_mc_se: 0.75,
                 mc_se: 0.5,
             }
         );
@@ -5263,14 +5305,14 @@ mod tests {
     #[test]
     fn the_floor_ignores_excursions_on_either_side() {
         let mut w = vec![100.0; 50];
-        assert_eq!(objective_floor(&w), Some(100.0));
+        assert_eq!(objective_floor(w.clone()), 100.0);
         w[..5].fill(50.0);
-        assert_eq!(objective_floor(&w), Some(100.0));
+        assert_eq!(objective_floor(w.clone()), 100.0);
         w[5] = 50.0;
-        assert_eq!(objective_floor(&w), Some(50.0));
+        assert_eq!(objective_floor(w.clone()), 50.0);
         let mut w = vec![100.0; 50];
         w[..44].fill(1e6);
-        assert_eq!(objective_floor(&w), Some(100.0));
+        assert_eq!(objective_floor(w.clone()), 100.0);
     }
 
     /// A run needs three windows of ten, and a shorter schedule reads a third of itself.
@@ -5312,9 +5354,6 @@ mod tests {
             t.settling(None),
             McemSettling::Falling { floor, .. } if floor == 100.0
         ));
-        let mut t = two_windows(100.0, 100.0, 0.1);
-        t.objectives[100..145].fill(f64::NAN);
-        assert_eq!(t.settling(None), McemSettling::TooShort);
         let flat = two_windows(100.0, 100.0, 0.1);
         for marginal in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
             assert_eq!(flat.settling(exact(marginal)), McemSettling::Settled);
@@ -5326,17 +5365,106 @@ mod tests {
         }
     }
 
-    /// The window's noise is its median, so one bad iteration's SE cannot excuse a
-    /// falling floor, and iterations before the window do not count.
+    /// Each of the four columns the test reads can leave it unable to read a window, and
+    /// that is `Unusable`, not `TooShort`: the run was long enough. `usable` counts the
+    /// worse window, and ten finite values are enough.
     #[test]
-    fn settling_reads_the_noise_of_the_window_only() {
+    fn settling_tells_an_unusable_trace_from_a_short_one() {
+        let columns: [(fn(&mut McemObjectiveTrail) -> &mut Vec<f64>, usize); 4] = [
+            (|t| &mut t.objectives, 50),
+            (|t| &mut t.objectives, 100),
+            (|t| &mut t.mc_se, 50),
+            (|t| &mut t.mc_se, 100),
+        ];
+        for (column, start) in columns {
+            for (poison, expected) in [(f64::NAN, 9), (f64::INFINITY, 9)] {
+                let mut t = two_windows(100.0, 100.0, 0.1);
+                column(&mut t)[start..start + 41].fill(poison);
+                assert_eq!(
+                    t.settling(None),
+                    McemSettling::Unusable {
+                        window: 50,
+                        usable: expected
+                    },
+                    "column at {start}"
+                );
+            }
+            let mut t = two_windows(100.0, 100.0, 0.1);
+            column(&mut t)[start..start + 40].fill(f64::NAN);
+            assert_eq!(t.settling(None), McemSettling::Settled, "column at {start}");
+        }
+    }
+
+    /// The first third is not read, so nothing there can make a trace unusable.
+    #[test]
+    fn settling_ignores_non_finite_values_before_the_windows() {
+        let mut t = two_windows(100.0, 100.0, 0.1);
+        t.objectives[..50].fill(f64::NAN);
+        t.mc_se[..50].fill(f64::NAN);
+        assert_eq!(t.settling(None), McemSettling::Settled);
+    }
+
+    /// Each window's noise is its own median, so one bad iteration's SE cannot excuse a
+    /// falling floor, and iterations before the windows do not count.
+    #[test]
+    fn settling_reads_the_noise_of_each_window_only() {
         let mut t = two_windows(120.0, 100.0, 0.5);
+        t.mc_se[50..100].fill(0.75);
         t.mc_se[149] = 1e6;
-        t.mc_se[..100].fill(1e6);
+        t.mc_se[99] = 1e6;
+        t.mc_se[..50].fill(1e6);
         assert!(matches!(
             t.settling(None),
-            McemSettling::Falling { mc_se, .. } if mc_se == 0.5
+            McemSettling::Falling { previous_mc_se, mc_se, .. }
+                if previous_mc_se == 0.75 && mc_se == 0.5
         ));
+    }
+
+    /// The case `imp_auto` makes: the earlier window sampled less, so its floor is the
+    /// noisy one and the last window's SE alone would convict. A gap of 20 clears 4 of
+    /// the last window's SEs (0.4) and not 4 of the earlier window's (6).
+    #[test]
+    fn settling_weighs_the_earlier_windows_noise() {
+        let ramped = |previous_se: f64| {
+            let mut t = two_windows(120.0, 100.0, 0.1);
+            t.mc_se[50..100].fill(previous_se);
+            t
+        };
+        assert_eq!(ramped(6.0).settling(None), McemSettling::Settled);
+        assert!(matches!(
+            ramped(0.1).settling(None),
+            McemSettling::Falling { .. }
+        ));
+        // The SEs combine, so a gap clearing each alone can fall short of both: 4 · 3 = 12
+        // and 4 · 3√2 = 16.97, with no bias between equal SEs.
+        let both = |gap: f64| two_windows(100.0 + gap, 100.0, 3.0).settling(None);
+        assert_eq!(both(16.9), McemSettling::Settled);
+        assert!(matches!(both(17.0), McemSettling::Falling { .. }));
+    }
+
+    /// Fewer samples raise the objective by `se²/4` with no change in the estimates,
+    /// which outruns the noise bound once the SE passes 16: at 20 the excess is 100 and
+    /// the bound 80, so a fall has to pass 180.
+    #[test]
+    fn settling_takes_the_sampling_bias_off_the_fall() {
+        let ramped = |fall: f64| {
+            let mut t = two_windows(100.0 + fall, 100.0, 0.0);
+            t.mc_se[50..100].fill(20.0);
+            t.settling(None)
+        };
+        assert_eq!(ramped(90.0), McemSettling::Settled);
+        assert_eq!(ramped(179.9), McemSettling::Settled);
+        assert!(matches!(ramped(180.1), McemSettling::Falling { .. }));
+    }
+
+    /// `se²/4`, on the earlier window only: a noisier last window is no reason to think
+    /// the earlier one sat high, and must not lift the fall either.
+    #[test]
+    fn sampling_bias_counts_only_against_the_earlier_window() {
+        assert_eq!(sampling_bias_excess(4.0, 0.0), 4.0);
+        assert_eq!(sampling_bias_excess(4.0, 2.0), 3.0);
+        assert_eq!(sampling_bias_excess(2.0, 2.0), 0.0);
+        assert_eq!(sampling_bias_excess(0.0, 4.0), 0.0);
     }
 
     /// The final pass draws the configured count while `imp_auto` ramps the iterations,

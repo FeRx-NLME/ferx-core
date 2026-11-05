@@ -223,7 +223,7 @@
 //! | `W_NONFINITE_OBJECTIVE` | the objective at the final estimates is NaN, infinite, or at or above the `1e14` divergence cutoff, so the fit is reported `converged: false` (#1303) |
 //! | `W_NONFINITE_MARGINAL` | the importance-sampling marginal −2 log L at the final estimates is NaN, infinite, or past the divergence cutoffs, so the fit is reported `converged: false` (#2652) |
 //! | `W_MCEM_OBJECTIVE_ROSE` | an IMP / IMPMAP final marginal sits more than 10% of the objective's scale above the lowest value its iterations reached, so the fit is reported `converged: false` (#2652) |
-//! | `W_MCEM_NOT_SETTLED` | an IMP / IMPMAP run stopped at its iteration limit with its objective's floor still falling, or well above the final marginal, so the fit is reported `converged: false` (#2686) |
+//! | `W_MCEM_NOT_SETTLED` | an IMP / IMPMAP run stopped at its iteration limit with its objective's floor still falling, or well above the final marginal, or with too few finite iterations to read, so the fit is reported `converged: false` (#2686) |
 //! | `W_MCEM_SETTLING_UNTESTED` | an IMP / IMPMAP run was too short to test whether its objective settled; the verdict stands, and only says the run did not diverge (#2686) |
 //! | `W_DEGENERATE_CL_V` | the final estimates put a non-positive or non-finite `CL` or `V` on some dose, observation, EVID=2 or EVID=3/4 record of a 1-/2-/3-cpt IV / oral closed-form model; such a record is served 0 (non-positive / infinite) or `NaN` (#2104) |
 //! | `W_EBE_START_DEPENDENT` | the EBEs at the final parameters depend on where the inner loop starts: a cold re-solve scores materially worse or non-finite (#833), lower than the minimised objective (#1565), or the Sobol screen moved subjects (#2013) |
