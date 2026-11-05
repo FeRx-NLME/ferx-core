@@ -22,7 +22,7 @@
 //! branch-wise derivative is exact, so [`is_continuous_select`] exempts them, and `clamp` with
 //! it when its bounds are ordered literals. [`arms_agree_on_switch`] extends that to any `if`
 //! whose arms meet where its condition flips, like `if (rb < C) (C / rb)^0.16 else 1.0`: the
-//! jump in the sensitivity is `(f⁺ − f⁻)·∂τ/∂p`, and a continuous `f` has none. Anything
+//! jump in the sensitivity is `(f⁻ − f⁺)·∂τ/∂p`, and a continuous `f` has none. Anything
 //! neither can prove continuous is reported.
 
 use super::{eval_expression, with_model_time, BinOp, CmpOp, Condition, Expression, Statement};
@@ -241,25 +241,59 @@ const SWITCH_BISECTIONS: usize = 80;
 /// How close to zero `l - r` must get, relative to `1 + |l| + |r|`. A sign change that does
 /// not reach this is a pole, such as `C / x` crossing `x = 0`, not a switch.
 const SWITCH_ROOT_TOL: f64 = 1e-9;
-/// How far apart the arms may sit at a crossing, relative to `1 + |a| + |b|`. Looser than the
-/// root tolerance, which an arm's slope amplifies.
-const SWITCH_ARM_TOL: f64 = 1e-7;
+/// The gap between the arms that is rounding alone, in units of `EPSILON·(|a| + |b|)`.
+const SWITCH_ARM_ULPS: f64 = 16.0;
+/// How far along the segment, as a fraction of it, to step off a crossing to read the gap there.
+const SWITCH_STEP: f64 = 1e-8;
+/// How much smaller the gap must be at the crossing than one [`SWITCH_STEP`] away. Arms that
+/// meet shrink it to rounding, measured at 2.5e-8 at worst; a jump leaves it where it was. A
+/// threshold on the gap itself could not tell these apart: it would pass a small jump between
+/// small arms, and a large one between arms that share a large offset.
+const SWITCH_ARM_SHRINK: f64 = 1e-6;
 
 /// The names an expression reads, or `None` when it holds anything this proof cannot sample:
-/// a nested conditional, or a step function, whose jump could sit outside the sampled range;
-/// and what has no free value here (θ, η, `MIXNUM`, a network output, a level block).
+/// a nested conditional, a step function or `abs`, whose jump or kink could sit outside the
+/// sampled range; and what has no free value here (θ, η, `MIXNUM`, a network output, a level
+/// block).
 fn sampled_names(e: &Expression, names: &mut BTreeSet<String>) -> Option<()> {
     let mut ok = true;
     super::visit_expr_nodes(e, &mut |n| match n {
-        Expression::Variable(v) | Expression::Covariate(v) => {
+        Expression::Variable(v) => {
             names.insert(v.clone());
         }
         Expression::Literal(_) | Expression::Time | Expression::Power(..) => {}
         Expression::BinOp(_, op, _) => ok &= !matches!(op, BinOp::Mod),
-        Expression::UnaryFn(f, _) => ok &= !matches!(f.as_str(), "floor" | "ceil" | "round"),
+        Expression::UnaryFn(f, _) => {
+            ok &= !matches!(f.as_str(), "floor" | "ceil" | "round" | "abs")
+        }
         _ => ok = false,
     });
     ok.then_some(())
+}
+
+/// `true` when `e` is affine in the names it reads.
+fn is_affine(e: &Expression) -> bool {
+    let literal = |e: &Expression| matches!(e, Expression::Literal(_));
+    match e {
+        Expression::Literal(_) | Expression::Variable(_) | Expression::Time => true,
+        Expression::BinOp(a, BinOp::Add | BinOp::Sub, b) => is_affine(a) && is_affine(b),
+        Expression::BinOp(a, BinOp::Mul, b) => {
+            (literal(a) && is_affine(b)) || (is_affine(a) && literal(b))
+        }
+        Expression::BinOp(a, BinOp::Div, b) => is_affine(a) && literal(b),
+        _ => false,
+    }
+}
+
+/// `true` when `l = r` is a single hyperplane: both sides affine, or an affine ratio against a
+/// literal. Sampling sees only a bounded box, so a surface with several components, like
+/// `x * (x - 3000) = 0`, could hide one whose arms miss beyond it. A hyperplane reaches the box
+/// wherever it goes, and arms that agree on part of it agree on all of it if they are analytic,
+/// which is why [`sampled_names`] refuses what is not.
+fn is_one_surface(l: &Expression, r: &Expression) -> bool {
+    let ratio = |e: &Expression| matches!(e, Expression::BinOp(a, BinOp::Div, b) if is_affine(a) && is_affine(b));
+    let literal = |e: &Expression| matches!(e, Expression::Literal(_));
+    (is_affine(l) && is_affine(r)) || (ratio(l) && literal(r)) || (literal(l) && ratio(r))
 }
 
 /// `true` when both arms of `if (l ? r)` agree wherever `l = r`, so the select is continuous
@@ -275,6 +309,9 @@ fn arms_agree_on_switch(c: &Condition, then_e: &Expression, else_e: &Expression)
     let Condition::Compare(l, _, r) = c else {
         return false;
     };
+    if !is_one_surface(l, r) {
+        return false;
+    }
     let mut names = BTreeSet::new();
     for e in [l, r, then_e, else_e] {
         if sampled_names(e, &mut names).is_none() {
@@ -322,7 +359,8 @@ fn arms_agree_on_switch(c: &Condition, then_e: &Expression, else_e: &Expression)
                 hi = mid;
             }
         }
-        let x = at(0.5 * (lo + hi));
+        let t = 0.5 * (lo + hi);
+        let x = at(t);
         let (lv, rv) = (eval(l, &x), eval(r, &x));
         if !((lv - rv).abs() <= SWITCH_ROOT_TOL * (1.0 + lv.abs() + rv.abs())) {
             continue;
@@ -331,7 +369,11 @@ fn arms_agree_on_switch(c: &Condition, then_e: &Expression, else_e: &Expression)
         if !tv.is_finite() && !ev.is_finite() {
             continue;
         }
-        if !((tv - ev).abs() <= SWITCH_ARM_TOL * (1.0 + tv.abs() + ev.abs())) {
+        let miss = (tv - ev).abs();
+        let x_beside = at(t + SWITCH_STEP);
+        let beside = (eval(then_e, &x_beside) - eval(else_e, &x_beside)).abs();
+        let rounding = SWITCH_ARM_ULPS * f64::EPSILON * (tv.abs() + ev.abs());
+        if !(miss <= rounding || miss <= SWITCH_ARM_SHRINK * beside) {
             return false;
         }
         crossings += 1;

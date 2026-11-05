@@ -167,6 +167,16 @@ fn arms_that_meet_at_the_switch_are_exempt() {
         "d/dt(a) = -KE * (if (TIME > LAGT) TIME - LAGT else 0.0)\nd/dt(tau) = 1.0",
         // Arms that read a third name still have to meet for every value of it.
         "d/dt(a) = -(if (tau > LAGT) KE * (tau - LAGT) else 0.0)\nd/dt(tau) = 1.0",
+        // Scaled sides, and a ratio against a literal on either side.
+        "d/dt(a) = -(if (tau * 2.0 > LAGT) tau * 2.0 - LAGT else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -(if (2.0 * tau - 1.0 > LAGT / 2.0) 2.0 * tau - 1.0 - LAGT / 2.0 else 0.0)\n\
+         d/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (1.0 >= LAGT / tau) 1.0 else (LAGT / tau)^0.16)\nd/dt(tau) = 1.0",
+        // One function spelled two ways: the arms differ by rounding, at every point.
+        "d/dt(a) = -(if (tau > LAGT) tau * 3.0 * 0.1 else tau * 0.1 + tau * 0.1 + tau * 0.1)\n\
+         d/dt(tau) = 1.0",
+        // Large arms sharing an offset, meeting to within its rounding and no closer.
+        "d/dt(a) = (if (tau > LAGT) 1e12 + tau - LAGT else 1e12) - 1e12\nd/dt(tau) = 1.0",
     ] {
         assert_eq!(reads(body), Vec::new(), "{body}");
     }
@@ -179,22 +189,41 @@ fn arms_that_miss_at_the_switch_are_not_exempt() {
         // Arms 1 and 2 apart everywhere on the surface.
         "d/dt(a) = -KE * (if (tau < LAGT) (LAGT / tau)^0.16 else 2.0)\nd/dt(tau) = 1.0",
         // A small jump is still a jump.
-        "d/dt(a) = -KE * (if (tau > LAGT) tau - LAGT + 1e-4 else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (tau > LAGT) tau - LAGT + 1e-10 else 0.0)\nd/dt(tau) = 1.0",
+        // So is one between small arms, and one the arms' size would otherwise hide.
+        "d/dt(a) = -KE * (if (tau > LAGT) 1e-9 else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = (if (tau > LAGT) 1000000000001.0 else 1000000000000.0) - 1e12\n\
+         d/dt(tau) = 1.0",
+        // And one beside a steep arm, however it compares with the arm's own growth.
+        "d/dt(a) = -KE * (if (tau > LAGT) 1e-6 + 1e6 * (tau - LAGT) else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (tau > LAGT) 1.0 + 1e7 * (tau - LAGT) else 0.0)\nd/dt(tau) = 1.0",
         // The arms meet at one value of `KE`, not across the surface.
         "d/dt(a) = -(if (tau > LAGT) KE else 1.0)\nd/dt(tau) = 1.0",
         // `|x|` and `x` agree on half the surface: positive draws alone would pass this.
         "d/dt(a) = -KE * (if (tau > LAGT) sqrt(tau * tau) else LAGT)\nd/dt(tau) = 1.0",
         // The arms meet wherever `tau`, `KE` and `a` have an even count of negatives, which
         // is most of the surface: one crossing can pass, and only several reject it.
-        "d/dt(a) = -(if (tau > LAGT) abs(tau) * abs(KE) * abs(a) else LAGT * KE * a)\n\
+        "d/dt(a) = -(if (tau > LAGT) sqrt(tau * tau) * sqrt(KE * KE) * sqrt(a * a) \
+         else LAGT * KE * a)\n\
          d/dt(tau) = 1.0",
-        "d/dt(a) = -(if (LAGT < tau) abs(KE) * abs(a) * abs(LAGT) else KE * a * tau)\n\
+        "d/dt(a) = -(if (LAGT < tau) sqrt(KE * KE) * sqrt(a * a) * sqrt(LAGT * LAGT) \
+         else KE * a * tau)\n\
          d/dt(tau) = 1.0",
         // A step inside an arm can hide its jump above the sampled range.
-        "d/dt(a) = -KE * (if (tau > LAGT) floor(abs(LAGT) / 1e9) else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (tau > LAGT) floor(sqrt(LAGT * LAGT) / 1e9) else 0.0)\nd/dt(tau) = 1.0",
+        // So can a kink.
+        "d/dt(a) = -(if (tau > LAGT) abs(LAGT - 1e9) + LAGT else 1e9)\nd/dt(tau) = 1.0",
         // A nested conditional can too.
         "d/dt(a) = -KE * (if (tau > LAGT) (if (LAGT > 1e9) 1.0 else 0.0) else 0.0)\n\
          d/dt(tau) = 1.0",
+        // The arms meet at `tau = LAGT`, the only part of this surface in the sampled range,
+        // and miss at `tau = LAGT + 3000`.
+        "d/dt(a) = -(if (0.0 < (tau - LAGT) * (tau - LAGT - 3000.0)) tau - LAGT else 0.0)\n\
+         d/dt(tau) = 1.0",
+        // A ratio against a name, and a product of names, are not one hyperplane either.
+        "d/dt(a) = -(if (tau / LAGT > KE) tau / LAGT - KE else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -(if (tau > LAGT / KE) tau - LAGT / KE else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -(if (tau * KE > LAGT) tau * KE - LAGT else 0.0)\nd/dt(tau) = 1.0",
         // A compound condition has no single surface to bisect onto.
         "d/dt(a) = -KE * (if (tau > LAGT && a > 0.0) tau - LAGT else 0.0)\nd/dt(tau) = 1.0",
     ] {
