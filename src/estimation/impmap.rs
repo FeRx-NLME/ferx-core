@@ -203,8 +203,15 @@ fn under_sampling_advice(
     k_start: usize,
     sample_opt: &str,
     auto_opt: &str,
+    only_left_out_noisy: bool,
 ) -> String {
-    if auto && final_k >= AUTO_SAMPLES_MAX {
+    if auto && only_left_out_noisy {
+        format!(
+            "`{auto_opt}` met the MC-SE target on the subjects it samples for; the remaining \
+             noise comes from the subject(s) it left out, named below, so a larger \
+             `{sample_opt}` is unlikely to help."
+        )
+    } else if auto && final_k >= AUTO_SAMPLES_MAX {
         format!(
             "`{auto_opt}` is enabled but the sample count {final_k} (cap {AUTO_SAMPLES_MAX}) \
              was not enough to reach the MC-SE target."
@@ -245,6 +252,137 @@ fn auto_step(
     let may_raise =
         (hold_over || objective_settled(objectives, total_se)) && raises_pay(se_history, k_start);
     (next_sample_count(k, k_start, se, may_raise), se)
+}
+
+/// Effective sample size below which a subject's importance weights are
+/// degenerate: one draw carries the weight, or the sampler failed outright.
+const DEGENERATE_ESS: f64 = 2.0;
+
+/// Whether a subject with ESS fraction `f` at `k` draws is degenerate
+/// (ESS < [`DEGENERATE_ESS`]). Written so a `NaN` fraction reads as degenerate.
+fn is_degenerate(f: f64, k: usize) -> bool {
+    !(f * k as f64 >= DEGENERATE_ESS)
+}
+
+/// Subjects whose degenerate weights more draws have already failed to fix, so
+/// `auto` leaves them out of the sample-count decision (#2690).
+///
+/// A degenerate subject's variance term is about 1 at any K, so one of them keeps
+/// the per-subject SE at `2/√N` or more, above the target for any N below 1600, and
+/// would ramp every subject to the cap. Not every degenerate subject is hopeless: a
+/// proposal that only undersamples the posterior recovers as K grows. So a subject
+/// stays in the decision until, within one unbroken run of degenerate iterations, it
+/// has been degenerate at a K above the lowest K of that run: a raise was tried on it
+/// and did not help. A lowering is no such test, so a subject degenerate first at a
+/// high K and then at a lower one stays in. A failed subject (`f = 0`, which is not a
+/// sampling problem) is left out at once.
+#[derive(Debug, Default)]
+struct StuckSubjects {
+    /// Per subject, its current degenerate run: the lowest K of the run, and
+    /// whether a raise above that K has already failed to help it.
+    runs: Vec<Option<(usize, bool)>>,
+}
+
+impl StuckSubjects {
+    /// Record one iteration's ESS fractions at `k` draws and return, per subject,
+    /// whether it is now left out of the ramp.
+    fn update(&mut self, ess_fracs: &[f64], k: usize) -> Vec<bool> {
+        self.runs.resize(ess_fracs.len(), None);
+        ess_fracs
+            .iter()
+            .zip(self.runs.iter_mut())
+            .map(|(&f, run)| {
+                if !is_degenerate(f, k) {
+                    *run = None;
+                    return false;
+                }
+                let (lo, raised) =
+                    run.map_or((k, false), |(lo, raised)| (lo.min(k), raised || k > lo));
+                *run = Some((lo, raised));
+                !(f > 0.0) || raised
+            })
+            .collect()
+    }
+}
+
+/// The per-subject SE history `auto` acts on, rebuilt from each iteration's ESS
+/// fractions over the subjects not flagged in `stuck` now (#2690).
+///
+/// [`windowed_se`] takes a median over several iterations, so excluding a subject
+/// only from the newest entry would leave it driving raises from the older ones
+/// until the window turned over, which on a one-draw subject among 100 is three
+/// doublings toward the cap. [`raises_pay`] compares against its own baseline the
+/// same way, so the whole history is rebuilt on the current set.
+fn ramp_se_history(ess_history: &[(Vec<f64>, usize)], stuck: &[bool]) -> Vec<(f64, usize)> {
+    ess_history
+        .iter()
+        .map(|(fracs, k)| (ramp_se_per_subject(fracs, *k, stuck).0, *k))
+        .collect()
+}
+
+/// The per-subject objective MC SE over the subjects `auto` acts on, and how many
+/// of them there are: those not flagged in `stuck` (#2690).
+fn ramp_se_per_subject(ess_fracs: &[f64], k: usize, stuck: &[bool]) -> (f64, usize) {
+    let (var, n) = ess_fracs
+        .iter()
+        .zip(stuck)
+        .filter(|(_, &s)| !s)
+        .fold((0.0, 0usize), |(v, n), (&f, _)| {
+            (v + log_marginal_mc_variance(f, k), n + 1)
+        });
+    (2.0 * var.sqrt() / (n.max(1) as f64).sqrt(), n)
+}
+
+/// The lowest-ESS subjects, as `ID (ESS e)`, for the verbose log of a change of K:
+/// it shows which subjects drive a ramp (#2690).
+fn lowest_ess_summary(ids: &[&str], ess_fracs: &[f64], k: usize, n: usize) -> String {
+    let mut order: Vec<usize> = (0..ess_fracs.len()).collect();
+    order.sort_by(|&a, &b| ess_fracs[a].total_cmp(&ess_fracs[b]));
+    order
+        .iter()
+        .take(n)
+        .map(|&i| format!("{} (ESS {:.1})", ids[i], ess_fracs[i] * k as f64))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A list of subject IDs for a warning, truncated after `max` with a count of the
+/// rest.
+fn id_list(ids: &[&str], max: usize) -> String {
+    let shown = ids[..ids.len().min(max)].join(", ");
+    match ids.len().saturating_sub(max) {
+        0 => shown,
+        rest => format!("{shown} and {rest} more"),
+    }
+}
+
+/// The under-sampling warning's sentence on degenerate subjects that are not named as
+/// left out of the ramp. More draws may still recover one whose proposal only
+/// undersamples the posterior, so it makes no claim either way (#2690 review).
+fn collapse_sentence(n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    format!(
+        " {n} subject(s) had a degenerate proposal (ESS < {DEGENERATE_ESS}: one draw carries \
+         the weight, or the sampler failed), whose moments are unreliable at this sample \
+         count — check their EBE/Hessian quality."
+    )
+}
+
+/// The under-sampling warning's sentence naming the subjects `auto` left out of the
+/// sample-count decision; empty when there are none or `auto` is off (#2690).
+fn stuck_subjects_sentence(auto: bool, auto_opt: &str, ids: &[&str]) -> String {
+    if !auto || ids.is_empty() {
+        return String::new();
+    }
+    format!(
+        " `{auto_opt}` left {} subject(s) out of the sample-count decision because more \
+         draws did not lift their ESS above {DEGENERATE_ESS}: {}. Their fix is a better \
+         proposal, not more samples.",
+        ids.len(),
+        id_list(ids, 10)
+    )
 }
 
 /// Refuse an unusable wall-clock limit rather than let a `NaN` never trip it.
@@ -603,8 +741,11 @@ impl McemObjectiveTrail {
 }
 
 /// `Var(log p̂)` of one subject's importance-sampling marginal (Geweke, from the
-/// self-normalized ESS): `(1/ESS_frac − 1)/K`. A degenerate subject gets a finite
-/// fallback.
+/// self-normalized ESS): `(1/ESS_frac − 1)/K`. A failed subject (`ESS_frac = 0`)
+/// gets a finite fallback of 1.
+///
+/// A subject whose single draw dominates has `ESS_frac = 1/K` and a term of
+/// `(K − 1)/K ≈ 1` whatever K is, the same as the fallback (#2690).
 fn log_marginal_mc_variance(ess_fraction: f64, k_samples: usize) -> f64 {
     if ess_fraction > 1e-6 {
         ((1.0 / ess_fraction) - 1.0).max(0.0) / k_samples as f64
@@ -1866,6 +2007,10 @@ fn run_mcem(
     // moment bias (which scales as 1/(K·ESS) and is severe in high dimensions).
     let mut final_ess_median = 1.0_f64;
     let mut final_n_collapsed = 0usize;
+    // Subjects `auto` left out of the sample-count decision at the final E-step.
+    let mut final_stuck_ids: Vec<&str> = Vec::new();
+    let mut stuck_subjects = StuckSubjects::default();
+    let subject_ids: Vec<&str> = population.subjects.iter().map(|s| s.id.as_str()).collect();
     // Effective (possibly ramped) sample count and the final objective MC SE,
     // for the post-fit under-sampling warning.
     let mut final_k_samples = k_samples;
@@ -1882,6 +2027,10 @@ fn run_mcem(
     let mut iteration_objectives: Vec<f64> = Vec::with_capacity(n_iter);
     let mut iteration_mc_se: Vec<f64> = Vec::with_capacity(n_iter);
     let mut iteration_se: Vec<(f64, usize)> = Vec::with_capacity(n_iter);
+    // Each iteration's ESS fractions and K, so `iteration_se` can be rebuilt
+    // when the set of subjects `auto` acts on changes (#2690).
+    let mut ess_history: Vec<(Vec<f64>, usize)> = Vec::new();
+    let mut prev_stuck: Vec<bool> = vec![false; population.subjects.len()];
     // Iterations actually run, and the seconds at which `max_time` stopped them.
     let mut iterations_done = 0usize;
     let mut stopped_after: Option<f64> = None;
@@ -2233,17 +2382,27 @@ fn run_mcem(
         let mc_se_per_subject = mc_se / (ess_fracs.len().max(1) as f64).sqrt();
         final_mc_se = mc_se_per_subject;
         final_k_samples = k_samples;
+        // The ramp acts on the SE without the subjects more draws have not helped,
+        // so one of them cannot send every subject to the cap (#2690).
+        let stuck = stuck_subjects.update(&ess_fracs, k_samples);
         // Adaptive sampling (NONMEM `AUTO`): move K so the M-step is driven by
         // signal, not noise. Raising waits for the objective to settle, because
         // early in a run the proposal lags the parameters and the SE reflects that
         // lag, not what the converged fit needs (#2687).
         if auto {
-            iteration_se.push((mc_se_per_subject, k_samples));
+            let (ramp_se, n_ramp) = ramp_se_per_subject(&ess_fracs, k_samples, &stuck);
+            ess_history.push((ess_fracs.clone(), k_samples));
+            if stuck == prev_stuck {
+                iteration_se.push((ramp_se, k_samples));
+            } else {
+                iteration_se = ramp_se_history(&ess_history, &stuck);
+            }
+            prev_stuck.clone_from(&stuck);
             let (new_k, se) = auto_step(
                 &iteration_objectives,
                 &iteration_se,
                 k_start,
-                ess_fracs.len(),
+                n_ramp,
                 k >= auto_hold_end,
             );
             if verbose && new_k != k_samples {
@@ -2252,15 +2411,34 @@ fn run_mcem(
                 } else {
                     "lowering"
                 };
+                let n_degenerate = ess_fracs
+                    .iter()
+                    .filter(|&&f| is_degenerate(f, k_samples))
+                    .count();
                 eprintln!(
                     "{label}: auto-sampling — iteration {k}, per-subject objective MC SE \
-                     {se:.3} (target {AUTO_STDOBJ_TARGET:.2}), {verb} K {k_samples} → {new_k}"
+                     {se:.3} (target {AUTO_STDOBJ_TARGET:.2}), {verb} K {k_samples} → {new_k}; \
+                     {n_degenerate} subject(s) at ESS < {DEGENERATE_ESS}, {} left out; \
+                     lowest ESS: {}",
+                    ess_fracs.len() - n_ramp,
+                    lowest_ess_summary(&subject_ids, &ess_fracs, k_samples, 5)
                 );
             }
             k_samples = new_k;
         }
         // Track the final E-step's ESS health for the post-fit bias warning.
-        final_n_collapsed = ess_fracs.iter().filter(|&&f| f <= 1e-6).count();
+        // `f ≥ 1/K` whenever any draw has weight, so `f ≤ 1e-6` alone would only
+        // count failed subjects; ESS < 2 also counts a one-draw subject (#2690).
+        final_n_collapsed = ess_fracs
+            .iter()
+            .filter(|&&f| is_degenerate(f, final_k_samples))
+            .count();
+        final_stuck_ids = subject_ids
+            .iter()
+            .zip(&stuck)
+            .filter(|(_, &s)| s)
+            .map(|(&id, _)| id)
+            .collect();
         ess_fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         final_ess_median = ess_fracs.get(ess_fracs.len() / 2).copied().unwrap_or(1.0);
 
@@ -2657,15 +2835,17 @@ fn run_mcem(
         } else {
             ("imp_samples", "imp_auto")
         };
-        let collapse = if final_n_collapsed > 0 {
-            format!(
-                " {} subject(s) had a fully collapsed proposal (ESS ≈ 0), whose moments \
-                 are unreliable regardless of sample count — check their EBE/Hessian quality.",
-                final_n_collapsed
-            )
-        } else {
-            String::new()
-        };
+        // Under `auto` the left-out subjects get their own sentence, which says
+        // more samples will not help them; the collapse sentence counts the rest,
+        // which a larger count may still recover (#2690 review).
+        let named = if auto { final_stuck_ids.len() } else { 0 };
+        let collapse = collapse_sentence(final_n_collapsed.saturating_sub(named));
+        let stuck = stuck_subjects_sentence(auto, auto_opt, &final_stuck_ids);
+        // The noise is all theirs when the subjects `auto` acts on met the target.
+        let only_left_out_noisy = named > 0
+            && iteration_se
+                .last()
+                .is_some_and(|&(se, _)| se <= AUTO_STDOBJ_TARGET);
         let advice = under_sampling_advice(
             auto,
             final_k_samples,
@@ -2673,19 +2853,21 @@ fn run_mcem(
             k_start,
             sample_opt,
             auto_opt,
+            only_left_out_noisy,
         );
         warnings.push(format!(
             "{label}: {} importance samples for {} give a noisy objective \
              (per-subject MC SE = {:.3}, target {:.2}; median ESS/K = {:.2}). The weighted M-step \
              moments then carry a finite-sample bias — typical-value and Ω estimates may be off, \
-             and it shrinks only as the sample count grows. {}{}",
+             and it shrinks only as the sample count grows. {}{}{}",
             final_k_samples,
             sampled_dimension_phrase(n_eta, n_kappa, max_occ),
             final_mc_se,
             AUTO_STDOBJ_TARGET,
             final_ess_median,
             advice,
-            collapse
+            collapse,
+            stuck
         ));
     }
 
@@ -7926,6 +8108,139 @@ mod tests {
     }
 
     #[test]
+    fn is_degenerate_is_ess_below_two() {
+        assert!(is_degenerate(1.0 / 300.0, 300));
+        assert!(is_degenerate(0.0, 300));
+        assert!(is_degenerate(f64::NAN, 300));
+        assert!(!is_degenerate(2.0 / 300.0, 300));
+        assert!(!is_degenerate(0.5, 300));
+    }
+
+    /// The mechanism of #2690: a one-draw subject's term is about 1 at every K, the
+    /// same as a failed subject's fallback, while a healthy subject's falls as 1/K.
+    #[test]
+    fn a_one_draw_subjects_variance_term_does_not_fall_with_k() {
+        for k in [300, 1000, AUTO_SAMPLES_MAX] {
+            let term = log_marginal_mc_variance(1.0 / k as f64, k);
+            assert!((term - 1.0).abs() <= 1.0 / 300.0, "k = {k}: {term}");
+        }
+        assert_eq!(log_marginal_mc_variance(0.0, 1000), 1.0);
+        assert!((log_marginal_mc_variance(0.5, 1000) - 1e-3).abs() < 1e-12);
+        assert!((log_marginal_mc_variance(0.5, 2000) - 5e-4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_degenerate_subject_is_left_out_once_a_change_of_k_has_not_helped() {
+        let mut t = StuckSubjects::default();
+        let one = |k: usize| 1.0 / k as f64;
+        // One-draw at the start: it may only be undersampled, so it stays in.
+        assert_eq!(t.update(&[0.5, one(300)], 300), [false, false]);
+        // Still one-draw at the same K: no evidence yet that draws do not help.
+        assert_eq!(t.update(&[0.5, one(300)], 300), [false, false]);
+        // Still one-draw after a raise: left out.
+        assert_eq!(t.update(&[0.5, one(600)], 600), [false, true]);
+        // And it stays out after a lowering.
+        assert_eq!(t.update(&[0.5, one(300)], 300), [false, true]);
+        assert_eq!(t.update(&[0.5, one(600)], 600), [false, true]);
+        // A recovery ends the run, so it must fail at two counts again.
+        assert_eq!(t.update(&[0.5, 0.2], 300), [false, false]);
+        assert_eq!(t.update(&[0.5, one(300)], 300), [false, false]);
+        assert_eq!(t.update(&[0.5, one(600)], 600), [false, true]);
+    }
+
+    /// A lowering is not a test of whether more draws help: a subject degenerate
+    /// first at a high K and then at a lower one stays in, and is left out only
+    /// once K rises past the lowest K of its run.
+    #[test]
+    fn a_lowering_does_not_mark_a_degenerate_subject_stuck() {
+        let mut t = StuckSubjects::default();
+        let one = |k: usize| 1.0 / k as f64;
+        assert_eq!(t.update(&[one(4000)], 4000), [false]);
+        assert_eq!(t.update(&[one(2000)], 2000), [false]);
+        assert_eq!(t.update(&[one(1000)], 1000), [false]);
+        // Back up to a K it has been degenerate at before, but above the run's
+        // lowest: that raise did not help.
+        assert_eq!(t.update(&[one(2000)], 2000), [true]);
+    }
+
+    /// Once a subject is left out, the window `auto` reads must lose it too. With
+    /// the stale entries the median still includes the one-draw subject and K
+    /// doubles; rebuilt on the current set it holds. Both sides are asserted.
+    #[test]
+    fn leaving_a_subject_out_rebuilds_the_se_window() {
+        let k = 1000;
+        let mut fracs = vec![0.8; 100];
+        fracs.push(1.0 / k as f64);
+        let history: Vec<(Vec<f64>, usize)> = vec![(fracs.clone(), k); 5];
+        let flat = vec![4000.0; 10];
+        let mut stuck = vec![false; 101];
+        let stale_with_newest = {
+            let mut h = ramp_se_history(&history[..4], &stuck);
+            stuck[100] = true;
+            h.push((ramp_se_per_subject(&fracs, k, &stuck).0, k));
+            h
+        };
+        assert_eq!(auto_step(&flat, &stale_with_newest, k, 100, true).0, 2 * k);
+        let rebuilt = ramp_se_history(&history, &stuck);
+        assert!(rebuilt.iter().all(|&(se, _)| se < AUTO_STDOBJ_TARGET));
+        assert_eq!(auto_step(&flat, &rebuilt, k, 100, true).0, k);
+    }
+
+    #[test]
+    fn a_failed_subject_is_left_out_at_once() {
+        let mut t = StuckSubjects::default();
+        assert_eq!(t.update(&[0.0, f64::NAN, 0.5], 300), [true, true, false]);
+    }
+
+    /// 100 well-sampled subjects and one that draws cannot fix: with it the SE sits
+    /// at `2/√101 ≈ 0.2`, four times the target, and would ramp all 101 to the cap;
+    /// without it the SE is under the target. Both sides of the straddle are asserted.
+    #[test]
+    fn a_stuck_subject_does_not_set_the_ramp_se() {
+        let k = 1000;
+        let mut fracs = vec![0.8; 100];
+        fracs.push(1.0 / k as f64);
+        let mut stuck = vec![false; 101];
+        let (with, n_with) = ramp_se_per_subject(&fracs, k, &stuck);
+        assert_eq!(n_with, 101);
+        assert!(with > 2.0 / (101f64).sqrt() - 1e-3, "{with}");
+        stuck[100] = true;
+        let (without, n_without) = ramp_se_per_subject(&fracs, k, &stuck);
+        assert_eq!(n_without, 100);
+        // Each healthy term is (1/0.8 − 1)/1000 = 2.5e-4, so the SE is 2·√2.5e-4.
+        assert!(
+            (without - 2.0 * (2.5e-4f64).sqrt()).abs() < 1e-12,
+            "{without}"
+        );
+        assert!(without < AUTO_STDOBJ_TARGET && with > AUTO_STDOBJ_TARGET);
+        // With every subject left out there is nothing to raise for.
+        assert_eq!(ramp_se_per_subject(&fracs, k, &[true; 101]), (0.0, 0));
+    }
+
+    #[test]
+    fn lowest_ess_summary_lists_the_worst_subjects_first() {
+        let ids = ["a", "b", "c"];
+        assert_eq!(
+            lowest_ess_summary(&ids, &[0.5, 0.001, 0.1], 1000, 2),
+            "b (ESS 1.0), c (ESS 100.0)"
+        );
+    }
+
+    #[test]
+    fn stuck_subjects_sentence_names_the_subjects_under_auto_only() {
+        let ids: Vec<String> = (1..=12).map(|i| format!("S{i}")).collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let s = stuck_subjects_sentence(true, "imp_auto", &ids);
+        assert!(s.contains("`imp_auto` left 12 subject(s)"), "{s}");
+        assert!(s.contains("S1, S2") && s.contains("S10 and 2 more"), "{s}");
+        assert!(!s.contains("S11"), "{s}");
+        assert!(s.contains("better proposal, not more samples"), "{s}");
+        assert_eq!(stuck_subjects_sentence(false, "imp_auto", &ids), "");
+        assert_eq!(stuck_subjects_sentence(true, "imp_auto", &[]), "");
+        assert_eq!(id_list(&["x", "y"], 10), "x, y");
+    }
+
+    #[test]
     fn next_sample_count_raises_only_when_allowed() {
         assert_eq!(next_sample_count(1000, 1000, 0.5, false), 1000);
         assert_eq!(next_sample_count(1000, 1000, 0.5, true), 2000);
@@ -7966,7 +8281,7 @@ mod tests {
         let advice = |auto, k, stopped| {
             let mut history = at_scale(5.0, 1000, 5);
             history.extend(at_scale(if stopped { 11.0 } else { 5.0 }, 2000, 5));
-            under_sampling_advice(auto, k, &history, 1000, "imp_samples", "imp_auto")
+            under_sampling_advice(auto, k, &history, 1000, "imp_samples", "imp_auto", false)
         };
         let at_cap = advice(true, AUTO_SAMPLES_MAX, false);
         assert!(at_cap.contains("was not enough") && !at_cap.contains("below the cap"));
@@ -7992,6 +8307,43 @@ mod tests {
         );
         let fixed = advice(false, 2000, false);
         assert!(fixed.contains("`imp_auto = true`") && !fixed.contains("is enabled"));
+    }
+
+    /// When only the left-out subjects are noisy, the advice must not ask for more
+    /// samples or iterations, whatever else the history says; without them it does.
+    #[test]
+    fn under_sampling_advice_does_not_ask_for_samples_left_out_subjects_cannot_use() {
+        let h = at_scale(5.0, 1000, 5);
+        for k in [1000, AUTO_SAMPLES_MAX] {
+            let left_out =
+                under_sampling_advice(true, k, &h, 1000, "imp_samples", "imp_auto", true);
+            assert!(
+                left_out.contains("met the MC-SE target")
+                    && left_out.contains("left out")
+                    && left_out.contains("larger `imp_samples` is unlikely to help")
+                    && !left_out.contains("more iterations")
+                    && !left_out.contains("was not enough"),
+                "{left_out}"
+            );
+        }
+        let ordinary =
+            under_sampling_advice(true, 1000, &h, 1000, "imp_samples", "imp_auto", false);
+        assert!(ordinary.contains("more iterations") && !ordinary.contains("left out"));
+        // Without `auto` nothing was left out of any ramp.
+        let fixed = under_sampling_advice(false, 1000, &h, 1000, "imp_samples", "imp_auto", true);
+        assert!(fixed.contains("`imp_auto = true`") && !fixed.contains("left out"));
+    }
+
+    #[test]
+    fn collapse_sentence_makes_no_claim_about_more_samples() {
+        assert_eq!(collapse_sentence(0), "");
+        let s = collapse_sentence(3);
+        assert!(s.contains("3 subject(s)") && s.contains("ESS < 2"), "{s}");
+        assert!(s.contains("at this sample count"), "{s}");
+        assert!(
+            !s.contains("regardless") && !s.contains("not more samples"),
+            "{s}"
+        );
     }
 
     /// `n` iterations at `k` with a constant `SE²·K` of `scale`.
