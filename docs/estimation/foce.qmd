@@ -133,13 +133,23 @@ The two can disagree. A subject no recorder serves — an out-of-scope ODE dose 
 
 ```
 1 of 32 subjects could not be given the exact analytic outer gradient during this fit
-(e.g. subject 7) (a shape no analytic recorder serves, or a trial point
-where it could not be formed) and used fixed-EBE outer gradients, which omit the
-EBE-response term the analytic gradient carries. If the fit stalls,
+(e.g. subject 7) (1 with an inner Hessian at the EBE that was singular, or indefinite
+at an EBE that was not stationary, at some trial point — an EBE off a strict mode, as
+when subjects move between modes of a multimodal posterior, which can also make the
+objective jump under the line search) and used fixed-EBE outer gradients, which omit
+the EBE-response term the analytic gradient carries. If the fit stalls,
 `reconverge_gradient_interval = N` restores the reconverged gradient every N-th
 evaluation. The reported outer gradient method is the model-level route, not the
 per-subject one.
 ```
+
+The parenthesis names the cause of each decline (#2713), one clause per cause, with its subject count:
+
+- **a shape no analytic recorder serves** — the subject's records are outside the recorders' scope, at every parameter point;
+- **an inner Hessian at the EBE that was singular, or indefinite at an EBE that was not stationary** — the identity the exact gradient rests on needs a nonsingular `H` at a stationary `η̂`, and this subject's EBE was off a strict mode at some trial point. A large count here points at multimodal EBEs: a subject that changes mode makes the objective jump, which a line search with an exact gradient can fail on;
+- **a recording that failed or came back non-finite** — a prediction, Ω factor or gradient component that was not finite at a trial point.
+
+A subject that declined for different causes at different trial points counts under each, so the counts can add up to more than the declined total. Which cause dominates decides the remedy: a shape decline needs recorder coverage, a mode-system one is a property of the posterior that `reconverge_gradient_interval` cannot change, and a recording one usually comes from blown-up line-search trials.
 
 #### What a declined subject is charged {#declined-subject-salvage}
 

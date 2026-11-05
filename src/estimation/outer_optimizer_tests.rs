@@ -6641,9 +6641,19 @@ mod outer_fd_fallback {
             outer_fd_fallback_warning(&model, &pop, &log).expect("a declining subject must warn");
         assert!(w.contains("1 of 2"), "got: {w}");
         assert!(
-            w.contains("could not be given the exact analytic outer gradient")
-                && w.contains("a trial point where it could not be formed"),
-            "must not attribute every decline to the provider's scope; got: {w}"
+            w.contains("could not be given the exact analytic outer gradient"),
+            "got: {w}"
+        );
+        // #2713: the decline is named by its cause. The walk declines this subject's
+        // SS infusion under a lag mid-recording, which only the structural check tells
+        // apart from a failed recording — so the shape clause, and neither other one.
+        assert!(
+            w.contains("(1 with a shape no analytic recorder serves)"),
+            "a shape decline must be named as one; got: {w}"
+        );
+        assert!(
+            !w.contains("failed or came back non-finite") && !w.contains("inner Hessian"),
+            "got: {w}"
         );
         assert!(
             w.contains("OUT_OF_SCOPE"),
@@ -6654,6 +6664,71 @@ mod outer_fd_fallback {
             w.contains("model-level route, not the per-subject one"),
             "must reconcile the warning with `gradient_method_outer`; got: {w}"
         );
+    }
+
+    /// #2713: the warning breaks the declined subjects down by cause, one clause per cause
+    /// some subject declined for, so a fit with a large fallback share says which remedy
+    /// applies. Each clause is asserted present exactly when its cause was recorded, its
+    /// count included; a subject that declined for two causes counts in both; and a log no
+    /// route stamped a cause on (the quadrature's) keeps the generic sentence.
+    #[test]
+    fn warning_names_each_decline_cause() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        const SHAPE: &str = "with a shape no analytic recorder serves";
+        const MODE: &str = "with an inner Hessian at the EBE that was singular";
+        const MULTIMODAL: &str = "as when subjects move between modes";
+        const RECORDING: &str = "with a recording that failed or came back non-finite";
+        const GENERIC: &str = "a trial point where it could not be formed";
+        let warn = |causes: &[(usize, DeclineCause)]| {
+            let log = OuterFdDeclineLog::new(2);
+            for &(i, c) in causes {
+                log.record(i);
+                log.record_cause(i, c);
+            }
+            outer_fd_fallback_warning(&model, &pop, &log).expect("must warn")
+        };
+        let only = |w: &str, present: &[&str]| {
+            for clause in [SHAPE, MODE, RECORDING, GENERIC] {
+                assert_eq!(
+                    w.contains(clause),
+                    present.contains(&clause),
+                    "clause {clause:?}; got: {w}"
+                );
+            }
+        };
+        let w = warn(&[(1, DeclineCause::Shape)]);
+        only(&w, &[SHAPE]);
+        assert!(w.contains(&format!("(1 {SHAPE})")), "got: {w}");
+
+        let w = warn(&[(0, DeclineCause::ModeSystem), (1, DeclineCause::ModeSystem)]);
+        only(&w, &[MODE]);
+        assert!(
+            w.contains(&format!("(2 {MODE}")) && w.contains(MULTIMODAL),
+            "got: {w}"
+        );
+
+        let w = warn(&[(0, DeclineCause::Recording)]);
+        only(&w, &[RECORDING]);
+        assert!(w.contains(&format!("(1 {RECORDING}")), "got: {w}");
+
+        // Subject 0 declined at its mode system on one trial point and in its recording on
+        // another: it counts in both, beside subject 1's shape.
+        let w = warn(&[
+            (0, DeclineCause::ModeSystem),
+            (0, DeclineCause::Recording),
+            (1, DeclineCause::Shape),
+        ]);
+        only(&w, &[SHAPE, MODE, RECORDING]);
+        assert!(
+            w.contains(&format!("(1 {SHAPE}; 1 {MODE}")) && w.contains(&format!("; 1 {RECORDING}")),
+            "got: {w}"
+        );
+
+        let log = OuterFdDeclineLog::new(2);
+        log.record(1);
+        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("must warn");
+        only(&w, &[GENERIC]);
     }
 
     /// #1529: the consequence sentence depends on which salvage the route takes, so both

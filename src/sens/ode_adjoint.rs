@@ -385,6 +385,7 @@ pub(crate) fn subject_adjoint_gradient_at(
 /// gradient's own recording: one more sweep per BSV effect, no second recording (#2549).
 /// The response is `None` where the gradient is (the adjoint declined) or the inner Hessian
 /// is singular.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_gradient_with_eta_dx_at(
     model: &CompiledModel,
     subject: &Subject,
@@ -403,6 +404,7 @@ pub(crate) fn subject_adjoint_gradient_with_eta_dx_at(
 /// [`subject_adjoint_gradient_with_eta_dx_at`] for any objective the adjoint serves: under
 /// Laplace/AGQ (`Objective::Agq`) the response of the conditional mode the quadrature is
 /// centred on, from the exact inner Hessian, out of the quadrature gradient's own tape.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_gradient_and_eta_dx_at(
     model: &CompiledModel,
     subject: &Subject,
@@ -875,7 +877,15 @@ fn adjoint_gradient(
     eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let (template, x) = (pt.template, pt.x);
-    let mut sc = scope(model, subject, pt, eta_hat)?;
+    let shape = |eta_dx: Option<&mut ModeOut>| {
+        if let Some(o) = eta_dx {
+            o.decline = Some(DeclineCause::Shape);
+        }
+    };
+    let Some(mut sc) = scope(model, subject, pt, eta_hat) else {
+        shape(eta_dx);
+        return None;
+    };
     let objective = match objective {
         // No random effects: both anchors are the empty `H`, and `Ψ = F`.
         Objective::Agq { n_agq, exact: true } if sc.width == 0 => Objective::Agq {
@@ -884,7 +894,11 @@ fn adjoint_gradient(
         },
         // The exact anchor's recording runs at its own buckets: pad to one.
         Objective::Agq { exact: true, .. } => {
-            sc.bucket = EXACT_ANCHOR_BUCKETS.into_iter().find(|&b| b >= sc.width)?;
+            let Some(b) = EXACT_ANCHOR_BUCKETS.into_iter().find(|&b| b >= sc.width) else {
+                shape(eta_dx);
+                return None;
+            };
+            sc.bucket = b;
             sc.eta.resize(sc.bucket, 0.0);
             objective
         }
@@ -942,20 +956,28 @@ fn adjoint_gradient(
             // gradient must not depend on whether the response was asked for, so a failed
             // fused pass is re-run as the gradient alone, whose Ψ is the same arithmetic, and
             // reports no response (#2549 review r2 #2).
-            Some(o) => match go_run(Some(&mut *o)) {
-                Some(g) => Some(g),
-                None if o.want_dx => {
-                    let mut lite = ModeOut {
-                        want_hessian: o.want_hessian,
-                        ..ModeOut::default()
-                    };
-                    let g = go_run(Some(&mut lite));
-                    o.eta_dx = None;
-                    o.hessian = lite.hessian;
-                    g
-                }
-                None => None,
-            },
+            Some(o) => {
+                let g = match go_run(Some(&mut *o)) {
+                    Some(g) => Some(g),
+                    None if o.want_dx => {
+                        let mut lite = ModeOut {
+                            want_hessian: o.want_hessian,
+                            ..ModeOut::default()
+                        };
+                        let g = go_run(Some(&mut lite));
+                        o.eta_dx = None;
+                        o.hessian = lite.hessian;
+                        g
+                    }
+                    None => None,
+                };
+                // A pass that names no cause failed in the recording (#2713).
+                o.decline = match g {
+                    Some(_) => None,
+                    None => o.decline.or(Some(DeclineCause::Recording)),
+                };
+                g
+            }
         }
     }
     by_bucket!(
@@ -4283,7 +4305,7 @@ fn run<const N: usize, const M: usize>(
         ng.as_ref(),
     )?;
     let fz = if interaction { None } else { pop_v.as_deref() };
-    let w = mode_solve(&h, &grad_f, &grad_l, || {
+    let Some(w) = mode_solve(&h, &grad_f, &grad_l, || {
         let mut g = inner_search_gradient::<N>(model, subject, lay, theta, eta, &ctx, &pv, fz)?;
         if let Some(j) = ng.as_ref() {
             for (gk, qk) in g.iter_mut().zip(&j.g) {
@@ -4291,7 +4313,12 @@ fn run<const N: usize, const M: usize>(
             }
         }
         Some(g)
-    })?;
+    }) else {
+        if let Some(o) = eta_dx {
+            o.decline = Some(DeclineCause::ModeSystem);
+        }
+        return None;
+    };
 
     // ---- 3. Ψ = F − wᵀ∇_η l on the scalar tape, one single-lane sweep -----------------
     rtape_reset();
@@ -4475,6 +4502,9 @@ pub(crate) struct ModeOut {
     pub(crate) want_hessian: bool,
     pub(crate) eta_dx: Option<Vec<DVector<f64>>>,
     pub(crate) hessian: Option<DMatrix<f64>>,
+    /// Why the gradient was declined, when it was (#2713). Set by the pass, never read by
+    /// it; it survives [`Self::clear`], which drops only the products.
+    pub(crate) decline: Option<DeclineCause>,
 }
 
 impl ModeOut {
@@ -4483,6 +4513,22 @@ impl ModeOut {
         self.eta_dx = None;
         self.hessian = None;
     }
+}
+
+/// Why the adjoint declined a subject's gradient (#2713): the question a large fallback
+/// share leaves open, since each points at a different remedy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclineCause {
+    /// The subject's data shape (or the packed layout) is outside the recorders' scope
+    /// ([`scope`]): it declines at every parameter point.
+    Shape,
+    /// The mode system `H w = ∇_η F` could not be solved ([`mode_solve`]): `H` singular at
+    /// `η̂`, or indefinite at an `η̂` that is not stationary — an EBE off a strict mode, as
+    /// when the inner search lands between modes of a multimodal posterior.
+    ModeSystem,
+    /// The recording itself failed at this trial point: a non-finite prediction, a
+    /// non-positive-definite Ω, or a non-finite gradient component.
+    Recording,
 }
 
 #[cfg(test)]
@@ -5481,7 +5527,12 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             at_mode = false;
             DVector::zeros(N)
         }
-        None => return None,
+        None => {
+            if let Some(o) = eta_dx {
+                o.decline = Some(DeclineCause::ModeSystem);
+            }
+            return None;
+        }
     };
 
     // ---- sweep 2: Ψ = A − wᵀ∇_η l(η̂) ----------------------------------------------

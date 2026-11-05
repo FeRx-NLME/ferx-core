@@ -3190,6 +3190,81 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
     assert!(w.contains("used fixed-EBE outer gradients"), "{w}");
 }
 
+/// #2713: a declined FOCEI gradient names its cause. Off the mode, on the grid point
+/// where the exact `H` is indefinite (`laplace_serves_the_prior_precision_anchor_fallback`'s
+/// search), the mode system declines and says so — with the mode response asked for too,
+/// whose fused pass fails at the same solve before its retry. The straddle: at the EBE the
+/// same subject is served, and a cause left on a reused `ModeOut` is cleared. Mutations
+/// that redden it: dropping the `ModeSystem` stamp in `run` (the pass reports
+/// `Recording`), or not clearing the cause on a served pass.
+#[test]
+fn a_declined_gradient_names_its_cause() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = &one.default_params;
+    let x = pack_params(params);
+    let pt = PackedPoint::new(params, &x).expect("packed point");
+    let grid = [-2.5, -1.5, -0.75, 0.75, 1.5, 2.5];
+    let mut points = Vec::new();
+    for &a in &grid {
+        for &b in &grid {
+            for &c in &grid {
+                points.push([a, b, c]);
+            }
+        }
+    }
+    let eta = points
+        .into_iter()
+        .find(|e| {
+            exact_inner_hessian(&one, &s, params, e)
+                .expect("recorded")
+                .cholesky()
+                .is_none()
+        })
+        .expect("a point where the exact H is indefinite");
+    for want_dx in [false, true] {
+        let mut out = ModeOut {
+            want_dx,
+            ..ModeOut::default()
+        };
+        let g =
+            subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &eta, Objective::Focei, &mut out);
+        assert!(
+            g.is_none(),
+            "want_dx = {want_dx}: off the mode, H indefinite must decline"
+        );
+        assert_eq!(
+            out.decline,
+            Some(DeclineCause::ModeSystem),
+            "want_dx = {want_dx}: the decline is the mode system's"
+        );
+        // The straddle: at the EBE the subject is served, and the reused `out` loses the
+        // stale cause.
+        let ebe = find_ebe(&one, &s, params, 500, 1e-11, None, None, 0).eta;
+        let g = subject_adjoint_gradient_and_mode_at(
+            &one,
+            &s,
+            &pt,
+            ebe.as_slice(),
+            Objective::Focei,
+            &mut out,
+        );
+        assert!(g.is_some(), "want_dx = {want_dx}: the EBE is served");
+        assert_eq!(
+            out.decline, None,
+            "want_dx = {want_dx}: a served pass names no cause"
+        );
+    }
+}
+
 #[test]
 fn laplace_kernel_is_the_production_objective() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
