@@ -152,6 +152,57 @@ fn a_near_miss_of_a_continuous_select_is_not_exempt() {
     }
 }
 
+/// An `if` whose arms meet at the switch has no sensitivity jump, whatever the arms are.
+#[test]
+fn arms_that_meet_at_the_switch_are_exempt() {
+    for body in [
+        // Friberg feedback, as NONMEM writes it: the arms are `(C/x)^g` and 1 at `x = C`.
+        "d/dt(a) = -KE * (if (tau < LAGT) (LAGT / tau)^0.16 else 1.0)\nd/dt(tau) = 1.0",
+        // The same switch spelled through the ratio, with the arms swapped.
+        "d/dt(a) = -KE * (if (LAGT / tau <= 1.0) 1.0 else (LAGT / tau)^0.16)\nd/dt(tau) = 1.0",
+        // A hinge, with the condition on either side.
+        "d/dt(a) = -KE * (if (tau > LAGT) tau - LAGT else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (LAGT >= tau) 0.0 else 2.0 * (tau - LAGT))\nd/dt(tau) = 1.0",
+        // The clock is a coordinate of the surface too.
+        "d/dt(a) = -KE * (if (TIME > LAGT) TIME - LAGT else 0.0)\nd/dt(tau) = 1.0",
+        // Arms that read a third name still have to meet for every value of it.
+        "d/dt(a) = -(if (tau > LAGT) KE * (tau - LAGT) else 0.0)\nd/dt(tau) = 1.0",
+    ] {
+        assert_eq!(reads(body), Vec::new(), "{body}");
+    }
+}
+
+/// Each of these is one edit from a shape above, and each jumps at its switch.
+#[test]
+fn arms_that_miss_at_the_switch_are_not_exempt() {
+    for body in [
+        // Arms 1 and 2 apart everywhere on the surface.
+        "d/dt(a) = -KE * (if (tau < LAGT) (LAGT / tau)^0.16 else 2.0)\nd/dt(tau) = 1.0",
+        // A small jump is still a jump.
+        "d/dt(a) = -KE * (if (tau > LAGT) tau - LAGT + 1e-4 else 0.0)\nd/dt(tau) = 1.0",
+        // The arms meet at one value of `KE`, not across the surface.
+        "d/dt(a) = -(if (tau > LAGT) KE else 1.0)\nd/dt(tau) = 1.0",
+        // `|x|` and `x` agree on half the surface: positive draws alone would pass this.
+        "d/dt(a) = -KE * (if (tau > LAGT) sqrt(tau * tau) else LAGT)\nd/dt(tau) = 1.0",
+        // The arms meet wherever `tau`, `KE` and `a` have an even count of negatives, which
+        // is most of the surface: one crossing can pass, and only several reject it.
+        "d/dt(a) = -(if (tau > LAGT) abs(tau) * abs(KE) * abs(a) else LAGT * KE * a)\n\
+         d/dt(tau) = 1.0",
+        "d/dt(a) = -(if (LAGT < tau) abs(KE) * abs(a) * abs(LAGT) else KE * a * tau)\n\
+         d/dt(tau) = 1.0",
+        // A step inside an arm can hide its jump above the sampled range.
+        "d/dt(a) = -KE * (if (tau > LAGT) floor(abs(LAGT) / 1e9) else 0.0)\nd/dt(tau) = 1.0",
+        // A nested conditional can too.
+        "d/dt(a) = -KE * (if (tau > LAGT) (if (LAGT > 1e9) 1.0 else 0.0) else 0.0)\n\
+         d/dt(tau) = 1.0",
+        // A compound condition has no single surface to bisect onto.
+        "d/dt(a) = -KE * (if (tau > LAGT && a > 0.0) tau - LAGT else 0.0)\nd/dt(tau) = 1.0",
+    ] {
+        let got = reads(body);
+        assert!(got.iter().any(|c| c.moves), "{body}\ngot {got:?}");
+    }
+}
+
 /// The #2649 model with its `[individual_parameters]` and first equation swappable.
 fn model(thetas: &str, indiv: &str, rhs: &str) -> crate::types::CompiledModel {
     let src = format!(
@@ -247,6 +298,27 @@ fn a_switch_moved_by_an_estimated_parameter_routes_to_fd() {
         &model(TLAG, "SW = TLAG * TIME", "if (SW > 0.5) -KE * a else 0.0"),
         "SW",
         "a parameter reading TIME",
+    );
+}
+
+/// An `if` whose arms meet at its switch stays on the exact route, however it is moved.
+#[test]
+fn a_moving_switch_with_meeting_arms_stays_analytic() {
+    assert_analytic(
+        &model(
+            TLAG,
+            "LAGT = TLAG",
+            "if (tau > LAGT) KE * (LAGT - tau) else 0.0",
+        ),
+        "a hinge at a moved switch",
+    );
+    assert_analytic(
+        &model(
+            TLAG,
+            "LAGT = TLAG",
+            "-KE * a * (if (tau < LAGT) (LAGT / tau)^0.16 else 1.0)",
+        ),
+        "a feedback ratio at a moved switch",
     );
 }
 

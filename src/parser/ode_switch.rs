@@ -20,9 +20,13 @@
 //!
 //! `min` and `max` desugar to conditionals but are continuous across their switch, where the
 //! branch-wise derivative is exact, so [`is_continuous_select`] exempts them, and `clamp` with
-//! it when its bounds are ordered literals. Anything it cannot prove continuous is reported.
+//! it when its bounds are ordered literals. [`arms_agree_on_switch`] extends that to any `if`
+//! whose arms meet where its condition flips, like `if (rb < C) (C / rb)^0.16 else 1.0`: the
+//! jump in the sensitivity is `(f⁺ − f⁻)·∂τ/∂p`, and a continuous `f` has none. Anything
+//! neither can prove continuous is reported.
 
-use super::{CmpOp, Condition, Expression, Statement};
+use super::{eval_expression, with_model_time, BinOp, CmpOp, Condition, Expression, Statement};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use std::collections::{BTreeSet, HashMap};
 
 /// What an expression or condition reads, as far as a switch is concerned.
@@ -138,7 +142,7 @@ impl Walker<'_> {
         let mut conds: Vec<Reads> = Vec::new();
         super::visit_expr_nodes(e, &mut |n| {
             if let Expression::Conditional(c, t, f) = n {
-                if !is_continuous_select(c, t, f) {
+                if !is_continuous_select(c, t, f) && !arms_agree_on_switch(c, t, f) {
                     conds.push(self.cond_reads(c));
                 }
             }
@@ -226,6 +230,116 @@ fn is_continuous_select(c: &Condition, then_e: &Expression, else_e: &Expression)
         && same(inner_l, l)
         && same(inner_then, inner_r)
         && same(inner_else, l)
+}
+
+/// Switching-surface points [`arms_agree_on_switch`] requires before it trusts the arms.
+const SWITCH_POINTS: usize = 16;
+/// Pairs of random points it may try while looking for those crossings.
+const SWITCH_PAIRS: usize = 2000;
+/// Bisection steps per crossing, enough to reach `f64` resolution along the segment.
+const SWITCH_BISECTIONS: usize = 80;
+/// How close to zero `l - r` must get, relative to `1 + |l| + |r|`. A sign change that does
+/// not reach this is a pole, such as `C / x` crossing `x = 0`, not a switch.
+const SWITCH_ROOT_TOL: f64 = 1e-9;
+/// How far apart the arms may sit at a crossing, relative to `1 + |a| + |b|`. Looser than the
+/// root tolerance, which an arm's slope amplifies.
+const SWITCH_ARM_TOL: f64 = 1e-7;
+
+/// The names an expression reads, or `None` when it holds anything this proof cannot sample:
+/// a nested conditional, or a step function, whose jump could sit outside the sampled range;
+/// and what has no free value here (θ, η, `MIXNUM`, a network output, a level block).
+fn sampled_names(e: &Expression, names: &mut BTreeSet<String>) -> Option<()> {
+    let mut ok = true;
+    super::visit_expr_nodes(e, &mut |n| match n {
+        Expression::Variable(v) | Expression::Covariate(v) => {
+            names.insert(v.clone());
+        }
+        Expression::Literal(_) | Expression::Time | Expression::Power(..) => {}
+        Expression::BinOp(_, op, _) => ok &= !matches!(op, BinOp::Mod),
+        Expression::UnaryFn(f, _) => ok &= !matches!(f.as_str(), "floor" | "ceil" | "round"),
+        _ => ok = false,
+    });
+    ok.then_some(())
+}
+
+/// `true` when both arms of `if (l ? r)` agree wherever `l = r`, so the select is continuous
+/// at its switch and no sensitivity jump exists there.
+///
+/// Evaluated rather than simplified, so it needs no algebra: it draws pairs of random points
+/// over every name the select reads, bisects each pair that straddles the switch, and compares
+/// the arms at the crossing. Two different analytic arms meet on a set of measure zero within
+/// the surface, so [`SWITCH_POINTS`] crossings separate them. Each name is free, including an
+/// intermediate: arms that agree for every value of it agree for the value it takes. So an
+/// intermediate can only lose the proof, and a select it loses stays on finite differences.
+fn arms_agree_on_switch(c: &Condition, then_e: &Expression, else_e: &Expression) -> bool {
+    let Condition::Compare(l, _, r) = c else {
+        return false;
+    };
+    let mut names = BTreeSet::new();
+    for e in [l, r, then_e, else_e] {
+        if sampled_names(e, &mut names).is_none() {
+            return false;
+        }
+    }
+    let names: Vec<String> = names.into_iter().collect();
+    // One value per name, then the clock, which is not a name.
+    let eval = |e: &Expression, x: &[f64]| {
+        let vars: HashMap<String, f64> = names.iter().cloned().zip(x.iter().copied()).collect();
+        with_model_time(x[names.len()], || {
+            eval_expression(e, &[], &[], &vars, &vars, &[])
+        })
+    };
+    let gap = |x: &[f64]| eval(l, x) - eval(r, x);
+    let mut rng = StdRng::seed_from_u64(2649);
+    // Log-uniform over about six decades, one value in four negative: an identity that holds
+    // only for positive values must not pass.
+    let mut draw = || -> Vec<f64> {
+        (0..=names.len())
+            .map(|_| {
+                let v = rng.random_range(-7.0_f64..7.0).exp();
+                if rng.random_bool(0.25) {
+                    -v
+                } else {
+                    v
+                }
+            })
+            .collect()
+    };
+    let mut crossings = 0;
+    for _ in 0..SWITCH_PAIRS {
+        let (a, b) = (draw(), draw());
+        let (ga, gb) = (gap(&a), gap(&b));
+        if !(ga * gb < 0.0) {
+            continue;
+        }
+        let at = |t: f64| -> Vec<f64> { a.iter().zip(&b).map(|(p, q)| p + t * (q - p)).collect() };
+        let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+        for _ in 0..SWITCH_BISECTIONS {
+            let mid = 0.5 * (lo + hi);
+            if gap(&at(mid)) * ga > 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let x = at(0.5 * (lo + hi));
+        let (lv, rv) = (eval(l, &x), eval(r, &x));
+        if !((lv - rv).abs() <= SWITCH_ROOT_TOL * (1.0 + lv.abs() + rv.abs())) {
+            continue;
+        }
+        let (tv, ev) = (eval(then_e, &x), eval(else_e, &x));
+        if !tv.is_finite() && !ev.is_finite() {
+            continue;
+        }
+        if !((tv - ev).abs() <= SWITCH_ARM_TOL * (1.0 + tv.abs() + ev.abs())) {
+            return false;
+        }
+        crossings += 1;
+        if crossings == SWITCH_POINTS {
+            return true;
+        }
+    }
+    false
 }
 
 /// Every condition in the **unresolved** `[odes]` program `stmts` that an individual parameter

@@ -857,6 +857,105 @@ fn ode_init_on_the_static_walk_matches_reconverged_fd() {
     assert!(worst < 1e-7, "worst relative difference {worst:.2e}");
 }
 
+/// A Friberg feedback loop: the `if` switches where `r` crosses `C0`, a time every η moves.
+const ODE_MOVING_CONTINUOUS_SWITCH: &str = r#"
+[parameters]
+  theta TVK(0.3, 0.01, 5.0)
+  theta TVSL(0.6, 0.01, 5.0)
+  theta TVC(4.0, 0.1, 20.0)
+  theta TVG(0.5, 0.01, 2.0)
+  omega ETA_K ~ 0.1
+  omega ETA_C ~ 0.1
+  sigma ADD ~ 0.2 (sd)
+[individual_parameters]
+  K = TVK * exp(ETA_K)
+  SL = TVSL
+  C0 = TVC * exp(ETA_C)
+  G = TVG
+[structural_model]
+  ode(states=[d, p, r])
+[odes]
+  init(p) = C0
+  init(r) = C0
+  d/dt(d) = -0.5 * d
+  d/dt(p) = K * p * (1.0 - SL * d) * (if (r < C0) (C0 / r)^G else 1.0) - K * p
+  d/dt(r) = K * p - K * r
+[scaling]
+  y = r
+[error_model]
+  DV ~ additive(ADD)
+"#;
+
+/// The packed gradient of `ODE_MOVING_CONTINUOUS_SWITCH` with its feedback written as `form`,
+/// at that form's own mode.
+fn moving_switch_gradient(form: &str) -> Vec<f64> {
+    let src = ODE_MOVING_CONTINUOUS_SWITCH.replace("(if (r < C0) (C0 / r)^G else 1.0)", form);
+    let model = tight(parse_model_string(&src).unwrap());
+    let s = moving_switch_subject(&model);
+    assert!(in_scope(&model, &s), "`{form}` must be served");
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-10, true);
+    subject_adjoint_packed_gradient(&model, &s, &params, &x, eta.as_slice(), true)
+        .expect("in adjoint scope")
+}
+
+/// Two doses, so the second lands on a depressed, rebounding `r`.
+fn moving_switch_subject(model: &CompiledModel) -> Subject {
+    subject(
+        model,
+        vec![
+            DoseEvent::new(0.0, 4.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 4.0, 1, 0.0, false, 0.0),
+        ],
+        &[2.0, 6.0, 12.0, 18.0, 24.0, 30.0, 36.0, 44.0, 52.0, 60.0],
+        &[0.1, -0.05],
+    )
+}
+
+/// An `if` whose arms meet at the switch is served by the exact derivatives although every η
+/// moves the switching time, so it must be the same function as its `max` twin. They agree to
+/// roundoff, not bit for bit: `max` raises `1.0` to `G` where the `if` writes `1.0`.
+///
+/// The reference for the value is the smoothed kink, not FD: central FD of the objective across
+/// this kink reads -0.187 for `if` and -0.117 for the `abs` spelling of one function at `x[0]`,
+/// more than the gap below, while the smoothed adjoint moves by under 1e-3 of `1 + |g|` from
+/// `eps = 3e-3` to `1e-4`, and matched its own FD to 3e-7 at `eps = 0.1`. Against it the gap is
+/// 9.5e-3 of `1 + |g|`, because a kink is not exact to second order and FOCEI's gradient reads
+/// second derivatives. That inexactness is shared with `max` and `abs`, and is measured here
+/// so it cannot widen unseen.
+///
+/// Regression caught: the twins parting (a change to one arm's differentiation), or the gap
+/// widening beyond the measured value.
+#[test]
+fn ode_continuous_moving_switch_matches_its_max_twin_and_the_smoothed_limit() {
+    let model = tight(parse_model_string(ODE_MOVING_CONTINUOUS_SWITCH).unwrap());
+    let s = moving_switch_subject(&model);
+    let theta = &model.default_params.theta;
+    let eta = [0.1, -0.05];
+    let preds = crate::pk::compute_predictions_with_tv(&model, &s, theta, &eta);
+    // The fixture is live: the arm changes between records, in both directions.
+    let c0 = theta[2] * eta[1].exp();
+    let below: Vec<bool> = preds.iter().map(|&r| r < c0).collect();
+    let flips = below.windows(2).filter(|w| w[0] != w[1]).count();
+    assert!(flips >= 2, "r = {preds:?} against C0 = {c0}");
+
+    let got = moving_switch_gradient("(if (r < C0) (C0 / r)^G else 1.0)");
+    let twin = moving_switch_gradient("max(C0 / r, 1.0)^G");
+    for (a, b) in got.iter().zip(&twin) {
+        assert!((a - b).abs() <= 1e-13 * (1.0 + b.abs()), "{got:?} {twin:?}");
+    }
+
+    let smooth =
+        moving_switch_gradient("(0.5 * (C0 / r + 1.0 + sqrt((C0 / r - 1.0)^2 + 1e-3 * 1e-3)))^G");
+    let mut worst = 0.0f64;
+    for (a, b) in got.iter().zip(&smooth) {
+        assert!(a.is_finite() && b.is_finite(), "{got:?} {smooth:?}");
+        worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+    }
+    assert!(worst < 2e-2, "worst relative difference {worst:.2e}");
+}
+
 /// #2124: the static dual walk (`integrate_g`) reads a record one ULP before a co-timed
 /// dose — where the reader puts an observation listed before the dose — pre-dose, as the
 /// production predictor does. Only `t = 0` is the live cell: there the record and the dose
