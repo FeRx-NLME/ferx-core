@@ -918,6 +918,10 @@ pub(crate) fn evaluate_final_marginal(
     use crate::estimation::importance_sampling::{
         run_importance_sampling, run_importance_sampling_mixture,
     };
+    debug_assert!(matches!(
+        method,
+        EstimationMethod::Imp | EstimationMethod::Impmap
+    ));
     let mut marg_opts = options.clone();
     // `run_importance_sampling` reads the `imp_*` knobs; for IMPMAP map the
     // `impmap_*` knobs onto them so the final eval mirrors the method's
