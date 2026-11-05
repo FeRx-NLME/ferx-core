@@ -91,7 +91,8 @@ Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽�
      inflate Ω.
    - **θ** (non-mu-ref) and **σ**: maximize the importance-weighted observation
      likelihood $\sum_i \sum_k \tilde w_{ik}\log p(y_i\mid\eta_{ik},\theta,\sigma)$
-     with a derivative-free NLopt BOBYQA step.
+     with a derivative-free NLopt BOBYQA step
+     ([if it leaves a parameter behind](importance-sampling.qmd#mstep-frozen)).
 
 > **High-dimensional models need more samples.** The self-normalized importance
 > weights make the M-step moments carry a finite-sample bias that grows with the
@@ -234,6 +235,27 @@ The ferx IMPMAP row's IS readout uses K = 300; an `imp_eval_only` evaluation at
 the same estimates with K = 3000 gives −1199.41. The other thetas, ω² and σ agree
 to about 1%. Before #1629 ferx IMPMAP reported −1177.62 here, with ω²(ETA_V1)
 0.176 and ω²(ETA_KA) 0.228. The next section explains why.
+
+### A model with no closed-form step {#impmap-non-mu-ref}
+
+Here every θ and σ goes through the weighted M-step: a two-compartment oral model with
+θ on (−10, 10), none mu-referenced, and three strata of combined error, so 14 coordinates.
+The data are 100 simulated subjects with 2200 observations, and the fit starts from
+deliberately wrong values (#2718). Both programs ran K = 1000 from the same start. ferx ran
+200 iterations. NONMEM 7.5.1 was stopped by a time limit, so its rows are iteration 80, not
+final estimates. One evaluator scored all four: NONMEM `EONLY=1`, K = 5000.
+
+| Estimate | −2 log L | `LOG_KA` | `B_CLSEX` | SD of `A2` |
+|---|---:|---:|---:|---:|
+| ferx `imp` | −4871.6 | 0.179 | −0.154 | 0.1064 |
+| ferx `impmap` | −4871.6 | 0.176 | −0.156 | 0.1065 |
+| NONMEM `IMP`, iteration 80 | −4873.2 | 0.242 | −0.211 | 0.1069 |
+| NONMEM `IMPMAP`, iteration 80 | −4873.3 | 0.241 | −0.214 | 0.1069 |
+
+σ agrees. ferx ends 1.6 above NONMEM, with some θ still apart, so the run has not fully
+reached NONMEM's point. At K = 300 and 15 iterations ferx's own marginal for this model
+was −4508.2 before #2718 and −4743.4 after it. The control stream, data and model are
+`imp_non_mu_ref_mstep` under `nonmem_anchor/`.
 
 ## Stale warm-start modes {#impmap-stale-warm-start}
 
