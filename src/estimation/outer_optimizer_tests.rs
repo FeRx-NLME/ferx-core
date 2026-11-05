@@ -15446,6 +15446,16 @@ const BOTH_PASSES: &[LegStart] = &[LegStart::ColdModes, LegStart::NewtonStep];
 /// One fit of a `tests/fixtures/cold_mode_leg` dataset with the #2645 cold-mode pass on or
 /// off, and the legs it ran.
 fn cold_mode_fit(csv: &str, off: &'static [LegStart]) -> (OuterResult, Vec<UnprofiledLeg>) {
+    cold_mode_fit_from(csv, off, 0)
+}
+
+/// [`cold_mode_fit`] from the model's start with its thetas moved by a relative 1e-9 in a
+/// pattern fixed by `jitter` (`0`: the start itself).
+fn cold_mode_fit_from(
+    csv: &str,
+    off: &'static [LegStart],
+    jitter: usize,
+) -> (OuterResult, Vec<UnprofiledLeg>) {
     use crate::parser::model_parser::parse_full_model;
     use crate::read_nonmem_csv;
     use std::path::Path;
@@ -15467,12 +15477,18 @@ fn cold_mode_fit(csv: &str, off: &'static [LegStart]) -> (OuterResult, Vec<Unpro
         threads: Some(1),
         ..parsed.fit_options.clone()
     };
+    let mut start = parsed.model.default_params.clone();
+    if jitter > 0 {
+        for (i, t) in start.theta.iter_mut().enumerate() {
+            *t *= 1.0 + 1e-9 * ((jitter as f64) * (i as f64 + 1.3)).sin();
+        }
+    }
     LEG_PASSES_OFF.with(|o| o.set(off));
     UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().clear());
     let result = optimize_nlopt(
         &parsed.model,
         &pop,
-        &parsed.model.default_params,
+        &start,
         &opts,
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
@@ -15489,11 +15505,40 @@ fn cold_mode_fit(csv: &str, off: &'static [LegStart]) -> (OuterResult, Vec<Unpro
 /// dataset that did so most steadily of twelve tried on both platforms (20 subjects, six legs
 /// and 196.7247 on Linux aarch64 and macOS arm64, ~0.5 s). What the rounds gain, and what a
 /// losing round leaves, is pinned by the `slow-tests` pairs below.
+///
+/// The fixture's subjects have second EBE modes, so which trajectory a start takes is
+/// chaotic: measured (#2706) over ten starts moved by a relative 1e-9, 3 of 10 grind to the
+/// evaluation cap near OFV 198.8 with no verified stop (and so no rounds) and the rest stop
+/// at 196.72 — on unchanged code; 4 of 10 under #2706's round-off-level gradient change,
+/// which moved the start itself onto a trajectory whose warm leg exhausts the cap at 198.12.
+/// So the claim is asserted on the first of a few fixed starts that does not grind (all
+/// five grinding at that rate: ~0.5%), not on whichever trajectory the start's last bits
+/// pick.
 #[test]
 fn a_verified_stop_runs_both_rounds() {
-    let (fit, legs) = cold_mode_fit("both_rounds.csv", &[]);
-    assert!(fit.ofv.is_finite(), "{}", fit.ofv);
-    assert!(legs.len() >= 3, "warm, cold and Newton legs: {legs:?}");
+    let mut tried = Vec::new();
+    for jitter in 0..5 {
+        let (fit, legs) = cold_mode_fit_from("both_rounds.csv", &[], jitter);
+        assert!(fit.ofv.is_finite(), "{}", fit.ofv);
+        // A grinding start ends on the evaluation cap: with no verified stop (no legs), or
+        // inside its warm leg, which leaves no budget for the rounds.
+        let ground = legs.is_empty()
+            || legs
+                .iter()
+                .any(|l| matches!(l.ret, Ok((nlopt::SuccessState::MaxEvalReached, _))));
+        if !ground {
+            assert!(
+                legs.len() >= 3,
+                "start {jitter}: warm, cold and Newton legs: {legs:?}"
+            );
+            return;
+        }
+        tried.push((fit.ofv, legs.len()));
+    }
+    panic!(
+        "every start ground to the evaluation cap ((OFV, legs): {tried:?}): the fixture no \
+         longer tests the rounds"
+    );
 }
 
 /// A [`drive_leg_passes`] pass of the test below: which starts ran, and what each one does.

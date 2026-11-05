@@ -302,8 +302,8 @@ fn a_time_varying_channel_covariate_declines_the_subject() {
     assert_eq!(g_on, g_off);
 }
 
-/// A logit channel (bioavailability) and an IOV channel `exp(ETA_CL + KAPPA_CL)`: the κ
-/// shifts each occasion's `u` with η, so `∂/∂η` still carries the theta.
+/// A logit channel (bioavailability) and an IOV channel `exp(ETA_CL + KAPPA_CL)`, plain and
+/// weighted: the κ shifts each occasion's `u` with η, so `∂/∂η` still carries the theta.
 #[test]
 fn logit_and_iov_channels_match_the_taped_gradient() {
     let logit = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
@@ -320,11 +320,15 @@ fn logit_and_iov_channels_match_the_taped_gradient() {
         KA = TVKA * exp(ETA_KA)\n\
         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
         [error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  iov_column = OCC\n";
+    // A weighted κ (#1031) is rewritten to `KAPPA_CL / sqrt(W)` inside the link: a link
+    // offset the channel detection looks through (`strip_link_offsets`).
+    let weighted = iov.replace("kappa KAPPA_CL ~ 0.04", "kappa KAPPA_CL ~ 0.04 weight = 4");
     for (name, src, eta_ref) in [
-        ("logit", logit, vec![0.1, -0.05, 0.2, 0.3]),
-        ("iov", iov, vec![0.1, -0.05, 0.2, 0.05]),
+        ("logit", logit.to_string(), vec![0.1, -0.05, 0.2, 0.3]),
+        ("iov", iov.to_string(), vec![0.1, -0.05, 0.2, 0.05]),
+        ("weighted iov", weighted, vec![0.1, -0.05, 0.2, 0.05]),
     ] {
-        let model = parse_model_string(src).unwrap();
+        let model = parse_model_string(&src).unwrap();
         let s = static_subject(&model, &[], &eta_ref);
         let ((g_on, _), (g_off, _), hits) = both_ways(&model, &s, Objective::Focei, false);
         assert!(
@@ -351,5 +355,68 @@ fn every_exclusion_fixture_keeps_the_taped_gradient() {
         let w = worst_rel(&g_on, &g_off);
         assert!(w < 1e-12, "{name}: worst gradient gap {w:.2e}");
         assert_eq!(hits > 0, served, "{name}");
+    }
+}
+
+/// Nested levels (#1082): the shared fixture with a BSV η on KA too and its arm κ
+/// unweighted, so every theta is carried and the reduction runs (asserted), against the taped gradient — closed form and
+/// ODE, FOCEI and FOCE — at the compact EBE `find_ebe_for_stage` returns.
+#[test]
+fn nested_levels_take_the_channels_and_match_the_taped_gradient() {
+    use crate::estimation::inner_optimizer::find_ebe_for_stage;
+    use crate::stats::nested_levels::test_helpers as fx;
+    // The arm κ unweighted: the weighted-κ rewrite (#1031) takes `V` out of the mu shape,
+    // so a weighted fixture carries no `TVV` and takes the taped path (it still nests).
+    let with_eta_ka = |src: String| {
+        src.replace("KA = TVKA * exp(K_B)", "KA = TVKA * exp(ETA_KA + K_B)")
+            .replace(" at ARM weight = NARM", " at ARM")
+            .replace(
+                "omega ETA_V ~ 0.04\n",
+                "omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.2\n",
+            )
+    };
+    for (label, src) in [("closed form", fx::closed_form()), ("ode", fx::ode())] {
+        let (model, pop) = fx::prepared(&with_eta_ka(src), 1);
+        assert!(model.has_nested_levels(), "{label}: the fixture must nest");
+        let s = &pop.subjects[0];
+        for interaction in [true, false] {
+            let p = moved_params(&model);
+            let x = pack_params(&p);
+            let stage = crate::types::FitOptions {
+                method: if interaction {
+                    crate::types::EstimationMethod::FoceI
+                } else {
+                    crate::types::EstimationMethod::Foce
+                },
+                interaction,
+                inner_tol: 1e-10,
+                inner_maxiter: 2000,
+                ..crate::types::FitOptions::default()
+            };
+            let ebe = find_ebe_for_stage(&model, s, &p, 2000, 1e-10, None, None, 0, &stage);
+            let mut stacked = ebe.eta.as_slice().to_vec();
+            for k in &ebe.kappas {
+                stacked.extend_from_slice(k.as_slice());
+            }
+            let objective = if interaction {
+                Objective::Focei
+            } else {
+                Objective::Foce
+            };
+            let go = || subject_adjoint_gradient(&model, s, &p, &x, &stacked, objective);
+            THETA_CHANNEL_HITS.with(|c| c.set(0));
+            let on = go().expect("in scope");
+            let hits = THETA_CHANNEL_HITS.with(|c| c.get());
+            THETA_CHANNELS_OFF.with(|c| c.set(true));
+            let off = go().expect("in scope");
+            THETA_CHANNELS_OFF.with(|c| c.set(false));
+            let case = format!("{label} interaction={interaction}");
+            assert!(
+                hits > 0,
+                "{case}: the reduction must have served the recording"
+            );
+            let w = worst_rel(&on, &off);
+            assert!(w < 1e-12, "{case}: worst gradient gap {w:.2e}");
+        }
     }
 }

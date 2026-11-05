@@ -1836,6 +1836,8 @@ fn detect_theta_channels(
     n_bsv_eta: usize,
     outside_idents: &HashSet<String>,
 ) -> Option<ThetaChannels> {
+    let stripped = strip_link_offsets(stmts, n_bsv_eta);
+    let stmts = &stripped[..];
     let mut counts = HashMap::new();
     count_all_assignments(stmts, &mut counts);
     let mut scope = InlineScope::new(stmts);
@@ -1900,6 +1902,88 @@ fn detect_theta_channels(
         }
     });
     (complete && !channels.is_empty()).then_some(ThetaChannels { channels, carried })
+}
+
+/// `stmts` with every **link offset** dropped, for [`detect_theta_channels`] alone: inside
+/// an `exp(…)` whose argument sums exactly one bare BSV η with other terms, a term that
+/// reads a κ and nothing but κs, covariates and literals. Such a term moves `u_j` by an
+/// amount independent of θ and of `η_j`, so the channel identity holds with it in place;
+/// dropping it lets the shape match see `exp(ETA + KAPPA / sqrt(W))` (the weighted-κ
+/// rewrite, #1031) as the `exp(ETA + KAPPA)` it scales. The shared mu-reference shapes are
+/// left as they are, since SAEM's groups read them too. What a dropped term reads (κ,
+/// covariates) is nothing the θ and η exclusivity walks look at, so they are unchanged.
+fn strip_link_offsets(stmts: &[Statement], n_bsv: usize) -> Vec<Statement> {
+    fn terms(e: &Expression, out: &mut Vec<Expression>) {
+        match e {
+            Expression::BinOp(l, BinOp::Add, r) => {
+                terms(l, out);
+                terms(r, out);
+            }
+            _ => out.push(e.clone()),
+        }
+    }
+    let offset = |e: &Expression| {
+        let (mut kappa, mut other) = (false, false);
+        visit_expr_nodes(e, &mut |n| match n {
+            Expression::Eta(i) if *i >= n_bsv => kappa = true,
+            Expression::Literal(_)
+            | Expression::Covariate(_)
+            | Expression::BinOp(..)
+            | Expression::UnaryFn(..)
+            | Expression::Power(..) => {}
+            _ => other = true,
+        });
+        kappa && !other
+    };
+    let strip = |e: &mut Expression| {
+        visit_expr_nodes_mut(e, &mut |n| {
+            let Expression::UnaryFn(f, arg) = n else {
+                return;
+            };
+            if f != "exp" {
+                return;
+            }
+            let mut ts = Vec::new();
+            terms(arg, &mut ts);
+            let bare = ts
+                .iter()
+                .filter(|t| matches!(t, Expression::Eta(i) if *i < n_bsv))
+                .count();
+            if bare != 1 || !ts.iter().any(|t| offset(t)) {
+                return;
+            }
+            let kept: Vec<Expression> = ts.into_iter().filter(|t| !offset(t)).collect();
+            let mut it = kept.into_iter();
+            let first = it.next().expect("the bare η is kept");
+            **arg = it.fold(first, |a, t| {
+                Expression::BinOp(Box::new(a), BinOp::Add, Box::new(t))
+            });
+        });
+    };
+    fn walk(stmts: &[Statement], strip: &dyn Fn(&mut Expression)) -> Vec<Statement> {
+        stmts
+            .iter()
+            .map(|s| match s {
+                Statement::Assign(name, e) => {
+                    let mut e = e.clone();
+                    strip(&mut e);
+                    Statement::Assign(name.clone(), e)
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => Statement::If {
+                    branches: branches
+                        .iter()
+                        .map(|(c, b)| (c.clone(), walk(b, strip)))
+                        .collect(),
+                    else_body: else_body.as_ref().map(|b| walk(b, strip)),
+                },
+                other => other.clone(),
+            })
+            .collect()
+    }
+    walk(stmts, &strip)
 }
 
 /// One mu-scale channel of [`ThetaChannels`]: the individual parameter (a top-level name,

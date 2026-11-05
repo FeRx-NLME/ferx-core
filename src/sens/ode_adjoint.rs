@@ -4583,7 +4583,9 @@ impl<const N: usize, const M: usize> ChannelPlan<N, M> {
     /// The plan for `subject`, or `None` (tape every theta) when the model carries no theta
     /// or this subject cannot be served: a channel covariate that varies within the subject
     /// (its `A_j` would move with time), a channel parameter flat in its η, or a model the
-    /// parameter program alone does not describe (`[covariate_nn]`, FREM, nested levels).
+    /// parameter program alone does not describe (`[covariate_nn]`, FREM). IOV and nested
+    /// levels are served: their κ shifts each cell's `u_j` with `η_j`, which leads the
+    /// stacked and the expanded vector alike (`expand_nested`), so `∂/∂η_j` still carries θ.
     fn new(
         model: &CompiledModel,
         subject: &Subject,
@@ -4596,10 +4598,7 @@ impl<const N: usize, const M: usize> ChannelPlan<N, M> {
             return None;
         }
         let tc = model.indiv_param_partials.theta_channels.as_ref()?;
-        if model.frem_config.is_some()
-            || model.has_nested_levels()
-            || crate::sens::provider::nn_weight_theta_count(model) > 0
-        {
+        if model.frem_config.is_some() || crate::sens::provider::nn_weight_theta_count(model) > 0 {
             return None;
         }
         if tc.channels.iter().any(|c| {
