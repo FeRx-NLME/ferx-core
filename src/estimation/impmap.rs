@@ -7337,8 +7337,6 @@ mod tests {
             impmap_samples: 30,
             impmap_auto: false,
             impmap_max_time: Some(1e-9),
-            // IMP's limit must not reach an IMPMAP fit.
-            imp_max_time: Some(1e9),
             run_covariance_step: false,
             ..FitOptions::default()
         };
