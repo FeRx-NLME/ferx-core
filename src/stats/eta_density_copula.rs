@@ -240,6 +240,53 @@ impl<T: PkNum> Mlin<T> {
     pub(crate) fn sqrt(&self) -> Self {
         self.powf(k(0.5))
     }
+
+    /// `g(self)` for a function known by its value `g0 = g(a₀)` and its derivative `h = g′`
+    /// as an `Mlin` function: `h` on the probe `a₀ + Σεᵢ` carries every `h⁽ʲ⁾(a₀)` (the
+    /// coefficient of the first `j` directions), which are `g⁽ʲ⁺¹⁾(a₀)`.
+    pub(crate) fn lift_by_derivative(&self, g0: T, h: impl Fn(&Self) -> Self) -> Self {
+        if !self.live {
+            return Self::cst(self.d, g0);
+        }
+        let mut probe = Self::cst(self.d, self.val());
+        for i in 0..self.d {
+            probe.c[1 << i] = k(1.0);
+        }
+        probe.live = true;
+        let hp = h(&probe);
+        let mut f = vec![g0];
+        for j in 0..self.d {
+            f.push(hp.c[(1usize << j) - 1]);
+        }
+        self.apply(&f)
+    }
+
+    /// `Φ(self)`, the standard normal CDF.
+    pub(crate) fn normal_cdf(&self) -> Self {
+        let g0 = crate::stats::special::normal_cdf_g(self.val());
+        let c = k::<T>(1.0 / std::f64::consts::TAU.sqrt());
+        self.lift_by_derivative(g0, |p| p.mul(p).scale(k(-0.5)).exp().scale(c))
+    }
+
+    /// The Student-t CDF with `nu` degrees of freedom.
+    pub(crate) fn student_t_cdf(&self, nu: T) -> Self {
+        let one = k::<T>(1.0);
+        let half = k::<T>(0.5);
+        let g0 = super::kinds::eta_cdf(super::DensityKind::StudentT, self.val(), one, &[nu])
+            .unwrap_or(self.val() * k(f64::NAN));
+        let ln_c = ((nu + one) * half).ln_gamma()
+            - (nu * half).ln_gamma()
+            - half * (nu * k(std::f64::consts::PI)).ln();
+        let c = ln_c.exp();
+        self.lift_by_derivative(g0, |p| {
+            p.mul(p)
+                .scale(one / nu)
+                .ln1p()
+                .scale(-(nu + one) * half)
+                .exp()
+                .scale(c)
+        })
+    }
 }
 
 /// `exp(x) − 1` over `T`, by its series below `|x| = 1e-3` (where `exp(x) − 1` cancels).
@@ -295,6 +342,24 @@ pub(crate) enum CopulaFamily {
     Bb9,
     /// BB10, `φ(t) = ((1 − δ)/(eᵗ − δ))^{1/θ}`, `θ > 0`, `δ ∈ [0, 1)`.
     Bb10,
+    /// Galambos (negative logistic) extreme value, `θ > 0`.
+    Galambos,
+    /// Hüsler–Reiss extreme value, `θ > 0` (bivariate).
+    HuslerReiss,
+    /// Extremal-t extreme value, `ν > 0`, `ρ ∈ (−1, 1)` (bivariate).
+    TEv,
+    /// Tawn's mixed extreme value, `A(t) = 1 − θt(1 − t)`, `θ ∈ [0, 1]`.
+    Mixed,
+    /// Asymmetric mixed extreme value, `A(t) = θ₂t³ + θ₁t² − (θ₁ + θ₂)t + 1` (bivariate).
+    AsymMixed,
+    /// Asymmetric logistic (Tawn) extreme value, `α ≥ 1`, `θ₁, θ₂ ∈ (0, 1]` (bivariate).
+    AsymLog,
+    /// Asymmetric Galambos extreme value, `α > 0`, `θ₁, θ₂ ∈ (0, 1]` (bivariate).
+    AsymGalambos,
+    /// BB4: Archimax of the Clayton generator (`θ > 0`) and the Galambos tail (`δ > 0`).
+    Bb4,
+    /// BB5: Archimax of the Gumbel generator (`θ ≥ 1`) and the Galambos tail (`δ > 0`).
+    Bb5,
 }
 
 /// One dependence parameter's θ: its auto-declared name prefix, init and bounds, and the
@@ -309,7 +374,7 @@ pub(crate) struct CopulaParam {
 }
 
 impl CopulaFamily {
-    pub(crate) const ALL: [CopulaFamily; 17] = [
+    pub(crate) const ALL: [CopulaFamily; 26] = [
         CopulaFamily::Independent,
         CopulaFamily::Clayton,
         CopulaFamily::Frank,
@@ -327,6 +392,15 @@ impl CopulaFamily {
         CopulaFamily::Bb8,
         CopulaFamily::Bb9,
         CopulaFamily::Bb10,
+        CopulaFamily::Galambos,
+        CopulaFamily::HuslerReiss,
+        CopulaFamily::TEv,
+        CopulaFamily::Mixed,
+        CopulaFamily::AsymMixed,
+        CopulaFamily::AsymLog,
+        CopulaFamily::AsymGalambos,
+        CopulaFamily::Bb4,
+        CopulaFamily::Bb5,
     ];
 
     /// The model-file name (Copulas.jl's, lower-cased, without `Copula`).
@@ -349,11 +423,48 @@ impl CopulaFamily {
             CopulaFamily::Bb8 => "bb8",
             CopulaFamily::Bb9 => "bb9",
             CopulaFamily::Bb10 => "bb10",
+            CopulaFamily::Galambos => "galambos",
+            CopulaFamily::HuslerReiss => "huslerreiss",
+            CopulaFamily::TEv => "tev",
+            CopulaFamily::Mixed => "mixed",
+            CopulaFamily::AsymMixed => "asymmixed",
+            CopulaFamily::AsymLog => "asymlog",
+            CopulaFamily::AsymGalambos => "asymgalambos",
+            CopulaFamily::Bb4 => "bb4",
+            CopulaFamily::Bb5 => "bb5",
+        }
+    }
+
+    /// The model-file names: [`Self::name`], and Copulas.jl's other spelling where it has
+    /// one (its logistic extreme-value `LogCopula` is the Gumbel copula).
+    pub(crate) fn aliases(self) -> &'static [&'static str] {
+        match self {
+            CopulaFamily::Gumbel => &["gumbel", "logistic", "log"],
+            CopulaFamily::AsymLog => &["asymlog", "tawn"],
+            _ => &[],
+        }
+    }
+
+    /// The largest group the family takes: 2 for the bivariate-only families (whose
+    /// Copulas.jl form beyond two needs a multivariate normal or t CDF, or has no
+    /// d-variate version), [`MAX_COPULA_DIM`] otherwise.
+    pub(crate) fn max_dim(self) -> usize {
+        match self {
+            CopulaFamily::HuslerReiss
+            | CopulaFamily::TEv
+            | CopulaFamily::AsymMixed
+            | CopulaFamily::AsymLog
+            | CopulaFamily::AsymGalambos
+            | CopulaFamily::Bb4
+            | CopulaFamily::Bb5 => 2,
+            _ => MAX_COPULA_DIM,
         }
     }
 
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|f| f.name() == name)
+        Self::ALL
+            .into_iter()
+            .find(|f| f.name() == name || f.aliases().contains(&name))
     }
 
     /// Whether the family's dependence lives in the group's Ω block (a correlation),
@@ -426,6 +537,38 @@ impl CopulaFamily {
                 p("THETA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
                 p("DELTA", 0.5, 0.0, 0.99, (0.0, 1.0)),
             ],
+            CopulaFamily::Galambos | CopulaFamily::HuslerReiss => {
+                vec![p("THETA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY))]
+            }
+            CopulaFamily::TEv => vec![
+                p("NU", 4.0, 0.1, 100.0, (0.0, f64::INFINITY)),
+                p("RHO", 0.3, -0.99, 0.99, (-1.0, 1.0)),
+            ],
+            CopulaFamily::Mixed => vec![p("THETA", 0.5, 0.0, 1.0, (0.0, 1.0))],
+            // θ₁ ≥ 0, θ₁ + θ₂ ≤ 1, θ₁ + 2θ₂ ≤ 1, θ₁ + 3θ₂ ≥ 0: a box here, the rest checked
+            // where the density is read (outside it the copula reads as a wall).
+            CopulaFamily::AsymMixed => vec![
+                p("THETA1", 0.3, 0.0, 1.0, (0.0, 1.0)),
+                p("THETA2", 0.0, -1.0 / 3.0, 0.5, (-1.0 / 3.0, 0.5)),
+            ],
+            CopulaFamily::AsymLog => vec![
+                p("ALPHA", 2.0, 1.0, 50.0, (1.0, f64::INFINITY)),
+                p("THETA1", 0.5, 0.01, 1.0, (0.0, 1.0)),
+                p("THETA2", 0.5, 0.01, 1.0, (0.0, 1.0)),
+            ],
+            CopulaFamily::AsymGalambos => vec![
+                p("ALPHA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
+                p("THETA1", 0.5, 0.01, 1.0, (0.0, 1.0)),
+                p("THETA2", 0.5, 0.01, 1.0, (0.0, 1.0)),
+            ],
+            CopulaFamily::Bb4 => vec![
+                p("THETA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
+                p("DELTA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
+            ],
+            CopulaFamily::Bb5 => vec![
+                p("THETA", 1.5, 1.0, 50.0, (1.0, f64::INFINITY)),
+                p("DELTA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
+            ],
         }
     }
 
@@ -445,8 +588,44 @@ impl CopulaFamily {
             | CopulaFamily::Bb7
             | CopulaFamily::Bb8
             | CopulaFamily::Bb9
-            | CopulaFamily::Bb10 => false,
+            | CopulaFamily::Bb10
+            | CopulaFamily::Galambos
+            | CopulaFamily::HuslerReiss
+            | CopulaFamily::TEv
+            | CopulaFamily::AsymLog
+            | CopulaFamily::AsymGalambos
+            | CopulaFamily::Bb4
+            | CopulaFamily::Bb5 => false,
+            CopulaFamily::Mixed => p[0] == 0.0,
+            CopulaFamily::AsymMixed => p[0] == 0.0 && p[1] == 0.0,
         }
+    }
+
+    /// The joint constraints a box of θ bounds cannot state: AsymMixed's
+    /// `θ₁ + θ₂ ≤ 1`, `θ₁ + 2θ₂ ≤ 1`, `θ₁ + 3θ₂ ≥ 0` (Copulas.jl's, its `A` convex and
+    /// between `max(t, 1 − t)` and 1).
+    pub(crate) fn valid(self, p: &[f64]) -> bool {
+        match self {
+            CopulaFamily::AsymMixed => {
+                let (a, b) = (p[0], p[1]);
+                a >= 0.0 && a + b <= 1.0 && a + 2.0 * b <= 1.0 && a + 3.0 * b >= 0.0
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether the family is extreme value (`C = exp(−ℓ(−ln u))`) rather than Archimedean.
+    fn extreme_value(self) -> bool {
+        matches!(
+            self,
+            CopulaFamily::Galambos
+                | CopulaFamily::HuslerReiss
+                | CopulaFamily::TEv
+                | CopulaFamily::Mixed
+                | CopulaFamily::AsymMixed
+                | CopulaFamily::AsymLog
+                | CopulaFamily::AsymGalambos
+        )
     }
 
     /// `φ⁻¹(u)` of an Archimedean family, over `Mlin`; `p` its parameters.
@@ -512,7 +691,16 @@ impl CopulaFamily {
             CopulaFamily::Bb9 => u.ln().neg().addc(one / p[1]).powf(th).addc(-p[1].pow(-th)),
             // ln(δ + (1 − δ) u^{−θ}).
             CopulaFamily::Bb10 => u.ln().scale(-th).exp().scale(one - p[1]).addc(p[1]).ln(),
-            CopulaFamily::StudentT => unreachable!("the t copula is not Archimedean"),
+            CopulaFamily::StudentT
+            | CopulaFamily::Galambos
+            | CopulaFamily::HuslerReiss
+            | CopulaFamily::TEv
+            | CopulaFamily::Mixed
+            | CopulaFamily::AsymMixed
+            | CopulaFamily::AsymLog
+            | CopulaFamily::AsymGalambos
+            | CopulaFamily::Bb4
+            | CopulaFamily::Bb5 => unreachable!("{self:?} has no Archimedean generator"),
         }
     }
 
@@ -591,12 +779,40 @@ impl CopulaFamily {
                 .addc(super::kinds::ln1p_g(-p[1]))
                 .scale(one / th)
                 .exp(),
-            CopulaFamily::StudentT => unreachable!("the t copula is not Archimedean"),
+            CopulaFamily::StudentT
+            | CopulaFamily::Galambos
+            | CopulaFamily::HuslerReiss
+            | CopulaFamily::TEv
+            | CopulaFamily::Mixed
+            | CopulaFamily::AsymMixed
+            | CopulaFamily::AsymLog
+            | CopulaFamily::AsymGalambos
+            | CopulaFamily::Bb4
+            | CopulaFamily::Bb5 => unreachable!("{self:?} has no Archimedean generator"),
         }
     }
 
     /// `C(u)` of a non-elliptical family, over `Mlin`; `p` its dependence parameters.
     pub(crate) fn cdf<T: PkNum>(self, u: &[Mlin<T>], p: &[T]) -> Mlin<T> {
+        // `C(u₁, …, 1, …) = C(the rest)`: a coordinate held at exactly 1 (the sampler's
+        // marginalised ones) is dropped, so no family meets `x = −ln 1 = 0` inside a ratio
+        // (the Pickands form's `t = x/(x + y)`). One left is its own CDF; the rest of a
+        // family is its own (d − 1)-variate copula, the families here being closed under
+        // margins.
+        let kept: Vec<Mlin<T>> = u
+            .iter()
+            .filter(|x| x.live || x.val().val() != 1.0)
+            .cloned()
+            .collect();
+        if kept.len() < u.len() {
+            if kept.len() <= 1 {
+                return kept
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| Mlin::cst(u[0].d, k(1.0)));
+            }
+            return self.cdf(&kept, p);
+        }
         let pv: Vec<f64> = p.iter().map(|x| x.val()).collect();
         if self.independent_at(&pv) {
             let mut c = u[0].clone();
@@ -608,6 +824,21 @@ impl CopulaFamily {
         if self == CopulaFamily::Bb2 {
             return bb2_cdf(u, p);
         }
+        if self.extreme_value() {
+            let x: Vec<Mlin<T>> = u.iter().map(|v| v.ln().neg()).collect();
+            return ev::stdf(self, &x, p).neg().exp();
+        }
+        if matches!(self, CopulaFamily::Bb4 | CopulaFamily::Bb5) {
+            // Archimax: C = φ(ℓ_Galambos(φ⁻¹(u))), φ Clayton (BB4) or Gumbel (BB5).
+            let gen = if self == CopulaFamily::Bb4 {
+                CopulaFamily::Clayton
+            } else {
+                CopulaFamily::Gumbel
+            };
+            let x: Vec<Mlin<T>> = u.iter().map(|v| gen.phi_inv(v, &p[..1])).collect();
+            let l = ev::stdf(CopulaFamily::Galambos, &x, &p[1..2]);
+            return gen.phi(&l, &p[..1]);
+        }
         let mut s = self.phi_inv(&u[0], p);
         for x in &u[1..] {
             s = s.add(&self.phi_inv(x, p));
@@ -618,6 +849,9 @@ impl CopulaFamily {
     /// `ln c(u)` of a non-elliptical family at `u ∈ (0, 1)^d`, over `T`; `−∞` where the
     /// density is not positive, or not representable (below `≈ e^{−700}`).
     pub(crate) fn log_density<T: PkNum>(self, u: &[T], p: &[T]) -> T {
+        if !self.valid(&p.iter().map(|x| x.val()).collect::<Vec<_>>()) {
+            return k(f64::NEG_INFINITY);
+        }
         let d = u.len();
         let xs: Vec<Mlin<T>> = u
             .iter()
@@ -625,10 +859,13 @@ impl CopulaFamily {
             .map(|(i, &v)| Mlin::var(d, i, v))
             .collect();
         let c = self.cdf(&xs, p).top();
-        // Below `≈ e^{−700}` the density is not representable from its CDF (BB2 and BB3,
-        // whose `φ⁻¹` grows like an exponential of a power, reach it at moderate `u`): the
-        // value or its jets leave f64 range, and the copula reads as a wall (`−∞`) rather
-        // than hand an estimator a finite value with a non-finite gradient.
+        // Where the density is not representable from its CDF, the copula reads as a wall
+        // (`−∞`) rather than hand an estimator a wrong finite value or a finite value with a
+        // non-finite gradient: below `≈ e^{−700}` (BB2 and BB3, whose `φ⁻¹` grows like an
+        // exponential of a power, reach it at moderate `u`), and where a tiny density is the
+        // difference of O(1) terms and rounds to `≤ 0` (an extreme-value family far off the
+        // diagonal under strong dependence: Hüsler–Reiss θ = 4 at (0.97, 0.02) has
+        // `ln c = −46`).
         if c.val() > 0.0 && c.val().is_finite() && c.jets_finite() {
             let lc = c.ln();
             // A subnormal `c` has finite jets of its own but `ln c`'s are `g/c`.
@@ -677,6 +914,122 @@ impl CopulaFamily {
             u.push((0.5 * (lo + hi)).clamp(1e-300, 1.0 - 1e-16));
         }
         u
+    }
+}
+
+/// The extreme-value families' stable tail dependence functions `ℓ(x)`, `x = −ln u`, as
+/// Copulas.jl 1.0.1 writes them: through the Pickands function `A(t)` for a bivariate
+/// family (`ℓ(x, y) = (x + y)·A(x/(x + y))`), directly for the d-variate Galambos and Mixed.
+mod ev {
+    use super::{k, CopulaFamily, Mlin};
+    use crate::sens::num::PkNum;
+
+    /// The d-variate Galambos `ℓ(x) = Σxᵢ + Σ_{|I| ≥ 2} (−1)^{|I|+1} (Σ_{i∈I} xᵢ^{−θ})^{−1/θ}`.
+    fn galambos<T: PkNum>(x: &[Mlin<T>], th: T) -> Mlin<T> {
+        let d = x.len();
+        let mut out = x[0].clone();
+        for xi in &x[1..] {
+            out = out.add(xi);
+        }
+        for mask in 1usize..(1 << d) {
+            let size = mask.count_ones() as usize;
+            if size < 2 {
+                continue;
+            }
+            let mut s: Option<Mlin<T>> = None;
+            for (i, xi) in x.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    let term = xi.powf(-th);
+                    s = Some(match s {
+                        None => term,
+                        Some(a) => a.add(&term),
+                    });
+                }
+            }
+            let term = s.expect("size ≥ 2").powf(-k::<T>(1.0) / th);
+            out = if size % 2 == 0 {
+                out.sub(&term)
+            } else {
+                out.add(&term)
+            };
+        }
+        out
+    }
+
+    /// `(x + y)·A(x/(x + y))`.
+    fn from_pickands<T: PkNum>(
+        x: &Mlin<T>,
+        y: &Mlin<T>,
+        a: impl Fn(&Mlin<T>) -> Mlin<T>,
+    ) -> Mlin<T> {
+        let s = x.add(y);
+        let t = x.div(&s);
+        s.mul(&a(&t))
+    }
+
+    pub(super) fn stdf<T: PkNum>(fam: CopulaFamily, x: &[Mlin<T>], p: &[T]) -> Mlin<T> {
+        let one = k::<T>(1.0);
+        match fam {
+            CopulaFamily::Galambos => galambos(x, p[0]),
+            // (1 − θ)Σx + θ ℓ_Galambos(1)(x).
+            CopulaFamily::Mixed => {
+                let mut sum = x[0].clone();
+                for xi in &x[1..] {
+                    sum = sum.add(xi);
+                }
+                sum.scale(one - p[0]).add(&galambos(x, one).scale(p[0]))
+            }
+            CopulaFamily::HuslerReiss => from_pickands(&x[0], &x[1], |t| {
+                let th = p[0];
+                let om = t.neg().addc(one);
+                let z1 = t.div(&om).ln().scale(k::<T>(0.5) * th).addc(one / th);
+                let z2 = om.div(t).ln().scale(k::<T>(0.5) * th).addc(one / th);
+                t.mul(&z1.normal_cdf()).add(&om.mul(&z2.normal_cdf()))
+            }),
+            CopulaFamily::TEv => from_pickands(&x[0], &x[1], |t| {
+                let (nu, rho) = (p[0], p[1]);
+                let c = ((one + nu) / (one - rho * rho)).sqrt();
+                let al = one / nu;
+                let om = t.neg().addc(one);
+                let lr = t.ln().sub(&om.ln());
+                let z1 = lr.scale(al).exp().addc(-rho).scale(c);
+                let z2 = lr.scale(-al).exp().addc(-rho).scale(c);
+                t.mul(&z1.student_t_cdf(nu + one))
+                    .add(&om.mul(&z2.student_t_cdf(nu + one)))
+            }),
+            CopulaFamily::AsymMixed => from_pickands(&x[0], &x[1], |t| {
+                let (t1, t2) = (p[0], p[1]);
+                let t2_ = t.mul(t);
+                let t3 = t2_.mul(t);
+                t3.scale(t2)
+                    .add(&t2_.scale(t1))
+                    .sub(&t.scale(t1 + t2))
+                    .addc(one)
+            }),
+            // ℓ_log(α)(θ₂t, θ₁(1 − t)) + (θ₁ − θ₂)t + 1 − θ₁.
+            CopulaFamily::AsymLog => from_pickands(&x[0], &x[1], |t| {
+                let (al, t1, t2) = (p[0], p[1], p[2]);
+                let a = t.scale(t2);
+                let b = t.neg().addc(one).scale(t1);
+                a.powf(al)
+                    .add(&b.powf(al))
+                    .powf(one / al)
+                    .add(&t.scale(t1 - t2))
+                    .addc(one - t1)
+            }),
+            // 1 − (x^{−α} + y^{−α})^{−1/α}, x = θ₁t, y = θ₂(1 − t).
+            CopulaFamily::AsymGalambos => from_pickands(&x[0], &x[1], |t| {
+                let (al, t1, t2) = (p[0], p[1], p[2]);
+                let a = t.scale(t1);
+                let b = t.neg().addc(one).scale(t2);
+                a.powf(-al)
+                    .add(&b.powf(-al))
+                    .powf(-one / al)
+                    .neg()
+                    .addc(one)
+            }),
+            _ => unreachable!("{fam:?} is not extreme value"),
+        }
     }
 }
 

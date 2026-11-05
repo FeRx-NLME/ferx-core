@@ -8745,6 +8745,14 @@ fn merge_copula_lines(
             ));
         };
         let d = c.etas.len();
+        if d > family.max_dim() {
+            return Err(format!(
+                "[parameters] the `{}` copula is bivariate in Copulas.jl (beyond two ETAs it \
+                 needs a multivariate normal or t CDF, or has no d-variate form): `{}`",
+                family.name(),
+                c.line
+            ));
+        }
         if d > MAX_COPULA_DIM {
             return Err(format!(
                 "[parameters] a copula joins at most {MAX_COPULA_DIM} ETAs (its density has 2^d \
