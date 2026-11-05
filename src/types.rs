@@ -10914,6 +10914,15 @@ impl FitOptions {
         v
     }
 
+    /// Whether no stage of the chain estimates: each one runs as a pure evaluator, so the
+    /// fit reports the initial estimates by request (#2716). That is a standalone
+    /// `imp_eval_only` or `agq_eval_only` run. A readout after an estimator is not one, and
+    /// neither is a run whose flag names a method outside its chain, where the flag is inert.
+    pub(crate) fn evaluation_only_chain(&self) -> bool {
+        let eval_only = self.eval_only_methods();
+        self.method_chain().iter().all(|m| eval_only.contains(m))
+    }
+
     /// The chain stage that would run the post-fit covariance step: the last stage that
     /// estimates, ignoring a trailing run of evaluation-only stages (#615).
     ///
