@@ -27,6 +27,8 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         residual_error_eta: None,
         analytical_init: Vec::new(),
         analytic_readout: None,
+        eta_densities: Vec::new(),
+        kappa_densities: Vec::new(),
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
         mixture: None,
@@ -94,6 +96,7 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         kappa_param_types: Vec::new(),
+        kappa_distributions: Vec::new(),
         theta_transform: Vec::new(),
         theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]

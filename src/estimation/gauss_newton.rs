@@ -1996,6 +1996,8 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
         && !model.residual_cov_at(template).is_dense()
         && !model.has_non_gaussian()
         && model.frem_config.is_none()
+        // The closed forms carry the Gaussian prior `η̂ᵀΩ⁻¹η̂ + log|Ω|` (#1716).
+        && !model.has_densities()
 }
 
 /// Whether the fixed-EBE packed score of this model is **biased**, not merely noisy, so a
@@ -2021,7 +2023,9 @@ pub(crate) fn fixed_ebe_score_drops_ebe_response(model: &CompiledModel) -> bool 
     if model.has_ctmm() {
         return false;
     }
-    model.n_eta > 0 && (model.has_tte() || model.has_discrete())
+    // A density's prior curvature `½∇²c` moves with η̂ as a TTE / discrete data term's
+    // Hessian does (#1716).
+    model.n_eta > 0 && (model.has_tte() || model.has_discrete() || model.has_densities())
 }
 
 /// The per-subject term `tᵢ` that GN and trust-region add to the raw fixed-EBE score `gᵢ`
@@ -2696,6 +2700,7 @@ mod tests {
             has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             kappa_param_types: Vec::new(),
+            kappa_distributions: Vec::new(),
             theta_transform: Vec::new(),
             theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]
@@ -2711,6 +2716,8 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             analytic_readout: None,
+            eta_densities: Vec::new(),
+            kappa_densities: Vec::new(),
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
             mixture: None,
@@ -4273,6 +4280,7 @@ mod tests {
             has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             kappa_param_types: Vec::new(),
+            kappa_distributions: Vec::new(),
             theta_transform: Vec::new(),
             theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]
@@ -4288,6 +4296,8 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             analytic_readout: None,
+            eta_densities: Vec::new(),
+            kappa_densities: Vec::new(),
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
             mixture: None,
@@ -4573,6 +4583,7 @@ mod tests {
             has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             kappa_param_types: Vec::new(),
+            kappa_distributions: Vec::new(),
             theta_transform: Vec::new(),
             theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]
@@ -4588,6 +4599,8 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             analytic_readout: None,
+            eta_densities: Vec::new(),
+            kappa_densities: Vec::new(),
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
             mixture: None,

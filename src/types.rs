@@ -3614,6 +3614,26 @@ pub struct EtaParamInfo {
     pub linked_theta: Option<String>,
     /// Name of the individual parameter this ETA appears in (e.g. `"CL"`).
     pub individual_param_name: String,
+    /// A non-Gaussian distribution of the ETA (#1716): a `density` on its omega line or a
+    /// shape `transform` / `[eta_shape]` on it. `None` for a Gaussian ETA, and for a fit
+    /// saved before #1716.
+    #[serde(default)]
+    pub distribution: Option<EtaDistribution>,
+}
+
+/// How a non-Gaussian ETA is distributed (#1716), for reporting.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct EtaDistribution {
+    /// `"density"`: the ETA follows the kind (the estimators hold its latent);
+    /// `"transform"`: η ~ N(0, ω) and the model reads `h(η)`.
+    pub form: String,
+    /// The kind's model-file name (`gamma`, `t`, `boxcox`, …); a copula ETA's own margin.
+    pub kind: String,
+    /// The θ names of its shapes (ν, μ, λ, …), in the kind's argument order.
+    pub shape_thetas: Vec<String>,
+    /// `Some((lo, hi))` for `truncated(…)`, `None` (infinite) on an open side.
+    #[serde(default)]
+    pub truncation: Option<(Option<f64>, Option<f64>)>,
 }
 
 /// PK parameter function: maps `(theta, eta, covariates, time)` -> PkParams.
@@ -4626,6 +4646,15 @@ pub struct CompiledModel {
     /// θ is `FIX`ed at 0 (the parser drops the line, as it drops a `FIX` zero
     /// `block_sigma` off-diagonal).
     pub residual_serial: Option<ResidualSerial>,
+    /// Non-Gaussian random-effect densities (#1716): each group is one Ω block whose ETAs
+    /// follow a `density KIND(…)` (`gamma`, `t(ν)`, `copula(…)`, …) instead of `N(0, Ω)`. Empty for a
+    /// Gaussian model. Every prior consumer adds
+    /// `crate::stats::eta_density::correction_g` to its Gaussian term.
+    pub eta_densities: Vec<crate::stats::eta_density::EtaDensity>,
+    /// Non-Gaussian IOV densities (#1716): each group is one Ω_IOV block whose κs follow a
+    /// `density` (κ positions `0..n_kappa`); every occasion's κ follows it. Empty for
+    /// Gaussian IOV.
+    pub kappa_densities: Vec<crate::stats::eta_density::EtaDensity>,
     pub pk_param_fn: PkParamFn,
     pub n_theta: usize,
     /// Number of between-subject variability (BSV) ETAs.
@@ -4911,6 +4940,10 @@ pub struct CompiledModel {
     /// assignment, `Custom` otherwise (or when its uses disagree). Never
     /// `LogitProbability`. Forwarded into `FitResult`.
     pub kappa_param_types: Vec<EtaParamType>,
+    /// What each IOV kappa follows when it carries a `density` (#1716), parallel to
+    /// `kappa_names`; `None` for a Gaussian κ, empty for a model with none. Forwarded into
+    /// `FitResult` for the KAPPA rows' notes.
+    pub kappa_distributions: Vec<Option<EtaDistribution>>,
     /// Per-theta transformation: `theta_transform[i]` describes whether theta i
     /// is used on the natural (Identity), log, or logit scale. Length == n_theta.
     pub theta_transform: Vec<ThetaTransform>,
@@ -6249,6 +6282,12 @@ impl CompiledModel {
 
     /// Whether the model declares more than one variability level below `ID` (#1082).
     #[inline]
+    /// Whether any random effect follows a non-Gaussian `density` (#1716): a BSV ETA or
+    /// an IOV κ.
+    pub(crate) fn has_densities(&self) -> bool {
+        !self.eta_densities.is_empty() || !self.kappa_densities.is_empty()
+    }
+
     pub(crate) fn has_nested_levels(&self) -> bool {
         self.indiv_param_partials.nested_levels.is_some()
     }
@@ -8211,6 +8250,11 @@ pub struct FitResult {
     /// saved before #1643, and on a hand-built result; consumers then fall
     /// back to the log-normal CV%.
     pub kappa_param_types: Vec<EtaParamType>,
+    /// What each IOV kappa follows when it carries a `density` (#1716), parallel to
+    /// `kappa_names` (`CompiledModel::kappa_distributions`): the KAPPA rows' distribution
+    /// notes. Empty on a result from before it.
+    #[serde(default)]
+    pub kappa_distributions: Vec<Option<EtaDistribution>>,
     /// The data-derived bindings the fitted model was compiled from (#1621):
     /// each θ level block's observed levels and contrast, and the covariate
     /// statistics behind symbolic `[covariate_model]` centres. Rebuilding the
@@ -9237,6 +9281,10 @@ pub struct FitOptions {
     /// the reported posterior. HMC step size / leapfrog count adapt during this
     /// phase. Default 1000.
     pub bayes_warmup: usize,
+    /// The prior on each Ω block under `method = bayes` (#1716). The inverse Wishart is the
+    /// conjugate default; Wishart and LKJ (on the correlation, with the same
+    /// inverse-gamma margins on the variances) move every block by Metropolis instead.
+    pub bayes_omega_prior: OmegaPrior,
     /// Number of post-warmup sampling sweeps retained per chain (before
     /// thinning). Default 1000.
     pub bayes_iters: usize,
@@ -9891,6 +9939,7 @@ impl Default for FitOptions {
             saem_imh_defensive: 0.05,
             saem_imh_min_obs_per_eta: 2.0,
             bayes_warmup: 1000,
+            bayes_omega_prior: OmegaPrior::InverseWishart,
             bayes_iters: 1000,
             bayes_chains: 4,
             bayes_thin: 1,
@@ -10692,6 +10741,20 @@ pub enum ViSigmaUpdate {
 /// The ELBO is a *lower bound*: not comparable with a FOCE OFV, not comparable
 /// across models with different variational families, and not a `−2 log L`. So it
 /// is never written to `FitResult::ofv`. This option asks for a real one instead.
+/// The prior on an Ω block under `method = bayes` (#1716; Pumas's `InverseWishart`,
+/// `Wishart`, `LKJ` / `LKJCholesky`). Each is centred on the declared Ω: the inverse
+/// Wishart and the Wishart have ν = n + 2 and the declared Ω as scale (Wishart: as mean).
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub enum OmegaPrior {
+    /// Conjugate inverse Wishart (the default).
+    #[default]
+    InverseWishart,
+    /// Wishart, mean the declared Ω.
+    Wishart,
+    /// LKJ(η) on the correlation, inverse-gamma on each variance.
+    Lkj { eta: f64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ViFinalOfv {
     /// Leave `FitResult::ofv` as `NaN` and warn. The default: no number at all is
@@ -11459,6 +11522,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "bayes_chains",
             "bayes_thin",
             "bayes_seed",
+            "bayes_omega_prior",
         ],
         EstimationMethod::Vi => &[
             // `inner_maxiter` / `inner_tol` are meaningful only for the optional

@@ -4433,6 +4433,43 @@ pub fn run_saem(
 
     // Initialize state
     let theta_cur = init_params.theta.clone();
+    // #1716: the density groups' M-step (their Ω blocks and shape θs, by SA on the score).
+    let theta_bounds_nat: Vec<(f64, f64)> = init_params
+        .theta_lower
+        .iter()
+        .zip(&init_params.theta_upper)
+        .map(|(&lo, &hi)| (lo, hi))
+        .collect();
+    let mut density_mstep = crate::estimation::eta_density_mstep::DensityMstep::new(
+        model,
+        &init_params.omega_fixed,
+        &init_params.theta_fixed,
+        &theta_bounds_nat,
+    );
+    // A density ETA's per-class ω under a `[mixture]` override, one M-step per (class, η).
+    let mut class_density_msteps: std::collections::HashMap<
+        (usize, usize),
+        Option<crate::estimation::eta_density_mstep::DensityMstep>,
+    > = std::collections::HashMap::new();
+    // …and the κ groups', against Ω_IOV over every occasion's draw.
+    let mut kappa_density_mstep = crate::estimation::eta_density_mstep::DensityMstep::for_kappas(
+        model,
+        &init_params.kappa_fixed,
+        &init_params.theta_fixed,
+        &theta_bounds_nat,
+    );
+    let density_owned_thetas: Vec<usize> = density_mstep
+        .as_ref()
+        .map(|d| d.owned_thetas())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(
+            kappa_density_mstep
+                .as_ref()
+                .map(|d| d.owned_thetas())
+                .unwrap_or_default(),
+        )
+        .collect();
     let omega_cur = init_params.omega.matrix.clone();
     let sigma_cur = init_params.sigma.values.clone();
     let s2 = omega_cur.clone();
@@ -6171,6 +6208,99 @@ pub fn run_saem(
             }
         }
 
+        // ---- Step 3c: density groups (#1716) ----
+        // Their Ω blocks (and the κ groups' Ω_IOV blocks) replace the closed forms just
+        // taken from `s2` / `s2_iov` (the Gaussian statistics), on the same burn-in gate and
+        // gain. Their shape θs move here and nowhere else: they enter the prior only.
+        if k > omega_burnin {
+            let mut theta_nat: Vec<f64> = (0..n_theta)
+                .map(|i| unpack_theta(i, log_theta[i]))
+                .collect();
+            if let Some(dm) = density_mstep.as_mut() {
+                // A `[mixture]` class override on a density ETA: the base step draws only on
+                // subjects whose class keeps the base Ω, and each override class steps its
+                // own ω on its members (the shape θ stays the base step's).
+                let over: Vec<(usize, usize)> = saem_mix
+                    .as_ref()
+                    .map(|m| {
+                        m.mp.omega_override_addr
+                            .iter()
+                            .copied()
+                            .filter(|&(_, j)| m.density_etas.contains(&j))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if over.is_empty() {
+                    dm.sa_step(
+                        model,
+                        &state.etas,
+                        &mut state.omega_mat,
+                        &mut theta_nat,
+                        gamma_omega,
+                    );
+                } else if let Some(mix) = saem_mix.as_mut() {
+                    let base: Vec<Vec<f64>> = state
+                        .etas
+                        .iter()
+                        .zip(&mix.classes)
+                        .filter(|(_, c)| !over.iter().any(|&(oc, _)| oc == **c))
+                        .map(|(e, _)| e.clone())
+                        .collect();
+                    dm.sa_step(
+                        model,
+                        &base,
+                        &mut state.omega_mat,
+                        &mut theta_nat,
+                        gamma_omega,
+                    );
+                    if mix.omega_stat_active {
+                        for &(c, j) in &over {
+                            let Some(g) = model.eta_densities.iter().find(|d| d.etas == [j]) else {
+                                continue;
+                            };
+                            let st = class_density_msteps.entry((c, j)).or_insert_with(|| {
+                                crate::estimation::eta_density_mstep::DensityMstep::for_groups(
+                                    std::slice::from_ref(g),
+                                    &init_params.omega_fixed,
+                                    &vec![true; n_theta],
+                                    &theta_bounds_nat,
+                                )
+                            });
+                            let Some(st) = st.as_mut() else { continue };
+                            let members: Vec<Vec<f64>> = state
+                                .etas
+                                .iter()
+                                .zip(&mix.classes)
+                                .filter(|(_, cl)| **cl == c)
+                                .map(|(e, _)| e.clone())
+                                .collect();
+                            if members.is_empty() {
+                                continue;
+                            }
+                            let mut tmp = state.omega_mat.clone();
+                            tmp[(j, j)] = mix.s2_diag[c][j];
+                            let mut th = theta_nat.clone();
+                            st.sa_step(model, &members, &mut tmp, &mut th, gamma_omega);
+                            mix.s2_diag[c][j] = tmp[(j, j)];
+                        }
+                    }
+                }
+            }
+            if let Some(dm) = kappa_density_mstep.as_mut() {
+                let kdraws: Vec<Vec<f64>> = state.kappas.iter().flatten().cloned().collect();
+                dm.sa_step(
+                    model,
+                    &kdraws,
+                    &mut state.omega_iov_mat,
+                    &mut theta_nat,
+                    gamma_omega,
+                );
+            }
+            for &t in &density_owned_thetas {
+                log_theta[t] = pack_theta(t, theta_nat[t]);
+            }
+        }
+
         // ---- Step 4: M-step theta, sigma (lightweight NLopt, warm-started) ----
         // Only run every few iterations during exploration to save time
         // The exploration throttle exists because a BOBYQA re-maximisation costs
@@ -6242,6 +6372,11 @@ pub fn run_saem(
                 // for the rest of this iteration's NLL cache refresh).
                 let mut temp_theta_lower = log_theta_lower.clone();
                 let mut temp_theta_upper = log_theta_upper.clone();
+                // #1716: a density's shape θ is the prior M-step's (Step 3c), not the data's.
+                for &t in &density_owned_thetas {
+                    temp_theta_lower[t] = log_theta[t];
+                    temp_theta_upper[t] = log_theta[t];
+                }
                 let mut n_pinned: u64 = 0;
                 for &(theta_idx, eta_idx) in &mu_ref_pairs {
                     if init_params
@@ -6458,6 +6593,11 @@ pub fn run_saem(
                     .collect();
                 let mut temp_theta_lower = log_theta_lower.clone();
                 let mut temp_theta_upper = log_theta_upper.clone();
+                // #1716: a density's shape θ is the prior M-step's (Step 3c), not the data's.
+                for &t in &density_owned_thetas {
+                    temp_theta_lower[t] = log_theta[t];
+                    temp_theta_upper[t] = log_theta[t];
+                }
                 let mut n_pinned: u64 = 0;
                 for pair in &mix_mu_ref_pairs {
                     let eta_idx = pair.eta_idx;

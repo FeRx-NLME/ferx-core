@@ -718,6 +718,10 @@ fn fit_unstamped(
     // gradient or the inner solve, and a long σ was carried into the result unused.
     // The same checks the post-fit entry points run; `fit` returns their message.
     crate::api::check_theta_length(model, &init_params.theta)?;
+    // #1716: the combinations a `density` random effect is not carried beside yet.
+    if let Some(m) = crate::stats::eta_density::fit_refusal(model, options, init_params) {
+        return Err(crate::api::entry_refusals::density_unsupported(m));
+    }
     crate::api::check_param_shape(model, &crate::api::ParamBlock::all_of(init_params))?;
     // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
     // objective via the derivative-free (BOBYQA) outer optimizer. Estimators the mixture
@@ -2910,7 +2914,17 @@ fn fit_inner(
     crate::io::checkpoint::finish_success();
 
     // Shrinkage
-    let shrinkage_eta = compute_eta_shrinkage(&subjects, &result.params.omega.matrix);
+    let mut shrinkage_eta = compute_eta_shrinkage(&subjects, &result.params.omega.matrix);
+    // #1716: a density ETA's ω is its *effect's* variance and its latent is not centred
+    // at 0, so its shrinkage is taken on the effect: `1 − RMS(m(ẑ) − μ)/σ` with the
+    // kind's exact prior mean μ and SD σ; NaN where those have no closed form.
+    crate::stats::eta_density::effect_shrinkage(
+        model,
+        &result.params.theta,
+        &result.params.omega.matrix,
+        &subjects,
+        &mut shrinkage_eta,
+    );
     let shrinkage_eps = compute_eps_shrinkage(&subjects);
     // Nested levels (#1082 PR4): per-level κ̂, and each κ's shrinkage over the groups
     // of its own level, which replaces the per-cell pool. The per-slot breakdown has no
@@ -3329,6 +3343,7 @@ fn fit_inner(
         environment: crate::environment::detect(),
         eta_param_info: model.eta_param_info.clone(),
         kappa_param_types: model.kappa_param_types.clone(),
+        kappa_distributions: model.kappa_distributions.clone(),
         data_bindings: model.data_bindings().clone(),
         theta_transform: model.theta_transform.clone(),
         sigma_types: model

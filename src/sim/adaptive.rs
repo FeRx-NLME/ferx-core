@@ -758,6 +758,32 @@ pub(crate) fn subject_kappa_base_seed(root: u64, subject_id: &str, replicate: us
 /// an occasion, a monitor, or another κ component never shifts any other draw. The
 /// caller assembles `n_kappa` such draws into a z-vector and applies the IOV
 /// Cholesky factor to obtain the correlated κ for that occasion.
+/// #1716: occasion `g`'s κ under the model's κ density groups, redrawn from the Gaussian
+/// `kappa_g` on its own deterministic substream (keyed past every component's), so the
+/// adaptive driver's two builds of a window's κ stay bit-identical.
+pub(crate) fn kappa_density_redraw(
+    model: &crate::types::CompiledModel,
+    omega_iov: &nalgebra::DMatrix<f64>,
+    theta: &[f64],
+    base_seed: u64,
+    occasion: usize,
+    kappa_g: &mut [f64],
+) {
+    use rand::SeedableRng;
+    if model.kappa_densities.is_empty() {
+        return;
+    }
+    let key = combine_seed(combine_seed(base_seed, occasion as u64), u64::MAX);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(key);
+    crate::stats::eta_density::redraw_latents(
+        &model.kappa_densities,
+        omega_iov,
+        theta,
+        kappa_g,
+        &mut rng,
+    );
+}
+
 pub(crate) fn kappa_standard_normal(base_seed: u64, occasion: usize, component: usize) -> f64 {
     use rand::SeedableRng;
     use rand_distr::{Distribution, Normal};

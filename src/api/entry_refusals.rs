@@ -95,6 +95,12 @@ pub(crate) fn ctmm_unsupported(message: impl Into<String>) -> EngineError {
     coded("E_CTMM_UNSUPPORTED", Some("markov_model"), message.into())
 }
 
+/// `E_DENSITY_UNSUPPORTED`: a non-Gaussian random-effect distribution (`density`, #1716)
+/// beside a feature or under an estimator whose objective does not carry it yet.
+pub(crate) fn density_unsupported(message: impl Into<String>) -> EngineError {
+    coded("E_DENSITY_UNSUPPORTED", Some("parameters"), message.into())
+}
+
 /// `E_TTE_NOT_SIMULATABLE`: a TTE endpoint and population the event-time simulator
 /// cannot draw from — more than one recurrent stream on a subject, a recurrent cause
 /// beside a competing single-event one, an EVID=3/4 reset under a recurrent or an
