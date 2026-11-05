@@ -275,9 +275,15 @@ fn fd_h_runs_at_the_jacobian_tolerance_and_leaves_the_fits_in_force() {
         baked.max_steps * ODE_FD_JACOBIAN_MAX_STEPS_FACTOR,
     );
     let tighter = pinned_chain(1e-10, 1e-12, baked.max_steps * 100);
-    assert!(fd_jacobian_ode_override(&default).is_some());
-    assert_eq!(fd_jacobian_ode_override(&pinned), None);
-    assert_eq!(fd_jacobian_ode_override(&tighter), None);
+    let tolerances = |m: &CompiledModel| {
+        let ov = fd_jacobian_ode_override(m).expect("an integrated model");
+        (ov.reltol.unwrap(), ov.abstol.unwrap())
+    };
+    assert_eq!(
+        tolerances(&default),
+        (ODE_FD_JACOBIAN_RELTOL, ODE_FD_JACOBIAN_ABSTOL)
+    );
+    assert_eq!(tolerances(&tighter), (1e-10, 1e-12));
 
     let pop = chain_population(1);
     let s = &pop.subjects[0];
@@ -493,10 +499,85 @@ fn a_redone_final_h_is_reported_by_the_fit() {
     roomy.gradient_method = GradientMethod::Fd;
     assert_eq!(fd_h_subjects_redone(&roomy, &pop, &params, &etas, &[]), 0);
 
-    // Already at the Jacobian's tolerance: nothing to redo, and nothing is built.
-    let mut tight = pinned_chain(1e-9, 1e-11, STARVED_MAX_STEPS);
+    // #2701 review 3: a fit already at the Jacobian's tolerance is checked all the same.
+    let mut tight = pinned_chain(1e-9, 1e-11, 5);
     tight.gradient_method = GradientMethod::Fd;
-    assert_eq!(fd_h_subjects_redone(&tight, &pop, &params, &etas, &[]), 0);
+    assert_eq!(fd_h_subjects_redone(&tight, &pop, &params, &etas, &[]), 4);
+    let mut tight_roomy = pinned_chain(1e-9, 1e-11, 100_000);
+    tight_roomy.gradient_method = GradientMethod::Fd;
+    assert_eq!(
+        fd_h_subjects_redone(&tight_roomy, &pop, &params, &etas, &[]),
+        0
+    );
+}
+
+/// #2701 review 3: the budget a tight fit's Jacobian gets is the same multiple, so a perturbed
+/// solve that needs more than the fit's own budget can still finish. Measured on this fixture
+/// at `1e-9` / `1e-11`: the fit's budget here leaves segments unfinished, 32 times it does not.
+#[test]
+fn an_already_tight_fit_gets_the_jacobians_budget() {
+    let mut model = pinned_chain(1e-9, 1e-11, TIGHT_FIT_MAX_STEPS);
+    model.gradient_method = GradientMethod::Fd;
+    let pop = chain_population(2);
+    let params = model.default_params.clone();
+    let etas: Vec<DVector<f64>> = (0..2)
+        .map(|i| DVector::from_column_slice(&eta_of(i)))
+        .collect();
+    let scope = crate::ode::solver::SolverStatsScope::enter();
+    let mut scratch = pk::EventPkParams::default();
+    for (s, eta) in pop.subjects.iter().zip(&etas) {
+        pk::compute_predictions_with_tv_into_with_schedule(
+            &model,
+            s,
+            &params.theta,
+            eta.as_slice(),
+            &mut scratch,
+            None,
+        );
+    }
+    assert!(scope.collected().kept_unfinished_segments() > 0);
+    drop(scope);
+    assert_eq!(fd_h_subjects_redone(&model, &pop, &params, &etas, &[]), 0);
+    let mut roomy = pinned_chain(1e-9, 1e-11, 1_000_000);
+    roomy.gradient_method = GradientMethod::Fd;
+    let s = &pop.subjects[0];
+    let eta = etas[0].as_slice();
+    assert_eq!(
+        compute_jacobian_fd(&model, s, &params.theta, eta, &mut scratch, None),
+        compute_jacobian_fd(&roomy, s, &params.theta, eta, &mut scratch, None),
+        "the budget must not have truncated this H"
+    );
+}
+
+const TIGHT_FIT_MAX_STEPS: usize = 200;
+
+/// #2701 review 3: a candidate carries its own `H`'s status, on the plain and the IOV solve.
+#[test]
+fn an_ebe_candidate_carries_its_own_h_status() {
+    let mut starved = budget_starved_chain();
+    starved.gradient_method = GradientMethod::Fd;
+    let mut roomy = pinned_chain(1e-1, 1e-1, 100_000);
+    roomy.ode_spec.as_mut().unwrap().solver_opts.method = OdeMethod::Rosenbrock23;
+    roomy.gradient_method = GradientMethod::Fd;
+    let mut pop = chain_population(1);
+    pop.subjects[0].observations = vec![1.0; 10];
+    let s = &pop.subjects[0];
+    let solve = |m: &CompiledModel| find_ebe(m, s, &m.default_params, 5, 1e-3, None, None, 0);
+    assert!(solve(&starved).fd_h_redone);
+    assert!(!solve(&roomy).fd_h_redone);
+
+    let iov = |max_steps: usize| {
+        let mut m = chain_iov_model();
+        let opts = &mut m.ode_spec.as_mut().unwrap().solver_opts;
+        opts.reltol = 1e-1;
+        opts.abstol = 1e-1;
+        opts.max_steps = max_steps;
+        opts.method = OdeMethod::Rosenbrock23;
+        m.gradient_method = GradientMethod::Fd;
+        m
+    };
+    assert!(solve(&iov(STARVED_MAX_STEPS)).fd_h_redone);
+    assert!(!solve(&iov(100_000)).fd_h_redone);
 }
 
 /// Under IOV the count runs on the IOV `H`, and a subject with no κ̂ is skipped.
@@ -574,9 +655,11 @@ fn the_fit_warns_when_its_final_h_ran_at_the_fits_tolerance() {
         .unwrap_or_else(|| panic!("no FD Jacobian warning in {:?}", result.warnings));
     for clause in [
         "4 of 4 subjects' finite-difference Jacobian",
-        "ode_reltol = 1e-8 / ode_abstol = 1e-10",
-        "ran at the fit's own ODE tolerance",
-        "so the OFV may be too high",
+        "at no looser than ode_reltol = 1e-8 / ode_abstol = 1e-10",
+        "could not be integrated cleanly at the final estimates",
+        "with 32 times ode_max_steps",
+        "was taken at the fit's own ODE settings",
+        "so the OFV may be off",
         "Raise ode_max_steps or ode_stiff_abort_after, or name a stiff ode_method",
     ] {
         assert!(msg.contains(clause), "missing {clause:?} in {msg}");

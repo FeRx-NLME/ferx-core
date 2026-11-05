@@ -3753,23 +3753,27 @@ pub(crate) fn non_fit_diagnostics(
 const FD_H_NOT_TIGHTENED_TOKEN: &str = "W_FD_JACOBIAN_NOT_TIGHTENED";
 
 /// The warning for `redone` of `n_subjects` subjects whose finite-difference `H` at the final
-/// estimates could not run at the Jacobian's tolerance (#2701), or `None` when none did.
+/// estimates fell back to the fit's own ODE settings (#2701), or `None` when none did. The
+/// wording holds for a fit tighter than the Jacobian's target too, whose tolerances are its own.
 pub(crate) fn fd_h_not_tightened_warning(
     redone: usize,
     n_subjects: usize,
 ) -> Option<(String, WarningEntry)> {
-    use crate::estimation::inner_optimizer::{ODE_FD_JACOBIAN_ABSTOL, ODE_FD_JACOBIAN_RELTOL};
+    use crate::estimation::inner_optimizer::{
+        ODE_FD_JACOBIAN_ABSTOL, ODE_FD_JACOBIAN_MAX_STEPS_FACTOR, ODE_FD_JACOBIAN_RELTOL,
+    };
     if redone == 0 {
         return None;
     }
     let msg = format!(
         "{FD_H_NOT_TIGHTENED_TOKEN}: {redone} of {n_subjects} subjects' finite-difference \
-         Jacobian could not be integrated at ode_reltol = {ODE_FD_JACOBIAN_RELTOL:.0e} / \
-         ode_abstol = {ODE_FD_JACOBIAN_ABSTOL:.0e} at the final estimates, and ran at the \
-         fit's own ODE tolerance instead. Integration error enters the objective's \
-         determinant term through this Jacobian, so the OFV may be too high. Raise \
-         ode_max_steps or ode_stiff_abort_after, or name a stiff ode_method, so the tighter \
-         solve can finish (#2701)."
+         Jacobian could not be integrated cleanly at the final estimates, at no looser than \
+         ode_reltol = {ODE_FD_JACOBIAN_RELTOL:.0e} / ode_abstol = \
+         {ODE_FD_JACOBIAN_ABSTOL:.0e} with {ODE_FD_JACOBIAN_MAX_STEPS_FACTOR} times \
+         ode_max_steps, and was taken at the fit's own ODE settings instead. Integration \
+         error enters the objective's determinant term through this Jacobian, so the OFV \
+         may be off. Raise ode_max_steps or ode_stiff_abort_after, or name a stiff \
+         ode_method, so the solve can finish (#2701)."
     );
     let details = serde_json::json!({ "subjects": redone, "n_subjects": n_subjects });
     let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), Some(details));

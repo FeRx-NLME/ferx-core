@@ -529,6 +529,9 @@ pub(crate) static GRADIENT_TIMINGS: GradientTimings = GradientTimings::new();
 pub struct EbeResult {
     pub eta: DVector<f64>,
     pub h_matrix: DMatrix<f64>,
+    /// This candidate's `h_matrix` is an FD Jacobian that fell back to the fit's own ODE
+    /// settings (#2701). On the candidate so a discarded one's fallback leaves with it.
+    pub(crate) fd_h_redone: bool,
     /// Exact conditional eta Hessian at the returned mode when the adjoint
     /// (`exact_inner_hessian`) can produce it.  Laplace/AGQ may reuse this instead
     /// of immediately repeating the same evaluation.
@@ -2372,6 +2375,7 @@ fn find_ebe_impl_from(
         return EbeResult {
             eta: DVector::zeros(model.n_eta),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
@@ -2695,6 +2699,7 @@ fn find_ebe_solve(
         return Some(EbeResult {
             eta: DVector::zeros(0),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), 0),
+            fd_h_redone: false,
             terminal_hessian: policy
                 .capture_terminal_hessian
                 .then(|| DMatrix::zeros(0, 0)),
@@ -3293,6 +3298,7 @@ fn find_ebe_solve(
                 .then(|| DMatrix::from_fn(rows.len(), n_eta, |j, k| rows[j].df_deta[k]))
             })
     };
+    let redone_before = fd_h_redone_on_this_thread();
     let h_matrix = ebe_h_matrix(
         model,
         subject,
@@ -3302,10 +3308,12 @@ fn find_ebe_solve(
         &mut pk_scratch_cell.borrow_mut(),
         schedule,
     );
+    let fd_h_redone = fd_h_redone_on_this_thread() > redone_before;
 
     Some(EbeResult {
         eta: DVector::from_column_slice(&eta_true),
         h_matrix,
+        fd_h_redone,
         terminal_hessian,
         converged: ebe_exit.converged(),
         used_fallback,
@@ -3854,6 +3862,7 @@ fn find_ebe_iov_seeded(
         return EbeResult {
             eta: DVector::from_column_slice(&bsv_eta),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), n_eta),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
@@ -4015,11 +4024,14 @@ fn find_ebe_iov_seeded(
         .map(|k| DVector::from_column_slice(k))
         .collect();
 
+    let redone_before = fd_h_redone_on_this_thread();
     let h_matrix = iov_ebe_h_matrix(model, subject, params, &bsv_eta, &kappas_vec);
+    let fd_h_redone = fd_h_redone_on_this_thread() > redone_before;
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
         h_matrix,
+        fd_h_redone,
         terminal_hessian: None,
         converged: ebe_exit.converged() && nll.is_finite(),
         used_fallback,
@@ -7319,19 +7331,18 @@ pub(crate) const ODE_FD_JACOBIAN_ABSTOL: f64 = 1e-10;
 /// How much the step budget grows under [`fd_jacobian_ode_override`]. Tightening the default
 /// `ode_reltol` 10⁴× costs an order-`p` stepper 10^(4/p) more steps: ~6× for rk45, ~22× for
 /// rosenbrock23. A cap, paid only by a solve that needs it.
-const ODE_FD_JACOBIAN_MAX_STEPS_FACTOR: usize = 32;
+pub(crate) const ODE_FD_JACOBIAN_MAX_STEPS_FACTOR: usize = 32;
 
 /// The ODE solver override the FD Jacobian integrates under, or `None` when the model has no
-/// integrator or already runs at least that tight. Every field is pinned, so the fit's
-/// `ode_method` and budgets reach the Jacobian. Read on the thread that solves, where the
-/// fit's override is in force.
+/// integrator. A fit already at least that tight keeps its tolerances and still gets the
+/// budget and [`with_fd_jacobian_integration`]'s health check: a perturbed solve can fail where
+/// the prediction pass at η̂ does not, and no other diagnostic sees it. Every field is pinned,
+/// so the fit's `ode_method` and budgets reach the Jacobian. Read on the thread that solves,
+/// where the fit's override is in force.
 fn fd_jacobian_ode_override(
     model: &CompiledModel,
 ) -> Option<crate::ode::solver::OdeSolverOverride> {
     let eff = model.integrator_spec()?.effective_solver_opts();
-    if eff.reltol <= ODE_FD_JACOBIAN_RELTOL && eff.abstol <= ODE_FD_JACOBIAN_ABSTOL {
-        return None;
-    }
     Some(crate::ode::solver::OdeSolverOverride {
         reltol: Some(eff.reltol.min(ODE_FD_JACOBIAN_RELTOL)),
         abstol: Some(eff.abstol.min(ODE_FD_JACOBIAN_ABSTOL)),
@@ -7361,7 +7372,7 @@ fn fd_jacobian_ode_override(
 /// test, so either way the difference stays finite without meeting the tolerance. So the pass
 /// is accepted only if it is finite and the trajectories it **kept** have no unfinished segment
 /// and no clamped step. An `auto` attempt the guard discarded and re-solved cleanly does not
-/// count against it. Otherwise it is redone at the fit's tolerance with the same step, and
+/// count against it. Otherwise it is redone at the fit's own settings with the same step, and
 /// counted in [`FD_H_REDONE`], which is how the fit reports it to the user.
 fn with_fd_jacobian_integration(
     model: &CompiledModel,
@@ -7395,23 +7406,23 @@ thread_local! {
     static FD_H_REDONE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// FD Jacobians redone on this thread so far: a caller solving one subject serially reads it
-/// on either side of the solve.
-pub(crate) fn fd_h_redone_on_this_thread() -> usize {
+/// FD Jacobians redone on this thread so far, read on either side of building one `H`.
+fn fd_h_redone_on_this_thread() -> usize {
     FD_H_REDONE.with(|c| c.get())
 }
 
-/// How many subjects' `H` at the final estimates ran at the fit's tolerance because the
-/// Jacobian's own could not finish (#2701). Not for a `[mixture]` fit, whose objective reads
-/// every contributing class's `H`: `mixture_ofv` counts those as it builds them.
+/// How many subjects' `H` at the final estimates fell back to the fit's own settings because
+/// the Jacobian's pass could not meet its tolerance (#2701). Not for a `[mixture]` fit, whose
+/// objective reads every contributing class's `H`: `mixture_ofv` reads
+/// [`EbeResult::fd_h_redone`] for those.
 ///
 /// A second pass over the subjects, because no objective evaluation carries a report out of
 /// the inner loop, and because the reported objective reads this `H` and no earlier one. It
 /// builds `H` through [`ebe_h_matrix_of`], the route the fit took, so a subject on an exact
 /// Jacobian counts nothing, at the cost of one first-order sweep per subject.
 ///
-/// `0` without building anything when no tightening applies. A subject the fit reported no
-/// EBE or no κ̂ for is skipped.
+/// `0` without building anything on a model that never integrates. A subject the fit reported
+/// no EBE or no κ̂ for is skipped.
 pub(crate) fn fd_h_subjects_redone(
     model: &CompiledModel,
     population: &Population,
@@ -7790,6 +7801,7 @@ fn cancelled_ebe_placeholder(
     EbeResult {
         eta,
         h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+        fd_h_redone: false,
         terminal_hessian: None,
         converged: false,
         used_fallback: false,

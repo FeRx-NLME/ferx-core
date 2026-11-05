@@ -186,7 +186,6 @@ pub(crate) fn mixture_ofv_with_modes(
                 .and_then(|w| w.get(cls))
                 .and_then(|wc| wc.get(i))
                 .map(|e| e.as_slice());
-            let redone_before = crate::estimation::inner_optimizer::fd_h_redone_on_this_thread();
             let ebe = find_ebe_for_stage(
                 model,
                 subject,
@@ -198,8 +197,7 @@ pub(crate) fn mixture_ofv_with_modes(
                 options.inner_restarts,
                 options,
             );
-            fd_h_redone[cls][i] =
-                crate::estimation::inner_optimizer::fd_h_redone_on_this_thread() > redone_before;
+            fd_h_redone[cls][i] = ebe.fd_h_redone;
             // Inter-occasion variability (#985): `find_ebe` already routes to the
             // IOV inner solve when `n_kappa > 0` (each class carries the shared base
             // `omega_iov`, since `class_params` only swaps Ω/Σ), so `ebe.kappas` are
