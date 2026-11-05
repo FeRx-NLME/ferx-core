@@ -18,10 +18,10 @@
 //!   to NONMEM's η by `(z + S/2)/√S`. Measured: OFV 6.4e-8, EBE 2.4e-8.
 //! - **logistic**: two IMP engines differ by ≈ 0.06 on a *Gaussian* model already
 //!   (`eta_shape_null` under the same `$EST`), so the absolute −2LL is the wrong object.
-//!   The density's contribution is the difference against that null, which agreed to
-//!   0.007 in the review run (NONMEM's SE of the difference ≈ 0.025).
-//!   `the_logistic_density_matches_nonmem_net_of_the_null` asserts it once the null's
-//!   IMP output (`eta_density_imp_null.ctl`) is committed.
+//!   The density's contribution is the difference against that null, compared on ferx's
+//!   IS marginal (not `ofv`, a Laplace pass after IMP): measured gap 1.9e-5.
+//!   `the_logistic_density_matches_nonmem_net_of_the_null` asserts it against the null's
+//!   committed IMP output (`eta_density_imp_null.*`).
 //!
 //! `the_lognormal_density_is_its_affine_gaussian_twin` runs the first reduction inside
 //! ferx as well: the density path against ferx's own Gaussian path.
@@ -198,7 +198,6 @@ fn the_lognormal_density_matches_nonmem() {
 /// on the null already, so only the density's contribution is comparable. NONMEM's side is
 /// the mean over its `EONLY` iterations, ferx's the mean over five seeds.
 #[test]
-#[ignore = "pending: commit nonmem_anchor/results/eta_density_imp_null.ext (eta_density_imp_null.ctl in nonmem:7.6.0-anchor)"]
 fn the_logistic_density_matches_nonmem_net_of_the_null() {
     let mean_iters = |file: &str| {
         let objs: Vec<f64> = nonmem_rows(file, 1)
@@ -226,9 +225,13 @@ fn the_logistic_density_matches_nonmem_net_of_the_null() {
                     run_covariance_step: false,
                     ..parsed.fit_options.clone()
                 };
+                // The IS marginal, not `ofv`: after an IMP stage `ofv` is a final Laplace
+                // pass (#2654), which is not the object NONMEM's IMP `OBJ` estimates.
                 fit(&parsed.model, &pop, &parsed.model.default_params, &options)
                     .expect("IMP evaluates")
-                    .ofv
+                    .importance_sampling
+                    .expect("an IMP fit reports its IS marginal")
+                    .minus2_log_likelihood
             })
             .collect();
         assert!(ofvs.iter().all(|v| v.is_finite()), "{ofvs:?}");
@@ -236,7 +239,11 @@ fn the_logistic_density_matches_nonmem_net_of_the_null() {
     };
     let ferx_diff = imp("omega ETA_CL ~ 0.2 density logistic") - imp("omega ETA_CL ~ 0.2");
     let gap = (ferx_diff - nm_diff).abs();
-    eprintln!("logistic − null: ferx {ferx_diff:.4}, NONMEM {nm_diff:.4}, gap {gap:.4}");
-    // Review run: gap 0.007 against NONMEM's SE of the difference ≈ 0.025; 3 SE.
-    assert!(gap < 0.075, "gap {gap}");
+    eprintln!("logistic − null: ferx {ferx_diff:.6}, NONMEM {nm_diff:.6}, gap {gap:.6}");
+    // Measured (macOS arm64, both sides averaged over five seeds): gap 1.9e-5. The bound
+    // is set to kill the wrong object, not to cover NONMEM's MC noise (SE of the
+    // difference ≈ 0.025, but both sides are fixed, seeded numbers): reading `ofv` (the
+    // final Laplace pass) instead of the IS marginal gives a gap of 0.027, so 0.01 kills
+    // that with 2.7× margin and leaves ~500× headroom over the measured gap.
+    assert!(gap < 0.01, "gap {gap}");
 }
