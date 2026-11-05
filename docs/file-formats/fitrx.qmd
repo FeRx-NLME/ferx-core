@@ -52,6 +52,56 @@ save_fit(
 )?;
 ```
 
+The bundle is built in memory, written to a temporary file in the target's directory,
+and renamed into place. A save that fails leaves an existing bundle as it was and no
+partial file behind. The new file keeps what `File::create` would have given it: an
+existing bundle's permissions, the umask's for a new one, and a symlink at the path is
+followed. A read-only bundle is refused.
+
+`save_fit` refuses, with `FitrxError::Unwritable`, anything that is not what was fitted:
+
+- a data file whose SHA-256 is not `FitResult::data_hash`. The error names the file.
+- model text whose SHA-256 is not `FitResult::model_hash`.
+
+A fit with no recorded hash, such as one made in memory, has nothing to compare, so its
+data and model text are written unchecked.
+
+## Bundles in memory
+
+`save_fit` and `load_fit` wrap functions that work on a bundle's bytes, for an interface
+that carries the bundle on its fit object:
+
+| Function | Purpose |
+|---|---|
+| `save_fit_to_bytes` | The bytes `save_fit` would write |
+| `load_fit_from_bytes` | `load_fit` from bytes |
+| `load_fit_from_bytes_without_population` | `load_fit_without_population` from bytes |
+| `bundle_with_data` | Add or replace `data.csv`, checked against the bundle's `data_hash` |
+| `bundle_with_interface_extras` | Set `interface_extras.json`, or remove it with `None` |
+
+The two `bundle_with_*` functions return new bytes laid out as a save with that content
+would be. Other entries are carried over unchanged, and the manifest keeps its
+`created_at`.
+
+## Saving a loaded fit
+
+`save_fit` needs a `Population` for the `TIME`, `DV` and `OCC` columns of
+`predictions.csv`, which `FitResult` does not hold. `save_loaded_fit` takes a `LoadedFit`
+instead and writes those columns back from the bundle it was loaded from, so a bundle
+with no `data.csv` can be saved again:
+
+```rust
+use ferx_core::io::fitrx::{load_fit, save_loaded_fit, SaveFitOptions};
+
+let loaded = load_fit(Path::new("run1.fitrx"))?;
+save_loaded_fit(&loaded, Path::new("copy.fitrx"), SaveFitOptions::default())?;
+```
+
+A bundled `data.csv` is kept, even after `load_fit_without_population`, unless
+`SaveFitOptions::include_data` names another file. It is checked against `data_hash` in
+either case. If the subjects in `loaded.fit` no longer match those columns, the save is
+refused.
+
 ## Loading a bundle
 
 ```rust
@@ -612,7 +662,8 @@ duplicated for grep-friendliness.
 
 A verbatim copy of the input NONMEM CSV. Only present when the writer was
 asked to embed data (`--include-data` on the CLI, or `SaveFitOptions::include_data
-= Some(path)` via the Rust API).
+= Some(path)` via the Rust API). The bytes must match the fit's `data_hash`: a file
+edited since the fit is refused.
 
 `load_fit` re-reads it into `LoadedFit::population`. On a bundle that records
 `reader_settings` and a `population_fingerprint`, it reads with those settings

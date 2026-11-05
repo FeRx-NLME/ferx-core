@@ -26,7 +26,7 @@ use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zip::write::SimpleFileOptions;
@@ -54,7 +54,8 @@ pub enum FitrxError {
     /// [`save_fit`] refused a fit whose recorded settings [`load_fit`] would reject as
     /// `Corrupt` (#1770): a `scoring_settings` or `sir_settings` value outside the
     /// `[fit_options]` domain, which only a `FitResult` edited after the fit can hold.
-    /// Nothing is written.
+    /// Also a data file or model text whose SHA-256 is not the one the fit recorded
+    /// (#2696): that is not what was fitted. Nothing is written.
     #[error("refusing to write .fitrx: {0}")]
     Unwritable(String),
 }
@@ -63,7 +64,8 @@ pub enum FitrxError {
 #[derive(Debug, Clone, Default)]
 pub struct SaveFitOptions {
     /// When `Some(path)`, the file at `path` is embedded verbatim as `data.csv`
-    /// inside the archive. When `None`, no data is bundled.
+    /// inside the archive, provided its bytes match `FitResult::data_hash` (a fit
+    /// with no recorded hash is embedded unchecked). When `None`, no data is bundled.
     pub include_data: Option<PathBuf>,
 }
 
@@ -78,6 +80,61 @@ pub struct LoadedFit {
     pub manifest: Manifest,
     /// The model-selection verdicts as the saving ferx reached them.
     pub verdicts: FitVerdicts,
+    /// `predictions.csv`'s data columns, which [`FitResult`] has no field for.
+    /// [`save_loaded_fit`] writes them back in place of a population.
+    recorded_rows: Vec<RecordedRows>,
+    /// The bundled `data.csv`, kept whether or not it was parsed into `population`,
+    /// so [`save_loaded_fit`] does not drop it.
+    data_csv: Option<Vec<u8>>,
+}
+
+/// One subject's data columns as `predictions.csv` holds them.
+#[derive(Debug, Clone, Default)]
+struct RecordedRows {
+    time: Vec<f64>,
+    dv: Vec<f64>,
+    occ: Vec<u32>,
+}
+
+/// Where `predictions.csv` gets the columns [`FitResult`] does not hold.
+enum ObservedRows<'a> {
+    Population(&'a Population),
+    Recorded(&'a [RecordedRows]),
+}
+
+impl ObservedRows<'_> {
+    fn any_occ(&self) -> bool {
+        match self {
+            Self::Population(p) => p.subjects.iter().any(|s| !s.occasions.is_empty()),
+            Self::Recorded(rows) => rows.iter().any(|r| !r.occ.is_empty()),
+        }
+    }
+
+    /// The raw data TIME, so the bundle's predictions.csv joins back to the input CSV
+    /// and to the sdtab, which is also raw; `obs_times` may be the internal shifted
+    /// timeline for stacked reset occasions. Falls back to `obs_times` when no raw
+    /// vector was recorded.
+    fn time(&self, subject: usize, j: usize) -> f64 {
+        match self {
+            Self::Population(p) => p.subjects[subject].readout_time(j),
+            Self::Recorded(rows) => rows[subject].time[j],
+        }
+    }
+
+    fn dv(&self, subject: usize, j: usize) -> f64 {
+        match self {
+            Self::Population(p) => p.subjects[subject].observations[j],
+            Self::Recorded(rows) => rows[subject].dv[j],
+        }
+    }
+
+    fn occ(&self, subject: usize, j: usize) -> u32 {
+        let occasions = match self {
+            Self::Population(p) => &p.subjects[subject].occasions,
+            Self::Recorded(rows) => &rows[subject].occ,
+        };
+        occasions.get(j).copied().unwrap_or(0)
+    }
 }
 
 /// The [`crate::model_selection`] verdicts recorded in `fit.json`, derived from the fit
@@ -832,6 +889,9 @@ const COVTAB_ENTRY: &str = "covtab.csv";
 const COVTAB_BASE_COLUMNS: [&str; 3] = ["ID", "TIME", "EVID"];
 const TRACE_ENTRY: &str = "trace.csv";
 const EXTRAS_ENTRY: &str = "interface_extras.json";
+const DATA_ENTRY: &str = "data.csv";
+/// The entries an existing bundle's bytes can be changed in, in [`save_fit`]'s order.
+const REWRITABLE_ENTRIES: [&str; 2] = [DATA_ENTRY, EXTRAS_ENTRY];
 
 /// The bundle entry holding level `name`'s κ̂ (#1082 PR4).
 fn level_kappa_entry(name: &str) -> String {
@@ -1042,10 +1102,105 @@ fn check_writable(r: &FitResult) -> Result<(), FitrxError> {
         }
     }
     if let Some(extras) = &r.interface_extras {
-        serde_json::from_str::<serde::de::IgnoredAny>(extras).map_err(|e| {
-            FitrxError::Unwritable(format!("interface_extras is not valid JSON: {e}"))
-        })?;
+        check_interface_extras(extras)?;
     }
+    Ok(())
+}
+
+fn check_interface_extras(extras: &str) -> Result<(), FitrxError> {
+    serde_json::from_str::<serde::de::IgnoredAny>(extras)
+        .map_err(|e| FitrxError::Unwritable(format!("interface_extras is not valid JSON: {e}")))?;
+    Ok(())
+}
+
+/// Refuse data whose bytes are not the ones the fit hashed: a file edited since the fit
+/// is not the data that was fitted (#2696). `name` is what the message calls the data.
+/// With no recorded hash there is nothing to compare.
+fn check_data_hash(data: &[u8], expected: Option<&str>, name: &str) -> Result<(), FitrxError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = crate::io::hash::sha256_bytes(data);
+    if actual != expected {
+        return Err(FitrxError::Unwritable(format!(
+            "{name} is not the data that was fitted: its SHA-256 is {actual}, the fit \
+             recorded {expected}. It has changed since the fit was produced; bundle the \
+             original file, or refit."
+        )));
+    }
+    Ok(())
+}
+
+/// [`check_data_hash`] for the model text a bundle would hold.
+fn check_model_hash(r: &FitResult, text: &str) -> Result<(), FitrxError> {
+    let Some(expected) = &r.model_hash else {
+        return Ok(());
+    };
+    let actual = crate::io::hash::sha256_bytes(text.as_bytes());
+    if &actual != expected {
+        let name = r.model_path.as_deref().unwrap_or("the model source");
+        return Err(FitrxError::Unwritable(format!(
+            "the model text for {name} is not the model that was fitted: its SHA-256 is \
+             {actual}, the fit recorded {expected}."
+        )));
+    }
+    Ok(())
+}
+
+/// Read the file [`SaveFitOptions::include_data`] names, with the name its refusal uses.
+fn read_included_data(opts: &SaveFitOptions) -> Result<Option<(Vec<u8>, String)>, FitrxError> {
+    let Some(data_path) = &opts.include_data else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(data_path).map_err(|e| {
+        FitrxError::Io(std::io::Error::new(
+            e.kind(),
+            format!("opening {} for bundling: {}", data_path.display(), e),
+        ))
+    })?;
+    Ok(Some((bytes, format!("data file {}", data_path.display()))))
+}
+
+/// The directory a temporary sibling of `target` goes in. A bare file name has an empty
+/// parent, which is the working directory.
+fn parent_dir(target: &Path) -> &Path {
+    match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// Replace the file at `path` with what `write` produces, or leave it as it was.
+///
+/// `write` fills a temporary file in the target's directory, which is renamed over the
+/// target only once it is complete and synced, so a failure at any point leaves an
+/// existing bundle intact and no partial file behind. The outcome otherwise matches
+/// `File::create`: a symlink is followed, an existing file keeps its permissions, a
+/// read-only one is refused, and a new one gets the umask's.
+fn replace_file(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<(), FitrxError> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let existing = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    if existing.as_ref().is_some_and(|p| p.readonly()) {
+        return Err(FitrxError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is read-only", target.display()),
+        )));
+    }
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".fitrx-").suffix(".tmp");
+    // A temporary file is private by default; a bundle is not.
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    let mut tmp = builder.tempfile_in(parent_dir(&target))?;
+    write(tmp.as_file_mut())?;
+    if let Some(permissions) = existing {
+        tmp.as_file().set_permissions(permissions)?;
+    }
+    tmp.as_file().sync_all()?;
+    tmp.persist(&target).map_err(|e| FitrxError::Io(e.error))?;
     Ok(())
 }
 
@@ -1054,6 +1209,10 @@ fn check_writable(r: &FitResult) -> Result<(), FitrxError> {
 /// `model_source` is the verbatim text of the `.ferx` model; it is embedded so
 /// a future [`load_fit`] can recompile the model and run `predict()` against
 /// the loaded fit.
+///
+/// The bundle is built in memory and moved into place by rename, so a failed save
+/// leaves whatever was at `path` untouched. Data or model text that does not match
+/// the hash the fit recorded is refused with [`FitrxError::Unwritable`].
 pub fn save_fit(
     result: &FitResult,
     population: &Population,
@@ -1061,8 +1220,93 @@ pub fn save_fit(
     path: &Path,
     opts: SaveFitOptions,
 ) -> Result<(), FitrxError> {
-    // Before the file is created, so a refused fit leaves nothing behind.
+    let bytes = save_fit_to_bytes(result, population, model_source, opts)?;
+    replace_file(path, |file| file.write_all(&bytes))
+}
+
+/// [`save_fit`] to memory: the bytes of the bundle it would write.
+pub fn save_fit_to_bytes(
+    result: &FitResult,
+    population: &Population,
+    model_source: &str,
+    opts: SaveFitOptions,
+) -> Result<Vec<u8>, FitrxError> {
+    let data = read_included_data(&opts)?;
+    let data = data.as_ref().map(|(b, name)| (b.as_slice(), name.as_str()));
+    encode_bundle(
+        result,
+        ObservedRows::Population(population),
+        model_source,
+        data,
+    )
+}
+
+/// Write a [`LoadedFit`] to `path` with no [`Population`], as [`save_fit`] does.
+///
+/// `predictions.csv`'s data columns come from the bundle it was loaded from, and a
+/// bundled `data.csv` is kept unless [`SaveFitOptions::include_data`] names another
+/// file. Refused with [`FitrxError::Unwritable`] when those columns do not cover
+/// `loaded.fit`: the bundle had none, or the subjects were changed after the load.
+pub fn save_loaded_fit(
+    loaded: &LoadedFit,
+    path: &Path,
+    opts: SaveFitOptions,
+) -> Result<(), FitrxError> {
+    check_recorded_rows(&loaded.fit, &loaded.recorded_rows)?;
+    let included = read_included_data(&opts)?;
+    let data = match &included {
+        Some((bytes, name)) => Some((bytes.as_slice(), name.as_str())),
+        None => loaded
+            .data_csv
+            .as_deref()
+            .map(|bytes| (bytes, "the bundled data.csv")),
+    };
+    let bytes = encode_bundle(
+        &loaded.fit,
+        ObservedRows::Recorded(&loaded.recorded_rows),
+        &loaded.model_source,
+        data,
+    )?;
+    replace_file(path, |file| file.write_all(&bytes))
+}
+
+fn check_recorded_rows(fit: &FitResult, rows: &[RecordedRows]) -> Result<(), FitrxError> {
+    if rows.len() != fit.subjects.len() {
+        return Err(FitrxError::Unwritable(format!(
+            "the loaded bundle has data columns for {} subjects, the fit has {}; pass the \
+             population to `save_fit`",
+            rows.len(),
+            fit.subjects.len()
+        )));
+    }
+    for (subject, row) in fit.subjects.iter().zip(rows) {
+        let n = subject.ipred.len();
+        if row.time.len() != n || row.dv.len() != n {
+            return Err(FitrxError::Unwritable(format!(
+                "the loaded bundle's predictions.csv has {} TIME and {} DV values for \
+                 subject {:?}, which has {n} predictions; pass the population to `save_fit`",
+                row.time.len(),
+                row.dv.len(),
+                subject.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Serialize a fit. `data` is the bytes for `data.csv` with the name a refusal uses.
+fn encode_bundle(
+    result: &FitResult,
+    rows: ObservedRows<'_>,
+    model_source: &str,
+    data: Option<(&[u8], &str)>,
+) -> Result<Vec<u8>, FitrxError> {
     check_writable(result)?;
+    let effective_source = result.model_text.as_deref().unwrap_or(model_source);
+    check_model_hash(result, effective_source)?;
+    if let Some((bytes, name)) = data {
+        check_data_hash(bytes, result.data_hash.as_deref(), name)?;
+    }
     let wire = build_fit_wire(result);
     // The reader's own shape checks, so a hand-built result with a short parallel vector
     // is refused here rather than saved as a bundle `load_fit` calls corrupt.
@@ -1070,9 +1314,8 @@ pub fn save_fit(
         FitrxError::Corrupt(msg) => FitrxError::Unwritable(msg),
         other => other,
     })?;
-    let file = File::create(path)?;
-    let mut zip = ZipWriter::new(file);
-    let zopts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let zopts = bundle_entry_options();
 
     let mut entries: Vec<String> = Vec::new();
     entries.push("manifest.json".into());
@@ -1114,7 +1357,7 @@ pub fn save_fit(
 
     // --- predictions.csv ---------------------------------------------------
     zip.start_file("predictions.csv", zopts)?;
-    write_predictions_csv(&mut zip, result, population)?;
+    write_predictions_csv(&mut zip, result, &rows)?;
     entries.push("predictions.csv".into());
 
     // --- predictions_discrete.csv (only when the fit has discrete rows) ----
@@ -1139,7 +1382,6 @@ pub fn save_fit(
     }
 
     // --- model.ferx --------------------------------------------------------
-    let effective_source = result.model_text.as_deref().unwrap_or(model_source);
     zip.start_file("model.ferx", zopts)?;
     zip.write_all(effective_source.as_bytes())?;
     entries.push("model.ferx".into());
@@ -1152,18 +1394,10 @@ pub fn save_fit(
     entries.push("warnings.txt".into());
 
     // --- data.csv (optional) ----------------------------------------------
-    if let Some(data_path) = &opts.include_data {
-        let mut src = File::open(data_path).map_err(|e| {
-            FitrxError::Io(std::io::Error::new(
-                e.kind(),
-                format!("opening {} for bundling: {}", data_path.display(), e),
-            ))
-        })?;
-        let mut buf = Vec::new();
-        src.read_to_end(&mut buf)?;
-        zip.start_file("data.csv", zopts)?;
-        zip.write_all(&buf)?;
-        entries.push("data.csv".into());
+    if let Some((bytes, _)) = data {
+        zip.start_file(DATA_ENTRY, zopts)?;
+        zip.write_all(bytes)?;
+        entries.push(DATA_ENTRY.into());
     }
 
     // --- interface_extras.json (only when an interface set it) -------------
@@ -1181,12 +1415,87 @@ pub fn save_fit(
         created_at: iso8601_now(),
         entries,
     };
-    zip.start_file("manifest.json", zopts)?;
-    zip.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
-    zip.write_all(b"\n")?;
+    write_manifest(&mut zip, &manifest)?;
+    Ok(zip.finish()?.into_inner())
+}
 
-    zip.finish()?;
+fn bundle_entry_options() -> SimpleFileOptions {
+    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+}
+
+fn write_manifest<W: Write + std::io::Seek>(
+    zip: &mut ZipWriter<W>,
+    manifest: &Manifest,
+) -> Result<(), FitrxError> {
+    zip.start_file("manifest.json", bundle_entry_options())?;
+    zip.write_all(&serde_json::to_vec_pretty(manifest)?)?;
+    zip.write_all(b"\n")?;
     Ok(())
+}
+
+/// Add `data` to the bundle `bundle` as `data.csv`, replacing any it has, and return the
+/// new bundle's bytes.
+///
+/// The bytes are checked against the `data_hash` in the bundle's `fit.json` first, and a
+/// mismatch is refused with [`FitrxError::Unwritable`], calling them `name` (the file they
+/// came from, say). Every other entry is carried over unchanged.
+pub fn bundle_with_data(bundle: &[u8], data: &[u8], name: &str) -> Result<Vec<u8>, FitrxError> {
+    let mut archive = ZipArchive::new(Cursor::new(bundle))?;
+    read_manifest(&mut archive)?;
+    let wire: FitWire = read_json(&mut archive, "fit.json")?;
+    check_data_hash(data, wire.data_hash.as_deref(), name)?;
+    rewrite_bundle(bundle, DATA_ENTRY, Some(data))
+}
+
+/// Set `interface_extras.json` on the bundle `bundle`, or remove it with `None`, and
+/// return the new bundle's bytes. Text that is not well-formed JSON is refused, as
+/// [`save_fit`] refuses it. Every other entry is carried over unchanged.
+pub fn bundle_with_interface_extras(
+    bundle: &[u8],
+    extras: Option<&str>,
+) -> Result<Vec<u8>, FitrxError> {
+    if let Some(extras) = extras {
+        check_interface_extras(extras)?;
+    }
+    rewrite_bundle(bundle, EXTRAS_ENTRY, extras.map(str::as_bytes))
+}
+
+/// Copy `bundle` with the entry `name` (one of [`REWRITABLE_ENTRIES`]) set to `content`,
+/// or gone when `None`. Those entries and the manifest are written last, in [`save_fit`]'s
+/// order, so an edited bundle has the layout of one saved that way; the rest are copied
+/// still compressed. The manifest keeps its `created_at` and lists the new entries.
+fn rewrite_bundle(
+    bundle: &[u8],
+    name: &str,
+    content: Option<&[u8]>,
+) -> Result<Vec<u8>, FitrxError> {
+    let mut archive = ZipArchive::new(Cursor::new(bundle))?;
+    let mut manifest = read_manifest(&mut archive)?;
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let mut entries = vec!["manifest.json".to_string()];
+    for i in 0..archive.len() {
+        let file = archive.by_index_raw(i)?;
+        let entry = file.name()?.to_string();
+        if entry != "manifest.json" && !REWRITABLE_ENTRIES.contains(&entry.as_str()) {
+            zip.raw_copy_file(file)?;
+            entries.push(entry);
+        }
+    }
+    for entry in REWRITABLE_ENTRIES {
+        if entry == name {
+            if let Some(content) = content {
+                zip.start_file(entry, bundle_entry_options())?;
+                zip.write_all(content)?;
+                entries.push(entry.to_string());
+            }
+        } else if let Some(i) = archive.index_for_name(entry) {
+            zip.raw_copy_file(archive.by_index_raw(i)?)?;
+            entries.push(entry.to_string());
+        }
+    }
+    manifest.entries = entries;
+    write_manifest(&mut zip, &manifest)?;
+    Ok(zip.finish()?.into_inner())
 }
 
 fn build_fit_wire(r: &FitResult) -> FitWire {
@@ -1647,10 +1956,10 @@ fn write_conddist_csv<W: Write>(w: &mut W, r: &FitResult, cd: &CondDist) -> Resu
 fn write_predictions_csv<W: Write>(
     w: &mut W,
     r: &FitResult,
-    p: &Population,
+    rows: &ObservedRows<'_>,
 ) -> Result<(), FitrxError> {
     let any_cens = r.subjects.iter().any(|s| s.cens.iter().any(|&c| c != 0));
-    let any_occ = p.subjects.iter().any(|s| !s.occasions.is_empty());
+    let any_occ = rows.any_occ();
     // NPDE/NPD are only present when the fit ran with npde_nsim > 0.
     let any_npde = r
         .subjects
@@ -1671,17 +1980,12 @@ fn write_predictions_csv<W: Write>(
     writeln!(w, "{}", header)?;
 
     for (si, sr) in r.subjects.iter().enumerate() {
-        let subj = &p.subjects[si];
         for j in 0..sr.ipred.len() {
             let mut row = csv_escape(&sr.id);
             row.push(',');
-            // Report the raw data TIME (so the bundle's predictions.csv joins back
-            // to the input CSV and to the sdtab, which is also raw); `obs_times`
-            // may be the internal shifted timeline for stacked reset occasions.
-            // Falls back to `obs_times` when no raw vector was recorded.
-            row.push_str(&fmt_f64(subj.readout_time(j)));
+            row.push_str(&fmt_f64(rows.time(si, j)));
             row.push(',');
-            row.push_str(&fmt_f64(subj.observations[j]));
+            row.push_str(&fmt_f64(rows.dv(si, j)));
             row.push(',');
             row.push_str(&fmt_f64(sr.pred[j]));
             row.push(',');
@@ -1706,7 +2010,7 @@ fn write_predictions_csv<W: Write>(
             }
             if any_occ {
                 row.push(',');
-                row.push_str(&(subj.occasions.get(j).copied().unwrap_or(0)).to_string());
+                row.push_str(&rows.occ(si, j).to_string());
             }
             writeln!(w, "{}", row)?;
         }
@@ -1821,7 +2125,12 @@ fn epoch_to_utc(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 
 /// Read a fit bundle from `path`.
 pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
-    load_fit_with(path, true)
+    load_bundle(File::open(path)?, true)
+}
+
+/// [`load_fit`] from a bundle's bytes.
+pub fn load_fit_from_bytes(bundle: &[u8]) -> Result<LoadedFit, FitrxError> {
+    load_bundle(Cursor::new(bundle), true)
 }
 
 /// [`load_fit`] without re-reading a bundled `data.csv`: the population is
@@ -1833,17 +2142,31 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
 /// without `nn`, and the fallback read without the mapping can then fail on a
 /// renamed column — refusing an export that never needed the data.
 pub fn load_fit_without_population(path: &Path) -> Result<LoadedFit, FitrxError> {
-    load_fit_with(path, false)
+    load_bundle(File::open(path)?, false)
 }
 
-fn load_fit_with(path: &Path, read_population: bool) -> Result<LoadedFit, FitrxError> {
-    let file = File::open(path)?;
-    let mut archive = ZipArchive::new(file)?;
+/// [`load_fit_without_population`] from a bundle's bytes.
+pub fn load_fit_from_bytes_without_population(bundle: &[u8]) -> Result<LoadedFit, FitrxError> {
+    load_bundle(Cursor::new(bundle), false)
+}
 
-    let manifest: Manifest = read_json(&mut archive, "manifest.json")?;
+/// The bundle's manifest, once its `format_version` is known to be this one.
+fn read_manifest<R: Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+) -> Result<Manifest, FitrxError> {
+    let manifest: Manifest = read_json(archive, "manifest.json")?;
     if manifest.format_version != FORMAT_VERSION {
         return Err(FitrxError::UnsupportedVersion(manifest.format_version));
     }
+    Ok(manifest)
+}
+
+fn load_bundle<R: Read + std::io::Seek>(
+    reader: R,
+    read_population: bool,
+) -> Result<LoadedFit, FitrxError> {
+    let mut archive = ZipArchive::new(reader)?;
+    let manifest = read_manifest(&mut archive)?;
 
     let wire: FitWire = read_json(&mut archive, "fit.json")?;
     let ebes_csv = read_text(&mut archive, "ebes.csv")?;
@@ -1851,14 +2174,15 @@ fn load_fit_with(path: &Path, read_population: bool) -> Result<LoadedFit, FitrxE
     let conddist_csv = read_optional_text(&mut archive, "conddist.csv")?;
     let preds_csv = read_text(&mut archive, "predictions.csv")?;
     let model_source = read_text(&mut archive, "model.ferx")?;
-    let data_csv = if read_population && archive.index_for_name("data.csv").is_some() {
-        Some(read_bytes(&mut archive, "data.csv")?)
+    let data_csv = if archive.index_for_name(DATA_ENTRY).is_some() {
+        Some(read_bytes(&mut archive, DATA_ENTRY)?)
     } else {
         None
     };
 
     let n_eta = wire.omega.matrix.rows;
     let mut subjects = parse_subjects(&ebes_csv, &preds_csv, ebes_kappa_csv.as_deref(), n_eta)?;
+    let recorded_rows = parse_recorded_rows(&preds_csv, &subjects);
     let discrete_csv = read_optional_text(&mut archive, DISCRETE_ENTRY)?;
     attach_discrete_rows(&mut subjects, &ebes_csv, discrete_csv.as_deref())?;
     let ebe_kappas = if let Some(csv) = ebes_kappa_csv.as_deref() {
@@ -1916,16 +2240,16 @@ fn load_fit_with(path: &Path, read_population: bool) -> Result<LoadedFit, FitrxE
     }
 
     // data.csv is optional — re-parse only when present.
-    let population = match data_csv {
-        Some(bytes) => {
-            let (population, note) = read_bundled_population(&bytes, &model_source, &fit)?;
+    let population = match &data_csv {
+        Some(bytes) if read_population => {
+            let (population, note) = read_bundled_population(bytes, &model_source, &fit)?;
             if let Some(note) = note {
                 fit.warnings.push(note);
                 crate::api::rebuild_warnings_structured(&mut fit);
             }
             population
         }
-        None => None,
+        _ => None,
     };
 
     Ok(LoadedFit {
@@ -1934,7 +2258,44 @@ fn load_fit_with(path: &Path, read_population: bool) -> Result<LoadedFit, FitrxE
         population,
         manifest,
         verdicts,
+        recorded_rows,
+        data_csv,
     })
+}
+
+/// `predictions.csv`'s data columns, per subject. `parse_subjects` has checked the rows
+/// against `subjects`. A column the file lacks leaves its vectors empty, which only
+/// [`save_loaded_fit`] minds: a bundle that loads without it still loads.
+fn parse_recorded_rows(preds_csv: &str, subjects: &[SubjectResult]) -> Vec<RecordedRows> {
+    let mut lines = preds_csv.lines();
+    let header = parse_csv_row(lines.next().unwrap_or_default());
+    let column = |name: &str| header.iter().position(|c| c == name);
+    let (time_i, dv_i, occ_i) = (column("TIME"), column("DV"), column("OCC"));
+    let number = |fields: &[String], i: usize| {
+        let cell = fields.get(i).map_or("", String::as_str);
+        parse_cell(cell).unwrap_or(f64::NAN)
+    };
+    let mut rows = lines.filter(|l| !l.trim().is_empty()).map(parse_csv_row);
+    subjects
+        .iter()
+        .map(|s| {
+            let mut recorded = RecordedRows::default();
+            for fields in rows.by_ref().take(s.n_obs) {
+                if let Some(i) = time_i {
+                    recorded.time.push(number(&fields, i));
+                }
+                if let Some(i) = dv_i {
+                    recorded.dv.push(number(&fields, i));
+                }
+                if let Some(i) = occ_i {
+                    recorded
+                        .occ
+                        .push(fields.get(i).and_then(|c| c.parse().ok()).unwrap_or(0));
+                }
+            }
+            recorded
+        })
+        .collect()
 }
 
 /// Re-read a bundle's `data.csv` as the population the fit was given.
@@ -7338,5 +7699,476 @@ mod tests {
         let fit = load_fit(&path).unwrap().fit;
         assert!(fit.bayes.is_none() && fit.importance_sampling.is_none());
         assert!(fit.impmap_trace.is_none() && fit.exclusions.is_none());
+    }
+
+    // --- Atomic write, hash checks, in-memory bundles (#2696) -----------------
+
+    const DATA_2696: &str = "ID,TIME,DV,EVID,AMT,CMT\n1,0,0,1,100,1\n1,1,5,0,0,1\n";
+
+    fn fixture_2696() -> (FitResult, Population) {
+        (minimal_fit_result(), dummy_population(&["S1", "S2"], 3))
+    }
+
+    /// A bundle's entries by name, with the manifest's timestamp blanked: it is the only
+    /// thing two saves of one fit may differ in.
+    fn entries_2696(bundle: &[u8]) -> BTreeMap<String, Vec<u8>> {
+        let mut archive = ZipArchive::new(Cursor::new(bundle)).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.name_for_index(i).unwrap().unwrap().into_owned())
+            .collect();
+        let mut out: BTreeMap<String, Vec<u8>> = names
+            .iter()
+            .map(|n| (n.clone(), read_bytes(&mut archive, n).unwrap()))
+            .collect();
+        let mut manifest: Manifest = serde_json::from_slice(&out["manifest.json"]).unwrap();
+        manifest.created_at.clear();
+        out.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        out
+    }
+
+    fn manifest_2696(bundle: &[u8]) -> Manifest {
+        let mut archive = ZipArchive::new(Cursor::new(bundle)).unwrap();
+        read_json(&mut archive, "manifest.json").unwrap()
+    }
+
+    fn dir_names_2696(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn assert_refused_2696(err: FitrxError, wants: &[&str]) {
+        let FitrxError::Unwritable(msg) = err else {
+            panic!("expected Unwritable, got {err:?}");
+        };
+        for want in wants {
+            assert!(msg.contains(want), "{want:?} not in: {msg}");
+        }
+    }
+
+    /// The write itself failing after partial output: the old file survives and the
+    /// partial one does not.
+    ///
+    /// Mutation: writing to `path` directly reddens the content assertion, and leaking
+    /// the temporary file the directory listing.
+    #[test]
+    fn a_write_failing_midway_leaves_the_existing_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.fitrx");
+        std::fs::write(&path, b"the old bundle").unwrap();
+        let err = replace_file(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("disk full"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"the old bundle");
+        assert_eq!(dir_names_2696(dir.path()), ["run.fitrx"]);
+    }
+
+    /// `save_fit` failing after it has started on the bundle: `include_data` is the last
+    /// thing it reads, and it used to fail with the target already truncated.
+    #[test]
+    fn a_failed_save_leaves_the_existing_bundle_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.fitrx");
+        let (r, p) = fixture_2696();
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let missing = dir.path().join("gone.csv");
+        let err = save_fit(
+            &r,
+            &p,
+            "src\n",
+            &path,
+            SaveFitOptions {
+                include_data: Some(missing.clone()),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, FitrxError::Io(_)), "{err:?}");
+        assert!(err.to_string().contains("gone.csv"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(dir_names_2696(dir.path()), ["run.fitrx"]);
+    }
+
+    /// The rename is the step that can still fail once the bytes are written.
+    #[test]
+    fn a_failed_rename_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("taken");
+        std::fs::create_dir(&path).unwrap();
+        let err = replace_file(&path, |file| file.write_all(b"x")).unwrap_err();
+        assert!(matches!(err, FitrxError::Io(_)), "{err:?}");
+        assert_eq!(dir_names_2696(dir.path()), ["taken"]);
+        assert!(dir_names_2696(&path).is_empty());
+    }
+
+    #[test]
+    fn a_bare_file_name_is_written_in_the_working_directory() {
+        assert_eq!(parent_dir(Path::new("run.fitrx")), Path::new("."));
+        assert_eq!(parent_dir(Path::new("a/run.fitrx")), Path::new("a"));
+    }
+
+    /// A temporary file is 0600; a bundle has to come out as `File::create` left it, or
+    /// a run directory shared with a group stops being readable by it.
+    #[cfg(unix)]
+    #[test]
+    fn the_rename_keeps_what_file_create_would_have_left() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+
+        let reference = dir.path().join("reference");
+        File::create(&reference).unwrap();
+        let new = dir.path().join("new.fitrx");
+        replace_file(&new, |file| file.write_all(b"x")).unwrap();
+        assert_eq!(mode(&new), mode(&reference));
+
+        let shared = dir.path().join("shared.fitrx");
+        std::fs::write(&shared, b"old").unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o640)).unwrap();
+        replace_file(&shared, |file| file.write_all(b"new")).unwrap();
+        assert_eq!(mode(&shared), 0o640);
+        assert_eq!(std::fs::read(&shared).unwrap(), b"new");
+
+        let link = dir.path().join("latest.fitrx");
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+        replace_file(&link, |file| file.write_all(b"via link")).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&shared).unwrap(), b"via link");
+
+        // `File::create` fails on a read-only file; a rename alone would not.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o440)).unwrap();
+        let err = replace_file(&shared, |file| file.write_all(b"no")).unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
+        assert_eq!(std::fs::read(&shared).unwrap(), b"via link");
+    }
+
+    /// An edited file is refused by name with the bundle untouched, the file it hashes
+    /// to is accepted, and a fit with no hash has nothing to check against.
+    #[test]
+    fn data_edited_since_the_fit_is_refused_and_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("pk_study.csv");
+        std::fs::write(&data, DATA_2696).unwrap();
+        let path = dir.path().join("run.fitrx");
+        let (mut r, p) = fixture_2696();
+        r.data_hash = Some(crate::io::hash::sha256_bytes(DATA_2696.as_bytes()));
+        let opts = || SaveFitOptions {
+            include_data: Some(data.clone()),
+        };
+        save_fit(&r, &p, "src\n", &path, opts()).expect("the fitted bytes are bundled");
+        let before = std::fs::read(&path).unwrap();
+
+        let edited = DATA_2696.replace("1,1,5", "1,1,6");
+        std::fs::write(&data, &edited).unwrap();
+        let err = save_fit(&r, &p, "src\n", &path, opts()).unwrap_err();
+        let actual = crate::io::hash::sha256_bytes(edited.as_bytes());
+        assert_refused_2696(
+            err,
+            &[
+                data.to_str().unwrap(),
+                "not the data that was fitted",
+                &actual,
+                r.data_hash.as_deref().unwrap(),
+            ],
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        r.data_hash = None;
+        let bytes = save_fit_to_bytes(&r, &p, "src\n", opts()).unwrap();
+        assert_eq!(entries_2696(&bytes)["data.csv"], edited.as_bytes());
+    }
+
+    /// Both places the text can come from, `model_text` winning as it does for the
+    /// entry, so a stale argument beside a good `model_text` is not refused.
+    #[test]
+    fn model_text_that_is_not_the_hashed_model_is_refused() {
+        let (mut r, p) = fixture_2696();
+        let save =
+            |r: &FitResult, src: &str| save_fit_to_bytes(r, &p, src, SaveFitOptions::default());
+        r.model_text = None;
+        r.model_hash = Some(crate::io::hash::sha256_bytes(b"fitted\n"));
+        r.model_path = Some("models/run1.ferx".into());
+        save(&r, "fitted\n").expect("the fitted text");
+        assert_refused_2696(
+            save(&r, "edited\n").unwrap_err(),
+            &["models/run1.ferx", "not the model that was fitted"],
+        );
+
+        r.model_text = Some("fitted\n".into());
+        let bytes = save(&r, "edited\n").expect("model_text is what is written");
+        assert_eq!(entries_2696(&bytes)["model.ferx"], b"fitted\n");
+        r.model_text = Some("edited\n".into());
+        assert_refused_2696(
+            save(&r, "fitted\n").unwrap_err(),
+            &["not the model that was fitted"],
+        );
+
+        r.model_path = None;
+        assert_refused_2696(save(&r, "x").unwrap_err(), &["the model source"]);
+        r.model_hash = None;
+        save(&r, "x").expect("no recorded hash, nothing to compare");
+    }
+
+    #[test]
+    fn bytes_and_a_file_hold_the_same_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data.csv");
+        std::fs::write(&data, DATA_2696).unwrap();
+        let path = dir.path().join("run.fitrx");
+        let (mut r, p) = fixture_2696();
+        r.interface_extras = Some(r#"{"k": 1}"#.into());
+        let opts = || SaveFitOptions {
+            include_data: Some(data.clone()),
+        };
+        save_fit(&r, &p, "src\n", &path, opts()).unwrap();
+        let bytes = save_fit_to_bytes(&r, &p, "src\n", opts()).unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(entries_2696(&bytes), entries_2696(&on_disk));
+        assert_eq!(
+            manifest_2696(&bytes).entries,
+            manifest_2696(&on_disk).entries
+        );
+
+        let from_file = load_fit(&path).unwrap();
+        let from_bytes = load_fit_from_bytes(&bytes).unwrap();
+        assert_eq!(from_bytes.model_source, from_file.model_source);
+        assert_eq!(from_bytes.fit.theta, from_file.fit.theta);
+        assert_eq!(from_bytes.fit.interface_extras, r.interface_extras);
+        assert!(from_bytes.population.is_some() && from_file.population.is_some());
+
+        let bare = load_fit_from_bytes_without_population(&bytes).unwrap();
+        assert!(bare.population.is_none());
+        assert_eq!(bare.fit.theta, from_file.fit.theta);
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_current_bundle_do_not_load() {
+        assert!(matches!(
+            load_fit_from_bytes(b"not a zip file"),
+            Err(FitrxError::Zip(_) | FitrxError::Io(_))
+        ));
+        let (r, p) = fixture_2696();
+        let good = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        let mut manifest = manifest_2696(&good);
+        manifest.format_version = "1".into();
+        write_manifest(&mut zip, &manifest).unwrap();
+        let old = zip.finish().unwrap().into_inner();
+        for result in [
+            load_fit_from_bytes(&old).map(|_| ()),
+            bundle_with_data(&old, b"x", "d.csv").map(|_| ()),
+            bundle_with_interface_extras(&old, None).map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(FitrxError::UnsupportedVersion(ref v)) if v == "1"),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// Adding data and extras to bytes gives the bundle a save with them gives, down to
+    /// the manifest's entry order.
+    #[test]
+    fn edited_bytes_match_a_bundle_saved_with_the_same_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data.csv");
+        std::fs::write(&data, DATA_2696).unwrap();
+        let (mut r, p) = fixture_2696();
+        r.data_hash = Some(crate::io::hash::sha256_bytes(DATA_2696.as_bytes()));
+        let plain = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
+        assert!(!entries_2696(&plain).contains_key("data.csv"));
+
+        // Extras first: `data.csv` still has to land ahead of them.
+        let extras = r#"{ "a" : 1.50 }"#;
+        let edited = bundle_with_interface_extras(&plain, Some(extras)).unwrap();
+        let edited = bundle_with_data(&edited, DATA_2696.as_bytes(), "data.csv").unwrap();
+
+        r.interface_extras = Some(extras.into());
+        let saved = save_fit_to_bytes(
+            &r,
+            &p,
+            "src\n",
+            SaveFitOptions {
+                include_data: Some(data),
+            },
+        )
+        .unwrap();
+        assert_eq!(entries_2696(&edited), entries_2696(&saved));
+        assert_eq!(
+            manifest_2696(&edited).entries,
+            manifest_2696(&saved).entries
+        );
+        assert_eq!(
+            manifest_2696(&edited).created_at,
+            manifest_2696(&plain).created_at
+        );
+
+        let loaded = load_fit_from_bytes(&edited).unwrap();
+        assert_eq!(loaded.fit.interface_extras.as_deref(), Some(extras));
+        assert!(loaded.population.is_some());
+    }
+
+    #[test]
+    fn data_added_to_bytes_is_checked_against_the_bundles_hash() {
+        let (mut r, p) = fixture_2696();
+        r.data_hash = Some(crate::io::hash::sha256_bytes(DATA_2696.as_bytes()));
+        let bundle = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
+        let err = bundle_with_data(&bundle, b"ID,TIME\n", "pk_study.csv").unwrap_err();
+        assert_refused_2696(err, &["pk_study.csv", "not the data that was fitted"]);
+
+        // With no hash a second call replaces the first, leaving one entry.
+        r.data_hash = None;
+        let bundle = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
+        let once = bundle_with_data(&bundle, b"first\n", "a.csv").unwrap();
+        let twice = bundle_with_data(&once, b"second\n", "b.csv").unwrap();
+        assert_eq!(entries_2696(&twice)["data.csv"], b"second\n");
+        let listed = manifest_2696(&twice).entries;
+        assert_eq!(listed.iter().filter(|e| *e == "data.csv").count(), 1);
+    }
+
+    /// The set, replace and remove arms, each leaving `data.csv` and the rest alone.
+    #[test]
+    fn interface_extras_can_be_replaced_and_removed_on_bytes() {
+        let (r, p) = fixture_2696();
+        let plain = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
+        let with_data = bundle_with_data(&plain, DATA_2696.as_bytes(), "d.csv").unwrap();
+        let one = bundle_with_interface_extras(&with_data, Some("[1]")).unwrap();
+        let two = bundle_with_interface_extras(&one, Some("[2]")).unwrap();
+        assert_eq!(entries_2696(&two)[EXTRAS_ENTRY], b"[2]");
+        assert_eq!(entries_2696(&two)["data.csv"], DATA_2696.as_bytes());
+
+        let removed = bundle_with_interface_extras(&two, None).unwrap();
+        assert_eq!(entries_2696(&removed), entries_2696(&with_data));
+        assert!(!manifest_2696(&removed)
+            .entries
+            .iter()
+            .any(|e| e == EXTRAS_ENTRY));
+
+        let err = bundle_with_interface_extras(&plain, Some("{not json")).unwrap_err();
+        assert_refused_2696(err, &["interface_extras is not valid JSON"]);
+    }
+
+    /// Nothing in the loaded fit holds TIME, DV or OCC, so this fails on any re-save
+    /// that does not carry them. The values are off the dummy population's defaults and
+    /// the raw times differ from `obs_times`, so a fallback cannot produce them.
+    #[test]
+    fn a_fit_loaded_without_data_can_be_saved_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, mut p) = fixture_2696();
+        // `load_fit` always fills this from `model.ferx`, so a fit without it would
+        // differ in `fit.json` for a reason that has nothing to do with the re-save.
+        r.model_text = Some("src\n".into());
+        for s in &mut p.subjects {
+            s.obs_raw_times = vec![0.25, 1.5, 24.125];
+            s.observations = vec![1.1, f64::NAN, 3.3];
+            s.occasions = vec![1, 1, 2];
+        }
+        let first = dir.path().join("first.fitrx");
+        save_fit(&r, &p, "src\n", &first, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit_without_population(&first).unwrap();
+        assert!(loaded.population.is_none());
+        let second = dir.path().join("second.fitrx");
+        save_loaded_fit(&loaded, &second, SaveFitOptions::default()).unwrap();
+
+        let (a, b) = (
+            entries_2696(&std::fs::read(&first).unwrap()),
+            entries_2696(&std::fs::read(&second).unwrap()),
+        );
+        let preds = std::str::from_utf8(&b["predictions.csv"]).unwrap();
+        assert!(
+            preds.contains(",OCC") && preds.contains("24.125"),
+            "{preds}"
+        );
+        assert_eq!(a, b);
+    }
+
+    /// A kept `data.csv` still answers to the fit's hash, and `include_data` replaces it.
+    #[test]
+    fn a_saved_loaded_fit_keeps_its_bundled_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, p) = fixture_2696();
+        r.data_hash = Some(crate::io::hash::sha256_bytes(DATA_2696.as_bytes()));
+        let data = dir.path().join("data.csv");
+        std::fs::write(&data, DATA_2696).unwrap();
+        let bytes = save_fit_to_bytes(
+            &r,
+            &p,
+            "src\n",
+            SaveFitOptions {
+                include_data: Some(data.clone()),
+            },
+        )
+        .unwrap();
+        let mut loaded = load_fit_from_bytes_without_population(&bytes).unwrap();
+        let out = dir.path().join("out.fitrx");
+        save_loaded_fit(&loaded, &out, SaveFitOptions::default()).unwrap();
+        let kept = entries_2696(&std::fs::read(&out).unwrap());
+        assert_eq!(kept["data.csv"], DATA_2696.as_bytes());
+
+        std::fs::write(&data, "ID,TIME\n").unwrap();
+        let opts = SaveFitOptions {
+            include_data: Some(data.clone()),
+        };
+        let err = save_loaded_fit(&loaded, &out, opts.clone()).unwrap_err();
+        assert_refused_2696(err, &[data.to_str().unwrap()]);
+
+        loaded.fit.data_hash = None;
+        save_loaded_fit(&loaded, &out, opts).unwrap();
+        let replaced = entries_2696(&std::fs::read(&out).unwrap());
+        assert_eq!(replaced["data.csv"], b"ID,TIME\n");
+
+        loaded.fit.data_hash = Some("0".repeat(64));
+        let err = save_loaded_fit(&loaded, &out, SaveFitOptions::default()).unwrap_err();
+        assert_refused_2696(err, &["the bundled data.csv"]);
+    }
+
+    /// Rows that do not cover the fit are refused rather than written short or panicked
+    /// on: a `predictions.csv` with no TIME, and subjects changed after the load.
+    #[test]
+    fn a_loaded_fit_whose_rows_do_not_cover_it_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.fitrx");
+        let (r, p) = fixture_2696();
+        let bytes = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
+        let save = |l: &LoadedFit| save_loaded_fit(l, &out, SaveFitOptions::default());
+
+        let mut fewer = load_fit_from_bytes(&bytes).unwrap();
+        fewer.fit.subjects.pop();
+        assert_refused_2696(
+            save(&fewer).unwrap_err(),
+            &["for 2 subjects, the fit has 1"],
+        );
+
+        let preds = String::from_utf8(entries_2696(&bytes)["predictions.csv"].clone()).unwrap();
+        let no_time = preds.replacen("ID,TIME,", "ID,XTIME,", 1);
+        let mut archive = ZipArchive::new(Cursor::new(&bytes[..])).unwrap();
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..archive.len() {
+            let file = archive.by_index_raw(i).unwrap();
+            if file.name().unwrap() != "predictions.csv" {
+                zip.raw_copy_file(file).unwrap();
+            }
+        }
+        zip.start_file("predictions.csv", bundle_entry_options())
+            .unwrap();
+        zip.write_all(no_time.as_bytes()).unwrap();
+        let rewritten = zip.finish().unwrap().into_inner();
+
+        let loaded = load_fit_from_bytes(&rewritten).expect("TIME is not needed to load");
+        assert_refused_2696(save(&loaded).unwrap_err(), &["0 TIME", "\"S1\""]);
+        assert!(!out.exists());
     }
 }
