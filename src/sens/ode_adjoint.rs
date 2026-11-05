@@ -4445,6 +4445,15 @@ fn run<const N: usize, const M: usize>(
     Some(out)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test switch: sweep the quadrature's Ψ on its own, as before the fused read.
+    pub(crate) static PSI_SWEEP_UNFUSED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Quadrature gradients that read Ψ's θ adjoint off A's and the response rows'.
+    pub(crate) static PSI_FUSED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Widest lane chunk of the fused gradient-and-response sweeps ([`run`]).
 const DX_LANES: usize = 4;
 
@@ -5434,7 +5443,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             theta_adj,
         ))
     };
-    let (mut grad_eta, _) = sweep(TapeAdj::Plain(&s1), false)?;
+    // With the mode response formed over every live effect, A's θ adjoint and the rows'
+    // give Ψ's without its own sweep (below), so this sweep also collects A's.
+    let fuse_psi = matches!(&eta_dx, Some(o) if o.want_dx) && n_bsv.min(active) == active;
+    let (mut grad_eta, theta_a) = sweep(TapeAdj::Plain(&s1), fuse_psi)?;
     // The term's inputs at η̂ move with η̂ through their own η-derivatives (the node values'
     // movement is the linearisation's, already on the tape).
     if let (Some(ngr), Some(ng)) = (ng_r.as_ref(), ng) {
@@ -5471,7 +5483,6 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let psi =
         a - <R as crate::sens::num::PkNum>::wsum3(0.0, (0..N).map(|k| (R::c(w[k]), lg[k], one)));
     let s2 = rsweep::<1>(&[psi]).to_vec();
-    let (_, mut theta_adj) = sweep(TapeAdj::Plain(&s2), true)?;
     let psi_of = |x: R| -> f64 { ra(&s2, x) };
     // ---- the mode response's sweeps, as [`run`] forms it for FOCE(I) (#2549) -----------
     // The quadrature is centred on the conditional mode `η̂ = argmin l`, whatever the
@@ -5495,6 +5506,27 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             Some((rows.len(), chunks, tas))
         }
         _ => None,
+    };
+    // Ψ's θ adjoint. `w = H⁻¹∇_η A` and the rows are `y_r = Σ_k (H⁻¹)_rk g_k`, so
+    // `Σ_k w_k ∂g_k = Σ_r (∇_η A)_r ∂y_r` and `∂Ψ/∂θ = ∂A/∂θ − Σ_r (∇_η A)_r ∂y_r/∂θ`: every
+    // term already swept, when the rows cover every live effect (not under IOV, whose rows
+    // are the BSV block). At a held mode `w = 0` and Ψ is A. Otherwise Ψ's own sweep.
+    #[cfg(test)]
+    let fuse_psi = fuse_psi && !PSI_SWEEP_UNFUSED.with(|c| c.get());
+    let mut theta_adj = match (&response, fuse_psi, at_mode) {
+        (Some((n, _, tas)), true, true) if *n == active => {
+            #[cfg(test)]
+            PSI_FUSED_HITS.with(|c| c.set(c.get() + 1));
+            let mut t = theta_a;
+            for (r, ta) in tas.iter().enumerate() {
+                for (tv, dv) in t.iter_mut().zip(ta) {
+                    *tv -= grad_eta[r] * dv;
+                }
+            }
+            t
+        }
+        (_, true, false) => theta_a,
+        _ => sweep(TapeAdj::Plain(&s2), true)?.1,
     };
     // The term's θ-derivatives: at η̂ through `(q, ∇q, ∇²q)`, at each node through its value.
     if let (Some(ngr), Some(_)) = (ng_r.as_ref(), ng) {
@@ -5617,3 +5649,7 @@ mod phenomena_tests;
 #[cfg(test)]
 #[path = "ode_adjoint_theta_channels_tests.rs"]
 mod theta_channels_tests;
+
+#[cfg(test)]
+#[path = "ode_adjoint_psi_fused_tests.rs"]
+mod psi_fused_tests;
