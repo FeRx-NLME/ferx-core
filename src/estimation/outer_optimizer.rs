@@ -4049,6 +4049,41 @@ pub(crate) fn final_inner_solve(
     seed: Option<&[DVector<f64>]>,
     options: &FitOptions,
 ) -> FinalInnerSolve {
+    inner_solve_polled(model, population, params, mu_k, seed, options, None)
+}
+
+/// The cold solve that opens a [`LegStart::ColdModes`] round, or `None` if the fit was
+/// cancelled during it. Unlike a final readout it polls the cancel flag per subject (#574),
+/// and a subject the cancel skipped holds a placeholder, which must not seed a leg.
+fn cold_modes_solve(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    mu_k: &[f64],
+    options: &FitOptions,
+) -> Option<FinalInnerSolve> {
+    let cold = inner_solve_polled(
+        model,
+        population,
+        params,
+        mu_k,
+        None,
+        options,
+        options.cancel.as_ref(),
+    );
+    (!crate::cancel::is_cancelled(&options.cancel)).then_some(cold)
+}
+
+/// [`final_inner_solve`], polling `cancel` if given.
+fn inner_solve_polled(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    mu_k: &[f64],
+    seed: Option<&[DVector<f64>]>,
+    options: &FitOptions,
+    cancel: Option<&crate::cancel::CancelFlag>,
+) -> FinalInnerSolve {
     let (etas, h_mats, _, kappas, moved) = run_inner_loop_warm_map(
         model,
         population,
@@ -4060,7 +4095,7 @@ pub(crate) fn final_inner_solve(
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
         InnerSolvePolicy::for_stage(options, model),
-        None,
+        cancel,
         |_, ebe| ebe.screen_moved || ebe.twin_moved,
     );
     let screen_moved_ids = population
@@ -6397,15 +6432,62 @@ pub(crate) enum LegStart {
 /// instead of them, because no start wins everywhere: the warm leg is what
 /// `transit_flip_flop_fit_matches_ode_twin` needs (#2549), and the others can lose outright,
 /// so the fit keeps whichever ended lower. Only from a stop the legs settled: a leg cap or a
-/// spent budget is not a verified incumbent, and a stop the #2093 basin probe ended goes to
-/// the basin-shift restart.
+/// spent budget is not a verified incumbent, a stop the #2093 basin probe ended goes to the
+/// basin-shift restart, and a cancelled fit starts nothing. `Settled` does not rule the last
+/// out: a cancel during a leg ends the loop there, as settled.
 #[cfg_attr(not(test), allow(unused_variables))] // `start` is the tests' switch
-pub(crate) fn leg_pass_applies(start: LegStart, end: PolishEnd, basin_probe_fired: bool) -> bool {
+pub(crate) fn leg_pass_applies(
+    start: LegStart,
+    end: PolishEnd,
+    basin_probe_fired: bool,
+    cancelled: bool,
+) -> bool {
     #[cfg(test)]
     if LEG_PASSES_OFF.with(|o| o.get()).contains(&start) {
         return false;
     }
-    matches!(end, PolishEnd::Settled) && !basin_probe_fired
+    matches!(end, PolishEnd::Settled) && !basin_probe_fired && !cancelled
+}
+
+/// The fit's own state a pass can leave behind, restored when the pass is discarded.
+pub(crate) struct PassState<'a> {
+    pub(crate) basin_probe_fired: &'a std::cell::Cell<bool>,
+    pub(crate) stagnation_latched: &'a std::sync::atomic::AtomicBool,
+    /// The incumbent's objective at the leg tolerance: what a kept pass changes.
+    pub(crate) kept_best: &'a std::cell::Cell<Option<f64>>,
+}
+
+/// Runs each [`LegStart`] pass that applies after the verdict `warm`, and returns the verdict
+/// that stands: a pass's only if it moved the incumbent ([`keep_verify_leg`]). A discarded pass
+/// leaves nothing behind. Its latch and its #2093 probe describe the point it explored, not
+/// the incumbent, so they go back: a cold round's probe would otherwise stop the Newton round
+/// and send a verified stop to a restart on another point's evidence.
+pub(crate) fn drive_leg_passes<V>(
+    warm: V,
+    end_of: impl Fn(&V) -> PolishEnd,
+    cancelled: impl Fn() -> bool,
+    state: PassState<'_>,
+    mut pass: impl FnMut(LegStart, &V) -> V,
+) -> V {
+    let mut verdict = warm;
+    for start in [LegStart::ColdModes, LegStart::NewtonStep] {
+        let probe_fired = state.basin_probe_fired.get();
+        if !leg_pass_applies(start, end_of(&verdict), probe_fired, cancelled()) {
+            continue;
+        }
+        let verified_best = state.kept_best.get();
+        let verified_latched = state.stagnation_latched.load(Ordering::Relaxed);
+        let round = pass(start, &verdict);
+        if state.kept_best.get() == verified_best {
+            state
+                .stagnation_latched
+                .store(verified_latched, Ordering::Relaxed);
+            state.basin_probe_fired.set(probe_fired);
+        } else {
+            verdict = round;
+        }
+    }
+    verdict
 }
 
 /// Does a Newton step's predicted `gain` warrant a [`LegStart::NewtonStep`] leg? Above
@@ -7968,7 +8050,7 @@ fn optimize_nlopt_attempt_probed(
                     let x_inc: Vec<f64> = best_x.iter().zip(&scale).map(|(v, s)| v * s).collect();
                     let p = unpack_params(&x_inc, init_params);
                     let mu_k = compute_mu_k(model, &p.theta, leg_options.mu_referencing);
-                    let cold = final_inner_solve(model, population, &p, &mu_k, None, &leg_options);
+                    let cold = cold_modes_solve(model, population, &p, &mu_k, &leg_options)?;
                     let incumbent = best_solve_cl.lock().unwrap();
                     let inc = incumbent.as_ref().filter(|inc| inc.xs == best_x)?;
                     let terms = |etas: &[DVector<f64>],
@@ -8117,29 +8199,26 @@ fn optimize_nlopt_attempt_probed(
             &budget_left,
             &mut run_leg,
         );
-        let mut verdict = warm;
-        for start in [LegStart::ColdModes, LegStart::NewtonStep] {
-            if !leg_pass_applies(start, verdict.1, basin_probe_fired.get()) {
-                continue;
-            }
-            let verified_best = kept_best_seen.get();
-            let verified_latched = stagnation_latched.load(Ordering::Relaxed);
-            next_start.set(start);
-            let pass = unprofiled_verify_legs(
-                verdict.0,
-                true,
-                leg_needs_verify,
-                &budget_left,
-                &mut run_leg,
-            );
-            if kept_best_seen.get() == verified_best {
-                // The incumbent still stands, and with it the verdict on it.
-                stagnation_latched.store(verified_latched, Ordering::Relaxed);
-            } else {
-                verdict = pass;
-            }
-        }
-        verdict
+        drive_leg_passes(
+            warm,
+            |v| v.1,
+            || crate::cancel::is_cancelled(&options.cancel),
+            PassState {
+                basin_probe_fired: &basin_probe_fired,
+                stagnation_latched: &stagnation_latched,
+                kept_best: &kept_best_seen,
+            },
+            |start, verified| {
+                next_start.set(start);
+                unprofiled_verify_legs(
+                    verified.0,
+                    true,
+                    leg_needs_verify,
+                    &budget_left,
+                    &mut run_leg,
+                )
+            },
+        )
     } else {
         // The predicted gain behind the last decision to polish a quadrature stop; `None`
         // once a stop needs no polish. A leg that then settles leaves it standing.

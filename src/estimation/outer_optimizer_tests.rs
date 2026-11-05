@@ -13292,15 +13292,16 @@ fn an_empty_subject_keeps_the_zero_gradient_at_an_unpackable_point() {
 #[test]
 fn leg_passes_run_only_from_a_settled_stop() {
     let start = LegStart::ColdModes;
-    assert!(leg_pass_applies(start, PolishEnd::Settled, false));
-    assert!(!leg_pass_applies(start, PolishEnd::Settled, true));
+    assert!(leg_pass_applies(start, PolishEnd::Settled, false, false));
+    assert!(!leg_pass_applies(start, PolishEnd::Settled, true, false));
+    assert!(!leg_pass_applies(start, PolishEnd::Settled, false, true));
     for end in [
         PolishEnd::NotNeeded,
         PolishEnd::Skipped,
         PolishEnd::BudgetSpent,
         PolishEnd::LegCapReached { last_gain: 1.0 },
     ] {
-        assert!(!leg_pass_applies(start, end, false), "{end:?}");
+        assert!(!leg_pass_applies(start, end, false, false), "{end:?}");
     }
 }
 
@@ -15484,11 +15485,115 @@ fn cold_mode_fit(csv: &str, off: &'static [LegStart]) -> (OuterResult, Vec<Unpro
     )
 }
 
+/// #2645, the one fit a PR runs: both rounds open and run legs of their own, on the cheapest
+/// of 160 simulated datasets that takes both (15 subjects). What the rounds gain, and what a
+/// losing round leaves, is pinned by the `slow-tests` pairs below.
+#[test]
+fn a_verified_stop_runs_both_rounds() {
+    let (fit, legs) = cold_mode_fit("both_rounds.csv", &[]);
+    assert!(fit.ofv.is_finite(), "{}", fit.ofv);
+    assert!(legs.len() >= 3, "warm, cold and Newton legs: {legs:?}");
+}
+
+/// A [`drive_leg_passes`] pass of the test below: which starts ran, and what each one does.
+struct FakePasses<'a> {
+    ran: std::cell::RefCell<Vec<LegStart>>,
+    probe: &'a std::cell::Cell<bool>,
+    latched: &'a std::sync::atomic::AtomicBool,
+    kept: &'a std::cell::Cell<Option<f64>>,
+}
+
+impl FakePasses<'_> {
+    /// `start` runs: it fires the probe and the latch, and lowers the incumbent if `wins`.
+    fn run(&self, start: LegStart, wins: bool) -> PolishEnd {
+        self.ran.borrow_mut().push(start);
+        self.probe.set(true);
+        self.latched.store(true, Ordering::Relaxed);
+        if wins {
+            self.kept.set(Some(1.0));
+        }
+        PolishEnd::Settled
+    }
+}
+
+/// #2645 review: a discarded round leaves nothing behind. A cold round that lost, its probe
+/// fired, must not stop the Newton round, and neither its probe nor its latch outlives it.
+/// The straddle: the same probe from a round that *won* does stop the Newton round.
+#[test]
+fn a_discarded_round_leaves_its_probe_and_latch_behind() {
+    let run = |cold_wins: bool| {
+        let (probe, latched) = (
+            std::cell::Cell::new(false),
+            std::sync::atomic::AtomicBool::new(false),
+        );
+        let kept = std::cell::Cell::new(Some(2.0));
+        let fake = FakePasses {
+            ran: Default::default(),
+            probe: &probe,
+            latched: &latched,
+            kept: &kept,
+        };
+        drive_leg_passes(
+            PolishEnd::Settled,
+            |v| *v,
+            || false,
+            PassState {
+                basin_probe_fired: &probe,
+                stagnation_latched: &latched,
+                kept_best: &kept,
+            },
+            |start, _| fake.run(start, start == LegStart::ColdModes && cold_wins),
+        );
+        let ran = fake.ran.borrow().clone();
+        (ran, probe.get(), latched.load(Ordering::Relaxed))
+    };
+    let both = vec![LegStart::ColdModes, LegStart::NewtonStep];
+    assert_eq!(run(false), (both, false, false), "both rounds lost");
+    assert_eq!(
+        run(true),
+        (vec![LegStart::ColdModes], true, true),
+        "a kept round's probe stands, and goes to the restart"
+    );
+}
+
+/// #2645 review: a cancel stops the rounds, between them as at the first. The flag is read
+/// per round: it is raised by the cold round here, and the Newton round does not start.
+#[test]
+fn a_cancel_starts_no_further_round() {
+    let (probe, latched) = (
+        std::cell::Cell::new(false),
+        std::sync::atomic::AtomicBool::new(false),
+    );
+    let kept = std::cell::Cell::new(None);
+    let cancelled = std::cell::Cell::new(false);
+    let ran = std::cell::RefCell::new(Vec::new());
+    drive_leg_passes(
+        PolishEnd::Settled,
+        |v| *v,
+        || cancelled.get(),
+        PassState {
+            basin_probe_fired: &probe,
+            stagnation_latched: &latched,
+            kept_best: &kept,
+        },
+        |start, v| {
+            ran.borrow_mut().push(start);
+            cancelled.set(true);
+            *v
+        },
+    );
+    assert_eq!(*ran.borrow(), vec![LegStart::ColdModes]);
+}
+
 /// #2645, the side where the cold modes win. Warm legs alone verify the stop on the modes the
 /// fit holds; the pass finds the lower optimum another mode leads to. Measured gain 0.0097 on
 /// Linux aarch64 and 0.0094 on macOS arm64, the steadiest of 60 simulated datasets across the
 /// two: the bound is a tenth of that.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: two fits to convergence; opt in with --features slow-tests"
+)]
 fn a_cold_mode_leg_below_the_verified_incumbent_is_kept() {
     let (off, off_legs) = cold_mode_fit("cold_wins.csv", BOTH_PASSES);
     let (on, on_legs) = cold_mode_fit("cold_wins.csv", &[LegStart::NewtonStep]);
@@ -15517,6 +15622,10 @@ fn a_cold_mode_leg_below_the_verified_incumbent_is_kept() {
 /// capped BHHH step leaves it. Measured gain 0.81 on Linux aarch64, 0.83 on macOS arm64, with
 /// no help from the cold modes on this dataset (their pass gains 0 on both).
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: two fits to convergence; opt in with --features slow-tests"
+)]
 fn a_newton_leg_leaves_a_verified_stop_that_is_no_minimum() {
     let (off, off_legs) = cold_mode_fit("newton_wins.csv", BOTH_PASSES);
     let (on, on_legs) = cold_mode_fit("newton_wins.csv", &[LegStart::ColdModes]);
@@ -15540,6 +15649,10 @@ fn a_newton_leg_leaves_a_verified_stop_that_is_no_minimum() {
 /// that such a leg actually ran. This is what makes the cold start safe to try on the case
 /// #2549 stopped it for.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: two fits to convergence; opt in with --features slow-tests"
+)]
 fn a_cold_mode_leg_above_the_verified_incumbent_changes_nothing() {
     let (off, off_legs) = cold_mode_fit("cold_loses.csv", BOTH_PASSES);
     HELD_SOLVE_AT_RESTORED.with(|c| c.set(None));
