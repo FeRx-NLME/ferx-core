@@ -5339,6 +5339,18 @@ impl CompiledModel {
         self.ode_spec.is_some() || self.absorption_ode_equivalent.is_some()
     }
 
+    /// The spec this model integrates on: its own, or for a closed form its absorption twin's
+    /// (a model has one or the other). `None` for a model that never integrates. The twin
+    /// counts even when no current subject reaches it, since the flip-flop reroute is decided
+    /// per `(θ, η)` and can reach it at a perturbed point only (#520 review).
+    pub(crate) fn integrator_spec(&self) -> Option<&crate::ode::predictions::OdeSpec> {
+        self.ode_spec.as_ref().or_else(|| {
+            self.absorption_ode_equivalent
+                .as_ref()
+                .and_then(|eq| eq.built().ode_spec.as_ref())
+        })
+    }
+
     /// Returns true for a **compartment-free** (`$PRED`-equivalent) model — one
     /// whose `[structural_model]` declares its prediction as an equation with no
     /// compartments underneath (issue #811).

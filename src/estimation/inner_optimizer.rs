@@ -4127,23 +4127,26 @@ fn compute_jacobian_fd_iov(
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
-    let eps = 1e-6;
-    let mut h = DMatrix::zeros(n_obs, n_eta);
-    let mut eta_pert = eta.to_vec();
 
-    for col in 0..n_eta {
-        let h_step = eps * (1.0 + eta[col].abs());
-        eta_pert[col] = eta[col] + h_step;
-        let preds_plus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
-        eta_pert[col] = eta[col] - h_step;
-        let preds_minus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
-        eta_pert[col] = eta[col];
+    let mut h = with_fd_jacobian_integration(model, |eps| {
+        let mut h = DMatrix::zeros(n_obs, n_eta);
+        let mut eta_pert = eta.to_vec();
 
-        let inv = 1.0 / (2.0 * h_step);
-        for j in 0..n_obs {
-            h[(j, col)] = (preds_plus[j] - preds_minus[j]) * inv;
+        for col in 0..n_eta {
+            let h_step = eps * (1.0 + eta[col].abs());
+            eta_pert[col] = eta[col] + h_step;
+            let preds_plus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
+            eta_pert[col] = eta[col] - h_step;
+            let preds_minus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
+            eta_pert[col] = eta[col];
+
+            let inv = 1.0 / (2.0 * h_step);
+            for j in 0..n_obs {
+                h[(j, col)] = (preds_plus[j] - preds_minus[j]) * inv;
+            }
         }
-    }
+        h
+    });
 
     // Overwrite FREM pseudo-observation rows with exact analytical Jacobian.
     overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
@@ -7280,6 +7283,87 @@ fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
     g
 }
 
+/// Central-difference step of the FD Jacobian on a model that never integrates, where only
+/// roundoff limits the difference.
+const FD_JACOBIAN_STEP: f64 = 1e-6;
+
+/// Central-difference step of the FD Jacobian on a model with an integrator (#2701), per unit
+/// of `1 + |η|`. Integration error reaches `H` as `error / step`, so a step sized for roundoff
+/// lets the integrator set the determinant term. On the 8-state neutropenia model (6 worst
+/// subjects, OFV −3.6510 once `H` is resolved) the step alone, at the fit's `1e-4` / `1e-6`,
+/// measured 71.6 at `1e-6`, 44.3 at `1e-5`, 17.5 at `1e-4` and −2.2 at `1e-3`. Truncation is
+/// `O(step²)`: `1e-3` and `3e-3` agree to 1e-4 OFV at every tolerance from `1e-7` down.
+const ODE_FD_JACOBIAN_STEP: f64 = 1e-3;
+
+/// `ode_reltol` / `ode_abstol` the FD Jacobian integrates at, at most (#2701). Unlike the
+/// covariance plateau (`1e-6` / `1e-8`) this one is measured against a difference of step
+/// [`ODE_FD_JACOBIAN_STEP`]: at that step on the same model (256 subjects, `H` resolved at
+/// −289.8764), `1e-7` / `1e-9` left 1.2e-2 OFV, this 5.3e-3, `1e-9` / `1e-12` 2.4e-4.
+const ODE_FD_JACOBIAN_RELTOL: f64 = 1e-8;
+const ODE_FD_JACOBIAN_ABSTOL: f64 = 1e-10;
+
+/// How much the step budget grows under [`fd_jacobian_ode_override`]. Tightening the default
+/// `ode_reltol` 10⁴× costs an order-`p` stepper 10^(4/p) more steps: ~6× for rk45, ~22× for
+/// rosenbrock23. A cap, paid only by a solve that needs it.
+const ODE_FD_JACOBIAN_MAX_STEPS_FACTOR: usize = 32;
+
+/// The ODE solver override the FD Jacobian integrates under, or `None` when the model has no
+/// integrator or already runs at least that tight. Every field is pinned, so the fit's
+/// `ode_method` and budgets reach the Jacobian. Read on the thread that solves, where the
+/// fit's override is in force.
+fn fd_jacobian_ode_override(
+    model: &CompiledModel,
+) -> Option<crate::ode::solver::OdeSolverOverride> {
+    let eff = model.integrator_spec()?.effective_solver_opts();
+    if eff.reltol <= ODE_FD_JACOBIAN_RELTOL && eff.abstol <= ODE_FD_JACOBIAN_ABSTOL {
+        return None;
+    }
+    Some(crate::ode::solver::OdeSolverOverride {
+        reltol: Some(eff.reltol.min(ODE_FD_JACOBIAN_RELTOL)),
+        abstol: Some(eff.abstol.min(ODE_FD_JACOBIAN_ABSTOL)),
+        max_steps: Some(
+            eff.max_steps
+                .saturating_mul(ODE_FD_JACOBIAN_MAX_STEPS_FACTOR),
+        ),
+        method: Some(eff.method),
+        stiff_abort_after: Some(eff.stiff_abort_after),
+        auto_switch: Some(eff.auto_switch),
+    })
+}
+
+/// The step `difference` takes per unit of `1 + |η|`, and the tolerance it runs at (#2701).
+///
+/// `H` enters FOCE/FOCEI through `log|Ω⁻¹ + HᵀR⁻¹H|`, so integration error in `H` raises the
+/// objective at an unchanged mode and residuals: on the neutropenia model, `H` differenced at
+/// the fit's tolerance cost 30 OFV on 256 subjects and about 1450 on 5111. The predictions
+/// and the EBE search keep the fit's tolerance, exactly as beside an exact analytic Jacobian.
+///
+/// The override reaches this thread alone, which is all the differences use: they run inside
+/// one subject's work, on one worker.
+///
+/// A tighter solve can fail where the fit's own does not: a non-finite result is redone at the
+/// fit's tolerance, with the same step, rather than handing the subject a non-finite `H`.
+fn with_fd_jacobian_integration(
+    model: &CompiledModel,
+    mut difference: impl FnMut(f64) -> DMatrix<f64>,
+) -> DMatrix<f64> {
+    let step = if model.integrator_spec().is_some() {
+        ODE_FD_JACOBIAN_STEP
+    } else {
+        FD_JACOBIAN_STEP
+    };
+    if let Some(tight) = fd_jacobian_ode_override(model) {
+        let h = {
+            let _tight = crate::ode::solver::arm_ode_solver_override(tight);
+            difference(step)
+        };
+        if h.iter().all(|v| v.is_finite()) {
+            return h;
+        }
+    }
+    difference(step)
+}
+
 /// Compute Jacobian H = d(predictions)/d(eta) via finite differences.
 /// H is n_obs x n_eta.
 ///
@@ -7297,30 +7381,32 @@ fn compute_jacobian_fd(
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
-    let eps = 1e-6;
 
-    let mut h = DMatrix::zeros(n_obs, n_eta);
-    let mut eta_pert = eta.to_vec();
+    let mut h = with_fd_jacobian_integration(model, |eps| {
+        let mut h = DMatrix::zeros(n_obs, n_eta);
+        let mut eta_pert = eta.to_vec();
 
-    for j in 0..n_eta {
-        let h_step = eps * (1.0 + eta[j].abs());
+        for j in 0..n_eta {
+            let h_step = eps * (1.0 + eta[j].abs());
 
-        eta_pert[j] = eta[j] + h_step;
-        let preds_plus = pk::compute_predictions_with_tv_into_with_schedule(
-            model, subject, theta, &eta_pert, scratch, schedule,
-        );
+            eta_pert[j] = eta[j] + h_step;
+            let preds_plus = pk::compute_predictions_with_tv_into_with_schedule(
+                model, subject, theta, &eta_pert, scratch, schedule,
+            );
 
-        eta_pert[j] = eta[j] - h_step;
-        let preds_minus = pk::compute_predictions_with_tv_into_with_schedule(
-            model, subject, theta, &eta_pert, scratch, schedule,
-        );
+            eta_pert[j] = eta[j] - h_step;
+            let preds_minus = pk::compute_predictions_with_tv_into_with_schedule(
+                model, subject, theta, &eta_pert, scratch, schedule,
+            );
 
-        for i in 0..n_obs {
-            h[(i, j)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
+            for i in 0..n_obs {
+                h[(i, j)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
+            }
+
+            eta_pert[j] = eta[j];
         }
-
-        eta_pert[j] = eta[j];
-    }
+        h
+    });
 
     // Overwrite FREM pseudo-observation rows with exact analytical Jacobian.
     // For FREMTYPE > 0 observations, prediction = theta[k] + eta[m], so
@@ -7783,6 +7869,10 @@ mod tests;
 #[cfg(test)]
 #[path = "inner_optimizer_iov_tests.rs"]
 mod iov_tests;
+
+#[cfg(test)]
+#[path = "inner_optimizer_fd_jacobian_tests.rs"]
+mod fd_jacobian_tests;
 
 #[cfg(test)]
 #[path = "inner_optimizer_screen_tests.rs"]

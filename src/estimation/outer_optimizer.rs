@@ -4907,13 +4907,7 @@ fn decrement_ode_override(
     model: &CompiledModel,
     options: &FitOptions,
 ) -> Option<crate::ode::solver::OdeSolverOverride> {
-    let spec = model.ode_spec.as_ref().or_else(|| {
-        model
-            .absorption_ode_equivalent
-            .as_ref()
-            .and_then(|eq| eq.built().ode_spec.as_ref())
-    })?;
-    let eff = spec.effective_solver_opts();
+    let eff = model.integrator_spec()?.effective_solver_opts();
     if eff.method == crate::ode::OdeMethod::Linear {
         return None;
     }
