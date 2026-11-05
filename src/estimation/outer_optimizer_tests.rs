@@ -7479,9 +7479,8 @@ mod outer_fd_fallback {
     /// a floor-1 coordinate takes the ungated difference bit for bit and never calls the tight
     /// twin — and a floored coordinate whose twin agrees keeps its #2187 step: on a clean
     /// objective it is accepted at the first step, from two twin probes, and takes the twin's
-    /// difference there. The twin is the objective plus a constant, so each of its probes
-    /// differs from its τ probe (a twin that reproduces them measured nothing) while its slope
-    /// is the same.
+    /// difference there. The twin's slope in `x₀` is the objective's plus 1e-5, well inside
+    /// `RESOLVED_REL` but a different number, so the difference shows which side it came from.
     #[test]
     fn the_gradient_gate_leaves_floor_one_and_resolved_coordinates_alone() {
         use crate::estimation::parameterization::fd_step;
@@ -7500,7 +7499,7 @@ mod outer_fd_fallback {
 
         let floor = [2e-3, 1.0];
         let calls = std::cell::Cell::new(0usize);
-        let shifted = |v: &[f64]| f(v) + 0.25;
+        let shifted = |v: &[f64]| f(v) + 0.25 + 1e-5 * v[0];
         let twin = |v: &[f64]| {
             calls.set(calls.get() + 1);
             Some(shifted(v))
@@ -7516,8 +7515,13 @@ mod outer_fd_fallback {
         let at = |x0: f64| shifted(&[x0, x[1]]);
         let twin_diff = (at(x[0] + h) - at(x[0] - h)) / ((x[0] + h) - (x[0] - h));
         assert_eq!(gated[0].to_bits(), twin_diff.to_bits());
+        assert_ne!(
+            twin_diff.to_bits(),
+            ungated[0].to_bits(),
+            "fixture: the twin's difference is distinguishable from the stencil's"
+        );
         assert!(
-            (gated[0] - ungated[0]).abs() < 1e-9,
+            (gated[0] - ungated[0]).abs() < 2e-5,
             "{gated:?} vs {ungated:?}"
         );
         assert_eq!(gated[1].to_bits(), ungated[1].to_bits());

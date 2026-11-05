@@ -1840,7 +1840,6 @@ fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
             numer: numer.abs(),
             scale: f0.abs(),
             span: 2.0 * h,
-            probes: [fp, fm],
         })
     };
     gated
@@ -7092,15 +7091,16 @@ mod tests {
     /// with coordinate 0 floored and a twin that agrees, it is accepted at the first step, from
     /// three twin objectives (its centre and two probes): its diagonal is the twin's second
     /// difference at the #2187 step and every other entry is the ungated stencil's bit for bit.
-    /// The twin is the objective plus a constant, so each probe differs from its τ probe (a twin
-    /// that reproduces them measured nothing) while its curvature is the same.
+    /// The twin's curvature in `x₀` is the objective's plus 1e-6, well inside `RESOLVED_REL`
+    /// but a different number, so the diagonal shows which side it came from. Coordinate 0 sits at 0.077 here, where its
+    /// second difference clears the noise guard at the first step.
     #[test]
     fn the_hessian_gate_leaves_floor_one_and_resolved_coordinates_alone() {
         use super::{fd_ofv_hessian, fd_ofv_hessian_gated, fd_step};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let opts = crate::types::FitOptions::default();
-        let x_hat = [0.0077f64, 7.7];
+        let x_hat = [0.077f64, 7.7];
         let f0 = gate_fixture(&x_hat);
         let eps = 1e-2;
         let panics = |_: &[f64]| -> Option<f64> { panic!("a floor-1 coordinate reached the gate") };
@@ -7120,9 +7120,9 @@ mod tests {
             fd_ofv_hessian(2, &x_hat, &[0, 1], &[1.0; 2], eps, f0, &gate_fixture, &opts).unwrap();
         assert_eq!(hess_bits(&gated), hess_bits(&ungated));
 
-        let floor = [0.0077, 1.0];
+        let floor = [0.077, 1.0];
         let calls = AtomicUsize::new(0);
-        let shifted = |x: &[f64]| gate_fixture(x) + 0.25;
+        let shifted = |x: &[f64]| gate_fixture(x) + 0.25 + 5e-7 * x[0] * x[0];
         let twin = |x: &[f64]| {
             calls.fetch_add(1, Ordering::Relaxed);
             Some(shifted(x))
@@ -7147,6 +7147,11 @@ mod tests {
             + shifted(&[x_hat[0] - h, x_hat[1]]))
             / (h * h);
         assert_eq!(gated.hess[(0, 0)].to_bits(), twin_diag.to_bits());
+        assert_ne!(
+            twin_diag.to_bits(),
+            ungated.hess[(0, 0)].to_bits(),
+            "fixture: the twin's diagonal is distinguishable from the stencil's"
+        );
         assert!(
             (gated.hess[(0, 0)] - ungated.hess[(0, 0)]).abs() < 1e-3,
             "{} vs {}",

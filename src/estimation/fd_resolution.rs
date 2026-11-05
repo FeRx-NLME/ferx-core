@@ -30,10 +30,20 @@ pub(crate) const RESOLVED_REL: f64 = 1e-5;
 pub(crate) const STEP_GROWTH: f64 = 10.0;
 /// The tight twin's inner tolerance, relative to the stencil's own.
 pub(crate) const TIGHT_FACTOR: f64 = 1e-2;
-/// The difference's numerator must exceed `ULP_GUARD·ε·|f|`: below it the τ and τ/100
-/// differences can agree because both are the same rounding of `f`, not because either
-/// resolved anything.
-pub(crate) const ULP_GUARD: f64 = 1e3;
+/// The τ/100 difference's numerator must exceed `NOISE_GUARD·√ε·|f|`, the noise floor of a
+/// re-solved objective, for its agreement with the τ one to count.
+///
+/// The inner solve resolves η only to about √ε, since its objective is flat to second order at
+/// the mode, while the marginal reads η at first order through `log det H`. Below that floor a
+/// solve can stop at the same iterate under τ and τ/100, `converged`, and the two differences
+/// agree because neither measured anything. On a covariate exponent declared at 1e-4 the
+/// per-subject gradient did exactly that on Linux x86_64, at `numer/(√ε·|f|)` = 0.032, and was
+/// accepted 13% off; an ε-scale guard (`1e3·ε·|f|`) passed it. Measured ratios: a stall that
+/// agreed at 0.032, a population difference 2.2e-5 off at 0.20 and 2e-7 off at 1.8, the
+/// smallest accepted real difference at 14 (that per-subject gradient at floor 0.1), and a
+/// `V = TVV/k` volume at 2e5. So 1 sits 31× above the stall and 14× below the smallest
+/// accepted difference (#2406).
+pub(crate) const NOISE_GUARD: f64 = 1.0;
 
 /// The tight twin's inner tolerance for a stencil that re-solves at `tol`.
 pub(crate) fn tight_tol(tol: f64) -> f64 {
@@ -56,15 +66,12 @@ pub(crate) fn ebe_resolved(ebe: &EbeResult) -> bool {
 pub(crate) struct Difference {
     /// The difference quotient: `(f₊ − f₋)/(x₊ − x₋)`, or `(f₊ − 2f₀ + f₋)/h²`.
     pub(crate) value: f64,
-    /// `|numerator|` of that quotient, for the ulp guard.
+    /// `|numerator|` of that quotient, for the noise guard.
     pub(crate) numer: f64,
-    /// Magnitude of the objective at the probes, for the ulp guard.
+    /// Magnitude of the objective at the probes, for the noise guard.
     pub(crate) scale: f64,
     /// The probes' span in the coordinate's units. Growth stops once the bounds clamp holds it.
     pub(crate) span: f64,
-    /// The objective at the two probes, `[f₊, f₋]`, so a τ/100 probe that reproduced its τ
-    /// value can be told from one that re-solved.
-    pub(crate) probes: [f64; 2],
 }
 
 /// Where [`resolve_floored_step`] stopped.
@@ -79,19 +86,9 @@ pub(crate) struct Resolved {
 }
 
 /// Whether the τ difference `loose` and the τ/100 difference `tight` resolve the step.
-///
-/// Each τ/100 probe must also differ from its τ probe. One that returns the τ value bit for bit
-/// has measured nothing: the inner solve stopped at the same iterate under both tolerances, which
-/// is what a solve at its precision floor does. There the η error that both share is below the
-/// rounding of the inner objective and invisible to it, but the marginal's `log det H` term reads
-/// it at first order. On fixture A's per-subject gradient at `θ₀ = 1e-4` (Linux x86_64), both
-/// probes at floor 1e-4 came back from the τ/100 re-solve unchanged, the two differences agreed
-/// exactly, and the accepted value was 13 % from the floor-1 one. One side reproduced and the
-/// other moving by a hair can agree inside `RESOLVED_REL` too, so the test is per probe (#2406).
 fn accepts(loose: &Difference, tight: &Difference) -> bool {
     (loose.value - tight.value).abs() <= RESOLVED_REL * tight.value.abs()
-        && tight.numer > ULP_GUARD * f64::EPSILON * tight.scale
-        && loose.probes.iter().zip(&tight.probes).all(|(l, t)| l != t)
+        && tight.numer > NOISE_GUARD * f64::EPSILON.sqrt() * tight.scale
 }
 
 /// Grow one floored coordinate's step from `floor0` until its difference is resolved.
@@ -102,8 +99,7 @@ fn accepts(loose: &Difference, tight: &Difference) -> bool {
 /// converge. The τ/100 side is evaluated only when the τ side exists.
 ///
 /// Returns the τ/100 difference at the first floor whose two differences agree
-/// ([`RESOLVED_REL`]) above the ulp guard ([`ULP_GUARD`]), with both τ/100 probes re-solved
-/// off their τ values (`accepts`). Growth stops at floor 1 — the
+/// ([`RESOLVED_REL`]) above the noise guard ([`NOISE_GUARD`]). Growth stops at floor 1 — the
 /// pre-#2187 step — or once the bounds clamp keeps the span from growing; there the τ/100
 /// difference is returned if it exists, else the τ one, else `None` (the caller's own
 /// fallback for a missing probe takes over).
@@ -146,25 +142,13 @@ pub(crate) fn resolve_floored_step(
 mod tests {
     use super::*;
 
-    /// A difference the ulp guard passes: the numerator is far above `ULP_GUARD·ε·scale`. Its
-    /// probes are the τ/100 side's when `tight`, and differ from the τ side's, as a twin that
-    /// re-solved does.
-    fn diff(value: f64, span: f64, tight: bool) -> Difference {
+    /// A difference the noise guard passes: the numerator is far above `NOISE_GUARD·√ε·scale`.
+    fn diff(value: f64, span: f64) -> Difference {
         Difference {
             value,
             numer: 1.0,
             scale: 1.0,
             span,
-            probes: probes(tight),
-        }
-    }
-
-    /// Probe values that differ between the τ and τ/100 sides.
-    fn probes(tight: bool) -> [f64; 2] {
-        if tight {
-            [1.0, 2.0]
-        } else {
-            [3.0, 4.0]
         }
     }
 
@@ -198,7 +182,6 @@ mod tests {
             Some(diff(
                 2.0 + if tight { err(fl) / 100.0 } else { err(fl) },
                 fl,
-                tight,
             ))
         });
         let r = r.expect("a resolved difference");
@@ -214,11 +197,7 @@ mod tests {
     #[test]
     fn a_disagreement_past_the_bound_grows_to_the_cap() {
         let (r, asked) = run(1e-3, |fl, tight| {
-            Some(diff(
-                if tight { 1.0 } else { 1.0 + 2.0 * RESOLVED_REL },
-                fl,
-                tight,
-            ))
+            Some(diff(if tight { 1.0 } else { 1.0 + 2.0 * RESOLVED_REL }, fl))
         });
         let r = r.unwrap();
         assert!(!r.accepted);
@@ -230,93 +209,43 @@ mod tests {
         assert_eq!(loose_floors(&asked), [1e-3, 1e-2, 1e-1, 1.0]);
 
         let (r, _) = run(1e-3, |fl, tight| {
-            Some(diff(
-                if tight { 1.0 } else { 1.0 + 0.5 * RESOLVED_REL },
-                fl,
-                tight,
-            ))
+            Some(diff(if tight { 1.0 } else { 1.0 + 0.5 * RESOLVED_REL }, fl))
         });
         let r = r.unwrap();
         assert!(r.accepted);
         assert_eq!(r.floor, 1e-3);
     }
 
-    /// Two differences that are the same rounding of `f` agree exactly and resolve nothing:
-    /// the ulp guard rejects them (the θ₀ = 1e-10 cell of #2406), and the step grows to the
-    /// first floor whose numerator clears `ULP_GUARD·ε·|f|`.
+    /// Two differences whose numerator is below the re-solved objective's noise floor agree
+    /// and resolve nothing — a stalled inner solve returns the same objective at τ and τ/100
+    /// (the per-subject leg of #2406 on Linux) — so the step grows to the first floor whose
+    /// numerator clears `NOISE_GUARD·√ε·|f|`. The stalled numerator is far above an ε-scale
+    /// guard, so the guard has to be √ε-scale to reject it.
     #[test]
-    fn the_ulp_guard_rejects_an_agreement_of_two_roundings() {
+    fn the_noise_guard_rejects_an_agreement_below_the_resolve_noise() {
         let scale = 1e4;
-        let (r, _) = run(1e-4, |fl, tight| {
-            let numer = if fl < 5e-3 {
-                10.0 * f64::EPSILON * scale
-            } else {
-                1e-6
-            };
+        let noise = NOISE_GUARD * f64::EPSILON.sqrt() * scale;
+        let stalled = 0.5 * noise;
+        assert!(stalled > 1e6 * f64::EPSILON * scale);
+        let (r, asked) = run(1e-4, |fl, _| {
             Some(Difference {
                 value: 3.0,
-                numer,
+                numer: if fl < 5e-3 { stalled } else { 2.0 * noise },
                 scale,
                 span: fl,
-                probes: probes(tight),
-            })
-        });
-        let r = r.unwrap();
-        assert!(r.accepted);
-        assert_eq!(r.floor, 1e-2);
-    }
-
-    /// A τ/100 twin whose probes come back with their τ values bit for bit measured nothing: the
-    /// two differences agree exactly, above the ulp guard, and the step still grows. The Linux
-    /// trace of #2406 had both probes reproduced at floor 1e-4; here they are below floor 1e-2.
-    /// With one probe reproduced and the other moved by a hair, the two differences agree inside
-    /// `RESOLVED_REL` and the step must still grow, so the test is per probe, not on the value.
-    #[test]
-    fn a_twin_that_reproduces_its_tau_probes_does_not_accept() {
-        let stalled = |fl: f64| fl < 5e-3;
-        let (r, asked) = run(1e-4, |fl, tight| {
-            Some(Difference {
-                probes: if tight && !stalled(fl) {
-                    probes(true)
-                } else {
-                    probes(false)
-                },
-                ..diff(7.0, fl, tight)
             })
         });
         let r = r.unwrap();
         assert!(r.accepted);
         assert_eq!(r.floor, 1e-2);
         assert_eq!(loose_floors(&asked), [1e-4, 1e-3, 1e-2]);
-
-        for reproduced in [0, 1] {
-            let (r, _) = run(1e-4, |fl, tight| {
-                let moved = if tight { 0.5 * RESOLVED_REL } else { 0.0 };
-                let mut half = probes(false);
-                half[1 - reproduced] += moved;
-                Some(Difference {
-                    probes: if stalled(fl) || !tight {
-                        half
-                    } else {
-                        probes(true)
-                    },
-                    ..diff(7.0 * (1.0 + moved), fl, tight)
-                })
-            });
-            let r = r.unwrap();
-            assert!(r.accepted);
-            assert_eq!(
-                r.floor, 1e-2,
-                "probe {reproduced} reproduced, the other moved"
-            );
-        }
     }
 
     /// The cap is floor 1 exactly, also from a floor that is not a power of ten.
     #[test]
     fn growth_is_capped_at_floor_one() {
         let (r, asked) = run(3e-3, |fl, tight| {
-            Some(diff(if tight { 1.0 } else { 2.0 }, fl, tight))
+            Some(diff(if tight { 1.0 } else { 2.0 }, fl))
         });
         assert_eq!(r.unwrap().floor, 1.0);
         assert_eq!(loose_floors(&asked), [3e-3, 3e-2, 3e-1, 1.0]);
@@ -327,13 +256,13 @@ mod tests {
     #[test]
     fn an_unresolved_twin_grows_the_step() {
         let (r, _) = run(1e-3, |fl, tight| {
-            (!tight || fl > 5e-3).then(|| diff(5.0, fl, tight))
+            (!tight || fl > 5e-3).then(|| diff(5.0, fl))
         });
         let r = r.unwrap();
         assert!(r.accepted);
         assert_eq!(r.floor, 1e-2);
 
-        let (r, _) = run(1e-3, |fl, tight| (!tight).then(|| diff(5.0, fl, tight)));
+        let (r, _) = run(1e-3, |fl, tight| (!tight).then(|| diff(5.0, fl)));
         let r = r.unwrap();
         assert!(!r.accepted);
         assert_eq!(
@@ -349,7 +278,7 @@ mod tests {
     #[test]
     fn growth_stops_once_the_bounds_clamp_holds_the_span() {
         let (r, asked) = run(1e-3, |fl, tight| {
-            Some(diff(if tight { 1.0 } else { 2.0 }, fl.min(5e-3), tight))
+            Some(diff(if tight { 1.0 } else { 2.0 }, fl.min(5e-3)))
         });
         let r = r.unwrap();
         assert!(!r.accepted);

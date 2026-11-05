@@ -9676,7 +9676,6 @@ fn central_diff_packed_gated(
                         numer: (fp - fm).abs(),
                         scale: fp.abs().max(fm.abs()),
                         span: xp - xm,
-                        probes: [fp, fm],
                     })
                 });
             if let Some(r) = resolved {
