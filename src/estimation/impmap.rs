@@ -277,13 +277,16 @@ fn mc_var_term(f: f64, k: usize) -> f64 {
 /// the per-subject SE at `2/√N` or more, above the target for any N below 1600, and
 /// would ramp every subject to the cap. Not every degenerate subject is hopeless: a
 /// proposal that only undersamples the posterior recovers as K grows. So a subject
-/// stays in the decision until it has been degenerate at two different sample
-/// counts in one unbroken run of iterations, and a failed subject (`f = 0`, which
-/// is not a sampling problem) is left out at once.
+/// stays in the decision until, within one unbroken run of degenerate iterations, it
+/// has been degenerate at a K above the lowest K of that run: a raise was tried on it
+/// and did not help. A lowering is no such test, so a subject degenerate first at a
+/// high K and then at a lower one stays in. A failed subject (`f = 0`, which is not a
+/// sampling problem) is left out at once.
 #[derive(Debug, Default)]
 struct StuckSubjects {
-    /// Per subject, the `(lowest, highest)` K of its current degenerate run.
-    runs: Vec<Option<(usize, usize)>>,
+    /// Per subject, its current degenerate run: the lowest K of the run, and
+    /// whether a raise above that K has already failed to help it.
+    runs: Vec<Option<(usize, bool)>>,
 }
 
 impl StuckSubjects {
@@ -299,12 +302,28 @@ impl StuckSubjects {
                     *run = None;
                     return false;
                 }
-                let (lo, hi) = run.map_or((k, k), |(lo, hi)| (lo.min(k), hi.max(k)));
-                *run = Some((lo, hi));
-                !(f > 0.0) || lo < hi
+                let (lo, raised) =
+                    run.map_or((k, false), |(lo, raised)| (lo.min(k), raised || k > lo));
+                *run = Some((lo, raised));
+                !(f > 0.0) || raised
             })
             .collect()
     }
+}
+
+/// The per-subject SE history `auto` acts on, rebuilt from each iteration's ESS
+/// fractions over the subjects not flagged in `stuck` now (#2690).
+///
+/// [`windowed_se`] takes a median over several iterations, so excluding a subject
+/// only from the newest entry would leave it driving raises from the older ones
+/// until the window turned over, which on a one-draw subject among 100 is three
+/// doublings toward the cap. [`raises_pay`] compares against its own baseline the
+/// same way, so the whole history is rebuilt on the current set.
+fn ramp_se_history(ess_history: &[(Vec<f64>, usize)], stuck: &[bool]) -> Vec<(f64, usize)> {
+    ess_history
+        .iter()
+        .map(|(fracs, k)| (ramp_se_per_subject(fracs, *k, stuck).0, *k))
+        .collect()
 }
 
 /// The per-subject objective MC SE over the subjects `auto` acts on, and how many
@@ -1628,6 +1647,10 @@ fn run_mcem(
     // Every iteration's −2 log L and (per-subject SE, K), for `auto`.
     let mut iteration_objectives: Vec<f64> = Vec::with_capacity(n_iter);
     let mut iteration_se: Vec<(f64, usize)> = Vec::with_capacity(n_iter);
+    // Each iteration's ESS fractions and K, so `iteration_se` can be rebuilt
+    // when the set of subjects `auto` acts on changes (#2690).
+    let mut ess_history: Vec<(Vec<f64>, usize)> = Vec::new();
+    let mut prev_stuck: Vec<bool> = vec![false; population.subjects.len()];
     // Iterations actually run, and the seconds at which `max_time` stopped them.
     let mut iterations_done = 0usize;
     let mut stopped_after: Option<f64> = None;
@@ -1984,7 +2007,13 @@ fn run_mcem(
         let stuck = stuck_subjects.update(&ess_fracs, k_samples);
         if auto {
             let (ramp_se, n_ramp) = ramp_se_per_subject(&ess_fracs, k_samples, &stuck);
-            iteration_se.push((ramp_se, k_samples));
+            ess_history.push((ess_fracs.clone(), k_samples));
+            if stuck == prev_stuck {
+                iteration_se.push((ramp_se, k_samples));
+            } else {
+                iteration_se = ramp_se_history(&ess_history, &stuck);
+            }
+            prev_stuck.clone_from(&stuck);
             let (new_k, se) = auto_step(
                 &iteration_objectives,
                 &iteration_se,
@@ -7254,10 +7283,49 @@ mod tests {
         assert_eq!(t.update(&[0.5, one(600)], 600), [false, true]);
         // And it stays out after a lowering.
         assert_eq!(t.update(&[0.5, one(300)], 300), [false, true]);
+        assert_eq!(t.update(&[0.5, one(600)], 600), [false, true]);
         // A recovery ends the run, so it must fail at two counts again.
         assert_eq!(t.update(&[0.5, 0.2], 300), [false, false]);
         assert_eq!(t.update(&[0.5, one(300)], 300), [false, false]);
         assert_eq!(t.update(&[0.5, one(600)], 600), [false, true]);
+    }
+
+    /// A lowering is not a test of whether more draws help: a subject degenerate
+    /// first at a high K and then at a lower one stays in, and is left out only
+    /// once K rises past the lowest K of its run.
+    #[test]
+    fn a_lowering_does_not_mark_a_degenerate_subject_stuck() {
+        let mut t = StuckSubjects::default();
+        let one = |k: usize| 1.0 / k as f64;
+        assert_eq!(t.update(&[one(4000)], 4000), [false]);
+        assert_eq!(t.update(&[one(2000)], 2000), [false]);
+        assert_eq!(t.update(&[one(1000)], 1000), [false]);
+        // Back up to a K it has been degenerate at before, but above the run's
+        // lowest: that raise did not help.
+        assert_eq!(t.update(&[one(2000)], 2000), [true]);
+    }
+
+    /// Once a subject is left out, the window `auto` reads must lose it too. With
+    /// the stale entries the median still includes the one-draw subject and K
+    /// doubles; rebuilt on the current set it holds. Both sides are asserted.
+    #[test]
+    fn leaving_a_subject_out_rebuilds_the_se_window() {
+        let k = 1000;
+        let mut fracs = vec![0.8; 100];
+        fracs.push(1.0 / k as f64);
+        let history: Vec<(Vec<f64>, usize)> = vec![(fracs.clone(), k); 5];
+        let flat = vec![4000.0; 10];
+        let mut stuck = vec![false; 101];
+        let stale_with_newest = {
+            let mut h = ramp_se_history(&history[..4], &stuck);
+            stuck[100] = true;
+            h.push((ramp_se_per_subject(&fracs, k, &stuck).0, k));
+            h
+        };
+        assert_eq!(auto_step(&flat, &stale_with_newest, k, 100, true).0, 2 * k);
+        let rebuilt = ramp_se_history(&history, &stuck);
+        assert!(rebuilt.iter().all(|&(se, _)| se < AUTO_STDOBJ_TARGET));
+        assert_eq!(auto_step(&flat, &rebuilt, k, 100, true).0, k);
     }
 
     #[test]

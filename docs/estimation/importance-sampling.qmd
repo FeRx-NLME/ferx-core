@@ -131,9 +131,11 @@ carries all the weight or because its sampler failed, adds about 1 to the varian
 sum whatever K is. One such subject keeps the per-subject SE above 0.05 for any N
 below 1600, so it could ramp every subject to the cap without improving itself. A
 degenerate subject still counts at first, since a proposal that only undersamples
-the posterior recovers as K grows. It is left out of the decision once it has been
-degenerate at two different values of K over consecutive iterations, and a failed
-subject is left out at once. The fit's warning names the subjects left out at the
+the posterior recovers as K grows. It is left out of the decision once, over consecutive
+degenerate iterations, K has risen above the lowest K of that run and the subject is
+still degenerate; a lowering of K does not count. A failed subject is left out at
+once. When the set left out changes, the five-iteration SE window is recomputed
+without them, so they stop driving rises straight away. The fit's warning names the subjects left out at the
 final iteration: they need a better proposal (check their EBE and Hessian), not more
 samples. The reported MC SE still includes them.
 
