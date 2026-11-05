@@ -344,7 +344,10 @@ Jᵢ = ∂f/∂η at η̂ᵢ:
      proposal — gives a valid but noisy LL estimate).
 
 2. **Draw K samples** $\eta_{ik} \sim t_\nu(\hat\eta_i, \Sigma_i)$
-   (multivariate Student-t).
+   (multivariate Student-t; a multivariate normal with
+   `imp_proposal_df = normal`). With `imp_defensive_alpha > 0` a fraction
+   of the draws come from the prior (see [Defensive mixture](#defensive-mixture)).
+   An IOV subject samples the stacked (η, κ) vector the same way.
 
 3. **Compute log importance weights:**
 $$
@@ -619,7 +622,9 @@ lives in `tests/warfarin_imp_nonmem.rs`.
 
 ## See also
 
-- [SAEM](saem.qmd) — common upstream stage for `method = [saem, imp]`.
+- [SAEM](saem.qmd) — common upstream stage for `method = [saem, imp]` with
+  `imp_eval_only = true`, which scores the SAEM fit (NONMEM `SAEM` →
+  `IMP EONLY=1`); see [Post-SAEM Finalization](saem.qmd#post-saem-finalization).
 - [SIR](sir.qmd) — a different importance-sampling-flavoured procedure
   that targets *parameter uncertainty* (CIs on θ/Ω/σ), not the marginal
   likelihood. The name overlap is unfortunate; the two methods are

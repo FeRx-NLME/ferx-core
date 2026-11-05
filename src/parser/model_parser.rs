@@ -16989,6 +16989,34 @@ fn build_ode_spec(
         tad_slot,
         macheps_slot,
     );
+    // The compiled RHS, or why the interpreter keeps it, named for `fit()` and `ferx
+    // check` (#2681): a slot by the name the `[odes]` block reads it under.
+    let rhs_reg = rhs_regcode::RhsRegProgram::compile_unless_disabled(
+        &stmts_owned,
+        &rhs_regcode::RhsLayout {
+            n_vars: n_vars_total,
+            state_count,
+            indiv_to_params_slot: &indiv_to_params_slot,
+            seed_slots: [time_slot, tafd_slot, tad_slot, macheps_slot],
+        },
+    )
+    .map_err(|r| {
+        let slot_name = |slot: usize| -> String {
+            state_names_owned
+                .iter()
+                .chain(indiv_names_owned.iter())
+                .chain(intermediates.iter())
+                .nth(slot)
+                .cloned()
+                .or_else(|| {
+                    ["TIME", "TAFD", "TAD", "MACHEPS"]
+                        .get(slot.wrapping_sub(n_base_vars))
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| format!("slot {slot}"))
+        };
+        r.named(slot_name)
+    });
     let mut rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -17010,15 +17038,8 @@ fn build_ode_spec(
         #[cfg(feature = "survival")]
         init_indiv_reads,
         init_program,
-        reg: rhs_regcode::RhsRegProgram::compile_unless_disabled(
-            &stmts_owned,
-            &rhs_regcode::RhsLayout {
-                n_vars: n_vars_total,
-                state_count,
-                indiv_to_params_slot: &indiv_to_params_slot,
-                seed_slots: [time_slot, tafd_slot, tad_slot, macheps_slot],
-            },
-        ),
+        reg: rhs_reg.as_ref().ok().cloned(),
+        reg_refusal: rhs_reg.err(),
         hoist: rhs_hoist,
         binding,
         columns: None,
@@ -31183,6 +31204,9 @@ pub struct OdeRhsProgram {
     /// `rhs_regcode`); `None` otherwise. It recomputes the hoist's parameter-only values,
     /// which are bit-identical to the cached ones by construction.
     reg: Option<rhs_regcode::RhsRegProgram>,
+    /// Why [`Self::reg`] is `None`: the construct that kept the interpreter, and where
+    /// (#2681). `Some` exactly when `reg` is `None`.
+    reg_refusal: Option<rhs_regcode::RhsInterpreted>,
     /// The f64 RHS at many single-state perturbations in one lane pass
     /// ([`OdeRhsProgram::rhs_columns`]); `None` when a statement cannot run on lanes.
     columns: Option<RhsColumnsFn>,
@@ -31268,6 +31292,23 @@ impl OdeRhsProgram {
     /// clock, or a parameter that reads `TIME`). A parameter counts when a θ or η reaches it,
     /// FIX or not: `ModelParameters::theta_fixed` is the caller's to change at `fit()`, which
     /// the model-level scope cannot see. A covariate-only `LAGT = WT / 10` is left alone.
+    /// Which engine runs this RHS (#2681): the interpreter, with the construct that kept
+    /// it; the register code, with why no native code; or native code.
+    pub(crate) fn rhs_route(&self) -> rhs_regcode::RhsRoute<'_> {
+        match (&self.reg, &self.reg_refusal) {
+            (_, Some(r)) => rhs_regcode::RhsRoute::Interpreter(r),
+            (Some(reg), None) => reg.route(),
+            // Not built by the parser, which sets exactly one of the two.
+            (None, None) => rhs_regcode::RhsRoute::Native,
+        }
+    }
+
+    /// The note `fit()` and `ferx check` report for an RHS that does not run as native code
+    /// (#2681): `(code, message, details)`, or `None` when it does.
+    pub(crate) fn route_note(&self) -> Option<(&'static str, String, serde_json::Value)> {
+        rhs_regcode::rhs_route_note(self.rhs_route())
+    }
+
     fn resolve_moving_switches(&mut self, deps: &std::collections::HashMap<String, IndivVarDeps>) {
         let mut out: Vec<String> = Vec::new();
         for c in &self.condition_reads {

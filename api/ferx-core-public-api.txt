@@ -2839,6 +2839,7 @@ pub ferx_core::types::WarningCode::InitNotRepresentable
 pub ferx_core::types::WarningCode::InitOutsideBounds
 pub ferx_core::types::WarningCode::MuReferencing
 pub ferx_core::types::WarningCode::MultiStart
+pub ferx_core::types::WarningCode::OdeRhsRoute
 pub ferx_core::types::WarningCode::OdeSolver
 pub ferx_core::types::WarningCode::OmegaStructure
 pub ferx_core::types::WarningCode::OptimizerConfig
@@ -4281,6 +4282,7 @@ pub ferx_core::WarningCode::InitNotRepresentable
 pub ferx_core::WarningCode::InitOutsideBounds
 pub ferx_core::WarningCode::MuReferencing
 pub ferx_core::WarningCode::MultiStart
+pub ferx_core::WarningCode::OdeRhsRoute
 pub ferx_core::WarningCode::OdeSolver
 pub ferx_core::WarningCode::OmegaStructure
 pub ferx_core::WarningCode::OptimizerConfig

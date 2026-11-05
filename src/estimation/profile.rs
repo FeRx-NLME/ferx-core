@@ -59,9 +59,9 @@ use crate::estimation::outer_optimizer::{
     bobyqa_initial_step, bobyqa_stop_needs_polish, drive_legs, ebe_guard_rejects,
     flat_theta_candidates, flat_theta_probe_moves, flat_theta_probe_value, flat_theta_warning,
     joint_warm_start, joint_warm_starts, max_scaled_deviation, population_gradient,
-    resolve_outer_ftol, runs_outer_optimizer, subject_nll, OuterFdDeclineLog, OuterResult,
-    OuterTrial, PolishEnd, StartEval, INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS, POLISH_FTOL_REL,
-    POLISH_XTOL_REL,
+    resolve_outer_ftol, runs_outer_optimizer, subject_nll, wants_start_warm_rescore,
+    warm_rescore_accepted, OuterFdDeclineLog, OuterResult, OuterTrial, PolishEnd, StartEval,
+    INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS, POLISH_FTOL_REL, POLISH_XTOL_REL,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_params,
@@ -2745,7 +2745,56 @@ pub(crate) fn optimize_profiled(
         let params = unpack_params(x, &hold);
         let warm = best.lock().unwrap().warm.clone();
         let mut work = ProfileCounts::default();
-        let solved = ctx.solve_counted(&params, &warm, &mut work);
+        let mut solved = ctx.solve_counted(&params, &warm, &mut work);
+        // #2682: a first solve the guard rejects on its unconverged fraction is solved again,
+        // warm from its own levels and EBEs, and that solve is judged instead — the
+        // incumbent's warm start stays the template's cold one until an evaluation is
+        // accepted, so a start rejected cold was rejected the same way at every later trial.
+        // A re-solve the guard still rejects (or that fails) is discarded: the evaluation is
+        // the cold one, as before.
+        let mut warm_rescored_from = None;
+        if first_call && !crate::cancel::is_cancelled(&options.cancel) {
+            if let Ok(cold) = &solved {
+                let n_subj = population.subjects.len();
+                if wants_start_warm_rescore(
+                    &cold.ebe,
+                    n_subj,
+                    cold.ofv,
+                    options.max_unconverged_frac,
+                ) {
+                    let rewarm = ProfileWarm::from_solve(&layout, cold);
+                    let resolved = ctx.solve_counted(&params, &rewarm, &mut work);
+                    let accepted = resolved.as_ref().is_ok_and(|w| {
+                        warm_rescore_accepted(&w.ebe, n_subj, w.ofv, options.max_unconverged_frac)
+                    });
+                    if options.verbose {
+                        eprintln!(
+                            "Profiled start rejected by the EBE convergence guard ({} of {} \
+                             subjects unconverged from the cold start); re-solved warm from its \
+                             own EBEs: {}",
+                            cold.ebe.n_unconverged,
+                            n_subj,
+                            match &resolved {
+                                Ok(w) => format!(
+                                    "{} unconverged, {}",
+                                    w.ebe.n_unconverged,
+                                    if accepted {
+                                        "accepted"
+                                    } else {
+                                        "still rejected"
+                                    }
+                                ),
+                                Err(_) => "the solve failed, still rejected".to_string(),
+                            },
+                        );
+                    }
+                    if accepted {
+                        warm_rescored_from = Some(cold.ebe.n_unconverged);
+                        solved = resolved;
+                    }
+                }
+            }
+        }
         // The unprofiled loop's EBE guard, on the same counts: too many unconverged
         // subjects (or one hard-rejected at its start) and the trial is a wall.
         let guarded = solved.as_ref().is_ok_and(|s| {
@@ -2769,6 +2818,7 @@ pub(crate) fn optimize_profiled(
                     n_unconverged: s.ebe.n_unconverged,
                     n_start_rejected: s.ebe.n_start_rejected,
                     rescored: None,
+                    warm_rescored_from,
                 },
                 Err(_) => StartEval {
                     ofv: f64::INFINITY,
@@ -2776,6 +2826,7 @@ pub(crate) fn optimize_profiled(
                     n_unconverged: 0,
                     n_start_rejected: 0,
                     rescored: None,
+                    warm_rescored_from: None,
                 },
             };
             *start_eval.lock().unwrap() = Some(start);

@@ -410,6 +410,10 @@ mod stalled_at_init_warning_tests;
 mod degenerate_cl_v_warning_tests;
 
 #[cfg(test)]
+#[path = "tests/ode_rhs_route_tests.rs"]
+mod ode_rhs_route_tests;
+
+#[cfg(test)]
 #[path = "tests/nonfinite_objective_tests.rs"]
 mod nonfinite_objective_tests;
 
