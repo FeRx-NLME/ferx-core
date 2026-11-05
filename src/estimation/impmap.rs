@@ -203,8 +203,15 @@ fn under_sampling_advice(
     k_start: usize,
     sample_opt: &str,
     auto_opt: &str,
+    only_left_out_noisy: bool,
 ) -> String {
-    if auto && final_k >= AUTO_SAMPLES_MAX {
+    if auto && only_left_out_noisy {
+        format!(
+            "`{auto_opt}` met the MC-SE target on the subjects it samples for; the remaining \
+             noise comes from the subject(s) it left out, named below, so a larger \
+             `{sample_opt}` is unlikely to help."
+        )
+    } else if auto && final_k >= AUTO_SAMPLES_MAX {
         format!(
             "`{auto_opt}` is enabled but the sample count {final_k} (cap {AUTO_SAMPLES_MAX}) \
              was not enough to reach the MC-SE target."
@@ -360,6 +367,20 @@ fn id_list(ids: &[&str], max: usize) -> String {
         0 => shown,
         rest => format!("{shown} and {rest} more"),
     }
+}
+
+/// The under-sampling warning's sentence on degenerate subjects that are not named as
+/// left out of the ramp. More draws may still recover one whose proposal only
+/// undersamples the posterior, so it makes no claim either way (#2690 review).
+fn collapse_sentence(n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    format!(
+        " {n} subject(s) had a degenerate proposal (ESS < {DEGENERATE_ESS}: one draw carries \
+         the weight, or the sampler failed), whose moments are unreliable at this sample \
+         count — check their EBE/Hessian quality."
+    )
 }
 
 /// The under-sampling warning's sentence naming the subjects `auto` left out of the
@@ -2451,17 +2472,17 @@ fn run_mcem(
         } else {
             ("imp_samples", "imp_auto")
         };
-        let collapse = if final_n_collapsed > 0 {
-            format!(
-                " {} subject(s) had a collapsed proposal (ESS < {DEGENERATE_ESS}: one draw \
-                 carries the weight, or the sampler failed), whose moments are unreliable \
-                 regardless of sample count — check their EBE/Hessian quality.",
-                final_n_collapsed
-            )
-        } else {
-            String::new()
-        };
+        // Under `auto` the left-out subjects get their own sentence, which says
+        // more samples will not help them; the collapse sentence counts the rest,
+        // which a larger count may still recover (#2690 review).
+        let named = if auto { final_stuck_ids.len() } else { 0 };
+        let collapse = collapse_sentence(final_n_collapsed.saturating_sub(named));
         let stuck = stuck_subjects_sentence(auto, auto_opt, &final_stuck_ids);
+        // The noise is all theirs when the subjects `auto` acts on met the target.
+        let only_left_out_noisy = named > 0
+            && iteration_se
+                .last()
+                .is_some_and(|&(se, _)| se <= AUTO_STDOBJ_TARGET);
         let advice = under_sampling_advice(
             auto,
             final_k_samples,
@@ -2469,6 +2490,7 @@ fn run_mcem(
             k_start,
             sample_opt,
             auto_opt,
+            only_left_out_noisy,
         );
         warnings.push(format!(
             "{label}: {} importance samples for {} give a noisy objective \
@@ -7423,7 +7445,7 @@ mod tests {
         let advice = |auto, k, stopped| {
             let mut history = at_scale(5.0, 1000, 5);
             history.extend(at_scale(if stopped { 11.0 } else { 5.0 }, 2000, 5));
-            under_sampling_advice(auto, k, &history, 1000, "imp_samples", "imp_auto")
+            under_sampling_advice(auto, k, &history, 1000, "imp_samples", "imp_auto", false)
         };
         let at_cap = advice(true, AUTO_SAMPLES_MAX, false);
         assert!(at_cap.contains("was not enough") && !at_cap.contains("below the cap"));
@@ -7449,6 +7471,43 @@ mod tests {
         );
         let fixed = advice(false, 2000, false);
         assert!(fixed.contains("`imp_auto = true`") && !fixed.contains("is enabled"));
+    }
+
+    /// When only the left-out subjects are noisy, the advice must not ask for more
+    /// samples or iterations, whatever else the history says; without them it does.
+    #[test]
+    fn under_sampling_advice_does_not_ask_for_samples_left_out_subjects_cannot_use() {
+        let h = at_scale(5.0, 1000, 5);
+        for k in [1000, AUTO_SAMPLES_MAX] {
+            let left_out =
+                under_sampling_advice(true, k, &h, 1000, "imp_samples", "imp_auto", true);
+            assert!(
+                left_out.contains("met the MC-SE target")
+                    && left_out.contains("left out")
+                    && left_out.contains("larger `imp_samples` is unlikely to help")
+                    && !left_out.contains("more iterations")
+                    && !left_out.contains("was not enough"),
+                "{left_out}"
+            );
+        }
+        let ordinary =
+            under_sampling_advice(true, 1000, &h, 1000, "imp_samples", "imp_auto", false);
+        assert!(ordinary.contains("more iterations") && !ordinary.contains("left out"));
+        // Without `auto` nothing was left out of any ramp.
+        let fixed = under_sampling_advice(false, 1000, &h, 1000, "imp_samples", "imp_auto", true);
+        assert!(fixed.contains("`imp_auto = true`") && !fixed.contains("left out"));
+    }
+
+    #[test]
+    fn collapse_sentence_makes_no_claim_about_more_samples() {
+        assert_eq!(collapse_sentence(0), "");
+        let s = collapse_sentence(3);
+        assert!(s.contains("3 subject(s)") && s.contains("ESS < 2"), "{s}");
+        assert!(s.contains("at this sample count"), "{s}");
+        assert!(
+            !s.contains("regardless") && !s.contains("not more samples"),
+            "{s}"
+        );
     }
 
     /// `n` iterations at `k` with a constant `SE²·K` of `scale`.
