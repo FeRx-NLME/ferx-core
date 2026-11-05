@@ -193,13 +193,13 @@ fn both_ways(
 
 fn worst_rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    a.iter()
+    let gaps: Vec<f64> = a
+        .iter()
         .zip(b)
-        .map(|(x, y)| {
-            assert!(x.is_finite() && y.is_finite(), "{x} vs {y}");
-            (x - y).abs() / (1.0 + y.abs())
-        })
-        .fold(0.0, f64::max)
+        .map(|(x, y)| (x - y).abs() / (1.0 + y.abs()))
+        .collect();
+    assert!(gaps.iter().all(|e| e.is_finite()), "{a:?} vs {b:?}");
+    gaps.into_iter().fold(0.0, f64::max)
 }
 
 /// Closed form, covariate exponent, block Ω, combined error; and its ODE twin.

@@ -7513,8 +7513,14 @@ fn the_quadrature_mode_response_is_the_focei_one() {
                 plain.unwrap_or_else(|| panic!("{label}: no gradient")),
                 fused.unwrap_or_else(|| panic!("{label}: no fused gradient")),
             );
+            // Not bitwise: with the response formed, Ψ's θ adjoint is read off A's and the
+            // rows' instead of its own sweep (`agq_taped`), the same quantity summed in
+            // another order: measured worst 4.1e-16 over these fixtures, so 1e-14 keeps ~25×
+            // headroom. A response that corrupted the gradient moves it by far more.
             for (a, b) in plain.iter().zip(&fused) {
-                assert_eq!(a.to_bits(), b.to_bits(), "{label}: the gradient moved");
+                assert!(a.is_finite() && b.is_finite(), "{label}: {a} vs {b}");
+                let gap = (a - b).abs() / (1.0 + b.abs());
+                assert!(gap < 1e-14, "{label}: the gradient moved by {gap:.2e}");
             }
             let want = focei.unwrap_or_else(|| panic!("{label}: no FOCEI response"));
             let got = dx.unwrap_or_else(|| panic!("{label}: no quadrature response"));

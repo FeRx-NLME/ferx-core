@@ -65,13 +65,13 @@ fn subject_for(model: &CompiledModel) -> Subject {
 
 fn worst_rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    a.iter()
+    let gaps: Vec<f64> = a
+        .iter()
         .zip(b)
-        .map(|(x, y)| {
-            assert!(x.is_finite() && y.is_finite(), "{x} vs {y}");
-            (x - y).abs() / (1.0 + y.abs())
-        })
-        .fold(0.0, f64::max)
+        .map(|(x, y)| (x - y).abs() / (1.0 + y.abs()))
+        .collect();
+    assert!(gaps.iter().all(|e| e.is_finite()), "{a:?} vs {b:?}");
+    gaps.into_iter().fold(0.0, f64::max)
 }
 
 /// Laplace (exact anchor, one node) and AGQ-3 under the FOCEI anchor, closed form and ODE:
