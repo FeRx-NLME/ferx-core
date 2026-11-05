@@ -23735,6 +23735,10 @@ pub(crate) const SUPPORTED_UNARY_FNS: &[&str] = &[
     // including softplus's `|z| > 20` tails that `log(1 + exp(z))` gets wrong.
     "tanh",
     "softplus",
+    // #2720: trigonometric functions, in radians — circadian baselines
+    // (`AMP * cos(2 * PI * (TIME - PHS) / 24)`), NONMEM's `SIN`/`COS`.
+    "sin",
+    "cos",
 ];
 
 /// Panic message for the (parser-guaranteed unreachable) tail of each
@@ -28219,6 +28223,8 @@ fn eval_expr<E: EvalEnv>(
                 }
                 "tanh" => crate::nn::Activation::Tanh.apply(v),
                 "softplus" => crate::nn::Activation::Softplus.apply(v),
+                "sin" => v.sin(),
+                "cos" => v.cos(),
                 // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
                 _ => unreachable!("{UNARY_FN_ARM_MISSING} (eval_expr, `{name}`)"),
             }
@@ -28394,6 +28400,10 @@ enum Op {
     /// the code a `[covariate_nn]` runs, on every evaluator.
     Tanh,
     Softplus,
+    /// `sin(x)` / `cos(x)` in radians (#2720): `f64::sin`/`f64::cos` on every
+    /// evaluator, the dual jets lifted from the same values.
+    Sin,
+    Cos,
     CmpLt,
     CmpLe,
     CmpGt,
@@ -28478,7 +28488,9 @@ fn ip_op_cost(op: &Op) -> u32 {
         | Op::Logit
         | Op::InvLogit
         | Op::Tanh
-        | Op::Softplus => 20,
+        | Op::Softplus
+        | Op::Sin
+        | Op::Cos => 20,
         Op::Div | Op::Mod => 4,
         _ => 1,
     }
@@ -28524,6 +28536,8 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
             | Op::Logit
             | Op::Tanh
             | Op::Softplus
+            | Op::Sin
+            | Op::Cos
             | Op::CmpLt
             | Op::CmpLe
             | Op::CmpGt
@@ -28695,6 +28709,8 @@ fn ip_op_pops(op: &Op) -> Option<usize> {
         | Op::Logit
         | Op::Tanh
         | Op::Softplus
+        | Op::Sin
+        | Op::Cos
         | Op::LogicNot
         | Op::IsPresent
         | Op::Floor
@@ -29407,6 +29423,8 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::Logit
             | Op::Tanh
             | Op::Softplus
+            | Op::Sin
+            | Op::Cos
             | Op::LogicNot
             | Op::IsPresent
             | Op::Floor
@@ -29532,6 +29550,8 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 "logit" => bc.ops.push(Op::Logit),
                 "tanh" => bc.ops.push(Op::Tanh),
                 "softplus" => bc.ops.push(Op::Softplus),
+                "sin" => bc.ops.push(Op::Sin),
+                "cos" => bc.ops.push(Op::Cos),
                 "floor" => bc.ops.push(Op::Floor),
                 "ceil" => bc.ops.push(Op::Ceil),
                 "round" => bc.ops.push(Op::Round),
@@ -29786,6 +29806,8 @@ fn eval_bytecode_lanes<L: Lane>(
             }),
             Op::Tanh => unary!(|v| crate::nn::Activation::Tanh.apply(v)),
             Op::Softplus => unary!(|v| crate::nn::Activation::Softplus.apply(v)),
+            Op::Sin => unary!(|v| v.sin()),
+            Op::Cos => unary!(|v| v.cos()),
             Op::CmpLt => binary!(|l, r| bool01(l < r)),
             Op::CmpLe => binary!(|l, r| bool01(l <= r)),
             Op::CmpGt => binary!(|l, r| bool01(l > r)),
@@ -29863,6 +29885,21 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
         Op::Round => T::from_f64(v.val().round()),
         _ => unreachable!("apply_unary: {op:?} is not a unary value op"),
     }
+}
+
+/// `sin(x)` on any number type (#2720): the value is `f64::sin` bit for bit, and the
+/// jet carries `sin⁽ⁿ⁾` through n = 4 (the covariance step's nested dual reads all four).
+#[inline]
+fn sin_g<T: crate::sens::num::PkNum>(x: T) -> T {
+    let (s, c) = (x.val().sin(), x.val().cos());
+    x.lift4(s, c, -s, -c, s)
+}
+
+/// `cos(x)` on any number type (#2720); see [`sin_g`].
+#[inline]
+fn cos_g<T: crate::sens::num::PkNum>(x: T) -> T {
+    let (s, c) = (x.val().sin(), x.val().cos());
+    x.lift4(c, -s, -c, s, c)
 }
 
 /// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
@@ -30058,6 +30095,14 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::Softplus => {
                 let v = pop!();
                 push!(crate::nn::Activation::Softplus.apply_g(v));
+            }
+            Op::Sin => {
+                let v = pop!();
+                push!(sin_g(v));
+            }
+            Op::Cos => {
+                let v = pop!();
+                push!(cos_g(v));
             }
             Op::Logit => {
                 let v = pop!();
@@ -32169,6 +32214,8 @@ fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
         | Op::Logit
         | Op::Tanh
         | Op::Softplus
+        | Op::Sin
+        | Op::Cos
         | Op::CmpLt
         | Op::CmpLe
         | Op::CmpGt
@@ -33633,6 +33680,8 @@ fn resolve_condition_indices(
 //   UnaryFn("tanh", a)     : (1 − tanh(a)²) · a'
 //   UnaryFn("softplus", a) : a' / exp(a)·a' / inv_logit(a)·a' on the branch
 //                            `Activation::Softplus` takes (a > 20 / a < −20 / else)
+//   UnaryFn("sin", a)      : cos(a) · a'
+//   UnaryFn("cos", a)      : −sin(a) · a'
 //   UnaryFn("floor"|"ceil"|"round", a) : 0 (piecewise constant; the integer
 //                            boundaries are undefined and ignored, as for Mod)
 //   Power(b, e)            : b^e · (e'·ln(b) + e · b'/b)  (general; subsumes
@@ -33907,6 +33956,15 @@ fn differentiate_with_chain(
                             Box::new(mul(sig_a, da)),
                         )),
                     )
+                }
+                "sin" => {
+                    // cos(a) · a'
+                    mul(Expression::UnaryFn("cos".into(), arg.clone()), da)
+                }
+                "cos" => {
+                    // −sin(a) · a'
+                    let s = Expression::UnaryFn("sin".into(), arg.clone());
+                    sub(Expression::Literal(0.0), mul(s, da))
                 }
                 "floor" | "ceil" | "round" => {
                     // Piecewise constant: 0 almost everywhere, undefined on the

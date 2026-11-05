@@ -17784,6 +17784,111 @@ fn bytecode_g_dual2_matches_fd() {
     );
 }
 
+/// `sin`/`cos` (#2720) on the `Dual2` VM with the **random effect inside the
+/// argument** — the circadian shape `A·cos(2π(t + η)/24 − φ) + B·sin(4π(t + η)/24 − φ₂)`,
+/// seeded in η (the phase shift) and in the amplitude `A`, against central FD of the
+/// `f64` VM. The value is pinned to the `f64` VM, the gradient and every Hessian entry,
+/// including the η–A cross term, to closed forms and to FD. The point `η = 1.3 h`, `t = 7` puts both
+/// arguments away from a zero of either function, so no derivative is trivially `0`.
+#[test]
+fn bytecode_g_sin_cos_dual2_matches_fd_with_eta_in_the_argument() {
+    use crate::sens::dual2::Dual2;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    // arg_k = k·2π·(TIME + η)/24 − φ_k, with TIME a literal and η = vars[1].
+    let arg = |k: f64, phi: f64| {
+        binop(
+            BinOp::Sub,
+            binop(
+                BinOp::Div,
+                binop(
+                    BinOp::Mul,
+                    lit(k * two_pi),
+                    binop(BinOp::Add, lit(7.0), Expression::Eta(0)),
+                ),
+                lit(24.0),
+            ),
+            lit(phi),
+        )
+    };
+    let expr = binop(
+        BinOp::Add,
+        binop(BinOp::Mul, varidx(0), unary("cos", arg(1.0, 0.9))),
+        binop(BinOp::Mul, lit(0.04), unary("sin", arg(2.0, 0.5))),
+    );
+    let bc = compile_bytecode(&expr);
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let v = |amp: f64, eta: f64| {
+        let mut s: Vec<f64> = Vec::new();
+        eval_bytecode(&bc, &[], &[eta], &[], &[amp], &nn, &mut s)
+    };
+    let (amp, eta) = (0.12, 1.3);
+    let mut sd: Vec<Dual2<2>> = Vec::new();
+    let d = eval_bytecode_g::<Dual2<2>>(
+        &bc,
+        &[],
+        &[Dual2::<2>::var(eta, 1)],
+        &[],
+        &[Dual2::<2>::var(amp, 0)],
+        &[],
+        &mut sd,
+    );
+    assert!(close(d.value, v(amp, eta), 1e-13, 1e-13), "value vs f64 VM");
+    // Closed forms, so a sign error in a lifted derivative cannot hide in FD noise:
+    // ∂/∂A = cos(a₁), ∂/∂η = −A·sin(a₁)·2π/24 + 0.04·cos(a₂)·4π/24.
+    let (a1, a2) = (
+        two_pi * (7.0 + eta) / 24.0 - 0.9,
+        2.0 * two_pi * (7.0 + eta) / 24.0 - 0.5,
+    );
+    let (c1, c2) = (two_pi / 24.0, 2.0 * two_pi / 24.0);
+    let want_g = [a1.cos(), -amp * a1.sin() * c1 + 0.04 * a2.cos() * c2];
+    let want_h = [
+        [0.0, -a1.sin() * c1],
+        [
+            -a1.sin() * c1,
+            -amp * a1.cos() * c1 * c1 - 0.04 * a2.sin() * c2 * c2,
+        ],
+    ];
+    for i in 0..2 {
+        assert!(
+            close(d.grad[i], want_g[i], 1e-14, 1e-14),
+            "grad[{i}]: {} vs {}",
+            d.grad[i],
+            want_g[i]
+        );
+        for j in 0..2 {
+            assert!(
+                close(d.hess[i][j], want_h[i][j], 1e-14, 1e-14),
+                "hess[{i}][{j}]: {} vs {}",
+                d.hess[i][j],
+                want_h[i][j]
+            );
+        }
+    }
+    // …and against FD of the f64 VM, which shares no derivative code with either.
+    let h = 1e-5;
+    let gfd = [
+        (v(amp + h, eta) - v(amp - h, eta)) / (2.0 * h),
+        (v(amp, eta + h) - v(amp, eta - h)) / (2.0 * h),
+    ];
+    let hh = 1e-4;
+    let hfd_ee = (v(amp, eta + hh) - 2.0 * v(amp, eta) + v(amp, eta - hh)) / (hh * hh);
+    let hfd_ae = (v(amp + hh, eta + hh) - v(amp + hh, eta - hh) - v(amp - hh, eta + hh)
+        + v(amp - hh, eta - hh))
+        / (4.0 * hh * hh);
+    for (got, fd, what) in [
+        (d.grad[0], gfd[0], "∂/∂A"),
+        (d.grad[1], gfd[1], "∂/∂η"),
+        (d.hess[1][1], hfd_ee, "∂²/∂η²"),
+        (d.hess[0][1], hfd_ae, "∂²/∂A∂η"),
+    ] {
+        assert!(
+            got.is_finite() && fd.is_finite(),
+            "{what}: {got} vs FD {fd}"
+        );
+        assert!(close(got, fd, 1e-6, 1e-6), "{what}: {got} vs FD {fd}");
+    }
+}
+
 #[test]
 fn compute_max_stack_allows_branching_bytecode() {
     // Regression: a `Conditional` compiles to
@@ -26089,6 +26194,8 @@ fn every_supported_unary_fn_has_an_arm_in_all_three_consumers() {
         ("expit", 0.5),
         ("tanh", 0.5),
         ("softplus", 0.5),
+        ("sin", 0.5),
+        ("cos", 0.5),
     ];
     // The probe table must equal the const as a *multiset*, asserted as one
     // comparison of sorted vectors rather than as a set of membership and
