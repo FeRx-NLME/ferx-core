@@ -541,11 +541,11 @@ fn test_imp_marginal_warns_when_effective_draws_are_too_few() {
 }
 
 // ── Test: IMP in a chained methods sequence + IOV exercises the IS IOV path ─
-// `method = [foce, imp]` on a kappa-bearing model drives the importance-
-// sampling marginal-likelihood step through its IOV branch
-// (`obs_nll_iov_fixed_kappa`, `compute_posterior_hessian`,
-// `subject_is_estimate`, `build_proposals`). κ is held at its EBE, so the
-// reported −2LL is a partial marginal (see `KappaTreatment::FixedAtMode`).
+// `method = [foce, imp]` with `imp_eval_only` on a kappa-bearing model drives the
+// evaluation-only importance-sampling step through its IOV branch
+// (`compute_joint_posterior_hessian`, `subject_is_estimate_joint`): η and κ are
+// sampled jointly, so the reported −2LL marginalises κ
+// (`KappaTreatment::Marginalized`).
 #[test]
 fn test_iov_imp_chain_runs_importance_sampling() {
     let model = make_iov_model();
@@ -554,8 +554,7 @@ fn test_iov_imp_chain_runs_importance_sampling() {
     opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
     opts.imp_samples = 200; // keep the per-subject sampling cheap
     opts.imp_seed = Some(42); // deterministic proposal draws
-                              // The IS IOV branch is the evaluation-only path; the estimating IMP
-                              // M-step does not yet support IOV (refused up front).
+                              // Evaluation-only: score FOCE's estimates rather than re-estimate them.
     opts.imp_eval_only = true;
     let result = fit(&model, &pop, &model.default_params, &opts);
     assert!(

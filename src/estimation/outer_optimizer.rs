@@ -152,7 +152,7 @@ pub struct OuterResult {
     /// against it (`crate::api::postfit::mcem_marginal_warning`, #2652).
     pub(crate) mcem_lowest_objective: Option<f64>,
     /// The per-iteration objectives of an IMP / IMPMAP run; `None` for every other
-    /// estimator. `fit()` tests them for settling
+    /// estimator, and for a run its wall-clock limit stopped. `fit()` tests them for settling
     /// (`crate::api::postfit::mcem_settling_warning`, #2686).
     pub(crate) mcem_objective_trail: Option<crate::estimation::impmap::McemObjectiveTrail>,
 }
@@ -1977,6 +1977,101 @@ pub(crate) fn ebe_guard_rejects(
 /// backtrack to a feasible step. `BASE` is a wall far above any feasible OFV yet low enough
 /// that the quadratic term stays f64-resolvable (the old `1e20` swamped it). Only the
 /// gradient optimizers need this; derivative-free BOBYQA keeps the flat `1e20` wall.
+/// Whether an outer run's **first** evaluation, rejected by the EBE guard, is solved again
+/// warm from the EBEs it just found before it is judged (#2682).
+///
+/// The guard rejects a *step*: too many unconverged inner loops make the objective there
+/// untrustworthy, so the optimizer backs away to its incumbent. At the start there is no
+/// incumbent, and [`adopt_warm_start`] keeps the warm-start cache at zero until there is
+/// one (#1290) — so a start whose cold inner solve leaves more than `max_unconverged_frac`
+/// of the subjects unconverged is re-solved cold at every later trial too, each is
+/// rejected the same way, and the optimizer walks the centre-push gradient toward the box
+/// midpoint. Reported on an 8-state ODE with 5,112 subjects: eval 1 printed the guard
+/// penalty `1000000050451.003662`, no later evaluation was feasible, and the run hit a 2 h
+/// cap; at `max_unconverged_frac = 1.0` the same start scored −5732.82 and the fit moved
+/// on at once. A second inner pass from the first one's EBEs gives the unconverged
+/// subjects the budget a warm start would have, at the one point where no warm start
+/// exists.
+///
+/// The profiled loop (`profile::optimize_profiled`) applies the same rule to its first
+/// profile solve, re-solving from `ProfileWarm::from_solve`.
+///
+/// Only the fraction trigger qualifies. A hard start rejection holds a placeholder
+/// `(η, H)` that is no warm start, and a non-finite objective is not something more inner
+/// iterations repair.
+pub(crate) fn wants_start_warm_rescore(
+    stats: &InnerLoopStats,
+    n_subj: usize,
+    raw_ofv: f64,
+    max_unconverged_frac: f64,
+) -> bool {
+    stats.n_start_rejected == 0 && ebe_guard_rejects(stats, n_subj, raw_ofv, max_unconverged_frac)
+}
+
+/// One evaluation's inner solve as the objective closure consumes it: EBEs, inner
+/// Hessians, inner-loop statistics, κ̂, the objective, and AGQ's population evaluation.
+type StartSolve = (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+    f64,
+    Option<crate::estimation::agq::PopulationEvaluation>,
+);
+
+/// Whether [`wants_start_warm_rescore`]'s warm re-solve replaces the cold solve it was run
+/// from: the guard accepts it **and** its objective is finite.
+///
+/// The second half is not implied by the first. [`ebe_guard_rejects`] answers `false` for a
+/// non-finite objective — the fraction trigger only judges a finite one — so on the guard
+/// alone a re-solve that returned `NaN` or `∞` would replace a finite, fraction-rejected
+/// cold solve and be published as an unguarded start, which `above_start_warning` then
+/// skips (#2682 review r3). Kept, the cold solve stays the evaluation, rejected as before.
+pub(crate) fn warm_rescore_accepted(
+    stats: &InnerLoopStats,
+    n_subj: usize,
+    raw_ofv: f64,
+    max_unconverged_frac: f64,
+) -> bool {
+    raw_ofv.is_finite() && !ebe_guard_rejects(stats, n_subj, raw_ofv, max_unconverged_frac)
+}
+
+/// The verbose line for an evaluation the optimizer was handed a penalty for instead of
+/// its objective (#2682): which trigger rejected it, with the count behind it.
+fn guarded_eval_line(
+    stats: &InnerLoopStats,
+    n_subj: usize,
+    raw_ofv: f64,
+    max_unconverged_frac: f64,
+) -> String {
+    if !raw_ofv.is_finite() {
+        format!("rejected, the objective is not finite ({raw_ofv})")
+    } else if stats.n_start_rejected > 0 {
+        format!(
+            "rejected by the EBE convergence guard, {} of {} subjects rejected at their inner \
+             start",
+            stats.n_start_rejected, n_subj,
+        )
+    } else {
+        format!(
+            "rejected by the EBE convergence guard, {} of {} subjects' inner loops did not \
+             converge, against `max_unconverged_frac` = {max_unconverged_frac} (OFV there \
+             {raw_ofv:.6})",
+            stats.n_unconverged, n_subj,
+        )
+    }
+}
+
+/// A first evaluation's cold inner solve, held while [`wants_start_warm_rescore`]'s warm
+/// re-solve runs, with what that re-solve overwrites.
+struct ColdStart {
+    solved: StartSolve,
+    cached_etas: Vec<DVector<f64>>,
+    contribs: Vec<f64>,
+    mixeval: Option<crate::estimation::mixture::MixtureEval>,
+    mixmodes: Option<crate::estimation::mixture::MixtureClassModes>,
+}
+
 /// The floor of [`guard_penalty_value`] — the wall a guard-rejected gradient evaluation
 /// returns before the quadratic term is added, so every value that function can produce is
 /// `>= GUARD_PENALTY_BASE`.
@@ -3056,6 +3151,10 @@ pub(crate) struct StartEval {
     /// Set when the run's own start scored `∞` and this is that start re-scored at a larger
     /// inner budget (#2619, `floor_escape::escape_floor`); `None` for a start scored first time.
     pub rescored: Option<StartRescore>,
+    /// Set when the guard rejected the start's cold inner solve and the warm re-solve from
+    /// its own EBEs was accepted instead (#2682): the subjects unconverged cold. The other
+    /// fields then describe the warm re-solve.
+    pub warm_rescored_from: Option<usize>,
 }
 
 /// The inner budgets of a re-scored start (#2619): the run's own, at which the starting
@@ -6745,100 +6844,171 @@ fn optimize_nlopt_attempt_probed(
         // left empty on the mixture branch, whose objective has no per-subject
         // decomposition, which disarms the guard there.
         let mut contribs: Vec<f64> = Vec::new();
-        let (ehs, hms, ebe_stats, kappas, raw_ofv, agq_evaluation) = if params.mixture.is_some() {
-            let warm = (!state.cached_etas_by_class.is_empty())
-                .then_some(state.cached_etas_by_class.as_slice());
-            let mut m = if grad.is_some() && model.n_kappa > 0 {
-                let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
-                    model, population, &params, options, warm,
-                );
-                mixmodes = Some(modes);
-                m
-            } else {
-                crate::estimation::mixture::mixture_ofv(model, population, &params, options, warm)
-            };
-            let stats = InnerLoopStats {
-                n_unconverged: m.ebe_stats.n_unconverged,
-                n_fallback: m.ebe_stats.n_fallback,
-                n_nm_polished: m.ebe_stats.n_nm_polished,
-                n_start_rejected: m.ebe_stats.n_start_rejected,
-            };
-            let ofv = m.ofv;
-            // A derivative-free eval (`grad` is `None` — e.g. BOBYQA)
-            // never touches `mixeval` or the analytic gradient, so avoid the full
-            // per-class EBE cache clone: move `etas_by_class` straight into the
-            // warm-start cache and the MIXEST EBEs into the result. When a gradient
-            // *is* requested the analytic path reads `m.etas_by_class`, so it must
-            // stay intact and the cache takes a clone.
-            if grad.is_some() {
-                state.cached_etas_by_class = m.etas_by_class.clone();
-                let out = (
-                    m.mixest_etas.clone(),
-                    m.mixest_h_mats.clone(),
-                    stats,
-                    Vec::new(),
-                    ofv,
-                    None,
-                );
-                mixeval = Some(m);
-                out
-            } else {
-                state.cached_etas_by_class = std::mem::take(&mut m.etas_by_class);
-                (
-                    std::mem::take(&mut m.mixest_etas),
-                    std::mem::take(&mut m.mixest_h_mats),
-                    stats,
-                    Vec::new(),
-                    ofv,
-                    None,
-                )
-            }
-        } else {
-            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-            let predicted: Option<Vec<DVector<f64>>> = match &state.pred_jac {
-                Some(jac) if !state.cached_etas_are_modes => {
-                    #[cfg(test)]
-                    crate::estimation::inner_optimizer::record_prediction(
-                        &state.cached_etas,
-                        jac,
-                        &state.pred_anchor,
-                        &x,
+        // #2682: a guard-rejected first evaluation is solved a second time, warm from its own
+        // EBEs, before it is judged — see `wants_start_warm_rescore`. `cold_start` holds the
+        // first solve (and what it overwrote) while the second runs.
+        let mut cold_start: Option<ColdStart> = None;
+        let mut warm_rescored_from: Option<usize> = None;
+        let (ehs, hms, ebe_stats, kappas, raw_ofv, agq_evaluation) = loop {
+            let solved = if params.mixture.is_some() {
+                let warm = (!state.cached_etas_by_class.is_empty())
+                    .then_some(state.cached_etas_by_class.as_slice());
+                let mut m = if grad.is_some() && model.n_kappa > 0 {
+                    let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
+                        model, population, &params, options, warm,
                     );
-                    Some(crate::estimation::sens_outer_gradient::predict_warm_etas(
-                        &state.cached_etas,
-                        jac,
-                        &state.pred_anchor,
-                        &x,
-                    ))
+                    mixmodes = Some(modes);
+                    m
+                } else {
+                    crate::estimation::mixture::mixture_ofv(
+                        model, population, &params, options, warm,
+                    )
+                };
+                let stats = InnerLoopStats {
+                    n_unconverged: m.ebe_stats.n_unconverged,
+                    n_fallback: m.ebe_stats.n_fallback,
+                    n_nm_polished: m.ebe_stats.n_nm_polished,
+                    n_start_rejected: m.ebe_stats.n_start_rejected,
+                };
+                let ofv = m.ofv;
+                // A derivative-free eval (`grad` is `None` — e.g. BOBYQA)
+                // never touches `mixeval` or the analytic gradient, so avoid the full
+                // per-class EBE cache clone: move `etas_by_class` straight into the
+                // warm-start cache and the MIXEST EBEs into the result. When a gradient
+                // *is* requested the analytic path reads `m.etas_by_class`, so it must
+                // stay intact and the cache takes a clone.
+                if grad.is_some() {
+                    state.cached_etas_by_class = m.etas_by_class.clone();
+                    let out = (
+                        m.mixest_etas.clone(),
+                        m.mixest_h_mats.clone(),
+                        stats,
+                        Vec::new(),
+                        ofv,
+                        None,
+                    );
+                    mixeval = Some(m);
+                    out
+                } else {
+                    state.cached_etas_by_class = std::mem::take(&mut m.etas_by_class);
+                    (
+                        std::mem::take(&mut m.mixest_etas),
+                        std::mem::take(&mut m.mixest_h_mats),
+                        stats,
+                        Vec::new(),
+                        ofv,
+                        None,
+                    )
                 }
-                _ => None,
+            } else {
+                let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+                let predicted: Option<Vec<DVector<f64>>> = match &state.pred_jac {
+                    Some(jac) if !state.cached_etas_are_modes => {
+                        #[cfg(test)]
+                        crate::estimation::inner_optimizer::record_prediction(
+                            &state.cached_etas,
+                            jac,
+                            &state.pred_anchor,
+                            &x,
+                        );
+                        Some(crate::estimation::sens_outer_gradient::predict_warm_etas(
+                            &state.cached_etas,
+                            jac,
+                            &state.pred_anchor,
+                            &x,
+                        ))
+                    }
+                    _ => None,
+                };
+                let (ehs, hms, ebe_stats, kappas, nll, prepared, nll_i) =
+                    run_inner_loop_and_nll_prepared(
+                        model,
+                        population,
+                        &params,
+                        eval_options,
+                        Some(predicted.as_ref().unwrap_or(&state.cached_etas)),
+                        predicted.is_some().then_some(
+                            crate::estimation::inner_optimizer::PredictedFromAll {
+                                modes: &state.cached_etas,
+                                seeds: state.seed_hessians.as_deref(),
+                            },
+                        ),
+                        Some(&mu_k),
+                        fuse_agq_gradient.then_some((
+                            init_params,
+                            x.as_slice(),
+                            &bounds,
+                            warm_predictor,
+                        )),
+                        Some(&schedule_cache),
+                        std::mem::take(&mut state.cached_etas_are_modes),
+                        options.cancel.as_ref(),
+                    );
+                contribs = nll_i.iter().map(|v| 2.0 * v).collect();
+                (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
             };
-            let (ehs, hms, ebe_stats, kappas, nll, prepared, nll_i) =
-                run_inner_loop_and_nll_prepared(
-                    model,
-                    population,
-                    &params,
-                    eval_options,
-                    Some(predicted.as_ref().unwrap_or(&state.cached_etas)),
-                    predicted.is_some().then_some(
-                        crate::estimation::inner_optimizer::PredictedFromAll {
-                            modes: &state.cached_etas,
-                            seeds: state.seed_hessians.as_deref(),
-                        },
-                    ),
-                    Some(&mu_k),
-                    fuse_agq_gradient.then_some((
-                        init_params,
-                        x.as_slice(),
-                        &bounds,
-                        warm_predictor,
-                    )),
-                    Some(&schedule_cache),
-                    std::mem::take(&mut state.cached_etas_are_modes),
-                    options.cancel.as_ref(),
+            if let Some(cold) = cold_start.take() {
+                // The warm re-score is judged on its own; when the guard still rejects it the
+                // evaluation is the cold one, as it was before #2682, and so is the warm-start
+                // cache — no incumbent exists yet to have earned a non-zero one (#1290).
+                state.cached_etas = cold.cached_etas;
+                let accepted = warm_rescore_accepted(
+                    &solved.2,
+                    n_subj,
+                    solved.4,
+                    options.max_unconverged_frac,
                 );
-            contribs = nll_i.iter().map(|v| 2.0 * v).collect();
-            (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
+                if verbose {
+                    eprintln!(
+                        "Eval {:>4}: start rejected by the EBE convergence guard ({} of {} \
+                         subjects unconverged from the cold start); re-solved warm from its own \
+                         EBEs: {} unconverged, {}",
+                        state.n_evals + 1,
+                        cold.solved.2.n_unconverged,
+                        n_subj,
+                        solved.2.n_unconverged,
+                        if accepted {
+                            "accepted"
+                        } else {
+                            "still rejected"
+                        },
+                    );
+                }
+                if accepted {
+                    warm_rescored_from = Some(cold.solved.2.n_unconverged);
+                    break solved;
+                }
+                contribs = cold.contribs;
+                mixeval = cold.mixeval;
+                mixmodes = cold.mixmodes;
+                break cold.solved;
+            }
+            if start_eval.get().is_none()
+                && !crate::cancel::is_cancelled(&options.cancel)
+                && wants_start_warm_rescore(
+                    &solved.2,
+                    n_subj,
+                    solved.4,
+                    options.max_unconverged_frac,
+                )
+            {
+                // A mixture's warm start is `cached_etas_by_class`, which its branch above has
+                // already set to this solve's modes; only the single-class cache is set here.
+                let warm = if params.mixture.is_some() {
+                    state.cached_etas.clone()
+                } else {
+                    outer_cache_warm_starts(model, &solved.0, &solved.3)
+                };
+                cold_start = Some(ColdStart {
+                    cached_etas: std::mem::replace(&mut state.cached_etas, warm),
+                    solved,
+                    contribs: std::mem::take(&mut contribs),
+                    mixeval: mixeval.take(),
+                    mixmodes: mixmodes.take(),
+                });
+                continue;
+            }
+            break solved;
         };
         // The pass above polls the flag per subject (#574), so a cancel that lands inside
         // it comes back here as placeholders. Leave the way the entry check does, before
@@ -6916,6 +7086,7 @@ fn optimize_nlopt_attempt_probed(
                 n_unconverged: ebe_stats.n_unconverged,
                 n_start_rejected: ebe_stats.n_start_rejected,
                 rescored: None,
+                warm_rescored_from,
             }));
         }
         let ofv = if guarded {
@@ -7128,7 +7299,20 @@ fn optimize_nlopt_attempt_probed(
         if ofv < state.best_ofv {
             state.best_ofv = ofv;
             if verbose {
-                if nn_reg.is_active() {
+                if guarded {
+                    // A guarded evaluation's `ofv` is `guard_penalty_value` (or the `1e20`
+                    // wall), not a likelihood: printed as an OFV it read as one (#2682).
+                    eprintln!(
+                        "Eval {:>4}: {}",
+                        state.n_evals,
+                        guarded_eval_line(
+                            &ebe_stats,
+                            n_subj,
+                            raw_ofv,
+                            options.max_unconverged_frac
+                        ),
+                    );
+                } else if nn_reg.is_active() {
                     eprintln!(
                         "Eval {:>4}: OFV = {:.6} (penalized objective {:.6})",
                         state.n_evals, ofv_clean, ofv

@@ -158,6 +158,13 @@ macro_rules! field_row {
 /// 40 of 40). The settings that only act on a solve that did not converge — the fallback's
 /// warm start, the restart seeds — are inert at the default solver, with `inner_maxiter` at
 /// 200, 3 or 1 (measured: the premise fails).
+///
+/// Evaluation-only (`outer_maxiter = 0`): the step is scored at the starting estimates.
+/// That is where every fit on this base used to report, since the EBE guard rejected every
+/// trial and the fit fell back to its start (`W_NO_FEASIBLE_EVAL`). Since #2682 the guard
+/// re-solves a rejected start warm, the start is accepted, and three outer iterations move
+/// the fit to a point where `ebe_warm_start` no longer moves the covariance (measured: the
+/// premise fails). The row checks the record and not the point, so it holds the point.
 fn failing_inner() -> FitOptions {
     FitOptions {
         inner_optimizer: InnerOptimizer::NelderMead,
@@ -165,6 +172,7 @@ fn failing_inner() -> FitOptions {
         // With the #2013 screen on, `ebe_warm_start` no longer moves the covariance on
         // this base (measured: the premise fails), so the screen is held off on both sides.
         inner_screen: 0,
+        outer_maxiter: 0,
         ..quiet(EstimationMethod::FoceI)
     }
 }
