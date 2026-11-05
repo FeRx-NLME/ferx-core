@@ -131,6 +131,11 @@ fn run_quiet_fit() {
         std::path::Path::new(trace_path).exists(),
         "reported trace path does not exist: {trace_path}"
     );
+    // The file is temporary, so the fit holds its text (#2695).
+    assert_eq!(
+        result.trace_csv.as_deref(),
+        Some(std::fs::read_to_string(trace_path).unwrap().as_str())
+    );
     let _ = std::fs::remove_file(trace_path);
 }
 

@@ -5255,7 +5255,17 @@ fn dense_residual_inner_gradient(
     // constant of the search, so `∂R/∂η = 0` and only the `−a_kᵀs` term survives.
     let var_preds: &[f64] = frozen_var_preds.unwrap_or(&ipreds);
     let corr = residual_cov;
-    let r = match mult {
+    // IIV on the residual (#2656): `R(η) = exp(2η_r)·R₀`, the objective's scale. A frozen
+    // variance is `R⁰`, at every random effect zero, `η_r` included.
+    let ruv_idx = model
+        .residual_error_eta
+        .filter(|_| frozen_var_preds.is_none());
+    let ruv_scale = if ruv_idx.is_some() {
+        model.residual_var_scale(eta)
+    } else {
+        1.0
+    };
+    let mut r = match mult {
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled_cov(
             &model.error_spec,
             var_preds,
@@ -5282,7 +5292,10 @@ fn dense_residual_inner_gradient(
             corr,
         ),
     };
-    let chol = r.clone().cholesky()?;
+    if ruv_scale != 1.0 {
+        r *= ruv_scale;
+    }
+    let chol = r.cholesky()?;
     let r_inv = chol.inverse();
     let residuals = DVector::from_iterator(
         n_obs,
@@ -5322,6 +5335,12 @@ fn dense_residual_inner_gradient(
         for m in 0..n_obs {
             term_a += sens[m].df_deta[k] * s[m];
         }
+        // `η_r` moves no prediction and enters `R` directly: `∂R/∂η_r = 2R`, so
+        // `tr(R⁻¹∂R/∂η_r) = 2n` and `sᵀ(∂R/∂η_r)s = 2rᵀR⁻¹r = 2rᵀs` (#2656).
+        if Some(k) == ruv_idx {
+            grad[k] = -term_a + n_obs as f64 - residuals.dot(&s) + prior_work[k];
+            continue;
+        }
         // ∂R/∂η_k = Σ_m H[m,k]·∂R/∂f_m.
         let mut dr_k = DMatrix::<f64>::zeros(n_obs, n_obs);
         for m in 0..n_obs {
@@ -5329,6 +5348,9 @@ fn dense_residual_inner_gradient(
             if h_mk != 0.0 {
                 dr_k += h_mk * &dr[m];
             }
+        }
+        if ruv_scale != 1.0 {
+            dr_k *= ruv_scale;
         }
         // tr(M_k) = tr(R⁻¹ ∂R/∂η_k) = Σ_{p,q} r_inv[p,q]·dr_k[q,p].
         let mut tr_mk = 0.0;

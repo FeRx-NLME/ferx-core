@@ -121,8 +121,11 @@ The line is fitted by `method = foce` and `focei` only. Refused, each with
   endpoints, `[mixture]`, and SDE (`[diffusion]`) models.
 
 The parser refuses it with a per-CMT or covariate-selected (`if … else`) error
-model, with `iiv_on_ruv`, and next to a `block_sigma`, which is a different
-residual correlation (between sigmas of one record, or of paired records).
+model, and next to a `block_sigma`, which is a different residual correlation
+(between sigmas of one record, or of paired records).
+
+`iiv_on_ruv` is supported next to the line, under `method = focei`. See
+[below](#with-iiv-on-the-residual).
 
 Inter-occasion random effects (`kappa`) and nested levels are supported, with
 the one refusal [below](#with-kappa-and-nested-levels).
@@ -176,6 +179,37 @@ across studies) with `ar1` at ρ = 0.5 and −0.4, `car1` at 0.6 and a ρ = 0
 control, NONMEM writing the arm's residuals through `L2` and a hand-built
 Cholesky factor: the worst OFV difference is 5.7e-8 and the worst EBE
 difference 1.7e-7 (Linux).
+
+## With IIV on the residual {#with-iiv-on-the-residual}
+
+An [`iiv_on_ruv`](error-model.qmd#iiv-on-residual-error-iiv_on_ruv) random effect
+scales every residual SD of a subject by the same factor, so it scales the
+subject's whole `R` and leaves the correlation matrix unchanged:
+
+```
+R_i(η) = exp(2·η_ruv) · R_i(η = 0)
+```
+
+This is the NONMEM model with one `EPS` shared within a group through `L2` and an
+`ETA` on the residual magnitude, common for paired readouts from one device:
+
+```
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  correlation cs(RHO) by SAMPLE
+  iiv_on_ruv = ETA_RUV
+```
+
+`iiv_on_ruv` needs an interaction method and a `correlation` line needs `foce` or
+`focei`, so the combination is fitted by `method = focei` only: `foce` refuses with
+`E_IIV_ON_RUV_METHOD`, and the other methods with `E_RESIDUAL_CORRELATION_SCOPE`.
+`kappa` and nested levels compose with it. Both loops and the covariance step stay
+exact and analytic. CWRES and NPDE use the scaled `R`, and IWRES divides by the
+subject's factor.
+
+The objective, each η̂ and each CWRES match NONMEM at `MAXEVAL=0` on 30 subjects
+with `|η̂_ruv|` up to 1.3, for `cs` and `ar1` with ρ of either sign
+(`nonmem_anchor/iiv_ruv_dense/`, `tests/iiv_ruv_dense_nonmem_anchor.rs`).
 
 ## With a profiled level block
 

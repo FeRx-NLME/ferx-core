@@ -44,7 +44,7 @@ $$
 p(\eta_i | y_i, \theta, \Omega, \sigma)
 $$
 
-Two samplers are available:
+Three samplers are available:
 
 #### Metropolis-Hastings (default, `n_leapfrog = 0`)
 
@@ -139,6 +139,148 @@ with momentum $p \sim N(0, I)$ and a standard velocity Störmer-Verlet (leapfrog
 - The model is outside the analytic gradient's scope (time-varying covariates, oral infusion, SS+reset, or LTBS). A η-dependent expression `obs_scale` is served analytically (since #486), so on a closed-form model it takes the HMC path — only LTBS combined with it falls back to MH.
 
 In a single run with `n_leapfrog > 0`, different subjects can therefore use different samplers. The acceptance rate reported in verbose output and the optimizer trace is an aggregate across all subjects; in mixed HMC/MH runs the target (65% for HMC, 40% for MH) may not be meaningful for the aggregate. The `n_mh_steps` option governs the number of proposals for MH-fallback subjects even when `n_leapfrog > 0`.
+
+#### f-SAEM independent MH (`saem_kernel = imh`) {#saem-imh}
+
+`saem_kernel = imh` replaces kernel 1 — the `n_mh_steps` block random-walk
+proposals — with `saem_imh_proposals` (default 2) draws from an **independent**
+proposal built for each subject (Karimi, Lavielle & Moulines, *CSDA* 2020):
+
+$$
+q_i(\eta) = (1-\alpha)\,N\!\left(\hat\eta_i,\; c\,\Gamma_i\right) + \alpha\,N(0, \Omega),
+\qquad \Gamma_i^{-1} = H_i^\top R_i^{-1} H_i + \tfrac12 \tilde C_i^\top \tilde C_i + \Omega^{-1}
+$$
+
+centred on the subject's conditional mode $\hat\eta_i$ with the FOCEI curvature
+at that mode — assembled by the same code the FOCEI objective takes its
+log-determinant from, from the exact η-Jacobian (the closed form's, or the dual
+ODE walk's on an ODE model). The mode is tracked
+by warm-started Gauss-Newton steps and the proposal rebuilt every
+`saem_imh_refresh` (default 5) iterations; once the mode is tracked a rebuild
+costs one η-gradient and one η-Jacobian and no NLL evaluation. The search is
+seeded from the previous centre, or from the prior mean $\eta = 0$ on the
+first build, and never from the chain's current state: Gauss-Newton is capped
+at five steps and can stop short of the mode, and a centre that depended on
+the current $\eta$ would void the correction below. Because the proposal does
+not depend on the chain's current state, the proposal density no longer
+cancels, and the acceptance ratio carries it:
+$\log\alpha = [\text{NLL}(\eta) - \text{NLL}(\eta')] + [\log q(\eta) - \log q(\eta')]$.
+Both NLLs come from the same evaluation the random walk scores, so the two
+kernels target the same conditional, and a subject whose curvature cannot be
+built takes the random walk until its next scheduled refresh.
+
+The componentwise sweep (kernel 2) still runs after it — it is the
+anti-collapse device for a block Ω, and an IMH proposal is not a substitute
+(`tests/saem_block_omega_collapse.rs` runs under both kernels). The random
+walk's step-scale controller never reads the IMH kernel's acceptance (≈0.8 is
+not on the random walk's 0.40 scale).
+
+Three details carry the design:
+
+- **The defensive component** ($\alpha$ = `saem_imh_defensive`, default 0.05).
+  On `CL = TVCL·exp(η)` with informative data the conditional can be far flatter
+  than its curvature at the mode: on a measured subject the mode sits at
+  $\eta_{CL} = 1.5$ with a Laplace SD of 0.074, so $\eta = 0$ is 20 proposal SDs
+  out while scoring only 15 objective units above the mode, and a pure Laplace
+  proposal accepts **0 of 200** moves from there. Mixing in the prior bounds the
+  importance ratio and unsticks it. The main component is also inflated by a
+  fixed $c = 1.2$.
+- **Two gates, decided before the run.** Scope: an analytical PK or ODE model
+  whose η-gradient and η-Jacobian the adjoint's recorder serves exactly (an ODE
+  model whose right-hand side and readout the dual ODE walk covers; an SDE, or an
+  ODE the walk declines, is out), and none of IOV, `iiv_on_ruv`, mixture, FREM,
+  `block_sigma`, M3, non-Gaussian endpoint or LTBS. Information: at least
+  `saem_imh_min_obs_per_eta` (default 2.0) mean observations per subject per η —
+  below that the conditional is barely narrower than the prior, and the
+  kernel's premise does not hold. A declined fit runs `rw` with a warning that
+  names the reason; the startup banner's `sampler:` line reports the same
+  decision.
+- **No clock reaches the estimates.** The kernel's cost per subject-iteration
+  depends on the model — an η-gradient measured at ~3 NLL evaluations on a
+  closed-form 2-cpt model and ~22 on one whose clearance reads `TIME` — and the
+  fit reports it as a warning when it exceeds 1.5× the random walk it replaced,
+  but never switches kernel on it, so a seeded fit is reproducible.
+
+##### Measured {#saem-imh-measured}
+
+ferx `f8955c24` against the same commit with `saem_kernel = imh`, 6 seeds,
+150 + 250 iterations, one thread, one uncontended lane with the arms
+interleaved per seed, on macOS arm64. Likelihood is the importance-sampled
+−2 log L (`method = [saem, imp]`, `imp_eval_only`, 3000 samples, fixed IS
+seed); Δ is paired by seed against `rw`, negative is better; CPU is user+sys of
+a SAEM-only run.
+
+| bench | obs/η | CPU vs `rw` | Δ IS −2LL, `imh` | Δ, `imh` + `score_sa` | seed sd, `rw` → `imh` |
+|---|---|---|---|---|---|
+| warfarin (10 subj, 3 η) | 3.67 | −40 % (0.033 → 0.020 s) | −0.000 ± 0.002 | −0.001 ± 0.001 | 0.001 → 0.002 |
+| busulfan, first 100 | 2.31 | −2 % | **−2.20 ± 1.18 (6/6)** | **−3.39 ± 1.26 (6/6)** | 1.26 → 0.37 |
+| busulfan 600, TVQ fixed | 2.92 | −9 % | −0.38 ± 1.03 | +0.51 ± 1.24 | 1.28 → 0.57 |
+| busulfan 600, TVQ free | 2.92 | −3 % | **+5.16 ± 5.44 (1/6)** | −1.97 ± 5.37 | 2.29 → 3.98 |
+
+What this says:
+
+- **It is a quality lever, not a speed lever.** The speed programme measured
+  −40…−50 % CPU against a random walk of 20 proposals; since `n_mh_steps = auto`
+  (#1468) the random walk spends 6–9, and on busulfan the two kernels cost the
+  same to within the run-to-run spread. (Warfarin's −40 % is two 10 ms timer
+  ticks.)
+- **Where it pays** is a data-rich model whose random effects carry all the
+  structure: on the 100-subject busulfan subset it is better on every seed and
+  3.4× tighter across seeds, and lands where NONMEM 7.5.1's SAEM does — ferx's
+  importance-sampled −2 log L at NONMEM's own SAEM estimates (three seeds) is
+  7531.0, 7531.8 and 7532.1, against 7533.8 ± 1.3 for `rw` and 7531.6 ± 0.4 for
+  `imh`.
+- **Pair it with `mstep_solver = score_sa` when a θ has no η.** With busulfan's
+  `TVQ` free, `imh` alone is worse: TVQ, which the M-step estimates from one
+  draw per iteration, spreads 9.2–12.0 across seeds against 9.2–10.2 under
+  `rw`, because near-independent draws move a single-draw maximiser further each
+  iteration. `score_sa` averages the score rather than the maximiser, and the
+  pairing is tie-or-better on all four benches. It costs CPU on busulfan
+  (+9…+25 %), which `score_sa` alone does too (+11…+37 %). A fit that runs
+  `imh` with such a θ under `bobyqa` says so in its warnings.
+- **Where it does not run.** The information gate declines the sparse benches —
+  cefepime 0.51 obs/η, pembrolizumab 1.02. ODE models were out of scope when
+  this table was measured; they are in scope since #2639, measured below.
+
+##### ODE models {#saem-imh-ode}
+
+Since #2639 the kernel runs on ODE models: the refresh's η-gradient and
+η-Jacobian come from the adjoint's dual ODE walk, the same recorder that gives
+FOCEI its exact inner gradient there. Same protocol as the table above (6
+seeds, 150 + 250 iterations, IS −2 log L at 3000 samples, fixed IS seed, Δ paired
+by seed against `rw`, negative is better), ferx `177e5877`, measured on
+**Linux** aarch64 (glibc 2.41, Docker): one lane, one thread, every arm
+interleaved per seed, nothing else running in the container VM (load average
+2.0–2.1 throughout). CPU is user+sys of the whole `[saem, imp]` run, so it
+includes the IS stage both arms share.
+
+| bench | Δ IS −2LL, `imh` | Δ, `imh` + `score_sa` | seed sd, `rw` → `imh` | CPU vs `rw` |
+|---|---|---|---|---|
+| busulfan first 100, closed form (control) | −2.25 ± 1.22 (6/6) | −3.06 ± 1.30 (6/6) | 1.27 → 0.39 | −1 % |
+| same, `[odes]`, `ode_method = rk45` | **−2.43 ± 1.69 (6/6)** | **−2.95 ± 0.62 (6/6)** | 1.44 → 0.36 | −3 % (19.5 → 18.9 s) |
+| TMDD QSS (60 subj, 1 η, 6 θ without η) | +0.05 ± 1.02 (4/6) | not comparable | 0.72 → 0.93 | −27 % |
+
+- **The busulfan ODE twin carries the analytic result over.** Integrated by
+  RK45, it gains as much as the closed form does, on every seed, at the same CPU.
+  Left on `ode_method = auto` the twin is solved exactly by the matrix
+  exponential and reproduces the closed form's numbers, so it is not an ODE bench.
+  ferx's IS −2 log L at NONMEM 7.5.1's own SAEM estimates on that model (three
+  seeds, #1449) is 7531.1, 7531.9 and 7532.1 on the RK45 twin; `imh` reaches
+  7531.5 ± 0.4, `rw` 7533.9 ± 1.4.
+- **TMDD is a tie, at three quarters of the CPU.** It is the θ-without-η case
+  on a genuinely nonlinear three-state model: six of its seven θ are moved by the
+  single-draw M-step, and the fit warns about running `imh` with them under
+  `bobyqa`, as it does on busulfan with `TVQ` free. A macOS run of the same arms
+  leaned the other way (+0.78, 2/6), so read the row as no gain rather than as a
+  win. The `score_sa` remedy does not apply here: on macOS it did not converge on
+  this model under either kernel (IS −2 log L 4830–9864 against 4762), so that
+  column was not repeated. NONMEM's SAEM (`ISAMPLE=2`, same starts) does not
+  converge on it either — V1 collapses to 0.01 and three θ end at their initial
+  values — so there is no external reference for this row.
+- **Cost.** The kernel's cost report (`imh_cost_warning`) fired on none of the
+  30 `imh` fits: one dual ODE sweep for the η-gradient and one for the
+  η-Jacobian amortise over the `saem_imh_refresh` interval as they do on the
+  closed form.
 
 The E-step sampling is parallelized across subjects using Rayon.
 
@@ -776,7 +918,7 @@ different number at that seed, because almost any change on the chain's path
 the public stand-ins built for
 [#2602](https://github.com/FeRx-NLME/ferx-core/issues/2602) (450 subjects each:
 a two-compartment oral closed form with a block Ω, and the same model as a
-3-state ODE), `method = [saem, imp]` was run over 40 seeds. The IS −2 log L had a
+3-state ODE), `method = [saem, imp]` with `imp_eval_only = true` was run over 40 seeds. The IS −2 log L had a
 seed-to-seed sd of 1.5 and 3.4–4.1, and a range of 7 and 14–15. The
 importance-sampling draw alone, with the SAEM seed held fixed, accounts for an
 sd of only 0.55 and 0.9. Most of the spread is where the chain ends. So a +4 or
@@ -975,13 +1117,30 @@ After the SAEM iterations complete:
 
 For sparsely-sampled data where the Laplace OFV is biased, you can
 append an importance-sampling stage that estimates `−2 log L` by Monte
-Carlo:
+Carlo at the SAEM estimates — the equivalent of NONMEM `$EST METHOD=SAEM`
+followed by `$EST METHOD=IMP EONLY=1`:
 
 ```
-method = [saem, imp]
+[fit_options]
+  method        = [saem, imp]
+  imp_eval_only = true
+  imp_samples   = 3000      # default 1000; 2000–5000 for a reported value
 ```
 
-See [Importance Sampling (IMP)](importance-sampling.qmd).
+`imp_eval_only = true` is required. Without it the `imp` stage is an
+estimator (NONMEM `METHOD=IMP`): it re-fits θ/Ω/σ by Monte-Carlo EM, so the
+reported estimates are no longer SAEM's.
+
+The importance-sampled `−2 log L` and its Monte-Carlo standard error are on
+`FitResult.importance_sampling` (`fit$importance_sampling` in R; the
+`IS done. −2 log L = …` line in verbose output). `ofv` remains the FOCE
+approximation at the SAEM estimates described above, and AIC/BIC are built from
+it. The `imp` stage starts each subject's proposal from the final EBE refinement in
+step 1 and adapts it over `imp_adapt_passes` pilot passes (default 5; see
+[Adaptive evaluation](importance-sampling.qmd#adaptive-evaluation)), so for a
+subject still listed under `low_ess_subjects`, check that refinement's EBE and
+Hessian first. See
+[Importance Sampling (IMP)](importance-sampling.qmd#evaluation-only-mode-imp_eval_only-true).
 
 ### Covariance step on a non-Gaussian model {#saem-covariance-non-gaussian}
 

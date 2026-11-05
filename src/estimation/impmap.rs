@@ -37,13 +37,16 @@
 //! them. Use FOCE / FOCEI for those.
 
 use crate::estimation::covariate_mu_ref::{resolve_covariate_mu_groups, GroupStepInput};
-use crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov;
+use crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov_with_schedule;
 use crate::estimation::importance_sampling::{
     build_joint_omega_inv, compute_joint_posterior_hessian, compute_posterior_hessian,
     find_optimal_iscale, find_optimal_iscale_with, subject_is_draws, subject_is_draws_with,
     SubjectDraws, MIX_ESS_PMIX_FLOOR,
 };
-use crate::estimation::inner_optimizer::{find_ebe, EbeResult, InnerLoopStats};
+use crate::estimation::inner_optimizer::{
+    build_schedule_cache, cacheable_schedule, cacheable_schedule_iov, find_ebe, EbeResult,
+    InnerLoopStats,
+};
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
 use crate::estimation::saem::{
@@ -51,8 +54,9 @@ use crate::estimation::saem::{
     get_mixture_mu_ref_pairs, mixture_mu_ref_means, mu_ref_pairs_for_cov_groups, MixtureMuRefPairs,
     MuRefPairs,
 };
+use crate::pk::event_driven::EventSchedule;
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::obs_nll_subject_into;
+use crate::stats::likelihood::obs_nll_subject_into_with_schedule;
 use crate::stats::stacked_layout::{kappa_range, stacked_width};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -78,6 +82,210 @@ const AUTO_STDOBJ_TARGET: f64 = 0.05;
 
 /// Hard cap on the adaptive per-subject sample count (NONMEM `ISAMPEND` default).
 const AUTO_SAMPLES_MAX: usize = 10_000;
+
+/// Iterations in each of the two windows [`objective_settled`] compares. Five
+/// puts the first possible raise at iteration 10, and a window mean carries
+/// `√(1/5)` of one iteration's noise.
+const AUTO_SETTLE_WINDOW: usize = 5;
+
+/// Headroom on the sample count a raise aims for, over the count the current
+/// per-subject SE says would just meet the target. The SE of one iteration is
+/// itself noisy, so an exact aim would land on the target and raise again.
+const AUTO_RAISE_HEADROOM: f64 = 1.1;
+
+/// How far `SE²·K` may grow past its value at the first raise before [`raises_pay`]
+/// refuses further raises.
+const AUTO_SCALE_GROWTH_LIMIT: f64 = 2.0;
+
+/// Whether the MCEM objective has stopped moving, as far as Monte-Carlo noise
+/// can tell: the means of the last two [`AUTO_SETTLE_WINDOW`]-iteration windows
+/// differ by no more than two standard errors of that difference, taken from the
+/// current total objective SE (#2687).
+///
+/// This is the ascent-based MCEM idea (Caffo, Jank & Jones 2005): more draws pay
+/// once the change in the objective is lost in the noise, not while a cold start
+/// is descending by tens of units an iteration. The test uses the *estimated* SE
+/// on purpose. A fit whose objective wanders far beyond that SE, as cefepime does
+/// at ±20 against a total SE near 3, is not held to be settled, and gets its
+/// samples when [`auto_hold_ends`] says so.
+fn objective_settled(objectives: &[f64], total_mc_se: f64) -> bool {
+    let w = AUTO_SETTLE_WINDOW;
+    if objectives.len() < 2 * w {
+        return false;
+    }
+    let (older, recent) = objectives[objectives.len() - 2 * w..].split_at(w);
+    let mean = |x: &[f64]| x.iter().sum::<f64>() / w as f64;
+    // Written so a `NaN` on either side reads as "not settled".
+    (mean(recent) - mean(older)).abs() <= 2.0 * total_mc_se * (2.0 / w as f64).sqrt()
+}
+
+/// The iteration after which `auto` may raise K whether or not the objective has
+/// settled: the one before the averaging window, whose iterations make up the
+/// reported estimate, so a fit that never settles still has them sampled to the
+/// target. The hold covers at most the first three quarters of the run, so
+/// `averaging = 1` does not leave the raise one iteration to work with, and at
+/// least the first half, so an averaging window as long as a short run does not
+/// switch the hold off (#2687).
+fn auto_hold_ends(n_iter: usize, n_avg: usize) -> usize {
+    n_iter - n_avg.clamp(n_iter / 4, n_iter / 2)
+}
+
+/// The per-subject SE `auto` acts on at a sample count of `k`: the median of
+/// `SE²·K` over the last [`AUTO_SETTLE_WINDOW`] iterations, which `SE² ∝ 1/K` makes
+/// comparable across a change of K, rescaled to `k`.
+///
+/// One iteration's SE is not enough to act on. It is dominated by the few subjects
+/// with the worst ESS, and on cefepime it swung between 0.018 and 0.094 from one
+/// iteration to the next, which halved K on one iteration and doubled it on the
+/// following one (#2687).
+fn windowed_se(se_times_k: &[(f64, usize)], k: usize) -> f64 {
+    let tail = &se_times_k[se_times_k.len().saturating_sub(AUTO_SETTLE_WINDOW)..];
+    let mut scaled: Vec<f64> = tail.iter().map(|&(se, n)| se * se * n as f64).collect();
+    scaled.sort_by(f64::total_cmp);
+    match scaled.get(scaled.len() / 2) {
+        Some(&median) => (median / k as f64).sqrt(),
+        None => f64::NAN,
+    }
+}
+
+/// Whether raising K is still doing what a raise assumes.
+///
+/// `SE² ∝ 1/K` makes `SE²·K` constant, so a raise sized from it lands on the
+/// target. Once that product has grown by [`AUTO_SCALE_GROWTH_LIMIT`] since the
+/// first raise the assumption has failed, and following the SE only walks K to the
+/// cap: on cefepime the SE was 0.071 at K = 1000 and 0.083 at K = 6912, and K = 10000
+/// cost ten times as much per iteration for no lower SE (#2687). The limit leaves
+/// a run whose SE does scale untouched, since its product stays where it was and its
+/// target K sits below the largest K this allows, about `2.2 ×` the one the first
+/// raise asked for.
+///
+/// The baseline is the window before K first left `k_start`. It holds across a later
+/// lowering, and a product that falls back under the limit allows raises again.
+fn raises_pay(se_history: &[(f64, usize)], k_start: usize) -> bool {
+    let Some(first_raise) = se_history.iter().position(|&(_, k)| k > k_start) else {
+        return true;
+    };
+    let scale_at = |history: &[(f64, usize)]| windowed_se(history, 1).powi(2);
+    scale_at(se_history) < AUTO_SCALE_GROWTH_LIMIT * scale_at(&se_history[..first_raise])
+}
+
+/// The sample count for the next iteration under `auto` (#2687).
+///
+/// Above [`AUTO_STDOBJ_TARGET`], and only when `may_raise`, K rises to what the
+/// SE asks for (`SE² ∝ 1/K`) with [`AUTO_RAISE_HEADROOM`], at most doubling and at
+/// most [`AUTO_SAMPLES_MAX`]; sizing the step keeps an SE that only just misses
+/// the target from doubling the cost of every later iteration. Below half the
+/// target K halves, but never below the configured `k_start`. Halving a count
+/// that sits under half the target predicts an SE of `0.71 ×` target, so on a
+/// stable [`windowed_se`] a lowering does not call for a raise.
+fn next_sample_count(k: usize, k_start: usize, se_per_subject: f64, may_raise: bool) -> usize {
+    if se_per_subject > AUTO_STDOBJ_TARGET {
+        if !may_raise {
+            return k;
+        }
+        let ratio = se_per_subject / AUTO_STDOBJ_TARGET;
+        let wanted = (k as f64 * ratio * ratio * AUTO_RAISE_HEADROOM).ceil() as usize;
+        wanted.min(k.saturating_mul(2)).min(AUTO_SAMPLES_MAX).max(k)
+    } else if se_per_subject < 0.5 * AUTO_STDOBJ_TARGET {
+        (k / 2).max(k_start).min(k)
+    } else {
+        k
+    }
+}
+
+/// The closing advice of the under-sampling warning. Under `auto`, a final count
+/// below the cap means either [`raises_pay`] stopped the ramp or the run ran out of iterations rather than out of samples, which the hold on
+/// raising makes a real case (#2687).
+fn under_sampling_advice(
+    auto: bool,
+    final_k: usize,
+    se_history: &[(f64, usize)],
+    k_start: usize,
+    sample_opt: &str,
+    auto_opt: &str,
+) -> String {
+    if auto && final_k >= AUTO_SAMPLES_MAX {
+        format!(
+            "`{auto_opt}` is enabled but the sample count {final_k} (cap {AUTO_SAMPLES_MAX}) \
+             was not enough to reach the MC-SE target."
+        )
+    } else if auto && !raises_pay(se_history, k_start) {
+        format!(
+            "`{auto_opt}` stopped raising the sample count at {final_k}, below the cap of \
+             {AUTO_SAMPLES_MAX}, because extra samples were not lowering the MC SE as they \
+             should. A larger `{sample_opt}` is unlikely to help."
+        )
+    } else if auto {
+        format!(
+            "`{auto_opt}` is enabled but the run ended at {final_k} samples, below the cap of \
+             {AUTO_SAMPLES_MAX}, before the count could reach the MC-SE target. Raise \
+             `{sample_opt}` or give the fit more iterations."
+        )
+    } else {
+        format!(
+            "Raise `{sample_opt}` (high-dimensional / FREM models typically need several \
+             thousand) or set `{auto_opt} = true` to ramp it automatically."
+        )
+    }
+}
+
+/// One `auto` decision after an iteration: the next K, and the [`windowed_se`] it
+/// was made on. `se_history` ends with the iteration just run, whose K is current;
+/// `hold_over` is whether [`auto_hold_ends`] has passed.
+fn auto_step(
+    objectives: &[f64],
+    se_history: &[(f64, usize)],
+    k_start: usize,
+    n_subjects: usize,
+    hold_over: bool,
+) -> (usize, f64) {
+    let k = se_history.last().map_or(k_start, |&(_, k)| k);
+    let se = windowed_se(se_history, k);
+    let total_se = se * (n_subjects.max(1) as f64).sqrt();
+    let may_raise =
+        (hold_over || objective_settled(objectives, total_se)) && raises_pay(se_history, k_start);
+    (next_sample_count(k, k_start, se, may_raise), se)
+}
+
+/// Refuse an unusable wall-clock limit rather than let a `NaN` never trip it.
+fn check_max_time(label: &str, key: &str, limit: Option<f64>) -> Result<(), String> {
+    match limit {
+        Some(s) if !(s.is_finite() && s > 0.0) => Err(format!(
+            "{label}: `{key}` must be a positive number of seconds, got {s}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Seconds elapsed once the wall-clock limit has passed; `None` while there is
+/// time left, or when no limit is set.
+fn time_limit_reached(started: std::time::Instant, limit: Option<f64>) -> Option<f64> {
+    let elapsed = started.elapsed().as_secs_f64();
+    limit.filter(|&s| elapsed >= s).map(|_| elapsed)
+}
+
+/// The warning that explains a fit stopped by `imp_max_time` / `impmap_max_time`.
+/// `n_acc` is how many iterations of the averaging window were reached, which
+/// decides what the reported estimate is.
+fn time_limit_warning(
+    label: &str,
+    key: &str,
+    elapsed: f64,
+    iterations_done: usize,
+    n_iter: usize,
+    n_acc: usize,
+) -> String {
+    let estimate = if n_acc > 0 {
+        format!("the mean of the {n_acc} averaging iteration(s) reached")
+    } else {
+        "the last iteration's parameters, unaveraged".to_string()
+    };
+    format!(
+        "{label}: stopped by `{key}` after {elapsed:.1} s, at iteration {iterations_done} of \
+         {n_iter}. The reported estimate is {estimate}. The fit did not finish its schedule, \
+         so it is reported as not converged."
+    )
+}
 
 /// Absolute lower bound on the IMP proposal-covariance diagonal — a numerical
 /// guard against a literally-zero (degenerate-ESS) variance, NOT a statistical
@@ -150,6 +358,276 @@ pub(crate) fn gate_converged_on_mcem_objective(converged: &mut bool, ofv: f64) -
     ))
 }
 
+/// How far above the lowest iteration objective, as a fraction of the objective's
+/// scale, a final marginal may sit before [`mcem_objective_rise`] calls the run
+/// collapsed (#2652).
+///
+/// An EM iteration should not raise the objective, so the only legitimate gap is
+/// Monte-Carlo noise. Measured on Linux aarch64 (glibc 2.41, release without LTO) over
+/// the seven models of the 2026-11 IMP-vs-NONMEM evaluation, K = 1000, `[focei, imp]`
+/// and cold `imp`, reading every iteration's objective. With #2650, #2651 and #2653 in,
+/// all eleven runs are healthy and the widest gap is 0.13 % of the scale (thioguanine:
+/// lowest -250.89, marginal -250.57). Collapses need the tree before #2650: there the
+/// narrowest is 50.7 % (cold cefepime: lowest 4300.70, marginal 6480.15). 10 % sits 77×
+/// above the first and 5× below the second. macOS arm64, measured on its own before
+/// #2650, gave a narrowest collapse of 28 %, also above the bound.
+pub(crate) const MCEM_RISE_TOLERANCE: f64 = 0.10;
+
+/// The rise of the final marginal `marginal` over `lowest`, the lowest objective the
+/// MCEM iterations reached, when it is too large to be Monte-Carlo noise (#2652);
+/// `None` otherwise.
+///
+/// A collapse on the first recentre can sit below the 1e14 / 1e15 cutoffs of
+/// [`gate_converged_on_mcem_objective`] for good: before #2650, on Linux, cefepime read
+/// 4313.3 at iteration 1, 4.4e7 at iteration 2, and ended at a marginal of 13,354.7
+/// against NONMEM's 4282.9.
+///
+/// * The baseline is the **lowest** iteration, not the first, because a cold start
+///   makes the first a poor reference: infliximab read 3087.4, reached 703.1, blew up
+///   to 5e5 and ended at 1545.6, below where it began.
+/// * The scale is `max(|lowest|, n_obs)`, because −2 log L has no natural zero: an
+///   objective near 0 would make a purely relative test fire on noise.
+pub(crate) fn mcem_objective_rise(marginal: f64, lowest: f64, n_obs: usize) -> Option<f64> {
+    let rise = marginal - lowest;
+    (rise > MCEM_RISE_TOLERANCE * lowest.abs().max(n_obs as f64)).then_some(rise)
+}
+
+/// Fold one iteration's objective into the lowest seen so far. A non-finite value is
+/// skipped explicitly: `f64::min` would do it silently for `NaN`, and for `-inf` it
+/// would keep a baseline nothing can rise above.
+fn lowest_objective(lowest: Option<f64>, objective: f64) -> Option<f64> {
+    if !objective.is_finite() {
+        return lowest;
+    }
+    Some(lowest.map_or(objective, |l| l.min(objective)))
+}
+
+/// Iterations in each of the two trailing windows [`McemObjectiveTrail::settling`]
+/// compares (#2686). A run shorter than three windows uses a third of its length, so
+/// the first third, where a cold start descends, is never read.
+pub(crate) const MCEM_SETTLE_WINDOW: usize = 50;
+
+/// Fewest iterations per window [`McemObjectiveTrail::settling`] will judge, so a run
+/// needs three times this many.
+pub(crate) const MCEM_SETTLE_MIN_WINDOW: usize = 10;
+
+/// The fraction of a window below its floor (#2686). See
+/// [`McemObjectiveTrail::settling`] for why a floor, and not a spread.
+const MCEM_FLOOR_QUANTILE: f64 = 0.10;
+
+/// Smallest gap, in −2 log L units, that [`McemObjectiveTrail::settling`] treats as
+/// material: 3.84, the 5% point of χ²₁. A gap under one likelihood-ratio step cannot
+/// change a model comparison. It also spares a slow finish: cold infliximab's floor was
+/// still falling by 1.78, 23 SEs, and its marginal ended within 1 of the best.
+pub(crate) const MCEM_SETTLE_MIN_GAP: f64 = 3.84;
+
+/// How many Monte-Carlo SEs a gap must also exceed in
+/// [`McemObjectiveTrail::settling`], so a noisy objective has to show more.
+pub(crate) const MCEM_SETTLE_NOISE_RATIO: f64 = 4.0;
+
+/// The per-iteration record of an MCEM run, published so `fit()` can test whether the
+/// objective settled once the final marginal is known (#2686).
+#[derive(Debug, Clone)]
+pub(crate) struct McemObjectiveTrail {
+    /// −2 log L of each iteration.
+    pub(crate) objectives: Vec<f64>,
+    /// Monte-Carlo SE of each entry of `objectives`.
+    pub(crate) mc_se: Vec<f64>,
+    /// `"IMP"` or `"IMPMAP"`, as the run's other warnings spell it.
+    pub(crate) label: String,
+    pub(crate) iterations_option: &'static str,
+    pub(crate) samples_option: &'static str,
+    pub(crate) proposal_option: &'static str,
+}
+
+/// The final marginal [`McemObjectiveTrail::settling`] compares the floor with. Its SE
+/// is its own: the final pass draws the configured sample count, which `imp_auto` can
+/// leave far below what the iterations ramped to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FinalMarginal {
+    pub(crate) value: f64,
+    pub(crate) mc_se: f64,
+}
+
+/// What [`McemObjectiveTrail::settling`] found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum McemSettling {
+    /// Too few iterations to judge. The verdict stays as it was.
+    TooShort,
+    /// Enough iterations, but too few of them finite to read a window. `usable` is the
+    /// count in the worse of the two windows, each `window` iterations long.
+    Unusable {
+        window: usize,
+        usable: usize,
+    },
+    Settled,
+    /// The objective's floor was still falling at the iteration limit.
+    Falling {
+        window: usize,
+        previous_floor: f64,
+        floor: f64,
+        previous_mc_se: f64,
+        mc_se: f64,
+    },
+    /// The iterations stayed well above the marginal of their own final estimates.
+    AboveMarginal {
+        window: usize,
+        floor: f64,
+        marginal: FinalMarginal,
+        mc_se: f64,
+    },
+}
+
+/// The floor of a window of iteration objectives: its lower 10% point. Takes the
+/// window's finite values, so a non-finite iteration is dropped, as [`lowest_objective`]
+/// drops it.
+fn objective_floor(mut finite: Vec<f64>) -> f64 {
+    finite.sort_by(f64::total_cmp);
+    finite[(MCEM_FLOOR_QUANTILE * finite.len() as f64) as usize]
+}
+
+/// The finite entries of `window`.
+fn finite_values(window: &[f64]) -> Vec<f64> {
+    window.iter().copied().filter(|v| v.is_finite()).collect()
+}
+
+/// How far the objective of a window with MC SE `previous_mc_se` sits above that of one
+/// with `mc_se`, from sampling alone. `log p̂` runs low by half its variance, so −2 log L
+/// runs high by `Σᵢ Var(log p̂ᵢ) = se²/4`. It counts only against the earlier window:
+/// that is the direction `imp_auto` ramps, and the direction that fakes a fall.
+fn sampling_bias_excess(previous_mc_se: f64, mc_se: f64) -> f64 {
+    ((previous_mc_se * previous_mc_se - mc_se * mc_se) / 4.0).max(0.0)
+}
+
+impl McemObjectiveTrail {
+    /// Whether the objective had settled by the end of the run (#2686). IMP and IMPMAP
+    /// run a fixed schedule, so every run ends at the iteration limit.
+    ///
+    /// Reads the floor of the last window, and asks two things of it. A gap counts when
+    /// it exceeds both [`MCEM_SETTLE_MIN_GAP`] and [`MCEM_SETTLE_NOISE_RATIO`] MC SEs of
+    /// what it compares. Each side brings its own SE, and they combine as independent
+    /// estimates: the two windows' for two floors, the last window's and the marginal's
+    /// for a floor and a marginal.
+    ///
+    /// * **Is it still falling?** Against the floor of the window before. This is the
+    ///   run that needs more iterations. `imp_auto` can leave that window on fewer
+    ///   samples, which raises its objective with no change in the estimates, so
+    ///   [`sampling_bias_excess`] comes off the fall first.
+    /// * **Is it above the marginal?** `marginal` is scored at the final estimates with
+    ///   a fresh proposal. Iterations that never come near it were not sampling the
+    ///   posterior, so nothing in the trace shows the run reached an optimum. A marginal
+    ///   without a finite value and SE cannot convict a run of this.
+    ///
+    /// **The floor, not the spread.** A failed proposal misses posterior mass, so it
+    /// only ever raises an iteration's objective. A normal proposal makes these
+    /// excursions on a run whose estimates are fine: thioguanine at seed 777 climbed to
+    /// −132.8 inside the window, and still ended with a marginal of −249.82 against a
+    /// best of −250.58. Its robust spread (13.4) is twice that of vancomycin at 1004.72,
+    /// which is 8 short of the optimum (6.0), so no bound on spread separates them.
+    ///
+    /// Measured on Linux aarch64 (glibc 2.41, release without LTO), K = 1000 and 200
+    /// iterations, on the six models of the 2026-11 IMP-vs-NONMEM evaluation: `[focei,
+    /// imp]`, cold `imp`, and cold `imp` with `imp_proposal_df = normal` and
+    /// `imp_averaging = 1`, the last at three seeds. Also cold `impmap` on warfarin,
+    /// thioguanine and propofol, and both drivers on a two-class mixture.
+    ///
+    /// | Gap | Widest on a healthy run | On a run short of the optimum |
+    /// |---|---|---|
+    /// | floor fell | 1.78 (infliximab) | 30.5 (vancomycin at 1004.72, best 996.75) |
+    /// | floor above marginal | 3.86 at 1.5 SEs (chained cefepime) | 42.4 and 69.2 (cefepime at 4288.06 and 4298.55, best 4277) |
+    ///
+    /// The noise term decides that 3.86, which the minimum alone would convict. It sits
+    /// on a good estimate: cefepime's low-ESS subjects keep its objective noisy.
+    ///
+    /// Those runs fix K. `imp_auto` holds its raises until the objective settles or
+    /// [`auto_hold_ends`], which at 200 iterations and an averaging window of 50 is
+    /// iteration 150, the line between the two windows. Cold on the same six models
+    /// with `imp_auto` on, under both proposals, eleven runs finished. K moved inside
+    /// the windows on three of them (vancomycin, down at iteration 108; propofol, 152 to
+    /// 158; thioguanine, up to 192). All eleven kept `converged: true` with no settling warning, the
+    /// widest fall being 2.16 (vancomycin, marginal 996.67). None had an SE near the 16
+    /// where [`sampling_bias_excess`] outruns the noise bound, so that term rests on its
+    /// derivation.
+    pub(crate) fn settling(&self, marginal: Option<FinalMarginal>) -> McemSettling {
+        use crate::estimation::vi::run::median_and_mad;
+        let n = self.objectives.len();
+        let window = MCEM_SETTLE_WINDOW.min(n / 3);
+        if window < MCEM_SETTLE_MIN_WINDOW {
+            return McemSettling::TooShort;
+        }
+        let start = n - window;
+        let previous = start - window..start;
+        let last = start..n;
+        let columns = [
+            finite_values(&self.objectives[previous.clone()]),
+            finite_values(&self.objectives[last.clone()]),
+            finite_values(&self.mc_se[previous]),
+            finite_values(&self.mc_se[last]),
+        ];
+        let usable = columns.iter().map(Vec::len).min().unwrap_or(0);
+        if usable < MCEM_SETTLE_MIN_WINDOW {
+            return McemSettling::Unusable { window, usable };
+        }
+        let [previous_objectives, objectives, previous_se, se] = columns;
+        let (Some((previous_mc_se, _)), Some((mc_se, _))) =
+            (median_and_mad(&previous_se), median_and_mad(&se))
+        else {
+            return McemSettling::Unusable { window, usable };
+        };
+        let previous_floor = objective_floor(previous_objectives);
+        let floor = objective_floor(objectives);
+        let material = |se: f64| MCEM_SETTLE_MIN_GAP.max(MCEM_SETTLE_NOISE_RATIO * se);
+        let fall = previous_floor - floor - sampling_bias_excess(previous_mc_se, mc_se);
+        if fall > material(mc_se.hypot(previous_mc_se)) {
+            return McemSettling::Falling {
+                window,
+                previous_floor,
+                floor,
+                previous_mc_se,
+                mc_se,
+            };
+        }
+        // Filtered first: `f64::max` would discard a `NaN` SE and leave the bare minimum.
+        match marginal.filter(|m| m.value.is_finite() && m.mc_se.is_finite()) {
+            Some(marginal) if floor - marginal.value > material(mc_se.hypot(marginal.mc_se)) => {
+                McemSettling::AboveMarginal {
+                    window,
+                    floor,
+                    marginal,
+                    mc_se,
+                }
+            }
+            _ => McemSettling::Settled,
+        }
+    }
+}
+
+/// `Var(log p̂)` of one subject's importance-sampling marginal (Geweke, from the
+/// self-normalized ESS): `(1/ESS_frac − 1)/K`. A degenerate subject gets a finite
+/// fallback.
+fn log_marginal_mc_variance(ess_fraction: f64, k_samples: usize) -> f64 {
+    if ess_fraction > 1e-6 {
+        ((1.0 / ess_fraction) - 1.0).max(0.0) / k_samples as f64
+    } else {
+        1.0
+    }
+}
+
+/// [`log_marginal_mc_variance`] of a mixture subject's `log Σ_c π_c p̂_c`. By the delta
+/// method class `c` enters with its responsibility squared, so a class the subject does
+/// not belong to adds nothing however poor its proposal.
+fn mixture_log_marginal_mc_variance(
+    responsibilities: &[f64],
+    ess_fractions: impl Iterator<Item = f64>,
+    k_samples: usize,
+) -> f64 {
+    responsibilities
+        .iter()
+        .zip(ess_fractions)
+        .map(|(r, ess)| r * r * log_marginal_mc_variance(ess, k_samples))
+        .sum()
+}
+
 /// How each MCEM iteration positions the per-subject importance-sampling
 /// proposal — the one piece that distinguishes IMP from IMPMAP. Everything else
 /// (M-step, sufficient statistics, averaging, ESS diagnostics, final objective)
@@ -168,6 +646,28 @@ enum ProposalRecenter {
 }
 
 impl ProposalRecenter {
+    /// Bundle a finished run's per-iteration record with the option names its warning
+    /// should cite.
+    fn objective_trail(
+        self,
+        objectives: Vec<f64>,
+        mc_se: Vec<f64>,
+        label: &str,
+    ) -> McemObjectiveTrail {
+        let (iterations_option, samples_option, proposal_option) = match self {
+            ProposalRecenter::Map => ("impmap_iterations", "impmap_samples", "impmap_proposal_df"),
+            ProposalRecenter::SampleMoments => ("imp_iterations", "imp_samples", "imp_proposal_df"),
+        };
+        McemObjectiveTrail {
+            objectives,
+            mc_se,
+            label: label.to_string(),
+            iterations_option,
+            samples_option,
+            proposal_option,
+        }
+    }
+
     /// The estimation method this recentering strategy implements, so the shared
     /// MCEM core can ask `EstimationMethod::requires_random_effects` about the
     /// method actually running rather than restating the membership rule (#1050).
@@ -175,6 +675,14 @@ impl ProposalRecenter {
         match self {
             ProposalRecenter::Map => EstimationMethod::Impmap,
             ProposalRecenter::SampleMoments => EstimationMethod::Imp,
+        }
+    }
+
+    /// The `[fit_options]` key of this method's wall-clock limit.
+    fn max_time_key(self) -> &'static str {
+        match self {
+            ProposalRecenter::Map => "impmap_max_time",
+            ProposalRecenter::SampleMoments => "imp_max_time",
         }
     }
 }
@@ -189,11 +697,18 @@ impl ProposalRecenter {
 /// the prior term `−½ηᵀΩ⁻¹η` of the resulting far samples explodes the −2 log L
 /// and the next Ω M-step. We therefore **cap** the proposal-covariance diagonal
 /// at the prior `Ωᵢᵢ` — the conditional variance of a well-identified η is
-/// bounded above by its prior variance. The diagonal is floored only at a tiny
-/// absolute value to avoid a singular matrix (NOT at a fraction of Ω — see
-/// [`IMP_PROPOSAL_COV_FLOOR`]). If the result is still not Cholesky-invertible a
-/// zero matrix is returned, which makes `build_proposal` take its Ω fallback — a
-/// broad but valid proposal.
+/// bounded above by its prior variance. A capped dimension's covariances are
+/// rescaled by the same factor, so the correlations survive: `D C D` stays
+/// positive semi-definite, whereas capping the diagonal alone leaves a strongly
+/// correlated covariance indefinite (#2650). A non-finite variance carries no
+/// usable correlation, so its covariances are dropped. The diagonal is floored
+/// only at a tiny absolute value to avoid a singular matrix (NOT at a fraction of
+/// Ω — see [`IMP_PROPOSAL_COV_FLOOR`]). If the result is still not
+/// Cholesky-invertible the prior precision `Ω⁻¹` is returned — a broad but valid
+/// proposal. It has to be returned here: a zero matrix does not reach
+/// `build_proposal`'s Ω fallback, because the jitter turns it into a
+/// positive-definite `1e−10·I`, a proposal SD of 1e5 (#2650). A zero matrix remains
+/// only for an Ω that is itself not positive-definite.
 fn covariance_to_proposal_hessian(
     cov: &DMatrix<f64>,
     omega: &DMatrix<f64>,
@@ -201,19 +716,33 @@ fn covariance_to_proposal_hessian(
 ) -> DMatrix<f64> {
     let n = cov.nrows();
     let mut c = cov.clone();
+    let mut sd_scale = vec![1.0_f64; n];
     for i in 0..n {
         let hi = omega[(i, i)].max(floor);
         let v = c[(i, i)];
-        if !v.is_finite() || v > hi {
+        if !v.is_finite() {
             c[(i, i)] = hi;
+            sd_scale[i] = 0.0;
+        } else if v > hi {
+            c[(i, i)] = hi;
+            sd_scale[i] = (hi / v).sqrt();
         } else if v < floor {
             c[(i, i)] = floor;
         }
     }
-    match c.cholesky() {
-        Some(ch) => ch.inverse(),
-        None => DMatrix::zeros(n, n),
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            // Assign rather than multiply on a dropped dimension: `0 · NaN` is NaN.
+            let s = sd_scale[i] * sd_scale[j];
+            c[(i, j)] = if s == 0.0 { 0.0 } else { c[(i, j)] * s };
+        }
     }
+    c.cholesky()
+        .or_else(|| omega.clone().cholesky())
+        .map_or_else(|| DMatrix::zeros(n, n), |ch| ch.inverse())
 }
 
 /// Translate one subject's importance draws by `−shift` in η-space: every
@@ -636,11 +1165,111 @@ fn run_map_multistart(
     (eta_hats, h_matrices, kappas, stats)
 }
 
-/// Run IMPMAP. `warm_etas`, when supplied by a preceding chain stage, seed the
-/// first MAP inner loop; otherwise the inner loop cold-starts from η = 0.
-/// Run IMPMAP (NONMEM `METHOD=IMPMAP`). Thin wrapper over the shared MCEM core
-/// with mode re-centering on every iteration; resolves the `impmap_*` options.
+/// The importance-sampling marginal −2 log L at a finished stage's estimates, as NONMEM
+/// reports it. `fit()` publishes it, and a direct [`run_imp`] / [`run_impmap`] call reads
+/// it for its verdict. `options` are the stage's. A mixture uses its own evaluator.
+pub(crate) fn evaluate_final_marginal(
+    model: &CompiledModel,
+    population: &Population,
+    result: &OuterResult,
+    options: &FitOptions,
+    method: EstimationMethod,
+) -> Result<crate::types::ImportanceSamplingResult, String> {
+    use crate::estimation::importance_sampling::{
+        run_importance_sampling, run_importance_sampling_mixture,
+    };
+    debug_assert!(matches!(
+        method,
+        EstimationMethod::Imp | EstimationMethod::Impmap
+    ));
+    let mut marg_opts = options.clone();
+    // `run_importance_sampling` reads the `imp_*` knobs; for IMPMAP map the
+    // `impmap_*` knobs onto them so the final eval mirrors the method's
+    // own sample count / proposal df / seed.
+    if method == EstimationMethod::Impmap {
+        marg_opts.imp_samples = options.impmap_samples;
+        marg_opts.imp_seed = options.impmap_seed;
+        marg_opts.imp_low_ess_threshold = options.impmap_low_ess_threshold;
+        // A Gaussian IMPMAP proposal (`impmap_proposal_df = ∞`, opt-in)
+        // is one the IS evaluator could sample (#2651), but its light
+        // tails leave the weights unbounded. The marginal is
+        // proposal-independent in expectation, so evaluate under a
+        // finite-t proposal instead (heavier tails ⇒ bounded weights).
+        // The default `impmap_proposal_df = 4` passes through unchanged.
+        let df = options.impmap_proposal_df;
+        marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
+    }
+    if model.mixture.is_some() {
+        run_importance_sampling_mixture(model, population, &result.params, &marg_opts)
+    } else {
+        run_importance_sampling(
+            model,
+            population,
+            &result.params,
+            &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            &marg_opts,
+        )
+    }
+}
+
+/// Give a direct [`run_imp`] / [`run_impmap`] caller the settling verdict `fit()` gives
+/// its stages (#2686), which needs the final marginal a stage does not compute. If the
+/// marginal fails, the falling-floor test still runs and a warning says so.
+fn apply_settling_verdict(
+    mut result: OuterResult,
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+    method: EstimationMethod,
+) -> OuterResult {
+    use crate::api::postfit::mcem_settling_warning;
+    let marginal = match evaluate_final_marginal(model, population, &result, options, method) {
+        Ok(is) => Some(FinalMarginal {
+            value: is.minus2_log_likelihood,
+            mc_se: is.mc_standard_error,
+        }),
+        Err(e) => {
+            result
+                .warnings
+                .push(format!("marginal −2 log L eval skipped: {e}"));
+            None
+        }
+    };
+    let trail = result.mcem_objective_trail.take();
+    if let Some((msg, _)) = mcem_settling_warning(&mut result.converged, trail.as_ref(), marginal) {
+        result.warnings.push(msg);
+    }
+    result.mcem_objective_trail = trail;
+    result
+}
+
+/// Run IMPMAP (NONMEM `METHOD=IMPMAP`), as a complete estimation. `warm_etas`, when
+/// supplied, seed the first MAP inner loop; otherwise it cold-starts from η = 0.
+///
+/// `converged` includes the settling verdict, so this also scores the final marginal.
 pub fn run_impmap(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>,
+    options: &FitOptions,
+) -> Result<OuterResult, String> {
+    let result = run_impmap_stage(model, population, init_params, warm_etas, options)?;
+    Ok(apply_settling_verdict(
+        result,
+        model,
+        population,
+        options,
+        EstimationMethod::Impmap,
+    ))
+}
+
+/// One IMPMAP stage of a `fit()`, which scores the marginal and gives the settling
+/// verdict itself. Thin wrapper over the shared MCEM core with mode re-centering on
+/// every iteration; resolves the `impmap_*` options.
+pub(crate) fn run_impmap_stage(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -669,14 +1298,35 @@ pub fn run_impmap(
         options.impmap_sobol,
         options.impmap_trace,
         options.impmap_auto,
+        options.impmap_max_time,
     )
 }
 
-/// Run IMP as an estimator (NONMEM `METHOD=IMP`). Thin wrapper over the shared
-/// MCEM core with sample-moment re-centering (conditional mode found only on the
-/// first iteration); resolves the `imp_*` options. The evaluation-only
-/// `imp_eval_only` path lives in `importance_sampling.rs`.
+/// Run IMP as an estimator (NONMEM `METHOD=IMP`), as a complete estimation. The
+/// evaluation-only `imp_eval_only` path lives in `importance_sampling.rs`.
+///
+/// `converged` includes the settling verdict, so this also scores the final marginal.
 pub fn run_imp(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>,
+    options: &FitOptions,
+) -> Result<OuterResult, String> {
+    let result = run_imp_stage(model, population, init_params, warm_etas, options)?;
+    Ok(apply_settling_verdict(
+        result,
+        model,
+        population,
+        options,
+        EstimationMethod::Imp,
+    ))
+}
+
+/// One IMP stage of a `fit()`, which scores the marginal and gives the settling verdict
+/// itself. Thin wrapper over the shared MCEM core with sample-moment re-centering
+/// (conditional mode found only on the first iteration); resolves the `imp_*` options.
+pub(crate) fn run_imp_stage(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -702,6 +1352,7 @@ pub fn run_imp(
         options.imp_sobol,
         false, // collect_trace: IMP has no trace option
         options.imp_auto,
+        options.imp_max_time,
     )
 }
 
@@ -777,13 +1428,17 @@ fn run_mcem(
     use_sobol: bool,
     collect_trace: bool,
     auto: bool,
+    max_time: Option<f64>,
 ) -> Result<OuterResult, String> {
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
     let n_theta = init_params.theta.len();
     let n_sigma = init_params.sigma.values.len();
+    let started = std::time::Instant::now();
+    let max_time_key = recenter.max_time_key();
 
     // ---- Validation ----
+    check_max_time(label, max_time_key, max_time)?;
     check_sobol_config(
         label,
         df_key,
@@ -816,6 +1471,7 @@ fn run_mcem(
             use_sobol,
             collect_trace,
             auto,
+            max_time,
         );
     }
     if recenter.method().requires_random_effects() && n_eta == 0 {
@@ -866,19 +1522,22 @@ fn run_mcem(
     }
 
     let n_iter = n_iter_opt.max(1);
-    // `k_samples` is mutable so the adaptive (`auto`) path can ramp it up between
+    // `k_samples` is mutable so the adaptive (`auto`) path can move it between
     // iterations when the objective is too Monte-Carlo-noisy (NONMEM `AUTO`).
-    let mut k_samples = k_opt.max(2);
-    // `INFINITY` selects the multivariate-normal proposal; any finite value must
-    // be a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
+    let k_start = k_opt.max(2);
+    let mut k_samples = k_start;
+    // `INFINITY` selects the multivariate-normal proposal; anything else must be
+    // a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
     // bypasses the parser's range check can't reach the `ChiSquared::new(nu)`
-    // panic in `subject_is_draws`. Mirrors `run_importance_sampling`.
-    if nu.is_finite() && nu < 1.0 {
+    // panic in `subject_is_draws`, and a NaN can't pass for a normal proposal by
+    // being non-finite. Mirrors `run_importance_sampling`.
+    if nu.is_nan() || nu < 1.0 {
         return Err(format!(
             "{label}: {df_key} must be >= 1.0 (or +inf for a normal proposal), got {nu}"
         ));
     }
     let n_avg = n_avg_opt.min(n_iter);
+    let auto_hold_end = auto_hold_ends(n_iter, n_avg);
     let verbose = options.verbose;
     let cancel = &options.cancel;
 
@@ -1159,6 +1818,7 @@ fn run_mcem(
             }
         })
         .collect();
+    let schedules = mcem_schedule_cache(model, population, &n_occ_of);
     // MAP warm starts, stacked `[η̂, κ̂₁..κ̂_K]` for an IOV subject so κ is
     // warm-started too. A chained stage's η-only warm start leaves κ at 0.
     let mut prev_etas: Option<Vec<DVector<f64>>> = warm_etas.map(|e| e.to_vec());
@@ -1216,6 +1876,15 @@ fn run_mcem(
     // left its initial value (#918 review).
     let mut cov_group_skipped = vec![0usize; cov_mu_groups.len()];
 
+    // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
+    let mut lowest_iteration_objective: Option<f64> = None;
+    // Every iteration's −2 log L and total MC SE, and its (per-subject SE, K) for `auto`.
+    let mut iteration_objectives: Vec<f64> = Vec::with_capacity(n_iter);
+    let mut iteration_mc_se: Vec<f64> = Vec::with_capacity(n_iter);
+    let mut iteration_se: Vec<(f64, usize)> = Vec::with_capacity(n_iter);
+    // Iterations actually run, and the seconds at which `max_time` stopped them.
+    let mut iterations_done = 0usize;
+    let mut stopped_after: Option<f64> = None;
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             if verbose {
@@ -1362,7 +2031,7 @@ fn run_mcem(
                     let theta = &params_k.theta;
                     let sigma = &params_k.sigma.values;
                     let obs_nll = |b: &[f64], sc: &mut EventPkParams| {
-                        draw_obs_nll(model, subject, theta, sigma, b, sc)
+                        draw_obs_nll(model, subject, theta, sigma, b, schedules[i].as_ref(), sc)
                     };
                     let iscale = find_optimal_iscale_with(
                         &obs_nll,
@@ -1504,6 +2173,7 @@ fn run_mcem(
                     scratch,
                     iscale_min,
                     iscale_max,
+                    schedules[i].as_ref(),
                 );
                 subject_is_draws(
                     model,
@@ -1522,6 +2192,7 @@ fn run_mcem(
                     iscale,
                     use_sobol,
                     defensive_mixture.as_ref(),
+                    schedules[i].as_ref(),
                 )
             })
             .collect();
@@ -1547,32 +2218,43 @@ fn run_mcem(
             ess_fracs.push(d.ess_fraction);
         }
         let minus2ll = -2.0 * ll;
+        lowest_iteration_objective = lowest_objective(lowest_iteration_objective, minus2ll);
         // Objective Monte-Carlo standard error from the self-normalized ESS
         // (Geweke: Var(log p̂ᵢ) ≈ (1/ESS_frac − 1)/K; degenerate subjects get a
         // finite fallback). −2 log L scales this by 2.
         let var_ll: f64 = ess_fracs
             .iter()
-            .map(|&f| {
-                if f > 1e-6 {
-                    ((1.0 / f) - 1.0).max(0.0) / k_samples as f64
-                } else {
-                    1.0
-                }
-            })
+            .map(|&f| log_marginal_mc_variance(f, k_samples))
             .sum();
         let mc_se = 2.0 * var_ll.sqrt();
+        iteration_objectives.push(minus2ll);
+        iteration_mc_se.push(mc_se);
         // Per-subject objective SE (N-independent): see AUTO_STDOBJ_TARGET.
         let mc_se_per_subject = mc_se / (ess_fracs.len().max(1) as f64).sqrt();
         final_mc_se = mc_se_per_subject;
         final_k_samples = k_samples;
-        // Adaptive sampling (NONMEM `AUTO`): ramp K up (×2, capped) while the
-        // objective is too MC-noisy, so the M-step is driven by signal not noise.
-        if auto && mc_se_per_subject > AUTO_STDOBJ_TARGET && k_samples < AUTO_SAMPLES_MAX {
-            let new_k = (k_samples.saturating_mul(2)).min(AUTO_SAMPLES_MAX);
-            if verbose {
+        // Adaptive sampling (NONMEM `AUTO`): move K so the M-step is driven by
+        // signal, not noise. Raising waits for the objective to settle, because
+        // early in a run the proposal lags the parameters and the SE reflects that
+        // lag, not what the converged fit needs (#2687).
+        if auto {
+            iteration_se.push((mc_se_per_subject, k_samples));
+            let (new_k, se) = auto_step(
+                &iteration_objectives,
+                &iteration_se,
+                k_start,
+                ess_fracs.len(),
+                k >= auto_hold_end,
+            );
+            if verbose && new_k != k_samples {
+                let verb = if new_k > k_samples {
+                    "raising"
+                } else {
+                    "lowering"
+                };
                 eprintln!(
-                    "{label}: auto-sampling — per-subject objective MC SE {mc_se_per_subject:.3} \
-                     > {AUTO_STDOBJ_TARGET:.2}, raising K {k_samples} → {new_k}"
+                    "{label}: auto-sampling — iteration {k}, per-subject objective MC SE \
+                     {se:.3} (target {AUTO_STDOBJ_TARGET:.2}), {verb} K {k_samples} → {new_k}"
                 );
             }
             k_samples = new_k;
@@ -1676,6 +2358,7 @@ fn run_mcem(
             model,
             population,
             &draws,
+            &schedules,
             &log_theta,
             &log_sigma,
             &mstep_theta_lower,
@@ -1794,7 +2477,13 @@ fn run_mcem(
                                     let mut e2 = eta.clone();
                                     group.shift_eta(&mut e2, shifts, i);
                                     s += w * draw_obs_nll(
-                                        model, subject, th, &sigma_now, &e2, scratch,
+                                        model,
+                                        subject,
+                                        th,
+                                        &sigma_now,
+                                        &e2,
+                                        schedules[i].as_ref(),
+                                        scratch,
                                     );
                                 }
                                 s
@@ -1911,10 +2600,28 @@ fn run_mcem(
                 k, minus2ll, n_low_ess
             );
         }
+
+        iterations_done = k;
+        if k < n_iter {
+            stopped_after = time_limit_reached(started, max_time);
+            if stopped_after.is_some() {
+                break;
+            }
+        }
     }
 
     if crate::cancel::is_cancelled(cancel) {
         return Err("cancelled by user".to_string());
+    }
+    if let Some(elapsed) = stopped_after {
+        warnings.push(time_limit_warning(
+            label,
+            max_time_key,
+            elapsed,
+            iterations_done,
+            n_iter,
+            n_acc,
+        ));
     }
 
     // ---- Importance-sampling bias warning ----
@@ -1959,18 +2666,14 @@ fn run_mcem(
         } else {
             String::new()
         };
-        let advice = if auto {
-            format!(
-                "`{auto_opt}` is enabled but the sample count {} (cap {AUTO_SAMPLES_MAX}) \
-                 was not enough to reach the MC-SE target.",
-                final_k_samples
-            )
-        } else {
-            format!(
-                "Raise `{sample_opt}` (high-dimensional / FREM models typically need several \
-                 thousand) or set `{auto_opt} = true` to ramp it automatically."
-            )
-        };
+        let advice = under_sampling_advice(
+            auto,
+            final_k_samples,
+            &iteration_se,
+            k_start,
+            sample_opt,
+            auto_opt,
+        );
         warnings.push(format!(
             "{label}: {} importance samples for {} give a noisy objective \
              (per-subject MC SE = {:.3}, target {:.2}; median ESS/K = {:.2}). The weighted M-step \
@@ -2009,7 +2712,7 @@ fn run_mcem(
              importance-weighted M-step alone, or not at all; check them against a FOCEI fit \
              and consider bounding the covariate slope (#619).",
             skipped,
-            n_iter,
+            iterations_done,
             names.join(", ")
         ));
     }
@@ -2176,9 +2879,9 @@ fn run_mcem(
         None
     };
 
-    // IMPMAP runs a fixed iteration schedule (no parameter-stabilization
-    // stopping test yet), so the only convergence signal we can honestly
-    // report is a sane final objective. A non-finite OFV means the MCEM
+    // IMP and IMPMAP run a fixed iteration schedule, so there is no stopping test
+    // to report. The verdict here rests on a sane final objective, and `fit()` adds
+    // the checks that need the marginal (#2652, #2686). A non-finite OFV means the MCEM
     // diverged; but a *runaway* (importance weights collapse → weighted
     // M-step walks θ to the bounds) produces a finite-but-enormous OFV
     // (~1e35), which `is_finite()` alone would wave through as converged and
@@ -2187,7 +2890,7 @@ fn run_mcem(
     // #1303: both rules now live in `gate_converged_on_mcem_objective`, which also
     // *says* which one fired — the verdict used to be a bare boolean with nothing
     // in `warnings` to explain it.
-    let mut converged = true;
+    let mut converged = stopped_after.is_none();
     if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
         warnings.push(w);
     }
@@ -2200,7 +2903,7 @@ fn run_mcem(
         params: final_params,
         ofv,
         converged,
-        n_iterations: n_iter,
+        n_iterations: iterations_done,
         eta_hats,
         h_matrices,
         kappas: final_kappas,
@@ -2227,6 +2930,12 @@ fn run_mcem(
         mixture_posteriors: None,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: lowest_iteration_objective,
+        // A run `max_time` stopped did not reach the limit the settling verdict is about,
+        // and already says why it is not converged.
+        mcem_objective_trail: stopped_after
+            .is_none()
+            .then(|| recenter.objective_trail(iteration_objectives, iteration_mc_se, label)),
     })
 }
 
@@ -2267,6 +2976,7 @@ fn run_mcem_mixture(
     use_sobol: bool,
     collect_trace: bool,
     auto: bool,
+    max_time: Option<f64>,
 ) -> Result<OuterResult, String> {
     use crate::estimation::importance_sampling::{
         compute_posterior_hessian, subject_is_draws, DefensiveMixture,
@@ -2322,6 +3032,7 @@ fn run_mcem_mixture(
         ));
     }
 
+    let started = std::time::Instant::now();
     let n_iter = n_iter_opt.max(1);
     let k_samples = k_opt.max(2);
     let n_avg = n_avg_opt.min(n_iter);
@@ -2605,6 +3316,7 @@ fn run_mcem_mixture(
         ));
     }
 
+    let schedules = build_schedule_cache(model, population);
     let mut theta_cur = init_params.theta.clone();
     let mut sigma_cur = init_params.sigma.values.clone();
     let mut omega_mat = init_params.omega.matrix.clone();
@@ -2639,6 +3351,13 @@ fn run_mcem_mixture(
         );
     }
 
+    // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
+    let mut lowest_iteration_objective: Option<f64> = None;
+    let mut iteration_objectives: Vec<f64> = Vec::with_capacity(n_iter);
+    let mut iteration_mc_se: Vec<f64> = Vec::with_capacity(n_iter);
+    // Iterations actually run, and the seconds at which `max_time` stopped them.
+    let mut iterations_done = 0usize;
+    let mut stopped_after: Option<f64> = None;
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             break;
@@ -2781,6 +3500,7 @@ fn run_mcem_mixture(
                         scratch,
                         options.iscale_min,
                         options.iscale_max,
+                        schedules[i].as_ref(),
                     );
                     let d = subject_is_draws(
                         model,
@@ -2799,6 +3519,7 @@ fn run_mcem_mixture(
                         iscale,
                         use_sobol,
                         defensive.as_ref(),
+                        schedules[i].as_ref(),
                     );
                     nll[c] = -d.log_marginal;
                     class_draws.push(d);
@@ -2825,6 +3546,15 @@ fn run_mcem_mixture(
             pmix.push(pmix_i);
             ofv += contribution;
         }
+        lowest_iteration_objective = lowest_objective(lowest_iteration_objective, ofv);
+        let var_ll: f64 = (0..n_subjects)
+            .map(|i| {
+                let ess = (0..n_classes).map(|c| draws_by_class[c][i].ess_fraction);
+                mixture_log_marginal_mc_variance(&pmix[i], ess, k_samples)
+            })
+            .sum();
+        iteration_objectives.push(ofv);
+        iteration_mc_se.push(2.0 * var_ll.sqrt());
         if verbose {
             // Per-subject ESS: the worst per-class proposal among the classes the
             // subject actually contributes to (a collapsed proposal in a class
@@ -2897,6 +3627,7 @@ fn run_mcem_mixture(
             model,
             population,
             &draws_by_class,
+            &schedules,
             &pmix,
             &log_theta,
             &log_sigma,
@@ -3015,6 +3746,14 @@ fn run_mcem_mixture(
         } else {
             None
         };
+
+        iterations_done = k;
+        if k < n_iter {
+            stopped_after = time_limit_reached(started, max_time);
+            if stopped_after.is_some() {
+                break;
+            }
+        }
     }
 
     // A cancel observed inside (or at the top of) the loop breaks out with
@@ -3023,6 +3762,16 @@ fn run_mcem_mixture(
     // rather than paying for them and handing back a bogus `Ok` (#992 review).
     if crate::cancel::is_cancelled(cancel) {
         return Err("cancelled by user".to_string());
+    }
+    if let Some(elapsed) = stopped_after {
+        warnings.push(time_limit_warning(
+            label,
+            recenter.max_time_key(),
+            elapsed,
+            iterations_done,
+            n_iter,
+            n_acc,
+        ));
     }
 
     if !empty_class_theta.is_empty() {
@@ -3128,7 +3877,7 @@ fn run_mcem_mixture(
     warnings.extend(cov_warnings);
 
     // #1303 / #528 — the same two rules as the single-population exit above.
-    let mut converged = true;
+    let mut converged = stopped_after.is_none();
     if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
         warnings.push(w);
     }
@@ -3141,7 +3890,7 @@ fn run_mcem_mixture(
         params: final_params,
         ofv,
         converged,
-        n_iterations: n_iter,
+        n_iterations: iterations_done,
         eta_hats,
         h_matrices,
         kappas: final_kappas,
@@ -3168,6 +3917,12 @@ fn run_mcem_mixture(
         mixture_posteriors,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: lowest_iteration_objective,
+        // A run `max_time` stopped did not reach the limit the settling verdict is about,
+        // and already says why it is not converged.
+        mcem_objective_trail: stopped_after
+            .is_none()
+            .then(|| recenter.objective_trail(iteration_objectives, iteration_mc_se, label)),
     })
 }
 
@@ -3241,23 +3996,28 @@ fn stack_eta_kappa(eta: &DVector<f64>, kappas: &[DVector<f64>]) -> DVector<f64> 
 
 /// The joint prior `Ω ⊕ I_K ⊗ Ω_iov` of an IOV subject with `K` occasions, the
 /// pieces of it the E-step reads, and its defensive component (#2301).
-struct JointPrior {
+pub(crate) struct JointPrior {
     /// `(Ω ⊕ I_K ⊗ Ω_iov)⁻¹`.
-    inv: DMatrix<f64>,
+    pub(crate) inv: DMatrix<f64>,
     /// `log det Ω + K · log det Ω_iov`.
-    log_det: f64,
+    pub(crate) log_det: f64,
     /// `Ω ⊕ I_K ⊗ Ω_iov`, the IMP proposal-covariance cap.
     matrix: DMatrix<f64>,
-    mixture: Option<crate::estimation::importance_sampling::DefensiveMixture>,
+    pub(crate) mixture: Option<crate::estimation::importance_sampling::DefensiveMixture>,
 }
 
 /// One [`JointPrior`] per distinct occasion count in the population, built once
 /// per MCEM iteration — the IOV twin of sharing the η-only defensive component
 /// across subjects (#528).
-struct JointPriors(std::collections::BTreeMap<usize, JointPrior>);
+pub(crate) struct JointPriors(std::collections::BTreeMap<usize, JointPrior>);
 
 impl JointPriors {
-    fn build(omega: &OmegaMatrix, iov: &OmegaMatrix, n_occ_of: &[usize], alpha: f64) -> Self {
+    pub(crate) fn build(
+        omega: &OmegaMatrix,
+        iov: &OmegaMatrix,
+        n_occ_of: &[usize],
+        alpha: f64,
+    ) -> Self {
         let (n_eta, n_kappa) = (omega.matrix.nrows(), iov.matrix.nrows());
         let mut map = std::collections::BTreeMap::new();
         for &n_occ in n_occ_of.iter().filter(|&&k| k > 0) {
@@ -3283,7 +4043,7 @@ impl JointPriors {
         Self(map)
     }
 
-    fn get(&self, n_occ: usize) -> &JointPrior {
+    pub(crate) fn get(&self, n_occ: usize) -> &JointPrior {
         &self.0[&n_occ]
     }
 }
@@ -3313,12 +4073,13 @@ fn split_kappas(kappa_part: &[f64], n_kappa: usize, buf: &mut Vec<Vec<f64>>) -> 
 /// alone (scored exactly as before #2301), or an IOV subject's stacked
 /// `[η, κ₁..κ_K]`, scored with per-occasion predictions — the observation NLL
 /// SAEM's IOV M-step uses.
-fn draw_obs_nll(
+pub(crate) fn draw_obs_nll(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     sigma: &[f64],
     b: &[f64],
+    schedule: Option<&EventSchedule>,
     scratch: &mut EventPkParams,
 ) -> f64 {
     let n_eta = model.n_eta;
@@ -3328,7 +4089,7 @@ fn draw_obs_nll(
         KAPPA_SPLIT.with(|buf| {
             let mut buf = buf.borrow_mut();
             let n_occ = split_kappas(&b[n_eta..], model.n_kappa, &mut buf);
-            obs_nll_subject_into_iov(
+            obs_nll_subject_into_iov_with_schedule(
                 model,
                 subject,
                 theta,
@@ -3336,10 +4097,11 @@ fn draw_obs_nll(
                 &b[..n_eta],
                 &buf[..n_occ],
                 scratch,
+                schedule,
             )
         })
     } else {
-        obs_nll_subject_into(
+        obs_nll_subject_into_with_schedule(
             model,
             subject,
             theta,
@@ -3347,8 +4109,34 @@ fn draw_obs_nll(
             model.residual_cov_theta(theta),
             b,
             scratch,
+            schedule,
         )
     }
+}
+
+/// Each subject's cached event schedule for the MCEM scoring loops, `None` where
+/// reuse is unsound. The E-step and the M-steps score every draw, so a subject on
+/// the event-driven walk would otherwise rebuild its schedule K times per
+/// evaluation; on vancomycin and infliximab (time-varying covariates) that rebuild
+/// was the largest single cost of a fixed-K run (#2687). An IOV subject walks the
+/// IOV funnel whatever its covariates, hence its own gate.
+fn mcem_schedule_cache(
+    model: &CompiledModel,
+    population: &Population,
+    n_occ_of: &[usize],
+) -> Vec<Option<EventSchedule>> {
+    population
+        .subjects
+        .iter()
+        .zip(n_occ_of)
+        .map(|(subject, &n_occ)| {
+            if n_occ > 0 {
+                cacheable_schedule_iov(model, subject)
+            } else {
+                cacheable_schedule(model, subject)
+            }
+        })
+        .collect()
 }
 
 /// Closed-form Ω_iov M-step (#2301): the importance-weighted second moment of
@@ -3416,6 +4204,7 @@ fn weighted_mstep_objective(
     model: &CompiledModel,
     population: &Population,
     draws: &[SubjectDraws],
+    schedules: &[Option<EventSchedule>],
     theta: &[f64],
     sigma: &[f64],
 ) -> f64 {
@@ -3427,16 +4216,28 @@ fn weighted_mstep_objective(
         .subjects
         .par_iter()
         .zip(draws.par_iter())
-        .map_init(EventPkParams::default, |scratch, (subject, d)| {
-            let mut s = 0.0f64;
-            for (w, b) in d.weights.iter().zip(d.etas.iter()) {
-                if *w == 0.0 {
-                    continue;
+        .zip(schedules.par_iter())
+        .map_init(
+            EventPkParams::default,
+            |scratch, ((subject, d), schedule)| {
+                let mut s = 0.0f64;
+                for (w, b) in d.weights.iter().zip(d.etas.iter()) {
+                    if *w == 0.0 {
+                        continue;
+                    }
+                    s += w * draw_obs_nll(
+                        model,
+                        subject,
+                        theta,
+                        sigma,
+                        b,
+                        schedule.as_ref(),
+                        scratch,
+                    );
                 }
-                s += w * draw_obs_nll(model, subject, theta, sigma, b, scratch);
-            }
-            s
-        })
+                s
+            },
+        )
         .collect();
     let val: f64 = per_subj.iter().sum();
     if val.is_finite() {
@@ -3456,6 +4257,7 @@ fn theta_sigma_weighted_mstep(
     model: &CompiledModel,
     population: &Population,
     draws: &[crate::estimation::importance_sampling::SubjectDraws],
+    schedules: &[Option<EventSchedule>],
     log_theta_init: &[f64],
     log_sigma_init: &[f64],
     log_theta_lower: &[f64],
@@ -3501,7 +4303,7 @@ fn theta_sigma_weighted_mstep(
     let obj = |xv: &[f64], _: Option<&mut [f64]>, _: &mut ()| -> f64 {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
-        weighted_mstep_objective(model, population, draws, &th, &sg)
+        weighted_mstep_objective(model, population, draws, schedules, &th, &sg)
     };
 
     let mut opt = nlopt::Nlopt::new(
@@ -3539,6 +4341,7 @@ fn theta_sigma_weighted_mstep_mixture(
     model: &CompiledModel,
     population: &Population,
     draws: &[Vec<crate::estimation::importance_sampling::SubjectDraws>],
+    schedules: &[Option<EventSchedule>],
     pmix: &[Vec<f64>],
     log_theta_init: &[f64],
     log_sigma_init: &[f64],
@@ -3601,7 +4404,7 @@ fn theta_sigma_weighted_mstep_mixture(
                         if *w == 0.0 {
                             continue;
                         }
-                        sc += w * obs_nll_subject_into(
+                        sc += w * obs_nll_subject_into_with_schedule(
                             model,
                             subject,
                             &th,
@@ -3609,6 +4412,7 @@ fn theta_sigma_weighted_mstep_mixture(
                             model.residual_cov_theta(&th),
                             eta,
                             scratch,
+                            schedules[i].as_ref(),
                         );
                     }
                     s += p * sc;
@@ -4595,6 +5399,556 @@ mod tests {
         assert!(!objective_converged(OFV_DIVERGENCE_CAP));
     }
 
+    /// #2652: every row is a run from the 2026-11 evaluation (lowest iteration, final
+    /// objective, observations), so the bound is pinned to what separated them.
+    #[test]
+    fn mcem_objective_rise_separates_the_measured_collapses_from_healthy_runs() {
+        // Linux aarch64 (glibc 2.41): (lowest iteration, final marginal, n_obs). See
+        // `MCEM_RISE_TOLERANCE` for the setup. The collapses are from the tree before
+        // #2650, which removed their cause.
+        for (lowest, end, n_obs) in [
+            (4313.3406, 13354.7091, 702), // cefepime, warm: the issue's fit
+            (4300.6956, 6480.1505, 702),  // cefepime, cold: the narrowest collapse
+            (661.4346, 1589.4539, 183),   // infliximab, warm
+            (703.0588, 1545.6446, 183),   // infliximab, cold: ends below its 3087.4 start
+            (998.0913, 3814.4033, 274),   // vancomycin, warm
+            (-79.8594, 2126.9567, 132),   // thioguanine, cold
+        ] {
+            assert!(
+                mcem_objective_rise(end, lowest, n_obs).is_some(),
+                "a collapse passed: {lowest} → {end}"
+            );
+        }
+        for (lowest, end, n_obs) in [
+            (4276.0932, 4279.2241, 702),    // cefepime, cold
+            (4279.0421, 4281.7779, 702),    // cefepime, warm
+            (665.3862, 665.4009, 183),      // infliximab, cold
+            (660.8735, 661.1218, 183),      // infliximab, warm
+            (995.9150, 996.7820, 274),      // vancomycin, warm
+            (5963.0649, 5966.0838, 1231),   // pembrolizumab, warm
+            (-3054.2406, -3053.8571, 1006), // propofol, warm
+            (-250.8932, -250.5679, 132),    // thioguanine, cold: the widest gap
+            (-250.8932, -250.5775, 132),    // thioguanine, warm
+            (-286.1552, -286.0387, 110),    // warfarin, cold
+            (-286.1552, -286.0393, 110),    // warfarin, warm
+        ] {
+            assert_eq!(
+                mcem_objective_rise(end, lowest, n_obs),
+                None,
+                "a healthy run fired: {lowest} → {end}"
+            );
+        }
+    }
+
+    /// The scale's two halves, each on the input only it decides. Dropping `abs()` makes
+    /// a negative objective's tolerance negative, so a tiny rise fires; dropping the
+    /// `n_obs` floor makes noise around zero a 1000 % rise.
+    #[test]
+    fn mcem_objective_rise_scales_on_the_magnitude_and_the_observation_count() {
+        assert_eq!(mcem_objective_rise(-990.0, -1000.0, 10), None);
+        assert_eq!(mcem_objective_rise(-850.0, -1000.0, 10), Some(150.0));
+        assert_eq!(mcem_objective_rise(5.0, 0.4, 100), None);
+        assert!(mcem_objective_rise(11.0, 0.4, 100).is_some());
+        // A fall is never a rise, however large.
+        assert_eq!(mcem_objective_rise(-5000.0, 4000.0, 100), None);
+    }
+
+    /// A non-finite iteration must neither become the baseline nor erase it. `-inf`
+    /// is the case `f64::min` gets wrong: nothing could ever rise above it.
+    #[test]
+    fn lowest_objective_keeps_the_lowest_finite_iteration() {
+        assert_eq!(lowest_objective(None, f64::NAN), None);
+        assert_eq!(lowest_objective(None, f64::INFINITY), None);
+        assert_eq!(lowest_objective(None, 7.0), Some(7.0));
+        assert_eq!(lowest_objective(Some(7.0), 9.0), Some(7.0));
+        assert_eq!(lowest_objective(Some(7.0), 5.0), Some(5.0));
+        assert_eq!(lowest_objective(Some(7.0), f64::NAN), Some(7.0));
+        assert_eq!(lowest_objective(Some(7.0), f64::NEG_INFINITY), Some(7.0));
+    }
+
+    /// The last 100 iteration objectives of four Linux runs, to one decimal (#2686).
+    /// `THIOGUANINE_NORMAL_S777` and both `*_NORMAL` runs are cold, with
+    /// `imp_proposal_df = normal` and `imp_averaging = 1`; `CEFEPIME_CHAINED` is
+    /// `[focei, imp]`.
+    const THIOGUANINE_NORMAL_S777: [f64; 100] = [
+        -244.1, -239.6, -244.7, -250.1, -250.3, -245.2, -249.6, -250.3, -249.7, -250.1, -251.0,
+        -245.0, -249.1, -250.3, -249.9, -247.9, -243.0, -248.1, -250.3, -251.0, -249.7, -250.0,
+        -250.5, -242.5, -235.5, -248.5, -245.9, -252.1, -230.2, -236.3, -231.7, -247.7, -246.9,
+        -249.8, -249.8, -249.7, -250.2, -249.6, -250.1, -241.9, -219.7, -210.6, -203.1, -193.6,
+        -198.6, -174.1, -168.2, -152.0, -154.0, -140.1, -132.8, -138.9, -156.8, -171.7, -166.4,
+        -185.8, -175.3, -166.4, -184.0, -194.6, -207.6, -226.2, -214.4, -192.2, -205.9, -219.9,
+        -225.0, -234.8, -241.2, -234.3, -239.5, -241.1, -243.0, -231.7, -244.7, -247.5, -250.4,
+        -228.3, -248.6, -250.3, -249.9, -249.9, -249.5, -235.9, -250.9, -249.8, -250.1, -249.6,
+        -246.4, -250.1, -249.5, -250.4, -251.3, -249.7, -242.5, -250.3, -249.6, -249.4, -249.7,
+        -240.3,
+    ];
+    const VANCOMYCIN_NORMAL: [f64; 100] = [
+        1082.2, 1065.9, 1080.5, 1073.9, 1073.0, 1085.9, 1088.0, 1083.3, 1090.1, 1083.7, 1071.6,
+        1072.7, 1069.6, 1066.2, 1088.0, 1084.2, 1080.3, 1079.9, 1089.2, 1073.5, 1073.4, 1059.9,
+        1070.9, 1081.7, 1087.3, 1087.4, 1076.7, 1057.2, 1053.6, 1061.8, 1051.1, 1047.9, 1044.0,
+        1034.1, 1039.0, 1046.4, 1050.2, 1052.8, 1045.6, 1034.7, 1050.5, 1048.8, 1048.4, 1056.7,
+        1036.0, 1040.9, 1034.3, 1035.2, 1031.7, 1041.1, 1034.8, 1044.9, 1040.5, 1047.2, 1034.8,
+        1025.4, 1025.9, 1032.5, 1026.1, 1019.5, 1016.8, 1015.5, 1014.2, 1013.4, 1013.1, 1013.2,
+        1012.6, 1011.7, 1011.6, 1010.9, 1011.1, 1010.6, 1010.4, 1010.2, 1010.9, 1009.5, 1017.0,
+        1008.8, 1009.7, 1008.7, 1007.5, 1008.7, 1008.7, 1008.1, 1007.2, 1007.1, 1005.5, 1006.5,
+        1006.5, 1005.9, 1006.0, 1005.9, 1005.4, 1005.3, 1005.0, 1005.0, 1005.7, 1013.7, 1005.5,
+        1004.9,
+    ];
+    const CEFEPIME_NORMAL: [f64; 100] = [
+        4320.0, 4334.1, 4327.5, 4375.1, 4328.1, 4318.2, 4323.3, 4361.0, 4355.0, 4348.9, 4339.6,
+        4340.6, 4387.1, 4410.3, 4410.0, 4396.3, 4384.4, 4387.2, 4392.9, 4410.2, 4403.9, 4404.8,
+        4371.3, 4339.6, 4319.8, 4318.7, 4362.7, 4380.7, 4362.1, 4368.2, 4375.1, 4357.9, 4384.1,
+        4385.5, 4336.3, 4341.1, 4367.3, 4361.1, 4356.2, 4334.8, 4335.0, 4344.9, 4391.7, 4359.9,
+        4346.5, 4380.1, 4342.3, 4340.2, 4340.6, 4338.2, 4344.4, 4367.5, 4356.7, 4361.1, 4356.7,
+        4331.9, 4337.3, 4341.0, 4330.4, 4321.5, 4352.0, 4322.1, 4353.5, 4348.0, 4365.4, 4348.0,
+        4316.9, 4348.6, 4319.8, 4311.9, 4362.3, 4366.8, 4377.4, 4394.0, 4421.7, 4405.3, 4373.7,
+        4397.4, 4355.7, 4376.3, 4415.6, 4431.8, 4444.7, 4419.2, 4426.9, 4403.2, 4393.9, 4439.8,
+        4413.7, 4392.6, 4370.5, 4379.0, 4362.3, 4408.1, 4439.1, 4442.3, 4470.3, 4423.3, 4408.5,
+        4398.6,
+    ];
+    const CEFEPIME_CHAINED: [f64; 100] = [
+        4282.0, 4283.1, 4282.0, 4279.9, 4294.0, 4283.2, 4328.1, 4305.3, 4300.7, 4306.5, 4292.6,
+        4294.0, 4283.5, 4282.8, 4281.1, 4280.6, 4280.5, 4284.6, 4281.6, 4282.7, 4282.0, 4284.2,
+        4286.7, 4280.7, 4282.2, 4277.6, 4285.5, 4279.3, 4277.2, 4277.4, 4281.9, 4281.4, 4283.9,
+        4282.2, 4286.5, 4279.7, 4288.7, 4280.5, 4270.2, 4278.8, 4279.7, 4283.4, 4277.6, 4300.6,
+        4289.9, 4301.2, 4311.1, 4307.9, 4307.7, 4299.2, 4281.5, 4292.5, 4292.4, 4278.6, 4280.4,
+        4289.0, 4310.3, 4277.8, 4277.3, 4294.1, 4277.4, 4281.1, 4286.0, 4276.8, 4280.4, 4278.7,
+        4277.6, 4289.7, 4282.4, 4281.0, 4278.8, 4275.0, 4277.7, 4283.9, 4310.5, 4290.2, 4294.1,
+        4277.0, 4313.9, 4291.0, 4309.4, 4295.5, 4278.5, 4275.6, 4304.8, 4289.8, 4287.7, 4280.0,
+        4292.3, 4297.0, 4312.6, 4290.1, 4285.6, 4279.1, 4279.1, 4284.8, 4292.2, 4279.2, 4297.5,
+        4294.4,
+    ];
+
+    /// A 150-iteration trail ending in `tail`. The first 50 entries are absurd on
+    /// purpose: at that length the test never reads the first third.
+    fn trail_ending_in(tail: &[f64], mc_se: f64) -> McemObjectiveTrail {
+        let mut objectives = vec![1e9; 150 - tail.len()];
+        objectives.extend_from_slice(tail);
+        ProposalRecenter::SampleMoments.objective_trail(objectives, vec![mc_se; 150], "IMP")
+    }
+
+    /// A marginal with no noise of its own, for tests about the floor.
+    fn exact(value: f64) -> Option<FinalMarginal> {
+        Some(FinalMarginal { value, mc_se: 0.0 })
+    }
+
+    /// Two windows of 50, at the two floors given. Most of each window sits 10 above its
+    /// floor, so the floor is what the test has to read.
+    fn two_windows(previous_floor: f64, floor: f64, mc_se: f64) -> McemObjectiveTrail {
+        let window = |f: f64| {
+            let mut v = vec![f + 10.0; 44];
+            v.extend_from_slice(&[f; 6]);
+            v
+        };
+        trail_ending_in(&[window(previous_floor), window(floor)].concat(), mc_se)
+    }
+
+    /// The two runs NONMEM's evaluator scored short of the optimum are the two this
+    /// fires on, each by its own arm. The other two are the hard negative controls: the
+    /// thioguanine run swings by more than either, and chained cefepime is noisy.
+    #[test]
+    fn settling_separates_the_measured_runs() {
+        let settling = |tail: &[f64], se, value, mc_se| {
+            trail_ending_in(tail, se).settling(Some(FinalMarginal { value, mc_se }))
+        };
+        assert!(matches!(
+            settling(&VANCOMYCIN_NORMAL, 0.29, 1004.72, 0.23),
+            McemSettling::Falling { window: 50, .. }
+        ));
+        assert!(matches!(
+            settling(&CEFEPIME_NORMAL, 2.54, 4288.06, 1.09),
+            McemSettling::AboveMarginal { window: 50, .. }
+        ));
+        assert_eq!(
+            settling(&THIOGUANINE_NORMAL_S777, 0.69, -249.82, 0.23),
+            McemSettling::Settled
+        );
+        assert_eq!(
+            settling(&CEFEPIME_CHAINED, 2.24, 4277.29, 1.26),
+            McemSettling::Settled
+        );
+    }
+
+    /// Cefepime's trace alone says nothing, which is why the test sits in `fit()`: its
+    /// floor is flat, so only the marginal shows the run is short of the optimum.
+    #[test]
+    fn a_plateau_needs_the_marginal_to_be_seen() {
+        let trail = trail_ending_in(&CEFEPIME_NORMAL, 2.54);
+        assert_eq!(trail.settling(None), McemSettling::Settled);
+    }
+
+    #[test]
+    fn a_gap_must_clear_both_the_minimum_and_the_noise() {
+        // Falling arm. 3.0 is 30 SEs and under the minimum, 5.0 clears both, and with
+        // an SE of 2 the 5.0 is under 4 SEs.
+        assert_eq!(
+            two_windows(103.0, 100.0, 0.1).settling(None),
+            McemSettling::Settled
+        );
+        assert!(matches!(
+            two_windows(105.0, 100.0, 0.1).settling(None),
+            McemSettling::Falling { .. }
+        ));
+        assert_eq!(
+            two_windows(105.0, 100.0, 2.0).settling(None),
+            McemSettling::Settled
+        );
+        // Marginal arm, the same three cases.
+        let flat = |se| two_windows(100.0, 100.0, se);
+        assert_eq!(flat(0.1).settling(exact(97.0)), McemSettling::Settled);
+        assert!(matches!(
+            flat(0.1).settling(exact(95.0)),
+            McemSettling::AboveMarginal { .. }
+        ));
+        assert_eq!(flat(2.0).settling(exact(95.0)), McemSettling::Settled);
+    }
+
+    /// The reported values, each distinct so that swapping two fails.
+    #[test]
+    fn settling_reports_the_floors_it_compared() {
+        let mut falling = two_windows(120.0, 100.0, 0.5);
+        falling.mc_se[50..100].fill(0.75);
+        assert_eq!(
+            falling.settling(None),
+            McemSettling::Falling {
+                window: 50,
+                previous_floor: 120.0,
+                floor: 100.0,
+                previous_mc_se: 0.75,
+                mc_se: 0.5,
+            }
+        );
+        assert_eq!(
+            two_windows(100.0, 100.0, 0.5).settling(Some(FinalMarginal {
+                value: 90.0,
+                mc_se: 0.25,
+            })),
+            McemSettling::AboveMarginal {
+                window: 50,
+                floor: 100.0,
+                marginal: FinalMarginal {
+                    value: 90.0,
+                    mc_se: 0.25,
+                },
+                mc_se: 0.5,
+            }
+        );
+    }
+
+    /// A rising floor is not "still falling", and a marginal above the floor is not
+    /// "floor above the marginal": `W_MCEM_OBJECTIVE_ROSE` owns that direction.
+    #[test]
+    fn settling_is_one_sided() {
+        assert_eq!(
+            two_windows(100.0, 120.0, 0.1).settling(None),
+            McemSettling::Settled
+        );
+        assert_eq!(
+            two_windows(100.0, 100.0, 0.1).settling(exact(120.0)),
+            McemSettling::Settled
+        );
+    }
+
+    /// Five of 50 iterations can sit anywhere below the floor without moving it, and any
+    /// number above it. The sixth lowest value is the one read.
+    #[test]
+    fn the_floor_ignores_excursions_on_either_side() {
+        let mut w = vec![100.0; 50];
+        assert_eq!(objective_floor(w.clone()), 100.0);
+        w[..5].fill(50.0);
+        assert_eq!(objective_floor(w.clone()), 100.0);
+        w[5] = 50.0;
+        assert_eq!(objective_floor(w.clone()), 50.0);
+        let mut w = vec![100.0; 50];
+        w[..44].fill(1e6);
+        assert_eq!(objective_floor(w.clone()), 100.0);
+    }
+
+    /// A run needs three windows of ten, and a shorter schedule reads a third of itself.
+    #[test]
+    fn settling_needs_three_windows_and_skips_the_first_third() {
+        let trail = |n: usize| {
+            let third = n / 3;
+            let mut o = vec![1e9; n - 2 * third];
+            o.extend(vec![110.0; third]);
+            o.extend(vec![100.0; third]);
+            ProposalRecenter::SampleMoments.objective_trail(o, vec![0.1; n], "IMP")
+        };
+        assert_eq!(trail(29).settling(None), McemSettling::TooShort);
+        assert!(matches!(
+            trail(30).settling(None),
+            McemSettling::Falling { window: 10, .. }
+        ));
+        assert!(matches!(
+            trail(90).settling(None),
+            McemSettling::Falling { window: 30, .. }
+        ));
+        assert!(matches!(
+            trail(150).settling(None),
+            McemSettling::Falling { window: 50, .. }
+        ));
+        // The window stops growing at 50: both of them now sit in the flat last third.
+        assert_eq!(trail(600).settling(None), McemSettling::Settled);
+    }
+
+    /// A non-finite iteration is dropped rather than read as a floor. With too few left
+    /// the run cannot be judged, and a marginal that is not a number convicts nothing:
+    /// `W_NONFINITE_MARGINAL` reports it.
+    #[test]
+    fn settling_survives_non_finite_values() {
+        let mut t = two_windows(120.0, 100.0, 0.1);
+        t.objectives[120] = f64::NEG_INFINITY;
+        t.objectives[121] = f64::NAN;
+        assert!(matches!(
+            t.settling(None),
+            McemSettling::Falling { floor, .. } if floor == 100.0
+        ));
+        let flat = two_windows(100.0, 100.0, 0.1);
+        for marginal in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
+            assert_eq!(flat.settling(exact(marginal)), McemSettling::Settled);
+        }
+        // A marginal whose own SE is unusable cannot convict either, even at a gap of 50.
+        for mc_se in [f64::NAN, f64::INFINITY] {
+            let marginal = Some(FinalMarginal { value: 50.0, mc_se });
+            assert_eq!(flat.settling(marginal), McemSettling::Settled);
+        }
+    }
+
+    /// Each of the four columns the test reads can leave it unable to read a window, and
+    /// that is `Unusable`, not `TooShort`: the run was long enough. `usable` counts the
+    /// worse window, and ten finite values are enough.
+    #[test]
+    fn settling_tells_an_unusable_trace_from_a_short_one() {
+        let columns: [(fn(&mut McemObjectiveTrail) -> &mut Vec<f64>, usize); 4] = [
+            (|t| &mut t.objectives, 50),
+            (|t| &mut t.objectives, 100),
+            (|t| &mut t.mc_se, 50),
+            (|t| &mut t.mc_se, 100),
+        ];
+        for (column, start) in columns {
+            for (poison, expected) in [(f64::NAN, 9), (f64::INFINITY, 9)] {
+                let mut t = two_windows(100.0, 100.0, 0.1);
+                column(&mut t)[start..start + 41].fill(poison);
+                assert_eq!(
+                    t.settling(None),
+                    McemSettling::Unusable {
+                        window: 50,
+                        usable: expected
+                    },
+                    "column at {start}"
+                );
+            }
+            let mut t = two_windows(100.0, 100.0, 0.1);
+            column(&mut t)[start..start + 40].fill(f64::NAN);
+            assert_eq!(t.settling(None), McemSettling::Settled, "column at {start}");
+        }
+    }
+
+    /// The first third is not read, so nothing there can make a trace unusable.
+    #[test]
+    fn settling_ignores_non_finite_values_before_the_windows() {
+        let mut t = two_windows(100.0, 100.0, 0.1);
+        t.objectives[..50].fill(f64::NAN);
+        t.mc_se[..50].fill(f64::NAN);
+        assert_eq!(t.settling(None), McemSettling::Settled);
+    }
+
+    /// Each window's noise is its own median, so one bad iteration's SE cannot excuse a
+    /// falling floor, and iterations before the windows do not count.
+    #[test]
+    fn settling_reads_the_noise_of_each_window_only() {
+        let mut t = two_windows(120.0, 100.0, 0.5);
+        t.mc_se[50..100].fill(0.75);
+        t.mc_se[149] = 1e6;
+        t.mc_se[99] = 1e6;
+        t.mc_se[..50].fill(1e6);
+        assert!(matches!(
+            t.settling(None),
+            McemSettling::Falling { previous_mc_se, mc_se, .. }
+                if previous_mc_se == 0.75 && mc_se == 0.5
+        ));
+    }
+
+    /// The case `imp_auto` makes: the earlier window sampled less, so its floor is the
+    /// noisy one and the last window's SE alone would convict. A gap of 20 clears 4 of
+    /// the last window's SEs (0.4) and not 4 of the earlier window's (6).
+    #[test]
+    fn settling_weighs_the_earlier_windows_noise() {
+        let ramped = |previous_se: f64| {
+            let mut t = two_windows(120.0, 100.0, 0.1);
+            t.mc_se[50..100].fill(previous_se);
+            t
+        };
+        assert_eq!(ramped(6.0).settling(None), McemSettling::Settled);
+        assert!(matches!(
+            ramped(0.1).settling(None),
+            McemSettling::Falling { .. }
+        ));
+        // The SEs combine, so a gap clearing each alone can fall short of both: 4 · 3 = 12
+        // and 4 · 3√2 = 16.97, with no bias between equal SEs.
+        let both = |gap: f64| two_windows(100.0 + gap, 100.0, 3.0).settling(None);
+        assert_eq!(both(16.9), McemSettling::Settled);
+        assert!(matches!(both(17.0), McemSettling::Falling { .. }));
+    }
+
+    /// Fewer samples raise the objective by `se²/4` with no change in the estimates,
+    /// which outruns the noise bound once the SE passes 16: at 20 the excess is 100 and
+    /// the bound 80, so a fall has to pass 180.
+    #[test]
+    fn settling_takes_the_sampling_bias_off_the_fall() {
+        let ramped = |fall: f64| {
+            let mut t = two_windows(100.0 + fall, 100.0, 0.0);
+            t.mc_se[50..100].fill(20.0);
+            t.settling(None)
+        };
+        assert_eq!(ramped(90.0), McemSettling::Settled);
+        assert_eq!(ramped(179.9), McemSettling::Settled);
+        assert!(matches!(ramped(180.1), McemSettling::Falling { .. }));
+    }
+
+    /// `se²/4`, on the earlier window only: a noisier last window is no reason to think
+    /// the earlier one sat high, and must not lift the fall either.
+    #[test]
+    fn sampling_bias_counts_only_against_the_earlier_window() {
+        assert_eq!(sampling_bias_excess(4.0, 0.0), 4.0);
+        assert_eq!(sampling_bias_excess(4.0, 2.0), 3.0);
+        assert_eq!(sampling_bias_excess(2.0, 2.0), 0.0);
+        assert_eq!(sampling_bias_excess(0.0, 4.0), 0.0);
+    }
+
+    /// The final pass draws the configured count while `imp_auto` ramps the iterations,
+    /// so the marginal can be the noisier of the two. The gap here is 20: far past 4 of
+    /// the window's SEs, and within 4 of the marginal's. The SEs combine, so a gap that
+    /// clears each alone (5.0 > 4 · 1) can still fall short of both (4 · √2 = 5.66).
+    #[test]
+    fn a_noisy_marginal_cannot_convict_a_settled_trace() {
+        let flat = |se| two_windows(100.0, 100.0, se);
+        let marginal = |value, mc_se| Some(FinalMarginal { value, mc_se });
+        assert!(matches!(
+            flat(0.1).settling(marginal(80.0, 0.1)),
+            McemSettling::AboveMarginal { .. }
+        ));
+        assert_eq!(
+            flat(0.1).settling(marginal(80.0, 6.0)),
+            McemSettling::Settled
+        );
+        assert_eq!(
+            flat(1.0).settling(marginal(95.0, 1.0)),
+            McemSettling::Settled
+        );
+        assert!(matches!(
+            flat(1.0).settling(marginal(94.0, 1.0)),
+            McemSettling::AboveMarginal { .. }
+        ));
+    }
+
+    /// The marginal's SE judges only the marginal: two floors share no such noise.
+    #[test]
+    fn a_noisy_marginal_does_not_excuse_a_falling_floor() {
+        let noisy = Some(FinalMarginal {
+            value: 100.0,
+            mc_se: 50.0,
+        });
+        assert!(matches!(
+            two_windows(120.0, 100.0, 0.1).settling(noisy),
+            McemSettling::Falling { .. }
+        ));
+    }
+
+    #[test]
+    fn log_marginal_mc_variance_is_gewekes_form_with_a_finite_fallback() {
+        assert_eq!(log_marginal_mc_variance(0.5, 100), 0.01);
+        assert_eq!(log_marginal_mc_variance(1.0, 100), 0.0);
+        assert_eq!(log_marginal_mc_variance(0.0, 100), 1.0);
+    }
+
+    /// Weighted by the squared responsibility, so a subject settled in one class gets
+    /// that class's variance and the other's proposal is irrelevant.
+    #[test]
+    fn a_mixture_subject_pays_for_its_classes_by_responsibility() {
+        let var =
+            |r: &[f64], ess: &[f64]| mixture_log_marginal_mc_variance(r, ess.iter().copied(), 100);
+        assert_eq!(var(&[1.0, 0.0], &[0.5, 0.0]), 0.01);
+        assert_eq!(var(&[0.5, 0.5], &[0.5, 0.5]), 0.005);
+        assert_eq!(var(&[0.5, 0.5], &[0.5, 1.0]), 0.0025);
+    }
+
+    /// Each driver's record has one row per iteration, and cites its own options.
+    #[test]
+    fn each_mcem_driver_publishes_its_trail() {
+        let check = |res: &OuterResult, n: usize, label: &str, prefix: &str| {
+            let t = res.mcem_objective_trail.as_ref().expect("trail published");
+            assert_eq!(t.objectives.len(), n);
+            assert_eq!(t.mc_se.len(), n);
+            assert!(t.objectives.iter().all(|v| v.is_finite()), "{t:?}");
+            assert!(t.mc_se.iter().all(|v| v.is_finite()), "{t:?}");
+            assert!(t.mc_se.iter().any(|&v| v > 0.0), "{t:?}");
+            assert_eq!(t.label, label);
+            assert_eq!(t.iterations_option, format!("{prefix}_iterations"));
+            assert_eq!(t.samples_option, format!("{prefix}_samples"));
+            assert_eq!(t.proposal_option, format!("{prefix}_proposal_df"));
+        };
+        let model = iov_model();
+        let pop = iov_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 3;
+        opts.impmap_samples = 120;
+        opts.impmap_seed = Some(11);
+        opts.imp_iterations = 4;
+        opts.imp_samples = 100;
+        opts.imp_seed = Some(11);
+        opts.run_covariance_step = false;
+        let params = &model.default_params;
+        let impmap = run_impmap(&model, &pop, params, None, &opts).expect("impmap");
+        check(&impmap, 3, "IMPMAP", "impmap");
+        let imp = run_imp(&model, &pop, params, None, &opts).expect("imp");
+        check(&imp, 4, "IMP", "imp");
+
+        let model = mix996_model("TVV");
+        let pop = mix996_pop(3);
+        let params = &model.default_params;
+        let mixture = run_impmap(&model, &pop, params, None, &opts).expect("mixture impmap");
+        check(&mixture, 3, "IMPMAP", "impmap");
+        // The wrapper reaches the mixture too: too short to test, and saying so.
+        let told = |w: &String| w.starts_with("W_MCEM_SETTLING_UNTESTED: IMPMAP: 3 iteration(s)");
+        assert!(mixture.warnings.iter().any(told), "{:?}", mixture.warnings);
+        let marginal =
+            evaluate_final_marginal(&model, &pop, &mixture, &opts, EstimationMethod::Impmap)
+                .expect("mixture marginal");
+        assert!(marginal.minus2_log_likelihood.is_finite());
+        assert_eq!(marginal.n_samples, opts.impmap_samples);
+    }
+
+    /// The baseline `fit()` reads is the lowest iteration row, and not simply the first:
+    /// the premise asserts this fixture's objective falls, or the two would coincide.
+    #[test]
+    fn run_mcem_publishes_the_lowest_iteration_objective() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 4;
+        opts.impmap_samples = 200;
+        opts.impmap_seed = Some(11);
+        opts.impmap_trace = true;
+        opts.run_covariance_step = false;
+        let res = run_impmap(&model, &pop, &model.default_params, None, &opts).expect("impmap");
+        let trace = res.impmap_trace.as_ref().expect("impmap_trace requested");
+        let rows: Vec<f64> = trace
+            .rows
+            .iter()
+            .filter(|r| r.iteration > 0)
+            .map(|r| r.ofv)
+            .collect();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|v| v.is_finite()), "rows {rows:?}");
+        let lowest = rows.iter().copied().fold(f64::INFINITY, f64::min); // nan-ok: asserted finite above
+        assert!(
+            lowest < rows[0],
+            "premise: the objective falls, rows {rows:?}"
+        );
+        assert_eq!(res.mcem_lowest_objective, Some(lowest));
+    }
+
     /// #1303: the MCEM exits apply **two** objective rules, and this pins that
     /// neither is redundant — the trap being that two conditions rejecting the
     /// same inputs cover for each other, so deleting either leaves the suite
@@ -4962,6 +6316,78 @@ mod tests {
         );
     }
 
+    /// Correlation between dimensions `i` and `j` of a covariance matrix.
+    fn corr(c: &DMatrix<f64>, i: usize, j: usize) -> f64 {
+        c[(i, j)] / (c[(i, i)] * c[(j, j)]).sqrt()
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_keeps_a_capped_correlated_covariance_pd() {
+        // #2650. Both variances sit just above Ωii and the correlation is about
+        // −0.98, so capping the diagonal alone gives
+        // 0.034·0.031 − 0.0335² < 0: indefinite, a failed Cholesky, a zero matrix.
+        let cov = DMatrix::from_row_slice(2, 2, &[0.0362, -0.0335, -0.0335, 0.0322]);
+        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[0.034, 0.031]));
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        let capped = h
+            .try_inverse()
+            .expect("capped covariance must stay invertible");
+        assert!((capped[(0, 0)] - 0.034).abs() < 1e-12);
+        assert!((capped[(1, 1)] - 0.031).abs() < 1e-12);
+        assert!(
+            (corr(&capped, 0, 1) - corr(&cov, 0, 1)).abs() < 1e-9,
+            "the cap must keep the correlation: {} vs {}",
+            corr(&capped, 0, 1),
+            corr(&cov, 0, 1)
+        );
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_rescales_only_what_the_cap_touched() {
+        // Dimension 0 is capped, 1 and 2 are not. Every correlation survives, and
+        // the covariance between the two uncapped dimensions is left exactly alone,
+        // so a scale applied to all off-diagonals, or squared, cannot pass.
+        let cov = DMatrix::from_row_slice(3, 3, &[4.0, 0.3, 0.2, 0.3, 0.25, 0.05, 0.2, 0.05, 0.16]);
+        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0, 10.0, 10.0]));
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        let capped = h.try_inverse().expect("must stay invertible");
+        assert!((capped[(0, 0)] - 1.0).abs() < 1e-9);
+        assert!((capped[(1, 2)] - 0.05).abs() < 1e-9);
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            assert!(
+                (corr(&capped, i, j) - corr(&cov, i, j)).abs() < 1e-9,
+                "correlation ({i},{j}) must survive the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_drops_covariances_of_a_non_finite_variance() {
+        // A NaN variance usually arrives with NaN covariances. They must not reach
+        // the Cholesky, or a dimension that could be capped costs the whole matrix.
+        let cov = DMatrix::from_row_slice(2, 2, &[f64::NAN, f64::NAN, f64::NAN, 0.2]);
+        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[0.5, 1.0]));
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        assert!((h[(0, 0)] - 2.0).abs() < 1e-9, "got {}", h[(0, 0)]);
+        assert!((h[(1, 1)] - 5.0).abs() < 1e-9, "got {}", h[(1, 1)]);
+        assert_eq!(h[(0, 1)], 0.0);
+    }
+
+    #[test]
+    fn covariance_to_proposal_hessian_returns_the_prior_precision_when_indefinite() {
+        // An in-bounds but indefinite covariance gets past the cap and fails the
+        // Cholesky. The answer is Ω⁻¹ itself, not a zero matrix for `build_proposal`
+        // to jitter into a proposal of SD 1e5 (#2650).
+        let cov = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+        let omega = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 4.0]);
+        let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        let want = omega.clone().try_inverse().expect("Ω is invertible");
+        assert!(
+            (&h - &want).abs().max() < 1e-12,
+            "got {h}, want Ω⁻¹ = {want}"
+        );
+    }
+
     #[test]
     fn covariance_to_proposal_hessian_caps_exploding_diagonal() {
         // A heavy-tailed-outlier-inflated covariance is capped at Ωii so the
@@ -4974,15 +6400,14 @@ mod tests {
     }
 
     #[test]
-    fn covariance_to_proposal_hessian_falls_back_on_non_pd() {
-        // An indefinite covariance is not Cholesky-invertible → zero matrix,
-        // signalling `build_proposal` to use its Ω fallback.
+    fn covariance_to_proposal_hessian_is_zero_only_when_omega_is_not_pd() {
+        // With no usable covariance and no usable Ω there is nothing left to return.
         let cov = DMatrix::from_row_slice(2, 2, &[1.0, 5.0, 5.0, 1.0]);
-        let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0, 1.0]));
+        let omega = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
         assert!(
             h.iter().all(|&v| v == 0.0),
-            "non-PD covariance must yield the zero fallback"
+            "a non-PD Ω must yield the zero matrix, got {h}"
         );
     }
 
@@ -5061,6 +6486,8 @@ mod tests {
         let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("imp mixture");
         assert!(res.ofv.is_finite());
         assert!(res.mixture_posteriors.is_some());
+        // The mixture loop keeps its own objective, so it records its own baseline (#2652).
+        assert!(res.mcem_lowest_objective.is_some_and(f64::is_finite));
     }
 
     /// Estimating IMP/IMPMAP rejects a mixture with per-class Ω/Σ overrides.
@@ -5472,6 +6899,7 @@ mod tests {
             &model,
             &pop,
             &draws_by_class,
+            &vec![None; pop.subjects.len()],
             &pmix,
             &log_theta,
             &log_sigma,
@@ -5608,7 +7036,7 @@ mod tests {
         let mut scratch = EventPkParams::default();
         let eta = [0.1, -0.05, 0.2];
 
-        let plain = obs_nll_subject_into(
+        let plain = obs_nll_subject_into_with_schedule(
             &model,
             subject,
             theta,
@@ -5616,20 +7044,21 @@ mod tests {
             model.residual_cov_theta(theta),
             &eta,
             &mut scratch,
+            None,
         );
-        let eta_only = draw_obs_nll(&model, subject, theta, sigma, &eta, &mut scratch);
+        let eta_only = draw_obs_nll(&model, subject, theta, sigma, &eta, None, &mut scratch);
         assert_eq!(eta_only, plain, "an η-only sample is scored unchanged");
 
         let mut b = eta.to_vec();
         b.extend([0.0, 0.0]);
-        let at_zero = draw_obs_nll(&model, subject, theta, sigma, &b, &mut scratch);
+        let at_zero = draw_obs_nll(&model, subject, theta, sigma, &b, None, &mut scratch);
         assert!(
             (at_zero - plain).abs() < 1e-9 * plain.abs().max(1.0),
             "κ = 0 must reproduce the η-only NLL: {at_zero} vs {plain}"
         );
 
         b[eta.len() + 1] = 0.5; // κ on the second occasion only
-        let moved = draw_obs_nll(&model, subject, theta, sigma, &b, &mut scratch);
+        let moved = draw_obs_nll(&model, subject, theta, sigma, &b, None, &mut scratch);
         assert!(
             (moved - at_zero).abs() > 1e-3,
             "a non-zero κ must change the score: {moved} vs {at_zero}"
@@ -5664,8 +7093,11 @@ mod tests {
                 })
                 .collect()
         };
-        let live = weighted_mstep_objective(&model, &pop, &draws_with(0.3), theta, sigma);
-        let zero = weighted_mstep_objective(&model, &pop, &draws_with(0.0), theta, sigma);
+        let no_schedules = vec![None; pop.subjects.len()];
+        let live =
+            weighted_mstep_objective(&model, &pop, &draws_with(0.3), &no_schedules, theta, sigma);
+        let zero =
+            weighted_mstep_objective(&model, &pop, &draws_with(0.0), &no_schedules, theta, sigma);
         assert!(
             live.is_finite() && live < 1e19,
             "objective must be real: {live}"
@@ -5801,9 +7233,23 @@ mod tests {
         pop: &Population,
         params: &ModelParameters,
     ) -> ImportanceSamplingResult {
+        // Adapting routes through the E-step's own draw code; this check needs
+        // `subject_is_estimate_joint`, the separate estimator.
+        joint_is_with(model, pop, params, 0, 0.0)
+    }
+
+    fn joint_is_with(
+        model: &CompiledModel,
+        pop: &Population,
+        params: &ModelParameters,
+        passes: usize,
+        alpha: f64,
+    ) -> ImportanceSamplingResult {
         let mut opts = FitOptions::default();
         opts.imp_samples = 2000;
         opts.imp_seed = Some(5);
+        opts.imp_adapt_passes = passes;
+        opts.imp_defensive_alpha = alpha;
         let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
         let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
             model,
@@ -5829,12 +7275,165 @@ mod tests {
         .expect("joint IS on an IOV model")
     }
 
+    /// `run_importance_sampling` at `params` with 2000 samples around the EBEs
+    /// found there, after `tweak` has adjusted the evaluator's options.
+    fn is_at_with(
+        model: &CompiledModel,
+        pop: &Population,
+        params: &ModelParameters,
+        tweak: impl Fn(&mut FitOptions),
+    ) -> ImportanceSamplingResult {
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 2000;
+        opts.imp_seed = Some(5);
+        // The single-proposal evaluator: what the kernels under test run with no
+        // adaptive pilots (#2653) in front of them.
+        opts.imp_adapt_passes = 0;
+        tweak(&mut opts);
+        let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
+        let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
+            model,
+            pop,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            &mu_k,
+            0,
+            11,
+            1,
+        );
+        crate::estimation::importance_sampling::run_importance_sampling(
+            model,
+            pop,
+            params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &opts,
+        )
+        .expect("IS evaluation")
+    }
+
+    /// warfarin_iov with its κ removed: the same data, scored by the η-only
+    /// evaluator kernel.
+    fn eta_only_model() -> CompiledModel {
+        let src = include_str!("../../examples/warfarin_iov.ferx")
+            .replace("  kappa KAPPA_CL ~ 0.01\n", "")
+            .replace(" + KAPPA_CL", "");
+        let model = crate::parser::model_parser::parse_full_model(&src)
+            .expect("parses")
+            .model;
+        assert_eq!(model.n_kappa, 0, "the κ edit must take");
+        model
+    }
+
+    /// `imp_eval_only` with `imp_proposal_df = normal` (parsed to `f64::INFINITY`)
+    /// is a documented setting. The evaluator once carried its own Student-t-only
+    /// sampler, whose density constant at ν = ∞ is `lnΓ(∞) − lnΓ(∞) = NaN`, so the
+    /// readout was not a number. Both kernels are covered — η-only, and the joint
+    /// (η, κ) one an IOV subject takes — each against its own t₅ readout, which
+    /// estimates the same marginal from a different proposal.
+    #[test]
+    fn imp_eval_with_a_normal_proposal_agrees_with_the_student_t_readout() {
+        let pop = iov_pop();
+        for (name, model) in [("eta-only", eta_only_model()), ("iov", iov_model())] {
+            let params = model.default_params.clone();
+            let t5 = is_at_with(&model, &pop, &params, |o| o.imp_proposal_df = 5.0);
+            let mvn = is_at_with(&model, &pop, &params, |o| o.imp_proposal_df = f64::INFINITY);
+            assert!(
+                mvn.minus2_log_likelihood.is_finite() && mvn.mc_standard_error.is_finite(),
+                "{name}: normal-proposal readout {} ± {}",
+                mvn.minus2_log_likelihood,
+                mvn.mc_standard_error
+            );
+            assert!(t5.minus2_log_likelihood.is_finite(), "{name}: t5 readout");
+            let gap = (mvn.minus2_log_likelihood - t5.minus2_log_likelihood).abs();
+            eprintln!(
+                "{name}: normal {} ± {} (ess_min {}), t5 {} ± {}; gap {gap}",
+                mvn.minus2_log_likelihood,
+                mvn.mc_standard_error,
+                mvn.ess_min,
+                t5.minus2_log_likelihood,
+                t5.mc_standard_error
+            );
+            // A ν = ∞ quietly mapped to a finite df would make the "normal" readout
+            // the t₅ one: gap 0, inside the bound. The normal branch draws no χ², so
+            // the two streams always differ.
+            assert_ne!(
+                mvn.minus2_log_likelihood.to_bits(),
+                t5.minus2_log_likelihood.to_bits(),
+                "{name}: the normal readout is the t5 one — ν = ∞ never reached the sampler"
+            );
+            assert!(mvn.ess_min > 0.0, "{name}: ess_min {}", mvn.ess_min);
+            assert!(gap < NORMAL_VS_T5_GAP_BOUND, "{name}: gap {gap}");
+        }
+    }
+
+    /// Normal vs t₅ readouts of one marginal, at warfarin_iov's start values.
+    /// Measured (Linux x86_64, K = 2000): 0.319 (η-only) and 0.495 (IOV), 3–4
+    /// combined MC SEs: at the start values the light-tailed normal proposal
+    /// under-covers the posterior, which biases its readout up and makes its
+    /// ESS-based SE optimistic (at SAEM's estimates the CLI gap is 0.01–0.05). 1.0
+    /// is 2× the worst; the pre-fix normal readout was not finite at all.
+    const NORMAL_VS_T5_GAP_BOUND: f64 = 1.0;
+
+    /// α = 0.2 vs α = 0 on warfarin_iov at the start values. Measured (Linux
+    /// x86_64, K = 2000): 0.059, against MC SEs of 0.10 / 0.13. 0.15 is 2.5× that,
+    /// and still well below a mis-scored mixture (the `assert_ne` alone passes on
+    /// the changed RNG stream, so this bound is what checks the mixture density).
+    const ALPHA_GAP_BOUND: f64 = 0.15;
+
+    /// `imp_defensive_alpha` reaches the joint (η, κ) evaluator. The IOV kernel
+    /// once had its own sampler that took no mixture, so α changed nothing for an
+    /// IOV subject. α > 0 must move the readout (a different proposal) and stay
+    /// within Monte-Carlo error of α = 0 (the same marginal).
+    #[test]
+    fn imp_eval_defensive_mixture_reaches_iov_subjects() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = model.default_params.clone();
+        let plain = is_at_with(&model, &pop, &params, |_| {});
+        let mixed = is_at_with(&model, &pop, &params, |o| o.imp_defensive_alpha = 0.2);
+        let gap = (mixed.minus2_log_likelihood - plain.minus2_log_likelihood).abs();
+        eprintln!(
+            "α=0 {} ± {}, α=0.2 {} ± {}; gap {gap}",
+            plain.minus2_log_likelihood,
+            plain.mc_standard_error,
+            mixed.minus2_log_likelihood,
+            mixed.mc_standard_error
+        );
+        assert_ne!(
+            mixed.minus2_log_likelihood.to_bits(),
+            plain.minus2_log_likelihood.to_bits(),
+            "α = 0.2 left the IOV readout unchanged"
+        );
+        assert!(gap < ALPHA_GAP_BOUND, "gap {gap}");
+    }
+
+    /// The adaptive and the single-proposal evaluation of a joint (η, κ) subject
+    /// draw from different proposals, so their marginals must agree within MC
+    /// error. Since #2627 both share the sampler and the per-draw scorer, so this
+    /// pins the adaptation's wiring, not a second likelihood implementation.
+    #[test]
+    fn adapted_joint_marginal_agrees_with_the_single_proposal_estimator() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = &model.default_params;
+        crate::estimation::importance_sampling::assert_adaptive_evaluation_is_wired(
+            |passes, alpha| joint_is_with(&model, &pop, params, passes, alpha),
+        );
+    }
+
     /// The trace −2LL of an IOV fit is the joint (η, κ) marginal. Iteration 1's
     /// E-step runs at the start values, so its row must agree with
-    /// `run_importance_sampling`, a separate joint estimator
-    /// (`subject_is_estimate_joint`), at the same parameters. Dropping the
-    /// `n_occ · log det Ω_iov` term from `log_det_joint` moves the trace by
-    /// `Σᵢ Kᵢ · |ln det Ω_iov|`, far outside the bound below.
+    /// `run_importance_sampling` at the same parameters. The two share the sampler,
+    /// the per-draw scorer and the joint prior (`JointPriors`), so what this pins
+    /// is the rest of the wiring: each side's own MAP solve, proposal Hessian and
+    /// (E-step) ISCALE search must land on the same marginal. The prior's
+    /// `K · log det Ω_iov` term is pinned directly by
+    /// `joint_priors_match_the_per_subject_construction_for_each_occasion_count`;
+    /// the `m1_shift` check below only confirms the fixture would make it visible.
     #[test]
     fn impmap_iov_trace_ofv_matches_the_joint_is_marginal() {
         let model = iov_model();
@@ -6135,7 +7734,15 @@ mod tests {
         let mut scratch = EventPkParams::default();
         let fresh = |subject: &Subject, b: &[f64], scratch: &mut EventPkParams| {
             let kappas: Vec<Vec<f64>> = b[3..].chunks(1).map(<[f64]>::to_vec).collect();
-            obs_nll_subject_into_iov(&model, subject, theta, sigma, &b[..3], &kappas, scratch)
+            crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov(
+                &model,
+                subject,
+                theta,
+                sigma,
+                &b[..3],
+                &kappas,
+                scratch,
+            )
         };
         // warfarin_iov subjects all have two occasions; a copy with every record
         // on its first occasion has one.
@@ -6164,7 +7771,7 @@ mod tests {
                 (0..widths[n])
                     .map(|g| 0.03 * (g as f64 + 1.0) * if n % 4 < 2 { 1.0 } else { -1.0 }),
             );
-            let got = draw_obs_nll(&model, subject, theta, sigma, &b, &mut scratch);
+            let got = draw_obs_nll(&model, subject, theta, sigma, &b, None, &mut scratch);
             assert!(got.is_finite());
             assert_eq!(
                 got,
@@ -6189,5 +7796,582 @@ mod tests {
         assert_eq!(split_kappas(&[7.0, 8.0], 2, &mut buf), 1);
         assert_eq!(buf[..1], [vec![7.0, 8.0]]);
         assert_eq!(buf.len(), 3, "the wider sample's allocations are kept");
+    }
+
+    // ---- `auto` sample count and wall-clock limit (#2687) ----
+
+    #[test]
+    fn objective_settled_needs_two_full_windows() {
+        let flat = vec![-250.0; 2 * AUTO_SETTLE_WINDOW - 1];
+        assert!(!objective_settled(&flat, 1.0));
+        let flat = vec![-250.0; 2 * AUTO_SETTLE_WINDOW];
+        assert!(objective_settled(&flat, 1.0));
+    }
+
+    #[test]
+    fn objective_settled_compares_the_last_two_windows_to_the_mc_se() {
+        // Thioguanine's iterations 1-10: a descent of hundreds against a total SE
+        // near 2.8 (0.5 per subject, 31 subjects).
+        let cold = [
+            65.7, -86.8, -145.2, -177.6, -212.4, -231.0, -240.0, -245.0, -247.0, -248.4,
+        ];
+        assert!(!objective_settled(&cold, 2.8));
+        // Only the last 2w iterations count: the same descent followed by a plateau.
+        let mut settled = cold.to_vec();
+        settled.extend([-250.3, -250.1, -250.4, -250.2, -250.3]);
+        settled.extend([-250.2, -250.4, -250.1, -250.3, -250.3]);
+        assert!(objective_settled(&settled, 0.33));
+        // The bound on a window-mean step of 1: 2·SE·√(2/5) straddles it at SE ≈ 0.79.
+        let step: Vec<f64> = [[0.0; 5], [1.0; 5]].concat();
+        assert!(!objective_settled(&step, 0.78));
+        assert!(objective_settled(&step, 0.80));
+        // A rise is movement as well.
+        let rise: Vec<f64> = [[1.0; 5], [0.0; 5]].concat();
+        assert!(!objective_settled(&rise, 0.78));
+    }
+
+    #[test]
+    fn objective_settled_reads_a_nan_as_unsettled() {
+        let mut o = vec![1.0; 2 * AUTO_SETTLE_WINDOW];
+        assert!(!objective_settled(&o, f64::NAN));
+        o[9] = f64::NAN;
+        assert!(!objective_settled(&o, 1.0));
+    }
+
+    #[test]
+    fn auto_hold_ends_before_the_averaging_window_within_its_bounds() {
+        assert_eq!(auto_hold_ends(200, 50), 150, "the default: the window");
+        assert_eq!(auto_hold_ends(200, 1), 150, "at most 3/4 of the run");
+        assert_eq!(auto_hold_ends(200, 150), 100, "at least 1/2 of the run");
+        assert_eq!(auto_hold_ends(6, 6), 3);
+        assert_eq!(auto_hold_ends(1, 1), 1);
+    }
+
+    #[test]
+    fn windowed_se_takes_the_median_over_the_window() {
+        // A spike in either direction does not move it.
+        let spike = [
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.5, 1000),
+            (0.05, 1000),
+            (0.001, 1000),
+        ];
+        assert!((windowed_se(&spike, 1000) - 0.05).abs() < 1e-12);
+        // Only the last window counts.
+        let old = [
+            (9.0, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+        ];
+        assert!((windowed_se(&old, 1000) - 0.05).abs() < 1e-12);
+        // A short history still answers, and an empty one reads as no signal.
+        assert!((windowed_se(&[(0.2, 100)], 100) - 0.2).abs() < 1e-12);
+        assert!(windowed_se(&[], 100).is_nan());
+    }
+
+    #[test]
+    fn windowed_se_rescales_across_a_change_of_k() {
+        // The same per-draw variance, sampled at K and then 4K: the SE halves, and
+        // the window reads one value at each count.
+        let h = [
+            (0.2, 1000),
+            (0.2, 1000),
+            (0.1, 4000),
+            (0.1, 4000),
+            (0.1, 4000),
+        ];
+        assert!((windowed_se(&h, 4000) - 0.1).abs() < 1e-12);
+        assert!((windowed_se(&h, 1000) - 0.2).abs() < 1e-12);
+    }
+
+    /// Cefepime's trace at iterations 30-35: neither the one quiet iteration among
+    /// noisy ones nor the one noisy iteration among quiet ones moves K. Read off the
+    /// last iteration's SE, the first would halve K and the second double it.
+    #[test]
+    fn auto_step_does_not_act_on_a_single_iteration() {
+        let flat = vec![4290.0; 10];
+        let k = 4000;
+        let quiet = [(0.04, k), (0.04, k), (0.04, k), (0.04, k), (0.02, k)];
+        assert_eq!(auto_step(&flat, &quiet, 1000, 458, true).0, k);
+        let noisy = [(0.04, k), (0.04, k), (0.04, k), (0.04, k), (0.09, k)];
+        assert_eq!(auto_step(&flat, &noisy, 1000, 458, true).0, k);
+    }
+
+    /// The hold, through the same decision the loop makes: above the target K waits
+    /// for a settled objective or the end of the hold, and takes either.
+    #[test]
+    fn auto_step_raises_once_settled_or_once_the_hold_is_over() {
+        let k = 1000;
+        let se = [(0.1, k); 5];
+        let descending: Vec<f64> = (0..10).map(|i| 1000.0 - 50.0 * i as f64).collect();
+        let settled = vec![500.0; 10];
+        assert_eq!(auto_step(&descending, &se, k, 100, false).0, k);
+        assert_eq!(auto_step(&settled, &se, k, 100, false).0, 2 * k);
+        assert_eq!(auto_step(&descending, &se, k, 100, true).0, 2 * k);
+    }
+
+    /// The settled test reads the total SE, √N times the per-subject one: this step
+    /// of 1 is inside the noise of 100 subjects at 0.1 and outside that of one.
+    #[test]
+    fn auto_step_scales_the_settled_test_by_the_subject_count() {
+        let k = 1000;
+        let se = [(0.1, k); 5];
+        let step: Vec<f64> = [[0.0; 5], [1.0; 5]].concat();
+        assert_eq!(auto_step(&step, &se, k, 100, false).0, 2 * k);
+        assert_eq!(auto_step(&step, &se, k, 1, false).0, k);
+    }
+
+    #[test]
+    fn next_sample_count_raises_only_when_allowed() {
+        assert_eq!(next_sample_count(1000, 1000, 0.5, false), 1000);
+        assert_eq!(next_sample_count(1000, 1000, 0.5, true), 2000);
+    }
+
+    #[test]
+    fn next_sample_count_sizes_the_raise_to_the_se() {
+        // Cefepime's `0.050 > 0.05`: an SE that only just misses the target used
+        // to double K. SE² ∝ 1/K asks for 2 % more, and the headroom adds 10 %.
+        assert_eq!(next_sample_count(4000, 1000, 0.0505, true), 4489);
+        // Doubling and the cap both still bound the step.
+        assert_eq!(next_sample_count(4000, 1000, 0.09, true), 8000);
+        assert_eq!(next_sample_count(8000, 1000, 0.09, true), AUTO_SAMPLES_MAX);
+        assert_eq!(
+            next_sample_count(AUTO_SAMPLES_MAX, 1000, 0.09, true),
+            AUTO_SAMPLES_MAX
+        );
+        // A configured count above the cap is the user's, and `auto` keeps it.
+        assert_eq!(next_sample_count(20_000, 20_000, 0.09, true), 20_000);
+    }
+
+    #[test]
+    fn next_sample_count_lowers_to_no_less_than_the_start() {
+        assert_eq!(next_sample_count(4000, 1000, 0.02, false), 2000);
+        assert_eq!(next_sample_count(1500, 1000, 0.02, true), 1000);
+        assert_eq!(next_sample_count(1000, 1000, 0.02, true), 1000);
+    }
+
+    #[test]
+    fn next_sample_count_holds_between_half_the_target_and_the_target() {
+        for se in [0.5 * AUTO_STDOBJ_TARGET, 0.04, AUTO_STDOBJ_TARGET, f64::NAN] {
+            assert_eq!(next_sample_count(4000, 1000, se, true), 4000, "se = {se}");
+        }
+    }
+
+    #[test]
+    fn under_sampling_advice_names_what_ran_out() {
+        let advice = |auto, k, stopped| {
+            let mut history = at_scale(5.0, 1000, 5);
+            history.extend(at_scale(if stopped { 11.0 } else { 5.0 }, 2000, 5));
+            under_sampling_advice(auto, k, &history, 1000, "imp_samples", "imp_auto")
+        };
+        let at_cap = advice(true, AUTO_SAMPLES_MAX, false);
+        assert!(at_cap.contains("was not enough") && !at_cap.contains("below the cap"));
+        // Reaching the cap is the story even if the last raises were refused.
+        assert_eq!(advice(true, AUTO_SAMPLES_MAX, true), at_cap);
+        let stopped = advice(true, 2000, true);
+        assert!(
+            stopped.contains("stopped raising the sample count at 2000")
+                && stopped.contains("not lowering the MC SE")
+                && stopped.contains("larger `imp_samples` is unlikely to help")
+                && !stopped.contains("more iterations"),
+            "{stopped}"
+        );
+        // The flag only means something under `auto`.
+        assert_eq!(advice(false, 2000, true), advice(false, 2000, false));
+        let short = advice(true, 2000, false);
+        assert!(
+            short.contains("ended at 2000 samples")
+                && short.contains("`imp_samples`")
+                && short.contains("more iterations")
+                && !short.contains("was not enough"),
+            "{short}"
+        );
+        let fixed = advice(false, 2000, false);
+        assert!(fixed.contains("`imp_auto = true`") && !fixed.contains("is enabled"));
+    }
+
+    /// `n` iterations at `k` with a constant `SE²·K` of `scale`.
+    fn at_scale(scale: f64, k: usize, n: usize) -> Vec<(f64, usize)> {
+        vec![((scale / k as f64).sqrt(), k); n]
+    }
+
+    #[test]
+    fn raises_pay_while_the_scale_stays_under_the_limit() {
+        // No raise yet: nothing to compare against, whatever the SE.
+        assert!(raises_pay(&at_scale(50.0, 1000, 5), 1000));
+        let mut h = at_scale(5.0, 1000, 5);
+        // SE² ∝ 1/K holds: the SE fell with the raise.
+        h.extend(at_scale(5.0, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+        h.extend(at_scale(9.9, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+        h.extend(at_scale(10.1, 2000, 5));
+        assert!(!raises_pay(&h, 1000));
+    }
+
+    #[test]
+    fn raises_pay_measures_from_the_first_raise_and_keeps_that_baseline() {
+        // Scale 5 before the first raise, 8 after, then K back at the start. The
+        // baseline stays 5, so 11 is over the limit, and against the 8 of the second
+        // visit to K = 2000 it would not be.
+        let mut h = at_scale(5.0, 1000, 5);
+        h.extend(at_scale(8.0, 2000, 5));
+        h.extend(at_scale(8.0, 1000, 5));
+        h.extend(at_scale(8.0, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+        h.extend(at_scale(11.0, 2000, 5));
+        assert!(!raises_pay(&h, 1000));
+        // The product falling back reopens raising.
+        h.extend(at_scale(6.0, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+    }
+
+    #[test]
+    fn raises_pay_baseline_is_a_window_not_the_last_iteration() {
+        // The last iteration before the raise spiked to 100; the window median is 5.
+        let mut h = at_scale(5.0, 1000, 4);
+        h.extend(at_scale(100.0, 1000, 1));
+        h.extend(at_scale(11.0, 2000, 5));
+        assert!(!raises_pay(&h, 1000));
+    }
+
+    #[test]
+    fn auto_step_stops_raising_when_the_se_does_not_fall_with_k() {
+        // The cefepime shape: SE 0.071 at K = 1000 and still 0.072 at K = 2000.
+        let flat = vec![4276.0; 20];
+        let mut h = vec![(0.071, 1000); 5];
+        h.extend(vec![(0.072, 2000); 5]);
+        assert_eq!(auto_step(&flat, &h, 1000, 458, true).0, 2000);
+        // The twin whose SE did fall with K, still over target, keeps ramping.
+        let mut paying = vec![(0.071, 1000); 5];
+        paying.extend(vec![(0.0515, 2000); 5]);
+        assert!(auto_step(&flat, &paying, 1000, 458, true).0 > 2000);
+    }
+
+    #[test]
+    fn auto_step_still_lowers_after_raises_stopped() {
+        let flat = vec![4276.0; 20];
+        // Scale 1.25 at K = 500, then 4.84 at the cap: raises stopped, SE under half
+        // the target.
+        let mut h = vec![(0.05, 500); 5];
+        h.extend(vec![(0.022, AUTO_SAMPLES_MAX); 5]);
+        assert!(!raises_pay(&h, 500));
+        assert_eq!(auto_step(&flat, &h, 500, 458, true).0, AUTO_SAMPLES_MAX / 2);
+    }
+
+    /// `WT` changes within each subject, so scoring takes the event-driven walk,
+    /// and σ is free, so the weighted M-step runs.
+    fn tv_fixture() -> (CompiledModel, Population) {
+        use std::io::Write;
+        let model = crate::parser::model_parser::parse_full_model(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma EPS ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * (WT / 70.0)^0.75 * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+        )
+        .expect("model parses")
+        .model;
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,WT\n");
+        for id in 1..=6 {
+            let cl = 0.8 + 0.1 * id as f64;
+            csv.push_str(&format!("{id},0,0,100,1,1,60\n"));
+            for (j, t) in [0.5_f64, 1.0, 2.0, 4.0, 8.0].iter().enumerate() {
+                let dv = 10.0 * (-(cl / 10.0) * t).exp() * (1.0 + 0.03 * ((id + j) as f64).sin());
+                csv.push_str(&format!("{id},{t},{dv:.5},0,0,1,{}\n", 60 + 5 * j));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(f.path(), Some(&["WT"]), None).unwrap();
+        (model, pop)
+    }
+
+    fn tv_imp_options(iterations: usize) -> FitOptions {
+        FitOptions {
+            method: EstimationMethod::Imp,
+            imp_iterations: iterations,
+            imp_samples: 30,
+            imp_averaging: 1,
+            imp_auto: false,
+            imp_seed: Some(2687),
+            run_covariance_step: false,
+            ..FitOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_cached_schedule_scores_a_draw_as_the_rebuilt_one_does() {
+        let (model, pop) = tv_fixture();
+        let schedules = mcem_schedule_cache(&model, &pop, &vec![0; pop.subjects.len()]);
+        assert!(schedules.iter().all(Option::is_some), "premise: cacheable");
+        let theta = &model.default_params.theta;
+        let sigma = &model.default_params.sigma.values;
+        let mut scratch = EventPkParams::default();
+        for (subject, schedule) in pop.subjects.iter().zip(&schedules) {
+            let eta = [0.2, -0.1];
+            let cached = draw_obs_nll(
+                &model,
+                subject,
+                theta,
+                sigma,
+                &eta,
+                schedule.as_ref(),
+                &mut scratch,
+            );
+            let rebuilt = draw_obs_nll(&model, subject, theta, sigma, &eta, None, &mut scratch);
+            assert!(cached.is_finite());
+            assert_eq!(cached.to_bits(), rebuilt.to_bits());
+        }
+    }
+
+    #[test]
+    fn mcem_schedule_cache_uses_the_iov_gate_for_a_subject_with_occasions() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let n = pop.subjects.len();
+        assert!(
+            pop.subjects.iter().all(|s| !s.has_tv_covariates()),
+            "premise: nothing but the IOV gate admits these subjects"
+        );
+        let with_occasions = mcem_schedule_cache(&model, &pop, &vec![2; n]);
+        assert!(with_occasions.iter().all(Option::is_some));
+        let without = mcem_schedule_cache(&model, &pop, &vec![0; n]);
+        assert!(without.iter().all(Option::is_none));
+    }
+
+    /// The E-step pilot, the E-step draws and the M-step all run every iteration,
+    /// so a rebuild in any of them makes the count grow with `imp_iterations`.
+    /// Equality of the fits cannot see that (#1452).
+    #[test]
+    fn imp_schedule_builds_do_not_grow_with_iterations() {
+        use crate::pk::event_driven::{reset_schedule_build_count, schedule_build_count};
+        let (model, pop) = tv_fixture();
+        let count = |iterations: usize| -> u64 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                reset_schedule_build_count();
+                let opts = tv_imp_options(iterations);
+                run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
+                schedule_build_count()
+            })
+        };
+        let (short, long) = (count(2), count(6));
+        assert!(
+            long - short < pop.subjects.len() as u64,
+            "schedule builds grew from {short} to {long} over 4 extra iterations"
+        );
+    }
+
+    /// The same cold start with the hold in force: 12 iterations from K = 8, with
+    /// the hold ending at iteration 9, leave room for three raises. Raising from
+    /// iteration 1 would reach the cap of 10000.
+    #[test]
+    fn imp_auto_holds_a_cold_start_and_raises_when_the_hold_ends() {
+        let (model, pop) = tv_fixture();
+        let opts = FitOptions {
+            imp_iterations: 12,
+            imp_averaging: 3,
+            imp_samples: 8,
+            imp_auto: true,
+            ..tv_imp_options(12)
+        };
+        let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
+        let warning = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("give a noisy objective"))
+            .unwrap_or_else(|| panic!("no under-sampling warning: {:?}", res.warnings));
+        let k: usize = warning
+            .strip_prefix("IMP: ")
+            .and_then(|w| w.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no K in {warning}"));
+        assert!(k > 8 && k <= 64, "final K = {k}");
+        assert!(warning.contains("below the cap"), "{warning}");
+    }
+
+    #[test]
+    fn imp_max_time_stops_cleanly_and_reports_not_converged() {
+        let (model, pop) = tv_fixture();
+        let opts = FitOptions {
+            imp_max_time: Some(1e-9),
+            ..tv_imp_options(5)
+        };
+        let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
+        assert_eq!(res.n_iterations, 1);
+        assert!(!res.converged);
+        assert!(res.ofv.is_finite());
+        let warning = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("stopped by `imp_max_time`"))
+            .unwrap_or_else(|| panic!("no stop warning: {:?}", res.warnings));
+        assert!(warning.contains("at iteration 1 of 5"), "{warning}");
+        assert!(warning.contains("unaveraged"), "{warning}");
+        assert!(warning.contains("reported as not converged"), "{warning}");
+        // Its stop was the clock, so the settling verdict has nothing to say about it.
+        assert!(res.mcem_objective_trail.is_none());
+
+        let classified = crate::types::classify_warning(warning);
+        assert_eq!(classified.severity, WarningSeverity::Warning);
+        assert_eq!(classified.category, WarningCode::Convergence);
+    }
+
+    /// What the user reads: the published verdict of a stopped fit, on its own and
+    /// as the last stage of a chain, whose FOCEI stage the limit must not touch.
+    #[test]
+    fn a_fit_stopped_by_imp_max_time_publishes_not_converged() {
+        let (model, pop) = tv_fixture();
+        for methods in [vec![], vec![EstimationMethod::FoceI, EstimationMethod::Imp]] {
+            let opts = FitOptions {
+                methods: methods.clone(),
+                imp_max_time: Some(1e-9),
+                ..tv_imp_options(5)
+            };
+            let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit Ok");
+            assert!(!res.converged, "{methods:?}");
+            assert!(res.ofv.is_finite(), "{methods:?}");
+            assert!(
+                res.warnings
+                    .iter()
+                    .any(|w| w.contains("stopped by `imp_max_time`")),
+                "{methods:?}: {:?}",
+                res.warnings
+            );
+            // One iteration is under the 30 the settling test needs, but the clock
+            // stopped the run: raising `imp_iterations` is not the advice it needs.
+            assert!(
+                !res.warnings.iter().any(|w| w.contains("W_MCEM_")),
+                "{methods:?}: {:?}",
+                res.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn imp_max_time_reports_the_averaged_estimate_inside_the_window() {
+        let (model, pop) = tv_fixture();
+        let opts = FitOptions {
+            imp_max_time: Some(1e-9),
+            imp_averaging: 3,
+            ..tv_imp_options(3)
+        };
+        let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
+        assert!(
+            res.warnings.iter().any(|w| w
+                .contains("the mean of the 1 averaging iteration(s) reached")
+                && !w.contains("unaveraged")),
+            "{:?}",
+            res.warnings
+        );
+    }
+
+    /// The other side of the gate: a limit that does not bind leaves the schedule
+    /// and the verdict alone, and one that binds on the last iteration stopped
+    /// nothing.
+    #[test]
+    fn imp_max_time_that_stops_nothing_changes_nothing() {
+        let (model, pop) = tv_fixture();
+        let plain = run_imp(
+            &model,
+            &pop,
+            &model.default_params,
+            None,
+            &tv_imp_options(3),
+        )
+        .expect("IMP Ok");
+        let roomy = FitOptions {
+            imp_max_time: Some(1e9),
+            ..tv_imp_options(3)
+        };
+        let roomy = run_imp(&model, &pop, &model.default_params, None, &roomy).expect("IMP Ok");
+        assert_eq!(roomy.n_iterations, 3);
+        assert!(roomy.converged && plain.converged);
+        assert_eq!(roomy.ofv.to_bits(), plain.ofv.to_bits());
+
+        let last = FitOptions {
+            imp_max_time: Some(1e-9),
+            ..tv_imp_options(1)
+        };
+        let last = run_imp(&model, &pop, &model.default_params, None, &last).expect("IMP Ok");
+        assert!(last.converged, "{:?}", last.warnings);
+        assert!(!last.warnings.iter().any(|w| w.contains("_max_time")));
+    }
+
+    #[test]
+    fn impmap_max_time_is_its_own_key() {
+        let (model, pop) = tv_fixture();
+        let opts = FitOptions {
+            method: EstimationMethod::Impmap,
+            impmap_iterations: 4,
+            impmap_samples: 30,
+            impmap_auto: false,
+            impmap_max_time: Some(1e-9),
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let res = run_impmap(&model, &pop, &model.default_params, None, &opts).expect("Ok");
+        assert_eq!(res.n_iterations, 1);
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("IMPMAP: stopped by `impmap_max_time`")));
+    }
+
+    #[test]
+    fn imp_max_time_stops_a_mixture_fit() {
+        let model = mix996_model("TVV * exp(ETA_V)");
+        let pop = mix996_pop(3);
+        let opts = FitOptions {
+            imp_max_time: Some(1e-9),
+            ..tv_imp_options(4)
+        };
+        let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
+        assert_eq!(res.n_iterations, 1);
+        assert!(!res.converged);
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("stopped by `imp_max_time`")),
+            "{:?}",
+            res.warnings
+        );
+        assert!(res.mcem_objective_trail.is_none());
+    }
+
+    #[test]
+    fn a_max_time_that_cannot_trip_is_refused() {
+        let (model, pop) = tv_fixture();
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let opts = FitOptions {
+                imp_max_time: Some(bad),
+                ..tv_imp_options(2)
+            };
+            let err = run_imp(&model, &pop, &model.default_params, None, &opts)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must be refused"));
+            assert!(err.contains("`imp_max_time`"), "{err}");
+        }
     }
 }

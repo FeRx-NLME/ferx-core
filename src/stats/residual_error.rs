@@ -2578,6 +2578,10 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
 /// the model fitted**, `w = L⁻¹ D · iwres` with `R = L Lᵀ` the subject's `R` at the
 /// individual predictions and `D = diag(√R_jj)` (so `D · iwres = y − f`).
 ///
+/// With `iiv_on_ruv` this `R` is the η = 0 one and `D · iwres` is `(y − f)/s`, since
+/// IWRES already divides by the subject's `s = exp(η̂_ruv)`. That is the same `w`:
+/// the subject's `R` is `s²·R₀`, so its factor is `s·L₀` (#2656).
+///
 /// Under the model `w` is independent standard normal, so the statistic asks what
 /// it asks of an independent-residual model — is there dependence the model does
 /// *not* explain? On raw IWRES it would report the correlation the line was written
@@ -4274,7 +4278,6 @@ mod tests {
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
-            #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
             #[cfg(feature = "survival")]
             tte_rows: Vec::new(),

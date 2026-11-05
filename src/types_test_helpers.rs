@@ -358,6 +358,9 @@ pub(crate) fn empty_fit_result() -> FitResult {
         nlopt_missing_algorithms: Vec::new(),
         covariance_n_evals_estimated: None,
         trace_path: None,
+        trace_csv: None,
+        cov_fixed: Vec::new(),
+        interface_extras: None,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
@@ -509,6 +512,9 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         nlopt_missing_algorithms: vec![],
         covariance_n_evals_estimated: None,
         trace_path: None,
+        trace_csv: None,
+        cov_fixed: Vec::new(),
+        interface_extras: None,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
@@ -618,7 +624,6 @@ pub(crate) fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResu
         extra_columns: vec![],
         per_obs_tad: vec![],
         compartment_states: vec![],
-        #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
         #[cfg(feature = "survival")]
         tte_rows: Vec::new(),

@@ -70,8 +70,10 @@ fn platelet_example_parses_and_pins_the_ladder() {
         .as_ref()
         .expect("[adaptive_dosing] block present");
     assert_eq!(
-        spec.levels.as_deref(),
-        Some(&[25.0, 50.0, 75.0, 100.0][..]),
+        spec.levels
+            .as_ref()
+            .map(|l| l.iter().map(|v| v.as_literal()).collect::<Vec<_>>()),
+        Some(vec![Some(25.0), Some(50.0), Some(75.0), Some(100.0)]),
         "strictly-increasing discrete ladder"
     );
     assert_eq!(spec.start_dose, 100.0, "starts at the top rung");

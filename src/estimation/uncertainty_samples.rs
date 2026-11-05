@@ -64,9 +64,9 @@ pub enum UncertaintyMethod {
 /// estimated, and its fitted value is read from [`FitResult::mixture_overrides`]
 /// (#1765), which every `fit()` of such a model records — SAEM included — and a `.fitrx`
 /// bundle [`save_fit`](crate::io::fitrx::save_fit) wrote from one carries on reload. A fit
-/// without it (built in R, or a bundle saved before #1765) falls back to the override
-/// segment of [`FitResult::packed_estimate`], which a packed-space fit (FOCE / FOCEI /
-/// Laplace / Gauss-Newton) carries in memory and in a bundle saved since #1815. That
+/// without it (built in R) falls back to the override segment of
+/// [`FitResult::packed_estimate`], which a packed-space fit (FOCE / FOCEI / Laplace /
+/// Gauss-Newton) carries in memory and in a bundle. That
 /// vector is read only when it unpacks bit-for-bit to the fit's reported θ / Ω / σ /
 /// Ω_IOV / ρ.
 ///
@@ -79,9 +79,7 @@ pub enum UncertaintyMethod {
 ///
 /// For a `[mixture]` model with at least one override: `E_FIT_INPUT_MODEL` when
 /// `mixture_overrides` does not hold one non-negative finite value per declared override.
-/// When it is `None`, `E_FIT_INPUT_MISSING` if `packed_estimate` is `None` too (a
-/// `.fitrx` bundle saved before #1765 / #1815, or written by ferx-r before
-/// FeRx-NLME/ferx-r#655), and
+/// When it is `None`, `E_FIT_INPUT_MISSING` if `packed_estimate` is `None` too, and
 /// `E_FIT_INPUT_MODEL` if it does not have this model's packed length (a different
 /// model) or no longer unpacks to the fit's reported estimates (they were edited after
 /// the fit, or the model's layout differs).
@@ -163,8 +161,7 @@ pub(crate) enum PackedEstimate<'a> {
     /// Ω_IOV, ρ and recorded `[mixture]` override values: the optimizer's own point,
     /// safe to reuse as the centre.
     Usable(&'a [f64]),
-    /// The fit carries none (SAEM / IMP / Bayes, a fit built in R, a `.fitrx`
-    /// bundle saved before #1815 or written by ferx-r).
+    /// The fit carries none (SAEM / IMP / Bayes, a fit built in R).
     Absent,
     /// Has this many coordinates, which is not this model's packed length.
     WrongLength(usize),
@@ -349,9 +346,7 @@ fn fitted_mixture_values(
                 "this [mixture] fit estimates the per-class override(s) {}, and the fit \
                  records neither their fitted values (mixture_overrides) nor a packed \
                  estimate holding them. A fit() result records them, and so does a .fitrx \
-                 bundle save_fit wrote from one; a .fitrx bundle saved before #1765 from an \
-                 SAEM fit or before #1815 from any other method, or written by ferx-r before \
-                 FeRx-NLME/ferx-r#655, lacks them.",
+                 bundle save_fit wrote from one.",
                 names.join(", ")
             )))
         }
@@ -1021,6 +1016,9 @@ mod tests {
             nlopt_missing_algorithms: vec![],
             covariance_n_evals_estimated: None,
             trace_path: None,
+            trace_csv: None,
+            cov_fixed: Vec::new(),
+            interface_extras: None,
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,

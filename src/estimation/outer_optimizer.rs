@@ -13,6 +13,7 @@ use nalgebra::{DMatrix, DVector};
 #[cfg(test)]
 use nalgebra::SymmetricEigen;
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -146,6 +147,14 @@ pub struct OuterResult {
     /// whichever run it reports, so a restart that lands above the user's start cannot pass
     /// by comparing against its own.
     pub(crate) start_eval: Option<StartEval>,
+    /// The lowest −2 log L an IMP / IMPMAP iteration reached; `None` for every other
+    /// estimator, and when no iteration was finite. `fit()` compares the final marginal
+    /// against it (`crate::api::postfit::mcem_marginal_warning`, #2652).
+    pub(crate) mcem_lowest_objective: Option<f64>,
+    /// The per-iteration objectives of an IMP / IMPMAP run; `None` for every other
+    /// estimator, and for a run its wall-clock limit stopped. `fit()` tests them for settling
+    /// (`crate::api::postfit::mcem_settling_warning`, #2686).
+    pub(crate) mcem_objective_trail: Option<crate::estimation::impmap::McemObjectiveTrail>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1208,6 +1217,8 @@ fn evaluate_at_initial_params(
         mixture_posteriors,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: None,
+        mcem_objective_trail: None,
         params,
         ofv,
         converged: false,
@@ -1462,6 +1473,32 @@ pub(crate) fn pop_nll(
     kappas: &[Vec<DVector<f64>>],
     interaction: bool,
 ) -> f64 {
+    // Preserve the existing subject-index summation order, including at width 1.
+    subject_nlls(
+        model,
+        population,
+        params,
+        eta_hats,
+        h_matrices,
+        kappas,
+        interaction,
+    )
+    .iter()
+    .sum()
+}
+
+/// Each subject's term of [`pop_nll`], in subject order. Because the population objective
+/// is exactly their sum, a subject's EBEs can be chosen without reference to anyone
+/// else's, which is what [`lowest_per_subject`] relies on.
+fn subject_nlls(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    interaction: bool,
+) -> Vec<f64> {
     let eval = |(i, subject): (usize, &Subject)| {
         subject_nll(
             model,
@@ -1473,19 +1510,16 @@ pub(crate) fn pop_nll(
             interaction,
         )
     };
-    let per_subject: Vec<f64> =
-        if crate::api::parallelize_cheap_subject_pass(population.subjects.len()) {
-            population
-                .subjects
-                .par_iter()
-                .enumerate()
-                .map(eval)
-                .collect()
-        } else {
-            population.subjects.iter().enumerate().map(eval).collect()
-        };
-    // Preserve the existing subject-index summation order, including at width 1.
-    per_subject.iter().sum()
+    if crate::api::parallelize_cheap_subject_pass(population.subjects.len()) {
+        population
+            .subjects
+            .par_iter()
+            .enumerate()
+            .map(eval)
+            .collect()
+    } else {
+        population.subjects.iter().enumerate().map(eval).collect()
+    }
 }
 
 /// Shared subject dispatch for separate and fused population evaluations, and the
@@ -1943,6 +1977,101 @@ pub(crate) fn ebe_guard_rejects(
 /// backtrack to a feasible step. `BASE` is a wall far above any feasible OFV yet low enough
 /// that the quadratic term stays f64-resolvable (the old `1e20` swamped it). Only the
 /// gradient optimizers need this; derivative-free BOBYQA keeps the flat `1e20` wall.
+/// Whether an outer run's **first** evaluation, rejected by the EBE guard, is solved again
+/// warm from the EBEs it just found before it is judged (#2682).
+///
+/// The guard rejects a *step*: too many unconverged inner loops make the objective there
+/// untrustworthy, so the optimizer backs away to its incumbent. At the start there is no
+/// incumbent, and [`adopt_warm_start`] keeps the warm-start cache at zero until there is
+/// one (#1290) — so a start whose cold inner solve leaves more than `max_unconverged_frac`
+/// of the subjects unconverged is re-solved cold at every later trial too, each is
+/// rejected the same way, and the optimizer walks the centre-push gradient toward the box
+/// midpoint. Reported on an 8-state ODE with 5,112 subjects: eval 1 printed the guard
+/// penalty `1000000050451.003662`, no later evaluation was feasible, and the run hit a 2 h
+/// cap; at `max_unconverged_frac = 1.0` the same start scored −5732.82 and the fit moved
+/// on at once. A second inner pass from the first one's EBEs gives the unconverged
+/// subjects the budget a warm start would have, at the one point where no warm start
+/// exists.
+///
+/// The profiled loop (`profile::optimize_profiled`) applies the same rule to its first
+/// profile solve, re-solving from `ProfileWarm::from_solve`.
+///
+/// Only the fraction trigger qualifies. A hard start rejection holds a placeholder
+/// `(η, H)` that is no warm start, and a non-finite objective is not something more inner
+/// iterations repair.
+pub(crate) fn wants_start_warm_rescore(
+    stats: &InnerLoopStats,
+    n_subj: usize,
+    raw_ofv: f64,
+    max_unconverged_frac: f64,
+) -> bool {
+    stats.n_start_rejected == 0 && ebe_guard_rejects(stats, n_subj, raw_ofv, max_unconverged_frac)
+}
+
+/// One evaluation's inner solve as the objective closure consumes it: EBEs, inner
+/// Hessians, inner-loop statistics, κ̂, the objective, and AGQ's population evaluation.
+type StartSolve = (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+    f64,
+    Option<crate::estimation::agq::PopulationEvaluation>,
+);
+
+/// Whether [`wants_start_warm_rescore`]'s warm re-solve replaces the cold solve it was run
+/// from: the guard accepts it **and** its objective is finite.
+///
+/// The second half is not implied by the first. [`ebe_guard_rejects`] answers `false` for a
+/// non-finite objective — the fraction trigger only judges a finite one — so on the guard
+/// alone a re-solve that returned `NaN` or `∞` would replace a finite, fraction-rejected
+/// cold solve and be published as an unguarded start, which `above_start_warning` then
+/// skips (#2682 review r3). Kept, the cold solve stays the evaluation, rejected as before.
+pub(crate) fn warm_rescore_accepted(
+    stats: &InnerLoopStats,
+    n_subj: usize,
+    raw_ofv: f64,
+    max_unconverged_frac: f64,
+) -> bool {
+    raw_ofv.is_finite() && !ebe_guard_rejects(stats, n_subj, raw_ofv, max_unconverged_frac)
+}
+
+/// The verbose line for an evaluation the optimizer was handed a penalty for instead of
+/// its objective (#2682): which trigger rejected it, with the count behind it.
+fn guarded_eval_line(
+    stats: &InnerLoopStats,
+    n_subj: usize,
+    raw_ofv: f64,
+    max_unconverged_frac: f64,
+) -> String {
+    if !raw_ofv.is_finite() {
+        format!("rejected, the objective is not finite ({raw_ofv})")
+    } else if stats.n_start_rejected > 0 {
+        format!(
+            "rejected by the EBE convergence guard, {} of {} subjects rejected at their inner \
+             start",
+            stats.n_start_rejected, n_subj,
+        )
+    } else {
+        format!(
+            "rejected by the EBE convergence guard, {} of {} subjects' inner loops did not \
+             converge, against `max_unconverged_frac` = {max_unconverged_frac} (OFV there \
+             {raw_ofv:.6})",
+            stats.n_unconverged, n_subj,
+        )
+    }
+}
+
+/// A first evaluation's cold inner solve, held while [`wants_start_warm_rescore`]'s warm
+/// re-solve runs, with what that re-solve overwrites.
+struct ColdStart {
+    solved: StartSolve,
+    cached_etas: Vec<DVector<f64>>,
+    contribs: Vec<f64>,
+    mixeval: Option<crate::estimation::mixture::MixtureEval>,
+    mixmodes: Option<crate::estimation::mixture::MixtureClassModes>,
+}
+
 /// The floor of [`guard_penalty_value`] — the wall a guard-rejected gradient evaluation
 /// returns before the quadratic term is added, so every value that function can produce is
 /// `>= GUARD_PENALTY_BASE`.
@@ -3022,6 +3151,10 @@ pub(crate) struct StartEval {
     /// Set when the run's own start scored `∞` and this is that start re-scored at a larger
     /// inner budget (#2619, `floor_escape::escape_floor`); `None` for a start scored first time.
     pub rescored: Option<StartRescore>,
+    /// Set when the guard rejected the start's cold inner solve and the warm re-solve from
+    /// its own EBEs was accepted instead (#2682): the subjects unconverged cold. The other
+    /// fields then describe the warm re-solve.
+    pub warm_rescored_from: Option<usize>,
 }
 
 /// The inner budgets of a re-scored start (#2619): the run's own, at which the starting
@@ -3227,8 +3360,13 @@ impl ColdSolveVerdict {
     }
 }
 
-/// Compare a cold re-solve against `reference_ofv` on the same relative scale as the
-/// plateau self-consistency check, so "materially worse" means one thing in this file.
+/// Compare a cold re-solve against `reference_ofv` on [`BASIN_SHIFT_ABS_TOL`], the bound
+/// the opposite direction uses, so a gap means the same thing either way round.
+///
+/// Absolute, for the reason that constant gives. This rule used to be the plateau check's
+/// relative `1e-3·(1 + |OFV|)`, which is 4.3 units at OFV 4,310 and 186 at OFV 186,000: on
+/// #2646's benchmarks a cold solve 2.3 and 0.37 above best-seen counted as a reproduction,
+/// so the optimizer's better EBEs were thrown away with no warning.
 ///
 /// Two callers, one rule. Against `best_seen_ofv` it is the *trigger*: only a cold solve
 /// that failed to reproduce the objective the optimizer measured is worth scoring the
@@ -3239,7 +3377,7 @@ fn cold_solve_verdict(cold_ofv: f64, reference_ofv: f64) -> ColdSolveVerdict {
         return ColdSolveVerdict::NonFinite;
     }
     let gap = cold_ofv - reference_ofv;
-    if gap > PLATEAU_CONSISTENCY_REL_TOL * (1.0 + reference_ofv.abs()) {
+    if gap > BASIN_SHIFT_ABS_TOL {
         ColdSolveVerdict::Worse(gap)
     } else {
         ColdSolveVerdict::Reproduces
@@ -3255,20 +3393,33 @@ fn cold_solve_verdict(cold_ofv: f64, reference_ofv: f64) -> ColdSolveVerdict {
 /// — the regression fixture for this very code path is the second kind. Naming both, in
 /// that order, is what keeps the warning a report of what was measured rather than a
 /// claim about the model.
-fn ebe_start_dependence_warning(cold_ofv: f64, reported_ofv: f64) -> Option<String> {
+///
+/// `ids` are the subjects a cold start missed by themselves (see [`subjects_cold_lost`]),
+/// largest gap first. It is empty when the gap is diffuse or cannot be split by subject
+/// (AGQ), and the message then names nobody.
+fn ebe_start_dependence_warning(
+    cold_ofv: f64,
+    reported_ofv: f64,
+    ids: &[String],
+) -> Option<String> {
     match cold_solve_verdict(cold_ofv, reported_ofv) {
         ColdSolveVerdict::Reproduces => None,
         ColdSolveVerdict::Worse(gap) => Some(format!(
             "W_EBE_START_DEPENDENT: empirical Bayes estimates at the final parameters \
              depend on the inner loop's starting point — re-solving them cold scores \
              {gap:.4} OFV units worse than the EBEs the optimizer minimised against \
-             ({cold_ofv:.4} vs the reported {reported_ofv:.4}). The reported fit uses the \
-             best of the candidates. Either the individual objective has more than one \
+             ({cold_ofv:.4} vs the reported {reported_ofv:.4}){named}. The reported fit \
+             keeps the lowest-scoring candidate, subject by subject. Either the individual objective has more than one \
              mode at these estimates, or the inner loop cannot reach it from a cold start \
              within `inner_maxiter`; in both cases the EBEs — and the diagnostics built on \
              them (IPRED, IWRES, CWRES, shrinkage) and the covariance step — depend on \
              where the inner loop starts. Raising `inner_maxiter`, or `inner_restarts` for \
-             a suspected second mode, tells the two apart."
+             a suspected second mode, tells the two apart.",
+            named = if ids.is_empty() {
+                String::new()
+            } else {
+                format!(", on {}", counted_subjects(ids))
+            },
         )),
         ColdSolveVerdict::NonFinite => Some(format!(
             "W_EBE_START_DEPENDENT: re-solving the empirical Bayes estimates cold at the \
@@ -3283,8 +3434,24 @@ fn ebe_start_dependence_warning(cold_ofv: f64, reported_ofv: f64) -> Option<Stri
     }
 }
 
-/// How many subject IDs [`ebe_screen_moved_warning`] lists before it counts the rest.
-const SCREEN_MOVED_ID_LIST_CAP: usize = 10;
+/// How many subject IDs a warning lists before it counts the rest.
+const WARNING_ID_LIST_CAP: usize = 10;
+
+/// `ids` for a warning: "1 subject (A)", or "12 subjects (A, B, … and 2 more)".
+fn counted_subjects(ids: &[String]) -> String {
+    let n = ids.len();
+    let listed = ids[..n.min(WARNING_ID_LIST_CAP)].join(", ");
+    let list = if n > WARNING_ID_LIST_CAP {
+        format!("{listed} and {} more", n - WARNING_ID_LIST_CAP)
+    } else {
+        listed
+    };
+    if n == 1 {
+        format!("1 subject ({list})")
+    } else {
+        format!("{n} subjects ({list})")
+    }
+}
 
 /// The user-facing message for subjects whose EBE the cold final re-solve's Sobol screen
 /// (#2013) or flip-flop twin seed (#2095) moved, or `None` when they moved none.
@@ -3296,25 +3463,14 @@ const SCREEN_MOVED_ID_LIST_CAP: usize = 10;
 /// multimodality, since a cold descent that stops short of the mode moves the same way.
 /// It names no candidate either: the reported EBEs may still be the #833 incumbent's.
 pub(crate) fn ebe_screen_moved_warning(ids: &[String]) -> Option<String> {
-    let n = ids.len();
-    if n == 0 {
+    if ids.is_empty() {
         return None;
     }
-    let listed = ids[..n.min(SCREEN_MOVED_ID_LIST_CAP)].join(", ");
-    let list = if n > SCREEN_MOVED_ID_LIST_CAP {
-        format!("{listed} and {} more", n - SCREEN_MOVED_ID_LIST_CAP)
-    } else {
-        listed
-    };
-    let who = if n == 1 {
-        "1 subject".to_string()
-    } else {
-        format!("{n} subjects")
-    };
+    let who = counted_subjects(ids);
     Some(format!(
         "W_EBE_START_DEPENDENT: at the final parameters, the inner loop's Sobol screen \
          (`inner_screen`) or flip-flop twin seed (`inner_twin_seed`) moved the empirical \
-         Bayes estimates of {who} ({list}) to a lower \
+         Bayes estimates of {who} to a lower \
          individual objective than the descent from η = 0 reached. Either the individual \
          objective has more than one mode there, or that descent stopped short of it; in \
          both cases these EBEs, and the diagnostics built on them (IPRED, IWRES, CWRES, \
@@ -3336,6 +3492,150 @@ pub(crate) fn ebe_screen_moved_warning(ids: &[String]) -> Option<String> {
 /// two orders of magnitude below the 88-unit gap it exists to catch.
 const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
 
+/// Whether the mid-leg basin probe runs at this feasible-evaluation count: 32, 64, 128, …
+/// — a logarithmic number of cold passes per leg, none before the trajectory has had a
+/// chance to settle (#2093).
+fn basin_probe_due(feasible_evals: usize) -> bool {
+    feasible_evals >= BASIN_PROBE_FIRST && feasible_evals.is_power_of_two()
+}
+
+/// The first feasible evaluation at which [`basin_probe_due`] fires.
+const BASIN_PROBE_FIRST: usize = 32;
+
+/// What the mid-leg basin probe does with a cold re-solve that beat the best seen (#2600).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BasinProbeAction {
+    /// End the leg for a basin-shift restart: a fresh optimizer from the incumbent, its
+    /// first inner solve cold (#2093).
+    Restart,
+    /// Keep the leg running, with the cold re-solve's modes as the next evaluation's warm
+    /// starts. The optimizer's curvature memory survives; the surface it minimises from
+    /// here on is the one the cold modes define.
+    Absorb,
+}
+
+/// The share of the population that has to sit in a lower cold mode before the mid-leg
+/// probe restarts the leg rather than absorbing the modes into it ([`basin_probe_action`]).
+const BASIN_PROBE_RESTART_SHARE: f64 = 0.01;
+
+/// Restart or absorb, from how many subjects the probe's cold re-solve put in a lower
+/// individual mode (`switched`, [`subjects_in_a_lower_cold_mode`]) out of `n_subjects`
+/// (#2600).
+///
+/// The #2093 probe restarted on any gap above [`BASIN_SHIFT_ABS_TOL`]. On a 10-subject
+/// fixture one subject switching is a tenth of the objective, and the curvature pairs the
+/// optimizer collected on the trapped surface are worth little afterwards. On a
+/// 5,937-subject FOCEI fit a handful of the subjects will almost always sit in a lower cold
+/// mode, so every leg was cut at its 32nd evaluation — five legs, gains 33.5 / 14.3 / 0.99 /
+/// 1.14 / 0.55 from 19 / 9 / 3 / 5 / 4 switched subjects — no leg reached its own stopping
+/// rule, and the fit ended with |g|∞ = 16.3. Restarting throws the L-BFGS memory away,
+/// and 19 of 5,937 terms changing leaves most of it describing the same surface; so below
+/// [`BASIN_PROBE_RESTART_SHARE`] of the population the switch is absorbed into the running
+/// leg instead. The end-of-leg check (#1565) still runs on every leg, so a gap that
+/// survives to the leg's own stop still files its restart and its warning.
+///
+/// `switched = None` — the count is not available (AGQ, whose per-subject term is not the
+/// one the count scores, or no held state at the incumbent) — restarts, as before #2600.
+///
+/// `cold_guard_rejected` — the cold solve fails the EBE guard an ordinary evaluation must
+/// pass ([`ebe_guard_rejects`]: too many unconverged subjects, or a start rejected) — also
+/// restarts, as before #2600. Absorbing makes the cold solve the incumbent in every tracker
+/// ([`absorb_cold_incumbent`]), and an objective the optimizer would have rejected must not
+/// become the bar every later valid evaluation has to beat, nor the EBE state the final
+/// restore scores. The restart's own first inner solve is guarded as usual.
+fn basin_probe_action(
+    switched: Option<usize>,
+    n_subjects: usize,
+    cold_guard_rejected: bool,
+) -> BasinProbeAction {
+    match switched {
+        Some(k)
+            if !cold_guard_rejected
+                && (k as f64) < basin_probe_restart_share() * n_subjects as f64 =>
+        {
+            BasinProbeAction::Absorb
+        }
+        _ => BasinProbeAction::Restart,
+    }
+}
+
+/// [`BASIN_PROBE_RESTART_SHARE`], or this thread's `BASIN_PROBE_RESTART_SHARE_TEST`
+/// override (tests only, for the A/B of the two arms on one fit).
+fn basin_probe_restart_share() -> f64 {
+    #[cfg(test)]
+    if let Some(share) = BASIN_PROBE_RESTART_SHARE_TEST.with(|c| c.get()) {
+        return share;
+    }
+    BASIN_PROBE_RESTART_SHARE
+}
+
+/// The objective the mid-leg basin probe compares its cold solve against: the active leg's
+/// incumbent (#2600 review). A #2462 verification leg evaluates at a tighter inner tolerance
+/// and ranks in its own `leg_best`, so its probe solves at that leg's options
+/// (`eval_options`) and is scored against `leg_best`. Against the pre-leg `best_seen`, at
+/// the fit's tolerance, it would compare two objective surfaces, and an absorb would copy a
+/// loose objective into the leg's incumbent.
+fn basin_probe_reference(
+    in_verify_leg: bool,
+    leg_best: &BestPoint,
+    best_seen: &BestPoint,
+) -> Option<f64> {
+    let best = if in_verify_leg { leg_best } else { best_seen };
+    best.get().map(|b| b.ofv_clean)
+}
+
+/// Make the mid-leg probe's cold solve the leg's incumbent when it absorbs it (#2600):
+/// `ofv = (penalized, clean)` at `solve.xs` and its EBE state `solve`. The warm starts are
+/// built here from `solve` itself ([`outer_cache_warm_starts`]: η then κ cells, or η alone
+/// on ODE+IOV), so the
+/// cache cannot be handed modes from any other solve than the one recorded (#2674).
+///
+/// Every tracker an evaluation's improvement is measured against moves to the cold
+/// objective, or a later trial scoring between it and the warm one would count as an
+/// improvement, overwrite the held EBE state, and be restored as the best point although the
+/// probe had already scored a lower one:
+///
+/// - `state.best_ofv`, the warm-start adoption rule's bar ([`adopt_warm_start`]);
+/// - `best` — `best_seen`, or a verification leg's own incumbent — the point the final
+///   restore lands on;
+/// - `best_solve`, the held EBE state the final inner loop scores at that point;
+/// - the plateau tracker's baseline: the drop is progress, and counting the trace as flat
+///   through it would let the plateau check certify a stop the cold modes just moved;
+/// - `last_gradient`, cleared: it is the warm modes' gradient, not this objective's. The
+///   next improving gradient evaluation sets it again; failing that the end of the fit
+///   forms one at the restored point.
+///
+/// The mode response and the inner-Hessian seeds belong to the warm modes they were taken
+/// at, so they go too, as on a verification leg's start ([`NloptState::reset_to_cold_start`]).
+#[allow(clippy::too_many_arguments)]
+fn absorb_cold_incumbent(
+    state: &mut NloptState,
+    best: &mut BestPoint,
+    best_solve: &mut Option<IncumbentSolve>,
+    last_gradient: &mut Option<Vec<f64>>,
+    plateau: &mut (f64, usize, usize),
+    (ofv, ofv_clean): (f64, f64),
+    model: &CompiledModel,
+    solve: IncumbentSolve,
+) {
+    state.reset_to_cold_start();
+    let modes = outer_cache_warm_starts(model, &solve.etas, &solve.kappas);
+    if modes.len() == state.cached_etas.len() {
+        state.cached_etas = modes;
+    }
+    if ofv < state.best_ofv {
+        state.best_ofv = ofv;
+    }
+    if best.observe(state.n_evals, &solve.xs, ofv, ofv_clean) {
+        *best_solve = Some(solve);
+        *last_gradient = None;
+    }
+    if plateau.0 - ofv > PLATEAU_OFV_THRESHOLD {
+        plateau.0 = ofv;
+        plateau.1 = plateau.2;
+    }
+}
+
 /// By how much a cold re-solve at the restored point *beat* the objective the optimizer
 /// minimised there, when it beat it by more than [`BASIN_SHIFT_ABS_TOL`] (#1565).
 ///
@@ -3353,16 +3653,6 @@ const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
 /// path has no cold solve; a run with no feasible evaluation has no best-seen) or a
 /// non-finite one, which [`ColdSolveVerdict::NonFinite`] and
 /// [`gate_converged_on_objective`] already own.
-/// Whether the mid-leg basin probe runs at this feasible-evaluation count: 32, 64, 128, …
-/// — a logarithmic number of cold passes per leg, none before the trajectory has had a
-/// chance to settle (#2093).
-fn basin_probe_due(feasible_evals: usize) -> bool {
-    feasible_evals >= BASIN_PROBE_FIRST && feasible_evals.is_power_of_two()
-}
-
-/// The first feasible evaluation at which [`basin_probe_due`] fires.
-const BASIN_PROBE_FIRST: usize = 32;
-
 fn cold_solve_beats_best_seen(cold_ofv: Option<f64>, best_seen_ofv: Option<f64>) -> Option<f64> {
     let (cold, best) = (cold_ofv?, best_seen_ofv?);
     if !cold.is_finite() || !best.is_finite() {
@@ -3485,6 +3775,13 @@ pub(crate) type EbeCandidate = (
     f64,
 );
 
+/// A borrowed EBE triple: the η̂, `H` and κ̂ `pop_nll_opts` consumes.
+type EbeTriple<'a> = (
+    &'a [DVector<f64>],
+    &'a [DMatrix<f64>],
+    &'a [Vec<DVector<f64>>],
+);
+
 /// Score an EBE triple on the fit's objective at `params` (#833).
 pub(crate) fn score_final_ebes(
     model: &CompiledModel,
@@ -3497,18 +3794,141 @@ pub(crate) fn score_final_ebes(
     (etas, h_mats, kappas, 2.0 * nll)
 }
 
+/// The `base` candidate, with each subject another candidate beats by more than
+/// [`BASIN_SHIFT_ABS_TOL`] in `−2LL` moved onto its lowest, and which candidate each subject
+/// came from. `terms[c][i]` is subject `i`'s objective term under candidate `c`.
+///
+/// The bound is what keeps this a choice between modes. Without it a subject moves for any
+/// gain at all, and a candidate an inner budget stopped short can score a few `1e-3` below
+/// the converged one: on `tests/run_covariance_reported_ebes.rs`'s starved row a plain
+/// minimum reported −1199.3302, below the fixture's optimum of −1199.3264.
+///
+/// A subject's `(η̂, H, κ̂)` move together: `H` is the curvature at that η̂, so splitting
+/// them would score a `log|H|` belonging to another point. The lowest is
+/// [`reported_candidate`]'s, so a non-finite term never wins, and a subject whose `base`
+/// term is itself non-finite always moves if anything finite exists.
+fn lowest_per_subject(
+    candidates: &[EbeCandidate],
+    terms: &[Vec<f64>],
+    base: usize,
+) -> (
+    (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>),
+    Vec<usize>,
+) {
+    let source: Vec<usize> = (0..terms[0].len())
+        .map(|i| {
+            let column: Vec<f64> = terms.iter().map(|t| t[i]).collect();
+            let lowest = reported_candidate(&column);
+            let moves = !column[base].is_finite()
+                || 2.0 * (column[base] - column[lowest]) > BASIN_SHIFT_ABS_TOL;
+            if moves {
+                lowest
+            } else {
+                base
+            }
+        })
+        .collect();
+    let pick = |i: usize| &candidates[source[i]];
+    let etas = (0..source.len()).map(|i| pick(i).0[i].clone()).collect();
+    let h_mats = (0..source.len()).map(|i| pick(i).1[i].clone()).collect();
+    // A model without IOV may carry no κ̂ at all; that shape is kept, since postfit branches
+    // on `kappas.is_empty()`.
+    let kappas = if candidates[0].2.is_empty() {
+        Vec::new()
+    } else {
+        (0..source.len())
+            .map(|i| pick(i).2.get(i).cloned().unwrap_or_default())
+            .collect()
+    };
+    ((etas, h_mats, kappas), source)
+}
+
+/// The subjects `other` beats the cold solve on by more than [`BASIN_SHIFT_ABS_TOL`] in
+/// `−2LL`, largest gap first: the ones a cold start cannot be said to reproduce (#2646).
+/// Terms are the `nll`s of [`subject_nlls`]; the `>` means a `NaN` side never counts.
+fn subjects_cold_lost(population: &Population, cold: &[f64], other: &[f64]) -> Vec<String> {
+    let mut lost: Vec<(f64, &str)> = population
+        .subjects
+        .iter()
+        .zip(cold.iter().zip(other))
+        .map(|(subject, (c, o))| (2.0 * (c - o), subject.id.as_str()))
+        .filter(|&(gap, _)| gap > BASIN_SHIFT_ABS_TOL)
+        .collect();
+    lost.sort_by(|a, b| b.0.total_cmp(&a.0));
+    lost.into_iter().map(|(_, id)| id.to_string()).collect()
+}
+
+/// [`subjects_cold_lost`] between two EBE triples at `params`. Empty under AGQ, whose
+/// per-subject term is not the one [`subject_nll`] computes. This is the per-subject half
+/// of the trigger for [`best_final_candidate`]: population totals can agree while subjects
+/// differ both ways, one held in a lower mode and another in a higher one.
+fn subjects_cold_lost_to(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    cold: EbeTriple<'_>,
+    other: EbeTriple<'_>,
+    options: &FitOptions,
+) -> Vec<String> {
+    if options.agq_nodes().is_some() {
+        return Vec::new();
+    }
+    let terms = |(etas, h_mats, kappas): EbeTriple<'_>| {
+        subject_nlls(
+            model,
+            population,
+            params,
+            etas,
+            h_mats,
+            kappas,
+            options.interaction,
+        )
+    };
+    subjects_cold_lost(population, &terms(cold), &terms(other))
+}
+
+/// What [`best_final_candidate`] decided.
+pub(crate) struct FinalPick {
+    pub(crate) reported: EbeCandidate,
+    /// [`subjects_cold_lost`] against the reported EBEs. Empty under AGQ.
+    cold_lost_ids: Vec<String>,
+    /// Under AGQ, which has no per-subject term: did a whole other candidate win?
+    pub(crate) cold_replaced: bool,
+}
+
+impl FinalPick {
+    /// Drop the #2013 subjects whose reported EBEs are no longer the cold solve's: the
+    /// warning names EBEs the cold solve moved, and another candidate's were not.
+    ///
+    /// Read off [`Self::cold_lost_ids`], not off which candidate each subject came from.
+    /// Candidates at one mode differ by solver noise, so on #2646's CJ 224 of 458 subjects
+    /// came from the seeded re-solve by ~1e-6, and those are still the cold solve's EBEs.
+    fn retain_cold_reported(&self, ids: &mut Vec<String>) {
+        if self.cold_replaced {
+            ids.clear();
+        }
+        let lost: HashSet<&str> = self.cold_lost_ids.iter().map(String::as_str).collect();
+        ids.retain(|id| !lost.contains(id.as_str()));
+    }
+}
+
 /// #833's recovery once a cold re-solve has missed the optimizer's own objective: a
 /// re-solve seeded from `seed` (the optimizer's EBEs), scored beside the cold solve and,
-/// when it belongs to this point, the optimizer's own `held` state as it left it. Returns
-/// the [`reported_candidate`] and its index — 0 is the cold solve, which callers pass
-/// first so that ties keep reporting it.
+/// when it belongs to this point, the optimizer's own `held` state as it left it. The
+/// cold solve comes first, so that ties keep reporting it.
 ///
 /// The held state is scored rather than merely used as a seed because the inner solve
 /// is *not* monotone from its seed (#1365), so the seeded re-solve alone could come back
 /// above the objective its own seed already had. Shared by the NLopt leg and the trust
 /// region (#2097).
+///
+/// The objective is a sum over subjects, so a fourth candidate starts from the best of the
+/// others and moves each subject that another beats materially (#2646,
+/// [`lowest_per_subject`]): no whole candidate need hold every subject's best, and picking
+/// one would give up what the others found. AGQ's per-subject term is not the one
+/// [`subject_nll`] computes, so there the whole candidates compete alone.
 #[allow(clippy::too_many_arguments)]
-fn best_final_candidate(
+pub(crate) fn best_final_candidate(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -3517,7 +3937,7 @@ fn best_final_candidate(
     cold: EbeCandidate,
     seed: &[DVector<f64>],
     held: Option<EbeCandidate>,
-) -> (EbeCandidate, usize) {
+) -> FinalPick {
     let s = final_inner_solve(model, population, params, mu_k, Some(seed), options);
     let warm = score_final_ebes(
         model,
@@ -3528,9 +3948,85 @@ fn best_final_candidate(
     );
     let mut candidates = vec![cold, warm];
     candidates.extend(held);
+    let mut terms = None;
+    if options.agq_nodes().is_none() {
+        let per_candidate: Vec<Vec<f64>> = candidates
+            .iter()
+            .map(|(etas, h_mats, kappas, _)| {
+                subject_nlls(
+                    model,
+                    population,
+                    params,
+                    etas,
+                    h_mats,
+                    kappas,
+                    options.interaction,
+                )
+            })
+            .collect();
+        let whole: Vec<f64> = candidates.iter().map(|c| c.3).collect();
+        let (parts, source) =
+            lowest_per_subject(&candidates, &per_candidate, reported_candidate(&whole));
+        candidates.push(score_final_ebes(model, population, params, parts, options));
+        let lowest = source
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| per_candidate[c][i])
+            .collect();
+        terms = Some((per_candidate, lowest));
+    }
     let objectives: Vec<f64> = candidates.iter().map(|c| c.3).collect();
     let pick = reported_candidate(&objectives);
-    (candidates.swap_remove(pick), pick)
+    let cold_lost_ids = terms
+        .as_ref()
+        .map_or_else(Vec::new, |(per_candidate, lowest)| {
+            let reported = per_candidate.get(pick).unwrap_or(lowest);
+            subjects_cold_lost(population, &per_candidate[0], reported)
+        });
+    FinalPick {
+        reported: candidates.swap_remove(pick),
+        cold_lost_ids,
+        cold_replaced: terms.is_none() && pick != 0,
+    }
+}
+
+/// Which EBEs a final cold solve hands on: the cold ones, unless they missed the optimizer's
+/// own. `cold_missed` is the population verdict; the per-subject test beside it is here
+/// because the totals can agree while subjects differ both ways (#2646). The one trigger
+/// for the NLopt leg and the trust region. A fit whose cold solve misses on neither keeps
+/// it, with no further solve, so such a fit is bit-identical to before.
+#[allow(clippy::too_many_arguments)]
+fn recover_final_ebes(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    mu_k: &[f64],
+    options: &FitOptions,
+    cold: EbeCandidate,
+    seed: &[DVector<f64>],
+    held: Option<EbeCandidate>,
+    cold_missed: bool,
+) -> FinalPick {
+    let a_subject_missed = held.as_ref().is_some_and(|h| {
+        !subjects_cold_lost_to(
+            model,
+            population,
+            params,
+            (&cold.0, &cold.1, &cold.2),
+            (&h.0, &h.1, &h.2),
+            options,
+        )
+        .is_empty()
+    });
+    if cold_missed || a_subject_missed {
+        best_final_candidate(model, population, params, mu_k, options, cold, seed, held)
+    } else {
+        FinalPick {
+            reported: cold,
+            cold_lost_ids: Vec::new(),
+            cold_replaced: false,
+        }
+    }
 }
 
 /// A final inner solve at `params` and what its Sobol screen (#2013) and flip-flop twin
@@ -3558,6 +4054,42 @@ pub(crate) fn final_inner_solve(
     seed: Option<&[DVector<f64>]>,
     options: &FitOptions,
 ) -> FinalInnerSolve {
+    inner_solve_polled(model, population, params, mu_k, seed, options, None)
+}
+
+/// The cold solve at a verified stop ([`verified_stop_owes_a_restart`]), which also seeds a
+/// [`LegStart::ColdModes`] round, or `None` if the fit was
+/// cancelled during it. Unlike a final readout it polls the cancel flag per subject (#574),
+/// and a subject the cancel skipped holds a placeholder, which must not seed a leg.
+fn cold_modes_solve(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    mu_k: &[f64],
+    options: &FitOptions,
+) -> Option<FinalInnerSolve> {
+    let cold = inner_solve_polled(
+        model,
+        population,
+        params,
+        mu_k,
+        None,
+        options,
+        options.cancel.as_ref(),
+    );
+    (!crate::cancel::is_cancelled(&options.cancel)).then_some(cold)
+}
+
+/// [`final_inner_solve`], polling `cancel` if given.
+fn inner_solve_polled(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    mu_k: &[f64],
+    seed: Option<&[DVector<f64>]>,
+    options: &FitOptions,
+    cancel: Option<&crate::cancel::CancelFlag>,
+) -> FinalInnerSolve {
     let (etas, h_mats, _, kappas, moved) = run_inner_loop_warm_map(
         model,
         population,
@@ -3569,7 +4101,7 @@ pub(crate) fn final_inner_solve(
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
         InnerSolvePolicy::for_stage(options, model),
-        None,
+        cancel,
         |_, ebe| ebe.screen_moved || ebe.twin_moved,
     );
     let screen_moved_ids = population
@@ -3595,7 +4127,8 @@ pub(crate) fn final_inner_solve(
 /// - cold **materially better** — the optimizer's EBEs sat in a higher mode, so the
 ///   estimates minimise a surrogate above the objective; `converged` is demoted and
 ///   [`ebe_basin_shift_warning`] says so (#1565);
-/// - cold **materially worse**, or non-finite — [`ebe_start_dependence_warning`] (#833);
+/// - cold **materially worse**, or non-finite — [`ebe_start_dependence_warning`] (#833),
+///   naming the subjects it missed on (#2646);
 /// - the cold solve's screen moved some subjects — [`ebe_screen_moved_warning`] (#2013).
 ///
 /// What is reported depends on `adopt`. With `adopt` (the trust region, which has always
@@ -3604,8 +4137,8 @@ pub(crate) fn final_inner_solve(
 /// and the incumbent itself, exactly as on the NLopt leg — so a fit whose cold solve
 /// reproduces its optimizer's EBEs is unchanged. Without it (Gauss–Newton) the incumbent
 /// is always reported and the check is diagnostic only. The screen-moved warning, like
-/// the NLopt leg's, is dropped when the reported EBEs came from another candidate the
-/// helper chose; Gauss–Newton keeps it, since its incumbent is the only candidate and the
+/// the NLopt leg's, drops the subjects whose reported EBEs came from another candidate
+/// the helper chose; Gauss–Newton keeps them, since its incumbent is the only candidate and the
 /// fact it reports — η = 0 does not descend to those subjects' mode — holds either way.
 ///
 /// On a cancelled run nothing is solved and the incumbent comes back as it was.
@@ -3665,11 +4198,10 @@ pub(crate) fn final_ebe_check(
             report,
         ));
     }
-    let reported = if !adopt {
-        incumbent
-    } else if cold_solve_verdict(cold_ofv, incumbent_ofv).missed() {
+    let (reported, cold_lost_ids) = if adopt {
         let seed = joint_warm_starts(&incumbent.0, &incumbent.2);
-        let (reported, pick) = best_final_candidate(
+        let cold_missed = cold_solve_verdict(cold_ofv, incumbent_ofv).missed();
+        let pick = recover_final_ebes(
             model,
             population,
             params,
@@ -3678,15 +4210,26 @@ pub(crate) fn final_ebe_check(
             cold,
             &seed,
             Some(incumbent),
+            cold_missed,
         );
-        if pick != 0 {
-            screen_moved_ids.clear();
-        }
-        reported
+        pick.retain_cold_reported(&mut screen_moved_ids);
+        (pick.reported, pick.cold_lost_ids)
     } else {
-        cold
+        let ids = subjects_cold_lost_to(
+            model,
+            population,
+            params,
+            (&cold.0, &cold.1, &cold.2),
+            (&incumbent.0, &incumbent.1, &incumbent.2),
+            options,
+        );
+        (incumbent, ids)
     };
-    warnings.extend(ebe_start_dependence_warning(cold_ofv, reported.3));
+    warnings.extend(ebe_start_dependence_warning(
+        cold_ofv,
+        reported.3,
+        &cold_lost_ids,
+    ));
     warnings.extend(ebe_screen_moved_warning(&screen_moved_ids));
     (reported, warnings)
 }
@@ -4239,6 +4782,19 @@ fn bhhh_newton_decrement(
     bounds: &PackedBounds,
     fixed: &[bool],
 ) -> Option<f64> {
+    bhhh_newton_step(per_subject, penalty_grad, penalty_hess, x, bounds, fixed).map(|(d, _)| d)
+}
+
+/// [`bhhh_newton_decrement`] with the step it predicts from: `−S⁻¹s` in packed coordinates,
+/// on the eigenvalues the decrement keeps, and zero on every coordinate it does not free.
+fn bhhh_newton_step(
+    per_subject: &[Vec<f64>],
+    penalty_grad: &[f64],
+    penalty_hess: &DMatrix<f64>,
+    x: &[f64],
+    bounds: &PackedBounds,
+    fixed: &[bool],
+) -> Option<(f64, Vec<f64>)> {
     let n = x.len();
     let s_full: Vec<f64> = (0..n)
         .map(|k| per_subject.iter().map(|g| g[k]).sum::<f64>() + 0.5 * penalty_grad[k])
@@ -4272,14 +4828,20 @@ fn bhhh_newton_decrement(
     if lambda_max <= 0.0 {
         return None;
     }
-    let decrement: f64 = eig
-        .eigenvalues
-        .iter()
-        .enumerate()
-        .filter(|&(_, &lambda)| lambda > 1e-10 * lambda_max)
-        .map(|(j, &lambda)| eig.eigenvectors.column(j).dot(&s).powi(2) / lambda)
-        .sum();
-    decrement.is_finite().then_some(decrement)
+    let mut decrement = 0.0;
+    let mut step_free = DVector::zeros(m);
+    for (j, &lambda) in eig.eigenvalues.iter().enumerate() {
+        if lambda > 1e-10 * lambda_max {
+            let along = eig.eigenvectors.column(j).dot(&s);
+            decrement += along * along / lambda;
+            step_free -= eig.eigenvectors.column(j) * (along / lambda);
+        }
+    }
+    let mut step = vec![0.0; n];
+    for (a, &k) in free.iter().enumerate() {
+        step[k] = step_free[a];
+    }
+    decrement.is_finite().then_some((decrement, step))
 }
 
 /// Largest [`bhhh_newton_decrement`] at which the stagnation guard may still latch
@@ -4446,6 +5008,35 @@ fn predicted_remaining_gain(
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
     priors: &crate::estimation::priors::PriorSet,
 ) -> Option<f64> {
+    predicted_newton_step(
+        model,
+        population,
+        init_params,
+        x,
+        ehs,
+        kappas,
+        bounds,
+        options,
+        nn_reg,
+        priors,
+    )
+    .map(|(gain, _)| gain)
+}
+
+/// [`predicted_remaining_gain`] with the step behind it ([`bhhh_newton_step`]).
+#[allow(clippy::too_many_arguments)]
+fn predicted_newton_step(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> Option<(f64, Vec<f64>)> {
     if !per_subject_outer_gradients_in_scope(model, options) {
         return None;
     }
@@ -4488,7 +5079,7 @@ fn predicted_remaining_gain(
     nn_reg.add_packed_hessian(&theta, &mut |i, j, v| penalty_hess[(i, j)] += v);
     priors.add_gradient(x, &mut penalty_grad);
     priors.add_hessian(&mut |i, j, v| penalty_hess[(i, j)] += v);
-    bhhh_newton_decrement(
+    bhhh_newton_step(
         &per_subject,
         &penalty_grad,
         &penalty_hess,
@@ -4818,7 +5409,7 @@ pub(crate) enum RestartCause {
 /// dropping by hundreds per eval, and the existing retry, gated on `left_init`,
 /// never sees it. Then the optimizer is simply restarted from the best point it
 /// reached, which resets L-BFGS's `(s, y)` memory and the trust region with it.
-fn optimize_nlopt(
+pub(crate) fn optimize_nlopt(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -5815,6 +6406,158 @@ pub(crate) fn keep_verify_leg<G: Clone>(
     }
 }
 
+/// Where a leg starts. Every leg starts at the incumbent's own modes (#2549) unless it opens
+/// one of the further passes a verified stop gets (#2645): a round of
+/// [`unprofiled_verify_legs`] from somewhere the warm legs cannot reach, which replaces the
+/// incumbent only by ending lower ([`keep_verify_leg`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum LegStart {
+    /// The incumbent, at its own modes.
+    Incumbent,
+    /// The incumbent, at a cold solve's modes. A warm leg verifies the stop on the modes the
+    /// fit already holds, so it cannot see that another mode set has a lower optimum in θ,
+    /// and a subject's other mode can score *worse* at the incumbent and still lead there: no
+    /// per-subject comparison at that point finds it. On the propofol benchmark (24 subjects,
+    /// 3-cpt closed form) a cold solve at the incumbent scores −3038.866 against −3038.980,
+    /// on one subject, and the leg from those modes reaches −3039.288158, NONMEM's
+    /// −3039.2882 (macOS arm64). On the cefepime benchmark (458 subjects) four subjects score
+    /// 2.32 worse cold, and the leg ends 2.76 lower. It runs only when
+    /// [`subjects_off_the_held_modes`] finds a subject to move.
+    ColdModes,
+    /// The BHHH Newton step from the incumbent, at its modes. A leg restarts L-BFGS with no
+    /// curvature memory, so on a long valley its first line search can fail at a point that
+    /// is no minimum. On the busulfan benchmark (1518 subjects, ODE + IOV; TVCL and TVDROP
+    /// nearly confounded) the fit stopped `converged` at 126579.41, with |g|∞ 4.26 and
+    /// a predicted gain of 7.9, and every leg gained under 1e-6; a leg from this step reaches
+    /// 126565.48 with |g|∞ 0.08 (macOS arm64). It runs only when that gain exceeds
+    /// [`LATCH_MAX_PREDICTED_GAIN`], the guard's own line between a plateau and a creep.
+    NewtonStep,
+}
+
+/// Does a stop that ended `end` get the pass opening at `start`? After the warm legs, not
+/// instead of them, because no start wins everywhere: the warm leg is what
+/// `transit_flip_flop_fit_matches_ode_twin` needs (#2549), and the others can lose outright,
+/// so the fit keeps whichever ended lower. Only from a stop the legs settled: a leg cap or a
+/// spent budget is not a verified incumbent, a stop the #2093 basin probe ended goes to the
+/// basin-shift restart, and a cancelled fit starts nothing. `Settled` does not rule the last
+/// out: a cancel during a leg ends the loop there, as settled.
+#[cfg_attr(not(test), allow(unused_variables))] // `start` is the tests' switch
+pub(crate) fn leg_pass_applies(
+    start: LegStart,
+    end: PolishEnd,
+    basin_probe_fired: bool,
+    cancelled: bool,
+) -> bool {
+    #[cfg(test)]
+    if LEG_PASSES_OFF.with(|o| o.get()).contains(&start) {
+        return false;
+    }
+    matches!(end, PolishEnd::Settled) && !basin_probe_fired && !cancelled
+}
+
+/// Does a verified stop already belong to a restart, and so take no [`LegStart`] pass? True
+/// when the end of the attempt, were it at this stop, would restart it: a cold solve that
+/// fails the consistency check (#1277) or beats the objective (#1565). A pass could lower the
+/// incumbent just enough to pass those checks, and the restart that would have gone further
+/// would never run. On a simulated 80-subject dataset (`restart_wins.csv`) rounds took a stop at
+/// 778.06, cold 781.31, down to 777.17, consistent and reported converged, where the restarts
+/// from 778.06 reach 775.45. A stop that takes passes is one nothing was going to restart, so
+/// passes never replace a restart. `best` and `cold` are at the attempt's final check's own
+/// terms: `cold` at the fit's `inner_tol`, not the legs'.
+pub(crate) fn verified_stop_owes_a_restart(best: f64, cold: f64) -> bool {
+    !cold_solve_is_consistent(Some(best), cold)
+        || cold_solve_beats_best_seen(Some(cold), Some(best)).is_some()
+}
+
+/// The fit's own state a pass can leave behind, restored when the pass is discarded.
+pub(crate) struct PassState<'a> {
+    pub(crate) basin_probe_fired: &'a std::cell::Cell<bool>,
+    pub(crate) stagnation_latched: &'a std::sync::atomic::AtomicBool,
+    /// The incumbent's objective at the leg tolerance: what a kept pass changes.
+    pub(crate) kept_best: &'a std::cell::Cell<Option<f64>>,
+}
+
+/// Runs each [`LegStart`] pass that applies after the verdict `warm`, and returns the verdict
+/// that stands: a pass's only if it moved the incumbent ([`keep_verify_leg`]). A discarded pass
+/// leaves nothing behind. Its latch and its #2093 probe describe the point it explored, not
+/// the incumbent, so they go back: a cold round's probe would otherwise stop the Newton round
+/// and send a verified stop to a restart on another point's evidence.
+///
+/// `stop_is_free` is asked once, before the first pass, whether the verified stop may take
+/// passes at all ([`verified_stop_owes_a_restart`]).
+pub(crate) fn drive_leg_passes<V>(
+    warm: V,
+    end_of: impl Fn(&V) -> PolishEnd,
+    cancelled: impl Fn() -> bool,
+    state: PassState<'_>,
+    stop_is_free: impl FnOnce() -> bool,
+    mut pass: impl FnMut(LegStart, &V) -> V,
+) -> V {
+    let mut verdict = warm;
+    let mut stop_is_free = Some(stop_is_free);
+    for start in [LegStart::ColdModes, LegStart::NewtonStep] {
+        let probe_fired = state.basin_probe_fired.get();
+        if !leg_pass_applies(start, end_of(&verdict), probe_fired, cancelled()) {
+            continue;
+        }
+        if stop_is_free.take().is_some_and(|free| !free()) {
+            break;
+        }
+        let verified_best = state.kept_best.get();
+        let verified_latched = state.stagnation_latched.load(Ordering::Relaxed);
+        let round = pass(start, &verdict);
+        if state.kept_best.get() == verified_best {
+            state
+                .stagnation_latched
+                .store(verified_latched, Ordering::Relaxed);
+            state.basin_probe_fired.set(probe_fired);
+        } else {
+            verdict = round;
+        }
+    }
+    verdict
+}
+
+/// Does a Newton step's predicted `gain` warrant a [`LegStart::NewtonStep`] leg? Above
+/// [`LATCH_MAX_PREDICTED_GAIN`], and only with more subjects than coordinates the step moves.
+/// `S = Σ gᵢgᵢᵀ` has rank at most the subject count, and on `s`'s own span `sᵀS⁺s` reads as a
+/// constant rather than a distance to the optimum: one subject reads exactly 1 wherever it
+/// is. On the one-subject `fit_on_ss_absorption_converges` that sent a leg along a flat
+/// direction, V from 20 to 6.66 for 0.002 OFV.
+pub(crate) fn newton_gain_warrants_a_leg(gain: f64, n_subjects: usize, step: &[f64]) -> bool {
+    gain > LATCH_MAX_PREDICTED_GAIN && n_subjects > step.iter().filter(|d| **d != 0.0).count()
+}
+
+/// The longest step, on any packed coordinate, a [`LegStart::NewtonStep`] leg starts from.
+/// `S` is nearly singular along the very valley the step is for, so the full step overshoots:
+/// on the busulfan benchmark it scored ~2.2e5 against 126579, and the leg ended at 182723.
+/// Capped at 0.1 or 0.3 (10% to 35% on a log-packed θ), the same step reached 126565.48
+/// in two legs and one; 0.3 is the cap that took one.
+const NEWTON_START_MAX_STEP: f64 = 0.3;
+
+/// `x + step`, the step scaled down so that no coordinate moves more than
+/// [`NEWTON_START_MAX_STEP`], then each coordinate held inside its bounds.
+pub(crate) fn newton_start(x: &[f64], step: &[f64], bounds: &PackedBounds) -> Vec<f64> {
+    let longest = step.iter().fold(0.0_f64, |m, d| m.max(d.abs()));
+    let shrink = (NEWTON_START_MAX_STEP / longest).min(1.0);
+    x.iter()
+        .zip(step)
+        .enumerate()
+        .map(|(k, (v, d))| (v + shrink * d).clamp(bounds.lower[k], bounds.upper[k]))
+        .collect()
+}
+
+/// How many subjects' `−2LL` terms differ between the held and the cold modes by more than
+/// [`PLATEAU_OFV_THRESHOLD`], in either direction: a [`LegStart::ColdModes`] pass has nothing
+/// to explore when this is zero, which is every unimodal fit, so there it costs one inner pass
+/// and no leg. `>` on a difference: a `NaN` side is never counted.
+pub(crate) fn subjects_off_the_held_modes(held: &[f64], cold: &[f64]) -> usize {
+    held.iter()
+        .zip(cold)
+        .filter(|(h, c)| 2.0 * (*h - *c).abs() > PLATEAU_OFV_THRESHOLD)
+        .count()
+}
+
 /// The internal switch for the #2462 verification leg. `false` restores the pre-#2462
 /// verdict on every stop; kept so a change in a test can be attributed to the leg.
 const UNPROFILED_VERIFY_LEG: bool = true;
@@ -5826,9 +6569,19 @@ thread_local! {
     /// Turns the #2462 leg off on this thread, for the tests' mutation checks.
     pub(crate) static UNPROFILED_VERIFY_OFF: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// The #2645 passes turned off on this thread, for the tests' straddles.
+    pub(crate) static LEG_PASSES_OFF: std::cell::Cell<&'static [LegStart]> =
+        const { std::cell::Cell::new(&[]) };
     /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Each mid-leg basin probe that found a gap on this thread (#2600): the gap and the
+    /// switched-subject count [`basin_probe_action`] decided on.
+    pub(crate) static BASIN_PROBE_DECISIONS: std::cell::RefCell<Vec<(f64, Option<usize>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Overrides `BASIN_PROBE_RESTART_SHARE` on this thread (#2600).
+    pub(crate) static BASIN_PROBE_RESTART_SHARE_TEST: std::cell::Cell<Option<f64>> =
+        const { std::cell::Cell::new(None) };
     /// Makes no #2462 leg settle on this thread, so every stop runs `MAX_POLISH_LEGS` legs —
     /// for the #2507 test of the kept leg's state.
     pub(crate) static UNPROFILED_VERIFY_NEVER_SETTLE: std::cell::Cell<bool> =
@@ -5836,6 +6589,11 @@ thread_local! {
     /// Whether the held `best_solve` at the final restore belonged to the restored point
     /// (`None` with none held), for the #2507 tests.
     pub(crate) static HELD_SOLVE_AT_RESTORED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    /// Scales the first subject's held `H` at the final restore, for the #2646 test of this
+    /// leg: a natural gap between a cold and a warm EBE needs a fixture the next search-path
+    /// change retires, as `tests/ebe_basin_shift.rs` records four times over.
+    pub(crate) static HELD_FIRST_H_SCALE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -6325,100 +7083,171 @@ fn optimize_nlopt_attempt_probed(
         // left empty on the mixture branch, whose objective has no per-subject
         // decomposition, which disarms the guard there.
         let mut contribs: Vec<f64> = Vec::new();
-        let (ehs, hms, ebe_stats, kappas, raw_ofv, agq_evaluation) = if params.mixture.is_some() {
-            let warm = (!state.cached_etas_by_class.is_empty())
-                .then_some(state.cached_etas_by_class.as_slice());
-            let mut m = if grad.is_some() && model.n_kappa > 0 {
-                let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
-                    model, population, &params, options, warm,
-                );
-                mixmodes = Some(modes);
-                m
-            } else {
-                crate::estimation::mixture::mixture_ofv(model, population, &params, options, warm)
-            };
-            let stats = InnerLoopStats {
-                n_unconverged: m.ebe_stats.n_unconverged,
-                n_fallback: m.ebe_stats.n_fallback,
-                n_nm_polished: m.ebe_stats.n_nm_polished,
-                n_start_rejected: m.ebe_stats.n_start_rejected,
-            };
-            let ofv = m.ofv;
-            // A derivative-free eval (`grad` is `None` — e.g. BOBYQA)
-            // never touches `mixeval` or the analytic gradient, so avoid the full
-            // per-class EBE cache clone: move `etas_by_class` straight into the
-            // warm-start cache and the MIXEST EBEs into the result. When a gradient
-            // *is* requested the analytic path reads `m.etas_by_class`, so it must
-            // stay intact and the cache takes a clone.
-            if grad.is_some() {
-                state.cached_etas_by_class = m.etas_by_class.clone();
-                let out = (
-                    m.mixest_etas.clone(),
-                    m.mixest_h_mats.clone(),
-                    stats,
-                    Vec::new(),
-                    ofv,
-                    None,
-                );
-                mixeval = Some(m);
-                out
-            } else {
-                state.cached_etas_by_class = std::mem::take(&mut m.etas_by_class);
-                (
-                    std::mem::take(&mut m.mixest_etas),
-                    std::mem::take(&mut m.mixest_h_mats),
-                    stats,
-                    Vec::new(),
-                    ofv,
-                    None,
-                )
-            }
-        } else {
-            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-            let predicted: Option<Vec<DVector<f64>>> = match &state.pred_jac {
-                Some(jac) if !state.cached_etas_are_modes => {
-                    #[cfg(test)]
-                    crate::estimation::inner_optimizer::record_prediction(
-                        &state.cached_etas,
-                        jac,
-                        &state.pred_anchor,
-                        &x,
+        // #2682: a guard-rejected first evaluation is solved a second time, warm from its own
+        // EBEs, before it is judged — see `wants_start_warm_rescore`. `cold_start` holds the
+        // first solve (and what it overwrote) while the second runs.
+        let mut cold_start: Option<ColdStart> = None;
+        let mut warm_rescored_from: Option<usize> = None;
+        let (ehs, hms, ebe_stats, kappas, raw_ofv, agq_evaluation) = loop {
+            let solved = if params.mixture.is_some() {
+                let warm = (!state.cached_etas_by_class.is_empty())
+                    .then_some(state.cached_etas_by_class.as_slice());
+                let mut m = if grad.is_some() && model.n_kappa > 0 {
+                    let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
+                        model, population, &params, options, warm,
                     );
-                    Some(crate::estimation::sens_outer_gradient::predict_warm_etas(
-                        &state.cached_etas,
-                        jac,
-                        &state.pred_anchor,
-                        &x,
-                    ))
+                    mixmodes = Some(modes);
+                    m
+                } else {
+                    crate::estimation::mixture::mixture_ofv(
+                        model, population, &params, options, warm,
+                    )
+                };
+                let stats = InnerLoopStats {
+                    n_unconverged: m.ebe_stats.n_unconverged,
+                    n_fallback: m.ebe_stats.n_fallback,
+                    n_nm_polished: m.ebe_stats.n_nm_polished,
+                    n_start_rejected: m.ebe_stats.n_start_rejected,
+                };
+                let ofv = m.ofv;
+                // A derivative-free eval (`grad` is `None` — e.g. BOBYQA)
+                // never touches `mixeval` or the analytic gradient, so avoid the full
+                // per-class EBE cache clone: move `etas_by_class` straight into the
+                // warm-start cache and the MIXEST EBEs into the result. When a gradient
+                // *is* requested the analytic path reads `m.etas_by_class`, so it must
+                // stay intact and the cache takes a clone.
+                if grad.is_some() {
+                    state.cached_etas_by_class = m.etas_by_class.clone();
+                    let out = (
+                        m.mixest_etas.clone(),
+                        m.mixest_h_mats.clone(),
+                        stats,
+                        Vec::new(),
+                        ofv,
+                        None,
+                    );
+                    mixeval = Some(m);
+                    out
+                } else {
+                    state.cached_etas_by_class = std::mem::take(&mut m.etas_by_class);
+                    (
+                        std::mem::take(&mut m.mixest_etas),
+                        std::mem::take(&mut m.mixest_h_mats),
+                        stats,
+                        Vec::new(),
+                        ofv,
+                        None,
+                    )
                 }
-                _ => None,
+            } else {
+                let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+                let predicted: Option<Vec<DVector<f64>>> = match &state.pred_jac {
+                    Some(jac) if !state.cached_etas_are_modes => {
+                        #[cfg(test)]
+                        crate::estimation::inner_optimizer::record_prediction(
+                            &state.cached_etas,
+                            jac,
+                            &state.pred_anchor,
+                            &x,
+                        );
+                        Some(crate::estimation::sens_outer_gradient::predict_warm_etas(
+                            &state.cached_etas,
+                            jac,
+                            &state.pred_anchor,
+                            &x,
+                        ))
+                    }
+                    _ => None,
+                };
+                let (ehs, hms, ebe_stats, kappas, nll, prepared, nll_i) =
+                    run_inner_loop_and_nll_prepared(
+                        model,
+                        population,
+                        &params,
+                        eval_options,
+                        Some(predicted.as_ref().unwrap_or(&state.cached_etas)),
+                        predicted.is_some().then_some(
+                            crate::estimation::inner_optimizer::PredictedFromAll {
+                                modes: &state.cached_etas,
+                                seeds: state.seed_hessians.as_deref(),
+                            },
+                        ),
+                        Some(&mu_k),
+                        fuse_agq_gradient.then_some((
+                            init_params,
+                            x.as_slice(),
+                            &bounds,
+                            warm_predictor,
+                        )),
+                        Some(&schedule_cache),
+                        std::mem::take(&mut state.cached_etas_are_modes),
+                        options.cancel.as_ref(),
+                    );
+                contribs = nll_i.iter().map(|v| 2.0 * v).collect();
+                (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
             };
-            let (ehs, hms, ebe_stats, kappas, nll, prepared, nll_i) =
-                run_inner_loop_and_nll_prepared(
-                    model,
-                    population,
-                    &params,
-                    eval_options,
-                    Some(predicted.as_ref().unwrap_or(&state.cached_etas)),
-                    predicted.is_some().then_some(
-                        crate::estimation::inner_optimizer::PredictedFromAll {
-                            modes: &state.cached_etas,
-                            seeds: state.seed_hessians.as_deref(),
-                        },
-                    ),
-                    Some(&mu_k),
-                    fuse_agq_gradient.then_some((
-                        init_params,
-                        x.as_slice(),
-                        &bounds,
-                        warm_predictor,
-                    )),
-                    Some(&schedule_cache),
-                    std::mem::take(&mut state.cached_etas_are_modes),
-                    options.cancel.as_ref(),
+            if let Some(cold) = cold_start.take() {
+                // The warm re-score is judged on its own; when the guard still rejects it the
+                // evaluation is the cold one, as it was before #2682, and so is the warm-start
+                // cache — no incumbent exists yet to have earned a non-zero one (#1290).
+                state.cached_etas = cold.cached_etas;
+                let accepted = warm_rescore_accepted(
+                    &solved.2,
+                    n_subj,
+                    solved.4,
+                    options.max_unconverged_frac,
                 );
-            contribs = nll_i.iter().map(|v| 2.0 * v).collect();
-            (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
+                if verbose {
+                    eprintln!(
+                        "Eval {:>4}: start rejected by the EBE convergence guard ({} of {} \
+                         subjects unconverged from the cold start); re-solved warm from its own \
+                         EBEs: {} unconverged, {}",
+                        state.n_evals + 1,
+                        cold.solved.2.n_unconverged,
+                        n_subj,
+                        solved.2.n_unconverged,
+                        if accepted {
+                            "accepted"
+                        } else {
+                            "still rejected"
+                        },
+                    );
+                }
+                if accepted {
+                    warm_rescored_from = Some(cold.solved.2.n_unconverged);
+                    break solved;
+                }
+                contribs = cold.contribs;
+                mixeval = cold.mixeval;
+                mixmodes = cold.mixmodes;
+                break cold.solved;
+            }
+            if start_eval.get().is_none()
+                && !crate::cancel::is_cancelled(&options.cancel)
+                && wants_start_warm_rescore(
+                    &solved.2,
+                    n_subj,
+                    solved.4,
+                    options.max_unconverged_frac,
+                )
+            {
+                // A mixture's warm start is `cached_etas_by_class`, which its branch above has
+                // already set to this solve's modes; only the single-class cache is set here.
+                let warm = if params.mixture.is_some() {
+                    state.cached_etas.clone()
+                } else {
+                    outer_cache_warm_starts(model, &solved.0, &solved.3)
+                };
+                cold_start = Some(ColdStart {
+                    cached_etas: std::mem::replace(&mut state.cached_etas, warm),
+                    solved,
+                    contribs: std::mem::take(&mut contribs),
+                    mixeval: mixeval.take(),
+                    mixmodes: mixmodes.take(),
+                });
+                continue;
+            }
+            break solved;
         };
         // The pass above polls the flag per subject (#574), so a cancel that lands inside
         // it comes back here as placeholders. Leave the way the entry check does, before
@@ -6496,6 +7325,7 @@ fn optimize_nlopt_attempt_probed(
                 n_unconverged: ebe_stats.n_unconverged,
                 n_start_rejected: ebe_stats.n_start_rejected,
                 rescored: None,
+                warm_rescored_from,
             }));
         }
         let ofv = if guarded {
@@ -6708,7 +7538,20 @@ fn optimize_nlopt_attempt_probed(
         if ofv < state.best_ofv {
             state.best_ofv = ofv;
             if verbose {
-                if nn_reg.is_active() {
+                if guarded {
+                    // A guarded evaluation's `ofv` is `guard_penalty_value` (or the `1e20`
+                    // wall), not a likelihood: printed as an OFV it read as one (#2682).
+                    eprintln!(
+                        "Eval {:>4}: {}",
+                        state.n_evals,
+                        guarded_eval_line(
+                            &ebe_stats,
+                            n_subj,
+                            raw_ofv,
+                            options.max_unconverged_frac
+                        ),
+                    );
+                } else if nn_reg.is_active() {
                     eprintln!(
                         "Eval {:>4}: OFV = {:.6} (penalized objective {:.6})",
                         state.n_evals, ofv_clean, ofv
@@ -6841,6 +7684,9 @@ fn optimize_nlopt_attempt_probed(
         // that check's own margin ([`cold_solve_beats_best_seen`]), the leg stops through
         // the stagnation early-return and the end-of-leg check files the basin-shift
         // restart. A leg whose probe finds nothing continues on a bit-identical trajectory.
+        // #2600: a gap carried by under `BASIN_PROBE_RESTART_SHARE` of the subjects does not
+        // end the leg; their cold modes become the warm starts and the leg keeps its L-BFGS
+        // memory ([`basin_probe_action`]).
         let mut basin_probe_stopped = false;
         if !state.stagnation_stopped && !guarded && init_params.mixture.is_none() {
             let feasible = plateau_tracker_cl.lock().unwrap().2;
@@ -6850,37 +7696,127 @@ fn optimize_nlopt_attempt_probed(
                     .unwrap()
                     .as_ref()
                     .map(|inc| inc.xs.clone());
-                let best = best_seen_cl.lock().unwrap().get().map(|b| b.ofv_clean);
+                // The active leg's objective: inside a #2462 verification leg, its own
+                // incumbent at its own tolerance, never `best_seen`'s loose one (#2600 review).
+                let best = {
+                    let leg = leg_best.borrow();
+                    let seen = best_seen_cl.lock().unwrap();
+                    basin_probe_reference(in_verify_leg, &leg, &seen)
+                };
+                let probe_options = eval_options;
                 if let Some(xs_inc) = incumbent {
                     let x_inc: Vec<f64> = xs_inc.iter().zip(&scale).map(|(v, s)| v * s).collect();
                     let p = unpack_params(&x_inc, init_params);
-                    let mu_k = compute_mu_k(model, &p.theta, options.mu_referencing);
-                    let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
+                    let mu_k = compute_mu_k(model, &p.theta, probe_options.mu_referencing);
+                    let (ehs, hms, cold_stats, kappas) = run_inner_loop_warm_seeded(
                         model,
                         population,
                         &p,
-                        options.inner_maxiter,
-                        options.inner_tol,
+                        probe_options.inner_maxiter,
+                        probe_options.inner_tol,
                         None,
                         Some(&mu_k),
-                        options.min_obs_for_convergence_check as usize,
-                        options.inner_restarts,
-                        InnerHessianSeed::for_options(options),
-                        options,
+                        probe_options.min_obs_for_convergence_check as usize,
+                        probe_options.inner_restarts,
+                        InnerHessianSeed::for_options(probe_options),
+                        probe_options,
                     );
-                    let cold =
-                        2.0 * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, options);
+                    let cold = 2.0
+                        * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, probe_options);
                     if let Some(gap) = cold_solve_beats_best_seen(Some(cold), best) {
-                        state.stagnation_stopped = true;
-                        basin_probe_stopped = true;
-                        basin_probe_fired.set(true);
-                        if verbose {
-                            eprintln!(
-                                "Eval {:>4}: basin probe — a cold re-solve at the best point \
-                                 scores {cold:.6}, {gap:.4} below the best seen; ending this \
-                                 leg for a basin-shift restart.",
-                                state.n_evals,
-                            );
+                        // #2600: how many subjects the gap is, which decides between ending
+                        // the leg and absorbing the cold modes into it.
+                        let switched = if options.agq_nodes().is_none() {
+                            best_solve_cl
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .filter(|inc| {
+                                    inc.xs == xs_inc && inc.etas.len() == population.subjects.len()
+                                })
+                                .map(|inc| {
+                                    subjects_in_a_lower_cold_mode(
+                                        model,
+                                        population,
+                                        &p,
+                                        (&inc.etas, &inc.h_mats, &inc.kappas),
+                                        &ehs,
+                                        &hms,
+                                        &kappas,
+                                        options.interaction,
+                                    )
+                                })
+                        } else {
+                            None
+                        };
+                        #[cfg(test)]
+                        BASIN_PROBE_DECISIONS.with(|d| d.borrow_mut().push((gap, switched)));
+                        // The same EBE guard an ordinary evaluation passes (#2600 review r3).
+                        let cold_guard_rejected = ebe_guard_rejects(
+                            &cold_stats,
+                            population.subjects.len(),
+                            cold,
+                            options.max_unconverged_frac,
+                        );
+                        match basin_probe_action(
+                            switched,
+                            population.subjects.len(),
+                            cold_guard_rejected,
+                        ) {
+                            BasinProbeAction::Restart => {
+                                state.stagnation_stopped = true;
+                                basin_probe_stopped = true;
+                                basin_probe_fired.set(true);
+                                if verbose {
+                                    eprintln!(
+                                        "Eval {:>4}: basin probe — a cold re-solve at the best \
+                                         point scores {cold:.6}, {gap:.4} below the best seen \
+                                         ({switched:?} subjects in a lower cold mode); ending \
+                                         this leg for a basin-shift restart.",
+                                        state.n_evals,
+                                    );
+                                }
+                            }
+                            BasinProbeAction::Absorb => {
+                                // The cold solve is the incumbent now, in every tracker an
+                                // evaluation's improvement is measured against.
+                                let cold_penalized =
+                                    cold + nn_reg.penalty_value(&p.theta) + priors.penalty(&x_inc);
+                                let solve = IncumbentSolve {
+                                    xs: xs_inc.clone(),
+                                    etas: ehs,
+                                    h_mats: hms,
+                                    kappas,
+                                    scores: None,
+                                };
+                                let mut leg_tracker = leg_best.borrow_mut();
+                                let mut seen_tracker = best_seen_cl.lock().unwrap();
+                                absorb_cold_incumbent(
+                                    state,
+                                    if in_verify_leg {
+                                        &mut leg_tracker
+                                    } else {
+                                        &mut seen_tracker
+                                    },
+                                    &mut best_solve_cl.lock().unwrap(),
+                                    &mut last_gradient_cl.lock().unwrap(),
+                                    &mut plateau_tracker_cl.lock().unwrap(),
+                                    (cold_penalized, cold),
+                                    model,
+                                    solve,
+                                );
+                                if verbose {
+                                    eprintln!(
+                                        "Eval {:>4}: basin probe — a cold re-solve at the best \
+                                         point scores {cold:.6}, {gap:.4} below the best seen, \
+                                         from {} of {} subjects; continuing this leg from \
+                                         their cold modes.",
+                                        state.n_evals,
+                                        switched.unwrap_or(0),
+                                        population.subjects.len(),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -7089,6 +8025,8 @@ fn optimize_nlopt_attempt_probed(
     let verified_needs_left_init = verified_stop_needs_left_init(&first_leg, latched_at_stop);
     // The best leg incumbent copied into `best_seen` so far (#2507), at the leg tolerance.
     let mut kept_leg_best: Option<f64> = None;
+    // `kept_leg_best` as the code around the legs reads it, while they hold the original.
+    let kept_best_seen = std::cell::Cell::new(None::<f64>);
     // The optimizer gradient and the whole EBE state (`best_solve`) at that incumbent
     // ([`keep_verify_leg`]).
     let mut kept_leg_state: Option<(Option<Vec<f64>>, Option<IncumbentSolve>)> = None;
@@ -7109,105 +8047,241 @@ fn optimize_nlopt_attempt_probed(
                 left_init_at_stop,
                 plateau_shape,
             );
-        unprofiled_verify_legs(
-            first_leg,
-            first_needs_verify,
-            // Read live: a cancel during a leg ends the legs there.
-            |r| {
-                !basin_probe_fired.get()
-                    && unprofiled_stop_needs_verify(
-                        r,
-                        crate::cancel::is_cancelled(&options.cancel),
-                        left_init_at_stop,
-                        true,
-                    )
-            },
-            budget_left,
-            |left| {
-                if plateau_tracker.lock().unwrap().2 == 0 {
-                    return None;
-                }
-                let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
-                let mut state = opt_slot.take()?.recover_user_data();
-                // The incumbent's own modes, when the held state is this point's.
-                let held = best_solve_cl
+        // Read live: a cancel during a leg ends the legs there.
+        let leg_needs_verify = |r: &NloptReturn| {
+            !basin_probe_fired.get()
+                && unprofiled_stop_needs_verify(
+                    r,
+                    crate::cancel::is_cancelled(&options.cancel),
+                    left_init_at_stop,
+                    true,
+                )
+        };
+        // The cold solve at the verified stop: judges the stop, then seeds the cold round.
+        let cold_at_stop = std::cell::RefCell::new(None::<FinalInnerSolve>);
+        // Set for the first leg of a pass ([`leg_pass_applies`]).
+        let next_start = std::cell::Cell::new(LegStart::Incumbent);
+        let mut run_leg = |left: u32| {
+            if plateau_tracker.lock().unwrap().2 == 0 {
+                return None;
+            }
+            let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
+            // The point and modes the leg starts at: the incumbent and its own modes when the
+            // held state is this point's. A pass needs that held state to compare against.
+            let mut start_x = best_x.clone();
+            let held = match next_start.replace(LegStart::Incumbent) {
+                LegStart::Incumbent => best_solve_cl
                     .lock()
                     .unwrap()
                     .as_ref()
                     .filter(|inc| inc.xs == best_x)
-                    .map(|inc| outer_cache_warm_starts(model, &inc.etas, &inc.kappas));
-                x0.copy_from_slice(&best_x);
-                state.prev_x = best_x;
-                // Unlatched: a latched state answers every evaluation with the incumbent
-                // and a zero gradient, and the latch carries into the recovered state.
-                state.stagnation_stopped = false;
-                state.recent_steps.clear();
-                stagnation_latched.store(false, Ordering::Relaxed);
-                // The leg's own incumbent, so its first evaluation is adopted as the
-                // warm start whatever the loose objective was.
-                state.best_ofv = f64::INFINITY;
-                state.last_improvement_eval = state.n_evals;
-                state.best_at_last_improvement = f64::INFINITY;
-                // The leg's first evaluation re-solves the incumbent's own modes at the leg's
-                // tolerance: a verification leg tightens the inner solve at the point it
-                // starts from, so its inner solves start at the modes of that point (#2549).
-                // A cold start re-selected every mode at `UNPROFILED_VERIFY_INNER_TOL`: on the
-                // ODE twin of `transit_flip_flop_fit_matches_ode_twin` it left one of four
-                // subjects unconverged, the EBE guard rejected the leg's start, and the leg
-                // walked to the TVNTR floor (−59.31 against the incumbent's −228.59). No mode
-                // response carries over: it belongs to the modes of the evaluation it was
-                // taken at, and the leg's first point needs none (Δx = 0). Cold only when the
-                // held state is another point's.
-                state.reset_to_cold_start();
-                if let Some(modes) = held.filter(|m| m.len() == state.cached_etas.len()) {
-                    state.cached_etas = modes;
+                    .map(|inc| outer_cache_warm_starts(model, &inc.etas, &inc.kappas)),
+                LegStart::ColdModes => {
+                    let x_inc: Vec<f64> = best_x.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                    let p = unpack_params(&x_inc, init_params);
+                    let cold = cold_at_stop.take()?;
+                    let incumbent = best_solve_cl.lock().unwrap();
+                    let inc = incumbent.as_ref().filter(|inc| inc.xs == best_x)?;
+                    let terms = |etas: &[DVector<f64>],
+                                 h_mats: &[DMatrix<f64>],
+                                 kappas: &[Vec<DVector<f64>>]| {
+                        subject_nlls(
+                            model,
+                            population,
+                            &p,
+                            etas,
+                            h_mats,
+                            kappas,
+                            options.interaction,
+                        )
+                    };
+                    let moved = subjects_off_the_held_modes(
+                        &terms(&inc.etas, &inc.h_mats, &inc.kappas),
+                        &terms(&cold.etas, &cold.h_mats, &cold.kappas),
+                    );
+                    if verbose {
+                        eprintln!(
+                            "Cold solve at the verified incumbent: {moved} of {} subjects off \
+                             its modes.",
+                            population.subjects.len(),
+                        );
+                    }
+                    if moved == 0 {
+                        return None;
+                    }
+                    Some(outer_cache_warm_starts(model, &cold.etas, &cold.kappas))
                 }
-                *leg_best.borrow_mut() = BestPoint::new();
-                leg_first.set(None);
-                let mut leg =
-                    nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
-                leg.set_lower_bounds(&lower_s).unwrap();
-                leg.set_upper_bounds(&upper_s).unwrap();
-                leg.set_maxeval(left).unwrap();
-                // The first leg's own stops (`verify_on` excludes the reachable ones).
-                leg.set_xtol_rel(1e-12).unwrap();
-                leg.set_ftol_rel(1e-12).unwrap();
-                in_leg.set(true);
-                let r = leg.optimize(&mut x0);
-                in_leg.set(false);
-                opt_slot = Some(leg);
-                let best = leg_best.borrow().get().map(|b| b.ofv);
-                let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
-                // The first leg's incumbent replaces the loose one: the two are at different
-                // tolerances, and the loose one can be lower by its noise alone. A later leg's
-                // replaces it only when lower; otherwise the kept leg's gradient and EBE state
-                // go back in, which this leg's improving evaluations overwrote
-                // ([`keep_verify_leg`]).
-                let mut live = (
-                    last_gradient.lock().unwrap().take(),
-                    best_solve.lock().unwrap().take(),
-                );
-                if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, best, &mut live) {
-                    *best_seen.lock().unwrap() = leg_best.borrow().clone();
+                LegStart::NewtonStep => {
+                    let incumbent = best_solve_cl.lock().unwrap();
+                    let inc = incumbent.as_ref().filter(|inc| inc.xs == best_x)?;
+                    let x_inc: Vec<f64> = best_x.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                    let (gain, step) = predicted_newton_step(
+                        model,
+                        population,
+                        init_params,
+                        &x_inc,
+                        &inc.etas,
+                        &inc.kappas,
+                        &bounds,
+                        options,
+                        &nn_reg,
+                        &priors,
+                    )?;
+                    if verbose {
+                        eprintln!(
+                            "Newton step from the verified incumbent: predicted gain {gain:.4} \
+                             (a leg runs above {LATCH_MAX_PREDICTED_GAIN})."
+                        );
+                    }
+                    if !newton_gain_warrants_a_leg(gain, population.subjects.len(), &step) {
+                        return None;
+                    }
+                    start_x = newton_start(&x_inc, &step, &bounds)
+                        .iter()
+                        .zip(&scale)
+                        .map(|(v, s)| v / s)
+                        .collect();
+                    Some(outer_cache_warm_starts(model, &inc.etas, &inc.kappas))
                 }
-                *last_gradient.lock().unwrap() = live.0;
-                *best_solve.lock().unwrap() = live.1;
-                let outcome = UnprofiledLeg {
-                    ret: r,
-                    gain,
-                    best,
-                    first: leg_first.get(),
-                };
-                #[cfg(test)]
-                UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
-                if options.verbose {
-                    eprintln!(
-                        "Verification leg from OFV {before:.9} at inner_tol = {:e}: {:?}, \
+            };
+            let mut state = opt_slot.take()?.recover_user_data();
+            x0.copy_from_slice(&start_x);
+            state.prev_x = start_x;
+            // Unlatched: a latched state answers every evaluation with the incumbent
+            // and a zero gradient, and the latch carries into the recovered state.
+            state.stagnation_stopped = false;
+            state.recent_steps.clear();
+            stagnation_latched.store(false, Ordering::Relaxed);
+            // The leg's own incumbent, so its first evaluation is adopted as the
+            // warm start whatever the loose objective was.
+            state.best_ofv = f64::INFINITY;
+            state.last_improvement_eval = state.n_evals;
+            state.best_at_last_improvement = f64::INFINITY;
+            // The leg's first evaluation re-solves the incumbent's own modes at the leg's
+            // tolerance: a verification leg tightens the inner solve at the point it
+            // starts from, so its inner solves start at the modes of that point (#2549).
+            // A cold start re-selected every mode at `UNPROFILED_VERIFY_INNER_TOL`: on the
+            // ODE twin of `transit_flip_flop_fit_matches_ode_twin` it left one of four
+            // subjects unconverged, the EBE guard rejected the leg's start, and the leg
+            // walked to the TVNTR floor (−59.31 against the incumbent's −228.59). No mode
+            // response carries over: it belongs to the modes of the evaluation it was
+            // taken at, and the leg's first point needs none (Δx = 0). Cold only when the
+            // held state is another point's. The cold-mode pass starts its first leg at a
+            // cold solve's modes the same way, so that leg's first evaluation is a warm
+            // re-solve of them and a subject the cold solve left unconverged is not what
+            // the guard judges (#2645).
+            state.reset_to_cold_start();
+            if let Some(modes) = held.filter(|m| m.len() == state.cached_etas.len()) {
+                state.cached_etas = modes;
+            }
+            *leg_best.borrow_mut() = BestPoint::new();
+            leg_first.set(None);
+            let mut leg = nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
+            leg.set_lower_bounds(&lower_s).unwrap();
+            leg.set_upper_bounds(&upper_s).unwrap();
+            leg.set_maxeval(left).unwrap();
+            // The first leg's own stops (`verify_on` excludes the reachable ones).
+            leg.set_xtol_rel(1e-12).unwrap();
+            leg.set_ftol_rel(1e-12).unwrap();
+            in_leg.set(true);
+            let r = leg.optimize(&mut x0);
+            in_leg.set(false);
+            opt_slot = Some(leg);
+            let best = leg_best.borrow().get().map(|b| b.ofv);
+            let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
+            // The first leg's incumbent replaces the loose one: the two are at different
+            // tolerances, and the loose one can be lower by its noise alone. A later leg's
+            // replaces it only when lower; otherwise the kept leg's gradient and EBE state
+            // go back in, which this leg's improving evaluations overwrote
+            // ([`keep_verify_leg`]).
+            let mut live = (
+                last_gradient.lock().unwrap().take(),
+                best_solve.lock().unwrap().take(),
+            );
+            if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, best, &mut live) {
+                *best_seen.lock().unwrap() = leg_best.borrow().clone();
+            }
+            kept_best_seen.set(kept_leg_best);
+            *last_gradient.lock().unwrap() = live.0;
+            *best_solve.lock().unwrap() = live.1;
+            let outcome = UnprofiledLeg {
+                ret: r,
+                gain,
+                best,
+                first: leg_first.get(),
+            };
+            #[cfg(test)]
+            UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
+            if options.verbose {
+                eprintln!(
+                    "Verification leg from OFV {before:.9} at inner_tol = {:e}: {:?}, \
                          gain {gain:.3e}, best {best:?}",
-                        leg_options.inner_tol, outcome.ret,
+                    leg_options.inner_tol, outcome.ret,
+                );
+            }
+            Some(outcome)
+        };
+        let warm = unprofiled_verify_legs(
+            first_leg,
+            first_needs_verify,
+            leg_needs_verify,
+            &budget_left,
+            &mut run_leg,
+        );
+        drive_leg_passes(
+            warm,
+            |v| v.1,
+            || crate::cancel::is_cancelled(&options.cancel),
+            PassState {
+                basin_probe_fired: &basin_probe_fired,
+                stagnation_latched: &stagnation_latched,
+                kept_best: &kept_best_seen,
+            },
+            || {
+                // Clean, as the final check reads it: the cold objective carries no penalty.
+                let incumbent = best_seen
+                    .lock()
+                    .unwrap()
+                    .get()
+                    .map(|b| (b.x.clone(), b.ofv_clean));
+                let Some((best_x, best)) = incumbent.filter(|(x, _)| x.len() == n) else {
+                    return false;
+                };
+                let x_inc: Vec<f64> = best_x.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                let p = unpack_params(&x_inc, init_params);
+                let mu_k = compute_mu_k(model, &p.theta, options.mu_referencing);
+                let Some(cold) = cold_modes_solve(model, population, &p, &mu_k, options) else {
+                    return false;
+                };
+                let cold_ofv = 2.0
+                    * pop_nll_opts(
+                        model,
+                        population,
+                        &p,
+                        &cold.etas,
+                        &cold.h_mats,
+                        &cold.kappas,
+                        options,
+                    );
+                let owed = verified_stop_owes_a_restart(best, cold_ofv);
+                if verbose && owed {
+                    eprintln!(
+                        "Verified stop at OFV {best:.6}, cold {cold_ofv:.6}: left to its \
+                         restart, no further rounds."
                     );
                 }
-                Some(outcome)
+                *cold_at_stop.borrow_mut() = Some(cold);
+                !owed
+            },
+            |start, verified| {
+                next_start.set(start);
+                unprofiled_verify_legs(
+                    verified.0,
+                    true,
+                    leg_needs_verify,
+                    &budget_left,
+                    &mut run_leg,
+                )
             },
         )
     } else {
@@ -7566,6 +8640,9 @@ fn optimize_nlopt_attempt_probed(
     // #2013: the IDs of the subjects whose EBE the cold solve's Sobol screen moved off the
     // mode the cold descent found. Feeds the warning only.
     let mut screen_moved_ids: Vec<String> = Vec::new();
+    // #2646: the subjects whose reported EBEs score materially below their cold ones.
+    // Feeds the warning only.
+    let mut cold_lost_ids: Vec<String> = Vec::new();
 
     // Final inner loop at converged parameters. Mixture (#977 Phase 3): the OFV
     // is the K-fold log-sum-exp and the reported EBEs are the MIXEST class.
@@ -7634,10 +8711,11 @@ fn optimize_nlopt_attempt_probed(
             // for would not hold on precisely the path that motivated it. Scoring the
             // incumbent costs one `pop_nll_opts` pass and no inner loop.
             //
-            // The extra work is *conditional* on the cold solve having failed to
-            // reproduce `best_seen_ofv`. On a unimodal inner problem — most fits — it
-            // reproduces it, there is nothing to recover, and the fit stays
-            // bit-identical to the pre-#833 behaviour at exactly the old cost. A
+            // The re-solve is *conditional* on the cold solve having failed to reproduce
+            // `best_seen_ofv`, in total or on some subject (#2646). On a unimodal inner
+            // problem — most fits — it reproduces it, there is nothing to recover, and
+            // the fit stays bit-identical to the pre-#833 behaviour, at the cost of the
+            // population passes that comparison takes and no inner solve. A
             // non-finite cold objective asks for the retry too; that is `NonFinite`'s
             // own arm rather than a gap test, because every comparison against `NaN` is
             // false.
@@ -7651,6 +8729,13 @@ fn optimize_nlopt_attempt_probed(
                 .filter(|inc| inc.etas.len() == population.subjects.len());
             #[cfg(test)]
             HELD_SOLVE_AT_RESTORED.with(|c| c.set(held.as_ref().map(|inc| inc.xs == restored_xs)));
+            #[cfg(test)]
+            let held = held.map(|mut inc| {
+                if let Some(scale) = HELD_FIRST_H_SCALE.with(|c| c.get()) {
+                    inc.h_mats[0] *= scale;
+                }
+                inc
+            });
             // #1565: the opposite direction. Counting is a diagnostic for the warning,
             // and it reads the held state as *this point's*, so it needs the same
             // `xs` match as scoring it does below; AGQ's per-subject term is not the
@@ -7674,8 +8759,8 @@ fn optimize_nlopt_attempt_probed(
                         )
                     });
             }
-            let incumbent = held.filter(|_| cold_missed_the_incumbent);
-            let (ehs, hms, kappas, ofv) = match incumbent {
+            let cold_candidate = (cold_ehs, cold_hms, cold_kappas, cold);
+            let (ehs, hms, kappas, ofv) = match held {
                 Some(inc) => {
                     // Scoring the held state is only sound when it belongs to the point
                     // that was restored — its `h_mats` are that point's curvature. When
@@ -7692,24 +8777,22 @@ fn optimize_nlopt_attempt_probed(
                             options,
                         )
                     });
-                    let (reported, pick) = best_final_candidate(
+                    let pick = recover_final_ebes(
                         model,
                         population,
                         &final_params,
                         &final_mu_k,
                         options,
-                        (cold_ehs, cold_hms, cold_kappas, cold),
+                        cold_candidate,
                         &seed,
                         held,
+                        cold_missed_the_incumbent,
                     );
-                    // The #2013 warning names EBEs the cold solve moved; reported EBEs
-                    // from another candidate were not.
-                    if pick != 0 {
-                        screen_moved_ids.clear();
-                    }
-                    reported
+                    pick.retain_cold_reported(&mut screen_moved_ids);
+                    cold_lost_ids = pick.cold_lost_ids;
+                    pick.reported
                 }
-                None => (cold_ehs, cold_hms, cold_kappas, cold),
+                None => cold_candidate,
             };
             (ehs, hms, kappas, ofv, None)
         };
@@ -7874,7 +8957,9 @@ fn optimize_nlopt_attempt_probed(
     // estimates depend on where the inner loop starts, and so does every diagnostic
     // built on them. Surface it rather than silently reporting the best candidate
     // (#833). [`ebe_start_dependence_warning`] owns both arms and the wording.
-    if let Some(w) = cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv)) {
+    if let Some(w) =
+        cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv, &cold_lost_ids))
+    {
         warnings.push(w);
     }
     if let Some(w) = ebe_screen_moved_warning(&screen_moved_ids) {
@@ -8046,6 +9131,8 @@ fn optimize_nlopt_attempt_probed(
         vi: None,
         // A restart leg publishes the fit's start, not its own (see `OuterResult::start_eval`).
         start_eval: inherited_start.unwrap_or(start_eval.get()),
+        mcem_lowest_objective: None,
+        mcem_objective_trail: None,
     };
     (
         result,
@@ -8682,6 +9769,8 @@ fn optimize_bfgs(
         mixture_posteriors: None,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: None,
+        mcem_objective_trail: None,
         params: final_params,
         ofv: final_ofv,
         converged,

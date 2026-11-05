@@ -291,6 +291,11 @@ Off-diagonal Cholesky entries appear as `chol_<eta_row>_<eta_col>` (`L_ij`,
 not log-transformed). See [Packed Parameter
 Space](estimation/parameterization.qmd) for the full layout and bounds.
 
+On an IMP or IMPMAP fit, `objective_function` also carries `ofv_type: laplace`,
+and any fit with an importance-sampling marginal carries
+`marginal_minus2_log_likelihood` and `marginal_mc_standard_error`. See
+[which number matches NONMEM](estimation/importance-sampling.qmd#how-the-estimator-works).
+
 `warnings:` lists the warning messages. `warning_details:` follows it with
 every warning that carries a structured `details` payload — see [Where
 `details` is written](warnings.qmd#where-details-is-written). Both blocks are
@@ -347,8 +352,8 @@ absent when there is nothing to list.
   (#1683, #1697). A console CV% of 1e6 or more prints to three significant
   figures in scientific notation (`CV% = 7.64e35`) rather than every integer
   digit of the double (#1883); a CV% that size usually means the variance is on
-  another scale, e.g. an additive kappa read as log-normal from a bundle saved
-  before `kappa_param_types`. The YAML's `cv_pct` keeps its full figure. That line's figure is printed exactly when the row's note is
+  another scale, e.g. an additive kappa read as log-normal on a result with no
+  `kappa_param_types`. The YAML's `cv_pct` keeps its full figure. That line's figure is printed exactly when the row's note is
   (#1698): a custom kappa, or a covariance step that failed or fell back to SIR,
   leaves the bare `weight = NARM (κ ~ …)`. The YAML keys are written either way.
 - **weight** / **weight_typical** / **sd_at_typical_weight** /
@@ -430,8 +435,7 @@ keyed by its name; for a sample-size-weighted kappa the interval is on the
 weight-1 γ², like the `omega_iov` entry's `variance`. A model with no kappa
 writes no `ci_kappa:` key. On the `FitResult` the same numbers are
 `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ci_kappa` (`None` without a
-kappa) and `sir_ess`, and they are saved in a `.fitrx` bundle; a bundle saved
-before #1705 loads with `sir_ci_kappa = None`.
+kappa) and `sir_ess`, and they are saved in a `.fitrx` bundle.
 
 ## FitResult Fields (Rust API / console)
 
@@ -563,10 +567,6 @@ Where it appears:
   code means the step produced no matrix, so by the rule above there is no
   estimator to name and the key is omitted.
 
-A `.fitrx` bundle written before this field existed loads with
-`covariance_method: None`: the file does not record it, and a default would be a
-fabricated provenance.
-
 ### Run Record Fields
 
 | Field | Description |
@@ -600,8 +600,7 @@ Container detection is best-effort: a cgroup-v2 host with a cgroup namespace
 the Kubernetes env var check exists as a fallback alongside the `/.dockerenv`
 marker and cgroup substring match.
 
-`.fitrx` bundles saved before this field existed load with an `"unknown"`
-placeholder rather than the *loading* machine's environment.
+A `.fitrx` bundle returns the environment it recorded, not the *loading* machine's.
 
 ### EBE Convergence Diagnostics
 
@@ -616,7 +615,7 @@ Counters from the inner-loop (EBE) optimizer, useful for diagnosing problematic 
 
 ## Optimizer Trace CSV
 
-When `optimizer_trace = true` is set in `[fit_options]`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is also stored in `FitResult::trace_path`.
+When `optimizer_trace = true` is set in `[fit_options]`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is also stored in `FitResult::trace_path`, and the text in `FitResult::trace_csv`, which a `.fitrx` bundle carries as `trace.csv` after the temporary file is gone.
 
 Each row is one outer iteration. See the [fit-options trace table](model-file/fit-options.qmd#optimizer-trace) for the full column reference.
 

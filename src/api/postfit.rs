@@ -948,6 +948,8 @@ pub(crate) fn compute_subject_results(
                     &params.theta,
                     eta.as_slice(),
                 ),
+                #[cfg(not(feature = "survival"))]
+                discrete_rows: Vec::new(),
                 // TTE per-record residuals at the same EBE, off the curves the OFV
                 // contribution above scored (#901). Empty without a TTE endpoint.
                 #[cfg(feature = "survival")]
@@ -1700,6 +1702,25 @@ fn warning_entry_with_severity(
     }
 }
 
+/// The `[odes]` RHS-route note (#2681) as a fit warning, once per fit: informational,
+/// with the construct that kept the interpreter (or why no native code) in `details`.
+/// `None` for a model with no `[odes]` block or one whose RHS runs as native code.
+pub(crate) fn ode_rhs_route_warning(model: &CompiledModel) -> Option<(String, WarningEntry)> {
+    let (_, msg, details) = model
+        .ode_spec
+        .as_ref()?
+        .rhs_program
+        .as_ref()?
+        .route_note()?;
+    let entry = warning_entry_with_severity(
+        WarningSeverity::Info,
+        WarningCode::OdeRhsRoute,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
+}
+
 /// Shared scaffold for the list-style fit-end warnings: given a set of `hits`,
 /// return `None` when empty, otherwise join a human `list` string (`line` per
 /// hit), format the message (`msg` over the joined list), build the structured
@@ -2034,6 +2055,196 @@ pub(crate) fn nonfinite_objective_warning(
     );
     Some((msg, entry))
 }
+
+/// Demote a fit whose importance-sampling marginal shows the run failed, and say
+/// which way (#2652).
+///
+/// `ofv` is not the number at stake here. Under IMP / IMPMAP it is a Laplace pass, so
+/// `nonfinite_objective_warning` never saw the two fits this exists for: cefepime with
+/// a marginal of `inf` (before #2651), and cefepime with a marginal of 13,354.7 (Linux,
+/// before #2650) against NONMEM's 4282.9. Both reported `converged: true`.
+///
+/// * **Unusable marginal.** The same two rules as
+///   `impmap::gate_converged_on_mcem_objective`. This arm also covers an
+///   `imp_eval_only` readout, where the estimates are another stage's: the fit still
+///   publishes a marginal it cannot stand behind.
+/// * **Risen marginal.** See `impmap::mcem_objective_rise`. `lowest` is `None` when
+///   no MCEM stage produced the reported estimates, so this arm needs an estimating
+///   IMP / IMPMAP stage.
+///
+/// `marginal` is `None` when no marginal was published, which leaves the verdict alone:
+/// an estimating stage whose marginal pass was skipped is not checked for a rise.
+pub(crate) fn mcem_marginal_warning(
+    converged: &mut bool,
+    marginal: Option<f64>,
+    lowest: Option<f64>,
+    n_obs: usize,
+) -> Option<(String, WarningEntry)> {
+    use crate::estimation::impmap::{
+        mcem_objective_rise, objective_converged, MCEM_RISE_TOLERANCE,
+    };
+    use crate::estimation::outer_optimizer::{nonfinite_objective_reason, ofv_is_valid};
+    let marginal = marginal?;
+    let (msg, details) = if !(ofv_is_valid(marginal) && objective_converged(marginal)) {
+        let reason = nonfinite_objective_reason(marginal);
+        let msg = format!(
+            "{NONFINITE_MARGINAL_TOKEN}: the importance-sampling marginal −2 log L at the final \
+             estimates is {reason} ({marginal:?}), so the fit is reported converged: false."
+        );
+        let details = serde_json::json!({
+            "marginal": json_value(marginal),
+            "reason": reason,
+        });
+        (msg, details)
+    } else {
+        let lowest = lowest?;
+        let rise = mcem_objective_rise(marginal, lowest, n_obs)?;
+        let msg = format!(
+            "{MCEM_OBJECTIVE_ROSE_TOKEN}: the importance-sampling marginal −2 log L at the final \
+             estimates ({marginal:.4}) is {rise:.4} above the lowest value the iterations \
+             reached ({lowest:.4}), so the fit is reported converged: false. An EM iteration \
+             should not raise the objective, so the run left that point and did not return."
+        );
+        let details = serde_json::json!({
+            "marginal": marginal,
+            "lowest_iteration_objective": lowest,
+            "rise": rise,
+            "tolerance": MCEM_RISE_TOLERANCE,
+        });
+        (msg, details)
+    };
+    *converged = false;
+    let entry = warning_entry_with_severity(
+        WarningSeverity::Critical,
+        WarningCode::Convergence,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
+}
+
+/// Demote a fit whose IMP / IMPMAP objective had not settled when the iteration limit
+/// stopped it, and say which way (#2686). See `impmap::McemObjectiveTrail::settling`.
+///
+/// `trail` is `None` when no MCEM stage produced the estimates. `marginal` is `None`
+/// when no marginal was published, which leaves only the falling-floor test.
+///
+/// A run too short to test keeps its verdict, and hears that the verdict then only says
+/// the run did not diverge. A run long enough whose trace cannot be read is demoted:
+/// nothing in it shows the run settled.
+pub(crate) fn mcem_settling_warning(
+    converged: &mut bool,
+    trail: Option<&crate::estimation::impmap::McemObjectiveTrail>,
+    marginal: Option<crate::estimation::impmap::FinalMarginal>,
+) -> Option<(String, WarningEntry)> {
+    use crate::estimation::impmap::{McemSettling, MCEM_SETTLE_MIN_WINDOW};
+    let trail = trail?;
+    let label = &trail.label;
+    let n = trail.objectives.len();
+    let (severity, msg, details) = match trail.settling(marginal) {
+        McemSettling::Settled => return None,
+        McemSettling::TooShort => {
+            let needed = 3 * MCEM_SETTLE_MIN_WINDOW;
+            let msg = format!(
+                "{MCEM_SETTLING_UNTESTED_TOKEN}: {label}: {n} iteration(s) are too few to test \
+                 whether the objective settled, so `converged` only says the run did not \
+                 diverge. The test needs `{}` of at least {needed}.",
+                trail.iterations_option
+            );
+            let details = serde_json::json!({ "iterations": n, "needed": needed });
+            (WarningSeverity::Warning, msg, details)
+        }
+        McemSettling::Unusable { window, usable } => {
+            *converged = false;
+            let msg = format!(
+                "{MCEM_NOT_SETTLED_TOKEN}: {label}: the run's objective trace cannot be read, \
+                 so the fit is reported converged: false. One of its last two windows of \
+                 {window} iterations has only {usable} finite value(s) of objective or \
+                 Monte-Carlo SE, and reading a window takes {MCEM_SETTLE_MIN_WINDOW}. Those \
+                 iterations produced no usable likelihood, so find out why before relying on \
+                 the estimates."
+            );
+            let details = serde_json::json!({
+                "reason": "unusable_trace",
+                "window": window,
+                "usable": usable,
+                "needed": MCEM_SETTLE_MIN_WINDOW,
+            });
+            (WarningSeverity::Critical, msg, details)
+        }
+        McemSettling::Falling {
+            window,
+            previous_floor,
+            floor,
+            previous_mc_se,
+            mc_se,
+        } => {
+            *converged = false;
+            let msg = format!(
+                "{MCEM_NOT_SETTLED_TOKEN}: {label}: the objective was still falling when the \
+                 run reached its limit of {n} iterations, so the fit is reported converged: \
+                 false. Its floor fell from {previous_floor:.2} to {floor:.2} over the last \
+                 two windows of {window} iterations (Monte-Carlo SEs {previous_mc_se:.2} and \
+                 {mc_se:.2}), so the estimates are likely short of the optimum. Raise `{}`.",
+                trail.iterations_option
+            );
+            let details = serde_json::json!({
+                "reason": "falling",
+                "window": window,
+                "previous_floor": previous_floor,
+                "floor": floor,
+                "previous_mc_se": previous_mc_se,
+                "mc_se": mc_se,
+            });
+            (WarningSeverity::Critical, msg, details)
+        }
+        McemSettling::AboveMarginal {
+            window,
+            floor,
+            marginal,
+            mc_se,
+        } => {
+            *converged = false;
+            let msg = format!(
+                "{MCEM_NOT_SETTLED_TOKEN}: {label}: the iteration objective stayed well above \
+                 the final marginal, so the fit is reported converged: false. Over the last \
+                 {window} iterations its floor was {floor:.2} (Monte-Carlo SE {mc_se:.2}) \
+                 against a marginal of {:.2} (SE {:.2}), so the iterations were not sampling \
+                 the posterior well and the estimates may be short of the optimum. Raise `{}`, \
+                 use a heavy-tailed proposal (`{}`), or chain a FOCE/FOCEI stage first.",
+                marginal.value, marginal.mc_se, trail.samples_option, trail.proposal_option
+            );
+            let details = serde_json::json!({
+                "reason": "above_marginal",
+                "window": window,
+                "floor": floor,
+                "marginal": marginal.value,
+                "marginal_mc_se": marginal.mc_se,
+                "mc_se": mc_se,
+            });
+            (WarningSeverity::Critical, msg, details)
+        }
+    };
+    let entry = warning_entry_with_severity(
+        severity,
+        WarningCode::Convergence,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
+}
+
+/// Stable token of [`mcem_settling_warning`]'s demoting arms.
+pub(crate) const MCEM_NOT_SETTLED_TOKEN: &str = "W_MCEM_NOT_SETTLED";
+
+/// Stable token of [`mcem_settling_warning`]'s note on a run too short to test.
+pub(crate) const MCEM_SETTLING_UNTESTED_TOKEN: &str = "W_MCEM_SETTLING_UNTESTED";
+
+/// Stable token of [`mcem_marginal_warning`]'s unusable-marginal arm.
+pub(crate) const NONFINITE_MARGINAL_TOKEN: &str = "W_NONFINITE_MARGINAL";
+
+/// Stable token of [`mcem_marginal_warning`]'s risen-marginal arm.
+pub(crate) const MCEM_OBJECTIVE_ROSE_TOKEN: &str = "W_MCEM_OBJECTIVE_ROSE";
 
 /// How many subjects `W_NONFINITE_OBJECTIVE`'s message names before it says "and N
 /// more"; the `details` payload lists every one (#2038).

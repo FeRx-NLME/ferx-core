@@ -60,7 +60,7 @@ export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
 # current user's numeric group IDs, and it wins. The first draft used it and
 # every group name silently became a GID — `unknown group 'check' — expected one
 # of: 20 12 61 ...`.
-ALL_GROUPS=(changelog fmt check clippy rustdoc docs public-api debug-assertions release-semantics)
+ALL_GROUPS=(changelog fmt check clippy rustdoc docs patterns public-api debug-assertions release-semantics)
 
 # Groups that are NOT in the default selection.
 #
@@ -141,8 +141,9 @@ one thing under a live guard and another without it. CI runs this one as
 NOT covered by the DEFAULT set: the test jobs. \`cargo check --tests\` COMPILES
 the test targets but runs nothing, so \`Tests + coverage (core)\` can still go red
 after a green preflight. The default set gates compilation and lint, not
-behaviour. Three exceptions: \`docs\`, whose gate IS its test run (a filesystem walk
-over \`docs/\`, not a fit), and the two opt-in suites above.
+behaviour. Four exceptions: \`docs\` and \`patterns\`, whose gates ARE their test
+runs (a walk over \`docs/\`, and a parse of the test code against
+\`tools/lint-rules/\` — not a fit), and the two opt-in suites above.
 
 \`changelog\` compiles nothing: it validates the \`changelog.d/\` fragments
 (#1545). Whether a PR needs one is \`tools/changelog.sh require\`, run in CI by
@@ -439,6 +440,25 @@ group_docs() {
   # whose lint coverage exists only because of this line would otherwise keep exactly
   # the exit-0 hole #1470 closed everywhere else.
   run cargo clippy -p docs-lint --all-targets -- -Dunused
+}
+
+group_patterns() {
+  CI_JOB="Patterns lint"
+  # Source-pattern lints over TEST code (#2634), rule files and the shrink-only
+  # baseline under `tools/lint-rules/`. The first rule is `nan-fold`: a
+  # `x = x.max(e)` / `.fold(…, f64::max)` in a test discards NaN, so the
+  # assertion passes on the finite rows and a solver returning NaN goes green —
+  # the hole AGENTS.md documents and `pktte_tdep_nonmem_anchor` shipped with.
+  #
+  # Same shape as the `docs` group, for the same reason: the corpus check IS a
+  # test (`crates/patterns-lint/tests/patterns_corpus.rs`), a parse of the source tree
+  # rather than a fit, so running it is the gate. The crate depends on no
+  # workspace crate (only `syn`), so this never touches the `ferx-core` build.
+  run cargo test -p patterns-lint
+
+  # Outside the `Clippy` group's package list, like `docs-lint`; `-Dunused` for
+  # the same reason as there.
+  run cargo clippy -p patterns-lint --all-targets -- -Dunused
 }
 
 group_rustdoc() {

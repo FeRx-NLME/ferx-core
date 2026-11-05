@@ -98,6 +98,17 @@ fn yaml_cv_pct(cv: f64) -> String {
     }
 }
 
+/// The IS proposal's degrees of freedom as a YAML scalar: `{:.4}` when finite,
+/// else `.inf`, for the same reason as [`yaml_cv_pct`] — `imp_proposal_df =
+/// normal` is ν = ∞ on an otherwise healthy result (#2651).
+fn yaml_proposal_df(nu: f64) -> String {
+    if nu.is_finite() {
+        format!("{:.4}", nu)
+    } else {
+        ".inf".to_string()
+    }
+}
+
 /// Largest absolute component of [`FitResult::final_gradient`], or `None` when
 /// the fit reported no gradient (#1934). A non-finite component makes the whole
 /// norm `NaN` rather than being dropped — `f64::max` discards `NaN`, so a plain
@@ -1173,6 +1184,85 @@ fn write_prior_summary(out: &mut impl std::fmt::Write, result: &FitResult) {
 /// be compared to NONMEM (whose `$COVARIANCE` default is `RSR`, not `R`) or to
 /// another ferx run. Falls back to the bare status when there is no matrix and
 /// hence no estimator to name.
+/// Whether `ofv` on this result is the final Laplace pass of an IMP/IMPMAP fit
+/// (#2654), which NONMEM's `METHOD=IMP` objective is not.
+///
+/// `FitResult::method` is the last *estimating* stage, so it alone is not enough:
+/// `method = [imp, laplace]` + `agq_eval_only` still reports `IMP` while `ofv`
+/// holds the quadrature marginal the trailing stage wrote. A trailing
+/// `imp_eval_only` stage is the one evaluator that leaves `ofv` alone. A standalone
+/// `imp_eval_only` run scores `ofv` with the same Laplace objective at the initial
+/// parameters, so it counts too.
+fn ofv_is_imp_laplace(result: &FitResult) -> bool {
+    use crate::types::EstimationMethod::{Imp, Impmap};
+    if !matches!(result.method, Imp | Impmap) {
+        return false;
+    }
+    let chain = &result.method_chain;
+    let last_estimator = chain.iter().rposition(|m| *m == result.method);
+    last_estimator.is_none_or(|i| chain[i + 1..].iter().all(|m| *m == Imp))
+}
+
+/// The importance-sampling marginal, printed next to `ofv` so the two cannot be
+/// mistaken for one another. `None` when the fit has no marginal.
+fn is_marginal_line(result: &FitResult) -> Option<String> {
+    result.importance_sampling.as_ref().map(|is| {
+        format!(
+            "IS marginal -2LL:  {:.4}  (MC SE = {:.4}, K = {})",
+            is.minus2_log_likelihood, is.mc_standard_error, is.n_samples
+        )
+    })
+}
+
+/// What a reader comparing this objective with a NONMEM `.lst` needs to be told
+/// (#2654). Empty for a fit with no importance-sampling stage, so its output is
+/// unchanged. Shared by the console, the summary file and the YAML comments.
+fn objective_notes(result: &FitResult) -> Vec<&'static str> {
+    let laplace = ofv_is_imp_laplace(result);
+    let mut notes = Vec::new();
+    if laplace {
+        notes.push("OFV, AIC and BIC come from a final Laplace pass, not the IS marginal.");
+    }
+    match &result.importance_sampling {
+        // A partial marginal is not what NONMEM reports either; the importance
+        // sampling section says so.
+        Some(is) if is.kappa_treatment != KappaTreatment::FixedAtMode => {
+            notes.push("Compare NONMEM METHOD=IMP objectives with the IS marginal, not OFV.");
+        }
+        None if laplace => notes.push("This result carries no IS marginal."),
+        _ => {}
+    }
+    notes
+}
+
+/// The objective rows of the console report and the summary file, which differ
+/// only in `indent`.
+fn write_objective_lines(out: &mut String, result: &FitResult, indent: &str) {
+    use std::fmt::Write as _;
+    let ofv_label = if ofv_is_imp_laplace(result) {
+        "OFV (Laplace)"
+    } else {
+        "OFV"
+    };
+    let _ = writeln!(out, "{indent}{ofv_label}:  {:.4}", result.ofv);
+    // Under parameter priors (#254) the OFV above is the penalized objective
+    // that was minimised, so the split is printed right under it — and AIC/BIC
+    // are labelled with the half they are computed from, since an information
+    // criterion from a penalized objective would not be one.
+    if !result.prior_summary.is_empty() {
+        let _ = writeln!(out, "{indent}  data:  {:.4}", result.ofv_data);
+        let _ = writeln!(out, "{indent}  prior: {:.4}", result.ofv_prior);
+    }
+    if let Some(line) = is_marginal_line(result) {
+        let _ = writeln!(out, "{indent}{line}");
+    }
+    let _ = writeln!(out, "{indent}AIC:  {:.4}", result.aic);
+    let _ = writeln!(out, "{indent}BIC:  {:.4}", result.bic);
+    for note in objective_notes(result) {
+        let _ = writeln!(out, "{indent}{note}");
+    }
+}
+
 fn covariance_status_label(result: &FitResult) -> String {
     let status = match result.covariance_status {
         CovarianceStatus::Computed => "computed",
@@ -1241,15 +1331,9 @@ pub fn print_results(result: &FitResult) {
     eprintln!("Iterations: {}", result.n_iterations);
 
     eprintln!("\n--- Objective Function ---");
-    eprintln!("OFV:  {:.4}", result.ofv);
-    if !result.prior_summary.is_empty() {
-        eprintln!("  data:  {:.4}", result.ofv_data);
-        eprintln!("  prior: {:.4}", result.ofv_prior);
-    }
-    eprintln!("AIC:  {:.4}", result.aic);
-    eprintln!("BIC:  {:.4}", result.bic);
     {
         let mut buf = String::new();
+        write_objective_lines(&mut buf, result, "");
         write_prior_summary(&mut buf, result);
         if !buf.is_empty() {
             eprint!("{buf}");
@@ -1373,6 +1457,12 @@ pub fn print_results(result: &FitResult) {
             "  ESS / K: min = {:.3}, median = {:.3}",
             imp.ess_min, imp.ess_median
         );
+        if imp.adapt_passes > 0 {
+            eprintln!(
+                "  Proposal adaptation: up to {} pilot passes",
+                imp.adapt_passes
+            );
+        }
         match imp.kappa_treatment {
             KappaTreatment::FixedAtMode => {
                 eprintln!(
@@ -1560,17 +1650,7 @@ pub fn format_summary(result: &FitResult) -> String {
 
     // --- Objective function ---
     let _ = writeln!(out, "\n--- Objective Function ---");
-    let _ = writeln!(out, "  OFV:  {:.4}", result.ofv);
-    // Under parameter priors (#254) the OFV above is the penalized objective
-    // that was minimised, so the split is printed right under it — and AIC/BIC
-    // are labelled with the half they are computed from, since an information
-    // criterion from a penalized objective would not be one.
-    if !result.prior_summary.is_empty() {
-        let _ = writeln!(out, "    data:  {:.4}", result.ofv_data);
-        let _ = writeln!(out, "    prior: {:.4}", result.ofv_prior);
-    }
-    let _ = writeln!(out, "  AIC:  {:.4}", result.aic);
-    let _ = writeln!(out, "  BIC:  {:.4}", result.bic);
+    write_objective_lines(&mut out, result, "  ");
     write_prior_summary(&mut out, result);
 
     // NN weight thetas are excluded from the per-parameter table (they can
@@ -2017,12 +2097,11 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     // binary-only or TTE-only fit (no Gaussian rows at all, hence no `obs_cmts`) would
     // emit an sdtab with the endpoint CMT silently dropped.
     #[cfg(feature = "survival")]
-    let any_discrete = result
-        .subjects
-        .iter()
-        .any(|s| !s.discrete_rows.is_empty() || !s.tte_rows.is_empty());
+    let has_endpoint_rows =
+        |s: &SubjectResult| !s.discrete_rows.is_empty() || !s.tte_rows.is_empty();
     #[cfg(not(feature = "survival"))]
-    let any_discrete = false;
+    let has_endpoint_rows = |s: &SubjectResult| !s.discrete_rows.is_empty();
+    let any_discrete = result.subjects.iter().any(has_endpoint_rows);
     let any_multicmt = any_discrete
         || population
             .subjects
@@ -2262,7 +2341,6 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         }
     }
 
-    #[cfg(feature = "survival")]
     append_discrete_rows(&mut cols, result, population);
     #[cfg(feature = "survival")]
     append_tte_rows(&mut cols, result, population);
@@ -2285,7 +2363,6 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
 /// `CWRES` is deliberately blank: the conditional weighted residual is defined through
 /// the Gaussian residual-variance model, and there is none for a Bernoulli outcome.
 /// `IWRES` carries the standardized (Pearson) residual instead.
-#[cfg(feature = "survival")]
 fn append_discrete_rows(
     cols: &mut [(String, Vec<f64>)],
     result: &FitResult,
@@ -2386,25 +2463,14 @@ pub fn write_sdtab_csv(
     population: &Population,
     path: &str,
 ) -> Result<(), String> {
-    // A result restored from a `.fitrx` checkpoint carries no per-record discrete
-    // diagnostics — the bundle doesn't round-trip them (see `io::fitrx::parse_subjects`).
-    // Writing anyway would emit a table silently missing every discrete-endpoint row
-    // (header-only for a binary-only fit, since the columns exist but are zero-length, so
-    // the `cols.is_empty()` check below never fires). Refuse instead.
+    // A result restored from a `.fitrx` checkpoint carries no per-record time-to-event
+    // diagnostics: the bundle has no entry for them (#911). Writing anyway would emit a
+    // table silently missing every event row, so refuse. Discrete rows do round-trip
+    // (`predictions_discrete.csv`, #2695).
     //
     // The discriminator is `restored_from_checkpoint` AND "the restored model declares a
-    // binary endpoint" — NOT "the reconstructed population has discrete records". The
-    // population is not a usable signal: `load_fit` re-reads the bundled data through
-    // `read_nonmem_csv_mapped`, which uses the default (Gaussian) `ObsRouting`, so a binary
-    // DV comes back as an ordinary continuous observation and the population carries *no*
-    // `DiscreteState` records at all — keying on `obs_records` (as an earlier revision did)
-    // therefore never fired on a real restore, and its test only passed on a hand-built
-    // population that `load_fit` cannot produce. `model_text` *is* round-tripped, so parse
-    // it and ask the direct question: would a live fit of this model have produced
-    // `discrete_rows` or `tte_rows`? `binary_cmts()` is binary-only (not CTMM), so a
-    // restored CTMM fit — which legitimately produces no `discrete_rows` live or restored
-    // (occupancy is #820) — is correctly *allowed* through. #911 removes this once
-    // diagnostics round-trip.
+    // time-to-event endpoint", read from the round-tripped `model_text`, since a restored
+    // fit may have no population to ask.
     #[cfg(feature = "survival")]
     if result.restored_from_checkpoint {
         if let Some(msg) = result
@@ -2456,27 +2522,17 @@ pub fn write_sdtab_csv(
 }
 
 /// Why a restored fit of `model` cannot write sdtab, or `None` when it can: the model
-/// declares a binary or a time-to-event endpoint, whose per-record rows a `.fitrx`
-/// checkpoint does not round-trip (#911), so the table would silently lack them.
+/// declares a time-to-event endpoint, whose per-record rows a `.fitrx` checkpoint does not
+/// round-trip (#911), so the table would silently lack them.
 #[cfg(feature = "survival")]
 fn restored_sdtab_refusal(model: &crate::types::CompiledModel) -> Option<String> {
-    let kinds: Vec<&str> = [
-        (!model.binary_cmts().is_empty()).then_some("a [binary_model] endpoint"),
-        model.has_tte().then_some("a time-to-event endpoint"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if kinds.is_empty() {
-        return None;
-    }
-    Some(format!(
+    model.has_tte().then(|| {
         "refusing to write sdtab: this fit was restored from a `.fitrx` checkpoint, which \
-         does not round-trip per-record binary or time-to-event diagnostics, and the model \
-         declares {} — so the table would be silently missing those rows. Re-run the fit \
-         to write sdtab (#911).",
-        kinds.join(" and ")
-    ))
+         does not round-trip per-record time-to-event diagnostics, and the model declares \
+         a time-to-event endpoint — so the table would be silently missing those rows. \
+         Re-run the fit to write sdtab (#911)."
+            .to_string()
+    })
 }
 
 /// Write the covariate table (from a `[covariates]` block) as a CSV file.
@@ -2900,6 +2956,28 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 
     writeln!(f, "\nobjective_function:").map_err(|e| e.to_string())?;
     writeln!(f, "  ofv: {:.6}", result.ofv).map_err(|e| e.to_string())?;
+    // Emitted only on an importance-sampling fit (#2654), so any other fit's YAML
+    // is byte-identical to what it was before.
+    if ofv_is_imp_laplace(result) {
+        writeln!(f, "  ofv_type: laplace").map_err(|e| e.to_string())?;
+    }
+    if let Some(ref is) = result.importance_sampling {
+        writeln!(
+            f,
+            "  marginal_minus2_log_likelihood: {:.6}",
+            is.minus2_log_likelihood
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(
+            f,
+            "  marginal_mc_standard_error: {:.6}",
+            is.mc_standard_error
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for note in objective_notes(result) {
+        writeln!(f, "  # {note}").map_err(|e| e.to_string())?;
+    }
     // Emitted only under a prior (#254), so an unpriored fit's YAML is
     // byte-identical to what it was before this feature.
     if !result.prior_summary.is_empty() {
@@ -3432,9 +3510,11 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  mc_standard_error: {:.6}", imp.mc_standard_error)
             .map_err(|e| e.to_string())?;
         writeln!(f, "  n_samples: {}", imp.n_samples).map_err(|e| e.to_string())?;
-        writeln!(f, "  proposal_df: {:.4}", imp.proposal_df).map_err(|e| e.to_string())?;
+        writeln!(f, "  proposal_df: {}", yaml_proposal_df(imp.proposal_df))
+            .map_err(|e| e.to_string())?;
         writeln!(f, "  ess_min: {:.4}", imp.ess_min).map_err(|e| e.to_string())?;
         writeln!(f, "  ess_median: {:.4}", imp.ess_median).map_err(|e| e.to_string())?;
+        writeln!(f, "  adapt_passes: {}", imp.adapt_passes).map_err(|e| e.to_string())?;
         let kt = match imp.kappa_treatment {
             KappaTreatment::NotApplicable => "not_applicable",
             KappaTreatment::FixedAtMode => "fixed_at_mode",
@@ -4016,6 +4096,9 @@ mod tests {
             nlopt_missing_algorithms: Vec::new(),
             covariance_n_evals_estimated: None,
             trace_path: None,
+            trace_csv: None,
+            cov_fixed: Vec::new(),
+            interface_extras: None,
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
@@ -4990,7 +5073,6 @@ mod tests {
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
-            #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
             #[cfg(feature = "survival")]
             tte_rows: Vec::new(),
@@ -5202,6 +5284,9 @@ mod tests {
             nlopt_missing_algorithms: Vec::new(),
             covariance_n_evals_estimated: None,
             trace_path: None,
+            trace_csv: None,
+            cov_fixed: Vec::new(),
+            interface_extras: None,
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
@@ -5606,15 +5691,15 @@ mod tests {
     }
 
     /// T9 (#901): the restored-fit refusal over model × {binary, TTE, both, neither}.
-    /// A restored `.fitrx` fit carries no `tte_rows`, so a TTE model must be refused
-    /// like a binary one, the message naming what the model declares and #911; a model
-    /// with neither still writes.
+    /// A restored `.fitrx` fit carries no `tte_rows`, so a model with a TTE endpoint must
+    /// be refused, the message naming #911. Its discrete rows do round-trip (#2695), so a
+    /// binary model is not.
     ///
-    /// Dies on: the refusal keyed on binary only, a message that names "binary" for a
-    /// TTE-only model, a refusal of a model with neither.
+    /// Dies on: a refusal that still reads the binary endpoints, one that ignores the TTE
+    /// endpoint, a refusal of a model with neither.
     #[cfg(feature = "survival")]
     #[test]
-    fn restored_sdtab_refusal_names_binary_and_tte_endpoints() {
+    fn restored_sdtab_refusal_is_keyed_on_a_tte_endpoint() {
         const PARAMS: &str = "
 [parameters]
   theta TH0(0.1, 0.001, 10.0)
@@ -5649,15 +5734,15 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}\n{src}"));
             restored_sdtab_refusal(&model)
         };
-        let binary = refusal(BINARY, false).expect("binary refused");
-        assert!(binary.contains("[binary_model]") && !binary.contains("time-to-event endpoint"));
+        // Binary rows round-trip (#2695), so a binary model alone is not refused.
+        assert_eq!(refusal(BINARY, false), None);
         let tte = refusal(TTE, false).expect("TTE refused");
-        assert!(tte.contains("a time-to-event endpoint") && !tte.contains("[binary_model]"));
-        let both = refusal(&format!("{BINARY}{TTE}"), false).expect("both refused");
-        assert!(both.contains("[binary_model] endpoint and a time-to-event endpoint"));
-        for msg in [&binary, &tte, &both] {
-            assert!(msg.contains("restored") && msg.contains("fitrx") && msg.contains("#911"));
-        }
+        assert!(tte.contains("a time-to-event endpoint") && !tte.contains("binary"));
+        assert_eq!(
+            refusal(&format!("{BINARY}{TTE}"), false).as_ref(),
+            Some(&tte)
+        );
+        assert!(tte.contains("restored") && tte.contains("fitrx") && tte.contains("#911"));
         assert_eq!(refusal(GAUSSIAN, true), None);
 
         // Wired into the writer: a restored TTE fit is refused before any file exists.
@@ -5844,7 +5929,6 @@ mod tests {
             extra_columns: Vec::new(),
             per_obs_tad: Vec::new(),
             compartment_states: Vec::new(),
-            #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
             #[cfg(feature = "survival")]
             tte_rows: Vec::new(),
@@ -6696,6 +6780,7 @@ mod tests {
             proposal_df: 5.0,
             ess_min: 0.05,
             ess_median: 0.6,
+            adapt_passes: 5,
             kappa_treatment: KappaTreatment::FixedAtMode,
         });
         // SIR CIs for theta/omega/sigma.
@@ -6796,6 +6881,7 @@ mod tests {
         assert!(yaml.contains("\nimportance_sampling:"));
         assert!(yaml.contains("  kappa_treatment: fixed_at_mode"));
         assert!(yaml.contains("  low_ess_subjects:") && yaml.contains("- id: \"S3\""));
+        assert!(yaml.contains("  adapt_passes: 5\n"));
         // Bayesian posterior block.
         assert!(yaml.contains("\nbayes:"));
         assert!(yaml.contains("  max_rhat: 1.0100"));
@@ -7198,6 +7284,159 @@ mod tests {
         print_results(&r);
     }
 
+    /// A fit shaped like `chain`, whose `method` is the last estimating stage.
+    fn imp_objective_result(
+        method: EstimationMethod,
+        chain: &[EstimationMethod],
+        marginal: Option<KappaTreatment>,
+    ) -> FitResult {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.method = method;
+        r.method_chain = chain.to_vec();
+        r.ofv = 4326.6;
+        r.importance_sampling = marginal.map(|kappa_treatment| ImportanceSamplingResult {
+            minus2_log_likelihood: 4299.6,
+            mc_standard_error: 0.75,
+            low_ess_subjects: Vec::new(),
+            n_samples: 1000,
+            proposal_df: 5.0,
+            ess_min: 0.5,
+            ess_median: 0.8,
+            kappa_treatment,
+            adapt_passes: 0,
+        });
+        r
+    }
+
+    fn objective_yaml(r: &FitResult) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(r, path.to_str().unwrap()).expect("yaml write");
+        std::fs::read_to_string(&path).expect("yaml read")
+    }
+
+    const LAPLACE_NOTE: &str = "come from a final Laplace pass";
+    const COMPARE_NOTE: &str = "Compare NONMEM METHOD=IMP objectives";
+    const NO_MARGINAL_NOTE: &str = "carries no IS marginal";
+
+    #[test]
+    fn imp_and_impmap_fits_name_ofv_as_laplace_next_to_the_marginal() {
+        use EstimationMethod::{FoceI, Imp, Impmap};
+        for (method, chain) in [
+            (Imp, vec![Imp]),
+            (Impmap, vec![Impmap]),
+            (Imp, vec![FoceI, Imp]),
+            // A trailing `imp_eval_only` stage leaves `ofv` with the estimator.
+            (Impmap, vec![Impmap, Imp]),
+        ] {
+            let r = imp_objective_result(method, &chain, Some(KappaTreatment::Marginalized));
+            let summary = format_summary(&r);
+            assert!(summary.contains("  OFV (Laplace):  4326.6000"), "{summary}");
+            assert!(
+                summary.contains("  IS marginal -2LL:  4299.6000  (MC SE = 0.7500, K = 1000)"),
+                "{summary}"
+            );
+            assert!(summary.contains(LAPLACE_NOTE), "{summary}");
+            assert!(summary.contains(COMPARE_NOTE), "{summary}");
+            assert!(!summary.contains(NO_MARGINAL_NOTE), "{summary}");
+
+            let yaml = objective_yaml(&r);
+            assert!(yaml.contains("  ofv: 4326.600000\n"), "{yaml}");
+            assert!(yaml.contains("  ofv_type: laplace\n"), "{yaml}");
+            assert!(
+                yaml.contains("  marginal_minus2_log_likelihood: 4299.600000\n"),
+                "{yaml}"
+            );
+            assert!(
+                yaml.contains("  marginal_mc_standard_error: 0.750000\n"),
+                "{yaml}"
+            );
+            assert!(yaml.contains(&format!("  # OFV, AIC and BIC {LAPLACE_NOTE}")));
+            assert!(yaml.contains(&format!("  # {COMPARE_NOTE}")), "{yaml}");
+        }
+    }
+
+    /// A skipped marginal eval (or a restored `.fitrx`) leaves `ofv` just as Laplace,
+    /// and there is then nothing to point the reader at.
+    #[test]
+    fn imp_fit_without_a_marginal_says_so_and_points_nowhere() {
+        use EstimationMethod::Imp;
+        let r = imp_objective_result(Imp, &[Imp], None);
+        let summary = format_summary(&r);
+        assert!(summary.contains("OFV (Laplace):"), "{summary}");
+        assert!(summary.contains(LAPLACE_NOTE), "{summary}");
+        assert!(summary.contains(NO_MARGINAL_NOTE), "{summary}");
+        assert!(!summary.contains(COMPARE_NOTE), "{summary}");
+        assert!(!summary.contains("IS marginal -2LL"), "{summary}");
+
+        let yaml = objective_yaml(&r);
+        assert!(yaml.contains("  ofv_type: laplace\n"), "{yaml}");
+        assert!(!yaml.contains("marginal_minus2_log_likelihood"), "{yaml}");
+    }
+
+    /// `method` reports the last estimator, so `[imp, laplace]` + `agq_eval_only` still
+    /// says IMP while `ofv` is the quadrature marginal: calling that Laplace would be false.
+    #[test]
+    fn imp_fit_finished_by_a_later_objective_stage_is_not_called_laplace() {
+        use EstimationMethod::{Imp, Impmap, Laplace};
+        for (method, chain) in [
+            (Imp, vec![Imp, Laplace]),
+            // The trailing `imp_eval_only` must not hide the AGQ stage before it.
+            (Impmap, vec![Impmap, Laplace, Imp]),
+        ] {
+            let r = imp_objective_result(method, &chain, None);
+            let summary = format_summary(&r);
+            assert!(summary.contains("  OFV:  4326.6000"), "{summary}");
+            assert!(!summary.contains("Laplace pass"), "{summary}");
+            assert!(!summary.contains(NO_MARGINAL_NOTE), "{summary}");
+            assert!(!objective_yaml(&r).contains("ofv_type"));
+        }
+    }
+
+    /// `[focei, imp]` + `imp_eval_only` keeps FOCEI's objective, so `ofv` gets no
+    /// Laplace label, but its marginal is still the NONMEM-comparable number.
+    #[test]
+    fn evaluation_only_marginal_sits_next_to_the_estimators_ofv() {
+        use EstimationMethod::{FoceI, Imp};
+        let r = imp_objective_result(FoceI, &[FoceI, Imp], Some(KappaTreatment::NotApplicable));
+        let summary = format_summary(&r);
+        assert!(summary.contains("  OFV:  4326.6000"), "{summary}");
+        assert!(
+            summary.contains("IS marginal -2LL:  4299.6000"),
+            "{summary}"
+        );
+        assert!(summary.contains(COMPARE_NOTE), "{summary}");
+        assert!(!summary.contains(LAPLACE_NOTE), "{summary}");
+
+        let yaml = objective_yaml(&r);
+        assert!(!yaml.contains("ofv_type"), "{yaml}");
+        assert!(yaml.contains("  marginal_minus2_log_likelihood:"), "{yaml}");
+    }
+
+    /// κ held at its mode is a partial marginal, which NONMEM does not report either.
+    #[test]
+    fn partial_marginal_is_not_offered_as_the_nonmem_number() {
+        use EstimationMethod::Imp;
+        let r = imp_objective_result(Imp, &[Imp], Some(KappaTreatment::FixedAtMode));
+        let summary = format_summary(&r);
+        assert!(summary.contains("IS marginal -2LL:"), "{summary}");
+        assert!(summary.contains(LAPLACE_NOTE), "{summary}");
+        assert!(!summary.contains(COMPARE_NOTE), "{summary}");
+        assert!(!summary.contains(NO_MARGINAL_NOTE), "{summary}");
+    }
+
+    #[test]
+    fn a_fit_with_no_importance_sampling_keeps_its_objective_output() {
+        use EstimationMethod::FoceI;
+        let r = imp_objective_result(FoceI, &[FoceI], None);
+        let summary = format_summary(&r);
+        assert!(summary.contains("  OFV:  4326.6000\n  AIC:"), "{summary}");
+        assert!(summary.contains("  BIC:  "), "{summary}");
+        assert!(!summary.contains("marginal"), "{summary}");
+        let yaml = objective_yaml(&r);
+        assert!(yaml.contains("  ofv: 4326.600000\n  aic:"), "{yaml}");
+    }
+
     #[test]
     fn print_results_smoke_comprehensive() {
         // Exercises the maximal-section path of the stderr printer.
@@ -7233,6 +7472,7 @@ mod tests {
             proposal_df: 4.0,
             ess_min: 0.9,
             ess_median: 0.95,
+            adapt_passes: 0,
             kappa_treatment: KappaTreatment::Marginalized,
         });
         r.covariance_status = CovarianceStatus::Failed;
@@ -8012,6 +8252,28 @@ mod tests {
         let path = dir.path().join("fit.yaml");
         write_estimates_yaml(r, path.to_str().unwrap()).expect("yaml write");
         std::fs::read_to_string(&path).expect("yaml read")
+    }
+
+    /// #2651: `imp_proposal_df = normal` reports ν = ∞ on a healthy result, which
+    /// a YAML reader must get back as a number, not Rust's string `inf`.
+    #[test]
+    fn yaml_writes_an_infinite_proposal_df_as_yaml_infinity() {
+        let is_with = |proposal_df| ImportanceSamplingResult {
+            minus2_log_likelihood: -10.0,
+            mc_standard_error: 0.5,
+            low_ess_subjects: Vec::new(),
+            n_samples: 100,
+            proposal_df,
+            ess_min: 0.9,
+            ess_median: 0.95,
+            kappa_treatment: KappaTreatment::NotApplicable,
+            adapt_passes: 0,
+        };
+        let mut r = classified_result();
+        r.importance_sampling = Some(is_with(f64::INFINITY));
+        assert!(yaml_of(&r).contains("\n  proposal_df: .inf\n"));
+        r.importance_sampling = Some(is_with(5.0));
+        assert!(yaml_of(&r).contains("\n  proposal_df: 5.0000\n"));
     }
 
     /// `classified_result` with `K_ADD` weighted by `NARM`, typical arm 4.

@@ -492,12 +492,60 @@ fn test_iov_saem_in_methods_chain_succeeds() {
     );
 }
 
+/// A marginal with too few effective draws says so, from both places a marginal
+/// is produced. `imp_samples = 4` caps every subject below the gate, whatever the
+/// fixture does. The clean run is the other side of it (#2653).
+#[test]
+fn test_imp_marginal_warns_when_effective_draws_are_too_few() {
+    let unreliable = |r: &crate::types::FitResult| {
+        r.warnings
+            .iter()
+            .filter(|w| w.contains("marginal −2 log L is unreliable"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let model = make_iov_model();
+    let pop = make_iov_population();
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    opts.outer_maxiter = 2;
+    opts.imp_seed = Some(42);
+
+    // Evaluation-only stage, after an estimator: prefixed with the stage.
+    opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
+    opts.imp_eval_only = true;
+    opts.imp_samples = 4;
+    let eval = fit(&model, &pop, &model.default_params, &opts).expect("eval-only IMP");
+    let got = unreliable(&eval);
+    assert_eq!(got.len(), 1, "{:?}", eval.warnings);
+    assert!(got[0].starts_with("[IMP] "), "{}", got[0]);
+
+    opts.imp_samples = 400;
+    let clean = fit(&model, &pop, &model.default_params, &opts).expect("eval-only IMP");
+    assert!(unreliable(&clean).is_empty(), "{:?}", clean.warnings);
+
+    // The final marginal of an estimating stage, in a chain and alone.
+    opts.imp_eval_only = false;
+    opts.imp_samples = 4;
+    opts.imp_iterations = 2;
+    opts.imp_averaging = 1;
+    let chained = fit(&model, &pop, &model.default_params, &opts).expect("estimating IMP");
+    let got = unreliable(&chained);
+    assert_eq!(got.len(), 1, "{:?}", chained.warnings);
+    assert!(got[0].starts_with("[IMP] "), "{}", got[0]);
+
+    opts.methods = vec![EstimationMethod::Imp];
+    let alone = fit(&model, &pop, &model.default_params, &opts).expect("estimating IMP");
+    let got = unreliable(&alone);
+    assert_eq!(got.len(), 1, "{:?}", alone.warnings);
+    assert!(!got[0].starts_with('['), "{}", got[0]);
+}
+
 // ── Test: IMP in a chained methods sequence + IOV exercises the IS IOV path ─
-// `method = [foce, imp]` on a kappa-bearing model drives the importance-
-// sampling marginal-likelihood step through its IOV branch
-// (`obs_nll_iov_fixed_kappa`, `compute_posterior_hessian`,
-// `subject_is_estimate`, `build_proposals`). κ is held at its EBE, so the
-// reported −2LL is a partial marginal (see `KappaTreatment::FixedAtMode`).
+// `method = [foce, imp]` with `imp_eval_only` on a kappa-bearing model drives the
+// evaluation-only importance-sampling step through its IOV branch
+// (`compute_joint_posterior_hessian`, `subject_is_estimate_joint`): η and κ are
+// sampled jointly, so the reported −2LL marginalises κ
+// (`KappaTreatment::Marginalized`).
 #[test]
 fn test_iov_imp_chain_runs_importance_sampling() {
     let model = make_iov_model();
@@ -506,8 +554,7 @@ fn test_iov_imp_chain_runs_importance_sampling() {
     opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
     opts.imp_samples = 200; // keep the per-subject sampling cheap
     opts.imp_seed = Some(42); // deterministic proposal draws
-                              // The IS IOV branch is the evaluation-only path; the estimating IMP
-                              // M-step does not yet support IOV (refused up front).
+                              // Evaluation-only: score FOCE's estimates rather than re-estimate them.
     opts.imp_eval_only = true;
     let result = fit(&model, &pop, &model.default_params, &opts);
     assert!(
@@ -2268,11 +2315,9 @@ fn test_simulate_singular_rho_one_does_not_panic() {
 }
 
 // Cover the custom-magnitude (`Some(mult)`) R-build branch and the
-// `ruv_scale != 1.0` scaling inside `emit_correlated_residual_rows`. The
-// model-driven simulate() path can't reach these for a supported
-// `block_sigma` model (block_sigma + iiv_on_ruv is rejected at fit), so call
-// the helper directly with a hand-built per-observation multiplier and a
-// non-unit scale and assert it draws both rows without panicking.
+// `ruv_scale != 1.0` scaling inside `emit_correlated_residual_rows`: call the
+// helper directly with a hand-built per-observation multiplier and a non-unit
+// scale and assert it draws both rows without panicking.
 #[test]
 fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
     use rand::SeedableRng;

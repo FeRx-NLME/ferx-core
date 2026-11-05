@@ -118,7 +118,7 @@ fn data_ofv(fit: &FitResult) -> f64 {
 ///   settings from `fit.scoring_settings`, the stage that produced the estimates, the
 ///   same way (#1806): its draws are re-scored under the inner-loop and ODE settings
 ///   `sir = true` would have used. The SIR-only settings, seed included, have no record
-///   on such a fit and come from `options`. A fit with neither record (a `.fitrx` written before #1758) uses `options` as
+///   on such a fit and come from `options`. A fit with neither record uses `options` as
 ///   given. Without a SIR record, an unset `sir_seed` falls back to `fit.sir_seed`
 ///   (the seed such a fit was given). `inner_optimizer` and
 ///   `ebe_warm_start` hold for this call's draws only; nothing outlives the call (#426).
@@ -136,8 +136,7 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// from the fit (#1704). A class override's fitted value is read from
 /// [`FitResult::mixture_overrides`], which every `fit()` records and `.fitrx` keeps
 /// (#1765), else from a usable `packed_estimate`; for a mixture model with at least
-/// one override, a fit with neither (built in R, or a bundle saved before #1765 /
-/// #1815) returns an error (see [`fitted_params_from_result`]).
+/// one override, a fit with neither (built in R) returns an error (see [`fitted_params_from_result`]).
 pub fn run_sir(
     fit: &FitResult,
     model: Option<&CompiledModel>,

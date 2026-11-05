@@ -1,7 +1,7 @@
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::sim::adaptive::{
     validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, DoseStep, IntervalStep,
+    Comparison, DoseStep, DoseValue, IntervalStep,
 };
 use crate::types::*;
 use regex::Regex;
@@ -2751,18 +2751,48 @@ fn classify_theta_eta_linked(
     n_theta: usize,
     nn_theta_deps: &[Vec<Vec<usize>>],
 ) -> Vec<bool> {
+    let mut linked = vec![false; n_theta];
+    for deps in indiv_var_deps(stmts, nn_theta_deps).values() {
+        if deps.has_eta {
+            for &i in &deps.thetas {
+                if i < n_theta {
+                    linked[i] = true;
+                }
+            }
+        }
+    }
+    linked
+}
+
+/// What one `[individual_parameters]` variable depends on, through every intermediate.
+#[derive(Debug, Clone, Default)]
+struct IndivVarDeps {
+    thetas: std::collections::BTreeSet<usize>,
+    has_eta: bool,
+    reads_time: bool,
+}
+
+/// [`IndivVarDeps`] of every variable assigned in `stmts`. An `if`/`else` contributes its
+/// condition's reads to every variable assigned inside it. Runs before index resolution, so
+/// it sees `Expression::Variable`, never `VariableIdx`.
+fn indiv_var_deps(
+    stmts: &[Statement],
+    nn_theta_deps: &[Vec<Vec<usize>>],
+) -> std::collections::HashMap<String, IndivVarDeps> {
     use std::collections::{HashMap, HashSet};
 
     #[derive(Default, Clone)]
     struct Deps {
         thetas: HashSet<usize>,
         has_eta: bool,
+        reads_time: bool,
         vars: HashSet<String>,
     }
     impl Deps {
         fn merge(&mut self, other: &Deps) {
             self.thetas.extend(other.thetas.iter().copied());
             self.has_eta |= other.has_eta;
+            self.reads_time |= other.reads_time;
             self.vars.extend(other.vars.iter().cloned());
         }
     }
@@ -2780,6 +2810,7 @@ fn classify_theta_eta_linked(
                 d.thetas.extend(spec.theta_indices());
             }
             Expression::Eta(_) => d.has_eta = true,
+            Expression::Time => d.reads_time = true,
             Expression::Variable(v) => {
                 d.vars.insert(v.clone());
             }
@@ -2824,31 +2855,25 @@ fn classify_theta_eta_linked(
     let mut map: HashMap<String, Deps> = HashMap::new();
     walk(stmts, &Deps::default(), &mut map, nn_theta_deps);
 
-    let mut linked = vec![false; n_theta];
-    for name in map.keys() {
-        // Transitive closure over referenced variables (cycle-safe).
-        let mut thetas: HashSet<usize> = HashSet::new();
-        let mut has_eta = false;
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut stack: Vec<&str> = vec![name.as_str()];
-        while let Some(v) = stack.pop() {
-            if !seen.insert(v) {
-                continue;
-            }
-            let Some(d) = map.get(v) else { continue };
-            thetas.extend(d.thetas.iter().copied());
-            has_eta |= d.has_eta;
-            stack.extend(d.vars.iter().map(String::as_str));
-        }
-        if has_eta {
-            for i in thetas {
-                if i < n_theta {
-                    linked[i] = true;
+    map.keys()
+        .map(|name| {
+            // Transitive closure over referenced variables (cycle-safe).
+            let mut out = IndivVarDeps::default();
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut stack: Vec<&str> = vec![name.as_str()];
+            while let Some(v) = stack.pop() {
+                if !seen.insert(v) {
+                    continue;
                 }
+                let Some(d) = map.get(v) else { continue };
+                out.thetas.extend(d.thetas.iter().copied());
+                out.has_eta |= d.has_eta;
+                out.reads_time |= d.reads_time;
+                stack.extend(d.vars.iter().map(String::as_str));
             }
-        }
-    }
-    linked
+            (name.clone(), out)
+        })
+        .collect()
 }
 
 /// Classify each top-level [individual_parameters] assignment and return
@@ -5596,13 +5621,9 @@ pub fn parse_full_model_with(
         _ => Vec::new(),
     };
     let residual_serial = match &correlation_decl {
-        Some(decl) => resolve_correlation(
-            decl,
-            &parsed_error_model,
-            iiv_on_ruv_name.as_deref(),
-            !block_sigmas.is_empty(),
-            &thetas,
-        )?,
+        Some(decl) => {
+            resolve_correlation(decl, &parsed_error_model, !block_sigmas.is_empty(), &thetas)?
+        }
         None => None,
     };
     let (error_model, error_spec) =
@@ -5912,6 +5933,11 @@ pub fn parse_full_model_with(
     // desugared statements, so `[covariate_model]` thetas are classified too.
     let theta_eta_linked =
         classify_theta_eta_linked(&indiv_stmts, theta_names.len(), &nn_theta_deps);
+    // Which `[odes]` conditions move with an estimated parameter (#2649). Needs the same
+    // desugared statements, so the dependencies a condition's parameters carry are complete.
+    if let Some(program) = ode_spec.as_mut().and_then(|o| o.rhs_program.as_mut()) {
+        program.resolve_moving_switches(&indiv_var_deps(&indiv_stmts, &nn_theta_deps));
+    }
     debug_assert_eq!(
         theta_transform.len(),
         theta_names.len(),
@@ -6306,6 +6332,23 @@ pub fn parse_full_model_with(
                  not mean to read a weight.",
                 offending.join(", ")
             ));
+        }
+    }
+
+    // #944: the `[adaptive_dosing]` dose expressions are stored as source and compiled
+    // at simulate time, like `observe`. Check them against the model here, so a syntax
+    // error or a read a dose expression may not make (a state, `TIME`, κ, an individual
+    // parameter, η, `MIXNUM`) is a parse error that `ferx check` reports. A covariate
+    // absent from the data needs the data, so that stays at simulate time.
+    if let Some(spec) = adaptive_dosing.as_ref() {
+        for (key, src) in spec.dose_expressions() {
+            check_adaptive_dose_expression(
+                src,
+                key,
+                &model,
+                &declared_covariate_names,
+                spec.at[0],
+            )?;
         }
     }
 
@@ -7304,6 +7347,20 @@ pub fn parse_full_model_with(
     // desugared because the PK-slot layout was full (see the headroom check above).
     if let Some(note) = readout_fd_fallback_note.take() {
         model.parse_warnings.push(note);
+    }
+
+    // The route change below the scope gate is otherwise invisible (#2649).
+    if let Some(switch) = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .and_then(|p| p.moving_switch())
+    {
+        model.parse_warnings.push(format!(
+            "[odes]: `{switch}` depends on a model parameter and reaches an `if` condition \
+             that switches during the integration, so the switching time moves with it. Exact \
+             derivatives cannot see that, so this model uses finite-difference gradients."
+        ));
     }
 
     model.parse_warnings.extend(check_unused_parameters(
@@ -11103,11 +11160,11 @@ fn parse_adaptive_dosing_block(
     let mut with_assay_error = false;
     let mut assay_cmt: Option<usize> = None;
     let mut at: Option<Vec<f64>> = None;
-    let mut start_dose: Option<f64> = None;
+    let mut start_dose: Option<DoseValue> = None;
     let mut route: Option<AdaptiveRoute> = None;
-    let mut dose_bounds: Option<(f64, f64)> = None;
+    let mut dose_bounds: Option<(DoseValue, DoseValue)> = None;
     let mut confirm: u32 = 1;
-    let mut levels: Option<Vec<f64>> = None;
+    let mut levels: Option<Vec<DoseValue>> = None;
     let mut intervals: Option<Vec<f64>> = None;
     let mut start_interval: Option<f64> = None;
     // The `every` step of `at`, kept for the intervals-on-the-grid check (#945).
@@ -11165,30 +11222,36 @@ fn parse_adaptive_dosing_block(
                 at_step = step;
             }
             "start_dose" => {
-                let d: f64 = val
-                    .parse()
-                    .map_err(|_| format!("[adaptive_dosing]: bad start_dose: {val}"))?;
-                if !d.is_finite() || d < 0.0 {
-                    return Err(format!(
-                        "[adaptive_dosing]: start_dose must be finite and >= 0: {val}"
-                    ));
+                // A number is checked here, as before #944; an expression is checked
+                // per subject once it is evaluated.
+                let d = parse_dose_value("start_dose", val)?;
+                if let Some(x) = d.as_literal() {
+                    if !x.is_finite() || x < 0.0 {
+                        return Err(format!(
+                            "[adaptive_dosing]: start_dose must be finite and >= 0: {val}"
+                        ));
+                    }
                 }
                 start_dose = Some(d);
             }
             "route" => route = Some(parse_adaptive_route(val)?),
             "dose_bounds" => {
-                let b = parse_float_array(val)
-                    .map_err(|e| format!("[adaptive_dosing]: bad dose_bounds: {e}"))?;
+                let b = parse_dose_list("dose_bounds", val)?;
                 if b.len() != 2 {
                     return Err(format!(
                         "[adaptive_dosing]: dose_bounds must be `[low, high]`: {val}"
                     ));
                 }
-                let (lo, hi) = (b[0], b[1]);
-                if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi < lo {
-                    return Err(format!(
-                        "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: {val}"
-                    ));
+                let mut b = b.into_iter();
+                let (lo, hi) = (b.next().unwrap(), b.next().unwrap());
+                // Two numbers are checked here, as before #944; with an expression on
+                // either side the pair is checked per subject.
+                if let (Some(l), Some(h)) = (lo.as_literal(), hi.as_literal()) {
+                    if !l.is_finite() || !h.is_finite() || l < 0.0 || h < l {
+                        return Err(format!(
+                            "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: {val}"
+                        ));
+                    }
                 }
                 dose_bounds = Some((lo, hi));
             }
@@ -11205,9 +11268,11 @@ fn parse_adaptive_dosing_block(
                 confirm = n;
             }
             "levels" => {
-                let l = parse_float_array(val)
-                    .map_err(|e| format!("[adaptive_dosing]: bad levels: {e}"))?;
-                validate_increasing_finite(&l, "levels")?;
+                let l = parse_dose_list("levels", val)?;
+                let numbers: Option<Vec<f64>> = l.iter().map(DoseValue::as_literal).collect();
+                if let Some(numbers) = numbers {
+                    validate_increasing_finite(&numbers, "levels")?;
+                }
                 levels = Some(l);
             }
             "intervals" => {
@@ -11303,6 +11368,41 @@ fn parse_adaptive_dosing_block(
         check_intervals_on_every_grid(ladder, step)?;
     }
     Ok(spec)
+}
+
+/// One `[adaptive_dosing]` dose value (#944): a number stays a
+/// [`DoseValue::Literal`], read exactly as before; anything else is kept as a
+/// [`DoseValue::Expr`] and checked against the model once the whole file is parsed
+/// (`check_adaptive_dose_expression`).
+fn parse_dose_value(key: &str, val: &str) -> Result<DoseValue, String> {
+    let v = val.trim();
+    if v.is_empty() {
+        return Err(format!(
+            "[adaptive_dosing]: {key} requires a number or an expression"
+        ));
+    }
+    Ok(match v.parse::<f64>() {
+        Ok(x) => DoseValue::Literal(x),
+        Err(_) => DoseValue::Expr(v.to_string()),
+    })
+}
+
+/// A bracketed list of dose values (`dose_bounds`, `levels`; #944). A list of numbers
+/// goes through `parse_float_array`, exactly as before; otherwise the items are split
+/// on the commas outside parentheses, so `[0, min(30 * WT, 4000)]` is two items.
+fn parse_dose_list(key: &str, val: &str) -> Result<Vec<DoseValue>, String> {
+    if let Ok(xs) = parse_float_array(val) {
+        return Ok(xs.into_iter().map(DoseValue::Literal).collect());
+    }
+    let inner = val
+        .trim()
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .ok_or_else(|| format!("[adaptive_dosing]: {key} must be a list `[...]`: {val}"))?;
+    split_top_level_args(inner)
+        .iter()
+        .map(|item| parse_dose_value(key, item))
+        .collect()
 }
 
 /// On an `at = every S …` grid, every due time an interval produces lands on the grid
@@ -12421,6 +12521,57 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.saem_mstep_draws = v;
         }
+        "saem_kernel" => {
+            opts.saem_kernel = match value.to_lowercase().as_str() {
+                "rw" | "random_walk" | "random-walk" | "mh" => crate::types::SaemKernel::RandomWalk,
+                "imh" | "fsaem" | "f-saem" => crate::types::SaemKernel::Imh,
+                other => {
+                    return Err(format!(
+                        "fit option `{key}`: unknown value `{other}` — expected rw/imh"
+                    ));
+                }
+            };
+        }
+        "saem_imh_proposals" => {
+            let v = parse_usize(key)?;
+            if v == 0 {
+                return Err(format!(
+                    "fit option `{key}` must be at least 1 — it is the number of \
+                     independent-MH proposals per subject per SAEM iteration, got {v}"
+                ));
+            }
+            opts.saem_imh_proposals = v;
+        }
+        "saem_imh_refresh" => {
+            let v = parse_usize(key)?;
+            if v == 0 {
+                return Err(format!(
+                    "fit option `{key}` must be at least 1 — it is the number of SAEM \
+                     iterations between rebuilds of a subject's IMH proposal, got {v}"
+                ));
+            }
+            opts.saem_imh_refresh = v;
+        }
+        "saem_imh_defensive" => {
+            let v = parse_f64(key)?;
+            if !(0.0..=0.5).contains(&v) {
+                return Err(format!(
+                    "fit option `{key}` must be in [0, 0.5] — it is the weight of the prior \
+                     component mixed into the IMH proposal, got {v}"
+                ));
+            }
+            opts.saem_imh_defensive = v;
+        }
+        "saem_imh_min_obs_per_eta" => {
+            let v = parse_f64(key)?;
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(format!(
+                    "fit option `{key}` must be a finite value >= 0 (0 disables the \
+                     information gate), got {v}"
+                ));
+            }
+            opts.saem_imh_min_obs_per_eta = v;
+        }
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "conddist" | "saem_conddist" => opts.saem_conddist = parse_bool("conddist")?,
         "conddist_nsamp" => opts.saem_conddist_nsamp = parse_usize("conddist_nsamp")?,
@@ -12584,6 +12735,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "imp_low_ess_threshold" => {
             opts.imp_low_ess_threshold = parse_unit_interval("imp_low_ess_threshold")?
         }
+        "imp_adapt_passes" => opts.imp_adapt_passes = parse_usize("imp_adapt_passes")?,
         "imp_iterations" => {
             let v = parse_usize("imp_iterations")?;
             if v < 1 {
@@ -12626,6 +12778,19 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "frem_rao_blackwell" => opts.frem_rao_blackwell = parse_bool("frem_rao_blackwell")?,
         "imp_auto" => opts.imp_auto = parse_bool("imp_auto")?,
         "impmap_auto" => opts.impmap_auto = parse_bool("impmap_auto")?,
+        "imp_max_time" | "impmap_max_time" => {
+            let v = parse_f64(key)?;
+            if !(v.is_finite() && v > 0.0) {
+                return Err(format!(
+                    "fit option `{key}` must be a positive number of seconds"
+                ));
+            }
+            if key == "imp_max_time" {
+                opts.imp_max_time = Some(v);
+            } else {
+                opts.impmap_max_time = Some(v);
+            }
+        }
         "iscale_min" => {
             let v = parse_f64("iscale_min")?;
             if v <= 0.0 {
@@ -13434,6 +13599,87 @@ fn warn_if_time_alias_folds(
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     if let Ok(mut expr) = parse_scalar_expression(src, ctx) {
         rewrite_scaling_time_alias(&mut expr, context, declared_covariates, parse_warnings);
+    }
+}
+
+/// Refuse what an `[adaptive_dosing]` dose expression (`start_dose`, a side of
+/// `dose_bounds`, a rung of `levels`; #944) may not read.
+///
+/// A dose expression is evaluated once per subject, at the first decision, from θ and
+/// the data covariates in force there. The shared output compiler would accept more —
+/// a state compiles and reads the (zero) state slice, `TIME` reads 0.0 outside the
+/// driver, an individual parameter reads the (zero) PK slice — so each is refused here,
+/// by name, rather than silently evaluated to a number that means nothing. The
+/// parser runs it at model level, so `ferx check` reports it;
+/// `compile_dose_exprs` runs it again on a spec built in code. A syntax error is
+/// reported with the key as its context. Individual parameters and random effects are
+/// refused outright here: which subjects' values are known at dosing time is #944's
+/// next step.
+pub(crate) fn check_adaptive_dose_expression(
+    src: &str,
+    key: &str,
+    model: &CompiledModel,
+    declared_covariates: &[String],
+    at0: f64,
+) -> Result<(), String> {
+    let ctx = ParseCtx::new(
+        &model.theta_names,
+        &model.eta_names,
+        &model.indiv_param_names,
+    );
+    let expr =
+        parse_scalar_expression(src, ctx).map_err(|e| format!("[adaptive_dosing] {key}: {e}"))?;
+    if expr_references_time_builtin(&expr, declared_covariates) {
+        return Err(format!(
+            "[adaptive_dosing] {key} reads TIME. A dose expression is evaluated once, at the \
+             first decision (t = {at0}), so TIME is always {at0}; write the value instead."
+        ));
+    }
+    if let Some(k) = expr_references_kappa(&expr, &model.kappa_names) {
+        return Err(format!(
+            "[adaptive_dosing] {key} reads {k}, an inter-occasion random effect. It is drawn \
+             for each occasion, so it is never known at dosing time, even for a subject whose \
+             random effects are supplied."
+        ));
+    }
+    let states: &[String] = model
+        .ode_spec
+        .as_ref()
+        .map_or(&[], |o| o.state_names.as_slice());
+    // A subject's own parameter value: not known at dosing time unless supplied, and
+    // supplied values are #944's next step, so refused with the route that works today.
+    const OWN_VALUE: &str = " A dose expression may read data covariates and θ; it \
+        cannot read a subject's own parameter values yet. To dose from a known value, carry \
+        it as a data column (e.g. CL_KNOWN) and read that.";
+    let mut refusal: Option<String> = None;
+    visit_expr_nodes(&expr, &mut |e: &Expression| {
+        if refusal.is_some() {
+            return;
+        }
+        refusal = match e {
+            Expression::Variable(n) | Expression::Covariate(n) if states.contains(n) => {
+                Some(format!(
+                    "{n}, a state of the model. A dose expression is evaluated once per \
+                     subject, at the first decision; it may read data covariates and θ. To \
+                     respond to the drug level, write a `when signal …` rule."
+                ))
+            }
+            Expression::Variable(n) => Some(format!("{n}, an individual parameter.{OWN_VALUE}")),
+            Expression::Eta(i) => Some(format!(
+                "{}, a random effect.{OWN_VALUE}",
+                model.eta_names.get(*i).map_or("an η", String::as_str)
+            )),
+            Expression::MixNum => Some(
+                "MIXNUM, the subject's mixture class, which the simulation draws; no \
+                 prescriber knows it at dosing time."
+                    .to_string(),
+            ),
+            _ => None,
+        };
+    });
+    match refusal {
+        Some(what) => Err(format!("[adaptive_dosing] {key} reads {what}")),
+        None => Ok(()),
     }
 }
 
@@ -16451,6 +16697,51 @@ fn build_ode_spec(
 
     // Linearity is decided on names, so before the rewrite below turns them into slots (#852).
     let affine_in_states = ode_linearity::stmts_affine_in_states(&stmts_owned, &state_names_owned);
+    // Also on names, for the same reason (#2649).
+    let name_of_slot = |slot: &usize| {
+        indiv_slots_owned
+            .iter()
+            .position(|s| s == slot)
+            .map(|i| indiv_names_owned[i].clone())
+    };
+    let is_dose_attr = |attr: Option<crate::types::DoseAttr>, i: usize, slot: usize| {
+        let indexed = crate::types::DoseAttr::from_indexed_name(&indiv_names_owned[i]);
+        match attr {
+            Some(a) => {
+                slot == crate::types::PK_IDX_LAGTIME || indexed.is_some_and(|(found, _)| found == a)
+            }
+            None => {
+                slot == crate::types::PK_IDX_F
+                    || slot == crate::types::PK_IDX_LAGTIME
+                    || indexed.is_some()
+            }
+        }
+    };
+    let params_where = |attr: Option<crate::types::DoseAttr>| -> Vec<String> {
+        indiv_slots_owned
+            .iter()
+            .enumerate()
+            .filter(|&(i, &slot)| is_dose_attr(attr, i, slot))
+            .map(|(i, _)| indiv_names_owned[i].clone())
+            .collect()
+    };
+    let condition_reads = ode_switch::conditions_reading_params(
+        &stmts_owned,
+        &ode_switch::SwitchInputs {
+            states: &state_names_owned,
+            params: &indiv_names_owned,
+            dose_params: params_where(None),
+            lag_params: params_where(Some(crate::types::DoseAttr::Lag)),
+            forcing_params: input_rate
+                .iter()
+                .map(|f| {
+                    let slots = f.arg_slots.iter().chain(&f.frac_slot).chain(&f.lag_slot);
+                    (f.cmt, slots.filter_map(name_of_slot).collect())
+                })
+                .collect(),
+            inits: &init_specs,
+        },
+    );
 
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
@@ -16698,6 +16989,34 @@ fn build_ode_spec(
         tad_slot,
         macheps_slot,
     );
+    // The compiled RHS, or why the interpreter keeps it, named for `fit()` and `ferx
+    // check` (#2681): a slot by the name the `[odes]` block reads it under.
+    let rhs_reg = rhs_regcode::RhsRegProgram::compile_unless_disabled(
+        &stmts_owned,
+        &rhs_regcode::RhsLayout {
+            n_vars: n_vars_total,
+            state_count,
+            indiv_to_params_slot: &indiv_to_params_slot,
+            seed_slots: [time_slot, tafd_slot, tad_slot, macheps_slot],
+        },
+    )
+    .map_err(|r| {
+        let slot_name = |slot: usize| -> String {
+            state_names_owned
+                .iter()
+                .chain(indiv_names_owned.iter())
+                .chain(intermediates.iter())
+                .nth(slot)
+                .cloned()
+                .or_else(|| {
+                    ["TIME", "TAFD", "TAD", "MACHEPS"]
+                        .get(slot.wrapping_sub(n_base_vars))
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| format!("slot {slot}"))
+        };
+        r.named(slot_name)
+    });
     let mut rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -16714,18 +17033,13 @@ fn build_ode_spec(
         pk_reads_tad,
         pk_reads_solver_time,
         affine_in_states,
+        condition_reads,
+        moving_switches: Vec::new(),
         #[cfg(feature = "survival")]
         init_indiv_reads,
         init_program,
-        reg: rhs_regcode::RhsRegProgram::compile_unless_disabled(
-            &stmts_owned,
-            &rhs_regcode::RhsLayout {
-                n_vars: n_vars_total,
-                state_count,
-                indiv_to_params_slot: &indiv_to_params_slot,
-                seed_slots: [time_slot, tafd_slot, tad_slot, macheps_slot],
-            },
-        ),
+        reg: rhs_reg.as_ref().ok().cloned(),
+        reg_refusal: rhs_reg.err(),
         hoist: rhs_hoist,
         binding,
         columns: None,
@@ -21487,7 +21801,6 @@ fn correlation_kind_list() -> String {
 fn resolve_correlation(
     decl: &CorrelationDecl,
     parsed: &ParsedErrorModel,
-    iiv_on_ruv: Option<&str>,
     has_block_sigma: bool,
     thetas: &[ThetaSpec],
 ) -> Result<Option<crate::types::ResidualSerial>, String> {
@@ -21506,11 +21819,6 @@ fn resolve_correlation(
                  (`if … else`) error model."
             ))
         }
-    }
-    if let Some(eta) = iiv_on_ruv {
-        return Err(format!(
-            "[error_model] `{line}` is not supported together with `iiv_on_ruv = {eta}`."
-        ));
     }
     if has_block_sigma {
         return Err(format!(
@@ -21548,9 +21856,45 @@ fn parse_error_model(
 fn parse_error_model_inner(
     lines: &[String],
 ) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
+    // IIV on residual error: `iiv_on_ruv = ETA_NAME` (NONMEM `Y=IPRED+EPS*EXP(ETA)`). It
+    // modifies the whole block rather than one statement, so it is taken out first: it
+    // sits beside a plain, per-CMT or if/else block alike (#2656). Inside an if/else
+    // branch it would read as scaling that branch alone, which no model here can do, so
+    // only a line outside every brace counts and one inside is refused.
+    static IIV_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap());
+    let mut iiv_on_ruv: Option<String> = None;
+    let mut statements: Vec<String> = Vec::with_capacity(lines.len());
+    let mut depth = 0_usize;
+    for line in lines {
+        let code = line.split('#').next().unwrap_or("").trim();
+        match IIV_RE.captures(code) {
+            Some(c) if depth > 0 => {
+                return Err(format!(
+                    "[error_model] `iiv_on_ruv = {}` is inside an `if/else` branch. It scales \
+                     every branch, so write it after the closing `}}`.",
+                    &c[1]
+                ));
+            }
+            Some(_) if iiv_on_ruv.is_some() => {
+                return Err("[error_model] has more than one `iiv_on_ruv = ...` entry".to_string());
+            }
+            Some(c) => iiv_on_ruv = Some(c[1].to_string()),
+            None => {
+                for ch in code.chars() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                statements.push(line.clone());
+            }
+        }
+    }
     // Covariate-selected if/else form (issue #658) — detected and parsed first;
     // falls through to the line-based single / per-CMT grammar when absent.
-    if let Some((branches, default, covariates)) = parse_selected_error_model(lines)? {
+    if let Some((branches, default, covariates)) = parse_selected_error_model(&statements)? {
         return Ok((
             ParsedErrorModel::Selected {
                 branches,
@@ -21558,7 +21902,7 @@ fn parse_error_model_inner(
                 covariates,
             },
             LtbsFlags::default(),
-            None,
+            iiv_on_ruv,
         ));
     }
     // Single-endpoint:
@@ -21592,27 +21936,12 @@ fn parse_error_model_inner(
     // and the `power(...)` exponent expression when the line is that form.
     let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
-    // IIV on residual error: `iiv_on_ruv = ETA_NAME` (NONMEM `Y=IPRED+EPS*EXP(ETA)`).
-    static IIV_RE: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap());
-    let iiv_re = &*IIV_RE;
-    let mut iiv_on_ruv: Option<String> = None;
-
-    for line in lines {
+    for line in &statements {
         // Strip inline `# ...` comments so the anchored statement regex sees a
         // clean `LHS ~ TYPE(args)` (a trailing comment would otherwise defeat
         // the `$` anchor and the statement would be silently ignored).
         let trimmed = line.split('#').next().unwrap_or("").trim();
         if trimmed.is_empty() {
-            continue;
-        }
-
-        // `iiv_on_ruv = ETA_NAME` declares a random effect on the residual error.
-        if let Some(c) = iiv_re.captures(trimmed) {
-            if iiv_on_ruv.is_some() {
-                return Err("[error_model] has more than one `iiv_on_ruv = ...` entry".to_string());
-            }
-            iiv_on_ruv = Some(c[1].to_string());
             continue;
         }
 
@@ -30860,6 +31189,12 @@ pub struct OdeRhsProgram {
     /// read through [`Self::is_affine_in_states`] (#852). Decided on the unresolved program by
     /// `ode_linearity::stmts_affine_in_states`.
     affine_in_states: bool,
+    /// The `if` conditions an individual parameter reaches (#2649). Decided on the unresolved
+    /// program; [`Self::moving_switch`] is what a gate should ask.
+    condition_reads: Vec<ode_switch::ConditionReads>,
+    /// The parameters that move an `if` switch (#2649). Filled once `[individual_parameters]`
+    /// is known; see [`Self::resolve_moving_switches`].
+    moving_switches: Vec<String>,
     /// The parameter-only subexpressions lifted out of the RK stages, and the
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
@@ -30869,6 +31204,9 @@ pub struct OdeRhsProgram {
     /// `rhs_regcode`); `None` otherwise. It recomputes the hoist's parameter-only values,
     /// which are bit-identical to the cached ones by construction.
     reg: Option<rhs_regcode::RhsRegProgram>,
+    /// Why [`Self::reg`] is `None`: the construct that kept the interpreter, and where
+    /// (#2681). `Some` exactly when `reg` is `None`.
+    reg_refusal: Option<rhs_regcode::RhsInterpreted>,
     /// The f64 RHS at many single-state perturbations in one lane pass
     /// ([`OdeRhsProgram::rhs_columns`]); `None` when a statement cannot run on lanes.
     columns: Option<RhsColumnsFn>,
@@ -30949,6 +31287,53 @@ impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
 }
 
 impl OdeRhsProgram {
+    /// Fill [`Self::moving_switches`] from `deps`, the `[individual_parameters]` dependencies.
+    /// A condition counts when something in it varies during the integration (a state, a
+    /// clock, or a parameter that reads `TIME`). A parameter counts when a θ or η reaches it,
+    /// FIX or not: `ModelParameters::theta_fixed` is the caller's to change at `fit()`, which
+    /// the model-level scope cannot see. A covariate-only `LAGT = WT / 10` is left alone.
+    /// Which engine runs this RHS (#2681): the interpreter, with the construct that kept
+    /// it; the register code, with why no native code; or native code.
+    pub(crate) fn rhs_route(&self) -> rhs_regcode::RhsRoute<'_> {
+        match (&self.reg, &self.reg_refusal) {
+            (_, Some(r)) => rhs_regcode::RhsRoute::Interpreter(r),
+            (Some(reg), None) => reg.route(),
+            // Not built by the parser, which sets exactly one of the two.
+            (None, None) => rhs_regcode::RhsRoute::Native,
+        }
+    }
+
+    /// The note `fit()` and `ferx check` report for an RHS that does not run as native code
+    /// (#2681): `(code, message, details)`, or `None` when it does.
+    pub(crate) fn route_note(&self) -> Option<(&'static str, String, serde_json::Value)> {
+        rhs_regcode::rhs_route_note(self.rhs_route())
+    }
+
+    fn resolve_moving_switches(&mut self, deps: &std::collections::HashMap<String, IndivVarDeps>) {
+        let mut out: Vec<String> = Vec::new();
+        for c in &self.condition_reads {
+            let moves = c.moves
+                || c.params
+                    .iter()
+                    .any(|p| deps.get(p).is_some_and(|d| d.reads_time));
+            if !moves {
+                continue;
+            }
+            for p in &c.params {
+                let Some(d) = deps.get(p) else { continue };
+                if (d.has_eta || !d.thetas.is_empty()) && !out.contains(p) {
+                    out.push(p.clone());
+                }
+            }
+        }
+        self.moving_switches = out;
+    }
+
+    /// The first parameter whose `if` switch moves with it (#2649), if any.
+    pub(crate) fn moving_switch(&self) -> Option<&str> {
+        self.moving_switches.first().map(String::as_str)
+    }
+
     /// `rhs` as direct native calls ([`DirectRhsF64`]): `Some` only when `rhs` is the very
     /// closure this program was built with (same address) and the program has an `f64`
     /// native function.
@@ -35080,6 +35465,9 @@ fn parse_if_statement(
 
 #[path = "ode_linearity.rs"]
 mod ode_linearity;
+
+#[path = "ode_switch.rs"]
+mod ode_switch;
 
 #[path = "rhs_regcode.rs"]
 mod rhs_regcode;
