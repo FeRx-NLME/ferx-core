@@ -3487,8 +3487,10 @@ fn fit_inner(
         fit_result.se_theta.as_ref(),
         &fit_result.theta_fixed,
     );
+    // The final parameters, not `init_params`: an estimator can hold more than it was
+    // given, as SAEM does a mixture's σ overrides, and the step ran on these.
     fit_result.cov_fixed =
-        crate::estimation::parameterization::cov_fixed_mask(init_params, &fit_result);
+        crate::estimation::parameterization::cov_fixed_mask(&result.params, &fit_result);
 
     Ok(fit_result)
 }

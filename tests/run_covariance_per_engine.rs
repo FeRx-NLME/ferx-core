@@ -10,7 +10,7 @@
 //! those bits.
 //!
 //! **Claims**, per row: in memory and reloaded, the covariance matrix and every SE vector
-//! are bit-identical to the inline step's.
+//! are bit-identical to the inline step's, and `cov_fixed` is the same mask.
 //!
 //! Mutations (measured, see the PR):
 //! - compare within the legacy 1e-6 band always (the pre-#1847 start rule): the five
@@ -108,6 +108,11 @@ fn rerun(f: &Fitted, fit: &FitResult, what: &str) -> Vec<Vec<u64>> {
     };
     let out = run_covariance(fit, Some(&f.model), Some(&f.population), &options)
         .unwrap_or_else(|e| panic!("{what}: run_covariance: {e}"));
+    assert!(!out.cov_fixed.is_empty(), "{what}: a matrix has a mask");
+    assert_eq!(
+        out.cov_fixed, f.fit.cov_fixed,
+        "{what}: the inline and post-hoc steps held the same coordinates (#2695)"
+    );
     bits_of(&out, what)
 }
 
