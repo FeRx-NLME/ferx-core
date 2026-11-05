@@ -8141,12 +8141,16 @@ pub struct FitResult {
     /// Number of outer iterations in which at least one subject had an
     /// unconverged EBE.  Always `0` for SAEM (which uses MH sampling).
     pub ebe_convergence_warnings: u32,
-    /// Worst-case number of unconverged subjects in a single outer iteration.
+    /// Worst-case number of unconverged subjects in a single outer iteration. An evaluation
+    /// whose inner pass stopped once the EBE guard's rejection was certain (#2709) counts the
+    /// subjects it solved, so its count is a lower bound; a run with no feasible evaluation
+    /// never stops one.
     pub max_unconverged_subjects: u32,
     /// How many times, summed over every inner loop (not a count of distinct subjects), an
     /// inner solve returned a fallback's point (`EbeResult::used_fallback`): the recovery
     /// after the primary search failed its certificate, or the runaway-EBE guard's. A solve
-    /// whose fallback point a multi-start candidate then replaced is not counted (#2589).
+    /// whose fallback point a multi-start candidate then replaced is not counted (#2589), nor
+    /// a subject an inner pass left unsolved once the EBE guard's rejection was certain (#2709).
     /// Counted only by the outer loop under an NLopt optimizer (`auto`, `bobyqa`, `slsqp`,
     /// `mma`, and `nlopt_lbfgs` with its model-file aliases `lbfgs` / `bfgs`), for FOCE,
     /// FOCEI, Laplace and AGQ alike; by a fit with a `profile`d level block; and by Bayes'

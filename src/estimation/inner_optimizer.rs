@@ -10,7 +10,7 @@ use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Objective values one inner solve keeps by the exact bits of η (`find_ebe_solve`'s memo).
 const OBJ_MEMO: usize = 4;
@@ -7479,6 +7479,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send + Default>(
         None,
         policy,
         cancel,
+        None,
         finish_subject,
     )
 }
@@ -7500,6 +7501,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
     schedules: &[Option<pk::event_driven::EventSchedule>],
     policy: InnerSolvePolicy,
     cancel: Option<&crate::cancel::CancelFlag>,
+    guard_stop: Option<&GuardStop>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -7522,6 +7524,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
         Some(schedules),
         policy,
         cancel,
+        guard_stop,
         finish_subject,
     )
 }
@@ -7552,6 +7555,7 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
     policy: InnerSolvePolicy,
     cancel: Option<&crate::cancel::CancelFlag>,
+    guard_stop: Option<&GuardStop>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -7574,6 +7578,7 @@ pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
         schedules,
         policy,
         cancel,
+        guard_stop,
         finish_subject,
     )
 }
@@ -7639,6 +7644,101 @@ fn cancelled_ebe_placeholder(
     }
 }
 
+/// Stops an outer evaluation's inner pass once the EBE convergence guard's rejection of it
+/// is certain (#2709).
+///
+/// The guard (`outer_optimizer::ebe_guard_rejects`) rejects an evaluation on any hard start
+/// rejection, or on more than `max_unconverged_frac` of the subjects unconverged; a rejected
+/// evaluation is scored by a penalty that depends on the outer point alone, and no gradient
+/// pass runs there. Both counts only grow as subjects finish, so once either is past its
+/// threshold no subject still to be solved can change what the outer optimizer receives.
+/// The remaining subjects get the #574 cancel placeholder instead of a solve. The
+/// placeholder is a hard rejection, so a stopped pass is always rejected.
+///
+/// Counts mirror the end-of-pass [`InnerLoopStats`] exactly: an unconverged subject counts
+/// only with at least `min_obs` scored rows, a hard rejection counts regardless. They are
+/// taken from the subjects actually solved, so on a stopped pass they are lower bounds,
+/// and with more than one worker which subjects were solved depends on scheduling.
+pub(crate) struct GuardStop {
+    n_subj: usize,
+    min_obs: usize,
+    max_unconverged_frac: f64,
+    unconverged: AtomicUsize,
+    start_rejected: AtomicUsize,
+    fallback: AtomicUsize,
+    nm_polished: AtomicUsize,
+    solved: AtomicUsize,
+    stopped: AtomicBool,
+}
+
+impl GuardStop {
+    /// A token for one pass over `n_subj` subjects, judged as `ebe_guard_rejects` judges it.
+    pub(crate) fn new(n_subj: usize, min_obs: usize, max_unconverged_frac: f64) -> Self {
+        Self {
+            n_subj,
+            min_obs,
+            max_unconverged_frac,
+            unconverged: AtomicUsize::new(0),
+            start_rejected: AtomicUsize::new(0),
+            fallback: AtomicUsize::new(0),
+            nm_polished: AtomicUsize::new(0),
+            solved: AtomicUsize::new(0),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the unconverged count `n` alone already makes the guard reject. The same
+    /// test as `ebe_guard_rejects`' fraction arm; a negative `max_unconverged_frac` disables
+    /// it there and here.
+    fn fraction_rejects(&self, n: usize) -> bool {
+        self.max_unconverged_frac >= 0.0
+            && n as f64 / (self.n_subj as f64).max(1.0) > self.max_unconverged_frac
+    }
+
+    /// Records a finished subject's result and stops the pass when the rejection is certain.
+    pub(crate) fn record(&self, subject: &Subject, ebe: &EbeResult) {
+        self.solved.fetch_add(1, Ordering::Relaxed);
+        if ebe.used_fallback {
+            self.fallback.fetch_add(1, Ordering::Relaxed);
+        }
+        if ebe.nm_polished {
+            self.nm_polished.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut certain = false;
+        if ebe.hard_reject {
+            self.start_rejected.fetch_add(1, Ordering::Relaxed);
+            certain = true;
+        }
+        if !ebe.converged && subject.n_scored_rows() >= self.min_obs.max(1) {
+            let n = self.unconverged.fetch_add(1, Ordering::Relaxed) + 1;
+            certain |= self.fraction_rejects(n);
+        }
+        if certain {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the pass stopped: the guard rejects it whatever the unsolved subjects do.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// The statistics of the subjects actually solved, for a stopped pass's report.
+    pub(crate) fn observed_stats(&self) -> InnerLoopStats {
+        InnerLoopStats {
+            n_unconverged: self.unconverged.load(Ordering::Relaxed),
+            n_fallback: self.fallback.load(Ordering::Relaxed),
+            n_nm_polished: self.nm_polished.load(Ordering::Relaxed),
+            n_start_rejected: self.start_rejected.load(Ordering::Relaxed),
+        }
+    }
+
+    /// How many subjects were solved before the pass stopped.
+    pub(crate) fn solved(&self) -> usize {
+        self.solved.load(Ordering::Relaxed)
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_inner_loop_warm_map_impl<T: Send + Default>(
     model: &CompiledModel,
@@ -7654,6 +7754,9 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
     policy: InnerSolvePolicy,
     cancel: Option<&crate::cancel::CancelFlag>,
+    // Polled per subject like `cancel`, and fed each finished subject ([`GuardStop`],
+    // #2709). `None`: every subject is solved.
+    guard_stop: Option<&GuardStop>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -7683,7 +7786,10 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
             // poll between evaluations. A subject that has not started when the flag
             // flips gets a placeholder instead of a solve, so the pass drains in the
             // time of the solves already in flight.
-            if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled) {
+            // A pass the guard is certain to reject stops the same way (#2709).
+            if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled)
+                || guard_stop.is_some_and(GuardStop::stopped)
+            {
                 return (
                     cancelled_ebe_placeholder(model, subject, init),
                     T::default(),
@@ -7728,6 +7834,9 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
                         ebe = alt;
                     }
                 }
+            }
+            if let Some(stop) = guard_stop {
+                stop.record(subject, &ebe);
             }
             let extra = finish_subject(subject, &ebe);
             (ebe, extra)

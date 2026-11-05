@@ -882,6 +882,31 @@ Eval    1: start rejected by the EBE convergence guard (17 of 30 subjects unconv
 Eval    1: OFV = -1040.033385
 ```
 
+#### A rejected step stops solving subjects {#guard-early-stop}
+
+A trial the guard rejects is scored by its rejection penalty, which depends on the
+parameters alone, and no gradient pass runs there. So once enough subjects have finished
+for the rejection to be certain, the rest are not solved
+([#2709](https://github.com/FeRx-NLME/ferx-core/issues/2709)). The rejection is certain
+once more than `max_unconverged_frac` of the subjects are unconverged, or one is rejected
+at its inner start. Every value the optimizer receives is the same as with the full pass,
+so the fit is too, bit for bit.
+
+Two kinds of evaluation always solve every subject:
+
+- the first evaluation, which the warm re-solve above starts from;
+- every evaluation of a run that has not yet had a feasible one, so `W_NO_FEASIBLE_EVAL`
+  still reports the worst unconverged count over full passes.
+
+On a stopped evaluation the fit-level counters (`max_unconverged_subjects`,
+`total_ebe_fallbacks`) count the subjects that were solved.
+
+The rejected trials are where this pays: they are often far from the data, where the inner
+loops are slowest. On nlmixr2data's `Infusion_2CPTMM` (120 subjects, a two-compartment
+Michaelis–Menten ODE), one line-search trial puts `TVVM` on its upper bound and leaves 54 of
+the subjects unconverged. Solving all 120 there took 155 s. With the stop, the whole fit goes
+from 241.8 s to 114.2 s, with the same fit YAML (Linux x86_64, one thread, no covariance step).
+
 ### When the fit ends above its start {#above-start}
 
 The best-seen restore ranks only the evaluations the EBE guard accepted, so a **starting
