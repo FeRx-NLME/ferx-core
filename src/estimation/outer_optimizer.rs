@@ -4741,6 +4741,19 @@ fn bhhh_newton_decrement(
     bounds: &PackedBounds,
     fixed: &[bool],
 ) -> Option<f64> {
+    bhhh_newton_step(per_subject, penalty_grad, penalty_hess, x, bounds, fixed).map(|(d, _)| d)
+}
+
+/// [`bhhh_newton_decrement`] with the step it predicts from: `−S⁻¹s` in packed coordinates,
+/// on the eigenvalues the decrement keeps, and zero on every coordinate it does not free.
+fn bhhh_newton_step(
+    per_subject: &[Vec<f64>],
+    penalty_grad: &[f64],
+    penalty_hess: &DMatrix<f64>,
+    x: &[f64],
+    bounds: &PackedBounds,
+    fixed: &[bool],
+) -> Option<(f64, Vec<f64>)> {
     let n = x.len();
     let s_full: Vec<f64> = (0..n)
         .map(|k| per_subject.iter().map(|g| g[k]).sum::<f64>() + 0.5 * penalty_grad[k])
@@ -4774,14 +4787,20 @@ fn bhhh_newton_decrement(
     if lambda_max <= 0.0 {
         return None;
     }
-    let decrement: f64 = eig
-        .eigenvalues
-        .iter()
-        .enumerate()
-        .filter(|&(_, &lambda)| lambda > 1e-10 * lambda_max)
-        .map(|(j, &lambda)| eig.eigenvectors.column(j).dot(&s).powi(2) / lambda)
-        .sum();
-    decrement.is_finite().then_some(decrement)
+    let mut decrement = 0.0;
+    let mut step_free = DVector::zeros(m);
+    for (j, &lambda) in eig.eigenvalues.iter().enumerate() {
+        if lambda > 1e-10 * lambda_max {
+            let along = eig.eigenvectors.column(j).dot(&s);
+            decrement += along * along / lambda;
+            step_free -= eig.eigenvectors.column(j) * (along / lambda);
+        }
+    }
+    let mut step = vec![0.0; n];
+    for (a, &k) in free.iter().enumerate() {
+        step[k] = step_free[a];
+    }
+    decrement.is_finite().then_some((decrement, step))
 }
 
 /// Largest [`bhhh_newton_decrement`] at which the stagnation guard may still latch
@@ -4948,6 +4967,35 @@ fn predicted_remaining_gain(
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
     priors: &crate::estimation::priors::PriorSet,
 ) -> Option<f64> {
+    predicted_newton_step(
+        model,
+        population,
+        init_params,
+        x,
+        ehs,
+        kappas,
+        bounds,
+        options,
+        nn_reg,
+        priors,
+    )
+    .map(|(gain, _)| gain)
+}
+
+/// [`predicted_remaining_gain`] with the step behind it ([`bhhh_newton_step`]).
+#[allow(clippy::too_many_arguments)]
+fn predicted_newton_step(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> Option<(f64, Vec<f64>)> {
     if !per_subject_outer_gradients_in_scope(model, options) {
         return None;
     }
@@ -4990,7 +5038,7 @@ fn predicted_remaining_gain(
     nn_reg.add_packed_hessian(&theta, &mut |i, j, v| penalty_hess[(i, j)] += v);
     priors.add_gradient(x, &mut penalty_grad);
     priors.add_hessian(&mut |i, j, v| penalty_hess[(i, j)] += v);
-    bhhh_newton_decrement(
+    bhhh_newton_step(
         &per_subject,
         &penalty_grad,
         &penalty_hess,
@@ -6317,6 +6365,89 @@ pub(crate) fn keep_verify_leg<G: Clone>(
     }
 }
 
+/// Where a leg starts. Every leg starts at the incumbent's own modes (#2549) unless it opens
+/// one of the further passes a verified stop gets (#2645): a round of
+/// [`unprofiled_verify_legs`] from somewhere the warm legs cannot reach, which replaces the
+/// incumbent only by ending lower ([`keep_verify_leg`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum LegStart {
+    /// The incumbent, at its own modes.
+    Incumbent,
+    /// The incumbent, at a cold solve's modes. A warm leg verifies the stop on the modes the
+    /// fit already holds, so it cannot see that another mode set has a lower optimum in θ,
+    /// and a subject's other mode can score *worse* at the incumbent and still lead there: no
+    /// per-subject comparison at that point finds it. On the propofol benchmark (24 subjects,
+    /// 3-cpt closed form) a cold solve at the incumbent scores −3038.866 against −3038.980,
+    /// on one subject, and the leg from those modes reaches −3039.288158, NONMEM's
+    /// −3039.2882 (macOS arm64). On the cefepime benchmark (458 subjects) four subjects score
+    /// 2.32 worse cold, and the leg ends 2.76 lower. It runs only when
+    /// [`subjects_off_the_held_modes`] finds a subject to move.
+    ColdModes,
+    /// The BHHH Newton step from the incumbent, at its modes. A leg restarts L-BFGS with no
+    /// curvature memory, so on a long valley its first line search can fail at a point that
+    /// is no minimum. On the busulfan benchmark (1518 subjects, ODE + IOV; TVCL and TVDROP
+    /// nearly confounded) the fit stopped `converged` at 126579.41, with |g|∞ 4.26 and
+    /// a predicted gain of 7.9, and every leg gained under 1e-6; a leg from this step reaches
+    /// 126565.48 with |g|∞ 0.08 (macOS arm64). It runs only when that gain exceeds
+    /// [`LATCH_MAX_PREDICTED_GAIN`], the guard's own line between a plateau and a creep.
+    NewtonStep,
+}
+
+/// Does a stop that ended `end` get the pass opening at `start`? After the warm legs, not
+/// instead of them, because no start wins everywhere: the warm leg is what
+/// `transit_flip_flop_fit_matches_ode_twin` needs (#2549), and the others can lose outright,
+/// so the fit keeps whichever ended lower. Only from a stop the legs settled: a leg cap or a
+/// spent budget is not a verified incumbent, and a stop the #2093 basin probe ended goes to
+/// the basin-shift restart.
+#[cfg_attr(not(test), allow(unused_variables))] // `start` is the tests' switch
+pub(crate) fn leg_pass_applies(start: LegStart, end: PolishEnd, basin_probe_fired: bool) -> bool {
+    #[cfg(test)]
+    if LEG_PASSES_OFF.with(|o| o.get()).contains(&start) {
+        return false;
+    }
+    matches!(end, PolishEnd::Settled) && !basin_probe_fired
+}
+
+/// Does a Newton step's predicted `gain` warrant a [`LegStart::NewtonStep`] leg? Above
+/// [`LATCH_MAX_PREDICTED_GAIN`], and only with more subjects than coordinates the step moves.
+/// `S = Σ gᵢgᵢᵀ` has rank at most the subject count, and on `s`'s own span `sᵀS⁺s` reads as a
+/// constant rather than a distance to the optimum: one subject reads exactly 1 wherever it
+/// is. On the one-subject `fit_on_ss_absorption_converges` that sent a leg along a flat
+/// direction, V from 20 to 6.66 for 0.002 OFV.
+pub(crate) fn newton_gain_warrants_a_leg(gain: f64, n_subjects: usize, step: &[f64]) -> bool {
+    gain > LATCH_MAX_PREDICTED_GAIN && n_subjects > step.iter().filter(|d| **d != 0.0).count()
+}
+
+/// The longest step, on any packed coordinate, a [`LegStart::NewtonStep`] leg starts from.
+/// `S` is nearly singular along the very valley the step is for, so the full step overshoots:
+/// on the busulfan benchmark it scored ~2.2e5 against 126579, and the leg ended at 182723.
+/// Capped at 0.1 or 0.3 (10% to 35% on a log-packed θ), the same step reached 126565.48
+/// in two legs and one; 0.3 is the cap that took one.
+const NEWTON_START_MAX_STEP: f64 = 0.3;
+
+/// `x + step`, the step scaled down so that no coordinate moves more than
+/// [`NEWTON_START_MAX_STEP`], then each coordinate held inside its bounds.
+pub(crate) fn newton_start(x: &[f64], step: &[f64], bounds: &PackedBounds) -> Vec<f64> {
+    let longest = step.iter().fold(0.0_f64, |m, d| m.max(d.abs()));
+    let shrink = (NEWTON_START_MAX_STEP / longest).min(1.0);
+    x.iter()
+        .zip(step)
+        .enumerate()
+        .map(|(k, (v, d))| (v + shrink * d).clamp(bounds.lower[k], bounds.upper[k]))
+        .collect()
+}
+
+/// How many subjects' `−2LL` terms differ between the held and the cold modes by more than
+/// [`PLATEAU_OFV_THRESHOLD`], in either direction: a [`LegStart::ColdModes`] pass has nothing
+/// to explore when this is zero, which is every unimodal fit, so there it costs one inner pass
+/// and no leg. `>` on a difference: a `NaN` side is never counted.
+pub(crate) fn subjects_off_the_held_modes(held: &[f64], cold: &[f64]) -> usize {
+    held.iter()
+        .zip(cold)
+        .filter(|(h, c)| 2.0 * (*h - *c).abs() > PLATEAU_OFV_THRESHOLD)
+        .count()
+}
+
 /// The internal switch for the #2462 verification leg. `false` restores the pre-#2462
 /// verdict on every stop; kept so a change in a test can be attributed to the leg.
 const UNPROFILED_VERIFY_LEG: bool = true;
@@ -6328,6 +6459,9 @@ thread_local! {
     /// Turns the #2462 leg off on this thread, for the tests' mutation checks.
     pub(crate) static UNPROFILED_VERIFY_OFF: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// The #2645 passes turned off on this thread, for the tests' straddles.
+    pub(crate) static LEG_PASSES_OFF: std::cell::Cell<&'static [LegStart]> =
+        const { std::cell::Cell::new(&[]) };
     /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -7781,6 +7915,8 @@ fn optimize_nlopt_attempt_probed(
     let verified_needs_left_init = verified_stop_needs_left_init(&first_leg, latched_at_stop);
     // The best leg incumbent copied into `best_seen` so far (#2507), at the leg tolerance.
     let mut kept_leg_best: Option<f64> = None;
+    // `kept_leg_best` as the code around the legs reads it, while they hold the original.
+    let kept_best_seen = std::cell::Cell::new(None::<f64>);
     // The optimizer gradient and the whole EBE state (`best_solve`) at that incumbent
     // ([`keep_verify_leg`]).
     let mut kept_leg_state: Option<(Option<Vec<f64>>, Option<IncumbentSolve>)> = None;
@@ -7801,107 +7937,209 @@ fn optimize_nlopt_attempt_probed(
                 left_init_at_stop,
                 plateau_shape,
             );
-        unprofiled_verify_legs(
-            first_leg,
-            first_needs_verify,
-            // Read live: a cancel during a leg ends the legs there.
-            |r| {
-                !basin_probe_fired.get()
-                    && unprofiled_stop_needs_verify(
-                        r,
-                        crate::cancel::is_cancelled(&options.cancel),
-                        left_init_at_stop,
-                        true,
-                    )
-            },
-            budget_left,
-            |left| {
-                if plateau_tracker.lock().unwrap().2 == 0 {
-                    return None;
-                }
-                let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
-                let mut state = opt_slot.take()?.recover_user_data();
-                // The incumbent's own modes, when the held state is this point's.
-                let held = best_solve_cl
+        // Read live: a cancel during a leg ends the legs there.
+        let leg_needs_verify = |r: &NloptReturn| {
+            !basin_probe_fired.get()
+                && unprofiled_stop_needs_verify(
+                    r,
+                    crate::cancel::is_cancelled(&options.cancel),
+                    left_init_at_stop,
+                    true,
+                )
+        };
+        // Set for the first leg of a pass ([`leg_pass_applies`]).
+        let next_start = std::cell::Cell::new(LegStart::Incumbent);
+        let mut run_leg = |left: u32| {
+            if plateau_tracker.lock().unwrap().2 == 0 {
+                return None;
+            }
+            let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
+            // The point and modes the leg starts at: the incumbent and its own modes when the
+            // held state is this point's. A pass needs that held state to compare against.
+            let mut start_x = best_x.clone();
+            let held = match next_start.replace(LegStart::Incumbent) {
+                LegStart::Incumbent => best_solve_cl
                     .lock()
                     .unwrap()
                     .as_ref()
                     .filter(|inc| inc.xs == best_x)
-                    .map(|inc| outer_cache_warm_starts(model, &inc.etas, &inc.kappas));
-                x0.copy_from_slice(&best_x);
-                state.prev_x = best_x;
-                // Unlatched: a latched state answers every evaluation with the incumbent
-                // and a zero gradient, and the latch carries into the recovered state.
-                state.stagnation_stopped = false;
-                state.recent_steps.clear();
-                stagnation_latched.store(false, Ordering::Relaxed);
-                // The leg's own incumbent, so its first evaluation is adopted as the
-                // warm start whatever the loose objective was.
-                state.best_ofv = f64::INFINITY;
-                state.last_improvement_eval = state.n_evals;
-                state.best_at_last_improvement = f64::INFINITY;
-                // The leg's first evaluation re-solves the incumbent's own modes at the leg's
-                // tolerance: a verification leg tightens the inner solve at the point it
-                // starts from, so its inner solves start at the modes of that point (#2549).
-                // A cold start re-selected every mode at `UNPROFILED_VERIFY_INNER_TOL`: on the
-                // ODE twin of `transit_flip_flop_fit_matches_ode_twin` it left one of four
-                // subjects unconverged, the EBE guard rejected the leg's start, and the leg
-                // walked to the TVNTR floor (−59.31 against the incumbent's −228.59). No mode
-                // response carries over: it belongs to the modes of the evaluation it was
-                // taken at, and the leg's first point needs none (Δx = 0). Cold only when the
-                // held state is another point's.
-                state.reset_to_cold_start();
-                if let Some(modes) = held.filter(|m| m.len() == state.cached_etas.len()) {
-                    state.cached_etas = modes;
-                }
-                *leg_best.borrow_mut() = BestPoint::new();
-                leg_first.set(None);
-                let mut leg =
-                    nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
-                leg.set_lower_bounds(&lower_s).unwrap();
-                leg.set_upper_bounds(&upper_s).unwrap();
-                leg.set_maxeval(left).unwrap();
-                // The first leg's own stops (`verify_on` excludes the reachable ones).
-                leg.set_xtol_rel(1e-12).unwrap();
-                leg.set_ftol_rel(1e-12).unwrap();
-                in_leg.set(true);
-                let r = leg.optimize(&mut x0);
-                in_leg.set(false);
-                opt_slot = Some(leg);
-                let best = leg_best.borrow().get().map(|b| b.ofv);
-                let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
-                // The first leg's incumbent replaces the loose one: the two are at different
-                // tolerances, and the loose one can be lower by its noise alone. A later leg's
-                // replaces it only when lower; otherwise the kept leg's gradient and EBE state
-                // go back in, which this leg's improving evaluations overwrote
-                // ([`keep_verify_leg`]).
-                let mut live = (
-                    last_gradient.lock().unwrap().take(),
-                    best_solve.lock().unwrap().take(),
-                );
-                if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, best, &mut live) {
-                    *best_seen.lock().unwrap() = leg_best.borrow().clone();
-                }
-                *last_gradient.lock().unwrap() = live.0;
-                *best_solve.lock().unwrap() = live.1;
-                let outcome = UnprofiledLeg {
-                    ret: r,
-                    gain,
-                    best,
-                    first: leg_first.get(),
-                };
-                #[cfg(test)]
-                UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
-                if options.verbose {
-                    eprintln!(
-                        "Verification leg from OFV {before:.9} at inner_tol = {:e}: {:?}, \
-                         gain {gain:.3e}, best {best:?}",
-                        leg_options.inner_tol, outcome.ret,
+                    .map(|inc| outer_cache_warm_starts(model, &inc.etas, &inc.kappas)),
+                LegStart::ColdModes => {
+                    let x_inc: Vec<f64> = best_x.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                    let p = unpack_params(&x_inc, init_params);
+                    let mu_k = compute_mu_k(model, &p.theta, leg_options.mu_referencing);
+                    let cold = final_inner_solve(model, population, &p, &mu_k, None, &leg_options);
+                    let incumbent = best_solve_cl.lock().unwrap();
+                    let inc = incumbent.as_ref().filter(|inc| inc.xs == best_x)?;
+                    let terms = |etas: &[DVector<f64>],
+                                 h_mats: &[DMatrix<f64>],
+                                 kappas: &[Vec<DVector<f64>>]| {
+                        subject_nlls(
+                            model,
+                            population,
+                            &p,
+                            etas,
+                            h_mats,
+                            kappas,
+                            options.interaction,
+                        )
+                    };
+                    let moved = subjects_off_the_held_modes(
+                        &terms(&inc.etas, &inc.h_mats, &inc.kappas),
+                        &terms(&cold.etas, &cold.h_mats, &cold.kappas),
                     );
+                    if verbose {
+                        eprintln!(
+                            "Cold solve at the verified incumbent: {moved} of {} subjects off \
+                             its modes.",
+                            population.subjects.len(),
+                        );
+                    }
+                    if moved == 0 {
+                        return None;
+                    }
+                    Some(outer_cache_warm_starts(model, &cold.etas, &cold.kappas))
                 }
-                Some(outcome)
-            },
-        )
+                LegStart::NewtonStep => {
+                    let incumbent = best_solve_cl.lock().unwrap();
+                    let inc = incumbent.as_ref().filter(|inc| inc.xs == best_x)?;
+                    let x_inc: Vec<f64> = best_x.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                    let (gain, step) = predicted_newton_step(
+                        model,
+                        population,
+                        init_params,
+                        &x_inc,
+                        &inc.etas,
+                        &inc.kappas,
+                        &bounds,
+                        options,
+                        &nn_reg,
+                        &priors,
+                    )?;
+                    if verbose {
+                        eprintln!(
+                            "Newton step from the verified incumbent: predicted gain {gain:.4} \
+                             (a leg runs above {LATCH_MAX_PREDICTED_GAIN})."
+                        );
+                    }
+                    if !newton_gain_warrants_a_leg(gain, population.subjects.len(), &step) {
+                        return None;
+                    }
+                    start_x = newton_start(&x_inc, &step, &bounds)
+                        .iter()
+                        .zip(&scale)
+                        .map(|(v, s)| v / s)
+                        .collect();
+                    Some(outer_cache_warm_starts(model, &inc.etas, &inc.kappas))
+                }
+            };
+            let mut state = opt_slot.take()?.recover_user_data();
+            x0.copy_from_slice(&start_x);
+            state.prev_x = start_x;
+            // Unlatched: a latched state answers every evaluation with the incumbent
+            // and a zero gradient, and the latch carries into the recovered state.
+            state.stagnation_stopped = false;
+            state.recent_steps.clear();
+            stagnation_latched.store(false, Ordering::Relaxed);
+            // The leg's own incumbent, so its first evaluation is adopted as the
+            // warm start whatever the loose objective was.
+            state.best_ofv = f64::INFINITY;
+            state.last_improvement_eval = state.n_evals;
+            state.best_at_last_improvement = f64::INFINITY;
+            // The leg's first evaluation re-solves the incumbent's own modes at the leg's
+            // tolerance: a verification leg tightens the inner solve at the point it
+            // starts from, so its inner solves start at the modes of that point (#2549).
+            // A cold start re-selected every mode at `UNPROFILED_VERIFY_INNER_TOL`: on the
+            // ODE twin of `transit_flip_flop_fit_matches_ode_twin` it left one of four
+            // subjects unconverged, the EBE guard rejected the leg's start, and the leg
+            // walked to the TVNTR floor (−59.31 against the incumbent's −228.59). No mode
+            // response carries over: it belongs to the modes of the evaluation it was
+            // taken at, and the leg's first point needs none (Δx = 0). Cold only when the
+            // held state is another point's. The cold-mode pass starts its first leg at a
+            // cold solve's modes the same way, so that leg's first evaluation is a warm
+            // re-solve of them and a subject the cold solve left unconverged is not what
+            // the guard judges (#2645).
+            state.reset_to_cold_start();
+            if let Some(modes) = held.filter(|m| m.len() == state.cached_etas.len()) {
+                state.cached_etas = modes;
+            }
+            *leg_best.borrow_mut() = BestPoint::new();
+            leg_first.set(None);
+            let mut leg = nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
+            leg.set_lower_bounds(&lower_s).unwrap();
+            leg.set_upper_bounds(&upper_s).unwrap();
+            leg.set_maxeval(left).unwrap();
+            // The first leg's own stops (`verify_on` excludes the reachable ones).
+            leg.set_xtol_rel(1e-12).unwrap();
+            leg.set_ftol_rel(1e-12).unwrap();
+            in_leg.set(true);
+            let r = leg.optimize(&mut x0);
+            in_leg.set(false);
+            opt_slot = Some(leg);
+            let best = leg_best.borrow().get().map(|b| b.ofv);
+            let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
+            // The first leg's incumbent replaces the loose one: the two are at different
+            // tolerances, and the loose one can be lower by its noise alone. A later leg's
+            // replaces it only when lower; otherwise the kept leg's gradient and EBE state
+            // go back in, which this leg's improving evaluations overwrote
+            // ([`keep_verify_leg`]).
+            let mut live = (
+                last_gradient.lock().unwrap().take(),
+                best_solve.lock().unwrap().take(),
+            );
+            if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, best, &mut live) {
+                *best_seen.lock().unwrap() = leg_best.borrow().clone();
+            }
+            kept_best_seen.set(kept_leg_best);
+            *last_gradient.lock().unwrap() = live.0;
+            *best_solve.lock().unwrap() = live.1;
+            let outcome = UnprofiledLeg {
+                ret: r,
+                gain,
+                best,
+                first: leg_first.get(),
+            };
+            #[cfg(test)]
+            UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
+            if options.verbose {
+                eprintln!(
+                    "Verification leg from OFV {before:.9} at inner_tol = {:e}: {:?}, \
+                         gain {gain:.3e}, best {best:?}",
+                    leg_options.inner_tol, outcome.ret,
+                );
+            }
+            Some(outcome)
+        };
+        let warm = unprofiled_verify_legs(
+            first_leg,
+            first_needs_verify,
+            leg_needs_verify,
+            &budget_left,
+            &mut run_leg,
+        );
+        let mut verdict = warm;
+        for start in [LegStart::ColdModes, LegStart::NewtonStep] {
+            if !leg_pass_applies(start, verdict.1, basin_probe_fired.get()) {
+                continue;
+            }
+            let verified_best = kept_best_seen.get();
+            let verified_latched = stagnation_latched.load(Ordering::Relaxed);
+            next_start.set(start);
+            let pass = unprofiled_verify_legs(
+                verdict.0,
+                true,
+                leg_needs_verify,
+                &budget_left,
+                &mut run_leg,
+            );
+            if kept_best_seen.get() == verified_best {
+                // The incumbent still stands, and with it the verdict on it.
+                stagnation_latched.store(verified_latched, Ordering::Relaxed);
+            } else {
+                verdict = pass;
+            }
+        }
+        verdict
     } else {
         // The predicted gain behind the last decision to polish a quadrature stop; `None`
         // once a stop needs no polish. A leg that then settles leaves it standing.

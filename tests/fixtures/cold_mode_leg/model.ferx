@@ -1,0 +1,31 @@
+# #2645: simulated, sparse (1 to 3 observations on 3 random effects), so some subjects have a second
+# EBE mode. Generated, not measured: no subject is real.
+#   cold_wins.csv    a leg from the cold modes ends below the verified incumbent
+#   cold_loses.csv   it ends far above it
+#   newton_wins.csv  a leg from the capped Newton step ends below it
+
+[parameters]
+  theta TVCL(4.0, 0.1, 30.0)
+  theta TVV1(20.0, 1.0, 500.0)
+  theta TVV2(12.0, 1.0, 200.0)
+
+  block_omega (ETA_CL, ETA_V1, ETA_V2) = [0.17, 0.0, 0.15, 0.0, 0.0, 0.7]
+
+  sigma PROP_ERR ~ 0.13
+  sigma ADD_ERR  ~ 1.7
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = 12.0
+  V2 = TVV2 * exp(ETA_V2)
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+
+[fit_options]
+  method     = focei
+  covariance = false

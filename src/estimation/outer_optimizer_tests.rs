@@ -13286,6 +13286,110 @@ fn an_empty_subject_keeps_the_zero_gradient_at_an_unpackable_point() {
 /// from a stuck stop at least 1.70e-4. Each side of the pair is one measured value. The
 /// pair is asserted on a later leg (`first_leg = false`), where it is the whole gain test;
 /// a first leg also settles below the noise floor (#2507, below).
+/// #2645: the cold-mode pass runs only from a stop the legs settled. A leg cap or a spent
+/// budget is no verified incumbent, a stop that took no leg has none to compare, and one the
+/// #2093 probe ended belongs to the basin-shift restart.
+#[test]
+fn leg_passes_run_only_from_a_settled_stop() {
+    let start = LegStart::ColdModes;
+    assert!(leg_pass_applies(start, PolishEnd::Settled, false));
+    assert!(!leg_pass_applies(start, PolishEnd::Settled, true));
+    for end in [
+        PolishEnd::NotNeeded,
+        PolishEnd::Skipped,
+        PolishEnd::BudgetSpent,
+        PolishEnd::LegCapReached { last_gain: 1.0 },
+    ] {
+        assert!(!leg_pass_applies(start, end, false), "{end:?}");
+    }
+}
+
+/// #2645: a subject counts as off the held modes in **either** direction. Lower-only would
+/// miss the benchmark cases, where the cold modes score worse at the incumbent and lead to a
+/// lower optimum. `2·Δ` against `PLATEAU_OFV_THRESHOLD`.
+#[test]
+fn subjects_off_the_held_modes_counts_both_directions_above_the_threshold() {
+    let t = PLATEAU_OFV_THRESHOLD;
+    let held = [10.0, 10.0, 10.0, 10.0, 10.0];
+    // Worse cold, better cold, within the threshold on each side of it, and a `NaN`.
+    let cold = [10.0 + t, 10.0 - t, 10.0 + 0.4 * t, 10.0 - 0.4 * t, f64::NAN];
+    assert_eq!(subjects_off_the_held_modes(&held, &cold), 2);
+    assert_eq!(subjects_off_the_held_modes(&held, &held), 0);
+}
+
+/// #2645: the step and the decrement are one computation. With `sᵀS⁻¹s` the decrement and
+/// `−S⁻¹s` the step, the decrement is `−sᵀ·step`, and on a diagonal `S` each component is
+/// `−s_k / S_kk` by hand. A `fixed` coordinate and one pushed through its bound take no step.
+#[test]
+fn bhhh_newton_step_is_the_step_the_decrement_predicts_from() {
+    // Three subjects, four coordinates. Coordinates 0 and 1 are the live ones: the subjects'
+    // gradients on them are orthogonal, so `S` is diagonal there.
+    let per_subject = vec![
+        vec![2.0, 0.0, 1.0, -1.0],
+        vec![0.0, 1.0, 1.0, -1.0],
+        vec![0.0, 0.0, 1.0, -1.0],
+    ];
+    let n = 4;
+    let x = vec![0.0, 0.0, 0.0, 5.0];
+    let bounds = PackedBounds {
+        lower: vec![-10.0; n],
+        upper: vec![10.0, 10.0, 10.0, 5.0],
+    };
+    let fixed = [false, false, true, false];
+    let zeros = vec![0.0; n];
+    let hess = DMatrix::zeros(n, n);
+    let (decrement, step) =
+        bhhh_newton_step(&per_subject, &zeros, &hess, &x, &bounds, &fixed).expect("formed");
+    // s = (2, 1), S = diag(4, 1): step (−0.5, −1), decrement 2·0.5 + 1·1 = 2.
+    assert_eq!(step, vec![-0.5, -1.0, 0.0, 0.0]);
+    assert!((decrement - 2.0).abs() < 1e-12, "{decrement}");
+    assert_eq!(
+        bhhh_newton_decrement(&per_subject, &zeros, &hess, &x, &bounds, &fixed),
+        Some(decrement),
+    );
+}
+
+/// #2645: both halves of the gate, each on its own side. `NaN` is no gain; one subject per
+/// moved coordinate is the rank-deficient `S` whose decrement is no distance.
+#[test]
+fn a_newton_leg_needs_a_real_gain_and_more_subjects_than_moved_coordinates() {
+    let step = [0.1, -0.2, 0.0];
+    assert!(newton_gain_warrants_a_leg(7.9, 3, &step));
+    assert!(!newton_gain_warrants_a_leg(7.9, 2, &step), "rank-deficient");
+    assert!(
+        !newton_gain_warrants_a_leg(1.0, 1, &[0.1]),
+        "one subject reads 1"
+    );
+    assert!(!newton_gain_warrants_a_leg(
+        LATCH_MAX_PREDICTED_GAIN,
+        3,
+        &step
+    ));
+    assert!(!newton_gain_warrants_a_leg(f64::NAN, 3, &step));
+}
+
+/// #2645: a short step is taken whole; a long one keeps its direction at the cap, whichever
+/// coordinate is the long one; and a bound clips only the coordinate it binds.
+#[test]
+fn newton_start_caps_the_step_then_holds_the_bounds() {
+    let n = 2;
+    let bounds = PackedBounds {
+        lower: vec![-1.0; n],
+        upper: vec![1.0, 0.05],
+    };
+    let at = |step: &[f64]| newton_start(&[0.0, 0.0], step, &bounds);
+    assert_eq!(at(&[0.1, 0.01]), vec![0.1, 0.01]);
+    let cap = NEWTON_START_MAX_STEP;
+    assert_eq!(at(&[-30.0, 0.0]), vec![-cap, 0.0]);
+    let capped = at(&[-3.0, -1.5]);
+    assert!((capped[0] + cap).abs() < 1e-15 && (capped[1] + cap / 2.0).abs() < 1e-15);
+    assert_eq!(
+        at(&[0.1, 0.2]),
+        vec![0.1, 0.05],
+        "the bound binds only its own"
+    );
+}
+
 #[test]
 fn unprofiled_leg_settles_straddles_the_measured_gap() {
     assert!(UNPROFILED_VERIFY_GAIN > 5.9e-6 && UNPROFILED_VERIFY_GAIN < 1.70e-4);
@@ -15333,6 +15437,134 @@ fn a_leg_that_is_not_kept_hands_back_the_kept_ebe_state() {
             p.pass
         );
     }
+}
+
+/// Both #2645 passes, for `LEG_PASSES_OFF`.
+const BOTH_PASSES: &[LegStart] = &[LegStart::ColdModes, LegStart::NewtonStep];
+
+/// One fit of a `tests/fixtures/cold_mode_leg` dataset with the #2645 cold-mode pass on or
+/// off, and the legs it ran.
+fn cold_mode_fit(csv: &str, off: &'static [LegStart]) -> (OuterResult, Vec<UnprofiledLeg>) {
+    use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let text = std::fs::read_to_string("tests/fixtures/cold_mode_leg/model.ferx")
+        .expect("fixture model exists");
+    let parsed = parse_full_model(&text).expect("fixture model parses");
+    let pop = read_nonmem_csv(
+        Path::new(&format!("tests/fixtures/cold_mode_leg/{csv}")),
+        None,
+        None,
+    )
+    .expect("fixture data loads");
+    let opts = FitOptions {
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: false,
+        report_final_gradient: false,
+        verbose: false,
+        threads: Some(1),
+        ..parsed.fit_options.clone()
+    };
+    LEG_PASSES_OFF.with(|o| o.set(off));
+    UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().clear());
+    let result = optimize_nlopt(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        None,
+        &[],
+    );
+    LEG_PASSES_OFF.with(|o| o.set(&[]));
+    (
+        result,
+        UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().split_off(0)),
+    )
+}
+
+/// #2645, the side where the cold modes win. Warm legs alone verify the stop on the modes the
+/// fit holds; the pass finds the lower optimum another mode leads to. Measured gain 0.0097 on
+/// Linux aarch64 and 0.0094 on macOS arm64, the steadiest of 60 simulated datasets across the
+/// two: the bound is a tenth of that.
+#[test]
+fn a_cold_mode_leg_below_the_verified_incumbent_is_kept() {
+    let (off, off_legs) = cold_mode_fit("cold_wins.csv", BOTH_PASSES);
+    let (on, on_legs) = cold_mode_fit("cold_wins.csv", &[LegStart::NewtonStep]);
+    eprintln!(
+        "off {} ({} legs), on {} ({} legs)",
+        off.ofv,
+        off_legs.len(),
+        on.ofv,
+        on_legs.len()
+    );
+    assert!(on.ofv.is_finite() && off.ofv.is_finite());
+    assert!(
+        on_legs.len() > off_legs.len(),
+        "the pass must run legs of its own: {on_legs:?}"
+    );
+    assert!(
+        on.ofv < off.ofv - 1e-3,
+        "the cold modes reach a lower optimum: on {} off {}",
+        on.ofv,
+        off.ofv
+    );
+    assert!(on.converged, "a kept pass still verifies the stop");
+}
+
+/// #2645, the Newton pass: the legs settle on a stop that is no minimum, and a leg from the
+/// capped BHHH step leaves it. Measured gain 0.81 on Linux aarch64, 0.83 on macOS arm64, with
+/// no help from the cold modes on this dataset (their pass gains 0 on both).
+#[test]
+fn a_newton_leg_leaves_a_verified_stop_that_is_no_minimum() {
+    let (off, off_legs) = cold_mode_fit("newton_wins.csv", BOTH_PASSES);
+    let (on, on_legs) = cold_mode_fit("newton_wins.csv", &[LegStart::ColdModes]);
+    eprintln!("off {} on {}", off.ofv, on.ofv);
+    assert!(on.ofv.is_finite() && off.ofv.is_finite());
+    assert!(
+        on_legs.len() > off_legs.len(),
+        "the pass must run legs of its own: {on_legs:?}"
+    );
+    assert!(
+        on.ofv < off.ofv - 0.4,
+        "the Newton leg reaches a lower optimum: on {} off {}",
+        on.ofv,
+        off.ofv
+    );
+    assert!(on.converged, "a kept pass still verifies the stop");
+}
+
+/// #2645, the side where they lose: the leg from the cold modes ends far above the verified
+/// incumbent, so the fit reports exactly what it reports without the pass. The straddle is
+/// that such a leg actually ran. This is what makes the cold start safe to try on the case
+/// #2549 stopped it for.
+#[test]
+fn a_cold_mode_leg_above_the_verified_incumbent_changes_nothing() {
+    let (off, off_legs) = cold_mode_fit("cold_loses.csv", BOTH_PASSES);
+    HELD_SOLVE_AT_RESTORED.with(|c| c.set(None));
+    let (on, on_legs) = cold_mode_fit("cold_loses.csv", &[LegStart::NewtonStep]);
+    let held_at_restored = HELD_SOLVE_AT_RESTORED.with(|c| c.get());
+    let verified = off_legs
+        .iter()
+        .filter_map(|l| l.best)
+        .fold(f64::INFINITY, f64::min); // nan-ok: `filter_map` keeps only a feasible leg's best
+    assert!(verified.is_finite(), "the warm legs ran: {off_legs:?}");
+    assert!(
+        on_legs[off_legs.len()..]
+            .iter()
+            .filter_map(|l| l.best)
+            .any(|b| b > verified + 1.0),
+        "the fixture must run a cold-mode leg that loses: {on_legs:?}"
+    );
+    assert_eq!(on.ofv, off.ofv, "a losing pass leaves the OFV alone");
+    assert_eq!(on.params.theta, off.params.theta, "and the estimates");
+    assert_eq!(on.converged, off.converged, "and the verdict");
+    assert_eq!(
+        held_at_restored,
+        Some(true),
+        "the final restore holds the verified incumbent's EBE state"
+    );
 }
 
 /// #2507 / #1564: `optimize_nlopt` runs its attempts with the covariance step deferred and
