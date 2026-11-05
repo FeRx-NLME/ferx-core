@@ -1811,6 +1811,116 @@ fn detect_covariate_mu_refs(
         .collect()
 }
 
+/// The mu-scale channels through which some thetas reach the predictions — what lets the
+/// adjoint gradient record those thetas as constants (#2706).
+///
+/// A **channel** is a top-level `[individual_parameters]` assignment `P = g⁻¹(g(A) + η_j)`
+/// in one of the covariate mu-reference shapes ([`split_typical_and_eta`], one or more
+/// thetas), whose typical value `A` reads thetas, covariates and literals only, whose name is
+/// assigned nowhere else, and whose BSV `η_j` nothing else reads — no other right-hand side
+/// ([`eta_read_outside_the_group`]) and no other block. A theta is **carried** when the
+/// channels are the only route by which it reaches the likelihood: some channel reads it,
+/// and its taint, stopped at every channel ([`thetas_read_outside_the_group`]), reaches no
+/// other block.
+///
+/// Then the predictions depend on a carried `θ_m` and on `η_j` only through
+/// `u_j = g(A_j) + η_j` (with `A_j` subject-constant when its covariates are), so every
+/// derivative order in `θ_m` is read off the `η` ones:
+/// `∂/∂θ_m = Σ_j (∂g(A_j)/∂θ_m) ∂/∂η_j`. `None` unless **every** theta the likelihood reads
+/// is carried: one left on the tape keeps the solve taped, and the reduction would only add
+/// work (measured +2.2% on a 2-cpt model whose `Q = TVQ` has no random effect).
+fn detect_theta_channels(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv_eta: usize,
+    outside_idents: &HashSet<String>,
+) -> Option<ThetaChannels> {
+    let mut counts = HashMap::new();
+    count_all_assignments(stmts, &mut counts);
+    let mut scope = InlineScope::new(stmts);
+    // (statement, η, parameter name, thetas read, covariates read)
+    let mut found: Vec<(&Statement, usize, String, Vec<usize>, Vec<String>)> = Vec::new();
+    for (si, s) in stmts.iter().enumerate() {
+        let Statement::Assign(name, raw) = s else {
+            continue;
+        };
+        if counts.get(name.as_str()).copied() == Some(1) {
+            let view = scope.view(si, raw);
+            if let Some((eta_idx, entry)) =
+                classify_typical_value(view, theta_names, eta_names, n_bsv_eta, |n| n >= 1)
+            {
+                let exclusive = !outside_idents.contains(&eta_names[eta_idx].to_ascii_uppercase())
+                    && !eta_read_outside_the_group(stmts, OwnerOf::Statement(s), eta_idx);
+                if exclusive {
+                    let thetas = entry
+                        .theta_names
+                        .iter()
+                        .filter_map(|t| theta_names.iter().position(|n| n == t))
+                        .collect();
+                    found.push((s, eta_idx, name.clone(), thetas, entry.covariate_names));
+                }
+            }
+        }
+        scope.record(si, name, raw);
+    }
+    let owners: Vec<&Statement> = found.iter().map(|f| f.0).collect();
+    let carried: Vec<bool> = (0..theta_names.len())
+        .map(|t| {
+            found.iter().any(|f| f.3.contains(&t))
+                && thetas_read_outside_the_group(
+                    stmts,
+                    theta_names,
+                    outside_idents,
+                    &owners,
+                    std::slice::from_ref(&theta_names[t]),
+                )
+                .is_empty()
+        })
+        .collect();
+    let channels: Vec<ThetaChannel> = found
+        .into_iter()
+        .filter(|f| f.3.iter().any(|&t| carried[t]))
+        .map(|(_, eta_idx, param, _, covariates)| ThetaChannel {
+            eta_idx,
+            param,
+            covariates,
+        })
+        .collect();
+    // Whether every theta the likelihood reads is carried: a theta the channels do not
+    // carry stays a tape leaf, and since the solve reads every parameter it keeps the whole
+    // recording taped, so a partial reduction only adds work.
+    let complete = (0..theta_names.len()).all(|t| {
+        carried[t] || {
+            let mut reads = outside_idents.contains(&theta_names[t].to_ascii_uppercase());
+            let mut tainted = HashSet::new();
+            spread_theta_taint(stmts, t, &[], &mut tainted);
+            reads |= !tainted.is_empty();
+            !reads
+        }
+    });
+    (complete && !channels.is_empty()).then_some(ThetaChannels { channels, carried })
+}
+
+/// One mu-scale channel of [`ThetaChannels`]: the individual parameter (a top-level name,
+/// so its var slot is its index in `indiv_param_names`), its exclusive BSV η, and the covariates its typical value reads (a
+/// subject on which any of them varies is not served: `A_j` would move with time).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ThetaChannel {
+    pub(crate) eta_idx: usize,
+    pub(crate) param: String,
+    pub(crate) covariates: Vec<String>,
+}
+
+/// The thetas that reach the likelihood only through mu-scale channels, and the channels
+/// ([`detect_theta_channels`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ThetaChannels {
+    pub(crate) channels: Vec<ThetaChannel>,
+    /// Per theta (declaration order): carried by the channels alone.
+    pub(crate) carried: Vec<bool>,
+}
+
 /// Drop every group an assignment to `name` supersedes.
 ///
 /// A group is keyed on the eta it carries, so recording is a
@@ -5923,6 +6033,13 @@ pub fn parse_full_model_with(
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
+    indiv_param_partials.theta_channels = detect_theta_channels(
+        &indiv_stmts,
+        &theta_names,
+        &all_eta_names,
+        eta_names_bsv.len(),
+        &outside_idents,
+    );
     indiv_param_partials.lognormal_eta_chain = Some(lognormal_eta_chain_exact(
         &indiv_stmts,
         &indiv_var_names,
@@ -32829,6 +32946,47 @@ impl IndivParamProgram {
         covariates: &HashMap<String, f64>,
         nn: &[Vec<T>],
     ) -> Vec<T> {
+        self.eval_vars_g(theta, eta, covariates, nn, |vars| {
+            let mut out = crate::scratch::take_for(self.pk_var_slots.len());
+            out.extend(
+                self.pk_var_slots
+                    .iter()
+                    .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0))),
+            );
+            out
+        })
+    }
+
+    /// The program's variables at the given var slots (a top-level individual parameter's
+    /// slot is its index in `indiv_param_names`, see `n_top_level_vars`), evaluated as
+    /// [`Self::eval_params_g`] does: what the adjoint reads a mu-scale channel's typical
+    /// value off (#2706).
+    pub(crate) fn eval_var_slots_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+        nn: &[Vec<T>],
+        slots: &[usize],
+    ) -> Option<Vec<T>> {
+        if slots.iter().any(|&v| v >= self.n_top_level_vars) {
+            return None;
+        }
+        Some(self.eval_vars_g(theta, eta, covariates, nn, |vars| {
+            slots.iter().map(|&v| vars[v]).collect()
+        }))
+    }
+
+    /// The shared body of [`Self::eval_params_g`] and [`Self::eval_var_slots_g`]: run the
+    /// program and hand `read` every variable.
+    fn eval_vars_g<T: crate::sens::num::vm::VmNum, R>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+        nn: &[Vec<T>],
+        read: impl FnOnce(&[T]) -> R,
+    ) -> R {
         // Every buffer comes from this thread's pool, cleared and filled exactly as a
         // fresh one would be, and goes back after.
         let mut cov_vec: Vec<f64> = crate::scratch::take();
@@ -32868,12 +33026,7 @@ impl IndivParamProgram {
             skip,
             nn,
         );
-        let mut out = crate::scratch::take_for(self.pk_var_slots.len());
-        out.extend(
-            self.pk_var_slots
-                .iter()
-                .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0))),
-        );
+        let out = read(&vars);
         crate::scratch::give(cov_vec);
         crate::scratch::give_for(vars);
         crate::scratch::give_for(stack);
@@ -33946,6 +34099,10 @@ pub struct IndivParamPartials {
     /// all public, so recording it does not break a downstream struct literal.
     /// Empty without a `[derived]` block, and for hand-built fixtures.
     pub(crate) derived_reads: Vec<String>,
+    /// The thetas the adjoint gradient reads off the η-derivatives instead of taping
+    /// (#2706, [`detect_theta_channels`]). `None` when no theta qualifies, and for
+    /// hand-built fixtures.
+    pub(crate) theta_channels: Option<ThetaChannels>,
 }
 
 impl IndivParamPartials {
@@ -33971,6 +34128,7 @@ impl IndivParamPartials {
             nested_levels: None,
             mu_ref_owners: std::collections::BTreeMap::new(),
             derived_reads: Vec::new(),
+            theta_channels: None,
         }
     }
 
@@ -34044,6 +34202,7 @@ fn build_indiv_param_partials(
         nested_levels: None,
         mu_ref_owners: std::collections::BTreeMap::new(),
         derived_reads: Vec::new(),
+        theta_channels: None,
     }
 }
 
