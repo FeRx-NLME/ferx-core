@@ -3478,7 +3478,7 @@ fn fit_inner(
     // predicate it surfaces (`crate::stalled_at_init`) reads the assembled
     // `FitResult` — `left_init`, `theta_init`/`theta`, and the fixed masks —
     // none of which exist as one object before this point.
-    if let Some((msg, entry)) = crate::api::stalled_at_init_warning(&fit_result) {
+    if let Some((msg, entry)) = crate::api::stalled_at_init_warning(&fit_result, options) {
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }
