@@ -911,7 +911,7 @@ negative and `PIT` a hair above 1. Only `DEVIANCE` clamps `ΔH` at 0.
 IOV κ never reach a hazard (see [IOV, mixtures and refusals](#iov-mixtures-and-refusals)),
 so the residuals are those of the BSV η̂ alone.
 
-A fit restored from a `.fitrx` checkpoint has no TTE rows, so writing its sdtab is refused
+A fit restored from a `.fitrx` bundle has no TTE rows, so writing its sdtab is refused
 with a message naming the time-to-event endpoint, until
 [#911](https://github.com/FeRx-NLME/ferx-core/issues/911).
 

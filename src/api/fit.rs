@@ -2902,6 +2902,13 @@ fn fit_inner(
     } else {
         None
     };
+    // The file is a temporary one, so the fit keeps its text. `None` here leaves
+    // `trace_path` as the only record, which a bundle cannot carry.
+    let trace_csv = trace_path.as_deref().and_then(|path| {
+        std::fs::read_to_string(path)
+            .map_err(|e| warnings.push(format!("could not read trace file {path}: {e}")))
+            .ok()
+    });
 
     // Estimation completed: delete the resume checkpoint (nothing left to
     // resume). Any post-estimation error below still returns Err, but a fresh
@@ -3192,6 +3199,8 @@ fn fit_inner(
 
     let mut fit_result = FitResult {
         restored_from_checkpoint: false,
+        cov_fixed: Vec::new(),
+        interface_extras: None,
         // #1111: the `[covariate_model]` echo, joined to the θ this fit
         // estimated. Filled in just below, once `fit_result` owns the θ vector.
         covariate_relations: Vec::new(),
@@ -3307,6 +3316,7 @@ fn fit_inner(
         nlopt_missing_algorithms: nlopt_missing,
         covariance_n_evals_estimated,
         trace_path,
+        trace_csv,
         ebe_convergence_warnings: result.ebe_convergence_warnings,
         max_unconverged_subjects: result.max_unconverged_subjects,
         total_ebe_fallbacks: result.total_ebe_fallbacks,
@@ -3476,6 +3486,11 @@ fn fit_inner(
         &fit_result.theta,
         fit_result.se_theta.as_ref(),
         &fit_result.theta_fixed,
+    );
+    fit_result.cov_fixed = crate::estimation::parameterization::cov_fixed_mask(
+        init_params,
+        &fit_result.theta_fixed,
+        fit_result.covariance_matrix.as_ref().map(|m| m.nrows()),
     );
 
     Ok(fit_result)

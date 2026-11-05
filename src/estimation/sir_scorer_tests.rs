@@ -285,9 +285,7 @@ fn mixture_override_refusals_carry_their_codes() {
     let missing = "this [mixture] fit estimates the per-class override(s) omega(2) ETA_CL, \
                    and the fit records neither their fitted values (mixture_overrides) nor a \
                    packed estimate holding them. A fit() result records them, and so does a \
-                   .fitrx bundle save_fit wrote from one; a .fitrx bundle saved before #1765 \
-                   from an SAEM fit or before #1815 from any other method, or written by \
-                   ferx-r before FeRx-NLME/ferx-r#655, lacks them.";
+                   .fitrx bundle save_fit wrote from one.";
     let layout = format!(
         "the fit's packed estimate has {} coordinates but this model's parameter layout has \
          {n}, so the [mixture] override values cannot be read from it. Supply the model the \

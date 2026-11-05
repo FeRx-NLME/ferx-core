@@ -2466,25 +2466,14 @@ pub fn write_sdtab_csv(
     population: &Population,
     path: &str,
 ) -> Result<(), String> {
-    // A result restored from a `.fitrx` checkpoint carries no per-record discrete
-    // diagnostics — the bundle doesn't round-trip them (see `io::fitrx::parse_subjects`).
-    // Writing anyway would emit a table silently missing every discrete-endpoint row
-    // (header-only for a binary-only fit, since the columns exist but are zero-length, so
-    // the `cols.is_empty()` check below never fires). Refuse instead.
+    // A result restored from a `.fitrx` checkpoint carries no per-record time-to-event
+    // diagnostics: the bundle has no entry for them (#911). Writing anyway would emit a
+    // table silently missing every event row, so refuse. Discrete rows do round-trip
+    // (`predictions_discrete.csv`, #2695).
     //
     // The discriminator is `restored_from_checkpoint` AND "the restored model declares a
-    // binary endpoint" — NOT "the reconstructed population has discrete records". The
-    // population is not a usable signal: `load_fit` re-reads the bundled data through
-    // `read_nonmem_csv_mapped`, which uses the default (Gaussian) `ObsRouting`, so a binary
-    // DV comes back as an ordinary continuous observation and the population carries *no*
-    // `DiscreteState` records at all — keying on `obs_records` (as an earlier revision did)
-    // therefore never fired on a real restore, and its test only passed on a hand-built
-    // population that `load_fit` cannot produce. `model_text` *is* round-tripped, so parse
-    // it and ask the direct question: would a live fit of this model have produced
-    // `discrete_rows` or `tte_rows`? `binary_cmts()` is binary-only (not CTMM), so a
-    // restored CTMM fit — which legitimately produces no `discrete_rows` live or restored
-    // (occupancy is #820) — is correctly *allowed* through. #911 removes this once
-    // diagnostics round-trip.
+    // time-to-event endpoint", read from the round-tripped `model_text`, since a restored
+    // fit may have no population to ask.
     #[cfg(feature = "survival")]
     if result.restored_from_checkpoint {
         if let Some(msg) = result
@@ -2536,27 +2525,17 @@ pub fn write_sdtab_csv(
 }
 
 /// Why a restored fit of `model` cannot write sdtab, or `None` when it can: the model
-/// declares a binary or a time-to-event endpoint, whose per-record rows a `.fitrx`
-/// checkpoint does not round-trip (#911), so the table would silently lack them.
+/// declares a time-to-event endpoint, whose per-record rows a `.fitrx` checkpoint does not
+/// round-trip (#911), so the table would silently lack them.
 #[cfg(feature = "survival")]
 fn restored_sdtab_refusal(model: &crate::types::CompiledModel) -> Option<String> {
-    let kinds: Vec<&str> = [
-        (!model.binary_cmts().is_empty()).then_some("a [binary_model] endpoint"),
-        model.has_tte().then_some("a time-to-event endpoint"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if kinds.is_empty() {
-        return None;
-    }
-    Some(format!(
+    model.has_tte().then(|| {
         "refusing to write sdtab: this fit was restored from a `.fitrx` checkpoint, which \
-         does not round-trip per-record binary or time-to-event diagnostics, and the model \
-         declares {} — so the table would be silently missing those rows. Re-run the fit \
-         to write sdtab (#911).",
-        kinds.join(" and ")
-    ))
+         does not round-trip per-record time-to-event diagnostics, and the model declares \
+         a time-to-event endpoint — so the table would be silently missing those rows. \
+         Re-run the fit to write sdtab (#911)."
+            .to_string()
+    })
 }
 
 /// Write the covariate table (from a `[covariates]` block) as a CSV file.
@@ -4120,6 +4099,9 @@ mod tests {
             nlopt_missing_algorithms: Vec::new(),
             covariance_n_evals_estimated: None,
             trace_path: None,
+            trace_csv: None,
+            cov_fixed: Vec::new(),
+            interface_extras: None,
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
@@ -5306,6 +5288,9 @@ mod tests {
             nlopt_missing_algorithms: Vec::new(),
             covariance_n_evals_estimated: None,
             trace_path: None,
+            trace_csv: None,
+            cov_fixed: Vec::new(),
+            interface_extras: None,
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
@@ -5710,15 +5695,15 @@ mod tests {
     }
 
     /// T9 (#901): the restored-fit refusal over model × {binary, TTE, both, neither}.
-    /// A restored `.fitrx` fit carries no `tte_rows`, so a TTE model must be refused
-    /// like a binary one, the message naming what the model declares and #911; a model
-    /// with neither still writes.
+    /// A restored `.fitrx` fit carries no `tte_rows`, so a model with a TTE endpoint must
+    /// be refused, the message naming #911. Its discrete rows do round-trip (#2695), so a
+    /// binary model is not.
     ///
-    /// Dies on: the refusal keyed on binary only, a message that names "binary" for a
-    /// TTE-only model, a refusal of a model with neither.
+    /// Dies on: a refusal that still reads the binary endpoints, one that ignores the TTE
+    /// endpoint, a refusal of a model with neither.
     #[cfg(feature = "survival")]
     #[test]
-    fn restored_sdtab_refusal_names_binary_and_tte_endpoints() {
+    fn restored_sdtab_refusal_is_keyed_on_a_tte_endpoint() {
         const PARAMS: &str = "
 [parameters]
   theta TH0(0.1, 0.001, 10.0)
@@ -5753,15 +5738,15 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}\n{src}"));
             restored_sdtab_refusal(&model)
         };
-        let binary = refusal(BINARY, false).expect("binary refused");
-        assert!(binary.contains("[binary_model]") && !binary.contains("time-to-event endpoint"));
+        // Binary rows round-trip (#2695), so a binary model alone is not refused.
+        assert_eq!(refusal(BINARY, false), None);
         let tte = refusal(TTE, false).expect("TTE refused");
-        assert!(tte.contains("a time-to-event endpoint") && !tte.contains("[binary_model]"));
-        let both = refusal(&format!("{BINARY}{TTE}"), false).expect("both refused");
-        assert!(both.contains("[binary_model] endpoint and a time-to-event endpoint"));
-        for msg in [&binary, &tte, &both] {
-            assert!(msg.contains("restored") && msg.contains("fitrx") && msg.contains("#911"));
-        }
+        assert!(tte.contains("a time-to-event endpoint") && !tte.contains("binary"));
+        assert_eq!(
+            refusal(&format!("{BINARY}{TTE}"), false).as_ref(),
+            Some(&tte)
+        );
+        assert!(tte.contains("restored") && tte.contains("fitrx") && tte.contains("#911"));
         assert_eq!(refusal(GAUSSIAN, true), None);
 
         // Wired into the writer: a restored TTE fit is refused before any file exists.

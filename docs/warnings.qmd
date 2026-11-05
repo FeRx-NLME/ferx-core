@@ -824,8 +824,7 @@ A payload is part of the fit's output, not only of the Rust value (#2268):
   message strings, and the block is absent when no warning has a payload.
 - **`.fitrx`** — `fit.json` stores the entries that have a payload under
   `warning_details`, and a reload restores them unchanged. Every other entry is
-  rebuilt from `warnings` on load, the way a fresh fit builds it. A bundle saved
-  before #2268 has no such field and reloads without the at-source payloads.
+  rebuilt from `warnings` on load, the way a fresh fit builds it.
 
 The R package reads `warnings_structured` without the `details` column until its
 matching change lands.
