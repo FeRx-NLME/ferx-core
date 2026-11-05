@@ -731,7 +731,34 @@ pub(crate) fn apply_omega_dist_clauses(
         // #1716: a `copula (…) ~ FAMILY()` line declares its θs here, and is rewritten
         // with their names so every later parse reads the same model.
         if decl_keyword(line) == "copula" {
-            let (etas, fname, args) = parse_copula_line(line)?;
+            let (etas, ast) = parse_copula_line(line)?;
+            // A construction over families names its θs; only a plain family's
+            // `FAMILY()` declares them here.
+            let (fname, args) = match &ast {
+                CopulaAst::Call {
+                    name,
+                    args,
+                    apply: None,
+                } if !COPULA_COMBINATORS.contains(&name.as_str()) => (name.clone(), args.clone()),
+                CopulaAst::Call { name, .. } if COPULA_COMBINATORS.contains(&name.as_str()) => {
+                    continue;
+                }
+                _ => {
+                    return Err(format!(
+                        "[parameters] cannot read the copula `{}` — write `FAMILY(THETA)`, \
+                         e.g. `clayton(THETA_C)`, or a construction such as `survival(…)`",
+                        line.trim()
+                    ))
+                }
+            };
+            let args: Option<Vec<String>> = Some(
+                args.iter()
+                    .map(|a| match a {
+                        CopulaAst::Word(w) => w.clone(),
+                        CopulaAst::Call { .. } => String::new(),
+                    })
+                    .collect(),
+            );
             let family = crate::stats::eta_density::copula::CopulaFamily::from_name(&fname)
                 .ok_or_else(|| {
                     format!(
@@ -956,21 +983,88 @@ pub(crate) fn apply_omega_dist_clauses(
     Ok(shape_lines)
 }
 
+/// The right-hand side of a `copula` line (#1716), as written: a call `NAME(ARGS)` with an
+/// optional applied list `(…)` (a nested node's children), or a bare word (a θ, an ETA).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CopulaAst {
+    Call {
+        name: String,
+        args: Vec<CopulaAst>,
+        apply: Option<Vec<CopulaAst>>,
+    },
+    Word(String),
+}
+
+/// The constructions a `copula` line composes from families.
+pub(crate) const COPULA_COMBINATORS: [&str; 8] = [
+    "survival",
+    "rotated90",
+    "rotated180",
+    "rotated270",
+    "khoudraji",
+    "liebscher",
+    "nested",
+    "weights",
+];
+
+/// Parse a copula spec: `word`, `name(args)`, or `name(args)(applied)`.
+pub(crate) fn parse_copula_ast(s: &str) -> Option<CopulaAst> {
+    let s = s.trim();
+    let Some(open) = s.find('(') else {
+        return (!s.is_empty()).then(|| CopulaAst::Word(s.to_string()));
+    };
+    let name = s[..open].trim().to_ascii_lowercase();
+    // The matching close of the first group.
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, ch) in s[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let list = |inner: &str| -> Option<Vec<CopulaAst>> {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return Some(Vec::new());
+        }
+        split_top_level(inner)
+            .iter()
+            .map(|a| parse_copula_ast(a))
+            .collect()
+    };
+    let args = list(&s[open + 1..close])?;
+    let rest = s[close + 1..].trim();
+    let apply = if rest.is_empty() {
+        None
+    } else {
+        Some(list(rest.strip_prefix('(')?.strip_suffix(')')?)?)
+    };
+    Some(CopulaAst::Call { name, args, apply })
+}
+
 /// A `copula (ETA_A, ETA_B, …) ~ FAMILY(ARGS)` line of `[parameters]` (#1716): a
 /// non-elliptical copula joining ETAs declared on their own `omega` lines, each with its
 /// own margin (its `density`, or the Gaussian).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CopulaDecl {
     pub(crate) etas: Vec<String>,
-    pub(crate) family: String,
-    /// The family's θ names (empty for a parameter-free family).
-    pub(crate) args: Vec<String>,
+    /// The copula, a family or a construction over families.
+    pub(crate) spec: CopulaAst,
     pub(crate) line: String,
 }
 
 /// Read one `copula (…) ~ FAMILY(…)` line; `args` is `None` for `FAMILY()`, which
 /// declares its θs.
-fn parse_copula_line(line: &str) -> Result<(Vec<String>, String, Option<Vec<String>>), String> {
+fn parse_copula_line(line: &str) -> Result<(Vec<String>, CopulaAst), String> {
     let bad = || {
         format!(
             "[parameters] cannot read the copula line `{}` — write \
@@ -994,8 +1088,8 @@ fn parse_copula_line(line: &str) -> Result<(Vec<String>, String, Option<Vec<Stri
     }
     let rest = rest[close + 1..].trim_start();
     let spec = rest.strip_prefix('~').ok_or_else(bad)?.trim();
-    let (name, args) = parse_kind_spec(spec).ok_or_else(bad)?;
-    Ok((etas, name, args))
+    let ast = parse_copula_ast(spec).ok_or_else(bad)?;
+    Ok((etas, ast))
 }
 
 /// Declare a copula family's θs (`FAMILY()`): `{PREFIX}_COP_{first ETA}`, at the
@@ -1033,11 +1127,10 @@ pub(crate) fn copula_decls(parameters: &[String]) -> Result<Vec<CopulaDecl>, Str
         if decl_keyword(line) != "copula" {
             continue;
         }
-        let (etas, family, args) = parse_copula_line(line)?;
+        let (etas, spec) = parse_copula_line(line)?;
         out.push(CopulaDecl {
             etas,
-            family,
-            args: args.unwrap_or_default(),
+            spec,
             line: line.trim().to_string(),
         });
     }

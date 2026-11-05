@@ -276,3 +276,138 @@ fn each_sampler_has_its_kendall_tau() {
     eprintln!("sampler Kendall τ: worst {:.2} SE ({})", worst.0, worst.1);
     assert!(worst.0 < 4.0, "{:.2} SE ({})", worst.0, worst.1);
 }
+
+/// The `CopulaSpec` each `COMPOSITE_REFS` label stands for (`copula_anchor/refs.jl`).
+fn composite_spec(label: &str) -> CopulaSpec {
+    use CopulaFamily as F;
+    let fam = |f| Box::new(CopulaSpec::Family(f));
+    match label {
+        "fgm2" | "fgm3" => CopulaSpec::Family(F::Fgm),
+        "plackett" | "plackett_neg" => CopulaSpec::Family(F::Plackett),
+        "survival_clayton3" => CopulaSpec::Reflect {
+            base: fam(F::Clayton),
+            flip: vec![true; 3],
+        },
+        "survival_clayton3_flip2" => CopulaSpec::Reflect {
+            base: fam(F::Clayton),
+            flip: vec![false, true, false],
+        },
+        "rot90_gumbel" => CopulaSpec::Reflect {
+            base: fam(F::Gumbel),
+            flip: vec![true, false],
+        },
+        "rot270_gumbel" => CopulaSpec::Reflect {
+            base: fam(F::Gumbel),
+            flip: vec![false, true],
+        },
+        "khoudraji_gumbel" => CopulaSpec::Liebscher {
+            parts: vec![
+                CopulaSpec::Family(F::Independent),
+                CopulaSpec::Family(F::Gumbel),
+            ],
+        },
+        "khoudraji_clayton_gumbel" => CopulaSpec::Liebscher {
+            parts: vec![
+                CopulaSpec::Family(F::Clayton),
+                CopulaSpec::Family(F::Gumbel),
+            ],
+        },
+        "liebscher3" => CopulaSpec::Liebscher {
+            parts: vec![
+                CopulaSpec::Family(F::Clayton),
+                CopulaSpec::Family(F::Gumbel),
+                CopulaSpec::Family(F::Frank),
+            ],
+        },
+        "nested_clayton" => CopulaSpec::Nested {
+            family: F::Clayton,
+            root: NestNode::Node(vec![
+                NestNode::Node(vec![NestNode::Leaf(0), NestNode::Leaf(1)]),
+                NestNode::Leaf(2),
+            ]),
+        },
+        _ => panic!("no spec for {label}"),
+    }
+}
+
+/// FGM, Plackett, and Copulas.jl's constructions over families — survival copulas (all
+/// and some coordinates reflected), the 90°/270° rotations, Khoudraji (one and two
+/// components), a three-part Liebscher, and a nested Clayton tree — each against
+/// Copulas.jl 1.0.1's log-density and CDF, through the same `Mlin` CDF route.
+/// Dies under: a reflection's inclusion–exclusion sign, a Liebscher weight row
+/// misplaced, a nested tree's θ order, or FGM's subset order.
+#[test]
+fn every_composite_copula_is_copulas_jl() {
+    let mut worst = (0.0f64, String::new());
+    for &(label, pv, u, lp, cdf) in COMPOSITE_REFS {
+        let spec = composite_spec(label);
+        assert_eq!(spec.n_params(u.len()), pv.len(), "{label}: parameter count");
+        let got_lp = spec.log_density::<f64>(u, pv);
+        let xs: Vec<Mlin<f64>> = u.iter().map(|&v| Mlin::cst(u.len(), v)).collect();
+        let got_cdf = spec.cdf(&xs, pv).val();
+        assert!(
+            got_lp.is_finite() && got_cdf.is_finite() && lp.is_finite() && cdf.is_finite(),
+            "{label} at {u:?}: {got_lp} {got_cdf}"
+        );
+        for (g, w, what) in [(got_lp, lp, "log c"), (got_cdf, cdf, "C")] {
+            let e = (g - w).abs() / w.abs().max(1.0);
+            if e > worst.0 {
+                worst = (e, format!("{label} {what} at {u:?}"));
+            }
+        }
+    }
+    eprintln!(
+        "composites vs Copulas.jl: worst relative {:.2e} ({})",
+        worst.0, worst.1
+    );
+    assert!(worst.0 < COMPOSITE_TOL, "{:e} ({})", worst.0, worst.1);
+}
+// Measured 4.05e-15 (the nested Clayton); bound 1e-12.
+const COMPOSITE_TOL: f64 = 1e-12;
+
+/// The generic sampler on constructions: a survival Clayton has the Clayton's τ (a
+/// reflection of every coordinate preserves concordance), a 90° rotation negates it, and
+/// a nested Clayton's within-child pair has the child's τ and its cross pairs the root's.
+/// Dies under: a reflection applied to the wrong coordinate, or a tree's θs swapped.
+#[test]
+fn composite_samplers_have_their_kendall_tau() {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1716);
+    let n = 2000usize;
+    let tau = |x: &[Vec<f64>], a: usize, b: usize| -> f64 {
+        let mut s = 0.0;
+        for i in 0..x.len() {
+            for j in (i + 1)..x.len() {
+                s += ((x[i][a] - x[j][a]) * (x[i][b] - x[j][b])).signum();
+            }
+        }
+        s / (x.len() * (x.len() - 1) / 2) as f64
+    };
+    let nf = n as f64;
+    let se = (2.0 * (2.0 * nf + 5.0) / (9.0 * nf * (nf - 1.0))).sqrt();
+    let clayton_tau = |t: f64| t / (t + 2.0);
+    let draws =
+        |spec: &CopulaSpec, d: usize, p: &[f64], rng: &mut rand::rngs::StdRng| -> Vec<Vec<f64>> {
+            (0..n).map(|_| spec.sample(d, p, rng)).collect()
+        };
+    let mut worst = (0.0f64, String::new());
+    let mut check = |got: f64, want: f64, what: &str| {
+        let z = (got - want).abs() / se;
+        eprintln!("{what}: τ {got:.4} vs {want:.4} ({z:.2} SE)");
+        if z > worst.0 {
+            worst = (z, what.to_string());
+        }
+    };
+    let surv = composite_spec("survival_clayton3");
+    let x = draws(&surv, 3, &[1.8], &mut rng);
+    check(tau(&x, 0, 1), clayton_tau(1.8), "survival Clayton (0, 1)");
+    let rot = composite_spec("rot90_gumbel");
+    let x = draws(&rot, 2, &[1.7], &mut rng);
+    check(tau(&x, 0, 1), -(1.0 - 1.0 / 1.7), "rotated90 Gumbel");
+    let nest = composite_spec("nested_clayton");
+    let x = draws(&nest, 3, &[0.8, 2.5], &mut rng);
+    check(tau(&x, 0, 1), clayton_tau(2.5), "nested child (0, 1)");
+    check(tau(&x, 0, 2), clayton_tau(0.8), "nested root (0, 2)");
+    eprintln!("composite sampler τ: worst {:.2} SE ({})", worst.0, worst.1);
+    assert!(worst.0 < 4.0, "{:.2} SE ({})", worst.0, worst.1);
+}

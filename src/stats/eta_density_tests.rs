@@ -677,7 +677,7 @@ fn a_clayton_group_is_its_margins_and_its_copula() {
         trunc: None,
         margins: vec![DensityKind::Gamma, DensityKind::Normal],
         log_anchors: Vec::new(),
-        family: Some(CopulaFamily::Clayton),
+        family: Some(copula::CopulaSpec::Family(CopulaFamily::Clayton)),
     };
     let mut worst = 0.0f64;
     for (z, th) in [([0.1, -0.2], 1.7), ([-0.4, 0.15], 0.6), ([0.05, 0.3], 4.0)] {

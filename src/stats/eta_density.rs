@@ -405,7 +405,7 @@ pub struct EtaDensity {
     /// correlation, `correction_g`'s closed form). `Some` adds its own dependence θs after
     /// the margins' shapes in `shape_thetas`; a non-elliptical family's Ω block is
     /// diagonal (each margin's ω), an elliptical one's (the t) carries the correlation.
-    pub(crate) family: Option<copula::CopulaFamily>,
+    pub(crate) family: Option<copula::CopulaSpec>,
 }
 
 /// One end of a truncation.
@@ -433,7 +433,7 @@ impl EtaDensity {
     /// (#1716) joins ETAs declared on their own `omega` lines, its dependence lives in its
     /// own θs, and every update of the block must keep the off-diagonals at 0.
     pub(crate) fn diagonal_omega(&self) -> bool {
-        self.family.is_some_and(|f| !f.elliptical())
+        self.family.as_ref().is_some_and(|f| !f.elliptical())
     }
 
     /// The model expression that reads the latent `eta` of the group's `pos`-th ETA as the
@@ -832,9 +832,9 @@ fn group_correction_g<T: PkNum>(
             uv.push(u);
         }
         // #1716: a copula family other than the Gaussian; its own θs follow the margins'.
-        if let Some(fam) = d.family {
+        if let Some(fam) = &d.family {
             let fp = &shapes[at..];
-            let lc = if fam == copula::CopulaFamily::StudentT {
+            let lc = if fam.is_student_t() {
                 // R⁻¹ = D^{½}Ω⁻¹D^{½}, ln|R| = ln|Ω| − Σ ln Ωₖₖ, as for the Gaussian.
                 let r_inv: Vec<Vec<T>> = (0..n)
                     .map(|i| {
@@ -1317,9 +1317,9 @@ pub(crate) fn redraw_latents(
             // family, its own draw (#1716). Then each margin by its inverse CDF.
             let n = d.etas.len();
             let n_margin_shapes: usize = d.margins.iter().map(|k| k.shapes().len()).sum();
-            let fam_u: Option<Vec<f64>> = d.family.map(|fam| {
+            let fam_u: Option<Vec<f64>> = d.family.as_ref().map(|fam| {
                 let fp = &shapes[n_margin_shapes..];
-                if fam == copula::CopulaFamily::StudentT {
+                if fam.is_student_t() {
                     let r = DMatrix::from_fn(n, n, |i, j| {
                         let (a, b) = (d.etas[i], d.etas[j]);
                         omega[(a, b)] / (omega[(a, a)] * omega[(b, b)]).sqrt()

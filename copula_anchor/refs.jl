@@ -78,3 +78,33 @@ for (ν, R) in ((4.0, [1.0 0.5; 0.5 1.0]), (12.0, [1.0 -0.3; -0.3 1.0]), (3.0, [
     println("    ($(f(ν)), &$(v(tri)), &$(v(u)), $(f(logpdf(C, u)))),")
 end
 println("];")
+# Constructions over families, and FGM / Plackett: (label, parameters in ferx's order, u,
+# logpdf, cdf). The labels are mapped to ferx's `CopulaSpec` in
+# src/stats/eta_density_copula_tests.rs (`composite_spec`).
+comps = [
+ ("fgm2",            [0.6],                         p -> FGMCopula(2, p[1])),
+ ("fgm3",            [0.3, -0.2, 0.25, 0.1],        p -> FGMCopula(3, p)),
+ ("plackett",        [3.5],                         p -> PlackettCopula(p[1])),
+ ("plackett_neg",    [0.3],                         p -> PlackettCopula(p[1])),
+ ("survival_clayton3", [1.8],                       p -> SurvivalCopula(ClaytonCopula(3, p[1]))),
+ ("survival_clayton3_flip2", [1.8],                 p -> SurvivalCopula(ClaytonCopula(3, p[1]), (2,))),
+ ("rot90_gumbel",    [1.7],                         p -> Rotated90Copula(GumbelCopula(2, p[1]))),
+ ("rot270_gumbel",   [1.7],                         p -> Rotated270Copula(GumbelCopula(2, p[1]))),
+ ("khoudraji_gumbel", [2.5, 0.3, 0.8],              p -> KhoudrajiCopula(2, GumbelCopula(2, p[1]), [p[2], p[3]])),
+ ("khoudraji_clayton_gumbel", [1.5, 2.0, 0.4, 0.7], p -> KhoudrajiCopula(2, (ClaytonCopula(2, p[1]), GumbelCopula(2, p[2])), [p[3], p[4]])),
+ # weights rows 2 and 3 (ferx's rows 1..K); row 1 = 1 − their column sums.
+ ("liebscher3", [1.2, 1.8, 4.0, 0.3, 0.2, 0.25, 0.5],
+     p -> LiebscherCopula(2, (ClaytonCopula(2, p[1]), GumbelCopula(2, p[2]), FrankCopula(2, p[3])),
+                          [1 - p[4] - p[6]  1 - p[5] - p[7]; p[4] p[5]; p[6] p[7]])),
+ # root Clayton θ₀ over (a nested Clayton θ₁ on coordinates 1, 2) and the leaf 3.
+ ("nested_clayton", [0.8, 2.5],
+     p -> NestedArchimedeanCopula(Copulas.ClaytonGenerator(p[1]); leaves = [3], children = [ClaytonCopula(2, p[2]) => [1, 2]])),
+]
+println("const COMPOSITE_REFS: &[(&str, &[f64], &[f64], f64, f64)] = &[")
+for (label, pv, mk) in comps
+    C = mk(pv)
+    for u in (length(C) == 2 ? pts2 : pts3)
+        println("    (\"$label\", &$(v(pv)), &$(v(u)), $(f(logpdf(C, u))), $(f(cdf(C, u)))),")
+    end
+end
+println("];")

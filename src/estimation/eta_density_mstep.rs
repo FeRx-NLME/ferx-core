@@ -480,7 +480,7 @@ fn group_log_density<T: PkNum>(
         trunc: d.trunc,
         margins: d.margins.clone(),
         log_anchors: Vec::new(),
-        family: d.family,
+        family: d.family.clone(),
     };
     let mut free = 0;
     let shape_vals: Vec<T> = l

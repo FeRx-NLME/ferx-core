@@ -360,6 +360,11 @@ pub(crate) enum CopulaFamily {
     Bb4,
     /// BB5: Archimax of the Gumbel generator (`θ ≥ 1`) and the Galambos tail (`δ > 0`).
     Bb5,
+    /// Farlie–Gumbel–Morgenstern, `2^d − d − 1` interaction θs (by order, then
+    /// lexicographically), every hypercube corner of the density non-negative.
+    Fgm,
+    /// Plackett, `θ > 0` (bivariate).
+    Plackett,
 }
 
 /// One dependence parameter's θ: its auto-declared name prefix, init and bounds, and the
@@ -374,7 +379,7 @@ pub(crate) struct CopulaParam {
 }
 
 impl CopulaFamily {
-    pub(crate) const ALL: [CopulaFamily; 26] = [
+    pub(crate) const ALL: [CopulaFamily; 28] = [
         CopulaFamily::Independent,
         CopulaFamily::Clayton,
         CopulaFamily::Frank,
@@ -401,6 +406,8 @@ impl CopulaFamily {
         CopulaFamily::AsymGalambos,
         CopulaFamily::Bb4,
         CopulaFamily::Bb5,
+        CopulaFamily::Fgm,
+        CopulaFamily::Plackett,
     ];
 
     /// The model-file name (Copulas.jl's, lower-cased, without `Copula`).
@@ -432,6 +439,8 @@ impl CopulaFamily {
             CopulaFamily::AsymGalambos => "asymgalambos",
             CopulaFamily::Bb4 => "bb4",
             CopulaFamily::Bb5 => "bb5",
+            CopulaFamily::Fgm => "fgm",
+            CopulaFamily::Plackett => "plackett",
         }
     }
 
@@ -456,7 +465,8 @@ impl CopulaFamily {
             | CopulaFamily::AsymLog
             | CopulaFamily::AsymGalambos
             | CopulaFamily::Bb4
-            | CopulaFamily::Bb5 => 2,
+            | CopulaFamily::Bb5
+            | CopulaFamily::Plackett => 2,
             _ => MAX_COPULA_DIM,
         }
     }
@@ -569,6 +579,11 @@ impl CopulaFamily {
                 p("THETA", 1.5, 1.0, 50.0, (1.0, f64::INFINITY)),
                 p("DELTA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
             ],
+            CopulaFamily::Fgm => fgm_subsets(d)
+                .into_iter()
+                .map(|_| p("THETA", 0.0, -1.0, 1.0, (-1.0, 1.0)))
+                .collect(),
+            CopulaFamily::Plackett => vec![p("THETA", 2.0, 0.01, 100.0, (0.0, f64::INFINITY))],
         }
     }
 
@@ -598,6 +613,8 @@ impl CopulaFamily {
             | CopulaFamily::Bb5 => false,
             CopulaFamily::Mixed => p[0] == 0.0,
             CopulaFamily::AsymMixed => p[0] == 0.0 && p[1] == 0.0,
+            CopulaFamily::Fgm => p.iter().all(|&x| x == 0.0),
+            CopulaFamily::Plackett => p[0] == 1.0,
         }
     }
 
@@ -609,6 +626,26 @@ impl CopulaFamily {
             CopulaFamily::AsymMixed => {
                 let (a, b) = (p[0], p[1]);
                 a >= 0.0 && a + b <= 1.0 && a + 2.0 * b <= 1.0 && a + 3.0 * b >= 0.0
+            }
+            // The density's value at every hypercube corner, `1 + Σ θ_S Π_{i∈S} εᵢ ≥ 0`.
+            CopulaFamily::Fgm => {
+                let subsets = fgm_subsets(fgm_dim(p.len()));
+                let d = fgm_dim(p.len());
+                (0..(1usize << d)).all(|corner| {
+                    1.0 + subsets
+                        .iter()
+                        .zip(p)
+                        .map(|(&sm, &th)| {
+                            let neg = (sm & corner).count_ones() % 2 == 1;
+                            if neg {
+                                -th
+                            } else {
+                                th
+                            }
+                        })
+                        .sum::<f64>()
+                        >= 0.0
+                })
             }
             _ => true,
         }
@@ -700,7 +737,9 @@ impl CopulaFamily {
             | CopulaFamily::AsymLog
             | CopulaFamily::AsymGalambos
             | CopulaFamily::Bb4
-            | CopulaFamily::Bb5 => unreachable!("{self:?} has no Archimedean generator"),
+            | CopulaFamily::Bb5
+            | CopulaFamily::Fgm
+            | CopulaFamily::Plackett => unreachable!("{self:?} has no Archimedean generator"),
         }
     }
 
@@ -788,7 +827,9 @@ impl CopulaFamily {
             | CopulaFamily::AsymLog
             | CopulaFamily::AsymGalambos
             | CopulaFamily::Bb4
-            | CopulaFamily::Bb5 => unreachable!("{self:?} has no Archimedean generator"),
+            | CopulaFamily::Bb5
+            | CopulaFamily::Fgm
+            | CopulaFamily::Plackett => unreachable!("{self:?} has no Archimedean generator"),
         }
     }
 
@@ -828,6 +869,37 @@ impl CopulaFamily {
             let x: Vec<Mlin<T>> = u.iter().map(|v| v.ln().neg()).collect();
             return ev::stdf(self, &x, p).neg().exp();
         }
+        if self == CopulaFamily::Fgm {
+            // Π uᵢ [1 + Σ_S θ_S Π_{i∈S} (1 − uᵢ)].
+            let d = u.len();
+            let ubar: Vec<Mlin<T>> = u.iter().map(|x| x.neg().addc(k(1.0))).collect();
+            let mut bracket = Mlin::cst(u[0].d, k(1.0));
+            for (&sm, &th) in fgm_subsets(d).iter().zip(p) {
+                let mut term: Option<Mlin<T>> = None;
+                for (i, ub) in ubar.iter().enumerate() {
+                    if sm & (1 << i) != 0 {
+                        term = Some(match term {
+                            None => ub.clone(),
+                            Some(t) => t.mul(ub),
+                        });
+                    }
+                }
+                bracket = bracket.add(&term.expect("|S| ≥ 2").scale(th));
+            }
+            let mut prod = u[0].clone();
+            for x in &u[1..] {
+                prod = prod.mul(x);
+            }
+            return prod.mul(&bracket);
+        }
+        if self == CopulaFamily::Plackett {
+            // ([1 + (θ − 1)(u + v)] − √([1 + (θ − 1)(u + v)]² − 4uvθ(θ − 1)))/(2(θ − 1)).
+            let th = p[0];
+            let tm = th - k(1.0);
+            let a = u[0].add(&u[1]).scale(tm).addc(k(1.0));
+            let disc = a.mul(&a).sub(&u[0].mul(&u[1]).scale(k::<T>(4.0) * th * tm));
+            return a.sub(&disc.sqrt()).scale(k::<T>(1.0) / (k::<T>(2.0) * tm));
+        }
         if matches!(self, CopulaFamily::Bb4 | CopulaFamily::Bb5) {
             // Archimax: C = φ(ℓ_Galambos(φ⁻¹(u))), φ Clayton (BB4) or Gumbel (BB5).
             let gen = if self == CopulaFamily::Bb4 {
@@ -849,72 +921,45 @@ impl CopulaFamily {
     /// `ln c(u)` of a non-elliptical family at `u ∈ (0, 1)^d`, over `T`; `−∞` where the
     /// density is not positive, or not representable (below `≈ e^{−700}`).
     pub(crate) fn log_density<T: PkNum>(self, u: &[T], p: &[T]) -> T {
-        if !self.valid(&p.iter().map(|x| x.val()).collect::<Vec<_>>()) {
-            return k(f64::NEG_INFINITY);
-        }
-        let d = u.len();
-        let xs: Vec<Mlin<T>> = u
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| Mlin::var(d, i, v))
-            .collect();
-        let c = self.cdf(&xs, p).top();
-        // Where the density is not representable from its CDF, the copula reads as a wall
-        // (`−∞`) rather than hand an estimator a wrong finite value or a finite value with a
-        // non-finite gradient: below `≈ e^{−700}` (BB2 and BB3, whose `φ⁻¹` grows like an
-        // exponential of a power, reach it at moderate `u`), and where a tiny density is the
-        // difference of O(1) terms and rounds to `≤ 0` (an extreme-value family far off the
-        // diagonal under strong dependence: Hüsler–Reiss θ = 4 at (0.97, 0.02) has
-        // `ln c = −46`).
-        if c.val() > 0.0 && c.val().is_finite() && c.jets_finite() {
-            let lc = c.ln();
-            // A subnormal `c` has finite jets of its own but `ln c`'s are `g/c`.
-            if lc.jets_finite() {
-                return lc;
-            }
-        }
-        k(f64::NEG_INFINITY)
+        CopulaSpec::Family(self).log_density(u, p)
     }
 
-    /// One draw `u ∈ (0, 1)^d` of a non-elliptical family by conditional inversion:
-    /// `u₁ ~ U(0, 1)`, then each `u_k` solves `C(u_k | u₁..u_{k−1}) = v_k` by bisection,
-    /// the conditional CDF being the `{1..k−1}` coefficient of `C(u₁..u_k, 1, …, 1)`
-    /// over that of `C(u₁..u_{k−1}, 1, …, 1)`'s density.
+    /// One draw of a non-elliptical family ([`CopulaSpec::sample`]).
     pub(crate) fn sample(self, d: usize, p: &[f64], rng: &mut impl rand::Rng) -> Vec<f64> {
-        use rand::RngExt;
-        let mut u = vec![rng.random::<f64>().clamp(1e-300, 1.0 - 1e-16)];
-        for kk in 1..d {
-            let v: f64 = rng.random();
-            // The conditioning coordinates carry directions 0..kk; u_k and the rest are
-            // constants (the rest at 1, which marginalises them out).
-            let cond = |x: f64| -> f64 {
-                let args: Vec<Mlin<f64>> = (0..d)
-                    .map(|i| {
-                        if i < kk {
-                            Mlin::var(kk, i, u[i])
-                        } else if i == kk {
-                            Mlin::cst(kk, x)
-                        } else {
-                            Mlin::cst(kk, 1.0)
-                        }
-                    })
-                    .collect();
-                self.cdf(&args, p).top()
-            };
-            let denom = cond(1.0);
-            let (mut lo, mut hi) = (0.0f64, 1.0f64);
-            for _ in 0..80 {
-                let mid = 0.5 * (lo + hi);
-                if cond(mid) / denom < v {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
-            }
-            u.push((0.5 * (lo + hi)).clamp(1e-300, 1.0 - 1e-16));
-        }
-        u
+        CopulaSpec::Family(self).sample(d, p, rng)
     }
+}
+
+/// FGM's interaction subsets of `{0..d}` as bit masks, in Copulas.jl's order: by size,
+/// then lexicographically (`combinations(1:d, k)` for `k = 2..d`).
+pub(crate) fn fgm_subsets(d: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for size in 2..=d {
+        let mut combo: Vec<usize> = (0..size).collect();
+        loop {
+            out.push(combo.iter().fold(0usize, |m, &i| m | (1 << i)));
+            // Next combination in lexicographic order.
+            let mut i = size;
+            while i > 0 && combo[i - 1] == d - size + i - 1 {
+                i -= 1;
+            }
+            if i == 0 {
+                break;
+            }
+            combo[i - 1] += 1;
+            for j in i..size {
+                combo[j] = combo[j - 1] + 1;
+            }
+        }
+    }
+    out
+}
+
+/// The `d` whose FGM has `n = 2^d − d − 1` parameters.
+fn fgm_dim(n: usize) -> usize {
+    (2..=MAX_COPULA_DIM)
+        .find(|&d| (1usize << d) - d - 1 == n)
+        .unwrap_or(2)
 }
 
 /// The extreme-value families' stable tail dependence functions `ℓ(x)`, `x = −ln u`, as
@@ -1086,6 +1131,248 @@ pub(crate) fn gumbel_barnett_max(d: usize) -> f64 {
                 0.046
             }
         }
+    }
+}
+
+/// A copula as the model file composes it (#1716): a [`CopulaFamily`], or one of
+/// Copulas.jl's constructions over others. Every one is evaluated through its CDF on
+/// [`Mlin`], so its density, exact gradients and sampler come from the same code.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CopulaSpec {
+    Family(CopulaFamily),
+    /// `SurvivalCopula` / `Rotated90/180/270Copula`: `base` with the coordinates `flip`
+    /// marks reflected, `uᵢ ↦ 1 − uᵢ`. CDF by inclusion–exclusion over the flipped ones.
+    Reflect {
+        base: Box<CopulaSpec>,
+        flip: Vec<bool>,
+    },
+    /// `LiebscherCopula` (`KhoudrajiCopula` is its two-part case): `Π_k C_k(u^{a_k})`.
+    /// Its parameters are each part's in turn, then the weights of rows `1..K` (row-major,
+    /// `d` each); row 0 is `1 −` their column sums.
+    Liebscher {
+        parts: Vec<CopulaSpec>,
+    },
+    /// `NestedArchimedeanCopula` of one one-parameter family: one θ per node, pre-order
+    /// from the root, each node's θ at least its parent's (the sufficient nesting
+    /// condition).
+    Nested {
+        family: CopulaFamily,
+        root: NestNode,
+    },
+}
+
+/// A node of a nested Archimedean tree: a coordinate (its position in the group), or a
+/// generator over its children.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NestNode {
+    Leaf(usize),
+    Node(Vec<NestNode>),
+}
+
+impl NestNode {
+    fn n_nodes(&self) -> usize {
+        match self {
+            NestNode::Leaf(_) => 0,
+            NestNode::Node(ch) => 1 + ch.iter().map(|c| c.n_nodes()).sum::<usize>(),
+        }
+    }
+
+    /// `C` of this subtree, its θs from `p[*at..]` (pre-order).
+    fn cdf<T: PkNum>(&self, fam: CopulaFamily, u: &[Mlin<T>], p: &[T], at: &mut usize) -> Mlin<T> {
+        match self {
+            NestNode::Leaf(i) => u[*i].clone(),
+            NestNode::Node(ch) => {
+                let th = p[*at];
+                *at += 1;
+                let vals: Vec<Mlin<T>> = ch.iter().map(|c| c.cdf(fam, u, p, at)).collect();
+                fam.cdf(&vals, &[th])
+            }
+        }
+    }
+
+    /// Whether every child node's θ is at least this one's.
+    fn nests(&self, p: &[f64], at: &mut usize, parent: f64) -> bool {
+        match self {
+            NestNode::Leaf(_) => true,
+            NestNode::Node(ch) => {
+                let th = p[*at];
+                *at += 1;
+                th >= parent && ch.iter().all(|c| c.nests(p, at, th))
+            }
+        }
+    }
+}
+
+impl CopulaSpec {
+    /// The number of parameters for a group of `d`.
+    pub(crate) fn n_params(&self, d: usize) -> usize {
+        match self {
+            CopulaSpec::Family(f) => f.params(d).len(),
+            CopulaSpec::Reflect { base, .. } => base.n_params(d),
+            CopulaSpec::Liebscher { parts } => {
+                parts.iter().map(|c| c.n_params(d)).sum::<usize>() + (parts.len() - 1) * d
+            }
+            CopulaSpec::Nested { root, .. } => root.n_nodes(),
+        }
+    }
+
+    /// Whether its dependence lives in the group's Ω block (the t copula).
+    pub(crate) fn elliptical(&self) -> bool {
+        matches!(self, CopulaSpec::Family(f) if f.elliptical())
+    }
+
+    /// The Student t family, the one copula `correction_g` evaluates through Ω.
+    pub(crate) fn is_student_t(&self) -> bool {
+        *self == CopulaSpec::Family(CopulaFamily::StudentT)
+    }
+
+    /// The parameters' joint constraints (beyond each θ's own bounds).
+    pub(crate) fn valid(&self, p: &[f64], d: usize) -> bool {
+        match self {
+            CopulaSpec::Family(f) => f.valid(p),
+            CopulaSpec::Reflect { base, .. } => base.valid(p, d),
+            CopulaSpec::Liebscher { parts } => {
+                let mut at = 0;
+                for c in parts {
+                    let n = c.n_params(d);
+                    if !c.valid(&p[at..at + n], d) {
+                        return false;
+                    }
+                    at += n;
+                }
+                let w = &p[at..];
+                (0..d).all(|j| {
+                    let col: f64 = (0..parts.len() - 1).map(|r| w[r * d + j]).sum();
+                    (0..parts.len() - 1).all(|r| w[r * d + j] >= 0.0) && col <= 1.0
+                })
+            }
+            CopulaSpec::Nested { root, .. } => root.nests(p, &mut 0, f64::NEG_INFINITY),
+        }
+    }
+
+    /// `C(u)` over `Mlin`.
+    pub(crate) fn cdf<T: PkNum>(&self, u: &[Mlin<T>], p: &[T]) -> Mlin<T> {
+        match self {
+            CopulaSpec::Family(f) => f.cdf(u, p),
+            CopulaSpec::Reflect { base, flip } => {
+                // Ĉ(u) = Σ_{S ⊆ F} (−1)^{|S|} C(v^S), vᵢ = 1 − uᵢ on S, 1 on F ∖ S, uᵢ off F.
+                let f: Vec<usize> = (0..u.len()).filter(|&i| flip[i]).collect();
+                let one = Mlin::cst(u[0].d, k::<T>(1.0));
+                let mut out = Mlin::cst(u[0].d, k::<T>(0.0));
+                for s in 0usize..(1 << f.len()) {
+                    let v: Vec<Mlin<T>> = (0..u.len())
+                        .map(|i| match f.iter().position(|&j| j == i) {
+                            None => u[i].clone(),
+                            Some(b) if s & (1 << b) != 0 => u[i].neg().addc(k(1.0)),
+                            Some(_) => one.clone(),
+                        })
+                        .collect();
+                    let c = base.cdf(&v, p);
+                    out = if s.count_ones() % 2 == 1 {
+                        out.sub(&c)
+                    } else {
+                        out.add(&c)
+                    };
+                }
+                out
+            }
+            CopulaSpec::Liebscher { parts } => {
+                let d = u.len();
+                let mut at = 0;
+                let n_part: Vec<usize> = parts.iter().map(|c| c.n_params(d)).collect();
+                let w0 = n_part.iter().sum::<usize>();
+                let weight = |r: usize, j: usize| -> T {
+                    if r == 0 {
+                        let mut s = k::<T>(1.0);
+                        for rr in 1..parts.len() {
+                            s = s - p[w0 + (rr - 1) * d + j];
+                        }
+                        s
+                    } else {
+                        p[w0 + (r - 1) * d + j]
+                    }
+                };
+                let mut out = Mlin::cst(u[0].d, k::<T>(1.0));
+                for (r, c) in parts.iter().enumerate() {
+                    // u^a, with a weight of exactly 0 a constant 1 (the coordinate is
+                    // inactive in that part, and `cdf` marginalises it out).
+                    let ua: Vec<Mlin<T>> = (0..d)
+                        .map(|j| {
+                            let a = weight(r, j);
+                            if a.val() == 0.0 {
+                                Mlin::cst(u[0].d, k(1.0))
+                            } else {
+                                u[j].powf(a)
+                            }
+                        })
+                        .collect();
+                    out = out.mul(&c.cdf(&ua, &p[at..at + n_part[r]]));
+                    at += n_part[r];
+                }
+                out
+            }
+            CopulaSpec::Nested { family, root } => root.cdf(*family, u, p, &mut 0),
+        }
+    }
+
+    /// `ln c(u)` at `u ∈ (0, 1)^d`, over `T`; `−∞` where the density is not positive or
+    /// not representable from the CDF (see [`CopulaFamily::log_density`]), or the
+    /// parameters break a joint constraint.
+    pub(crate) fn log_density<T: PkNum>(&self, u: &[T], p: &[T]) -> T {
+        let d = u.len();
+        if !self.valid(&p.iter().map(|x| x.val()).collect::<Vec<_>>(), d) {
+            return k(f64::NEG_INFINITY);
+        }
+        let xs: Vec<Mlin<T>> = u
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| Mlin::var(d, i, v))
+            .collect();
+        let c = self.cdf(&xs, p).top();
+        if c.val() > 0.0 && c.val().is_finite() && c.jets_finite() {
+            let lc = c.ln();
+            if lc.jets_finite() {
+                return lc;
+            }
+        }
+        k(f64::NEG_INFINITY)
+    }
+
+    /// One draw `u ∈ (0, 1)^d` by conditional inversion: `u₁ ~ U(0, 1)`, then each `u_k`
+    /// solves `C(u_k | u₁..u_{k−1}) = v_k` by bisection, the conditional CDF being the
+    /// `{1..k−1}` coefficient of `C(u₁..u_k, 1, …, 1)` over its value at `u_k = 1`.
+    pub(crate) fn sample(&self, d: usize, p: &[f64], rng: &mut impl rand::Rng) -> Vec<f64> {
+        use rand::RngExt;
+        let mut u = vec![rng.random::<f64>().clamp(1e-300, 1.0 - 1e-16)];
+        for kk in 1..d {
+            let v: f64 = rng.random();
+            let cond = |x: f64| -> f64 {
+                let args: Vec<Mlin<f64>> = (0..d)
+                    .map(|i| {
+                        if i < kk {
+                            Mlin::var(kk, i, u[i])
+                        } else if i == kk {
+                            Mlin::cst(kk, x)
+                        } else {
+                            Mlin::cst(kk, 1.0)
+                        }
+                    })
+                    .collect();
+                self.cdf(&args, p).top()
+            };
+            let denom = cond(1.0);
+            let (mut lo, mut hi) = (0.0f64, 1.0f64);
+            for _ in 0..80 {
+                let mid = 0.5 * (lo + hi);
+                if cond(mid) / denom < v {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            u.push((0.5 * (lo + hi)).clamp(1e-300, 1.0 - 1e-16));
+        }
+        u
     }
 }
 
