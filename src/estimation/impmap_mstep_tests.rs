@@ -392,6 +392,59 @@ fn the_gate_demotes_and_names_what_froze() {
     assert!(!w.contains("stopped before reaching them"), "{w}");
 }
 
+/// The verdict has to read the same on the structured surface, for both messages and
+/// behind a chain prefix. Without its token arm the first reads as `Info` under
+/// `mu_referencing`, because it says "mu-reference", and the second as `Warning` under
+/// `general`, beside a demoted `converged`.
+#[test]
+fn the_gate_is_classified_as_a_critical_convergence_warning() {
+    use crate::types::{classify_warning, WarningSeverity};
+    let model = parse_model_string(WIDE_MODEL).unwrap();
+    let (lo, hi) = WIDE;
+    let mut m = MstepMotion::new(2);
+    m.record(&[1.0, 2.0], &lo, &hi, &step_to(&[1.5, 2.0], None));
+    let mut converged = true;
+    let stopped = gate_converged_on_mstep_motion(&mut converged, "IMP", &m, &model).unwrap();
+    let rejected = Some(nlopt::FailState::InvalidArgs);
+    m.record(&[1.5, 2.0], &lo, &hi, &step_to(&[1.5, 2.0], rejected));
+    let failed = gate_converged_on_mstep_motion(&mut converged, "IMP", &m, &model).unwrap();
+    assert!(stopped.contains("mu-reference") && !stopped.contains("NLopt"));
+    assert!(failed.contains("NLopt") && !failed.contains("mu-reference"));
+    let one_cpt = parse_model_string(ONE_CPT).unwrap();
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::Imp],
+        imp_iterations: 1,
+        imp_samples: 50,
+        imp_auto: false,
+        imp_seed: Some(11),
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let base = crate::api::fit(&one_cpt, &one_cpt_pop(), &one_cpt.default_params, &opts).unwrap();
+    for msg in [stopped, failed] {
+        for raw in [msg.clone(), format!("[IMP] {msg}")] {
+            let w = classify_warning(&raw);
+            assert_eq!(
+                (w.severity, w.category.as_str()),
+                (WarningSeverity::Critical, "convergence"),
+                "{raw}"
+            );
+            assert_eq!(w.message, msg);
+        }
+        // The path `fit()` publishes through.
+        let mut fit = base.clone();
+        fit.warnings.push(msg.clone());
+        crate::api::rebuild_warnings_structured(&mut fit);
+        let entry = fit
+            .warnings_structured
+            .iter()
+            .find(|e| e.message == msg)
+            .unwrap_or_else(|| panic!("{:?}", fit.warnings_structured));
+        assert_eq!(entry.severity, WarningSeverity::Critical);
+        assert_eq!(entry.category.as_str(), "convergence");
+    }
+}
+
 #[test]
 fn the_gate_is_silent_when_everything_moved() {
     let model = parse_model_string(WIDE_MODEL).unwrap();
