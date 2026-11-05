@@ -23,7 +23,7 @@ for (n in sel) { f <- fx[[n]]; cat("==",n,"\n")
   l <- suppressWarnings(ferx_load_fit(p))
   p2 <- file.path(S,"rt",paste0(n,".r2.fitrx")); suppressWarnings(ferx_save_fit(l,p2,include_data=TRUE))
   p3 <- file.path(S,"rt",paste0(n,".core.fitrx"))
-  e <- tryCatch({ferx:::ferx_rust_fitrx_engine_resave(p,p3);"ok"},error=function(e) conditionMessage(e))
+  e <- tryCatch({utils::getFromNamespace("ferx_rust_fitrx_engine_resave","ferx")(p,p3);"ok"},error=function(e) conditionMessage(e))
   rd <- function(p,ent="fit.json") { d<-tempfile();dir.create(d);utils::unzip(p,exdir=d);jsonlite::read_json(file.path(d,ent)) }
   fn <- names(unclass(fit)); ln <- names(unclass(l))
   common <- intersect(fn,ln)

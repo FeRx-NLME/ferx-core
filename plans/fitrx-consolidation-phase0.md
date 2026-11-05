@@ -298,7 +298,7 @@ The repository is `Robterheine/ferxgui`, not under FeRx-NLME, and it is maintain
 - It tolerates scalars where arrays belong, from before #379, so stricter arrays in v2 are safe for it.
 - `tests/fixtures/` holds eight v1 bundles, and `make_fixtures.R` rebuilds them through R.
 
-**Through R, `src/io/r_extract.rs`.** It runs `ferx_fit()` and `ferx_save_fit()` for every run, and calls `ferx_load_fit()` in 15 places. Phase 5 breaks seven assignments:
+**Through R, `src/io/r_extract.rs`.** It runs `ferx_fit()` and `ferx_save_fit()` for every run, and calls `ferx_load_fit()` in about ten places. Phase 5 breaks seven assignments:
 
 - `fit$data_path <- data_override` at `:177`, `:339` and `:850`, and the restore at `:347`. This relocates a moved project, and it is a genuine use case. `ferx_covariance()` has no `data` argument, so Phase 5 needs one, or a supported way to rebind the path.
 - `fit$sir_resamples`, `_n` and `_dim` at `:769`-`:771`. These re-inject SIR draws on the stated grounds that `ferx_load_fit()` does not restore them. That has been untrue since ferx-r #549, so the code can simply go.
