@@ -238,10 +238,7 @@ const SWITCH_POINTS: usize = 16;
 const SWITCH_PAIRS: usize = 2000;
 /// Bisection steps per crossing, enough to reach `f64` resolution along the segment.
 const SWITCH_BISECTIONS: usize = 80;
-/// How close to zero `l - r` must get, relative to `1 + |l| + |r|`. A sign change that does
-/// not reach this is a pole, such as `C / x` crossing `x = 0`, not a switch.
-const SWITCH_ROOT_TOL: f64 = 1e-9;
-/// The gap between the arms that is rounding alone, in units of `EPSILON·(|a| + |b|)`.
+/// The gap between the arms that is rounding alone, in units of `EPSILON·max(|a|, |b|)`.
 const SWITCH_ARM_ULPS: f64 = 16.0;
 /// How far along the segment, as a fraction of it, to step off a crossing to read the gap there.
 const SWITCH_STEP: f64 = 1e-8;
@@ -250,6 +247,9 @@ const SWITCH_STEP: f64 = 1e-8;
 /// threshold on the gap itself could not tell these apart: it would pass a small jump between
 /// small arms, and a large one between arms that share a large offset.
 const SWITCH_ARM_SHRINK: f64 = 1e-6;
+/// The largest gap the shrink test may excuse, relative to `1 + |a| + |b|`. An arm steep enough
+/// amplifies the crossing's own rounding past any jump, so its shrink proves nothing.
+const SWITCH_ARM_CEILING: f64 = 1e-7;
 
 /// The names an expression reads, or `None` when it holds anything this proof cannot sample:
 /// a nested conditional, a step function or `abs`, whose jump or kink could sit outside the
@@ -271,7 +271,12 @@ fn sampled_names(e: &Expression, names: &mut BTreeSet<String>) -> Option<()> {
     ok.then_some(())
 }
 
-/// `true` when `e` is affine in the names it reads.
+/// `true` when `e` is affine in the names it reads, so `l = r` with both sides affine is one
+/// hyperplane. Sampling sees only a bounded box, so a surface with several components, like
+/// `x * (x - 3000) = 0`, could hide one whose arms miss beyond it, and a variable denominator
+/// adds a pole where the condition flips with the arms apart. A hyperplane reaches the box
+/// wherever it goes, and arms that agree on part of it agree on all of it if they are analytic,
+/// which is why [`sampled_names`] refuses what is not.
 fn is_affine(e: &Expression) -> bool {
     let literal = |e: &Expression| matches!(e, Expression::Literal(_));
     match e {
@@ -285,17 +290,6 @@ fn is_affine(e: &Expression) -> bool {
     }
 }
 
-/// `true` when `l = r` is a single hyperplane: both sides affine, or an affine ratio against a
-/// literal. Sampling sees only a bounded box, so a surface with several components, like
-/// `x * (x - 3000) = 0`, could hide one whose arms miss beyond it. A hyperplane reaches the box
-/// wherever it goes, and arms that agree on part of it agree on all of it if they are analytic,
-/// which is why [`sampled_names`] refuses what is not.
-fn is_one_surface(l: &Expression, r: &Expression) -> bool {
-    let ratio = |e: &Expression| matches!(e, Expression::BinOp(a, BinOp::Div, b) if is_affine(a) && is_affine(b));
-    let literal = |e: &Expression| matches!(e, Expression::Literal(_));
-    (is_affine(l) && is_affine(r)) || (ratio(l) && literal(r)) || (literal(l) && ratio(r))
-}
-
 /// `true` when both arms of `if (l ? r)` agree wherever `l = r`, so the select is continuous
 /// at its switch and no sensitivity jump exists there.
 ///
@@ -306,10 +300,12 @@ fn is_one_surface(l: &Expression, r: &Expression) -> bool {
 /// intermediate: arms that agree for every value of it agree for the value it takes. So an
 /// intermediate can only lose the proof, and a select it loses stays on finite differences.
 fn arms_agree_on_switch(c: &Condition, then_e: &Expression, else_e: &Expression) -> bool {
-    let Condition::Compare(l, _, r) = c else {
+    // `==` and `!=` have no two sides to be continuous across: `if (x == 0.0) a else b` is `b`
+    // around the switch, whatever `a` is, and the arm read at the switch is the wrong one.
+    let Condition::Compare(l, CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge, r) = c else {
         return false;
     };
-    if !is_one_surface(l, r) {
+    if !(is_affine(l) && is_affine(r)) {
         return false;
     }
     let mut names = BTreeSet::new();
@@ -361,19 +357,16 @@ fn arms_agree_on_switch(c: &Condition, then_e: &Expression, else_e: &Expression)
         }
         let t = 0.5 * (lo + hi);
         let x = at(t);
-        let (lv, rv) = (eval(l, &x), eval(r, &x));
-        if !((lv - rv).abs() <= SWITCH_ROOT_TOL * (1.0 + lv.abs() + rv.abs())) {
-            continue;
-        }
         let (tv, ev) = (eval(then_e, &x), eval(else_e, &x));
-        if !tv.is_finite() && !ev.is_finite() {
-            continue;
+        if !tv.is_finite() || !ev.is_finite() {
+            return false;
         }
         let miss = (tv - ev).abs();
         let x_beside = at(t + SWITCH_STEP);
         let beside = (eval(then_e, &x_beside) - eval(else_e, &x_beside)).abs();
-        let rounding = SWITCH_ARM_ULPS * f64::EPSILON * (tv.abs() + ev.abs());
-        if !(miss <= rounding || miss <= SWITCH_ARM_SHRINK * beside) {
+        let rounding = SWITCH_ARM_ULPS * f64::EPSILON * tv.abs().max(ev.abs());
+        let ceiling = SWITCH_ARM_CEILING * (1.0 + tv.abs() + ev.abs());
+        if !(miss <= rounding || (miss <= SWITCH_ARM_SHRINK * beside && miss <= ceiling)) {
             return false;
         }
         crossings += 1;

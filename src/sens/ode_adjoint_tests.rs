@@ -956,6 +956,33 @@ fn ode_continuous_moving_switch_matches_its_max_twin_and_the_smoothed_limit() {
     assert!(worst < 2e-2, "worst relative difference {worst:.2e}");
 }
 
+/// The gradient on the route the exemption keeps, against reconverged FD. A kink defeats FD, so
+/// this fixture's arms also meet in value, slope and curvature: the `if` is `C²` across a
+/// switch every η moves, and FD is an oracle for it. The test above cannot see a wrong gradient
+/// common to its three spellings; this one can.
+///
+/// Regression caught: the served derivatives parting from the function.
+#[test]
+fn ode_smooth_moving_switch_matches_reconverged_fd() {
+    let src = ODE_MOVING_CONTINUOUS_SWITCH.replace(
+        "(if (r < C0) (C0 / r)^G else 1.0)",
+        "(if (r < C0) 1.0 + 20.0 * G * ((C0 - r) / C0)^3 else 1.0)",
+    );
+    let model = tight(parse_model_string(&src).unwrap());
+    let s = moving_switch_subject(&model);
+    assert!(in_scope(&model, &s), "the `if` must be served");
+    let theta = &model.default_params.theta;
+    let eta = [0.1, -0.05];
+    let preds = crate::pk::compute_predictions_with_tv(&model, &s, theta, &eta);
+    let c0 = theta[2] * eta[1].exp();
+    let below: Vec<bool> = preds.iter().map(|&r| r < c0).collect();
+    let flips = below.windows(2).filter(|w| w[0] != w[1]).count();
+    assert!(flips >= 2, "r = {preds:?} against C0 = {c0}");
+    let worst = fd_oracle(&model, &s, true);
+    // Measured worst 1.3e-7 on macOS, at the Richardson FD noise floor; about 15× headroom.
+    assert!(worst < 2e-6, "worst relative difference {worst:.2e}");
+}
+
 /// #2124: the static dual walk (`integrate_g`) reads a record one ULP before a co-timed
 /// dose — where the reader puts an observation listed before the dose — pre-dose, as the
 /// production predictor does. Only `t = 0` is the live cell: there the record and the dose

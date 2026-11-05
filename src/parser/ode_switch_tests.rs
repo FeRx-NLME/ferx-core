@@ -158,8 +158,6 @@ fn arms_that_meet_at_the_switch_are_exempt() {
     for body in [
         // Friberg feedback, as NONMEM writes it: the arms are `(C/x)^g` and 1 at `x = C`.
         "d/dt(a) = -KE * (if (tau < LAGT) (LAGT / tau)^0.16 else 1.0)\nd/dt(tau) = 1.0",
-        // The same switch spelled through the ratio, with the arms swapped.
-        "d/dt(a) = -KE * (if (LAGT / tau <= 1.0) 1.0 else (LAGT / tau)^0.16)\nd/dt(tau) = 1.0",
         // A hinge, with the condition on either side.
         "d/dt(a) = -KE * (if (tau > LAGT) tau - LAGT else 0.0)\nd/dt(tau) = 1.0",
         "d/dt(a) = -KE * (if (LAGT >= tau) 0.0 else 2.0 * (tau - LAGT))\nd/dt(tau) = 1.0",
@@ -167,11 +165,13 @@ fn arms_that_meet_at_the_switch_are_exempt() {
         "d/dt(a) = -KE * (if (TIME > LAGT) TIME - LAGT else 0.0)\nd/dt(tau) = 1.0",
         // Arms that read a third name still have to meet for every value of it.
         "d/dt(a) = -(if (tau > LAGT) KE * (tau - LAGT) else 0.0)\nd/dt(tau) = 1.0",
-        // Scaled sides, and a ratio against a literal on either side.
+        // `<=` is a side like any other.
+        "d/dt(a) = -(if (tau <= LAGT) 0.0 else tau - LAGT)\nd/dt(tau) = 1.0",
+        // Scaled sides, with the arms swapped.
         "d/dt(a) = -(if (tau * 2.0 > LAGT) tau * 2.0 - LAGT else 0.0)\nd/dt(tau) = 1.0",
         "d/dt(a) = -(if (2.0 * tau - 1.0 > LAGT / 2.0) 2.0 * tau - 1.0 - LAGT / 2.0 else 0.0)\n\
          d/dt(tau) = 1.0",
-        "d/dt(a) = -KE * (if (1.0 >= LAGT / tau) 1.0 else (LAGT / tau)^0.16)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (tau >= LAGT) 1.0 else (LAGT / tau)^0.16)\nd/dt(tau) = 1.0",
         // One function spelled two ways: the arms differ by rounding, at every point.
         "d/dt(a) = -(if (tau > LAGT) tau * 3.0 * 0.1 else tau * 0.1 + tau * 0.1 + tau * 0.1)\n\
          d/dt(tau) = 1.0",
@@ -194,8 +194,17 @@ fn arms_that_miss_at_the_switch_are_not_exempt() {
         "d/dt(a) = -KE * (if (tau > LAGT) 1e-9 else 0.0)\nd/dt(tau) = 1.0",
         "d/dt(a) = (if (tau > LAGT) 1000000000001.0 else 1000000000000.0) - 1e12\n\
          d/dt(tau) = 1.0",
+        // An arm can be steep enough to drown the jump in the crossing's rounding.
+        "d/dt(a) = -KE * (if (tau > LAGT) 1.0 + 1e300 * (tau - LAGT) else 0.0)\nd/dt(tau) = 1.0",
+        // Arms whose sizes overflow when added, and one arm that is not finite at all.
+        "d/dt(a) = 1e-308 * (if (tau > LAGT) 1e308 else 9e307)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (tau > LAGT) exp(1000.0) else 1.0)\nd/dt(tau) = 1.0",
+        // `==` and `!=` read one arm on the switch and the other everywhere around it.
+        "d/dt(a) = -(if (tau == LAGT) 2.0 * tau else tau + LAGT)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -(if (tau != LAGT) 2.0 * tau else tau + LAGT)\nd/dt(tau) = 1.0",
         // And one beside a steep arm, however it compares with the arm's own growth.
-        "d/dt(a) = -KE * (if (tau > LAGT) 1e-6 + 1e6 * (tau - LAGT) else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (tau > LAGT) 1e-9 + 1e3 * (tau - LAGT) else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (tau > LAGT) 1e-5 + 1e10 * (tau - LAGT) else 0.0)\nd/dt(tau) = 1.0",
         "d/dt(a) = -KE * (if (tau > LAGT) 1.0 + 1e7 * (tau - LAGT) else 0.0)\nd/dt(tau) = 1.0",
         // The arms meet at one value of `KE`, not across the surface.
         "d/dt(a) = -(if (tau > LAGT) KE else 1.0)\nd/dt(tau) = 1.0",
@@ -219,6 +228,11 @@ fn arms_that_miss_at_the_switch_are_not_exempt() {
         // The arms meet at `tau = LAGT`, the only part of this surface in the sampled range,
         // and miss at `tau = LAGT + 3000`.
         "d/dt(a) = -(if (0.0 < (tau - LAGT) * (tau - LAGT - 3000.0)) tau - LAGT else 0.0)\n\
+         d/dt(tau) = 1.0",
+        // A variable denominator flips the condition at its pole too, with the arms apart.
+        "d/dt(a) = -(if (LAGT / tau > 1.0) LAGT - tau else 0.0)\nd/dt(tau) = -LAGT",
+        // A pole above the sampled range never shows in the arms, but can in a trajectory.
+        "d/dt(a) = -(if (tau / (LAGT - 1200.0) > 0.01) tau - 0.01 * (LAGT - 1200.0) else 0.0)\n\
          d/dt(tau) = 1.0",
         // A ratio against a name, and a product of names, are not one hyperplane either.
         "d/dt(a) = -(if (tau / LAGT > KE) tau / LAGT - KE else 0.0)\nd/dt(tau) = 1.0",
