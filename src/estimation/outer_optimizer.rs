@@ -151,6 +151,10 @@ pub struct OuterResult {
     /// estimator, and when no iteration was finite. `fit()` compares the final marginal
     /// against it (`crate::api::postfit::mcem_marginal_warning`, #2652).
     pub(crate) mcem_lowest_objective: Option<f64>,
+    /// The per-iteration objectives of an IMP / IMPMAP run; `None` for every other
+    /// estimator, and for a run its wall-clock limit stopped. `fit()` tests them for settling
+    /// (`crate::api::postfit::mcem_settling_warning`, #2686).
+    pub(crate) mcem_objective_trail: Option<crate::estimation::impmap::McemObjectiveTrail>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1214,6 +1218,7 @@ fn evaluate_at_initial_params(
         vi: None,
         start_eval: None,
         mcem_lowest_objective: None,
+        mcem_objective_trail: None,
         params,
         ofv,
         converged: false,
@@ -9127,6 +9132,7 @@ fn optimize_nlopt_attempt_probed(
         // A restart leg publishes the fit's start, not its own (see `OuterResult::start_eval`).
         start_eval: inherited_start.unwrap_or(start_eval.get()),
         mcem_lowest_objective: None,
+        mcem_objective_trail: None,
     };
     (
         result,
@@ -9764,6 +9770,7 @@ fn optimize_bfgs(
         vi: None,
         start_eval: None,
         mcem_lowest_objective: None,
+        mcem_objective_trail: None,
         params: final_params,
         ofv: final_ofv,
         converged,

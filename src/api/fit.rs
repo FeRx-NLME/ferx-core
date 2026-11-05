@@ -2061,6 +2061,7 @@ fn fit_inner(
                         vi: None,
                         start_eval: None,
                         mcem_lowest_objective: None,
+                        mcem_objective_trail: None,
                         mixture_posteriors: None,
                     });
                 }
@@ -2160,6 +2161,7 @@ fn fit_inner(
                     vi: None,
                     start_eval: None,
                     mcem_lowest_objective: None,
+                    mcem_objective_trail: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -2252,7 +2254,7 @@ fn fit_inner(
                 // Warm-start the first MAP inner loop from the preceding stage's
                 // EBEs when chained (e.g. [focei, impmap] / [saem, impmap]).
                 let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
-                crate::estimation::impmap::run_impmap(
+                crate::estimation::impmap::run_impmap_stage(
                     model,
                     population,
                     &stage_params,
@@ -2287,7 +2289,7 @@ fn fit_inner(
                 // reaches here. Warm-start from the preceding stage's EBEs when
                 // chained (e.g. [saem, imp]).
                 let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
-                crate::estimation::impmap::run_imp(
+                crate::estimation::impmap::run_imp_stage(
                     model,
                     population,
                     &stage_params,
@@ -2366,38 +2368,13 @@ fn fit_inner(
         if is_last_estimating && matches!(method, EstimationMethod::Imp | EstimationMethod::Impmap)
         {
             let r = result.as_ref().expect("stage result was just set");
-            let mut marg_opts = stage_opts.clone();
-            // `run_importance_sampling` reads the `imp_*` knobs; for IMPMAP map the
-            // `impmap_*` knobs onto them so the final eval mirrors the method's
-            // own sample count / proposal df / seed.
-            if method == EstimationMethod::Impmap {
-                marg_opts.imp_samples = stage_opts.impmap_samples;
-                marg_opts.imp_seed = stage_opts.impmap_seed;
-                marg_opts.imp_low_ess_threshold = stage_opts.impmap_low_ess_threshold;
-                // A Gaussian IMPMAP proposal (`impmap_proposal_df = ∞`, opt-in)
-                // is one the IS evaluator could sample (#2651), but its light
-                // tails leave the weights unbounded. The marginal is
-                // proposal-independent in expectation, so evaluate under a
-                // finite-t proposal instead (heavier tails ⇒ bounded weights).
-                // The default `impmap_proposal_df = 4` passes through unchanged.
-                let df = stage_opts.impmap_proposal_df;
-                marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
-            }
-            let marg_call = if model.mixture.is_some() {
-                crate::estimation::importance_sampling::run_importance_sampling_mixture(
-                    model, population, &r.params, &marg_opts,
-                )
-            } else {
-                crate::estimation::importance_sampling::run_importance_sampling(
-                    model,
-                    population,
-                    &r.params,
-                    &r.eta_hats,
-                    &r.h_matrices,
-                    &r.kappas,
-                    &marg_opts,
-                )
-            };
+            let marg_call = crate::estimation::impmap::evaluate_final_marginal(
+                model,
+                population,
+                r,
+                &stage_opts,
+                method,
+            );
             match marg_call {
                 Ok(is) => {
                     if let Some(msg) =
@@ -3053,6 +3030,20 @@ fn fit_inner(
         is_result.as_ref().map(|r| r.minus2_log_likelihood),
         result.mcem_lowest_objective,
         population.n_obs(),
+    ) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+    // Every IMP / IMPMAP run stops at its iteration limit, finished or not (#2686).
+    if let Some((msg, entry)) = mcem_settling_warning(
+        &mut converged,
+        result.mcem_objective_trail.as_ref(),
+        is_result
+            .as_ref()
+            .map(|r| crate::estimation::impmap::FinalMarginal {
+                value: r.minus2_log_likelihood,
+                mc_se: r.mc_standard_error,
+            }),
     ) {
         warnings.push(msg);
         native_warnings.push(entry);

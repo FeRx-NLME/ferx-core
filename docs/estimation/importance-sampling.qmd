@@ -149,7 +149,9 @@ the limit stops there and keeps its result:
 
 - The estimate is the mean of the averaging iterations reached, or the last iteration's
   parameters if the averaging window had not started.
-- `converged` is `false`, and a warning gives the iteration reached.
+- `converged` is `false`, and a warning gives the iteration reached. The
+  [settling check](#not-settled) does not run, since the run did not reach its iteration
+  limit.
 - The post-fit work still runs: final EBEs, the covariance step if enabled, and the
   marginal evaluation. It is not counted against the limit, so set `covariance = false`
   if the budget is tight.
@@ -423,7 +425,8 @@ $$
 ## When the marginal shows a collapse {#marginal-collapse}
 
 IMP and IMPMAP run a fixed iteration schedule, so `converged` has no stopping
-test to report. It rests on the objectives instead. `ofv` is a Laplace pass, which
+test to report. It rests on the objectives instead, and on the check in
+[When the objective has not settled](#not-settled). `ofv` is a Laplace pass, which
 can look sane on a run that has collapsed, so `fit()` also checks the marginal
 in `importance_sampling.minus2_log_likelihood` and reports `converged: false` in
 two cases (#2652):
@@ -444,6 +447,50 @@ The rise check needs an estimating IMP / IMPMAP stage and a published marginal. 
 the marginal pass was skipped, a warning says so and this check does not run. The
 marginal is computed after the last estimating stage, so a trailing `agq_eval_only`
 readout replaces `ofv` and leaves both checks in force.
+
+## When the objective has not settled {#not-settled}
+
+Every IMP and IMPMAP run stops at its iteration limit, finished or not. So `fit()`, and
+a direct `run_imp` or `run_impmap` call, check the end of the iteration trace, and report
+`converged: false` with `W_MCEM_NOT_SETTLED` when it shows the run had not finished
+(#2686).
+
+The check reads the objective's *floor*: the lower 10% point of the last 50 iterations.
+A shorter run uses windows of a third of its length, so it never reads the first third,
+where a cold start descends. A gap counts when it exceeds both 3.84, one likelihood-ratio
+step, and 4 Monte-Carlo SEs. Each side brings its own SE, taken as a window's median, and
+they combine as independent estimates. That matters under `imp_auto`: an earlier window
+can have sampled less than the last one, and the final pass does not inherit a ramped-up
+sample count. Fewer samples also raise the objective, by about SE²/4, so that excess comes
+off a fall before it is tested.
+
+| What the floor shows | What it means | What to do |
+|---|---|---|
+| It fell from the window before | The run needed more iterations | Raise `imp_iterations` (`impmap_iterations`) |
+| It stayed above the final marginal | The iterations were not sampling the posterior well | Raise `imp_samples` (`impmap_samples`), use a heavy-tailed proposal (`imp_proposal_df`, `impmap_proposal_df`), or chain a FOCE/FOCEI stage first |
+
+The second test needs the marginal, so it does not run if the marginal pass was skipped.
+
+The check reads the floor and not the spread because a failed proposal misses posterior
+mass, which only ever raises an iteration's objective. A `normal` proposal makes large
+upward excursions on runs whose estimates are fine, so a wide trace alone proves nothing.
+
+The bounds were measured on Linux, on the six models of a comparison with NONMEM, at
+K = 1000 and 200 iterations. On healthy runs the floor fell by at most 1.78, and sat at
+most 3.86 above the marginal, which is 1.5 Monte-Carlo SEs. The two cold runs that
+NONMEM's own evaluator scored short of the optimum read 30.5 (vancomycin, falling) and
+42.4 (cefepime, above the marginal). With `imp_auto` on, the same cold runs mostly reach
+the optimum: eleven of the twelve finished, including three whose K moved inside
+the windows, and none was demoted. The widest fall was 2.16. The twelfth, cefepime with a
+`normal` proposal, did not finish in the time allowed.
+
+A run of fewer than 30 iterations is too short to test. It keeps its verdict and gets
+`W_MCEM_SETTLING_UNTESTED`, which says `converged` then only means the run did not
+diverge.
+
+A longer run whose trace cannot be read is another matter. If either window has fewer
+than 10 finite objectives or SEs, those iterations produced no usable likelihood, so the
+fit is reported `converged: false` with `W_MCEM_NOT_SETTLED`, `reason: unusable_trace`.
 
 ## Defensive mixture {#defensive-mixture}
 

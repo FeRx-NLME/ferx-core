@@ -402,6 +402,232 @@ fn lowest_objective(lowest: Option<f64>, objective: f64) -> Option<f64> {
     Some(lowest.map_or(objective, |l| l.min(objective)))
 }
 
+/// Iterations in each of the two trailing windows [`McemObjectiveTrail::settling`]
+/// compares (#2686). A run shorter than three windows uses a third of its length, so
+/// the first third, where a cold start descends, is never read.
+pub(crate) const MCEM_SETTLE_WINDOW: usize = 50;
+
+/// Fewest iterations per window [`McemObjectiveTrail::settling`] will judge, so a run
+/// needs three times this many.
+pub(crate) const MCEM_SETTLE_MIN_WINDOW: usize = 10;
+
+/// The fraction of a window below its floor (#2686). See
+/// [`McemObjectiveTrail::settling`] for why a floor, and not a spread.
+const MCEM_FLOOR_QUANTILE: f64 = 0.10;
+
+/// Smallest gap, in −2 log L units, that [`McemObjectiveTrail::settling`] treats as
+/// material: 3.84, the 5% point of χ²₁. A gap under one likelihood-ratio step cannot
+/// change a model comparison. It also spares a slow finish: cold infliximab's floor was
+/// still falling by 1.78, 23 SEs, and its marginal ended within 1 of the best.
+pub(crate) const MCEM_SETTLE_MIN_GAP: f64 = 3.84;
+
+/// How many Monte-Carlo SEs a gap must also exceed in
+/// [`McemObjectiveTrail::settling`], so a noisy objective has to show more.
+pub(crate) const MCEM_SETTLE_NOISE_RATIO: f64 = 4.0;
+
+/// The per-iteration record of an MCEM run, published so `fit()` can test whether the
+/// objective settled once the final marginal is known (#2686).
+#[derive(Debug, Clone)]
+pub(crate) struct McemObjectiveTrail {
+    /// −2 log L of each iteration.
+    pub(crate) objectives: Vec<f64>,
+    /// Monte-Carlo SE of each entry of `objectives`.
+    pub(crate) mc_se: Vec<f64>,
+    /// `"IMP"` or `"IMPMAP"`, as the run's other warnings spell it.
+    pub(crate) label: String,
+    pub(crate) iterations_option: &'static str,
+    pub(crate) samples_option: &'static str,
+    pub(crate) proposal_option: &'static str,
+}
+
+/// The final marginal [`McemObjectiveTrail::settling`] compares the floor with. Its SE
+/// is its own: the final pass draws the configured sample count, which `imp_auto` can
+/// leave far below what the iterations ramped to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FinalMarginal {
+    pub(crate) value: f64,
+    pub(crate) mc_se: f64,
+}
+
+/// What [`McemObjectiveTrail::settling`] found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum McemSettling {
+    /// Too few iterations to judge. The verdict stays as it was.
+    TooShort,
+    /// Enough iterations, but too few of them finite to read a window. `usable` is the
+    /// count in the worse of the two windows, each `window` iterations long.
+    Unusable {
+        window: usize,
+        usable: usize,
+    },
+    Settled,
+    /// The objective's floor was still falling at the iteration limit.
+    Falling {
+        window: usize,
+        previous_floor: f64,
+        floor: f64,
+        previous_mc_se: f64,
+        mc_se: f64,
+    },
+    /// The iterations stayed well above the marginal of their own final estimates.
+    AboveMarginal {
+        window: usize,
+        floor: f64,
+        marginal: FinalMarginal,
+        mc_se: f64,
+    },
+}
+
+/// The floor of a window of iteration objectives: its lower 10% point. Takes the
+/// window's finite values, so a non-finite iteration is dropped, as [`lowest_objective`]
+/// drops it.
+fn objective_floor(mut finite: Vec<f64>) -> f64 {
+    finite.sort_by(f64::total_cmp);
+    finite[(MCEM_FLOOR_QUANTILE * finite.len() as f64) as usize]
+}
+
+/// The finite entries of `window`.
+fn finite_values(window: &[f64]) -> Vec<f64> {
+    window.iter().copied().filter(|v| v.is_finite()).collect()
+}
+
+/// How far the objective of a window with MC SE `previous_mc_se` sits above that of one
+/// with `mc_se`, from sampling alone. `log p̂` runs low by half its variance, so −2 log L
+/// runs high by `Σᵢ Var(log p̂ᵢ) = se²/4`. It counts only against the earlier window:
+/// that is the direction `imp_auto` ramps, and the direction that fakes a fall.
+fn sampling_bias_excess(previous_mc_se: f64, mc_se: f64) -> f64 {
+    ((previous_mc_se * previous_mc_se - mc_se * mc_se) / 4.0).max(0.0)
+}
+
+impl McemObjectiveTrail {
+    /// Whether the objective had settled by the end of the run (#2686). IMP and IMPMAP
+    /// run a fixed schedule, so every run ends at the iteration limit.
+    ///
+    /// Reads the floor of the last window, and asks two things of it. A gap counts when
+    /// it exceeds both [`MCEM_SETTLE_MIN_GAP`] and [`MCEM_SETTLE_NOISE_RATIO`] MC SEs of
+    /// what it compares. Each side brings its own SE, and they combine as independent
+    /// estimates: the two windows' for two floors, the last window's and the marginal's
+    /// for a floor and a marginal.
+    ///
+    /// * **Is it still falling?** Against the floor of the window before. This is the
+    ///   run that needs more iterations. `imp_auto` can leave that window on fewer
+    ///   samples, which raises its objective with no change in the estimates, so
+    ///   [`sampling_bias_excess`] comes off the fall first.
+    /// * **Is it above the marginal?** `marginal` is scored at the final estimates with
+    ///   a fresh proposal. Iterations that never come near it were not sampling the
+    ///   posterior, so nothing in the trace shows the run reached an optimum. A marginal
+    ///   without a finite value and SE cannot convict a run of this.
+    ///
+    /// **The floor, not the spread.** A failed proposal misses posterior mass, so it
+    /// only ever raises an iteration's objective. A normal proposal makes these
+    /// excursions on a run whose estimates are fine: thioguanine at seed 777 climbed to
+    /// −132.8 inside the window, and still ended with a marginal of −249.82 against a
+    /// best of −250.58. Its robust spread (13.4) is twice that of vancomycin at 1004.72,
+    /// which is 8 short of the optimum (6.0), so no bound on spread separates them.
+    ///
+    /// Measured on Linux aarch64 (glibc 2.41, release without LTO), K = 1000 and 200
+    /// iterations, on the six models of the 2026-11 IMP-vs-NONMEM evaluation: `[focei,
+    /// imp]`, cold `imp`, and cold `imp` with `imp_proposal_df = normal` and
+    /// `imp_averaging = 1`, the last at three seeds. Also cold `impmap` on warfarin,
+    /// thioguanine and propofol, and both drivers on a two-class mixture.
+    ///
+    /// | Gap | Widest on a healthy run | On a run short of the optimum |
+    /// |---|---|---|
+    /// | floor fell | 1.78 (infliximab) | 30.5 (vancomycin at 1004.72, best 996.75) |
+    /// | floor above marginal | 3.86 at 1.5 SEs (chained cefepime) | 42.4 and 69.2 (cefepime at 4288.06 and 4298.55, best 4277) |
+    ///
+    /// The noise term decides that 3.86, which the minimum alone would convict. It sits
+    /// on a good estimate: cefepime's low-ESS subjects keep its objective noisy.
+    ///
+    /// Those runs fix K. `imp_auto` holds its raises until the objective settles or
+    /// [`auto_hold_ends`], which at 200 iterations and an averaging window of 50 is
+    /// iteration 150, the line between the two windows. Cold on the same six models
+    /// with `imp_auto` on, under both proposals, eleven runs finished. K moved inside
+    /// the windows on three of them (vancomycin, down at iteration 108; propofol, 152 to
+    /// 158; thioguanine, up to 192). All eleven kept `converged: true` with no settling warning, the
+    /// widest fall being 2.16 (vancomycin, marginal 996.67). None had an SE near the 16
+    /// where [`sampling_bias_excess`] outruns the noise bound, so that term rests on its
+    /// derivation.
+    pub(crate) fn settling(&self, marginal: Option<FinalMarginal>) -> McemSettling {
+        use crate::estimation::vi::run::median_and_mad;
+        let n = self.objectives.len();
+        let window = MCEM_SETTLE_WINDOW.min(n / 3);
+        if window < MCEM_SETTLE_MIN_WINDOW {
+            return McemSettling::TooShort;
+        }
+        let start = n - window;
+        let previous = start - window..start;
+        let last = start..n;
+        let columns = [
+            finite_values(&self.objectives[previous.clone()]),
+            finite_values(&self.objectives[last.clone()]),
+            finite_values(&self.mc_se[previous]),
+            finite_values(&self.mc_se[last]),
+        ];
+        let usable = columns.iter().map(Vec::len).min().unwrap_or(0);
+        if usable < MCEM_SETTLE_MIN_WINDOW {
+            return McemSettling::Unusable { window, usable };
+        }
+        let [previous_objectives, objectives, previous_se, se] = columns;
+        let (Some((previous_mc_se, _)), Some((mc_se, _))) =
+            (median_and_mad(&previous_se), median_and_mad(&se))
+        else {
+            return McemSettling::Unusable { window, usable };
+        };
+        let previous_floor = objective_floor(previous_objectives);
+        let floor = objective_floor(objectives);
+        let material = |se: f64| MCEM_SETTLE_MIN_GAP.max(MCEM_SETTLE_NOISE_RATIO * se);
+        let fall = previous_floor - floor - sampling_bias_excess(previous_mc_se, mc_se);
+        if fall > material(mc_se.hypot(previous_mc_se)) {
+            return McemSettling::Falling {
+                window,
+                previous_floor,
+                floor,
+                previous_mc_se,
+                mc_se,
+            };
+        }
+        // Filtered first: `f64::max` would discard a `NaN` SE and leave the bare minimum.
+        match marginal.filter(|m| m.value.is_finite() && m.mc_se.is_finite()) {
+            Some(marginal) if floor - marginal.value > material(mc_se.hypot(marginal.mc_se)) => {
+                McemSettling::AboveMarginal {
+                    window,
+                    floor,
+                    marginal,
+                    mc_se,
+                }
+            }
+            _ => McemSettling::Settled,
+        }
+    }
+}
+
+/// `Var(log p̂)` of one subject's importance-sampling marginal (Geweke, from the
+/// self-normalized ESS): `(1/ESS_frac − 1)/K`. A degenerate subject gets a finite
+/// fallback.
+fn log_marginal_mc_variance(ess_fraction: f64, k_samples: usize) -> f64 {
+    if ess_fraction > 1e-6 {
+        ((1.0 / ess_fraction) - 1.0).max(0.0) / k_samples as f64
+    } else {
+        1.0
+    }
+}
+
+/// [`log_marginal_mc_variance`] of a mixture subject's `log Σ_c π_c p̂_c`. By the delta
+/// method class `c` enters with its responsibility squared, so a class the subject does
+/// not belong to adds nothing however poor its proposal.
+fn mixture_log_marginal_mc_variance(
+    responsibilities: &[f64],
+    ess_fractions: impl Iterator<Item = f64>,
+    k_samples: usize,
+) -> f64 {
+    responsibilities
+        .iter()
+        .zip(ess_fractions)
+        .map(|(r, ess)| r * r * log_marginal_mc_variance(ess, k_samples))
+        .sum()
+}
+
 /// How each MCEM iteration positions the per-subject importance-sampling
 /// proposal — the one piece that distinguishes IMP from IMPMAP. Everything else
 /// (M-step, sufficient statistics, averaging, ESS diagnostics, final objective)
@@ -420,6 +646,28 @@ enum ProposalRecenter {
 }
 
 impl ProposalRecenter {
+    /// Bundle a finished run's per-iteration record with the option names its warning
+    /// should cite.
+    fn objective_trail(
+        self,
+        objectives: Vec<f64>,
+        mc_se: Vec<f64>,
+        label: &str,
+    ) -> McemObjectiveTrail {
+        let (iterations_option, samples_option, proposal_option) = match self {
+            ProposalRecenter::Map => ("impmap_iterations", "impmap_samples", "impmap_proposal_df"),
+            ProposalRecenter::SampleMoments => ("imp_iterations", "imp_samples", "imp_proposal_df"),
+        };
+        McemObjectiveTrail {
+            objectives,
+            mc_se,
+            label: label.to_string(),
+            iterations_option,
+            samples_option,
+            proposal_option,
+        }
+    }
+
     /// The estimation method this recentering strategy implements, so the shared
     /// MCEM core can ask `EstimationMethod::requires_random_effects` about the
     /// method actually running rather than restating the membership rule (#1050).
@@ -917,11 +1165,111 @@ fn run_map_multistart(
     (eta_hats, h_matrices, kappas, stats)
 }
 
-/// Run IMPMAP. `warm_etas`, when supplied by a preceding chain stage, seed the
-/// first MAP inner loop; otherwise the inner loop cold-starts from η = 0.
-/// Run IMPMAP (NONMEM `METHOD=IMPMAP`). Thin wrapper over the shared MCEM core
-/// with mode re-centering on every iteration; resolves the `impmap_*` options.
+/// The importance-sampling marginal −2 log L at a finished stage's estimates, as NONMEM
+/// reports it. `fit()` publishes it, and a direct [`run_imp`] / [`run_impmap`] call reads
+/// it for its verdict. `options` are the stage's. A mixture uses its own evaluator.
+pub(crate) fn evaluate_final_marginal(
+    model: &CompiledModel,
+    population: &Population,
+    result: &OuterResult,
+    options: &FitOptions,
+    method: EstimationMethod,
+) -> Result<crate::types::ImportanceSamplingResult, String> {
+    use crate::estimation::importance_sampling::{
+        run_importance_sampling, run_importance_sampling_mixture,
+    };
+    debug_assert!(matches!(
+        method,
+        EstimationMethod::Imp | EstimationMethod::Impmap
+    ));
+    let mut marg_opts = options.clone();
+    // `run_importance_sampling` reads the `imp_*` knobs; for IMPMAP map the
+    // `impmap_*` knobs onto them so the final eval mirrors the method's
+    // own sample count / proposal df / seed.
+    if method == EstimationMethod::Impmap {
+        marg_opts.imp_samples = options.impmap_samples;
+        marg_opts.imp_seed = options.impmap_seed;
+        marg_opts.imp_low_ess_threshold = options.impmap_low_ess_threshold;
+        // A Gaussian IMPMAP proposal (`impmap_proposal_df = ∞`, opt-in)
+        // is one the IS evaluator could sample (#2651), but its light
+        // tails leave the weights unbounded. The marginal is
+        // proposal-independent in expectation, so evaluate under a
+        // finite-t proposal instead (heavier tails ⇒ bounded weights).
+        // The default `impmap_proposal_df = 4` passes through unchanged.
+        let df = options.impmap_proposal_df;
+        marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
+    }
+    if model.mixture.is_some() {
+        run_importance_sampling_mixture(model, population, &result.params, &marg_opts)
+    } else {
+        run_importance_sampling(
+            model,
+            population,
+            &result.params,
+            &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            &marg_opts,
+        )
+    }
+}
+
+/// Give a direct [`run_imp`] / [`run_impmap`] caller the settling verdict `fit()` gives
+/// its stages (#2686), which needs the final marginal a stage does not compute. If the
+/// marginal fails, the falling-floor test still runs and a warning says so.
+fn apply_settling_verdict(
+    mut result: OuterResult,
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+    method: EstimationMethod,
+) -> OuterResult {
+    use crate::api::postfit::mcem_settling_warning;
+    let marginal = match evaluate_final_marginal(model, population, &result, options, method) {
+        Ok(is) => Some(FinalMarginal {
+            value: is.minus2_log_likelihood,
+            mc_se: is.mc_standard_error,
+        }),
+        Err(e) => {
+            result
+                .warnings
+                .push(format!("marginal −2 log L eval skipped: {e}"));
+            None
+        }
+    };
+    let trail = result.mcem_objective_trail.take();
+    if let Some((msg, _)) = mcem_settling_warning(&mut result.converged, trail.as_ref(), marginal) {
+        result.warnings.push(msg);
+    }
+    result.mcem_objective_trail = trail;
+    result
+}
+
+/// Run IMPMAP (NONMEM `METHOD=IMPMAP`), as a complete estimation. `warm_etas`, when
+/// supplied, seed the first MAP inner loop; otherwise it cold-starts from η = 0.
+///
+/// `converged` includes the settling verdict, so this also scores the final marginal.
 pub fn run_impmap(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>,
+    options: &FitOptions,
+) -> Result<OuterResult, String> {
+    let result = run_impmap_stage(model, population, init_params, warm_etas, options)?;
+    Ok(apply_settling_verdict(
+        result,
+        model,
+        population,
+        options,
+        EstimationMethod::Impmap,
+    ))
+}
+
+/// One IMPMAP stage of a `fit()`, which scores the marginal and gives the settling
+/// verdict itself. Thin wrapper over the shared MCEM core with mode re-centering on
+/// every iteration; resolves the `impmap_*` options.
+pub(crate) fn run_impmap_stage(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -954,11 +1302,31 @@ pub fn run_impmap(
     )
 }
 
-/// Run IMP as an estimator (NONMEM `METHOD=IMP`). Thin wrapper over the shared
-/// MCEM core with sample-moment re-centering (conditional mode found only on the
-/// first iteration); resolves the `imp_*` options. The evaluation-only
-/// `imp_eval_only` path lives in `importance_sampling.rs`.
+/// Run IMP as an estimator (NONMEM `METHOD=IMP`), as a complete estimation. The
+/// evaluation-only `imp_eval_only` path lives in `importance_sampling.rs`.
+///
+/// `converged` includes the settling verdict, so this also scores the final marginal.
 pub fn run_imp(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>,
+    options: &FitOptions,
+) -> Result<OuterResult, String> {
+    let result = run_imp_stage(model, population, init_params, warm_etas, options)?;
+    Ok(apply_settling_verdict(
+        result,
+        model,
+        population,
+        options,
+        EstimationMethod::Imp,
+    ))
+}
+
+/// One IMP stage of a `fit()`, which scores the marginal and gives the settling verdict
+/// itself. Thin wrapper over the shared MCEM core with sample-moment re-centering
+/// (conditional mode found only on the first iteration); resolves the `imp_*` options.
+pub(crate) fn run_imp_stage(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -1510,8 +1878,9 @@ fn run_mcem(
 
     // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
     let mut lowest_iteration_objective: Option<f64> = None;
-    // Every iteration's −2 log L and (per-subject SE, K), for `auto`.
+    // Every iteration's −2 log L and total MC SE, and its (per-subject SE, K) for `auto`.
     let mut iteration_objectives: Vec<f64> = Vec::with_capacity(n_iter);
+    let mut iteration_mc_se: Vec<f64> = Vec::with_capacity(n_iter);
     let mut iteration_se: Vec<(f64, usize)> = Vec::with_capacity(n_iter);
     // Iterations actually run, and the seconds at which `max_time` stopped them.
     let mut iterations_done = 0usize;
@@ -1855,20 +2224,15 @@ fn run_mcem(
         // finite fallback). −2 log L scales this by 2.
         let var_ll: f64 = ess_fracs
             .iter()
-            .map(|&f| {
-                if f > 1e-6 {
-                    ((1.0 / f) - 1.0).max(0.0) / k_samples as f64
-                } else {
-                    1.0
-                }
-            })
+            .map(|&f| log_marginal_mc_variance(f, k_samples))
             .sum();
         let mc_se = 2.0 * var_ll.sqrt();
+        iteration_objectives.push(minus2ll);
+        iteration_mc_se.push(mc_se);
         // Per-subject objective SE (N-independent): see AUTO_STDOBJ_TARGET.
         let mc_se_per_subject = mc_se / (ess_fracs.len().max(1) as f64).sqrt();
         final_mc_se = mc_se_per_subject;
         final_k_samples = k_samples;
-        iteration_objectives.push(minus2ll);
         // Adaptive sampling (NONMEM `AUTO`): move K so the M-step is driven by
         // signal, not noise. Raising waits for the objective to settle, because
         // early in a run the proposal lags the parameters and the SE reflects that
@@ -2515,9 +2879,9 @@ fn run_mcem(
         None
     };
 
-    // IMPMAP runs a fixed iteration schedule (no parameter-stabilization
-    // stopping test yet), so the only convergence signal we can honestly
-    // report is a sane final objective. A non-finite OFV means the MCEM
+    // IMP and IMPMAP run a fixed iteration schedule, so there is no stopping test
+    // to report. The verdict here rests on a sane final objective, and `fit()` adds
+    // the checks that need the marginal (#2652, #2686). A non-finite OFV means the MCEM
     // diverged; but a *runaway* (importance weights collapse → weighted
     // M-step walks θ to the bounds) produces a finite-but-enormous OFV
     // (~1e35), which `is_finite()` alone would wave through as converged and
@@ -2567,6 +2931,11 @@ fn run_mcem(
         vi: None,
         start_eval: None,
         mcem_lowest_objective: lowest_iteration_objective,
+        // A run `max_time` stopped did not reach the limit the settling verdict is about,
+        // and already says why it is not converged.
+        mcem_objective_trail: stopped_after
+            .is_none()
+            .then(|| recenter.objective_trail(iteration_objectives, iteration_mc_se, label)),
     })
 }
 
@@ -2984,6 +3353,8 @@ fn run_mcem_mixture(
 
     // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
     let mut lowest_iteration_objective: Option<f64> = None;
+    let mut iteration_objectives: Vec<f64> = Vec::with_capacity(n_iter);
+    let mut iteration_mc_se: Vec<f64> = Vec::with_capacity(n_iter);
     // Iterations actually run, and the seconds at which `max_time` stopped them.
     let mut iterations_done = 0usize;
     let mut stopped_after: Option<f64> = None;
@@ -3176,6 +3547,14 @@ fn run_mcem_mixture(
             ofv += contribution;
         }
         lowest_iteration_objective = lowest_objective(lowest_iteration_objective, ofv);
+        let var_ll: f64 = (0..n_subjects)
+            .map(|i| {
+                let ess = (0..n_classes).map(|c| draws_by_class[c][i].ess_fraction);
+                mixture_log_marginal_mc_variance(&pmix[i], ess, k_samples)
+            })
+            .sum();
+        iteration_objectives.push(ofv);
+        iteration_mc_se.push(2.0 * var_ll.sqrt());
         if verbose {
             // Per-subject ESS: the worst per-class proposal among the classes the
             // subject actually contributes to (a collapsed proposal in a class
@@ -3539,6 +3918,11 @@ fn run_mcem_mixture(
         vi: None,
         start_eval: None,
         mcem_lowest_objective: lowest_iteration_objective,
+        // A run `max_time` stopped did not reach the limit the settling verdict is about,
+        // and already says why it is not converged.
+        mcem_objective_trail: stopped_after
+            .is_none()
+            .then(|| recenter.objective_trail(iteration_objectives, iteration_mc_se, label)),
     })
 }
 
@@ -5080,6 +5464,459 @@ mod tests {
         assert_eq!(lowest_objective(Some(7.0), 5.0), Some(5.0));
         assert_eq!(lowest_objective(Some(7.0), f64::NAN), Some(7.0));
         assert_eq!(lowest_objective(Some(7.0), f64::NEG_INFINITY), Some(7.0));
+    }
+
+    /// The last 100 iteration objectives of four Linux runs, to one decimal (#2686).
+    /// `THIOGUANINE_NORMAL_S777` and both `*_NORMAL` runs are cold, with
+    /// `imp_proposal_df = normal` and `imp_averaging = 1`; `CEFEPIME_CHAINED` is
+    /// `[focei, imp]`.
+    const THIOGUANINE_NORMAL_S777: [f64; 100] = [
+        -244.1, -239.6, -244.7, -250.1, -250.3, -245.2, -249.6, -250.3, -249.7, -250.1, -251.0,
+        -245.0, -249.1, -250.3, -249.9, -247.9, -243.0, -248.1, -250.3, -251.0, -249.7, -250.0,
+        -250.5, -242.5, -235.5, -248.5, -245.9, -252.1, -230.2, -236.3, -231.7, -247.7, -246.9,
+        -249.8, -249.8, -249.7, -250.2, -249.6, -250.1, -241.9, -219.7, -210.6, -203.1, -193.6,
+        -198.6, -174.1, -168.2, -152.0, -154.0, -140.1, -132.8, -138.9, -156.8, -171.7, -166.4,
+        -185.8, -175.3, -166.4, -184.0, -194.6, -207.6, -226.2, -214.4, -192.2, -205.9, -219.9,
+        -225.0, -234.8, -241.2, -234.3, -239.5, -241.1, -243.0, -231.7, -244.7, -247.5, -250.4,
+        -228.3, -248.6, -250.3, -249.9, -249.9, -249.5, -235.9, -250.9, -249.8, -250.1, -249.6,
+        -246.4, -250.1, -249.5, -250.4, -251.3, -249.7, -242.5, -250.3, -249.6, -249.4, -249.7,
+        -240.3,
+    ];
+    const VANCOMYCIN_NORMAL: [f64; 100] = [
+        1082.2, 1065.9, 1080.5, 1073.9, 1073.0, 1085.9, 1088.0, 1083.3, 1090.1, 1083.7, 1071.6,
+        1072.7, 1069.6, 1066.2, 1088.0, 1084.2, 1080.3, 1079.9, 1089.2, 1073.5, 1073.4, 1059.9,
+        1070.9, 1081.7, 1087.3, 1087.4, 1076.7, 1057.2, 1053.6, 1061.8, 1051.1, 1047.9, 1044.0,
+        1034.1, 1039.0, 1046.4, 1050.2, 1052.8, 1045.6, 1034.7, 1050.5, 1048.8, 1048.4, 1056.7,
+        1036.0, 1040.9, 1034.3, 1035.2, 1031.7, 1041.1, 1034.8, 1044.9, 1040.5, 1047.2, 1034.8,
+        1025.4, 1025.9, 1032.5, 1026.1, 1019.5, 1016.8, 1015.5, 1014.2, 1013.4, 1013.1, 1013.2,
+        1012.6, 1011.7, 1011.6, 1010.9, 1011.1, 1010.6, 1010.4, 1010.2, 1010.9, 1009.5, 1017.0,
+        1008.8, 1009.7, 1008.7, 1007.5, 1008.7, 1008.7, 1008.1, 1007.2, 1007.1, 1005.5, 1006.5,
+        1006.5, 1005.9, 1006.0, 1005.9, 1005.4, 1005.3, 1005.0, 1005.0, 1005.7, 1013.7, 1005.5,
+        1004.9,
+    ];
+    const CEFEPIME_NORMAL: [f64; 100] = [
+        4320.0, 4334.1, 4327.5, 4375.1, 4328.1, 4318.2, 4323.3, 4361.0, 4355.0, 4348.9, 4339.6,
+        4340.6, 4387.1, 4410.3, 4410.0, 4396.3, 4384.4, 4387.2, 4392.9, 4410.2, 4403.9, 4404.8,
+        4371.3, 4339.6, 4319.8, 4318.7, 4362.7, 4380.7, 4362.1, 4368.2, 4375.1, 4357.9, 4384.1,
+        4385.5, 4336.3, 4341.1, 4367.3, 4361.1, 4356.2, 4334.8, 4335.0, 4344.9, 4391.7, 4359.9,
+        4346.5, 4380.1, 4342.3, 4340.2, 4340.6, 4338.2, 4344.4, 4367.5, 4356.7, 4361.1, 4356.7,
+        4331.9, 4337.3, 4341.0, 4330.4, 4321.5, 4352.0, 4322.1, 4353.5, 4348.0, 4365.4, 4348.0,
+        4316.9, 4348.6, 4319.8, 4311.9, 4362.3, 4366.8, 4377.4, 4394.0, 4421.7, 4405.3, 4373.7,
+        4397.4, 4355.7, 4376.3, 4415.6, 4431.8, 4444.7, 4419.2, 4426.9, 4403.2, 4393.9, 4439.8,
+        4413.7, 4392.6, 4370.5, 4379.0, 4362.3, 4408.1, 4439.1, 4442.3, 4470.3, 4423.3, 4408.5,
+        4398.6,
+    ];
+    const CEFEPIME_CHAINED: [f64; 100] = [
+        4282.0, 4283.1, 4282.0, 4279.9, 4294.0, 4283.2, 4328.1, 4305.3, 4300.7, 4306.5, 4292.6,
+        4294.0, 4283.5, 4282.8, 4281.1, 4280.6, 4280.5, 4284.6, 4281.6, 4282.7, 4282.0, 4284.2,
+        4286.7, 4280.7, 4282.2, 4277.6, 4285.5, 4279.3, 4277.2, 4277.4, 4281.9, 4281.4, 4283.9,
+        4282.2, 4286.5, 4279.7, 4288.7, 4280.5, 4270.2, 4278.8, 4279.7, 4283.4, 4277.6, 4300.6,
+        4289.9, 4301.2, 4311.1, 4307.9, 4307.7, 4299.2, 4281.5, 4292.5, 4292.4, 4278.6, 4280.4,
+        4289.0, 4310.3, 4277.8, 4277.3, 4294.1, 4277.4, 4281.1, 4286.0, 4276.8, 4280.4, 4278.7,
+        4277.6, 4289.7, 4282.4, 4281.0, 4278.8, 4275.0, 4277.7, 4283.9, 4310.5, 4290.2, 4294.1,
+        4277.0, 4313.9, 4291.0, 4309.4, 4295.5, 4278.5, 4275.6, 4304.8, 4289.8, 4287.7, 4280.0,
+        4292.3, 4297.0, 4312.6, 4290.1, 4285.6, 4279.1, 4279.1, 4284.8, 4292.2, 4279.2, 4297.5,
+        4294.4,
+    ];
+
+    /// A 150-iteration trail ending in `tail`. The first 50 entries are absurd on
+    /// purpose: at that length the test never reads the first third.
+    fn trail_ending_in(tail: &[f64], mc_se: f64) -> McemObjectiveTrail {
+        let mut objectives = vec![1e9; 150 - tail.len()];
+        objectives.extend_from_slice(tail);
+        ProposalRecenter::SampleMoments.objective_trail(objectives, vec![mc_se; 150], "IMP")
+    }
+
+    /// A marginal with no noise of its own, for tests about the floor.
+    fn exact(value: f64) -> Option<FinalMarginal> {
+        Some(FinalMarginal { value, mc_se: 0.0 })
+    }
+
+    /// Two windows of 50, at the two floors given. Most of each window sits 10 above its
+    /// floor, so the floor is what the test has to read.
+    fn two_windows(previous_floor: f64, floor: f64, mc_se: f64) -> McemObjectiveTrail {
+        let window = |f: f64| {
+            let mut v = vec![f + 10.0; 44];
+            v.extend_from_slice(&[f; 6]);
+            v
+        };
+        trail_ending_in(&[window(previous_floor), window(floor)].concat(), mc_se)
+    }
+
+    /// The two runs NONMEM's evaluator scored short of the optimum are the two this
+    /// fires on, each by its own arm. The other two are the hard negative controls: the
+    /// thioguanine run swings by more than either, and chained cefepime is noisy.
+    #[test]
+    fn settling_separates_the_measured_runs() {
+        let settling = |tail: &[f64], se, value, mc_se| {
+            trail_ending_in(tail, se).settling(Some(FinalMarginal { value, mc_se }))
+        };
+        assert!(matches!(
+            settling(&VANCOMYCIN_NORMAL, 0.29, 1004.72, 0.23),
+            McemSettling::Falling { window: 50, .. }
+        ));
+        assert!(matches!(
+            settling(&CEFEPIME_NORMAL, 2.54, 4288.06, 1.09),
+            McemSettling::AboveMarginal { window: 50, .. }
+        ));
+        assert_eq!(
+            settling(&THIOGUANINE_NORMAL_S777, 0.69, -249.82, 0.23),
+            McemSettling::Settled
+        );
+        assert_eq!(
+            settling(&CEFEPIME_CHAINED, 2.24, 4277.29, 1.26),
+            McemSettling::Settled
+        );
+    }
+
+    /// Cefepime's trace alone says nothing, which is why the test sits in `fit()`: its
+    /// floor is flat, so only the marginal shows the run is short of the optimum.
+    #[test]
+    fn a_plateau_needs_the_marginal_to_be_seen() {
+        let trail = trail_ending_in(&CEFEPIME_NORMAL, 2.54);
+        assert_eq!(trail.settling(None), McemSettling::Settled);
+    }
+
+    #[test]
+    fn a_gap_must_clear_both_the_minimum_and_the_noise() {
+        // Falling arm. 3.0 is 30 SEs and under the minimum, 5.0 clears both, and with
+        // an SE of 2 the 5.0 is under 4 SEs.
+        assert_eq!(
+            two_windows(103.0, 100.0, 0.1).settling(None),
+            McemSettling::Settled
+        );
+        assert!(matches!(
+            two_windows(105.0, 100.0, 0.1).settling(None),
+            McemSettling::Falling { .. }
+        ));
+        assert_eq!(
+            two_windows(105.0, 100.0, 2.0).settling(None),
+            McemSettling::Settled
+        );
+        // Marginal arm, the same three cases.
+        let flat = |se| two_windows(100.0, 100.0, se);
+        assert_eq!(flat(0.1).settling(exact(97.0)), McemSettling::Settled);
+        assert!(matches!(
+            flat(0.1).settling(exact(95.0)),
+            McemSettling::AboveMarginal { .. }
+        ));
+        assert_eq!(flat(2.0).settling(exact(95.0)), McemSettling::Settled);
+    }
+
+    /// The reported values, each distinct so that swapping two fails.
+    #[test]
+    fn settling_reports_the_floors_it_compared() {
+        let mut falling = two_windows(120.0, 100.0, 0.5);
+        falling.mc_se[50..100].fill(0.75);
+        assert_eq!(
+            falling.settling(None),
+            McemSettling::Falling {
+                window: 50,
+                previous_floor: 120.0,
+                floor: 100.0,
+                previous_mc_se: 0.75,
+                mc_se: 0.5,
+            }
+        );
+        assert_eq!(
+            two_windows(100.0, 100.0, 0.5).settling(Some(FinalMarginal {
+                value: 90.0,
+                mc_se: 0.25,
+            })),
+            McemSettling::AboveMarginal {
+                window: 50,
+                floor: 100.0,
+                marginal: FinalMarginal {
+                    value: 90.0,
+                    mc_se: 0.25,
+                },
+                mc_se: 0.5,
+            }
+        );
+    }
+
+    /// A rising floor is not "still falling", and a marginal above the floor is not
+    /// "floor above the marginal": `W_MCEM_OBJECTIVE_ROSE` owns that direction.
+    #[test]
+    fn settling_is_one_sided() {
+        assert_eq!(
+            two_windows(100.0, 120.0, 0.1).settling(None),
+            McemSettling::Settled
+        );
+        assert_eq!(
+            two_windows(100.0, 100.0, 0.1).settling(exact(120.0)),
+            McemSettling::Settled
+        );
+    }
+
+    /// Five of 50 iterations can sit anywhere below the floor without moving it, and any
+    /// number above it. The sixth lowest value is the one read.
+    #[test]
+    fn the_floor_ignores_excursions_on_either_side() {
+        let mut w = vec![100.0; 50];
+        assert_eq!(objective_floor(w.clone()), 100.0);
+        w[..5].fill(50.0);
+        assert_eq!(objective_floor(w.clone()), 100.0);
+        w[5] = 50.0;
+        assert_eq!(objective_floor(w.clone()), 50.0);
+        let mut w = vec![100.0; 50];
+        w[..44].fill(1e6);
+        assert_eq!(objective_floor(w.clone()), 100.0);
+    }
+
+    /// A run needs three windows of ten, and a shorter schedule reads a third of itself.
+    #[test]
+    fn settling_needs_three_windows_and_skips_the_first_third() {
+        let trail = |n: usize| {
+            let third = n / 3;
+            let mut o = vec![1e9; n - 2 * third];
+            o.extend(vec![110.0; third]);
+            o.extend(vec![100.0; third]);
+            ProposalRecenter::SampleMoments.objective_trail(o, vec![0.1; n], "IMP")
+        };
+        assert_eq!(trail(29).settling(None), McemSettling::TooShort);
+        assert!(matches!(
+            trail(30).settling(None),
+            McemSettling::Falling { window: 10, .. }
+        ));
+        assert!(matches!(
+            trail(90).settling(None),
+            McemSettling::Falling { window: 30, .. }
+        ));
+        assert!(matches!(
+            trail(150).settling(None),
+            McemSettling::Falling { window: 50, .. }
+        ));
+        // The window stops growing at 50: both of them now sit in the flat last third.
+        assert_eq!(trail(600).settling(None), McemSettling::Settled);
+    }
+
+    /// A non-finite iteration is dropped rather than read as a floor. With too few left
+    /// the run cannot be judged, and a marginal that is not a number convicts nothing:
+    /// `W_NONFINITE_MARGINAL` reports it.
+    #[test]
+    fn settling_survives_non_finite_values() {
+        let mut t = two_windows(120.0, 100.0, 0.1);
+        t.objectives[120] = f64::NEG_INFINITY;
+        t.objectives[121] = f64::NAN;
+        assert!(matches!(
+            t.settling(None),
+            McemSettling::Falling { floor, .. } if floor == 100.0
+        ));
+        let flat = two_windows(100.0, 100.0, 0.1);
+        for marginal in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
+            assert_eq!(flat.settling(exact(marginal)), McemSettling::Settled);
+        }
+        // A marginal whose own SE is unusable cannot convict either, even at a gap of 50.
+        for mc_se in [f64::NAN, f64::INFINITY] {
+            let marginal = Some(FinalMarginal { value: 50.0, mc_se });
+            assert_eq!(flat.settling(marginal), McemSettling::Settled);
+        }
+    }
+
+    /// Each of the four columns the test reads can leave it unable to read a window, and
+    /// that is `Unusable`, not `TooShort`: the run was long enough. `usable` counts the
+    /// worse window, and ten finite values are enough.
+    #[test]
+    fn settling_tells_an_unusable_trace_from_a_short_one() {
+        let columns: [(fn(&mut McemObjectiveTrail) -> &mut Vec<f64>, usize); 4] = [
+            (|t| &mut t.objectives, 50),
+            (|t| &mut t.objectives, 100),
+            (|t| &mut t.mc_se, 50),
+            (|t| &mut t.mc_se, 100),
+        ];
+        for (column, start) in columns {
+            for (poison, expected) in [(f64::NAN, 9), (f64::INFINITY, 9)] {
+                let mut t = two_windows(100.0, 100.0, 0.1);
+                column(&mut t)[start..start + 41].fill(poison);
+                assert_eq!(
+                    t.settling(None),
+                    McemSettling::Unusable {
+                        window: 50,
+                        usable: expected
+                    },
+                    "column at {start}"
+                );
+            }
+            let mut t = two_windows(100.0, 100.0, 0.1);
+            column(&mut t)[start..start + 40].fill(f64::NAN);
+            assert_eq!(t.settling(None), McemSettling::Settled, "column at {start}");
+        }
+    }
+
+    /// The first third is not read, so nothing there can make a trace unusable.
+    #[test]
+    fn settling_ignores_non_finite_values_before_the_windows() {
+        let mut t = two_windows(100.0, 100.0, 0.1);
+        t.objectives[..50].fill(f64::NAN);
+        t.mc_se[..50].fill(f64::NAN);
+        assert_eq!(t.settling(None), McemSettling::Settled);
+    }
+
+    /// Each window's noise is its own median, so one bad iteration's SE cannot excuse a
+    /// falling floor, and iterations before the windows do not count.
+    #[test]
+    fn settling_reads_the_noise_of_each_window_only() {
+        let mut t = two_windows(120.0, 100.0, 0.5);
+        t.mc_se[50..100].fill(0.75);
+        t.mc_se[149] = 1e6;
+        t.mc_se[99] = 1e6;
+        t.mc_se[..50].fill(1e6);
+        assert!(matches!(
+            t.settling(None),
+            McemSettling::Falling { previous_mc_se, mc_se, .. }
+                if previous_mc_se == 0.75 && mc_se == 0.5
+        ));
+    }
+
+    /// The case `imp_auto` makes: the earlier window sampled less, so its floor is the
+    /// noisy one and the last window's SE alone would convict. A gap of 20 clears 4 of
+    /// the last window's SEs (0.4) and not 4 of the earlier window's (6).
+    #[test]
+    fn settling_weighs_the_earlier_windows_noise() {
+        let ramped = |previous_se: f64| {
+            let mut t = two_windows(120.0, 100.0, 0.1);
+            t.mc_se[50..100].fill(previous_se);
+            t
+        };
+        assert_eq!(ramped(6.0).settling(None), McemSettling::Settled);
+        assert!(matches!(
+            ramped(0.1).settling(None),
+            McemSettling::Falling { .. }
+        ));
+        // The SEs combine, so a gap clearing each alone can fall short of both: 4 · 3 = 12
+        // and 4 · 3√2 = 16.97, with no bias between equal SEs.
+        let both = |gap: f64| two_windows(100.0 + gap, 100.0, 3.0).settling(None);
+        assert_eq!(both(16.9), McemSettling::Settled);
+        assert!(matches!(both(17.0), McemSettling::Falling { .. }));
+    }
+
+    /// Fewer samples raise the objective by `se²/4` with no change in the estimates,
+    /// which outruns the noise bound once the SE passes 16: at 20 the excess is 100 and
+    /// the bound 80, so a fall has to pass 180.
+    #[test]
+    fn settling_takes_the_sampling_bias_off_the_fall() {
+        let ramped = |fall: f64| {
+            let mut t = two_windows(100.0 + fall, 100.0, 0.0);
+            t.mc_se[50..100].fill(20.0);
+            t.settling(None)
+        };
+        assert_eq!(ramped(90.0), McemSettling::Settled);
+        assert_eq!(ramped(179.9), McemSettling::Settled);
+        assert!(matches!(ramped(180.1), McemSettling::Falling { .. }));
+    }
+
+    /// `se²/4`, on the earlier window only: a noisier last window is no reason to think
+    /// the earlier one sat high, and must not lift the fall either.
+    #[test]
+    fn sampling_bias_counts_only_against_the_earlier_window() {
+        assert_eq!(sampling_bias_excess(4.0, 0.0), 4.0);
+        assert_eq!(sampling_bias_excess(4.0, 2.0), 3.0);
+        assert_eq!(sampling_bias_excess(2.0, 2.0), 0.0);
+        assert_eq!(sampling_bias_excess(0.0, 4.0), 0.0);
+    }
+
+    /// The final pass draws the configured count while `imp_auto` ramps the iterations,
+    /// so the marginal can be the noisier of the two. The gap here is 20: far past 4 of
+    /// the window's SEs, and within 4 of the marginal's. The SEs combine, so a gap that
+    /// clears each alone (5.0 > 4 · 1) can still fall short of both (4 · √2 = 5.66).
+    #[test]
+    fn a_noisy_marginal_cannot_convict_a_settled_trace() {
+        let flat = |se| two_windows(100.0, 100.0, se);
+        let marginal = |value, mc_se| Some(FinalMarginal { value, mc_se });
+        assert!(matches!(
+            flat(0.1).settling(marginal(80.0, 0.1)),
+            McemSettling::AboveMarginal { .. }
+        ));
+        assert_eq!(
+            flat(0.1).settling(marginal(80.0, 6.0)),
+            McemSettling::Settled
+        );
+        assert_eq!(
+            flat(1.0).settling(marginal(95.0, 1.0)),
+            McemSettling::Settled
+        );
+        assert!(matches!(
+            flat(1.0).settling(marginal(94.0, 1.0)),
+            McemSettling::AboveMarginal { .. }
+        ));
+    }
+
+    /// The marginal's SE judges only the marginal: two floors share no such noise.
+    #[test]
+    fn a_noisy_marginal_does_not_excuse_a_falling_floor() {
+        let noisy = Some(FinalMarginal {
+            value: 100.0,
+            mc_se: 50.0,
+        });
+        assert!(matches!(
+            two_windows(120.0, 100.0, 0.1).settling(noisy),
+            McemSettling::Falling { .. }
+        ));
+    }
+
+    #[test]
+    fn log_marginal_mc_variance_is_gewekes_form_with_a_finite_fallback() {
+        assert_eq!(log_marginal_mc_variance(0.5, 100), 0.01);
+        assert_eq!(log_marginal_mc_variance(1.0, 100), 0.0);
+        assert_eq!(log_marginal_mc_variance(0.0, 100), 1.0);
+    }
+
+    /// Weighted by the squared responsibility, so a subject settled in one class gets
+    /// that class's variance and the other's proposal is irrelevant.
+    #[test]
+    fn a_mixture_subject_pays_for_its_classes_by_responsibility() {
+        let var =
+            |r: &[f64], ess: &[f64]| mixture_log_marginal_mc_variance(r, ess.iter().copied(), 100);
+        assert_eq!(var(&[1.0, 0.0], &[0.5, 0.0]), 0.01);
+        assert_eq!(var(&[0.5, 0.5], &[0.5, 0.5]), 0.005);
+        assert_eq!(var(&[0.5, 0.5], &[0.5, 1.0]), 0.0025);
+    }
+
+    /// Each driver's record has one row per iteration, and cites its own options.
+    #[test]
+    fn each_mcem_driver_publishes_its_trail() {
+        let check = |res: &OuterResult, n: usize, label: &str, prefix: &str| {
+            let t = res.mcem_objective_trail.as_ref().expect("trail published");
+            assert_eq!(t.objectives.len(), n);
+            assert_eq!(t.mc_se.len(), n);
+            assert!(t.objectives.iter().all(|v| v.is_finite()), "{t:?}");
+            assert!(t.mc_se.iter().all(|v| v.is_finite()), "{t:?}");
+            assert!(t.mc_se.iter().any(|&v| v > 0.0), "{t:?}");
+            assert_eq!(t.label, label);
+            assert_eq!(t.iterations_option, format!("{prefix}_iterations"));
+            assert_eq!(t.samples_option, format!("{prefix}_samples"));
+            assert_eq!(t.proposal_option, format!("{prefix}_proposal_df"));
+        };
+        let model = iov_model();
+        let pop = iov_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 3;
+        opts.impmap_samples = 120;
+        opts.impmap_seed = Some(11);
+        opts.imp_iterations = 4;
+        opts.imp_samples = 100;
+        opts.imp_seed = Some(11);
+        opts.run_covariance_step = false;
+        let params = &model.default_params;
+        let impmap = run_impmap(&model, &pop, params, None, &opts).expect("impmap");
+        check(&impmap, 3, "IMPMAP", "impmap");
+        let imp = run_imp(&model, &pop, params, None, &opts).expect("imp");
+        check(&imp, 4, "IMP", "imp");
+
+        let model = mix996_model("TVV");
+        let pop = mix996_pop(3);
+        let params = &model.default_params;
+        let mixture = run_impmap(&model, &pop, params, None, &opts).expect("mixture impmap");
+        check(&mixture, 3, "IMPMAP", "impmap");
+        // The wrapper reaches the mixture too: too short to test, and saying so.
+        let told = |w: &String| w.starts_with("W_MCEM_SETTLING_UNTESTED: IMPMAP: 3 iteration(s)");
+        assert!(mixture.warnings.iter().any(told), "{:?}", mixture.warnings);
+        let marginal =
+            evaluate_final_marginal(&model, &pop, &mixture, &opts, EstimationMethod::Impmap)
+                .expect("mixture marginal");
+        assert!(marginal.minus2_log_likelihood.is_finite());
+        assert_eq!(marginal.n_samples, opts.impmap_samples);
     }
 
     /// The baseline `fit()` reads is the lowest iteration row, and not simply the first:
@@ -7393,6 +8230,8 @@ mod tests {
         assert!(warning.contains("at iteration 1 of 5"), "{warning}");
         assert!(warning.contains("unaveraged"), "{warning}");
         assert!(warning.contains("reported as not converged"), "{warning}");
+        // Its stop was the clock, so the settling verdict has nothing to say about it.
+        assert!(res.mcem_objective_trail.is_none());
 
         let classified = crate::types::classify_warning(warning);
         assert_eq!(classified.severity, WarningSeverity::Warning);
@@ -7417,6 +8256,13 @@ mod tests {
                 res.warnings
                     .iter()
                     .any(|w| w.contains("stopped by `imp_max_time`")),
+                "{methods:?}: {:?}",
+                res.warnings
+            );
+            // One iteration is under the 30 the settling test needs, but the clock
+            // stopped the run: raising `imp_iterations` is not the advice it needs.
+            assert!(
+                !res.warnings.iter().any(|w| w.contains("W_MCEM_")),
                 "{methods:?}: {:?}",
                 res.warnings
             );
@@ -7511,6 +8357,7 @@ mod tests {
             "{:?}",
             res.warnings
         );
+        assert!(res.mcem_objective_trail.is_none());
     }
 
     #[test]
