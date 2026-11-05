@@ -942,12 +942,16 @@ fn ode_continuous_moving_switch_matches_its_max_twin_and_the_smoothed_limit() {
 
     let got = moving_switch_gradient("(if (r < C0) (C0 / r)^G else 1.0)");
     let twin = moving_switch_gradient("max(C0 / r, 1.0)^G");
+    // Four θ, two ω and σ: a shorter gradient would leave the loops below with less to check.
+    assert_eq!(got.len(), 7, "{got:?}");
+    assert_eq!(twin.len(), 7, "{twin:?}");
     for (a, b) in got.iter().zip(&twin) {
         assert!((a - b).abs() <= 1e-13 * (1.0 + b.abs()), "{got:?} {twin:?}");
     }
 
     let smooth =
         moving_switch_gradient("(0.5 * (C0 / r + 1.0 + sqrt((C0 / r - 1.0)^2 + 1e-3 * 1e-3)))^G");
+    assert_eq!(smooth.len(), 7, "{smooth:?}");
     let mut worst = 0.0f64;
     for (a, b) in got.iter().zip(&smooth) {
         assert!(a.is_finite() && b.is_finite(), "{got:?} {smooth:?}");

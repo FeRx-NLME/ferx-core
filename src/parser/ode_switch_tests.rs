@@ -173,8 +173,6 @@ fn arms_that_meet_at_the_switch_are_exempt() {
          d/dt(tau) = 1.0",
         "d/dt(a) = -KE * (if (tau >= LAGT) 1.0 else (LAGT / tau)^0.16)\nd/dt(tau) = 1.0",
         // The functions that have no jump of their own to hide.
-        "d/dt(a) = -(if (tau > LAGT) exp(0.01 * tau) - exp(0.01 * LAGT) else 0.0)\n\
-         d/dt(tau) = 1.0",
         "d/dt(a) = -(if (tau > LAGT) log(1.0 + tau * tau) - log(1.0 + LAGT * LAGT) else 0.0)\n\
          d/dt(tau) = 1.0",
         "d/dt(a) = -(if (tau > LAGT) ln(1.0 + tau * tau) - ln(1.0 + LAGT * LAGT) else 0.0)\n\
@@ -237,6 +235,8 @@ fn arms_that_miss_at_the_switch_are_not_exempt() {
         "d/dt(a) = -(if (tau > LAGT) abs(LAGT - 1e9) + LAGT else 1e9)\nd/dt(tau) = 1.0",
         // So can a saturation: `tanh` rounds to -1 throughout the sampled range.
         "d/dt(a) = -(if (tau > LAGT) tanh(a - 1200.0) else -1.0)\nd/dt(tau) = 1.0",
+        // As can `exp`, whose term rounds away against the 1 until `a` passes 1200.
+        "d/dt(a) = -(if (tau > LAGT) 1.0 + exp(0.4 * (a - 1200.0)) else 1.0)\nd/dt(tau) = 1.0",
         // A nested conditional can too.
         "d/dt(a) = -KE * (if (tau > LAGT) (if (LAGT > 1e9) 1.0 else 0.0) else 0.0)\n\
          d/dt(tau) = 1.0",
