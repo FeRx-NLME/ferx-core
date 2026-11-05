@@ -252,9 +252,9 @@ const SWITCH_ARM_SHRINK: f64 = 1e-6;
 const SWITCH_ARM_CEILING: f64 = 1e-7;
 
 /// The names an expression reads, or `None` when it holds anything this proof cannot sample:
-/// a nested conditional, a step function or `abs`, whose jump or kink could sit outside the
-/// sampled range; and what has no free value here (θ, η, `MIXNUM`, a network output, a level
-/// block).
+/// a nested conditional, or any function but `exp`, `log` and `sqrt`, since a step, a kink or a
+/// saturation like `tanh(y - 1200)` could hold its jump outside the sampled range; and what has
+/// no free value here (θ, η, `MIXNUM`, a network output, a level block).
 fn sampled_names(e: &Expression, names: &mut BTreeSet<String>) -> Option<()> {
     let mut ok = true;
     super::visit_expr_nodes(e, &mut |n| match n {
@@ -263,9 +263,7 @@ fn sampled_names(e: &Expression, names: &mut BTreeSet<String>) -> Option<()> {
         }
         Expression::Literal(_) | Expression::Time | Expression::Power(..) => {}
         Expression::BinOp(_, op, _) => ok &= !matches!(op, BinOp::Mod),
-        Expression::UnaryFn(f, _) => {
-            ok &= !matches!(f.as_str(), "floor" | "ceil" | "round" | "abs")
-        }
+        Expression::UnaryFn(f, _) => ok &= matches!(f.as_str(), "exp" | "log" | "ln" | "sqrt"),
         _ => ok = false,
     });
     ok.then_some(())
@@ -297,8 +295,8 @@ fn is_affine(e: &Expression) -> bool {
 /// over every name the select reads, bisects each pair that straddles the switch, and compares
 /// the arms at the crossing. Two different analytic arms meet on a set of measure zero within
 /// the surface, so [`SWITCH_POINTS`] crossings separate them. Each name is free, including an
-/// intermediate: arms that agree for every value of it agree for the value it takes. So an
-/// intermediate can only lose the proof, and a select it loses stays on finite differences.
+/// intermediate: arms that agree for every value of it agree for the value it takes, so one the
+/// arms need expanded loses the proof, and a select it loses stays on finite differences.
 fn arms_agree_on_switch(c: &Condition, then_e: &Expression, else_e: &Expression) -> bool {
     // `==` and `!=` have no two sides to be continuous across: `if (x == 0.0) a else b` is `b`
     // around the switch, whatever `a` is, and the arm read at the switch is the wrong one.

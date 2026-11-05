@@ -172,6 +172,15 @@ fn arms_that_meet_at_the_switch_are_exempt() {
         "d/dt(a) = -(if (2.0 * tau - 1.0 > LAGT / 2.0) 2.0 * tau - 1.0 - LAGT / 2.0 else 0.0)\n\
          d/dt(tau) = 1.0",
         "d/dt(a) = -KE * (if (tau >= LAGT) 1.0 else (LAGT / tau)^0.16)\nd/dt(tau) = 1.0",
+        // The functions that have no jump of their own to hide.
+        "d/dt(a) = -(if (tau > LAGT) exp(0.01 * tau) - exp(0.01 * LAGT) else 0.0)\n\
+         d/dt(tau) = 1.0",
+        "d/dt(a) = -(if (tau > LAGT) log(1.0 + tau * tau) - log(1.0 + LAGT * LAGT) else 0.0)\n\
+         d/dt(tau) = 1.0",
+        "d/dt(a) = -(if (tau > LAGT) ln(1.0 + tau * tau) - ln(1.0 + LAGT * LAGT) else 0.0)\n\
+         d/dt(tau) = 1.0",
+        "d/dt(a) = -(if (tau > LAGT) sqrt(1.0 + tau * tau) - sqrt(1.0 + LAGT * LAGT) else 0.0)\n\
+         d/dt(tau) = 1.0",
         // One function spelled two ways: the arms differ by rounding, at every point.
         "d/dt(a) = -(if (tau > LAGT) tau * 3.0 * 0.1 else tau * 0.1 + tau * 0.1 + tau * 0.1)\n\
          d/dt(tau) = 1.0",
@@ -220,8 +229,14 @@ fn arms_that_miss_at_the_switch_are_not_exempt() {
          d/dt(tau) = 1.0",
         // A step inside an arm can hide its jump above the sampled range.
         "d/dt(a) = -KE * (if (tau > LAGT) floor(sqrt(LAGT * LAGT) / 1e9) else 0.0)\nd/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (tau > LAGT) ceil(sqrt(LAGT * LAGT) / 1e9 - 1.0) else 0.0)\n\
+         d/dt(tau) = 1.0",
+        "d/dt(a) = -KE * (if (tau > LAGT) round(sqrt(LAGT * LAGT) / 1e9) else 0.0)\n\
+         d/dt(tau) = 1.0",
         // So can a kink.
         "d/dt(a) = -(if (tau > LAGT) abs(LAGT - 1e9) + LAGT else 1e9)\nd/dt(tau) = 1.0",
+        // So can a saturation: `tanh` rounds to -1 throughout the sampled range.
+        "d/dt(a) = -(if (tau > LAGT) tanh(a - 1200.0) else -1.0)\nd/dt(tau) = 1.0",
         // A nested conditional can too.
         "d/dt(a) = -KE * (if (tau > LAGT) (if (LAGT > 1e9) 1.0 else 0.0) else 0.0)\n\
          d/dt(tau) = 1.0",

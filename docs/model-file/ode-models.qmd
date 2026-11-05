@@ -68,10 +68,11 @@ Expressions can reference:
   the first-order sensitivities. Its gradient is still inexact to second order, by
   about 1% on a measured feedback model. ferx checks the arms by evaluating them at
   points on the switch, and keeps finite differences when it cannot: for a compound
-  condition, `==` or `!=`, a nested `if`, `abs`, `floor`, `ceil`, `round` or `mod`, a
-  condition that is not linear in what it reads, or an arm so steep that rounding
-  hides the gap at the switch. The check samples a bounded range, so a kink built by
-  hand from `sqrt(x * x)` far from it can pass. An
+  condition, `==` or `!=`, a nested `if`, `mod`, any function other than `exp`, `log`
+  and `sqrt`, a condition that is not linear in what it reads, or an arm so steep
+  that rounding hides the gap at the switch. The check samples values up to about
+  1000 and works in floating point, so it can't see a kink built by hand from
+  `sqrt(x * x)` beyond that, or a jump near rounding error. An
   intermediate is treated as a free value, so arms that meet only once it is
   expanded also stay on finite differences; write the expression in the arm.
 
