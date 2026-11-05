@@ -2097,12 +2097,11 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     // binary-only or TTE-only fit (no Gaussian rows at all, hence no `obs_cmts`) would
     // emit an sdtab with the endpoint CMT silently dropped.
     #[cfg(feature = "survival")]
-    let any_discrete = result
-        .subjects
-        .iter()
-        .any(|s| !s.discrete_rows.is_empty() || !s.tte_rows.is_empty());
+    let has_endpoint_rows =
+        |s: &SubjectResult| !s.discrete_rows.is_empty() || !s.tte_rows.is_empty();
     #[cfg(not(feature = "survival"))]
-    let any_discrete = false;
+    let has_endpoint_rows = |s: &SubjectResult| !s.discrete_rows.is_empty();
+    let any_discrete = result.subjects.iter().any(has_endpoint_rows);
     let any_multicmt = any_discrete
         || population
             .subjects
@@ -2342,7 +2341,6 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         }
     }
 
-    #[cfg(feature = "survival")]
     append_discrete_rows(&mut cols, result, population);
     #[cfg(feature = "survival")]
     append_tte_rows(&mut cols, result, population);
@@ -2365,7 +2363,6 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
 /// `CWRES` is deliberately blank: the conditional weighted residual is defined through
 /// the Gaussian residual-variance model, and there is none for a Bernoulli outcome.
 /// `IWRES` carries the standardized (Pearson) residual instead.
-#[cfg(feature = "survival")]
 fn append_discrete_rows(
     cols: &mut [(String, Vec<f64>)],
     result: &FitResult,
@@ -5076,7 +5073,6 @@ mod tests {
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
-            #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
             #[cfg(feature = "survival")]
             tte_rows: Vec::new(),
@@ -5933,7 +5929,6 @@ mod tests {
             extra_columns: Vec::new(),
             per_obs_tad: Vec::new(),
             compartment_states: Vec::new(),
-            #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
             #[cfg(feature = "survival")]
             tte_rows: Vec::new(),

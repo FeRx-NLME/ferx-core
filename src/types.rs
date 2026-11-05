@@ -6449,7 +6449,9 @@ impl std::fmt::Debug for CompiledModel {
 /// CWRES, and its `ipred` is a probability rather than a concentration. Every column
 /// the Gaussian rows carry but a discrete row cannot define is emitted as an empty
 /// sdtab cell.
-#[cfg(feature = "survival")]
+///
+/// Not behind `survival`, unlike the code that computes it: a `.fitrx` bundle read by a
+/// build without that feature keeps these rows, and writes them back when it is re-saved.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct DiscreteObsDiagnostic {
     /// CMT of the endpoint that produced this record.
@@ -6560,7 +6562,6 @@ pub struct SubjectResult {
     /// Post-fit diagnostics for this subject's **discrete** (binary) endpoint records,
     /// one entry per record (§8.8.5). Empty for models with no discrete endpoint, which
     /// keeps every existing `FitResult` serialization byte-identical.
-    #[cfg(feature = "survival")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discrete_rows: Vec<DiscreteObsDiagnostic>,
     /// Post-fit residuals for this subject's **time-to-event** records, one entry per

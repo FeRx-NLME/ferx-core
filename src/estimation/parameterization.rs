@@ -1046,25 +1046,30 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
     mask
 }
 
-/// `FitResult::cov_fixed`: [`packed_fixed_mask`] over a covariance matrix of dimension
-/// `cov_dim`, or empty when there is no matrix or the layout does not have its dimension,
-/// so a reader gets no mask rather than a misaligned one.
+/// `FitResult::cov_fixed` for `fit`: [`packed_fixed_mask`] over its covariance matrix, or
+/// empty when there is no matrix or the layout does not have its dimension, so a reader
+/// gets no mask rather than a misaligned one.
 ///
-/// `theta_fixed` is the fit's own record, which adds to the model file's FIX every θ the
-/// engine froze during the fit for having no effect on the objective; the step held those
-/// too.
+/// The step holds more than the model file's FIX: every θ the engine froze during the fit
+/// for having no effect on the objective (`theta_fixed`), and every profiled level on its
+/// bound (`profiled_levels_at_bound`, θ indices), which `theta_fixed` does not list. Read
+/// after both are final.
 pub(crate) fn cov_fixed_mask(
     template: &ModelParameters,
-    theta_fixed: &[bool],
-    cov_dim: Option<usize>,
+    fit: &crate::types::FitResult,
 ) -> Vec<bool> {
-    let Some(dim) = cov_dim else {
+    let Some(dim) = fit.covariance_matrix.as_ref().map(|m| m.nrows()) else {
         return Vec::new();
     };
     let mut held = template.clone();
-    if theta_fixed.len() == held.theta_fixed.len() {
-        for (f, &frozen) in held.theta_fixed.iter_mut().zip(theta_fixed) {
+    if fit.theta_fixed.len() == held.theta_fixed.len() {
+        for (f, &frozen) in held.theta_fixed.iter_mut().zip(&fit.theta_fixed) {
             *f |= frozen;
+        }
+    }
+    for &k in &fit.profiled_levels_at_bound {
+        if let Some(f) = held.theta_fixed.get_mut(k) {
+            *f = true;
         }
     }
     let mask = packed_fixed_mask(&held);
@@ -2174,8 +2179,9 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
-    /// #2695: the mask is the packed one, plus every θ the fit froze, and only for a
-    /// matrix of the layout's own dimension. Mutations: drop the OR → the frozen row dies;
+    /// #2695: the mask is the packed one, plus every θ the fit froze and every profiled
+    /// level on its bound, and only for a matrix of the layout's own dimension. Mutations:
+    /// drop the OR → the frozen row dies; drop the profiled loop → the bound row dies;
     /// return the mask on a dimension mismatch → the misaligned row dies; apply a
     /// `theta_fixed` of the wrong length → the short row panics or differs.
     #[test]
@@ -2203,19 +2209,27 @@ mod tests {
         let template = &parsed.default_params;
         let plain = vec![true, false, false, false];
         assert_eq!(packed_fixed_mask(template), plain, "premise");
+        let fit = |theta_fixed: &[bool], at_bound: &[usize], dim: Option<usize>| {
+            let mut f = crate::types::test_helpers::empty_fit_result();
+            f.theta_fixed = theta_fixed.to_vec();
+            f.profiled_levels_at_bound = at_bound.to_vec();
+            f.covariance_matrix = dim.map(|d| DMatrix::identity(d, d));
+            cov_fixed_mask(template, &f)
+        };
+        assert_eq!(fit(&[true, false], &[], Some(4)), plain, "the file's FIX");
         assert_eq!(
-            cov_fixed_mask(template, &[true, false], Some(4)),
-            plain,
-            "the file's FIX"
-        );
-        assert_eq!(
-            cov_fixed_mask(template, &[false, true], Some(4)),
+            fit(&[false, true], &[], Some(4)),
             vec![true, true, false, false],
             "a θ the fit froze adds to the file's FIX and removes nothing"
         );
-        assert_eq!(cov_fixed_mask(template, &[true], Some(4)), plain, "short");
-        assert!(cov_fixed_mask(template, &[true, false], Some(3)).is_empty());
-        assert!(cov_fixed_mask(template, &[true, false], None).is_empty());
+        assert_eq!(
+            fit(&[true, false], &[1], Some(4)),
+            vec![true, true, false, false],
+            "a profiled level on its bound, which `theta_fixed` does not list"
+        );
+        assert_eq!(fit(&[true], &[], Some(4)), plain, "short");
+        assert!(fit(&[true, false], &[], Some(3)).is_empty());
+        assert!(fit(&[true, false], &[], None).is_empty());
     }
 
     /// `omega_cholesky_jacobian` against central finite differences of

@@ -824,9 +824,7 @@ struct LevelWire {
 }
 
 /// The discrete-rows entry and the `ebes.csv` column that sizes each subject's block.
-#[cfg(feature = "survival")]
 const DISCRETE_ENTRY: &str = "predictions_discrete.csv";
-#[cfg(feature = "survival")]
 const DISCRETE_HEADER: [&str; 7] = ["ID", "CMT", "TIME", "DV", "PRED", "IPRED", "IWRES"];
 const N_OBS_DISCRETE: &str = "n_obs_discrete";
 
@@ -1120,7 +1118,6 @@ pub fn save_fit(
     entries.push("predictions.csv".into());
 
     // --- predictions_discrete.csv (only when the fit has discrete rows) ----
-    #[cfg(feature = "survival")]
     if has_discrete_rows(result) {
         zip.start_file(DISCRETE_ENTRY, zopts)?;
         write_predictions_discrete_csv(&mut zip, result)?;
@@ -1401,20 +1398,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
     }
 }
 
-/// How many discrete rows this subject holds. Always `0` without `survival`, which has
-/// nowhere to keep them.
-#[cfg(feature = "survival")]
-fn n_discrete_rows(s: &SubjectResult) -> usize {
-    s.discrete_rows.len()
-}
-
-#[cfg(not(feature = "survival"))]
-fn n_discrete_rows(_: &SubjectResult) -> usize {
-    0
-}
-
 fn has_discrete_rows(r: &FitResult) -> bool {
-    r.subjects.iter().any(|s| n_discrete_rows(s) > 0)
+    r.subjects.iter().any(|s| !s.discrete_rows.is_empty())
 }
 
 fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> {
@@ -1461,7 +1446,7 @@ fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> 
         row.push_str(&s.n_obs.to_string());
         if any_discrete {
             row.push(',');
-            row.push_str(&n_discrete_rows(s).to_string());
+            row.push_str(&s.discrete_rows.len().to_string());
         }
         if let Some(k) = mix_k {
             // MIXEST is 1-based; write 0 for a subject that somehow lacks it so
@@ -1731,7 +1716,6 @@ fn write_predictions_csv<W: Write>(
 
 /// `predictions_discrete.csv`: one block of rows per subject with discrete records, in
 /// `ebes.csv` order, sized by that subject's `n_obs_discrete`.
-#[cfg(feature = "survival")]
 fn write_predictions_discrete_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> {
     writeln!(w, "{}", DISCRETE_HEADER.join(","))?;
     for s in &r.subjects {
@@ -1874,13 +1858,9 @@ fn load_fit_with(path: &Path, read_population: bool) -> Result<LoadedFit, FitrxE
     };
 
     let n_eta = wire.omega.matrix.rows;
-    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut subjects = parse_subjects(&ebes_csv, &preds_csv, ebes_kappa_csv.as_deref(), n_eta)?;
-    #[cfg(feature = "survival")]
-    {
-        let discrete_csv = read_optional_text(&mut archive, DISCRETE_ENTRY)?;
-        attach_discrete_rows(&mut subjects, &ebes_csv, discrete_csv.as_deref())?;
-    }
+    let discrete_csv = read_optional_text(&mut archive, DISCRETE_ENTRY)?;
+    attach_discrete_rows(&mut subjects, &ebes_csv, discrete_csv.as_deref())?;
     let ebe_kappas = if let Some(csv) = ebes_kappa_csv.as_deref() {
         parse_ebe_kappas(
             csv,
@@ -2232,7 +2212,6 @@ fn parse_subjects(
             per_obs_tad: vec![],
             compartment_states: vec![],
             // Filled by `attach_discrete_rows` from `predictions_discrete.csv`.
-            #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
             // The bundle has no entry for these (#911), so a restored result has none.
             #[cfg(feature = "survival")]
@@ -2264,11 +2243,10 @@ fn parse_subjects(
     let npde_i = col.get("NPDE").copied();
     let npd_i = col.get("NPD").copied();
     let cens_i = col.get("CENS").copied();
-    // N_OBS is always written by `write_predictions_csv`, but treat it as
-    // optional so a hand-built bundle without it still loads. When present, it
-    // is validated per row against the subject we're filling — the ID order
-    // check alone can't catch two same-ID blocks written in the wrong order.
-    let n_obs_i = col.get("N_OBS").copied();
+    // Validated per row against the subject we're filling: the ID order check alone
+    // can't catch two same-ID blocks written in the wrong order.
+    let n_obs_i = require("N_OBS")?;
+    let n_cols = col.len();
 
     // Rows are written one contiguous block per subject, in the same order as
     // ebes.csv (see `write_predictions_csv`), with exactly `n_obs` rows each.
@@ -2293,9 +2271,14 @@ fn parse_subjects(
             continue;
         }
         let fields = parse_csv_row(line);
-        let id = fields
-            .get(id_i)
-            .ok_or_else(|| FitrxError::Corrupt(format!("predictions.csv row {}: short", i + 1)))?;
+        if fields.len() != n_cols {
+            return Err(FitrxError::Corrupt(format!(
+                "predictions.csv row {} has {} fields, expected {n_cols}",
+                i + 1,
+                fields.len()
+            )));
+        }
+        let id = &fields[id_i];
         // Advance past subjects whose observation block is complete (including
         // zero-observation subjects, which consume no prediction rows).
         while cur < subjects.len() && filled == subjects[cur].n_obs {
@@ -2321,21 +2304,19 @@ fn parse_subjects(
         }
         // Row-level N_OBS guard: catches two same-ID blocks written out of
         // order, where the ID check above passes but the block sizes differ.
-        if let Some(j) = n_obs_i {
-            if let Some(raw) = fields.get(j) {
-                if let Ok(row_n_obs) = raw.parse::<usize>() {
-                    if row_n_obs != subjects[idx].n_obs {
-                        return Err(FitrxError::Corrupt(format!(
-                            "predictions.csv row {}: N_OBS {} disagrees with ebes.csv \
-                             n_obs {} for subject {:?}",
-                            i + 1,
-                            row_n_obs,
-                            subjects[idx].n_obs,
-                            subjects[idx].id
-                        )));
-                    }
-                }
-            }
+        let raw = &fields[n_obs_i];
+        let row_n_obs = raw.parse::<usize>().map_err(|_| {
+            FitrxError::Corrupt(format!("predictions.csv row {}: bad N_OBS {raw:?}", i + 1))
+        })?;
+        if row_n_obs != subjects[idx].n_obs {
+            return Err(FitrxError::Corrupt(format!(
+                "predictions.csv row {}: N_OBS {} disagrees with ebes.csv \
+                 n_obs {} for subject {:?}",
+                i + 1,
+                row_n_obs,
+                subjects[idx].n_obs,
+                subjects[idx].id
+            )));
         }
         subjects[idx].pred.push(parse_opt(&fields[pred_i]));
         subjects[idx].ipred.push(parse_opt(&fields[ipred_i]));
@@ -2383,7 +2364,6 @@ fn parse_subjects(
 /// Fill `discrete_rows` from `predictions_discrete.csv`: each subject's block is the next
 /// `n_obs_discrete` rows, with the row ID as a check, as `predictions.csv` is read. The
 /// column and the entry come together, so either one alone is `Corrupt`.
-#[cfg(feature = "survival")]
 fn attach_discrete_rows(
     subjects: &mut [SubjectResult],
     ebes_csv: &str,
@@ -6641,6 +6621,58 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// #2695 review: `N_OBS` is required and every value is read. Dropping the column or
+    /// blanking one cell would otherwise turn off the guard that catches two same-ID blocks
+    /// in the wrong order, and a short row would index past its fields.
+    #[test]
+    fn predictions_csv_needs_a_readable_n_obs_on_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = saved(&dir, &minimal_fit_result());
+        load_fit(&good).expect("premise: the unedited bundle loads");
+        let edited = dir.path().join("edited.fitrx");
+        let load_with = |edit: &dyn Fn(&str) -> String| {
+            rewrite_bundle(&good, &edited, |name, body| {
+                Some(if name == "predictions.csv" {
+                    edit(std::str::from_utf8(&body).unwrap()).into_bytes()
+                } else {
+                    body
+                })
+            });
+            load_corrupt(load_fit(&edited))
+        };
+        // Drop the column at `at` from every line.
+        let without = |csv: &str, at: usize| -> String {
+            csv.lines()
+                .map(|l| {
+                    let mut f: Vec<&str> = l.split(',').collect();
+                    f.remove(at);
+                    f.join(",") + "\n"
+                })
+                .collect()
+        };
+        let n_obs_col = |csv: &str| {
+            let header = csv.lines().next().unwrap();
+            header.split(',').position(|c| c == "N_OBS").unwrap()
+        };
+        let no_column = load_with(&|csv| without(csv, n_obs_col(csv)));
+        assert_eq!(no_column, "predictions.csv missing column N_OBS");
+        let blank = load_with(&|csv| {
+            let at = n_obs_col(csv);
+            let mut lines: Vec<String> = csv.lines().map(String::from).collect();
+            let mut f: Vec<&str> = lines[2].split(',').collect();
+            f[at] = "";
+            lines[2] = f.join(",");
+            lines.join("\n") + "\n"
+        });
+        assert_eq!(blank, "predictions.csv row 2: bad N_OBS \"\"");
+        let short = load_with(&|csv| {
+            let mut lines: Vec<String> = csv.lines().map(String::from).collect();
+            lines[1] = lines[1].rsplit_once(',').unwrap().0.to_string();
+            lines.join("\n") + "\n"
+        });
+        assert!(short.starts_with("predictions.csv row 1 has "), "{short}");
+    }
+
     /// #2695: `ofv_data` and `ofv_prior` are written for every fit, so an unpriored fit's
     /// reload restores what it held rather than reconstructing it from `ofv`. The fixture
     /// holds a value `ofv` could not have supplied.
@@ -6656,7 +6688,6 @@ mod tests {
         assert_eq!(loaded.ofv_prior, -3.5);
     }
 
-    #[cfg(feature = "survival")]
     fn discrete_row(cmt: usize, time: f64, iwres: f64) -> crate::types::DiscreteObsDiagnostic {
         crate::types::DiscreteObsDiagnostic {
             cmt,
@@ -6671,7 +6702,6 @@ mod tests {
     /// #2695: discrete rows round-trip, each to its own subject. The two subjects share an
     /// ID, so only `n_obs_discrete` can place the rows, and the first has fewer rows than
     /// the second. The doubles need all their digits and one cell is `NaN`.
-    #[cfg(feature = "survival")]
     #[test]
     fn roundtrip_discrete_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -6710,6 +6740,24 @@ mod tests {
         );
     }
 
+    /// #2695 review: the rows outlive a second save, in every build: storing them does not
+    /// need `survival`, which only computes them. Run under both feature sets (the default
+    /// build is the one that used to drop them). Mutation: gate the entry on `survival`
+    /// again → dies in the default build.
+    #[test]
+    fn discrete_rows_survive_a_load_and_re_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        r.subjects[1].discrete_rows = vec![discrete_row(3, 2.5, 0.25)];
+        let loaded = load_fit(&saved(&dir, &r)).unwrap();
+        let again = dir.path().join("again.fitrx");
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&loaded.fit, &p, "src\n", &again, SaveFitOptions::default()).unwrap();
+        let back = load_fit(&again).unwrap().fit;
+        assert!(back.subjects[0].discrete_rows.is_empty());
+        assert_eq!(back.subjects[1].discrete_rows, r.subjects[1].discrete_rows);
+    }
+
     /// The other side of the gate: a fit with no discrete rows has neither the entry nor
     /// the column, so its `ebes.csv` is the plain one.
     #[test]
@@ -6724,7 +6772,6 @@ mod tests {
 
     /// #2695: the count column and the entry vouch for each other, and a row that does not
     /// fit its count is refused rather than given to a neighbour.
-    #[cfg(feature = "survival")]
     #[test]
     fn damaged_discrete_rows_are_corrupt() {
         let dir = tempfile::tempdir().unwrap();

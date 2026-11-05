@@ -543,6 +543,8 @@ ID,TIME,DV,PRED,IPRED,CWRES,IWRES,EBE_OFV,N_OBS[,CENS[,OCC]]
 - `ID` — subject string identifier.
 - One row per observation (MDV=0). Subject rows are contiguous and in the
   same observation order as the underlying data.
+- `N_OBS` is required on every row and must equal the subject's `n_obs` in `ebes.csv`:
+  two subjects may share an ID, so it is what catches blocks written out of order.
 - `CENS` and `OCC` columns are present only when at least one subject in the
   population has censoring or occasions, respectively.
 - NaN values (e.g. CWRES/IWRES for censored observations) are written as
@@ -562,6 +564,9 @@ ID,CMT,TIME,DV,PRED,IPRED,IWRES
   The row `ID` is a check: two subjects may share an ID, so it cannot place a row.
 - `PRED` and `IPRED` are `P(Y = 1)` at η = 0 and at the EBE. `IWRES` is the Pearson
   residual, empty at a degenerate `p`.
+
+Every build reads and re-saves this entry, including one without the `survival` feature,
+which cannot compute these rows.
 
 Time-to-event residuals (`SubjectResult::tte_rows`) have no entry, so sdtab of a
 reloaded fit with a TTE endpoint is refused

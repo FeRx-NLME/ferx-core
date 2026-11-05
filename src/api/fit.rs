@@ -3487,11 +3487,8 @@ fn fit_inner(
         fit_result.se_theta.as_ref(),
         &fit_result.theta_fixed,
     );
-    fit_result.cov_fixed = crate::estimation::parameterization::cov_fixed_mask(
-        init_params,
-        &fit_result.theta_fixed,
-        fit_result.covariance_matrix.as_ref().map(|m| m.nrows()),
-    );
+    fit_result.cov_fixed =
+        crate::estimation::parameterization::cov_fixed_mask(init_params, &fit_result);
 
     Ok(fit_result)
 }
