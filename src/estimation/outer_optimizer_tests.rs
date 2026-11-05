@@ -14929,6 +14929,7 @@ fn a_verified_start_takes_every_point_field_from_the_lower_run() {
             mixture_posteriors: Some(MixturePosteriors {
                 pmix: vec![vec![tag]],
                 mixest: vec![],
+                n_fd_h_redone: 0,
             }),
             converged: tag == 2.0,
             warnings: vec![format!("{tag}")],

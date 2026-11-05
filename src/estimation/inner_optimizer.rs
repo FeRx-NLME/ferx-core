@@ -7357,10 +7357,12 @@ fn fd_jacobian_ode_override(
 ///
 /// A tighter solve can fail where the fit's own does not, and a failed one need not look
 /// failed: a segment that runs out of `ode_max_steps` or `ode_stiff_abort_after` is padded with
-/// its last state, so the difference stays finite. So the pass is accepted only if it is finite
-/// **and** its solver counters show every segment finished. Otherwise it is redone at the fit's
-/// tolerance with the same step, and counted in [`FD_H_REDONE`], which is how
-/// [`fd_h_subjects_redone`] reports it to the user.
+/// its last state, and a step force-accepted at `min_dt` finishes the segment over the error
+/// test, so either way the difference stays finite without meeting the tolerance. So the pass
+/// is accepted only if it is finite and the trajectories it **kept** have no unfinished segment
+/// and no clamped step. An `auto` attempt the guard discarded and re-solved cleanly does not
+/// count against it. Otherwise it is redone at the fit's tolerance with the same step, and
+/// counted in [`FD_H_REDONE`], which is how the fit reports it to the user.
 fn with_fd_jacobian_integration(
     model: &CompiledModel,
     mut difference: impl FnMut(f64) -> DMatrix<f64>,
@@ -7376,8 +7378,10 @@ fn with_fd_jacobian_integration(
             let _tight = crate::ode::solver::arm_ode_solver_override(tight);
             difference(step)
         };
-        let finished = stats.collected().unfinished_segments == 0;
-        if finished && h.iter().all(|v| v.is_finite()) {
+        let solved = stats.collected();
+        let met_tolerance =
+            solved.kept_unfinished_segments() == 0 && solved.kept_clamped_steps() == 0;
+        if met_tolerance && h.iter().all(|v| v.is_finite()) {
             return h;
         }
         FD_H_REDONE.with(|c| c.set(c.get() + 1));
@@ -7391,23 +7395,29 @@ thread_local! {
     static FD_H_REDONE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// FD Jacobians redone on this thread so far: a caller solving one subject serially reads it
+/// on either side of the solve.
+pub(crate) fn fd_h_redone_on_this_thread() -> usize {
+    FD_H_REDONE.with(|c| c.get())
+}
+
 /// How many subjects' `H` at the final estimates ran at the fit's tolerance because the
-/// Jacobian's own could not finish (#2701).
+/// Jacobian's own could not finish (#2701). Not for a `[mixture]` fit, whose objective reads
+/// every contributing class's `H`: `mixture_ofv` counts those as it builds them.
 ///
 /// A second pass over the subjects, because no objective evaluation carries a report out of
 /// the inner loop, and because the reported objective reads this `H` and no earlier one. It
 /// builds `H` through [`ebe_h_matrix_of`], the route the fit took, so a subject on an exact
 /// Jacobian counts nothing, at the cost of one first-order sweep per subject.
 ///
-/// `0` without building anything when no tightening applies. `mixest` binds each subject's
-/// fitted class. A subject the fit reported no EBE or no κ̂ for is skipped.
+/// `0` without building anything when no tightening applies. A subject the fit reported no
+/// EBE or no κ̂ for is skipped.
 pub(crate) fn fd_h_subjects_redone(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     etas: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
-    mixest: Option<&[usize]>,
 ) -> usize {
     use rayon::prelude::*;
     if fd_jacobian_ode_override(model).is_none() {
@@ -7425,12 +7435,9 @@ pub(crate) fn fd_h_subjects_redone(
             if iov_h_route(model, subject) && subject_kappas.is_empty() {
                 return false;
             }
-            let _class = mixest
-                .and_then(|m| m.get(i))
-                .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
-            let before = FD_H_REDONE.with(|c| c.get());
+            let before = fd_h_redone_on_this_thread();
             ebe_h_matrix_of(model, subject, params, eta.as_slice(), subject_kappas);
-            FD_H_REDONE.with(|c| c.get()) > before
+            fd_h_redone_on_this_thread() > before
         })
         .count()
 }

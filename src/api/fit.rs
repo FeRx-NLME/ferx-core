@@ -3062,18 +3062,23 @@ fn fit_inner(
     }
     // The final `H` of an integrated model on the FD route, where the tighter solve the
     // Jacobian runs at could not finish (#2701). That solve is no part of the prediction
-    // pass, so `ode_solver_stats` above cannot see it.
-    if let Some((msg, entry)) = super::postfit::fd_h_not_tightened_warning(
-        crate::estimation::inner_optimizer::fd_h_subjects_redone(
-            model,
-            population,
-            &result.params,
-            &result.eta_hats,
-            &result.kappas,
-            mixest_classes.as_deref(),
-        ),
-        population.subjects.len(),
-    ) {
+    // pass, so `ode_solver_stats` above cannot see it. A mixture's objective reads every
+    // contributing class's `H`, of which `result` keeps one, so its evaluation counted them.
+    let fd_h_redone = result.mixture_posteriors.as_ref().map_or_else(
+        || {
+            crate::estimation::inner_optimizer::fd_h_subjects_redone(
+                model,
+                population,
+                &result.params,
+                &result.eta_hats,
+                &result.kappas,
+            )
+        },
+        |posteriors| posteriors.n_fd_h_redone,
+    );
+    if let Some((msg, entry)) =
+        super::postfit::fd_h_not_tightened_warning(fd_h_redone, population.subjects.len())
+    {
         warnings.push(msg);
         native_warnings.push(entry);
     }

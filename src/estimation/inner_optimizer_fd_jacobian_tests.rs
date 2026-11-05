@@ -481,31 +481,22 @@ fn a_redone_final_h_is_reported_by_the_fit() {
     assert_eq!(scope.collected().unfinished_segments, 0);
     drop(scope);
 
-    assert_eq!(
-        fd_h_subjects_redone(&model, &pop, &params, &etas, &[], None),
-        4
-    );
+    assert_eq!(fd_h_subjects_redone(&model, &pop, &params, &etas, &[]), 4);
     // A subject with no reported EBE is skipped rather than read out of bounds.
     assert_eq!(
-        fd_h_subjects_redone(&model, &pop, &params, &etas[..1], &[], None),
+        fd_h_subjects_redone(&model, &pop, &params, &etas[..1], &[]),
         1
     );
 
     let mut roomy = pinned_chain(1e-1, 1e-1, 100_000);
     roomy.ode_spec.as_mut().unwrap().solver_opts.method = OdeMethod::Rosenbrock23;
     roomy.gradient_method = GradientMethod::Fd;
-    assert_eq!(
-        fd_h_subjects_redone(&roomy, &pop, &params, &etas, &[], None),
-        0
-    );
+    assert_eq!(fd_h_subjects_redone(&roomy, &pop, &params, &etas, &[]), 0);
 
     // Already at the Jacobian's tolerance: nothing to redo, and nothing is built.
     let mut tight = pinned_chain(1e-9, 1e-11, STARVED_MAX_STEPS);
     tight.gradient_method = GradientMethod::Fd;
-    assert_eq!(
-        fd_h_subjects_redone(&tight, &pop, &params, &etas, &[], None),
-        0
-    );
+    assert_eq!(fd_h_subjects_redone(&tight, &pop, &params, &etas, &[]), 0);
 }
 
 /// Under IOV the count runs on the IOV `H`, and a subject with no κ̂ is skipped.
@@ -532,11 +523,11 @@ fn a_redone_final_h_is_counted_under_iov() {
         })
         .collect();
     assert_eq!(
-        fd_h_subjects_redone(&model, &pop, &params, &etas, &kappas, None),
+        fd_h_subjects_redone(&model, &pop, &params, &etas, &kappas),
         2
     );
     assert_eq!(
-        fd_h_subjects_redone(&model, &pop, &params, &etas, &kappas[..1], None),
+        fd_h_subjects_redone(&model, &pop, &params, &etas, &kappas[..1]),
         1
     );
 }
@@ -552,10 +543,7 @@ fn an_exact_h_is_never_counted_as_redone() {
     let etas: Vec<DVector<f64>> = (0..2)
         .map(|i| DVector::from_column_slice(&eta_of(i)))
         .collect();
-    assert_eq!(
-        fd_h_subjects_redone(&model, &pop, &params, &etas, &[], None),
-        0
-    );
+    assert_eq!(fd_h_subjects_redone(&model, &pop, &params, &etas, &[]), 0);
 }
 
 /// End to end: `fit()` carries the warning, typed, in both its channels, and each sentence of
@@ -597,3 +585,154 @@ fn the_fit_warns_when_its_final_h_ran_at_the_fits_tolerance() {
     assert_eq!(classified.category, WarningCode::OdeSolver);
     assert_eq!(classified.severity, WarningSeverity::Warning);
 }
+
+/// #2701 review 2: a pass that clamps at `min_dt` finishes every segment, on real solves, and
+/// still missed the tolerance, so it is redone. Here `min_dt` is set where the fit's tolerance
+/// never reaches it and the Jacobian's does.
+#[test]
+fn a_finished_tight_jacobian_that_clamped_at_min_dt_is_redone() {
+    let mut model = pinned_chain(1e-1, 1e-1, 100_000);
+    let opts = &mut model.ode_spec.as_mut().unwrap().solver_opts;
+    opts.method = OdeMethod::Rk45;
+    opts.min_dt = 1.0;
+    model.gradient_method = GradientMethod::Fd;
+    let pop = chain_population(2);
+    let params = model.default_params.clone();
+    let etas: Vec<DVector<f64>> = (0..2)
+        .map(|i| DVector::from_column_slice(&eta_of(i)))
+        .collect();
+    let mut scratch = pk::EventPkParams::default();
+    let mut solve = |tight: bool| {
+        let override_ = fd_jacobian_ode_override(&model).unwrap();
+        let _armed = tight.then(|| arm_ode_solver_override(override_));
+        let scope = crate::ode::solver::SolverStatsScope::enter();
+        for (s, eta) in pop.subjects.iter().zip(&etas) {
+            pk::compute_predictions_with_tv_into_with_schedule(
+                &model,
+                s,
+                &params.theta,
+                eta.as_slice(),
+                &mut scratch,
+                None,
+            );
+        }
+        scope.collected()
+    };
+    let (fit, tight) = (solve(false), solve(true));
+    assert_eq!(
+        fit.kept_clamped_steps(),
+        0,
+        "the fixture's fit must be clean"
+    );
+    assert!(tight.kept_clamped_steps() > 0, "the tight solve must clamp");
+    assert_eq!(tight.kept_unfinished_segments(), 0, "and still finish");
+    assert_eq!(fd_h_subjects_redone(&model, &pop, &params, &etas, &[]), 2);
+}
+
+/// #2701 review 2: acceptance reads what the caller received. A clamp or an unfinished segment
+/// inside an `auto` attempt the guard discarded leaves a clean trajectory.
+#[test]
+fn only_kept_trajectories_count_against_a_tight_pass() {
+    use crate::ode::solver::OdeSolverStats;
+    let discarded = OdeSolverStats {
+        min_step_clamped_steps: 3,
+        discarded_clamped_steps: 3,
+        unfinished_segments: 2,
+        discarded_unfinished_segments: 2,
+        ..Default::default()
+    };
+    assert_eq!(discarded.kept_clamped_steps(), 0);
+    assert_eq!(discarded.kept_unfinished_segments(), 0);
+    let kept = OdeSolverStats {
+        min_step_clamped_steps: 4,
+        discarded_clamped_steps: 3,
+        unfinished_segments: 3,
+        discarded_unfinished_segments: 2,
+        ..Default::default()
+    };
+    assert_eq!(kept.kept_clamped_steps(), 1);
+    assert_eq!(kept.kept_unfinished_segments(), 1);
+}
+
+const CLASS_CHAIN: &str = "
+[parameters]
+  theta TSLOPE(15.0, 0.01, 1000.0)
+  theta TMTT(120.0, 10.0, 500.0)
+  theta TC0(5.0, 0.1, 50.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_SLOPE ~ 0.3
+  omega ETA_MTT ~ 0.05
+  omega ETA_C ~ 0.1
+  sigma S ~ 100.0 (sd)
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+";
+
+/// #2701 review 2: a mixture's OFV is a log-sum-exp over every class, so a non-winning class
+/// that carries weight and fell back is reported though its subject's MIXEST class did not.
+/// Class 2 runs a much faster chain, so only its tight solves reach `min_dt`.
+#[test]
+fn a_mixture_counts_a_redone_h_in_a_contributing_non_winning_class() {
+    use crate::types::FitOptions;
+    let chain = CHAIN.replace(" KAPPA_TERM", "").replace(
+        "MTT   = TMTT * exp(ETA_MTT)",
+        "MTT   = if (MIXNUM == 1) TMTT * exp(ETA_MTT) else TMTT * exp(ETA_MTT) / CLASS_RATIO",
+    );
+    let build = |ratio: &str, min_dt: f64| {
+        let mut model = parse_model_string(&format!(
+            "{CLASS_CHAIN}{}",
+            chain.replace("CLASS_RATIO", ratio)
+        ))
+        .expect("the class chain parses");
+        let opts = &mut model.ode_spec.as_mut().unwrap().solver_opts;
+        opts.reltol = 1e-1;
+        opts.abstol = 1e-1;
+        opts.max_steps = 100_000;
+        opts.min_dt = min_dt;
+        opts.method = OdeMethod::Rk45;
+        model.gradient_method = GradientMethod::Fd;
+        model
+    };
+    let mut pop = chain_population(2);
+    for s in &mut pop.subjects {
+        s.occasions = Vec::new();
+        s.dose_occasions = Vec::new();
+    }
+    // The data are class 1's typical curve, so class 1 wins every subject.
+    let model = build("20.0", MIXTURE_MIN_DT);
+    let params = model.default_params.clone();
+    let mut scratch = pk::EventPkParams::default();
+    for s in &mut pop.subjects {
+        let _class = crate::parser::model_parser::MixtureClassGuard::enter(1);
+        s.observations = pk::compute_predictions_with_tv_into_with_schedule(
+            &model,
+            s,
+            &params.theta,
+            &[0.0; 3],
+            &mut scratch,
+            None,
+        );
+    }
+    let options = FitOptions {
+        run_covariance_step: false,
+        interaction: true,
+        inner_maxiter: 20,
+        inner_restarts: 0,
+        ..FitOptions::default()
+    };
+    let eval = crate::estimation::mixture::mixture_ofv(&model, &pop, &params, &options, None);
+    assert!(eval.mixest.iter().all(|&c| c == 0), "{:?}", eval.mixest);
+    assert!(eval.pmix.iter().all(|p| p[1] > 1e-6), "{:?}", eval.pmix);
+    assert_eq!(eval.n_fd_h_redone, 2);
+
+    // Class 1 alone does not fall back, so the count above is class 2's.
+    let same = build("1.0", MIXTURE_MIN_DT);
+    let eval = crate::estimation::mixture::mixture_ofv(&same, &pop, &params, &options, None);
+    assert_eq!(eval.n_fd_h_redone, 0);
+}
+
+/// Measured on this fixture: below 0.03 class 2's tight solves stop clamping, and at 0.3 class
+/// 1's start to.
+const MIXTURE_MIN_DT: f64 = 0.1;

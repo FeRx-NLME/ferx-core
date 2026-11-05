@@ -57,6 +57,9 @@ pub struct MixtureEval {
     pub etas_by_class: Vec<Vec<DVector<f64>>>,
     /// Inner-loop stats aggregated over each subject's winning class.
     pub ebe_stats: InnerLoopStats,
+    /// Subjects with a contributing class whose FD Jacobian ran at the fit's tolerance
+    /// because its own tighter solve could not finish (#2701).
+    pub(crate) n_fd_h_redone: usize,
 }
 
 /// A class-`k` (0-based) view of `params`: base theta / FIX flags, with the
@@ -169,6 +172,7 @@ pub(crate) fn mixture_ofv_with_modes(
     let mut fallback: Vec<Vec<bool>> = vec![vec![false; n]; k];
     let mut nm_polished: Vec<Vec<bool>> = vec![vec![false; n]; k];
     let mut hard_reject: Vec<Vec<bool>> = vec![vec![false; n]; k];
+    let mut fd_h_redone: Vec<Vec<bool>> = vec![vec![false; n]; k];
 
     for cls in 0..k {
         // MIXNUM = cls+1 for the whole class solve (serial → thread-local safe).
@@ -182,6 +186,7 @@ pub(crate) fn mixture_ofv_with_modes(
                 .and_then(|w| w.get(cls))
                 .and_then(|wc| wc.get(i))
                 .map(|e| e.as_slice());
+            let redone_before = crate::estimation::inner_optimizer::fd_h_redone_on_this_thread();
             let ebe = find_ebe_for_stage(
                 model,
                 subject,
@@ -193,6 +198,8 @@ pub(crate) fn mixture_ofv_with_modes(
                 options.inner_restarts,
                 options,
             );
+            fd_h_redone[cls][i] =
+                crate::estimation::inner_optimizer::fd_h_redone_on_this_thread() > redone_before;
             // Inter-occasion variability (#985): `find_ebe` already routes to the
             // IOV inner solve when `n_kappa > 0` (each class carries the shared base
             // `omega_iov`, since `class_params` only swaps Ω/Σ), so `ebe.kappas` are
@@ -253,6 +260,7 @@ pub(crate) fn mixture_ofv_with_modes(
     let mut mixest_kappas = Vec::with_capacity(n);
     let (mut n_unconverged, mut n_fallback, mut n_start_rejected) = (0usize, 0usize, 0usize);
     let mut n_nm_polished = 0usize;
+    let mut n_fd_h_redone = 0usize;
 
     for (i, subject) in population.subjects.iter().enumerate() {
         let logp = eval_mixing_log_probs(spec, &params.theta, &subject.covariates);
@@ -282,6 +290,10 @@ pub(crate) fn mixture_ofv_with_modes(
         if any_contributing(&reject_i, &probs) {
             n_start_rejected += 1;
         }
+        let fd_h_redone_i: Vec<bool> = (0..k).map(|cls| fd_h_redone[cls][i]).collect();
+        if any_contributing(&fd_h_redone_i, &probs) {
+            n_fd_h_redone += 1;
+        }
         mixest_etas.push(etas_by_class[best][i].clone());
         mixest_h_mats.push(hmats_by_class[best][i].clone());
         mixest_kappas.push(kappas_by_class[best][i].clone());
@@ -303,6 +315,7 @@ pub(crate) fn mixture_ofv_with_modes(
             n_nm_polished,
             n_start_rejected,
         },
+        n_fd_h_redone,
     };
     let modes = MixtureClassModes {
         h_mats: hmats_by_class,

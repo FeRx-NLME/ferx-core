@@ -3953,9 +3953,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // clause below. They are reported through `auto_stiff_rejected` instead. A stall *is* the
     // rejection trigger, so without this subtraction every rejected escalation would be told
     // its predictions were padded when the guard had just repaired them.
-    let clamped = stats
-        .min_step_clamped_steps
-        .saturating_sub(stats.discarded_clamped_steps);
+    let clamped = stats.kept_clamped_steps();
     let rejected = stats.auto_stiff_rejected;
     // The rejections only a dual solve could have taken (#1204), carried here from the
     // post-fit *sensitivity* sweep — `fit_inner` collects that sweep in its own scope and
@@ -3968,9 +3966,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // Like clamps, an unfinished stiff attempt that the guard discarded did not reach the
     // caller. Only the explicit fallback (or a named/kept method) belongs in the returned-
     // trajectory clause.
-    let unfinished_kept = stats
-        .unfinished_segments
-        .saturating_sub(stats.discarded_unfinished_segments);
+    let unfinished_kept = stats.kept_unfinished_segments();
     let aborted = stats.stiff_aborted_segments;
     // `unfinished_kept` is a roll-up: a segment abandoned by `ode_stiff_abort_after` stops
     // while `t < tf`, so it is *also* an unfinished segment, and the abort clause below already
