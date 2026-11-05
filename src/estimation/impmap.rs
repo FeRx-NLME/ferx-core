@@ -37,13 +37,16 @@
 //! them. Use FOCE / FOCEI for those.
 
 use crate::estimation::covariate_mu_ref::{resolve_covariate_mu_groups, GroupStepInput};
-use crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov;
+use crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov_with_schedule;
 use crate::estimation::importance_sampling::{
     build_joint_omega_inv, compute_joint_posterior_hessian, compute_posterior_hessian,
     find_optimal_iscale, find_optimal_iscale_with, subject_is_draws, subject_is_draws_with,
     SubjectDraws, MIX_ESS_PMIX_FLOOR,
 };
-use crate::estimation::inner_optimizer::{find_ebe, EbeResult, InnerLoopStats};
+use crate::estimation::inner_optimizer::{
+    build_schedule_cache, cacheable_schedule, cacheable_schedule_iov, find_ebe, EbeResult,
+    InnerLoopStats,
+};
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
 use crate::estimation::saem::{
@@ -51,8 +54,9 @@ use crate::estimation::saem::{
     get_mixture_mu_ref_pairs, mixture_mu_ref_means, mu_ref_pairs_for_cov_groups, MixtureMuRefPairs,
     MuRefPairs,
 };
+use crate::pk::event_driven::EventSchedule;
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::obs_nll_subject_into;
+use crate::stats::likelihood::obs_nll_subject_into_with_schedule;
 use crate::stats::stacked_layout::{kappa_range, stacked_width};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -78,6 +82,210 @@ const AUTO_STDOBJ_TARGET: f64 = 0.05;
 
 /// Hard cap on the adaptive per-subject sample count (NONMEM `ISAMPEND` default).
 const AUTO_SAMPLES_MAX: usize = 10_000;
+
+/// Iterations in each of the two windows [`objective_settled`] compares. Five
+/// puts the first possible raise at iteration 10, and a window mean carries
+/// `√(1/5)` of one iteration's noise.
+const AUTO_SETTLE_WINDOW: usize = 5;
+
+/// Headroom on the sample count a raise aims for, over the count the current
+/// per-subject SE says would just meet the target. The SE of one iteration is
+/// itself noisy, so an exact aim would land on the target and raise again.
+const AUTO_RAISE_HEADROOM: f64 = 1.1;
+
+/// How far `SE²·K` may grow past its value at the first raise before [`raises_pay`]
+/// refuses further raises.
+const AUTO_SCALE_GROWTH_LIMIT: f64 = 2.0;
+
+/// Whether the MCEM objective has stopped moving, as far as Monte-Carlo noise
+/// can tell: the means of the last two [`AUTO_SETTLE_WINDOW`]-iteration windows
+/// differ by no more than two standard errors of that difference, taken from the
+/// current total objective SE (#2687).
+///
+/// This is the ascent-based MCEM idea (Caffo, Jank & Jones 2005): more draws pay
+/// once the change in the objective is lost in the noise, not while a cold start
+/// is descending by tens of units an iteration. The test uses the *estimated* SE
+/// on purpose. A fit whose objective wanders far beyond that SE, as cefepime does
+/// at ±20 against a total SE near 3, is not held to be settled, and gets its
+/// samples when [`auto_hold_ends`] says so.
+fn objective_settled(objectives: &[f64], total_mc_se: f64) -> bool {
+    let w = AUTO_SETTLE_WINDOW;
+    if objectives.len() < 2 * w {
+        return false;
+    }
+    let (older, recent) = objectives[objectives.len() - 2 * w..].split_at(w);
+    let mean = |x: &[f64]| x.iter().sum::<f64>() / w as f64;
+    // Written so a `NaN` on either side reads as "not settled".
+    (mean(recent) - mean(older)).abs() <= 2.0 * total_mc_se * (2.0 / w as f64).sqrt()
+}
+
+/// The iteration after which `auto` may raise K whether or not the objective has
+/// settled: the one before the averaging window, whose iterations make up the
+/// reported estimate, so a fit that never settles still has them sampled to the
+/// target. The hold covers at most the first three quarters of the run, so
+/// `averaging = 1` does not leave the raise one iteration to work with, and at
+/// least the first half, so an averaging window as long as a short run does not
+/// switch the hold off (#2687).
+fn auto_hold_ends(n_iter: usize, n_avg: usize) -> usize {
+    n_iter - n_avg.clamp(n_iter / 4, n_iter / 2)
+}
+
+/// The per-subject SE `auto` acts on at a sample count of `k`: the median of
+/// `SE²·K` over the last [`AUTO_SETTLE_WINDOW`] iterations, which `SE² ∝ 1/K` makes
+/// comparable across a change of K, rescaled to `k`.
+///
+/// One iteration's SE is not enough to act on. It is dominated by the few subjects
+/// with the worst ESS, and on cefepime it swung between 0.018 and 0.094 from one
+/// iteration to the next, which halved K on one iteration and doubled it on the
+/// following one (#2687).
+fn windowed_se(se_times_k: &[(f64, usize)], k: usize) -> f64 {
+    let tail = &se_times_k[se_times_k.len().saturating_sub(AUTO_SETTLE_WINDOW)..];
+    let mut scaled: Vec<f64> = tail.iter().map(|&(se, n)| se * se * n as f64).collect();
+    scaled.sort_by(f64::total_cmp);
+    match scaled.get(scaled.len() / 2) {
+        Some(&median) => (median / k as f64).sqrt(),
+        None => f64::NAN,
+    }
+}
+
+/// Whether raising K is still doing what a raise assumes.
+///
+/// `SE² ∝ 1/K` makes `SE²·K` constant, so a raise sized from it lands on the
+/// target. Once that product has grown by [`AUTO_SCALE_GROWTH_LIMIT`] since the
+/// first raise the assumption has failed, and following the SE only walks K to the
+/// cap: on cefepime the SE was 0.071 at K = 1000 and 0.083 at K = 6912, and K = 10000
+/// cost ten times as much per iteration for no lower SE (#2687). The limit leaves
+/// a run whose SE does scale untouched, since its product stays where it was and its
+/// target K sits below the largest K this allows, about `2.2 ×` the one the first
+/// raise asked for.
+///
+/// The baseline is the window before K first left `k_start`. It holds across a later
+/// lowering, and a product that falls back under the limit allows raises again.
+fn raises_pay(se_history: &[(f64, usize)], k_start: usize) -> bool {
+    let Some(first_raise) = se_history.iter().position(|&(_, k)| k > k_start) else {
+        return true;
+    };
+    let scale_at = |history: &[(f64, usize)]| windowed_se(history, 1).powi(2);
+    scale_at(se_history) < AUTO_SCALE_GROWTH_LIMIT * scale_at(&se_history[..first_raise])
+}
+
+/// The sample count for the next iteration under `auto` (#2687).
+///
+/// Above [`AUTO_STDOBJ_TARGET`], and only when `may_raise`, K rises to what the
+/// SE asks for (`SE² ∝ 1/K`) with [`AUTO_RAISE_HEADROOM`], at most doubling and at
+/// most [`AUTO_SAMPLES_MAX`]; sizing the step keeps an SE that only just misses
+/// the target from doubling the cost of every later iteration. Below half the
+/// target K halves, but never below the configured `k_start`. Halving a count
+/// that sits under half the target predicts an SE of `0.71 ×` target, so on a
+/// stable [`windowed_se`] a lowering does not call for a raise.
+fn next_sample_count(k: usize, k_start: usize, se_per_subject: f64, may_raise: bool) -> usize {
+    if se_per_subject > AUTO_STDOBJ_TARGET {
+        if !may_raise {
+            return k;
+        }
+        let ratio = se_per_subject / AUTO_STDOBJ_TARGET;
+        let wanted = (k as f64 * ratio * ratio * AUTO_RAISE_HEADROOM).ceil() as usize;
+        wanted.min(k.saturating_mul(2)).min(AUTO_SAMPLES_MAX).max(k)
+    } else if se_per_subject < 0.5 * AUTO_STDOBJ_TARGET {
+        (k / 2).max(k_start).min(k)
+    } else {
+        k
+    }
+}
+
+/// The closing advice of the under-sampling warning. Under `auto`, a final count
+/// below the cap means either [`raises_pay`] stopped the ramp or the run ran out of iterations rather than out of samples, which the hold on
+/// raising makes a real case (#2687).
+fn under_sampling_advice(
+    auto: bool,
+    final_k: usize,
+    se_history: &[(f64, usize)],
+    k_start: usize,
+    sample_opt: &str,
+    auto_opt: &str,
+) -> String {
+    if auto && final_k >= AUTO_SAMPLES_MAX {
+        format!(
+            "`{auto_opt}` is enabled but the sample count {final_k} (cap {AUTO_SAMPLES_MAX}) \
+             was not enough to reach the MC-SE target."
+        )
+    } else if auto && !raises_pay(se_history, k_start) {
+        format!(
+            "`{auto_opt}` stopped raising the sample count at {final_k}, below the cap of \
+             {AUTO_SAMPLES_MAX}, because extra samples were not lowering the MC SE as they \
+             should. A larger `{sample_opt}` is unlikely to help."
+        )
+    } else if auto {
+        format!(
+            "`{auto_opt}` is enabled but the run ended at {final_k} samples, below the cap of \
+             {AUTO_SAMPLES_MAX}, before the count could reach the MC-SE target. Raise \
+             `{sample_opt}` or give the fit more iterations."
+        )
+    } else {
+        format!(
+            "Raise `{sample_opt}` (high-dimensional / FREM models typically need several \
+             thousand) or set `{auto_opt} = true` to ramp it automatically."
+        )
+    }
+}
+
+/// One `auto` decision after an iteration: the next K, and the [`windowed_se`] it
+/// was made on. `se_history` ends with the iteration just run, whose K is current;
+/// `hold_over` is whether [`auto_hold_ends`] has passed.
+fn auto_step(
+    objectives: &[f64],
+    se_history: &[(f64, usize)],
+    k_start: usize,
+    n_subjects: usize,
+    hold_over: bool,
+) -> (usize, f64) {
+    let k = se_history.last().map_or(k_start, |&(_, k)| k);
+    let se = windowed_se(se_history, k);
+    let total_se = se * (n_subjects.max(1) as f64).sqrt();
+    let may_raise =
+        (hold_over || objective_settled(objectives, total_se)) && raises_pay(se_history, k_start);
+    (next_sample_count(k, k_start, se, may_raise), se)
+}
+
+/// Refuse an unusable wall-clock limit rather than let a `NaN` never trip it.
+fn check_max_time(label: &str, key: &str, limit: Option<f64>) -> Result<(), String> {
+    match limit {
+        Some(s) if !(s.is_finite() && s > 0.0) => Err(format!(
+            "{label}: `{key}` must be a positive number of seconds, got {s}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Seconds elapsed once the wall-clock limit has passed; `None` while there is
+/// time left, or when no limit is set.
+fn time_limit_reached(started: std::time::Instant, limit: Option<f64>) -> Option<f64> {
+    let elapsed = started.elapsed().as_secs_f64();
+    limit.filter(|&s| elapsed >= s).map(|_| elapsed)
+}
+
+/// The warning that explains a fit stopped by `imp_max_time` / `impmap_max_time`.
+/// `n_acc` is how many iterations of the averaging window were reached, which
+/// decides what the reported estimate is.
+fn time_limit_warning(
+    label: &str,
+    key: &str,
+    elapsed: f64,
+    iterations_done: usize,
+    n_iter: usize,
+    n_acc: usize,
+) -> String {
+    let estimate = if n_acc > 0 {
+        format!("the mean of the {n_acc} averaging iteration(s) reached")
+    } else {
+        "the last iteration's parameters, unaveraged".to_string()
+    };
+    format!(
+        "{label}: stopped by `{key}` after {elapsed:.1} s, at iteration {iterations_done} of \
+         {n_iter}. The reported estimate is {estimate}. The fit did not finish its schedule, \
+         so it is reported as not converged."
+    )
+}
 
 /// Absolute lower bound on the IMP proposal-covariance diagonal — a numerical
 /// guard against a literally-zero (degenerate-ESS) variance, NOT a statistical
@@ -219,6 +427,14 @@ impl ProposalRecenter {
         match self {
             ProposalRecenter::Map => EstimationMethod::Impmap,
             ProposalRecenter::SampleMoments => EstimationMethod::Imp,
+        }
+    }
+
+    /// The `[fit_options]` key of this method's wall-clock limit.
+    fn max_time_key(self) -> &'static str {
+        match self {
+            ProposalRecenter::Map => "impmap_max_time",
+            ProposalRecenter::SampleMoments => "imp_max_time",
         }
     }
 }
@@ -734,6 +950,7 @@ pub fn run_impmap(
         options.impmap_sobol,
         options.impmap_trace,
         options.impmap_auto,
+        options.impmap_max_time,
     )
 }
 
@@ -767,6 +984,7 @@ pub fn run_imp(
         options.imp_sobol,
         false, // collect_trace: IMP has no trace option
         options.imp_auto,
+        options.imp_max_time,
     )
 }
 
@@ -842,13 +1060,17 @@ fn run_mcem(
     use_sobol: bool,
     collect_trace: bool,
     auto: bool,
+    max_time: Option<f64>,
 ) -> Result<OuterResult, String> {
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
     let n_theta = init_params.theta.len();
     let n_sigma = init_params.sigma.values.len();
+    let started = std::time::Instant::now();
+    let max_time_key = recenter.max_time_key();
 
     // ---- Validation ----
+    check_max_time(label, max_time_key, max_time)?;
     check_sobol_config(
         label,
         df_key,
@@ -881,6 +1103,7 @@ fn run_mcem(
             use_sobol,
             collect_trace,
             auto,
+            max_time,
         );
     }
     if recenter.method().requires_random_effects() && n_eta == 0 {
@@ -931,9 +1154,10 @@ fn run_mcem(
     }
 
     let n_iter = n_iter_opt.max(1);
-    // `k_samples` is mutable so the adaptive (`auto`) path can ramp it up between
+    // `k_samples` is mutable so the adaptive (`auto`) path can move it between
     // iterations when the objective is too Monte-Carlo-noisy (NONMEM `AUTO`).
-    let mut k_samples = k_opt.max(2);
+    let k_start = k_opt.max(2);
+    let mut k_samples = k_start;
     // `INFINITY` selects the multivariate-normal proposal; anything else must be
     // a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
     // bypasses the parser's range check can't reach the `ChiSquared::new(nu)`
@@ -945,6 +1169,7 @@ fn run_mcem(
         ));
     }
     let n_avg = n_avg_opt.min(n_iter);
+    let auto_hold_end = auto_hold_ends(n_iter, n_avg);
     let verbose = options.verbose;
     let cancel = &options.cancel;
 
@@ -1225,6 +1450,7 @@ fn run_mcem(
             }
         })
         .collect();
+    let schedules = mcem_schedule_cache(model, population, &n_occ_of);
     // MAP warm starts, stacked `[η̂, κ̂₁..κ̂_K]` for an IOV subject so κ is
     // warm-started too. A chained stage's η-only warm start leaves κ at 0.
     let mut prev_etas: Option<Vec<DVector<f64>>> = warm_etas.map(|e| e.to_vec());
@@ -1284,6 +1510,12 @@ fn run_mcem(
 
     // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
     let mut lowest_iteration_objective: Option<f64> = None;
+    // Every iteration's −2 log L and (per-subject SE, K), for `auto`.
+    let mut iteration_objectives: Vec<f64> = Vec::with_capacity(n_iter);
+    let mut iteration_se: Vec<(f64, usize)> = Vec::with_capacity(n_iter);
+    // Iterations actually run, and the seconds at which `max_time` stopped them.
+    let mut iterations_done = 0usize;
+    let mut stopped_after: Option<f64> = None;
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             if verbose {
@@ -1430,7 +1662,7 @@ fn run_mcem(
                     let theta = &params_k.theta;
                     let sigma = &params_k.sigma.values;
                     let obs_nll = |b: &[f64], sc: &mut EventPkParams| {
-                        draw_obs_nll(model, subject, theta, sigma, b, sc)
+                        draw_obs_nll(model, subject, theta, sigma, b, schedules[i].as_ref(), sc)
                     };
                     let iscale = find_optimal_iscale_with(
                         &obs_nll,
@@ -1572,6 +1804,7 @@ fn run_mcem(
                     scratch,
                     iscale_min,
                     iscale_max,
+                    schedules[i].as_ref(),
                 );
                 subject_is_draws(
                     model,
@@ -1590,6 +1823,7 @@ fn run_mcem(
                     iscale,
                     use_sobol,
                     defensive_mixture.as_ref(),
+                    schedules[i].as_ref(),
                 )
             })
             .collect();
@@ -1634,14 +1868,29 @@ fn run_mcem(
         let mc_se_per_subject = mc_se / (ess_fracs.len().max(1) as f64).sqrt();
         final_mc_se = mc_se_per_subject;
         final_k_samples = k_samples;
-        // Adaptive sampling (NONMEM `AUTO`): ramp K up (×2, capped) while the
-        // objective is too MC-noisy, so the M-step is driven by signal not noise.
-        if auto && mc_se_per_subject > AUTO_STDOBJ_TARGET && k_samples < AUTO_SAMPLES_MAX {
-            let new_k = (k_samples.saturating_mul(2)).min(AUTO_SAMPLES_MAX);
-            if verbose {
+        iteration_objectives.push(minus2ll);
+        // Adaptive sampling (NONMEM `AUTO`): move K so the M-step is driven by
+        // signal, not noise. Raising waits for the objective to settle, because
+        // early in a run the proposal lags the parameters and the SE reflects that
+        // lag, not what the converged fit needs (#2687).
+        if auto {
+            iteration_se.push((mc_se_per_subject, k_samples));
+            let (new_k, se) = auto_step(
+                &iteration_objectives,
+                &iteration_se,
+                k_start,
+                ess_fracs.len(),
+                k >= auto_hold_end,
+            );
+            if verbose && new_k != k_samples {
+                let verb = if new_k > k_samples {
+                    "raising"
+                } else {
+                    "lowering"
+                };
                 eprintln!(
-                    "{label}: auto-sampling — per-subject objective MC SE {mc_se_per_subject:.3} \
-                     > {AUTO_STDOBJ_TARGET:.2}, raising K {k_samples} → {new_k}"
+                    "{label}: auto-sampling — iteration {k}, per-subject objective MC SE \
+                     {se:.3} (target {AUTO_STDOBJ_TARGET:.2}), {verb} K {k_samples} → {new_k}"
                 );
             }
             k_samples = new_k;
@@ -1745,6 +1994,7 @@ fn run_mcem(
             model,
             population,
             &draws,
+            &schedules,
             &log_theta,
             &log_sigma,
             &mstep_theta_lower,
@@ -1863,7 +2113,13 @@ fn run_mcem(
                                     let mut e2 = eta.clone();
                                     group.shift_eta(&mut e2, shifts, i);
                                     s += w * draw_obs_nll(
-                                        model, subject, th, &sigma_now, &e2, scratch,
+                                        model,
+                                        subject,
+                                        th,
+                                        &sigma_now,
+                                        &e2,
+                                        schedules[i].as_ref(),
+                                        scratch,
                                     );
                                 }
                                 s
@@ -1980,10 +2236,28 @@ fn run_mcem(
                 k, minus2ll, n_low_ess
             );
         }
+
+        iterations_done = k;
+        if k < n_iter {
+            stopped_after = time_limit_reached(started, max_time);
+            if stopped_after.is_some() {
+                break;
+            }
+        }
     }
 
     if crate::cancel::is_cancelled(cancel) {
         return Err("cancelled by user".to_string());
+    }
+    if let Some(elapsed) = stopped_after {
+        warnings.push(time_limit_warning(
+            label,
+            max_time_key,
+            elapsed,
+            iterations_done,
+            n_iter,
+            n_acc,
+        ));
     }
 
     // ---- Importance-sampling bias warning ----
@@ -2028,18 +2302,14 @@ fn run_mcem(
         } else {
             String::new()
         };
-        let advice = if auto {
-            format!(
-                "`{auto_opt}` is enabled but the sample count {} (cap {AUTO_SAMPLES_MAX}) \
-                 was not enough to reach the MC-SE target.",
-                final_k_samples
-            )
-        } else {
-            format!(
-                "Raise `{sample_opt}` (high-dimensional / FREM models typically need several \
-                 thousand) or set `{auto_opt} = true` to ramp it automatically."
-            )
-        };
+        let advice = under_sampling_advice(
+            auto,
+            final_k_samples,
+            &iteration_se,
+            k_start,
+            sample_opt,
+            auto_opt,
+        );
         warnings.push(format!(
             "{label}: {} importance samples for {} give a noisy objective \
              (per-subject MC SE = {:.3}, target {:.2}; median ESS/K = {:.2}). The weighted M-step \
@@ -2078,7 +2348,7 @@ fn run_mcem(
              importance-weighted M-step alone, or not at all; check them against a FOCEI fit \
              and consider bounding the covariate slope (#619).",
             skipped,
-            n_iter,
+            iterations_done,
             names.join(", ")
         ));
     }
@@ -2256,7 +2526,7 @@ fn run_mcem(
     // #1303: both rules now live in `gate_converged_on_mcem_objective`, which also
     // *says* which one fired — the verdict used to be a bare boolean with nothing
     // in `warnings` to explain it.
-    let mut converged = true;
+    let mut converged = stopped_after.is_none();
     if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
         warnings.push(w);
     }
@@ -2269,7 +2539,7 @@ fn run_mcem(
         params: final_params,
         ofv,
         converged,
-        n_iterations: n_iter,
+        n_iterations: iterations_done,
         eta_hats,
         h_matrices,
         kappas: final_kappas,
@@ -2337,6 +2607,7 @@ fn run_mcem_mixture(
     use_sobol: bool,
     collect_trace: bool,
     auto: bool,
+    max_time: Option<f64>,
 ) -> Result<OuterResult, String> {
     use crate::estimation::importance_sampling::{
         compute_posterior_hessian, subject_is_draws, DefensiveMixture,
@@ -2392,6 +2663,7 @@ fn run_mcem_mixture(
         ));
     }
 
+    let started = std::time::Instant::now();
     let n_iter = n_iter_opt.max(1);
     let k_samples = k_opt.max(2);
     let n_avg = n_avg_opt.min(n_iter);
@@ -2675,6 +2947,7 @@ fn run_mcem_mixture(
         ));
     }
 
+    let schedules = build_schedule_cache(model, population);
     let mut theta_cur = init_params.theta.clone();
     let mut sigma_cur = init_params.sigma.values.clone();
     let mut omega_mat = init_params.omega.matrix.clone();
@@ -2711,6 +2984,9 @@ fn run_mcem_mixture(
 
     // The lowest −2 log L any iteration reached, for `fit()`'s rise check (#2652).
     let mut lowest_iteration_objective: Option<f64> = None;
+    // Iterations actually run, and the seconds at which `max_time` stopped them.
+    let mut iterations_done = 0usize;
+    let mut stopped_after: Option<f64> = None;
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             break;
@@ -2853,6 +3129,7 @@ fn run_mcem_mixture(
                         scratch,
                         options.iscale_min,
                         options.iscale_max,
+                        schedules[i].as_ref(),
                     );
                     let d = subject_is_draws(
                         model,
@@ -2871,6 +3148,7 @@ fn run_mcem_mixture(
                         iscale,
                         use_sobol,
                         defensive.as_ref(),
+                        schedules[i].as_ref(),
                     );
                     nll[c] = -d.log_marginal;
                     class_draws.push(d);
@@ -2970,6 +3248,7 @@ fn run_mcem_mixture(
             model,
             population,
             &draws_by_class,
+            &schedules,
             &pmix,
             &log_theta,
             &log_sigma,
@@ -3088,6 +3367,14 @@ fn run_mcem_mixture(
         } else {
             None
         };
+
+        iterations_done = k;
+        if k < n_iter {
+            stopped_after = time_limit_reached(started, max_time);
+            if stopped_after.is_some() {
+                break;
+            }
+        }
     }
 
     // A cancel observed inside (or at the top of) the loop breaks out with
@@ -3096,6 +3383,16 @@ fn run_mcem_mixture(
     // rather than paying for them and handing back a bogus `Ok` (#992 review).
     if crate::cancel::is_cancelled(cancel) {
         return Err("cancelled by user".to_string());
+    }
+    if let Some(elapsed) = stopped_after {
+        warnings.push(time_limit_warning(
+            label,
+            recenter.max_time_key(),
+            elapsed,
+            iterations_done,
+            n_iter,
+            n_acc,
+        ));
     }
 
     if !empty_class_theta.is_empty() {
@@ -3201,7 +3498,7 @@ fn run_mcem_mixture(
     warnings.extend(cov_warnings);
 
     // #1303 / #528 — the same two rules as the single-population exit above.
-    let mut converged = true;
+    let mut converged = stopped_after.is_none();
     if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
         warnings.push(w);
     }
@@ -3214,7 +3511,7 @@ fn run_mcem_mixture(
         params: final_params,
         ofv,
         converged,
-        n_iterations: n_iter,
+        n_iterations: iterations_done,
         eta_hats,
         h_matrices,
         kappas: final_kappas,
@@ -3315,23 +3612,28 @@ fn stack_eta_kappa(eta: &DVector<f64>, kappas: &[DVector<f64>]) -> DVector<f64> 
 
 /// The joint prior `Ω ⊕ I_K ⊗ Ω_iov` of an IOV subject with `K` occasions, the
 /// pieces of it the E-step reads, and its defensive component (#2301).
-struct JointPrior {
+pub(crate) struct JointPrior {
     /// `(Ω ⊕ I_K ⊗ Ω_iov)⁻¹`.
-    inv: DMatrix<f64>,
+    pub(crate) inv: DMatrix<f64>,
     /// `log det Ω + K · log det Ω_iov`.
-    log_det: f64,
+    pub(crate) log_det: f64,
     /// `Ω ⊕ I_K ⊗ Ω_iov`, the IMP proposal-covariance cap.
     matrix: DMatrix<f64>,
-    mixture: Option<crate::estimation::importance_sampling::DefensiveMixture>,
+    pub(crate) mixture: Option<crate::estimation::importance_sampling::DefensiveMixture>,
 }
 
 /// One [`JointPrior`] per distinct occasion count in the population, built once
 /// per MCEM iteration — the IOV twin of sharing the η-only defensive component
 /// across subjects (#528).
-struct JointPriors(std::collections::BTreeMap<usize, JointPrior>);
+pub(crate) struct JointPriors(std::collections::BTreeMap<usize, JointPrior>);
 
 impl JointPriors {
-    fn build(omega: &OmegaMatrix, iov: &OmegaMatrix, n_occ_of: &[usize], alpha: f64) -> Self {
+    pub(crate) fn build(
+        omega: &OmegaMatrix,
+        iov: &OmegaMatrix,
+        n_occ_of: &[usize],
+        alpha: f64,
+    ) -> Self {
         let (n_eta, n_kappa) = (omega.matrix.nrows(), iov.matrix.nrows());
         let mut map = std::collections::BTreeMap::new();
         for &n_occ in n_occ_of.iter().filter(|&&k| k > 0) {
@@ -3357,7 +3659,7 @@ impl JointPriors {
         Self(map)
     }
 
-    fn get(&self, n_occ: usize) -> &JointPrior {
+    pub(crate) fn get(&self, n_occ: usize) -> &JointPrior {
         &self.0[&n_occ]
     }
 }
@@ -3393,6 +3695,7 @@ pub(crate) fn draw_obs_nll(
     theta: &[f64],
     sigma: &[f64],
     b: &[f64],
+    schedule: Option<&EventSchedule>,
     scratch: &mut EventPkParams,
 ) -> f64 {
     let n_eta = model.n_eta;
@@ -3402,7 +3705,7 @@ pub(crate) fn draw_obs_nll(
         KAPPA_SPLIT.with(|buf| {
             let mut buf = buf.borrow_mut();
             let n_occ = split_kappas(&b[n_eta..], model.n_kappa, &mut buf);
-            obs_nll_subject_into_iov(
+            obs_nll_subject_into_iov_with_schedule(
                 model,
                 subject,
                 theta,
@@ -3410,10 +3713,11 @@ pub(crate) fn draw_obs_nll(
                 &b[..n_eta],
                 &buf[..n_occ],
                 scratch,
+                schedule,
             )
         })
     } else {
-        obs_nll_subject_into(
+        obs_nll_subject_into_with_schedule(
             model,
             subject,
             theta,
@@ -3421,8 +3725,34 @@ pub(crate) fn draw_obs_nll(
             model.residual_cov_theta(theta),
             b,
             scratch,
+            schedule,
         )
     }
+}
+
+/// Each subject's cached event schedule for the MCEM scoring loops, `None` where
+/// reuse is unsound. The E-step and the M-steps score every draw, so a subject on
+/// the event-driven walk would otherwise rebuild its schedule K times per
+/// evaluation; on vancomycin and infliximab (time-varying covariates) that rebuild
+/// was the largest single cost of a fixed-K run (#2687). An IOV subject walks the
+/// IOV funnel whatever its covariates, hence its own gate.
+fn mcem_schedule_cache(
+    model: &CompiledModel,
+    population: &Population,
+    n_occ_of: &[usize],
+) -> Vec<Option<EventSchedule>> {
+    population
+        .subjects
+        .iter()
+        .zip(n_occ_of)
+        .map(|(subject, &n_occ)| {
+            if n_occ > 0 {
+                cacheable_schedule_iov(model, subject)
+            } else {
+                cacheable_schedule(model, subject)
+            }
+        })
+        .collect()
 }
 
 /// Closed-form Ω_iov M-step (#2301): the importance-weighted second moment of
@@ -3490,6 +3820,7 @@ fn weighted_mstep_objective(
     model: &CompiledModel,
     population: &Population,
     draws: &[SubjectDraws],
+    schedules: &[Option<EventSchedule>],
     theta: &[f64],
     sigma: &[f64],
 ) -> f64 {
@@ -3501,16 +3832,28 @@ fn weighted_mstep_objective(
         .subjects
         .par_iter()
         .zip(draws.par_iter())
-        .map_init(EventPkParams::default, |scratch, (subject, d)| {
-            let mut s = 0.0f64;
-            for (w, b) in d.weights.iter().zip(d.etas.iter()) {
-                if *w == 0.0 {
-                    continue;
+        .zip(schedules.par_iter())
+        .map_init(
+            EventPkParams::default,
+            |scratch, ((subject, d), schedule)| {
+                let mut s = 0.0f64;
+                for (w, b) in d.weights.iter().zip(d.etas.iter()) {
+                    if *w == 0.0 {
+                        continue;
+                    }
+                    s += w * draw_obs_nll(
+                        model,
+                        subject,
+                        theta,
+                        sigma,
+                        b,
+                        schedule.as_ref(),
+                        scratch,
+                    );
                 }
-                s += w * draw_obs_nll(model, subject, theta, sigma, b, scratch);
-            }
-            s
-        })
+                s
+            },
+        )
         .collect();
     let val: f64 = per_subj.iter().sum();
     if val.is_finite() {
@@ -3530,6 +3873,7 @@ fn theta_sigma_weighted_mstep(
     model: &CompiledModel,
     population: &Population,
     draws: &[crate::estimation::importance_sampling::SubjectDraws],
+    schedules: &[Option<EventSchedule>],
     log_theta_init: &[f64],
     log_sigma_init: &[f64],
     log_theta_lower: &[f64],
@@ -3575,7 +3919,7 @@ fn theta_sigma_weighted_mstep(
     let obj = |xv: &[f64], _: Option<&mut [f64]>, _: &mut ()| -> f64 {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
-        weighted_mstep_objective(model, population, draws, &th, &sg)
+        weighted_mstep_objective(model, population, draws, schedules, &th, &sg)
     };
 
     let mut opt = nlopt::Nlopt::new(
@@ -3613,6 +3957,7 @@ fn theta_sigma_weighted_mstep_mixture(
     model: &CompiledModel,
     population: &Population,
     draws: &[Vec<crate::estimation::importance_sampling::SubjectDraws>],
+    schedules: &[Option<EventSchedule>],
     pmix: &[Vec<f64>],
     log_theta_init: &[f64],
     log_sigma_init: &[f64],
@@ -3675,7 +4020,7 @@ fn theta_sigma_weighted_mstep_mixture(
                         if *w == 0.0 {
                             continue;
                         }
-                        sc += w * obs_nll_subject_into(
+                        sc += w * obs_nll_subject_into_with_schedule(
                             model,
                             subject,
                             &th,
@@ -3683,6 +4028,7 @@ fn theta_sigma_weighted_mstep_mixture(
                             model.residual_cov_theta(&th),
                             eta,
                             scratch,
+                            schedules[i].as_ref(),
                         );
                     }
                     s += p * sc;
@@ -5716,6 +6062,7 @@ mod tests {
             &model,
             &pop,
             &draws_by_class,
+            &vec![None; pop.subjects.len()],
             &pmix,
             &log_theta,
             &log_sigma,
@@ -5852,7 +6199,7 @@ mod tests {
         let mut scratch = EventPkParams::default();
         let eta = [0.1, -0.05, 0.2];
 
-        let plain = obs_nll_subject_into(
+        let plain = obs_nll_subject_into_with_schedule(
             &model,
             subject,
             theta,
@@ -5860,20 +6207,21 @@ mod tests {
             model.residual_cov_theta(theta),
             &eta,
             &mut scratch,
+            None,
         );
-        let eta_only = draw_obs_nll(&model, subject, theta, sigma, &eta, &mut scratch);
+        let eta_only = draw_obs_nll(&model, subject, theta, sigma, &eta, None, &mut scratch);
         assert_eq!(eta_only, plain, "an η-only sample is scored unchanged");
 
         let mut b = eta.to_vec();
         b.extend([0.0, 0.0]);
-        let at_zero = draw_obs_nll(&model, subject, theta, sigma, &b, &mut scratch);
+        let at_zero = draw_obs_nll(&model, subject, theta, sigma, &b, None, &mut scratch);
         assert!(
             (at_zero - plain).abs() < 1e-9 * plain.abs().max(1.0),
             "κ = 0 must reproduce the η-only NLL: {at_zero} vs {plain}"
         );
 
         b[eta.len() + 1] = 0.5; // κ on the second occasion only
-        let moved = draw_obs_nll(&model, subject, theta, sigma, &b, &mut scratch);
+        let moved = draw_obs_nll(&model, subject, theta, sigma, &b, None, &mut scratch);
         assert!(
             (moved - at_zero).abs() > 1e-3,
             "a non-zero κ must change the score: {moved} vs {at_zero}"
@@ -5908,8 +6256,11 @@ mod tests {
                 })
                 .collect()
         };
-        let live = weighted_mstep_objective(&model, &pop, &draws_with(0.3), theta, sigma);
-        let zero = weighted_mstep_objective(&model, &pop, &draws_with(0.0), theta, sigma);
+        let no_schedules = vec![None; pop.subjects.len()];
+        let live =
+            weighted_mstep_objective(&model, &pop, &draws_with(0.3), &no_schedules, theta, sigma);
+        let zero =
+            weighted_mstep_objective(&model, &pop, &draws_with(0.0), &no_schedules, theta, sigma);
         assert!(
             live.is_finite() && live < 1e19,
             "objective must be real: {live}"
@@ -6087,9 +6438,146 @@ mod tests {
         .expect("joint IS on an IOV model")
     }
 
-    /// An adaptive evaluation of a joint (η, κ) subject samples through
-    /// `subject_is_draws_with`, so `subject_is_estimate_joint` is an independent
-    /// check on it: separate likelihood code, separate proposal.
+    /// `run_importance_sampling` at `params` with 2000 samples around the EBEs
+    /// found there, after `tweak` has adjusted the evaluator's options.
+    fn is_at_with(
+        model: &CompiledModel,
+        pop: &Population,
+        params: &ModelParameters,
+        tweak: impl Fn(&mut FitOptions),
+    ) -> ImportanceSamplingResult {
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 2000;
+        opts.imp_seed = Some(5);
+        // The single-proposal evaluator: what the kernels under test run with no
+        // adaptive pilots (#2653) in front of them.
+        opts.imp_adapt_passes = 0;
+        tweak(&mut opts);
+        let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
+        let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
+            model,
+            pop,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            &mu_k,
+            0,
+            11,
+            1,
+        );
+        crate::estimation::importance_sampling::run_importance_sampling(
+            model,
+            pop,
+            params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &opts,
+        )
+        .expect("IS evaluation")
+    }
+
+    /// warfarin_iov with its κ removed: the same data, scored by the η-only
+    /// evaluator kernel.
+    fn eta_only_model() -> CompiledModel {
+        let src = include_str!("../../examples/warfarin_iov.ferx")
+            .replace("  kappa KAPPA_CL ~ 0.01\n", "")
+            .replace(" + KAPPA_CL", "");
+        let model = crate::parser::model_parser::parse_full_model(&src)
+            .expect("parses")
+            .model;
+        assert_eq!(model.n_kappa, 0, "the κ edit must take");
+        model
+    }
+
+    /// `imp_eval_only` with `imp_proposal_df = normal` (parsed to `f64::INFINITY`)
+    /// is a documented setting. The evaluator once carried its own Student-t-only
+    /// sampler, whose density constant at ν = ∞ is `lnΓ(∞) − lnΓ(∞) = NaN`, so the
+    /// readout was not a number. Both kernels are covered — η-only, and the joint
+    /// (η, κ) one an IOV subject takes — each against its own t₅ readout, which
+    /// estimates the same marginal from a different proposal.
+    #[test]
+    fn imp_eval_with_a_normal_proposal_agrees_with_the_student_t_readout() {
+        let pop = iov_pop();
+        for (name, model) in [("eta-only", eta_only_model()), ("iov", iov_model())] {
+            let params = model.default_params.clone();
+            let t5 = is_at_with(&model, &pop, &params, |o| o.imp_proposal_df = 5.0);
+            let mvn = is_at_with(&model, &pop, &params, |o| o.imp_proposal_df = f64::INFINITY);
+            assert!(
+                mvn.minus2_log_likelihood.is_finite() && mvn.mc_standard_error.is_finite(),
+                "{name}: normal-proposal readout {} ± {}",
+                mvn.minus2_log_likelihood,
+                mvn.mc_standard_error
+            );
+            assert!(t5.minus2_log_likelihood.is_finite(), "{name}: t5 readout");
+            let gap = (mvn.minus2_log_likelihood - t5.minus2_log_likelihood).abs();
+            eprintln!(
+                "{name}: normal {} ± {} (ess_min {}), t5 {} ± {}; gap {gap}",
+                mvn.minus2_log_likelihood,
+                mvn.mc_standard_error,
+                mvn.ess_min,
+                t5.minus2_log_likelihood,
+                t5.mc_standard_error
+            );
+            // A ν = ∞ quietly mapped to a finite df would make the "normal" readout
+            // the t₅ one: gap 0, inside the bound. The normal branch draws no χ², so
+            // the two streams always differ.
+            assert_ne!(
+                mvn.minus2_log_likelihood.to_bits(),
+                t5.minus2_log_likelihood.to_bits(),
+                "{name}: the normal readout is the t5 one — ν = ∞ never reached the sampler"
+            );
+            assert!(mvn.ess_min > 0.0, "{name}: ess_min {}", mvn.ess_min);
+            assert!(gap < NORMAL_VS_T5_GAP_BOUND, "{name}: gap {gap}");
+        }
+    }
+
+    /// Normal vs t₅ readouts of one marginal, at warfarin_iov's start values.
+    /// Measured (Linux x86_64, K = 2000): 0.319 (η-only) and 0.495 (IOV), 3–4
+    /// combined MC SEs: at the start values the light-tailed normal proposal
+    /// under-covers the posterior, which biases its readout up and makes its
+    /// ESS-based SE optimistic (at SAEM's estimates the CLI gap is 0.01–0.05). 1.0
+    /// is 2× the worst; the pre-fix normal readout was not finite at all.
+    const NORMAL_VS_T5_GAP_BOUND: f64 = 1.0;
+
+    /// α = 0.2 vs α = 0 on warfarin_iov at the start values. Measured (Linux
+    /// x86_64, K = 2000): 0.059, against MC SEs of 0.10 / 0.13. 0.15 is 2.5× that,
+    /// and still well below a mis-scored mixture (the `assert_ne` alone passes on
+    /// the changed RNG stream, so this bound is what checks the mixture density).
+    const ALPHA_GAP_BOUND: f64 = 0.15;
+
+    /// `imp_defensive_alpha` reaches the joint (η, κ) evaluator. The IOV kernel
+    /// once had its own sampler that took no mixture, so α changed nothing for an
+    /// IOV subject. α > 0 must move the readout (a different proposal) and stay
+    /// within Monte-Carlo error of α = 0 (the same marginal).
+    #[test]
+    fn imp_eval_defensive_mixture_reaches_iov_subjects() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = model.default_params.clone();
+        let plain = is_at_with(&model, &pop, &params, |_| {});
+        let mixed = is_at_with(&model, &pop, &params, |o| o.imp_defensive_alpha = 0.2);
+        let gap = (mixed.minus2_log_likelihood - plain.minus2_log_likelihood).abs();
+        eprintln!(
+            "α=0 {} ± {}, α=0.2 {} ± {}; gap {gap}",
+            plain.minus2_log_likelihood,
+            plain.mc_standard_error,
+            mixed.minus2_log_likelihood,
+            mixed.mc_standard_error
+        );
+        assert_ne!(
+            mixed.minus2_log_likelihood.to_bits(),
+            plain.minus2_log_likelihood.to_bits(),
+            "α = 0.2 left the IOV readout unchanged"
+        );
+        assert!(gap < ALPHA_GAP_BOUND, "gap {gap}");
+    }
+
+    /// The adaptive and the single-proposal evaluation of a joint (η, κ) subject
+    /// draw from different proposals, so their marginals must agree within MC
+    /// error. Since #2627 both share the sampler and the per-draw scorer, so this
+    /// pins the adaptation's wiring, not a second likelihood implementation.
     #[test]
     fn adapted_joint_marginal_agrees_with_the_single_proposal_estimator() {
         let model = iov_model();
@@ -6102,10 +6590,13 @@ mod tests {
 
     /// The trace −2LL of an IOV fit is the joint (η, κ) marginal. Iteration 1's
     /// E-step runs at the start values, so its row must agree with
-    /// `run_importance_sampling`, a separate joint estimator
-    /// (`subject_is_estimate_joint`), at the same parameters. Dropping the
-    /// `n_occ · log det Ω_iov` term from `log_det_joint` moves the trace by
-    /// `Σᵢ Kᵢ · |ln det Ω_iov|`, far outside the bound below.
+    /// `run_importance_sampling` at the same parameters. The two share the sampler,
+    /// the per-draw scorer and the joint prior (`JointPriors`), so what this pins
+    /// is the rest of the wiring: each side's own MAP solve, proposal Hessian and
+    /// (E-step) ISCALE search must land on the same marginal. The prior's
+    /// `K · log det Ω_iov` term is pinned directly by
+    /// `joint_priors_match_the_per_subject_construction_for_each_occasion_count`;
+    /// the `m1_shift` check below only confirms the fixture would make it visible.
     #[test]
     fn impmap_iov_trace_ofv_matches_the_joint_is_marginal() {
         let model = iov_model();
@@ -6406,7 +6897,15 @@ mod tests {
         let mut scratch = EventPkParams::default();
         let fresh = |subject: &Subject, b: &[f64], scratch: &mut EventPkParams| {
             let kappas: Vec<Vec<f64>> = b[3..].chunks(1).map(<[f64]>::to_vec).collect();
-            obs_nll_subject_into_iov(&model, subject, theta, sigma, &b[..3], &kappas, scratch)
+            crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov(
+                &model,
+                subject,
+                theta,
+                sigma,
+                &b[..3],
+                &kappas,
+                scratch,
+            )
         };
         // warfarin_iov subjects all have two occasions; a copy with every record
         // on its first occasion has one.
@@ -6435,7 +6934,7 @@ mod tests {
                 (0..widths[n])
                     .map(|g| 0.03 * (g as f64 + 1.0) * if n % 4 < 2 { 1.0 } else { -1.0 }),
             );
-            let got = draw_obs_nll(&model, subject, theta, sigma, &b, &mut scratch);
+            let got = draw_obs_nll(&model, subject, theta, sigma, &b, None, &mut scratch);
             assert!(got.is_finite());
             assert_eq!(
                 got,
@@ -6460,5 +6959,572 @@ mod tests {
         assert_eq!(split_kappas(&[7.0, 8.0], 2, &mut buf), 1);
         assert_eq!(buf[..1], [vec![7.0, 8.0]]);
         assert_eq!(buf.len(), 3, "the wider sample's allocations are kept");
+    }
+
+    // ---- `auto` sample count and wall-clock limit (#2687) ----
+
+    #[test]
+    fn objective_settled_needs_two_full_windows() {
+        let flat = vec![-250.0; 2 * AUTO_SETTLE_WINDOW - 1];
+        assert!(!objective_settled(&flat, 1.0));
+        let flat = vec![-250.0; 2 * AUTO_SETTLE_WINDOW];
+        assert!(objective_settled(&flat, 1.0));
+    }
+
+    #[test]
+    fn objective_settled_compares_the_last_two_windows_to_the_mc_se() {
+        // Thioguanine's iterations 1-10: a descent of hundreds against a total SE
+        // near 2.8 (0.5 per subject, 31 subjects).
+        let cold = [
+            65.7, -86.8, -145.2, -177.6, -212.4, -231.0, -240.0, -245.0, -247.0, -248.4,
+        ];
+        assert!(!objective_settled(&cold, 2.8));
+        // Only the last 2w iterations count: the same descent followed by a plateau.
+        let mut settled = cold.to_vec();
+        settled.extend([-250.3, -250.1, -250.4, -250.2, -250.3]);
+        settled.extend([-250.2, -250.4, -250.1, -250.3, -250.3]);
+        assert!(objective_settled(&settled, 0.33));
+        // The bound on a window-mean step of 1: 2·SE·√(2/5) straddles it at SE ≈ 0.79.
+        let step: Vec<f64> = [[0.0; 5], [1.0; 5]].concat();
+        assert!(!objective_settled(&step, 0.78));
+        assert!(objective_settled(&step, 0.80));
+        // A rise is movement as well.
+        let rise: Vec<f64> = [[1.0; 5], [0.0; 5]].concat();
+        assert!(!objective_settled(&rise, 0.78));
+    }
+
+    #[test]
+    fn objective_settled_reads_a_nan_as_unsettled() {
+        let mut o = vec![1.0; 2 * AUTO_SETTLE_WINDOW];
+        assert!(!objective_settled(&o, f64::NAN));
+        o[9] = f64::NAN;
+        assert!(!objective_settled(&o, 1.0));
+    }
+
+    #[test]
+    fn auto_hold_ends_before_the_averaging_window_within_its_bounds() {
+        assert_eq!(auto_hold_ends(200, 50), 150, "the default: the window");
+        assert_eq!(auto_hold_ends(200, 1), 150, "at most 3/4 of the run");
+        assert_eq!(auto_hold_ends(200, 150), 100, "at least 1/2 of the run");
+        assert_eq!(auto_hold_ends(6, 6), 3);
+        assert_eq!(auto_hold_ends(1, 1), 1);
+    }
+
+    #[test]
+    fn windowed_se_takes_the_median_over_the_window() {
+        // A spike in either direction does not move it.
+        let spike = [
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.5, 1000),
+            (0.05, 1000),
+            (0.001, 1000),
+        ];
+        assert!((windowed_se(&spike, 1000) - 0.05).abs() < 1e-12);
+        // Only the last window counts.
+        let old = [
+            (9.0, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+            (0.05, 1000),
+        ];
+        assert!((windowed_se(&old, 1000) - 0.05).abs() < 1e-12);
+        // A short history still answers, and an empty one reads as no signal.
+        assert!((windowed_se(&[(0.2, 100)], 100) - 0.2).abs() < 1e-12);
+        assert!(windowed_se(&[], 100).is_nan());
+    }
+
+    #[test]
+    fn windowed_se_rescales_across_a_change_of_k() {
+        // The same per-draw variance, sampled at K and then 4K: the SE halves, and
+        // the window reads one value at each count.
+        let h = [
+            (0.2, 1000),
+            (0.2, 1000),
+            (0.1, 4000),
+            (0.1, 4000),
+            (0.1, 4000),
+        ];
+        assert!((windowed_se(&h, 4000) - 0.1).abs() < 1e-12);
+        assert!((windowed_se(&h, 1000) - 0.2).abs() < 1e-12);
+    }
+
+    /// Cefepime's trace at iterations 30-35: neither the one quiet iteration among
+    /// noisy ones nor the one noisy iteration among quiet ones moves K. Read off the
+    /// last iteration's SE, the first would halve K and the second double it.
+    #[test]
+    fn auto_step_does_not_act_on_a_single_iteration() {
+        let flat = vec![4290.0; 10];
+        let k = 4000;
+        let quiet = [(0.04, k), (0.04, k), (0.04, k), (0.04, k), (0.02, k)];
+        assert_eq!(auto_step(&flat, &quiet, 1000, 458, true).0, k);
+        let noisy = [(0.04, k), (0.04, k), (0.04, k), (0.04, k), (0.09, k)];
+        assert_eq!(auto_step(&flat, &noisy, 1000, 458, true).0, k);
+    }
+
+    /// The hold, through the same decision the loop makes: above the target K waits
+    /// for a settled objective or the end of the hold, and takes either.
+    #[test]
+    fn auto_step_raises_once_settled_or_once_the_hold_is_over() {
+        let k = 1000;
+        let se = [(0.1, k); 5];
+        let descending: Vec<f64> = (0..10).map(|i| 1000.0 - 50.0 * i as f64).collect();
+        let settled = vec![500.0; 10];
+        assert_eq!(auto_step(&descending, &se, k, 100, false).0, k);
+        assert_eq!(auto_step(&settled, &se, k, 100, false).0, 2 * k);
+        assert_eq!(auto_step(&descending, &se, k, 100, true).0, 2 * k);
+    }
+
+    /// The settled test reads the total SE, √N times the per-subject one: this step
+    /// of 1 is inside the noise of 100 subjects at 0.1 and outside that of one.
+    #[test]
+    fn auto_step_scales_the_settled_test_by_the_subject_count() {
+        let k = 1000;
+        let se = [(0.1, k); 5];
+        let step: Vec<f64> = [[0.0; 5], [1.0; 5]].concat();
+        assert_eq!(auto_step(&step, &se, k, 100, false).0, 2 * k);
+        assert_eq!(auto_step(&step, &se, k, 1, false).0, k);
+    }
+
+    #[test]
+    fn next_sample_count_raises_only_when_allowed() {
+        assert_eq!(next_sample_count(1000, 1000, 0.5, false), 1000);
+        assert_eq!(next_sample_count(1000, 1000, 0.5, true), 2000);
+    }
+
+    #[test]
+    fn next_sample_count_sizes_the_raise_to_the_se() {
+        // Cefepime's `0.050 > 0.05`: an SE that only just misses the target used
+        // to double K. SE² ∝ 1/K asks for 2 % more, and the headroom adds 10 %.
+        assert_eq!(next_sample_count(4000, 1000, 0.0505, true), 4489);
+        // Doubling and the cap both still bound the step.
+        assert_eq!(next_sample_count(4000, 1000, 0.09, true), 8000);
+        assert_eq!(next_sample_count(8000, 1000, 0.09, true), AUTO_SAMPLES_MAX);
+        assert_eq!(
+            next_sample_count(AUTO_SAMPLES_MAX, 1000, 0.09, true),
+            AUTO_SAMPLES_MAX
+        );
+        // A configured count above the cap is the user's, and `auto` keeps it.
+        assert_eq!(next_sample_count(20_000, 20_000, 0.09, true), 20_000);
+    }
+
+    #[test]
+    fn next_sample_count_lowers_to_no_less_than_the_start() {
+        assert_eq!(next_sample_count(4000, 1000, 0.02, false), 2000);
+        assert_eq!(next_sample_count(1500, 1000, 0.02, true), 1000);
+        assert_eq!(next_sample_count(1000, 1000, 0.02, true), 1000);
+    }
+
+    #[test]
+    fn next_sample_count_holds_between_half_the_target_and_the_target() {
+        for se in [0.5 * AUTO_STDOBJ_TARGET, 0.04, AUTO_STDOBJ_TARGET, f64::NAN] {
+            assert_eq!(next_sample_count(4000, 1000, se, true), 4000, "se = {se}");
+        }
+    }
+
+    #[test]
+    fn under_sampling_advice_names_what_ran_out() {
+        let advice = |auto, k, stopped| {
+            let mut history = at_scale(5.0, 1000, 5);
+            history.extend(at_scale(if stopped { 11.0 } else { 5.0 }, 2000, 5));
+            under_sampling_advice(auto, k, &history, 1000, "imp_samples", "imp_auto")
+        };
+        let at_cap = advice(true, AUTO_SAMPLES_MAX, false);
+        assert!(at_cap.contains("was not enough") && !at_cap.contains("below the cap"));
+        // Reaching the cap is the story even if the last raises were refused.
+        assert_eq!(advice(true, AUTO_SAMPLES_MAX, true), at_cap);
+        let stopped = advice(true, 2000, true);
+        assert!(
+            stopped.contains("stopped raising the sample count at 2000")
+                && stopped.contains("not lowering the MC SE")
+                && stopped.contains("larger `imp_samples` is unlikely to help")
+                && !stopped.contains("more iterations"),
+            "{stopped}"
+        );
+        // The flag only means something under `auto`.
+        assert_eq!(advice(false, 2000, true), advice(false, 2000, false));
+        let short = advice(true, 2000, false);
+        assert!(
+            short.contains("ended at 2000 samples")
+                && short.contains("`imp_samples`")
+                && short.contains("more iterations")
+                && !short.contains("was not enough"),
+            "{short}"
+        );
+        let fixed = advice(false, 2000, false);
+        assert!(fixed.contains("`imp_auto = true`") && !fixed.contains("is enabled"));
+    }
+
+    /// `n` iterations at `k` with a constant `SE²·K` of `scale`.
+    fn at_scale(scale: f64, k: usize, n: usize) -> Vec<(f64, usize)> {
+        vec![((scale / k as f64).sqrt(), k); n]
+    }
+
+    #[test]
+    fn raises_pay_while_the_scale_stays_under_the_limit() {
+        // No raise yet: nothing to compare against, whatever the SE.
+        assert!(raises_pay(&at_scale(50.0, 1000, 5), 1000));
+        let mut h = at_scale(5.0, 1000, 5);
+        // SE² ∝ 1/K holds: the SE fell with the raise.
+        h.extend(at_scale(5.0, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+        h.extend(at_scale(9.9, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+        h.extend(at_scale(10.1, 2000, 5));
+        assert!(!raises_pay(&h, 1000));
+    }
+
+    #[test]
+    fn raises_pay_measures_from_the_first_raise_and_keeps_that_baseline() {
+        // Scale 5 before the first raise, 8 after, then K back at the start. The
+        // baseline stays 5, so 11 is over the limit, and against the 8 of the second
+        // visit to K = 2000 it would not be.
+        let mut h = at_scale(5.0, 1000, 5);
+        h.extend(at_scale(8.0, 2000, 5));
+        h.extend(at_scale(8.0, 1000, 5));
+        h.extend(at_scale(8.0, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+        h.extend(at_scale(11.0, 2000, 5));
+        assert!(!raises_pay(&h, 1000));
+        // The product falling back reopens raising.
+        h.extend(at_scale(6.0, 2000, 5));
+        assert!(raises_pay(&h, 1000));
+    }
+
+    #[test]
+    fn raises_pay_baseline_is_a_window_not_the_last_iteration() {
+        // The last iteration before the raise spiked to 100; the window median is 5.
+        let mut h = at_scale(5.0, 1000, 4);
+        h.extend(at_scale(100.0, 1000, 1));
+        h.extend(at_scale(11.0, 2000, 5));
+        assert!(!raises_pay(&h, 1000));
+    }
+
+    #[test]
+    fn auto_step_stops_raising_when_the_se_does_not_fall_with_k() {
+        // The cefepime shape: SE 0.071 at K = 1000 and still 0.072 at K = 2000.
+        let flat = vec![4276.0; 20];
+        let mut h = vec![(0.071, 1000); 5];
+        h.extend(vec![(0.072, 2000); 5]);
+        assert_eq!(auto_step(&flat, &h, 1000, 458, true).0, 2000);
+        // The twin whose SE did fall with K, still over target, keeps ramping.
+        let mut paying = vec![(0.071, 1000); 5];
+        paying.extend(vec![(0.0515, 2000); 5]);
+        assert!(auto_step(&flat, &paying, 1000, 458, true).0 > 2000);
+    }
+
+    #[test]
+    fn auto_step_still_lowers_after_raises_stopped() {
+        let flat = vec![4276.0; 20];
+        // Scale 1.25 at K = 500, then 4.84 at the cap: raises stopped, SE under half
+        // the target.
+        let mut h = vec![(0.05, 500); 5];
+        h.extend(vec![(0.022, AUTO_SAMPLES_MAX); 5]);
+        assert!(!raises_pay(&h, 500));
+        assert_eq!(auto_step(&flat, &h, 500, 458, true).0, AUTO_SAMPLES_MAX / 2);
+    }
+
+    /// `WT` changes within each subject, so scoring takes the event-driven walk,
+    /// and σ is free, so the weighted M-step runs.
+    fn tv_fixture() -> (CompiledModel, Population) {
+        use std::io::Write;
+        let model = crate::parser::model_parser::parse_full_model(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma EPS ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * (WT / 70.0)^0.75 * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+        )
+        .expect("model parses")
+        .model;
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,WT\n");
+        for id in 1..=6 {
+            let cl = 0.8 + 0.1 * id as f64;
+            csv.push_str(&format!("{id},0,0,100,1,1,60\n"));
+            for (j, t) in [0.5_f64, 1.0, 2.0, 4.0, 8.0].iter().enumerate() {
+                let dv = 10.0 * (-(cl / 10.0) * t).exp() * (1.0 + 0.03 * ((id + j) as f64).sin());
+                csv.push_str(&format!("{id},{t},{dv:.5},0,0,1,{}\n", 60 + 5 * j));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(f.path(), Some(&["WT"]), None).unwrap();
+        (model, pop)
+    }
+
+    fn tv_imp_options(iterations: usize) -> FitOptions {
+        FitOptions {
+            method: EstimationMethod::Imp,
+            imp_iterations: iterations,
+            imp_samples: 30,
+            imp_averaging: 1,
+            imp_auto: false,
+            imp_seed: Some(2687),
+            run_covariance_step: false,
+            ..FitOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_cached_schedule_scores_a_draw_as_the_rebuilt_one_does() {
+        let (model, pop) = tv_fixture();
+        let schedules = mcem_schedule_cache(&model, &pop, &vec![0; pop.subjects.len()]);
+        assert!(schedules.iter().all(Option::is_some), "premise: cacheable");
+        let theta = &model.default_params.theta;
+        let sigma = &model.default_params.sigma.values;
+        let mut scratch = EventPkParams::default();
+        for (subject, schedule) in pop.subjects.iter().zip(&schedules) {
+            let eta = [0.2, -0.1];
+            let cached = draw_obs_nll(
+                &model,
+                subject,
+                theta,
+                sigma,
+                &eta,
+                schedule.as_ref(),
+                &mut scratch,
+            );
+            let rebuilt = draw_obs_nll(&model, subject, theta, sigma, &eta, None, &mut scratch);
+            assert!(cached.is_finite());
+            assert_eq!(cached.to_bits(), rebuilt.to_bits());
+        }
+    }
+
+    #[test]
+    fn mcem_schedule_cache_uses_the_iov_gate_for_a_subject_with_occasions() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let n = pop.subjects.len();
+        assert!(
+            pop.subjects.iter().all(|s| !s.has_tv_covariates()),
+            "premise: nothing but the IOV gate admits these subjects"
+        );
+        let with_occasions = mcem_schedule_cache(&model, &pop, &vec![2; n]);
+        assert!(with_occasions.iter().all(Option::is_some));
+        let without = mcem_schedule_cache(&model, &pop, &vec![0; n]);
+        assert!(without.iter().all(Option::is_none));
+    }
+
+    /// The E-step pilot, the E-step draws and the M-step all run every iteration,
+    /// so a rebuild in any of them makes the count grow with `imp_iterations`.
+    /// Equality of the fits cannot see that (#1452).
+    #[test]
+    fn imp_schedule_builds_do_not_grow_with_iterations() {
+        use crate::pk::event_driven::{reset_schedule_build_count, schedule_build_count};
+        let (model, pop) = tv_fixture();
+        let count = |iterations: usize| -> u64 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                reset_schedule_build_count();
+                let opts = tv_imp_options(iterations);
+                run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
+                schedule_build_count()
+            })
+        };
+        let (short, long) = (count(2), count(6));
+        assert!(
+            long - short < pop.subjects.len() as u64,
+            "schedule builds grew from {short} to {long} over 4 extra iterations"
+        );
+    }
+
+    /// The same cold start with the hold in force: 12 iterations from K = 8, with
+    /// the hold ending at iteration 9, leave room for three raises. Raising from
+    /// iteration 1 would reach the cap of 10000.
+    #[test]
+    fn imp_auto_holds_a_cold_start_and_raises_when_the_hold_ends() {
+        let (model, pop) = tv_fixture();
+        let opts = FitOptions {
+            imp_iterations: 12,
+            imp_averaging: 3,
+            imp_samples: 8,
+            imp_auto: true,
+            ..tv_imp_options(12)
+        };
+        let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
+        let warning = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("give a noisy objective"))
+            .unwrap_or_else(|| panic!("no under-sampling warning: {:?}", res.warnings));
+        let k: usize = warning
+            .strip_prefix("IMP: ")
+            .and_then(|w| w.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no K in {warning}"));
+        assert!(k > 8 && k <= 64, "final K = {k}");
+        assert!(warning.contains("below the cap"), "{warning}");
+    }
+
+    #[test]
+    fn imp_max_time_stops_cleanly_and_reports_not_converged() {
+        let (model, pop) = tv_fixture();
+        let opts = FitOptions {
+            imp_max_time: Some(1e-9),
+            ..tv_imp_options(5)
+        };
+        let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
+        assert_eq!(res.n_iterations, 1);
+        assert!(!res.converged);
+        assert!(res.ofv.is_finite());
+        let warning = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("stopped by `imp_max_time`"))
+            .unwrap_or_else(|| panic!("no stop warning: {:?}", res.warnings));
+        assert!(warning.contains("at iteration 1 of 5"), "{warning}");
+        assert!(warning.contains("unaveraged"), "{warning}");
+        assert!(warning.contains("reported as not converged"), "{warning}");
+
+        let classified = crate::types::classify_warning(warning);
+        assert_eq!(classified.severity, WarningSeverity::Warning);
+        assert_eq!(classified.category, WarningCode::Convergence);
+    }
+
+    /// What the user reads: the published verdict of a stopped fit, on its own and
+    /// as the last stage of a chain, whose FOCEI stage the limit must not touch.
+    #[test]
+    fn a_fit_stopped_by_imp_max_time_publishes_not_converged() {
+        let (model, pop) = tv_fixture();
+        for methods in [vec![], vec![EstimationMethod::FoceI, EstimationMethod::Imp]] {
+            let opts = FitOptions {
+                methods: methods.clone(),
+                imp_max_time: Some(1e-9),
+                ..tv_imp_options(5)
+            };
+            let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit Ok");
+            assert!(!res.converged, "{methods:?}");
+            assert!(res.ofv.is_finite(), "{methods:?}");
+            assert!(
+                res.warnings
+                    .iter()
+                    .any(|w| w.contains("stopped by `imp_max_time`")),
+                "{methods:?}: {:?}",
+                res.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn imp_max_time_reports_the_averaged_estimate_inside_the_window() {
+        let (model, pop) = tv_fixture();
+        let opts = FitOptions {
+            imp_max_time: Some(1e-9),
+            imp_averaging: 3,
+            ..tv_imp_options(3)
+        };
+        let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
+        assert!(
+            res.warnings.iter().any(|w| w
+                .contains("the mean of the 1 averaging iteration(s) reached")
+                && !w.contains("unaveraged")),
+            "{:?}",
+            res.warnings
+        );
+    }
+
+    /// The other side of the gate: a limit that does not bind leaves the schedule
+    /// and the verdict alone, and one that binds on the last iteration stopped
+    /// nothing.
+    #[test]
+    fn imp_max_time_that_stops_nothing_changes_nothing() {
+        let (model, pop) = tv_fixture();
+        let plain = run_imp(
+            &model,
+            &pop,
+            &model.default_params,
+            None,
+            &tv_imp_options(3),
+        )
+        .expect("IMP Ok");
+        let roomy = FitOptions {
+            imp_max_time: Some(1e9),
+            ..tv_imp_options(3)
+        };
+        let roomy = run_imp(&model, &pop, &model.default_params, None, &roomy).expect("IMP Ok");
+        assert_eq!(roomy.n_iterations, 3);
+        assert!(roomy.converged && plain.converged);
+        assert_eq!(roomy.ofv.to_bits(), plain.ofv.to_bits());
+
+        let last = FitOptions {
+            imp_max_time: Some(1e-9),
+            ..tv_imp_options(1)
+        };
+        let last = run_imp(&model, &pop, &model.default_params, None, &last).expect("IMP Ok");
+        assert!(last.converged, "{:?}", last.warnings);
+        assert!(!last.warnings.iter().any(|w| w.contains("_max_time")));
+    }
+
+    #[test]
+    fn impmap_max_time_is_its_own_key() {
+        let (model, pop) = tv_fixture();
+        let opts = FitOptions {
+            method: EstimationMethod::Impmap,
+            impmap_iterations: 4,
+            impmap_samples: 30,
+            impmap_auto: false,
+            impmap_max_time: Some(1e-9),
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let res = run_impmap(&model, &pop, &model.default_params, None, &opts).expect("Ok");
+        assert_eq!(res.n_iterations, 1);
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("IMPMAP: stopped by `impmap_max_time`")));
+    }
+
+    #[test]
+    fn imp_max_time_stops_a_mixture_fit() {
+        let model = mix996_model("TVV * exp(ETA_V)");
+        let pop = mix996_pop(3);
+        let opts = FitOptions {
+            imp_max_time: Some(1e-9),
+            ..tv_imp_options(4)
+        };
+        let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
+        assert_eq!(res.n_iterations, 1);
+        assert!(!res.converged);
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("stopped by `imp_max_time`")),
+            "{:?}",
+            res.warnings
+        );
+    }
+
+    #[test]
+    fn a_max_time_that_cannot_trip_is_refused() {
+        let (model, pop) = tv_fixture();
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let opts = FitOptions {
+                imp_max_time: Some(bad),
+                ..tv_imp_options(2)
+            };
+            let err = run_imp(&model, &pop, &model.default_params, None, &opts)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must be refused"));
+            assert!(err.contains("`imp_max_time`"), "{err}");
+        }
     }
 }

@@ -97,14 +97,36 @@ marginal, and the label is dropped for the same reason.
 ### Adaptive sample count
 
 `imp_auto` and `impmap_auto` are on by default, so `imp_samples` and
-`impmap_samples` are starting counts. After each iteration K doubles, up to
-10000, while the **per-subject** objective Monte-Carlo SE exceeds 0.05:
+`impmap_samples` are starting counts, and K never goes below them. After each
+iteration K may rise, up to 10000, while the **per-subject** objective Monte-Carlo
+SE exceeds 0.05. The SE used is the median of the last five iterations, rescaled to
+the current K, because a single iteration's SE follows the few worst-sampled subjects:
 
 $$
 \frac{\operatorname{SE}(-2 \log L_{IS})}{\sqrt{N}} \;>\; 0.05
 $$
 
-K never comes back down. The per-subject form keeps the rule from ramping a large
+A rise waits until one of two things is true:
+
+- **The objective has settled.** The means of the last two 5-iteration windows differ
+  by no more than two standard errors of that difference, taken from the total
+  MC SE. Early in a run the proposal lags the parameters, so the SE reflects that lag
+  and says little about what the converged fit needs.
+- **The averaging window is about to start**, so the iterations behind the reported
+  estimate are sampled to the target even on a fit that never settles. The hold
+  covers at least the first half of the run and at most the first three quarters.
+
+Each rise aims for the K the SE asks for, since SE² scales as 1/K, plus 10% headroom,
+and at most doubles K. When the SE falls below 0.025, K halves.
+
+K also stops rising when samples stop paying for themselves. If SE² scales as 1/K,
+then SE²·K stays constant, so once it has doubled since the first rise that
+assumption has failed and following the SE would only walk K to the cap. On
+`cefepime_jordan` the SE was 0.071 at K = 1000 and 0.083 at K = 6912. If the
+product falls back, rises resume. A fit that ends noisy after this stop says so in
+its warnings, and a larger `imp_samples` is unlikely to help it.
+
+The per-subject form keeps the rule from ramping a large
 dataset purely because it has more subjects, since the total SE grows as √N. NONMEM's
 `AUTO` targets the total: `STDOBJ = 1.0` corresponds to 0.05 only near N = 400. With
 100 subjects the ferx rule asks for a total SE of 0.5, half of NONMEM's target, so
@@ -118,6 +140,23 @@ MC SE is above 0.1. The cap and target are fixed.
 The final marginal uses the configured `imp_samples` / `impmap_samples`, not the
 ramped K, so its `K` and MC SE describe that one evaluation. To tighten the MC SE
 of the reported marginal, raise the starting count.
+
+### Wall-clock limit
+
+`imp_max_time` and `impmap_max_time` cap the MCEM iterations, in seconds. The limit is
+checked after each iteration, so the iteration in progress finishes. A fit that reaches
+the limit stops there and keeps its result:
+
+- The estimate is the mean of the averaging iterations reached, or the last iteration's
+  parameters if the averaging window had not started.
+- `converged` is `false`, and a warning gives the iteration reached.
+- The post-fit work still runs: final EBEs, the covariance step if enabled, and the
+  marginal evaluation. It is not counted against the limit, so set `covariance = false`
+  if the budget is tight.
+
+The limit covers the IMP or IMPMAP stage alone, not earlier stages of a chain such as
+`[focei, imp]`. Where a fit stops depends on the machine, so a run that reaches the
+limit is not reproducible from its seed.
 
 ### Rich data and cold starts
 
@@ -305,7 +344,10 @@ Jᵢ = ∂f/∂η at η̂ᵢ:
      proposal — gives a valid but noisy LL estimate).
 
 2. **Draw K samples** $\eta_{ik} \sim t_\nu(\hat\eta_i, \Sigma_i)$
-   (multivariate Student-t).
+   (multivariate Student-t; a multivariate normal with
+   `imp_proposal_df = normal`). With `imp_defensive_alpha > 0` a fraction
+   of the draws come from the prior (see [Defensive mixture](#defensive-mixture)).
+   An IOV subject samples the stacked (η, κ) vector the same way.
 
 3. **Compute log importance weights:**
 $$
@@ -580,7 +622,9 @@ lives in `tests/warfarin_imp_nonmem.rs`.
 
 ## See also
 
-- [SAEM](saem.qmd) — common upstream stage for `method = [saem, imp]`.
+- [SAEM](saem.qmd) — common upstream stage for `method = [saem, imp]` with
+  `imp_eval_only = true`, which scores the SAEM fit (NONMEM `SAEM` →
+  `IMP EONLY=1`); see [Post-SAEM Finalization](saem.qmd#post-saem-finalization).
 - [SIR](sir.qmd) — a different importance-sampling-flavoured procedure
   that targets *parameter uncertainty* (CIs on θ/Ω/σ), not the marginal
   likelihood. The name overlap is unfortunate; the two methods are

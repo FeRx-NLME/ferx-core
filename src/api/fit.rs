@@ -3462,6 +3462,13 @@ fn fit_inner(
         fit_result.warnings_structured.push(entry);
     }
 
+    // Which engine ran the `[odes]` RHS, when it was not native code (#2681): a property
+    // of the model, reported once per fit rather than per stage of a chain.
+    if let Some((msg, entry)) = crate::api::postfit::ode_rhs_route_warning(model) {
+        fit_result.warnings.push(msg);
+        fit_result.warnings_structured.push(entry);
+    }
+
     // The `[covariate_model]` echo (#1111): the relations as declared, joined to
     // the θ this fit estimated and their standard errors. Built here rather than
     // in the literal above because it reads the assembled θ vector.

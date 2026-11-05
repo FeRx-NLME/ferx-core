@@ -10689,6 +10689,92 @@ fn an_exactly_zero_solved_ebe_is_not_multistarted_at_every_evaluation() {
     }
 }
 
+/// #2682's warm re-solve of a guard-rejected start swaps the cache to the cold solve's modes
+/// and back, and the cache kind ([`PrevEtas`]) has to travel with it, in both directions:
+///
+/// - **in:** the re-solve reads its start as `Solved`, so the empty subject's exactly-zero
+///   mode is warm there like an informed subject's nonzero one. Kept as the cold
+///   `Placeholder`, the re-solve multi-starts the empty subject once more than the informed
+///   one (measured 6 vs 5 accepted, 21 vs 20 rejected; Linux x86_64);
+/// - **out:** the cold solve's cache is restored as `Placeholder`. Left `Solved`, every later
+///   evaluation of a start that stays rejected — still at the zero fill, since nothing was
+///   adopted — takes the zeros for a solve's modes and skips its cold multi-start: measured 2
+///   multi-starts of the informed subject in 29 solves, against 20 restored.
+///
+/// Two fixtures on the same population, `max_unconverged_frac = 0`: at `inner_maxiter = 1`
+/// the re-solve converges the start and is accepted, at `0` it stays rejected.
+#[test]
+fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
+    use crate::estimation::inner_optimizer::{record_inner_solves, InnerLoopStats};
+    use crate::types::FitOptions;
+    let (pop, informed) = population_with_an_empty_subject();
+    let n_subj = pop.subjects.len();
+    let model = make_model();
+    let init = &model.default_params;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    let fit = |inner_maxiter: usize| {
+        let opts = FitOptions {
+            outer_maxiter: 1,
+            inner_maxiter,
+            max_unconverged_frac: 0.0,
+            inner_restarts: 1,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let declines = OuterFdDeclineLog::new(n_subj);
+        let (r, rec) = pool.install(|| {
+            record_inner_solves(|| optimize_nlopt(&model, &pop, init, &opts, &declines, None, &[]))
+        });
+        let start = r.start_eval.expect("the unprofiled loop records its start");
+        let ms = |id: &str| rec.multistarts.iter().filter(|s| *s == id).count();
+        let solves = rec
+            .solve_tols
+            .iter()
+            .filter(|(id, _)| *id == informed)
+            .count();
+        (start, ms("EMPTY"), ms(&informed), solves)
+    };
+
+    let (start, ms_empty, ms_informed, _) = fit(1);
+    assert!(
+        !start.guard_rejected && start.warm_rescored_from.is_some_and(|n| n > 0),
+        "fixture: the cold start must be rejected and its warm re-solve accepted: {start:?}"
+    );
+    assert!(ms_informed >= 1, "fixture must reach the multi-start gate");
+    assert_eq!(
+        ms_empty, ms_informed,
+        "accepted re-solve: the exactly-zero mode was multi-started as a cold start there"
+    );
+
+    let (start, ms_empty, ms_informed, solves) = fit(0);
+    let cold = InnerLoopStats {
+        n_unconverged: start.n_unconverged,
+        n_start_rejected: start.n_start_rejected,
+        ..Default::default()
+    };
+    assert!(
+        start.guard_rejected
+            && start.warm_rescored_from.is_none()
+            && start.ofv.is_finite()
+            && wants_start_warm_rescore(&cold, n_subj, start.ofv, 0.0),
+        "fixture: the start must earn the warm re-solve and stay rejected after it: {start:?}"
+    );
+    assert_eq!(
+        ms_empty, ms_informed,
+        "rejected re-solve: the exactly-zero mode was multi-started as a cold start there"
+    );
+    assert!(
+        2 * ms_informed > solves,
+        "rejected start: the zero fill was restored as a solve's modes, so later evaluations \
+         skipped their cold multi-start ({ms_informed} multi-starts in {solves} solves)"
+    );
+}
+
 /// The two re-solving FD stencils warm every probe from the modes the gradient is taken at,
 /// so an exactly-zero mode among them is no cold start either: no probe multi-starts any
 /// subject. Both `2·n_free` probes deep — the reconverged gradient at every outer
@@ -14168,6 +14254,7 @@ mod above_start {
             n_unconverged: if guard_rejected { 1 } else { 0 },
             n_start_rejected: 0,
             rescored: None,
+            warm_rescored_from: None,
         }
     }
 
@@ -14459,13 +14546,15 @@ mod above_start {
     }
 
     /// The recorded start carries the guard's verdict and counts: with
-    /// `max_unconverged_frac = 0` and a one-iteration inner budget, the first evaluation
-    /// leaves subjects unconverged and is guard-rejected, with a finite objective.
+    /// `max_unconverged_frac = 0` and no inner budget, the first evaluation leaves subjects
+    /// unconverged and is guard-rejected, with a finite objective. The budget was 1 until
+    /// #2682, whose warm re-solve of a rejected start spends a second iteration there and
+    /// converges every subject; at 0 neither solve moves the start.
     #[test]
     fn the_recorded_start_carries_the_guard_verdict() {
         let (model, pop, opts) = one_cpt_iv();
         let starved = FitOptions {
-            inner_maxiter: 1,
+            inner_maxiter: 0,
             max_unconverged_frac: 0.0,
             ..opts
         };
@@ -15968,4 +16057,157 @@ fn outer_cache_warm_starts_drops_kappa_only_on_an_ode_iov_model() {
         ],
         "closed-form IOV: warm start is η̂ then every cell's κ̂ (#2261)"
     );
+}
+
+/// #2682: a first evaluation the EBE guard rejects on its unconverged fraction is solved
+/// again warm from its own EBEs before it is judged ([`wants_start_warm_rescore`]).
+mod start_warm_rescore {
+    use super::*;
+
+    fn stats(n_unconverged: usize, n_start_rejected: usize) -> InnerLoopStats {
+        InnerLoopStats {
+            n_unconverged,
+            n_start_rejected,
+            ..Default::default()
+        }
+    }
+
+    /// Only the fraction trigger earns a re-solve: a hard start rejection holds a placeholder
+    /// `(η, H)`, a non-finite objective is not an inner-budget problem, and an accepted start
+    /// needs nothing. Each row is the one input that flips the answer from the first.
+    #[test]
+    fn only_the_fraction_trigger_is_rescored() {
+        assert!(wants_start_warm_rescore(&stats(17, 0), 30, -1000.0, 0.1));
+        assert!(!wants_start_warm_rescore(&stats(17, 1), 30, -1000.0, 0.1));
+        assert!(!wants_start_warm_rescore(&stats(17, 0), 30, f64::NAN, 0.1));
+        assert!(!wants_start_warm_rescore(&stats(17, 0), 30, -1000.0, 1.0));
+        assert!(!wants_start_warm_rescore(&stats(3, 0), 30, -1000.0, 0.1));
+    }
+
+    /// A warm re-solve replaces the cold one only when the guard accepts it **and** its
+    /// objective is finite (#2682 review r3). `ebe_guard_rejects` answers `false` for a
+    /// non-finite objective, so the `NaN` / `∞` rows straddle the guard: accepted by it,
+    /// refused here. Mutation: drop `raw_ofv.is_finite()` → those two rows go `true`.
+    #[test]
+    fn a_non_finite_warm_resolve_is_not_accepted() {
+        for bad in [f64::NAN, f64::INFINITY] {
+            assert!(
+                !ebe_guard_rejects(&stats(0, 0), 30, bad, 0.1),
+                "premise: the guard alone accepts a non-finite objective ({bad})"
+            );
+            assert!(
+                !warm_rescore_accepted(&stats(0, 0), 30, bad, 0.1),
+                "a {bad} re-solve must not replace the cold solve"
+            );
+        }
+        assert!(warm_rescore_accepted(&stats(0, 0), 30, -1040.0, 0.1));
+        assert!(!warm_rescore_accepted(&stats(6, 0), 30, -1040.0, 0.1));
+        assert!(!warm_rescore_accepted(&stats(0, 1), 30, -1040.0, 0.1));
+    }
+
+    /// The verbose line for a guarded evaluation names its trigger and the count behind it,
+    /// one arm per trigger, and never prints the penalty as an `OFV =` (the issue's
+    /// `Eval 1: OFV = 1000000050451.003662`).
+    #[test]
+    fn a_guarded_eval_line_names_its_trigger() {
+        let frac = guarded_eval_line(&stats(17, 0), 30, -1040.5, 0.1);
+        assert!(
+            frac.contains("17 of 30 subjects' inner loops did not converge")
+                && frac.contains("`max_unconverged_frac` = 0.1")
+                && frac.contains("-1040.500000")
+                && !frac.contains("OFV ="),
+            "{frac}"
+        );
+        let hard = guarded_eval_line(&stats(17, 2), 30, -1040.5, 0.1);
+        assert!(
+            hard.contains("2 of 30 subjects rejected at their inner start")
+                && !hard.contains("did not converge"),
+            "{hard}"
+        );
+        let nonfinite = guarded_eval_line(&stats(17, 0), 30, f64::INFINITY, 0.1);
+        assert!(
+            nonfinite.contains("not finite") && !nonfinite.contains("EBE convergence guard"),
+            "{nonfinite}"
+        );
+    }
+
+    fn run(inner_maxiter: usize) -> (StartEval, usize) {
+        let prep = crate::api::prepare_run(
+            "examples/two_cpt_oral_cov.ferx",
+            Some("data/two_cpt_oral_cov.csv"),
+        )
+        .expect("prepare two_cpt_oral_cov");
+        let n_subj = prep.population.subjects.len();
+        let opts = FitOptions {
+            inner_maxiter,
+            outer_maxiter: 1,
+            run_covariance_step: false,
+            verbose: false,
+            ..prep.parsed.fit_options.clone()
+        };
+        let r = optimize_nlopt(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &opts,
+            &OuterFdDeclineLog::new(n_subj),
+            None,
+            &[],
+        );
+        (
+            r.start_eval.expect("the unprofiled loop records its start"),
+            n_subj,
+        )
+    }
+
+    /// The straddle, on `two_cpt_oral_cov` at `inner_maxiter = 3`: the cold first solve
+    /// leaves 17 of 30 subjects unconverged, over `max_unconverged_frac = 0.1`, and before
+    /// #2682 the guard rejected the start and every trial after it re-solved from the same
+    /// zero cache. Re-solved warm, all 30 converge and the start is accepted at the
+    /// objective the default inner budget gives it with no re-solve at all — measured
+    /// −1040.033385 against −1040.033394 (Linux x86_64), a 9.1e-6 gap, bounded at 1e-4.
+    ///
+    /// Mutations: `wants_start_warm_rescore` → `false` reddens the `warm_rescored_from`
+    /// assertion (the start is then `guard_rejected` with 17); the control's
+    /// `is_none()` dies if the re-solve runs on an accepted start.
+    #[test]
+    fn a_start_rejected_cold_is_accepted_when_its_warm_resolve_converges() {
+        let (start, n_subj) = run(3);
+        let cold = start.warm_rescored_from.unwrap_or_else(|| {
+            panic!("the cold start must be rejected and then re-solved warm: {start:?}")
+        });
+        assert!(
+            cold as f64 / n_subj as f64 > 0.1,
+            "non-degeneracy: the cold solve must exceed the guard's fraction ({cold} of \
+             {n_subj}), or this fixture tests an accepted start"
+        );
+        assert!(
+            !start.guard_rejected && start.n_unconverged == 0,
+            "the warm re-solve is what is judged: {start:?}"
+        );
+        let (control, _) = run(200);
+        assert!(
+            control.warm_rescored_from.is_none() && !control.guard_rejected,
+            "an accepted cold start is not re-solved: {control:?}"
+        );
+        assert!(start.ofv.is_finite() && control.ofv.is_finite());
+        assert!(
+            (start.ofv - control.ofv).abs() < 1e-4,
+            "the warm re-solve scores the start the converged inner loop does: {} vs {}",
+            start.ofv,
+            control.ofv
+        );
+    }
+
+    /// At `inner_maxiter = 2` the warm re-solve still leaves 6 of 30 unconverged, so the
+    /// start stays rejected — and it is the **cold** solve that is reported (27), as before
+    /// #2682, not the re-solve. Mutation: break with the re-solve when it is rejected too →
+    /// `n_unconverged` reads 6.
+    #[test]
+    fn a_start_still_rejected_warm_keeps_its_cold_solve() {
+        let (start, _) = run(2);
+        assert!(start.guard_rejected, "{start:?}");
+        assert_eq!(start.warm_rescored_from, None, "{start:?}");
+        assert_eq!(start.n_unconverged, 27, "{start:?}");
+    }
 }
