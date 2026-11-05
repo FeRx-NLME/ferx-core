@@ -4185,7 +4185,31 @@ fn run<const N: usize, const M: usize>(
     vtape_reset(N + 1);
     // An endpoint-only model has no parameter program (and no Gaussian rows to record).
     let axis = theta_axis(model).or_else(|| endpoint_only(model).then_some(theta.len()))?;
-    let th = theta_leaves::<N, M, false>(axis, theta);
+    let unit = unit_dirs::<N>();
+    // On the heap: at the widest bucket the array is ~470 KB and its `from_fn` builder a
+    // second transient copy, which overflowed a 2 MB thread's stack (a direct, non-fit caller
+    // such as a test thread or the R session) once this frame had grown (#2482).
+    let et: Vec<DualV<N, M>> = (0..N)
+        .map(|k| DualV::free(eta[k], unit[k], [0.0; M]))
+        .collect();
+    // The thetas the mu-scale channels carry are constants of the recording, their
+    // derivative read off the η-jets in step 4 (`ChannelPlan`).
+    let chan = ChannelPlan::new(model, subject, theta, axis, &et);
+    let th: Vec<DualV<N, M>> = match chan.as_ref() {
+        None => theta_leaves::<N, M, false>(axis, theta),
+        Some(c) => theta
+            .iter()
+            .zip(&c.leaves)
+            .enumerate()
+            .map(|(m, (&v, carried))| {
+                if m < axis && carried.is_none() {
+                    DualV::leaf(v, [0.0; N], [0.0; M])
+                } else {
+                    DualV::constant(v)
+                }
+            })
+            .collect(),
+    };
     // `[covariate_nn]` outputs as tape leaves when the weights reach the likelihood through
     // them alone (`NnReduction`): the recordings read the leaves, and the weights' adjoint
     // is one backward pass through each network below, in place of every network taped
@@ -4196,13 +4220,6 @@ fn run<const N: usize, const M: usize>(
     let lv = ThetaLeaves::with_nn(&th, nn_out.as_ref().map(|(_, z)| z.as_slice()));
     #[cfg(not(feature = "nn"))]
     let lv = ThetaLeaves::theta(&th);
-    let unit = unit_dirs::<N>();
-    // On the heap: at the widest bucket the array is ~470 KB and its `from_fn` builder a
-    // second transient copy, which overflowed a 2 MB thread's stack (a direct, non-fit caller
-    // such as a test thread or the R session) once this frame had grown (#2482).
-    let et: Vec<DualV<N, M>> = (0..N)
-        .map(|k| DualV::free(eta[k], unit[k], [0.0; M]))
-        .collect();
     // A subject with no Gaussian rows (an endpoint-only one) has nothing to record.
     let preds = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
         Vec::new()
@@ -4229,17 +4246,17 @@ fn run<const N: usize, const M: usize>(
     // θ leaves, with η held at zero (values only). Beside a non-Gaussian term production's
     // objective takes the conditional variance, but the EBE is still the frozen-variance
     // inner objective's stationary point (#1722), so `∇_η l` reads this point either way.
+    // Under a `ChannelPlan` the carried thetas reach `f(η = 0)` untaped too, so it carries
+    // its η-tangents there, which step 4 reads their derivative off.
     let pop = if n_obs > 0 && !interaction && model.error_spec.has_f_dependent_variance() {
         let zeros = [0.0; N];
-        let p0 = record(
-            pop_model,
-            subject,
-            lay,
-            theta,
-            &zeros,
-            &lv,
-            &[DualV::constant(0.0); N],
-        )?;
+        let e0: Vec<DualV<N, M>> = (0..N)
+            .map(|k| match chan {
+                Some(_) => DualV::free(0.0, unit[k], [0.0; M]),
+                None => DualV::constant(0.0),
+            })
+            .collect();
+        let p0 = record(pop_model, subject, lay, theta, &zeros, &lv, &e0)?;
         (p0.len() == n_obs).then_some(p0)?.into()
     } else {
         None
@@ -4338,6 +4355,7 @@ fn run<const N: usize, const M: usize>(
             fr: &fr,
             gr: &gr,
             pop: pop.as_ref().zip(pr0.as_ref()),
+            chan: chan.as_ref(),
         };
         // A leaf's value-component adjoint (θ, and the networks' outputs under the
         // reduction), by lane.
@@ -4345,6 +4363,13 @@ fn run<const N: usize, const M: usize>(
             for l in 0..*n {
                 #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
                 let mut ta: Vec<f64> = th.iter().map(|lf| at(lf, l)).collect();
+                if let Some(c) = chan.as_ref() {
+                    for (t, leaf) in ta.iter_mut().zip(&c.leaves) {
+                        if let Some(lf) = leaf {
+                            *t += at(lf, l);
+                        }
+                    }
+                }
                 #[cfg(feature = "nn")]
                 if let Some((red, z)) = &nn_out {
                     add_nn_weight_adjoint(model, red, z, theta, |lf| at(lf, l), &mut ta)?;
@@ -4424,6 +4449,15 @@ fn run<const N: usize, const M: usize>(
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: sweep the quadrature's Ψ on its own, as before the fused read.
+    pub(crate) static PSI_SWEEP_UNFUSED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Quadrature gradients that read Ψ's θ adjoint off A's and the response rows'.
+    pub(crate) static PSI_FUSED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Widest lane chunk of the fused gradient-and-response sweeps ([`run`]).
@@ -4518,6 +4552,110 @@ struct DxSeeds<'a, const N: usize, const M: usize> {
     fr: &'a [R],
     gr: &'a [[R; N]],
     pop: Option<(&'a Vec<DualV<N, M>>, &'a Vec<R>)>,
+    chan: Option<&'a ChannelPlan<N, M>>,
+}
+
+/// The thetas a subject's predictions read through mu-scale channels alone (#2706,
+/// `detect_theta_channels`), recorded as constants so the solve meets no tape.
+///
+/// Such a θ_m reaches the predictions only through `u_j = g(A_j(θ)) + η_j` of the channels
+/// that read it, each `η_j` read by nothing else, so on every jet `∂/∂θ_m` is
+/// `Σ_j c_jm ∂/∂η_j` with `c_jm = ∂g(A_j)/∂θ_m`. Through `Ψ`'s adjoints `a_f`, `a_G` of
+/// the predictions and their η-tangents that is `Σ_j c_jm E_j`,
+/// `E_j = Σ_i a_f,i G_ij + Σ_ik a_G,ik ∂²f_i/∂η_k∂η_j` — everything already in hand (plus
+/// `Σ_i a_f⁰,i ∂f⁰_i/∂η_j` for FOCE's `f⁰ = f(η = 0)`, recorded with η-tangents for it).
+/// `c_jm` comes from the parameter program alone, recorded with the carried thetas as
+/// leaves (every other theta constant): its channel parameter `P_j = g⁻¹(u_j)` has
+/// `∂P_j/∂θ_m = c_jm ∂P_j/∂η_j`, so the value seed `E_j / (∂P_j/∂η_j)` on `P_j` sweeps to
+/// `Σ_j c_jm E_j` at the leaves, in the same sweep as the predictions' seeds.
+struct ChannelPlan<const N: usize, const M: usize> {
+    /// Per channel: its η, the taped `P_j` node, and `∂P_j/∂η_j`.
+    seeds: Vec<(usize, u32, f64)>,
+    /// Per theta: the parameter-program leaf of a carried theta, `None` otherwise.
+    leaves: Vec<Option<DualV<N, M>>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: tape every theta, as before #2706.
+    pub(crate) static THETA_CHANNELS_OFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Gradient recordings that read their carried thetas off the η-jets.
+    pub(crate) static THETA_CHANNEL_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+impl<const N: usize, const M: usize> ChannelPlan<N, M> {
+    /// The plan for `subject`, or `None` (tape every theta) when the model carries no theta
+    /// or this subject cannot be served: a channel covariate that varies within the subject
+    /// (its `A_j` would move with time), a channel parameter flat in its η, or a model the
+    /// parameter program alone does not describe (`[covariate_nn]`, FREM). IOV and nested
+    /// levels are served: their κ shifts each cell's `u_j` with `η_j`, which leads the
+    /// stacked and the expanded vector alike (`expand_nested`), so `∂/∂η_j` still carries θ.
+    fn new(
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        axis: usize,
+        et: &[DualV<N, M>],
+    ) -> Option<Self> {
+        #[cfg(test)]
+        if THETA_CHANNELS_OFF.with(|c| c.get()) {
+            return None;
+        }
+        let tc = model.indiv_param_partials.theta_channels.as_ref()?;
+        if model.frem_config.is_some() || crate::sens::provider::nn_weight_theta_count(model) > 0 {
+            return None;
+        }
+        if tc.channels.iter().any(|c| {
+            c.eta_idx >= N.min(model.n_eta)
+                || c.covariates.iter().any(|n| {
+                    crate::estimation::covariate_mu_ref::covariate_varies_within(subject, n)
+                })
+        }) {
+            return None;
+        }
+        let leaves: Vec<Option<DualV<N, M>>> = (0..theta.len())
+            .map(|m| {
+                (m < axis && tc.carried.get(m).copied().unwrap_or(false))
+                    .then(|| DualV::leaf(theta[m], [0.0; N], [0.0; M]))
+            })
+            .collect();
+        if leaves.iter().all(Option::is_none) {
+            return None;
+        }
+        let th: Vec<DualV<N, M>> = leaves
+            .iter()
+            .zip(theta)
+            .map(|(l, &v)| l.unwrap_or(DualV::constant(v)))
+            .collect();
+        let slots: Vec<usize> = tc
+            .channels
+            .iter()
+            .map(|c| model.indiv_param_names.iter().position(|n| *n == c.param))
+            .collect::<Option<_>>()?;
+        let vals = param_program(model)?.eval_var_slots_g(
+            &th[..axis.min(th.len())],
+            et,
+            &subject.covariates,
+            &[],
+            &slots,
+        )?;
+        let mut seeds = Vec::with_capacity(vals.len());
+        for (c, p) in tc.channels.iter().zip(&vals) {
+            if p.i == NONE {
+                continue;
+            }
+            let d = p.g[c.eta_idx];
+            if !(d.is_finite() && d != 0.0) {
+                return None;
+            }
+            seeds.push((c.eta_idx, p.i, d));
+        }
+        #[cfg(test)]
+        THETA_CHANNEL_HITS.with(|c| c.set(c.get() + 1));
+        Some(ChannelPlan { seeds, leaves })
+    }
 }
 
 impl<const N: usize, const M: usize> DxSeeds<'_, N, M> {
@@ -4548,6 +4686,24 @@ impl<const N: usize, const M: usize> DxSeeds<'_, N, M> {
             if let Some((p0, r0)) = self.pop {
                 for (p, &x) in p0.iter().zip(r0) {
                     seed(p.i, 0, l, of(x, l));
+                }
+            }
+            if let Some(c) = self.chan {
+                for &(j, node, d) in &c.seeds {
+                    let mut e = 0.0;
+                    for (i, p) in self.preds.iter().enumerate() {
+                        e += of(self.fr[i], l) * p.g[j];
+                        for k in 0..N {
+                            e += of(self.gr[i][k], l) * p.hess(k, j);
+                        }
+                    }
+                    // FOCE's `f(η = 0)`, whose η-tangents the plan had it carry.
+                    if let Some((p0, r0)) = self.pop {
+                        for (p, &x) in p0.iter().zip(r0) {
+                            e += of(x, l) * p.g[j];
+                        }
+                    }
+                    seed(node, 0, l, e / d);
                 }
             }
         }
@@ -5292,7 +5448,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             theta_adj,
         ))
     };
-    let (mut grad_eta, _) = sweep(TapeAdj::Plain(&s1), false)?;
+    // With the mode response formed over every live effect, A's θ adjoint and the rows'
+    // give Ψ's without its own sweep (below), so this sweep also collects A's.
+    let fuse_psi = matches!(&eta_dx, Some(o) if o.want_dx) && n_bsv.min(active) == active;
+    let (mut grad_eta, theta_a) = sweep(TapeAdj::Plain(&s1), fuse_psi)?;
     // The term's inputs at η̂ move with η̂ through their own η-derivatives (the node values'
     // movement is the linearisation's, already on the tape).
     if let (Some(ngr), Some(ng)) = (ng_r.as_ref(), ng) {
@@ -5329,7 +5488,6 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let psi =
         a - <R as crate::sens::num::PkNum>::wsum3(0.0, (0..N).map(|k| (R::c(w[k]), lg[k], one)));
     let s2 = rsweep::<1>(&[psi]).to_vec();
-    let (_, mut theta_adj) = sweep(TapeAdj::Plain(&s2), true)?;
     let psi_of = |x: R| -> f64 { ra(&s2, x) };
     // ---- the mode response's sweeps, as [`run`] forms it for FOCE(I) (#2549) -----------
     // The quadrature is centred on the conditional mode `η̂ = argmin l`, whatever the
@@ -5353,6 +5511,29 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             Some((rows.len(), chunks, tas))
         }
         _ => None,
+    };
+    // Ψ's θ adjoint. `w = H⁻¹∇_η A` and the rows are `y_r = Σ_k (H⁻¹)_rk g_k`, so
+    // `Σ_k w_k ∂g_k = Σ_r (∇_η A)_r ∂y_r` and `∂Ψ/∂θ = ∂A/∂θ − Σ_r (∇_η A)_r ∂y_r/∂θ`: every
+    // term already swept, when the rows cover every live effect (not under IOV, whose rows
+    // are the BSV block). At a held mode `w = 0` and Ψ is A. Otherwise Ψ's own sweep.
+    #[cfg(test)]
+    let fuse_psi = fuse_psi && !PSI_SWEEP_UNFUSED.with(|c| c.get());
+    let mut theta_adj = match (&response, fuse_psi, at_mode) {
+        // `fuse_psi` already holds the rows to every live effect; `n == 0` is a singular
+        // `H_aa`, whose rows `eta_dx_outputs` declines.
+        (Some((n, _, tas)), true, true) if *n > 0 => {
+            #[cfg(test)]
+            PSI_FUSED_HITS.with(|c| c.set(c.get() + 1));
+            let mut t = theta_a;
+            for (r, ta) in tas.iter().enumerate() {
+                for (tv, dv) in t.iter_mut().zip(ta) {
+                    *tv -= grad_eta[r] * dv;
+                }
+            }
+            t
+        }
+        (_, true, false) => theta_a,
+        _ => sweep(TapeAdj::Plain(&s2), true)?.1,
     };
     // The term's θ-derivatives: at η̂ through `(q, ∇q, ∇²q)`, at each node through its value.
     if let (Some(ngr), Some(_)) = (ng_r.as_ref(), ng) {
@@ -5471,3 +5652,11 @@ mod tests;
 #[cfg(test)]
 #[path = "ode_adjoint_phenomena_tests.rs"]
 mod phenomena_tests;
+
+#[cfg(test)]
+#[path = "ode_adjoint_theta_channels_tests.rs"]
+mod theta_channels_tests;
+
+#[cfg(test)]
+#[path = "ode_adjoint_psi_fused_tests.rs"]
+mod psi_fused_tests;
