@@ -3084,12 +3084,13 @@ fn run_mcem(
     if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
         warnings.push(w);
     }
-    if stopped_after.is_none() {
-        if let Some(w) = gate_converged_on_mstep_motion(&mut converged, label, &mstep_motion, model)
-        {
-            warnings.push(w);
-        }
-    }
+    warnings.extend(mstep_warnings(
+        &mut converged,
+        label,
+        &mstep_motion,
+        model,
+        stopped_after.is_some(),
+    ));
 
     if verbose {
         eprintln!("{} completed. Final OFV (Laplace) = {:.4}", label, ofv);
@@ -4086,12 +4087,13 @@ fn run_mcem_mixture(
     if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
         warnings.push(w);
     }
-    if stopped_after.is_none() {
-        if let Some(w) = gate_converged_on_mstep_motion(&mut converged, label, &mstep_motion, model)
-        {
-            warnings.push(w);
-        }
-    }
+    warnings.extend(mstep_warnings(
+        &mut converged,
+        label,
+        &mstep_motion,
+        model,
+        stopped_after.is_some(),
+    ));
 
     if verbose {
         eprintln!("{label} (mixture) completed. Final marginal OFV = {ofv:.4}");
@@ -4461,23 +4463,26 @@ fn weighted_mstep_objective(
 /// Stable token of [`gate_converged_on_mstep_motion`].
 pub(crate) const MCEM_MSTEP_FROZEN_TOKEN: &str = "W_MCEM_MSTEP_FROZEN";
 
+/// Stable token of [`gate_converged_on_mstep_failures`].
+pub(crate) const MCEM_MSTEP_FAILED_TOKEN: &str = "W_MCEM_MSTEP_FAILED";
+
 /// Smallest displacement from its start, in packed units, that counts as a coordinate of
 /// the weighted M-step having moved (#2718). The reported freeze left coordinates equal
 /// to their start to 6 decimals.
 const MSTEP_MOVED_TOL: f64 = 1e-6;
 
-/// Which coordinates of the weighted θ/σ M-step moved over a run (#2718).
+/// What the weighted θ/σ M-step did over a run (#2718).
 ///
-/// The draws change every iteration, so the maximiser does too: a coordinate a working
-/// solve owns moves by Monte-Carlo noise even when it starts at the optimum. One that
-/// never moves was not estimated. Nothing else can see this, because Ω keeps the
-/// objective falling and #2686's settling test reads the objective.
+/// Nothing else can see a frozen coordinate, because Ω keeps the objective falling and
+/// #2686's settling test reads the objective. Not moving is not enough to call one frozen:
+/// a coordinate that starts at its optimum has no reason to move. So it also has to be
+/// [`improvable_coordinates`] after the last solve that owned it.
 struct MstepMotion {
     /// Each coordinate's value before the first solve that owned it; `None` while pinned.
     start: Vec<Option<f64>>,
     moved: Vec<bool>,
-    /// Sitting on a bound after the latest solve, where staying put is a real answer.
-    at_bound: Vec<bool>,
+    /// Whether a step along the coordinate alone beat the latest solve that owned it.
+    improvable: Vec<bool>,
     solves: usize,
     failed: usize,
     last_failure: Option<nlopt::FailState>,
@@ -4488,7 +4493,7 @@ impl MstepMotion {
         MstepMotion {
             start: vec![None; n],
             moved: vec![false; n],
-            at_bound: vec![false; n],
+            improvable: vec![false; n],
             solves: 0,
             failed: 0,
             last_failure: None,
@@ -4505,27 +4510,26 @@ impl MstepMotion {
         }
         let after = step.log_theta.iter().chain(&step.log_sigma);
         for (i, &x) in after.enumerate() {
-            let (lo, hi) = (lower[i], upper[i]);
-            if hi <= lo {
+            if upper[i] <= lower[i] {
                 continue;
             }
             let start = *self.start[i].get_or_insert(before[i]);
             self.moved[i] |= (x - start).abs() > MSTEP_MOVED_TOL;
-            self.at_bound[i] = x - lo <= MSTEP_MOVED_TOL || hi - x <= MSTEP_MOVED_TOL;
+            self.improvable[i] = step.improvable[i];
         }
     }
 
-    /// The coordinates a solve owned that never left their start, in θ-then-σ order.
+    /// The coordinates a solve owned, never moved, and could still have improved, in
+    /// θ-then-σ order.
     fn frozen(&self) -> Vec<usize> {
         (0..self.start.len())
-            .filter(|&i| self.start[i].is_some() && !self.moved[i] && !self.at_bound[i])
+            .filter(|&i| self.start[i].is_some() && !self.moved[i] && self.improvable[i])
             .collect()
     }
 }
 
 /// Demote `converged` when the weighted M-step left a parameter it owns at its start
-/// (#2718), and say why. A run `max_time` stopped is not judged: it may have had too few
-/// solves to tell, and it already reports why it is not converged.
+/// although moving it would have paid (#2718), and say why.
 fn gate_converged_on_mstep_motion(
     converged: &mut bool,
     label: &str,
@@ -4548,23 +4552,93 @@ fn gate_converged_on_mstep_motion(
                 .map_or("?", String::as_str)
         })
         .collect();
-    let cause = match motion.last_failure {
-        Some(state) => format!(
-            "NLopt failed {} of those solves ({state:?}), so this is a solver fault, not a \
-             property of the data: please report it.",
-            motion.failed
-        ),
-        None => "The solver stopped before reaching them. Start closer, mu-reference them so \
-                 the closed-form step owns them, or chain a FOCE/FOCEI stage first."
-            .to_string(),
-    };
     Some(format!(
         "{MCEM_MSTEP_FROZEN_TOKEN}: {label}: [{}] never left the starting values in {} \
-         weighted M-step(s), so the fit is reported converged: false. No other step of the \
-         run updates them, so these are starting values and not estimates. {cause}",
+         weighted M-step(s), though a step along each alone still lowers −2 log L by more \
+         than {MCEM_SETTLE_MIN_GAP}, so the fit is reported converged: false. No other step of the run updates them, so \
+         these are starting values and not estimates. Start closer, mu-reference them so \
+         the closed-form step owns them, or chain a FOCE/FOCEI stage first.",
         names.join(", "),
         motion.solves,
     ))
+}
+
+/// Demote `converged` when NLopt failed any weighted M-step (#2718). Independent of
+/// whether the coordinates moved, because an earlier solve moving them says nothing about
+/// a later one. BOBYQA has no failure a sound problem reaches: past roundoff, which
+/// [`mstep_failure`] lets through, it only reports bad arguments, memory and a forced
+/// stop. So one is enough, and there is no count to calibrate.
+fn gate_converged_on_mstep_failures(
+    converged: &mut bool,
+    label: &str,
+    motion: &MstepMotion,
+) -> Option<String> {
+    let state = motion.last_failure?;
+    *converged = false;
+    Some(format!(
+        "{MCEM_MSTEP_FAILED_TOKEN}: {label}: NLopt failed {} of {} weighted M-step(s) \
+         ({state:?}), so the fit is reported converged: false. A failed solve can leave θ \
+         and σ where they were for that iteration. This is a solver fault, not a property \
+         of the data: please report it.",
+        motion.failed, motion.solves,
+    ))
+}
+
+/// Everything the weighted M-step has to report at the end of a run. A run `max_time`
+/// stopped is not judged on motion: it may have had too few solves to tell, and it
+/// already reports why it is not converged. A failure stands either way.
+fn mstep_warnings(
+    converged: &mut bool,
+    label: &str,
+    motion: &MstepMotion,
+    model: &CompiledModel,
+    stopped: bool,
+) -> Vec<String> {
+    let failed = gate_converged_on_mstep_failures(converged, label, motion);
+    let frozen = if stopped {
+        None
+    } else {
+        gate_converged_on_mstep_motion(converged, label, motion, model)
+    };
+    failed.into_iter().chain(frozen).collect()
+}
+
+/// For each coordinate of the solve's result `x` that did not move from `start`, whether a
+/// step along it alone, inside its bounds, gains a likelihood-ratio step (#2718):
+/// [`MCEM_SETTLE_MIN_GAP`] on −2 log L, so half of it on `obj`, which is −log L.
+///
+/// The solve's own tolerance is too low a bar. On `impmap_mstep_tests`'s fixture the
+/// additive σ, which its data barely inform, read as improvable at 1e-7 relative from a
+/// converged solve's result. The step is the solve's first step, so a coordinate within
+/// about half of it of its optimum reads `false`, as does one the objective is flat in, and
+/// one on a bound with its optimum outside. Moved and pinned coordinates read `false`.
+fn improvable_coordinates<F>(
+    obj: &F,
+    start: &[f64],
+    x: &[f64],
+    lower: &[f64],
+    upper: &[f64],
+) -> Vec<bool>
+where
+    F: Fn(&[f64], Option<&mut [f64]>, &mut ()) -> f64,
+{
+    let unmoved = |i: usize| upper[i] > lower[i] && (x[i] - start[i]).abs() <= MSTEP_MOVED_TOL;
+    let mut improvable = vec![false; x.len()];
+    if !(0..x.len()).any(unmoved) {
+        return improvable;
+    }
+    let at = obj(x, None, &mut ());
+    let mut probe = x.to_vec();
+    for i in (0..x.len()).filter(|&i| unmoved(i)) {
+        let step = mstep_initial_step(lower[i], upper[i]);
+        for candidate in [(x[i] - step).max(lower[i]), (x[i] + step).min(upper[i])] {
+            probe[i] = candidate;
+            improvable[i] |=
+                candidate != x[i] && 2.0 * (at - obj(&probe, None, &mut ())) > MCEM_SETTLE_MIN_GAP;
+        }
+        probe[i] = x[i];
+    }
+    improvable
 }
 
 /// What one weighted θ/σ M-step returned.
@@ -4575,13 +4649,32 @@ struct WeightedMstep {
     /// place. `RoundoffLimited` is not: BOBYQA reports it at the end of a solve that
     /// has run out of precision, with its best point in hand.
     failure: Option<nlopt::FailState>,
+    /// [`improvable_coordinates`] at the returned point, θ then σ.
+    improvable: Vec<bool>,
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Fail every weighted M-step on this thread, for a driver test of the gate: a working
-    /// BOBYQA moves every free coordinate, even one the objective is flat in.
-    static FAIL_MSTEP_SOLVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Fail every weighted M-step on this thread after this many more, for a driver test
+    /// of the gates: a working BOBYQA moves every free coordinate, even one the objective
+    /// is flat in.
+    static FAIL_MSTEP_SOLVES_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether [`FAIL_MSTEP_SOLVES_AFTER`] fails this solve.
+#[cfg(test)]
+fn mstep_solve_forced_to_fail() -> bool {
+    let Some(left) = FAIL_MSTEP_SOLVES_AFTER.get() else {
+        return false;
+    };
+    FAIL_MSTEP_SOLVES_AFTER.set(Some(left.saturating_sub(1)));
+    left == 0
+}
+
+#[cfg(not(test))]
+fn mstep_solve_forced_to_fail() -> bool {
+    false
 }
 
 /// The failure an NLopt outcome reports, under [`WeightedMstep::failure`]'s meaning.
@@ -4618,20 +4711,12 @@ fn solve_weighted_mstep<F>(
 where
     F: Fn(&[f64], Option<&mut [f64]>, &mut ()) -> f64,
 {
-    #[cfg(test)]
-    if FAIL_MSTEP_SOLVES.get() {
-        let log_sigma = x.split_off(n_theta);
-        return WeightedMstep {
-            log_theta: x,
-            log_sigma,
-            failure: Some(nlopt::FailState::Failure),
-        };
-    }
     let n = x.len();
+    let start = x.clone();
     let mut opt = nlopt::Nlopt::new(
         nlopt::Algorithm::Bobyqa,
         n,
-        obj,
+        &obj,
         nlopt::Target::Minimize,
         (),
     );
@@ -4646,7 +4731,11 @@ where
         .collect();
     opt.set_initial_step(&initial_step).unwrap();
 
-    let failure = mstep_failure(&opt.optimize(&mut x));
+    let failure = if mstep_solve_forced_to_fail() {
+        Some(nlopt::FailState::Failure)
+    } else {
+        mstep_failure(&opt.optimize(&mut x))
+    };
     // A configuration NLopt rejects is a bug here, not a property of the fit. A release
     // build reports it through `MstepMotion`.
     debug_assert!(
@@ -4654,11 +4743,13 @@ where
         "IMP weighted M-step: NLopt rejected the problem (InvalidArgs) — check the initial \
          step against the bounds"
     );
+    let improvable = improvable_coordinates(&obj, &start, &x, lower, upper);
     let log_sigma = x.split_off(n_theta);
     WeightedMstep {
         log_theta: x,
         log_sigma,
         failure,
+        improvable,
     }
 }
 

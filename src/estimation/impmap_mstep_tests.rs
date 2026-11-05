@@ -251,6 +251,7 @@ fn step_to(after: &[f64], failure: Option<nlopt::FailState>) -> WeightedMstep {
         log_theta: after.to_vec(),
         log_sigma: Vec::new(),
         failure,
+        improvable: vec![true; after.len()],
     }
 }
 
@@ -307,16 +308,86 @@ fn motion_ignores_a_coordinate_while_it_is_pinned() {
     assert_eq!(m.frozen(), vec![0], "owned from here, and it stayed at 7");
 }
 
-/// Staying on a bound is an answer: the optimum is outside the box. Both bounds, and off
-/// the bound the same coordinate is frozen, so the exemption is what clears it.
+/// Not moving is only half of it: a coordinate no step would improve stays out, and the
+/// latest solve decides.
 #[test]
-fn motion_exempts_a_coordinate_held_on_a_bound() {
-    for at in [-10.0, 10.0] {
-        let (lo, hi) = WIDE;
-        let mut m = MstepMotion::new(2);
-        m.record(&[at, 0.0], &lo, &hi, &step_to(&[at, 0.0], None));
-        assert_eq!(m.frozen(), vec![1], "bound {at}");
-    }
+fn motion_needs_the_coordinate_to_be_improvable() {
+    let (lo, hi) = WIDE;
+    let mut m = MstepMotion::new(2);
+    let mut step = step_to(&[1.0, 2.0], None);
+    m.record(&[1.0, 2.0], &lo, &hi, &step);
+    assert_eq!(m.frozen(), vec![0, 1]);
+    step.improvable = vec![false, true];
+    m.record(&[1.0, 2.0], &lo, &hi, &step);
+    assert_eq!(m.frozen(), vec![1]);
+}
+
+/// A bowl with its minimum at the origin.
+fn bowl(x: &[f64], _: Option<&mut [f64]>, _: &mut ()) -> f64 {
+    x.iter().map(|v| v * v).sum::<f64>() * 1e3
+}
+
+#[test]
+fn improvable_reads_only_what_a_step_would_gain() {
+    let (lo, hi) = ([-10.0; 3], [10.0; 3]);
+    // At its optimum, off it, and a coordinate that moved in the solve.
+    let start = [0.0, 2.0, 5.0];
+    let x = [0.0, 2.0, 1.0];
+    assert_eq!(
+        improvable_coordinates(&bowl, &start, &x, &lo, &hi),
+        vec![false, true, false]
+    );
+    // Within half a step of the optimum a step overshoots, so it reads as there.
+    let x = [0.04, 0.0, 0.0];
+    assert_eq!(
+        improvable_coordinates(&bowl, &x, &x, &lo, &hi),
+        vec![false; 3]
+    );
+    // Off its optimum, but pinned.
+    let x = [3.0, 0.0, 0.0];
+    assert_eq!(
+        improvable_coordinates(&bowl, &x, &x, &[3.0, -10.0, -10.0], &[3.0, 10.0, 10.0]),
+        vec![false; 3]
+    );
+}
+
+/// On a bound the only step is inward, so it pays only if the optimum is inside.
+#[test]
+fn improvable_steps_inside_the_bounds() {
+    let x = [1.0, 0.0];
+    let optimum_outside = improvable_coordinates(&bowl, &x, &x, &[1.0, -1.0], &[10.0, 1.0]);
+    assert_eq!(optimum_outside, vec![false, false]);
+    let optimum_inside = improvable_coordinates(&bowl, &x, &x, &[-1.0, -1.0], &[1.0, 1.0]);
+    assert_eq!(optimum_inside, vec![true, false]);
+}
+
+/// A flat objective gives no coordinate a reason to move.
+#[test]
+fn improvable_is_false_on_a_flat_objective() {
+    let flat = |_: &[f64], _: Option<&mut [f64]>, _: &mut ()| 5.0;
+    let x = [1.0, 2.0];
+    let (lo, hi) = WIDE;
+    assert_eq!(
+        improvable_coordinates(&flat, &x, &x, &lo, &hi),
+        vec![false; 2]
+    );
+}
+
+/// The bar is one likelihood-ratio step on −2 log L, so 1.92 on −log L, either side of it.
+#[test]
+fn improvable_needs_a_likelihood_ratio_step() {
+    let (lo, hi) = (&WIDE.0[..1], &WIDE.1[..1]);
+    // A step of 0.1 down this slope gains `slope / 10` on −log L.
+    let slope = |g: f64| move |x: &[f64], _: Option<&mut [f64]>, _: &mut ()| g * x[0];
+    let x = [1.0];
+    assert_eq!(
+        improvable_coordinates(&slope(19.0), &x, &x, lo, hi),
+        vec![false]
+    );
+    assert_eq!(
+        improvable_coordinates(&slope(20.0), &x, &x, lo, hi),
+        vec![true]
+    );
 }
 
 #[test]
@@ -348,17 +419,14 @@ fn roundoff_is_not_a_failed_solve() {
     ));
 }
 
-/// Every clause of the message, on both sides of the one conditional sentence, and a
-/// σ's name as well as a θ's: the index runs across both.
+/// Every clause of the message, and a σ's name as well as a θ's: the index runs across
+/// both.
 #[test]
 fn the_gate_demotes_and_names_what_froze() {
     let model = parse_model_string(WIDE_MODEL).unwrap();
     let n = 14;
     let (lo, hi) = (vec![-20.0; n], vec![20.0; n]);
-    let mut after = vec![0.0; n];
-    for x in after.iter_mut() {
-        *x = 1.0;
-    }
+    let mut after = vec![1.0; n];
     after[1] = 0.0;
     after[9] = 0.0;
     let mut m = MstepMotion::new(n);
@@ -373,28 +441,96 @@ fn the_gate_demotes_and_names_what_froze() {
         "{w}"
     );
     assert!(w.contains("in 2 weighted M-step(s)"), "{w}");
+    assert!(w.contains("still lowers −2 log L by more than 3.84"), "{w}");
     assert!(w.contains("reported converged: false"), "{w}");
     assert!(w.contains("starting values and not estimates"), "{w}");
-    assert!(w.contains("stopped before reaching them"), "{w}");
     assert!(w.contains("mu-reference them"), "{w}");
     assert!(!w.contains("NLopt"), "{w}");
+}
 
+/// #2718 review: every coordinate moved on the first solve, and the failures after it
+/// still have to demote the run. The motion gate has nothing to say here, and a stopped
+/// run is told too.
+#[test]
+fn a_failure_demotes_a_run_whose_coordinates_all_moved() {
+    let model = parse_model_string(WIDE_MODEL).unwrap();
+    let (lo, hi) = WIDE;
+    let mut m = MstepMotion::new(2);
+    m.record(&[1.0, 2.0], &lo, &hi, &step_to(&[1.5, 2.5], None));
     let rejected = Some(nlopt::FailState::InvalidArgs);
-    m.record(&after, &lo, &hi, &step_to(&after, rejected));
+    m.record(&[1.5, 2.5], &lo, &hi, &step_to(&[1.5, 2.5], rejected));
+    m.record(&[1.5, 2.5], &lo, &hi, &step_to(&[1.5, 2.5], rejected));
+    assert!(m.frozen().is_empty());
+
+    for stopped in [false, true] {
+        let mut converged = true;
+        let w = mstep_warnings(&mut converged, "IMP", &m, &model, stopped);
+        assert!(!converged);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with("W_MCEM_MSTEP_FAILED: IMP: NLopt failed 2 of 3"),
+            "{w:?}"
+        );
+        assert!(w[0].contains("(InvalidArgs)"), "{w:?}");
+        assert!(w[0].contains("reported converged: false"), "{w:?}");
+        assert!(w[0].contains("leave θ and σ where they were"), "{w:?}");
+        assert!(w[0].contains("solver fault"), "{w:?}");
+    }
+}
+
+/// A run `max_time` stopped is not judged on motion, and one that finished is.
+#[test]
+fn a_stopped_run_is_not_judged_on_motion() {
+    let model = parse_model_string(WIDE_MODEL).unwrap();
+    let (lo, hi) = WIDE;
+    let mut m = MstepMotion::new(2);
+    m.record(&[1.0, 2.0], &lo, &hi, &step_to(&[1.5, 2.0], None));
     let mut converged = true;
-    let w = gate_converged_on_mstep_motion(&mut converged, "IMP", &m, &model).unwrap();
+    assert!(mstep_warnings(&mut converged, "IMP", &m, &model, true).is_empty());
+    assert!(converged);
+    let w = mstep_warnings(&mut converged, "IMP", &m, &model, false);
+    assert_eq!(w.len(), 1, "{w:?}");
     assert!(!converged);
-    assert!(
-        w.contains("NLopt failed 1 of those solves (InvalidArgs)"),
-        "{w}"
-    );
-    assert!(w.contains("solver fault"), "{w}");
-    assert!(!w.contains("stopped before reaching them"), "{w}");
+}
+
+/// #2718 review, the differential pair. No coordinate moves in either arm, because every
+/// solve fails, so the only difference is where they start. From a converged solve's
+/// result nothing is improvable; from `WIDE_MODEL`'s start the same non-movement is a
+/// freeze. The objective repeats between solves, as it does for a coordinate the draws do
+/// not reach.
+#[test]
+fn an_unmoved_coordinate_at_its_optimum_is_not_frozen() {
+    let mut w = WideSolve::new();
+    let motion_of = |w: &WideSolve| {
+        let n = w.theta.len() + w.log_sigma.len();
+        let (mut lo, mut hi) = (w.theta_lower.clone(), w.theta_upper.clone());
+        lo.extend(vec![-8.0; w.log_sigma.len()]);
+        hi.extend(vec![5.0; w.log_sigma.len()]);
+        let before = [w.theta.as_slice(), w.log_sigma.as_slice()].concat();
+        let mut m = MstepMotion::new(n);
+        FAIL_MSTEP_SOLVES_AFTER.set(Some(0));
+        for _ in 0..3 {
+            let step = w.solve(4);
+            assert_eq!(w.moved(&step), 0);
+            m.record(&before, &lo, &hi, &step);
+        }
+        FAIL_MSTEP_SOLVES_AFTER.set(None);
+        m
+    };
+    let cold = motion_of(&w).frozen();
+    // Realised: LOG_CL, LOG_V1, LOG_Q, LOG_V2, LOG_KA, B_CLSEX and A2. The other seven
+    // are within what a likelihood-ratio step can see from this start.
+    assert_eq!(cold, vec![0, 1, 2, 3, 4, 7, 11]);
+
+    let optimum = w.solve(400);
+    w.theta = optimum.log_theta;
+    w.log_sigma = optimum.log_sigma;
+    assert_eq!(motion_of(&w).frozen(), Vec::<usize>::new());
 }
 
 /// The verdict has to read the same on the structured surface, for both messages and
-/// behind a chain prefix. Without its token arm the first reads as `Info` under
-/// `mu_referencing`, because it says "mu-reference", and the second as `Warning` under
+/// behind a chain prefix. Without its token arm the frozen one reads as `Info` under
+/// `mu_referencing`, because it says "mu-reference", and the failed one as `Warning` under
 /// `general`, beside a demoted `converged`.
 #[test]
 fn the_gate_is_classified_as_a_critical_convergence_warning() {
@@ -407,7 +543,7 @@ fn the_gate_is_classified_as_a_critical_convergence_warning() {
     let stopped = gate_converged_on_mstep_motion(&mut converged, "IMP", &m, &model).unwrap();
     let rejected = Some(nlopt::FailState::InvalidArgs);
     m.record(&[1.5, 2.0], &lo, &hi, &step_to(&[1.5, 2.0], rejected));
-    let failed = gate_converged_on_mstep_motion(&mut converged, "IMP", &m, &model).unwrap();
+    let failed = gate_converged_on_mstep_failures(&mut converged, "IMP", &m).unwrap();
     assert!(stopped.contains("mu-reference") && !stopped.contains("NLopt"));
     assert!(failed.contains("NLopt") && !failed.contains("mu-reference"));
     let one_cpt = parse_model_string(ONE_CPT).unwrap();
@@ -534,6 +670,12 @@ fn a_run_reports_a_parameter_its_mstep_never_moved() {
             .find(|w| w.starts_with(MCEM_MSTEP_FROZEN_TOKEN))
             .cloned()
     };
+    let failed = |r: &OuterResult| {
+        r.warnings
+            .iter()
+            .find(|w| w.starts_with(MCEM_MSTEP_FAILED_TOKEN))
+            .cloned()
+    };
     for (source, label) in [(ONE_CPT, "plain"), (MIX_ONE_CPT, "mixture")] {
         let model = parse_model_string(source).unwrap();
         let p = &model.default_params;
@@ -547,21 +689,29 @@ fn a_run_reports_a_parameter_its_mstep_never_moved() {
             };
             let healthy = run();
             assert_eq!(frozen(&healthy), None, "{label}, imp = {imp}");
+            assert_eq!(failed(&healthy), None, "{label}, imp = {imp}");
             assert!(healthy.converged, "{label}, imp = {imp}");
 
-            FAIL_MSTEP_SOLVES.set(true);
+            FAIL_MSTEP_SOLVES_AFTER.set(Some(0));
             let res = run();
-            FAIL_MSTEP_SOLVES.set(false);
+            FAIL_MSTEP_SOLVES_AFTER.set(None);
             let w = frozen(&res).unwrap_or_else(|| panic!("{label}: {:?}", res.warnings));
             assert!(w.contains("TVV"), "{label}: {w}");
-            assert!(w.contains("EPS] never left"), "{label}: {w}");
-            assert!(
-                w.contains("NLopt failed 3 of those solves (Failure)"),
-                "{w}"
-            );
+            let w = failed(&res).unwrap_or_else(|| panic!("{label}: {:?}", res.warnings));
+            assert!(w.contains("NLopt failed 3 of 3 weighted"), "{w}");
             assert!(!res.converged, "{label}, imp = {imp}");
             let sigma_drift = (res.params.sigma.values[0] - p.sigma.values[0]).abs();
             assert!(sigma_drift < 1e-12, "{label}: {sigma_drift}");
+
+            // The first solve works and the rest fail: everything moved, so only the
+            // failure gate can catch it.
+            FAIL_MSTEP_SOLVES_AFTER.set(Some(1));
+            let res = run();
+            FAIL_MSTEP_SOLVES_AFTER.set(None);
+            assert_eq!(frozen(&res), None, "{label}, imp = {imp}");
+            let w = failed(&res).unwrap_or_else(|| panic!("{label}: {:?}", res.warnings));
+            assert!(w.contains("NLopt failed 2 of 3 weighted"), "{w}");
+            assert!(!res.converged, "{label}, imp = {imp}");
         }
     }
 }
