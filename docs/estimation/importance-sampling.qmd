@@ -291,6 +291,15 @@ on 6 threads). `imp_adapt_passes = 0` restores the single Laplace proposal with
 component applies but the pilots do not run; its low-dimensional conditional
 proposal is already well matched.
 
+An evaluation does not use the options that adapt the MCEM iterations. It draws
+at a proposal scale of 1, so `iscale_min` and `iscale_max` have no effect, and it
+draws a fixed `imp_samples` in each pass, so `imp_auto` has no effect either.
+Setting any of the three under `imp_eval_only` draws a warning. An evaluation's
+proposal follows `imp_adapt_passes`, `imp_proposal_df` and `imp_defensive_alpha`,
+and its Monte-Carlo error falls as `imp_samples` rises. In
+`method = [impmap, imp]` the IMPMAP stage still reads `iscale_*`, so those two
+draw no warning there.
+
 ### Why a proposal built at the mode reads high
 
 On a very sparse subject the posterior of a poorly informed η can run along a
@@ -539,8 +548,9 @@ Practical notes:
   [adaptive evaluation](#adaptive-evaluation) always keeps at least $\alpha = 0.1$.
 - **It bounds the weights, not the raw ESS.** A sharp interior likelihood spike
   can still keep ESS low; the mixture only guarantees no single sample runs away.
-- **Complementary to the ISCALE pilot search, not redundant with it.** The
-  per-subject ISCALE search (`iscale_min`/`iscale_max`) already rescues *many*
+- **Complementary to the ISCALE pilot search, not redundant with it.** During the
+  MCEM iterations, the per-subject ISCALE search (`iscale_min`/`iscale_max`) already
+  rescues *many*
   collapses by isotropically rebroadening a too-narrow proposal, and with it on the
   mixture is often unnecessary. But ISCALE applies a single scalar to the whole
   proposal covariance: it cannot cover a proposal that is badly *centred* or wrong

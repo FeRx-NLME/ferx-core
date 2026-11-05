@@ -9558,7 +9558,8 @@ pub struct FitOptions {
     /// then reach a low-noise objective instead of carrying a sample-count-dependent
     /// M-step bias, but a fit that stays above the target while its SE does scale runs
     /// at the cap, at about ten times the per-iteration cost of K = 1000. Set `false`
-    /// to pin the sample count.
+    /// to pin the sample count. Estimating path only: an `imp_eval_only` evaluation
+    /// draws a fixed `imp_samples` and warns if this is set (#2717).
     pub imp_auto: bool,
     /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
     /// [`FitOptions::imp_auto`] but moves `impmap_samples`. Default `true`.
@@ -9574,10 +9575,13 @@ pub struct FitOptions {
     pub impmap_max_time: Option<f64>,
     /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
     /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
-    /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
+    /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1. Read by the
+    /// estimating `imp` / `impmap` iterations only: a reported marginal, including an
+    /// `imp_eval_only` evaluation, draws at scale 1, and `imp_eval_only` warns if this
+    /// is set (#2717).
     pub iscale_min: f64,
     /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
-    /// Default 10.0.
+    /// Default 10.0. Same scope as [`Self::iscale_min`].
     pub iscale_max: f64,
     /// Defensive-mixture weight for the IMP/IMPMAP importance-sampling proposal
     /// (issue #528). Each subject draws an `imp_defensive_alpha` fraction of its
@@ -11110,7 +11114,55 @@ impl FitOptions {
             ));
         }
         warnings.extend(self.inert_covariance_key_notices());
+        warnings.extend(self.inert_imp_eval_only_key_notices());
         warnings
+    }
+
+    /// Notices for the MCEM-only `imp` keys set on a chain whose `imp` stage only evaluates.
+    ///
+    /// `iscale_min`, `iscale_max` and `imp_auto` belong to `imp`'s key list because the
+    /// estimating path reads them, so [`Self::unsupported_keys_warnings`] accepts them. The
+    /// evaluator reads none: it draws at a fixed scale of 1 and a fixed `imp_samples`, and
+    /// its proposal is shaped by `imp_adapt_passes` alone (#2717).
+    ///
+    /// This keys on `user_set_keys`, not on the values, because `imp_auto` defaults to
+    /// `true`. A key another stage of the chain reads stays quiet: `iscale_*` still drive
+    /// the IMPMAP stage of `[impmap, imp]`. A chain with no `imp` stage is left to the
+    /// "not used by method" warning, which already covers these keys there.
+    fn inert_imp_eval_only_key_notices(&self) -> Vec<String> {
+        let chain = self.method_chain();
+        if !self.imp_eval_only || !chain.contains(&EstimationMethod::Imp) {
+            return Vec::new();
+        }
+        let read_by_another_stage = |key: &str| {
+            chain
+                .iter()
+                .filter(|&&m| m != EstimationMethod::Imp)
+                .any(|&m| method_specific_keys(m).contains(&key))
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut notices = Vec::new();
+        for key in &self.user_set_keys {
+            let notice = match key.as_str() {
+                "iscale_min" | "iscale_max" => format!(
+                    "fit option `{key}` bounds the proposal-scale search of the estimating \
+                     IMP iterations, but `imp_eval_only` runs an evaluation, which does not \
+                     search a scale, so it has no effect. An evaluation's proposal is adapted \
+                     only by `imp_adapt_passes`."
+                ),
+                "imp_auto" => "fit option `imp_auto` adapts the sample count of the estimating \
+                     IMP iterations, but `imp_eval_only` runs an evaluation, which draws a \
+                     fixed `imp_samples` per subject in each pass, so it has no effect. Raise \
+                     `imp_samples` to lower the evaluation's Monte-Carlo error."
+                    .to_string(),
+                _ => continue,
+            };
+            if read_by_another_stage(key) || !seen.insert(key.clone()) {
+                continue;
+            }
+            notices.push(notice);
+        }
+        notices
     }
 
     /// Notices for [`covariance_keys`] set on a chain whose covariance step never runs.
