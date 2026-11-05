@@ -4194,16 +4194,22 @@ fn run<const N: usize, const M: usize>(
         .collect();
     // The thetas the mu-scale channels carry are constants of the recording, their
     // derivative read off the η-jets in step 4 (`ChannelPlan`).
-    let pop_needed = !interaction && model.error_spec.has_f_dependent_variance();
     let chan = ChannelPlan::new(model, subject, theta, axis, &et);
-    let mut th = theta_leaves::<N, M, false>(axis, theta);
-    if let Some(c) = chan.as_ref() {
-        for (t, leaf) in th.iter_mut().zip(&c.leaves) {
-            if leaf.is_some() {
-                *t = DualV::constant(t.v);
-            }
-        }
-    }
+    let th: Vec<DualV<N, M>> = match chan.as_ref() {
+        None => theta_leaves::<N, M, false>(axis, theta),
+        Some(c) => theta
+            .iter()
+            .zip(&c.leaves)
+            .enumerate()
+            .map(|(m, (&v, carried))| {
+                if m < axis && carried.is_none() {
+                    DualV::leaf(v, [0.0; N], [0.0; M])
+                } else {
+                    DualV::constant(v)
+                }
+            })
+            .collect(),
+    };
     // `[covariate_nn]` outputs as tape leaves when the weights reach the likelihood through
     // them alone (`NnReduction`): the recordings read the leaves, and the weights' adjoint
     // is one backward pass through each network below, in place of every network taped
@@ -4242,7 +4248,7 @@ fn run<const N: usize, const M: usize>(
     // inner objective's stationary point (#1722), so `∇_η l` reads this point either way.
     // Under a `ChannelPlan` the carried thetas reach `f(η = 0)` untaped too, so it carries
     // its η-tangents there, which step 4 reads their derivative off.
-    let pop = if n_obs > 0 && pop_needed {
+    let pop = if n_obs > 0 && !interaction && model.error_spec.has_f_dependent_variance() {
         let zeros = [0.0; N];
         let e0: Vec<DualV<N, M>> = (0..N)
             .map(|k| match chan {
@@ -5513,7 +5519,9 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     #[cfg(test)]
     let fuse_psi = fuse_psi && !PSI_SWEEP_UNFUSED.with(|c| c.get());
     let mut theta_adj = match (&response, fuse_psi, at_mode) {
-        (Some((n, _, tas)), true, true) if *n == active => {
+        // `fuse_psi` already holds the rows to every live effect; `n == 0` is a singular
+        // `H_aa`, whose rows `eta_dx_outputs` declines.
+        (Some((n, _, tas)), true, true) if *n > 0 => {
             #[cfg(test)]
             PSI_FUSED_HITS.with(|c| c.set(c.get() + 1));
             let mut t = theta_a;

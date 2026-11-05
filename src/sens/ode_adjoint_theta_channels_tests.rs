@@ -420,3 +420,31 @@ fn nested_levels_take_the_channels_and_match_the_taped_gradient() {
         }
     }
 }
+
+/// A dose attribute the ODE engine reads by name (`ALAG1`, `F1`), with no other block
+/// spelling it, is a route to the data (#2711 review): a theta it reads is not carried. The
+/// twin whose attribute reads no theta is served, and the gradient is the taped one on both
+/// — a wrongly carried TVKA would drop the lag's (or the fraction's) θ-derivative.
+#[test]
+fn an_engine_read_dose_attribute_is_a_route_to_the_data() {
+    for (attr, reads, free) in [
+        ("ALAG1", "ALAG1 = 0.1 * TVKA", "ALAG1 = 0.1"),
+        ("F1", "F1 = 0.4 + 0.1 * TVKA", "F1 = 0.6"),
+    ] {
+        for (line, served) in [(reads, false), (free, true)] {
+            let src = format!("{COV_ORAL}  {line}\n{ORAL_ODE}");
+            let model = parse_model_string(&src).unwrap();
+            let s = static_subject(&model, &[("WT", 82.0), ("CRCL", 74.0)], &[0.1, -0.05, 0.2]);
+            let ((g_on, _), (g_off, _), hits) = both_ways(&model, &s, Objective::Focei, false);
+            // Parity first, so a wrongly carried theta reports the gradient it breaks.
+            let w = worst_rel(&g_on, &g_off);
+            assert!(w < 1e-12, "{attr} `{line}`: worst gradient gap {w:.2e}");
+            assert_eq!(hits > 0, served, "{attr}: `{line}`");
+            assert_eq!(
+                model.indiv_param_partials.theta_channels.is_some(),
+                served,
+                "{attr}: `{line}`"
+            );
+        }
+    }
+}

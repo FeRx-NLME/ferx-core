@@ -1913,15 +1913,6 @@ fn detect_theta_channels(
 /// left as they are, since SAEM's groups read them too. What a dropped term reads (κ,
 /// covariates) is nothing the θ and η exclusivity walks look at, so they are unchanged.
 fn strip_link_offsets(stmts: &[Statement], n_bsv: usize) -> Vec<Statement> {
-    fn terms(e: &Expression, out: &mut Vec<Expression>) {
-        match e {
-            Expression::BinOp(l, BinOp::Add, r) => {
-                terms(l, out);
-                terms(r, out);
-            }
-            _ => out.push(e.clone()),
-        }
-    }
     let offset = |e: &Expression| {
         let (mut kappa, mut other) = (false, false);
         visit_expr_nodes(e, &mut |n| match n {
@@ -1943,16 +1934,22 @@ fn strip_link_offsets(stmts: &[Statement], n_bsv: usize) -> Vec<Statement> {
             if f != "exp" {
                 return;
             }
-            let mut ts = Vec::new();
-            terms(arg, &mut ts);
+            let mut ts: Vec<&Expression> = Vec::new();
+            flatten_chain(&**arg, BinOp::Add, true, &mut ts);
             let bare = ts
                 .iter()
                 .filter(|t| matches!(t, Expression::Eta(i) if *i < n_bsv))
                 .count();
-            if bare != 1 || !ts.iter().any(|t| offset(t)) {
+            let drop: Vec<bool> = ts.iter().map(|t| offset(t)).collect();
+            if bare != 1 || !drop.contains(&true) {
                 return;
             }
-            let kept: Vec<Expression> = ts.into_iter().filter(|t| !offset(t)).collect();
+            let kept: Vec<Expression> = ts
+                .iter()
+                .zip(&drop)
+                .filter(|(_, d)| !**d)
+                .map(|(t, _)| (*t).clone())
+                .collect();
             let mut it = kept.into_iter();
             let first = it.next().expect("the bare η is kept");
             **arg = it.fold(first, |a, t| {
@@ -6117,12 +6114,33 @@ pub fn parse_full_model_with(
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
+    // The names the engine reads without any other block spelling them — the dose
+    // attributes (`F`/`LAGTIME` by their routed slot, `F{n}`/`ALAG{n}`/`LAGTIME{n}`/`D{n}`/
+    // `R{n}` by name) and a reserved-name alias — are routes to the data as much as an
+    // `[odes]` read, so a theta reaching one is not carried. Every assignment target counts,
+    // a branch's included.
+    let mut channel_outside = outside_idents.clone();
+    {
+        let mut targets: HashMap<&str, usize> = HashMap::new();
+        count_all_assignments(&indiv_stmts, &mut targets);
+        for name in targets.keys() {
+            let slot = indiv_var_names
+                .iter()
+                .position(|n| n == name)
+                .and_then(|i| ode_slot_map.get(i).copied());
+            if crate::types::DoseAttrConsumption::of(name, slot).is_some()
+                || reserved_flag_slot(name).is_some()
+            {
+                channel_outside.insert(name.to_ascii_uppercase());
+            }
+        }
+    }
     indiv_param_partials.theta_channels = detect_theta_channels(
         &indiv_stmts,
         &theta_names,
         &all_eta_names,
         eta_names_bsv.len(),
-        &outside_idents,
+        &channel_outside,
     );
     indiv_param_partials.lognormal_eta_chain = Some(lognormal_eta_chain_exact(
         &indiv_stmts,
