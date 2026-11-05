@@ -468,3 +468,96 @@ fn a_kink_kind_is_refused_where_curvature_is_read() {
     )
     .is_ok());
 }
+
+/// Every copula family (#1716) fits: each non-elliptical family on a `copula` line over a
+/// gamma clearance and a Gaussian volume under FOCEI, and the Clayton group under SAEM,
+/// IMP, Bayes and VI, whose density M-step / Metropolis moves its θ; the block t copula
+/// under FOCEI and SAEM. The non-elliptical group's Ω block stays diagonal through every
+/// update (its dependence is its θ, not a covariance).
+#[test]
+fn every_copula_family_fits() {
+    let (_, pop) = model_and_data();
+    let indiv = "  CL = TVCL * ETA_CL\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n";
+    let line = |fam: &str| {
+        variant(
+            &format!(
+                "  omega ETA_CL ~ 0.09 density gamma\n  omega ETA_V  ~ 0.04 density t(NU)\n  omega ETA_KA ~ 0.30\n  copula (ETA_CL, ETA_V) ~ {fam}()\n"
+            ),
+            indiv,
+            "",
+        )
+    };
+    for fam in ["clayton", "frank", "gumbel", "joe", "amh"] {
+        let model = line(fam);
+        let r = ferx_core::fit(
+            &model,
+            &pop,
+            &model.default_params,
+            &short(EstimationMethod::FoceI, true),
+        )
+        .unwrap_or_else(|e| panic!("{fam} FOCEI: {e}"));
+        assert!(
+            r.ofv.is_finite() && r.ofv.abs() < 1e10,
+            "{fam}: OFV {}",
+            r.ofv
+        );
+    }
+    let clayton = line("clayton");
+    let th = clayton
+        .theta_names
+        .iter()
+        .position(|n| n == "THETA_COP_ETA_CL")
+        .expect("auto θ");
+    for method in [
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Bayes,
+        EstimationMethod::Vi,
+    ] {
+        let r = ferx_core::fit(
+            &clayton,
+            &pop,
+            &clayton.default_params,
+            &short(method, true),
+        )
+        .unwrap_or_else(|e| panic!("clayton {method:?}: {e}"));
+        assert!(
+            r.ofv.is_finite() && r.ofv.abs() < 1e10,
+            "{method:?}: OFV {}",
+            r.ofv
+        );
+        assert_eq!(
+            r.omega[(0, 1)],
+            0.0,
+            "{method:?}: the copula block stays diagonal"
+        );
+        if matches!(
+            method,
+            EstimationMethod::Saem | EstimationMethod::Bayes | EstimationMethod::Vi
+        ) {
+            assert_ne!(
+                r.theta[th], clayton.default_params.theta[th],
+                "{method:?} moves the copula θ"
+            );
+        }
+    }
+    let t_block = variant(
+        "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] density copula(ETA_CL = gamma, ETA_V = normal, family = t())\n  omega ETA_KA ~ 0.30\n",
+        indiv,
+        "",
+    );
+    for method in [EstimationMethod::FoceI, EstimationMethod::Saem] {
+        let r = ferx_core::fit(
+            &t_block,
+            &pop,
+            &t_block.default_params,
+            &short(method, true),
+        )
+        .unwrap_or_else(|e| panic!("t copula {method:?}: {e}"));
+        assert!(
+            r.ofv.is_finite() && r.ofv.abs() < 1e10,
+            "t copula {method:?}: OFV {}",
+            r.ofv
+        );
+    }
+}

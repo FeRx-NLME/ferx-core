@@ -1,0 +1,6 @@
+[deps]
+Copulas = "ae264745-0b69-425e-9d9d-cf662c5eec93"
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+
+[compat]
+Copulas = "=1.0.1"

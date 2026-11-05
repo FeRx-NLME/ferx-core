@@ -728,6 +728,53 @@ pub(crate) fn apply_omega_dist_clauses(
     let shape_lines: Vec<String> = Vec::new();
     let mut new_thetas = Vec::new();
     for line in parameters.iter_mut() {
+        // #1716: a `copula (…) ~ FAMILY()` line declares its θs here, and is rewritten
+        // with their names so every later parse reads the same model.
+        if decl_keyword(line) == "copula" {
+            let (etas, fname, args) = parse_copula_line(line)?;
+            let family = crate::stats::eta_density::copula::CopulaFamily::from_name(&fname)
+                .ok_or_else(|| {
+                    format!(
+                        "[parameters] unknown copula family `{fname}` in `{}` — the families are {}",
+                        line.trim(),
+                        crate::stats::eta_density::copula::CopulaFamily::ALL
+                            .iter()
+                            .filter(|f| !f.elliptical())
+                            .map(|f| format!("`{}`", f.name()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            if family.elliptical() {
+                return Err(format!(
+                    "[parameters] `copula (…) ~ {fname}` is elliptical: its dependence is a \
+                     correlation, so it goes on a `block_omega` — `block_omega ({}) = [...] \
+                     density copula({}, family = {fname}(NU))`: `{}`",
+                    etas.join(", "),
+                    etas.iter()
+                        .map(|e| format!("{e} = normal"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    line.trim()
+                ));
+            }
+            if args.as_ref().is_none_or(|a| a.is_empty()) && !family.params(etas.len()).is_empty() {
+                let names = auto_copula_thetas(
+                    family,
+                    etas.len(),
+                    &etas[0],
+                    &theta_names,
+                    &mut new_thetas,
+                    line,
+                )?;
+                *line = format!(
+                    "  copula ({}) ~ {fname}({})",
+                    etas.join(", "),
+                    names.join(", ")
+                );
+            }
+            continue;
+        }
         let Some((s, e, clause)) = find_dist_clause(line)? else {
             continue;
         };
@@ -791,6 +838,43 @@ pub(crate) fn apply_omega_dist_clauses(
                 }
                 rewritten.push(format!("{eta} = {name}({})", names.join(", ")));
                 changed = true;
+            }
+            // The block's `family = …` (#1716): only an elliptical family has its
+            // dependence in Ω; `family = t()` declares its ν.
+            if let (Some(fam), _) = split_copula_family(&clause.args) {
+                let (fname, fargs) = parse_kind_spec(&fam).ok_or_else(|| {
+                    format!(
+                        "[parameters] cannot read the copula family `{fam}`: `{}`",
+                        line.trim()
+                    )
+                })?;
+                let family = crate::stats::eta_density::copula::CopulaFamily::from_name(&fname)
+                    .filter(|f| f.elliptical())
+                    .ok_or_else(|| {
+                        format!(
+                            "[parameters] `family = {fname}` on a `block_omega` copula: a block \
+                             carries a correlation, so it takes an elliptical family (`t(NU)`, or \
+                             none for the Gaussian); a non-elliptical copula joins ETAs on their \
+                             own `omega` lines — `copula ({}) ~ {fname}(THETA)`: `{}`",
+                            etas.join(", "),
+                            line.trim()
+                        )
+                    })?;
+                let fnames = match fargs {
+                    Some(a) if !a.is_empty() => a,
+                    _ => {
+                        changed = true;
+                        auto_copula_thetas(
+                            family,
+                            etas.len(),
+                            &etas[0],
+                            &theta_names,
+                            &mut new_thetas,
+                            line,
+                        )?
+                    }
+                };
+                rewritten.push(format!("family = {fname}({})", fnames.join(", ")));
             }
             if changed {
                 *line = format!(
@@ -872,6 +956,110 @@ pub(crate) fn apply_omega_dist_clauses(
     Ok(shape_lines)
 }
 
+/// A `copula (ETA_A, ETA_B, …) ~ FAMILY(ARGS)` line of `[parameters]` (#1716): a
+/// non-elliptical copula joining ETAs declared on their own `omega` lines, each with its
+/// own margin (its `density`, or the Gaussian).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CopulaDecl {
+    pub(crate) etas: Vec<String>,
+    pub(crate) family: String,
+    /// The family's θ names (empty for a parameter-free family).
+    pub(crate) args: Vec<String>,
+    pub(crate) line: String,
+}
+
+/// Read one `copula (…) ~ FAMILY(…)` line; `args` is `None` for `FAMILY()`, which
+/// declares its θs.
+fn parse_copula_line(line: &str) -> Result<(Vec<String>, String, Option<Vec<String>>), String> {
+    let bad = || {
+        format!(
+            "[parameters] cannot read the copula line `{}` — write \
+             `copula (ETA_A, ETA_B) ~ FAMILY(THETA)`, e.g. `copula (ETA_CL, ETA_V) ~ clayton(THETA_C)`, \
+             or `FAMILY()` to declare its θ",
+            line.trim()
+        )
+    };
+    let rest = line.trim_start()[6..].trim_start();
+    let rest = rest.strip_prefix('(').ok_or_else(bad)?;
+    let close = rest.find(')').ok_or_else(bad)?;
+    let etas: Vec<String> = rest[..close]
+        .split(',')
+        .map(|e| e.trim().to_string())
+        .collect();
+    if etas.len() < 2 || etas.iter().any(|e| e.is_empty()) {
+        return Err(format!(
+            "[parameters] a copula joins at least two ETAs: `{}`",
+            line.trim()
+        ));
+    }
+    let rest = rest[close + 1..].trim_start();
+    let spec = rest.strip_prefix('~').ok_or_else(bad)?.trim();
+    let (name, args) = parse_kind_spec(spec).ok_or_else(bad)?;
+    Ok((etas, name, args))
+}
+
+/// Declare a copula family's θs (`FAMILY()`): `{PREFIX}_COP_{first ETA}`, at the
+/// family's init and bounds for a group of `d`.
+fn auto_copula_thetas(
+    family: crate::stats::eta_density::copula::CopulaFamily,
+    d: usize,
+    first: &str,
+    theta_names: &[String],
+    new_thetas: &mut Vec<String>,
+    line: &str,
+) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for p in family.params(d) {
+        let n = format!("{}_COP_{first}", p.prefix);
+        if theta_names.contains(&n) {
+            return Err(format!(
+                "[parameters] the copula `{}()` would declare θ `{n}`, which [parameters] \
+                 already declares — name it: `{}`",
+                family.name(),
+                line.trim()
+            ));
+        }
+        new_thetas.push(format!("theta {n}({}, {}, {})", p.init, p.lower, p.upper));
+        names.push(n);
+    }
+    Ok(names)
+}
+
+/// Every `copula (…) ~ FAMILY(…)` line, read after [`apply_omega_dist_clauses`] has named
+/// its θs.
+pub(crate) fn copula_decls(parameters: &[String]) -> Result<Vec<CopulaDecl>, String> {
+    let mut out = Vec::new();
+    for line in parameters {
+        if decl_keyword(line) != "copula" {
+            continue;
+        }
+        let (etas, family, args) = parse_copula_line(line)?;
+        out.push(CopulaDecl {
+            etas,
+            family,
+            args: args.unwrap_or_default(),
+            line: line.trim().to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// The `family = FAMILY(…)` argument of a block `density copula(…)` (#1716), and the
+/// margins without it. `None` is the Gaussian copula.
+pub(crate) fn split_copula_family(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut fam = None;
+    let mut rest = Vec::new();
+    for a in args {
+        match a.split_once('=') {
+            Some((k, v)) if k.trim().eq_ignore_ascii_case("family") => {
+                fam = Some(v.trim().to_string())
+            }
+            _ => rest.push(a.clone()),
+        }
+    }
+    (fam, rest)
+}
+
 /// A `copula(ETA_A = KIND, ETA_B = KIND(…), …)` clause's margins, in the block's ETA
 /// order. The margins are named, not positional, so reordering a `block_omega` cannot
 /// silently re-bind them (#1721 review): every ETA of the block must be named exactly once.
@@ -881,7 +1069,8 @@ pub(crate) fn named_copula_margins(
     line: &str,
 ) -> Result<Vec<String>, String> {
     let mut by_eta: Vec<Option<String>> = vec![None; etas.len()];
-    for a in args {
+    let (_, margins) = split_copula_family(args);
+    for a in &margins {
         let Some((name, spec)) = a.split_once('=') else {
             return Err(format!(
                 "[parameters] copula margins are named — `copula({} = gamma, …)` — so a \

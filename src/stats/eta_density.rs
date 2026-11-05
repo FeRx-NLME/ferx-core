@@ -401,6 +401,11 @@ pub struct EtaDensity {
     /// AST and does not keep as a Gaussian mu-reference. Bayes's θ–z shift move
     /// (`log θ_t + δ`, `z − δ`) reads it; empty for a group with none.
     pub(crate) log_anchors: Vec<Option<usize>>,
+    /// A copula group's family (#1716): `None` is the Gaussian copula (Ω carries its
+    /// correlation, `correction_g`'s closed form). `Some` adds its own dependence θs after
+    /// the margins' shapes in `shape_thetas`; a non-elliptical family's Ω block is
+    /// diagonal (each margin's ω), an elliptical one's (the t) carries the correlation.
+    pub(crate) family: Option<copula::CopulaFamily>,
 }
 
 /// One end of a truncation.
@@ -424,6 +429,13 @@ pub(crate) struct Truncation {
 }
 
 impl EtaDensity {
+    /// Whether the group's Ω block is diagonal by construction: a non-elliptical copula
+    /// (#1716) joins ETAs declared on their own `omega` lines, its dependence lives in its
+    /// own θs, and every update of the block must keep the off-diagonals at 0.
+    pub(crate) fn diagonal_omega(&self) -> bool {
+        self.family.is_some_and(|f| !f.elliptical())
+    }
+
     /// The model expression that reads the latent `eta` of the group's `pos`-th ETA as the
     /// random effect, or `None` where the model reads the latent itself.
     pub(crate) fn read_expr(
@@ -462,6 +474,9 @@ use kinds::ln1p_g;
 
 #[path = "eta_density_kinds.rs"]
 mod kinds;
+
+#[path = "eta_density_copula.rs"]
+pub(crate) mod copula;
 
 /// The random effect `m(z)` a reported distribution's model reads at latent `z`: the
 /// kind's domain map, or a truncation's bounded map (`lo + (hi − lo)·inv_logit(z)`,
@@ -786,6 +801,7 @@ fn group_correction_g<T: PkNum>(
         let mut at = 0;
         let mut total = c(0.0);
         let mut qv = Vec::with_capacity(n);
+        let mut uv = Vec::with_capacity(n);
         let mut ld_r = ld_om;
         for (i, &kind) in d.margins.iter().enumerate() {
             let m = kind.shapes().len();
@@ -810,7 +826,31 @@ fn group_correction_g<T: PkNum>(
                 return c(f64::INFINITY);
             }
             total = total + neg2;
-            qv.push(normal_quantile(u));
+            if d.family.is_none() {
+                qv.push(normal_quantile(u));
+            }
+            uv.push(u);
+        }
+        // #1716: a copula family other than the Gaussian; its own θs follow the margins'.
+        if let Some(fam) = d.family {
+            let fp = &shapes[at..];
+            let lc = if fam == copula::CopulaFamily::StudentT {
+                // R⁻¹ = D^{½}Ω⁻¹D^{½}, ln|R| = ln|Ω| − Σ ln Ωₖₖ, as for the Gaussian.
+                let r_inv: Vec<Vec<T>> = (0..n)
+                    .map(|i| {
+                        (0..n)
+                            .map(|j| oi_g[i][j] * (om[i][i] * om[j][j]).sqrt())
+                            .collect()
+                    })
+                    .collect();
+                copula::t_copula_log_density(&uv, fp[0], &r_inv, ld_r)
+            } else {
+                fam.log_density(&uv, fp)
+            };
+            if !lc.val().is_finite() {
+                return c(f64::INFINITY);
+            }
+            return total - c(2.0) * lc - gauss;
         }
         let mut quad = c(0.0);
         for i in 0..n {
@@ -1272,8 +1312,26 @@ pub(crate) fn redraw_latents(
             continue;
         }
         if d.kind == DensityKind::Copula {
-            // q ~ N(0, R) from the Gaussian draw (η = L·z already correlated by Ω, so
-            // q = D^{-½}η), u = Φ(q), each margin by its inverse CDF.
+            // The copula's uniforms: for the Gaussian, q ~ N(0, R) from the Gaussian draw
+            // (η = L·z already correlated by Ω, so q = D^{-½}η) and u = Φ(q); for another
+            // family, its own draw (#1716). Then each margin by its inverse CDF.
+            let n = d.etas.len();
+            let n_margin_shapes: usize = d.margins.iter().map(|k| k.shapes().len()).sum();
+            let fam_u: Option<Vec<f64>> = d.family.map(|fam| {
+                let fp = &shapes[n_margin_shapes..];
+                if fam == copula::CopulaFamily::StudentT {
+                    let r = DMatrix::from_fn(n, n, |i, j| {
+                        let (a, b) = (d.etas[i], d.etas[j]);
+                        omega[(a, b)] / (omega[(a, a)] * omega[(b, b)]).sqrt()
+                    });
+                    match r.cholesky() {
+                        Some(ch) => copula::sample_t_copula(fp[0], &ch.l(), rng),
+                        None => vec![f64::NAN; n],
+                    }
+                } else {
+                    fam.sample(n, fp, rng)
+                }
+            });
             let mut at = 0;
             for (i, &kind) in d.margins.iter().enumerate() {
                 let m = kind.shapes().len();
@@ -1281,8 +1339,11 @@ pub(crate) fn redraw_latents(
                 at += m;
                 let a = d.etas[i];
                 let w = omega[(a, a)];
-                let u =
-                    crate::stats::special::normal_cdf(eta[a] / w.sqrt()).clamp(1e-300, 1.0 - 1e-16);
+                let u = match &fam_u {
+                    Some(us) => us[i],
+                    None => crate::stats::special::normal_cdf(eta[a] / w.sqrt())
+                        .clamp(1e-300, 1.0 - 1e-16),
+                };
                 let x = margin_quantile(kind, u, w, sk);
                 eta[a] = kind.map().invert(x);
             }

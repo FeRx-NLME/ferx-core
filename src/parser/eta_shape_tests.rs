@@ -1154,3 +1154,75 @@ fn a_tdist_shape_theta_must_keep_nu_at_least_3() {
         );
     }
 }
+
+/// A `copula (…) ~ FAMILY(…)` line (#1716) joins ETAs declared on their own `omega`
+/// lines into one copula group: each ETA's own density (or the Gaussian) is its margin, in
+/// the line's order, `FAMILY()` declares the family's θ at its init, and the family's θs
+/// follow the margins' shapes. A block takes an elliptical `family = t()` the same way.
+/// Dies under: the margins taken in another order, the family θ not appended, or a
+/// margin's own group left behind beside the copula.
+#[test]
+fn a_copula_line_joins_its_etas() {
+    use crate::stats::eta_density::copula::CopulaFamily;
+    use crate::stats::eta_density::DensityKind;
+    let indiv = "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)";
+    let m = densed(
+        "  omega ETA_CL ~ 0.1 density gamma\n  omega ETA_V ~ 0.1\n  copula (ETA_V, ETA_CL) ~ clayton()",
+        indiv,
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        m.eta_densities.len(),
+        1,
+        "one copula group, not gamma + copula"
+    );
+    let g = &m.eta_densities[0];
+    assert_eq!(g.kind, DensityKind::Copula);
+    assert_eq!(g.family, Some(CopulaFamily::Clayton));
+    let cl = m.eta_names.iter().position(|n| n == "ETA_CL").unwrap();
+    let v = m.eta_names.iter().position(|n| n == "ETA_V").unwrap();
+    assert_eq!(g.etas, vec![v, cl], "the line's order");
+    assert_eq!(g.margins, vec![DensityKind::Normal, DensityKind::Gamma]);
+    let t = *g.shape_thetas.last().unwrap();
+    assert_eq!(m.theta_names[t], "THETA_COP_ETA_V");
+    assert_eq!(m.default_params.theta[t], 1.0);
+    assert!(g.diagonal_omega());
+    // An elliptical family on a block: `family = t()` declares its ν after the margins'.
+    let b = densed(
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.1] density copula(ETA_CL = gamma, ETA_V = normal, family = t())",
+        indiv,
+        "",
+    )
+    .unwrap();
+    let g = &b.eta_densities[0];
+    assert_eq!(g.family, Some(CopulaFamily::StudentT));
+    assert_eq!(
+        b.theta_names[*g.shape_thetas.last().unwrap()],
+        "NU_COP_ETA_CL"
+    );
+    assert!(!g.diagonal_omega());
+}
+
+/// Each copula refusal names its cause: an elliptical family on a line, an unknown family,
+/// an ETA inside a `block_omega`, an ETA named twice, a wrong θ count, a θ bounded outside
+/// the family's domain, a truncated margin, and a non-elliptical `family =` on a block.
+/// Dies under: any one refusal removed (each asserts its own message).
+#[test]
+fn copula_refusals() {
+    let indiv = "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)";
+    let cases = [
+        ("  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_V) ~ t()", "is elliptical"),
+        ("  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_V) ~ banana()", "unknown copula family"),
+        ("  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.1]\n  copula (ETA_CL, ETA_V) ~ clayton()", "is in a `block_omega`"),
+        ("  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_CL) ~ clayton()", "names `ETA_CL` twice"),
+        ("  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_V) ~ clayton(L, NU)", "takes 1 θ"),
+        ("  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_V) ~ gumbel(L)", "must be bounded inside [1"),
+        ("  omega ETA_CL ~ 0.1 density truncated(gamma, 0.5, 2)\n  omega ETA_V ~ 0.1\n  copula (ETA_CL, ETA_V) ~ clayton()", "`truncated` density"),
+        ("  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.1] density copula(ETA_CL = gamma, ETA_V = normal, family = clayton())", "takes an elliptical family"),
+    ];
+    for (omegas, want) in cases {
+        let e = densed(omegas, indiv, "").unwrap_err();
+        assert!(e.contains(want), "{omegas}: {e}");
+    }
+}
