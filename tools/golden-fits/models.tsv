@@ -1,0 +1,42 @@
+# Golden fit set (#2635): reference models fitted nightly on Linux by
+# .github/workflows/golden-fits.yml and diffed against the last release.
+#
+# One row per estimator / structural / endpoint family. The point is coverage of
+# *families*, not of features: each row is the cheapest committed example that puts
+# its family on the fit path. Feature-specific pins stay with the NONMEM anchors
+# (nonmem_anchor/) and the Tier-3 convergence bands; this set does not replace them.
+#
+# Columns (tab-separated): id, model, data, family.
+#   id      stable key in results.json and bands.json — never reuse one for a different
+#           model; retire it and add a new id instead, so its history stays its own
+#   model   repo-relative .ferx path (read from the tree being fitted, so a release
+#           baseline uses the release's copy of the file)
+#   data    repo-relative CSV path
+#   family  what the row is in the set for; tests/golden_fit_set.rs requires distinct
+#
+# Not covered: GN / GN-hybrid / Laplace / AGQ / Bayes / VI — no examples/ model uses
+# them today. Add a row when one does, rather than a golden-only model file.
+id	model	data	family
+warfarin	examples/warfarin.ferx	data/warfarin.csv	FOCE, 1-cpt oral analytic
+warfarin_bobyqa	examples/warfarin_bobyqa.ferx	data/warfarin.csv	BOBYQA outer optimizer
+warfarin_trust_region	examples/warfarin_trust_region.ferx	data/warfarin.csv	trust-region outer optimizer
+warfarin_block_omega	examples/warfarin_block_omega.ferx	data/warfarin_block_omega.csv	block omega
+warfarin_saem	examples/warfarin_saem.ferx	data/warfarin.csv	SAEM
+warfarin_impmap	examples/warfarin_impmap.ferx	data/warfarin.csv	IMPMAP (importance sampling)
+warfarin_prior	examples/warfarin_prior.ferx	data/warfarin.csv	FOCEI with a parameter prior
+warfarin_ode	examples/warfarin_ode.ferx	data/warfarin.csv	ODE solver (twin of warfarin)
+warfarin_iov	examples/warfarin_iov.ferx	data/warfarin_iov.csv	inter-occasion variability
+warfarin_bloq	examples/warfarin_bloq.ferx	data/warfarin_bloq.csv	BLOQ (M3 likelihood)
+warfarin_sde	examples/warfarin_sde.ferx	data/warfarin_sde.csv	SDE / EKF
+correlated_residual_combined	examples/correlated_residual_combined.ferx	data/correlated_residual_combined.csv	combined error, correlated residuals (evaluation only, maxiter = 0)
+one_cpt_infusion	examples/one_cpt_infusion.ferx	data/one_cpt_infusion.csv	zero-order infusion
+two_cpt_iv	examples/two_cpt_iv.ferx	data/two_cpt_iv.csv	2-cpt IV analytic
+two_cpt_oral_cov	examples/two_cpt_oral_cov.ferx	data/two_cpt_oral_cov.csv	2-cpt oral with covariates
+three_cpt_iv	examples/three_cpt_iv.ferx	data/three_cpt_iv.csv	3-cpt IV analytic
+mm_oral	examples/mm_oral.ferx	data/mm_oral.csv	Michaelis-Menten elimination (ODE)
+transit_2cpt	examples/transit_2cpt.ferx	data/transit_2cpt.csv	transit absorption (ODE)
+pkpd_nonmem	examples/pkpd_nonmem.ferx	data/pkpd_nonmem.csv	PK/PD, effect compartment (ODE)
+emax_timecourse	examples/emax_timecourse.ferx	data/emax_timecourse.csv	Emax PD
+binary_logistic	examples/binary_logistic.ferx	data/binary_logistic.csv	binary (categorical) endpoint
+tte_weibull	examples/tte_weibull.ferx	data/tte_weibull.csv	time-to-event, Weibull hazard
+ctmm_2state	examples/ctmm_2state.ferx	data/ctmm_2state.csv	continuous-time Markov model

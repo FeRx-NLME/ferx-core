@@ -268,6 +268,7 @@ after each major feature) and not yet on GitHub — a known gap to formalize.
 | `ci.yml` | PR, merge queue, push to `main` | `Check` (compile-only, incl. the `survival` / `markov` / `slow-tests` feature combos), `Tests + coverage (core k/6)` (`--tests --features ci` split over six runners by `tools/ci-test-shard.py` — integration binaries whole, the lib unit tests by module, #2167; instrumented on `--profile ci-cov` — runs the Tier-1/2 suite with the `debug_assert!` guards live), `Tests + coverage (core)` (uploads the six shard reports as the one patch-coverage report), `Tests + coverage (TTE/CTMM endpoints k/4)` (`--features ci,markov,nn`: the lib unit tests and only the endpoint test binaries of `tools/ci-endpoint-tests.txt`, split the same way), `Tests + coverage (TTE/CTMM endpoints)` (uploads those four reports as one), `Tests (release semantics)` (`--lib` on the **`ci-fast`** profile, so the guards are compiled out and release overflow semantics are exercised — see below), `Clippy`, `Format`, `Public API baseline` (diffs `api/ferx-core-public-api.txt`), `Changelog` (validates `changelog.d/` fragments); **`Tests + coverage (full, slow-tests)`** on weekly schedule / manual |
 | `changelog.yml` | PR, incl. label changes | `Changelog fragment` — a PR touching user-facing source must add a `changelog.d/` fragment or carry the `no-changelog` label |
 | `slow-tests.yml` | nightly 06:00 UTC, Sundays 07:00 UTC (`full-nn`), manual, push to `main` touching the suite's inputs | Tier-3 fits to convergence on `--profile ci-test`: `Slow regression tests (core k/4)` (the whole workspace suite split over four runners by `tools/ci-test-shard.py`, #2182), `Slow regression tests (core)` (the one verdict over the four shards), `Slow regression tests (nn)` (the lib unit tests and `tools/slow-nn-tests.txt` with `nn` on), `Slow regression tests (nn test set)`; on Sundays `full-nn k/4` instead — see [Slow tests, sharded](#slow-tests-sharded) |
+| `golden-fits.yml` | nightly 04:30 UTC, manual | `Golden fit set (Linux)`: the reference models of `tools/golden-fits/models.tsv` fitted at the last release and at head, diffed into the job summary; report-only until 2026-12-07, then fails outside the measured band — see [Golden fit set](golden-fits.qmd) |
 | `mutants.yml` | nightly 01:30 UTC, manual | cargo-mutants over the previous UTC day's merges to `main`: `Plan mutants`, `Mutants (k/N)` (N sized from the selection), `Mutants summary` (survivors as `file:line` + mutation in the job summary; an untested tail goes to a follow-up pass on the same commit); report-only — see [Nightly mutants](#nightly-mutants) |
 | `docs.yml` | push to `main` touching `docs/**` | `quarto render` → deploy to `gh-pages` |
 | `release.yml` | tag `v*` or manual | GitHub release with generated notes |
@@ -674,6 +675,9 @@ Trunk-based, so a release is a **tag on `main`**:
    does, merge `main` back in and assemble again: the `Changelog fragment` check
    fails a release PR that leaves a fragment pending, and `release.yml` refuses
    a tag whose tree still has one (`tools/changelog.sh released <tag>`).
+   In the same PR, clear `accepted` in `tools/golden-fits/bands.json`: the new
+   release becomes the golden set's baseline, which absorbs those changes (see
+   [Golden fit set](golden-fits.qmd#an-intentional-change)).
 2. Tag `main` with `vX.Y.Z` (e.g. `v0.3.0`). `release.yml` builds the GitHub
    release and generates notes.
 3. Point users at the **tagged release**, not an arbitrary `main` commit.

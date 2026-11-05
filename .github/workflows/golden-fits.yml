@@ -1,0 +1,141 @@
+name: Golden fits
+
+# Golden fit set (#2635). The ~20 reference models in tools/golden-fits/models.tsv,
+# fitted nightly on Linux — the reference platform for fit numbers (AGENTS.md, #1688) —
+# and diffed against the last release's values. The table is the job summary.
+#
+# Complements, does not replace, the NONMEM anchors and the Tier-3 convergence bands:
+# those pin features; this tracks the SAME models across releases, so a drift in θ, SE
+# or OFV from an unrelated change is visible on the day it lands.
+#
+# Report-only until FAIL_ON_BAND_FROM in tools/golden-fits/golden.py; from that date a
+# change outside the measured band (tools/golden-fits/bands.json) fails the job. See
+# docs/development/golden-fits.qmd. `tests/golden_fit_set.rs` pins this file's shape.
+#
+# Deliberately not on pull_request or push: a full set of fits per PR is the cost the
+# slow-tests split exists to avoid. Dispatch it on a branch to see a change's effect.
+
+on:
+  schedule:
+    - cron: '30 4 * * *'   # daily 04:30 UTC, ahead of slow-tests (06:00) on the runner pool
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Comma-separated model ids from tools/golden-fits/models.tsv (default: all)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read   # download the previous nightly's results artifact
+
+concurrency:
+  group: golden-fits-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: nightly
+  # Kept for cargo; it does NOT pin the fits. ferx sizes its own pool (#1460), so
+  # golden.py passes `--threads 1` to every fit and rejects a result whose
+  # `n_threads_used` is not 1 — the fits are compared digit for digit, and the
+  # runner's core count must not pick the reduction order.
+  RAYON_NUM_THREADS: 1
+  FEATURES: ferx-core/markov   # implies survival: the TTE / binary / CTMM rows need both
+
+jobs:
+  golden:
+    name: Golden fit set (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # the release tags
+
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+
+      - name: Last release tag
+        id: release
+        run: |
+          tag=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Last release: $tag"
+
+      # The release's values are a function of the tag and the manifest only, so they are
+      # fitted once per release and restored from the cache every other night. `only` is
+      # in the key so a dispatch's partial baseline never stands in for the full one.
+      - name: Restore release baseline
+        id: base-cache
+        uses: actions/cache@v4
+        with:
+          path: golden/base.json
+          key: golden-base-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.release.outputs.tag }}-${{ hashFiles('tools/golden-fits/models.tsv', 'tools/golden-fits/golden.py') }}-only=${{ inputs.only }}
+
+      # The release tree is fitted from its OWN examples/ and data/ (the `--root`), so the
+      # baseline is what that release produced. A model whose file changed since is marked
+      # in the table. A failure here leaves the report head-only rather than red: the
+      # baseline is context, the head fits are the measurement.
+      - name: Fit the golden set at the release
+        if: steps.base-cache.outputs.cache-hit != 'true' && steps.release.outputs.tag != ''
+        continue-on-error: true
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          mkdir -p golden
+          git worktree add --detach ../release "$TAG"
+          (cd ../release && cargo build --profile ci-test -p ferx-cli --features "$FEATURES")
+          python3 -I tools/golden-fits/golden.py run \
+            --ferx ../release/target/ci-test/ferx --root ../release \
+            --label "$TAG" --out golden/base.json --only "${{ inputs.only }}"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: golden-fits
+
+      - name: Build ferx at head
+        run: cargo build --profile ci-test -p ferx-cli --features "$FEATURES"
+
+      - name: Fit the golden set at head
+        run: |
+          mkdir -p golden
+          python3 -I tools/golden-fits/golden.py run \
+            --ferx target/ci-test/ferx --root . \
+            --label "${GITHUB_REF_NAME}@${GITHUB_SHA::8}" --out golden/head.json \
+            --only "${{ inputs.only }}"
+
+      # The previous scheduled run on main, for the "Δ OFV prev" column that attributes a
+      # change to one day's merges. Absent on the first night or after an artifact expires.
+      # `completed`, not `success`: once fail-on-band is on, the night a drift lands is red
+      # and still uploads its results, and the next night must diff against THAT night,
+      # not the last green one. A run that died before uploading has no artifact; the
+      # download then fails soft and the column is empty for one night.
+      - name: Previous nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh run list --workflow golden-fits.yml --branch main --event schedule \
+                 --status completed --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "$id" ]; then
+            gh run download "$id" --name golden-fits-results --dir prev || true
+          fi
+
+      - name: Report
+        run: |
+          python3 -I tools/golden-fits/golden.py report \
+            --head golden/head.json --base golden/base.json --prev prev/head.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      # The nightly history `golden.py bands` measures the spread from: 90 days holds the
+      # 30-nightly window with room to re-measure after a release.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: golden-fits-results
+          path: golden/
+          retention-days: 90
+          if-no-files-found: warn
