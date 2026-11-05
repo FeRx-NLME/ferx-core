@@ -236,6 +236,10 @@ impl<T: PkNum> Mlin<T> {
     pub(crate) fn div(&self, o: &Self) -> Self {
         self.mul(&o.recip())
     }
+
+    pub(crate) fn sqrt(&self) -> Self {
+        self.powf(k(0.5))
+    }
 }
 
 /// `exp(x) − 1` over `T`, by its series below `|x| = 1e-3` (where `exp(x) − 1` cancels).
@@ -271,6 +275,26 @@ pub(crate) enum CopulaFamily {
     Amh,
     /// Student t, `ν > 0` and the correlation of the group's Ω block.
     StudentT,
+    /// Inverse Gaussian, `φ(t) = exp((1 − √(1 + 2θ²t))/θ)`, `θ ≥ 0`.
+    InvGaussian,
+    /// Gumbel–Barnett, `φ(t) = exp((1 − eᵗ)/θ)`, `θ ∈ [0, θ_d]` (`θ₂ = 1`).
+    GumbelBarnett,
+    /// BB1, `φ(t) = (1 + t^{1/δ})^{−1/θ}`, `θ > 0`, `δ ≥ 1`.
+    Bb1,
+    /// BB2, `φ(t) = (1 + ln(1 + t)/δ)^{−1/θ}`, `θ, δ > 0`.
+    Bb2,
+    /// BB3, `φ(t) = exp(−(ln(1 + t)/δ)^{1/θ})`, `θ ≥ 1`, `δ > 0`.
+    Bb3,
+    /// BB6, `φ(t) = 1 − (1 − exp(−t^{1/δ}))^{1/θ}`, `θ, δ ≥ 1`.
+    Bb6,
+    /// BB7, `φ(t) = 1 − (1 − (1 + t)^{−1/δ})^{1/θ}`, `θ ≥ 1`, `δ > 0`.
+    Bb7,
+    /// BB8, `φ(t) = (1 − (1 − ηe^{−t})^{1/ϑ})/δ`, `η = 1 − (1 − δ)^ϑ`, `ϑ ≥ 1`, `δ ∈ (0, 1]`.
+    Bb8,
+    /// BB9, `φ(t) = exp(1/δ − (t + δ^{−ϑ})^{1/ϑ})`, `ϑ ≥ 1`, `δ > 0`.
+    Bb9,
+    /// BB10, `φ(t) = ((1 − δ)/(eᵗ − δ))^{1/θ}`, `θ > 0`, `δ ∈ [0, 1)`.
+    Bb10,
 }
 
 /// One dependence parameter's θ: its auto-declared name prefix, init and bounds, and the
@@ -285,7 +309,7 @@ pub(crate) struct CopulaParam {
 }
 
 impl CopulaFamily {
-    pub(crate) const ALL: [CopulaFamily; 7] = [
+    pub(crate) const ALL: [CopulaFamily; 17] = [
         CopulaFamily::Independent,
         CopulaFamily::Clayton,
         CopulaFamily::Frank,
@@ -293,6 +317,16 @@ impl CopulaFamily {
         CopulaFamily::Joe,
         CopulaFamily::Amh,
         CopulaFamily::StudentT,
+        CopulaFamily::InvGaussian,
+        CopulaFamily::GumbelBarnett,
+        CopulaFamily::Bb1,
+        CopulaFamily::Bb2,
+        CopulaFamily::Bb3,
+        CopulaFamily::Bb6,
+        CopulaFamily::Bb7,
+        CopulaFamily::Bb8,
+        CopulaFamily::Bb9,
+        CopulaFamily::Bb10,
     ];
 
     /// The model-file name (Copulas.jl's, lower-cased, without `Copula`).
@@ -305,6 +339,16 @@ impl CopulaFamily {
             CopulaFamily::Joe => "joe",
             CopulaFamily::Amh => "amh",
             CopulaFamily::StudentT => "t",
+            CopulaFamily::InvGaussian => "invgaussian",
+            CopulaFamily::GumbelBarnett => "gumbelbarnett",
+            CopulaFamily::Bb1 => "bb1",
+            CopulaFamily::Bb2 => "bb2",
+            CopulaFamily::Bb3 => "bb3",
+            CopulaFamily::Bb6 => "bb6",
+            CopulaFamily::Bb7 => "bb7",
+            CopulaFamily::Bb8 => "bb8",
+            CopulaFamily::Bb9 => "bb9",
+            CopulaFamily::Bb10 => "bb10",
         }
     }
 
@@ -353,6 +397,35 @@ impl CopulaFamily {
                 }
             }
             CopulaFamily::StudentT => vec![p("NU", 10.0, 2.0, 100.0, (0.0, f64::INFINITY))],
+            CopulaFamily::InvGaussian => vec![p("THETA", 0.5, 0.0, 50.0, (0.0, f64::INFINITY))],
+            CopulaFamily::GumbelBarnett => {
+                let hi = gumbel_barnett_max(d);
+                vec![p("THETA", 0.5 * hi, 0.0, hi, (0.0, hi))]
+            }
+            CopulaFamily::Bb1 => vec![
+                p("THETA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
+                p("DELTA", 1.5, 1.0, 50.0, (1.0, f64::INFINITY)),
+            ],
+            CopulaFamily::Bb2 => vec![
+                p("THETA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
+                p("DELTA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
+            ],
+            CopulaFamily::Bb3 | CopulaFamily::Bb7 | CopulaFamily::Bb9 => vec![
+                p("THETA", 1.5, 1.0, 50.0, (1.0, f64::INFINITY)),
+                p("DELTA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
+            ],
+            CopulaFamily::Bb6 => vec![
+                p("THETA", 1.5, 1.0, 50.0, (1.0, f64::INFINITY)),
+                p("DELTA", 1.5, 1.0, 50.0, (1.0, f64::INFINITY)),
+            ],
+            CopulaFamily::Bb8 => vec![
+                p("THETA", 1.5, 1.0, 50.0, (1.0, f64::INFINITY)),
+                p("DELTA", 0.5, 0.01, 1.0, (0.0, 1.0)),
+            ],
+            CopulaFamily::Bb10 => vec![
+                p("THETA", 1.0, 0.01, 50.0, (0.0, f64::INFINITY)),
+                p("DELTA", 0.5, 0.0, 0.99, (0.0, 1.0)),
+            ],
         }
     }
 
@@ -363,12 +436,23 @@ impl CopulaFamily {
             CopulaFamily::Independent => true,
             CopulaFamily::Clayton | CopulaFamily::Frank | CopulaFamily::Amh => p[0] == 0.0,
             CopulaFamily::Gumbel | CopulaFamily::Joe => p[0] == 1.0,
-            CopulaFamily::StudentT => false,
+            CopulaFamily::InvGaussian | CopulaFamily::GumbelBarnett => p[0] == 0.0,
+            CopulaFamily::StudentT
+            | CopulaFamily::Bb1
+            | CopulaFamily::Bb2
+            | CopulaFamily::Bb3
+            | CopulaFamily::Bb6
+            | CopulaFamily::Bb7
+            | CopulaFamily::Bb8
+            | CopulaFamily::Bb9
+            | CopulaFamily::Bb10 => false,
         }
     }
 
-    /// `φ⁻¹(u)` of an Archimedean family, over `Mlin`.
-    fn phi_inv<T: PkNum>(self, u: &Mlin<T>, th: T) -> Mlin<T> {
+    /// `φ⁻¹(u)` of an Archimedean family, over `Mlin`; `p` its parameters.
+    fn phi_inv<T: PkNum>(self, u: &Mlin<T>, p: &[T]) -> Mlin<T> {
+        let th = p[0];
+        let one = k::<T>(1.0);
         match self {
             // (u^{−θ} − 1)/θ = expm1(−θ ln u)/θ.
             CopulaFamily::Clayton => u.ln().scale(-th).expm1().scale(k::<T>(1.0) / th),
@@ -386,13 +470,56 @@ impl CopulaFamily {
             // ln((1 − θ + θu)/u).
             CopulaFamily::Amh => u.scale(th).addc(k::<T>(1.0) - th).ln().sub(&u.ln()),
             CopulaFamily::Independent => u.ln().neg(),
+            // ((1 − θ ln u)² − 1)/(2θ²).
+            CopulaFamily::InvGaussian => {
+                let a = u.ln().scale(-th).addc(one);
+                a.mul(&a).addc(-one).scale(one / (k::<T>(2.0) * th * th))
+            }
+            // ln1p(−θ ln u).
+            CopulaFamily::GumbelBarnett => u.ln().scale(-th).ln1p(),
+            // (u^{−θ} − 1)^δ.
+            CopulaFamily::Bb1 => u.ln().scale(-th).expm1().powf(p[1]),
+            // expm1(δ expm1(−θ ln u)).
+            CopulaFamily::Bb2 => u.ln().scale(-th).expm1().scale(p[1]).expm1(),
+            // expm1(δ (−ln u)^θ).
+            CopulaFamily::Bb3 => u.ln().neg().powf(th).scale(p[1]).expm1(),
+            // (−ln1p(−(1 − u)^θ))^δ.
+            CopulaFamily::Bb6 => u.neg().addc(one).powf(th).neg().ln1p().neg().powf(p[1]),
+            // w^{−δ} − 1, w = 1 − (1 − u)^θ; `ln(1 − u)`, which is −∞ at a constant
+            // `u = 1` (the sampler's marginalised coordinates), where `ln1p_g` is NaN.
+            CopulaFamily::Bb7 => u
+                .neg()
+                .addc(one)
+                .ln()
+                .scale(th)
+                .expm1()
+                .neg()
+                .powf(-p[1])
+                .addc(-one),
+            // −ln((1 − (1 − δu)^ϑ)/η).
+            CopulaFamily::Bb8 => {
+                let eta = bb8_eta(th, p[1]);
+                u.scale(-p[1])
+                    .addc(one)
+                    .powf(th)
+                    .neg()
+                    .addc(one)
+                    .scale(one / eta)
+                    .ln()
+                    .neg()
+            }
+            // (1/δ − ln u)^ϑ − δ^{−ϑ}.
+            CopulaFamily::Bb9 => u.ln().neg().addc(one / p[1]).powf(th).addc(-p[1].pow(-th)),
+            // ln(δ + (1 − δ) u^{−θ}).
+            CopulaFamily::Bb10 => u.ln().scale(-th).exp().scale(one - p[1]).addc(p[1]).ln(),
             CopulaFamily::StudentT => unreachable!("the t copula is not Archimedean"),
         }
     }
 
-    /// `φ(s)` of an Archimedean family, over `Mlin`.
-    fn phi<T: PkNum>(self, s: &Mlin<T>, th: T) -> Mlin<T> {
+    /// `φ(s)` of an Archimedean family, over `Mlin`; `p` its parameters.
+    fn phi<T: PkNum>(self, s: &Mlin<T>, p: &[T]) -> Mlin<T> {
         let one = k::<T>(1.0);
+        let th = p[0];
         match self {
             CopulaFamily::Clayton => s.scale(th).addc(one).powf(-one / th),
             // −ln1p(e^{−s}·expm1(−θ))/θ.
@@ -402,6 +529,68 @@ impl CopulaFamily {
             CopulaFamily::Joe => s.neg().expm1().neg().powf(one / th).neg().addc(one),
             CopulaFamily::Amh => s.exp().addc(-th).recip().scale(one - th),
             CopulaFamily::Independent => s.neg().exp(),
+            CopulaFamily::InvGaussian => s
+                .scale(k::<T>(2.0) * th * th)
+                .addc(one)
+                .sqrt()
+                .neg()
+                .addc(one)
+                .scale(one / th)
+                .exp(),
+            // exp(−expm1(s)/θ).
+            CopulaFamily::GumbelBarnett => s.expm1().scale(-one / th).exp(),
+            // (1 + s^{1/δ})^{−1/θ}.
+            CopulaFamily::Bb1 => s.powf(one / p[1]).ln1p().scale(-one / th).exp(),
+            // exp(−ln1p(ln1p(s)/δ)/θ).
+            CopulaFamily::Bb2 => s.ln1p().scale(one / p[1]).ln1p().scale(-one / th).exp(),
+            // exp(−(ln1p(s)/δ)^{1/θ}).
+            CopulaFamily::Bb3 => s.ln1p().scale(one / p[1]).powf(one / th).neg().exp(),
+            // 1 − (1 − exp(−s^{1/δ}))^{1/θ}.
+            CopulaFamily::Bb6 => s
+                .powf(one / p[1])
+                .neg()
+                .expm1()
+                .neg()
+                .powf(one / th)
+                .neg()
+                .addc(one),
+            // 1 − (1 − (1 + s)^{−1/δ})^{1/θ}.
+            CopulaFamily::Bb7 => s
+                .ln1p()
+                .scale(-one / p[1])
+                .expm1()
+                .neg()
+                .powf(one / th)
+                .neg()
+                .addc(one),
+            // (1 − (1 − ηe^{−s})^{1/ϑ})/δ.
+            CopulaFamily::Bb8 => {
+                let eta = bb8_eta(th, p[1]);
+                s.neg()
+                    .exp()
+                    .scale(-eta)
+                    .addc(one)
+                    .powf(one / th)
+                    .neg()
+                    .addc(one)
+                    .scale(one / p[1])
+            }
+            // exp(1/δ − (s + δ^{−ϑ})^{1/ϑ}).
+            CopulaFamily::Bb9 => s
+                .addc(p[1].pow(-th))
+                .powf(one / th)
+                .neg()
+                .addc(one / p[1])
+                .exp(),
+            // ((1 − δ)/(eˢ − δ))^{1/θ}.
+            CopulaFamily::Bb10 => s
+                .exp()
+                .addc(-p[1])
+                .ln()
+                .neg()
+                .addc(super::kinds::ln1p_g(-p[1]))
+                .scale(one / th)
+                .exp(),
             CopulaFamily::StudentT => unreachable!("the t copula is not Archimedean"),
         }
     }
@@ -416,16 +605,18 @@ impl CopulaFamily {
             }
             return c;
         }
-        let th = p[0];
-        let mut s = self.phi_inv(&u[0], th);
-        for x in &u[1..] {
-            s = s.add(&self.phi_inv(x, th));
+        if self == CopulaFamily::Bb2 {
+            return bb2_cdf(u, p);
         }
-        self.phi(&s, th)
+        let mut s = self.phi_inv(&u[0], p);
+        for x in &u[1..] {
+            s = s.add(&self.phi_inv(x, p));
+        }
+        self.phi(&s, p)
     }
 
     /// `ln c(u)` of a non-elliptical family at `u ∈ (0, 1)^d`, over `T`; `−∞` where the
-    /// density is not positive.
+    /// density is not positive, or not representable (below `≈ e^{−700}`).
     pub(crate) fn log_density<T: PkNum>(self, u: &[T], p: &[T]) -> T {
         let d = u.len();
         let xs: Vec<Mlin<T>> = u
@@ -434,11 +625,18 @@ impl CopulaFamily {
             .map(|(i, &v)| Mlin::var(d, i, v))
             .collect();
         let c = self.cdf(&xs, p).top();
-        if c.val() > 0.0 && c.val().is_finite() {
-            c.ln()
-        } else {
-            k(f64::NEG_INFINITY)
+        // Below `≈ e^{−700}` the density is not representable from its CDF (BB2 and BB3,
+        // whose `φ⁻¹` grows like an exponential of a power, reach it at moderate `u`): the
+        // value or its jets leave f64 range, and the copula reads as a wall (`−∞`) rather
+        // than hand an estimator a finite value with a non-finite gradient.
+        if c.val() > 0.0 && c.val().is_finite() && c.jets_finite() {
+            let lc = c.ln();
+            // A subnormal `c` has finite jets of its own but `ln c`'s are `g/c`.
+            if lc.jets_finite() {
+                return lc;
+            }
         }
+        k(f64::NEG_INFINITY)
     }
 
     /// One draw `u ∈ (0, 1)^d` of a non-elliptical family by conditional inversion:
@@ -479,6 +677,62 @@ impl CopulaFamily {
             u.push((0.5 * (lo + hi)).clamp(1e-300, 1.0 - 1e-16));
         }
         u
+    }
+}
+
+/// BB2's CDF in log space: `C = (1 + ln1p(s)/δ)^{−1/θ}` with `s = Σ (e^{aᵢ} − 1)`,
+/// `aᵢ = δ(u^{−θ} − 1)`. `e^{aᵢ}` overflows deep in a tail (`a = 750` at `u = 0.02`,
+/// θ = 2), but `ln1p(s) = a_m + ln(Σ e^{aᵢ − a_m} − (d − 1)e^{−a_m})` at the largest `a_m`
+/// does not.
+fn bb2_cdf<T: PkNum>(u: &[Mlin<T>], p: &[T]) -> Mlin<T> {
+    let (th, de) = (p[0], p[1]);
+    let one = k::<T>(1.0);
+    let a: Vec<Mlin<T>> = u
+        .iter()
+        .map(|x| x.ln().scale(-th).expm1().scale(de))
+        .collect();
+    let m = (0..a.len())
+        .max_by(|&i, &j| a[i].val().val().total_cmp(&a[j].val().val()))
+        .unwrap_or(0);
+    let mut sum = a[0].sub(&a[m]).exp();
+    for x in &a[1..] {
+        sum = sum.add(&x.sub(&a[m]).exp());
+    }
+    let tail = a[m].neg().exp().scale(k(-((a.len() - 1) as f64)));
+    let ln1p_s = a[m].add(&sum.add(&tail).ln());
+    ln1p_s.scale(one / de).addc(one).powf(-one / th)
+}
+
+/// BB8's `η = 1 − (1 − δ)^ϑ`.
+fn bb8_eta<T: PkNum>(th: T, de: T) -> T {
+    -expm1_t(th * super::kinds::ln1p_g(-de))
+}
+
+/// Gumbel–Barnett's largest θ in `d` dimensions (Copulas.jl's
+/// `_find_critical_value_gumbelbarnett`): above it the generator is not `d`-monotone.
+pub(crate) fn gumbel_barnett_max(d: usize) -> f64 {
+    match d {
+        2 => 1.0,
+        3 => 0.380,
+        4 => 0.216,
+        5 => 0.145,
+        6 => 0.106,
+        7 => 0.082,
+        8 => 0.066,
+        9 => 0.055,
+        10 => 0.046,
+        _ => {
+            let df = d as f64;
+            let c2 = df * (df - 1.0) / 2.0;
+            let c3 = c2 * (df - 2.0) / 3.0;
+            let c4 = c3 * (df - 3.0) / 4.0;
+            let discr = c2 * c2 - (2.0 * df / (df - 1.0)) * (c3 + 3.0 * c4);
+            if discr >= 0.0 {
+                1.0 / (c2 / df + (df - 1.0) / df * discr.sqrt())
+            } else {
+                0.046
+            }
+        }
     }
 }
 

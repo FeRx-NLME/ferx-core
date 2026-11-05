@@ -56,10 +56,30 @@ fn the_multilinear_dual_has_the_closed_form_mixed_partials() {
 #[test]
 fn every_archimedean_family_is_copulas_jl() {
     let mut worst = (0.0f64, String::new());
-    for &(fam, th, u, lp, cdf) in ARCH_REFS.iter().chain(ARCH_NEG_REFS) {
-        let got_lp = fam.log_density::<f64>(u, &[th]);
+    let scalar = ARCH_REFS
+        .iter()
+        .chain(ARCH_NEG_REFS)
+        .map(|&(f, th, u, lp, c)| (f, vec![th], u, lp, c));
+    let vector = ARCH2_REFS
+        .iter()
+        .map(|&(f, p, u, lp, c)| (f, p.to_vec(), u, lp, c));
+    let mut skipped = 0;
+    for (fam, pv, u, lp, cdf) in scalar.chain(vector) {
+        let th = pv[0];
+        // Copulas.jl evaluates far into the tail in log space; ferx's density comes off
+        // its CDF and reads a density below `e^{−700}` as a wall (`log_density`'s docs).
+        if lp < -700.0 {
+            assert_eq!(
+                fam.log_density::<f64>(u, &pv),
+                f64::NEG_INFINITY,
+                "{fam:?} {pv:?} at {u:?}"
+            );
+            skipped += 1;
+            continue;
+        }
+        let got_lp = fam.log_density::<f64>(u, &pv);
         let xs: Vec<Mlin<f64>> = u.iter().map(|&v| Mlin::cst(u.len(), v)).collect();
-        let got_cdf = fam.cdf(&xs, &[th]).val();
+        let got_cdf = fam.cdf(&xs, &pv).val();
         assert!(
             got_lp.is_finite() && got_cdf.is_finite() && lp.is_finite() && cdf.is_finite(),
             "{fam:?} θ {th} at {u:?}: {got_lp} {got_cdf}"
@@ -67,7 +87,7 @@ fn every_archimedean_family_is_copulas_jl() {
         for (g, w, what) in [(got_lp, lp, "log c"), (got_cdf, cdf, "C")] {
             let e = (g - w).abs() / w.abs().max(1.0);
             if e > worst.0 {
-                worst = (e, format!("{fam:?} θ {th} {what} at {u:?}"));
+                worst = (e, format!("{fam:?} {pv:?} (θ {th}) {what} at {u:?}"));
             }
         }
     }
@@ -108,18 +128,21 @@ fn the_t_copula_is_copulas_jl() {
 }
 const T_TOL: f64 = 1e-6;
 
-/// The bivariate density integrates to 1 and its θ-score to 0, on the probit scale
-/// (`u = Φ(x)`, where the integrand is smooth and decays), for every family at each
-/// reference θ. The θ-score is read off a `DualT` through the whole `Mlin` evaluation:
-/// `∫∫ ∂θ c = ∂θ 1 = 0` holds for the true derivative of a normalised density, so it
-/// pins the exact θ-gradient the estimators use, with no finite difference.
-/// Dies under: a density off by a factor, or a θ-jet dropped or mis-signed anywhere in
-/// the generator or its inverse.
+/// Each bivariate copula's conditional margin is uniform for every `u` and every parameter,
+/// so `∫ c(u, v) dv = 1` and `∫ ∂c(u, v)/∂pⱼ dv = 0` exactly, at each fixed `u`. Integrated
+/// on the probit scale (`v = Φ(y)`, where the integrand is smooth and decays) at
+/// `u = 0.1, 0.5, 0.9`, for every family at each reference parameter vector. The
+/// parameter score is read off a `DualT` through the whole `Mlin` evaluation, so this pins
+/// the exact parameter gradient the estimators use, with no finite difference; a 1-D
+/// integral at fixed `u` resolves a strongly tail-dependent family's ridge, which a 2-D
+/// grid does not.
+/// Dies under: a density off by a factor, or a parameter's jet dropped or mis-signed
+/// anywhere in a generator or its inverse.
 #[test]
-fn each_bivariate_density_has_unit_mass_and_zero_score() {
-    type D = DualT<1, f64>;
-    let n = 200usize;
-    let (lo, hi) = (-7.0f64, 7.0f64);
+fn each_bivariate_conditional_margin_is_uniform_with_zero_score() {
+    type D = DualT<2, f64>;
+    let n = 4000usize;
+    let (lo, hi) = (-8.5f64, 8.5f64);
     let h = (hi - lo) / n as f64;
     let w = |i: usize| -> f64 {
         if i == 0 || i == n {
@@ -133,42 +156,65 @@ fn each_bivariate_density_has_unit_mass_and_zero_score() {
     let phi = |x: f64| (-0.5 * x * x).exp() / std::f64::consts::TAU.sqrt();
     let mut worst = (0.0f64, String::new());
     let mut seen = std::collections::HashSet::new();
-    for &(fam, th, ..) in ARCH_REFS.iter().chain(ARCH_NEG_REFS) {
-        if !seen.insert((fam.name(), th.to_bits())) {
+    let scalar = ARCH_REFS
+        .iter()
+        .chain(ARCH_NEG_REFS)
+        .map(|&(f, th, ..)| (f, vec![th]));
+    let vector = ARCH2_REFS.iter().map(|&(f, p, ..)| (f, p.to_vec()));
+    for (fam, pv) in scalar.chain(vector) {
+        let key: Vec<u64> = pv.iter().map(|x| x.to_bits()).collect();
+        if !seen.insert((fam.name(), key)) {
             continue;
         }
-        let (mut mass, mut score) = (0.0f64, 0.0f64);
-        for i in 0..=n {
-            let x = lo + i as f64 * h;
-            let ux = crate::stats::special::normal_cdf(x);
-            for j in 0..=n {
-                let y = lo + j as f64 * h;
-                let uy = crate::stats::special::normal_cdf(y);
-                let lc = fam.log_density::<D>(
-                    &[D { v: ux, g: [0.0] }, D { v: uy, g: [0.0] }],
-                    &[D { v: th, g: [1.0] }],
-                );
+        let pd: Vec<D> = pv
+            .iter()
+            .enumerate()
+            .map(|(j, &v)| D {
+                v,
+                g: [
+                    if j == 0 { 1.0 } else { 0.0 },
+                    if j == 1 { 1.0 } else { 0.0 },
+                ],
+            })
+            .collect();
+        for u in [0.1f64, 0.5, 0.9] {
+            let (mut mass, mut score) = (0.0f64, [0.0f64; 2]);
+            for i in 0..=n {
+                let y = lo + i as f64 * h;
+                let v = crate::stats::special::normal_cdf(y);
+                let lc =
+                    fam.log_density::<D>(&[D { v: u, g: [0.0; 2] }, D { v, g: [0.0; 2] }], &pd);
                 if !lc.v.is_finite() {
                     continue;
                 }
-                let wt = w(i) * w(j) * phi(x) * phi(y) * lc.v.exp();
+                assert!(
+                    lc.g.iter().all(|g| g.is_finite()),
+                    "{fam:?} {pv:?} at ({u}, {v})"
+                );
+                let wt = w(i) * phi(y) * lc.v.exp();
                 mass += wt;
-                score += wt * lc.g[0];
+                score[0] += wt * lc.g[0];
+                score[1] += wt * lc.g[1];
             }
-        }
-        let k2 = h * h / 9.0;
-        let (mass, score) = (mass * k2, score * k2);
-        assert!(mass.is_finite() && score.is_finite(), "{fam:?} θ {th}");
-        for (g, what) in [((mass - 1.0).abs(), "mass − 1"), (score.abs(), "score")] {
-            if g > worst.0 {
-                worst = (g, format!("{fam:?} θ {th} {what}"));
+            let k1 = h / 3.0;
+            let mass = mass * k1;
+            let score = [score[0] * k1, score[1] * k1];
+            assert!(
+                mass.is_finite() && score[0].is_finite() && score[1].is_finite(),
+                "{fam:?} {pv:?} u {u}: mass {mass}, score {score:?}"
+            );
+            for (g, what) in [
+                ((mass - 1.0).abs(), "mass − 1"),
+                (score[0].abs(), "score 1"),
+                (score[1].abs(), "score 2"),
+            ] {
+                if g > worst.0 {
+                    worst = (g, format!("{fam:?} {pv:?} u {u} {what}"));
+                }
             }
         }
     }
-    eprintln!(
-        "bivariate mass / score: worst {:.2e} ({})",
-        worst.0, worst.1
-    );
+    eprintln!("conditional margins: worst {:.2e} ({})", worst.0, worst.1);
     assert!(worst.0 < MASS_TOL, "{:e} ({})", worst.0, worst.1);
 }
 const MASS_TOL: f64 = 1e-4;
@@ -196,17 +242,22 @@ fn each_sampler_has_its_kendall_tau() {
     let nf = n as f64;
     let se = (2.0 * (2.0 * nf + 5.0) / (9.0 * nf * (nf - 1.0))).sqrt();
     let mut worst = (0.0f64, String::new());
-    for &(fam, th, want) in TAU_REFS {
-        let draws: Vec<Vec<f64>> = (0..n).map(|_| fam.sample(2, &[th], &mut rng)).collect();
+    let taus = TAU_REFS
+        .iter()
+        .map(|&(f, th, t)| (f, vec![th], t))
+        .chain(TAU2_REFS.iter().map(|&(f, p, t)| (f, p.to_vec(), t)));
+    for (fam, pv, want) in taus {
+        let th = pv[0];
+        let draws: Vec<Vec<f64>> = (0..n).map(|_| fam.sample(2, &pv, &mut rng)).collect();
         assert!(draws
             .iter()
             .flatten()
             .all(|v| v.is_finite() && *v > 0.0 && *v < 1.0));
         let got = tau(&draws, 0, 1);
         let z = (got - want).abs() / se;
-        eprintln!("{fam:?} θ {th}: τ {got:.4} vs {want:.4} ({z:.2} SE)");
+        eprintln!("{fam:?} {pv:?}: τ {got:.4} vs {want:.4} ({z:.2} SE)");
         if z > worst.0 {
-            worst = (z, format!("{fam:?} θ {th}"));
+            worst = (z, format!("{fam:?} {pv:?} (θ {th})"));
         }
     }
     let clayton3: Vec<Vec<f64>> = (0..n)
@@ -221,3 +272,4 @@ fn each_sampler_has_its_kendall_tau() {
     eprintln!("sampler Kendall τ: worst {:.2} SE ({})", worst.0, worst.1);
     assert!(worst.0 < 4.0, "{:.2} SE ({})", worst.0, worst.1);
 }
+
