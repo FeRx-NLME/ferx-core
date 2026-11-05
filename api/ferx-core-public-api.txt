@@ -1008,8 +1008,8 @@ pub fn ferx_core::io::fitrx::load_fit_from_bytes(bundle: &[u8]) -> core::result:
 pub fn ferx_core::io::fitrx::load_fit_from_bytes_without_population(bundle: &[u8]) -> core::result::Result<ferx_core::io::fitrx::LoadedFit, ferx_core::io::fitrx::FitrxError>
 pub fn ferx_core::io::fitrx::load_fit_without_population(path: &std::path::Path) -> core::result::Result<ferx_core::io::fitrx::LoadedFit, ferx_core::io::fitrx::FitrxError>
 pub fn ferx_core::io::fitrx::save_fit(result: &ferx_core::FitResult, population: &ferx_core::Population, model_source: &str, path: &std::path::Path, opts: ferx_core::io::fitrx::SaveFitOptions) -> core::result::Result<(), ferx_core::io::fitrx::FitrxError>
+pub fn ferx_core::io::fitrx::save_fit_from_bundle(result: &ferx_core::FitResult, bundle: &[u8], path: &std::path::Path, opts: ferx_core::io::fitrx::SaveFitOptions) -> core::result::Result<(), ferx_core::io::fitrx::FitrxError>
 pub fn ferx_core::io::fitrx::save_fit_to_bytes(result: &ferx_core::FitResult, population: &ferx_core::Population, model_source: &str, opts: ferx_core::io::fitrx::SaveFitOptions) -> core::result::Result<alloc::vec::Vec<u8>, ferx_core::io::fitrx::FitrxError>
-pub fn ferx_core::io::fitrx::save_loaded_fit(loaded: &ferx_core::io::fitrx::LoadedFit, path: &std::path::Path, opts: ferx_core::io::fitrx::SaveFitOptions) -> core::result::Result<(), ferx_core::io::fitrx::FitrxError>
 pub mod ferx_core::io::hash
 pub fn ferx_core::io::hash::sha256_bytes(bytes: &[u8]) -> alloc::string::String
 pub fn ferx_core::io::hash::sha256_file(path: &std::path::Path) -> core::result::Result<alloc::string::String, alloc::string::String>

@@ -80,12 +80,6 @@ pub struct LoadedFit {
     pub manifest: Manifest,
     /// The model-selection verdicts as the saving ferx reached them.
     pub verdicts: FitVerdicts,
-    /// `predictions.csv`'s data columns, which [`FitResult`] has no field for.
-    /// [`save_loaded_fit`] writes them back in place of a population.
-    recorded_rows: Vec<RecordedRows>,
-    /// The bundled `data.csv`, kept whether or not it was parsed into `population`,
-    /// so [`save_loaded_fit`] does not drop it.
-    data_csv: Option<Vec<u8>>,
 }
 
 /// One subject's data columns as `predictions.csv` holds them.
@@ -1241,50 +1235,102 @@ pub fn save_fit_to_bytes(
     )
 }
 
-/// Write a [`LoadedFit`] to `path` with no [`Population`], as [`save_fit`] does.
+/// Write `result` to `path` with no [`Population`], taking what it lacks from `bundle`,
+/// the bytes of the bundle it was loaded from.
 ///
-/// `predictions.csv`'s data columns come from the bundle it was loaded from, and a
-/// bundled `data.csv` is kept unless [`SaveFitOptions::include_data`] names another
-/// file. Refused with [`FitrxError::Unwritable`] when those columns do not cover
-/// `loaded.fit`: the bundle had none, or the subjects were changed after the load.
-pub fn save_loaded_fit(
-    loaded: &LoadedFit,
+/// `predictions.csv`'s `TIME`, `DV` and `OCC` columns have no field on [`FitResult`], so
+/// they come from `bundle`, as does its `data.csv` unless
+/// [`SaveFitOptions::include_data`] names another file, and the model text when `result`
+/// has none. Otherwise this is [`save_fit`], with its atomic write and hash checks.
+///
+/// Those columns only belong to `result` if its subjects are the bundle's, so anything
+/// else is refused with [`FitrxError::Unwritable`]: the subjects must have the same IDs in
+/// the same order and the same `PRED`, `IPRED`, `CWRES` and `IWRES`. The values are
+/// compared because IDs can repeat, and the residuals because they depend on `DV`. The
+/// save is also refused when `bundle` has no `TIME` or `DV` column.
+pub fn save_fit_from_bundle(
+    result: &FitResult,
+    bundle: &[u8],
     path: &Path,
     opts: SaveFitOptions,
 ) -> Result<(), FitrxError> {
-    check_recorded_rows(&loaded.fit, &loaded.recorded_rows)?;
+    let mut archive = ZipArchive::new(Cursor::new(bundle))?;
+    read_manifest(&mut archive)?;
+    let wire: FitWire = read_json(&mut archive, "fit.json")?;
+    let ebes_csv = read_text(&mut archive, "ebes.csv")?;
+    let preds_csv = read_text(&mut archive, "predictions.csv")?;
+    let subjects = parse_subjects(&ebes_csv, &preds_csv, None, wire.omega.matrix.rows)?;
+    let rows = parse_recorded_rows(&preds_csv, &subjects);
+    check_bundle_rows(result, &subjects, &rows)?;
+
+    let model_source = read_text(&mut archive, "model.ferx")?;
     let included = read_included_data(&opts)?;
-    let data = match &included {
-        Some((bytes, name)) => Some((bytes.as_slice(), name.as_str())),
-        None => loaded
-            .data_csv
-            .as_deref()
-            .map(|bytes| (bytes, "the bundled data.csv")),
+    let bundled = if included.is_none() && archive.index_for_name(DATA_ENTRY).is_some() {
+        Some(read_bytes(&mut archive, DATA_ENTRY)?)
+    } else {
+        None
     };
-    let bytes = encode_bundle(
-        &loaded.fit,
-        ObservedRows::Recorded(&loaded.recorded_rows),
-        &loaded.model_source,
-        data,
-    )?;
+    let data = match (&included, &bundled) {
+        (Some((bytes, name)), _) => Some((bytes.as_slice(), name.as_str())),
+        (None, Some(bytes)) => Some((bytes.as_slice(), "the bundled data.csv")),
+        (None, None) => None,
+    };
+    let bytes = encode_bundle(result, ObservedRows::Recorded(&rows), &model_source, data)?;
     replace_file(path, |file| file.write_all(&bytes))
 }
 
-fn check_recorded_rows(fit: &FitResult, rows: &[RecordedRows]) -> Result<(), FitrxError> {
-    if rows.len() != fit.subjects.len() {
+/// Equal value for value, `NaN` matching `NaN`: a missing cell is `NaN` on both sides.
+fn same_values(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x == y || (x.is_nan() && y.is_nan()))
+}
+
+/// Refuse `fit` unless `rows`, read from a bundle alongside `subjects`, are its own rows.
+/// See [`save_fit_from_bundle`].
+fn check_bundle_rows(
+    fit: &FitResult,
+    subjects: &[SubjectResult],
+    rows: &[RecordedRows],
+) -> Result<(), FitrxError> {
+    const ADVICE: &str = "pass the population to `save_fit`";
+    if subjects.len() != fit.subjects.len() {
         return Err(FitrxError::Unwritable(format!(
-            "the loaded bundle has data columns for {} subjects, the fit has {}; pass the \
-             population to `save_fit`",
-            rows.len(),
+            "the bundle has {} subjects, the fit has {}; {ADVICE}",
+            subjects.len(),
             fit.subjects.len()
         )));
     }
-    for (subject, row) in fit.subjects.iter().zip(rows) {
-        let n = subject.ipred.len();
+    for (i, ((subject, bundled), row)) in fit.subjects.iter().zip(subjects).zip(rows).enumerate() {
+        if subject.id != bundled.id {
+            return Err(FitrxError::Unwritable(format!(
+                "subject {} is {:?} in the fit and {:?} in the bundle; {ADVICE}",
+                i + 1,
+                subject.id,
+                bundled.id
+            )));
+        }
+        for (column, ours, theirs) in [
+            ("PRED", &subject.pred, &bundled.pred),
+            ("IPRED", &subject.ipred, &bundled.ipred),
+            ("CWRES", &subject.cwres, &bundled.cwres),
+            ("IWRES", &subject.iwres, &bundled.iwres),
+        ] {
+            if !same_values(ours, theirs) {
+                return Err(FitrxError::Unwritable(format!(
+                    "subject {} ({:?}) has a different {column} in the fit and the bundle; \
+                     {ADVICE}",
+                    i + 1,
+                    subject.id
+                )));
+            }
+        }
+        let n = bundled.ipred.len();
         if row.time.len() != n || row.dv.len() != n {
             return Err(FitrxError::Unwritable(format!(
-                "the loaded bundle's predictions.csv has {} TIME and {} DV values for \
-                 subject {:?}, which has {n} predictions; pass the population to `save_fit`",
+                "the bundle's predictions.csv has {} TIME and {} DV values for subject {:?}, \
+                 which has {n} predictions; {ADVICE}",
                 row.time.len(),
                 row.dv.len(),
                 subject.id
@@ -2174,7 +2220,7 @@ fn load_bundle<R: Read + std::io::Seek>(
     let conddist_csv = read_optional_text(&mut archive, "conddist.csv")?;
     let preds_csv = read_text(&mut archive, "predictions.csv")?;
     let model_source = read_text(&mut archive, "model.ferx")?;
-    let data_csv = if archive.index_for_name(DATA_ENTRY).is_some() {
+    let data_csv = if read_population && archive.index_for_name(DATA_ENTRY).is_some() {
         Some(read_bytes(&mut archive, DATA_ENTRY)?)
     } else {
         None
@@ -2182,7 +2228,6 @@ fn load_bundle<R: Read + std::io::Seek>(
 
     let n_eta = wire.omega.matrix.rows;
     let mut subjects = parse_subjects(&ebes_csv, &preds_csv, ebes_kappa_csv.as_deref(), n_eta)?;
-    let recorded_rows = parse_recorded_rows(&preds_csv, &subjects);
     let discrete_csv = read_optional_text(&mut archive, DISCRETE_ENTRY)?;
     attach_discrete_rows(&mut subjects, &ebes_csv, discrete_csv.as_deref())?;
     let ebe_kappas = if let Some(csv) = ebes_kappa_csv.as_deref() {
@@ -2240,16 +2285,16 @@ fn load_bundle<R: Read + std::io::Seek>(
     }
 
     // data.csv is optional — re-parse only when present.
-    let population = match &data_csv {
-        Some(bytes) if read_population => {
-            let (population, note) = read_bundled_population(bytes, &model_source, &fit)?;
+    let population = match data_csv {
+        Some(bytes) => {
+            let (population, note) = read_bundled_population(&bytes, &model_source, &fit)?;
             if let Some(note) = note {
                 fit.warnings.push(note);
                 crate::api::rebuild_warnings_structured(&mut fit);
             }
             population
         }
-        _ => None,
+        None => None,
     };
 
     Ok(LoadedFit {
@@ -2258,14 +2303,12 @@ fn load_bundle<R: Read + std::io::Seek>(
         population,
         manifest,
         verdicts,
-        recorded_rows,
-        data_csv,
     })
 }
 
 /// `predictions.csv`'s data columns, per subject. `parse_subjects` has checked the rows
 /// against `subjects`. A column the file lacks leaves its vectors empty, which only
-/// [`save_loaded_fit`] minds: a bundle that loads without it still loads.
+/// [`save_fit_from_bundle`] minds: a bundle that loads without it still loads.
 fn parse_recorded_rows(preds_csv: &str, subjects: &[SubjectResult]) -> Vec<RecordedRows> {
     let mut lines = preds_csv.lines();
     let header = parse_csv_row(lines.next().unwrap_or_default());
@@ -8075,17 +8118,16 @@ mod tests {
             s.observations = vec![1.1, f64::NAN, 3.3];
             s.occasions = vec![1, 1, 2];
         }
-        let first = dir.path().join("first.fitrx");
-        save_fit(&r, &p, "src\n", &first, SaveFitOptions::default()).unwrap();
+        let first = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
 
-        let loaded = load_fit_without_population(&first).unwrap();
+        let loaded = load_fit_from_bytes_without_population(&first).unwrap();
         assert!(loaded.population.is_none());
-        let second = dir.path().join("second.fitrx");
-        save_loaded_fit(&loaded, &second, SaveFitOptions::default()).unwrap();
+        let path = dir.path().join("second.fitrx");
+        save_fit_from_bundle(&loaded.fit, &first, &path, SaveFitOptions::default()).unwrap();
 
         let (a, b) = (
-            entries_2696(&std::fs::read(&first).unwrap()),
-            entries_2696(&std::fs::read(&second).unwrap()),
+            entries_2696(&first),
+            entries_2696(&std::fs::read(&path).unwrap()),
         );
         let preds = std::str::from_utf8(&b["predictions.csv"]).unwrap();
         assert!(
@@ -8095,9 +8137,23 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// A kept `data.csv` still answers to the fit's hash, and `include_data` replaces it.
+    /// With no `model_text` the bundle's `model.ferx` is the text written.
     #[test]
-    fn a_saved_loaded_fit_keeps_its_bundled_data() {
+    fn a_fit_without_model_text_takes_the_bundles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = fixture_2696();
+        let bundle = save_fit_to_bytes(&r, &p, "bundled\n", SaveFitOptions::default()).unwrap();
+        let mut fit = load_fit_from_bytes(&bundle).unwrap().fit;
+        fit.model_text = None;
+        let path = dir.path().join("out.fitrx");
+        save_fit_from_bundle(&fit, &bundle, &path, SaveFitOptions::default()).unwrap();
+        let written = entries_2696(&std::fs::read(&path).unwrap());
+        assert_eq!(written["model.ferx"], b"bundled\n");
+    }
+
+    /// A bundled `data.csv` still answers to the fit's hash, and `include_data` replaces it.
+    #[test]
+    fn a_resave_keeps_the_bundled_data() {
         let dir = tempfile::tempdir().unwrap();
         let (mut r, p) = fixture_2696();
         r.data_hash = Some(crate::io::hash::sha256_bytes(DATA_2696.as_bytes()));
@@ -8112,9 +8168,9 @@ mod tests {
             },
         )
         .unwrap();
-        let mut loaded = load_fit_from_bytes_without_population(&bytes).unwrap();
+        let mut fit = load_fit_from_bytes_without_population(&bytes).unwrap().fit;
         let out = dir.path().join("out.fitrx");
-        save_loaded_fit(&loaded, &out, SaveFitOptions::default()).unwrap();
+        save_fit_from_bundle(&fit, &bytes, &out, SaveFitOptions::default()).unwrap();
         let kept = entries_2696(&std::fs::read(&out).unwrap());
         assert_eq!(kept["data.csv"], DATA_2696.as_bytes());
 
@@ -8122,34 +8178,119 @@ mod tests {
         let opts = SaveFitOptions {
             include_data: Some(data.clone()),
         };
-        let err = save_loaded_fit(&loaded, &out, opts.clone()).unwrap_err();
+        let err = save_fit_from_bundle(&fit, &bytes, &out, opts.clone()).unwrap_err();
         assert_refused_2696(err, &[data.to_str().unwrap()]);
 
-        loaded.fit.data_hash = None;
-        save_loaded_fit(&loaded, &out, opts).unwrap();
+        fit.data_hash = None;
+        save_fit_from_bundle(&fit, &bytes, &out, opts).unwrap();
         let replaced = entries_2696(&std::fs::read(&out).unwrap());
         assert_eq!(replaced["data.csv"], b"ID,TIME\n");
 
-        loaded.fit.data_hash = Some("0".repeat(64));
-        let err = save_loaded_fit(&loaded, &out, SaveFitOptions::default()).unwrap_err();
+        fit.data_hash = Some("0".repeat(64));
+        let err = save_fit_from_bundle(&fit, &bytes, &out, SaveFitOptions::default()).unwrap_err();
         assert_refused_2696(err, &["the bundled data.csv"]);
     }
 
-    /// Rows that do not cover the fit are refused rather than written short or panicked
-    /// on: a `predictions.csv` with no TIME, and subjects changed after the load.
+    /// Two subjects with one ID and equal-length results, as a reused ID gives: the ID
+    /// check cannot tell them apart, so only the values can.
+    fn twins_2696() -> (FitResult, Vec<u8>) {
+        let (mut r, p) = fixture_2696();
+        r.subjects[1].id = r.subjects[0].id.clone();
+        for (k, s) in r.subjects.iter_mut().enumerate() {
+            let shift = k as f64 + 1.0;
+            s.n_obs = 3;
+            for v in [&mut s.pred, &mut s.ipred, &mut s.cwres, &mut s.iwres] {
+                *v = vec![shift, shift * 2.0, f64::NAN];
+            }
+        }
+        let bundle = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
+        let fit = load_fit_from_bytes(&bundle).unwrap().fit;
+        (fit, bundle)
+    }
+
+    /// TIME and DV would otherwise land on the wrong subject with no error. Each edit
+    /// leaves every length alone, so only the identity check can see it, and nothing is
+    /// written. The untouched fit passes, which also shows `NaN` matching `NaN`.
     #[test]
-    fn a_loaded_fit_whose_rows_do_not_cover_it_is_refused() {
+    fn subjects_that_are_not_the_bundles_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.fitrx");
+        let save = |fit: &FitResult, bundle: &[u8]| {
+            save_fit_from_bundle(fit, bundle, &out, SaveFitOptions::default())
+        };
+
+        let (r, p) = fixture_2696();
+        let bundle = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
+        let mut swapped = load_fit_from_bytes(&bundle).unwrap().fit;
+        swapped.subjects.swap(0, 1);
+        assert_refused_2696(
+            save(&swapped, &bundle).unwrap_err(),
+            &["subject 1 is \"S2\" in the fit and \"S1\" in the bundle"],
+        );
+        let mut renamed = load_fit_from_bytes(&bundle).unwrap().fit;
+        renamed.subjects[1].id = "S9".into();
+        assert_refused_2696(
+            save(&renamed, &bundle).unwrap_err(),
+            &["subject 2 is \"S9\""],
+        );
+
+        let (fit, bundle) = twins_2696();
+        let mut swapped = fit.clone();
+        swapped.subjects.swap(0, 1);
+        assert_refused_2696(
+            save(&swapped, &bundle).unwrap_err(),
+            &["subject 1 (\"S1\") has a different PRED"],
+        );
+        assert!(!out.exists());
+        save(&fit, &bundle).expect("the bundle's own subjects");
+    }
+
+    /// One column at a time, so a column dropped from the comparison reddens its own row.
+    #[test]
+    fn each_compared_column_can_refuse_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.fitrx");
+        let (fit, bundle) = twins_2696();
+        let columns: [(&str, fn(&mut SubjectResult) -> &mut Vec<f64>); 4] = [
+            ("PRED", |s| &mut s.pred),
+            ("IPRED", |s| &mut s.ipred),
+            ("CWRES", |s| &mut s.cwres),
+            ("IWRES", |s| &mut s.iwres),
+        ];
+        for (column, field) in columns {
+            let mut edited = fit.clone();
+            field(&mut edited.subjects[1])[0] += 1.0;
+            let err = save_fit_from_bundle(&edited, &bundle, &out, SaveFitOptions::default())
+                .unwrap_err();
+            let want = format!("subject 2 (\"S1\") has a different {column} ");
+            assert_refused_2696(err, &[&want]);
+        }
+    }
+
+    #[test]
+    fn same_values_needs_equal_length_and_treats_nan_as_equal() {
+        assert!(same_values(&[1.0, f64::NAN], &[1.0, f64::NAN]));
+        assert!(!same_values(&[1.0, f64::NAN], &[1.0, 2.0]));
+        assert!(!same_values(&[1.0], &[1.0, 2.0]));
+    }
+
+    /// Rows that do not cover the fit are refused rather than written short or panicked
+    /// on: fewer subjects than the bundle, and a `predictions.csv` with no TIME.
+    #[test]
+    fn a_bundle_whose_rows_do_not_cover_the_fit_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out.fitrx");
         let (r, p) = fixture_2696();
         let bytes = save_fit_to_bytes(&r, &p, "src\n", SaveFitOptions::default()).unwrap();
-        let save = |l: &LoadedFit| save_loaded_fit(l, &out, SaveFitOptions::default());
+        let save = |fit: &FitResult, bundle: &[u8]| {
+            save_fit_from_bundle(fit, bundle, &out, SaveFitOptions::default())
+        };
 
-        let mut fewer = load_fit_from_bytes(&bytes).unwrap();
-        fewer.fit.subjects.pop();
+        let mut fewer = load_fit_from_bytes(&bytes).unwrap().fit;
+        fewer.subjects.pop();
         assert_refused_2696(
-            save(&fewer).unwrap_err(),
-            &["for 2 subjects, the fit has 1"],
+            save(&fewer, &bytes).unwrap_err(),
+            &["the bundle has 2 subjects, the fit has 1"],
         );
 
         let preds = String::from_utf8(entries_2696(&bytes)["predictions.csv"].clone()).unwrap();
@@ -8167,8 +8308,20 @@ mod tests {
         zip.write_all(no_time.as_bytes()).unwrap();
         let rewritten = zip.finish().unwrap().into_inner();
 
-        let loaded = load_fit_from_bytes(&rewritten).expect("TIME is not needed to load");
-        assert_refused_2696(save(&loaded).unwrap_err(), &["0 TIME", "\"S1\""]);
+        let fit = load_fit_from_bytes(&rewritten)
+            .expect("TIME is not needed to load")
+            .fit;
+        assert_refused_2696(save(&fit, &rewritten).unwrap_err(), &["0 TIME", "\"S1\""]);
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_bundle_are_refused_by_a_resave() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, _) = fixture_2696();
+        let out = dir.path().join("out.fitrx");
+        let err = save_fit_from_bundle(&r, b"not a zip", &out, SaveFitOptions::default());
+        assert!(matches!(err, Err(FitrxError::Zip(_) | FitrxError::Io(_))));
         assert!(!out.exists());
     }
 }

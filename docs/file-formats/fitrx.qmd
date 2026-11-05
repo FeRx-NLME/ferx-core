@@ -86,21 +86,25 @@ would be. Other entries are carried over unchanged, and the manifest keeps its
 ## Saving a loaded fit
 
 `save_fit` needs a `Population` for the `TIME`, `DV` and `OCC` columns of
-`predictions.csv`, which `FitResult` does not hold. `save_loaded_fit` takes a `LoadedFit`
-instead and writes those columns back from the bundle it was loaded from, so a bundle
-with no `data.csv` can be saved again:
+`predictions.csv`, which `FitResult` does not hold. `save_fit_from_bundle` takes them from
+the bytes of the bundle the fit was loaded from instead, so a bundle with no `data.csv`
+can be saved again:
 
 ```rust
-use ferx_core::io::fitrx::{load_fit, save_loaded_fit, SaveFitOptions};
+use ferx_core::io::fitrx::{load_fit_from_bytes, save_fit_from_bundle, SaveFitOptions};
 
-let loaded = load_fit(Path::new("run1.fitrx"))?;
-save_loaded_fit(&loaded, Path::new("copy.fitrx"), SaveFitOptions::default())?;
+let bundle = std::fs::read("run1.fitrx")?;
+let loaded = load_fit_from_bytes(&bundle)?;
+save_fit_from_bundle(&loaded.fit, &bundle, Path::new("copy.fitrx"), SaveFitOptions::default())?;
 ```
 
-A bundled `data.csv` is kept, even after `load_fit_without_population`, unless
-`SaveFitOptions::include_data` names another file. It is checked against `data_hash` in
-either case. If the subjects in `loaded.fit` no longer match those columns, the save is
-refused.
+A bundled `data.csv` is kept unless `SaveFitOptions::include_data` names another file, and
+it is checked against `data_hash` in either case.
+
+Those columns only belong to the fit if its subjects are the bundle's, so the save is
+refused unless the subjects have the same IDs in the same order and the same `PRED`,
+`IPRED`, `CWRES` and `IWRES` values. To save a fit whose subjects have changed, pass the
+population to `save_fit`.
 
 ## Loading a bundle
 
