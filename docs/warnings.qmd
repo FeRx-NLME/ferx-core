@@ -214,7 +214,7 @@ reports each one it can reach, so the two do not disagree:
 | repeated-event records out of order, interval-censored, … | `E_RTTE_RECORDS` | with `--data` |
 | a binary DV outside {0, 1} | `E_BINARY_STATE` | with `--data` |
 | a CTMM state not declared, CTMM times out of order | `E_CTMM_RECORDS` | with `--data` |
-| LTBS on a hand-built model with a proportional or (natural-scale) combined error, per-CMT errors or an SDE, or a `LogCombined` error without LTBS | `E_LTBS_UNSUPPORTED` | the parser refuses it first |
+| LTBS on a hand-built model with a proportional or (natural-scale) combined error on any endpoint, a covariate-selected error model or an SDE, or a `LogCombined` error without LTBS | `E_LTBS_UNSUPPORTED` | the parser refuses it first |
 | `iiv_on_ruv`: an η also used in `[individual_parameters]`; a non-interaction method | `E_IIV_ON_RUV_SHARED_ETA`; `E_IIV_ON_RUV_METHOD` | yes |
 | the AGQ grid under IOV | `E_AGQ_GRID_TOO_LARGE` | with `--data` |
 | a derived `iov_occasion` that gives one occasion per subject | `E_IOV_SINGLE_OCCASION` | with `--data` |

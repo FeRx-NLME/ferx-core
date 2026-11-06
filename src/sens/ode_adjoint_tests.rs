@@ -732,6 +732,86 @@ fn ltbs_combined_kernel_objective_and_hessian_match_production() {
     assert!(fd < 5e-11, "FOCEI Hessian vs FD {fd:.2e}");
 }
 
+/// Per-endpoint LTBS combined error on the ODE engine (#2729): plasma (`CMT=2`) and a
+/// cumulative urine amount (`CMT=3`), each with its own `PROP`/`ADD`.
+const ODE_LTBS_COMBINED_PER_CMT: &str = r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_P ~ 0.1 (sd)
+  sigma ADD_P ~ 0.3 (sd)
+  sigma PROP_U ~ 0.2 (sd)
+  sigma ADD_U ~ 2.0 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(states=[depot, central, urine])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+  d/dt(urine) = 0.4 * (CL/V) * central
+[scaling]
+  y[CMT=2] = central / V
+  y[CMT=3] = urine
+[error_model]
+  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)
+  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+#[test]
+fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt() {
+    let model = parse_model_string(ODE_LTBS_COMBINED_PER_CMT).unwrap();
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let base = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 20.0];
+    let times: Vec<f64> = base.iter().flat_map(|&t| [t, t]).collect();
+    let mut s = subject(&model, doses, &times, &[0.1, -0.05]);
+    s.obs_cmts = (0..times.len()).map(|j| 2 + j % 2).collect();
+    // `subject` built the observations against CMT 1; rebuild them per endpoint.
+    let preds = crate::pk::compute_predictions_with_tv(
+        &model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    assert!(preds.iter().all(|p| p.is_finite()), "{preds:?}");
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, g)| g + 0.15 * (1.3 * j as f64).sin())
+        .collect();
+    // Both terms live on both endpoints: ADD/F straddles PROP on each.
+    let nat: Vec<f64> = preds.iter().map(|g| g.exp()).collect();
+    for (cmt, prop, add) in [(2usize, 0.1, 0.3), (3, 0.2, 2.0)] {
+        let r: Vec<f64> = (0..nat.len())
+            .filter(|&j| s.obs_cmts[j] == cmt)
+            .map(|j| add / nat[j] / prop)
+            .collect();
+        assert!(
+            r.iter().any(|&x| x > 1.0) && r.iter().any(|&x| x < 1.0),
+            "CMT={cmt}: ADD/(F·PROP) {r:?}"
+        );
+    }
+    assert!(
+        in_scope(&model, &s),
+        "per-CMT LTBS combined must be served by the ODE adjoint, not FD"
+    );
+    let g = objective_gaps::<2>(&model, &s, &model.default_params, &[0.1, -0.05]);
+    eprintln!("per-CMT LTBS combined objective gaps {g:?}");
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "kernel vs production: {g:?}");
+    let worst = parity(&model, &s);
+    eprintln!("per-CMT LTBS combined FOCEI vs reconverged FD {worst:.2e}");
+    // Measured 2.0e-9 (Linux x86_64); 5× headroom.
+    assert!(worst < 1e-8, "FOCEI worst relative difference {worst:.2e}");
+}
+
 #[test]
 fn analytic_adjoint_matches_reconverged_fd_steady_state() {
     let model = parse_model_string(ONE_CPT_ORAL).unwrap();

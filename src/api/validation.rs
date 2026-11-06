@@ -4515,7 +4515,8 @@ pub(crate) fn check_ctmm_records(
 
 /// `E_LTBS_UNSUPPORTED` on block `error_model`: LTBS (`log_transform = true`) with an
 /// error model the log-scale likelihood cannot represent — a proportional or (natural-scale)
-/// combined error, a per-CMT error spec, or an SDE (#1788) — and the converse, a
+/// combined error on any endpoint, a covariate-selected error spec, or an SDE (#1788) —
+/// and the converse, a
 /// `LogCombined` error without LTBS (#2729), whose `exp(−f)` loading reads `f` as a log
 /// prediction. The parser refuses all of these for a `.ferx` model, so only a hand-built
 /// `CompiledModel` reaches this; predictions would be log-wrapped while the variance still
@@ -4541,19 +4542,26 @@ pub(crate) fn check_ltbs_model(model: &CompiledModel) -> Vec<Diagnostic> {
         }
         return diags;
     }
-    if !matches!(
-        model.error_model,
-        ErrorModel::Additive | ErrorModel::LogCombined
-    ) {
+    // Every endpoint is scored on the log scale (the log-wrap is model-wide), so each
+    // one's error model must be a log-scale one; per-CMT is fine on those terms (#2729).
+    let log_scale = |em: ErrorModel| matches!(em, ErrorModel::Additive | ErrorModel::LogCombined);
+    let all_log_scale = match &model.error_spec {
+        ErrorSpec::Single(em) => log_scale(*em) && log_scale(model.error_model),
+        ErrorSpec::PerCmt(m) | ErrorSpec::Selected { endpoints: m, .. } => {
+            m.values().all(|e| log_scale(e.error_model))
+        }
+    };
+    if !all_log_scale {
         refuse(
             "LTBS (`log_transform = true`) requires `error_model = Additive` or \
-             `LogCombined`; proportional/combined error on the log scale is not supported",
+             `LogCombined` on every endpoint; proportional/combined error on the log \
+             scale is not supported",
         );
     }
-    if !matches!(model.error_spec, crate::types::ErrorSpec::Single(_)) {
+    if matches!(model.error_spec, ErrorSpec::Selected { .. }) {
         refuse(
-            "LTBS (`log_transform = true`) is not supported with per-CMT \
-             (`ErrorSpec::PerCmt`) error models",
+            "LTBS (`log_transform = true`) is not supported with covariate-selected \
+             (`ErrorSpec::Selected`) error models",
         );
     }
     if model.diffusion_theta_start.is_some() {

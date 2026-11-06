@@ -645,7 +645,24 @@ terms are live, with one observation per subject at `t = 0` that sits on the flo
 - **Additive or combined only.** LTBS pairs with additive error on the log scale or
   the combined form above; `log(DV) ~ proportional(...)` / `power(...)` are rejected
   at parse time.
-- **Single endpoint.** Not supported with per-CMT (multi-endpoint) error models.
+- **Per-endpoint: every endpoint or none.** `CMT=N:` lines may be LTBS — the
+  issue's case is plasma and urine, each with its own `PROP` and `ADD`:
+
+  ```
+  [error_model]
+    CMT=2: log(DV) ~ combined(PROP_P, ADD_P)   # plasma, mg/L
+    CMT=3: log(DV) ~ combined(PROP_U, ADD_U)   # cumulative urine, mg
+  ```
+
+  The log transform is model-wide (every prediction and, under `log(DV)`, every
+  `DV` is logged), so a block mixing log-scale and natural-scale lines, or
+  `log(DV) ~ ...` with `DV ~ log_...(...)`, is refused. Per-CMT lines take plain
+  σ names, so a magnitude expression on one argument needs the single-endpoint
+  form. Matched to NONMEM 7.6.0 at `MAXEVAL=0` on a seeded plasma + urine fixture
+  (`tests/ltbs_combined_cmt_nonmem_anchor.rs`): FOCEI 1236.250155, FOCE
+  1279.711094, and 1020.297559 at NONMEM's final estimates, within 1e-7 (the ODE
+  solvers' tolerance). Covariate-selected (`if/else`) error models stay
+  single-scale.
 - **No SDE.** Not supported with a `[diffusion]` (SDE/EKF) model.
 - **BLOQ/M3 is supported** — the LLOQ is log-transformed alongside `DV`.
 - A non-positive `DV` under `log(DV) ~ additive(...)` cannot be log-transformed;

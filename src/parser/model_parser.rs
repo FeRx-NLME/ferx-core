@@ -22165,6 +22165,9 @@ fn parse_error_model_inner(
     // and the `power(...)` exponent expression when the line is that form.
     let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
+    // Each per-CMT line's LTBS flags (#2729): the log transform is model-wide, so the
+    // lines must agree, which is checked once they are all read.
+    let mut per_cmt_flags: Vec<(usize, LtbsFlags)> = Vec::new();
     for line in &statements {
         // Strip inline `# ...` comments so the anchored statement regex sees a
         // clean `LHS ~ TYPE(args)` (a trailing comment would otherwise defeat
@@ -22337,8 +22340,8 @@ fn parse_error_model_inner(
 
         // LTBS validation. `log(DV) ~ log_additive(...)` double-logs the data and
         // is rejected; LTBS supports additive error on the log scale and the
-        // combined form with a natural-unit additive part (#2729); and the
-        // per-CMT (multi-endpoint) form is out of scope for LTBS.
+        // combined form with a natural-unit additive part (#2729). Per-CMT lines
+        // may be LTBS too, all of them or none (checked after the loop).
         if lhs_logged && type_is_log {
             let plain = if type_is_log_combined {
                 "combined"
@@ -22360,13 +22363,6 @@ fn parse_error_model_inner(
                 trimmed
             ));
         }
-        if log_transform && cmt_opt.is_some() {
-            return Err(
-                "[error_model] log-transform-both-sides (`log(DV) ~ ...` / `log_additive` / \
-                 `log_combined`) is not supported with per-CMT (multi-endpoint) error models"
-                    .to_string(),
-            );
-        }
         // The engine always log-transforms the `DV` column under LTBS — a
         // different LHS name (e.g. `log(CONC) ~ additive(...)`) would parse but
         // silently operate on `DV`, which is confusing. Reject it.
@@ -22386,7 +22382,10 @@ fn parse_error_model_inner(
         };
 
         match cmt_opt {
-            Some(cmt) => per_cmt.push((cmt, error_model, sigma_names)),
+            Some(cmt) => {
+                per_cmt.push((cmt, error_model, sigma_names));
+                per_cmt_flags.push((cmt, flags));
+            }
             None => singles.push((error_model, sigma_names, flags, exponent)),
         }
     }
@@ -22425,11 +22424,36 @@ fn parse_error_model_inner(
                         (multi-endpoint) error models"
                 .to_string());
         }
-        return Ok((
-            ParsedErrorModel::PerCmt(per_cmt),
-            LtbsFlags::default(),
-            None,
-        ));
+        // LTBS per endpoint (#2729). The engine logs every prediction and, under
+        // `log(DV)`, every `DV`, so it is all endpoints or none, under one DV
+        // convention — a log-scale plasma endpoint beside a natural-scale one would
+        // have its natural residual scored against a logged prediction.
+        let flags = per_cmt_flags[0].1;
+        let differ = |pick: fn(&LtbsFlags) -> bool| {
+            per_cmt_flags
+                .iter()
+                .find(|(_, f)| pick(f) != pick(&flags))
+                .map(|&(cmt, _)| cmt)
+        };
+        if let Some(cmt) = differ(|f| f.log_transform) {
+            return Err(format!(
+                "[error_model] log-transform-both-sides applies to every endpoint or none: \
+                 CMT={} and CMT={cmt} disagree. Write every `CMT=N:` line on the log scale \
+                 (`log(DV) ~ additive/combined(...)` or `DV ~ log_additive/log_combined(...)`) \
+                 or none of them",
+                per_cmt_flags[0].0
+            ));
+        }
+        if let Some(cmt) = differ(|f| f.dv_pre_logged) {
+            return Err(format!(
+                "[error_model] CMT={} and CMT={cmt} disagree on the scale of `DV`: one is \
+                 written `log(DV) ~ ...` (DV on the natural scale, the engine logs it) and the \
+                 other `DV ~ log_...(...)` (DV already logged). The `DV` column has one \
+                 scale; use one spelling on every line",
+                per_cmt_flags[0].0
+            ));
+        }
+        return Ok((ParsedErrorModel::PerCmt(per_cmt), flags, None));
     }
 
     match singles.into_iter().next() {

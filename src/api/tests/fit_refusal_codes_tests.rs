@@ -194,8 +194,30 @@ fn ltbs_refusals_are_coded() {
     };
     let mut proportional = ltbs();
     proportional.error_model = ErrorModel::Proportional;
+    // A per-CMT spec is accepted under LTBS when every endpoint is a log-scale one
+    // (#2729); one proportional endpoint is refused.
+    let endpoint = |error_model, sigma_idx: Vec<usize>| crate::types::EndpointError {
+        error_model,
+        sigma_idx,
+    };
     let mut per_cmt = ltbs();
-    per_cmt.error_spec = ErrorSpec::PerCmt(std::collections::HashMap::new());
+    per_cmt.error_spec = ErrorSpec::PerCmt(std::collections::HashMap::from([
+        (2, endpoint(ErrorModel::LogCombined, vec![0, 1])),
+        (3, endpoint(ErrorModel::Proportional, vec![2])),
+    ]));
+    let mut per_cmt_ok = ltbs();
+    per_cmt_ok.error_spec = ErrorSpec::PerCmt(std::collections::HashMap::from([
+        (2, endpoint(ErrorModel::LogCombined, vec![0, 1])),
+        (3, endpoint(ErrorModel::Additive, vec![2])),
+    ]));
+    let mut selected = ltbs();
+    selected.error_spec = ErrorSpec::Selected {
+        selector: crate::types::ErrorSelector {
+            eval: Box::new(|_| 0),
+            branch_labels: vec!["else".to_string()],
+        },
+        endpoints: std::collections::HashMap::from([(0, endpoint(ErrorModel::Additive, vec![0]))]),
+    };
     let mut sde = ltbs();
     sde.diffusion_theta_start = Some(0);
     // #2729: the converse — a `LogCombined` spec whose prediction is never logged.
@@ -207,7 +229,8 @@ fn ltbs_refusals_are_coded() {
             "proportional",
             proportional,
             "LTBS (`log_transform = true`) requires `error_model = Additive` or \
-             `LogCombined`; proportional/combined error on the log scale is not supported",
+             `LogCombined` on every endpoint; proportional/combined error on the log \
+             scale is not supported",
         ),
         (
             "LogCombined without LTBS",
@@ -216,10 +239,17 @@ fn ltbs_refusals_are_coded() {
              additive part loads `exp(−f)`, which reads the prediction on the log scale",
         ),
         (
-            "per-CMT error",
+            "per-CMT with a proportional endpoint",
             per_cmt,
-            "LTBS (`log_transform = true`) is not supported with per-CMT \
-             (`ErrorSpec::PerCmt`) error models",
+            "LTBS (`log_transform = true`) requires `error_model = Additive` or \
+             `LogCombined` on every endpoint; proportional/combined error on the log \
+             scale is not supported",
+        ),
+        (
+            "covariate-selected error",
+            selected,
+            "LTBS (`log_transform = true`) is not supported with covariate-selected \
+             (`ErrorSpec::Selected`) error models",
         ),
         (
             "SDE",
@@ -247,6 +277,10 @@ fn ltbs_refusals_are_coded() {
     assert!(
         crate::api::validation::check_ltbs_model(&log_combined).is_empty(),
         "LTBS on a LogCombined single-endpoint model is accepted"
+    );
+    assert!(
+        crate::api::validation::check_ltbs_model(&per_cmt_ok).is_empty(),
+        "LTBS on per-CMT log-scale endpoints is accepted"
     );
 }
 
