@@ -386,6 +386,16 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   covariates and `TIME` — including every `weight =` model — has no direct-θ
   channel at all, and keeps the fast closed forms everywhere.
 
+### Not available with adaptive dosing {#magnitude-adaptive}
+
+Adaptive dosing (`simulate_adaptive*`) refuses any residual-error magnitude
+(`E_ADAPTIVE_UNSUPPORTED`): a magnitude expression, a
+[`weight =`](#residual-weighting-weight-...), a [`power(...)`](#power) exponent,
+or a magnitude on a `CMT=N:` line. The controller assay draws a `Dv` reading
+from the bare sigma, so the factor would otherwise be dropped from the signal
+while the run reported success (#2741). Plain `simulate()` applies the
+magnitude.
+
 ### On `CMT=N:` lines and in `if/else` branches {#endpoint-magnitude}
 
 A magnitude expression works on a [`CMT=N:`](#multiple-endpoints-per-cmt-error-models)
@@ -427,9 +437,9 @@ Restrictions on these forms:
   rejected, because a row holds one multiplier per sigma. Declare a second sigma.
 - **`weight =` and `power(...)` stay refused** on `CMT=N:` lines and in `if/else` branches.
   Write the factor as a magnitude expression instead of a `weight =`.
-- **Adaptive dosing** (`simulate_adaptive*`) refuses a magnitude expression on a `CMT=N:`
-  line, because the assay draws from the bare sigma. It refuses a covariate-selected error
-  model in any case.
+- **Adaptive dosing** (`simulate_adaptive*`) refuses these magnitudes, as it refuses
+  [every magnitude](#magnitude-adaptive), because the assay
+  draws from the bare sigma. It refuses a covariate-selected error model in any case.
 
 #### Comparison with NONMEM {#endpoint-magnitude-nonmem-anchor}
 

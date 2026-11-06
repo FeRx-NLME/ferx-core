@@ -56,21 +56,23 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
     Ok(())
 }
 
-/// Reject an adaptive-dosing simulation on a `CMT=N:` line carrying a magnitude
-/// expression (#2731). [`assay_resid_var`] has no observation row to evaluate the
-/// expression on, so the assay would draw on the bare sigma and report the run as if
-/// the factor had applied.
-fn reject_endpoint_magnitude_for_adaptive(model: &CompiledModel) -> Result<(), EngineError> {
-    if model
-        .ruv_magnitude
-        .as_ref()
-        .is_some_and(|rm| rm.has_endpoint_magnitude())
-    {
+/// Reject an adaptive-dosing simulation on any active residual-error magnitude: a sigma
+/// scaled by an expression, a `weight =`, a `power(σ, P)` exponent, or a magnitude on a
+/// `CMT=N:` line (#2731, #2741). [`assay_resid_var`] has no observation row to evaluate
+/// a magnitude on, so the assay would draw on the bare sigma and report the run as if
+/// the factor had applied — measured on #2741: a tenfold multiplier and a cubed loading
+/// left every `Dv` reading bit-identical to the bare model's.
+///
+/// One gate, [`RuvMagnitude::is_active`](crate::types::RuvMagnitude::is_active), so the
+/// single-endpoint and endpoint-keyed forms cannot drift apart.
+fn reject_ruv_magnitude_for_adaptive(model: &CompiledModel) -> Result<(), EngineError> {
+    if model.has_custom_ruv_magnitude() {
         return Err(super::entry_refusals::adaptive_unsupported(
             Some("error_model"),
-            "adaptive-dosing simulation does not support a magnitude expression on a `CMT=N:` \
-             line: the assay draws its residual error from the bare sigma, without the \
-             expression. Use bare sigma names in `[error_model]`.",
+            "adaptive-dosing simulation does not support a residual-error magnitude (a sigma \
+             multiplied by an expression, a `weight =`, a `power(...)` exponent, or a \
+             magnitude on a `CMT=N:` line). The assay draws its residual error from the bare \
+             sigma, without the magnitude. Use bare sigma names in `[error_model]`.",
         ));
     }
     Ok(())
@@ -93,7 +95,7 @@ pub(crate) fn check_adaptive_model_data(
     }
     first_error(&check_simulation_data(model, population))?;
     reject_selected_error_for_adaptive(model)?;
-    reject_endpoint_magnitude_for_adaptive(model)
+    reject_ruv_magnitude_for_adaptive(model)
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
