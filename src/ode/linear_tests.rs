@@ -1667,3 +1667,30 @@ fn spectral_declines_repeated_and_complex_spectra() {
         }
     }
 }
+
+#[test]
+fn the_singleton_precheck_sees_only_acyclic_compartments() {
+    // A transit chain at one rate: every compartment is acyclic, its diagonal an exact
+    // eigenvalue, so the repeat is declined without an eigensolve.
+    #[rustfmt::skip]
+    let chain = [
+        -0.7, 0.0, 0.0,
+         0.7, -0.7, 0.0,
+         0.0, 0.7, -0.2,
+    ];
+    assert!(repeated_singleton_eigenvalue(&chain, 3));
+    // Equal diagonals on a cycle (central ↔ peripheral) are not eigenvalues: the eigenvalues
+    // of [[-1, 1], [1, -1]] are 0 and −2, distinct, so the precheck must leave them to
+    // `spectral_of`, which accepts them.
+    let cycle = [-1.0, 1.0, 1.0, -1.0];
+    assert!(!repeated_singleton_eigenvalue(&cycle, 2));
+    assert!(spectral_of::<f64>(&cycle, 2, &cycle).is_some());
+    // Distinct acyclic rates pass through.
+    #[rustfmt::skip]
+    let oral = [
+        -1.5, 0.0,
+         1.5, -0.2,
+    ];
+    assert!(!repeated_singleton_eigenvalue(&oral, 2));
+    assert!(spectral_of::<f64>(&oral, 2, &oral).is_some());
+}

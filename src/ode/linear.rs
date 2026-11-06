@@ -554,37 +554,54 @@ fn spectral_enabled() -> bool {
     !crate::devflags::off("spectral")
 }
 
-thread_local! {
-    /// The value matrices `spectral` last declined on this thread: a transit chain's generator
-    /// is the same matrix in every segment of a subject (and in its `f64` and dual runs), so a
-    /// repeat costs one comparison instead of an eigensolve that declines again.
-    static SPECTRAL_DECLINED: std::cell::RefCell<Vec<Vec<u64>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// How many declined generators [`SPECTRAL_DECLINED`] remembers.
-const SPECTRAL_DECLINED_MAX: usize = 8;
-
 pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
     if n == 0 || n > 6 {
         return None;
     }
     let vals: Vec<f64> = a.iter().map(|x| x.val()).collect();
-    let key: Vec<u64> = vals.iter().map(|v| v.to_bits()).collect();
-    if SPECTRAL_DECLINED.with(|d| d.borrow().iter().any(|k| *k == key)) {
+    if repeated_singleton_eigenvalue(&vals, n) {
         return None;
     }
-    let out = spectral_of(a, n, &vals);
-    if out.is_none() {
-        SPECTRAL_DECLINED.with(|d| {
-            let mut d = d.borrow_mut();
-            if d.len() == SPECTRAL_DECLINED_MAX {
-                d.remove(0);
-            }
-            d.push(key);
-        });
+    spectral_of(a, n, &vals)
+}
+
+/// Whether two compartments that sit on no cycle of `A`'s coupling graph have (nearly) the same
+/// diagonal. Such a compartment is a 1×1 diagonal block of `A`'s block-triangular form, so its
+/// diagonal *is* an eigenvalue, exactly: a transit chain at one rate shows its repeated
+/// eigenvalue here, without the eigensolve [`spectral_of`] would run only to decline it
+/// (measured: that eigensolve made an all-declined transit fit 3% slower than Padé alone). The
+/// gap is relative to the larger of the two diagonals, at most the spectral radius
+/// `spectral_of` measures against, so this declines nothing `spectral_of` would accept.
+fn repeated_singleton_eigenvalue(vals: &[f64], n: usize) -> bool {
+    // reach[i][j]: j reachable from i along nonzero couplings (Warshall, n ≤ 6).
+    let mut reach = [[false; 6]; 6];
+    for i in 0..n {
+        for j in 0..n {
+            reach[i][j] = i != j && vals[i * n + j] != 0.0;
+        }
     }
-    out
+    for k in 0..n {
+        for i in 0..n {
+            if reach[i][k] {
+                for j in 0..n {
+                    reach[i][j] |= reach[k][j];
+                }
+            }
+        }
+    }
+    let mut diag = [0.0_f64; 6];
+    let mut m = 0;
+    for i in 0..n {
+        if !reach[i][i] {
+            diag[m] = vals[i * n + i];
+            m += 1;
+        }
+    }
+    (0..m).any(|i| {
+        (i + 1..m).any(|j| {
+            (diag[i] - diag[j]).abs() <= SPECTRAL_MIN_REL_GAP * diag[i].abs().max(diag[j].abs())
+        })
+    })
 }
 
 fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64]) -> Option<Spectral<T>> {
