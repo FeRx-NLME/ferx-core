@@ -8182,6 +8182,7 @@ fn both_entry_points_reject_a_cmt_line_magnitude() {
     assert_eq!(err.code(), Some("E_ADAPTIVE_UNSUPPORTED"), "{err}");
     assert!(err.to_string().contains(want), "{err}");
     assert!(err.to_string().contains("without the expression"), "{err}");
+    assert!(err.to_string().contains("Use bare sigma names"), "{err}");
     let err =
         simulate_adaptive_from_spec(&scaled, &pop, &scaled.default_params, 1, &spec, &spec_opts)
             .expect_err("simulate_adaptive_from_spec must reject a CMT-line magnitude");

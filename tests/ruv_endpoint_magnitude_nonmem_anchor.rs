@@ -17,6 +17,8 @@
 //! | `shared` | one sigma on both endpoints, factor on one | −282.091324165 | 5.9e-8 |
 //! | `ifelse` | one sigma in both branches, factor on one | −200.188323133 | 3.8e-8 |
 //!
+//! Gaps measured on Linux x86_64 (`tools/linux-test.sh`); macOS arm64 prints the same digits.
+//!
 //! `shared` and `ifelse` are the arms a per-sigma multiplier cannot pass: the factor is on
 //! the same sigma slot the other endpoint reads bare, so it has to follow the row's
 //! endpoint. `ifelse` and `mixed` also reach a `combined` endpoint, whose sigmas are not
