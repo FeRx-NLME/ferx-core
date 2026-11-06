@@ -405,6 +405,7 @@ mod tests {
         let ebe = |converged, used_fallback, nm_polished| EbeResult {
             eta: DVector::zeros(1),
             h_matrix: DMatrix::zeros(1, 1),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged,
             used_fallback,
