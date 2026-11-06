@@ -13,6 +13,7 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 
 | Anchors | ferx feature | NONMEM control stream | ferx model |
 |---------|--------------|-----------------------|------------|
+| **Compartment on/off** | `EVID=2`, `CMT=-N` / `CMT=N` on `[odes]` models, one subject per measured case — [#2732](https://github.com/FeRx-NLME/ferx-core/issues/2732) (`ADVAN6 TOL=12`, `MAXEVAL=0`; dataset from `cmt_toggle_gen.py`) | `cmt_toggle.ctl` | `cmt_toggle.ferx`, `tests/cmt_toggle_nonmem_anchor.rs` |
 | **Savic transit** | `transit(n, mtt)` — PR [#343](https://github.com/FeRx-NLME/ferx-core/pull/343) | `savic_transit.ctl` | `transit_savic_fit.ferx` |
 | **Freijer & Post IG** | `igd(mat, cv2)` — issue [#347](https://github.com/FeRx-NLME/ferx-core/issues/347) | `freijer_ig.ctl` | *(in `tests/igd_nonmem_anchor.rs`)* |
 | **Weibull** | `weibull(td, beta)` — [#322](https://github.com/FeRx-NLME/ferx-core/issues/322) Phase 2 | `weibull_absorption.ctl` | `weibull_absorption_fit.ferx` |

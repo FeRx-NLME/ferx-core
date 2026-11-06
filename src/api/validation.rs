@@ -3223,6 +3223,178 @@ fn population_uses_analytical_pk(model: &CompiledModel, population: &Population)
         .any(|s| crate::pk::subject_feeds_analytical_pk(model, s))
 }
 
+/// Refuse what compartment on/off rows (`EVID=2`, `CMT=-N`, #2732) cannot do here.
+///
+/// Only the event-driven ODE walk has the record, so anything that integrates elsewhere is
+/// refused rather than run with the row ignored: an analytical or compartment-free model, an
+/// SDE, and an endpoint model, whose hazard or transition solve is the dense walk. A compartment
+/// fed by a built-in absorption input has no amount of its own to switch.
+///
+/// The rest mirrors NONMEM 7.5.1, which stops the run on an observation of an off compartment
+/// ("COMPARTMENT ASSOCIATED WITH THE PREDICTION IS OFF"). The record replays the status the
+/// way the engines reach it: a reset turns every compartment on, and a dose turns its own on
+/// at the record for this purpose, since NONMEM accepts an observation between a lagged dose's
+/// record and its arrival and reads zero there. An `SS=1` dose is refused while anything is off,
+/// because its periodic solve would integrate the compartment as if it were on.
+pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let Some(subject) = population.subjects.iter().find(|s| s.has_cmt_toggles()) else {
+        return Vec::new();
+    };
+    let refused = |why: &str, block: &str| {
+        vec![Diagnostic::error(
+            "E_CMT_TOGGLE_UNSUPPORTED",
+            format!(
+                "subject {} turns a compartment off (`EVID=2` with a negative `CMT`), which {why}.",
+                subject.id
+            ),
+        )
+        .with_block(block)]
+    };
+    let Some(spec) = model.ode_spec.as_ref() else {
+        return refused(
+            "needs an `[odes]` model: write the system as `ode(states=[...])`",
+            "structural_model",
+        );
+    };
+    if model.is_sde() {
+        return refused("an SDE model cannot honour", "diffusion");
+    }
+    if crate::api::run::model_routes_rows_by_cmt(model) {
+        return refused(
+            "a model with a declared endpoint cannot honour",
+            "structural_model",
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum Event {
+        Reset,
+        Dose(usize),
+        Toggle(crate::types::CmtToggle),
+        Obs(usize),
+    }
+    let rank = |e: &Event| match e {
+        Event::Reset => 0,
+        Event::Dose(_) => 1,
+        Event::Toggle(_) => 2,
+        Event::Obs(_) => 3,
+    };
+    let mut diags = Vec::new();
+    for s in population.subjects.iter().filter(|s| s.has_cmt_toggles()) {
+        for c in s.cmt_toggles.iter().filter(|c| !c.on) {
+            let cmt = c.state + 1;
+            if c.state >= spec.n_states {
+                diags.push(
+                    Diagnostic::error(
+                        "E_CMT_TOGGLE_OUT_OF_RANGE",
+                        format!(
+                            "subject {}, time {}: `CMT=-{cmt}` turns off compartment {cmt}, but \
+                             the `[odes]` block declares only {} state(s) (CMT is 1-based: {:?}).",
+                            s.id, s.pk_only_raw_times[c.pk_only], spec.n_states, spec.state_names,
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+            } else if spec.input_rate.iter().any(|f| f.cmt == c.state) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_CMT_TOGGLE_UNSUPPORTED",
+                        format!(
+                            "subject {}, time {}: `CMT=-{cmt}` turns off `{}`, which a built-in \
+                             absorption input feeds. Only a compartment dosed directly or fed by \
+                             its `d/dt` terms can be switched.",
+                            s.id, s.pk_only_raw_times[c.pk_only], spec.state_names[c.state],
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+            }
+        }
+        if !diags.is_empty() {
+            return diags;
+        }
+
+        let mut events: Vec<(f64, Event)> =
+            s.reset_times.iter().map(|&t| (t, Event::Reset)).collect();
+        events.extend(
+            s.doses
+                .iter()
+                .enumerate()
+                .map(|(k, d)| (d.time, Event::Dose(k))),
+        );
+        events.extend(
+            s.cmt_toggles
+                .iter()
+                .map(|&c| (s.pk_only_times[c.pk_only], Event::Toggle(c))),
+        );
+        events.extend(
+            s.obs_times
+                .iter()
+                .enumerate()
+                .map(|(j, &t)| (t, Event::Obs(j))),
+        );
+        events.sort_by(|a, b| a.0.total_cmp(&b.0).then(rank(&a.1).cmp(&rank(&b.1))));
+        let mut off: Vec<usize> = Vec::new();
+        for (t, event) in events {
+            match event {
+                Event::Reset => off.clear(),
+                Event::Toggle(c) => {
+                    off.retain(|&x| x != c.state);
+                    if !c.on {
+                        off.push(c.state);
+                    }
+                }
+                Event::Dose(k) => {
+                    let d = &s.doses[k];
+                    // Before the dose turns its own compartment on: an `SS=1` dose into an
+                    // off compartment is the same refusal.
+                    if d.ss && !off.is_empty() {
+                        diags.push(
+                            Diagnostic::error(
+                                "E_CMT_TOGGLE_SS",
+                                format!(
+                                    "subject {}, time {t}: an `SS=1` dose while `{}` is off. Turn \
+                                     the compartment on before the steady-state record, or off \
+                                     after it.",
+                                    s.id, spec.state_names[off[0]],
+                                ),
+                            )
+                            .with_block("odes"),
+                        );
+                        break;
+                    }
+                    off.retain(|&x| x != d.cmt_idx());
+                }
+                Event::Obs(j) => {
+                    let cmt = s
+                        .obs_cmts
+                        .get(j)
+                        .copied()
+                        .unwrap_or(crate::io::datareader::DEFAULT_CMT);
+                    if cmt >= 1 && off.contains(&(cmt - 1)) {
+                        diags.push(
+                            Diagnostic::error(
+                                "E_OBS_CMT_OFF",
+                                format!(
+                                    "subject {}, time {}: an observation of compartment {cmt} \
+                                     (`{}`) while it is off. Turn it on before this record, or \
+                                     observe it before the off row.",
+                                    s.id,
+                                    s.obs_raw_times[j],
+                                    spec.state_names[cmt - 1],
+                                ),
+                            )
+                            .with_block("odes"),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    diags
+}
+
 /// Every dose must name a compartment the **analytical** engine can actually
 /// deliver it into (#375). The datareader cannot make this call — it has no
 /// model — and the parse-time infusable check
@@ -3286,10 +3458,19 @@ fn population_uses_analytical_pk(model: &CompiledModel, population: &Population)
 /// Reported once per `(kind, compartment)` so a dataset with many offending
 /// rows yields one actionable error per cause, matching
 /// [`check_modeled_dose_rates`].
+///
+/// Compartment on/off rows are checked first ([`check_cmt_toggles`]), so every entry point
+/// that validates its doses refuses what it cannot honour.
 pub(crate) fn check_dose_compartments(
     model: &CompiledModel,
     population: &Population,
 ) -> Vec<Diagnostic> {
+    // Ahead of everything else here, the compartment-free return below included: a model
+    // that cannot honour an off row must not run with the row ignored (#2732).
+    let toggle_diags = check_cmt_toggles(model, population);
+    if !toggle_diags.is_empty() {
+        return toggle_diags;
+    }
     // A compartment-free model (#811) applies no dose on any engine, and its
     // `pk_model` is the `one_cpt_iv` **placeholder** the parser installs for the
     // class — so a `CMT=2` dose would be rejected as out of that placeholder's

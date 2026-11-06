@@ -227,6 +227,10 @@ pub(crate) fn has_infusion_into_input_rate(model: &CompiledModel, subject: &Subj
 /// η-directions, so it has no `MAX_ODE_SENS_DIM` table to overflow and shares this gate
 /// instead of a copy of it.
 pub(crate) fn static_walk_subject_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    // A compartment on/off row is a state event, which only the event-driven walk has (#2732).
+    if subject.has_cmt_toggles() {
+        return false;
+    }
     // Infusion into a built-in absorption compartment (#719 gap 2) → FD fallback (see
     // `has_infusion_into_input_rate`): the f64 prediction is exact, but the dual walk's `+rate`
     // injection would double-count the mass the convolved `R_in_inf` already delivers.
@@ -466,9 +470,23 @@ pub(crate) fn event_walk_subject_supported(model: &CompiledModel, subject: &Subj
     event_walk_scope(model, subject)
 }
 
+/// Whether a dose lands on a compartment this subject switches at a time that moves with the
+/// parameters (#2732): a lagged arrival or a modeled window. That arrival turns the compartment
+/// on, so the right-hand side changes across a moving boundary, which no saltation here
+/// carries. Such a subject routes to FD.
+pub(crate) fn toggled_cmt_has_moving_dose(model: &CompiledModel, subject: &Subject) -> bool {
+    subject.doses.iter().any(|d| {
+        subject.cmt_toggles.iter().any(|c| c.state == d.cmt_idx())
+            && (model.has_lagtime_on_cmt(d.cmt_1based()) || !d.is_fixed())
+    })
+}
+
 /// The one event-driven-walk scope gate behind `event_walk_subject_supported` (and, before
 /// #2093, the retired `ode_tvcov_supported`).
 fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
+    if toggled_cmt_has_moving_dose(model, subject) {
+        return false;
+    }
     // Infusion into a built-in absorption compartment (#719 gap 2) → FD fallback (the f64
     // prediction is exact; the dual walk would double-count the suppressed `+rate`). Same decline
     // as the static gate above — see `has_infusion_into_input_rate`.
@@ -566,6 +584,7 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     if !model_ok
         || !(subject.has_tv_covariates()
             || has_reset_snapshots
+            || subject.has_cmt_toggles()
             || model.has_lagtime()
             || has_route_lag
             || has_ss
@@ -1280,7 +1299,7 @@ pub(crate) fn ode_iov_walk_scope(
     subject: &Subject,
     layout: &crate::stats::stacked_layout::StackedLayout,
 ) -> Option<()> {
-    if !ode_iov_model_scope(model) {
+    if !ode_iov_model_scope(model) || toggled_cmt_has_moving_dose(model, subject) {
         return None;
     }
     // Single scan for the periodic steady-state predicate reused by every SS gate
@@ -2886,6 +2905,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     // spelling (`eval_rhs_at_offset`), and every pointwise input rate reads its `tad`
     // shifted the same way (its dose lags by `−s`). The window membership is value-based and
     // unchanged by a value-zero `s`.
+    // Compartments off at this point of the walk (#2732), production's `off_states`: a
+    // `RefCell` because the closures below read it while the event arms change it.
+    let off_states: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
     let boundary_velocity = |state: &[T],
                              side_params: &[T],
                              t_ev: f64,
@@ -2984,6 +3006,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 t_ev,
                 &mut v,
             );
+        }
+        for &c in off_states.borrow().iter() {
+            v[c] = T::from_f64(0.0);
         }
         v
     };
@@ -3230,6 +3255,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                         du,
                     );
                 }
+                for &c in off_states.borrow().iter() {
+                    du[c] = T::from_f64(0.0);
+                }
             };
             // Single save point per segment — a stack array avoids the per-segment
             // heap allocation of `vec![t_event]` (#449 review #14).
@@ -3270,6 +3298,11 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // keep the derivative of a dose the value no longer has. The TAD anchor fold below
             // is not: production anchors TAD on every dose, live or not.
             let arrival_live = event_gate().live(&subject.doses, idx);
+            // A live arrival turns its compartment on (#2732). Its boundary does not move, by
+            // `toggled_cmt_has_moving_dose`, so nothing below differentiates across the switch.
+            if arrival_live {
+                off_states.borrow_mut().retain(|&c| c != d.cmt_idx());
+            }
             // The anchor this arrival establishes, computed ONCE and used by every consumer in
             // this arm: the post side of the saltation below, and the segment the arrival opens.
             //
@@ -3934,6 +3967,16 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // run at this record, and the next segment must use its params (with κ fixed
             // at zero under IOV, matching production `predict_iov`).
             last_params = &pk_at_pk_only[idx];
+            // A compartment on/off row zeroes its state, jet included: the amount after it
+            // is the constant 0, whatever the parameters (#2732).
+            for toggle in subject.cmt_toggles.iter().filter(|c| c.pk_only == idx) {
+                crate::ode::predictions::apply_cmt_toggle(
+                    toggle,
+                    &mut u,
+                    &mut off_states.borrow_mut(),
+                    T::from_f64(0.0),
+                );
+            }
         } else if kind == K_DOSE_REC {
             // #1073: the dose row. A NONMEM record — `$PK` ran here, so its snapshot
             // becomes current and governs the segment that ended here. No state jump and
@@ -4173,6 +4216,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // `reset_floor`) — the active-set filter and the rate-off saltation below both
             // consult it (#472 review #1/#2).
             reset_floor = t_event;
+            off_states.borrow_mut().clear();
         }
     }
     states

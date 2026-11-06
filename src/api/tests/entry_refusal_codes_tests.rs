@@ -1415,3 +1415,32 @@ fn ferx_check_reports_what_fit_refuses() {
         }
     }
 }
+
+/// The adaptive walk has no compartment on/off record (#2732), so it must refuse the row
+/// rather than integrate through the off window.
+#[test]
+fn adaptive_refuses_a_compartment_off_row() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction};
+    let ode = parse_model_string(ODE_ADAPTIVE).expect("parse");
+    let mut subject = observed("1", &[1.0]);
+    subject.pk_only_times = vec![0.5];
+    subject.pk_only_raw_times = vec![0.5];
+    subject.cmt_toggles = vec![crate::types::CmtToggle {
+        pk_only: 0,
+        state: 0,
+        on: false,
+    }];
+    let pop = population_of(vec![subject], &[]);
+    let bolus = || |_: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+    let options = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&ode, &pop, &ode.default_params, 1, bolus, &options)
+        .err()
+        .expect("refused");
+    let text = format!("{err:?}");
+    assert!(text.contains("E_ADAPTIVE_UNSUPPORTED"), "{text}");
+    assert!(text.contains("adaptive dosing cannot honour"), "{text}");
+}

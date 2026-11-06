@@ -5193,6 +5193,7 @@ mod tests {
             pk_only_covariates: vec![],
             reset_times: vec![],
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
             occasions: vec![],
             obs_l2: Vec::new(),

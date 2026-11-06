@@ -2547,6 +2547,7 @@ pub(crate) struct ResetGate {
     cutoff: Option<usize>,
     reached: f64,
     reset_floor: f64,
+    t_seg: f64,
 }
 
 impl ResetGate {
@@ -2561,6 +2562,7 @@ impl ResetGate {
             cutoff: crate::dosing::ss_reset_cutoff(doses, reached),
             reached,
             reset_floor,
+            t_seg,
         }
     }
 
@@ -2573,10 +2575,16 @@ impl ResetGate {
     /// absorption forcing reads it per segment, and every infusion and zero-order window's
     /// membership reads it too (#1586): a window recorded before a reached reset is off,
     /// running, pending behind a lag, or the #1121 residual of an earlier `SS=1` infusion.
+    ///
+    /// Turning a dose's compartment off ends it the same way (#2732, `DoseEvent::off_at`).
+    /// That test is exact, without the `EVENT_MATCH_TOL` of `reached`: the reader leaves a
+    /// co-timed record and its off row one ULP apart, and which side of the row a segment
+    /// starts on is the whole answer.
     #[inline]
     pub(crate) fn live(&self, doses: &[DoseEvent], k: usize) -> bool {
         crate::dosing::ss_reset_live(doses, self.cutoff, k)
             && crate::dosing::evid_reset_live(doses[k].time, self.reset_floor)
+            && self.t_seg < doses[k].off_at
     }
 
     /// Whether this segment has reached `d`'s record, so its implied pulse train is on.
@@ -2883,6 +2891,28 @@ fn forcing_adder<'a>(
         prepared,
         infusions,
         zero_order,
+        off: &[],
+    }
+}
+
+/// Apply one compartment on/off record to the state and the list of off compartments
+/// (#2732). Off zeroes the amount, and a repeat changes nothing. On restarts from the zero
+/// the compartment holds, so `init(...)` is not re-applied. A state past the model's end is
+/// only reachable through an on row, which is a no-op there as on any compartment that is
+/// already on: `check_cmt_toggles` refuses the off row.
+pub(crate) fn apply_cmt_toggle<T: Copy>(
+    toggle: &crate::types::CmtToggle,
+    u: &mut [T],
+    off: &mut Vec<usize>,
+    zero: T,
+) {
+    if toggle.state >= u.len() {
+        return;
+    }
+    off.retain(|&c| c != toggle.state);
+    if !toggle.on {
+        u[toggle.state] = zero;
+        off.push(toggle.state);
     }
 }
 
@@ -2898,9 +2928,18 @@ pub(crate) struct SegmentForcing<'a> {
     prepared: &'a PreparedForcings,
     infusions: InfusionInput,
     zero_order: &'a [(usize, f64)],
+    /// Compartments off for this segment (#2732), held at zero whatever flows at them.
+    off: &'a [usize],
 }
 
-impl SegmentForcing<'_> {
+impl<'a> SegmentForcing<'a> {
+    /// This forcing with `off` held at zero. Applied last, so every spelling of the
+    /// segment's right-hand side (the closure, the Jacobian columns, the native direct
+    /// step) discards the row, and the linear path reads a zero row of `A` from it.
+    fn holding(self, off: &'a [usize]) -> Self {
+        Self { off, ..self }
+    }
+
     /// Add the forcing at time `t` to `dy`.
     #[inline(always)]
     pub(crate) fn apply(&self, t: f64, dy: &mut [f64]) {
@@ -2946,6 +2985,9 @@ impl SegmentForcing<'_> {
                 t,
                 dy,
             );
+        }
+        for &c in self.off {
+            dy[c] = 0.0;
         }
     }
 }
@@ -7691,6 +7733,33 @@ pub fn ode_predictions_event_driven(
     pk_at_pk_only: &[PkParams],
     pk_at_reset: &[PkParams],
 ) -> Vec<f64> {
+    event_driven_walk(
+        ode,
+        subject,
+        theta,
+        eta,
+        pk_at_dose,
+        pk_at_obs,
+        pk_at_pk_only,
+        pk_at_reset,
+        None,
+    )
+}
+
+/// [`ode_predictions_event_driven`], also writing the full state at each observation into
+/// `obs_states` when it is given (one row per observation, left as found if none is read).
+#[allow(clippy::too_many_arguments)]
+fn event_driven_walk(
+    ode: &OdeSpec,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams],
+    pk_at_reset: &[PkParams],
+    mut obs_states: Option<&mut [Vec<f64>]>,
+) -> Vec<f64> {
     assert_eq!(pk_at_dose.len(), subject.doses.len());
     assert_eq!(pk_at_obs.len(), subject.obs_times.len());
     assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
@@ -7969,6 +8038,9 @@ pub fn ode_predictions_event_driven(
     // Most-recent system-reset time (EVID=3/4); `NEG_INFINITY` until the
     // first reset. Infusions started before it are no longer active.
     let mut reset_floor = f64::NEG_INFINITY;
+    // Compartments currently off (#2732). Every compartment starts on, and a reset turns
+    // them all back on: measured in `nonmem_anchor/cmt_toggle_*`.
+    let mut off_states: Vec<usize> = Vec::new();
     let mut auto_state = OdeAutoSwitchState::default();
 
     for (i, &(t_event, kind, idx)) in timeline.iter().enumerate() {
@@ -8062,7 +8134,8 @@ pub fn ode_predictions_event_driven(
                 &prepared,
                 InfusionInput::Spanning(active),
                 &zero_order,
-            );
+            )
+            .holding(&off_states);
             let wrapped_rhs = forced(ode, &force);
             let columns = forced_columns(ode, &force);
             let direct = direct_step(ode, &force);
@@ -8153,6 +8226,10 @@ pub fn ode_predictions_event_driven(
                     let chz_before = chz_snapshot(ode, &u);
                     u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts, &chz_before);
                 }
+                // A dose turns its compartment on when it arrives, not at its record:
+                // `nonmem_anchor/cmt_toggle_*` holds the amount at zero, with no inflow,
+                // across the lag.
+                off_states.retain(|&c| c != d.cmt_idx());
                 // Boluses: add amt to state. Infusions: no instantaneous
                 // change — handled via the wrapped RHS for segments inside
                 // [d.time, d.time + d.duration]. A dose into a built-in
@@ -8192,13 +8269,19 @@ pub fn ode_predictions_event_driven(
                 } else {
                     v
                 };
+                if let Some(states) = obs_states.as_deref_mut() {
+                    states[idx].clone_from(&u);
+                }
                 last_pk = pk_now;
             }
             Kind::PkOnly => {
-                // EVID=2: $PK ran at this record but compartment state is
-                // unchanged. The new pk is consumed by the next segment's
-                // integration via the loop-top `pk_now` lookup.
+                // EVID=2: $PK ran at this record and, unless it is a compartment
+                // on/off row, the state is unchanged. The new pk is consumed by the
+                // next segment's integration via the loop-top `pk_now` lookup.
                 last_pk = pk_now;
+                for toggle in subject.cmt_toggles.iter().filter(|c| c.pk_only == idx) {
+                    apply_cmt_toggle(toggle, &mut u, &mut off_states, 0.0);
+                }
             }
             Kind::InfusionEnd => {
                 // Not a NONMEM record: no state update, no PK update —
@@ -8229,6 +8312,7 @@ pub fn ode_predictions_event_driven(
                 // reset time so infusions started earlier stop contributing.
                 u = ode.initial_state(&pk_at_reset[idx].values);
                 reset_floor = t_event;
+                off_states.clear();
             }
         }
     }
@@ -8727,6 +8811,25 @@ pub fn ode_predictions_event_driven_with_states(
     pk_at_pk_only: &[PkParams],
     pk_at_reset: &[PkParams],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
+    // The dense walk below has no compartment on/off record (#2732), so such a subject
+    // reads its states off the walk that produced `ipreds`. They are exact: each row is the
+    // state under that observation's own record.
+    if subject.has_cmt_toggles() {
+        let mut states = vec![vec![f64::NAN; ode.n_states]; subject.obs_times.len()];
+        let ipreds = event_driven_walk(
+            ode,
+            subject,
+            theta,
+            eta,
+            pk_at_dose,
+            pk_at_obs,
+            pk_at_pk_only,
+            pk_at_reset,
+            Some(&mut states),
+        );
+        return (ipreds, states);
+    }
+
     // Re-use the standard path to get ipred, then do a second pass to
     // extract states. The event-driven function is already complex enough
     // that duplicating it would be error-prone; a second pass is acceptable

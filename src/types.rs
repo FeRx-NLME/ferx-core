@@ -136,6 +136,33 @@ pub struct DoseEvent {
     /// NONMEM gives no `$PK` call of its own; see [`ImpliedDose`]. Set only by the reader,
     /// so a dose built in memory is a record, as before. Crate-private, like `evid4`.
     pub(crate) implied: Option<ImpliedDose>,
+    /// The time this dose's input stops because its compartment was turned off (#2732),
+    /// `+∞` when it never does: the first `EVID=2`, `CMT=-N` row on its compartment after
+    /// its record, or after its parent's for an `ADDL`-implied dose. NONMEM cancels the
+    /// input whatever stage it has reached, measured in `nonmem_anchor/cmt_toggle_*`: an
+    /// infusion stops and does not resume when the compartment comes back, a lagged dose
+    /// still in flight never lands, and the rest of an `ADDL` train never arrives. Read
+    /// through `ode::predictions::ResetGate`. Set only by the reader. Crate-private, like
+    /// `evid4`.
+    pub(crate) off_at: f64,
+}
+
+/// One compartment on/off record (#2732): an `EVID=2` row with `CMT=N` (on) or `CMT=-N`
+/// (off) on a subject that turns a compartment off somewhere.
+///
+/// Off zeroes the amount and holds it at zero: the state's own `d/dt` is discarded, so
+/// mass flowing in is lost, and any term reading the state sees zero. On restarts it from
+/// zero, without re-applying `init(...)`. A dose arrival also turns its compartment on,
+/// and a reset turns every compartment on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CmtToggle {
+    /// Index into `Subject::pk_only_times` of the row. The row is an ordinary record,
+    /// so it takes its time, and its place among co-timed records, from there.
+    pub pk_only: usize,
+    /// 0-based state index.
+    pub state: usize,
+    /// `true` for on, `false` for off.
+    pub on: bool,
 }
 
 /// Which records parameterise an `ADDL`-implied dose (#1909). NONMEM evaluates `$PK` only
@@ -197,6 +224,7 @@ impl DoseEvent {
             infusion_def: InfusionDef::RateDefined,
             evid4: false,
             implied: None,
+            off_at: f64::INFINITY,
         }
     }
 
@@ -225,6 +253,7 @@ impl DoseEvent {
             infusion_def,
             evid4: false,
             implied: None,
+            off_at: f64::INFINITY,
         }
     }
 
@@ -1068,6 +1097,10 @@ pub struct Subject {
     /// constant covariates `reset_cov` falls back to the subject-static map and
     /// every convention agrees.
     pub reset_covariates: Vec<HashMap<String, f64>>,
+    /// Compartment on/off records (#2732), in file order. Empty for a subject that never
+    /// turns a compartment off: an `EVID=2`, `CMT=N` row with nothing to turn back on
+    /// changes nothing and is not kept. See [`CmtToggle`].
+    pub cmt_toggles: Vec<CmtToggle>,
     /// Censoring flag per observation (0 = quantified, 1 = below LLOQ, -1 = above ULOQ).
     /// On censored rows, `observations[j]` holds the corresponding LOQ limit.
     pub cens: Vec<i8>,
@@ -1218,6 +1251,18 @@ impl Subject {
     /// whether they have time-varying covariates.
     pub fn has_resets(&self) -> bool {
         !self.reset_times.is_empty()
+    }
+
+    /// True when this subject turns a compartment off (`EVID=2`, `CMT=-N`, #2732).
+    pub fn has_cmt_toggles(&self) -> bool {
+        !self.cmt_toggles.is_empty()
+    }
+
+    /// True when this subject's state can jump at a record: a reset or a compartment
+    /// on/off row. Neither has a place in the dense ODE walk, so such a subject takes the
+    /// event-driven one.
+    pub fn has_state_events(&self) -> bool {
+        self.has_resets() || self.has_cmt_toggles()
     }
 
     /// True when any dose record on this subject is flagged steady-state

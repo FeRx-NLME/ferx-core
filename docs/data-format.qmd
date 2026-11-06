@@ -39,7 +39,7 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 |--------|------|---------|-------------|
 | `EVID` | integer | 0 | Event ID: 0 = observation, 1 = dose, 2 = other event, 3 = system reset, 4 = reset + dose. If the column is omitted, the record type is inferred from `AMT` — see [Inferring doses without an `EVID` column](#inferring-doses-without-an-evid-column). |
 | `AMT` | numeric | 0 | Dose amount (for `EVID=1`/`EVID=4`; also the dose-inference signal when `EVID` is absent) |
-| `CMT` | integer | 1 | Compartment number (1-indexed). A float-formatted integer (`2.0`, as pandas writes a whole column once any cell in it is blank) reads as that integer. A missing (`.`/blank/`NA`) or unreadable cell, and an absent column, fall back to compartment 1 — reported as `W_CMT_DEFAULTED` whenever `CMT` selects something on that model, whether a dose's compartment or an observation's readout, scale or error model; see [`CMT` on `[odes]` models](#cmt-on-odes-models). |
+| `CMT` | integer | 1 | Compartment number (1-indexed). Negative only on an `EVID=2` row, where it turns that compartment off; see [Compartment on/off](#compartment-onoff-evid2-cmt-n). A float-formatted integer (`2.0`, as pandas writes a whole column once any cell in it is blank) reads as that integer. A missing (`.`/blank/`NA`) or unreadable cell, and an absent column, fall back to compartment 1 — reported as `W_CMT_DEFAULTED` whenever `CMT` selects something on that model, whether a dose's compartment or an observation's readout, scale or error model; see [`CMT` on `[odes]` models](#cmt-on-odes-models). |
 | `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM's coded values `-1` (modeled rate via an `R{cmt}` `$PK` parameter) and `-2` (modeled duration via a `D{cmt}` `$PK` parameter) are supported on both analytical and ODE models — see [Infusion Doses](#infusion-doses). |
 | `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored (row excluded from the likelihood). A non-dose `MDV=1` row is still a record, read like an `EVID=2` row: it can start the integration, and its covariate values govern the interval that ends at it, as in NONMEM. |
 | `II` | numeric | 0 | Interdose interval for repeated dosing |
@@ -265,7 +265,7 @@ A `[data_selection]` clause that compares `CMT` is the third thing the column ad
 |------|---------|
 | 0 | Observation record. `DV` is used for estimation. |
 | 1 | Dosing record. `AMT` is administered to compartment `CMT`. |
-| 2 | Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row's covariate values — matching NONMEM's `$PK runs at every record` semantic. It is a record on every subject, time-varying covariates or not: the first one can be where the integration starts (see [`TIME` need not start at zero](#required-columns)). An `EVID=0` row with `MDV=1` is read the same way. |
+| 2 | Other event (typically a covariate-change marker). With a negative `CMT` it turns a compartment off, and with a positive one back on: see [Compartment on/off](#compartment-onoff-evid2-cmt-n). Otherwise the compartment state is unchanged but the rate matrix is refreshed from this row's covariate values — matching NONMEM's `$PK runs at every record` semantic. It is a record on every subject, time-varying covariates or not: the first one can be where the integration starts (see [`TIME` need not start at zero](#required-columns)). An `EVID=0` row with `MDV=1` is read the same way. |
 | 3 | System reset. All compartment amounts are set to zero at this time, and any ongoing infusion is turned off. No dose is given and `DV` is ignored. |
 | 4 | Reset and dose. Like EVID=3 (zero every compartment, stop ongoing infusions) followed immediately by a dose of `AMT` into compartment `CMT`. |
 
@@ -367,6 +367,46 @@ written at 24 and listed before a dose at 24
 ([#1969](https://github.com/FeRx-NLME/ferx-core/issues/1969)). Before #1969 it took the
 earlier one, and on a 30-subject induction fixture the objective was 1007 units off
 NONMEM's; it now agrees to 2e-8 (Linux).
+
+## Compartment on/off (EVID=2, CMT=-N)
+
+An `EVID=2` row with `CMT=-N` turns compartment `N` off, and one with `CMT=N` turns it back on. Urine collection is the usual reason: the bladder is emptied at the end of each collection window, so each window's amount starts from zero.
+
+```csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,0,1,100,1,1
+1,2,17,0,0,2,0
+1,4,30,0,0,2,0
+1,4,0,2,0,-2,1
+1,6,0,2,0,2,1
+1,8,10,0,0,2,0
+```
+
+Here urine is read at `t=4`, then emptied, and collects again from `t=6`. On a one-subject fixture of this shape ferx and NONMEM 7.5.1 give the same objective (`nonmem_anchor/cmt_toggle_*`). This is `[odes]` only: on any other model the row is refused rather than ignored (`E_CMT_TOGGLE_UNSUPPORTED`).
+
+While a compartment is off:
+
+- **Its amount is zero and stays zero.** Mass that would flow in is lost, and the source compartment keeps losing it. Any `d/dt` term reading the compartment sees zero.
+- **It cannot be observed.** An observation with that `CMT` is an error, `E_OBS_CMT_OFF`, as in NONMEM. Read the compartment before the off row. An `EVID=0`, `MDV=1` row with that `CMT`, which stops a NONMEM run, is accepted here, because it asks for no prediction.
+- **Dose input into it stops, for good.** An infusion running when the row arrives does not resume when the compartment comes back, a lagged dose still in flight never lands, and the rest of an `ADDL` train never arrives.
+
+What turns a compartment on:
+
+- **An `EVID=2` row with `CMT=N`.** It restarts from zero and does not re-apply `init(...)`. On a compartment that is already on, this changes nothing, which is why a covariate marker with a `CMT` is harmless.
+- **A dose into it, at the dose's arrival.** With a lagtime the amount stays at zero with no inflow until the arrival. Observing it in between reads zero and is not an error.
+- **A reset.** `EVID=3` and `EVID=4` turn every compartment on.
+
+Records at the same `TIME` as an on/off row take effect in file order. An observation listed before the off row reads the amount, one listed after it is refused, and a dose listed before it is wiped. Two placements cannot be represented: an on/off row between two doses at one `TIME`, or between a reset and a dose (`E_CMT_TOGGLE_TIE`). Give the row its own `TIME`.
+
+A negative `CMT` on any other record is an error, `E_NEGATIVE_CMT`. NONMEM stops on one on a dose or an observation too. On an `EVID=3` row it resets and leaves the compartment off, which ferx does not support: write the reset, then an `EVID=2` row.
+
+Limits:
+
+- There is no equivalent of `$MODEL` `INITIALOFF` or `NOOFF`. To start a compartment off, put an off row at the subject's first record. After a reset it is on again, where `INITIALOFF` would restore it to off, so repeat the row.
+- An `SS=1` dose while a compartment is off is refused (`E_CMT_TOGGLE_SS`).
+- A compartment fed by a built-in absorption input cannot be switched, and neither SDE nor endpoint models nor adaptive dosing support the rows (`E_CMT_TOGGLE_UNSUPPORTED`, and `E_ADAPTIVE_UNSUPPORTED` for adaptive dosing). An off row naming a compartment past the model's states is `E_CMT_TOGGLE_OUT_OF_RANGE`.
+- `[derived]` outputs on the grid read `NaN` for such a subject. Per-observation compartment amounts are exact.
+- A lagged or modeled-rate dose into a switched compartment routes that subject to finite-difference gradients, reported in the usual warning.
 
 ## System Resets (EVID=3 / EVID=4)
 

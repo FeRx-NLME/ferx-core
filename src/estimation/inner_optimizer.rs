@@ -3159,7 +3159,7 @@ fn find_ebe_solve(
         // coordinate and scans only the weakly-identified ones, so well-informed
         // subjects pay just `2·n_eta` cheap objective evaluations and their EBE
         // stays bit-identical to `inner_restarts = 0` (no seed solve runs).
-        let scan_all = subject.has_resets() || subject.has_tv_covariates();
+        let scan_all = subject.has_state_events() || subject.has_tv_covariates();
         let scan_coord: Vec<bool> = if scan_all {
             vec![true; n_eta]
         } else {

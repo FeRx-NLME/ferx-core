@@ -646,6 +646,7 @@ fn data_fingerprint(data: &Population) -> String {
             pk_only_covariates,
             reset_times,
             reset_covariates,
+            cmt_toggles,
             cens,
             occasions,
             obs_l2,
@@ -692,6 +693,10 @@ fn data_fingerprint(data: &Population) -> String {
         }
         if !reset_period_times.is_empty() {
             let _ = writeln!(buf, "reset_period_times={reset_period_times:?}");
+        }
+        // Only when present, so a dataset with no compartment on/off row keeps its digest.
+        if !cmt_toggles.is_empty() {
+            let _ = writeln!(buf, "cmt_toggles={cmt_toggles:?}");
         }
         let _ = writeln!(buf, "fremtype={fremtype:?}");
         let _ = writeln!(buf, "obs_records={obs_records:?}");

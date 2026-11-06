@@ -83,6 +83,7 @@ fn main() {
             pk_only_covariates: vec![],
             reset_times: vec![],
             reset_covariates: vec![],
+            cmt_toggles: Vec::new(),
             cens: vec![],
             occasions: vec![],
             obs_l2: Vec::new(),

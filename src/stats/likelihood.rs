@@ -295,7 +295,7 @@ fn try_joint_pktte_shared_solve(
     // stated contract above exists to prevent.
     if subject.obs_records.is_empty()
         || subject.has_tv_covariates()
-        || subject.has_resets()
+        || subject.has_state_events()
         || crate::pk::model_uses_time_anywhere(model)
         || model.is_sde()
         || subject.fremtype.iter().any(|&f| f > 0)
@@ -5372,6 +5372,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             obs_l2: Vec::new(),
@@ -6886,6 +6887,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0, 0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -7082,6 +7084,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0, 0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -9656,6 +9659,7 @@ mod conditional_obs_terms_tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),

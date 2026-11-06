@@ -218,6 +218,7 @@ fn bound_subject(id: &str, obs: &[f64]) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; TIMES.len()],
         occasions: Vec::new(),
         obs_l2: Vec::new(),

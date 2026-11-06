@@ -157,6 +157,12 @@
 //! | `W_DATA` | `ferx check` relay code for a data-reader warning whose message states no `W_` code of its own |
 //! | `E_DOSE_NO_AMT` | the dataset has dose records (`EVID=1/4`) but no `AMT` column, so every dose amount would be zero (#753) |
 //! | `E_DOSE_CMT_OUT_OF_RANGE` | a dose record (any `AMT`, bolus or infusion) whose `CMT` exceeds the model's compartment count — the `[odes]` states, or the analytical model's compartments (#899) |
+//! | `E_NEGATIVE_CMT` | a negative `CMT` on anything but an `EVID=2` row: NONMEM stops on one on a dose or observation, and ferx refuses one on a reset (#2732) |
+//! | `E_CMT_TOGGLE_TIE` | a compartment on/off row between two doses, or a reset and a dose, at one `TIME`: no engine order can place it (#2732) |
+//! | `E_CMT_TOGGLE_UNSUPPORTED` | a compartment off row (`EVID=2`, `CMT=-N`) on a model that cannot honour it: not an `[odes]` model, an SDE, a declared endpoint, or a compartment fed by a built-in absorption input (#2732) |
+//! | `E_CMT_TOGGLE_OUT_OF_RANGE` | a `CMT=-N` off row past the `[odes]` block's declared states (#2732) |
+//! | `E_CMT_TOGGLE_SS` | an `SS=1` dose while a compartment is off (#2732) |
+//! | `E_OBS_CMT_OFF` | an observation of a compartment that is off at that record, as NONMEM refuses (#2732) |
 //! | `E_DOSE_CMT_NOT_INFUSABLE` | an infusion with `AMT ≠ 0` into compartment 0 (`CMT=0`), which is a default bolus compartment with no zero-order target, on an ODE or event-walk analytical model (#899) |
 //! | `W_STEADY_STATE_INIT` | subject(s) have SS=1 doses while the analytical model declares an `[initial_conditions]` baseline; the baseline is superposed on the steady state and double-counts the starting amount (#521) |
 //! | `E_MODELED_DURATION_NO_PARAM` | a `RATE=-2` dose (modeled infusion duration) into compartment n on a model that declares no `D{n}` parameter; one per compartment. Not raised on a compartment-free model |
