@@ -1000,6 +1000,7 @@ str_enum_map!(ErrorModel, "error_model", error_model_to_str(ErrorModel), error_m
     Additive => "additive",
     Proportional => "proportional",
     Combined => "combined",
+    LogCombined => "log_combined",
 });
 
 str_enum_map!(

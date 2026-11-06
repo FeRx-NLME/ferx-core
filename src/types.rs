@@ -3201,6 +3201,15 @@ pub enum ErrorModel {
     Additive,
     Proportional,
     Combined,
+    /// Combined proportional + additive error under log-transform-both-sides
+    /// (`log(DV) ~ combined(PROP, ADD)` / `DV ~ log_combined(PROP, ADD)`, #2729):
+    /// `Var(log y) = PROP² + ADD²/F²`, NONMEM's `W = SQRT(PROP**2 + ADD**2/IPR**2)`.
+    /// `PROP` is on the log scale (unitless); `ADD` is in natural `DV` units, and `F`
+    /// is the natural-scale prediction floored at the LTBS floor
+    /// (`IF (IPR.LT.1E-12) IPR=1E-12`). The residual is scored on the log scale, so
+    /// the variance is written in the log prediction `g = log(max(F, floor))` as
+    /// `PROP² + ADD²·exp(−2g)`. Only meaningful with `log_transform = true`.
+    LogCombined,
 }
 
 /// How a sigma parameter enters the residual error model.
@@ -3216,7 +3225,9 @@ impl ErrorModel {
         match self {
             ErrorModel::Proportional => vec![SigmaType::Proportional],
             ErrorModel::Additive => vec![SigmaType::Additive],
-            ErrorModel::Combined => vec![SigmaType::Proportional, SigmaType::Additive],
+            ErrorModel::Combined | ErrorModel::LogCombined => {
+                vec![SigmaType::Proportional, SigmaType::Additive]
+            }
         }
     }
 
@@ -3224,7 +3235,7 @@ impl ErrorModel {
     pub fn n_sigma(self) -> usize {
         match self {
             ErrorModel::Additive | ErrorModel::Proportional => 1,
-            ErrorModel::Combined => 2,
+            ErrorModel::Combined | ErrorModel::LogCombined => 2,
         }
     }
 }

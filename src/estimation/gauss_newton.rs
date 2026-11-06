@@ -1743,10 +1743,9 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     //   (combined or proportional), and 0 for additive — the analytical
     //   SB path takes the same `dvar_dlogsigma{,_scaled}` per observation).
     //
-    // Resolve SigmaType through `error_spec` (the same dispatcher every other
-    // variance call uses), not `model.error_model`, so this stays internally
-    // consistent under any future refactor that lets the two diverge.
-    let sigma_types = error_spec.sigma_types(n_sigma);
+    // Resolve the `f`-dependent slot through `error_spec` (the same dispatcher
+    // every other variance call uses), not `model.error_model`, so this stays
+    // internally consistent under any future refactor that lets the two diverge.
     let sigma_start = omega_start + omega_entries.len();
     for ks in 0..n_sigma {
         let k = sigma_start + ks;
@@ -1765,12 +1764,19 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
                 None => error_spec.dvar_dlogsigma(err_keys[j], ks, ipreds[j], sigma_values),
             })
             .collect();
-        // ∂d/∂log σ_s. For proportional and combined, d = 2·σ_prop²·f, so
-        // ∂d/∂log σ_prop = 2·d and ∂d/∂log σ_add = 0. For additive d = 0
-        // identically.
-        let dd_factor = match sigma_types.get(ks).copied() {
-            Some(SigmaType::Proportional) => 2.0,
-            _ => 0.0,
+        // ∂d/∂log σ_s, per row. `d = ∂R/∂f` is carried by the one slot of the row's
+        // endpoint whose loading reads `f`, and is quadratic in that slot's σ: for
+        // proportional and combined, d = 2·σ_prop²·f, so ∂d/∂log σ_prop = 2·d and
+        // ∂d/∂log σ_add = 0; for `LogCombined` (#2729) it is the additive slot,
+        // d = −2·σ_add²·exp(−2f). For additive d = 0 identically. Decided on the
+        // row's own key: under `PerCmt` a σ that reads `f` on one endpoint is
+        // absent from another's rows, whose `d` it must not scale.
+        let dd_factor = |j: usize| {
+            if error_spec.slot_reads_f(err_keys[j], ks, n_sigma) {
+                2.0
+            } else {
+                0.0
+            }
         };
 
         let mut s_acc = 0.0_f64;
@@ -1782,7 +1788,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
             let d = d_vec[j];
             let e = err[j];
             let dr = dr_per_obs[j];
-            let dd = d * dd_factor;
+            let dd = d * dd_factor(j);
             // data_ll piece: ∂R·(1/R − err²/R²) = ∂R·(R − err²)/R²
             let data_term = dr * (r - e * e) * inv_r2;
             // log|H̃| piece via chain on R and on c̃:
@@ -4078,25 +4084,81 @@ mod tests {
     /// well above the 1e-4·(1+|ref|) tolerance).
     #[test]
     fn test_subject_nll_pop_grad_analytical_laplace_combined_error() {
+        laplace_two_sigma_grad_matches_fd(
+            ErrorModel::Combined,
+            ErrorSpec::Single(ErrorModel::Combined),
+            vec![0.3, 0.3],
+            None,
+        );
+    }
+
+    /// The same under LTBS combined error (#2729), where `∂R/∂f` lives on the
+    /// *additive* slot (`d = −2·σ_add²·exp(−2f)`): a `dd_factor` keyed on the
+    /// proportional `SigmaType` puts the `2·d` on the wrong σ. The fixture's
+    /// predictions are ~2, so `σ_add = 0.6` makes `σ_add/F ≈ σ_prop`.
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_laplace_log_combined_error() {
+        laplace_two_sigma_grad_matches_fd(
+            ErrorModel::LogCombined,
+            ErrorSpec::Single(ErrorModel::LogCombined),
+            vec![0.3, 0.6],
+            None,
+        );
+    }
+
+    /// Two `LogCombined` endpoints, each with its own σ pair, rows alternating
+    /// between them: the σ that carries `∂R/∂f` differs by row, so `∂d/∂log σ` must
+    /// be decided on each row's own key. Deciding it once on key `0` — which no
+    /// endpoint has — drops it for every σ, and the additive σ gradients miss
+    /// the FD reference (#2729 review).
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_laplace_log_combined_per_cmt() {
+        let endpoint = |sigma_idx: Vec<usize>| crate::types::EndpointError {
+            error_model: ErrorModel::LogCombined,
+            sigma_idx,
+        };
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (2, endpoint(vec![0, 1])),
+            (3, endpoint(vec![2, 3])),
+        ]));
+        laplace_two_sigma_grad_matches_fd(
+            ErrorModel::LogCombined,
+            spec,
+            vec![0.3, 0.6, 0.2, 0.9],
+            Some(vec![2, 3, 2]),
+        );
+    }
+
+    fn laplace_two_sigma_grad_matches_fd(
+        em: ErrorModel,
+        spec: ErrorSpec,
+        sigma: Vec<f64>,
+        obs_cmts: Option<Vec<usize>>,
+    ) {
         let mut model = make_model();
-        model.error_model = ErrorModel::Combined;
-        model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+        model.error_model = em;
+        model.error_spec = spec;
+        model.log_transform = em == ErrorModel::LogCombined;
+        let n_sigma = sigma.len();
         // Combined needs two sigmas — replace template's single-σ vector and
         // keep model.n_epsilon / model.sigma_init_as_sd in sync to avoid any
         // downstream code path that reads those fields tripping on a length
         // mismatch with `template.sigma.values`.
         let mut template = model.default_params.clone();
         template.sigma = SigmaVector {
-            values: vec![0.3, 0.3],
-            names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
+            values: sigma,
+            names: (0..n_sigma).map(|k| format!("SIGMA_{k}")).collect(),
         };
-        template.sigma_fixed = vec![false, false];
+        template.sigma_fixed = vec![false; n_sigma];
         model.default_params = template.clone();
-        model.n_epsilon = 2;
-        model.sigma_init_as_sd = vec![false, false];
+        model.n_epsilon = n_sigma;
+        model.sigma_init_as_sd = vec![false; n_sigma];
         let template = &model.default_params;
 
-        let population = make_population();
+        let mut population = make_population();
+        if let Some(cmts) = obs_cmts {
+            population.subjects[0].obs_cmts = cmts;
+        }
         let x = pack_params(template);
         let bounds = compute_bounds(template);
         let n = x.len();

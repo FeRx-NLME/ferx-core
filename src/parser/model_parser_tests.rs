@@ -10398,14 +10398,204 @@ fn test_ltbs_rejects_non_dv_lhs() {
     );
 }
 
+// ── #2729: combined proportional + additive under LTBS ───────────────────
+
 #[test]
-fn test_ltbs_rejects_per_cmt() {
-    // LTBS is single-endpoint only.
-    let err = model_with_error_block("  CMT=1: log(DV) ~ additive(SIG1)").unwrap_err();
+fn test_ltbs_log_dv_combined_is_log_combined() {
+    // `log(DV) ~ combined(PROP, ADD)`: engine logs DV; the additive part stays in
+    // natural units, so it is `LogCombined`, not the natural-scale `Combined`.
+    let m = model_with_error_block("  log(DV) ~ combined(SIG1, SIG2)").unwrap();
+    assert!(m.log_transform && !m.dv_pre_logged);
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+    assert!(matches!(
+        m.error_spec,
+        crate::types::ErrorSpec::Single(ErrorModel::LogCombined)
+    ));
+}
+
+#[test]
+fn test_ltbs_log_combined_case1() {
+    // `DV ~ log_combined(PROP, ADD)`: DV already log; only the prediction is logged.
+    let m = model_with_error_block("  DV ~ log_combined(SIG1, SIG2)").unwrap();
+    assert!(m.log_transform && m.dv_pre_logged);
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+}
+
+#[test]
+fn test_plain_combined_stays_natural_scale() {
+    let m = model_with_error_block("  DV ~ combined(SIG1, SIG2)").unwrap();
+    assert!(!m.log_transform);
+    assert_eq!(m.error_model, ErrorModel::Combined);
+}
+
+#[test]
+fn test_log_combined_rejects_the_forms_it_cannot_take() {
+    let err = model_with_error_block("  log(DV) ~ log_combined(SIG1, SIG2)").unwrap_err();
     assert!(
-        err.contains("per-CMT") || err.contains("multi-endpoint"),
-        "expected per-CMT rejection, got: {err}"
+        err.contains("double-log")
+            && err.contains("`log(DV) ~ combined(...)`")
+            && err.contains("`DV ~ log_combined(...)`")
+            && !err.contains("additive(...)"),
+        "double-log names the combined spellings: {err}"
     );
+    let err = model_with_error_block("  log(DV) ~ log_additive(SIG1)").unwrap_err();
+    assert!(
+        err.contains("`log(DV) ~ additive(...)`") && !err.contains("combined"),
+        "double-log on log_additive still names the additive spellings: {err}"
+    );
+    let err = model_with_error_block("  DV ~ log_combined(SIG1)").unwrap_err();
+    assert!(err.contains("expects 2 sigma(s) but 1 given"), "got: {err}");
+    let err = model_with_error_block("  log(DV) ~ proportional(SIG1)").unwrap_err();
+    assert!(
+        err.contains("log(DV) ~ combined(PROP, ADD)"),
+        "the refusal names the combined LTBS form: {err}"
+    );
+}
+
+/// `weight = W` divides DV and the prediction by `W`: the log residual is unchanged and
+/// `ADD/F` becomes `ADD·W/F`, so the weight lands on the additive (second) slot.
+#[test]
+fn test_log_combined_weight_scales_the_additive_slot() {
+    let m = model_with_error_block("  log(DV) ~ combined(SIG1, SIG2) weight = TVV").unwrap();
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+    let mag = m
+        .ruv_magnitude
+        .as_ref()
+        .expect("weight desugars to a magnitude");
+    let row = mag.eval_obs(&m.default_params.theta, &HashMap::new(), 1.0, 1.0);
+    assert_eq!(row[0], 1.0, "proportional slot untouched: {row:?}");
+    assert_eq!(row[1], 10.0, "additive slot carries W = TVV: {row:?}");
+}
+
+/// Plasma + urine with their own `PROP`/`ADD` pairs (#2729): a per-CMT LTBS block,
+/// every line on the log scale. ODE-only, as every per-CMT error model is.
+fn ltbs_per_cmt_model(error_block: &str) -> Result<crate::types::CompiledModel, String> {
+    parse_model_string(&format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_P ~ 0.1 (sd)
+  sigma ADD_P ~ 0.05 (sd)
+  sigma PROP_U ~ 0.2 (sd)
+  sigma ADD_U ~ 0.5 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[depot, central, urine])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+  d/dt(urine) = 0.4 * (CL/V) * central
+[scaling]
+  y[CMT=2] = central / V
+  y[CMT=3] = urine
+[error_model]
+{error_block}
+"#
+    ))
+}
+
+#[test]
+fn test_ltbs_per_cmt_combined_endpoints() {
+    for (block, pre_logged) in [
+        (
+            "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)",
+            false,
+        ),
+        (
+            "  CMT=2: DV ~ log_combined(PROP_P, ADD_P)\n  CMT=3: DV ~ log_additive(PROP_U)",
+            true,
+        ),
+    ] {
+        let m = ltbs_per_cmt_model(block).unwrap();
+        assert!(m.log_transform, "{block}");
+        assert_eq!(m.dv_pre_logged, pre_logged, "{block}");
+        let crate::types::ErrorSpec::PerCmt(map) = &m.error_spec else {
+            panic!("per-CMT spec expected: {block}");
+        };
+        assert_eq!(map[&2].error_model, ErrorModel::LogCombined);
+        assert_eq!(map[&2].sigma_idx, vec![0, 1]);
+        if pre_logged {
+            assert_eq!(map[&3].error_model, ErrorModel::Additive);
+            assert_eq!(map[&3].sigma_idx, vec![2]);
+        } else {
+            assert_eq!(map[&3].error_model, ErrorModel::LogCombined);
+            assert_eq!(map[&3].sigma_idx, vec![2, 3]);
+        }
+    }
+}
+
+/// The log transform is model-wide: every endpoint on the log scale under one `DV`
+/// convention, or none. Each refusal names its own reason and not the other's.
+#[test]
+fn test_ltbs_per_cmt_lines_must_agree() {
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: DV ~ proportional(PROP_U)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("every endpoint or none") && !err.contains("scale of `DV`"),
+        "got: {err}"
+    );
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: DV ~ proportional(PROP_U)\n  CMT=3: log(DV) ~ combined(PROP_P, ADD_P)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("every endpoint or none"),
+        "order-independent: {err}"
+    );
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: DV ~ log_combined(PROP_U, ADD_U)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("scale of `DV`") && !err.contains("every endpoint or none"),
+        "got: {err}"
+    );
+    // Proportional on the log scale is still refused per line.
+    let err = ltbs_per_cmt_model("  CMT=2: log(DV) ~ proportional(PROP_P)").unwrap_err();
+    assert!(err.contains("log(DV) ~ combined(PROP, ADD)"), "got: {err}");
+}
+
+/// The motivating plasma + urine model in full (#2729): per-endpoint LTBS with the
+/// early-time factor on the plasma `PROP` only, written on its `CMT=2:` argument
+/// (per-CMT magnitudes are #2731's; this pins that they compose with LTBS). Sigmas are
+/// flat in declaration order: `PROP_P, ADD_P, PROP_U, ADD_U`.
+#[test]
+fn test_ltbs_per_cmt_argument_magnitude() {
+    let m = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P * (if (TAD < 3) TVKA else 1), ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)",
+    )
+    .unwrap();
+    assert!(m.log_transform && m.has_custom_ruv_magnitude());
+    let crate::types::ErrorSpec::PerCmt(map) = &m.error_spec else {
+        panic!("per-CMT spec expected");
+    };
+    assert_eq!(map[&2].error_model, ErrorModel::LogCombined);
+    assert_eq!(map[&2].sigma_idx, vec![0, 1]);
+    assert_eq!(map[&3].sigma_idx, vec![2, 3]);
+    // Rows at t = 1, 2, 3, 4 after a dose at 0: plasma early, plasma early, urine
+    // early, plasma late.
+    let mut s = magnitude_rows_subject(&[(2, 0.0), (2, 0.0), (3, 0.0), (2, 0.0)], "UNUSED");
+    s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let rows = m.ruv_obs_mult(&s, &m.default_params.theta).unwrap();
+    assert_eq!(rows[0], vec![1.5, 1.0, 1.0, 1.0], "plasma, TAD 1");
+    assert_eq!(rows[1], vec![1.5, 1.0, 1.0, 1.0], "plasma, TAD 2");
+    assert_eq!(rows[2], vec![1.0, 1.0, 1.0, 1.0], "urine is bare");
+    assert_eq!(rows[3], vec![1.0, 1.0, 1.0, 1.0], "plasma, TAD 4");
+}
+
+#[test]
+fn test_ltbs_per_cmt_requires_an_ode_model() {
+    // Per-CMT error models of any kind are ODE-only; LTBS does not change that.
+    let err = model_with_error_block("  CMT=1: log(DV) ~ additive(SIG1)").unwrap_err();
+    assert!(err.contains("require an ODE-based"), "got: {err}");
 }
 
 #[test]
@@ -26062,7 +26252,7 @@ fn power_form_rejects_the_forms_it_cannot_combine_with() {
         "log(DV) ~ power(PROP_ERR, RUV_POW)",
     ));
     assert!(
-        err.contains("log-transform-both-sides supports only additive"),
+        err.contains("log-transform-both-sides supports additive error on the log scale"),
         "got: {err}"
     );
     let err = expect_parse_err(&POWER_MODEL.replace(

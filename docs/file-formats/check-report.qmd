@@ -259,7 +259,7 @@ Model features a method or an error model cannot represent. `fit()` refused each
 | `E_MIXTURE_METHOD` | error | A `[mixture]` model with a method its objective is not wired for: `method = focei` with `n_agq > 1`, an estimator other than `foce` / `focei` / `saem` / `bayes` / `imp` / `impmap`, or `bayes` with per-class `omega(k)` / `sigma(k)` overrides, since its Ω draw is shared across classes. Checked at every stage of the method chain. Block `fit_options`. |
 | `E_IIV_ON_RUV_SHARED_ETA` | error | The `iiv_on_ruv` random effect is also used in `[individual_parameters]`. It must be a dedicated `omega`. Block `error_model`. |
 | `E_IIV_ON_RUV_METHOD` | error | `iiv_on_ruv` with a non-interaction stage (`foce`, or `gn` without `interaction`) anywhere in the method chain. `Y = IPRED + EPS·EXP(ETA)` is an interaction model: use `focei`, `imp`, `impmap` or `saem`. Block `fit_options`. |
-| `E_LTBS_UNSUPPORTED` | error | LTBS (`log_transform = true`) with a proportional or combined error, a per-CMT error model, or an SDE. The parser refuses all three, so only a `CompiledModel` built in code reaches it, through `fit()` or `check_model_options()`. Block `error_model`. |
+| `E_LTBS_UNSUPPORTED` | error | LTBS (`log_transform = true`) with a proportional or (natural-scale) combined error on any endpoint, a covariate-selected error model, or an SDE; or a `LogCombined` error without LTBS. The parser refuses all of these, so only a `CompiledModel` built in code reaches it, through `fit()` or `check_model_options()`. Block `error_model`. |
 
 #### Correlated residual error
 

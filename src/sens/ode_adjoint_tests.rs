@@ -634,6 +634,211 @@ fn analytic_adjoint_matches_reconverged_fd_lagtime_ltbs() {
     assert!(worst < 8e-6, "worst relative difference {worst:.2e}");
 }
 
+/// LTBS with a natural-unit additive part (#2729): `Var(log y) = PROP² + ADD²/F²`. The
+/// concentrations fall from ~9 to ~0.1 over the record, so `ADD/F` runs from ~0.03 (below
+/// `PROP`) to ~3 (far above it): both terms are live, and `∂V/∂f` is non-zero on every
+/// row — the first LTBS model where the FOCEI interaction term is. `{MAG}` is spliced
+/// with a magnitude on the proportional slot.
+const ONE_CPT_ORAL_LTBS_COMBINED: &str = r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta PROP_EARLY(1.8, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+  sigma ADD_ERR ~ 0.3 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  log(DV) ~ combined(PROP_ERR{MAG}, ADD_ERR)
+"#;
+
+fn ltbs_combined_fixture(mag: &str) -> (CompiledModel, Subject) {
+    let model = parse_model_string(&ONE_CPT_ORAL_LTBS_COMBINED.replace("{MAG}", mag)).unwrap();
+    assert_eq!(model.error_model, crate::types::ErrorModel::LogCombined);
+    assert!(model.log_transform && !model.dv_pre_logged);
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 11.5, 13.0, 16.0, 20.0, 30.0];
+    let s = subject(&model, doses, &times, &[0.1, -0.05]);
+    // Both terms live: the natural-scale predictions straddle `ADD/PROP = 3`.
+    let preds = crate::pk::compute_predictions_with_tv(
+        &model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    let nat: Vec<f64> = preds.iter().map(|g| g.exp()).collect();
+    assert!(
+        nat.iter().any(|&f| f > 6.0) && nat.iter().any(|&f| f < 0.5),
+        "the fixture must put rows on both sides of ADD/PROP: {nat:?}"
+    );
+    (model, s)
+}
+
+#[test]
+fn analytic_adjoint_matches_reconverged_fd_ltbs_combined() {
+    let (model, s) = ltbs_combined_fixture("");
+    assert!(
+        in_scope(&model, &s),
+        "LTBS combined must be served by the closed-form engine, not FD"
+    );
+    let worst = parity(&model, &s);
+    eprintln!("LTBS combined FOCEI vs reconverged FD {worst:.2e}");
+    // Measured 4.7e-10 (Linux x86_64); 5× headroom.
+    assert!(
+        worst < 2.5e-9,
+        "FOCEI worst relative difference {worst:.2e}"
+    );
+    let worst = parity_foce(&model, &s);
+    eprintln!("LTBS combined FOCE vs reconverged FD {worst:.2e}");
+    // Measured 3.5e-9; 5× headroom.
+    assert!(worst < 1.8e-8, "FOCE worst relative difference {worst:.2e}");
+}
+
+/// The same with a magnitude on the proportional slot only — the motivating model's
+/// `PROP = THETA(6)*THETA(12)` at early times: the multiplier rides the constant log-scale
+/// loading, not the `exp(−f)` one.
+#[test]
+fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_magnitude() {
+    let (model, s) = ltbs_combined_fixture(" * (if (TIME < 3) PROP_EARLY else 1)");
+    assert!(model.has_custom_ruv_magnitude());
+    assert!(in_scope(&model, &s), "served by the closed-form engine");
+    let worst = parity(&model, &s);
+    eprintln!("LTBS combined + magnitude FOCEI vs reconverged FD {worst:.2e}");
+    // Measured 3.3e-10; 5× headroom.
+    assert!(worst < 1.7e-9, "worst relative difference {worst:.2e}");
+}
+
+/// The kernel's objective is production's, and its covariance R-matrix is the
+/// reconverged-FD Hessian of it.
+#[test]
+fn ltbs_combined_kernel_objective_and_hessian_match_production() {
+    let (model, s) = ltbs_combined_fixture("");
+    let g = objective_gaps::<2>(&model, &s, &model.default_params, &[0.1, -0.05]);
+    eprintln!("LTBS combined objective gaps {g:?}");
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "kernel vs production: {g:?}");
+    let (fd, _) = hessian_gaps_for(&model, &s, Objective::Focei);
+    eprintln!("LTBS combined FOCEI Hessian vs reconverged FD {fd:.2e}");
+    // Measured 9.1e-12; 5× headroom.
+    assert!(fd < 5e-11, "FOCEI Hessian vs FD {fd:.2e}");
+}
+
+/// Per-endpoint LTBS combined error on the ODE engine (#2729): plasma (`CMT=2`) and a
+/// cumulative urine amount (`CMT=3`), each with its own `PROP`/`ADD`.
+const ODE_LTBS_COMBINED_PER_CMT: &str = r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_P ~ 0.1 (sd)
+  sigma ADD_P ~ 0.3 (sd)
+  sigma PROP_U ~ 0.2 (sd)
+  sigma ADD_U ~ 2.0 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(states=[depot, central, urine])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+  d/dt(urine) = 0.4 * (CL/V) * central
+[scaling]
+  y[CMT=2] = central / V
+  y[CMT=3] = urine
+[error_model]
+  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)
+  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+#[test]
+fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt() {
+    let model = parse_model_string(ODE_LTBS_COMBINED_PER_CMT).unwrap();
+    // Measured 2.0e-9 (Linux x86_64); 5× headroom.
+    ltbs_combined_per_cmt_parity(model, 1e-8);
+}
+
+/// The same with the motivating model's early-time factor on the plasma `PROP` only,
+/// written on the per-CMT argument (#2729 review, through #2731's per-endpoint
+/// magnitude tables): a θ-dependent magnitude on one endpoint's constant log-scale
+/// loading.
+#[test]
+fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt_magnitude() {
+    let src = ODE_LTBS_COMBINED_PER_CMT
+        .replace(
+            "CMT=2: log(DV) ~ combined(PROP_P, ADD_P)",
+            "CMT=2: log(DV) ~ combined(PROP_P * (if (TAD < 3) FAC else 1), ADD_P)",
+        )
+        .replace(
+            "  sigma PROP_P",
+            "  theta FAC(1.8, 0.1, 10.0)\n  sigma PROP_P",
+        );
+    let model = parse_model_string(&src).unwrap();
+    assert!(model.has_custom_ruv_magnitude());
+    // Measured 2.2e-9 (Linux x86_64); ~5× headroom.
+    ltbs_combined_per_cmt_parity(model, 1e-8);
+}
+
+fn ltbs_combined_per_cmt_parity(model: CompiledModel, bound: f64) {
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let base = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 20.0];
+    let times: Vec<f64> = base.iter().flat_map(|&t| [t, t]).collect();
+    let mut s = subject(&model, doses, &times, &[0.1, -0.05]);
+    s.obs_cmts = (0..times.len()).map(|j| 2 + j % 2).collect();
+    // `subject` built the observations against CMT 1; rebuild them per endpoint.
+    let preds = crate::pk::compute_predictions_with_tv(
+        &model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    assert!(preds.iter().all(|p| p.is_finite()), "{preds:?}");
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, g)| g + 0.15 * (1.3 * j as f64).sin())
+        .collect();
+    // Both terms live on both endpoints: ADD/F straddles PROP on each.
+    let nat: Vec<f64> = preds.iter().map(|g| g.exp()).collect();
+    // (The magnitude variant scales PROP_P by 1.8 before t = 3, which keeps the
+    // straddle: its early rows have F well above ADD/PROP.)
+    for (cmt, prop, add) in [(2usize, 0.1, 0.3), (3, 0.2, 2.0)] {
+        let r: Vec<f64> = (0..nat.len())
+            .filter(|&j| s.obs_cmts[j] == cmt)
+            .map(|j| add / nat[j] / prop)
+            .collect();
+        assert!(
+            r.iter().any(|&x| x > 1.0) && r.iter().any(|&x| x < 1.0),
+            "CMT={cmt}: ADD/(F·PROP) {r:?}"
+        );
+    }
+    assert!(
+        in_scope(&model, &s),
+        "per-CMT LTBS combined must be served by the ODE adjoint, not FD"
+    );
+    let g = objective_gaps::<2>(&model, &s, &model.default_params, &[0.1, -0.05]);
+    eprintln!("per-CMT LTBS combined objective gaps {g:?}");
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "kernel vs production: {g:?}");
+    let worst = parity(&model, &s);
+    eprintln!("per-CMT LTBS combined FOCEI vs reconverged FD {worst:.2e}");
+    assert!(worst < bound, "FOCEI worst relative difference {worst:.2e}");
+}
+
 #[test]
 fn analytic_adjoint_matches_reconverged_fd_steady_state() {
     let model = parse_model_string(ONE_CPT_ORAL).unwrap();

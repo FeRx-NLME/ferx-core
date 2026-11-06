@@ -4514,28 +4514,54 @@ pub(crate) fn check_ctmm_records(
 }
 
 /// `E_LTBS_UNSUPPORTED` on block `error_model`: LTBS (`log_transform = true`) with an
-/// error model the log-scale likelihood cannot represent — a proportional or combined
-/// error, a per-CMT error spec, or an SDE (#1788). The parser refuses all three for a
-/// `.ferx` model, so only a hand-built `CompiledModel` reaches this; predictions would be
-/// log-wrapped while the variance still expects natural-scale `f`.
+/// error model the log-scale likelihood cannot represent — a proportional or (natural-scale)
+/// combined error on any endpoint, a covariate-selected error spec, or an SDE (#1788) —
+/// and the converse, a
+/// `LogCombined` error without LTBS (#2729), whose `exp(−f)` loading reads `f` as a log
+/// prediction. The parser refuses all of these for a `.ferx` model, so only a hand-built
+/// `CompiledModel` reaches this; predictions would be log-wrapped while the variance still
+/// expects natural-scale `f`, or the reverse.
 pub(crate) fn check_ltbs_model(model: &CompiledModel) -> Vec<Diagnostic> {
-    if !model.log_transform {
-        return Vec::new();
-    }
+    use crate::types::{ErrorModel, ErrorSpec};
     let mut diags = Vec::new();
     let mut refuse = |m: &str| {
         diags.push(Diagnostic::error("E_LTBS_UNSUPPORTED", m).with_block("error_model"));
     };
-    if !matches!(model.error_model, crate::types::ErrorModel::Additive) {
+    if !model.log_transform {
+        let log_combined = match &model.error_spec {
+            ErrorSpec::Single(em) => *em == ErrorModel::LogCombined,
+            ErrorSpec::PerCmt(m) | ErrorSpec::Selected { endpoints: m, .. } => {
+                m.values().any(|e| e.error_model == ErrorModel::LogCombined)
+            }
+        };
+        if log_combined || model.error_model == ErrorModel::LogCombined {
+            refuse(
+                "`error_model = LogCombined` requires LTBS (`log_transform = true`): its \
+                 additive part loads `exp(−f)`, which reads the prediction on the log scale",
+            );
+        }
+        return diags;
+    }
+    // Every endpoint is scored on the log scale (the log-wrap is model-wide), so each
+    // one's error model must be a log-scale one; per-CMT is fine on those terms (#2729).
+    let log_scale = |em: ErrorModel| matches!(em, ErrorModel::Additive | ErrorModel::LogCombined);
+    let all_log_scale = match &model.error_spec {
+        ErrorSpec::Single(em) => log_scale(*em) && log_scale(model.error_model),
+        ErrorSpec::PerCmt(m) | ErrorSpec::Selected { endpoints: m, .. } => {
+            m.values().all(|e| log_scale(e.error_model))
+        }
+    };
+    if !all_log_scale {
         refuse(
-            "LTBS (`log_transform = true`) requires `error_model = Additive`; \
-             proportional/combined error on the log scale is not supported",
+            "LTBS (`log_transform = true`) requires `error_model = Additive` or \
+             `LogCombined` on every endpoint; proportional/combined error on the log \
+             scale is not supported",
         );
     }
-    if !matches!(model.error_spec, crate::types::ErrorSpec::Single(_)) {
+    if matches!(model.error_spec, ErrorSpec::Selected { .. }) {
         refuse(
-            "LTBS (`log_transform = true`) is not supported with per-CMT \
-             (`ErrorSpec::PerCmt`) error models",
+            "LTBS (`log_transform = true`) is not supported with covariate-selected \
+             (`ErrorSpec::Selected`) error models",
         );
     }
     if model.diffusion_theta_start.is_some() {
@@ -6006,6 +6032,7 @@ pub(crate) fn check_profiled_levels(
     if let Some(em) = models.iter().find(|e| !matches!(e, ErrorModel::Additive)) {
         let name = match em {
             ErrorModel::Proportional => "proportional (or power)",
+            ErrorModel::LogCombined => "log_combined",
             _ => "combined",
         };
         out.push(refuse(

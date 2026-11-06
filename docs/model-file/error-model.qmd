@@ -39,8 +39,9 @@ which named the line at fault. See
 
 The accepted forms are `DV ~ additive(SIGMA)`, `DV ~ proportional(SIGMA)`,
 `DV ~ combined(SIGMA_PROP, SIGMA_ADD)`, [`DV ~ power(SIGMA, EXPONENT)`](#power),
-the two log-transform-both-sides spellings `DV ~ log_additive(SIGMA)` and
-`log(DV) ~ additive(SIGMA)`, a [`CMT=N:`](#multiple-endpoints-per-cmt-error-models)
+the log-transform-both-sides spellings `DV ~ log_additive(SIGMA)`,
+`log(DV) ~ additive(SIGMA)`, `DV ~ log_combined(SIGMA_PROP, SIGMA_ADD)` and
+`log(DV) ~ combined(SIGMA_PROP, SIGMA_ADD)`, a [`CMT=N:`](#multiple-endpoints-per-cmt-error-models)
 prefix on any of them, the [`weight = <expr>`](#residual-weighting-weight-...)
 modifier, [`iiv_on_ruv = ETA_NAME`](#iiv-on-residual-error-iiv_on_ruv) alongside a
 statement, and the [covariate-selected `if/else`](#covariate-selected-error-models-ifelse)
@@ -656,11 +657,85 @@ $$
 \text{Var}(\log DV) = \sigma^2, \qquad \text{IWRES} = \frac{\log DV - \log f}{\sigma}
 $$
 
+### Combined proportional + additive error on the log scale {#ltbs-combined}
+
+```
+[parameters]
+  sigma PROP ~ 0.1 (sd)    # log scale (unitless), ≈ the CV
+  sigma ADD  ~ 0.05 (sd)   # natural DV units
+
+[error_model]
+  log(DV) ~ combined(PROP, ADD)     # DV on the natural scale
+  # or: DV ~ log_combined(PROP, ADD) # DV already log-transformed
+```
+
+On the log scale a proportional error is a constant, and a natural-scale additive
+error `a` becomes `a/f` (the delta method), so the variance is
+
+$$
+\text{Var}(\log DV) = \text{PROP}^2 + \frac{\text{ADD}^2}{f^2},
+$$
+
+NONMEM's `Y = LOG(IPR) + W*EPS(1)` with `W = SQRT(PROP**2 + ADD**2/IPR**2)`.
+**`ADD` is in natural `DV` units**, unlike every other LTBS σ, which is on the log
+scale; `PROP` is on the log scale. `f` is the natural-scale prediction, before the
+log.
+
+The variance grows without bound as `f → 0`. ferx floors the prediction at
+`1e-12` before taking its log — the same floor every LTBS model uses — and the
+floored value is the `f` that divides `ADD`. A NONMEM control stream reproduces it
+with `IF (IPR.LT.1E-12) IPR=1E-12` ahead of both `LOG(IPR)` and `W`. A model that
+floors `IPR` at a larger value by hand (`IF (IPR.LT.0.01) IPR=0.01`) is a different
+model below that value.
+
+A magnitude expression applies per argument, so a factor on the proportional part
+only is written on that argument: `log(DV) ~ combined(PROP * (if (TIME < 3) FAC else
+1), ADD)`. `weight = W` scales the additive argument, as for `combined`: dividing `DV`
+and `f` by `W` leaves the log residual unchanged and turns `ADD/f` into `ADD·W/f`.
+
+The variance depends on the prediction, so the FOCEI interaction term is live, and
+FOCE reads the variance at the population prediction. All estimators, IWRES/CWRES,
+`iiv_on_ruv` and simulation (drawn on the log scale) go through the same variance.
+`ADD → 0` reduces to `log(DV) ~ additive(PROP)`.
+
+#### Comparison with NONMEM {#ltbs-combined-nonmem-anchor}
+
+A one-compartment oral fixture whose concentrations fall from ~9 to ~0.06, so both
+terms are live, with one observation per subject at `t = 0` that sits on the floor
+(`tests/nonmem/ltbs_combined*.ctl`, `tests/ltbs_combined_nonmem_anchor.rs`). NONMEM
+7.6.0 at `MAXEVAL=0`; both ferx spellings give the same objective to the printed digit:
+
+| evaluation point | NONMEM 7.6.0 | ferx |
+|---|---:|---:|
+| FOCEI, initial estimates | 482.533241 | 482.533241 |
+| FOCE, initial estimates | 1464.351396 | 1464.351396 |
+| FOCEI, NONMEM's final estimates | 417.230486 | 417.230486 |
+
 ### Restrictions
 
-- **Additive only.** LTBS pairs with additive error on the log scale; `log(DV) ~
-  proportional(...)` / `combined(...)` are rejected at parse time.
-- **Single endpoint.** Not supported with per-CMT (multi-endpoint) error models.
+- **Additive or combined only.** LTBS pairs with additive error on the log scale or
+  the combined form above; `log(DV) ~ proportional(...)` / `power(...)` are rejected
+  at parse time.
+- **Per-endpoint: every endpoint or none.** `CMT=N:` lines may be LTBS — the
+  issue's case is plasma and urine, each with its own `PROP` and `ADD`:
+
+  ```
+  [error_model]
+    CMT=2: log(DV) ~ combined(PROP_P, ADD_P)   # plasma, mg/L
+    CMT=3: log(DV) ~ combined(PROP_U, ADD_U)   # cumulative urine, mg
+  ```
+
+  The log transform is model-wide (every prediction and, under `log(DV)`, every
+  `DV` is logged), so a block mixing log-scale and natural-scale lines, or
+  `log(DV) ~ ...` with `DV ~ log_...(...)`, is refused. An argument may carry a
+  [magnitude](#endpoint-magnitude) here too, so the
+  motivating model's early-time factor on the plasma `PROP` alone is
+  `CMT=2: log(DV) ~ combined(PROP_P * (if (TAD < 3) FAC else 1), ADD_P)`.
+  Matched to NONMEM 7.6.0 at `MAXEVAL=0` on a seeded plasma + urine fixture
+  (`tests/ltbs_combined_cmt_nonmem_anchor.rs`): FOCEI 1236.250155, FOCE
+  1279.711094, 1020.297559 at NONMEM's final estimates, and 1265.165067 with the
+  factor, within 1e-7 (the ODE solvers' tolerance). Covariate-selected (`if/else`)
+  error models stay single-scale.
 - **No SDE.** Not supported with a `[diffusion]` (SDE/EKF) model.
 - **BLOQ/M3 is supported** — the LLOQ is log-transformed alongside `DV`.
 - A non-positive `DV` under `log(DV) ~ additive(...)` cannot be log-transformed;
