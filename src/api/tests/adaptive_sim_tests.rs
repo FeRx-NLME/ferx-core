@@ -8148,6 +8148,49 @@ const ODE_1571_SELECTED: &str = r#"
   FREE continuous
 "#;
 
+/// #2731: the assay draws from `assay_resid_var`, which has no observation row to evaluate
+/// a magnitude on, so a `CMT=N:` expression would be dropped from the draw with the run
+/// reporting success. Bare `CMT=N:` lines on the same model and data are the straddle: they
+/// must run, so the `Err` is this reject and nothing else.
+#[test]
+fn both_entry_points_reject_a_cmt_line_magnitude() {
+    let bare_src = ODE_1571_SELECTED
+        .replace(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+            "  CMT=1: DV ~ proportional(PROP_TOTAL)\n  CMT=2: DV ~ proportional(PROP_UNBOUND)",
+        );
+    assert_ne!(bare_src, ODE_1571_SELECTED, "the twin must differ");
+    let scaled_src = bare_src.replace(
+        "proportional(PROP_TOTAL)",
+        "proportional(PROP_TOTAL * (1.0 + FREE))",
+    );
+    assert_ne!(scaled_src, bare_src, "the twin must differ");
+    let bare = parse_model_string(&bare_src).expect("parse bare");
+    let scaled = parse_model_string(&scaled_src).expect("parse scaled");
+    let pop = pop_1571(Some("FREE"));
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![12.0, 36.0],
+        ..Default::default()
+    };
+    let spec = simple_titration_spec();
+    let spec_opts = AdaptiveSimulateOptions::default();
+    let want = "magnitude expression on a `CMT=N:` line";
+
+    let err = simulate_adaptive(&scaled, &pop, &scaled.default_params, 1, fixed_bolus, &opts)
+        .expect_err("simulate_adaptive must reject a CMT-line magnitude");
+    assert_eq!(err.code(), Some("E_ADAPTIVE_UNSUPPORTED"), "{err}");
+    assert!(err.to_string().contains(want), "{err}");
+    assert!(err.to_string().contains("without the expression"), "{err}");
+    let err =
+        simulate_adaptive_from_spec(&scaled, &pop, &scaled.default_params, 1, &spec, &spec_opts)
+            .expect_err("simulate_adaptive_from_spec must reject a CMT-line magnitude");
+    assert!(err.to_string().contains(want), "{err}");
+
+    simulate_adaptive(&bare, &pop, &bare.default_params, 1, fixed_bolus, &opts)
+        .expect("bare CMT lines must run");
+}
+
 #[test]
 fn both_entry_points_reject_a_selected_error_model_through_the_shared_helper() {
     // #658 was pinned only on `reject_selected_error_for_adaptive` directly, so deleting

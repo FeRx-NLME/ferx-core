@@ -176,3 +176,91 @@ fn saem_applies_the_custom_magnitude() {
          multiplier is not reaching its likelihood"
     );
 }
+
+/// Joint model on the #2731 anchor data, a factor `tpf` on the `CMT=1` line (`CMT=2` bare).
+fn endpoint_magnitude_src(tpf: &str) -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL(2.2, 0.01, 100.0)
+  theta TVV(18.0, 0.1, 1000.0)
+  theta TVKE0(0.6, 0.001, 10.0)
+  theta TPF({tpf}, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma S ~ 0.25 (sd)
+  sigma U ~ 0.4 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KE0 = TVKE0
+
+[structural_model]
+  ode(states=[central, effect])
+
+[odes]
+  d/dt(central) = -CL/V * central
+  d/dt(effect) = KE0 * (central/V - effect)
+
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = effect
+
+[covariates]
+  EARLY continuous
+
+[error_model]
+  CMT=1: DV ~ additive(S * (1.0 + (TPF - 1.0) * EARLY))
+  CMT=2: DV ~ additive(U)
+"
+    )
+}
+
+fn endpoint_magnitude_ofv(tpf: &str, method: EstimationMethod) -> f64 {
+    let model = parse_model_string(&endpoint_magnitude_src(tpf)).expect("model must parse");
+    let population = read_nonmem_csv(
+        Path::new("nonmem_anchor/ruv_endpoint_magnitude.csv"),
+        None,
+        None,
+    )
+    .expect("data must load");
+    let opts = FitOptions {
+        method,
+        methods: vec![],
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        checkpoint: false,
+        threads: Some(2),
+        saem_n_exploration: 2,
+        saem_n_convergence: 2,
+        saem_seed: Some(1),
+        ..FitOptions::default()
+    };
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .unwrap_or_else(|e| panic!("{method:?} must accept a CMT-line magnitude: {e}"));
+    assert!(result.ofv.is_finite(), "{method:?}: OFV {}", result.ofv);
+    result.ofv
+}
+
+/// #2731: every estimator family scores a `CMT=N:` magnitude, not only the FOCE/FOCEI the
+/// anchor covers. The factor at 1 and at 2 straddle it: a likelihood that dropped the row
+/// would score the two alike.
+#[test]
+fn every_estimator_applies_a_cmt_line_magnitude() {
+    for method in [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::FoceGn,
+        EstimationMethod::Saem,
+    ] {
+        let inert = endpoint_magnitude_ofv("1.0", method);
+        let active = endpoint_magnitude_ofv("2.0", method);
+        eprintln!("{method:?}: inert {inert}, active {active}");
+        assert!(
+            (active - inert).abs() > 1e-3,
+            "{method:?} scored TPF = 1 and TPF = 2 alike ({inert}, {active})"
+        );
+    }
+}

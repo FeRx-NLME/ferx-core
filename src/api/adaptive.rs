@@ -56,6 +56,26 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
     Ok(())
 }
 
+/// Reject an adaptive-dosing simulation on a `CMT=N:` line carrying a magnitude
+/// expression (#2731). [`assay_resid_var`] has no observation row to evaluate the
+/// expression on, so the assay would draw on the bare sigma and report the run as if
+/// the factor had applied.
+fn reject_endpoint_magnitude_for_adaptive(model: &CompiledModel) -> Result<(), EngineError> {
+    if model
+        .ruv_magnitude
+        .as_ref()
+        .is_some_and(|rm| rm.has_endpoint_magnitude())
+    {
+        return Err(super::entry_refusals::adaptive_unsupported(
+            Some("error_model"),
+            "adaptive-dosing simulation does not support a magnitude expression on a `CMT=N:` \
+             line: the assay draws its residual error from the bare sigma, without the \
+             expression. Use bare sigma names in `[error_model]`.",
+        ));
+    }
+    Ok(())
+}
+
 /// The model-vs-data checks both public adaptive entry points run before anything
 /// else touches the population: `check_simulation_data` (the list every other
 /// simulate entry point runs, #1083), then the `Selected` error-model reject (#658).
@@ -72,7 +92,8 @@ pub(crate) fn check_adaptive_model_data(
         return Err(super::entry_refusals::nested_level_simulate_unsupported());
     }
     first_error(&check_simulation_data(model, population))?;
-    reject_selected_error_for_adaptive(model)
+    reject_selected_error_for_adaptive(model)?;
+    reject_endpoint_magnitude_for_adaptive(model)
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
