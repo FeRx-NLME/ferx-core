@@ -1394,8 +1394,8 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
 /// its implicit index ([`LevelBlockDecl::record_cmts`]) (#2623). Why depends on whether
 /// any expression reads the block bare ([`LevelBlockDecl::read_bare`]): if none does,
 /// the expression is the cause; if one does, its reader defines no level on this data —
-/// a level-defining endpoint with no records here, or only a Gaussian prediction or a
-/// CTMM generator. An explicit `NAME[COLUMN]` read is named either way.
+/// a level-defining endpoint with no records here, or only a Gaussian prediction, a
+/// CTMM generator or a TTE hazard. An explicit `NAME[COLUMN]` read is named either way.
 fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     let name = decl.name();
     let head = format!("theta {name}[{}]", decl.columns().join(", "));
@@ -1426,11 +1426,12 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
         ));
     } else {
         message.push_str(
-            " The block is read bare, but only by a Gaussian prediction or a `[markov_model]` \
-             CTMM generator, and neither defines a level on this data: it has no Gaussian rows, \
-             and a CTMM generator is built once per subject from the baseline, so its records \
-             define none. Read the block in a `[binary_model]` predictor or a DTMM \
-             `[markov_model]` transition.",
+            " The block is read bare, but only by a Gaussian prediction, a `[markov_model]` \
+             CTMM generator or an `[event_model]` hazard, and none of them defines a level on \
+             this data: it has no Gaussian rows, a CTMM generator is built once per subject \
+             from the baseline, and one time-to-event row can yield zero or two records, so \
+             neither kind of record defines a level. Read the block in a `[binary_model]` \
+             predictor or a DTMM `[markov_model]` transition.",
         );
     }
     if !decl.keyed_reads.is_empty() {

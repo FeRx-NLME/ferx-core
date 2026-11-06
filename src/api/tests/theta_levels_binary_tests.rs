@@ -1007,11 +1007,12 @@ const KEYED: &str = "An explicit read indexes the block by the value its column 
 const KEYED_ANY: &str = "An explicit read";
 /// Conditional on a bare read whose only readers define no level (review r1 #1): a
 /// Gaussian prediction or a CTMM generator …
-const BARE_NO_DEFINER: &str = "The block is read bare, but only by a Gaussian prediction or a \
-                               `[markov_model]` CTMM generator, and neither defines a level on \
-                               this data";
-const BARE_WHY: &str = "it has no Gaussian rows, and a CTMM generator is built once per subject \
-                        from the baseline, so its records define none.";
+const BARE_NO_DEFINER: &str = "The block is read bare, but only by a Gaussian prediction, a \
+                               `[markov_model]` CTMM generator or an `[event_model]` hazard, and \
+                               none of them defines a level on this data";
+const BARE_WHY: &str = "it has no Gaussian rows, a CTMM generator is built once per subject from \
+                        the baseline, and one time-to-event row can yield zero or two records, \
+                        so neither kind of record defines a level.";
 const BARE_ADVICE: &str =
     "Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` transition.";
 /// … or a level-defining endpoint the data has no record for.
@@ -1165,6 +1166,33 @@ fn a_gaussian_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     assert_bare_read_refusal("y bare", &d.message, false);
     assert!(d.message.contains(KEYED), "{}", d.message);
+}
+
+/// Review r2 #5: a block read bare by an `[event_model]` hazard alone is read through its
+/// implicit index too, but a time-to-event row defines no level (#2562), so the refusal
+/// is the bare-read arm that names the hazard, not "check the expression".
+///
+/// Mutation: drop `read_bare` and the cell gets `CHECK`; drop the hazard from the arm's
+/// reader list and `BARE_NO_DEFINER` is missing.
+#[test]
+fn a_hazard_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
+    let text = read_model(Rows::Binary, Read::Unread).replace(
+        "theta TVL(-0.3, -5.0, 5.0)\n",
+        "theta TVL(-0.3, -5.0, 5.0)\n  theta LAM(0.1, 0.001, 10.0)\n",
+    )
+        + "[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = LAM * exp(PLACEBO)\n";
+    let mut parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    let decl = &parsed.model.theta_blocks().level_blocks()[0];
+    assert!(
+        decl.read_bare && decl.record_cmts.is_empty(),
+        "fixture precondition: read bare by the hazard alone"
+    );
+    let mut pop = read_population(Rows::Binary, true);
+    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+        .expect_err("a hazard defines no levels");
+    assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
+    assert_bare_read_refusal("hazard bare", &d.message, false);
+    assert!(!d.message.contains(KEYED_ANY), "{}", d.message);
 }
 
 /// Review r1 #1, the Markov cells: a block read bare by a CTMM generator alone (whose

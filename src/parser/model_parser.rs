@@ -24417,7 +24417,7 @@ pub struct LevelBlockDecl {
     /// `index_covariate` — the model's referenced covariates include it (#2623 review).
     /// With [`Self::record_cmts`] it tells the binder's no-levels refusal whether the
     /// expression is the cause or the block's only readers define no level on the data
-    /// (a Gaussian prediction on data with no Gaussian rows, a CTMM generator).
+    /// (a Gaussian prediction on data with no Gaussian rows, a CTMM generator, a TTE hazard).
     pub(crate) read_bare: bool,
 }
 
