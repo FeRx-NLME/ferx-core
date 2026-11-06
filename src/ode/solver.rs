@@ -155,15 +155,23 @@ impl OdeAutoSwitchState {
 /// Step-shrink factor applied when the local error estimate is non-finite (NaN/∞). The
 /// trajectory is diverging, so shrink toward `min_dt` instead of falling into the
 /// I-controller's growth branch, which would otherwise enlarge the step on a NaN error.
+const NONFINITE_ERR_SHRINK_FACTOR: f64 = 0.2;
+
 /// The error norms past which the I-controller's factor `0.9·err^(−1/q)` is certain to be
-/// clamped, for one exponent `1/q`: below `lo` it is ≥ 5, above `hi` it is ≤ 0.2. Computed once
-/// per exponent rather than one `powf` per step attempt (a measured 6.8% of a Michaelis–Menten
-/// FOCEI fit's instructions, #2706 follow-up).
-#[derive(Default)]
+/// clamped, for one exponent `1/q`: below `lo` it is ≥ 5, above `hi` it is ≤ 0.2. A step whose
+/// error lies outside them skips its `powf` (a measured 6.8% of a Michaelis–Menten FOCEI fit's
+/// instructions, #2706 follow-up). Computed once per thread and exponent — a method has one —
+/// not once per integration: a per-call pair of `powf`s cost more than a short segment saved.
+#[derive(Clone, Copy)]
 struct ControllerBounds {
     exp_bits: u64,
     lo: f64,
     hi: f64,
+}
+
+thread_local! {
+    static CONTROLLER_BOUNDS: std::cell::Cell<ControllerBounds> =
+        const { std::cell::Cell::new(ControllerBounds { exp_bits: 0, lo: 0.0, hi: 0.0 }) };
 }
 
 /// `0.9·err^(−err_exp)` as the controllers have always computed it, or the clamp value it is
@@ -171,7 +179,7 @@ struct ControllerBounds {
 /// `clamp(0.2, 5.0)` after it can tell apart computed by `powf`, so the step sequence is
 /// bit-identical: `powf` is correct to an ulp, far inside the margin.
 #[inline]
-fn controller_factor(err_norm: f64, err_exp: f64, b: &mut ControllerBounds) -> f64 {
+fn controller_factor(err_norm: f64, err_exp: f64) -> f64 {
     const SAFETY: f64 = 0.9;
     if !err_norm.is_finite() {
         return NONFINITE_ERR_SHRINK_FACTOR;
@@ -179,11 +187,15 @@ fn controller_factor(err_norm: f64, err_exp: f64, b: &mut ControllerBounds) -> f
     if !(err_norm > 1e-15) {
         return 5.0;
     }
+    let mut b = CONTROLLER_BOUNDS.with(|c| c.get());
     if b.exp_bits != err_exp.to_bits() || b.hi == 0.0 {
         let inv = 1.0 / err_exp;
-        b.exp_bits = err_exp.to_bits();
-        b.lo = (SAFETY / 5.0).powf(inv) * (1.0 - 1e-12);
-        b.hi = (SAFETY / 0.2).powf(inv) * (1.0 + 1e-12);
+        b = ControllerBounds {
+            exp_bits: err_exp.to_bits(),
+            lo: (SAFETY / 5.0).powf(inv) * (1.0 - 1e-12),
+            hi: (SAFETY / 0.2).powf(inv) * (1.0 + 1e-12),
+        };
+        CONTROLLER_BOUNDS.with(|c| c.set(b));
     }
     if err_norm < b.lo {
         5.0
@@ -193,8 +205,6 @@ fn controller_factor(err_norm: f64, err_exp: f64, b: &mut ControllerBounds) -> f
         SAFETY * err_norm.powf(-err_exp)
     }
 }
-
-const NONFINITE_ERR_SHRINK_FACTOR: f64 = 0.2;
 
 /// ODE right-hand side function type.
 /// `rhs(u, params, t) -> du/dt`  where u and du are `&[f64]` of length n_states.
@@ -1526,7 +1536,6 @@ fn integrate_dense_g<T: PkNum>(
     let mut stepper = make_stepper::<T>(n, method);
     stepper.set_dense_required(!interp_at.is_empty());
     let mut err_exp = stepper.err_exp();
-    let mut bounds = ControllerBounds::default();
     // Mid-segment re-probing is `auto`'s business only: a named method is pinned, failed
     // result included (the same rule the escalation guard follows). The explicit re-solve the
     // guard runs pins its method for exactly this reason, so it cannot switch back.
@@ -1729,7 +1738,7 @@ fn integrate_dense_g<T: PkNum>(
         // On reject: (u, t) is unchanged, so the stepper's carried state stays valid.
 
         // Adapt the step (memoryless I-controller — see the note above).
-        let factor = controller_factor(err_norm, err_exp, &mut bounds);
+        let factor = controller_factor(err_norm, err_exp);
         dt = dt_eff * factor.clamp(0.2, 5.0);
         dt = dt.max(opts.min_dt);
     }
@@ -2120,7 +2129,6 @@ fn until_threshold_with(
     // This driver localizes the crossing inside a step, so it always interpolates.
     stepper.set_dense_required(true);
     let mut err_exp = stepper.err_exp();
-    let mut bounds = ControllerBounds::default();
     let mut t = t0;
     let mut dt = opts.initial_dt.min((tf - t0) / 10.0).max(opts.min_dt);
     // Mid-segment switching, exactly as the dense driver does it (#1080 Part C): `auto` only,
@@ -2271,7 +2279,7 @@ fn until_threshold_with(
         // (diverging / NaN RHS, or an unusable attempt) shrinks toward `min_dt` instead of
         // growing, so the step is force-accepted at `min_dt` and the non-finite guard above
         // fires with a clear cause rather than silently burning the step budget.
-        let factor = controller_factor(err_norm, err_exp, &mut bounds);
+        let factor = controller_factor(err_norm, err_exp);
         dt = (dt_eff * factor.clamp(0.2, 5.0)).max(opts.min_dt);
     }
 

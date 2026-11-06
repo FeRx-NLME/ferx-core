@@ -562,11 +562,15 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
     if n == 0 || n > 6 {
         return None;
     }
-    let vals: Vec<f64> = a.iter().map(|x| x.val()).collect();
-    if repeated_singleton_eigenvalue(&vals, n) {
+    let mut buf = [0.0_f64; 36];
+    let vals = &mut buf[..n * n];
+    for (v, x) in vals.iter_mut().zip(a) {
+        *v = x.val();
+    }
+    if repeated_singleton_eigenvalue(vals, n) {
         return None;
     }
-    spectral_of(a, n, &vals)
+    spectral_of(a, n, vals)
 }
 
 /// Whether two compartments that sit on no cycle of `A`'s coupling graph have (nearly) the same
@@ -577,6 +581,11 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
 /// gap is relative to the larger of the two diagonals, at most the spectral radius
 /// `spectral_of` measures against, so this declines nothing `spectral_of` would accept.
 fn repeated_singleton_eigenvalue(vals: &[f64], n: usize) -> bool {
+    let close = |x: f64, y: f64| (x - y).abs() <= SPECTRAL_MIN_REL_GAP * x.abs().max(y.abs());
+    // Only a pair of close diagonals can decline, so the coupling graph is walked only for one.
+    if !(0..n).any(|i| (i + 1..n).any(|j| close(vals[i * n + i], vals[j * n + j]))) {
+        return false;
+    }
     // reach[i][j]: j reachable from i along nonzero couplings (Warshall, n ≤ 6).
     let mut reach = [[false; 6]; 6];
     for i in 0..n {
@@ -601,11 +610,7 @@ fn repeated_singleton_eigenvalue(vals: &[f64], n: usize) -> bool {
             m += 1;
         }
     }
-    (0..m).any(|i| {
-        (i + 1..m).any(|j| {
-            (diag[i] - diag[j]).abs() <= SPECTRAL_MIN_REL_GAP * diag[i].abs().max(diag[j].abs())
-        })
-    })
+    (0..m).any(|i| (i + 1..m).any(|j| close(diag[i], diag[j])))
 }
 
 fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64]) -> Option<Spectral<T>> {
