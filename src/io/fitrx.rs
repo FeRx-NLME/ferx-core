@@ -2182,7 +2182,6 @@ fn write_predictions_tte_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), F
     writeln!(w, "{}", TTE_HEADER.join(","))?;
     for s in &r.subjects {
         for t in &s.tte_rows {
-            let mut t = t.clone(); // `tte_residual` hands out the field by `&mut`
             let mut line = format!(
                 "{},{},{},{}",
                 csv_escape(&s.id),
@@ -2192,7 +2191,7 @@ fn write_predictions_tte_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), F
             );
             for name in crate::io::output::TTE_RESIDUAL_COLUMNS {
                 line.push(',');
-                line.push_str(&fmt_f64(*tte_residual(&mut t, name)));
+                line.push_str(&fmt_f64(tte_residual(t, name)));
             }
             writeln!(w, "{line}")?;
         }
@@ -2200,10 +2199,24 @@ fn write_predictions_tte_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), F
     Ok(())
 }
 
-/// The residual field of `t` under sdtab column `name`, one of `TTE_RESIDUAL_COLUMNS`:
-/// the one map from a column name to a field, used by the writer and the reader alike.
+/// The residual of `t` under sdtab column `name`, one of `TTE_RESIDUAL_COLUMNS`, for the
+/// writer. The bundle shares the sdtab's column names, not its field mapping:
+/// `append_tte_rows` has its own, and T1 pins this one against literal entry text, since a
+/// reader built on the same mistake would round-trip it exactly.
 #[cfg(feature = "survival")]
-fn tte_residual<'a>(t: &'a mut crate::types::TteObsDiagnostic, name: &str) -> &'a mut f64 {
+fn tte_residual(t: &crate::types::TteObsDiagnostic, name: &str) -> f64 {
+    match name {
+        "COXSNELL" => t.coxsnell,
+        "MARTINGALE" => t.martingale,
+        "DEVIANCE" => t.deviance,
+        "PIT" => t.pit,
+        other => unreachable!("no TteObsDiagnostic field for sdtab column {other:?}"),
+    }
+}
+
+/// [`tte_residual`]'s field by `&mut`, for the reader.
+#[cfg(feature = "survival")]
+fn tte_residual_mut<'a>(t: &'a mut crate::types::TteObsDiagnostic, name: &str) -> &'a mut f64 {
     match name {
         "COXSNELL" => &mut t.coxsnell,
         "MARTINGALE" => &mut t.martingale,
@@ -3078,7 +3091,7 @@ fn attach_tte_rows(
                 pit: f64::NAN,
             };
             for (name, cell) in TTE_HEADER.iter().zip(&fields).skip(TTE_KEY_COLUMNS.len()) {
-                *tte_residual(&mut row, name) = num(cell)?;
+                *tte_residual_mut(&mut row, name) = num(cell)?;
             }
             s.tte_rows.push(row);
         }
@@ -7519,8 +7532,7 @@ mod tests {
     #[cfg(feature = "survival")]
     fn tte_fit_911() -> (FitResult, Population) {
         let mut r = minimal_fit_result();
-        let mut s2 = r.subjects[0].clone();
-        s2.id = r.subjects[0].id.clone();
+        let s2 = r.subjects[0].clone();
         r.subjects.push(s2);
         r.n_subjects = 3;
         r.subjects[0].discrete_rows = vec![discrete_row(3, 1.5, 0.25)];
@@ -7531,7 +7543,7 @@ mod tests {
         r.subjects[2].tte_rows = vec![
             tte_row_911(2.0, 0.0, 0.1 + 0.2, -0.75),
             tte_row_911(4.0, 1.0, 1e-300, 0.5),
-            tte_row_911(6.0, 0.0, 2.0 / 3.0, -2.0),
+            tte_row_911(6.0, 1.0, 0.0, f64::INFINITY),
         ];
         r.model_text = Some(TTE_MODEL_911.to_string());
         let id0 = r.subjects[0].id.clone();
@@ -7579,6 +7591,20 @@ mod tests {
             header.ends_with(",n_obs,n_obs_discrete,n_obs_tte"),
             "{header}"
         );
+        // The entry's own text, not only its round trip: the writer and the reader share
+        // a name→field map, so a swapped pair (DEVIANCE ↔ PIT) would round-trip exactly
+        // (review r1 #1). Row 2 holds the interval censor's empty DV; row 5 an event with
+        // ΔH = 0, whose +∞ deviance the bundle writes `inf` where the sdtab leaves it empty.
+        let entry = entry_text(&path, "predictions_tte.csv").unwrap();
+        let lines: Vec<&str> = entry.lines().collect();
+        assert_eq!(lines[0], "ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE,PIT");
+        assert_eq!(
+            lines[1],
+            "S1,2,5.0,1.0,-1e-17,0.30000000000000004,-0.0,1e-300"
+        );
+        assert_eq!(lines[2], "S1,2,7.5,,0.75,0.30000000000000004,-0.5,1e-300");
+        assert_eq!(lines[5], "S1,2,6.0,1.0,0.0,0.30000000000000004,inf,1e-300");
+        assert_eq!(lines.len(), 6);
     }
 
     /// T2 (#911), the exit condition: `sdtab()` and `write_sdtab_csv` of the restored
@@ -7865,6 +7891,15 @@ mod tests {
                 }
                 body = edited.into_bytes();
             }
+            // Index the new entry, as a survival build's writer does (review r1 #5).
+            if name == "manifest.json" {
+                body = edit_json(body, |v| {
+                    v["entries"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push("predictions_tte.csv".into())
+                });
+            }
             out.start_file(name, SimpleFileOptions::default()).unwrap();
             out.write_all(&body).unwrap();
         }
@@ -7874,6 +7909,13 @@ mod tests {
         out.finish().unwrap();
 
         let loaded = load_fit(&with_tte).expect("a TTE bundle loads without survival");
+        assert!(
+            loaded
+                .manifest
+                .entries
+                .contains(&"predictions_tte.csv".to_string()),
+            "premise: the fixture indexes the entry"
+        );
         assert!(loaded.fit.subjects[0].discrete_rows.is_empty());
         assert_eq!(
             loaded.fit.subjects[1].discrete_rows,

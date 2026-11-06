@@ -640,10 +640,13 @@ ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE,PIT
 - One block per subject, in `ebes.csv` order, sized by that subject's `n_obs_tte`. The
   row `ID` is a check, as in `predictions_discrete.csv`.
 - `DV` is the event indicator, empty for an interval-censored record. The four residual
-  columns are the sdtab's, named from the same list, and are empty where the sdtab's are.
+  columns are the sdtab's, named from the same list. As in every bundle CSV, `NaN` is an
+  empty cell and `±∞` is `inf` / `-inf`, so an event scored with `ΔH = 0` has
+  `DEVIANCE` `inf` here where the sdtab leaves the cell empty.
 
 The entry needs the `survival` feature. A build without it loads the bundle and ignores
-the entry and the column, and a bundle it saves again has neither: a later load in a
+the entry and the column, and so does a ferx older than #911 (a ferx-r whose lock is
+behind). A bundle either one saves again has neither: a later load in a current
 `survival` build then has no TTE rows, and its sdtab is refused.
 
 A bundle written before #911 has no entry. It still loads, with no TTE rows, and sdtab
