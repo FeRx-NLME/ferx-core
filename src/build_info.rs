@@ -151,8 +151,19 @@ pub fn gradient_method_outer(
             // caller's `FitOptions::interaction` says), so `method` alone fixes it
             // here; this function does not receive the options.
             let interaction = crate::types::interaction_for(method, false);
-            // Resolved by the outer loop's own dispatch rule (#1540), so a mixture
-            // model's `auto` → BOBYQA downgrade reports "no outer gradient" here too.
+            // Resolved by the outer loop's own dispatch rule (#1540), so a mixture model's
+            // replacement of an optimizer that cannot carry its objective reports "no outer
+            // gradient" here too.
+            //
+            // `resolve_outer_optimizer`, not `resolve_fit_optimizer`: this report is
+            // **model-level** and takes no population, so it cannot see whether a mixture's
+            // classes start indistinguishable (where `auto` runs BOBYQA, #2739). On such a fit
+            // this reads `analytic (…)` while `FitResult::optimizer` reads `auto (bobyqa)`.
+            // That is the same model-level-versus-run split `gradient_method_outer` already
+            // carries for a per-subject FD fallback — see
+            // `tests/outer_gradient_fd_fallback_warning.rs`, whose
+            // `out_of_scope_subject_warns_while_the_report_still_says_analytic` pins it — and
+            // the FD-fallback warning, not this field, is what reports the run.
             let analytic =
                 crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction);
             let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
@@ -344,17 +355,17 @@ mod tests {
         );
     }
 
-    /// A mixture model left on `auto` runs derivative-free BOBYQA
-    /// (`resolve_outer_optimizer`'s mixture arm), so it has no outer gradient to
-    /// report (#1540). The non-mixture twin — same structural model, in analytic
-    /// scope — must still report `Analytic` under `auto`, or the pair does not
-    /// straddle the gate. An explicit NLopt gradient optimizer is honoured under a
-    /// mixture; an explicit built-in BFGS is replaced by BOBYQA.
+    /// A mixture model left on `auto` in analytic scope runs L-BFGS, like its non-mixture
+    /// twin, so both report `Analytic`. An explicit NLopt gradient optimizer is honoured
+    /// under a mixture; an explicit built-in BFGS is replaced by BOBYQA, which has no
+    /// outer gradient to report (#1540). This report is model-level: a start whose classes
+    /// are indistinguishable, where `auto` runs BOBYQA, is `fit()`'s to report.
     ///
     /// Mutation that must redden this: resolving through `Optimizer::resolve_auto`
-    /// again (the pre-#1540 code), which reports the mixture `auto` arm `Analytic`.
+    /// again (the pre-#1540 code), which reports the mixture's explicit-BFGS arm as a
+    /// gradient optimizer.
     #[test]
-    fn outer_mixture_auto_reports_no_outer_gradient() {
+    fn outer_mixture_reports_the_gradient_of_the_optimizer_it_runs() {
         let params = "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  theta MIXL(0.0, -10.0, 10.0)\n  omega ETA_CL ~ 0.1\n  sigma EPS ~ 0.01\n";
         let body = "[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n";
         let parse = |s: &str| crate::parser::model_parser::parse_model_string(s).expect("parse");
@@ -373,8 +384,8 @@ mod tests {
         );
         assert_eq!(
             outer(Optimizer::Auto, &mix),
-            GradientMethodKind::NotApplicable,
-            "mixture + `auto` runs BOBYQA: no outer gradient"
+            GradientMethodKind::Analytic,
+            "mixture + `auto` in analytic scope runs L-BFGS on the analytic gradient"
         );
         assert_eq!(
             outer(Optimizer::NloptLbfgs, &mix),

@@ -60,8 +60,8 @@ const WARFARIN_F: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
-/// [`WARFARIN_F`] with a two-class `[mixture]`, so `optimizer = auto` resolves to BOBYQA
-/// via `resolve_outer_optimizer` while `gradient_method_outer` still reports analytic.
+/// [`WARFARIN_F`] with a two-class `[mixture]`, where an optimizer the mixture objective
+/// cannot carry is replaced by BOBYQA (`resolve_outer_optimizer`).
 const MIXTURE_F: &str = r#"
 [parameters]
   theta TVCL1(0.15, 0.001, 10.0)
@@ -213,20 +213,24 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
     );
 }
 
-/// PR #1418 review, finding 2. A mixture model with `optimizer = auto` runs **BOBYQA**:
-/// `resolve_outer_optimizer` downgrades `Auto` silently for `[mixture]`. A
-/// derivative-free fit requests no outer gradient at all, so no subject can have taken an
-/// FD *outer* gradient and the warning must stay silent even with a subject the provider
-/// would decline.
+/// PR #1418 review, finding 2. A derivative-free fit requests no outer gradient at all, so
+/// no subject can have taken an FD *outer* gradient and the warning must stay silent even
+/// with a subject the provider would decline.
 ///
-/// When this test was written `build_info::gradient_method_outer` did not model that
-/// downgrade and still reported `analytic (Dual2)` here, so a gate written against it
+/// The vehicle is a `[mixture]` model under `optimizer = trust_region`, which the mixture
+/// objective cannot carry: `resolve_outer_optimizer` replaces it with BOBYQA. (Until #2739
+/// a mixture's `auto` was the vehicle, because every mixture ran BOBYQA whatever its
+/// gradient; `auto` now follows the analytic gradient like any other model's, so it is
+/// L-BFGS on this fixture and no longer derivative-free.)
+///
+/// When this test was written `build_info::gradient_method_outer` did not model the
+/// replacement and still reported `analytic (Dual2)` here, so a gate written against it
 /// would have emitted "1 of 2 ... could not be given the exact analytic outer gradient".
 /// Since #1540 the report resolves through `resolve_outer_optimizer` too and reads `N/A`,
 /// which is asserted below alongside `FitResult::optimizer`. The warning's silence still
 /// comes from its runtime log, not from either report.
 #[test]
-fn a_derivative_free_mixture_auto_fit_does_not_warn() {
+fn a_derivative_free_mixture_fit_does_not_warn() {
     let model = ferx_core::parse_model_string(MIXTURE_F).expect("mixture model parses");
     let mut population = ferx_core::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data loads");
@@ -235,8 +239,8 @@ fn a_derivative_free_mixture_auto_fit_does_not_warn() {
     let options = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
-        // The knob under test: `auto` on a mixture model resolves to BOBYQA.
-        optimizer: Optimizer::Auto,
+        // The knob under test: an optimizer the mixture objective cannot carry runs as BOBYQA.
+        optimizer: Optimizer::TrustRegion,
         outer_maxiter: 1,
         run_covariance_step: false,
         ..Default::default()
@@ -246,7 +250,7 @@ fn a_derivative_free_mixture_auto_fit_does_not_warn() {
 
     // Both reports describe the BOBYQA run (#1540), so the fixture is the derivative-free
     // fit this test is about.
-    assert_eq!(result.optimizer, "auto (bobyqa)");
+    assert_eq!(result.optimizer, "bobyqa");
     assert_eq!(
         result.gradient_method_outer, "N/A",
         "a derivative-free fit has no outer gradient to report"

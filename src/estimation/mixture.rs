@@ -75,6 +75,81 @@ pub fn class_params(params: &ModelParameters, k: usize) -> ModelParameters {
     p
 }
 
+/// Whether the mixture's classes cannot be told apart at `params`: every subject has the same
+/// mixing probability, and the same individual objective at η = 0 and at a probe η (0.3 prior SD
+/// on each random effect), for **some pair** of classes on every subject.
+///
+/// One such pair is enough. The mixture objective is then symmetric under swapping that pair, so
+/// its gradient is: a gradient optimizer started there moves both of them the same way and never
+/// separates them. It stops on that saddle and reports it converged (two identical classes on
+/// `tests/nonmem/mixture_iv.csv`: OFV 350.27 against the optimum's 301.58). A derivative-free
+/// optimizer's probe steps break the symmetry, so `optimizer = auto` runs BOBYQA from such a
+/// start instead.
+///
+/// Pairwise, not all-classes: with `nsub = 3`, two identical classes beside a third that differs
+/// leave the identical two inseparable, so the fit can only ever reach the best solution in which
+/// they stay merged. Requiring every class to match would call that start distinguishable and hand
+/// it to L-BFGS, which is the failure this guard exists to prevent.
+///
+/// The comparison is exact (`to_bits`): identical classes are the same computation on the same
+/// inputs. It can err only towards "symmetric", for classes that differ only away from the two
+/// η probed or only through κ (which `individual_nll` holds at 0), and that costs nothing but
+/// the faster optimizer.
+pub(crate) fn classes_indistinguishable(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> bool {
+    let (Some(spec), Some(mp)) = (model.mixture.as_ref(), params.mixture.as_ref()) else {
+        return false;
+    };
+    let k = mp.omega.len();
+    if k < 2 {
+        return false;
+    }
+    let zeros = vec![0.0; model.n_eta];
+    let probe: Vec<f64> = (0..model.n_eta)
+        .map(|j| 0.3 * params.omega.matrix[(j, j)].max(0.0).sqrt())
+        .collect();
+    let classes: Vec<ModelParameters> = (0..k).map(|cls| class_params(params, cls)).collect();
+    // Every pair still symmetric on every subject seen so far. A subject that tells a pair apart
+    // drops it; an empty set means no pair can be symmetric and the scan stops there.
+    let mut pairs: Vec<(usize, usize)> = (0..k)
+        .flat_map(|a| (a + 1..k).map(move |b| (a, b)))
+        .collect();
+    for subject in &population.subjects {
+        let logp = eval_mixing_log_probs(spec, &params.theta, &subject.covariates);
+        let nlls: Vec<Vec<u64>> = [&zeros, &probe]
+            .iter()
+            .map(|eta| {
+                classes
+                    .iter()
+                    .enumerate()
+                    .map(|(cls, cp)| {
+                        let _guard = MixtureClassGuard::enter(cls + 1);
+                        crate::stats::likelihood::individual_nll(
+                            model,
+                            subject,
+                            &cp.theta,
+                            eta,
+                            &cp.omega,
+                            &cp.sigma.values,
+                        )
+                        .to_bits()
+                    })
+                    .collect()
+            })
+            .collect();
+        pairs.retain(|&(a, b)| {
+            logp[a].to_bits() == logp[b].to_bits() && nlls.iter().all(|n| n[a] == n[b])
+        });
+        if pairs.is_empty() {
+            return false;
+        }
+    }
+    !pairs.is_empty()
+}
+
 /// Combine one subject's per-class scores into its mixture contribution.
 ///
 /// Given `ln p_ik` (`logp`) and `nll_ik` (`nll`), returns
@@ -2609,5 +2684,218 @@ mod tests {
                 assert!(v.is_finite() && v > 0.0, "{method:?}: θ[{j}] variance {v}");
             }
         }
+    }
+}
+
+/// [`classes_indistinguishable`]: each case changes one thing from an indistinguishable start
+/// and must flip the answer, so every input the check reads is shown to matter.
+#[cfg(test)]
+mod indistinguishable_tests {
+    use super::classes_indistinguishable;
+
+    /// The `tests/mixture_nonmem.rs` model at an indistinguishable start: both classes at
+    /// CL 1.7, the mixing logit at 0 (p = ½ each).
+    const SYMMETRIC: &str = r"
+[parameters]
+  theta TVCL1(1.7, 0.01, 100.0)
+  theta TVCL2(1.7, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    fn indistinguishable(src: &str) -> bool {
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("tests/nonmem/mixture_iv.csv"),
+            Some(&["WT"]),
+            None,
+        )
+        .expect("data loads");
+        classes_indistinguishable(&model, &pop, &model.default_params)
+    }
+
+    fn edit(from: &str, to: &str) -> String {
+        assert!(SYMMETRIC.contains(from), "the edit must apply: {from}");
+        SYMMETRIC.replace(from, to)
+    }
+
+    #[test]
+    fn identical_classes_at_equal_probabilities_are_indistinguishable() {
+        assert!(indistinguishable(SYMMETRIC));
+    }
+
+    #[test]
+    fn different_class_parameters_are_distinguishable() {
+        assert!(!indistinguishable(&edit(
+            "theta TVCL2(1.7, 0.01, 100.0)",
+            "theta TVCL2(2.5, 0.01, 100.0)",
+        )));
+    }
+
+    /// Identical classes at unequal mixing probabilities: the gradient weights the classes by
+    /// p₁ and p₂, so it separates them (measured: L-BFGS reaches the optimum from here).
+    #[test]
+    fn unequal_mixing_probabilities_are_distinguishable() {
+        assert!(!indistinguishable(&edit(
+            "theta MIXL(0.0, -10.0, 10.0)",
+            "theta MIXL(1.0, -10.0, 10.0)",
+        )));
+    }
+
+    /// Classes that differ only in a per-class Ω: the same predictions, a different prior.
+    #[test]
+    fn a_class_omega_override_is_distinguishable() {
+        assert!(!indistinguishable(&edit(
+            "  logit(1) = MIXL\n",
+            "  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.36\n",
+        )));
+    }
+
+    /// Classes that differ only in how they use η: identical at η = 0, so only the probe η
+    /// can tell them apart.
+    #[test]
+    fn classes_differing_only_through_eta_are_distinguishable() {
+        assert!(!indistinguishable(&edit(
+            "else TVCL2 * exp(ETA_CL)",
+            "else TVCL2 * exp(2 * ETA_CL)",
+        )));
+    }
+
+    /// A three-class start where two classes are identical and the third differs. The identical
+    /// pair is still permutation-symmetric, so a gradient optimizer keeps them merged and can
+    /// only reach the best solution in which they are: the guard must flag it. Requiring every
+    /// class to match (the first cut) reported this distinguishable.
+    ///
+    /// The control is the same model with all three classes distinct, which must not be flagged,
+    /// so the test cannot pass by flagging every three-class start.
+    #[test]
+    fn two_identical_classes_beside_a_third_are_indistinguishable() {
+        const THREE: &str = r"
+[parameters]
+  theta TVCL1(1.7, 0.01, 100.0)
+  theta TVCL2(1.7, 0.01, 100.0)
+  theta TVCL3(3.1, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL1(0.0, -10.0, 10.0)
+  theta MIXL2(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 3
+  logit(1) = MIXL1
+  logit(2) = MIXL2
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else if (MIXNUM == 2) TVCL2 * exp(ETA_CL) else TVCL3 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let judge = |src: &str| {
+            let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+            assert_eq!(model.mixture.as_ref().expect("mixture").n_classes, 3);
+            let pop = crate::io::datareader::read_nonmem_csv(
+                std::path::Path::new("tests/nonmem/mixture_iv.csv"),
+                Some(&["WT"]),
+                None,
+            )
+            .expect("data loads");
+            classes_indistinguishable(&model, &pop, &model.default_params)
+        };
+        assert!(
+            judge(THREE),
+            "classes 1 and 2 are identical at equal p: that pair cannot be separated"
+        );
+        // The third class differing is what the all-classes rule keyed on, so the control has to
+        // break the *pair*: class 2 moved off class 1.
+        assert!(!judge(&THREE.replace(
+            "theta TVCL2(1.7, 0.01, 100.0)",
+            "theta TVCL2(2.4, 0.01, 100.0)"
+        )));
+        // Equal classes but unequal mixing probabilities: the pair is weighted differently, so
+        // the gradient separates them.
+        assert!(!judge(&THREE.replace(
+            "theta MIXL2(0.0, -10.0, 10.0)",
+            "theta MIXL2(1.0, -10.0, 10.0)"
+        )));
+    }
+
+    /// The `tests/mixture_iov_nonmem.rs` model (IOV on CL, `p(1)` mixing): `individual_nll`
+    /// holds κ at 0, so an indistinguishable start is still caught, and a distinct one is not.
+    #[test]
+    fn an_iov_mixture_is_judged_too() {
+        const IOV: &str = r"
+[parameters]
+  theta TVCL1(1.8, 0.01, 100.0)
+  theta TVCL2(1.8, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta P1(0.5, 0.001, 0.999)
+  omega ETA_CL ~ 0.05
+  kappa KAPPA_CL ~ 0.02
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  p(1) = P1
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL + KAPPA_CL) else TVCL2 * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("tests/nonmem/mixture_iv_iov.csv"),
+            Some(&["WT"]),
+            Some("OCC"),
+        )
+        .expect("data loads");
+        let judge = |src: &str| {
+            let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+            assert_eq!(model.n_kappa, 1);
+            classes_indistinguishable(&model, &pop, &model.default_params)
+        };
+        assert!(judge(IOV), "identical classes, p = ½");
+        assert!(!judge(&IOV.replace(
+            "theta TVCL2(1.8, 0.01, 100.0)",
+            "theta TVCL2(3.0, 0.01, 100.0)"
+        )));
+    }
+
+    #[test]
+    fn a_model_without_a_mixture_is_not_flagged() {
+        let plain = SYMMETRIC
+            .replace("[mixture]\n  nsub = 2\n  logit(1) = MIXL\n", "")
+            .replace(
+                "CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)",
+                "CL = TVCL1 * exp(ETA_CL + 0 * TVCL2 + 0 * MIXL)",
+            );
+        assert!(!plain.contains("[mixture]"));
+        assert!(!indistinguishable(&plain));
     }
 }

@@ -6955,8 +6955,9 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     //
     // Quiet, therefore, on: a model out of the analytic scope anyway (ODE/PD, LTBS,
     // TTE) where `fd` changed nothing; a model above `BOBYQA_MAX_DIM`, where `auto`
-    // takes L-BFGS on an FD gradient either way; a mixture model; and an
-    // evaluation-only (`maxiter = 0`) fit.
+    // takes L-BFGS on an FD gradient either way; and an evaluation-only
+    // (`maxiter = 0`) fit. A mixture model *does* warn since #2739: its `auto` follows
+    // the analytic gradient like any other model's, so `gradient = fd` moves it too.
     //
     // The gradient is read through `GradientMethod::effective`, not off
     // `model.gradient_method`, because `validate_model_file` (`ferx check`) hands us

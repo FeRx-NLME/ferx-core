@@ -887,8 +887,10 @@ Notes:
   or `gradient = fd`, where the outer loop runs on finite differences — it falls
   back to the derivative-free `bobyqa`. Models with more than 64 free parameters,
   and models with a residual `correlation` line together with `kappa` (#2122),
-  take `nlopt_lbfgs` regardless, and mixture models take `bobyqa` regardless (see
-  [the `auto` default](../estimation/optimizers.qmd#the-auto-default)). Benchmarking across ~10 real FOCEI datasets
+  take `nlopt_lbfgs` regardless, and a mixture model whose classes start
+  indistinguishable takes `bobyqa` (see
+  [the `auto` default](../estimation/optimizers.qmd#the-auto-default) and
+  [mixture models](../estimation/optimizers.qmd#auto-mixture)). Benchmarking across ~10 real FOCEI datasets
   (#490) found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem
   and `bobyqa` both fastest and most reliable on the FD-only problems. The fit
   output records the resolved optimizer as `auto (<resolved>)`. Set `optimizer`
