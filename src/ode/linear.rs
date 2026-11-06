@@ -546,12 +546,16 @@ thread_local! {
     pub(super) static SPECTRAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[inline]
 fn spectral_enabled() -> bool {
     #[cfg(test)]
-    if SPECTRAL_OFF.with(|c| c.get()) {
-        return false;
+    {
+        !SPECTRAL_OFF.with(|c| c.get())
     }
-    !crate::devflags::off("spectral")
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 
 pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
@@ -966,14 +970,11 @@ fn segment_in<T: PkNum>(
                 let at = |ts: &[f64]| -> Vec<SolPointG<T>> {
                     ts.iter().map(|&t| SolPointG { t, u: lookup(t) }).collect()
                 };
-                crate::devflags::bump(7);
                 #[cfg(test)]
                 SPECTRAL_HITS.with(|c| c.set(c.get() + 1));
                 return Some((at(saveat), at(interp_at)));
             }
-            crate::devflags::bump(8);
         } else {
-            crate::devflags::bump(9);
         }
     }
 
