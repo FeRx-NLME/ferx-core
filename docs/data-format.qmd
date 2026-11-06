@@ -677,8 +677,9 @@ versions did:
 - Closed-form and constant-parameter ODE fits do not change.
 - With time-varying covariates or IOV, the objective and the EBEs at any given
   parameters do not change, but the outer gradient can round differently, by up to
-  3e-15 relative on the test fixtures. Estimates can then differ in the last few
-  digits.
+  3e-15 relative on the test fixtures. The optimizer can amplify that and stop at a
+  slightly different point. Run to convergence on Linux, those fixtures kept the
+  objective to 14 digits and the estimates to 2e-9 relative.
 - A subject whose route depended on the removed rows takes the route of the data
   without them, for example when a covariate the model reads varied only there. On
   an integrated ODE the two routes differ within solver tolerance: 1.7e-6 on the test

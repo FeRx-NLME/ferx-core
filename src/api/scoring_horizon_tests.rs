@@ -331,12 +331,64 @@ const SATURABLE: &str = "
   d/dt(central) = KA*depot/V - CL/V*central/(1 + central/100)
 ";
 
-/// Rounding between a fit and the same fit on every record, where a walk's parameters are
-/// per record (time-varying covariates, IOV). The objective and EBEs agree bit for bit at
-/// any one point there; the adjoint's outer gradient does not, by up to 3e-15 relative on
-/// these fixtures, and three optimizer iterations carry that into the estimates. Worst
-/// measured 5.1e-14, on the κ-block fixture; the bound leaves 20x.
-const PER_RECORD_ROUNDING: f64 = 1e-12;
+/// The gap between a few iterations of a fit and of the same fit on every record, where a
+/// walk's parameters are per record (time-varying covariates, IOV).
+///
+/// The objective and EBEs agree bit for bit at any one point there and the outer gradient
+/// only to rounding ([`a_per_record_gradient_differs_only_by_rounding`]), and the optimizer
+/// amplifies that. The amplification depends on platform and build and does not grow
+/// steadily with iterations, so this is not a rounding bound: worst measured 1.2e-10 in Linux
+/// CI, 2.4e-10 in `tools/linux-test.sh`, 5.1e-14 on macOS. The bound leaves 40x over Linux
+/// and stays 170x under the smallest real effect here, the 1.7e-6 of a route change.
+const PER_RECORD_ROUNDING: f64 = 1e-8;
+
+/// One gradient per subject, every record against the cut ones, at the subject's mode. The
+/// EBE must match exactly and each gradient entry to `1e-13` relative. Measured worst 3e-15
+/// on macOS and 2e-16 on Linux, IOV exact there.
+fn assert_gradient_rounding(run: &crate::api::PreparedRun) {
+    use crate::estimation::{inner_optimizer::find_ebe, sens_outer_gradient as outer};
+    let model = &run.parsed.model;
+    let every_record = crate::api::fitted_population(
+        model,
+        &crate::types::IovOccasionRule::Column,
+        false,
+        Cow::Borrowed(&run.population),
+        &mut Vec::new(),
+    );
+    let view = scored_population(model, Cow::Borrowed(&*every_record));
+    let mut params = run.init_params.clone();
+    params.theta.iter_mut().for_each(|t| *t *= 1.0137);
+    let x = crate::estimation::parameterization::pack_params(&params);
+    for (full, cut) in every_record.subjects.iter().zip(&view.subjects) {
+        assert!(cut.doses.len() < full.doses.len());
+        let mode = find_ebe(model, full, &params, 500, 1e-10, None, None, 0);
+        let on_cut = find_ebe(model, cut, &params, 500, 1e-10, None, None, 0);
+        assert_eq!(mode.nll.to_bits(), on_cut.nll.to_bits());
+        assert_eq!(mode.eta, on_cut.eta);
+        let mut stacked: Vec<f64> = mode.eta.iter().copied().collect();
+        stacked.extend(mode.kappas.iter().flatten().copied());
+        let gradient = if model.n_kappa > 0 {
+            outer::subject_packed_gradient_foce_iov
+        } else {
+            outer::subject_packed_gradient_foce
+        };
+        let on_full = gradient(model, full, &params, &x, &stacked).expect("the dual path");
+        let on_cut = gradient(model, cut, &params, &x, &stacked).expect("the dual path");
+        for (a, b) in on_full.iter().zip(&on_cut) {
+            assert!(a.is_finite() && b.is_finite());
+            assert!((a - b).abs() <= 1e-13 * a.abs().max(b.abs()), "{a:e} {b:e}");
+        }
+    }
+}
+
+#[test]
+fn a_per_record_gradient_differs_only_by_rounding() {
+    assert_gradient_rounding(&prepared(
+        &model_text(TV_INDIVIDUAL, ODE),
+        &dataset(Tail::Doses, 90.0, 2),
+    ));
+    assert_gradient_rounding(&prepared(&iov_model(), &dataset(Tail::Doses, 70.0, 2)));
+}
 
 /// A read covariate that varies only on trailing rows made the subject time-varying. On the
 /// view it no longer does, so the subject leaves that route for the constant one, as it
