@@ -5372,6 +5372,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             obs_l2: Vec::new(),
@@ -5591,6 +5592,81 @@ mod tests {
                 at(code).to_bits(),
                 "m3_logcdf: CENS={flag} must score as CENS={code}"
             );
+        }
+    }
+
+    /// #2762, the M3 callers of `log_normal_cdf`: a censored row whose limit lies so far on
+    /// the certain side that `z = (limit − f)/sd` passes `|z| ≈ 1.9e154` (where `normal_cdf`
+    /// squares it to `+∞`) scored a `NaN` term — measured end to end on
+    /// `examples/warfarin_bloq.ferx` at `3cd15863`: `LLOQ = 1e300` (CENS=1) or `ULOQ = −1e300`
+    /// (CENS=−1) on one row took the objective to the 2e20 divergence sentinel ("censored (M3)
+    /// term = NaN"). Its probability is 1, so the term is `0` — the same `0` a limit of `±1e6`
+    /// already scores, where `Φ` rounds to `1` without reaching the gate. Through the three
+    /// Gaussian objectives (conditional, FOCE and FOCEI marginals), the far limit must score
+    /// bit-for-bit as the near one.
+    #[test]
+    fn a_censored_limit_past_the_normal_cdf_overflow_scores_as_certain() {
+        let theta = [5.0, 50.0];
+        let eta = [0.1];
+        let omega = make_omega(0.09);
+        let sigma = [0.2];
+        // Straddle, on the fixture row's own z (review r1 #7): the near limit stays below
+        // the gate (`(z/√2)²` finite) and the far one reaches it (`(z/√2)²` overflows).
+        {
+            let model = make_model();
+            let subject = make_simple_subject();
+            let f = model_predictions(&model, &subject, &theta, &eta)[5];
+            let key = model.error_spec.obs_key(&subject, 5);
+            let sd = model.error_spec.variance_at(key, f, &sigma).sqrt();
+            let sq = |limit: f64| ((limit - f) / sd / std::f64::consts::SQRT_2).powi(2);
+            for (far, near) in [(1e300, 1e6), (-1e300, -1e6)] {
+                assert!(sq(near).is_finite(), "near {near:e}: f {f}, sd {sd}");
+                assert_eq!(sq(far), f64::INFINITY, "far {far:e}: f {f}, sd {sd}");
+            }
+        }
+        let setup = |limit: f64, flag: i8| {
+            let mut model = make_model();
+            model.bloq_method = BloqMethod::M3;
+            let mut subject = make_simple_subject();
+            subject.observations[5] = limit;
+            subject.cens[5] = flag;
+            (model, subject)
+        };
+        let conditional = |limit: f64, flag: i8| {
+            let (model, subject) = setup(limit, flag);
+            individual_nll(&model, &subject, &theta, &eta, &omega, &sigma)
+        };
+        let marginal = |limit: f64, flag: i8, interaction: bool| {
+            let (model, subject) = setup(limit, flag);
+            let eta_hat = DVector::from_vec(eta.to_vec());
+            let h = DMatrix::from_element(subject.obs_times.len(), 1, 4.0);
+            foce_subject_nll(
+                &model,
+                &subject,
+                &theta,
+                &eta_hat,
+                &h,
+                &omega,
+                &sigma,
+                &[],
+                interaction,
+            )
+        };
+        let objectives: [(&str, &dyn Fn(f64, i8) -> f64); 3] = [
+            ("individual_nll", &conditional),
+            ("FOCE", &|l: f64, c: i8| marginal(l, c, false)),
+            ("FOCEI", &|l: f64, c: i8| marginal(l, c, true)),
+        ];
+        for (name, nll) in objectives {
+            for (far, near, flag) in [(1e300, 1e6, 1), (-1e300, -1e6, -1)] {
+                let (got, want) = (nll(far, flag), nll(near, flag));
+                assert!(want.is_finite(), "{name}: control at {near:e}, CENS={flag}");
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{name}: limit {far:e} (CENS={flag}) scored {got}, the certain row {want}"
+                );
+            }
         }
     }
 
@@ -6886,6 +6962,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0, 0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -7082,6 +7159,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0, 0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -9656,6 +9734,7 @@ mod conditional_obs_terms_tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),

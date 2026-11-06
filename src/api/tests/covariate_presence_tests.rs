@@ -285,3 +285,117 @@ fn adaptive_observe_covariate_decides_presence_from_the_subjects() {
         }
     }
 }
+
+/// #2671: a covariate is carried only when the static map **and** every per-record
+/// snapshot hold it. Each record kind's snapshot is a map some predictor reads (a record
+/// reads its own, an adaptive decision reads the one in force), so a key one snapshot
+/// lacks is read as 0 at that record. The CSV reader cannot produce such a gap; a
+/// population built in code can. Both sides in one test: every map carrying `WTX` is
+/// accepted, and removing it from one snapshot of each kind in turn is refused with the
+/// `E_MISSING_COVARIATE` text.
+///
+/// Regressions: `population_carries` back to the static map alone (every gap accepted);
+/// any one record kind left out of the chain (that kind's gap accepted, named here).
+#[test]
+fn a_record_snapshot_without_the_covariate_does_not_carry_it() {
+    let model = parse_model_string(ONE_CPT_IV_WTX).expect("parse");
+    let mut pop = cells().pop().expect("cells").population;
+    for s in &mut pop.subjects {
+        let m = HashMap::from([("WTX".to_string(), s.covariates["WTX"])]);
+        s.obs_covariates = vec![m.clone(); 3];
+        s.dose_covariates = vec![m.clone(); 1];
+        s.pk_only_covariates = vec![m.clone(); 1];
+        s.reset_covariates = vec![m.clone(); 1];
+        s.endpoint_covariates = vec![m; 1];
+    }
+    assert!(
+        check_covariates(&model, &pop).is_empty(),
+        "control: every map carries WTX"
+    );
+
+    // `endpoint_covariates` (review r1 row 1): binary / categorical / DTMM rows read it
+    // through `record_cov`.
+    type Maps = fn(&mut Subject) -> &mut Vec<HashMap<String, f64>>;
+    let kinds: [(&str, Maps); 5] = [
+        ("observation", |s| &mut s.obs_covariates),
+        ("dose", |s| &mut s.dose_covariates),
+        ("PK-only", |s| &mut s.pk_only_covariates),
+        ("reset", |s| &mut s.reset_covariates),
+        ("endpoint", |s| &mut s.endpoint_covariates),
+    ];
+    for (kind, maps) in kinds {
+        let mut gap = pop.clone();
+        let snapshot = maps(&mut gap.subjects[1]).last_mut().expect("one snapshot");
+        assert!(snapshot.remove("WTX").is_some(), "{kind}: the gap is made");
+        let diags = check_covariates(&model, &gap);
+        assert_eq!(diags.len(), 1, "{kind} snapshot without WTX: {diags:?}");
+        assert_eq!(diags[0].code, "E_MISSING_COVARIATE", "{kind}");
+        assert_eq!(diags[0].message, MISSING, "{kind}");
+    }
+}
+
+/// The opening of the "not read as covariates" message (#1936), which must name only a
+/// column the reader never took.
+const UNREAD: &str = "Model references column(s) that are in the data but were not read as";
+
+/// #2671 review r1 row 2: a name that is a header of the file the population came from
+/// gets the "not read as covariates" message, which says the reader did not take the
+/// column and advises re-reading with the model. Both are false once any map of the
+/// population holds the name: the reader took it, and the population was edited in code
+/// afterwards. Four cells in one test, all with `WTX` a header:
+/// - no map holds `WTX` → the unread message (the #1936 case, unchanged);
+/// - every map but one observation snapshot holds it → the missing-covariate message;
+/// - one subject's static map lacks it, the other's holds it → the missing-covariate
+///   message;
+/// - only the observation snapshots hold it → the missing-covariate message.
+///
+/// Regressions: the unread choice back to "is a header" alone (cells two to four get the
+/// unread message); the held-check reading only the static maps (the fourth cell gets
+/// it); the held-check inverted (the first cell flips).
+#[test]
+fn a_header_some_map_holds_is_missing_not_unread() {
+    let model = parse_model_string(ONE_CPT_IV_WTX).expect("parse");
+    let header = |mut p: Population| {
+        p.input_columns = vec!["WTX".to_string()];
+        p
+    };
+    let all = cells();
+
+    let unread = header(all[1].population.clone());
+    let d = check_covariates(&model, &unread);
+    assert_eq!(d.len(), 1, "no map holds WTX: {d:?}");
+    assert!(
+        d[0].message.starts_with(UNREAD),
+        "no map holds WTX: {}",
+        d[0].message
+    );
+
+    let mut snapshot_gap = header(all[4].population.clone());
+    for s in &mut snapshot_gap.subjects {
+        let m = HashMap::from([("WTX".to_string(), s.covariates["WTX"])]);
+        s.obs_covariates = vec![m; 3];
+    }
+    assert!(
+        check_covariates(&model, &snapshot_gap).is_empty(),
+        "control: every map carries WTX"
+    );
+    snapshot_gap.subjects[1].obs_covariates[2].remove("WTX");
+    let d = check_covariates(&model, &snapshot_gap);
+    assert_eq!(d.len(), 1, "one snapshot lacks WTX: {d:?}");
+    assert_eq!(d[0].message, MISSING, "one snapshot lacks WTX");
+
+    let static_gap = header(all[3].population.clone());
+    let d = check_covariates(&model, &static_gap);
+    assert_eq!(d.len(), 1, "subject 2's static map lacks WTX: {d:?}");
+    assert_eq!(d[0].message, MISSING, "subject 2's static map lacks WTX");
+
+    // Only the snapshots hold it: every static map lacks `WTX`, so a held-check that
+    // reads the static maps alone would call the column unread.
+    let mut snapshots_only = snapshot_gap.clone();
+    for s in &mut snapshots_only.subjects {
+        s.covariates.remove("WTX");
+    }
+    let d = check_covariates(&model, &snapshots_only);
+    assert_eq!(d.len(), 1, "only the snapshots hold WTX: {d:?}");
+    assert_eq!(d[0].message, MISSING, "only the snapshots hold WTX");
+}

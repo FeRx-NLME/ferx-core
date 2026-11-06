@@ -4365,6 +4365,11 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
             .as_ref()
             .unwrap_or_else(|| panic!("no covariance: {:?}", f.warnings));
         assert_eq!(f.profiled_levels_at_bound, held);
+        // `cov_fixed` says so (#2695), though the level is not FIX in `theta_fixed`.
+        for &k in held {
+            assert!(f.cov_fixed[k] && !f.theta_fixed[k], "θ index {k}");
+        }
+        assert_eq!(f.cov_fixed.len(), c.nrows());
         for k in 0..f.theta.len() {
             if held.contains(&k) {
                 assert!(
@@ -4532,6 +4537,7 @@ fn run_covariance_reports_the_levels_its_step_held() {
             out.warnings
         );
         assert_eq!(out.profiled_levels_at_bound, [k], "{cell}");
+        assert!(out.cov_fixed[k], "{cell}: the replayed step held it");
         let n = |w: &str| out.warnings.iter().filter(|x| x.as_str() == w).count();
         assert_eq!(
             (n(&at(true)), n(&at(false))),

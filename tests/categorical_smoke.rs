@@ -219,9 +219,14 @@ mod binary_smoke {
         let wrap = |block: &str| {
             format!("[parameters]\n  theta TH0(0.0, -10.0, 10.0)\n{block}\n[fit_options]\n  method = focei\n")
         };
-        // Unsupported link.
+        // A link that disagrees with the predictor's key (#2603).
         assert!(parse_model_string(&wrap(
             "[binary_model]\n  cmt = 3\n  logit = TH0\n  link = probit"
+        ))
+        .is_err());
+        // Unsupported link.
+        assert!(parse_model_string(&wrap(
+            "[binary_model]\n  cmt = 3\n  logit = TH0\n  link = cloglog"
         ))
         .is_err());
         // Unknown key.
@@ -438,96 +443,42 @@ mod binary_smoke {
             .is_empty());
     }
 
-    /// A fit **restored from a `.fitrx` checkpoint** carries no per-record discrete
-    /// diagnostics (the bundle doesn't round-trip them), so writing sdtab would emit a
-    /// table silently missing every binary row. `write_sdtab_csv` refuses — keyed on the
-    /// `restored_from_checkpoint` flag **and the restored model's declared binary
-    /// endpoint** (`model_text`), NOT on discrete records in the reconstructed population.
-    /// That distinction is the whole point: `load_fit` re-reads the data with default
-    /// (Gaussian) routing, so a genuinely restored population carries *no* `DiscreteState`
-    /// records at all — an earlier pop-based guard therefore never fired on a real restore
-    /// and wrote a truncated table. A *live* CTMM fit (no binary endpoint) must still
-    /// write; see `markov_smoke`.
+    /// A fit **restored from a `.fitrx` bundle** keeps its per-record discrete diagnostics
+    /// (`predictions_discrete.csv`, #2695), so its sdtab has the live fit's rows. Before
+    /// that, `write_sdtab_csv` refused the restored fit: this is the real round trip, not
+    /// a flag flipped by hand, and the row counts are what the refusal protected.
     #[test]
-    fn sdtab_refuses_a_restored_binary_fit_missing_its_discrete_rows() {
-        use ferx_core::types::Population;
+    fn sdtab_of_a_restored_binary_fit_keeps_its_discrete_rows() {
         let model = parse_model_string(MIXED_MODEL).unwrap();
         let pop = common::binary_pop(&sim_subjects(), 3);
         let mut res = fit(&model, &pop, &model.default_params, &smoke_opts()).expect("fit");
-
-        // A live fit writes fine and carries real discrete rows.
+        res.model_text = Some(MIXED_MODEL.to_string());
         assert!(!res.restored_from_checkpoint);
         assert!(res.subjects.iter().any(|s| !s.discrete_rows.is_empty()));
+
         let dir = tempfile::tempdir().expect("temp dir");
-        let live = dir.path().join("live.csv");
-        ferx_core::io::output::write_sdtab_csv(&res, &pop, live.to_str().unwrap())
+        let bundle = dir.path().join("fit.fitrx");
+        ferx_core::io::fitrx::save_fit(&res, &pop, MIXED_MODEL, &bundle, Default::default())
+            .expect("save_fit");
+        let restored = ferx_core::io::fitrx::load_fit(&bundle)
+            .expect("load_fit")
+            .fit;
+        assert!(restored.restored_from_checkpoint);
+        for (live, back) in res.subjects.iter().zip(&restored.subjects) {
+            assert_eq!(back.discrete_rows.len(), live.discrete_rows.len());
+            for (l, b) in live.discrete_rows.iter().zip(&back.discrete_rows) {
+                assert_eq!((l.cmt, l.time.to_bits()), (b.cmt, b.time.to_bits()));
+                assert_eq!(l.ipred.to_bits(), b.ipred.to_bits());
+            }
+        }
+
+        let (live_csv, back_csv) = (dir.path().join("live.csv"), dir.path().join("back.csv"));
+        ferx_core::io::output::write_sdtab_csv(&res, &pop, live_csv.to_str().unwrap())
             .expect("a live binary fit must write sdtab");
-
-        // Simulate the restore faithfully: the flag flips, the diagnostics are gone, the
-        // model source is carried (as `load_fit` sets it) — and, critically, the
-        // reconstructed population carries NO discrete records (Gaussian routing). The
-        // guard must still refuse, so it cannot be relying on the population.
-        res.restored_from_checkpoint = true;
-        res.model_text = Some(MIXED_MODEL.to_string());
-        for sr in &mut res.subjects {
-            sr.discrete_rows.clear();
-        }
-        let no_discrete_pop = Population {
-            subjects: vec![],
-            covariate_names: vec![],
-            dv_column: "DV".to_string(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
-        let restored = dir.path().join("restored.csv");
-        let err = ferx_core::io::output::write_sdtab_csv(
-            &res,
-            &no_discrete_pop,
-            restored.to_str().unwrap(),
-        )
-        .expect_err("a restored fit of a binary model must be refused even with no discrete rows in the pop");
-        assert!(
-            err.contains("restored") && err.contains("fitrx"),
-            "message: {err}"
-        );
-        assert!(!restored.exists(), "no partial file may be left behind");
-
-        // No false positive: the same restored flag on a model with **no** binary endpoint
-        // (a plain Gaussian / CTMM fit, whose occupancy diagnostics are #820) must NOT be
-        // refused — `binary_cmts()` is binary-only, so the guard stays silent.
-        const GAUSSIAN_MODEL: &str = r"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 500.0)
-  sigma PROP ~ 0.05
-
-[individual_parameters]
-  CL = TVCL
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP)
-";
-        res.model_text = Some(GAUSSIAN_MODEL.to_string());
-        // Use the real (aligned) population here: the guard does not fire, so control
-        // reaches `sdtab`, which indexes `population.subjects` by `result.subjects` order.
-        let out = ferx_core::io::output::write_sdtab_csv(
-            &res,
-            &pop,
-            dir.path().join("gauss.csv").to_str().unwrap(),
-        );
-        // It may still Err for an unrelated reason (a binary fit has no Gaussian rows to
-        // write) — but it must never be the discrete-diagnostics refusal.
-        if let Err(e) = &out {
-            assert!(
-                !e.contains("restored from"),
-                "a restored non-binary fit must not hit the discrete-diagnostics refusal: {e}"
-            );
-        }
+        ferx_core::io::output::write_sdtab_csv(&restored, &pop, back_csv.to_str().unwrap())
+            .expect("a restored binary fit must write sdtab");
+        let n_rows = |p: &std::path::Path| std::fs::read_to_string(p).unwrap().lines().count();
+        assert_eq!(n_rows(&back_csv), n_rows(&live_csv));
     }
 
     // ---- Slice 1b: sdtab diagnostics ---------------------------------------------------

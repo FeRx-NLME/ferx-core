@@ -286,7 +286,6 @@ nan-fold 1 tests/record_clock_nonmem_anchor.rs::worst_pred_error_on
 nan-fold 1 tests/residual_correlation_nonmem_anchor.rs::combined_error_correlation_matches_nonmem_focei
 nan-fold 1 tests/residual_correlation_nonmem_anchor.rs::residual_correlation_matches_nonmem_at_fixed_parameters
 nan-fold 1 tests/run_covariance_fitrx_roundtrip.rs::max_gap
-nan-fold 1 tests/run_covariance_per_engine.rs::max_rel_gap
 nan-fold 2 tests/saem_block_omega_collapse.rs::assert_no_rank1_collapse
 nan-fold 1 tests/simulate_iov_kappa.rs::simulate_samples_inter_occasion_kappa
 nan-fold 1 tests/sir_ci_kappa.rs::mbma_placebo_kappa_sir_interval_is_shared_brackets_and_matches_wald

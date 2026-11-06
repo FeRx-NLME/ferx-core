@@ -150,6 +150,7 @@ fn subject() -> Subject {
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: vec![],
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: OBS.iter().map(|&(_, o, _)| o).collect(),
         obs_l2: vec![],

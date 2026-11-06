@@ -2367,6 +2367,7 @@ fn tv_cov_population() -> crate::types::Population {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
             obs_l2: Vec::new(),
@@ -10398,14 +10399,204 @@ fn test_ltbs_rejects_non_dv_lhs() {
     );
 }
 
+// ── #2729: combined proportional + additive under LTBS ───────────────────
+
 #[test]
-fn test_ltbs_rejects_per_cmt() {
-    // LTBS is single-endpoint only.
-    let err = model_with_error_block("  CMT=1: log(DV) ~ additive(SIG1)").unwrap_err();
+fn test_ltbs_log_dv_combined_is_log_combined() {
+    // `log(DV) ~ combined(PROP, ADD)`: engine logs DV; the additive part stays in
+    // natural units, so it is `LogCombined`, not the natural-scale `Combined`.
+    let m = model_with_error_block("  log(DV) ~ combined(SIG1, SIG2)").unwrap();
+    assert!(m.log_transform && !m.dv_pre_logged);
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+    assert!(matches!(
+        m.error_spec,
+        crate::types::ErrorSpec::Single(ErrorModel::LogCombined)
+    ));
+}
+
+#[test]
+fn test_ltbs_log_combined_case1() {
+    // `DV ~ log_combined(PROP, ADD)`: DV already log; only the prediction is logged.
+    let m = model_with_error_block("  DV ~ log_combined(SIG1, SIG2)").unwrap();
+    assert!(m.log_transform && m.dv_pre_logged);
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+}
+
+#[test]
+fn test_plain_combined_stays_natural_scale() {
+    let m = model_with_error_block("  DV ~ combined(SIG1, SIG2)").unwrap();
+    assert!(!m.log_transform);
+    assert_eq!(m.error_model, ErrorModel::Combined);
+}
+
+#[test]
+fn test_log_combined_rejects_the_forms_it_cannot_take() {
+    let err = model_with_error_block("  log(DV) ~ log_combined(SIG1, SIG2)").unwrap_err();
     assert!(
-        err.contains("per-CMT") || err.contains("multi-endpoint"),
-        "expected per-CMT rejection, got: {err}"
+        err.contains("double-log")
+            && err.contains("`log(DV) ~ combined(...)`")
+            && err.contains("`DV ~ log_combined(...)`")
+            && !err.contains("additive(...)"),
+        "double-log names the combined spellings: {err}"
     );
+    let err = model_with_error_block("  log(DV) ~ log_additive(SIG1)").unwrap_err();
+    assert!(
+        err.contains("`log(DV) ~ additive(...)`") && !err.contains("combined"),
+        "double-log on log_additive still names the additive spellings: {err}"
+    );
+    let err = model_with_error_block("  DV ~ log_combined(SIG1)").unwrap_err();
+    assert!(err.contains("expects 2 sigma(s) but 1 given"), "got: {err}");
+    let err = model_with_error_block("  log(DV) ~ proportional(SIG1)").unwrap_err();
+    assert!(
+        err.contains("log(DV) ~ combined(PROP, ADD)"),
+        "the refusal names the combined LTBS form: {err}"
+    );
+}
+
+/// `weight = W` divides DV and the prediction by `W`: the log residual is unchanged and
+/// `ADD/F` becomes `ADD·W/F`, so the weight lands on the additive (second) slot.
+#[test]
+fn test_log_combined_weight_scales_the_additive_slot() {
+    let m = model_with_error_block("  log(DV) ~ combined(SIG1, SIG2) weight = TVV").unwrap();
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+    let mag = m
+        .ruv_magnitude
+        .as_ref()
+        .expect("weight desugars to a magnitude");
+    let row = mag.eval_obs(&m.default_params.theta, &HashMap::new(), 1.0, 1.0);
+    assert_eq!(row[0], 1.0, "proportional slot untouched: {row:?}");
+    assert_eq!(row[1], 10.0, "additive slot carries W = TVV: {row:?}");
+}
+
+/// Plasma + urine with their own `PROP`/`ADD` pairs (#2729): a per-CMT LTBS block,
+/// every line on the log scale. ODE-only, as every per-CMT error model is.
+fn ltbs_per_cmt_model(error_block: &str) -> Result<crate::types::CompiledModel, String> {
+    parse_model_string(&format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_P ~ 0.1 (sd)
+  sigma ADD_P ~ 0.05 (sd)
+  sigma PROP_U ~ 0.2 (sd)
+  sigma ADD_U ~ 0.5 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[depot, central, urine])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+  d/dt(urine) = 0.4 * (CL/V) * central
+[scaling]
+  y[CMT=2] = central / V
+  y[CMT=3] = urine
+[error_model]
+{error_block}
+"#
+    ))
+}
+
+#[test]
+fn test_ltbs_per_cmt_combined_endpoints() {
+    for (block, pre_logged) in [
+        (
+            "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)",
+            false,
+        ),
+        (
+            "  CMT=2: DV ~ log_combined(PROP_P, ADD_P)\n  CMT=3: DV ~ log_additive(PROP_U)",
+            true,
+        ),
+    ] {
+        let m = ltbs_per_cmt_model(block).unwrap();
+        assert!(m.log_transform, "{block}");
+        assert_eq!(m.dv_pre_logged, pre_logged, "{block}");
+        let crate::types::ErrorSpec::PerCmt(map) = &m.error_spec else {
+            panic!("per-CMT spec expected: {block}");
+        };
+        assert_eq!(map[&2].error_model, ErrorModel::LogCombined);
+        assert_eq!(map[&2].sigma_idx, vec![0, 1]);
+        if pre_logged {
+            assert_eq!(map[&3].error_model, ErrorModel::Additive);
+            assert_eq!(map[&3].sigma_idx, vec![2]);
+        } else {
+            assert_eq!(map[&3].error_model, ErrorModel::LogCombined);
+            assert_eq!(map[&3].sigma_idx, vec![2, 3]);
+        }
+    }
+}
+
+/// The log transform is model-wide: every endpoint on the log scale under one `DV`
+/// convention, or none. Each refusal names its own reason and not the other's.
+#[test]
+fn test_ltbs_per_cmt_lines_must_agree() {
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: DV ~ proportional(PROP_U)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("every endpoint or none") && !err.contains("scale of `DV`"),
+        "got: {err}"
+    );
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: DV ~ proportional(PROP_U)\n  CMT=3: log(DV) ~ combined(PROP_P, ADD_P)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("every endpoint or none"),
+        "order-independent: {err}"
+    );
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: DV ~ log_combined(PROP_U, ADD_U)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("scale of `DV`") && !err.contains("every endpoint or none"),
+        "got: {err}"
+    );
+    // Proportional on the log scale is still refused per line.
+    let err = ltbs_per_cmt_model("  CMT=2: log(DV) ~ proportional(PROP_P)").unwrap_err();
+    assert!(err.contains("log(DV) ~ combined(PROP, ADD)"), "got: {err}");
+}
+
+/// The motivating plasma + urine model in full (#2729): per-endpoint LTBS with the
+/// early-time factor on the plasma `PROP` only, written on its `CMT=2:` argument
+/// (per-CMT magnitudes are #2731's; this pins that they compose with LTBS). Sigmas are
+/// flat in declaration order: `PROP_P, ADD_P, PROP_U, ADD_U`.
+#[test]
+fn test_ltbs_per_cmt_argument_magnitude() {
+    let m = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P * (if (TAD < 3) TVKA else 1), ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)",
+    )
+    .unwrap();
+    assert!(m.log_transform && m.has_custom_ruv_magnitude());
+    let crate::types::ErrorSpec::PerCmt(map) = &m.error_spec else {
+        panic!("per-CMT spec expected");
+    };
+    assert_eq!(map[&2].error_model, ErrorModel::LogCombined);
+    assert_eq!(map[&2].sigma_idx, vec![0, 1]);
+    assert_eq!(map[&3].sigma_idx, vec![2, 3]);
+    // Rows at t = 1, 2, 3, 4 after a dose at 0: plasma early, plasma early, urine
+    // early, plasma late.
+    let mut s = magnitude_rows_subject(&[(2, 0.0), (2, 0.0), (3, 0.0), (2, 0.0)], "UNUSED");
+    s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let rows = m.ruv_obs_mult(&s, &m.default_params.theta).unwrap();
+    assert_eq!(rows[0], vec![1.5, 1.0, 1.0, 1.0], "plasma, TAD 1");
+    assert_eq!(rows[1], vec![1.5, 1.0, 1.0, 1.0], "plasma, TAD 2");
+    assert_eq!(rows[2], vec![1.0, 1.0, 1.0, 1.0], "urine is bare");
+    assert_eq!(rows[3], vec![1.0, 1.0, 1.0, 1.0], "plasma, TAD 4");
+}
+
+#[test]
+fn test_ltbs_per_cmt_requires_an_ode_model() {
+    // Per-CMT error models of any kind are ODE-only; LTBS does not change that.
+    let err = model_with_error_block("  CMT=1: log(DV) ~ additive(SIG1)").unwrap_err();
+    assert!(err.contains("require an ODE-based"), "got: {err}");
 }
 
 #[test]
@@ -12145,6 +12336,235 @@ fn pkpd_model_str(error_block: &str) -> String {
     )
 }
 
+/// `pkpd_model_str` with a θ and a covariate for a magnitude expression to read (#2731).
+fn pkpd_magnitude_str(error_block: &str) -> String {
+    pkpd_model_str(error_block).replace(
+        "  theta TVV(50.0, 5.0, 500.0)\n",
+        "  theta TVV(50.0, 5.0, 500.0)\n  theta TPF(1.5, 0.1, 10.0)\n",
+    ) + "\n[covariates]\n  EARLY continuous\n"
+}
+
+/// `selected_err_model_str` with a θ for a magnitude expression to read (#2731).
+fn selected_magnitude_str(error_block: &str) -> String {
+    selected_err_model_str(error_block).replace(
+        "  theta TVV(50.0, 5.0, 500.0)\n",
+        "  theta TVV(50.0, 5.0, 500.0)\n  theta TPF(1.5, 0.1, 10.0)\n",
+    )
+}
+
+/// One subject with one observation per `(cmt, EARLY)` pair, for reading magnitude rows.
+fn magnitude_rows_subject(rows: &[(usize, f64)], cov: &str) -> Subject {
+    let mut s = Subject {
+        obs_cmts: rows.iter().map(|r| r.0).collect(),
+        obs_times: (0..rows.len()).map(|j| 1.0 + j as f64).collect(),
+        observations: vec![1.0; rows.len()],
+        obs_covariates: rows
+            .iter()
+            .map(|r| HashMap::from([(cov.to_string(), r.1)]))
+            .collect(),
+        ..Subject::default()
+    };
+    s.cens = vec![0; rows.len()];
+    s
+}
+
+/// #2731: an expression on a `CMT=N:` line scales its own endpoint's rows only, and the
+/// bare endpoint's rows stay at 1. `S` is shared, so a per-slot multiplier cannot tell the
+/// two endpoints apart: the row has to follow the endpoint.
+#[test]
+fn cmt_line_magnitude_follows_the_rows_endpoint() {
+    let model = parse_full_model(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ additive(ADD_ERR_PD * (1.0 + (TPF - 1.0) * EARLY))\n  \
+         CMT=2: DV ~ proportional(PROP_ERR_PK)\n",
+    ))
+    .unwrap()
+    .model;
+    assert!(model.has_custom_ruv_magnitude());
+    assert!(model.has_theta_dependent_ruv_magnitude());
+    assert!(model.referenced_covariates.iter().any(|c| c == "EARLY"));
+    let s = magnitude_rows_subject(&[(1, 1.0), (1, 0.0), (2, 1.0)], "EARLY");
+    let theta = &model.default_params.theta;
+    let rows = model.ruv_obs_mult(&s, theta).unwrap();
+    // Sigmas are flat in declaration order: PROP_ERR_PK = 0, ADD_ERR_PD = 1.
+    assert_eq!(rows[0], vec![1.0, 1.5], "CMT=1, EARLY=1");
+    assert_eq!(rows[1], vec![1.0, 1.0], "CMT=1, EARLY=0");
+    assert_eq!(rows[2], vec![1.0, 1.0], "CMT=2 is bare");
+}
+
+#[test]
+fn cmt_lines_sharing_a_sigma_carry_their_own_factors() {
+    let model = parse_full_model(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ additive(ADD_ERR_PD * TPF)\n  CMT=2: DV ~ additive(ADD_ERR_PD * 2.0)\n",
+    ))
+    .unwrap()
+    .model;
+    let s = magnitude_rows_subject(&[(1, 0.0), (2, 0.0)], "EARLY");
+    let rows = model.ruv_obs_mult(&s, &model.default_params.theta).unwrap();
+    assert_eq!(rows[0][1], 1.5);
+    assert_eq!(rows[1][1], 2.0);
+}
+
+/// Bare `CMT=N:` lines build no magnitude at all, so they keep the legacy variance path.
+#[test]
+fn bare_cmt_lines_build_no_magnitude() {
+    let model = parse_full_model(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ proportional(PROP_ERR_PK)\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n",
+    ))
+    .unwrap()
+    .model;
+    assert!(!model.has_custom_ruv_magnitude());
+    assert!(model.ruv_magnitude.is_none());
+}
+
+/// #2731: the row's branch is the one the selector picks, `else` included, and the keys
+/// `endpoint_magnitude_args` writes down are the ones `build_error_spec` hands out. Three
+/// branches, so a key off by one lands on a different factor rather than on nothing.
+#[test]
+fn if_else_magnitude_follows_the_selected_branch() {
+    let model = parse_full_model(&selected_magnitude_str(
+        "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL * TPF)\n  } else if (FREE == 1) {\n    \
+         DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_TOTAL * 3.0)\n  }",
+    ))
+    .unwrap()
+    .model;
+    let s = magnitude_rows_subject(&[(1, 0.0), (1, 1.0), (1, 2.0)], "FREE");
+    let rows = model.ruv_obs_mult(&s, &model.default_params.theta).unwrap();
+    assert_eq!(rows[0][0], 1.5, "first branch");
+    assert_eq!(rows[1][0], 1.0, "bare middle branch");
+    assert_eq!(rows[2][0], 3.0, "else branch");
+}
+
+/// The expression may read `TIME`, `TAD` and an inline `if`, as on a plain line.
+#[test]
+fn endpoint_magnitude_reads_tad_and_an_inline_if() {
+    let model = parse_full_model(&selected_magnitude_str(
+        "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL * (if (TAD < 3.0) TPF else 1.0))\n  \
+         } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+    ))
+    .unwrap()
+    .model;
+    let mut s = magnitude_rows_subject(&[(1, 0.0), (1, 0.0), (1, 0.0), (1, 0.0)], "FREE");
+    s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let rows = model.ruv_obs_mult(&s, &model.default_params.theta).unwrap();
+    assert_eq!(rows[1][0], 1.5, "TAD = 2");
+    assert_eq!(rows[3][0], 1.0, "TAD = 4");
+}
+
+/// The rules of a plain line hold on an endpoint line, and the diagnostic names the line.
+/// A case per rule; the `CMT=1:` / branch label is what a multi-line block needs to be
+/// actionable, so each message asserts it next to the rule.
+#[test]
+fn endpoint_magnitude_keeps_the_plain_line_rules() {
+    for (arg, want) in [
+        ("TPF * 2.0", "references no declared sigma"),
+        ("PROP_ERR_PK * ADD_ERR_PD", "references multiple sigmas"),
+        ("ADD_ERR_PD * ETA_CL", "random effect"),
+        ("ADD_ERR_PD * CL", "undeclared covariate `CL`"),
+        ("ADD_ERR_PD * IPRED", "may not reference `IPRED`"),
+        ("ADD_ERR_PD * NOPE", "undeclared covariate `NOPE`"),
+    ] {
+        let err = expect_parse_err(&pkpd_magnitude_str(&format!(
+            "  CMT=1: DV ~ additive(ADD_ERR_PD)\n  CMT=2: DV ~ additive({arg})\n"
+        )));
+        assert!(err.contains(want), "{arg}: {err}");
+        assert!(err.contains("[error_model] CMT=2:"), "{arg}: {err}");
+        assert!(!err.contains("unknown sigma"), "{arg}: {err}");
+    }
+}
+
+#[test]
+fn if_else_magnitude_diagnostics_name_the_branch() {
+    for (block, want) in [
+        (
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL * NOPE)\n  } else {\n    \
+             DV ~ proportional(PROP_UNBOUND)\n  }",
+            "[error_model] if/else branch 1:",
+        ),
+        (
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    \
+             DV ~ proportional(PROP_UNBOUND * NOPE)\n  }",
+            "[error_model] `else` branch:",
+        ),
+    ] {
+        let err = expect_parse_err(&selected_magnitude_str(block));
+        assert!(err.contains(want), "{err}");
+        assert!(err.contains("undeclared covariate `NOPE`"), "{err}");
+    }
+    // Zero and two sigmas: the plain-line wording, not the "unknown sigma" it used to be.
+    let err = expect_parse_err(&selected_magnitude_str(
+        "  if (FREE == 0) {\n    DV ~ proportional(TPF * 2.0)\n  } else {\n    \
+         DV ~ proportional(PROP_UNBOUND)\n  }",
+    ));
+    assert!(err.contains("references no declared sigma"), "{err}");
+    assert!(!err.contains("unknown sigma"), "{err}");
+    let err = expect_parse_err(&selected_magnitude_str(
+        "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL * PROP_UNBOUND)\n  } else {\n    \
+         DV ~ proportional(PROP_UNBOUND)\n  }",
+    ));
+    assert!(err.contains("references multiple sigmas"), "{err}");
+}
+
+/// A typo'd bare name on a `CMT=N:` line keeps its wording and its endpoint.
+#[test]
+fn bare_typo_on_a_cmt_line_is_still_an_unknown_sigma() {
+    let err = expect_parse_err(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ additive(ADD_ERR_PD)\n  CMT=2: DV ~ additive(NOPE)\n",
+    ));
+    assert!(
+        err.contains("[error_model] CMT=2: references unknown sigma 'NOPE'"),
+        "{err}"
+    );
+}
+
+/// A row holds one multiplier per sigma slot, so a statement whose two arguments share a
+/// sigma cannot carry a factor on either; both orders of the pair are refused. Two bare
+/// arguments have no factor to misplace and parse as they always did.
+#[test]
+fn one_statement_cannot_share_a_sigma_with_a_magnitude() {
+    for args in [
+        "ADD_ERR_PD * TPF, ADD_ERR_PD",
+        "ADD_ERR_PD, ADD_ERR_PD * TPF",
+    ] {
+        let err = expect_parse_err(&pkpd_magnitude_str(&format!(
+            "  CMT=1: DV ~ combined({args})\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n"
+        )));
+        assert!(err.contains("[error_model] CMT=1:"), "{args}: {err}");
+        assert!(err.contains("declare a second sigma"), "{args}: {err}");
+        assert!(err.contains("uses sigma 'ADD_ERR_PD'"), "{args}: {err}");
+    }
+    parse_full_model(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ combined(ADD_ERR_PD, ADD_ERR_PD)\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n",
+    ))
+    .expect("bare repeats are unchanged");
+}
+
+/// `weight =` and `power(...)` stay refused on these forms, as the docs say.
+#[test]
+fn weight_and_power_stay_refused_on_endpoint_forms() {
+    let err = expect_parse_err(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ additive(ADD_ERR_PD * TPF) weight = EARLY\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n",
+    ));
+    assert!(
+        err.contains("`weight = …` is not supported with per-CMT"),
+        "{err}"
+    );
+    let err = expect_parse_err(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ power(ADD_ERR_PD * TPF, TPF)\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n",
+    ));
+    assert!(
+        err.contains("`power(...)` is not supported with per-CMT"),
+        "{err}"
+    );
+    let err = expect_parse_err(&selected_magnitude_str(
+        "  if (FREE == 0) {\n    DV ~ power(PROP_TOTAL * TPF, TPF)\n  } else {\n    \
+         DV ~ proportional(PROP_UNBOUND)\n  }",
+    ));
+    assert!(
+        err.contains("`power(...)` is not supported inside"),
+        "{err}"
+    );
+}
+
 #[test]
 fn test_per_cmt_error_model_parses() {
     let model = parse_full_model(&pkpd_model_str(
@@ -12423,6 +12843,7 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
@@ -12501,6 +12922,7 @@ fn test_selected_error_obs_keys_dispatch() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
@@ -17784,6 +18206,333 @@ fn bytecode_g_dual2_matches_fd() {
     );
 }
 
+/// `pnorm(x) = Φ(x)` (#2603) against references computed outside ferx, in both tails: R's
+/// `pnorm` (Linux and macOS agree in every printed digit) from −37.5 up, and, where that
+/// underflows, positivity and monotonicity through the subnormals. The branch switch at
+/// `x = −37` is continuous, `NaN` stays `NaN`, and `±∞` give `1` and `0`.
+///
+/// Mutations: the `exp(log Φ)` branch dropped (`normal_cdf` alone is `0` before the
+/// subnormals: the `−38.3` row); the value taken from the A&S `erf` (1.5e-7 off: every row);
+/// the switch moved (the continuity check).
+#[test]
+fn pnorm_value_matches_reference_in_both_tails() {
+    // (x, Φ(x)) from R 4.6.1 `pnorm`, %.17e.
+    let reference: [(f64, f64); 12] = [
+        (-37.5, 4.60535300958195519e-308),
+        (-37.01, 3.95358388740127839e-300),
+        (-36.99, 8.29093073247200962e-300),
+        (-30.0, 4.90671392714818718e-198),
+        (-8.0, 6.22096057427178486e-16),
+        (-3.0, 1.34989803163009458e-03),
+        (-1.0, 1.58655253931457046e-01),
+        (0.0, 0.5),
+        (0.5, 6.91462461274013007e-01),
+        (1.0, 8.41344746068542926e-01),
+        (3.0, 9.98650101968369897e-01),
+        (8.0, 9.99999999999999334e-01),
+    ];
+    for (x, want) in reference {
+        let got = crate::stats::special::pnorm(x);
+        let ast = eval_at(&unary("pnorm", lit(x)), &[], &[], &[], &[]);
+        assert_eq!(
+            got.to_bits(),
+            ast.to_bits(),
+            "x {x}: eval_expr is special::pnorm"
+        );
+        assert!(got.is_finite(), "x {x}: {got}");
+        let rel = ((got - want) / want).abs();
+        assert!(rel < 1e-12, "x {x}: {got} vs {want} (rel {rel:.2e})");
+    }
+    // Continuous across the switch at −37: the two sides differ by Φ′/Φ·Δ ≈ 37·Δ.
+    let (lo, hi) = (
+        crate::stats::special::pnorm(-37.0 - 1e-9),
+        crate::stats::special::pnorm(-37.0 + 1e-9),
+    );
+    assert!(lo > 0.0 && hi > lo, "{lo} {hi}");
+    assert!((hi / lo - 1.0).abs() < 1e-7, "jump at −37: {lo} vs {hi}");
+    // Below −37.5: positive, non-increasing to 0, through the subnormals.
+    assert!(
+        crate::stats::special::pnorm(-38.3) > 0.0,
+        "Φ(−38.3) is a subnormal, not 0"
+    );
+    assert!(crate::stats::special::pnorm(-38.3) < f64::MIN_POSITIVE);
+    let mut prev = crate::stats::special::pnorm(-36.0);
+    for i in 1..=400 {
+        let x = -36.0 - 0.01 * i as f64;
+        let v = crate::stats::special::pnorm(x);
+        assert!(
+            v.is_finite() && v >= 0.0 && v <= prev,
+            "x {x}: {v} after {prev}"
+        );
+        prev = v;
+    }
+    assert_eq!(crate::stats::special::pnorm(-40.0), 0.0);
+    assert!(crate::stats::special::pnorm(f64::NAN).is_nan());
+    assert_eq!(crate::stats::special::pnorm(f64::INFINITY), 1.0);
+    assert_eq!(crate::stats::special::pnorm(f64::NEG_INFINITY), 0.0);
+    // The upper tail rounds to 1 and never passes it.
+    assert_eq!(crate::stats::special::pnorm(9.0), 1.0);
+    assert!(crate::stats::special::pnorm(7.0) < 1.0);
+}
+
+/// `pnorm`'s jet through fourth order on a Taylor polynomial, against closed forms `φ`,
+/// `−xφ`, `(x² − 1)φ`, `(3x − x³)φ` and against central differences of the `f64` value, at
+/// points across both tails. The value is `special::pnorm` bit for bit. Mutations: any one
+/// lifted order changed (each of the four is compared).
+#[test]
+fn pnorm_jet_carries_four_exact_orders() {
+    use crate::sens::taylor::Taylor;
+    type T4 = Taylor<1, 4, 5>;
+    let fact = [1.0, 1.0, 2.0, 6.0, 24.0];
+    for x in [-37.5, -8.0, -2.2, -0.6, 0.0, 0.3, 1.7, 5.0] {
+        let t = pnorm_g(T4::seed(x, 0));
+        assert_eq!(
+            t.c[0].to_bits(),
+            crate::stats::special::pnorm(x).to_bits(),
+            "x {x}"
+        );
+        let phi = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        let want = [
+            crate::stats::special::pnorm(x),
+            phi,
+            -x * phi,
+            (x * x - 1.0) * phi,
+            (3.0 * x - x * x * x) * phi,
+        ];
+        for k in 1..5 {
+            let got = t.c[k] * fact[k];
+            assert!(got.is_finite(), "x {x} order {k}: {got}");
+            assert!(
+                (got - want[k]).abs() <= 1e-14 * want[k].abs().max(1e-300),
+                "x {x} order {k}: {got} vs {}",
+                want[k]
+            );
+        }
+    }
+    // FD of the value path, where a difference is accurate.
+    for x in [-2.2, -0.6, 0.0, 0.3, 1.7] {
+        let t = pnorm_g(T4::seed(x, 0));
+        let h = 1e-5;
+        let fd =
+            (crate::stats::special::pnorm(x + h) - crate::stats::special::pnorm(x - h)) / (2.0 * h);
+        assert!(fd.is_finite());
+        assert!((t.c[1] - fd).abs() < 1e-9, "x {x}: {} vs FD {fd}", t.c[1]);
+        let hh = 1e-4;
+        let fd2 = (crate::stats::special::pnorm(x + hh) - 2.0 * crate::stats::special::pnorm(x)
+            + crate::stats::special::pnorm(x - hh))
+            / (hh * hh);
+        assert!(fd2.is_finite());
+        assert!(
+            (2.0 * t.c[2] - fd2).abs() < 1e-6,
+            "x {x}: {} vs FD {fd2}",
+            2.0 * t.c[2]
+        );
+    }
+    // Review r1 #10: where `φ` is 0 the jet is exactly zero, not `0 · ∞ = NaN` from `x²`
+    // overflowing (±1e200) or from `±∞` itself, and the value is still the tail's 0 / 1.
+    for (x, value) in [
+        (1e200, 1.0),
+        (-1e200, 0.0),
+        (f64::INFINITY, 1.0),
+        (f64::NEG_INFINITY, 0.0),
+    ] {
+        let t = pnorm_g(T4::seed(x, 0));
+        assert_eq!(t.c[0], value, "x {x}");
+        assert_eq!(t.c[1..], [0.0; 4], "x {x}: {:?}", t.c);
+    }
+}
+
+/// `pnorm` with the random effect inside the argument, `pnorm(A·(t + η) − B)` on the `Dual2`
+/// VM: the value is the `f64` VM's, the gradient and Hessian (the `η`–`A` cross term
+/// included) match closed forms and central FD of the `f64` VM, which shares no derivative
+/// code with the jet.
+#[test]
+fn bytecode_g_pnorm_dual2_matches_fd_with_eta_in_the_argument() {
+    use crate::sens::dual2::Dual2;
+    // arg = A·(0.4 + η) − 0.3, with A = vars[0] and η = Eta(0).
+    let arg = binop(
+        BinOp::Sub,
+        binop(
+            BinOp::Mul,
+            varidx(0),
+            binop(BinOp::Add, lit(0.4), Expression::Eta(0)),
+        ),
+        lit(0.3),
+    );
+    let expr = binop(BinOp::Mul, lit(2.0), unary("pnorm", arg));
+    let bc = compile_bytecode(&expr);
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let v = |amp: f64, eta: f64| {
+        let mut s: Vec<f64> = Vec::new();
+        eval_bytecode(&bc, &[], &[eta], &[], &[amp], &nn, &mut s)
+    };
+    let (amp, eta) = (1.3, 0.25);
+    let mut sd: Vec<Dual2<2>> = Vec::new();
+    let d = eval_bytecode_g::<Dual2<2>>(
+        &bc,
+        &[],
+        &[Dual2::<2>::var(eta, 1)],
+        &[],
+        &[Dual2::<2>::var(amp, 0)],
+        &[],
+        &mut sd,
+    );
+    assert!(close(d.value, v(amp, eta), 1e-15, 1e-15), "value vs f64 VM");
+    let u = 0.4 + eta;
+    let z = amp * u - 0.3;
+    let phi = (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    // f = 2Φ(z): ∂f/∂A = 2φu, ∂f/∂η = 2φA; ∂²f/∂A² = −2zφu², ∂²f/∂η² = −2zφA²,
+    // ∂²f/∂A∂η = 2φ(1 − zAu).
+    let want_g = [2.0 * phi * u, 2.0 * phi * amp];
+    let want_h = [
+        [-2.0 * z * phi * u * u, 2.0 * phi * (1.0 - z * amp * u)],
+        [2.0 * phi * (1.0 - z * amp * u), -2.0 * z * phi * amp * amp],
+    ];
+    for i in 0..2 {
+        assert!(
+            close(d.grad[i], want_g[i], 1e-14, 1e-14),
+            "grad[{i}]: {} vs {}",
+            d.grad[i],
+            want_g[i]
+        );
+        for j in 0..2 {
+            assert!(
+                close(d.hess[i][j], want_h[i][j], 1e-14, 1e-14),
+                "hess[{i}][{j}]: {} vs {}",
+                d.hess[i][j],
+                want_h[i][j]
+            );
+        }
+    }
+    let h = 1e-5;
+    let gfd = [
+        (v(amp + h, eta) - v(amp - h, eta)) / (2.0 * h),
+        (v(amp, eta + h) - v(amp, eta - h)) / (2.0 * h),
+    ];
+    let hh = 1e-4;
+    let hfd_ee = (v(amp, eta + hh) - 2.0 * v(amp, eta) + v(amp, eta - hh)) / (hh * hh);
+    let hfd_ae = (v(amp + hh, eta + hh) - v(amp + hh, eta - hh) - v(amp - hh, eta + hh)
+        + v(amp - hh, eta - hh))
+        / (4.0 * hh * hh);
+    for (got, fd, what) in [
+        (d.grad[0], gfd[0], "∂/∂A"),
+        (d.grad[1], gfd[1], "∂/∂η"),
+        (d.hess[1][1], hfd_ee, "∂²/∂η²"),
+        (d.hess[0][1], hfd_ae, "∂²/∂A∂η"),
+    ] {
+        assert!(
+            got.is_finite() && fd.is_finite(),
+            "{what}: {got} vs FD {fd}"
+        );
+        assert!(close(got, fd, 1e-6, 1e-6), "{what}: {got} vs FD {fd}");
+    }
+}
+
+/// `sin`/`cos` (#2720) on the `Dual2` VM with the **random effect inside the
+/// argument** — the circadian shape `A·cos(2π(t + η)/24 − φ) + B·sin(4π(t + η)/24 − φ₂)`,
+/// seeded in η (the phase shift) and in the amplitude `A`, against central FD of the
+/// `f64` VM. The value is pinned to the `f64` VM, the gradient and every Hessian entry,
+/// including the η–A cross term, to closed forms and to FD. The point `η = 1.3 h`, `t = 7` puts both
+/// arguments away from a zero of either function, so no derivative is trivially `0`.
+#[test]
+fn bytecode_g_sin_cos_dual2_matches_fd_with_eta_in_the_argument() {
+    use crate::sens::dual2::Dual2;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    // arg_k = k·2π·(TIME + η)/24 − φ_k, with TIME a literal and η = vars[1].
+    let arg = |k: f64, phi: f64| {
+        binop(
+            BinOp::Sub,
+            binop(
+                BinOp::Div,
+                binop(
+                    BinOp::Mul,
+                    lit(k * two_pi),
+                    binop(BinOp::Add, lit(7.0), Expression::Eta(0)),
+                ),
+                lit(24.0),
+            ),
+            lit(phi),
+        )
+    };
+    let expr = binop(
+        BinOp::Add,
+        binop(BinOp::Mul, varidx(0), unary("cos", arg(1.0, 0.9))),
+        binop(BinOp::Mul, lit(0.04), unary("sin", arg(2.0, 0.5))),
+    );
+    let bc = compile_bytecode(&expr);
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let v = |amp: f64, eta: f64| {
+        let mut s: Vec<f64> = Vec::new();
+        eval_bytecode(&bc, &[], &[eta], &[], &[amp], &nn, &mut s)
+    };
+    let (amp, eta) = (0.12, 1.3);
+    let mut sd: Vec<Dual2<2>> = Vec::new();
+    let d = eval_bytecode_g::<Dual2<2>>(
+        &bc,
+        &[],
+        &[Dual2::<2>::var(eta, 1)],
+        &[],
+        &[Dual2::<2>::var(amp, 0)],
+        &[],
+        &mut sd,
+    );
+    assert!(close(d.value, v(amp, eta), 1e-13, 1e-13), "value vs f64 VM");
+    // Closed forms, so a sign error in a lifted derivative cannot hide in FD noise:
+    // ∂/∂A = cos(a₁), ∂/∂η = −A·sin(a₁)·2π/24 + 0.04·cos(a₂)·4π/24.
+    let (a1, a2) = (
+        two_pi * (7.0 + eta) / 24.0 - 0.9,
+        2.0 * two_pi * (7.0 + eta) / 24.0 - 0.5,
+    );
+    let (c1, c2) = (two_pi / 24.0, 2.0 * two_pi / 24.0);
+    let want_g = [a1.cos(), -amp * a1.sin() * c1 + 0.04 * a2.cos() * c2];
+    let want_h = [
+        [0.0, -a1.sin() * c1],
+        [
+            -a1.sin() * c1,
+            -amp * a1.cos() * c1 * c1 - 0.04 * a2.sin() * c2 * c2,
+        ],
+    ];
+    for i in 0..2 {
+        assert!(
+            close(d.grad[i], want_g[i], 1e-14, 1e-14),
+            "grad[{i}]: {} vs {}",
+            d.grad[i],
+            want_g[i]
+        );
+        for j in 0..2 {
+            assert!(
+                close(d.hess[i][j], want_h[i][j], 1e-14, 1e-14),
+                "hess[{i}][{j}]: {} vs {}",
+                d.hess[i][j],
+                want_h[i][j]
+            );
+        }
+    }
+    // …and against FD of the f64 VM, which shares no derivative code with either.
+    let h = 1e-5;
+    let gfd = [
+        (v(amp + h, eta) - v(amp - h, eta)) / (2.0 * h),
+        (v(amp, eta + h) - v(amp, eta - h)) / (2.0 * h),
+    ];
+    let hh = 1e-4;
+    let hfd_ee = (v(amp, eta + hh) - 2.0 * v(amp, eta) + v(amp, eta - hh)) / (hh * hh);
+    let hfd_ae = (v(amp + hh, eta + hh) - v(amp + hh, eta - hh) - v(amp - hh, eta + hh)
+        + v(amp - hh, eta - hh))
+        / (4.0 * hh * hh);
+    for (got, fd, what) in [
+        (d.grad[0], gfd[0], "∂/∂A"),
+        (d.grad[1], gfd[1], "∂/∂η"),
+        (d.hess[1][1], hfd_ee, "∂²/∂η²"),
+        (d.hess[0][1], hfd_ae, "∂²/∂A∂η"),
+    ] {
+        assert!(
+            got.is_finite() && fd.is_finite(),
+            "{what}: {got} vs FD {fd}"
+        );
+        assert!(close(got, fd, 1e-6, 1e-6), "{what}: {got} vs FD {fd}");
+    }
+}
+
 #[test]
 fn compute_max_stack_allows_branching_bytecode() {
     // Regression: a `Conditional` compiles to
@@ -22737,6 +23486,187 @@ fn test_weighted_kappa_refusal_keeps_scaling_label_for_a_real_scaling_block() {
     );
 }
 
+/// #2624: the unnamed blocks sit in a `HashMap`, and the refusal used to return
+/// on the first offending block — so with two of them it named `[derived]` on
+/// some compiles and `[scaling]` on others (21/19 over 40 at `d69779e2`). Every
+/// offending block is now named, sorted, and the message is the same every time.
+/// Each compile builds fresh maps with fresh `RandomState`, so 40 compiles under
+/// a hash-order walk differ with probability 1 − 2·2⁻⁴⁰.
+#[test]
+fn test_weighted_kappa_refusal_names_every_block_in_a_stable_order() {
+    let src = weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n\n[scaling]\n  y = central / V + KAPPA_CL\n",
+    );
+    let first = expect_parse_err(&src);
+    assert!(
+        first.starts_with(
+            "[derived] references `KAPPA_CL` and [scaling] references `KAPPA_CL`, \
+             a kappa declared with `weight = ...`."
+        ),
+        "both blocks named, sorted, one kappa in the singular, got: {first}"
+    );
+    assert!(
+        first.contains("a reference in any of these blocks") && first.contains("Move each term"),
+        "plural wording for two blocks, got: {first}"
+    );
+    assert!(
+        !first.contains("a reference here") && !first.contains("Move the term"),
+        "no singular wording for two blocks, got: {first}"
+    );
+    for i in 1..40 {
+        let again = expect_parse_err(&src);
+        assert_eq!(again, first, "compile {i} gave a different refusal");
+    }
+}
+
+/// Three offending blocks exercise the comma arm of the list join: `A, B and C`,
+/// not `A and B and C`. Every other fixture lists at most two items, where the
+/// separator inside `init` is never written (#2624 review r2).
+#[test]
+fn test_weighted_kappa_refusal_lists_three_blocks_with_commas() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n\n[scaling]\n  y = central / V + KAPPA_CL\n\n\
+         [simulation]\n  dose_amt = KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL`, [scaling] references `KAPPA_CL` and \
+             [simulation] references `KAPPA_CL`, a kappa declared with `weight = ...`."
+        ),
+        "three blocks, comma-joined then `and`, got: {err}"
+    );
+}
+
+/// The single-block case keeps its singular wording: the plural added for
+/// #2624 must not leak into it.
+#[test]
+fn test_weighted_kappa_refusal_single_block_keeps_singular_wording() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with("[derived] references `KAPPA_CL`, a kappa declared with `weight = ...`."),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("a reference here would silently use") && err.contains("Move the term"),
+        "singular wording for one block, got: {err}"
+    );
+    assert!(
+        !err.contains(" and [") && !err.contains("these blocks") && !err.contains("each term"),
+        "no plural wording for one block, got: {err}"
+    );
+}
+
+/// Two distinct weighted kappas in one block: the block is named once with both
+/// kappas, the noun goes plural, and the wording speaks of one block — not "any
+/// of these blocks" (#2624 review).
+#[test]
+fn test_weighted_kappa_refusal_two_kappas_one_block_is_plural() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM\n  kappa KAPPA_V ~ 0.04 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_V + KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL` and `KAPPA_V`, kappas declared with `weight = ...`."
+        ),
+        "one block named once, both kappas, plural noun, got: {err}"
+    );
+    assert!(
+        err.contains("these references would silently use") && err.contains("Move each term"),
+        "one-block multi-kappa wording, got: {err}"
+    );
+    assert!(
+        !err.contains("a kappa declared")
+            && !err.contains("these blocks")
+            && !err.contains("a reference here")
+            && err.matches("[derived]").count() == 1,
+        "no singular, no multi-block wording, block not repeated, got: {err}"
+    );
+}
+
+/// A named block (`[event_model armA]`, walked from the `BTreeMap` half) and an
+/// unnamed one (`[derived]`, from the `HashMap` half) are named together, sorted
+/// on the printed label (#2624 review).
+#[cfg(feature = "survival")]
+#[test]
+fn test_weighted_kappa_refusal_names_named_and_unnamed_blocks_together() {
+    let model_str = r"
+[parameters]
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  omega ETA ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+
+[derived]
+  KOUT = KAPPA_CL
+
+[event_model armA]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(KAPPA_CL)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(model_str);
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL` and [event_model armA] references `KAPPA_CL`, \
+             a kappa declared with `weight = ...`."
+        ),
+        "both halves of the walk named, sorted, got: {err}"
+    );
+}
+
+/// The relabel runs before the sort, so a compartment-free model is ordered by
+/// the label it prints. `[simulation]` sorts between the internal `scaling` key
+/// and the printed `structural_model`, so sorting on the raw key would put the
+/// equations block first (#2624 review).
+#[test]
+fn test_weighted_kappa_refusal_sorts_compartment_free_on_the_printed_label() {
+    let src = r"
+[parameters]
+  theta TVBASE(10.0)
+  omega ETA_BASE ~ 0.09
+  kappa KAPPA_ARM ~ 0.04 weight = NARM
+  sigma ADD ~ 1.0 (sd)
+
+[individual_parameters]
+  BASE = TVBASE + ETA_BASE + KAPPA_ARM
+
+[structural_model]
+  y = BASE + KAPPA_ARM
+
+[error_model]
+  DV ~ additive(ADD)
+
+[covariates]
+  NARM continuous
+
+[simulation]
+  dose_amt = KAPPA_ARM
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(src);
+    assert!(
+        err.starts_with(
+            "[simulation] references `KAPPA_ARM` and [structural_model] references `KAPPA_ARM`, \
+             a kappa declared with `weight = ...`."
+        ),
+        "sorted on the printed label, got: {err}"
+    );
+    assert!(!err.contains("[scaling]"), "got: {err}");
+}
+
 /// The unweighted kappa keeps its freedom to appear elsewhere.
 #[test]
 fn test_unweighted_kappa_is_not_restricted_to_individual_parameters() {
@@ -23037,6 +23967,7 @@ fn covariate_nn_reads_time_varying_covariate_values() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; times.len()],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -23163,6 +24094,7 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -25728,7 +26660,7 @@ fn power_form_rejects_the_forms_it_cannot_combine_with() {
         "log(DV) ~ power(PROP_ERR, RUV_POW)",
     ));
     assert!(
-        err.contains("log-transform-both-sides supports only additive"),
+        err.contains("log-transform-both-sides supports additive error on the log scale"),
         "got: {err}"
     );
     let err = expect_parse_err(&POWER_MODEL.replace(
@@ -26089,6 +27021,9 @@ fn every_supported_unary_fn_has_an_arm_in_all_three_consumers() {
         ("expit", 0.5),
         ("tanh", 0.5),
         ("softplus", 0.5),
+        ("sin", 0.5),
+        ("cos", 0.5),
+        ("pnorm", 0.5),
     ];
     // The probe table must equal the const as a *multiset*, asserted as one
     // comparison of sorted vectors rather than as a set of membership and
@@ -28908,6 +29843,7 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
         name: "KM".to_string(),
         spec,
         index_covariate: None,
+        columns: Vec::new(),
         profiled: false,
         linked: false,
         profile_box: None,
@@ -31894,7 +32830,7 @@ fn word_valued_keys_reject_an_identifier_value() {
                 rhs,
                 "[binary_model]\n  cmt = 3\n  logit = 0.5\n  link = V\n",
             ),
-            "link `V` is not yet supported",
+            "link `V` is not supported",
         ));
     }
     #[cfg(feature = "markov")]
@@ -35768,7 +36704,7 @@ fn linked_of(text: &str, name: &str) -> bool {
         .linked
 }
 
-const LINK_SENTENCE: &str = "A logit link is accepted only as the whole prediction";
+const LINK_SENTENCE: &str = "is accepted only as the whole prediction";
 
 /// The two arms of an `if` on data, each a link around an affine read.
 const LINK_BRANCHES: &str = "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0\n  if (DOSE > 0) {\n    P = \
@@ -35843,9 +36779,10 @@ fn profile_refuses_a_logit_link_that_is_not_the_whole_prediction() {
         assert!(msg.contains(&here), "missing {here:?} in {msg}");
         assert!(
             msg.contains(
-                "A logit link is accepted only as the whole prediction, `y = inv_logit(c × \
-                 PLACEBO + …)`, on every branch of an `if` that chooses it, not scaled, added \
-                 to or inside another link."
+                "A link (`inv_logit`, `expit` or `pnorm`) is accepted only as the whole \
+                 prediction, `y = inv_logit(c × PLACEBO + …)` or `y = pnorm(c × PLACEBO + …)`, \
+                 on every branch of an `if` that chooses it, not scaled, added to or inside \
+                 another link."
             ),
             "{msg}"
         );
@@ -37635,5 +38572,416 @@ fn the_not_mu_referenced_advice_over_the_additive_input_space() {
             "{label}: {w}"
         );
         assert!(w.contains(says), "{label}: {w}");
+    }
+}
+
+/// `[binary_model]`'s link surface (#2603), every cell of the plan's table: the predictor's
+/// key names its link, `link =` is optional and must agree with it. Each accepted cell
+/// asserts the parsed `LinkFn`; each refused cell asserts every sentence of its message and
+/// the absence of the other cells' text, so a message serving the wrong cell cannot pass.
+#[cfg(feature = "survival")]
+#[test]
+fn binary_model_link_cells() {
+    use crate::types::{EndpointLikelihood, LinkFn};
+    let wrap = |block: &str| {
+        format!("[parameters]\n  theta TH0(0.0, -10.0, 10.0)\n[binary_model]\n  cmt = 3\n{block}\n")
+    };
+    let link_of = |block: &str| -> LinkFn {
+        let m = parse_model_string(&wrap(block)).unwrap_or_else(|e| panic!("{block}: {e}"));
+        match m.endpoints.get(&3) {
+            Some(EndpointLikelihood::Binary { link, .. }) => *link,
+            _ => panic!("{block}: no binary endpoint"),
+        }
+    };
+    assert_eq!(link_of("  logit = TH0"), LinkFn::Logit);
+    assert_eq!(link_of("  logit = TH0\n  link = logit"), LinkFn::Logit);
+    assert_eq!(link_of("  probit = TH0"), LinkFn::Probit);
+    assert_eq!(link_of("  link = probit\n  probit = TH0"), LinkFn::Probit);
+
+    let err = |block: &str| {
+        parse_model_string(&wrap(block))
+            .err()
+            .unwrap_or_else(|| panic!("{block} parsed"))
+    };
+    // `link` disagreeing with the key, both ways round: each names the declared link, the key
+    // used and the key to write.
+    let e = err("  logit = TH0\n  link = probit");
+    assert!(
+        e.contains("`link = probit` but the predictor is written `logit = …`"),
+        "{e}"
+    );
+    assert!(
+        e.contains("under `link = probit` write the predictor as `probit = …`"),
+        "{e}"
+    );
+    let e = err("  probit = TH0\n  link = logit");
+    assert!(
+        e.contains("`link = logit` but the predictor is written `probit = …`"),
+        "{e}"
+    );
+    assert!(
+        e.contains("under `link = logit` write the predictor as `logit = …`"),
+        "{e}"
+    );
+    // Both keys in one block.
+    let e = err("  logit = TH0\n  probit = TH0");
+    assert!(
+        e.contains("the predictor is given twice (`logit` and `probit`)"),
+        "{e}"
+    );
+    assert!(
+        e.contains("a block has one linear predictor, written under the key that names its link"),
+        "{e}"
+    );
+    assert!(!e.contains("but the predictor is written"), "{e}");
+    // One key repeated (review r1 #8): last-wins before #2603, refused now, naming the key once.
+    for key in ["logit", "probit"] {
+        let e = err(&format!("  {key} = TH0\n  {key} = 2 * TH0"));
+        assert!(e.contains(&format!("`{key}` is given twice")), "{e}");
+        assert!(
+            e.contains(
+                "a block has one linear predictor, written under the key that names its link"
+            ),
+            "{e}"
+        );
+        assert!(!e.contains("the predictor is given twice"), "{e}");
+    }
+    // An unknown link lists the two that exist.
+    let e = err("  logit = TH0\n  link = cloglog");
+    assert!(e.contains("link `cloglog` is not supported"), "{e}");
+    assert!(
+        e.contains("the links are `logit` (the default) and `probit`"),
+        "{e}"
+    );
+    assert!(!e.contains("planned"), "{e}");
+    // No predictor at all names both keys.
+    let e = err("  link = probit");
+    assert!(e.contains("missing the linear predictor"), "{e}");
+    assert!(
+        e.contains("write `logit = …` (logit link) or `probit = …` (probit link)"),
+        "{e}"
+    );
+    // The unknown-key message lists `probit`.
+    let e = err("  logit = TH0\n  bogus = 1");
+    assert!(e.contains("valid keys: cmt, logit, probit, link"), "{e}");
+}
+
+/// `pnorm` is a link to the profile route as `inv_logit` is (#2603): an outermost
+/// `pnorm(affine)` is accepted and marks the block linked, inline and through a parameter,
+/// while `pnorm(exp(block))` names the `exp`, and `100 * pnorm(…)` and a `pnorm` inside
+/// `inv_logit` are refused with the link sentence naming `pnorm(...)`. Each refused row's
+/// accepted twin is in the same test. Dies when `is_link` drops `pnorm` (the accepted rows
+/// are refused as `` `pnorm(...)` `` constructs), or when the link sentence loses `pnorm`.
+#[test]
+fn profile_accepts_an_outermost_pnorm_link_and_refuses_it_elsewhere() {
+    let base = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    for (indiv, y) in [
+        (base, "pnorm(BASE)"),
+        ("  P = pnorm(TVE0 + PLACEBO[STUDY] + ETA_E0)", "P"),
+    ] {
+        assert!(
+            linked_of(&route_model(indiv, y, ADD), "PLACEBO"),
+            "{indiv} / y = {y}"
+        );
+    }
+    let msg = route_err(
+        "  BASE = TVE0 + ETA_E0",
+        "pnorm(BASE + exp(PLACEBO[STUDY]))",
+        ADD,
+    );
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains("Here `PLACEBO` reaches `y` through `exp(...)` in the `y` readout."),
+        "{msg}"
+    );
+    assert!(!msg.contains("`pnorm(...)`"), "{msg}");
+    for (y, through) in [
+        ("100 * pnorm(BASE)", "`pnorm(...)`"),
+        ("inv_logit(pnorm(BASE))", "`pnorm(...)`"),
+        ("pnorm(inv_logit(BASE))", "`inv_logit(...)`"),
+    ] {
+        let msg = route_err(base, y, ADD);
+        assert_route_frame(&msg);
+        let here = format!("Here `PLACEBO` reaches `y` through {through} in the `y` readout.");
+        assert!(msg.contains(&here), "{y}: missing {here:?} in {msg}");
+        assert!(msg.contains(LINK_SENTENCE), "{y}: {msg}");
+        assert!(msg.contains("`y = pnorm(c × PLACEBO + …)`"), "{y}: {msg}");
+    }
+}
+
+// ── #2744: a data-driven level block is read bare ────────────────────────────
+
+/// The refusal's three sentences for `spelling` on a block declared over `cols`, each
+/// asserted whole, so deleting any one of them fails the test that reads it.
+fn data_driven_subscript_sentences(spelling: &str, cols: &str) -> [String; 3] {
+    [
+        format!(
+            "`{spelling}`: `PLACEBO` is a data-driven θ level block (`theta \
+             PLACEBO[{cols}]`), read bare, as `PLACEBO`: each record reads the level its \
+             own `{cols}` values select."
+        ),
+        "A subscript would index the block by the number it evaluates to, which matches \
+         the record's level only by coincidence."
+            .to_string(),
+        "To supply the index yourself, declare the counted form `theta PLACEBO[N]` and \
+         read `PLACEBO[COLUMN]`."
+            .to_string(),
+    ]
+}
+
+/// One model per place a θ level block can be read, declaring `PLACEBO` as `decl` and
+/// reading it as `read`: an `[individual_parameters]` line, the `y` readout, a
+/// residual-error magnitude, `[derived]`, a `[binary_model]` predictor, a `[scaling]`
+/// `obs_scale` and, with `markov`, a DTMM `[markov_model]` transition. Not every reader:
+/// a `FIX` kappa `weight`, a `[scaling] y`, a closed-form `[event_model]` hazard and a
+/// CTMM generator are left out, since they compile through the same `parse_atom` arm
+/// these seven reach, and the gate sits there rather than per block.
+fn level_read_sites(decl: &str, read: &str) -> Vec<(&'static str, String)> {
+    let gaussian = |indiv: &str, y: &str| {
+        format!(
+            "
+[parameters]
+  theta TVE0(1.5, -10.0, 10.0)
+  theta PLACEBO[{decl}](0.0, -10.0, 10.0)
+  sigma ADD ~ 0.1
+[covariates]
+  STUDY categorical
+[individual_parameters]
+  E0 = TVE0{indiv}
+[structural_model]
+  y = E0{y}
+[error_model]
+  DV ~ additive(ADD)
+"
+        )
+    };
+    #[allow(unused_mut)]
+    let mut sites = vec![
+        (
+            "[individual_parameters]",
+            gaussian(&format!(" + {read}"), ""),
+        ),
+        ("y", gaussian("", &format!(" + {read}"))),
+        (
+            "residual-error magnitude",
+            gaussian("", "").replace(
+                "DV ~ additive(ADD)",
+                &format!("DV ~ additive(ADD * exp({read}))"),
+            ),
+        ),
+        (
+            "[derived]",
+            gaussian("", "") + &format!("[derived]\n  D = E0 + {read}\n"),
+        ),
+        (
+            "[scaling]",
+            format!(
+                "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta PLACEBO[{decl}](0.0, -1.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+[covariates]
+  STUDY categorical
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V * exp({read})
+[error_model]
+  DV ~ proportional(EPS1)
+"
+            ),
+        ),
+    ];
+    // `[binary_model]` is a `survival` block: without it the parse refuses the block
+    // itself, before the read (as the core CI shards, built without `survival`, found).
+    #[cfg(feature = "survival")]
+    sites.push((
+        "[binary_model]",
+        format!(
+            "
+[parameters]
+  theta TVL(-0.3, -5.0, 5.0)
+  theta PLACEBO[{decl}](0.0, -5.0, 5.0)
+[covariates]
+  STUDY categorical
+[binary_model]
+  cmt   = 1
+  logit = TVL + {read}
+"
+        ),
+    ));
+    #[cfg(feature = "markov")]
+    sites.push((
+        "DTMM [markov_model]",
+        format!(
+            "
+[parameters]
+  theta A(-0.8, -10.0, 10.0)
+  theta PLACEBO[{decl}](0.0)
+[covariates]
+  STUDY categorical
+[markov_model]
+  type   = dtmm
+  cmt    = 1
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = inv_logit(A + {read})
+  transition asleep -> awake  = inv_logit(A)
+"
+        ),
+    ));
+    sites
+}
+
+/// #2744: at every site, a subscripted read of a data-driven block is refused with all
+/// three sentences, while both other sides of the gate parse at the same site: the
+/// data-driven block read bare, and a counted block (`PLACEBO[3]`) read by the same
+/// `PLACEBO[STUDY]`, where the subscript is the documented interface.
+///
+/// Mutations: drop the `index_covariate` test (refuse every subscript) and the counted
+/// cell fails; drop the refusal and the data-driven cell parses; delete any sentence of
+/// the message and its assertion fails at every site.
+#[test]
+fn a_subscripted_read_of_a_data_driven_block_is_refused_at_every_site() {
+    let want = data_driven_subscript_sentences("PLACEBO[STUDY]", "STUDY");
+    let refused = level_read_sites("STUDY", "PLACEBO[STUDY]");
+    let bare = level_read_sites("STUDY", "PLACEBO");
+    let counted = level_read_sites("3", "PLACEBO[STUDY]");
+    let expected_sites =
+        5 + usize::from(cfg!(feature = "survival")) + usize::from(cfg!(feature = "markov"));
+    assert_eq!(refused.len(), expected_sites);
+    for (((site, src), (_, bare_src)), (_, counted_src)) in refused.iter().zip(&bare).zip(&counted)
+    {
+        let err = expect_parse_err(src);
+        for sentence in &want {
+            assert!(
+                err.contains(sentence.as_str()),
+                "{site}: missing {sentence:?} in {err}"
+            );
+        }
+        if let Err(e) = parse_full_model(bare_src) {
+            panic!("{site}: the bare read must parse: {e}");
+        }
+        if let Err(e) = parse_full_model(counted_src) {
+            panic!("{site}: a counted block's subscripted read must parse: {e}");
+        }
+    }
+}
+
+/// #2744: every index shape gets the same refusal, echoing the read as written and the
+/// block's own columns — a plain column, a column the block is not keyed on, `TIME`
+/// (which the pre-fit range check cannot walk, so it used to fit at the divergence
+/// sentinel), a computed index (never recorded as a gather use, so it used to fit
+/// silently) and a literal (which used to say "must be in 1..=0"). On a one-column and
+/// a two-column block, each asserted against the other's columns so the echo cannot
+/// name the wrong declaration.
+///
+/// Mutations: render the index from the wrong token, or echo `cols` from anything but
+/// the block's declaration, and the spelling or columns assertion fails; let the
+/// literal fold run first and `PLACEBO[2]` gets the old range message.
+#[test]
+fn every_index_shape_is_refused_with_its_own_spelling() {
+    for (cols, other) in [("STUDY", "STUDY, TIME"), ("STUDY, TIME", "STUDY]")] {
+        for index in ["STUDY", "GRP", "TIME", "STUDY + 0", "2"] {
+            let spelling = format!("PLACEBO[{index}]");
+            let src = level_read_sites(cols, &spelling).swap_remove(0).1.replace(
+                "STUDY categorical",
+                "STUDY categorical\n  GRP   categorical",
+            );
+            let err = expect_parse_err(&src);
+            for sentence in data_driven_subscript_sentences(&spelling, cols) {
+                assert!(
+                    err.contains(&sentence),
+                    "{cols} / {index}: missing {sentence:?} in {err}"
+                );
+            }
+            assert!(
+                !err.contains(&format!("theta PLACEBO[{other}")) && !err.contains("1..=0"),
+                "{cols} / {index}: {err}"
+            );
+        }
+    }
+}
+
+/// #2744 audit A: in a context that cannot read a θ, the #1637 remedy reads a
+/// data-driven block bare (`PLACEBO_I = PLACEBO`), since its subscripted read is
+/// refused, while a counted block keeps the read as written. Each engine separately:
+/// `parse_atom`'s ODE scope (`[odes]`) and the hazard pre-check
+/// (`ode_level_block_read`), so a mutation to either names its own side.
+///
+/// Mutations: drop the `index_covariate` test in the ODE scope and the `[odes]` row
+/// says `PLACEBO_I = PLACEBO[STUDY]`; drop it in the hazard pre-check and the hazard
+/// row does; apply it to counted blocks too and the counted rows lose their index.
+#[test]
+fn an_ode_scope_remedy_reads_a_data_driven_block_bare() {
+    let odes = |decl: &str| {
+        format!(
+            "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta PLACEBO[{decl}](0.0, -1.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+[covariates]
+  STUDY categorical
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * exp(PLACEBO[STUDY]) * central
+[error_model]
+  DV ~ proportional(EPS1)
+"
+        )
+    };
+    let data_driven = expect_parse_err(&odes("STUDY"));
+    assert!(
+        data_driven.contains("[odes] cannot read a θ directly")
+            && data_driven.contains("(e.g. `PLACEBO_I = PLACEBO`)"),
+        "[odes], data-driven: {data_driven}"
+    );
+    let counted = expect_parse_err(&odes("3"));
+    assert!(
+        counted.contains("(e.g. `PLACEBO_I = PLACEBO[STUDY]`)"),
+        "[odes], counted: {counted}"
+    );
+
+    #[cfg(feature = "survival")]
+    for (index_covariate, want) in [
+        (Some("__level_KM".to_string()), "(e.g. `KM_I = KM`)"),
+        (None, "(e.g. `KM_I = KM[STUDY]`)"),
+    ] {
+        let _scope = VectorThetaScope::enter(vec![VectorThetaDecl {
+            name: "KM".to_string(),
+            spec: std::sync::Arc::new(GatherSpec {
+                name: "KM".to_string(),
+                levels: vec![LevelRule::Free(0), LevelRule::Free(1)],
+            }),
+            columns: index_covariate
+                .as_ref()
+                .map(|_| vec!["STUDY".to_string()])
+                .unwrap_or_default(),
+            index_covariate: index_covariate.clone(),
+            profiled: false,
+            linked: false,
+            profile_box: None,
+        }]);
+        let why = ode_level_block_read("H0 * KM[STUDY]")
+            .unwrap()
+            .expect("a block read in the hazard is refused");
+        assert!(
+            why.contains("an ODE-accumulated `hazard` cannot read") && why.contains(want),
+            "hazard, index_covariate {index_covariate:?}: {why}"
+        );
     }
 }

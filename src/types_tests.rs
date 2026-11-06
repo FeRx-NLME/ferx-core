@@ -225,6 +225,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![],
         obs_l2: Vec::new(),
@@ -285,6 +286,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![],
         obs_l2: Vec::new(),
@@ -2562,6 +2564,7 @@ fn bare_subject(id: &str) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: Vec::new(),
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -3977,6 +3980,119 @@ fn eval_only_trailing_stage_leaves_the_covariance_step_on_bayes() {
     };
     assert_eq!(estimating.covariance_stage(), Some(EstimationMethod::Imp));
     assert!(estimating.unsupported_keys_warnings().is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  #2717 — MCEM-only `imp` keys under `imp_eval_only`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `imp_eval_only` on `chain`, with `(key, value)` applied the way a model file or
+/// ferx-r applies them, so `user_set_keys` is the parser's rather than hand-written.
+fn eval_only_opts(chain: &[EstimationMethod], keys: &[(&str, &str)]) -> FitOptions {
+    let mut opts = FitOptions {
+        methods: chain.to_vec(),
+        imp_eval_only: true,
+        ..FitOptions::default()
+    };
+    for (key, value) in keys {
+        crate::parser::model_parser::apply_fit_option(&mut opts, key, value)
+            .expect("the option parses");
+    }
+    opts
+}
+
+const EVAL_CHAIN: [EstimationMethod; 2] = [EstimationMethod::FoceI, EstimationMethod::Imp];
+
+/// Every sentence of each message, and the set and unset cases of each option. `imp_auto`
+/// defaults to `true`, so `unset` is what catches a rule keyed on the value.
+#[test]
+fn eval_only_iscale_keys_warn_when_set_and_only_then() {
+    assert!(eval_only_opts(&EVAL_CHAIN, &[])
+        .unsupported_keys_warnings()
+        .is_empty());
+    for (key, other) in [("iscale_min", "iscale_max"), ("iscale_max", "iscale_min")] {
+        let w = eval_only_opts(&EVAL_CHAIN, &[(key, "5")]).unsupported_keys_warnings();
+        assert_eq!(
+            w,
+            vec![format!(
+                "fit option `{key}` bounds the proposal-scale search of the estimating IMP \
+                 iterations, but `imp_eval_only` runs an evaluation, which does not search \
+                 a scale, so it has no effect. An evaluation's proposal is adapted only by \
+                 `imp_adapt_passes`."
+            )]
+        );
+        assert!(!w[0].contains(other), "{}", w[0]);
+    }
+}
+
+#[test]
+fn eval_only_imp_auto_warns_when_set_to_either_value_and_only_then() {
+    let unset = eval_only_opts(&EVAL_CHAIN, &[]);
+    assert!(
+        unset.imp_auto,
+        "the unset case must hold the default `true`"
+    );
+    assert!(unset.unsupported_keys_warnings().is_empty());
+    for value in ["true", "false"] {
+        let w = eval_only_opts(&EVAL_CHAIN, &[("imp_auto", value)]).unsupported_keys_warnings();
+        assert_eq!(
+            w,
+            vec![
+                "fit option `imp_auto` adapts the sample count of the estimating IMP \
+                 iterations, but `imp_eval_only` runs an evaluation, which draws a fixed \
+                 `imp_samples` per subject in each pass, so it has no effect. Raise \
+                 `imp_samples` to lower the evaluation's Monte-Carlo error."
+                    .to_string()
+            ],
+            "imp_auto = {value}"
+        );
+    }
+}
+
+/// The estimating path reads all three, so the pair straddles `imp_eval_only`.
+#[test]
+fn estimating_imp_keeps_the_mcem_keys_quiet() {
+    let keys = [
+        ("iscale_min", "5"),
+        ("iscale_max", "5"),
+        ("imp_auto", "false"),
+    ];
+    let evaluating = eval_only_opts(&[EstimationMethod::Imp], &keys);
+    assert_eq!(evaluating.unsupported_keys_warnings().len(), 3);
+    let estimating = FitOptions {
+        imp_eval_only: false,
+        ..evaluating
+    };
+    assert!(estimating.unsupported_keys_warnings().is_empty());
+}
+
+/// `[impmap, imp]`: IMPMAP reads `iscale_*`, so calling them inert would be false, while
+/// it reads `impmap_auto` rather than `imp_auto`, so that one stays inert.
+#[test]
+fn eval_only_notice_skips_a_key_an_impmap_stage_reads() {
+    let w = eval_only_opts(
+        &[EstimationMethod::Impmap, EstimationMethod::Imp],
+        &[("iscale_min", "5"), ("imp_auto", "false")],
+    )
+    .unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].starts_with("fit option `imp_auto`"), "{}", w[0]);
+}
+
+/// With no `imp` stage the key is unknown to the chain: one warning, the general one.
+#[test]
+fn eval_only_notice_leaves_a_chain_without_imp_to_the_general_warning() {
+    let w = eval_only_opts(&[EstimationMethod::FoceI], &[("iscale_min", "5")])
+        .unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("is not used by method"), "{}", w[0]);
+}
+
+#[test]
+fn eval_only_notice_is_issued_once_per_key() {
+    let w = eval_only_opts(&EVAL_CHAIN, &[("imp_auto", "true"), ("imp_auto", "false")])
+        .unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1413,6 +1413,9 @@ fn each_parsable_refusal_names_its_construct_and_statement() {
         ("  d/dt(x1) = logit(x1)", "`logit`", "`d/dt(x1)`"),
         ("  d/dt(x1) = tanh(x1)", "`tanh`", "`d/dt(x1)`"),
         ("  d/dt(x1) = softplus(x1)", "`softplus`", "`d/dt(x1)`"),
+        ("  d/dt(x1) = sin(x1)", "`sin`", "`d/dt(x1)`"),
+        ("  d/dt(x1) = cos(x1)", "`cos`", "`d/dt(x1)`"),
+        ("  d/dt(x1) = pnorm(x1)", "`pnorm`", "`d/dt(x1)`"),
         // The site is the assignment, not the derivative that reads it.
         (
             "  E = sqrt(A)\n  d/dt(x1) = -E * x1",

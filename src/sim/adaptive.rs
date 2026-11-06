@@ -230,7 +230,13 @@ pub struct ObservedSignal {
 /// own [`ObserveMode`], so the controller never draws assay noise itself
 /// (reproducibility is the engine's responsibility, #391 S1.5).
 pub struct ControllerCtx<'a> {
-    /// Decision time on the subject's clock.
+    /// Decision time on the subject's **engine** clock: the clock `decision_times`, the
+    /// decision log and the dose ledger are given on. After a reset that restarts `TIME`,
+    /// the reader shifts the period onto this monotonic clock (#1969), so `t` can then run
+    /// ahead of the `TIME` written in the data. A monitor reading `TIME` (an `observe`
+    /// expression or a `[scaling]` readout) reads the written value instead, as an
+    /// observation record there does (#2756). So in such a period, `signals` and `t` are
+    /// on different clocks.
     pub t: f64,
     /// Current ODE state vector (0-based compartments). The controller may
     /// compute any expression over this directly.

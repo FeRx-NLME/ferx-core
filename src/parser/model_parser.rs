@@ -1811,6 +1811,197 @@ fn detect_covariate_mu_refs(
         .collect()
 }
 
+/// The mu-scale channels through which some thetas reach the predictions — what lets the
+/// adjoint gradient record those thetas as constants (#2706).
+///
+/// A **channel** is a top-level `[individual_parameters]` assignment `P = g⁻¹(g(A) + η_j)`
+/// in one of the covariate mu-reference shapes ([`split_typical_and_eta`], one or more
+/// thetas), whose typical value `A` reads thetas, covariates and literals only, whose name is
+/// assigned nowhere else, and whose BSV `η_j` nothing else reads — no other right-hand side
+/// ([`eta_read_outside_the_group`]) and no other block. A theta is **carried** when the
+/// channels are the only route by which it reaches the likelihood: some channel reads it,
+/// and its taint, stopped at every channel ([`thetas_read_outside_the_group`]), reaches no
+/// other block.
+///
+/// Then the predictions depend on a carried `θ_m` and on `η_j` only through
+/// `u_j = g(A_j) + η_j` (with `A_j` subject-constant when its covariates are), so every
+/// derivative order in `θ_m` is read off the `η` ones:
+/// `∂/∂θ_m = Σ_j (∂g(A_j)/∂θ_m) ∂/∂η_j`. `None` unless **every** theta the likelihood reads
+/// is carried: one left on the tape keeps the solve taped, and the reduction would only add
+/// work (measured +2.2% on a 2-cpt model whose `Q = TVQ` has no random effect).
+fn detect_theta_channels(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv_eta: usize,
+    outside_idents: &HashSet<String>,
+) -> Option<ThetaChannels> {
+    let stripped = strip_link_offsets(stmts, n_bsv_eta);
+    let stmts = &stripped[..];
+    let mut counts = HashMap::new();
+    count_all_assignments(stmts, &mut counts);
+    let mut scope = InlineScope::new(stmts);
+    // (statement, η, parameter name, thetas read, covariates read)
+    let mut found: Vec<(&Statement, usize, String, Vec<usize>, Vec<String>)> = Vec::new();
+    for (si, s) in stmts.iter().enumerate() {
+        let Statement::Assign(name, raw) = s else {
+            continue;
+        };
+        if counts.get(name.as_str()).copied() == Some(1) {
+            let view = scope.view(si, raw);
+            if let Some((eta_idx, entry)) =
+                classify_typical_value(view, theta_names, eta_names, n_bsv_eta, |n| n >= 1)
+            {
+                let exclusive = !outside_idents.contains(&eta_names[eta_idx].to_ascii_uppercase())
+                    && !eta_read_outside_the_group(stmts, OwnerOf::Statement(s), eta_idx);
+                if exclusive {
+                    let thetas = entry
+                        .theta_names
+                        .iter()
+                        .filter_map(|t| theta_names.iter().position(|n| n == t))
+                        .collect();
+                    found.push((s, eta_idx, name.clone(), thetas, entry.covariate_names));
+                }
+            }
+        }
+        scope.record(si, name, raw);
+    }
+    let owners: Vec<&Statement> = found.iter().map(|f| f.0).collect();
+    let carried: Vec<bool> = (0..theta_names.len())
+        .map(|t| {
+            found.iter().any(|f| f.3.contains(&t))
+                && thetas_read_outside_the_group(
+                    stmts,
+                    theta_names,
+                    outside_idents,
+                    &owners,
+                    std::slice::from_ref(&theta_names[t]),
+                )
+                .is_empty()
+        })
+        .collect();
+    let channels: Vec<ThetaChannel> = found
+        .into_iter()
+        .filter(|f| f.3.iter().any(|&t| carried[t]))
+        .map(|(_, eta_idx, param, _, covariates)| ThetaChannel {
+            eta_idx,
+            param,
+            covariates,
+        })
+        .collect();
+    // Whether every theta the likelihood reads is carried: a theta the channels do not
+    // carry stays a tape leaf, and since the solve reads every parameter it keeps the whole
+    // recording taped, so a partial reduction only adds work.
+    let complete = (0..theta_names.len()).all(|t| {
+        carried[t] || {
+            let mut reads = outside_idents.contains(&theta_names[t].to_ascii_uppercase());
+            let mut tainted = HashSet::new();
+            spread_theta_taint(stmts, t, &[], &mut tainted);
+            reads |= !tainted.is_empty();
+            !reads
+        }
+    });
+    (complete && !channels.is_empty()).then_some(ThetaChannels { channels, carried })
+}
+
+/// `stmts` with every **link offset** dropped, for [`detect_theta_channels`] alone: inside
+/// an `exp(…)` whose argument sums exactly one bare BSV η with other terms, a term that
+/// reads a κ and nothing but κs, covariates and literals. Such a term moves `u_j` by an
+/// amount independent of θ and of `η_j`, so the channel identity holds with it in place;
+/// dropping it lets the shape match see `exp(ETA + KAPPA / sqrt(W))` (the weighted-κ
+/// rewrite, #1031) as the `exp(ETA + KAPPA)` it scales. The shared mu-reference shapes are
+/// left as they are, since SAEM's groups read them too. What a dropped term reads (κ,
+/// covariates) is nothing the θ and η exclusivity walks look at, so they are unchanged.
+fn strip_link_offsets(stmts: &[Statement], n_bsv: usize) -> Vec<Statement> {
+    let offset = |e: &Expression| {
+        let (mut kappa, mut other) = (false, false);
+        visit_expr_nodes(e, &mut |n| match n {
+            Expression::Eta(i) if *i >= n_bsv => kappa = true,
+            Expression::Literal(_)
+            | Expression::Covariate(_)
+            | Expression::BinOp(..)
+            | Expression::UnaryFn(..)
+            | Expression::Power(..) => {}
+            _ => other = true,
+        });
+        kappa && !other
+    };
+    let strip = |e: &mut Expression| {
+        visit_expr_nodes_mut(e, &mut |n| {
+            let Expression::UnaryFn(f, arg) = n else {
+                return;
+            };
+            if f != "exp" {
+                return;
+            }
+            let mut ts: Vec<&Expression> = Vec::new();
+            flatten_chain(&**arg, BinOp::Add, true, &mut ts);
+            let bare = ts
+                .iter()
+                .filter(|t| matches!(t, Expression::Eta(i) if *i < n_bsv))
+                .count();
+            let drop: Vec<bool> = ts.iter().map(|t| offset(t)).collect();
+            if bare != 1 || !drop.contains(&true) {
+                return;
+            }
+            let kept: Vec<Expression> = ts
+                .iter()
+                .zip(&drop)
+                .filter(|(_, d)| !**d)
+                .map(|(t, _)| (*t).clone())
+                .collect();
+            let mut it = kept.into_iter();
+            let first = it.next().expect("the bare η is kept");
+            **arg = it.fold(first, |a, t| {
+                Expression::BinOp(Box::new(a), BinOp::Add, Box::new(t))
+            });
+        });
+    };
+    fn walk(stmts: &[Statement], strip: &dyn Fn(&mut Expression)) -> Vec<Statement> {
+        stmts
+            .iter()
+            .map(|s| match s {
+                Statement::Assign(name, e) => {
+                    let mut e = e.clone();
+                    strip(&mut e);
+                    Statement::Assign(name.clone(), e)
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => Statement::If {
+                    branches: branches
+                        .iter()
+                        .map(|(c, b)| (c.clone(), walk(b, strip)))
+                        .collect(),
+                    else_body: else_body.as_ref().map(|b| walk(b, strip)),
+                },
+                other => other.clone(),
+            })
+            .collect()
+    }
+    walk(stmts, &strip)
+}
+
+/// One mu-scale channel of [`ThetaChannels`]: the individual parameter (a top-level name,
+/// so its var slot is its index in `indiv_param_names`), its exclusive BSV η, and the covariates its typical value reads (a
+/// subject on which any of them varies is not served: `A_j` would move with time).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ThetaChannel {
+    pub(crate) eta_idx: usize,
+    pub(crate) param: String,
+    pub(crate) covariates: Vec<String>,
+}
+
+/// The thetas that reach the likelihood only through mu-scale channels, and the channels
+/// ([`detect_theta_channels`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ThetaChannels {
+    pub(crate) channels: Vec<ThetaChannel>,
+    /// Per theta (declaration order): carried by the channels alone.
+    pub(crate) carried: Vec<bool>,
+}
+
 /// Drop every group an assignment to `name` supersedes.
 ///
 /// A group is keyed on the eta it carries, so recording is a
@@ -4708,6 +4899,11 @@ pub fn parse_full_model_with(
             .named
             .iter()
             .flat_map(|(ty, m)| m.keys().map(move |inst| (format!("{ty} {inst}"), &m[inst])));
+        // Every offending (block, kappa) pair is collected and named in one
+        // refusal, sorted, so the user fixes them all at once. `blocks` is a
+        // `HashMap`: returning on the first hit named a different block from
+        // one compile to the next (#2624).
+        let mut offending: Vec<(String, &String)> = Vec::new();
         for (block, lines) in blocks
             .iter()
             .filter(|(b, _)| b.as_str() != "parameters" && b.as_str() != "individual_parameters")
@@ -4718,21 +4914,19 @@ pub fn parse_full_model_with(
             collect_referenced_identifiers(lines, &mut refs);
             for name in &weighted_names {
                 if refs.contains(&name.to_ascii_uppercase()) {
-                    // A compartment-free model's equations sit under the
-                    // `scaling` key; name the block the user wrote (#1827).
-                    return Err(retarget_scaling_diag(
-                        is_algebraic,
-                        format!(
-                            "[{block}] references `{name}`, a kappa declared with `weight = ...`. \
-                             A weighted kappa is scaled where it is used, and only \
-                             `[individual_parameters]` applies that scaling — a reference here \
-                             would silently use the unweighted κ. Move the term into \
-                             `[individual_parameters]` (assign it to an individual parameter and \
-                             reference that name instead)."
-                        ),
-                    ));
+                    offending.push((block.clone(), name));
                 }
             }
+        }
+        if !offending.is_empty() {
+            // A compartment-free model's equations sit under the `scaling`
+            // key; name the block the user wrote (#1827). Relabel before
+            // sorting so the order is the one the message prints.
+            for (block, _) in &mut offending {
+                *block = retarget_scaling_diag(is_algebraic, format!("[{block}]"));
+            }
+            offending.sort();
+            return Err(weighted_kappa_outside_indiv_message(&offending));
         }
     }
     if !weighted_kappa_slots.is_empty() {
@@ -5613,6 +5807,7 @@ pub fn parse_full_model_with(
             }
             ParsedErrorModel::PerCmt(_) | ParsedErrorModel::Selected { .. } => None,
         };
+    let endpoint_error_args = endpoint_magnitude_args(&parsed_error_model);
     // Covariates the #658 error selector references become required data columns
     // (validated as E_MISSING_COVARIATE at fit setup). Capture before
     // `build_error_spec` consumes the parsed model.
@@ -5923,6 +6118,34 @@ pub fn parse_full_model_with(
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
+    // The names the engine reads without any other block spelling them — the dose
+    // attributes (`F`/`LAGTIME` by their routed slot, `F{n}`/`ALAG{n}`/`LAGTIME{n}`/`D{n}`/
+    // `R{n}` by name) and a reserved-name alias — are routes to the data as much as an
+    // `[odes]` read, so a theta reaching one is not carried. Every assignment target counts,
+    // a branch's included.
+    let mut channel_outside = outside_idents.clone();
+    {
+        let mut targets: HashMap<&str, usize> = HashMap::new();
+        count_all_assignments(&indiv_stmts, &mut targets);
+        for name in targets.keys() {
+            let slot = indiv_var_names
+                .iter()
+                .position(|n| n == name)
+                .and_then(|i| ode_slot_map.get(i).copied());
+            if crate::types::DoseAttrConsumption::of(name, slot).is_some()
+                || reserved_flag_slot(name).is_some()
+            {
+                channel_outside.insert(name.to_ascii_uppercase());
+            }
+        }
+    }
+    indiv_param_partials.theta_channels = detect_theta_channels(
+        &indiv_stmts,
+        &theta_names,
+        &all_eta_names,
+        eta_names_bsv.len(),
+        &channel_outside,
+    );
     indiv_param_partials.lognormal_eta_chain = Some(lognormal_eta_chain_exact(
         &indiv_stmts,
         &indiv_var_names,
@@ -7068,6 +7291,7 @@ pub fn parse_full_model_with(
         let ruv_eta_names = model.eta_names.clone();
         let (rm, used_thetas, used_covs) = build_ruv_magnitude(
             &single_error_args,
+            &endpoint_error_args,
             &ruv_sigma_names,
             &ruv_theta_names,
             &ruv_eta_names,
@@ -7275,6 +7499,16 @@ pub fn parse_full_model_with(
     // #2562: the gathers an endpoint block reads count for the pre-fit index check too, and
     // they were parsed after `theta_blocks` took its first copy.
     model.indiv_param_partials.theta_blocks.uses = VectorThetaScope::uses();
+    // #2623: whether any expression reads each level block, for the binder's no-levels
+    // refusal. A data-driven block can only be read bare (#2744).
+    for decl in model
+        .indiv_param_partials
+        .theta_blocks
+        .level_blocks
+        .iter_mut()
+    {
+        decl.read_bare = model.referenced_covariates.contains(&decl.index_covariate);
+    }
     // #2562: which discrete-state endpoints read each level block, for the binder.
     #[cfg(feature = "survival")]
     for decl in model
@@ -8691,7 +8925,7 @@ fn restrict_and_validate_indiv_stmts(
     // blocks shared this helper.
     let predictor = match block {
         "event_model" => "a hazard expression",
-        "binary_model" => "the logit predictor",
+        "binary_model" => "the linear predictor",
         "markov_model" => "a transition probability",
         _ => "a predictor expression",
     };
@@ -9544,7 +9778,9 @@ fn parse_event_model_block(
 /// - `logit` — required; the linear predictor `lp` (log-odds of `P(Y=1)`) as a
 ///   θ/η/covariate/`[individual_parameters]` expression. `TIME` resolves per observation
 ///   (the data term sets the model-time guard per record).
-/// - `link`  — optional; `logit` (default). `probit`/`cloglog` are not yet supported.
+/// - `probit` — instead of `logit`: the same predictor under the probit link, `P(Y=1) = Φ(lp)`
+///   (#2603). Exactly one of `logit` / `probit` is given.
+/// - `link`  — optional; `logit` (default) or `probit`. It must agree with the predictor's key.
 #[cfg(feature = "survival")]
 fn parse_binary_model_block(
     lines: &[String],
@@ -9574,8 +9810,13 @@ fn parse_binary_model_block(
     let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
 
     let mut cmt_opt: Option<usize> = None;
-    let mut logit_expr: Option<Expression> = None;
-    let mut link = LinkFn::Logit;
+    // The predictor, under the key that names its link (`logit =` / `probit =`, #2603).
+    let mut predictor: Option<(LinkFn, Expression)> = None;
+    let mut declared_link: Option<LinkFn> = None;
+    let key_of = |l: LinkFn| match l {
+        LinkFn::Logit => "logit",
+        LinkFn::Probit => "probit",
+    };
 
     for line in lines {
         let trimmed = line.trim();
@@ -9595,30 +9836,67 @@ fn parse_binary_model_block(
                     format!("[binary_model]: invalid cmt `{value}` — expected a positive integer")
                 })?);
             }
-            "logit" => {
-                logit_expr = Some(parse_scalar_expression(value, ctx)?);
+            "logit" | "probit" => {
+                let this = if key == "logit" {
+                    LinkFn::Logit
+                } else {
+                    LinkFn::Probit
+                };
+                if let Some((prev, _)) = predictor {
+                    // Before #2603 a repeated `logit =` was last-wins, silently; it is refused
+                    // now, as two predictors under different keys are (review r1 #8).
+                    let given = if prev == this {
+                        format!("`{key}` is given twice")
+                    } else {
+                        format!(
+                            "the predictor is given twice (`{}` and `{key}`)",
+                            key_of(prev)
+                        )
+                    };
+                    return Err(format!(
+                        "[binary_model]: {given} — a block has one linear predictor, written \
+                         under the key that names its link"
+                    ));
+                }
+                predictor = Some((this, parse_scalar_expression(value, ctx)?));
             }
             "link" => {
-                link = match value {
+                declared_link = Some(match value {
                     "logit" => LinkFn::Logit,
+                    "probit" => LinkFn::Probit,
                     other => {
                         return Err(format!(
-                            "[binary_model]: link `{other}` is not yet supported — only `logit` \
-                             (the default) is available; probit/cloglog are planned."
+                            "[binary_model]: link `{other}` is not supported — the links are \
+                             `logit` (the default) and `probit`"
                         ))
                     }
-                };
+                });
             }
             other => {
                 return Err(format!(
-                    "[binary_model]: unknown key `{other}` — valid keys: cmt, logit, link"
+                    "[binary_model]: unknown key `{other}` — valid keys: cmt, logit, probit, link"
                 ));
             }
         }
     }
 
     let cmt = cmt_opt.ok_or("[binary_model]: missing required key `cmt`")?;
-    let logit_expr = logit_expr.ok_or("[binary_model]: missing required key `logit`")?;
+    let (link, logit_expr) = predictor.ok_or(
+        "[binary_model]: missing the linear predictor — write `logit = …` (logit link) or \
+         `probit = …` (probit link)",
+    )?;
+    if let Some(declared) = declared_link {
+        if declared != link {
+            return Err(format!(
+                "[binary_model]: `link = {}` but the predictor is written `{} = …` — under \
+                 `link = {}` write the predictor as `{} = …`",
+                key_of(declared),
+                key_of(link),
+                key_of(declared),
+                key_of(declared)
+            ));
+        }
+    }
     // For the mixed-BIC θ classification (#1177); see `parse_event_model_block`.
     endpoint_stmts.push(Statement::Assign(
         format!("__ferx_binary_model_{cmt}_logit"),
@@ -13728,6 +14006,17 @@ fn declares_time_alias(declared_covariates: &[String]) -> bool {
         .any(|d| d.eq_ignore_ascii_case("T"))
 }
 
+/// The value a [`build_y_output_fn`] closure reads for covariate `name` from the map it
+/// is handed: the map's value, or `0.0` when the key is absent. Shared by that closure
+/// and the dose-expression "reads" sentence (#2671), so the sentence reports the value
+/// the closure used. Only those two: the endpoint evaluator (`eval_endpoint_outputs_g`)
+/// keeps its own read. The entry-point presence check (`population_carries`) is what
+/// keeps the absent case from a run.
+#[inline]
+pub(crate) fn output_covariate_read(covariates: &HashMap<String, f64>, name: &str) -> f64 {
+    covariates.get(name).copied().unwrap_or(0.0)
+}
+
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
 /// the uniform and per-CMT paths.
 #[allow(clippy::too_many_arguments)]
@@ -13978,9 +14267,7 @@ pub(crate) fn build_y_output_fn(
                 if n_cov > 0 {
                     scratch.y_cov.resize(n_cov, 0.0);
                     for (i, name) in cov_names_for_fn.iter().enumerate() {
-                        if let Some(&v) = covariates.get(name) {
-                            scratch.y_cov[i] = v;
-                        }
+                        scratch.y_cov[i] = output_covariate_read(covariates, name);
                     }
                 }
 
@@ -19553,13 +19840,14 @@ fn parse_parameters(
                     // Resolve the block to its level → θ map plus the θ names to
                     // append, then append once. Both bracket forms end here; the
                     // difference is only where the level list came from.
-                    let (levels, theta_names, index_covariate) = match spec {
+                    let (levels, theta_names, index_covariate, block_columns) = match spec {
                         ThetaBlockSpec::Count(n_levels) => (
                             (0..n_levels)
                                 .map(|i| LevelRule::Free((base + i) as u32))
                                 .collect(),
                             (1..=n_levels).map(|l| format!("{name}[{l}]")).collect(),
                             None,
+                            Vec::new(),
                         ),
                         ThetaBlockSpec::Columns { columns, contrast } => {
                             let index_covariate = level_index_column(&name);
@@ -19583,7 +19871,7 @@ fn parse_parameters(
                             };
                             level_block_decls.push(LevelBlockDecl {
                                 name: name.clone(),
-                                columns,
+                                columns: columns.clone(),
                                 contrast: binding.map(|b| b.contrast).unwrap_or(contrast),
                                 labels: binding.map(|b| b.labels.clone()).unwrap_or_default(),
                                 scale_share: None,
@@ -19591,8 +19879,9 @@ fn parse_parameters(
                                 eta_readers: Vec::new(),
                                 index_covariate: index_covariate.clone(),
                                 record_cmts: Vec::new(),
+                                read_bare: false,
                             });
-                            (levels, theta_names, Some(index_covariate))
+                            (levels, theta_names, Some(index_covariate), columns)
                         }
                     };
                     for theta_name in theta_names {
@@ -19608,6 +19897,7 @@ fn parse_parameters(
                         name: name.clone(),
                         spec: std::sync::Arc::new(GatherSpec { name, levels }),
                         index_covariate,
+                        columns: block_columns,
                         profiled,
                         linked: false,
                         profile_box,
@@ -20854,6 +21144,52 @@ fn is_algebraic_structural(struct_lines: &[String]) -> bool {
     struct_lines.iter().any(|l| l == ALGEBRAIC_MARKER)
 }
 
+/// The refusal for weighted kappas referenced outside `[individual_parameters]`
+/// (#1031). `offending` holds `([block], kappa)` pairs, sorted, whose label is
+/// the one the user wrote — already relabelled `[scaling]` → `[structural_model]`
+/// for a compartment-free model (#1827), never the raw key. Every pair is named,
+/// grouped by block, so the user fixes them all in one pass (#2624).
+fn weighted_kappa_outside_indiv_message(offending: &[(String, &String)]) -> String {
+    fn and_list(items: &[String]) -> String {
+        match items {
+            [init @ .., last] if !init.is_empty() => format!("{} and {last}", init.join(", ")),
+            _ => items.concat(),
+        }
+    }
+    // Sorted input keeps a block's pairs adjacent.
+    let mut by_block: Vec<(&str, Vec<String>)> = Vec::new();
+    for (block, name) in offending {
+        match by_block.last_mut() {
+            Some((b, names)) if *b == block.as_str() => names.push(format!("`{name}`")),
+            _ => by_block.push((block.as_str(), vec![format!("`{name}`")])),
+        }
+    }
+    let clauses: Vec<String> = by_block
+        .iter()
+        .map(|(block, names)| format!("{block} references {}", and_list(names)))
+        .collect();
+    let listed = and_list(&clauses);
+    let mut names: Vec<&String> = offending.iter().map(|(_, n)| *n).collect();
+    names.sort();
+    names.dedup();
+    let what = if names.len() == 1 {
+        "a kappa declared"
+    } else {
+        "kappas declared"
+    };
+    let (where_, term) = match (by_block.len(), offending.len()) {
+        (1, 1) => ("a reference here", "the term"),
+        (1, _) => ("these references", "each term"),
+        _ => ("a reference in any of these blocks", "each term"),
+    };
+    format!(
+        "{listed}, {what} with `weight = ...`. A weighted kappa is scaled where it is used, \
+         and only `[individual_parameters]` applies that scaling — {where_} would silently use \
+         the unweighted κ. Move {term} into `[individual_parameters]` (assign it to an \
+         individual parameter and reference that name instead)."
+    )
+}
+
 /// Retarget a `[scaling]`-worded diagnostic at `[structural_model]` (#811).
 ///
 /// A compartment-free model's equations are written in `[structural_model]` but
@@ -21424,12 +21760,11 @@ fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), St
         )
     })?;
     let error_type = caps[2].to_lowercase();
-    if error_type == "log_additive" {
-        return Err(
-            "[error_model] `log_additive` (log-transform-both-sides) is not supported inside a \
+    if error_type == "log_additive" || error_type == "log_combined" {
+        return Err(format!(
+            "[error_model] `{error_type}` (log-transform-both-sides) is not supported inside a \
              covariate-selected if/else block"
-                .to_string(),
-        );
+        ));
     }
     if error_type == "power" {
         return Err(
@@ -21616,6 +21951,14 @@ const ERROR_MODEL_FORMS: &[(&str, &str)] = &[
     ),
     ("DV ~ log_additive(SIGMA)", "DV ~ log_additive(ADD_ERR)"),
     ("log(DV) ~ additive(SIGMA)", "log(DV) ~ additive(ADD_ERR)"),
+    (
+        "DV ~ log_combined(SIGMA_PROP, SIGMA_ADD)",
+        "DV ~ log_combined(PROP_ERR, ADD_ERR)",
+    ),
+    (
+        "log(DV) ~ combined(SIGMA_PROP, SIGMA_ADD)",
+        "log(DV) ~ combined(PROP_ERR, ADD_ERR)",
+    ),
     (
         "CMT=N: DV ~ TYPE(...) (per-endpoint, ODE models)",
         "CMT=2: DV ~ proportional(PROP_ERR)",
@@ -21912,6 +22255,9 @@ fn parse_error_model_inner(
     // Log-transform-both-sides (LTBS), additive error on the log scale:
     //   log(DV) ~ additive(SIGMA_NAME)   # natural-scale DV; engine logs DV + pred
     //   DV ~ log_additive(SIGMA_NAME)    # DV already log; engine logs the pred only
+    // LTBS with a natural-unit additive part, Var(log y) = PROP² + ADD²/F² (#2729):
+    //   log(DV) ~ combined(PROP, ADD)    # natural-scale DV
+    //   DV ~ log_combined(PROP, ADD)     # DV already log
     // Multi-endpoint (per-CMT dispatch, ODE models only):
     //   CMT=2: DV ~ proportional(PROP_ERR_PK)
     //   CMT=3: DV ~ additive(ADD_ERR_PD)
@@ -21936,6 +22282,9 @@ fn parse_error_model_inner(
     // and the `power(...)` exponent expression when the line is that form.
     let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
+    // Each per-CMT line's LTBS flags (#2729): the log transform is model-wide, so the
+    // lines must agree, which is checked once they are all read.
+    let mut per_cmt_flags: Vec<(usize, LtbsFlags)> = Vec::new();
     for line in &statements {
         // Strip inline `# ...` comments so the anchored statement regex sees a
         // clean `LHS ~ TYPE(args)` (a trailing comment would otherwise defeat
@@ -22003,8 +22352,11 @@ fn parse_error_model_inner(
         // commas (e.g. inside a future `min(a, b)`) don't fragment an argument.
         let mut sigma_names: Vec<String> = split_top_level_args(&caps[3]);
         // `log_additive` (case 1) is additive error whose prediction is logged
-        // while DV is taken as-is (already log-transformed in the data).
+        // while DV is taken as-is (already log-transformed in the data);
+        // `log_combined` is its combined counterpart (#2729).
         let type_is_log_additive = error_type == "log_additive";
+        let type_is_log_combined = error_type == "log_combined";
+        let type_is_log = type_is_log_additive || type_is_log_combined;
         // `power(SIGMA, P)` (#1182) — NONMEM's `Y = F + EPS(1) * F**THETA(n)`,
         // Pharmpy's `set_power_on_ruv`. The loading is the proportional one
         // raised to `P`, so the form *is* the proportional model plus an
@@ -22044,7 +22396,11 @@ fn parse_error_model_inner(
         let error_model = match error_type.as_str() {
             "additive" | "log_additive" => ErrorModel::Additive,
             "proportional" | "power" => ErrorModel::Proportional,
+            // Under LTBS `combined(PROP, ADD)` is the log-scale form whose additive
+            // part stays in natural units (#2729).
+            "combined" if lhs_logged => ErrorModel::LogCombined,
             "combined" => ErrorModel::Combined,
+            "log_combined" => ErrorModel::LogCombined,
             other => return Err(format!("Unknown error model: {}", other)),
         };
         if sigma_names.len() != error_model.n_sigma() {
@@ -22080,9 +22436,12 @@ fn parse_error_model_inner(
             }
             // Combined's argument order is (proportional, additive) — see
             // `ErrorModel::sigma_types` — so the weighted slot is the last one.
+            // `LogCombined` (#2729): dividing DV and the prediction by `W` leaves
+            // the log residual unchanged and turns `ADD/F` into `ADD·W/F`, so its
+            // natural-unit additive slot takes the weight, as `Combined`'s does.
             let slot = match error_model {
                 ErrorModel::Additive => 0,
-                ErrorModel::Combined => 1,
+                ErrorModel::Combined | ErrorModel::LogCombined => 1,
                 ErrorModel::Proportional => {
                     return Err(format!(
                         "[error_model] `weight = {}` has no effect on a purely proportional error \
@@ -22097,29 +22456,29 @@ fn parse_error_model_inner(
         }
 
         // LTBS validation. `log(DV) ~ log_additive(...)` double-logs the data and
-        // is rejected; LTBS only supports additive error on the log scale; and the
-        // per-CMT (multi-endpoint) form is out of scope for LTBS.
-        if lhs_logged && type_is_log_additive {
+        // is rejected; LTBS supports additive error on the log scale and the
+        // combined form with a natural-unit additive part (#2729). Per-CMT lines
+        // may be LTBS too, all of them or none (checked after the loop).
+        if lhs_logged && type_is_log {
+            let plain = if type_is_log_combined {
+                "combined"
+            } else {
+                "additive"
+            };
             return Err(format!(
-                "[error_model] `{}` double-log-transforms DV: use `log(DV) ~ additive(...)` \
-                 (engine logs DV) OR `DV ~ log_additive(...)` (DV already log), not both",
-                trimmed
+                "[error_model] `{trimmed}` double-log-transforms DV: use `log(DV) ~ {plain}(...)` \
+                 (engine logs DV) OR `DV ~ {error_type}(...)` (DV already log), not both"
             ));
         }
-        let log_transform = lhs_logged || type_is_log_additive;
-        if log_transform && !matches!(error_model, ErrorModel::Additive) {
+        let log_transform = lhs_logged || type_is_log;
+        if log_transform && !matches!(error_model, ErrorModel::Additive | ErrorModel::LogCombined) {
             return Err(format!(
-                "[error_model] log-transform-both-sides supports only additive error on the \
-                 log scale; use `log(DV) ~ additive(...)` or `DV ~ log_additive(...)`: {}",
+                "[error_model] log-transform-both-sides supports additive error on the log \
+                 scale (`log(DV) ~ additive(...)` / `DV ~ log_additive(...)`) and combined \
+                 proportional + additive error (`log(DV) ~ combined(PROP, ADD)` / \
+                 `DV ~ log_combined(PROP, ADD)`): {}",
                 trimmed
             ));
-        }
-        if log_transform && cmt_opt.is_some() {
-            return Err(
-                "[error_model] log-transform-both-sides (`log(DV) ~ ...` / `log_additive`) \
-                 is not supported with per-CMT (multi-endpoint) error models"
-                    .to_string(),
-            );
         }
         // The engine always log-transforms the `DV` column under LTBS — a
         // different LHS name (e.g. `log(CONC) ~ additive(...)`) would parse but
@@ -22134,12 +22493,16 @@ fn parse_error_model_inner(
         let flags = LtbsFlags {
             log_transform,
             // `log(DV)` logs DV in the engine (data is natural scale);
-            // `log_additive` trusts the data is already on the log scale.
-            dv_pre_logged: type_is_log_additive,
+            // `log_additive` / `log_combined` trust the data is already on the
+            // log scale.
+            dv_pre_logged: type_is_log,
         };
 
         match cmt_opt {
-            Some(cmt) => per_cmt.push((cmt, error_model, sigma_names)),
+            Some(cmt) => {
+                per_cmt.push((cmt, error_model, sigma_names));
+                per_cmt_flags.push((cmt, flags));
+            }
             None => singles.push((error_model, sigma_names, flags, exponent)),
         }
     }
@@ -22178,11 +22541,36 @@ fn parse_error_model_inner(
                         (multi-endpoint) error models"
                 .to_string());
         }
-        return Ok((
-            ParsedErrorModel::PerCmt(per_cmt),
-            LtbsFlags::default(),
-            None,
-        ));
+        // LTBS per endpoint (#2729). The engine logs every prediction and, under
+        // `log(DV)`, every `DV`, so it is all endpoints or none, under one DV
+        // convention — a log-scale plasma endpoint beside a natural-scale one would
+        // have its natural residual scored against a logged prediction.
+        let flags = per_cmt_flags[0].1;
+        let differ = |pick: fn(&LtbsFlags) -> bool| {
+            per_cmt_flags
+                .iter()
+                .find(|(_, f)| pick(f) != pick(&flags))
+                .map(|&(cmt, _)| cmt)
+        };
+        if let Some(cmt) = differ(|f| f.log_transform) {
+            return Err(format!(
+                "[error_model] log-transform-both-sides applies to every endpoint or none: \
+                 CMT={} and CMT={cmt} disagree. Write every `CMT=N:` line on the log scale \
+                 (`log(DV) ~ additive/combined(...)` or `DV ~ log_additive/log_combined(...)`) \
+                 or none of them",
+                per_cmt_flags[0].0
+            ));
+        }
+        if let Some(cmt) = differ(|f| f.dv_pre_logged) {
+            return Err(format!(
+                "[error_model] CMT={} and CMT={cmt} disagree on the scale of `DV`: one is \
+                 written `log(DV) ~ ...` (DV on the natural scale, the engine logs it) and the \
+                 other `DV ~ log_...(...)` (DV already logged). The `DV` column has one \
+                 scale; use one spelling on every line",
+                per_cmt_flags[0].0
+            ));
+        }
+        return Ok((ParsedErrorModel::PerCmt(per_cmt), flags, None));
     }
 
     match singles.into_iter().next() {
@@ -22327,15 +22715,11 @@ fn build_error_spec(
             let mut representative = None;
             for (cmt, em, names) in entries {
                 let mut sigma_idx = Vec::with_capacity(names.len());
-                for nm in &names {
-                    let idx = sigma_names.iter().position(|s| s == nm).ok_or_else(|| {
-                        format!(
-                            "[error_model] CMT={}: references unknown sigma '{}' \
-                             (declare it in [parameters])",
-                            cmt, nm
-                        )
-                    })?;
-                    sigma_idx.push(idx);
+                for arg in &names {
+                    sigma_idx.push(
+                        arg_sigma_slot(arg, sigma_names)
+                            .map_err(|e| at_error_endpoint(&format!("CMT={cmt}:"), e))?,
+                    );
                 }
                 if representative.is_none() {
                     representative = Some(em);
@@ -22359,15 +22743,8 @@ fn build_error_spec(
             // Resolve one endpoint's sigma names to flat-sigma indices.
             let resolve = |em: ErrorModel, names: &[String]| -> Result<EndpointError, String> {
                 let mut sigma_idx = Vec::with_capacity(names.len());
-                for nm in names {
-                    let idx = sigma_names.iter().position(|s| s == nm).ok_or_else(|| {
-                        format!(
-                            "[error_model] references unknown sigma '{}' \
-                             (declare it in [parameters])",
-                            nm
-                        )
-                    })?;
-                    sigma_idx.push(idx);
+                for arg in names {
+                    sigma_idx.push(arg_sigma_slot(arg, sigma_names)?);
                 }
                 Ok(EndpointError {
                     error_model: em,
@@ -22606,10 +22983,58 @@ fn compile_ruv_mag_deriv_program(
     }
 }
 
-/// Build the custom residual-error magnitude (#484) from the single-endpoint
-/// `[error_model]` arguments, once covariate names are known. Returns `(None, {})`
-/// when every argument is a bare sigma (the legacy variance path is then taken
-/// verbatim). Each non-bare argument compiles to a per-observation multiplier
+/// One endpoint's `[error_model]` arguments, as [`build_ruv_magnitude`] reads them.
+struct EndpointMagnitudeArgs {
+    /// The [`ErrorSpec::obs_key`] rows of this endpoint resolve to.
+    key: usize,
+    /// How a diagnostic names the endpoint.
+    label: String,
+    args: Vec<String>,
+}
+
+/// The endpoints of a `CMT=N:` or `if/else` block. A `Selected` block's keys are
+/// its source order with the `else` last, as `build_error_spec` assigns them.
+fn endpoint_magnitude_args(parsed: &ParsedErrorModel) -> Vec<EndpointMagnitudeArgs> {
+    match parsed {
+        ParsedErrorModel::Single(..) => Vec::new(),
+        ParsedErrorModel::PerCmt(entries) => entries
+            .iter()
+            .map(|(cmt, _, args)| EndpointMagnitudeArgs {
+                key: *cmt,
+                label: format!("CMT={cmt}:"),
+                args: args.clone(),
+            })
+            .collect(),
+        ParsedErrorModel::Selected {
+            branches, default, ..
+        } => branches
+            .iter()
+            .enumerate()
+            .map(|(k, (_, _, args))| EndpointMagnitudeArgs {
+                key: k,
+                label: format!("if/else branch {}:", k + 1),
+                args: args.clone(),
+            })
+            .chain(std::iter::once(EndpointMagnitudeArgs {
+                key: branches.len(),
+                label: "`else` branch:".to_string(),
+                args: default.1.clone(),
+            }))
+            .collect(),
+    }
+}
+
+/// Name the endpoint in an `[error_model]` diagnostic that would otherwise not say
+/// which line of a multi-endpoint block it is about.
+fn at_error_endpoint(label: &str, err: String) -> String {
+    err.replacen("[error_model]", &format!("[error_model] {label}"), 1)
+}
+
+/// Build the custom residual-error magnitude (#484) from the `[error_model]`
+/// arguments, once covariate names are known: `single_error_args` for a plain
+/// statement, `endpoint_args` for a `CMT=N:` or `if/else` block (#2731). Returns
+/// `(None, {})` when every argument is a bare sigma (the legacy variance path is then
+/// taken verbatim). Each non-bare argument compiles to a per-observation multiplier
 /// closure over `(theta, observation covariates, TIME)`, plus a `Dual1`
 /// θ-derivative program (#576/#486) so the analytic outer θ/σ gradient can
 /// differentiate the magnitude exactly instead of falling back to FD.
@@ -22620,6 +23045,7 @@ fn compile_ruv_mag_deriv_program(
 /// mirroring how `[event_model]` thetas are unioned in.
 fn build_ruv_magnitude(
     single_error_args: &Option<(ErrorModel, Vec<String>, Option<String>)>,
+    endpoint_args: &[EndpointMagnitudeArgs],
     sigma_names: &[String],
     theta_names: &[String],
     eta_names: &[String],
@@ -22638,8 +23064,9 @@ fn build_ruv_magnitude(
     // dose scan behind it runs only for a model that can see the result
     // (`RuvMagnitude::uses_tad`).
     let mut uses_tad = false;
-    let Some((_em, args, exponent)) = single_error_args else {
-        return Ok((None, used_thetas, Vec::new()));
+    let (args, exponent): (&[String], Option<&String>) = match single_error_args {
+        Some((_em, args, exponent)) => (args, exponent.as_ref()),
+        None => (&[], None),
     };
     let allowed_covs: Option<Vec<String>> = covariate_decls
         .as_ref()
@@ -22726,6 +23153,51 @@ fn build_ruv_magnitude(
         per_sigma.push(Some(f));
         per_sigma_deriv.push(Some(deriv));
     }
+    // A `CMT=N:` or `if/else` block: each endpoint gets its own table over the flat
+    // sigma vector, so one sigma can carry a factor on one endpoint and none on
+    // another (#2731).
+    let mut per_endpoint: HashMap<usize, EndpointMagnitude> = HashMap::new();
+    for ep in endpoint_args {
+        let mut table = EndpointMagnitude {
+            per_sigma: std::iter::repeat_with(|| None)
+                .take(sigma_names.len())
+                .collect(),
+            per_sigma_deriv: vec![None; sigma_names.len()],
+        };
+        let mut claimed: Vec<usize> = Vec::with_capacity(ep.args.len());
+        let mut has_expr = false;
+        for arg in &ep.args {
+            let slot = arg_sigma_slot(arg, sigma_names)?;
+            let sigma_name = &sigma_names[slot];
+            let trimmed = arg.trim();
+            let is_expr = trimmed != sigma_name;
+            // A row carries one multiplier per slot, so `combined(S * A, S)` has no
+            // representation: the factor would land on both arguments.
+            if claimed.contains(&slot) && (is_expr || has_expr) {
+                return Err(at_error_endpoint(
+                    &ep.label,
+                    format!(
+                        "[error_model] argument `{trimmed}` uses sigma '{sigma_name}', which \
+                         another argument of this statement also uses. A magnitude expression \
+                         needs its sigma to itself, so declare a second sigma for this argument."
+                    ),
+                ));
+            }
+            claimed.push(slot);
+            if !is_expr {
+                continue;
+            }
+            has_expr = true;
+            let (f, deriv) = compile(trimmed, Some(sigma_name), "magnitude")
+                .map_err(|e| at_error_endpoint(&ep.label, e))?;
+            table.per_sigma[slot] = Some(f);
+            table.per_sigma_deriv[slot] = Some(deriv);
+        }
+        if has_expr {
+            per_endpoint.insert(ep.key, table);
+        }
+    }
+    any |= !per_endpoint.is_empty();
     // The `power(SIGMA, P)` exponent (#1182) goes on the proportional slot —
     // slot 0 for a single-endpoint form. Every `_scaled` variance function
     // reads it at `row[n_sigma + slot]` (`RuvMagnitude::eval_obs`), so the
@@ -22772,6 +23244,7 @@ fn build_ruv_magnitude(
         rm.per_sigma_exponent = per_sigma_exponent;
         rm.per_sigma_exponent_deriv = per_sigma_exponent_deriv;
         rm.uses_tad = uses_tad;
+        rm.per_endpoint = per_endpoint;
         Some(rm)
     } else {
         None
@@ -23516,6 +23989,13 @@ pub(crate) const SUPPORTED_UNARY_FNS: &[&str] = &[
     // including softplus's `|z| > 20` tails that `log(1 + exp(z))` gets wrong.
     "tanh",
     "softplus",
+    // #2720: trigonometric functions, in radians — circadian baselines
+    // (`AMP * cos(2 * PI * (TIME - PHS) / 24)`), NONMEM's `SIN`/`COS`.
+    "sin",
+    "cos",
+    // #2603: the standard-normal CDF `Φ(x)`, NONMEM's `PHI` — a probit link written out
+    // (`y = pnorm(LP)`), the companion of `[binary_model] link = probit`.
+    "pnorm",
 ];
 
 /// Panic message for the (parser-guaranteed unreachable) tail of each
@@ -23692,6 +24172,11 @@ pub(crate) struct VectorThetaDecl {
     /// `None` for the explicit `theta NAME[N]` form, where a bare reference is
     /// an error and the user supplies the index column.
     pub(crate) index_covariate: Option<String>,
+    /// The data columns a level block is declared over (`STUDY, TIME`), for the
+    /// refusal of a subscripted read (#2744) to echo the declaration. Empty for the
+    /// counted form. Display only: whether a block is data-driven is
+    /// `index_covariate`, and nothing gates on this.
+    pub(crate) columns: Vec<String>,
     /// Declared `profile` (#1065): the levels are solved for at every outer
     /// evaluation rather than searched by the optimizer.
     pub(crate) profiled: bool,
@@ -23794,6 +24279,21 @@ fn level_block_unreadable_message(
     }
 }
 
+/// The refusal for a subscripted read of a data-driven θ level block (#2744).
+/// `spelling` is the read as written (`PLACEBO[STUDY]`, `PLACEBO[STUDY + 0]`,
+/// `PLACEBO[2]`), `columns` the block's declared columns. The index kinds share one
+/// wording: each is a number, and none of them is the record's level.
+fn data_driven_subscript_message(name: &str, spelling: &str, columns: &[String]) -> String {
+    let cols = columns.join(", ");
+    format!(
+        "`{spelling}`: `{name}` is a data-driven θ level block (`theta {name}[{cols}]`), \
+         read bare, as `{name}`: each record reads the level its own `{cols}` values \
+         select. A subscript would index the block by the number it evaluates to, which \
+         matches the record's level only by coincidence. To supply the index yourself, \
+         declare the counted form `theta {name}[N]` and read `{name}[COLUMN]`."
+    )
+}
+
 /// The `[odes]`-scope refusal for the first θ level block `src` reads, if any (#1637).
 /// For an expression that compiles as an ODE line but is written elsewhere (the
 /// joint PK-TTE `hazard =`), so its caller can name the line the user wrote.
@@ -23809,8 +24309,12 @@ fn ode_level_block_read(src: &str) -> Result<Option<String>, String> {
         if pos > 0 && tokens[pos - 1] == Token::Dot {
             continue;
         }
-        if lookup_vector_theta(name).is_some() {
-            let spelling = if tokens.get(pos + 1) == Some(&Token::LBracket) {
+        if let Some(decl) = lookup_vector_theta(name) {
+            // As in `parse_atom`'s ODE-scope refusal: a data-driven block's remedy
+            // reads it bare, since its subscripted read is refused (#2744).
+            let spelling = if tokens.get(pos + 1) == Some(&Token::LBracket)
+                && decl.index_covariate.is_none()
+            {
                 format!("{name}[{}]", render_index_tokens(&tokens, pos + 2))
             } else {
                 name.clone()
@@ -24029,6 +24533,14 @@ pub struct LevelBlockDecl {
     /// CTMM generator is built once per subject from the baseline, and one time-to-event
     /// data row can yield zero or two records, so neither defines levels.
     pub(crate) record_cmts: Vec<usize>,
+    /// Set by the parse: some expression reads this block bare, through
+    /// `index_covariate` — the model's referenced covariates include it (#2623 review).
+    /// Bare is the only way to read a data-driven block: the parse refuses a
+    /// subscripted read (#2744), so `false` means nothing reads it.
+    /// With [`Self::record_cmts`] it tells the binder's no-levels refusal whether the
+    /// expression is the cause or the block's only readers define no level on the data
+    /// (a Gaussian prediction on data with no Gaussian rows, a CTMM generator, a TTE hazard).
+    pub(crate) read_bare: bool,
 }
 
 impl LevelBlockDecl {
@@ -25559,8 +26071,8 @@ pub(crate) enum ProfileRouteBreak {
     /// No prediction reads the block, so its levels have nothing to be solved from
     /// (#2103 review #8).
     Unread,
-    /// Inside a logit link (`inv_logit`, `expit`) that is not the whole prediction
-    /// (#2111): scaled, added to, or inside another link.
+    /// Inside a link (`inv_logit`, `expit`, `pnorm`) that is not the whole prediction
+    /// (#2111, #2603): scaled, added to, or inside another link.
     InnerLink(String),
 }
 
@@ -25609,17 +26121,17 @@ fn binary_predictor_exprs(
         .flat_map(|lines| lines.iter())
         .filter_map(|line| {
             let (key, value) = line.trim().split_once('=')?;
-            (key.trim() == "logit")
+            matches!(key.trim(), "logit" | "probit")
                 .then(|| parse_scalar_expression(value.trim(), ctx).ok())
                 .flatten()
         })
         .collect()
 }
 
-/// Whether `f` is a logit link, the one function a profiled block may be read through
-/// (#2111).
-fn is_logit_link(f: &str) -> bool {
-    f == "inv_logit" || f == "expit"
+/// Whether `f` is a link, the one kind of function a profiled block may be read through:
+/// a logit link (`inv_logit`, `expit`, #2111) or a probit link (`pnorm`, #2603).
+fn is_link(f: &str) -> bool {
+    f == "inv_logit" || f == "expit" || f == "pnorm"
 }
 
 /// The route half of `E_PROFILE_NOT_LINEAR` (#1065): every prediction must read a
@@ -25808,9 +26320,10 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
              prediction may read only one profiled block."
         ),
         ProfileRouteBreak::InnerLink(c) => format!(
-            "Here `{block}` reaches `y` through {c} {at}. A logit link is accepted only as the \
-             whole prediction, `y = inv_logit(c × {block} + …)`, on every branch of an `if` \
-             that chooses it, not scaled, added to or inside another link."
+            "Here `{block}` reaches `y` through {c} {at}. A link (`inv_logit`, `expit` or \
+             `pnorm`) is accepted only as the whole prediction, `y = inv_logit(c × {block} + …)` \
+             or `y = pnorm(c × {block} + …)`, on every branch of an `if` that chooses it, not \
+             scaled, added to or inside another link."
         ),
         ProfileRouteBreak::Unread => unreachable!("answered above"),
     };
@@ -25859,7 +26372,7 @@ impl ProfileWalk<'_, '_> {
             (!out.is_empty()).then_some(out)
         };
         match e {
-            Expression::UnaryFn(f, arg) if is_logit_link(f) => Some(vec![(arg, at, site.clone())]),
+            Expression::UnaryFn(f, arg) if is_link(f) => Some(vec![(arg, at, site.clone())]),
             Expression::Variable(n) | Expression::Covariate(n) => {
                 let defs = self.ctx.resolve(at, n);
                 if defs.is_empty()
@@ -25934,7 +26447,7 @@ impl ProfileWalk<'_, '_> {
             }
             // A link is peeled only as the whole prediction ([`Self::outer_link`]); one
             // reached here is scaled, added to, or nested.
-            Expression::UnaryFn(f, _) if is_logit_link(f) => {
+            Expression::UnaryFn(f, _) if is_link(f) => {
                 fail(ProfileRouteBreak::InnerLink(format!("`{f}(...)`")))
             }
             Expression::UnaryFn(f, _) => fail(ProfileRouteBreak::Construct(format!("`{f}(...)`"))),
@@ -26474,7 +26987,11 @@ const WORD_VALUED_KEYS: &[(&str, &str, WordValue)] = &[
         "clock",
         WordValue::Words(&["forward", "reset"]),
     ),
-    ("binary_model", "link", WordValue::Words(&["logit"])),
+    (
+        "binary_model",
+        "link",
+        WordValue::Words(&["logit", "probit"]),
+    ),
     ("markov_model", "type", WordValue::Words(&["ctmm", "dtmm"])),
     ("markov_model", "states", WordValue::Labels),
     // `parse_decision_schedule`: `[t1, …]` or `every Δ from t0 to t1`.
@@ -27779,6 +28296,16 @@ fn arg_sigma_name(arg: &str, sigma_names: &[String]) -> Result<String, String> {
     }
 }
 
+/// [`arg_sigma_name`] as a slot of the flat sigma vector, for the `CMT=N:` and
+/// `if/else` forms, which bind by name.
+fn arg_sigma_slot(arg: &str, sigma_names: &[String]) -> Result<usize, String> {
+    let name = arg_sigma_name(arg, sigma_names)?;
+    Ok(sigma_names
+        .iter()
+        .position(|s| *s == name)
+        .expect("arg_sigma_name returns a declared sigma"))
+}
+
 /// Warn about parameters declared in `[parameters]` that are not referenced in
 /// any expression. Returns one warning string per unused parameter; the caller
 /// appends these to `CompiledModel.parse_warnings`.
@@ -28000,6 +28527,9 @@ fn eval_expr<E: EvalEnv>(
                 }
                 "tanh" => crate::nn::Activation::Tanh.apply(v),
                 "softplus" => crate::nn::Activation::Softplus.apply(v),
+                "sin" => v.sin(),
+                "cos" => v.cos(),
+                "pnorm" => crate::stats::special::pnorm(v),
                 // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
                 _ => unreachable!("{UNARY_FN_ARM_MISSING} (eval_expr, `{name}`)"),
             }
@@ -28175,6 +28705,13 @@ enum Op {
     /// the code a `[covariate_nn]` runs, on every evaluator.
     Tanh,
     Softplus,
+    /// `sin(x)` / `cos(x)` in radians (#2720): `f64::sin`/`f64::cos` on every
+    /// evaluator, the dual jets lifted from the same values.
+    Sin,
+    Cos,
+    /// `pnorm(x)`, the standard-normal CDF `Φ(x)` (#2603): [`pnorm`](crate::stats::special::pnorm) on every
+    /// evaluator, the dual jets lifted from the same value (`pnorm_g`).
+    Pnorm,
     CmpLt,
     CmpLe,
     CmpGt,
@@ -28259,7 +28796,10 @@ fn ip_op_cost(op: &Op) -> u32 {
         | Op::Logit
         | Op::InvLogit
         | Op::Tanh
-        | Op::Softplus => 20,
+        | Op::Softplus
+        | Op::Sin
+        | Op::Cos
+        | Op::Pnorm => 20,
         Op::Div | Op::Mod => 4,
         _ => 1,
     }
@@ -28305,6 +28845,9 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
             | Op::Logit
             | Op::Tanh
             | Op::Softplus
+            | Op::Sin
+            | Op::Cos
+            | Op::Pnorm
             | Op::CmpLt
             | Op::CmpLe
             | Op::CmpGt
@@ -28476,6 +29019,9 @@ fn ip_op_pops(op: &Op) -> Option<usize> {
         | Op::Logit
         | Op::Tanh
         | Op::Softplus
+        | Op::Sin
+        | Op::Cos
+        | Op::Pnorm
         | Op::LogicNot
         | Op::IsPresent
         | Op::Floor
@@ -29188,6 +29734,9 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::Logit
             | Op::Tanh
             | Op::Softplus
+            | Op::Sin
+            | Op::Cos
+            | Op::Pnorm
             | Op::LogicNot
             | Op::IsPresent
             | Op::Floor
@@ -29313,6 +29862,9 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 "logit" => bc.ops.push(Op::Logit),
                 "tanh" => bc.ops.push(Op::Tanh),
                 "softplus" => bc.ops.push(Op::Softplus),
+                "sin" => bc.ops.push(Op::Sin),
+                "cos" => bc.ops.push(Op::Cos),
+                "pnorm" => bc.ops.push(Op::Pnorm),
                 "floor" => bc.ops.push(Op::Floor),
                 "ceil" => bc.ops.push(Op::Ceil),
                 "round" => bc.ops.push(Op::Round),
@@ -29567,6 +30119,9 @@ fn eval_bytecode_lanes<L: Lane>(
             }),
             Op::Tanh => unary!(|v| crate::nn::Activation::Tanh.apply(v)),
             Op::Softplus => unary!(|v| crate::nn::Activation::Softplus.apply(v)),
+            Op::Sin => unary!(|v| v.sin()),
+            Op::Cos => unary!(|v| v.cos()),
+            Op::Pnorm => unary!(crate::stats::special::pnorm),
             Op::CmpLt => binary!(|l, r| bool01(l < r)),
             Op::CmpLe => binary!(|l, r| bool01(l <= r)),
             Op::CmpGt => binary!(|l, r| bool01(l > r)),
@@ -29644,6 +30199,43 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
         Op::Round => T::from_f64(v.val().round()),
         _ => unreachable!("apply_unary: {op:?} is not a unary value op"),
     }
+}
+
+/// `sin(x)` on any number type (#2720): the value is `f64::sin` bit for bit, and the
+/// jet carries `sin⁽ⁿ⁾` through n = 4 (the covariance step's nested dual reads all four).
+#[inline]
+fn sin_g<T: crate::sens::num::PkNum>(x: T) -> T {
+    let (s, c) = (x.val().sin(), x.val().cos());
+    x.lift4(s, c, -s, -c, s)
+}
+
+/// `cos(x)` on any number type (#2720); see [`sin_g`].
+#[inline]
+fn cos_g<T: crate::sens::num::PkNum>(x: T) -> T {
+    let (s, c) = (x.val().sin(), x.val().cos());
+    x.lift4(c, -s, -c, s, c)
+}
+
+/// `pnorm(x)` on any number type (#2603): the value is
+/// [`pnorm`](crate::stats::special::pnorm) bit for bit, and the jet carries `Φ⁽ⁿ⁾` through
+/// n = 4 — `φ`, `−xφ`, `(x² − 1)φ`, `(3x − x³)φ` — which the covariance step's nested dual
+/// reads. Where `φ` is `0` (past `|x| ≈ 38.6`, and at `±∞`) every derivative is `0`, returned
+/// as such: the polynomial factors would make `0 · ∞ = NaN` once `x²` overflows (review r1 #10).
+#[inline]
+fn pnorm_g<T: crate::sens::num::PkNum>(x: T) -> T {
+    use crate::stats::special::{pnorm, INV_SQRT_2PI};
+    let v = x.val();
+    let d = (-0.5 * v * v).exp() * INV_SQRT_2PI;
+    if d == 0.0 {
+        return x.lift4(pnorm(v), 0.0, 0.0, 0.0, 0.0);
+    }
+    x.lift4(
+        pnorm(v),
+        d,
+        -v * d,
+        (v * v - 1.0) * d,
+        (3.0 * v - v * v * v) * d,
+    )
 }
 
 /// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
@@ -29839,6 +30431,18 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::Softplus => {
                 let v = pop!();
                 push!(crate::nn::Activation::Softplus.apply_g(v));
+            }
+            Op::Sin => {
+                let v = pop!();
+                push!(sin_g(v));
+            }
+            Op::Cos => {
+                let v = pop!();
+                push!(cos_g(v));
+            }
+            Op::Pnorm => {
+                let v = pop!();
+                push!(pnorm_g(v));
             }
             Op::Logit => {
                 let v = pop!();
@@ -31950,6 +32554,9 @@ fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
         | Op::Logit
         | Op::Tanh
         | Op::Softplus
+        | Op::Sin
+        | Op::Cos
+        | Op::Pnorm
         | Op::CmpLt
         | Op::CmpLe
         | Op::CmpGt
@@ -32829,6 +33436,47 @@ impl IndivParamProgram {
         covariates: &HashMap<String, f64>,
         nn: &[Vec<T>],
     ) -> Vec<T> {
+        self.eval_vars_g(theta, eta, covariates, nn, |vars| {
+            let mut out = crate::scratch::take_for(self.pk_var_slots.len());
+            out.extend(
+                self.pk_var_slots
+                    .iter()
+                    .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0))),
+            );
+            out
+        })
+    }
+
+    /// The program's variables at the given var slots (a top-level individual parameter's
+    /// slot is its index in `indiv_param_names`, see `n_top_level_vars`), evaluated as
+    /// [`Self::eval_params_g`] does: what the adjoint reads a mu-scale channel's typical
+    /// value off (#2706).
+    pub(crate) fn eval_var_slots_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+        nn: &[Vec<T>],
+        slots: &[usize],
+    ) -> Option<Vec<T>> {
+        if slots.iter().any(|&v| v >= self.n_top_level_vars) {
+            return None;
+        }
+        Some(self.eval_vars_g(theta, eta, covariates, nn, |vars| {
+            slots.iter().map(|&v| vars[v]).collect()
+        }))
+    }
+
+    /// The shared body of [`Self::eval_params_g`] and [`Self::eval_var_slots_g`]: run the
+    /// program and hand `read` every variable.
+    fn eval_vars_g<T: crate::sens::num::vm::VmNum, R>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+        nn: &[Vec<T>],
+        read: impl FnOnce(&[T]) -> R,
+    ) -> R {
         // Every buffer comes from this thread's pool, cleared and filled exactly as a
         // fresh one would be, and goes back after.
         let mut cov_vec: Vec<f64> = crate::scratch::take();
@@ -32868,12 +33516,7 @@ impl IndivParamProgram {
             skip,
             nn,
         );
-        let mut out = crate::scratch::take_for(self.pk_var_slots.len());
-        out.extend(
-            self.pk_var_slots
-                .iter()
-                .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0))),
-        );
+        let out = read(&vars);
         crate::scratch::give(cov_vec);
         crate::scratch::give_for(vars);
         crate::scratch::give_for(stack);
@@ -33378,6 +34021,9 @@ fn resolve_condition_indices(
 //   UnaryFn("tanh", a)     : (1 − tanh(a)²) · a'
 //   UnaryFn("softplus", a) : a' / exp(a)·a' / inv_logit(a)·a' on the branch
 //                            `Activation::Softplus` takes (a > 20 / a < −20 / else)
+//   UnaryFn("sin", a)      : cos(a) · a'
+//   UnaryFn("cos", a)      : −sin(a) · a'
+//   UnaryFn("pnorm", a)    : exp(−a²/2)/√(2π) · a'
 //   UnaryFn("floor"|"ceil"|"round", a) : 0 (piecewise constant; the integer
 //                            boundaries are undefined and ignored, as for Mod)
 //   Power(b, e)            : b^e · (e'·ln(b) + e · b'/b)  (general; subsumes
@@ -33652,6 +34298,27 @@ fn differentiate_with_chain(
                             Box::new(mul(sig_a, da)),
                         )),
                     )
+                }
+                "sin" => {
+                    // cos(a) · a'
+                    mul(Expression::UnaryFn("cos".into(), arg.clone()), da)
+                }
+                "cos" => {
+                    // −sin(a) · a'
+                    let s = Expression::UnaryFn("sin".into(), arg.clone());
+                    sub(Expression::Literal(0.0), mul(s, da))
+                }
+                "pnorm" => {
+                    // φ(a) · a',   φ(a) = exp(−a²/2) / √(2π)
+                    let a = (**arg).clone();
+                    let phi = mul(
+                        Expression::Literal(crate::stats::special::INV_SQRT_2PI),
+                        Expression::UnaryFn(
+                            "exp".into(),
+                            Box::new(mul(Expression::Literal(-0.5), mul(a.clone(), a))),
+                        ),
+                    );
+                    mul(phi, da)
                 }
                 "floor" | "ceil" | "round" => {
                     // Piecewise constant: 0 almost everywhere, undefined on the
@@ -33946,6 +34613,10 @@ pub struct IndivParamPartials {
     /// all public, so recording it does not break a downstream struct literal.
     /// Empty without a `[derived]` block, and for hand-built fixtures.
     pub(crate) derived_reads: Vec<String>,
+    /// The thetas the adjoint gradient reads off the η-derivatives instead of taping
+    /// (#2706, [`detect_theta_channels`]). `None` when no theta qualifies, and for
+    /// hand-built fixtures.
+    pub(crate) theta_channels: Option<ThetaChannels>,
 }
 
 impl IndivParamPartials {
@@ -33971,6 +34642,7 @@ impl IndivParamPartials {
             nested_levels: None,
             mu_ref_owners: std::collections::BTreeMap::new(),
             derived_reads: Vec::new(),
+            theta_channels: None,
         }
     }
 
@@ -34044,6 +34716,7 @@ fn build_indiv_param_partials(
         nested_levels: None,
         mu_ref_owners: std::collections::BTreeMap::new(),
         derived_reads: Vec::new(),
+        theta_channels: None,
     }
 }
 
@@ -35030,7 +35703,9 @@ fn parse_atom(
                 // `Theta(t)` read against the empty θ slice these contexts evaluate
                 // with (a silent 0, or an index-out-of-bounds panic).
                 if ctx.level_blocks != LevelBlockScope::Readable {
-                    let spelling = if subscripted {
+                    // The remedy's read: as written for a counted block, bare for a
+                    // data-driven one, whose subscripted read is itself refused (#2744).
+                    let spelling = if subscripted && decl.index_covariate.is_none() {
                         format!("{name}[{}]", render_index_tokens(tokens, pos + 2))
                     } else {
                         name.to_string()
@@ -35040,6 +35715,21 @@ fn parse_atom(
                         &spelling,
                         ctx.level_blocks,
                         "[odes]",
+                    ));
+                }
+                // #2744: a data-driven block is read bare. A subscript would index it by
+                // the number it evaluates to, which is a level only by coincidence: on a
+                // column holding exactly 1..N it equals the bare read, and otherwise it
+                // is a range error, a dead-level refusal, or (an index the pre-fit check
+                // cannot walk, such as `TIME` or a computed one) a fit at the divergence
+                // sentinel. Refused here, before the literal fold, so every reader — and
+                // every index shape — meets the same refusal.
+                if subscripted && decl.index_covariate.is_some() {
+                    let spelling = format!("{name}[{}]", render_index_tokens(tokens, pos + 2));
+                    return Err(data_driven_subscript_message(
+                        name,
+                        &spelling,
+                        &decl.columns,
                     ));
                 }
                 if subscripted {

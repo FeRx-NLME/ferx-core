@@ -110,7 +110,7 @@ pub(crate) use postfit::{
     eps_shrinkage_warning, eta_shrinkage_warning, extract_residual_correlation_se,
     extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
     is_last_estimating_stage, kappa_shrinkages, kappa_weight_typicals, keep_gn_zero_eta_warning,
-    mcem_marginal_warning, name_nonfinite_subjects, non_fit_diagnostics,
+    mcem_marginal_warning, mcem_settling_warning, name_nonfinite_subjects, non_fit_diagnostics,
     nonfinite_objective_warning, ode_solver_diagnostics_warning, probe_nlopt_algorithms,
     profiled_bound_report, rebuild_warnings_structured, refresh_profiled_bound_report,
     report_resolved_levels, resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
@@ -542,6 +542,11 @@ mod adaptive_obs_scale_tests;
 #[cfg(test)]
 #[path = "tests/adaptive_moved_reset_tests.rs"]
 mod adaptive_moved_reset_tests;
+
+// #2756: a monitor's readout reads the TIME as written after a reset that restarts it.
+#[cfg(test)]
+#[path = "tests/adaptive_written_time_tests.rs"]
+mod adaptive_written_time_tests;
 
 // #2156: FREM covariate rows on the adaptive path.
 #[cfg(test)]

@@ -206,6 +206,11 @@ fn final_ofv_no_worse_than_best_seen_during_trace() {
         .clone()
         .expect("optimizer_trace=true must produce a trace path");
     let csv = std::fs::read_to_string(&trace_path).expect("trace file must be readable");
+    assert_eq!(
+        result.trace_csv.as_deref(),
+        Some(csv.as_str()),
+        "the fit holds the trace file's text"
+    );
     let mut lines = csv.lines();
     lines.next().expect("trace must have a header"); // skip header
     let min_trace_ofv = lines

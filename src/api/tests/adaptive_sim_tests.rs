@@ -329,6 +329,7 @@ fn subj(id: &str, obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
         obs_l2: Vec::new(),
@@ -8147,6 +8148,130 @@ const ODE_1571_SELECTED: &str = r#"
 [covariates]
   FREE continuous
 "#;
+
+/// The whole refusal text of `reject_ruv_magnitude_for_adaptive` (#2741). Asserted by
+/// equality, so deleting any one of its three sentences — or a form from the list —
+/// reddens [`both_entry_points_reject_every_ruv_magnitude_form`].
+const RUV_MAGNITUDE_REFUSAL: &str = "adaptive-dosing simulation does not support a \
+    residual-error magnitude (a sigma multiplied by an expression, a `weight =`, a \
+    `power(...)` exponent, or a magnitude on a `CMT=N:` line). The assay draws its residual \
+    error from the bare sigma, without the magnitude. Use bare sigma names in \
+    `[error_model]`.";
+
+/// The adaptive options and spec every #2741 refusal check runs under: `pop_1571`'s
+/// subject carries `FREE`, so every data check passes and only the model can refuse.
+fn ruv_magnitude_run(
+    src: &str,
+) -> (
+    Result<AdaptiveSimulationResult, crate::diagnostics::EngineError>,
+    Result<AdaptiveSimulationResult, crate::diagnostics::EngineError>,
+) {
+    let model = parse_model_string(src).expect("parse");
+    let pop = pop_1571(Some("FREE"));
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![12.0, 36.0],
+        ..Default::default()
+    };
+    let programmatic =
+        simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts);
+    let spec = simulate_adaptive_from_spec(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        &simple_titration_spec(),
+        &AdaptiveSimulateOptions::default(),
+    );
+    (programmatic, spec)
+}
+
+/// #2741 (single-endpoint forms) and #2731 (`CMT=N:` lines): the assay draws from
+/// `assay_resid_var`, which never evaluates a residual-error magnitude, so under a `Dv`
+/// monitor each form below was dropped from the draw with the run reporting success —
+/// measured on #2741: a tenfold multiplier and a cubed `power` loading left every
+/// reading bit-identical to the bare model's.
+///
+/// The refusal is unconditional, and these fixtures carry no `Dv` monitor (`fixed_bolus`
+/// under default options, `simple_titration_spec` without assay error): a run that reads
+/// no residual error was correct and is refused anyway, until #2741's lift applies the
+/// magnitude in the assay. The test pins the gate, not the `Dv` path.
+///
+/// One test holds both sides of the gate: each bare twin (single-endpoint and `CMT=N:`)
+/// runs through both entry points, so each `Err` is this reject and nothing else; each
+/// magnitude form is refused through both with the full text.
+///
+/// Regressions: the gate narrowed back to `has_endpoint_magnitude` (the four
+/// single-endpoint forms run); the gate dropped from `check_adaptive_model_data` (all
+/// run); any sentence of the message deleted or changed.
+#[test]
+fn both_entry_points_reject_every_ruv_magnitude_form() {
+    const SELECTED_BLOCK: &str = "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } \
+                                  else {\n    DV ~ proportional(PROP_UNBOUND)\n  }";
+    let single = ODE_1571_SELECTED.replace(SELECTED_BLOCK, "  DV ~ proportional(PROP_TOTAL)");
+    let cmt_lines = ODE_1571_SELECTED.replace(
+        SELECTED_BLOCK,
+        "  CMT=1: DV ~ proportional(PROP_TOTAL)\n  CMT=2: DV ~ proportional(PROP_UNBOUND)",
+    );
+    assert_ne!(single, ODE_1571_SELECTED, "the bare twin must differ");
+    assert_ne!(cmt_lines, ODE_1571_SELECTED, "the CMT twin must differ");
+
+    // The straddle's bare side: both twins run through both entry points.
+    for (name, bare) in [("single", &single), ("CMT lines", &cmt_lines)] {
+        let (p, s) = ruv_magnitude_run(bare);
+        assert!(p.is_ok(), "bare {name}, simulate_adaptive: {:?}", p.err());
+        assert!(s.is_ok(), "bare {name}, from_spec: {:?}", s.err());
+    }
+
+    let forms = [
+        (
+            "multiplier",
+            single.replace(
+                "proportional(PROP_TOTAL)",
+                "proportional(PROP_TOTAL * (1.0 + FREE))",
+            ),
+        ),
+        (
+            "weight",
+            single.replace(
+                "DV ~ proportional(PROP_TOTAL)",
+                "DV ~ combined(PROP_TOTAL, PROP_UNBOUND) weight = (1.0 + FREE)",
+            ),
+        ),
+        (
+            "power",
+            single
+                .replace(
+                    "theta TVV(50.0, 1.0, 500.0)",
+                    "theta TVV(50.0, 1.0, 500.0)\n  theta POW(3.0, 0.1, 5.0)",
+                )
+                .replace("proportional(PROP_TOTAL)", "power(PROP_TOTAL, POW)"),
+        ),
+        (
+            "CMT line",
+            cmt_lines.replace(
+                "proportional(PROP_TOTAL)",
+                "proportional(PROP_TOTAL * (1.0 + FREE))",
+            ),
+        ),
+    ];
+    for (name, src) in &forms {
+        assert!(
+            src != &single && src != &cmt_lines,
+            "{name}: the magnitude twin must differ from its bare twin"
+        );
+        let (p, s) = ruv_magnitude_run(src);
+        for (entry, r) in [("simulate_adaptive", p), ("from_spec", s)] {
+            let err = r.expect_err(&format!("{name}: {entry} must refuse the magnitude"));
+            assert_eq!(
+                err.code(),
+                Some("E_ADAPTIVE_UNSUPPORTED"),
+                "{name}, {entry}: {err}"
+            );
+            assert_eq!(err.message(), RUV_MAGNITUDE_REFUSAL, "{name}, {entry}");
+        }
+    }
+}
 
 #[test]
 fn both_entry_points_reject_a_selected_error_model_through_the_shared_helper() {

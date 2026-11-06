@@ -455,7 +455,7 @@ A kappa at a level has one estimate per group of that level, so each post-fit qu
 | the KAPPA rows | the level after the name: `K_ST at STUDY = 0.040000 …`, `K_ST at STUDY [FIX]` when fixed; the rest of the row is unchanged |
 | the fit YAML | a `level:` line in each kappa's `omega_iov:` entry |
 | the sdtab | one column per kappa, named after it, with the estimate of the row's own group: `K_ST` is the study estimate, `K_ARM` the arm estimate |
-| `.fitrx` | one `ebes_kappa_<LEVEL>.csv` per level (`ID,GROUP,<label columns>,<kappas>`), listed in `fit.json`; a bundle written before this release loads with no per-level estimates |
+| `.fitrx` | one `ebes_kappa_<LEVEL>.csv` per level (`ID,GROUP,<label columns>,<kappas>`), listed in `fit.json` |
 
 A model with a single level (`iov_column`, or one `level` line) has none of the additions, and its output is as before.
 

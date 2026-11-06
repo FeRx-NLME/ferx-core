@@ -2059,6 +2059,7 @@ fn make_population(n_subj: usize) -> Population {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
             obs_l2: Vec::new(),
@@ -2896,6 +2897,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             obs_l2: Vec::new(),
@@ -14939,6 +14941,7 @@ fn a_verified_start_takes_every_point_field_from_the_lower_run() {
             mixture_posteriors: Some(MixturePosteriors {
                 pmix: vec![vec![tag]],
                 mixest: vec![],
+                n_fd_h_redone: 0,
             }),
             converged: tag == 2.0,
             warnings: vec![format!("{tag}")],
@@ -15454,8 +15457,13 @@ fn a_leg_that_is_not_kept_hands_back_the_kept_ebe_state() {
 const BOTH_PASSES: &[LegStart] = &[LegStart::ColdModes, LegStart::NewtonStep];
 
 /// One fit of a `tests/fixtures/cold_mode_leg` dataset with the #2645 cold-mode pass on or
-/// off, and the legs it ran.
-fn cold_mode_fit(csv: &str, off: &'static [LegStart]) -> (OuterResult, Vec<UnprofiledLeg>) {
+/// off, and the legs it ran, from the model's start with its thetas moved by a relative 1e-9
+/// in a pattern fixed by `jitter` (`0`: the start itself).
+fn cold_mode_fit(
+    csv: &str,
+    off: &'static [LegStart],
+    jitter: usize,
+) -> (OuterResult, Vec<UnprofiledLeg>) {
     use crate::parser::model_parser::parse_full_model;
     use crate::read_nonmem_csv;
     use std::path::Path;
@@ -15477,12 +15485,18 @@ fn cold_mode_fit(csv: &str, off: &'static [LegStart]) -> (OuterResult, Vec<Unpro
         threads: Some(1),
         ..parsed.fit_options.clone()
     };
+    let mut start = parsed.model.default_params.clone();
+    if jitter > 0 {
+        for (i, t) in start.theta.iter_mut().enumerate() {
+            *t *= 1.0 + 1e-9 * ((jitter as f64) * (i as f64 + 1.3)).sin();
+        }
+    }
     LEG_PASSES_OFF.with(|o| o.set(off));
     UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().clear());
     let result = optimize_nlopt(
         &parsed.model,
         &pop,
-        &parsed.model.default_params,
+        &start,
         &opts,
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
@@ -15495,15 +15509,87 @@ fn cold_mode_fit(csv: &str, off: &'static [LegStart]) -> (OuterResult, Vec<Unpro
     )
 }
 
+/// Whether a [`cold_mode_fit`] ground to the evaluation cap: no verified stop (no legs), or
+/// a leg that ran out of evaluations, leaving none for the passes.
+fn ground(legs: &[UnprofiledLeg]) -> bool {
+    legs.is_empty()
+        || legs
+            .iter()
+            .any(|l| matches!(l.ret, Ok((nlopt::SuccessState::MaxEvalReached, _))))
+}
+
+/// The pair a #2645 slow test compares — the fit with the passes `off` and the fit with the
+/// passes `on` — from the first of twelve fixed starts ([`cold_mode_fit`]) whose `off` fit
+/// does not grind and on which the test's `premise` (its straddle: the kind of leg it is about
+/// actually ran) holds; the claims are then asserted on that pair. These fixtures have subjects with second EBE modes, so which trajectory a
+/// start takes is chaotic: measured (#2706) over starts moved by a relative 1e-9, 3 of 10
+/// grind on `both_rounds.csv` and 31 of 50 on `cold_loses.csv` on unchanged code (22 of 50
+/// under #2706's round-off-level gradient change, which moved `cold_loses.csv`'s own start
+/// onto one). Start 0 is the model's start, so a pair that does
+/// not grind there is the one it always compared.
+fn cold_mode_pair(
+    csv: &str,
+    off: &'static [LegStart],
+    on: &'static [LegStart],
+    premise: impl Fn(&[UnprofiledLeg], &[UnprofiledLeg]) -> bool,
+) -> (
+    (OuterResult, Vec<UnprofiledLeg>),
+    (OuterResult, Vec<UnprofiledLeg>),
+) {
+    let mut tried = Vec::new();
+    for jitter in 0..12 {
+        let (off_fit, off_legs) = cold_mode_fit(csv, off, jitter);
+        if ground(&off_legs) {
+            tried.push((off_fit.ofv, off_legs.len()));
+            continue;
+        }
+        // The `on` fit's final restore is the one a test reads the probe of.
+        HELD_SOLVE_AT_RESTORED.with(|c| c.set(None));
+        let (on_fit, on_legs) = cold_mode_fit(csv, on, jitter);
+        if !premise(&off_legs, &on_legs) {
+            tried.push((on_fit.ofv, on_legs.len()));
+            continue;
+        }
+        return ((off_fit, off_legs), (on_fit, on_legs));
+    }
+    panic!(
+        "{csv}: no start both stops short of the evaluation cap and meets the test's premise \
+         ((OFV, legs): {tried:?})"
+    );
+}
+
 /// #2645, the one fit a PR runs: both rounds open and run legs of their own, on the simulated
 /// dataset that did so most steadily of twelve tried on both platforms (20 subjects, six legs
 /// and 196.7247 on Linux aarch64 and macOS arm64, ~0.5 s). What the rounds gain, and what a
 /// losing round leaves, is pinned by the `slow-tests` pairs below.
+///
+/// The fixture's subjects have second EBE modes, so which trajectory a start takes is
+/// chaotic: measured (#2706) over ten starts moved by a relative 1e-9, 3 of 10 grind to the
+/// evaluation cap near OFV 198.8 with no verified stop (and so no rounds) and the rest stop
+/// at 196.72 — on unchanged code; 4 of 10 under #2706's round-off-level gradient change,
+/// which moved the start itself onto a trajectory whose warm leg exhausts the cap at 198.12.
+/// So the claim is asserted on the first of a few fixed starts that does not grind (all
+/// five grinding at that rate: ~0.5%), not on whichever trajectory the start's last bits
+/// pick.
 #[test]
 fn a_verified_stop_runs_both_rounds() {
-    let (fit, legs) = cold_mode_fit("both_rounds.csv", &[]);
-    assert!(fit.ofv.is_finite(), "{}", fit.ofv);
-    assert!(legs.len() >= 3, "warm, cold and Newton legs: {legs:?}");
+    let mut tried = Vec::new();
+    for jitter in 0..5 {
+        let (fit, legs) = cold_mode_fit("both_rounds.csv", &[], jitter);
+        assert!(fit.ofv.is_finite(), "{}", fit.ofv);
+        if !ground(&legs) {
+            assert!(
+                legs.len() >= 3,
+                "start {jitter}: warm, cold and Newton legs: {legs:?}"
+            );
+            return;
+        }
+        tried.push((fit.ofv, legs.len()));
+    }
+    panic!(
+        "every start ground to the evaluation cap ((OFV, legs): {tried:?}): the fixture no \
+         longer tests the rounds"
+    );
 }
 
 /// A [`drive_leg_passes`] pass of the test below: which starts ran, and what each one does.
@@ -15674,8 +15760,8 @@ fn a_cancel_starts_no_further_round() {
     ignore = "slow: two fits to convergence; opt in with --features slow-tests"
 )]
 fn a_round_does_not_take_a_stop_from_its_restart() {
-    let (off, off_legs) = cold_mode_fit("restart_wins.csv", BOTH_PASSES);
-    let (on, on_legs) = cold_mode_fit("restart_wins.csv", &[]);
+    let ((off, off_legs), (on, on_legs)) =
+        cold_mode_pair("restart_wins.csv", BOTH_PASSES, &[], |_, _| true);
     eprintln!("off {} on {}", off.ofv, on.ofv);
     assert!(on.ofv.is_finite(), "{}", on.ofv);
     assert!(
@@ -15698,8 +15784,12 @@ fn a_round_does_not_take_a_stop_from_its_restart() {
     ignore = "slow: two fits to convergence; opt in with --features slow-tests"
 )]
 fn a_cold_mode_leg_below_the_verified_incumbent_is_kept() {
-    let (off, off_legs) = cold_mode_fit("cold_wins.csv", BOTH_PASSES);
-    let (on, on_legs) = cold_mode_fit("cold_wins.csv", &[LegStart::NewtonStep]);
+    let ((off, off_legs), (on, on_legs)) = cold_mode_pair(
+        "cold_wins.csv",
+        BOTH_PASSES,
+        &[LegStart::NewtonStep],
+        |_, _| true,
+    );
     eprintln!(
         "off {} ({} legs), on {} ({} legs)",
         off.ofv,
@@ -15730,8 +15820,12 @@ fn a_cold_mode_leg_below_the_verified_incumbent_is_kept() {
     ignore = "slow: two fits to convergence; opt in with --features slow-tests"
 )]
 fn a_newton_leg_leaves_a_verified_stop_that_is_no_minimum() {
-    let (off, off_legs) = cold_mode_fit("newton_wins.csv", BOTH_PASSES);
-    let (on, on_legs) = cold_mode_fit("newton_wins.csv", &[LegStart::ColdModes]);
+    let ((off, off_legs), (on, on_legs)) = cold_mode_pair(
+        "newton_wins.csv",
+        BOTH_PASSES,
+        &[LegStart::ColdModes],
+        |_, _| true,
+    );
     eprintln!("off {} on {}", off.ofv, on.ofv);
     assert!(on.ofv.is_finite() && off.ofv.is_finite());
     assert!(
@@ -15757,9 +15851,22 @@ fn a_newton_leg_leaves_a_verified_stop_that_is_no_minimum() {
     ignore = "slow: two fits to convergence; opt in with --features slow-tests"
 )]
 fn a_cold_mode_leg_above_the_verified_incumbent_changes_nothing() {
-    let (off, off_legs) = cold_mode_fit("cold_loses.csv", BOTH_PASSES);
-    HELD_SOLVE_AT_RESTORED.with(|c| c.set(None));
-    let (on, on_legs) = cold_mode_fit("cold_loses.csv", &[LegStart::NewtonStep]);
+    // `cold_mode_pair` clears the probe before the `on` fit, which it runs last.
+    let ((off, off_legs), (on, on_legs)) = cold_mode_pair(
+        "cold_loses.csv",
+        BOTH_PASSES,
+        &[LegStart::NewtonStep],
+        |off_legs, on_legs| {
+            let verified = off_legs
+                .iter()
+                .filter_map(|l| l.best)
+                .fold(f64::INFINITY, f64::min); // nan-ok: `filter_map` keeps only a feasible leg's best
+            on_legs
+                .iter()
+                .filter_map(|l| l.best)
+                .any(|b| b > verified + 1.0)
+        },
+    );
     let held_at_restored = HELD_SOLVE_AT_RESTORED.with(|c| c.get());
     let verified = off_legs
         .iter()

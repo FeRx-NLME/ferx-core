@@ -5,6 +5,7 @@ pub mod event_driven;
 pub(crate) mod modified_release;
 pub mod ode_template;
 pub mod one_compartment;
+pub(crate) mod sharing_scope;
 pub mod three_compartment;
 pub(crate) mod topology;
 pub mod two_compartment;
@@ -1321,7 +1322,15 @@ fn fill_dose_pk_params(
         Some(p) => out.resize(subject.doses.len(), p),
         None => {
             let doses: Vec<_> = dose_pk_inputs(subject).collect();
-            fill_per_record_pk_params(model, theta, eta, &[&doses], &mut [out]);
+            fill_per_record_pk_params(
+                model,
+                subject,
+                sharing_scope::ShareSite::Dose,
+                theta,
+                eta,
+                &[&doses],
+                &mut [out],
+            );
             inherit_parent_dose_attrs(model, subject, out);
         }
     }
@@ -1469,8 +1478,13 @@ pub(crate) fn first_record_with_same_pk_inputs<'a>(
 /// of `records[l]` (its records' `(covariate snapshot, time)`). Records with the same
 /// inputs, in any of the lists, share one evaluation
 /// ([`first_record_with_same_pk_inputs`]); the rest are bit-identical copies of it.
+/// `records` are `subject`'s records for `site`, whose index an open
+/// [`sharing_scope::SharingScope`] keeps.
+#[allow(clippy::too_many_arguments)]
 fn fill_per_record_pk_params(
     model: &CompiledModel,
+    subject: &Subject,
+    site: sharing_scope::ShareSite,
     theta: &[f64],
     eta: &[f64],
     records: &[&[(&std::collections::HashMap<String, f64>, f64)]],
@@ -1479,8 +1493,10 @@ fn fill_per_record_pk_params(
     debug_assert_eq!(records.len(), outs.len());
     // `locate` indexes each list from 0; both callers clear `outs` first.
     debug_assert!(outs.iter().all(|o| o.is_empty()));
-    let first = first_record_with_same_pk_inputs(
+    let first = sharing_scope::first_record_with_same_pk_inputs(
         model,
+        subject,
+        site,
         records
             .iter()
             .flat_map(|r| r.iter().map(|&(cov, _)| (None, cov))),
@@ -1633,7 +1649,9 @@ pub(crate) fn compute_dose_pk_params_into(
 /// the buffer is allocated once per subject and reused across many
 /// `eta` evaluations, so the snapshot vectors are not reallocated per
 /// call. On the TV-cov path each call still allocates the per-record input
-/// lists and the sharing index of `first_record_with_same_pk_inputs`.
+/// lists and builds the index of which records can share one `$PK` evaluation. Inside
+/// the crate an EBE search keeps that index for its subject (#2558); a call from outside
+/// the crate builds it every time.
 ///
 /// Resizes `out`'s `Vec`s to the exact lengths required by `subject`,
 /// then overwrites the contents. If the existing capacity already
@@ -1670,6 +1688,8 @@ pub fn compute_event_pk_params_into(
         let reset: Vec<_> = reset_pk_inputs(subject).collect();
         fill_per_record_pk_params(
             model,
+            subject,
+            sharing_scope::ShareSite::ObsPkOnlyReset,
             theta,
             eta,
             &[&obs, &pk_only, &reset],
@@ -3201,7 +3221,7 @@ pub fn compute_predictions_with_states(
         // that snapshot is not uniform, and gates `W_DERIVED_CMT_TV_ODE` (#1855).
         let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
         let (mut ipred, states) =
-            if subject.has_tv_covariates() || subject.has_resets() || uses_time {
+            if subject.has_tv_covariates() || subject.has_state_events() || uses_time {
                 let mut scratch = EventPkParams::with_capacity_for(subject);
                 compute_event_pk_params_into(model, subject, theta, eta, &mut scratch);
                 crate::ode::ode_predictions_event_driven_with_states(
@@ -3492,7 +3512,7 @@ pub fn compute_predictions_ode(
     // walker — the plain `ode_predictions` segment loop has no reset event.
     // Replicate the (constant) params across every event slot, mirroring the
     // no-TV uniform fill used by `compute_event_pk_params`.
-    if subject.has_resets() {
+    if subject.has_state_events() {
         let mut pk = PkParams::default();
         let n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
         pk.values[..n].copy_from_slice(&pk_params_flat[..n]);
@@ -3699,7 +3719,7 @@ pub(crate) fn compute_predictions_with_tv_recycle_with_schedule(
         // ODE path. Resets (EVID=3/4) need the state-propagating event-driven
         // walker too, even without time-varying covariates — the plain
         // `ode_predictions` loop has no reset event.
-        if has_tv || subject.has_resets() || uses_time {
+        if has_tv || subject.has_state_events() || uses_time {
             compute_event_pk_params_into(model, subject, theta, eta, scratch);
             crate::ode::ode_predictions_event_driven(
                 ode,
@@ -4109,6 +4129,304 @@ mod tests {
         assert_ne!(ev.obs[3].cl(), ev.pk_only[1].cl());
     }
 
+    // ── the sharing index is built once per scope (#2558) ──
+
+    /// `CL` reads `WT` and `V` reads `AGE` when `wt`; otherwise `WT` is no input at all.
+    fn wt_age_model(wt: bool) -> CompiledModel {
+        let cl = if wt {
+            "TVCL * exp(ETA_CL) * (WT/70)"
+        } else {
+            "TVCL * exp(ETA_CL)"
+        };
+        crate::parser::model_parser::parse_model_string(&format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.1
+[individual_parameters]
+  CL = {cl}
+  V  = TVV * (AGE/40)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(EPS)
+"#
+        ))
+        .expect("parses")
+    }
+
+    /// A subject whose `WT` changes from record to record over a constant `AGE`, with as
+    /// many resets as doses, so its dose list and its reset list are the same length.
+    fn wt_varying_subject(wts: [f64; 5]) -> Subject {
+        let w = |wt: f64| covs(&[("WT", wt), ("AGE", 40.0)]);
+        let mut s = make_subject_with_tv(
+            w(wts[0]),
+            vec![w(wts[0]), w(wts[1])],
+            wts.iter().map(|&x| w(x)).collect(),
+            2,
+            5,
+        );
+        s.reset_times = vec![2.5, 3.5];
+        s.reset_covariates = vec![w(wts[2]), w(wts[3])];
+        s
+    }
+
+    /// Every snapshot of `ev`, as bits.
+    fn snapshot_bits(ev: &EventPkParams) -> Vec<Vec<u64>> {
+        [&ev.dose, &ev.obs, &ev.pk_only, &ev.reset]
+            .iter()
+            .flat_map(|l| l.iter().map(|p| p.values.map(f64::to_bits).to_vec()))
+            .collect()
+    }
+
+    /// Outside a scope each evaluation builds both of its indices; inside one the first
+    /// evaluation builds them and every later one reuses them, at any η, and the
+    /// snapshots are the same bits either way. Catches an EBE search whose scope stops
+    /// holding the index, and a reused index that is not the one a fresh build gives.
+    #[test]
+    fn a_sharing_scope_builds_each_index_once_and_changes_no_snapshot() {
+        let model = wt_age_model(true);
+        let s = wt_varying_subject([70.0, 95.0, 95.0, 80.0, 70.0]);
+        assert!(subject_needs_per_event_pk(&model, &s));
+        let theta = model.default_params.theta.clone();
+        let builds = sharing_scope::builds;
+        let eval = |eta: f64| snapshot_bits(&compute_event_pk_params(&model, &s, &theta, &[eta]));
+
+        let b0 = builds();
+        let unscoped = [eval(0.2), eval(-0.3)];
+        assert_eq!(
+            builds() - b0,
+            4,
+            "outside a scope: dose + rest index per evaluation"
+        );
+        let scoped = {
+            let _share = sharing_scope::SharingScope::enter(&model, &s);
+            let b1 = builds();
+            let scoped = [eval(0.2), eval(-0.3), eval(0.2)];
+            assert_eq!(builds() - b1, 2, "inside a scope: dose + rest index, once");
+            scoped
+        };
+        assert_eq!(
+            scoped[0], unscoped[0],
+            "η = 0.2: a reused index moved a snapshot"
+        );
+        assert_eq!(
+            scoped[1], unscoped[1],
+            "η = -0.3: a reused index moved a snapshot"
+        );
+        assert_eq!(scoped[2], unscoped[0]);
+        // Closed, the scope keeps nothing.
+        let b2 = builds();
+        eval(0.2);
+        assert_eq!(
+            builds() - b2,
+            2,
+            "a closed scope must not keep serving its index"
+        );
+    }
+
+    /// The scope is for one model, one subject, one site and one set of κ groups, and an
+    /// index for anything else is built and handed back but not kept, so the scope's own
+    /// still answers afterwards. Each pair below differs in one of those and has a
+    /// different index, asserted, so a key that drops it hands back the wrong one.
+    #[test]
+    fn a_sharing_scope_rebuilds_for_another_model_subject_site_or_grouping() {
+        use sharing_scope::{first_record_with_same_pk_inputs as scoped, ShareSite};
+        let (with_wt, age_only) = (wt_age_model(true), wt_age_model(false));
+        let s = wt_varying_subject([70.0, 95.0, 95.0, 80.0, 70.0]);
+        let other = wt_varying_subject([70.0, 70.0, 95.0, 95.0, 95.0]);
+        let builds = sharing_scope::builds;
+        fn none(s: &Subject) -> Vec<(Option<usize>, &HashMap<String, f64>)> {
+            (0..s.obs_times.len())
+                .map(|j| (None, s.obs_cov(j)))
+                .collect()
+        }
+        let direct = |m: &CompiledModel, r: &[(Option<usize>, &HashMap<String, f64>)]| {
+            first_record_with_same_pk_inputs(m, r.iter().copied()).expect("parsed, no TIME")
+        };
+        let get = |m: &CompiledModel, sub: &Subject, site, r: &[_]| {
+            scoped(m, sub, site, r.iter().copied())
+                .expect("parsed, no TIME")
+                .to_vec()
+        };
+        let (rs, ro) = (none(&s), none(&other));
+        // The same records in other κ groups: obs 1 and 2 now share only within a group.
+        let grouped: Vec<_> = rs
+            .iter()
+            .enumerate()
+            .map(|(j, &(_, c))| (Some(j % 2), c))
+            .collect();
+        let want = direct(&with_wt, &rs);
+        assert_eq!(want, [0, 1, 1, 3, 0]);
+        assert_ne!(
+            direct(&age_only, &rs),
+            want,
+            "the models must index s differently"
+        );
+        assert_ne!(
+            direct(&with_wt, &ro),
+            want,
+            "the subjects must index differently"
+        );
+        assert_ne!(
+            direct(&with_wt, &grouped),
+            want,
+            "the groupings must index differently"
+        );
+
+        let _share = sharing_scope::SharingScope::enter(&with_wt, &s);
+        assert_eq!(get(&with_wt, &s, ShareSite::Recorder, &rs), want);
+        let b = builds();
+        assert_eq!(get(&with_wt, &s, ShareSite::Recorder, &rs), want);
+        assert_eq!(builds(), b, "the scope's own index is reused");
+
+        assert_eq!(
+            get(&age_only, &s, ShareSite::Recorder, &rs),
+            direct(&age_only, &rs),
+            "another model (as the evaluation twin is) builds its own index"
+        );
+        assert_eq!(
+            get(&with_wt, &other, ShareSite::Recorder, &ro),
+            direct(&with_wt, &ro),
+            "another subject builds its own index"
+        );
+        assert_eq!(builds(), b + 2);
+        let b = builds();
+        assert_eq!(get(&with_wt, &s, ShareSite::Recorder, &rs), want);
+        assert_eq!(builds(), b, "neither of those replaced the scope's index");
+
+        // Another site's list, the same length with the same (absent) groups, as the
+        // recorder's and the f64 materializer's lists can be on a model without IOV.
+        assert_eq!(rs.len(), ro.len());
+        assert_eq!(
+            get(&with_wt, &s, ShareSite::ObsPkOnlyReset, &ro),
+            direct(&with_wt, &ro),
+            "another site keeps its own index"
+        );
+        let b = builds();
+        assert_eq!(get(&with_wt, &s, ShareSite::Recorder, &rs), want);
+        assert_eq!(builds(), b, "and leaves the recorder's alone");
+
+        assert_eq!(
+            get(&with_wt, &s, ShareSite::Recorder, &grouped),
+            direct(&with_wt, &grouped),
+            "other κ groups rebuild"
+        );
+    }
+
+    /// A scope opened inside another hands the outer one back when it closes; one opened
+    /// for the pair already open changes nothing. Catches a guard that leaves its own
+    /// state behind, which costs the outer search its index for the rest of the search.
+    #[test]
+    fn a_nested_sharing_scope_restores_the_outer_one() {
+        use sharing_scope::{first_record_with_same_pk_inputs as scoped, ShareSite, SharingScope};
+        let model = wt_age_model(true);
+        let (s, other) = (
+            wt_varying_subject([70.0, 95.0, 95.0, 80.0, 70.0]),
+            wt_varying_subject([70.0, 70.0, 95.0, 95.0, 95.0]),
+        );
+        let builds = sharing_scope::builds;
+        let ask = |sub: &Subject| {
+            let r: Vec<_> = (0..5).map(|j| (None, sub.obs_cov(j))).collect();
+            scoped(&model, sub, ShareSite::Dose, r.into_iter());
+        };
+        let _outer = SharingScope::enter(&model, &s);
+        ask(&s);
+        let b = builds();
+        {
+            let _inner = SharingScope::enter(&model, &other);
+            ask(&other);
+            ask(&other);
+            assert_eq!(builds(), b + 1, "the inner scope keeps its own index");
+        }
+        let b = builds();
+        ask(&s);
+        assert_eq!(
+            builds(),
+            b,
+            "the outer scope's index survives the inner one"
+        );
+        {
+            let _again = SharingScope::enter(&model, &s);
+            ask(&s);
+        }
+        ask(&s);
+        assert_eq!(builds(), b, "re-entering the open pair keeps its index");
+    }
+
+    /// A guard that closes while one opened after it is still open must not hand back its
+    /// own predecessor: the later guard would then reinstall a scope whose borrows have
+    /// ended. A debug build fails at the out-of-order drop, and every scope is closed, so a
+    /// release build only loses the index. Catches a `Drop` that restores unconditionally.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn an_out_of_order_sharing_scope_closes_every_scope() {
+        use sharing_scope::{first_record_with_same_pk_inputs as scoped, ShareSite, SharingScope};
+        let model = wt_age_model(true);
+        let (s, other) = (
+            wt_varying_subject([70.0, 95.0, 95.0, 80.0, 70.0]),
+            wt_varying_subject([70.0, 70.0, 95.0, 95.0, 95.0]),
+        );
+        let ask = |sub: &Subject| {
+            let r: Vec<_> = (0..5).map(|j| (None, sub.obs_cov(j))).collect();
+            scoped(&model, sub, ShareSite::Dose, r.into_iter());
+        };
+        let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let first = SharingScope::enter(&model, &s);
+            let second = SharingScope::enter(&model, &other);
+            drop(first);
+            drop(second);
+        }));
+        let msg = closed.expect_err("an out-of-order drop must fail a debug build");
+        assert!(
+            msg.downcast_ref::<&str>()
+                .is_some_and(|m| m.contains("closed before one opened after it")),
+            "the panic names the out-of-order close"
+        );
+        // Nothing is left open: neither subject's index is kept.
+        for sub in [&s, &other] {
+            let b = sharing_scope::builds();
+            ask(sub);
+            ask(sub);
+            assert_eq!(
+                sharing_scope::builds(),
+                b + 2,
+                "no scope may outlive its guard"
+            );
+        }
+    }
+
+    /// An EBE search opens the scope: across all its evaluations each site builds once.
+    /// Without it a search of two evaluations already builds four f64 indices.
+    #[test]
+    fn an_ebe_search_builds_each_sharing_index_once() {
+        let model = wt_age_model(true);
+        let mut s = wt_varying_subject([70.0, 95.0, 95.0, 80.0, 70.0]);
+        s.observations = vec![9.0, 6.0, 4.0, 3.0, 2.0];
+        let b = sharing_scope::builds();
+        let ebe = crate::estimation::inner_optimizer::find_ebe(
+            &model,
+            &s,
+            &model.default_params,
+            200,
+            1e-8,
+            None,
+            None,
+            0,
+        );
+        assert!(ebe.nll.is_finite());
+        // Exactly one per site, so a site the search stops reaching (the inner gradient
+        // routed to FD, say) fails as surely as a site that rebuilds.
+        let built = sharing_scope::builds() - b;
+        assert_eq!(
+            built, 3,
+            "indices built across one EBE search: want the f64 dose index, the f64 \
+             obs/PK-only/reset index and the inner gradient's recorder index, one each"
+        );
+    }
+
     // ── the doses-only materializer is the full one's `dose` vector (#1235) ──
 
     /// `compute_dose_pk_params_into` must be **bit-identical** to
@@ -4173,6 +4491,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -4496,6 +4815,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: vec![8.0],
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             // The reset row itself is occasion 2 — the occasion it STARTS. The record
             // before it is occasion 1, which is what every neighbour-inferring rule
             // resolves to, and what ferx used before this was measured.
@@ -4777,6 +5097,7 @@ mod tests {
             // Each reset row carries a `WT` shared with no neighbouring record, so reading
             // one row early or late shows up in the assertions below.
             reset_covariates: vec![wt(50.0), wt(80.0)],
+            cmt_toggles: Vec::new(),
             cens: vec![0; 2],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -4827,6 +5148,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: vec![5.0],
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 2],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -4891,6 +5213,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -5150,6 +5473,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -5921,6 +6245,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1, 1, 2, 2],
             obs_l2: Vec::new(),
@@ -6589,6 +6914,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             obs_l2: Vec::new(),

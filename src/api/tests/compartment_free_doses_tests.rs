@@ -58,6 +58,7 @@ fn population(dose_lists: Vec<Vec<DoseEvent>>) -> Population {
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
                 reset_covariates: Vec::new(),
+                cmt_toggles: Vec::new(),
                 cens: vec![0],
                 occasions: Vec::new(),
                 obs_l2: Vec::new(),

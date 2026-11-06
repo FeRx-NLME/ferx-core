@@ -71,6 +71,7 @@ fn subject(id: &str, scale: f64) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -195,6 +196,56 @@ fn a_fit_with_no_covariance_matrix_names_no_estimator() {
         fit.cov_condition_number.is_none() && fit.cov_eigenvalues.is_none(),
         "premise: the quantities the label exists for are absent too"
     );
+}
+
+/// #2695: `cov_fixed` is the held-coordinate mask of the matrix a fit publishes, set by
+/// `fit()` and refreshed by `run_covariance`, and empty when there is no matrix. The FIX θ
+/// is what makes the mask more than a row of `false`. The post-hoc step starts from a fit
+/// whose mask was cleared, so inheriting it would fail; `interface_extras` is not the
+/// engine's to drop.
+#[test]
+fn cov_fixed_is_the_mask_of_the_published_matrix() {
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0) FIX
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+    )
+    .expect("parse");
+    let pop = population();
+    let o = opts(CovarianceMethod::Hessian, true);
+    let held = vec![false, true, false, false];
+
+    let mut fitted = fit(&model, &pop, &model.default_params, &o).expect("fit");
+    let dim = fitted.covariance_matrix.as_ref().expect("premise").nrows();
+    assert_eq!(
+        dim,
+        held.len(),
+        "premise: the matrix spans the packed layout"
+    );
+    assert_eq!(fitted.cov_fixed, held);
+
+    fitted.cov_fixed.clear();
+    fitted.interface_extras = Some("{\"call\": 1}".into());
+    let rerun = run_covariance(&fitted, Some(&model), Some(&pop), &o).expect("run_covariance");
+    assert_eq!(rerun.cov_fixed, held);
+    assert_eq!(rerun.interface_extras, fitted.interface_extras);
+
+    let mut none = opts(CovarianceMethod::Hessian, true);
+    none.run_covariance_step = false;
+    let bare = fit(&model, &pop, &model.default_params, &none).expect("fit");
+    assert!(bare.covariance_matrix.is_none(), "premise");
+    assert!(bare.cov_fixed.is_empty());
 }
 
 /// **G3 — `run_covariance` relabels, and does not inherit — including in the

@@ -113,6 +113,7 @@ fn subject(cell: Cell) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: if cell.reset { vec![26.0] } else { Vec::new() },
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: Vec::new(),
         obs_l2: Vec::new(),

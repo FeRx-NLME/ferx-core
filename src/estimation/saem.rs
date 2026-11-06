@@ -57,7 +57,7 @@ pub(crate) const MSTEP_NLOPT_ALGORITHM: nlopt::Algorithm = nlopt::Algorithm::Bob
 /// coordinates) and captures 50–90 % of the achievable gain on thiotepa; a
 /// 3× budget on top of that bought nothing (IS −2 log L 5835.0 against
 /// 5827.3, at 2.3× the wall time), so the budget is left alone.
-const MSTEP_INITIAL_STEP: f64 = 0.1;
+pub(crate) const MSTEP_INITIAL_STEP: f64 = 0.1;
 
 /// Initial BOBYQA step for one packed coordinate: [`MSTEP_INITIAL_STEP`],
 /// bounded by a quarter of the coordinate's own interval.
@@ -69,7 +69,7 @@ const MSTEP_INITIAL_STEP: f64 = 0.1;
 /// (`upper == lower`) is eliminated by NLopt before BOBYQA runs and keeps the
 /// nominal step, which only has to be positive. An unbounded coordinate
 /// (`+∞` width) keeps the nominal step too.
-fn mstep_initial_step(lower: f64, upper: f64) -> f64 {
+pub(crate) fn mstep_initial_step(lower: f64, upper: f64) -> f64 {
     let width = upper - lower;
     if width > 0.0 && width.is_finite() {
         MSTEP_INITIAL_STEP.min(width / 4.0)
@@ -87,7 +87,7 @@ fn mstep_initial_step(lower: f64, upper: f64) -> f64 {
 /// converged solve moves. `1e-7` is 1e-3 units on a 1e4 objective, below
 /// anything the SA blend can resolve, and the `maxeval` budget still bounds
 /// the work.
-const MSTEP_FTOL_REL: f64 = 1e-7;
+pub(crate) const MSTEP_FTOL_REL: f64 = 1e-7;
 
 /// Relative objective tolerance of the numerical θ/σ M-step **under a mixture
 /// model** — the pre-#1415 value, kept deliberately, together with NLopt's
@@ -7121,6 +7121,7 @@ pub fn run_saem(
             let posteriors = crate::estimation::outer_optimizer::MixturePosteriors {
                 pmix: meval.pmix.clone(),
                 mixest: meval.mixest.clone(),
+                n_fd_h_redone: meval.n_fd_h_redone,
             };
             (
                 meval.mixest_etas,
@@ -7300,6 +7301,7 @@ pub fn run_saem(
         vi: None,
         start_eval: None,
         mcem_lowest_objective: None,
+        mcem_objective_trail: None,
     })
 }
 
@@ -10760,6 +10762,7 @@ DV ~ additive(EPS)
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0],
             occasions: vec![],
             obs_l2: Vec::new(),
@@ -10920,6 +10923,7 @@ DV ~ additive(EPS)
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![],
             obs_l2: Vec::new(),
@@ -11030,6 +11034,7 @@ DV ~ additive(EPS)
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1u32, 1, 2, 2],
             obs_l2: Vec::new(),
@@ -11167,6 +11172,7 @@ DV ~ additive(EPS)
                     pk_only_covariates: Vec::new(),
                     reset_times: Vec::new(),
                     reset_covariates: Vec::new(),
+                    cmt_toggles: Vec::new(),
                     cens: vec![0, 0, 0, 0],
                     occasions: vec![1, 1, 2, 2],
                     obs_l2: Vec::new(),
@@ -11345,6 +11351,7 @@ DV ~ additive(EPS)
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![],
             obs_l2: Vec::new(),
@@ -12886,6 +12893,7 @@ DV ~ additive(EPS)
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0],
             occasions: vec![],
             obs_l2: Vec::new(),
