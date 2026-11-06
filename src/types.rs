@@ -1386,6 +1386,20 @@ impl Subject {
             .fold(f64::INFINITY, f64::min)
     }
 
+    /// Every per-record covariate snapshot of the subject — observation, dose, PK-only,
+    /// reset and non-Gaussian endpoint rows — each a map some predictor reads at its
+    /// record. Not the subject-static `covariates` map. The one list of record kinds for
+    /// the covariate presence check (`population_carries`, #2671), so a kind cannot be
+    /// left out of one caller and kept in another.
+    pub(crate) fn record_maps(&self) -> impl Iterator<Item = &HashMap<String, f64>> {
+        self.obs_covariates
+            .iter()
+            .chain(&self.dose_covariates)
+            .chain(&self.pk_only_covariates)
+            .chain(&self.reset_covariates)
+            .chain(&self.endpoint_covariates)
+    }
+
     /// Covariate snapshot at observation index `j`. Falls back to the
     /// subject-static `covariates` map when per-event snapshots aren't present.
     pub fn obs_cov(&self, j: usize) -> &HashMap<String, f64> {

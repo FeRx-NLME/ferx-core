@@ -122,9 +122,15 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
     // `read_nonmem_csv*` population handed to `fit()`. It gets its own message;
     // the historical text below keeps every other name byte-for-byte. An in-memory
     // population (`input_columns` empty) and a case-differing spelling stay there.
-    let (unread, plain): (Vec<&str>, Vec<&str>) = plain
-        .iter()
-        .partition(|n| population.input_columns.iter().any(|h| h == *n));
+    // So does a header some map of the population holds (#2671): the reader *did*
+    // take that column, and a population later edited in code to drop it from one
+    // map is missing it there, not unread.
+    let (unread, plain): (Vec<&str>, Vec<&str>) = plain.iter().partition(|n| {
+        population.input_columns.iter().any(|h| h == *n)
+            && !population.subjects.iter().any(|s| {
+                s.covariates.contains_key(**n) || s.record_maps().any(|m| m.contains_key(**n))
+            })
+    });
 
     if !plain.is_empty() {
         diags.push(missing_covariate_diagnostic(population, &plain));
@@ -213,21 +219,30 @@ fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diag
 /// per-subject maps, so a name that is listed but missing from some subject is read
 /// as 0 for that subject. An empty population carries nothing.
 ///
-/// The subject-static map decides, not the per-record snapshots: every lookup
-/// without a snapshot of its own — a dose, reset or PK-only row of a subject with no
-/// such snapshots, an adaptive decision before the first record — falls back to it,
-/// so a name the static map lacks is read as 0 there even when every observation
-/// snapshot has it. The CSV reader fills the static map with each subject's first
-/// value.
+/// A subject carries `name` when its subject-static map **and** every per-record
+/// snapshot (`Subject::record_maps`: observation, dose, PK-only,
+/// reset, non-Gaussian endpoint) holds it, since each is a map some predictor reads:
+/// - the static map is the fallback of every lookup without a snapshot of its own — a
+///   dose, reset or PK-only row of a subject with no such snapshots, an adaptive
+///   decision before the first record — so a name it lacks is read as 0 there even
+///   when every observation snapshot has it;
+/// - a record's snapshot is what that record reads, the PK at that row and, through
+///   `locf_decision_cov`, an adaptive `observe` or dose expression at a decision in
+///   force there (#2671), and a binary / categorical / DTMM endpoint row through
+///   `record_cov`, so a name one snapshot lacks is read as 0 at that record even when
+///   the static map has it.
 ///
-/// Shared with the `[adaptive_dosing]` `observe` check in
-/// `simulate_adaptive_from_spec`, so the two cannot disagree on one population.
+/// The CSV reader cannot produce either gap: it fills the static map with each
+/// subject's first value (`NaN` when it has none) and starts every snapshot from a
+/// copy of it, only ever adding keys. Only a population built in code can.
+///
+/// Shared with the `[adaptive_dosing]` `observe` and dose-expression checks in
+/// `simulate_adaptive_from_spec`, so they cannot disagree on one population.
 pub(crate) fn population_carries(population: &Population, name: &str) -> bool {
     !population.subjects.is_empty()
-        && population
-            .subjects
-            .iter()
-            .all(|s| s.covariates.contains_key(name))
+        && population.subjects.iter().all(|s| {
+            s.covariates.contains_key(name) && s.record_maps().all(|m| m.contains_key(name))
+        })
 }
 
 /// The "Available covariate columns" list of an `E_MISSING_COVARIATE`: the listed
