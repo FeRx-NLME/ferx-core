@@ -50,9 +50,10 @@ def jet(x):
         for k in range(4000, 0, -1):
             f = t + k / f
         q = phi_pdf(t) / f
-        # -log(1 - q): exact at 80 digits while 1 - q does not round to 1 (q above ~1e-70);
-        # below that the two-term series is exact to q^3 ~ 1e-210 relative (review r1 #3).
-        val = -(1 - q).ln() if q > D(10) ** -70 else q + q * q / 2
+        # -log(1 - q) (review r1 #3). Forming 1 - q at 80 digits costs ~1e-80 absolute, so
+        # ~1e-80/q relative: 1e-40 for q above 1e-40. Below that the two-term series
+        # q + q^2/2 is better, exact to q^2 ~ 1e-80 relative (review r2 #11).
+        val = -(1 - q).ln() if q > D(10) ** -40 else q + q * q / 2
     else:
         val = -Phi(x).ln()
     return [val, -m, -m1, -m2, -m3]
