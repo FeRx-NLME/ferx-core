@@ -111,7 +111,8 @@ restarts `TIME` the later period shares the earlier period's levels. Anything
 else is a covariate column, which the reader loads automatically.
 
 The two forms cannot be confused: brackets containing only digits are a level
-count, anything else is a column list.
+count, anything else is a column list. A data-driven block is read bare, as
+`PLACEBO` ([Where a block may be read](#where-a-block-may-be-read)).
 
 Only combinations the data actually shows become parameters — an unbalanced
 design does not acquire cells nobody measured.
@@ -201,8 +202,17 @@ parsed:
 - an error-model selector condition, `if (...)`.
 
 For the first three, assign the block in `[individual_parameters]`
-(`KM_I = KM[K]`) and use `KM_I`. A selector condition reads per-row data
-columns only, so put the grouping in a data column and select on that.
+(`KM_I = KM[K]`, or `KM_I = KM` for a data-driven block) and use `KM_I`. A
+selector condition reads per-row data columns only, so put the grouping in a data
+column and select on that.
+
+The subscripted reads above (`SCALE[STUDY]`, `KM[K]`) are of the counted form,
+where the index is yours. A data-driven block is read **bare**, as `PLACEBO`,
+in every one of these places, and each record reads the level its own columns
+select. A subscript on it (`PLACEBO[STUDY]`, `PLACEBO[TIME]`,
+`PLACEBO[STUDY + 0]`, `PLACEBO[2]`) is a parse error, since it would index the
+block by the number it evaluates to, which matches a level only by coincidence
+(#2744). To supply the index yourself, use the counted form.
 
 ### Identifiability
 
@@ -991,20 +1001,20 @@ An `if` on data and a sum of reads are affine too, and are accepted (#2114):
 
 ```
 if (WT > 70) {
-  B = PLACEBO[STUDY] * 2
+  B = PLACEBO * 2
 } else {
-  B = PLACEBO[STUDY]
+  B = PLACEBO
 }
-C = if (WT > 70) PLACEBO[STUDY] * 2 else PLACEBO[STUDY]
-D = PLACEBO[STUDY] * X + PLACEBO[STUDY] * Z
+C = if (WT > 70) PLACEBO * 2 else PLACEBO
+D = PLACEBO * X + PLACEBO * Z
 ```
 
 Each is `c × PLACEBO` with `c` from the data: `if (WT > 70) 2 else 1` for `B` and `C`,
 `X + Z` for `D`. A branch may also leave the block out, which is `c = 0` on its rows.
 The condition must read data only. One that reads a θ, an η or the block itself is
 refused, and so is every `max`, `min` or `clamp` of the block, since each compares the
-block. Every branch must itself be affine: a branch giving `PLACEBO[STUDY]` under one
-condition and `exp(PLACEBO[STUDY])` under the other is refused, naming the `exp`.
+block. Every branch must itself be affine: a branch giving `PLACEBO` under one
+condition and `exp(PLACEBO)` under the other is refused, naming the `exp`.
 
 ##### Through a link
 
