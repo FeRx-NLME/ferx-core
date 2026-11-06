@@ -4196,6 +4196,9 @@ fn run<const N: usize, const M: usize>(
     // derivative read off the η-jets in step 4 (`ChannelPlan`).
     let chan = ChannelPlan::new(model, subject, theta, axis, &et);
     let th: Vec<DualV<N, M>> = match chan.as_ref() {
+        _ if crate::devflags::off("thetatape") => {
+            theta.iter().map(|&v| DualV::constant(v)).collect()
+        }
         None => theta_leaves::<N, M, false>(axis, theta),
         Some(c) => theta
             .iter()

@@ -3,7 +3,7 @@
 //! `FERX_DEV_OFF=a,b` turns named features off.
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub const N: usize = 16;
+pub const N: usize = 28;
 pub static COUNTS: [AtomicUsize; N] = [const { AtomicUsize::new(0) }; N];
 pub const NAMES: [&str; N] = [
     "iov_solves_warm",
@@ -16,12 +16,24 @@ pub const NAMES: [&str; N] = [
     "lin_spectral",
     "lin_spectral_rejected",
     "lin_spectral_declined",
-    "c10",
-    "c11",
-    "c12",
-    "c13",
-    "c14",
-    "c15",
+    "ls_accept",
+    "ls_rej_nonfinite",
+    "ls_rej_increase",
+    "ls_rej_small_decrease",
+    "ls_floor_stop",
+    "ls_rej_inc_reset",
+    "k0r0",
+    "k0r1",
+    "k0r2_3",
+    "k0r4p",
+    "k1r0",
+    "k1r1",
+    "k1r2_3",
+    "k1r4p",
+    "k2r0",
+    "k2r1",
+    "k2r2_3",
+    "k2r4p",
 ];
 
 #[inline]
