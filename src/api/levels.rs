@@ -1382,15 +1382,47 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
         }
     }
     if levels.is_empty() {
-        return Err(format!(
-            "theta {}[{}]: the data carries no observation rows, so the block \
-             has no levels",
-            decl.name(),
-            decl.columns().join(", ")
-        ));
+        return Err(no_levels_message(decl, population));
     }
     levels.sort_by(cmp_levels);
     Ok(levels)
+}
+
+/// The refusal for a block [`discover_levels`] found no level of. Every Gaussian
+/// observation defines a level, so there are none; when the data still carries
+/// discrete-state records, none of them is on an endpoint that reads the block through
+/// its implicit index ([`LevelBlockDecl::record_cmts`]), and the cause is the expression,
+/// not the data (#2623). An explicit `NAME[COLUMN]` read is named as the likely cause.
+fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
+    let name = decl.name();
+    let head = format!("theta {name}[{}]", decl.columns().join(", "));
+    let has_records = population.subjects.iter().any(|s| {
+        s.obs_records
+            .iter()
+            .any(|r| matches!(r, ObsRecord::DiscreteState { .. }))
+    });
+    if !has_records {
+        return format!("{head}: the data carries no observation rows, so the block has no levels");
+    }
+    let mut message = format!(
+        "{head}: the block has no levels. The data carries no Gaussian observation rows, and \
+         none of its discrete-state records is on an endpoint whose expression reads the block \
+         through its implicit index. Check the expression that reads it: a data-driven block \
+         is read bare, as `{name}`; its index is implicit."
+    );
+    if !decl.keyed_reads.is_empty() {
+        let reads: Vec<String> = decl
+            .keyed_reads
+            .iter()
+            .map(|c| format!("`{name}[{c}]`"))
+            .collect();
+        message.push_str(&format!(
+            " An explicit read indexes the block by the value its column holds, not by its \
+             level: {}. Write `{name}` instead.",
+            reads.join(", ")
+        ));
+    }
+    message
 }
 
 /// The columns that would key a block's levels to subjects: the leading ones,
