@@ -591,11 +591,13 @@ fn repeated_singleton_eigenvalue(vals: &[f64], n: usize) -> bool {
         return false;
     }
     let acyclic = acyclic_mask(vals, n);
-    let diag: Vec<f64> = (0..n)
-        .filter(|&i| acyclic & (1 << i) != 0)
-        .map(|i| vals[i * n + i])
-        .collect();
-    (0..diag.len()).any(|i| (i + 1..diag.len()).any(|j| close(diag[i], diag[j])))
+    let mut diag = [0.0_f64; 6];
+    let mut m = 0;
+    for i in (0..n).filter(|&i| acyclic & (1 << i) != 0) {
+        diag[m] = vals[i * n + i];
+        m += 1;
+    }
+    (0..m).any(|i| (i + 1..m).any(|j| close(diag[i], diag[j])))
 }
 
 /// `down[i]`: the compartments `i` reaches along `A`'s nonzero couplings, itself included
