@@ -4899,6 +4899,11 @@ pub fn parse_full_model_with(
             .named
             .iter()
             .flat_map(|(ty, m)| m.keys().map(move |inst| (format!("{ty} {inst}"), &m[inst])));
+        // Every offending (block, kappa) pair is collected and named in one
+        // refusal, sorted, so the user fixes them all at once. `blocks` is a
+        // `HashMap`: returning on the first hit named a different block from
+        // one compile to the next (#2624).
+        let mut offending: Vec<(String, &String)> = Vec::new();
         for (block, lines) in blocks
             .iter()
             .filter(|(b, _)| b.as_str() != "parameters" && b.as_str() != "individual_parameters")
@@ -4909,21 +4914,19 @@ pub fn parse_full_model_with(
             collect_referenced_identifiers(lines, &mut refs);
             for name in &weighted_names {
                 if refs.contains(&name.to_ascii_uppercase()) {
-                    // A compartment-free model's equations sit under the
-                    // `scaling` key; name the block the user wrote (#1827).
-                    return Err(retarget_scaling_diag(
-                        is_algebraic,
-                        format!(
-                            "[{block}] references `{name}`, a kappa declared with `weight = ...`. \
-                             A weighted kappa is scaled where it is used, and only \
-                             `[individual_parameters]` applies that scaling — a reference here \
-                             would silently use the unweighted κ. Move the term into \
-                             `[individual_parameters]` (assign it to an individual parameter and \
-                             reference that name instead)."
-                        ),
-                    ));
+                    offending.push((block.clone(), name));
                 }
             }
+        }
+        if !offending.is_empty() {
+            // A compartment-free model's equations sit under the `scaling`
+            // key; name the block the user wrote (#1827). Relabel before
+            // sorting so the order is the one the message prints.
+            for (block, _) in &mut offending {
+                *block = retarget_scaling_diag(is_algebraic, format!("[{block}]"));
+            }
+            offending.sort();
+            return Err(weighted_kappa_outside_indiv_message(&offending));
         }
     }
     if !weighted_kappa_slots.is_empty() {
@@ -21073,6 +21076,40 @@ fn apply_algebraic_structural(extracted: &mut ExtractedBlocks) -> Result<(), Str
 /// `is_ode`-style `starts_with` scan is enough.
 fn is_algebraic_structural(struct_lines: &[String]) -> bool {
     struct_lines.iter().any(|l| l == ALGEBRAIC_MARKER)
+}
+
+/// The refusal for weighted kappas referenced outside `[individual_parameters]`
+/// (#1031). `offending` holds `([block], kappa)` pairs, already labelled and
+/// sorted; every pair is named so the user fixes them all in one pass (#2624).
+fn weighted_kappa_outside_indiv_message(offending: &[(String, &String)]) -> String {
+    let clauses: Vec<String> = offending
+        .iter()
+        .map(|(block, name)| format!("{block} references `{name}`"))
+        .collect();
+    let listed = match clauses.as_slice() {
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+        [] => String::new(),
+    };
+    let mut names: Vec<&String> = offending.iter().map(|(_, n)| *n).collect();
+    names.sort();
+    names.dedup();
+    let what = if names.len() == 1 {
+        "a kappa declared"
+    } else {
+        "kappas declared"
+    };
+    let (where_, term) = if offending.len() == 1 {
+        ("a reference here", "the term")
+    } else {
+        ("a reference in any of these blocks", "each term")
+    };
+    format!(
+        "{listed}, {what} with `weight = ...`. A weighted kappa is scaled where it is used, \
+         and only `[individual_parameters]` applies that scaling — {where_} would silently use \
+         the unweighted κ. Move {term} into `[individual_parameters]` (assign it to an \
+         individual parameter and reference that name instead)."
+    )
 }
 
 /// Retarget a `[scaling]`-worded diagnostic at `[structural_model]` (#811).

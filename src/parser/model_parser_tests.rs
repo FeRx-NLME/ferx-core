@@ -23261,6 +23261,80 @@ fn test_weighted_kappa_refusal_keeps_scaling_label_for_a_real_scaling_block() {
     );
 }
 
+/// #2624: the unnamed blocks sit in a `HashMap`, and the refusal used to return
+/// on the first offending block — so with two of them it named `[derived]` on
+/// some compiles and `[scaling]` on others (21/19 over 40 at `d69779e2`). Every
+/// offending block is now named, sorted, and the message is the same every time.
+/// Each compile builds fresh maps with fresh `RandomState`, so 40 compiles under
+/// a hash-order walk differ with probability 1 − 2·2⁻⁴⁰.
+#[test]
+fn test_weighted_kappa_refusal_names_every_block_in_a_stable_order() {
+    let src = weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n\n[scaling]\n  y = central / V + KAPPA_CL\n",
+    );
+    let first = expect_parse_err(&src);
+    assert!(
+        first.starts_with(
+            "[derived] references `KAPPA_CL` and [scaling] references `KAPPA_CL`, \
+             a kappa declared with `weight = ...`."
+        ),
+        "both blocks named, sorted, one kappa in the singular, got: {first}"
+    );
+    assert!(
+        first.contains("a reference in any of these blocks") && first.contains("Move each term"),
+        "plural wording for two blocks, got: {first}"
+    );
+    assert!(
+        !first.contains("a reference here") && !first.contains("Move the term"),
+        "no singular wording for two blocks, got: {first}"
+    );
+    for i in 1..40 {
+        let again = expect_parse_err(&src);
+        assert_eq!(again, first, "compile {i} gave a different refusal");
+    }
+}
+
+/// The single-block case keeps its singular wording: the plural added for
+/// #2624 must not leak into it.
+#[test]
+fn test_weighted_kappa_refusal_single_block_keeps_singular_wording() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with("[derived] references `KAPPA_CL`, a kappa declared with `weight = ...`."),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("a reference here would silently use") && err.contains("Move the term"),
+        "singular wording for one block, got: {err}"
+    );
+    assert!(
+        !err.contains(" and [") && !err.contains("these blocks") && !err.contains("each term"),
+        "no plural wording for one block, got: {err}"
+    );
+}
+
+/// Two distinct weighted kappas in one block: both pairs named, and the
+/// noun goes plural because there is more than one kappa (#2624).
+#[test]
+fn test_weighted_kappa_refusal_two_kappas_one_block_is_plural() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM\n  kappa KAPPA_V ~ 0.04 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_V + KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL` and [derived] references `KAPPA_V`, \
+             kappas declared with `weight = ...`."
+        ),
+        "got: {err}"
+    );
+    assert!(!err.contains("a kappa declared"), "got: {err}");
+}
+
 /// The unweighted kappa keeps its freedom to appear elsewhere.
 #[test]
 fn test_unweighted_kappa_is_not_restricted_to_individual_parameters() {
