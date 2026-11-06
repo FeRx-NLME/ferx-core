@@ -1743,10 +1743,9 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     //   (combined or proportional), and 0 for additive — the analytical
     //   SB path takes the same `dvar_dlogsigma{,_scaled}` per observation).
     //
-    // Resolve SigmaType through `error_spec` (the same dispatcher every other
-    // variance call uses), not `model.error_model`, so this stays internally
-    // consistent under any future refactor that lets the two diverge.
-    let sigma_types = error_spec.sigma_types(n_sigma);
+    // Resolve the `f`-dependent slot through `error_spec` (the same dispatcher
+    // every other variance call uses), not `model.error_model`, so this stays
+    // internally consistent under any future refactor that lets the two diverge.
     let sigma_start = omega_start + omega_entries.len();
     for ks in 0..n_sigma {
         let k = sigma_start + ks;
@@ -1765,12 +1764,15 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
                 None => error_spec.dvar_dlogsigma(err_keys[j], ks, ipreds[j], sigma_values),
             })
             .collect();
-        // ∂d/∂log σ_s. For proportional and combined, d = 2·σ_prop²·f, so
-        // ∂d/∂log σ_prop = 2·d and ∂d/∂log σ_add = 0. For additive d = 0
-        // identically.
-        let dd_factor = match sigma_types.get(ks).copied() {
-            Some(SigmaType::Proportional) => 2.0,
-            _ => 0.0,
+        // ∂d/∂log σ_s. `d = ∂R/∂f` is carried by the one slot whose loading reads
+        // `f`, and is quadratic in that slot's σ: for proportional and combined,
+        // d = 2·σ_prop²·f, so ∂d/∂log σ_prop = 2·d and ∂d/∂log σ_add = 0; for
+        // `LogCombined` (#2729) it is the additive slot, d = −2·σ_add²·exp(−2f).
+        // For additive d = 0 identically. The spec is `Single` here (asserted above).
+        let dd_factor = if error_spec.slot_reads_f(0, ks, n_sigma) {
+            2.0
+        } else {
+            0.0
         };
 
         let mut s_acc = 0.0_f64;
@@ -4078,16 +4080,30 @@ mod tests {
     /// well above the 1e-4·(1+|ref|) tolerance).
     #[test]
     fn test_subject_nll_pop_grad_analytical_laplace_combined_error() {
+        laplace_two_sigma_grad_matches_fd(ErrorModel::Combined, [0.3, 0.3]);
+    }
+
+    /// The same under LTBS combined error (#2729), where `∂R/∂f` lives on the
+    /// *additive* slot (`d = −2·σ_add²·exp(−2f)`): a `dd_factor` keyed on the
+    /// proportional `SigmaType` puts the `2·d` on the wrong σ. The fixture's
+    /// predictions are ~2, so `σ_add = 0.6` makes `σ_add/F ≈ σ_prop`.
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_laplace_log_combined_error() {
+        laplace_two_sigma_grad_matches_fd(ErrorModel::LogCombined, [0.3, 0.6]);
+    }
+
+    fn laplace_two_sigma_grad_matches_fd(em: ErrorModel, sigma: [f64; 2]) {
         let mut model = make_model();
-        model.error_model = ErrorModel::Combined;
-        model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+        model.error_model = em;
+        model.error_spec = ErrorSpec::Single(em);
+        model.log_transform = em == ErrorModel::LogCombined;
         // Combined needs two sigmas — replace template's single-σ vector and
         // keep model.n_epsilon / model.sigma_init_as_sd in sync to avoid any
         // downstream code path that reads those fields tripping on a length
         // mismatch with `template.sigma.values`.
         let mut template = model.default_params.clone();
         template.sigma = SigmaVector {
-            values: vec![0.3, 0.3],
+            values: sigma.to_vec(),
             names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
         };
         template.sigma_fixed = vec![false, false];

@@ -1434,6 +1434,7 @@ pub fn print_results(result: &FitResult) {
         ErrorModel::Additive => "additive",
         ErrorModel::Proportional => "proportional",
         ErrorModel::Combined => "combined",
+        ErrorModel::LogCombined => "log_combined",
     };
     eprintln!("\n--- SIGMA Estimates ({}) ---", err_type);
     eprint!("{}", format_sigma_rows(result));
@@ -1733,6 +1734,7 @@ pub fn format_summary(result: &FitResult) -> String {
         ErrorModel::Additive => "additive",
         ErrorModel::Proportional => "proportional",
         ErrorModel::Combined => "combined",
+        ErrorModel::LogCombined => "log_combined",
     };
     let _ = writeln!(out, "\n--- SIGMA ({}) ---", err_type);
     // The console's rows verbatim, as OMEGA and KAPPA above.
@@ -3307,6 +3309,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         ErrorModel::Additive => "additive",
         ErrorModel::Proportional => "proportional",
         ErrorModel::Combined => "combined",
+        ErrorModel::LogCombined => "log_combined",
     };
     writeln!(f, "\nsigma:  # error model: {}", err_type_str).map_err(|e| e.to_string())?;
     // Sigma is stored on the SD scale (see src/stats/residual_error.rs).

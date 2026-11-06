@@ -2944,16 +2944,19 @@ fn sigma_loading_slopes_match_loading_shape_with_f_derivatives() {
     // ∂coeff/∂f: 0 for the additive (constant) slot, 1 for the proportional
     // slot. This keeps the dense-R ∂R/∂f cross-covariance assembly consistent.
     let add = ErrorSpec::Single(ErrorModel::Additive);
-    assert_eq!(add.sigma_loading_slopes(0, 1), vec![(0, 0.0)]);
-    assert!(add.sigma_loading_slopes(0, 0).is_empty());
+    assert_eq!(add.sigma_loading_slopes(0, 5.0, 1), vec![(0, 0.0)]);
+    assert!(add.sigma_loading_slopes(0, 5.0, 0).is_empty());
 
     let prop = ErrorSpec::Single(ErrorModel::Proportional);
-    assert_eq!(prop.sigma_loading_slopes(0, 1), vec![(0, 1.0)]);
-    assert!(prop.sigma_loading_slopes(0, 0).is_empty());
+    assert_eq!(prop.sigma_loading_slopes(0, 5.0, 1), vec![(0, 1.0)]);
+    assert!(prop.sigma_loading_slopes(0, 5.0, 0).is_empty());
 
     let comb = ErrorSpec::Single(ErrorModel::Combined);
-    assert_eq!(comb.sigma_loading_slopes(0, 2), vec![(0, 1.0), (1, 0.0)]);
-    assert_eq!(comb.sigma_loading_slopes(0, 1), vec![(0, 1.0)]);
+    assert_eq!(
+        comb.sigma_loading_slopes(0, 5.0, 2),
+        vec![(0, 1.0), (1, 0.0)]
+    );
+    assert_eq!(comb.sigma_loading_slopes(0, 5.0, 1), vec![(0, 1.0)]);
 
     // PerCmt dispatch over global sigma indices, mirroring sigma_loadings.
     let mut map = std::collections::HashMap::new();
@@ -2979,10 +2982,13 @@ fn sigma_loading_slopes_match_loading_shape_with_f_derivatives() {
         },
     );
     let spec = ErrorSpec::PerCmt(map);
-    assert_eq!(spec.sigma_loading_slopes(1, 4), vec![(2, 1.0), (3, 0.0)]);
-    assert_eq!(spec.sigma_loading_slopes(2, 4), vec![(0, 1.0)]);
-    assert_eq!(spec.sigma_loading_slopes(3, 4), vec![(1, 0.0)]);
-    assert!(spec.sigma_loading_slopes(9, 4).is_empty());
+    assert_eq!(
+        spec.sigma_loading_slopes(1, 5.0, 4),
+        vec![(2, 1.0), (3, 0.0)]
+    );
+    assert_eq!(spec.sigma_loading_slopes(2, 5.0, 4), vec![(0, 1.0)]);
+    assert_eq!(spec.sigma_loading_slopes(3, 5.0, 4), vec![(1, 0.0)]);
+    assert!(spec.sigma_loading_slopes(9, 5.0, 4).is_empty());
 }
 
 #[test]

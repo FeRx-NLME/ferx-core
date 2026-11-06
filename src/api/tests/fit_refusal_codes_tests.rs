@@ -198,12 +198,22 @@ fn ltbs_refusals_are_coded() {
     per_cmt.error_spec = ErrorSpec::PerCmt(std::collections::HashMap::new());
     let mut sde = ltbs();
     sde.diffusion_theta_start = Some(0);
+    // #2729: the converse — a `LogCombined` spec whose prediction is never logged.
+    let mut log_combined_natural = ltbs();
+    log_combined_natural.log_transform = false;
+    log_combined_natural.error_spec = ErrorSpec::Single(ErrorModel::LogCombined);
     for (label, model, want) in [
         (
             "proportional",
             proportional,
-            "LTBS (`log_transform = true`) requires `error_model = Additive`; \
-             proportional/combined error on the log scale is not supported",
+            "LTBS (`log_transform = true`) requires `error_model = Additive` or \
+             `LogCombined`; proportional/combined error on the log scale is not supported",
+        ),
+        (
+            "LogCombined without LTBS",
+            log_combined_natural,
+            "`error_model = LogCombined` requires LTBS (`log_transform = true`): its \
+             additive part loads `exp(−f)`, which reads the prediction on the log scale",
         ),
         (
             "per-CMT error",
@@ -230,6 +240,13 @@ fn ltbs_refusals_are_coded() {
     assert!(
         crate::api::validation::check_ltbs_model(&ltbs()).is_empty(),
         "LTBS on an additive single-endpoint model is accepted"
+    );
+    let mut log_combined = ltbs();
+    log_combined.error_model = ErrorModel::LogCombined;
+    log_combined.error_spec = ErrorSpec::Single(ErrorModel::LogCombined);
+    assert!(
+        crate::api::validation::check_ltbs_model(&log_combined).is_empty(),
+        "LTBS on a LogCombined single-endpoint model is accepted"
     );
 }
 

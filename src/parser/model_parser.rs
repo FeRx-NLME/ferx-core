@@ -21643,12 +21643,11 @@ fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), St
         )
     })?;
     let error_type = caps[2].to_lowercase();
-    if error_type == "log_additive" {
-        return Err(
-            "[error_model] `log_additive` (log-transform-both-sides) is not supported inside a \
+    if error_type == "log_additive" || error_type == "log_combined" {
+        return Err(format!(
+            "[error_model] `{error_type}` (log-transform-both-sides) is not supported inside a \
              covariate-selected if/else block"
-                .to_string(),
-        );
+        ));
     }
     if error_type == "power" {
         return Err(
@@ -21835,6 +21834,14 @@ const ERROR_MODEL_FORMS: &[(&str, &str)] = &[
     ),
     ("DV ~ log_additive(SIGMA)", "DV ~ log_additive(ADD_ERR)"),
     ("log(DV) ~ additive(SIGMA)", "log(DV) ~ additive(ADD_ERR)"),
+    (
+        "DV ~ log_combined(SIGMA_PROP, SIGMA_ADD)",
+        "DV ~ log_combined(PROP_ERR, ADD_ERR)",
+    ),
+    (
+        "log(DV) ~ combined(SIGMA_PROP, SIGMA_ADD)",
+        "log(DV) ~ combined(PROP_ERR, ADD_ERR)",
+    ),
     (
         "CMT=N: DV ~ TYPE(...) (per-endpoint, ODE models)",
         "CMT=2: DV ~ proportional(PROP_ERR)",
@@ -22131,6 +22138,9 @@ fn parse_error_model_inner(
     // Log-transform-both-sides (LTBS), additive error on the log scale:
     //   log(DV) ~ additive(SIGMA_NAME)   # natural-scale DV; engine logs DV + pred
     //   DV ~ log_additive(SIGMA_NAME)    # DV already log; engine logs the pred only
+    // LTBS with a natural-unit additive part, Var(log y) = PROP² + ADD²/F² (#2729):
+    //   log(DV) ~ combined(PROP, ADD)    # natural-scale DV
+    //   DV ~ log_combined(PROP, ADD)     # DV already log
     // Multi-endpoint (per-CMT dispatch, ODE models only):
     //   CMT=2: DV ~ proportional(PROP_ERR_PK)
     //   CMT=3: DV ~ additive(ADD_ERR_PD)
@@ -22222,8 +22232,11 @@ fn parse_error_model_inner(
         // commas (e.g. inside a future `min(a, b)`) don't fragment an argument.
         let mut sigma_names: Vec<String> = split_top_level_args(&caps[3]);
         // `log_additive` (case 1) is additive error whose prediction is logged
-        // while DV is taken as-is (already log-transformed in the data).
+        // while DV is taken as-is (already log-transformed in the data);
+        // `log_combined` is its combined counterpart (#2729).
         let type_is_log_additive = error_type == "log_additive";
+        let type_is_log_combined = error_type == "log_combined";
+        let type_is_log = type_is_log_additive || type_is_log_combined;
         // `power(SIGMA, P)` (#1182) — NONMEM's `Y = F + EPS(1) * F**THETA(n)`,
         // Pharmpy's `set_power_on_ruv`. The loading is the proportional one
         // raised to `P`, so the form *is* the proportional model plus an
@@ -22263,7 +22276,11 @@ fn parse_error_model_inner(
         let error_model = match error_type.as_str() {
             "additive" | "log_additive" => ErrorModel::Additive,
             "proportional" | "power" => ErrorModel::Proportional,
+            // Under LTBS `combined(PROP, ADD)` is the log-scale form whose additive
+            // part stays in natural units (#2729).
+            "combined" if lhs_logged => ErrorModel::LogCombined,
             "combined" => ErrorModel::Combined,
+            "log_combined" => ErrorModel::LogCombined,
             other => return Err(format!("Unknown error model: {}", other)),
         };
         if sigma_names.len() != error_model.n_sigma() {
@@ -22299,9 +22316,12 @@ fn parse_error_model_inner(
             }
             // Combined's argument order is (proportional, additive) — see
             // `ErrorModel::sigma_types` — so the weighted slot is the last one.
+            // `LogCombined` (#2729): dividing DV and the prediction by `W` leaves
+            // the log residual unchanged and turns `ADD/F` into `ADD·W/F`, so its
+            // natural-unit additive slot takes the weight, as `Combined`'s does.
             let slot = match error_model {
                 ErrorModel::Additive => 0,
-                ErrorModel::Combined => 1,
+                ErrorModel::Combined | ErrorModel::LogCombined => 1,
                 ErrorModel::Proportional => {
                     return Err(format!(
                         "[error_model] `weight = {}` has no effect on a purely proportional error \
@@ -22316,27 +22336,34 @@ fn parse_error_model_inner(
         }
 
         // LTBS validation. `log(DV) ~ log_additive(...)` double-logs the data and
-        // is rejected; LTBS only supports additive error on the log scale; and the
+        // is rejected; LTBS supports additive error on the log scale and the
+        // combined form with a natural-unit additive part (#2729); and the
         // per-CMT (multi-endpoint) form is out of scope for LTBS.
-        if lhs_logged && type_is_log_additive {
+        if lhs_logged && type_is_log {
+            let plain = if type_is_log_combined {
+                "combined"
+            } else {
+                "additive"
+            };
             return Err(format!(
-                "[error_model] `{}` double-log-transforms DV: use `log(DV) ~ additive(...)` \
-                 (engine logs DV) OR `DV ~ log_additive(...)` (DV already log), not both",
-                trimmed
+                "[error_model] `{trimmed}` double-log-transforms DV: use `log(DV) ~ {plain}(...)` \
+                 (engine logs DV) OR `DV ~ {error_type}(...)` (DV already log), not both"
             ));
         }
-        let log_transform = lhs_logged || type_is_log_additive;
-        if log_transform && !matches!(error_model, ErrorModel::Additive) {
+        let log_transform = lhs_logged || type_is_log;
+        if log_transform && !matches!(error_model, ErrorModel::Additive | ErrorModel::LogCombined) {
             return Err(format!(
-                "[error_model] log-transform-both-sides supports only additive error on the \
-                 log scale; use `log(DV) ~ additive(...)` or `DV ~ log_additive(...)`: {}",
+                "[error_model] log-transform-both-sides supports additive error on the log \
+                 scale (`log(DV) ~ additive(...)` / `DV ~ log_additive(...)`) and combined \
+                 proportional + additive error (`log(DV) ~ combined(PROP, ADD)` / \
+                 `DV ~ log_combined(PROP, ADD)`): {}",
                 trimmed
             ));
         }
         if log_transform && cmt_opt.is_some() {
             return Err(
-                "[error_model] log-transform-both-sides (`log(DV) ~ ...` / `log_additive`) \
-                 is not supported with per-CMT (multi-endpoint) error models"
+                "[error_model] log-transform-both-sides (`log(DV) ~ ...` / `log_additive` / \
+                 `log_combined`) is not supported with per-CMT (multi-endpoint) error models"
                     .to_string(),
             );
         }
@@ -22353,8 +22380,9 @@ fn parse_error_model_inner(
         let flags = LtbsFlags {
             log_transform,
             // `log(DV)` logs DV in the engine (data is natural scale);
-            // `log_additive` trusts the data is already on the log scale.
-            dv_pre_logged: type_is_log_additive,
+            // `log_additive` / `log_combined` trust the data is already on the
+            // log scale.
+            dv_pre_logged: type_is_log,
         };
 
         match cmt_opt {

@@ -10398,6 +10398,79 @@ fn test_ltbs_rejects_non_dv_lhs() {
     );
 }
 
+// ── #2729: combined proportional + additive under LTBS ───────────────────
+
+#[test]
+fn test_ltbs_log_dv_combined_is_log_combined() {
+    // `log(DV) ~ combined(PROP, ADD)`: engine logs DV; the additive part stays in
+    // natural units, so it is `LogCombined`, not the natural-scale `Combined`.
+    let m = model_with_error_block("  log(DV) ~ combined(SIG1, SIG2)").unwrap();
+    assert!(m.log_transform && !m.dv_pre_logged);
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+    assert!(matches!(
+        m.error_spec,
+        crate::types::ErrorSpec::Single(ErrorModel::LogCombined)
+    ));
+}
+
+#[test]
+fn test_ltbs_log_combined_case1() {
+    // `DV ~ log_combined(PROP, ADD)`: DV already log; only the prediction is logged.
+    let m = model_with_error_block("  DV ~ log_combined(SIG1, SIG2)").unwrap();
+    assert!(m.log_transform && m.dv_pre_logged);
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+}
+
+#[test]
+fn test_plain_combined_stays_natural_scale() {
+    let m = model_with_error_block("  DV ~ combined(SIG1, SIG2)").unwrap();
+    assert!(!m.log_transform);
+    assert_eq!(m.error_model, ErrorModel::Combined);
+}
+
+#[test]
+fn test_log_combined_rejects_the_forms_it_cannot_take() {
+    let err = model_with_error_block("  log(DV) ~ log_combined(SIG1, SIG2)").unwrap_err();
+    assert!(
+        err.contains("double-log")
+            && err.contains("`log(DV) ~ combined(...)`")
+            && err.contains("`DV ~ log_combined(...)`")
+            && !err.contains("additive(...)"),
+        "double-log names the combined spellings: {err}"
+    );
+    let err = model_with_error_block("  log(DV) ~ log_additive(SIG1)").unwrap_err();
+    assert!(
+        err.contains("`log(DV) ~ additive(...)`") && !err.contains("combined"),
+        "double-log on log_additive still names the additive spellings: {err}"
+    );
+    let err = model_with_error_block("  DV ~ log_combined(SIG1)").unwrap_err();
+    assert!(err.contains("expects 2 sigma(s) but 1 given"), "got: {err}");
+    let err = model_with_error_block("  CMT=1: log(DV) ~ combined(SIG1, SIG2)").unwrap_err();
+    assert!(err.contains("per-CMT"), "got: {err}");
+    let err = model_with_error_block("  CMT=1: DV ~ log_combined(SIG1, SIG2)").unwrap_err();
+    assert!(err.contains("per-CMT"), "got: {err}");
+    let err = model_with_error_block("  log(DV) ~ proportional(SIG1)").unwrap_err();
+    assert!(
+        err.contains("log(DV) ~ combined(PROP, ADD)"),
+        "the refusal names the combined LTBS form: {err}"
+    );
+}
+
+/// `weight = W` divides DV and the prediction by `W`: the log residual is unchanged and
+/// `ADD/F` becomes `ADD·W/F`, so the weight lands on the additive (second) slot.
+#[test]
+fn test_log_combined_weight_scales_the_additive_slot() {
+    let m = model_with_error_block("  log(DV) ~ combined(SIG1, SIG2) weight = TVV").unwrap();
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+    let mag = m
+        .ruv_magnitude
+        .as_ref()
+        .expect("weight desugars to a magnitude");
+    let row = mag.eval_obs(&m.default_params.theta, &HashMap::new(), 1.0, 1.0);
+    assert_eq!(row[0], 1.0, "proportional slot untouched: {row:?}");
+    assert_eq!(row[1], 10.0, "additive slot carries W = TVV: {row:?}");
+}
+
 #[test]
 fn test_ltbs_rejects_per_cmt() {
     // LTBS is single-endpoint only.
@@ -25833,7 +25906,7 @@ fn power_form_rejects_the_forms_it_cannot_combine_with() {
         "log(DV) ~ power(PROP_ERR, RUV_POW)",
     ));
     assert!(
-        err.contains("log-transform-both-sides supports only additive"),
+        err.contains("log-transform-both-sides supports additive error on the log scale"),
         "got: {err}"
     );
     let err = expect_parse_err(&POWER_MODEL.replace(
