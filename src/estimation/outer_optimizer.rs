@@ -6992,7 +6992,11 @@ fn optimize_nlopt_attempt_probed(
     // ranked in `leg_best`, the leg's own incumbent, instead of `best_seen`, which holds
     // objectives at the user's tolerance; `leg_first` is the leg's first feasible
     // objective, for its gain.
-    let verify_on = unprofiled_verify_enabled()
+    // No random effects → no inner solve to tighten, so the verification leg has nothing to
+    // re-solve at a different tolerance. On a 240-subject ODE-hazard model at `n_eta = 0`
+    // the leg is 12 evaluations / ~42% of the estimation time, gain 0 OFV (#2739 lead 5e).
+    let verify_on = (model.n_eta + model.n_kappa) > 0
+        && unprofiled_verify_enabled()
         && unprofiled_verify_applies(
             algo,
             gradient_run_has_reachable_stops(options),

@@ -3763,6 +3763,19 @@ fn ng_jets3(
     let n = eta.len();
     let term = NonGaussianTerm::new(model, subject);
     let f = FixedTheta { theta, term: &term };
+    // No random effects: only the value `q` is read (the gradient, Hessian and third
+    // derivative are empty), so evaluate it over `f64` instead of carrying a third-order
+    // Taylor jet through the ODE walk. On a 240-subject ODE-hazard model at `reltol = 1e-9`
+    // this removes ~50% of the per-evaluation cost (#2739 lead 5e).
+    if n == 0 {
+        let q = f.eval::<f64>(&[])?;
+        return (q.is_finite() && q < 1e19).then_some(NgJets {
+            q,
+            g: Vec::new(),
+            h: Vec::new(),
+            t: Vec::new(),
+        });
+    }
     macro_rules! go {
         ($p:literal) => {{
             const L: usize = crate::sens::taylor::binom($p + 3, 3);
