@@ -385,6 +385,77 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   covariates and `TIME` — including every `weight =` model — has no direct-θ
   channel at all, and keeps the fast closed forms everywhere.
 
+### On `CMT=N:` lines and in `if/else` branches {#endpoint-magnitude}
+
+A magnitude expression works on a [`CMT=N:`](#multiple-endpoints-per-cmt-error-models)
+line and inside a [covariate-selected `if/else`](#covariate-selected-error-models-ifelse)
+branch, under the same rules as a plain line
+([#2731](https://github.com/FeRx-NLME/ferx-core/issues/2731)). This is the usual joint
+model, a residual per endpoint with a factor on one of them:
+
+```
+[error_model]
+  CMT=1: DV ~ additive(S * (1.0 + (TPF - 1.0) * EARLY))
+  CMT=2: DV ~ additive(U)
+```
+
+The NONMEM spelling of the same idea sets the factor on one endpoint only:
+
+```fortran
+IF (CMT.EQ.2) THEN
+  IF (TAD.LT.3) PROP=THETA(6)*THETA(12)
+  IF (TAD.GE.3) PROP=THETA(6)
+ENDIF
+```
+
+The expression applies to the rows of its own endpoint, so two endpoints can share a sigma
+under different factors:
+
+```
+[error_model]
+  if (EARLY > 0.5) {
+    DV ~ additive(S * TPF)
+  } else {
+    DV ~ additive(S)
+  }
+```
+
+Restrictions on these forms:
+
+- **One statement cannot use a sigma twice with a factor.** `combined(S * TPF, S)` is
+  rejected, because a row holds one multiplier per sigma. Declare a second sigma.
+- **`weight =` and `power(...)` stay refused** on `CMT=N:` lines and in `if/else` branches.
+  Write the factor as a magnitude expression instead of a `weight =`.
+- **Adaptive dosing** (`simulate_adaptive*`) refuses a magnitude expression on a `CMT=N:`
+  line, because the assay draws from the bare sigma. It refuses a covariate-selected error
+  model in any case.
+
+#### Comparison with NONMEM {#endpoint-magnitude-nonmem-anchor}
+
+FOCEI objective at fixed parameters against NONMEM 7.5.1 at `MAXEVAL=0`, on a simulated
+two-dose, two-endpoint dataset where `EARLY` changes within each subject
+(`nonmem_anchor/ruv_endpoint_magnitude_*.ctl`, exercised by
+`tests/ruv_endpoint_magnitude_nonmem_anchor.rs`):
+
+| model | NONMEM 7.5.1 | ferx |
+|---|---:|---:|
+| factor on `CMT=1`, own sigma on `CMT=2` | −354.349028 | −354.349028 |
+| the same model at a second point | −294.153412 | −294.153412 |
+| single-statement workaround of the first row | −354.349028 | −354.349028 |
+| `TAD` factor on the proportional half of a `combined` endpoint | −185.934433 | −185.934433 |
+| one sigma on both endpoints, factor on one | −282.091324 | −282.091324 |
+| `if/else` branches sharing a sigma, factor on one | −200.188323 | −200.188323 |
+
+The largest gap is 6.8e-8. In ferx the `CMT=N:` lines and the single-statement workaround
+give the same objective. The workaround is:
+
+```
+DV ~ additive(S * ((1.0 + (TPF - 1.0) * EARLY) * (1.0 - ISUR) + TRU * ISUR))
+```
+
+It estimates the second endpoint's SD as the ratio `TRU = sd2/sd1` and needs both endpoints
+to share one error type, which the `CMT=N:` form does not.
+
 ## Residual weighting (`weight = ...`)
 
 > **Maturity: beta** ([#1029](https://github.com/FeRx-NLME/ferx-core/issues/1029)).
@@ -647,6 +718,8 @@ Rules and restrictions:
   for what the warning covers and when it stays silent.
 - **Estimation method.** Supported with FOCE/FOCEI, the Gauss-Newton
   optimizers, and SAEM (optionally followed by `imp`).
+- **Magnitude expressions** are accepted on a `CMT=N:` line
+  ([details](#endpoint-magnitude)).
 
 A complete worked model lives in [`examples/emax_pkpd.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/emax_pkpd.ferx)
 — an oral 1-compartment PK model with an effect-compartment Emax PD readout,
@@ -766,6 +839,11 @@ Rules and restrictions:
 - **`simulate()` validates the selector covariate** the same way `fit()` does: a
   selector covariate absent from the data is a hard `E_MISSING_COVARIATE` error,
   never silently read as 0.
+
+### Magnitude expressions in a branch
+
+A sigma argument in a branch may be a magnitude expression, and two branches may share a
+sigma under different factors. See [the rules](#endpoint-magnitude).
 
 ### Comparison with NONMEM
 

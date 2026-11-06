@@ -891,6 +891,74 @@ fn test_dose_before_same_time_obs_stays_post_dose() {
 }
 
 #[test]
+fn test_trough_after_a_co_timed_reset_moves_with_it() {
+    // #2728: EVID=3, obs, dose at one TIME. NONMEM scores the observation on the reset
+    // state. The trough moves one ULP below the dose, so the reset moves with it, staying
+    // ahead of it at that ULP; alone, the observation would read the pre-reset state.
+    let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,29,1.0,0,.\n\
+                   1,30,.,3,.\n\
+                   1,30,5.0,0,.\n\
+                   1,30,.,1,100\n\
+                   1,31,13.0,0,.\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+    let below = 30.0_f64.next_down();
+    assert_eq!(subj.obs_times, vec![29.0, below, 31.0]);
+    assert_eq!(
+        subj.reset_times,
+        vec![below],
+        "the reset moves with the trough"
+    );
+    assert!(
+        subj.doses.iter().any(|d| d.time == 30.0),
+        "doses are never moved"
+    );
+    // Each keeps the TIME it was written at, and the dose at the tie is not read one ULP
+    // late through the reset's offset.
+    assert_eq!(subj.param_time_at(below), 30.0);
+    assert_eq!(subj.param_time_at(30.0), 30.0);
+    assert_eq!(subj.param_time_at(31.0), 31.0);
+    assert_eq!(subj.obs_raw_times[1], 30.0);
+}
+
+#[test]
+fn test_reset_co_timed_with_a_post_dose_obs_stays() {
+    // The control for `test_trough_after_a_co_timed_reset_moves_with_it`: with the dose
+    // listed before the observation nothing moves, the reset included.
+    let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,30,.,3,.\n\
+                   1,30,.,1,100\n\
+                   1,30,5.0,0,.\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+    assert_eq!(subj.obs_times, vec![30.0]);
+    assert_eq!(subj.reset_times, vec![30.0]);
+    assert!(subj.reset_period_times.is_empty());
+}
+
+#[test]
+fn test_trough_before_a_co_timed_reset_reads_the_pre_reset_state() {
+    // The other file order: obs, EVID=3, dose. The reset shifts the rest of the record past
+    // the observation (`RESET_SEGMENT_GAP`), so the observation is pre-reset and nothing at
+    // its time needs the #614 move, and the reset is not moved either.
+    let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,30,5.0,0,.\n\
+                   1,30,.,3,.\n\
+                   1,30,.,1,100\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+    assert_eq!(subj.obs_times, vec![30.0]);
+    assert_eq!(subj.reset_times, vec![31.0]);
+}
+
+#[test]
 fn test_obs_before_ss_dose_is_nudged() {
     // #2510: an observation listed before a same-TIME SS dose reads the amounts carried from
     // the previous record, as before any other dose (NONMEM 7.5.1,

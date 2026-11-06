@@ -12146,6 +12146,235 @@ fn pkpd_model_str(error_block: &str) -> String {
     )
 }
 
+/// `pkpd_model_str` with a θ and a covariate for a magnitude expression to read (#2731).
+fn pkpd_magnitude_str(error_block: &str) -> String {
+    pkpd_model_str(error_block).replace(
+        "  theta TVV(50.0, 5.0, 500.0)\n",
+        "  theta TVV(50.0, 5.0, 500.0)\n  theta TPF(1.5, 0.1, 10.0)\n",
+    ) + "\n[covariates]\n  EARLY continuous\n"
+}
+
+/// `selected_err_model_str` with a θ for a magnitude expression to read (#2731).
+fn selected_magnitude_str(error_block: &str) -> String {
+    selected_err_model_str(error_block).replace(
+        "  theta TVV(50.0, 5.0, 500.0)\n",
+        "  theta TVV(50.0, 5.0, 500.0)\n  theta TPF(1.5, 0.1, 10.0)\n",
+    )
+}
+
+/// One subject with one observation per `(cmt, EARLY)` pair, for reading magnitude rows.
+fn magnitude_rows_subject(rows: &[(usize, f64)], cov: &str) -> Subject {
+    let mut s = Subject {
+        obs_cmts: rows.iter().map(|r| r.0).collect(),
+        obs_times: (0..rows.len()).map(|j| 1.0 + j as f64).collect(),
+        observations: vec![1.0; rows.len()],
+        obs_covariates: rows
+            .iter()
+            .map(|r| HashMap::from([(cov.to_string(), r.1)]))
+            .collect(),
+        ..Subject::default()
+    };
+    s.cens = vec![0; rows.len()];
+    s
+}
+
+/// #2731: an expression on a `CMT=N:` line scales its own endpoint's rows only, and the
+/// bare endpoint's rows stay at 1. `S` is shared, so a per-slot multiplier cannot tell the
+/// two endpoints apart: the row has to follow the endpoint.
+#[test]
+fn cmt_line_magnitude_follows_the_rows_endpoint() {
+    let model = parse_full_model(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ additive(ADD_ERR_PD * (1.0 + (TPF - 1.0) * EARLY))\n  \
+         CMT=2: DV ~ proportional(PROP_ERR_PK)\n",
+    ))
+    .unwrap()
+    .model;
+    assert!(model.has_custom_ruv_magnitude());
+    assert!(model.has_theta_dependent_ruv_magnitude());
+    assert!(model.referenced_covariates.iter().any(|c| c == "EARLY"));
+    let s = magnitude_rows_subject(&[(1, 1.0), (1, 0.0), (2, 1.0)], "EARLY");
+    let theta = &model.default_params.theta;
+    let rows = model.ruv_obs_mult(&s, theta).unwrap();
+    // Sigmas are flat in declaration order: PROP_ERR_PK = 0, ADD_ERR_PD = 1.
+    assert_eq!(rows[0], vec![1.0, 1.5], "CMT=1, EARLY=1");
+    assert_eq!(rows[1], vec![1.0, 1.0], "CMT=1, EARLY=0");
+    assert_eq!(rows[2], vec![1.0, 1.0], "CMT=2 is bare");
+}
+
+#[test]
+fn cmt_lines_sharing_a_sigma_carry_their_own_factors() {
+    let model = parse_full_model(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ additive(ADD_ERR_PD * TPF)\n  CMT=2: DV ~ additive(ADD_ERR_PD * 2.0)\n",
+    ))
+    .unwrap()
+    .model;
+    let s = magnitude_rows_subject(&[(1, 0.0), (2, 0.0)], "EARLY");
+    let rows = model.ruv_obs_mult(&s, &model.default_params.theta).unwrap();
+    assert_eq!(rows[0][1], 1.5);
+    assert_eq!(rows[1][1], 2.0);
+}
+
+/// Bare `CMT=N:` lines build no magnitude at all, so they keep the legacy variance path.
+#[test]
+fn bare_cmt_lines_build_no_magnitude() {
+    let model = parse_full_model(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ proportional(PROP_ERR_PK)\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n",
+    ))
+    .unwrap()
+    .model;
+    assert!(!model.has_custom_ruv_magnitude());
+    assert!(model.ruv_magnitude.is_none());
+}
+
+/// #2731: the row's branch is the one the selector picks, `else` included, and the keys
+/// `endpoint_magnitude_args` writes down are the ones `build_error_spec` hands out. Three
+/// branches, so a key off by one lands on a different factor rather than on nothing.
+#[test]
+fn if_else_magnitude_follows_the_selected_branch() {
+    let model = parse_full_model(&selected_magnitude_str(
+        "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL * TPF)\n  } else if (FREE == 1) {\n    \
+         DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_TOTAL * 3.0)\n  }",
+    ))
+    .unwrap()
+    .model;
+    let s = magnitude_rows_subject(&[(1, 0.0), (1, 1.0), (1, 2.0)], "FREE");
+    let rows = model.ruv_obs_mult(&s, &model.default_params.theta).unwrap();
+    assert_eq!(rows[0][0], 1.5, "first branch");
+    assert_eq!(rows[1][0], 1.0, "bare middle branch");
+    assert_eq!(rows[2][0], 3.0, "else branch");
+}
+
+/// The expression may read `TIME`, `TAD` and an inline `if`, as on a plain line.
+#[test]
+fn endpoint_magnitude_reads_tad_and_an_inline_if() {
+    let model = parse_full_model(&selected_magnitude_str(
+        "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL * (if (TAD < 3.0) TPF else 1.0))\n  \
+         } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+    ))
+    .unwrap()
+    .model;
+    let mut s = magnitude_rows_subject(&[(1, 0.0), (1, 0.0), (1, 0.0), (1, 0.0)], "FREE");
+    s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let rows = model.ruv_obs_mult(&s, &model.default_params.theta).unwrap();
+    assert_eq!(rows[1][0], 1.5, "TAD = 2");
+    assert_eq!(rows[3][0], 1.0, "TAD = 4");
+}
+
+/// The rules of a plain line hold on an endpoint line, and the diagnostic names the line.
+/// A case per rule; the `CMT=1:` / branch label is what a multi-line block needs to be
+/// actionable, so each message asserts it next to the rule.
+#[test]
+fn endpoint_magnitude_keeps_the_plain_line_rules() {
+    for (arg, want) in [
+        ("TPF * 2.0", "references no declared sigma"),
+        ("PROP_ERR_PK * ADD_ERR_PD", "references multiple sigmas"),
+        ("ADD_ERR_PD * ETA_CL", "random effect"),
+        ("ADD_ERR_PD * CL", "undeclared covariate `CL`"),
+        ("ADD_ERR_PD * IPRED", "may not reference `IPRED`"),
+        ("ADD_ERR_PD * NOPE", "undeclared covariate `NOPE`"),
+    ] {
+        let err = expect_parse_err(&pkpd_magnitude_str(&format!(
+            "  CMT=1: DV ~ additive(ADD_ERR_PD)\n  CMT=2: DV ~ additive({arg})\n"
+        )));
+        assert!(err.contains(want), "{arg}: {err}");
+        assert!(err.contains("[error_model] CMT=2:"), "{arg}: {err}");
+        assert!(!err.contains("unknown sigma"), "{arg}: {err}");
+    }
+}
+
+#[test]
+fn if_else_magnitude_diagnostics_name_the_branch() {
+    for (block, want) in [
+        (
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL * NOPE)\n  } else {\n    \
+             DV ~ proportional(PROP_UNBOUND)\n  }",
+            "[error_model] if/else branch 1:",
+        ),
+        (
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    \
+             DV ~ proportional(PROP_UNBOUND * NOPE)\n  }",
+            "[error_model] `else` branch:",
+        ),
+    ] {
+        let err = expect_parse_err(&selected_magnitude_str(block));
+        assert!(err.contains(want), "{err}");
+        assert!(err.contains("undeclared covariate `NOPE`"), "{err}");
+    }
+    // Zero and two sigmas: the plain-line wording, not the "unknown sigma" it used to be.
+    let err = expect_parse_err(&selected_magnitude_str(
+        "  if (FREE == 0) {\n    DV ~ proportional(TPF * 2.0)\n  } else {\n    \
+         DV ~ proportional(PROP_UNBOUND)\n  }",
+    ));
+    assert!(err.contains("references no declared sigma"), "{err}");
+    assert!(!err.contains("unknown sigma"), "{err}");
+    let err = expect_parse_err(&selected_magnitude_str(
+        "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL * PROP_UNBOUND)\n  } else {\n    \
+         DV ~ proportional(PROP_UNBOUND)\n  }",
+    ));
+    assert!(err.contains("references multiple sigmas"), "{err}");
+}
+
+/// A typo'd bare name on a `CMT=N:` line keeps its wording and its endpoint.
+#[test]
+fn bare_typo_on_a_cmt_line_is_still_an_unknown_sigma() {
+    let err = expect_parse_err(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ additive(ADD_ERR_PD)\n  CMT=2: DV ~ additive(NOPE)\n",
+    ));
+    assert!(
+        err.contains("[error_model] CMT=2: references unknown sigma 'NOPE'"),
+        "{err}"
+    );
+}
+
+/// A row holds one multiplier per sigma slot, so a statement whose two arguments share a
+/// sigma cannot carry a factor on either; both orders of the pair are refused. Two bare
+/// arguments have no factor to misplace and parse as they always did.
+#[test]
+fn one_statement_cannot_share_a_sigma_with_a_magnitude() {
+    for args in [
+        "ADD_ERR_PD * TPF, ADD_ERR_PD",
+        "ADD_ERR_PD, ADD_ERR_PD * TPF",
+    ] {
+        let err = expect_parse_err(&pkpd_magnitude_str(&format!(
+            "  CMT=1: DV ~ combined({args})\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n"
+        )));
+        assert!(err.contains("[error_model] CMT=1:"), "{args}: {err}");
+        assert!(err.contains("declare a second sigma"), "{args}: {err}");
+        assert!(err.contains("uses sigma 'ADD_ERR_PD'"), "{args}: {err}");
+    }
+    parse_full_model(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ combined(ADD_ERR_PD, ADD_ERR_PD)\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n",
+    ))
+    .expect("bare repeats are unchanged");
+}
+
+/// `weight =` and `power(...)` stay refused on these forms, as the docs say.
+#[test]
+fn weight_and_power_stay_refused_on_endpoint_forms() {
+    let err = expect_parse_err(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ additive(ADD_ERR_PD * TPF) weight = EARLY\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n",
+    ));
+    assert!(
+        err.contains("`weight = …` is not supported with per-CMT"),
+        "{err}"
+    );
+    let err = expect_parse_err(&pkpd_magnitude_str(
+        "  CMT=1: DV ~ power(ADD_ERR_PD * TPF, TPF)\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n",
+    ));
+    assert!(
+        err.contains("`power(...)` is not supported with per-CMT"),
+        "{err}"
+    );
+    let err = expect_parse_err(&selected_magnitude_str(
+        "  if (FREE == 0) {\n    DV ~ power(PROP_TOTAL * TPF, TPF)\n  } else {\n    \
+         DV ~ proportional(PROP_UNBOUND)\n  }",
+    ));
+    assert!(
+        err.contains("`power(...)` is not supported inside"),
+        "{err}"
+    );
+}
+
 #[test]
 fn test_per_cmt_error_model_parses() {
     let model = parse_full_model(&pkpd_model_str(
