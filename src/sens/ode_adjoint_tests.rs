@@ -5450,6 +5450,216 @@ fn circadian_sin_cos_matches_reconverged_fd() {
     }
 }
 
+/// #2603: a bounded Gaussian endpoint read through `pnorm`, the random effect inside the
+/// link. The FOCE/FOCEI gradient differentiates the lifted `φ`, the Laplace exact anchor's
+/// taped Hessian `φ′`, and the covariance step's nested dual `φ″`/`φ‴` — each against the
+/// reconverged FD of the production objective.
+#[test]
+fn pnorm_link_matches_reconverged_fd() {
+    let model = crate::parser::model_parser::parse_full_model(
+        r#"
+[parameters]
+  theta TVL(-0.2, -5.0, 5.0)
+  theta SLOPE(0.08, -1.0, 1.0)
+  omega ETA_L ~ 0.3
+  omega ETA_S ~ 0.05
+  sigma ADD ~ 0.05 (sd)
+[individual_parameters]
+  LP = TVL + ETA_L + SLOPE * exp(ETA_S)
+[structural_model]
+  y = pnorm(LP + SLOPE * TIME * exp(ETA_S))
+[error_model]
+  DV ~ additive(ADD)
+"#,
+    )
+    .unwrap()
+    .model;
+    assert!(model.is_algebraic());
+    let s = subject(&model, vec![], &TIMES, &[0.2, -0.1]);
+    assert!(
+        in_scope(&model, &s),
+        "the compartment-free recorder must serve a pnorm subject"
+    );
+    let g = fd_oracle(&model, &s, true);
+    eprintln!("pnorm FOCEI gradient vs reconverged FD {g:.2e}");
+    assert!(g < 1e-5, "FOCEI gradient vs FD {g:.2e}");
+    let g = fd_oracle(&model, &s, false);
+    eprintln!("pnorm FOCE gradient vs reconverged FD {g:.2e}");
+    assert!(g < FOCE_FD_TOL, "FOCE gradient vs FD {g:.2e}");
+    let g = fd_oracle_agq(&model, &s, 1, true);
+    eprintln!("pnorm Laplace gradient vs reconverged FD {g:.2e}");
+    assert!(g < 1e-5, "Laplace gradient vs FD {g:.2e}");
+    for (objective, name) in [
+        (Objective::Focei, "FOCEI"),
+        (
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+            "Laplace",
+        ),
+    ] {
+        let (fd, _) = hessian_gaps_for(&model, &s, objective);
+        eprintln!("pnorm {name} Hessian vs reconverged FD {fd:.2e}");
+        assert!(fd < 1e-5, "{name} Hessian vs FD {fd:.2e}");
+    }
+}
+
+/// #2603: the `[binary_model]` probit term on every adjoint route — the outer gradient
+/// under FOCEI and FOCE, the Laplace and AGQ(3) gradients, and the covariance step's
+/// Hessian under each objective — against the reconverged FD of the production objective.
+/// The predictor carries the random effect nonlinearly (`exp(0.5·η)` on the time slope), so
+/// every order of the lifted `−log Φ` is live: `g′` in the gradients, `g″` in the Laplace
+/// log-determinant, `g‴`/`g⁗` in its gradient and the R-matrix. The model-level gates are
+/// asserted first, so the test cannot pass on a finite-difference fallback.
+///
+/// The records put `y = 1` at a strongly negative predictor and `y = 0` at a positive one,
+/// so `s = 2y − 1` takes both signs on records where `m` is far from its `lp = 0` value.
+#[cfg(feature = "survival")]
+#[test]
+fn the_probit_binary_term_is_exact_on_every_adjoint_route() {
+    use crate::types::ObsRecord;
+    let model = parse_model_string(
+        "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
+         omega ETA_I ~ 0.3\n[binary_model]\n  cmt    = 3\n  link   = probit\n  \
+         probit = TH0 + ETA_I + THT * TIME * exp(0.5 * ETA_I)\n",
+    )
+    .unwrap();
+    let rows = [
+        (0.0, 0),
+        (1.0, 1),
+        (2.0, 1),
+        (4.0, 0),
+        (6.0, 1),
+        (9.0, 0),
+        (-8.0, 1),
+    ];
+    let s = Subject {
+        id: "1".into(),
+        obs_records: rows
+            .iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                raw_time: time,
+                state,
+                cmt: 3,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    assert!(outer_model_in_scope(&model), "the outer route is analytic");
+    let mut gaps = Vec::new();
+    for interaction in [true, false] {
+        gaps.push((
+            format!("outer interaction={interaction}"),
+            fd_oracle(&model, &s, interaction),
+        ));
+    }
+    for (n_agq, exact) in [(1, true), (3, true), (3, false)] {
+        gaps.push((
+            format!("AGQ n_agq={n_agq} exact={exact}"),
+            fd_oracle_agq(&model, &s, n_agq, exact),
+        ));
+    }
+    for objective in [
+        Objective::Focei,
+        Objective::Foce,
+        Objective::Agq {
+            n_agq: 1,
+            exact: true,
+        },
+        Objective::Agq {
+            n_agq: 3,
+            exact: true,
+        },
+    ] {
+        assert!(
+            super::cov_non_gaussian_served(&model, objective),
+            "{objective:?}: the model-level gate serves the probit term"
+        );
+        gaps.push((
+            format!("cov {objective:?}"),
+            hessian_gaps_for(&model, &s, objective).0,
+        ));
+    }
+    for (what, gap) in &gaps {
+        eprintln!("probit {what}: {gap:.2e}");
+        assert!(gap.is_finite(), "{what}: {gap}");
+    }
+    // Measured, macOS arm64 and Linux aarch64 alike: every gradient 1.9e-11, every R-matrix
+    // 3.8e-11 — the oracles' floor. 1e-9 keeps 26–50× headroom over it (review r1 #6); the
+    // file's shared bounds (5e-7, 1e-5) would pass a 1e-4 relative error in `g‴` / `g⁗`.
+    for (what, gap) in &gaps {
+        let bound = 1e-9;
+        assert!(*gap < bound, "{what}: {gap:.2e}");
+    }
+}
+
+/// #2603: the inner loop's exact η-gradient and η-Hessian of the probit term
+/// (`discrete_subject_eta_grad` / `discrete_subject_eta_hessian`) against central
+/// differences of the value path `discrete_subject_nll`, which shares no derivative code
+/// with them. Mutation: the probit arm's `g″` zeroed (the Hessian), or `s` dropped (both).
+#[cfg(feature = "survival")]
+#[test]
+fn the_probit_inner_eta_derivatives_match_fd_of_the_value() {
+    use crate::categorical::{
+        discrete_subject_eta_grad, discrete_subject_eta_hessian, discrete_subject_nll,
+    };
+    use crate::types::ObsRecord;
+    let model = parse_model_string(
+        "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
+         omega ETA_I ~ 0.3\n  omega ETA_T ~ 0.1\n[binary_model]\n  cmt    = 3\n  \
+         probit = TH0 + ETA_I + THT * TIME * exp(ETA_T)\n",
+    )
+    .unwrap();
+    let s = Subject {
+        id: "1".into(),
+        obs_records: [(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)]
+            .iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                raw_time: time,
+                state,
+                cmt: 3,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let theta = [-0.3, 0.2];
+    let eta = [0.4, -0.3];
+    let f = |e: &[f64]| discrete_subject_nll(&model, &s, &theta, e);
+    let (v, g) = discrete_subject_eta_grad(&model, &s, &theta, &eta).expect("exact gradient");
+    let (vh, h) = discrete_subject_eta_hessian(&model, &s, &theta, &eta).expect("exact Hessian");
+    assert_eq!(v.to_bits(), f(&eta).to_bits());
+    assert_eq!(vh.to_bits(), f(&eta).to_bits());
+    let st = 1e-5;
+    let at = |i: usize, d: f64| {
+        let mut e = eta;
+        e[i] += d;
+        e
+    };
+    for i in 0..2 {
+        let fd = (f(&at(i, st)) - f(&at(i, -st))) / (2.0 * st);
+        assert!(g[i].is_finite() && fd.is_finite());
+        assert!((g[i] - fd).abs() < 1e-8, "∂/∂η{i}: {} vs FD {fd}", g[i]);
+        let gp = discrete_subject_eta_grad(&model, &s, &theta, &at(i, st))
+            .unwrap()
+            .1;
+        let gm = discrete_subject_eta_grad(&model, &s, &theta, &at(i, -st))
+            .unwrap()
+            .1;
+        for j in 0..2 {
+            let fd = (gp[j] - gm[j]) / (2.0 * st);
+            assert!(h[(i, j)].is_finite() && fd.is_finite());
+            assert!(
+                (h[(i, j)] - fd).abs() < 1e-7,
+                "H[{i},{j}]: {} vs FD {fd}",
+                h[(i, j)]
+            );
+        }
+    }
+}
+
 #[test]
 fn mixture_class_gradient_matches_reconverged_fd_under_the_class_guard() {
     let src = r#"

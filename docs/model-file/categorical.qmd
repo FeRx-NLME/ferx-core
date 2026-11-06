@@ -20,7 +20,8 @@ logit = TH0 + THX * X + THT * TIME     ; log-odds of P(DV = 1)
 ```
 
 Observations for the block's `cmt` carry `DV ∈ {0, 1}` (`EVID = 0`). The model
-computes a per-observation probability
+computes a per-observation probability (under the default logit link; see [The probit
+link](#the-probit-link) for the other)
 
 $$
 p = \operatorname{logit}^{-1}(\eta_\text{lp}) = \frac{1}{1 + e^{-\eta_\text{lp}}},
@@ -40,8 +41,40 @@ $$
 | Key | Required | Meaning |
 |-----|----------|---------|
 | `cmt`   | yes | Data-file `CMT` column value for this endpoint's rows. |
-| `logit` | yes | Linear predictor (log-odds of `DV = 1`). Any θ/η/covariate/`[individual_parameters]`/`TIME` expression. |
-| `link`  | no  | Link function. Only `logit` is available; `probit`/`cloglog` are planned. |
+| `logit` | one of `logit` / `probit` | Linear predictor under the logit link (log-odds of `DV = 1`). Any θ/η/covariate/`[individual_parameters]`/`TIME` expression. |
+| `probit` | one of `logit` / `probit` | The same linear predictor under the probit link (see [The probit link](#the-probit-link)). |
+| `link`  | no  | `logit` (the default) or `probit`. It must agree with the predictor's key. |
+
+### The probit link
+
+Write the predictor under `probit =` instead of `logit =` and the model computes
+
+$$
+p = \Phi(\eta_\text{lp}),
+$$
+
+the standard-normal CDF of the linear predictor, which is NONMEM's `P = PHI(LP)` and R's
+`glm(..., family = binomial(link = "probit"))`. `link = probit` may be added, but it is
+implied by the key:
+
+```ini
+[binary_model]
+cmt    = 3
+probit = TH0 + THX * X + ETA_I        ; P(DV = 1) = Phi(...)
+```
+
+The key names the link, so a predictor is never called `logit` when it is not one. A
+block with `link = probit` and a `logit =` predictor (or the other way round) is refused,
+and so is a block that gives both keys. `cloglog` is not available.
+
+The data term is the same Bernoulli likelihood, computed as `−log Φ(s·η_lp)` with
+`s = +1` for `DV = 1` and `−1` for `DV = 0`. It is evaluated in log space, and in the lower tail (where `Φ`
+would underflow) it never forms `Φ` at all, so a record far in either tail (an event at
+`η_lp = −40`, say) contributes its exact `≈ η_lp²/2` rather than `log(0)`. The gradient, the η-Hessian and the covariance
+step's derivatives are exact, as under logit.
+
+The probit link is anchored against NONMEM `METHOD=COND LAPLACE LIKE` with `P = PHI(LP)`
+on a 2400-row binary meta-analysis fixture (`probit_b1` in `nonmem_anchor/README.md`).
 
 ### Random effects and the fixed-effects special case
 
@@ -64,7 +97,8 @@ at baseline.
 A θ level block (`theta PLACEBO[STUDY, TIME](0.0)`) may be read in the predictor, as in
 a binary model-based meta-analysis: each record is scored at the level its own columns
 name, and the binary records define the block's levels as Gaussian observations do (see
-[θ level blocks](parameters.qmd)). It cannot be `profile`d there yet (#2111).
+[θ level blocks](parameters.qmd)). It may also be `profile`d there, under either link
+(see [Through a link](parameters.qmd#through-a-link)).
 
 ## Data format
 

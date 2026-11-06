@@ -56,6 +56,7 @@ name from quietly reading as zero and collapsing the formula.
 | `tanh()` | `tanh(0.4 * (WT - 70) / 12)` |
 | `softplus()` | `softplus(Z_CL)` |
 | `sin()`, `cos()` (radians) | `AMP * cos(2 * 3.141592653589793 * (TIME - PHS) / 24)` |
+| `pnorm()` (normal CDF Φ) | `P = pnorm(TVL + ETA_P)` |
 | `min(a, b)`, `max(a, b)` | `max(TVCL * WT / 70, 0.1)` |
 | `clamp(x, lo, hi)` | `clamp(ACR20, 0.01, 0.99)` |
 | `present(x)` (condition only) | `if (present(WT)) (WT/70)^0.75 else 1.0` |
@@ -85,7 +86,7 @@ naming the call and listing what is available:
 
 ```
 unknown function `sinh`. Supported: exp, log, ln, sqrt, abs, floor, ceil, round,
-logit, inv_logit, expit, tanh, softplus, sin, cos, min(a, b), max(a, b),
+logit, inv_logit, expit, tanh, softplus, sin, cos, pnorm, min(a, b), max(a, b),
 clamp(x, lo, hi), present(x) (conditions only)
 ```
 
@@ -146,6 +147,25 @@ data supports, and when an η̂ for the phase lands far out in the tail, check t
 subject's fit before trusting it. In `[odes]`, `sin` and `cos` run on the
 right-hand-side interpreter rather than native code, and the fit says so
 ([which engine ran it](ode-models.qmd#rhs-route-note)); the results are the same.
+
+### The normal CDF: `pnorm` {#normal-cdf}
+
+`pnorm(x)` is the standard-normal CDF `Φ(x)`, NONMEM's `PHI(x)` and R's `pnorm(x)`
+([#2603](https://github.com/FeRx-NLME/ferx-core/issues/2603)). It is a probit link
+written out: a bounded endpoint read as `y = pnorm(LP)` is the probit form of
+`y = inv_logit(LP)`, and a profiled θ level block may be read through it the same way
+([Through a link](parameters.qmd#through-a-link)). For a binary outcome use
+`[binary_model] probit = LP` instead ([The probit link](categorical.qmd#the-probit-link)),
+which scores the Bernoulli term without forming `Φ`.
+
+It is accurate to `f64` rounding in both tails: down to `x = −37` it is the
+incomplete-gamma form of `Φ`, and below that `φ(x)` divided by the inverse Mills ratio
+from its continued fraction, so it keeps its digits into the subnormals and is `0` only
+once `Φ(x)` is too (about `x = −38.5`). Above about `x = 8.3`, `Φ(x)` is `1` in `f64`, and
+`pnorm` returns `1`. `log(pnorm(x))` therefore is `−inf` below about `−38.5`; a likelihood
+that needs `log Φ` far in the tail belongs in `[binary_model]`, which works in log space.
+Its derivatives are exact on both loops and in the covariance step. In `[odes]` it runs on
+the right-hand-side interpreter, as `sin` and `cos` do.
 
 ### Piecewise-constant functions and `mod` {#piecewise-constant-functions}
 
