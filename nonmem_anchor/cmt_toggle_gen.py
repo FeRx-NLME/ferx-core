@@ -110,6 +110,8 @@ CASES = [
     ([dose(0), obs(2, 2, 17), off(4), reset(4), dose(4.5), obs(6, 2, 10), obs(8, 2, 20)], 0, 0, 0),
     # 30 a reset, then off, at one TIME: the compartment stays off until the on row
     ([dose(0), obs(2, 2, 17), reset(4), off(4), dose(4.5), on(5), obs(6, 2, 10), obs(8, 2, 20)], 0, 0, 0),
+    # 31 reset, observe, dose, off at one TIME: the observation reads the reset state
+    ([dose(0), obs(2, 2, 17), reset(4), obs(4, 2, 1), dose(4, 100, 1), off(4), on(5), obs(6, 2, 10)], 0, 0, 0),
 ]
 
 

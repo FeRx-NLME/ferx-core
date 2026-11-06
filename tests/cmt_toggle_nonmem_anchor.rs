@@ -15,6 +15,8 @@
 //!   Input elsewhere carries on (ID 9, 22).
 //! - A reset turns every compartment on (ID 15, 16), and takes effect in file order against
 //!   an off row at its own `TIME`: it undoes one before it (ID 29), not one after it (ID 30).
+//!   An observation listed after it, ahead of a dose, reads the reset state when an off row
+//!   shares the tie too (ID 31), which is #2728's rule meeting this pass.
 //! - Co-timed records take effect in file order (ID 5, 17, 18, 19, 20). IDs 25 to 28 are
 //!   the ties the #614 and #1810 passes leave wrong, so only `order_cmt_toggle_ties`
 //!   orders them: an infusion before an off row (25), an observation between a dose and
@@ -32,7 +34,7 @@ use ferx_core::{CompiledModel, Population};
 use std::path::{Path, PathBuf};
 
 /// `METHOD=1 INTER MAXEVAL=0` objective, from `results/cmt_toggle.ext`.
-const NM_OFV: f64 = 19834.949763454737;
+const NM_OFV: f64 = 19834.101869724269;
 /// Measured on macOS arm64: worst 5.4e-15 on the linear route and in the states, 6.2e-13 on
 /// `rodas5p`, 1.5e-11 on `rk45` at `1e-10` tolerances. Bound set from the last, with about
 /// 70× headroom for the solvers' platform variation.

@@ -1920,7 +1920,14 @@ fn order_cmt_toggle_ties(
             place(item, at);
             last_rank = rank(item);
         }
-        // Downward from the first dose.
+        // Downward from the first dose. Not past a reset: #614 moves a reset with the
+        // observations it precedes (#2728), and an observation moved here would leave that
+        // pass nothing to find, so it would land below the reset and read the state before
+        // it. With a reset at the tie no on/off row is in this stretch, `below_a_reset`
+        // having refused one, so nothing here needs this pass.
+        if resets.contains(&t) {
+            continue;
+        }
         let (mut at, mut next_rank) = (t, 0);
         for &item in items[..first_dose.unwrap_or(0)].iter().rev() {
             if at == t || rank(item) > next_rank {
