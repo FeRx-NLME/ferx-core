@@ -8186,10 +8186,15 @@ fn ruv_magnitude_run(
 }
 
 /// #2741 (single-endpoint forms) and #2731 (`CMT=N:` lines): the assay draws from
-/// `assay_resid_var`, which never evaluates a residual-error magnitude, so each form
-/// below was dropped from the `Dv` draw with the run reporting success — measured on
-/// #2741: a tenfold multiplier and a cubed `power` loading left every reading
-/// bit-identical to the bare model's.
+/// `assay_resid_var`, which never evaluates a residual-error magnitude, so under a `Dv`
+/// monitor each form below was dropped from the draw with the run reporting success —
+/// measured on #2741: a tenfold multiplier and a cubed `power` loading left every
+/// reading bit-identical to the bare model's.
+///
+/// The refusal is unconditional, and these fixtures carry no `Dv` monitor (`fixed_bolus`
+/// under default options, `simple_titration_spec` without assay error): a run that reads
+/// no residual error was correct and is refused anyway, until #2741's lift applies the
+/// magnitude in the assay. The test pins the gate, not the `Dv` path.
 ///
 /// One test holds both sides of the gate: each bare twin (single-endpoint and `CMT=N:`)
 /// runs through both entry points, so each `Err` is this reject and nothing else; each

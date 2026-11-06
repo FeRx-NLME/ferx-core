@@ -393,8 +393,9 @@ Adaptive dosing (`simulate_adaptive*`) refuses any residual-error magnitude
 [`weight =`](#residual-weighting-weight-...), a [`power(...)`](#power) exponent,
 or a magnitude on a `CMT=N:` line. The controller assay draws a `Dv` reading
 from the bare sigma, so the factor would otherwise be dropped from the signal
-while the run reported success (#2741). Plain `simulate()` applies the
-magnitude.
+while the run reported success (#2741). The refusal applies to every adaptive run
+on such a model, including one with only `Ipred` monitors, which reads no residual
+error. Plain `simulate()` applies the magnitude.
 
 ### On `CMT=N:` lines and in `if/else` branches {#endpoint-magnitude}
 

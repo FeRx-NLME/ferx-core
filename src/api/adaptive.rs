@@ -63,6 +63,11 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
 /// the factor had applied — measured on #2741: a tenfold multiplier and a cubed loading
 /// left every `Dv` reading bit-identical to the bare model's.
 ///
+/// The assay is the only reader of the residual error, so a run with no `Dv` monitor
+/// (and a spec without assay error) was correct, and is refused too: the check runs on
+/// the model alone, before the options are looked at, like the `Selected` reject above.
+/// #2741's lift, applying the magnitude in the assay, removes the refusal for both.
+///
 /// One gate, [`RuvMagnitude::is_active`](crate::types::RuvMagnitude::is_active), so the
 /// single-endpoint and endpoint-keyed forms cannot drift apart.
 fn reject_ruv_magnitude_for_adaptive(model: &CompiledModel) -> Result<(), EngineError> {
