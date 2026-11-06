@@ -212,12 +212,16 @@ pub fn run_foce_gn(
         // #2777: one subject whose EBE mode sits near a fold can own the step
         // direction through its `tᵢ`, which is exact at the point and wrong over any
         // step GN can take. After a run of unclamped rejections, take such a subject
-        // back to its raw score `gᵢ`; the BHHH matrix already uses `gᵢ`.
+        // back to its raw score `gᵢ`; the BHHH matrix already uses `gᵢ`. Only the
+        // coordinates the step can move count: a FIX one, or one held on its bound,
+        // played no part in the rejections.
         for &s in &raw_score_subjects {
             drop_ebe_response(&mut grad, &mut per_subj_t[s]);
         }
         if unclamped_stalls >= GN_DOMINANT_SUBJECT_STALLS {
-            if let Some(s) = dominant_ebe_response_subject(&per_subj_t, &grad, &gn_scale) {
+            let held = bound_active_outward(&x, &grad, &bounds);
+            let free: Vec<bool> = (0..n_packed).map(|i| !fixed_mask[i] && !held[i]).collect();
+            if let Some(s) = dominant_ebe_response_subject(&per_subj_t, &grad, &gn_scale, &free) {
                 drop_ebe_response(&mut grad, &mut per_subj_t[s]);
                 raw_score_subjects.push(s);
                 warnings.push(format!(
@@ -242,7 +246,8 @@ pub fn run_foce_gn(
         // pinned value; this form guarantees the Cholesky solve gives
         // `delta[i] = 0` exactly (rather than relying on the clamp to hide a
         // large, meaningless step). A coordinate on a bound whose descent points
-        // out of the box is held the same way for this iteration (#2777).
+        // out of the box is held the same way for this iteration (#2777); read
+        // after any raw-score switch above, which can change the gradient's sign.
         let held = bound_active_outward(&x, &grad, &bounds);
         for i in 0..n_packed {
             if fixed_mask[i] || held[i] {
@@ -971,10 +976,13 @@ const GN_DOMINANT_SUBJECT_RATIO: f64 = 10.0;
 /// `‖tᵢ‖∞` is at least [`GN_DOMINANT_SUBJECT_RATIO`] times every other subject's, and on
 /// some coordinate its contribution `2·tᵢ[k]` outweighs the rest of the gradient
 /// `grad[k] − 2·tᵢ[k]`. With fewer than two subjects there is nothing to compare against.
+/// Both tests read only the coordinates `free` marks: a FIX coordinate, or one held on
+/// its bound, never entered the steps that were rejected.
 fn dominant_ebe_response_subject(
     per_subj_t: &[Vec<f64>],
     grad: &DVector<f64>,
     scale: &[f64],
+    free: &[bool],
 ) -> Option<usize> {
     if per_subj_t.len() < 2 {
         return None;
@@ -984,7 +992,9 @@ fn dominant_ebe_response_subject(
         .map(|t| {
             t.iter()
                 .zip(scale)
-                .map(|(tk, sk)| (tk * sk).abs())
+                .zip(free)
+                .filter(|(_, &f)| f)
+                .map(|((tk, sk), _)| (tk * sk).abs())
                 .fold(0.0, f64::max)
         })
         .collect();
@@ -1004,7 +1014,7 @@ fn dominant_ebe_response_subject(
     let sets_direction = per_subj_t[s]
         .iter()
         .enumerate()
-        .any(|(k, &tk)| (2.0 * tk).abs() > (grad[k] - 2.0 * tk).abs());
+        .any(|(k, &tk)| free[k] && (2.0 * tk).abs() > (grad[k] - 2.0 * tk).abs());
     sets_direction.then_some(s)
 }
 
@@ -3355,6 +3365,33 @@ mod tests {
         assert!((taken_step_reduction(&g, &h, &x, &x_try, &[1.0, 2.0]) - 0.375).abs() < 1e-12);
     }
 
+    /// #2777: a step that crosses a bound before the coordinate is active is judged on
+    /// the step taken. Unbounded, this fixture's TVV ends at 49.868 from its start of 50;
+    /// a lower bound of 49.95 sits between the two, so the first step clamps TVV. On the
+    /// taken step the first iteration is accepted and the fit moves onto the bound; on
+    /// the unclamped prediction rho credits the clamped share and rejects it, and the
+    /// one-iteration fit stays at the start.
+    #[test]
+    fn a_step_clamped_by_a_bound_is_judged_on_the_step_taken() {
+        let mut model = make_model();
+        model.default_params.theta_lower[1] = 49.9999;
+        model.default_params.omega_fixed = vec![true];
+        model.default_params.sigma_fixed = vec![true];
+        let pop = make_population();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceGn,
+            outer_maxiter: 1,
+            run_covariance_step: false,
+            ..Default::default()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(
+            (res.params.theta[1] / 49.9999 - 1.0).abs() < 1e-12,
+            "the first step must be accepted onto the TVV bound: TVV = {}",
+            res.params.theta[1]
+        );
+    }
+
     /// #2777: a subject is dominant only when its scaled `‖tᵢ‖∞` is at least 10× every
     /// other subject's *and* it outweighs the rest of the gradient on some coordinate.
     /// Each condition is broken alone, and the passing case is the issue's measured one
@@ -3362,6 +3399,7 @@ mod tests {
     #[test]
     fn dominant_ebe_response_subject_needs_both_dominance_and_direction() {
         let scale = [1.0, 1.0];
+        let free = [true, true];
         let others = vec![vec![1.0, 0.2]; 4];
         let with = |t: Vec<f64>| {
             let mut all = others.clone();
@@ -3378,34 +3416,65 @@ mod tests {
         };
         let ts = with(vec![4919.0, 3.0]);
         let g = grad_for(&ts, [-192.0, 30.0]);
-        assert_eq!(dominant_ebe_response_subject(&ts, &g, &scale), Some(2));
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &free),
+            Some(2)
+        );
 
         // Under 10× the runner-up: not dominant.
         let ts = with(vec![9.0, 0.0]);
         let g = grad_for(&ts, [-192.0, 30.0]);
-        assert_eq!(dominant_ebe_response_subject(&ts, &g, &scale), None);
+        assert_eq!(dominant_ebe_response_subject(&ts, &g, &scale, &free), None);
 
         // Dominant over the subjects, but the rest of the gradient outweighs it on
         // every coordinate.
         let ts = with(vec![4919.0, 3.0]);
         let g = grad_for(&ts, [1e5, 1e5]);
-        assert_eq!(dominant_ebe_response_subject(&ts, &g, &scale), None);
+        assert_eq!(dominant_ebe_response_subject(&ts, &g, &scale, &free), None);
 
         // The comparison is made in the scaled space the step is solved in: the same
         // `tᵢ` stops dominating when its coordinate is scaled down below the others'.
         let ts = with(vec![4919.0, 0.0]);
         let g = grad_for(&ts, [-192.0, 30.0]);
-        assert_eq!(dominant_ebe_response_subject(&ts, &g, &[1e-4, 1.0]), None);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &[1e-4, 1.0], &free),
+            None
+        );
+
+        // A held or FIX coordinate does not count (#2777 review). Each mask is broken
+        // alone. Norm: dominant only through coordinate 0; on coordinate 1 alone its 1.0
+        // is 5× the others' 0.2, under the ratio, while it does outweigh the rest of the
+        // gradient there (rest 0 once its 2·1.0 is removed), so only the norm's mask
+        // rejects it.
+        let ts = with(vec![4919.0, 1.0]);
+        let g = grad_for(&ts, [-192.0, -1.6]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &[false, true]),
+            None,
+            "the norm must read only free coordinates"
+        );
+        // Direction: dominant on both coordinates, but outweighs the rest only on 0.
+        let ts = with(vec![4919.0, 4919.0]);
+        let g = grad_for(&ts, [-192.0, 1e6]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &[true, true]),
+            Some(2)
+        );
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &[false, true]),
+            None,
+            "the direction test must read only free coordinates"
+        );
 
         // One subject has nothing to be dominant over; a non-finite `tᵢ` is not ranked.
         let one = vec![vec![4919.0, 0.0]];
         assert_eq!(
-            dominant_ebe_response_subject(&one, &grad_for(&one, [0.0, 0.0]), &scale),
+            dominant_ebe_response_subject(&one, &grad_for(&one, [0.0, 0.0]), &scale, &free),
             None
         );
         let ts = with(vec![f64::NAN, 0.0]);
         assert_eq!(
-            dominant_ebe_response_subject(&ts, &DVector::zeros(2), &scale),
+            dominant_ebe_response_subject(&ts, &DVector::zeros(2), &scale, &free),
             None
         );
     }
