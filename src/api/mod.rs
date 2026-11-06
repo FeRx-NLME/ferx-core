@@ -563,6 +563,11 @@ mod frem_ode_sdtab_tests;
 #[path = "tests/adaptive_dose_expr_tests.rs"]
 mod adaptive_dose_expr_tests;
 
+// #944 PR2: which subjects a dose expression may read individual values for.
+#[cfg(test)]
+#[path = "tests/adaptive_dose_knowledge_tests.rs"]
+mod adaptive_dose_knowledge_tests;
+
 // #1594: supplied per-subject η on the adaptive path.
 #[cfg(test)]
 #[path = "tests/adaptive_inputs_tests.rs"]
