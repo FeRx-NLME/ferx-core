@@ -1326,8 +1326,10 @@ fn record_ode<T: VmNum>(
     th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
-    let ode = model.ode_spec.as_ref()?;
-    let prog = ode.indiv_param_program.as_ref()?;
+    let (ode, prog) = ode_programs(model)?;
+    if ode_walk_declines_shape(model, subject) {
+        return None;
+    }
     if static_walk_subject_supported(model, subject) {
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
         let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
@@ -1348,9 +1350,8 @@ fn record_ode<T: VmNum>(
         };
         return apply_expression_scale(model, subject, th, et, &by_slot, preds);
     }
-    if !event_walk_subject_supported(model, subject) {
-        return None;
-    }
+    // Past `ode_walk_declines_shape`, a subject the static walk declines is the event
+    // walk's.
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let (pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset) =
         seed_tvcov_snapshots::<T>(model, subject, uses_time, |cov, time| {
@@ -1696,9 +1697,10 @@ fn record_ode_iov<T: VmNum>(
     th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
-    let ode = model.ode_spec.as_ref()?;
-    let prog = ode.indiv_param_program.as_ref()?;
-    ode_iov_walk_scope(model, subject, layout)?;
+    let (_, prog) = ode_programs(model)?;
+    if ode_iov_walk_declines_shape(model, subject, layout) {
+        return None;
+    }
     if layout.n_stacked() > et.len() {
         return None;
     }
@@ -1911,24 +1913,96 @@ fn events_walk_declines_shape(model: &CompiledModel, subject: &Subject) -> bool 
         || !pv::modeled_dose_analytic_gate(model, subject)
 }
 
+/// The ODE spec and its individual-parameter program [`record_ode`] and [`record_ode_iov`]
+/// record over; `None` when the model has neither.
+fn ode_programs(
+    model: &CompiledModel,
+) -> Option<(
+    &crate::ode::OdeSpec,
+    &crate::parser::model_parser::IndivParamProgram,
+)> {
+    let ode = model.ode_spec.as_ref()?;
+    Some((ode, ode.indiv_param_program.as_ref()?))
+}
+
+/// The gates of [`record_ode`] that read the model and the records alone: no program to
+/// record, or a subject neither ODE walk serves (an infusion into a built-in absorption
+/// compartment, say). Both walk predicates take only the model and the subject.
+fn ode_walk_declines_shape(model: &CompiledModel, subject: &Subject) -> bool {
+    ode_programs(model).is_none()
+        || (!static_walk_subject_supported(model, subject)
+            && !event_walk_subject_supported(model, subject))
+}
+
+/// The gates of [`record_ode_iov`] that read the model, the records and the layout built
+/// from them alone.
+fn ode_iov_walk_declines_shape(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
+) -> bool {
+    ode_programs(model).is_none() || ode_iov_walk_scope(model, subject, layout).is_none()
+}
+
+/// The readout program and individual-parameter program [`record_algebraic`] records over;
+/// `None` (a decline at every point) when the readout is not a single dual-evaluable
+/// program or the parameter program does not read the combined `[η, κ]`.
+fn algebraic_programs(
+    model: &CompiledModel,
+) -> Option<(
+    &crate::parser::model_parser::OdeOutputProgram,
+    &crate::parser::model_parser::IndivParamProgram,
+)> {
+    let readout = model.analytic_readout.as_ref()?;
+    let prog_out = match &readout.readout {
+        crate::ode::OdeReadout::Single(_) => {
+            readout.program.as_ref().filter(|p| p.is_dual_evaluable())?
+        }
+        _ => return None,
+    };
+    let prog = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .filter(|p| p.n_eta_axis() == model.n_eta + model.n_kappa)?;
+    Some((prog_out, prog))
+}
+
 /// Whether the recorder [`record_cells`] dispatches `subject` to declines it for its data
 /// shape: a gate that reads the model and the records alone, so the decline holds at every
-/// parameter point (#2713 review). Only the closed-form recorders have such gates in front
-/// of their values, so this is `false` for an ODE or algebraic model. `false` is no promise
+/// parameter point (#2713 review). Mirrors [`record`]'s dispatch, and each arm asks the
+/// gate predicate its recorder itself calls, so the two cannot part. `false` is no promise
 /// that the recording succeeds: a decline that depends on parameter values (the
 /// separability of a modeled infusion window, an ODE step that cannot be formed, a
 /// non-finite prediction) is a failed recording, not a shape.
 fn recorder_declines_shape(model: &CompiledModel, subject: &Subject) -> bool {
-    if model.is_algebraic() || model.ode_spec.is_some() {
-        return false;
-    }
-    if model.n_kappa > 0
-        || crate::sens::provider::subject_routes_to_event_walk(model, subject)
-        || closed_form_reshapes_f_window(model, subject)
-    {
-        events_walk_declines_shape(model, subject)
+    let built;
+    let lay = if model.n_kappa > 0 {
+        match crate::stats::stacked_layout::StackedLayout::sens_of(model, subject) {
+            Some(l) => {
+                built = l;
+                Some(&built)
+            }
+            // `record` builds this layout first and declines without it.
+            None => return true,
+        }
     } else {
-        !closed_form_serves(model, subject)
+        None
+    };
+    if model.is_algebraic() {
+        return algebraic_programs(model).is_none();
+    }
+    match (model.ode_spec.is_some(), lay) {
+        (true, Some(lay)) => ode_iov_walk_declines_shape(model, subject, lay),
+        (true, None) => ode_walk_declines_shape(model, subject),
+        (false, Some(_)) => events_walk_declines_shape(model, subject),
+        (false, None)
+            if crate::sens::provider::subject_routes_to_event_walk(model, subject)
+                || closed_form_reshapes_f_window(model, subject) =>
+        {
+            events_walk_declines_shape(model, subject)
+        }
+        (false, None) => !closed_form_serves(model, subject),
     }
 }
 
@@ -2202,18 +2276,7 @@ fn record_algebraic<T: VmNum>(
     th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
-    let readout = model.analytic_readout.as_ref()?;
-    let prog_out = match &readout.readout {
-        crate::ode::OdeReadout::Single(_) => {
-            readout.program.as_ref().filter(|p| p.is_dual_evaluable())?
-        }
-        _ => return None,
-    };
-    let prog = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .filter(|p| p.n_eta_axis() == model.n_eta + model.n_kappa)?;
+    let (prog_out, prog) = algebraic_programs(model)?;
     let iov = model.n_kappa > 0;
     let layout = if iov { Some(lay?) } else { None };
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
