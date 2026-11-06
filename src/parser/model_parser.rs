@@ -7499,19 +7499,15 @@ pub fn parse_full_model_with(
     // #2562: the gathers an endpoint block reads count for the pre-fit index check too, and
     // they were parsed after `theta_blocks` took its first copy.
     model.indiv_param_partials.theta_blocks.uses = VectorThetaScope::uses();
-    // #2623: the explicit `NAME[COLUMN]` reads of each level block, and whether any
-    // expression reads it bare, for the binder's no-levels refusal.
+    // #2623: whether any expression reads each level block, for the binder's no-levels
+    // refusal. A data-driven block can only be read bare (#2744).
+    for decl in model
+        .indiv_param_partials
+        .theta_blocks
+        .level_blocks
+        .iter_mut()
     {
-        let blocks = &mut model.indiv_param_partials.theta_blocks;
-        for decl in blocks.level_blocks.iter_mut() {
-            decl.read_bare = model.referenced_covariates.contains(&decl.index_covariate);
-            decl.keyed_reads.clear();
-            for u in blocks.uses.iter().filter(|u| u.block == decl.name) {
-                if !decl.keyed_reads.contains(&u.index_covariate) {
-                    decl.keyed_reads.push(u.index_covariate.clone());
-                }
-            }
-        }
+        decl.read_bare = model.referenced_covariates.contains(&decl.index_covariate);
     }
     // #2562: which discrete-state endpoints read each level block, for the binder.
     #[cfg(feature = "survival")]
@@ -19800,13 +19796,14 @@ fn parse_parameters(
                     // Resolve the block to its level → θ map plus the θ names to
                     // append, then append once. Both bracket forms end here; the
                     // difference is only where the level list came from.
-                    let (levels, theta_names, index_covariate) = match spec {
+                    let (levels, theta_names, index_covariate, block_columns) = match spec {
                         ThetaBlockSpec::Count(n_levels) => (
                             (0..n_levels)
                                 .map(|i| LevelRule::Free((base + i) as u32))
                                 .collect(),
                             (1..=n_levels).map(|l| format!("{name}[{l}]")).collect(),
                             None,
+                            Vec::new(),
                         ),
                         ThetaBlockSpec::Columns { columns, contrast } => {
                             let index_covariate = level_index_column(&name);
@@ -19830,7 +19827,7 @@ fn parse_parameters(
                             };
                             level_block_decls.push(LevelBlockDecl {
                                 name: name.clone(),
-                                columns,
+                                columns: columns.clone(),
                                 contrast: binding.map(|b| b.contrast).unwrap_or(contrast),
                                 labels: binding.map(|b| b.labels.clone()).unwrap_or_default(),
                                 scale_share: None,
@@ -19838,10 +19835,9 @@ fn parse_parameters(
                                 eta_readers: Vec::new(),
                                 index_covariate: index_covariate.clone(),
                                 record_cmts: Vec::new(),
-                                keyed_reads: Vec::new(),
                                 read_bare: false,
                             });
-                            (levels, theta_names, Some(index_covariate))
+                            (levels, theta_names, Some(index_covariate), columns)
                         }
                     };
                     for theta_name in theta_names {
@@ -19857,6 +19853,7 @@ fn parse_parameters(
                         name: name.clone(),
                         spec: std::sync::Arc::new(GatherSpec { name, levels }),
                         index_covariate,
+                        columns: block_columns,
                         profiled,
                         linked: false,
                         profile_box,
@@ -24128,6 +24125,11 @@ pub(crate) struct VectorThetaDecl {
     /// `None` for the explicit `theta NAME[N]` form, where a bare reference is
     /// an error and the user supplies the index column.
     pub(crate) index_covariate: Option<String>,
+    /// The data columns a level block is declared over (`STUDY, TIME`), for the
+    /// refusal of a subscripted read (#2744) to echo the declaration. Empty for the
+    /// counted form. Display only: whether a block is data-driven is
+    /// `index_covariate`, and nothing gates on this.
+    pub(crate) columns: Vec<String>,
     /// Declared `profile` (#1065): the levels are solved for at every outer
     /// evaluation rather than searched by the optimizer.
     pub(crate) profiled: bool,
@@ -24230,6 +24232,21 @@ fn level_block_unreadable_message(
     }
 }
 
+/// The refusal for a subscripted read of a data-driven θ level block (#2744).
+/// `spelling` is the read as written (`PLACEBO[STUDY]`, `PLACEBO[STUDY + 0]`,
+/// `PLACEBO[2]`), `columns` the block's declared columns. The index kinds share one
+/// wording: each is a number, and none of them is the record's level.
+fn data_driven_subscript_message(name: &str, spelling: &str, columns: &[String]) -> String {
+    let cols = columns.join(", ");
+    format!(
+        "`{spelling}`: `{name}` is a data-driven θ level block (`theta {name}[{cols}]`), \
+         read bare, as `{name}`: each record reads the level its own `{cols}` values \
+         select. A subscript would index the block by the number it evaluates to, which \
+         matches the record's level only by coincidence. To supply the index yourself, \
+         declare the counted form `theta {name}[N]` and read `{name}[COLUMN]`."
+    )
+}
+
 /// The `[odes]`-scope refusal for the first θ level block `src` reads, if any (#1637).
 /// For an expression that compiles as an ODE line but is written elsewhere (the
 /// joint PK-TTE `hazard =`), so its caller can name the line the user wrote.
@@ -24245,8 +24262,12 @@ fn ode_level_block_read(src: &str) -> Result<Option<String>, String> {
         if pos > 0 && tokens[pos - 1] == Token::Dot {
             continue;
         }
-        if lookup_vector_theta(name).is_some() {
-            let spelling = if tokens.get(pos + 1) == Some(&Token::LBracket) {
+        if let Some(decl) = lookup_vector_theta(name) {
+            // As in `parse_atom`'s ODE-scope refusal: a data-driven block's remedy
+            // reads it bare, since its subscripted read is refused (#2744).
+            let spelling = if tokens.get(pos + 1) == Some(&Token::LBracket)
+                && decl.index_covariate.is_none()
+            {
                 format!("{name}[{}]", render_index_tokens(&tokens, pos + 2))
             } else {
                 name.clone()
@@ -24465,14 +24486,10 @@ pub struct LevelBlockDecl {
     /// CTMM generator is built once per subject from the baseline, and one time-to-event
     /// data row can yield zero or two records, so neither defines levels.
     pub(crate) record_cmts: Vec<usize>,
-    /// Set by the parse: the plain data columns of the explicit `NAME[COLUMN]` reads of
-    /// this block (#2623), deduplicated in read order — the [`ThetaBlocks::uses`] naming
-    /// it. A data-driven block is read bare, through `index_covariate`; an explicit read
-    /// indexes it by the column itself and makes no endpoint a level-defining reader, so
-    /// the binder names this spelling when that leaves the block with no levels.
-    pub(crate) keyed_reads: Vec<String>,
     /// Set by the parse: some expression reads this block bare, through
     /// `index_covariate` — the model's referenced covariates include it (#2623 review).
+    /// Bare is the only way to read a data-driven block: the parse refuses a
+    /// subscripted read (#2744), so `false` means nothing reads it.
     /// With [`Self::record_cmts`] it tells the binder's no-levels refusal whether the
     /// expression is the cause or the block's only readers define no level on the data
     /// (a Gaussian prediction on data with no Gaussian rows, a CTMM generator, a TTE hazard).
@@ -35584,7 +35601,9 @@ fn parse_atom(
                 // `Theta(t)` read against the empty θ slice these contexts evaluate
                 // with (a silent 0, or an index-out-of-bounds panic).
                 if ctx.level_blocks != LevelBlockScope::Readable {
-                    let spelling = if subscripted {
+                    // The remedy's read: as written for a counted block, bare for a
+                    // data-driven one, whose subscripted read is itself refused (#2744).
+                    let spelling = if subscripted && decl.index_covariate.is_none() {
                         format!("{name}[{}]", render_index_tokens(tokens, pos + 2))
                     } else {
                         name.to_string()
@@ -35594,6 +35613,21 @@ fn parse_atom(
                         &spelling,
                         ctx.level_blocks,
                         "[odes]",
+                    ));
+                }
+                // #2744: a data-driven block is read bare. A subscript would index it by
+                // the number it evaluates to, which is a level only by coincidence: on a
+                // column holding exactly 1..N it equals the bare read, and otherwise it
+                // is a range error, a dead-level refusal, or (an index the pre-fit check
+                // cannot walk, such as `TIME` or a computed one) a fit at the divergence
+                // sentinel. Refused here, before the literal fold, so every reader — and
+                // every index shape — meets the same refusal.
+                if subscripted && decl.index_covariate.is_some() {
+                    let spelling = format!("{name}[{}]", render_index_tokens(tokens, pos + 2));
+                    return Err(data_driven_subscript_message(
+                        name,
+                        &spelling,
+                        &decl.columns,
                     ));
                 }
                 if subscripted {
