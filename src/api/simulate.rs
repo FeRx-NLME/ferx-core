@@ -2048,7 +2048,6 @@ fn drawn_derived_columns(
                 extra_columns: Vec::new(),
                 per_obs_tad: Vec::new(),
                 compartment_states,
-                #[cfg(feature = "survival")]
                 discrete_rows: Vec::new(),
                 #[cfg(feature = "survival")]
                 tte_rows: Vec::new(),

@@ -1,0 +1,149 @@
+---
+pagetitle: "Golden fit set — nightly drift report against the last release"
+description-meta: "The golden fit set: reference models fitted nightly on Linux, diffed against the last release, report-only until a fixed date and then failing on changes outside a measured band."
+---
+
+# Golden fit set
+
+The NONMEM anchors pin specific features and the Tier-3 tests pin convergence
+bands, but neither tracks **the same reference models across releases**. A small
+drift in θ, SE or OFV from an unrelated change would otherwise be noticed by a
+user, by a downstream repository, or by chance. The golden fit set closes that
+gap (#2635). It sits beside the anchors and does not replace any of them.
+
+| | |
+|---|---|
+| Models | `tools/golden-fits/models.tsv`: one row per estimator, structural or endpoint family, each an existing `examples/` model |
+| Runner | `tools/golden-fits/golden.py` (`run`, `report`, `bands`), standard-library Python only |
+| Workflow | `.github/workflows/golden-fits.yml`, nightly 04:30 UTC and on dispatch, **Linux only** |
+| Output | the job summary table, and a `golden-fits-results` artifact kept 90 days |
+| Guard | `tests/golden_fit_set.rs` (per PR, runs no fit) |
+
+## What a nightly does
+
+1. Fits every model with the **last release's** binary on the release's own
+   `examples/` and `data/`, then caches the result under the tag. That fit runs
+   once per release. On every other night the cache supplies it.
+2. Builds `ferx` at the head of `main` and fits the same models.
+3. Downloads the previous scheduled run's results, if one is available, whether that run passed or failed: a red night is the one a drift lands on.
+4. Writes the table to the job summary.
+
+Each row records OFV, every θ, ω (including off-diagonals of a block), κ and σ
+with its SE, the iteration count, the convergence flag and the covariance status.
+The columns show the change against the release: ΔOFV as an absolute value, the
+largest scaled change (`|head − release| / max(|release|, 1e-6)`) over the estimates
+and over the SEs together with the parameter it occurs on, and the change in iterations. A `Δ OFV prev` column
+compares against the previous nightly, which ties a change to one day's merges.
+For every model that changed, a collapsible block lists each parameter that
+moved.
+
+A `NaN` anywhere counts as a change, even when the release had `NaN` in the
+same place. The report never folds a `NaN` away the
+way `max` would (see AGENTS.md on `f64::max`). A row whose model or data file
+differs from the release's copy is marked as such, so an edited example does not
+read as engine drift.
+
+All fits run on one worker thread. `golden.py` passes `--threads 1` and rejects
+any result whose `n_threads_used` is not 1. `RAYON_NUM_THREADS` alone does not do
+this, because ferx sizes its own pool from the machine's core count (#1460). If
+the flag were left out, the size of the runner would decide the reduction order,
+and that would show up as drift.
+
+Fit numbers come from **Linux** only. See
+[Reference platform](sdlc.qmd#reference-platform-linux). Do not compare a macOS
+run of `golden.py` with the nightly table.
+
+## Report-only, then fail-on-band
+
+The job is **report-only until 2026-12-07**, the date in `FAIL_ON_BAND_FROM` in
+`golden.py`. That gives about 30 nightlies, starting 2026-11-05, to measure the
+natural spread of each model. Two things happen on that date:
+
+- If `tools/golden-fits/bands.json` has not been committed, the job **fails**,
+  and the failure names the missing file. A report with no end date gets read for
+  a week and is then ignored, so the date is enforced and does not expire
+  quietly.
+- Once `bands.json` is committed, the job fails when any quantity moves outside
+  its band relative to the release, when a fit that succeeded at the release fails
+  at head, or when a model or parameter has no measured band.
+
+`tests/golden_fit_set.rs` requires this page and `golden.py` to give the same
+date. To move the date, change both in the same commit.
+
+### Measuring the bands
+
+```bash
+# the last 30 scheduled runs' results, one directory each. `completed`, not
+# `success`: once fail-on-band is on, a night with a new or drifted model is red
+# and still uploads its results. A run that died before uploading has none.
+for id in $(gh run list --workflow golden-fits.yml --branch main --event schedule \
+              --status completed --limit 30 --json databaseId --jq '.[].databaseId'); do
+  gh run download "$id" --name golden-fits-results --dir "hist/$id" || true
+done
+python3 tools/golden-fits/golden.py bands hist/*/head.json   # writes tools/golden-fits/bands.json
+```
+
+A band is `headroom × max |x − median|` over the nightlies, with a default
+headroom of 2. It is absolute for OFV and iterations. For estimates and SEs it is
+on the same scale the report measures a change on, `|x − median| / max(|median|,
+1e-6)`: relative for an ordinary value, and absolute (in units of 1e-6) for one
+at or near zero, such as a block covariance estimated at 0 or a fixed SE. A pure
+ratio would score every move off zero as exactly 1, however small, and divide a
+zero median's spread into a band no change can leave. `bands.json` records the
+scale as `abs_scale`, and the report refuses bands measured on a different one. If the spread of a quantity is exactly zero, the band falls back to
+a floor (1e-6 relative, 1e-3 OFV, 2 iterations), because a band of 0 would fail
+on the last bit. The floors are a choice, not a measurement, and `bands.json`
+records them. `bands` refuses to run on fewer than 30 nightlies. A quantity
+that went `NaN` during the window gets a `NaN` band. The report treats a
+non-finite band as missing, so the quantity fails until the bands are
+re-measured.
+
+### An intentional change
+
+When a pull request moves a golden model on purpose (a new default, or a fixed
+likelihood), dispatch the workflow on the branch, download its
+`golden-fits-results` artifact, and pin the model's new state together with the
+reason and the PR:
+
+```bash
+python3 tools/golden-fits/golden.py accept warfarin_saem --head head.json \
+  --reason "#1234: SAEM burn-in default 150 → 200"
+```
+
+This writes an entry under `accepted` in `bands.json` that holds the model's
+OFV, iterations, estimates and SEs at that point. The model is **not exempted**.
+From then on it is banded against the accepted state instead of the release. The
+row still shows its change against the release, marked `✔︎`, but a later,
+unrelated drift away from the accepted state fails the job as usual (`🔺`). An
+entry without a pinned state also fails the job.
+
+At each release the baseline absorbs the change, so clear `accepted` then. The
+`accepted` entries for a release are also its list of "estimates changed for
+model X" lines for the release notes.
+
+## Seeing a change before it merges
+
+Dispatch the workflow on a branch:
+
+```bash
+gh workflow run golden-fits.yml --ref <branch>            # all models
+gh workflow run golden-fits.yml --ref <branch> -f only=warfarin,warfarin_saem
+```
+
+A perturbation, for example a changed default, appears as `≠` on every model it
+reaches, with the parameters that moved listed under *Changed models*. The guard
+test checks this on synthetic results: a 1% change on one θ must be reported on
+that θ, and the unperturbed twin must report `=`.
+
+## Adding or retiring a model
+
+- Add a row to `models.tsv`. Its `family` must differ from every other row's;
+  the guard checks this, along with the existence of the model and data files.
+- Never reuse an `id` for a different model. Retire the old id and add a new
+  one, so each history stays with its own model.
+- A new model has no release value until the next release. Its row shows `🆕`.
+  Once fail-on-band mode is active, a new model also needs a band, so re-measure
+  `bands.json` after the model has run for 30 nightlies.
+- GN, GN-hybrid, Laplace, AGQ, Bayes and VI are not covered yet because no
+  `examples/` model uses them. Add a row when one does, instead of writing a
+  model file just for this set.

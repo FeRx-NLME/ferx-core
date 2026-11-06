@@ -75,9 +75,11 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/gauss_newton.rs",
-        13,
+        14,
         "the GN optimizer and its gradient kernels receive the stage options (the exact \
-         fixed-EBE score and EBE-response correction pick their objective from them, #2482)",
+         fixed-EBE score and EBE-response correction pick their objective from them, #2482; \
+         `gn_gradient_takes_total_derivative` routes FOCEI subjects to the total derivative \
+         on the same GN / trust-region stage options, #2740)",
     ),
     (
         "src/estimation/impmap.rs",
@@ -96,7 +98,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/outer_optimizer.rs",
-        16,
+        17,
         "the outer optimizer and objective, run on a stage's options; \
          `warm_ebe_start_check` (#2097) runs on the Gauss–Newton stage's options \
          (#2549: the built-in BFGS loop's two standalone `population_eta_dx` reads went \

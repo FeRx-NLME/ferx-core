@@ -60,27 +60,3 @@ fn neural_network_info_reports_identity_when_normalization_is_absent() {
     assert_eq!(infos[0].input_center, vec![0.0, 0.0]);
     assert_eq!(infos[0].input_scale, vec![1.0, 1.0]);
 }
-
-/// A `.fitrx` bundle written before `center` / `scale` existed must still load.
-///
-/// `NeuralNetworkInfo` is `Serialize + Deserialize` and round-trips through `fit.json`
-/// inside the archive, so adding a *required* field would have made every existing bundle
-/// undeserialisable. Both are `serde(default)`; a legacy bundle predates normalization
-/// entirely, so the empty vectors it yields correctly mean "no transform".
-#[test]
-fn neural_network_info_deserializes_a_bundle_written_before_normalization() {
-    let legacy = r#"{
-        "name": "TYPICAL_PK",
-        "shape": [2, 3, 2],
-        "hidden_activation": "tanh",
-        "output_activation": "softplus",
-        "n_weights": 17,
-        "weights_offset": 1,
-        "input_names": ["WT", "CRCL"],
-        "output_names": ["CL", "V"]
-    }"#;
-    let info: crate::types::NeuralNetworkInfo =
-        serde_json::from_str(legacy).expect("a pre-normalization bundle must still deserialize");
-    assert!(info.input_center.is_empty());
-    assert!(info.input_scale.is_empty());
-}

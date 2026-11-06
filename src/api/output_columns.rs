@@ -620,6 +620,12 @@ pub(crate) fn compute_extra_output_columns(
                                 // integral NaN while the adjacent per-obs
                                 // `compartments[i]` column stayed finite.
                                 vec![]
+                            } else if subject.has_cmt_toggles() {
+                                // The dense walk this grid would take has no compartment
+                                // on/off record, so it would integrate through the off
+                                // window (#2732). NaN, like every case here with no valid
+                                // answer.
+                                vec![]
                             } else if let Some(ref ode) = model.ode_spec {
                                 // Time-independent params: the disposition is one snapshot
                                 // (t=0) across the grid; the ODE solver supplies its own clock.

@@ -1887,7 +1887,6 @@ fn fit_inner(
         }
         crate::io::checkpoint::set_stage(stage_idx);
         let stage_start = std::time::Instant::now();
-        let is_last = stage_idx + 1 == n_stages;
         let mut stage_opts = options.clone();
         stage_opts.method = method;
         stage_opts.methods = Vec::new();
@@ -2061,6 +2060,8 @@ fn fit_inner(
                         stationary_start: false,
                         vi: None,
                         start_eval: None,
+                        mcem_lowest_objective: None,
+                        mcem_objective_trail: None,
                         mixture_posteriors: None,
                     });
                 }
@@ -2159,6 +2160,8 @@ fn fit_inner(
                     mixture_posteriors: None,
                     vi: None,
                     start_eval: None,
+                    mcem_lowest_objective: None,
+                    mcem_objective_trail: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -2221,6 +2224,15 @@ fn fit_inner(
                             msg
                         });
                     }
+                    if let Some(msg) =
+                        crate::estimation::importance_sampling::marginal_reliability_warning(&r)
+                    {
+                        accumulated_warnings.push(if n_stages > 1 {
+                            format!("[IMP] {}", msg)
+                        } else {
+                            msg
+                        });
+                    }
                     is_result = Some(r);
                 }
                 Err(e) => {
@@ -2242,7 +2254,7 @@ fn fit_inner(
                 // Warm-start the first MAP inner loop from the preceding stage's
                 // EBEs when chained (e.g. [focei, impmap] / [saem, impmap]).
                 let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
-                crate::estimation::impmap::run_impmap(
+                crate::estimation::impmap::run_impmap_stage(
                     model,
                     population,
                     &stage_params,
@@ -2277,7 +2289,7 @@ fn fit_inner(
                 // reaches here. Warm-start from the preceding stage's EBEs when
                 // chained (e.g. [saem, imp]).
                 let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
-                crate::estimation::impmap::run_imp(
+                crate::estimation::impmap::run_imp_stage(
                     model,
                     population,
                     &stage_params,
@@ -2348,42 +2360,34 @@ fn fit_inner(
         // on `FitResult.importance_sampling`, so callers comparing to NONMEM read
         // the matching number. Best-effort: a failure (e.g. SDE, IOV without
         // Ω_iov, n_eta = 0) leaves the field unset with a warning, never aborts.
-        if is_last && matches!(method, EstimationMethod::Imp | EstimationMethod::Impmap) {
+        //
+        // Keyed on the last *estimating* stage: a trailing evaluator leaves these
+        // parameters reported, and an `agq_eval_only` stage replaces only `ofv`, so
+        // the marginal is still what shows whether they collapsed (#2652). A trailing
+        // `imp_eval_only` stage repeats the evaluation and its result wins.
+        if is_last_estimating && matches!(method, EstimationMethod::Imp | EstimationMethod::Impmap)
+        {
             let r = result.as_ref().expect("stage result was just set");
-            let mut marg_opts = stage_opts.clone();
-            // `run_importance_sampling` reads the `imp_*` knobs; for IMPMAP map the
-            // `impmap_*` knobs onto them so the final eval mirrors the method's
-            // own sample count / proposal df / seed.
-            if method == EstimationMethod::Impmap {
-                marg_opts.imp_samples = stage_opts.impmap_samples;
-                marg_opts.imp_seed = stage_opts.impmap_seed;
-                marg_opts.imp_low_ess_threshold = stage_opts.impmap_low_ess_threshold;
-                // A Gaussian IMPMAP proposal (`impmap_proposal_df = ∞`, opt-in)
-                // is one the IS evaluator could sample (#2651), but its light
-                // tails leave the weights unbounded. The marginal is
-                // proposal-independent in expectation, so evaluate under a
-                // finite-t proposal instead (heavier tails ⇒ bounded weights).
-                // The default `impmap_proposal_df = 4` passes through unchanged.
-                let df = stage_opts.impmap_proposal_df;
-                marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
-            }
-            let marg_call = if model.mixture.is_some() {
-                crate::estimation::importance_sampling::run_importance_sampling_mixture(
-                    model, population, &r.params, &marg_opts,
-                )
-            } else {
-                crate::estimation::importance_sampling::run_importance_sampling(
-                    model,
-                    population,
-                    &r.params,
-                    &r.eta_hats,
-                    &r.h_matrices,
-                    &r.kappas,
-                    &marg_opts,
-                )
-            };
+            let marg_call = crate::estimation::impmap::evaluate_final_marginal(
+                model,
+                population,
+                r,
+                &stage_opts,
+                method,
+            );
             match marg_call {
-                Ok(is) => is_result = Some(is),
+                Ok(is) => {
+                    if let Some(msg) =
+                        crate::estimation::importance_sampling::marginal_reliability_warning(&is)
+                    {
+                        accumulated_warnings.push(if n_stages > 1 {
+                            format!("[{}] {}", method.label(), msg)
+                        } else {
+                            msg
+                        });
+                    }
+                    is_result = Some(is);
+                }
                 Err(e) => accumulated_warnings.push(if n_stages > 1 {
                     format!("[{}] marginal −2 log L eval skipped: {}", method.label(), e)
                 } else {
@@ -2875,6 +2879,13 @@ fn fit_inner(
     } else {
         None
     };
+    // The file is a temporary one, so the fit keeps its text. `None` here leaves
+    // `trace_path` as the only record, which a bundle cannot carry.
+    let trace_csv = trace_path.as_deref().and_then(|path| {
+        std::fs::read_to_string(path)
+            .map_err(|e| warnings.push(format!("could not read trace file {path}: {e}")))
+            .ok()
+    });
 
     // Estimation completed: delete the resume checkpoint (nothing left to
     // resume). Any post-estimation error below still returns Err, but a fresh
@@ -3019,6 +3030,31 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
+    // The marginal is published beside `ofv`, and under IMP / IMPMAP it is the objective
+    // that shows a collapse: the gate above read the Laplace `ofv` (#2652).
+    if let Some((msg, entry)) = mcem_marginal_warning(
+        &mut converged,
+        is_result.as_ref().map(|r| r.minus2_log_likelihood),
+        result.mcem_lowest_objective,
+        population.n_obs(),
+    ) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+    // Every IMP / IMPMAP run stops at its iteration limit, finished or not (#2686).
+    if let Some((msg, entry)) = mcem_settling_warning(
+        &mut converged,
+        result.mcem_objective_trail.as_ref(),
+        is_result
+            .as_ref()
+            .map(|r| crate::estimation::impmap::FinalMarginal {
+                value: r.minus2_log_likelihood,
+                mc_se: r.mc_standard_error,
+            }),
+    ) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
     // ODE-solver health at the final estimates (#1080 Part B): min-`dt` clamps, `auto`
     // escalations, and escalations the guard discarded — none of which any production path
     // reported before. Emitted typed at source, at `Info` severity when the only thing to
@@ -3028,6 +3064,28 @@ fn fit_inner(
         options,
         SolverStatsPhase::PostfitPredictions,
     ) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+    // The final `H` of an integrated model on the FD route, where the tighter solve the
+    // Jacobian runs at could not finish (#2701). That solve is no part of the prediction
+    // pass, so `ode_solver_stats` above cannot see it. A mixture's objective reads every
+    // contributing class's `H`, of which `result` keeps one, so its evaluation counted them.
+    let fd_h_redone = result.mixture_posteriors.as_ref().map_or_else(
+        || {
+            crate::estimation::inner_optimizer::fd_h_subjects_redone(
+                model,
+                population,
+                &result.params,
+                &result.eta_hats,
+                &result.kappas,
+            )
+        },
+        |posteriors| posteriors.n_fd_h_redone,
+    );
+    if let Some((msg, entry)) =
+        super::postfit::fd_h_not_tightened_warning(fd_h_redone, population.subjects.len())
+    {
         warnings.push(msg);
         native_warnings.push(entry);
     }
@@ -3154,6 +3212,8 @@ fn fit_inner(
 
     let mut fit_result = FitResult {
         restored_from_checkpoint: false,
+        cov_fixed: Vec::new(),
+        interface_extras: None,
         // #1111: the `[covariate_model]` echo, joined to the θ this fit
         // estimated. Filled in just below, once `fit_result` owns the θ vector.
         covariate_relations: Vec::new(),
@@ -3269,6 +3329,7 @@ fn fit_inner(
         nlopt_missing_algorithms: nlopt_missing,
         covariance_n_evals_estimated,
         trace_path,
+        trace_csv,
         ebe_convergence_warnings: result.ebe_convergence_warnings,
         max_unconverged_subjects: result.max_unconverged_subjects,
         total_ebe_fallbacks: result.total_ebe_fallbacks,
@@ -3417,7 +3478,14 @@ fn fit_inner(
     // predicate it surfaces (`crate::stalled_at_init`) reads the assembled
     // `FitResult` — `left_init`, `theta_init`/`theta`, and the fixed masks —
     // none of which exist as one object before this point.
-    if let Some((msg, entry)) = crate::api::stalled_at_init_warning(&fit_result) {
+    if let Some((msg, entry)) = crate::api::stalled_at_init_warning(&fit_result, options) {
+        fit_result.warnings.push(msg);
+        fit_result.warnings_structured.push(entry);
+    }
+
+    // Which engine ran the `[odes]` RHS, when it was not native code (#2681): a property
+    // of the model, reported once per fit rather than per stage of a chain.
+    if let Some((msg, entry)) = crate::api::postfit::ode_rhs_route_warning(model) {
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }
@@ -3432,6 +3500,10 @@ fn fit_inner(
         fit_result.se_theta.as_ref(),
         &fit_result.theta_fixed,
     );
+    // The final parameters, not `init_params`: an estimator can hold more than it was
+    // given, as SAEM does a mixture's σ overrides, and the step ran on these.
+    fit_result.cov_fixed =
+        crate::estimation::parameterization::cov_fixed_mask(&result.params, &fit_result);
 
     Ok(fit_result)
 }

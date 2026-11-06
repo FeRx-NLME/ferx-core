@@ -87,6 +87,7 @@ fn static_subject() -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         cens: vec![0, 0, 0, 0],

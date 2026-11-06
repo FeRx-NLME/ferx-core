@@ -698,6 +698,7 @@ mod tests {
             pk_only_covariates: vec![],
             reset_times: vec![],
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
             simulated_mixnum: None,

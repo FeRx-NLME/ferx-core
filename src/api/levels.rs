@@ -1382,15 +1382,61 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
         }
     }
     if levels.is_empty() {
-        return Err(format!(
-            "theta {}[{}]: the data carries no observation rows, so the block \
-             has no levels",
-            decl.name(),
-            decl.columns().join(", ")
-        ));
+        return Err(no_levels_message(decl, population));
     }
     levels.sort_by(cmp_levels);
     Ok(levels)
+}
+
+/// The refusal for a block [`discover_levels`] found no level of. Every Gaussian
+/// observation defines a level, so there are none; when the data still carries
+/// discrete-state records, none of them is on an endpoint that reads the block through
+/// its implicit index ([`LevelBlockDecl::record_cmts`]) (#2623). Why depends on whether
+/// any expression reads the block bare ([`LevelBlockDecl::read_bare`]): if none does,
+/// nothing reads it at all, since the parse refuses a subscripted `NAME[COLUMN]` read
+/// (#2744); if one does, its reader defines no level on this data — a level-defining
+/// endpoint with no records here, or only a Gaussian prediction, a CTMM generator or a
+/// TTE hazard.
+fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
+    let name = decl.name();
+    let head = format!("theta {name}[{}]", decl.columns().join(", "));
+    let has_records = population.subjects.iter().any(|s| {
+        s.obs_records
+            .iter()
+            .any(|r| matches!(r, ObsRecord::DiscreteState { .. }))
+    });
+    if !has_records {
+        return format!("{head}: the data carries no observation rows, so the block has no levels");
+    }
+    let mut message = format!(
+        "{head}: the block has no levels. The data carries no Gaussian observation rows, and \
+         none of its discrete-state records is on an endpoint whose expression reads the block \
+         through its implicit index."
+    );
+    if !decl.read_bare {
+        // A subscripted read is refused at parse (#2744), so here nothing reads the block.
+        message.push_str(&format!(
+            " Nothing reads it: a data-driven block is read bare, as `{name}`; its index is \
+             implicit."
+        ));
+    } else if !decl.record_cmts.is_empty() {
+        let cmts: Vec<String> = decl.record_cmts.iter().map(|c| c.to_string()).collect();
+        message.push_str(&format!(
+            " The block is read bare by an endpoint whose records define levels (CMT {}), but \
+             the data has no record there.",
+            cmts.join(", ")
+        ));
+    } else {
+        message.push_str(
+            " The block is read bare, but only by a Gaussian prediction, a `[markov_model]` \
+             CTMM generator or an `[event_model]` hazard, and none of them defines a level on \
+             this data: it has no Gaussian rows, a CTMM generator is built once per subject \
+             from the baseline, and one time-to-event row can yield zero or two records, so \
+             neither kind of record defines a level. Read the block in a `[binary_model]` \
+             predictor or a DTMM `[markov_model]` transition.",
+        );
+    }
+    message
 }
 
 /// The columns that would key a block's levels to subjects: the leading ones,

@@ -1,0 +1,46 @@
+[parameters]
+  theta LOG_CL(1.30, -10, 10)
+  theta LOG_V1(3.10, -10, 10)
+  theta LOG_Q(1.80, -10, 10)
+  theta LOG_V2(3.80, -10, 10)
+  theta LOG_KA(-0.10, -10, 10)
+  theta B_CLWT(0.40, -5, 5)
+  theta B_VWT(0.50, -5, 5)
+  theta B_CLSEX(0.05, -5, 5)
+  omega ETA_CL ~ 0.20
+  omega ETA_V1 ~ 0.20
+  omega ETA_Q ~ 0.20
+  omega ETA_V2 ~ 0.20
+  omega ETA_KA ~ 0.20
+  sigma P1 ~ 0.20 (sd)
+  sigma A1 ~ 0.15 (sd)
+  sigma P2 ~ 0.25 (sd)
+  sigma A2 ~ 0.25 (sd)
+  sigma P3 ~ 0.30 (sd)
+  sigma A3 ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = exp(LOG_CL + B_CLWT*LWT + B_CLSEX*SEX + ETA_CL)
+  V1 = exp(LOG_V1 + B_VWT*LWT + ETA_V1)
+  Q  = exp(LOG_Q + ETA_Q)
+  V2 = exp(LOG_V2 + ETA_V2)
+  KA = exp(LOG_KA + ETA_KA)
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  if (ASSAY == 1) {
+    DV ~ combined(P1, A1)
+  } else if (ASSAY == 2) {
+    DV ~ combined(P2, A2)
+  } else {
+    DV ~ combined(P3, A3)
+  }
+
+[fit_options]
+  method = imp
+  imp_iterations = 200
+  imp_samples = 1000
+  imp_auto = false
+  imp_seed = 12345

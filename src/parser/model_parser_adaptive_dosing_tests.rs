@@ -62,7 +62,7 @@ fn full_continuous_block_parses() {
     assert_eq!(spec.at, vec![24.0, 48.0, 72.0, 96.0]);
     assert_eq!(spec.start_dose, 100.0);
     assert_eq!(spec.route, AdaptiveRoute::Bolus { cmt: 1 });
-    assert_eq!(spec.dose_bounds, (0.0, 400.0));
+    assert_eq!(spec.dose_bounds, (0.0.into(), 400.0.into()));
     assert_eq!(spec.confirm, 2);
     assert_eq!(spec.levels, None);
     assert_eq!(spec.rules.len(), 4);
@@ -251,7 +251,10 @@ fn discrete_levels_block_parses() {
         "when signal > 3 : decrease",
     ]))
     .expect("discrete levels block parses");
-    assert_eq!(spec.levels, Some(vec![50.0, 100.0, 150.0, 200.0]));
+    assert_eq!(
+        spec.levels,
+        crate::sim::adaptive::literal_levels(&[50.0, 100.0, 150.0, 200.0])
+    );
     assert_eq!(
         spec.rules[0].action,
         AdaptiveAction::Increase(DoseStep::Level)
@@ -850,4 +853,404 @@ fn parsed_model_carries_an_interval_ladder() {
         .expect("block attached");
     assert_eq!(spec.start_interval, Some(12.0));
     assert_eq!(spec.rules[1].interval, Some(IntervalStep::Shorten));
+}
+
+// ── Dose expressions (#944) ──
+
+/// Each accepted form: a number stays a literal; an expression, a mixed pair, a `min`
+/// whose own comma sits inside parentheses, and an expression rung are kept as source.
+///
+/// Regressions: `[0, min(30 * WT, 4000)]` split on every comma (three items, refused as
+/// not a pair); a number kept as an expression (the literal path, and its parse-time
+/// checks, skipped).
+#[test]
+fn dose_values_parse_as_numbers_or_expressions() {
+    let spec = parse_adaptive_dosing_block(&lines(&[
+        "observe = central",
+        "at = [24, 48]",
+        "start_dose = 15 * WT",
+        "route = bolus(cmt = 1)",
+        "dose_bounds = [0, min(30 * WT, 4000)]",
+        "levels = [500, 10 * WT, 4000]",
+        "when signal < 10 : increase",
+    ]))
+    .expect("expressions parse");
+    assert_eq!(spec.start_dose, DoseValue::Expr("15 * WT".to_string()));
+    assert_eq!(
+        spec.dose_bounds,
+        (
+            DoseValue::Literal(0.0),
+            DoseValue::Expr("min(30 * WT, 4000)".to_string())
+        )
+    );
+    assert_eq!(
+        spec.levels,
+        Some(vec![
+            DoseValue::Literal(500.0),
+            DoseValue::Expr("10 * WT".to_string()),
+            DoseValue::Literal(4000.0),
+        ])
+    );
+    let lit = parse_adaptive_dosing_block(&lines(&valid_min())).expect("literal block");
+    assert_eq!(lit.start_dose, DoseValue::Literal(100.0));
+    assert_eq!(
+        lit.dose_bounds,
+        (DoseValue::Literal(0.0), DoseValue::Literal(400.0))
+    );
+}
+
+/// The shape errors a dose key can still have: no value, a list that is not a pair, a
+/// list without brackets.
+///
+/// Regressions: an empty `start_dose` kept as an empty expression; the pair count taken
+/// before the top-level split; a bracket-less list accepted.
+#[test]
+fn dose_value_shape_errors() {
+    let mut b = without("start_dose");
+    b.push("start_dose =".to_string());
+    let refs: Vec<&str> = b.iter().map(String::as_str).collect();
+    assert_eq!(
+        perr(&refs),
+        "[adaptive_dosing]: start_dose requires a number or an expression"
+    );
+
+    let mut b = without("dose_bounds");
+    b.push("dose_bounds = [0, 30 * WT, 4000]".to_string());
+    let refs: Vec<&str> = b.iter().map(String::as_str).collect();
+    assert_eq!(
+        perr(&refs),
+        "[adaptive_dosing]: dose_bounds must be `[low, high]`: [0, 30 * WT, 4000]"
+    );
+
+    let mut b = without("dose_bounds");
+    b.push("dose_bounds = 0, 30 * WT".to_string());
+    let refs: Vec<&str> = b.iter().map(String::as_str).collect();
+    assert_eq!(
+        perr(&refs),
+        "[adaptive_dosing]: dose_bounds must be a list `[...]`: 0, 30 * WT"
+    );
+}
+
+/// A 1-cpt model with a WT covariate, an η on CL, and — when `kappa` — a κ on CL.
+fn dose_model(kappa: bool, start_dose: &str) -> String {
+    let (k_decl, k_use) = if kappa {
+        ("  kappa KAPPA_CL ~ 0.09\n", " + KAPPA_CL")
+    } else {
+        ("", "")
+    };
+    format!(
+        "[parameters]
+  theta TVCL(6.0, 0.1, 50.0)
+  theta TVV(0.7, 0.05, 5.0)
+  omega ETA_CL ~ 0.09
+{k_decl}  sigma ADD ~ 1.0
+[individual_parameters]
+  CL = TVCL * (WT / 70) * exp(ETA_CL{k_use})
+  V  = TVV * WT
+[structural_model]
+  ode(states=[CENT])
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT
+[scaling]
+  y = CENT / V
+[error_model]
+  DV ~ additive(ADD)
+[adaptive_dosing]
+  observe = CENT / V
+  at = every 12 from 12 to 48
+  start_dose = {start_dose}
+  route = infuse(cmt=1, over=1)
+  dose_bounds = [0, 4000]
+  when signal < 15 : increase 25%
+"
+    )
+}
+
+fn full_err(src: &str) -> String {
+    match crate::parser::model_parser::parse_full_model(src) {
+        Ok(_) => panic!("expected a parse error"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Every read a dose expression may not make is refused when the model is parsed, by
+/// name, with the whole message asserted (so deleting any sentence fails here). A
+/// θ-and-covariate expression on the same model parses, so the refusals are not a
+/// blanket rejection of expressions.
+///
+/// Regressions, per row: the state check dropped (`2 * CENT` reads a zero state); the
+/// `TIME` check dropped (it evaluates to 0.0 outside the driver), or the `T` alias
+/// missed; κ reported with the shared compiler's `Form C … per observation` text; an
+/// individual parameter or η read let through to a zero PK / η slice; `MIXNUM` let
+/// through; a syntax error reported without the key.
+#[test]
+fn dose_expression_reads_are_refused_at_parse_time() {
+    let cases: [(bool, &str, &str); 7] = [
+        (
+            false,
+            "2 * CENT",
+            "[adaptive_dosing] start_dose reads CENT, a state of the model. A dose \
+             expression is evaluated once per subject, at the first decision; it may read \
+             data covariates and θ. To respond to the drug level, write a `when signal …` \
+             rule.",
+        ),
+        (
+            false,
+            "100 * TIME",
+            "[adaptive_dosing] start_dose reads TIME. A dose expression is evaluated once, \
+             at the first decision (t = 12), so TIME is always 12; write the value instead.",
+        ),
+        (
+            false,
+            "100 * T",
+            "[adaptive_dosing] start_dose reads TIME. A dose expression is evaluated once, \
+             at the first decision (t = 12), so TIME is always 12; write the value instead.",
+        ),
+        (
+            true,
+            "100 * exp(KAPPA_CL)",
+            "[adaptive_dosing] start_dose reads KAPPA_CL, an inter-occasion random effect. \
+             It is drawn for each occasion, so it is never known at dosing time, even for a \
+             subject whose random effects are supplied.",
+        ),
+        (
+            false,
+            "400 * CL",
+            "[adaptive_dosing] start_dose reads CL, an individual parameter. A dose \
+             expression may read data covariates and θ; it cannot read a subject's own \
+             parameter values yet. To dose from a known value, carry it as a data column \
+             (e.g. CL_KNOWN) and read that.",
+        ),
+        (
+            false,
+            "1000 * exp(ETA_CL)",
+            "[adaptive_dosing] start_dose reads ETA_CL, a random effect. A dose expression \
+             may read data covariates and θ; it cannot read a subject's own parameter values \
+             yet. To dose from a known value, carry it as a data column (e.g. CL_KNOWN) and \
+             read that.",
+        ),
+        (false, "15 * (WT", "[adaptive_dosing] start_dose: "),
+    ];
+    for (kappa, expr, want) in cases {
+        let got = full_err(&dose_model(kappa, expr));
+        if expr == "15 * (WT" {
+            assert!(got.starts_with(want), "{expr}: {got}");
+        } else {
+            assert!(got.ends_with(want), "{expr}:\n got {got}\nwant {want}");
+            assert!(
+                !got.contains("Form C") && !got.contains("per observation"),
+                "{got}"
+            );
+        }
+    }
+    assert!(
+        crate::parser::model_parser::parse_full_model(&dose_model(true, "15 * WT * TVCL")).is_ok()
+    );
+}
+
+/// `MIXNUM` is drawn with the subject's class, so a dose expression cannot read it.
+///
+/// Regression: `MIXNUM` let through, evaluating to the class-1 default for every subject.
+#[test]
+fn a_dose_expression_reading_mixnum_is_refused() {
+    let src = "[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta MIXL(0.0, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL * exp(ETA_CL) else 4 * TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central / V
+  at = [0, 24]
+  start_dose = 100 * MIXNUM
+  route = bolus(cmt=1)
+  dose_bounds = [0, 400]
+  when signal < 1 : increase 25%
+";
+    assert!(
+        full_err(src).ends_with(
+            "[adaptive_dosing] start_dose reads MIXNUM, the subject's mixture class, which \
+             the simulation draws; no prescriber knows it at dosing time."
+        ),
+        "{}",
+        full_err(src)
+    );
+}
+
+/// The key named in a refusal is the key the expression is under.
+///
+/// Regression: every refusal hard-coding `start_dose` (the shared arm's discriminator).
+#[test]
+fn a_dose_expression_refusal_names_its_own_key() {
+    let src =
+        dose_model(false, "500").replace("dose_bounds = [0, 4000]", "dose_bounds = [0, 2 * CENT]");
+    let got = full_err(&src);
+    assert!(
+        got.contains("[adaptive_dosing] dose_bounds reads CENT"),
+        "{got}"
+    );
+    assert!(!got.contains("start_dose"), "{got}");
+    let src = dose_model(false, "500")
+        .replace(
+            "dose_bounds = [0, 4000]",
+            "dose_bounds = [0, 4000]\n  levels = [500, 400 * CL]",
+        )
+        .replace("increase 25%", "increase");
+    let got = full_err(&src);
+    assert!(got.contains("[adaptive_dosing] levels reads CL"), "{got}");
+    assert!(!got.contains("start_dose"), "{got}");
+}
+
+/// A block that mixes numbers and expressions is checked among its numbers when it is
+/// parsed (#2667 review r1 row 1): every invariant whose values are all numbers is a
+/// parse error, so a typo in the block is not reported as subject 1's dose value. Each
+/// row has both sides of its gate: the refused block, and the same pair with one side
+/// an expression, which parses (it is checked per subject).
+///
+/// Regressions: the dose checks gated on an all-numbers block again (every refused row
+/// parses); a check that runs with an unknown operand (a parsing row refused); the
+/// ladder order checked only between neighbours (`[500, 10 * WT, 400]` parses);
+/// start-on-the-ladder checked with an expression rung present (`12 * WT` refused).
+#[test]
+fn a_mixed_block_is_checked_among_its_numbers_at_parse_time() {
+    let block = |start: &str, bounds: &str, levels: Option<&str>| {
+        let mut b = vec![
+            "observe = central".to_string(),
+            "at = [24, 48]".to_string(),
+            format!("start_dose = {start}"),
+            "route = bolus(cmt = 1)".to_string(),
+            format!("dose_bounds = {bounds}"),
+        ];
+        match levels {
+            Some(l) => {
+                b.push(format!("levels = {l}"));
+                b.push("when signal < 10 : increase".to_string());
+            }
+            None => b.push("when signal < 10 : increase 25%".to_string()),
+        }
+        b
+    };
+    let refused: [(&str, &str, Option<&str>, &str); 11] = [
+        // A start no expression rung can reach (#2667 review r2 N3): the only expression
+        // rung is above 200, or between 100 and 200 while the start is 250 (only its
+        // upper neighbour rules it out) or 50 (only its lower neighbour does).
+        (
+            "50",
+            "[0, 30 * WT]",
+            Some("[100, 10 * WT, 200]"),
+            "[adaptive_dosing]: start_dose 50 must be one of the declared levels [100, 10 * \
+             WT, 200]. It is none of the numbers, and the ladder increases, so no expression \
+             rung can equal it: none lies below 100, the lowest number.",
+        ),
+        (
+            "150",
+            "[0, 30 * WT]",
+            Some("[100, 200, 20 * WT]"),
+            "[adaptive_dosing]: start_dose 150 must be one of the declared levels [100, 200, \
+             20 * WT]. It is none of the numbers, and the ladder increases, so no expression \
+             rung can equal it: none lies between 100 and 200, the numbers either side of 150.",
+        ),
+        // Two numbers above the expression rung: only the nearest one, 100, rules it out
+        // (#2667 N3 review M1 — comparing against the farthest, 200, would let it parse).
+        (
+            "150",
+            "[0, 30 * WT]",
+            Some("[20 * WT, 100, 200]"),
+            "[adaptive_dosing]: start_dose 150 must be one of the declared levels [20 * WT, \
+             100, 200]. It is none of the numbers, and the ladder increases, so no expression \
+             rung can equal it: none lies between 100 and 200, the numbers either side of 150.",
+        ),
+        (
+            "250",
+            "[0, 30 * WT]",
+            Some("[100, 10 * WT, 200]"),
+            "[adaptive_dosing]: start_dose 250 must be one of the declared levels [100, 10 * \
+             WT, 200]. It is none of the numbers, and the ladder increases, so no expression \
+             rung can equal it: none lies above 200, the highest number.",
+        ),
+        (
+            "500",
+            "[-1, 30 * WT]",
+            None,
+            "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: [-1, 30 * WT]",
+        ),
+        // A negative numeric high beside an expression low: invalid on its own, since
+        // `0 <= low <= high` (#2667 review r2 N1). Without that check it would be reported
+        // as the start being outside the bounds.
+        (
+            "500",
+            "[5 * WT, -1]",
+            None,
+            "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: [5 * WT, -1]",
+        ),
+        (
+            "5",
+            "[10, 30 * WT]",
+            None,
+            "[adaptive_dosing]: start_dose 5 is outside dose_bounds [10, 30 * WT]",
+        ),
+        (
+            "500",
+            "[0, 30 * WT]",
+            Some("[500, 400, 20 * WT]"),
+            "[adaptive_dosing]: levels must be strictly increasing",
+        ),
+        (
+            "500",
+            "[0, 30 * WT]",
+            Some("[500, 10 * WT, 400]"),
+            "[adaptive_dosing]: levels must be strictly increasing",
+        ),
+        (
+            "600",
+            "[0, 30 * WT]",
+            Some("[500, 1000]"),
+            "[adaptive_dosing]: start_dose 600 must be one of the declared levels [500.0, 1000.0]",
+        ),
+        (
+            "10 * WT",
+            "[0, 450]",
+            Some("[100, 500, 20 * WT]"),
+            "[adaptive_dosing]: level 500 is outside dose_bounds [0, 450]",
+        ),
+    ];
+    for (start, bounds, levels, want) in refused {
+        let lines = block(start, bounds, levels);
+        let got = parse_adaptive_dosing_block(&lines).expect_err("refused at parse time");
+        assert_eq!(got, want, "{lines:?}");
+    }
+    // The same pairs with one side an expression: accepted here, checked per subject.
+    let parses: [(&str, &str, Option<&str>); 9] = [
+        // An expression rung that can take the start dose: between its numeric
+        // neighbours, below the first number, above the last (#2667 review r2 N3).
+        ("150", "[0, 30 * WT]", Some("[100, 20 * WT, 200]")),
+        ("50", "[0, 30 * WT]", Some("[10 * WT, 100, 200]")),
+        ("250", "[0, 30 * WT]", Some("[100, 200, 20 * WT]")),
+        ("500", "[0, 30 * WT]", None),
+        ("5 * WT", "[10, 30 * WT]", None),
+        ("500", "[0, 30 * WT]", Some("[400, 500, 20 * WT]")),
+        ("500", "[0, 30 * WT]", Some("[400, 10 * WT, 500]")),
+        ("600", "[0, 30 * WT]", Some("[500, 12 * WT]")),
+        ("10 * WT", "[0, 30 * WT]", Some("[100, 500, 20 * WT]")),
+    ];
+    for (start, bounds, levels) in parses {
+        let lines = block(start, bounds, levels);
+        if let Err(e) = parse_adaptive_dosing_block(&lines) {
+            panic!("{lines:?} should parse: {e}");
+        }
+    }
 }

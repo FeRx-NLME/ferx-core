@@ -205,6 +205,7 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -314,7 +315,7 @@ fn binary_logit_time_varying_covariate_is_rejected_only_without_aligned_snapshot
     let msg = tv_refusal(&model, &pop, "binary_model");
     assert_eq!(
         msg,
-        "[binary_model] on CMT=3: the logit predictor references covariate `X`, which is \
+        "[binary_model] on CMT=3: the linear predictor references covariate `X`, which is \
          time-varying for subject `S1`, but that subject carries no per-record covariate \
          snapshot aligned with its binary records (it also has time-to-event records, or was \
          built in memory without `endpoint_covariates`), so the predictor could only read the \
@@ -666,6 +667,7 @@ fn tiny_population() -> Population {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
             obs_l2: Vec::new(),
@@ -771,6 +773,9 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         nlopt_missing_algorithms: vec![],
         covariance_n_evals_estimated: None,
         trace_path: None,
+        trace_csv: None,
+        cov_fixed: Vec::new(),
+        interface_extras: None,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,

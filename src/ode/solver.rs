@@ -847,6 +847,19 @@ impl OdeSolverStats {
         }
     }
 
+    /// Steps force-accepted at `min_dt` over the error test on trajectories the caller
+    /// received: a clamp in an `auto` attempt the guard discarded is not one.
+    pub(crate) fn kept_clamped_steps(&self) -> usize {
+        self.min_step_clamped_steps
+            .saturating_sub(self.discarded_clamped_steps)
+    }
+
+    /// Unfinished segments among the trajectories the caller received.
+    pub(crate) fn kept_unfinished_segments(&self) -> usize {
+        self.unfinished_segments
+            .saturating_sub(self.discarded_unfinished_segments)
+    }
+
     /// Accumulate another integration's counters into these, for a caller that splits one
     /// logical solve across more than one driver call (the `auto` finite-guard's escalated
     /// attempt and its explicit re-solve).

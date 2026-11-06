@@ -68,7 +68,7 @@ The outer loop optimizer is selected independently of the method. See **[Outer O
 - You suspect the FOCE solution is a local minimum
 - The model has complex nonlinear random effect structure
 
-**Chain with IMP** (`method = [focei, imp]` or `[saem, imp]`) when you need a more accurate marginal likelihood for model selection — especially on sparse data where the Laplace approximation is biased.
+**Chain with IMP** (`method = [focei, imp]` or `[saem, imp]`, with `imp_eval_only = true`) when you need a more accurate marginal likelihood for model selection — especially on sparse data where the Laplace approximation is biased. Read it from `FitResult.importance_sampling`, not `ofv`. Without `imp_eval_only`, the `imp` stage re-estimates the parameters by Monte-Carlo EM instead of scoring the previous stage's fit.
 
 **Add SIR** (`sir = true`) when the covariance step fails or when you want non-parametric uncertainty intervals.
 
@@ -78,14 +78,17 @@ Methods can be chained so that each stage warm-starts from the previous result:
 
 ```
 [fit_options]
-  method = [saem, focei, imp]
+  method        = [saem, focei, imp]
+  imp_eval_only = true
 ```
 
-This runs SAEM to find the basin → FOCEI polishes to the marginal optimum → IMP computes an exact marginal log-likelihood. Any two- or three-stage combination is valid; the most common chains are:
+This runs SAEM to find the basin → FOCEI polishes to the FOCEI optimum → IMP evaluates the importance-sampled marginal `−2 log L` at those estimates (a Monte-Carlo estimate with a reported standard error, on `FitResult.importance_sampling`). Drop `imp_eval_only` and the `imp` stage *estimates* instead (NONMEM `METHOD=IMP`), moving the parameters away from FOCEI's. Any two- or three-stage combination is valid; the most common chains are:
 
 | Chain | Use case |
 |-------|----------|
 | `[saem, focei]` | Robust convergence + precise FOCE estimates |
 | `[gn, focei]` | Equivalent to `gn_hybrid` |
-| `[focei, imp]` | Exact marginal likelihood after a standard fit |
-| `[saem, focei, imp]` | Most thorough: robust start + polished estimates + exact OFV |
+| `[focei, imp]` + `imp_eval_only` | Importance-sampled marginal likelihood after a standard fit |
+| `[saem, imp]` + `imp_eval_only` | Importance-sampled marginal likelihood at the SAEM estimates (NONMEM `SAEM` → `IMP EONLY=1`) |
+| `[saem, focei, imp]` + `imp_eval_only` | Most thorough: robust start + polished estimates + importance-sampled OFV |
+| `[focei, imp]` | IMP estimation warm-started from FOCEI |

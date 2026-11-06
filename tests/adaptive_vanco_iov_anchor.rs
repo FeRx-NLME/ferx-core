@@ -119,6 +119,7 @@ fn anchor_subject(decision_times: &[f64]) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
         obs_l2: Vec::new(),
@@ -154,7 +155,7 @@ fn vanco_iov_example_parses_and_runs_the_verifier() {
         .as_ref()
         .expect("[adaptive_dosing] block present");
     assert_eq!(spec.start_dose, 500.0, "empiric start dose");
-    assert_eq!(spec.dose_bounds, (250.0, 4000.0));
+    assert_eq!(spec.dose_bounds, (250.0.into(), 4000.0.into()));
     assert_eq!(
         spec.target_window,
         Some((10.0, 15.0)),

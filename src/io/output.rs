@@ -1434,6 +1434,7 @@ pub fn print_results(result: &FitResult) {
         ErrorModel::Additive => "additive",
         ErrorModel::Proportional => "proportional",
         ErrorModel::Combined => "combined",
+        ErrorModel::LogCombined => "log_combined",
     };
     eprintln!("\n--- SIGMA Estimates ({}) ---", err_type);
     eprint!("{}", format_sigma_rows(result));
@@ -1457,6 +1458,12 @@ pub fn print_results(result: &FitResult) {
             "  ESS / K: min = {:.3}, median = {:.3}",
             imp.ess_min, imp.ess_median
         );
+        if imp.adapt_passes > 0 {
+            eprintln!(
+                "  Proposal adaptation: up to {} pilot passes",
+                imp.adapt_passes
+            );
+        }
         match imp.kappa_treatment {
             KappaTreatment::FixedAtMode => {
                 eprintln!(
@@ -1727,6 +1734,7 @@ pub fn format_summary(result: &FitResult) -> String {
         ErrorModel::Additive => "additive",
         ErrorModel::Proportional => "proportional",
         ErrorModel::Combined => "combined",
+        ErrorModel::LogCombined => "log_combined",
     };
     let _ = writeln!(out, "\n--- SIGMA ({}) ---", err_type);
     // The console's rows verbatim, as OMEGA and KAPPA above.
@@ -2091,12 +2099,11 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     // binary-only or TTE-only fit (no Gaussian rows at all, hence no `obs_cmts`) would
     // emit an sdtab with the endpoint CMT silently dropped.
     #[cfg(feature = "survival")]
-    let any_discrete = result
-        .subjects
-        .iter()
-        .any(|s| !s.discrete_rows.is_empty() || !s.tte_rows.is_empty());
+    let has_endpoint_rows =
+        |s: &SubjectResult| !s.discrete_rows.is_empty() || !s.tte_rows.is_empty();
     #[cfg(not(feature = "survival"))]
-    let any_discrete = false;
+    let has_endpoint_rows = |s: &SubjectResult| !s.discrete_rows.is_empty();
+    let any_discrete = result.subjects.iter().any(has_endpoint_rows);
     let any_multicmt = any_discrete
         || population
             .subjects
@@ -2336,7 +2343,6 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         }
     }
 
-    #[cfg(feature = "survival")]
     append_discrete_rows(&mut cols, result, population);
     #[cfg(feature = "survival")]
     append_tte_rows(&mut cols, result, population);
@@ -2359,7 +2365,6 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
 /// `CWRES` is deliberately blank: the conditional weighted residual is defined through
 /// the Gaussian residual-variance model, and there is none for a Bernoulli outcome.
 /// `IWRES` carries the standardized (Pearson) residual instead.
-#[cfg(feature = "survival")]
 fn append_discrete_rows(
     cols: &mut [(String, Vec<f64>)],
     result: &FitResult,
@@ -2400,9 +2405,11 @@ fn append_discrete_rows(
     }
 }
 
-/// The four per-record time-to-event residual columns (#901), in sdtab order.
+/// The four per-record time-to-event residual columns (#901), in sdtab order. The
+/// `.fitrx` bundle's `predictions_tte.csv` (#911) reads its header from this list, so the
+/// sdtab and the bundle name the same columns.
 #[cfg(feature = "survival")]
-const TTE_RESIDUAL_COLUMNS: [&str; 4] = ["COXSNELL", "MARTINGALE", "DEVIANCE", "PIT"];
+pub const TTE_RESIDUAL_COLUMNS: [&str; 4] = ["COXSNELL", "MARTINGALE", "DEVIANCE", "PIT"];
 
 /// Append one sdtab row per time-to-event record, after the Gaussian and the discrete
 /// rows (#901): rows are grouped by endpoint family, never interleaved by subject, so a
@@ -2460,32 +2467,27 @@ pub fn write_sdtab_csv(
     population: &Population,
     path: &str,
 ) -> Result<(), String> {
-    // A result restored from a `.fitrx` checkpoint carries no per-record discrete
-    // diagnostics — the bundle doesn't round-trip them (see `io::fitrx::parse_subjects`).
-    // Writing anyway would emit a table silently missing every discrete-endpoint row
-    // (header-only for a binary-only fit, since the columns exist but are zero-length, so
-    // the `cols.is_empty()` check below never fires). Refuse instead.
+    // A `.fitrx` bundle carries the per-record time-to-event rows (`predictions_tte.csv`,
+    // #911) and the discrete rows (`predictions_discrete.csv`, #2695), so a restored fit
+    // writes the table the live one did. A bundle written before #911 has no TTE entry:
+    // writing its fit anyway would emit a table silently missing every event row, so
+    // refuse.
     //
     // The discriminator is `restored_from_checkpoint` AND "the restored model declares a
-    // binary endpoint" — NOT "the reconstructed population has discrete records". The
-    // population is not a usable signal: `load_fit` re-reads the bundled data through
-    // `read_nonmem_csv_mapped`, which uses the default (Gaussian) `ObsRouting`, so a binary
-    // DV comes back as an ordinary continuous observation and the population carries *no*
-    // `DiscreteState` records at all — keying on `obs_records` (as an earlier revision did)
-    // therefore never fired on a real restore, and its test only passed on a hand-built
-    // population that `load_fit` cannot produce. `model_text` *is* round-tripped, so parse
-    // it and ask the direct question: would a live fit of this model have produced
-    // `discrete_rows` or `tte_rows`? `binary_cmts()` is binary-only (not CTMM), so a
-    // restored CTMM fit — which legitimately produces no `discrete_rows` live or restored
-    // (occupancy is #820) — is correctly *allowed* through. #911 removes this once
-    // diagnostics round-trip.
+    // time-to-event endpoint" (read from the round-tripped `model_text`, since a restored
+    // fit may have no population to ask) AND "no subject carries a TTE row". The last
+    // stands in for "the bundle had no TTE entry", and the two coincide because a fit of a
+    // TTE model always has rows: `fit()` refuses a declared endpoint with no routed record
+    // (`E_ENDPOINT_NO_RECORDS`, `check_endpoint_routing`), and `tte_record_diagnostics`
+    // emits one row per event record, so the writer, which writes the entry whenever any
+    // subject has a row, always writes it for such a fit.
     #[cfg(feature = "survival")]
     if result.restored_from_checkpoint {
         if let Some(msg) = result
             .model_text
             .as_deref()
             .and_then(|src| crate::parser::model_parser::parse_full_model(src).ok())
-            .and_then(|parsed| restored_sdtab_refusal(&parsed.model))
+            .and_then(|parsed| restored_sdtab_refusal(&parsed.model, result))
         {
             return Err(msg);
         }
@@ -2529,28 +2531,24 @@ pub fn write_sdtab_csv(
     Ok(())
 }
 
-/// Why a restored fit of `model` cannot write sdtab, or `None` when it can: the model
-/// declares a binary or a time-to-event endpoint, whose per-record rows a `.fitrx`
-/// checkpoint does not round-trip (#911), so the table would silently lack them.
+/// Why the restored fit `result` of `model` cannot write sdtab, or `None` when it can: the
+/// model declares a time-to-event endpoint but no subject carries a TTE row, which is a
+/// `.fitrx` bundle written before those rows were bundled (#911), so the table would
+/// silently lack them.
 #[cfg(feature = "survival")]
-fn restored_sdtab_refusal(model: &crate::types::CompiledModel) -> Option<String> {
-    let kinds: Vec<&str> = [
-        (!model.binary_cmts().is_empty()).then_some("a [binary_model] endpoint"),
-        model.has_tte().then_some("a time-to-event endpoint"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if kinds.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "refusing to write sdtab: this fit was restored from a `.fitrx` checkpoint, which \
-         does not round-trip per-record binary or time-to-event diagnostics, and the model \
-         declares {} — so the table would be silently missing those rows. Re-run the fit \
-         to write sdtab (#911).",
-        kinds.join(" and ")
-    ))
+fn restored_sdtab_refusal(
+    model: &crate::types::CompiledModel,
+    result: &FitResult,
+) -> Option<String> {
+    let has_rows = result.subjects.iter().any(|s| !s.tte_rows.is_empty());
+    (model.has_tte() && !has_rows).then(|| {
+        "refusing to write sdtab: this fit was restored from a `.fitrx` bundle written \
+         before time-to-event rows were bundled, and the model declares a time-to-event \
+         endpoint, so the table would be silently missing those rows. \
+         Re-run the fit to write sdtab, or, if the live fit is still in hand, save it again \
+         with a current ferx (#911)."
+            .to_string()
+    })
 }
 
 /// Write the covariate table (from a `[covariates]` block) as a CSV file.
@@ -3325,6 +3323,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         ErrorModel::Additive => "additive",
         ErrorModel::Proportional => "proportional",
         ErrorModel::Combined => "combined",
+        ErrorModel::LogCombined => "log_combined",
     };
     writeln!(f, "\nsigma:  # error model: {}", err_type_str).map_err(|e| e.to_string())?;
     // Sigma is stored on the SD scale (see src/stats/residual_error.rs).
@@ -3532,6 +3531,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             .map_err(|e| e.to_string())?;
         writeln!(f, "  ess_min: {:.4}", imp.ess_min).map_err(|e| e.to_string())?;
         writeln!(f, "  ess_median: {:.4}", imp.ess_median).map_err(|e| e.to_string())?;
+        writeln!(f, "  adapt_passes: {}", imp.adapt_passes).map_err(|e| e.to_string())?;
         let kt = match imp.kappa_treatment {
             KappaTreatment::NotApplicable => "not_applicable",
             KappaTreatment::FixedAtMode => "fixed_at_mode",
@@ -4113,6 +4113,9 @@ mod tests {
             nlopt_missing_algorithms: Vec::new(),
             covariance_n_evals_estimated: None,
             trace_path: None,
+            trace_csv: None,
+            cov_fixed: Vec::new(),
+            interface_extras: None,
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
@@ -5087,7 +5090,6 @@ mod tests {
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
-            #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
             #[cfg(feature = "survival")]
             tte_rows: Vec::new(),
@@ -5208,6 +5210,7 @@ mod tests {
             pk_only_covariates: vec![],
             reset_times: vec![],
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
             occasions: vec![],
             obs_l2: Vec::new(),
@@ -5299,6 +5302,9 @@ mod tests {
             nlopt_missing_algorithms: Vec::new(),
             covariance_n_evals_estimated: None,
             trace_path: None,
+            trace_csv: None,
+            cov_fixed: Vec::new(),
+            interface_extras: None,
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
@@ -5702,16 +5708,19 @@ mod tests {
         assert_eq!(col(&cols, "MIXNUM").unwrap()[3..], [1.0, 2.0, 2.0]);
     }
 
-    /// T9 (#901): the restored-fit refusal over model × {binary, TTE, both, neither}.
-    /// A restored `.fitrx` fit carries no `tte_rows`, so a TTE model must be refused
-    /// like a binary one, the message naming what the model declares and #911; a model
-    /// with neither still writes.
+    /// T9 (#901), T6 (#911): the restored-fit refusal over model × {binary, TTE, both,
+    /// neither} × {TTE rows, none}. A `.fitrx` bundle carries the TTE rows since #911, so a
+    /// restored fit is refused only when its model declares a TTE endpoint **and** no
+    /// subject has a row — a bundle written before #911. Discrete rows round-trip (#2695),
+    /// so a binary model is never refused.
     ///
-    /// Dies on: the refusal keyed on binary only, a message that names "binary" for a
-    /// TTE-only model, a refusal of a model with neither.
+    /// Dies on: a refusal that still reads the binary endpoints, one that ignores the TTE
+    /// endpoint, one keyed on the TTE endpoint alone (refuses a restored fit that has its
+    /// rows), one keyed on the rows alone (refuses a binary or Gaussian model), and the
+    /// deletion of either sentence of the message.
     #[cfg(feature = "survival")]
     #[test]
-    fn restored_sdtab_refusal_names_binary_and_tte_endpoints() {
+    fn restored_sdtab_refusal_is_keyed_on_a_tte_endpoint_without_rows() {
         const PARAMS: &str = "
 [parameters]
   theta TH0(0.1, 0.001, 10.0)
@@ -5737,30 +5746,50 @@ mod tests {
 [error_model]
   DV ~ additive(SIG)
 ";
-        let refusal = |body: &str, sigma: bool| {
+        let no_rows = minimal_sdtab_result(vec![sdtab_subject_result("1", 1)]);
+        let mut with_rows = no_rows.clone();
+        with_rows.subjects[0].tte_rows.push(tte_row(5.0, 1.0, 0.5));
+        let refusal = |body: &str, sigma: bool, result: &FitResult| {
             let src = format!(
                 "{PARAMS}{}{body}",
                 if sigma { "  sigma SIG ~ 0.1\n" } else { "" }
             );
             let model = crate::parser::model_parser::parse_model_string(&src)
                 .unwrap_or_else(|e| panic!("{e}\n{src}"));
-            restored_sdtab_refusal(&model)
+            restored_sdtab_refusal(&model, result)
         };
-        let binary = refusal(BINARY, false).expect("binary refused");
-        assert!(binary.contains("[binary_model]") && !binary.contains("time-to-event endpoint"));
-        let tte = refusal(TTE, false).expect("TTE refused");
-        assert!(tte.contains("a time-to-event endpoint") && !tte.contains("[binary_model]"));
-        let both = refusal(&format!("{BINARY}{TTE}"), false).expect("both refused");
-        assert!(both.contains("[binary_model] endpoint and a time-to-event endpoint"));
-        for msg in [&binary, &tte, &both] {
-            assert!(msg.contains("restored") && msg.contains("fitrx") && msg.contains("#911"));
+        // Binary rows round-trip (#2695), so a binary model alone is not refused, and
+        // neither is a Gaussian one — with or without TTE rows on the result.
+        for r in [&no_rows, &with_rows] {
+            assert_eq!(refusal(BINARY, false, r), None);
+            assert_eq!(refusal(GAUSSIAN, true, r), None);
         }
-        assert_eq!(refusal(GAUSSIAN, true), None);
+        // A TTE model whose bundle carried its rows (#911) is not refused either.
+        assert_eq!(refusal(TTE, false, &with_rows), None);
+        assert_eq!(refusal(&format!("{BINARY}{TTE}"), false, &with_rows), None);
+        // A TTE model with no rows is a bundle written before #911: refused.
+        let tte = refusal(TTE, false, &no_rows).expect("TTE without rows refused");
+        assert_eq!(
+            refusal(&format!("{BINARY}{TTE}"), false, &no_rows).as_ref(),
+            Some(&tte)
+        );
+        // First sentence: what the bundle lacks and why that matters.
+        assert!(
+            tte.contains("restored from a `.fitrx` bundle written before"),
+            "{tte}"
+        );
+        assert!(tte.contains("time-to-event rows were bundled"), "{tte}");
+        assert!(tte.contains("declares a time-to-event endpoint"), "{tte}");
+        assert!(tte.contains("silently missing those rows"), "{tte}");
+        // Second sentence: the two ways out, and the issue.
+        assert!(tte.contains("Re-run the fit"), "{tte}");
+        assert!(tte.contains("save it again with a current ferx"), "{tte}");
+        assert!(tte.contains("#911"), "{tte}");
+        // No longer true after #911, and never about the binary endpoint.
+        assert!(!tte.contains("does not round-trip"), "{tte}");
+        assert!(!tte.contains("binary"), "{tte}");
 
-        // Wired into the writer: a restored TTE fit is refused before any file exists.
-        let mut result = minimal_sdtab_result(vec![sdtab_subject_result("1", 1)]);
-        result.restored_from_checkpoint = true;
-        result.model_text = Some(format!("{PARAMS}{TTE}"));
+        // Wired into the writer: a restored TTE fit with its rows writes the table ...
         let population = Population {
             subjects: vec![sdtab_subject("1", 1, vec![1])],
             covariate_names: vec![],
@@ -5770,6 +5799,18 @@ mod tests {
             warnings: vec![],
         };
         let dir = tempfile::tempdir().unwrap();
+        let mut restored = with_rows.clone();
+        restored.restored_from_checkpoint = true;
+        restored.model_text = Some(format!("{PARAMS}{TTE}"));
+        let ok_path = dir.path().join("sdtab_rows.csv");
+        write_sdtab_csv(&restored, &population, ok_path.to_str().unwrap())
+            .expect("a restored TTE fit with its rows writes sdtab");
+        assert!(ok_path.exists());
+
+        // ... and one without them is refused before any file exists.
+        let mut result = no_rows;
+        result.restored_from_checkpoint = true;
+        result.model_text = Some(format!("{PARAMS}{TTE}"));
         let path = dir.path().join("sdtab.csv");
         let err = write_sdtab_csv(&result, &population, path.to_str().unwrap()).unwrap_err();
         assert_eq!(err, tte);
@@ -5941,7 +5982,6 @@ mod tests {
             extra_columns: Vec::new(),
             per_obs_tad: Vec::new(),
             compartment_states: Vec::new(),
-            #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
             #[cfg(feature = "survival")]
             tte_rows: Vec::new(),
@@ -6793,6 +6833,7 @@ mod tests {
             proposal_df: 5.0,
             ess_min: 0.05,
             ess_median: 0.6,
+            adapt_passes: 5,
             kappa_treatment: KappaTreatment::FixedAtMode,
         });
         // SIR CIs for theta/omega/sigma.
@@ -6893,6 +6934,7 @@ mod tests {
         assert!(yaml.contains("\nimportance_sampling:"));
         assert!(yaml.contains("  kappa_treatment: fixed_at_mode"));
         assert!(yaml.contains("  low_ess_subjects:") && yaml.contains("- id: \"S3\""));
+        assert!(yaml.contains("  adapt_passes: 5\n"));
         // Bayesian posterior block.
         assert!(yaml.contains("\nbayes:"));
         assert!(yaml.contains("  max_rhat: 1.0100"));
@@ -7314,6 +7356,7 @@ mod tests {
             ess_min: 0.5,
             ess_median: 0.8,
             kappa_treatment,
+            adapt_passes: 0,
         });
         r
     }
@@ -7482,6 +7525,7 @@ mod tests {
             proposal_df: 4.0,
             ess_min: 0.9,
             ess_median: 0.95,
+            adapt_passes: 0,
             kappa_treatment: KappaTreatment::Marginalized,
         });
         r.covariance_status = CovarianceStatus::Failed;
@@ -8276,6 +8320,7 @@ mod tests {
             ess_min: 0.9,
             ess_median: 0.95,
             kappa_treatment: KappaTreatment::NotApplicable,
+            adapt_passes: 0,
         };
         let mut r = classified_result();
         r.importance_sampling = Some(is_with(f64::INFINITY));

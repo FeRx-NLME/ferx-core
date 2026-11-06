@@ -53,11 +53,19 @@ const DEFAULT_THREADS_CAP: usize = 8;
 
 /// Core cap arithmetic for the unpinned default thread count, split out from
 /// [`default_thread_count`] so it is testable without depending on the host's actual
-/// core count: leave one core free for the OS/other work, and don't scale past
+/// core count: leave one core free for the OS/other work (but never drop below two workers where
+/// two cores exist), and don't scale past
 /// [`DEFAULT_THREADS_CAP`] even on much larger machines, since most fits see no benefit
 /// from spreading across every core and (notably on Apple Silicon) not all cores are equal.
+///
+/// Never fewer than two workers where two cores exist: leaving one free on a two-core host
+/// left a single worker, every fit serial (measured equal to one core on a 2-core
+/// affinity, #2706 follow-up), so the free core bought nothing but half the throughput.
 pub(crate) fn cap_default_threads(available: usize) -> usize {
-    available.saturating_sub(1).clamp(1, DEFAULT_THREADS_CAP)
+    available
+        .saturating_sub(1)
+        .max(available.min(2))
+        .clamp(1, DEFAULT_THREADS_CAP)
 }
 
 /// Default worker-thread count used when nothing pins an explicit count (`threads` unset
@@ -81,10 +89,10 @@ pub(crate) fn default_thread_count() -> usize {
 static EXPLICIT_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Declare the worker count this process should fit with, overriding the automatic default
-/// (available cores minus one, capped at 8). Intended for a CLI binary applying its
-/// `--threads N` before the first fit; library callers that want a pinned thread count for
-/// a single fit should use `FitOptions::threads` instead, which exclusively leases a pool
-/// for that call.
+/// (available cores minus one, at least two where two cores exist, capped at 8). Intended for
+/// a CLI binary applying its `--threads N` before the first fit; library callers that want a
+/// pinned thread count for a single fit should use `FitOptions::threads` instead, which
+/// exclusively leases a pool for that call.
 ///
 /// **This does not build Rayon's global pool** (#1460), despite the name it has carried
 /// since #707. It used to: `--threads N` called `build_global` with `N`, and then every
@@ -142,7 +150,7 @@ pub(crate) fn reconfiguration_result(already: usize, requested: usize) -> Result
 /// spawn-and-tear-down a fresh `N × 32 MiB` pool (which oversubscribes CPUs and can
 /// exhaust address space).
 ///
-/// Sized by [`default_thread_count`] (available cores minus one, capped at 8 — #707): most
+/// Sized by [`default_thread_count`] (available cores minus one, at least two where two cores exist, capped at 8 — #707): most
 /// fits gain little from spreading across every core, and not all cores are equal on
 /// asymmetric platforms (e.g. Apple Silicon E-cores). A caller that declared an explicit
 /// process-wide width via [`configure_global_thread_pool`] (the CLI's `--threads N`) is

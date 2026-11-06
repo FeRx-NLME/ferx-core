@@ -388,11 +388,7 @@ So since #2462 every such stop that would be reported converged is first checked
 - the inner loop at `inner_tol = 1e-10` (or your own, if tighter) for that leg only,
 - the leg's own best point, ranked at that tolerance,
 - the stagnation guard off, and
-- the EBEs of its first evaluation solved from η = 0.
-
-The last item is needed. Started from the incumbent's own modes, a subject's inner solve can fall
-back to Nelder–Mead at exactly that point and score it slightly below every neighbour, so the leg's
-first line search fails and gains nothing.
+- the EBEs of its first evaluation solved from the incumbent's own modes (#2549).
 
 A leg **settles** the stop when it lowered its own objective by at most 3e-5. The first leg also
 settles when it lowered it by at most 1e-3, the objective's noise floor (#2507): it ran to its own
@@ -424,6 +420,42 @@ in total and doubled the wall time (9.7 s to 20.7 s for 80 fits); on `warfarin_i
 evaluations to a 49-evaluation fit. The fit's reported OFV is still the final cold
 re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather than the +4e-8 the
 leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) and mixtures do not take the leg.
+
+#### Rounds from outside the incumbent's modes
+
+A leg started at the incumbent can verify a stop that a different start would leave, so once the
+legs have settled, two more rounds of legs may run (#2645). Each opens from somewhere the legs could
+not reach, and the fit keeps a round only if it ended lower; otherwise the incumbent and its verdict
+stand. Neither start wins everywhere, which is why the warm legs run first: a cold start left a
+subject unconverged on the `transit_flip_flop` ODE twin, and on one simulated dataset the cold
+round ended several OFV above the incumbent.
+
+- **From a cold solve's modes.** A cold solve at the verified point runs, and if any subject's `−2LL`
+  term differs from the incumbent's by more than 1e-3, *in either direction*, a round starts at the
+  cold modes. The direction matters: a subject's other mode can score worse at the incumbent and
+  still lead to a lower optimum in θ, so comparing subjects at that point finds nothing. On a
+  24-subject 3-compartment benchmark the cold solve scored −3038.866 against the incumbent's
+  −3038.980, and the round ended at −3039.288158, NONMEM's −3039.2882. Starting *at* those modes
+  means the first evaluation re-solves them warm, so a subject left unconverged cold is not what
+  the EBE guard judges.
+- **From a Newton step.** When the BHHH decrement says a Newton step would still gain more than 0.1
+  OFV, a round starts along that step, capped at 0.3 on any packed coordinate (a full step
+  overshoots: `S` is nearly singular along the valley it is for). A leg restarts L-BFGS with no
+  curvature memory, so on a long valley its first line search can fail at a point that is no
+  minimum. On a 1518-subject ODE + IOV benchmark with two nearly confounded parameters, the fit
+  stopped at 126579.41 with |g|∞ 4.26 and a predicted gain of 7.9 (macOS arm64; the same start
+  needs no round on Linux); the round reached 126565.48 with |g|∞ 0.08, in about 40% more wall
+  time. The step needs more subjects than coordinates it moves: below that `S` is rank-deficient and
+  the decrement measures nothing, so no round runs.
+
+On a fit whose modes do not depend on the start and which sits at its optimum, the two checks cost
+one inner pass and one gradient pass, and no leg. That was every bundled example that reached a
+leg.
+
+A stop that a restart would take takes no round: one whose cold solve is inconsistent with it, or
+beats it. A round could lower such a stop just enough to pass those checks, and the restart that
+would have gone further would never run. On one simulated dataset, rounds took a stop at 778.06
+(cold 781.31) to 777.17, reported converged, where the restarts reach 775.45.
 
 #### Inner searches stuck at their mode {#inner-search-stuck-at-mode}
 

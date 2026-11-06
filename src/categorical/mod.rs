@@ -52,9 +52,20 @@ fn inv_logit(x: f64) -> f64 {
 /// third-order jets and the covariance step's nested duals read past the second (#2482),
 /// which a second-order lift would leave zero. The `f64` instance is the stable form above,
 /// bit for bit.
+///
+/// Under the probit link (#2603) the record term is `−log Φ(s·lp)` with `s = 2y − 1`, by
+/// `Φ(−x) = 1 − Φ(x)`: one function of `x = s·lp` for both outcomes, lifted from
+/// [`neg_log_normal_cdf_jet`], whose value and derivatives never form `Φ` in the lower tail
+/// (below `x = −2`), where it would underflow.
 #[inline]
 fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) -> T {
     match link {
+        LinkFn::Probit => {
+            let s = if y > 0.5 { 1.0 } else { -1.0 };
+            let [v, d1, d2, d3, d4] = neg_log_normal_cdf_jet(s * lp.val());
+            // d^k/dlp^k g(s·lp) = s^k g^(k)(s·lp), and s^2 = 1.
+            lp.lift4(v, s * d1, d2, s * d3, d4)
+        }
         LinkFn::Logit => {
             let x = lp.val();
             let p = inv_logit(x);
@@ -68,6 +79,61 @@ fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) 
             ) - T::from_f64(y) * lp
         }
     }
+}
+
+/// Below this `x`, [`neg_log_normal_cdf_jet`] takes the lower-tail continued fraction.
+const PROBIT_CF_BELOW: f64 = -2.0;
+
+/// `g(x) = −log Φ(x)` and its first four derivatives, the probit record term of
+/// [`binary_record_nll_g`] (#2603). Accurate to `f64` rounding in both tails, which the
+/// direct recursion in the inverse Mills ratio `m = φ/Φ` is not.
+///
+/// **From `x = −2` up**, `Φ` is at least 0.02, so `m = φ(x)/Φ(x)` is formed directly and the
+/// derivatives follow from `m′ = −m(x + m)` (no cancellation there, since `x + m > 0` is not
+/// small):
+///
+/// ```text
+/// g′ = −m,   g″ = −m′,   g‴ = −m″,   g⁗ = −m‴
+/// m″ = −m′(x + m) − m(1 + m′)
+/// m‴ = −m″(x + m) − 2m′(1 + m′) − m·m″
+/// ```
+///
+/// The value is `−ln Φ(x)` for `x ≤ 0` and `−ln_1p(−Φ(−x))` above, so the upper tail keeps
+/// its digits (`Φ(30)` is `1` in `f64`, but `−log Φ(30) = 4.9e-198`).
+///
+/// **Below `x = −2`** that recursion cancels: with `t = −x`, `m ≈ t + 1/t`, so `x + m ≈ 1/t`
+/// and `g‴ ≈ −2/t³` come out of differences of `O(t)` numbers, all digits lost by
+/// `t ≈ 40`. There `g = t²/2 + ½ln 2π + L(t)`, `L = −ln R` with `R = Q/φ` the Mills ratio,
+/// and `L′(t) = m − t = a` is the Laplace continued fraction
+/// `a = 1/(t + 2/(t + 3/(t + …)))`, a sum of positive terms. It is evaluated on a third-order
+/// Taylor jet in `t`, which gives `a`, `a′`, `a″`, `a‴` without a single subtraction, and
+/// `d/dx = −d/dt` maps them over: `g′ = −(t + a)`, `g″ = 1 + a′`, `g‴ = −a″`, `g⁗ = a‴`,
+/// value `t²/2 + ½ln 2π + ln(t + a)`. Nothing forms `Φ`, so nothing underflows, however far
+/// out `x` is.
+pub(crate) fn neg_log_normal_cdf_jet(x: f64) -> [f64; 5] {
+    use crate::stats::special::normal_cdf;
+    if x < PROBIT_CF_BELOW {
+        use crate::sens::taylor::Taylor;
+        let t = -x;
+        let a = crate::stats::special::mills_excess(Taylor::<1, 3, 4>::seed(t, 0));
+        // `c[k]` is the k-th derivative over k!.
+        let (a0, a1, a2, a3) = (a.c[0], a.c[1], 2.0 * a.c[2], 6.0 * a.c[3]);
+        let value = 0.5 * t * t + 0.5 * std::f64::consts::TAU.ln() + (t + a0).ln();
+        return [value, -(t + a0), 1.0 + a1, -a2, a3];
+    }
+    let phi = (-0.5 * x * x).exp() / std::f64::consts::TAU.sqrt();
+    let cdf = normal_cdf(x);
+    let value = if x > 0.0 {
+        -(-normal_cdf(-x)).ln_1p()
+    } else {
+        -cdf.ln()
+    };
+    let m = phi / cdf;
+    let a = x + m;
+    let m1 = -m * a;
+    let m2 = -m1 * a - m * (1.0 + m1);
+    let m3 = -m2 * a - 2.0 * m1 * (1.0 + m1) - m * m2;
+    [value, -m, -m1, -m2, -m3]
 }
 
 /// Evaluate the linear predictor once per binary record on `cmt`, invoking
@@ -219,6 +285,7 @@ pub(crate) fn binary_data_term(
 fn binary_prob(link: LinkFn, lp: f64) -> f64 {
     match link {
         LinkFn::Logit => inv_logit(lp),
+        LinkFn::Probit => crate::stats::special::pnorm(lp),
     }
 }
 
@@ -533,7 +600,8 @@ pub fn simulate_binary<R: rand::Rng>(
             warnings.push(format!(
                 "[binary_model] cmt = {cmt}: subject {} has {n_nonfinite} record(s) whose linear \
                  predictor evaluated to NaN — those rows were skipped and carry no simulated \
-                 outcome. Check the `logit` expression and the subject's covariates.",
+                 outcome. Check the linear predictor (`logit =` / `probit =`) and the subject's \
+                 covariates.",
                 subject.id
             ));
         }
@@ -1173,3 +1241,7 @@ mod per_record_covariate_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "probit_tests.rs"]
+mod probit_tests;

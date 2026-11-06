@@ -26,7 +26,7 @@
 
 use crate::sens::num::PkNum;
 use crate::sens::rtape::DualT;
-use crate::stats::residual_error::ResidualCov;
+use crate::stats::residual_error::{LoadingForm, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 
 /// The population parameters the likelihood reads directly, as kernel values: Ω (by
@@ -232,8 +232,9 @@ impl<'a> LikCtx<'a> {
     }
 
     /// Row `j`'s σ loadings at prediction `f`, as generic values: a constant slot's
-    /// coefficient, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
-    /// `power(...)` exponent — each times the custom magnitude multiplier. The same
+    /// `1`, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
+    /// `power(...)` exponent — and a `LogCombined` additive slot's `exp(−f)` (#2729),
+    /// each times the custom magnitude multiplier. The same
     /// loadings as `ErrorSpec::scaled_loadings`, built in `T` arithmetic so every order
     /// of derivative in `f`, `θ` and `η` is exact without a hand-written rule. Returned
     /// in a fixed buffer with its length (no allocation per row).
@@ -246,14 +247,13 @@ impl<'a> LikCtx<'a> {
         let n_sigma = p.sigma.len();
         let mult = p.ruv_mult.as_ref().and_then(|m| m.get(j));
         let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
-        let (shape, len) = self
+        let shape = self
             .model
             .error_spec
-            .sigma_loading_shape(self.keys[j], self.params.sigma.values.len());
-        for (o, &(idx, c0, slope)) in out.iter_mut().zip(&shape[..len]) {
-            let c = if slope == 0.0 {
-                T::from_f64(c0)
-            } else {
+            .loading_shape(self.keys[j], self.params.sigma.values.len());
+        let len = shape.len();
+        for (o, &(idx, form)) in out.iter_mut().zip(shape.iter()) {
+            let c = if form == LoadingForm::Prop {
                 // `slot_exponent`: the exponent half of the row, when present.
                 match mult
                     .filter(|m| m.len() == 2 * n_sigma)
@@ -266,8 +266,10 @@ impl<'a> LikCtx<'a> {
                             T::from_f64(if f.val() < 0.0 { -1.0 } else { 1.0 }) * f.abs().pow(pw)
                         }
                     }
-                    _ => T::from_f64(c0) + f * T::from_f64(slope),
+                    _ => form.coeff_g(f),
                 }
+            } else {
+                form.coeff_g(f)
             };
             let m = mult
                 .and_then(|m| m.get(idx).copied())
@@ -1291,4 +1293,52 @@ fn chol_solve<T: PkNum>(l: &[Vec<T>], b: &[T]) -> Vec<T> {
         y[i] = s / l[i][i];
     }
     y
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sens::dual2::Dual2;
+
+    /// #2762 on the adjoint's M3 kernel (`m3_terms`, behind the exact FOCEI gradient, `H̃`
+    /// and R-matrix). It lifts the f64 `log_normal_cdf` / `inv_mills` by hand, so the value-
+    /// path likelihood test never reaches it (#2767 review r1 #4). A censored limit at `±1e300`
+    /// puts `z` past the `normal_cdf` overflow, where `log_normal_cdf` was `NaN`. It must score
+    /// bit for bit like `±1e6`, where `Φ` already rounds to `1`: value and `g2` (the `H̃` term
+    /// every M3 row adds), each with its jet in `f`.
+    ///
+    /// Not asserted: `cz`/`cm`. They form `h·z²`, which is `0·∞ = NaN` once `z²` overflows,
+    /// and they enter `H̃` only under `iiv_on_ruv`. That is the residual tracked in the
+    /// follow-up issue, not something this gate changes.
+    #[test]
+    fn m3_terms_score_a_limit_past_the_normal_cdf_overflow_as_certain() {
+        // Proportional error at f = 1, σ = 0.1: v = σ²f², d = 2σ²f, d2 = 2σ², all carried
+        // in the dual so the jets of the terms move with f.
+        let terms = |limit: f64, cens: i8| {
+            let f = Dual2::<1>::var(1.0, 0);
+            let s2 = Dual2::<1>::from_f64(0.01);
+            let two = Dual2::<1>::from_f64(2.0);
+            m3_terms(limit, f, s2 * f * f, two * s2 * f, two * s2, cens)
+        };
+        for (far, near, cens) in [(1e300, 1e6, 1), (-1e300, -1e6, -1)] {
+            // The straddle: (z/√2)² finite for the near limit, overflowing for the far one.
+            let sq = |limit: f64| ((limit - 1.0) / 0.1 / std::f64::consts::SQRT_2).powi(2);
+            assert!(sq(near).is_finite() && sq(far) == f64::INFINITY, "{far:e}");
+            let (got, want) = (terms(far, cens), terms(near, cens));
+            for (name, g, w) in [("value", got.0, want.0), ("g2", got.1, want.1)] {
+                assert!(w.val().is_finite(), "{name} control at {near:e}");
+                assert_eq!(g.val().to_bits(), w.val().to_bits(), "{name} at {far:e}");
+                assert_eq!(
+                    g.grad[0].to_bits(),
+                    w.grad[0].to_bits(),
+                    "∂{name}/∂f at {far:e}"
+                );
+                assert_eq!(
+                    g.hess[0][0].to_bits(),
+                    w.hess[0][0].to_bits(),
+                    "∂²{name}/∂f² at {far:e}"
+                );
+            }
+        }
+    }
 }

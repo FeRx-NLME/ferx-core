@@ -919,13 +919,7 @@ fn cov_ode_override(
     options: &FitOptions,
 ) -> Option<crate::ode::solver::OdeSolverOverride> {
     use crate::estimation::cov_diagnostics::{COV_FD_PLATEAU_ABSTOL, COV_FD_PLATEAU_RELTOL};
-    let spec = model.ode_spec.as_ref().or_else(|| {
-        model
-            .absorption_ode_equivalent
-            .as_ref()
-            .and_then(|eq| eq.built().ode_spec.as_ref())
-    })?;
-    let eff = spec.effective_solver_opts();
+    let eff = model.integrator_spec()?.effective_solver_opts();
     if eff.reltol <= COV_FD_PLATEAU_RELTOL && eff.abstol <= COV_FD_PLATEAU_ABSTOL {
         return None;
     }

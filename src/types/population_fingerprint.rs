@@ -395,6 +395,7 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         pk_only_covariates,
         reset_times,
         reset_covariates,
+        cmt_toggles,
         cens,
         occasions,
         obs_l2,
@@ -438,6 +439,15 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
     r.f64s(pk_only_times);
     r.f64s(pk_only_raw_times);
     r.f64s(reset_times);
+    // Only when present, so every population without one keeps the digest it had.
+    if !cmt_toggles.is_empty() {
+        r.len(cmt_toggles.len());
+        cmt_toggles.iter().for_each(|c| {
+            r.usize(c.pk_only);
+            r.usize(c.state);
+            r.usize(usize::from(c.on));
+        });
+    }
     r.len(reset_period_times.len());
     reset_period_times
         .iter()
@@ -512,6 +522,8 @@ fn dose(e: &mut Encoder, d: &DoseEvent) {
         // labels records for the #2104 warning's count.
         evid4: _,
         implied,
+        // Not hashed: derived from `Subject::cmt_toggles`, which is.
+        off_at: _,
     } = d;
     e.f64(*time);
     e.f64(*amt);

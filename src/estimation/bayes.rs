@@ -2084,6 +2084,7 @@ pub fn run_bayes(
         let posteriors = crate::estimation::outer_optimizer::MixturePosteriors {
             pmix: meval.pmix.clone(),
             mixest: meval.mixest.clone(),
+            n_fd_h_redone: meval.n_fd_h_redone,
         };
         (
             meval.mixest_etas,
@@ -2259,6 +2260,8 @@ pub fn run_bayes(
         mixture_posteriors,
         vi: None,
         start_eval: None,
+        mcem_lowest_objective: None,
+        mcem_objective_trail: None,
     })
 }
 
