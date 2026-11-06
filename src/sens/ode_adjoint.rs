@@ -1892,6 +1892,46 @@ fn closed_form_finish<T: VmNum>(
     Some(preds)
 }
 
+/// The gates of [`record_analytic_events`], which read the model and the subject's records
+/// alone, never a parameter value: a decline here holds at every parameter point.
+///
+/// The program must cover every slot the closed form reads, and read the combined `[η, κ]`
+/// the records hand it. Beyond that, only what the shared walk or production semantics
+/// require. The forward provider's dispatch-width, readout-slot and IOV gates do not apply
+/// to a recorder that hands the walk taped parameters: a compartment-free model has no walk;
+/// the walk lacks the pre-arrival SS overlay under a lag; a modeled dose needs its slot.
+fn events_walk_declines_shape(model: &CompiledModel, subject: &Subject) -> bool {
+    use crate::sens::provider as pv;
+    pv::analytic_param_program(model)
+        .filter(|p| p.n_eta_axis() == model.n_eta + model.n_kappa)
+        .is_none()
+        || model.is_algebraic()
+        || !closed_form_serves(model, subject)
+        || pv::ss_lagtime_walk_unsupported(model, subject)
+        || !pv::modeled_dose_analytic_gate(model, subject)
+}
+
+/// Whether the recorder [`record_cells`] dispatches `subject` to declines it for its data
+/// shape: a gate that reads the model and the records alone, so the decline holds at every
+/// parameter point (#2713 review). Only the closed-form recorders have such gates in front
+/// of their values, so this is `false` for an ODE or algebraic model. `false` is no promise
+/// that the recording succeeds: a decline that depends on parameter values (the
+/// separability of a modeled infusion window, an ODE step that cannot be formed, a
+/// non-finite prediction) is a failed recording, not a shape.
+fn recorder_declines_shape(model: &CompiledModel, subject: &Subject) -> bool {
+    if model.is_algebraic() || model.ode_spec.is_some() {
+        return false;
+    }
+    if model.n_kappa > 0
+        || crate::sens::provider::subject_routes_to_event_walk(model, subject)
+        || closed_form_reshapes_f_window(model, subject)
+    {
+        events_walk_declines_shape(model, subject)
+    } else {
+        !closed_form_serves(model, subject)
+    }
+}
+
 /// Closed-form event engine: the event-driven walk (`closed_form_event_predictions`) fed
 /// each dose, observation and pk-only row its own parameter set — its covariate snapshot
 /// and time, and under IOV its occasion's `[η, κ_g]` — exactly as `fill_record_params` /
@@ -1914,21 +1954,11 @@ fn record_analytic_events<T: VmNum>(
         PK_IDX_CL, PK_IDX_F, PK_IDX_KA, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
     };
     let iov = model.n_kappa > 0;
-    // The program must cover every slot the closed form reads, and read the combined
-    // `[η, κ]` the records hand it.
-    let prog = pv::analytic_param_program(model)
-        .filter(|p| p.n_eta_axis() == model.n_eta + model.n_kappa)?;
-    // Only what the shared walk or production semantics require — the forward provider's
-    // dispatch-width, readout-slot and IOV gates do not apply to a recorder that hands the
-    // walk taped parameters: a compartment-free model has no walk; the walk lacks the
-    // pre-arrival SS overlay under a lag; a modeled dose needs its slot.
-    if model.is_algebraic()
-        || !closed_form_serves(model, subject)
-        || pv::ss_lagtime_walk_unsupported(model, subject)
-        || !pv::modeled_dose_analytic_gate(model, subject)
-    {
+    if events_walk_declines_shape(model, subject) {
         return None;
     }
+    let prog = pv::analytic_param_program(model)
+        .filter(|p| p.n_eta_axis() == model.n_eta + model.n_kappa)?;
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let n_eta = model.n_eta;
     let layout = if iov { Some(lay?) } else { None };
@@ -4252,7 +4282,17 @@ fn run<const N: usize, const M: usize>(
     let preds = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
         Vec::new()
     } else {
-        record(model, subject, lay, theta, eta, &lv, &et)?
+        let Some(p) = record(model, subject, lay, theta, eta, &lv, &et) else {
+            // A gate the recorder applies to the records alone is the subject's shape;
+            // anything else failed at these values (#2713 review).
+            if recorder_declines_shape(model, subject) {
+                if let Some(o) = eta_dx {
+                    o.decline = Some(DeclineCause::Shape);
+                }
+            }
+            return None;
+        };
+        p
     };
     let n_obs = preds.len();
     if n_obs != subject.observations.len() {
@@ -4526,16 +4566,19 @@ impl ModeOut {
 /// share leaves open, since each points at a different remedy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeclineCause {
-    /// The subject's data shape (or the packed layout) is outside the recorders' scope
-    /// ([`scope`]): it declines at every parameter point.
+    /// The subject's data shape (or the packed layout) is outside the recorders' scope:
+    /// [`scope`] rejects it, or a gate of its recorder that reads the model and the records
+    /// alone does ([`recorder_declines_shape`]). It declines at every parameter point.
     Shape,
     /// The mode system `H w = ∇_η F` could not be solved ([`mode_solve`]): `H` singular at
     /// `η̂`, or indefinite at an `η̂` that is not stationary — an EBE off a strict mode.
     /// Not by itself evidence that a subject changed modes: that is what the cold re-solve
     /// check measures.
     ModeSystem,
-    /// The recording itself failed at this trial point: a non-finite prediction, a
-    /// non-positive-definite Ω, or a non-finite gradient component.
+    /// The recording failed at these parameter values: a non-finite prediction, an ODE step
+    /// that could not be formed, a parameter-dependent decline (the separability of a
+    /// modeled infusion window), a non-positive-definite Ω, or a non-finite gradient
+    /// component.
     Recording,
 }
 

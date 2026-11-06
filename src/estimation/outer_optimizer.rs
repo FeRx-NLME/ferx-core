@@ -429,6 +429,21 @@ pub fn optimize_population(
     // the runtime log, rather than from a probe in `fit_inner`: only this scope knows
     // which evaluations ran, and the log is empty for every route that never reaches the
     // analytic branch — so no route gate is needed and none can go stale.
+    // #2713 review: classified only when there is a warning to carry it, at the point the
+    // fit reports — one adjoint pass per subject, no salvage.
+    if !declines.declined_indices().is_empty() {
+        if let Some(at) = declines_at_estimates(
+            model,
+            population,
+            init_params,
+            &result.params,
+            &result.eta_hats,
+            &result.kappas,
+            options,
+        ) {
+            declines.set_at_estimates(at);
+        }
+    }
     if let Some(w) = outer_fd_fallback_warning(model, population, &declines) {
         result.warnings.push(w);
     }
@@ -7593,26 +7608,20 @@ fn optimize_nlopt_attempt_probed(
         // at its own tolerance; the leg copies it into `best_seen` when it ends. Mixing the
         // two tolerances in one tracker would keep a loose objective that is lower only by
         // its noise, and the next leg would restart from it.
-        let adopted = if in_verify_leg {
-            let adopted = !guarded
-                && leg_best
+        if in_verify_leg {
+            if !guarded {
+                leg_best
                     .borrow_mut()
                     .observe(state.n_evals, xs, ofv, ofv_clean);
-            if !guarded && leg_first.get().is_none() {
-                leg_first.set(Some(ofv));
+                if leg_first.get().is_none() {
+                    leg_first.set(Some(ofv));
+                }
             }
-            adopted
         } else {
             best_seen_cl
                 .lock()
                 .unwrap()
-                .observe(state.n_evals, xs, ofv, ofv_clean)
-        };
-        // #2713 review: the declines of the gradient at the point the fit stops on. Only an
-        // evaluation that formed the population gradient has a tally of its own; a mixture's
-        // gradient takes no per-subject salvage, so it leaves none.
-        if adopted && gradient_requested && mixeval.is_none() {
-            declines.mark_incumbent();
+                .observe(state.n_evals, xs, ofv, ofv_clean);
         }
         // After updating best_ofv, check whether we've stalled. If yes,
         // `stagnation_stopped` is latched and the early-return at the
@@ -9698,11 +9707,7 @@ fn optimize_bfgs(
         // written point correct anyway when the penalized objective the line
         // search ranks on and the clean OFV the checkpoint reports diverge under
         // NN regularization, and keeps every driver on one rule (#1317).
-        // `fdfg_s` formed this point's gradient just above, so its declines are the
-        // incumbent's when it is adopted (#2713 review).
-        if best.observe(iter, &xs, f_val, clean_ofv_at(&xs, f_val, &scale)) {
-            declines.mark_incumbent();
-        }
+        best.observe(iter, &xs, f_val, clean_ofv_at(&xs, f_val, &scale));
         if crate::io::checkpoint::is_due() {
             best.write_checkpoint(|best_xs| (0..n).map(|i| best_xs[i] * scale[i]).collect());
         }
@@ -10311,20 +10316,6 @@ fn subject_fixed_ebe_gradient(
 /// The adjoint's kernel scores dense residual covariances itself, so the one structural
 /// cause left is a subject no recorder serves: its decline is scope, not numerics, and
 /// recurs at every evaluation exactly as a model-level exclusion does.
-///
-/// Judged by recording the predictions at the template's θ at **two** η: the trial's `η̂`
-/// and `η = 0`. A decline counts as structural only when both recordings fail. At `η̂`
-/// alone, a recording can fail for its values (an ODE step that cannot be formed at an EBE
-/// a line-search trial blew up, as on #2210, where `η_V` reached −647), and that decline
-/// belongs to one trial point, not to the subject's shape. At `η = 0` alone, a shape that
-/// depends on η (the separability check on modeled infusion windows reads the resolved
-/// durations and lags) can fail where the EBE is served. A shape no recorder serves fails
-/// at both (#2713 review).
-///
-/// Neither half has a fixture that reaches it on its own. Every recording probed while
-/// writing this (closed form and RK45 ODE, η up to ±800) returned non-finite values rather
-/// than `None`, so a test can only pin the case where both recordings fail
-/// (`warns_with_count_and_example_subject`).
 fn is_structural_decline(
     model: &CompiledModel,
     subject: &Subject,
@@ -10333,16 +10324,13 @@ fn is_structural_decline(
 ) -> bool {
     // A subject no recorder can serve declines at every evaluation, as a model-level
     // exclusion does; any other decline is numerical (a non-PD factor at a trial point).
-    let fails = |eta: &[f64]| {
-        crate::sens::ode_provider::adjoint::exact_eta_jacobian(
-            model,
-            subject,
-            &init_params.theta,
-            eta,
-        )
-        .is_none()
-    };
-    fails(eta_hat) && fails(&vec![0.0; eta_hat.len()])
+    crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+        model,
+        subject,
+        &init_params.theta,
+        eta_hat,
+    )
+    .is_none()
 }
 
 /// The salvage a declined non-IOV subject takes in [`population_gradient_sens_mixed_dx`]:
@@ -11072,14 +11060,9 @@ pub(crate) struct OuterFdDeclineLog {
     /// system on some trial points only (#2713). Which cause dominates is what decides the
     /// remedy, so the warning breaks the declined subjects down by it.
     causes: Vec<std::sync::atomic::AtomicU8>,
-    /// The current gradient evaluation's declines ([`Self::begin_eval`]): how many subjects,
-    /// and how many per cause, indexed by [`cause_index`].
-    eval_declined: AtomicUsize,
-    eval_causes: [AtomicUsize; 3],
-    /// The declines of the gradient evaluated at the incumbent ([`Self::mark_incumbent`]):
-    /// the gradient the optimizer last held at the point it stopped on. `None` before any
-    /// incumbent's gradient was recorded.
-    at_incumbent: Mutex<Option<EvalDeclines>>,
+    /// The declines at the estimates the fit reports, classified once after the optimizer
+    /// returns ([`declines_at_estimates`]). `None` when they were not classified.
+    at_estimates: Mutex<Option<EvalDeclines>>,
     /// Test switch: subjects whose analytic outer gradient is treated as declined, so a
     /// test can reach a *numerical* decline on a fixture the adjoint serves.
     #[cfg(test)]
@@ -11100,9 +11083,9 @@ fn cause_bit(cause: DeclineCause) -> u8 {
     1 << cause_index(cause)
 }
 
-/// One gradient evaluation's declines (#2713 review): how many subjects took a salvage,
-/// and how many of those per [`DeclineCause`] (indexed by [`cause_index`]; a route that
-/// names no cause leaves them short of `declined`).
+/// The declines of one population's analytic outer gradient at one point (#2713 review):
+/// how many subjects it could not serve, and how many of those per [`DeclineCause`]
+/// (indexed by [`cause_index`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct EvalDeclines {
     pub(crate) declined: usize,
@@ -11123,9 +11106,7 @@ impl OuterFdDeclineLog {
             causes: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
-            eval_declined: AtomicUsize::new(0),
-            eval_causes: Default::default(),
-            at_incumbent: Mutex::new(None),
+            at_estimates: Mutex::new(None),
             #[cfg(test)]
             forced: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
@@ -11160,7 +11141,6 @@ impl OuterFdDeclineLog {
     pub(crate) fn record_cause(&self, i: usize, cause: DeclineCause) {
         if let Some(bits) = self.causes.get(i) {
             bits.fetch_or(cause_bit(cause), Ordering::Relaxed);
-            self.eval_causes[cause_index(cause)].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -11179,37 +11159,17 @@ impl OuterFdDeclineLog {
     pub(crate) fn record(&self, i: usize) {
         if let Some(flag) = self.declined.get(i) {
             flag.store(true, Ordering::Relaxed);
-            self.eval_declined.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /// Start a gradient evaluation's tally: called once per population gradient, before
-    /// any subject is assembled, so [`Self::mark_incumbent`] snapshots this one's alone.
-    pub(crate) fn begin_eval(&self) {
-        self.eval_declined.store(0, Ordering::Relaxed);
-        for c in &self.eval_causes {
-            c.store(0, Ordering::Relaxed);
-        }
+    /// Record the declines at the reported estimates ([`declines_at_estimates`]).
+    pub(crate) fn set_at_estimates(&self, at: EvalDeclines) {
+        *self.at_estimates.lock().unwrap() = Some(at);
     }
 
-    /// The current evaluation's tally.
-    fn eval_snapshot(&self) -> EvalDeclines {
-        EvalDeclines {
-            declined: self.eval_declined.load(Ordering::Relaxed),
-            by_cause: std::array::from_fn(|k| self.eval_causes[k].load(Ordering::Relaxed)),
-        }
-    }
-
-    /// The point whose gradient was just evaluated became the optimizer's incumbent: keep
-    /// that gradient's declines as the ones at the point the fit stops on (#2713 review).
-    /// The caller calls it only when this evaluation computed a gradient.
-    pub(crate) fn mark_incumbent(&self) {
-        *self.at_incumbent.lock().unwrap() = Some(self.eval_snapshot());
-    }
-
-    /// The declines of the incumbent's gradient, if one was recorded.
-    pub(crate) fn at_incumbent(&self) -> Option<EvalDeclines> {
-        *self.at_incumbent.lock().unwrap()
+    /// The declines at the reported estimates, if they were classified.
+    pub(crate) fn at_estimates(&self) -> Option<EvalDeclines> {
+        *self.at_estimates.lock().unwrap()
     }
 
     /// Mark declined subject `i` as a structural decline (#1536). Rayon workers,
@@ -11329,29 +11289,29 @@ pub(crate) fn outer_fd_fallback_warning(
     };
     Some(format!(
         "{n_fd} of {n_total} subjects could not be given the exact analytic outer \
-         gradient during this fit{example} ({why}) and {consequence}{at_incumbent} The \
+         gradient during this fit{example} ({why}) and {consequence}{at_estimates} The \
          reported outer gradient method is the model-level route, not the per-subject \
          one.{skipped}",
         why = decline_causes_clause(log),
-        at_incumbent = incumbent_declines_sentence(log, n_total),
+        at_estimates = estimates_declines_sentence(log, n_total),
     ))
 }
 
-/// The sentence of [`outer_fd_fallback_warning`] that ties the declines to the point the
-/// optimizer stopped on (#2713 review): how many subjects the gradient evaluated at the
-/// incumbent salvaged, and why. The fit-wide counts include every rejected trial point, so
-/// a large share there says nothing about the gradient the optimizer last held; this one
-/// does. None salvaged rules the salvage out as what the final gradient got wrong — the
-/// fallbacks happened at points the optimizer moved away from. Empty when no incumbent's
-/// gradient was recorded (an optimizer that never accepted a step, or a mixture).
-fn incumbent_declines_sentence(log: &OuterFdDeclineLog, n_total: usize) -> String {
-    let Some(at) = log.at_incumbent() else {
+/// The sentence of [`outer_fd_fallback_warning`] about the estimates the fit reports
+/// (#2713 review): how many subjects the analytic outer gradient declines there, by cause,
+/// from [`declines_at_estimates`]. The fit-wide counts include every trial point, so they
+/// cannot say whether the reported point's own gradient is exact; this can. It cannot say
+/// the fallbacks were harmless when it is zero: a line search reads gradients at trial
+/// points it then rejects, and a fixed-EBE gradient there can still misdirect it. Empty
+/// when the estimates were not classified (a mixture, AGQ, or an IOV/EBE shape mismatch).
+fn estimates_declines_sentence(log: &OuterFdDeclineLog, n_total: usize) -> String {
+    let Some(at) = log.at_estimates() else {
         return String::new();
     };
     if at.declined == 0 {
-        return " At the best point the optimizer reached, every subject had the exact \
-                analytic outer gradient, so these fallbacks happened only at points it \
-                moved away from."
+        return " At the reported estimates every subject has the exact analytic outer \
+                gradient; the fallbacks were at other points, line-search trials among \
+                them, where they could still have misdirected the optimizer."
             .to_string();
     }
     let parts: Vec<String> = [
@@ -11365,16 +11325,63 @@ fn incumbent_declines_sentence(log: &OuterFdDeclineLog, n_total: usize) -> Strin
         n => Some(format!("{n} {name}")),
     })
     .collect();
-    let by = if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", parts.join(", "))
-    };
     format!(
-        " At the best point the optimizer reached, the outer gradient still salvaged {} of \
-         {n_total} subjects{by}.",
-        at.declined
+        " At the reported estimates the analytic outer gradient still declines {} of \
+         {n_total} subjects ({}).",
+        at.declined,
+        parts.join(", ")
     )
+}
+
+/// Classify the analytic outer gradient's declines at the estimates the fit reports
+/// (#2713 review): one adjoint pass per subject at `params` and its reported EBE (stacked
+/// with κ̂ under IOV), no salvage formed. Done once, after the optimizer returns, so it
+/// reads the point actually reported whatever the legs, restarts, probes and restores that
+/// chose it, rather than a snapshot that has to follow every one of them.
+///
+/// `None` where the per-subject adjoint is not the fit's gradient (AGQ, a mixture) or the
+/// EBEs do not match the population.
+pub(crate) fn declines_at_estimates(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> Option<EvalDeclines> {
+    if options.agq_nodes().is_some()
+        || template.mixture.is_some()
+        || eta_hats.len() != population.subjects.len()
+    {
+        return None;
+    }
+    let x = pack_params(params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, &x)?;
+    let causes: Vec<Option<DeclineCause>> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let stacked = joint_warm_start(&eta_hats[i], kappas.get(i).map_or(&[], Vec::as_slice));
+            subject_analytic_outer_gradient_dx(
+                model,
+                subject,
+                &pt,
+                stacked.as_slice(),
+                options.interaction,
+                false,
+            )
+            .0
+            .err()
+        })
+        .collect();
+    let mut at = EvalDeclines::default();
+    for c in causes.into_iter().flatten() {
+        at.declined += 1;
+        at.by_cause[cause_index(c)] += 1;
+    }
+    Some(at)
 }
 
 /// The parenthesis of [`outer_fd_fallback_warning`] that says why the subjects declined
@@ -11383,8 +11390,8 @@ fn incumbent_declines_sentence(log: &OuterFdDeclineLog, n_total: usize) -> Strin
 /// point, the recorders' scope), a mode system that would not solve (an EBE off a strict
 /// mode), and a failed recording — and the warning used to name only the first and a
 /// catch-all for the rest. These are counts over the whole fit, rejected trial points
-/// included, so they say what happened, not what stopped the optimizer: that is
-/// [`incumbent_declines_sentence`]'s. Nor is a mode-system decline evidence that a subject
+/// included, so they say what happened, not whether the reported point's gradient is exact:
+/// that is [`estimates_declines_sentence`]'s. Nor is a mode-system decline evidence that a subject
 /// changed modes; whether EBEs sit in a higher mode than a cold solve finds is what
 /// `W_EBE_START_DEPENDENT` reports (#2713 review). A subject can decline for more than one
 /// cause on different trial points, so the counts can sum past the declined total. A log no
@@ -11532,10 +11539,7 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                     if structural {
                         declines.record_structural(i);
                     }
-                    // A recorder that declines the shape mid-recording (an event walk that
-                    // serves no SS infusion under a lag) fails as a recording does; the
-                    // structural check is what tells the two apart (#2713).
-                    declines.record_cause(i, if structural { DeclineCause::Shape } else { cause });
+                    declines.record_cause(i, cause);
                     declined_subject_gradient(
                         np,
                         population,
@@ -11707,19 +11711,7 @@ pub(crate) fn population_gradient_sens_iov_mixed(
                 Ok(g) => g,
                 Err(cause) => {
                     declines.record(i);
-                    // As on the non-IOV route: a shape the recorder declines mid-recording
-                    // fails as a recording does, and the structural check tells them apart.
-                    // The IOV salvage is reconverged either way, so only the cause reads it.
-                    let structural =
-                        is_structural_decline(model, subject, init_params, stacked.as_slice());
-                    declines.record_cause(
-                        i,
-                        if structural {
-                            DeclineCause::Shape
-                        } else {
-                            cause
-                        },
-                    );
+                    declines.record_cause(i, cause);
                     declined_subject_gradient(
                         np,
                         population,
@@ -11914,9 +11906,6 @@ fn population_gradient_with_agq_evaluation(
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
     *grad_eval_idx += 1;
-    // Every route starts its own tally, the reconverged one included (it declines no
-    // subject), so an incumbent's snapshot is never a previous evaluation's (#2713 review).
-    declines.begin_eval();
     // AGQ minimises a *different* objective (the quadrature marginal, not the FOCE/Laplace
     // one), so every analytic and fixed-EBE gradient below — all of them closed forms of
     // the FOCE marginal — is simply the gradient of the wrong function. Feeding one to the

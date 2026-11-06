@@ -137,26 +137,21 @@ The two can disagree. A subject no recorder serves — an out-of-scope ODE dose 
 at an EBE that was not stationary (an EBE off a strict mode), at some trial point) and
 used fixed-EBE outer gradients, which omit the EBE-response term the analytic gradient
 carries. If the fit stalls, `reconverge_gradient_interval = N` restores the reconverged
-gradient every N-th evaluation. At the best point the optimizer reached, every subject
-had the exact analytic outer gradient, so these fallbacks happened only at points it
-moved away from. The reported outer gradient method is the model-level route, not the
-per-subject one.
+gradient every N-th evaluation. At the reported estimates every subject has the exact
+analytic outer gradient; the fallbacks were at other points, line-search trials among
+them, where they could still have misdirected the optimizer. The reported outer
+gradient method is the model-level route, not the per-subject one.
 ```
 
 The first parenthesis names the cause of each decline (#2713), one clause per cause, with its subject count:
 
-- **a shape no analytic recorder serves**: the subject's records are outside the recorders' scope. The predictions are recorded at both the trial's EBE and `η = 0`, and the subject counts here only if both recordings fail. A failure at an extreme trial-point EBE alone is a failed recording, not a shape.
+- **a shape no analytic recorder serves**: the subject's records are outside the recorders' scope. Only a check that reads the model and the records alone counts here, never one that depends on parameter values, so the decline holds at every parameter point.
 - **an inner Hessian at the EBE that was singular, or indefinite at an EBE that was not stationary**: the identity behind the exact gradient needs a nonsingular `H` at a stationary `η̂`, and at some trial point this subject's EBE was off a strict mode. On its own this does not show that the subject switched between modes. That is measured by the cold re-solve of the EBEs, reported as `W_EBE_START_DEPENDENT`.
-- **a recording that failed or came back non-finite**: a prediction, Ω factor or gradient component was not finite at a trial point, typically one a line search tried and rejected.
+- **a recording that failed or came back non-finite**: the predictions could not be recorded at those parameter values. Causes include a non-finite prediction, an ODE step that could not be formed, or a modeled infusion window whose separability depends on the parameters.
 
 These counts cover the whole fit, rejected trial points included. A subject that declined for different causes at different trial points counts under each, so the counts can add up to more than the declined total.
 
-The sentence after the remedy ties the fallbacks to where the fit ended. It counts the subjects the gradient salvaged at the best point the optimizer reached (its incumbent), by cause, or says that none were salvaged there. When the fit ends with an optimizer `Failure`, this is the sentence to read:
-
-- **No subject salvaged at the incumbent:** the fixed-EBE fallback did not distort the gradient the optimizer last held. Look elsewhere for the cause of the `Failure`.
-- **A large share salvaged:** the final gradient omits their EBE response, and `reconverge_gradient_interval = N` is the check to run.
-
-The sentence is absent when no incumbent's gradient was recorded, for example under a `[mixture]` model or AGQ.
+The sentence after the remedy is about the estimates the fit reports. After the optimizer returns, the exact gradient is formed once more there for every subject, and the subjects it still declines are counted by cause. This shows whether the reported point's own gradient carries the fixed-EBE approximation. It cannot show that the fallbacks were harmless: L-BFGS and the other gradient optimizers read gradients at line-search trial points they then reject, so a fixed-EBE gradient there can still end a fit in `Failure` even when the reported point is fully exact. Rerunning with `reconverge_gradient_interval = N` is the direct test. The sentence is absent under AGQ and for a `[mixture]` model, whose gradients are not the per-subject one it classifies.
 
 #### What a declined subject is charged {#declined-subject-salvage}
 
