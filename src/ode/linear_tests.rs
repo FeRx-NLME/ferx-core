@@ -1817,9 +1817,9 @@ fn spectral_declines_a_non_normal_chain_by_its_projector_size() {
     );
     let lam: Vec<f64> = (0..5).map(|i| -p[i]).collect();
     let full = [(0b11111u8, 0b11111u8); 5];
-    let kappa = projectors(&a, &lam, &full, 5)
-        .iter()
-        .fold(0.0_f64, |m, x| m.max(x.abs()));
+    let pr = projectors(&a, &lam, &full, 5);
+    assert!(pr.iter().all(|x| x.is_finite()));
+    let kappa = pr.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     assert!(
         kappa > SPECTRAL_MAX_KAPPA,
         "κ = {kappa:e} must exceed the bound"

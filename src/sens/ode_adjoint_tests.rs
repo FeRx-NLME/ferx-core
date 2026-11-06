@@ -2698,9 +2698,14 @@ fn ode_iov_past_24_axes_matches_fd() {
     );
     let model = tight(parse_model_string(&src).unwrap());
     let s = iov_subject(&model);
-    // Measured (macOS arm64): Jacobian 5.0e-13, FOCEI 3.1e-9 (the Richardson floor at EBE
-    // tol 1e-12, as on the 7-axis fixture); 10× headroom each.
-    assert_wide_iov_parity("ODE", &model, &s, (5e-12, 3e-8));
+    // Measured: Jacobian 5.0e-13 (macOS arm64), 4.3e-13 (Linux); FOCEI 3.1e-9 on Padé, 3.8e-8
+    // on the spectral path (#2706 follow-up). The analytic gradient is the same on both
+    // engines (to the 11 printed digits); the gap is the oracle's. Its inner objective is flat
+    // to 4e-15 along one direction at `x[22] + 1e-3`, so the re-solved η̂ lands 1e-10 apart on
+    // the two engines, and the FOCEI objective, not stationary in η, moves 9e-11 there — a kink
+    // a Richardson step of 1e-3 reads as 3.8e-8. A tighter EBE tol (1e-15) changes neither
+    // point. 10× headroom on the Jacobian, 5× on the FOCEI gap.
+    assert_wide_iov_parity("ODE", &model, &s, (5e-12, 2e-7));
 }
 
 #[test]
