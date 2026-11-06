@@ -357,3 +357,50 @@ fn a_steady_state_dose_after_a_reset_is_accepted() {
     ));
     assert!(ferx_core::predict(&m, &pop, &m.default_params).is_ok());
 }
+
+/// A dataset with an `ADDL` column, for the trains below.
+fn data_addl(rows: &str) -> Population {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.csv");
+    std::fs::write(
+        &path,
+        format!("ID,TIME,DV,EVID,AMT,CMT,MDV,II,SS,ADDL\n{rows}"),
+    )
+    .unwrap();
+    ferx_core::read_nonmem_csv(&path, None, None).expect("the dataset loads")
+}
+
+/// A train into `urine` at 0, 2, 4 and 6, cancelled by the off row at 3. The dose at 4 stays
+/// in `Subject::doses` but never arrives, so it turns nothing on.
+const CANCELLED_TRAIN: &str = "1,0,.,1,100,1,1,0,0,0\n1,0,.,1,10,2,1,2,0,3\n1,3,.,2,.,-2,1,0,0,0\n";
+
+/// NONMEM 7.5.1 stops here too, on record 5: "COMPARTMENT ASSOCIATED WITH THE PREDICTION IS
+/// OFF".
+#[test]
+fn an_observation_past_a_cancelled_train_is_refused() {
+    let pop = data_addl(&format!("{CANCELLED_TRAIN}1,5,1,0,.,2,0,0,0,0\n"));
+    let e = refusal(&model(ODE), &pop);
+    assert!(e.contains("E_OBS_CMT_OFF"), "{e}");
+    assert!(e.contains("time 5"), "{e}");
+}
+
+#[test]
+fn a_steady_state_dose_past_a_cancelled_train_is_refused() {
+    let pop = data_addl(&format!(
+        "{CANCELLED_TRAIN}1,5,.,1,100,1,1,12,1,0\n1,6,1,0,.,1,0,0,0,0\n"
+    ));
+    let e = refusal(&model(ODE), &pop);
+    assert!(e.contains("E_CMT_TOGGLE_SS"), "{e}");
+    assert!(e.contains("time 5"), "{e}");
+}
+
+/// The control: a train that starts after the off row is live, and its first dose turns
+/// the compartment on, so only the cancellation above can be what refuses.
+#[test]
+fn an_observation_after_a_live_train_is_accepted() {
+    let m = model(ODE);
+    let pop = data_addl(
+        "1,0,.,1,100,1,1,0,0,0\n1,1,.,2,.,-2,1,0,0,0\n1,2,.,1,10,2,1,2,0,3\n1,5,1,0,.,2,0,0,0,0\n",
+    );
+    assert!(ferx_core::predict(&m, &pop, &m.default_params).is_ok());
+}

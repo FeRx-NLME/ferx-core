@@ -3372,6 +3372,7 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
         // check cannot read, so a lagged dose leaves `held` set until an on row or a reset.
         let mut off: Vec<usize> = Vec::new();
         let mut held: Vec<usize> = Vec::new();
+        let cutoffs = s.with_cmt_cutoffs();
         for (t, event) in events {
             match event {
                 Event::Reset => {
@@ -3405,6 +3406,11 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
                             .with_block("odes"),
                         );
                         break;
+                    }
+                    // A dose an off row cancelled never arrives, so it turns nothing on. The
+                    // rest of an `ADDL` train stays in `doses` past that row.
+                    if d.time >= cutoffs.doses[k].off_at {
+                        continue;
                     }
                     off.retain(|&x| x != d.cmt_idx());
                     if !model.has_lagtime_on_cmt(d.cmt_1based()) {
