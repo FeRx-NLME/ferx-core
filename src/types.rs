@@ -4452,13 +4452,14 @@ pub enum TteRecurrence {
 }
 
 #[cfg(feature = "survival")]
-/// Link function for a categorical endpoint's linear predictor. Only `Logit`
-/// (log-odds) is implemented in Phase 4 slice 1; probit/cloglog are rejected at
-/// parse with a "not yet supported" error so the surface stays forward-compatible.
+/// Link function for a categorical endpoint's linear predictor: logit (the default) or
+/// probit (#2603). `cloglog` is rejected at parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkFn {
     /// Logistic (log-odds) link: `p = 1 / (1 + exp(-lp))`.
     Logit,
+    /// Probit link: `p = Φ(lp)`, the standard-normal CDF (#2603).
+    Probit,
 }
 
 #[cfg(feature = "survival")]

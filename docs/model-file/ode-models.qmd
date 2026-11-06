@@ -504,7 +504,7 @@ informational entry in `warnings` / `warning_details` (category `ode_rhs_route`)
   construct (an `if (…) { … }` statement, `sqrt`, a read of `L` before it is assigned, …)
   and the statement it is in (`d/dt(sm)`, the assignment to `E`). `sin` and `cos`
   ([#2720](https://github.com/FeRx-NLME/ferx-core/issues/2720)) are among the functions
-  the compiler does not translate, as are `tanh`, `softplus`, `logit` and `inv_logit`.
+  the compiler does not translate, as are `pnorm`, `tanh`, `softplus`, `logit` and `inv_logit`.
 - `W_ODE_RHS_NOT_NATIVE`: the block compiled, but runs as register code, because
   `FERX_NO_RHS_JIT=1` is set, Cranelift cannot target the host, or the native compiler did
   not build the program.

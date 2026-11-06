@@ -1393,9 +1393,10 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
 /// discrete-state records, none of them is on an endpoint that reads the block through
 /// its implicit index ([`LevelBlockDecl::record_cmts`]) (#2623). Why depends on whether
 /// any expression reads the block bare ([`LevelBlockDecl::read_bare`]): if none does,
-/// the expression is the cause; if one does, its reader defines no level on this data —
-/// a level-defining endpoint with no records here, or only a Gaussian prediction, a
-/// CTMM generator or a TTE hazard. An explicit `NAME[COLUMN]` read is named either way.
+/// nothing reads it at all, since the parse refuses a subscripted `NAME[COLUMN]` read
+/// (#2744); if one does, its reader defines no level on this data — a level-defining
+/// endpoint with no records here, or only a Gaussian prediction, a CTMM generator or a
+/// TTE hazard.
 fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     let name = decl.name();
     let head = format!("theta {name}[{}]", decl.columns().join(", "));
@@ -1413,9 +1414,10 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
          through its implicit index."
     );
     if !decl.read_bare {
+        // A subscripted read is refused at parse (#2744), so here nothing reads the block.
         message.push_str(&format!(
-            " Check the expression that reads it: a data-driven block is read bare, as \
-             `{name}`; its index is implicit."
+            " Nothing reads it: a data-driven block is read bare, as `{name}`; its index is \
+             implicit."
         ));
     } else if !decl.record_cmts.is_empty() {
         let cmts: Vec<String> = decl.record_cmts.iter().map(|c| c.to_string()).collect();
@@ -1433,18 +1435,6 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
              neither kind of record defines a level. Read the block in a `[binary_model]` \
              predictor or a DTMM `[markov_model]` transition.",
         );
-    }
-    if !decl.keyed_reads.is_empty() {
-        let reads: Vec<String> = decl
-            .keyed_reads
-            .iter()
-            .map(|c| format!("`{name}[{c}]`"))
-            .collect();
-        message.push_str(&format!(
-            " An explicit read indexes the block by the value its column holds, not by its \
-             level: {}. Write `{name}` instead.",
-            reads.join(", ")
-        ));
     }
     message
 }

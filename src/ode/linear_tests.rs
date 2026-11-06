@@ -1410,6 +1410,7 @@ fn random_rhs_matrix(seed: &mut u64, n: usize) -> (Vec<f64>, Vec<f64>) {
 
 #[test]
 fn the_expm_workspace_is_the_pre_expm_kernel_bit_for_bit() {
+    let _pade = PadeOnly::new();
     use crate::sens::vfree::DualF;
     // Gaps at powers of two of each other (shared Padé steps), others that are not, a gap
     // repeated, and the tiny and long ends of a dosing timeline.
@@ -1536,6 +1537,7 @@ fn a_taped_type_recomputes_every_exponential() {
 
 #[test]
 fn a_segment_reuses_the_threads_pade_work_bit_for_bit() {
+    let _pade = PadeOnly::new();
     let pooled = pooled_pade_entries::<f64>;
     let (a, b) = (-0.8, 2.0);
     let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
@@ -1574,6 +1576,7 @@ fn a_segment_reuses_the_threads_pade_work_bit_for_bit() {
 
 #[test]
 fn a_full_pool_entry_count_is_forgotten_at_the_next_segment() {
+    let _pade = PadeOnly::new();
     // Fill the thread's workspace past the bound with segments of distinct generators
     // (none large enough to scale, so each is its own approximant)...
     let run = |k: usize| {
@@ -1596,4 +1599,503 @@ fn a_full_pool_entry_count_is_forgotten_at_the_next_segment() {
         "{} kept",
         pooled_pade_entries::<f64>()
     );
+}
+
+/// Padé only, for the tests of its own machinery (the approximant pool, the workspace): with
+/// the spectral path on, their diagonalisable segments would never reach it.
+struct PadeOnly;
+impl PadeOnly {
+    fn new() -> Self {
+        SPECTRAL_OFF.with(|c| c.set(true));
+        PadeOnly
+    }
+}
+impl Drop for PadeOnly {
+    fn drop(&mut self) {
+        SPECTRAL_OFF.with(|c| c.set(false));
+    }
+}
+
+/// Run `f` with the spectral path on or off, returning its result and how many segments the
+/// spectral path served.
+/// The coupling graph of a constant matrix: every nonzero entry ([`spectral`]'s `present`).
+fn nonzero(a: &[f64]) -> u64 {
+    a.iter()
+        .enumerate()
+        .fold(0, |m, (i, &x)| if x != 0.0 { m | (1 << i) } else { m })
+}
+
+fn with_spectral<R>(on: bool, f: impl FnOnce() -> R) -> (R, usize) {
+    SPECTRAL_OFF.with(|c| c.set(!on));
+    SPECTRAL_HITS.with(|c| c.set(0));
+    let r = f();
+    let hits = SPECTRAL_HITS.with(|c| c.get());
+    SPECTRAL_OFF.with(|c| c.set(false));
+    (r, hits)
+}
+
+/// The spectral propagation (#2706 follow-up) equals Padé's on a depot + 2-compartment
+/// generator with an infusion, in value, gradient and Hessian, at every saved time: two exact
+/// propagations of one linear system, so the gap is round-off.
+#[test]
+fn spectral_segment_equals_pade_in_values_and_jets() {
+    let base = [1.4, 0.12, 0.35, 0.18, 5.0];
+    let u0 = [100.0, 3.0, 1.0];
+    let saveat = [0.5, 1.0, 2.0, 6.0, 10.0];
+    let p: Vec<Dual2<2>> = base
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| match i {
+            0 => Dual2::<2>::var(v, 0),
+            2 => Dual2::<2>::var(v, 1),
+            _ => Dual2::<2>::from_f64(v),
+        })
+        .collect();
+    let u: Vec<Dual2<2>> = u0.iter().map(|&v| Dual2::<2>::from_f64(v)).collect();
+    let run = || {
+        linear_segment_g(&two_cpt_depot, &u, (0.0, 10.0), &p, &saveat, &[])
+            .unwrap()
+            .0
+    };
+    let (sp, hits) = with_spectral(true, run);
+    let (pade, pade_hits) = with_spectral(false, run);
+    assert!(hits > 0, "the spectral path must have served the segment");
+    assert_eq!(pade_hits, 0);
+    let mut worst = 0.0_f64;
+    let mut gap = |a: f64, b: f64| {
+        assert!(a.is_finite() && b.is_finite(), "{a} vs {b}");
+        worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+    };
+    for (a, b) in sp.iter().zip(&pade) {
+        for (x, y) in a.u.iter().zip(&b.u) {
+            gap(x.value, y.value);
+            for k in 0..2 {
+                gap(x.grad[k], y.grad[k]);
+                for l in 0..2 {
+                    gap(x.hess[k][l], y.hess[k][l]);
+                }
+            }
+        }
+    }
+    // Measured worst 5.9e-14 (values, gradients and Hessians); 1e-12 keeps ~17× headroom.
+    assert!(worst < 1e-12, "spectral vs Padé: worst gap {worst:.2e}");
+}
+
+/// An undrained compartment (a cumulative amount, eigenvalue 0) takes the series for
+/// `(e^{λΔ} − 1)/λ` and still equals Padé.
+#[test]
+fn spectral_handles_a_zero_eigenvalue() {
+    fn absorbed<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = -p[0] * u[0];
+        du[1] = p[0] * u[0] - p[1] * u[1];
+        du[2] = p[1] * u[1];
+    }
+    let p = [0.9, 0.25];
+    let u0 = [50.0, 0.0, 0.0];
+    let saveat = [0.25, 1.0, 4.0, 24.0];
+    let run = || {
+        linear_segment_g::<f64>(&absorbed, &u0, (0.0, 24.0), &p, &saveat, &[])
+            .unwrap()
+            .0
+    };
+    let (sp, hits) = with_spectral(true, run);
+    let (pade, _) = with_spectral(false, run);
+    assert!(hits > 0);
+    for (a, b) in sp.iter().zip(&pade) {
+        for (x, y) in a.u.iter().zip(&b.u) {
+            assert!((x - y).abs() <= 1e-12 * (1.0 + y.abs()), "{x} vs {y}");
+        }
+    }
+}
+
+/// A repeated eigenvalue (a transit chain at one rate, a defective generator) and a complex
+/// pair both decline to Padé, which then gives the answer it always gave.
+#[test]
+fn spectral_declines_repeated_and_complex_spectra() {
+    fn transit<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = -p[0] * u[0];
+        du[1] = p[0] * u[0] - p[0] * u[1];
+        du[2] = p[0] * u[1] - p[0] * u[2];
+    }
+    fn rotation<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = -p[0] * u[0] + p[1] * u[1];
+        du[1] = -p[1] * u[0] - p[0] * u[1];
+    }
+    for (name, n) in [("transit", 3usize), ("rotation", 2)] {
+        let rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]) = match name {
+            "transit" => &transit::<f64>,
+            _ => &rotation::<f64>,
+        };
+        let p = [0.7, 2.0];
+        let u0: Vec<f64> = (0..n).map(|i| 10.0 + i as f64).collect();
+        let run = || {
+            linear_segment_g::<f64>(rhs, &u0, (0.0, 5.0), &p, &[1.0, 5.0], &[])
+                .unwrap()
+                .0
+        };
+        let (on, hits) = with_spectral(true, run);
+        let (off, _) = with_spectral(false, run);
+        assert_eq!(hits, 0, "{name}: the spectral path must decline");
+        for (a, b) in on.iter().zip(&off) {
+            assert_eq!(a.u, b.u, "{name}: a declined segment is Padé's");
+        }
+    }
+}
+
+#[test]
+fn the_singleton_precheck_sees_only_acyclic_compartments() {
+    // A transit chain at one rate: every compartment is acyclic, its diagonal an exact
+    // eigenvalue, so the repeat is declined without an eigensolve.
+    #[rustfmt::skip]
+    let chain = [
+        -0.7, 0.0, 0.0,
+         0.7, -0.7, 0.0,
+         0.0, 0.7, -0.2,
+    ];
+    assert!(repeated_singleton_eigenvalue(&chain, nonzero(&chain), 3));
+    // Equal diagonals on a cycle (central ↔ peripheral) are not eigenvalues: the eigenvalues
+    // of [[-1, 1], [1, -1]] are 0 and −2, distinct, so the precheck must leave them to
+    // `spectral_of`, which accepts them.
+    let cycle = [-1.0, 1.0, 1.0, -1.0];
+    assert!(!repeated_singleton_eigenvalue(&cycle, nonzero(&cycle), 2));
+    assert!(spectral_of::<f64>(&cycle, 2, &cycle, nonzero(&cycle)).is_some());
+    // Distinct acyclic rates pass through.
+    #[rustfmt::skip]
+    let oral = [
+        -1.5, 0.0,
+         1.5, -0.2,
+    ];
+    assert!(!repeated_singleton_eigenvalue(&oral, nonzero(&oral), 2));
+    assert!(spectral_of::<f64>(&oral, 2, &oral, nonzero(&oral)).is_some());
+}
+
+/// Spectral vs Padé on `rhs`, seeding `p[seed[0]]`, `p[seed[1]]` as the two `Dual2` axes:
+/// whether the spectral path served it, and the worst relative gap over values, gradients
+/// and Hessians at every saved time.
+fn spectral_vs_pade_dual2(
+    rhs: &dyn Fn(&[Dual2<2>], &[Dual2<2>], f64, &mut [Dual2<2>]),
+    p0: &[f64],
+    seed: [usize; 2],
+    u0: &[f64],
+    span: (f64, f64),
+    saveat: &[f64],
+) -> (usize, f64) {
+    let p: Vec<Dual2<2>> = p0
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| match seed.iter().position(|&s| s == i) {
+            Some(k) => Dual2::<2>::var(v, k),
+            None => Dual2::<2>::from_f64(v),
+        })
+        .collect();
+    let u: Vec<Dual2<2>> = u0.iter().map(|&v| Dual2::<2>::from_f64(v)).collect();
+    let run = || linear_segment_g(rhs, &u, span, &p, saveat, &[]).unwrap().0;
+    let (sp, hits) = with_spectral(true, run);
+    let (pade, _) = with_spectral(false, run);
+    let mut worst = 0.0_f64;
+    let mut gap = |a: f64, b: f64| {
+        assert!(a.is_finite() && b.is_finite(), "{a} vs {b}");
+        worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+    };
+    for (a, b) in sp.iter().zip(&pade) {
+        for (x, y) in a.u.iter().zip(&b.u) {
+            gap(x.value, y.value);
+            for k in 0..2 {
+                gap(x.grad[k], y.grad[k]);
+                for l in 0..2 {
+                    gap(x.hess[k][l], y.hess[k][l]);
+                }
+            }
+        }
+    }
+    (hits, worst)
+}
+
+/// `φ(λ, Δ) = (e^{λΔ} − 1)/λ` where the quotient cancels: a slow rate (`λ = −0.005`) over
+/// 0.002-wide gaps puts `λΔ` at 1e-5, where the plain quotient kept ~2e-6 of the second-order
+/// jet. Lifted from `g(z) = expm1(z)/z`'s series, the jets match Padé's to round-off.
+#[test]
+fn spectral_phi_is_exact_where_its_quotient_cancels() {
+    fn slow<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = p[2] - p[0] * u[0];
+        du[1] = p[0] * u[0] - p[1] * u[1];
+    }
+    let saveat: Vec<f64> = (1..=8).map(|i| 0.002 * i as f64).collect();
+    let (hits, worst) = spectral_vs_pade_dual2(
+        &slow,
+        &[1.3, 0.005, 40.0],
+        [1, 2],
+        &[5.0, 2.0],
+        (0.0, 0.016),
+        &saveat,
+    );
+    assert!(hits > 0, "the spectral path must serve the segment");
+    // Measured 2.2e-15 (the plain quotient: ~2e-6); 1e-13 keeps ~45× headroom.
+    assert!(worst < 1e-13, "small-z φ: worst {worst:.2e}");
+}
+
+/// A stiff spectrum (rates 10, 0.5, 0.005). Every compartment is acyclic, so every
+/// eigenvalue is a diagonal, exact in value and jets; the projectors carry the chain's
+/// structural zeros exactly. Against the exact solution (60-digit decimal, outside both
+/// engines) spectral is 1.6e-12 off at worst, Padé 1.0e-13: the residue is the sum of modes'
+/// own cancellation — mode 0's `(A − λ₂I)/(λ₀ − λ₂)` cancels on compartment 1 in exact
+/// arithmetic only, the same cancellation a closed-form Bateman sum carries — on entries
+/// whose exact value is 0 (`∂²u₁/∂k₂²`).
+#[test]
+fn spectral_is_exact_on_a_stiff_spectrum() {
+    fn chain<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = p[3] - p[0] * u[0];
+        du[1] = p[0] * u[0] - p[1] * u[1];
+        du[2] = p[1] * u[1] - p[2] * u[2];
+    }
+    let saveat = [0.05, 0.5, 2.0, 24.0, 120.0];
+    let (hits, worst) = spectral_vs_pade_dual2(
+        &chain,
+        &[10.0, 0.5, 0.005, 3.0],
+        [0, 2],
+        &[100.0, 1.0, 1.0],
+        (0.0, 120.0),
+        &saveat,
+    );
+    assert!(hits > 0, "the spectral path must serve the segment");
+    // Measured 1.6e-12 against Padé (above); 1e-11 keeps ~6× headroom.
+    assert!(worst < 1e-11, "stiff spectrum: worst {worst:.2e}");
+}
+
+/// A transit chain at five distinct rates has a non-normal generator whose projectors reach
+/// κ ≫ 32 (they amplify rounding κ-fold, κ²-fold in a second-order jet), so it is declined to
+/// Padé by the κ bound alone: the rates are distinct, so the gap and the acyclic precheck
+/// both pass it.
+#[test]
+fn spectral_declines_a_non_normal_chain_by_its_projector_size() {
+    fn transit<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = -p[0] * u[0];
+        for i in 1..5 {
+            du[i] = p[i - 1] * u[i - 1] - p[i] * u[i];
+        }
+    }
+    let p = [1.0, 1.1, 1.2, 1.3, 1.4];
+    let mut a = vec![0.0; 25];
+    let mut du = [0.0; 5];
+    for j in 0..5 {
+        let mut e = [0.0; 5];
+        e[j] = 1.0;
+        transit(&e, &p, 0.0, &mut du);
+        for i in 0..5 {
+            a[i * 5 + j] = du[i];
+        }
+    }
+    assert!(
+        !repeated_singleton_eigenvalue(&a, nonzero(&a), 5),
+        "the precheck must pass it"
+    );
+    let lam: Vec<f64> = (0..5).map(|i| -p[i]).collect();
+    let full = [(0b11111u8, 0b11111u8); 5];
+    let pr = projectors(&a, &lam, &full, 5);
+    assert!(pr.iter().all(|x| x.is_finite()));
+    let kappa = pr.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    assert!(
+        kappa > SPECTRAL_MAX_KAPPA,
+        "κ = {kappa:e} must exceed the bound"
+    );
+    assert!(spectral_of::<f64>(&a, 5, &a, nonzero(&a)).is_none());
+    let u0 = [100.0, 0.0, 0.0, 0.0, 0.0];
+    let run = || {
+        linear_segment_g::<f64>(&transit, &u0, (0.0, 6.0), &p, &[1.0, 3.0, 6.0], &[])
+            .unwrap()
+            .0
+    };
+    let (on, hits) = with_spectral(true, run);
+    let (off, _) = with_spectral(false, run);
+    assert_eq!(hits, 0);
+    for (a, b) in on.iter().zip(&off) {
+        assert_eq!(a.u, b.u, "a declined segment is Padé's");
+    }
+}
+
+/// The spectral decision reads `A`'s values only, so the `f64` run and a dual run take the
+/// same path and agree in value bit for bit.
+#[test]
+fn spectral_f64_and_dual_values_are_the_same_bits() {
+    let p = [1.4, 0.12, 0.35, 0.18, 5.0];
+    let u0 = [100.0, 3.0, 1.0];
+    let saveat = [0.5, 1.0, 2.0, 6.0, 10.0];
+    let (vf, hf) = with_spectral(true, || {
+        linear_segment_g::<f64>(&two_cpt_depot, &u0, (0.0, 10.0), &p, &saveat, &[])
+            .unwrap()
+            .0
+    });
+    let pd: Vec<Dual2<2>> = p
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if i < 2 {
+                Dual2::<2>::var(v, i)
+            } else {
+                Dual2::<2>::from_f64(v)
+            }
+        })
+        .collect();
+    let ud: Vec<Dual2<2>> = u0.iter().map(|&v| Dual2::<2>::from_f64(v)).collect();
+    let (vd, hd) = with_spectral(true, || {
+        linear_segment_g(&two_cpt_depot, &ud, (0.0, 10.0), &pd, &saveat, &[])
+            .unwrap()
+            .0
+    });
+    assert!(hf > 0 && hd > 0, "both runs must take the spectral path");
+    for (a, b) in vf.iter().zip(&vd) {
+        for (x, y) in a.u.iter().zip(&b.u) {
+            assert_eq!(x.to_bits(), y.value.to_bits());
+        }
+    }
+}
+
+/// A propagated state that fails the reproduction check (here: a growing mode overflows)
+/// abandons the spectral result, and the segment ends as Padé's does.
+#[test]
+fn a_spectral_state_that_fails_its_check_falls_back_to_pade() {
+    fn growth<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = p[0] * u[0];
+        du[1] = u[0] - p[1] * u[1];
+    }
+    let p = [400.0, 0.3];
+    let u0 = [1.0, 0.0];
+    let run = || linear_segment_g::<f64>(&growth, &u0, (0.0, 2.0), &p, &[1.0, 2.0], &[]);
+    let (on, hits) = with_spectral(true, run);
+    let (off, _) = with_spectral(false, run);
+    assert_eq!(hits, 0, "an overflowed spectral state must not be returned");
+    match (on, off) {
+        (None, None) => {}
+        (Some((a, _)), Some((b, _))) => {
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(x.u, y.u, "the fallback is Padé's result");
+            }
+        }
+        (a, b) => panic!("spectral-on {:?} vs Padé {:?}", a.is_some(), b.is_some()),
+    }
+}
+
+/// `exprel_derivs`: `g` is the same bits whatever orders are asked for (the `f64` and dual
+/// runs read one value), and the series (`|z| ≤ 2`) meets the closed forms at the switch.
+#[test]
+fn exprel_derivs_is_one_value_and_continuous_at_its_switch() {
+    for z in [-1.7, -0.3, 0.0, 1e-9, 0.8, 1.99] {
+        let g0 = exprel_derivs(z, 0)[0];
+        for orders in 1..=4 {
+            assert_eq!(
+                exprel_derivs(z, orders)[0].to_bits(),
+                g0.to_bits(),
+                "z = {z}"
+            );
+        }
+    }
+    for z in [-2.0, 2.0] {
+        let below = exprel_derivs(z * (1.0 - 1e-12), 4);
+        let above = exprel_derivs(z * (1.0 + 1e-12), 4);
+        for m in 0..5 {
+            let (a, b) = (below[m], above[m]);
+            assert!(a.is_finite() && b.is_finite());
+            // Measured ≤ 1.1e-13 (g⁗'s closed form, ~2 digits lost); 1e-11 bounds it.
+            assert!(
+                (a - b).abs() <= 1e-11 * b.abs(),
+                "z = {z}, order {m}: {a} vs {b}"
+            );
+        }
+    }
+    // g(0) = 1, g′(0) = 1/2, …, g⁽ᵐ⁾(0) = 1/(m + 1).
+    let at0 = exprel_derivs(0.0, 4);
+    for (m, v) in at0.iter().enumerate() {
+        assert_eq!(*v, 1.0 / (m as f64 + 1.0));
+    }
+}
+
+/// A rate whose value is 0 but which carries a derivative is an edge of the coupling graph
+/// (#2747 review): `KBACK = 0` with a seed couples `central` back into `depot` in every
+/// derivative though not in value. Read from values alone, the depot was acyclic, its
+/// eigenvalue snapped to `−KA` and the masks zeroed `∂depot/∂KBACK`, which is
+/// `∫e^{−KA(t−s)}·central(s) ds ≠ 0`. The test also asserts that derivative is live, so it
+/// cannot pass on a fixture where it is 0 anyway.
+#[test]
+fn a_zero_valued_rate_with_a_derivative_is_a_coupling() {
+    fn back<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = -p[0] * u[0] + p[1] * u[1];
+        du[1] = p[0] * u[0] - p[2] * u[1];
+    }
+    let saveat = [0.5, 2.0, 6.0];
+    let (hits, worst) = spectral_vs_pade_dual2(
+        &back,
+        &[1.2, 0.0, 0.3],
+        [0, 1],
+        &[100.0, 5.0],
+        (0.0, 6.0),
+        &saveat,
+    );
+    assert!(hits > 0, "the spectral path must serve the segment");
+    // Measured 1.4e-13; 1e-12 keeps ~7× headroom. (With the graph read from values, the
+    // gap was 0.998: ∂depot/∂KBACK read 0.)
+    assert!(worst < 1e-12, "zero-valued coupling: worst {worst:.2e}");
+    let p: Vec<Dual2<2>> = [1.2, 0.0, 0.3]
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if i < 2 {
+                Dual2::<2>::var(v, i)
+            } else {
+                Dual2::<2>::from_f64(v)
+            }
+        })
+        .collect();
+    let u: Vec<Dual2<2>> = [100.0, 5.0]
+        .iter()
+        .map(|&v| Dual2::<2>::from_f64(v))
+        .collect();
+    let r = linear_segment_g(&back, &u, (0.0, 6.0), &p, &saveat, &[])
+        .unwrap()
+        .0;
+    assert!(r[1].u[0].grad[1].abs() > 1.0, "∂depot/∂KBACK must be live");
+}
+
+/// Every jet order the crate's number types carry (up to 4: the covariance step's nested
+/// dual) through the spectral path, against Padé: a `Taylor<1, 4>` seeded on a rate of the
+/// cyclic central–peripheral block, whose eigenvalues take the chord iteration's jets and
+/// whose `φ` reads `exprel_derivs` to order 4.
+#[test]
+fn spectral_carries_every_jet_order_to_four() {
+    type T4 = crate::sens::taylor::Taylor<1, 4, 5>;
+    let base = [1.4, 0.12, 0.35, 0.18, 5.0];
+    let p: Vec<T4> = base
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if i == 2 {
+                T4::var(v, 0)
+            } else {
+                T4::from_f64(v)
+            }
+        })
+        .collect();
+    let u: Vec<T4> = [100.0, 3.0, 1.0].iter().map(|&v| T4::from_f64(v)).collect();
+    let run = || {
+        linear_segment_g(&two_cpt_depot, &u, (0.0, 10.0), &p, &[0.5, 2.0, 10.0], &[])
+            .unwrap()
+            .0
+    };
+    let (sp, hits) = with_spectral(true, run);
+    let (pade, _) = with_spectral(false, run);
+    assert!(hits > 0, "the spectral path must serve the segment");
+    let mut worst = 0.0_f64;
+    for (a, b) in sp.iter().zip(&pade) {
+        for (x, y) in a.u.iter().zip(&b.u) {
+            for (cx, cy) in x.c.iter().zip(&y.c) {
+                assert!(cx.is_finite() && cy.is_finite(), "{cx} vs {cy}");
+                worst = worst.max((cx - cy).abs() / (1.0 + cy.abs()));
+            }
+        }
+    }
+    // The order-4 coefficient must be live, or the comparison says nothing about it.
+    assert!(pade
+        .iter()
+        .any(|pt| pt.u.iter().any(|x| x.c[4].abs() > 1e-6)));
+    // Measured 1.5e-12 (3 chord steps instead of 5: 1.37); 1e-11 keeps ~6.6× headroom.
+    assert!(worst < 1e-11, "order-4 Taylor: worst {worst:.2e}");
 }

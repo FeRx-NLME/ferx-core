@@ -93,7 +93,12 @@ readout, so it shares that block's name scope — including the `TIME` built-in
 (spelled `TIME` or `T`), which resolves to **the decision's own time**. A
 protocol-time-dependent target such as `observe = central / V - TARGET * TIME /
 (TIME + T50)` therefore titrates against the intended ramp
-([#1028](https://github.com/FeRx-NLME/ferx-core/issues/1028)).
+([#1028](https://github.com/FeRx-NLME/ferx-core/issues/1028)). It is the `TIME` as
+written at the decision, which is what an observation record there reads. After a reset
+that restarts `TIME`, that is the restarted value, not the engine clock the decision
+times are given on. The same holds for a monitor without `observe` whose `[scaling]`
+readout reads `TIME`, and for every point of an `auc_target` window
+([#2756](https://github.com/FeRx-NLME/ferx-core/issues/2756)).
 
 The shared name scope includes the `T` precedence rule: a `T` (or `t`) declared in
 `[covariates]` is the **data column**, in `observe` exactly as in `[scaling]`, so

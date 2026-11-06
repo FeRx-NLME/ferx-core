@@ -514,6 +514,448 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     with_workspace(|ws: &mut LinWs<T>| segment_in(ws, rhs, u0, t_span, params, saveat, interp_at))
 }
 
+/// The spectral form of a segment's generator `A` (n×n, row-major): its eigenvalues `λ_i`
+/// and Sylvester projectors `P_i = Π_{j≠i} (A − λ_j I)/(λ_i − λ_j)`, so that
+/// `exp(A·h) = Σ_i e^{λ_i h} P_i` and `∫_0^h exp(A·s) ds = Σ_i φ(λ_i, h) P_i` with
+/// `φ(λ, h) = (e^{λh} − 1)/λ`. Exact for a diagonalisable `A` with distinct eigenvalues,
+/// in every number type: each eigenvalue holds the eigensolver's value (an acyclic
+/// compartment's diagonal, exactly) and the exact implicit derivatives of its eigenpair
+/// ([`spectral_of`]).
+pub(super) struct Spectral<T> {
+    pub(super) lambda: Vec<T>,
+    /// `P_i` row-major, `n·n` each, concatenated.
+    pub(super) proj: Vec<T>,
+}
+
+/// Relative eigenvalue separation below which the projectors' `1/(λ_i − λ_j)` amplifies
+/// rounding past what Padé would deliver: a repeated or near-repeated eigenvalue (a
+/// transit chain at one rate, `KA = CL/V`) takes the Padé path, which needs no
+/// diagonalisation. A numerical-validity bound, checked again on the result below.
+const SPECTRAL_MIN_REL_GAP: f64 = 1e-4;
+/// Largest projector entry the spectral path accepts (see `spectral_of`).
+const SPECTRAL_MAX_KAPPA: f64 = 32.0;
+/// The projectors must reproduce `I = Σ P_i` and `A = Σ λ_i P_i` to this relative accuracy
+/// (values and jets), or the segment takes Padé.
+const SPECTRAL_CHECK_RTOL: f64 = 1e-11;
+/// Chord steps for an eigenvalue's jets ([`spectral_of`]): each makes one more derivative
+/// order exact, and the crate's deepest number type (the covariance step's nested dual)
+/// carries four.
+const SPECTRAL_JET_STEPS: usize = 5;
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: propagate every segment by Padé, as before the spectral path.
+    pub(crate) static SPECTRAL_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Segments the spectral path propagated on this thread.
+    pub(super) static SPECTRAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn spectral_enabled() -> bool {
+    #[cfg(test)]
+    {
+        !SPECTRAL_OFF.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
+    if n == 0 || n > 6 {
+        return None;
+    }
+    let mut buf = [0.0_f64; 36];
+    let vals = &mut buf[..n * n];
+    for (v, x) in vals.iter_mut().zip(a) {
+        *v = x.val();
+    }
+    // The coupling graph: entry `r·n + c` is an edge unless it is a structural zero — value 0
+    // and no derivative ([`crate::sens::linsolve::structural_zero`], the convention the Padé
+    // kernels skip on). A rate whose value sits at 0 while it carries a jet is an edge: its
+    // derivative couples the compartments even where its value does not.
+    let present = a.iter().enumerate().fold(0u64, |m, (i, x)| {
+        if crate::sens::linsolve::structural_zero(*x) {
+            m
+        } else {
+            m | (1 << i)
+        }
+    });
+    if repeated_singleton_eigenvalue(vals, present, n) {
+        return None;
+    }
+    spectral_of(a, n, vals, present)
+}
+
+/// Whether two compartments that sit on no cycle of `A`'s coupling graph have (nearly) the same
+/// diagonal. Such a compartment is a 1×1 diagonal block of `A`'s block-triangular form, so its
+/// diagonal *is* an eigenvalue, exactly: a transit chain at one rate shows its repeated
+/// eigenvalue here, without the eigensolve [`spectral_of`] would run only to decline it
+/// (measured: that eigensolve made an all-declined transit fit 3% slower than Padé alone). The
+/// gap is relative to the larger of the two diagonals, at most the spectral radius
+/// `spectral_of` measures against, so this declines nothing `spectral_of` would accept.
+fn repeated_singleton_eigenvalue(vals: &[f64], present: u64, n: usize) -> bool {
+    let close = |x: f64, y: f64| (x - y).abs() <= SPECTRAL_MIN_REL_GAP * x.abs().max(y.abs());
+    // Only a pair of close diagonals can decline, so the coupling graph is walked only for one.
+    if !(0..n).any(|i| (i + 1..n).any(|j| close(vals[i * n + i], vals[j * n + j]))) {
+        return false;
+    }
+    let acyclic = acyclic_mask(present, n);
+    let mut diag = [0.0_f64; 6];
+    let mut m = 0;
+    for i in (0..n).filter(|&i| acyclic & (1 << i) != 0) {
+        diag[m] = vals[i * n + i];
+        m += 1;
+    }
+    (0..m).any(|i| (i + 1..m).any(|j| close(diag[i], diag[j])))
+}
+
+/// `down[i]`: the compartments `i` reaches along `A`'s nonzero couplings, itself included
+/// (Warshall over row bitmasks, `n ≤ 6`). Amount flows from column `c` to row `r` where
+/// `A_rc ≠ 0`, so `r ∈ down[c]` is the reachability every power of `A` — and every function of
+/// it, `exp(A·t)` and each projector included — is supported on.
+fn downstream(present: u64, n: usize) -> [u8; 6] {
+    let mut reach = [0u8; 6];
+    for r in 0..n {
+        for c in 0..n {
+            if r != c && present & (1 << (r * n + c)) != 0 {
+                reach[c] |= 1 << r;
+            }
+        }
+    }
+    for k in 0..n {
+        for i in 0..n {
+            if reach[i] & (1 << k) != 0 {
+                reach[i] |= reach[k];
+            }
+        }
+    }
+    for (i, r) in reach.iter_mut().enumerate().take(n) {
+        *r |= 1 << i;
+    }
+    reach
+}
+
+/// Bit `i` set when compartment `i` sits on no cycle of `A`'s coupling graph: a 1×1 block of
+/// `A`'s block-triangular form, whose diagonal is therefore an eigenvalue, exactly.
+fn acyclic_mask(present: u64, n: usize) -> u8 {
+    let down = downstream(present, n);
+    (0..n).fold(0u8, |m, i| {
+        let cyclic = (0..n).any(|j| j != i && down[i] & (1 << j) != 0 && down[j] & (1 << i) != 0);
+        if cyclic {
+            m
+        } else {
+            m | (1 << i)
+        }
+    })
+}
+
+/// The Sylvester projectors `P_i = Π_{j≠i} (A − λ_j I)/(λ_i − λ_j)`, row-major and
+/// concatenated. One body for the `f64` decision and the `T` result, so the `T` projectors'
+/// values are the `f64` ones bit for bit: the same operations on the same values.
+fn projectors<U: PkNum>(a: &[U], lambda: &[U], masks: &[(u8, u8)], n: usize) -> Vec<U> {
+    let zero = U::from_f64(0.0);
+    let one = U::from_f64(1.0);
+    let mut proj = vec![zero; n * n * n];
+    let mut tmp = vec![zero; n * n];
+    for i in 0..n {
+        let p = &mut proj[i * n * n..(i + 1) * n * n];
+        for d in 0..n {
+            p[d * n + d] = one;
+        }
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
+            let inv = one / (lambda[i] - lambda[j]);
+            // p ← p·(A − λ_j I)·inv
+            for r in 0..n {
+                for col in 0..n {
+                    let mut s = zero;
+                    for l in 0..n {
+                        let alc = if l == col {
+                            a[l * n + col] - lambda[j]
+                        } else {
+                            a[l * n + col]
+                        };
+                        s = s + p[r * n + l] * alc;
+                    }
+                    tmp[r * n + col] = s * inv;
+                }
+            }
+            p.copy_from_slice(&tmp);
+        }
+        // Exact structural zeros, which the products above leave as rounding residue.
+        let (rows, cols) = masks[i];
+        for r in 0..n {
+            for c in 0..n {
+                if rows & (1 << r) == 0 || cols & (1 << c) == 0 {
+                    p[r * n + c] = zero;
+                }
+            }
+        }
+    }
+    proj
+}
+
+/// `A`'s spectral form, or `None` (the segment takes Padé). Decided in `f64` on `A`'s values
+/// and its coupling graph (`present`: every entry but a structural zero): the eigenvalues,
+/// the projectors' size and the identities they must reproduce never read a jet, so a
+/// declined segment records nothing on a tape, and `f64` and every dual or tape type take the
+/// same decision — unless an entry's value is 0 while it carries a derivative, which is an
+/// edge for the dual run and not for the `f64` one. Only an accepted form is built in `T`.
+fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64], present: u64) -> Option<Spectral<T>> {
+    let ev = nalgebra::DMatrix::<f64>::from_row_slice(n, n, vals).complex_eigenvalues();
+    let scale = vals.iter().fold(0.0_f64, |s, x| s.max(x.abs())).max(1e-300);
+    let mut lam_f: Vec<f64> = Vec::with_capacity(n);
+    for z in ev.iter() {
+        if !(z.re.is_finite() && z.im.is_finite()) || z.im.abs() > 1e-12 * scale {
+            return None;
+        }
+        lam_f.push(z.re);
+    }
+    lam_f.sort_by(|x, y| x.total_cmp(y));
+    let lmax = lam_f
+        .iter()
+        .fold(0.0_f64, |s, x| s.max(x.abs()))
+        .max(scale * 1e-12);
+    for w in lam_f.windows(2) {
+        if (w[1] - w[0]).abs() < SPECTRAL_MIN_REL_GAP * lmax {
+            return None;
+        }
+    }
+    // Each eigenvalue belongs to one diagonal block of `A`'s block-triangular form: a strongly
+    // connected set of compartments. An acyclic compartment is a 1×1 block, its diagonal an
+    // eigenvalue exactly, which the eigensolver returns to within an ulp or so: snapping to
+    // the exact bits makes `A − λI` zero that compartment's row (measured: a depot decayed to
+    // 1e-6 of its dose otherwise read 5.5e-10 off, the other modes leaking `ε·‖x‖` into it).
+    // A cyclic block's eigenvalues are found by solving that block alone. The block fixes the
+    // projector's support — rows downstream of it, columns upstream — which the products then
+    // keep as exact zeros rather than rounding residue. (Entries a projector's support does
+    // include can still carry the modes' algebraic cancellation: a stiff chain's
+    // `∂²u₁/∂k₂²`, exactly 0, reads ~1e-12 through mode 0's `(A − λ₂I)/(λ₀ − λ₂)`.) `exact[k]`: the compartment eigenvalue `k` is the diagonal of.
+    let down = downstream(present, n);
+    let mut exact: [Option<usize>; 6] = [None; 6];
+    let mut block: [u8; 6] = [0; 6];
+    let mut done = 0u8;
+    for i in 0..n {
+        if done & (1 << i) != 0 {
+            continue;
+        }
+        let scc = (0..n).fold(0u8, |m, j| {
+            if down[i] & (1 << j) != 0 && down[j] & (1 << i) != 0 {
+                m | (1 << j)
+            } else {
+                m
+            }
+        });
+        done |= scc;
+        let members: Vec<usize> = (0..n).filter(|&j| scc & (1 << j) != 0).collect();
+        let targets: Vec<f64> = if members.len() == 1 {
+            vec![vals[i * n + i]]
+        } else {
+            let sub = nalgebra::DMatrix::<f64>::from_fn(members.len(), members.len(), |r, c| {
+                vals[members[r] * n + members[c]]
+            });
+            sub.complex_eigenvalues().iter().map(|z| z.re).collect()
+        };
+        for d in targets {
+            let k = (0..n)
+                .filter(|&k| block[k] == 0)
+                .min_by(|&x, &y| (lam_f[x] - d).abs().total_cmp(&(lam_f[y] - d).abs()))?;
+            if !((lam_f[k] - d).abs() <= SPECTRAL_CHECK_RTOL * lmax) {
+                return None;
+            }
+            block[k] = scc;
+            if members.len() == 1 {
+                lam_f[k] = d;
+                exact[k] = Some(i);
+            }
+        }
+    }
+    let masks: Vec<(u8, u8)> = (0..n)
+        .map(|k| {
+            let b = block[k];
+            let rows = (0..n)
+                .filter(|&s| b & (1 << s) != 0)
+                .fold(0u8, |m, s| m | down[s]);
+            let cols = (0..n).fold(0u8, |m, c| if down[c] & b != 0 { m | (1 << c) } else { m });
+            (rows, cols)
+        })
+        .collect();
+    let pf = projectors(vals, &lam_f, &masks, n);
+    // The projectors' size bounds how much they amplify rounding (×κ in values, ×κ² in a
+    // second-order jet); Padé's error does not depend on it. A compartmental generator has
+    // κ ≈ 1 (measured 0.88–1.27 on 2- and 3-state models); a transit chain is strongly
+    // non-normal (94 to 1.9e5 on a 5-state one, whose order-2 jets then sat 1.2e-10 off
+    // Padé's against 6.8e-12), so past `SPECTRAL_MAX_KAPPA` the segment takes Padé. A
+    // non-finite entry declines too (`f64::max` would drop a NaN).
+    if !pf.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    let kappa = pf.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    if !(kappa <= SPECTRAL_MAX_KAPPA) {
+        return None;
+    }
+    // Validity: Σ P_i = I and Σ λ_i P_i = A.
+    for r in 0..n {
+        for col in 0..n {
+            let (mut sp, mut sa) = (0.0, 0.0);
+            for i in 0..n {
+                let pij = pf[i * n * n + r * n + col];
+                sp += pij;
+                sa += lam_f[i] * pij;
+            }
+            let id = if r == col { 1.0 } else { 0.0 };
+            if !((sp - id).abs() <= SPECTRAL_CHECK_RTOL
+                && (sa - vals[r * n + col]).abs() <= SPECTRAL_CHECK_RTOL * scale)
+            {
+                return None;
+            }
+        }
+    }
+    if a.iter().all(|x| x.is_constant()) {
+        return Some(Spectral {
+            lambda: lam_f.into_iter().map(T::from_f64).collect(),
+            proj: pf.into_iter().map(T::from_f64).collect(),
+        });
+    }
+    // ── The jets. Each eigenpair `(λ, v)` solves `(A − λI)v = 0, v₀ᵀv = 1`, with `v₀` the
+    // `f64` eigenvector (`P_k`'s largest column). A chord step `z ← z − J₀⁻¹F(z)`, with `J₀`
+    // that system's exact `f64` Jacobian at the eigensolver's `(λ, v₀)`, makes one more
+    // derivative order exact; its value part is dropped, so `λ` keeps the eigensolver's
+    // value bit for bit. No characteristic polynomial is formed: its coefficients cancel on a
+    // stiff spectrum (rates 10, 0.5, 0.005 left the slowest eigenvalue's jets 4e-9 off Padé).
+    let zero = T::from_f64(0.0);
+    let one = T::from_f64(1.0);
+    let m = n + 1;
+    let mut lambda: Vec<T> = Vec::with_capacity(n);
+    let mut v: Vec<T> = vec![zero; n];
+    let mut fz: Vec<T> = vec![zero; m];
+    for (k, &l0) in lam_f.iter().enumerate() {
+        if let Some(i) = exact[k] {
+            // The diagonal itself: exact in value and in every jet.
+            lambda.push(a[i * n + i]);
+            continue;
+        }
+        let pk = &pf[k * n * n..(k + 1) * n * n];
+        let col = (0..n)
+            .max_by(|&x, &y| {
+                let nx: f64 = (0..n).map(|r| pk[r * n + x] * pk[r * n + x]).sum();
+                let ny: f64 = (0..n).map(|r| pk[r * n + y] * pk[r * n + y]).sum();
+                nx.total_cmp(&ny)
+            })
+            .unwrap_or(0);
+        let norm = (0..n).map(|r| pk[r * n + col].powi(2)).sum::<f64>().sqrt();
+        if !(norm > 0.0 && norm.is_finite()) {
+            return None;
+        }
+        let v0: Vec<f64> = (0..n).map(|r| pk[r * n + col] / norm).collect();
+        let jac = nalgebra::DMatrix::<f64>::from_fn(m, m, |r, c| match (r < n, c < n) {
+            (true, true) => vals[r * n + c] - if r == c { l0 } else { 0.0 },
+            (true, false) => -v0[r],
+            (false, true) => v0[c],
+            (false, false) => 0.0,
+        });
+        let jinv = jac.try_inverse()?;
+        if !jinv.iter().all(|x| x.is_finite()) {
+            return None;
+        }
+        for (vi, &x) in v.iter_mut().zip(&v0) {
+            *vi = T::from_f64(x);
+        }
+        let mut l = T::from_f64(l0);
+        for _ in 0..SPECTRAL_JET_STEPS {
+            for r in 0..n {
+                let mut acc = zero - l * v[r];
+                for c in 0..n {
+                    acc = acc + a[r * n + c] * v[c];
+                }
+                fz[r] = acc;
+            }
+            let mut dot = zero - one;
+            for c in 0..n {
+                dot = dot + T::from_f64(v0[c]) * v[c];
+            }
+            fz[n] = dot;
+            for r in 0..m {
+                let mut d = zero;
+                for c in 0..m {
+                    d = d + T::from_f64(jinv[(r, c)]) * fz[c];
+                }
+                let d = d - T::from_f64(d.val());
+                if r < n {
+                    v[r] = v[r] - d;
+                } else {
+                    l = l - d;
+                }
+            }
+        }
+        lambda.push(l);
+    }
+    let proj = projectors(a, &lambda, &masks, n);
+    Some(Spectral { lambda, proj })
+}
+
+/// `1/j` for `j < 48`, so the series below divides by no runtime value.
+const RECIP: [f64; 48] = {
+    let mut r = [0.0; 48];
+    let mut j = 1;
+    while j < 48 {
+        r[j] = 1.0 / j as f64;
+        j += 1;
+    }
+    r
+};
+
+/// `g(z) = (e^z − 1)/z` and its derivatives up to `orders` (≤ 4), the rest left 0, so
+/// `φ(λ, Δ) = Δ·g(λΔ)` is lifted exactly through the jet orders a number type carries
+/// ([`PkNum::lift4`]). Near `z = 0` the closed forms cancel (`g⁗` loses ~7 digits at `z = 0.1`),
+/// so `|z| ≤ 2` sums `g⁽ᵐ⁾(z) = Σ_k (zᵏ/k!)/(k + m + 1)` in one pass over `k`; past it the
+/// closed forms lose at most ~2. Each order accumulates on its own, so `g` is the same bits
+/// whatever `orders` asks for: the `f64` run and a dual run read one value.
+fn exprel_derivs(z: f64, orders: usize) -> [f64; 5] {
+    let mut out = [0.0; 5];
+    let top = orders.min(4);
+    if z.abs() <= 2.0 {
+        let mut p = 1.0; // zᵏ/k!
+        let mut k = 0;
+        loop {
+            for (m, o) in out.iter_mut().enumerate().take(top + 1) {
+                *o += p * RECIP[k + m + 1];
+            }
+            k += 1;
+            p *= z * RECIP[k];
+            // |z| ≤ 2: the next terms sum below 2·|p|, under an ulp of every order's value
+            // (each is at least g⁽ᵐ⁾(−2) > 0.03).
+            if p.abs() < 1e-19 || k + top + 1 >= RECIP.len() {
+                break;
+            }
+        }
+        return out;
+    }
+    let e = z.exp();
+    let (z2, z3, z4) = (z * z, z * z * z, z * z * z * z);
+    // Past `z ≈ −745` the exponential is 0 and the polynomials it multiplies may overflow
+    // (`0·inf = NaN`): drop the term, leaving each closed form's constant over `zᵐ⁺¹`.
+    let e_term = |poly: f64| if e == 0.0 { 0.0 } else { e * poly };
+    out[0] = z.exp_m1() / z;
+    if top >= 1 {
+        out[1] = (e_term(z - 1.0) + 1.0) / z2;
+    }
+    if top >= 2 {
+        out[2] = (e_term(z2 - 2.0 * z + 2.0) - 2.0) / z3;
+    }
+    if top >= 3 {
+        out[3] = (e_term(z3 - 3.0 * z2 + 6.0 * z - 6.0) + 6.0) / z4;
+    }
+    if top >= 4 {
+        out[4] = (e_term(z4 - 4.0 * z3 + 12.0 * z2 - 24.0 * z + 24.0) - 24.0) / (z4 * z);
+    }
+    out
+}
+
 /// [`linear_segment_g`] on a reused workspace: every buffer a segment needs, so a fit's
 /// thousands of segments allocate their outputs and nothing else.
 fn segment_in<T: PkNum>(
@@ -650,6 +1092,118 @@ fn segment_in<T: PkNum>(
         }
     }
 
+    // Every requested time, clamped into the span, visited once in ascending order.
+    let clamp = |t: f64| t.clamp(t0, t1);
+    times.clear();
+    times.extend(saveat.iter().chain(interp_at).map(|&t| clamp(t)));
+    times.sort_by(|x, y| x.total_cmp(y));
+    times.dedup();
+
+    // ── Spectral fast path (#2706 follow-up): a diagonalisable `A` with real, distinct
+    // eigenvalues — every 1/2/3-compartment disposition with first-order absorption — is
+    // propagated as `Σ_i P_i (e^{λ_i Δ} x + φ(λ_i, Δ) b)`: `n` exponentials per gap instead of
+    // a degree-13 Padé and its squarings. A repeated, near-repeated or complex spectrum (a
+    // transit chain at one rate) declines to Padé below. Whether to take it is decided on
+    // `A`'s values and coupling graph ([`spectral_of`]); each propagated state then passes the
+    // same reproduction check as Padé's, which reads jets too, so a state that fails it
+    // mid-segment sends that run (with the records it has made) to Padé, possibly on one
+    // number type and not another — the two exact propagations agree to round-off.
+    if spectral_enabled() {
+        if let Some(sp) = spectral(a, n) {
+            // The derivative orders `φ` needs: none on a constant generator; else the type's
+            // (every type in the crate carries at most 4; one that reports none gets all).
+            let jet_orders = if a.iter().all(|v| v.is_constant()) {
+                0
+            } else if T::JET_ORDER == 0 {
+                4
+            } else {
+                T::JET_ORDER
+            };
+            // `P_i b`, once per segment.
+            let mut pb = vec![zero; n * n];
+            for k in 0..n {
+                let pk = &sp.proj[k * n * n..(k + 1) * n * n];
+                for r in 0..n {
+                    let mut acc = zero;
+                    if T::FUSED_FOLDS {
+                        pairs.clear();
+                        pairs.extend((0..n).map(|col| (pk[r * n + col], b[col])));
+                        acc = T::dot_fold(acc, pairs);
+                    } else {
+                        for col in 0..n {
+                            acc = acc + pk[r * n + col] * b[col];
+                        }
+                    }
+                    pb[k * n + r] = acc;
+                }
+            }
+            states.clear();
+            x.clear();
+            x.extend_from_slice(u0);
+            let mut t_prev = t0;
+            let mut ok = true;
+            for &t in times.iter() {
+                let dt = t - t_prev;
+                if dt > 0.0 {
+                    let dt_t = T::from_f64(dt);
+                    for v in next.iter_mut().take(n) {
+                        *v = zero;
+                    }
+                    for k in 0..n {
+                        let lam = sp.lambda[k];
+                        let z = lam * dt_t;
+                        let e = z.exp();
+                        // φ(λ, Δ) = (e^{λΔ} − 1)/λ = Δ·g(λΔ), lifted exactly ([`exprel_derivs`]).
+                        let [g0, g1, g2, g3, g4] = exprel_derivs(z.val(), jet_orders);
+                        let phi = dt_t * z.lift4(g0, g1, g2, g3, g4);
+                        let pk = &sp.proj[k * n * n..(k + 1) * n * n];
+                        for r in 0..n {
+                            // One tape node per entry on a taped type (`PkNum::dot_fold`), as
+                            // the Padé path's products.
+                            let px = if T::FUSED_FOLDS {
+                                pairs.clear();
+                                pairs.extend((0..n).map(|col| (pk[r * n + col], x[col])));
+                                T::dot_fold(zero, pairs)
+                            } else {
+                                let mut px = zero;
+                                for col in 0..n {
+                                    px = px + pk[r * n + col] * x[col];
+                                }
+                                px
+                            };
+                            next[r] = next[r] + e * px + phi * pb[k * n + r];
+                        }
+                    }
+                    std::mem::swap(x, next);
+                    t_prev = t;
+                    if !reproduces(x, t_mid, direct) {
+                        ok = false;
+                        break;
+                    }
+                }
+                states.extend_from_slice(x);
+            }
+            if ok {
+                let lookup = |t: f64| -> Vec<T> {
+                    let tc = clamp(t);
+                    if tc <= t0 {
+                        return u0.to_vec();
+                    }
+                    let i = times
+                        .binary_search_by(|s| s.total_cmp(&tc))
+                        .expect("every requested time was propagated");
+                    states[i * n..(i + 1) * n].to_vec()
+                };
+                let at = |ts: &[f64]| -> Vec<SolPointG<T>> {
+                    ts.iter().map(|&t| SolPointG { t, u: lookup(t) }).collect()
+                };
+                #[cfg(test)]
+                SPECTRAL_HITS.with(|c| c.set(c.get() + 1));
+                return Some((at(saveat), at(interp_at)));
+            }
+        }
+    }
+
     // ── Augmented generator M = [[A, b/c], [0, 0]], (n+1)×(n+1); the propagated forcing
     // column is multiplied back by `c` below. Without `c` a forcing far above the rates sets
     // ‖M‖, and with it the squaring count: `du/dt = 1e20 − u` over unit time needs ~64
@@ -694,13 +1248,6 @@ fn segment_in<T: PkNum>(
     }
     // The last row, the constant input's, stays the zeros `ws.size` filled it with.
     let c = T::from_f64(c);
-
-    // Every requested time, clamped into the span, visited once in ascending order.
-    let clamp = |t: f64| t.clamp(t0, t1);
-    times.clear();
-    times.extend(saveat.iter().chain(interp_at).map(|&t| clamp(t)));
-    times.sort_by(|x, y| x.total_cmp(y));
-    times.dedup();
 
     // Propagators keyed by the exact gap, so an evenly spaced grid pays one exponential (and
     // `Expm` shares the Padé step between gaps whose scaled generators coincide, here and in
