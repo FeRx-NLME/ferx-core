@@ -533,7 +533,6 @@ fn segment_in<T: PkNum>(
     }
     let zero = T::from_f64(0.0);
     let t_mid = t0 + 0.5 * h;
-    let m = n + 1;
     ws.size(n, zero);
     let LinWs {
         probe,
@@ -555,6 +554,7 @@ fn segment_in<T: PkNum>(
         n_props,
         states,
         expms,
+        live,
     } = ws;
 
     // ── Extract A (row-major n×n) and b at the midpoint: b = f(0), column j = (f(s·e_j) − b)/s.
@@ -664,12 +664,35 @@ fn segment_in<T: PkNum>(
     });
     let c = (b_max / a_max.max(1.0)).max(1.0);
     let inv_c = T::from_f64(1.0 / c);
-    for i in 0..n {
-        for j in 0..n {
-            gen[i * m + j] = a[i * n + j];
-        }
-        gen[i * m + n] = b[i] * inv_c;
+
+    // ── Dormant states: a state whose forcing, row and column of `A` are all structural zeros
+    // (`structural_zero`: value 0, no jet, no tape node) neither moves nor moves anything over
+    // the segment, so it is copied through and left out of the exponential. Its row and
+    // column of the full exponential are exactly the identity's: every product that would
+    // reach them is a structural zero the kernels below already skip, so leaving them out
+    // changes no other entry, and the squaring count, set by ‖A‖₁, is the same. A gated
+    // accumulator (`d/dt(u_k) = G_k·k·x` with `G_k = 0` in this segment) is such a state,
+    // and a model with many of them is a large system of which a few states move (#2760).
+    // Only structural zeros count: a value that is merely 0 (`θ − θ₀` at `θ = θ₀`) has a
+    // derivative and keeps its state live.
+    {
+        use crate::sens::linsolve::structural_zero as sz;
+        live.clear();
+        live.extend(
+            (0..n).filter(|&i| !sz(b[i]) || (0..n).any(|j| !sz(a[i * n + j]) || !sz(a[j * n + i]))),
+        );
     }
+    let nl = live.len();
+    #[cfg(test)]
+    DORMANT_STATES.with(|c| c.set(c.get() + (n - nl)));
+    let m = nl + 1;
+    for (li, &i) in live.iter().enumerate() {
+        for (lj, &j) in live.iter().enumerate() {
+            gen[li * m + lj] = a[i * n + j];
+        }
+        gen[li * m + nl] = b[i] * inv_c;
+    }
+    // The last row, the constant input's, stays the zeros `ws.size` filled it with.
     let c = T::from_f64(c);
 
     // Every requested time, clamped into the span, visited once in ascending order.
@@ -712,10 +735,10 @@ fn segment_in<T: PkNum>(
                 Some(i) => i,
                 None => {
                     let dt_t = T::from_f64(dt);
-                    for (o, &g) in scaled.iter_mut().zip(gen.iter()) {
+                    for (o, &g) in scaled[..m * m].iter_mut().zip(gen[..m * m].iter()) {
                         *o = g * dt_t;
                     }
-                    let e = expm.exp(scaled)?;
+                    let e = expm.exp(&scaled[..m * m])?;
                     if *n_props == props.len() {
                         props.push((0, Vec::new()));
                     }
@@ -731,25 +754,27 @@ fn segment_in<T: PkNum>(
             // `x` is finite here: `u0` passed the magnitude check, and every propagated state
             // passed `reproduces`, which declines a non-finite one
             // (`a_segment_whose_state_overflows_declines`). So a skipped term is exactly `±0`.
-            for i in 0..n {
-                let acc = e[i * m + n] * c;
+            // A dormant state is its entry value; `next` holds the previous step's states.
+            next.copy_from_slice(x);
+            for (li, &i) in live.iter().enumerate() {
+                let acc = e[li * m + nl] * c;
                 if T::FUSED_FOLDS {
                     // One tape node per state (`PkNum::dot_fold`), the loop's values.
                     pairs.clear();
-                    for j in 0..n {
-                        if !crate::sens::linsolve::structural_zero(e[i * m + j]) {
-                            pairs.push((e[i * m + j], x[j]));
+                    for (lj, &j) in live.iter().enumerate() {
+                        if !crate::sens::linsolve::structural_zero(e[li * m + lj]) {
+                            pairs.push((e[li * m + lj], x[j]));
                         }
                     }
                     next[i] = T::dot_fold(acc, &pairs);
                     continue;
                 }
                 let mut acc = acc;
-                for j in 0..n {
-                    if crate::sens::linsolve::structural_zero(e[i * m + j]) {
+                for (lj, &j) in live.iter().enumerate() {
+                    if crate::sens::linsolve::structural_zero(e[li * m + lj]) {
                         continue;
                     }
-                    acc = acc + e[i * m + j] * x[j];
+                    acc = acc + e[li * m + lj] * x[j];
                 }
                 next[i] = acc;
             }
@@ -808,6 +833,8 @@ struct LinWs<T> {
     states: Vec<T>,
     /// One exponential workspace per size, its Padé approximants kept between segments.
     expms: Vec<Expm<T>>,
+    /// The segment's live states (not dormant), ascending: the exponential's rows.
+    live: Vec<usize>,
 }
 
 impl<T: PkNum> LinWs<T> {
@@ -832,6 +859,7 @@ impl<T: PkNum> LinWs<T> {
             n_props: 0,
             states: Vec::new(),
             expms: Vec::new(),
+            live: Vec::new(),
         }
     }
     /// Every per-segment buffer at its size for `n` states, filled with `zero` (the values a
@@ -856,6 +884,13 @@ impl<T: PkNum> LinWs<T> {
         }
         self.pairs.clear();
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Dormant states left out of an exponential, summed over this thread's segments: what
+    /// lets a test tell that the reduction ran, rather than a fixture with none to reduce.
+    pub(crate) static DORMANT_STATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {

@@ -115,12 +115,15 @@ struct VExt {
     x: Vec<f64>,
 }
 
-/// One RHS call recorded whole ([`record_rhs`]): its outputs are the consecutive nodes
-/// `o0 .. o0 + n_out`, and their adjoints reach the inputs through the kernel's compiled
-/// reverse pass, at the tape's own components ([`VRhs::layout`]).
+/// One RHS call recorded whole ([`record_rhs`]): its live outputs are the consecutive nodes
+/// `o0 .. o0 + n_live`, the `k`-th of them output `rhs_live[live_at + k]`, and their adjoints
+/// reach the inputs through the kernel's compiled reverse pass, at the tape's own components
+/// ([`VRhs::layout`]). An output that is a structural zero has no node: its adjoint is 0.
 struct VRhs {
     o0: u32,
     n_out: u32,
+    n_live: u32,
+    live_at: u32,
     kernel: u32,
     /// The reverse pass's lanes: the tape's `nc` components (value and tangents, plus the
     /// payload when it is taped).
@@ -146,6 +149,8 @@ struct VTape {
     rhss: Vec<VRhs>,
     rhs_ids: Vec<u32>,
     rhs_x: Vec<f64>,
+    /// Per block ([`VRhs::live_at`]), the output index of each of its nodes in order.
+    rhs_live: Vec<u32>,
     /// The kernels [`VRhs::kernel`] indexes, each held for the recording's life.
     kernels: Vec<std::sync::Arc<dyn crate::sens::num::vm::RhsKernel>>,
     mark: Mark,
@@ -166,14 +171,15 @@ struct Mark {
     rhss: usize,
     rhs_ids: usize,
     rhs_x: usize,
+    rhs_live: usize,
 }
 
 thread_local! {
     static VT: UnsafeCell<VTape> = const { UnsafeCell::new(VTape {
         nc: 0, nodes: Vec::new(), vals: Vec::new(), auxf: Vec::new(), auxi: Vec::new(),
         adj: Vec::new(), lus: Vec::new(), exts: Vec::new(), rhss: Vec::new(),
-        rhs_ids: Vec::new(), rhs_x: Vec::new(), kernels: Vec::new(),
-        mark: Mark { nodes: 0, auxf: 0, auxi: 0, lus: 0, exts: 0, rhss: 0, rhs_ids: 0, rhs_x: 0 },
+        rhs_ids: Vec::new(), rhs_x: Vec::new(), rhs_live: Vec::new(), kernels: Vec::new(),
+        mark: Mark { nodes: 0, auxf: 0, auxi: 0, lus: 0, exts: 0, rhss: 0, rhs_ids: 0, rhs_x: 0, rhs_live: 0 },
         cse: Vec::new(),
     }) };
 }
@@ -199,6 +205,7 @@ pub(crate) fn vtape_reset(nc: usize) {
     t.rhss.clear();
     t.rhs_ids.clear();
     t.rhs_x.clear();
+    t.rhs_live.clear();
     t.kernels.clear();
     t.mark = Mark::default();
     // The CSE cache is not cleared between recordings: a hit is verified against the
@@ -229,6 +236,7 @@ pub(crate) fn vtape_trim(nodes: usize) {
             rhss: Vec::new(),
             rhs_ids: Vec::new(),
             rhs_x: Vec::new(),
+            rhs_live: Vec::new(),
             kernels: Vec::new(),
             mark: Mark::default(),
             cse: Vec::new(),
@@ -258,6 +266,7 @@ fn vmark() -> usize {
         rhss: t.rhss.len(),
         rhs_ids: t.rhs_ids.len(),
         rhs_x: t.rhs_x.len(),
+        rhs_live: t.rhs_live.len(),
     };
     t.mark.nodes
 }
@@ -278,6 +287,7 @@ fn vrollback(mark: usize) {
     t.rhss.truncate(m.rhss);
     t.rhs_ids.truncate(m.rhs_ids);
     t.rhs_x.truncate(m.rhs_x);
+    t.rhs_live.truncate(m.rhs_live);
 }
 
 thread_local! {
@@ -368,6 +378,56 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
                 out.as_mut_ptr(),
             )
         };
+        // The outputs that are structural zeros (`RhsKernel::structural_zeros`) carry no
+        // derivative of any order, so they stay off the tape as constants: the exact linear
+        // path then sees them as the zeros they are (`ode::linear`'s sparsity skips and dormant
+        // states, #2760). Their adjoint is exactly 0 either way, so the sweep's values do
+        // not move. An output is dropped only if every lane the forward wrote is `0` too — the
+        // analysis may under-report, and this keeps an over-report from ever losing a lane.
+        let mut dead = vec![false; edu];
+        let known = {
+            let sz = |x: &DualV<N, M, TH>| crate::sens::linsolve::structural_zero(*x);
+            let val = |l: &[f64]| l[0];
+            let uv: Vec<f64> = xin[..eu * wf].chunks_exact(wf).map(val).collect();
+            let pv: Vec<f64> = xin[eu * wf..(eu + ep) * wf]
+                .chunks_exact(wf)
+                .map(val)
+                .collect();
+            let mut sv = [0.0; 4];
+            for (s, l) in sv.iter_mut().zip(xin[(eu + ep) * wf..].chunks_exact(wf)) {
+                *s = l[0];
+            }
+            let zu: Vec<bool> = u[..eu].iter().map(sz).collect();
+            let zp: Vec<bool> = params[..ep].iter().map(sz).collect();
+            let zs = [sz(&seeds[0]), sz(&seeds[1]), sz(&seeds[2]), sz(&seeds[3])];
+            kernel.structural_zeros(&uv, &pv, &sv, &zu, &zp, &zs, &mut dead)
+        };
+        #[cfg(test)]
+        let known = known && !RHS_DEAD_KEPT.with(|c| c.get());
+        for (o, l) in dead.iter_mut().zip(out.chunks_exact(wf)) {
+            *o = known && *o && l.iter().all(|&x| x == 0.0);
+        }
+        // A dropped output keeps the forward's lanes bit for bit (a `-0` tangent included),
+        // with no tape node.
+        let untaped = |l: &[f64]| {
+            let mut g = [0.0; N];
+            let mut h = [0.0; M];
+            g.copy_from_slice(&l[1..1 + N]);
+            h.copy_from_slice(&l[1 + N..1 + N + M]);
+            DualV {
+                v: l[0],
+                g,
+                h,
+                i: NONE,
+            }
+        };
+        if dead.iter().all(|&d| d) {
+            // Nothing to differentiate: no block, no inputs kept.
+            for (d, l) in du[..edu].iter_mut().zip(out.chunks_exact(wf)) {
+                *d = untaped(l);
+            }
+            return;
+        }
         let k = {
             let t = vt();
             match t
@@ -392,17 +452,26 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
             at
         };
         let o0 = vt().nodes.len() as u32;
-        for (d, l) in du[..edu].iter_mut().zip(out.chunks_exact(wf)) {
+        let live_at = vt().rhs_live.len() as u32;
+        for (o, (d, l)) in du[..edu].iter_mut().zip(out.chunks_exact(wf)).enumerate() {
+            if dead[o] {
+                *d = untaped(l);
+                continue;
+            }
             let mut g = [0.0; N];
             let mut h = [0.0; M];
             g.copy_from_slice(&l[1..1 + N]);
             h.copy_from_slice(&l[1 + N..1 + N + M]);
             let i = push::<N>(Op::Rhs, NONE, NONE, NONE, l[0], &g, &h);
             *d = DualV { v: l[0], g, h, i };
+            vt().rhs_live.push(o as u32);
         }
+        let n_live = vt().rhs_live.len() as u32 - live_at;
         vt().rhss.push(VRhs {
             o0,
             n_out: edu as u32,
+            n_live,
+            live_at,
             kernel: k,
             layout: rev,
             eu: eu as u32,
@@ -418,6 +487,9 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
 thread_local! {
     /// Test switch: tape every RHS operation instead of recording the call whole.
     pub(crate) static RHS_BLOCK_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test switch: keep every output of a recorded block on the tape, the structural zeros
+    /// included — the recording before #2760, the oracle its tests compare against.
+    pub(crate) static RHS_DEAD_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The block adjoint of one [`VRhs`] for one adjoint lane: read the outputs' adjoints
@@ -440,10 +512,11 @@ fn rhs_block_adjoint(
     du_bar.clear();
     du_bar.resize(n_out * w, 0.0);
     let mut live = false;
-    for o in 0..n_out {
+    let outs = &t.rhs_live[r.live_at as usize..(r.live_at + r.n_live) as usize];
+    for (k, &o) in outs.iter().enumerate() {
         for c in 0..w {
-            let a = adj[idx(r.o0 as usize + o, c)];
-            du_bar[o * w + c] = a;
+            let a = adj[idx(r.o0 as usize + k, c)];
+            du_bar[o as usize * w + c] = a;
             live |= a != 0.0;
         }
     }

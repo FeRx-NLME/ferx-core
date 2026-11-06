@@ -618,6 +618,19 @@ impl RhsKernel for JitInner {
     fn has_reverse(&self, layout: Layout) -> bool {
         self.resolve_vjp(layout).is_some()
     }
+    fn structural_zeros(
+        &self,
+        u: &[f64],
+        params: &[f64],
+        seeds: &[f64; 4],
+        zu: &[bool],
+        zp: &[bool],
+        zs: &[bool; 4],
+        out: &mut [bool],
+    ) -> bool {
+        super::structural_zeros(&self.code, self.n_regs, u, params, seeds, zu, zp, zs, out);
+        true
+    }
     unsafe fn forward(
         &self,
         layout: Layout,

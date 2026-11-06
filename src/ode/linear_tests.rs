@@ -389,6 +389,73 @@ fn segment_agrees_with_a_tight_integrator() {
     );
 }
 
+/// One state per way a state can be live or dormant (#2760): a parent `x0` draining at
+/// `k`; `x1`, which neither moves nor is forced but feeds `x2` (live by its column only);
+/// `x2`, fed by `x1`; `x3`, an accumulator whose gate is on (live by its row only); `x4`, the
+/// same accumulator with its gate off (dormant, holding what it held); `x5`, forced and
+/// nothing else (live by its forcing only). `p = [k, k2, k3, rate, gate_on, gate_off]`.
+fn dormancy_cases<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+    let (k, k2, k3, rate, on, off) = (p[0], p[1], p[2], p[3], p[4], p[5]);
+    du[0] = -(k * u[0]);
+    du[1] = T::from_f64(0.0);
+    du[2] = k2 * u[1] - k3 * u[2];
+    du[3] = on * k * u[0];
+    du[4] = off * k * u[0];
+    du[5] = rate;
+}
+
+#[test]
+fn a_dormant_state_is_left_out_and_every_live_one_kept() {
+    use crate::ode::linear::DORMANT_STATES;
+    let p = [0.3, 0.2, 0.15, 4.0, 1.0, 0.0];
+    let u0 = [100.0, 7.0, 1.0, 0.5, 9.0, 2.0];
+    let saveat = [0.5, 2.0, 6.0, 12.0];
+    let tight = OdeSolverOptions {
+        reltol: 1e-12,
+        abstol: 1e-12,
+        max_steps: 1_000_000,
+        method: OdeMethod::Rodas5P,
+        ..Default::default()
+    };
+    let reference = solve_ode(
+        &dormancy_cases::<f64>,
+        &u0,
+        (0.0, 12.0),
+        &p,
+        &saveat,
+        &tight,
+    );
+    DORMANT_STATES.with(|c| c.set(0));
+    let (hard, _) =
+        linear_segment_g::<f64>(&dormancy_cases, &u0, (0.0, 12.0), &p, &saveat, &[]).unwrap();
+    // Exactly one state is dormant — `x4` — and the straddle is the gated pair: `x3` and
+    // `x4` differ only by their gate.
+    assert_eq!(DORMANT_STATES.with(|c| c.get()), 1, "dormant states");
+    assert_eq!(hard.len(), reference.len());
+    let mut worst = [0.0_f64; 6];
+    for (got, want) in hard.iter().zip(&reference) {
+        // The dormant state holds its entry value bit for bit.
+        assert_eq!(got.u[4].to_bits(), u0[4].to_bits(), "x4 at t = {}", got.t);
+        for (i, (g, w)) in got.u.iter().zip(&want.u).enumerate() {
+            assert!(
+                g.is_finite() && w.is_finite(),
+                "x{i}: linear {g}, rodas5p {w}"
+            );
+            worst[i] = worst[i].max((g - w).abs() / w.abs().max(1e-12));
+        }
+    }
+    // Per state, so a failure names the one that was wrongly left out. Measured worst 9.1e-14
+    // (x0) against rodas5p at 1e-12, Linux x86_64; 10× headroom. A state wrongly left out is
+    // off by O(1).
+    eprintln!("dormancy cases vs tight rodas5p, worst per state: {worst:?}");
+    for (i, w) in worst.iter().enumerate() {
+        assert!(
+            *w < 1e-12,
+            "x{i}: linear vs tight rodas5p, worst rel err {w:e}"
+        );
+    }
+}
+
 #[test]
 fn segment_declines_a_nonlinear_rhs() {
     // Michaelis–Menten elimination: the classifier rejects it structurally; this is the

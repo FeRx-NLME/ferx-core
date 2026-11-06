@@ -566,6 +566,24 @@ pub(crate) mod vm {
         fn has_forward(&self, layout: Layout) -> bool;
         /// Whether a reverse pass exists (or can be built) for `layout`.
         fn has_reverse(&self, layout: Layout) -> bool;
+        /// Mark in `out` (one entry per derivative, at the extent) each derivative that is a
+        /// structural zero — exactly `0`, with every derivative of every order `0` — given the
+        /// inputs' values (`u`, `params`, `seeds`) and which inputs are structural zeros
+        /// (`zu`, `zp`, `zs`). `false`, with `out` unspecified, when the kernel cannot tell;
+        /// then every output must be treated as live. It may under-report, never over-report.
+        #[allow(clippy::too_many_arguments)]
+        fn structural_zeros(
+            &self,
+            _u: &[f64],
+            _params: &[f64],
+            _seeds: &[f64; 4],
+            _zu: &[bool],
+            _zp: &[bool],
+            _zs: &[bool; 4],
+            _out: &mut [bool],
+        ) -> bool {
+            false
+        }
         /// The forward over `layout`.
         ///
         /// # Safety

@@ -1620,3 +1620,382 @@ fn a_compiled_rhs_without_native_code_reports_the_register_code() {
         RhsConstruct::Function(_)
     ));
 }
+
+/// `structural_zeros` on `reg`'s own code, inputs marked by `zero` (states, then params,
+/// then seeds).
+fn zeros_of(reg: &RhsRegProgram, raw: (&[f64], &[f64], &[f64; 4]), zero: &[bool]) -> Vec<bool> {
+    let (nu, np) = (raw.0.len(), raw.1.len());
+    let zs = [
+        zero[nu + np],
+        zero[nu + np + 1],
+        zero[nu + np + 2],
+        zero[nu + np + 3],
+    ];
+    let mut out = vec![true; 3];
+    super::structural_zeros(
+        &reg.code,
+        reg.n_regs,
+        raw.0,
+        raw.1,
+        raw.2,
+        &zero[..nu],
+        &zero[nu..nu + np],
+        &zs,
+        &mut out,
+    );
+    out
+}
+
+/// The program on `Dual2<3>`: a structural-zero input is the constant `0`, every other one
+/// moves along its own random combination of the three directions, so a derivative that is
+/// not zero shows in the jets (no two inputs share a direction to cancel in).
+fn dual2_outputs(
+    reg: &RhsRegProgram,
+    raw: (&[f64], &[f64], &[f64; 4]),
+    zero: &[bool],
+    rng: &mut Rng,
+) -> Vec<crate::sens::dual2::Dual2<3>> {
+    use crate::sens::dual2::Dual2;
+    let mut k = 0;
+    let mut lift = |v: f64| -> Dual2<3> {
+        let z = zero[k];
+        k += 1;
+        if z {
+            return Dual2::<3>::from_f64(0.0);
+        }
+        let mut x = Dual2::<3>::from_f64(v);
+        for d in 0..3 {
+            let c = rng.unit() * 2.0 - 1.0;
+            x = x + <Dual2<3> as PkNum>::var(0.0, d) * Dual2::<3>::from_f64(c);
+        }
+        x
+    };
+    let u: Vec<_> = raw.0.iter().map(|&v| lift(v)).collect();
+    let p: Vec<_> = raw.1.iter().map(|&v| lift(v)).collect();
+    let s: Vec<_> = raw.2.iter().map(|&v| lift(v)).collect();
+    let s = [s[0], s[1], s[2], s[3]];
+    let mut du = vec![Dual2::<3>::from_f64(9.0); 3];
+    let mut regs = vec![Dual2::<3>::from_f64(0.0); reg.n_regs()];
+    reg.run(&u, &p, &s, &mut du, &mut regs);
+    du
+}
+
+/// #2760: every derivative `structural_zeros` reports is identically zero — value `0`,
+/// every first- and second-order derivative in every direction `0` — on random programs
+/// over every operation the compiler translates, with inputs that are structural zeros,
+/// live zeros (`0` with a derivative), tiny values and values that hit the guards. A
+/// report that is wrong is a derivative the tape silently drops, so this is the test that
+/// the analysis never over-reports.
+#[test]
+fn a_reported_structural_zero_is_identically_zero_on_random_programs() {
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let (mut reported, mut zero_valued) = (0usize, 0usize);
+    for case in 0..400 {
+        let odes = random_odes(&mut rng);
+        let prog = program(&odes);
+        let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog))
+            .unwrap_or_else(|e| panic!("case {case} did not compile ({e:?}):\n{odes}"));
+        let raw_u = seed_values(&mut rng, 3);
+        let raw_p = seed_values(&mut rng, n_params);
+        let raw_s = [1.75, rng.unit() * 5.0, 0.0, f64::EPSILON];
+        // An input that is exactly 0 is a structural zero three times in four, otherwise a
+        // live zero, which must never be reported through.
+        let zero: Vec<bool> = raw_u
+            .iter()
+            .chain(&raw_p)
+            .chain(&raw_s)
+            .map(|&v| v == 0.0 && rng.below(4) != 0)
+            .collect();
+        let raw = (&raw_u[..], &raw_p[..], &raw_s);
+        let _time = ModelTimeGuard::enter(1.75);
+        let dead = zeros_of(&reg, raw, &zero);
+        let du = dual2_outputs(&reg, raw, &zero, &mut rng);
+        for (o, (&d, x)) in dead.iter().zip(&du).enumerate() {
+            zero_valued += usize::from(x.val() == 0.0);
+            if !d {
+                continue;
+            }
+            reported += 1;
+            assert!(
+                x.val() == 0.0 && x.jets_finite() && x.jet_max_abs() == 0.0,
+                "case {case}: du[{o}] reported a structural zero but is {x:?}\n{odes}"
+            );
+        }
+    }
+    // The test checks nothing unless the analysis reports, and it reports a fraction of the
+    // zero-valued outputs (it may under-report). Measured: see the message.
+    eprintln!("{reported} reported of {zero_valued} zero-valued outputs");
+    assert!(reported >= 100, "only {reported} outputs reported");
+}
+
+/// #2760: the analysis on the shape it exists for, and its guards. A gated term `G·k·x`
+/// is a structural zero exactly when the gate is, and a structural zero against a value
+/// that is not finite (`0·∞`, `0/0`) is not one, since IEEE arithmetic makes it `NaN`.
+#[test]
+fn a_gated_term_is_a_structural_zero_exactly_when_its_gate_is() {
+    // x1..x3 are the states, A, B, C the individual parameters.
+    let prog = program("  d/dt(x1) = C * A * x2\n  d/dt(x2) = C / B - A * x2\n  d/dt(x3) = C / C");
+    let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog)).expect("compiles");
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let s = [1.75, 1.0, 0.5, f64::EPSILON];
+    let mut p = vec![0.7; n_params];
+    let mut zero = vec![false; 3 + n_params + 4];
+    // C is the third individual parameter; the binding reads it from its params slot.
+    let c = prog.indiv_to_params_slot[2];
+    let _time = ModelTimeGuard::enter(1.75);
+    // C = 0, a structural zero: x1' and x2's C/B term are dead; x2' still has −A·x2; C/C is
+    // 0/0.
+    p[c] = 0.0;
+    zero[3 + c] = true;
+    let u = [1.0, 2.0, 3.0];
+    let d = zeros_of(&reg, (&u, &p, &s), &zero);
+    assert_eq!(d, [true, false, false], "gate off");
+    // The same zero with a derivative (a live 0): nothing is dead.
+    zero[3 + c] = false;
+    assert_eq!(
+        zeros_of(&reg, (&u, &p, &s), &zero),
+        [false; 3],
+        "a live zero"
+    );
+    // The gate on: nothing is dead.
+    p[c] = 1.0;
+    assert_eq!(zeros_of(&reg, (&u, &p, &s), &zero), [false; 3], "gate on");
+    // Gate off against an infinite state: `0·∞` is `NaN`, not a zero.
+    p[c] = 0.0;
+    zero[3 + c] = true;
+    let u_inf = [1.0, f64::INFINITY, 3.0];
+    assert_eq!(zeros_of(&reg, (&u_inf, &p, &s), &zero)[0], false, "0·inf");
+}
+
+/// One taped block recording of `reg` over `DualV<N, M, TH>` in which the inputs `zero`
+/// marks are structural zeros (the constant `0`) and every other parameter and two of the
+/// states are tape leaves, swept from fixed adjoints on every taped output. `keep_dead`
+/// keeps the structural-zero outputs on the tape (`RHS_DEAD_KEPT`). Returns every leaf's
+/// adjoint components, the outputs and the tape's length.
+fn masked_block_adjoints<const N: usize, const M: usize, const TH: bool>(
+    reg: &RhsRegProgram,
+    raw: (&[f64], &[f64], &[f64; 4]),
+    zero: &[bool],
+    out_bar: &[f64],
+    keep_dead: bool,
+) -> (Vec<f64>, Vec<DualV<N, M, TH>>, usize) {
+    use crate::sens::vtape::{
+        vadj_index, vadj_index_h, vadj_init, vsweep, vsweep_h, vtape_len, vtape_reset,
+        RHS_DEAD_KEPT,
+    };
+    let nc = if TH { 1 + N + M } else { 1 + N };
+    RHS_DEAD_KEPT.with(|c| c.set(keep_dead));
+    vtape_reset(nc);
+    let mut leaves = Vec::new();
+    let mut k = 0;
+    let mut mk = |v: f64, leaf: bool| {
+        let z = zero[k];
+        k += 1;
+        if z {
+            return DualV::<N, M, TH>::constant(0.0);
+        }
+        let mut g = [0.0; N];
+        let mut h = [0.0; M];
+        for (j, x) in g.iter_mut().enumerate() {
+            *x = [0.5, -1.25, 0.0, 0.375][(k + j) % 4];
+        }
+        for (j, x) in h.iter_mut().enumerate() {
+            *x = [0.25, 0.0, -0.5][(k + j) % 3];
+        }
+        if leaf {
+            let d = DualV::<N, M, TH>::leaf(v, g, h);
+            leaves.push(d.i);
+            d
+        } else {
+            DualV::<N, M, TH>::free(v, g, h)
+        }
+    };
+    let u: Vec<_> = raw
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| mk(v, i != 1))
+        .collect();
+    let p: Vec<_> = raw.1.iter().map(|&v| mk(v, true)).collect();
+    let s: Vec<_> = raw.2.iter().map(|&v| mk(v, false)).collect();
+    let s: [DualV<N, M, TH>; 4] = [s[0], s[1], s[2], s[3]];
+    let mut du = vec![DualV::<N, M, TH>::constant(0.0); 3];
+    let mut regs = vec![DualV::<N, M, TH>::constant(0.0); reg.n_regs()];
+    reg.run(&u, &p, &s, &mut du, &mut regs);
+    RHS_DEAD_KEPT.with(|c| c.set(false));
+    let top = vtape_len();
+    let adj = vadj_init::<1>();
+    for (o, d) in du.iter().enumerate() {
+        if <DualV<N, M, TH> as PkNum>::is_taped(*d) {
+            for c in 0..nc {
+                let k = if TH {
+                    vadj_index_h::<N, M>(d.i, c)
+                } else {
+                    vadj_index::<N, 1>(d.i, c, 0)
+                };
+                adj[k] = out_bar[o * nc + c];
+            }
+        }
+    }
+    let a = if TH {
+        vsweep_h::<N, M>(top)
+    } else {
+        vsweep::<N, 1>(top)
+    };
+    let mut out = Vec::new();
+    for &id in &leaves {
+        for c in 0..nc {
+            out.push(if TH {
+                a[vadj_index_h::<N, M>(id, c)]
+            } else {
+                a[vadj_index::<N, 1>(id, c, 0)]
+            });
+        }
+    }
+    (out, du, top)
+}
+
+/// Dropped and kept recordings of one case: bit-identical values, jets and leaf adjoints;
+/// how many outputs were dropped.
+fn check_dead_outputs<const N: usize, const M: usize, const TH: bool>(
+    reg: &RhsRegProgram,
+    raw: (&[f64], &[f64], &[f64; 4]),
+    zero: &[bool],
+    rng: &mut Rng,
+    label: &str,
+) -> usize {
+    let nc = if TH { 1 + N + M } else { 1 + N };
+    let out_bar: Vec<f64> = (0..3 * nc).map(|_| rng.unit() * 2.0 - 1.0).collect();
+    let (want, du_kept, top_kept) =
+        masked_block_adjoints::<N, M, TH>(reg, raw, zero, &out_bar, true);
+    let (got, du, top) = masked_block_adjoints::<N, M, TH>(reg, raw, zero, &out_bar, false);
+    let same = |x: f64, y: f64| x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan());
+    let mut dropped = 0;
+    for (o, (a, b)) in du_kept.iter().zip(&du).enumerate() {
+        assert!(
+            same(a.v, b.v)
+                && a.g.iter().zip(&b.g).all(|(x, y)| same(*x, *y))
+                && a.h.iter().zip(&b.h).all(|(x, y)| same(*x, *y)),
+            "{label}: du[{o}] differs: kept {a:?}, dropped {b:?}"
+        );
+        if PkNum::is_taped(*a) && !PkNum::is_taped(*b) {
+            dropped += 1;
+            assert!(
+                PkNum::is_constant(*b),
+                "{label}: dropped du[{o}] is not a constant"
+            );
+        }
+    }
+    assert_eq!(
+        top_kept - top,
+        dropped,
+        "{label}: one node per dropped output"
+    );
+    for (k, (w, g)) in want.iter().zip(&got).enumerate() {
+        assert!(
+            same(*w, *g),
+            "{label}: leaf adjoint {k}: dropped {g:e} vs kept {w:e}"
+        );
+    }
+    dropped
+}
+
+/// #2760: a block that leaves its structural-zero outputs off the tape is the block that
+/// tapes them, bit for bit — every output's value, tangents and payload, and every leaf's
+/// adjoint after a sweep from adjoints on every output — over the outer-gradient layouts and
+/// the taped-payload one. The dropped outputs' local partials toward every taped input are
+/// exact zeros, which the sweep already skips; this pins that, and that the drop happens.
+#[test]
+fn dropping_a_blocks_structural_zero_outputs_moves_no_bit() {
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let mut dropped = 0;
+    // The gated shape first, then random programs.
+    let mut cases = vec![
+        "  d/dt(x1) = C * A * x2\n  d/dt(x2) = C / B - A * x2\n  d/dt(x3) = A * C * x1".to_string(),
+    ];
+    cases.extend((0..80).map(|_| random_odes(&mut rng)));
+    for (case, odes) in cases.iter().enumerate() {
+        let prog = program(odes);
+        let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog))
+            .unwrap_or_else(|e| panic!("case {case} did not compile ({e:?}):\n{odes}"));
+        // Away from the guards, as the block-vs-per-operation test; C a structural zero in
+        // the gated case, otherwise a random half of the states and parameters.
+        let mut raw_u: Vec<f64> = (0..3).map(|_| rng.unit() * 3.0 + 0.2).collect();
+        let mut raw_p: Vec<f64> = (0..n_params).map(|_| rng.unit() * 3.0 + 0.2).collect();
+        let raw_s = [
+            1.75,
+            rng.unit() * 5.0 + 0.1,
+            rng.unit() * 2.0 + 0.1,
+            f64::EPSILON,
+        ];
+        let mut zero = vec![false; 3 + n_params + 4];
+        if case == 0 {
+            zero[3 + prog.indiv_to_params_slot[2]] = true;
+        } else {
+            for z in zero.iter_mut().take(3 + n_params) {
+                *z = rng.below(2) == 0;
+            }
+        }
+        for (i, z) in zero.iter().enumerate().take(3 + n_params) {
+            if *z {
+                if i < 3 {
+                    raw_u[i] = 0.0;
+                } else {
+                    raw_p[i - 3] = 0.0;
+                }
+            }
+        }
+        let raw = (&raw_u[..], &raw_p[..], &raw_s);
+        let _time = ModelTimeGuard::enter(1.75);
+        let label = format!("case {case}:\n{odes}");
+        let d = check_dead_outputs::<2, 0, false>(&reg, raw, &zero, &mut rng, &label);
+        check_dead_outputs::<3, 6, false>(&reg, raw, &zero, &mut rng, &label);
+        check_dead_outputs::<2, 2, true>(&reg, raw, &zero, &mut rng, &label);
+        if case == 0 {
+            assert_eq!(d, 2, "the gated case drops both gated derivatives");
+        }
+        dropped += d;
+    }
+    eprintln!("{dropped} outputs dropped over {} cases", cases.len());
+    assert!(dropped >= 20, "only {dropped} outputs dropped");
+}
+
+/// #2760: the analysis reads values, so a structural zero times a factor whose value is
+/// finite but whose tangent is not — a diverged upstream jet — is reported dead, while the
+/// forward's lanes for it are `0·∞ = NaN`. Such an output must stay on the tape with its
+/// `NaN`, as it was before the drop, rather than leave as a clean zero: the block drops an
+/// output only when every lane the forward wrote is `0`. Both sides: the same program with a
+/// finite tangent is dropped.
+#[test]
+fn a_structural_zero_against_a_non_finite_tangent_stays_on_the_tape() {
+    let prog = program("  d/dt(x1) = C * A\n  d/dt(x2) = -A * x2\n  d/dt(x3) = B * x3");
+    let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog)).expect("compiles");
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let (a, c) = (prog.indiv_to_params_slot[0], prog.indiv_to_params_slot[2]);
+    let _time = ModelTimeGuard::enter(1.75);
+    let run = |tangent: f64| -> DualV<2, 0, false> {
+        crate::sens::vtape::vtape_reset(3);
+        let leaf = |v: f64| DualV::<2, 0, false>::leaf(v, [0.5, -0.25], []);
+        let u: Vec<_> = [1.0, 2.0, 3.0].iter().map(|&v| leaf(v)).collect();
+        let mut p: Vec<_> = (0..n_params).map(|_| leaf(0.7)).collect();
+        p[a] = DualV::<2, 0, false>::leaf(2.0, [tangent, 0.0], []);
+        p[c] = DualV::<2, 0, false>::constant(0.0);
+        let s = [DualV::<2, 0, false>::constant(1.75); 4];
+        let mut du = vec![DualV::<2, 0, false>::constant(0.0); 3];
+        let mut regs = vec![DualV::<2, 0, false>::constant(0.0); reg.n_regs()];
+        reg.run(&u, &p, &s, &mut du, &mut regs);
+        du[0]
+    };
+    let dropped = run(1.0);
+    assert!(
+        !PkNum::is_taped(dropped),
+        "a finite tangent: the gated term is dropped"
+    );
+    let kept = run(f64::INFINITY);
+    assert!(
+        PkNum::is_taped(kept) && kept.g[0].is_nan(),
+        "a non-finite tangent: the gated term stays taped with its NaN, got {kept:?}"
+    );
+}
