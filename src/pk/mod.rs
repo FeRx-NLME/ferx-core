@@ -458,9 +458,9 @@ fn iov_occasion_eta<'a, K: AsRef<[f64]>>(
 /// evaluates them. One
 /// builder for the funnel and for [`effective_model_for_eval_iov`], so the route is decided
 /// on exactly the parameters the prediction then uses.
-fn fill_iov_record_params(
+fn fill_iov_record_params<'s>(
     model: &CompiledModel,
-    subject: &Subject,
+    subject: &'s Subject,
     theta: &[f64],
     combined_for: &dyn Fn(u32) -> Vec<f64>,
     dose: &mut Vec<PkParams>,
@@ -478,7 +478,7 @@ fn fill_iov_record_params(
     // the vector (#2549 W1).
     let mut push = |out: &mut Vec<PkParams>,
                     occ: u32,
-                    cov: &std::collections::HashMap<String, f64>,
+                    cov: &'s std::collections::HashMap<String, f64>,
                     time: f64| {
         let p = memo.get_ref(occ, cov, time, || {
             pk_params_at_time(model, theta, &combined_for(occ), cov, time)
@@ -534,9 +534,9 @@ fn iov_table_off() -> bool {
 /// each holding a 1 KB copy. Every record reads the snapshot it read as a copy; an
 /// `ADDL`-implied dose that inherits its parent's attributes gets an entry of its own
 /// first (copy-on-write), so no record sharing the entry sees the edit.
-fn fill_iov_record_table(
+fn fill_iov_record_table<'s>(
     model: &CompiledModel,
-    subject: &Subject,
+    subject: &'s Subject,
     theta: &[f64],
     combined_for: &dyn Fn(u32) -> Vec<f64>,
     table: &mut Vec<PkParams>,
@@ -550,7 +550,7 @@ fn fill_iov_record_table(
                     last: &mut Option<u32>,
                     out: &mut Vec<u32>,
                     occ: u32,
-                    cov: &std::collections::HashMap<String, f64>,
+                    cov: &'s std::collections::HashMap<String, f64>,
                     time: f64| {
         let mut fresh = false;
         let p = memo.get_ref(occ, cov, time, || {
@@ -616,19 +616,31 @@ fn fill_iov_record_table(
 }
 
 /// The last per-record parameter evaluation of [`fill_iov_record_params`] and its inputs:
-/// the occasion (which fixes `[η, κ]` within one call), the covariate map by address, and the
-/// time unless the parameter program provably does not read `TIME`.
-struct RecordParamMemo {
+/// the occasion (which fixes `[η, κ]` within one call), the covariate map, and the time unless
+/// the parameter program provably does not read `TIME`.
+struct RecordParamMemo<'a> {
     time_free: bool,
     last: Option<(
         u32,
-        *const std::collections::HashMap<String, f64>,
+        &'a std::collections::HashMap<String, f64>,
         u64,
         PkParams,
     )>,
 }
 
-impl RecordParamMemo {
+/// Whether two covariate maps hold the same values, bit for bit: the inputs the parameter
+/// program reads from them are then identical, whichever map it is handed.
+fn same_covariates(
+    a: &std::collections::HashMap<String, f64>,
+    b: &std::collections::HashMap<String, f64>,
+) -> bool {
+    std::ptr::eq(a, b)
+        || (a.len() == b.len()
+            && a.iter()
+                .all(|(k, v)| b.get(k).is_some_and(|w| w.to_bits() == v.to_bits())))
+}
+
+impl<'a> RecordParamMemo<'a> {
     /// `time_free` trusts the parsed program's `TIME` flag ([`model_uses_time_builtin`]) to
     /// speak for `model.pk_param_fn`, the closure the memo actually calls. That is the
     /// predicate routing already trusts for the same question: a closure that reads `time`
@@ -648,16 +660,15 @@ impl RecordParamMemo {
     fn get_ref(
         &mut self,
         occ: u32,
-        cov: &std::collections::HashMap<String, f64>,
+        cov: &'a std::collections::HashMap<String, f64>,
         time: f64,
         eval: impl FnOnce() -> PkParams,
     ) -> &PkParams {
         let t = if self.time_free { 0 } else { time.to_bits() };
-        let cov_ptr = cov as *const _;
         let hit = matches!(&self.last, Some((o, c, tt, _))
-            if *o == occ && std::ptr::eq(*c, cov_ptr) && *tt == t);
+            if *o == occ && *tt == t && same_covariates(c, cov));
         if !hit {
-            self.last = Some((occ, cov_ptr, t, eval()));
+            self.last = Some((occ, cov, t, eval()));
         }
         &self.last.as_ref().expect("set above").3
     }
@@ -3851,7 +3862,7 @@ mod parent_dose_attr_tests;
 #[cfg(test)]
 mod tests {
     /// #1564: the IOV record memo reuses a parameter evaluation exactly when every input
-    /// the program reads repeats — occasion, covariate map (by address), and the time unless
+    /// the program reads repeats — occasion, covariate values, and the time unless
     /// the program cannot read `TIME` — and evaluates otherwise.
     #[test]
     fn record_param_memo_reuses_only_identical_inputs() {
@@ -3873,10 +3884,19 @@ mod tests {
         // Same occasion and map, another time, on a time-free program: reused.
         assert_eq!(memo.get_ref(0, &a, 2.0, || eval(9.0)).values[0], 1.0);
         assert_eq!(calls.get(), 1);
-        // Another occasion, another map (even with equal contents): evaluated.
+        // Another occasion: evaluated. Another map with the same contents: reused — the
+        // reader gives every record of a time-varying-covariate subject a map of its own.
         assert_eq!(memo.get_ref(1, &a, 2.0, || eval(2.0)).values[0], 2.0);
-        assert_eq!(memo.get_ref(1, &b, 2.0, || eval(3.0)).values[0], 3.0);
-        assert_eq!(calls.get(), 3);
+        assert_eq!(memo.get_ref(1, &b, 2.0, || eval(3.0)).values[0], 2.0);
+        assert_eq!(calls.get(), 2);
+        // A map whose value differs — by its bits alone, `-0.0` against `0.0` — is evaluated.
+        let c: HashMap<String, f64> = [("WT".to_string(), 0.0)].into_iter().collect();
+        let d: HashMap<String, f64> = [("WT".to_string(), -0.0)].into_iter().collect();
+        let e: HashMap<String, f64> = [("CRCL".to_string(), 0.0)].into_iter().collect();
+        assert_eq!(memo.get_ref(1, &c, 2.0, || eval(7.0)).values[0], 7.0);
+        assert_eq!(memo.get_ref(1, &d, 2.0, || eval(8.0)).values[0], 8.0);
+        assert_eq!(memo.get_ref(1, &e, 2.0, || eval(9.0)).values[0], 9.0);
+        assert_eq!(calls.get(), 5);
         // A program that reads `TIME` keys on the time too.
         let mut timed = RecordParamMemo {
             time_free: false,
@@ -3885,7 +3905,7 @@ mod tests {
         timed.get_ref(0, &a, 1.0, || eval(4.0));
         assert_eq!(timed.get_ref(0, &a, 2.0, || eval(5.0)).values[0], 5.0);
         assert_eq!(timed.get_ref(0, &a, 2.0, || eval(6.0)).values[0], 5.0);
-        assert_eq!(calls.get(), 5);
+        assert_eq!(calls.get(), 7);
     }
 
     use super::*;
