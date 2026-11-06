@@ -7525,6 +7525,7 @@ mod guard_stop {
         EbeResult {
             eta: DVector::zeros(1),
             h_matrix: DMatrix::zeros(1, 1),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged,
             used_fallback: false,

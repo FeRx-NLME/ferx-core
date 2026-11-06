@@ -16676,6 +16676,7 @@ mod guard_stop {
         let rejected = EbeResult {
             eta: DVector::zeros(model.n_eta),
             h_matrix: DMatrix::zeros(1, model.n_eta),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
@@ -16768,6 +16769,7 @@ mod guard_stop {
         let unconverged = EbeResult {
             eta: DVector::zeros(1),
             h_matrix: DMatrix::zeros(1, 1),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false,
             used_fallback: true,
