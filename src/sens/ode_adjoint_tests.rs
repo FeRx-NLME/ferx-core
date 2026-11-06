@@ -1644,6 +1644,87 @@ fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
     }
 }
 
+/// Inside a `SharingScope` the recorder's second call reads the index its first call
+/// kept (#2558), and its output must be the bits an unscoped call gives, on `f64` and on
+/// the inner loop's `DualF`. The subject's records do share (asserted), so the index a hit
+/// hands back decides which evaluation each record reads, and a wrong or stale one moves
+/// a prediction. The bits match the twin that shares nothing too, so what is compared is
+/// the right answer, not only the unscoped path's. Catches a hit that hands the recorder
+/// an index other than the one a build gives, which the f64 materializer's bit test and
+/// the parity tests, run outside any scope, cannot see.
+#[test]
+fn the_recorder_reads_the_same_bits_from_a_kept_sharing_index() {
+    use crate::pk::sharing_scope::{builds, SharingScope};
+    for iov in [false, true] {
+        let model = parse_model_string(&shared_inputs_src(iov)).unwrap();
+        let shared = shared_inputs_subject(&model, |_| false);
+        let twin = shared_inputs_subject(&model, |_| true);
+        let theta = &model.default_params.theta;
+        let w = subject_width(&model, &shared).unwrap();
+        let eta: Vec<f64> = (0..w).map(|k| 0.1 - 0.07 * k as f64).collect();
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let values = |s: &Subject| {
+            let f = record::<f64>(
+                &model,
+                s,
+                None,
+                theta,
+                &eta,
+                &ThetaLeaves::theta(theta),
+                &eta,
+            )
+            .expect("the closed-form recorder serves the subject");
+            bits(&f)
+        };
+        let jets = |s: &Subject| {
+            let rows = exact_obs_grads(&model, s, theta, &eta)
+                .expect("the closed-form recorder serves the subject");
+            let flat: Vec<f64> = rows
+                .iter()
+                .flat_map(|r| std::iter::once(r.f).chain(r.df_deta.iter().copied()))
+                .collect();
+            bits(&flat)
+        };
+        let records = crate::pk::record_pk_inputs(&shared);
+        let group = |occ: u32| {
+            crate::stats::stacked_layout::StackedLayout::sens_of(&model, &shared)
+                .and_then(|l| l.group_of(occ))
+        };
+        let first = crate::pk::first_record_with_same_pk_inputs(
+            &model,
+            records.iter().map(|&(occ, cov, _)| (group(occ), cov)),
+        )
+        .expect("a parsed model that does not read TIME has a sharing index");
+        assert!(
+            first.iter().enumerate().any(|(i, &f)| f != i),
+            "iov {iov}: the records must share, or a hit's index decides nothing: {first:?}"
+        );
+
+        let (want_f, want_jets) = (values(&twin), jets(&twin));
+        assert_eq!(values(&shared), want_f, "iov {iov}: unscoped f64");
+        assert_eq!(jets(&shared), want_jets, "iov {iov}: unscoped DualF");
+        let _share = SharingScope::enter(&model, &shared);
+        let b = builds();
+        assert_eq!(
+            values(&shared),
+            want_f,
+            "iov {iov}: f64, the call that builds"
+        );
+        assert_eq!(
+            builds(),
+            b + 1,
+            "iov {iov}: the recorder builds its index once"
+        );
+        assert_eq!(values(&shared), want_f, "iov {iov}: f64, a hit");
+        assert_eq!(jets(&shared), want_jets, "iov {iov}: DualF, a hit");
+        assert_eq!(
+            builds(),
+            b + 1,
+            "iov {iov}: every later call is a hit, or this test compares builds"
+        );
+    }
+}
+
 #[test]
 fn ode_steady_state_dose_matches_reconverged_fd() {
     let model = tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap());
