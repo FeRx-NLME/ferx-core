@@ -29620,6 +29620,7 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
         name: "KM".to_string(),
         spec,
         index_covariate: None,
+        columns: Vec::new(),
         profiled: false,
         linked: false,
         profile_box: None,
@@ -38347,5 +38348,276 @@ fn the_not_mu_referenced_advice_over_the_additive_input_space() {
             "{label}: {w}"
         );
         assert!(w.contains(says), "{label}: {w}");
+    }
+}
+
+// ── #2744: a data-driven level block is read bare ────────────────────────────
+
+/// The refusal's three sentences for `spelling` on a block declared over `cols`, each
+/// asserted whole, so deleting any one of them fails the test that reads it.
+fn data_driven_subscript_sentences(spelling: &str, cols: &str) -> [String; 3] {
+    [
+        format!(
+            "`{spelling}`: `PLACEBO` is a data-driven θ level block (`theta \
+             PLACEBO[{cols}]`), read bare, as `PLACEBO`: each record reads the level its \
+             own `{cols}` values select."
+        ),
+        "A subscript would index the block by the number it evaluates to, which matches \
+         the record's level only by coincidence."
+            .to_string(),
+        "To supply the index yourself, declare the counted form `theta PLACEBO[N]` and \
+         read `PLACEBO[COLUMN]`."
+            .to_string(),
+    ]
+}
+
+/// One model per place a θ level block can be read, declaring `PLACEBO` as `decl` and
+/// reading it as `read`: an `[individual_parameters]` line, the `y` readout, a
+/// residual-error magnitude, `[derived]`, a `[binary_model]` predictor, a `[scaling]`
+/// `obs_scale` and, with `markov`, a DTMM `[markov_model]` transition — every place
+/// `docs/model-file/parameters.qmd` lists a block as readable.
+fn level_read_sites(decl: &str, read: &str) -> Vec<(&'static str, String)> {
+    let gaussian = |indiv: &str, y: &str| {
+        format!(
+            "
+[parameters]
+  theta TVE0(1.5, -10.0, 10.0)
+  theta PLACEBO[{decl}](0.0, -10.0, 10.0)
+  sigma ADD ~ 0.1
+[covariates]
+  STUDY categorical
+[individual_parameters]
+  E0 = TVE0{indiv}
+[structural_model]
+  y = E0{y}
+[error_model]
+  DV ~ additive(ADD)
+"
+        )
+    };
+    #[allow(unused_mut)]
+    let mut sites = vec![
+        (
+            "[individual_parameters]",
+            gaussian(&format!(" + {read}"), ""),
+        ),
+        ("y", gaussian("", &format!(" + {read}"))),
+        (
+            "residual-error magnitude",
+            gaussian("", "").replace(
+                "DV ~ additive(ADD)",
+                &format!("DV ~ additive(ADD * exp({read}))"),
+            ),
+        ),
+        (
+            "[derived]",
+            gaussian("", "") + &format!("[derived]\n  D = E0 + {read}\n"),
+        ),
+        (
+            "[binary_model]",
+            format!(
+                "
+[parameters]
+  theta TVL(-0.3, -5.0, 5.0)
+  theta PLACEBO[{decl}](0.0, -5.0, 5.0)
+[covariates]
+  STUDY categorical
+[binary_model]
+  cmt   = 1
+  logit = TVL + {read}
+"
+            ),
+        ),
+        (
+            "[scaling]",
+            format!(
+                "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta PLACEBO[{decl}](0.0, -1.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+[covariates]
+  STUDY categorical
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V * exp({read})
+[error_model]
+  DV ~ proportional(EPS1)
+"
+            ),
+        ),
+    ];
+    #[cfg(feature = "markov")]
+    sites.push((
+        "DTMM [markov_model]",
+        format!(
+            "
+[parameters]
+  theta A(-0.8, -10.0, 10.0)
+  theta PLACEBO[{decl}](0.0)
+[covariates]
+  STUDY categorical
+[markov_model]
+  type   = dtmm
+  cmt    = 1
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = inv_logit(A + {read})
+  transition asleep -> awake  = inv_logit(A)
+"
+        ),
+    ));
+    sites
+}
+
+/// #2744: at every site, a subscripted read of a data-driven block is refused with all
+/// three sentences, while both other sides of the gate parse at the same site: the
+/// data-driven block read bare, and a counted block (`PLACEBO[3]`) read by the same
+/// `PLACEBO[STUDY]`, where the subscript is the documented interface.
+///
+/// Mutations: drop the `index_covariate` test (refuse every subscript) and the counted
+/// cell fails; drop the refusal and the data-driven cell parses; delete any sentence of
+/// the message and its assertion fails at every site.
+#[test]
+fn a_subscripted_read_of_a_data_driven_block_is_refused_at_every_site() {
+    let want = data_driven_subscript_sentences("PLACEBO[STUDY]", "STUDY");
+    let refused = level_read_sites("STUDY", "PLACEBO[STUDY]");
+    let bare = level_read_sites("STUDY", "PLACEBO");
+    let counted = level_read_sites("3", "PLACEBO[STUDY]");
+    let expected_sites = if cfg!(feature = "markov") { 7 } else { 6 };
+    assert_eq!(refused.len(), expected_sites);
+    for (((site, src), (_, bare_src)), (_, counted_src)) in refused.iter().zip(&bare).zip(&counted)
+    {
+        let err = expect_parse_err(src);
+        for sentence in &want {
+            assert!(
+                err.contains(sentence.as_str()),
+                "{site}: missing {sentence:?} in {err}"
+            );
+        }
+        if let Err(e) = parse_full_model(bare_src) {
+            panic!("{site}: the bare read must parse: {e}");
+        }
+        if let Err(e) = parse_full_model(counted_src) {
+            panic!("{site}: a counted block's subscripted read must parse: {e}");
+        }
+    }
+}
+
+/// #2744: every index shape gets the same refusal, echoing the read as written and the
+/// block's own columns — a plain column, a column the block is not keyed on, `TIME`
+/// (which the pre-fit range check cannot walk, so it used to fit at the divergence
+/// sentinel), a computed index (never recorded as a gather use, so it used to fit
+/// silently) and a literal (which used to say "must be in 1..=0"). On a one-column and
+/// a two-column block, each asserted against the other's columns so the echo cannot
+/// name the wrong declaration.
+///
+/// Mutations: render the index from the wrong token, or echo `cols` from anything but
+/// the block's declaration, and the spelling or columns assertion fails; let the
+/// literal fold run first and `PLACEBO[2]` gets the old range message.
+#[test]
+fn every_index_shape_is_refused_with_its_own_spelling() {
+    for (cols, other) in [("STUDY", "STUDY, TIME"), ("STUDY, TIME", "STUDY]")] {
+        for index in ["STUDY", "GRP", "TIME", "STUDY + 0", "2"] {
+            let spelling = format!("PLACEBO[{index}]");
+            let src = level_read_sites(cols, &spelling).swap_remove(0).1.replace(
+                "STUDY categorical",
+                "STUDY categorical\n  GRP   categorical",
+            );
+            let err = expect_parse_err(&src);
+            for sentence in data_driven_subscript_sentences(&spelling, cols) {
+                assert!(
+                    err.contains(&sentence),
+                    "{cols} / {index}: missing {sentence:?} in {err}"
+                );
+            }
+            assert!(
+                !err.contains(&format!("theta PLACEBO[{other}")) && !err.contains("1..=0"),
+                "{cols} / {index}: {err}"
+            );
+        }
+    }
+}
+
+/// #2744 audit A: in a context that cannot read a θ, the #1637 remedy reads a
+/// data-driven block bare (`PLACEBO_I = PLACEBO`), since its subscripted read is
+/// refused, while a counted block keeps the read as written. Each engine separately:
+/// `parse_primary`'s ODE scope (`[odes]`) and the hazard pre-check
+/// (`ode_level_block_read`), so a mutation to either names its own side.
+///
+/// Mutations: drop the `index_covariate` test in the ODE scope and the `[odes]` row
+/// says `PLACEBO_I = PLACEBO[STUDY]`; drop it in the hazard pre-check and the hazard
+/// row does; apply it to counted blocks too and the counted rows lose their index.
+#[test]
+fn an_ode_scope_remedy_reads_a_data_driven_block_bare() {
+    let odes = |decl: &str| {
+        format!(
+            "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta PLACEBO[{decl}](0.0, -1.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+[covariates]
+  STUDY categorical
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * exp(PLACEBO[STUDY]) * central
+[error_model]
+  DV ~ proportional(EPS1)
+"
+        )
+    };
+    let data_driven = expect_parse_err(&odes("STUDY"));
+    assert!(
+        data_driven.contains("[odes] cannot read a θ directly")
+            && data_driven.contains("(e.g. `PLACEBO_I = PLACEBO`)"),
+        "[odes], data-driven: {data_driven}"
+    );
+    let counted = expect_parse_err(&odes("3"));
+    assert!(
+        counted.contains("(e.g. `PLACEBO_I = PLACEBO[STUDY]`)"),
+        "[odes], counted: {counted}"
+    );
+
+    #[cfg(feature = "survival")]
+    for (index_covariate, want) in [
+        (Some("__level_KM".to_string()), "(e.g. `KM_I = KM`)"),
+        (None, "(e.g. `KM_I = KM[STUDY]`)"),
+    ] {
+        let _scope = VectorThetaScope::enter(vec![VectorThetaDecl {
+            name: "KM".to_string(),
+            spec: std::sync::Arc::new(GatherSpec {
+                name: "KM".to_string(),
+                levels: vec![LevelRule::Free(0), LevelRule::Free(1)],
+            }),
+            columns: index_covariate
+                .as_ref()
+                .map(|_| vec!["STUDY".to_string()])
+                .unwrap_or_default(),
+            index_covariate: index_covariate.clone(),
+            profiled: false,
+            linked: false,
+            profile_box: None,
+        }]);
+        let why = ode_level_block_read("H0 * KM[STUDY]")
+            .unwrap()
+            .expect("a block read in the hazard is refused");
+        assert!(
+            why.contains("an ODE-accumulated `hazard` cannot read") && why.contains(want),
+            "hazard, index_covariate {index_covariate:?}: {why}"
+        );
     }
 }

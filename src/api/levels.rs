@@ -1395,7 +1395,8 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
 /// any expression reads the block bare ([`LevelBlockDecl::read_bare`]): if none does,
 /// the expression is the cause; if one does, its reader defines no level on this data —
 /// a level-defining endpoint with no records here, or only a Gaussian prediction, a
-/// CTMM generator or a TTE hazard. An explicit `NAME[COLUMN]` read is named either way.
+/// CTMM generator or a TTE hazard. A subscripted `NAME[COLUMN]` read never gets here:
+/// the parse refuses it (#2744).
 fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     let name = decl.name();
     let head = format!("theta {name}[{}]", decl.columns().join(", "));
@@ -1433,18 +1434,6 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
              neither kind of record defines a level. Read the block in a `[binary_model]` \
              predictor or a DTMM `[markov_model]` transition.",
         );
-    }
-    if !decl.keyed_reads.is_empty() {
-        let reads: Vec<String> = decl
-            .keyed_reads
-            .iter()
-            .map(|c| format!("`{name}[{c}]`"))
-            .collect();
-        message.push_str(&format!(
-            " An explicit read indexes the block by the value its column holds, not by its \
-             level: {}. Write `{name}` instead.",
-            reads.join(", ")
-        ));
     }
     message
 }
