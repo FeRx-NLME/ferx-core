@@ -2092,6 +2092,9 @@ pub(crate) fn gn_gradient_takes_total_derivative(
 /// convergence, near its initial estimates, against the L-BFGS optimum 308.830465 (#2455).
 /// The adjoint's `dᵢ` is not masked on FIX'd coordinates; `build_gn_system` zeroes them.
 ///
+/// Under `gradient = fd` (model, `FitOptions`, or the fit-scoped flag) or a model outside
+/// the adjoint's scope, `dᵢ` is always the reconverged difference.
+///
 /// Otherwise, or when the subject is repelled (`nll` unusable, `gᵢ` or `dᵢ` non-finite),
 /// it is the closed form's `gn_theta_correction`, or zero without a cache.
 #[allow(clippy::too_many_arguments)]
@@ -2133,8 +2136,15 @@ pub(crate) fn ebe_response_correction(
     {
         let subject = &population.subjects[subj_idx];
         // The exact total derivative `dᵢ` — the adjoint's packed gradient carries the mode
-        // response the fixed-EBE score drops. IOV subjects took the arm above.
-        let exact = crate::estimation::covariance::stacked_mode(model, subject, eta_hat, None)
+        // response the fixed-EBE score drops. IOV subjects took the arm above. Asked only
+        // where the NLopt dispatch would ask it (`analytic_outer_gradient_available`, which
+        // reads the fit-scoped `gradient = fd` too, as the IOV arm's `pt` does) and where the
+        // caller's own options do not force FD; otherwise the reconverged difference below.
+        let analytic = crate::sens::provider::analytic_outer_gradient_available(model)
+            && GradientMethod::effective(model, options) != GradientMethod::Fd;
+        let exact = analytic
+            .then(|| crate::estimation::covariance::stacked_mode(model, subject, eta_hat, None))
+            .flatten()
             .and_then(|b| {
                 let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
                 crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
@@ -3719,6 +3729,126 @@ mod tests {
                  got {worst_old:.3e}"
             );
         }
+    }
+
+    /// #2740 review: the widened total-derivative arm must honour `gradient = fd` from every
+    /// source the rest of the crate reads — the model's flag, the caller's `FitOptions`, and
+    /// the fit-scoped flag `fit()` arms on its threads — by taking the reconverged difference
+    /// instead of the adjoint. Each forced side must equal `fd − g` **bit for bit**; the
+    /// unforced control must take the adjoint, which differs from `fd − g` in the bits and
+    /// agrees with the adjoint called directly. Without the gate every forced side reads
+    /// the adjoint's value and fails the bit check; a gate that ignores one source fails
+    /// that side alone (each names itself).
+    #[test]
+    fn total_derivative_arm_honours_forced_fd_from_every_source() {
+        use crate::sens::ode_provider::adjoint;
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_bloq.ferx"),
+            Some(&format!("{root}/data/warfarin_bloq.csv")),
+        )
+        .unwrap();
+        let base_model = &prep.parsed.model;
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(base_model),
+            "fixture precondition: the adjoint serves this model"
+        );
+        let template = &prep.init_params;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let s = &prep.population.subjects[0];
+        let base_opts = prep.parsed.fit_options.clone();
+        let ebe = crate::estimation::inner_optimizer::find_ebe(
+            base_model, s, template, 500, 1e-10, None, None, 0,
+        );
+        let correction = |model: &CompiledModel, opts: &FitOptions| {
+            let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
+                &x,
+                template,
+                model,
+                &prep.population,
+                0,
+                &ebe.eta,
+                &ebe.h_matrix,
+                &[],
+                &bounds,
+                opts,
+            );
+            let ti = ebe_response_correction(
+                &x,
+                template,
+                model,
+                &prep.population,
+                0,
+                &ebe.eta,
+                &[],
+                None,
+                nll,
+                &gi,
+                cache.as_ref(),
+                &bounds,
+                opts,
+            );
+            let fd = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+                &x, template, model, s, &ebe.eta, &bounds, opts,
+            );
+            let fd_t: Vec<f64> = fd.iter().zip(&gi).map(|(d, g)| d - g).collect();
+            (gi, ti, fd_t)
+        };
+
+        // Unforced control: the adjoint.
+        let (gi, ti, fd_t) = correction(base_model, &base_opts);
+        let pt = adjoint::PackedPoint::new(template, &x).unwrap();
+        let di = adjoint::subject_adjoint_gradient_at(
+            base_model,
+            s,
+            &pt,
+            ebe.eta.as_slice(),
+            adjoint::Objective::Focei,
+        )
+        .expect("in the adjoint's scope");
+        assert!(ti.iter().chain(&di).chain(&gi).all(|v| v.is_finite()));
+        for k in 0..x.len() {
+            let want = di[k] - gi[k];
+            assert!(
+                (ti[k] - want).abs() <= 1e-12 * (1.0 + want.abs()),
+                "unforced: coordinate {k} must take the adjoint, {} vs {want}",
+                ti[k]
+            );
+        }
+        assert_ne!(
+            ti, fd_t,
+            "fixture precondition: adjoint and FD differ in the bits"
+        );
+
+        // Forced, one source at a time.
+        let fd_opts = FitOptions {
+            gradient_method: GradientMethod::Fd,
+            ..base_opts.clone()
+        };
+        let (_, ti, fd_t) = correction(base_model, &fd_opts);
+        assert_eq!(
+            ti, fd_t,
+            "FitOptions gradient = fd must take the reconverged FD"
+        );
+        {
+            let _armed = crate::types::arm_forced_fd(true);
+            let (_, ti, fd_t) = correction(base_model, &base_opts);
+            assert_eq!(
+                ti, fd_t,
+                "the fit-scoped gradient = fd must take the reconverged FD"
+            );
+        }
+        let mut fd_model = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_bloq.ferx"),
+            Some(&format!("{root}/data/warfarin_bloq.csv")),
+        )
+        .unwrap()
+        .parsed
+        .model;
+        fd_model.gradient_method = GradientMethod::Fd;
+        let (_, ti, fd_t) = correction(&fd_model, &base_opts);
+        assert_eq!(ti, fd_t, "model gradient = fd must take the reconverged FD");
     }
 
     /// #2740, the GN call site: on a Gaussian FOCEI model `build_gn_system`'s gradient must
