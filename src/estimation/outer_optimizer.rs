@@ -447,6 +447,15 @@ pub fn optimize_population(
     if let Some(w) = outer_fd_fallback_warning(model, population, &declines) {
         result.warnings.push(w);
     }
+    // #2713 review: a gradient-driven stop short of convergence is probed for its cause.
+    failure::attach_failure_probe(
+        resolved,
+        model,
+        population,
+        init_params,
+        options,
+        &mut result,
+    );
     result
 }
 
@@ -9871,6 +9880,19 @@ fn reconverged_probe_ofv(
     warm: &[DVector<f64>],
     options: &FitOptions,
 ) -> f64 {
+    reconverged_probe(xv, init_params, model, population, warm, options).0
+}
+
+/// [`reconverged_probe_ofv`] with the EBEs the probe re-solved, which the outer-failure
+/// probe ([`failure::diagnose_outer_failure`]) compares across points for mode switches.
+fn reconverged_probe(
+    xv: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+) -> (f64, Vec<DVector<f64>>) {
     let params = unpack_params(xv, init_params);
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
@@ -9888,12 +9910,14 @@ fn reconverged_probe_ofv(
     );
     let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
     let n_subj = population.subjects.len();
-    if !raw.is_finite() || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
+    let ofv = if !raw.is_finite()
+        || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
     {
         1e20
     } else {
         raw
-    }
+    };
+    (ofv, ehs)
 }
 
 /// The gradient of the objective the covariance step's `R` is the Hessian of, at `x` (#2541):
@@ -12228,6 +12252,9 @@ fn covariance_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
     )
 }
+
+#[path = "outer_optimizer_failure.rs"]
+mod failure;
 
 #[cfg(test)]
 #[path = "outer_optimizer_tests.rs"]

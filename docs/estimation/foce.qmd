@@ -151,7 +151,27 @@ The first parenthesis names the cause of each decline (#2713), one clause per ca
 
 These counts cover the whole fit, rejected trial points included. A subject that declined for different causes at different trial points counts under each, so the counts can add up to more than the declined total.
 
-The sentence after the remedy is about the estimates the fit reports. After the optimizer returns, the exact gradient is formed once more there for every subject, and the subjects it still declines are counted by cause. This shows whether the reported point's own gradient carries the fixed-EBE approximation. It cannot show that the fallbacks were harmless: L-BFGS and the other gradient optimizers read gradients at line-search trial points they then reject, so a fixed-EBE gradient there can still end a fit in `Failure` even when the reported point is fully exact. Rerunning with `reconverge_gradient_interval = N` is the direct test. The sentence is absent under AGQ and for a `[mixture]` model, whose gradients are not the per-subject one it classifies.
+The sentence after the remedy is about the estimates the fit reports. After the optimizer returns, the exact gradient is formed once more there for every subject, and the subjects it still declines are counted by cause. This shows whether the reported point's own gradient carries the fixed-EBE approximation. It cannot show that the fallbacks were harmless: L-BFGS and the other gradient optimizers read gradients at line-search trial points they then reject, so a fixed-EBE gradient there can still end a fit in `Failure` even when the reported point is fully exact. The [stop probe](#outer-stop-probe) tests the reported point itself, and rerunning with `reconverge_gradient_interval = N` tests the trial points too. The sentence is absent under AGQ and for a `[mixture]` model, whose gradients are not the per-subject one it classifies.
+
+#### Why the optimizer stopped short {#outer-stop-probe}
+
+When a gradient optimizer (L-BFGS, SLSQP, MMA, or the built-in BFGS) returns without converging, with budget left and the fit not cancelled, ferx probes the reported estimates once to say why (#2713). A line search ends in `Failure` when it cannot lower the objective along its gradient's direction, and the probe tests that directly. It evaluates the objective, with every subject's EBE re-solved, along two directions:
+
+- the gradient the fit uses there, with its held-EBE fallbacks;
+- the exact gradient, with every declined subject's gradient reconverged.
+
+Steps are sized so that the gradient predicts an OFV drop of 1, 0.1, 0.01 and 0.001. A direction descends when some step realises at least a tenth of its predicted drop. The warning then names one verdict:
+
+| Along the fit's gradient | Along the exact gradient | Verdict |
+|---|---|---|
+| does not descend | descends | the **fixed-EBE outer gradients** stopped the line search; `reconverge_gradient_interval = 1` is the remedy |
+| does not descend | does not descend, and some EBE moves by more than half a prior SD over the shortest step | the **objective jumps** where an EBE changes mode, a property of the model and data; SAEM or `optimizer = bobyqa` do not rely on a gradient |
+| does not descend | does not descend, no EBE switches mode | the objective is **not differentiable** there, for example at a kink an `if`, `abs`, `max` or `min` puts in the model |
+| descends | either | **no cause at this point**: the stop came from a trial point or the line search's own tolerances |
+
+The warning also gives how many subjects carry a fallback at the reported estimates, and how far the fit's gradient is from the exact one. A structural decline is reconverged in both gradients, so it adds nothing to that distance.
+
+The probe costs one reconverged gradient over the subjects that decline at the reported estimates, plus up to nine population inner solves. It runs once, after the optimizer has stopped. It is skipped under AGQ, for a `[mixture]` model and for a model with `[iov]`.
 
 #### What a declined subject is charged {#declined-subject-salvage}
 
