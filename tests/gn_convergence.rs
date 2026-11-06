@@ -187,3 +187,57 @@ fn gn_tr_two_cpt_oral_cov_ofv_matches_slsqp_baseline() {
         TOLERANCE,
     );
 }
+
+/// #2740: `method = gn` on an M3 BLOQ FOCEI model must recover NONMEM's MLE.
+///
+/// M3 takes the kernel fixed-EBE score, which had no EBE-response correction (`tᵢ = 0`),
+/// so GN stepped along a gradient that disagreed with its own objective (θ: 49.86 vs a
+/// reconverged central difference of 6.86). The trust region collapsed and GN stopped
+/// 10.6 OFV above FOCEI. It now takes each subject's exact total derivative. The
+/// reference is the NONMEM 7.5.1 LAPLACE M3 fit `bloq_convergence.rs` anchors L-BFGS
+/// to (`tests/nonmem/warfarin_bloq.lst`), at the same tolerances.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn gn_warfarin_bloq_m3_matches_nonmem() {
+    let model = parse_model_file(Path::new("examples/warfarin_bloq.ferx"))
+        .expect("warfarin BLOQ model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None)
+        .expect("warfarin BLOQ data must load");
+
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceGn;
+    opts.outer_maxiter = 200;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("GN fit must succeed");
+    assert!(
+        result.ofv.is_finite(),
+        "OFV must be finite, got {}",
+        result.ofv
+    );
+    eprintln!(
+        "[#2740] GN warfarin_bloq: OFV {:.6}, θ {:?}, σ {:?}, converged {}",
+        result.ofv, result.theta, result.sigma, result.converged
+    );
+
+    let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
+    for (name, got, want, tol) in [
+        ("TVCL", result.theta[0], 0.132801, 0.01),
+        ("TVV", result.theta[1], 7.73139, 0.01),
+        ("TVKA", result.theta[2], 0.809824, 0.02),
+        ("PROP", result.sigma[0], 0.0107600, 0.02),
+        ("ω²(CL)", result.omega[(0, 0)], 0.0288494, 0.05),
+        ("ω²(V)", result.omega[(1, 1)], 0.00954401, 0.05),
+        ("ω²(KA)", result.omega[(2, 2)], 0.335772, 0.05),
+    ] {
+        assert!(
+            rel(got, want) < tol,
+            "{name} {got} vs NONMEM {want} (rel {:.3e})",
+            rel(got, want)
+        );
+    }
+}
