@@ -421,7 +421,7 @@ A negative `CMT` on any other record is an error, `E_NEGATIVE_CMT`. NONMEM stops
 Limits:
 
 - There is no equivalent of `$MODEL` `INITIALOFF` or `NOOFF`. To start a compartment off, put an off row at the subject's first record. After a reset it is on again, where `INITIALOFF` would restore it to off, so repeat the row.
-- An `SS=1` dose while a compartment is off is refused (`E_CMT_TOGGLE_SS`).
+- An `SS=1` dose while a compartment is off is refused (`E_CMT_TOGGLE_SS`). After a lagged dose into the compartment that holds until an `EVID=2` on row or a reset, even once the dose has arrived, because the check cannot read the lag.
 - A compartment fed by a built-in absorption input cannot be switched, and neither SDE nor endpoint models nor adaptive dosing support the rows (`E_CMT_TOGGLE_UNSUPPORTED`, and `E_ADAPTIVE_UNSUPPORTED` for adaptive dosing). An off row naming a compartment past the model's states is `E_CMT_TOGGLE_OUT_OF_RANGE`.
 - `[derived]` outputs on the grid read `NaN` for such a subject. Per-observation compartment amounts are exact.
 - A lagged or modeled-rate dose into a switched compartment routes that subject to finite-difference gradients, reported in the usual warning.

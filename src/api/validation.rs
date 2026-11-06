@@ -3234,8 +3234,9 @@ fn population_uses_analytical_pk(model: &CompiledModel, population: &Population)
 /// ("COMPARTMENT ASSOCIATED WITH THE PREDICTION IS OFF"). The record replays the status the
 /// way the engines reach it: a reset turns every compartment on, and a dose turns its own on
 /// at the record for this purpose, since NONMEM accepts an observation between a lagged dose's
-/// record and its arrival and reads zero there. An `SS=1` dose is refused while anything is off,
-/// because its periodic solve would integrate the compartment as if it were on.
+/// record and its arrival and reads zero there. An `SS=1` dose is refused while the walk may
+/// still hold anything off, that gap included, because its periodic solve would integrate the
+/// compartment as if it were on.
 pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     let Some(subject) = population.subjects.iter().find(|s| s.has_cmt_toggles()) else {
         return Vec::new();
@@ -3365,29 +3366,40 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
                 .map(|(j, &t)| (t, Event::Obs(j))),
         );
         events.sort_by(|a, b| a.0.total_cmp(&b.0).then(rank(&a.1).cmp(&rank(&b.1))));
+        // Two statuses, because a lagged dose separates them. `off` is what an observation is
+        // checked against, which a dose clears at its record. `held` is what the walk holds at
+        // zero, which it clears at the arrival. The arrival's time is a model parameter this
+        // check cannot read, so a lagged dose leaves `held` set until an on row or a reset.
         let mut off: Vec<usize> = Vec::new();
+        let mut held: Vec<usize> = Vec::new();
         for (t, event) in events {
             match event {
-                Event::Reset => off.clear(),
+                Event::Reset => {
+                    off.clear();
+                    held.clear();
+                }
                 Event::Toggle(c) => {
                     off.retain(|&x| x != c.state);
+                    held.retain(|&x| x != c.state);
                     if !c.on {
                         off.push(c.state);
+                        held.push(c.state);
                     }
                 }
                 Event::Dose(k) => {
                     let d = &s.doses[k];
                     // Before the dose turns its own compartment on: an `SS=1` dose into an
                     // off compartment is the same refusal.
-                    if d.ss && !off.is_empty() {
+                    if d.ss && !held.is_empty() {
                         diags.push(
                             Diagnostic::error(
                                 "E_CMT_TOGGLE_SS",
                                 format!(
-                                    "subject {}, time {t}: an `SS=1` dose while `{}` is off. Turn \
-                                     the compartment on before the steady-state record, or off \
-                                     after it.",
-                                    s.id, spec.state_names[off[0]],
+                                    "subject {}, time {t}: an `SS=1` dose while `{}` is off, or \
+                                     may be: a lagged dose only turns a compartment on when it \
+                                     arrives. Turn the compartment on with an `EVID=2` row before \
+                                     the steady-state record, or off after it.",
+                                    s.id, spec.state_names[held[0]],
                                 ),
                             )
                             .with_block("odes"),
@@ -3395,6 +3407,9 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
                         break;
                     }
                     off.retain(|&x| x != d.cmt_idx());
+                    if !model.has_lagtime_on_cmt(d.cmt_1based()) {
+                        held.retain(|&x| x != d.cmt_idx());
+                    }
                 }
                 Event::Obs(j) => {
                     let cmt = s

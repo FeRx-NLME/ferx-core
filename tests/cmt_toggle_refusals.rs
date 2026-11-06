@@ -126,6 +126,14 @@ fn a_steady_state_dose_while_a_compartment_is_off_is_refused() {
     let e = refusal(&model(ODE), &pop);
     assert!(e.contains("E_CMT_TOGGLE_SS"), "{e}");
     assert!(e.contains("while `urine` is off"), "{e}");
+    assert!(
+        e.contains("a lagged dose only turns a compartment on when it arrives"),
+        "{e}"
+    );
+    assert!(
+        e.contains("with an `EVID=2` row before the steady-state record"),
+        "{e}"
+    );
 }
 
 /// NONMEM's answer here is its own periodic solve of the compartment, which ferx does not
@@ -297,4 +305,45 @@ fn an_on_off_record_naming_no_row_is_refused() {
     let e = refusal(&m, &pop);
     assert!(e.contains("E_CMT_TOGGLE_OUT_OF_RANGE"), "{e}");
     assert!(e.contains("pk-only row 7, but the subject has 1"), "{e}");
+}
+
+fn lagged_urine() -> CompiledModel {
+    model(&ODE.replace("  V  = TV\n", "  V  = TV\n  ALAG2 = 1.0\n"))
+}
+
+const LAGGED_DOSE_AT_4: &str = "1,4,.,1,50,2,1,0,0\n";
+
+/// A lagged dose clears an observation of its compartment at the record, but the walk holds
+/// the compartment off to the arrival, so an `SS=1` record in between would refill it.
+#[test]
+fn a_steady_state_dose_before_a_lagged_arrival_is_refused() {
+    let pop = data(&format!(
+        "{OFF_AT_3}{LAGGED_DOSE_AT_4}1,4.5,.,1,100,1,1,12,1\n1,6,1,0,.,1,0,0,0\n"
+    ));
+    let e = refusal(&lagged_urine(), &pop);
+    assert!(e.contains("E_CMT_TOGGLE_SS"), "{e}");
+    assert!(e.contains("time 4.5"), "{e}");
+    assert!(e.contains("`urine`"), "{e}");
+}
+
+/// The two halves of that status, each with the other held fixed. Same rows, no lag: the
+/// dose turns the compartment on at its record. Same lag, an on row: nothing is held. Same
+/// lag, no `SS=1`: the observation between record and arrival stays accepted.
+#[test]
+fn the_lag_alone_decides_the_steady_state_refusal() {
+    let ss_rows =
+        format!("{OFF_AT_3}{LAGGED_DOSE_AT_4}1,4.5,.,1,100,1,1,12,1\n1,6,1,0,.,1,0,0,0\n");
+    let unlagged = model(ODE);
+    assert!(ferx_core::predict(&unlagged, &data(&ss_rows), &unlagged.default_params).is_ok());
+
+    let m = lagged_urine();
+    let turned_on = data(&format!(
+        "{OFF_AT_3}{LAGGED_DOSE_AT_4}1,4.2,.,2,.,2,1,0,0\n1,4.5,.,1,100,1,1,12,1\n1,6,1,0,.,1,0,0,0\n"
+    ));
+    assert!(ferx_core::predict(&m, &turned_on, &m.default_params).is_ok());
+
+    let observed = data(&format!(
+        "{OFF_AT_3}{LAGGED_DOSE_AT_4}1,4.5,1,0,.,2,0,0,0\n"
+    ));
+    assert!(ferx_core::predict(&m, &observed, &m.default_params).is_ok());
 }
