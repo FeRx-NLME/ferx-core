@@ -86,6 +86,7 @@ fn assert_preds(label: &str, got: &[(String, f64, f64)], bound: f64) {
         );
         assert!(g.is_finite(), "{label}: ID {id} t={t} non-finite ({g})");
         let rel = (g - w).abs() / (1.0 + w.abs());
+        assert!(rel.is_finite(), "{label}: ID {id} t={t} rel {rel}");
         if !(rel < bound) {
             bad.push(format!(
                 "ID {id} t={t}: ferx {g} vs NONMEM {w} (rel {rel:.3e})"

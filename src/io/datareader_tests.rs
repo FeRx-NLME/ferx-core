@@ -3346,7 +3346,7 @@ fn missing_and_unparseable_cmt_cells_default_to_1_and_are_counted() {
                1,0,.,1,100,.,1\n\
                1,1,.,1,100,,1\n\
                1,2,.,1,100,NA,1\n\
-               1,3,.,1,100,-1,1\n\
+               1,3,.,1,100,-1.5,1\n\
                1,4,.,1,100,2.5,1\n\
                1,5,.,1,100,x,1\n\
                1,6,5.0,0,.,1,0\n";
@@ -3373,9 +3373,9 @@ fn missing_and_unparseable_cmt_cells_default_to_1_and_are_counted() {
     );
     assert!(
         w.contains("3 row(s) had a CMT cell that is not a compartment index"),
-        "unparseable count must be 3 (`-1`, `2.5`, `x`), got: {w}"
+        "unparseable count must be 3 (`-1.5`, `2.5`, `x`), got: {w}"
     );
-    for quoted in ["\"-1\"", "\"2.5\"", "\"x\""] {
+    for quoted in ["\"-1.5\"", "\"2.5\"", "\"x\""] {
         assert!(w.contains(quoted), "summary must quote {quoted}, got: {w}");
     }
     assert!(
@@ -3599,7 +3599,7 @@ fn negative_zero_is_reported_like_every_other_negative() {
     // Review finding. `(0.0..=usize::MAX as f64).contains(&-0.0)` is `true` (IEEE
     // `-0.0 == 0.0`) and `(-0.0f64) as usize` is `0`, so `-0` used to read as
     // compartment 0 — the *default dose compartment*, silently accepted — while
-    // `-1` one row below was reported. The straddle is the point: all three
+    // `-1.5` one row below was reported. The straddle is the point: all three
     // spellings are negative, so all three must be reported alike — while the
     // literal `0` on row four must **not** be, even though it doses the same
     // compartment they do. `CMT=0` is NONMEM's default dose compartment and
@@ -3610,7 +3610,7 @@ fn negative_zero_is_reported_like_every_other_negative() {
     let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
                1,0,.,1,100,-0,1\n\
                1,1,.,1,100,-0.0,1\n\
-               1,2,.,1,100,-1,1\n\
+               1,2,.,1,100,-1.5,1\n\
                1,3,.,1,100,0,1\n\
                1,4,5.0,0,.,1,0\n";
     let f = write_csv(csv);
@@ -3624,7 +3624,7 @@ fn negative_zero_is_reported_like_every_other_negative() {
         w.contains("3 row(s) had a CMT cell that is not a compartment index"),
         "all three negatives are reported, `-0` included: {w}"
     );
-    for quoted in ["\"-0\"", "\"-0.0\"", "\"-1\""] {
+    for quoted in ["\"-0\"", "\"-0.0\"", "\"-1.5\""] {
         assert!(w.contains(quoted), "must quote {quoted}: {w}");
     }
     assert!(
@@ -3794,7 +3794,7 @@ fn emitted_cmt_defaulted_message_classifies_as_data_quality() {
     let cells = write_csv(
         "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
          1,0,.,1,100,.,1\n\
-         1,1,.,1,100,-1,1\n\
+         1,1,.,1,100,-1.5,1\n\
          1,2,5.0,0,.,1,0\n",
     );
     for f in [&absent, &cells] {

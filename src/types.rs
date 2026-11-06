@@ -139,7 +139,7 @@ pub struct DoseEvent {
     /// The time this dose's input stops because its compartment was turned off (#2732),
     /// `+∞` when it never does: the first `EVID=2`, `CMT=-N` row on its compartment after
     /// its record, or after its parent's for an `ADDL`-implied dose. NONMEM cancels the
-    /// input whatever stage it has reached, measured in `nonmem_anchor/cmt_toggle_*`: an
+    /// input whatever stage it has reached, measured in `nonmem_anchor/cmt_toggle.ctl`: an
     /// infusion stops and does not resume when the compartment comes back, a lagged dose
     /// still in flight never lands, and the rest of an `ADDL` train never arrives. Read
     /// through `ode::predictions::ResetGate`. Set only by the reader. Crate-private, like

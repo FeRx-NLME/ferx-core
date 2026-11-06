@@ -279,3 +279,12 @@ fn a_subject_built_in_memory_is_refused_at_its_engine_time() {
         "{e}"
     );
 }
+
+/// NONMEM stops on this row too, but it asks for no prediction, so ferx reads it as the
+/// pk-only record it is. Documented as a difference in `docs/data-format.qmd`.
+#[test]
+fn an_mdv_row_on_an_off_compartment_is_accepted() {
+    let m = model(ODE);
+    let pop = data(&format!("{OFF_AT_3}1,4,.,0,.,2,1,0,0\n1,5,1,0,.,1,0,0,0\n"));
+    assert!(ferx_core::predict(&m, &pop, &m.default_params).is_ok());
+}

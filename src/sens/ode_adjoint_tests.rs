@@ -7909,7 +7909,8 @@ fn with_toggles(mut s: Subject, rows: &[(f64, usize, bool)]) -> Subject {
             .iter()
             .filter(|r| !r.2 && r.1 == d.cmt_idx() && r.0 > d.time)
             .map(|r| r.0)
-            .fold(f64::INFINITY, f64::min);
+            .min_by(f64::total_cmp)
+            .unwrap_or(f64::INFINITY);
     }
     s
 }

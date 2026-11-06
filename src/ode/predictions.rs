@@ -8039,7 +8039,7 @@ fn event_driven_walk(
     // first reset. Infusions started before it are no longer active.
     let mut reset_floor = f64::NEG_INFINITY;
     // Compartments currently off (#2732). Every compartment starts on, and a reset turns
-    // them all back on: measured in `nonmem_anchor/cmt_toggle_*`.
+    // them all back on: measured in `nonmem_anchor/cmt_toggle.ctl`.
     let mut off_states: Vec<usize> = Vec::new();
     let mut auto_state = OdeAutoSwitchState::default();
 
@@ -8227,7 +8227,7 @@ fn event_driven_walk(
                     u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts, &chz_before);
                 }
                 // A dose turns its compartment on when it arrives, not at its record:
-                // `nonmem_anchor/cmt_toggle_*` holds the amount at zero, with no inflow,
+                // `nonmem_anchor/cmt_toggle.ctl` holds the amount at zero, with no inflow,
                 // across the lag.
                 off_states.retain(|&c| c != d.cmt_idx());
                 // Boluses: add amt to state. Infusions: no instantaneous

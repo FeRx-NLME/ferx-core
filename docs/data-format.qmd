@@ -382,7 +382,7 @@ ID,TIME,DV,EVID,AMT,CMT,MDV
 1,8,10,0,0,2,0
 ```
 
-Here urine is read at `t=4`, then emptied, and collects again from `t=6`. On a one-subject fixture of this shape ferx and NONMEM 7.5.1 give the same objective (`nonmem_anchor/cmt_toggle_*`). This is `[odes]` only: on any other model the row is refused rather than ignored (`E_CMT_TOGGLE_UNSUPPORTED`).
+Here urine is read at `t=4`, then emptied, and collects again from `t=6`. Every rule below is anchored case by case against NONMEM 7.5.1 (`nonmem_anchor/cmt_toggle.ctl`), except where it says ferx differs. This is `[odes]` only: on any other model the row is refused rather than ignored (`E_CMT_TOGGLE_UNSUPPORTED`).
 
 While a compartment is off:
 
@@ -407,6 +407,7 @@ Limits:
 - A compartment fed by a built-in absorption input cannot be switched, and neither SDE nor endpoint models nor adaptive dosing support the rows (`E_CMT_TOGGLE_UNSUPPORTED`, and `E_ADAPTIVE_UNSUPPORTED` for adaptive dosing). An off row naming a compartment past the model's states is `E_CMT_TOGGLE_OUT_OF_RANGE`.
 - `[derived]` outputs on the grid read `NaN` for such a subject. Per-observation compartment amounts are exact.
 - A lagged or modeled-rate dose into a switched compartment routes that subject to finite-difference gradients, reported in the usual warning.
+- A `[data_selection]` clause reading `CMT` sees compartment 1 on a negative cell, as on any other unreadable one, and `W_CMT_DEFAULTED` reports a row removed that way. An off row removed by such a clause is ignored.
 
 ## System Resets (EVID=3 / EVID=4)
 

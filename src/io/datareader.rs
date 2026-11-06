@@ -1793,6 +1793,9 @@ enum CmtCell {
 /// rounded: the caller defaults it *and reports it*, so a mistyped compartment is
 /// loud instead of wrong.
 ///
+/// A whole negative number does not get that far on a record that uses it: it is an
+/// on/off row or `E_NEGATIVE_CMT` ([`negative_cmt`], #2732).
+///
 /// Two range traps, both measured, both closed by the guard below rather than by a
 /// `contains` range:
 ///

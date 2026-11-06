@@ -16437,7 +16437,7 @@ fn every_raw_observable_reader_names_who_converts_it() {
              and the ODE branch of compute_predictions_with_states (sdtab IPRED, #2259)",
         ),
         (
-            "ode_predictions_event_driven",
+            "event_driven_walk",
             "the pk sink (compute_predictions_with_tv)",
         ),
         (
