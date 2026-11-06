@@ -7687,15 +7687,17 @@ impl GuardStop {
         }
     }
 
-    /// Whether the unconverged count `n` alone already makes the guard reject. The same
-    /// test as `ebe_guard_rejects`' fraction arm; a negative `max_unconverged_frac` disables
-    /// it there and here.
-    fn fraction_rejects(&self, n: usize) -> bool {
-        self.max_unconverged_frac >= 0.0
-            && n as f64 / (self.n_subj as f64).max(1.0) > self.max_unconverged_frac
-    }
-
-    /// Records a finished subject's result and stops the pass when the rejection is certain.
+    /// Records a finished subject's result and stops the pass when rejection is certain.
+    ///
+    /// "Certain" means: `ebe_guard_rejects` on the full pass *must* return true, whatever the
+    /// remaining subjects do. A hard rejection makes it certain at once. An unconverged count
+    /// past the fraction threshold makes it certain because the count only grows and the
+    /// fraction arm fires on any *finite* OFV — and a non-finite OFV is rejected by its own
+    /// arm. So either way the evaluation is rejected. The predicate here is a monotone lower
+    /// bound of `ebe_guard_rejects`, not a re-implementation: it answers "already decided"
+    /// rather than "what would the guard say now". That is why `raw_ofv.is_finite()` does not
+    /// appear: the objective is not known until after every subject is scored, and the token
+    /// fires before then.
     pub(crate) fn record(&self, subject: &Subject, ebe: &EbeResult) {
         self.solved.fetch_add(1, Ordering::Relaxed);
         if ebe.used_fallback {
@@ -7711,7 +7713,9 @@ impl GuardStop {
         }
         if !ebe.converged && subject.n_scored_rows() >= self.min_obs.max(1) {
             let n = self.unconverged.fetch_add(1, Ordering::Relaxed) + 1;
-            certain |= self.fraction_rejects(n);
+            // The same fraction test as `ebe_guard_rejects`' fraction arm.
+            certain |= self.max_unconverged_frac >= 0.0
+                && n as f64 / (self.n_subj as f64).max(1.0) > self.max_unconverged_frac;
         }
         if certain {
             self.stopped.store(true, Ordering::Relaxed);

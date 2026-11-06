@@ -8164,7 +8164,8 @@ pub struct FitResult {
     /// stop was not a mode and the stationarity certificate moved it there with the gradient.
     /// The primary search's moved point is not a fallback. Always `0` under every other
     /// `inner_optimizer`, and counted only on the paths that count `total_ebe_fallbacks`
-    /// (#2571).
+    /// (#2571). A subject an inner pass left unsolved once the EBE guard's rejection was
+    /// certain (#2709) is not counted.
     pub total_ebe_nm_polished: u32,
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,
