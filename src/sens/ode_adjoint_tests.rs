@@ -7892,8 +7892,8 @@ const TWO_CPT_TOGGLE_ODE: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
-/// `s` with on/off rows at `rows` = `(time, state, on)`, and each dose's input stopped by
-/// the first off row of its compartment after its record, as the reader sets it.
+/// `s` with on/off rows at `rows` = `(time, state, on)`, filled in as a caller outside the
+/// crate has to: `DoseEvent::off_at` is left alone, so the walks derive it.
 fn with_toggles(mut s: Subject, rows: &[(f64, usize, bool)]) -> Subject {
     for (m, &(t, state, on)) in rows.iter().enumerate() {
         s.pk_only_times.push(t);
@@ -7903,14 +7903,6 @@ fn with_toggles(mut s: Subject, rows: &[(f64, usize, bool)]) -> Subject {
             state,
             on,
         });
-    }
-    for d in &mut s.doses {
-        d.off_at = rows
-            .iter()
-            .filter(|r| !r.2 && r.1 == d.cmt_idx() && r.0 > d.time)
-            .map(|r| r.0)
-            .min_by(f64::total_cmp)
-            .unwrap_or(f64::INFINITY);
     }
     s
 }
@@ -7997,7 +7989,11 @@ fn adjoint_matches_fd_for_an_infusion_stopped_by_a_toggle() {
         &[0.1, -0.05],
     );
     let s = with_toggles(plain.clone(), &[(4.0, 1, false), (6.0, 1, true)]);
-    assert!(s.doses[1].off_at == 4.0);
+    assert_eq!(
+        s.doses[1].off_at,
+        f64::INFINITY,
+        "derived by the walk, not here"
+    );
     assert_toggle_is_live(&model, &s, &plain);
     let worst = fd_oracle(&model, &s, true);
     assert!(

@@ -7764,6 +7764,8 @@ fn event_driven_walk(
     assert_eq!(pk_at_obs.len(), subject.obs_times.len());
     assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
     assert_eq!(pk_at_reset.len(), subject.reset_times.len());
+    let with_cutoffs = subject.with_cmt_cutoffs();
+    let subject: &Subject = &with_cutoffs;
 
     // Resolve modeled-RATE doses to concrete (`Fixed`) doses once (#324), each
     // with its own per-dose PK snapshot `pk_at_dose[k]` (this is the event-driven

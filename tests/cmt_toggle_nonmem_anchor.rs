@@ -13,7 +13,8 @@
 //! - An off row ends dose input into that compartment for good: a running infusion
 //!   (ID 6, 7), a lagged dose in flight (ID 10), the rest of an `ADDL` train (ID 21).
 //!   Input elsewhere carries on (ID 9, 22).
-//! - A reset turns every compartment on (ID 15, 16).
+//! - A reset turns every compartment on (ID 15, 16), and takes effect in file order against
+//!   an off row at its own `TIME`: it undoes one before it (ID 29), not one after it (ID 30).
 //! - Co-timed records take effect in file order (ID 5, 17, 18, 19, 20). IDs 25 to 28 are
 //!   the ties the #614 and #1810 passes leave wrong, so only `order_cmt_toggle_ties`
 //!   orders them: an infusion before an off row (25), an observation between a dose and
@@ -31,7 +32,7 @@ use ferx_core::{CompiledModel, Population};
 use std::path::{Path, PathBuf};
 
 /// `METHOD=1 INTER MAXEVAL=0` objective, from `results/cmt_toggle.ext`.
-const NM_OFV: f64 = 19445.244975010002;
+const NM_OFV: f64 = 19834.949763454737;
 /// Measured on macOS arm64: worst 5.4e-15 on the linear route and in the states, 6.2e-13 on
 /// `rodas5p`, 1.5e-11 on `rk45` at `1e-10` tolerances. Bound set from the last, with about
 /// 70× headroom for the solvers' platform variation.
@@ -187,4 +188,66 @@ fn the_flat_parameter_entry_point_honours_the_row() {
     for (g, w) in got.iter().zip(&want) {
         assert!((g - w.3).abs() / (1.0 + w.3.abs()) < BOUND, "{g} vs {w:?}");
     }
+}
+
+/// A subject built in memory sets `cmt_toggles` and the pk-only times and nothing else, and
+/// must predict what the same records read from a file predict: the dose cutoffs are not
+/// the reader's to supply. Each case is a dose the off row must stop, with the compartment
+/// back on afterwards, which is where a missing cutoff shows. ID 6 is an infusion stopped at
+/// 3, ID 10 a lagged dose in flight, and ID 25 an infusion at the off row's own `TIME`, where
+/// the written times hold the tie the reader would have split.
+#[test]
+fn a_subject_built_in_memory_predicts_what_the_reader_predicts() {
+    use ferx_core::types::DoseEvent;
+    let m = model("");
+    let pop = population();
+    let theta = &m.default_params.theta;
+    let eta = vec![0.0; m.n_eta];
+    for id in ["6", "10", "25"] {
+        let read = pop.subjects.iter().find(|s| s.id == id).unwrap();
+        let mut built = read.clone();
+        built.doses = read
+            .doses
+            .iter()
+            .map(|d| DoseEvent::new(d.time, d.amt, d.cmt_1based(), d.rate, false, 0.0))
+            .collect();
+        built.pk_only_times = read.pk_only_raw_times.clone();
+        let want = ferx_core::pk::compute_predictions_with_tv(&m, read, theta, &eta);
+        let got = ferx_core::pk::compute_predictions_with_tv(&m, &built, theta, &eta);
+        assert_eq!(got.len(), want.len(), "ID {id}");
+        for (g, w) in got.iter().zip(&want) {
+            assert!(
+                g.is_finite() && (g - w).abs() < 1e-9,
+                "ID {id}: {got:?} vs {want:?}"
+            );
+        }
+        let (_, states) = compute_predictions_with_states(&m, &built, theta, &eta);
+        let (_, read_states) = compute_predictions_with_states(&m, read, theta, &eta);
+        for (g, w) in states.iter().flatten().zip(read_states.iter().flatten()) {
+            assert!(g.is_finite() && (g - w).abs() < 1e-9, "ID {id}: {states:?}");
+        }
+    }
+}
+
+/// Clearing the rows from a subject the reader built leaves its cutoffs behind, and they
+/// must go with the rows: the infusion of ID 6 then runs to its end.
+#[test]
+fn clearing_the_rows_clears_what_they_did_to_the_doses() {
+    use ferx_core::types::DoseEvent;
+    let m = model("");
+    let pop = population();
+    let theta = &m.default_params.theta;
+    let eta = vec![0.0; m.n_eta];
+    let mut cleared = pop.subjects.iter().find(|s| s.id == "6").unwrap().clone();
+    cleared.cmt_toggles.clear();
+    let mut plain = cleared.clone();
+    plain.doses = cleared
+        .doses
+        .iter()
+        .map(|d| DoseEvent::new(d.time, d.amt, d.cmt_1based(), d.rate, false, 0.0))
+        .collect();
+    let got = ferx_core::pk::compute_predictions_with_tv(&m, &cleared, theta, &eta);
+    let want = ferx_core::pk::compute_predictions_with_tv(&m, &plain, theta, &eta);
+    assert!(got.iter().all(|v| v.is_finite()), "{got:?}");
+    assert_eq!(got, want);
 }

@@ -288,3 +288,13 @@ fn an_mdv_row_on_an_off_compartment_is_accepted() {
     let pop = data(&format!("{OFF_AT_3}1,4,.,0,.,2,1,0,0\n1,5,1,0,.,1,0,0,0\n"));
     assert!(ferx_core::predict(&m, &pop, &m.default_params).is_ok());
 }
+
+#[test]
+fn an_on_off_record_naming_no_row_is_refused() {
+    let m = model(ODE);
+    let mut pop = data(&format!("{OFF_AT_3}1,4,1,0,.,1,0,0,0\n"));
+    pop.subjects[0].cmt_toggles[0].pk_only = 7;
+    let e = refusal(&m, &pop);
+    assert!(e.contains("E_CMT_TOGGLE_OUT_OF_RANGE"), "{e}");
+    assert!(e.contains("pk-only row 7, but the subject has 1"), "{e}");
+}

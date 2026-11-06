@@ -142,8 +142,10 @@ pub struct DoseEvent {
     /// input whatever stage it has reached, measured in `nonmem_anchor/cmt_toggle.ctl`: an
     /// infusion stops and does not resume when the compartment comes back, a lagged dose
     /// still in flight never lands, and the rest of an `ADDL` train never arrives. Read
-    /// through `ode::predictions::ResetGate`. Set only by the reader. Crate-private, like
-    /// `evid4`.
+    /// through `ode::predictions::ResetGate`. Derived from `Subject::cmt_toggles` by
+    /// [`cmt_off_times`], never authored: the reader sets it, and the state walks re-derive
+    /// it through `Subject::with_cmt_cutoffs` for a subject built or edited in memory.
+    /// Crate-private, like `evid4`.
     pub(crate) off_at: f64,
 }
 
@@ -154,6 +156,10 @@ pub struct DoseEvent {
 /// mass flowing in is lost, and any term reading the state sees zero. On restarts it from
 /// zero, without re-applying `init(...)`. A dose arrival also turns its compartment on,
 /// and a reset turns every compartment on.
+///
+/// A subject built in memory fills this and `Subject::pk_only_times` and nothing else: what
+/// the row does to dose input is derived from them. It has no file order, so records at the
+/// row's exact time take the engines' order, `Reset < Dose < PkOnly < Obs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CmtToggle {
     /// Index into `Subject::pk_only_times` of the row. The row is an ordinary record,
@@ -163,6 +169,31 @@ pub struct CmtToggle {
     pub state: usize,
     /// `true` for on, `false` for off.
     pub on: bool,
+}
+
+/// The time each dose's input stops: the first off row on its compartment at or after its
+/// record, or after its parent's for an `ADDL`-implied dose, since the train was scheduled
+/// there. `+∞` when no off row follows. The one rule for `DoseEvent::off_at` (#2732).
+///
+/// "At" is the engines' order: a dose sorts ahead of a co-timed row, so the row stops it. The
+/// reader leaves no such tie, having put the two a ULP apart in file order.
+pub(crate) fn cmt_off_times(
+    doses: &[DoseEvent],
+    toggles: &[CmtToggle],
+    pk_only_times: &[f64],
+) -> Vec<f64> {
+    doses
+        .iter()
+        .map(|d| {
+            let record = d.implied.map_or(d.time, |i| doses[i.parent].time);
+            toggles
+                .iter()
+                .filter(|c| !c.on && c.state == d.cmt_idx())
+                .filter_map(|c| pk_only_times.get(c.pk_only).copied())
+                .filter(|&t| t >= record)
+                .fold(f64::INFINITY, f64::min)
+        })
+        .collect()
 }
 
 /// Which records parameterise an `ADDL`-implied dose (#1909). NONMEM evaluates `$PK` only
@@ -1263,6 +1294,26 @@ impl Subject {
     /// event-driven one.
     pub fn has_state_events(&self) -> bool {
         self.has_resets() || self.has_cmt_toggles()
+    }
+
+    /// This subject with every `DoseEvent::off_at` matching `cmt_toggles`, for a state walk
+    /// to read. `cmt_toggles` is public and `off_at` is not, so a subject built or edited in
+    /// memory has no other way to get it right. Borrowed when it is right already, as on
+    /// every subject from the reader and every subject with no on/off row.
+    pub(crate) fn with_cmt_cutoffs(&self) -> std::borrow::Cow<'_, Subject> {
+        use std::borrow::Cow;
+        if self.cmt_toggles.is_empty() && self.doses.iter().all(|d| d.off_at == f64::INFINITY) {
+            return Cow::Borrowed(self);
+        }
+        let want = cmt_off_times(&self.doses, &self.cmt_toggles, &self.pk_only_times);
+        if self.doses.iter().zip(&want).all(|(d, &w)| d.off_at == w) {
+            return Cow::Borrowed(self);
+        }
+        let mut owned = self.clone();
+        for (d, w) in owned.doses.iter_mut().zip(want) {
+            d.off_at = w;
+        }
+        Cow::Owned(owned)
     }
 
     /// True when any dose record on this subject is flagged steady-state

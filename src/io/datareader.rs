@@ -4134,17 +4134,9 @@ fn parse_subject(
     // (#2732). An implied dose counts from its parent's record: the train was scheduled
     // there, and an off row anywhere after it cancels what is left of the train.
     if !cmt_toggles.is_empty() {
-        let records: Vec<f64> = sorted_doses
-            .iter()
-            .map(|d| d.implied.map_or(d.time, |i| sorted_doses[i.parent].time))
-            .collect();
-        for (d, record) in sorted_doses.iter_mut().zip(records) {
-            d.off_at = cmt_toggles
-                .iter()
-                .filter(|c| !c.on && c.state == d.cmt_idx())
-                .map(|c| pk_only_times[c.pk_only])
-                .filter(|&t| t > record)
-                .fold(f64::INFINITY, f64::min);
+        let off_times = crate::types::cmt_off_times(&sorted_doses, &cmt_toggles, &pk_only_times);
+        for (d, off_at) in sorted_doses.iter_mut().zip(off_times) {
+            d.off_at = off_at;
         }
     }
 

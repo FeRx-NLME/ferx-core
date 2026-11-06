@@ -2419,6 +2419,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     // Hard, not `debug_`: `pk_at_reset[idx]` at the `K_RESET` branch is a release-live
     // index, and its production twin (`ode_predictions_event_driven`) asserts always (#1133).
     assert_eq!(pk_at_reset.len(), subject.reset_times.len());
+    // Production's `event_driven_walk` reads the same cutoffs.
+    let with_cutoffs = subject.with_cmt_cutoffs();
+    let subject: &Subject = &with_cutoffs;
 
     // Per-dose lagtime: dose `k` arrives at `d.time + lag_val(k)`, with its lag read from
     // `pk_at_dose[k][dose_lag_slot[k]]` — the bare `PK_IDX_LAGTIME` slot or, for a

@@ -5597,3 +5597,14 @@ fn a_toggle_no_timeline_can_place_is_refused() {
     let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
     assert!(err.starts_with("E_CMT_TOGGLE_TIE"), "{err}");
 }
+
+/// A reset row sorts ahead of every co-timed record on the engines, so the file order of an
+/// off row and a reset has to reach them another way: the reset goes past the off row, as a
+/// reset goes past anything recorded before it at its own `TIME`.
+#[test]
+fn an_off_row_and_a_reset_keep_their_file_order() {
+    let off_first = toggled("1,0,.,1,100,1,1\n1,4,.,2,.,-2,1\n1,4,.,3,.,1,1\n1,6,10,0,.,2,0\n");
+    assert!(off_first.pk_only_times[0] < off_first.reset_times[0]);
+    let reset_first = toggled("1,0,.,1,100,1,1\n1,4,.,3,.,1,1\n1,4,.,2,.,-2,1\n1,6,10,0,.,1,0\n");
+    assert_eq!(reset_first.pk_only_times[0], reset_first.reset_times[0]);
+}

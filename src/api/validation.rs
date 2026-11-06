@@ -3289,6 +3289,24 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
     };
     let mut diags = Vec::new();
     for s in population.subjects.iter().filter(|s| s.has_cmt_toggles()) {
+        // Reachable only from a subject built in memory: the reader's indices are its own.
+        if let Some(c) = s
+            .cmt_toggles
+            .iter()
+            .find(|c| c.pk_only >= s.pk_only_times.len())
+        {
+            return vec![Diagnostic::error(
+                "E_CMT_TOGGLE_OUT_OF_RANGE",
+                format!(
+                    "subject {}: a compartment on/off record names pk-only row {}, but the \
+                     subject has {}.",
+                    s.id,
+                    c.pk_only,
+                    s.pk_only_times.len(),
+                ),
+            )
+            .with_block("odes")];
+        }
         for c in s.cmt_toggles.iter().filter(|c| !c.on) {
             let cmt = c.state + 1;
             if c.state >= spec.n_states {
