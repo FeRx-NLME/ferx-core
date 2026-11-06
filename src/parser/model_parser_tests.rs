@@ -23295,6 +23295,25 @@ fn test_weighted_kappa_refusal_names_every_block_in_a_stable_order() {
     }
 }
 
+/// Three offending blocks exercise the comma arm of the list join: `A, B and C`,
+/// not `A and B and C`. Every other fixture lists at most two items, where the
+/// separator inside `init` is never written (#2624 review r2).
+#[test]
+fn test_weighted_kappa_refusal_lists_three_blocks_with_commas() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n\n[scaling]\n  y = central / V + KAPPA_CL\n\n\
+         [simulation]\n  dose_amt = KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL`, [scaling] references `KAPPA_CL` and \
+             [simulation] references `KAPPA_CL`, a kappa declared with `weight = ...`."
+        ),
+        "three blocks, comma-joined then `and`, got: {err}"
+    );
+}
+
 /// The single-block case keeps its singular wording: the plural added for
 /// #2624 must not leak into it.
 #[test]
