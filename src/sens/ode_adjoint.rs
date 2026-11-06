@@ -1400,7 +1400,7 @@ fn record_analytic<T: VmNum>(
     th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
-    if !closed_form_serves(model, subject) || closed_form_reshapes_f_window(model, subject) {
+    if analytic_declines_shape(model, subject) || closed_form_reshapes_f_window(model, subject) {
         return None;
     }
     let prog = crate::sens::provider::analytic_param_program(model)?;
@@ -1909,6 +1909,7 @@ fn events_walk_declines_shape(model: &CompiledModel, subject: &Subject) -> bool 
         .is_none()
         || model.is_algebraic()
         || !closed_form_serves(model, subject)
+        || closed_form_scaling_declines_shape(model, subject)
         || pv::ss_lagtime_walk_unsupported(model, subject)
         || !pv::modeled_dose_analytic_gate(model, subject)
 }
@@ -1930,6 +1931,7 @@ fn ode_programs(
 /// compartment, say). Both walk predicates take only the model and the subject.
 fn ode_walk_declines_shape(model: &CompiledModel, subject: &Subject) -> bool {
     ode_programs(model).is_none()
+        || ode_scaling_declines_shape(model)
         || (!static_walk_subject_supported(model, subject)
             && !event_walk_subject_supported(model, subject))
 }
@@ -1941,7 +1943,46 @@ fn ode_iov_walk_declines_shape(
     subject: &Subject,
     layout: &crate::stats::stacked_layout::StackedLayout,
 ) -> bool {
-    ode_programs(model).is_none() || ode_iov_walk_scope(model, subject, layout).is_none()
+    ode_programs(model).is_none()
+        || ode_scaling_declines_shape(model)
+        || ode_iov_walk_scope(model, subject, layout).is_none()
+}
+
+/// The output scales neither ODE recorder serves, whatever the parameters: a per-CMT
+/// scale, or an expression scale with no compiled program (`apply_expression_scale`, and
+/// `record_ode_iov`'s per-group scale). Reads the model alone (#2713 review).
+fn ode_scaling_declines_shape(model: &CompiledModel) -> bool {
+    matches!(
+        model.scaling,
+        ScalingSpec::ExpressionScale { deriv: None, .. } | ScalingSpec::PerCmt(_)
+    )
+}
+
+/// The output scales [`closed_form_finish`] (and the IOV event walk's per-group scale)
+/// cannot serve, whatever the parameters: an expression scale with no compiled program,
+/// on the model or on the per-CMT entry of a compartment the subject observes. Reads the
+/// model and the records alone (#2713 review).
+fn closed_form_scaling_declines_shape(model: &CompiledModel, subject: &Subject) -> bool {
+    let unserved = |spec: &ScalingSpec| {
+        matches!(
+            spec,
+            ScalingSpec::ExpressionScale { deriv: None, .. } | ScalingSpec::PerCmt(_)
+        )
+    };
+    match &model.scaling {
+        ScalingSpec::PerCmt(map) => subject
+            .obs_cmts
+            .iter()
+            .any(|c| map.get(c).is_some_and(unserved)),
+        spec => unserved(spec),
+    }
+}
+
+/// The gates of [`record_analytic`] that read the model and the records alone.
+fn analytic_declines_shape(model: &CompiledModel, subject: &Subject) -> bool {
+    !closed_form_serves(model, subject)
+        || crate::sens::provider::analytic_param_program(model).is_none()
+        || closed_form_scaling_declines_shape(model, subject)
 }
 
 /// The readout program and individual-parameter program [`record_algebraic`] records over;
@@ -2002,7 +2043,7 @@ fn recorder_declines_shape(model: &CompiledModel, subject: &Subject) -> bool {
         {
             events_walk_declines_shape(model, subject)
         }
-        (false, None) => !closed_form_serves(model, subject),
+        (false, None) => analytic_declines_shape(model, subject),
     }
 }
 

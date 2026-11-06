@@ -3282,6 +3282,74 @@ fn a_declined_gradient_names_its_cause() {
     }
 }
 
+/// #2713 review round 5: an output scale a recorder cannot serve is a shape, at every
+/// parameter point — a per-CMT scale on the ODE IOV walk, and on a closed form a per-CMT
+/// entry whose expression has no compiled program. Each straddles a served twin: the
+/// model-wide scale on the IOV walk, the compiled entry on the closed form. Mutations
+/// that must redden it: dropping `ode_scaling_declines_shape` from
+/// `ode_iov_walk_declines_shape`, or `closed_form_scaling_declines_shape` from
+/// `analytic_declines_shape`.
+#[test]
+fn an_unserved_output_scale_is_a_shape_decline() {
+    let cause = |m: &CompiledModel, s: &Subject, eta: &[f64]| {
+        let p = m.default_params.clone();
+        let x = pack_params(&p);
+        let pt = PackedPoint::new(&p, &x).expect("packed point");
+        let mut out = ModeOut::default();
+        let g = subject_adjoint_gradient_and_mode_at(m, s, &pt, eta, Objective::Focei, &mut out);
+        (g.is_some(), out.decline)
+    };
+    let iov = |line: &str| {
+        let src = ODE_IOV
+            .replace("ode(states=", "ode(obs_cmt=central, states=")
+            .replace("  y = central / V", line);
+        let m = parse_model_string(&src).unwrap();
+        let s = iov_subject(&m);
+        let eta = vec![0.0; m.n_eta + 3 * m.n_kappa];
+        cause(&m, &s, &eta)
+    };
+    assert_eq!(
+        iov("  obs_scale = V"),
+        (true, None),
+        "IOV: the model-wide scale is served"
+    );
+    assert_eq!(
+        iov("  obs_scale[CMT=1] = V"),
+        (false, Some(DeclineCause::Shape)),
+        "IOV: a per-CMT scale is a shape"
+    );
+
+    let src = ONE_CPT_ORAL.replace(
+        "[error_model]",
+        "[scaling]\n  obs_scale[CMT=1] = V / 10.0\n[error_model]",
+    );
+    let compiled = parse_model_string(&src).unwrap();
+    let s = subject(
+        &compiled,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.0, 0.0, 0.0],
+    );
+    assert_eq!(
+        cause(&compiled, &s, &[0.0; 3]),
+        (true, None),
+        "the compiled entry is served"
+    );
+    let mut bare = parse_model_string(&src).unwrap();
+    let crate::types::ScalingSpec::PerCmt(map) = &mut bare.scaling else {
+        panic!("fixture must carry a per-compartment scale");
+    };
+    let Some(crate::types::ScalingSpec::ExpressionScale { deriv, .. }) = map.get_mut(&1) else {
+        panic!("CMT 1 carries an expression scale");
+    };
+    *deriv = None;
+    assert_eq!(
+        cause(&bare, &s, &[0.0; 3]),
+        (false, Some(DeclineCause::Shape)),
+        "an entry with no compiled program is a shape"
+    );
+}
+
 #[test]
 fn laplace_kernel_is_the_production_objective() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();

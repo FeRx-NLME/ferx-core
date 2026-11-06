@@ -6838,6 +6838,106 @@ mod outer_fd_fallback {
         );
     }
 
+    /// #2713 review round 5: a per-CMT output scale on an ODE model. Neither ODE recorder
+    /// serves one (`apply_expression_scale`), at any parameter point, so the decline is a
+    /// shape: counted structural and given the reconverged salvage, as before routing
+    /// followed the typed cause. The straddle is the same scale written model-wide, which
+    /// the walk serves. Mutation that must redden it: dropping `ode_scaling_declines_shape`
+    /// from `ode_walk_declines_shape` (the decline then reads as a failed recording and
+    /// takes the held-EBE salvage).
+    #[test]
+    fn a_per_cmt_scale_on_an_ode_model_is_a_structural_shape() {
+        const ODE_SCALED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central
+[scaling]
+  SCALE_LINE
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let data = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let s = data.subjects[0].clone();
+        assert!(s.obs_cmts.iter().all(|&c| c == 1), "fixture observes CMT 1");
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let route = |line: &str| {
+            let model = crate::parser::model_parser::parse_model_string(
+                &ODE_SCALED.replace("SCALE_LINE", line),
+            )
+            .expect("model parses");
+            assert!(crate::sens::ode_provider::adjoint::outer_model_in_scope(
+                &model
+            ));
+            let params = &model.default_params;
+            let x = pack_params(params);
+            let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x)
+                .expect("packed point");
+            let cause = subject_analytic_outer_gradient_dx(
+                &model,
+                &s,
+                &pt,
+                &[0.0; 2],
+                opts.interaction,
+                false,
+            )
+            .0
+            .err();
+            (model, cause)
+        };
+        let (per_cmt, cause) = route("obs_scale[CMT=1] = V");
+        assert!(matches!(
+            per_cmt.scaling,
+            crate::types::ScalingSpec::PerCmt(_)
+        ));
+        assert_eq!(
+            cause,
+            Some(DeclineCause::Shape),
+            "a per-CMT scale is a shape"
+        );
+        let (wide, cause) = route("obs_scale = V");
+        assert!(matches!(
+            wide.scaling,
+            crate::types::ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+        ));
+        assert_eq!(cause, None, "the straddle: the model-wide scale is served");
+
+        let pop = mk_pop(vec![s.clone()]);
+        let log = record_one_gradient_eval(&per_cmt, &pop);
+        assert_eq!(
+            log.n_structural(),
+            1,
+            "the shape takes the reconverged salvage"
+        );
+        let w = outer_fd_fallback_warning(&per_cmt, &pop, &log).expect("the subject declined");
+        assert!(
+            w.contains("(1 with a shape no analytic recorder serves)"),
+            "got: {w}"
+        );
+        assert!(
+            w.contains("used reconverged finite-difference outer gradients")
+                && !w.contains("used fixed-EBE outer gradients"),
+            "got: {w}"
+        );
+    }
+
     /// #2713 review: the classification at the reported estimates. Over the fixture, at
     /// zero EBEs, the in-scope subject is served and the SS-infusion one is declined for
     /// its shape — the straddle between the two subjects, each named by its count. At an
