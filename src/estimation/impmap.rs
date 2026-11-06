@@ -51,8 +51,8 @@ use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
 use crate::estimation::saem::{
     classify_mixture_mu_ref_pairs, classify_mu_ref_pairs, floor_omega_diagonal,
-    get_mixture_mu_ref_pairs, mixture_mu_ref_means, mu_ref_pairs_for_cov_groups, MixtureMuRefPairs,
-    MuRefPairs,
+    get_mixture_mu_ref_pairs, mixture_mu_ref_means, mstep_initial_step,
+    mu_ref_pairs_for_cov_groups, MixtureMuRefPairs, MuRefPairs, MSTEP_FTOL_REL,
 };
 use crate::pk::event_driven::EventSchedule;
 use crate::pk::EventPkParams;
@@ -2034,6 +2034,7 @@ fn run_mcem(
     // Iterations actually run, and the seconds at which `max_time` stopped them.
     let mut iterations_done = 0usize;
     let mut stopped_after: Option<f64> = None;
+    let mut mstep_motion = MstepMotion::new(n_theta + n_sigma);
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             if verbose {
@@ -2532,7 +2533,8 @@ fn run_mcem(
             }
         }
         let mstep_maxiter: u32 = if k <= n_iter / 2 { 4 } else { 8 };
-        let (new_log_theta, new_log_sigma) = theta_sigma_weighted_mstep(
+        let mstep_before = [log_theta.as_slice(), log_sigma.as_slice()].concat();
+        let mstep = theta_sigma_weighted_mstep(
             model,
             population,
             &draws,
@@ -2548,8 +2550,14 @@ fn run_mcem(
             mstep_maxiter,
             &theta_packs_log_mask,
         );
-        log_theta = new_log_theta;
-        log_sigma = new_log_sigma;
+        mstep_motion.record(
+            &mstep_before,
+            &[mstep_theta_lower.as_slice(), log_sigma_lower.as_slice()].concat(),
+            &[mstep_theta_upper.as_slice(), log_sigma_upper.as_slice()].concat(),
+            &mstep,
+        );
+        log_theta = mstep.log_theta;
+        log_sigma = mstep.log_sigma;
 
         // ---- Closed-form mu-ref θ shift: packed θ (= mu) += population mean(η) ----
         if use_closed_form {
@@ -3076,6 +3084,13 @@ fn run_mcem(
     if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
         warnings.push(w);
     }
+    warnings.extend(mstep_warnings(
+        &mut converged,
+        label,
+        &mstep_motion,
+        model,
+        stopped_after.is_some(),
+    ));
 
     if verbose {
         eprintln!("{} completed. Final OFV (Laplace) = {:.4}", label, ofv);
@@ -3540,6 +3555,7 @@ fn run_mcem_mixture(
     // Iterations actually run, and the seconds at which `max_time` stopped them.
     let mut iterations_done = 0usize;
     let mut stopped_after: Option<f64> = None;
+    let mut mstep_motion = MstepMotion::new(n_theta + n_sigma);
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             break;
@@ -3805,7 +3821,8 @@ fn run_mcem_mixture(
         }
         empty_class_theta.extend(unpinned);
         let mstep_maxiter: u32 = if k <= n_iter / 2 { 4 } else { 8 };
-        let (new_log_theta, new_log_sigma) = theta_sigma_weighted_mstep_mixture(
+        let mstep_before = [log_theta.as_slice(), log_sigma.as_slice()].concat();
+        let mstep = theta_sigma_weighted_mstep_mixture(
             model,
             population,
             &draws_by_class,
@@ -3822,8 +3839,14 @@ fn run_mcem_mixture(
             mstep_maxiter,
             &theta_packs_log_mask,
         );
-        log_theta = new_log_theta;
-        log_sigma = new_log_sigma;
+        mstep_motion.record(
+            &mstep_before,
+            &[mstep_theta_lower.as_slice(), log_sigma_lower.as_slice()].concat(),
+            &[mstep_theta_upper.as_slice(), log_sigma_upper.as_slice()].concat(),
+            &mstep,
+        );
+        log_theta = mstep.log_theta;
+        log_sigma = mstep.log_sigma;
 
         // (a2) Apply the class-aware closed-form mu-ref θ shift computed above:
         //      log θ_k += (Σ_i r_ic η̄_ic) / (Σ_i r_ic) over the classes θ_k serves.
@@ -4064,6 +4087,13 @@ fn run_mcem_mixture(
     if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
         warnings.push(w);
     }
+    warnings.extend(mstep_warnings(
+        &mut converged,
+        label,
+        &mstep_motion,
+        model,
+        stopped_after.is_some(),
+    ));
 
     if verbose {
         eprintln!("{label} (mixture) completed. Final marginal OFV = {ofv:.4}");
@@ -4430,6 +4460,299 @@ fn weighted_mstep_objective(
     }
 }
 
+/// Stable token of [`gate_converged_on_mstep_motion`].
+pub(crate) const MCEM_MSTEP_FROZEN_TOKEN: &str = "W_MCEM_MSTEP_FROZEN";
+
+/// Stable token of [`gate_converged_on_mstep_failures`].
+pub(crate) const MCEM_MSTEP_FAILED_TOKEN: &str = "W_MCEM_MSTEP_FAILED";
+
+/// Smallest displacement from its start, in packed units, that counts as a coordinate of
+/// the weighted M-step having moved (#2718). The reported freeze left coordinates equal
+/// to their start to 6 decimals.
+const MSTEP_MOVED_TOL: f64 = 1e-6;
+
+/// What the weighted θ/σ M-step did over a run (#2718).
+///
+/// Nothing else can see a frozen coordinate, because Ω keeps the objective falling and
+/// #2686's settling test reads the objective. Not moving is not enough to call one frozen:
+/// a coordinate that starts at its optimum has no reason to move. So it also has to be
+/// [`improvable_coordinates`] after the last solve that owned it.
+struct MstepMotion {
+    /// Each coordinate's value before the first solve that owned it; `None` while pinned.
+    start: Vec<Option<f64>>,
+    moved: Vec<bool>,
+    /// Whether a step along the coordinate alone beat the latest solve that owned it.
+    improvable: Vec<bool>,
+    solves: usize,
+    failed: usize,
+    last_failure: Option<nlopt::FailState>,
+}
+
+impl MstepMotion {
+    fn new(n: usize) -> Self {
+        MstepMotion {
+            start: vec![None; n],
+            moved: vec![false; n],
+            improvable: vec![false; n],
+            solves: 0,
+            failed: 0,
+            last_failure: None,
+        }
+    }
+
+    /// Fold in one solve. `before` is the packed vector it started from and `lower` /
+    /// `upper` its bounds, θ then σ; a coordinate with `upper == lower` was pinned.
+    fn record(&mut self, before: &[f64], lower: &[f64], upper: &[f64], step: &WeightedMstep) {
+        self.solves += 1;
+        if let Some(state) = step.failure {
+            self.failed += 1;
+            self.last_failure = Some(state);
+        }
+        let after = step.log_theta.iter().chain(&step.log_sigma);
+        for (i, &x) in after.enumerate() {
+            if upper[i] <= lower[i] {
+                continue;
+            }
+            let start = *self.start[i].get_or_insert(before[i]);
+            self.moved[i] |= (x - start).abs() > MSTEP_MOVED_TOL;
+            self.improvable[i] = step.improvable[i];
+        }
+    }
+
+    /// The coordinates a solve owned, never moved, and could still have improved, in
+    /// θ-then-σ order.
+    fn frozen(&self) -> Vec<usize> {
+        (0..self.start.len())
+            .filter(|&i| self.start[i].is_some() && !self.moved[i] && self.improvable[i])
+            .collect()
+    }
+}
+
+/// Demote `converged` when the weighted M-step left a parameter it owns at its start
+/// although moving it would have paid (#2718), and say why.
+fn gate_converged_on_mstep_motion(
+    converged: &mut bool,
+    label: &str,
+    motion: &MstepMotion,
+    model: &CompiledModel,
+) -> Option<String> {
+    let frozen = motion.frozen();
+    if frozen.is_empty() {
+        return None;
+    }
+    *converged = false;
+    let names: Vec<&str> = frozen
+        .iter()
+        .map(|&i| {
+            model
+                .theta_names
+                .iter()
+                .chain(&model.default_params.sigma.names)
+                .nth(i)
+                .map_or("?", String::as_str)
+        })
+        .collect();
+    Some(format!(
+        "{MCEM_MSTEP_FROZEN_TOKEN}: {label}: [{}] never left the starting values in {} \
+         weighted M-step(s), though a step along each alone still lowers −2 log L by more \
+         than {MCEM_SETTLE_MIN_GAP}, so the fit is reported converged: false. No other step of the run updates them, so \
+         these are starting values and not estimates. Start closer, mu-reference them so \
+         the closed-form step owns them, or chain a FOCE/FOCEI stage first.",
+        names.join(", "),
+        motion.solves,
+    ))
+}
+
+/// Demote `converged` when NLopt failed any weighted M-step (#2718). Independent of
+/// whether the coordinates moved, because an earlier solve moving them says nothing about
+/// a later one. BOBYQA has no failure a sound problem reaches: past roundoff, which
+/// [`mstep_failure`] lets through, it only reports bad arguments, memory and a forced
+/// stop. So one is enough, and there is no count to calibrate.
+fn gate_converged_on_mstep_failures(
+    converged: &mut bool,
+    label: &str,
+    motion: &MstepMotion,
+) -> Option<String> {
+    let state = motion.last_failure?;
+    *converged = false;
+    Some(format!(
+        "{MCEM_MSTEP_FAILED_TOKEN}: {label}: NLopt failed {} of {} weighted M-step(s) \
+         ({state:?}), so the fit is reported converged: false. A failed solve can leave θ \
+         and σ where they were for that iteration. This is a solver fault, not a property \
+         of the data: please report it.",
+        motion.failed, motion.solves,
+    ))
+}
+
+/// Everything the weighted M-step has to report at the end of a run. A run `max_time`
+/// stopped is not judged on motion: it may have had too few solves to tell, and it
+/// already reports why it is not converged. A failure stands either way.
+fn mstep_warnings(
+    converged: &mut bool,
+    label: &str,
+    motion: &MstepMotion,
+    model: &CompiledModel,
+    stopped: bool,
+) -> Vec<String> {
+    let failed = gate_converged_on_mstep_failures(converged, label, motion);
+    let frozen = if stopped {
+        None
+    } else {
+        gate_converged_on_mstep_motion(converged, label, motion, model)
+    };
+    failed.into_iter().chain(frozen).collect()
+}
+
+/// For each coordinate of the solve's result `x` that did not move from `start`, whether a
+/// step along it alone, inside its bounds, gains a likelihood-ratio step (#2718):
+/// [`MCEM_SETTLE_MIN_GAP`] on −2 log L, so half of it on `obj`, which is −log L.
+///
+/// The solve's own tolerance is too low a bar. On `impmap_mstep_tests`'s fixture the
+/// additive σ, which its data barely inform, read as improvable at 1e-7 relative from a
+/// converged solve's result. The step is the solve's first step, so a coordinate within
+/// about half of it of its optimum reads `false`, as does one the objective is flat in, and
+/// one on a bound with its optimum outside. Moved and pinned coordinates read `false`.
+fn improvable_coordinates<F>(
+    obj: &F,
+    start: &[f64],
+    x: &[f64],
+    lower: &[f64],
+    upper: &[f64],
+) -> Vec<bool>
+where
+    F: Fn(&[f64], Option<&mut [f64]>, &mut ()) -> f64,
+{
+    let unmoved = |i: usize| upper[i] > lower[i] && (x[i] - start[i]).abs() <= MSTEP_MOVED_TOL;
+    let mut improvable = vec![false; x.len()];
+    if !(0..x.len()).any(unmoved) {
+        return improvable;
+    }
+    let at = obj(x, None, &mut ());
+    let mut probe = x.to_vec();
+    for i in (0..x.len()).filter(|&i| unmoved(i)) {
+        let step = mstep_initial_step(lower[i], upper[i]);
+        for candidate in [(x[i] - step).max(lower[i]), (x[i] + step).min(upper[i])] {
+            probe[i] = candidate;
+            improvable[i] |=
+                candidate != x[i] && 2.0 * (at - obj(&probe, None, &mut ())) > MCEM_SETTLE_MIN_GAP;
+        }
+        probe[i] = x[i];
+    }
+    improvable
+}
+
+/// What one weighted θ/σ M-step returned.
+struct WeightedMstep {
+    log_theta: Vec<f64>,
+    log_sigma: Vec<f64>,
+    /// The NLopt failure that ended the solve, if it was one that can leave the start in
+    /// place. `RoundoffLimited` is not: BOBYQA reports it at the end of a solve that
+    /// has run out of precision, with its best point in hand.
+    failure: Option<nlopt::FailState>,
+    /// [`improvable_coordinates`] at the returned point, θ then σ.
+    improvable: Vec<bool>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fail every weighted M-step on this thread after this many more, for a driver test
+    /// of the gates: a working BOBYQA moves every free coordinate, even one the objective
+    /// is flat in.
+    static FAIL_MSTEP_SOLVES_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether [`FAIL_MSTEP_SOLVES_AFTER`] fails this solve.
+#[cfg(test)]
+fn mstep_solve_forced_to_fail() -> bool {
+    let Some(left) = FAIL_MSTEP_SOLVES_AFTER.get() else {
+        return false;
+    };
+    FAIL_MSTEP_SOLVES_AFTER.set(Some(left.saturating_sub(1)));
+    left == 0
+}
+
+#[cfg(not(test))]
+fn mstep_solve_forced_to_fail() -> bool {
+    false
+}
+
+/// The failure an NLopt outcome reports, under [`WeightedMstep::failure`]'s meaning.
+fn mstep_failure(
+    outcome: &Result<(nlopt::SuccessState, f64), (nlopt::FailState, f64)>,
+) -> Option<nlopt::FailState> {
+    match outcome {
+        Ok(_) | Err((nlopt::FailState::RoundoffLimited, _)) => None,
+        Err((state, _)) => Some(*state),
+    }
+}
+
+/// Run one weighted θ/σ M-step: BOBYQA on the packed vector `x`, θ then σ, from a local
+/// first design ([`mstep_initial_step`]) to [`MSTEP_FTOL_REL`] (#2718).
+///
+/// These are the settings #1415 gave SAEM. Before them this solve took NLopt's default
+/// first design, a quarter of the bound width and so about 5 units on (−10, 10), and
+/// stopped at `ftol_rel = 1e-4`, about 0.15 on an objective near 1480. On a 14-coordinate
+/// model every M-step then ended `FtolReached` with 2–3 coordinates moved. The first step
+/// is the main lever; loosening the tolerance alone moved 4–6.
+///
+/// The mixture M-step shares this configuration. SAEM's mixture arm keeps the old one
+/// (`MSTEP_MIXTURE_FTOL_REL`) because it solves on hard class assignments. This solve is
+/// weighted by the soft responsibilities, so it is an ordinary EM step and a converged
+/// solve is the right target.
+fn solve_weighted_mstep<F>(
+    obj: F,
+    mut x: Vec<f64>,
+    lower: &[f64],
+    upper: &[f64],
+    n_theta: usize,
+    maxiter: u32,
+) -> WeightedMstep
+where
+    F: Fn(&[f64], Option<&mut [f64]>, &mut ()) -> f64,
+{
+    let n = x.len();
+    let start = x.clone();
+    let mut opt = nlopt::Nlopt::new(
+        nlopt::Algorithm::Bobyqa,
+        n,
+        &obj,
+        nlopt::Target::Minimize,
+        (),
+    );
+    opt.set_lower_bounds(lower).unwrap();
+    opt.set_upper_bounds(upper).unwrap();
+    opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
+    opt.set_ftol_rel(MSTEP_FTOL_REL).unwrap();
+    let initial_step: Vec<f64> = lower
+        .iter()
+        .zip(upper)
+        .map(|(&lo, &hi)| mstep_initial_step(lo, hi))
+        .collect();
+    opt.set_initial_step(&initial_step).unwrap();
+
+    let failure = if mstep_solve_forced_to_fail() {
+        Some(nlopt::FailState::Failure)
+    } else {
+        mstep_failure(&opt.optimize(&mut x))
+    };
+    // A configuration NLopt rejects is a bug here, not a property of the fit. A release
+    // build reports it through `MstepMotion`.
+    debug_assert!(
+        !matches!(failure, Some(nlopt::FailState::InvalidArgs)),
+        "IMP weighted M-step: NLopt rejected the problem (InvalidArgs) — check the initial \
+         step against the bounds"
+    );
+    let improvable = improvable_coordinates(&obj, &start, &x, lower, upper);
+    let log_sigma = x.split_off(n_theta);
+    WeightedMstep {
+        log_theta: x,
+        log_sigma,
+        failure,
+        improvable,
+    }
+}
+
 /// Weighted θ/σ M-step: minimize the importance-weighted observation NLL
 /// `Σᵢ Σₖ w̃ᵢₖ · obs_nll(yᵢ | ηᵢₖ, θ, σ)` over the per-subject sample sets, using
 /// derivative-free NLopt BOBYQA in packed log-space, warm-started from the
@@ -4451,7 +4774,7 @@ fn theta_sigma_weighted_mstep(
     n_sigma: usize,
     maxiter: u32,
     theta_packs_log_mask: &[bool],
-) -> (Vec<f64>, Vec<f64>) {
+) -> WeightedMstep {
     let n = n_theta + n_sigma;
 
     let mut x: Vec<f64> = Vec::with_capacity(n);
@@ -4489,26 +4812,7 @@ fn theta_sigma_weighted_mstep(
         weighted_mstep_objective(model, population, draws, schedules, &th, &sg)
     };
 
-    let mut opt = nlopt::Nlopt::new(
-        nlopt::Algorithm::Bobyqa,
-        n,
-        obj,
-        nlopt::Target::Minimize,
-        (),
-    );
-    opt.set_lower_bounds(&lower).unwrap();
-    opt.set_upper_bounds(&upper).unwrap();
-    opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
-    opt.set_ftol_rel(1e-4).unwrap();
-
-    let mut xs = x.clone();
-    match opt.optimize(&mut xs) {
-        Ok(_) | Err(_) => {}
-    }
-
-    let log_theta_new = xs[..n_theta].to_vec();
-    let log_sigma_new = xs[n_theta..].to_vec();
-    (log_theta_new, log_sigma_new)
+    solve_weighted_mstep(obj, x, &lower, &upper, n_theta, maxiter)
 }
 
 /// Mixture (#985) weighted θ/σ M-step. Minimises the class-responsibility- and
@@ -4536,7 +4840,7 @@ fn theta_sigma_weighted_mstep_mixture(
     n_sigma: usize,
     maxiter: u32,
     theta_packs_log_mask: &[bool],
-) -> (Vec<f64>, Vec<f64>) {
+) -> WeightedMstep {
     use crate::parser::model_parser::MixtureClassGuard;
     let n = n_theta + n_sigma;
     let n_classes = draws.len();
@@ -4611,20 +4915,7 @@ fn theta_sigma_weighted_mstep_mixture(
         }
     };
 
-    let mut opt = nlopt::Nlopt::new(
-        nlopt::Algorithm::Bobyqa,
-        n,
-        obj,
-        nlopt::Target::Minimize,
-        (),
-    );
-    opt.set_lower_bounds(&lower).unwrap();
-    opt.set_upper_bounds(&upper).unwrap();
-    opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
-    opt.set_ftol_rel(1e-4).unwrap();
-    let mut xs = x.clone();
-    let _ = opt.optimize(&mut xs);
-    (xs[..n_theta].to_vec(), xs[n_theta..].to_vec())
+    solve_weighted_mstep(obj, x, &lower, &upper, n_theta, maxiter)
 }
 
 #[cfg(test)]
@@ -7078,7 +7369,7 @@ mod tests {
         lower[0] = log_theta[0];
         upper[0] = log_theta[0];
 
-        let (out_theta, _out_sigma) = theta_sigma_weighted_mstep_mixture(
+        let out_theta = theta_sigma_weighted_mstep_mixture(
             &model,
             &pop,
             &draws_by_class,
@@ -7094,7 +7385,8 @@ mod tests {
             n_sigma,
             8,
             &mask,
-        );
+        )
+        .log_theta;
         assert!(
             (out_theta[0] - log_theta[0]).abs() < 1e-12,
             "pinned theta must not move: {} vs {}",
@@ -8728,3 +9020,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "impmap_mstep_tests.rs"]
+mod mstep_tests;

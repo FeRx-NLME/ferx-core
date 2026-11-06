@@ -7397,6 +7397,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // distinct from a budget-limited convergence failure so programmatic
         // consumers can choose new starts or a chained initializer.
         (WarningSeverity::Critical, WarningCode::ViBadBasin)
+    } else if lower.starts_with("w_mcem_mstep_") {
+        // #2718: the IMP / IMPMAP weighted M-step left a parameter at its start, or NLopt
+        // failed it, and `converged` is demoted. A token arm ahead of the prose ones: the
+        // first message advises "mu-reference", which the `MuReferencing` arm below would
+        // claim as `Info`.
+        (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("w_absorption_twin_declined") {
         // #1008: the analytic absorption model kept no ODE twin. Not an estimation problem —
         // the fit that follows is a pure closed form — but the model has silently lost the

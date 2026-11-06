@@ -4011,7 +4011,8 @@ fn a_short_mcem_fit_is_told_its_verdict_was_not_tested() {
         s.observations = s
             .obs_times
             .iter()
-            .map(|t| 10.0 * (-0.1 * t).exp())
+            .enumerate()
+            .map(|(j, t)| 10.0 * (-0.1 * t).exp() * if j % 2 == 0 { 1.05 } else { 0.95 })
             .collect();
         s
     };
@@ -4203,11 +4204,15 @@ fn a_direct_estimator_call_gets_the_settling_verdict() {
 }
 
 /// The rise arm through `fit()`: `mcem_lowest_objective` has to survive from the loop to
-/// the gate. The fit starts at the truth of noiseless additive-error data, so iteration 1
-/// sets a low baseline; once the first M-step moves TVCL the model predicts nothing, no
+/// the gate. The fit starts near the truth of additive-error data, so iteration 1 sets a
+/// low baseline; once the first M-step moves TVCL the model predicts nothing, no
 /// parameter can win that back, and the marginal ends far above it without nearing the
 /// divergence cutoffs. An additive σ matters: a proportional one absorbs the change of
 /// scale. The plain model is the twin.
+///
+/// The data carry ±5 % so the twin has an optimum. On exact data the objective has no
+/// minimum: σ falls every iteration, the averaged estimate lags the last one, and the
+/// marginal reads 8.06 above the lowest iteration, over the 7.28 this scale allows (#2718).
 #[test]
 fn a_risen_marginal_reaches_the_published_verdict() {
     use crate::api::postfit::{MCEM_OBJECTIVE_ROSE_TOKEN, NONFINITE_MARGINAL_TOKEN};
@@ -4241,7 +4246,8 @@ fn a_risen_marginal_reaches_the_published_verdict() {
         s.observations = s
             .obs_times
             .iter()
-            .map(|t| 10.0 * (-0.1 * t).exp())
+            .enumerate()
+            .map(|(j, t)| 10.0 * (-0.1 * t).exp() * if j % 2 == 0 { 1.05 } else { 0.95 })
             .collect();
         s
     };

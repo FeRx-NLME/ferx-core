@@ -514,6 +514,28 @@ A longer run whose trace cannot be read is another matter. If either window has 
 than 10 finite objectives or SEs, those iterations produced no usable likelihood, so the
 fit is reported `converged: false` with `W_MCEM_NOT_SETTLED`, `reason: unusable_trace`.
 
+## When the M-step leaves a parameter behind {#mstep-frozen}
+
+σ, and any θ the closed-form shift does not own, are updated by a BOBYQA solve of the
+importance-weighted observation likelihood. Two checks read what that solve did (#2718).
+
+`W_MCEM_MSTEP_FROZEN` names a parameter the solve never moved although it should have. The
+parameter ended the run within 1e-6 of where the solve first took it up, in packed units,
+and after the last solve a step along it alone, of 0.1 or a quarter of a narrower interval,
+still lowered −2 log L by more than 3.84, one likelihood-ratio step. The value reported is
+then a starting value, so the fit is `converged: false`. A parameter that starts near its
+optimum, sits on a bound with its optimum outside, or barely affects the objective does not
+trigger this, and nor does one the closed-form shift owns or that is `FIX`. A run stopped by `imp_max_time` is not judged.
+
+The objective cannot show this, because Ω keeps absorbing the misfit and the objective
+keeps falling, so the settling check above does not see it. To clear the warning, start
+closer, mu-reference the parameters so the closed-form shift owns them, or chain a
+FOCE/FOCEI stage first.
+
+`W_MCEM_MSTEP_FAILED` says NLopt failed at least one solve, for a reason other than
+roundoff, and also reports `converged: false`, whether or not the parameters moved. It
+points at a solver fault rather than the data, so please report it.
+
 ## Defensive mixture {#defensive-mixture}
 
 A weakly-identified subject — e.g. an analytical `[initial_conditions]` baseline
@@ -610,6 +632,10 @@ whose minimum can sit far from the `imp` estimate on such a model (#1781). See
 when it applies, the measured effect, and the warnings it carries.
 
 ## Cost
+
+An estimating iteration adds a weighted M-step to the sampling below. That solve runs on
+the θ and σ the closed-form shift does not own, and its evaluation budget grows with their
+number.
 
 K × n_subjects predict calls per pass, and an evaluation runs
 `imp_adapt_passes + 1` passes. For warfarin (32 subjects) with K=2000 and the
