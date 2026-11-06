@@ -5797,13 +5797,24 @@ pub fn parse_full_model_with(
     // consumed, so the custom residual-magnitude programs (#484) can be built
     // after the [covariates] block is parsed (covariate names are needed to
     // validate the magnitude expressions).
-    let single_error_args: Option<(ErrorModel, Vec<String>, Option<String>)> =
-        match &parsed_error_model {
-            ParsedErrorModel::Single(em, args, exponent) => {
-                Some((*em, args.clone(), exponent.clone()))
-            }
-            ParsedErrorModel::PerCmt(_) | ParsedErrorModel::Selected { .. } => None,
-        };
+    let single_error_args: Option<RuvArgs> = match &parsed_error_model {
+        ParsedErrorModel::Single(_, args, exponent) => Some(RuvArgs {
+            args: args.clone(),
+            exponent: exponent.clone(),
+            by_name: false,
+        }),
+        // Per-CMT arguments may carry a magnitude too (#2729): each scales the
+        // sigma it names, so its program sits on that sigma's flat slot.
+        ParsedErrorModel::PerCmt(entries) if !entries.is_empty() => Some(RuvArgs {
+            args: entries
+                .iter()
+                .flat_map(|(_, _, args)| args.iter().cloned())
+                .collect(),
+            exponent: None,
+            by_name: true,
+        }),
+        ParsedErrorModel::PerCmt(_) | ParsedErrorModel::Selected { .. } => None,
+    };
     // Covariates the #658 error selector references become required data columns
     // (validated as E_MISSING_COVARIATE at fit setup). Capture before
     // `build_error_spec` consumes the parsed model.
@@ -22599,13 +22610,15 @@ fn build_error_spec(
             for (cmt, em, names) in entries {
                 let mut sigma_idx = Vec::with_capacity(names.len());
                 for nm in &names {
-                    let idx = sigma_names.iter().position(|s| s == nm).ok_or_else(|| {
-                        format!(
-                            "[error_model] CMT={}: references unknown sigma '{}' \
-                             (declare it in [parameters])",
-                            cmt, nm
-                        )
+                    // A bare sigma name, or a magnitude expression scaling exactly one
+                    // sigma (#2729; compiled by `build_ruv_magnitude`).
+                    let name = arg_sigma_name(nm, sigma_names).map_err(|e| {
+                        e.replacen("[error_model] ", &format!("[error_model] CMT={cmt}: "), 1)
                     })?;
+                    let idx = sigma_names
+                        .iter()
+                        .position(|s| *s == name)
+                        .expect("arg_sigma_name returns a declared sigma");
                     sigma_idx.push(idx);
                 }
                 if representative.is_none() {
@@ -22889,8 +22902,19 @@ fn compile_ruv_mag_deriv_program(
 /// references — a theta that appears *only* in `[error_model]` (e.g. `RUV_LATE`)
 /// would otherwise trip `check_unused_parameters`'s "not referenced" warning,
 /// mirroring how `[event_model]` thetas are unioned in.
+/// The `[error_model]` arguments a residual magnitude (#484) is built from.
+struct RuvArgs {
+    args: Vec<String>,
+    /// The `power(...)` exponent; single-endpoint only.
+    exponent: Option<String>,
+    /// `false`: argument `i` scales flat sigma slot `i` (the single-endpoint form,
+    /// whose sigmas are consumed positionally). `true`: each argument scales the
+    /// slot of the sigma it names (per-CMT, whose endpoints carry resolved indices).
+    by_name: bool,
+}
+
 fn build_ruv_magnitude(
-    single_error_args: &Option<(ErrorModel, Vec<String>, Option<String>)>,
+    single_error_args: &Option<RuvArgs>,
     sigma_names: &[String],
     theta_names: &[String],
     eta_names: &[String],
@@ -22909,7 +22933,12 @@ fn build_ruv_magnitude(
     // dose scan behind it runs only for a model that can see the result
     // (`RuvMagnitude::uses_tad`).
     let mut uses_tad = false;
-    let Some((_em, args, exponent)) = single_error_args else {
+    let Some(RuvArgs {
+        args,
+        exponent,
+        by_name,
+    }) = single_error_args
+    else {
         return Ok((None, used_thetas, Vec::new()));
     };
     let allowed_covs: Option<Vec<String>> = covariate_decls
@@ -22981,21 +23010,44 @@ fn build_ruv_magnitude(
         Ok((f, deriv))
     };
 
-    let mut per_sigma: Vec<Option<RuvMagFn>> = Vec::with_capacity(args.len());
-    let mut per_sigma_deriv: Vec<Option<RuvMagDerivProgram>> = Vec::with_capacity(args.len());
+    let n_slots = sigma_names.len().max(args.len());
+    let mut per_sigma: Vec<Option<RuvMagFn>> =
+        std::iter::repeat_with(|| None).take(n_slots).collect();
+    let mut per_sigma_deriv: Vec<Option<RuvMagDerivProgram>> =
+        std::iter::repeat_with(|| None).take(n_slots).collect();
+    // The argument text each slot was claimed with (per-CMT: a sigma two endpoints
+    // share must be scaled the same way by both, or one slot would need two programs).
+    let mut claimed: Vec<Option<&str>> = vec![None; n_slots];
     let mut any = false;
-    for arg in args {
+    for (pos, arg) in args.iter().enumerate() {
         let sigma_name = arg_sigma_name(arg, sigma_names)?;
         let trimmed = arg.trim();
+        let slot = if *by_name {
+            sigma_names
+                .iter()
+                .position(|s| *s == sigma_name)
+                .expect("arg_sigma_name returns a declared sigma")
+        } else {
+            pos
+        };
+        if let Some(prev) = claimed[slot] {
+            if prev != trimmed {
+                return Err(format!(
+                    "[error_model] sigma `{sigma_name}` is scaled two different ways (`{prev}` \
+                     and `{trimmed}`); a sigma shared by two endpoints takes one magnitude. \
+                     Declare a separate sigma per endpoint"
+                ));
+            }
+            continue;
+        }
+        claimed[slot] = Some(trimmed);
         if trimmed == sigma_name {
-            per_sigma.push(None);
-            per_sigma_deriv.push(None);
             continue;
         }
         any = true;
         let (f, deriv) = compile(trimmed, Some(&sigma_name), "magnitude")?;
-        per_sigma.push(Some(f));
-        per_sigma_deriv.push(Some(deriv));
+        per_sigma[slot] = Some(f);
+        per_sigma_deriv[slot] = Some(deriv);
     }
     // The `power(SIGMA, P)` exponent (#1182) goes on the proportional slot —
     // slot 0 for a single-endpoint form. Every `_scaled` variance function

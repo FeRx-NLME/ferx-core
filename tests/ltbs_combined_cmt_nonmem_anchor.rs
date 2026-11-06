@@ -26,6 +26,13 @@
 //! | FOCEI OBJ, initial estimates | 1236.2501551968762 | 1236.250155138609 |
 //! | FOCE OBJ, initial estimates | 1279.7110938059068 | 1279.711093903299 |
 //! | FOCEI OBJ, NONMEM's final estimates | 1020.2975589006809 | 1020.297558907486 |
+//! | FOCEI OBJ, inits + early-time plasma `PROP` factor | 1265.1650674155283 | 1265.165067356047 |
+//!
+//! The last row is the motivating model's whole residual shape:
+//! `ltbs_combined_cmt_mag_eval.ctl` multiplies the plasma `PROP` by `FAC = 1.8` while
+//! `TIME < 3` (one dose at 0, so that is the time after dose), which ferx writes on the
+//! per-CMT argument itself:
+//! `CMT=2: log(DV) ~ combined(PROP_P * (if (TAD < 3) FAC else 1), ADD_P)`.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
@@ -35,6 +42,8 @@ const DATA: &str = "tests/nonmem/ltbs_combined_cmt.csv";
 const NM_FOCEI_OBJ: f64 = 1236.2501551968762;
 const NM_FOCE_OBJ: f64 = 1279.7110938059068;
 const NM_FINAL_OBJ: f64 = 1020.2975589006809;
+/// `ltbs_combined_cmt_mag_eval.ext`.
+const NM_MAG_OBJ: f64 = 1265.1650674155283;
 /// Realised gaps (Linux x86_64): −5.8e-8 (FOCEI, inits), 9.7e-8 (FOCE, inits), 6.8e-9
 /// (FOCEI, final) — the ODE solvers' tolerance, not the residual model, which the
 /// single-endpoint closed-form anchor pins to 6e-9. ~5× headroom; swapping the two
@@ -60,6 +69,11 @@ const FINAL: Params = Params {
 };
 
 fn model(p: &Params) -> ferx_core::types::CompiledModel {
+    model_with(p, "PROP_P", "")
+}
+
+/// `prop_p` is the plasma endpoint's first argument; `extra` adds `[parameters]` lines.
+fn model_with(p: &Params, prop_p: &str, extra: &str) -> ferx_core::types::CompiledModel {
     let src = format!(
         "[parameters]
   theta TVCL({}, 0.01, 50.0)
@@ -72,7 +86,7 @@ fn model(p: &Params) -> ferx_core::types::CompiledModel {
   sigma ADD_P ~ {} (sd)
   sigma PROP_U ~ {} (sd)
   sigma ADD_U ~ {} (sd)
-
+{extra}
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
   V  = TVV  * exp(ETA_V)
@@ -92,7 +106,7 @@ fn model(p: &Params) -> ferx_core::types::CompiledModel {
   y[CMT=3] = urine
 
 [error_model]
-  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)
+  CMT=2: log(DV) ~ combined({prop_p}, ADD_P)
   CMT=3: log(DV) ~ combined(PROP_U, ADD_U)
 
 [fit_options]
@@ -132,7 +146,16 @@ fn evaluate(m: &ferx_core::types::CompiledModel, method: EstimationMethod) -> f6
 }
 
 fn check(p: &Params, method: EstimationMethod, want: f64, label: &str) {
-    let ofv = evaluate(&model(p), method);
+    check_model(&model(p), method, want, label);
+}
+
+fn check_model(
+    m: &ferx_core::types::CompiledModel,
+    method: EstimationMethod,
+    want: f64,
+    label: &str,
+) {
+    let ofv = evaluate(m, method);
     eprintln!(
         "{label}: ferx {ofv:.12} vs NONMEM {want:.12}, diff {:e}",
         ofv - want
@@ -189,5 +212,25 @@ fn swapping_the_endpoint_sigma_pairs_moves_the_objective() {
     assert!(
         (ofv - NM_FOCEI_OBJ).abs() > 10.0,
         "swapping the pairs left the objective at {ofv}"
+    );
+}
+
+/// The motivating model's whole residual shape: per-endpoint `PROP`/`ADD` and, on the
+/// plasma `PROP` only, a factor while `TAD < 3`. Its NONMEM objective is 29 above the
+/// factor-free one, so the factor is live and a model that ignored it could not pass.
+#[test]
+fn ltbs_combined_per_cmt_with_an_early_time_prop_factor_matches_nonmem() {
+    let m = model_with(
+        &INITS,
+        "PROP_P * (if (TAD < 3) FAC else 1)",
+        "  theta FAC(1.8, 0.1, 10.0)\n",
+    );
+    assert!(m.has_custom_ruv_magnitude());
+    assert!((NM_MAG_OBJ - NM_FOCEI_OBJ).abs() > 10.0);
+    check_model(
+        &m,
+        EstimationMethod::FoceI,
+        NM_MAG_OBJ,
+        "FOCEI, inits + PROP factor",
     );
 }

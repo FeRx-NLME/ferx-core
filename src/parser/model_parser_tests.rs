@@ -10563,6 +10563,82 @@ fn test_ltbs_per_cmt_lines_must_agree() {
     assert!(err.contains("log(DV) ~ combined(PROP, ADD)"), "got: {err}");
 }
 
+/// A per-CMT argument may carry a magnitude (#2729 review): the motivating model's
+/// early-time factor on the plasma `PROP` only. The program sits on `PROP_P`'s flat
+/// slot (0); every other slot — including the urine pair — stays bare.
+#[test]
+fn test_ltbs_per_cmt_argument_magnitude_keys_on_its_sigma_slot() {
+    let m = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P * (if (TAD < 3) TVKA else 1), ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)",
+    )
+    .unwrap();
+    let crate::types::ErrorSpec::PerCmt(map) = &m.error_spec else {
+        panic!("per-CMT spec expected");
+    };
+    assert_eq!(map[&2].sigma_idx, vec![0, 1]);
+    assert_eq!(map[&3].sigma_idx, vec![2, 3]);
+    let mag = m.ruv_magnitude.as_ref().expect("a magnitude was written");
+    assert!(m.has_custom_ruv_magnitude());
+    let theta = &m.default_params.theta;
+    let early = mag.eval_obs(theta, &HashMap::new(), 1.0, 1.0);
+    let late = mag.eval_obs(theta, &HashMap::new(), 5.0, 5.0);
+    assert_eq!(
+        early,
+        vec![1.5, 1.0, 1.0, 1.0],
+        "TAD < 3 scales PROP_P only"
+    );
+    assert_eq!(late, vec![1.0, 1.0, 1.0, 1.0]);
+
+    // Keyed by the sigma it names, not its argument position: with the urine line
+    // first, `ADD_U * TVKA` is the second argument read but scales flat slot 3.
+    let m = ltbs_per_cmt_model(
+        "  CMT=3: log(DV) ~ combined(PROP_U, ADD_U * TVKA)\n  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)",
+    )
+    .unwrap();
+    let row = m.ruv_magnitude.as_ref().unwrap().eval_obs(
+        &m.default_params.theta,
+        &HashMap::new(),
+        1.0,
+        1.0,
+    );
+    assert_eq!(row, vec![1.0, 1.0, 1.0, 1.5]);
+}
+
+#[test]
+fn test_per_cmt_argument_magnitude_refusals() {
+    // A sigma two endpoints share takes one magnitude.
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P * TVKA, ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_P, ADD_U)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("`PROP_P` is scaled two different ways"),
+        "got: {err}"
+    );
+    // Shared and scaled the same way is fine.
+    ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P * TVKA, ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_P * TVKA, ADD_U)",
+    )
+    .unwrap();
+    // The per-CMT spelling of the unknown / ambiguous sigma errors keeps its prefix.
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(NOPE, ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("CMT=2: references unknown sigma 'NOPE'"),
+        "got: {err}"
+    );
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P * ADD_U, ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("CMT=2: argument") && err.contains("multiple sigmas"),
+        "got: {err}"
+    );
+}
+
 #[test]
 fn test_ltbs_per_cmt_requires_an_ode_model() {
     // Per-CMT error models of any kind are ODE-only; LTBS does not change that.

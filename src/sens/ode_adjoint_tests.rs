@@ -769,6 +769,31 @@ const ODE_LTBS_COMBINED_PER_CMT: &str = r#"
 #[test]
 fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt() {
     let model = parse_model_string(ODE_LTBS_COMBINED_PER_CMT).unwrap();
+    // Measured 2.0e-9 (Linux x86_64); 5× headroom.
+    ltbs_combined_per_cmt_parity(model, 1e-8);
+}
+
+/// The same with the motivating model's early-time factor on the plasma `PROP` only,
+/// written on the per-CMT argument (#2729 review): a θ-dependent magnitude on one
+/// endpoint's constant log-scale loading, keyed on that sigma's flat slot.
+#[test]
+fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt_magnitude() {
+    let src = ODE_LTBS_COMBINED_PER_CMT
+        .replace(
+            "CMT=2: log(DV) ~ combined(PROP_P, ADD_P)",
+            "CMT=2: log(DV) ~ combined(PROP_P * (if (TAD < 3) FAC else 1), ADD_P)",
+        )
+        .replace(
+            "  sigma PROP_P",
+            "  theta FAC(1.8, 0.1, 10.0)\n  sigma PROP_P",
+        );
+    let model = parse_model_string(&src).unwrap();
+    assert!(model.has_custom_ruv_magnitude());
+    // Measured 2.2e-9 (Linux x86_64); ~5× headroom.
+    ltbs_combined_per_cmt_parity(model, 1e-8);
+}
+
+fn ltbs_combined_per_cmt_parity(model: CompiledModel, bound: f64) {
     let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
     let base = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 20.0];
     let times: Vec<f64> = base.iter().flat_map(|&t| [t, t]).collect();
@@ -789,6 +814,8 @@ fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt() {
         .collect();
     // Both terms live on both endpoints: ADD/F straddles PROP on each.
     let nat: Vec<f64> = preds.iter().map(|g| g.exp()).collect();
+    // (The magnitude variant scales PROP_P by 1.8 before t = 3, which keeps the
+    // straddle: its early rows have F well above ADD/PROP.)
     for (cmt, prop, add) in [(2usize, 0.1, 0.3), (3, 0.2, 2.0)] {
         let r: Vec<f64> = (0..nat.len())
             .filter(|&j| s.obs_cmts[j] == cmt)
@@ -808,8 +835,7 @@ fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt() {
     assert!(g.0 < 1e-12 && g.1 < 1e-12, "kernel vs production: {g:?}");
     let worst = parity(&model, &s);
     eprintln!("per-CMT LTBS combined FOCEI vs reconverged FD {worst:.2e}");
-    // Measured 2.0e-9 (Linux x86_64); 5× headroom.
-    assert!(worst < 1e-8, "FOCEI worst relative difference {worst:.2e}");
+    assert!(worst < bound, "FOCEI worst relative difference {worst:.2e}");
 }
 
 #[test]
