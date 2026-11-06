@@ -386,16 +386,26 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   covariates and `TIME` — including every `weight =` model — has no direct-θ
   channel at all, and keeps the fast closed forms everywhere.
 
-### Not available with adaptive dosing {#magnitude-adaptive}
+### With adaptive dosing {#magnitude-adaptive}
 
-Adaptive dosing (`simulate_adaptive*`) refuses any residual-error magnitude
-(`E_ADAPTIVE_UNSUPPORTED`): a magnitude expression, a
-[`weight =`](#residual-weighting-weight-...), a [`power(...)`](#power) exponent,
-or a magnitude on a `CMT=N:` line. The controller assay draws a `Dv` reading
-from the bare sigma, so the factor would otherwise be dropped from the signal
-while the run reported success (#2741). The refusal applies to every adaptive run
-on such a model, including one with only `Ipred` monitors, which reads no residual
-error. Plain `simulate()` applies the magnitude.
+Adaptive dosing (`simulate_adaptive*`) applies the residual-error magnitude to a `Dv`
+monitor's assay draw, as `simulate()` applies it to an observation row
+([#2741](https://github.com/FeRx-NLME/ferx-core/issues/2741)). This covers a magnitude
+expression, a [`weight =`](#residual-weighting-weight-...), a [`power(...)`](#power)
+exponent and a magnitude on a `CMT=N:` line, with IIV on the residual error,
+`block_sigma`, FREM and `MIXNUM`. The magnitude is evaluated at the decision:
+
+- **Covariates**: the row in force at the decision.
+- **`TIME`**: the time as written, the same value the monitor reads.
+- **`TAD`**: the time after the last dose given *before* the reading, the base regimen
+  plus the controller's own earlier doses. A dose decided at the same decision comes
+  after the reading. Before any dose, `TAD` is the time since the subject's first
+  record, so a first dose decided at 4 on a subject with a record at 0 reads `TAD = 4`.
+
+A magnitude that evaluates to zero, a negative number or a non-finite value at a
+decision stops the run with `E_RUV_MAGNITUDE_NONPOSITIVE`. The data check behind that
+code sees the observation rows only. A decision can sit on a row it never evaluates,
+such as an `EVID=2` row. A model without a magnitude draws exactly what it drew before.
 
 ### On `CMT=N:` lines and in `if/else` branches {#endpoint-magnitude}
 
@@ -438,9 +448,10 @@ Restrictions on these forms:
   rejected, because a row holds one multiplier per sigma. Declare a second sigma.
 - **`weight =` and `power(...)` stay refused** on `CMT=N:` lines and in `if/else` branches.
   Write the factor as a magnitude expression instead of a `weight =`.
-- **Adaptive dosing** (`simulate_adaptive*`) refuses these magnitudes, as it refuses
-  [every magnitude](#magnitude-adaptive), because the assay
-  draws from the bare sigma. It refuses a covariate-selected error model in any case.
+- **Adaptive dosing** (`simulate_adaptive*`) applies a `CMT=N:` magnitude to the assay
+  draw of a `Dv` monitor on that compartment, as it applies
+  [every magnitude](#magnitude-adaptive). It refuses a covariate-selected error model in
+  any case.
 
 #### Comparison with NONMEM {#endpoint-magnitude-nonmem-anchor}
 

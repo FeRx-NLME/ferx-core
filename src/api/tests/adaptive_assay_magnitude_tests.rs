@@ -904,3 +904,47 @@ fn a_non_positive_magnitude_at_a_decision_is_refused() {
         );
     }
 }
+
+/// T1, the variance half. The readings above cannot see a bare model handed a row of
+/// ones: the `_scaled` form differs from the legacy one in the last bit of the variance on
+/// about half of all predictions, but `L + √v·ε` rounds that ulp away (measured: the
+/// mutation left every reading of `bare_model_readings_keep_their_bits` unchanged). So the
+/// assay's variance itself is pinned against the legacy form, bit for bit, on a grid of
+/// 20 000 predictions — and the straddle is asserted: on the same grid the `_scaled` form
+/// at a row of ones differs on a large share (measured 54% on 200 000).
+///
+/// Regression: `assay_resid_var` passing `Some(row of ones)` for a bare model.
+#[test]
+fn bare_model_assay_variance_is_the_legacy_form_bit_for_bit() {
+    let m = parse_model_string(ODE_NO_IIV).expect("parse");
+    let params = &m.default_params;
+    let (s, c) = (&params.sigma.values, &m.residual_correlations);
+    let cov = std::collections::HashMap::new();
+    let (mut n, mut scaled_differs) = (0, 0);
+    for i in 0..20_000 {
+        let f = 0.001 + (i as f64) * 0.007_31;
+        let row = crate::sim::adaptive::AssayRow {
+            cmt: 1,
+            ipred: f,
+            time: 0.0,
+            tad: 0.0,
+            cov: &cov,
+        };
+        let got = super::adaptive::assay_resid_var(&m, params, &row, 1.0)
+            .expect("bare: nothing to refuse")
+            .expect("cmt 1 has an error model");
+        let legacy = m.error_spec.variance_at_with_correlations(1, f, s, c) * 1.0;
+        assert_eq!(
+            got.to_bits(),
+            legacy.to_bits(),
+            "f = {f}: {got} vs {legacy}"
+        );
+        let scaled = m.error_spec.variance_at_scaled(1, f, s, c, &[1.0]);
+        scaled_differs += usize::from(scaled.to_bits() != legacy.to_bits());
+        n += 1;
+    }
+    assert!(
+        scaled_differs * 4 > n,
+        "the straddle: the `_scaled` form differs on {scaled_differs} of {n}"
+    );
+}

@@ -463,8 +463,8 @@ observes a 1-based compartment/endpoint under an [`ObserveMode`]:
 - `Dv` — the realized, assay-noised measurement: `IPRED + ε·√(residual variance)`,
   clamped at 0, with the residual variance taken from the endpoint's own
   `[error_model]`. This is the realistic TDM / titration signal — a clinician
-  titrates on a *measured* value, not the latent truth. The variance is the bare
-  sigma's, so an `[error_model]` with a residual-error magnitude is refused
+  titrates on a *measured* value, not the latent truth. A residual-error magnitude
+  applies, evaluated at the decision
   ([magnitudes and adaptive dosing](error-model.qmd#magnitude-adaptive)).
 
 Mode is chosen **per monitor**, so a PK exposure target can run on `Ipred` while a
