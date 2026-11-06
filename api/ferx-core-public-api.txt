@@ -2586,7 +2586,8 @@ pub fn ferx_core::ErrorSpec::dvar_df_scaled(&self, cmt: usize, f: f64, sigma: &[
 pub fn ferx_core::ErrorSpec::dvar_dlogsigma(&self, cmt: usize, k: usize, f: f64, sigma: &[f64]) -> f64
 pub fn ferx_core::ErrorSpec::dvar_dlogsigma_scaled(&self, cmt: usize, k: usize, f: f64, sigma: &[f64], mult: &[f64]) -> f64
 pub fn ferx_core::ErrorSpec::has_f_dependent_variance(&self) -> bool
-pub fn ferx_core::ErrorSpec::sigma_loading_slopes(&self, cmt: usize, f: f64, n_sigma: usize) -> alloc::vec::Vec<(usize, f64)>
+pub fn ferx_core::ErrorSpec::sigma_loading_slopes(&self, cmt: usize, n_sigma: usize) -> alloc::vec::Vec<(usize, f64)>
+pub fn ferx_core::ErrorSpec::sigma_loading_slopes_at(&self, cmt: usize, f: f64, n_sigma: usize) -> alloc::vec::Vec<(usize, f64)>
 pub fn ferx_core::ErrorSpec::sigma_loadings(&self, cmt: usize, f: f64, n_sigma: usize) -> alloc::vec::Vec<(usize, f64)>
 pub fn ferx_core::ErrorSpec::sigma_types(&self, n_sigma: usize) -> alloc::vec::Vec<ferx_core::SigmaType>
 pub fn ferx_core::ErrorSpec::variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64
@@ -4009,7 +4010,8 @@ pub fn ferx_core::ErrorSpec::dvar_df_scaled(&self, cmt: usize, f: f64, sigma: &[
 pub fn ferx_core::ErrorSpec::dvar_dlogsigma(&self, cmt: usize, k: usize, f: f64, sigma: &[f64]) -> f64
 pub fn ferx_core::ErrorSpec::dvar_dlogsigma_scaled(&self, cmt: usize, k: usize, f: f64, sigma: &[f64], mult: &[f64]) -> f64
 pub fn ferx_core::ErrorSpec::has_f_dependent_variance(&self) -> bool
-pub fn ferx_core::ErrorSpec::sigma_loading_slopes(&self, cmt: usize, f: f64, n_sigma: usize) -> alloc::vec::Vec<(usize, f64)>
+pub fn ferx_core::ErrorSpec::sigma_loading_slopes(&self, cmt: usize, n_sigma: usize) -> alloc::vec::Vec<(usize, f64)>
+pub fn ferx_core::ErrorSpec::sigma_loading_slopes_at(&self, cmt: usize, f: f64, n_sigma: usize) -> alloc::vec::Vec<(usize, f64)>
 pub fn ferx_core::ErrorSpec::sigma_loadings(&self, cmt: usize, f: f64, n_sigma: usize) -> alloc::vec::Vec<(usize, f64)>
 pub fn ferx_core::ErrorSpec::sigma_types(&self, n_sigma: usize) -> alloc::vec::Vec<ferx_core::SigmaType>
 pub fn ferx_core::ErrorSpec::variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64

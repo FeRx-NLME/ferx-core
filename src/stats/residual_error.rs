@@ -243,20 +243,36 @@ impl ErrorSpec {
         self.sigma_loadings_inline(cmt, f, n_sigma).to_vec()
     }
 
-    /// `∂(sigma loading coefficient)/∂f` at prediction `f` for each slot an
-    /// observation loads on, parallel in shape to
-    /// [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings).
+    /// `∂(sigma loading coefficient)/∂f` for each slot an observation loads on,
+    /// parallel in shape to [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings).
     ///
-    /// The proportional slot loads `f` (slope `1`), the additive slot loads the
-    /// constant `1` (slope `0`), and the natural-unit additive slot of
-    /// `LogCombined` loads `exp(−f)` (slope `−exp(−f)`, the one loading that is not
-    /// affine in `f`, #2729). Returning the slopes with the *same slot
-    /// presence* as [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings) lets the dense-`R` derivative
+    /// The proportional slot loads `f` (slope `1`) and the additive slot loads the
+    /// constant `1` (slope `0`), so for every error model but `LogCombined` the slopes
+    /// do not depend on `f`. `LogCombined`'s natural-unit additive slot loads `exp(−f)`,
+    /// whose slope does (#2729): it is reported as `NaN` here, so a caller that has not
+    /// passed the prediction cannot silently use a wrong value — use
+    /// [`Self::sigma_loading_slopes_at`], which is exact for every model.
+    ///
+    /// Returning the slopes with the *same slot presence* as
+    /// [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings) lets the dense-`R` derivative
     /// ([`crate::stats::residual_error::compute_dr_df_matrices`]) reuse the exact
     /// bilinear cross-covariance assembly with the value loadings replaced by
     /// these slopes — the off-diagonal `R` is linear in each observation's
     /// loadings, so `∂R_jk/∂f_j = cross(slopes_j, values_k)`.
-    pub fn sigma_loading_slopes(&self, cmt: usize, f: f64, n_sigma: usize) -> Vec<(usize, f64)> {
+    pub fn sigma_loading_slopes(&self, cmt: usize, n_sigma: usize) -> Vec<(usize, f64)> {
+        self.loading_shape(cmt, n_sigma)
+            .iter()
+            .map(|&(i, form)| match form {
+                LoadingForm::InvExp => (i, f64::NAN),
+                _ => (i, form.eval(0.0).1),
+            })
+            .collect()
+    }
+
+    /// [`Self::sigma_loading_slopes`] at the prediction `f`: exact for every error model,
+    /// including `LogCombined`'s `exp(−f)` slot (slope `−exp(−f)`, #2729). For the other
+    /// models it equals [`Self::sigma_loading_slopes`] at any `f`.
+    pub fn sigma_loading_slopes_at(&self, cmt: usize, f: f64, n_sigma: usize) -> Vec<(usize, f64)> {
         self.sigma_loading_slopes_inline(cmt, f, n_sigma).to_vec()
     }
 
@@ -2483,25 +2499,37 @@ fn visit_d2r_df2_cov(
             diag_self_second_deriv(&scaled[m], sigma_values, correlations),
         );
     }
-    // Mixed partial ∂²R_jk/∂f_j∂f_k for each matched pair (both slope loadings).
+    // Curvature loadings `c''`: zero for an affine loading, live for a `power(...)`
+    // slot (#1182) and `LogCombined`'s `exp(−f)` slot (#2729).
+    let cload: Vec<Vec<(usize, f64)>> = scaled
+        .iter()
+        .map(|row| row.iter().map(|l| (l.idx, l.c2)).collect())
+        .collect();
+    // For each matched pair, `R_jk = cross(c_j, c_k)` is bilinear in the two rows'
+    // loadings: the mixed partial `∂²R_jk/∂f_j∂f_k = cross(c_j', c_k')`, and — where a
+    // loading is not affine — the own-row curvatures `∂²R_jk/∂f_j² = cross(c_j'', c_k)`
+    // and `∂²R_jk/∂f_k² = cross(c_j, c_k'')`.
     for &(j, k, _) in &pairs {
-        let d =
-            cross_observation_covariance(&sload[j], &sload[k], sigma_values, correlations, |c| {
-                correlations[c].rho
-            });
+        let cross = |a: &[(usize, f64)], b: &[(usize, f64)]| {
+            cross_observation_covariance(a, b, sigma_values, correlations, |c| correlations[c].rho)
+        };
+        let d = cross(&sload[j], &sload[k]);
         if d != 0.0 {
             sink(j, k, j, k, d);
             sink(k, j, j, k, d);
         }
+        let djj = cross(&cload[j], &vload[k]);
+        if djj != 0.0 {
+            sink(j, j, j, k, djj);
+        }
+        let dkk = cross(&vload[j], &cload[k]);
+        if dkk != 0.0 {
+            sink(k, k, j, k, dkk);
+        }
     }
-    // A `correlation` line (#1081): `∂²R_jk/∂f_j∂f_k = C_jk · Σ c_j' c_k' σ²`, and —
-    // for a `power(...)` slot, whose loading is not affine — the own-row curvature
-    // `∂²R_jk/∂f_j² = C_jk · Σ c_j'' c_k σ²`.
+    // A `correlation` line (#1081): `∂²R_jk/∂f_j∂f_k = C_jk · Σ c_j' c_k' σ²`, and the
+    // own-row curvature `∂²R_jk/∂f_j² = C_jk · Σ c_j'' c_k σ²` of a non-affine loading.
     if let Some(serial) = cov.serial {
-        let cload: Vec<Vec<(usize, f64)>> = scaled
-            .iter()
-            .map(|row| row.iter().map(|l| (l.idx, l.c2)).collect())
-            .collect();
         match serial_pairs(serial, obs_rgroup, obs_times, obs_raw_times, n) {
             Some(spairs) => {
                 for (j, k, c) in spairs {
@@ -2792,7 +2820,7 @@ mod tests {
         };
         let lists_of = |spec: &ErrorSpec, k: usize, n: usize| {
             let at0 = spec.sigma_loadings(k, F, n);
-            let slopes = spec.sigma_loading_slopes(k, F, n);
+            let slopes = spec.sigma_loading_slopes_at(k, F, n);
             assert_eq!(at0.len(), slopes.len(), "slot presence is shared");
             at0.iter()
                 .zip(&slopes)
@@ -3024,6 +3052,126 @@ mod tests {
                 SigmaType::Proportional
             ]
         );
+    }
+
+    /// The two-argument `sigma_loading_slopes` keeps its pre-#2729 values for every
+    /// model whose slopes do not depend on `f`, and reports the `exp(−f)` slot as `NaN`
+    /// rather than a slope at some arbitrary `f`; `sigma_loading_slopes_at` is exact.
+    #[test]
+    fn sigma_loading_slopes_compat_and_at() {
+        for em in [
+            ErrorModel::Additive,
+            ErrorModel::Proportional,
+            ErrorModel::Combined,
+        ] {
+            let spec = ErrorSpec::Single(em);
+            for f in [-2.0, 0.0, 3.5] {
+                assert_eq!(
+                    spec.sigma_loading_slopes(0, 2),
+                    spec.sigma_loading_slopes_at(0, f, 2),
+                    "{em:?} at {f}"
+                );
+            }
+        }
+        let lc = ErrorSpec::Single(ErrorModel::LogCombined);
+        let compat = lc.sigma_loading_slopes(0, 2);
+        assert_eq!(compat[0], (0, 0.0));
+        assert_eq!(compat[1].0, 1);
+        assert!(compat[1].1.is_nan(), "{compat:?}");
+        let g = 0.7;
+        let at = lc.sigma_loading_slopes_at(0, g, 2);
+        assert_eq!(at[0], (0, 0.0));
+        assert_eq!(at[1].0, 1);
+        assert_relative_eq!(at[1].1, -(-g).exp(), max_relative = 1e-15);
+    }
+
+    /// The dense `∂²R/∂f²` of matched `block_sigma` pairs carries each row's own
+    /// curvature when a loading is not affine: with the two endpoints' `exp(−f)` slots
+    /// correlated, `∂²R_jk/∂f_j² = cross(c_j'', c_k) ≠ 0`. Against central FD of the
+    /// dense `R` itself (not of `∂R/∂f`, which shares the loadings under test), every
+    /// entry of the tensor, plus a pin that the own-row entry is live.
+    #[test]
+    fn d2r_df2_includes_own_row_curvature_of_paired_log_combined_rows() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::LogCombined,
+                    sigma_idx: vec![0, 1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::LogCombined,
+                    sigma_idx: vec![2, 3],
+                },
+            ),
+        ]));
+        // Log-scale predictions; the ADD slots (1 and 3) are correlated across rows
+        // sampled at the same time.
+        let ipreds = [1.0, -0.5, 0.3, -1.2];
+        let cmts = [1usize, 2, 1, 2];
+        let times = [1.0, 1.0, 2.0, 2.0];
+        let sigma = [0.1, 0.4, 0.2, 0.6];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 3,
+            rho: 0.5,
+        };
+        let r_at = |f: &[f64]| {
+            compute_r_matrix_with_correlations(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &[],
+                &sigma,
+                &[corr],
+            )
+        };
+        let d2r = compute_d2r_df2_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+            None,
+        );
+        let n = ipreds.len();
+        let h = 2e-4;
+        let mut worst = 0.0f64;
+        for a in 0..n {
+            for b in 0..n {
+                let at = |da: f64, db: f64| {
+                    let mut f = ipreds.to_vec();
+                    f[a] += da;
+                    f[b] += db;
+                    r_at(&f)
+                };
+                let fd = (at(h, h) - at(h, -h) - at(-h, h) + at(-h, -h)) / (4.0 * h * h);
+                for p in 0..n {
+                    for q in 0..n {
+                        let (got, want) = (d2r[a][b][(p, q)], fd[(p, q)]);
+                        assert!(got.is_finite() && want.is_finite());
+                        worst = worst.max((got - want).abs() / (1.0 + want.abs()));
+                    }
+                }
+            }
+        }
+        // Measured 5.0e-8 at h = 2e-4 (Linux x86_64); 5× headroom. Without the own-row
+        // curvature the gap is the missing entry itself, O(0.1).
+        assert!(worst < 2.5e-7, "worst relative gap {worst:.2e}");
+        // Row 0 (CMT 1, t=1) pairs with row 1 (CMT 2, t=1): its own curvature is live.
+        let own = d2r[0][0][(0, 1)];
+        let want = 0.5 * 0.4 * 0.6 * (-ipreds[0]).exp() * (-ipreds[1]).exp();
+        assert_relative_eq!(own, want, max_relative = 1e-12);
     }
 
     // ── #1182: the `power(...)` exponent channel ─────────────────────────
