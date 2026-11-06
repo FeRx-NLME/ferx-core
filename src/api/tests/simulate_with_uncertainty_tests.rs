@@ -2219,9 +2219,13 @@ fn simulated_flip_flop_tally_skips_an_undosed_subject() {
 ///
 /// Measured (r4): the same holds for a dose exactly **at** t = 3, because a transit or IG
 /// absorption contributes exactly zero central concentration at elapsed time zero — nothing
-/// has transited yet. Moving it `1e-9` earlier gives `1.67e-39`: tiny, but not zero, so
+/// has transited yet. Moving it slightly earlier gives a tiny but non-zero concentration, so
 /// `d.time < last_obs` sits on the right side of the boundary. (`<=` would be right for an
-/// IV bolus; this family is oral.)
+/// IV bolus; this family is oral.) "Slightly" is per family: `1e-9` for transit, but `1e-2`
+/// for IG, whose CDF vanishes like `exp(−λ/2t)` — at `1e-9` it is `2.7e-1447648277`, an
+/// exact `0` in f64, and at `1e-2` it is `1.5e-145` (`mpmath`, `λ = 6.67`, #2769). Until
+/// #2769 the IG case passed at `1e-9` only because the old `ln Φ` floor left
+/// `(F·D/V)·M(ke)·exp(2λr/μ + ln 1e-300) ≈ 1.3e-297` standing in for that zero.
 ///
 /// The oracle is applied **at η = 0**, deliberately. At a crossing η the with-dose and
 /// dose-free predictions are identical for *every* dose time — that is the clamp itself — so
@@ -2245,12 +2249,14 @@ fn simulated_flip_flop_tally_skips_a_dose_that_reaches_no_observation() {
 
     // The oracle, at η = 0, on both families: a dose at or after the last observation
     // contributes nothing; one just before it does.
-    for (fam, m, crosser) in [("transit", &model, 0.6_f64), ("ig", &ig, 2.3)] {
+    for (fam, m, crosser, just_before) in
+        [("transit", &model, 0.6_f64, 1e-9), ("ig", &ig, 2.3, 1e-2)]
+    {
         let theta = m.default_params.theta.clone();
         for (name, t, reaches) in [
             ("long after the last obs", 100.0, false),
             ("exactly on the last obs", last_obs, false),
-            ("just before the last obs", last_obs - 1e-9, true),
+            ("just before the last obs", last_obs - just_before, true),
             ("before the first obs", 0.0, true),
         ] {
             let s = at(t);

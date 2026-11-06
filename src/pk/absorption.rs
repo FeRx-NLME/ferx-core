@@ -1439,6 +1439,34 @@ mod tests {
         }
     }
 
+    /// The prepared IG kernel's CDF — the `Φ(z₁) + exp(2λ/μ + ln Φ(z₂))` behind
+    /// [`PreparedInputRate::rate_infused`] — against a 60-digit `mpmath` IG CDF at low CV
+    /// (#2769; `mpmath` quadrature of the density agrees with it to ≤ 3e-59). With
+    /// `ln Φ` floored at `ln 1e-300` this CDF was `> 1` from `CV ≈ 0.053` (`inf` at
+    /// `CV = 0.03`), the same defect as the analytic closed form, at its second call site.
+    #[test]
+    fn prepared_igd_cdf_matches_mpmath_at_low_cv() {
+        // (CV, s, F_IG(s; μ = 1, λ = 1/CV²)).
+        let reference: [(f64, f64, f64); 9] = [
+            (0.05, 0.97, 0.2794716292740564),
+            (0.05, 1.0, 0.50996733518830131),
+            (0.05, 1.03, 0.7311742413831019),
+            (0.03, 0.97, 0.158543070414421),
+            (0.03, 1.0, 0.50598278868364468),
+            (0.03, 1.03, 0.8414503974523925),
+            (0.01, 0.97, 0.0011786682238743386),
+            (0.01, 1.0, 0.50199466153796173),
+            (0.01, 1.03, 0.99846691222877099),
+        ];
+        for &(cv, s, want) in &reference {
+            let prepared = PreparedInputRate::<f64>::inverse_gaussian(1.0, cv * cv);
+            let got = prepared.cdf(s);
+            assert!(got.is_finite(), "CV {cv} s {s}: F = {got}");
+            // Measured worst (macOS arm64): 2.2e-14 (CV 0.01, s 0.97); 1e-13 leaves ~4.5×.
+            assert_relative_eq!(got, want, max_relative = 1e-13);
+        }
+    }
+
     /// `InputRateForcing::validate` reads `mat`/`cv2` from the right slots for the
     /// IG kind and surfaces the domain error.
     #[test]
