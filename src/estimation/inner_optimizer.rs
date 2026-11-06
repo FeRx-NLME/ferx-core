@@ -3961,6 +3961,27 @@ fn find_ebe_iov_seeded(
         primary
     };
     let bfgs_converged = primary.converged();
+    let dev_warm = is_warm_start(eta_init, init_is_mode);
+    crate::devflags::bump(if dev_warm { 0 } else { 1 });
+    if !bfgs_converged {
+        if std::env::var_os("FERX_DEV_TRACE").is_some() {
+            let g = agrad(&x);
+            let gn = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+            eprintln!(
+                "DEVTRACE iov_fail id={} exit={:?} gnorm={gn:.3e} tol={tol:.1e} f={:.6} x={:?}",
+                subject.id,
+                primary,
+                obj(&x),
+                x
+            );
+        }
+        crate::devflags::bump(if dev_warm { 2 } else { 3 });
+        crate::devflags::bump(if matches!(primary, InnerExit::Failed) {
+            4
+        } else {
+            5
+        });
+    }
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
@@ -3968,7 +3989,15 @@ fn find_ebe_iov_seeded(
         if skip_ode_iov_nm_fallback(model) {
             (false, false)
         } else {
+            let f_partial = obj(&partial);
             let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, &cert);
+            if std::env::var_os("FERX_DEV_TRACE").is_some() {
+                eprintln!(
+                    "DEVTRACE iov_nm id={} ok={ok} f_partial={f_partial:.6e} f_nm={:.6e}",
+                    subject.id,
+                    obj(&best)
+                );
+            }
             x = best;
             (ok, true)
         }
@@ -4002,6 +4031,7 @@ fn find_ebe_iov_seeded(
         let mut seed = vec![0.0; n_flat];
         seed[..n_eta].copy_from_slice(&mu);
         // Certified on stationarity, polish held inside the runaway limit (#1527).
+        crate::devflags::bump(6);
         let (cold, cold_ok) = cert.nelder_mead_recover(&obj, seed, &|p| {
             iov_prior_maha(p, &mu, n_eta, n_kappa, k_occasions, nested, params) <= runaway_limit
         });

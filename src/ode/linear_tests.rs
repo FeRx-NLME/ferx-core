@@ -1343,6 +1343,7 @@ fn random_rhs_matrix(seed: &mut u64, n: usize) -> (Vec<f64>, Vec<f64>) {
 
 #[test]
 fn the_expm_workspace_is_the_pre_expm_kernel_bit_for_bit() {
+    let _pade = PadeOnly::new();
     use crate::sens::vfree::DualF;
     // Gaps at powers of two of each other (shared Padé steps), others that are not, a gap
     // repeated, and the tiny and long ends of a dosing timeline.
@@ -1469,6 +1470,7 @@ fn a_taped_type_recomputes_every_exponential() {
 
 #[test]
 fn a_segment_reuses_the_threads_pade_work_bit_for_bit() {
+    let _pade = PadeOnly::new();
     let pooled = pooled_pade_entries::<f64>;
     let (a, b) = (-0.8, 2.0);
     let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
@@ -1507,6 +1509,7 @@ fn a_segment_reuses_the_threads_pade_work_bit_for_bit() {
 
 #[test]
 fn a_full_pool_entry_count_is_forgotten_at_the_next_segment() {
+    let _pade = PadeOnly::new();
     // Fill the thread's workspace past the bound with segments of distinct generators
     // (none large enough to scale, so each is its own approximant)...
     let run = |k: usize| {
@@ -1529,4 +1532,138 @@ fn a_full_pool_entry_count_is_forgotten_at_the_next_segment() {
         "{} kept",
         pooled_pade_entries::<f64>()
     );
+}
+
+/// Padé only, for the tests of its own machinery (the approximant pool, the workspace): with
+/// the spectral path on, their diagonalisable segments would never reach it.
+struct PadeOnly;
+impl PadeOnly {
+    fn new() -> Self {
+        SPECTRAL_OFF.with(|c| c.set(true));
+        PadeOnly
+    }
+}
+impl Drop for PadeOnly {
+    fn drop(&mut self) {
+        SPECTRAL_OFF.with(|c| c.set(false));
+    }
+}
+
+/// Run `f` with the spectral path on or off, returning its result and how many segments the
+/// spectral path served.
+fn with_spectral<R>(on: bool, f: impl FnOnce() -> R) -> (R, usize) {
+    SPECTRAL_OFF.with(|c| c.set(!on));
+    SPECTRAL_HITS.with(|c| c.set(0));
+    let r = f();
+    let hits = SPECTRAL_HITS.with(|c| c.get());
+    SPECTRAL_OFF.with(|c| c.set(false));
+    (r, hits)
+}
+
+/// The spectral propagation (#2706 follow-up) equals Padé's on a depot + 2-compartment
+/// generator with an infusion, in value, gradient and Hessian, at every saved time: two exact
+/// propagations of one linear system, so the gap is round-off.
+#[test]
+fn spectral_segment_equals_pade_in_values_and_jets() {
+    let base = [1.4, 0.12, 0.35, 0.18, 5.0];
+    let u0 = [100.0, 3.0, 1.0];
+    let saveat = [0.5, 1.0, 2.0, 6.0, 10.0];
+    let p: Vec<Dual2<2>> = base
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| match i {
+            0 => Dual2::<2>::var(v, 0),
+            2 => Dual2::<2>::var(v, 1),
+            _ => Dual2::<2>::from_f64(v),
+        })
+        .collect();
+    let u: Vec<Dual2<2>> = u0.iter().map(|&v| Dual2::<2>::from_f64(v)).collect();
+    let run = || {
+        linear_segment_g(&two_cpt_depot, &u, (0.0, 10.0), &p, &saveat, &[])
+            .unwrap()
+            .0
+    };
+    let (sp, hits) = with_spectral(true, run);
+    let (pade, pade_hits) = with_spectral(false, run);
+    assert!(hits > 0, "the spectral path must have served the segment");
+    assert_eq!(pade_hits, 0);
+    let mut worst = 0.0_f64;
+    let mut gap = |a: f64, b: f64| {
+        assert!(a.is_finite() && b.is_finite(), "{a} vs {b}");
+        worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+    };
+    for (a, b) in sp.iter().zip(&pade) {
+        for (x, y) in a.u.iter().zip(&b.u) {
+            gap(x.value, y.value);
+            for k in 0..2 {
+                gap(x.grad[k], y.grad[k]);
+                for l in 0..2 {
+                    gap(x.hess[k][l], y.hess[k][l]);
+                }
+            }
+        }
+    }
+    // Measured worst 5.9e-14 (values, gradients and Hessians); 1e-12 keeps ~17× headroom.
+    assert!(worst < 1e-12, "spectral vs Padé: worst gap {worst:.2e}");
+}
+
+/// An undrained compartment (a cumulative amount, eigenvalue 0) takes the series for
+/// `(e^{λΔ} − 1)/λ` and still equals Padé.
+#[test]
+fn spectral_handles_a_zero_eigenvalue() {
+    fn absorbed<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = -p[0] * u[0];
+        du[1] = p[0] * u[0] - p[1] * u[1];
+        du[2] = p[1] * u[1];
+    }
+    let p = [0.9, 0.25];
+    let u0 = [50.0, 0.0, 0.0];
+    let saveat = [0.25, 1.0, 4.0, 24.0];
+    let run = || {
+        linear_segment_g::<f64>(&absorbed, &u0, (0.0, 24.0), &p, &saveat, &[])
+            .unwrap()
+            .0
+    };
+    let (sp, hits) = with_spectral(true, run);
+    let (pade, _) = with_spectral(false, run);
+    assert!(hits > 0);
+    for (a, b) in sp.iter().zip(&pade) {
+        for (x, y) in a.u.iter().zip(&b.u) {
+            assert!((x - y).abs() <= 1e-12 * (1.0 + y.abs()), "{x} vs {y}");
+        }
+    }
+}
+
+/// A repeated eigenvalue (a transit chain at one rate, a defective generator) and a complex
+/// pair both decline to Padé, which then gives the answer it always gave.
+#[test]
+fn spectral_declines_repeated_and_complex_spectra() {
+    fn transit<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = -p[0] * u[0];
+        du[1] = p[0] * u[0] - p[0] * u[1];
+        du[2] = p[0] * u[1] - p[0] * u[2];
+    }
+    fn rotation<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = -p[0] * u[0] + p[1] * u[1];
+        du[1] = -p[1] * u[0] - p[0] * u[1];
+    }
+    for (name, n) in [("transit", 3usize), ("rotation", 2)] {
+        let rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]) = match name {
+            "transit" => &transit::<f64>,
+            _ => &rotation::<f64>,
+        };
+        let p = [0.7, 2.0];
+        let u0: Vec<f64> = (0..n).map(|i| 10.0 + i as f64).collect();
+        let run = || {
+            linear_segment_g::<f64>(rhs, &u0, (0.0, 5.0), &p, &[1.0, 5.0], &[])
+                .unwrap()
+                .0
+        };
+        let (on, hits) = with_spectral(true, run);
+        let (off, _) = with_spectral(false, run);
+        assert_eq!(hits, 0, "{name}: the spectral path must decline");
+        for (a, b) in on.iter().zip(&off) {
+            assert_eq!(a.u, b.u, "{name}: a declined segment is Padé's");
+        }
+    }
 }

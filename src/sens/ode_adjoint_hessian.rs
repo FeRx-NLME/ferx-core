@@ -270,6 +270,7 @@ fn cov_hessian(
             hessian_with::<8, 36, DualH<8, 36, R>>(&sc, subject, template, x, objective, sel)
         }
         (4, _) => hessian_with::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective, sel),
+        (6, _) => hessian_with::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective, sel),
         (8, _) => hessian_with::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective, sel),
         (24, _) => hessian_with::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective, sel),
         (48, _) => {
@@ -281,10 +282,11 @@ fn cov_hessian(
     h
 }
 
-/// The Hessian's dispatch widths: its own, shorter ladder (the covariance step runs once per
-/// fit, so padding is cheap while every bucket instantiates the recorders over a nested
-/// dual — a 5- or 6-wide subject pads to 8 rather than carry a bucket of its own).
-const HESSIAN_BUCKETS: [usize; 4] = [4, 8, 24, 48];
+/// The Hessian's dispatch widths: its own, shorter ladder, since every bucket instantiates the
+/// recorders over a nested dual. 6 earns its instantiation: a 5- or 6-effect model (the common
+/// 2-compartment-oral IIV set) padded to 8 carried 36 Hessian-payload lanes for 21, and the
+/// covariance step was a quarter of such a fit (#2706 follow-up).
+const HESSIAN_BUCKETS: [usize; 5] = [4, 6, 8, 24, 48];
 
 /// The exact anchor's Hessian widths. Its inner η-dual carries `Q` as well as `(f, G)`, so
 /// a value is `(1 + K) · (1 + N + N(N+1)/2)` taped scalars (16 bytes): ~2 kB at `N = 4`,
@@ -378,6 +380,7 @@ pub(crate) fn subject_adjoint_eta_dx_at(
     }
     let r = match bucket {
         4 => go::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective),
+        6 => go::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective),
         8 => go::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective),
         24 => go::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective),
         48 => go::<48, 1176, DualT<48, R>>(&sc, subject, template, x, objective),

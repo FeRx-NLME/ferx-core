@@ -558,6 +558,7 @@ pub fn fit(
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
     let mut result = fit_unstamped(model, population, init_params, options)?;
+    crate::devflags::report();
     // Under a derived `iov_occasion` rule the fit overwrites the occasion labels, so
     // the ones the population carries are not part of what it was given (#1685
     // review r1 #1): `run_model_with_data` hands back its population with them set.

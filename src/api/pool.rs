@@ -56,8 +56,15 @@ const DEFAULT_THREADS_CAP: usize = 8;
 /// core count: leave one core free for the OS/other work, and don't scale past
 /// [`DEFAULT_THREADS_CAP`] even on much larger machines, since most fits see no benefit
 /// from spreading across every core and (notably on Apple Silicon) not all cores are equal.
+///
+/// Never fewer than two workers where two cores exist: leaving one free on a two-core host
+/// left a single worker, every fit serial (measured equal to one core on a 2-core
+/// affinity, #2706 follow-up), so the free core bought nothing but half the throughput.
 pub(crate) fn cap_default_threads(available: usize) -> usize {
-    available.saturating_sub(1).clamp(1, DEFAULT_THREADS_CAP)
+    available
+        .saturating_sub(1)
+        .max(available.min(2))
+        .clamp(1, DEFAULT_THREADS_CAP)
 }
 
 /// Default worker-thread count used when nothing pins an explicit count (`threads` unset

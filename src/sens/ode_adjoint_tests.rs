@@ -6886,8 +6886,11 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         // Measured: 3.8e-16 on the explicit and closed-form engines; 1.2e-10 on Rodas5P,
         // where the taped side solves `W` through the vector tape's block LU and the
         // forward side element by element over the dual, and the stiff `W`'s conditioning
-        // amplifies that rounding difference. ~25× and ~9× headroom.
-        let bound = if name.contains("rodas") { 1e-9 } else { 1e-14 };
+        // amplifies that rounding difference. ~25× and ~9× headroom. The linear-ODE
+        // spectral path (#2706 follow-up) moved `additive_four_eta` to 3.8e-14: its validity
+        // check reads the jets, so the two sides may take spectral and Padé respectively,
+        // two exact propagations apart by round-off; 2e-13 keeps ~5× headroom.
+        let bound = if name.contains("rodas") { 1e-9 } else { 2e-13 };
         assert!(worst < bound, "{name}: worst relative difference {worst:e}");
         worst_all = worst_all.max(worst);
     }
