@@ -10787,8 +10787,14 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
                     informed_by_pass.get(&p).copied().unwrap_or(0),
                 )
             })
-            // Only warm passes: one where the informed subject was not multi-started.
-            .filter(|&(_, e, i)| i == 0 && e > 0)
+            // Only the first two passes: the first evaluation (pass 0) and the #2682 warm
+            // re-solve (pass 1). Later passes traverse a trajectory whose cold-re-solve and
+            // verification legs differ by platform (#1688, CI 219 vs local 218 passes), and a
+            // held-modes restore after `reset_to_cold_start` can leave the zero-mode subject
+            // cold while an informed one's nonzero mode survives. That is the cold re-solve
+            // working, not the warm-start fix. The per-pass warm property is pinned directly
+            // by the sibling test `the_fd_stencils_take_an_exactly_zero_mode_as_warm`.
+            .filter(|&(p, e, i)| p.is_some_and(|n| n <= 1) && e > i)
             .collect();
         (
             start,
