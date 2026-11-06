@@ -13,7 +13,7 @@ use crate::sens::num::PkNum;
 /// 1 / sqrt(2)
 const INV_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// 1 / sqrt(2*pi)
-const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
+pub(crate) const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 /// Smallest probability retained before taking `ln`. Prevents `-inf` contamination
 /// of the likelihood when a BLOQ observation lies many SDs above the prediction.
 const MIN_PROB: f64 = 1e-300;
@@ -204,6 +204,44 @@ pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
         T::from_f64(MIN_PROB.ln())
     } else {
         p.ln()
+    }
+}
+
+/// Depth of [`mills_excess`]'s continued fraction. Measured against an 80-digit reference
+/// (#2603): at `t = 2` depth 80 leaves 5e-14 relative and depth 160 nothing; larger `t`
+/// converge faster (depth 40 is exact from `t = 4`).
+const MILLS_CF_DEPTH: usize = 160;
+
+/// `a(t) = 1/R(t) − t` for `t ≥ 2`, where `R(t) = Q(t)/φ(t)` is the Mills ratio of the upper
+/// tail, by the Laplace continued fraction `a = 1/(t + 2/(t + 3/(t + …)))` (#2603).
+///
+/// Every step adds positive terms, so there is no cancellation however large `t` is, and over
+/// a jet type it gives `a`'s derivatives the same way. `1/R = t + a` is the inverse Mills ratio
+/// `φ(−t)/Φ(−t)` of the lower tail; `a ≈ 1/t` is the part of it a direct `φ/Φ − t` loses to
+/// cancellation. Callers take it only for `t ≥ 2`, where [`MILLS_CF_DEPTH`] has converged.
+pub(crate) fn mills_excess<T: PkNum>(t: T) -> T {
+    let mut f = t;
+    for k in (2..=MILLS_CF_DEPTH).rev() {
+        f = t + T::from_f64(k as f64) / f;
+    }
+    T::from_f64(1.0) / f
+}
+
+/// `Φ(x)` accurate in both tails and defined at `±∞` (#2603): the `pnorm` expression function
+/// and the probit link's `P(Y = 1)`. [`normal_cdf`] (incomplete-gamma form, no cancellation in
+/// either tail) down to `x = −37`; below it, `φ(x)/(t + a)` with `t = −x` and `a` the Mills
+/// continued fraction ([`mills_excess`]), so the value keeps its digits into the subnormals and
+/// reaches `0` only when `Φ` itself is below them. Above `x = 38`, `1`: `Φ` rounds to `1` from
+/// about `8.3`, and [`normal_cdf`] is `NaN` at `±∞`, which this maps to `1` / `0`. `NaN`
+/// stays `NaN`.
+pub(crate) fn pnorm(x: f64) -> f64 {
+    if x < -37.0 {
+        let t = -x;
+        (-0.5 * t * t).exp() * INV_SQRT_2PI / (t + mills_excess(t))
+    } else if x > 38.0 {
+        1.0
+    } else {
+        normal_cdf(x)
     }
 }
 

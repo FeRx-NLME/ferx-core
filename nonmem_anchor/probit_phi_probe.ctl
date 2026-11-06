@@ -1,0 +1,11 @@
+$PROBLEM ferx #2603: NONMEM's PHI tabulated at known points (accuracy probe)
+$INPUT ID TIME X DV MDV
+$DATA probit_phi_probe.csv IGNORE=@
+$PRED
+ P = PHI(X)
+ Y = THETA(1) + ETA(1) + EPS(1)
+$THETA 0 FIX
+$OMEGA 0.1 FIX
+$SIGMA 1 FIX
+$ESTIMATION METHOD=0 MAXEVAL=0
+$TABLE ID X P NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE23.16 FILE=probit_phi_probe.tab
