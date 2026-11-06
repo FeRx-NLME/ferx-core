@@ -280,9 +280,8 @@ struct CompiledDoseExpr {
     key: &'static str,
     eval: OdeOutputFn,
     covariates: Vec<String>,
-    /// The subject values it reads: individual parameters, random effects, `MIXNUM`
-    /// (`check_adaptive_dose_expression`'s return).
-    subject_values: Vec<String>,
+    /// What it reads of the subject (`check_adaptive_dose_expression`'s return).
+    reads: crate::parser::model_parser::DoseExprReads,
 }
 
 /// A subject's own values at the first decision, for the dose expressions that read
@@ -316,24 +315,24 @@ impl CompiledDoseExprs {
         out
     }
 
-    /// The subject values the expressions read (individual parameters, random effects,
-    /// `MIXNUM`), each once, with the first key that reads it.
+    /// The subject values the expressions read (individual parameters a draw reaches,
+    /// random effects, `MIXNUM`), each once, with the first key that reads it.
     pub(crate) fn subject_value_reads(&self) -> Vec<(&'static str, &str)> {
-        let mut out: Vec<(&'static str, &str)> = Vec::new();
-        for e in &self.exprs {
-            for n in &e.subject_values {
-                if !out.iter().any(|(_, m)| m == n) {
-                    out.push((e.key, n));
-                }
-            }
-        }
-        out
+        first_reads(&self.exprs, |r| &r.subject_values)
     }
 
     /// Whether any expression reads a subject value, so that a subject may be dosed from
     /// it only when that value is known (or under `dose_knowledge = oracle`).
     pub(crate) fn reads_subject_values(&self) -> bool {
-        self.exprs.iter().any(|e| !e.subject_values.is_empty())
+        self.exprs
+            .iter()
+            .any(|e| !e.reads.subject_values.is_empty())
+    }
+
+    /// Whether any expression reads an individual parameter, a draw-free one included:
+    /// every such read needs the subject's PK at the first decision.
+    pub(crate) fn reads_indiv_params(&self) -> bool {
+        self.exprs.iter().any(|e| !e.reads.indiv_params.is_empty())
     }
 
     /// Evaluate every dose value of `spec` for one subject, from `theta`, the
@@ -343,8 +342,8 @@ impl CompiledDoseExprs {
     /// The parser refuses a state and `TIME` (`check_adaptive_dose_expression`), and
     /// `compile_adaptive` refuses them again on a spec built in code, so the state slice
     /// is zeros that no expression reads. With `subject` absent the PK and η slices are
-    /// zeros too; the caller passes `None` only when [`Self::reads_subject_values`] is
-    /// false.
+    /// zeros too; the caller passes `None` only when [`Self::reads_indiv_params`] and
+    /// [`Self::reads_subject_values`] are both false.
     pub(crate) fn resolve(
         &self,
         spec: &AdaptiveDosingSpec,
@@ -393,10 +392,19 @@ impl CompiledDoseExprs {
                 )
             })
             .collect();
+        // Every individual parameter read, then the random effects and `MIXNUM`.
+        let indiv = first_reads(&self.exprs, |r| &r.indiv_params);
+        let others = self.subject_value_reads();
+        let mut names: Vec<&str> = indiv.into_iter().map(|(_, n)| n).collect();
+        for (_, n) in others {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
         reads.extend(
-            self.subject_value_reads()
+            names
                 .into_iter()
-                .map(|(_, n)| (n.to_string(), subject_value_read(model, pk, eta, n))),
+                .map(|n| (n.to_string(), subject_value_read(model, pk, eta, n))),
         );
         ResolvedDosePlan {
             violation: dose_plan_violation(&plan),
@@ -404,6 +412,22 @@ impl CompiledDoseExprs {
             reads,
         }
     }
+}
+
+/// Each name `pick` lists across `exprs`, once, with the first key that reads it.
+fn first_reads<'a>(
+    exprs: &'a [CompiledDoseExpr],
+    pick: impl Fn(&'a crate::parser::model_parser::DoseExprReads) -> &'a Vec<String>,
+) -> Vec<(&'static str, &'a str)> {
+    let mut out: Vec<(&'static str, &str)> = Vec::new();
+    for e in exprs {
+        for n in pick(&e.reads) {
+            if !out.iter().any(|(_, m)| m == n) {
+                out.push((e.key, n));
+            }
+        }
+    }
+    out
 }
 
 /// The value a dose expression reads for subject value `name` — the slot
@@ -443,7 +467,7 @@ pub(crate) fn compile_dose_exprs(
         .map_or(&[], |o| o.state_names.as_slice());
     let mut exprs = Vec::new();
     for (key, src) in spec.dose_expressions() {
-        let subject_values = crate::parser::model_parser::check_adaptive_dose_expression(
+        let reads = crate::parser::model_parser::check_adaptive_dose_expression(
             src,
             key,
             model,
@@ -473,7 +497,7 @@ pub(crate) fn compile_dose_exprs(
             key,
             eval,
             covariates,
-            subject_values,
+            reads,
         });
     }
     let compiled = CompiledDoseExprs { exprs };

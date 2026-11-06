@@ -230,7 +230,9 @@ pub(crate) fn adaptive_spec(message: impl Into<String>) -> Diagnostic {
 /// `dose_bounds`, `levels`) whose value for one subject breaks a dose invariant — not
 /// finite, negative, a `start_dose` outside the bounds or off the ladder, a rung outside
 /// the bounds, a ladder that does not increase (#944). Checked for every subject before
-/// any subject runs; the message names the subject and the values read.
+/// any subject runs, except an oracle subject (`dose_knowledge = oracle`), checked in each
+/// replicate after its draw; the message names the subject (and that replicate) and the
+/// values read.
 pub(crate) fn adaptive_dose_value(message: impl Into<String>) -> EngineError {
     coded(
         "E_ADAPTIVE_DOSE_VALUE",

@@ -6476,6 +6476,17 @@ impl CompiledModel {
         self.indiv_param_partials.nested_levels.as_ref()
     }
 
+    /// Whether individual parameter `name` depends on a draw — an η or κ, or `MIXNUM`,
+    /// through any intermediate or `if` condition (#944). `true` for every name on a
+    /// hand-built model that never went through the parser (no record of its
+    /// dependencies), so a caller never treats a drawn value as known.
+    pub(crate) fn indiv_param_is_random(&self, name: &str) -> bool {
+        self.indiv_param_partials
+            .random_indiv_params
+            .as_ref()
+            .is_none_or(|r| r.binary_search_by(|n| n.as_str().cmp(name)).is_ok())
+    }
+
     /// The names a `[derived]` expression looks up at evaluation time, other than
     /// its built-ins (`IPRED`, `DV`, `TIME`, …) and earlier `[derived]` columns (#2599).
     /// A covariate overrides an individual parameter or a compartment of the same

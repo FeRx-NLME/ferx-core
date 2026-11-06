@@ -2959,8 +2959,11 @@ fn classify_theta_eta_linked(
 #[derive(Debug, Clone, Default)]
 struct IndivVarDeps {
     thetas: std::collections::BTreeSet<usize>,
+    /// Reads an η or a κ (`[individual_parameters]` parses κ as `Expression::Eta`).
     has_eta: bool,
     reads_time: bool,
+    /// Reads the mixture class `MIXNUM`, which the simulation draws (#944).
+    reads_mixnum: bool,
 }
 
 /// [`IndivVarDeps`] of every variable assigned in `stmts`. An `if`/`else` contributes its
@@ -2977,6 +2980,7 @@ fn indiv_var_deps(
         thetas: HashSet<usize>,
         has_eta: bool,
         reads_time: bool,
+        reads_mixnum: bool,
         vars: HashSet<String>,
     }
     impl Deps {
@@ -2984,6 +2988,7 @@ fn indiv_var_deps(
             self.thetas.extend(other.thetas.iter().copied());
             self.has_eta |= other.has_eta;
             self.reads_time |= other.reads_time;
+            self.reads_mixnum |= other.reads_mixnum;
             self.vars.extend(other.vars.iter().cloned());
         }
     }
@@ -3002,6 +3007,7 @@ fn indiv_var_deps(
             }
             Expression::Eta(_) => d.has_eta = true,
             Expression::Time => d.reads_time = true,
+            Expression::MixNum => d.reads_mixnum = true,
             Expression::Variable(v) => {
                 d.vars.insert(v.clone());
             }
@@ -3060,6 +3066,7 @@ fn indiv_var_deps(
                 out.thetas.extend(d.thetas.iter().copied());
                 out.has_eta |= d.has_eta;
                 out.reads_time |= d.reads_time;
+                out.reads_mixnum |= d.reads_mixnum;
                 stack.extend(d.vars.iter().map(String::as_str));
             }
             (name.clone(), out)
@@ -6156,6 +6163,16 @@ pub fn parse_full_model_with(
     // desugared statements, so `[covariate_model]` thetas are classified too.
     let theta_eta_linked =
         classify_theta_eta_linked(&indiv_stmts, theta_names.len(), &nn_theta_deps);
+    // The individual parameters a draw reaches (#944): an η or κ, or `MIXNUM`, through any
+    // intermediate or `if` condition. Every other one is a function of θ, covariates and
+    // `TIME` alone, so an `[adaptive_dosing]` dose expression may read it for any subject.
+    let mut random_indiv: Vec<String> = indiv_var_deps(&indiv_stmts, &nn_theta_deps)
+        .into_iter()
+        .filter(|(_, d)| d.has_eta || d.reads_mixnum)
+        .map(|(name, _)| name)
+        .collect();
+    random_indiv.sort();
+    indiv_param_partials.random_indiv_params = Some(random_indiv);
     // Which `[odes]` conditions move with an estimated parameter (#2649). Needs the same
     // desugared statements, so the dependencies a condition's parameters carry are complete.
     if let Some(program) = ode_spec.as_mut().and_then(|o| o.rhs_program.as_mut()) {
@@ -6576,6 +6593,7 @@ pub fn parse_full_model_with(
                 spec.at[0],
                 spec.dose_knowledge,
             )?
+            .subject_values
             .is_empty();
         }
         check_dose_knowledge_used(spec.dose_knowledge, reads_truth)?;
@@ -13913,12 +13931,16 @@ fn warn_if_time_alias_folds(
 /// `compile_dose_exprs` runs it again on a spec built in code. A syntax error is
 /// reported with the key as its context.
 ///
-/// Returns the names of the individual parameters and random effects the expression
-/// reads (and `MIXNUM`), in first-read order: whether each subject may read them depends
-/// on whether its η are supplied, so that is decided before the run, per subject
-/// (`E_ADAPTIVE_DOSE_KNOWLEDGE`), not here. `MIXNUM` is refused here unless `knowledge`
-/// is [`DoseKnowledge::Oracle`]: supplied η refuse a `[mixture]` model, so no subject's
-/// class is ever known.
+/// Returns what the expression reads of the subject, in first-read order
+/// ([`DoseExprReads`]): the individual parameters, all of which need the subject's PK at
+/// the first decision, and among them and the random effects the **subject values** — an
+/// individual parameter a draw reaches (an η, a κ or `MIXNUM`; `random_indiv_params`), a
+/// random effect, `MIXNUM`. Whether a subject may read a subject value depends on whether
+/// its η are supplied, so that is decided before the run, per subject
+/// (`E_ADAPTIVE_DOSE_KNOWLEDGE`), not here. An individual parameter no draw reaches
+/// (`TVCLW = TVCL * (WT / 70)`) is known for every subject. `MIXNUM` is refused here
+/// unless `knowledge` is [`DoseKnowledge::Oracle`]: supplied η refuse a `[mixture]` model,
+/// so no subject's class is ever known.
 pub(crate) fn check_adaptive_dose_expression(
     src: &str,
     key: &str,
@@ -13926,7 +13948,7 @@ pub(crate) fn check_adaptive_dose_expression(
     declared_covariates: &[String],
     at0: f64,
     knowledge: DoseKnowledge,
-) -> Result<Vec<String>, String> {
+) -> Result<DoseExprReads, String> {
     let ctx = ParseCtx::new(
         &model.theta_names,
         &model.eta_names,
@@ -13953,10 +13975,10 @@ pub(crate) fn check_adaptive_dose_expression(
         .as_ref()
         .map_or(&[], |o| o.state_names.as_slice());
     let mut refusal: Option<String> = None;
-    let mut reads: Vec<String> = Vec::new();
-    let mut read = |n: &str| {
-        if !reads.iter().any(|r| r == n) {
-            reads.push(n.to_string());
+    let mut reads = DoseExprReads::default();
+    let push = |v: &mut Vec<String>, n: &str| {
+        if !v.iter().any(|r| r == n) {
+            v.push(n.to_string());
         }
     };
     visit_expr_nodes(&expr, &mut |e: &Expression| {
@@ -13972,8 +13994,16 @@ pub(crate) fn check_adaptive_dose_expression(
                      write a `when signal …` rule."
                 ));
             }
-            Expression::Variable(n) => read(n),
-            Expression::Eta(i) => read(model.eta_names.get(*i).map_or("an η", String::as_str)),
+            Expression::Variable(n) => {
+                push(&mut reads.indiv_params, n);
+                if model.indiv_param_is_random(n) {
+                    push(&mut reads.subject_values, n);
+                }
+            }
+            Expression::Eta(i) => push(
+                &mut reads.subject_values,
+                model.eta_names.get(*i).map_or("an η", String::as_str),
+            ),
             Expression::MixNum if knowledge != DoseKnowledge::Oracle => {
                 refusal = Some(
                     "MIXNUM, the subject's mixture class, which the simulation draws; no \
@@ -13983,7 +14013,7 @@ pub(crate) fn check_adaptive_dose_expression(
                         .to_string(),
                 );
             }
-            Expression::MixNum => read("MIXNUM"),
+            Expression::MixNum => push(&mut reads.subject_values, "MIXNUM"),
             _ => {}
         }
     });
@@ -13991,6 +14021,17 @@ pub(crate) fn check_adaptive_dose_expression(
         Some(what) => Err(format!("[adaptive_dosing] {key} reads {what}")),
         None => Ok(reads),
     }
+}
+
+/// What one `[adaptive_dosing]` dose expression reads of the subject (#944), each name
+/// once, in first-read order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct DoseExprReads {
+    /// Every individual parameter read: each needs the subject's PK at the first decision.
+    pub(crate) indiv_params: Vec<String>,
+    /// The reads a draw reaches — individual parameters with an η, κ or `MIXNUM` upstream,
+    /// random effects, `MIXNUM` — known only for a subject whose η are supplied.
+    pub(crate) subject_values: Vec<String>,
 }
 
 /// `dose_knowledge = oracle` must have something to apply to (#944): a block whose dose
@@ -34663,6 +34704,11 @@ pub struct IndivParamPartials {
     /// all public, so recording it does not break a downstream struct literal.
     /// Empty without a `[derived]` block, and for hand-built fixtures.
     pub(crate) derived_reads: Vec<String>,
+    /// The individual parameters whose value depends on a draw — an η or κ, or `MIXNUM`,
+    /// through any intermediate or `if` condition (#944) — sorted. `None` for a hand-built
+    /// fixture that never went through the parser, which every consumer treats as "every
+    /// individual parameter is random" (the conservative answer).
+    pub(crate) random_indiv_params: Option<Vec<String>>,
     /// The thetas the adjoint gradient reads off the η-derivatives instead of taping
     /// (#2706, [`detect_theta_channels`]). `None` when no theta qualifies, and for
     /// hand-built fixtures.
@@ -34692,6 +34738,7 @@ impl IndivParamPartials {
             nested_levels: None,
             mu_ref_owners: std::collections::BTreeMap::new(),
             derived_reads: Vec::new(),
+            random_indiv_params: None,
             theta_channels: None,
         }
     }
@@ -34767,6 +34814,7 @@ fn build_indiv_param_partials(
         mu_ref_owners: std::collections::BTreeMap::new(),
         derived_reads: Vec::new(),
         theta_channels: None,
+        random_indiv_params: None,
     }
 }
 

@@ -137,7 +137,8 @@ it is the subject's first value of each covariate, as in the driver. The resulti
 start dose, bounds and ladder then work exactly as the numbers would: rules step from
 that start dose and clamp to those bounds.
 
-Every subject's values are checked before any subject is simulated, with the same
+Every subject's values are checked before any subject is simulated (except an oracle
+subject, checked in each replicate after its draw; see [Which subjects' values are known](#which-subjects-values-are-known)), with the same
 rules as the numbers: finite and `>= 0`, `low <= high`, the start dose inside the
 bounds (and on the ladder, with `levels`), every rung inside the bounds, and the ladder
 strictly increasing. The first subject that fails is refused with
@@ -161,7 +162,8 @@ A covariate the data lack is refused when the run starts, with
 |---|---|---|
 | A number, θ | yes | The same for every subject. |
 | A data covariate | yes | Known when the dose is written. Read at `at[0]`. |
-| An individual parameter (`CL`) or a random effect (`ETA_CL`) | for a supplied subject; for a drawn one only under `dose_knowledge = oracle` | Known at dosing time only when the subject's η come from input; see [Which subjects' values are known](#which-subjects-values-are-known). |
+| An individual parameter that no random effect reaches (`TVCLW = TVCL * (WT / 70)`) | yes | A function of θ, covariates and `TIME` alone, so known for every subject. Read at `at[0]`. |
+| An individual parameter that a random effect reaches (`CL = TVCLW * exp(ETA_CL)`, or any parameter computed from one), or a random effect (`ETA_CL`) | for a supplied subject; for a drawn one only under `dose_knowledge = oracle` | Known at dosing time only when the subject's η come from input; see [Which subjects' values are known](#which-subjects-values-are-known). A parameter counts as reached when an η, a κ or `MIXNUM` enters it through any intermediate or `if` condition. |
 | A state (`CENT`) | no | The expression runs once; to follow the drug level, write a `when signal …` rule. |
 | `TIME` (or `T`) | no | It would always be `at[0]`; write the value. |
 | A κ (IOV) | no | Drawn for each occasion, so never known at dosing time. Read the individual parameter instead: a supplied subject reads it at κ = 0. |
@@ -194,9 +196,9 @@ The refusal names the three routes to a dose computed from an individual value:
 of 1 of 2 subject(s) are drawn by the simulation ('2'), so CL is the simulated truth,
 which no prescriber knows at dosing time. To dose from it: carry the known value as a
 data column (e.g. CL_KNOWN) and read that; supply each subject's random effects (e.g. a
-previous fit's estimates, as `etas` in R or `AdaptiveInputs::with_etas` in Rust); or set
-dose_knowledge = oracle for a perfect-information comparison arm, which is flagged in
-the results.
+previous fit's estimates, as `etas` in R, or through `AdaptiveInputs::with_etas` and
+`simulate_adaptive_from_spec_with_inputs` in Rust); or set dose_knowledge = oracle for a
+perfect-information comparison arm, which is flagged in the results.
 ```
 
 The individual parameters are evaluated at the first decision: at the covariates in
@@ -209,19 +211,20 @@ oracle's κ and the κ its first trough reflects can differ.
 
 **The oracle is never silent.** `dose_knowledge = oracle` is a perfect-information
 comparison arm, a standard benchmark in model-informed dosing studies. Each subject
-dosed from its drawn values has `AdaptiveSubjectMetrics::dose_oracle = true` (the
-`DOSE_ORACLE` metrics column in R), and the run warns:
+dosed from its drawn values has `dose_oracle = true` in its metrics
+(`AdaptiveSubjectMetrics::dose_oracle` in Rust), and the run warns:
 
 ```
 W_ADAPTIVE_DOSE_ORACLE: 1 of 2 subject(s) were dosed from their simulated individual
 values (dose_knowledge = oracle; start_dose reads CL). This is a perfect-information
-arm: no prescriber has these values. The per-subject flag is the metrics column
-dose_oracle.
+arm: no prescriber has these values. Each such subject's metrics have dose_oracle =
+true.
 ```
 
 A run in which every subject is supplied doses no subject from its drawn values, so it
 flags none and does not warn. A block whose dose expressions read no individual
-parameter, random effect or `MIXNUM` has nothing for the oracle to apply to, so
+parameter that a random effect reaches, no random effect and no `MIXNUM` has nothing for
+the oracle to apply to, so
 `dose_knowledge = oracle` there is refused when the model is parsed.
 
 **Supplied values are taken as exact.** A supplied subject's η are both its simulated

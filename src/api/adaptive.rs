@@ -525,8 +525,10 @@ impl AdaptiveEntry {
 /// simulated: the first whose plan breaks an invariant is refused
 /// (`E_ADAPTIVE_DOSE_VALUE`). A block of numbers gives every subject the same plan.
 ///
-/// When an expression reads a subject's own values (an individual parameter, a random
-/// effect), the knowledge rule decides per subject. A subject whose η are supplied
+/// An individual parameter that no draw reaches (no η, κ or `MIXNUM` upstream) is known for
+/// every subject and is evaluated at η = 0, where it is exact. When an expression reads a
+/// subject's own values (an individual parameter a draw reaches, a random effect), the
+/// knowledge rule decides per subject. A subject whose η are supplied
 /// reads its supplied η, with κ = 0: κ is drawn per occasion, so it is never known. A
 /// drawn subject's values are the simulation's truth, so under `dose_knowledge = known`
 /// the run is refused, naming the drawn subjects (`E_ADAPTIVE_DOSE_KNOWLEDGE`); under
@@ -544,6 +546,7 @@ fn resolve_dose_plans(
         return Ok(vec![Some(plan); population.subjects.len()]);
     }
     let reads_values = exprs.reads_subject_values();
+    let reads_pk = exprs.reads_indiv_params();
     if reads_values && spec.dose_knowledge == crate::sim::adaptive::DoseKnowledge::Known {
         let drawn: Vec<&str> = population
             .subjects
@@ -566,15 +569,19 @@ fn resolve_dose_plans(
         .iter()
         .zip(supplied)
         .map(|(subject, eta)| {
+            let n_full = model.n_eta + model.n_kappa;
             let values = match (reads_values, eta) {
-                (false, _) => None,
-                (true, Some(eta)) => {
-                    let mut e = eta.clone();
-                    e.resize(model.n_eta + model.n_kappa, 0.0);
-                    Some(e)
-                }
                 // Drawn, under `oracle` (a `known` run was refused above).
                 (true, None) => return Ok(None),
+                (true, Some(eta)) => {
+                    let mut e = eta.clone();
+                    e.resize(n_full, 0.0);
+                    Some(e)
+                }
+                // Only individual parameters no draw reaches (`TVCLW = TVCL * (WT / 70)`):
+                // exact at η = 0, so the same for every subject, supplied or drawn.
+                (false, _) if reads_pk => Some(vec![0.0; n_full]),
+                (false, _) => None,
             };
             subject_dose_plan(
                 model,
@@ -652,8 +659,9 @@ fn oracle_dose_plan(
 }
 
 /// `E_ADAPTIVE_DOSE_KNOWLEDGE` (#944): a dose expression reads a subject value and
-/// these subjects' η are drawn, under `dose_knowledge = known`. Names the first key and
-/// value read, and the drawn subjects only — a supplied subject may read it.
+/// these subjects' η are drawn, under `dose_knowledge = known`. Names every key and value
+/// read, so a block is not refused one read at a time, and the drawn subjects only — a
+/// supplied subject may read them.
 fn dose_knowledge_refusal(
     model: &CompiledModel,
     exprs: &crate::sim::adaptive_control::CompiledDoseExprs,
@@ -661,20 +669,44 @@ fn dose_knowledge_refusal(
     n_subjects: usize,
 ) -> EngineError {
     let reads = exprs.subject_value_reads();
-    let (key, name) = reads[0];
-    let kind = if model.eta_names.iter().any(|n| n == name) {
-        "a random effect"
+    let kind = |name: &str| {
+        if model.eta_names.iter().any(|n| n == name) {
+            "a random effect"
+        } else {
+            "an individual parameter"
+        }
+    };
+    let what = reads
+        .iter()
+        .map(|(key, name)| format!("{key} reads {name}, {}", kind(name)))
+        .collect::<Vec<_>>()
+        .join(", and ");
+    let first = reads[0].1;
+    let (truth, it, value, column, those) = if reads.len() == 1 {
+        (
+            format!("{first} is"),
+            "it",
+            "the known value",
+            "a data column",
+            "that",
+        )
     } else {
-        "an individual parameter"
+        (
+            "these are".to_string(),
+            "them",
+            "the known values",
+            "data columns",
+            "those",
+        )
     };
     super::entry_refusals::adaptive_dose_knowledge(format!(
-        "[adaptive_dosing] {key} reads {name}, {kind}, but the random effects of {} of \
-         {n_subjects} subject(s) are drawn by the simulation ({}), so {name} is the \
-         simulated truth, which no prescriber knows at dosing time. To dose from it: carry \
-         the known value as a data column (e.g. {name}_KNOWN) and read that; supply each \
-         subject's random effects (e.g. a previous fit's estimates, as `etas` in R or \
-         `AdaptiveInputs::with_etas` in Rust); or set dose_knowledge = oracle for a \
-         perfect-information comparison arm, which is flagged in the results.",
+        "[adaptive_dosing] {what}, but the random effects of {} of {n_subjects} subject(s) \
+         are drawn by the simulation ({}), so {truth} the simulated truth, which no \
+         prescriber knows at dosing time. To dose from {it}: carry {value} as {column} \
+         (e.g. {first}_KNOWN) and read {those}; supply each subject's random effects (e.g. \
+         a previous fit's estimates, as `etas` in R, or through `AdaptiveInputs::with_etas` \
+         and `simulate_adaptive_from_spec_with_inputs` in Rust); or set dose_knowledge = \
+         oracle for a perfect-information comparison arm, which is flagged in the results.",
         drawn.len(),
         super::adaptive_inputs::list_ids(drawn),
     ))
@@ -700,8 +732,8 @@ fn dose_oracle_warning(
     Some(format!(
         "W_ADAPTIVE_DOSE_ORACLE: {n_oracle} of {n_subjects} subject(s) were dosed from their \
          simulated individual values (dose_knowledge = oracle; {reads}). This is a \
-         perfect-information arm: no prescriber has these values. The per-subject flag is \
-         the metrics column dose_oracle."
+         perfect-information arm: no prescriber has these values. Each such subject's \
+         metrics have dose_oracle = true."
     ))
 }
 

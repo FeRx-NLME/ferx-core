@@ -110,6 +110,28 @@ fn run(
     simulate_adaptive_from_spec_with_inputs(&p.model, population, &inputs, n_sim, spec, &opts)
 }
 
+/// Run with every subject drawn, through the entry point that takes no supplied η (a
+/// `[mixture]` model refuses a supplied-η table, even an empty one).
+fn run_drawn(
+    p: &ParsedModel,
+    population: &Population,
+    n_sim: usize,
+) -> Result<AdaptiveSimulationResult, EngineError> {
+    let spec = p.adaptive_dosing.as_ref().expect("block present");
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(17),
+        ..Default::default()
+    };
+    simulate_adaptive_from_spec(
+        &p.model,
+        population,
+        &p.model.default_params,
+        n_sim,
+        spec,
+        &opts,
+    )
+}
+
 fn first_dose(r: &AdaptiveSimulationResult, id: &str, sim: usize) -> f64 {
     r.ledger
         .iter()
@@ -129,9 +151,10 @@ const K1_CL: &str = "[adaptive_dosing] start_dose reads CL, an individual parame
     the random effects of 1 of 2 subject(s) are drawn by the simulation ('2'), so CL is the \
     simulated truth, which no prescriber knows at dosing time. To dose from it: carry the \
     known value as a data column (e.g. CL_KNOWN) and read that; supply each subject's \
-    random effects (e.g. a previous fit's estimates, as `etas` in R or \
-    `AdaptiveInputs::with_etas` in Rust); or set dose_knowledge = oracle for a \
-    perfect-information comparison arm, which is flagged in the results.";
+    random effects (e.g. a previous fit's estimates, as `etas` in R, or through \
+    `AdaptiveInputs::with_etas` and `simulate_adaptive_from_spec_with_inputs` in Rust); or \
+    set dose_knowledge = oracle for a perfect-information comparison arm, which is flagged \
+    in the results.";
 
 // ── The straddle: supplied may read, drawn may not ────────────────────────────────
 
@@ -232,8 +255,8 @@ fn an_oracle_run_flags_each_drawn_subject_and_warns_once() {
         [
             &"W_ADAPTIVE_DOSE_ORACLE: 1 of 2 subject(s) were dosed from their simulated \
            individual values (dose_knowledge = oracle; start_dose reads CL). This is a \
-           perfect-information arm: no prescriber has these values. The per-subject flag \
-           is the metrics column dose_oracle."
+           perfect-information arm: no prescriber has these values. Each such subject's \
+           metrics have dose_oracle = true."
                 .to_string()
         ]
     );
@@ -247,6 +270,19 @@ fn an_oracle_run_flags_each_drawn_subject_and_warns_once() {
     }
     let (d1, d2) = (first_dose(&r, "2", 1), first_dose(&r, "2", 2));
     let typical = dose_400_cl(50.0, 0.0);
+    // The dose is 400 · the CL the subject is simulated under (no IOV, so one CL over the
+    // whole run), backed out of its trough at 24 outside the engine (one bolus, no rule
+    // fires). Worst relative gap measured on macOS arm64: 5.3e-16; bound 1e-12.
+    for sim in [1, 2] {
+        let d0 = first_dose(&r, "2", sim);
+        let cl = backed_out_cl(&r, "2", sim, TVV * 50.0);
+        let gap = ((d0 - 400.0 * cl) / (400.0 * cl)).abs();
+        assert!(
+            gap < 1e-12,
+            "replicate {sim}: dose {d0} vs 400·CL {} ({gap:e})",
+            400.0 * cl
+        );
+    }
     assert!(
         d1 != d2,
         "the oracle reads each replicate's draw: {d1} {d2}"
@@ -265,6 +301,22 @@ fn an_oracle_run_flags_each_drawn_subject_and_warns_once() {
         "{:?}",
         r.warnings
     );
+}
+
+/// The CL a subject ran under over `(0, 24]`, backed out of the trough at decision 24
+/// outside the engine: one bolus `d₀` at 0 into a 1-cpt model with volume `v`, no rule
+/// firing, so `C(24) = d₀/V · exp(−CL/V · 24)` and `CL = −V/24 · ln(C·V/d₀)`.
+fn backed_out_cl(r: &AdaptiveSimulationResult, id: &str, sim: usize, v: f64) -> f64 {
+    let d0 = first_dose(r, id, sim);
+    let c = r
+        .decisions
+        .iter()
+        .find(|d| d.subject == id && d.sim == sim && d.time == 24.0)
+        .expect("decision at 24")
+        .observed_signals[0]
+        .value;
+    assert!(c.is_finite() && c > 0.0, "{id} sim {sim}: trough {c}");
+    -v / 24.0 * (c * v / d0).ln()
 }
 
 // ── IOV: κ = 0 for a supplied subject, κ₀ for an oracle one ───────────────────────
@@ -579,5 +631,207 @@ fn a_hand_built_oracle_spec_reading_no_subject_value_is_refused() {
         e.message(),
         "[adaptive_dosing] dose_knowledge = oracle has no effect: no dose expression reads \
          an individual parameter, a random effect or MIXNUM."
+    );
+}
+
+// ── An individual parameter no draw reaches is known for every subject (review r1 S1) ──
+
+/// [`model`] with a typical value spelled as its own individual parameter, and one that
+/// reaches η only through an intermediate.
+fn model_tv(block: &str) -> ParsedModel {
+    parse_full_model(&model_tv_src(block)).expect("model parses")
+}
+
+fn model_tv_src(block: &str) -> String {
+    format!(
+        "[parameters]
+  theta TVCL({TVCL}, 0.1, 50.0)
+  theta TVV({TVV}, 0.05, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 1.0
+[individual_parameters]
+  TVCLW = TVCL * (WT / 70)
+  CL = TVCLW * exp(ETA_CL)
+  CL2 = 2 * CL
+  V  = TVV * WT
+[structural_model]
+  ode(states=[CENT])
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT
+[scaling]
+  y = CENT / V
+[error_model]
+  DV ~ additive(ADD)
+[adaptive_dosing]
+{block}"
+    )
+}
+
+/// `TVCLW = TVCL * (WT / 70)` depends on θ and a covariate only, so every subject knows
+/// it: with both subjects drawn under `known`, `400 * TVCLW` runs, doses
+/// `400 · TVCL · WT/70` to the bit, flags no subject and does not warn. On the same model
+/// and population, `400 * CL` (η directly) and `400 * CL2` (η only through `CL`) are
+/// refused, and under `oracle` a block reading only `TVCLW` is C4 (nothing for the oracle
+/// to apply to).
+///
+/// Mutations: every individual parameter classed as a subject value by name (the
+/// `TVCLW` run is refused, and its oracle block passes C4 and flags every subject); the
+/// classification not transitive (`CL2` let through, dosed from the draw); a draw-free
+/// read evaluated with no PK (`TVCLW` reads 0, a 0 mg hold).
+#[test]
+fn a_typical_value_parameter_is_known_for_every_subject() {
+    let population = pop(&csv(&[("1", 70.0), ("2", 50.0)]));
+    let p = model_tv(&block("400 * TVCLW", ""));
+    let r = run(&p, &population, &[], 1).expect("TVCLW is known for drawn subjects");
+    for (id, wt) in [("1", 70.0), ("2", 50.0)] {
+        let want = 400.0 * (TVCL * (wt / 70.0));
+        assert_eq!(
+            first_dose(&r, id, 1).to_bits(),
+            want.to_bits(),
+            "subject {id}"
+        );
+    }
+    assert!(r.metrics.iter().all(|m| !m.dose_oracle && !m.eta_supplied));
+    assert!(!r
+        .warnings
+        .iter()
+        .any(|w| w.starts_with("W_ADAPTIVE_DOSE_ORACLE")));
+
+    for (expr, name) in [("400 * CL", "CL"), ("400 * CL2", "CL2")] {
+        let p = model_tv(&block(expr, ""));
+        let e = run(&p, &population, &[], 1).expect_err("drawn");
+        assert_eq!(e.code(), Some("E_ADAPTIVE_DOSE_KNOWLEDGE"), "{expr}: {e}");
+        assert!(
+            e.message().starts_with(&format!(
+                "[adaptive_dosing] start_dose reads {name}, an individual parameter, but"
+            )),
+            "{expr}: {e}"
+        );
+    }
+
+    let err = match parse_full_model(&model_tv_src(&block(
+        "400 * TVCLW",
+        "  dose_knowledge = oracle\n",
+    ))) {
+        Ok(_) => panic!("an oracle reading only TVCLW is refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.ends_with(
+            "[adaptive_dosing] dose_knowledge = oracle has no effect: no dose expression \
+             reads an individual parameter, a random effect or MIXNUM."
+        ),
+        "{err}"
+    );
+}
+
+/// Two subject values read under different keys: the refusal names both, with the
+/// plural wording, so the block is not refused one read at a time.
+///
+/// Mutation: the refusal built from `reads[0]` (or `reads.last()`) alone.
+#[test]
+fn a_knowledge_refusal_names_every_read() {
+    let b = block("400 * CL", "").replace(
+        "dose_bounds = [0, 4000]",
+        "dose_bounds = [0, 4000 * exp(ETA_CL)]",
+    );
+    let p = model(false, &b);
+    let e = run(&p, &pop(&csv(&[("1", 70.0), ("2", 50.0)])), &[], 1).expect_err("drawn");
+    assert_eq!(e.code(), Some("E_ADAPTIVE_DOSE_KNOWLEDGE"), "{e}");
+    assert_eq!(
+        e.message(),
+        "[adaptive_dosing] start_dose reads CL, an individual parameter, and dose_bounds \
+         reads ETA_CL, a random effect, but the random effects of 2 of 2 subject(s) are \
+         drawn by the simulation ('1', '2'), so these are the simulated truth, which no \
+         prescriber knows at dosing time. To dose from them: carry the known values as data \
+         columns (e.g. CL_KNOWN) and read those; supply each subject's random effects (e.g. \
+         a previous fit's estimates, as `etas` in R, or through `AdaptiveInputs::with_etas` \
+         and `simulate_adaptive_from_spec_with_inputs` in Rust); or set dose_knowledge = \
+         oracle for a perfect-information comparison arm, which is flagged in the results."
+    );
+}
+
+// ── MIXNUM under the oracle, at run time (review r1 S2) ──────────────────────────────
+
+/// A two-class `[mixture]` model: class 2 clears 4× faster. `CLM` reaches the draw only
+/// through `MIXNUM` (no η).
+fn mixture_model(block: &str) -> ParsedModel {
+    parse_full_model(&format!(
+        "[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta MIXL(0.0, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL * exp(ETA_CL) else 4 * TVCL * exp(ETA_CL)
+  CLM = if (MIXNUM == 1) TVCL else 4 * TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[CENT])
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT
+[scaling]
+  y = CENT / V
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+{block}"
+    ))
+    .expect("model parses")
+}
+
+/// `start_dose = 100 * MIXNUM` under the oracle: each subject is dosed from the class it is
+/// simulated under. The class is read back outside the engine from the CL backed out of the
+/// trough (class 1 CL ≈ 5, class 2 ≈ 20 with ω² = 0.09; the threshold 10 sits between
+/// them), and both classes occur. Under `known`, `100 * CLM` — reaching the draw only
+/// through `MIXNUM` — is refused. A dose value refusal that reads `MIXNUM` names its value.
+///
+/// Mutations: the controller built outside the class guard (every subject dosed as class
+/// 1); `MIXNUM` not counted as a draw (`CLM` let through); the `MIXNUM` arm of the reads
+/// sentence reporting another value.
+#[test]
+fn an_oracle_reads_the_mixture_class_the_subject_is_simulated_under() {
+    let ids: Vec<(String, f64)> = (1..=6).map(|i| (i.to_string(), 70.0)).collect();
+    let ids: Vec<(&str, f64)> = ids.iter().map(|(i, w)| (i.as_str(), *w)).collect();
+    let population = pop(&csv(&ids));
+    let b = block("100 * MIXNUM", "  dose_knowledge = oracle\n");
+    let p = mixture_model(&b);
+    let r = run_drawn(&p, &population, 2).expect("oracle runs");
+    let mut seen = [false, false];
+    for (id, _) in &ids {
+        for sim in [1, 2] {
+            let d0 = first_dose(&r, id, sim);
+            let cl = backed_out_cl(&r, id, sim, 50.0);
+            let class = if cl > 10.0 { 2 } else { 1 };
+            assert_eq!(d0, 100.0 * class as f64, "subject {id} sim {sim}: CL {cl}");
+            seen[class - 1] = true;
+        }
+    }
+    assert_eq!(seen, [true, true], "both classes occur");
+    assert!(r.metrics.iter().all(|m| m.dose_oracle));
+
+    let p = mixture_model(&block("100 * CLM", ""));
+    let e = run_drawn(&p, &population, 1).expect_err("CLM reaches the draw through MIXNUM");
+    assert_eq!(e.code(), Some("E_ADAPTIVE_DOSE_KNOWLEDGE"), "{e}");
+    assert!(
+        e.message()
+            .starts_with("[adaptive_dosing] start_dose reads CLM, an individual parameter, but"),
+        "{e}"
+    );
+
+    let b = block("100 * MIXNUM", "  dose_knowledge = oracle\n").replace("[0, 4000]", "[0, 150]");
+    let e = run_drawn(&mixture_model(&b), &population, 1).expect_err("class 2 doses 200");
+    assert_eq!(e.code(), Some("E_ADAPTIVE_DOSE_VALUE"), "{e}");
+    let msg = e.message();
+    let tail = ", replicate 1: start_dose = 100 * MIXNUM evaluates to 200, outside \
+                dose_bounds = [0, 150], which evaluate to [0, 150]. The dose expressions \
+                read MIXNUM = 2, at the first decision (t = 0).";
+    assert!(
+        msg.starts_with("[adaptive_dosing] subject ") && msg.ends_with(tail),
+        "{msg}"
     );
 }
