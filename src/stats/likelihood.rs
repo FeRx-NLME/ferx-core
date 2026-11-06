@@ -5595,6 +5595,73 @@ mod tests {
         }
     }
 
+    /// #2762, the M3 callers of `log_normal_cdf`: a censored row whose limit lies so far on
+    /// the certain side that `z = (limit − f)/sd` passes `|z| ≈ 1.9e154` (where `normal_cdf`
+    /// squares it to `+∞`) scored a `NaN` term — measured end to end on
+    /// `examples/warfarin_bloq.ferx` at `3cd15863`: `LLOQ = 1e300` (CENS=1) or `ULOQ = −1e300`
+    /// (CENS=−1) on one row took the objective to the 2e20 divergence sentinel ("censored (M3)
+    /// term = NaN"). Its probability is 1, so the term is `0` — the same `0` a limit of `±1e6`
+    /// already scores, where `Φ` rounds to `1` without reaching the gate. Through the three
+    /// Gaussian objectives (conditional, FOCE and FOCEI marginals), the far limit must score
+    /// bit-for-bit as the near one.
+    #[test]
+    fn a_censored_limit_past_the_normal_cdf_overflow_scores_as_certain() {
+        // Straddle: for any row sd from the variance floor's √1e-12 to 1e3, the near limit
+        // keeps |z| ≤ 1e12 (ungated) and the far one |z| ≥ 1e297 (gated).
+        let gate = 1.9e154;
+        for sd in [1e-6, 1e3] {
+            assert!(1e6 / sd < gate && (1e300 - 1e3) / sd > gate, "sd {sd}");
+        }
+        let theta = [5.0, 50.0];
+        let eta = [0.1];
+        let omega = make_omega(0.09);
+        let sigma = [0.2];
+        let setup = |limit: f64, flag: i8| {
+            let mut model = make_model();
+            model.bloq_method = BloqMethod::M3;
+            let mut subject = make_simple_subject();
+            subject.observations[5] = limit;
+            subject.cens[5] = flag;
+            (model, subject)
+        };
+        let conditional = |limit: f64, flag: i8| {
+            let (model, subject) = setup(limit, flag);
+            individual_nll(&model, &subject, &theta, &eta, &omega, &sigma)
+        };
+        let marginal = |limit: f64, flag: i8, interaction: bool| {
+            let (model, subject) = setup(limit, flag);
+            let eta_hat = DVector::from_vec(eta.to_vec());
+            let h = DMatrix::from_element(subject.obs_times.len(), 1, 4.0);
+            foce_subject_nll(
+                &model,
+                &subject,
+                &theta,
+                &eta_hat,
+                &h,
+                &omega,
+                &sigma,
+                &[],
+                interaction,
+            )
+        };
+        let objectives: [(&str, &dyn Fn(f64, i8) -> f64); 3] = [
+            ("individual_nll", &conditional),
+            ("FOCE", &|l: f64, c: i8| marginal(l, c, false)),
+            ("FOCEI", &|l: f64, c: i8| marginal(l, c, true)),
+        ];
+        for (name, nll) in objectives {
+            for (far, near, flag) in [(1e300, 1e6, 1), (-1e300, -1e6, -1)] {
+                let (got, want) = (nll(far, flag), nll(near, flag));
+                assert!(want.is_finite(), "{name}: control at {near:e}, CENS={flag}");
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{name}: limit {far:e} (CENS={flag}) scored {got}, the certain row {want}"
+                );
+            }
+        }
+    }
+
     /// #1496: the two claims `W_CENS_UNEXPECTED` makes about the objective, checked
     /// against the objective rather than restated. Under `m3` an out-of-domain flag
     /// scores as its sign's code (`7` as `1`, `-2` as `-1`); under `drop` any flag
