@@ -866,9 +866,14 @@ fn fit_unstamped(
     drop(ode_solver_override);
     drop(bloq_override);
 
+    // What the estimators score: the records up to each subject's last scored one (#2778).
+    // Everything above ran on every record. `pop_ref` stays for the outputs reading past it.
+    let scored = crate::api::scored_population(model, std::borrow::Cow::Borrowed(pop_ref));
+    let scored_ref: &Population = &scored;
+
     // Single-start fast path (default)
     if options.n_starts <= 1 {
-        let run = || fit_inner(model, pop_ref, init_params, options);
+        let run = || fit_inner(model, scored_ref, pop_ref, init_params, options);
         // A pinned positive `threads` builds a fit-scoped pool sized to it (and surfaces a
         // build failure as `Err`, as before). The unpinned default reuses the shared
         // big-stack pool; if that one-time build ever failed we run on the ambient pool
@@ -941,7 +946,7 @@ fn fit_unstamped(
                     };
                     &opts_k_storage
                 };
-                (k, fit_inner(model, pop_ref, &init_k, opts_ref))
+                (k, fit_inner(model, scored_ref, pop_ref, &init_k, opts_ref))
             })
             .collect()
     };
@@ -1198,9 +1203,13 @@ fn release_worker_tapes() {
     }
 }
 
+/// One fit of `population`, the records the estimators score (`scored_population`, #2778).
+/// `all_records` is the same population with every record, for the data warnings and the
+/// `[derived]` outputs, whose grids run past the last observation.
 fn fit_inner(
     model: &CompiledModel,
     population: &Population,
+    all_records: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
@@ -1592,13 +1601,13 @@ fn fit_inner(
     // `check_model_data_warnings` so `ferx check` reports the same findings;
     // message text is unchanged. Probed against `population` (not the pruned
     // copy) and `init_params`, matching the historical inline checks.
-    for d in check_model_data_warnings(model, population, init_params) {
+    for d in check_model_data_warnings(model, all_records, init_params) {
         accumulated_warnings.push(d.message);
     }
     // Fit-only, so not in the bundle above that `simulate()` shares (#2459). Reads the
     // censoring method through `bloq_in_force`, armed by `fit_unstamped` (#1824).
     if let Some(d) =
-        crate::api::validation::check_zero_dv_magnitude_only(model, population, init_params)
+        crate::api::validation::check_zero_dv_magnitude_only(model, all_records, init_params)
     {
         accumulated_warnings.push(d.message);
     }
@@ -1631,7 +1640,7 @@ fn fit_inner(
     }
     // A `[covariate_nn]` input the data drive into saturation (#2549).
     #[cfg(feature = "nn")]
-    for d in crate::api::validation::check_nn_input_scale(model, population) {
+    for d in crate::api::validation::check_nn_input_scale(model, all_records) {
         accumulated_warnings.push(d.message);
     }
     if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
@@ -2552,7 +2561,7 @@ fn fit_inner(
     if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_lagtime() {
         compute_extra_output_columns(
             model,
-            population,
+            all_records,
             &result.params.theta,
             &result.kappas,
             &mut subjects,
@@ -2677,7 +2686,7 @@ fn fit_inner(
         // actually serves it (#1855).
         warnings.extend(derived_cmt_time_varying_warnings(
             model,
-            population,
+            all_records,
             &result.params.theta,
             &result.eta_hats,
             &result.kappas,
@@ -2691,7 +2700,7 @@ fn fit_inner(
         // An `[odes] init(...)` re-seeded at a reset reads the reset row's own snapshot
         // in the state pass, as `ipred` does (#1133, #2133); only the disposition stays
         // at the first-observation snapshot, which W_DERIVED_CMT_TV_ODE above covers.
-        if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_resets()) {
+        if model.ode_spec.is_none() && all_records.subjects.iter().any(|s| s.has_resets()) {
             warnings.push(
                 "W_DERIVED_CMT_RESET_ANALYTICAL: analytical model with EVID=3/4 \
                  reset events — compartment states and compartment-based integrals \
@@ -2723,7 +2732,7 @@ fn fit_inner(
         // per-obs compartment states return empty (→ NaN) rather than report
         // silently-wrong amounts.
         if model.ode_spec.is_none()
-            && population
+            && all_records
                 .subjects
                 .iter()
                 .any(|s| crate::pk::dose_needs_event_walk(model.pk_model, s))
