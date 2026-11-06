@@ -23264,6 +23264,187 @@ fn test_weighted_kappa_refusal_keeps_scaling_label_for_a_real_scaling_block() {
     );
 }
 
+/// #2624: the unnamed blocks sit in a `HashMap`, and the refusal used to return
+/// on the first offending block — so with two of them it named `[derived]` on
+/// some compiles and `[scaling]` on others (21/19 over 40 at `d69779e2`). Every
+/// offending block is now named, sorted, and the message is the same every time.
+/// Each compile builds fresh maps with fresh `RandomState`, so 40 compiles under
+/// a hash-order walk differ with probability 1 − 2·2⁻⁴⁰.
+#[test]
+fn test_weighted_kappa_refusal_names_every_block_in_a_stable_order() {
+    let src = weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n\n[scaling]\n  y = central / V + KAPPA_CL\n",
+    );
+    let first = expect_parse_err(&src);
+    assert!(
+        first.starts_with(
+            "[derived] references `KAPPA_CL` and [scaling] references `KAPPA_CL`, \
+             a kappa declared with `weight = ...`."
+        ),
+        "both blocks named, sorted, one kappa in the singular, got: {first}"
+    );
+    assert!(
+        first.contains("a reference in any of these blocks") && first.contains("Move each term"),
+        "plural wording for two blocks, got: {first}"
+    );
+    assert!(
+        !first.contains("a reference here") && !first.contains("Move the term"),
+        "no singular wording for two blocks, got: {first}"
+    );
+    for i in 1..40 {
+        let again = expect_parse_err(&src);
+        assert_eq!(again, first, "compile {i} gave a different refusal");
+    }
+}
+
+/// Three offending blocks exercise the comma arm of the list join: `A, B and C`,
+/// not `A and B and C`. Every other fixture lists at most two items, where the
+/// separator inside `init` is never written (#2624 review r2).
+#[test]
+fn test_weighted_kappa_refusal_lists_three_blocks_with_commas() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n\n[scaling]\n  y = central / V + KAPPA_CL\n\n\
+         [simulation]\n  dose_amt = KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL`, [scaling] references `KAPPA_CL` and \
+             [simulation] references `KAPPA_CL`, a kappa declared with `weight = ...`."
+        ),
+        "three blocks, comma-joined then `and`, got: {err}"
+    );
+}
+
+/// The single-block case keeps its singular wording: the plural added for
+/// #2624 must not leak into it.
+#[test]
+fn test_weighted_kappa_refusal_single_block_keeps_singular_wording() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with("[derived] references `KAPPA_CL`, a kappa declared with `weight = ...`."),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("a reference here would silently use") && err.contains("Move the term"),
+        "singular wording for one block, got: {err}"
+    );
+    assert!(
+        !err.contains(" and [") && !err.contains("these blocks") && !err.contains("each term"),
+        "no plural wording for one block, got: {err}"
+    );
+}
+
+/// Two distinct weighted kappas in one block: the block is named once with both
+/// kappas, the noun goes plural, and the wording speaks of one block — not "any
+/// of these blocks" (#2624 review).
+#[test]
+fn test_weighted_kappa_refusal_two_kappas_one_block_is_plural() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM\n  kappa KAPPA_V ~ 0.04 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_V + KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL` and `KAPPA_V`, kappas declared with `weight = ...`."
+        ),
+        "one block named once, both kappas, plural noun, got: {err}"
+    );
+    assert!(
+        err.contains("these references would silently use") && err.contains("Move each term"),
+        "one-block multi-kappa wording, got: {err}"
+    );
+    assert!(
+        !err.contains("a kappa declared")
+            && !err.contains("these blocks")
+            && !err.contains("a reference here")
+            && err.matches("[derived]").count() == 1,
+        "no singular, no multi-block wording, block not repeated, got: {err}"
+    );
+}
+
+/// A named block (`[event_model armA]`, walked from the `BTreeMap` half) and an
+/// unnamed one (`[derived]`, from the `HashMap` half) are named together, sorted
+/// on the printed label (#2624 review).
+#[cfg(feature = "survival")]
+#[test]
+fn test_weighted_kappa_refusal_names_named_and_unnamed_blocks_together() {
+    let model_str = r"
+[parameters]
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  omega ETA ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+
+[derived]
+  KOUT = KAPPA_CL
+
+[event_model armA]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(KAPPA_CL)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(model_str);
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL` and [event_model armA] references `KAPPA_CL`, \
+             a kappa declared with `weight = ...`."
+        ),
+        "both halves of the walk named, sorted, got: {err}"
+    );
+}
+
+/// The relabel runs before the sort, so a compartment-free model is ordered by
+/// the label it prints. `[simulation]` sorts between the internal `scaling` key
+/// and the printed `structural_model`, so sorting on the raw key would put the
+/// equations block first (#2624 review).
+#[test]
+fn test_weighted_kappa_refusal_sorts_compartment_free_on_the_printed_label() {
+    let src = r"
+[parameters]
+  theta TVBASE(10.0)
+  omega ETA_BASE ~ 0.09
+  kappa KAPPA_ARM ~ 0.04 weight = NARM
+  sigma ADD ~ 1.0 (sd)
+
+[individual_parameters]
+  BASE = TVBASE + ETA_BASE + KAPPA_ARM
+
+[structural_model]
+  y = BASE + KAPPA_ARM
+
+[error_model]
+  DV ~ additive(ADD)
+
+[covariates]
+  NARM continuous
+
+[simulation]
+  dose_amt = KAPPA_ARM
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(src);
+    assert!(
+        err.starts_with(
+            "[simulation] references `KAPPA_ARM` and [structural_model] references `KAPPA_ARM`, \
+             a kappa declared with `weight = ...`."
+        ),
+        "sorted on the printed label, got: {err}"
+    );
+    assert!(!err.contains("[scaling]"), "got: {err}");
+}
+
 /// The unweighted kappa keeps its freedom to appear elsewhere.
 #[test]
 fn test_unweighted_kappa_is_not_restricted_to_individual_parameters() {
