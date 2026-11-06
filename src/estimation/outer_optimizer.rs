@@ -9627,10 +9627,12 @@ fn reporting_fd_gradient(
 /// below 1 goes through the resolution gate of
 /// [`resolve_floored_step`](crate::estimation::fd_resolution::resolve_floored_step) (#2406):
 /// `tight` is `eval` re-solved at τ/100, `None` where a solve fell to Nelder–Mead or did not
-/// converge, and the step grows ×10 until the two agree. Without `tight` no coordinate is
-/// gated, and a floor-1 coordinate takes the ungated difference either way. A floored one whose
-/// probes stay missing up to the cap takes the ungated difference at floor 1, the pre-#2187
-/// step, with its one-sided fallback.
+/// converge, and the step grows ×10 until the two agree or growth runs into truncation error.
+/// Without `tight` no coordinate is gated, and a floor-1 coordinate takes the ungated difference
+/// either way. A floored one for which no floor gave a difference takes the ungated difference
+/// at its own floor, with its one-sided fallback — the covariance gate's fallback too. Floor 1
+/// was the worst step there: on a `V = TVV/k` volume it is the step through `V ≤ 0` that made
+/// the probe go missing (#2406 review r1).
 fn central_diff_packed_gated(
     x: &[f64],
     fixed: &[bool],
@@ -9649,7 +9651,7 @@ fn central_diff_packed_gated(
         if fixed[k] {
             continue;
         }
-        let mut floor_k = floor[k];
+        let floor_k = floor[k];
         if let Some(tight) = tight.filter(|_| floor_k < 1.0) {
             let resolved =
                 crate::estimation::fd_resolution::resolve_floored_step(floor_k, |fl, at_tight| {
@@ -9684,7 +9686,6 @@ fn central_diff_packed_gated(
                 }
                 continue;
             }
-            floor_k = 1.0;
         }
         let h = fd_step(eps, x[k], floor_k);
         let xp = (x[k] + h).min(bounds.upper[k]);

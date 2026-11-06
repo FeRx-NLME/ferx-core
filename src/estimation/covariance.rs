@@ -1762,16 +1762,15 @@ pub(super) fn fd_ofv_hessian_gated<F: Fn(&[f64]) -> f64 + Sync>(
             if step.n_halvings == 1 { "" } else { "s" }
         );
     }
-    let mut diag = step.diag;
+    let diag = step.diag;
     let mut floor = floor.to_vec();
     let mut resolved_diag: Vec<(usize, f64)> = Vec::new();
-    if let (Some(tight), Some(d)) = (tight, diag.as_mut()) {
-        for (a, i, r, (fp, fm)) in
-            resolve_fd_diag(x_hat, free_idx, &floor, step.eps, f0, d, ofv, tight)
-        {
+    if let (Some(tight), Some(d)) = (tight, diag.as_deref()) {
+        // A gated coordinate's off-diagonal pairs are stepped at the floor it settled on. Its
+        // two axis points in `diag` stay the first step's: they feed only its own diagonal
+        // entry, which the resolved value replaces below.
+        for (i, r) in resolve_fd_diag(x_hat, free_idx, &floor, step.eps, f0, d, ofv, tight) {
             floor[i] = r.floor;
-            d[2 * a] = fp;
-            d[2 * a + 1] = fm;
             resolved_diag.push((i, r.value));
         }
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -1798,12 +1797,10 @@ pub(super) fn fd_ofv_hessian_gated<F: Fn(&[f64]) -> f64 + Sync>(
     Some(stencil)
 }
 
-/// The gated diagonal of [`fd_ofv_hessian_gated`]: for each free coordinate `a` (packed `i`)
-/// whose floor is below 1, where its step settled, as `(a, i, resolved, (f₊, f₋))` — `f₊, f₋`
-/// the τ objectives at the settled step, which replace the coordinate's points in `diag` so
-/// the stencil's off-diagonal pairs and its diagonal agree on one step. `diag` is the accepted
-/// pass of [`select_fd_step`], reused as the τ side of the first step. The τ/100 side's centre
-/// is `tight(x̂)`, evaluated once and only when some coordinate is floored, so all three points
+/// The gated diagonal of [`fd_ofv_hessian_gated`]: for each free coordinate (packed `i`) whose
+/// floor is below 1, where its step settled, as `(i, resolved)`. `diag` is the accepted pass
+/// of [`select_fd_step`], reused as the τ side of the first step. The τ/100 side's centre is
+/// `tight(x̂)`, evaluated once and only when some coordinate is floored, so all three points
 /// of its second difference share a tolerance.
 #[allow(clippy::too_many_arguments)]
 fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
@@ -1815,12 +1812,7 @@ fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
     diag: &[f64],
     ofv: &F,
     tight: TightOfv<'_>,
-) -> Vec<(
-    usize,
-    usize,
-    crate::estimation::fd_resolution::Resolved,
-    (f64, f64),
-)> {
+) -> Vec<(usize, crate::estimation::fd_resolution::Resolved)> {
     use crate::estimation::fd_resolution::{resolve_floored_step, Difference};
     let gated: Vec<(usize, usize)> = free_idx
         .iter()
@@ -1832,7 +1824,15 @@ fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
         return Vec::new();
     }
     let f0_tight = tight(x_hat);
+    // A point on the `1e20` wall is missing, not a value, as on the gradient side: two walled
+    // diagonals agree to an ulp and clear the noise guard, so differenced they would accept
+    // a diagonal of ~2e20/h² and an SE of ~0. Growing ×10 toward the bounds is what reaches
+    // the wall; the ungated stencil only ever halves.
+    let usable = crate::stats::likelihood::is_usable_subject_nll;
     let second = |fp: f64, f0: f64, fm: f64, h: f64| {
+        if !(usable(fp) && usable(f0) && usable(fm)) {
+            return None;
+        }
         let numer = fp - 2.0 * f0 + fm;
         let value = numer / (h * h);
         value.is_finite().then_some(Difference {
@@ -1845,7 +1845,6 @@ fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
     gated
         .par_iter()
         .filter_map(|&(a, i)| {
-            let mut loose_pts = (diag[2 * a], diag[2 * a + 1]);
             let r = resolve_floored_step(floor[i], |fl, at_tight| {
                 let h = fd_step(eps, x_hat[i], fl);
                 let plus = FdPert::Single { i, di: h };
@@ -1858,16 +1857,18 @@ fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
                     );
                     second(fp?, f0t, fm?, h)
                 } else {
-                    if fl != floor[i] {
-                        loose_pts = rayon::join(
+                    let (fp, fm) = if fl == floor[i] {
+                        (diag[2 * a], diag[2 * a + 1])
+                    } else {
+                        rayon::join(
                             || eval_fd_point(x_hat, plus, ofv),
                             || eval_fd_point(x_hat, minus, ofv),
-                        );
-                    }
-                    second(loose_pts.0, f0, loose_pts.1, h)
+                        )
+                    };
+                    second(fp, f0, fm, h)
                 }
             })?;
-            Some((a, i, r, loose_pts))
+            Some((i, r))
         })
         .collect()
 }
@@ -7165,6 +7166,65 @@ mod tests {
                 "H{ij:?}"
             );
         }
+    }
+
+    /// #2406 review r1, row 3: a floored coordinate whose grown step reaches the `1e20` wall.
+    /// The twin's curvature differs by 2e-4 relative, so the gate grows; past `|Δx₀| = 5e-3`
+    /// every point, τ and τ/100, is the wall, which floor 0.77 (`h ≈ 7.7e-3`) reaches. Two
+    /// walled second differences agree to an ulp and their numerator clears the noise guard,
+    /// so the gate accepted a diagonal of ~2e20/h²; read as missing, the walled floors give
+    /// nothing, and the diagonal is the twin's at floor 0. Both sides of the gate: the wall is
+    /// reached, and the diagonal is the fixture's curvature, not the wall's.
+    #[test]
+    fn the_hessian_gate_reads_a_walled_probe_as_missing() {
+        use super::fd_ofv_hessian_gated;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let opts = crate::types::FitOptions::default();
+        let x_hat = [0.077f64, 7.7];
+        let walls = AtomicUsize::new(0);
+        let walled = |f: f64, x: &[f64]| {
+            if (x[0] - x_hat[0]).abs() > 5e-3 {
+                walls.fetch_add(1, Ordering::Relaxed);
+                crate::stats::likelihood::SUBJECT_SENTINEL_NLL
+            } else {
+                f
+            }
+        };
+        let ofv = |x: &[f64]| walled(gate_fixture(x), x);
+        let twin = |x: &[f64]| Some(walled(gate_fixture(x) + 1e-3 * x[0] * x[0], x));
+        let f0 = gate_fixture(&x_hat);
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &[0.077, 1.0],
+            1e-2,
+            f0,
+            &ofv,
+            Some(&twin),
+            &opts,
+        )
+        .unwrap();
+        assert!(
+            walls.load(Ordering::Relaxed) > 0,
+            "fixture: the grown step reaches the wall"
+        );
+        // f₀₀ = 6 + 6·x₀·x₁, plus the twin's 2e-3.
+        let want = 6.0 + 6.0 * x_hat[0] * x_hat[1] + 2e-3;
+        let got = gated.hess[(0, 0)];
+        assert!(
+            got.is_finite() && (got - want).abs() < 1e-3,
+            "H00 {got:e} vs {want}"
+        );
+        // The off-diagonal pair is stepped at the floor the gate settled on, floor 0, where no
+        // point is the wall's: stepped at a walled floor it would be ~1e20. f₀₁ = 0.2 + 3·x₀².
+        let want01 = 0.2 + 3.0 * x_hat[0] * x_hat[0];
+        let got01 = gated.hess[(0, 1)];
+        assert!(
+            got01.is_finite() && (got01 - want01).abs() < 1e-2,
+            "H01 {got01:e} vs {want01}"
+        );
     }
 
     /// #2406: a floored coordinate whose τ objective *stalls* near `x̂` — modelled as

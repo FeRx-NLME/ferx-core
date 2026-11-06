@@ -7581,11 +7581,13 @@ mod outer_fd_fallback {
     }
 
     /// #2406: a floored coordinate whose τ probe is missing at every step up to the cap leaves
-    /// the gate with nothing, and takes the ungated difference at floor 1 — the pre-#2187 step,
-    /// with its one-sided fallback — not the one-sided difference at its own floor.
-    /// `f = (x0 − 1)²` is missing below `x0`; one-sided at step `h` it reads `2(x0 − 1) + h`.
+    /// the gate with nothing, and takes the ungated difference at its own floor, with its
+    /// one-sided fallback — the covariance gate's fallback too — not the one at floor 1, the
+    /// largest step there is (review r1, row 2: on a `TVV/k` volume that step is the one
+    /// through `V ≤ 0`). `f = (x0 − 1)²` is missing below `x0`; one-sided at step `h` it reads
+    /// `2(x0 − 1) + h`.
     #[test]
-    fn the_gradient_gate_falls_back_to_the_floor_one_step_when_a_side_stays_missing() {
+    fn the_gradient_gate_falls_back_to_its_own_floor_when_a_side_stays_missing() {
         let x = [1e-3];
         let fixed = [false];
         let bounds = PackedBounds {
@@ -7605,8 +7607,8 @@ mod outer_fd_fallback {
         let at_own_floor = central_diff_packed(&x, &fixed, &[1e-3], &bounds, f);
         assert_eq!(
             gated[0].to_bits(),
-            at_floor_one[0].to_bits(),
-            "{gated:?} vs {at_floor_one:?}"
+            at_own_floor[0].to_bits(),
+            "{gated:?} vs {at_own_floor:?}"
         );
         assert_ne!(
             at_floor_one[0], at_own_floor[0],
@@ -7808,6 +7810,52 @@ mod outer_fd_fallback {
         );
         assert_eq!(evals, 4, "B is accepted at its first step");
         assert!(rel < 1e-5, "B: rel {rel:e}");
+    }
+
+    /// #2406 review r1, row 1: fixture B at its stationary point, where the gradient is too
+    /// small for the relative test or the noise guard ever to pass. The gate grew the step until
+    /// truncation error made the difference large enough to pass them, and accepted
+    /// `k·g = −1.11e-2` at `k = 1e-4…1e-8` (`−2.2e-4` at `1e-2`) after 12 re-solves, where the
+    /// ungated difference is `−4.37e-6`; the truncation test now stops at floor 1 and keeps floor
+    /// 0's difference, 8 re-solves. `TVV_S = 7.611829143·k` is the stationary value (a secant on
+    /// the exact gradient gives it for every `k`), checked here by the exact gradient itself.
+    /// Measured (Linux x86_64): gated `k·g = −4.3571e-6` and ungated `−4.3577e-6` against an
+    /// exact `1.1e-8`, at both `k`, against an off-optimum `k·g` of 13.3.
+    #[test]
+    fn the_gradient_gate_keeps_a_scaled_volumes_step_at_its_stationary_point() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        for k in [1e-2, 1e-6] {
+            let (mut m, p) = warfarin_scaled_v(k);
+            m.default_params.theta[1] = 7.611829143 * k;
+            let (gated, evals, ungated, exact) = gated_gradient_cell(&m, &p, &opts, 1);
+            let (gated, ungated, exact) = (gated * k, ungated * k, exact * k);
+            eprintln!(
+                "MEASURE #2406 B stationary k={k:e}: gated {gated:e} [{evals} re-solves], \
+                 ungated {ungated:e}, exact {exact:e}"
+            );
+            // At the stationary point to well inside the FD error under test (4.4e-6): the
+            // ten-digit TVV_S leaves an exact k·g of 1.1e-8 at both k (Linux x86_64).
+            assert!(
+                exact.abs() < 1e-7,
+                "fixture: not at the stationary point ({exact:e})"
+            );
+            assert!(gated.is_finite() && ungated.is_finite());
+            // Floor 0, then floor 1 to see the move: τ and τ/100 at each.
+            assert_eq!(
+                evals, 8,
+                "k={k:e}: stopped on the truncation test at floor 1"
+            );
+            // No worse than the ungated step, 4.37e-6 from the exact gradient here; the gate
+            // without the truncation test was 2550× worse at k = 1e-6.
+            assert!(
+                (gated - exact).abs() <= 1.01 * (ungated - exact).abs(),
+                "k={k:e}: gated {gated:e} vs ungated {ungated:e}, exact {exact:e}"
+            );
+        }
     }
 
     /// #2406: every production caller of the reconverged FD gradient hands
