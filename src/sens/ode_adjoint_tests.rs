@@ -7152,11 +7152,16 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         // Measured: 3.8e-16 on the explicit and closed-form engines; 1.2e-10 on Rodas5P,
         // where the taped side solves `W` through the vector tape's block LU and the
         // forward side element by element over the dual, and the stiff `W`'s conditioning
-        // amplifies that rounding difference. ~25× and ~9× headroom. The linear-ODE
-        // spectral path (#2706 follow-up) moved `additive_four_eta` to 3.8e-14: its validity
-        // check reads the jets, so the two sides may take spectral and Padé respectively,
-        // two exact propagations apart by round-off; 2e-13 keeps ~5× headroom.
-        let bound = if name.contains("rodas") { 1e-9 } else { 2e-13 };
+        // amplifies that rounding difference. ~25× and ~9× headroom.
+        // `additive_four_eta` is a linear ODE served by the spectral path (#2706 follow-up),
+        // whose propagation is a sum of modes: measured 1.9e-14 there; 1e-13 keeps ~5×.
+        let bound = if name.contains("rodas") {
+            1e-9
+        } else if name == "additive_four_eta" {
+            1e-13
+        } else {
+            1e-14
+        };
         assert!(worst < bound, "{name}: worst relative difference {worst:e}");
         worst_all = worst_all.max(worst);
     }
@@ -8057,4 +8062,96 @@ fn the_quadrature_mode_hessian_is_the_exact_inner_hessian() {
         worst < 1e-12,
         "mode Hessian vs exact_inner_hessian {worst:.2e}"
     );
+}
+
+/// The covariance step's 6-wide Hessian bucket (#2706 follow-up) is the padded 8-wide one
+/// minus its zero lanes: on a five-effect subject the Hessian and the mode response agree
+/// to round-off. Both legs are asserted to dispatch where they claim (6, then 8), so the
+/// pair cannot collapse into one bucket compared with itself.
+#[test]
+fn the_six_wide_hessian_bucket_equals_the_padded_eight() {
+    const FIVE_ETA: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(30.0, 1.0, 500.0)
+  theta TVQ(6.0, 0.1, 100.0)
+  theta TVV2(60.0, 1.0, 1000.0)
+  theta TVKA(1.1, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.06
+  omega ETA_Q ~ 0.05
+  omega ETA_V2 ~ 0.07
+  omega ETA_KA ~ 0.12
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q = TVQ * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = parse_model_string(FIVE_ETA).unwrap();
+    let s = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.08, -0.1, 0.15],
+    );
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-12, true);
+    assert_eq!(hessian::hessian_bucket(5, Objective::Focei), Some(6));
+    let run = |skip6: bool| {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    hessian::SKIP_HESSIAN_BUCKET_6.with(|c| c.set(skip6));
+                    assert_eq!(
+                        hessian::hessian_bucket(5, Objective::Focei),
+                        Some(if skip6 { 8 } else { 6 })
+                    );
+                    let pt = PackedPoint::new(&params, &x).unwrap();
+                    let h = subject_adjoint_cov_hessian_at(
+                        &model,
+                        &s,
+                        &pt,
+                        eta.as_slice(),
+                        Objective::Focei,
+                    )
+                    .expect("Hessian in scope");
+                    let dx = subject_adjoint_eta_dx_at(&model, &s, &pt, eta.as_slice(), true)
+                        .expect("mode response in scope");
+                    (h, dx)
+                })
+                .expect("spawn")
+                .join()
+                .expect("join")
+        })
+    };
+    let ((h6, dx6), (h8, dx8)) = (run(false), run(true));
+    let mut worst = 0.0_f64;
+    let mut gap = |u: f64, v: f64| {
+        assert!(u.is_finite() && v.is_finite(), "{u} vs {v}");
+        worst = worst.max((u - v).abs() / (1.0 + v.abs()));
+    };
+    for (u, v) in h6.iter().zip(h8.iter()) {
+        gap(*u, *v);
+    }
+    assert_eq!(dx6.len(), dx8.len());
+    for (a, b) in dx6.iter().zip(&dx8) {
+        for (u, v) in a.iter().zip(b.iter()) {
+            gap(*u, *v);
+        }
+    }
+    // Measured 0 (bit-identical: the padding lanes are exact zeros); any difference is a
+    // defect in the 6-wide instantiation.
+    assert!(worst == 0.0, "bucket 6 vs padded 8: worst {worst:.2e}");
 }

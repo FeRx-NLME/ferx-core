@@ -310,7 +310,18 @@ pub(crate) fn hessian_bucket(width: usize, objective: Objective) -> Option<usize
     } else {
         &HESSIAN_BUCKETS
     };
+    #[cfg(test)]
+    if SKIP_HESSIAN_BUCKET_6.with(|c| c.get()) {
+        return ladder.iter().copied().find(|&b| b >= width && b != 6);
+    }
     ladder.iter().copied().find(|&b| b >= width)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: dispatch as before bucket 6, padding a 5- or 6-wide subject to 8.
+    pub(crate) static SKIP_HESSIAN_BUCKET_6: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Whether `subject` is too wide for any Hessian bucket under `objective`
