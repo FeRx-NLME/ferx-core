@@ -586,26 +586,27 @@ fn repeated_singleton_eigenvalue(vals: &[f64], n: usize) -> bool {
     if !(0..n).any(|i| (i + 1..n).any(|j| close(vals[i * n + i], vals[j * n + j]))) {
         return false;
     }
-    // reach[i][j]: j reachable from i along nonzero couplings (Warshall, n ≤ 6).
-    let mut reach = [[false; 6]; 6];
+    // reach[i], bit j: j reachable from i along nonzero couplings (Warshall over row
+    // bitmasks, n ≤ 6).
+    let mut reach = [0u8; 6];
     for i in 0..n {
         for j in 0..n {
-            reach[i][j] = i != j && vals[i * n + j] != 0.0;
+            if i != j && vals[i * n + j] != 0.0 {
+                reach[i] |= 1 << j;
+            }
         }
     }
     for k in 0..n {
         for i in 0..n {
-            if reach[i][k] {
-                for j in 0..n {
-                    reach[i][j] |= reach[k][j];
-                }
+            if reach[i] & (1 << k) != 0 {
+                reach[i] |= reach[k];
             }
         }
     }
     let mut diag = [0.0_f64; 6];
     let mut m = 0;
     for i in 0..n {
-        if !reach[i][i] {
+        if reach[i] & (1 << i) == 0 {
             diag[m] = vals[i * n + i];
             m += 1;
         }
