@@ -1001,20 +1001,20 @@ An `if` on data and a sum of reads are affine too, and are accepted (#2114):
 
 ```
 if (WT > 70) {
-  B = PLACEBO[STUDY] * 2
+  B = PLACEBO * 2
 } else {
-  B = PLACEBO[STUDY]
+  B = PLACEBO
 }
-C = if (WT > 70) PLACEBO[STUDY] * 2 else PLACEBO[STUDY]
-D = PLACEBO[STUDY] * X + PLACEBO[STUDY] * Z
+C = if (WT > 70) PLACEBO * 2 else PLACEBO
+D = PLACEBO * X + PLACEBO * Z
 ```
 
 Each is `c × PLACEBO` with `c` from the data: `if (WT > 70) 2 else 1` for `B` and `C`,
 `X + Z` for `D`. A branch may also leave the block out, which is `c = 0` on its rows.
 The condition must read data only. One that reads a θ, an η or the block itself is
 refused, and so is every `max`, `min` or `clamp` of the block, since each compares the
-block. Every branch must itself be affine: a branch giving `PLACEBO[STUDY]` under one
-condition and `exp(PLACEBO[STUDY])` under the other is refused, naming the `exp`.
+block. Every branch must itself be affine: a branch giving `PLACEBO` under one
+condition and `exp(PLACEBO)` under the other is refused, naming the `exp`.
 
 ##### Through a logit link
 

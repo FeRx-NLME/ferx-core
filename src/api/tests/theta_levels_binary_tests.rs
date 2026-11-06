@@ -998,6 +998,10 @@ const NO_LEVELS: &str = "theta PLACEBO[STUDY]: the block has no levels.";
 const NO_GAUSSIAN: &str = "The data carries no Gaussian observation rows";
 const NO_READER: &str = "none of its discrete-state records is on an endpoint whose expression \
                          reads the block through its implicit index";
+/// Conditional on no bare read, which since #2744 means nothing reads the block at all.
+const UNREAD: &str = "Nothing reads it:";
+/// The per-level check's wording for an all-dead block on Gaussian data, a different arm
+/// whose block may well be read (`0 * PLACEBO`), so it keeps pointing at the expression.
 const CHECK: &str = "Check the expression that reads it";
 const READ_BARE: &str = "a data-driven block is read bare, as `PLACEBO`; its index is implicit.";
 /// Conditional on a bare read whose only readers define no level (review r1 #1): a
@@ -1039,7 +1043,7 @@ fn no_reading_endpoint_cells() {
                     let d = got.expect_err(&cell);
                     assert_eq!(d.code, "E_THETA_LEVEL_BINDING", "{cell}");
                     let m = &d.message;
-                    for sentence in [NO_LEVELS, NO_GAUSSIAN, NO_READER, CHECK, READ_BARE] {
+                    for sentence in [NO_LEVELS, NO_GAUSSIAN, NO_READER, UNREAD, READ_BARE] {
                         assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
                     }
                     assert!(!m.contains(NO_ROWS), "{cell}: blames the data: {m}");
@@ -1061,7 +1065,7 @@ fn no_reading_endpoint_cells() {
             }
         }
     }
-    // The Gaussian path's own wording, which the new refusal echoes.
+    // The per-level check keeps its own wording on Gaussian data, and not the binder's.
     let m = bind_read(Rows::Gaussian, Read::Unread, true)
         .expect_err("unread on Gaussian data")
         .message;
@@ -1081,7 +1085,7 @@ fn a_population_with_no_rows_still_says_so() {
     let d = bind_read(Rows::Binary, Read::Unread, false).expect_err("no rows");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     assert!(d.message.contains(NO_ROWS), "{}", d.message);
-    for sentence in [NO_GAUSSIAN, NO_READER, CHECK, READ_BARE]
+    for sentence in [NO_GAUSSIAN, NO_READER, UNREAD, READ_BARE]
         .into_iter()
         .chain(BARE_ANY)
     {
@@ -1100,7 +1104,7 @@ fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool) {
     for sentence in [NO_LEVELS, NO_GAUSSIAN, NO_READER] {
         assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
     }
-    for sentence in [CHECK, READ_BARE, NO_ROWS] {
+    for sentence in [UNREAD, CHECK, READ_BARE, NO_ROWS] {
         assert!(!m.contains(sentence), "{cell}: already read bare: {m}");
     }
     let (want, not): (&[&str], &[&str]) = if no_records {
@@ -1129,7 +1133,7 @@ fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool) {
 /// through its implicit index, only not by a reader whose rows define levels — so the
 /// refusal says that, not "check the expression". The binary predictor does not read it.
 ///
-/// Mutations: drop `read_bare` (always false) and the cell gets `CHECK`; route every
+/// Mutations: drop `read_bare` (always false) and the cell gets `UNREAD`; route every
 /// bare read to the no-records arm and it gets `BARE_NO_RECORDS`.
 #[test]
 fn a_gaussian_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
@@ -1158,7 +1162,7 @@ fn a_gaussian_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
 /// implicit index too, but a time-to-event row defines no level (#2562), so the refusal
 /// is the bare-read arm that names the hazard, not "check the expression".
 ///
-/// Mutation: drop `read_bare` and the cell gets `CHECK`; drop the hazard from the arm's
+/// Mutation: drop `read_bare` and the cell gets `UNREAD`; drop the hazard from the arm's
 /// reader list and `BARE_NO_DEFINER` is missing.
 #[test]
 fn a_hazard_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
@@ -1184,7 +1188,7 @@ fn a_hazard_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
 /// records define no level, #2562), and one read bare by a DTMM on CMT 1 when the data's
 /// records are all on another endpoint (CMT 5). Each names its own arm.
 ///
-/// Mutations: drop `read_bare` and both get `CHECK`; drop the `record_cmts` test and the
+/// Mutations: drop `read_bare` and both get `UNREAD`; drop the `record_cmts` test and the
 /// DTMM cell gets the CTMM arm; swap the arms and each gets the other's sentence.
 #[cfg(feature = "markov")]
 #[test]

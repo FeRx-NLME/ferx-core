@@ -38374,8 +38374,10 @@ fn data_driven_subscript_sentences(spelling: &str, cols: &str) -> [String; 3] {
 /// One model per place a θ level block can be read, declaring `PLACEBO` as `decl` and
 /// reading it as `read`: an `[individual_parameters]` line, the `y` readout, a
 /// residual-error magnitude, `[derived]`, a `[binary_model]` predictor, a `[scaling]`
-/// `obs_scale` and, with `markov`, a DTMM `[markov_model]` transition — every place
-/// `docs/model-file/parameters.qmd` lists a block as readable.
+/// `obs_scale` and, with `markov`, a DTMM `[markov_model]` transition. Not every reader:
+/// a `FIX` kappa `weight`, a `[scaling] y`, a closed-form `[event_model]` hazard and a
+/// CTMM generator are left out, since they compile through the same `parse_atom` arm
+/// these seven reach, and the gate sits there rather than per block.
 fn level_read_sites(decl: &str, read: &str) -> Vec<(&'static str, String)> {
     let gaussian = |indiv: &str, y: &str| {
         format!(
@@ -38549,7 +38551,7 @@ fn every_index_shape_is_refused_with_its_own_spelling() {
 /// #2744 audit A: in a context that cannot read a θ, the #1637 remedy reads a
 /// data-driven block bare (`PLACEBO_I = PLACEBO`), since its subscripted read is
 /// refused, while a counted block keeps the read as written. Each engine separately:
-/// `parse_primary`'s ODE scope (`[odes]`) and the hazard pre-check
+/// `parse_atom`'s ODE scope (`[odes]`) and the hazard pre-check
 /// (`ode_level_block_read`), so a mutation to either names its own side.
 ///
 /// Mutations: drop the `index_covariate` test in the ODE scope and the `[odes]` row

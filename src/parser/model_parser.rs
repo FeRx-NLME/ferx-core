@@ -24263,7 +24263,7 @@ fn ode_level_block_read(src: &str) -> Result<Option<String>, String> {
             continue;
         }
         if let Some(decl) = lookup_vector_theta(name) {
-            // As in `parse_primary`'s ODE-scope refusal: a data-driven block's remedy
+            // As in `parse_atom`'s ODE-scope refusal: a data-driven block's remedy
             // reads it bare, since its subscripted read is refused (#2744).
             let spelling = if tokens.get(pos + 1) == Some(&Token::LBracket)
                 && decl.index_covariate.is_none()
