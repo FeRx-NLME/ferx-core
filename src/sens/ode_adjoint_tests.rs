@@ -3725,6 +3725,201 @@ fn custom_residual_magnitude_objective_and_gradients() {
     }
 }
 
+// ---- magnitude expressions per endpoint (#2731) -----------------------------------------
+
+/// Two endpoints on one sigma each, a θ factor gated on `TAD` on the first and a θ factor
+/// on the second's own sigma, so the direct-θ channel is live on both endpoints and differs
+/// between them.
+const ODE_ENDPOINT_MAGNITUDE: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta FU(0.3, 0.01, 1.0)
+  theta TH_M(1.4, 0.1, 10.0)
+  theta TH_A(0.7, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  sigma PROP_TOT ~ 0.1 (sd)
+  sigma PROP_UNB ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = FU * central / V
+[error_model]
+  CMT=1: DV ~ proportional(PROP_TOT * (if (TAD < 3.0) TH_M else 1.0))
+  CMT=2: DV ~ proportional(PROP_UNB * TH_A)
+"#;
+
+/// Two doses and a total and an unbound row at every time, on [`ODE_ENDPOINT_MAGNITUDE`]
+/// and its variants.
+fn endpoint_magnitude_subject(model: &CompiledModel) -> Subject {
+    let base = [1.0, 2.0, 5.0, 9.0, 13.0, 14.0, 18.0, 23.0];
+    let times: Vec<f64> = base.iter().flat_map(|&t| [t, t]).collect();
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let mut s = subject_shell(doses, &times);
+    s.obs_cmts = (0..times.len()).map(|j| 1 + j % 2).collect();
+    let preds = crate::pk::compute_predictions_with_tv(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.15 * (1.3 * j as f64).sin()))
+        .collect();
+    s
+}
+
+/// The factor differs across rows of one subject, or the fixture cannot tell a row's
+/// endpoint from any other.
+fn assert_rows_differ(model: &CompiledModel, s: &Subject) {
+    assert!(
+        model
+            .ruv_magnitude
+            .as_ref()
+            .is_some_and(|rm| rm.has_endpoint_magnitude() && rm.theta_dependent),
+        "fixture must carry a θ-dependent endpoint magnitude"
+    );
+    let rows = model.ruv_obs_mult(s, &model.default_params.theta).unwrap();
+    assert!(rows.iter().any(|r| *r != rows[0]), "{rows:?}");
+}
+
+fn assert_endpoint_magnitude_parity(model: &CompiledModel, s: &Subject) {
+    assert_rows_differ(model, s);
+    let g = objective_gaps::<2>(model, s, &model.default_params, &[0.08, -0.06]);
+    eprintln!("objective gaps {g:?}");
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "objective {g:?}");
+    for (label, worst) in [
+        ("FOCEI", fd_oracle(model, s, true)),
+        ("FOCE", fd_oracle(model, s, false)),
+        ("Laplace", fd_oracle_laplace(model, s)),
+    ] {
+        eprintln!("{label}: worst {worst:.2e}");
+        // Measured worst 4.2e-9 over the four fixtures (macOS arm64); ~25×.
+        assert!(worst < 1e-7, "{label}: {worst:.2e}");
+    }
+}
+
+/// #2731: every θ and σ against the reconverged FD oracle, on `CMT=N:` lines. Kills the
+/// adjoint reading a row's magnitude from a table other than the production row's: the
+/// objective gap then opens, since production keys `ruv_obs_mult` on the endpoint.
+#[test]
+fn cmt_line_magnitude_objective_and_gradients() {
+    let model = tight(parse_model_string(ODE_ENDPOINT_MAGNITUDE).unwrap());
+    let s = endpoint_magnitude_subject(&model);
+    assert_endpoint_magnitude_parity(&model, &s);
+}
+
+/// One sigma on both endpoints under different factors: the shape a per-slot multiplier
+/// cannot represent, and where the σ column sums both endpoints' rows.
+#[test]
+fn shared_sigma_cmt_magnitude_objective_and_gradients() {
+    let src = ODE_ENDPOINT_MAGNITUDE
+        .replace("  sigma PROP_UNB ~ 0.15 (sd)\n", "")
+        .replace(
+            "proportional(PROP_UNB * TH_A)",
+            "proportional(PROP_TOT * TH_A)",
+        );
+    let model = tight(parse_model_string(&src).unwrap());
+    let s = endpoint_magnitude_subject(&model);
+    assert_endpoint_magnitude_parity(&model, &s);
+}
+
+/// Cross-endpoint `block_sigma` pairs: each row of a pair loads its own endpoint's factor,
+/// so `R`'s off-diagonal carries the product of two different multipliers.
+#[test]
+fn block_sigma_cmt_magnitude_objective_and_gradients() {
+    let src = ODE_ENDPOINT_MAGNITUDE.replace(
+        "  sigma PROP_TOT ~ 0.1 (sd)\n  sigma PROP_UNB ~ 0.15 (sd)\n",
+        "  block_sigma (PROP_TOT, PROP_UNB) = [0.01, 0.006, 0.0225]\n",
+    );
+    let model = tight(parse_model_string(&src).unwrap());
+    let s = endpoint_magnitude_subject(&model);
+    assert!(model.residual_cov_at(&model.default_params).is_dense());
+    assert_endpoint_magnitude_parity(&model, &s);
+}
+
+/// `if/else` branches on the closed-form engine, sharing a sigma with a factor on one
+/// branch and a `combined` on the other, with `EARLY` changing inside the subject. The
+/// `Selected` key is a branch index, not a `CMT`.
+fn selected_magnitude_fixture() -> (CompiledModel, Subject) {
+    let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TH_M(1.4, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+  sigma ADD_ERR ~ 0.05 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[covariates]
+  EARLY continuous
+[error_model]
+  if (EARLY > 0.5) {
+    DV ~ proportional(PROP_ERR * TH_M)
+  } else {
+    DV ~ combined(PROP_ERR, ADD_ERR)
+  }
+"#;
+    let model = tight(parse_model_string(src).unwrap());
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0];
+    let mut s = subject_shell(doses, &times);
+    s.covariates.insert("EARLY".into(), 0.0);
+    s.obs_covariates = (0..times.len())
+        .map(|j| HashMap::from([("EARLY".to_string(), (j % 2) as f64)]))
+        .collect();
+    let preds = crate::pk::compute_predictions_with_tv(
+        &model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.15 * (1.3 * j as f64).sin()))
+        .collect();
+    (model, s)
+}
+
+#[test]
+fn if_else_magnitude_objective_and_gradients() {
+    let (model, s) = selected_magnitude_fixture();
+    assert_endpoint_magnitude_parity(&model, &s);
+}
+
+/// The covariance step's R-matrix reads the row through its own call site
+/// (`ode_adjoint_hessian`), which the gradient oracles above never reach.
+#[test]
+fn endpoint_magnitude_cov_hessian_matches_fd() {
+    let (model, s) = selected_magnitude_fixture();
+    let (fd, _) = hessian_gaps(&model, &s, true);
+    // Measured 7.7e-12 (macOS arm64); ~13×.
+    assert!(fd < 1e-10, "{fd:.2e}");
+}
+
 // ---- closed-form analytic `init(...)` impulses -----------------------------------------
 
 const CF_INIT: &str = r#"
@@ -4894,6 +5089,77 @@ fn algebraic_model_matches_reconverged_fd() {
     assert!(fd < 1e-5, "FOCEI: FD {fd:.2e}");
     let fd = fd_oracle(&model, &s, false);
     assert!(fd < FOCE_FD_TOL, "FOCE vs FD {fd:.2e}");
+}
+
+/// #2720: a circadian baseline with the phase random effect inside `cos` and `sin`.
+const CIRCADIAN: &str = r#"
+[parameters]
+  theta TVBASE(120.0, 1.0, 1000.0)
+  theta TVAMP1(0.12, 0.001, 1.0)
+  theta PHS1(0.9, -5.0, 5.0)
+  theta TVAMP2(0.04, 0.001, 1.0)
+  omega ETA_BASE ~ 0.03
+  omega ETA_AMP1 ~ 0.08
+  omega ETA_SHIFT ~ 0.5
+  sigma PROP ~ 0.03 (sd)
+[individual_parameters]
+  BASE  = TVBASE * exp(ETA_BASE)
+  AMP1  = TVAMP1 * exp(ETA_AMP1)
+  SHIFT = ETA_SHIFT
+[structural_model]
+  CIRC = AMP1 * cos(2 * 3.141592653589793 * (TIME + SHIFT) / 24 - PHS1) + TVAMP2 * sin(4 * 3.141592653589793 * (TIME + SHIFT) / 24 - 0.5)
+  y = BASE * (1 + CIRC)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// #2720: `sin`/`cos` with a random effect in the argument, through every order the
+/// recorders read. The FOCE/FOCEI gradient differentiates the lifted `φ′`, the Laplace
+/// exact anchor's taped-Hessian sweep `φ″` (`DualV::lift3`), and the covariance step's
+/// nested dual `φ‴`/`φ⁗` (`DualT::lift3`, `DualH::lift4`) — each against the reconverged
+/// FD of the production objective, which shares no derivative code with the adjoint.
+///
+/// `ω(SHIFT)` is kept small on purpose. The inner objective is periodic in a phase η,
+/// so it can have several modes, and at `ω = 3 h²` the FOCE oracle's re-solve at
+/// `x[0] + 1e-3` landed on a second one (`η̂_SHIFT` 1.71 → 6.11, measured): a 31% "gap"
+/// that was the oracle switching basins, not the adjoint. At `ω = 0.5` the mode is
+/// unique over the stencil.
+#[test]
+fn circadian_sin_cos_matches_reconverged_fd() {
+    let model = crate::parser::model_parser::parse_full_model(CIRCADIAN)
+        .unwrap()
+        .model;
+    assert!(model.is_algebraic());
+    let s = subject(&model, vec![], &TIMES, &[0.1, -0.2, 0.6]);
+    assert!(
+        in_scope(&model, &s),
+        "the compartment-free recorder must serve a sin/cos subject"
+    );
+    // Measured (Linux): FOCEI 6.7e-9, FOCE 7.4e-9, Laplace 3.3e-11, Hessians FOCEI 8.8e-11
+    // and Laplace 1.3e-10 — the oracles' floor; the bounds are this file's shared ones.
+    let g = fd_oracle(&model, &s, true);
+    eprintln!("circadian FOCEI gradient vs reconverged FD {g:.2e}");
+    assert!(g < 1e-5, "FOCEI gradient vs FD {g:.2e}");
+    let g = fd_oracle(&model, &s, false);
+    eprintln!("circadian FOCE gradient vs reconverged FD {g:.2e}");
+    assert!(g < FOCE_FD_TOL, "FOCE gradient vs FD {g:.2e}");
+    let g = fd_oracle_agq(&model, &s, 1, true);
+    eprintln!("circadian Laplace gradient vs reconverged FD {g:.2e}");
+    assert!(g < 1e-5, "Laplace gradient vs FD {g:.2e}");
+    for (objective, name) in [
+        (Objective::Focei, "FOCEI"),
+        (
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+            "Laplace",
+        ),
+    ] {
+        let (fd, _) = hessian_gaps_for(&model, &s, objective);
+        eprintln!("circadian {name} Hessian vs reconverged FD {fd:.2e}");
+        assert!(fd < 1e-5, "{name} Hessian vs FD {fd:.2e}");
+    }
 }
 
 #[test]

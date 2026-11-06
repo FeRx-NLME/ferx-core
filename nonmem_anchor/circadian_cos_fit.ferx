@@ -1,0 +1,37 @@
+# #2720 NONMEM anchor: a circadian baseline through `cos(...)` and `sin(...)`.
+#
+# Two harmonics on a log-normal baseline, with a phase random effect (ETA_SHIFT,
+# in hours) inside BOTH trigonometric arguments, so the eta-derivative of the
+# prediction runs through cos and sin. The NONMEM $PRED twins are
+# circadian_cos.ctl (evaluated at the initial estimates below, MAXEVAL=0) and
+# circadian_cos_est.ctl (fitted to convergence). Data: circadian_cos.csv
+# (simulate_circadian_cos.py, seed 2720). See nonmem_anchor/README.md.
+
+[parameters]
+  theta TVBASE(110, 1, 1000)
+  theta TVAMP1(0.10, 0.001, 1)
+  theta PHS1(0.8, -5, 5)
+  theta TVAMP2(0.05, 0.001, 1)
+  theta PHS2(0.6, -5, 5)
+
+  omega ETA_BASE  ~ 0.03
+  omega ETA_AMP1  ~ 0.08
+  omega ETA_SHIFT ~ 3.0
+
+  sigma PROP_ERR ~ 0.03 (sd)
+
+[individual_parameters]
+  BASE  = TVBASE * exp(ETA_BASE)
+  AMP1  = TVAMP1 * exp(ETA_AMP1)
+  SHIFT = ETA_SHIFT
+
+[structural_model]
+  CIRC = AMP1 * cos(2 * 3.141592653589793 * (TIME + SHIFT) / 24 - PHS1) + TVAMP2 * sin(4 * 3.141592653589793 * (TIME + SHIFT) / 24 - PHS2)
+  y = BASE * (1 + CIRC)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  covariance = true

@@ -3137,14 +3137,7 @@ fn gaussian_fixed_eta_data_score(
         pr.ruv_mult = match model.ruv_magnitude.as_ref().filter(|rm| rm.is_active()) {
             Some(rm) => Some(
                 (0..n_obs)
-                    .map(|j| {
-                        rm.eval_obs_g(
-                            &pr.theta,
-                            subject.obs_cov(j),
-                            subject.readout_time(j),
-                            rm.tad_for(subject, j),
-                        )
-                    })
+                    .map(|j| rm.eval_subject_obs_g(&model.error_spec, subject, j, &pr.theta))
                     .collect::<Option<Vec<_>>>()?,
             ),
             None => None,
@@ -3672,14 +3665,7 @@ fn tape_params(
     let ruv_mult = match model.ruv_magnitude.as_ref().filter(|rm| rm.is_active()) {
         Some(rm) => Some(
             (0..subject.observations.len())
-                .map(|j| {
-                    rm.eval_obs_g(
-                        &pr.theta,
-                        subject.obs_cov(j),
-                        subject.readout_time(j),
-                        rm.tad_for(subject, j),
-                    )
-                })
+                .map(|j| rm.eval_subject_obs_g(&model.error_spec, subject, j, &pr.theta))
                 .collect::<Option<Vec<_>>>()?,
         ),
         None => None,

@@ -1040,8 +1040,10 @@ pub struct Subject {
     /// `(engine time, TIME as written)` of every dose and reset row the reader shifted
     /// onto the monotonic timeline because a reset restarted `TIME` (#1969), ascending
     /// in engine time. Empty for a subject with no such period. Read through
-    /// `Subject::param_time_at`: a dose or reset row is never moved one ULP, so its
-    /// engine time finds its row here exactly. The written time is stored rather than
+    /// `Subject::param_time_at`: a dose row is never moved one ULP, so its engine time
+    /// finds its row here exactly. A reset is moved one ULP only with a trough listed
+    /// after it at a dose tie (#2728); the reader then adds a row for both its moved time
+    /// and the tie, so it and the doses there each find their own. The written time is stored rather than
     /// recomputed as `engine − offset`, which is inexact for most decimal times
     /// (`(0.1 + 73.1) − 73.1` is `0.09999999999999432`).
     pub reset_period_times: Vec<(f64, f64)>,
@@ -3388,11 +3390,24 @@ impl std::fmt::Debug for KappaWeight {
     }
 }
 
+/// One endpoint's magnitude programs (#2731), for a `CMT=N:` line or an `if/else`
+/// branch: the same two parallel tables as [`RuvMagnitude::per_sigma`] and
+/// [`RuvMagnitude::per_sigma_deriv`], indexed on the flat sigma vector, with `None`
+/// for a slot this endpoint leaves bare or does not load.
+pub(crate) struct EndpointMagnitude {
+    pub(crate) per_sigma: Vec<Option<RuvMagFn>>,
+    pub(crate) per_sigma_deriv: Vec<Option<crate::parser::model_parser::RuvMagDerivProgram>>,
+}
+
 /// Custom residual-error magnitude (#484): one optional multiplier per flat
 /// sigma slot, indexed positionally to match `ErrorSpec::Single`'s sigma
 /// consumption order. `per_sigma[k] == None` means slot `k` is a bare sigma
 /// (multiplier ≡ 1, the legacy path); `Some(f)` makes the slot's magnitude
 /// vary with TIME / covariates / theta.
+///
+/// A multi-endpoint block carries its expressions in `per_endpoint` instead and
+/// leaves `per_sigma` all `None`: two endpoints may share a sigma under different
+/// factors, so a slot's multiplier depends on which endpoint the row resolves to.
 ///
 /// `#[non_exhaustive]`: `per_sigma_deriv` (#576/#486) is the first field added
 /// since this type shipped; marking the struct non-exhaustive now means a
@@ -3449,6 +3464,12 @@ pub struct RuvMagnitude {
     /// so the scan runs only when an expression can see the result. Set by
     /// the parser; `false` for every model built before this field existed.
     pub(crate) uses_tad: bool,
+    /// Per-endpoint magnitudes of a `CMT=N:` or `if/else` block (#2731), keyed as
+    /// [`ErrorSpec::obs_key`] keys the row: the data `CMT` for `PerCmt`, the branch
+    /// index for `Selected`. An endpoint with only bare sigmas has no entry, and its
+    /// rows read `per_sigma`, which such a block leaves all `None`. Empty for a
+    /// single-endpoint block.
+    pub(crate) per_endpoint: HashMap<usize, EndpointMagnitude>,
 }
 
 impl std::fmt::Debug for RuvMagnitude {
@@ -3465,6 +3486,10 @@ impl std::fmt::Debug for RuvMagnitude {
                 .map(|s| if s.is_some() { "power" } else { "-" })
                 .collect();
             write!(f, "RuvMagnitude({:?}, exponent {:?})", slots, exps)
+        } else if !self.per_endpoint.is_empty() {
+            let mut keys: Vec<usize> = self.per_endpoint.keys().copied().collect();
+            keys.sort_unstable();
+            write!(f, "RuvMagnitude(endpoints {:?})", keys)
         } else {
             write!(f, "RuvMagnitude({:?})", slots)
         }
@@ -3476,7 +3501,32 @@ impl RuvMagnitude {
     /// `RuvMagnitude` whose slots are all `None` behaves identically to no
     /// custom magnitude.
     pub fn is_active(&self) -> bool {
-        self.per_sigma.iter().any(|s| s.is_some()) || self.has_exponent()
+        self.per_sigma.iter().any(|s| s.is_some())
+            || self.has_exponent()
+            || self.has_endpoint_magnitude()
+    }
+
+    /// Whether the magnitude is keyed by endpoint, a `CMT=N:` or `if/else` block
+    /// (#2731). [`eval_obs`](Self::eval_obs) cannot see such a magnitude: it has no
+    /// endpoint to look up.
+    pub(crate) fn has_endpoint_magnitude(&self) -> bool {
+        !self.per_endpoint.is_empty()
+    }
+
+    /// The magnitude programs of the endpoint observation `j` of `subject` resolves
+    /// to, or `None` to read the single-endpoint tables. The key is resolved only for
+    /// a block that has endpoint magnitudes, since a `Selected` key evaluates the
+    /// selector and this runs on the inner objective's per-call path.
+    fn endpoint_for(
+        &self,
+        spec: &ErrorSpec,
+        subject: &Subject,
+        j: usize,
+    ) -> Option<&EndpointMagnitude> {
+        if self.per_endpoint.is_empty() {
+            return None;
+        }
+        self.per_endpoint.get(&spec.obs_key(subject, j))
     }
 
     /// Whether any slot carries a `power(...)` exponent (#1182). When true,
@@ -3502,6 +3552,9 @@ impl RuvMagnitude {
     /// active, the exponents (`1.0` for a slot without one) following the
     /// multipliers. `tad` is the record's time after dose
     /// ([`Subject::time_after_dose`]).
+    ///
+    /// This reads the single-endpoint tables, so for a `CMT=N:` or `if/else` block it
+    /// returns all ones; [`CompiledModel::ruv_obs_mult`] resolves each row's endpoint.
     pub fn eval_obs(
         &self,
         theta: &[f64],
@@ -3509,8 +3562,39 @@ impl RuvMagnitude {
         time: f64,
         tad: f64,
     ) -> Vec<f64> {
-        let mut out: Vec<f64> = self
-            .per_sigma
+        self.eval_row(&self.per_sigma, theta, obs_covariates, time, tad)
+    }
+
+    /// [`eval_obs`](Self::eval_obs) of observation `j` of `subject`, on the magnitude
+    /// programs of the endpoint it resolves to under `spec`.
+    pub(crate) fn eval_subject_obs(
+        &self,
+        spec: &ErrorSpec,
+        subject: &Subject,
+        j: usize,
+        theta: &[f64],
+    ) -> Vec<f64> {
+        let fns = self
+            .endpoint_for(spec, subject, j)
+            .map_or(&self.per_sigma, |ep| &ep.per_sigma);
+        self.eval_row(
+            fns,
+            theta,
+            subject.obs_cov(j),
+            subject.readout_time(j),
+            self.tad_for(subject, j),
+        )
+    }
+
+    fn eval_row(
+        &self,
+        fns: &[Option<RuvMagFn>],
+        theta: &[f64],
+        obs_covariates: &HashMap<String, f64>,
+        time: f64,
+        tad: f64,
+    ) -> Vec<f64> {
+        let mut out: Vec<f64> = fns
             .iter()
             .map(|slot| match slot {
                 Some(f) => f(theta, obs_covariates, time, tad),
@@ -3527,17 +3611,20 @@ impl RuvMagnitude {
         out
     }
 
-    /// [`eval_obs`](Self::eval_obs) over any VM number type, from the compiled slot
-    /// programs (`per_sigma_deriv` / `per_sigma_exponent_deriv`): the same two-half row
-    /// (multipliers, then exponents when a power form is active), each a function of the
-    /// caller's θ. `None` when an active slot has no compiled program.
-    pub(crate) fn eval_obs_g<T: crate::sens::num::vm::VmNum>(
+    /// [`eval_subject_obs`](Self::eval_subject_obs) over any VM number type, from the
+    /// compiled slot programs (`per_sigma_deriv` / `per_sigma_exponent_deriv`): the same
+    /// two-half row (multipliers, then exponents when a power form is active), each a
+    /// function of the caller's θ. `None` when an active slot has no compiled program.
+    pub(crate) fn eval_subject_obs_g<T: crate::sens::num::vm::VmNum>(
         &self,
+        spec: &ErrorSpec,
+        subject: &Subject,
+        j: usize,
         theta: &[T],
-        obs_covariates: &HashMap<String, f64>,
-        time: f64,
-        tad: f64,
     ) -> Option<Vec<T>> {
+        let obs_covariates = subject.obs_cov(j);
+        let time = subject.readout_time(j);
+        let tad = self.tad_for(subject, j);
         let half = |fns: &[Option<RuvMagFn>],
                     progs: &[Option<crate::parser::model_parser::RuvMagDerivProgram>]|
          -> Option<Vec<T>> {
@@ -3553,7 +3640,10 @@ impl RuvMagnitude {
                 })
                 .collect()
         };
-        let mut out = half(&self.per_sigma, &self.per_sigma_deriv)?;
+        let mut out = match self.endpoint_for(spec, subject, j) {
+            Some(ep) => half(&ep.per_sigma, &ep.per_sigma_deriv)?,
+            None => half(&self.per_sigma, &self.per_sigma_deriv)?,
+        };
         if self.has_exponent() {
             out.extend(half(
                 &self.per_sigma_exponent,
@@ -6178,12 +6268,7 @@ impl CompiledModel {
         let n = subject.observations.len();
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
-            out.push(rm.eval_obs(
-                theta,
-                subject.obs_cov(j),
-                subject.readout_time(j),
-                rm.tad_for(subject, j),
-            ));
+            out.push(rm.eval_subject_obs(&self.error_spec, subject, j, theta));
         }
         Some(out)
     }
@@ -7397,6 +7482,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // distinct from a budget-limited convergence failure so programmatic
         // consumers can choose new starts or a chained initializer.
         (WarningSeverity::Critical, WarningCode::ViBadBasin)
+    } else if lower.starts_with("w_mcem_mstep_") {
+        // #2718: the IMP / IMPMAP weighted M-step left a parameter at its start, or NLopt
+        // failed it, and `converged` is demoted. A token arm ahead of the prose ones: the
+        // first message advises "mu-reference", which the `MuReferencing` arm below would
+        // claim as `Info`.
+        (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("w_absorption_twin_declined") {
         // #1008: the analytic absorption model kept no ODE twin. Not an estimation problem —
         // the fit that follows is a pure closed form — but the model has silently lost the
@@ -9558,7 +9649,8 @@ pub struct FitOptions {
     /// then reach a low-noise objective instead of carrying a sample-count-dependent
     /// M-step bias, but a fit that stays above the target while its SE does scale runs
     /// at the cap, at about ten times the per-iteration cost of K = 1000. Set `false`
-    /// to pin the sample count.
+    /// to pin the sample count. Estimating path only: an `imp_eval_only` evaluation
+    /// draws a fixed `imp_samples` and warns if this is set (#2717).
     pub imp_auto: bool,
     /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
     /// [`FitOptions::imp_auto`] but moves `impmap_samples`. Default `true`.
@@ -9574,10 +9666,13 @@ pub struct FitOptions {
     pub impmap_max_time: Option<f64>,
     /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
     /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
-    /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
+    /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1. Read by the
+    /// estimating `imp` / `impmap` iterations only: a reported marginal, including an
+    /// `imp_eval_only` evaluation, draws at scale 1, and `imp_eval_only` warns if this
+    /// is set (#2717).
     pub iscale_min: f64,
     /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
-    /// Default 10.0.
+    /// Default 10.0. Same scope as [`Self::iscale_min`].
     pub iscale_max: f64,
     /// Defensive-mixture weight for the IMP/IMPMAP importance-sampling proposal
     /// (issue #528). Each subject draws an `imp_defensive_alpha` fraction of its
@@ -10914,6 +11009,15 @@ impl FitOptions {
         v
     }
 
+    /// Whether no stage of the chain estimates: each one runs as a pure evaluator, so the
+    /// fit reports the initial estimates by request (#2716). That is a standalone
+    /// `imp_eval_only` or `agq_eval_only` run. A readout after an estimator is not one, and
+    /// neither is a run whose flag names a method outside its chain, where the flag is inert.
+    pub(crate) fn evaluation_only_chain(&self) -> bool {
+        let eval_only = self.eval_only_methods();
+        self.method_chain().iter().all(|m| eval_only.contains(m))
+    }
+
     /// The chain stage that would run the post-fit covariance step: the last stage that
     /// estimates, ignoring a trailing run of evaluation-only stages (#615).
     ///
@@ -11110,7 +11214,55 @@ impl FitOptions {
             ));
         }
         warnings.extend(self.inert_covariance_key_notices());
+        warnings.extend(self.inert_imp_eval_only_key_notices());
         warnings
+    }
+
+    /// Notices for the MCEM-only `imp` keys set on a chain whose `imp` stage only evaluates.
+    ///
+    /// `iscale_min`, `iscale_max` and `imp_auto` belong to `imp`'s key list because the
+    /// estimating path reads them, so [`Self::unsupported_keys_warnings`] accepts them. The
+    /// evaluator reads none: it draws at a fixed scale of 1 and a fixed `imp_samples`, and
+    /// its proposal is shaped by `imp_adapt_passes` alone (#2717).
+    ///
+    /// This keys on `user_set_keys`, not on the values, because `imp_auto` defaults to
+    /// `true`. A key another stage of the chain reads stays quiet: `iscale_*` still drive
+    /// the IMPMAP stage of `[impmap, imp]`. A chain with no `imp` stage is left to the
+    /// "not used by method" warning, which already covers these keys there.
+    fn inert_imp_eval_only_key_notices(&self) -> Vec<String> {
+        let chain = self.method_chain();
+        if !self.imp_eval_only || !chain.contains(&EstimationMethod::Imp) {
+            return Vec::new();
+        }
+        let read_by_another_stage = |key: &str| {
+            chain
+                .iter()
+                .filter(|&&m| m != EstimationMethod::Imp)
+                .any(|&m| method_specific_keys(m).contains(&key))
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut notices = Vec::new();
+        for key in &self.user_set_keys {
+            let notice = match key.as_str() {
+                "iscale_min" | "iscale_max" => format!(
+                    "fit option `{key}` bounds the proposal-scale search of the estimating \
+                     IMP iterations, but `imp_eval_only` runs an evaluation, which does not \
+                     search a scale, so it has no effect. An evaluation's proposal is adapted \
+                     only by `imp_adapt_passes`."
+                ),
+                "imp_auto" => "fit option `imp_auto` adapts the sample count of the estimating \
+                     IMP iterations, but `imp_eval_only` runs an evaluation, which draws a \
+                     fixed `imp_samples` per subject in each pass, so it has no effect. Raise \
+                     `imp_samples` to lower the evaluation's Monte-Carlo error."
+                    .to_string(),
+                _ => continue,
+            };
+            if read_by_another_stage(key) || !seen.insert(key.clone()) {
+                continue;
+            }
+            notices.push(notice);
+        }
+        notices
     }
 
     /// Notices for [`covariance_keys`] set on a chain whose covariance step never runs.

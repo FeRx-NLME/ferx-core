@@ -3184,13 +3184,20 @@ pub(crate) fn high_correlation_warning(result: &FitResult) -> Option<(String, Wa
 /// the OFV of the initial values and so carries no information about the model —
 /// a judgement for the caller, and one `Strictness::reject_init_stall` already
 /// makes for search harnesses that want it fatal.
-pub(crate) fn stalled_at_init_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
-    // An evaluation-only run (`outer_maxiter = 0`, NONMEM `MAXEVAL=0`) reports the
-    // objective at the initial estimates *by request*. The predicate is perfectly
-    // correct there and the warning tells the caller nothing they did not ask for,
-    // so it is suppressed — the one case where "the estimates are the initial
-    // values" is the answer rather than a symptom.
-    if result.outer_maxiter == 0 {
+pub(crate) fn stalled_at_init_warning(
+    result: &FitResult,
+    options: &FitOptions,
+) -> Option<(String, WarningEntry)> {
+    // An evaluation-only run reports the objective at the initial estimates *by
+    // request*: `outer_maxiter = 0` (NONMEM `MAXEVAL=0`), or a chain with no estimating
+    // stage (a standalone `imp_eval_only` or `agq_eval_only`, #2716). The predicate is
+    // perfectly correct there and the warning tells the caller nothing they did not ask
+    // for, so it is suppressed — the one case where "the estimates are the initial
+    // values" is the answer rather than a symptom. The second spelling is read from
+    // `options` because the result records no trace of it: its `outer_maxiter` is the
+    // untouched default, and an estimating IMP fit carries the same `method_chain` and
+    // `importance_sampling`.
+    if result.outer_maxiter == 0 || options.evaluation_only_chain() {
         return None;
     }
     if crate::model_selection::stalled_at_init(result) != Some(true) {
