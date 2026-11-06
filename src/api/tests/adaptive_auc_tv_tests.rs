@@ -101,6 +101,7 @@ pub(super) fn fixed_dose_spec(observe: Option<&str>, at: &[f64], dose: f64) -> A
         levels: None,
         target_window: None,
         auc_target: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: -1e9,

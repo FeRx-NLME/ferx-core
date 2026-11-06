@@ -1,7 +1,7 @@
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::sim::adaptive::{
     validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, DoseStep, DoseValue, IntervalStep,
+    Comparison, DoseKnowledge, DoseStep, DoseValue, IntervalStep,
 };
 use crate::types::*;
 use regex::Regex;
@@ -6560,19 +6560,25 @@ pub fn parse_full_model_with(
 
     // #944: the `[adaptive_dosing]` dose expressions are stored as source and compiled
     // at simulate time, like `observe`. Check them against the model here, so a syntax
-    // error or a read a dose expression may not make (a state, `TIME`, κ, an individual
-    // parameter, η, `MIXNUM`) is a parse error that `ferx check` reports. A covariate
-    // absent from the data needs the data, so that stays at simulate time.
+    // error or a read a dose expression may never make (a state, `TIME`, κ, `MIXNUM`
+    // unless `dose_knowledge = oracle`) is a parse error that `ferx check` reports, as is
+    // an oracle block that reads nothing the oracle applies to. A covariate absent from
+    // the data needs the data, and whether a subject may read its individual parameters
+    // needs the supplied η, so both stay at simulate time.
     if let Some(spec) = adaptive_dosing.as_ref() {
+        let mut reads_truth = false;
         for (key, src) in spec.dose_expressions() {
-            check_adaptive_dose_expression(
+            reads_truth |= !check_adaptive_dose_expression(
                 src,
                 key,
                 &model,
                 &declared_covariate_names,
                 spec.at[0],
-            )?;
+                spec.dose_knowledge,
+            )?
+            .is_empty();
         }
+        check_dose_knowledge_used(spec.dose_knowledge, reads_truth)?;
     }
 
     // #993, the `[adaptive_dosing]` half. `observe` is compiled through the very
@@ -11399,6 +11405,7 @@ fn parse_adaptive_dosing_block(
     let mut dose_bounds: Option<(DoseValue, DoseValue)> = None;
     let mut confirm: u32 = 1;
     let mut levels: Option<Vec<DoseValue>> = None;
+    let mut dose_knowledge = DoseKnowledge::Known;
     let mut intervals: Option<Vec<f64>> = None;
     let mut start_interval: Option<f64> = None;
     // The `every` step of `at`, kept for the intervals-on-the-grid check (#945).
@@ -11509,6 +11516,17 @@ fn parse_adaptive_dosing_block(
                 }
                 levels = Some(l);
             }
+            "dose_knowledge" => {
+                dose_knowledge = match val {
+                    "known" => DoseKnowledge::Known,
+                    "oracle" => DoseKnowledge::Oracle,
+                    other => {
+                        return Err(format!(
+                            "[adaptive_dosing]: dose_knowledge must be `known` or `oracle`, got `{other}`"
+                        ))
+                    }
+                };
+            }
             "intervals" => {
                 let l = parse_float_array(val)
                     .map_err(|e| format!("[adaptive_dosing]: bad intervals: {e}"))?;
@@ -11591,6 +11609,7 @@ fn parse_adaptive_dosing_block(
         dose_bounds,
         confirm,
         levels,
+        dose_knowledge,
         intervals,
         start_interval,
         target_window,
@@ -13837,25 +13856,33 @@ fn warn_if_time_alias_folds(
 }
 
 /// Refuse what an `[adaptive_dosing]` dose expression (`start_dose`, a side of
-/// `dose_bounds`, a rung of `levels`; #944) may not read.
+/// `dose_bounds`, a rung of `levels`; #944) may never read, and return the subject
+/// values it reads that are known only for some subjects.
 ///
-/// A dose expression is evaluated once per subject, at the first decision, from θ and
-/// the data covariates in force there. The shared output compiler would accept more —
-/// a state compiles and reads the (zero) state slice, `TIME` reads 0.0 outside the
-/// driver, an individual parameter reads the (zero) PK slice — so each is refused here,
-/// by name, rather than silently evaluated to a number that means nothing. The
-/// parser runs it at model level, so `ferx check` reports it;
+/// A dose expression is evaluated once per subject, at the first decision. It may read
+/// θ and the data covariates in force there, and — for a subject whose values are known
+/// at dosing time — the subject's individual parameters and random effects. The shared
+/// output compiler would accept more: a state compiles and reads the (zero) state slice
+/// and `TIME` reads 0.0 outside the driver, so each is refused here, by name, rather than
+/// silently evaluated to a number that means nothing. A κ is drawn per occasion, so it is
+/// never known. The parser runs this at model level, so `ferx check` reports it;
 /// `compile_dose_exprs` runs it again on a spec built in code. A syntax error is
-/// reported with the key as its context. Individual parameters and random effects are
-/// refused outright here: which subjects' values are known at dosing time is #944's
-/// next step.
+/// reported with the key as its context.
+///
+/// Returns the names of the individual parameters and random effects the expression
+/// reads (and `MIXNUM`), in first-read order: whether each subject may read them depends
+/// on whether its η are supplied, so that is decided before the run, per subject
+/// (`E_ADAPTIVE_DOSE_KNOWLEDGE`), not here. `MIXNUM` is refused here unless `knowledge`
+/// is [`DoseKnowledge::Oracle`]: supplied η refuse a `[mixture]` model, so no subject's
+/// class is ever known.
 pub(crate) fn check_adaptive_dose_expression(
     src: &str,
     key: &str,
     model: &CompiledModel,
     declared_covariates: &[String],
     at0: f64,
-) -> Result<(), String> {
+    knowledge: DoseKnowledge,
+) -> Result<Vec<String>, String> {
     let ctx = ParseCtx::new(
         &model.theta_names,
         &model.eta_names,
@@ -13873,48 +13900,71 @@ pub(crate) fn check_adaptive_dose_expression(
         return Err(format!(
             "[adaptive_dosing] {key} reads {k}, an inter-occasion random effect. It is drawn \
              for each occasion, so it is never known at dosing time, even for a subject whose \
-             random effects are supplied."
+             random effects are supplied. Read the individual parameter instead: it is \
+             evaluated at the first decision, with {k} = 0 for a supplied subject."
         ));
     }
     let states: &[String] = model
         .ode_spec
         .as_ref()
         .map_or(&[], |o| o.state_names.as_slice());
-    // A subject's own parameter value: not known at dosing time unless supplied, and
-    // supplied values are #944's next step, so refused with the route that works today.
-    const OWN_VALUE: &str = " A dose expression may read data covariates and θ; it \
-        cannot read a subject's own parameter values yet. To dose from a known value, carry \
-        it as a data column (e.g. CL_KNOWN) and read that.";
     let mut refusal: Option<String> = None;
+    let mut reads: Vec<String> = Vec::new();
+    let mut read = |n: &str| {
+        if !reads.iter().any(|r| r == n) {
+            reads.push(n.to_string());
+        }
+    };
     visit_expr_nodes(&expr, &mut |e: &Expression| {
         if refusal.is_some() {
             return;
         }
-        refusal = match e {
+        match e {
             Expression::Variable(n) | Expression::Covariate(n) if states.contains(n) => {
-                Some(format!(
+                refusal = Some(format!(
                     "{n}, a state of the model. A dose expression is evaluated once per \
-                     subject, at the first decision; it may read data covariates and θ. To \
-                     respond to the drug level, write a `when signal …` rule."
-                ))
+                     subject, at the first decision; it may read data covariates, θ and \
+                     the subject's individual parameters. To respond to the drug level, \
+                     write a `when signal …` rule."
+                ));
             }
-            Expression::Variable(n) => Some(format!("{n}, an individual parameter.{OWN_VALUE}")),
-            Expression::Eta(i) => Some(format!(
-                "{}, a random effect.{OWN_VALUE}",
-                model.eta_names.get(*i).map_or("an η", String::as_str)
-            )),
-            Expression::MixNum => Some(
-                "MIXNUM, the subject's mixture class, which the simulation draws; no \
-                 prescriber knows it at dosing time."
-                    .to_string(),
-            ),
-            _ => None,
-        };
+            Expression::Variable(n) => read(n),
+            Expression::Eta(i) => read(model.eta_names.get(*i).map_or("an η", String::as_str)),
+            Expression::MixNum if knowledge != DoseKnowledge::Oracle => {
+                refusal = Some(
+                    "MIXNUM, the subject's mixture class, which the simulation draws; no \
+                     prescriber knows it at dosing time. For a perfect-information \
+                     comparison arm, set dose_knowledge = oracle, which is flagged in the \
+                     results."
+                        .to_string(),
+                );
+            }
+            Expression::MixNum => read("MIXNUM"),
+            _ => {}
+        }
     });
     match refusal {
         Some(what) => Err(format!("[adaptive_dosing] {key} reads {what}")),
-        None => Ok(()),
+        None => Ok(reads),
     }
+}
+
+/// `dose_knowledge = oracle` must have something to apply to (#944): a block whose dose
+/// expressions read no individual parameter, random effect or mixture class would flag
+/// a run that read no simulated truth, so it is refused instead. `reads_truth` is
+/// whether any [`check_adaptive_dose_expression`] returned a read.
+pub(crate) fn check_dose_knowledge_used(
+    knowledge: DoseKnowledge,
+    reads_truth: bool,
+) -> Result<(), String> {
+    if knowledge == DoseKnowledge::Oracle && !reads_truth {
+        return Err(
+            "[adaptive_dosing] dose_knowledge = oracle has no effect: no dose expression \
+             reads an individual parameter, a random effect or MIXNUM."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Whether `expr` reads the model-time built-in, under either spelling: the

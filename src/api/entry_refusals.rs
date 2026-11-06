@@ -239,6 +239,18 @@ pub(crate) fn adaptive_dose_value(message: impl Into<String>) -> EngineError {
     )
 }
 
+/// `E_ADAPTIVE_DOSE_KNOWLEDGE`: an `[adaptive_dosing]` dose expression reads a
+/// subject's individual parameter or random effect, and some subject's η are drawn by
+/// the simulation, under `dose_knowledge = known` (#944). Refused before any subject
+/// runs; the message lists the drawn subjects and the three routes.
+pub(crate) fn adaptive_dose_knowledge(message: impl Into<String>) -> EngineError {
+    coded(
+        "E_ADAPTIVE_DOSE_KNOWLEDGE",
+        Some("adaptive_dosing"),
+        message.into(),
+    )
+}
+
 /// `E_THETA_LENGTH`: a θ whose length is not the model's (#1614, #1615) — a
 /// parameter vector handed to a `simulate*` / `predict*` entry point, or the fit's θ
 /// against the model `run_sir` / `run_covariance` run on (#1774).

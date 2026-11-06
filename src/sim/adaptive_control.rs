@@ -280,6 +280,17 @@ struct CompiledDoseExpr {
     key: &'static str,
     eval: OdeOutputFn,
     covariates: Vec<String>,
+    /// The subject values it reads: individual parameters, random effects, `MIXNUM`
+    /// (`check_adaptive_dose_expression`'s return).
+    subject_values: Vec<String>,
+}
+
+/// A subject's own values at the first decision, for the dose expressions that read
+/// them (#944): its `[η | κ]` and the PK they give there. A supplied subject passes its
+/// supplied η with κ = 0; an oracle subject its drawn η and first-occasion κ.
+pub(crate) struct SubjectValues<'a> {
+    pub eta: &'a [f64],
+    pub pk: &'a crate::types::PkParams,
 }
 
 /// One subject's dose plan, or the first invariant it breaks.
@@ -305,29 +316,55 @@ impl CompiledDoseExprs {
         out
     }
 
-    /// Evaluate every dose value of `spec` for one subject, from `theta` and the
-    /// covariates `covs` in force at the first decision (#944).
+    /// The subject values the expressions read (individual parameters, random effects,
+    /// `MIXNUM`), each once, with the first key that reads it.
+    pub(crate) fn subject_value_reads(&self) -> Vec<(&'static str, &str)> {
+        let mut out: Vec<(&'static str, &str)> = Vec::new();
+        for e in &self.exprs {
+            for n in &e.subject_values {
+                if !out.iter().any(|(_, m)| m == n) {
+                    out.push((e.key, n));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether any expression reads a subject value, so that a subject may be dosed from
+    /// it only when that value is known (or under `dose_knowledge = oracle`).
+    pub(crate) fn reads_subject_values(&self) -> bool {
+        self.exprs.iter().any(|e| !e.subject_values.is_empty())
+    }
+
+    /// Evaluate every dose value of `spec` for one subject, from `theta`, the
+    /// covariates `covs` in force at the first decision, and — when an expression reads
+    /// them — the subject's own values `subject` there (#944).
     ///
-    /// An expression reads only θ and covariates — the parser refuses a state, `TIME`,
-    /// an individual parameter, a random effect and `MIXNUM`
-    /// (`check_adaptive_dose_expression`), and `compile_adaptive` refuses them again on
-    /// a spec built in code — so the state, PK and η slices it is handed are zeros that
-    /// it never reads.
+    /// The parser refuses a state and `TIME` (`check_adaptive_dose_expression`), and
+    /// `compile_adaptive` refuses them again on a spec built in code, so the state slice
+    /// is zeros that no expression reads. With `subject` absent the PK and η slices are
+    /// zeros too; the caller passes `None` only when [`Self::reads_subject_values`] is
+    /// false.
     pub(crate) fn resolve(
         &self,
         spec: &AdaptiveDosingSpec,
         model: &CompiledModel,
         theta: &[f64],
         covs: &std::collections::HashMap<String, f64>,
+        subject: Option<&SubjectValues<'_>>,
     ) -> ResolvedDosePlan {
         let n_states = model.ode_spec.as_ref().map_or(0, |o| o.n_states);
         let states = vec![0.0; n_states];
-        let pk = crate::types::PkParams::default();
-        let eta = vec![0.0; model.n_eta + model.n_kappa];
+        let zero_pk = crate::types::PkParams::default();
+        let zero_eta = vec![0.0; model.n_eta + model.n_kappa];
+        let (pk, eta) = match subject {
+            Some(v) => (v.pk, v.eta),
+            None => (&zero_pk, zero_eta.as_slice()),
+        };
         let mut values = self
             .exprs
             .iter()
-            .map(|e| (e.eval)(&states, &pk.values, theta, &eta, covs));
+            .map(|e| (e.eval)(&states, &pk.values, theta, eta, covs));
         let mut value = |v: &crate::sim::adaptive::DoseValue| match v.as_literal() {
             Some(x) => x,
             None => values
@@ -346,7 +383,7 @@ impl CompiledDoseExprs {
             dose_bounds,
             levels,
         };
-        let reads = self
+        let mut reads: Vec<(String, f64)> = self
             .covariates()
             .into_iter()
             .map(|(_, c)| {
@@ -356,12 +393,40 @@ impl CompiledDoseExprs {
                 )
             })
             .collect();
+        reads.extend(
+            self.subject_value_reads()
+                .into_iter()
+                .map(|(_, n)| (n.to_string(), subject_value_read(model, pk, eta, n))),
+        );
         ResolvedDosePlan {
             violation: dose_plan_violation(&plan),
             plan,
             reads,
         }
     }
+}
+
+/// The value a dose expression reads for subject value `name` — the slot
+/// `build_y_output_fn` reads it from: an individual parameter's PK slot, a random
+/// effect's η, or the mixture class. For the "reads" sentence of a refusal, so it
+/// reports the value the expression used.
+fn subject_value_read(
+    model: &CompiledModel,
+    pk: &crate::types::PkParams,
+    eta: &[f64],
+    name: &str,
+) -> f64 {
+    if name == "MIXNUM" {
+        return crate::parser::model_parser::current_mixture_class() as f64;
+    }
+    if let Some(i) = model.indiv_param_names.iter().position(|n| n == name) {
+        return pk.values[model.pk_indices.get(i).copied().unwrap_or(i)];
+    }
+    model
+        .eta_names
+        .iter()
+        .position(|n| n == name)
+        .map_or(f64::NAN, |i| eta[i])
 }
 
 /// Compile every dose expression of `spec` (#944) through the same
@@ -378,12 +443,13 @@ pub(crate) fn compile_dose_exprs(
         .map_or(&[], |o| o.state_names.as_slice());
     let mut exprs = Vec::new();
     for (key, src) in spec.dose_expressions() {
-        crate::parser::model_parser::check_adaptive_dose_expression(
+        let subject_values = crate::parser::model_parser::check_adaptive_dose_expression(
             src,
             key,
             model,
             &spec.observe_declared_covariates,
             spec.at[0],
+            spec.dose_knowledge,
         )?;
         let context = format!("[adaptive_dosing] {key}");
         let mut warnings: Vec<String> = Vec::new();
@@ -407,9 +473,15 @@ pub(crate) fn compile_dose_exprs(
             key,
             eval,
             covariates,
+            subject_values,
         });
     }
-    Ok(CompiledDoseExprs { exprs })
+    let compiled = CompiledDoseExprs { exprs };
+    crate::parser::model_parser::check_dose_knowledge_used(
+        spec.dose_knowledge,
+        compiled.reads_subject_values(),
+    )?;
+    Ok(compiled)
 }
 
 /// Compile a latent (`Ipred`) `observe` expression into the engine's
@@ -584,6 +656,7 @@ mod tests {
             levels: levels.map(|l| l.into_iter().map(Into::into).collect()),
             target_window: None,
             auc_target: None,
+            dose_knowledge: Default::default(),
             rules,
             intervals: None,
             start_interval: None,
@@ -943,6 +1016,7 @@ mod tests {
             levels: None,
             target_window: None,
             auc_target: None,
+            dose_knowledge: Default::default(),
             rules: vec![rule(Comparison::Gt, 1000.0, AdaptiveAction::Hold)],
             intervals: None,
             start_interval: None,
