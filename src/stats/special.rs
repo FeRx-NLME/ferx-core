@@ -222,9 +222,10 @@ pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
 /// in steps of ½: the Mills form is exact to the last bit in value, gradient and Hessian
 /// from `z = −10.5` down, while the `ln Φ` branch carries up to 2.8e-14 relative in its
 /// Hessian on `[−10, −2]`; at the switch the two meet to 2.7e-16 / 1.8e-16 / 1.4e-14.
-/// The switch is free in `(−26.5, −2)`: above `z ≈ −26.5` because there the `Dual2`
-/// Hessian of `ln Q(½, z²/2)` turns `NaN`, below `z = −2` because there
-/// [`mills_excess`]'s continued fraction stops being converged at [`MILLS_CF_DEPTH`].
+/// The switch is free in `(−26.5, −2)`. It must sit above `z ≈ −26.5`, because below
+/// it the `Dual2` Hessian of `ln Q(½, z²/2)` is `NaN`. It must sit below `z = −2`,
+/// because above it [`mills_excess`]'s continued fraction is not converged at
+/// [`MILLS_CF_DEPTH`].
 const LOG_NORMAL_CDF_MILLS_SWITCH: f64 = -10.0;
 
 /// Depth of [`mills_excess`]'s continued fraction. Measured against an 80-digit reference
@@ -1563,27 +1564,29 @@ mod tests {
         }
     }
 
-    /// The two branches of `log_normal_cdf_g` must meet at the switch (#2769): the Mills
-    /// form, written out here, against the `ln Φ` branch the function itself takes **at**
-    /// `z = LOG_NORMAL_CDF_MILLS_SWITCH` (the test is `z < switch`). A seam in the value
-    /// is a jump in the IG CDF; a seam in the slope or curvature a jump in the gradient
-    /// and Hessian the optimizer and the covariance step see.
+    /// The two branches of `log_normal_cdf_g` must meet at the switch (#2769). Both sides
+    /// come from the production function: the `ln Φ` branch it takes **at**
+    /// `z = LOG_NORMAL_CDF_MILLS_SWITCH` (the test is `z < switch`), and the Mills branch
+    /// it takes one ulp below. A seam in the value is a jump in the IG CDF. A seam in the
+    /// slope or curvature is a jump in the gradient and Hessian that the optimizer and the
+    /// covariance step see.
     #[test]
     fn log_normal_cdf_g_branches_meet_at_the_mills_switch() {
         use crate::sens::dual2::Dual2;
         let z0 = LOG_NORMAL_CDF_MILLS_SWITCH;
-        let z = Dual2::<1>::var(z0, 0);
-        let t = -z;
-        let mills = Dual2::<1>::from_f64(-0.5) * t * t
-            - Dual2::<1>::from_f64(HALF_LN_2PI)
-            - (t + mills_excess(t)).ln();
-        let at = log_normal_cdf_g(z);
-        // The ln Φ branch really is the one taken at the switch (else this compares the
-        // Mills form with itself).
+        let below = z0.next_down();
+        let at = log_normal_cdf_g(Dual2::<1>::var(z0, 0));
+        let mills = log_normal_cdf_g(Dual2::<1>::var(below, 0));
+        // Each side is the branch it is meant to be (else this compares one branch with
+        // itself): the value at the switch is the `ln Φ` spelling bit for bit, and the
+        // value one ulp below is not.
         assert_eq!(at.value, normal_cdf_g::<f64>(z0).ln());
+        assert_ne!(mills.value, normal_cdf_g::<f64>(below).ln());
+        // One ulp of z at −10 is 1.8e-15; with slope ≈ 10 and value ≈ −53 that moves the
+        // value by ~3e-16 relative and the slope by ~2e-16, both inside the bounds.
         // Measured at z = −10 (macOS arm64): value 2.7e-16, gradient 1.8e-16, Hessian
-        // 1.4e-14 relative — the `ln Φ` branch's own error against mpmath at the same
-        // point, so the seam is no larger than the branch's accuracy.
+        // 1.4e-14 relative. That is the `ln Φ` branch's own error against mpmath at the
+        // same point, so the seam is no larger than the branch's accuracy.
         assert_relative_eq!(at.value, mills.value, max_relative = 4e-15);
         assert_relative_eq!(at.grad[0], mills.grad[0], max_relative = 4e-15);
         assert_relative_eq!(at.hess[0][0], mills.hess[0][0], max_relative = 2e-13);
