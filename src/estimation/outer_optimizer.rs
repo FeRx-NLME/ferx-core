@@ -1,6 +1,6 @@
 use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_map, run_inner_loop_warm_seeded, stencil_inner_tol,
-    InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
+    GuardStop, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{
@@ -1593,6 +1593,7 @@ fn run_inner_loop_and_nll(
 ) {
     let (etas, h_matrices, stats, kappas, nll, _, _) = run_inner_loop_and_nll_prepared(
         model, population, params, options, prev_etas, None, mu_k, None, schedules, false, cancel,
+        None,
     );
     (etas, h_matrices, stats, kappas, nll)
 }
@@ -1651,6 +1652,11 @@ fn run_inner_loop_and_nll_prepared(
     // out of every accepted state passes `Some`: the NLopt objective and the global
     // pre-search. The built-in BFGS loop passes `None` and polls between iterations.
     cancel: Option<&crate::cancel::CancelFlag>,
+    // Stops the pass once the EBE guard is certain to reject it (#2709). Honoured on the
+    // schedule-cached and predicted passes, which are the ones the NLopt objective runs;
+    // the uncached arm solves every subject. A caller passing `Some` must read
+    // `GuardStop::stopped` and reject a stopped evaluation: its sum is over placeholders.
+    guard_stop: Option<&GuardStop>,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -1692,6 +1698,7 @@ fn run_inner_loop_and_nll_prepared(
                         schedules,
                         policy,
                         cancel,
+                        guard_stop,
                         take_terminal_work,
                     )
                 }
@@ -1709,6 +1716,7 @@ fn run_inner_loop_and_nll_prepared(
                         cache,
                         policy,
                         cancel,
+                        guard_stop,
                         take_terminal_work,
                     )
                 }
@@ -1727,9 +1735,11 @@ fn run_inner_loop_and_nll_prepared(
                     take_terminal_work,
                 ),
             };
-        // A cancel observed during the pass left placeholders, not modes: do not run
-        // the quadrature on them (#574).
-        if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled) {
+        // A cancel observed during the pass, or a stop on a certain guard rejection
+        // (#2709), left placeholders, not modes: do not run the quadrature on them (#574).
+        if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled)
+            || guard_stop.is_some_and(GuardStop::stopped)
+        {
             return (
                 etas,
                 h_matrices,
@@ -1825,6 +1835,7 @@ fn run_inner_loop_and_nll_prepared(
                 schedules,
                 policy,
                 cancel,
+                guard_stop,
                 finish_subject,
             )
         } else if let Some(cache) = schedules {
@@ -1841,6 +1852,7 @@ fn run_inner_loop_and_nll_prepared(
                 cache,
                 policy,
                 cancel,
+                guard_stop,
                 finish_subject,
             )
         } else {
@@ -1860,6 +1872,8 @@ fn run_inner_loop_and_nll_prepared(
             )
         };
     // A cancelled pass sums placeholder contributions (#574); never report it as an OFV.
+    // A pass stopped on a certain guard rejection (#2709) sums them too, but its caller
+    // reads `GuardStop::stopped` and rejects the evaluation, so that sum is never an OFV.
     let nll = if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled) {
         f64::INFINITY
     } else {
@@ -2064,6 +2078,70 @@ fn guarded_eval_line(
             stats.n_unconverged, n_subj,
         )
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: `true` runs every pass in full, the behaviour before #2709, so a test can
+    /// compare a fit with and without the stop. Read on the thread the objective runs on.
+    pub(crate) static GUARD_STOP_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Test counter: evaluations whose inner pass the #2709 stop cut short.
+    pub(crate) static GUARD_STOPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the #2709 stop is switched off: only ever by a test ([`GUARD_STOP_DISABLED`]).
+#[cfg(test)]
+fn guard_stop_disabled() -> bool {
+    GUARD_STOP_DISABLED.with(std::cell::Cell::get)
+}
+
+/// Whether the #2709 stop is switched off: never outside a test.
+#[cfg(not(test))]
+fn guard_stop_disabled() -> bool {
+    false
+}
+
+/// The statistics an evaluation is judged and reported on, and how many subjects its pass
+/// solved when it stopped on a certain guard rejection (#2709). A stopped pass reports the
+/// counts of the subjects it solved ([`GuardStop::observed_stats`]): its end-of-pass `pass`
+/// statistics also count every unsolved placeholder, as a hard rejection and as unconverged.
+fn stopped_pass_stats(
+    guard_stop: Option<&GuardStop>,
+    pass: InnerLoopStats,
+) -> (InnerLoopStats, Option<usize>) {
+    match guard_stop.filter(|g| g.stopped()) {
+        Some(g) => (g.observed_stats(), Some(g.solved())),
+        None => (pass, None),
+    }
+}
+
+/// The verbose line for an evaluation whose inner pass stopped once the EBE guard's
+/// rejection was certain (#2709): the trigger, the counts it stopped on, and how many
+/// subjects it left unsolved. The counts are of the `solved` subjects only.
+fn stopped_eval_line(
+    stats: &InnerLoopStats,
+    solved: usize,
+    n_subj: usize,
+    max_unconverged_frac: f64,
+) -> String {
+    let trigger = if stats.n_start_rejected > 0 {
+        format!(
+            "{} subjects rejected at their inner start",
+            stats.n_start_rejected
+        )
+    } else {
+        format!(
+            "{} subjects' inner loops did not converge, against `max_unconverged_frac` = \
+             {max_unconverged_frac}",
+            stats.n_unconverged
+        )
+    };
+    format!(
+        "rejected by the EBE convergence guard after {solved} of {n_subj} subjects: {trigger}; \
+         the other {} were not solved",
+        n_subj.saturating_sub(solved),
+    )
 }
 
 /// A first evaluation's cold inner solve, held while [`wants_start_warm_rescore`]'s warm
@@ -7086,6 +7164,18 @@ fn optimize_nlopt_attempt_probed(
         // first solve (and what it overwrote) while the second runs.
         let mut cold_start: Option<ColdStart> = None;
         let mut warm_rescored_from: Option<usize> = None;
+        // #2709: a pass the guard is certain to reject stops solving subjects. Only once
+        // the fit has scored a feasible evaluation: so never on the first evaluation, whose
+        // rejected EBEs #2682's warm re-solve starts from, and never on a run with no
+        // feasible evaluation at all, whose `W_NO_FEASIBLE_EVAL` reports the worst count.
+        let feasible_seen = plateau_tracker_cl.lock().unwrap().2 > 0;
+        let guard_stop = (feasible_seen && !guard_stop_disabled()).then(|| {
+            GuardStop::new(
+                n_subj,
+                eval_options.min_obs_for_convergence_check as usize,
+                options.max_unconverged_frac,
+            )
+        });
         let (ehs, hms, ebe_stats, kappas, raw_ofv, agq_evaluation) = loop {
             let solved = if params.mixture.is_some() {
                 let warm = (!state.cached_etas_by_class.is_empty())
@@ -7180,6 +7270,7 @@ fn optimize_nlopt_attempt_probed(
                         Some(&schedule_cache),
                         std::mem::take(&mut state.cached_etas_are_modes),
                         options.cancel.as_ref(),
+                        guard_stop.as_ref(),
                     );
                 contribs = nll_i.iter().map(|v| 2.0 * v).collect();
                 (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
@@ -7293,10 +7384,24 @@ fn optimize_nlopt_attempt_probed(
         };
         let raw_ofv = raw_ofv + nn_penalty + prior_penalty;
 
+        // #2709: a pass stopped on a certain rejection reports the counts of the subjects it
+        // solved; its unsolved placeholders are not results. Rejected by construction: the
+        // counts it stopped on already cross the threshold. On the FOCE path `raw_ofv` is
+        // finite (the placeholder contributions are `f64::default() = 0.0`), so
+        // `ebe_guard_rejects`' fraction arm fires from the observed stats alone. On the AGQ
+        // path `raw_ofv` is `INFINITY` (the quadrature skip), which makes the fraction arm
+        // return false — and a fraction-triggered stop has `n_start_rejected = 0` in the
+        // observed stats, so the hard-rejection arm also returns false. The `stopped_after`
+        // gate covers that case: a stopped pass is always a guard rejection.
+        let (ebe_stats, stopped_after) = stopped_pass_stats(guard_stop.as_ref(), ebe_stats);
+        #[cfg(test)]
+        if stopped_after.is_some() {
+            GUARD_STOPS.with(|n| n.set(n.get() + 1));
+        }
         // EBE convergence guard: reject step when too many subjects unconverged or any
         // subject was hard-rejected at its inner start.
-        let ebe_guard_triggered =
-            ebe_guard_rejects(&ebe_stats, n_subj, raw_ofv, options.max_unconverged_frac);
+        let ebe_guard_triggered = stopped_after.is_some()
+            || ebe_guard_rejects(&ebe_stats, n_subj, raw_ofv, options.max_unconverged_frac);
         {
             let mut acc = ebe_accum_cl.lock().unwrap();
             if acc.max_unconverged < ebe_stats.n_unconverged {
@@ -7539,16 +7644,21 @@ fn optimize_nlopt_attempt_probed(
                 if guarded {
                     // A guarded evaluation's `ofv` is `guard_penalty_value` (or the `1e20`
                     // wall), not a likelihood: printed as an OFV it read as one (#2682).
-                    eprintln!(
-                        "Eval {:>4}: {}",
-                        state.n_evals,
-                        guarded_eval_line(
+                    let line = match stopped_after {
+                        Some(solved) => stopped_eval_line(
+                            &ebe_stats,
+                            solved,
+                            n_subj,
+                            options.max_unconverged_frac,
+                        ),
+                        None => guarded_eval_line(
                             &ebe_stats,
                             n_subj,
                             raw_ofv,
-                            options.max_unconverged_frac
+                            options.max_unconverged_frac,
                         ),
-                    );
+                    };
+                    eprintln!("Eval {:>4}: {line}", state.n_evals);
                 } else if nn_reg.is_active() {
                     eprintln!(
                         "Eval {:>4}: OFV = {:.6} (penalized objective {:.6})",
@@ -9374,6 +9484,7 @@ fn optimize_bfgs(
                 None,
                 cached_etas_are_modes.take(),
                 None, // the built-in BFGS loop polls between iterations (#574)
+                None,
             );
             let contribs: Vec<f64> = contribs.iter().map(|v| 2.0 * v).collect();
             let ofv = 2.0 * nll;
