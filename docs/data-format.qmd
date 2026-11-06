@@ -642,6 +642,40 @@ ID,TIME,DV,EVID,AMT,CMT,MDV
 1,24.5,18.1,0,.,.,0
 ```
 
+### Doses after the last observation
+
+A dose after a subject's last scored record cannot change any prediction in the
+objective, so `fit()` leaves it out of the likelihood
+([#2778](https://github.com/FeRx-NLME/ferx-core/issues/2778)). Nothing is needed
+in the dataset: dosing records can run to end of treatment while sampling stops
+early. An `ADDL` train crossing that point is cut at it.
+
+The cut is per subject, at the last record of any endpoint: an observation,
+censored or not, or a time-to-event, discrete-state or count record, including
+the right bound of an interval-censored event. A dose listed ahead of that
+record at the same `TIME` stays, since it acts on the observation. Later `EVID=2`,
+`EVID=3` and `EVID=4` rows go with the doses. Three exceptions:
+
+- A subject with a non-Gaussian record also keeps the first record after it,
+  which closes the interval holding that record.
+- A subject's first dose always stays, because `TAD` and `TAFD` read it before
+  it arrives.
+- A model with more than one `level` keeps every record.
+
+Only the estimation steps use the shorter list, including `run_covariance()` and
+`run_sir()`. Data-derived covariate statistics such as `center = median`,
+validation, `[derived]` outputs, the sdtab and the saved fit all see the dataset
+as supplied, and `predict()` and `simulate()` keep every dose.
+
+An occasion that only trailing rows carry keeps its `kappa` block, so the layout
+of the fitted occasions does not change.
+
+The objective and the EBEs at any given parameters do not change. On a closed-form
+or constant-parameter ODE fit the estimates do not change either. With time-varying
+covariates or IOV, the outer gradient can round differently, by up to 3e-15 relative
+on the test fixtures, so estimates can differ from a fit of every record in the last
+few digits. A fit of the same data with those rows deleted matches exactly.
+
 ## Column Name Case
 
 Column names are case-insensitive. `ID`, `Id`, and `id` are all recognized. Covariate columns preserve their case as declared in the CSV header.

@@ -63,6 +63,7 @@ mod pool;
 pub(crate) mod postfit;
 mod predict;
 mod run;
+mod scoring_horizon;
 mod simulate;
 
 pub use adaptive::{
@@ -191,6 +192,7 @@ pub(crate) use postfit::{
 pub(crate) use predict::grid_median_from_cumhaz;
 #[cfg(test)]
 pub(crate) use run::derive_output_occasions;
+pub(crate) use scoring_horizon::scored_population;
 #[cfg(test)]
 pub(crate) use simulate::emit_correlated_residual_rows;
 pub(crate) use simulate::{correlated_residual_draw, draw_correlations, SimClasses};
