@@ -770,8 +770,7 @@ const ODE_LTBS_COMBINED_PER_CMT: &str = r#"
 #[test]
 fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt() {
     let model = parse_model_string(ODE_LTBS_COMBINED_PER_CMT).unwrap();
-    // Measured 2.0e-9 (Linux x86_64); 5× headroom.
-    ltbs_combined_per_cmt_parity(model, 1e-8);
+    ltbs_combined_per_cmt_parity(model, LTBS_PER_CMT_BOUND);
 }
 
 /// The same with the motivating model's early-time factor on the plasma `PROP` only,
@@ -791,9 +790,14 @@ fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt_magnitude() {
         );
     let model = parse_model_string(&src).unwrap();
     assert!(model.has_custom_ruv_magnitude());
-    // Measured 2.2e-9 (Linux x86_64); ~5× headroom.
-    ltbs_combined_per_cmt_parity(model, 1e-8);
+    ltbs_combined_per_cmt_parity(model, LTBS_PER_CMT_BOUND);
 }
+
+/// Measured on Padé 2.0e-9 / 2.2e-9 (plain / magnitude, Linux x86_64); on the spectral path
+/// (#2706 follow-up) 1.1e-8 / 1.3e-8 (CI, release semantics). The analytic gradient is the
+/// same on both engines to the 11 printed digits; what moves is the reconverged-FD oracle's
+/// objective, whose re-solved η̂ lands differently by round-off. ~5× over the worst.
+const LTBS_PER_CMT_BOUND: f64 = 6e-8;
 
 fn ltbs_combined_per_cmt_parity(model: CompiledModel, bound: f64) {
     let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
