@@ -284,15 +284,17 @@ fn the_fit_reports_whether_the_exact_linear_path_ran() {
         !ran_exact(&ode_model(""), &eval_opts()),
         "the saturable fixture is integrated"
     );
-    // Routed to the exact path, but every segment declined: the inert `sink` rate puts
-    // ‖A·dt‖ past the exponential's squaring budget, so each segment is integrated instead.
-    // Routing alone would report `true`; the flag must report what ran.
+    // Routed to the exact path, but every segment declined: two inert sinks at one rate give
+    // a repeated eigenvalue, which the spectral propagator declines, and their rate puts
+    // ‖A·dt‖ past the Padé exponential's squaring budget, so each segment is integrated
+    // instead. (One sink alone the spectral path propagates exactly.) Routing alone would
+    // report `true`; the flag must report what ran.
     let declined = parse_model_string(
         &LINEAR_SOURCE
-            .replace("ode(states=[central])", "ode(states=[central, sink])")
+            .replace("ode(states=[central])", "ode(states=[central, sink, sink2])")
             .replace(
                 "d/dt(central) = -(CL / V) * central",
-                "d/dt(central) = -(CL / V) * central\n  d/dt(sink) = -1e25 * sink",
+                "d/dt(central) = -(CL / V) * central\n  d/dt(sink) = -1e25 * sink\n  d/dt(sink2) = -1e25 * sink2",
             ),
     )
     .expect("declined model parses");
