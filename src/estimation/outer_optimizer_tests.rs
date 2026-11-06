@@ -10732,26 +10732,53 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
         });
         let start = r.start_eval.expect("the unprofiled loop records its start");
         let ms = |id: &str| rec.multistarts.iter().filter(|s| *s == id).count();
-        let solves = rec
-            .solve_tols
+        let solves_of = |id: &str| rec.solve_tols.iter().filter(|(i, _)| i == id).count();
+        // `multistarts` and `solve_tols` are pushed from the rayon worker that ran the solve,
+        // and `record_inner_solves` sees only the recording thread's, so a pass spread over
+        // several workers records a subset — per subject, by scheduling. Measured on this
+        // 4-subject fixture: at one thread every subject records 218 solves, at two threads
+        // two of them record 0, at four threads 4 / 218 / 8 / 5. The pool above is one thread
+        // so the recording is complete, and this asserts that rather than trusting it: a
+        // partial recording would otherwise read as a difference in multi-starts and send the
+        // next reader after a defect that is not there (#2691 CI).
+        let counts: Vec<(String, usize, usize)> = pop
+            .subjects
             .iter()
-            .filter(|(id, _)| *id == informed)
-            .count();
-        (start, ms("EMPTY"), ms(&informed), solves)
+            .map(|s| (s.id.clone(), solves_of(&s.id), ms(&s.id)))
+            .collect();
+        let complete = counts.iter().all(|(_, n, _)| *n == counts[0].1);
+        assert!(
+            complete,
+            "the recording is incomplete, so its per-subject counts cannot be compared: \
+             (id, solves, multi-starts) = {counts:?}. Every subject must record the same \
+             number of solves; `record_inner_solves` keeps only the recording thread's."
+        );
+        (
+            start,
+            ms("EMPTY"),
+            ms(&informed),
+            solves_of(&informed),
+            counts,
+        )
     };
 
-    let (start, ms_empty, ms_informed, _) = fit(1);
+    let (start, ms_empty, ms_informed, _, counts) = fit(1);
     assert!(
         !start.guard_rejected && start.warm_rescored_from.is_some_and(|n| n > 0),
         "fixture: the cold start must be rejected and its warm re-solve accepted: {start:?}"
     );
     assert!(ms_informed >= 1, "fixture must reach the multi-start gate");
-    assert_eq!(
-        ms_empty, ms_informed,
-        "accepted re-solve: the exactly-zero mode was multi-started as a cold start there"
+    // `<=`, not `==`: the property is that the exactly-zero mode is never multi-started where
+    // an informed subject's nonzero mode is taken as warm. Fewer is the fix working harder,
+    // and cannot be the regression. Mutation A (the re-solve reads `Placeholder`) gives the
+    // empty subject one *more* than the informed one, which this still kills.
+    assert!(
+        ms_empty <= ms_informed,
+        "accepted re-solve: the exactly-zero mode was multi-started as a cold start where the \
+         informed subject's was taken as warm: (id, solves, multi-starts) = {counts:?}"
     );
 
-    let (start, ms_empty, ms_informed, solves) = fit(0);
+    let (start, ms_empty, ms_informed, solves, counts) = fit(0);
     let cold = InnerLoopStats {
         n_unconverged: start.n_unconverged,
         n_start_rejected: start.n_start_rejected,
@@ -10764,9 +10791,10 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
             && wants_start_warm_rescore(&cold, n_subj, start.ofv, 0.0),
         "fixture: the start must earn the warm re-solve and stay rejected after it: {start:?}"
     );
-    assert_eq!(
-        ms_empty, ms_informed,
-        "rejected re-solve: the exactly-zero mode was multi-started as a cold start there"
+    assert!(
+        ms_empty <= ms_informed,
+        "rejected re-solve: the exactly-zero mode was multi-started as a cold start where the \
+         informed subject's was taken as warm: (id, solves, multi-starts) = {counts:?}"
     );
     assert!(
         2 * ms_informed > solves,
