@@ -6340,7 +6340,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         theta,
                         readout_eta,
                         decision_cov,
-                        t_start,
+                        subject.param_time_at(t_start),
                     );
                     // A finite state (guarded above) that reads out non-finite is a readout
                     // defect, not a divergence (#1578): a `[scaling]` readout or an `observe`
@@ -6809,8 +6809,33 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 (Some(a), Some(w)) if started => a.grid_inside(w, t_start, t_end),
                 _ => Vec::new(),
             };
+            // `t` is the engine time of the node and stays the AUC's axis; the readout reads
+            // the `TIME` written there (#2756). The post-event node at `t_start` reads the
+            // written time of the row there, and every later node of the segment carries the
+            // segment's own offset. The pre-event node at `t_end` is a left limit, so it must
+            // stay in the period the segment ran in: `param_time_at(t_end)` would read a reset
+            // row at `t_end` as the *next* period's restarted `TIME`. With no restarted period
+            // the offset is 0 and every node reads its engine time exactly.
+            let w_start = subject.param_time_at(t_start);
+            let seg_offset = t_start - w_start;
+            let written = |t: f64| {
+                if t == t_start {
+                    w_start
+                } else {
+                    t - seg_offset
+                }
+            };
             let auc_signal = |mon: &AdaptiveMonitor, u: &[f64], t: f64| {
-                adaptive_monitor_signal(ode, mon, u, seg_pk_values, theta, seg_eta, seg_cov, t)
+                adaptive_monitor_signal(
+                    ode,
+                    mon,
+                    u,
+                    seg_pk_values,
+                    theta,
+                    seg_eta,
+                    seg_cov,
+                    written(t),
+                )
             };
             if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
                 a.push(w, t_start, auc_signal(a.monitor, &u, t_start));
@@ -7519,9 +7544,17 @@ fn adaptive_frozen_replay_tv(
 /// with or without the AUC (#943).
 const ADAPTIVE_AUC_PANELS: usize = 128;
 
-/// The value monitor `am` presents at state `u` and time `t`, in observation units:
-/// its compiled `observe` expression when it has one, else the model readout on
-/// `am.spec.cmt` divided by its `[scaling]` divisor under `eta` (#2129).
+/// The value monitor `am` presents at state `u`, in observation units: its compiled
+/// `observe` expression when it has one, else the model readout on `am.spec.cmt` divided
+/// by its `[scaling]` divisor under `eta` (#2129).
+///
+/// `t` is the `TIME` the readout reads: the TIME as written at the point
+/// (`Subject::param_time_at` of its engine time), not the engine clock. They differ in a
+/// period a reset restarted `TIME` in, where every static engine and the driver's own
+/// trajectory rows read the written time (`Subject::readout_time`), and so does the
+/// decision's PK (#1969). On the engine clock the controller was handed a value no output
+/// row reports, off by the reset shift (#2756). Callers integrate and key the AUC on the
+/// engine time; only this read takes the written one.
 ///
 /// The one spelling of "what this monitor reads": the decision hook resolves the
 /// controller's signal through it, and the window AUC (#943) integrates it at every grid

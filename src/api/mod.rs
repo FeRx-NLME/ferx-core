@@ -543,6 +543,11 @@ mod adaptive_obs_scale_tests;
 #[path = "tests/adaptive_moved_reset_tests.rs"]
 mod adaptive_moved_reset_tests;
 
+// #2756: a monitor's readout reads the TIME as written after a reset that restarts it.
+#[cfg(test)]
+#[path = "tests/adaptive_written_time_tests.rs"]
+mod adaptive_written_time_tests;
+
 // #2156: FREM covariate rows on the adaptive path.
 #[cfg(test)]
 #[path = "tests/adaptive_frem_tests.rs"]
