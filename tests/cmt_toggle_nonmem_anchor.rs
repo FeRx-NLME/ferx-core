@@ -14,7 +14,10 @@
 //!   (ID 6, 7), a lagged dose in flight (ID 10), the rest of an `ADDL` train (ID 21).
 //!   Input elsewhere carries on (ID 9, 22).
 //! - A reset turns every compartment on (ID 15, 16).
-//! - Co-timed records take effect in file order (ID 5, 17, 18, 19, 20).
+//! - Co-timed records take effect in file order (ID 5, 17, 18, 19, 20). IDs 25 to 28 are
+//!   the ties the #614 and #1810 passes leave wrong, so only `order_cmt_toggle_ties`
+//!   orders them: an infusion before an off row (25), an observation between a dose and
+//!   an off row (26), and an off row between an observation and a dose (27, 28).
 //! - The row is a record, so its covariates govern the interval ending at it (ID 23).
 //!
 //! Multi-dose by construction: ID 2 toggles with residual drug on both sides of every
@@ -28,12 +31,12 @@ use ferx_core::{CompiledModel, Population};
 use std::path::{Path, PathBuf};
 
 /// `METHOD=1 INTER MAXEVAL=0` objective, from `results/cmt_toggle.ext`.
-const NM_OFV: f64 = 18898.345332748067;
+const NM_OFV: f64 = 19445.244975010002;
 /// Measured on macOS arm64: worst 5.4e-15 on the linear route and in the states, 6.2e-13 on
 /// `rodas5p`, 1.5e-11 on `rk45` at `1e-10` tolerances. Bound set from the last, with about
 /// 70× headroom for the solvers' platform variation.
 const BOUND: f64 = 1e-9;
-/// Measured on macOS arm64: Δ 1.8e-5 on 18898, the two engines' EBE tolerances. About
+/// Measured on macOS arm64: Δ 1.8e-5 on 19445, the two engines' EBE tolerances. About
 /// 50× headroom. A wrong amount at σ = 0.1 moves this by whole OFV units.
 const OFV_BOUND: f64 = 1e-3;
 
@@ -165,4 +168,23 @@ fn the_objective_matches_nonmem() {
         "OFV {} vs {NM_OFV} (Δ {delta:.3e})",
         result.ofv
     );
+}
+
+/// `compute_predictions_ode` is public and takes one flat parameter vector, so it has its
+/// own route to the walk. ID 1 reads the same whichever way it gets there.
+#[test]
+fn the_flat_parameter_entry_point_honours_the_row() {
+    let m = model("");
+    let pop = population();
+    let s = &pop.subjects[0];
+    let theta = &m.default_params.theta;
+    let eta = vec![0.0; m.n_eta];
+    let pk = (m.pk_param_fn)(theta, &eta, &s.covariates, 0.0);
+    let ode = m.ode_spec.as_ref().expect("an [odes] model");
+    let got = ferx_core::pk::compute_predictions_ode(ode, s, &pk.values, theta, &eta);
+    let want = nonmem_obs();
+    assert_eq!(got.len(), 3);
+    for (g, w) in got.iter().zip(&want) {
+        assert!((g - w.3).abs() / (1.0 + w.3.abs()) < BOUND, "{g} vs {w:?}");
+    }
 }

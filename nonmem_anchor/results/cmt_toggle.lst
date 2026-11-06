@@ -1,4 +1,4 @@
-Fri Nov  6 03:19:04 AM UTC 2026
+Fri Nov  6 04:49:12 AM UTC 2026
 $PROBLEM compartment on/off records, one subject per case (#2732)
 $INPUT ID TIME DV EVID AMT CMT MDV RATE II SS ADDL KBC LAGC WT A0C
 $DATA cmt_toggle.csv IGNORE=@
@@ -56,7 +56,7 @@ Days until program expires : 283
 0DATA CHECKOUT RUN:              NO
  DATA SET LOCATED ON UNIT NO.:    2
  THIS UNIT TO BE REWOUND:        NO
- NO. OF DATA RECS IN DATA SET:      151
+ NO. OF DATA RECS IN DATA SET:      177
  NO. OF DATA ITEMS IN DATA SET:  15
  ID DATA ITEM IS DATA ITEM NO.:   1
  DEP VARIABLE IS DATA ITEM NO.:   3
@@ -70,8 +70,8 @@ Days until program expires : 283
 0FORMAT FOR DATA:
  (E3.0,E4.0,E10.0,E2.0,E4.0,E3.0,E2.0,E3.0,3E2.0,E4.0,E2.0,2E4.0)
 
- TOT. NO. OF OBS RECS:       60
- TOT. NO. OF INDIVIDUALS:       24
+ TOT. NO. OF OBS RECS:       70
+ TOT. NO. OF INDIVIDUALS:       28
 0LENGTH OF THETA:   2
 0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
 0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
@@ -215,7 +215,7 @@ Days until program expires : 283
  IRS=IRESI
 
  Elapsed evaluation time in seconds:     0.01
- Elapsed postprocess time in seconds:     0.05
+ Elapsed postprocess time in seconds:     0.01
 1
  
  
@@ -249,7 +249,7 @@ Days until program expires : 283
 
 
 
- #OBJV:********************************************    18898.345       **************************************************
+ #OBJV:********************************************    19445.245       **************************************************
 1
  ************************************************************************************************************************
  ********************                                                                                ********************
@@ -309,6 +309,6 @@ Days until program expires : 283
 +        1.00E-01
  
  Elapsed finaloutput time in seconds:     0.00
- #CPUT: Total CPU Time in Seconds,        0.100
+ #CPUT: Total CPU Time in Seconds,        0.038
 Stop Time:
-Fri Nov  6 03:19:05 AM UTC 2026
+Fri Nov  6 04:49:12 AM UTC 2026

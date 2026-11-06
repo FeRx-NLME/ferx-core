@@ -295,7 +295,7 @@ fn try_joint_pktte_shared_solve(
     // stated contract above exists to prevent.
     if subject.obs_records.is_empty()
         || subject.has_tv_covariates()
-        || subject.has_state_events()
+        || subject.has_resets()
         || crate::pk::model_uses_time_anywhere(model)
         || model.is_sde()
         || subject.fremtype.iter().any(|&f| f > 0)

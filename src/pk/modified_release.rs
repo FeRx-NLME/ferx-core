@@ -683,7 +683,7 @@ pub(crate) fn mr_scope<'a>(
     eta: &[f64],
 ) -> Option<MrScope<'a>> {
     let spec = model.ode_spec.as_ref()?;
-    if model.n_kappa > 0 || subject.has_tv_covariates() || subject.has_state_events() {
+    if model.n_kappa > 0 || subject.has_tv_covariates() || subject.has_resets() {
         return None;
     }
     // Any model-time dependence — a `TIME`-reading *individual parameter*, or a

@@ -94,6 +94,18 @@ CASES = [
     ([dose(0), obs(2, 2, 20), off(4, wt=140), on(6), obs(8, 2, 10, wt=35), obs(10, 2, 10, wt=35)], 0, 0, 0),
     # 24 on restarts from zero and does not re-apply the initial amount
     ([dose(0), obs(2, 2, 17), off(3), on(4), obs(6, 2, 10)], 0, 0, 5),
+    # Ties the #614 and #1810 passes leave in the wrong order, so only the on/off pass
+    # orders them.
+    # 25 an infusion, then off, at one TIME: it never delivers. The t = 2 observation pins
+    # CL: without it this subject has two EBE modes, and NONMEM stops at the worse one
+    # (OBJ 76.34 against 19.42, which it reports too when started at ferx's eta).
+    ([dose(0), obs(2, 2, 20), dose(4, 100, 2, rate=10), off(4), on(5), obs(6, 2, 10), obs(9, 2, 10)], 0, 0, 0),
+    # 26 dose, observe, off at one TIME: the observation reads the dosed amount
+    ([dose(0), dose(4, 20, 2), obs(4, 2, 40), off(4), on(5), obs(6, 2, 10)], 0, 0, 0),
+    # 27 observe, off, dose into another compartment, at one TIME
+    ([dose(0), obs(4, 2, 30), off(4), dose(4, 20, 1), on(5), obs(6, 2, 10)], 0, 0, 0),
+    # 28 observe, off, on, dose into the same compartment, at one TIME
+    ([dose(0), obs(4, 2, 30), off(4), on(4), dose(4, 20, 2), obs(4, 2, 20), obs(6, 2, 30)], 0, 0, 0),
 ]
 
 
