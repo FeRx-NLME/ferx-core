@@ -347,3 +347,13 @@ fn the_lag_alone_decides_the_steady_state_refusal() {
     ));
     assert!(ferx_core::predict(&m, &observed, &m.default_params).is_ok());
 }
+
+/// A reset turns every compartment on, so an `SS=1` dose after one has nothing held off.
+#[test]
+fn a_steady_state_dose_after_a_reset_is_accepted() {
+    let m = model(ODE);
+    let pop = data(&format!(
+        "{OFF_AT_3}1,3.5,.,3,.,1,1,0,0\n1,4,.,1,100,1,1,12,1\n1,5,1,0,.,1,0,0,0\n"
+    ));
+    assert!(ferx_core::predict(&m, &pop, &m.default_params).is_ok());
+}
