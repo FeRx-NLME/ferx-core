@@ -1849,8 +1849,7 @@ fn negative_cmt(row: &[String], cmt_col: Option<usize>) -> Option<usize> {
 /// Those two passes then find nothing to do at such a time. Doses never move. Records before
 /// the first dose go below it, and records after the last dose stay at the tie unless
 /// the kind order needs them above it. An on/off row always leaves a dose's `TIME`, so
-/// that `DoseEvent::off_at` can tell which side of it the dose's record is on by time
-/// alone.
+/// that `cmt_off_times` can tell which side of it the dose's record is on by time alone.
 ///
 /// `Err` holds the time of a tie no such move can order: an on/off row between two doses,
 /// or between a reset and a dose.
@@ -4127,16 +4126,6 @@ fn parse_subject(
     for (k, m) in gov_by_pk_only {
         if let Some(i) = sorted_doses[k].implied.as_mut() {
             i.gov_time = pk_only_times[m];
-        }
-    }
-
-    // The time each dose's input stops, now that the on/off rows have their final times
-    // (#2732). An implied dose counts from its parent's record: the train was scheduled
-    // there, and an off row anywhere after it cancels what is left of the train.
-    if !cmt_toggles.is_empty() {
-        let off_times = crate::types::cmt_off_times(&sorted_doses, &cmt_toggles, &pk_only_times);
-        for (d, off_at) in sorted_doses.iter_mut().zip(off_times) {
-            d.off_at = off_at;
         }
     }
 

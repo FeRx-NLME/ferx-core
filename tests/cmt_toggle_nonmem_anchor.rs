@@ -229,8 +229,9 @@ fn a_subject_built_in_memory_predicts_what_the_reader_predicts() {
     }
 }
 
-/// Clearing the rows from a subject the reader built leaves its cutoffs behind, and they
-/// must go with the rows: the infusion of ID 6 then runs to its end.
+/// What a row does to a dose lives in the row: clear the rows from a subject the reader
+/// built and the infusion of ID 6 runs to its end. This pins the stored dose, which every
+/// walk reads, against one built fresh.
 #[test]
 fn clearing_the_rows_clears_what_they_did_to_the_doses() {
     use ferx_core::types::DoseEvent;
@@ -246,6 +247,11 @@ fn clearing_the_rows_clears_what_they_did_to_the_doses() {
         .iter()
         .map(|d| DoseEvent::new(d.time, d.amt, d.cmt_1based(), d.rate, false, 0.0))
         .collect();
+    // A later dose breaks the dense walk's segment past the off row, so a cutoff left on the
+    // stored dose would stop the infusion there too.
+    for s in [&mut cleared, &mut plain] {
+        s.doses.push(DoseEvent::new(4.0, 1.0, 1, 0.0, false, 0.0));
+    }
     let got = ferx_core::pk::compute_predictions_with_tv(&m, &cleared, theta, &eta);
     let want = ferx_core::pk::compute_predictions_with_tv(&m, &plain, theta, &eta);
     assert!(got.iter().all(|v| v.is_finite()), "{got:?}");

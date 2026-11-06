@@ -5550,7 +5550,7 @@ fn an_off_row_before_a_dose_goes_below_it_and_keeps_the_dose_live() {
     let s = toggled("1,0,.,1,100,1,1\n1,4,.,2,.,-2,1\n1,4,.,1,20,2,1\n1,6,10,0,.,2,0\n");
     assert!(s.pk_only_times[0] < 4.0);
     assert_eq!(s.doses[1].time, 4.0);
-    assert_eq!(s.doses[1].off_at, f64::INFINITY);
+    assert_eq!(s.with_cmt_cutoffs().doses[1].off_at, f64::INFINITY);
 }
 
 #[test]
@@ -5558,7 +5558,7 @@ fn an_off_row_after_a_dose_goes_above_it_and_stops_the_dose() {
     let s = toggled("1,0,.,1,100,1,1\n1,4,.,1,20,2,1\n1,4,.,2,.,-2,1\n1,4,5,0,.,1,0\n");
     assert!(s.pk_only_times[0] > 4.0);
     assert_eq!(s.doses[1].time, 4.0);
-    assert_eq!(s.doses[1].off_at, s.pk_only_times[0]);
+    assert_eq!(s.with_cmt_cutoffs().doses[1].off_at, s.pk_only_times[0]);
     // The observation listed after the row stays after it.
     assert!(s.obs_times[0] >= s.pk_only_times[0]);
 }
@@ -5566,8 +5566,9 @@ fn an_off_row_after_a_dose_goes_above_it_and_stops_the_dose() {
 #[test]
 fn an_off_row_only_stops_doses_into_its_own_compartment() {
     let s = toggled("1,0,.,1,100,1,1\n1,1,.,1,50,2,1\n1,3,.,2,.,-2,1\n1,8,10,0,.,1,0\n");
-    assert_eq!(s.doses[0].off_at, f64::INFINITY);
-    assert_eq!(s.doses[1].off_at, 3.0);
+    let cut = s.with_cmt_cutoffs();
+    assert_eq!(cut.doses[0].off_at, f64::INFINITY);
+    assert_eq!(cut.doses[1].off_at, 3.0);
 }
 
 /// An off row past an implied dose counts from the row that scheduled the train.
@@ -5580,7 +5581,8 @@ fn an_off_row_stops_the_rest_of_an_addl_train() {
         .unwrap()
         .subjects
         .remove(0);
-    let got: Vec<(f64, f64)> = s.doses.iter().map(|d| (d.time, d.off_at)).collect();
+    let cut = s.with_cmt_cutoffs();
+    let got: Vec<(f64, f64)> = cut.doses.iter().map(|d| (d.time, d.off_at)).collect();
     assert_eq!(got, [(0.0, 3.0), (2.0, 3.0), (4.0, 3.0), (6.0, 3.0)]);
 }
 

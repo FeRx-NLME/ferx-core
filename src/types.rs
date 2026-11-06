@@ -142,10 +142,10 @@ pub struct DoseEvent {
     /// input whatever stage it has reached, measured in `nonmem_anchor/cmt_toggle.ctl`: an
     /// infusion stops and does not resume when the compartment comes back, a lagged dose
     /// still in flight never lands, and the rest of an `ADDL` train never arrives. Read
-    /// through `ode::predictions::ResetGate`. Derived from `Subject::cmt_toggles` by
-    /// [`cmt_off_times`], never authored: the reader sets it, and the state walks re-derive
-    /// it through `Subject::with_cmt_cutoffs` for a subject built or edited in memory.
-    /// Crate-private, like `evid4`.
+    /// through `ode::predictions::ResetGate`. `+∞` on every stored subject: only the copy a
+    /// state walk takes from `Subject::with_cmt_cutoffs` carries a finite one, derived from
+    /// `Subject::cmt_toggles`, so no edit to those rows can leave it stale. Crate-private,
+    /// like `evid4`.
     pub(crate) off_at: f64,
 }
 
@@ -1296,22 +1296,19 @@ impl Subject {
         self.has_resets() || self.has_cmt_toggles()
     }
 
-    /// This subject with every `DoseEvent::off_at` matching `cmt_toggles`, for a state walk
-    /// to read. `cmt_toggles` is public and `off_at` is not, so a subject built or edited in
-    /// memory has no other way to get it right. Borrowed when it is right already, as on
-    /// every subject from the reader and every subject with no on/off row.
+    /// This subject with each `DoseEvent::off_at` set from `cmt_toggles`, for a state walk to
+    /// read. Borrowed for a subject with no on/off row. The copy is the cost of keeping the
+    /// cutoffs off the stored subject, paid only by subjects with such a row, and small
+    /// against the solve it precedes.
     pub(crate) fn with_cmt_cutoffs(&self) -> std::borrow::Cow<'_, Subject> {
         use std::borrow::Cow;
-        if self.cmt_toggles.is_empty() && self.doses.iter().all(|d| d.off_at == f64::INFINITY) {
+        if self.cmt_toggles.is_empty() {
             return Cow::Borrowed(self);
         }
-        let want = cmt_off_times(&self.doses, &self.cmt_toggles, &self.pk_only_times);
-        if self.doses.iter().zip(&want).all(|(d, &w)| d.off_at == w) {
-            return Cow::Borrowed(self);
-        }
+        let off_times = cmt_off_times(&self.doses, &self.cmt_toggles, &self.pk_only_times);
         let mut owned = self.clone();
-        for (d, w) in owned.doses.iter_mut().zip(want) {
-            d.off_at = w;
+        for (d, off_at) in owned.doses.iter_mut().zip(off_times) {
+            d.off_at = off_at;
         }
         Cow::Owned(owned)
     }
