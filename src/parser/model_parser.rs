@@ -13950,10 +13950,11 @@ fn declares_time_alias(declared_covariates: &[String]) -> bool {
 }
 
 /// The value a [`build_y_output_fn`] closure reads for covariate `name` from the map it
-/// is handed: the map's value, or `0.0` when the key is absent. The one definition of
-/// that read, so a caller reporting what an expression read (the dose-expression
-/// "reads" sentence, #2671) reports the value the closure used. The entry-point
-/// presence check (`population_carries`) is what keeps the absent case from a run.
+/// is handed: the map's value, or `0.0` when the key is absent. Shared by that closure
+/// and the dose-expression "reads" sentence (#2671), so the sentence reports the value
+/// the closure used. Only those two: the endpoint evaluator (`eval_endpoint_outputs_g`)
+/// keeps its own read. The entry-point presence check (`population_carries`) is what
+/// keeps the absent case from a run.
 #[inline]
 pub(crate) fn output_covariate_read(covariates: &HashMap<String, f64>, name: &str) -> f64 {
     covariates.get(name).copied().unwrap_or(0.0)
