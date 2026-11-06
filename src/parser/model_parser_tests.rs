@@ -38985,3 +38985,88 @@ fn an_ode_scope_remedy_reads_a_data_driven_block_bare() {
         );
     }
 }
+
+/// #2766: a θ used only in a `[mixture]` mixing expression is not unused.
+#[test]
+fn a_theta_used_only_in_the_mixing_expression_is_not_flagged_unused() {
+    // Logit form: MIXL appears only in `logit(1) = MIXL`.
+    let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta UNUSED(42.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let parsed = parse_full_model(src).expect("parse ok");
+    let unused: Vec<&str> = parsed
+        .model
+        .parse_warnings
+        .iter()
+        .filter(|w| w.contains("not referenced in any model expression"))
+        .map(|w| w.as_str())
+        .collect();
+    assert!(
+        !unused.iter().any(|w| w.contains("'MIXL'")),
+        "MIXL is used in `logit(1) = MIXL` and must not be flagged; got: {unused:?}"
+    );
+    // The straddle: UNUSED really is unused and must still be flagged.
+    assert!(
+        unused.iter().any(|w| w.contains("'UNUSED'")),
+        "UNUSED is declared and used nowhere; got: {unused:?}"
+    );
+}
+
+/// Same as the logit test above, but for the `p(1) = P1` mixing form (#2766).
+#[test]
+fn the_p_form_mixing_theta_is_not_flagged_unused_either() {
+    let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta P1(0.5, 0.001, 0.999)
+  omega ETA_CL ~ 0.05
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  p(1) = P1
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let parsed = parse_full_model(src).expect("parse ok");
+    assert!(
+        !parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("'P1'") && w.contains("not referenced")),
+        "P1 is used in `p(1) = P1`; got: {:?}",
+        parsed.model.parse_warnings
+    );
+}

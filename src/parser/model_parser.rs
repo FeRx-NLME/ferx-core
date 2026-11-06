@@ -7597,6 +7597,17 @@ pub fn parse_full_model_with(
         ));
     }
 
+    // A θ used only in a [mixture] mixing expression (logit(1) = MIXL, p(1) = P1) is not
+    // referenced in [individual_parameters] or [event_model], but it IS estimated — the
+    // mixing fraction. Scan the expressions the same way the event-model blocks do (#2766).
+    if let Some(spec) = &model.mixture {
+        for expr in &spec.mixing {
+            visit_expr_nodes(&expr.expr, &mut |e: &Expression| {
+                note_theta_eta(e, &mut event_model_used_thetas, &mut event_model_used_etas)
+            });
+        }
+    }
+
     model.parse_warnings.extend(check_unused_parameters(
         &thetas,
         &eta_names_bsv,
