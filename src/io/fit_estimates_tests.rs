@@ -21,6 +21,7 @@ fn fit_with_iov() -> FitResult {
     r.kappa_names = vec!["kappa_CL".into()];
     r.kappa_fixed = vec![false];
     r.kappa_init_as_sd = vec![false];
+    r.kappa_param_types = vec![crate::types::EtaParamType::LogNormal];
     r.se_kappa = Some(vec![0.008]);
     r
 }
@@ -242,6 +243,28 @@ fn json_round_trip_carries_the_data_bindings() {
     let back: FitResult = serde_json::from_str(&text).unwrap();
     assert_eq!(back.data_bindings, b);
     assert!(read_fit_estimates(&path).is_ok());
+}
+
+/// #2695: a model naming a v1 bundle in `[priors] from_fit` stops with the version error
+/// and the path, not a parse failure further on.
+#[test]
+fn a_v1_fitrx_is_refused_by_name_and_version() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.fitrx");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(
+        br#"{"format_version":"1","ferx_version":"0.1.0","model_name":"m",
+             "created_at":"2026-01-01T00:00:00Z","entries":[]}"#,
+    )
+    .unwrap();
+    zip.finish().unwrap();
+    let err = read_fit_estimates(&path).unwrap_err();
+    assert!(err.contains("old.fitrx"), "{err}");
+    assert!(err.contains("format_version \"1\""), "{err}");
+    assert!(err.contains("expected \"2\""), "{err}");
 }
 
 #[test]

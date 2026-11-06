@@ -648,7 +648,7 @@ fn join_names<S: AsRef<str>>(names: impl Iterator<Item = S>) -> String {
 /// Whether covariate `name` takes more than one value across a subject's record
 /// snapshots. `subject.covariates` is the first non-missing value; the per-event
 /// snapshots are empty when the dataset has no time-varying covariates at all.
-fn covariate_varies_within(subject: &Subject, name: &str) -> bool {
+pub(crate) fn covariate_varies_within(subject: &Subject, name: &str) -> bool {
     let base = subject.covariates.get(name).copied();
     let differs = |v: Option<f64>| match (base, v) {
         (Some(b), Some(x)) => !(b == x || (b.is_nan() && x.is_nan())),

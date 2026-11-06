@@ -38,9 +38,16 @@
 //! A platform on which Laplace also lands bit-identical fails the premise loudly; it
 //! cannot pass without testing anything.
 //!
+//! Since #2706 the premise also holds by construction, on a row of its own: the Laplace
+//! FD-R fit's packed vector is swapped for a neighbour within a few ulps that unpacks to the
+//! same reported estimates bit for bit (so it is still `Usable`) but is not `pack(params)`.
+//! A round-off-level change upstream of the fit (#2706 moved every fixture row's end point
+//! onto one that round-trips) can no longer leave the set without a discriminating row.
+//!
 //! Mutations — route `PackedEstimate::Usable` to the fallback arm in `run_covariance`:
 //! the claim dies on the first row whose premise holds (warfarin FOCE on macOS arm64,
-//! #1929; warfarin Laplace on Linux/aarch64, #1847). `load_fit` reads
+//! #1929; warfarin Laplace on Linux/aarch64, #1847), and the constructed row finds no
+//! neighbour that moves the step (measured, #2706). `load_fit` reads
 //! `packed_estimate: None`: the bundle assert dies first, on row one; with that assert
 //! removed, the claim dies on the same row as above.
 //!
@@ -263,6 +270,61 @@ fn reload_repeats_inline_covariance() {
                 identical.push(row);
             }
         }
+    }
+    // A row whose premise holds by construction (#2706). The fixture rows' premises rest on
+    // their end point failing `pack(unpack(x))` by an ulp, which moves with the platform
+    // (#1929) and with any round-off-level change upstream. Here the Laplace FD-R fit's
+    // packed vector is replaced by a neighbour that unpacks to the *same* reported θ, Ω, σ
+    // bit for bit (so `run_covariance` must take it as the fit's own, `Usable`) but is not
+    // `pack(params)`: the legacy re-pack cannot land on it, and the FD stencil steps from
+    // it. Such neighbours exist wherever `exp` or the Cholesky map several floats to one
+    // value; the first one found within a few ulps of each coordinate is used.
+    {
+        let row = "examples/warfarin.ferx Laplace (FD R), a packed neighbour of the same estimates";
+        let mut f = fit_inline(
+            row,
+            "examples/warfarin.ferx",
+            "data/warfarin.csv",
+            EstimationMethod::Laplace,
+            false,
+        );
+        let x0 = f.fit.packed_estimate.clone().expect("packed");
+        let mut legacy_fit = f.fit.clone();
+        legacy_fit.packed_estimate = None;
+        let legacy = covariance_bits(&f, &legacy_fit, &format!("{row} legacy"));
+        let mut found = None;
+        'search: for k in 0..x0.len() {
+            let (mut up, mut down) = (x0[k], x0[k]);
+            for _ in 0..8 {
+                up = up.next_up();
+                down = down.next_down();
+                for v in [up, down] {
+                    f.fit.packed_estimate.as_mut().unwrap()[k] = v;
+                    let inline = covariance_bits(&f, &f.fit, &format!("{row} inline"));
+                    if inline != legacy {
+                        found = Some(inline);
+                        break 'search;
+                    }
+                }
+            }
+            f.fit.packed_estimate.as_mut().unwrap()[k] = x0[k];
+        }
+        let inline = found.unwrap_or_else(|| {
+            panic!(
+                "{row}: no packed neighbour within 8 ulps both unpacks to the estimates and \
+                 moves the step"
+            )
+        });
+        let reloaded = covariance_bits(&f, &reload(&f), &format!("{row} reloaded"));
+        assert!(
+            reloaded == inline,
+            "{row}: claim — run_covariance on the reloaded fit must repeat the in-memory step"
+        );
+        eprintln!(
+            "premise {row}: max |legacy - inline| = {:e}",
+            max_gap(&legacy.0, &inline.0).max(max_gap(&legacy.1, &inline.1))
+        );
+        discriminating.push(row.to_string());
     }
     eprintln!("premise held on {discriminating:?}; failed on {identical:?}");
     assert!(

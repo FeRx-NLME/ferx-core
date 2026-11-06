@@ -138,6 +138,7 @@ fn make_iov_population() -> Population {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 6],
             occasions: occasions.clone(),
             obs_l2: Vec::new(),
@@ -492,12 +493,60 @@ fn test_iov_saem_in_methods_chain_succeeds() {
     );
 }
 
+/// A marginal with too few effective draws says so, from both places a marginal
+/// is produced. `imp_samples = 4` caps every subject below the gate, whatever the
+/// fixture does. The clean run is the other side of it (#2653).
+#[test]
+fn test_imp_marginal_warns_when_effective_draws_are_too_few() {
+    let unreliable = |r: &crate::types::FitResult| {
+        r.warnings
+            .iter()
+            .filter(|w| w.contains("marginal −2 log L is unreliable"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let model = make_iov_model();
+    let pop = make_iov_population();
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    opts.outer_maxiter = 2;
+    opts.imp_seed = Some(42);
+
+    // Evaluation-only stage, after an estimator: prefixed with the stage.
+    opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
+    opts.imp_eval_only = true;
+    opts.imp_samples = 4;
+    let eval = fit(&model, &pop, &model.default_params, &opts).expect("eval-only IMP");
+    let got = unreliable(&eval);
+    assert_eq!(got.len(), 1, "{:?}", eval.warnings);
+    assert!(got[0].starts_with("[IMP] "), "{}", got[0]);
+
+    opts.imp_samples = 400;
+    let clean = fit(&model, &pop, &model.default_params, &opts).expect("eval-only IMP");
+    assert!(unreliable(&clean).is_empty(), "{:?}", clean.warnings);
+
+    // The final marginal of an estimating stage, in a chain and alone.
+    opts.imp_eval_only = false;
+    opts.imp_samples = 4;
+    opts.imp_iterations = 2;
+    opts.imp_averaging = 1;
+    let chained = fit(&model, &pop, &model.default_params, &opts).expect("estimating IMP");
+    let got = unreliable(&chained);
+    assert_eq!(got.len(), 1, "{:?}", chained.warnings);
+    assert!(got[0].starts_with("[IMP] "), "{}", got[0]);
+
+    opts.methods = vec![EstimationMethod::Imp];
+    let alone = fit(&model, &pop, &model.default_params, &opts).expect("estimating IMP");
+    let got = unreliable(&alone);
+    assert_eq!(got.len(), 1, "{:?}", alone.warnings);
+    assert!(!got[0].starts_with('['), "{}", got[0]);
+}
+
 // ── Test: IMP in a chained methods sequence + IOV exercises the IS IOV path ─
-// `method = [foce, imp]` on a kappa-bearing model drives the importance-
-// sampling marginal-likelihood step through its IOV branch
-// (`obs_nll_iov_fixed_kappa`, `compute_posterior_hessian`,
-// `subject_is_estimate`, `build_proposals`). κ is held at its EBE, so the
-// reported −2LL is a partial marginal (see `KappaTreatment::FixedAtMode`).
+// `method = [foce, imp]` with `imp_eval_only` on a kappa-bearing model drives the
+// evaluation-only importance-sampling step through its IOV branch
+// (`compute_joint_posterior_hessian`, `subject_is_estimate_joint`): η and κ are
+// sampled jointly, so the reported −2LL marginalises κ
+// (`KappaTreatment::Marginalized`).
 #[test]
 fn test_iov_imp_chain_runs_importance_sampling() {
     let model = make_iov_model();
@@ -506,8 +555,7 @@ fn test_iov_imp_chain_runs_importance_sampling() {
     opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
     opts.imp_samples = 200; // keep the per-subject sampling cheap
     opts.imp_seed = Some(42); // deterministic proposal draws
-                              // The IS IOV branch is the evaluation-only path; the estimating IMP
-                              // M-step does not yet support IOV (refused up front).
+                              // Evaluation-only: score FOCE's estimates rather than re-estimate them.
     opts.imp_eval_only = true;
     let result = fit(&model, &pop, &model.default_params, &opts);
     assert!(
@@ -1456,6 +1504,7 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -1545,6 +1594,7 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 2],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -1697,6 +1747,7 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -1804,6 +1855,7 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -1900,6 +1952,7 @@ fn test_saem_block_sigma_ofv_matches_foce() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -2004,6 +2057,7 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -2111,6 +2165,7 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
@@ -2594,6 +2649,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -2845,6 +2901,7 @@ fn reset_crossover_population(reset_label: Option<u32>) -> Population {
                 pk_only_occasions: Vec::new(),
                 reset_times: vec![12.0],
                 reset_covariates: Vec::new(),
+                cmt_toggles: Vec::new(),
                 cens: vec![0; 8],
                 occasions: vec![1, 1, 1, 1, 2, 2, 2, 2],
                 obs_l2: Vec::new(),

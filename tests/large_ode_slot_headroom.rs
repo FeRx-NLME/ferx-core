@@ -203,6 +203,7 @@ fn template_population(n: usize) -> Population {
             pk_only_covariates: vec![],
             reset_times: vec![],
             reset_covariates: vec![],
+            cmt_toggles: Vec::new(),
             cens: vec![0; obs_times.len()],
             occasions: vec![],
             obs_l2: Vec::new(),

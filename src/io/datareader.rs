@@ -1793,6 +1793,9 @@ enum CmtCell {
 /// rounded: the caller defaults it *and reports it*, so a mistyped compartment is
 /// loud instead of wrong.
 ///
+/// A whole negative number does not get that far on a record that uses it: it is an
+/// on/off row or `E_NEGATIVE_CMT` ([`negative_cmt`], #2732).
+///
 /// Two range traps, both measured, both closed by the guard below rather than by a
 /// `contains` range:
 ///
@@ -1824,6 +1827,117 @@ fn parse_cmt_cell(s: &str) -> CmtCell {
         Some(f) if !f.is_sign_negative() && f < usize::MAX as f64 => CmtCell::Value(f as usize),
         _ => CmtCell::Unparseable,
     }
+}
+
+/// The compartment a `CMT` cell turns off (`-2`, `-2.0`), if it is a negative compartment
+/// number (#2732). `-0` is not one, nor is `-1.5`: those stay [`CmtCell::Unparseable`].
+fn negative_cmt(row: &[String], cmt_col: Option<usize>) -> Option<usize> {
+    let cell = row.get(cmt_col?)?.trim().strip_prefix('-')?;
+    match parse_cmt_cell(cell) {
+        CmtCell::Value(n) if n > 0 => Some(n),
+        _ => None,
+    }
+}
+
+/// Put the records sharing a `TIME` with a compartment on/off row into file order on the
+/// engines' timeline (#2732).
+///
+/// Which side of an on/off row a co-timed record falls on changes the answer: an
+/// observation before an off row reads the amount, one after it reads zero, and a dose
+/// before it is wiped. The engines order a tie by kind (`Dose < PkOnly < Obs`), so where
+/// that disagrees with the file the records are moved by one ULP, as #614 and #1810 do.
+/// Those two passes then find nothing to do at such a time. Doses never move. Records before
+/// the first dose go below it, and records after the last dose stay at the tie unless
+/// the kind order needs them above it. An on/off row always leaves a dose's `TIME`, so
+/// that `cmt_off_times` can tell which side of it the dose's record is on by time alone.
+///
+/// `Err` holds the time of a tie no such move can order: an on/off row between two doses,
+/// or between a reset and a dose.
+fn order_cmt_toggle_ties(
+    toggles: &[crate::types::CmtToggle],
+    doses: &[(f64, usize)],
+    resets: &[f64],
+    (obs_times, obs_rec): (&mut [f64], &[usize]),
+    (pk_only_times, pk_only_rec): (&mut [f64], &[usize]),
+) -> Result<(), f64> {
+    #[derive(Clone, Copy)]
+    enum Item {
+        Dose,
+        PkOnly(usize),
+        Obs(usize),
+    }
+    let rank = |item: Item| match item {
+        Item::Dose => 0,
+        Item::PkOnly(_) => 1,
+        Item::Obs(_) => 2,
+    };
+    let is_toggle =
+        |item: Item| matches!(item, Item::PkOnly(m) if toggles.iter().any(|c| c.pk_only == m));
+    let mut tie_times: Vec<f64> = toggles.iter().map(|c| pk_only_times[c.pk_only]).collect();
+    tie_times.sort_by(f64::total_cmp);
+    tie_times.dedup();
+    for t in tie_times {
+        let mut tie: Vec<(usize, Item)> = doses
+            .iter()
+            .filter(|d| d.0 == t)
+            .map(|d| (d.1, Item::Dose))
+            .collect();
+        tie.extend(
+            (0..pk_only_times.len())
+                .filter(|&m| pk_only_times[m] == t)
+                .map(|m| (pk_only_rec[m], Item::PkOnly(m))),
+        );
+        tie.extend(
+            (0..obs_times.len())
+                .filter(|&j| obs_times[j] == t)
+                .map(|j| (obs_rec[j], Item::Obs(j))),
+        );
+        tie.sort_by_key(|e| e.0);
+        let items: Vec<Item> = tie.into_iter().map(|e| e.1).collect();
+        let is_dose = |i: &Item| matches!(i, Item::Dose);
+        let first_dose = items.iter().position(is_dose);
+        let last_dose = items.iter().rposition(is_dose);
+        let between = first_dose
+            .zip(last_dose)
+            .is_some_and(|(a, b)| items[a..b].iter().any(|&i| is_toggle(i)));
+        let below_a_reset = resets.contains(&t)
+            && first_dose.is_some_and(|a| items[..a].iter().any(|&i| is_toggle(i)));
+        if between || below_a_reset {
+            return Err(t);
+        }
+        let mut place = |item: Item, at: f64| match item {
+            Item::PkOnly(m) => pk_only_times[m] = at,
+            Item::Obs(j) => obs_times[j] = at,
+            Item::Dose => {}
+        };
+        // Upward from the last dose, or from the tie's own time without one.
+        let (mut at, mut last_rank) = (t, 0);
+        for &item in &items[last_dose.map_or(0, |b| b + 1)..] {
+            let leaves_dose = last_dose.is_some() && at == t && is_toggle(item);
+            if leaves_dose || rank(item) < last_rank {
+                at = at.next_up();
+            }
+            place(item, at);
+            last_rank = rank(item);
+        }
+        // Downward from the first dose. Not past a reset: #614 moves a reset with the
+        // observations it precedes (#2728), and an observation moved here would leave that
+        // pass nothing to find, so it would land below the reset and read the state before
+        // it. With a reset at the tie no on/off row is in this stretch, `below_a_reset`
+        // having refused one, so nothing here needs this pass.
+        if resets.contains(&t) {
+            continue;
+        }
+        let (mut at, mut next_rank) = (t, 0);
+        for &item in items[..first_dose.unwrap_or(0)].iter().rev() {
+            if at == t || rank(item) > next_rank {
+                at = at.next_down();
+            }
+            place(item, at);
+            next_rank = rank(item);
+        }
+    }
+    Ok(())
 }
 
 /// How the reader arrived at a compartment the dataset did not give it.
@@ -2797,6 +2911,8 @@ fn parse_subject(
     let mut reset_rec: Vec<usize> = Vec::new();
     let mut reset_covariates: Vec<HashMap<String, f64>> = Vec::new();
     let mut reset_occasions: Vec<u32> = Vec::new();
+    // Compartment on/off rows (#2732), in file order.
+    let mut cmt_toggles: Vec<crate::types::CmtToggle> = Vec::new();
 
     // Reset-delimited occasion segmentation. NONMEM processes records
     // sequentially, so an EVID=3/4 reset whose TIME restarts at/below the
@@ -3173,6 +3289,23 @@ fn parse_subject(
             if occ_col.is_some() {
                 reset_occasions.push(occ);
             }
+        }
+
+        // A negative `CMT` turns a compartment off, and only an `EVID=2` row may do that
+        // (#2732). NONMEM 7.5.1 stops the run on one on a dose ("CAN NOT TURN OFF A
+        // COMPARTMENT RECEIVING A DOSE") or an observation, `MDV=1` included ("SPECIFIED
+        // COMPARTMENT MAY NOT BE TURNED OFF WITH AN OBSERVATION RECORD"). It accepts one on
+        // an `EVID=3` reset and leaves the compartment off afterwards, which ferx refuses
+        // rather than half-supports: write the reset, then an `EVID=2` row.
+        let off_cmt = negative_cmt(row, cmt_col);
+        if let (Some(n), true) = (off_cmt, evid != 2) {
+            return Err(format!(
+                "E_NEGATIVE_CMT: subject {id}, {}: `CMT={}` on an `EVID={evid}` record. A negative \
+                 `CMT` turns a compartment off and is only valid on an `EVID=2` row; give this \
+                 record the compartment number, and put the off row beside it.",
+                row_at(raw_time),
+                -(n as i64),
+            ));
         }
 
         if evid == 3 {
@@ -3645,6 +3778,26 @@ fn parse_subject(
             // its first observation or dose. NONMEM 7.6.0 starts the clock at
             // an EVID=0/MDV=1 record too (#1809 triage), and NONMEM 7 turns a
             // non-dose MDV=1 record into EVID=2 when no EVID is supplied.
+            //
+            // An `EVID=2` row with a `CMT` is also a compartment on/off record (#2732),
+            // `CMT=0` and no `CMT` being neither. It stays a pk-only row: `$PK` runs at it
+            // like any other, and the #1810 ordering applies to it.
+            if evid == 2 {
+                let on_cmt =
+                    cmt_col
+                        .and_then(|c| row.get(c))
+                        .and_then(|s| match parse_cmt_cell(s) {
+                            CmtCell::Value(n) if n > 0 => Some(n),
+                            _ => None,
+                        });
+                if let Some((n, on)) = off_cmt.map(|n| (n, false)).or(on_cmt.map(|n| (n, true))) {
+                    cmt_toggles.push(crate::types::CmtToggle {
+                        pk_only: pk_only_times.len(),
+                        state: n - 1,
+                        on,
+                    });
+                }
+            }
             pk_only_times.push(time);
             note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
             pk_only_raw_times.push(raw_time);
@@ -3720,6 +3873,8 @@ fn parse_subject(
     // `ImpliedDose::gov_time` is re-read from it once they have run (#2371).
     let mut gov_by_obs: Vec<(usize, usize)> = Vec::new();
     let mut gov_by_pk_only: Vec<(usize, usize)> = Vec::new();
+    // ... and by a reset, which the #614 pass may move one ULP with a trough (#2728).
+    let mut gov_by_reset: Vec<(usize, usize)> = Vec::new();
     if sorted_implied.contains(&true) {
         #[derive(Clone, Copy)]
         enum Rec {
@@ -3775,7 +3930,8 @@ fn parse_subject(
             match rec {
                 Rec::Obs(j) => gov_by_obs.push((k, j)),
                 Rec::PkOnly(m) => gov_by_pk_only.push((k, m)),
-                Rec::Dose(_) | Rec::Reset(_) => {}
+                Rec::Reset(r) => gov_by_reset.push((k, r)),
+                Rec::Dose(_) => {}
             }
             if any_tv {
                 sorted_dose_cov[k] = match rec {
@@ -3822,6 +3978,32 @@ fn parse_subject(
             reset_occasions = rperm.iter().map(|&i| reset_occasions[i]).collect();
         }
     }
+
+    // A subject that never turns a compartment off has nothing to turn on: its `EVID=2`
+    // rows with a `CMT` are the covariate markers they always were, and it keeps the
+    // engine it always took.
+    if cmt_toggles.iter().all(|c| c.on) {
+        cmt_toggles.clear();
+    }
+    let dose_ties: Vec<(f64, usize)> = sorted_doses
+        .iter()
+        .zip(&sorted_dose_rec)
+        .map(|(d, &r)| (d.time, r))
+        .collect();
+    order_cmt_toggle_ties(
+        &cmt_toggles,
+        &dose_ties,
+        &reset_times,
+        (&mut obs_times, &obs_rec),
+        (&mut pk_only_times, &pk_only_rec),
+    )
+    .map_err(|t| {
+        format!(
+            "E_CMT_TOGGLE_TIE: subject {id}: a compartment on/off row at engine time {t} is \
+             listed between records ferx cannot place around it (two doses, or a reset and a \
+             dose, at the same `TIME`). Give the on/off row its own `TIME`."
+        )
+    })?;
 
     // ── Honor NONMEM record order for the record that ends an interval (#1810) ──
     // NONMEM advances the system into a shared TIME once, at the first record there in
@@ -3924,6 +4106,16 @@ fn parse_subject(
     // nothing before its own record (`docs/model-file/steady-state.qmd`), so one ULP
     // below the dose is exactly that carried state. Until #2510 SS doses were excluded,
     // and such an observation read the post-dose steady state.
+    //
+    // A reset at the tie moves with the observation (#2728). The reader shifts a reset
+    // past every record before it (`time_offset` above), so a reset at the tie is always
+    // its first record, and an observation there was listed after it: NONMEM scores it on
+    // the reset state. Moved alone, one ULP below the tie, it would sit below the reset
+    // too and read the state from before it (on #2728's fixture, OFV 1007 against
+    // NONMEM's 38.8). Moving the reset to the same ULP keeps it first there, since the
+    // engines order a reset ahead of an observation at one time (`kind_order`). The reset
+    // keeps the `TIME` it was written at for its `$PK` (`reset_period_times`, below).
+    let mut moved_reset_ties: Vec<f64> = Vec::new();
     for j in 0..obs_times.len() {
         let t = obs_times[j];
         let mut later = false;
@@ -3939,13 +4131,30 @@ fn parse_subject(
         }
         if later && !earlier {
             obs_times[j] = t.next_down();
+            if reset_times.contains(&t) && !moved_reset_ties.contains(&t) {
+                moved_reset_ties.push(t);
+            }
         }
+    }
+    // The engine time moves and the written time does not, so both the reset's new engine
+    // time and the tie's (where the doses stay) need a row in `reset_period_times`:
+    // without the second, `period_written_time` would read a dose at the tie through the
+    // reset's one-ULP offset, one ULP late.
+    for t in moved_reset_ties {
+        let written = crate::types::period_written_time(&reset_period_times, t);
+        for r in reset_times.iter_mut().filter(|r| **r == t) {
+            *r = t.next_down();
+        }
+        reset_period_times.push((t.next_down(), written));
+        reset_period_times.push((t, written));
+        reset_period_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+        reset_period_times.dedup();
     }
 
     // The engine time an implied dose's occasion is read at is its governing record's as
     // the subject holds it (#2371): after the two passes above, which move times in place,
     // so the indices recorded by the #1909 pass still name the same records. Doses are
-    // never moved, and resets are not moved here.
+    // never moved; a reset moves only with a trough at its tie (#2728).
     for (k, j) in gov_by_obs {
         if let Some(i) = sorted_doses[k].implied.as_mut() {
             i.gov_time = obs_times[j];
@@ -3954,6 +4163,11 @@ fn parse_subject(
     for (k, m) in gov_by_pk_only {
         if let Some(i) = sorted_doses[k].implied.as_mut() {
             i.gov_time = pk_only_times[m];
+        }
+    }
+    for (k, r) in gov_by_reset {
+        if let Some(i) = sorted_doses[k].implied.as_mut() {
+            i.gov_time = reset_times[r];
         }
     }
 
@@ -3989,6 +4203,7 @@ fn parse_subject(
             pk_only_covariates,
             reset_times,
             reset_covariates,
+            cmt_toggles,
             reset_occasions,
             pk_only_occasions,
             cens,

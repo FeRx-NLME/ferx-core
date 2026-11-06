@@ -1,0 +1,33 @@
+# Twin of cmt_toggle.ctl (#2732). THETA FIX on the NONMEM side; `maxiter = 0` here.
+[parameters]
+  theta TCL(1.0, 0.01, 100.0)
+  theta TV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.04
+  sigma S ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TCL * (WT / 70) * exp(ETA_CL)
+  V  = TV
+  KB = KBC
+  ALAG2 = LAGC
+  A0 = A0C
+
+[structural_model]
+  ode(states=[central, urine])
+
+[odes]
+  d/dt(central) = -CL / V * central + KB * urine
+  d/dt(urine)   = CL / V * central - KB * urine
+  init(urine) = A0
+
+[scaling]
+  y[CMT=1] = central
+  y[CMT=2] = urine
+
+[error_model]
+  DV ~ additive(S)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false

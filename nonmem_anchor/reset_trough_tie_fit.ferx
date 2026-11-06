@@ -1,0 +1,36 @@
+# ferx twin of nonmem_anchor/reset_trough_tie.ctl (#2728): an observation listed between a
+# co-timed EVID=3 reset and a dose reads the reset state. All thetas fixed at the .ctl's
+# values and evaluated once (maxiter = 0) by tests/reset_trough_tie_nonmem_anchor.rs.
+[parameters]
+  theta TCL(1.0, FIX)
+  theta TV(10.0, FIX)
+  theta TA0(50.0, FIX)
+  theta BSTEP(2.0, FIX)
+  omega ETA_CL ~ 0.04
+  sigma S ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TCL * exp(ETA_CL)
+  V  = TV
+  A0 = if (TIME >= 30.0) TA0 * BSTEP else TA0
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  init(central) = A0
+  d/dt(central) = -CL / V * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ additive(S)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  inner_tol  = 1e-10
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

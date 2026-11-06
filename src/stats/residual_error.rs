@@ -161,6 +161,61 @@ pub(crate) fn residual_variance_raw(
             let prop = f_pred * sigma_values[0];
             prop * prop + sigma_values[1] * sigma_values[1]
         }
+        ErrorModel::LogCombined => {
+            // V = sigma1^2 + (sigma2 / F)^2 at the log prediction f = log(F) (#2729).
+            // Associated as the loadings sum `c·c·σ·σ` (`loadings_variance_g`) so
+            // the value and the generic kernel agree bit for bit.
+            let e = inv_exp_loading(f_pred);
+            sigma_values[0] * sigma_values[0] + e * e * sigma_values[1] * sigma_values[1]
+        }
+    }
+}
+
+/// How one σ slot's loading coefficient `c(f)` depends on the prediction `f` the
+/// residual is scored at; the slot's variance contribution is `(c·σ)²`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoadingForm {
+    /// `c = 1`: an additive slot.
+    Const,
+    /// `c = f`: a proportional slot (raised to `sign(f)·|f|^p` when its magnitude
+    /// row carries a `power(...)` exponent, #1182).
+    Prop,
+    /// `c = exp(−f)`: the natural-unit additive slot of [`ErrorModel::LogCombined`]
+    /// (#2729). `f` is the LTBS log prediction `log(max(F, LTBS_FLOOR))`, so
+    /// `c = 1/max(F, LTBS_FLOOR)` — NONMEM's `ADD/IPR` with `IPR` floored. Not affine
+    /// in `f`, so the slope and curvature are `−c` and `c`.
+    InvExp,
+}
+
+/// The [`LoadingForm::InvExp`] coefficient `exp(−f)`.
+#[inline]
+fn inv_exp_loading(f: f64) -> f64 {
+    (-f).exp()
+}
+
+impl LoadingForm {
+    /// `(c, ∂c/∂f, ∂²c/∂f²)` at `f`, without a `power(...)` exponent.
+    #[inline]
+    fn eval(self, f: f64) -> (f64, f64, f64) {
+        match self {
+            LoadingForm::Const => (1.0, 0.0, 0.0),
+            LoadingForm::Prop => (f, 1.0, 0.0),
+            LoadingForm::InvExp => {
+                let e = inv_exp_loading(f);
+                (e, -e, e)
+            }
+        }
+    }
+
+    /// The coefficient in generic arithmetic, so the dual kernel differentiates the
+    /// same function the `f64` path evaluates.
+    #[inline]
+    pub(crate) fn coeff_g<T: crate::sens::num::PkNum>(self, f: T) -> T {
+        match self {
+            LoadingForm::Const => T::from_f64(1.0),
+            LoadingForm::Prop => f,
+            LoadingForm::InvExp => (T::from_f64(0.0) - f).exp(),
+        }
     }
 }
 
@@ -191,69 +246,66 @@ impl ErrorSpec {
     /// `∂(sigma loading coefficient)/∂f` for each slot an observation loads on,
     /// parallel in shape to [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings).
     ///
-    /// Every loading coefficient is affine in the prediction `f`: the
-    /// proportional slot loads `f` (slope `1`), the additive slot loads the
-    /// constant `1` (slope `0`). Returning the slopes with the *same slot
-    /// presence* as [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings) lets the dense-`R` derivative
+    /// The proportional slot loads `f` (slope `1`) and the additive slot loads the
+    /// constant `1` (slope `0`), so for every error model but `LogCombined` the slopes
+    /// do not depend on `f`. `LogCombined`'s natural-unit additive slot loads `exp(−f)`,
+    /// whose slope does (#2729): it is reported as `NaN` here, so a caller that has not
+    /// passed the prediction cannot silently use a wrong value — use
+    /// [`Self::sigma_loading_slopes_at`], which is exact for every model.
+    ///
+    /// Returning the slopes with the *same slot presence* as
+    /// [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings) lets the dense-`R` derivative
     /// ([`crate::stats::residual_error::compute_dr_df_matrices`]) reuse the exact
     /// bilinear cross-covariance assembly with the value loadings replaced by
     /// these slopes — the off-diagonal `R` is linear in each observation's
     /// loadings, so `∂R_jk/∂f_j = cross(slopes_j, values_k)`.
     pub fn sigma_loading_slopes(&self, cmt: usize, n_sigma: usize) -> Vec<(usize, f64)> {
-        self.sigma_loading_slopes_inline(cmt, n_sigma).to_vec()
+        self.loading_shape(cmt, n_sigma)
+            .iter()
+            .map(|&(i, form)| match form {
+                LoadingForm::InvExp => (i, f64::NAN),
+                _ => (i, form.eval(0.0).1),
+            })
+            .collect()
+    }
+
+    /// [`Self::sigma_loading_slopes`] at the prediction `f`: exact for every error model,
+    /// including `LogCombined`'s `exp(−f)` slot (slope `−exp(−f)`, #2729). For the other
+    /// models it equals [`Self::sigma_loading_slopes`] at any `f`.
+    pub fn sigma_loading_slopes_at(&self, cmt: usize, f: f64, n_sigma: usize) -> Vec<(usize, f64)> {
+        self.sigma_loading_slopes_inline(cmt, f, n_sigma).to_vec()
     }
 
     /// The slots an observation with key `cmt` loads on, in [`Self::sigma_loadings`]'s
-    /// order, each `true` when it is the proportional one (loading `f`, slope `1`) and
-    /// `false` when additive (loading `1`, slope `0`). The one shape both
-    /// [`Self::sigma_loadings`] and [`Self::sigma_loading_slopes`] read, without a heap
-    /// allocation.
-    fn loading_shape(&self, cmt: usize, n_sigma: usize) -> Loads<(usize, bool)> {
-        let mut out = Loads::empty((0, false));
-        match self {
-            ErrorSpec::Single(em) => match em {
-                ErrorModel::Additive => {
-                    if n_sigma > 0 {
-                        out.push((0, false));
-                    }
-                }
-                ErrorModel::Proportional => {
-                    if n_sigma > 0 {
-                        out.push((0, true));
-                    }
-                }
-                ErrorModel::Combined => {
-                    if n_sigma > 0 {
-                        out.push((0, true));
-                    }
-                    if n_sigma > 1 {
-                        out.push((1, false));
-                    }
-                }
-            },
+    /// order, each with its [`LoadingForm`]. The one shape [`Self::sigma_loadings`],
+    /// [`Self::sigma_loading_slopes`], [`Self::scaled_loadings`] and the generic
+    /// likelihood kernel read, without a heap allocation — the kernel reads it for every
+    /// row of every subject at every gradient.
+    pub(crate) fn loading_shape(&self, cmt: usize, n_sigma: usize) -> Loads<(usize, LoadingForm)> {
+        let mut out = Loads::empty((0, LoadingForm::Const));
+        let (model, slots) = match self {
+            ErrorSpec::Single(em) => (em, [(n_sigma > 0).then_some(0), (n_sigma > 1).then_some(1)]),
             ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
-                if let Some(ep) = map.get(&cmt) {
-                    match ep.error_model {
-                        ErrorModel::Additive => {
-                            if let Some(&i) = ep.sigma_idx.first() {
-                                out.push((i, false));
-                            }
-                        }
-                        ErrorModel::Proportional => {
-                            if let Some(&i) = ep.sigma_idx.first() {
-                                out.push((i, true));
-                            }
-                        }
-                        ErrorModel::Combined => {
-                            if let Some(&i) = ep.sigma_idx.first() {
-                                out.push((i, true));
-                            }
-                            if let Some(&i) = ep.sigma_idx.get(1) {
-                                out.push((i, false));
-                            }
-                        }
-                    }
+                match map.get(&cmt) {
+                    Some(ep) => (
+                        &ep.error_model,
+                        [ep.sigma_idx.first().copied(), ep.sigma_idx.get(1).copied()],
+                    ),
+                    None => return out,
                 }
+            }
+        };
+        let forms: [Option<LoadingForm>; MAX_SIGMA_LOADINGS] = match model {
+            ErrorModel::Additive => [Some(LoadingForm::Const), None],
+            ErrorModel::Proportional => [Some(LoadingForm::Prop), None],
+            ErrorModel::Combined => [Some(LoadingForm::Prop), Some(LoadingForm::Const)],
+            // On the log scale the proportional part is a constant and the
+            // natural-unit additive part loads `1/F = exp(−f)` (#2729).
+            ErrorModel::LogCombined => [Some(LoadingForm::Const), Some(LoadingForm::InvExp)],
+        };
+        for (slot, form) in slots.into_iter().zip(forms) {
+            if let (Some(i), Some(form)) = (slot, form) {
+                out.push((i, form));
             }
         }
         out
@@ -267,8 +319,8 @@ impl ErrorSpec {
         n_sigma: usize,
     ) -> Loads<(usize, f64)> {
         let mut out = Loads::empty((0, 0.0));
-        for (i, prop) in self.loading_shape(cmt, n_sigma) {
-            out.push((i, if prop { f } else { 1.0 }));
+        for (i, form) in self.loading_shape(cmt, n_sigma) {
+            out.push((i, form.eval(f).0));
         }
         out
     }
@@ -277,53 +329,32 @@ impl ErrorSpec {
     pub(crate) fn sigma_loading_slopes_inline(
         &self,
         cmt: usize,
+        f: f64,
         n_sigma: usize,
     ) -> Loads<(usize, f64)> {
         let mut out = Loads::empty((0, 0.0));
-        for (i, prop) in self.loading_shape(cmt, n_sigma) {
-            out.push((i, if prop { 1.0 } else { 0.0 }));
+        for (i, form) in self.loading_shape(cmt, n_sigma) {
+            out.push((i, form.eval(f).1));
         }
         out
     }
 
-    /// The loading shape of an observation with key `cmt`: per slot `(slot, c₀, slope)`, the
-    /// loading being `c(f) = c₀ + slope·f`, and the slot count — exactly what
-    /// [`Self::sigma_loadings`] at `f = 0` and [`Self::sigma_loading_slopes`] give together,
-    /// in a fixed buffer, without allocating either list. Every loading is affine in `f`
-    /// (see [`Self::sigma_loading_slopes`]), so the shape is the whole loading; the likelihood
-    /// kernel reads it for every row of every subject at every gradient.
-    pub(crate) fn sigma_loading_shape(
-        &self,
-        cmt: usize,
-        n_sigma: usize,
-    ) -> ([(usize, f64, f64); MAX_SIGMA_LOADINGS], usize) {
-        let mut out = [(0usize, 0.0, 0.0); MAX_SIGMA_LOADINGS];
-        let (model, slots) = match self {
-            ErrorSpec::Single(em) => (em, [(n_sigma > 0).then_some(0), (n_sigma > 1).then_some(1)]),
-            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
-                match map.get(&cmt) {
-                    Some(ep) => (
-                        &ep.error_model,
-                        [ep.sigma_idx.first().copied(), ep.sigma_idx.get(1).copied()],
-                    ),
-                    None => return (out, 0),
-                }
-            }
-        };
-        let rows: [Option<(usize, f64, f64)>; MAX_SIGMA_LOADINGS] = match model {
-            ErrorModel::Additive => [slots[0].map(|i| (i, 1.0, 0.0)), None],
-            ErrorModel::Proportional => [slots[0].map(|i| (i, 0.0, 1.0)), None],
-            ErrorModel::Combined => [
-                slots[0].map(|i| (i, 0.0, 1.0)),
-                slots[1].map(|i| (i, 1.0, 0.0)),
-            ],
-        };
-        let mut n = 0;
-        for row in rows.into_iter().flatten() {
-            out[n] = row;
-            n += 1;
-        }
-        (out, n)
+    /// Whether flat sigma slot `k`'s loading for the observation with key `cmt` depends on
+    /// the prediction `f` — the slot that carries `∂v/∂f` (the proportional one, or
+    /// `LogCombined`'s additive one, #2729).
+    pub(crate) fn slot_reads_f(&self, cmt: usize, k: usize, n_sigma: usize) -> bool {
+        self.loading_shape(cmt, n_sigma)
+            .iter()
+            .any(|&(i, form)| i == k && form != LoadingForm::Const)
+    }
+
+    /// Whether any slot of the observation with key `cmt` loads non-affinely in `f`
+    /// ([`LoadingForm::InvExp`], #2729): the closed-form `∂v/∂f` shortcuts, which assume
+    /// the only `f`-dependent slot is the proportional one, do not apply.
+    fn has_inv_exp_slot(&self, cmt: usize, n_sigma: usize) -> bool {
+        self.loading_shape(cmt, n_sigma)
+            .iter()
+            .any(|&(_, form)| form == LoadingForm::InvExp)
     }
 
     /// Residual variance including fixed residual correlations from
@@ -418,45 +449,45 @@ impl ErrorSpec {
         n_sigma: usize,
         mult: &[f64],
     ) -> Loads<ScaledLoading> {
-        let loadings = self.sigma_loadings_inline(cmt, f, n_sigma);
-        let slopes = self.sigma_loading_slopes_inline(cmt, n_sigma);
         let mut out = Loads::empty(ScaledLoading {
             idx: 0,
             c: 0.0,
             c1: 0.0,
             c2: 0.0,
         });
-        for l in loadings.into_iter().map(|(idx, coeff)| {
-            let m = mult.get(idx).copied().unwrap_or(1.0);
-            let slope = slopes
-                .iter()
-                .find(|(i, _)| *i == idx)
-                .map(|(_, s)| *s)
-                .unwrap_or(0.0);
-            // Only a proportional-type loading (slope ≠ 0) is raised to a
-            // power; an additive slot's constant loading ignores its
-            // exponent entry.
-            match (slope != 0.0)
-                .then(|| slot_exponent(mult, n_sigma, idx))
-                .flatten()
-            {
-                Some(p) if p != 1.0 => {
-                    let (g, g1, g2) = power_loading(f, p);
-                    ScaledLoading {
-                        idx,
-                        c: m * g,
-                        c1: m * g1,
-                        c2: m * g2,
+        for l in self
+            .loading_shape(cmt, n_sigma)
+            .into_iter()
+            .map(|(idx, form)| {
+                let m = mult.get(idx).copied().unwrap_or(1.0);
+                // Only a proportional loading is raised to a power; a constant
+                // slot's loading ignores its exponent entry.
+                match (form == LoadingForm::Prop)
+                    .then(|| slot_exponent(mult, n_sigma, idx))
+                    .flatten()
+                {
+                    Some(p) if p != 1.0 => {
+                        let (g, g1, g2) = power_loading(f, p);
+                        ScaledLoading {
+                            idx,
+                            c: m * g,
+                            c1: m * g1,
+                            c2: m * g2,
+                        }
+                    }
+                    _ => {
+                        let (coeff, slope, curv) = form.eval(f);
+                        ScaledLoading {
+                            idx,
+                            c: coeff * m,
+                            c1: slope * m,
+                            // An affine loading's curvature is an exact `0`, not `0·m`.
+                            c2: if curv == 0.0 { 0.0 } else { curv * m },
+                        }
                     }
                 }
-                _ => ScaledLoading {
-                    idx,
-                    c: coeff * m,
-                    c1: slope * m,
-                    c2: 0.0,
-                },
-            }
-        }) {
+            })
+        {
             out.push(l);
         }
         out
@@ -467,10 +498,12 @@ impl ErrorSpec {
     fn prop_slot_exponent(&self, cmt: usize, n_sigma: usize, mult: &[f64]) -> Option<f64> {
         let slot = self.prop_sigma_slot(cmt)?;
         // `prop_sigma_slot` is `Some(0)` for an additive `Single` too; only a
-        // slot whose loading actually slopes in `f` is raised to a power.
-        let slopes = self.sigma_loading_slopes_inline(cmt, n_sigma);
-        let slopes_in_f = slopes.iter().any(|&(i, s)| i == slot && s != 0.0);
-        if !slopes_in_f {
+        // proportional loading is raised to a power.
+        let is_prop = self
+            .loading_shape(cmt, n_sigma)
+            .iter()
+            .any(|&(i, form)| i == slot && form == LoadingForm::Prop);
+        if !is_prop {
             return None;
         }
         slot_exponent(mult, n_sigma, slot)
@@ -530,7 +563,35 @@ impl ErrorSpec {
         if variance_is_guarded(self.variance_at_raw(cmt, f, sigma)) {
             return 0.0;
         }
+        if self.has_inv_exp_slot(cmt, sigma.len()) {
+            return self.dvar_df_loadings(cmt, f, sigma, &[]);
+        }
         self.dvar_df_raw(cmt, f, sigma)
+    }
+
+    /// `∂v/∂f = Σ 2·c·c'·σ²` summed over the scaled loadings — the form every loading
+    /// that is not the plain affine proportional one takes (a `power(...)` slot, #1182;
+    /// `LogCombined`'s `exp(−f)` slot, #2729). Ungated: the callers gate first.
+    fn dvar_df_loadings(&self, cmt: usize, f: f64, sigma: &[f64], mult: &[f64]) -> f64 {
+        self.scaled_loadings(cmt, f, sigma.len(), mult)
+            .iter()
+            .map(|l| {
+                let sg = sigma.get(l.idx).copied().unwrap_or(0.0);
+                2.0 * l.c * l.c1 * sg * sg
+            })
+            .sum()
+    }
+
+    /// `∂²v/∂f² = Σ 2·(c'² + c·c'')·σ²` over the scaled loadings; the companion of
+    /// [`Self::dvar_df_loadings`]. Ungated.
+    fn d2var_df2_loadings(&self, cmt: usize, f: f64, sigma: &[f64], mult: &[f64]) -> f64 {
+        self.scaled_loadings(cmt, f, sigma.len(), mult)
+            .iter()
+            .map(|l| {
+                let sg = sigma.get(l.idx).copied().unwrap_or(0.0);
+                2.0 * (l.c1 * l.c1 + l.c * l.c2) * sg * sg
+            })
+            .sum()
     }
 
     /// Raw (ungated) `∂v/∂f` — the closed-form proportional slope before the
@@ -559,6 +620,11 @@ impl ErrorSpec {
         match em {
             ErrorModel::Additive => 0.0,
             ErrorModel::Proportional | ErrorModel::Combined => 2.0 * f * prop_sigma * prop_sigma,
+            // Its `f`-dependent slot is the additive one; the callers route it to
+            // `dvar_df_loadings` before reaching here.
+            ErrorModel::LogCombined => {
+                unreachable!("LogCombined is routed to dvar_df_loadings")
+            }
         }
     }
 
@@ -607,19 +673,15 @@ impl ErrorSpec {
         }
         // A `power(...)` slot (#1182): `R = Σ (c·σ)²` with `c = m·sign(f)|f|^p`,
         // so `∂R/∂f = Σ 2·c·c'·σ²` — the additive slot has `c' = 0` and drops
-        // out, exactly as it does from `dvar_df_raw`.
-        if self
-            .prop_slot_exponent(cmt, sigma.len(), mult)
-            .is_some_and(|p| p != 1.0)
+        // out, exactly as it does from `dvar_df_raw`. `LogCombined`'s `exp(−f)`
+        // slot (#2729) takes the same sum: its multiplier is the additive slot's,
+        // not the `m_prop` the closed form below scales by.
+        if self.has_inv_exp_slot(cmt, sigma.len())
+            || self
+                .prop_slot_exponent(cmt, sigma.len(), mult)
+                .is_some_and(|p| p != 1.0)
         {
-            return self
-                .scaled_loadings(cmt, f, sigma.len(), mult)
-                .iter()
-                .map(|l| {
-                    let sg = sigma.get(l.idx).copied().unwrap_or(0.0);
-                    2.0 * l.c * l.c1 * sg * sg
-                })
-                .sum();
+            return self.dvar_df_loadings(cmt, f, sigma, mult);
         }
         self.dvar_df_raw(cmt, f, sigma) * m * m
     }
@@ -641,6 +703,9 @@ impl ErrorSpec {
     pub fn d2var_df2(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
         if variance_is_guarded(self.variance_at_raw(cmt, f, sigma)) {
             return 0.0;
+        }
+        if self.has_inv_exp_slot(cmt, sigma.len()) {
+            return self.d2var_df2_loadings(cmt, f, sigma, &[]);
         }
         self.d2var_df2_raw(cmt, sigma)
     }
@@ -670,6 +735,9 @@ impl ErrorSpec {
         match em {
             ErrorModel::Additive => 0.0,
             ErrorModel::Proportional | ErrorModel::Combined => 2.0 * prop_sigma * prop_sigma,
+            ErrorModel::LogCombined => {
+                unreachable!("LogCombined is routed to d2var_df2_loadings")
+            }
         }
     }
 
@@ -702,19 +770,14 @@ impl ErrorSpec {
             return 0.0;
         }
         // A `power(...)` slot (#1182): `∂²(c²σ²)/∂f² = 2·(c'² + c·c'')·σ²`; the
-        // curvature `c''` is what the affine loadings never had.
-        if self
-            .prop_slot_exponent(cmt, sigma.len(), mult)
-            .is_some_and(|p| p != 1.0)
+        // curvature `c''` is what the affine loadings never had. So is
+        // `LogCombined`'s `exp(−f)` slot (#2729).
+        if self.has_inv_exp_slot(cmt, sigma.len())
+            || self
+                .prop_slot_exponent(cmt, sigma.len(), mult)
+                .is_some_and(|p| p != 1.0)
         {
-            return self
-                .scaled_loadings(cmt, f, sigma.len(), mult)
-                .iter()
-                .map(|l| {
-                    let sg = sigma.get(l.idx).copied().unwrap_or(0.0);
-                    2.0 * (l.c1 * l.c1 + l.c * l.c2) * sg * sg
-                })
-                .sum();
+            return self.d2var_df2_loadings(cmt, f, sigma, mult);
         }
         self.d2var_df2_raw(cmt, sigma) * m * m
     }
@@ -731,6 +794,20 @@ impl ErrorSpec {
             None => return 0.0,
         };
         let sk2 = sk * sk;
+        // `LogCombined` (#2729): its `SigmaType`s name what the slots *mean*
+        // (a proportional and an additive error), not how they load on the log
+        // prediction — slot `k`'s contribution is `(c·σ_k)²`, so `2·c²·σ_k²`.
+        if self.has_inv_exp_slot(cmt, sigma.len()) {
+            return self
+                .loading_shape(cmt, sigma.len())
+                .iter()
+                .find(|&&(i, _)| i == k)
+                .map(|&(_, form)| {
+                    let c = form.eval(f).0;
+                    2.0 * c * c * sk2
+                })
+                .unwrap_or(0.0);
+        }
         // Resolve which `SigmaType` (if any) global index `k` plays for this
         // observation's endpoint.
         let stype = match self {
@@ -816,16 +893,19 @@ impl ErrorSpec {
     }
 
     /// Global `sigma.values` indices of the additive component of every
-    /// `Combined` endpoint (the second sigma slot). De-duplicated; empty when
+    /// `Combined` or `LogCombined` endpoint (the second sigma slot). De-duplicated; empty when
     /// no endpoint is combined.
     pub fn combined_additive_sigma_indices(&self) -> Vec<usize> {
         match self {
-            ErrorSpec::Single(ErrorModel::Combined) => vec![1],
+            ErrorSpec::Single(ErrorModel::Combined | ErrorModel::LogCombined) => vec![1],
             ErrorSpec::Single(_) => Vec::new(),
             ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
                 let mut out = Vec::new();
                 for endpoint in map.values() {
-                    if matches!(endpoint.error_model, ErrorModel::Combined) {
+                    if matches!(
+                        endpoint.error_model,
+                        ErrorModel::Combined | ErrorModel::LogCombined
+                    ) {
                         if let Some(&idx) = endpoint.sigma_idx.get(1) {
                             if !out.contains(&idx) {
                                 out.push(idx);
@@ -2419,25 +2499,37 @@ fn visit_d2r_df2_cov(
             diag_self_second_deriv(&scaled[m], sigma_values, correlations),
         );
     }
-    // Mixed partial ∂²R_jk/∂f_j∂f_k for each matched pair (both slope loadings).
+    // Curvature loadings `c''`: zero for an affine loading, live for a `power(...)`
+    // slot (#1182) and `LogCombined`'s `exp(−f)` slot (#2729).
+    let cload: Vec<Vec<(usize, f64)>> = scaled
+        .iter()
+        .map(|row| row.iter().map(|l| (l.idx, l.c2)).collect())
+        .collect();
+    // For each matched pair, `R_jk = cross(c_j, c_k)` is bilinear in the two rows'
+    // loadings: the mixed partial `∂²R_jk/∂f_j∂f_k = cross(c_j', c_k')`, and — where a
+    // loading is not affine — the own-row curvatures `∂²R_jk/∂f_j² = cross(c_j'', c_k)`
+    // and `∂²R_jk/∂f_k² = cross(c_j, c_k'')`.
     for &(j, k, _) in &pairs {
-        let d =
-            cross_observation_covariance(&sload[j], &sload[k], sigma_values, correlations, |c| {
-                correlations[c].rho
-            });
+        let cross = |a: &[(usize, f64)], b: &[(usize, f64)]| {
+            cross_observation_covariance(a, b, sigma_values, correlations, |c| correlations[c].rho)
+        };
+        let d = cross(&sload[j], &sload[k]);
         if d != 0.0 {
             sink(j, k, j, k, d);
             sink(k, j, j, k, d);
         }
+        let djj = cross(&cload[j], &vload[k]);
+        if djj != 0.0 {
+            sink(j, j, j, k, djj);
+        }
+        let dkk = cross(&vload[j], &cload[k]);
+        if dkk != 0.0 {
+            sink(k, k, j, k, dkk);
+        }
     }
-    // A `correlation` line (#1081): `∂²R_jk/∂f_j∂f_k = C_jk · Σ c_j' c_k' σ²`, and —
-    // for a `power(...)` slot, whose loading is not affine — the own-row curvature
-    // `∂²R_jk/∂f_j² = C_jk · Σ c_j'' c_k σ²`.
+    // A `correlation` line (#1081): `∂²R_jk/∂f_j∂f_k = C_jk · Σ c_j' c_k' σ²`, and the
+    // own-row curvature `∂²R_jk/∂f_j² = C_jk · Σ c_j'' c_k σ²` of a non-affine loading.
     if let Some(serial) = cov.serial {
-        let cload: Vec<Vec<(usize, f64)>> = scaled
-            .iter()
-            .map(|row| row.iter().map(|l| (l.idx, l.c2)).collect())
-            .collect();
         match serial_pairs(serial, obs_rgroup, obs_times, obs_raw_times, n) {
             Some(spairs) => {
                 for (j, k, c) in spairs {
@@ -2708,21 +2800,27 @@ mod tests {
     use approx::assert_relative_eq;
     use std::collections::HashMap;
 
-    /// `sigma_loading_shape` is exactly `sigma_loadings` at `f = 0` and `sigma_loading_slopes`
-    /// together — the two lists the likelihood kernel used to allocate per row — on every
-    /// error form, every σ count a `Single` model can be declared with, every per-endpoint
-    /// model (with a combined endpoint missing its second σ), and an unmapped key.
-    /// (`Selected` shares the `PerCmt` arm.) Mutations, run: swapping the additive and
+    /// `loading_shape` evaluated at `f` is exactly `sigma_loadings` and `sigma_loading_slopes`
+    /// at `f` together — the two lists the likelihood kernel used to allocate per row — on
+    /// every error form, every σ count a `Single` model can be declared with, every
+    /// per-endpoint model (with a combined endpoint missing its second σ), and an unmapped
+    /// key. (`Selected` shares the `PerCmt` arm.) Mutations, run: swapping the additive and
     /// proportional slopes, or dropping the combined model's second slot, reddens it.
     #[test]
     fn the_loading_shape_is_the_loadings_and_their_slopes() {
+        const F: f64 = 0.7;
         let shape_of = |spec: &ErrorSpec, k: usize, n: usize| {
-            let (shape, len) = spec.sigma_loading_shape(k, n);
-            shape[..len].to_vec()
+            spec.loading_shape(k, n)
+                .iter()
+                .map(|&(i, form)| {
+                    let (c, c1, _) = form.eval(F);
+                    (i, c, c1)
+                })
+                .collect::<Vec<_>>()
         };
         let lists_of = |spec: &ErrorSpec, k: usize, n: usize| {
-            let at0 = spec.sigma_loadings(k, 0.0, n);
-            let slopes = spec.sigma_loading_slopes(k, n);
+            let at0 = spec.sigma_loadings(k, F, n);
+            let slopes = spec.sigma_loading_slopes_at(k, F, n);
             assert_eq!(at0.len(), slopes.len(), "slot presence is shared");
             at0.iter()
                 .zip(&slopes)
@@ -2736,6 +2834,7 @@ mod tests {
             ErrorModel::Additive,
             ErrorModel::Proportional,
             ErrorModel::Combined,
+            ErrorModel::LogCombined,
         ] {
             let spec = ErrorSpec::Single(em);
             for n in 0..=3 {
@@ -2788,6 +2887,291 @@ mod tests {
             "an unmapped key loads nothing"
         );
         assert_eq!(shape_of(&spec, 3, 6).len(), 2, "combined: two slots");
+    }
+
+    // ── #2729: combined error under log-transform-both-sides ─────────────
+
+    /// `LogCombined` at the log prediction `g = log F` is NONMEM's
+    /// `W² = PROP² + ADD²/IPR²`, on every value path: the bare variance, the scaled
+    /// one with an all-ones row, the correlated one with no pairs, and the loadings sum.
+    #[test]
+    fn log_combined_variance_is_prop_squared_plus_add_over_f_squared() {
+        let spec = ErrorSpec::Single(ErrorModel::LogCombined);
+        let sigma = [0.15, 0.4];
+        for big_f in [0.05, 0.4, 1.0, 3.0, 80.0] {
+            let g = f64::ln(big_f);
+            let want = 0.15 * 0.15 + 0.4 * 0.4 / (big_f * big_f);
+            let v = spec.variance_at(0, g, &sigma);
+            assert_relative_eq!(v, want, max_relative = 1e-14);
+            assert_eq!(spec.variance_at_scaled(0, g, &sigma, &[], &[1.0, 1.0]), v);
+            assert_eq!(spec.variance_at_with_correlations(0, g, &sigma, &[]), v);
+            assert_eq!(
+                residual_variance(ErrorModel::LogCombined, g, &sigma),
+                v,
+                "value and loadings paths associate identically"
+            );
+        }
+        // The LTBS floor is the variance floor: a prediction at `LTBS_FLOOR` scores
+        // `ADD/LTBS_FLOOR`, finite, and is not guarded.
+        let g = crate::pk::ltbs_log_g(0.0);
+        let v = spec.variance_at(0, g, &sigma);
+        assert!(v.is_finite() && v > 1e20, "floored variance {v:e}");
+        assert_relative_eq!(
+            v,
+            0.15 * 0.15 + (0.4 / crate::pk::LTBS_FLOOR).powi(2),
+            max_relative = 1e-12
+        );
+    }
+
+    /// `ADD → 0` is LTBS additive error at `PROP`, on the value and on every
+    /// derivative the likelihood reads (the issue's degenerate check).
+    #[test]
+    fn log_combined_with_zero_add_is_log_additive() {
+        let lc = ErrorSpec::Single(ErrorModel::LogCombined);
+        let add = ErrorSpec::Single(ErrorModel::Additive);
+        for g in [-2.0, 0.3, 4.0] {
+            assert_eq!(
+                lc.variance_at(0, g, &[0.2, 0.0]),
+                add.variance_at(0, g, &[0.2])
+            );
+            assert_eq!(lc.dvar_df(0, g, &[0.2, 0.0]), 0.0);
+            assert_eq!(lc.d2var_df2(0, g, &[0.2, 0.0]), 0.0);
+            assert_eq!(
+                lc.dvar_dlogsigma(0, 0, g, &[0.2, 0.0]),
+                add.dvar_dlogsigma(0, 0, g, &[0.2])
+            );
+        }
+    }
+
+    /// The `f`-derivatives of `LogCombined` are those of its value function — central FD
+    /// in the log prediction, bare and under a magnitude row on *each* slot. The rows put
+    /// a different multiplier on each slot, so scaling `∂V/∂f` by the proportional slot's
+    /// `m²` (the closed form every other model takes) reddens the scaled cases; and
+    /// `dvar_df`'s non-zero value pins that the additive slot is the live one.
+    #[test]
+    fn log_combined_f_derivatives_match_fd() {
+        let spec = ErrorSpec::Single(ErrorModel::LogCombined);
+        let sigma = [0.15, 0.4];
+        for row in [
+            vec![],
+            vec![1.0, 1.0],
+            vec![2.0, 1.0],
+            vec![1.0, 0.5],
+            vec![1.7, 2.5],
+        ] {
+            for g in [-1.5, 0.0, 1.2, 4.0] {
+                let h = 1e-5;
+                let v = |x: f64| spec.variance_at_scaled(0, x, &sigma, &[], &row);
+                let fd1 = (v(g + h) - v(g - h)) / (2.0 * h);
+                // A wider step for the second difference: at g = 4 the `f`-dependent
+                // part is 1% of V, and `1e-5` loses it to cancellation.
+                let h2 = 1e-3;
+                let fd2 = (v(g + h2) - 2.0 * v(g) + v(g - h2)) / (h2 * h2);
+                assert!(fd1.is_finite() && fd2.is_finite());
+                let m_add = row.get(1).copied().unwrap_or(1.0);
+                // Closed form: ∂V/∂g = −2·(m·ADD)²·e^{−2g}, ∂²V/∂g² = 4·(m·ADD)²·e^{−2g}.
+                let e2 = (-2.0 * g).exp() * (m_add * 0.4) * (m_add * 0.4);
+                let d1 = spec.dvar_df_scaled(0, g, &sigma, &row);
+                let d2 = spec.d2var_df2_scaled(0, g, &sigma, &row);
+                assert_relative_eq!(d1, -2.0 * e2, max_relative = 1e-12);
+                assert_relative_eq!(d2, 4.0 * e2, max_relative = 1e-12);
+                assert_relative_eq!(d1, fd1, max_relative = 1e-7);
+                assert_relative_eq!(d2, fd2, max_relative = 1e-4);
+                if row.is_empty() {
+                    assert_eq!(spec.dvar_df(0, g, &sigma), d1);
+                    assert_eq!(spec.d2var_df2(0, g, &sigma), d2);
+                }
+            }
+        }
+    }
+
+    /// `∂V/∂log σ_k` of `LogCombined` against FD in `log σ_k`: the proportional slot is
+    /// `2·PROP²` (constant on the log scale, not the `2·PROP²·f²` its `SigmaType`
+    /// would give), the additive one `2·ADD²·e^{−2g}`.
+    #[test]
+    fn log_combined_dvar_dlogsigma_matches_fd() {
+        let spec = ErrorSpec::Single(ErrorModel::LogCombined);
+        let sigma = [0.15, 0.4];
+        for row in [vec![], vec![1.6, 0.7]] {
+            for g in [-1.0, 0.5, 3.0] {
+                for k in 0..2 {
+                    let h = 1e-6;
+                    let at = |d: f64| {
+                        let mut s = sigma;
+                        s[k] *= d.exp();
+                        spec.variance_at_scaled(0, g, &s, &[], &row)
+                    };
+                    let fd = (at(h) - at(-h)) / (2.0 * h);
+                    let got = if row.is_empty() {
+                        spec.dvar_dlogsigma(0, k, g, &sigma)
+                    } else {
+                        spec.dvar_dlogsigma_scaled(0, k, g, &sigma, &row)
+                    };
+                    assert!(fd.is_finite());
+                    assert_relative_eq!(got, fd, max_relative = 1e-7);
+                }
+            }
+        }
+    }
+
+    /// Per-endpoint dispatch of the `LogCombined` loadings (the parser refuses LTBS per
+    /// CMT today, but the residual-error owner must not depend on that): the endpoint's
+    /// own σ slots, in order, the second one the `exp(−f)` slot; `slot_reads_f` names it.
+    #[test]
+    fn log_combined_endpoint_loads_its_own_slots() {
+        let mut map = HashMap::new();
+        map.insert(
+            2,
+            EndpointError {
+                error_model: ErrorModel::LogCombined,
+                sigma_idx: vec![3, 1],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        let g = 0.8;
+        let l = spec.sigma_loadings(2, g, 4);
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0], (3, 1.0));
+        assert_eq!(l[1].0, 1);
+        assert_relative_eq!(l[1].1, (-g).exp(), max_relative = 1e-15);
+        let sigma = [9.0, 0.4, 9.0, 0.15];
+        assert_relative_eq!(
+            spec.variance_at(2, g, &sigma),
+            0.15 * 0.15 + 0.4 * 0.4 * (-2.0 * g).exp(),
+            max_relative = 1e-14
+        );
+        assert!(spec.slot_reads_f(2, 1, 4) && !spec.slot_reads_f(2, 3, 4));
+        assert_eq!(spec.combined_additive_sigma_indices(), vec![1]);
+        assert!(spec.has_f_dependent_variance());
+        assert_eq!(
+            spec.sigma_types(4),
+            vec![
+                SigmaType::Additive,
+                SigmaType::Additive,
+                SigmaType::Additive,
+                SigmaType::Proportional
+            ]
+        );
+    }
+
+    /// The two-argument `sigma_loading_slopes` keeps its pre-#2729 values for every
+    /// model whose slopes do not depend on `f`, and reports the `exp(−f)` slot as `NaN`
+    /// rather than a slope at some arbitrary `f`; `sigma_loading_slopes_at` is exact.
+    #[test]
+    fn sigma_loading_slopes_compat_and_at() {
+        for em in [
+            ErrorModel::Additive,
+            ErrorModel::Proportional,
+            ErrorModel::Combined,
+        ] {
+            let spec = ErrorSpec::Single(em);
+            for f in [-2.0, 0.0, 3.5] {
+                assert_eq!(
+                    spec.sigma_loading_slopes(0, 2),
+                    spec.sigma_loading_slopes_at(0, f, 2),
+                    "{em:?} at {f}"
+                );
+            }
+        }
+        let lc = ErrorSpec::Single(ErrorModel::LogCombined);
+        let compat = lc.sigma_loading_slopes(0, 2);
+        assert_eq!(compat[0], (0, 0.0));
+        assert_eq!(compat[1].0, 1);
+        assert!(compat[1].1.is_nan(), "{compat:?}");
+        let g = 0.7;
+        let at = lc.sigma_loading_slopes_at(0, g, 2);
+        assert_eq!(at[0], (0, 0.0));
+        assert_eq!(at[1].0, 1);
+        assert_relative_eq!(at[1].1, -(-g).exp(), max_relative = 1e-15);
+    }
+
+    /// The dense `∂²R/∂f²` of matched `block_sigma` pairs carries each row's own
+    /// curvature when a loading is not affine: with the two endpoints' `exp(−f)` slots
+    /// correlated, `∂²R_jk/∂f_j² = cross(c_j'', c_k) ≠ 0`. Against central FD of the
+    /// dense `R` itself (not of `∂R/∂f`, which shares the loadings under test), every
+    /// entry of the tensor, plus a pin that the own-row entry is live.
+    #[test]
+    fn d2r_df2_includes_own_row_curvature_of_paired_log_combined_rows() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::LogCombined,
+                    sigma_idx: vec![0, 1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::LogCombined,
+                    sigma_idx: vec![2, 3],
+                },
+            ),
+        ]));
+        // Log-scale predictions; the ADD slots (1 and 3) are correlated across rows
+        // sampled at the same time.
+        let ipreds = [1.0, -0.5, 0.3, -1.2];
+        let cmts = [1usize, 2, 1, 2];
+        let times = [1.0, 1.0, 2.0, 2.0];
+        let sigma = [0.1, 0.4, 0.2, 0.6];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 3,
+            rho: 0.5,
+        };
+        let r_at = |f: &[f64]| {
+            compute_r_matrix_with_correlations(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &[],
+                &sigma,
+                &[corr],
+            )
+        };
+        let d2r = compute_d2r_df2_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+            None,
+        );
+        let n = ipreds.len();
+        let h = 2e-4;
+        let mut worst = 0.0f64;
+        for a in 0..n {
+            for b in 0..n {
+                let at = |da: f64, db: f64| {
+                    let mut f = ipreds.to_vec();
+                    f[a] += da;
+                    f[b] += db;
+                    r_at(&f)
+                };
+                let fd = (at(h, h) - at(h, -h) - at(-h, h) + at(-h, -h)) / (4.0 * h * h);
+                for p in 0..n {
+                    for q in 0..n {
+                        let (got, want) = (d2r[a][b][(p, q)], fd[(p, q)]);
+                        assert!(got.is_finite() && want.is_finite());
+                        worst = worst.max((got - want).abs() / (1.0 + want.abs()));
+                    }
+                }
+            }
+        }
+        // Measured 5.0e-8 at h = 2e-4 (Linux x86_64); 5× headroom. Without the own-row
+        // curvature the gap is the missing entry itself, O(0.1).
+        assert!(worst < 2.5e-7, "worst relative gap {worst:.2e}");
+        // Row 0 (CMT 1, t=1) pairs with row 1 (CMT 2, t=1): its own curvature is live.
+        let own = d2r[0][0][(0, 1)];
+        let want = 0.5 * 0.4 * 0.6 * (-ipreds[0]).exp() * (-ipreds[1]).exp();
+        assert_relative_eq!(own, want, max_relative = 1e-12);
     }
 
     // ── #1182: the `power(...)` exponent channel ─────────────────────────
@@ -4278,7 +4662,6 @@ mod tests {
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
-            #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
             #[cfg(feature = "survival")]
             tte_rows: Vec::new(),

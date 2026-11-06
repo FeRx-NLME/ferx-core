@@ -56,6 +56,33 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
     Ok(())
 }
 
+/// Reject an adaptive-dosing simulation on any active residual-error magnitude: a sigma
+/// scaled by an expression, a `weight =`, a `power(σ, P)` exponent, or a magnitude on a
+/// `CMT=N:` line (#2731, #2741). [`assay_resid_var`] has no observation row to evaluate
+/// a magnitude on, so the assay would draw on the bare sigma and report the run as if
+/// the factor had applied — measured on #2741: a tenfold multiplier and a cubed loading
+/// left every `Dv` reading bit-identical to the bare model's.
+///
+/// The assay is the only reader of the residual error, so a run with no `Dv` monitor
+/// (and a spec without assay error) was correct, and is refused too: the check runs on
+/// the model alone, before the options are looked at, like the `Selected` reject above.
+/// #2741's lift, applying the magnitude in the assay, removes the refusal for both.
+///
+/// One gate, [`RuvMagnitude::is_active`](crate::types::RuvMagnitude::is_active), so the
+/// single-endpoint and endpoint-keyed forms cannot drift apart.
+fn reject_ruv_magnitude_for_adaptive(model: &CompiledModel) -> Result<(), EngineError> {
+    if model.has_custom_ruv_magnitude() {
+        return Err(super::entry_refusals::adaptive_unsupported(
+            Some("error_model"),
+            "adaptive-dosing simulation does not support a residual-error magnitude (a sigma \
+             multiplied by an expression, a `weight =`, a `power(...)` exponent, or a \
+             magnitude on a `CMT=N:` line). The assay draws its residual error from the bare \
+             sigma, without the magnitude. Use bare sigma names in `[error_model]`.",
+        ));
+    }
+    Ok(())
+}
+
 /// The model-vs-data checks both public adaptive entry points run before anything
 /// else touches the population: `check_simulation_data` (the list every other
 /// simulate entry point runs, #1083), then the `Selected` error-model reject (#658).
@@ -72,7 +99,8 @@ pub(crate) fn check_adaptive_model_data(
         return Err(super::entry_refusals::nested_level_simulate_unsupported());
     }
     first_error(&check_simulation_data(model, population))?;
-    reject_selected_error_for_adaptive(model)
+    reject_selected_error_for_adaptive(model)?;
+    reject_ruv_magnitude_for_adaptive(model)
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
@@ -383,7 +411,8 @@ where
             obs_scale: None,
         })
         .collect();
-    let make = move || {
+    // The caller's controllers take no subject: the factory ignores the index.
+    let make = move |_subject: usize| {
         let mut c = make_controller();
         move |ctx: &ControllerCtx| crate::sim::adaptive::ControllerDecision {
             actions: c(ctx),
@@ -398,7 +427,7 @@ where
         n_sim,
         &opts.decision_times,
         &monitors,
-        make,
+        |_supplied: &[Option<Vec<f64>>]| Ok(make),
         // Programmatic path: no declarative block, so no target band — the
         // window-dependent metric (`pct_time_in_window`) is left unreported.
         None,
@@ -407,6 +436,8 @@ where
         None,
         opts,
         AdaptiveEntry::Programmatic,
+        // A caller's controller has no dose expressions.
+        &[],
     )
 }
 
@@ -480,6 +511,79 @@ impl AdaptiveEntry {
         }
         None
     }
+}
+
+/// Every subject's dose plan (#944), in population order: the block's numbers, with
+/// each dose expression evaluated from θ and the covariates in force at the first
+/// decision, `at[0]` — the row `locf_decision_cov` resolves there, the same resolver the
+/// driver hands `ctx.covariates` and the IOV block uses, so the expression reads what a
+/// controller reads at decision 0. Before the subject's first record that is
+/// `subject.covariates`, as in the driver. Every subject is checked here, before any is
+/// simulated: the first whose plan breaks an invariant is refused
+/// (`E_ADAPTIVE_DOSE_VALUE`). A block of numbers gives every subject the same plan.
+fn resolve_dose_plans(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    spec: &crate::sim::adaptive::AdaptiveDosingSpec,
+    exprs: &crate::sim::adaptive_control::CompiledDoseExprs,
+) -> Result<Vec<crate::sim::adaptive::SubjectDosePlan>, EngineError> {
+    if let Some(plan) = spec.literal_dose_plan() {
+        return Ok(vec![plan; population.subjects.len()]);
+    }
+    let at0 = spec.at[0];
+    population
+        .subjects
+        .iter()
+        .map(|subject| {
+            let records =
+                crate::ode::predictions::AdaptiveRecordIndex::new(subject, subject.doses.len());
+            let covs = crate::ode::predictions::locf_decision_cov(
+                &records,
+                at0,
+                subject,
+                &subject.covariates,
+            );
+            let r = exprs.resolve(spec, model, &params.theta, covs);
+            match r.violation {
+                None => Ok(r.plan),
+                Some(v) => Err(
+                    super::entry_refusals::adaptive_dose_value(v.subject_message(
+                        spec,
+                        &r.plan,
+                        &subject.id,
+                        &r.reads,
+                    ))
+                    .in_context("simulate_adaptive_from_spec"),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// The remedy `W_FREM_DRAWN_ETA` gives on an adaptive run. When a dose expression reads a
+/// data covariate (#944), it first names the keys and covariates: the dose is computed
+/// from the data, while a drawn subject's PK follows its drawn covariate η (#2245).
+fn frem_drawn_remedy(dose_covariates: &[(&str, &str)]) -> String {
+    let doses = if dose_covariates.is_empty() {
+        String::new()
+    } else {
+        let reads = dose_covariates
+            .iter()
+            .map(|(key, cov)| format!("{key} reads {cov}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "The [adaptive_dosing] dose expressions compute each subject's doses from the \
+             covariate values in the data ({reads}), which these subjects' PK does not follow. "
+        )
+    };
+    format!(
+        "{doses}A controller reading `ControllerCtx::covariates` doses these subjects on \
+         covariate values their PK does not follow. Supply the FREM fit's EBEs as \
+         `SuppliedEtas` (`AdaptiveInputs::with_etas`), which are conditioned on each \
+         subject's covariate rows."
+    )
 }
 
 /// `E_ADAPTIVE_SPEC` (block `adaptive_dosing`) in `simulate_adaptive_from_spec`'s context.
@@ -623,8 +727,13 @@ fn decisions_before_moved_reset_warnings(
 ///
 /// Both entries resolve `ode` and validate the schedule before calling, so this
 /// helper assumes them well-formed and focuses on the run loop.
+///
+/// `prepare` runs once, after the supplied η are resolved and before any subject is
+/// simulated, and returns the controller factory, which takes the subject's index in
+/// `population`. The spec entry evaluates each subject's dose plan there (#944), so a
+/// subject whose dose values break an invariant is refused before any subject runs.
 #[allow(clippy::too_many_arguments)]
-fn run_adaptive_population<F, C>(
+fn run_adaptive_population<P, F, C>(
     model: &CompiledModel,
     ode: &crate::ode::OdeSpec,
     population: &Population,
@@ -632,14 +741,16 @@ fn run_adaptive_population<F, C>(
     n_sim: usize,
     decision_times: &[f64],
     monitors: &[crate::sim::adaptive::AdaptiveMonitor],
-    make_controller: F,
+    prepare: P,
     target_window: Option<(f64, f64)>,
     auc_target: Option<(f64, f64)>,
     opts: &AdaptiveSimulateOptions,
     entry: AdaptiveEntry,
+    dose_covariates: &[(&str, &str)],
 ) -> Result<AdaptiveSimulationResult, EngineError>
 where
-    F: Fn() -> C,
+    P: FnOnce(&[Option<Vec<f64>>]) -> Result<F, EngineError>,
+    F: Fn(usize) -> C,
     C: FnMut(&ControllerCtx) -> crate::sim::adaptive::ControllerDecision,
 {
     // Start the process-global SS-equilibration non-convergence sink clean (#867, #1652). This
@@ -679,6 +790,17 @@ where
     // returns a recoverable `Err` here instead of the engine silently dropping it. (It was a no-op
     // for ODE models before #899 — do not "simplify" this call away as dead code.)
     first_error(&check_dose_compartments(model, population))?;
+    // The adaptive walk has its own timeline, with no compartment on/off record (#2732).
+    if let Some(s) = population.subjects.iter().find(|s| s.has_cmt_toggles()) {
+        return Err(super::entry_refusals::adaptive_unsupported(
+            None,
+            format!(
+                "subject {} turns a compartment off (`EVID=2` with a negative `CMT`), which \
+                 adaptive dosing cannot honour.",
+                s.id
+            ),
+        ));
+    }
     first_error(&check_absorption_closed_form_support_diags(
         model, population,
     ))?;
@@ -688,6 +810,9 @@ where
     // here, before any subject runs, when the η are not named as the model's or a
     // subject has none under `UnmatchedSubjects::Refuse`.
     let supplied_etas = inputs.resolve(model, population)?;
+    // Each subject's controller factory; on the spec entry, every subject's dose plan,
+    // evaluated and checked here (#944).
+    let make_controller = prepare(&supplied_etas)?;
 
     // The occasion bookkeeping assumes a strictly-increasing decision schedule:
     // `occasion_of` (per-decision-window κ selection) scans ascending and stops at the
@@ -808,7 +933,9 @@ where
 
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
-        for (subject, supplied) in population.subjects.iter().zip(&supplied_etas) {
+        for (subject_idx, (subject, supplied)) in
+            population.subjects.iter().zip(&supplied_etas).enumerate()
+        {
             // Held for the whole subject: the driver (and its window AUC) and the verifiers all
             // read `MIXNUM`, and every use of `params` below is this class's.
             let class = classes.enter(subject, 1, sim);
@@ -981,7 +1108,7 @@ where
             let monitors = subject_monitors.as_slice();
 
             // A fresh controller per (subject, replicate) — see the factory note.
-            let mut controller = make_controller();
+            let mut controller = make_controller(subject_idx);
             // The exposure metric's window AUCs (#391 S2.5b), integrated by the driver on its
             // own walk (#943): requested only when an `auc_target` is declared (its sole
             // consumer) and a monitor exists to read.
@@ -1174,9 +1301,7 @@ where
             .zip(&supplied_etas)
             .filter(|(_, e)| e.is_none())
             .map(|(s, _)| s),
-        "A controller reading `ControllerCtx::covariates` doses these subjects on covariate \
-         values their PK does not follow. Supply the FREM fit's EBEs as `SuppliedEtas` \
-         (`AdaptiveInputs::with_etas`), which are conditioned on each subject's covariate rows.",
+        &frem_drawn_remedy(dose_covariates),
     ));
     warnings.extend(moved_reset_warnings);
     warnings.extend(super::non_fit_diagnostics(
@@ -1852,6 +1977,29 @@ pub fn simulate_adaptive_from_spec_with_inputs(
         ))
         .in_context("simulate_adaptive_from_spec"));
     }
+    // A dose expression's covariate likewise (#944): it would read 0.0 and dose from it.
+    // Reported for the first key that reads a missing one, listing that key's.
+    let dose_covs = compiled.dose_exprs.covariates();
+    if let Some(&(key, _)) = dose_covs
+        .iter()
+        .find(|(_, name)| !super::validation::population_carries(population, name))
+    {
+        let missing: Vec<&str> = dose_covs
+            .iter()
+            .filter(|(k, name)| {
+                *k == key && !super::validation::population_carries(population, name)
+            })
+            .map(|&(_, name)| name)
+            .collect();
+        let available = super::validation::available_covariate_columns(population);
+        return Err(super::entry_refusals::observe_covariate_missing(format!(
+            "[adaptive_dosing] `{key}` references covariate(s) not found in data \
+             (case-sensitive): {}. Available covariate columns: {}.",
+            missing.join(", "),
+            available
+        ))
+        .in_context("simulate_adaptive_from_spec"));
+    }
     let ode = model
         .ode_spec
         .as_ref()
@@ -1873,7 +2021,11 @@ pub fn simulate_adaptive_from_spec_with_inputs(
         n_sim,
         &spec.at,
         &monitors,
-        compiled.make_controller.as_ref(),
+        |_supplied: &[Option<Vec<f64>>]| {
+            let plans = resolve_dose_plans(model, population, params, spec, &compiled.dose_exprs)?;
+            let make = compiled.make_controller.as_ref();
+            Ok(move |i: usize| make(&plans[i]))
+        },
         // The declarative block's optional therapeutic band feeds the
         // `pct_time_in_window` metric (it never influences dosing).
         spec.target_window,
@@ -1887,5 +2039,27 @@ pub fn simulate_adaptive_from_spec_with_inputs(
                 | crate::sim::adaptive::AdaptiveRoute::Infuse { cmt, .. } => cmt,
             },
         },
+        // `W_FREM_DRAWN_ETA` names only the covariates the model's own expressions do
+        // not read (#2667 review r1 row 6b). For a column the PK reads directly the
+        // clause "which these subjects' PK does not follow" would be false.
+        // `referenced_covariates` is wider than the PK (error magnitudes, endpoint and
+        // mixture expressions, level columns), so a covariate read only there is left
+        // out too (review r2 N4): the warning stays silent rather than say something
+        // false.
+        &frem_only_dose_covariates(model, &dose_covs),
     )
+}
+
+/// The dose-expression covariates (key, name) that the model's own expressions do not
+/// read (`referenced_covariates`): on a FREM model those reach a drawn subject's PK only
+/// through its drawn covariate η.
+fn frem_only_dose_covariates<'a>(
+    model: &CompiledModel,
+    dose_covariates: &[(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str)> {
+    dose_covariates
+        .iter()
+        .filter(|(_, name)| !model.referenced_covariates.iter().any(|r| r == name))
+        .copied()
+        .collect()
 }

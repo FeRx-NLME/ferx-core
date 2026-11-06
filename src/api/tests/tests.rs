@@ -4,8 +4,10 @@ use nalgebra::{DMatrix, DVector};
 // ── default thread count cap (#707) ─────────────────────────────────────
 
 #[test]
-fn cap_default_threads_leaves_one_core_free() {
-    assert_eq!(cap_default_threads(2), 1);
+fn cap_default_threads_leaves_one_core_free_but_keeps_two_workers() {
+    // Except on two cores, where one free core would leave a single, serial worker.
+    assert_eq!(cap_default_threads(2), 2);
+    assert_eq!(cap_default_threads(3), 2);
     assert_eq!(cap_default_threads(4), 3);
     assert_eq!(cap_default_threads(8), 7);
 }
@@ -250,6 +252,7 @@ fn adaptive_base_subject() -> crate::types::Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -469,7 +472,6 @@ fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         extra_columns: vec![],
         per_obs_tad: vec![],
         compartment_states: vec![],
-        #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
         #[cfg(feature = "survival")]
         tte_rows: Vec::new(),

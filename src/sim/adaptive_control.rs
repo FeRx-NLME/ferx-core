@@ -21,8 +21,9 @@
 use crate::diagnostics::Diagnostic;
 use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
-    AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
-    ControllerDecision, DoseAction, DoseStep, IntervalStep, MonitorSpec, ObserveMode,
+    dose_plan_violation, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
+    Comparison, ControllerCtx, ControllerDecision, DoseAction, DosePlanViolation, DoseStep,
+    IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
 };
 use crate::types::CompiledModel;
 
@@ -81,10 +82,13 @@ struct AdaptiveController {
 }
 
 impl AdaptiveController {
-    #[allow(clippy::float_cmp)] // start_dose ∈ levels is guaranteed by the parser
-    fn new(spec: &AdaptiveDosingSpec) -> Self {
-        let level = match &spec.levels {
-            Some(l) => l.iter().position(|&x| x == spec.start_dose).unwrap_or(0),
+    /// The controller for one subject: the block's rules and route, run from that
+    /// subject's dose plan (#944). `plan` passed `dose_plan_violation`, so `start_dose`
+    /// is a rung of `levels` when there is a ladder.
+    #[allow(clippy::float_cmp)] // start_dose ∈ levels is checked before any subject runs
+    fn new(spec: &AdaptiveDosingSpec, plan: &SubjectDosePlan) -> Self {
+        let level = match &plan.levels {
+            Some(l) => l.iter().position(|&x| x == plan.start_dose).unwrap_or(0),
             None => 0,
         };
         let rung = match (&spec.intervals, spec.start_interval) {
@@ -93,12 +97,12 @@ impl AdaptiveController {
         };
         Self {
             route: spec.route.clone(),
-            dose_bounds: spec.dose_bounds,
+            dose_bounds: plan.dose_bounds,
             confirm: spec.confirm,
             rules: spec.rules.clone(),
-            levels: spec.levels.clone(),
+            levels: plan.levels.clone(),
             intervals: spec.intervals.clone(),
-            dose: spec.start_dose,
+            dose: plan.start_dose,
             level,
             rung,
             last_rule: None,
@@ -252,16 +256,160 @@ impl AdaptiveController {
 /// running state (dose / `confirm` streak / titration rung), so a controller's
 /// state never leaks across `(subject, replicate)` runs — the isolation
 /// [`crate::api::simulate_adaptive`] makes structural via a factory rather than a
-/// shared closure. The controller reads its signal under [`ADAPTIVE_SIGNAL`].
+/// shared closure. The controller reads its signal under [`ADAPTIVE_SIGNAL`]. Each
+/// call takes the subject's dose plan (#944), so no dose value is shared across
+/// subjects either.
 #[allow(clippy::type_complexity)] // a controller factory is inherently nested Fn/FnMut
 pub(crate) fn build_adaptive_controller(
     spec: &AdaptiveDosingSpec,
-) -> impl Fn() -> Box<dyn FnMut(&ControllerCtx) -> ControllerDecision> {
-    let template = AdaptiveController::new(spec);
-    move || {
-        let mut controller = template.clone();
+) -> impl Fn(&SubjectDosePlan) -> Box<dyn FnMut(&ControllerCtx) -> ControllerDecision> {
+    let spec = spec.clone();
+    move |plan: &SubjectDosePlan| {
+        let mut controller = AdaptiveController::new(&spec, plan);
         Box::new(move |ctx: &ControllerCtx| controller.decide(ctx))
     }
+}
+
+/// The `[adaptive_dosing]` dose expressions compiled against the model (#944), one per
+/// [`AdaptiveDosingSpec::dose_expressions`] entry, in that order.
+pub(crate) struct CompiledDoseExprs {
+    exprs: Vec<CompiledDoseExpr>,
+}
+
+struct CompiledDoseExpr {
+    key: &'static str,
+    eval: OdeOutputFn,
+    covariates: Vec<String>,
+}
+
+/// One subject's dose plan, or the first invariant it breaks.
+pub(crate) struct ResolvedDosePlan {
+    pub plan: SubjectDosePlan,
+    /// The covariates the expressions read, with the values read, in first-read order.
+    pub reads: Vec<(String, f64)>,
+    pub violation: Option<DosePlanViolation>,
+}
+
+impl CompiledDoseExprs {
+    /// The data covariates the expressions read, each once, with the first key that
+    /// reads it.
+    pub(crate) fn covariates(&self) -> Vec<(&'static str, &str)> {
+        let mut out: Vec<(&'static str, &str)> = Vec::new();
+        for e in &self.exprs {
+            for c in &e.covariates {
+                if !out.iter().any(|(_, n)| n == c) {
+                    out.push((e.key, c));
+                }
+            }
+        }
+        out
+    }
+
+    /// Evaluate every dose value of `spec` for one subject, from `theta` and the
+    /// covariates `covs` in force at the first decision (#944).
+    ///
+    /// An expression reads only θ and covariates — the parser refuses a state, `TIME`,
+    /// an individual parameter, a random effect and `MIXNUM`
+    /// (`check_adaptive_dose_expression`), and `compile_adaptive` refuses them again on
+    /// a spec built in code — so the state, PK and η slices it is handed are zeros that
+    /// it never reads.
+    pub(crate) fn resolve(
+        &self,
+        spec: &AdaptiveDosingSpec,
+        model: &CompiledModel,
+        theta: &[f64],
+        covs: &std::collections::HashMap<String, f64>,
+    ) -> ResolvedDosePlan {
+        let n_states = model.ode_spec.as_ref().map_or(0, |o| o.n_states);
+        let states = vec![0.0; n_states];
+        let pk = crate::types::PkParams::default();
+        let eta = vec![0.0; model.n_eta + model.n_kappa];
+        let mut values = self
+            .exprs
+            .iter()
+            .map(|e| (e.eval)(&states, &pk.values, theta, &eta, covs));
+        let mut value = |v: &crate::sim::adaptive::DoseValue| match v.as_literal() {
+            Some(x) => x,
+            None => values
+                .next()
+                .expect("one compiled expression per dose expression, in order"),
+        };
+        // `dose_expressions` order: start_dose, the two bounds, then the levels.
+        let start_dose = value(&spec.start_dose);
+        let dose_bounds = (value(&spec.dose_bounds.0), value(&spec.dose_bounds.1));
+        let levels = spec
+            .levels
+            .as_ref()
+            .map(|l| l.iter().map(&mut value).collect::<Vec<f64>>());
+        let plan = SubjectDosePlan {
+            start_dose,
+            dose_bounds,
+            levels,
+        };
+        let reads = self
+            .covariates()
+            .into_iter()
+            .map(|(_, c)| {
+                (
+                    c.to_string(),
+                    crate::parser::model_parser::output_covariate_read(covs, c),
+                )
+            })
+            .collect();
+        ResolvedDosePlan {
+            violation: dose_plan_violation(&plan),
+            plan,
+            reads,
+        }
+    }
+}
+
+/// Compile every dose expression of `spec` (#944) through the same
+/// `build_y_output_fn` an `observe` expression goes through, after refusing the reads
+/// a dose expression may not make (the parser's check, again, for a spec built in
+/// code).
+pub(crate) fn compile_dose_exprs(
+    model: &CompiledModel,
+    spec: &AdaptiveDosingSpec,
+) -> Result<CompiledDoseExprs, String> {
+    let state_names: &[String] = model
+        .ode_spec
+        .as_ref()
+        .map_or(&[], |o| o.state_names.as_slice());
+    let mut exprs = Vec::new();
+    for (key, src) in spec.dose_expressions() {
+        crate::parser::model_parser::check_adaptive_dose_expression(
+            src,
+            key,
+            model,
+            &spec.observe_declared_covariates,
+            spec.at[0],
+        )?;
+        let context = format!("[adaptive_dosing] {key}");
+        let mut warnings: Vec<String> = Vec::new();
+        let (eval, _program, covariates) = crate::parser::model_parser::build_y_output_fn(
+            src,
+            &context,
+            &model.theta_names,
+            &model.eta_names,
+            &model.indiv_param_names,
+            &model.pk_indices,
+            state_names,
+            &model.kappa_names,
+            &[],
+            &[],
+            &spec.observe_declared_covariates,
+            &[],
+            &mut warnings,
+            &mut Vec::new(),
+        )?;
+        exprs.push(CompiledDoseExpr {
+            key,
+            eval,
+            covariates,
+        });
+    }
+    Ok(CompiledDoseExprs { exprs })
 }
 
 /// Compile a latent (`Ipred`) `observe` expression into the engine's
@@ -343,9 +491,13 @@ pub(crate) struct CompiledAdaptive {
     /// file-driven entry validates these against the data's covariate columns so a
     /// misspelt covariate fails loudly instead of silently reading 0.0.
     pub observe_covariates: Vec<String>,
-    /// Mints a fresh controller per `(subject, replicate)` (state isolation).
+    /// The dose expressions (#944), evaluated per subject before any subject runs.
+    pub dose_exprs: CompiledDoseExprs,
+    /// Mints a fresh controller per `(subject, replicate)` (state isolation), from that
+    /// subject's dose plan (#944).
     #[allow(clippy::type_complexity)]
-    pub make_controller: Box<dyn Fn() -> Box<dyn FnMut(&ControllerCtx) -> ControllerDecision>>,
+    pub make_controller:
+        Box<dyn Fn(&SubjectDosePlan) -> Box<dyn FnMut(&ControllerCtx) -> ControllerDecision>>,
 }
 
 /// Compile a declarative spec against its model into the engine-ready
@@ -394,11 +546,13 @@ pub(crate) fn compile_adaptive(
         (ObserveMode::Ipred, Some(out_fn), cov, 1)
     };
     let monitors = vec![MonitorSpec::new(ADAPTIVE_SIGNAL, cmt, mode)];
+    let dose_exprs = compile_dose_exprs(model, spec).map_err(crate::api::adaptive_spec)?;
     let factory = build_adaptive_controller(spec);
     Ok(CompiledAdaptive {
         monitors,
         observe,
         observe_covariates,
+        dose_exprs,
         make_controller: Box::new(factory),
     })
 }
@@ -423,11 +577,11 @@ mod tests {
             with_assay_error: false,
             assay_cmt: None,
             at: vec![24.0, 48.0],
-            start_dose,
+            start_dose: start_dose.into(),
             route,
-            dose_bounds,
+            dose_bounds: (dose_bounds.0.into(), dose_bounds.1.into()),
             confirm,
-            levels,
+            levels: levels.map(|l| l.into_iter().map(Into::into).collect()),
             target_window: None,
             auc_target: None,
             rules,
@@ -449,7 +603,7 @@ mod tests {
     /// action list each decision produced.
     fn run(spec: &AdaptiveDosingSpec, signals: &[f64]) -> Vec<Vec<DoseAction>> {
         let factory = build_adaptive_controller(spec);
-        let mut controller = factory();
+        let mut controller = factory(&spec.literal_dose_plan().expect("a block of numbers"));
         let empty_cov: HashMap<String, f64> = HashMap::new();
         signals
             .iter()
@@ -721,11 +875,12 @@ mod tests {
         };
         // Drive controller A twice (100 → 150 → 225); a fresh controller B must
         // start from 100 again, proving no shared state.
-        let mut a = factory();
+        let plan = s.literal_dose_plan().expect("a block of numbers");
+        let mut a = factory(&plan);
         let _ = a(&ctx);
         let a2 = a(&ctx).actions;
         assert_eq!(a2, bolus(225.0, 1));
-        let mut b = factory();
+        let mut b = factory(&plan);
         let b1 = b(&ctx).actions;
         assert_eq!(b1, bolus(150.0, 1));
     }
@@ -781,9 +936,9 @@ mod tests {
             with_assay_error,
             assay_cmt,
             at: vec![24.0, 48.0],
-            start_dose: 100.0,
+            start_dose: (100.0).into(),
             route: AdaptiveRoute::Bolus { cmt: 1 },
-            dose_bounds: (0.0, 400.0),
+            dose_bounds: ((0.0).into(), (400.0).into()),
             confirm: 1,
             levels: None,
             target_window: None,

@@ -144,11 +144,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "reports the block_sigma rows",
     ),
     (
-        "src/io/fitrx.rs",
-        "let residual_correlation_fixed_resolved = if w.sigma.residual_correlations.is_empty() {",
-        "round-trips the block_sigma FIX flags",
-    ),
-    (
         "src/estimation/uncertainty_samples.rs",
         "residual_correlations: if fit_result.residual_correlations.is_empty() {",
         "carries the block_sigma ρ into an uncertainty draw",

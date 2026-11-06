@@ -199,7 +199,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
-/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.38098512621974 since #2549; 402.38186322963156 from #2462; 402.38245815217266 from #2443; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
+/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3883345788064 since #2706; 402.38098512621974 from #2549; 402.38186322963156 from #2462; 402.38245815217266 from #2443; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
 /// carries no SIR warning at all.
 #[test]
 #[cfg_attr(
@@ -269,7 +269,15 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // aarch64): the L-BFGS stop now takes a verification leg at a tight inner tolerance,
     // which ends at the same optimum (OFV 205.090329604 with and without it, worst estimate
     // 2.1e-8 relative) in 70 evaluations instead of 49, so the proposal's covariance moves.
-    assert_ess(f.sir_ess, 402.380_985_126_219_74, "FOCE packed");
+    // #2706 moved it by +1.8e-5 relative (402.38098512621974 → 402.3883345788064; the x86_64
+    // CI slow-tests runs 42060576223 and 42078936113 agree to every printed digit, and `main`
+    // b9867c13 reproduces the old pin): this FOCE fit's θ are all mu-referenced, so its outer
+    // gradient reads them off the η-jets instead of the taped solve — the same derivatives to
+    // round-off (≤ 2.8e-14 relative) summed in another order. The last bits move the L-BFGS
+    // path to the same optimum (OFV 205.0903 on both, 55 → 64 iterations measured base
+    // 0dabda75 against head), and the fixed-seed SIR proposal is built from the covariance
+    // there. The FOCEI literals above stayed inside `ESS_REL_TOL`.
+    assert_ess(f.sir_ess, 402.388_334_578_806_4, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 

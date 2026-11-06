@@ -1101,7 +1101,7 @@ pub fn closed_form_sigma_support(
     // two σ". The count check below still catches a declared-but-unused σ.
     match model.error_spec {
         ErrorSpec::Single(ErrorModel::Additive) | ErrorSpec::Single(ErrorModel::Proportional) => {}
-        ErrorSpec::Single(ErrorModel::Combined) => {
+        ErrorSpec::Single(ErrorModel::Combined | ErrorModel::LogCombined) => {
             return Err(
                 "the combined error model couples two σ in one variance, which has no \
                  scalar stationary point"

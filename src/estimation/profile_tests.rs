@@ -4365,6 +4365,11 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
             .as_ref()
             .unwrap_or_else(|| panic!("no covariance: {:?}", f.warnings));
         assert_eq!(f.profiled_levels_at_bound, held);
+        // `cov_fixed` says so (#2695), though the level is not FIX in `theta_fixed`.
+        for &k in held {
+            assert!(f.cov_fixed[k] && !f.theta_fixed[k], "θ index {k}");
+        }
+        assert_eq!(f.cov_fixed.len(), c.nrows());
         for k in 0..f.theta.len() {
             if held.contains(&k) {
                 assert!(
@@ -4532,6 +4537,7 @@ fn run_covariance_reports_the_levels_its_step_held() {
             out.warnings
         );
         assert_eq!(out.profiled_levels_at_bound, [k], "{cell}");
+        assert!(out.cov_fixed[k], "{cell}: the replayed step held it");
         let n = |w: &str| out.warnings.iter().filter(|x| x.as_str() == w).count();
         assert_eq!(
             (n(&at(true)), n(&at(false))),
@@ -7009,43 +7015,93 @@ fn escape_floor_holds_a_profiled_fit_against_its_start() {
     assert_eq!(moved.ofv, plain.ofv);
 }
 
-/// #2519, the natural case (the #2461 failure on a profiled fit, no shift): at
-/// `inner_maxiter = 2` the EBE guard rejects F2's start (2 of 2 subjects unconverged at the
-/// default `max_unconverged_frac = 0.1`), so the optimizer never ranks it and walks to
-/// 66.022863, 39.5570 above the start's 26.465827 — which `optimize_profiled` alone reports
-/// converged. Control in the same test: at `inner_maxiter = 3` the start is accepted and the
-/// fit converges at 22.139638 with no warning.
+/// #2519, the natural case (the #2461 failure on a profiled fit, no shift), and #2682's
+/// warm re-solve of a rejected start on the profiled loop.
+///
+/// At `inner_maxiter = 2` the cold first profile solve leaves 2 of 2 subjects unconverged,
+/// over the default `max_unconverged_frac = 0.1`. Until #2682 the guard rejected it, the
+/// incumbent's warm start stayed the template's cold one, and the fit walked to 66.022863,
+/// 39.5570 above the start's 26.465827. Now the start is re-solved from
+/// `ProfileWarm::from_solve` of that cold solve, is accepted, and the fit converges at the
+/// optimum 22.139638 with no warning — the same verdict as the unprofiled loop. Mutation:
+/// drop the profiled re-solve → `warm_rescored_from` is `None` and the fit is demoted.
+///
+/// The #2519 walk itself still happens at `inner_maxiter = 1`, where the start solve fails
+/// outright, so there is nothing to re-solve from; `escape_floor` re-scores that start at the
+/// default budget (#2619) and holds the 66.022863 report against it. Control: at
+/// `inner_maxiter = 3` the cold start is accepted with no re-solve.
 #[test]
 fn a_profiled_fit_pushed_off_a_rejected_start_is_not_converged() {
     let p = prep(F2, F2_DATA, Some(2), |t| t);
-    let fit_at = |inner_maxiter: usize| {
+    let opts_at = |inner_maxiter: usize| {
         let o = FitOptions {
             run_covariance_step: false,
             inner_maxiter,
             ..options(&p)
         };
-        assert_eq!(o.max_unconverged_frac, 0.1, "the default the message names");
-        crate::fit(&p.parsed.model, &p.population, &p.init_params, &o).unwrap()
+        assert_eq!(
+            o.max_unconverged_frac, 0.1,
+            "the default the fixture straddles"
+        );
+        o
     };
-    let starved = fit_at(2);
+    let fit_at = |im: usize| {
+        crate::fit(&p.parsed.model, &p.population, &p.init_params, &opts_at(im)).unwrap()
+    };
+
+    let rescued = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &opts_at(2));
+    let start = rescued.start_eval.expect("recorded");
+    assert_eq!(
+        start.warm_rescored_from,
+        Some(2),
+        "#2682: the cold start must be rejected (2 of 2) and re-solved warm: {start:?}"
+    );
+    assert!(
+        !start.guard_rejected && start.n_unconverged == 0,
+        "{start:?}"
+    );
+    assert!(
+        (start.ofv - 26.465827).abs() < 1e-5,
+        "the warm re-solve scores the start the default budget does: {start:?}"
+    );
+    let fitted = fit_at(2);
+    assert!(fitted.converged, "{:?}", fitted.warnings);
+    assert!(
+        !warns_above_start(&fitted.warnings),
+        "{:?}",
+        fitted.warnings
+    );
+    assert!((fitted.ofv - 22.139638).abs() < 1e-5, "{}", fitted.ofv);
+
+    let starved = fit_at(1);
     assert!(!starved.converged, "{:?}", starved.warnings);
     let w = starved
         .warnings
         .iter()
         .find(|w| w.starts_with("W_ABOVE_START"))
         .unwrap_or_else(|| panic!("{:?}", starved.warnings));
+    assert!(w.contains("66.022863, 39.5570 above"), "{w}");
     assert!(w.contains("26.465827 its starting estimates scored"), "{w}");
-    assert!(w.contains("2 of 2 subjects"), "{w}");
-    assert!(w.contains("`max_unconverged_frac` = 0.1"), "{w}");
+    assert!(
+        w.contains("failed outright at `inner_maxiter` = 1"),
+        "the start was re-scored by #2619, not re-solved warm: {w}"
+    );
+    // The floor escape demoted the run before `escape_floor`'s start check, so that check
+    // adds no second generic non-convergence line; the floor warning is the run's own.
     assert!(
         starved
             .warnings
             .iter()
-            .any(|w| w == "Outer optimization did not converge"),
+            .any(|w| w.contains("log-packing floor")),
         "{:?}",
         starved.warnings
     );
     let control = fit_at(3);
+    let control_start =
+        optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &opts_at(3))
+            .start_eval
+            .expect("recorded");
+    assert_eq!(control_start.warm_rescored_from, None, "{control_start:?}");
     assert!(control.converged, "{:?}", control.warnings);
     assert!(
         !warns_above_start(&control.warnings),
@@ -7248,13 +7304,38 @@ fn a_restart_left_just_above_the_floor_is_not_reported_converged() {
     );
 }
 
-/// T5. All twelve studies at `inner_maxiter = 2`: the restart stops at 170.266229 (the
-/// optimum is 101.911514) with EMAX just above the floor, and is not reported converged.
-/// The profiled twin was already demoted by `W_ABOVE_START` (#2626) at 310.367564, with no
-/// floor restart adopted, and does not move.
+/// T5. All twelve studies at `inner_maxiter = 1`, both twins: the unprofiled restart stops
+/// at 170.266229 (the optimum is 101.911514) with EMAX just above the floor, and is not
+/// reported converged. The profiled twin is demoted by `W_ABOVE_START` (#2626) at
+/// 310.367564, with no floor restart adopted, and does not move.
+///
+/// Both ran at `inner_maxiter = 2` until #2682, and stopped at the same two objectives:
+/// `max_unconverged_frac = 0` rejected each loop's cold start, and every trial after it
+/// re-solved from the same cold start. Re-solved warm, both starts are accepted and both
+/// twins reach the optimum, converged and without a floor warning (unprofiled 101.911143,
+/// profiled 101.911514, Linux x86_64) — one verdict for the pair, asserted below.
 #[test]
 fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
-    let unprofiled = f2_fit(None, f2_unprofiled, 2);
+    for (twin, edit) in [
+        ("unprofiled", f2_unprofiled as fn(String) -> String),
+        ("profiled", |t| t),
+    ] {
+        let rescued = f2_fit(None, edit, 2);
+        assert!(
+            (rescued.ofv - 101.9113).abs() < 1e-3 && rescued.converged,
+            "#2682 ({twin}): the warm re-solve of the rejected start must let this fit reach \
+             the optimum: {} {:?}",
+            rescued.ofv,
+            rescued.warnings
+        );
+        assert!(
+            floor_warning(&rescued).is_none(),
+            "{twin}: {:?}",
+            rescued.warnings
+        );
+    }
+
+    let unprofiled = f2_fit(None, f2_unprofiled, 1);
     assert!(
         (unprofiled.ofv - 170.266229).abs() < 1e-5,
         "{} {:?}",
@@ -7265,7 +7346,7 @@ fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
     let w = floor_warning(&unprofiled).expect("a floor-escape warning");
     assert!(w.contains("EMAX below 1/1000 of its start"), "{w}");
 
-    let profiled = f2_fit(None, |t| t, 2);
+    let profiled = f2_fit(None, |t| t, 1);
     assert!(
         (profiled.ofv - 310.367564).abs() < 1e-5,
         "{} {:?}",
