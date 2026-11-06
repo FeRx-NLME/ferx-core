@@ -195,17 +195,37 @@ pub fn normal_cdf_g<T: PkNum>(z: T) -> T {
 /// `exp(2λ/μ* + ln Φ(z₂))` (this function) sidesteps the catastrophic cancellation
 /// of a direct `Φ(z₂)` (which underflows to `0`, making the product a spurious `0`
 /// instead of the true `O(1)` value). Because `Φ(z) = ½·erfc(−z/√2)` here evaluates
-/// the lower tail as the direct `Q(½, z²/2)`, `ln Φ` needs **no** Mills asymptotic —
-/// it stays accurate (and its `φ/Φ` jet exact) until `Φ` itself underflows below
-/// `MIN_PROB`, where it clamps flat to avoid `−∞` contaminating the likelihood.
+/// the lower tail as the direct `Q(½, z²/2)`, `ln Φ` is accurate there down to
+/// `z = −10` (`LOG_NORMAL_CDF_MILLS_SWITCH`). Below it the value is the Mills form
+/// `ln Φ(z) = −z²/2 − ½ln 2π − ln(t + a(t))`, `t = −z`, `a` = `mills_excess`, the
+/// Laplace continued fraction for the Mills ratio
+/// (#2769): no `Φ` is ever formed, so there is no floor — the value goes to `−∞` only
+/// when `z²` overflows — and the jet carries no `grad²/val²` term to underflow.
+///
+/// Both matter to the IG closed form, which adds `ln Φ(z₂)` to `2λ/μ* ≈ 2/CV²` with
+/// `z₂ ≈ −2/CV` near `t = MAT`: the old `MIN_PROB.ln()` clamp (from `z ≈ −37.5`) left
+/// `exp(2/CV² − 690.8)` standing for `CV ≲ 0.053` (a concentration of `~1e48` at
+/// `CV = 0.05`, `inf` at `0.03`), and the `Dual2` Hessian of `ln Q(½, z²/2)` was
+/// `0/0 = NaN` from `z ≈ −26.5` — i.e. IG Hessians from `CV ≈ 0.075`, where the values
+/// were still right.
 pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
-    let p = normal_cdf_g(z);
-    if p.val() < MIN_PROB {
-        T::from_f64(MIN_PROB.ln())
+    if z.val() < LOG_NORMAL_CDF_MILLS_SWITCH {
+        let t = -z;
+        T::from_f64(-0.5) * t * t - T::from_f64(HALF_LN_2PI) - (t + mills_excess(t)).ln()
     } else {
-        p.ln()
+        normal_cdf_g(z).ln()
     }
 }
+
+/// Below this `z`, [`log_normal_cdf_g`] takes the Mills form instead of `ln Φ(z)` (#2769).
+/// Measured against a 60-digit `mpmath` `ln Φ` and its derivatives on `z ∈ [−42, −2]`
+/// in steps of ½: the Mills form is exact to the last bit in value, gradient and Hessian
+/// from `z = −10.5` down, while the `ln Φ` branch carries up to 2.8e-14 relative in its
+/// Hessian on `[−10, −2]`; at the switch the two meet to 2.7e-16 / 1.8e-16 / 1.4e-14.
+/// The switch is free in `(−26.5, −2)`: above `z ≈ −26.5` because there the `Dual2`
+/// Hessian of `ln Q(½, z²/2)` turns `NaN`, below `z = −2` because there
+/// [`mills_excess`]'s continued fraction stops being converged at [`MILLS_CF_DEPTH`].
+const LOG_NORMAL_CDF_MILLS_SWITCH: f64 = -10.0;
 
 /// Depth of [`mills_excess`]'s continued fraction. Measured against an 80-digit reference
 /// (#2603): at `t = 2` depth 80 leaves 5e-14 relative and depth 160 nothing; larger `t`
@@ -1443,6 +1463,183 @@ mod tests {
                 max_relative = 1e-4,
                 epsilon = 1e-6
             );
+        }
+    }
+
+    /// `ln Φ(z)` and its 1st/2nd derivatives at 60 digits (`mpmath` `log(ncdf(z))` and
+    /// `diff`; the script is in the PR that fixed #2769), straddling the Mills switch at `z = −10`
+    /// and running past where the old `MIN_PROB` floor (`z ≈ −37.5`) and the old `NaN`
+    /// Hessian (`z ≈ −26.5`) began (#2769).
+    const LN_PHI_REF: [(f64, f64, f64, f64); 10] = [
+        (
+            -9.5,
+            -48.30601929896523,
+            9.6030500903842821,
+            -0.98959517977888859,
+        ),
+        (
+            -10.0,
+            -53.231285150512471,
+            10.098093233962512,
+            -0.99055462217434374,
+        ),
+        (
+            -10.5,
+            -58.404187061073243,
+            10.593583926132378,
+            -0.9913891756203221,
+        ),
+        (
+            -26.0,
+            -342.17850892992783,
+            26.038348579495471,
+            -0.99853368043156099,
+        ),
+        (
+            -27.0,
+            -368.71614246865635,
+            27.036936116444191,
+            -0.9986394206911267,
+        ),
+        (
+            -28.0,
+            -396.25241451163104,
+            28.035623753469084,
+            -0.99873414894556458,
+        ),
+        (
+            -37.5,
+            -707.66898931750719,
+            37.526628874883654,
+            -0.99929190511457925,
+        ),
+        (
+            -40.0,
+            -804.60844201375379,
+            40.024968847207264,
+            -0.99937733162140861,
+        ),
+        (
+            -100.0,
+            -5005.5242086942051,
+            100.00999800099926,
+            -0.99990005995005174,
+        ),
+        (
+            -1000.0,
+            -500007.82669481218,
+            1000.000999998,
+            -0.99999900000599995,
+        ),
+    ];
+
+    /// `log_normal_cdf_g`'s value, exact `Dual2` gradient and Hessian against the
+    /// 60-digit reference on both sides of the Mills switch (#2769). Each failure names
+    /// the point and the quantity: `−37.5 … −1000` value is what the old `ln 1e-300`
+    /// floor gets wrong (by up to 5e5), `−27`/`−28` Hessian is what the old `ln Q` jet
+    /// turned to `NaN`, and `−9.5`/`−10` pin the `ln Φ` branch.
+    #[test]
+    fn log_normal_cdf_g_matches_mpmath_on_both_sides_of_the_mills_switch() {
+        use crate::sens::dual2::Dual2;
+        for &(z, v, g, h) in &LN_PHI_REF {
+            let d = log_normal_cdf_g(Dual2::<1>::var(z, 0));
+            let (dv, dg, dh) = (d.value, d.grad[0], d.hess[0][0]);
+            assert!(
+                dv.is_finite() && dg.is_finite() && dh.is_finite(),
+                "ln Φ jet not finite at z = {z}: ({dv}, {dg}, {dh})"
+            );
+            assert_eq!(
+                log_normal_cdf_g::<f64>(z),
+                dv,
+                "f64 vs Dual2 value at z = {z}"
+            );
+            // Measured worst over the ten points (macOS arm64): value 2.7e-16, gradient
+            // 1.9e-16, Hessian 2.8e-14 — the last on the `ln Φ` branch at z = −9.5; the
+            // Mills branch is exact to the printed digit in all three from −10.5 on. The
+            // bounds leave ~15× / ~20× / ~10× headroom.
+            assert_relative_eq!(dv, v, max_relative = 4e-15);
+            assert_relative_eq!(dg, g, max_relative = 4e-15);
+            assert_relative_eq!(dh, h, max_relative = 3e-13);
+        }
+    }
+
+    /// The two branches of `log_normal_cdf_g` must meet at the switch (#2769): the Mills
+    /// form, written out here, against the `ln Φ` branch the function itself takes **at**
+    /// `z = LOG_NORMAL_CDF_MILLS_SWITCH` (the test is `z < switch`). A seam in the value
+    /// is a jump in the IG CDF; a seam in the slope or curvature a jump in the gradient
+    /// and Hessian the optimizer and the covariance step see.
+    #[test]
+    fn log_normal_cdf_g_branches_meet_at_the_mills_switch() {
+        use crate::sens::dual2::Dual2;
+        let z0 = LOG_NORMAL_CDF_MILLS_SWITCH;
+        let z = Dual2::<1>::var(z0, 0);
+        let t = -z;
+        let mills = Dual2::<1>::from_f64(-0.5) * t * t
+            - Dual2::<1>::from_f64(HALF_LN_2PI)
+            - (t + mills_excess(t)).ln();
+        let at = log_normal_cdf_g(z);
+        // The ln Φ branch really is the one taken at the switch (else this compares the
+        // Mills form with itself).
+        assert_eq!(at.value, normal_cdf_g::<f64>(z0).ln());
+        // Measured at z = −10 (macOS arm64): value 2.7e-16, gradient 1.8e-16, Hessian
+        // 1.4e-14 relative — the `ln Φ` branch's own error against mpmath at the same
+        // point, so the seam is no larger than the branch's accuracy.
+        assert_relative_eq!(at.value, mills.value, max_relative = 4e-15);
+        assert_relative_eq!(at.grad[0], mills.grad[0], max_relative = 4e-15);
+        assert_relative_eq!(at.hess[0][0], mills.hess[0][0], max_relative = 2e-13);
+    }
+
+    /// Without the floor, `log_normal_cdf_g` reaches `−∞` only where `ln Φ` itself is out
+    /// of range (#2769): `z = −1e150` is still a finite `−5e299`, and from `z ≈ −1.9e154`
+    /// on `z²/2` overflows, so the value is `−∞` — the f64 [`log_normal_cdf`]'s limit
+    /// too. The jet stays the exact one there (`(ln Φ)' = t + O(1/t)`, `(ln Φ)'' → −1`),
+    /// never `NaN`. (A caller's `exp(A + ln Φ)` there has Hessian `0·(slope²) = 0·∞`. The
+    /// IG callers' `|z₂| = √(λ/t)·(t·r/μ + 1)` passes `1.3e154` only once `λ/t` or
+    /// `λ·t/μ²` is near `f64::MAX`.)
+    #[test]
+    fn log_normal_cdf_g_is_minus_infinity_only_past_the_square_overflow() {
+        use crate::sens::dual2::Dual2;
+        let v = log_normal_cdf_g::<f64>(-1e150);
+        assert!(v.is_finite() && v < -4.9e299, "ln Φ(−1e150) = {v}");
+        for z in [-1e155_f64, -1e300] {
+            let d = log_normal_cdf_g(Dual2::<1>::var(z, 0));
+            assert_eq!(d.value, f64::NEG_INFINITY, "ln Φ({z:e})");
+            assert_relative_eq!(d.grad[0], -z, max_relative = 1e-15);
+            assert_relative_eq!(d.hess[0][0], -1.0, max_relative = 1e-15);
+        }
+        assert_eq!(
+            log_normal_cdf_g::<f64>(f64::NEG_INFINITY),
+            f64::NEG_INFINITY
+        );
+    }
+
+    /// Dual-vs-FD parity for `log_normal_cdf_g` across the Mills switch and through the
+    /// old `NaN`-Hessian and floor zones (#2769): the exact `Dual2` gradient against a
+    /// central difference of the `f64` value, and the Hessian against a central
+    /// difference of the exact gradient.
+    #[test]
+    fn log_normal_cdf_g_dual_matches_fd_across_the_mills_switch() {
+        use crate::sens::dual2::Dual2;
+        for &z in &[-9.9_f64, -10.1, -20.0, -26.0, -27.0, -40.0, -100.0] {
+            let d = log_normal_cdf_g(Dual2::<1>::var(z, 0));
+            let h = 1e-6 * z.abs();
+            let fd = (log_normal_cdf_g::<f64>(z + h) - log_normal_cdf_g::<f64>(z - h)) / (2.0 * h);
+            let h2 = 1e-4;
+            let gp = log_normal_cdf_g(Dual2::<1>::var(z + h2, 0)).grad[0];
+            let gm = log_normal_cdf_g(Dual2::<1>::var(z - h2, 0)).grad[0];
+            let fd2 = (gp - gm) / (2.0 * h2);
+            for (name, x) in [
+                ("grad", d.grad[0]),
+                ("hess", d.hess[0][0]),
+                ("fd", fd),
+                ("fd2", fd2),
+            ] {
+                assert!(x.is_finite(), "{name} not finite at z = {z}: {x}");
+            }
+            // Measured worst (macOS arm64): gradient 8.4e-11 (z = −26), Hessian 5.9e-11
+            // (z = −40) — FD truncation and rounding; 1e-9 leaves ~12× headroom.
+            assert_relative_eq!(d.grad[0], fd, max_relative = 1e-9);
+            assert_relative_eq!(d.hess[0][0], fd2, max_relative = 1e-9);
         }
     }
 

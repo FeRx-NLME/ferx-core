@@ -37,11 +37,27 @@ const ACCUM_RTOL: f64 = 3e-3;
 /// Build the (analytic, ODE) `.ferx` pair for a **1-cpt** IG model. In-domain
 /// params: `ke = 5/50 = 0.1 < 1/(2·2·0.3) = 0.833`.
 fn build_pair_1cpt(lag: bool, fbio: bool) -> (String, String) {
-    let mut thetas = String::from(
+    build_pair_1cpt_cv2(lag, fbio, 0.3)
+}
+
+/// The `TVCV2` lower bound: the suite's historical `0.001` (so the `CV² = 0.3` fits
+/// keep their exact optimizer setup), widened only for a `CV²` below it (#2769).
+fn cv2_lower_bound(cv2: f64) -> f64 {
+    if cv2 > 0.001 {
+        0.001
+    } else {
+        cv2 / 10.0
+    }
+}
+
+/// [`build_pair_1cpt`] at a chosen `CV²` (#2769 drives it down to `CV = 0.01`).
+fn build_pair_1cpt_cv2(lag: bool, fbio: bool, cv2: f64) -> (String, String) {
+    let mut thetas = format!(
         "  theta TVCL(5.0, 0.1, 100.0)\n  \
          theta TVV(50.0, 5.0, 500.0)\n  \
          theta TVMAT(2.0, 0.05, 24.0)\n  \
-         theta TVCV2(0.3, 0.001, 10.0)\n",
+         theta TVCV2({cv2:e}, {lo:e}, 10.0)\n",
+        lo = cv2_lower_bound(cv2),
     );
     let mut indiv =
         String::from("  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  MAT = TVMAT\n  CV2 = TVCV2\n");
@@ -77,13 +93,19 @@ fn build_pair_1cpt(lag: bool, fbio: bool) -> (String, String) {
 /// Build the (analytic, ODE) `.ferx` pair for a **2-cpt** IG model. In-domain:
 /// `α ≈ 0.30 < 1/(2·1.5·0.3) = 1.111`.
 fn build_pair_2cpt(lag: bool, fbio: bool) -> (String, String) {
-    let mut thetas = String::from(
+    build_pair_2cpt_cv2(lag, fbio, 0.3)
+}
+
+/// [`build_pair_2cpt`] at a chosen `CV²` (#2769).
+fn build_pair_2cpt_cv2(lag: bool, fbio: bool, cv2: f64) -> (String, String) {
+    let mut thetas = format!(
         "  theta TVCL(5.0, 0.1, 100.0)\n  \
          theta TVV1(50.0, 5.0, 500.0)\n  \
          theta TVQ(10.0, 0.1, 200.0)\n  \
          theta TVV2(100.0, 5.0, 1000.0)\n  \
          theta TVMAT(1.5, 0.05, 24.0)\n  \
-         theta TVCV2(0.3, 0.001, 10.0)\n",
+         theta TVCV2({cv2:e}, {lo:e}, 10.0)\n",
+        lo = cv2_lower_bound(cv2),
     );
     let mut indiv = String::from(
         "  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1\n  Q = TVQ\n  V2 = TVV2\n  MAT = TVMAT\n  CV2 = TVCV2\n",
@@ -338,6 +360,76 @@ fn ig_2cpt_multidose_lag_fbio_match_ode() {
         &population(doses, obs),
         ACCUM_RTOL,
     );
+}
+
+// ── Low CV (#2769) ───────────────────────────────────────────────────────────
+
+/// A narrow absorption-time distribution (`CV ≤ 0.06`) must still match the `igd()`
+/// ODE twin, 1-cpt and 2-cpt, over three doses, each one landing on residual drug.
+///
+/// Before #2769 the closed form's second CDF term was `exp(2/CV² + ln Φ(z₂))` with
+/// `ln Φ` floored at `ln 1e-300` from `z₂ ≈ −37.5`. Near `t = MAT`, `z₂ ≈ −2/CV`, so
+/// from `CV ≈ 0.053` the floor won: PRED was `~1e48` at `CV = 0.05` and `inf` at `0.03`
+/// and `0.01`, against an ODE PRED of a few mg/L. Observations bracket each dose's
+/// `t = MAT`, where `z₂` is most negative relative to the size of the term.
+///
+/// The twin is an oracle here only at its own accuracy (RK45 at the default
+/// `reltol = 1e-4`), far coarser than the closed form's ~1e-13 (pinned against mpmath
+/// in `src/pk/analytical_absorption.rs`). The bound is set from the realised error,
+/// which the failure message prints, so it measures "the twin agrees", not the closed
+/// form's last digits — the defect it catches is many orders of magnitude larger.
+#[test]
+fn ig_low_cv_matches_ode_twin() {
+    let doses = || vec![bolus(0.0, 100.0), bolus(12.0, 100.0), bolus(24.0, 100.0)];
+    // Observations at each dose's MAT ± 2.5 % plus the troughs between doses.
+    let obs = |mat: f64| {
+        let mut v = vec![];
+        for d in [0.0, 12.0, 24.0] {
+            for f in [0.95, 0.975, 1.0, 1.025, 1.05, 1.5] {
+                v.push(d + f * mat);
+            }
+            v.push(d + 11.5);
+        }
+        v
+    };
+    for &cv in &[0.06_f64, 0.05, 0.03, 0.01] {
+        let cv2 = cv * cv;
+        for (label, (a, o), mat) in [
+            ("1cpt", build_pair_1cpt_cv2(false, false, cv2), 2.0),
+            ("2cpt", build_pair_2cpt_cv2(false, false, cv2), 1.5),
+        ] {
+            let pop = population(doses(), obs(mat));
+            let an = parse_full_model(&a).unwrap().model;
+            let od = parse_full_model(&o).unwrap().model;
+            assert!(
+                an.ode_spec.is_none(),
+                "[{label} cv={cv}] must be the closed form"
+            );
+            let pa = predict(&an, &pop, &an.default_params).unwrap();
+            let po = predict(&od, &pop, &od.default_params).unwrap();
+            assert_eq!(pa.len(), po.len());
+            let mut worst = 0.0_f64;
+            for (x, y) in pa.iter().zip(po.iter()) {
+                assert!(
+                    x.pred.is_finite() && y.pred.is_finite(),
+                    "[{label} cv={cv}] t={}: analytic {} / ODE {} not finite",
+                    x.time,
+                    x.pred,
+                    y.pred
+                );
+                let rel = (x.pred - y.pred).abs() / y.pred.abs().max(1e-3);
+                assert!(rel.is_finite(), "[{label} cv={cv}] t={}: rel {rel}", x.time);
+                worst = worst.max(rel);
+            }
+            // Measured (macOS arm64, 3cd15863 + fix): worst 7.3e-4 (1cpt, CV 0.03), the
+            // other seven cells 2.3e-5 … 1.3e-4. `ACCUM_RTOL = 3e-3` leaves 4× headroom;
+            // pre-fix the same cells were 1e47 (CV 0.05) and non-finite (CV ≤ 0.03).
+            assert!(
+                worst <= ACCUM_RTOL,
+                "[{label} cv={cv}] analytic vs ODE twin: worst rel {worst:.3e} > {ACCUM_RTOL:e}"
+            );
+        }
+    }
 }
 
 // ── Flip-flop reroute + TIME desugar ──────────────────────────────────────────
