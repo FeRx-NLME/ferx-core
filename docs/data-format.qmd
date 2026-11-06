@@ -654,12 +654,15 @@ The cut is per subject, at the last record of any endpoint: an observation,
 censored or not, or a time-to-event, discrete-state or count record, including
 the right bound of an interval-censored event. A dose listed ahead of that
 record at the same `TIME` stays, since it acts on the observation. Later `EVID=2`,
-`EVID=3` and `EVID=4` rows go with the doses. Three exceptions:
+`EVID=3` and `EVID=4` rows go with the doses. Four exceptions:
 
 - A subject with a non-Gaussian record also keeps the first record after it,
   which closes the interval holding that record.
 - A subject's first dose always stays, because `TAD` and `TAFD` read it before
   it arrives.
+- A model with a lag whose `[odes]` reads `TAD` keeps every record. Before any
+  dose arrives, `TAD` counts from the earliest arrival, and with lags that differ
+  between doses that can be a later dose.
 - A model with more than one `level` keeps every record.
 
 Only the estimation steps use the shorter list, including `run_covariance()` and

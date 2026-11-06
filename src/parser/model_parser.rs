@@ -17157,6 +17157,9 @@ fn build_ode_spec(
     // slot, and "the RHS reads `TAD`" and "the RHS reads `TAFD`" are different sentences
     // with different fixes.
     let pk_reads_tad = stmts_read_slots(pk_view, &[tad_slot]);
+    // The whole program, hazard lines included: what a question about the `TAD` anchor
+    // itself has to ask (#2778).
+    let reads_tad = stmts_read_slots(&stmts_owned, &[tad_slot]);
     // Composed, not re-walked: `pk_reads_model_time` is exactly the union above widened by
     // `TAD`, which is the containment relation `pk_reads_absolute_time`'s doc comment states.
     // Spelling it as a fourth walk let the two drift; spelling it this way cannot.
@@ -17318,6 +17321,7 @@ fn build_ode_spec(
         pk_reads_model_time,
         pk_reads_tafd,
         pk_reads_tad,
+        reads_tad,
         pk_reads_solver_time,
         affine_in_states,
         condition_reads,
@@ -31789,6 +31793,9 @@ pub struct OdeRhsProgram {
     /// not, so refusing that window is a per-spelling question, not a
     /// [`Self::pk_reads_model_time`] one.
     pk_reads_tad: bool,
+    /// Does **any** line of the program read `TAD`, the injected hazard lines included? The
+    /// `[odes]`-wide counterpart of [`Self::pk_reads_tad`], which leaves those lines out.
+    reads_tad: bool,
     /// Every `d/dt(...)` is affine in the states and no state reaches an `if` condition —
     /// read through [`Self::is_affine_in_states`] (#852). Decided on the unresolved program by
     /// `ode_linearity::stmts_affine_in_states`.
@@ -32328,6 +32335,11 @@ impl OdeRhsProgram {
     /// specifically, or to phrase a message about it.
     pub(crate) fn pk_reads_tad(&self) -> bool {
         self.pk_reads_tad
+    }
+
+    /// See [`OdeRhsProgram::reads_tad`].
+    pub(crate) fn reads_tad(&self) -> bool {
+        self.reads_tad
     }
 
     /// See [`OdeRhsProgram::pk_reads_solver_time`]. Ask [`Self::pk_reads_absolute_time`] to

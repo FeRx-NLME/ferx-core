@@ -589,6 +589,98 @@ fn a_dose_tied_with_the_last_observation_moves_the_objective() {
     assert!(gap > 1.0, "{gap}");
 }
 
+// ── a lag that reorders arrivals ─────────────────────────────────────────────
+
+/// Compartment-specific lags, with `extra` added to `d/dt(central)`.
+fn lagged_model(extra: &str) -> String {
+    format!(
+        "{PARAMS}
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+  ALAG1 = 100
+  ALAG2 = 0
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) = KA*depot/V - CL/V*central{extra}
+{ERROR_MODEL}"
+    )
+}
+
+/// The dose at 0 arrives at 100 and the one at 20, past the last observation at 10, at 20.
+const LAGGED: &str = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+1,0,.,1,100,1,0,1
+1,5,1.2,0,.,2,0,0
+1,10,0.9,0,.,2,0,0
+1,20,.,1,100,2,0,1
+2,0,.,1,100,1,0,1
+2,5,1.1,0,.,2,0,0
+2,10,1.0,0,.,2,0,0
+2,20,.,1,100,2,0,1
+";
+
+/// Before any dose arrives `TAD` is anchored at the earliest arrival, here the dose past the
+/// horizon, so the model keeps it. Dropping it moves this prediction from 11.75 to 6.69.
+#[test]
+fn tad_before_the_first_arrival_keeps_a_dose_that_arrives_first() {
+    let run = prepared(&lagged_model(" + 0.01*(TAD + 200)"), LAGGED);
+    let model = &run.parsed.model;
+    let view = scored_population(model, Cow::Borrowed(&run.population));
+    assert!(matches!(view, Cow::Borrowed(_)));
+
+    let mut cut = run.population.clone();
+    for s in &mut cut.subjects {
+        s.doses.truncate(1);
+    }
+    let on =
+        |p: &Population| crate::api::predict(model, p, &run.init_params).expect("predict")[1].pred;
+    let (every_dose, one_dose) = (on(&run.population), on(&cut));
+    assert!(every_dose.is_finite() && one_dose.is_finite());
+    assert!(
+        (every_dose - one_dose).abs() > 0.01,
+        "{every_dose} {one_dose}"
+    );
+
+    let options = FitOptions {
+        outer_maxiter: 0,
+        ..few_iterations()
+    };
+    assert_eq!(
+        numbers(&fitted(&run, &options)),
+        numbers(&fitted_on_every_record(&run, &options))
+    );
+}
+
+/// A hazard line is outside the PK block `pk_reads_tad` looks at, but reads the same anchor.
+#[cfg(feature = "survival")]
+#[test]
+fn a_hazard_reading_tad_counts() {
+    let model = lagged_model("").replace(
+        "[error_model]",
+        "[event_model]\n  cmt = 3\n  hazard = 0.01 * exp(0.001*TAD)\n\n[error_model]",
+    );
+    let run = prepared(&model, LAGGED);
+    assert!(tad_reads_a_lagged_arrival(&run.parsed.model));
+}
+
+/// Only a lag and a `TAD` read together keep the doses: each alone is cut as usual.
+#[test]
+fn a_lag_or_a_tad_read_alone_still_cuts() {
+    let cut = |text: &str| {
+        let run = prepared(text, LAGGED);
+        let view = scored_population(&run.parsed.model, Cow::Borrowed(&run.population));
+        view.subjects[0].doses.len()
+    };
+    assert_eq!(cut(&lagged_model("")), 1, "a lag, no TAD");
+    let no_lag = lagged_model(" + 0.01*TAD").replace("  ALAG1 = 100\n  ALAG2 = 0\n", "");
+    assert_eq!(cut(&no_lag), 1, "TAD, no lag");
+}
+
 // ── what still reads the whole dataset ───────────────────────────────────────
 
 /// `[derived]` grid integrals run past the last observation, so the trailing doses reach
@@ -718,6 +810,13 @@ fn the_first_dose_stays_when_every_observation_precedes_it() {
     let mut s = subject();
     s.doses = vec![dose(20.0), dose(30.0)];
     assert_eq!(kept_dose_times(&s), vec![20.0]);
+}
+
+#[test]
+fn the_earliest_dose_stays_on_an_unsorted_list() {
+    let mut s = subject();
+    s.doses = vec![dose(30.0), dose(20.0), dose(40.0)];
+    assert_eq!(kept_dose_times(&s), vec![30.0, 20.0]);
 }
 
 #[test]
