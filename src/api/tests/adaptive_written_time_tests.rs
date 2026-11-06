@@ -166,3 +166,100 @@ fn window_auc_integrates_the_written_time_after_a_restart() {
         "observe = 1000·TIME across a restart",
     );
 }
+
+/// The same readout with the restart **strictly inside** a window, and the next window
+/// opening at a break that is no data record (review r1, row 2). Decisions at 0, 20, 28
+/// and 40:
+///
+/// - `[0, 20]`: 1000 · 20² / 2 = 200 000;
+/// - `[20, 28]` holds the reset at 25. It integrates written 20 … 25, then written 0 … 3:
+///   112 500 + 4 500 = 117 000 (engine clock: 192 000);
+/// - `[28, 40]` opens at decision 28, a break with no row in the reset-period table, so the
+///   first segment's offset comes from `param_time_at`'s period arithmetic, not from a row
+///   lookup. Written 3 … 15: 108 000 (engine clock: 408 000).
+///
+/// Mutations, measured. `assert_window_aucs` stops at the first window out of band, so each
+/// row names that window:
+/// - drop the segment offset (nodes after `t_start` read engine `t`): `[20, 28]` dies here,
+///   and `[25, 37]` in the edge-placed test;
+/// - the AUC nodes on engine time: `[20, 28]` dies;
+/// - every node through `param_time_at(t)` (no left limit): `[20, 28]` dies, because its
+///   pre-event node at the reset reads the restarted 0.
+#[test]
+fn window_auc_integrates_the_written_time_with_the_restart_inside_a_window() {
+    let m = parse_model_string(MODEL_TIME_READOUT).expect("parse");
+    let pop = read(RESTART_CSV);
+    assert_restart_premise(&pop);
+    let decisions = [0.0, 20.0, 28.0, 40.0];
+    // Premise: the restart lies strictly inside the second window, and the third window
+    // opens at a time that is no data record.
+    assert!(decisions[1] < SHIFT && SHIFT < decisions[2]);
+    let s = &pop.subjects[0];
+    assert!(!s.obs_times.contains(&decisions[2]) && !s.reset_times.contains(&decisions[2]));
+    let spec = fixed_dose_spec(Some("1000.0 * TIME"), &decisions, 100.0);
+    let half_sq = |a: f64, b: f64| 1000.0 * (b * b - a * a) / 2.0;
+    let want = [
+        half_sq(0.0, 20.0),
+        half_sq(20.0, SHIFT) + half_sq(0.0, 28.0 - SHIFT),
+        half_sq(28.0 - SHIFT, 40.0 - SHIFT),
+    ];
+    let engine_clock = [half_sq(0.0, 20.0), half_sq(20.0, 28.0), half_sq(28.0, 40.0)];
+    assert_distinct(
+        &want[1..],
+        &engine_clock[1..],
+        AUC_TOL,
+        "the windows after the restart, written vs engine clock",
+    );
+    assert_window_aucs(
+        &m,
+        &pop,
+        &spec,
+        1,
+        &want,
+        AUC_TOL,
+        "observe = 1000·TIME, restart inside a window",
+    );
+}
+
+/// The `observe` arm at decisions (review r1, row 3), including one **exactly on** the
+/// reset. `observe = 1000 · TIME` reads no state, so each reading is `1000 ×` the written
+/// TIME, exactly: 0 at decision 0, 0 at the reset (applied before the decision hook, so
+/// the restarted value), and 6000 at engine 31 (written 6). On the engine clock the last
+/// two would read 25 000 and 31 000. Decision 0 is the straddle's control, where both
+/// clocks agree.
+///
+/// Mutation: pass engine `t_start` at the decision hook. The decisions at 25 and 31 die
+/// here, as does `monitor_readout_reads_the_written_time_after_a_restart`.
+#[test]
+fn observe_reads_the_written_time_at_decisions_including_one_on_the_reset() {
+    let m = parse_model_string(MODEL_TIME_READOUT).expect("parse");
+    let pop = read(RESTART_CSV);
+    assert_restart_premise(&pop);
+    let decisions = [0.0, SHIFT, 31.0];
+    let spec = fixed_dose_spec(Some("1000.0 * TIME"), &decisions, 100.0);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        ..Default::default()
+    };
+    let res = simulate_adaptive_from_spec(&m, &pop, &m.default_params, 1, &spec, &opts)
+        .expect("spec run");
+    let got: Vec<f64> = res
+        .decisions
+        .iter()
+        .map(|d| d.observed_signals[0].value)
+        .collect();
+    let want = [0.0, 0.0, 6000.0];
+    let engine_clock = [0.0, 25_000.0, 31_000.0];
+    assert_eq!(
+        want[0], engine_clock[0],
+        "the control decision: both clocks agree"
+    );
+    assert!(want[1..]
+        .iter()
+        .zip(&engine_clock[1..])
+        .all(|(w, e)| w != e));
+    assert_eq!(
+        got, want,
+        "observe = 1000·TIME at decisions 0 / 25 (the reset) / 31"
+    );
+}
