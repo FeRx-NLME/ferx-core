@@ -8792,14 +8792,13 @@ pub struct FitResult {
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///
-    /// The checkpoint format does not round-trip per-record time-to-event diagnostics
-    /// (`SubjectResult::tte_rows`), so a restored fit of a TTE model has none. This flag
-    /// lets [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose model
-    /// declares a time-to-event endpoint (rows genuinely dropped) while still writing a
-    /// live fit. It is paired with the model's declared endpoints, parsed from
-    /// [`Self::model_text`]. Runtime-only: `#[serde(skip)]`, so no `.fitrx` / JSON / ferx-r
-    /// format change, and a live fit always carries `false`. Removed once diagnostics
-    /// round-trip (#911).
+    /// The checkpoint carries per-record time-to-event diagnostics
+    /// (`SubjectResult::tte_rows`) since #911, but a bundle written before that has none.
+    /// This flag lets [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose
+    /// model declares a time-to-event endpoint and whose subjects carry no TTE row (rows
+    /// genuinely dropped) while still writing a live fit. It is paired with the model's
+    /// declared endpoints, parsed from [`Self::model_text`]. Runtime-only: `#[serde(skip)]`,
+    /// so no `.fitrx` / JSON / ferx-r format change, and a live fit always carries `false`.
     #[serde(skip)]
     pub restored_from_checkpoint: bool,
     /// Free-parameter tally by Delattre class, the inputs to the BIC variants
