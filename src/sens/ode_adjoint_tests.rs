@@ -796,7 +796,10 @@ fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt_magnitude() {
 /// Measured on Padé 2.0e-9 / 2.2e-9 (plain / magnitude, Linux x86_64); on the spectral path
 /// (#2706 follow-up) 1.1e-8 / 1.3e-8 (CI, release semantics). The analytic gradient is the
 /// same on both engines to the 11 printed digits; what moves is the reconverged-FD oracle's
-/// objective, whose re-solved η̂ lands differently by round-off. ~5× over the worst.
+/// objective: the spectral propagation's values carry ~10× Padé's rounding (a sum of modes;
+/// `spectral_is_exact_on_a_stiff_spectrum` measures 1.6e-12 against Padé's 1.0e-13 on an
+/// exact solution), which the oracle's re-solved η̂ and its Richardson step amplify.
+/// ~5× over the worst.
 const LTBS_PER_CMT_BOUND: f64 = 6e-8;
 
 fn ltbs_combined_per_cmt_parity(model: CompiledModel, bound: f64) {
@@ -8434,6 +8437,11 @@ fn the_six_wide_hessian_bucket_equals_the_padded_eight() {
         })
     };
     let ((h6, dx6), (h8, dx8)) = (run(false), run(true));
+    assert_eq!((h6.nrows(), h6.ncols()), (h8.nrows(), h8.ncols()));
+    assert!(
+        h6.nrows() > 0,
+        "an empty Hessian compares equal to anything"
+    );
     let mut worst = 0.0_f64;
     let mut gap = |u: f64, v: f64| {
         assert!(u.is_finite() && v.is_finite(), "{u} vs {v}");

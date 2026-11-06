@@ -571,10 +571,21 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
     for (v, x) in vals.iter_mut().zip(a) {
         *v = x.val();
     }
-    if repeated_singleton_eigenvalue(vals, n) {
+    // The coupling graph: entry `r·n + c` is an edge unless it is a structural zero — value 0
+    // and no derivative ([`crate::sens::linsolve::structural_zero`], the convention the Padé
+    // kernels skip on). A rate whose value sits at 0 while it carries a jet is an edge: its
+    // derivative couples the compartments even where its value does not.
+    let present = a.iter().enumerate().fold(0u64, |m, (i, x)| {
+        if crate::sens::linsolve::structural_zero(*x) {
+            m
+        } else {
+            m | (1 << i)
+        }
+    });
+    if repeated_singleton_eigenvalue(vals, present, n) {
         return None;
     }
-    spectral_of(a, n, vals)
+    spectral_of(a, n, vals, present)
 }
 
 /// Whether two compartments that sit on no cycle of `A`'s coupling graph have (nearly) the same
@@ -584,13 +595,13 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
 /// (measured: that eigensolve made an all-declined transit fit 3% slower than Padé alone). The
 /// gap is relative to the larger of the two diagonals, at most the spectral radius
 /// `spectral_of` measures against, so this declines nothing `spectral_of` would accept.
-fn repeated_singleton_eigenvalue(vals: &[f64], n: usize) -> bool {
+fn repeated_singleton_eigenvalue(vals: &[f64], present: u64, n: usize) -> bool {
     let close = |x: f64, y: f64| (x - y).abs() <= SPECTRAL_MIN_REL_GAP * x.abs().max(y.abs());
     // Only a pair of close diagonals can decline, so the coupling graph is walked only for one.
     if !(0..n).any(|i| (i + 1..n).any(|j| close(vals[i * n + i], vals[j * n + j]))) {
         return false;
     }
-    let acyclic = acyclic_mask(vals, n);
+    let acyclic = acyclic_mask(present, n);
     let mut diag = [0.0_f64; 6];
     let mut m = 0;
     for i in (0..n).filter(|&i| acyclic & (1 << i) != 0) {
@@ -604,11 +615,11 @@ fn repeated_singleton_eigenvalue(vals: &[f64], n: usize) -> bool {
 /// (Warshall over row bitmasks, `n ≤ 6`). Amount flows from column `c` to row `r` where
 /// `A_rc ≠ 0`, so `r ∈ down[c]` is the reachability every power of `A` — and every function of
 /// it, `exp(A·t)` and each projector included — is supported on.
-fn downstream(vals: &[f64], n: usize) -> [u8; 6] {
+fn downstream(present: u64, n: usize) -> [u8; 6] {
     let mut reach = [0u8; 6];
     for r in 0..n {
         for c in 0..n {
-            if r != c && vals[r * n + c] != 0.0 {
+            if r != c && present & (1 << (r * n + c)) != 0 {
                 reach[c] |= 1 << r;
             }
         }
@@ -628,8 +639,8 @@ fn downstream(vals: &[f64], n: usize) -> [u8; 6] {
 
 /// Bit `i` set when compartment `i` sits on no cycle of `A`'s coupling graph: a 1×1 block of
 /// `A`'s block-triangular form, whose diagonal is therefore an eigenvalue, exactly.
-fn acyclic_mask(vals: &[f64], n: usize) -> u8 {
-    let down = downstream(vals, n);
+fn acyclic_mask(present: u64, n: usize) -> u8 {
+    let down = downstream(present, n);
     (0..n).fold(0u8, |m, i| {
         let cyclic = (0..n).any(|j| j != i && down[i] & (1 << j) != 0 && down[j] & (1 << i) != 0);
         if cyclic {
@@ -688,11 +699,13 @@ fn projectors<U: PkNum>(a: &[U], lambda: &[U], masks: &[(u8, u8)], n: usize) -> 
     proj
 }
 
-/// `A`'s spectral form, or `None` (the segment takes Padé). Decided on `A`'s values alone, in
-/// `f64`: the eigenvalues, the projectors' size and the identities they must reproduce never
-/// read a jet, so `f64` and every dual or tape type take the same path, and a declined segment
-/// records nothing on a tape. Only an accepted form is then built in `T`.
-fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64]) -> Option<Spectral<T>> {
+/// `A`'s spectral form, or `None` (the segment takes Padé). Decided in `f64` on `A`'s values
+/// and its coupling graph (`present`: every entry but a structural zero): the eigenvalues,
+/// the projectors' size and the identities they must reproduce never read a jet, so a
+/// declined segment records nothing on a tape, and `f64` and every dual or tape type take the
+/// same decision — unless an entry's value is 0 while it carries a derivative, which is an
+/// edge for the dual run and not for the `f64` one. Only an accepted form is built in `T`.
+fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64], present: u64) -> Option<Spectral<T>> {
     let ev = nalgebra::DMatrix::<f64>::from_row_slice(n, n, vals).complex_eigenvalues();
     let scale = vals.iter().fold(0.0_f64, |s, x| s.max(x.abs())).max(1e-300);
     let mut lam_f: Vec<f64> = Vec::with_capacity(n);
@@ -719,9 +732,10 @@ fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64]) -> Option<Spectral<T>>
     // 1e-6 of its dose otherwise read 5.5e-10 off, the other modes leaking `ε·‖x‖` into it).
     // A cyclic block's eigenvalues are found by solving that block alone. The block fixes the
     // projector's support — rows downstream of it, columns upstream — which the products then
-    // keep as exact zeros rather than rounding residue (a stiff chain's `∂²u₁/∂k₂²`, exactly 0,
-    // read 1e-12 without it). `exact[k]`: the compartment eigenvalue `k` is the diagonal of.
-    let down = downstream(vals, n);
+    // keep as exact zeros rather than rounding residue. (Entries a projector's support does
+    // include can still carry the modes' algebraic cancellation: a stiff chain's
+    // `∂²u₁/∂k₂²`, exactly 0, reads ~1e-12 through mode 0's `(A − λ₂I)/(λ₀ − λ₂)`.) `exact[k]`: the compartment eigenvalue `k` is the diagonal of.
+    let down = downstream(present, n);
     let mut exact: [Option<usize>; 6] = [None; 6];
     let mut block: [u8; 6] = [0; 6];
     let mut done = 0u8;
@@ -914,7 +928,7 @@ fn exprel_derivs(z: f64, orders: usize) -> [f64; 5] {
             k += 1;
             p *= z * RECIP[k];
             // |z| ≤ 2: the next terms sum below 2·|p|, under an ulp of every order's value
-            // (each is at least g⁽ᵐ⁾(−2) > 0.04).
+            // (each is at least g⁽ᵐ⁾(−2) > 0.03).
             if p.abs() < 1e-19 || k + top + 1 >= RECIP.len() {
                 break;
             }
@@ -923,18 +937,21 @@ fn exprel_derivs(z: f64, orders: usize) -> [f64; 5] {
     }
     let e = z.exp();
     let (z2, z3, z4) = (z * z, z * z * z, z * z * z * z);
+    // Past `z ≈ −745` the exponential is 0 and the polynomials it multiplies may overflow
+    // (`0·inf = NaN`): drop the term, leaving each closed form's constant over `zᵐ⁺¹`.
+    let e_term = |poly: f64| if e == 0.0 { 0.0 } else { e * poly };
     out[0] = z.exp_m1() / z;
     if top >= 1 {
-        out[1] = (e * (z - 1.0) + 1.0) / z2;
+        out[1] = (e_term(z - 1.0) + 1.0) / z2;
     }
     if top >= 2 {
-        out[2] = (e * (z2 - 2.0 * z + 2.0) - 2.0) / z3;
+        out[2] = (e_term(z2 - 2.0 * z + 2.0) - 2.0) / z3;
     }
     if top >= 3 {
-        out[3] = (e * (z3 - 3.0 * z2 + 6.0 * z - 6.0) + 6.0) / z4;
+        out[3] = (e_term(z3 - 3.0 * z2 + 6.0 * z - 6.0) + 6.0) / z4;
     }
     if top >= 4 {
-        out[4] = (e * (z4 - 4.0 * z3 + 12.0 * z2 - 24.0 * z + 24.0) - 24.0) / (z4 * z);
+        out[4] = (e_term(z4 - 4.0 * z3 + 12.0 * z2 - 24.0 * z + 24.0) - 24.0) / (z4 * z);
     }
     out
 }
@@ -1087,8 +1104,10 @@ fn segment_in<T: PkNum>(
     // propagated as `Σ_i P_i (e^{λ_i Δ} x + φ(λ_i, Δ) b)`: `n` exponentials per gap instead of
     // a degree-13 Padé and its squarings. A repeated, near-repeated or complex spectrum (a
     // transit chain at one rate) declines to Padé below. Whether to take it is decided on
-    // `A`'s values alone ([`spectral_of`]), so the `f64` and dual runs agree; each propagated
-    // state then passes the same reproduction check as Padé's.
+    // `A`'s values and coupling graph ([`spectral_of`]); each propagated state then passes the
+    // same reproduction check as Padé's, which reads jets too, so a state that fails it
+    // mid-segment sends that run (with the records it has made) to Padé, possibly on one
+    // number type and not another — the two exact propagations agree to round-off.
     if spectral_enabled() {
         if let Some(sp) = spectral(a, n) {
             // The derivative orders `φ` needs: none on a constant generator; else the type's

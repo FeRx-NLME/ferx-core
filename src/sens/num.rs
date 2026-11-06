@@ -418,6 +418,12 @@ macro_rules! impl_pknum_delegate {
             fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
                 Some($ty::same_bits(self, other))
             }
+            /// Every jet entry `+0.0`: the constant of its value, bit for bit (no tape to
+            /// carry). A `NaN` or `−0.0` entry reads non-constant, the conservative side.
+            #[inline]
+            fn is_constant(self) -> bool {
+                $ty::same_bits(&self, &$ty::constant(self.val()))
+            }
             #[inline]
             fn from_f64(x: f64) -> Self {
                 $ty::constant(x)

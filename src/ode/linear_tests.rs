@@ -1551,6 +1551,13 @@ impl Drop for PadeOnly {
 
 /// Run `f` with the spectral path on or off, returning its result and how many segments the
 /// spectral path served.
+/// The coupling graph of a constant matrix: every nonzero entry ([`spectral`]'s `present`).
+fn nonzero(a: &[f64]) -> u64 {
+    a.iter()
+        .enumerate()
+        .fold(0, |m, (i, &x)| if x != 0.0 { m | (1 << i) } else { m })
+}
+
 fn with_spectral<R>(on: bool, f: impl FnOnce() -> R) -> (R, usize) {
     SPECTRAL_OFF.with(|c| c.set(!on));
     SPECTRAL_HITS.with(|c| c.set(0));
@@ -1678,21 +1685,21 @@ fn the_singleton_precheck_sees_only_acyclic_compartments() {
          0.7, -0.7, 0.0,
          0.0, 0.7, -0.2,
     ];
-    assert!(repeated_singleton_eigenvalue(&chain, 3));
+    assert!(repeated_singleton_eigenvalue(&chain, nonzero(&chain), 3));
     // Equal diagonals on a cycle (central ↔ peripheral) are not eigenvalues: the eigenvalues
     // of [[-1, 1], [1, -1]] are 0 and −2, distinct, so the precheck must leave them to
     // `spectral_of`, which accepts them.
     let cycle = [-1.0, 1.0, 1.0, -1.0];
-    assert!(!repeated_singleton_eigenvalue(&cycle, 2));
-    assert!(spectral_of::<f64>(&cycle, 2, &cycle).is_some());
+    assert!(!repeated_singleton_eigenvalue(&cycle, nonzero(&cycle), 2));
+    assert!(spectral_of::<f64>(&cycle, 2, &cycle, nonzero(&cycle)).is_some());
     // Distinct acyclic rates pass through.
     #[rustfmt::skip]
     let oral = [
         -1.5, 0.0,
          1.5, -0.2,
     ];
-    assert!(!repeated_singleton_eigenvalue(&oral, 2));
-    assert!(spectral_of::<f64>(&oral, 2, &oral).is_some());
+    assert!(!repeated_singleton_eigenvalue(&oral, nonzero(&oral), 2));
+    assert!(spectral_of::<f64>(&oral, 2, &oral, nonzero(&oral)).is_some());
 }
 
 /// Spectral vs Padé on `rhs`, seeding `p[seed[0]]`, `p[seed[1]]` as the two `Dual2` axes:
@@ -1812,7 +1819,7 @@ fn spectral_declines_a_non_normal_chain_by_its_projector_size() {
         }
     }
     assert!(
-        !repeated_singleton_eigenvalue(&a, 5),
+        !repeated_singleton_eigenvalue(&a, nonzero(&a), 5),
         "the precheck must pass it"
     );
     let lam: Vec<f64> = (0..5).map(|i| -p[i]).collect();
@@ -1824,7 +1831,7 @@ fn spectral_declines_a_non_normal_chain_by_its_projector_size() {
         kappa > SPECTRAL_MAX_KAPPA,
         "κ = {kappa:e} must exceed the bound"
     );
-    assert!(spectral_of::<f64>(&a, 5, &a).is_none());
+    assert!(spectral_of::<f64>(&a, 5, &a, nonzero(&a)).is_none());
     let u0 = [100.0, 0.0, 0.0, 0.0, 0.0];
     let run = || {
         linear_segment_g::<f64>(&transit, &u0, (0.0, 6.0), &p, &[1.0, 3.0, 6.0], &[])
@@ -1890,7 +1897,15 @@ fn a_spectral_state_that_fails_its_check_falls_back_to_pade() {
     let (on, hits) = with_spectral(true, run);
     let (off, _) = with_spectral(false, run);
     assert_eq!(hits, 0, "an overflowed spectral state must not be returned");
-    assert_eq!(on.is_some(), off.is_some());
+    match (on, off) {
+        (None, None) => {}
+        (Some((a, _)), Some((b, _))) => {
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(x.u, y.u, "the fallback is Padé's result");
+            }
+        }
+        (a, b) => panic!("spectral-on {:?} vs Padé {:?}", a.is_some(), b.is_some()),
+    }
 }
 
 /// `exprel_derivs`: `g` is the same bits whatever orders are asked for (the `f64` and dual
@@ -1925,4 +1940,95 @@ fn exprel_derivs_is_one_value_and_continuous_at_its_switch() {
     for (m, v) in at0.iter().enumerate() {
         assert_eq!(*v, 1.0 / (m as f64 + 1.0));
     }
+}
+
+/// A rate whose value is 0 but which carries a derivative is an edge of the coupling graph
+/// (#2747 review): `KBACK = 0` with a seed couples `central` back into `depot` in every
+/// derivative though not in value. Read from values alone, the depot was acyclic, its
+/// eigenvalue snapped to `−KA` and the masks zeroed `∂depot/∂KBACK`, which is
+/// `∫e^{−KA(t−s)}·central(s) ds ≠ 0`. The test also asserts that derivative is live, so it
+/// cannot pass on a fixture where it is 0 anyway.
+#[test]
+fn a_zero_valued_rate_with_a_derivative_is_a_coupling() {
+    fn back<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+        du[0] = -p[0] * u[0] + p[1] * u[1];
+        du[1] = p[0] * u[0] - p[2] * u[1];
+    }
+    let saveat = [0.5, 2.0, 6.0];
+    let (hits, worst) = spectral_vs_pade_dual2(
+        &back,
+        &[1.2, 0.0, 0.3],
+        [0, 1],
+        &[100.0, 5.0],
+        (0.0, 6.0),
+        &saveat,
+    );
+    assert!(hits > 0, "the spectral path must serve the segment");
+    // Measured 1.4e-13; 1e-12 keeps ~7× headroom. (With the graph read from values, the
+    // gap was 0.998: ∂depot/∂KBACK read 0.)
+    assert!(worst < 1e-12, "zero-valued coupling: worst {worst:.2e}");
+    let p: Vec<Dual2<2>> = [1.2, 0.0, 0.3]
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if i < 2 {
+                Dual2::<2>::var(v, i)
+            } else {
+                Dual2::<2>::from_f64(v)
+            }
+        })
+        .collect();
+    let u: Vec<Dual2<2>> = [100.0, 5.0]
+        .iter()
+        .map(|&v| Dual2::<2>::from_f64(v))
+        .collect();
+    let r = linear_segment_g(&back, &u, (0.0, 6.0), &p, &saveat, &[])
+        .unwrap()
+        .0;
+    assert!(r[1].u[0].grad[1].abs() > 1.0, "∂depot/∂KBACK must be live");
+}
+
+/// Every jet order the crate's number types carry (up to 4: the covariance step's nested
+/// dual) through the spectral path, against Padé: a `Taylor<1, 4>` seeded on a rate of the
+/// cyclic central–peripheral block, whose eigenvalues take the chord iteration's jets and
+/// whose `φ` reads `exprel_derivs` to order 4.
+#[test]
+fn spectral_carries_every_jet_order_to_four() {
+    type T4 = crate::sens::taylor::Taylor<1, 4, 5>;
+    let base = [1.4, 0.12, 0.35, 0.18, 5.0];
+    let p: Vec<T4> = base
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if i == 2 {
+                T4::var(v, 0)
+            } else {
+                T4::from_f64(v)
+            }
+        })
+        .collect();
+    let u: Vec<T4> = [100.0, 3.0, 1.0].iter().map(|&v| T4::from_f64(v)).collect();
+    let run = || {
+        linear_segment_g(&two_cpt_depot, &u, (0.0, 10.0), &p, &[0.5, 2.0, 10.0], &[])
+            .unwrap()
+            .0
+    };
+    let (sp, hits) = with_spectral(true, run);
+    let (pade, _) = with_spectral(false, run);
+    assert!(hits > 0, "the spectral path must serve the segment");
+    let mut worst = 0.0_f64;
+    for (a, b) in sp.iter().zip(&pade) {
+        for (x, y) in a.u.iter().zip(&b.u) {
+            for (cx, cy) in x.c.iter().zip(&y.c) {
+                assert!(cx.is_finite() && cy.is_finite(), "{cx} vs {cy}");
+                worst = worst.max((cx - cy).abs() / (1.0 + cy.abs()));
+            }
+        }
+    }
+    // The order-4 coefficient must be live, or the comparison says nothing about it.
+    assert!(pade
+        .iter()
+        .any(|pt| pt.u.iter().any(|x| x.c[4].abs() > 1e-6)));
+    // Measured 1.5e-12 (3 chord steps instead of 5: 1.37); 1e-11 keeps ~6.6× headroom.
+    assert!(worst < 1e-11, "order-4 Taylor: worst {worst:.2e}");
 }
