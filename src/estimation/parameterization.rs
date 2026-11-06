@@ -2377,6 +2377,30 @@ mod tests {
         assert_eq!(fd_theta_step_floors(&model)[w], 1.0);
         assert_eq!(fd_theta_step_floor(&model, 1), 0.5);
         assert_eq!(fd_theta_step_floors(&model)[1], 0.5);
+        // An identity-packed non-weight θ with 0 < |θ₀| < 1: the |θ₀| floor must apply to it
+        // but NOT to a weight. A mutant `fd_step_floor → 1.0` survives the weight assertion
+        // above but fails here (the non-weight gets 1.0 instead of its declared 0.3).
+        let beta_src = "[parameters]
+  theta BETA(0.3, -5, 5)
+  omega ETA_CL ~ 0.1
+  sigma PROP ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = exp(ETA_CL)
+  V  = 10.0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let plain = crate::parser::model_parser::parse_model_string(beta_src).expect("parses");
+        assert!(
+            !theta_packs_log(plain.default_params.theta_lower[0]),
+            "BETA is identity-packed"
+        );
+        assert_eq!(fd_theta_step_floor(&plain, 0), 0.3, "non-weight |θ₀| floor");
         // The same θ without the exemption — what a wrapper passing `&[]` would return.
         assert_eq!(theta0_floor(&model.default_params, &[], w), 1e-3);
     }
