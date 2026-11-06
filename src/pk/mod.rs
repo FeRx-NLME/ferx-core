@@ -3201,7 +3201,7 @@ pub fn compute_predictions_with_states(
         // that snapshot is not uniform, and gates `W_DERIVED_CMT_TV_ODE` (#1855).
         let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
         let (mut ipred, states) =
-            if subject.has_tv_covariates() || subject.has_resets() || uses_time {
+            if subject.has_tv_covariates() || subject.has_state_events() || uses_time {
                 let mut scratch = EventPkParams::with_capacity_for(subject);
                 compute_event_pk_params_into(model, subject, theta, eta, &mut scratch);
                 crate::ode::ode_predictions_event_driven_with_states(
@@ -3492,7 +3492,7 @@ pub fn compute_predictions_ode(
     // walker — the plain `ode_predictions` segment loop has no reset event.
     // Replicate the (constant) params across every event slot, mirroring the
     // no-TV uniform fill used by `compute_event_pk_params`.
-    if subject.has_resets() {
+    if subject.has_state_events() {
         let mut pk = PkParams::default();
         let n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
         pk.values[..n].copy_from_slice(&pk_params_flat[..n]);
@@ -3699,7 +3699,7 @@ pub(crate) fn compute_predictions_with_tv_recycle_with_schedule(
         // ODE path. Resets (EVID=3/4) need the state-propagating event-driven
         // walker too, even without time-varying covariates — the plain
         // `ode_predictions` loop has no reset event.
-        if has_tv || subject.has_resets() || uses_time {
+        if has_tv || subject.has_state_events() || uses_time {
             compute_event_pk_params_into(model, subject, theta, eta, scratch);
             crate::ode::ode_predictions_event_driven(
                 ode,
@@ -4173,6 +4173,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -4496,6 +4497,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: vec![8.0],
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             // The reset row itself is occasion 2 — the occasion it STARTS. The record
             // before it is occasion 1, which is what every neighbour-inferring rule
             // resolves to, and what ferx used before this was measured.
@@ -4777,6 +4779,7 @@ mod tests {
             // Each reset row carries a `WT` shared with no neighbouring record, so reading
             // one row early or late shows up in the assertions below.
             reset_covariates: vec![wt(50.0), wt(80.0)],
+            cmt_toggles: Vec::new(),
             cens: vec![0; 2],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -4827,6 +4830,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: vec![5.0],
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 2],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -4891,6 +4895,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -5150,6 +5155,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -5921,6 +5927,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1, 1, 2, 2],
             obs_l2: Vec::new(),
@@ -6589,6 +6596,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             obs_l2: Vec::new(),

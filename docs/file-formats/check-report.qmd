@@ -337,6 +337,12 @@ A dose whose `CMT` the model has no compartment for, or cannot infuse into.
 | Code | Severity | Meaning |
 |------|----------|---------|
 | `E_DOSE_CMT_OUT_OF_RANGE` | error | A dose record — bolus or infusion, zero amount included — whose `CMT` exceeds the number of compartments: the `[odes]` block's declared states, or the analytical model's compartments. Such a dose used to be silently dropped (ODE) or panic the event walk (analytical). Reported once per (bolus/infusion, compartment); not raised on a compartment-free model, nor on an analytical model whose population feeds no PK prediction. |
+| `E_NEGATIVE_CMT` | error | A negative `CMT` on anything but an `EVID=2` row: NONMEM stops on one on a dose or observation, and ferx refuses one on a reset (#2732). See [Compartment on/off](../data-format.qmd#compartment-onoff-evid2-cmt-n). |
+| `E_CMT_TOGGLE_TIE` | error | A compartment on/off row between two doses, or a reset and a dose, at one `TIME`: no engine order can place it (#2732). See [Compartment on/off](../data-format.qmd#compartment-onoff-evid2-cmt-n). |
+| `E_CMT_TOGGLE_UNSUPPORTED` | error | A compartment off row (`EVID=2`, `CMT=-N`) on a model that cannot honour it: not an `[odes]` model, an SDE, a declared endpoint, or a compartment fed by a built-in absorption input (#2732). See [Compartment on/off](../data-format.qmd#compartment-onoff-evid2-cmt-n). |
+| `E_CMT_TOGGLE_OUT_OF_RANGE` | error | A `CMT=-N` off row past the `[odes]` block's declared states (#2732). See [Compartment on/off](../data-format.qmd#compartment-onoff-evid2-cmt-n). |
+| `E_CMT_TOGGLE_SS` | error | An `SS=1` dose while a compartment is off (#2732). See [Compartment on/off](../data-format.qmd#compartment-onoff-evid2-cmt-n). |
+| `E_OBS_CMT_OFF` | error | An observation of a compartment that is off at that record, as NONMEM refuses (#2732). See [Compartment on/off](../data-format.qmd#compartment-onoff-evid2-cmt-n). |
 | `E_DOSE_CMT_NOT_INFUSABLE` | error | An infusion (`RATE > 0` or a modeled rate) with a nonzero `AMT` that names a compartment the model cannot infuse into — in practice `CMT=0`, NONMEM's default dose compartment, which is defined for a bolus but not for a zero-order input. Raised on `[odes]` models and the event-walk analytical models (not transit / inverse-Gaussian); reported once per compartment, with the subject and time of the first row. |
 
 #### Dose attributes

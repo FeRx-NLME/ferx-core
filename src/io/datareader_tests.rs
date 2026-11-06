@@ -3414,7 +3414,7 @@ fn missing_and_unparseable_cmt_cells_default_to_1_and_are_counted() {
                1,0,.,1,100,.,1\n\
                1,1,.,1,100,,1\n\
                1,2,.,1,100,NA,1\n\
-               1,3,.,1,100,-1,1\n\
+               1,3,.,1,100,-1.5,1\n\
                1,4,.,1,100,2.5,1\n\
                1,5,.,1,100,x,1\n\
                1,6,5.0,0,.,1,0\n";
@@ -3441,9 +3441,9 @@ fn missing_and_unparseable_cmt_cells_default_to_1_and_are_counted() {
     );
     assert!(
         w.contains("3 row(s) had a CMT cell that is not a compartment index"),
-        "unparseable count must be 3 (`-1`, `2.5`, `x`), got: {w}"
+        "unparseable count must be 3 (`-1.5`, `2.5`, `x`), got: {w}"
     );
-    for quoted in ["\"-1\"", "\"2.5\"", "\"x\""] {
+    for quoted in ["\"-1.5\"", "\"2.5\"", "\"x\""] {
         assert!(w.contains(quoted), "summary must quote {quoted}, got: {w}");
     }
     assert!(
@@ -3667,7 +3667,7 @@ fn negative_zero_is_reported_like_every_other_negative() {
     // Review finding. `(0.0..=usize::MAX as f64).contains(&-0.0)` is `true` (IEEE
     // `-0.0 == 0.0`) and `(-0.0f64) as usize` is `0`, so `-0` used to read as
     // compartment 0 — the *default dose compartment*, silently accepted — while
-    // `-1` one row below was reported. The straddle is the point: all three
+    // `-1.5` one row below was reported. The straddle is the point: all three
     // spellings are negative, so all three must be reported alike — while the
     // literal `0` on row four must **not** be, even though it doses the same
     // compartment they do. `CMT=0` is NONMEM's default dose compartment and
@@ -3678,7 +3678,7 @@ fn negative_zero_is_reported_like_every_other_negative() {
     let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
                1,0,.,1,100,-0,1\n\
                1,1,.,1,100,-0.0,1\n\
-               1,2,.,1,100,-1,1\n\
+               1,2,.,1,100,-1.5,1\n\
                1,3,.,1,100,0,1\n\
                1,4,5.0,0,.,1,0\n";
     let f = write_csv(csv);
@@ -3692,7 +3692,7 @@ fn negative_zero_is_reported_like_every_other_negative() {
         w.contains("3 row(s) had a CMT cell that is not a compartment index"),
         "all three negatives are reported, `-0` included: {w}"
     );
-    for quoted in ["\"-0\"", "\"-0.0\"", "\"-1\""] {
+    for quoted in ["\"-0\"", "\"-0.0\"", "\"-1.5\""] {
         assert!(w.contains(quoted), "must quote {quoted}: {w}");
     }
     assert!(
@@ -3862,7 +3862,7 @@ fn emitted_cmt_defaulted_message_classifies_as_data_quality() {
     let cells = write_csv(
         "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
          1,0,.,1,100,.,1\n\
-         1,1,.,1,100,-1,1\n\
+         1,1,.,1,100,-1.5,1\n\
          1,2,5.0,0,.,1,0\n",
     );
     for f in [&absent, &cells] {
@@ -5525,4 +5525,156 @@ fn endpoint_rows_keep_their_covariate_snapshot() {
             "{name}: no TV covariate, no snapshots"
         );
     }
+}
+
+// ── compartment on/off records (#2732) ───────────────────────────────────
+
+const TOGGLE_HEAD: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV\n";
+
+fn toggled(rows: &str) -> crate::types::Subject {
+    let f = write_csv(&format!("{TOGGLE_HEAD}{rows}"));
+    read_nonmem_csv(f.path(), None, None)
+        .unwrap()
+        .subjects
+        .remove(0)
+}
+
+#[test]
+fn a_negative_cmt_on_an_evid2_row_is_an_off_record() {
+    let s = toggled("1,0,.,1,100,1,1\n1,4,.,2,.,-2,1\n1,6,.,2,.,2,1\n1,8,10,0,.,2,0\n");
+    assert_eq!(s.pk_only_times, [4.0, 6.0]);
+    let got: Vec<_> = s
+        .cmt_toggles
+        .iter()
+        .map(|c| (c.pk_only, c.state, c.on))
+        .collect();
+    assert_eq!(got, [(0, 1, false), (1, 1, true)]);
+    assert!(s.has_cmt_toggles() && s.has_state_events() && !s.has_resets());
+}
+
+#[test]
+fn a_float_formatted_negative_cmt_is_an_off_record() {
+    let s = toggled("1,0,.,1,100,1,1\n1,4,.,2,.,-2.0,1\n1,8,10,0,.,1,0\n");
+    assert_eq!(s.cmt_toggles[0].state, 1);
+    assert!(!s.cmt_toggles[0].on);
+}
+
+/// The covariate marker every older dataset carries must keep its engine: a positive `CMT`
+/// on an `EVID=2` row is only a record when something is off to turn on.
+#[test]
+fn an_on_row_with_no_off_row_is_a_plain_marker() {
+    let s = toggled("1,0,.,1,100,1,1\n1,4,.,2,.,1,1\n1,8,10,0,.,1,0\n");
+    assert!(s.cmt_toggles.is_empty());
+    assert!(!s.has_state_events());
+    assert_eq!(s.doses[0].off_at, f64::INFINITY);
+}
+
+#[test]
+fn cmt_zero_and_minus_zero_are_not_toggles() {
+    let s =
+        toggled("1,0,.,1,100,1,1\n1,3,.,2,.,-2,1\n1,4,.,2,.,0,1\n1,5,.,2,.,-0,1\n1,8,10,0,.,1,0\n");
+    assert_eq!(s.cmt_toggles.len(), 1, "{:?}", s.cmt_toggles);
+}
+
+/// NONMEM 7.5.1 stops on each of these (`nonmem_anchor/cmt_toggle_gen.py` for what it
+/// accepts). Each row names its own record, so a shared arm cannot pass for all of them.
+#[test]
+fn a_negative_cmt_off_an_evid2_row_is_refused() {
+    for (row, evid) in [
+        ("1,4,30,0,.,-2,0", 0),
+        ("1,4,.,0,.,-2,1", 0),
+        ("1,4,.,1,50,-2,1", 1),
+        ("1,4,.,3,.,-2,1", 3),
+        ("1,4,.,4,50,-2,1", 4),
+    ] {
+        let f = write_csv(&format!(
+            "{TOGGLE_HEAD}1,0,.,1,100,1,1\n{row}\n1,8,10,0,.,1,0\n"
+        ));
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.starts_with("E_NEGATIVE_CMT"), "{err}");
+        assert!(
+            err.contains(&format!("`CMT=-2` on an `EVID={evid}` record")),
+            "{err}"
+        );
+        assert!(err.contains("only valid on an `EVID=2` row"), "{err}");
+    }
+}
+
+/// An observation before the off row reads the amount and one after it reads zero, so
+/// their order has to survive onto the engines' timeline, where a tie sorts by kind.
+#[test]
+fn an_observation_before_an_off_row_stays_before_it() {
+    let s =
+        toggled("1,0,.,1,100,1,1\n1,4,30,0,.,2,0\n1,4,.,2,.,-2,1\n1,4,.,2,.,2,1\n1,4,0,0,.,2,0\n");
+    let (first, second) = (s.obs_times[0], s.obs_times[1]);
+    let (off, on) = (s.pk_only_times[0], s.pk_only_times[1]);
+    assert!(first < off, "{first} {off}");
+    assert!(off <= on && on <= second, "{off} {on} {second}");
+    assert_eq!(s.obs_raw_times, [4.0, 4.0]);
+}
+
+#[test]
+fn an_off_row_before_a_dose_goes_below_it_and_keeps_the_dose_live() {
+    let s = toggled("1,0,.,1,100,1,1\n1,4,.,2,.,-2,1\n1,4,.,1,20,2,1\n1,6,10,0,.,2,0\n");
+    assert!(s.pk_only_times[0] < 4.0);
+    assert_eq!(s.doses[1].time, 4.0);
+    assert_eq!(s.with_cmt_cutoffs().doses[1].off_at, f64::INFINITY);
+}
+
+#[test]
+fn an_off_row_after_a_dose_goes_above_it_and_stops_the_dose() {
+    let s = toggled("1,0,.,1,100,1,1\n1,4,.,1,20,2,1\n1,4,.,2,.,-2,1\n1,4,5,0,.,1,0\n");
+    assert!(s.pk_only_times[0] > 4.0);
+    assert_eq!(s.doses[1].time, 4.0);
+    assert_eq!(s.with_cmt_cutoffs().doses[1].off_at, s.pk_only_times[0]);
+    // The observation listed after the row stays after it.
+    assert!(s.obs_times[0] >= s.pk_only_times[0]);
+}
+
+#[test]
+fn an_off_row_only_stops_doses_into_its_own_compartment() {
+    let s = toggled("1,0,.,1,100,1,1\n1,1,.,1,50,2,1\n1,3,.,2,.,-2,1\n1,8,10,0,.,1,0\n");
+    let cut = s.with_cmt_cutoffs();
+    assert_eq!(cut.doses[0].off_at, f64::INFINITY);
+    assert_eq!(cut.doses[1].off_at, 3.0);
+}
+
+/// An off row past an implied dose counts from the row that scheduled the train.
+#[test]
+fn an_off_row_stops_the_rest_of_an_addl_train() {
+    let f = write_csv(
+        "ID,TIME,DV,EVID,AMT,CMT,MDV,II,ADDL\n1,0,.,1,10,2,1,2,3\n1,3,.,2,.,-2,1,0,0\n1,9,1,0,.,1,0,0,0\n",
+    );
+    let s = read_nonmem_csv(f.path(), None, None)
+        .unwrap()
+        .subjects
+        .remove(0);
+    let cut = s.with_cmt_cutoffs();
+    let got: Vec<(f64, f64)> = cut.doses.iter().map(|d| (d.time, d.off_at)).collect();
+    assert_eq!(got, [(0.0, 3.0), (2.0, 3.0), (4.0, 3.0), (6.0, 3.0)]);
+}
+
+#[test]
+fn a_toggle_no_timeline_can_place_is_refused() {
+    let between_doses = "1,4,.,1,20,1,1\n1,4,.,2,.,-2,1\n1,4,.,1,20,2,1\n1,8,10,0,.,1,0\n";
+    let f = write_csv(&format!("{TOGGLE_HEAD}1,0,.,1,100,1,1\n{between_doses}"));
+    let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+    assert!(err.starts_with("E_CMT_TOGGLE_TIE"), "{err}");
+    assert!(err.contains("Give the on/off row its own `TIME`"), "{err}");
+    // A reset, the row, then a dose: the row would have to go below the reset.
+    let after_reset = "1,4,.,3,.,1,1\n1,4,.,2,.,-2,1\n1,4,.,1,20,2,1\n1,8,10,0,.,1,0\n";
+    let f = write_csv(&format!("{TOGGLE_HEAD}1,0,.,1,100,1,1\n{after_reset}"));
+    let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+    assert!(err.starts_with("E_CMT_TOGGLE_TIE"), "{err}");
+}
+
+/// A reset row sorts ahead of every co-timed record on the engines, so the file order of an
+/// off row and a reset has to reach them another way: the reset goes past the off row, as a
+/// reset goes past anything recorded before it at its own `TIME`.
+#[test]
+fn an_off_row_and_a_reset_keep_their_file_order() {
+    let off_first = toggled("1,0,.,1,100,1,1\n1,4,.,2,.,-2,1\n1,4,.,3,.,1,1\n1,6,10,0,.,2,0\n");
+    assert!(off_first.pk_only_times[0] < off_first.reset_times[0]);
+    let reset_first = toggled("1,0,.,1,100,1,1\n1,4,.,3,.,1,1\n1,4,.,2,.,-2,1\n1,6,10,0,.,1,0\n");
+    assert_eq!(reset_first.pk_only_times[0], reset_first.reset_times[0]);
 }

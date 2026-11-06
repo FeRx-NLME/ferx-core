@@ -109,6 +109,7 @@ pub(super) fn subject_with_dose_time(id: &str, dose_time: f64, scale: f64) -> Su
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: Vec::new(),
         obs_l2: Vec::new(),

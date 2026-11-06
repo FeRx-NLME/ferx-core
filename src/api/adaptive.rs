@@ -783,6 +783,17 @@ where
     // returns a recoverable `Err` here instead of the engine silently dropping it. (It was a no-op
     // for ODE models before #899 — do not "simplify" this call away as dead code.)
     first_error(&check_dose_compartments(model, population))?;
+    // The adaptive walk has its own timeline, with no compartment on/off record (#2732).
+    if let Some(s) = population.subjects.iter().find(|s| s.has_cmt_toggles()) {
+        return Err(super::entry_refusals::adaptive_unsupported(
+            None,
+            format!(
+                "subject {} turns a compartment off (`EVID=2` with a negative `CMT`), which \
+                 adaptive dosing cannot honour.",
+                s.id
+            ),
+        ));
+    }
     first_error(&check_absorption_closed_form_support_diags(
         model, population,
     ))?;

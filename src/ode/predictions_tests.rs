@@ -52,6 +52,7 @@ fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n_obs],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -16436,7 +16437,7 @@ fn every_raw_observable_reader_names_who_converts_it() {
              and the ODE branch of compute_predictions_with_states (sdtab IPRED, #2259)",
         ),
         (
-            "ode_predictions_event_driven",
+            "event_driven_walk",
             "the pk sink (compute_predictions_with_tv)",
         ),
         (

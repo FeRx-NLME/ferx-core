@@ -34,6 +34,7 @@ pub(super) fn subject(
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
@@ -1813,6 +1814,7 @@ pub(super) fn subject_shell(doses: Vec<DoseEvent>, times: &[f64]) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
@@ -8259,4 +8261,259 @@ fn the_quadrature_mode_hessian_is_the_exact_inner_hessian() {
         worst < 1e-12,
         "mode Hessian vs exact_inner_hessian {worst:.2e}"
     );
+}
+
+// ---- compartment on/off records (#2732) ------------------------------------------------
+
+/// Two compartments with back-transfer, read from `central`: what the off compartment
+/// holds reaches the observations, so a wrong jet across a toggle shows in the gradient.
+const TWO_CPT_TOGGLE_ODE: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVQ(6.0, 0.1, 100.0)
+  theta TVV2(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  Q = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peri])
+[odes]
+  d/dt(central) = -(CL/V) * central - (Q/V) * central + (Q/V2) * peri
+  d/dt(peri) = (Q/V) * central - (Q/V2) * peri
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// `s` with on/off rows at `rows` = `(time, state, on)`, filled in as a caller outside the
+/// crate has to: `DoseEvent::off_at` is left alone, so the walks derive it.
+fn with_toggles(mut s: Subject, rows: &[(f64, usize, bool)]) -> Subject {
+    for (m, &(t, state, on)) in rows.iter().enumerate() {
+        s.pk_only_times.push(t);
+        s.pk_only_raw_times.push(t);
+        s.cmt_toggles.push(crate::types::CmtToggle {
+            pk_only: m,
+            state,
+            on,
+        });
+    }
+    s
+}
+
+fn toggle_model() -> CompiledModel {
+    with_tol(
+        parse_model_string(TWO_CPT_TOGGLE_ODE).unwrap(),
+        1e-12,
+        1e-14,
+    )
+}
+
+/// Measured worst 5.7e-9 on macOS arm64 (the infusion stopped by a toggle), the Richardson
+/// FD noise floor at these tolerances. About 17× headroom.
+const TOGGLE_BOUND: f64 = 1e-7;
+
+const TOGGLE_TIMES: [f64; 8] = [1.0, 2.0, 3.5, 5.0, 6.5, 8.0, 10.0, 14.0];
+
+/// The fixture's toggle must move the prediction, or a parity pass says nothing about it.
+fn assert_toggle_is_live(model: &CompiledModel, with: &Subject, without: &Subject) {
+    let theta = &model.default_params.theta;
+    let eta = vec![0.0; model.n_eta];
+    let a = crate::pk::compute_predictions_with_tv(model, with, theta, &eta);
+    let b = crate::pk::compute_predictions_with_tv(model, without, theta, &eta);
+    let gap = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f64>();
+    assert!(a.iter().all(|x| x.is_finite()), "{a:?}");
+    assert!(gap > 1e-2, "the toggle changes nothing: {a:?}");
+}
+
+#[test]
+fn adjoint_matches_fd_across_a_toggle_with_residual_on_both_sides() {
+    let model = toggle_model();
+    let plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    let s = with_toggles(
+        plain.clone(),
+        &[(3.0, 1, false), (4.5, 1, true), (9.0, 1, false)],
+    );
+    assert_toggle_is_live(&model, &s, &plain);
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+#[test]
+fn adjoint_matches_fd_when_the_main_compartment_is_off() {
+    let model = toggle_model();
+    let plain = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[1.0, 2.0, 5.0, 6.5, 8.0, 10.0],
+        &[0.1, -0.05],
+    );
+    // `central` off from 3 to 4 reads nothing on the observations in that window, so the
+    // observations after it are driven entirely by what `peri` kept.
+    let s = with_toggles(plain.clone(), &[(3.0, 0, false), (4.0, 0, true)]);
+    assert_toggle_is_live(&model, &s, &plain);
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+#[test]
+fn adjoint_matches_fd_for_an_infusion_stopped_by_a_toggle() {
+    let model = toggle_model();
+    let plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 50.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(1.0, 80.0, 2, 10.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    let s = with_toggles(plain.clone(), &[(4.0, 1, false), (6.0, 1, true)]);
+    assert_eq!(
+        s.doses[1].off_at,
+        f64::INFINITY,
+        "derived by the walk, not here"
+    );
+    assert_toggle_is_live(&model, &s, &plain);
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+#[test]
+fn adjoint_matches_fd_for_a_dose_that_turns_its_compartment_on() {
+    let model = toggle_model();
+    let plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(5.5, 60.0, 2, 0.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    let s = with_toggles(plain.clone(), &[(3.0, 1, false)]);
+    assert_toggle_is_live(&model, &s, &plain);
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+#[test]
+fn adjoint_matches_fd_for_a_reset_that_turns_a_compartment_on() {
+    let model = toggle_model();
+    let mut plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    plain.reset_times = vec![5.5];
+    let s = with_toggles(plain.clone(), &[(3.0, 1, false)]);
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+/// A lag on a compartment nothing switches is a moving boundary with a held state beside
+/// it: the walk serves it, and the arrival's saltation has to see the held row.
+#[test]
+fn adjoint_matches_fd_for_a_lagged_arrival_while_another_compartment_is_off() {
+    let src = TWO_CPT_TOGGLE_ODE
+        .replace(
+            "  theta TVV2(40.0, 1.0, 500.0)\n",
+            "  theta TVV2(40.0, 1.0, 500.0)\n  theta TVLAG(0.7, 0.01, 5.0)\n",
+        )
+        .replace("  V2 = TVV2\n", "  V2 = TVV2\n  ALAG1 = TVLAG\n");
+    let model = with_tol(parse_model_string(&src).unwrap(), 1e-12, 1e-14);
+    let plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(4.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    let s = with_toggles(plain.clone(), &[(3.0, 1, false), (6.0, 1, true)]);
+    assert_toggle_is_live(&model, &s, &plain);
+    assert!(in_scope(&model, &s), "the lag is on another compartment");
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+/// The arrival of a lagged dose switches the right-hand side at a moving time, which no
+/// saltation carries, so the subject must route to FD rather than take a wrong gradient.
+#[test]
+fn a_lagged_dose_into_a_switched_compartment_routes_to_fd() {
+    let src = TWO_CPT_TOGGLE_ODE
+        .replace(
+            "  theta TVV2(40.0, 1.0, 500.0)\n",
+            "  theta TVV2(40.0, 1.0, 500.0)\n  theta TVLAG(0.7, 0.01, 5.0)\n",
+        )
+        .replace("  V2 = TVV2\n", "  V2 = TVV2\n  ALAG2 = TVLAG\n");
+    let model = with_tol(parse_model_string(&src).unwrap(), 1e-12, 1e-14);
+    let plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(4.0, 50.0, 2, 0.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    assert!(in_scope(&model, &plain), "without the toggle it is served");
+    let s = with_toggles(plain, &[(3.0, 1, false)]);
+    assert!(!in_scope(&model, &s), "with it, the walk must decline");
+}
+
+/// A toggle is an event only the event-driven walk has, on the value path and the dual
+/// one, so a subject with nothing else to send it there must not take the static walk.
+#[test]
+fn a_toggle_alone_takes_the_event_driven_walk() {
+    let model = toggle_model();
+    let plain = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    let s = with_toggles(plain.clone(), &[(3.0, 1, false)]);
+    use crate::sens::ode_provider::{event_walk_subject_supported, static_walk_subject_supported};
+    assert!(static_walk_subject_supported(&model, &plain));
+    assert!(!event_walk_subject_supported(&model, &plain));
+    assert!(!static_walk_subject_supported(&model, &s));
+    assert!(event_walk_subject_supported(&model, &s));
 }

@@ -37,6 +37,7 @@ fn subject() -> Subject {
         pk_only_covariates: vec![cov(&[("WT", 73.0)])],
         reset_times: vec![30.0],
         reset_covariates: vec![cov(&[("WT", 74.0)])],
+        cmt_toggles: Vec::new(),
         cens: vec![0, 1],
         occasions: vec![1, 2],
         obs_l2: vec![0, 3],

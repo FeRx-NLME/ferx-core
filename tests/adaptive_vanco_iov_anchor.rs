@@ -119,6 +119,7 @@ fn anchor_subject(decision_times: &[f64]) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
         obs_l2: Vec::new(),

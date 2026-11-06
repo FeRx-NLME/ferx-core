@@ -13,6 +13,7 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 
 | Anchors | ferx feature | NONMEM control stream | ferx model |
 |---------|--------------|-----------------------|------------|
+| **Compartment on/off** | `EVID=2`, `CMT=-N` / `CMT=N` on `[odes]` models, one subject per measured case — [#2732](https://github.com/FeRx-NLME/ferx-core/issues/2732) (`ADVAN6 TOL=12`, `MAXEVAL=0`; dataset from `cmt_toggle_gen.py`) | `cmt_toggle.ctl` | `cmt_toggle.ferx`, `tests/cmt_toggle_nonmem_anchor.rs` |
 | **Magnitude expression per endpoint** | `CMT=1: DV ~ additive(S * (1.0 + (TPF - 1.0) * EARLY))` and the same in `if/else` branches — [#2731](https://github.com/FeRx-NLME/ferx-core/issues/2731) (`ADVAN6 TOL=9`, `MAXEVAL=0`, all parameters `FIX`; data simulated by `ruv_endpoint_magnitude_sim.ctl`, `ruv_endpoint_magnitude.csv`) | `ruv_endpoint_magnitude_{cmt,cmt_b,workaround,mixed,shared,ifelse,sim}.ctl` | *(in `tests/ruv_endpoint_magnitude_nonmem_anchor.rs`)* |
 | **Savic transit** | `transit(n, mtt)` — PR [#343](https://github.com/FeRx-NLME/ferx-core/pull/343) | `savic_transit.ctl` | `transit_savic_fit.ferx` |
 | **Freijer & Post IG** | `igd(mat, cv2)` — issue [#347](https://github.com/FeRx-NLME/ferx-core/issues/347) | `freijer_ig.ctl` | *(in `tests/igd_nonmem_anchor.rs`)* |

@@ -807,6 +807,7 @@ fn ode_iov_start_reject_inputs(scale: f64) -> (CompiledModel, Population) {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
