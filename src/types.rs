@@ -1040,8 +1040,10 @@ pub struct Subject {
     /// `(engine time, TIME as written)` of every dose and reset row the reader shifted
     /// onto the monotonic timeline because a reset restarted `TIME` (#1969), ascending
     /// in engine time. Empty for a subject with no such period. Read through
-    /// `Subject::param_time_at`: a dose or reset row is never moved one ULP, so its
-    /// engine time finds its row here exactly. The written time is stored rather than
+    /// `Subject::param_time_at`: a dose row is never moved one ULP, so its engine time
+    /// finds its row here exactly. A reset is moved one ULP only with a trough listed
+    /// after it at a dose tie (#2728); the reader then adds a row for both its moved time
+    /// and the tie, so it and the doses there each find their own. The written time is stored rather than
     /// recomputed as `engine − offset`, which is inexact for most decimal times
     /// (`(0.1 + 73.1) − 73.1` is `0.09999999999999432`).
     pub reset_period_times: Vec<(f64, f64)>,

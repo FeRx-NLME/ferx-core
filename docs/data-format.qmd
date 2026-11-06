@@ -353,9 +353,27 @@ covariates, not the dose row's. In each case the observation reads its own
 covariates in the readout, so only the state at the tie depends on the order.
 Before [#1810](https://github.com/FeRx-NLME/ferx-core/issues/1810) ferx ran that
 interval on the `EVID=2` row in the first case and on the dose row in the second,
-whatever the file said. An `SS=1` dose follows the same rule (#2510). A tie that
-carries a reset is unaffected. Measured against NONMEM 7.6.0 on #1810's seven
-tie cases, on an `[odes]` model and on `ADVAN1`.
+whatever the file said. An `SS=1` dose follows the same rule (#2510). Measured
+against NONMEM 7.6.0 on #1810's seven tie cases, on an `[odes]` model and on
+`ADVAN1`.
+
+A reset (`EVID=3`) at the tie replaces the state there, so the covariate rule
+above does not apply to it, but the trough rule still does. The reset is always
+the first record at its engine `TIME`: anything listed before it at that `TIME`
+starts a new period (see [System Resets](#system-resets-evid3-evid4)). So an
+observation in the tie is listed after the reset and reads the reset state, and
+when a dose follows it, it does not see the dose:
+
+```csv
+ID,TIME,DV,EVID,AMT,MDV
+1,30,.,3,.,1        # reset
+1,30,5.0,0,.,0      # trough: reads the reset state, not the dose
+1,30,.,1,100,1      # dose
+```
+
+Before [#2728](https://github.com/FeRx-NLME/ferx-core/issues/2728) that trough
+was scored on the state from before the reset, and the objective was far off
+NONMEM's with no warning. It now matches NONMEM 7.6.0 (`nonmem_anchor/reset_trough_tie`).
 
 The move is one ULP. These read the `TIME` you wrote, not the moved one: a
 `TIME`-keyed level block's cells, the `(time, occasion)` grouping of `block_sigma`
