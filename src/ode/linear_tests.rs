@@ -1892,3 +1892,37 @@ fn a_spectral_state_that_fails_its_check_falls_back_to_pade() {
     assert_eq!(hits, 0, "an overflowed spectral state must not be returned");
     assert_eq!(on.is_some(), off.is_some());
 }
+
+/// `exprel_derivs`: `g` is the same bits whatever orders are asked for (the `f64` and dual
+/// runs read one value), and the series (`|z| ≤ 2`) meets the closed forms at the switch.
+#[test]
+fn exprel_derivs_is_one_value_and_continuous_at_its_switch() {
+    for z in [-1.7, -0.3, 0.0, 1e-9, 0.8, 1.99] {
+        let g0 = exprel_derivs(z, 0)[0];
+        for orders in 1..=4 {
+            assert_eq!(
+                exprel_derivs(z, orders)[0].to_bits(),
+                g0.to_bits(),
+                "z = {z}"
+            );
+        }
+    }
+    for z in [-2.0, 2.0] {
+        let below = exprel_derivs(z * (1.0 - 1e-12), 4);
+        let above = exprel_derivs(z * (1.0 + 1e-12), 4);
+        for m in 0..5 {
+            let (a, b) = (below[m], above[m]);
+            assert!(a.is_finite() && b.is_finite());
+            // Measured ≤ 1.1e-13 (g⁗'s closed form, ~2 digits lost); 1e-11 bounds it.
+            assert!(
+                (a - b).abs() <= 1e-11 * b.abs(),
+                "z = {z}, order {m}: {a} vs {b}"
+            );
+        }
+    }
+    // g(0) = 1, g′(0) = 1/2, …, g⁽ᵐ⁾(0) = 1/(m + 1).
+    let at0 = exprel_derivs(0.0, 4);
+    for (m, v) in at0.iter().enumerate() {
+        assert_eq!(*v, 1.0 / (m as f64 + 1.0));
+    }
+}

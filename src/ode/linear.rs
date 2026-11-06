@@ -882,35 +882,58 @@ fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64]) -> Option<Spectral<T>>
     Some(Spectral { lambda, proj })
 }
 
-/// `g(z) = (e^z − 1)/z` and its first four derivatives, so `φ(λ, Δ) = Δ·g(λΔ)` is lifted
-/// exactly through every jet order the number types carry ([`PkNum::lift4`]). Near `z = 0`
-/// the closed forms cancel (`g⁗` loses ~7 digits at `z = 0.1`), so `|z| ≤ 2` sums the series
-/// `g⁽ᵐ⁾(z) = Σ_{k≥m} z^{k−m}·k!/((k−m)!·(k+1)!)`; past it the closed forms lose at most ~2.
-fn exprel_derivs(z: f64) -> [f64; 5] {
+/// `1/j` for `j < 48`, so the series below divides by no runtime value.
+const RECIP: [f64; 48] = {
+    let mut r = [0.0; 48];
+    let mut j = 1;
+    while j < 48 {
+        r[j] = 1.0 / j as f64;
+        j += 1;
+    }
+    r
+};
+
+/// `g(z) = (e^z − 1)/z` and its derivatives up to `orders` (≤ 4), the rest left 0, so
+/// `φ(λ, Δ) = Δ·g(λΔ)` is lifted exactly through the jet orders a number type carries
+/// ([`PkNum::lift4`]). Near `z = 0` the closed forms cancel (`g⁗` loses ~7 digits at `z = 0.1`),
+/// so `|z| ≤ 2` sums `g⁽ᵐ⁾(z) = Σ_k (zᵏ/k!)/(k + m + 1)` in one pass over `k`; past it the
+/// closed forms lose at most ~2. Each order accumulates on its own, so `g` is the same bits
+/// whatever `orders` asks for: the `f64` run and a dual run read one value.
+fn exprel_derivs(z: f64, orders: usize) -> [f64; 5] {
     let mut out = [0.0; 5];
+    let top = orders.min(4);
     if z.abs() <= 2.0 {
-        for (m, o) in out.iter_mut().enumerate() {
-            // term at k = m: m!/(m+1)! = 1/(m+1)
-            let mut term = 1.0 / (m as f64 + 1.0);
-            let mut sum = term;
-            for k in m..m + 60 {
-                term *= z * (k as f64 + 1.0) / ((k + 1 - m) as f64 * (k as f64 + 2.0));
-                sum += term;
-                if term.abs() <= 1e-18 * sum.abs() {
-                    break;
-                }
+        let mut p = 1.0; // zᵏ/k!
+        let mut k = 0;
+        loop {
+            for (m, o) in out.iter_mut().enumerate().take(top + 1) {
+                *o += p * RECIP[k + m + 1];
             }
-            *o = sum;
+            k += 1;
+            p *= z * RECIP[k];
+            // |z| ≤ 2: the next terms sum below 2·|p|, under an ulp of every order's value
+            // (each is at least g⁽ᵐ⁾(−2) > 0.04).
+            if p.abs() < 1e-19 || k + top + 1 >= RECIP.len() {
+                break;
+            }
         }
         return out;
     }
     let e = z.exp();
     let (z2, z3, z4) = (z * z, z * z * z, z * z * z * z);
     out[0] = z.exp_m1() / z;
-    out[1] = (e * (z - 1.0) + 1.0) / z2;
-    out[2] = (e * (z2 - 2.0 * z + 2.0) - 2.0) / z3;
-    out[3] = (e * (z3 - 3.0 * z2 + 6.0 * z - 6.0) + 6.0) / z4;
-    out[4] = (e * (z4 - 4.0 * z3 + 12.0 * z2 - 24.0 * z + 24.0) - 24.0) / (z4 * z);
+    if top >= 1 {
+        out[1] = (e * (z - 1.0) + 1.0) / z2;
+    }
+    if top >= 2 {
+        out[2] = (e * (z2 - 2.0 * z + 2.0) - 2.0) / z3;
+    }
+    if top >= 3 {
+        out[3] = (e * (z3 - 3.0 * z2 + 6.0 * z - 6.0) + 6.0) / z4;
+    }
+    if top >= 4 {
+        out[4] = (e * (z4 - 4.0 * z3 + 12.0 * z2 - 24.0 * z + 24.0) - 24.0) / (z4 * z);
+    }
     out
 }
 
@@ -1066,6 +1089,15 @@ fn segment_in<T: PkNum>(
     // state then passes the same reproduction check as Padé's.
     if spectral_enabled() {
         if let Some(sp) = spectral(a, n) {
+            // The derivative orders `φ` needs: none on a constant generator; else the type's
+            // (every type in the crate carries at most 4; one that reports none gets all).
+            let jet_orders = if a.iter().all(|v| v.is_constant()) {
+                0
+            } else if T::JET_ORDER == 0 {
+                4
+            } else {
+                T::JET_ORDER
+            };
             // `P_i b`, once per segment.
             let mut pb = vec![zero; n * n];
             for k in 0..n {
@@ -1101,7 +1133,7 @@ fn segment_in<T: PkNum>(
                         let z = lam * dt_t;
                         let e = z.exp();
                         // φ(λ, Δ) = (e^{λΔ} − 1)/λ = Δ·g(λΔ), lifted exactly ([`exprel_derivs`]).
-                        let [g0, g1, g2, g3, g4] = exprel_derivs(z.val());
+                        let [g0, g1, g2, g3, g4] = exprel_derivs(z.val(), jet_orders);
                         let phi = dt_t * z.lift4(g0, g1, g2, g3, g4);
                         let pk = &sp.proj[k * n * n..(k + 1) * n * n];
                         for r in 0..n {
