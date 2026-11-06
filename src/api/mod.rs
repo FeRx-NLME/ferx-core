@@ -548,6 +548,11 @@ mod adaptive_moved_reset_tests;
 #[path = "tests/adaptive_written_time_tests.rs"]
 mod adaptive_written_time_tests;
 
+// #2741: the controller assay applies the residual-error magnitude.
+#[cfg(test)]
+#[path = "tests/adaptive_assay_magnitude_tests.rs"]
+mod adaptive_assay_magnitude_tests;
+
 // #2156: FREM covariate rows on the adaptive path.
 #[cfg(test)]
 #[path = "tests/adaptive_frem_tests.rs"]

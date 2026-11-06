@@ -778,15 +778,41 @@ pub(crate) fn kappa_standard_normal(base_seed: u64, occasion: usize, component: 
 /// folded with the subject's `ruv_scale`) and the per-(subject, replicate) base
 /// seed that keys the controller-assay substream.
 ///
-/// `resid_var(cmt, ipred)` returns `Some(variance)` for a compartment that has a
-/// residual error model and `None` when none is defined — the driver turns the
-/// `None` into a typed error rather than fabricating a σ (S1.5 edge a).
+/// `resid_var(row)` returns `Ok(Some(variance))` for a compartment that has a
+/// residual error model and `Ok(None)` when none is defined — the driver turns the
+/// `None` into a typed error rather than fabricating a σ (S1.5 edge a). `Err` is a
+/// residual-error magnitude that is not positive and finite at the decision (#2741),
+/// worded for the user; the driver adds the decision and the monitor.
 pub(crate) struct AssayNoise<'a> {
-    /// `(cmt, ipred) -> Some(residual variance incl. ruv_scale)`, or `None` when
-    /// no residual error model covers `cmt`.
-    pub resid_var: &'a dyn Fn(usize, f64) -> Option<f64>,
+    /// `row -> Ok(Some(residual variance incl. ruv_scale and any magnitude))`,
+    /// `Ok(None)` when no residual error model covers `row.cmt`, `Err` on a
+    /// magnitude that is not positive and finite.
+    pub resid_var: &'a dyn Fn(&AssayRow) -> Result<Option<f64>, String>,
+    /// Whether the variance reads `TAD` (an `[error_model]` magnitude that names it).
+    /// The driver computes [`AssayRow::tad`] only then, as `tad_for` does for a data row.
+    pub needs_tad: bool,
     /// Per-(subject, replicate) base seed; see [`subject_assay_base_seed`].
     pub base_seed: u64,
+}
+
+/// One `Dv` reading as the assay's residual variance sees it (#2741): what
+/// `simulate()` reads from an observation row, read at a decision instead. A
+/// residual-error magnitude is a function of `(θ, covariates, TIME, TAD)`, so this
+/// is all it needs; θ is the resolver's own.
+pub(crate) struct AssayRow<'a> {
+    /// The monitored compartment: the endpoint key of a `CMT=N:` block.
+    pub cmt: usize,
+    /// The latent reading the noise is drawn around.
+    pub ipred: f64,
+    /// The `TIME` as written at the decision (`Subject::param_time_at`), the same
+    /// value the monitor's readout reads.
+    pub time: f64,
+    /// Time after dose at the decision on the causal record: the base regimen plus
+    /// the controller doses realized before the reading. `0.0` when
+    /// [`AssayNoise::needs_tad`] is false.
+    pub tad: f64,
+    /// The covariate row in force at the decision.
+    pub cov: &'a HashMap<String, f64>,
 }
 
 // ── Declarative `[adaptive_dosing]` block (#391 S2) ─────────────────────────
