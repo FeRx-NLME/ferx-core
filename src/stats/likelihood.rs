@@ -5606,16 +5606,24 @@ mod tests {
     /// bit-for-bit as the near one.
     #[test]
     fn a_censored_limit_past_the_normal_cdf_overflow_scores_as_certain() {
-        // Straddle: for any row sd from the variance floor's √1e-12 to 1e3, the near limit
-        // keeps |z| ≤ 1e12 (ungated) and the far one |z| ≥ 1e297 (gated).
-        let gate = 1.9e154;
-        for sd in [1e-6, 1e3] {
-            assert!(1e6 / sd < gate && (1e300 - 1e3) / sd > gate, "sd {sd}");
-        }
         let theta = [5.0, 50.0];
         let eta = [0.1];
         let omega = make_omega(0.09);
         let sigma = [0.2];
+        // Straddle, on the fixture row's own z (review r1 #7): the near limit stays below
+        // the gate (`(z/√2)²` finite) and the far one reaches it (`(z/√2)²` overflows).
+        {
+            let model = make_model();
+            let subject = make_simple_subject();
+            let f = model_predictions(&model, &subject, &theta, &eta)[5];
+            let key = model.error_spec.obs_key(&subject, 5);
+            let sd = model.error_spec.variance_at(key, f, &sigma).sqrt();
+            let sq = |limit: f64| ((limit - f) / sd / std::f64::consts::SQRT_2).powi(2);
+            for (far, near) in [(1e300, 1e6), (-1e300, -1e6)] {
+                assert!(sq(near).is_finite(), "near {near:e}: f {f}, sd {sd}");
+                assert_eq!(sq(far), f64::INFINITY, "far {far:e}: f {f}, sd {sd}");
+            }
+        }
         let setup = |limit: f64, flag: i8| {
             let mut model = make_model();
             model.bloq_method = BloqMethod::M3;
