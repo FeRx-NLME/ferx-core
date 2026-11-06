@@ -157,55 +157,6 @@ impl OdeAutoSwitchState {
 /// I-controller's growth branch, which would otherwise enlarge the step on a NaN error.
 const NONFINITE_ERR_SHRINK_FACTOR: f64 = 0.2;
 
-/// The error norms past which the I-controller's factor `0.9·err^(−1/q)` is certain to be
-/// clamped, for one exponent `1/q`: below `lo` it is ≥ 5, above `hi` it is ≤ 0.2. A step whose
-/// error lies outside them skips its `powf` (a measured 6.8% of a Michaelis–Menten FOCEI fit's
-/// instructions, #2706 follow-up). Computed once per thread and exponent — a method has one —
-/// not once per integration: a per-call pair of `powf`s cost more than a short segment saved.
-#[derive(Clone, Copy)]
-struct ControllerBounds {
-    exp_bits: u64,
-    lo: f64,
-    hi: f64,
-}
-
-thread_local! {
-    static CONTROLLER_BOUNDS: std::cell::Cell<ControllerBounds> =
-        const { std::cell::Cell::new(ControllerBounds { exp_bits: 0, lo: 0.0, hi: 0.0 }) };
-}
-
-/// `0.9·err^(−err_exp)` as the controllers have always computed it, or the clamp value it is
-/// certain to clamp to. A relative margin of 1e-12 on each bound keeps every factor the
-/// `clamp(0.2, 5.0)` after it can tell apart computed by `powf`, so the step sequence is
-/// bit-identical: `powf` is correct to an ulp, far inside the margin.
-#[inline]
-fn controller_factor(err_norm: f64, err_exp: f64) -> f64 {
-    const SAFETY: f64 = 0.9;
-    if !err_norm.is_finite() {
-        return NONFINITE_ERR_SHRINK_FACTOR;
-    }
-    if !(err_norm > 1e-15) {
-        return 5.0;
-    }
-    let mut b = CONTROLLER_BOUNDS.with(|c| c.get());
-    if b.exp_bits != err_exp.to_bits() || b.hi == 0.0 {
-        let inv = 1.0 / err_exp;
-        b = ControllerBounds {
-            exp_bits: err_exp.to_bits(),
-            lo: (SAFETY / 5.0).powf(inv) * (1.0 - 1e-12),
-            hi: (SAFETY / 0.2).powf(inv) * (1.0 + 1e-12),
-        };
-        CONTROLLER_BOUNDS.with(|c| c.set(b));
-    }
-    if err_norm < b.lo {
-        5.0
-    } else if err_norm > b.hi {
-        0.2
-    } else {
-        SAFETY * err_norm.powf(-err_exp)
-    }
-}
-
 /// ODE right-hand side function type.
 /// `rhs(u, params, t) -> du/dt`  where u and du are `&[f64]` of length n_states.
 pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
@@ -1600,13 +1551,7 @@ fn integrate_dense_g<T: PkNum>(
         }
 
         if accepted {
-            // Read only by the stage detector below, so computed only where it can run: the
-            // estimate is pure, and skipping it changes nothing else.
-            let stiffness_indicator = if switching && method == OdeMethod::EXPLICIT_FALLBACK {
-                stepper.stiffness_indicator(dt_eff)
-            } else {
-                None
-            };
+            let stiffness_indicator = stepper.stiffness_indicator(dt_eff);
             // Soft sampling: read every `interp_at` time in this just-accepted step's
             // half-open span `(t, t+dt_eff]` off the method's continuous extension, *before*
             // `u` advances and the stepper recycles its stages. This only reads committed
@@ -1738,7 +1683,14 @@ fn integrate_dense_g<T: PkNum>(
         // On reject: (u, t) is unchanged, so the stepper's carried state stays valid.
 
         // Adapt the step (memoryless I-controller — see the note above).
-        let factor = controller_factor(err_norm, err_exp);
+        let safety = 0.9;
+        let factor = if !err_norm.is_finite() {
+            NONFINITE_ERR_SHRINK_FACTOR
+        } else if err_norm > 1e-15 {
+            safety * err_norm.powf(-err_exp)
+        } else {
+            5.0
+        };
         dt = dt_eff * factor.clamp(0.2, 5.0);
         dt = dt.max(opts.min_dt);
     }
@@ -2275,11 +2227,18 @@ fn until_threshold_with(
             );
         }
 
+        let safety = 0.9;
         // Finite-error branch is identical to the dense driver; a *non-finite* err_norm
         // (diverging / NaN RHS, or an unusable attempt) shrinks toward `min_dt` instead of
         // growing, so the step is force-accepted at `min_dt` and the non-finite guard above
         // fires with a clear cause rather than silently burning the step budget.
-        let factor = controller_factor(err_norm, err_exp);
+        let factor = if !err_norm.is_finite() {
+            NONFINITE_ERR_SHRINK_FACTOR
+        } else if err_norm > 1e-15 {
+            safety * err_norm.powf(-err_exp)
+        } else {
+            5.0
+        };
         dt = (dt_eff * factor.clamp(0.2, 5.0)).max(opts.min_dt);
     }
 
