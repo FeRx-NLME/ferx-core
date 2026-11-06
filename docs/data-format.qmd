@@ -670,11 +670,20 @@ as supplied, and `predict()` and `simulate()` keep every dose.
 An occasion that only trailing rows carry keeps its `kappa` block, so the layout
 of the fitted occasions does not change.
 
-The objective and the EBEs at any given parameters do not change. On a closed-form
-or constant-parameter ODE fit the estimates do not change either. With time-varying
-covariates or IOV, the outer gradient can round differently, by up to 3e-15 relative
-on the test fixtures, so estimates can differ from a fit of every record in the last
-few digits. A fit of the same data with those rows deleted matches exactly.
+A fit matches the same data with those rows deleted exactly, unless an occasion
+only trailing rows carry keeps its block. Against scoring every record, as earlier
+versions did:
+
+- Closed-form and constant-parameter ODE fits do not change.
+- With time-varying covariates or IOV, the objective and the EBEs at any given
+  parameters do not change, but the outer gradient can round differently, by up to
+  3e-15 relative on the test fixtures. Estimates can then differ in the last few
+  digits.
+- A subject whose route depended on the removed rows takes the route of the data
+  without them, for example when a covariate the model reads varied only there. On
+  an integrated ODE the two routes differ within solver tolerance: 1.7e-6 on the test
+  fixture at the default `reltol = 1e-4`, moving the objective from 153.89223 to
+  153.89225.
 
 ## Column Name Case
 

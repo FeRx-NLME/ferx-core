@@ -16,6 +16,8 @@
 //! Cutting here rather than stopping each walk at the horizon leaves the engines alone: a
 //! subject on the view takes the route the same data with those rows deleted would, so one
 //! tail record of an unsupported kind no longer sends the subject to finite differences.
+//! That route change is the one way the view moves a result by more than rounding: two routes
+//! break an integrated walk at different records, so they agree only to solver tolerance.
 
 use std::borrow::Cow;
 

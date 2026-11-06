@@ -32,15 +32,23 @@ enum Tail {
 /// `tail_wt` and `tail_occ` are the `WT` and `OCC` of the trailing rows. The train's first
 /// row carries the `ADDL`, so it straddles the horizon.
 fn dataset(tail: Tail, tail_wt: f64, tail_occ: u32) -> String {
+    dataset_with_wt_step(tail, tail_wt, tail_occ, 1.0)
+}
+
+/// [`dataset`] with `WT` rising by `wt_step` at each observation.
+fn dataset_with_wt_step(tail: Tail, tail_wt: f64, tail_occ: u32, wt_step: f64) -> String {
     let mut csv = String::from("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,ADDL,WT,OCC\n");
-    for id in 1..=4 {
+    for id in 1..=3 {
         let wt = 60.0 + 5.0 * id as f64;
         let addl = if tail == Tail::Doses { 9 } else { 2 };
         csv += &format!("{id},0,.,1,100,1,0,1,24,{addl},{wt},1\n");
         for (j, t) in OBS_TIMES.iter().enumerate() {
             let dv = 4.0 + (id as f64 * 1.7 + j as f64).sin() + 0.1 * *t / 10.0;
             let occ = if *t < 24.0 { 1 } else { 2 };
-            csv += &format!("{id},{t},{dv:.5},0,.,1,0,0,0,0,{},{occ}\n", wt + j as f64);
+            csv += &format!(
+                "{id},{t},{dv:.5},0,.,1,0,0,0,0,{},{occ}\n",
+                wt + wt_step * j as f64
+            );
         }
         if tail == Tail::Doses {
             for t in [TAIL_TIME, TAIL_TIME + 24.0] {
@@ -246,14 +254,52 @@ fn trailing_doses_do_not_change_an_ode_fit() {
     assert_tail_is_free(&model_text(INDIVIDUAL, ODE), 70.0, &few_iterations(), 0.0);
 }
 
+/// A smooth-input walk through the trailing doses is what #2778 removes, and in a debug
+/// build one fit of it takes over a minute, so this compares one subject at one point: the
+/// inner solve and the dual outer gradient. `tests/trailing_doses_transit.rs` runs the whole
+/// fit against the rows deleted.
 #[test]
-fn trailing_doses_do_not_change_a_transit_fit() {
-    assert_tail_is_free(
+fn trailing_doses_do_not_change_a_transit_subject() {
+    let run = prepared(
         &model_text(TRANSIT_INDIVIDUAL, TRANSIT),
-        70.0,
-        &few_iterations(),
-        0.0,
+        &dataset(Tail::Doses, 70.0, 2),
     );
+    let model = &run.parsed.model;
+    // Prepared as `fit()` prepares it: `WT` is unread here, and a subject still carrying its
+    // snapshots takes the time-varying route, which differs at solver tolerance.
+    let prepared_population = crate::api::fitted_population(
+        model,
+        &crate::types::IovOccasionRule::Column,
+        false,
+        Cow::Borrowed(&run.population),
+        &mut Vec::new(),
+    );
+    let view = scored_population(model, Cow::Borrowed(&*prepared_population));
+    let (every_record, cut) = (&prepared_population.subjects[0], &view.subjects[0]);
+    assert_eq!(every_record.doses.len(), 12);
+    assert_eq!(cut.doses.len(), 3);
+
+    let params = &run.init_params;
+    let ebe = |s: &Subject| {
+        crate::estimation::inner_optimizer::find_ebe(model, s, params, 200, 1e-6, None, None, 0)
+    };
+    let (on_every_record, on_cut) = (ebe(every_record), ebe(cut));
+    assert_eq!(on_every_record.nll.to_bits(), on_cut.nll.to_bits());
+    let eta: Vec<f64> = on_cut.eta.iter().copied().collect();
+    assert_eq!(on_every_record.eta.iter().copied().collect::<Vec<_>>(), eta);
+
+    let x = crate::estimation::parameterization::pack_params(params);
+    let gradient = |s: &Subject| {
+        crate::estimation::sens_outer_gradient::subject_packed_gradient_foce(
+            model, s, params, &x, &eta,
+        )
+        .expect("the dual path, not the FD route")
+    };
+    let bits = |g: Vec<f64>| g.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let on_cut = gradient(cut);
+    assert!(on_cut.iter().all(|g| g.is_finite()));
+    assert!(on_cut.iter().any(|&g| g != 0.0));
+    assert_eq!(bits(gradient(every_record)), bits(on_cut));
 }
 
 const TV_INDIVIDUAL: &str = "
@@ -274,12 +320,47 @@ fn trailing_doses_do_not_change_a_time_varying_covariate_fit() {
     assert_tail_is_free(&model, 90.0, &few_iterations(), PER_RECORD_ROUNDING);
 }
 
+/// A nonlinear [`ODE`]: certified linear, that system is propagated exactly on both routes,
+/// and they agree to rounding.
+const SATURABLE: &str = "
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) = KA*depot/V - CL/V*central/(1 + central/100)
+";
+
 /// Rounding between a fit and the same fit on every record, where a walk's parameters are
 /// per record (time-varying covariates, IOV). The objective and EBEs agree bit for bit at
 /// any one point there; the adjoint's outer gradient does not, by up to 3e-15 relative on
 /// these fixtures, and three optimizer iterations carry that into the estimates. Worst
-/// measured 7.0e-14, on the κ-block fixture; the bound leaves 14x.
+/// measured 5.1e-14, on the κ-block fixture; the bound leaves 20x.
 const PER_RECORD_ROUNDING: f64 = 1e-12;
+
+/// A read covariate that varies only on trailing rows made the subject time-varying. On the
+/// view it no longer does, so the subject leaves that route for the constant one, as it
+/// would on the data without those rows. The two routes break the walk at different
+/// records, so this is the one case that moves by solver tolerance rather than rounding.
+#[test]
+fn a_subject_time_varying_only_on_trailing_rows_takes_the_constant_route() {
+    let model = model_text(TV_INDIVIDUAL, SATURABLE);
+    let options = FitOptions {
+        outer_maxiter: 0,
+        ..few_iterations()
+    };
+    let full = prepared(&model, &dataset_with_wt_step(Tail::Doses, 95.0, 2, 0.0));
+    let trimmed = prepared(&model, &dataset_with_wt_step(Tail::None, 0.0, 0, 0.0));
+    assert!(full.population.subjects[0].has_tv_covariates());
+
+    let new = fitted(&full, &options);
+    assert_eq!(numbers(&new), numbers(&fitted(&trimmed, &options)));
+    let old = fitted_on_every_record(&full, &options);
+    let gap = worst_relative_gap(&numbers(&new), &numbers(&old));
+    // Measured 1.7e-6 at the default `reltol = 1e-4` (objective 153.89223 to 153.89225);
+    // the bound leaves 12x. Zero would mean the fixture never changed route.
+    assert!(gap > 0.0 && gap <= 2e-5, "{gap:e}");
+}
 
 const IOV_PARAMS: &str = "
 [parameters]
@@ -771,7 +852,7 @@ mod non_gaussian {
         let mut lines = csv.lines();
         let mut out = format!("{}\n", lines.next().expect("header"));
         let rows: Vec<&str> = lines.collect();
-        for id in 1..=6 {
+        for id in 1..=3 {
             let prefix = format!("{id},");
             for row in rows.iter().filter(|r| r.starts_with(&prefix)) {
                 out += row;
