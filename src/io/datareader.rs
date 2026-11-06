@@ -3720,6 +3720,8 @@ fn parse_subject(
     // `ImpliedDose::gov_time` is re-read from it once they have run (#2371).
     let mut gov_by_obs: Vec<(usize, usize)> = Vec::new();
     let mut gov_by_pk_only: Vec<(usize, usize)> = Vec::new();
+    // ... and by a reset, which the #614 pass may move one ULP with a trough (#2728).
+    let mut gov_by_reset: Vec<(usize, usize)> = Vec::new();
     if sorted_implied.contains(&true) {
         #[derive(Clone, Copy)]
         enum Rec {
@@ -3775,7 +3777,8 @@ fn parse_subject(
             match rec {
                 Rec::Obs(j) => gov_by_obs.push((k, j)),
                 Rec::PkOnly(m) => gov_by_pk_only.push((k, m)),
-                Rec::Dose(_) | Rec::Reset(_) => {}
+                Rec::Reset(r) => gov_by_reset.push((k, r)),
+                Rec::Dose(_) => {}
             }
             if any_tv {
                 sorted_dose_cov[k] = match rec {
@@ -3924,6 +3927,16 @@ fn parse_subject(
     // nothing before its own record (`docs/model-file/steady-state.qmd`), so one ULP
     // below the dose is exactly that carried state. Until #2510 SS doses were excluded,
     // and such an observation read the post-dose steady state.
+    //
+    // A reset at the tie moves with the observation (#2728). The reader shifts a reset
+    // past every record before it (`time_offset` above), so a reset at the tie is always
+    // its first record, and an observation there was listed after it: NONMEM scores it on
+    // the reset state. Moved alone, one ULP below the tie, it would sit below the reset
+    // too and read the state from before it (on #2728's fixture, OFV 1007 against
+    // NONMEM's 38.8). Moving the reset to the same ULP keeps it first there, since the
+    // engines order a reset ahead of an observation at one time (`kind_order`). The reset
+    // keeps the `TIME` it was written at for its `$PK` (`reset_period_times`, below).
+    let mut moved_reset_ties: Vec<f64> = Vec::new();
     for j in 0..obs_times.len() {
         let t = obs_times[j];
         let mut later = false;
@@ -3939,13 +3952,30 @@ fn parse_subject(
         }
         if later && !earlier {
             obs_times[j] = t.next_down();
+            if reset_times.contains(&t) && !moved_reset_ties.contains(&t) {
+                moved_reset_ties.push(t);
+            }
         }
+    }
+    // The engine time moves and the written time does not, so both the reset's new engine
+    // time and the tie's (where the doses stay) need a row in `reset_period_times`:
+    // without the second, `period_written_time` would read a dose at the tie through the
+    // reset's one-ULP offset, one ULP late.
+    for t in moved_reset_ties {
+        let written = crate::types::period_written_time(&reset_period_times, t);
+        for r in reset_times.iter_mut().filter(|r| **r == t) {
+            *r = t.next_down();
+        }
+        reset_period_times.push((t.next_down(), written));
+        reset_period_times.push((t, written));
+        reset_period_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+        reset_period_times.dedup();
     }
 
     // The engine time an implied dose's occasion is read at is its governing record's as
     // the subject holds it (#2371): after the two passes above, which move times in place,
     // so the indices recorded by the #1909 pass still name the same records. Doses are
-    // never moved, and resets are not moved here.
+    // never moved; a reset moves only with a trough at its tie (#2728).
     for (k, j) in gov_by_obs {
         if let Some(i) = sorted_doses[k].implied.as_mut() {
             i.gov_time = obs_times[j];
@@ -3954,6 +3984,11 @@ fn parse_subject(
     for (k, m) in gov_by_pk_only {
         if let Some(i) = sorted_doses[k].implied.as_mut() {
             i.gov_time = pk_only_times[m];
+        }
+    }
+    for (k, r) in gov_by_reset {
+        if let Some(i) = sorted_doses[k].implied.as_mut() {
+            i.gov_time = reset_times[r];
         }
     }
 

@@ -1360,14 +1360,7 @@ fn population_params(
     let ruv_mult = match model.ruv_magnitude.as_ref().filter(|rm| rm.is_active()) {
         Some(rm) => Some(
             (0..subject.observations.len())
-                .map(|j| {
-                    rm.eval_obs_g(
-                        theta,
-                        subject.obs_cov(j),
-                        subject.readout_time(j),
-                        rm.tad_for(subject, j),
-                    )
-                })
+                .map(|j| rm.eval_subject_obs_g(&model.error_spec, subject, j, theta))
                 .collect::<Option<Vec<_>>>()?,
         ),
         None => None,

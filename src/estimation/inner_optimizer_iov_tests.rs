@@ -6121,6 +6121,7 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             tol,
             start,
             None,
+            0,
             EbeVariance::Conditional,
             false,
             InnerHessianSeed::None,
@@ -6580,4 +6581,314 @@ fn a_nelder_mead_fit_reports_the_moved_subjects() {
         (0, 0),
         "optimizer = bfgs does not count"
     );
+}
+
+// ── Guarded multi-start on the flat vector `[ψ, κ_1, …, κ_K]` (#2730) ─────────────────────
+
+/// The anchor's model and one of its subjects (`nonmem_anchor/iov_kappa_two_mode*`), scored
+/// at the parameters the twin declares. Subject 1's second occasion has a shallow mode at
+/// κ₂ ≈ +0.49, where a descent from κ = 0 ends, and a deep one at κ₂ ≈ −2.20.
+fn two_mode_fixture(csv: &str, id: &str) -> (CompiledModel, Subject) {
+    let src = include_str!("../../nonmem_anchor/iov_kappa_two_mode.ferx");
+    let model = crate::parser::model_parser::parse_model_string(src).expect("anchor model");
+    let path = format!("nonmem_anchor/{csv}");
+    let pop =
+        crate::io::datareader::read_nonmem_csv(std::path::Path::new(&path), None, Some("OCC"))
+            .expect("anchor data");
+    let subject = pop
+        .subjects
+        .into_iter()
+        .find(|s| s.id == id)
+        .expect("subject");
+    (model, subject)
+}
+
+const TWO_MODE_RESET: &str = "iov_kappa_two_mode.csv";
+const TWO_MODE_NO_RESET: &str = "iov_kappa_two_mode_noreset.csv";
+
+/// A cold solve of `subject` with `restarts`, under the stage defaults.
+fn cold_iov_solve(
+    model: &CompiledModel,
+    subject: &Subject,
+    restarts: usize,
+    tol: f64,
+    mu: Option<&[f64]>,
+) -> EbeResult {
+    find_ebe_for_stage(
+        model,
+        subject,
+        &model.default_params,
+        500,
+        tol,
+        None,
+        mu,
+        restarts,
+        &crate::types::FitOptions::default(),
+    )
+}
+
+/// The issue's case: on a reset subject `inner_restarts` used to do nothing, so the solve
+/// stayed in the mode a descent from κ = 0 reaches. Restarts off is the straddle: the same
+/// call without them must still end in the shallow mode, or this fixture proves nothing.
+#[test]
+fn iov_multistart_reaches_the_deep_kappa_mode_of_a_reset_subject() {
+    let (model, subject) = two_mode_fixture(TWO_MODE_RESET, "1");
+    assert!(
+        subject.has_resets(),
+        "family 1: every coordinate is scanned"
+    );
+    let off = cold_iov_solve(&model, &subject, 0, 1e-6, None);
+    let on = cold_iov_solve(&model, &subject, 1, 1e-6, None);
+    assert!(off.kappas[1][0] > 0.0, "shallow mode: {:?}", off.kappas);
+    assert!(
+        (on.kappas[1][0] + 2.2).abs() < 0.01,
+        "deep mode: {:?}",
+        on.kappas
+    );
+    assert!(on.nll + 1.0 < off.nll, "{} vs {}", on.nll, off.nll);
+    assert!(on.converged, "the deep mode's descent converged");
+    assert!(!on.used_fallback);
+}
+
+/// A family-2 subject: the same mode with no reset. κ₂ is sharp at the incumbent, so the
+/// flatness probe alone passes it over; only the barrier on the way to its seed scans it.
+#[test]
+fn iov_multistart_scans_a_sharp_kappa_behind_a_barrier() {
+    let (model, subject) = two_mode_fixture(TWO_MODE_NO_RESET, "1");
+    assert!(!subject.has_resets() && !subject.has_tv_covariates());
+    let off = cold_iov_solve(&model, &subject, 0, 1e-6, None);
+    let on = cold_iov_solve(&model, &subject, 1, 1e-6, None);
+    assert!(off.kappas[1][0] > 0.0, "shallow mode: {:?}", off.kappas);
+    assert!(
+        (on.kappas[1][0] + 2.2).abs() < 0.01,
+        "deep mode: {:?}",
+        on.kappas
+    );
+}
+
+/// A genuine warm start is never re-scanned: the outer loop carries the chosen mode on, and
+/// the scan on every outer evaluation is what the cold gate exists to prevent.
+#[test]
+fn iov_multistart_runs_on_cold_solves_only() {
+    let (model, subject) = two_mode_fixture(TWO_MODE_RESET, "1");
+    let shallow = cold_iov_solve(&model, &subject, 0, 1e-6, None);
+    let mut warm: Vec<f64> = shallow.eta.iter().copied().collect();
+    warm.extend(shallow.kappas.iter().flat_map(|k| k.iter().copied()));
+    let started = || EBE_MULTISTARTS_STARTED.with(|n| n.get());
+    let before = started();
+    let r = find_ebe_for_stage(
+        &model,
+        &subject,
+        &model.default_params,
+        500,
+        1e-6,
+        Some(&warm),
+        None,
+        4,
+        &crate::types::FitOptions::default(),
+    );
+    assert_eq!(started(), before, "a warm solve starts no multi-start");
+    assert!(r.kappas[1][0] > 0.0, "and stays put: {:?}", r.kappas);
+    cold_iov_solve(&model, &subject, 1, 1e-6, None);
+    assert_eq!(started(), before + 1, "a cold one does");
+}
+
+/// The issue's second validation: a unimodal IOV subject stays bit-identical, across a
+/// range of `tol` that makes the seeds' descents stop at points of their own on the same
+/// mode, some measurably below the primary's: the objective guard alone would take those.
+#[test]
+fn iov_multistart_leaves_a_unimodal_subject_bit_identical() {
+    let bits = |r: &EbeResult| -> Vec<u64> {
+        r.eta
+            .iter()
+            .chain(r.kappas.iter().flat_map(|k| k.iter()))
+            .chain(r.h_matrix.iter())
+            .chain(std::iter::once(&r.nll))
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    for id in ["2", "4", "6"] {
+        let (model, subject) = two_mode_fixture(TWO_MODE_RESET, id);
+        for tol in [1e-6, 1e-4, 1e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0] {
+            let off = cold_iov_solve(&model, &subject, 0, tol, None);
+            let on = cold_iov_solve(&model, &subject, 3, tol, None);
+            assert_eq!(bits(&off), bits(&on), "subject {id}, tol {tol}");
+            assert_eq!(off.converged, on.converged);
+        }
+    }
+}
+
+/// The scan's reach, which is its cost: a reset subject seeds every coordinate of the flat
+/// vector, `2·restarts` each, and the same subject with no reset only the ones its probes
+/// flag. The barrier or a flat coordinate cannot stand in for the reset rule here: subject 2
+/// is unimodal, so a mutation dropping that rule changes no EBE and only this count.
+#[test]
+fn iov_multistart_scans_every_coordinate_of_a_reset_subject_only() {
+    let seeds_of = |csv: &str, restarts: usize| {
+        let (model, subject) = two_mode_fixture(csv, "2");
+        let before = IOV_AXIS_SEEDS_RUN.with(|n| n.get());
+        cold_iov_solve(&model, &subject, restarts, 1e-6, None);
+        IOV_AXIS_SEEDS_RUN.with(|n| n.get()) - before
+    };
+    assert_eq!(seeds_of(TWO_MODE_RESET, 1), 2 * 4, "η_CL, η_V, κ₁, κ₂");
+    assert_eq!(seeds_of(TWO_MODE_RESET, 2), 4 * 4);
+    assert!(seeds_of(TWO_MODE_NO_RESET, 1) < 2 * 4);
+    assert_eq!(seeds_of(TWO_MODE_RESET, 0), 0);
+    // Data that says nothing: every coordinate is flat and none has a barrier, so here the
+    // flatness probe alone scans them.
+    let (mut model, subject) = two_mode_fixture(TWO_MODE_NO_RESET, "2");
+    model.default_params.sigma.values = vec![1e4];
+    let before = IOV_AXIS_SEEDS_RUN.with(|n| n.get());
+    cold_iov_solve(&model, &subject, 1, 1e-6, None);
+    assert_eq!(IOV_AXIS_SEEDS_RUN.with(|n| n.get()) - before, 2 * 4);
+}
+
+/// A seed sits about the prior's centre, which for the BSV block of the search vector is
+/// `μ`. A two-mode `η` here, with `μ` far enough from 0 that a seed placed about 0 is
+/// past the shallow mode on the wrong side and returns to it.
+#[test]
+fn iov_multistart_seeds_the_bsv_block_about_mu() {
+    let src = include_str!("../../nonmem_anchor/iov_kappa_two_mode.ferx")
+        .replace("omega ETA_V  ~ 0.09", "omega ETA_KA ~ 1.0")
+        .replace("kappa KAPPA_KA ~ 1.0", "kappa KAPPA_V ~ 0.01")
+        .replace("V  = TVV  * exp(ETA_V)", "V  = TVV  * exp(KAPPA_V)")
+        .replace("KA = TVKA * exp(KAPPA_KA)", "KA = TVKA * exp(ETA_KA)");
+    let model = crate::parser::model_parser::parse_model_string(&src).expect("model");
+    let (_, mut subject) = two_mode_fixture(TWO_MODE_RESET, "1");
+    // Both occasions absorb as the second does, so the second's two modes are η_KA's.
+    let late: Vec<f64> = subject.observations[3..].to_vec();
+    subject.observations[..3].copy_from_slice(&late);
+    let at = |mu: Option<&[f64]>| cold_iov_solve(&model, &subject, 1, 1e-6, mu);
+    let off = cold_iov_solve(&model, &subject, 0, 1e-6, None);
+    assert!(off.eta[1] > 0.0, "shallow mode: {:?}", off.eta);
+    let plain = at(None);
+    assert!(plain.eta[1] < -1.5, "deep mode: {:?}", plain.eta);
+    let shifted = at(Some(&[0.0, -5.0]));
+    assert!(
+        (shifted.nll - plain.nll).abs() < 1e-6,
+        "μ moves the search, not its answer: {} vs {}",
+        shifted.nll,
+        plain.nll
+    );
+}
+
+/// A seed's descent that replaces the incumbent replaces its flags too (#2100, #2589), as
+/// in the non-IOV scan: stopped at the iteration cap, it is taken, since it is lower, and
+/// reported unconverged.
+#[test]
+fn iov_axis_seed_that_stopped_short_is_not_reported_converged() {
+    let (model, subject) = two_mode_fixture(TWO_MODE_RESET, "1");
+    let solve = |max_iter: usize, restarts: usize| {
+        find_ebe_for_stage(
+            &model,
+            &subject,
+            &model.default_params,
+            max_iter,
+            1e-6,
+            None,
+            None,
+            restarts,
+            &crate::types::FitOptions::default(),
+        )
+    };
+    let full = solve(500, 1);
+    assert!(full.converged && !full.used_fallback);
+    // A budget the shallow incumbent converges within and the seed's longer descent does
+    // not, or the flag below would be the incumbent's and prove nothing.
+    let capped = (2..200)
+        .filter(|&b| solve(b, 0).converged)
+        .map(|b| solve(b, 1))
+        .find(|r| r.kappas[1][0] < -1.0 && !r.converged)
+        .expect("some budget ends a seed's descent short of the deep mode's tolerance");
+    assert!(!capped.used_fallback, "a seed's descent is not a fallback");
+}
+
+#[test]
+fn iov_prior_diag_follows_the_search_vector() {
+    let mut params = make_iov_model().default_params;
+    params.omega = OmegaMatrix::from_diagonal(&[0.09, 0.16], vec!["A".into(), "B".into()]);
+    params.omega_iov = Some(OmegaMatrix::from_diagonal(
+        &[0.04, 0.25],
+        vec!["K1".into(), "K2".into()],
+    ));
+    let d = iov_prior_diag(2, 2, 2, None, &params);
+    let vars: Vec<f64> = d.iter().map(|a| a.var).collect();
+    assert_eq!(vars, vec![0.09, 0.16, 0.04, 0.25, 0.04, 0.25]);
+    assert!((d[3].inv - 4.0).abs() < 1e-9, "(Ω_iov⁻¹)₂₂: {}", d[3].inv);
+    params.omega_iov = None;
+    let d = iov_prior_diag(2, 2, 2, None, &params);
+    assert_eq!(d.len(), 6);
+    assert!(d[2..].iter().all(|a| a.var == 0.0), "no κ prior: fixed");
+}
+
+/// Under nested levels the search vector is the compact one: one block per group of each
+/// level, each coordinate against its own κ's variance.
+#[test]
+fn iov_prior_diag_follows_the_compact_vector_under_nested_levels() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    use crate::stats::nested_levels::NestedLayout;
+    let (model, pop) = fx::prepared(&fx::closed_form(), 1);
+    let subject = &pop.subjects[0];
+    let layout = NestedLayout::of(&model, subject).expect("prepared");
+    let params = &model.default_params;
+    let groups = crate::stats::stacked_layout::group_count(subject);
+    let d = iov_prior_diag(model.n_eta, model.n_kappa, groups, Some(&layout), params);
+    assert_eq!(d.len(), layout.n_compact());
+    let oi = params.omega_iov.as_ref().unwrap();
+    let probe = vec![0.0; layout.n_compact()];
+    let mut at = model.n_eta;
+    for (l, block) in layout.blocks(&probe) {
+        for (j, k) in layout.kappas_at(l).into_iter().enumerate() {
+            assert_eq!(d[at + j].var, oi.matrix[(k, k)], "level {l}, slot {j}");
+        }
+        at += block.len();
+    }
+    assert_eq!(at, d.len());
+    // The multi-start runs over that vector, end to end.
+    let off = cold_iov_solve(&model, subject, 0, 1e-6, None);
+    let on = cold_iov_solve(&model, subject, 2, 1e-6, None);
+    assert!(
+        on.nll.is_finite() && on.nll <= off.nll,
+        "{} vs {}",
+        on.nll,
+        off.nll
+    );
+}
+
+#[test]
+fn axis_seed_starts_ladder_about_the_centre_and_skip_a_fixed_coordinate() {
+    let base = [0.5, 0.25, 0.75];
+    let starts = axis_seed_starts(
+        &base,
+        &[1.0, 0.0, 0.0],
+        &[true, false, true],
+        &[0.5, 1.0, 0.0],
+        2,
+    );
+    let want: Vec<Vec<f64>> = vec![
+        vec![0.0, 0.25, 0.75],
+        vec![2.0, 0.25, 0.75],
+        vec![-0.5, 0.25, 0.75],
+        vec![2.5, 0.25, 0.75],
+    ];
+    assert_eq!(starts, want);
+}
+
+#[test]
+fn section_has_barrier_needs_a_rise_and_a_fall() {
+    let x = [0.0];
+    let seed = [2.0];
+    let bowl = |p: &[f64]| p[0] * p[0];
+    let two_wells = |p: &[f64]| (p[0] * (p[0] - 2.0)).powi(2);
+    let saturating = |p: &[f64]| 1.0 - (-p[0] * p[0]).exp();
+    assert!(!section_has_barrier(&bowl, &x, &seed));
+    assert!(section_has_barrier(&two_wells, &x, &seed));
+    assert!(
+        !section_has_barrier(&saturating, &x, &seed),
+        "a flattening rise has no second mode"
+    );
+    let nan_seed = |p: &[f64]| if p[0] > 1.5 { f64::NAN } else { 1.0 };
+    let inf_mid = |p: &[f64]| if p[0] < 1.5 { f64::INFINITY } else { 0.0 };
+    assert!(!section_has_barrier(&nan_seed, &x, &seed));
+    assert!(!section_has_barrier(&inf_mid, &x, &seed));
 }

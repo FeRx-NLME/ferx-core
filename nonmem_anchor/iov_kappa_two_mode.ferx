@@ -1,0 +1,26 @@
+# ferx twin of iov_kappa_two_mode.ctl (#2730): evaluated at fixed parameters.
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  kappa KAPPA_KA ~ 1.0
+  sigma ADD_ERR ~ 0.3 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(KAPPA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  maxiter    = 0
+  covariance = false
