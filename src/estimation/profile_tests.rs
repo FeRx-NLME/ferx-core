@@ -15,7 +15,7 @@
 //! nothing with the solve but the objective.
 
 use super::*;
-use crate::estimation::inner_optimizer::run_inner_loop_warm_seeded;
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, PrevEtas};
 use crate::types::FitOptions;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -451,6 +451,7 @@ fn the_profiled_objective_is_the_unprofiled_objective_at_its_own_point() {
             o.inner_restarts,
             InnerHessianSeed::for_options(&o),
             &o,
+            PrevEtas::Placeholder,
         );
         let plain = 2.0
             * crate::estimation::outer_optimizer::pop_nll_opts(
@@ -2848,6 +2849,7 @@ fn unprofiled_ofv(p: &crate::api::PreparedRun, params: &ModelParameters) -> f64 
         o.inner_restarts,
         InnerHessianSeed::for_options(&o),
         &o,
+        PrevEtas::Placeholder,
     );
     2.0 * crate::estimation::outer_optimizer::pop_nll_opts(
         model,
@@ -3997,6 +3999,7 @@ fn the_bounded_objective_is_the_frozen_unbounded_objective() {
             o.inner_restarts,
             InnerHessianSeed::for_options(&o),
             &o,
+            PrevEtas::Placeholder,
         );
         let plain = 2.0
             * crate::estimation::outer_optimizer::pop_nll_opts(
@@ -6024,6 +6027,7 @@ fn laplace_ofv(p: &crate::api::PreparedRun, params: &ModelParameters, beta: &[f6
         o.inner_restarts,
         InnerHessianSeed::for_options(&o),
         &o,
+        PrevEtas::Placeholder,
     );
     2.0 * crate::estimation::agq::agq_population_nll(
         &p.parsed.model,

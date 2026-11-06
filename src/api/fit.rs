@@ -1996,6 +1996,7 @@ fn fit_inner(
                     stage_opts.inner_restarts,
                     crate::estimation::inner_optimizer::InnerHessianSeed::for_options(&stage_opts),
                     &stage_opts,
+                    crate::estimation::inner_optimizer::PrevEtas::Solved,
                 );
             let nll = crate::estimation::agq::agq_population_nll(
                 model,
@@ -2102,6 +2103,7 @@ fn fit_inner(
                         stage_opts.inner_restarts,
                         crate::estimation::inner_optimizer::InnerHessianSeed::None,
                         &stage_opts,
+                        crate::estimation::inner_optimizer::PrevEtas::Placeholder,
                     );
                 let nll = crate::estimation::outer_optimizer::pop_nll(
                     model,

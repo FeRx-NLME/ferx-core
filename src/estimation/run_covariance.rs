@@ -413,7 +413,7 @@ fn reported_ebe_inputs(
     options: &FitOptions,
 ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
     use crate::estimation::inner_optimizer::{
-        ebe_h_matrices_at, run_inner_loop_warm_seeded, InnerHessianSeed,
+        ebe_h_matrices_at, run_inner_loop_warm_seeded, InnerHessianSeed, PrevEtas,
     };
 
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
@@ -433,6 +433,7 @@ fn reported_ebe_inputs(
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
         options,
+        PrevEtas::Placeholder,
     );
 
     let reported: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();

@@ -857,7 +857,7 @@ fn test_invert_psd_with_floor_empty() {
 fn fresh_state() -> NloptState {
     NloptState {
         cached_etas: Vec::new(),
-        cached_etas_are_modes: false,
+        cached_etas_kind: PrevEtas::Placeholder,
         cached_h_mats: Vec::new(),
         cached_etas_by_class: Vec::new(),
         best_ofv: 0.0,
@@ -4081,6 +4081,7 @@ fn global_presearch_probes_skip_the_inner_multistart() {
             init,
             &opts,
             Some(&zeros),
+            PrevEtas::Placeholder,
             Some(&mu_k),
             None,
             None,
@@ -8797,6 +8798,7 @@ fn predicted_remaining_gain_is_withheld_when_the_tight_integration_is_unfinished
             0,
             InnerHessianSeed::for_options(&opts),
             &opts,
+            PrevEtas::Solved,
         );
         let gradients = |strict| {
             per_subject_outer_gradients_checked(&m, &pop, p, &x, &e, &k, &opts, strict).is_some()
@@ -10581,6 +10583,352 @@ fn an_exactly_zero_preflight_mode_still_skips_the_first_eval_multistart() {
     }
 }
 
+/// `make_population(4)` with distinct ids and its last subject, `EMPTY`, stripped of every
+/// observation, so its mode is exactly η = 0. Returns the population and an informed
+/// subject's id.
+fn population_with_an_empty_subject() -> (Population, String) {
+    let mut pop = make_population(4);
+    // `make_population` names every subject alike; the tests count per subject.
+    for (i, s) in pop.subjects.iter_mut().enumerate() {
+        s.id = format!("S{}", i + 1);
+    }
+    let empty = &mut pop.subjects[3];
+    empty.id = "EMPTY".into();
+    empty.obs_times.clear();
+    empty.observations.clear();
+    empty.obs_cmts.clear();
+    empty.cens.clear();
+    empty.occasions.clear();
+    let informed = pop.subjects[0].id.clone();
+    (pop, informed)
+}
+
+/// An EBE a solve returned as exactly zero — the prior mode of a subject with no
+/// observations, or of an η the model never reads — is that subject's warm start like any
+/// other: once one pass has solved it, the next pass does not run its cold multi-start
+/// again. The value test alone reads it as the cold placeholder, so before the cache kind
+/// ([`PrevEtas`]) every outer evaluation re-ran it: on `examples/mm_iv.ferx` with an inert
+/// `ETA_DUMMY` as the only η, 920 multi-starts against 60.
+///
+/// Per driver, from a cold cache: the empty subject is multi-started exactly as often as
+/// an informed one, whose nonzero mode is warm after its first solve. The straddle: the
+/// empty subject is solved more often than that, so the old behaviour (a multi-start at
+/// every solve) cannot pass.
+#[test]
+fn an_exactly_zero_solved_ebe_is_not_multistarted_at_every_evaluation() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::types::{EstimationMethod, FitOptions};
+    let (pop, informed) = population_with_an_empty_subject();
+    let model = make_model();
+    let init = &model.default_params;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    for (label, optimizer, method) in [
+        ("nlopt bobyqa", Optimizer::Bobyqa, EstimationMethod::Foce),
+        ("nlopt slsqp", Optimizer::Slsqp, EstimationMethod::Foce),
+        ("built-in bfgs", Optimizer::Bfgs, EstimationMethod::Foce),
+        (
+            "trust region",
+            Optimizer::TrustRegion,
+            EstimationMethod::Foce,
+        ),
+        ("gauss-newton", Optimizer::Bobyqa, EstimationMethod::FoceGn),
+    ] {
+        let opts = FitOptions {
+            method,
+            optimizer,
+            outer_maxiter: 4,
+            inner_restarts: 1,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let declines = OuterFdDeclineLog::new(pop.subjects.len());
+        let (ofv, rec) = pool.install(|| {
+            record_inner_solves(|| {
+                match (method, optimizer) {
+                    (EstimationMethod::FoceGn, _) => {
+                        crate::estimation::gauss_newton::run_foce_gn(&model, &pop, init, &opts)
+                    }
+                    (_, Optimizer::Bfgs) => {
+                        optimize_bfgs(&model, &pop, init, &opts, &declines, None)
+                    }
+                    (_, Optimizer::TrustRegion) => {
+                        crate::estimation::trust_region::optimize_trust_region(
+                            &model, &pop, init, &opts,
+                        )
+                    }
+                    _ => optimize_nlopt(&model, &pop, init, &opts, &declines, None, &[]),
+                }
+                .ofv
+            })
+        });
+        assert!(ofv.is_finite(), "{label}: OFV {ofv}");
+        let count =
+            |ids: &mut dyn Iterator<Item = &String>, id: &str| ids.filter(|s| *s == id).count();
+        let (ms_empty, ms_informed) = (
+            count(&mut rec.multistarts.iter(), "EMPTY"),
+            count(&mut rec.multistarts.iter(), &informed),
+        );
+        let solves_empty = count(&mut rec.solve_tols.iter().map(|(id, _)| id), "EMPTY");
+        assert!(
+            ms_informed >= 1,
+            "{label}: fixture must reach the multi-start gate"
+        );
+        assert!(
+            solves_empty > ms_informed,
+            "{label}: fixture must solve the empty subject warm at least once \
+             ({solves_empty} solves, {ms_informed} cold passes)"
+        );
+        assert_eq!(
+            ms_empty, ms_informed,
+            "{label}: the exactly-zero EBE was multi-started as a cold start \
+             ({ms_empty} times, the informed subject {ms_informed}, in {solves_empty} solves)"
+        );
+    }
+}
+
+/// #2682's warm re-solve of a guard-rejected start swaps the cache to the cold solve's modes
+/// and back, and the cache kind ([`PrevEtas`]) has to travel with it, in both directions:
+///
+/// - **in:** the re-solve reads its start as `Solved`, so the empty subject's exactly-zero
+///   mode is warm there like an informed subject's nonzero one. Kept as the cold
+///   `Placeholder`, the re-solve multi-starts the empty subject once more than the informed
+///   one (measured 6 vs 5 accepted, 21 vs 20 rejected; Linux x86_64);
+/// - **out:** the cold solve's cache is restored as `Placeholder`. Left `Solved`, every later
+///   evaluation of a start that stays rejected — still at the zero fill, since nothing was
+///   adopted — takes the zeros for a solve's modes and skips its cold multi-start: measured 2
+///   multi-starts of the informed subject in 29 solves, against 20 restored.
+///
+/// Two fixtures on the same population, `max_unconverged_frac = 0`: at `inner_maxiter = 1`
+/// the re-solve converges the start and is accepted, at `0` it stays rejected.
+#[test]
+fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
+    use crate::estimation::inner_optimizer::{record_inner_solves, InnerLoopStats};
+    use crate::types::FitOptions;
+    let (pop, informed) = population_with_an_empty_subject();
+    let n_subj = pop.subjects.len();
+    let model = make_model();
+    let init = &model.default_params;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    let fit = |inner_maxiter: usize| {
+        let opts = FitOptions {
+            outer_maxiter: 1,
+            inner_maxiter,
+            max_unconverged_frac: 0.0,
+            inner_restarts: 1,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let declines = OuterFdDeclineLog::new(n_subj);
+        let (r, rec) = pool.install(|| {
+            record_inner_solves(|| optimize_nlopt(&model, &pop, init, &opts, &declines, None, &[]))
+        });
+        let start = r.start_eval.expect("the unprofiled loop records its start");
+        let ms = |id: &str| rec.multistarts.iter().filter(|s| *s == id).count();
+        let solves_of = |id: &str| rec.solve_tols.iter().filter(|(i, _)| i == id).count();
+        // `multistarts` and `solve_tols` are pushed from the rayon worker that ran the solve,
+        // and `record_inner_solves` sees only the recording thread's, so a pass spread over
+        // several workers records a subset — per subject, by scheduling. Measured on this
+        // 4-subject fixture: at one thread every subject records 218 solves, at two threads
+        // two of them record 0, at four threads 4 / 218 / 8 / 5. The pool above is one thread
+        // so the recording is complete, and this asserts that rather than trusting it: a
+        // partial recording would otherwise read as a difference in multi-starts and send the
+        // next reader after a defect that is not there (#2691 CI).
+        let counts: Vec<(String, usize, usize)> = pop
+            .subjects
+            .iter()
+            .map(|s| (s.id.clone(), solves_of(&s.id), ms(&s.id)))
+            .collect();
+        let complete = counts.iter().all(|(_, n, _)| *n == counts[0].1);
+        assert!(
+            complete,
+            "the recording is incomplete, so its per-subject counts cannot be compared: \
+             (id, solves, multi-starts) = {counts:?}. Every subject must record the same \
+             number of solves; `record_inner_solves` keeps only the recording thread's."
+        );
+        // Per pass, the multi-starts of each subject (#2691 CI trace): the property is
+        // per-pass — a solved zero mode is not multi-started where a nonzero one is taken as
+        // warm — and counting over the whole fit hides which pass broke it. `multistart_passes`
+        // is parallel to `multistarts`.
+        let per_pass = |id: &str| -> std::collections::BTreeMap<Option<usize>, usize> {
+            let mut m = std::collections::BTreeMap::new();
+            for (s, p) in rec.multistarts.iter().zip(&rec.multistart_passes) {
+                if s == id {
+                    *m.entry(*p).or_insert(0) += 1;
+                }
+            }
+            m
+        };
+        let empty_by_pass = per_pass("EMPTY");
+        let informed_by_pass = per_pass(&informed);
+        // Passes where the informed subject was NOT multi-started are the warm ones — the
+        // evaluations where the property matters (a solved zero mode is taken as warm). Cold
+        // re-solves and verification legs run from a zero-filled cache on purpose, so the empty
+        // subject is always multi-started there while an informed one's nonzero mode survives
+        // through the held-modes restore. That asymmetry is by design, and how many cold passes
+        // there are depends on the optimizer's trajectory (#1688). The test pins the warm path.
+        let offending: Vec<(Option<usize>, usize, usize)> = empty_by_pass
+            .keys()
+            .chain(informed_by_pass.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|p| {
+                (
+                    p,
+                    empty_by_pass.get(&p).copied().unwrap_or(0),
+                    informed_by_pass.get(&p).copied().unwrap_or(0),
+                )
+            })
+            // Only the first two passes: the first evaluation (pass 0) and the #2682 warm
+            // re-solve (pass 1). Later passes traverse a trajectory whose cold-re-solve and
+            // verification legs differ by platform (#1688, CI 219 vs local 218 passes), and a
+            // held-modes restore after `reset_to_cold_start` can leave the zero-mode subject
+            // cold while an informed one's nonzero mode survives. That is the cold re-solve
+            // working, not the warm-start fix. The per-pass warm property is pinned directly
+            // by the sibling test `the_fd_stencils_take_an_exactly_zero_mode_as_warm`.
+            .filter(|&(p, e, i)| p.is_some_and(|n| n <= 1) && e > i)
+            .collect();
+        (
+            start,
+            ms("EMPTY"),
+            ms(&informed),
+            solves_of(&informed),
+            counts,
+            offending,
+        )
+    };
+
+    let (start, _ms_empty, ms_informed, _, counts, offending) = fit(1);
+    assert!(
+        !start.guard_rejected && start.warm_rescored_from.is_some_and(|n| n > 0),
+        "fixture: the cold start must be rejected and its warm re-solve accepted: {start:?}"
+    );
+    assert!(ms_informed >= 1, "fixture must reach the multi-start gate");
+    // Per pass, not over the whole fit: the property — the exactly-zero mode is never
+    // multi-started on a pass where an informed subject's nonzero mode is taken as warm — is a
+    // per-pass one, and a count over the fit mixes passes whose number differs by platform
+    // (#1688). `offending` is the passes where EMPTY exceeds the informed subject. Mutation A
+    // (the re-solve reads `Placeholder`) makes EMPTY cold on the re-solve pass, which lands
+    // there.
+    assert!(
+        offending.is_empty(),
+        "accepted re-solve: on (pass, EMPTY, informed) = {offending:?} the exactly-zero mode was \
+         multi-started as a cold start where the informed subject's was taken as warm; \
+         (id, solves, multi-starts) = {counts:?}"
+    );
+
+    let (start, _ms_empty, ms_informed, solves, counts, offending) = fit(0);
+    let cold = InnerLoopStats {
+        n_unconverged: start.n_unconverged,
+        n_start_rejected: start.n_start_rejected,
+        ..Default::default()
+    };
+    assert!(
+        start.guard_rejected
+            && start.warm_rescored_from.is_none()
+            && start.ofv.is_finite()
+            && wants_start_warm_rescore(&cold, n_subj, start.ofv, 0.0),
+        "fixture: the start must earn the warm re-solve and stay rejected after it: {start:?}"
+    );
+    assert!(
+        offending.is_empty(),
+        "rejected re-solve: on (pass, EMPTY, informed) = {offending:?} the exactly-zero mode was \
+         multi-started as a cold start where the informed subject's was taken as warm; \
+         (id, solves, multi-starts) = {counts:?}"
+    );
+    assert!(
+        2 * ms_informed > solves,
+        "rejected start: the zero fill was restored as a solve's modes, so later evaluations \
+         skipped their cold multi-start ({ms_informed} multi-starts in {solves} solves)"
+    );
+}
+
+/// The two re-solving FD stencils warm every probe from the modes the gradient is taken at,
+/// so an exactly-zero mode among them is no cold start either: no probe multi-starts any
+/// subject. Both `2·n_free` probes deep — the reconverged gradient at every outer
+/// evaluation of an IOV or TTE model, the reporting one once per derivative-free fit.
+#[test]
+fn the_fd_stencils_take_an_exactly_zero_mode_as_warm() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::types::FitOptions;
+    let (pop, _) = population_with_an_empty_subject();
+    let model = make_model();
+    let init = &model.default_params;
+    let opts = FitOptions {
+        inner_restarts: 1,
+        ..FitOptions::default()
+    };
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(init);
+    let params = unpack_params(&x, init);
+    let mu_k = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    let (ehs, _, _, kappas) = pool.install(|| {
+        run_inner_loop_warm_seeded(
+            &model,
+            &pop,
+            &params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            Some(&mu_k),
+            opts.min_obs_for_convergence_check as usize,
+            opts.inner_restarts,
+            InnerHessianSeed::for_options(&opts),
+            &opts,
+            PrevEtas::Placeholder,
+        )
+    });
+    assert!(
+        ehs[3].iter().all(|&v| v == 0.0) && ehs[0].iter().any(|&v| v != 0.0),
+        "fixture: the empty subject's mode is exactly zero, an informed one's is not"
+    );
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+    let priors = build_prior_set(&model, init);
+    for label in ["reconverged_fd_gradient", "reporting_fd_gradient"] {
+        let (g, rec) = pool.install(|| {
+            record_inner_solves(|| match label {
+                "reconverged_fd_gradient" => {
+                    reconverged_fd_gradient(&x, init, &model, &pop, &ehs, &kappas, &bounds, &opts)
+                }
+                _ => reporting_fd_gradient(
+                    &x, init, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                ),
+            })
+        });
+        assert!(g.iter().all(|v| v.is_finite()), "{label}: gradient {g:?}");
+        let empty_solves = rec
+            .solve_tols
+            .iter()
+            .filter(|(id, _)| id == "EMPTY")
+            .count();
+        assert!(
+            empty_solves >= 2,
+            "{label}: fixture must re-solve the empty subject ({empty_solves} solves)"
+        );
+        assert!(
+            rec.multistarts.is_empty(),
+            "{label}: a probe warm from the modes ran a cold multi-start: {:?}",
+            rec.multistarts
+        );
+    }
+}
+
 /// #2076 review: a pre-flight subject that exhausts `inner_maxiter` stopped on a partial
 /// descent, not a mode. Handing it over would make the first evaluation warm — no second
 /// Hessian metric, no multi-start, a fresh iteration budget — and change the first
@@ -10648,6 +10996,7 @@ fn preflight_start_modes(
             opts.inner_restarts,
             InnerHessianSeed::for_options(opts),
             opts,
+            PrevEtas::Placeholder,
         )
     });
     PreflightStart {
@@ -10714,7 +11063,7 @@ fn assert_first_eval_starts_at_preflight_mode(
                     Some(&mu_k),
                     None,
                     None,
-                    true,
+                    PrevEtas::ModesHere,
                     None,
                 )
                 .4;
@@ -11505,6 +11854,7 @@ fn identity_exact_derivatives_match_fd_of_the_probed_objective() {
                 opts.inner_restarts,
                 InnerHessianSeed::for_options(&opts),
                 &opts,
+                PrevEtas::Placeholder,
             )
         };
         // The production input: the pre-flight's cold solve at the fit's own `inner_tol`.
@@ -11614,6 +11964,7 @@ fn exact_candidate_derivatives_decline_off_the_mode_and_when_switched_off() {
         base.inner_restarts,
         InnerHessianSeed::for_options(&base),
         &base,
+        PrevEtas::Placeholder,
     );
     let off_mode: Vec<DVector<f64>> = modes.iter().map(|e| e.map(|v| v + 0.2)).collect();
     let at = |opts: &FitOptions, warm: &[DVector<f64>]| {
@@ -16070,7 +16421,7 @@ fn the_lower_cold_mode_count_is_the_subjects_the_held_state_scores_worse() {
 fn a_cold_start_drops_the_mode_response() {
     let mut state = new_nlopt_state(2, 2, &[0.0; 3], SalvageGuardPolicy::Off);
     state.cached_etas = vec![DVector::from_vec(vec![0.3, -0.1]); 2];
-    state.cached_etas_are_modes = true;
+    state.cached_etas_kind = PrevEtas::Solved;
     state.pred_jac = Some(vec![vec![DVector::from_vec(vec![1.0, 2.0]); 3]; 2]);
     state.pred_anchor = vec![0.5; 3];
     state.reset_to_cold_start();
@@ -16078,7 +16429,9 @@ fn a_cold_start_drops_the_mode_response() {
         .cached_etas
         .iter()
         .all(|e| e.len() == 2 && e.iter().all(|&v| v == 0.0)));
-    assert!(!state.cached_etas_are_modes);
+    // The zero fill is the cold placeholder again: kept as `Solved`, the next pass would
+    // take it for a solve's output and skip every subject's cold multi-start.
+    assert_eq!(state.cached_etas_kind, PrevEtas::Placeholder);
     assert!(state.pred_jac.is_none(), "the response went with the modes");
     assert!(state.pred_anchor.is_empty());
 }
