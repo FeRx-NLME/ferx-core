@@ -592,7 +592,7 @@ fn the_binary_refusal_names_a_changing_level_block_and_how_to_re_key_it() {
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(
         refused[0].message,
-        "[binary_model] on CMT=1: the logit predictor references θ level block `PLACEBO`, \
+        "[binary_model] on CMT=1: the linear predictor references θ level block `PLACEBO`, \
          whose level changes between records, which is time-varying for subject `7`, but that \
          subject carries no per-record covariate snapshot aligned with its binary records (it \
          also has time-to-event records, or was built in memory without \

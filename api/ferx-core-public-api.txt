@@ -2674,6 +2674,7 @@ pub ferx_core::types::KappaTreatment::Marginalized
 pub ferx_core::types::KappaTreatment::NotApplicable
 pub enum ferx_core::types::LinkFn
 pub ferx_core::types::LinkFn::Logit
+pub ferx_core::types::LinkFn::Probit
 pub enum ferx_core::types::MuTransform
 pub ferx_core::types::MuTransform::Identity
 pub ferx_core::types::MuTransform::Log
@@ -4108,6 +4109,7 @@ pub ferx_core::KappaTreatment::Marginalized
 pub ferx_core::KappaTreatment::NotApplicable
 pub enum ferx_core::LinkFn
 pub ferx_core::LinkFn::Logit
+pub ferx_core::LinkFn::Probit
 pub enum ferx_core::MatchMethod
 pub ferx_core::MatchMethod::Nearest
 pub ferx_core::MatchMethod::Optimal

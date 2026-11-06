@@ -954,9 +954,9 @@ every prediction as `c × block` plus terms that do not read it, with `c` taken 
 the data alone (`/ WPSE` is fine). Each of the following is refused, never fitted
 some other way:
 
-- the block reached through a function (other than one logit link around the whole
-  prediction or the implicit one of a `[binary_model]` predictor, see
-  [Through a logit link](#through-a-logit-link)), a power, a state, a
+- the block reached through a function (other than one logit or probit link around the
+  whole prediction or the implicit one of a `[binary_model]` predictor, see
+  [Through a link](#through-a-link)), a power, a state, a
   divisor, a parameter coefficient, or an `if` whose condition reads more than data; two
   reads multiplied or divided; read with a second profiled block; or read by no
   prediction at all (`E_PROFILE_NOT_LINEAR`);
@@ -1006,10 +1006,10 @@ refused, and so is every `max`, `min` or `clamp` of the block, since each compar
 block. Every branch must itself be affine: a branch giving `PLACEBO[STUDY]` under one
 condition and `exp(PLACEBO[STUDY])` under the other is refused, naming the `exp`.
 
-##### Through a logit link
+##### Through a link
 
 A bounded endpoint, such as an observed proportion, can read the block through one
-logit link, as long as the link is the whole prediction (#2111):
+logit or probit link, as long as the link is the whole prediction (#2111, #2603):
 
 ```
 [individual_parameters]
@@ -1019,7 +1019,8 @@ logit link, as long as the link is the whole prediction (#2111):
   y = inv_logit(LP)
 ```
 
-`expit` is the same link, and it may also be written inline (`y = inv_logit(TVL +
+`expit` is the same link, and `pnorm` is the probit one (`y = pnorm(LP)`, `Φ(LP)`). Either
+may also be written inline (`y = inv_logit(TVL +
 PLACEBO + …)`), through a parameter (`P = inv_logit(LP)`, `y = P`), or on every branch of
 an `if` on data (`P = if (TRT > 0) inv_logit(LP) else inv_logit(LP2)`, or the same as two
 assignments). Inside the link the rule above applies unchanged: the argument must read
@@ -1039,10 +1040,11 @@ until it is positive definite, which costs steps but keeps each one a descent st
 `verbose` reports how many matrices of each kind it took. The profiled levels reach the
 unprofiled fit's optimum under `foce`, `focei`, `laplace` and adaptive quadrature, and
 NONMEM's, with every level a `THETA`, under FOCEI and LAPLACE (see
-`nonmem_anchor/README.md`).
+`nonmem_anchor/README.md`). Under `pnorm` the profiled and unprofiled objectives agree
+at the same point, as they do under `inv_logit`.
 
-A `[binary_model] logit` predictor reads a profiled block the same way, its logit link
-implicit (#2111):
+A `[binary_model]` predictor reads a profiled block the same way, its link implicit
+(#2111), and that holds for `probit =` as for `logit =` (#2603):
 
 ```
 [binary_model]
@@ -1056,8 +1058,7 @@ level, and the solve takes the exact Newton matrix as above. On a binary row `fo
 `focei` and `laplace` are one objective, the Laplace form, and adaptive quadrature is
 another; the profiled levels reach the unprofiled objective under each, and NONMEM's
 `METHOD=COND LAPLACE LIKE` objective with every level a `THETA` (see
-`nonmem_anchor/README.md`). A model may mix Gaussian and binary rows. ferx has no probit
-link yet (#2603). A block in a model with a time-to-event or `[markov_model]` endpoint is
+`nonmem_anchor/README.md`). A model may mix Gaussian and binary rows. A block in a model with a time-to-event or `[markov_model]` endpoint is
 refused with `E_PROFILE_SCOPE`, which names that endpoint.
 
 ##### Bounds on a profiled block

@@ -207,6 +207,26 @@ pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
     }
 }
 
+/// Depth of [`mills_excess`]'s continued fraction. Measured against an 80-digit reference
+/// (#2603): at `t = 2` depth 80 leaves 5e-14 relative and depth 160 nothing; larger `t`
+/// converge faster (depth 40 is exact from `t = 4`).
+const MILLS_CF_DEPTH: usize = 160;
+
+/// `a(t) = 1/R(t) − t` for `t ≥ 2`, where `R(t) = Q(t)/φ(t)` is the Mills ratio of the upper
+/// tail, by the Laplace continued fraction `a = 1/(t + 2/(t + 3/(t + …)))` (#2603).
+///
+/// Every step adds positive terms, so there is no cancellation however large `t` is, and over
+/// a jet type it gives `a`'s derivatives the same way. `1/R = t + a` is the inverse Mills ratio
+/// `φ(−t)/Φ(−t)` of the lower tail; `a ≈ 1/t` is the part of it a direct `φ/Φ − t` loses to
+/// cancellation. Callers take it only for `t ≥ 2`, where [`MILLS_CF_DEPTH`] has converged.
+pub(crate) fn mills_excess<T: PkNum>(t: T) -> T {
+    let mut f = t;
+    for k in (2..=MILLS_CF_DEPTH).rev() {
+        f = t + T::from_f64(k as f64) / f;
+    }
+    T::from_f64(1.0) / f
+}
+
 /// Inverse Mills ratio `h = φ(z)/Φ(z)`, evaluated through logs (via
 /// [`log_normal_cdf`]) so it stays finite in the far tail where `Φ(z) → 0`.
 /// Single source for the M3-censored kernels (the closed-form and ODE inner

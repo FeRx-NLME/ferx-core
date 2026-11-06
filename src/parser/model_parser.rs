@@ -8929,7 +8929,7 @@ fn restrict_and_validate_indiv_stmts(
     // blocks shared this helper.
     let predictor = match block {
         "event_model" => "a hazard expression",
-        "binary_model" => "the logit predictor",
+        "binary_model" => "the linear predictor",
         "markov_model" => "a transition probability",
         _ => "a predictor expression",
     };
@@ -9782,7 +9782,9 @@ fn parse_event_model_block(
 /// - `logit` — required; the linear predictor `lp` (log-odds of `P(Y=1)`) as a
 ///   θ/η/covariate/`[individual_parameters]` expression. `TIME` resolves per observation
 ///   (the data term sets the model-time guard per record).
-/// - `link`  — optional; `logit` (default). `probit`/`cloglog` are not yet supported.
+/// - `probit` — instead of `logit`: the same predictor under the probit link, `P(Y=1) = Φ(lp)`
+///   (#2603). Exactly one of `logit` / `probit` is given.
+/// - `link`  — optional; `logit` (default) or `probit`. It must agree with the predictor's key.
 #[cfg(feature = "survival")]
 fn parse_binary_model_block(
     lines: &[String],
@@ -9812,8 +9814,13 @@ fn parse_binary_model_block(
     let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
 
     let mut cmt_opt: Option<usize> = None;
-    let mut logit_expr: Option<Expression> = None;
-    let mut link = LinkFn::Logit;
+    // The predictor, under the key that names its link (`logit =` / `probit =`, #2603).
+    let mut predictor: Option<(LinkFn, Expression)> = None;
+    let mut declared_link: Option<LinkFn> = None;
+    let key_of = |l: LinkFn| match l {
+        LinkFn::Logit => "logit",
+        LinkFn::Probit => "probit",
+    };
 
     for line in lines {
         let trimmed = line.trim();
@@ -9833,30 +9840,59 @@ fn parse_binary_model_block(
                     format!("[binary_model]: invalid cmt `{value}` — expected a positive integer")
                 })?);
             }
-            "logit" => {
-                logit_expr = Some(parse_scalar_expression(value, ctx)?);
+            "logit" | "probit" => {
+                let this = if key == "logit" {
+                    LinkFn::Logit
+                } else {
+                    LinkFn::Probit
+                };
+                if let Some((prev, _)) = predictor {
+                    return Err(format!(
+                        "[binary_model]: the predictor is given twice (`{}` and `{key}`) — a \
+                         block has one linear predictor, written under the key that names its \
+                         link",
+                        key_of(prev)
+                    ));
+                }
+                predictor = Some((this, parse_scalar_expression(value, ctx)?));
             }
             "link" => {
-                link = match value {
+                declared_link = Some(match value {
                     "logit" => LinkFn::Logit,
+                    "probit" => LinkFn::Probit,
                     other => {
                         return Err(format!(
-                            "[binary_model]: link `{other}` is not yet supported — only `logit` \
-                             (the default) is available; probit/cloglog are planned."
+                            "[binary_model]: link `{other}` is not supported — the links are \
+                             `logit` (the default) and `probit`"
                         ))
                     }
-                };
+                });
             }
             other => {
                 return Err(format!(
-                    "[binary_model]: unknown key `{other}` — valid keys: cmt, logit, link"
+                    "[binary_model]: unknown key `{other}` — valid keys: cmt, logit, probit, link"
                 ));
             }
         }
     }
 
     let cmt = cmt_opt.ok_or("[binary_model]: missing required key `cmt`")?;
-    let logit_expr = logit_expr.ok_or("[binary_model]: missing required key `logit`")?;
+    let (link, logit_expr) = predictor.ok_or(
+        "[binary_model]: missing the linear predictor — write `logit = …` (logit link) or \
+         `probit = …` (probit link)",
+    )?;
+    if let Some(declared) = declared_link {
+        if declared != link {
+            return Err(format!(
+                "[binary_model]: `link = {}` but the predictor is written `{} = …` — under \
+                 `link = {}` write the predictor as `{} = …`",
+                key_of(declared),
+                key_of(link),
+                key_of(declared),
+                key_of(declared)
+            ));
+        }
+    }
     // For the mixed-BIC θ classification (#1177); see `parse_event_model_block`.
     endpoint_stmts.push(Statement::Assign(
         format!("__ferx_binary_model_{cmt}_logit"),
@@ -23952,6 +23988,9 @@ pub(crate) const SUPPORTED_UNARY_FNS: &[&str] = &[
     // (`AMP * cos(2 * PI * (TIME - PHS) / 24)`), NONMEM's `SIN`/`COS`.
     "sin",
     "cos",
+    // #2603: the standard-normal CDF `Φ(x)`, NONMEM's `PHI` — a probit link written out
+    // (`y = pnorm(LP)`), the companion of `[binary_model] link = probit`.
+    "pnorm",
 ];
 
 /// Panic message for the (parser-guaranteed unreachable) tail of each
@@ -26007,8 +26046,8 @@ pub(crate) enum ProfileRouteBreak {
     /// No prediction reads the block, so its levels have nothing to be solved from
     /// (#2103 review #8).
     Unread,
-    /// Inside a logit link (`inv_logit`, `expit`) that is not the whole prediction
-    /// (#2111): scaled, added to, or inside another link.
+    /// Inside a link (`inv_logit`, `expit`, `pnorm`) that is not the whole prediction
+    /// (#2111, #2603): scaled, added to, or inside another link.
     InnerLink(String),
 }
 
@@ -26057,17 +26096,17 @@ fn binary_predictor_exprs(
         .flat_map(|lines| lines.iter())
         .filter_map(|line| {
             let (key, value) = line.trim().split_once('=')?;
-            (key.trim() == "logit")
+            matches!(key.trim(), "logit" | "probit")
                 .then(|| parse_scalar_expression(value.trim(), ctx).ok())
                 .flatten()
         })
         .collect()
 }
 
-/// Whether `f` is a logit link, the one function a profiled block may be read through
-/// (#2111).
-fn is_logit_link(f: &str) -> bool {
-    f == "inv_logit" || f == "expit"
+/// Whether `f` is a link, the one kind of function a profiled block may be read through:
+/// a logit link (`inv_logit`, `expit`, #2111) or a probit link (`pnorm`, #2603).
+fn is_link(f: &str) -> bool {
+    f == "inv_logit" || f == "expit" || f == "pnorm"
 }
 
 /// The route half of `E_PROFILE_NOT_LINEAR` (#1065): every prediction must read a
@@ -26256,9 +26295,10 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
              prediction may read only one profiled block."
         ),
         ProfileRouteBreak::InnerLink(c) => format!(
-            "Here `{block}` reaches `y` through {c} {at}. A logit link is accepted only as the \
-             whole prediction, `y = inv_logit(c × {block} + …)`, on every branch of an `if` \
-             that chooses it, not scaled, added to or inside another link."
+            "Here `{block}` reaches `y` through {c} {at}. A link (`inv_logit`, `expit` or \
+             `pnorm`) is accepted only as the whole prediction, `y = inv_logit(c × {block} + …)` \
+             or `y = pnorm(c × {block} + …)`, on every branch of an `if` that chooses it, not \
+             scaled, added to or inside another link."
         ),
         ProfileRouteBreak::Unread => unreachable!("answered above"),
     };
@@ -26307,7 +26347,7 @@ impl ProfileWalk<'_, '_> {
             (!out.is_empty()).then_some(out)
         };
         match e {
-            Expression::UnaryFn(f, arg) if is_logit_link(f) => Some(vec![(arg, at, site.clone())]),
+            Expression::UnaryFn(f, arg) if is_link(f) => Some(vec![(arg, at, site.clone())]),
             Expression::Variable(n) | Expression::Covariate(n) => {
                 let defs = self.ctx.resolve(at, n);
                 if defs.is_empty()
@@ -26382,7 +26422,7 @@ impl ProfileWalk<'_, '_> {
             }
             // A link is peeled only as the whole prediction ([`Self::outer_link`]); one
             // reached here is scaled, added to, or nested.
-            Expression::UnaryFn(f, _) if is_logit_link(f) => {
+            Expression::UnaryFn(f, _) if is_link(f) => {
                 fail(ProfileRouteBreak::InnerLink(format!("`{f}(...)`")))
             }
             Expression::UnaryFn(f, _) => fail(ProfileRouteBreak::Construct(format!("`{f}(...)`"))),
@@ -26922,7 +26962,11 @@ const WORD_VALUED_KEYS: &[(&str, &str, WordValue)] = &[
         "clock",
         WordValue::Words(&["forward", "reset"]),
     ),
-    ("binary_model", "link", WordValue::Words(&["logit"])),
+    (
+        "binary_model",
+        "link",
+        WordValue::Words(&["logit", "probit"]),
+    ),
     ("markov_model", "type", WordValue::Words(&["ctmm", "dtmm"])),
     ("markov_model", "states", WordValue::Labels),
     // `parse_decision_schedule`: `[t1, …]` or `every Δ from t0 to t1`.
@@ -28460,6 +28504,7 @@ fn eval_expr<E: EvalEnv>(
                 "softplus" => crate::nn::Activation::Softplus.apply(v),
                 "sin" => v.sin(),
                 "cos" => v.cos(),
+                "pnorm" => pnorm_value(v),
                 // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
                 _ => unreachable!("{UNARY_FN_ARM_MISSING} (eval_expr, `{name}`)"),
             }
@@ -28639,6 +28684,9 @@ enum Op {
     /// evaluator, the dual jets lifted from the same values.
     Sin,
     Cos,
+    /// `pnorm(x)`, the standard-normal CDF `Φ(x)` (#2603): [`pnorm_value`] on every
+    /// evaluator, the dual jets lifted from the same value (`pnorm_g`).
+    Pnorm,
     CmpLt,
     CmpLe,
     CmpGt,
@@ -28725,7 +28773,8 @@ fn ip_op_cost(op: &Op) -> u32 {
         | Op::Tanh
         | Op::Softplus
         | Op::Sin
-        | Op::Cos => 20,
+        | Op::Cos
+        | Op::Pnorm => 20,
         Op::Div | Op::Mod => 4,
         _ => 1,
     }
@@ -28773,6 +28822,7 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
             | Op::Softplus
             | Op::Sin
             | Op::Cos
+            | Op::Pnorm
             | Op::CmpLt
             | Op::CmpLe
             | Op::CmpGt
@@ -28946,6 +28996,7 @@ fn ip_op_pops(op: &Op) -> Option<usize> {
         | Op::Softplus
         | Op::Sin
         | Op::Cos
+        | Op::Pnorm
         | Op::LogicNot
         | Op::IsPresent
         | Op::Floor
@@ -29660,6 +29711,7 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::Softplus
             | Op::Sin
             | Op::Cos
+            | Op::Pnorm
             | Op::LogicNot
             | Op::IsPresent
             | Op::Floor
@@ -29787,6 +29839,7 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 "softplus" => bc.ops.push(Op::Softplus),
                 "sin" => bc.ops.push(Op::Sin),
                 "cos" => bc.ops.push(Op::Cos),
+                "pnorm" => bc.ops.push(Op::Pnorm),
                 "floor" => bc.ops.push(Op::Floor),
                 "ceil" => bc.ops.push(Op::Ceil),
                 "round" => bc.ops.push(Op::Round),
@@ -30043,6 +30096,7 @@ fn eval_bytecode_lanes<L: Lane>(
             Op::Softplus => unary!(|v| crate::nn::Activation::Softplus.apply(v)),
             Op::Sin => unary!(|v| v.sin()),
             Op::Cos => unary!(|v| v.cos()),
+            Op::Pnorm => unary!(pnorm_value),
             Op::CmpLt => binary!(|l, r| bool01(l < r)),
             Op::CmpLe => binary!(|l, r| bool01(l <= r)),
             Op::CmpGt => binary!(|l, r| bool01(l > r)),
@@ -30136,6 +30190,45 @@ fn cos_g<T: crate::sens::num::PkNum>(x: T) -> T {
     let (s, c) = (x.val().sin(), x.val().cos());
     x.lift4(c, -s, -c, s, c)
 }
+
+/// `pnorm(x) = Φ(x)` on `f64` (#2603). [`normal_cdf`](crate::stats::special::normal_cdf)
+/// (incomplete-gamma form, no cancellation in either tail) down to `x = −37`; below it,
+/// `φ(x)/(t + a)` with `t = −x` and `a` the Mills continued fraction
+/// ([`mills_excess`](crate::stats::special::mills_excess)), so the value keeps its digits
+/// into the subnormals and reaches `0` only when `Φ` itself is below them. The upper tail
+/// rounds to `1`, which is `Φ` to the last ulp, and `+∞` gives `1`. `NaN` stays `NaN`.
+#[inline]
+pub(crate) fn pnorm_value(x: f64) -> f64 {
+    if x < -37.0 {
+        let t = -x;
+        (-0.5 * t * t).exp() * PNORM_INV_SQRT_2PI / (t + crate::stats::special::mills_excess(t))
+    } else if x > 38.0 {
+        // `normal_cdf` is `1` long before here (from x ≈ 8.3) but `NaN` at `+∞`.
+        1.0
+    } else {
+        crate::stats::special::normal_cdf(x)
+    }
+}
+
+/// `pnorm(x)` on any number type (#2603): the value is [`pnorm_value`] bit for bit, and the
+/// jet carries `Φ⁽ⁿ⁾` through n = 4 — `φ`, `−xφ`, `(x² − 1)φ`, `(3x − x³)φ` — which the
+/// covariance step's nested dual reads. `φ` underflows to `0` past `|x| ≈ 38.6`, and so does
+/// every derivative.
+#[inline]
+fn pnorm_g<T: crate::sens::num::PkNum>(x: T) -> T {
+    let v = x.val();
+    let d = (-0.5 * v * v).exp() * PNORM_INV_SQRT_2PI;
+    x.lift4(
+        pnorm_value(v),
+        d,
+        -v * d,
+        (v * v - 1.0) * d,
+        (3.0 * v - v * v * v) * d,
+    )
+}
+
+/// `1/√(2π)`, the standard-normal density's constant.
+const PNORM_INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 /// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
 /// `TIME`, whose jet is zero).
@@ -30338,6 +30431,10 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::Cos => {
                 let v = pop!();
                 push!(cos_g(v));
+            }
+            Op::Pnorm => {
+                let v = pop!();
+                push!(pnorm_g(v));
             }
             Op::Logit => {
                 let v = pop!();
@@ -32451,6 +32548,7 @@ fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
         | Op::Softplus
         | Op::Sin
         | Op::Cos
+        | Op::Pnorm
         | Op::CmpLt
         | Op::CmpLe
         | Op::CmpGt
@@ -33917,6 +34015,7 @@ fn resolve_condition_indices(
 //                            `Activation::Softplus` takes (a > 20 / a < −20 / else)
 //   UnaryFn("sin", a)      : cos(a) · a'
 //   UnaryFn("cos", a)      : −sin(a) · a'
+//   UnaryFn("pnorm", a)    : exp(−a²/2)/√(2π) · a'
 //   UnaryFn("floor"|"ceil"|"round", a) : 0 (piecewise constant; the integer
 //                            boundaries are undefined and ignored, as for Mod)
 //   Power(b, e)            : b^e · (e'·ln(b) + e · b'/b)  (general; subsumes
@@ -34200,6 +34299,18 @@ fn differentiate_with_chain(
                     // −sin(a) · a'
                     let s = Expression::UnaryFn("sin".into(), arg.clone());
                     sub(Expression::Literal(0.0), mul(s, da))
+                }
+                "pnorm" => {
+                    // φ(a) · a',   φ(a) = exp(−a²/2) / √(2π)
+                    let a = (**arg).clone();
+                    let phi = mul(
+                        Expression::Literal(PNORM_INV_SQRT_2PI),
+                        Expression::UnaryFn(
+                            "exp".into(),
+                            Box::new(mul(Expression::Literal(-0.5), mul(a.clone(), a))),
+                        ),
+                    );
+                    mul(phi, da)
                 }
                 "floor" | "ceil" | "round" => {
                     // Piecewise constant: 0 almost everywhere, undefined on the

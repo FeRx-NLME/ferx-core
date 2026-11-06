@@ -119,6 +119,7 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 | **Profile likelihood on a level block** | an unstructured placebo with a BTAV κ and a drug effect nonlinear in `ETA` — [#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065); bounded, one level `FIX`ed at the bound the profiled box holds it on — [#2112](https://github.com/FeRx-NLME/ferx-core/issues/2112); from a start that puts TVE0 on ferx's log-packing floor — [#2339](https://github.com/FeRx-NLME/ferx-core/issues/2339); under `METHOD=1 LAPLACE` — [#2107](https://github.com/FeRx-NLME/ferx-core/issues/2107); see the section below | `profile_mbma.ctl`, `profile_mbma_bound.ctl`, `profile_mbma_tve0_55.ctl`, `profile_mbma_laplace.ctl` (4) | `profile_mbma_fit.ferx` *(in `tests/profiled_levels.rs`)* |
 | **Profile likelihood through a logit link** | a bounded proportion whose unstructured placebo and study `ETA` sit inside `inv_logit`, under `METHOD=1 INTER` and `METHOD=1 LAPLACE INTER` — [#2111](https://github.com/FeRx-NLME/ferx-core/issues/2111); see the section below | `profile_logit_b2_focei.ctl`, `profile_logit_b2_laplace.ctl` (2) | `profile_logit_b2.ferx` *(in `tests/profiled_logit_levels.rs`)* |
 | **A level block in a binary predictor** | 2400 Bernoulli rows whose unstructured placebo and study `ETA` are read on the log-odds, each record at its own visit and arm, under `METHOD=COND LAPLACE LIKE`, unprofiled ([#2562](https://github.com/FeRx-NLME/ferx-core/issues/2562)) and profiled (the binary half of [#2111](https://github.com/FeRx-NLME/ferx-core/issues/2111)); see the section below | `profile_logit_b1_laplace.ctl` | `profile_logit_b1.ferx` *(in `tests/binary_logit_levels.rs`)* |
+| **A probit link for a binary predictor** | `[binary_model] probit =` (`P = PHI(LP)`) on B1-probit, 2400 Bernoulli rows with an unstructured placebo and a study `ETA` on the probit scale, under `METHOD=COND LAPLACE LIKE`, unprofiled and profiled, plus a `MAXEVAL=0` tail point and a tabulation of NONMEM's `PHI` itself — [#2603](https://github.com/FeRx-NLME/ferx-core/issues/2603); see the section below | `probit_b1_laplace.ctl`, `probit_b1_tail.ctl`, `probit_phi_probe.ctl` (3) | `probit_b1.ferx` *(in `tests/binary_probit_nonmem_anchor.rs`)* |
 | **Nested levels × residual correlation** | `exact3` with each arm's residuals correlated, `correlation ar1\|car1(RHO) by ARM` — [#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082) PR5 (`MAXEVAL=0`, FOCEI; `gen_ctl.py` writes the streams) | `nested_levels_3_ar1/{ar1_r0,ar1_p05,ar1_m04,car1_p06}.ctl` | *(in `tests/nested_levels_correlation_nonmem_anchor.rs`)* |
 | **NPDE / NPD with a correlated residual** | a `block_sigma` correlation inside one combined error (A, ρ = −0.9) and across an `L2` total/unbound pair (B, ρ = −0.8) — [#1733](https://github.com/FeRx-NLME/ferx-core/issues/1733) | `npde_block_sigma_{a,b}.ctl` | `tests/fixtures/npde_block_sigma_{a,b}.ferx` *(in `tests/npde_block_sigma_nonmem_anchor.rs`)* |
 | **SAEM additive mu-reference** | SAEM on `E0 = MU_1 + ETA(1)` (additive mu-ref) against the same model without `MU_`, TVE0 and ω² free, every other θ `FIX` at `level_se_a`'s optimum; each estimate scored by `METHOD=1 MAXEVAL=0` — [#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540); the one-line `BASE = MU_1 + PLA + ETA(1)` as a mu-reference — [#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544); see the section below | `saem_additive_mu.ctl`, `saem_additive_mu_inline.ctl`, `saem_additive_mu_nomu.ctl` | `saem_additive_mu.ferx`, `saem_additive_mu_inline.ferx`, `saem_additive_mu_shared.ferx` *(in `tests/saem_additive_mu_nonmem_anchor.rs`)* |
@@ -1532,6 +1533,39 @@ on the exact discrete η-Hessian. FOCE and FOCEI give the Laplace objective on a
 The same anchor holds the profiled block (#2111): ferx is handed TVL, EMAX and Ω only and
 solves the 30 free levels itself through the predictor's implicit logit link, on the
 adjoint's exact Newton matrix (no finite-difference warning, which the test asserts).
+
+**A-B1-probit, a probit link (#2603).** `probit_b1_laplace.ctl` codes `probit_b1.ferx`
+(the A-B1 layout above, every level a `THETA`) with `P = PHI(LP)`. Data `probit_b1.csv`,
+written by `simulate_probit_b1.py` (synthetic, seed 2603): 10 studies × 4 visits × 2 arms ×
+30 Bernoulli rows, ID = study, drawn under `P = Φ(LP)` with TVL −0.3, EMAX 0.6, SD(η) 0.3,
+so the arm-visit probabilities run from 0.17 to 0.87. `$ESTIMATION METHOD=COND LAPLACE LIKE
+… SIGL=12 NSIG=4`: `MINIMIZATION SUCCESSFUL`, 4.3 significant digits; `$COV` reports S singular, as for A-B1.
+`probit_b1_tail.ctl` evaluates the same model (`MAXEVAL=0`) at TVL = −2.8, every level 0,
+where most records sit near `Φ = 3e-3`. Run with `nm3`
+(`~/NONMEMruns/ferx-2603-probit/`); the arm64 images land 2.4e-8 below it on the fit. Results:
+`results/probit_b1_{laplace,tail}.{lst,ext,phi}`.
+
+| | at NONMEM's optimum | at the tail point |
+|---|---|---|
+| NONMEM, anchor image | 3019.7507361661319 | 3882.8338506867021 |
+| independent Laplace with an exact `Φ` (`laplace_b1_check.py`) | 3019.7507340385255 | 3882.8338559211643 |
+| ferx `laplace` / `focei` / `foce` − exact `Φ` | 1.4e-12 each | 2.3e-12 each |
+| ferx − NONMEM | −2.13e-6 | +5.23e-6 |
+| ferx **profiled** at NONMEM's structural point − NONMEM | −2.16e-6; levels within 1.24e-5 | — |
+
+ferx numbers are macOS arm64 and Linux aarch64 (`tools/linux-test.sh`) alike, in every printed digit
+but the tail point's exact-`Φ` gap (2.3e-12 / 2.7e-12).
+
+**The ferx–NONMEM gap is NONMEM's `PHI`.** The same `laplace_b1_check.py` reproduces the
+logit twin A-B1 to −1.41e-9, so it computes NONMEM's objective; with an exact `Φ` it lands
+on ferx, not on NONMEM. `probit_phi_probe.ctl` tabulates `PHI(X)` at 25 points
+(`results/probit_phi_probe.tab`): against `erfc` it is off by 1e-8 to 3e-7 relative for
+|x| ≤ 2, 2.3e-6 at −2.5, 5e-5 at −3, 4.7e-4 at −4 and 1.0e-2 at −8. So the anchor holds ferx
+to the exact-`Φ` objective at 1e-10 and to NONMEM at 2e-5, with 4× headroom over the
+larger measured gap. Scoring the same point under the logit link moves the objective by
+37.7, which neither bound could miss. A NONMEM probit model whose predictor reaches the
+lower tail inherits that error, and ferx will not reproduce it: below about −3 the two
+differ by more than NONMEM's printed precision.
 
 **A-B2, a profiled block through a logit link (#2111).** `profile_logit_b2_focei.ctl` and
 `profile_logit_b2_laplace.ctl` code `profile_logit_b2.ferx` with every level a `THETA`

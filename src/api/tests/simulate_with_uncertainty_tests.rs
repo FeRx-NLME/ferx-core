@@ -315,7 +315,7 @@ fn binary_logit_time_varying_covariate_is_rejected_only_without_aligned_snapshot
     let msg = tv_refusal(&model, &pop, "binary_model");
     assert_eq!(
         msg,
-        "[binary_model] on CMT=3: the logit predictor references covariate `X`, which is \
+        "[binary_model] on CMT=3: the linear predictor references covariate `X`, which is \
          time-varying for subject `S1`, but that subject carries no per-record covariate \
          snapshot aligned with its binary records (it also has time-to-event records, or was \
          built in memory without `endpoint_covariates`), so the predictor could only read the \

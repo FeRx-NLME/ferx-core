@@ -18206,6 +18206,203 @@ fn bytecode_g_dual2_matches_fd() {
     );
 }
 
+/// `pnorm(x) = Φ(x)` (#2603) against references computed outside ferx, in both tails: R's
+/// `pnorm` (Linux and macOS agree in every printed digit) from −37.5 up, and, where that
+/// underflows, positivity and monotonicity through the subnormals. The branch switch at
+/// `x = −37` is continuous, `NaN` stays `NaN`, and `±∞` give `1` and `0`.
+///
+/// Mutations: the `exp(log Φ)` branch dropped (`normal_cdf` alone is `0` before the
+/// subnormals: the `−38.3` row); the value taken from the A&S `erf` (1.5e-7 off: every row);
+/// the switch moved (the continuity check).
+#[test]
+fn pnorm_value_matches_reference_in_both_tails() {
+    // (x, Φ(x)) from R 4.6.1 `pnorm`, %.17e.
+    let reference: [(f64, f64); 12] = [
+        (-37.5, 4.60535300958195519e-308),
+        (-37.01, 3.95358388740127839e-300),
+        (-36.99, 8.29093073247200962e-300),
+        (-30.0, 4.90671392714818718e-198),
+        (-8.0, 6.22096057427178486e-16),
+        (-3.0, 1.34989803163009458e-03),
+        (-1.0, 1.58655253931457046e-01),
+        (0.0, 0.5),
+        (0.5, 6.91462461274013007e-01),
+        (1.0, 8.41344746068542926e-01),
+        (3.0, 9.98650101968369897e-01),
+        (8.0, 9.99999999999999334e-01),
+    ];
+    for (x, want) in reference {
+        let got = pnorm_value(x);
+        let ast = eval_at(&unary("pnorm", lit(x)), &[], &[], &[], &[]);
+        assert_eq!(
+            got.to_bits(),
+            ast.to_bits(),
+            "x {x}: eval_expr is pnorm_value"
+        );
+        assert!(got.is_finite(), "x {x}: {got}");
+        let rel = ((got - want) / want).abs();
+        assert!(rel < 1e-12, "x {x}: {got} vs {want} (rel {rel:.2e})");
+    }
+    // Continuous across the switch at −37: the two sides differ by Φ′/Φ·Δ ≈ 37·Δ.
+    let (lo, hi) = (pnorm_value(-37.0 - 1e-9), pnorm_value(-37.0 + 1e-9));
+    assert!(lo > 0.0 && hi > lo, "{lo} {hi}");
+    assert!((hi / lo - 1.0).abs() < 1e-7, "jump at −37: {lo} vs {hi}");
+    // Below −37.5: positive, non-increasing to 0, through the subnormals.
+    assert!(pnorm_value(-38.3) > 0.0, "Φ(−38.3) is a subnormal, not 0");
+    assert!(pnorm_value(-38.3) < f64::MIN_POSITIVE);
+    let mut prev = pnorm_value(-36.0);
+    for i in 1..=400 {
+        let x = -36.0 - 0.01 * i as f64;
+        let v = pnorm_value(x);
+        assert!(
+            v.is_finite() && v >= 0.0 && v <= prev,
+            "x {x}: {v} after {prev}"
+        );
+        prev = v;
+    }
+    assert_eq!(pnorm_value(-40.0), 0.0);
+    assert!(pnorm_value(f64::NAN).is_nan());
+    assert_eq!(pnorm_value(f64::INFINITY), 1.0);
+    assert_eq!(pnorm_value(f64::NEG_INFINITY), 0.0);
+    // The upper tail rounds to 1 and never passes it.
+    assert_eq!(pnorm_value(9.0), 1.0);
+    assert!(pnorm_value(7.0) < 1.0);
+}
+
+/// `pnorm`'s jet through fourth order on a Taylor polynomial, against closed forms `φ`,
+/// `−xφ`, `(x² − 1)φ`, `(3x − x³)φ` and against central differences of the `f64` value, at
+/// points across both tails. The value is `pnorm_value` bit for bit. Mutations: any one
+/// lifted order changed (each of the four is compared).
+#[test]
+fn pnorm_jet_carries_four_exact_orders() {
+    use crate::sens::taylor::Taylor;
+    type T4 = Taylor<1, 4, 5>;
+    let fact = [1.0, 1.0, 2.0, 6.0, 24.0];
+    for x in [-37.5, -8.0, -2.2, -0.6, 0.0, 0.3, 1.7, 5.0] {
+        let t = pnorm_g(T4::seed(x, 0));
+        assert_eq!(t.c[0].to_bits(), pnorm_value(x).to_bits(), "x {x}");
+        let phi = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        let want = [
+            pnorm_value(x),
+            phi,
+            -x * phi,
+            (x * x - 1.0) * phi,
+            (3.0 * x - x * x * x) * phi,
+        ];
+        for k in 1..5 {
+            let got = t.c[k] * fact[k];
+            assert!(got.is_finite(), "x {x} order {k}: {got}");
+            assert!(
+                (got - want[k]).abs() <= 1e-14 * want[k].abs().max(1e-300),
+                "x {x} order {k}: {got} vs {}",
+                want[k]
+            );
+        }
+    }
+    // FD of the value path, where a difference is accurate.
+    for x in [-2.2, -0.6, 0.0, 0.3, 1.7] {
+        let t = pnorm_g(T4::seed(x, 0));
+        let h = 1e-5;
+        let fd = (pnorm_value(x + h) - pnorm_value(x - h)) / (2.0 * h);
+        assert!(fd.is_finite());
+        assert!((t.c[1] - fd).abs() < 1e-9, "x {x}: {} vs FD {fd}", t.c[1]);
+        let hh = 1e-4;
+        let fd2 = (pnorm_value(x + hh) - 2.0 * pnorm_value(x) + pnorm_value(x - hh)) / (hh * hh);
+        assert!(fd2.is_finite());
+        assert!(
+            (2.0 * t.c[2] - fd2).abs() < 1e-6,
+            "x {x}: {} vs FD {fd2}",
+            2.0 * t.c[2]
+        );
+    }
+}
+
+/// `pnorm` with the random effect inside the argument, `pnorm(A·(t + η) − B)` on the `Dual2`
+/// VM: the value is the `f64` VM's, the gradient and Hessian (the `η`–`A` cross term
+/// included) match closed forms and central FD of the `f64` VM, which shares no derivative
+/// code with the jet.
+#[test]
+fn bytecode_g_pnorm_dual2_matches_fd_with_eta_in_the_argument() {
+    use crate::sens::dual2::Dual2;
+    // arg = A·(0.4 + η) − 0.3, with A = vars[0] and η = Eta(0).
+    let arg = binop(
+        BinOp::Sub,
+        binop(
+            BinOp::Mul,
+            varidx(0),
+            binop(BinOp::Add, lit(0.4), Expression::Eta(0)),
+        ),
+        lit(0.3),
+    );
+    let expr = binop(BinOp::Mul, lit(2.0), unary("pnorm", arg));
+    let bc = compile_bytecode(&expr);
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let v = |amp: f64, eta: f64| {
+        let mut s: Vec<f64> = Vec::new();
+        eval_bytecode(&bc, &[], &[eta], &[], &[amp], &nn, &mut s)
+    };
+    let (amp, eta) = (1.3, 0.25);
+    let mut sd: Vec<Dual2<2>> = Vec::new();
+    let d = eval_bytecode_g::<Dual2<2>>(
+        &bc,
+        &[],
+        &[Dual2::<2>::var(eta, 1)],
+        &[],
+        &[Dual2::<2>::var(amp, 0)],
+        &[],
+        &mut sd,
+    );
+    assert!(close(d.value, v(amp, eta), 1e-15, 1e-15), "value vs f64 VM");
+    let u = 0.4 + eta;
+    let z = amp * u - 0.3;
+    let phi = (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    // f = 2Φ(z): ∂f/∂A = 2φu, ∂f/∂η = 2φA; ∂²f/∂A² = −2zφu², ∂²f/∂η² = −2zφA²,
+    // ∂²f/∂A∂η = 2φ(1 − zAu).
+    let want_g = [2.0 * phi * u, 2.0 * phi * amp];
+    let want_h = [
+        [-2.0 * z * phi * u * u, 2.0 * phi * (1.0 - z * amp * u)],
+        [2.0 * phi * (1.0 - z * amp * u), -2.0 * z * phi * amp * amp],
+    ];
+    for i in 0..2 {
+        assert!(
+            close(d.grad[i], want_g[i], 1e-14, 1e-14),
+            "grad[{i}]: {} vs {}",
+            d.grad[i],
+            want_g[i]
+        );
+        for j in 0..2 {
+            assert!(
+                close(d.hess[i][j], want_h[i][j], 1e-14, 1e-14),
+                "hess[{i}][{j}]: {} vs {}",
+                d.hess[i][j],
+                want_h[i][j]
+            );
+        }
+    }
+    let h = 1e-5;
+    let gfd = [
+        (v(amp + h, eta) - v(amp - h, eta)) / (2.0 * h),
+        (v(amp, eta + h) - v(amp, eta - h)) / (2.0 * h),
+    ];
+    let hh = 1e-4;
+    let hfd_ee = (v(amp, eta + hh) - 2.0 * v(amp, eta) + v(amp, eta - hh)) / (hh * hh);
+    let hfd_ae = (v(amp + hh, eta + hh) - v(amp + hh, eta - hh) - v(amp - hh, eta + hh)
+        + v(amp - hh, eta - hh))
+        / (4.0 * hh * hh);
+    for (got, fd, what) in [
+        (d.grad[0], gfd[0], "∂/∂A"),
+        (d.grad[1], gfd[1], "∂/∂η"),
+        (d.hess[1][1], hfd_ee, "∂²/∂η²"),
+        (d.hess[0][1], hfd_ae, "∂²/∂A∂η"),
+    ] {
+        assert!(
+            got.is_finite() && fd.is_finite(),
+            "{what}: {got} vs FD {fd}"
+        );
+        assert!(close(got, fd, 1e-6, 1e-6), "{what}: {got} vs FD {fd}");
+    }
+}
+
 /// `sin`/`cos` (#2720) on the `Dual2` VM with the **random effect inside the
 /// argument** — the circadian shape `A·cos(2π(t + η)/24 − φ) + B·sin(4π(t + η)/24 − φ₂)`,
 /// seeded in η (the phase shift) and in the amplitude `A`, against central FD of the
@@ -26801,6 +26998,7 @@ fn every_supported_unary_fn_has_an_arm_in_all_three_consumers() {
         ("softplus", 0.5),
         ("sin", 0.5),
         ("cos", 0.5),
+        ("pnorm", 0.5),
     ];
     // The probe table must equal the const as a *multiset*, asserted as one
     // comparison of sorted vectors rather than as a set of membership and
@@ -32606,7 +32804,7 @@ fn word_valued_keys_reject_an_identifier_value() {
                 rhs,
                 "[binary_model]\n  cmt = 3\n  logit = 0.5\n  link = V\n",
             ),
-            "link `V` is not yet supported",
+            "link `V` is not supported",
         ));
     }
     #[cfg(feature = "markov")]
@@ -36480,7 +36678,7 @@ fn linked_of(text: &str, name: &str) -> bool {
         .linked
 }
 
-const LINK_SENTENCE: &str = "A logit link is accepted only as the whole prediction";
+const LINK_SENTENCE: &str = "is accepted only as the whole prediction";
 
 /// The two arms of an `if` on data, each a link around an affine read.
 const LINK_BRANCHES: &str = "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0\n  if (DOSE > 0) {\n    P = \
@@ -36555,9 +36753,10 @@ fn profile_refuses_a_logit_link_that_is_not_the_whole_prediction() {
         assert!(msg.contains(&here), "missing {here:?} in {msg}");
         assert!(
             msg.contains(
-                "A logit link is accepted only as the whole prediction, `y = inv_logit(c × \
-                 PLACEBO + …)`, on every branch of an `if` that chooses it, not scaled, added \
-                 to or inside another link."
+                "A link (`inv_logit`, `expit` or `pnorm`) is accepted only as the whole \
+                 prediction, `y = inv_logit(c × PLACEBO + …)` or `y = pnorm(c × PLACEBO + …)`, \
+                 on every branch of an `if` that chooses it, not scaled, added to or inside \
+                 another link."
             ),
             "{msg}"
         );
@@ -38347,5 +38546,127 @@ fn the_not_mu_referenced_advice_over_the_additive_input_space() {
             "{label}: {w}"
         );
         assert!(w.contains(says), "{label}: {w}");
+    }
+}
+
+/// `[binary_model]`'s link surface (#2603), every cell of the plan's table: the predictor's
+/// key names its link, `link =` is optional and must agree with it. Each accepted cell
+/// asserts the parsed `LinkFn`; each refused cell asserts every sentence of its message and
+/// the absence of the other cells' text, so a message serving the wrong cell cannot pass.
+#[cfg(feature = "survival")]
+#[test]
+fn binary_model_link_cells() {
+    use crate::types::{EndpointLikelihood, LinkFn};
+    let wrap = |block: &str| {
+        format!("[parameters]\n  theta TH0(0.0, -10.0, 10.0)\n[binary_model]\n  cmt = 3\n{block}\n")
+    };
+    let link_of = |block: &str| -> LinkFn {
+        let m = parse_model_string(&wrap(block)).unwrap_or_else(|e| panic!("{block}: {e}"));
+        match m.endpoints.get(&3) {
+            Some(EndpointLikelihood::Binary { link, .. }) => *link,
+            _ => panic!("{block}: no binary endpoint"),
+        }
+    };
+    assert_eq!(link_of("  logit = TH0"), LinkFn::Logit);
+    assert_eq!(link_of("  logit = TH0\n  link = logit"), LinkFn::Logit);
+    assert_eq!(link_of("  probit = TH0"), LinkFn::Probit);
+    assert_eq!(link_of("  link = probit\n  probit = TH0"), LinkFn::Probit);
+
+    let err = |block: &str| {
+        parse_model_string(&wrap(block))
+            .err()
+            .unwrap_or_else(|| panic!("{block} parsed"))
+    };
+    // `link` disagreeing with the key, both ways round: each names the declared link, the key
+    // used and the key to write.
+    let e = err("  logit = TH0\n  link = probit");
+    assert!(
+        e.contains("`link = probit` but the predictor is written `logit = …`"),
+        "{e}"
+    );
+    assert!(
+        e.contains("under `link = probit` write the predictor as `probit = …`"),
+        "{e}"
+    );
+    let e = err("  probit = TH0\n  link = logit");
+    assert!(
+        e.contains("`link = logit` but the predictor is written `probit = …`"),
+        "{e}"
+    );
+    assert!(
+        e.contains("under `link = logit` write the predictor as `logit = …`"),
+        "{e}"
+    );
+    // Both keys in one block.
+    let e = err("  logit = TH0\n  probit = TH0");
+    assert!(
+        e.contains("the predictor is given twice (`logit` and `probit`)"),
+        "{e}"
+    );
+    assert!(
+        e.contains("a block has one linear predictor, written under the key that names its link"),
+        "{e}"
+    );
+    assert!(!e.contains("but the predictor is written"), "{e}");
+    // An unknown link lists the two that exist.
+    let e = err("  logit = TH0\n  link = cloglog");
+    assert!(e.contains("link `cloglog` is not supported"), "{e}");
+    assert!(
+        e.contains("the links are `logit` (the default) and `probit`"),
+        "{e}"
+    );
+    assert!(!e.contains("planned"), "{e}");
+    // No predictor at all names both keys.
+    let e = err("  link = probit");
+    assert!(e.contains("missing the linear predictor"), "{e}");
+    assert!(
+        e.contains("write `logit = …` (logit link) or `probit = …` (probit link)"),
+        "{e}"
+    );
+    // The unknown-key message lists `probit`.
+    let e = err("  logit = TH0\n  bogus = 1");
+    assert!(e.contains("valid keys: cmt, logit, probit, link"), "{e}");
+}
+
+/// `pnorm` is a link to the profile route as `inv_logit` is (#2603): an outermost
+/// `pnorm(affine)` is accepted and marks the block linked, inline and through a parameter,
+/// while `pnorm(exp(block))` names the `exp`, and `100 * pnorm(…)` and a `pnorm` inside
+/// `inv_logit` are refused with the link sentence naming `pnorm(...)`. Each refused row's
+/// accepted twin is in the same test. Dies when `is_link` drops `pnorm` (the accepted rows
+/// are refused as `` `pnorm(...)` `` constructs), or when the link sentence loses `pnorm`.
+#[test]
+fn profile_accepts_an_outermost_pnorm_link_and_refuses_it_elsewhere() {
+    let base = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    for (indiv, y) in [
+        (base, "pnorm(BASE)"),
+        ("  P = pnorm(TVE0 + PLACEBO[STUDY] + ETA_E0)", "P"),
+    ] {
+        assert!(
+            linked_of(&route_model(indiv, y, ADD), "PLACEBO"),
+            "{indiv} / y = {y}"
+        );
+    }
+    let msg = route_err(
+        "  BASE = TVE0 + ETA_E0",
+        "pnorm(BASE + exp(PLACEBO[STUDY]))",
+        ADD,
+    );
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains("Here `PLACEBO` reaches `y` through `exp(...)` in the `y` readout."),
+        "{msg}"
+    );
+    assert!(!msg.contains("`pnorm(...)`"), "{msg}");
+    for (y, through) in [
+        ("100 * pnorm(BASE)", "`pnorm(...)`"),
+        ("inv_logit(pnorm(BASE))", "`pnorm(...)`"),
+        ("pnorm(inv_logit(BASE))", "`inv_logit(...)`"),
+    ] {
+        let msg = route_err(base, y, ADD);
+        assert_route_frame(&msg);
+        let here = format!("Here `PLACEBO` reaches `y` through {through} in the `y` readout.");
+        assert!(msg.contains(&here), "{y}: missing {here:?} in {msg}");
+        assert!(msg.contains(LINK_SENTENCE), "{y}: {msg}");
+        assert!(msg.contains("`y = pnorm(c × PLACEBO + …)`"), "{y}: {msg}");
     }
 }
