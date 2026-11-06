@@ -1813,6 +1813,110 @@ fn weakly_identified_coords(
     omega: &OmegaMatrix,
     n_eta: usize,
 ) -> Vec<bool> {
+    weakly_identified_axes(obj, eta, nll, &omega_prior_diag(omega, n_eta))
+}
+
+/// One coordinate of a search vector as its prior sees it: the variance and `(Ω⁻¹)ᵢᵢ`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AxisPrior {
+    var: f64,
+    inv: f64,
+}
+
+/// The first `n` coordinates' priors under `omega`.
+fn omega_prior_diag(omega: &OmegaMatrix, n: usize) -> Vec<AxisPrior> {
+    (0..n)
+        .map(|i| AxisPrior {
+            var: omega.matrix[(i, i)],
+            inv: omega.inv[(i, i)],
+        })
+        .collect()
+}
+
+/// The priors of the IOV inner loop's flat vector, in its order: `Ω` for the BSV block, then
+/// `Ω_iov` for each occasion's κ, or for each group of each level under nested levels
+/// (#1082). A model with no `omega_iov` has no κ prior, so its κ coordinates read as fixed.
+fn iov_prior_diag(
+    n_eta: usize,
+    n_kappa: usize,
+    k_occasions: usize,
+    nested: Option<&crate::stats::nested_levels::NestedLayout>,
+    params: &ModelParameters,
+) -> Vec<AxisPrior> {
+    let n_flat = nested.map_or(stacked_width(n_eta, n_kappa, k_occasions), |n| {
+        n.n_compact()
+    });
+    let mut out = omega_prior_diag(&params.omega, n_eta);
+    if let Some(oi) = params.omega_iov.as_ref() {
+        let of = |k: usize| AxisPrior {
+            var: oi.matrix[(k, k)],
+            inv: oi.inv[(k, k)],
+        };
+        match nested {
+            Some(n) => {
+                for (l, _) in n.blocks(&vec![0.0; n_flat]) {
+                    out.extend(n.kappas_at(l).into_iter().map(of));
+                }
+            }
+            None => (0..k_occasions).for_each(|_| out.extend((0..n_kappa).map(of))),
+        }
+    }
+    out.resize(
+        n_flat,
+        AxisPrior {
+            var: 0.0,
+            inv: f64::INFINITY,
+        },
+    );
+    out
+}
+
+/// Whether the objective rises and falls again on the way from the mode `x` to `seed`: the
+/// midpoint is at least as high as the seed. A function convex along that segment, with its
+/// minimum at `x`, has its midpoint below the seed, so this proves a barrier. It is
+/// deliberately not the chord test, which a saturating response fails with no second mode.
+/// Non-finite values prove nothing.
+fn section_has_barrier(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], seed: &[f64]) -> bool {
+    let mid: Vec<f64> = x.iter().zip(seed).map(|(a, b)| 0.5 * (a + b)).collect();
+    let (at_mid, at_seed) = (obj(&mid), obj(seed));
+    at_mid.is_finite() && at_seed.is_finite() && at_mid >= at_seed
+}
+
+/// The starts of the guarded multi-start's axis scan: `base` with one scanned coordinate
+/// replaced by `centre[i] ± (m + 1)·sd[i]` for `m` in `1..=restarts`, coordinate by
+/// coordinate, the negative seed of each pair first. A coordinate of zero prior SD has none.
+fn axis_seed_starts(
+    base: &[f64],
+    centre: &[f64],
+    scan: &[bool],
+    sd: &[f64],
+    restarts: usize,
+) -> Vec<Vec<f64>> {
+    let mut starts = Vec::new();
+    for i in 0..base.len() {
+        if !scan[i] || sd[i] == 0.0 {
+            continue;
+        }
+        for m in 1..=restarts {
+            let step = (m as f64 + 1.0) * sd[i];
+            for k in [-step, step] {
+                let mut start = base.to_vec();
+                start[i] = centre[i] + k;
+                starts.push(start);
+            }
+        }
+    }
+    starts
+}
+
+/// [`weakly_identified_coords`] over any search vector, each coordinate against its own
+/// [`AxisPrior`].
+fn weakly_identified_axes(
+    obj: &dyn Fn(&[f64]) -> f64,
+    eta: &[f64],
+    nll: f64,
+    prior: &[AxisPrior],
+) -> Vec<bool> {
     // Prior variances below this are effectively fixed effects. `from_matrix`
     // floors a zero-variance diagonal to a 1e-8 eigenvalue (it must stay PD for
     // the cached Cholesky/inverse), so an exactly-zero test never survives; this
@@ -1820,19 +1924,19 @@ fn weakly_identified_coords(
     // random effect (a 1% CV is variance ~1e-4), so a pinned effect is skipped
     // without ever excluding a real one.
     const FIXED_VAR_FLOOR: f64 = 1e-7;
-    let mut flags = vec![false; n_eta];
+    let mut flags = vec![false; prior.len()];
     if !nll.is_finite() {
         return flags;
     }
-    for i in 0..n_eta {
-        let var_prior = omega.matrix[(i, i)].max(0.0);
+    for (i, axis) in prior.iter().enumerate() {
+        let var_prior = axis.var.max(0.0);
         let sd = var_prior.sqrt();
         // Fixed / effectively-zero-variance effect: it cannot move, so never
         // scan it (the prior pins it at 0 regardless of seed).
         if var_prior <= FIXED_VAR_FLOOR {
             continue;
         }
-        let prior_curv = omega.inv[(i, i)];
+        let prior_curv = axis.inv;
         if !prior_curv.is_finite() || prior_curv <= 0.0 {
             continue;
         }
@@ -2281,6 +2385,9 @@ fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
 // so a test can observe which callers pay for it (#2014 review).
 #[cfg(test)]
 thread_local! {
+    /// Descents this thread has started from an IOV axis seed (#2730).
+    pub(crate) static IOV_AXIS_SEEDS_RUN: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     /// This thread's [`MULTISTART_PROFILE`] moves — twin seed, screen, axis scan — so a test
@@ -2367,6 +2474,9 @@ fn find_ebe_impl_from(
     }
     #[cfg(test)]
     with_recording(|r| r.solve_tols.push((subject.id.clone(), tol)));
+    // Every evaluation below is this subject under this model, so the `$PK` sharing index
+    // is built once for the search instead of once per evaluation (#2558).
+    let _share = pk::sharing_scope::SharingScope::enter(model, subject);
 
     // A nested-level subject that was never given its cells (#1082): refused, never
     // estimated as one-level IOV or with κ dropped. `hard_reject` keeps the outer loop
@@ -2401,6 +2511,7 @@ fn find_ebe_impl_from(
             tol,
             eta_init,
             mu_k,
+            restarts,
             policy.ebe_variance,
             policy.init_is_mode,
             if policy.unseeded_iov_warm {
@@ -3165,46 +3276,35 @@ fn find_ebe_solve(
         } else {
             weakly_identified_coords(&obj, &eta, nll, &params.omega, n_eta)
         };
-        let base = eta.clone();
+        let sds: Vec<f64> = omega_prior_diag(&params.omega, n_eta)
+            .iter()
+            .map(|p| p.var.max(0.0).sqrt())
+            .collect();
         let mut axis_moved = false;
-        for i in 0..n_eta {
-            if !scan_coord[i] {
-                continue;
-            }
-            let sd = params.omega.matrix[(i, i)].max(0.0).sqrt();
-            if sd == 0.0 {
-                continue;
-            }
-            for m in 1..=restarts {
-                let step = (m as f64 + 1.0) * sd;
-                for &k in &[-step, step] {
-                    let mut cand = base.clone();
-                    cand[i] = k;
-                    let ok = inner_minimize_with_grad(
-                        &obj,
-                        &agrad,
-                        &mut cand,
-                        n_eta,
-                        max_iter,
-                        tol,
-                        precond.as_deref(),
-                        None,
-                        stop_precond,
-                        &stall_at,
-                        false,
-                    );
-                    if cand.iter().all(|v| v.is_finite()) {
-                        let cand_nll = obj(&cand);
-                        if cand_nll + 1e-9 < nll {
-                            nll = cand_nll;
-                            eta = cand;
-                            ebe_exit = ok;
-                            used_fallback = false;
-                            axis_moved = true;
-                            #[cfg(test)]
-                            AXIS_SWAPS.with(|n| n.set(n.get() + 1));
-                        }
-                    }
+        for mut cand in axis_seed_starts(&eta, &vec![0.0; n_eta], &scan_coord, &sds, restarts) {
+            let ok = inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                &mut cand,
+                n_eta,
+                max_iter,
+                tol,
+                precond.as_deref(),
+                None,
+                stop_precond,
+                &stall_at,
+                false,
+            );
+            if cand.iter().all(|v| v.is_finite()) {
+                let cand_nll = obj(&cand);
+                if cand_nll + 1e-9 < nll {
+                    nll = cand_nll;
+                    eta = cand;
+                    ebe_exit = ok;
+                    used_fallback = false;
+                    axis_moved = true;
+                    #[cfg(test)]
+                    AXIS_SWAPS.with(|n| n.set(n.get() + 1));
                 }
             }
         }
@@ -3508,6 +3608,7 @@ fn find_ebe_iov(
         tol,
         eta_init,
         mu_k,
+        0,
         ebe_variance,
         init_is_mode,
         InnerHessianSeed::GaussNewton,
@@ -3525,6 +3626,7 @@ fn find_ebe_iov_seeded(
     tol: f64,
     eta_init: Option<&[f64]>,
     mu_k: Option<&[f64]>,
+    restarts: usize,
     ebe_variance: EbeVariance,
     init_is_mode: bool,
     seed: InnerHessianSeed,
@@ -3995,6 +4097,81 @@ fn find_ebe_iov_seeded(
     } else {
         InnerExit::certified(nm_converged)
     };
+    // ── Guarded multi-start, IOV twin (`[fit_options] inner_restarts`, #2730) ───
+    // The axis scan of `find_ebe_solve`, on the flat vector `[ψ, κ_1, …, κ_K]`: a mode that
+    // differs in one occasion's κ is as invisible to a single descent as one in η, and the
+    // reset / TV-covariate subjects whose individual objective is multimodal are the same
+    // ones here. The same gates apply: cold starts only, every coordinate on a family-1
+    // subject and the flat ones otherwise, seeds from each coordinate's own prior SD.
+    //
+    // Three differences. A seed is placed about the prior's centre, which for ψ is `μ`, not
+    // 0. A candidate must also lie more than `SCREEN_MIN_OMEGA_DIST` from the incumbent in
+    // the joint prior's metric, as a Sobol screen descent must: this solve's descents stop
+    // on a stall or at a loose gradient norm, so two of them on one mode can differ by more
+    // than `1e-9`, and the objective guard alone would move a unimodal subject's EBE. And
+    // a family-2 subject also scans a coordinate that is well curved at the incumbent but
+    // has a barrier on the way to a seed ([`section_has_barrier`]): an occasion's κ with a
+    // few informative samples and a second solution on the far side of a peak in the
+    // response is sharp at both modes, so the flatness probe alone never sees it.
+    //
+    // Cost: `2·restarts` descents per scanned coordinate, so linear in the occasions, and
+    // on cold solves only; the probes are objective evaluations, `2` per seed. The Sobol
+    // screen and the twin seed stay off this path.
+    if restarts > 0 && !is_warm_start(eta_init, init_is_mode) {
+        #[cfg(test)]
+        EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
+        let mut nll = obj(&x);
+        let prior = iov_prior_diag(n_eta, n_kappa, k_occasions, nested, params);
+        let scan_all = subject.has_resets() || subject.has_tv_covariates();
+        let sds: Vec<f64> = prior.iter().map(|p| p.var.max(0.0).sqrt()).collect();
+        let mut centre = vec![0.0; n_flat];
+        centre[..n_eta].copy_from_slice(&mu);
+        let scan_coord: Vec<bool> = if scan_all {
+            vec![true; n_flat]
+        } else {
+            weakly_identified_axes(&obj, &x, nll, &prior)
+                .into_iter()
+                .enumerate()
+                .map(|(i, flat)| {
+                    let only_i: Vec<bool> = (0..n_flat).map(|j| j == i).collect();
+                    flat || axis_seed_starts(&x, &centre, &only_i, &sds, restarts)
+                        .iter()
+                        .any(|seed| section_has_barrier(&obj, &x, seed))
+                })
+                .collect()
+        };
+        let mut axis_moved = false;
+        for mut cand in axis_seed_starts(&x, &centre, &scan_coord, &sds, restarts) {
+            #[cfg(test)]
+            IOV_AXIS_SEEDS_RUN.with(|n| n.set(n.get() + 1));
+            let ok = inner_minimize_with_grad(
+                &obj, &agrad, &mut cand, n_flat, max_iter, tol, None, None, None, &stall_at, false,
+            );
+            if cand.iter().all(|v| v.is_finite()) {
+                let cand_nll = obj(&cand);
+                // The difference, re-centred on `μ` because the metric takes a point in ψ.
+                let gap: Vec<f64> = cand
+                    .iter()
+                    .zip(&x)
+                    .zip(&centre)
+                    .map(|((c, i), m)| c - i + m)
+                    .collect();
+                let dist =
+                    iov_prior_maha(&gap, &mu, n_eta, n_kappa, k_occasions, nested, params).sqrt();
+                if cand_nll + 1e-9 < nll && dist > SCREEN_MIN_OMEGA_DIST {
+                    nll = cand_nll;
+                    x = cand;
+                    ebe_exit = ok;
+                    used_fallback = false;
+                    axis_moved = true;
+                    #[cfg(test)]
+                    AXIS_SWAPS.with(|n| n.set(n.get() + 1));
+                }
+            }
+        }
+        MULTISTART_PROFILE.record(false, false, axis_moved);
+    }
+
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
     if !skip_ode_iov_nm_fallback(model)
         && iov_prior_maha(&x, &mu, n_eta, n_kappa, k_occasions, nested, params) > runaway_limit

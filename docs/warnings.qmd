@@ -80,7 +80,7 @@ the same list on each:
 | `predict_survival()`, `predict_survival_diag()` | time-varying covariate on a hazard, θ levels bound, θ length, population bound for the θ levels, covariates present, dose compartment, covariate levels |
 | `predict_categorical()` | time-varying covariate on the linear predictor, θ levels bound, θ length, population bound for the θ levels, covariates present, endpoint routing, covariate levels |
 | `inits_from_nca()` | coded `RATE`, dose compartment |
-| `simulate_adaptive()`, `simulate_adaptive_from_spec()` | an ODE model, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), a covariate-selected `[error_model]`, θ length, then the rest of its own adaptive-dosing rejections (`simulate_adaptive_from_spec()` first refuses an `opts` that sets `decision_times` or `monitors`), then coded `RATE`, dose compartment, absorption closed-form support, absorption input rate. **Not** the time-varying covariate on a hazard, and not the flip-flop check. |
+| `simulate_adaptive()`, `simulate_adaptive_from_spec()` | an ODE model, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), a covariate-selected `[error_model]`, a residual-error magnitude, θ length, then its other adaptive-dosing rejections (`simulate_adaptive_from_spec()` first refuses an `opts` that sets `decision_times` or `monitors`), then coded `RATE`, dose compartment, absorption closed-form support, absorption input rate. **Not** the time-varying covariate on a hazard, and not the flip-flop check. |
 | `predict()` | `predict_diag()`'s list, in its order. |
 | `simulate()`, `simulate_with_seed()` | the same set as `simulate_with_options()` bar `horizon`, which they do not take, in a different order — θ length, coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model, TTE simulatable, Ω~IOV~ present, the simulation data checks. |
 
@@ -214,7 +214,7 @@ reports each one it can reach, so the two do not disagree:
 | repeated-event records out of order, interval-censored, … | `E_RTTE_RECORDS` | with `--data` |
 | a binary DV outside {0, 1} | `E_BINARY_STATE` | with `--data` |
 | a CTMM state not declared, CTMM times out of order | `E_CTMM_RECORDS` | with `--data` |
-| LTBS on a hand-built model with a proportional or combined error, per-CMT errors or an SDE | `E_LTBS_UNSUPPORTED` | the parser refuses it first |
+| LTBS on a hand-built model with a proportional or (natural-scale) combined error on any endpoint, a covariate-selected error model or an SDE, or a `LogCombined` error without LTBS | `E_LTBS_UNSUPPORTED` | the parser refuses it first |
 | `iiv_on_ruv`: an η also used in `[individual_parameters]`; a non-interaction method | `E_IIV_ON_RUV_SHARED_ETA`; `E_IIV_ON_RUV_METHOD` | yes |
 | the AGQ grid under IOV | `E_AGQ_GRID_TOO_LARGE` | with `--data` |
 | a derived `iov_occasion` that gives one occasion per subject | `E_IOV_SINGLE_OCCASION` | with `--data` |

@@ -136,6 +136,64 @@ pub struct DoseEvent {
     /// NONMEM gives no `$PK` call of its own; see [`ImpliedDose`]. Set only by the reader,
     /// so a dose built in memory is a record, as before. Crate-private, like `evid4`.
     pub(crate) implied: Option<ImpliedDose>,
+    /// The time this dose's input stops because its compartment was turned off (#2732),
+    /// `+∞` when it never does: the first `EVID=2`, `CMT=-N` row on its compartment after
+    /// its record, or after its parent's for an `ADDL`-implied dose. NONMEM cancels the
+    /// input whatever stage it has reached, measured in `nonmem_anchor/cmt_toggle.ctl`: an
+    /// infusion stops and does not resume when the compartment comes back, a lagged dose
+    /// still in flight never lands, and the rest of an `ADDL` train never arrives. Read
+    /// through `ode::predictions::ResetGate`. `+∞` on every stored subject: only the copy a
+    /// state walk takes from `Subject::with_cmt_cutoffs` carries a finite one, derived from
+    /// `Subject::cmt_toggles`, so no edit to those rows can leave it stale. Crate-private,
+    /// like `evid4`.
+    pub(crate) off_at: f64,
+}
+
+/// One compartment on/off record (#2732): an `EVID=2` row with `CMT=N` (on) or `CMT=-N`
+/// (off) on a subject that turns a compartment off somewhere.
+///
+/// Off zeroes the amount and holds it at zero: the state's own `d/dt` is discarded, so
+/// mass flowing in is lost, and any term reading the state sees zero. On restarts it from
+/// zero, without re-applying `init(...)`. A dose arrival also turns its compartment on,
+/// and a reset turns every compartment on.
+///
+/// A subject built in memory fills this and `Subject::pk_only_times` and nothing else: what
+/// the row does to dose input is derived from them. It has no file order, so records at the
+/// row's exact time take the engines' order, `Reset < Dose < PkOnly < Obs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CmtToggle {
+    /// Index into `Subject::pk_only_times` of the row. The row is an ordinary record,
+    /// so it takes its time, and its place among co-timed records, from there.
+    pub pk_only: usize,
+    /// 0-based state index.
+    pub state: usize,
+    /// `true` for on, `false` for off.
+    pub on: bool,
+}
+
+/// The time each dose's input stops: the first off row on its compartment at or after its
+/// record, or after its parent's for an `ADDL`-implied dose, since the train was scheduled
+/// there. `+∞` when no off row follows. The one rule for `DoseEvent::off_at` (#2732).
+///
+/// "At" is the engines' order: a dose sorts ahead of a co-timed row, so the row stops it. The
+/// reader leaves no such tie, having put the two a ULP apart in file order.
+pub(crate) fn cmt_off_times(
+    doses: &[DoseEvent],
+    toggles: &[CmtToggle],
+    pk_only_times: &[f64],
+) -> Vec<f64> {
+    doses
+        .iter()
+        .map(|d| {
+            let record = d.implied.map_or(d.time, |i| doses[i.parent].time);
+            toggles
+                .iter()
+                .filter(|c| !c.on && c.state == d.cmt_idx())
+                .filter_map(|c| pk_only_times.get(c.pk_only).copied())
+                .filter(|&t| t >= record)
+                .fold(f64::INFINITY, f64::min)
+        })
+        .collect()
 }
 
 /// Which records parameterise an `ADDL`-implied dose (#1909). NONMEM evaluates `$PK` only
@@ -197,6 +255,7 @@ impl DoseEvent {
             infusion_def: InfusionDef::RateDefined,
             evid4: false,
             implied: None,
+            off_at: f64::INFINITY,
         }
     }
 
@@ -225,6 +284,7 @@ impl DoseEvent {
             infusion_def,
             evid4: false,
             implied: None,
+            off_at: f64::INFINITY,
         }
     }
 
@@ -1070,6 +1130,10 @@ pub struct Subject {
     /// constant covariates `reset_cov` falls back to the subject-static map and
     /// every convention agrees.
     pub reset_covariates: Vec<HashMap<String, f64>>,
+    /// Compartment on/off records (#2732), in file order. Empty for a subject that never
+    /// turns a compartment off: an `EVID=2`, `CMT=N` row with nothing to turn back on
+    /// changes nothing and is not kept. See [`CmtToggle`].
+    pub cmt_toggles: Vec<CmtToggle>,
     /// Censoring flag per observation (0 = quantified, 1 = below LLOQ, -1 = above ULOQ).
     /// On censored rows, `observations[j]` holds the corresponding LOQ limit.
     pub cens: Vec<i8>,
@@ -1222,6 +1286,35 @@ impl Subject {
         !self.reset_times.is_empty()
     }
 
+    /// True when this subject turns a compartment off (`EVID=2`, `CMT=-N`, #2732).
+    pub fn has_cmt_toggles(&self) -> bool {
+        !self.cmt_toggles.is_empty()
+    }
+
+    /// True when this subject's state can jump at a record: a reset or a compartment
+    /// on/off row. Neither has a place in the dense ODE walk, so such a subject takes the
+    /// event-driven one.
+    pub fn has_state_events(&self) -> bool {
+        self.has_resets() || self.has_cmt_toggles()
+    }
+
+    /// This subject with each `DoseEvent::off_at` set from `cmt_toggles`, for a state walk to
+    /// read. Borrowed for a subject with no on/off row. The copy is the cost of keeping the
+    /// cutoffs off the stored subject, paid only by subjects with such a row, and small
+    /// against the solve it precedes.
+    pub(crate) fn with_cmt_cutoffs(&self) -> std::borrow::Cow<'_, Subject> {
+        use std::borrow::Cow;
+        if self.cmt_toggles.is_empty() {
+            return Cow::Borrowed(self);
+        }
+        let off_times = cmt_off_times(&self.doses, &self.cmt_toggles, &self.pk_only_times);
+        let mut owned = self.clone();
+        for (d, off_at) in owned.doses.iter_mut().zip(off_times) {
+            d.off_at = off_at;
+        }
+        Cow::Owned(owned)
+    }
+
     /// True when any dose record on this subject is flagged steady-state
     /// (SS=1). Used to gate paths that don't yet honour SS (event-driven,
     /// AD propagators, ODE) — see `estimation/inner_optimizer.rs` and the
@@ -1291,6 +1384,20 @@ impl Subject {
             .map(|d| d.time)
             .filter(|&t| t >= seg_start - 1e-9)
             .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Every per-record covariate snapshot of the subject — observation, dose, PK-only,
+    /// reset and non-Gaussian endpoint rows — each a map some predictor reads at its
+    /// record. Not the subject-static `covariates` map. The one list of record kinds for
+    /// the covariate presence check (`population_carries`, #2671), so a kind cannot be
+    /// left out of one caller and kept in another.
+    pub(crate) fn record_maps(&self) -> impl Iterator<Item = &HashMap<String, f64>> {
+        self.obs_covariates
+            .iter()
+            .chain(&self.dose_covariates)
+            .chain(&self.pk_only_covariates)
+            .chain(&self.reset_covariates)
+            .chain(&self.endpoint_covariates)
     }
 
     /// Covariate snapshot at observation index `j`. Falls back to the
@@ -3201,6 +3308,15 @@ pub enum ErrorModel {
     Additive,
     Proportional,
     Combined,
+    /// Combined proportional + additive error under log-transform-both-sides
+    /// (`log(DV) ~ combined(PROP, ADD)` / `DV ~ log_combined(PROP, ADD)`, #2729):
+    /// `Var(log y) = PROP² + ADD²/F²`, NONMEM's `W = SQRT(PROP**2 + ADD**2/IPR**2)`.
+    /// `PROP` is on the log scale (unitless); `ADD` is in natural `DV` units, and `F`
+    /// is the natural-scale prediction floored at the LTBS floor
+    /// (`IF (IPR.LT.1E-12) IPR=1E-12`). The residual is scored on the log scale, so
+    /// the variance is written in the log prediction `g = log(max(F, floor))` as
+    /// `PROP² + ADD²·exp(−2g)`. Only meaningful with `log_transform = true`.
+    LogCombined,
 }
 
 /// How a sigma parameter enters the residual error model.
@@ -3216,7 +3332,9 @@ impl ErrorModel {
         match self {
             ErrorModel::Proportional => vec![SigmaType::Proportional],
             ErrorModel::Additive => vec![SigmaType::Additive],
-            ErrorModel::Combined => vec![SigmaType::Proportional, SigmaType::Additive],
+            ErrorModel::Combined | ErrorModel::LogCombined => {
+                vec![SigmaType::Proportional, SigmaType::Additive]
+            }
         }
     }
 
@@ -3224,7 +3342,7 @@ impl ErrorModel {
     pub fn n_sigma(self) -> usize {
         match self {
             ErrorModel::Additive | ErrorModel::Proportional => 1,
-            ErrorModel::Combined => 2,
+            ErrorModel::Combined | ErrorModel::LogCombined => 2,
         }
     }
 }
@@ -8688,14 +8806,13 @@ pub struct FitResult {
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///
-    /// The checkpoint format does not round-trip per-record time-to-event diagnostics
-    /// (`SubjectResult::tte_rows`), so a restored fit of a TTE model has none. This flag
-    /// lets [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose model
-    /// declares a time-to-event endpoint (rows genuinely dropped) while still writing a
-    /// live fit. It is paired with the model's declared endpoints, parsed from
-    /// [`Self::model_text`]. Runtime-only: `#[serde(skip)]`, so no `.fitrx` / JSON / ferx-r
-    /// format change, and a live fit always carries `false`. Removed once diagnostics
-    /// round-trip (#911).
+    /// The checkpoint carries per-record time-to-event diagnostics
+    /// (`SubjectResult::tte_rows`) since #911, but a bundle written before that has none.
+    /// This flag lets [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose
+    /// model declares a time-to-event endpoint and whose subjects carry no TTE row (rows
+    /// genuinely dropped) while still writing a live fit. It is paired with the model's
+    /// declared endpoints, parsed from [`Self::model_text`]. Runtime-only: `#[serde(skip)]`,
+    /// so no `.fitrx` / JSON / ferx-r format change, and a live fit always carries `false`.
     #[serde(skip)]
     pub restored_from_checkpoint: bool,
     /// Free-parameter tally by Delattre class, the inputs to the BIC variants

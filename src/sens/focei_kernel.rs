@@ -26,7 +26,7 @@
 
 use crate::sens::num::PkNum;
 use crate::sens::rtape::DualT;
-use crate::stats::residual_error::ResidualCov;
+use crate::stats::residual_error::{LoadingForm, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 
 /// The population parameters the likelihood reads directly, as kernel values: Ω (by
@@ -232,8 +232,9 @@ impl<'a> LikCtx<'a> {
     }
 
     /// Row `j`'s σ loadings at prediction `f`, as generic values: a constant slot's
-    /// coefficient, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
-    /// `power(...)` exponent — each times the custom magnitude multiplier. The same
+    /// `1`, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
+    /// `power(...)` exponent — and a `LogCombined` additive slot's `exp(−f)` (#2729),
+    /// each times the custom magnitude multiplier. The same
     /// loadings as `ErrorSpec::scaled_loadings`, built in `T` arithmetic so every order
     /// of derivative in `f`, `θ` and `η` is exact without a hand-written rule. Returned
     /// in a fixed buffer with its length (no allocation per row).
@@ -246,14 +247,13 @@ impl<'a> LikCtx<'a> {
         let n_sigma = p.sigma.len();
         let mult = p.ruv_mult.as_ref().and_then(|m| m.get(j));
         let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
-        let (shape, len) = self
+        let shape = self
             .model
             .error_spec
-            .sigma_loading_shape(self.keys[j], self.params.sigma.values.len());
-        for (o, &(idx, c0, slope)) in out.iter_mut().zip(&shape[..len]) {
-            let c = if slope == 0.0 {
-                T::from_f64(c0)
-            } else {
+            .loading_shape(self.keys[j], self.params.sigma.values.len());
+        let len = shape.len();
+        for (o, &(idx, form)) in out.iter_mut().zip(shape.iter()) {
+            let c = if form == LoadingForm::Prop {
                 // `slot_exponent`: the exponent half of the row, when present.
                 match mult
                     .filter(|m| m.len() == 2 * n_sigma)
@@ -266,8 +266,10 @@ impl<'a> LikCtx<'a> {
                             T::from_f64(if f.val() < 0.0 { -1.0 } else { 1.0 }) * f.abs().pow(pw)
                         }
                     }
-                    _ => T::from_f64(c0) + f * T::from_f64(slope),
+                    _ => form.coeff_g(f),
                 }
+            } else {
+                form.coeff_g(f)
             };
             let m = mult
                 .and_then(|m| m.get(idx).copied())

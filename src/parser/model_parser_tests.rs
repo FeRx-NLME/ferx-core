@@ -2367,6 +2367,7 @@ fn tv_cov_population() -> crate::types::Population {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
             obs_l2: Vec::new(),
@@ -10398,14 +10399,204 @@ fn test_ltbs_rejects_non_dv_lhs() {
     );
 }
 
+// ── #2729: combined proportional + additive under LTBS ───────────────────
+
 #[test]
-fn test_ltbs_rejects_per_cmt() {
-    // LTBS is single-endpoint only.
-    let err = model_with_error_block("  CMT=1: log(DV) ~ additive(SIG1)").unwrap_err();
+fn test_ltbs_log_dv_combined_is_log_combined() {
+    // `log(DV) ~ combined(PROP, ADD)`: engine logs DV; the additive part stays in
+    // natural units, so it is `LogCombined`, not the natural-scale `Combined`.
+    let m = model_with_error_block("  log(DV) ~ combined(SIG1, SIG2)").unwrap();
+    assert!(m.log_transform && !m.dv_pre_logged);
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+    assert!(matches!(
+        m.error_spec,
+        crate::types::ErrorSpec::Single(ErrorModel::LogCombined)
+    ));
+}
+
+#[test]
+fn test_ltbs_log_combined_case1() {
+    // `DV ~ log_combined(PROP, ADD)`: DV already log; only the prediction is logged.
+    let m = model_with_error_block("  DV ~ log_combined(SIG1, SIG2)").unwrap();
+    assert!(m.log_transform && m.dv_pre_logged);
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+}
+
+#[test]
+fn test_plain_combined_stays_natural_scale() {
+    let m = model_with_error_block("  DV ~ combined(SIG1, SIG2)").unwrap();
+    assert!(!m.log_transform);
+    assert_eq!(m.error_model, ErrorModel::Combined);
+}
+
+#[test]
+fn test_log_combined_rejects_the_forms_it_cannot_take() {
+    let err = model_with_error_block("  log(DV) ~ log_combined(SIG1, SIG2)").unwrap_err();
     assert!(
-        err.contains("per-CMT") || err.contains("multi-endpoint"),
-        "expected per-CMT rejection, got: {err}"
+        err.contains("double-log")
+            && err.contains("`log(DV) ~ combined(...)`")
+            && err.contains("`DV ~ log_combined(...)`")
+            && !err.contains("additive(...)"),
+        "double-log names the combined spellings: {err}"
     );
+    let err = model_with_error_block("  log(DV) ~ log_additive(SIG1)").unwrap_err();
+    assert!(
+        err.contains("`log(DV) ~ additive(...)`") && !err.contains("combined"),
+        "double-log on log_additive still names the additive spellings: {err}"
+    );
+    let err = model_with_error_block("  DV ~ log_combined(SIG1)").unwrap_err();
+    assert!(err.contains("expects 2 sigma(s) but 1 given"), "got: {err}");
+    let err = model_with_error_block("  log(DV) ~ proportional(SIG1)").unwrap_err();
+    assert!(
+        err.contains("log(DV) ~ combined(PROP, ADD)"),
+        "the refusal names the combined LTBS form: {err}"
+    );
+}
+
+/// `weight = W` divides DV and the prediction by `W`: the log residual is unchanged and
+/// `ADD/F` becomes `ADD·W/F`, so the weight lands on the additive (second) slot.
+#[test]
+fn test_log_combined_weight_scales_the_additive_slot() {
+    let m = model_with_error_block("  log(DV) ~ combined(SIG1, SIG2) weight = TVV").unwrap();
+    assert_eq!(m.error_model, ErrorModel::LogCombined);
+    let mag = m
+        .ruv_magnitude
+        .as_ref()
+        .expect("weight desugars to a magnitude");
+    let row = mag.eval_obs(&m.default_params.theta, &HashMap::new(), 1.0, 1.0);
+    assert_eq!(row[0], 1.0, "proportional slot untouched: {row:?}");
+    assert_eq!(row[1], 10.0, "additive slot carries W = TVV: {row:?}");
+}
+
+/// Plasma + urine with their own `PROP`/`ADD` pairs (#2729): a per-CMT LTBS block,
+/// every line on the log scale. ODE-only, as every per-CMT error model is.
+fn ltbs_per_cmt_model(error_block: &str) -> Result<crate::types::CompiledModel, String> {
+    parse_model_string(&format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_P ~ 0.1 (sd)
+  sigma ADD_P ~ 0.05 (sd)
+  sigma PROP_U ~ 0.2 (sd)
+  sigma ADD_U ~ 0.5 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[depot, central, urine])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+  d/dt(urine) = 0.4 * (CL/V) * central
+[scaling]
+  y[CMT=2] = central / V
+  y[CMT=3] = urine
+[error_model]
+{error_block}
+"#
+    ))
+}
+
+#[test]
+fn test_ltbs_per_cmt_combined_endpoints() {
+    for (block, pre_logged) in [
+        (
+            "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)",
+            false,
+        ),
+        (
+            "  CMT=2: DV ~ log_combined(PROP_P, ADD_P)\n  CMT=3: DV ~ log_additive(PROP_U)",
+            true,
+        ),
+    ] {
+        let m = ltbs_per_cmt_model(block).unwrap();
+        assert!(m.log_transform, "{block}");
+        assert_eq!(m.dv_pre_logged, pre_logged, "{block}");
+        let crate::types::ErrorSpec::PerCmt(map) = &m.error_spec else {
+            panic!("per-CMT spec expected: {block}");
+        };
+        assert_eq!(map[&2].error_model, ErrorModel::LogCombined);
+        assert_eq!(map[&2].sigma_idx, vec![0, 1]);
+        if pre_logged {
+            assert_eq!(map[&3].error_model, ErrorModel::Additive);
+            assert_eq!(map[&3].sigma_idx, vec![2]);
+        } else {
+            assert_eq!(map[&3].error_model, ErrorModel::LogCombined);
+            assert_eq!(map[&3].sigma_idx, vec![2, 3]);
+        }
+    }
+}
+
+/// The log transform is model-wide: every endpoint on the log scale under one `DV`
+/// convention, or none. Each refusal names its own reason and not the other's.
+#[test]
+fn test_ltbs_per_cmt_lines_must_agree() {
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: DV ~ proportional(PROP_U)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("every endpoint or none") && !err.contains("scale of `DV`"),
+        "got: {err}"
+    );
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: DV ~ proportional(PROP_U)\n  CMT=3: log(DV) ~ combined(PROP_P, ADD_P)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("every endpoint or none"),
+        "order-independent: {err}"
+    );
+    let err = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: DV ~ log_combined(PROP_U, ADD_U)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("scale of `DV`") && !err.contains("every endpoint or none"),
+        "got: {err}"
+    );
+    // Proportional on the log scale is still refused per line.
+    let err = ltbs_per_cmt_model("  CMT=2: log(DV) ~ proportional(PROP_P)").unwrap_err();
+    assert!(err.contains("log(DV) ~ combined(PROP, ADD)"), "got: {err}");
+}
+
+/// The motivating plasma + urine model in full (#2729): per-endpoint LTBS with the
+/// early-time factor on the plasma `PROP` only, written on its `CMT=2:` argument
+/// (per-CMT magnitudes are #2731's; this pins that they compose with LTBS). Sigmas are
+/// flat in declaration order: `PROP_P, ADD_P, PROP_U, ADD_U`.
+#[test]
+fn test_ltbs_per_cmt_argument_magnitude() {
+    let m = ltbs_per_cmt_model(
+        "  CMT=2: log(DV) ~ combined(PROP_P * (if (TAD < 3) TVKA else 1), ADD_P)\n  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)",
+    )
+    .unwrap();
+    assert!(m.log_transform && m.has_custom_ruv_magnitude());
+    let crate::types::ErrorSpec::PerCmt(map) = &m.error_spec else {
+        panic!("per-CMT spec expected");
+    };
+    assert_eq!(map[&2].error_model, ErrorModel::LogCombined);
+    assert_eq!(map[&2].sigma_idx, vec![0, 1]);
+    assert_eq!(map[&3].sigma_idx, vec![2, 3]);
+    // Rows at t = 1, 2, 3, 4 after a dose at 0: plasma early, plasma early, urine
+    // early, plasma late.
+    let mut s = magnitude_rows_subject(&[(2, 0.0), (2, 0.0), (3, 0.0), (2, 0.0)], "UNUSED");
+    s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let rows = m.ruv_obs_mult(&s, &m.default_params.theta).unwrap();
+    assert_eq!(rows[0], vec![1.5, 1.0, 1.0, 1.0], "plasma, TAD 1");
+    assert_eq!(rows[1], vec![1.5, 1.0, 1.0, 1.0], "plasma, TAD 2");
+    assert_eq!(rows[2], vec![1.0, 1.0, 1.0, 1.0], "urine is bare");
+    assert_eq!(rows[3], vec![1.0, 1.0, 1.0, 1.0], "plasma, TAD 4");
+}
+
+#[test]
+fn test_ltbs_per_cmt_requires_an_ode_model() {
+    // Per-CMT error models of any kind are ODE-only; LTBS does not change that.
+    let err = model_with_error_block("  CMT=1: log(DV) ~ additive(SIG1)").unwrap_err();
+    assert!(err.contains("require an ODE-based"), "got: {err}");
 }
 
 #[test]
@@ -12652,6 +12843,7 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
@@ -12730,6 +12922,7 @@ fn test_selected_error_obs_keys_dispatch() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
@@ -23071,6 +23264,187 @@ fn test_weighted_kappa_refusal_keeps_scaling_label_for_a_real_scaling_block() {
     );
 }
 
+/// #2624: the unnamed blocks sit in a `HashMap`, and the refusal used to return
+/// on the first offending block — so with two of them it named `[derived]` on
+/// some compiles and `[scaling]` on others (21/19 over 40 at `d69779e2`). Every
+/// offending block is now named, sorted, and the message is the same every time.
+/// Each compile builds fresh maps with fresh `RandomState`, so 40 compiles under
+/// a hash-order walk differ with probability 1 − 2·2⁻⁴⁰.
+#[test]
+fn test_weighted_kappa_refusal_names_every_block_in_a_stable_order() {
+    let src = weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n\n[scaling]\n  y = central / V + KAPPA_CL\n",
+    );
+    let first = expect_parse_err(&src);
+    assert!(
+        first.starts_with(
+            "[derived] references `KAPPA_CL` and [scaling] references `KAPPA_CL`, \
+             a kappa declared with `weight = ...`."
+        ),
+        "both blocks named, sorted, one kappa in the singular, got: {first}"
+    );
+    assert!(
+        first.contains("a reference in any of these blocks") && first.contains("Move each term"),
+        "plural wording for two blocks, got: {first}"
+    );
+    assert!(
+        !first.contains("a reference here") && !first.contains("Move the term"),
+        "no singular wording for two blocks, got: {first}"
+    );
+    for i in 1..40 {
+        let again = expect_parse_err(&src);
+        assert_eq!(again, first, "compile {i} gave a different refusal");
+    }
+}
+
+/// Three offending blocks exercise the comma arm of the list join: `A, B and C`,
+/// not `A and B and C`. Every other fixture lists at most two items, where the
+/// separator inside `init` is never written (#2624 review r2).
+#[test]
+fn test_weighted_kappa_refusal_lists_three_blocks_with_commas() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n\n[scaling]\n  y = central / V + KAPPA_CL\n\n\
+         [simulation]\n  dose_amt = KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL`, [scaling] references `KAPPA_CL` and \
+             [simulation] references `KAPPA_CL`, a kappa declared with `weight = ...`."
+        ),
+        "three blocks, comma-joined then `and`, got: {err}"
+    );
+}
+
+/// The single-block case keeps its singular wording: the plural added for
+/// #2624 must not leak into it.
+#[test]
+fn test_weighted_kappa_refusal_single_block_keeps_singular_wording() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with("[derived] references `KAPPA_CL`, a kappa declared with `weight = ...`."),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("a reference here would silently use") && err.contains("Move the term"),
+        "singular wording for one block, got: {err}"
+    );
+    assert!(
+        !err.contains(" and [") && !err.contains("these blocks") && !err.contains("each term"),
+        "no plural wording for one block, got: {err}"
+    );
+}
+
+/// Two distinct weighted kappas in one block: the block is named once with both
+/// kappas, the noun goes plural, and the wording speaks of one block — not "any
+/// of these blocks" (#2624 review).
+#[test]
+fn test_weighted_kappa_refusal_two_kappas_one_block_is_plural() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM\n  kappa KAPPA_V ~ 0.04 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_V + KAPPA_CL\n",
+    ));
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL` and `KAPPA_V`, kappas declared with `weight = ...`."
+        ),
+        "one block named once, both kappas, plural noun, got: {err}"
+    );
+    assert!(
+        err.contains("these references would silently use") && err.contains("Move each term"),
+        "one-block multi-kappa wording, got: {err}"
+    );
+    assert!(
+        !err.contains("a kappa declared")
+            && !err.contains("these blocks")
+            && !err.contains("a reference here")
+            && err.matches("[derived]").count() == 1,
+        "no singular, no multi-block wording, block not repeated, got: {err}"
+    );
+}
+
+/// A named block (`[event_model armA]`, walked from the `BTreeMap` half) and an
+/// unnamed one (`[derived]`, from the `HashMap` half) are named together, sorted
+/// on the printed label (#2624 review).
+#[cfg(feature = "survival")]
+#[test]
+fn test_weighted_kappa_refusal_names_named_and_unnamed_blocks_together() {
+    let model_str = r"
+[parameters]
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  omega ETA ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+
+[derived]
+  KOUT = KAPPA_CL
+
+[event_model armA]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(KAPPA_CL)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(model_str);
+    assert!(
+        err.starts_with(
+            "[derived] references `KAPPA_CL` and [event_model armA] references `KAPPA_CL`, \
+             a kappa declared with `weight = ...`."
+        ),
+        "both halves of the walk named, sorted, got: {err}"
+    );
+}
+
+/// The relabel runs before the sort, so a compartment-free model is ordered by
+/// the label it prints. `[simulation]` sorts between the internal `scaling` key
+/// and the printed `structural_model`, so sorting on the raw key would put the
+/// equations block first (#2624 review).
+#[test]
+fn test_weighted_kappa_refusal_sorts_compartment_free_on_the_printed_label() {
+    let src = r"
+[parameters]
+  theta TVBASE(10.0)
+  omega ETA_BASE ~ 0.09
+  kappa KAPPA_ARM ~ 0.04 weight = NARM
+  sigma ADD ~ 1.0 (sd)
+
+[individual_parameters]
+  BASE = TVBASE + ETA_BASE + KAPPA_ARM
+
+[structural_model]
+  y = BASE + KAPPA_ARM
+
+[error_model]
+  DV ~ additive(ADD)
+
+[covariates]
+  NARM continuous
+
+[simulation]
+  dose_amt = KAPPA_ARM
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(src);
+    assert!(
+        err.starts_with(
+            "[simulation] references `KAPPA_ARM` and [structural_model] references `KAPPA_ARM`, \
+             a kappa declared with `weight = ...`."
+        ),
+        "sorted on the printed label, got: {err}"
+    );
+    assert!(!err.contains("[scaling]"), "got: {err}");
+}
+
 /// The unweighted kappa keeps its freedom to appear elsewhere.
 #[test]
 fn test_unweighted_kappa_is_not_restricted_to_individual_parameters() {
@@ -23371,6 +23745,7 @@ fn covariate_nn_reads_time_varying_covariate_values() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; times.len()],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -23497,6 +23872,7 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -26062,7 +26438,7 @@ fn power_form_rejects_the_forms_it_cannot_combine_with() {
         "log(DV) ~ power(PROP_ERR, RUV_POW)",
     ));
     assert!(
-        err.contains("log-transform-both-sides supports only additive"),
+        err.contains("log-transform-both-sides supports additive error on the log scale"),
         "got: {err}"
     );
     let err = expect_parse_err(&POWER_MODEL.replace(

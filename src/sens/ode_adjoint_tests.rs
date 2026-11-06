@@ -34,6 +34,7 @@ pub(super) fn subject(
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
@@ -632,6 +633,211 @@ fn analytic_adjoint_matches_reconverged_fd_lagtime_ltbs() {
     let worst = parity(&model, &s);
     // Measured 1.5e-6 vs reconverged FD (Richardson, EBE re-solved per point); 5× headroom.
     assert!(worst < 8e-6, "worst relative difference {worst:.2e}");
+}
+
+/// LTBS with a natural-unit additive part (#2729): `Var(log y) = PROP² + ADD²/F²`. The
+/// concentrations fall from ~9 to ~0.1 over the record, so `ADD/F` runs from ~0.03 (below
+/// `PROP`) to ~3 (far above it): both terms are live, and `∂V/∂f` is non-zero on every
+/// row — the first LTBS model where the FOCEI interaction term is. `{MAG}` is spliced
+/// with a magnitude on the proportional slot.
+const ONE_CPT_ORAL_LTBS_COMBINED: &str = r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta PROP_EARLY(1.8, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+  sigma ADD_ERR ~ 0.3 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  log(DV) ~ combined(PROP_ERR{MAG}, ADD_ERR)
+"#;
+
+fn ltbs_combined_fixture(mag: &str) -> (CompiledModel, Subject) {
+    let model = parse_model_string(&ONE_CPT_ORAL_LTBS_COMBINED.replace("{MAG}", mag)).unwrap();
+    assert_eq!(model.error_model, crate::types::ErrorModel::LogCombined);
+    assert!(model.log_transform && !model.dv_pre_logged);
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 11.5, 13.0, 16.0, 20.0, 30.0];
+    let s = subject(&model, doses, &times, &[0.1, -0.05]);
+    // Both terms live: the natural-scale predictions straddle `ADD/PROP = 3`.
+    let preds = crate::pk::compute_predictions_with_tv(
+        &model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    let nat: Vec<f64> = preds.iter().map(|g| g.exp()).collect();
+    assert!(
+        nat.iter().any(|&f| f > 6.0) && nat.iter().any(|&f| f < 0.5),
+        "the fixture must put rows on both sides of ADD/PROP: {nat:?}"
+    );
+    (model, s)
+}
+
+#[test]
+fn analytic_adjoint_matches_reconverged_fd_ltbs_combined() {
+    let (model, s) = ltbs_combined_fixture("");
+    assert!(
+        in_scope(&model, &s),
+        "LTBS combined must be served by the closed-form engine, not FD"
+    );
+    let worst = parity(&model, &s);
+    eprintln!("LTBS combined FOCEI vs reconverged FD {worst:.2e}");
+    // Measured 4.7e-10 (Linux x86_64); 5× headroom.
+    assert!(
+        worst < 2.5e-9,
+        "FOCEI worst relative difference {worst:.2e}"
+    );
+    let worst = parity_foce(&model, &s);
+    eprintln!("LTBS combined FOCE vs reconverged FD {worst:.2e}");
+    // Measured 3.5e-9; 5× headroom.
+    assert!(worst < 1.8e-8, "FOCE worst relative difference {worst:.2e}");
+}
+
+/// The same with a magnitude on the proportional slot only — the motivating model's
+/// `PROP = THETA(6)*THETA(12)` at early times: the multiplier rides the constant log-scale
+/// loading, not the `exp(−f)` one.
+#[test]
+fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_magnitude() {
+    let (model, s) = ltbs_combined_fixture(" * (if (TIME < 3) PROP_EARLY else 1)");
+    assert!(model.has_custom_ruv_magnitude());
+    assert!(in_scope(&model, &s), "served by the closed-form engine");
+    let worst = parity(&model, &s);
+    eprintln!("LTBS combined + magnitude FOCEI vs reconverged FD {worst:.2e}");
+    // Measured 3.3e-10; 5× headroom.
+    assert!(worst < 1.7e-9, "worst relative difference {worst:.2e}");
+}
+
+/// The kernel's objective is production's, and its covariance R-matrix is the
+/// reconverged-FD Hessian of it.
+#[test]
+fn ltbs_combined_kernel_objective_and_hessian_match_production() {
+    let (model, s) = ltbs_combined_fixture("");
+    let g = objective_gaps::<2>(&model, &s, &model.default_params, &[0.1, -0.05]);
+    eprintln!("LTBS combined objective gaps {g:?}");
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "kernel vs production: {g:?}");
+    let (fd, _) = hessian_gaps_for(&model, &s, Objective::Focei);
+    eprintln!("LTBS combined FOCEI Hessian vs reconverged FD {fd:.2e}");
+    // Measured 9.1e-12; 5× headroom.
+    assert!(fd < 5e-11, "FOCEI Hessian vs FD {fd:.2e}");
+}
+
+/// Per-endpoint LTBS combined error on the ODE engine (#2729): plasma (`CMT=2`) and a
+/// cumulative urine amount (`CMT=3`), each with its own `PROP`/`ADD`.
+const ODE_LTBS_COMBINED_PER_CMT: &str = r#"
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_P ~ 0.1 (sd)
+  sigma ADD_P ~ 0.3 (sd)
+  sigma PROP_U ~ 0.2 (sd)
+  sigma ADD_U ~ 2.0 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(states=[depot, central, urine])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+  d/dt(urine) = 0.4 * (CL/V) * central
+[scaling]
+  y[CMT=2] = central / V
+  y[CMT=3] = urine
+[error_model]
+  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)
+  CMT=3: log(DV) ~ combined(PROP_U, ADD_U)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+#[test]
+fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt() {
+    let model = parse_model_string(ODE_LTBS_COMBINED_PER_CMT).unwrap();
+    // Measured 2.0e-9 (Linux x86_64); 5× headroom.
+    ltbs_combined_per_cmt_parity(model, 1e-8);
+}
+
+/// The same with the motivating model's early-time factor on the plasma `PROP` only,
+/// written on the per-CMT argument (#2729 review, through #2731's per-endpoint
+/// magnitude tables): a θ-dependent magnitude on one endpoint's constant log-scale
+/// loading.
+#[test]
+fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt_magnitude() {
+    let src = ODE_LTBS_COMBINED_PER_CMT
+        .replace(
+            "CMT=2: log(DV) ~ combined(PROP_P, ADD_P)",
+            "CMT=2: log(DV) ~ combined(PROP_P * (if (TAD < 3) FAC else 1), ADD_P)",
+        )
+        .replace(
+            "  sigma PROP_P",
+            "  theta FAC(1.8, 0.1, 10.0)\n  sigma PROP_P",
+        );
+    let model = parse_model_string(&src).unwrap();
+    assert!(model.has_custom_ruv_magnitude());
+    // Measured 2.2e-9 (Linux x86_64); ~5× headroom.
+    ltbs_combined_per_cmt_parity(model, 1e-8);
+}
+
+fn ltbs_combined_per_cmt_parity(model: CompiledModel, bound: f64) {
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let base = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 20.0];
+    let times: Vec<f64> = base.iter().flat_map(|&t| [t, t]).collect();
+    let mut s = subject(&model, doses, &times, &[0.1, -0.05]);
+    s.obs_cmts = (0..times.len()).map(|j| 2 + j % 2).collect();
+    // `subject` built the observations against CMT 1; rebuild them per endpoint.
+    let preds = crate::pk::compute_predictions_with_tv(
+        &model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    assert!(preds.iter().all(|p| p.is_finite()), "{preds:?}");
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, g)| g + 0.15 * (1.3 * j as f64).sin())
+        .collect();
+    // Both terms live on both endpoints: ADD/F straddles PROP on each.
+    let nat: Vec<f64> = preds.iter().map(|g| g.exp()).collect();
+    // (The magnitude variant scales PROP_P by 1.8 before t = 3, which keeps the
+    // straddle: its early rows have F well above ADD/PROP.)
+    for (cmt, prop, add) in [(2usize, 0.1, 0.3), (3, 0.2, 2.0)] {
+        let r: Vec<f64> = (0..nat.len())
+            .filter(|&j| s.obs_cmts[j] == cmt)
+            .map(|j| add / nat[j] / prop)
+            .collect();
+        assert!(
+            r.iter().any(|&x| x > 1.0) && r.iter().any(|&x| x < 1.0),
+            "CMT={cmt}: ADD/(F·PROP) {r:?}"
+        );
+    }
+    assert!(
+        in_scope(&model, &s),
+        "per-CMT LTBS combined must be served by the ODE adjoint, not FD"
+    );
+    let g = objective_gaps::<2>(&model, &s, &model.default_params, &[0.1, -0.05]);
+    eprintln!("per-CMT LTBS combined objective gaps {g:?}");
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "kernel vs production: {g:?}");
+    let worst = parity(&model, &s);
+    eprintln!("per-CMT LTBS combined FOCEI vs reconverged FD {worst:.2e}");
+    assert!(worst < bound, "FOCEI worst relative difference {worst:.2e}");
 }
 
 #[test]
@@ -1438,6 +1644,87 @@ fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
     }
 }
 
+/// Inside a `SharingScope` the recorder's second call reads the index its first call
+/// kept (#2558), and its output must be the bits an unscoped call gives, on `f64` and on
+/// the inner loop's `DualF`. The subject's records do share (asserted), so the index a hit
+/// hands back decides which evaluation each record reads, and a wrong or stale one moves
+/// a prediction. The bits match the twin that shares nothing too, so what is compared is
+/// the right answer, not only the unscoped path's. Catches a hit that hands the recorder
+/// an index other than the one a build gives, which the f64 materializer's bit test and
+/// the parity tests, run outside any scope, cannot see.
+#[test]
+fn the_recorder_reads_the_same_bits_from_a_kept_sharing_index() {
+    use crate::pk::sharing_scope::{builds, SharingScope};
+    for iov in [false, true] {
+        let model = parse_model_string(&shared_inputs_src(iov)).unwrap();
+        let shared = shared_inputs_subject(&model, |_| false);
+        let twin = shared_inputs_subject(&model, |_| true);
+        let theta = &model.default_params.theta;
+        let w = subject_width(&model, &shared).unwrap();
+        let eta: Vec<f64> = (0..w).map(|k| 0.1 - 0.07 * k as f64).collect();
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let values = |s: &Subject| {
+            let f = record::<f64>(
+                &model,
+                s,
+                None,
+                theta,
+                &eta,
+                &ThetaLeaves::theta(theta),
+                &eta,
+            )
+            .expect("the closed-form recorder serves the subject");
+            bits(&f)
+        };
+        let jets = |s: &Subject| {
+            let rows = exact_obs_grads(&model, s, theta, &eta)
+                .expect("the closed-form recorder serves the subject");
+            let flat: Vec<f64> = rows
+                .iter()
+                .flat_map(|r| std::iter::once(r.f).chain(r.df_deta.iter().copied()))
+                .collect();
+            bits(&flat)
+        };
+        let records = crate::pk::record_pk_inputs(&shared);
+        let group = |occ: u32| {
+            crate::stats::stacked_layout::StackedLayout::sens_of(&model, &shared)
+                .and_then(|l| l.group_of(occ))
+        };
+        let first = crate::pk::first_record_with_same_pk_inputs(
+            &model,
+            records.iter().map(|&(occ, cov, _)| (group(occ), cov)),
+        )
+        .expect("a parsed model that does not read TIME has a sharing index");
+        assert!(
+            first.iter().enumerate().any(|(i, &f)| f != i),
+            "iov {iov}: the records must share, or a hit's index decides nothing: {first:?}"
+        );
+
+        let (want_f, want_jets) = (values(&twin), jets(&twin));
+        assert_eq!(values(&shared), want_f, "iov {iov}: unscoped f64");
+        assert_eq!(jets(&shared), want_jets, "iov {iov}: unscoped DualF");
+        let _share = SharingScope::enter(&model, &shared);
+        let b = builds();
+        assert_eq!(
+            values(&shared),
+            want_f,
+            "iov {iov}: f64, the call that builds"
+        );
+        assert_eq!(
+            builds(),
+            b + 1,
+            "iov {iov}: the recorder builds its index once"
+        );
+        assert_eq!(values(&shared), want_f, "iov {iov}: f64, a hit");
+        assert_eq!(jets(&shared), want_jets, "iov {iov}: DualF, a hit");
+        assert_eq!(
+            builds(),
+            b + 1,
+            "iov {iov}: every later call is a hit, or this test compares builds"
+        );
+    }
+}
+
 #[test]
 fn ode_steady_state_dose_matches_reconverged_fd() {
     let model = tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap());
@@ -1608,6 +1895,7 @@ pub(super) fn subject_shell(doses: Vec<DoseEvent>, times: &[f64]) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
@@ -8159,4 +8447,259 @@ fn the_six_wide_hessian_bucket_equals_the_padded_eight() {
     // Measured 0 (bit-identical: the padding lanes are exact zeros); any difference is a
     // defect in the 6-wide instantiation.
     assert!(worst == 0.0, "bucket 6 vs padded 8: worst {worst:.2e}");
+}
+
+// ---- compartment on/off records (#2732) ------------------------------------------------
+
+/// Two compartments with back-transfer, read from `central`: what the off compartment
+/// holds reaches the observations, so a wrong jet across a toggle shows in the gradient.
+const TWO_CPT_TOGGLE_ODE: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVQ(6.0, 0.1, 100.0)
+  theta TVV2(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  Q = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peri])
+[odes]
+  d/dt(central) = -(CL/V) * central - (Q/V) * central + (Q/V2) * peri
+  d/dt(peri) = (Q/V) * central - (Q/V2) * peri
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// `s` with on/off rows at `rows` = `(time, state, on)`, filled in as a caller outside the
+/// crate has to: `DoseEvent::off_at` is left alone, so the walks derive it.
+fn with_toggles(mut s: Subject, rows: &[(f64, usize, bool)]) -> Subject {
+    for (m, &(t, state, on)) in rows.iter().enumerate() {
+        s.pk_only_times.push(t);
+        s.pk_only_raw_times.push(t);
+        s.cmt_toggles.push(crate::types::CmtToggle {
+            pk_only: m,
+            state,
+            on,
+        });
+    }
+    s
+}
+
+fn toggle_model() -> CompiledModel {
+    with_tol(
+        parse_model_string(TWO_CPT_TOGGLE_ODE).unwrap(),
+        1e-12,
+        1e-14,
+    )
+}
+
+/// Measured worst 5.7e-9 on macOS arm64 (the infusion stopped by a toggle), the Richardson
+/// FD noise floor at these tolerances. About 17× headroom.
+const TOGGLE_BOUND: f64 = 1e-7;
+
+const TOGGLE_TIMES: [f64; 8] = [1.0, 2.0, 3.5, 5.0, 6.5, 8.0, 10.0, 14.0];
+
+/// The fixture's toggle must move the prediction, or a parity pass says nothing about it.
+fn assert_toggle_is_live(model: &CompiledModel, with: &Subject, without: &Subject) {
+    let theta = &model.default_params.theta;
+    let eta = vec![0.0; model.n_eta];
+    let a = crate::pk::compute_predictions_with_tv(model, with, theta, &eta);
+    let b = crate::pk::compute_predictions_with_tv(model, without, theta, &eta);
+    let gap = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f64>();
+    assert!(a.iter().all(|x| x.is_finite()), "{a:?}");
+    assert!(gap > 1e-2, "the toggle changes nothing: {a:?}");
+}
+
+#[test]
+fn adjoint_matches_fd_across_a_toggle_with_residual_on_both_sides() {
+    let model = toggle_model();
+    let plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    let s = with_toggles(
+        plain.clone(),
+        &[(3.0, 1, false), (4.5, 1, true), (9.0, 1, false)],
+    );
+    assert_toggle_is_live(&model, &s, &plain);
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+#[test]
+fn adjoint_matches_fd_when_the_main_compartment_is_off() {
+    let model = toggle_model();
+    let plain = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[1.0, 2.0, 5.0, 6.5, 8.0, 10.0],
+        &[0.1, -0.05],
+    );
+    // `central` off from 3 to 4 reads nothing on the observations in that window, so the
+    // observations after it are driven entirely by what `peri` kept.
+    let s = with_toggles(plain.clone(), &[(3.0, 0, false), (4.0, 0, true)]);
+    assert_toggle_is_live(&model, &s, &plain);
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+#[test]
+fn adjoint_matches_fd_for_an_infusion_stopped_by_a_toggle() {
+    let model = toggle_model();
+    let plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 50.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(1.0, 80.0, 2, 10.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    let s = with_toggles(plain.clone(), &[(4.0, 1, false), (6.0, 1, true)]);
+    assert_eq!(
+        s.doses[1].off_at,
+        f64::INFINITY,
+        "derived by the walk, not here"
+    );
+    assert_toggle_is_live(&model, &s, &plain);
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+#[test]
+fn adjoint_matches_fd_for_a_dose_that_turns_its_compartment_on() {
+    let model = toggle_model();
+    let plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(5.5, 60.0, 2, 0.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    let s = with_toggles(plain.clone(), &[(3.0, 1, false)]);
+    assert_toggle_is_live(&model, &s, &plain);
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+#[test]
+fn adjoint_matches_fd_for_a_reset_that_turns_a_compartment_on() {
+    let model = toggle_model();
+    let mut plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    plain.reset_times = vec![5.5];
+    let s = with_toggles(plain.clone(), &[(3.0, 1, false)]);
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+/// A lag on a compartment nothing switches is a moving boundary with a held state beside
+/// it: the walk serves it, and the arrival's saltation has to see the held row.
+#[test]
+fn adjoint_matches_fd_for_a_lagged_arrival_while_another_compartment_is_off() {
+    let src = TWO_CPT_TOGGLE_ODE
+        .replace(
+            "  theta TVV2(40.0, 1.0, 500.0)\n",
+            "  theta TVV2(40.0, 1.0, 500.0)\n  theta TVLAG(0.7, 0.01, 5.0)\n",
+        )
+        .replace("  V2 = TVV2\n", "  V2 = TVV2\n  ALAG1 = TVLAG\n");
+    let model = with_tol(parse_model_string(&src).unwrap(), 1e-12, 1e-14);
+    let plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(4.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    let s = with_toggles(plain.clone(), &[(3.0, 1, false), (6.0, 1, true)]);
+    assert_toggle_is_live(&model, &s, &plain);
+    assert!(in_scope(&model, &s), "the lag is on another compartment");
+    let worst = fd_oracle(&model, &s, true);
+    assert!(
+        worst < TOGGLE_BOUND,
+        "worst relative difference {worst:.2e}"
+    );
+}
+
+/// The arrival of a lagged dose switches the right-hand side at a moving time, which no
+/// saltation carries, so the subject must route to FD rather than take a wrong gradient.
+#[test]
+fn a_lagged_dose_into_a_switched_compartment_routes_to_fd() {
+    let src = TWO_CPT_TOGGLE_ODE
+        .replace(
+            "  theta TVV2(40.0, 1.0, 500.0)\n",
+            "  theta TVV2(40.0, 1.0, 500.0)\n  theta TVLAG(0.7, 0.01, 5.0)\n",
+        )
+        .replace("  V2 = TVV2\n", "  V2 = TVV2\n  ALAG2 = TVLAG\n");
+    let model = with_tol(parse_model_string(&src).unwrap(), 1e-12, 1e-14);
+    let plain = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(4.0, 50.0, 2, 0.0, false, 0.0),
+        ],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    assert!(in_scope(&model, &plain), "without the toggle it is served");
+    let s = with_toggles(plain, &[(3.0, 1, false)]);
+    assert!(!in_scope(&model, &s), "with it, the walk must decline");
+}
+
+/// A toggle is an event only the event-driven walk has, on the value path and the dual
+/// one, so a subject with nothing else to send it there must not take the static walk.
+#[test]
+fn a_toggle_alone_takes_the_event_driven_walk() {
+    let model = toggle_model();
+    let plain = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TOGGLE_TIMES,
+        &[0.1, -0.05],
+    );
+    let s = with_toggles(plain.clone(), &[(3.0, 1, false)]);
+    use crate::sens::ode_provider::{event_walk_subject_supported, static_walk_subject_supported};
+    assert!(static_walk_subject_supported(&model, &plain));
+    assert!(!event_walk_subject_supported(&model, &plain));
+    assert!(!static_walk_subject_supported(&model, &s));
+    assert!(event_walk_subject_supported(&model, &s));
 }

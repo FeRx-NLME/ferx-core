@@ -119,6 +119,7 @@ fn subject(id: &str, cmts: [usize; 6], occasions: Vec<u32>) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),

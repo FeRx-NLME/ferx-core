@@ -4899,6 +4899,11 @@ pub fn parse_full_model_with(
             .named
             .iter()
             .flat_map(|(ty, m)| m.keys().map(move |inst| (format!("{ty} {inst}"), &m[inst])));
+        // Every offending (block, kappa) pair is collected and named in one
+        // refusal, sorted, so the user fixes them all at once. `blocks` is a
+        // `HashMap`: returning on the first hit named a different block from
+        // one compile to the next (#2624).
+        let mut offending: Vec<(String, &String)> = Vec::new();
         for (block, lines) in blocks
             .iter()
             .filter(|(b, _)| b.as_str() != "parameters" && b.as_str() != "individual_parameters")
@@ -4909,21 +4914,19 @@ pub fn parse_full_model_with(
             collect_referenced_identifiers(lines, &mut refs);
             for name in &weighted_names {
                 if refs.contains(&name.to_ascii_uppercase()) {
-                    // A compartment-free model's equations sit under the
-                    // `scaling` key; name the block the user wrote (#1827).
-                    return Err(retarget_scaling_diag(
-                        is_algebraic,
-                        format!(
-                            "[{block}] references `{name}`, a kappa declared with `weight = ...`. \
-                             A weighted kappa is scaled where it is used, and only \
-                             `[individual_parameters]` applies that scaling — a reference here \
-                             would silently use the unweighted κ. Move the term into \
-                             `[individual_parameters]` (assign it to an individual parameter and \
-                             reference that name instead)."
-                        ),
-                    ));
+                    offending.push((block.clone(), name));
                 }
             }
+        }
+        if !offending.is_empty() {
+            // A compartment-free model's equations sit under the `scaling`
+            // key; name the block the user wrote (#1827). Relabel before
+            // sorting so the order is the one the message prints.
+            for (block, _) in &mut offending {
+                *block = retarget_scaling_diag(is_algebraic, format!("[{block}]"));
+            }
+            offending.sort();
+            return Err(weighted_kappa_outside_indiv_message(&offending));
         }
     }
     if !weighted_kappa_slots.is_empty() {
@@ -7496,6 +7499,20 @@ pub fn parse_full_model_with(
     // #2562: the gathers an endpoint block reads count for the pre-fit index check too, and
     // they were parsed after `theta_blocks` took its first copy.
     model.indiv_param_partials.theta_blocks.uses = VectorThetaScope::uses();
+    // #2623: the explicit `NAME[COLUMN]` reads of each level block, and whether any
+    // expression reads it bare, for the binder's no-levels refusal.
+    {
+        let blocks = &mut model.indiv_param_partials.theta_blocks;
+        for decl in blocks.level_blocks.iter_mut() {
+            decl.read_bare = model.referenced_covariates.contains(&decl.index_covariate);
+            decl.keyed_reads.clear();
+            for u in blocks.uses.iter().filter(|u| u.block == decl.name) {
+                if !decl.keyed_reads.contains(&u.index_covariate) {
+                    decl.keyed_reads.push(u.index_covariate.clone());
+                }
+            }
+        }
+    }
     // #2562: which discrete-state endpoints read each level block, for the binder.
     #[cfg(feature = "survival")]
     for decl in model
@@ -13949,6 +13966,17 @@ fn declares_time_alias(declared_covariates: &[String]) -> bool {
         .any(|d| d.eq_ignore_ascii_case("T"))
 }
 
+/// The value a [`build_y_output_fn`] closure reads for covariate `name` from the map it
+/// is handed: the map's value, or `0.0` when the key is absent. Shared by that closure
+/// and the dose-expression "reads" sentence (#2671), so the sentence reports the value
+/// the closure used. Only those two: the endpoint evaluator (`eval_endpoint_outputs_g`)
+/// keeps its own read. The entry-point presence check (`population_carries`) is what
+/// keeps the absent case from a run.
+#[inline]
+pub(crate) fn output_covariate_read(covariates: &HashMap<String, f64>, name: &str) -> f64 {
+    covariates.get(name).copied().unwrap_or(0.0)
+}
+
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
 /// the uniform and per-CMT paths.
 #[allow(clippy::too_many_arguments)]
@@ -14199,9 +14227,7 @@ pub(crate) fn build_y_output_fn(
                 if n_cov > 0 {
                     scratch.y_cov.resize(n_cov, 0.0);
                     for (i, name) in cov_names_for_fn.iter().enumerate() {
-                        if let Some(&v) = covariates.get(name) {
-                            scratch.y_cov[i] = v;
-                        }
+                        scratch.y_cov[i] = output_covariate_read(covariates, name);
                     }
                 }
 
@@ -19812,6 +19838,8 @@ fn parse_parameters(
                                 eta_readers: Vec::new(),
                                 index_covariate: index_covariate.clone(),
                                 record_cmts: Vec::new(),
+                                keyed_reads: Vec::new(),
+                                read_bare: false,
                             });
                             (levels, theta_names, Some(index_covariate))
                         }
@@ -21075,6 +21103,52 @@ fn is_algebraic_structural(struct_lines: &[String]) -> bool {
     struct_lines.iter().any(|l| l == ALGEBRAIC_MARKER)
 }
 
+/// The refusal for weighted kappas referenced outside `[individual_parameters]`
+/// (#1031). `offending` holds `([block], kappa)` pairs, sorted, whose label is
+/// the one the user wrote — already relabelled `[scaling]` → `[structural_model]`
+/// for a compartment-free model (#1827), never the raw key. Every pair is named,
+/// grouped by block, so the user fixes them all in one pass (#2624).
+fn weighted_kappa_outside_indiv_message(offending: &[(String, &String)]) -> String {
+    fn and_list(items: &[String]) -> String {
+        match items {
+            [init @ .., last] if !init.is_empty() => format!("{} and {last}", init.join(", ")),
+            _ => items.concat(),
+        }
+    }
+    // Sorted input keeps a block's pairs adjacent.
+    let mut by_block: Vec<(&str, Vec<String>)> = Vec::new();
+    for (block, name) in offending {
+        match by_block.last_mut() {
+            Some((b, names)) if *b == block.as_str() => names.push(format!("`{name}`")),
+            _ => by_block.push((block.as_str(), vec![format!("`{name}`")])),
+        }
+    }
+    let clauses: Vec<String> = by_block
+        .iter()
+        .map(|(block, names)| format!("{block} references {}", and_list(names)))
+        .collect();
+    let listed = and_list(&clauses);
+    let mut names: Vec<&String> = offending.iter().map(|(_, n)| *n).collect();
+    names.sort();
+    names.dedup();
+    let what = if names.len() == 1 {
+        "a kappa declared"
+    } else {
+        "kappas declared"
+    };
+    let (where_, term) = match (by_block.len(), offending.len()) {
+        (1, 1) => ("a reference here", "the term"),
+        (1, _) => ("these references", "each term"),
+        _ => ("a reference in any of these blocks", "each term"),
+    };
+    format!(
+        "{listed}, {what} with `weight = ...`. A weighted kappa is scaled where it is used, \
+         and only `[individual_parameters]` applies that scaling — {where_} would silently use \
+         the unweighted κ. Move {term} into `[individual_parameters]` (assign it to an \
+         individual parameter and reference that name instead)."
+    )
+}
+
 /// Retarget a `[scaling]`-worded diagnostic at `[structural_model]` (#811).
 ///
 /// A compartment-free model's equations are written in `[structural_model]` but
@@ -21645,12 +21719,11 @@ fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), St
         )
     })?;
     let error_type = caps[2].to_lowercase();
-    if error_type == "log_additive" {
-        return Err(
-            "[error_model] `log_additive` (log-transform-both-sides) is not supported inside a \
+    if error_type == "log_additive" || error_type == "log_combined" {
+        return Err(format!(
+            "[error_model] `{error_type}` (log-transform-both-sides) is not supported inside a \
              covariate-selected if/else block"
-                .to_string(),
-        );
+        ));
     }
     if error_type == "power" {
         return Err(
@@ -21837,6 +21910,14 @@ const ERROR_MODEL_FORMS: &[(&str, &str)] = &[
     ),
     ("DV ~ log_additive(SIGMA)", "DV ~ log_additive(ADD_ERR)"),
     ("log(DV) ~ additive(SIGMA)", "log(DV) ~ additive(ADD_ERR)"),
+    (
+        "DV ~ log_combined(SIGMA_PROP, SIGMA_ADD)",
+        "DV ~ log_combined(PROP_ERR, ADD_ERR)",
+    ),
+    (
+        "log(DV) ~ combined(SIGMA_PROP, SIGMA_ADD)",
+        "log(DV) ~ combined(PROP_ERR, ADD_ERR)",
+    ),
     (
         "CMT=N: DV ~ TYPE(...) (per-endpoint, ODE models)",
         "CMT=2: DV ~ proportional(PROP_ERR)",
@@ -22133,6 +22214,9 @@ fn parse_error_model_inner(
     // Log-transform-both-sides (LTBS), additive error on the log scale:
     //   log(DV) ~ additive(SIGMA_NAME)   # natural-scale DV; engine logs DV + pred
     //   DV ~ log_additive(SIGMA_NAME)    # DV already log; engine logs the pred only
+    // LTBS with a natural-unit additive part, Var(log y) = PROP² + ADD²/F² (#2729):
+    //   log(DV) ~ combined(PROP, ADD)    # natural-scale DV
+    //   DV ~ log_combined(PROP, ADD)     # DV already log
     // Multi-endpoint (per-CMT dispatch, ODE models only):
     //   CMT=2: DV ~ proportional(PROP_ERR_PK)
     //   CMT=3: DV ~ additive(ADD_ERR_PD)
@@ -22157,6 +22241,9 @@ fn parse_error_model_inner(
     // and the `power(...)` exponent expression when the line is that form.
     let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
+    // Each per-CMT line's LTBS flags (#2729): the log transform is model-wide, so the
+    // lines must agree, which is checked once they are all read.
+    let mut per_cmt_flags: Vec<(usize, LtbsFlags)> = Vec::new();
     for line in &statements {
         // Strip inline `# ...` comments so the anchored statement regex sees a
         // clean `LHS ~ TYPE(args)` (a trailing comment would otherwise defeat
@@ -22224,8 +22311,11 @@ fn parse_error_model_inner(
         // commas (e.g. inside a future `min(a, b)`) don't fragment an argument.
         let mut sigma_names: Vec<String> = split_top_level_args(&caps[3]);
         // `log_additive` (case 1) is additive error whose prediction is logged
-        // while DV is taken as-is (already log-transformed in the data).
+        // while DV is taken as-is (already log-transformed in the data);
+        // `log_combined` is its combined counterpart (#2729).
         let type_is_log_additive = error_type == "log_additive";
+        let type_is_log_combined = error_type == "log_combined";
+        let type_is_log = type_is_log_additive || type_is_log_combined;
         // `power(SIGMA, P)` (#1182) — NONMEM's `Y = F + EPS(1) * F**THETA(n)`,
         // Pharmpy's `set_power_on_ruv`. The loading is the proportional one
         // raised to `P`, so the form *is* the proportional model plus an
@@ -22265,7 +22355,11 @@ fn parse_error_model_inner(
         let error_model = match error_type.as_str() {
             "additive" | "log_additive" => ErrorModel::Additive,
             "proportional" | "power" => ErrorModel::Proportional,
+            // Under LTBS `combined(PROP, ADD)` is the log-scale form whose additive
+            // part stays in natural units (#2729).
+            "combined" if lhs_logged => ErrorModel::LogCombined,
             "combined" => ErrorModel::Combined,
+            "log_combined" => ErrorModel::LogCombined,
             other => return Err(format!("Unknown error model: {}", other)),
         };
         if sigma_names.len() != error_model.n_sigma() {
@@ -22301,9 +22395,12 @@ fn parse_error_model_inner(
             }
             // Combined's argument order is (proportional, additive) — see
             // `ErrorModel::sigma_types` — so the weighted slot is the last one.
+            // `LogCombined` (#2729): dividing DV and the prediction by `W` leaves
+            // the log residual unchanged and turns `ADD/F` into `ADD·W/F`, so its
+            // natural-unit additive slot takes the weight, as `Combined`'s does.
             let slot = match error_model {
                 ErrorModel::Additive => 0,
-                ErrorModel::Combined => 1,
+                ErrorModel::Combined | ErrorModel::LogCombined => 1,
                 ErrorModel::Proportional => {
                     return Err(format!(
                         "[error_model] `weight = {}` has no effect on a purely proportional error \
@@ -22318,29 +22415,29 @@ fn parse_error_model_inner(
         }
 
         // LTBS validation. `log(DV) ~ log_additive(...)` double-logs the data and
-        // is rejected; LTBS only supports additive error on the log scale; and the
-        // per-CMT (multi-endpoint) form is out of scope for LTBS.
-        if lhs_logged && type_is_log_additive {
+        // is rejected; LTBS supports additive error on the log scale and the
+        // combined form with a natural-unit additive part (#2729). Per-CMT lines
+        // may be LTBS too, all of them or none (checked after the loop).
+        if lhs_logged && type_is_log {
+            let plain = if type_is_log_combined {
+                "combined"
+            } else {
+                "additive"
+            };
             return Err(format!(
-                "[error_model] `{}` double-log-transforms DV: use `log(DV) ~ additive(...)` \
-                 (engine logs DV) OR `DV ~ log_additive(...)` (DV already log), not both",
-                trimmed
+                "[error_model] `{trimmed}` double-log-transforms DV: use `log(DV) ~ {plain}(...)` \
+                 (engine logs DV) OR `DV ~ {error_type}(...)` (DV already log), not both"
             ));
         }
-        let log_transform = lhs_logged || type_is_log_additive;
-        if log_transform && !matches!(error_model, ErrorModel::Additive) {
+        let log_transform = lhs_logged || type_is_log;
+        if log_transform && !matches!(error_model, ErrorModel::Additive | ErrorModel::LogCombined) {
             return Err(format!(
-                "[error_model] log-transform-both-sides supports only additive error on the \
-                 log scale; use `log(DV) ~ additive(...)` or `DV ~ log_additive(...)`: {}",
+                "[error_model] log-transform-both-sides supports additive error on the log \
+                 scale (`log(DV) ~ additive(...)` / `DV ~ log_additive(...)`) and combined \
+                 proportional + additive error (`log(DV) ~ combined(PROP, ADD)` / \
+                 `DV ~ log_combined(PROP, ADD)`): {}",
                 trimmed
             ));
-        }
-        if log_transform && cmt_opt.is_some() {
-            return Err(
-                "[error_model] log-transform-both-sides (`log(DV) ~ ...` / `log_additive`) \
-                 is not supported with per-CMT (multi-endpoint) error models"
-                    .to_string(),
-            );
         }
         // The engine always log-transforms the `DV` column under LTBS — a
         // different LHS name (e.g. `log(CONC) ~ additive(...)`) would parse but
@@ -22355,12 +22452,16 @@ fn parse_error_model_inner(
         let flags = LtbsFlags {
             log_transform,
             // `log(DV)` logs DV in the engine (data is natural scale);
-            // `log_additive` trusts the data is already on the log scale.
-            dv_pre_logged: type_is_log_additive,
+            // `log_additive` / `log_combined` trust the data is already on the
+            // log scale.
+            dv_pre_logged: type_is_log,
         };
 
         match cmt_opt {
-            Some(cmt) => per_cmt.push((cmt, error_model, sigma_names)),
+            Some(cmt) => {
+                per_cmt.push((cmt, error_model, sigma_names));
+                per_cmt_flags.push((cmt, flags));
+            }
             None => singles.push((error_model, sigma_names, flags, exponent)),
         }
     }
@@ -22399,11 +22500,36 @@ fn parse_error_model_inner(
                         (multi-endpoint) error models"
                 .to_string());
         }
-        return Ok((
-            ParsedErrorModel::PerCmt(per_cmt),
-            LtbsFlags::default(),
-            None,
-        ));
+        // LTBS per endpoint (#2729). The engine logs every prediction and, under
+        // `log(DV)`, every `DV`, so it is all endpoints or none, under one DV
+        // convention — a log-scale plasma endpoint beside a natural-scale one would
+        // have its natural residual scored against a logged prediction.
+        let flags = per_cmt_flags[0].1;
+        let differ = |pick: fn(&LtbsFlags) -> bool| {
+            per_cmt_flags
+                .iter()
+                .find(|(_, f)| pick(f) != pick(&flags))
+                .map(|&(cmt, _)| cmt)
+        };
+        if let Some(cmt) = differ(|f| f.log_transform) {
+            return Err(format!(
+                "[error_model] log-transform-both-sides applies to every endpoint or none: \
+                 CMT={} and CMT={cmt} disagree. Write every `CMT=N:` line on the log scale \
+                 (`log(DV) ~ additive/combined(...)` or `DV ~ log_additive/log_combined(...)`) \
+                 or none of them",
+                per_cmt_flags[0].0
+            ));
+        }
+        if let Some(cmt) = differ(|f| f.dv_pre_logged) {
+            return Err(format!(
+                "[error_model] CMT={} and CMT={cmt} disagree on the scale of `DV`: one is \
+                 written `log(DV) ~ ...` (DV on the natural scale, the engine logs it) and the \
+                 other `DV ~ log_...(...)` (DV already logged). The `DV` column has one \
+                 scale; use one spelling on every line",
+                per_cmt_flags[0].0
+            ));
+        }
+        return Ok((ParsedErrorModel::PerCmt(per_cmt), flags, None));
     }
 
     match singles.into_iter().next() {
@@ -24339,6 +24465,18 @@ pub struct LevelBlockDecl {
     /// CTMM generator is built once per subject from the baseline, and one time-to-event
     /// data row can yield zero or two records, so neither defines levels.
     pub(crate) record_cmts: Vec<usize>,
+    /// Set by the parse: the plain data columns of the explicit `NAME[COLUMN]` reads of
+    /// this block (#2623), deduplicated in read order — the [`ThetaBlocks::uses`] naming
+    /// it. A data-driven block is read bare, through `index_covariate`; an explicit read
+    /// indexes it by the column itself and makes no endpoint a level-defining reader, so
+    /// the binder names this spelling when that leaves the block with no levels.
+    pub(crate) keyed_reads: Vec<String>,
+    /// Set by the parse: some expression reads this block bare, through
+    /// `index_covariate` — the model's referenced covariates include it (#2623 review).
+    /// With [`Self::record_cmts`] it tells the binder's no-levels refusal whether the
+    /// expression is the cause or the block's only readers define no level on the data
+    /// (a Gaussian prediction on data with no Gaussian rows, a CTMM generator, a TTE hazard).
+    pub(crate) read_bare: bool,
 }
 
 impl LevelBlockDecl {

@@ -56,21 +56,28 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
     Ok(())
 }
 
-/// Reject an adaptive-dosing simulation on a `CMT=N:` line carrying a magnitude
-/// expression (#2731). [`assay_resid_var`] has no observation row to evaluate the
-/// expression on, so the assay would draw on the bare sigma and report the run as if
-/// the factor had applied.
-fn reject_endpoint_magnitude_for_adaptive(model: &CompiledModel) -> Result<(), EngineError> {
-    if model
-        .ruv_magnitude
-        .as_ref()
-        .is_some_and(|rm| rm.has_endpoint_magnitude())
-    {
+/// Reject an adaptive-dosing simulation on any active residual-error magnitude: a sigma
+/// scaled by an expression, a `weight =`, a `power(σ, P)` exponent, or a magnitude on a
+/// `CMT=N:` line (#2731, #2741). [`assay_resid_var`] has no observation row to evaluate
+/// a magnitude on, so the assay would draw on the bare sigma and report the run as if
+/// the factor had applied — measured on #2741: a tenfold multiplier and a cubed loading
+/// left every `Dv` reading bit-identical to the bare model's.
+///
+/// The assay is the only reader of the residual error, so a run with no `Dv` monitor
+/// (and a spec without assay error) was correct, and is refused too: the check runs on
+/// the model alone, before the options are looked at, like the `Selected` reject above.
+/// #2741's lift, applying the magnitude in the assay, removes the refusal for both.
+///
+/// One gate, [`RuvMagnitude::is_active`](crate::types::RuvMagnitude::is_active), so the
+/// single-endpoint and endpoint-keyed forms cannot drift apart.
+fn reject_ruv_magnitude_for_adaptive(model: &CompiledModel) -> Result<(), EngineError> {
+    if model.has_custom_ruv_magnitude() {
         return Err(super::entry_refusals::adaptive_unsupported(
             Some("error_model"),
-            "adaptive-dosing simulation does not support a magnitude expression on a `CMT=N:` \
-             line: the assay draws its residual error from the bare sigma, without the \
-             expression. Use bare sigma names in `[error_model]`.",
+            "adaptive-dosing simulation does not support a residual-error magnitude (a sigma \
+             multiplied by an expression, a `weight =`, a `power(...)` exponent, or a \
+             magnitude on a `CMT=N:` line). The assay draws its residual error from the bare \
+             sigma, without the magnitude. Use bare sigma names in `[error_model]`.",
         ));
     }
     Ok(())
@@ -93,7 +100,7 @@ pub(crate) fn check_adaptive_model_data(
     }
     first_error(&check_simulation_data(model, population))?;
     reject_selected_error_for_adaptive(model)?;
-    reject_endpoint_magnitude_for_adaptive(model)
+    reject_ruv_magnitude_for_adaptive(model)
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
@@ -783,6 +790,17 @@ where
     // returns a recoverable `Err` here instead of the engine silently dropping it. (It was a no-op
     // for ODE models before #899 — do not "simplify" this call away as dead code.)
     first_error(&check_dose_compartments(model, population))?;
+    // The adaptive walk has its own timeline, with no compartment on/off record (#2732).
+    if let Some(s) = population.subjects.iter().find(|s| s.has_cmt_toggles()) {
+        return Err(super::entry_refusals::adaptive_unsupported(
+            None,
+            format!(
+                "subject {} turns a compartment off (`EVID=2` with a negative `CMT`), which \
+                 adaptive dosing cannot honour.",
+                s.id
+            ),
+        ));
+    }
     first_error(&check_absorption_closed_form_support_diags(
         model, population,
     ))?;
