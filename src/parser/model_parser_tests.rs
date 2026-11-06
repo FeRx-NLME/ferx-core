@@ -38416,21 +38416,6 @@ fn level_read_sites(decl: &str, read: &str) -> Vec<(&'static str, String)> {
             gaussian("", "") + &format!("[derived]\n  D = E0 + {read}\n"),
         ),
         (
-            "[binary_model]",
-            format!(
-                "
-[parameters]
-  theta TVL(-0.3, -5.0, 5.0)
-  theta PLACEBO[{decl}](0.0, -5.0, 5.0)
-[covariates]
-  STUDY categorical
-[binary_model]
-  cmt   = 1
-  logit = TVL + {read}
-"
-            ),
-        ),
-        (
             "[scaling]",
             format!(
                 "
@@ -38457,6 +38442,24 @@ fn level_read_sites(decl: &str, read: &str) -> Vec<(&'static str, String)> {
             ),
         ),
     ];
+    // `[binary_model]` is a `survival` block: without it the parse refuses the block
+    // itself, before the read (as the core CI shards, built without `survival`, found).
+    #[cfg(feature = "survival")]
+    sites.push((
+        "[binary_model]",
+        format!(
+            "
+[parameters]
+  theta TVL(-0.3, -5.0, 5.0)
+  theta PLACEBO[{decl}](0.0, -5.0, 5.0)
+[covariates]
+  STUDY categorical
+[binary_model]
+  cmt   = 1
+  logit = TVL + {read}
+"
+        ),
+    ));
     #[cfg(feature = "markov")]
     sites.push((
         "DTMM [markov_model]",
@@ -38493,7 +38496,8 @@ fn a_subscripted_read_of_a_data_driven_block_is_refused_at_every_site() {
     let refused = level_read_sites("STUDY", "PLACEBO[STUDY]");
     let bare = level_read_sites("STUDY", "PLACEBO");
     let counted = level_read_sites("3", "PLACEBO[STUDY]");
-    let expected_sites = if cfg!(feature = "markov") { 7 } else { 6 };
+    let expected_sites =
+        5 + usize::from(cfg!(feature = "survival")) + usize::from(cfg!(feature = "markov"));
     assert_eq!(refused.len(), expected_sites);
     for (((site, src), (_, bare_src)), (_, counted_src)) in refused.iter().zip(&bare).zip(&counted)
     {
