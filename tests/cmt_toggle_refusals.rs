@@ -251,3 +251,31 @@ fn a_fit_runs_on_the_analytic_gradient_and_a_grid_output_reads_nan() {
         );
     }
 }
+
+/// A subject built in memory, as the R glue and FREM build them, has no written times. The
+/// refusal must still be a refusal, not an index panic.
+#[test]
+fn a_subject_built_in_memory_is_refused_at_its_engine_time() {
+    use ferx_core::types::CmtToggle;
+    let m = model(ODE);
+    let mut pop = data(&format!("{OFF_AT_3}1,4,1,0,.,2,0,0,0\n"));
+    let s = &mut pop.subjects[0];
+    s.obs_raw_times.clear();
+    s.pk_only_raw_times.clear();
+    assert_eq!(
+        s.cmt_toggles[0],
+        CmtToggle {
+            pk_only: 0,
+            state: 1,
+            on: false
+        }
+    );
+    let e = refusal(&m, &pop);
+    assert!(e.contains("E_OBS_CMT_OFF") && e.contains("time 4"), "{e}");
+    pop.subjects[0].cmt_toggles[0].state = 5;
+    let e = refusal(&m, &pop);
+    assert!(
+        e.contains("E_CMT_TOGGLE_OUT_OF_RANGE") && e.contains("time 3"),
+        "{e}"
+    );
+}

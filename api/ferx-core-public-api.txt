@@ -2899,6 +2899,10 @@ impl ferx_core::BicInputs
 pub fn ferx_core::BicInputs::n_fixed_class(&self) -> usize
 pub fn ferx_core::BicInputs::n_free(&self) -> usize
 pub fn ferx_core::BicInputs::n_random_class(&self) -> usize
+pub struct ferx_core::types::CmtToggle
+pub ferx_core::types::CmtToggle::on: bool
+pub ferx_core::types::CmtToggle::pk_only: usize
+pub ferx_core::types::CmtToggle::state: usize
 pub struct ferx_core::types::CompiledModel
 pub ferx_core::types::CompiledModel::absorption_ode_equivalent: core::option::Option<ferx_core::AbsorptionOdeEquivalent>
 pub ferx_core::types::CompiledModel::analytic_readout: core::option::Option<ferx_core::AnalyticReadout>
@@ -3678,6 +3682,7 @@ pub ferx_core::types::SimulationSpec::obs_times: alloc::vec::Vec<f64>
 pub ferx_core::types::SimulationSpec::seed: u64
 pub struct ferx_core::types::Subject
 pub ferx_core::types::Subject::cens: alloc::vec::Vec<i8>
+pub ferx_core::types::Subject::cmt_toggles: alloc::vec::Vec<ferx_core::CmtToggle>
 pub ferx_core::types::Subject::covariates: std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub ferx_core::types::Subject::dose_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::types::Subject::dose_occasions: alloc::vec::Vec<u32>
@@ -3708,10 +3713,12 @@ impl ferx_core::Subject
 pub fn ferx_core::Subject::all_doses_fixed(&self) -> bool
 pub fn ferx_core::Subject::dose_cov(&self, k: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub fn ferx_core::Subject::has_censored_observation(&self) -> bool
+pub fn ferx_core::Subject::has_cmt_toggles(&self) -> bool
 pub fn ferx_core::Subject::has_periodic_ss_dose(&self) -> bool
 pub fn ferx_core::Subject::has_rate_defined_infusion(&self) -> bool
 pub fn ferx_core::Subject::has_resets(&self) -> bool
 pub fn ferx_core::Subject::has_ss_doses(&self) -> bool
+pub fn ferx_core::Subject::has_state_events(&self) -> bool
 pub fn ferx_core::Subject::has_tv_covariates(&self) -> bool
 pub fn ferx_core::Subject::obs_cov(&self, j: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub fn ferx_core::Subject::occasion_first_dose_time(&self, obs_time: f64) -> f64
@@ -4425,6 +4432,10 @@ pub fn ferx_core::diagnostics::CheckReport::error_count(&self) -> usize
 pub fn ferx_core::diagnostics::CheckReport::info_count(&self) -> usize
 pub fn ferx_core::diagnostics::CheckReport::new(model: impl core::convert::Into<alloc::string::String>, data: core::option::Option<alloc::string::String>, diagnostics: alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>) -> Self
 pub fn ferx_core::diagnostics::CheckReport::warning_count(&self) -> usize
+pub struct ferx_core::CmtToggle
+pub ferx_core::CmtToggle::on: bool
+pub ferx_core::CmtToggle::pk_only: usize
+pub ferx_core::CmtToggle::state: usize
 pub struct ferx_core::CompiledModel
 pub ferx_core::CompiledModel::absorption_ode_equivalent: core::option::Option<ferx_core::AbsorptionOdeEquivalent>
 pub ferx_core::CompiledModel::analytic_readout: core::option::Option<ferx_core::AnalyticReadout>
@@ -5432,6 +5443,7 @@ pub ferx_core::StrictnessVerdict::passed: bool
 pub ferx_core::StrictnessVerdict::skipped: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::Subject
 pub ferx_core::Subject::cens: alloc::vec::Vec<i8>
+pub ferx_core::Subject::cmt_toggles: alloc::vec::Vec<ferx_core::CmtToggle>
 pub ferx_core::Subject::covariates: std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub ferx_core::Subject::dose_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::Subject::dose_occasions: alloc::vec::Vec<u32>
@@ -5462,10 +5474,12 @@ impl ferx_core::Subject
 pub fn ferx_core::Subject::all_doses_fixed(&self) -> bool
 pub fn ferx_core::Subject::dose_cov(&self, k: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub fn ferx_core::Subject::has_censored_observation(&self) -> bool
+pub fn ferx_core::Subject::has_cmt_toggles(&self) -> bool
 pub fn ferx_core::Subject::has_periodic_ss_dose(&self) -> bool
 pub fn ferx_core::Subject::has_rate_defined_infusion(&self) -> bool
 pub fn ferx_core::Subject::has_resets(&self) -> bool
 pub fn ferx_core::Subject::has_ss_doses(&self) -> bool
+pub fn ferx_core::Subject::has_state_events(&self) -> bool
 pub fn ferx_core::Subject::has_tv_covariates(&self) -> bool
 pub fn ferx_core::Subject::obs_cov(&self, j: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub fn ferx_core::Subject::occasion_first_dose_time(&self, obs_time: f64) -> f64

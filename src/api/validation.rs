@@ -3279,6 +3279,14 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
         Event::Toggle(_) => 2,
         Event::Obs(_) => 3,
     };
+    // The `TIME` as written. A subject built in memory carries no written times.
+    let written_at = |s: &crate::types::Subject, c: &crate::types::CmtToggle| {
+        let engine = s.pk_only_times[c.pk_only];
+        s.pk_only_raw_times
+            .get(c.pk_only)
+            .copied()
+            .unwrap_or(engine)
+    };
     let mut diags = Vec::new();
     for s in population.subjects.iter().filter(|s| s.has_cmt_toggles()) {
         for c in s.cmt_toggles.iter().filter(|c| !c.on) {
@@ -3290,7 +3298,10 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
                         format!(
                             "subject {}, time {}: `CMT=-{cmt}` turns off compartment {cmt}, but \
                              the `[odes]` block declares only {} state(s) (CMT is 1-based: {:?}).",
-                            s.id, s.pk_only_raw_times[c.pk_only], spec.n_states, spec.state_names,
+                            s.id,
+                            written_at(s, c),
+                            spec.n_states,
+                            spec.state_names,
                         ),
                     )
                     .with_block("odes"),
@@ -3303,7 +3314,9 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
                             "subject {}, time {}: `CMT=-{cmt}` turns off `{}`, which a built-in \
                              absorption input feeds. Only a compartment dosed directly or fed by \
                              its `d/dt` terms can be switched.",
-                            s.id, s.pk_only_raw_times[c.pk_only], spec.state_names[c.state],
+                            s.id,
+                            written_at(s, c),
+                            spec.state_names[c.state],
                         ),
                     )
                     .with_block("odes"),
@@ -3380,7 +3393,7 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
                                      (`{}`) while it is off. Turn it on before this record, or \
                                      observe it before the off row.",
                                     s.id,
-                                    s.obs_raw_times[j],
+                                    s.obs_raw_times.get(j).copied().unwrap_or(t),
                                     spec.state_names[cmt - 1],
                                 ),
                             )

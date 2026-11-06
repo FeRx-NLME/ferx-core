@@ -1423,8 +1423,7 @@ fn adaptive_refuses_a_compartment_off_row() {
     use crate::sim::adaptive::{ControllerCtx, DoseAction};
     let ode = parse_model_string(ODE_ADAPTIVE).expect("parse");
     let mut subject = observed("1", &[1.0]);
-    subject.pk_only_times = vec![0.5];
-    subject.pk_only_raw_times = vec![0.5];
+    subject.pk_only_times = vec![1.5];
     subject.cmt_toggles = vec![crate::types::CmtToggle {
         pk_only: 0,
         state: 0,
