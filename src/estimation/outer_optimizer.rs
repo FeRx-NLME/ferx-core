@@ -10305,7 +10305,7 @@ fn subject_fixed_ebe_gradient(
     (nll, gi)
 }
 
-/// Is subject `subject`'s analytic outer-gradient decline **structural** — one it takes
+/// Is subject `subject`'s analytic outer-gradient decline **structural**: one it takes
 /// at every parameter point of the fit, rather than the parameter-dependent decline
 /// (non-PD inner Hessian at a blown-up trial) #1529 made cheap? (#1536)
 ///
@@ -10316,21 +10316,16 @@ fn subject_fixed_ebe_gradient(
 /// The adjoint's kernel scores dense residual covariances itself, so the one structural
 /// cause left is a subject no recorder serves: its decline is scope, not numerics, and
 /// recurs at every evaluation exactly as a model-level exclusion does.
-fn is_structural_decline(
-    model: &CompiledModel,
-    subject: &Subject,
-    init_params: &ModelParameters,
-    eta_hat: &[f64],
-) -> bool {
-    // A subject no recorder can serve declines at every evaluation, as a model-level
-    // exclusion does; any other decline is numerical (a non-PD factor at a trial point).
-    crate::sens::ode_provider::adjoint::exact_eta_jacobian(
-        model,
-        subject,
-        &init_params.theta,
-        eta_hat,
-    )
-    .is_none()
+///
+/// Read off the adjoint's own [`DeclineCause`] (#2713 review round 4), the same fact the
+/// warning reports, so routing and report cannot disagree. Until then this re-ran the
+/// recorder at the trial's EBE, and any recording that failed there counted, including a
+/// parameter-dependent one: a lagged arrival landing on a covariate-change row (the
+/// separability check of the event walk) declines at one lag and is served at the next,
+/// yet took the reconverged salvage and the "no analytic recorder serves them" sentence
+/// (`a_parameter_dependent_recorder_decline_is_not_structural`).
+fn is_structural_decline(cause: DeclineCause) -> bool {
+    cause == DeclineCause::Shape
 }
 
 /// The salvage a declined non-IOV subject takes in [`population_gradient_sens_mixed_dx`]:
@@ -11534,8 +11529,7 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                 // has blown up (#1520).
                 Err(cause) => {
                     declines.record(i);
-                    let structural =
-                        is_structural_decline(model, subject, init_params, ehs[i].as_slice());
+                    let structural = is_structural_decline(cause);
                     if structural {
                         declines.record_structural(i);
                     }

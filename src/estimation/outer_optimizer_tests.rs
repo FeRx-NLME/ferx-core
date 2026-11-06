@@ -6764,6 +6764,80 @@ mod outer_fd_fallback {
         );
     }
 
+    /// #2713 review round 4: a parameter-dependent recorder decline is neither a shape nor
+    /// structural. The in-scope subject is routed to the closed-form event walk (constant
+    /// covariate snapshots) and given a covariate-change row at `t = 0.5`. At the fixture's
+    /// `TVLAG = 0.5` the lagged arrival lands on that row, which the walk's separability
+    /// check declines, and at `TVLAG = 0.6` it does not and the subject is served: the
+    /// straddle, asserted, that makes the decline parameter-dependent. The cause is a failed
+    /// recording, the salvage is held-EBE, and the warning names neither the shape clause
+    /// nor the structural sentence. Before round 4 the structural check re-ran the recorder
+    /// at this point, saw it fail, and routed the subject to the reconverged salvage.
+    #[test]
+    fn a_parameter_dependent_recorder_decline_is_not_structural() {
+        let (model, mut analytic, _) = analytic_and_declining();
+        let snap: std::collections::HashMap<String, f64> = [("WT".to_string(), 70.0)].into();
+        analytic.dose_covariates = vec![snap.clone(); analytic.doses.len()];
+        analytic.obs_covariates = vec![snap.clone(); analytic.obs_times.len()];
+        let t_row = analytic.doses[0].time + 0.5;
+        analytic.pk_only_times = vec![t_row];
+        analytic.pk_only_covariates = vec![snap];
+        let pop = mk_pop(vec![analytic]);
+        let params = &model.default_params;
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let cause_at = |p: &ModelParameters| {
+            let x = pack_params(p);
+            let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x)
+                .expect("packed point");
+            subject_analytic_outer_gradient_dx(
+                &model,
+                &pop.subjects[0],
+                &pt,
+                &[0.0; 3],
+                opts.interaction,
+                false,
+            )
+            .0
+            .err()
+        };
+        assert_eq!(
+            cause_at(params),
+            Some(DeclineCause::Recording),
+            "the coincident arrival declines, and not for the subject's shape"
+        );
+        let mut moved = params.clone();
+        let lag = model
+            .theta_names
+            .iter()
+            .position(|n| n == "TVLAG")
+            .expect("TVLAG");
+        moved.theta[lag] = 0.6;
+        assert_eq!(
+            cause_at(&moved),
+            None,
+            "the straddle: at another lag it is served"
+        );
+
+        let log = record_one_gradient_eval(&model, &pop);
+        assert_eq!(
+            log.n_structural(),
+            0,
+            "a recording failure is not structural"
+        );
+        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("the subject declined");
+        assert!(w.contains("(1 with a recording that failed"), "got: {w}");
+        assert!(w.contains("used fixed-EBE outer gradients"), "got: {w}");
+        assert!(
+            !w.contains("with a shape no analytic recorder serves")
+                && !w.contains("no analytic recorder serves them"),
+            "got: {w}"
+        );
+    }
+
     /// #2713 review: the classification at the reported estimates. Over the fixture, at
     /// zero EBEs, the in-scope subject is served and the SS-infusion one is declined for
     /// its shape — the straddle between the two subjects, each named by its count. At an
