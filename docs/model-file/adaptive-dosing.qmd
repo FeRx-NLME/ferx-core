@@ -51,11 +51,12 @@ with the run, never with a fitted model's parameters.
 |-----|:--------:|---------|
 | `observe` | signal¹ | The **latent** monitored signal — a free-form expression over states + individual parameters (e.g. `central / V` for concentration), titrated on with **no** measurement noise. Provide this *or* `with_assay_error`, never both. The `when` rules compare the keyword `signal` to its value. |
 | `at` | ✓ | Decision schedule on the subject clock: an explicit list `[0, 24, 48]` or an arithmetic sequence `every <Δ> from <t0> to <t1>` (inclusive). |
-| `start_dose` | ✓ | The dose issued at the first decision; seeds the running dose. A number, or an expression over θ and data covariates evaluated per subject (e.g. `15 * WT`); see [Dose expressions](#dose-expressions). |
+| `start_dose` | ✓ | The dose issued at the first decision; seeds the running dose. A number, or an expression evaluated per subject (e.g. `15 * WT`, or `400 * CL` for a subject whose η are supplied); see [Dose expressions](#dose-expressions). |
 | `route` | ✓ | `bolus(cmt=N)` or `infuse(cmt=N, over=T)` (zero-order over duration `T`). |
 | `dose_bounds` | ✓ | Inclusive `[low, high]` clamp applied to every emitted dose. Each side is a number or a per-subject expression (e.g. `[0, min(30 * WT, 4000)]`). |
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. Each rung is a number or a per-subject expression. |
+| `dose_knowledge` | | `known` (default) or `oracle`: whether a dose expression may read a drawn subject's individual parameters. See [Which subjects' values are known](#which-subjects-values-are-known). |
 | `intervals` | | Dosing-interval ladder `[d1, d2, …]`, strictly increasing and positive. Rules step it with `lengthen` / `shorten`. Requires `start_interval`. See [Changing the dosing interval](#changing-the-dosing-interval). |
 | `start_interval` | | The dosing interval in force from the first decision; one of `intervals`, and required with it. |
 | `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
@@ -126,7 +127,9 @@ the first subject. Anything else is an expression, compiled with the same expres
 as `observe` (`min`, `max`, `exp`, `if (…) … else …`, …).
 
 Each expression is evaluated **once per subject, at the first decision** (`at[0]`),
-from θ and the covariates in force there: the row of the record in force at `at[0]`,
+from θ, the covariates in force there and, for a subject whose values are known, its
+individual parameters there (see [Which subjects' values are known](#which-subjects-values-are-known)).
+The covariates are the row of the record in force at `at[0]`,
 the same row a programmatic controller reads in `ctx.covariates` at that decision. A
 covariate that changes before `at[0]` is read at its new value; one that changes after
 `at[0]` does not change the plan. When `at[0]` is before the subject's first record,
@@ -139,7 +142,8 @@ rules as the numbers: finite and `>= 0`, `low <= high`, the start dose inside th
 bounds (and on the ladder, with `levels`), every rung inside the bounds, and the ladder
 strictly increasing. The first subject that fails is refused with
 `E_ADAPTIVE_DOSE_VALUE`, naming the subject, the expression, the values it evaluated to
-and the covariate values it read:
+and the covariate and individual-parameter values it read (and, for an oracle subject,
+checked in each replicate, the replicate):
 
 ```
 [adaptive_dosing] subject 2: start_dose = 15 * WT - 1000 evaluates to -250; a dose
@@ -157,15 +161,76 @@ A covariate the data lack is refused when the run starts, with
 |---|---|---|
 | A number, θ | yes | The same for every subject. |
 | A data covariate | yes | Known when the dose is written. Read at `at[0]`. |
+| An individual parameter (`CL`) or a random effect (`ETA_CL`) | for a supplied subject; for a drawn one only under `dose_knowledge = oracle` | Known at dosing time only when the subject's η come from input; see [Which subjects' values are known](#which-subjects-values-are-known). |
 | A state (`CENT`) | no | The expression runs once; to follow the drug level, write a `when signal …` rule. |
 | `TIME` (or `T`) | no | It would always be `at[0]`; write the value. |
-| An individual parameter (`CL`) or a random effect (`ETA_CL`) | not yet | A subject's own parameter values are not known at dosing time unless they are supplied; this is the next step of #944. Today, carry a known value as a data column (e.g. `CL_KNOWN`) and read that. |
-| A κ (IOV) | no | Drawn for each occasion, so never known at dosing time. |
-| `MIXNUM` | no | The simulation draws the class. |
+| A κ (IOV) | no | Drawn for each occasion, so never known at dosing time. Read the individual parameter instead: a supplied subject reads it at κ = 0. |
+| `MIXNUM` | only under `dose_knowledge = oracle` | The simulation draws the class, and supplied η refuse a `[mixture]` model, so no subject's class is known. |
 
-These are refused when the model is parsed, so `ferx check` reports them, with a
+The refusals are raised when the model is parsed, so `ferx check` reports them, with a
 message that names the key and the name read. A spec built in code is checked again
-when the run starts.
+when the run starts. Whether a subject may read its individual parameters depends on
+whether its η are supplied, so that is decided when the run starts.
+
+### Which subjects' values are known
+
+A subject's individual parameters are known at dosing time when they come from input:
+its η are supplied (`etas` in R, `AdaptiveInputs::with_etas` in Rust; see
+[Supplied individual values](#supplied-individual-values)). When the simulation draws
+the η, the individual parameters are the simulated truth, which no prescriber knows.
+The rule is decided per subject, so a run under `UnmatchedSubjects::Draw` that mixes
+known and virtual patients treats each by its own source
+([#944](https://github.com/FeRx-NLME/ferx-core/issues/944)):
+
+| Subject | `dose_knowledge = known` (default) | `dose_knowledge = oracle` |
+|---|---|---|
+| η supplied | reads its supplied η, with κ = 0 | the same; `dose_oracle` is `false` |
+| η drawn | the run is refused (`E_ADAPTIVE_DOSE_KNOWLEDGE`), listing the drawn subjects | reads its drawn η and the κ of the first decision's occasion, in each replicate; `dose_oracle` is `true` |
+
+The refusal names the three routes to a dose computed from an individual value:
+
+```
+[adaptive_dosing] start_dose reads CL, an individual parameter, but the random effects
+of 1 of 2 subject(s) are drawn by the simulation ('2'), so CL is the simulated truth,
+which no prescriber knows at dosing time. To dose from it: carry the known value as a
+data column (e.g. CL_KNOWN) and read that; supply each subject's random effects (e.g. a
+previous fit's estimates, as `etas` in R or `AdaptiveInputs::with_etas` in Rust); or set
+dose_knowledge = oracle for a perfect-information comparison arm, which is flagged in
+the results.
+```
+
+The individual parameters are evaluated at the first decision: at the covariates in
+force there and at `TIME` as written there, the same point the driver evaluates the
+first decision's PK at. κ is drawn per occasion, so a supplied subject reads κ = 0. An
+oracle subject reads the κ of the first decision's occasion, the one the driver resolves
+the first dose's attributes under. With a record at the next decision, the disposition
+over the first window follows that record's occasion ([#943](https://github.com/FeRx-NLME/ferx-core/issues/943)), so the
+oracle's κ and the κ its first trough reflects can differ.
+
+**The oracle is never silent.** `dose_knowledge = oracle` is a perfect-information
+comparison arm, a standard benchmark in model-informed dosing studies. Each subject
+dosed from its drawn values has `AdaptiveSubjectMetrics::dose_oracle = true` (the
+`DOSE_ORACLE` metrics column in R), and the run warns:
+
+```
+W_ADAPTIVE_DOSE_ORACLE: 1 of 2 subject(s) were dosed from their simulated individual
+values (dose_knowledge = oracle; start_dose reads CL). This is a perfect-information
+arm: no prescriber has these values. The per-subject flag is the metrics column
+dose_oracle.
+```
+
+A run in which every subject is supplied doses no subject from its drawn values, so it
+flags none and does not warn. A block whose dose expressions read no individual
+parameter, random effect or `MIXNUM` has nothing for the oracle to apply to, so
+`dose_knowledge = oracle` there is refused when the model is parsed.
+
+**Supplied values are taken as exact.** A supplied subject's η are both its simulated
+truth and its dosing input, so the run assumes the dose was computed from perfect
+estimates, which is optimistic. To represent estimation error, let the simulation draw
+the truth and pass the estimate as a data column (e.g. `CL_KNOWN`), which a dose
+expression reads as a covariate. The full treatment, where the controller estimates
+the individual values from the observations it sees, is the MAP-Bayes controller
+(#391, Part F).
 
 On a FREM model, a dose expression that reads a covariate doses from the value in the
 data, while a subject whose η is drawn has PK that follows its drawn covariate η — unless
