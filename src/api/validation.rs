@@ -213,21 +213,35 @@ fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diag
 /// per-subject maps, so a name that is listed but missing from some subject is read
 /// as 0 for that subject. An empty population carries nothing.
 ///
-/// The subject-static map decides, not the per-record snapshots: every lookup
-/// without a snapshot of its own — a dose, reset or PK-only row of a subject with no
-/// such snapshots, an adaptive decision before the first record — falls back to it,
-/// so a name the static map lacks is read as 0 there even when every observation
-/// snapshot has it. The CSV reader fills the static map with each subject's first
-/// value.
+/// A subject carries `name` when its subject-static map **and** every per-record
+/// snapshot (observation, dose, PK-only, reset) holds it, since each is a map some
+/// predictor reads:
+/// - the static map is the fallback of every lookup without a snapshot of its own — a
+///   dose, reset or PK-only row of a subject with no such snapshots, an adaptive
+///   decision before the first record — so a name it lacks is read as 0 there even
+///   when every observation snapshot has it;
+/// - a record's snapshot is what that record reads, the PK at that row and, through
+///   `locf_decision_cov`, an adaptive `observe` or dose expression at a decision in
+///   force there (#2671), so a name one snapshot lacks is read as 0 at that record
+///   even when the static map has it.
 ///
-/// Shared with the `[adaptive_dosing]` `observe` check in
-/// `simulate_adaptive_from_spec`, so the two cannot disagree on one population.
+/// The CSV reader cannot produce either gap: it fills the static map with each
+/// subject's first value (`NaN` when it has none) and starts every snapshot from a
+/// copy of it, only ever adding keys. Only a population built in code can.
+///
+/// Shared with the `[adaptive_dosing]` `observe` and dose-expression checks in
+/// `simulate_adaptive_from_spec`, so they cannot disagree on one population.
 pub(crate) fn population_carries(population: &Population, name: &str) -> bool {
     !population.subjects.is_empty()
-        && population
-            .subjects
-            .iter()
-            .all(|s| s.covariates.contains_key(name))
+        && population.subjects.iter().all(|s| {
+            s.covariates.contains_key(name)
+                && s.obs_covariates
+                    .iter()
+                    .chain(&s.dose_covariates)
+                    .chain(&s.pk_only_covariates)
+                    .chain(&s.reset_covariates)
+                    .all(|m| m.contains_key(name))
+        })
 }
 
 /// The "Available covariate columns" list of an `E_MISSING_COVARIATE`: the listed

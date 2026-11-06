@@ -285,3 +285,47 @@ fn adaptive_observe_covariate_decides_presence_from_the_subjects() {
         }
     }
 }
+
+/// #2671: a covariate is carried only when the static map **and** every per-record
+/// snapshot hold it. Each record kind's snapshot is a map some predictor reads (a record
+/// reads its own, an adaptive decision reads the one in force), so a key one snapshot
+/// lacks is read as 0 at that record. The CSV reader cannot produce such a gap; a
+/// population built in code can. Both sides in one test: every map carrying `WTX` is
+/// accepted, and removing it from one snapshot of each kind in turn is refused with the
+/// `E_MISSING_COVARIATE` text.
+///
+/// Regressions: `population_carries` back to the static map alone (every gap accepted);
+/// any one record kind left out of the chain (that kind's gap accepted, named here).
+#[test]
+fn a_record_snapshot_without_the_covariate_does_not_carry_it() {
+    let model = parse_model_string(ONE_CPT_IV_WTX).expect("parse");
+    let mut pop = cells().pop().expect("cells").population;
+    for s in &mut pop.subjects {
+        let m = HashMap::from([("WTX".to_string(), s.covariates["WTX"])]);
+        s.obs_covariates = vec![m.clone(); 3];
+        s.dose_covariates = vec![m.clone(); 1];
+        s.pk_only_covariates = vec![m.clone(); 1];
+        s.reset_covariates = vec![m; 1];
+    }
+    assert!(
+        check_covariates(&model, &pop).is_empty(),
+        "control: every map carries WTX"
+    );
+
+    type Maps = fn(&mut Subject) -> &mut Vec<HashMap<String, f64>>;
+    let kinds: [(&str, Maps); 4] = [
+        ("observation", |s| &mut s.obs_covariates),
+        ("dose", |s| &mut s.dose_covariates),
+        ("PK-only", |s| &mut s.pk_only_covariates),
+        ("reset", |s| &mut s.reset_covariates),
+    ];
+    for (kind, maps) in kinds {
+        let mut gap = pop.clone();
+        let snapshot = maps(&mut gap.subjects[1]).last_mut().expect("one snapshot");
+        assert!(snapshot.remove("WTX").is_some(), "{kind}: the gap is made");
+        let diags = check_covariates(&model, &gap);
+        assert_eq!(diags.len(), 1, "{kind} snapshot without WTX: {diags:?}");
+        assert_eq!(diags[0].code, "E_MISSING_COVARIATE", "{kind}");
+        assert_eq!(diags[0].message, MISSING, "{kind}");
+    }
+}

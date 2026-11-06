@@ -13949,6 +13949,16 @@ fn declares_time_alias(declared_covariates: &[String]) -> bool {
         .any(|d| d.eq_ignore_ascii_case("T"))
 }
 
+/// The value a [`build_y_output_fn`] closure reads for covariate `name` from the map it
+/// is handed: the map's value, or `0.0` when the key is absent. The one definition of
+/// that read, so a caller reporting what an expression read (the dose-expression
+/// "reads" sentence, #2671) reports the value the closure used. The entry-point
+/// presence check (`population_carries`) is what keeps the absent case from a run.
+#[inline]
+pub(crate) fn output_covariate_read(covariates: &HashMap<String, f64>, name: &str) -> f64 {
+    covariates.get(name).copied().unwrap_or(0.0)
+}
+
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
 /// the uniform and per-CMT paths.
 #[allow(clippy::too_many_arguments)]
@@ -14199,9 +14209,7 @@ pub(crate) fn build_y_output_fn(
                 if n_cov > 0 {
                     scratch.y_cov.resize(n_cov, 0.0);
                     for (i, name) in cov_names_for_fn.iter().enumerate() {
-                        if let Some(&v) = covariates.get(name) {
-                            scratch.y_cov[i] = v;
-                        }
+                        scratch.y_cov[i] = output_covariate_read(covariates, name);
                     }
                 }
 
