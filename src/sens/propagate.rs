@@ -939,7 +939,9 @@ fn propagate_bounds_g<T: PkNum>(
     dose_lag_dual: &[T],
     dose_inf_dual: &[Option<(T, T)>],
     reset_floor: f64,
+    scan: &crate::dosing::DoseScan,
 ) {
+    scan.debug_check(doses);
     // Dual clock position of dose `k`'s arrival, `τ_k = t_k + ALAG`. With an estimated
     // lagtime this boundary **moves**: `dose_lag_dual[k]` carries `∂ALAG/∂(θ,η)`, so the
     // sub-intervals on either side of the arrival pick up `±∂ALAG` in their dual lengths
@@ -972,14 +974,31 @@ fn propagate_bounds_g<T: PkNum>(
     // Only boundaries that genuinely *move* are recorded: with no lagtime and no modeled
     // window nothing does, so this stays empty and `dual_pos` below is the same no-op scan it
     // was pre-#486 — the ordinary fixed-dose subject (the hot path) pays nothing.
+    //
+    // And only doses with a break near this interval are visited (#2754): `dual_pos` is
+    // asked about this interval's own `bounds` alone, so an entry farther than the 1e-9 match
+    // window from all of them can never be returned. `scan.doses_near` lists, in dose order,
+    // every dose whose arrival or window end lies within `DOSE_NEAR_MARGIN` of the interval —
+    // the entries below are then the old full list's, minus ones no bound can match, in the
+    // old order, so the first match is unchanged. With an estimated lag the full list held
+    // every dose's arrival, rebuilt for every interval: `O(n²)` per walk.
     let has_lag = !dose_lag_dual.is_empty();
     let mut moving_bounds: Vec<(f64, T)> = Vec::new();
-    let gate = crate::ode::predictions::ResetGate::at_segment(
-        doses,
+    let mut near = Vec::new();
+    if has_lag || !scan.windowed().is_empty() {
+        scan.doses_near(
+            bounds.first().copied().unwrap_or(f64::NEG_INFINITY) - crate::dosing::DOSE_NEAR_MARGIN,
+            bounds.last().copied().unwrap_or(f64::INFINITY) + crate::dosing::DOSE_NEAR_MARGIN,
+            &mut near,
+        );
+    }
+    let gate = crate::ode::predictions::ResetGate::at_segment_scanned(
+        scan,
         reset_floor,
         bounds.first().copied().unwrap_or(f64::NEG_INFINITY),
     );
-    for (k, d) in doses.iter().enumerate() {
+    for &k in &near {
+        let d = &doses[k];
         let (t_start, dual_start) = dose_start(k, d);
         if !gate.live(doses, k) {
             continue;
@@ -1025,6 +1044,7 @@ fn propagate_bounds_g<T: PkNum>(
             reset_floor,
             mid,
             false,
+            scan,
         );
         apply_step_g(state, dt, pk, pk_model, rates);
     }
@@ -1046,6 +1066,9 @@ fn propagate_bounds_g<T: PkNum>(
 ///   observation correction wants exactly this: an infusion **ending** at `mid` is still
 ///   contributing (production's full-containment convention), while one **starting** at `mid`
 ///   is not yet, since the walk propagated into that instant under the old rate set.
+///
+/// Visits only the doses `scan` lists as windowed, as the value walk's `active_rates_at` does
+/// (#2754): no other dose can pass the rate test, so the sum and its order are unchanged.
 #[allow(clippy::too_many_arguments)]
 fn active_rates_g<T: PkNum>(
     doses: &[DoseEvent],
@@ -1056,19 +1079,25 @@ fn active_rates_g<T: PkNum>(
     reset_floor: f64,
     mid: f64,
     strict_start: bool,
+    scan: &crate::dosing::DoseScan,
 ) -> (T, T, T, T) {
+    scan.debug_check(doses);
     let mut rate_central = T::from_f64(0.0);
     let mut rate_periph1 = T::from_f64(0.0);
     let mut rate_periph2 = T::from_f64(0.0);
     let mut rate_depot = T::from_f64(0.0);
+    if scan.windowed().is_empty() {
+        return (rate_central, rate_periph1, rate_periph2, rate_depot);
+    }
     // The value walk's gate (`pk::event_driven::active_rates_at`), built the same way: once
     // per call, at `mid`. (`propagate_bounds_g`'s `moving_bounds` builds its own at the
     // interval start instead. No `SS=1` record lies inside an interval — every dose record is
     // an event — so the two can differ only on a sliver interval that ends on a record and
     // starts just over `EVENT_MATCH_TOL` below it, whose telescoping jet error is O(its
     // width).)
-    let gate = crate::ode::predictions::ResetGate::at_segment(doses, reset_floor, mid);
-    for (k, d) in doses.iter().enumerate() {
+    let gate = crate::ode::predictions::ResetGate::at_segment_scanned(scan, reset_floor, mid);
+    for &k in scan.windowed() {
+        let d = &doses[k];
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
         let t_end = t_start + d.duration;
@@ -1221,6 +1250,11 @@ fn apply_step_g<T: PkNum>(
 /// nothing about the coincident boundary actually moves (a fixed window with no lagtime). The
 /// caller declines subjects where *several* moving boundaries coincide with one observation, so at
 /// most one applies here.
+///
+/// Only doses with a break within `DOSE_NEAR_MARGIN` of `t` are visited, in dose order
+/// (#2754): no other dose can pass either `1e-9` test, so the first match is the full
+/// scan's. `near` is the caller's scratch for that list.
+#[allow(clippy::too_many_arguments)]
 fn obs_boundary_correction<T: PkNum>(
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
@@ -1228,12 +1262,25 @@ fn obs_boundary_correction<T: PkNum>(
     dose_inf_dual: &[Option<(T, T)>],
     reset_floor: f64,
     t: f64,
+    scan: &crate::dosing::DoseScan,
+    near: &mut Vec<usize>,
 ) -> Option<(T, bool)> {
+    scan.debug_check(doses);
     let has_lag = !dose_lag_dual.is_empty();
+    if !has_lag && scan.windowed().is_empty() {
+        // No arrival moves and no dose has a window end: neither test below can pass.
+        return None;
+    }
+    scan.doses_near(
+        t - crate::dosing::DOSE_NEAR_MARGIN,
+        t + crate::dosing::DOSE_NEAR_MARGIN,
+        near,
+    );
     // A window stopped by a reset — EVID=3/4 or an `SS=1` record reached at `t` (#1586) — has
     // no moving boundary to correct.
-    let gate = crate::ode::predictions::ResetGate::at_segment(doses, reset_floor, t);
-    for (k, d) in doses.iter().enumerate() {
+    let gate = crate::ode::predictions::ResetGate::at_segment_scanned(scan, reset_floor, t);
+    for &k in near.iter() {
+        let d = &doses[k];
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
         if !gate.live(doses, k) {
@@ -1368,6 +1415,8 @@ fn equilibrate_ss_g<T: PkNum>(
     // as the main walk does for the current pulse — closing the closed-form SS × modeled-dose
     // gap. `None` (a fixed-window infusion) recovers the pre-#486 f64 window behaviour.
     let synthetic_inf: Vec<Option<(T, T)>> = if is_inf { vec![inf] } else { Vec::new() };
+    let synthetic_scan = crate::dosing::DoseScan::new(&synthetic_dose, &synthetic_lag);
+    let no_doses = crate::dosing::DoseScan::default();
     let bounds: Vec<f64> = if is_inf {
         vec![0.0, dose.duration, dose.ii]
     } else {
@@ -1387,10 +1436,15 @@ fn equilibrate_ss_g<T: PkNum>(
         if forced && !is_inf {
             s[cmt_idx] = s[cmt_idx] + pk.f * T::from_f64(dose.amt);
         }
-        let (doses, lag, inf_dual): (&[DoseEvent], &[f64], &[Option<(T, T)>]) = if forced {
-            (&synthetic_dose, &synthetic_lag, &synthetic_inf)
+        let (doses, lag, inf_dual, scan): (&[DoseEvent], &[f64], &[Option<(T, T)>], _) = if forced {
+            (
+                &synthetic_dose,
+                &synthetic_lag,
+                &synthetic_inf,
+                &synthetic_scan,
+            )
         } else {
-            (&[], &[], &[])
+            (&[], &[], &[], &no_doses)
         };
         propagate_bounds_g(
             &mut s,
@@ -1402,6 +1456,7 @@ fn equilibrate_ss_g<T: PkNum>(
             &[],
             inf_dual,
             f64::NEG_INFINITY,
+            scan,
         );
         Some(s)
     };
@@ -1441,6 +1496,7 @@ fn equilibrate_ss_g<T: PkNum>(
             &[],
             &synthetic_inf,
             f64::NEG_INFINITY,
+            &synthetic_scan,
         );
         cycles_run = cycle + 1;
         if ss_dual_cycle_should_stop(cycle, &state, &mut cur, &mut prev) {
@@ -1646,6 +1702,9 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     let governing_record = crate::dosing::governing_record_indices(schedule.events.len(), |i| {
         crate::pk::event_driven::is_record(schedule.events[i].kind)
     });
+    // The value walk's dose indexes, from the same rule (#2754).
+    let scan = schedule.dose_scan_for(eff_doses);
+    let mut near = Vec::new();
 
     for (i, ev) in schedule.events.iter().enumerate() {
         if ev.kind == EventKind::Reset {
@@ -1676,6 +1735,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 dose_lag_dual,
                 dose_inf_dual,
                 reset_floor,
+                scan,
             );
             cur_t = ev.time;
         }
@@ -1702,8 +1762,12 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 // lag needs no separate suppression here — the walk threads `∂/∂lag`
                 // through the dual sub-interval lengths on either side of the arrival, and
                 // with no jump between them the two flows compose to one fixed-length flow.
-                if !crate::ode::predictions::ResetGate::at_segment(eff_doses, reset_floor, ev.time)
-                    .live(eff_doses, ev.orig_idx)
+                if !crate::ode::predictions::ResetGate::at_segment_scanned(
+                    scan,
+                    reset_floor,
+                    ev.time,
+                )
+                .live(eff_doses, ev.orig_idx)
                 {
                     continue;
                 }
@@ -1777,6 +1841,8 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     dose_inf_dual,
                     reset_floor,
                     ev.time,
+                    scan,
+                    &mut near,
                 ) {
                     Some((delta, strict_start)) => {
                         obs_state = state.clone();
@@ -1789,6 +1855,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                             reset_floor,
                             ev.time,
                             strict_start,
+                            scan,
                         );
                         apply_step_g(
                             &mut obs_state,
@@ -2112,8 +2179,17 @@ mod tests {
             };
             // Each route must reach the read it is here for, or the row tests nothing.
             assert_eq!(
-                obs_boundary_correction::<Dual2<1>>(&doses, &lagtimes, &lag_dual, &[], 0.0, 13.0)
-                    .is_some(),
+                obs_boundary_correction::<Dual2<1>>(
+                    &doses,
+                    &lagtimes,
+                    &lag_dual,
+                    &[],
+                    0.0,
+                    13.0,
+                    &crate::dosing::DoseScan::new(&doses, &lagtimes),
+                    &mut Vec::new(),
+                )
+                .is_some(),
                 lag > 0.0,
                 "{route}: the t = 13 record does not take the read this row is for"
             );
@@ -2821,5 +2897,327 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #2754: both closed-form walks, the value walk and its dual twin, give the same
+    /// bits reading the dose index as they gave rescanning every dose for every interval.
+    /// The full scan is the oracle (`with_exhaustive_dose_scans`): every index query then
+    /// answers with every dose, so the walks run the pre-index loops through the same
+    /// per-dose code.
+    ///
+    /// Each fixture reaches a different query the index answers:
+    /// * `lagged boluses` — a long history (one record every 12 h) with an estimated lag,
+    ///   so every arrival is a moving boundary, samples **on** arrivals (the observation
+    ///   correction) and an EVID=3 reset part-way;
+    /// * `infusions` — lagged infusions, overlapping ones, samples on window ends, an
+    ///   `SS=1` infusion whose seeded residual is still running at its record, and a later
+    ///   `SS=1` bolus record that stops every window recorded before it;
+    /// * `coincident break` — an infusion ending at `0.1 + 0.7 = 0.7999999999999999`, one ulp
+    ///   below a lagged arrival at 0.8, the dedup edge `DOSE_NEAR_MARGIN` exists for;
+    /// * `modeled windows` — no lag, but modeled infusion durations (`D{n}`), so the window
+    ///   **ends** are the moving boundaries, with samples on them.
+    ///
+    /// The duals seed `CL` (axis 0) and every moving boundary (axis 1): each dose's lag, or
+    /// for `modeled windows` each window's duration. A boundary the index failed to list
+    /// would drop its jet and show in `grad[1]`.
+    #[test]
+    fn walks_over_the_dose_index_match_the_full_scans_bit_for_bit() {
+        use crate::dosing::with_exhaustive_dose_scans;
+        use crate::pk::event_driven::EventSchedule;
+        use crate::types::{DoseEvent, PK_IDX_LAGTIME};
+
+        struct Fixture {
+            name: &'static str,
+            model: PkModel,
+            doses: Vec<DoseEvent>,
+            lags: Vec<f64>,
+            obs: Vec<f64>,
+            resets: Vec<f64>,
+            modeled: bool,
+            // Samples the central-difference check below leaves out: production declines a
+            // lagged `SS=1` infusion's subject to FD (`provider::ss_lagtime_walk_unsupported`),
+            // so the walk's jet is not the derivative there until a later `SS=1` record resets it.
+            fd_skip: (f64, f64),
+        }
+        let lagged_boluses = {
+            let doses: Vec<DoseEvent> = (0..60)
+                .map(|k| DoseEvent::new(12.0 * k as f64, 100.0, 1, 0.0, false, 0.0))
+                .collect();
+            let mut obs: Vec<f64> = (0..60).map(|k| 12.0 * k as f64 + 0.5).collect();
+            obs.extend((0..60).map(|k| 12.0 * k as f64 + 3.0));
+            obs.sort_by(f64::total_cmp);
+            Fixture {
+                name: "lagged boluses",
+                model: PkModel::OneCptOral,
+                lags: vec![0.5; doses.len()],
+                doses,
+                obs,
+                resets: vec![300.0],
+                modeled: false,
+                fd_skip: (0.0, 0.0),
+            }
+        };
+        let infusions = {
+            let mut doses: Vec<DoseEvent> = (0..30)
+                .map(|k| {
+                    // Every fourth infusion runs 8 h, past the next record at +6 h.
+                    let amt = if k % 4 == 0 { 400.0 } else { 100.0 };
+                    DoseEvent::new(6.0 * k as f64, amt, 1, 50.0, false, 0.0)
+                })
+                .collect();
+            // `SS=1` infusion with lag 8 > II − T_inf = 6: its previous cycle is still
+            // infusing at the record (the seeded residual).
+            doses.push(DoseEvent::new(200.0, 300.0, 1, 50.0, true, 12.0));
+            // A later `SS=1` bolus record stops every window recorded before it.
+            doses.push(DoseEvent::new(250.0, 100.0, 1, 0.0, true, 24.0));
+            doses.extend(
+                (0..5).map(|k| DoseEvent::new(260.0 + 6.0 * k as f64, 100.0, 1, 50.0, false, 0.0)),
+            );
+            doses.sort_by(|a, b| a.time.total_cmp(&b.time));
+            let mut lags = vec![0.7; doses.len()];
+            for (l, d) in lags.iter_mut().zip(&doses) {
+                if d.ss && d.rate > 0.0 {
+                    *l = 8.0;
+                }
+            }
+            let mut obs: Vec<f64> = (0..30).map(|k| 6.0 * k as f64 + 0.7 + 2.0).collect();
+            obs.extend((0..48).map(|k| 1.25 + 6.0 * k as f64));
+            obs.extend([203.0, 208.0, 210.0, 251.0, 262.7]);
+            obs.sort_by(f64::total_cmp);
+            Fixture {
+                name: "infusions",
+                model: PkModel::OneCptIv,
+                doses,
+                lags,
+                obs,
+                resets: vec![150.0],
+                modeled: false,
+                fd_skip: (200.0, 250.0),
+            }
+        };
+        let coincident_break = Fixture {
+            name: "coincident break",
+            model: PkModel::OneCptIv,
+            doses: vec![
+                DoseEvent::new(0.1, 7.0, 1, 10.0, false, 0.0),
+                DoseEvent::new(0.3, 50.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(2.0, 7.0, 1, 10.0, false, 0.0),
+            ],
+            lags: vec![0.0, 0.5, 0.5],
+            obs: vec![0.5, 0.8, 1.0, 2.5, 3.2, 6.0],
+            resets: vec![],
+            modeled: false,
+            fd_skip: (0.0, 0.0),
+        };
+        let modeled_windows = {
+            let doses: Vec<DoseEvent> = (0..30)
+                .map(|k| {
+                    let amt = if k % 4 == 0 { 400.0 } else { 100.0 };
+                    DoseEvent::new(6.0 * k as f64, amt, 1, 50.0, false, 0.0)
+                })
+                .collect();
+            let mut obs: Vec<f64> = (0..30).map(|k| 6.0 * k as f64 + 2.0).collect();
+            obs.extend((0..30).map(|k| 6.0 * k as f64 + 4.5));
+            obs.sort_by(f64::total_cmp);
+            Fixture {
+                name: "modeled windows",
+                model: PkModel::OneCptIv,
+                lags: vec![0.0; doses.len()],
+                doses,
+                obs,
+                resets: vec![100.0],
+                modeled: true,
+                fd_skip: (0.0, 0.0),
+            }
+        };
+        // The fixture's duals: a lag jet per dose, or a duration jet per modeled window.
+        let duals = |fx: &Fixture| -> (Vec<Dual2<2>>, Vec<Option<(Dual2<2>, Dual2<2>)>>) {
+            if fx.modeled {
+                let inf = fx
+                    .doses
+                    .iter()
+                    .map(|d| {
+                        (d.rate > 0.0).then(|| (Dual2::constant(d.rate), Dual2::var(d.duration, 1)))
+                    })
+                    .collect();
+                (Vec::new(), inf)
+            } else {
+                (
+                    fx.lags.iter().map(|&l| Dual2::var(l, 1)).collect(),
+                    Vec::new(),
+                )
+            }
+        };
+
+        let (cl, v, ka) = (4.0, 30.0, 1.1);
+        let mut corrected = 0usize;
+        for fx in [lagged_boluses, infusions, coincident_break, modeled_windows] {
+            let n_obs = fx.obs.len();
+            let subject = crate::types::Subject {
+                id: "1".into(),
+                doses: fx.doses.clone(),
+                obs_times: fx.obs.clone(),
+                observations: vec![0.0; n_obs],
+                obs_cmts: vec![1; n_obs],
+                cens: vec![0; n_obs],
+                reset_times: fx.resets.clone(),
+                ..Default::default()
+            };
+            let pk_dose: Vec<PkParams> = fx
+                .lags
+                .iter()
+                .map(|&l| {
+                    let mut p = pk_of(cl, v, ka);
+                    p.values[PK_IDX_LAGTIME] = l;
+                    p
+                })
+                .collect();
+            let pk_obs = vec![pk_of(cl, v, ka); n_obs];
+            let value = || event_driven_predictions(fx.model, &subject, &pk_dose, &pk_obs, &[]);
+            let dual = || {
+                let schedule = EventSchedule::for_subject(&subject, fx.model, &fx.doses, &fx.lags);
+                let pk = PkDual {
+                    cl: Dual2::<2>::var(cl, 0),
+                    v: Dual2::constant(v),
+                    q: Dual2::constant(0.0),
+                    v2: Dual2::constant(0.0),
+                    ka: Dual2::constant(ka),
+                    q3: Dual2::constant(0.0),
+                    v3: Dual2::constant(0.0),
+                    f: Dual2::constant(1.0),
+                };
+                let (lag_dual, inf_dual) = duals(&fx);
+                event_driven_sens_with_doses_g(
+                    fx.model,
+                    &subject,
+                    &schedule,
+                    &fx.doses,
+                    &lag_dual,
+                    &inf_dual,
+                    &vec![pk; fx.doses.len()],
+                    &vec![pk; n_obs],
+                    &[],
+                )
+            };
+            let bits = |d: &Dual2<2>| {
+                let mut b = vec![d.value.to_bits()];
+                b.extend(d.grad.iter().map(|g| g.to_bits()));
+                b.extend(d.hess.iter().flatten().map(|h| h.to_bits()));
+                b
+            };
+            let (v_index, d_index) = (value(), dual());
+            let (v_full, d_full) = with_exhaustive_dose_scans(|| (value(), dual()));
+            for j in 0..n_obs {
+                assert!(v_index[j].is_finite(), "{}: obs {j} not finite", fx.name);
+                assert_eq!(
+                    v_index[j].to_bits(),
+                    v_full[j].to_bits(),
+                    "{}: value walk at t = {}",
+                    fx.name,
+                    fx.obs[j]
+                );
+                assert_eq!(
+                    bits(&d_index[j]),
+                    bits(&d_full[j]),
+                    "{}: dual walk at t = {}: {:?} vs {:?}",
+                    fx.name,
+                    fx.obs[j],
+                    d_index[j],
+                    d_full[j]
+                );
+            }
+            // Non-degeneracy: the moving boundaries move the predictions, and samples sit
+            // on them, so the correction the index feeds is reached.
+            assert!(
+                d_index.iter().any(|d| d.grad[1].abs() > 1e-6),
+                "{}: no boundary sensitivity",
+                fx.name
+            );
+            // The bit comparison above shares every gate in front of the index with its
+            // oracle, so it cannot see one that wrongly skips a boundary; the boundary jet
+            // against a central difference of the value walk can. Samples within 1e-3 of a
+            // moving boundary are skipped: the walk's derivative there is one-sided.
+            let value_at = |h: f64| -> Vec<f64> {
+                if fx.modeled {
+                    let doses: Vec<DoseEvent> = fx
+                        .doses
+                        .iter()
+                        .map(|d| {
+                            if d.rate > 0.0 {
+                                let amt = d.rate * (d.duration + h);
+                                DoseEvent::new(d.time, amt, 1, d.rate, d.ss, d.ii)
+                            } else {
+                                d.clone()
+                            }
+                        })
+                        .collect();
+                    let s = crate::types::Subject {
+                        doses,
+                        ..subject.clone()
+                    };
+                    event_driven_predictions(fx.model, &s, &pk_dose, &pk_obs, &[])
+                } else {
+                    let mut pk = pk_dose.clone();
+                    pk.iter_mut().for_each(|p| p.values[PK_IDX_LAGTIME] += h);
+                    event_driven_predictions(fx.model, &subject, &pk, &pk_obs, &[])
+                }
+            };
+            let h = 1e-5;
+            let (up, dn) = (value_at(h), value_at(-h));
+            let boundaries: Vec<f64> = fx
+                .doses
+                .iter()
+                .zip(&fx.lags)
+                .flat_map(|(d, l)| [d.time + l, d.time + l + d.duration])
+                .collect();
+            let mut worst = 0.0f64;
+            for j in 0..n_obs {
+                let skipped = fx.obs[j] >= fx.fd_skip.0 && fx.obs[j] <= fx.fd_skip.1;
+                if skipped || boundaries.iter().any(|b| (b - fx.obs[j]).abs() < 1e-3) {
+                    continue;
+                }
+                let fd = (up[j] - dn[j]) / (2.0 * h);
+                let err = (fd - d_index[j].grad[1]).abs() / (1.0 + fd.abs());
+                assert!(err.is_finite(), "{}: FD at t = {}", fx.name, fx.obs[j]);
+                worst = worst.max(err);
+            }
+            // Measured (Linux x86_64): worst 4.0e-10 lagged boluses, 1.3e-9 infusions,
+            // 1.4e-11 coincident break, 2.7e-10 modeled windows — the h² truncation of the
+            // difference. 1e-7 leaves ~80× headroom; a dropped boundary jet is O(1).
+            assert!(
+                worst < 1e-7,
+                "{}: boundary jet vs central difference {worst:.3e}",
+                fx.name
+            );
+            let scan = crate::dosing::DoseScan::new(&fx.doses, &fx.lags);
+            let (lag_dual, inf_dual) = duals(&fx);
+            let on_boundary = fx
+                .obs
+                .iter()
+                .filter(|&&t| {
+                    obs_boundary_correction::<Dual2<2>>(
+                        &fx.doses,
+                        &fx.lags,
+                        &lag_dual,
+                        &inf_dual,
+                        f64::NEG_INFINITY,
+                        t,
+                        &scan,
+                        &mut Vec::new(),
+                    )
+                    .is_some()
+                })
+                .count();
+            assert!(
+                fx.name == "coincident break" || on_boundary >= 20,
+                "{}: only {on_boundary} samples on a moving boundary",
+                fx.name
+            );
+            corrected += on_boundary;
+        }
+        assert!(
+            corrected > 100,
+            "only {corrected} samples on a moving boundary"
+        );
     }
 }

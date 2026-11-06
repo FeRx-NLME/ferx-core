@@ -8598,3 +8598,95 @@ fn a_toggle_alone_takes_the_event_driven_walk() {
     assert!(!static_walk_subject_supported(&model, &s));
     assert!(event_walk_subject_supported(&model, &s));
 }
+
+/// #2754: the dose index moves the adjoint outer gradient by rounding only. The
+/// predictions and the forward duals are bit-identical (`sens::propagate`'s
+/// `walks_over_the_dose_index_match_the_full_scans_bit_for_bit`), the reverse tape is not:
+/// the full scans recorded a dual arrival `t + lag` for every dose of every interval, most
+/// of them dead, and every record passes through the tape's fixed-size CSE table
+/// (`vtape::push_cse`), so dropping them changes which later records are merged and so the
+/// grouping of the sweep's sums. Measured, not assumed: with the CSE lookup disabled the
+/// two gradients below are bit-identical.
+///
+/// Against the full scans (`with_exhaustive_dose_scans`) on 60 lagged doses, so a boundary
+/// the index failed to list — an `O(1)` change of the gradient — fails here on the adjoint
+/// path, which the forward-dual test does not reach.
+#[test]
+fn the_dose_index_moves_the_adjoint_gradient_by_rounding_only() {
+    let doses: Vec<DoseEvent> = (0..60)
+        .map(|k| DoseEvent::new(12.0 * k as f64, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    let times: Vec<f64> = (0..60)
+        .flat_map(|k| [12.0 * k as f64 + 1.5, 12.0 * k as f64 + 6.0])
+        .collect();
+    let worst_gap = |model: &CompiledModel, s: &Subject| -> f64 {
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        let eta = ebe_for(model, s, &params, 1e-12, true);
+        let grad = || {
+            subject_adjoint_packed_gradient(model, s, &params, &x, eta.as_slice(), true)
+                .expect("a long lagged history must take the adjoint")
+        };
+        let indexed = grad();
+        let full = crate::dosing::with_exhaustive_dose_scans(grad);
+        let mut worst = 0.0f64;
+        for (k, (a, b)) in indexed.iter().zip(&full).enumerate() {
+            assert!(b.abs() > 1e-6, "x[{k}]: inert coordinate {b}");
+            let rel = (a - b).abs() / b.abs();
+            assert!(rel.is_finite(), "x[{k}]: {a} vs {b}");
+            worst = worst.max(rel);
+        }
+        worst
+    };
+
+    let model = parse_model_string(ONE_CPT_ORAL_LAG_LTBS).unwrap();
+    let s = subject(&model, doses.clone(), &times, &[0.1, -0.05, 0.2]);
+    let worst = worst_gap(&model, &s);
+    // Measured 0 (bit-identical) on this one.
+    assert!(worst < 1e-12, "one-compartment, lag, LTBS: {worst:.3e}");
+
+    // Two compartments, a lag and IOV on CL over four occasions: the motivating shape.
+    let model = parse_model_string(CF_IOV_LAG_TWO_CPT).unwrap();
+    let mut s = subject_shell(doses, &times);
+    s.occasions = (0..times.len()).map(|j| 1 + (j / 30) as u32).collect();
+    s.dose_occasions = (0..60).map(|k| 1 + (k / 15) as u32).collect();
+    let kappas = vec![vec![0.1], vec![-0.05], vec![0.08], vec![-0.02]];
+    let eta = [0.1, -0.05, 0.2];
+    let preds = crate::pk::predict_iov(&model, &s, &model.default_params.theta, &eta, &kappas);
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    let worst = worst_gap(&model, &s);
+    // Measured 9.97e-14 (Linux x86_64), on the θ coordinates; 10× headroom.
+    assert!(worst < 1e-12, "two-compartment, lag, IOV: {worst:.3e}");
+}
+
+const CF_IOV_LAG_TWO_CPT: &str = r#"
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV1(25.0, 0.1, 1000.0)
+  theta TVQ(4.0, 0.01, 100.0)
+  theta TVV2(50.0, 0.1, 1000.0)
+  theta TVKA(0.8, 0.01, 50.0)
+  theta TVLAG(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V1 ~ 0.1
+  omega ETA_KA ~ 0.1
+  kappa KAPPA_CL ~ 0.05
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * exp(ETA_KA)
+  LAG = TVLAG
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, lagtime=LAG)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+"#;

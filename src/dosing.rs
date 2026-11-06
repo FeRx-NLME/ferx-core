@@ -1347,6 +1347,236 @@ pub(crate) fn evid_reset_live(record: f64, reset_floor: f64) -> bool {
     record >= reset_floor
 }
 
+/// How far outside an interval [`DoseScan::doses_near`] callers look for a dose whose
+/// break coincides with one of the interval's bounds. The walks match a break to a bound
+/// at `|bound − break| < 1e-9`; this is far wider than that window plus `f64` rounding at
+/// any clock time a dataset carries (the spacing of `f64` is 1.5e-8 at `t = 1e8`), so the
+/// candidates always include every dose that can match. A wider net only adds candidates
+/// the caller's own test then rejects.
+pub(crate) const DOSE_NEAR_MARGIN: f64 = 1e-6;
+
+#[cfg(test)]
+thread_local! {
+    static EXHAUSTIVE_DOSE_SCANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: whether [`DoseScan`]s built on this thread now are exhaustive — part of the
+/// key of any cache that holds one (`sens::provider`'s schedule cache), so an exhaustive
+/// run never reuses an indexed scan, or the reverse.
+#[cfg(test)]
+pub(crate) fn exhaustive_dose_scans() -> bool {
+    EXHAUSTIVE_DOSE_SCANS.with(std::cell::Cell::get)
+}
+
+/// Test-only: run `f` with every [`DoseScan`] built on this thread answering each query
+/// with every dose — the full per-interval scans the index replaced, through the same
+/// per-dose code. A walk run both ways must agree bit for bit.
+#[cfg(test)]
+pub(crate) fn with_exhaustive_dose_scans<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EXHAUSTIVE_DOSE_SCANS.with(|c| c.set(false));
+        }
+    }
+    EXHAUSTIVE_DOSE_SCANS.with(|c| c.set(true));
+    let _reset = Reset;
+    f()
+}
+
+/// Time-sorted indexes over one walk's dose list, built once per walk (or per
+/// [`crate::pk::event_driven::EventSchedule`]) so the closed-form event walks ask
+/// "which doses matter in this interval" without rescanning every dose.
+///
+/// Before this, each interval of the closed-form walk and its dual twin rescanned the
+/// whole dose list several times — the `SS=1` reset cutoff, the active input rates, the
+/// moving boundaries of an estimated lag — so a subject with `n` doses cost `O(n²)` per
+/// walk, and on a long dose history that bookkeeping, not the PK, was most of the fit.
+///
+/// Every query returns a **superset** of the doses the old scan acted on, in the old
+/// scan's dose order, and the callers run their unchanged per-dose test on each. So a walk
+/// that reads the index takes the same branches and does the same arithmetic in the same
+/// order as the full scan, and its result is bit-identical.
+///
+/// Built from the same `doses` and lag times the walk reads; a scan of one list must
+/// never be used with another (`n_doses` is checked in debug builds).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DoseScan {
+    n_doses: usize,
+    /// Test-only: answer every query with every dose, i.e. behave as the full scans
+    /// this index replaced ([`with_exhaustive_dose_scans`]) — the oracle the walks'
+    /// bit-identity tests compare against.
+    #[cfg(test)]
+    exhaustive: bool,
+    /// `(time, k)` of every `SS=1` record with `II > 0`, in dose order — the candidates of
+    /// [`ss_reset_cutoff`], which ignores every other dose.
+    ss_records: Vec<(f64, usize)>,
+    /// Whether `ss_records` times are finite and non-decreasing, so the cutoff is a
+    /// binary search. Otherwise (an unsorted list, such as the adaptive shadow list)
+    /// [`Self::ss_reset_cutoff`] runs [`ss_reset_cutoff`]'s own comparison over
+    /// `ss_records`.
+    ss_sorted: bool,
+    /// Every dose with `duration > 0`, ascending. A dose carries an input rate only in its
+    /// own window (`rate > 0 && duration > 0`) or as a seeded `SS` residual
+    /// ([`ss_residual_infusion_end`], which needs a real infusion, so `duration > 0`), so
+    /// a rate scan over these is the full scan minus doses that contribute nothing.
+    windowed: Vec<usize>,
+    /// The sub-interval breaks of every dose with `rate > 0 && duration > 0` — its window
+    /// start and end and its seeded `SS` residual end — finite ones, sorted. A non-finite
+    /// break fails every range test the bounds builder applies, so dropping it is exact.
+    window_breaks: Vec<f64>,
+    /// `(t, k)` for every dose's lagged arrival `time + lag` and every windowed dose's
+    /// window end `time + lag + duration`, finite ones, sorted by `t`: the clock positions
+    /// at which a dose can sit on an interval bound or an observation.
+    boundary_times: Vec<(f64, usize)>,
+}
+
+impl DoseScan {
+    /// Index `doses`, whose arrivals are shifted by `lagtimes[k]` (missing entries read
+    /// as 0, as in the walks).
+    pub(crate) fn new(doses: &[DoseEvent], lagtimes: &[f64]) -> Self {
+        let lag = |k: usize| lagtimes.get(k).copied().unwrap_or(0.0);
+        let ss_records: Vec<(f64, usize)> = doses
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.ss && d.ii > 0.0)
+            .map(|(k, d)| (d.time, k))
+            .collect();
+        let ss_sorted = ss_records.iter().all(|(t, _)| t.is_finite())
+            && ss_records.windows(2).all(|w| w[0].0 <= w[1].0);
+        let mut windowed = Vec::new();
+        let mut window_breaks = Vec::new();
+        let mut boundary_times = Vec::with_capacity(doses.len());
+        for (k, d) in doses.iter().enumerate() {
+            let t_start = d.time + lag(k);
+            boundary_times.push((t_start, k));
+            if d.duration > 0.0 {
+                windowed.push(k);
+                boundary_times.push((t_start + d.duration, k));
+            }
+            // The breaks `pk::event_driven::compute_propagation_bounds` used to collect by
+            // scanning every dose for every interval, from the same expressions.
+            if d.rate > 0.0 && d.duration > 0.0 {
+                window_breaks.push(t_start);
+                window_breaks.push(d.time + lag(k) + d.duration);
+                if let Some(end) = ss_residual_infusion_end(d, lag(k), 1.0) {
+                    window_breaks.push(end);
+                }
+            }
+        }
+        window_breaks.retain(|t| t.is_finite());
+        window_breaks.sort_by(f64::total_cmp);
+        boundary_times.retain(|(t, _)| t.is_finite());
+        boundary_times.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        #[cfg(test)]
+        if exhaustive_dose_scans() {
+            return Self {
+                n_doses: doses.len(),
+                exhaustive: true,
+                ss_records,
+                ss_sorted: false,
+                windowed: (0..doses.len()).collect(),
+                window_breaks,
+                boundary_times,
+            };
+        }
+        Self {
+            n_doses: doses.len(),
+            #[cfg(test)]
+            exhaustive: false,
+            ss_records,
+            ss_sorted,
+            windowed,
+            window_breaks,
+            boundary_times,
+        }
+    }
+
+    /// Whether every query a walk makes — the `SS=1` cutoff, `windowed`, `doses_near` —
+    /// answers the same on `self` and `other`. Only `window_breaks`, which the schedule's
+    /// own bounds read and which depends on the sign of each rate, may differ.
+    pub(crate) fn walk_queries_match(&self, other: &DoseScan) -> bool {
+        self.n_doses == other.n_doses
+            && self.ss_records == other.ss_records
+            && self.ss_sorted == other.ss_sorted
+            && self.windowed == other.windowed
+            && self.boundary_times == other.boundary_times
+    }
+
+    /// Debug check that this scan indexes `doses`.
+    #[inline]
+    pub(crate) fn debug_check(&self, doses: &[DoseEvent]) {
+        debug_assert_eq!(
+            self.n_doses,
+            doses.len(),
+            "DoseScan built over {} doses used with {}",
+            self.n_doses,
+            doses.len()
+        );
+    }
+
+    /// [`ss_reset_cutoff`] of the indexed doses at `t`, in `O(log n)` on a time-sorted
+    /// list.
+    pub(crate) fn ss_reset_cutoff(&self, t: f64) -> Option<usize> {
+        // A `NaN` query reaches every record in `ss_reset_cutoff` (`time > NaN` is
+        // false), which the binary search would not; the scan below keeps that.
+        if self.ss_sorted && !t.is_nan() {
+            // Times non-decreasing in dose order, so the last record with `time ≤ t` has
+            // the largest `(time, index)` among them — `ss_reset_cutoff`'s answer.
+            let n = self.ss_records.partition_point(|&(tt, _)| tt <= t);
+            return n.checked_sub(1).map(|i| self.ss_records[i].1);
+        }
+        let mut best: Option<(f64, usize)> = None;
+        for &(time, i) in &self.ss_records {
+            if time > t {
+                continue;
+            }
+            best = match best {
+                Some(b) if b > (time, i) => Some(b),
+                _ => Some((time, i)),
+            };
+        }
+        best.map(|(_, i)| i)
+    }
+
+    /// Doses that can carry an input rate (`duration > 0`), ascending.
+    #[inline]
+    pub(crate) fn windowed(&self) -> &[usize] {
+        &self.windowed
+    }
+
+    /// The window breaks strictly inside `(lo, hi)`, sorted.
+    pub(crate) fn window_breaks_in(&self, lo: f64, hi: f64) -> &[f64] {
+        let a = self.window_breaks.partition_point(|&b| b <= lo);
+        let b = self.window_breaks.partition_point(|&b| b < hi);
+        if a < b {
+            &self.window_breaks[a..b]
+        } else {
+            &[]
+        }
+    }
+
+    /// Replace `out` with every dose whose arrival or window end lies in `[lo, hi]`,
+    /// ascending and deduplicated.
+    pub(crate) fn doses_near(&self, lo: f64, hi: f64, out: &mut Vec<usize>) {
+        out.clear();
+        #[cfg(test)]
+        if self.exhaustive {
+            out.extend(0..self.n_doses);
+            return;
+        }
+        let a = self.boundary_times.partition_point(|&(t, _)| t < lo);
+        out.extend(
+            self.boundary_times[a..]
+                .iter()
+                .take_while(|&&(t, _)| t <= hi)
+                .map(|&(_, k)| k),
+        );
+        out.sort_unstable();
+        out.dedup();
+    }
+}
+
 #[cfg(test)]
 mod first_record_tests {
     use super::{first_record, FirstRecord};
@@ -1968,5 +2198,157 @@ mod evid_reset_tests {
             "recorded at the reset (EVID=4)"
         );
         assert!(evid_reset_live(10.001, 10.0), "recorded after the reset");
+    }
+}
+
+#[cfg(test)]
+mod dose_scan_tests {
+    use super::{ss_reset_cutoff, ss_residual_infusion_end, DoseScan, DOSE_NEAR_MARGIN};
+    use crate::types::DoseEvent;
+
+    /// xorshift64*, so the fixtures are deterministic without an RNG dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn unit(&mut self) -> f64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.unit() * n as f64) as usize
+        }
+    }
+
+    /// `n` records on a half-hour grid, so times tie: boluses, infusions, and `SS=1`
+    /// records of either kind. Time-sorted (stably, as the reader sorts) or left in draw
+    /// order.
+    fn doses(rng: &mut Rng, n: usize, sorted: bool) -> Vec<DoseEvent> {
+        let mut out: Vec<DoseEvent> = (0..n)
+            .map(|_| {
+                let time = rng.below(40) as f64 * 0.5;
+                let rate = if rng.below(3) == 0 { 25.0 } else { 0.0 };
+                let ss = rng.below(4) == 0;
+                let ii = if ss {
+                    [0.0, 6.0, 12.0][rng.below(3)]
+                } else {
+                    0.0
+                };
+                DoseEvent::new(time, 100.0, 1 + rng.below(2), rate, ss, ii)
+            })
+            .collect();
+        if sorted {
+            out.sort_by(|a, b| a.time.total_cmp(&b.time));
+        }
+        out
+    }
+
+    /// The indexed cutoff is `ss_reset_cutoff`'s, on time-sorted lists (the binary
+    /// search) and unsorted ones (the scan), at every record time, a hair either side,
+    /// between records, and at the non-finite queries.
+    #[test]
+    fn the_indexed_ss_cutoff_is_the_full_scans() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let (mut reached, mut searched) = (0usize, 0usize);
+        for _ in 0..300 {
+            for sorted in [true, false] {
+                let n = 1 + rng.below(30);
+                let d = doses(&mut rng, n, sorted);
+                let scan = DoseScan::new(&d, &[]);
+                if sorted {
+                    // Otherwise the binary search would never run here.
+                    assert!(scan.ss_sorted, "a time-sorted list must take the search");
+                    searched += 1;
+                }
+                let mut ts = vec![f64::NEG_INFINITY, f64::INFINITY, f64::NAN, -1.0, 99.0];
+                for x in &d {
+                    ts.extend([x.time, x.time - 1e-12, x.time + 1e-12, x.time + 0.25]);
+                }
+                for t in ts {
+                    let want = ss_reset_cutoff(&d, t);
+                    assert_eq!(scan.ss_reset_cutoff(t), want, "t = {t}, doses {d:?}");
+                    reached += usize::from(want.is_some());
+                }
+            }
+        }
+        assert!(
+            searched > 0 && reached > 1000,
+            "fixtures inert: {searched}, {reached}"
+        );
+    }
+
+    /// Every dose whose arrival or window end is within the walks' `1e-9` match of a
+    /// queried time is among `doses_near`'s candidates, which come back ascending and
+    /// unique — including next to a dose whose arrival is not finite.
+    #[test]
+    fn doses_near_lists_every_dose_a_bound_can_match() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut matched = 0usize;
+        for case in 0..300 {
+            let n = 1 + rng.below(30);
+            let d = doses(&mut rng, n, case % 2 == 0);
+            let mut lags: Vec<f64> = (0..d.len())
+                .map(|_| [0.0, 0.5, 0.7, 1.3][rng.below(4)])
+                .collect();
+            if case % 7 == 0 {
+                lags[0] = f64::NAN;
+            }
+            let scan = DoseScan::new(&d, &lags);
+            let breaks = |k: usize| {
+                let start = d[k].time + lags[k];
+                let end = (d[k].duration > 0.0).then(|| start + d[k].duration);
+                (start, end)
+            };
+            let mut ts = Vec::new();
+            for k in 0..d.len() {
+                let (s, e) = breaks(k);
+                ts.extend([s, s - 5e-10, s + 5e-10]);
+                ts.extend(e.into_iter().flat_map(|e| [e, e - 5e-10, e + 5e-10]));
+            }
+            let mut out = Vec::new();
+            for t in ts.into_iter().filter(|t| t.is_finite()) {
+                scan.doses_near(t - DOSE_NEAR_MARGIN, t + DOSE_NEAR_MARGIN, &mut out);
+                assert!(
+                    out.windows(2).all(|w| w[0] < w[1]),
+                    "not ascending: {out:?}"
+                );
+                for k in 0..d.len() {
+                    let (s, e) = breaks(k);
+                    let hit = (s - t).abs() < 1e-9 || e.is_some_and(|e| (e - t).abs() < 1e-9);
+                    if hit {
+                        matched += 1;
+                        assert!(out.contains(&k), "dose {k} missed at t = {t}: {out:?}");
+                    }
+                }
+            }
+        }
+        assert!(matched > 5000, "fixtures inert: {matched} matches");
+    }
+
+    /// `windowed` holds every dose that can carry an input rate — its own window, or the
+    /// seeded residual of an `SS=1` infusion — and nothing for a bolus-only history.
+    #[test]
+    fn windowed_holds_every_dose_that_can_carry_a_rate() {
+        let mut rng = Rng(0x0123_4567_89ab_cdef);
+        let mut residuals = 0usize;
+        for _ in 0..300 {
+            let n = 1 + rng.below(30);
+            let d = doses(&mut rng, n, true);
+            let lags: Vec<f64> = (0..d.len())
+                .map(|_| [0.0, 5.0, 11.0][rng.below(3)])
+                .collect();
+            let scan = DoseScan::new(&d, &lags);
+            for (k, x) in d.iter().enumerate() {
+                let residual = ss_residual_infusion_end(x, lags[k], 1.0).is_some();
+                residuals += usize::from(residual);
+                if residual || (x.rate > 0.0 && x.duration > 0.0) {
+                    assert!(scan.windowed().contains(&k), "dose {k} not windowed: {x:?}");
+                }
+            }
+        }
+        assert!(residuals > 0, "no seeded residual in the fixtures");
+        let boluses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0); 5];
+        assert!(DoseScan::new(&boluses, &[]).windowed().is_empty());
     }
 }
