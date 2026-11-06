@@ -879,6 +879,34 @@ const DISCRETE_ENTRY: &str = "predictions_discrete.csv";
 const DISCRETE_HEADER: [&str; 7] = ["ID", "CMT", "TIME", "DV", "PRED", "IPRED", "IWRES"];
 const N_OBS_DISCRETE: &str = "n_obs_discrete";
 
+/// The time-to-event-rows entry and the `ebes.csv` column that sizes each subject's block
+/// (#911). The header is `ID, CMT, TIME, DV` followed by the sdtab's own residual column
+/// list, so the two cannot drift.
+#[cfg(feature = "survival")]
+const TTE_ENTRY: &str = "predictions_tte.csv";
+#[cfg(feature = "survival")]
+const N_OBS_TTE: &str = "n_obs_tte";
+#[cfg(feature = "survival")]
+const TTE_KEY_COLUMNS: [&str; 4] = ["ID", "CMT", "TIME", "DV"];
+#[cfg(feature = "survival")]
+const TTE_HEADER_LEN: usize = TTE_KEY_COLUMNS.len() + crate::io::output::TTE_RESIDUAL_COLUMNS.len();
+#[cfg(feature = "survival")]
+const TTE_HEADER: [&str; TTE_HEADER_LEN] = {
+    let residuals = crate::io::output::TTE_RESIDUAL_COLUMNS;
+    let mut h = [""; TTE_HEADER_LEN];
+    let mut i = 0;
+    while i < TTE_KEY_COLUMNS.len() {
+        h[i] = TTE_KEY_COLUMNS[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < residuals.len() {
+        h[TTE_KEY_COLUMNS.len() + j] = residuals[j];
+        j += 1;
+    }
+    h
+};
+
 const COVTAB_ENTRY: &str = "covtab.csv";
 const COVTAB_BASE_COLUMNS: [&str; 3] = ["ID", "TIME", "EVID"];
 const TRACE_ENTRY: &str = "trace.csv";
@@ -1446,6 +1474,14 @@ fn encode_bundle(
         entries.push(DISCRETE_ENTRY.into());
     }
 
+    // --- predictions_tte.csv (only when the fit has time-to-event rows, #911) ---
+    #[cfg(feature = "survival")]
+    if has_tte_rows(result) {
+        zip.start_file(TTE_ENTRY, zopts)?;
+        write_predictions_tte_csv(&mut zip, result)?;
+        entries.push(TTE_ENTRY.into());
+    }
+
     // --- covtab.csv (only with a `[covariates]` block) ---------------------
     if let Some(table) = &result.covariate_table {
         zip.start_file(COVTAB_ENTRY, zopts)?;
@@ -1790,6 +1826,11 @@ fn has_discrete_rows(r: &FitResult) -> bool {
     r.subjects.iter().any(|s| !s.discrete_rows.is_empty())
 }
 
+#[cfg(feature = "survival")]
+fn has_tte_rows(r: &FitResult) -> bool {
+    r.subjects.iter().any(|s| !s.tte_rows.is_empty())
+}
+
 fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> {
     let n_eta = r.omega.nrows();
     let mut header = String::from("ID");
@@ -1805,6 +1846,14 @@ fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> 
     if any_discrete {
         header.push(',');
         header.push_str(N_OBS_DISCRETE);
+    }
+    // The same for time-to-event rows (#911), so a bundle without them keeps its old bytes.
+    #[cfg(feature = "survival")]
+    let any_tte = has_tte_rows(r);
+    #[cfg(feature = "survival")]
+    if any_tte {
+        header.push(',');
+        header.push_str(N_OBS_TTE);
     }
     // Mixture (#983): a mixture fit carries per-subject `MIXEST` (most-probable
     // class) and `PMIX_1..K` (posterior class weights). Append them after the
@@ -1835,6 +1884,11 @@ fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> 
         if any_discrete {
             row.push(',');
             row.push_str(&s.discrete_rows.len().to_string());
+        }
+        #[cfg(feature = "survival")]
+        if any_tte {
+            row.push(',');
+            row.push_str(&s.tte_rows.len().to_string());
         }
         if let Some(k) = mix_k {
             // MIXEST is 1-based; write 0 for a subject that somehow lacks it so
@@ -2119,6 +2173,46 @@ fn write_predictions_discrete_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<
     Ok(())
 }
 
+/// `predictions_tte.csv` (#911): one block of rows per subject with time-to-event records,
+/// in `ebes.csv` order, sized by that subject's `n_obs_tte`. The residual cells are written
+/// in `TTE_HEADER`'s order, looked up by name, so a reordered column list cannot shift a
+/// value under the wrong header.
+#[cfg(feature = "survival")]
+fn write_predictions_tte_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> {
+    writeln!(w, "{}", TTE_HEADER.join(","))?;
+    for s in &r.subjects {
+        for t in &s.tte_rows {
+            let mut t = t.clone(); // `tte_residual` hands out the field by `&mut`
+            let mut line = format!(
+                "{},{},{},{}",
+                csv_escape(&s.id),
+                t.cmt,
+                fmt_f64(t.time),
+                fmt_f64(t.dv)
+            );
+            for name in crate::io::output::TTE_RESIDUAL_COLUMNS {
+                line.push(',');
+                line.push_str(&fmt_f64(*tte_residual(&mut t, name)));
+            }
+            writeln!(w, "{line}")?;
+        }
+    }
+    Ok(())
+}
+
+/// The residual field of `t` under sdtab column `name`, one of `TTE_RESIDUAL_COLUMNS`:
+/// the one map from a column name to a field, used by the writer and the reader alike.
+#[cfg(feature = "survival")]
+fn tte_residual<'a>(t: &'a mut crate::types::TteObsDiagnostic, name: &str) -> &'a mut f64 {
+    match name {
+        "COXSNELL" => &mut t.coxsnell,
+        "MARTINGALE" => &mut t.martingale,
+        "DEVIANCE" => &mut t.deviance,
+        "PIT" => &mut t.pit,
+        other => unreachable!("no TteObsDiagnostic field for sdtab column {other:?}"),
+    }
+}
+
 /// `covtab.csv`: `ID, TIME, EVID, <covariates...>`, one row per input record. Exact doubles
 /// like every bundle CSV, where the `-covtab.csv` output beside a run rounds for reading.
 fn write_covtab_csv<W: Write>(w: &mut W, t: &CovariateTable) -> Result<(), FitrxError> {
@@ -2263,6 +2357,13 @@ fn load_bundle<R: Read + std::io::Seek>(
     let mut subjects = parse_subjects(&ebes_csv, &preds_csv, ebes_kappa_csv.as_deref(), n_eta)?;
     let discrete_csv = read_optional_text(&mut archive, DISCRETE_ENTRY)?;
     attach_discrete_rows(&mut subjects, &ebes_csv, discrete_csv.as_deref())?;
+    // Without `survival` the rows have no type to land in: the entry and the `n_obs_tte`
+    // column are ignored, as a reader older than #911 ignores them.
+    #[cfg(feature = "survival")]
+    {
+        let tte_csv = read_optional_text(&mut archive, TTE_ENTRY)?;
+        attach_tte_rows(&mut subjects, &ebes_csv, tte_csv.as_deref())?;
+    }
     let ebe_kappas = if let Some(csv) = ebes_kappa_csv.as_deref() {
         parse_ebe_kappas(
             csv,
@@ -2650,7 +2751,8 @@ fn parse_subjects(
             compartment_states: vec![],
             // Filled by `attach_discrete_rows` from `predictions_discrete.csv`.
             discrete_rows: Vec::new(),
-            // The bundle has no entry for these (#911), so a restored result has none.
+            // Filled by `attach_tte_rows` from `predictions_tte.csv` (#911); empty for a
+            // bundle written before that entry existed.
             #[cfg(feature = "survival")]
             tte_rows: Vec::new(),
         });
@@ -2884,6 +2986,106 @@ fn attach_discrete_rows(
     match rows.next() {
         Some((i, _)) => Err(corrupt(format!(
             "row {} is past the rows {N_OBS_DISCRETE} accounts for",
+            i + 1
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Fill `tte_rows` from `predictions_tte.csv` (#911): each subject's block is the next
+/// `n_obs_tte` rows, with the row ID as a check. The column and the entry come together,
+/// so either one alone is `Corrupt`; neither is a bundle written before #911, and leaves
+/// every `tte_rows` empty. A copy of [`attach_discrete_rows`] rather than a shared generic:
+/// these rows are `survival`-gated and those are not.
+#[cfg(feature = "survival")]
+fn attach_tte_rows(
+    subjects: &mut [SubjectResult],
+    ebes_csv: &str,
+    tte_csv: Option<&str>,
+) -> Result<(), FitrxError> {
+    let corrupt = |msg: String| FitrxError::Corrupt(format!("{TTE_ENTRY}: {msg}"));
+    let mut ebes = ebes_csv.lines();
+    let count_col = ebes
+        .next()
+        .and_then(|h| h.split(',').position(|c| c == N_OBS_TTE));
+    let (count_col, csv) = match (count_col, tte_csv) {
+        (None, None) => return Ok(()),
+        (Some(col), Some(csv)) => (col, csv),
+        (Some(_), None) => {
+            return Err(FitrxError::Corrupt(format!(
+                "ebes.csv has {N_OBS_TTE}, but the bundle has no {TTE_ENTRY}"
+            )))
+        }
+        (None, Some(_)) => return Err(corrupt(format!("ebes.csv has no {N_OBS_TTE}"))),
+    };
+    let counts = ebes
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields = parse_csv_row(line);
+            let raw = fields.get(count_col).map_or("", String::as_str);
+            raw.parse::<usize>()
+                .map_err(|_| FitrxError::Corrupt(format!("ebes.csv: bad {N_OBS_TTE} {raw:?}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut lines = csv.lines();
+    let header = lines.next().ok_or_else(|| corrupt("empty".into()))?;
+    if header.split(',').ne(TTE_HEADER) {
+        return Err(corrupt(format!(
+            "header {header:?}, expected {:?}",
+            TTE_HEADER.join(",")
+        )));
+    }
+    let mut rows = lines.filter(|line| !line.trim().is_empty()).enumerate();
+    for (s, n) in subjects.iter_mut().zip(counts) {
+        for _ in 0..n {
+            let (i, line) = rows.next().ok_or_else(|| {
+                corrupt(format!(
+                    "ran out of rows at subject {:?}, which {N_OBS_TTE} gives {n}",
+                    s.id
+                ))
+            })?;
+            let fields = parse_csv_row(line);
+            if fields.len() != TTE_HEADER.len() {
+                return Err(corrupt(format!(
+                    "row {} has {} fields, expected {}",
+                    i + 1,
+                    fields.len(),
+                    TTE_HEADER.len()
+                )));
+            }
+            if fields[0] != s.id {
+                return Err(corrupt(format!(
+                    "row {}: ID {:?} out of order; expected subject {:?}",
+                    i + 1,
+                    fields[0],
+                    s.id
+                )));
+            }
+            let cmt = fields[1]
+                .parse::<usize>()
+                .map_err(|_| corrupt(format!("row {}: bad CMT {:?}", i + 1, fields[1])))?;
+            let num = |f: &str| {
+                parse_cell(f).map_err(|_| corrupt(format!("row {}: bad number {f:?}", i + 1)))
+            };
+            let mut row = crate::types::TteObsDiagnostic {
+                cmt,
+                time: num(&fields[2])?,
+                dv: num(&fields[3])?,
+                coxsnell: f64::NAN,
+                martingale: f64::NAN,
+                deviance: f64::NAN,
+                pit: f64::NAN,
+            };
+            for (name, cell) in TTE_HEADER.iter().zip(&fields).skip(TTE_KEY_COLUMNS.len()) {
+                *tte_residual(&mut row, name) = num(cell)?;
+            }
+            s.tte_rows.push(row);
+        }
+    }
+    match rows.next() {
+        Some((i, _)) => Err(corrupt(format!(
+            "row {} is past the rows {N_OBS_TTE} accounts for",
             i + 1
         ))),
         None => Ok(()),
@@ -7260,6 +7462,422 @@ mod tests {
         assert!(
             no_column.contains("ebes.csv has no n_obs_discrete"),
             "{no_column}"
+        );
+    }
+
+    /// A binary + TTE model (#911): what `write_sdtab_csv` parses to decide the refusal.
+    #[cfg(feature = "survival")]
+    const TTE_MODEL_911: &str = "
+[parameters]
+  theta TH0(0.1, 0.001, 10.0)
+  omega ETA ~ 0.1
+[binary_model]
+  cmt   = 3
+  logit = TH0 + ETA
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TH0 * exp(ETA)
+";
+
+    #[cfg(feature = "survival")]
+    fn tte_row_911(
+        time: f64,
+        dv: f64,
+        coxsnell: f64,
+        deviance: f64,
+    ) -> crate::types::TteObsDiagnostic {
+        crate::types::TteObsDiagnostic {
+            cmt: 2,
+            time,
+            dv,
+            coxsnell,
+            martingale: 0.1 + 0.2,
+            deviance,
+            pit: 1e-300,
+        }
+    }
+
+    /// Every field of a TTE row as bits, so `NaN` compares equal to itself and `-0.0`
+    /// differs from `0.0`.
+    #[cfg(feature = "survival")]
+    fn tte_bits(rows: &[crate::types::TteObsDiagnostic]) -> Vec<(usize, [u64; 6])> {
+        rows.iter()
+            .map(|t| {
+                (
+                    t.cmt,
+                    [t.time, t.dv, t.coxsnell, t.martingale, t.deviance, t.pit].map(f64::to_bits),
+                )
+            })
+            .collect()
+    }
+
+    /// T1's fit (#911): three subjects, the first and third sharing an ID so only
+    /// `n_obs_tte` can place their rows. S0 has one binary row and two TTE rows, S1 none,
+    /// S2 three. The cells need every digit (`0.1 + 0.2`, `1e-300`), and hold an interval
+    /// censor's `NaN`, a deviance of `-0.0` and a round-off-negative Cox–Snell residual.
+    #[cfg(feature = "survival")]
+    fn tte_fit_911() -> (FitResult, Population) {
+        let mut r = minimal_fit_result();
+        let mut s2 = r.subjects[0].clone();
+        s2.id = r.subjects[0].id.clone();
+        r.subjects.push(s2);
+        r.n_subjects = 3;
+        r.subjects[0].discrete_rows = vec![discrete_row(3, 1.5, 0.25)];
+        r.subjects[0].tte_rows = vec![
+            tte_row_911(5.0, 1.0, -1e-17, -0.0),
+            tte_row_911(7.5, f64::NAN, 0.75, -0.5),
+        ];
+        r.subjects[2].tte_rows = vec![
+            tte_row_911(2.0, 0.0, 0.1 + 0.2, -0.75),
+            tte_row_911(4.0, 1.0, 1e-300, 0.5),
+            tte_row_911(6.0, 0.0, 2.0 / 3.0, -2.0),
+        ];
+        r.model_text = Some(TTE_MODEL_911.to_string());
+        let id0 = r.subjects[0].id.clone();
+        let id1 = r.subjects[1].id.clone();
+        let p = dummy_population(&[id0.as_str(), id1.as_str(), id0.as_str()], 3);
+        (r, p)
+    }
+
+    #[cfg(feature = "survival")]
+    fn save_911(dir: &tempfile::TempDir, name: &str, r: &FitResult, p: &Population) -> PathBuf {
+        let path = dir.path().join(name);
+        save_fit(r, p, TTE_MODEL_911, &path, SaveFitOptions::default()).unwrap();
+        path
+    }
+
+    /// T1 (#911): TTE rows round-trip bit for bit, each to its own subject, through
+    /// `predictions_tte.csv` and the `n_obs_tte` column, which appears exactly once.
+    ///
+    /// Dies on: the entry not written (no rows back), `attach_tte_rows` skipped, a field
+    /// written through `{:.6}` (`0.1 + 0.2`, `1e-300`), two subjects' blocks swapped (S0
+    /// and S2 share an ID, so only the count places them).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn roundtrip_tte_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = tte_fit_911();
+        let path = save_911(&dir, "tte.fitrx", &r, &p);
+        let loaded = load_fit(&path).unwrap();
+        assert!(loaded
+            .manifest
+            .entries
+            .contains(&"predictions_tte.csv".to_string()));
+        for (si, (got, want)) in loaded.fit.subjects.iter().zip(&r.subjects).enumerate() {
+            assert_eq!(
+                tte_bits(&got.tte_rows),
+                tte_bits(&want.tte_rows),
+                "subject {si}"
+            );
+            assert_eq!(got.discrete_rows, want.discrete_rows, "subject {si}");
+        }
+        let header = entry_text(&path, "ebes.csv").unwrap();
+        let header = header.lines().next().unwrap();
+        assert_eq!(header.split(',').filter(|c| *c == "n_obs_tte").count(), 1);
+        assert!(
+            header.ends_with(",n_obs,n_obs_discrete,n_obs_tte"),
+            "{header}"
+        );
+    }
+
+    /// T2 (#911), the exit condition: `sdtab()` and `write_sdtab_csv` of the restored
+    /// binary + TTE fit equal the live ones, bit for bit and byte for byte.
+    ///
+    /// Dies on: `attach_tte_rows` skipped (the restored fit is refused), the blocks
+    /// swapped (S0's and S2's rows change places under one ID), the refusal keyed on the
+    /// TTE endpoint alone.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn restored_sdtab_equals_live() {
+        use crate::io::output::{sdtab, write_sdtab_csv};
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = tte_fit_911();
+        let loaded = load_fit(&save_911(&dir, "tte.fitrx", &r, &p)).unwrap().fit;
+        assert!(loaded.restored_from_checkpoint, "premise: restored");
+
+        let live = sdtab(&r, &p);
+        let back = sdtab(&loaded, &p);
+        let names = |c: &[(String, Vec<f64>)]| c.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&back), names(&live));
+        assert!(
+            names(&live).iter().any(|n| n == "COXSNELL"),
+            "premise: TTE columns"
+        );
+        for ((name, want), (_, got)) in live.iter().zip(&back) {
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(got), bits(want), "column {name}");
+        }
+
+        let live_csv = dir.path().join("live.csv");
+        let back_csv = dir.path().join("back.csv");
+        write_sdtab_csv(&r, &p, live_csv.to_str().unwrap()).unwrap();
+        write_sdtab_csv(&loaded, &p, back_csv.to_str().unwrap())
+            .expect("a restored fit with its TTE rows writes sdtab");
+        assert_eq!(
+            std::fs::read(&back_csv).unwrap(),
+            std::fs::read(&live_csv).unwrap()
+        );
+    }
+
+    /// The bundle at `src` as a writer before #911 left it: no `predictions_tte.csv`, and
+    /// no `n_obs_tte` column in `ebes.csv` (the last column of a non-mixture fit).
+    #[cfg(feature = "survival")]
+    fn strip_tte_911(src: &Path, dst: &Path) {
+        rewrite_bundle(src, dst, |name, body| match name {
+            "predictions_tte.csv" => None,
+            "ebes.csv" => {
+                let text = String::from_utf8(body).unwrap();
+                assert!(
+                    text.lines().next().unwrap().ends_with(",n_obs_tte"),
+                    "premise: n_obs_tte is the last column"
+                );
+                let mut out = String::new();
+                for line in text.lines() {
+                    out.push_str(&line[..line.rfind(',').unwrap()]);
+                    out.push('\n');
+                }
+                Some(out.into_bytes())
+            }
+            _ => Some(body),
+        });
+    }
+
+    /// T3 (#911): a bundle written before #911 still loads, with every `tte_rows` empty,
+    /// and its sdtab is still refused, with the message saying the bundle predates the
+    /// TTE rows. A load + re-save cannot recover them (cell A5): there are none to write.
+    ///
+    /// Dies on: the strip rejected as `Corrupt` (the entry made mandatory), the refusal
+    /// keyed on the rows alone without the TTE endpoint (T6's binary cell), on a TTE
+    /// endpoint with rows (T2).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn pre_911_bundle_keeps_the_refusal() {
+        use crate::io::output::write_sdtab_csv;
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = tte_fit_911();
+        let new = save_911(&dir, "new.fitrx", &r, &p);
+        let old = dir.path().join("old.fitrx");
+        strip_tte_911(&new, &old);
+        assert_eq!(entry_text(&old, "predictions_tte.csv"), None);
+
+        let loaded = load_fit(&old).expect("a pre-#911 bundle loads").fit;
+        assert!(loaded.subjects.iter().all(|s| s.tte_rows.is_empty()));
+        assert_eq!(
+            loaded.subjects[0].discrete_rows,
+            r.subjects[0].discrete_rows
+        );
+        let out = dir.path().join("sdtab.csv");
+        let err = write_sdtab_csv(&loaded, &p, out.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("written before time-to-event rows were bundled"),
+            "{err}"
+        );
+        assert!(err.contains("#911"), "{err}");
+        assert!(!out.exists());
+
+        // A5: loading and saving again writes no entry, so the refusal stands.
+        let again = save_911(&dir, "again.fitrx", &loaded, &p);
+        assert_eq!(entry_text(&again, "predictions_tte.csv"), None);
+        let reloaded = load_fit(&again).unwrap().fit;
+        assert!(write_sdtab_csv(&reloaded, &p, out.to_str().unwrap()).is_err());
+    }
+
+    /// T4 (#911): the count column and the entry vouch for each other, and a row that does
+    /// not fit its count is refused rather than given to a neighbour.
+    ///
+    /// Dies on: each guard of `attach_tte_rows` deleted in turn (its own assert).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn damaged_tte_rows_are_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        r.subjects[0].tte_rows = vec![tte_row_911(1.5, 1.0, 0.5, -0.5)];
+        r.subjects[1].tte_rows = vec![tte_row_911(2.5, 0.0, 0.5, -0.5)];
+        let good = saved(&dir, &r);
+        let (s0, s1) = (r.subjects[0].id.clone(), r.subjects[1].id.clone());
+        load_fit(&good).expect("premise: the unedited bundle loads");
+        let edited = dir.path().join("edited.fitrx");
+        let load_with = |edit: &dyn Fn(String) -> Option<String>| {
+            rewrite_bundle(&good, &edited, |name, body| {
+                if name == "predictions_tte.csv" {
+                    edit(String::from_utf8(body).unwrap()).map(String::into_bytes)
+                } else {
+                    Some(body)
+                }
+            });
+            load_corrupt(load_fit(&edited))
+        };
+
+        let no_entry = load_with(&|_| None);
+        assert!(no_entry.contains("no predictions_tte.csv"), "{no_entry}");
+        let one_row = load_with(&|csv| Some(csv.lines().take(2).collect::<Vec<_>>().join("\n")));
+        assert!(one_row.contains("ran out of rows"), "{one_row}");
+        let extra = load_with(&|csv| Some(format!("{csv}{s1},2,9.0,1.0,0.5,0.5,0.5,0.5\n")));
+        assert!(extra.contains("past the rows"), "{extra}");
+        let swapped = load_with(&|csv| Some(csv.replacen(&s0, "OTHER", 1)));
+        assert!(swapped.contains("out of order"), "{swapped}");
+        let bad_num = load_with(&|csv| Some(csv.replace("1.5", "abc")));
+        assert!(bad_num.contains("bad number \"abc\""), "{bad_num}");
+        let bad_cmt =
+            load_with(&|csv| Some(csv.replacen(&format!("{s0},2,"), &format!("{s0},x,"), 1)));
+        assert!(bad_cmt.contains("bad CMT \"x\""), "{bad_cmt}");
+        let short = load_with(&|csv| {
+            let mut lines: Vec<String> = csv.lines().map(String::from).collect();
+            let cut = lines[1].rfind(',').unwrap();
+            lines[1].truncate(cut);
+            Some(lines.join("\n") + "\n")
+        });
+        assert!(short.contains("fields, expected 8"), "{short}");
+        let bad_header = load_with(&|csv| Some(csv.replacen("PIT", "PITT", 1)));
+        assert!(bad_header.contains("header"), "{bad_header}");
+
+        rewrite_bundle(&good, &edited, |name, body| {
+            Some(if name == "ebes.csv" {
+                String::from_utf8(body)
+                    .unwrap()
+                    .replace(",n_obs_tte", ",other")
+                    .into_bytes()
+            } else {
+                body
+            })
+        });
+        let no_column = load_corrupt(load_fit(&edited));
+        assert!(
+            no_column.contains("ebes.csv has no n_obs_tte"),
+            "{no_column}"
+        );
+
+        rewrite_bundle(&good, &edited, |name, body| {
+            Some(if name == "ebes.csv" {
+                let text = String::from_utf8(body).unwrap();
+                let mut lines = text.lines();
+                let mut out = format!("{}\n", lines.next().unwrap());
+                for line in lines {
+                    out.push_str(&line[..line.rfind(',').unwrap()]);
+                    out.push_str(",-1\n");
+                }
+                out.into_bytes()
+            } else {
+                body
+            })
+        });
+        let bad_count = load_corrupt(load_fit(&edited));
+        assert!(bad_count.contains("bad n_obs_tte \"-1\""), "{bad_count}");
+    }
+
+    /// T5 (#911): a fit without TTE rows writes neither the entry nor the column, so its
+    /// `ebes.csv` is byte for byte the layout a writer before #911 produced, plain and with
+    /// discrete rows.
+    ///
+    /// Dies on: the entry or the column written unconditionally.
+    #[test]
+    fn a_fit_without_tte_rows_writes_neither_entry_nor_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = saved(&dir, &minimal_fit_result());
+        assert_eq!(entry_text(&plain, "predictions_tte.csv"), None);
+        let ebes = entry_text(&plain, "ebes.csv").unwrap();
+        assert!(
+            ebes.lines()
+                .next()
+                .unwrap()
+                .ends_with(",ofv_contribution,n_obs"),
+            "{ebes}"
+        );
+        assert!(ebes.lines().nth(1).unwrap().ends_with(",3"), "{ebes}");
+
+        let mut r = minimal_fit_result();
+        r.subjects[1].discrete_rows = vec![discrete_row(3, 2.5, 0.25)];
+        let dir2 = tempfile::tempdir().unwrap();
+        let discrete = saved(&dir2, &r);
+        assert_eq!(entry_text(&discrete, "predictions_tte.csv"), None);
+        let ebes = entry_text(&discrete, "ebes.csv").unwrap();
+        let mut lines = ebes.lines();
+        assert!(
+            lines.next().unwrap().ends_with(",n_obs,n_obs_discrete"),
+            "{ebes}"
+        );
+        assert!(lines.next().unwrap().ends_with(",3,0"), "{ebes}");
+        assert!(lines.next().unwrap().ends_with(",2,1"), "{ebes}");
+    }
+
+    /// T7 (#911): the rows outlive a load and a second save, written from the restored
+    /// rows (cell A6).
+    ///
+    /// Dies on: the second save dropping the entry, the reader not filling `tte_rows`
+    /// (the writer then has nothing to write).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_rows_survive_a_load_and_re_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = tte_fit_911();
+        let loaded = load_fit(&save_911(&dir, "first.fitrx", &r, &p))
+            .unwrap()
+            .fit;
+        let back = load_fit(&save_911(&dir, "again.fitrx", &loaded, &p))
+            .unwrap()
+            .fit;
+        for (si, (got, want)) in back.subjects.iter().zip(&r.subjects).enumerate() {
+            assert_eq!(
+                tte_bits(&got.tte_rows),
+                tte_bits(&want.tte_rows),
+                "subject {si}"
+            );
+        }
+    }
+
+    /// T8 (#911): a build without `survival` loads a bundle that carries TTE rows (what a
+    /// survival build writes, built here from text), ignoring the entry and the column,
+    /// and keeps its discrete rows. Also the forward-compat proxy for a reader older than
+    /// #911 (cell F1), which knows neither name.
+    ///
+    /// Dies on: an unconditional `attach_tte_rows`-style read of the entry or the column
+    /// that refuses what it does not know.
+    #[cfg(not(feature = "survival"))]
+    #[test]
+    fn tte_bundle_loads_without_survival() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        r.subjects[1].discrete_rows = vec![discrete_row(3, 2.5, 0.25)];
+        let base = saved(&dir, &r);
+        let (s0, s1) = (r.subjects[0].id.clone(), r.subjects[1].id.clone());
+        let with_tte = dir.path().join("with_tte.fitrx");
+        let tte_csv = format!(
+            "ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE,PIT\n\
+             {s0},2,5.0,1.0,0.5,0.5,-0.5,0.6\n\
+             {s1},2,6.0,0.0,0.25,-0.25,-0.7,0.7\n\
+             {s1},2,7.0,,0.3,,,0.8\n"
+        );
+        let mut archive = ZipArchive::new(File::open(&base).unwrap()).unwrap();
+        let mut out = ZipWriter::new(File::create(&with_tte).unwrap());
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().unwrap().to_string();
+            let mut body = Vec::new();
+            f.read_to_end(&mut body).unwrap();
+            drop(f);
+            if name == "ebes.csv" {
+                let text = String::from_utf8(body).unwrap();
+                let mut lines = text.lines();
+                let mut edited = format!("{},n_obs_tte\n", lines.next().unwrap());
+                for (line, n) in lines.zip([1, 2]) {
+                    edited.push_str(&format!("{line},{n}\n"));
+                }
+                body = edited.into_bytes();
+            }
+            out.start_file(name, SimpleFileOptions::default()).unwrap();
+            out.write_all(&body).unwrap();
+        }
+        out.start_file("predictions_tte.csv", SimpleFileOptions::default())
+            .unwrap();
+        out.write_all(tte_csv.as_bytes()).unwrap();
+        out.finish().unwrap();
+
+        let loaded = load_fit(&with_tte).expect("a TTE bundle loads without survival");
+        assert!(loaded.fit.subjects[0].discrete_rows.is_empty());
+        assert_eq!(
+            loaded.fit.subjects[1].discrete_rows,
+            r.subjects[1].discrete_rows
         );
     }
 
