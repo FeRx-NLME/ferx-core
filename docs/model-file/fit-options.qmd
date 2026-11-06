@@ -213,13 +213,32 @@ Guarded multi-start count for the inner (per-subject EBE) optimizer, to escape a
 
 The initial BFGS metric also decides which basin a cold start lands in. Under `focei`, `foce`, `gn`, `gn_hybrid` and `laplace` (any `n_agq`), warm-started inner solves seed BFGS from the subject's conditional η-Hessian, which speeds up re-convergence near the previous mode. A **cold** start (the first outer evaluation and the final cold EBE re-solve) runs twice, once with that seed and once with the historical metric, and keeps the lower objective; the two share one [Sobol screen](#inner-screen), whose descents read neither metric (#2549). Neither metric picks the right basin on every subject ([#1504](https://github.com/FeRx-NLME/ferx-core/pull/1504)). If both reach the same mode, the historical solve is kept, so unimodal subjects are unchanged. Models with a `[covariate_nn]` block never use the seed.
 
+#### Inter-occasion variability {#inner-restarts-iov}
+
+On a subject with occasions in a `kappa` / `block_kappa` model, the per-coordinate seeds run on the whole search vector: every random effect and each occasion's `kappa` ([#2730](https://github.com/FeRx-NLME/ferx-core/issues/2730)). Before #2730 they did not run on these subjects at all, so `inner_restarts` had no effect there. Each `kappa` seed is placed by that `kappa`'s own variance, and under [nested levels](individual-parameters.qmd) there is one coordinate per group of each level.
+
+The same rule picks the coordinates. A subject with system resets or time-varying covariates scans every one. Any other subject scans a flat coordinate, and also one with a barrier on the way to its seed: the objective at the midpoint is at least as high as at the seed. An occasion with a few informative samples can have a second solution in `kappa` and be sharply curved at both, so flatness alone would miss it.
+
+A seed's descent replaces the EBE only when it ends lower and more than 0.5 from it in the prior's metric, the test the Sobol screen uses, so a unimodal subject is bit-identical to `inner_restarts = 0`.
+
+The cost is `2 * inner_restarts` descents per scanned coordinate, on cold solves only. It grows linearly with the occasions: a reset subject with 3 random effects and 3 `kappa`s on 3 occasions has 12 coordinates, so 24 descents per cold solve at the default. On `examples/warfarin_iov_ode_bloq.ferx` the fit's CPU time is unchanged, and with an `EVID=4` reset added at each later occasion it rises from 0.56 s to 1.02 s (macOS arm64). Set `inner_restarts = 0` if that is too much for a large ODE model.
+
+The move is chosen on the inner objective, not on the subject's FOCEI contribution, and the two can disagree: a lower individual mode can raise the OFV. NONMEM's `MCETA` makes the same choice. On the two-mode dataset in `nonmem_anchor/iov_kappa_two_mode*`, evaluated at fixed parameters:
+
+| Dataset | `inner_restarts = 0` | NONMEM, descent from zero | default | NONMEM, other starts |
+|---|---|---|---|---|
+| occasion 2 opens with `EVID=4` | 4.2797 | 4.2797 | -4.5724 | -4.5724 (started at the ferx EBEs) |
+| no reset | 4.8006 | 4.8006 | -5.2912 | -5.2912 (`MCETA=200`) |
+
+With the reset, `MCETA=200` reports -6.4973: it reaches the same mode for the two-mode subject, and misses a lower inner mode of another subject that the seeds find.
+
 #### The Sobol screen {#inner-screen}
 
 The per-coordinate seeds above move one random effect at a time, so they cannot reach a mode that only opens when two move together. The one-compartment oral flip-flop is the standard case: when absorption is slower than elimination, the data fit `(ka, k)` and the swapped pair almost equally well, and the twin sits where `η_ka` and `η_V` move together. On a synthetic subject with `ka = 0.02` and `k = CL/V = 0.1`, a cold descent from η = 0 and every axis seed stop at an individual objective of −42.34, while the twin is at −50.16 ([#2013](https://github.com/FeRx-NLME/ferx-core/issues/2013)).
 
 With `inner_screen = N > 0` (default `100`), each cold multi-start first scores `N` points of a scrambled Sobol sequence mapped to `N(0, 4Ω)`, twice the prior SD on every axis and correlated as Ω is, and runs a full inner descent from the `3` lowest. A descent replaces the current EBE only when its objective is lower by more than `1e-9` **and** it lies more than `0.5` from the current EBE in the Ω⁻¹ metric. A descent that comes back to the current mode, even a hair lower, is turned away, so a subject with one mode keeps exactly the EBE it gets with `inner_screen = 0`. The per-coordinate seeds then run as before, from whatever EBE the screen leaves.
 
-The screen runs on the same cold solves as `inner_restarts`, and `inner_restarts = 0` turns it off too. It applies to `focei`, `foce`, `laplace` (any `n_agq`), `gn`, `gn_hybrid` and `trust_region`, to the covariance step's re-solves and a mixture's per-class solves, and to SAEM's final EBE pass. Subjects of a model with inter-occasion variability (`kappa`/`block_kappa`) are not screened, nor are the EBEs of `imp`, `impmap` and `bayes`.
+The screen runs on the same cold solves as `inner_restarts`, and `inner_restarts = 0` turns it off too. It applies to `focei`, `foce`, `laplace` (any `n_agq`), `gn`, `gn_hybrid` and `trust_region`, to the covariance step's re-solves and a mixture's per-class solves, and to SAEM's final EBE pass. Subjects of a model with inter-occasion variability (`kappa`/`block_kappa`) are not screened, though the [per-coordinate seeds](#inner-restarts-iov) run on them, and neither are the EBEs of `imp`, `impmap` and `bayes`.
 
 The Sobol scramble is seeded from a fixed hash of the subject's ID, so the result does not depend on the number of threads or on where the subject sits in the data; renaming a subject changes its sequence. At `N = 100` the synthetic flip-flop subject reaches the twin on all 100 sequences tried, in both of the #2013 configurations. The cost is `N` objective evaluations and up to `3` descents per cold solve. Under the seeded BFGS metric a cold solve runs twice (see above), and so does its screen. On `examples/warfarin.ferx` and `examples/schnider.ferx` the default screen leaves the fit and the sdtab byte-identical to `inner_screen = 0`, and wall time goes from 0.08 s to 0.10 s and from 1.02 s to 1.21 s (macOS arm64, fastest of three runs).
 
