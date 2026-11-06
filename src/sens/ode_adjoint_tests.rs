@@ -1148,7 +1148,18 @@ fn an_addl_implied_dose_route_lag_from_its_parent_matches_reconverged_fd() {
             let mut dose = Vec::new();
             let theta = &model.default_params.theta;
             crate::pk::compute_dose_pk_params_into(&model, &s, theta, &[0.0, 0.0], &mut dose);
-            assert_eq!(dose[1].values[lag], dose[0].values[lag], "{label}");
+            assert_eq!(dose[1].values[lag], dose[0].values[lag], "{label}: copy");
+            // Straddle: the parent's lag (X = 1, TVLAG = 0.4) is half the governing record's
+            // (X = 2, TVLAG·2 = 0.8). The copy gives the implied dose the parent's value, so
+            // it must differ from what the governing record alone would give. Without this a
+            // fixture edit that equalised the two would turn the copy assertion into a tautology.
+            let parent_lag = dose[0].values[lag];
+            let gov_lag = parent_lag * 2.0; // the governing record is at X = 2
+            assert!(
+                (gov_lag - parent_lag).abs() > 0.1,
+                "{label}: the governing lag {gov_lag} must differ from the parent's {parent_lag} \
+                 for the copy to be testable"
+            );
             let params = moved_params(&model);
             let (gf, gl) = objective_gaps::<2>(&model, &s, &params, &[0.1, -0.05]);
             assert!(

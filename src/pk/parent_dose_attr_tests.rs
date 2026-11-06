@@ -194,7 +194,13 @@ fn an_implied_dose_takes_its_own_routes_lag_from_its_parent() {
     };
     let (la, lc) = (route_lag(0), route_lag(1));
     let lag_slot = |cmt: usize| model.active_dose_attr_map().lag_slot(cmt);
-    assert!(la != lc && ![lag_slot(1), lag_slot(2)].contains(&la));
+    assert!(
+        la != lc
+            && ![lag_slot(1), lag_slot(2)].contains(&la)
+            && ![lag_slot(1), lag_slot(2)].contains(&lc),
+        "fixture: route lag slots {la}, {lc} must not collide with compartment lag slots {:?}",
+        [lag_slot(1), lag_slot(2)]
+    );
 
     // Each implied dose copies its own route's lag, and not the other route's.
     let copies: Vec<_> = parent_dose_attr_copies(&model, &subject).collect();

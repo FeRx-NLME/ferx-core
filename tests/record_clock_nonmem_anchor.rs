@@ -276,7 +276,7 @@ const PRED_TOL_17: f64 = 1e-12;
 // a state. On the time-varying-X subjects (IDs 1–3) the forcing's RK error shows at the
 // `.tab`'s precision. The worst |PRED − NONMEM| is 9.6e-10, at ID 1 `TIME 40` (macOS arm64,
 // ode_reltol = abstol = 1e-12). It is integration error, because it scales with the
-// tolerance: 3.8e-8 at 1e-10 and 1.0e-11 at 1e-14. ID 4 (constant X) is 1.8e-15. A bound of
+// tolerance: 9.7e-8 at 1e-10 (PR #2668 body) and 1.0e-11 at 1e-14. ID 4 (constant X) is 1.8e-15. A bound of
 // 1e-8 leaves 10× headroom over the worst. Reading the route lag at the governing record
 // moves a PRED by 1.67 (ID 1 at `TIME 14`), and no affected row by less than 8.9e-2.
 const PRED_TOL_ROUTE_FORCING: f64 = 1e-8;
