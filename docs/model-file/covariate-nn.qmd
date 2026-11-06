@@ -360,7 +360,7 @@ identity-packed θ declared below 1 takes. A weight's θ₀ is its initial draw,
 anyone declared, and the objective's sensitivity to the weight does not scale with that draw.
 On `two_cpt_oral_cov` with a `CRCL`/`WT` network, a first-layer weight drawn at 1e-4 had a
 reconverged-FD gradient 5.5e-2 off under the `|θ₀|` floor. Under the unit floor it was 1.3e-7
-off (#2406).
+off, measured against the analytic gradient at `inner_tol = 1e-11` (#2406).
 
 ## Regularization (`nn_l2`, `nn_smooth`)
 

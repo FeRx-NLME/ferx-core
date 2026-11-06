@@ -753,7 +753,7 @@ impl MixtureScoreContext {
         let covariates = &population.subjects[i].covariates;
         // The p-form has no analytic mixing gradient; S, unlike the outer gradient, has no
         // whole-objective FD to fall back to, so difference the mixing map itself.
-        let floor = fd_theta_step_floors(&model);
+        let floor = fd_theta_step_floors(model);
         let dlnp = mixing_logp_grad(spec, &self.params.theta, covariates, &floor)
             .unwrap_or_else(|| mixing_logp_grad_fd(spec, &self.params.theta, covariates, &floor));
         let mut g = vec![0.0f64; packed_segments(&self.params).total()];
