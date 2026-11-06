@@ -3194,9 +3194,12 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
 /// where the exact `H` is indefinite (`laplace_serves_the_prior_precision_anchor_fallback`'s
 /// search), the mode system declines and says so — with the mode response asked for too,
 /// whose fused pass fails at the same solve before its retry. The straddle: at the EBE the
-/// same subject is served, and a cause left on a reused `ModeOut` is cleared. Mutations
-/// that redden it: dropping the `ModeSystem` stamp in `run` (the pass reports
-/// `Recording`), or not clearing the cause on a served pass.
+/// same subject is served, and a cause left on a reused `ModeOut` is cleared. Then, on the
+/// same `ModeOut` after a mode-system decline, an `η_KA` far enough out that `KA` overflows
+/// to infinity fails the recording itself, and must say so rather than keep the stale cause
+/// (#2713 review). Mutations that redden it: dropping the `ModeSystem` stamp in `run` (the
+/// pass reports `Recording`), not clearing the cause on a served pass, or not resetting it
+/// at the start of a pass.
 #[test]
 fn a_declined_gradient_names_its_cause() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
@@ -3261,6 +3264,20 @@ fn a_declined_gradient_names_its_cause() {
         assert_eq!(
             out.decline, None,
             "want_dx = {want_dx}: a served pass names no cause"
+        );
+
+        // A recording failure after a mode-system one, on the same `out`.
+        let g =
+            subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &eta, Objective::Focei, &mut out);
+        assert!(g.is_none() && out.decline == Some(DeclineCause::ModeSystem));
+        let blown = [0.0, 0.0, 800.0];
+        let g =
+            subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &blown, Objective::Focei, &mut out);
+        assert!(g.is_none(), "want_dx = {want_dx}: KA = inf must decline");
+        assert_eq!(
+            out.decline,
+            Some(DeclineCause::Recording),
+            "want_dx = {want_dx}: a failed recording must not keep the last pass's cause"
         );
     }
 }

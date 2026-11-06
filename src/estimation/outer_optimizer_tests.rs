@@ -6596,13 +6596,22 @@ mod outer_fd_fallback {
     /// Run one real outer-gradient evaluation over `pop` through the same mixed assembly
     /// the optimizer uses, and return the log it filled.
     fn record_one_gradient_eval(model: &CompiledModel, pop: &Population) -> OuterFdDeclineLog {
+        let ehs: Vec<DVector<f64>> = (0..pop.subjects.len())
+            .map(|_| DVector::zeros(model.n_eta))
+            .collect();
+        record_one_gradient_eval_at(model, pop, &ehs)
+    }
+
+    /// [`record_one_gradient_eval`] at the EBEs `ehs`.
+    fn record_one_gradient_eval_at(
+        model: &CompiledModel,
+        pop: &Population,
+        ehs: &[DVector<f64>],
+    ) -> OuterFdDeclineLog {
         let params = &model.default_params;
         let PackedStart {
             packed: x, bounds, ..
         } = pack_with_bounds(params);
-        let ehs: Vec<DVector<f64>> = (0..pop.subjects.len())
-            .map(|_| DVector::zeros(model.n_eta))
-            .collect();
         let opts = FitOptions {
             method: EstimationMethod::FoceI,
             interaction: true,
@@ -6619,7 +6628,7 @@ mod outer_fd_fallback {
             params,
             model,
             pop,
-            &ehs,
+            ehs,
             &hms,
             &bounds,
             &opts,
@@ -6677,7 +6686,9 @@ mod outer_fd_fallback {
         let pop = mk_pop(vec![analytic, declining]);
         const SHAPE: &str = "with a shape no analytic recorder serves";
         const MODE: &str = "with an inner Hessian at the EBE that was singular";
-        const MULTIMODAL: &str = "as when subjects move between modes";
+        // #2713 review: an off-mode EBE is not evidence of a mode change, so the clause
+        // must not claim one (that is `W_EBE_START_DEPENDENT`'s to report).
+        const MULTIMODAL: &str = "move between modes";
         const RECORDING: &str = "with a recording that failed or came back non-finite";
         const GENERIC: &str = "a trial point where it could not be formed";
         let warn = |causes: &[(usize, DeclineCause)]| {
@@ -6704,7 +6715,7 @@ mod outer_fd_fallback {
         let w = warn(&[(0, DeclineCause::ModeSystem), (1, DeclineCause::ModeSystem)]);
         only(&w, &[MODE]);
         assert!(
-            w.contains(&format!("(2 {MODE}")) && w.contains(MULTIMODAL),
+            w.contains(&format!("(2 {MODE}")) && !w.contains(MULTIMODAL) && !w.contains("jump"),
             "got: {w}"
         );
 
@@ -6729,6 +6740,95 @@ mod outer_fd_fallback {
         log.record(1);
         let w = outer_fd_fallback_warning(&model, &pop, &log).expect("must warn");
         only(&w, &[GENERIC]);
+    }
+
+    /// #2713 review: a decline that is numerical at the trial's `η̂` is labelled as a failed
+    /// recording, not a shape, and takes the held-EBE salvage. At `η_KA = 800` the in-scope
+    /// subject's `KA` overflows, so its objective is not finite. The straddle is
+    /// `warns_with_count_and_example_subject`, whose SS-infusion subject is a shape and keeps
+    /// the shape clause. This does not reach `is_structural_decline`'s two-point gate (see
+    /// its docs): the recording returns non-finite values here, not `None`.
+    #[test]
+    fn a_numerical_decline_at_an_extreme_eta_is_not_a_shape() {
+        let (model, analytic, _) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic]);
+        let blown = DVector::from_vec(vec![0.0, 0.0, 800.0]);
+        assert!(
+            !is_structural_decline(
+                &model,
+                &pop.subjects[0],
+                &model.default_params,
+                blown.as_slice()
+            ),
+            "a subject the recorder serves is not structural"
+        );
+        let log = record_one_gradient_eval_at(&model, &pop, &[blown]);
+        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("the subject declined");
+        assert!(
+            w.contains("(1 with a recording that failed or came back non-finite"),
+            "got: {w}"
+        );
+        assert!(
+            !w.contains("with a shape no analytic recorder serves")
+                && !w.contains("no analytic recorder serves them"),
+            "a numerical decline must not be called a shape; got: {w}"
+        );
+        assert!(w.contains("used fixed-EBE outer gradients"), "got: {w}");
+    }
+
+    /// #2713 review: the warning ties the declines to the gradient at the incumbent, not
+    /// the fit-wide counts. No incumbent recorded: no sentence. An adopted evaluation with a
+    /// decline: the count and its cause. A later adopted evaluation with none: the
+    /// all-exact sentence, so `begin_eval` must reset the tally. A later evaluation that
+    /// declines but is not adopted leaves the snapshot as it was.
+    #[test]
+    fn the_incumbent_sentence_reports_the_incumbent_gradient_alone() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        const AT: &str = "At the best point the optimizer reached";
+        const ALL_EXACT: &str = "every subject had the exact analytic outer gradient, so these \
+             fallbacks happened only at points it moved away from.";
+        let warn = |log: &OuterFdDeclineLog| {
+            outer_fd_fallback_warning(&model, &pop, log).expect("must warn")
+        };
+        let log = OuterFdDeclineLog::new(2);
+        log.begin_eval();
+        log.record(1);
+        log.record_cause(1, DeclineCause::ModeSystem);
+        assert!(
+            !warn(&log).contains(AT),
+            "no incumbent recorded; got: {}",
+            warn(&log)
+        );
+
+        log.mark_incumbent();
+        let w = warn(&log);
+        assert!(
+            w.contains(&format!(
+                "{AT}, the outer gradient still salvaged 1 of 2 subjects (1 inner Hessian)."
+            )),
+            "got: {w}"
+        );
+
+        log.begin_eval();
+        log.mark_incumbent();
+        let w = warn(&log);
+        assert!(w.contains(&format!("{AT}, {ALL_EXACT}")), "got: {w}");
+        assert!(!w.contains("still salvaged"), "got: {w}");
+
+        log.begin_eval();
+        log.record(0);
+        log.record_cause(0, DeclineCause::Recording);
+        let w = warn(&log);
+        assert!(
+            w.contains(ALL_EXACT),
+            "an unadopted evaluation must not move it; got: {w}"
+        );
+        // The fit-wide clause still counts every decline.
+        assert!(
+            w.contains("1 with an inner Hessian") && w.contains("1 with a recording"),
+            "got: {w}"
+        );
     }
 
     /// #1529: the consequence sentence depends on which salvage the route takes, so both

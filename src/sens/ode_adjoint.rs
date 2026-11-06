@@ -877,6 +877,12 @@ fn adjoint_gradient(
     eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let (template, x) = (pt.template, pt.x);
+    // A reused `out` starts each pass without a cause: a failure that names none must not
+    // inherit the last pass's (#2713 review).
+    let mut eta_dx = eta_dx;
+    if let Some(o) = eta_dx.as_deref_mut() {
+        o.decline = None;
+    }
     let shape = |eta_dx: Option<&mut ModeOut>| {
         if let Some(o) = eta_dx {
             o.decline = Some(DeclineCause::Shape);
@@ -4502,8 +4508,9 @@ pub(crate) struct ModeOut {
     pub(crate) want_hessian: bool,
     pub(crate) eta_dx: Option<Vec<DVector<f64>>>,
     pub(crate) hessian: Option<DMatrix<f64>>,
-    /// Why the gradient was declined, when it was (#2713). Set by the pass, never read by
-    /// it; it survives [`Self::clear`], which drops only the products.
+    /// Why the gradient was declined, when it was (#2713). Reset at the start of every
+    /// pass and set by it, never read by it; it survives [`Self::clear`], which drops only
+    /// the products.
     pub(crate) decline: Option<DeclineCause>,
 }
 
@@ -4523,8 +4530,9 @@ pub(crate) enum DeclineCause {
     /// ([`scope`]): it declines at every parameter point.
     Shape,
     /// The mode system `H w = ∇_η F` could not be solved ([`mode_solve`]): `H` singular at
-    /// `η̂`, or indefinite at an `η̂` that is not stationary — an EBE off a strict mode, as
-    /// when the inner search lands between modes of a multimodal posterior.
+    /// `η̂`, or indefinite at an `η̂` that is not stationary — an EBE off a strict mode.
+    /// Not by itself evidence that a subject changed modes: that is what the cold re-solve
+    /// check measures.
     ModeSystem,
     /// The recording itself failed at this trial point: a non-finite prediction, a
     /// non-positive-definite Ω, or a non-finite gradient component.

@@ -134,22 +134,29 @@ The two can disagree. A subject no recorder serves — an out-of-scope ODE dose 
 ```
 1 of 32 subjects could not be given the exact analytic outer gradient during this fit
 (e.g. subject 7) (1 with an inner Hessian at the EBE that was singular, or indefinite
-at an EBE that was not stationary, at some trial point — an EBE off a strict mode, as
-when subjects move between modes of a multimodal posterior, which can also make the
-objective jump under the line search) and used fixed-EBE outer gradients, which omit
-the EBE-response term the analytic gradient carries. If the fit stalls,
-`reconverge_gradient_interval = N` restores the reconverged gradient every N-th
-evaluation. The reported outer gradient method is the model-level route, not the
+at an EBE that was not stationary (an EBE off a strict mode), at some trial point) and
+used fixed-EBE outer gradients, which omit the EBE-response term the analytic gradient
+carries. If the fit stalls, `reconverge_gradient_interval = N` restores the reconverged
+gradient every N-th evaluation. At the best point the optimizer reached, every subject
+had the exact analytic outer gradient, so these fallbacks happened only at points it
+moved away from. The reported outer gradient method is the model-level route, not the
 per-subject one.
 ```
 
-The parenthesis names the cause of each decline (#2713), one clause per cause, with its subject count:
+The first parenthesis names the cause of each decline (#2713), one clause per cause, with its subject count:
 
-- **a shape no analytic recorder serves** — the subject's records are outside the recorders' scope, at every parameter point;
-- **an inner Hessian at the EBE that was singular, or indefinite at an EBE that was not stationary** — the identity the exact gradient rests on needs a nonsingular `H` at a stationary `η̂`, and this subject's EBE was off a strict mode at some trial point. A large count here points at multimodal EBEs: a subject that changes mode makes the objective jump, which a line search with an exact gradient can fail on;
-- **a recording that failed or came back non-finite** — a prediction, Ω factor or gradient component that was not finite at a trial point.
+- **a shape no analytic recorder serves**: the subject's records are outside the recorders' scope. The predictions are recorded at both the trial's EBE and `η = 0`, and the subject counts here only if both recordings fail. A failure at an extreme trial-point EBE alone is a failed recording, not a shape.
+- **an inner Hessian at the EBE that was singular, or indefinite at an EBE that was not stationary**: the identity behind the exact gradient needs a nonsingular `H` at a stationary `η̂`, and at some trial point this subject's EBE was off a strict mode. On its own this does not show that the subject switched between modes. That is measured by the cold re-solve of the EBEs, reported as `W_EBE_START_DEPENDENT`.
+- **a recording that failed or came back non-finite**: a prediction, Ω factor or gradient component was not finite at a trial point, typically one a line search tried and rejected.
 
-A subject that declined for different causes at different trial points counts under each, so the counts can add up to more than the declined total. Which cause dominates decides the remedy: a shape decline needs recorder coverage, a mode-system one is a property of the posterior that `reconverge_gradient_interval` cannot change, and a recording one usually comes from blown-up line-search trials.
+These counts cover the whole fit, rejected trial points included. A subject that declined for different causes at different trial points counts under each, so the counts can add up to more than the declined total.
+
+The sentence after the remedy ties the fallbacks to where the fit ended. It counts the subjects the gradient salvaged at the best point the optimizer reached (its incumbent), by cause, or says that none were salvaged there. When the fit ends with an optimizer `Failure`, this is the sentence to read:
+
+- **No subject salvaged at the incumbent:** the fixed-EBE fallback did not distort the gradient the optimizer last held. Look elsewhere for the cause of the `Failure`.
+- **A large share salvaged:** the final gradient omits their EBE response, and `reconverge_gradient_interval = N` is the check to run.
+
+The sentence is absent when no incumbent's gradient was recorded, for example under a `[mixture]` model or AGQ.
 
 #### What a declined subject is charged {#declined-subject-salvage}
 

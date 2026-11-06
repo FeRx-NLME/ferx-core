@@ -201,6 +201,16 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
             && w.contains("include the EBE-response term but are slower"),
         "the structural sentence must name the recorder scope; got: {w}"
     );
+    // #2713 review: the declines are tied to the point the optimizer stopped on. The
+    // subject's shape declines at every point, so the incumbent's gradient salvaged it too
+    // — which also pins that the NLopt objective snapshots an adopted point's tally.
+    assert!(
+        w.contains(&format!(
+            "At the best point the optimizer reached, the outer gradient still salvaged 1 \
+             of {n_total} subjects (1 shape)."
+        )),
+        "the incumbent's declines must be reported; got: {w}"
+    );
     assert!(
         !w.contains("correlated across observation rows"),
         "a diagonal-error subject must not be told its residuals are correlated; got: {w}"
