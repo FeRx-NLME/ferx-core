@@ -2,3 +2,10 @@
 # The Enzyme autodiff path was retired (Dual2 analytic sensitivities replace it),
 # so a stock nightly toolchain is sufficient — no custom Enzyme channel needed.
 channel = "nightly"
+# rust-analyzer so find-references works in agent sessions: grep and tree-sitter
+# miss `crate::…`-qualified and macro-generated uses (#2637). CI never reads this
+# list — every workflow job that runs cargo sets `RUSTUP_TOOLCHAIN`, which makes
+# rustup ignore this file (components included) — so a nightly missing one of
+# these cannot fail or roll back CI's `rustup toolchain install nightly`.
+# `tests/ci_toolchain_override.rs` pins that every such job keeps the override.
+components = ["rust-analyzer", "clippy", "rustfmt"]
