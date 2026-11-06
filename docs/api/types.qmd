@@ -62,10 +62,16 @@ covariate varies within the subject — the no-TV-cov fast paths use
 `covariates` directly. Helpers `subject.has_tv_covariates()`,
 `subject.dose_cov(k)`, and `subject.obs_cov(j)` abstract over this.
 
-A covariate the model reads (including an `[adaptive_dosing]` `observe`
-covariate) is present only when **every** subject's `covariates` map carries
-it. Per-record snapshots alone do not count: a dose or reset row without one,
-and an adaptive decision before the first record, read the `covariates` map.
+A covariate the model reads (including an `[adaptive_dosing]` `observe` or
+dose-expression covariate) is present only when **every** subject carries it in
+its `covariates` map **and** in every per-record snapshot it has
+(`obs_covariates`, `dose_covariates`, `pk_only_covariates`, `reset_covariates`,
+`endpoint_covariates`). Each map is read somewhere: a dose or reset row without
+a snapshot of its own, and an adaptive decision before the first record, read
+the `covariates` map; a record with a snapshot reads that snapshot, and an
+adaptive decision reads the snapshot of the record in force. A key one map
+lacks would be read as 0 there, so it is refused with `E_MISSING_COVARIATE`
+([#2671](https://github.com/FeRx-NLME/ferx-core/issues/2671)).
 `covariate_names` does not decide presence either: a population built in
 memory that lists a name some subject lacks is refused with
 `E_MISSING_COVARIATE`, since the predictor would read the missing value as 0

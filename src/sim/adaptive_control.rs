@@ -349,7 +349,12 @@ impl CompiledDoseExprs {
         let reads = self
             .covariates()
             .into_iter()
-            .map(|(_, c)| (c.to_string(), covs.get(c).copied().unwrap_or(f64::NAN)))
+            .map(|(_, c)| {
+                (
+                    c.to_string(),
+                    crate::parser::model_parser::output_covariate_read(covs, c),
+                )
+            })
             .collect();
         ResolvedDosePlan {
             violation: dose_plan_violation(&plan),
