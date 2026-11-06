@@ -21079,18 +21079,30 @@ fn is_algebraic_structural(struct_lines: &[String]) -> bool {
 }
 
 /// The refusal for weighted kappas referenced outside `[individual_parameters]`
-/// (#1031). `offending` holds `([block], kappa)` pairs, already labelled and
-/// sorted; every pair is named so the user fixes them all in one pass (#2624).
+/// (#1031). `offending` holds `([block], kappa)` pairs, sorted, whose label is
+/// the one the user wrote — already relabelled `[scaling]` → `[structural_model]`
+/// for a compartment-free model (#1827), never the raw key. Every pair is named,
+/// grouped by block, so the user fixes them all in one pass (#2624).
 fn weighted_kappa_outside_indiv_message(offending: &[(String, &String)]) -> String {
-    let clauses: Vec<String> = offending
+    fn and_list(items: &[String]) -> String {
+        match items {
+            [init @ .., last] if !init.is_empty() => format!("{} and {last}", init.join(", ")),
+            _ => items.concat(),
+        }
+    }
+    // Sorted input keeps a block's pairs adjacent.
+    let mut by_block: Vec<(&str, Vec<String>)> = Vec::new();
+    for (block, name) in offending {
+        match by_block.last_mut() {
+            Some((b, names)) if *b == block.as_str() => names.push(format!("`{name}`")),
+            _ => by_block.push((block.as_str(), vec![format!("`{name}`")])),
+        }
+    }
+    let clauses: Vec<String> = by_block
         .iter()
-        .map(|(block, name)| format!("{block} references `{name}`"))
+        .map(|(block, names)| format!("{block} references {}", and_list(names)))
         .collect();
-    let listed = match clauses.as_slice() {
-        [one] => one.clone(),
-        [init @ .., last] => format!("{} and {last}", init.join(", ")),
-        [] => String::new(),
-    };
+    let listed = and_list(&clauses);
     let mut names: Vec<&String> = offending.iter().map(|(_, n)| *n).collect();
     names.sort();
     names.dedup();
@@ -21099,10 +21111,10 @@ fn weighted_kappa_outside_indiv_message(offending: &[(String, &String)]) -> Stri
     } else {
         "kappas declared"
     };
-    let (where_, term) = if offending.len() == 1 {
-        ("a reference here", "the term")
-    } else {
-        ("a reference in any of these blocks", "each term")
+    let (where_, term) = match (by_block.len(), offending.len()) {
+        (1, 1) => ("a reference here", "the term"),
+        (1, _) => ("these references", "each term"),
+        _ => ("a reference in any of these blocks", "each term"),
     };
     format!(
         "{listed}, {what} with `weight = ...`. A weighted kappa is scaled where it is used, \
