@@ -10768,16 +10768,27 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
         };
         let empty_by_pass = per_pass("EMPTY");
         let informed_by_pass = per_pass(&informed);
+        // Passes where the informed subject was NOT multi-started are the warm ones — the
+        // evaluations where the property matters (a solved zero mode is taken as warm). Cold
+        // re-solves and verification legs run from a zero-filled cache on purpose, so the empty
+        // subject is always multi-started there while an informed one's nonzero mode survives
+        // through the held-modes restore. That asymmetry is by design, and how many cold passes
+        // there are depends on the optimizer's trajectory (#1688). The test pins the warm path.
         let offending: Vec<(Option<usize>, usize, usize)> = empty_by_pass
             .keys()
+            .chain(informed_by_pass.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .map(|p| {
                 (
-                    *p,
-                    empty_by_pass.get(p).copied().unwrap_or(0),
-                    informed_by_pass.get(p).copied().unwrap_or(0),
+                    p,
+                    empty_by_pass.get(&p).copied().unwrap_or(0),
+                    informed_by_pass.get(&p).copied().unwrap_or(0),
                 )
             })
-            .filter(|&(_, e, i)| e > i)
+            // Only warm passes: one where the informed subject was not multi-started.
+            .filter(|&(_, e, i)| i == 0 && e > 0)
             .collect();
         (
             start,
