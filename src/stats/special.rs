@@ -732,8 +732,13 @@ fn gamma_p_series<T: PkNum>(a: T, x: T) -> T {
 /// any `|z| ≳ 1.9e154` reaches here as `x = +∞` and `normal_cdf(±∞)` — or of a merely huge
 /// finite `z` — was `NaN`, taking `log_normal_cdf`, an M3 censored term, and the `pnorm`
 /// expression function with it. Every finite `x` takes the iteration below, unchanged.
+///
+/// The limit holds only for a shape in the function's domain, `0 < a < ∞`. A `NaN` shape
+/// (a transit `n` gone `NaN`) or `a = ∞` (`P(∞, ∞)` is indeterminate) falls through to the
+/// iteration and stays `NaN`, rather than reporting a confident `P = 1` (#2767 review r1 #3).
 fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
-    if x.val() == f64::INFINITY {
+    let av = a.val();
+    if x.val() == f64::INFINITY && av > 0.0 && av.is_finite() {
         return T::from_f64(0.0);
     }
     const EPS: f64 = 1e-15;
@@ -1724,6 +1729,12 @@ mod tests {
             assert_eq!(regularized_gamma_q(a, f64::INFINITY), 0.0, "Q({a}, ∞)");
             assert!(regularized_gamma_p(a, f64::NAN).is_nan(), "P({a}, NaN)");
         }
+        // …but only for a shape in the domain: a `NaN` or infinite `a` must not borrow the
+        // `x = ∞` limit (review r1 #3; both were `1` with the gate ignoring `a`).
+        for a in [f64::NAN, f64::INFINITY] {
+            assert!(regularized_gamma_p(a, f64::INFINITY).is_nan(), "P({a}, ∞)");
+            assert!(regularized_gamma_q(a, f64::INFINITY).is_nan(), "Q({a}, ∞)");
+        }
         assert!(normal_cdf(f64::NAN).is_nan());
         assert!(log_normal_cdf(f64::NAN).is_nan());
         assert!(pnorm(f64::NAN).is_nan());
@@ -1765,6 +1776,9 @@ mod tests {
                 assert_eq!(h, 0.0, "{name}''({z:e})");
             }
             if z.is_finite() {
+                // Both stencil points sit in the flat region, so this FD is 0 for any finite
+                // constant value, right or wrong: it checks the value path is not `NaN` beside
+                // the jet. The `grad == 0` / `hess == 0` assertions above test the jet itself.
                 let step = 1e-6 * z.abs();
                 let fd = |f: &dyn Fn(f64) -> f64| (f(z + step) - f(z - step)) / (2.0 * step);
                 assert_eq!(fd(&normal_cdf_g::<f64>), d.grad[0], "Φ_g FD at {z:e}");
