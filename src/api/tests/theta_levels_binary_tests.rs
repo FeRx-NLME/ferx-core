@@ -1000,9 +1000,25 @@ const NO_READER: &str = "none of its discrete-state records is on an endpoint wh
                          reads the block through its implicit index";
 const CHECK: &str = "Check the expression that reads it";
 const READ_BARE: &str = "a data-driven block is read bare, as `PLACEBO`; its index is implicit.";
-/// Conditional on an explicit `PLACEBO[COLUMN]` read.
+/// Conditional on an explicit `PLACEBO[COLUMN]` read. `KEYED_ANY` is its prefix, the
+/// negative assertion: with the list empty `KEYED` would be absent anyway (review r1 #2).
 const KEYED: &str = "An explicit read indexes the block by the value its column holds, not by \
                      its level: `PLACEBO[STUDY]`. Write `PLACEBO` instead.";
+const KEYED_ANY: &str = "An explicit read";
+/// Conditional on a bare read whose only readers define no level (review r1 #1): a
+/// Gaussian prediction or a CTMM generator …
+const BARE_NO_DEFINER: &str = "The block is read bare, but only by a Gaussian prediction or a \
+                               `[markov_model]` CTMM generator, and neither defines a level on \
+                               this data";
+const BARE_WHY: &str = "it has no Gaussian rows, and a CTMM generator is built once per subject \
+                        from the baseline, so its records define none.";
+const BARE_ADVICE: &str =
+    "Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` transition.";
+/// … or a level-defining endpoint the data has no record for.
+const BARE_NO_RECORDS: &str = "The block is read bare by an endpoint whose records define levels \
+                               (CMT 1), but the data has no record there.";
+/// Every bare-read sentence, for the cells where none belongs.
+const BARE_ANY: [&str; 4] = [BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE, BARE_NO_RECORDS];
 /// The pre-#2623 wording, still right when the data has no row at all.
 const NO_ROWS: &str = "the data carries no observation rows";
 
@@ -1033,11 +1049,14 @@ fn no_reading_endpoint_cells() {
                         assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
                     }
                     assert!(!m.contains(NO_ROWS), "{cell}: blames the data: {m}");
-                    assert_eq!(
-                        m.contains(KEYED),
-                        read == Read::Indexed,
-                        "{cell}: the explicit-read sentence belongs to the indexed cell: {m}"
-                    );
+                    for sentence in BARE_ANY {
+                        assert!(!m.contains(sentence), "{cell}: not read bare: {m}");
+                    }
+                    if read == Read::Indexed {
+                        assert!(m.contains(KEYED), "{cell}: names the explicit read: {m}");
+                    } else {
+                        assert!(!m.contains(KEYED_ANY), "{cell}: no explicit read: {m}");
+                    }
                 }
                 (_, Read::Bare | Read::Indexed) => {
                     assert!(got.is_ok(), "{cell}: {got:?}");
@@ -1072,13 +1091,142 @@ fn a_population_with_no_rows_still_says_so() {
     let d = bind_read(Rows::Binary, Read::Unread, false).expect_err("no rows");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     assert!(d.message.contains(NO_ROWS), "{}", d.message);
-    for sentence in [NO_GAUSSIAN, NO_READER, CHECK, READ_BARE, KEYED] {
+    for sentence in [NO_GAUSSIAN, NO_READER, CHECK, READ_BARE, KEYED_ANY]
+        .into_iter()
+        .chain(BARE_ANY)
+    {
         assert!(
             !d.message.contains(sentence),
             "{sentence:?} in {}",
             d.message
         );
     }
+}
+
+/// Assert the bare-read refusal of review r1 #1 on `m`: the shared facts, then exactly
+/// one bare-read arm — `no_records` picks which — and never the "read it bare" advice,
+/// which would tell the user to do what they already did.
+fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool) {
+    for sentence in [NO_LEVELS, NO_GAUSSIAN, NO_READER] {
+        assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
+    }
+    for sentence in [CHECK, READ_BARE, NO_ROWS] {
+        assert!(!m.contains(sentence), "{cell}: already read bare: {m}");
+    }
+    let (want, not): (&[&str], &[&str]) = if no_records {
+        (
+            &[BARE_NO_RECORDS],
+            &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
+        )
+    } else {
+        (
+            &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
+            &[BARE_NO_RECORDS],
+        )
+    };
+    for sentence in want {
+        assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
+    }
+    for sentence in not {
+        assert!(
+            !m.contains(sentence),
+            "{cell}: wrong arm, {sentence:?} in {m}"
+        );
+    }
+}
+
+/// Review r1 #1: a block read bare by a Gaussian `y` on binary-only data is read
+/// through its implicit index, only not by a reader whose rows define levels — so the
+/// refusal says that, not "check the expression". The binary predictor here reads it
+/// explicitly, so the explicit-read sentence is named in this arm too.
+///
+/// Mutations: drop `read_bare` (always false) and the cell gets `CHECK`; route every
+/// bare read to the no-records arm and it gets `BARE_NO_RECORDS`.
+#[test]
+fn a_gaussian_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
+    let text = read_model(Rows::Mixed, Read::Indexed)
+        .replace("BASE = B + PLACEBO[STUDY]", "BASE = B + PLACEBO");
+    let mut parsed = parse_full_model(&text).unwrap();
+    let decl = &parsed.model.theta_blocks().level_blocks()[0];
+    assert!(
+        decl.read_bare && decl.record_cmts.is_empty(),
+        "fixture precondition: read bare by `y` alone"
+    );
+    let mut pop = read_population(Rows::Binary, true);
+    for s in &mut pop.subjects {
+        for r in &mut s.obs_records {
+            if let ObsRecord::DiscreteState { cmt, .. } = r {
+                *cmt = 2;
+            }
+        }
+    }
+    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+        .expect_err("no Gaussian rows");
+    assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
+    assert_bare_read_refusal("y bare", &d.message, false);
+    assert!(d.message.contains(KEYED), "{}", d.message);
+}
+
+/// Review r1 #1, the Markov cells: a block read bare by a CTMM generator alone (whose
+/// records define no level, #2562), and one read bare by a DTMM on CMT 1 when the data's
+/// records are all on another endpoint (CMT 5). Each names its own arm.
+///
+/// Mutations: drop `read_bare` and both get `CHECK`; drop the `record_cmts` test and the
+/// DTMM cell gets the CTMM arm; swap the arms and each gets the other's sentence.
+#[cfg(feature = "markov")]
+#[test]
+fn a_markov_bare_read_names_why_it_defines_no_level() {
+    let ctmm = r"
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta PLACEBO[STUDY](0.0)
+[covariates]
+  STUDY categorical
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + PLACEBO)
+  transition asleep -> awake  = exp(LQ10)
+";
+    let mut parsed = parse_full_model(ctmm).unwrap();
+    let mut pop = state_population();
+    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, ctmm, &mut pop)
+        .expect_err("a CTMM defines no levels");
+    assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
+    assert_bare_read_refusal("ctmm bare", &d.message, false);
+    assert!(!d.message.contains(KEYED_ANY), "{}", d.message);
+
+    let dtmm = r"
+[parameters]
+  theta A(-0.8, -10.0, 10.0)
+  theta PLACEBO[STUDY](0.0)
+[covariates]
+  STUDY categorical
+[markov_model reads]
+  type   = dtmm
+  cmt    = 1
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = inv_logit(A + PLACEBO)
+  transition asleep -> awake  = inv_logit(A)
+[markov_model other]
+  type   = dtmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = inv_logit(A)
+  transition asleep -> awake  = inv_logit(A)
+";
+    let mut parsed = parse_full_model(dtmm).unwrap();
+    assert_eq!(
+        parsed.model.theta_blocks().level_blocks()[0].record_cmts,
+        [1],
+        "fixture precondition: the CMT-1 DTMM reads the block"
+    );
+    let mut pop = state_population();
+    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, dtmm, &mut pop)
+        .expect_err("no record on CMT 1");
+    assert_bare_read_refusal("dtmm bare, records elsewhere", &d.message, true);
 }
 
 /// #2623: every explicit read is named, once each, in read order. Two reads of the block

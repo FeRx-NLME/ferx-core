@@ -7496,11 +7496,12 @@ pub fn parse_full_model_with(
     // #2562: the gathers an endpoint block reads count for the pre-fit index check too, and
     // they were parsed after `theta_blocks` took its first copy.
     model.indiv_param_partials.theta_blocks.uses = VectorThetaScope::uses();
-    // #2623: the explicit `NAME[COLUMN]` reads of each level block, for the binder's
-    // no-levels refusal.
+    // #2623: the explicit `NAME[COLUMN]` reads of each level block, and whether any
+    // expression reads it bare, for the binder's no-levels refusal.
     {
         let blocks = &mut model.indiv_param_partials.theta_blocks;
         for decl in blocks.level_blocks.iter_mut() {
+            decl.read_bare = model.referenced_covariates.contains(&decl.index_covariate);
             decl.keyed_reads.clear();
             for u in blocks.uses.iter().filter(|u| u.block == decl.name) {
                 if !decl.keyed_reads.contains(&u.index_covariate) {
@@ -19826,6 +19827,7 @@ fn parse_parameters(
                                 index_covariate: index_covariate.clone(),
                                 record_cmts: Vec::new(),
                                 keyed_reads: Vec::new(),
+                                read_bare: false,
                             });
                             (levels, theta_names, Some(index_covariate))
                         }
@@ -24411,6 +24413,12 @@ pub struct LevelBlockDecl {
     /// indexes it by the column itself and makes no endpoint a level-defining reader, so
     /// the binder names this spelling when that leaves the block with no levels.
     pub(crate) keyed_reads: Vec<String>,
+    /// Set by the parse: some expression reads this block bare, through
+    /// `index_covariate` — the model's referenced covariates include it (#2623 review).
+    /// With [`Self::record_cmts`] it tells the binder's no-levels refusal whether the
+    /// expression is the cause or the block's only readers define no level on the data
+    /// (a Gaussian prediction on data with no Gaussian rows, a CTMM generator).
+    pub(crate) read_bare: bool,
 }
 
 impl LevelBlockDecl {

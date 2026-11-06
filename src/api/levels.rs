@@ -1391,8 +1391,11 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
 /// The refusal for a block [`discover_levels`] found no level of. Every Gaussian
 /// observation defines a level, so there are none; when the data still carries
 /// discrete-state records, none of them is on an endpoint that reads the block through
-/// its implicit index ([`LevelBlockDecl::record_cmts`]), and the cause is the expression,
-/// not the data (#2623). An explicit `NAME[COLUMN]` read is named as the likely cause.
+/// its implicit index ([`LevelBlockDecl::record_cmts`]) (#2623). Why depends on whether
+/// any expression reads the block bare ([`LevelBlockDecl::read_bare`]): if none does,
+/// the expression is the cause; if one does, its reader defines no level on this data —
+/// a level-defining endpoint with no records here, or only a Gaussian prediction or a
+/// CTMM generator. An explicit `NAME[COLUMN]` read is named either way.
 fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     let name = decl.name();
     let head = format!("theta {name}[{}]", decl.columns().join(", "));
@@ -1407,9 +1410,29 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     let mut message = format!(
         "{head}: the block has no levels. The data carries no Gaussian observation rows, and \
          none of its discrete-state records is on an endpoint whose expression reads the block \
-         through its implicit index. Check the expression that reads it: a data-driven block \
-         is read bare, as `{name}`; its index is implicit."
+         through its implicit index."
     );
+    if !decl.read_bare {
+        message.push_str(&format!(
+            " Check the expression that reads it: a data-driven block is read bare, as \
+             `{name}`; its index is implicit."
+        ));
+    } else if !decl.record_cmts.is_empty() {
+        let cmts: Vec<String> = decl.record_cmts.iter().map(|c| c.to_string()).collect();
+        message.push_str(&format!(
+            " The block is read bare by an endpoint whose records define levels (CMT {}), but \
+             the data has no record there.",
+            cmts.join(", ")
+        ));
+    } else {
+        message.push_str(
+            " The block is read bare, but only by a Gaussian prediction or a `[markov_model]` \
+             CTMM generator, and neither defines a level on this data: it has no Gaussian rows, \
+             and a CTMM generator is built once per subject from the baseline, so its records \
+             define none. Read the block in a `[binary_model]` predictor or a DTMM \
+             `[markov_model]` transition.",
+        );
+    }
     if !decl.keyed_reads.is_empty() {
         let reads: Vec<String> = decl
             .keyed_reads
