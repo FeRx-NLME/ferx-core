@@ -130,8 +130,8 @@ const EXACT_PHI_OFV: [(&str, f64); 2] = [
 const EXACT_OFV: f64 = 1e-10;
 
 /// |ΔOFV| bound against NONMEM. **NONMEM's `PHI` is an approximation**: tabulated at known
-/// points (`probit_phi_probe.ctl`, `results/probit_phi_probe.tab`) it is off by 1e-8 to 3e-7
-/// relative over |x| ≤ 2, 2.3e-6 at −2.5, 5e-5 at −3 and 1e-2 at −8, against `erfc`. That,
+/// points (`probit_phi_probe.ctl`, `results/probit_phi_probe.tab`) it is off by 1e-8 to 3e-6
+/// relative over |x| ≤ 2 (3.1e-6 at −2), 2.3e-6 at −2.5, 5e-5 at −3 and 1e-2 at −8, against `erfc`. That,
 /// not ferx, is the realised gap: ferx −2.13e-6 at NONMEM's optimum and +5.2e-6 low at the
 /// tail point (`probit_b1_tail`, where most records sit near `Φ = 3e-3`), and the exact-`Φ`
 /// reference shows the same two gaps to 1e-10. The bound keeps ~4× headroom over the larger;

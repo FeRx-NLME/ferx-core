@@ -13,7 +13,7 @@ use crate::sens::num::PkNum;
 /// 1 / sqrt(2)
 const INV_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// 1 / sqrt(2*pi)
-const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
+pub(crate) const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 /// Smallest probability retained before taking `ln`. Prevents `-inf` contamination
 /// of the likelihood when a BLOQ observation lies many SDs above the prediction.
 const MIN_PROB: f64 = 1e-300;
@@ -225,6 +225,24 @@ pub(crate) fn mills_excess<T: PkNum>(t: T) -> T {
         f = t + T::from_f64(k as f64) / f;
     }
     T::from_f64(1.0) / f
+}
+
+/// `Φ(x)` accurate in both tails and defined at `±∞` (#2603): the `pnorm` expression function
+/// and the probit link's `P(Y = 1)`. [`normal_cdf`] (incomplete-gamma form, no cancellation in
+/// either tail) down to `x = −37`; below it, `φ(x)/(t + a)` with `t = −x` and `a` the Mills
+/// continued fraction ([`mills_excess`]), so the value keeps its digits into the subnormals and
+/// reaches `0` only when `Φ` itself is below them. Above `x = 38`, `1`: `Φ` rounds to `1` from
+/// about `8.3`, and [`normal_cdf`] is `NaN` at `±∞`, which this maps to `1` / `0`. `NaN`
+/// stays `NaN`.
+pub(crate) fn pnorm(x: f64) -> f64 {
+    if x < -37.0 {
+        let t = -x;
+        (-0.5 * t * t).exp() * INV_SQRT_2PI / (t + mills_excess(t))
+    } else if x > 38.0 {
+        1.0
+    } else {
+        normal_cdf(x)
+    }
 }
 
 /// Inverse Mills ratio `h = φ(z)/Φ(z)`, evaluated through logs (via

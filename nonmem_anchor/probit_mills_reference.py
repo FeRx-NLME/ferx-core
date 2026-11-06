@@ -50,7 +50,9 @@ def jet(x):
         for k in range(4000, 0, -1):
             f = t + k / f
         q = phi_pdf(t) / f
-        val = q + q * q / 2 + q ** 3 / 3  # -log(1 - q)
+        # -log(1 - q): exact at 80 digits while 1 - q does not round to 1 (q above ~1e-70);
+        # below that the two-term series is exact to q^3 ~ 1e-210 relative (review r1 #3).
+        val = -(1 - q).ln() if q > D(10) ** -70 else q + q * q / 2
     else:
         val = -Phi(x).ln()
     return [val, -m, -m1, -m2, -m3]
@@ -58,7 +60,7 @@ def jet(x):
 if __name__ == "__main__":
     # FD self-check of the recursion at a few points.
     h = D(10) ** -20
-    for x in ["-3.5", "0.3", "2.5", "-12"]:
+    for x in ["-3.5", "0.3", "2.5", "-12", "3.01", "3.5", "4.5"]:
         j = jet(x)
         for k in range(4):
             fd = (jet(D(x) + h)[k] - jet(D(x) - h)[k]) / (2 * h)

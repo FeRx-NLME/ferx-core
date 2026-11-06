@@ -5586,10 +5586,11 @@ fn the_probit_binary_term_is_exact_on_every_adjoint_route() {
         eprintln!("probit {what}: {gap:.2e}");
         assert!(gap.is_finite(), "{what}: {gap}");
     }
-    // Measured (macOS arm64): every gradient 1.9e-11, every R-matrix 3.8e-11 — the oracles'
-    // floor. The bounds are this file's shared ones for these oracles.
+    // Measured, macOS arm64 and Linux aarch64 alike: every gradient 1.9e-11, every R-matrix
+    // 3.8e-11 — the oracles' floor. 1e-9 keeps 26–50× headroom over it (review r1 #6); the
+    // file's shared bounds (5e-7, 1e-5) would pass a 1e-4 relative error in `g‴` / `g⁗`.
     for (what, gap) in &gaps {
-        let bound = if what.starts_with("cov") { 1e-5 } else { 5e-7 };
+        let bound = 1e-9;
         assert!(*gap < bound, "{what}: {gap:.2e}");
     }
 }

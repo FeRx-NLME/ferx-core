@@ -68,9 +68,9 @@ block with `link = probit` and a `logit =` predictor (or the other way round) is
 and so is a block that gives both keys. `cloglog` is not available.
 
 The data term is the same Bernoulli likelihood, computed as `−log Φ(s·η_lp)` with
-`s = +1` for `DV = 1` and `−1` for `DV = 0`. It is evaluated in log space and never forms
-`Φ` itself, so a record far in either tail (an event at `η_lp = −40`, say) contributes its
-exact `≈ η_lp²/2` rather than `log(0)`. The gradient, the η-Hessian and the covariance
+`s = +1` for `DV = 1` and `−1` for `DV = 0`. It is evaluated in log space, and in the lower tail (where `Φ`
+would underflow) it never forms `Φ` at all, so a record far in either tail (an event at
+`η_lp = −40`, say) contributes its exact `≈ η_lp²/2` rather than `log(0)`. The gradient, the η-Hessian and the covariance
 step's derivatives are exact, as under logit.
 
 The probit link is anchored against NONMEM `METHOD=COND LAPLACE LIKE` with `P = PHI(LP)`

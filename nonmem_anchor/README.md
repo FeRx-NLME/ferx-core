@@ -1559,8 +1559,8 @@ but the tail point's exact-`Φ` gap (2.3e-12 / 2.7e-12).
 **The ferx–NONMEM gap is NONMEM's `PHI`.** The same `laplace_b1_check.py` reproduces the
 logit twin A-B1 to −1.41e-9, so it computes NONMEM's objective; with an exact `Φ` it lands
 on ferx, not on NONMEM. `probit_phi_probe.ctl` tabulates `PHI(X)` at 25 points
-(`results/probit_phi_probe.tab`): against `erfc` it is off by 1e-8 to 3e-7 relative for
-|x| ≤ 2, 2.3e-6 at −2.5, 5e-5 at −3, 4.7e-4 at −4 and 1.0e-2 at −8. So the anchor holds ferx
+(`results/probit_phi_probe.tab`): against `erfc` it is off by 1e-8 to 3e-6 relative for
+|x| ≤ 2 (3.1e-6 at −2), 2.3e-6 at −2.5, 5e-5 at −3, 4.7e-4 at −4 and 1.0e-2 at −8. So the anchor holds ferx
 to the exact-`Φ` objective at 1e-10 and to NONMEM at 2e-5, with 4× headroom over the
 larger measured gap. Scoring the same point under the logit link moves the objective by
 37.7, which neither bound could miss. A NONMEM probit model whose predictor reaches the

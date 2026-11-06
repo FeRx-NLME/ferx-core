@@ -55,7 +55,8 @@ fn inv_logit(x: f64) -> f64 {
 ///
 /// Under the probit link (#2603) the record term is `−log Φ(s·lp)` with `s = 2y − 1`, by
 /// `Φ(−x) = 1 − Φ(x)`: one function of `x = s·lp` for both outcomes, lifted from
-/// [`neg_log_normal_cdf_jet`], whose value and derivatives never form `Φ` itself.
+/// [`neg_log_normal_cdf_jet`], whose value and derivatives never form `Φ` in the lower tail
+/// (below `x = −2`), where it would underflow.
 #[inline]
 fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) -> T {
     match link {
@@ -284,7 +285,7 @@ pub(crate) fn binary_data_term(
 fn binary_prob(link: LinkFn, lp: f64) -> f64 {
     match link {
         LinkFn::Logit => inv_logit(lp),
-        LinkFn::Probit => crate::stats::special::normal_cdf(lp),
+        LinkFn::Probit => crate::stats::special::pnorm(lp),
     }
 }
 
@@ -599,7 +600,8 @@ pub fn simulate_binary<R: rand::Rng>(
             warnings.push(format!(
                 "[binary_model] cmt = {cmt}: subject {} has {n_nonfinite} record(s) whose linear \
                  predictor evaluated to NaN — those rows were skipped and carry no simulated \
-                 outcome. Check the `logit` expression and the subject's covariates.",
+                 outcome. Check the linear predictor (`logit =` / `probit =`) and the subject's \
+                 covariates.",
                 subject.id
             ));
         }

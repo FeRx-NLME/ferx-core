@@ -11,7 +11,34 @@ use crate::sens::taylor::Taylor;
 // The x = 0 row's value and second derivative are `ln 2` and `2/π` exactly (−log Φ(0) = ln 2,
 // g″(0) = 2/π), spelled as the constants; every other entry keeps the reference's 21 digits.
 #[allow(clippy::excessive_precision)]
-const REFERENCE: [[f64; 6]; 23] = [
+const REFERENCE: [[f64; 6]; 26] = [
+    // Review r1 #2: between the CF switch at −2 and the centre, so moving the switch to −1
+    // (where depth 160 is 1.4e-5 off on the fourth order) fails here and not only at Tier 2.
+    [
+        -1.5,
+        2.70594440082388976165e+00,
+        -1.93867716662254307991e+00,
+        8.50453406449797277844e-01,
+        -8.31519244239271315688e-02,
+        -5.66832319685752553107e-02,
+    ],
+    [
+        -1.2,
+        2.16221750604373941229e+00,
+        -1.68755202486518562921e+00,
+        8.22769406788365298411e-01,
+        -1.02057043834442986996e-01,
+        -6.96551307351665482948e-02,
+    ],
+    // Review r1 #3: the upper-tail value branch, which the reference now computes exactly.
+    [
+        3.5,
+        2.32656141376804553606e-04,
+        -8.72885753654735951565e-04,
+        3.05586206733050955858e-03,
+        -9.82796631892945971032e-03,
+        2.83219919511155764080e-02,
+    ],
     [
         -100.0,
         5.00552420869420529925e+03,
@@ -166,7 +193,7 @@ const REFERENCE: [[f64; 6]; 23] = [
     ],
     [
         4.0,
-        3.16717433774890095373e-05,
+        3.16717433774892670353e-05,
         -1.33834464468575138965e-04,
         5.35355769538180194418e-04,
         -2.00773191178957831349e-03,
@@ -343,4 +370,119 @@ fn probit_sampler_probability_agrees_with_likelihood() {
             assert!((p - binary_prob(LinkFn::Logit, lp)).abs() > 1e-3, "lp {lp}");
         }
     }
+}
+
+/// Review r1 #1: a probit predictor that overflows to `±∞` is a degenerate `p = 1 / 0`, as it
+/// is under logit — simulated as state 1 / 0 with `ipred` 1 / 0, predicted as `[0, 1]` /
+/// `[1, 0]`, never `NaN`. Before the fix `binary_prob` called `normal_cdf`, which is `NaN` at
+/// `±∞`, so every record simulated `ipred NaN, state 0` with no warning. The logit twin of the
+/// same model is the control: it always gave the degenerate draw.
+#[test]
+fn an_overflowing_probit_predictor_is_a_degenerate_draw_not_nan() {
+    use crate::parser::model_parser::parse_model_string;
+    assert_eq!(binary_prob(LinkFn::Probit, f64::INFINITY), 1.0);
+    assert_eq!(binary_prob(LinkFn::Probit, f64::NEG_INFINITY), 0.0);
+    assert!(binary_prob(LinkFn::Probit, f64::NAN).is_nan());
+    let rec = |time: f64, state: usize| ObsRecord::DiscreteState {
+        time,
+        raw_time: time,
+        state,
+        cmt: 3,
+    };
+    let subject = Subject {
+        id: "1".into(),
+        obs_records: vec![rec(0.0, 1), rec(1.0, 0)],
+        ..Default::default()
+    };
+    for key in ["probit", "logit"] {
+        let model = parse_model_string(&format!(
+            "[parameters]\n  theta TH0(1.0, -10.0, 10.0)\n[binary_model]\n  cmt = 3\n  \
+             {key} = TH0 * 1e200 * 1e200\n"
+        ))
+        .unwrap();
+        for (th0, want) in [(1.0, 1usize), (-1.0, 0usize)] {
+            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(2603);
+            let (mut sims, mut warnings) = (Vec::new(), Vec::new());
+            simulate_binary(
+                &model,
+                &subject,
+                &[th0],
+                &[],
+                0,
+                0,
+                &mut rng,
+                &mut sims,
+                &mut warnings,
+            );
+            assert_eq!(sims.len(), 2, "{key} TH0 {th0}");
+            assert!(warnings.is_empty(), "{key} TH0 {th0}: {warnings:?}");
+            for x in &sims {
+                assert_eq!(x.ipred, want as f64, "{key} TH0 {th0}: ipred {}", x.ipred);
+                assert!(
+                    matches!(x.outcome, crate::types::SimOutcome::Category { state } if state == want),
+                    "{key} TH0 {th0}: {:?}",
+                    x.outcome
+                );
+            }
+            let mut preds = Vec::new();
+            predict_binary(&model, &subject, &[th0], &[], &mut preds);
+            assert_eq!(preds.len(), 2, "{key} TH0 {th0}");
+            for p in &preds {
+                let Prediction::CatProbs { probs } = &p.prediction else {
+                    panic!("binary prediction");
+                };
+                assert_eq!(probs[want], 1.0, "{key} TH0 {th0}: {probs:?}");
+                assert_eq!(probs[1 - want], 0.0, "{key} TH0 {th0}: {probs:?}");
+            }
+        }
+    }
+}
+
+/// Review r1 #5: a `NaN` probit predictor skips its records with a warning that names the
+/// predictor by both keys, not by a `logit` key the block does not have.
+#[test]
+fn the_nan_predictor_warning_names_either_key() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+        "[parameters]\n  theta TH0(1.0, -10.0, 10.0)\n[binary_model]\n  cmt = 3\n  \
+         probit = (1e200 * 1e200) * 0 * TH0\n",
+    )
+    .unwrap();
+    let subject = Subject {
+        id: "7".into(),
+        obs_records: vec![ObsRecord::DiscreteState {
+            time: 0.0,
+            raw_time: 0.0,
+            state: 1,
+            cmt: 3,
+        }],
+        ..Default::default()
+    };
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(2603);
+    let (mut sims, mut warnings) = (Vec::new(), Vec::new());
+    simulate_binary(
+        &model,
+        &subject,
+        &[1.0],
+        &[],
+        0,
+        0,
+        &mut rng,
+        &mut sims,
+        &mut warnings,
+    );
+    assert!(sims.is_empty());
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let w = &warnings[0];
+    assert!(
+        w.contains("subject 7 has 1 record(s) whose linear predictor evaluated to NaN"),
+        "{w}"
+    );
+    assert!(
+        w.contains(
+            "Check the linear predictor (`logit =` / `probit =`) and the subject's covariates."
+        ),
+        "{w}"
+    );
+    assert!(!w.contains("the `logit` expression"), "{w}");
 }

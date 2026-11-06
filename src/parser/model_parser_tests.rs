@@ -18232,46 +18232,52 @@ fn pnorm_value_matches_reference_in_both_tails() {
         (8.0, 9.99999999999999334e-01),
     ];
     for (x, want) in reference {
-        let got = pnorm_value(x);
+        let got = crate::stats::special::pnorm(x);
         let ast = eval_at(&unary("pnorm", lit(x)), &[], &[], &[], &[]);
         assert_eq!(
             got.to_bits(),
             ast.to_bits(),
-            "x {x}: eval_expr is pnorm_value"
+            "x {x}: eval_expr is special::pnorm"
         );
         assert!(got.is_finite(), "x {x}: {got}");
         let rel = ((got - want) / want).abs();
         assert!(rel < 1e-12, "x {x}: {got} vs {want} (rel {rel:.2e})");
     }
     // Continuous across the switch at −37: the two sides differ by Φ′/Φ·Δ ≈ 37·Δ.
-    let (lo, hi) = (pnorm_value(-37.0 - 1e-9), pnorm_value(-37.0 + 1e-9));
+    let (lo, hi) = (
+        crate::stats::special::pnorm(-37.0 - 1e-9),
+        crate::stats::special::pnorm(-37.0 + 1e-9),
+    );
     assert!(lo > 0.0 && hi > lo, "{lo} {hi}");
     assert!((hi / lo - 1.0).abs() < 1e-7, "jump at −37: {lo} vs {hi}");
     // Below −37.5: positive, non-increasing to 0, through the subnormals.
-    assert!(pnorm_value(-38.3) > 0.0, "Φ(−38.3) is a subnormal, not 0");
-    assert!(pnorm_value(-38.3) < f64::MIN_POSITIVE);
-    let mut prev = pnorm_value(-36.0);
+    assert!(
+        crate::stats::special::pnorm(-38.3) > 0.0,
+        "Φ(−38.3) is a subnormal, not 0"
+    );
+    assert!(crate::stats::special::pnorm(-38.3) < f64::MIN_POSITIVE);
+    let mut prev = crate::stats::special::pnorm(-36.0);
     for i in 1..=400 {
         let x = -36.0 - 0.01 * i as f64;
-        let v = pnorm_value(x);
+        let v = crate::stats::special::pnorm(x);
         assert!(
             v.is_finite() && v >= 0.0 && v <= prev,
             "x {x}: {v} after {prev}"
         );
         prev = v;
     }
-    assert_eq!(pnorm_value(-40.0), 0.0);
-    assert!(pnorm_value(f64::NAN).is_nan());
-    assert_eq!(pnorm_value(f64::INFINITY), 1.0);
-    assert_eq!(pnorm_value(f64::NEG_INFINITY), 0.0);
+    assert_eq!(crate::stats::special::pnorm(-40.0), 0.0);
+    assert!(crate::stats::special::pnorm(f64::NAN).is_nan());
+    assert_eq!(crate::stats::special::pnorm(f64::INFINITY), 1.0);
+    assert_eq!(crate::stats::special::pnorm(f64::NEG_INFINITY), 0.0);
     // The upper tail rounds to 1 and never passes it.
-    assert_eq!(pnorm_value(9.0), 1.0);
-    assert!(pnorm_value(7.0) < 1.0);
+    assert_eq!(crate::stats::special::pnorm(9.0), 1.0);
+    assert!(crate::stats::special::pnorm(7.0) < 1.0);
 }
 
 /// `pnorm`'s jet through fourth order on a Taylor polynomial, against closed forms `φ`,
 /// `−xφ`, `(x² − 1)φ`, `(3x − x³)φ` and against central differences of the `f64` value, at
-/// points across both tails. The value is `pnorm_value` bit for bit. Mutations: any one
+/// points across both tails. The value is `special::pnorm` bit for bit. Mutations: any one
 /// lifted order changed (each of the four is compared).
 #[test]
 fn pnorm_jet_carries_four_exact_orders() {
@@ -18280,10 +18286,14 @@ fn pnorm_jet_carries_four_exact_orders() {
     let fact = [1.0, 1.0, 2.0, 6.0, 24.0];
     for x in [-37.5, -8.0, -2.2, -0.6, 0.0, 0.3, 1.7, 5.0] {
         let t = pnorm_g(T4::seed(x, 0));
-        assert_eq!(t.c[0].to_bits(), pnorm_value(x).to_bits(), "x {x}");
+        assert_eq!(
+            t.c[0].to_bits(),
+            crate::stats::special::pnorm(x).to_bits(),
+            "x {x}"
+        );
         let phi = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
         let want = [
-            pnorm_value(x),
+            crate::stats::special::pnorm(x),
             phi,
             -x * phi,
             (x * x - 1.0) * phi,
@@ -18303,17 +18313,32 @@ fn pnorm_jet_carries_four_exact_orders() {
     for x in [-2.2, -0.6, 0.0, 0.3, 1.7] {
         let t = pnorm_g(T4::seed(x, 0));
         let h = 1e-5;
-        let fd = (pnorm_value(x + h) - pnorm_value(x - h)) / (2.0 * h);
+        let fd =
+            (crate::stats::special::pnorm(x + h) - crate::stats::special::pnorm(x - h)) / (2.0 * h);
         assert!(fd.is_finite());
         assert!((t.c[1] - fd).abs() < 1e-9, "x {x}: {} vs FD {fd}", t.c[1]);
         let hh = 1e-4;
-        let fd2 = (pnorm_value(x + hh) - 2.0 * pnorm_value(x) + pnorm_value(x - hh)) / (hh * hh);
+        let fd2 = (crate::stats::special::pnorm(x + hh) - 2.0 * crate::stats::special::pnorm(x)
+            + crate::stats::special::pnorm(x - hh))
+            / (hh * hh);
         assert!(fd2.is_finite());
         assert!(
             (2.0 * t.c[2] - fd2).abs() < 1e-6,
             "x {x}: {} vs FD {fd2}",
             2.0 * t.c[2]
         );
+    }
+    // Review r1 #10: where `φ` is 0 the jet is exactly zero, not `0 · ∞ = NaN` from `x²`
+    // overflowing (±1e200) or from `±∞` itself, and the value is still the tail's 0 / 1.
+    for (x, value) in [
+        (1e200, 1.0),
+        (-1e200, 0.0),
+        (f64::INFINITY, 1.0),
+        (f64::NEG_INFINITY, 0.0),
+    ] {
+        let t = pnorm_g(T4::seed(x, 0));
+        assert_eq!(t.c[0], value, "x {x}");
+        assert_eq!(t.c[1..], [0.0; 4], "x {x}: {:?}", t.c);
     }
 }
 
@@ -38608,6 +38633,18 @@ fn binary_model_link_cells() {
         "{e}"
     );
     assert!(!e.contains("but the predictor is written"), "{e}");
+    // One key repeated (review r1 #8): last-wins before #2603, refused now, naming the key once.
+    for key in ["logit", "probit"] {
+        let e = err(&format!("  {key} = TH0\n  {key} = 2 * TH0"));
+        assert!(e.contains(&format!("`{key}` is given twice")), "{e}");
+        assert!(
+            e.contains(
+                "a block has one linear predictor, written under the key that names its link"
+            ),
+            "{e}"
+        );
+        assert!(!e.contains("the predictor is given twice"), "{e}");
+    }
     // An unknown link lists the two that exist.
     let e = err("  logit = TH0\n  link = cloglog");
     assert!(e.contains("link `cloglog` is not supported"), "{e}");

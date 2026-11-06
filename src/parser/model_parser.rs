@@ -9847,11 +9847,19 @@ fn parse_binary_model_block(
                     LinkFn::Probit
                 };
                 if let Some((prev, _)) = predictor {
+                    // Before #2603 a repeated `logit =` was last-wins, silently; it is refused
+                    // now, as two predictors under different keys are (review r1 #8).
+                    let given = if prev == this {
+                        format!("`{key}` is given twice")
+                    } else {
+                        format!(
+                            "the predictor is given twice (`{}` and `{key}`)",
+                            key_of(prev)
+                        )
+                    };
                     return Err(format!(
-                        "[binary_model]: the predictor is given twice (`{}` and `{key}`) — a \
-                         block has one linear predictor, written under the key that names its \
-                         link",
-                        key_of(prev)
+                        "[binary_model]: {given} — a block has one linear predictor, written \
+                         under the key that names its link"
                     ));
                 }
                 predictor = Some((this, parse_scalar_expression(value, ctx)?));
@@ -28504,7 +28512,7 @@ fn eval_expr<E: EvalEnv>(
                 "softplus" => crate::nn::Activation::Softplus.apply(v),
                 "sin" => v.sin(),
                 "cos" => v.cos(),
-                "pnorm" => pnorm_value(v),
+                "pnorm" => crate::stats::special::pnorm(v),
                 // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
                 _ => unreachable!("{UNARY_FN_ARM_MISSING} (eval_expr, `{name}`)"),
             }
@@ -28684,7 +28692,7 @@ enum Op {
     /// evaluator, the dual jets lifted from the same values.
     Sin,
     Cos,
-    /// `pnorm(x)`, the standard-normal CDF `Φ(x)` (#2603): [`pnorm_value`] on every
+    /// `pnorm(x)`, the standard-normal CDF `Φ(x)` (#2603): [`pnorm`](crate::stats::special::pnorm) on every
     /// evaluator, the dual jets lifted from the same value (`pnorm_g`).
     Pnorm,
     CmpLt,
@@ -30096,7 +30104,7 @@ fn eval_bytecode_lanes<L: Lane>(
             Op::Softplus => unary!(|v| crate::nn::Activation::Softplus.apply(v)),
             Op::Sin => unary!(|v| v.sin()),
             Op::Cos => unary!(|v| v.cos()),
-            Op::Pnorm => unary!(pnorm_value),
+            Op::Pnorm => unary!(crate::stats::special::pnorm),
             Op::CmpLt => binary!(|l, r| bool01(l < r)),
             Op::CmpLe => binary!(|l, r| bool01(l <= r)),
             Op::CmpGt => binary!(|l, r| bool01(l > r)),
@@ -30191,44 +30199,27 @@ fn cos_g<T: crate::sens::num::PkNum>(x: T) -> T {
     x.lift4(c, -s, -c, s, c)
 }
 
-/// `pnorm(x) = Φ(x)` on `f64` (#2603). [`normal_cdf`](crate::stats::special::normal_cdf)
-/// (incomplete-gamma form, no cancellation in either tail) down to `x = −37`; below it,
-/// `φ(x)/(t + a)` with `t = −x` and `a` the Mills continued fraction
-/// ([`mills_excess`](crate::stats::special::mills_excess)), so the value keeps its digits
-/// into the subnormals and reaches `0` only when `Φ` itself is below them. The upper tail
-/// rounds to `1`, which is `Φ` to the last ulp, and `+∞` gives `1`. `NaN` stays `NaN`.
-#[inline]
-pub(crate) fn pnorm_value(x: f64) -> f64 {
-    if x < -37.0 {
-        let t = -x;
-        (-0.5 * t * t).exp() * PNORM_INV_SQRT_2PI / (t + crate::stats::special::mills_excess(t))
-    } else if x > 38.0 {
-        // `normal_cdf` is `1` long before here (from x ≈ 8.3) but `NaN` at `+∞`.
-        1.0
-    } else {
-        crate::stats::special::normal_cdf(x)
-    }
-}
-
-/// `pnorm(x)` on any number type (#2603): the value is [`pnorm_value`] bit for bit, and the
-/// jet carries `Φ⁽ⁿ⁾` through n = 4 — `φ`, `−xφ`, `(x² − 1)φ`, `(3x − x³)φ` — which the
-/// covariance step's nested dual reads. `φ` underflows to `0` past `|x| ≈ 38.6`, and so does
-/// every derivative.
+/// `pnorm(x)` on any number type (#2603): the value is
+/// [`pnorm`](crate::stats::special::pnorm) bit for bit, and the jet carries `Φ⁽ⁿ⁾` through
+/// n = 4 — `φ`, `−xφ`, `(x² − 1)φ`, `(3x − x³)φ` — which the covariance step's nested dual
+/// reads. Where `φ` is `0` (past `|x| ≈ 38.6`, and at `±∞`) every derivative is `0`, returned
+/// as such: the polynomial factors would make `0 · ∞ = NaN` once `x²` overflows (review r1 #10).
 #[inline]
 fn pnorm_g<T: crate::sens::num::PkNum>(x: T) -> T {
+    use crate::stats::special::{pnorm, INV_SQRT_2PI};
     let v = x.val();
-    let d = (-0.5 * v * v).exp() * PNORM_INV_SQRT_2PI;
+    let d = (-0.5 * v * v).exp() * INV_SQRT_2PI;
+    if d == 0.0 {
+        return x.lift4(pnorm(v), 0.0, 0.0, 0.0, 0.0);
+    }
     x.lift4(
-        pnorm_value(v),
+        pnorm(v),
         d,
         -v * d,
         (v * v - 1.0) * d,
         (3.0 * v - v * v * v) * d,
     )
 }
-
-/// `1/√(2π)`, the standard-normal density's constant.
-const PNORM_INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 /// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
 /// `TIME`, whose jet is zero).
@@ -34304,7 +34295,7 @@ fn differentiate_with_chain(
                     // φ(a) · a',   φ(a) = exp(−a²/2) / √(2π)
                     let a = (**arg).clone();
                     let phi = mul(
-                        Expression::Literal(PNORM_INV_SQRT_2PI),
+                        Expression::Literal(crate::stats::special::INV_SQRT_2PI),
                         Expression::UnaryFn(
                             "exp".into(),
                             Box::new(mul(Expression::Literal(-0.5), mul(a.clone(), a))),
