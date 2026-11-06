@@ -2256,6 +2256,10 @@ pub(crate) struct InnerRecording {
     pub(crate) solve_tols: Vec<(String, f64)>,
     /// Every cold multi-start entered (non-IOV solves): its subject.
     pub(crate) multistarts: Vec<String>,
+    /// The pass each `multistarts` entry ran in, parallel to it (#2691 CI trace). `None` where
+    /// no pass index was set. Pushed on the recording thread with the entry, so complete when
+    /// `multistarts` is.
+    pub(crate) multistart_passes: Vec<Option<usize>>,
     pub(crate) passes: Vec<PassRecord>,
     /// Every warm-start prediction the outer loop handed a pass (#2549).
     pub(crate) predictions: Vec<PredictionRecord>,
@@ -3145,7 +3149,11 @@ fn find_ebe_solve(
         #[cfg(test)]
         {
             EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
-            with_recording(|r| r.multistarts.push(subject.id.clone()));
+            with_recording(|r| {
+                r.multistarts.push(subject.id.clone());
+                let p = r.current_pass;
+                r.multistart_passes.push(p);
+            });
         }
         // ── Flip-flop twin seed (`[fit_options] inner_twin_seed`, #2095) ────────
         // The commonest off-axis mode the screen below exists for has a closed form: on a

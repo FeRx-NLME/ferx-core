@@ -10753,32 +10753,62 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
              (id, solves, multi-starts) = {counts:?}. Every subject must record the same \
              number of solves; `record_inner_solves` keeps only the recording thread's."
         );
+        // Per pass, the multi-starts of each subject (#2691 CI trace): the property is
+        // per-pass — a solved zero mode is not multi-started where a nonzero one is taken as
+        // warm — and counting over the whole fit hides which pass broke it. `multistart_passes`
+        // is parallel to `multistarts`.
+        let per_pass = |id: &str| -> std::collections::BTreeMap<Option<usize>, usize> {
+            let mut m = std::collections::BTreeMap::new();
+            for (s, p) in rec.multistarts.iter().zip(&rec.multistart_passes) {
+                if s == id {
+                    *m.entry(*p).or_insert(0) += 1;
+                }
+            }
+            m
+        };
+        let empty_by_pass = per_pass("EMPTY");
+        let informed_by_pass = per_pass(&informed);
+        let offending: Vec<(Option<usize>, usize, usize)> = empty_by_pass
+            .keys()
+            .map(|p| {
+                (
+                    *p,
+                    empty_by_pass.get(p).copied().unwrap_or(0),
+                    informed_by_pass.get(p).copied().unwrap_or(0),
+                )
+            })
+            .filter(|&(_, e, i)| e > i)
+            .collect();
         (
             start,
             ms("EMPTY"),
             ms(&informed),
             solves_of(&informed),
             counts,
+            offending,
         )
     };
 
-    let (start, ms_empty, ms_informed, _, counts) = fit(1);
+    let (start, _ms_empty, ms_informed, _, counts, offending) = fit(1);
     assert!(
         !start.guard_rejected && start.warm_rescored_from.is_some_and(|n| n > 0),
         "fixture: the cold start must be rejected and its warm re-solve accepted: {start:?}"
     );
     assert!(ms_informed >= 1, "fixture must reach the multi-start gate");
-    // `<=`, not `==`: the property is that the exactly-zero mode is never multi-started where
-    // an informed subject's nonzero mode is taken as warm. Fewer is the fix working harder,
-    // and cannot be the regression. Mutation A (the re-solve reads `Placeholder`) gives the
-    // empty subject one *more* than the informed one, which this still kills.
+    // Per pass, not over the whole fit: the property — the exactly-zero mode is never
+    // multi-started on a pass where an informed subject's nonzero mode is taken as warm — is a
+    // per-pass one, and a count over the fit mixes passes whose number differs by platform
+    // (#1688). `offending` is the passes where EMPTY exceeds the informed subject. Mutation A
+    // (the re-solve reads `Placeholder`) makes EMPTY cold on the re-solve pass, which lands
+    // there.
     assert!(
-        ms_empty <= ms_informed,
-        "accepted re-solve: the exactly-zero mode was multi-started as a cold start where the \
-         informed subject's was taken as warm: (id, solves, multi-starts) = {counts:?}"
+        offending.is_empty(),
+        "accepted re-solve: on (pass, EMPTY, informed) = {offending:?} the exactly-zero mode was \
+         multi-started as a cold start where the informed subject's was taken as warm; \
+         (id, solves, multi-starts) = {counts:?}"
     );
 
-    let (start, ms_empty, ms_informed, solves, counts) = fit(0);
+    let (start, _ms_empty, ms_informed, solves, counts, offending) = fit(0);
     let cold = InnerLoopStats {
         n_unconverged: start.n_unconverged,
         n_start_rejected: start.n_start_rejected,
@@ -10792,9 +10822,10 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
         "fixture: the start must earn the warm re-solve and stay rejected after it: {start:?}"
     );
     assert!(
-        ms_empty <= ms_informed,
-        "rejected re-solve: the exactly-zero mode was multi-started as a cold start where the \
-         informed subject's was taken as warm: (id, solves, multi-starts) = {counts:?}"
+        offending.is_empty(),
+        "rejected re-solve: on (pass, EMPTY, informed) = {offending:?} the exactly-zero mode was \
+         multi-started as a cold start where the informed subject's was taken as warm; \
+         (id, solves, multi-starts) = {counts:?}"
     );
     assert!(
         2 * ms_informed > solves,
