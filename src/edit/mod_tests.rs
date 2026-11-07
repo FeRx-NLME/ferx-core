@@ -2881,6 +2881,39 @@ fn a_parameter_nothing_reads_is_still_pruned() {
     }
 }
 
+/// The engine looks these names up among individual parameters only, so a θ, or
+/// a κ, spelled like a dose attribute dies with the last thing that read it.
+#[test]
+fn a_theta_or_kappa_named_like_a_dose_attribute_is_still_pruned() {
+    for (route, theta, kappa) in [
+        (ANALYTIC_ROUTE, "D1", "R1"),
+        (ODE_ROUTE, "D1", "R1"),
+        (ODE_ROUTE, "F1", "ALAG1"),
+        (ODE_ROUTE, "F", "ALAG"),
+        (TEMPLATE_ROUTE, "D1", "R1"),
+    ] {
+        let src = model_around(route, "UNUSED")
+            .render()
+            .replace("TVX", theta)
+            .replace("KAPPA_X", kappa);
+        let mut text = ModelText::parse(&src).unwrap();
+        drop_relation(&mut text);
+        let params = text.block_lines("parameters");
+        assert!(
+            !params
+                .iter()
+                .any(|l| l.starts_with(&format!("theta {theta}("))
+                    || l.starts_with(&format!("kappa {kappa} "))),
+            "`{theta}` or `{kappa}` survived under {route:?}: {params:?}"
+        );
+        // The control: the pruner reached them through `UNUSED`, and stopped.
+        assert!(
+            params.iter().any(|l| l.starts_with("theta TVKA(")),
+            "{params:?}"
+        );
+    }
+}
+
 #[test]
 fn an_analytic_f_the_pk_line_binds_survives_because_the_line_reads_it() {
     assert_survives("  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F1)", "F1");

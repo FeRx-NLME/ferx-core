@@ -1886,9 +1886,12 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
     // `D1` no `RATE=-2` record consults is kept too. That is the side to err on:
     // an edit that keeps an inert parameter leaves the count where the author put
     // it, and one that deletes a live `D1` makes every coded dose unfittable (#2789).
+    //
+    // Only an `[individual_parameters]` assignment can be one: a θ, ω or κ that
+    // happens to be called `D1` is not what the engine looks up.
     if let Some(route) = DoseRoute::of(text) {
         for d in &decls {
-            if route.reads_by_name(&d.name) {
+            if individual.contains(&d.span.start) && route.reads_by_name(&d.name) {
                 live.insert(d.name.clone());
             }
         }

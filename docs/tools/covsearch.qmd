@@ -83,8 +83,9 @@ when every remaining effect is. Forced effects and relations the base model
 already declared are never candidates for removal.
 
 A removal that fails to fit, or fails the strictness gate, tests nothing, and a
-failed candidate is offered again at the next step. If the last backward step
-still has failed candidates, those effects stay in the final model without
+failed candidate is offered again at the next step. If the last backward step,
+whether nothing was removable or `max_steps` was reached, still has failed
+candidates, those effects stay in the final model without
 having met `p_backward`. The search says so: the summary reads `Final model
 (backward elimination incomplete)`, the notes name the effects and the first
 failure, and `final.ferx` opens with the same note as a comment. The exit code

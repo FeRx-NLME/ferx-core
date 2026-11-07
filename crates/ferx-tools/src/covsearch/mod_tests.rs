@@ -709,6 +709,52 @@ fn a_failed_candidate_in_a_step_that_removes_something_is_retried_not_reported()
     assert!(result.backward_incomplete.is_none());
 }
 
+/// Adaptive scope reduction is the way past `max_steps`: at one step per phase,
+/// forward adds CL-WT and stashes V-WT, adaptive adds V-WT, and backward gets a
+/// single step for two effects. Removing CL-WT is taken there, so step 4, which
+/// would retry a failed V-WT, is never allowed.
+fn one_step_per_phase() -> (Script, Space, CovsearchOptions) {
+    let mut script = Script::new(&[
+        ("", 100.0),
+        ("CL-WT=power", 80.0),
+        ("V-WT=power", 99.0),
+        ("CL-WT=power;V-WT=power", 72.0),
+    ]);
+    script.ofv_by_id.insert("b3-CL-WT-power".into(), 74.0);
+    let options = CovsearchOptions {
+        adaptive_scope_reduction: true,
+        max_steps: Some(1),
+        ..CovsearchOptions::default()
+    };
+    (script, two_effects(), options)
+}
+
+#[test]
+fn a_failure_the_step_limit_stops_retrying_is_reported() {
+    let (mut script, space, options) = one_step_per_phase();
+    script.erroring.push("b3-V-WT-power".into());
+    let result = run(&script, space, &options);
+
+    assert!(result.step_rows(3).any(|r| r.selected));
+    assert_eq!(result.n_steps(), 3, "{:?}", result.steps);
+    assert_eq!(labels(&result.included), vec!["V-WT-power"]);
+    let note = result.backward_incomplete.as_deref().expect("a note");
+    assert!(
+        note.contains("1 of 2 candidates of backward step 3"),
+        "{note}"
+    );
+    assert!(note.contains("so V-WT-power stayed"), "{note}");
+    assert!(result.notes.iter().any(|n| n == note), "{:?}", result.notes);
+}
+
+#[test]
+fn a_step_limit_with_nothing_failed_is_not_incomplete() {
+    let (script, space, options) = one_step_per_phase();
+    let result = run(&script, space, &options);
+    assert_eq!(result.n_steps(), 3, "{:?}", result.steps);
+    assert!(result.backward_incomplete.is_none());
+}
+
 #[test]
 fn a_step_that_fails_after_an_earlier_removal_names_the_later_step() {
     let mut script = two_effect_script();

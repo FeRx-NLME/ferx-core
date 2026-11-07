@@ -929,6 +929,11 @@ impl Pass<'_> {
         notes: &mut Vec<String>,
     ) -> Result<Outcome, String> {
         let mut taken = 0usize;
+        // What the latest step left untested. A later step retries those
+        // effects and replaces this, so it only survives the step the phase
+        // ends on, whether that step selected nothing or `max_steps` allows no
+        // retry after it.
+        let mut incomplete = None;
         loop {
             let removable: Vec<Effect> = included
                 .iter()
@@ -936,7 +941,10 @@ impl Pass<'_> {
                 .map(|i| i.effect.clone())
                 .collect();
             if removable.is_empty() || !self.steps_left(taken) {
-                return Ok(Outcome::finished());
+                return Ok(Outcome {
+                    cancelled: false,
+                    incomplete,
+                });
             }
             *step += 1;
             let phase = Phase::Backward;
@@ -1007,18 +1015,14 @@ impl Pass<'_> {
                 phase,
                 selected,
             });
+            incomplete = incomplete_backward_note(*step, &step_rows, self.options.p_backward);
+            rows.extend(step_rows);
             let Some(i) = winner else {
-                // Only the last step can leave an effect untested: after a
-                // removal the next step retries everything that is left.
-                let incomplete =
-                    incomplete_backward_note(*step, &step_rows, self.options.p_backward);
-                rows.extend(step_rows);
                 return Ok(Outcome {
                     cancelled: false,
                     incomplete,
                 });
             };
-            rows.extend(step_rows);
             let effect = &removable[i];
             let result = report
                 .results
@@ -1040,12 +1044,12 @@ impl Pass<'_> {
     }
 }
 
-/// The note for a last backward step that left effects untested, or `None`
-/// when every removal was judged.
+/// The note for a backward step that left effects untested, or `None` when
+/// every removal was judged.
 ///
-/// Such a step selects nothing, which is also how a completed backward phase
-/// ends, so without this the two read the same: exit 0 and a `Final model`
-/// holding terms that never met `p_backward` (#2789).
+/// A phase that ends on such a step looks like one that completed, so without
+/// this the two read the same: exit 0 and a `Final model` holding terms that
+/// never met `p_backward` (#2789).
 fn incomplete_backward_note(step: usize, rows: &[StepRow], alpha: f64) -> Option<String> {
     let untested: Vec<&StepRow> = rows
         .iter()
