@@ -9896,7 +9896,7 @@ pub(crate) fn reconverged_fd_gradient(
         |xv: &[f64]| reconverged_probe_ofv(xv, init_params, model, population, &warm, options);
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
@@ -10201,7 +10201,7 @@ fn reporting_fd_gradient(
             raw
         }
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
@@ -10220,7 +10220,9 @@ fn reporting_fd_gradient(
 /// Coordinate `k` is stepped by [`fd_step`]`(1e-4, xₖ, floor[k])`, `floor` from
 /// [`fd_step_floors`]: `1e-4·(1 + |xₖ|)` on every coordinate but a small identity-packed θ,
 /// which is stepped relative to its declared magnitude rather than by an absolute `1e-4` in
-/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187).
+/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187). A
+/// `[covariate_nn]` weight is identity-packed too but keeps the unit floor, since its θ₀ is
+/// a draw rather than a declared magnitude (#2406).
 fn central_diff_packed(
     x: &[f64],
     fixed: &[bool],
@@ -10584,7 +10586,7 @@ pub(crate) fn subject_reconverged_fd_gradient(
             options.interaction,
         )
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
@@ -10639,7 +10641,7 @@ fn subject_reconverged_fd_gradient_iov(
                 .expect("IOV model (n_kappa > 0) has omega_iov"),
         )
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
