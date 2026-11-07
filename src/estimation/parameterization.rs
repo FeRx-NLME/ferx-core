@@ -75,8 +75,9 @@ pub(crate) fn theta_packing_jacobian(theta: f64, theta_lower: f64) -> f64 {
 ///
 /// A `[covariate_nn]` weight keeps `1` too (#2406). It is identity-packed, but its θ₀ is a
 /// Glorot draw (or the zero output init), not a magnitude anyone declared, and its sensitivity
-/// does not scale with it: on `two_cpt_oral_cov`'s CRCL/WT network a first-layer weight drawn
-/// at 1e-4 got a reconverged-FD gradient 5.5e-2 off under the `|θ₀|` floor and 1.3e-7 under 1.
+/// does not scale with it: on `two_cpt_oral_cov`'s CRCL/WT network a first-layer weight at
+/// 1e-4 gets a reconverged-FD gradient 6.4e-3 off the exact adjoint gradient under the `|θ₀|`
+/// floor and 1.1e-8 under 1 (`a_small_covariate_nn_weight_gets_its_exact_gradient_from_the_fd_route`).
 pub(crate) fn fd_step_floor(template: &ModelParameters, model: &CompiledModel, k: usize) -> f64 {
     fd_step_floor_of(
         template,
@@ -2411,7 +2412,7 @@ mod tests {
         assert_eq!(theta0_floor(&declared, &[], 4), 0.3);
     }
 
-    /// #2406: the three public-to-the-crate wrappers read the network's θ ranges from the
+    /// #2406: the four public-to-the-crate wrappers read the network's θ ranges from the
     /// model, not an empty list. On a parsed `[covariate_nn]` with a first-layer weight set to
     /// `1e-3`, every wrapper gives that weight floor 1, while `TVKA = 0.5` (outside the network)
     /// keeps `|θ₀|` on the θ-unit floor. A wrapper passing `&[]` gives the weight `1e-3`.
@@ -2465,8 +2466,8 @@ mod tests {
         assert_eq!(fd_theta_step_floor(&model, 1), 0.5);
         assert_eq!(fd_theta_step_floors(&model)[1], 0.5);
         // An identity-packed non-weight θ with 0 < |θ₀| < 1: the |θ₀| floor must apply to it
-        // but NOT to a weight. A mutant `fd_step_floor → 1.0` survives the weight assertion
-        // above but fails here (the non-weight gets 1.0 instead of its declared 0.3).
+        // but NOT to a weight. A wrapper returning 1.0 everywhere survives the weight
+        // assertions above but fails here (the non-weight gets 1.0 instead of its 0.3).
         let beta_src = "[parameters]
   theta BETA(0.3, -5, 5)
   omega ETA_CL ~ 0.1
@@ -2488,6 +2489,16 @@ mod tests {
             "BETA is identity-packed"
         );
         assert_eq!(fd_theta_step_floor(&plain, 0), 0.3, "non-weight |θ₀| floor");
+        assert_eq!(
+            fd_theta_step_floors(&plain)[0],
+            0.3,
+            "non-weight |θ₀| floor"
+        );
+        // The packed wrappers too: BETA is identity-packed, so its packed coordinate is the θ
+        // and takes the |θ₀| floor. Without these, `fd_step_floor → 1.0` survived the whole
+        // `ci,survival,nn` unit suite (#2665 self-review): every other assertion on it expects 1.
+        assert_eq!(fd_step_floor(&plain.default_params, &plain, 0), 0.3);
+        assert_eq!(fd_step_floors(&plain.default_params, &plain)[0], 0.3);
         // The same θ without the exemption — what a wrapper passing `&[]` would return.
         assert_eq!(theta0_floor(&model.default_params, &[], w), 1e-3);
     }

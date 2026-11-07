@@ -7477,6 +7477,115 @@ mod outer_fd_fallback {
         }
     }
 
+    /// #2406: the production reconverged-FD gradient of a `[covariate_nn]` weight declared
+    /// at `1e-4`, against the exact adjoint gradient at the same point and EBEs. Before
+    /// #2406 the weight took the `|θ₀|` floor, a step of about `1e-8` in its own units; it
+    /// now keeps the unit floor. `TVKA`, outside the network, is the control: the two
+    /// gradients must agree there too, or the comparison is in the wrong units.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn a_small_covariate_nn_weight_gets_its_exact_gradient_from_the_fd_route() {
+        let mut model = crate::parser::model_parser::parse_model_string(
+            "[parameters]
+  theta TVQ(6.0, 0.1, 50.0)
+  theta TVKA(0.5, 0.05, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma PROP ~ 0.1 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs     = [CRCL, WT]
+  center     = [90, 70]
+  scale      = [30, 15]
+  outputs    = [CL, V1, V2]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+  init       = [4.0, 40.0, 80.0]
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V1 = TYPICAL_PK.V1
+  Q  = TVQ
+  V2 = TYPICAL_PK.V2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+        )
+        .expect("model parses");
+        // The output layer's zero init leaves every first-layer weight's gradient at 0, so
+        // each weight gets a fixed non-zero value first; the one under test is then set to
+        // 1e-4, a first-layer weight drawn small.
+        let ranges = model.nn_weight_theta_ranges();
+        for i in ranges.iter().flat_map(|r| r.clone()) {
+            model.default_params.theta[i] = 0.3 * (1.7 * i as f64).sin();
+        }
+        let w = ranges.first().expect("the network has weights").start;
+        model.default_params.theta[w] = 1e-4;
+        let mut pop = crate::read_nonmem_csv(
+            std::path::Path::new("data/two_cpt_oral_cov.csv"),
+            None,
+            None,
+        )
+        .expect("data loads");
+        pop.subjects.truncate(8);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let params = &model.default_params;
+        let x = pack_params(params);
+        assert_eq!(
+            x[w], 1e-4,
+            "fixture: the weight is identity-packed at its θ₀"
+        );
+        let bounds = compute_bounds(params);
+        let (fd, exact) = crate::api::with_fit_scope(&opts, || {
+            let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+            let (ehs, _, _, kappas) =
+                run_inner_loop_warm(&model, &pop, params, 500, 1e-10, None, Some(&mu), 0, 0);
+            let fd =
+                reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, &opts);
+            let mut exact = vec![0.0; x.len()];
+            for (s, eh) in pop.subjects.iter().zip(&ehs) {
+                let g = crate::estimation::sens_outer_gradient::subject_packed_gradient(
+                    &model,
+                    s,
+                    params,
+                    &x,
+                    eh.as_slice(),
+                )
+                .expect("the adjoint serves every subject of this fixture");
+                // `subject_packed_gradient` is of the subject's −log L; the reconverged FD is of
+                // the OFV, −2 log L (the control coordinate pins the factor: both legs off by
+                // exactly 2 without it).
+                for (e, gi) in exact.iter_mut().zip(&g) {
+                    *e += 2.0 * gi;
+                }
+            }
+            (fd, exact)
+        })
+        .unwrap();
+        for (label, k) in [("weight", w), ("TVKA (control)", 1)] {
+            let (f, e) = (fd[k], exact[k]);
+            assert!(f.is_finite() && e.is_finite(), "{label}: fd {f} exact {e}");
+            assert!(
+                e.abs() > 1e-3,
+                "fixture: the {label} gradient is live ({e})"
+            );
+            let rel = (f - e).abs() / e.abs();
+            eprintln!("MEASURE #2406 {label}: fd {f:e} exact {e:e} rel {rel:e}");
+            // Measured (Linux x86_64): weight 1.1e-8, TVKA 4.7e-9; 1e-7 is 9× the weight's.
+            // Under the pre-#2406 |θ₀| floor the weight is 6.4e-3 off.
+            assert!(rel < 1e-7, "{label}: fd {f:e} vs exact {e:e}, rel {rel:e}");
+        }
+    }
+
     /// #2406: the resolution gate is entered only for a coordinate whose floor is below 1 —
     /// a floor-1 coordinate takes the ungated difference bit for bit and never calls the tight
     /// twin — and a floored coordinate whose twin agrees keeps its #2187 step: on a clean

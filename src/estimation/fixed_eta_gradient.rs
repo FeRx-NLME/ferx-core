@@ -217,7 +217,8 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
 /// `floor = 1` it is the pre-#2187 `h·(1 + |θᵢ|)` bit for bit; on a θ declared below 1 in
 /// magnitude it is relative to that magnitude, where `h·(1 + |θᵢ|)` is an absolute `h` —
 /// 1.2 % of a θ of 8e-4 at `h = 1e-5`, a first-order error in a forward difference (#2187).
-/// Every θ difference of the SAEM M-step and the VI ELBO goes through it.
+/// A `[covariate_nn]` weight keeps floor 1 whatever its θ₀ (#2406). Every θ difference of
+/// the SAEM M-step and the VI ELBO goes through it.
 #[inline]
 fn theta_fd_step(model: &CompiledModel, h: f64, theta: &[f64], i: usize) -> f64 {
     crate::estimation::parameterization::fd_step(
