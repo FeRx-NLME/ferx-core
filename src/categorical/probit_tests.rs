@@ -494,15 +494,17 @@ fn the_nan_predictor_warning_names_either_key() {
 /// control at `1e150`, where `Φ` already rounds to `1`. Array `==` fails on any `NaN`.
 ///
 /// The lower side (`x ≤ −2`) is the Mills continued-fraction branch, which never forms `Φ`,
-/// so this gate does not touch it. `x = +∞` itself still has `NaN` in `d2..d4` (`−0·∞` in
-/// the recursion): a separate issue, not this gate.
+/// so this gate does not touch it. `x = +∞` itself had `NaN` in `d2..d4`: the inverse Mills
+/// ratio `m` is `0` there and `a = x + m` is `∞`, so the recursion's `−m·a` was `0·∞` (#2772).
+/// Its limit is `0`, like every derivative above the underflow of `m`. (`binary_data_term`
+/// repels a non-finite `lp` before it reaches the jet, so this pins the jet's own contract.)
 #[test]
 fn the_probit_jet_past_the_normal_cdf_overflow_is_the_certain_record() {
     let control = 1e150;
     assert!((control / std::f64::consts::SQRT_2).powi(2).is_finite());
     let want = neg_log_normal_cdf_jet(control);
     assert_eq!(want[0], 0.0, "−log Φ(1e150)");
-    for x in [1e155, 1e300] {
+    for x in [1e155, 1e300, f64::INFINITY] {
         assert_eq!(
             (x / std::f64::consts::SQRT_2).powi(2),
             f64::INFINITY,

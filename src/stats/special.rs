@@ -308,6 +308,12 @@ pub fn m3_censored_outer(
     cens: i8,
 ) -> (f64, f64, f64, f64) {
     let (h, z, m) = m3_censored_kernel(y, f, v, d, cens);
+    if h == 0.0 {
+        // The row is certain and `h` has underflowed (from `z ≈ 38.6`). Each coefficient is
+        // `h` times a polynomial in `z`, `m` and `∂m/∂f`, so its limit is `0`; past
+        // `|z| ≈ 1.3e154` those factors overflow and the products would be `0·∞` (#2772).
+        return (0.0, 0.0, 0.0, 0.0);
+    }
     let sgn = if cens < 0 { -1.0 } else { 1.0 };
     let w = v.sqrt();
     let w3 = v * w; // w³
@@ -1799,6 +1805,42 @@ mod tests {
                 - regularized_gamma_p(a - h, f64::INFINITY))
                 / (2.0 * h);
             assert_eq!(fd_a, p.grad[0], "∂P/∂a FD at ({a}, ∞)");
+        }
+    }
+
+    /// #2772: once `h = φ/Φ` underflows to `0` (from `z ≈ 38.6`), every coefficient of
+    /// `m3_censored_outer` is `h` times a polynomial in `z`, `m` and `∂m/∂f`. `h` decays like
+    /// `φ`, faster than any power, so each limit is `0`. But the factors overflow before `z`
+    /// does: `z²` from `|z| ≈ 1.3e154` (so `C = h(z² + hz − 1)` was `0·∞`), and at
+    /// `z = +∞` `m` and `∂m/∂f` themselves (`∞ − ∞` in `∂m/∂f`), so `g1` and `g2` were `NaN`
+    /// too. Both tails, both straddles; the control row at `±1e6` is the ungated region,
+    /// where every coefficient is already `0`.
+    #[test]
+    fn m3_censored_outer_is_zero_where_inv_mills_underflows() {
+        // Proportional error at f = 1, σ = 0.1: v = σ²f², d = 2σ²f, d2 = 2σ².
+        let (f, v, d, d2) = (1.0, 0.01, 0.02, 0.02);
+        for (near, sq_over, inf, cens) in [(1e6, 1e300, 1e308, 1), (-1e6, -1e300, -1e308, -1)] {
+            let (h, z, _) = m3_censored_kernel(near, f, v, d, cens);
+            assert!(
+                h == 0.0 && (z * z).is_finite(),
+                "control {near:e}: h={h}, z={z}"
+            );
+            let (h, z, _) = m3_censored_kernel(sq_over, f, v, d, cens);
+            assert!(
+                h == 0.0 && z.is_finite() && z * z == f64::INFINITY,
+                "{sq_over:e}"
+            );
+            let (h, z, m) = m3_censored_kernel(inf, f, v, d, cens);
+            assert!(
+                h == 0.0 && z == f64::INFINITY && m.is_infinite(),
+                "{inf:e}: m={m}"
+            );
+            for y in [near, sq_over, inf] {
+                let (g1, g2, cz, cm) = m3_censored_outer(y, f, v, d, d2, cens);
+                for (name, c) in [("g1", g1), ("g2", g2), ("cz", cz), ("cm", cm)] {
+                    assert!(c == 0.0, "{name} at y={y:e}, cens={cens}: {c}");
+                }
+            }
         }
     }
 }
