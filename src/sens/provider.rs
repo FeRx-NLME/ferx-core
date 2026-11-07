@@ -1301,6 +1301,9 @@ fn cached_event_schedule(
             scratch.push(times.len() as u64);
             scratch.extend(times.iter().map(|t| t.to_bits()));
         }
+        // In test builds the schedule's dose index may be built exhaustive or not.
+        #[cfg(test)]
+        scratch.push(u64::from(crate::dosing::exhaustive_dose_scans()));
         if let Some(e) = entry.as_ref().filter(|e| e.key == *scratch) {
             return e.schedule.clone();
         }

@@ -2529,8 +2529,9 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
 /// infusion ending at `0.1 + 0.7 = 0.7999999999999999` merges with an `SS=1` record at
 /// `0.8`). The walker still equilibrates the record's state there, and an exact
 /// comparison read the record as not reached for the whole segment — train off, earlier
-/// doses live (PR #1589 review finding 1: −51 % at t = 6). [`Self::at_segment`] is the
-/// only constructor, so no caller can apply the gate without the tolerance.
+/// doses live (PR #1589 review finding 1: −51 % at t = 6). [`Self::at_segment`] and its
+/// indexed twin [`Self::at_segment_scanned`] are the only constructors and both add it, so
+/// no caller can apply the gate without the tolerance.
 ///
 /// It also carries the **EVID=3/4 reset** (#1587), keyed the same way: on the dose
 /// *record*, never its lagged arrival. NONMEM cancels a dose whose record precedes a reset
@@ -2557,9 +2558,29 @@ impl ResetGate {
     /// `reset_floor` it means no EVID=3/4 reset.
     #[inline]
     pub(crate) fn at_segment(doses: &[DoseEvent], reset_floor: f64, t_seg: f64) -> Self {
+        Self::reaching(t_seg, reset_floor, |reached| {
+            crate::dosing::ss_reset_cutoff(doses, reached)
+        })
+    }
+
+    /// [`Self::at_segment`] over the doses `scan` indexes, without rescanning them: the
+    /// closed-form event walks build one gate per interval and per arrival, so the `O(n)`
+    /// cutoff search made each walk `O(n²)` in the number of doses.
+    #[inline]
+    pub(crate) fn at_segment_scanned(
+        scan: &crate::dosing::DoseScan,
+        reset_floor: f64,
+        t_seg: f64,
+    ) -> Self {
+        Self::reaching(t_seg, reset_floor, |reached| scan.ss_reset_cutoff(reached))
+    }
+
+    /// The one place "reached" is defined: `t_seg` plus [`EVENT_MATCH_TOL`].
+    #[inline]
+    fn reaching(t_seg: f64, reset_floor: f64, cutoff: impl FnOnce(f64) -> Option<usize>) -> Self {
         let reached = t_seg + EVENT_MATCH_TOL;
         Self {
-            cutoff: crate::dosing::ss_reset_cutoff(doses, reached),
+            cutoff: cutoff(reached),
             reached,
             reset_floor,
             t_seg,
