@@ -2063,6 +2063,8 @@ fn fit_inner(
                         mcem_lowest_objective: None,
                         mcem_objective_trail: None,
                         mixture_posteriors: None,
+                        newton_decrement: None,
+                        optimizer_stop: None,
                     });
                 }
             }
@@ -2162,6 +2164,8 @@ fn fit_inner(
                     start_eval: None,
                     mcem_lowest_objective: None,
                     mcem_objective_trail: None,
+                    newton_decrement: None,
+                    optimizer_stop: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -3382,6 +3386,8 @@ fn fit_inner(
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
         final_gradient_source: result.final_gradient_source.clone(),
+        newton_decrement: result.newton_decrement,
+        optimizer_stop: result.optimizer_stop.clone(),
         optimizer: optimizer_label,
         n_starts: options.n_starts,
         multi_start_seed: options.multi_start_seed,

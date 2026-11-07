@@ -7208,6 +7208,8 @@ pub fn run_saem(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum: _,
     } = out;
     warnings.extend(cov_warnings);
 
@@ -7302,6 +7304,8 @@ pub fn run_saem(
         start_eval: None,
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement,
+        optimizer_stop: None,
     })
 }
 

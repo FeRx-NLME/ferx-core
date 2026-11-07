@@ -281,6 +281,8 @@ fn run_covariance_scoped(
             warnings: new_warnings,
             sir_fallback_proposal: _,
             method: covariance_method,
+            newton_decrement,
+            non_stationary_optimum,
         },
         resolved,
     ) = crate::estimation::profile::replay_covariance(
@@ -353,8 +355,23 @@ fn run_covariance_scoped(
     // `high_correlation`) are also stale after a re-run, but `run_covariance` does
     // not re-derive them at all; refreshing those is `fit_inner`'s postfit pass and
     // a separate change.
-    out.warnings.retain(|w| !is_covariance_step_warning(w));
+    //
+    // #2785: `W_NON_STATIONARY_OPTIMUM` is filed under `convergence`, not as a
+    // covariance-step code, but it is a finding of the replaced step all the same, so it
+    // goes with them. A step that finds the estimate non-stationary demotes the fit as the
+    // inline one would; one that finds it stationary does not promote it — `converged`
+    // carries the optimizer's other verdicts, which this call does not revisit.
+    out.warnings.retain(|w| {
+        !is_covariance_step_warning(w)
+            && !w.contains(crate::estimation::cov_diagnostics::NON_STATIONARY_OPTIMUM_TOKEN)
+    });
     out.warnings.extend(new_warnings);
+    out.newton_decrement = newton_decrement;
+    crate::estimation::covariance::demote_non_stationary_optimum(
+        non_stationary_optimum,
+        &mut out.converged,
+        &mut out.warnings,
+    );
     out.warnings.extend(resolved_warning);
     out.warnings
         .extend(crate::api::rsr_one_subject_levels_warning(

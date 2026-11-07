@@ -1134,10 +1134,146 @@ pub(crate) fn tests_stationarity_by_gradient(
     !fell_back_to_s && !estimate_minimises_cov_objective(method)
 }
 
+/// Whether the covariance step tests the stationarity of an estimate its method claims to
+/// have minimised (#2785): the FOCE family, Laplace / AGQ and Gauss–Newton, on an `R` the
+/// eigenvalue floor left alone (`n_clipped == 0`), so `H⁻¹` is exact.
+pub(crate) fn tests_minimum_stationarity(method: EstimationMethod, n_clipped: usize) -> bool {
+    estimate_minimises_cov_objective(method) && n_clipped == 0
+}
+
 /// Whether a Newton decrement says the estimate is not stationary (#2541). A non-finite
 /// decrement — a gradient the step could not evaluate — makes no claim either way.
 pub(crate) fn decrement_is_non_stationary(decrement: f64) -> bool {
     decrement.is_finite() && decrement > NON_STATIONARY_DECREMENT_OFV
+}
+
+/// The `W_` token of [`format_non_stationary_optimum_warning`] (#2785).
+pub(crate) const NON_STATIONARY_OPTIMUM_TOKEN: &str = "W_NON_STATIONARY_OPTIMUM";
+
+/// How many coordinates [`format_non_stationary_optimum_warning`] names (#2785).
+pub(crate) const NON_STATIONARY_NAMED_COORDS: usize = 3;
+
+/// The stationarity test of an estimate its method claims to have minimised (#2785): the
+/// Newton decrement of the OFV on the free packed coordinates, with the coordinates a
+/// constrained optimum may legitimately leave a slope on taken out, and the Newton step
+/// each remaining coordinate would take, in standard errors.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StationarityReading {
+    /// `½·g_Aᵀ(H_AA)⁻¹g_A` over the coordinates `A` not held, in OFV units.
+    pub decrement: f64,
+    /// Per free coordinate, `δᵢ / SEᵢ`: the Newton step `δ = (H_AA)⁻¹g_A` divided by the
+    /// standard error `√(2·[(H_AA)⁻¹]ᵢᵢ)` of `R⁻¹` on the same block. `0` on a held
+    /// coordinate. The sign is that of the gradient, so the step a minimiser takes is `−δ`.
+    pub step_se: Vec<f64>,
+}
+
+/// Which free coordinates sit on a packed bound with their descent direction `−g` pointing
+/// out of the box (#2785) — the coordinates a bounded optimum leaves a nonzero gradient on,
+/// whose slope a Newton step cannot remove. The same rule as Gauss–Newton's
+/// active set (`gauss_newton::bound_active_outward`, #2777), with a tolerance of `1e-8`
+/// relative to the bound, since the covariance step receives the estimate after a round
+/// trip through the packed parameterisation.
+pub(crate) fn held_at_bound(x: &[f64], g: &[f64], lower: &[f64], upper: &[f64]) -> Vec<bool> {
+    // An infinite bound is never near: `|x − ∞| ≤ 1e-8·∞` is `∞ ≤ ∞`, true.
+    let near = |a: f64, b: f64| b.is_finite() && (a - b).abs() <= 1e-8 * b.abs().max(1.0);
+    (0..x.len())
+        .map(|i| {
+            ((x[i] >= upper[i] || near(x[i], upper[i])) && g[i] < 0.0)
+                || ((x[i] <= lower[i] || near(x[i], lower[i])) && g[i] > 0.0)
+        })
+        .collect()
+}
+
+/// [`StationarityReading`] of the free-block gradient `g_free` under `h_inv`, the inverse of
+/// the OFV's Hessian on the same block, with the `held` coordinates removed (#2785).
+///
+/// Removing a coordinate from a quadratic model is a Schur complement on `H⁻¹`, not a
+/// deletion of its row: `(H_AA)⁻¹ = (H⁻¹)_AA − (H⁻¹)_AB·[(H⁻¹)_BB]⁻¹·(H⁻¹)_BA`. With nothing
+/// held this is [`newton_decrement`] exactly. `None` when `(H⁻¹)_BB` cannot be inverted or an
+/// input is not finite — no claim either way.
+pub(crate) fn stationarity_reading(
+    g_free: &nalgebra::DVector<f64>,
+    h_inv: &nalgebra::DMatrix<f64>,
+    held: &[bool],
+) -> Option<StationarityReading> {
+    let n = g_free.len();
+    if !g_free.iter().all(|v| v.is_finite()) || !h_inv.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let a: Vec<usize> = (0..n).filter(|&i| !held[i]).collect();
+    let b: Vec<usize> = (0..n).filter(|&i| held[i]).collect();
+    let sub = |rows: &[usize], cols: &[usize]| {
+        nalgebra::DMatrix::from_fn(rows.len(), cols.len(), |r, c| h_inv[(rows[r], cols[c])])
+    };
+    let mut m = sub(&a, &a);
+    if !b.is_empty() && !a.is_empty() {
+        let bb_inv = sub(&b, &b).try_inverse()?;
+        m -= sub(&a, &b) * bb_inv * sub(&b, &a);
+    }
+    let g_a = nalgebra::DVector::from_iterator(a.len(), a.iter().map(|&i| g_free[i]));
+    let delta = &m * &g_a;
+    let mut step_se = vec![0.0; n];
+    for (k, &i) in a.iter().enumerate() {
+        let se = (2.0 * m[(k, k)]).sqrt();
+        step_se[i] = delta[k] / se;
+    }
+    Some(StationarityReading {
+        decrement: 0.5 * g_a.dot(&delta),
+        step_se,
+    })
+}
+
+/// The `n` coordinates with the largest Newton step in standard errors, as
+/// `(label index, step)`, largest `|step|` first (#2785). A non-finite step — a coordinate
+/// with no positive curvature on the block — sorts first, since it is the coordinate the
+/// reader most needs to see.
+pub(crate) fn largest_newton_steps(step_se: &[f64], n: usize) -> Vec<(usize, f64)> {
+    let mut idx: Vec<usize> = (0..step_se.len()).filter(|&i| step_se[i] != 0.0).collect();
+    let key = |v: f64| {
+        if v.is_finite() {
+            v.abs()
+        } else {
+            f64::INFINITY
+        }
+    };
+    idx.sort_by(|&i, &j| key(step_se[j]).total_cmp(&key(step_se[i])));
+    idx.into_iter().take(n).map(|i| (i, step_se[i])).collect()
+}
+
+/// The warning that demotes `converged` when an estimate its method minimised — FOCE, FOCEI,
+/// Laplace / AGQ, Gauss–Newton — is not a stationary point of its own objective (#2785).
+///
+/// `largest` is [`largest_newton_steps`] with each coordinate's label. The message says
+/// which way each coordinate would move by the sign of the step a minimiser would take.
+///
+/// Every sentence is pinned by `cov_diagnostics_tests.rs`.
+pub(crate) fn format_non_stationary_optimum_warning(
+    method: EstimationMethod,
+    decrement: f64,
+    largest: &[(String, f64)],
+) -> String {
+    let coords = largest
+        .iter()
+        .map(|(label, z)| format!("{label} {:+.1}", -z))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let named = if coords.is_empty() {
+        String::new()
+    } else {
+        format!(" The largest Newton steps, in standard errors: {coords}.")
+    };
+    format!(
+        "{NON_STATIONARY_OPTIMUM_TOKEN}: the {} estimate is not a stationary point of its \
+         objective, so the fit is not reported as converged. A Newton step from it would lower \
+         the OFV by an estimated {decrement:.3} units, about {:.1} standard errors from the \
+         minimum (the check fails above {NON_STATIONARY_DECREMENT_OFV:.1} OFV unit, one \
+         standard error).{named} The OFV, and the standard errors taken on the objective's \
+         slope, are not those of the optimum. Restart the fit from these estimates and \
+         compare the OFV; a coordinate that keeps stalling may need rescaling or tighter \
+         bounds.",
+        method.label(),
+        decrement.sqrt(),
+    )
 }
 
 /// The facts [`format_non_stationary_gradient_warning`] is assembled from (#2541).

@@ -843,6 +843,8 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         stationary_start: false,
         omega_is_diagonal: None,
         kappa_is_diagonal: None,
+        newton_decrement: None,
+        optimizer_stop: None,
     }
 }
 

@@ -527,7 +527,9 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::left_init: core::option
 pub ferx_core::estimation::outer_optimizer::OuterResult::max_unconverged_subjects: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::mixture_posteriors: core::option::Option<ferx_core::estimation::outer_optimizer::MixturePosteriors>
 pub ferx_core::estimation::outer_optimizer::OuterResult::n_iterations: usize
+pub ferx_core::estimation::outer_optimizer::OuterResult::newton_decrement: core::option::Option<f64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::ofv: f64
+pub ferx_core::estimation::outer_optimizer::OuterResult::optimizer_stop: core::option::Option<alloc::string::String>
 pub ferx_core::estimation::outer_optimizer::OuterResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::params: ferx_core::ModelParameters
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_mh_accept_tail: core::option::Option<f64>
@@ -3400,6 +3402,7 @@ pub ferx_core::types::FitResult::n_starts: usize
 pub ferx_core::types::FitResult::n_subjects: usize
 pub ferx_core::types::FitResult::n_threads_used: usize
 pub ferx_core::types::FitResult::neural_networks: alloc::vec::Vec<ferx_core::NeuralNetworkInfo>
+pub ferx_core::types::FitResult::newton_decrement: core::option::Option<f64>
 pub ferx_core::types::FitResult::nlopt_missing_algorithms: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::npde_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::obs_time_range: core::option::Option<(f64, f64)>
@@ -3416,6 +3419,7 @@ pub ferx_core::types::FitResult::omega_iov_param_corr: core::option::Option<nalg
 pub ferx_core::types::FitResult::omega_is_diagonal: core::option::Option<bool>
 pub ferx_core::types::FitResult::omega_param_corr: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::types::FitResult::optimizer: alloc::string::String
+pub ferx_core::types::FitResult::optimizer_stop: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::outer_gtol: f64
 pub ferx_core::types::FitResult::outer_maxiter: usize
 pub ferx_core::types::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
@@ -5013,6 +5017,7 @@ pub ferx_core::FitResult::n_starts: usize
 pub ferx_core::FitResult::n_subjects: usize
 pub ferx_core::FitResult::n_threads_used: usize
 pub ferx_core::FitResult::neural_networks: alloc::vec::Vec<ferx_core::NeuralNetworkInfo>
+pub ferx_core::FitResult::newton_decrement: core::option::Option<f64>
 pub ferx_core::FitResult::nlopt_missing_algorithms: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::npde_seed: core::option::Option<u64>
 pub ferx_core::FitResult::obs_time_range: core::option::Option<(f64, f64)>
@@ -5029,6 +5034,7 @@ pub ferx_core::FitResult::omega_iov_param_corr: core::option::Option<nalgebra::b
 pub ferx_core::FitResult::omega_is_diagonal: core::option::Option<bool>
 pub ferx_core::FitResult::omega_param_corr: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::FitResult::optimizer: alloc::string::String
+pub ferx_core::FitResult::optimizer_stop: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::outer_gtol: f64
 pub ferx_core::FitResult::outer_maxiter: usize
 pub ferx_core::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
