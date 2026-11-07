@@ -5028,6 +5028,9 @@ pub(crate) enum AdaptiveRefusalKind {
     Unsupported,
     /// A malformed or unsupported controller action (`E_ADAPTIVE_CONTROLLER_ACTION`).
     ControllerAction,
+    /// A residual-error magnitude that is not positive and finite at a `Dv` reading
+    /// (`E_RUV_MAGNITUDE_NONPOSITIVE`, #2741).
+    RuvMagnitude,
 }
 
 /// The error of [`ode_predictions_adaptive_impl`] (#1983): a refusal of the caller's
@@ -6321,6 +6324,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         None => &shadow.covariates,
                     }
                 };
+                // The `TIME` as written at the decision (#2756), computed once: the monitor
+                // readout reads it, and so does a `Dv` reading's residual-error magnitude
+                // (#2741), so the reading and its σ cannot read two clocks.
+                let written_t = subject.param_time_at(t_start);
                 // Resolve each monitored signal at the current (pre-dose) state.
                 let mut signals: HashMap<String, f64> = HashMap::new();
                 let mut observed: Vec<ObservedSignal> = Vec::with_capacity(monitors.len());
@@ -6340,7 +6347,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         theta,
                         readout_eta,
                         decision_cov,
-                        subject.param_time_at(t_start),
+                        written_t,
                     );
                     // A finite state (guarded above) that reads out non-finite is a readout
                     // defect, not a divergence (#1578): a `[scaling]` readout or an `observe`
@@ -6385,20 +6392,52 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             // entry points refuse it before any subject runs (#1983), with
                             // the same predicate `resid_var` applies, so a `None` here is an
                             // internal invariant and stays uncoded.
-                            let var = (a.resid_var)(m.cmt, latent).ok_or_else(|| {
-                                AdaptiveDriverError::Runtime(format!(
-                                    "decision {decision_index} at t={t_start}: monitor '{}' \
-                                     requests DV observation on compartment {} but no [error_model] \
-                                     defines residual error there",
-                                    m.name, m.cmt
-                                ))
-                            })?;
+                            //
+                            // The row is what `simulate()` reads from an observation row at
+                            // this decision (#2741): the decision's covariate row, the written
+                            // `TIME` and the time after dose on `shadow`, the causal record
+                            // (base regimen + the controller doses realized before this
+                            // reading). Where no dose precedes the reading and the first is
+                            // decided here, the frozen replay — which holds that dose — reads
+                            // `TAD = 0`; the reading cannot see a dose not yet decided, so it
+                            // reads the time since the first record (the #1151 peek).
+                            let row = crate::sim::adaptive::AssayRow {
+                                cmt: m.cmt,
+                                ipred: latent,
+                                time: written_t,
+                                tad: if a.needs_tad {
+                                    shadow.time_after_dose_at(t_start)
+                                } else {
+                                    0.0
+                                },
+                                cov: decision_cov,
+                            };
+                            let var = (a.resid_var)(&row)
+                                .map_err(|e| {
+                                    AdaptiveDriverError::refusal(
+                                        AdaptiveRefusalKind::RuvMagnitude,
+                                        format!(
+                                            "decision {decision_index} at t={t_start}: monitor \
+                                             '{}': {e}",
+                                            m.name
+                                        ),
+                                    )
+                                })?
+                                .ok_or_else(|| {
+                                    AdaptiveDriverError::Runtime(format!(
+                                        "decision {decision_index} at t={t_start}: monitor '{}' \
+                                         requests DV observation on compartment {} but no \
+                                         [error_model] defines residual error there",
+                                        m.name, m.cmt
+                                    ))
+                                })?;
                             // `has_residual_error_for_cmt` (the gate behind `resid_var`)
                             // requires `sigma` to cover the model's σ indices, so a `Some`
-                            // here is panic-free and structurally finite — no downstream
-                            // finiteness guard. A diverged state or a non-finite readout never
-                            // gets here: both are refused above (#1578). A NaN/∞ in `sigma` is
-                            // still whole-sim garbage-in, out of scope here.
+                            // here is panic-free, and `resid_var` refuses a magnitude that is
+                            // not positive and finite (`Err` above), so it is finite. A
+                            // diverged state or a non-finite readout never gets here: both
+                            // are refused above (#1578). A NaN/∞ in `sigma` is still
+                            // whole-sim garbage-in, out of scope here.
                             let eps = assay_standard_normal(a.base_seed, decision_index, &m.name);
                             let noised = latent + var.sqrt() * eps;
                             // Edge (b): an assay cannot read below zero; clamp the

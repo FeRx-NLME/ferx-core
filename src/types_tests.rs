@@ -4578,3 +4578,94 @@ fn retain_records_keeps_the_record_snapshots_aligned() {
     bare.retain_records(|_| false);
     assert!(bare.obs_records.is_empty() && bare.endpoint_covariates.is_empty());
 }
+
+/// #2741 T12: `time_after_dose(j)` is a thin wrapper over the time-keyed
+/// `time_after_dose_at`, bit for bit, on every fixture of
+/// `subject_time_after_dose_is_the_data_tad` (Pharmpy same-time grouping, group 0,
+/// SS with and without a preceding dose). Regression: a `j` wrapper that diverges
+/// from `*_at` (the assay reads `*_at`, every estimator reads the wrapper).
+#[test]
+fn time_after_dose_is_its_time_keyed_twin_bit_for_bit() {
+    let d = |t: f64, ss: bool, ii: f64| DoseEvent::new(t, 100.0, 1, 0.0, ss, ii);
+    let fixtures = [
+        Subject {
+            id: "1".into(),
+            doses: vec![d(0.0, false, 0.0), d(24.0, false, 0.0)],
+            obs_times: vec![-1.0, 0.0, 2.0, 23.9, 24.0, 30.0],
+            ..Default::default()
+        },
+        Subject {
+            id: "4".into(),
+            doses: vec![d(10.0, false, 0.0)],
+            pk_only_times: vec![-3.0],
+            obs_times: vec![-2.0, 0.0, 10.0, 12.0],
+            ..Default::default()
+        },
+        Subject {
+            id: "5".into(),
+            obs_times: vec![0.0, 4.0, 9.0],
+            ..Default::default()
+        },
+        Subject {
+            id: "2".into(),
+            doses: vec![d(0.0, true, 12.0)],
+            obs_times: vec![0.0, 26.0],
+            ..Default::default()
+        },
+        Subject {
+            id: "3".into(),
+            doses: vec![d(0.0, false, 0.0), d(48.0, true, 12.0)],
+            obs_times: vec![48.0],
+            ..Default::default()
+        },
+    ];
+    let mut n = 0;
+    for s in &fixtures {
+        for (j, &t) in s.obs_times.iter().enumerate() {
+            let (by_row, by_time) = (s.time_after_dose(j), s.time_after_dose_at(t));
+            assert!(by_row.is_finite(), "subject {} obs {j}: {by_row}", s.id);
+            assert_eq!(
+                by_row.to_bits(),
+                by_time.to_bits(),
+                "subject {} obs {j}",
+                s.id
+            );
+            n += 1;
+        }
+        assert!(
+            s.time_after_dose(s.obs_times.len()).is_nan(),
+            "out of range stays NaN"
+        );
+    }
+    assert_eq!(n, 16, "every fixture row was compared");
+}
+
+/// #2741 T6: at a decision time with no record there, `time_after_dose_at` folds the
+/// time itself into group 0's earliest record, so a decision at `0` on records from
+/// `1` reads `0` (by hand: no dose, no earlier record, the decision is its own group-0
+/// start), and one at `5` reads `5 − 1 = 4`. Regression: `obs_t` left out of the minimum,
+/// which reads `0 − 1 = −1` at the first decision.
+#[test]
+fn time_after_dose_at_a_decision_before_every_record_is_zero() {
+    let s = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(8.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![1.0, 6.0],
+        ..Default::default()
+    };
+    assert_eq!(
+        s.time_after_dose_at(0.0),
+        0.0,
+        "decision before every record"
+    );
+    assert_eq!(
+        s.time_after_dose_at(5.0),
+        4.0,
+        "decision after the first record"
+    );
+    assert_eq!(
+        s.time_after_dose_at(8.0),
+        0.0,
+        "at the first dose: that dose's"
+    );
+}
