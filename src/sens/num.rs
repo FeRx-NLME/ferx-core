@@ -572,6 +572,39 @@ pub(crate) mod vm {
         fn has_forward(&self, layout: Layout) -> bool;
         /// Whether a reverse pass exists (or can be built) for `layout`.
         fn has_reverse(&self, layout: Layout) -> bool;
+        /// Mark in `out` (one entry per derivative, at the extent) each derivative that is a
+        /// structural zero — exactly `0`, with every derivative of every order `0` — given the
+        /// inputs' values (`u`, `params`, `seeds`) and which inputs are structural zeros
+        /// (`zu`, `zp`, `zs`). `false`, with `out` unspecified, when the kernel cannot tell;
+        /// then every output must be treated as live. It may under-report, never over-report.
+        ///
+        /// See [`Self::may_mark_structural_zeros`] for when a caller may skip it.
+        #[allow(clippy::too_many_arguments)]
+        fn structural_zeros(
+            &self,
+            _u: &[f64],
+            _params: &[f64],
+            _seeds: &[f64; 4],
+            _zu: &[bool],
+            _zp: &[bool],
+            _zs: &[bool; 4],
+            _out: &mut [bool],
+        ) -> bool {
+            false
+        }
+        /// Whether [`Self::structural_zeros`] can mark any output, given which inputs are
+        /// structural zeros (`zero_u(i)`, `zero_p(slot)`, `zero_s(k)`; an index past an input
+        /// slice is a structural zero, as the binding reads it). `false` only when it would
+        /// mark nothing, so the caller may skip it; `true`, the conservative answer, by
+        /// default.
+        fn may_mark_structural_zeros(
+            &self,
+            _zero_u: &dyn Fn(usize) -> bool,
+            _zero_p: &dyn Fn(usize) -> bool,
+            _zero_s: &dyn Fn(usize) -> bool,
+        ) -> bool {
+            true
+        }
         /// The forward over `layout`.
         ///
         /// # Safety

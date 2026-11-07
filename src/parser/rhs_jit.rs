@@ -463,6 +463,10 @@ pub(super) struct JitCode {
 struct JitInner {
     code: Vec<Flat>,
     n_regs: usize,
+    /// `super::makes_structural_zeros(&code)`, computed once.
+    zero_sources: bool,
+    /// `super::loaded_inputs(&code)`: the states, `params` slots and seeds it loads.
+    loads: (Vec<u32>, Vec<u32>, [bool; 4]),
     extent: Extent,
     plan: HoistPlan,
     full: Box<[OnceLock<Option<Compiled<RhsFn>>>]>,
@@ -493,6 +497,8 @@ impl JitCode {
         let inner = Arc::new(JitInner {
             code: code.to_vec(),
             n_regs,
+            zero_sources: super::makes_structural_zeros(code),
+            loads: super::loaded_inputs(code),
             extent: extent(code),
             plan: hoist_plan(code),
             full: slots(),
@@ -617,6 +623,31 @@ impl RhsKernel for JitInner {
     }
     fn has_reverse(&self, layout: Layout) -> bool {
         self.resolve_vjp(layout).is_some()
+    }
+    fn may_mark_structural_zeros(
+        &self,
+        zero_u: &dyn Fn(usize) -> bool,
+        zero_p: &dyn Fn(usize) -> bool,
+        zero_s: &dyn Fn(usize) -> bool,
+    ) -> bool {
+        let (u, p, s) = &self.loads;
+        self.zero_sources
+            || u.iter().any(|&i| zero_u(i as usize))
+            || p.iter().any(|&k| zero_p(k as usize))
+            || (0..4).any(|k| s[k] && zero_s(k))
+    }
+    fn structural_zeros(
+        &self,
+        u: &[f64],
+        params: &[f64],
+        seeds: &[f64; 4],
+        zu: &[bool],
+        zp: &[bool],
+        zs: &[bool; 4],
+        out: &mut [bool],
+    ) -> bool {
+        super::structural_zeros(&self.code, self.n_regs, u, params, seeds, zu, zp, zs, out);
+        true
     }
     unsafe fn forward(
         &self,

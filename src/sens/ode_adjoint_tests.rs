@@ -1813,6 +1813,206 @@ const TWOCPT_DEPOT_LINEAR_ODE: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
+/// A parent drained into two gated accumulators, one per collection interval: the shape
+/// whose dormant states #2760 leaves out of the exponential. The observation reads
+/// both accumulators, so one that is dormant but holds drug still moves the prediction.
+/// `FE` has no random effect, so the outer gradient reads it off the tape (a θ with an η
+/// is carried by the η-jets instead, #2706): the gated terms are then taped block outputs,
+/// which only the recording's own structural-zero test can return as zeros.
+const GATED_ACCUMULATORS_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.2, 0.01, 50.0)
+  theta TVV(15.0, 0.5, 500.0)
+  theta TVFE(0.4, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  FE = TVFE
+  G1 = if (IDX == 1) 1 else 0
+  G2 = if (IDX == 2) 1 else 0
+[structural_model]
+  ode(states=[central, u1, u2])
+[odes]
+  d/dt(central) = -(CL / V) * central
+  d/dt(u1) = G1 * FE * (CL / V) * central
+  d/dt(u2) = G2 * FE * (CL / V) * central
+[scaling]
+  y = central / V + 0.01 * (u1 + u2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #2760: the adjoint on the exact linear path with gated accumulators matches
+/// reconverged FD. Three intervals, the gate `IDX` set at each dose: interval 1 fills `u1`
+/// (`u2` dormant and empty), interval 2 fills `u2` (`u1` dormant and holding drug), interval
+/// 3 fills neither (both dormant, both holding). The recording must take the exact path,
+/// and the dormant states must be left out on the taped recording itself: with the block
+/// keeping its structural-zero outputs (`RHS_DEAD_KEPT`, the recording before #2760)
+/// fewer states go dormant, since a taped zero is not a structural one. That straddle is
+/// what makes the parity a test of the reduced recording rather than of the full one.
+#[test]
+fn adjoint_with_dormant_gated_accumulators_matches_reconverged_fd() {
+    // Measured (Linux x86_64): dropped vs kept 7.0e-17, parity 3.4e-9.
+    dormant_accumulators_match_reconverged_fd(GATED_ACCUMULATORS_ODE, 1e-14, 3e-8);
+}
+
+/// [`GATED_ACCUMULATORS_ODE`] with a peripheral compartment, and the accumulators between
+/// the live states: `[u1, central, u2, periph]`. The three intervals leave `{u2}`, `{u1}`
+/// and `{u1, u2}` dormant, so a live state sits on both sides of a dormant one and the
+/// reduced block's index `lj` differs from the state index `j` it reads (#2761 review): the
+/// taped type's `dot_fold` branch builds its pairs through that map.
+const INTERLEAVED_ACCUMULATORS_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.2, 0.01, 50.0)
+  theta TVV(15.0, 0.5, 500.0)
+  theta TVFE(0.4, 0.01, 1.0)
+  theta TVQ(2.0, 0.01, 50.0)
+  theta TVV2(30.0, 0.5, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  FE = TVFE
+  Q  = TVQ
+  V2 = TVV2
+  G1 = if (IDX == 1) 1 else 0
+  G2 = if (IDX == 2) 1 else 0
+[structural_model]
+  ode(states=[u1, central, u2, periph])
+[odes]
+  d/dt(u1) = G1 * FE * (CL / V) * central
+  d/dt(central) = -(CL / V) * central - (Q / V) * central + (Q / V2) * periph
+  d/dt(u2) = G2 * FE * (CL / V) * central
+  d/dt(periph) = (Q / V) * central - (Q / V2) * periph
+[scaling]
+  y = central / V + 0.01 * (u1 + u2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+#[test]
+fn adjoint_with_interleaved_dormant_accumulators_matches_reconverged_fd() {
+    // Measured (Linux x86_64): dropped vs kept 4.2e-16, parity 4.9e-9.
+    dormant_accumulators_match_reconverged_fd(INTERLEAVED_ACCUMULATORS_ODE, 5e-14, 5e-8);
+}
+
+/// The body of the two tests above: `src` is a gated-accumulator model on an `IDX` gate
+/// (dose 1 fills `u1`, dose 2 `u2`, dose 3 neither), dosed into the state named `central`.
+/// Asserts the exact path, more dormant states on the recording that drops its structural
+/// zeros than on the one that keeps them (`RHS_DEAD_KEPT`, the straddle), the two gradients
+/// equal to `gap_tol`, and reconverged-FD parity to `parity_tol`.
+fn dormant_accumulators_match_reconverged_fd(src: &str, gap_tol: f64, parity_tol: f64) {
+    use crate::ode::linear::DORMANT_STATES;
+    use crate::ode::solver::SolverStatsScope;
+    use crate::sens::vtape::RHS_DEAD_KEPT;
+    let model = parse_model_string(src).unwrap();
+    assert_eq!(
+        model
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "the fixture must take the exact path"
+    );
+    // The doses go into the state named `central` (1-based), wherever the model puts it.
+    let cmt = 1 + model
+        .ode_spec
+        .as_ref()
+        .unwrap()
+        .state_names
+        .iter()
+        .position(|n| n == "central")
+        .expect("a `central` state");
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, cmt, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, cmt, 0.0, false, 0.0),
+        DoseEvent::new(48.0, 100.0, cmt, 0.0, false, 0.0),
+    ];
+    let times = [1.0, 6.0, 23.0, 25.0, 30.0, 47.0, 49.0, 60.0, 71.0];
+    let idx_at = |t: f64| {
+        if t < 24.0 {
+            1.0
+        } else if t < 48.0 {
+            2.0
+        } else {
+            3.0
+        }
+    };
+    let mut s = subject_shell(doses.clone(), &times);
+    s.covariates.insert("IDX".into(), 1.0);
+    s.obs_covariates = times
+        .iter()
+        .map(|&t| HashMap::from([("IDX".to_string(), idx_at(t))]))
+        .collect();
+    s.dose_covariates = doses
+        .iter()
+        .map(|d| HashMap::from([("IDX".to_string(), idx_at(d.time))]))
+        .collect();
+    let preds = crate::pk::compute_predictions_with_tv(
+        &model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    assert!(s.has_tv_covariates());
+    assert!(in_scope(&model, &s), "the subject must be in adjoint scope");
+    // One adjoint gradient, with the block dropping its structural zeros or keeping them:
+    // the gradient, the dormant states it left out, and the solver's step/decline counts.
+    let gradient = |keep: bool| {
+        let params = moved_params(&model);
+        let x = pack_params(&params);
+        let eta = ebe_for(&model, &s, &params, 1e-10, true);
+        RHS_DEAD_KEPT.with(|c| c.set(keep));
+        DORMANT_STATES.with(|c| c.set(0));
+        let scope = SolverStatsScope::enter();
+        let g = subject_adjoint_packed_gradient(&model, &s, &params, &x, eta.as_slice(), true)
+            .expect("in scope");
+        let st = scope.collected();
+        RHS_DEAD_KEPT.with(|c| c.set(false));
+        let dormant = DORMANT_STATES.with(|c| c.get());
+        (
+            g,
+            dormant,
+            (st.attempted_steps, st.linear_declined_segments),
+        )
+    };
+    let (g, dormant, steps) = gradient(false);
+    let (g_kept, dormant_kept, steps_kept) = gradient(true);
+    assert_eq!(steps, (0, 0), "the exact path stepped or declined");
+    assert_eq!(steps_kept, (0, 0), "the kept recording stepped or declined");
+    assert!(
+        dormant > dormant_kept,
+        "the taped recording left out no more dormant states ({dormant} vs {dormant_kept} kept)"
+    );
+    // The same gradient whether the taped zeros are dropped or kept, to rounding: the tape
+    // records fewer nodes, which moves what its CSE table merges and so the order a sweep
+    // sums in. The callers' bounds are their measurements with 100× headroom.
+    let mut gap = 0.0f64;
+    for (a, b) in g.iter().zip(&g_kept) {
+        assert!(a.is_finite() && b.is_finite(), "{a} vs {b}");
+        gap = gap.max((a - b).abs() / (1.0 + b.abs()));
+    }
+    eprintln!("dormant {dormant} (kept {dormant_kept}); dropped vs kept gradient: {gap:.2e}");
+    assert!(gap <= gap_tol, "dropped vs kept gradient {gap:.2e}");
+    let worst = parity(&model, &s);
+    eprintln!("gated accumulators vs reconverged FD: worst {worst:.2e}");
+    // Reconverged FD (Richardson, EBE re-solved per point); the callers' bounds are their
+    // measurements with 10× headroom.
+    assert!(worst < parity_tol, "worst relative difference {worst:.2e}");
+}
+
 /// The adjoint on the exact linear path (#852, Teun on #2093): its recordings run the
 /// matrix exponential over the tape types, whose derivative self-check reads
 /// `jet_max_abs`. Each subject's gradient must match reconverged FD, and the recording

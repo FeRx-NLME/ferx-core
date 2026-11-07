@@ -962,6 +962,206 @@ impl RhsRegProgram {
     }
 }
 
+/// Which derivatives are **structural zeros** — exactly `0` and identically so near the
+/// inputs, so every derivative of every order is `0` too — given which inputs are
+/// (`zu`, `zp`, `zs`: an untaped constant `0`, [`crate::sens::linsolve::structural_zero`]).
+/// `out[state]` is `true` for such a derivative and `false` for every other, including one
+/// the program does not write. Run on the inputs' values (`u`, `params`, `seeds`), through
+/// [`Self::exec`]'s own `f64` primitives, so it takes the branches the interpreter takes.
+///
+/// The rules are the exact ones: a sum or difference of structural zeros, a structural
+/// zero times (or divided by) a value that is finite (and, as a divisor, nonzero), a
+/// literal `0`, a comparison or logical result (the dual constants `0`/`1`), and the
+/// abs/floor/ceil/round of a structural zero. Everything else is not, so the analysis can
+/// only under-report — and the caller checks every lane of an output it reports before
+/// dropping its derivatives (`vtape::record_rhs`).
+///
+/// A taped number type records an RHS call as one opaque block whose every output is a
+/// tape node (`vtape::record_rhs`), so a gated term `G·k·x` with the gate `G = 0` reads as
+/// a live coefficient to the exact linear path's sparsity skips; this is what lets the
+/// block leave such an output off the tape (#2760).
+/// Whether `code` holds an instruction [`structural_zeros`] marks a structural zero without
+/// a structural-zero operand: a literal `0`, a product with the constant `0`, or a
+/// comparison or connective (whose `0` is the dual constant). Every other rule needs a
+/// structural-zero input, so for a program without one of these, loaded inputs
+/// ([`loaded_inputs`]) none of which is a structural zero leave every output live — and the
+/// analysis can be skipped, exactly.
+pub(super) fn makes_structural_zeros(code: &[Flat]) -> bool {
+    code.iter().any(|f| match *f {
+        Flat::LoadK { c, .. } | Flat::MulK { c, .. } => c == 0.0,
+        Flat::Cmp { .. } | Flat::And { .. } | Flat::Or { .. } | Flat::Not { .. } => true,
+        Flat::Present { .. } => true,
+        _ => false,
+    })
+}
+
+/// The inputs `code` loads: its states, its `params` slots and its seeds, each listed once.
+/// [`structural_zeros`] reads an input's structural-zero flag only through these loads, so
+/// a flag on any other input — a `params` slot below the extent the program never reads —
+/// cannot mark an output.
+pub(super) fn loaded_inputs(code: &[Flat]) -> (Vec<u32>, Vec<u32>, [bool; 4]) {
+    let (mut u, mut p, mut s) = (Vec::new(), Vec::new(), [false; 4]);
+    for f in code {
+        match *f {
+            Flat::LoadState { i, .. } if !u.contains(&i) => u.push(i),
+            Flat::LoadParam { slot, .. } if !p.contains(&slot) => p.push(slot),
+            Flat::LoadSeed { k, .. } => s[usize::from(k)] = true,
+            _ => {}
+        }
+    }
+    (u, p, s)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn structural_zeros(
+    code: &[Flat],
+    n_regs: usize,
+    u: &[f64],
+    params: &[f64],
+    seeds: &[f64; 4],
+    zu: &[bool],
+    zp: &[bool],
+    zs: &[bool; 4],
+    out: &mut [bool],
+) {
+    use crate::sens::num::vm::VmArith;
+    use crate::sens::num::PkNum;
+    let mut v = vec![0.0_f64; n_regs];
+    let mut z = vec![false; n_regs];
+    out.fill(false);
+    let mut pc = 0;
+    while let Some(f) = code.get(pc) {
+        pc += 1;
+        // `(value, structural zero)` of the destination.
+        let (d, val, zero) = match *f {
+            Flat::LoadState { d, i } => {
+                let i = i as usize;
+                // Past the end, the binding reads the constant `0`.
+                (
+                    d,
+                    u.get(i).copied().unwrap_or(0.0),
+                    zu.get(i).copied().unwrap_or(true),
+                )
+            }
+            Flat::LoadParam { d, slot } => {
+                let s = slot as usize;
+                (
+                    d,
+                    params.get(s).copied().unwrap_or(0.0),
+                    zp.get(s).copied().unwrap_or(true),
+                )
+            }
+            Flat::LoadSeed { d, k } => (d, seeds[k as usize], zs[k as usize]),
+            Flat::LoadK { d, c } => (d, c, c == 0.0),
+            Flat::Add { d, a, b } | Flat::Sub { d, a, b } | Flat::RSub { d, a, b } => {
+                let (x, y) = (v[a as usize], v[b as usize]);
+                let mut r = x;
+                match *f {
+                    Flat::Add { .. } => r.add_in(&y),
+                    Flat::Sub { .. } => r.sub_in(&y),
+                    _ => r.rsub_in(&y),
+                }
+                (d, r, z[a as usize] && z[b as usize])
+            }
+            Flat::Mul { d, a, b } => {
+                let (x, y) = (v[a as usize], v[b as usize]);
+                let mut r = x;
+                r.mul_in(&y);
+                let zero = (z[a as usize] && y.is_finite()) || (z[b as usize] && x.is_finite());
+                (d, r, zero)
+            }
+            Flat::Div { d, a, b } => {
+                let (x, y) = (v[a as usize], v[b as usize]);
+                let mut r = x;
+                apply_binary_in(&mut r, Op::Div, &y);
+                (d, r, z[a as usize] && y.is_finite() && y != 0.0)
+            }
+            Flat::AddK { d, a, c } | Flat::SubK { d, a, c } | Flat::RSubK { d, a, c } => {
+                let mut r = v[a as usize];
+                match *f {
+                    Flat::AddK { .. } => r.add_scalar_in(c),
+                    Flat::SubK { .. } => r.sub_scalar_in(c),
+                    _ => r.rsub_scalar_in(c),
+                }
+                (d, r, z[a as usize] && c == 0.0)
+            }
+            Flat::MulK { d, a, c } => {
+                let mut r = v[a as usize];
+                r.mul_scalar_in(c);
+                let zero =
+                    (z[a as usize] && c.is_finite()) || (c == 0.0 && v[a as usize].is_finite());
+                (d, r, zero)
+            }
+            Flat::DivK { d, a, c } => {
+                let mut r = v[a as usize];
+                apply_scalar_in(&mut r, Op::Div, c);
+                (d, r, z[a as usize] && c.is_finite() && c != 0.0)
+            }
+            Flat::Pow { d, a, e } => (d, v[a as usize].pow(v[e as usize]), false),
+            Flat::Unary { d, op, a } => {
+                let keeps_zero =
+                    matches!(op, Unary::Abs | Unary::Floor | Unary::Ceil | Unary::Round);
+                (
+                    d,
+                    apply_unary(op.op(), v[a as usize]),
+                    keeps_zero && z[a as usize],
+                )
+            }
+            Flat::Deriv { state, a } => {
+                if let Some(o) = out.get_mut(state as usize) {
+                    *o = z[a as usize];
+                }
+                continue;
+            }
+            Flat::Cmp { d, cc, a, b } => {
+                let r = if cc.holds(v[a as usize], v[b as usize]) {
+                    1.0
+                } else {
+                    0.0
+                };
+                (d, r, r == 0.0)
+            }
+            Flat::And { d, a, b } => {
+                let r = if v[a as usize] != 0.0 && v[b as usize] != 0.0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                (d, r, r == 0.0)
+            }
+            Flat::Or { d, a, b } => {
+                let r = if v[a as usize] != 0.0 || v[b as usize] != 0.0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                (d, r, r == 0.0)
+            }
+            Flat::Not { d, a } => {
+                let r = if v[a as usize] == 0.0 { 1.0 } else { 0.0 };
+                (d, r, r == 0.0)
+            }
+            Flat::Present { d, a } => {
+                let r = if v[a as usize].is_nan() { 0.0 } else { 1.0 };
+                (d, r, r == 0.0)
+            }
+            Flat::Branch { c, to } => {
+                if v[c as usize] == 0.0 {
+                    pc = to as usize;
+                }
+                continue;
+            }
+            Flat::Jump { to } => {
+                pc = to as usize;
+                continue;
+            }
+            Flat::Move { d, a } => (d, v[a as usize], z[a as usize]),
+        };
+        v[d as usize] = val;
+        z[d as usize] = zero;
+    }
+}
+
 /// Lower the builder's operand-form IR to [`Flat`] code over one register file: temps keep
 /// their numbers, a slot read before any assignment to it is loaded once in a prologue, a
 /// slot read after one reads the assigned value's register (the interpreter's `PushVar`
