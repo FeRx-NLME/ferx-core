@@ -621,6 +621,9 @@ fn resolve_fit_inputs_unattributed<'a>(
         population,
         &mut Vec::new(),
     );
+    // Scored on the records the fit scored, for its cost and because a subject's route can
+    // depend on them (#2778). The rule check below reads labels, which the view keeps.
+    let population = crate::api::scored_population(m, population);
     if fit.iov_occasion.is_none()
         && m.n_kappa > 0
         && population.subjects.iter().all(|s| s.occasions.is_empty())
