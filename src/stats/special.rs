@@ -1912,16 +1912,35 @@ mod tests {
             assert_eq!(erf_g::<f64>(-z), -1.0, "erf_g(−{z:e})");
             assert_eq!(erfc_g::<f64>(z), 0.0, "erfc_g({z:e})");
             assert_eq!(erfc_g::<f64>(-z), 2.0, "erfc_g(−{z:e})");
-            // Lower tail, each function's own convention, and monotone into it: the f64
-            // `log_normal_cdf` has no floor below −37 (its Mills branch gives −804.6 at
-            // −40), so its limit is −∞ and the floor would break monotonicity; the generic
-            // sibling clamps at `MIN_PROB.ln()` from about −37.5 on, so its limit is that
-            // same floor — the value it already returns at −40.
+            // Lower tail: neither function has a floor, and both are monotone into it. The
+            // f64 `log_normal_cdf` takes its Mills branch below −37 (−804.6 at −40). Since
+            // #2769 the generic sibling takes a Mills branch below −10, so it is a finite
+            // −5e299 at the ungated −1e150 and −∞ only once `z²` overflows. That is the same
+            // limit as the f64 function.
             let lo = log_normal_cdf(-z);
             assert!(lo <= log_normal_cdf(-40.0), "ln Φ(−{z:e}) = {lo}");
             assert_eq!(log_normal_cdf(-f64::INFINITY), f64::NEG_INFINITY);
-            assert_eq!(log_normal_cdf_g::<f64>(-z), MIN_PROB.ln(), "ln Φ_g(−{z:e})");
-            assert_eq!(log_normal_cdf_g::<f64>(-40.0), MIN_PROB.ln());
+            let lo_g = log_normal_cdf_g::<f64>(-z);
+            assert!(
+                lo_g <= log_normal_cdf_g::<f64>(-40.0),
+                "ln Φ_g(−{z:e}) = {lo_g}"
+            );
+            if z == ungated {
+                assert!(
+                    lo_g.is_finite() && lo_g < -4.9e299,
+                    "ln Φ_g(−{z:e}) = {lo_g}"
+                );
+            } else {
+                assert_eq!(lo_g, f64::NEG_INFINITY, "ln Φ_g(−{z:e})");
+            }
+            // Same value at −40, both Mills forms. Measured: 2.0e-14 relative. The generic
+            // side matches the 60-digit mpmath −804.60844201375379 to the last digit; the gap
+            // is the f64 function's own asymptotic, which #2769 leaves alone.
+            assert_relative_eq!(
+                log_normal_cdf_g::<f64>(-40.0),
+                log_normal_cdf(-40.0),
+                max_relative = 5e-14
+            );
         }
         // The gate itself: every shape parameter, both functions, and `NaN` stays `NaN`.
         for a in [0.5, 1.0, 3.7, 50.0] {
@@ -1958,19 +1977,23 @@ mod tests {
         }
     }
 
-    /// #2762's gate on the dual path: past the square's overflow `Φ` and `ln Φ` are
-    /// constant, so the exact jet is zero — matching a central FD of the `f64` value — and
-    /// the `∂/∂a` of `P(a, ∞)` is zero too. Before the gate every jet here was `NaN`.
+    /// #2762's gate on the dual path: past the square's overflow `Φ` is constant, and so is
+    /// `ln Φ` on the upper tail. There the exact jet is zero, matching a central FD of the
+    /// `f64` value, and the `∂/∂a` of `P(a, ∞)` is zero too. Before the gate every jet here
+    /// was `NaN`. The lower tail of `ln Φ_g` is not flat: since #2769 it is the Mills form,
+    /// `−∞` with slope `−z` and curvature `−1`, which
+    /// `log_normal_cdf_g_is_minus_infinity_only_past_the_square_overflow` pins.
     #[test]
     fn the_infinity_gate_carries_a_zero_jet_matching_fd() {
         use crate::sens::dual2::Dual2;
         for z in [1e300, -1e300, f64::INFINITY, f64::NEG_INFINITY] {
             let d = normal_cdf_g(Dual2::<1>::var(z, 0));
             let l = log_normal_cdf_g(Dual2::<1>::var(z, 0));
-            for (name, v, g, h) in [
-                ("Φ_g", d.val(), d.grad[0], d.hess[0][0]),
-                ("ln Φ_g", l.val(), l.grad[0], l.hess[0][0]),
-            ] {
+            let mut jets = vec![("Φ_g", d.val(), d.grad[0], d.hess[0][0])];
+            if z > 0.0 {
+                jets.push(("ln Φ_g", l.val(), l.grad[0], l.hess[0][0]));
+            }
+            for (name, v, g, h) in jets {
                 assert!(v.is_finite(), "{name}({z:e}) = {v}");
                 assert_eq!(g, 0.0, "{name}'({z:e})");
                 assert_eq!(h, 0.0, "{name}''({z:e})");
@@ -1982,6 +2005,10 @@ mod tests {
                 let step = 1e-6 * z.abs();
                 let fd = |f: &dyn Fn(f64) -> f64| (f(z + step) - f(z - step)) / (2.0 * step);
                 assert_eq!(fd(&normal_cdf_g::<f64>), d.grad[0], "Φ_g FD at {z:e}");
+            }
+            if z.is_finite() && z > 0.0 {
+                let step = 1e-6 * z.abs();
+                let fd = |f: &dyn Fn(f64) -> f64| (f(z + step) - f(z - step)) / (2.0 * step);
                 assert_eq!(
                     fd(&log_normal_cdf_g::<f64>),
                     l.grad[0],
