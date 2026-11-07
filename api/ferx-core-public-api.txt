@@ -527,7 +527,9 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::left_init: core::option
 pub ferx_core::estimation::outer_optimizer::OuterResult::max_unconverged_subjects: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::mixture_posteriors: core::option::Option<ferx_core::estimation::outer_optimizer::MixturePosteriors>
 pub ferx_core::estimation::outer_optimizer::OuterResult::n_iterations: usize
+pub ferx_core::estimation::outer_optimizer::OuterResult::newton_decrement: core::option::Option<f64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::ofv: f64
+pub ferx_core::estimation::outer_optimizer::OuterResult::optimizer_stop: core::option::Option<alloc::string::String>
 pub ferx_core::estimation::outer_optimizer::OuterResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::params: ferx_core::ModelParameters
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_mh_accept_tail: core::option::Option<f64>
@@ -2229,6 +2231,9 @@ impl ferx_core::sim::adaptive::DoseAction
 pub fn ferx_core::sim::adaptive::DoseAction::is_stop(&self) -> bool
 pub fn ferx_core::sim::adaptive::DoseAction::to_dose_event(&self, time: f64) -> core::option::Option<ferx_core::DoseEvent>
 pub fn ferx_core::sim::adaptive::DoseAction::validate(&self) -> core::result::Result<(), alloc::string::String>
+#[non_exhaustive] pub enum ferx_core::sim::adaptive::DoseKnowledge
+pub ferx_core::sim::adaptive::DoseKnowledge::Known
+pub ferx_core::sim::adaptive::DoseKnowledge::Oracle
 pub enum ferx_core::sim::adaptive::DoseStep
 pub ferx_core::sim::adaptive::DoseStep::Level
 pub ferx_core::sim::adaptive::DoseStep::Percent(f64)
@@ -2254,6 +2259,7 @@ pub ferx_core::sim::adaptive::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::confirm: u32
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_bounds: (ferx_core::sim::adaptive::DoseValue, ferx_core::sim::adaptive::DoseValue)
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_knowledge: ferx_core::sim::adaptive::DoseKnowledge
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<ferx_core::sim::adaptive::DoseValue>>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
@@ -2279,6 +2285,7 @@ pub ferx_core::sim::adaptive::AdaptiveRun::predictions: alloc::vec::Vec<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::auc_target_attainment: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::cumulative_dose: f64
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::discontinued: bool
+pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::dose_oracle: bool
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::draw: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::eta_supplied: bool
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_decreases: usize
@@ -3395,6 +3402,7 @@ pub ferx_core::types::FitResult::n_starts: usize
 pub ferx_core::types::FitResult::n_subjects: usize
 pub ferx_core::types::FitResult::n_threads_used: usize
 pub ferx_core::types::FitResult::neural_networks: alloc::vec::Vec<ferx_core::NeuralNetworkInfo>
+pub ferx_core::types::FitResult::newton_decrement: core::option::Option<f64>
 pub ferx_core::types::FitResult::nlopt_missing_algorithms: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::npde_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::obs_time_range: core::option::Option<(f64, f64)>
@@ -3411,6 +3419,7 @@ pub ferx_core::types::FitResult::omega_iov_param_corr: core::option::Option<nalg
 pub ferx_core::types::FitResult::omega_is_diagonal: core::option::Option<bool>
 pub ferx_core::types::FitResult::omega_param_corr: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::types::FitResult::optimizer: alloc::string::String
+pub ferx_core::types::FitResult::optimizer_stop: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::outer_gtol: f64
 pub ferx_core::types::FitResult::outer_maxiter: usize
 pub ferx_core::types::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
@@ -4337,6 +4346,7 @@ pub ferx_core::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::confirm: u32
 pub ferx_core::AdaptiveDosingSpec::dose_bounds: (ferx_core::sim::adaptive::DoseValue, ferx_core::sim::adaptive::DoseValue)
+pub ferx_core::AdaptiveDosingSpec::dose_knowledge: ferx_core::sim::adaptive::DoseKnowledge
 pub ferx_core::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<ferx_core::sim::adaptive::DoseValue>>
 pub ferx_core::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
@@ -4381,6 +4391,7 @@ pub ferx_core::AdaptiveSimulationResult::warnings: alloc::vec::Vec<alloc::string
 pub ferx_core::AdaptiveSubjectMetrics::auc_target_attainment: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::cumulative_dose: f64
 pub ferx_core::AdaptiveSubjectMetrics::discontinued: bool
+pub ferx_core::AdaptiveSubjectMetrics::dose_oracle: bool
 pub ferx_core::AdaptiveSubjectMetrics::draw: usize
 pub ferx_core::AdaptiveSubjectMetrics::eta_supplied: bool
 pub ferx_core::AdaptiveSubjectMetrics::n_decreases: usize
@@ -5006,6 +5017,7 @@ pub ferx_core::FitResult::n_starts: usize
 pub ferx_core::FitResult::n_subjects: usize
 pub ferx_core::FitResult::n_threads_used: usize
 pub ferx_core::FitResult::neural_networks: alloc::vec::Vec<ferx_core::NeuralNetworkInfo>
+pub ferx_core::FitResult::newton_decrement: core::option::Option<f64>
 pub ferx_core::FitResult::nlopt_missing_algorithms: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::npde_seed: core::option::Option<u64>
 pub ferx_core::FitResult::obs_time_range: core::option::Option<(f64, f64)>
@@ -5022,6 +5034,7 @@ pub ferx_core::FitResult::omega_iov_param_corr: core::option::Option<nalgebra::b
 pub ferx_core::FitResult::omega_is_diagonal: core::option::Option<bool>
 pub ferx_core::FitResult::omega_param_corr: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::FitResult::optimizer: alloc::string::String
+pub ferx_core::FitResult::optimizer_stop: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::outer_gtol: f64
 pub ferx_core::FitResult::outer_maxiter: usize
 pub ferx_core::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>

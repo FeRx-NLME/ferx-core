@@ -680,7 +680,7 @@ fn the_reported_dose_expression_read_is_the_value_used() {
         std::collections::HashMap::from([("DW".to_string(), 80.0), ("WT".to_string(), 70.0)]);
     let absent = std::collections::HashMap::from([("WT".to_string(), 70.0)]);
     for (label, covs) in [("present", &present), ("absent", &absent)] {
-        let r = exprs.resolve(spec, &p.model, theta, covs);
+        let r = exprs.resolve(spec, &p.model, theta, covs, None);
         assert_eq!(r.reads.len(), 1, "{label}: {:?}", r.reads);
         let (name, read) = &r.reads[0];
         assert_eq!(name, "DW", "{label}");
@@ -693,7 +693,7 @@ fn the_reported_dose_expression_read_is_the_value_used() {
     }
     assert_eq!(
         exprs
-            .resolve(spec, &p.model, theta, &present)
+            .resolve(spec, &p.model, theta, &present, None)
             .plan
             .start_dose,
         1200.0

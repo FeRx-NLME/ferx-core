@@ -252,15 +252,14 @@ pub(crate) fn mills_excess<T: PkNum>(t: T) -> T {
 /// and the probit link's `P(Y = 1)`. [`normal_cdf`] (incomplete-gamma form, no cancellation in
 /// either tail) down to `x = −37`; below it, `φ(x)/(t + a)` with `t = −x` and `a` the Mills
 /// continued fraction ([`mills_excess`]), so the value keeps its digits into the subnormals and
-/// reaches `0` only when `Φ` itself is below them. Above `x = 38`, `1`: `Φ` rounds to `1` from
-/// about `8.3`, and [`normal_cdf`] is `NaN` at `±∞`, which this maps to `1` / `0`. `NaN`
-/// stays `NaN`.
+/// reaches `0` only when `Φ` itself is below them (`−∞` gives `0`). The upper side is
+/// [`normal_cdf`] all the way out: `Φ` rounds to `1` from about `8.3`, and `normal_cdf(+∞) = 1`
+/// since #2762 — the `x > 38 ⇒ 1` arm this used to carry for that rejected exactly the inputs
+/// `normal_cdf` now gets right, so it went (one gate, not two). `NaN` stays `NaN`.
 pub(crate) fn pnorm(x: f64) -> f64 {
     if x < -37.0 {
         let t = -x;
         (-0.5 * t * t).exp() * INV_SQRT_2PI / (t + mills_excess(t))
-    } else if x > 38.0 {
-        1.0
     } else {
         normal_cdf(x)
     }
@@ -746,7 +745,23 @@ fn gamma_p_series<T: PkNum>(a: T, x: T) -> T {
 /// Lentz's continued fraction for the upper incomplete gamma `Q(a, x)`, used when
 /// `x ≥ a + 1`; the caller returns `P = 1 − Q`. `aₙ = −n·(n − a)`,
 /// `bₙ = x + 1 − a + 2n`.
+///
+/// `x = +∞` returns `Q = 0` exactly (and so `P = 1`), with a zero jet — the true limit and
+/// its derivatives, since the Gamma tail and its `a`-sensitivity both vanish there. Without it
+/// the prefactor `exp(−x + a·ln x − ln Γ(a))` is `exp(−∞ + ∞) = NaN`. That is the one gate
+/// behind every `Φ` in this module (#2762): [`erf_g`] / [`erfc_g`] square their argument, so
+/// any `|z| ≳ 1.9e154` reaches here as `x = +∞` and `normal_cdf(±∞)` — or of a merely huge
+/// finite `z` — was `NaN`, taking `log_normal_cdf`, an M3 censored term, and the `pnorm`
+/// expression function with it. Every finite `x` takes the iteration below, unchanged.
+///
+/// The limit holds only for a shape in the function's domain, `0 < a < ∞`. A `NaN` shape
+/// (a transit `n` gone `NaN`) or `a = ∞` (`P(∞, ∞)` is indeterminate) falls through to the
+/// iteration and stays `NaN`, rather than reporting a confident `P = 1` (#2767 review r1 #3).
 fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
+    let av = a.val();
+    if x.val() == f64::INFINITY && av > 0.0 && av.is_finite() {
+        return T::from_f64(0.0);
+    }
     const EPS: f64 = 1e-15;
     const FPMIN: f64 = 1e-300;
     const MAX_ITER: usize = 300;
@@ -1862,6 +1877,128 @@ mod tests {
                 let back = regularized_gamma_p(0.5 * nu, 0.5 * x);
                 assert!((back - p).abs() < 1e-11, "nu={nu} p={p}: P(x)={back}");
             }
+        }
+    }
+
+    /// #2762: `Φ` and `ln Φ` at `±∞` — and at every finite `|z| ≳ 1.9e154`, where
+    /// `erf_g`/`erfc_g` square `z/√2` to `+∞` — are the limits, not `NaN`. Before the
+    /// `gamma_q_cf` gate all of `1e155`, `1e300` and `∞` were `NaN` both ways while `1e150`
+    /// (square still finite) was already `1` / `0`; the pair straddles the overflow, and the
+    /// gated side must agree with the ungated one. Exact equalities throughout, so a `NaN`
+    /// fails every assertion rather than folding away.
+    #[test]
+    fn normal_cdf_and_log_normal_cdf_are_the_limits_at_infinity() {
+        let ungated = 1e150;
+        assert!(
+            (ungated / std::f64::consts::SQRT_2).powi(2).is_finite(),
+            "the control must stay below the square's overflow"
+        );
+        for z in [ungated, 1e155, 1e300, f64::INFINITY] {
+            assert!(
+                z == ungated || (z / std::f64::consts::SQRT_2).powi(2) == f64::INFINITY,
+                "z={z:e} must reach the gate"
+            );
+            assert_eq!(normal_cdf(z), 1.0, "Φ({z:e})");
+            assert_eq!(normal_cdf(-z), 0.0, "Φ(−{z:e})");
+            assert_eq!(normal_cdf_g::<f64>(z), 1.0, "Φ_g({z:e})");
+            assert_eq!(normal_cdf_g::<f64>(-z), 0.0, "Φ_g(−{z:e})");
+            assert_eq!(pnorm(z), 1.0, "pnorm({z:e})");
+            assert_eq!(pnorm(-z), 0.0, "pnorm(−{z:e})");
+            assert_eq!(log_normal_cdf(z), 0.0, "ln Φ({z:e})");
+            assert_eq!(log_normal_cdf_g::<f64>(z), 0.0, "ln Φ_g({z:e})");
+            // The upper-tail inverse Mills ratio the M3 kernels differentiate with.
+            assert_eq!(inv_mills(z), 0.0, "φ/Φ({z:e})");
+            assert_eq!(erf_g::<f64>(z), 1.0, "erf_g({z:e})");
+            assert_eq!(erf_g::<f64>(-z), -1.0, "erf_g(−{z:e})");
+            assert_eq!(erfc_g::<f64>(z), 0.0, "erfc_g({z:e})");
+            assert_eq!(erfc_g::<f64>(-z), 2.0, "erfc_g(−{z:e})");
+            // Lower tail, each function's own convention, and monotone into it: the f64
+            // `log_normal_cdf` has no floor below −37 (its Mills branch gives −804.6 at
+            // −40), so its limit is −∞ and the floor would break monotonicity; the generic
+            // sibling clamps at `MIN_PROB.ln()` from about −37.5 on, so its limit is that
+            // same floor — the value it already returns at −40.
+            let lo = log_normal_cdf(-z);
+            assert!(lo <= log_normal_cdf(-40.0), "ln Φ(−{z:e}) = {lo}");
+            assert_eq!(log_normal_cdf(-f64::INFINITY), f64::NEG_INFINITY);
+            assert_eq!(log_normal_cdf_g::<f64>(-z), MIN_PROB.ln(), "ln Φ_g(−{z:e})");
+            assert_eq!(log_normal_cdf_g::<f64>(-40.0), MIN_PROB.ln());
+        }
+        // The gate itself: every shape parameter, both functions, and `NaN` stays `NaN`.
+        for a in [0.5, 1.0, 3.7, 50.0] {
+            assert_eq!(regularized_gamma_p(a, f64::INFINITY), 1.0, "P({a}, ∞)");
+            assert_eq!(regularized_gamma_q(a, f64::INFINITY), 0.0, "Q({a}, ∞)");
+            assert!(regularized_gamma_p(a, f64::NAN).is_nan(), "P({a}, NaN)");
+        }
+        // …but only for a shape in the domain: a `NaN` or infinite `a` must not borrow the
+        // `x = ∞` limit (review r1 #3; both were `1` with the gate ignoring `a`).
+        for a in [f64::NAN, f64::INFINITY] {
+            assert!(regularized_gamma_p(a, f64::INFINITY).is_nan(), "P({a}, ∞)");
+            assert!(regularized_gamma_q(a, f64::INFINITY).is_nan(), "Q({a}, ∞)");
+        }
+        assert!(normal_cdf(f64::NAN).is_nan());
+        assert!(log_normal_cdf(f64::NAN).is_nan());
+        assert!(pnorm(f64::NAN).is_nan());
+        // The finite tails are untouched (every finite argument below the square's
+        // overflow takes the iteration): the two values here are the pre-#2762 ones.
+        assert_eq!(normal_cdf(-37.0), 5.725_571_222_524_531_3e-300);
+        assert_eq!(normal_cdf(9.0), 1.0);
+        assert!(normal_cdf(7.0) < 1.0);
+        // `pnorm` dropped its `x > 38 ⇒ 1` arm for `normal_cdf`: across the whole span that
+        // arm used to answer, up to the gate, `normal_cdf` gives the same exact `1`.
+        for k in 0..=1540 {
+            let x = 38.0 * 10f64.powf(k as f64 / 10.0);
+            if x > 1.9e154 {
+                break;
+            }
+            assert_eq!(pnorm(x), 1.0, "pnorm({x:e})");
+            if x >= 40.0 {
+                // Φ(−38) is still a subnormal (2.9e-316); from −40 it is below them.
+                assert_eq!(normal_cdf(-x), 0.0, "Φ(−{x:e})");
+            }
+        }
+    }
+
+    /// #2762's gate on the dual path: past the square's overflow `Φ` and `ln Φ` are
+    /// constant, so the exact jet is zero — matching a central FD of the `f64` value — and
+    /// the `∂/∂a` of `P(a, ∞)` is zero too. Before the gate every jet here was `NaN`.
+    #[test]
+    fn the_infinity_gate_carries_a_zero_jet_matching_fd() {
+        use crate::sens::dual2::Dual2;
+        for z in [1e300, -1e300, f64::INFINITY, f64::NEG_INFINITY] {
+            let d = normal_cdf_g(Dual2::<1>::var(z, 0));
+            let l = log_normal_cdf_g(Dual2::<1>::var(z, 0));
+            for (name, v, g, h) in [
+                ("Φ_g", d.val(), d.grad[0], d.hess[0][0]),
+                ("ln Φ_g", l.val(), l.grad[0], l.hess[0][0]),
+            ] {
+                assert!(v.is_finite(), "{name}({z:e}) = {v}");
+                assert_eq!(g, 0.0, "{name}'({z:e})");
+                assert_eq!(h, 0.0, "{name}''({z:e})");
+            }
+            if z.is_finite() {
+                // Both stencil points sit in the flat region, so this FD is 0 for any finite
+                // constant value, right or wrong: it checks the value path is not `NaN` beside
+                // the jet. The `grad == 0` / `hess == 0` assertions above test the jet itself.
+                let step = 1e-6 * z.abs();
+                let fd = |f: &dyn Fn(f64) -> f64| (f(z + step) - f(z - step)) / (2.0 * step);
+                assert_eq!(fd(&normal_cdf_g::<f64>), d.grad[0], "Φ_g FD at {z:e}");
+                assert_eq!(
+                    fd(&log_normal_cdf_g::<f64>),
+                    l.grad[0],
+                    "ln Φ_g FD at {z:e}"
+                );
+            }
+        }
+        for a in [0.5, 3.7] {
+            let p = regularized_gamma_p(Dual2::<2>::var(a, 0), Dual2::<2>::var(f64::INFINITY, 1));
+            assert_eq!(p.val(), 1.0);
+            assert_eq!(p.grad, [0.0, 0.0], "∇P({a}, ∞)");
+            assert_eq!(p.hess, [[0.0; 2]; 2], "∇²P({a}, ∞)");
+            let h = 1e-4;
+            let fd_a = (regularized_gamma_p(a + h, f64::INFINITY)
+                - regularized_gamma_p(a - h, f64::INFINITY))
+                / (2.0 * h);
+            assert_eq!(fd_a, p.grad[0], "∂P/∂a FD at ({a}, ∞)");
         }
     }
 }

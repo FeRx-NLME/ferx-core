@@ -1046,8 +1046,16 @@ pub(crate) fn optimize_trust_region_seeded(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum,
     } = out;
     warnings.extend(cov_warnings);
+    // #2785: a trust region that stopped on a small step is not thereby at a minimum.
+    crate::estimation::covariance::demote_non_stationary_optimum(
+        non_stationary_optimum,
+        &mut converged,
+        &mut warnings,
+    );
 
     OuterResult {
         params: final_params,
@@ -1091,6 +1099,8 @@ pub(crate) fn optimize_trust_region_seeded(
         start_eval: None,
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement,
+        optimizer_stop: None,
     }
 }
 

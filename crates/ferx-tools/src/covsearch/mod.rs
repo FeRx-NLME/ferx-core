@@ -372,6 +372,11 @@ pub struct CovsearchResult {
     /// The search stopped on a flipped [`CancelFlag`]; `steps` and
     /// `final_model` are what it reached.
     pub cancelled: bool,
+    /// Why the backward phase ended with effects it never tested, when it did.
+    /// `None` means every effect left in the final model that the forward
+    /// phases added was tested at `p_backward`, or that no backward phase ran
+    /// because none was asked for. The same text is in `notes`.
+    pub backward_incomplete: Option<String>,
 }
 
 impl CovsearchResult {
@@ -635,6 +640,7 @@ pub(crate) fn search(
             included,
             notes,
             true,
+            None,
         ));
     }
 
@@ -688,14 +694,25 @@ pub(crate) fn search(
     }
 
     // ── backward ────────────────────────────────────────────────────────
+    let mut backward_incomplete = None;
     if !cancelled && options.algorithm == Algorithm::ScmForwardThenBackward {
         let outcome =
             forward.backward(&mut parent, &mut included, &mut rows, &mut step, &mut notes)?;
         cancelled |= outcome.cancelled;
+        backward_incomplete = outcome.incomplete;
     }
 
+    notes.extend(backward_incomplete.clone());
     Ok(finish(
-        options, base_model, base_ofv, rows, parent, included, notes, cancelled,
+        options,
+        base_model,
+        base_ofv,
+        rows,
+        parent,
+        included,
+        notes,
+        cancelled,
+        backward_incomplete,
     ))
 }
 
@@ -709,6 +726,7 @@ fn finish(
     included: Vec<Included>,
     notes: Vec<String>,
     cancelled: bool,
+    backward_incomplete: Option<String>,
 ) -> CovsearchResult {
     CovsearchResult {
         options: options.clone(),
@@ -722,12 +740,31 @@ fn finish(
         included,
         notes,
         cancelled,
+        backward_incomplete,
     }
 }
 
 /// What one phase reports back to the driver.
 struct Outcome {
     cancelled: bool,
+    /// See [`CovsearchResult::backward_incomplete`].
+    incomplete: Option<String>,
+}
+
+impl Outcome {
+    fn finished() -> Outcome {
+        Outcome {
+            cancelled: false,
+            incomplete: None,
+        }
+    }
+
+    fn cancelled() -> Outcome {
+        Outcome {
+            cancelled: true,
+            incomplete: None,
+        }
+    }
 }
 
 /// The state shared by every phase.
@@ -807,7 +844,7 @@ impl Pass<'_> {
                     phase,
                     selected: None,
                 });
-                return Ok(Outcome { cancelled: true });
+                return Ok(Outcome::cancelled());
             }
             // A complete step has one row per candidate, in candidate order,
             // so a row index is a `remaining` index.
@@ -846,7 +883,7 @@ impl Pass<'_> {
 
             rows.extend(step_rows);
             let Some(i) = winner else {
-                return Ok(Outcome { cancelled: false });
+                return Ok(Outcome::finished());
             };
             let effect = remaining.remove(i);
             let result = report
@@ -879,7 +916,7 @@ impl Pass<'_> {
             }
             taken += 1;
         }
-        Ok(Outcome { cancelled: false })
+        Ok(Outcome::finished())
     }
 
     /// Backward elimination over the effects the forward phases added.
@@ -892,6 +929,11 @@ impl Pass<'_> {
         notes: &mut Vec<String>,
     ) -> Result<Outcome, String> {
         let mut taken = 0usize;
+        // What the latest step left untested. A later step retries those
+        // effects and replaces this, so it only survives the step the phase
+        // ends on, whether that step selected nothing or `max_steps` allows no
+        // retry after it.
+        let mut incomplete = None;
         loop {
             let removable: Vec<Effect> = included
                 .iter()
@@ -899,7 +941,10 @@ impl Pass<'_> {
                 .map(|i| i.effect.clone())
                 .collect();
             if removable.is_empty() || !self.steps_left(taken) {
-                return Ok(Outcome { cancelled: false });
+                return Ok(Outcome {
+                    cancelled: false,
+                    incomplete,
+                });
             }
             *step += 1;
             let phase = Phase::Backward;
@@ -949,7 +994,7 @@ impl Pass<'_> {
                     phase,
                     selected: None,
                 });
-                return Ok(Outcome { cancelled: true });
+                return Ok(Outcome::cancelled());
             }
             debug_assert_eq!(step_rows.len(), removable.len());
 
@@ -970,9 +1015,13 @@ impl Pass<'_> {
                 phase,
                 selected,
             });
+            incomplete = incomplete_backward_note(*step, &step_rows, self.options.p_backward);
             rows.extend(step_rows);
             let Some(i) = winner else {
-                return Ok(Outcome { cancelled: false });
+                return Ok(Outcome {
+                    cancelled: false,
+                    incomplete,
+                });
             };
             let effect = &removable[i];
             let result = report
@@ -993,6 +1042,38 @@ impl Pass<'_> {
             taken += 1;
         }
     }
+}
+
+/// The note for a backward step that left effects untested, or `None` when
+/// every removal was judged.
+///
+/// A phase that ends on such a step looks like one that completed, so without
+/// this the two read the same: exit 0 and a `Final model` holding terms that
+/// never met `p_backward` (#2789).
+fn incomplete_backward_note(step: usize, rows: &[StepRow], alpha: f64) -> Option<String> {
+    let untested: Vec<&StepRow> = rows
+        .iter()
+        .filter(|r| !(r.passed && r.lrt.is_some()))
+        .collect();
+    let first = untested.first()?;
+    let how_many = if untested.len() == rows.len() {
+        "every candidate".to_string()
+    } else {
+        format!("{} of {} candidates", untested.len(), rows.len())
+    };
+    let labels: Vec<String> = untested.iter().map(|r| r.effect.label()).collect();
+    let reason = first
+        .failures
+        .first()
+        .or(first.note.as_ref())
+        .map_or("no reason recorded", String::as_str);
+    Some(format!(
+        "backward elimination is incomplete: {how_many} of backward step {step} failed, so {} \
+         stayed in the final model without being tested at p_backward = {alpha}. First failure \
+         ({}): {reason}",
+        labels.join(", "),
+        first.effect.label(),
+    ))
 }
 
 /// Compare every candidate of a step with its parent.

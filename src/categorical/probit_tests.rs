@@ -486,3 +486,28 @@ fn the_nan_predictor_warning_names_either_key() {
     );
     assert!(!w.contains("the `logit` expression"), "{w}");
 }
+
+/// #2762 on the probit record term (#2767 review r1 #1): `neg_log_normal_cdf_jet` calls
+/// `normal_cdf` directly, not `pnorm`, so it is a caller of its own. Past the square's
+/// overflow (`(x/√2)² = ∞` from `x ≈ 1.9e154`) the jet was `[NaN; 5]`. Above that point the
+/// record's probability is 1, so `−log Φ` and its four derivatives must equal the ungated
+/// control at `1e150`, where `Φ` already rounds to `1`. Array `==` fails on any `NaN`.
+///
+/// The lower side (`x ≤ −2`) is the Mills continued-fraction branch, which never forms `Φ`,
+/// so this gate does not touch it. `x = +∞` itself still has `NaN` in `d2..d4` (`−0·∞` in
+/// the recursion): a separate issue, not this gate.
+#[test]
+fn the_probit_jet_past_the_normal_cdf_overflow_is_the_certain_record() {
+    let control = 1e150;
+    assert!((control / std::f64::consts::SQRT_2).powi(2).is_finite());
+    let want = neg_log_normal_cdf_jet(control);
+    assert_eq!(want[0], 0.0, "−log Φ(1e150)");
+    for x in [1e155, 1e300] {
+        assert_eq!(
+            (x / std::f64::consts::SQRT_2).powi(2),
+            f64::INFINITY,
+            "{x:e}"
+        );
+        assert_eq!(neg_log_normal_cdf_jet(x), want, "jet({x:e})");
+    }
+}

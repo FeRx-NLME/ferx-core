@@ -8,11 +8,14 @@
 use crate::estimation::cov_diagnostics::{
     cov_objective_method, cov_objective_route, decrement_is_non_stationary,
     estimate_minimises_cov_objective, format_non_stationary_gradient_warning,
-    format_non_stationary_warning, format_offdiag_nan_warning, format_quadrature_declined_warning,
+    format_non_stationary_optimum_warning, format_non_stationary_warning,
+    format_offdiag_nan_warning, format_quadrature_declined_warning,
     format_quadrature_objective_note, format_regularized_warning, format_salvage_note,
-    newton_decrement, r_falls_back_to_s, tests_stationarity_by_gradient, CovHessianSource,
+    held_at_bound, largest_newton_steps, newton_decrement, r_falls_back_to_s, stationarity_reading,
+    tests_minimum_stationarity, tests_stationarity_by_gradient, CovHessianSource,
     CovObjectiveRoute, CovRegularizationFacts, CovScopeDecline, NonStationaryFacts,
-    NonStationaryGradientFacts, OdeToleranceFacts, S_RANK_DEFICIENT_REASON,
+    NonStationaryGradientFacts, OdeToleranceFacts, NON_STATIONARY_NAMED_COORDS,
+    S_RANK_DEFICIENT_REASON,
 };
 use crate::estimation::inner_optimizer::find_ebe_for_stage;
 use crate::estimation::outer_optimizer::pop_nll_opts;
@@ -43,6 +46,14 @@ pub(crate) struct CovarianceOutput {
     /// `R⁻¹` / `R⁻¹SR⁻¹` that would have inverted a floored `R` at an estimate the objective
     /// never optimised by `S⁻¹` ([`crate::estimation::cov_diagnostics::r_falls_back_to_s`]).
     pub method: CovarianceMethod,
+    /// The Newton decrement of the OFV at the estimate, in OFV units (#2541, #2785), when the
+    /// step tested stationarity; `None` when it did not (no `R`, a floored `R` at an estimate
+    /// its method minimised, cancellation).
+    pub newton_decrement: Option<f64>,
+    /// The estimate's method minimised this objective and the decrement exceeds one standard
+    /// error (#2785): the fit stopped short of a stationary point, and whoever publishes
+    /// `converged` demotes it. The warning saying so is already in `warnings`.
+    pub non_stationary_optimum: bool,
 }
 
 /// Return type of [`compute_covariance`].
@@ -2360,6 +2371,8 @@ fn covariance_step(
             matrix: DMatrix::zeros(n, n),
             warnings: vec![],
             method: options.covariance_method,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         }));
     }
 
@@ -2407,6 +2420,8 @@ fn covariance_step(
                 .into_iter()
                 .collect(),
             method: CovarianceMethod::CrossProduct,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         }));
     }
 
@@ -2942,7 +2957,18 @@ fn covariance_step(
     // Off the fallback a sampler's `R` was not clipped, so `inv.inverse` is exactly `H⁻¹`.
     // The gradient is taken at the modes reconverged at `cov_inner_tol` (a mixture re-solves
     // its own), the ones the analytic R-matrix is assembled at.
-    if tests_stationarity_by_gradient(fit_method, fallback_to_s)
+    //
+    // #2785: the same test on an estimate its method *did* minimise — FOCE, FOCEI, Laplace /
+    // AGQ, Gauss–Newton — where a decrement above one standard error says the optimizer
+    // stopped short, whatever its own stop rule said, and the fit is demoted
+    // ([`CovarianceOutput::non_stationary_optimum`]). Only on an unclipped `R`: a floored
+    // `R⁻¹` reads `1/floor` along the clipped direction and would demote on the floor, which
+    // has its own warning. A coordinate on a bound whose slope points out of the box is
+    // held: that slope is the constraint's, not a stall's.
+    let minimum_test = tests_minimum_stationarity(fit_method, inv.n_clipped);
+    let mut newton_decrement_read = None;
+    let mut non_stationary_optimum = false;
+    if (tests_stationarity_by_gradient(fit_method, fallback_to_s) || minimum_test)
         && !crate::cancel::is_cancelled(&options.cancel)
     {
         let (ehs, hms, kaps) = if is_mixture {
@@ -2972,19 +2998,50 @@ fn covariance_step(
             nn_reg.as_ref(),
         );
         let g_free = DVector::from_iterator(n_free, free_idx.iter().map(|&i| g[i]));
-        let decrement = newton_decrement(&g_free, &inv.inverse);
-        if decrement_is_non_stationary(decrement) {
-            let msg = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
-                method: fit_method,
-                objective: cov_objective_method(options),
-                requested: estimator,
-                decrement,
-                quadrature_nodes,
-            });
-            if options.verbose {
-                eprintln!("  {}", msg);
+        if minimum_test {
+            let pick = |v: &[f64]| free_idx.iter().map(|&i| v[i]).collect::<Vec<_>>();
+            let held = held_at_bound(
+                &pick(x_hat),
+                g_free.as_slice(),
+                &pick(&bounds.lower),
+                &pick(&bounds.upper),
+            );
+            if let Some(reading) = stationarity_reading(&g_free, &inv.inverse, &held) {
+                newton_decrement_read = Some(reading.decrement);
+                if decrement_is_non_stationary(reading.decrement) {
+                    non_stationary_optimum = true;
+                    let largest: Vec<(String, f64)> =
+                        largest_newton_steps(&reading.step_se, NON_STATIONARY_NAMED_COORDS)
+                            .into_iter()
+                            .map(|(a, z)| (packed_param_label(free_idx[a], template), z))
+                            .collect();
+                    let msg = format_non_stationary_optimum_warning(
+                        fit_method,
+                        reading.decrement,
+                        &largest,
+                    );
+                    if options.verbose {
+                        eprintln!("  {}", msg);
+                    }
+                    cov_warnings.push(msg);
+                }
             }
-            cov_warnings.push(msg);
+        } else {
+            let decrement = newton_decrement(&g_free, &inv.inverse);
+            newton_decrement_read = Some(decrement);
+            if decrement_is_non_stationary(decrement) {
+                let msg = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
+                    method: fit_method,
+                    objective: cov_objective_method(options),
+                    requested: estimator,
+                    decrement,
+                    quadrature_nodes,
+                });
+                if options.verbose {
+                    eprintln!("  {}", msg);
+                }
+                cov_warnings.push(msg);
+            }
         }
     }
     if inv.n_clipped > 0 && estimator != CovarianceMethod::CrossProduct {
@@ -3053,6 +3110,8 @@ fn covariance_step(
         matrix: cov,
         warnings: cov_warnings,
         method: estimator,
+        newton_decrement: newton_decrement_read,
+        non_stationary_optimum,
     }))
 }
 
@@ -3580,6 +3639,27 @@ pub(crate) struct CovStepOutcome {
     /// `None` exactly when `matrix` is `None`; see
     /// [`published_covariance_method`].
     pub method: Option<crate::types::CovarianceMethod>,
+    /// [`CovarianceOutput::newton_decrement`]; `None` when no matrix was produced.
+    pub newton_decrement: Option<f64>,
+    /// [`CovarianceOutput::non_stationary_optimum`] (#2785): the caller that publishes
+    /// `converged` demotes it ([`demote_non_stationary_optimum`]).
+    pub non_stationary_optimum: bool,
+}
+
+/// Demote `converged` for a covariance step that found the estimate is not a stationary
+/// point of the objective its method minimised (#2785), pushing the generic
+/// "did not converge" line a demoted fit carries beside the step's own
+/// `W_NON_STATIONARY_OPTIMUM` (already in the step's warnings) — once, so a run already
+/// reported unconverged does not get it twice.
+pub(crate) fn demote_non_stationary_optimum(
+    non_stationary_optimum: bool,
+    converged: &mut bool,
+    warnings: &mut Vec<String>,
+) {
+    if non_stationary_optimum && *converged {
+        *converged = false;
+        warnings.push("Outer optimization did not converge".to_string());
+    }
 }
 
 /// The estimator label to publish alongside a covariance matrix: `Some(routed)`
@@ -3864,6 +3944,8 @@ pub(crate) fn run_covariance_step_inner(
     // The estimator the returned matrix actually is: `routed`, unless `compute_covariance`
     // itself replaced it (#1781's `S⁻¹` fallback), which it reports on its output.
     let mut used = routed;
+    let mut newton_decrement = None;
+    let mut non_stationary_optimum = false;
     let cov_timer = std::time::Instant::now();
     let matrix = match compute_covariance_for(
         fit_method, x_hat, template, model, population, eta_hats, h_matrices, kappas, options,
@@ -3871,6 +3953,8 @@ pub(crate) fn run_covariance_step_inner(
         CovarianceStepResult::Success(out) => {
             warnings.extend(out.warnings);
             used = out.method;
+            newton_decrement = out.newton_decrement;
+            non_stationary_optimum = out.non_stationary_optimum;
             Some(out.matrix)
         }
         CovarianceStepResult::Unusable(msg) => {
@@ -3896,6 +3980,8 @@ pub(crate) fn run_covariance_step_inner(
         wall_time_secs: cov_timer.elapsed().as_secs_f64(),
         warnings,
         sir_fallback_proposal,
+        newton_decrement,
+        non_stationary_optimum,
     }
 }
 
@@ -3929,6 +4015,8 @@ impl CovStepOutcome {
             warnings: Vec::new(),
             sir_fallback_proposal: None,
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         }
     }
 }
@@ -3972,6 +4060,8 @@ pub(crate) fn run_covariance_step(
             sir_fallback_proposal: None,
             // No step ran, so no estimator to name (#1382).
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         }
     }
 }

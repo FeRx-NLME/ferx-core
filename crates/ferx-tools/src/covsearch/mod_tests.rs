@@ -173,7 +173,7 @@ impl StepFitter for Script {
                 .or_else(|| self.ofv.get(&key))
                 .copied()
                 .unwrap_or(self.fallback);
-            if self.erroring.contains(&key) {
+            if self.erroring.contains(&key) || self.erroring.contains(&c.id) {
                 results.push(CandidateResult {
                     id: c.id.clone(),
                     hash: c.hash(),
@@ -600,6 +600,223 @@ fn backward_stops_when_a_strictness_failure_is_the_only_removable_one() {
     assert_eq!(labels(&result.included), vec!["CL-WT-power"]);
     let row = result.step_rows(2).next().unwrap();
     assert!(!row.passed && !row.selected);
+}
+
+// ── a backward phase that could not finish (#2789) ───────────────────────────
+
+/// Forward adds CL-WT then V-WT; `b3-…` are the first backward candidates.
+fn two_effect_script() -> Script {
+    Script::new(&[
+        ("", 100.0),
+        ("CL-WT=power", 80.0),
+        ("V-WT=power", 90.0),
+        ("CL-WT=power;V-WT=power", 72.0),
+    ])
+}
+
+fn two_effects() -> Space {
+    space(vec![pow("CL", "WT"), pow("V", "WT")])
+}
+
+#[test]
+fn a_backward_step_with_every_candidate_failing_is_reported() {
+    let mut script = two_effect_script();
+    script.erroring.push("b3-CL-WT-power".into());
+    script.erroring.push("b3-V-WT-power".into());
+    let result = run(&script, two_effects(), &CovsearchOptions::default());
+
+    // The final model is the end of the forward phase, as it must be…
+    assert_eq!(labels(&result.included).len(), 2);
+    assert!(result.step_rows(3).all(|r| !r.passed && !r.selected));
+    // …and every clause of the note says something the reader needs.
+    let note = result.backward_incomplete.as_deref().expect("a note");
+    assert_eq!(
+        note,
+        "backward elimination is incomplete: every candidate of backward step 3 failed, so \
+         CL-WT-power, V-WT-power stayed in the final model without being tested at p_backward \
+         = 0.001. First failure (CL-WT-power): no fit: does not compile"
+    );
+    assert!(result.notes.iter().any(|n| n == note), "{:?}", result.notes);
+
+    let summary = render_summary(&result);
+    assert!(
+        summary.contains("Final model (backward elimination incomplete): OFV 72.000"),
+        "{summary}"
+    );
+    assert!(summary.contains(&format!("  - {note}")), "{summary}");
+
+    let dir = tempfile::tempdir().unwrap();
+    write_report(dir.path(), &result).unwrap();
+    let final_model = std::fs::read_to_string(final_model_path(dir.path())).unwrap();
+    assert!(
+        final_model.starts_with(&format!("# {note}\n")),
+        "{final_model}"
+    );
+    // The comment does not stop the file being a model.
+    ModelText::parse(&final_model).unwrap();
+}
+
+#[test]
+fn a_completed_backward_phase_reads_as_complete() {
+    let script = two_effect_script();
+    let result = run(&script, two_effects(), &CovsearchOptions::default());
+    assert!(result.backward_incomplete.is_none());
+    assert!(result.notes.is_empty(), "{:?}", result.notes);
+
+    let summary = render_summary(&result);
+    assert!(summary.contains("Final model: OFV"), "{summary}");
+    assert!(!summary.contains("incomplete"), "{summary}");
+
+    let dir = tempfile::tempdir().unwrap();
+    write_report(dir.path(), &result).unwrap();
+    let final_model = std::fs::read_to_string(final_model_path(dir.path())).unwrap();
+    assert!(!final_model.contains("incomplete"), "{final_model}");
+}
+
+#[test]
+fn a_last_step_with_some_candidates_failing_names_only_those() {
+    let mut script = two_effect_script();
+    script.erroring.push("b3-V-WT-power".into());
+    // Removing CL-WT costs 18, over p_backward's cutoff of 10.83, so it is
+    // judged and kept and nothing is selected.
+    let result = run(&script, two_effects(), &CovsearchOptions::default());
+    let note = result.backward_incomplete.as_deref().expect("a note");
+    assert!(
+        note.contains("1 of 2 candidates of backward step 3"),
+        "{note}"
+    );
+    assert!(note.contains("so V-WT-power stayed"), "{note}");
+    assert!(note.contains("First failure (V-WT-power)"), "{note}");
+    assert!(!note.contains("CL-WT-power"), "{note}");
+    assert!(!note.contains("every candidate"), "{note}");
+}
+
+#[test]
+fn a_failed_candidate_in_a_step_that_removes_something_is_retried_not_reported() {
+    // V-WT fails at step 3, but CL-WT is removable there, so step 4 offers V-WT
+    // again and judges it: nothing went untested.
+    let mut script = Script::new(&[
+        ("", 100.0),
+        ("CL-WT=power", 80.0),
+        ("V-WT=power", 90.0),
+        ("CL-WT=power;V-WT=power", 72.0),
+    ]);
+    script.ofv_by_id.insert("b3-CL-WT-power".into(), 74.0);
+    script.erroring.push("b3-V-WT-power".into());
+    let result = run(&script, two_effects(), &CovsearchOptions::default());
+    assert!(result.step_rows(3).any(|r| r.selected));
+    assert!(result.step_rows(4).all(|r| r.passed && r.lrt.is_some()));
+    assert!(result.backward_incomplete.is_none());
+}
+
+/// Adaptive scope reduction is the way past `max_steps`: at one step per phase,
+/// forward adds CL-WT and stashes V-WT, adaptive adds V-WT, and backward gets a
+/// single step for two effects. Removing CL-WT is taken there, so step 4, which
+/// would retry a failed V-WT, is never allowed.
+fn one_step_per_phase() -> (Script, Space, CovsearchOptions) {
+    let mut script = Script::new(&[
+        ("", 100.0),
+        ("CL-WT=power", 80.0),
+        ("V-WT=power", 99.0),
+        ("CL-WT=power;V-WT=power", 72.0),
+    ]);
+    script.ofv_by_id.insert("b3-CL-WT-power".into(), 74.0);
+    let options = CovsearchOptions {
+        adaptive_scope_reduction: true,
+        max_steps: Some(1),
+        ..CovsearchOptions::default()
+    };
+    (script, two_effects(), options)
+}
+
+#[test]
+fn a_failure_the_step_limit_stops_retrying_is_reported() {
+    let (mut script, space, options) = one_step_per_phase();
+    script.erroring.push("b3-V-WT-power".into());
+    let result = run(&script, space, &options);
+
+    assert!(result.step_rows(3).any(|r| r.selected));
+    assert_eq!(result.n_steps(), 3, "{:?}", result.steps);
+    assert_eq!(labels(&result.included), vec!["V-WT-power"]);
+    let note = result.backward_incomplete.as_deref().expect("a note");
+    assert!(
+        note.contains("1 of 2 candidates of backward step 3"),
+        "{note}"
+    );
+    assert!(note.contains("so V-WT-power stayed"), "{note}");
+    assert!(result.notes.iter().any(|n| n == note), "{:?}", result.notes);
+}
+
+#[test]
+fn a_step_limit_with_nothing_failed_is_not_incomplete() {
+    let (script, space, options) = one_step_per_phase();
+    let result = run(&script, space, &options);
+    assert_eq!(result.n_steps(), 3, "{:?}", result.steps);
+    assert!(result.backward_incomplete.is_none());
+}
+
+#[test]
+fn a_step_that_fails_after_an_earlier_removal_names_the_later_step() {
+    let mut script = two_effect_script();
+    script.ofv_by_id.insert("b3-V-WT-power".into(), 74.0);
+    script.erroring.push("b4-CL-WT-power".into());
+    let result = run(&script, two_effects(), &CovsearchOptions::default());
+    assert_eq!(labels(&result.included), vec!["CL-WT-power"]);
+    let note = result.backward_incomplete.as_deref().expect("a note");
+    assert!(
+        note.contains("every candidate of backward step 4"),
+        "{note}"
+    );
+    assert!(note.contains("so CL-WT-power stayed"), "{note}");
+}
+
+#[test]
+fn a_strictness_failure_counts_as_untested_and_gives_its_reason() {
+    let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
+    script.failing.push("b2-CL-WT-power".into());
+    let result = run(
+        &script,
+        space(vec![pow("CL", "WT")]),
+        &CovsearchOptions::default(),
+    );
+    let note = result.backward_incomplete.as_deref().expect("a note");
+    assert!(
+        note.ends_with("First failure (CL-WT-power): stalled at the initial estimates (#751)"),
+        "{note}"
+    );
+}
+
+#[test]
+fn the_note_takes_an_unjudgeable_rows_reason_when_no_gate_failed() {
+    let script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
+    let result = run(
+        &script,
+        space(vec![pow("CL", "WT")]),
+        &CovsearchOptions::default(),
+    );
+    let mut row = result.step_rows(2).next().unwrap().clone();
+    assert!(incomplete_backward_note(2, std::slice::from_ref(&row), 0.001).is_none());
+
+    // Passed the gate but has no comparison: judged by nothing.
+    row.lrt = None;
+    row.note = Some("the fit is not in the journal cache".into());
+    let note = incomplete_backward_note(2, std::slice::from_ref(&row), 0.001).unwrap();
+    assert!(
+        note.ends_with("First failure (CL-WT-power): the fit is not in the journal cache"),
+        "{note}"
+    );
+
+    row.note = None;
+    let note = incomplete_backward_note(2, std::slice::from_ref(&row), 0.001).unwrap();
+    assert!(note.ends_with("no reason recorded"), "{note}");
+}
+
+#[test]
+fn a_forward_only_search_has_no_backward_phase_to_be_incomplete() {
+    let mut script = two_effect_script();
+    script.erroring.push("b3-CL-WT-power".into());
+    let result = run(&script, two_effects(), &forward_only());
+    assert!(result.backward_incomplete.is_none());
 }
 
 // ── adaptive scope reduction ─────────────────────────────────────────────────
