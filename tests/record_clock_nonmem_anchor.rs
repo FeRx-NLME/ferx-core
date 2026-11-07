@@ -41,6 +41,10 @@
 //!   row's. Under the parent-row rule ferx was off by 11.8 on `addl_f` and 4.05 on
 //!   `addl_ftime`. Under a governing-record lag it is off by 1.67 on `addl_lag` (13 %, ID 1
 //!   at `TIME 14`). Analytic and ODE twins, NONMEM 7.5.1, `.tab` at 17 significant figures.
+//!   A third twin, `addl_lag_route` (#2367), writes ALAG1 as the route's own lag,
+//!   `first_order(ka=KA, lag=0.25·X)` on a dose into central. A first-order route lagged by
+//!   L is a depot dosed with ALAG = L, so it is the same model and is checked against the
+//!   same `.tab`. Reading the route lag at the governing record is 1.67 off at the same row.
 //! * `addl_lagt`, `addl_dx`, `addl_dt` (#1909): the `TIME` each attribute sees.
 //!   `ALAG1 = 0.25 + 0.05·TIME` on the same data reads the parent row's `TIME`; reading
 //!   the governing `TIME` instead is 3.78 off. On `addl_inf`, an implied `RATE=-2` dose
@@ -123,7 +127,7 @@ fn worst_pred_error_on(
     nm.retain(|(id, _, _)| keep(id));
     assert!(!nm.is_empty(), "{anchor}: no observations kept");
     assert_eq!(ferx.len(), nm.len(), "{anchor}: observation count");
-    let tol = pred_tol(anchor);
+    let tol = pred_tol(anchor, twin);
     let mut worst = 0.0_f64;
     for (r, (id, t, want)) in ferx.iter().zip(&nm) {
         assert!(
@@ -227,6 +231,14 @@ fn an_addl_implied_dose_takes_f_and_time_from_the_governing_record_and_lag_from_
 }
 
 #[test]
+fn an_addl_implied_dose_takes_its_route_lag_from_its_parent_matches_nonmem() {
+    // `addl_lag` again, with ALAG1 on a depot spelled as a route lag on a dose into central:
+    // `first_order(ka=KA, lag=0.25·X)`. One model, so one `.tab`.
+    let pk_only: &[(&str, &[f64])] = &[("1", &[]), ("2", &[12.0]), ("3", &[]), ("4", &[])];
+    worst_pred_error("addl_lag", "addl_lag_route", "addl_dose", pk_only);
+}
+
+#[test]
 fn an_addl_implied_infusion_takes_its_modelled_duration_from_the_governing_record_matches_nonmem() {
     // IDs 3, 4 and 6 code RATE=-1. NONMEM re-reads R1 on every advance, which ferx does
     // not do for any modelled-rate infusion, implied or not. That defect predates #1909
@@ -260,8 +272,21 @@ const PRED_TOL: f64 = 1e-7;
 // what keeps a 1e-8 drift in either engine from passing.
 const PRED_TOL_17: f64 = 1e-12;
 
-/// The bound for `anchor`'s `.tab`, by how many significant figures it prints.
-fn pred_tol(anchor: &str) -> f64 {
+// `addl_lag_route` integrates the absorbed input as a forcing. The other ODE twins carry it as
+// a state. On the time-varying-X subjects (IDs 1–3) the forcing's RK error shows at the
+// `.tab`'s precision. The worst |PRED − NONMEM| is 9.6e-10, at ID 1 `TIME 40` (macOS arm64,
+// ode_reltol = abstol = 1e-12). It is integration error, because it scales with the
+// tolerance: 9.7e-8 at 1e-10 (PR #2668 body) and 1.0e-11 at 1e-14. ID 4 (constant X) is 1.8e-15. A bound of
+// 1e-8 leaves 10× headroom over the worst. Reading the route lag at the governing record
+// moves a PRED by 1.67 (ID 1 at `TIME 14`), and no affected row by less than 8.9e-2.
+const PRED_TOL_ROUTE_FORCING: f64 = 1e-8;
+
+/// The bound for `twin` against `anchor`'s `.tab`. It is set by how many significant figures
+/// the `.tab` prints, except for a twin whose own integration error is larger than that.
+fn pred_tol(anchor: &str, twin: &str) -> f64 {
+    if twin == "addl_lag_route" {
+        return PRED_TOL_ROUTE_FORCING;
+    }
     match anchor {
         "evid2_clock" | "tied_evid2" | "tied_evid2_advan1" => PRED_TOL,
         "addl_tie" | "addl_f" | "addl_lag" | "addl_ftime" | "addl_lagt" | "addl_dx" | "addl_dt" => {
