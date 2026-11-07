@@ -6899,6 +6899,7 @@ fn axis_seed_starts_ladder_about_the_centre_and_skip_a_fixed_coordinate() {
         &[true, false, true],
         &[0.5, 1.0, 0.0],
         2,
+        None,
     );
     let want: Vec<Vec<f64>> = vec![
         vec![0.0, 0.25, 0.75],
@@ -6907,6 +6908,56 @@ fn axis_seed_starts_ladder_about_the_centre_and_skip_a_fixed_coordinate() {
         vec![2.5, 0.25, 0.75],
     ];
     assert_eq!(starts, want);
+}
+
+/// With Ω, an axis seed moves along Ω's column for its coordinate, so its move is exactly
+/// `(m + 1)` prior SDs in `Ω⁻¹`'s metric however correlated Ω is (#2788). Without the shift
+/// the same seed on ρ = 0.999 is ~1000× farther in that metric — the straddle. A diagonal Ω
+/// gives the seeds of `None` bit for bit, and the scanned coordinate lands where it always did.
+///
+/// Mutation (run): drop the conditional-mean shift — the correlated distances are ~2000 and
+/// ~4500 instead of 4 and 9; apply it with `Ω_ij/Ω_jj` — the distances are wrong.
+#[test]
+fn axis_seeds_follow_the_prior_column_of_a_correlated_omega() {
+    let rho = 0.999;
+    let (s1, s2) = (0.5, 0.25);
+    let omega = DMatrix::from_row_slice(2, 2, &[s1 * s1, rho * s1 * s2, rho * s1 * s2, s2 * s2]);
+    let inv = omega.clone().try_inverse().unwrap();
+    let base = [0.1, -0.05];
+    let sd = [s1, s2];
+    let quad = |a: &[f64], b: &[f64]| {
+        let v = DVector::from_iterator(2, a.iter().zip(b).map(|(x, y)| x - y));
+        (v.transpose() * &inv * &v)[(0, 0)]
+    };
+    let shifted = axis_seed_starts(&base, &[0.0, 0.0], &[true, false], &sd, 2, Some(&omega));
+    let held = axis_seed_starts(&base, &[0.0, 0.0], &[true, false], &sd, 2, None);
+    assert_eq!(shifted.len(), 4);
+    for (k, (seed, plain)) in shifted.iter().zip(&held).enumerate() {
+        assert_eq!(
+            seed[0], plain[0],
+            "seed {k}: the scanned coordinate is where it was"
+        );
+        // The move from `base` along coordinate 0 is `seed[0] − base[0]`, not `(m + 1)·sd`
+        // (seeds ladder about the centre, not about `base`), so compare to its own length.
+        let along = (seed[0] - base[0]) / s1;
+        let d = quad(seed, &base);
+        assert!(
+            (d - along * along).abs() < 1e-9 * along * along,
+            "seed {k}: {d} prior units against the {along}-SD move"
+        );
+        assert!(
+            quad(plain, &base) > 400.0 * d,
+            "seed {k}: the held seed is not across the ridge ({})",
+            quad(plain, &base)
+        );
+    }
+
+    let diagonal = DMatrix::from_row_slice(2, 2, &[s1 * s1, 0.0, 0.0, s2 * s2]);
+    let scan = [true, true];
+    assert_eq!(
+        axis_seed_starts(&base, &[0.0, 0.0], &scan, &sd, 2, Some(&diagonal)),
+        axis_seed_starts(&base, &[0.0, 0.0], &scan, &sd, 2, None)
+    );
 }
 
 #[test]

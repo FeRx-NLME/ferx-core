@@ -1885,12 +1885,25 @@ fn section_has_barrier(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], seed: &[f64]) -> 
 /// The starts of the guarded multi-start's axis scan: `base` with one scanned coordinate
 /// replaced by `centre[i] ± (m + 1)·sd[i]` for `m` in `1..=restarts`, coordinate by
 /// coordinate, the negative seed of each pair first. A coordinate of zero prior SD has none.
+///
+/// With `omega` (the BSV Ω, over the leading coordinates it covers), a seed moves the
+/// coordinates correlated with `i` too, by their conditional mean `Ω_ji/Ω_ii · Δ` for the
+/// move `Δ` of coordinate `i` — along Ω's own column for `i`, so the seed's move is the
+/// `(m + 1)` prior SDs it is meant to be (#2788). Holding them, as without `omega`, crosses
+/// the prior's ridge: on the melphalan model at a FOCEI plateau (ρ(η_CL, η_V) = 0.9995) a
+/// two-SD η_CL seed with η_V held sat at `ηᵀΩ⁻¹η ≈ 6e5`, objective 3e5, and the descents from
+/// those seeds — into `V2 = 1e-60 … 1e110`, a hopelessly stiff ODE — made that plateau's cold
+/// solve of 68 subjects take 78 s; it takes 1.3 s on the same optimizer path now. A
+/// coordinate uncorrelated with `i` (every one, for a diagonal Ω) is not touched, so its seeds
+/// are bit-identical. The IOV scan passes `None`: its flat vector's κ blocks have their own
+/// priors, and it keeps the held seeds it had.
 fn axis_seed_starts(
     base: &[f64],
     centre: &[f64],
     scan: &[bool],
     sd: &[f64],
     restarts: usize,
+    omega: Option<&DMatrix<f64>>,
 ) -> Vec<Vec<f64>> {
     let mut starts = Vec::new();
     for i in 0..base.len() {
@@ -1902,6 +1915,14 @@ fn axis_seed_starts(
             for k in [-step, step] {
                 let mut start = base.to_vec();
                 start[i] = centre[i] + k;
+                if let Some(om) = omega.filter(|om| i < om.nrows() && om[(i, i)] > 0.0) {
+                    let delta = start[i] - base[i];
+                    for (j, sj) in start.iter_mut().enumerate().take(om.nrows()) {
+                        if j != i && om[(j, i)] != 0.0 {
+                            *sj += om[(j, i)] / om[(i, i)] * delta;
+                        }
+                    }
+                }
                 starts.push(start);
             }
         }
@@ -3281,7 +3302,14 @@ fn find_ebe_solve(
             .map(|p| p.var.max(0.0).sqrt())
             .collect();
         let mut axis_moved = false;
-        for mut cand in axis_seed_starts(&eta, &vec![0.0; n_eta], &scan_coord, &sds, restarts) {
+        for mut cand in axis_seed_starts(
+            &eta,
+            &vec![0.0; n_eta],
+            &scan_coord,
+            &sds,
+            restarts,
+            Some(&params.omega.matrix),
+        ) {
             let ok = inner_minimize_with_grad(
                 &obj,
                 &agrad,
@@ -4134,14 +4162,14 @@ fn find_ebe_iov_seeded(
                 .enumerate()
                 .map(|(i, flat)| {
                     let only_i: Vec<bool> = (0..n_flat).map(|j| j == i).collect();
-                    flat || axis_seed_starts(&x, &centre, &only_i, &sds, restarts)
+                    flat || axis_seed_starts(&x, &centre, &only_i, &sds, restarts, None)
                         .iter()
                         .any(|seed| section_has_barrier(&obj, &x, seed))
                 })
                 .collect()
         };
         let mut axis_moved = false;
-        for mut cand in axis_seed_starts(&x, &centre, &scan_coord, &sds, restarts) {
+        for mut cand in axis_seed_starts(&x, &centre, &scan_coord, &sds, restarts, None) {
             #[cfg(test)]
             IOV_AXIS_SEEDS_RUN.with(|n| n.set(n.get() + 1));
             let ok = inner_minimize_with_grad(

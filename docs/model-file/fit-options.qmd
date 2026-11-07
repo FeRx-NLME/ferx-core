@@ -213,6 +213,12 @@ Guarded multi-start count for the inner (per-subject EBE) optimizer, to escape a
 
 The initial BFGS metric also decides which basin a cold start lands in. Under `focei`, `foce`, `gn`, `gn_hybrid` and `laplace` (any `n_agq`), warm-started inner solves seed BFGS from the subject's conditional η-Hessian, which speeds up re-convergence near the previous mode. A **cold** start (the first outer evaluation and the final cold EBE re-solve) runs twice, once with that seed and once with the historical metric, and keeps the lower objective; the two share one [Sobol screen](#inner-screen), whose descents read neither metric (#2549). Neither metric picks the right basin on every subject ([#1504](https://github.com/FeRx-NLME/ferx-core/pull/1504)). If both reach the same mode, the historical solve is kept, so unimodal subjects are unchanged. Models with a `[covariate_nn]` block never use the seed.
 
+#### Seeds under a correlated Ω {#inner-restarts-correlated}
+
+A per-coordinate seed is placed `±2·sd`, `±3·sd`, … along its random effect. Under a `block_omega`, the random effects correlated with it move too, by their conditional mean given that move: the seed follows Ω's own column for that coordinate, so it sits the intended 2 or 3 prior SDs out. With a diagonal Ω nothing else moves and the seeds are as before.
+
+Until [#2788](https://github.com/FeRx-NLME/ferx-core/issues/2788) the other random effects were held. On a strongly correlated Ω that crosses the prior's ridge. On a melphalan 2-compartment ODE model at a FOCEI plateau, with ρ(η_CL, η_V) = 0.9995, a 2-SD η_CL seed with η_V held was at a prior distance `ηᵀΩ⁻¹η` of about 6×10⁵. The descents from those seeds ran on to `V2` of 10⁻⁶⁰ to 10¹¹⁰, where every ODE solve is stiff. On the same optimizer path, the cold solve of 68 subjects at that plateau went from 78 s to 1.3 s, and the fit from 191 s to 13 s, ending at the same OFV, 2686.670708 (Linux x86_64, one thread).
+
 #### Inter-occasion variability {#inner-restarts-iov}
 
 On a subject with occasions in a `kappa` / `block_kappa` model, the per-coordinate seeds run on the whole search vector: every random effect and each occasion's `kappa` ([#2730](https://github.com/FeRx-NLME/ferx-core/issues/2730)). Before #2730 they did not run on these subjects at all, so `inner_restarts` had no effect there. Each `kappa` seed is placed by that `kappa`'s own variance, and under [nested levels](individual-parameters.qmd) there is one coordinate per group of each level.
