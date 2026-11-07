@@ -271,6 +271,20 @@ const ACCOUNTED: &[(&str, &str)] = &[
         "Stochastic differential equations ([diffusion]",
         "See the Feature Maturity and SDE pages in the documentation.",
     ),
+    // The SS non-convergence sink is one set for the whole process, and `fit()` drains it
+    // into `FitResult.warnings`, so a concurrently running lib test that caps an SS
+    // equilibration (a Michaelis–Menten model dosed at steady state) lands its warning
+    // here; no lib test can assert the sink empty (`dosing.rs`, #1289). This fixture has no
+    // SS dose and never writes one. Measured: 1 failure in 23 runs of the `mixture optimizer
+    // auto` filter on `main` at 1a770c5e, both messages from another test.
+    (
+        "Steady-state (SS=1) equilibration did not converge within",
+        "The returned SS trough is unreliable.",
+    ),
+    (
+        "Steady-state (SS=1) equilibration reached the",
+        "simulations for such a model may be biased low.",
+    ),
 ];
 
 /// Fit `model` and assert that the only thing `fit_inner` says about

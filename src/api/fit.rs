@@ -281,17 +281,20 @@ pub fn fit_from_files(
 /// For the FOCE/FOCEI path the requested optimizer is resolved through
 /// `estimation::outer_optimizer::resolve_outer_optimizer` — the function the outer loop
 /// itself dispatches on — and not a second copy of the rule (#1540). `auto` is reported
-/// with what it resolved to (e.g. `auto (nlopt_lbfgs)`, #490). A mixture model sends
-/// `auto` to BOBYQA, which `Optimizer::resolve_auto` alone does not know about, and it
-/// replaces an explicit optimizer that cannot carry the mixture objective (built-in
-/// BFGS/L-BFGS, trust-region) with BOBYQA too; that replacement is reported as `bobyqa`,
-/// and the outer loop's downgrade warning says why. `has_mixture` is the same
-/// `init_params.mixture.is_some()` the outer loop keys on.
+/// with what it resolved to (e.g. `auto (nlopt_lbfgs)`, #490). A mixture model replaces an
+/// explicit optimizer that cannot carry the mixture objective (built-in BFGS/L-BFGS,
+/// trust-region) with BOBYQA, which `Optimizer::resolve_auto` alone does not know about;
+/// that replacement is reported as `bobyqa`, and the outer loop's downgrade warning says
+/// why. A mixture whose classes start indistinguishable (`symmetric_start`) runs `auto` under
+/// BOBYQA and is reported so. `has_mixture` and `symmetric_start` are what the outer loop keys
+/// on, at the start the final stage ran from. `symmetric_start` is evaluated only on the
+/// methods that run the outer optimizer, since it costs `O(n_subj · K)` inner evaluations.
 pub(crate) fn reported_optimizer_label(
     method: EstimationMethod,
     options: &FitOptions,
     model: &CompiledModel,
     has_mixture: bool,
+    symmetric_start: impl FnOnce() -> bool,
 ) -> String {
     match method {
         EstimationMethod::Saem => "saem".to_string(),
@@ -303,7 +306,7 @@ pub(crate) fn reported_optimizer_label(
         EstimationMethod::Impmap => "impmap-bobyqa".to_string(),
         EstimationMethod::Imp => "imp-bobyqa".to_string(),
         _ => {
-            let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
+            let (resolved, _) = crate::estimation::outer_optimizer::resolve_fit_optimizer(
                 options.optimizer,
                 model,
                 has_mixture,
@@ -311,6 +314,7 @@ pub(crate) fn reported_optimizer_label(
                     model,
                     options.interaction,
                 ),
+                symmetric_start(),
             );
             if options.optimizer == Optimizer::Auto {
                 format!("auto ({})", resolved.label())
@@ -1874,6 +1878,15 @@ fn fit_inner(
         }
     }
 
+    // The start the last stage ran from and the optimizer it requested, for the reported
+    // optimizer: a mixture's `auto` depends on whether its classes start indistinguishable there
+    // (`resolve_fit_optimizer`). The stage's own `optimizer` is what matters, not the fit's,
+    // because the guard overrides `auto` alone and a stage may rewrite it. Defensive today: the
+    // only stage that rewrites it is Laplace, and `E_MIXTURE_METHOD` refuses Laplace on a mixture
+    // until #985 wires it — so no reachable fit has a stage request that differs from the fit's.
+    // Reading the fit's would publish `auto (bobyqa)` for a stage that ran L-BFGS the moment it
+    // does (the #1540 defect class).
+    let mut last_stage_start: Option<(ModelParameters, Optimizer)> = None;
     for (stage_idx, &method) in chain.iter().enumerate() {
         // Resume: stages before the checkpoint's stage are already done. Record
         // zero wall time for them so `method_wall_times_secs` stays parallel to
@@ -1887,6 +1900,14 @@ fn fit_inner(
         }
         crate::io::checkpoint::set_stage(stage_idx);
         let stage_start = std::time::Instant::now();
+        // Recorded after the per-stage `optimizer` rewrites below, so it is the request the
+        // outer loop was handed.
+        let record_stage_start = |start: &ModelParameters, opts: &FitOptions| {
+            init_params
+                .mixture
+                .is_some()
+                .then(|| (start.clone(), opts.optimizer))
+        };
         let mut stage_opts = options.clone();
         stage_opts.method = method;
         stage_opts.methods = Vec::new();
@@ -2247,6 +2268,7 @@ fn fit_inner(
             continue;
         }
 
+        last_stage_start = record_stage_start(&stage_params, &stage_opts);
         let stage_result = match method {
             EstimationMethod::Saem => saem::run_saem(model, population, &stage_params, &stage_opts)
                 .map_err(EngineError::uncoded)?,
@@ -3207,8 +3229,26 @@ fn fit_inner(
         result.covariance_method,
     ));
 
-    let optimizer_label =
-        reported_optimizer_label(final_method, options, model, init_params.mixture.is_some());
+    // Judged at the start the last stage ran from, under the optimizer that stage requested.
+    // A restart *inside* the stage (the floor escape, a basin shift) begins elsewhere and is not
+    // re-judged: the label describes the stage's first run, as `left_init` does.
+    //
+    // Lazy: the scan is `O(n_subj · K)` inner objective evaluations, and the methods that report
+    // a fixed label (SAEM, IMP / IMPMAP, GN) never read it.
+    let symmetric_start = || {
+        last_stage_start.as_ref().is_some_and(|(start, optimizer)| {
+            crate::estimation::outer_optimizer::symmetric_mixture_start(
+                model, population, start, *optimizer,
+            )
+        })
+    };
+    let optimizer_label = reported_optimizer_label(
+        final_method,
+        options,
+        model,
+        init_params.mixture.is_some(),
+        symmetric_start,
+    );
 
     let mut fit_result = FitResult {
         restored_from_checkpoint: false,

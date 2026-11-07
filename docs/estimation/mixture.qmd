@@ -75,12 +75,16 @@ $$
 `nll_ik` is the ordinary per-subject FOCE/FOCEI negative log-likelihood evaluated
 with class-$k$ parameters and a **separate empirical Bayes solve per
 (subject × class)**. The mixing-logit coefficients are ordinary thetas and any
-per-class $\Omega$/$\Sigma$ are estimated jointly. Estimation defaults to the
-derivative-free BOBYQA outer optimizer; an analytic posterior-weighted outer
-gradient is available — exact also under IOV and with a block (correlated) $\Omega$ — so a
-user-selected NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured, with an automatic
-finite-difference fallback for subjects outside analytic scope. `MIXNUM`-branched typical
-values are in scope.
+per-class $\Omega$/$\Sigma$ are estimated jointly. The outer gradient is analytic and
+posterior-weighted, exact also under IOV and with a block (correlated) $\Omega$, with an
+automatic finite-difference fallback for subjects outside analytic scope; `MIXNUM`-branched
+typical values are in scope. So `optimizer = auto` runs L-BFGS on a mixture as on any other
+model in that scope, and an explicit NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is
+honoured. The exception is a start whose classes are indistinguishable (the same mixing
+probability and the same objective under every class), where no gradient optimizer can
+separate them. `auto` runs BOBYQA there and warns `W_MIXTURE_SYMMETRIC_START`; see
+[mixture models](optimizers.qmd#auto-mixture) on the optimizers page, which has the
+measurements. Give the classes different initial values.
 
 ## Output
 

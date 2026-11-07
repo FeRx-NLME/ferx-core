@@ -192,23 +192,29 @@ pub(crate) fn resolve_outer_optimizer(
     has_mixture: bool,
     analytic_outer_gradient: bool,
 ) -> (Optimizer, Option<String>) {
-    // Mixture models (#977). BOBYQA (derivative-free) is the default and safe
-    // choice — robust against the mixture's label-switching multimodality. Since
-    // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
-    // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
-    // honoured — those route through `optimize_nlopt`, whose objective closure
-    // branches to `mixture_gradient`. Every other choice (including `auto`, and
-    // the built-in BFGS / trust-region paths, which do not carry the mixture
-    // objective) falls back to BOBYQA.
+    // Mixture models (#977). The NLopt optimizers carry the mixture objective:
+    // `optimize_nlopt`'s objective closure branches to the analytic posterior-weighted
+    // `mixture_gradient` (Phase 4), so a user who picks SLSQP / L-BFGS / MMA is
+    // honoured, and `auto` follows the same rule as any other model: L-BFGS when the
+    // analytic outer gradient is in scope, BOBYQA otherwise. BOBYQA was `auto`'s mixture
+    // choice until #2739, as "robust against label switching". Measured on the public
+    // mixture fixtures (`tests/nonmem/mixture_iv*.csv`, 100 seeded random starts each),
+    // L-BFGS reached the best optimum as often as BOBYQA (100 vs 100, 71 vs 74, 99 vs 99)
+    // in 5–8× fewer evaluations. The one start it cannot leave is a permutation-symmetric
+    // one, which `optimize_population` detects and runs under BOBYQA
+    // (`mixture::classes_indistinguishable`). The built-in BFGS / trust-region /
+    // Gauss–Newton paths do not carry the mixture objective and fall back to BOBYQA.
     if has_mixture {
         return match requested {
             Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => (requested, None),
-            // `Auto` is the mixture default and downgrades silently by design;
-            // any *explicitly* chosen optimizer that the mixture path can't drive
+            Optimizer::Auto => (
+                requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
+                None,
+            ),
+            // Any *explicitly* chosen optimizer that the mixture path can't drive
             // (built-in BFGS/L-BFGS, trust-region, Gauss-Newton — none carry the
             // mixture objective) is run under BOBYQA instead, so say so rather than
             // dropping the choice invisibly.
-            Optimizer::Auto => (Optimizer::Bobyqa, None),
             other => (
                 Optimizer::Bobyqa,
                 Some(format!(
@@ -223,6 +229,61 @@ pub(crate) fn resolve_outer_optimizer(
         requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
         None,
     )
+}
+
+/// The optimizer a fit started at `init_params` runs: [`resolve_outer_optimizer`], except that a
+/// mixture whose classes start indistinguishable runs BOBYQA where `auto` would pick a gradient
+/// optimizer, with [`mixture_symmetric_start_warning`]. Such a start is a saddle no gradient
+/// optimizer leaves (`mixture::classes_indistinguishable`). Only `auto`'s own choice is
+/// overridden; an explicit gradient optimizer is the user's to keep.
+///
+/// The rule the outer loop dispatches on and the one `fit()` reports its optimizer from, so the
+/// two cannot disagree (#1540); `symmetric_start` is [`symmetric_mixture_start`] at the start the
+/// stage was run from. Returns the warnings owed with the choice.
+pub(crate) fn resolve_fit_optimizer(
+    requested: Optimizer,
+    model: &CompiledModel,
+    has_mixture: bool,
+    analytic_outer_gradient: bool,
+    symmetric_start: bool,
+) -> (Optimizer, Vec<String>) {
+    let (resolved, downgrade) =
+        resolve_outer_optimizer(requested, model, has_mixture, analytic_outer_gradient);
+    let mut warnings: Vec<String> = downgrade.into_iter().collect();
+    if requested == Optimizer::Auto
+        && has_mixture
+        && resolved != Optimizer::Bobyqa
+        && symmetric_start
+    {
+        warnings.push(mixture_symmetric_start_warning());
+        return (Optimizer::Bobyqa, warnings);
+    }
+    (resolved, warnings)
+}
+
+/// Whether a fit of a mixture under `optimizer = auto` starts where its classes cannot be told
+/// apart ([`crate::estimation::mixture::classes_indistinguishable`]). Evaluated only where it
+/// can change the choice: a mixture left on `auto`.
+pub(crate) fn symmetric_mixture_start(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    requested: Optimizer,
+) -> bool {
+    requested == Optimizer::Auto
+        && init_params.mixture.is_some()
+        && crate::estimation::mixture::classes_indistinguishable(model, population, init_params)
+}
+
+/// The warning for a mixture whose classes start indistinguishable, where `auto` runs BOBYQA
+/// instead of L-BFGS ([`crate::estimation::mixture::classes_indistinguishable`]).
+fn mixture_symmetric_start_warning() -> String {
+    "W_MIXTURE_SYMMETRIC_START: the mixture's classes start indistinguishable: the same \
+     mixing probability and the same objective for every subject under every class. A \
+     gradient optimizer cannot separate classes from such a start, so `optimizer = auto` ran \
+     BOBYQA instead of L-BFGS. Give the classes different initial values (for example of the \
+     class-specific parameters, or of the mixing probability) to fit with L-BFGS."
+        .to_string()
 }
 
 /// Run the outer optimizer for one stage from `init_params`.
@@ -260,13 +321,13 @@ pub fn optimize_population(
     // The mixture arm and the `auto` resolution both live in
     // `resolve_outer_optimizer`, so the #1381 coupling check cannot describe a
     // different rule than the one that runs here.
-    let (resolved, downgrade) = resolve_outer_optimizer(
+    let (resolved, optimizer_downgrade_warning) = resolve_fit_optimizer(
         options.optimizer,
         model,
         init_params.mixture.is_some(),
         crate::sens::provider::analytic_outer_gradient_for_interaction(model, options.interaction),
+        symmetric_mixture_start(model, population, init_params, options.optimizer),
     );
-    let optimizer_downgrade_warning: Vec<String> = downgrade.into_iter().collect();
     let owned_opts;
     let options = if resolved == options.optimizer {
         options

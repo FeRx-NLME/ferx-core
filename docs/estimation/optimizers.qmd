@@ -37,7 +37,7 @@ The default `optimizer = auto` picks the algorithm per model (see [`auto`](#the-
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `auto` | Per-model selection | **Default.** Resolves to `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are or the model is a mixture. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
+| `auto` | Per-model selection | **Default.** Resolves to `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are or a mixture's classes start indistinguishable. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
 
 ### NLopt algorithms
 
@@ -164,14 +164,28 @@ generous enough that the good start is allowed to settle.
 - **`nlopt_lbfgs`** — when the **exact analytic gradient** is available (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) and the model is **not** forced onto finite differences via `gradient = fd`.
 - **`bobyqa`** — otherwise: any model outside the analytic scope (for example an out-of-scope ODE/PD model or an SDE model), or any fit with `gradient = fd`, where the outer loop runs on finite differences.
 
-Two cases override that rule:
+One case overrides that rule, and mixture models have one exception of their own:
 
 - **More than 64 free packed parameters** (`BOBYQA_MAX_DIM`) → `nlopt_lbfgs` even on a finite-difference gradient. BOBYQA's interpolation set grows quadratically with the parameter count, so above that size O(n) FD passes are cheaper (#1064).
-- **Mixture models** (`[mixture]`) → `bobyqa` regardless of gradient availability, as the robust choice against label-switching multimodality (#977).
+- **A mixture model whose classes start indistinguishable** → `bobyqa`, with a `W_MIXTURE_SYMMETRIC_START` warning. Mixture models (`[mixture]`) otherwise follow the general rule. See [Mixture models](#auto-mixture) below.
 
 Outside these overrides, the choice mirrors the analytic-vs-FD decision the outer loop already makes: `auto` lands on the gradient-based optimizer when there is an exact gradient to feed it. Limited benchmarking across ~10 real FOCEI datasets (#490) found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin). A residual `correlation` line with `kappa` once sent `auto` to L-BFGS on a finite-difference gradient (#2122); it has the exact gradient now and follows the general rule.
 
-For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)`, or `auto (bobyqa)` for a mixture model — so a run records which algorithm actually executed (#1540). An explicit `trust_region` (or, from the API, the built-in BFGS/L-BFGS) that the mixture override replaces with BOBYQA is reported as `bobyqa` too, with a warning; an explicit NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) is honoured. One exception: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
+For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)`, or `auto (bobyqa)` for a model outside the analytic scope or a mixture started with indistinguishable classes — so a run records which algorithm actually executed (#1540). An explicit `trust_region` (or, from the API, the built-in BFGS/L-BFGS) that the mixture override replaces with BOBYQA is reported as `bobyqa` too, with a warning; an explicit NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) is honoured. One exception: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
+
+### Mixture models {#auto-mixture}
+
+A `[mixture]` model left on `auto` follows the rule above: `nlopt_lbfgs` on the analytic posterior-weighted outer gradient (#977), `bobyqa` where only finite differences are available. Until [#2739](https://github.com/FeRx-NLME/ferx-core/issues/2739) every mixture took `bobyqa`, as the choice robust against label switching. Measured, it is not more robust. From 100 seeded random starts on each of the public mixture fixtures (`tests/nonmem/mixture_iv.csv` with Ω/Σ fixed and free, and `tests/nonmem/mixture_iv_iov.csv`), the two optimizers reached the best optimum about equally often. L-BFGS needed 5–8× fewer evaluations:
+
+| fixture | BOBYQA | L-BFGS | median evaluations, BOBYQA / L-BFGS |
+|---|---|---|---|
+| `mixture_iv`, Ω/Σ fixed | 100 of 100 | 100 of 100 | 199 / 31 |
+| `mixture_iv`, Ω/Σ estimated | 74 of 100 | 71 of 100 | 336 / 44 |
+| `mixture_iv_iov` | 99 of 100 | 99 of 100 | 150 / 27 |
+
+On the estimated-Ω variant both optimizers end in the same collapsed-class local optimum from about a quarter of the starts. Started from the same start, BOBYQA did better 16 times and L-BFGS 13 times. Both reach NONMEM's optimum from the fixtures' own starts (OFV 301.5820 and 470.8143). On a simulated fixture of a two-compartment oral model with a lag, IOV and a two-class mixture over 200 doses per subject (`examples/mixture_2cpt_oral_iov.ferx`, generated by `tools/sim_mixture_2cpt_oral_iov.py`), the fit went from 4719 s and 451 evaluations to 504 s and 35, at the same optimum (Linux x86_64, one thread, both arms at `1a770c5e`).
+
+The one start L-BFGS cannot leave is one where the classes are **indistinguishable**: the same mixing probability and the same objective for every subject under every class, for example two classes with the same initial typical values at a mixing logit of 0. The objective is then symmetric under swapping the classes, and so is its gradient. A gradient optimizer moves both classes the same way, never separates them, and stops on that saddle reporting convergence: on `mixture_iv` at OFV 350.27, against the optimum's 301.58. `auto` checks for such a start and runs `bobyqa` from it, whose probe steps break the symmetry. The fit says so with `W_MIXTURE_SYMMETRIC_START` and records `auto (bobyqa)`. Giving the classes different initial values avoids it. The check compares the classes exactly, so classes that differ in any parameter, a class Ω or Σ, or the mixing probability are distinguishable.
 
 ### `gradient = fd` moves the optimizer too {#gradient-fd-moves-the-optimizer}
 

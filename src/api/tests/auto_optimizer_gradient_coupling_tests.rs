@@ -385,18 +385,19 @@ fn an_sde_model_is_forced_to_fd_by_the_engine_and_stays_silent() {
     );
 }
 
-/// **Finding 2 — a mixture fit was told its optimizer moved when it had not.**
+/// **Finding 2 — the warning must describe the rule the outer loop runs, mixture included.**
 ///
-/// `optimize_population` special-cases mixtures: `optimizer = auto` is BOBYQA for a
-/// mixture *whatever* the gradient situation, because the label-switching
-/// multimodality is what the choice is about. The first cut asked `resolve_auto`,
-/// which knows nothing of that arm, so an analytic-scope mixture with `gradient = fd`
-/// was told it had swapped `nlopt_lbfgs` for `bobyqa` — a swap that never happened.
+/// The first cut asked `resolve_auto`, which knows nothing of the mixture arm of
+/// `resolve_outer_optimizer`. While that arm sent every mixture's `auto` to BOBYQA, an
+/// analytic-scope mixture with `gradient = fd` was told it had swapped `nlopt_lbfgs` for
+/// `bobyqa`, a swap that never happened. Since a mixture's `auto` follows the analytic
+/// gradient like any other model's (L-BFGS in scope, BOBYQA on FD), the swap is real and
+/// the mixture warns exactly as its non-mixture twin does.
 ///
-/// The straddle is asserted: the same model *without* the mixture does warn, so this
-/// test cannot pass by the fixture having drifted out of analytic scope.
+/// The straddle is asserted: the same model without the mixture warns too, so this test
+/// cannot pass by the fixture having drifted out of analytic scope.
 #[test]
-fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
+fn a_mixture_fit_warns_like_its_non_mixture_twin() {
     let mut model = analytical_model(GradientMethod::Fd);
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
@@ -424,22 +425,27 @@ fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
         sigma_override_addr: Vec::new(),
         sigma_override_fixed: Vec::new(),
     });
-    assert_eq!(
+    let resolve = |analytic| {
         crate::estimation::outer_optimizer::resolve_outer_optimizer(
             Optimizer::Auto,
             &model,
             true,
-            true,
+            analytic,
         )
-        .0,
-        Optimizer::Bobyqa,
-        "a mixture resolves `auto` to BOBYQA even with an analytic gradient available"
+        .0
+    };
+    assert_eq!(
+        (resolve(true), resolve(false)),
+        (Optimizer::NloptLbfgs, Optimizer::Bobyqa),
+        "a mixture's `auto` follows the analytic gradient like any other model's"
     );
-    assert!(
-        !check_model_options(&model, &opts)
+    assert_eq!(
+        check_model_options(&model, &opts)
             .iter()
-            .any(|d| d.code == CODE),
-        "a mixture's `auto` is BOBYQA with or without the gradient override"
+            .filter(|d| d.code == CODE)
+            .count(),
+        1,
+        "the mixture's `gradient = fd` moves its `auto` too, and must say so"
     );
 }
 
