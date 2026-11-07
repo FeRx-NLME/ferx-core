@@ -3,6 +3,7 @@ use crate::estimation::inner_optimizer::{
     InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
+use crate::sens::ode_provider::adjoint::DeclineCause;
 use crate::stats::likelihood::{
     foce_subject_nll_cov, foce_subject_nll_iov_cov, SUBJECT_SENTINEL_NLL,
 };
@@ -428,9 +429,33 @@ pub fn optimize_population(
     // the runtime log, rather than from a probe in `fit_inner`: only this scope knows
     // which evaluations ran, and the log is empty for every route that never reaches the
     // analytic branch — so no route gate is needed and none can go stale.
+    // #2713 review: classified only when there is a warning to carry it, at the point the
+    // fit reports — one adjoint pass per subject, no salvage.
+    if !declines.declined_indices().is_empty() {
+        if let Some(at) = declines_at_estimates(
+            model,
+            population,
+            init_params,
+            &result.params,
+            &result.eta_hats,
+            &result.kappas,
+            options,
+        ) {
+            declines.set_at_estimates(at);
+        }
+    }
     if let Some(w) = outer_fd_fallback_warning(model, population, &declines) {
         result.warnings.push(w);
     }
+    // #2713 review: a gradient-driven stop short of convergence is probed for its cause.
+    failure::attach_failure_probe(
+        resolved,
+        model,
+        population,
+        init_params,
+        options,
+        &mut result,
+    );
     result
 }
 
@@ -9855,6 +9880,19 @@ fn reconverged_probe_ofv(
     warm: &[DVector<f64>],
     options: &FitOptions,
 ) -> f64 {
+    reconverged_probe(xv, init_params, model, population, warm, options).0
+}
+
+/// [`reconverged_probe_ofv`] with the EBEs the probe re-solved, which the outer-failure
+/// probe ([`failure::diagnose_outer_failure`]) compares across points for mode switches.
+fn reconverged_probe(
+    xv: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+) -> (f64, Vec<DVector<f64>>) {
     let params = unpack_params(xv, init_params);
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
@@ -9872,12 +9910,14 @@ fn reconverged_probe_ofv(
     );
     let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
     let n_subj = population.subjects.len();
-    if !raw.is_finite() || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
+    let ofv = if !raw.is_finite()
+        || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
     {
         1e20
     } else {
         raw
-    }
+    };
+    (ofv, ehs)
 }
 
 /// The gradient of the objective the covariance step's `R` is the Hessian of, at `x` (#2541):
@@ -10289,7 +10329,7 @@ fn subject_fixed_ebe_gradient(
     (nll, gi)
 }
 
-/// Is subject `subject`'s analytic outer-gradient decline **structural** — one it takes
+/// Is subject `subject`'s analytic outer-gradient decline **structural**: one it takes
 /// at every parameter point of the fit, rather than the parameter-dependent decline
 /// (non-PD inner Hessian at a blown-up trial) #1529 made cheap? (#1536)
 ///
@@ -10300,21 +10340,16 @@ fn subject_fixed_ebe_gradient(
 /// The adjoint's kernel scores dense residual covariances itself, so the one structural
 /// cause left is a subject no recorder serves: its decline is scope, not numerics, and
 /// recurs at every evaluation exactly as a model-level exclusion does.
-fn is_structural_decline(
-    model: &CompiledModel,
-    subject: &Subject,
-    init_params: &ModelParameters,
-    eta_hat: &[f64],
-) -> bool {
-    // A subject no recorder can serve declines at every evaluation, as a model-level
-    // exclusion does; any other decline is numerical (a non-PD factor at a trial point).
-    crate::sens::ode_provider::adjoint::exact_eta_jacobian(
-        model,
-        subject,
-        &init_params.theta,
-        eta_hat,
-    )
-    .is_none()
+///
+/// Read off the adjoint's own [`DeclineCause`] (#2713 review round 4), the same fact the
+/// warning reports, so routing and report cannot disagree. Until then this re-ran the
+/// recorder at the trial's EBE, and any recording that failed there counted, including a
+/// parameter-dependent one: a lagged arrival landing on a covariate-change row (the
+/// separability check of the event walk) declines at one lag and is served at the next,
+/// yet took the reconverged salvage and the "no analytic recorder serves them" sentence
+/// (`a_parameter_dependent_recorder_decline_is_not_structural`).
+fn is_structural_decline(cause: DeclineCause) -> bool {
+    cause == DeclineCause::Shape
 }
 
 /// The salvage a declined non-IOV subject takes in [`population_gradient_sens_mixed_dx`]:
@@ -10614,6 +10649,8 @@ fn subject_analytic_outer_gradient(
 
 /// [`subject_analytic_outer_gradient`], and with `want_eta_dx` the subject's mode response
 /// `dη̂/dx` formed from the same recording; the response is `None` wherever the gradient is.
+/// A declined gradient comes back as the adjoint's [`DeclineCause`] (#2713), so the decline
+/// log can say why — a non-finite component is a failed recording.
 fn subject_analytic_outer_gradient_dx(
     model: &CompiledModel,
     subject: &Subject,
@@ -10621,23 +10658,26 @@ fn subject_analytic_outer_gradient_dx(
     eta_hat: &[f64],
     interaction: bool,
     want_eta_dx: bool,
-) -> (Option<Vec<f64>>, Option<Vec<DVector<f64>>>) {
-    if !want_eta_dx || (subject.observations.is_empty() && subject.obs_records.is_empty()) {
-        return (
-            subject_analytic_outer_gradient(model, subject, pt, eta_hat, interaction),
-            None,
-        );
+) -> (Result<Vec<f64>, DeclineCause>, Option<Vec<DVector<f64>>>) {
+    use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_and_mode_at, ModeOut};
+    // No data at all contributes nothing (`sens_outer_gradient::subject_gradient_at`).
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        return (Ok(vec![0.0; pt.x.len()]), None);
     }
-    let (g, dx) = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_with_eta_dx_at(
-        model,
-        subject,
-        pt,
-        eta_hat,
-        interaction,
-    );
-    match g.filter(|g| g.iter().all(|v| v.is_finite())) {
-        Some(g) => (Some(g), dx),
-        None => (None, None),
+    let objective = if interaction {
+        crate::sens::ode_provider::adjoint::Objective::Focei
+    } else {
+        crate::sens::ode_provider::adjoint::Objective::Foce
+    };
+    let mut out = ModeOut {
+        want_dx: want_eta_dx,
+        ..ModeOut::default()
+    };
+    let g = subject_adjoint_gradient_and_mode_at(model, subject, pt, eta_hat, objective, &mut out);
+    match g {
+        Some(g) if g.iter().all(|v| v.is_finite()) => (Ok(g), out.eta_dx),
+        Some(_) => (Err(DeclineCause::Recording), None),
+        None => (Err(out.decline.unwrap_or(DeclineCause::Recording)), None),
     }
 }
 
@@ -11034,10 +11074,41 @@ pub(crate) struct OuterFdDeclineLog {
     /// admits is exactly such a gradient. Keyed on the route the subject took, not on the
     /// model-level predicate.
     reconverge_declined: bool,
+    /// Per declined subject, the [`DeclineCause`]s it declined for over the fit, one bit
+    /// each ([`cause_bit`]) — a subject can decline for its shape nowhere and at its mode
+    /// system on some trial points only (#2713). Which cause dominates is what decides the
+    /// remedy, so the warning breaks the declined subjects down by it.
+    causes: Vec<std::sync::atomic::AtomicU8>,
+    /// The declines at the estimates the fit reports, classified once after the optimizer
+    /// returns ([`declines_at_estimates`]). `None` when they were not classified.
+    at_estimates: Mutex<Option<EvalDeclines>>,
     /// Test switch: subjects whose analytic outer gradient is treated as declined, so a
     /// test can reach a *numerical* decline on a fixture the adjoint serves.
     #[cfg(test)]
     forced: Vec<std::sync::atomic::AtomicBool>,
+}
+
+/// The slot of a [`DeclineCause`] in the per-cause tallies.
+fn cause_index(cause: DeclineCause) -> usize {
+    match cause {
+        DeclineCause::Shape => 0,
+        DeclineCause::ModeSystem => 1,
+        DeclineCause::Recording => 2,
+    }
+}
+
+/// One bit of [`OuterFdDeclineLog::causes`] per [`DeclineCause`].
+fn cause_bit(cause: DeclineCause) -> u8 {
+    1 << cause_index(cause)
+}
+
+/// The declines of one population's analytic outer gradient at one point (#2713 review):
+/// how many subjects it could not serve, and how many of those per [`DeclineCause`]
+/// (indexed by [`cause_index`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EvalDeclines {
+    pub(crate) declined: usize,
+    pub(crate) by_cause: [usize; 3],
 }
 
 impl OuterFdDeclineLog {
@@ -11051,6 +11122,10 @@ impl OuterFdDeclineLog {
                 .collect(),
             skipped_salvages: AtomicUsize::new(0),
             reconverge_declined: false,
+            causes: (0..n_subjects)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
+            at_estimates: Mutex::new(None),
             #[cfg(test)]
             forced: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
@@ -11072,9 +11147,29 @@ impl OuterFdDeclineLog {
         self.forced[i].store(true, Ordering::Relaxed);
     }
 
+    /// The cause a forced decline reports: a numerical one, at the mode system.
     #[cfg(test)]
-    fn is_forced(&self, i: usize) -> bool {
-        self.forced[i].load(Ordering::Relaxed)
+    fn forced_cause(&self, i: usize) -> Option<DeclineCause> {
+        self.forced[i]
+            .load(Ordering::Relaxed)
+            .then_some(DeclineCause::ModeSystem)
+    }
+
+    /// Record why subject `i` declined on this evaluation (#2713). Rayon workers,
+    /// `Relaxed`, as [`Self::record`].
+    pub(crate) fn record_cause(&self, i: usize, cause: DeclineCause) {
+        if let Some(bits) = self.causes.get(i) {
+            bits.fetch_or(cause_bit(cause), Ordering::Relaxed);
+        }
+    }
+
+    /// How many declined subjects declined for `cause` at least once.
+    fn n_cause(&self, cause: DeclineCause) -> usize {
+        let bit = cause_bit(cause);
+        self.causes
+            .iter()
+            .filter(|b| b.load(Ordering::Relaxed) & bit != 0)
+            .count()
     }
 
     /// Mark subject `i` as having taken the FD outer gradient on this evaluation.
@@ -11084,6 +11179,16 @@ impl OuterFdDeclineLog {
         if let Some(flag) = self.declined.get(i) {
             flag.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Record the declines at the reported estimates ([`declines_at_estimates`]).
+    pub(crate) fn set_at_estimates(&self, at: EvalDeclines) {
+        *self.at_estimates.lock().unwrap() = Some(at);
+    }
+
+    /// The declines at the reported estimates, if they were classified.
+    pub(crate) fn at_estimates(&self) -> Option<EvalDeclines> {
+        *self.at_estimates.lock().unwrap()
     }
 
     /// Mark declined subject `i` as a structural decline (#1536). Rayon workers,
@@ -11203,10 +11308,141 @@ pub(crate) fn outer_fd_fallback_warning(
     };
     Some(format!(
         "{n_fd} of {n_total} subjects could not be given the exact analytic outer \
-         gradient during this fit{example} (a shape no analytic recorder serves, or a trial \
-         point where it could not be formed) and {consequence} The reported \
-         outer gradient method is the model-level route, not the per-subject one.{skipped}"
+         gradient during this fit{example} ({why}) and {consequence}{at_estimates} The \
+         reported outer gradient method is the model-level route, not the per-subject \
+         one.{skipped}",
+        why = decline_causes_clause(log),
+        at_estimates = estimates_declines_sentence(log, n_total),
     ))
+}
+
+/// The sentence of [`outer_fd_fallback_warning`] about the estimates the fit reports
+/// (#2713 review): how many subjects the analytic outer gradient declines there, by cause,
+/// from [`declines_at_estimates`]. The fit-wide counts include every trial point, so they
+/// cannot say whether the reported point's own gradient is exact; this can. It cannot say
+/// the fallbacks were harmless when it is zero: a line search reads gradients at trial
+/// points it then rejects, and a fixed-EBE gradient there can still misdirect it. Empty
+/// when the estimates were not classified (a mixture, AGQ, or an IOV/EBE shape mismatch).
+fn estimates_declines_sentence(log: &OuterFdDeclineLog, n_total: usize) -> String {
+    let Some(at) = log.at_estimates() else {
+        return String::new();
+    };
+    if at.declined == 0 {
+        return " At the reported estimates every subject has the exact analytic outer \
+                gradient; the fallbacks were at other points, line-search trials among \
+                them, where they could still have misdirected the optimizer."
+            .to_string();
+    }
+    let parts: Vec<String> = [
+        (DeclineCause::Shape, "shape"),
+        (DeclineCause::ModeSystem, "inner Hessian"),
+        (DeclineCause::Recording, "recording"),
+    ]
+    .into_iter()
+    .filter_map(|(cause, name)| match at.by_cause[cause_index(cause)] {
+        0 => None,
+        n => Some(format!("{n} {name}")),
+    })
+    .collect();
+    format!(
+        " At the reported estimates the analytic outer gradient still declines {} of \
+         {n_total} subjects ({}).",
+        at.declined,
+        parts.join(", ")
+    )
+}
+
+/// Classify the analytic outer gradient's declines at the estimates the fit reports
+/// (#2713 review): one adjoint pass per subject at `params` and its reported EBE (stacked
+/// with κ̂ under IOV), no salvage formed. Done once, after the optimizer returns, so it
+/// reads the point actually reported whatever the legs, restarts, probes and restores that
+/// chose it, rather than a snapshot that has to follow every one of them.
+///
+/// `None` where the per-subject adjoint is not the fit's gradient (AGQ, a mixture) or the
+/// EBEs do not match the population.
+pub(crate) fn declines_at_estimates(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> Option<EvalDeclines> {
+    if options.agq_nodes().is_some()
+        || template.mixture.is_some()
+        || eta_hats.len() != population.subjects.len()
+    {
+        return None;
+    }
+    let x = pack_params(params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, &x)?;
+    let causes: Vec<Option<DeclineCause>> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let stacked = joint_warm_start(&eta_hats[i], kappas.get(i).map_or(&[], Vec::as_slice));
+            subject_analytic_outer_gradient_dx(
+                model,
+                subject,
+                &pt,
+                stacked.as_slice(),
+                options.interaction,
+                false,
+            )
+            .0
+            .err()
+        })
+        .collect();
+    let mut at = EvalDeclines::default();
+    for c in causes.into_iter().flatten() {
+        at.declined += 1;
+        at.by_cause[cause_index(c)] += 1;
+    }
+    Some(at)
+}
+
+/// The parenthesis of [`outer_fd_fallback_warning`] that says why the subjects declined
+/// (#2713): one clause per [`DeclineCause`] some subject declined for, each with its count.
+/// A large share has three readings that call for different remedies — a data shape (every
+/// point, the recorders' scope), a mode system that would not solve (an EBE off a strict
+/// mode), and a failed recording — and the warning used to name only the first and a
+/// catch-all for the rest. These are counts over the whole fit, rejected trial points
+/// included, so they say what happened, not whether the reported point's gradient is exact:
+/// that is [`estimates_declines_sentence`]'s. Nor is a mode-system decline evidence that a subject
+/// changed modes; whether EBEs sit in a higher mode than a cold solve finds is what
+/// `W_EBE_START_DEPENDENT` reports (#2713 review). A subject can decline for more than one
+/// cause on different trial points, so the counts can sum past the declined total. A log no
+/// route stamped a cause on keeps the generic sentence.
+fn decline_causes_clause(log: &OuterFdDeclineLog) -> String {
+    let parts: Vec<String> = [
+        (
+            DeclineCause::Shape,
+            "with a shape no analytic recorder serves",
+        ),
+        (
+            DeclineCause::ModeSystem,
+            "with an inner Hessian at the EBE that was singular, or indefinite at an EBE \
+             that was not stationary (an EBE off a strict mode), at some trial point",
+        ),
+        (
+            DeclineCause::Recording,
+            "with a recording that failed or came back non-finite at some trial point",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(cause, text)| match log.n_cause(cause) {
+        0 => None,
+        n => Some(format!("{n} {text}")),
+    })
+    .collect();
+    if parts.is_empty() {
+        "a shape no analytic recorder serves, or a trial point where it could not be formed"
+            .to_string()
+    } else {
+        parts.join("; ")
+    }
 }
 
 /// `population_gradient_sens_mixed_dx` without the mode responses.
@@ -11305,29 +11541,23 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                     options.interaction,
                     want_eta_dx,
                 ),
-                // `x` is not the template's packed length: the adjoint declines, but a subject
-                // with no observations keeps the zero gradient it gives one.
-                None => (
-                    (subject.observations.is_empty() && subject.obs_records.is_empty())
-                        .then(|| vec![0.0; x.len()]),
-                    None,
-                ),
+                None => (packed_length_decline(subject, x.len()), None),
             };
             #[cfg(test)]
-            let analytic = analytic.filter(|_| !declines.is_forced(i));
+            let analytic = declines.forced_cause(i).map_or(analytic, Err);
             let g = match analytic {
                 // Keep the exact analytic gradient for in-scope, finite subjects.
-                Some(g) => g,
+                Ok(g) => g,
                 // Out-of-scope (or non-finite analytic) → per-subject salvage (held-EBE,
                 // or reconverged for a structural decline, #1536), unless the trial point
                 // has blown up (#1520).
-                None => {
+                Err(cause) => {
                     declines.record(i);
-                    let structural =
-                        is_structural_decline(model, subject, init_params, ehs[i].as_slice());
+                    let structural = is_structural_decline(cause);
                     if structural {
                         declines.record_structural(i);
                     }
+                    declines.record_cause(i, cause);
                     declined_subject_gradient(
                         np,
                         population,
@@ -11401,17 +11631,31 @@ fn subject_iov_analytic_gradient(
     stacked: &DVector<f64>,
     np: usize,
     options: &FitOptions,
-) -> Option<Vec<f64>> {
+) -> Result<Vec<f64>, DeclineCause> {
     match pt {
-        Some(pt) => subject_analytic_outer_gradient(
-            model,
-            subject,
-            pt,
-            stacked.as_slice(),
-            options.interaction,
-        ),
-        None => (subject.observations.is_empty() && subject.obs_records.is_empty())
-            .then(|| vec![0.0; np]),
+        Some(pt) => {
+            subject_analytic_outer_gradient_dx(
+                model,
+                subject,
+                pt,
+                stacked.as_slice(),
+                options.interaction,
+                false,
+            )
+            .0
+        }
+        None => packed_length_decline(subject, np),
+    }
+}
+
+/// The analytic gradient where `x` is not the template's packed length: the adjoint
+/// declines — a layout no recorder serves — but a subject with no data at all keeps the
+/// zero gradient it gives one.
+fn packed_length_decline(subject: &Subject, np: usize) -> Result<Vec<f64>, DeclineCause> {
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        Ok(vec![0.0; np])
+    } else {
+        Err(DeclineCause::Shape)
     }
 }
 
@@ -11433,7 +11677,7 @@ pub(crate) fn subject_iov_outer_gradient(
     options: &FitOptions,
 ) -> Vec<f64> {
     subject_iov_analytic_gradient(pt, model, subject, stacked, x.len(), options).unwrap_or_else(
-        || {
+        |_| {
             subject_reconverged_fd_gradient_iov(
                 x,
                 init_params,
@@ -11482,9 +11726,10 @@ pub(crate) fn population_gradient_sens_iov_mixed(
             let stacked = joint_warm_start(&ehs[i], &kappas[i]);
             match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
             {
-                Some(g) => g,
-                None => {
+                Ok(g) => g,
+                Err(cause) => {
                     declines.record(i);
+                    declines.record_cause(i, cause);
                     declined_subject_gradient(
                         np,
                         population,
@@ -12007,6 +12252,9 @@ fn covariance_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
     )
 }
+
+#[path = "outer_optimizer_failure.rs"]
+mod failure;
 
 #[cfg(test)]
 #[path = "outer_optimizer_tests.rs"]

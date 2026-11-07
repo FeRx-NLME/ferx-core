@@ -3490,6 +3490,166 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
     assert!(w.contains("used fixed-EBE outer gradients"), "{w}");
 }
 
+/// #2713: a declined FOCEI gradient names its cause. Off the mode, on the grid point
+/// where the exact `H` is indefinite (`laplace_serves_the_prior_precision_anchor_fallback`'s
+/// search), the mode system declines and says so — with the mode response asked for too,
+/// whose fused pass fails at the same solve before its retry. The straddle: at the EBE the
+/// same subject is served, and a cause left on a reused `ModeOut` is cleared. Then, on the
+/// same `ModeOut` after a mode-system decline, an `η_KA` far enough out that `KA` overflows
+/// to infinity fails the recording itself, and must say so rather than keep the stale cause
+/// (#2713 review). Mutations that redden it: dropping the `ModeSystem` stamp in `run` (the
+/// pass reports `Recording`), not clearing the cause on a served pass, or not resetting it
+/// at the start of a pass.
+#[test]
+fn a_declined_gradient_names_its_cause() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = &one.default_params;
+    let x = pack_params(params);
+    let pt = PackedPoint::new(params, &x).expect("packed point");
+    let grid = [-2.5, -1.5, -0.75, 0.75, 1.5, 2.5];
+    let mut points = Vec::new();
+    for &a in &grid {
+        for &b in &grid {
+            for &c in &grid {
+                points.push([a, b, c]);
+            }
+        }
+    }
+    let eta = points
+        .into_iter()
+        .find(|e| {
+            exact_inner_hessian(&one, &s, params, e)
+                .expect("recorded")
+                .cholesky()
+                .is_none()
+        })
+        .expect("a point where the exact H is indefinite");
+    for want_dx in [false, true] {
+        let mut out = ModeOut {
+            want_dx,
+            ..ModeOut::default()
+        };
+        let g =
+            subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &eta, Objective::Focei, &mut out);
+        assert!(
+            g.is_none(),
+            "want_dx = {want_dx}: off the mode, H indefinite must decline"
+        );
+        assert_eq!(
+            out.decline,
+            Some(DeclineCause::ModeSystem),
+            "want_dx = {want_dx}: the decline is the mode system's"
+        );
+        // The straddle: at the EBE the subject is served, and the reused `out` loses the
+        // stale cause.
+        let ebe = find_ebe(&one, &s, params, 500, 1e-11, None, None, 0).eta;
+        let g = subject_adjoint_gradient_and_mode_at(
+            &one,
+            &s,
+            &pt,
+            ebe.as_slice(),
+            Objective::Focei,
+            &mut out,
+        );
+        assert!(g.is_some(), "want_dx = {want_dx}: the EBE is served");
+        assert_eq!(
+            out.decline, None,
+            "want_dx = {want_dx}: a served pass names no cause"
+        );
+
+        // A recording failure after a mode-system one, on the same `out`.
+        let g =
+            subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &eta, Objective::Focei, &mut out);
+        assert!(g.is_none() && out.decline == Some(DeclineCause::ModeSystem));
+        let blown = [0.0, 0.0, 800.0];
+        let g =
+            subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &blown, Objective::Focei, &mut out);
+        assert!(g.is_none(), "want_dx = {want_dx}: KA = inf must decline");
+        assert_eq!(
+            out.decline,
+            Some(DeclineCause::Recording),
+            "want_dx = {want_dx}: a failed recording must not keep the last pass's cause"
+        );
+    }
+}
+
+/// #2713 review round 5: an output scale a recorder cannot serve is a shape, at every
+/// parameter point — a per-CMT scale on the ODE IOV walk, and on a closed form a per-CMT
+/// entry whose expression has no compiled program. Each straddles a served twin: the
+/// model-wide scale on the IOV walk, the compiled entry on the closed form. Mutations
+/// that must redden it: dropping `ode_scaling_declines_shape` from
+/// `ode_iov_walk_declines_shape`, or `closed_form_scaling_declines_shape` from
+/// `analytic_declines_shape`.
+#[test]
+fn an_unserved_output_scale_is_a_shape_decline() {
+    let cause = |m: &CompiledModel, s: &Subject, eta: &[f64]| {
+        let p = m.default_params.clone();
+        let x = pack_params(&p);
+        let pt = PackedPoint::new(&p, &x).expect("packed point");
+        let mut out = ModeOut::default();
+        let g = subject_adjoint_gradient_and_mode_at(m, s, &pt, eta, Objective::Focei, &mut out);
+        (g.is_some(), out.decline)
+    };
+    let iov = |line: &str| {
+        let src = ODE_IOV
+            .replace("ode(states=", "ode(obs_cmt=central, states=")
+            .replace("  y = central / V", line);
+        let m = parse_model_string(&src).unwrap();
+        let s = iov_subject(&m);
+        let eta = vec![0.0; m.n_eta + 3 * m.n_kappa];
+        cause(&m, &s, &eta)
+    };
+    assert_eq!(
+        iov("  obs_scale = V"),
+        (true, None),
+        "IOV: the model-wide scale is served"
+    );
+    assert_eq!(
+        iov("  obs_scale[CMT=1] = V"),
+        (false, Some(DeclineCause::Shape)),
+        "IOV: a per-CMT scale is a shape"
+    );
+
+    let src = ONE_CPT_ORAL.replace(
+        "[error_model]",
+        "[scaling]\n  obs_scale[CMT=1] = V / 10.0\n[error_model]",
+    );
+    let compiled = parse_model_string(&src).unwrap();
+    let s = subject(
+        &compiled,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.0, 0.0, 0.0],
+    );
+    assert_eq!(
+        cause(&compiled, &s, &[0.0; 3]),
+        (true, None),
+        "the compiled entry is served"
+    );
+    let mut bare = parse_model_string(&src).unwrap();
+    let crate::types::ScalingSpec::PerCmt(map) = &mut bare.scaling else {
+        panic!("fixture must carry a per-compartment scale");
+    };
+    let Some(crate::types::ScalingSpec::ExpressionScale { deriv, .. }) = map.get_mut(&1) else {
+        panic!("CMT 1 carries an expression scale");
+    };
+    *deriv = None;
+    assert_eq!(
+        cause(&bare, &s, &[0.0; 3]),
+        (false, Some(DeclineCause::Shape)),
+        "an entry with no compiled program is a shape"
+    );
+}
+
 #[test]
 fn laplace_kernel_is_the_production_objective() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();

@@ -6530,7 +6530,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
 /// (`moving_bounds_separable` reads the resolved infusion windows and lag times), so a
 /// subject can decline at the probe point and be served at its EBE. Both halves of that
 /// are pinned below.
-mod outer_fd_fallback {
+pub(crate) mod outer_fd_fallback {
     use super::*;
     use std::path::Path;
 
@@ -6567,7 +6567,7 @@ mod outer_fd_fallback {
   DV ~ proportional(PROP_ERR)
 "#;
 
-    fn mk_pop(subjects: Vec<Subject>) -> Population {
+    pub(crate) fn mk_pop(subjects: Vec<Subject>) -> Population {
         Population {
             subjects,
             covariate_names: Vec::new(),
@@ -6582,7 +6582,7 @@ mod outer_fd_fallback {
     /// infusion into the depot. An oral infusion routes the subject to the event walk,
     /// and the walk declines an SS infusion under a lag time
     /// (`ss_lagtime_walk_unsupported`), so the twin falls back while its sibling stays exact.
-    fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
+    pub(crate) fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
         let model =
             crate::parser::model_parser::parse_model_string(WARFARIN_F).expect("model parses");
         let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -6598,13 +6598,22 @@ mod outer_fd_fallback {
     /// Run one real outer-gradient evaluation over `pop` through the same mixed assembly
     /// the optimizer uses, and return the log it filled.
     fn record_one_gradient_eval(model: &CompiledModel, pop: &Population) -> OuterFdDeclineLog {
+        let ehs: Vec<DVector<f64>> = (0..pop.subjects.len())
+            .map(|_| DVector::zeros(model.n_eta))
+            .collect();
+        record_one_gradient_eval_at(model, pop, &ehs)
+    }
+
+    /// [`record_one_gradient_eval`] at the EBEs `ehs`.
+    fn record_one_gradient_eval_at(
+        model: &CompiledModel,
+        pop: &Population,
+        ehs: &[DVector<f64>],
+    ) -> OuterFdDeclineLog {
         let params = &model.default_params;
         let PackedStart {
             packed: x, bounds, ..
         } = pack_with_bounds(params);
-        let ehs: Vec<DVector<f64>> = (0..pop.subjects.len())
-            .map(|_| DVector::zeros(model.n_eta))
-            .collect();
         let opts = FitOptions {
             method: EstimationMethod::FoceI,
             interaction: true,
@@ -6621,7 +6630,7 @@ mod outer_fd_fallback {
             params,
             model,
             pop,
-            &ehs,
+            ehs,
             &hms,
             &bounds,
             &opts,
@@ -6643,9 +6652,19 @@ mod outer_fd_fallback {
             outer_fd_fallback_warning(&model, &pop, &log).expect("a declining subject must warn");
         assert!(w.contains("1 of 2"), "got: {w}");
         assert!(
-            w.contains("could not be given the exact analytic outer gradient")
-                && w.contains("a trial point where it could not be formed"),
-            "must not attribute every decline to the provider's scope; got: {w}"
+            w.contains("could not be given the exact analytic outer gradient"),
+            "got: {w}"
+        );
+        // #2713: the decline is named by its cause. The walk declines this subject's
+        // SS infusion under a lag mid-recording, which only the structural check tells
+        // apart from a failed recording — so the shape clause, and neither other one.
+        assert!(
+            w.contains("(1 with a shape no analytic recorder serves)"),
+            "a shape decline must be named as one; got: {w}"
+        );
+        assert!(
+            !w.contains("failed or came back non-finite") && !w.contains("inner Hessian"),
+            "got: {w}"
         );
         assert!(
             w.contains("OUT_OF_SCOPE"),
@@ -6655,6 +6674,363 @@ mod outer_fd_fallback {
         assert!(
             w.contains("model-level route, not the per-subject one"),
             "must reconcile the warning with `gradient_method_outer`; got: {w}"
+        );
+    }
+
+    /// #2713: the warning breaks the declined subjects down by cause, one clause per cause
+    /// some subject declined for, so a fit with a large fallback share says which remedy
+    /// applies. Each clause is asserted present exactly when its cause was recorded, its
+    /// count included; a subject that declined for two causes counts in both; and a log no
+    /// route stamped a cause on (the quadrature's) keeps the generic sentence.
+    #[test]
+    fn warning_names_each_decline_cause() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        const SHAPE: &str = "with a shape no analytic recorder serves";
+        const MODE: &str = "with an inner Hessian at the EBE that was singular";
+        // #2713 review: an off-mode EBE is not evidence of a mode change, so the clause
+        // must not claim one (that is `W_EBE_START_DEPENDENT`'s to report).
+        const MULTIMODAL: &str = "move between modes";
+        const RECORDING: &str = "with a recording that failed or came back non-finite";
+        const GENERIC: &str = "a trial point where it could not be formed";
+        let warn = |causes: &[(usize, DeclineCause)]| {
+            let log = OuterFdDeclineLog::new(2);
+            for &(i, c) in causes {
+                log.record(i);
+                log.record_cause(i, c);
+            }
+            outer_fd_fallback_warning(&model, &pop, &log).expect("must warn")
+        };
+        let only = |w: &str, present: &[&str]| {
+            for clause in [SHAPE, MODE, RECORDING, GENERIC] {
+                assert_eq!(
+                    w.contains(clause),
+                    present.contains(&clause),
+                    "clause {clause:?}; got: {w}"
+                );
+            }
+        };
+        let w = warn(&[(1, DeclineCause::Shape)]);
+        only(&w, &[SHAPE]);
+        assert!(w.contains(&format!("(1 {SHAPE})")), "got: {w}");
+
+        let w = warn(&[(0, DeclineCause::ModeSystem), (1, DeclineCause::ModeSystem)]);
+        only(&w, &[MODE]);
+        assert!(
+            w.contains(&format!("(2 {MODE}")) && !w.contains(MULTIMODAL) && !w.contains("jump"),
+            "got: {w}"
+        );
+
+        let w = warn(&[(0, DeclineCause::Recording)]);
+        only(&w, &[RECORDING]);
+        assert!(w.contains(&format!("(1 {RECORDING}")), "got: {w}");
+
+        // Subject 0 declined at its mode system on one trial point and in its recording on
+        // another: it counts in both, beside subject 1's shape.
+        let w = warn(&[
+            (0, DeclineCause::ModeSystem),
+            (0, DeclineCause::Recording),
+            (1, DeclineCause::Shape),
+        ]);
+        only(&w, &[SHAPE, MODE, RECORDING]);
+        assert!(
+            w.contains(&format!("(1 {SHAPE}; 1 {MODE}")) && w.contains(&format!("; 1 {RECORDING}")),
+            "got: {w}"
+        );
+
+        let log = OuterFdDeclineLog::new(2);
+        log.record(1);
+        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("must warn");
+        only(&w, &[GENERIC]);
+    }
+
+    /// #2713 review: a decline that is numerical at the trial's `η̂` is labelled a failed
+    /// recording, not a shape. At `η_KA = 800` the in-scope subject's `KA` overflows and its
+    /// objective is not finite; no gate of the recorder rejects its records. The straddle is
+    /// `warns_with_count_and_example_subject`, whose SS-infusion subject the event walk's
+    /// gate rejects at every point, and which keeps the shape clause.
+    #[test]
+    fn a_numerical_decline_at_an_extreme_eta_is_not_a_shape() {
+        let (model, analytic, _) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic]);
+        let blown = DVector::from_vec(vec![0.0, 0.0, 800.0]);
+        let log = record_one_gradient_eval_at(&model, &pop, &[blown]);
+        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("the subject declined");
+        assert!(
+            w.contains("(1 with a recording that failed or came back non-finite"),
+            "got: {w}"
+        );
+        assert!(
+            !w.contains("with a shape no analytic recorder serves"),
+            "a numerical decline must not be called a shape; got: {w}"
+        );
+    }
+
+    /// #2713 review round 4: a parameter-dependent recorder decline is neither a shape nor
+    /// structural. The in-scope subject is routed to the closed-form event walk (constant
+    /// covariate snapshots) and given a covariate-change row at `t = 0.5`. At the fixture's
+    /// `TVLAG = 0.5` the lagged arrival lands on that row, which the walk's separability
+    /// check declines, and at `TVLAG = 0.6` it does not and the subject is served: the
+    /// straddle, asserted, that makes the decline parameter-dependent. The cause is a failed
+    /// recording, the salvage is held-EBE, and the warning names neither the shape clause
+    /// nor the structural sentence. Before round 4 the structural check re-ran the recorder
+    /// at this point, saw it fail, and routed the subject to the reconverged salvage.
+    #[test]
+    fn a_parameter_dependent_recorder_decline_is_not_structural() {
+        let (model, mut analytic, _) = analytic_and_declining();
+        let snap: std::collections::HashMap<String, f64> = [("WT".to_string(), 70.0)].into();
+        analytic.dose_covariates = vec![snap.clone(); analytic.doses.len()];
+        analytic.obs_covariates = vec![snap.clone(); analytic.obs_times.len()];
+        let t_row = analytic.doses[0].time + 0.5;
+        analytic.pk_only_times = vec![t_row];
+        analytic.pk_only_covariates = vec![snap];
+        let pop = mk_pop(vec![analytic]);
+        let params = &model.default_params;
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let cause_at = |p: &ModelParameters| {
+            let x = pack_params(p);
+            let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x)
+                .expect("packed point");
+            subject_analytic_outer_gradient_dx(
+                &model,
+                &pop.subjects[0],
+                &pt,
+                &[0.0; 3],
+                opts.interaction,
+                false,
+            )
+            .0
+            .err()
+        };
+        assert_eq!(
+            cause_at(params),
+            Some(DeclineCause::Recording),
+            "the coincident arrival declines, and not for the subject's shape"
+        );
+        let mut moved = params.clone();
+        let lag = model
+            .theta_names
+            .iter()
+            .position(|n| n == "TVLAG")
+            .expect("TVLAG");
+        moved.theta[lag] = 0.6;
+        assert_eq!(
+            cause_at(&moved),
+            None,
+            "the straddle: at another lag it is served"
+        );
+
+        let log = record_one_gradient_eval(&model, &pop);
+        assert_eq!(
+            log.n_structural(),
+            0,
+            "a recording failure is not structural"
+        );
+        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("the subject declined");
+        assert!(w.contains("(1 with a recording that failed"), "got: {w}");
+        assert!(w.contains("used fixed-EBE outer gradients"), "got: {w}");
+        assert!(
+            !w.contains("with a shape no analytic recorder serves")
+                && !w.contains("no analytic recorder serves them"),
+            "got: {w}"
+        );
+    }
+
+    /// #2713 review round 5: a per-CMT output scale on an ODE model. Neither ODE recorder
+    /// serves one (`apply_expression_scale`), at any parameter point, so the decline is a
+    /// shape: counted structural and given the reconverged salvage, as before routing
+    /// followed the typed cause. The straddle is the same scale written model-wide, which
+    /// the walk serves. Mutation that must redden it: dropping `ode_scaling_declines_shape`
+    /// from `ode_walk_declines_shape` (the decline then reads as a failed recording and
+    /// takes the held-EBE salvage).
+    #[test]
+    fn a_per_cmt_scale_on_an_ode_model_is_a_structural_shape() {
+        const ODE_SCALED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central
+[scaling]
+  SCALE_LINE
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let data = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let s = data.subjects[0].clone();
+        assert!(s.obs_cmts.iter().all(|&c| c == 1), "fixture observes CMT 1");
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let route = |line: &str| {
+            let model = crate::parser::model_parser::parse_model_string(
+                &ODE_SCALED.replace("SCALE_LINE", line),
+            )
+            .expect("model parses");
+            assert!(crate::sens::ode_provider::adjoint::outer_model_in_scope(
+                &model
+            ));
+            let params = &model.default_params;
+            let x = pack_params(params);
+            let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x)
+                .expect("packed point");
+            let cause = subject_analytic_outer_gradient_dx(
+                &model,
+                &s,
+                &pt,
+                &[0.0; 2],
+                opts.interaction,
+                false,
+            )
+            .0
+            .err();
+            (model, cause)
+        };
+        let (per_cmt, cause) = route("obs_scale[CMT=1] = V");
+        assert!(matches!(
+            per_cmt.scaling,
+            crate::types::ScalingSpec::PerCmt(_)
+        ));
+        assert_eq!(
+            cause,
+            Some(DeclineCause::Shape),
+            "a per-CMT scale is a shape"
+        );
+        let (wide, cause) = route("obs_scale = V");
+        assert!(matches!(
+            wide.scaling,
+            crate::types::ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+        ));
+        assert_eq!(cause, None, "the straddle: the model-wide scale is served");
+
+        let pop = mk_pop(vec![s.clone()]);
+        let log = record_one_gradient_eval(&per_cmt, &pop);
+        assert_eq!(
+            log.n_structural(),
+            1,
+            "the shape takes the reconverged salvage"
+        );
+        let w = outer_fd_fallback_warning(&per_cmt, &pop, &log).expect("the subject declined");
+        assert!(
+            w.contains("(1 with a shape no analytic recorder serves)"),
+            "got: {w}"
+        );
+        assert!(
+            w.contains("used reconverged finite-difference outer gradients")
+                && !w.contains("used fixed-EBE outer gradients"),
+            "got: {w}"
+        );
+    }
+
+    /// #2713 review: the classification at the reported estimates. Over the fixture, at
+    /// zero EBEs, the in-scope subject is served and the SS-infusion one is declined for
+    /// its shape — the straddle between the two subjects, each named by its count. At an
+    /// EBE that overflows `KA` the in-scope subject is declined too, for its recording.
+    /// A mixture template is not classified.
+    #[test]
+    fn declines_at_estimates_classifies_the_reported_point() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let params = &model.default_params;
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let zeros = vec![DVector::zeros(model.n_eta); 2];
+        let kappas = vec![Vec::new(); 2];
+        let at = declines_at_estimates(&model, &pop, params, params, &zeros, &kappas, &opts)
+            .expect("classified");
+        assert_eq!(
+            at,
+            EvalDeclines {
+                declined: 1,
+                by_cause: [1, 0, 0]
+            }
+        );
+        let blown = vec![DVector::from_vec(vec![0.0, 0.0, 800.0]), DVector::zeros(3)];
+        let at = declines_at_estimates(&model, &pop, params, params, &blown, &kappas, &opts)
+            .expect("classified");
+        assert_eq!(
+            at,
+            EvalDeclines {
+                declined: 2,
+                by_cause: [1, 0, 1]
+            }
+        );
+        let laplace = FitOptions {
+            method: EstimationMethod::Laplace,
+            ..opts.clone()
+        };
+        assert!(
+            declines_at_estimates(&model, &pop, params, params, &zeros, &kappas, &laplace)
+                .is_none(),
+            "AGQ's gradient is not the per-subject adjoint this classifies"
+        );
+    }
+
+    /// #2713 review: the sentence about the reported estimates. Unclassified: no sentence.
+    /// Declines there: the count by cause. None: the all-exact sentence, which must not say
+    /// the fallbacks were harmless — a line search reads gradients at trial points it
+    /// rejects (review round 2).
+    #[test]
+    fn the_estimates_sentence_reports_the_reported_point() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        const AT: &str = "At the reported estimates";
+        let log = OuterFdDeclineLog::new(2);
+        log.record(1);
+        log.record_cause(1, DeclineCause::ModeSystem);
+        let warn = |log: &OuterFdDeclineLog| {
+            outer_fd_fallback_warning(&model, &pop, log).expect("must warn")
+        };
+        let w = warn(&log);
+        assert!(!w.contains(AT), "not classified; got: {w}");
+
+        log.set_at_estimates(EvalDeclines {
+            declined: 2,
+            by_cause: [1, 0, 1],
+        });
+        let w = warn(&log);
+        assert!(
+            w.contains(&format!(
+                "{AT} the analytic outer gradient still declines 2 of 2 subjects (1 shape, \
+                 1 recording)."
+            )),
+            "got: {w}"
+        );
+
+        log.set_at_estimates(EvalDeclines::default());
+        let w = warn(&log);
+        assert!(
+            w.contains(&format!(
+                "{AT} every subject has the exact analytic outer gradient; the fallbacks \
+                 were at other points, line-search trials among them, where they could \
+                 still have misdirected the optimizer."
+            )),
+            "got: {w}"
+        );
+        assert!(
+            !w.contains("still declines") && !w.contains("moved away from"),
+            "got: {w}"
         );
     }
 

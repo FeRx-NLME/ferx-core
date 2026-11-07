@@ -201,6 +201,16 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
             && w.contains("include the EBE-response term but are slower"),
         "the structural sentence must name the recorder scope; got: {w}"
     );
+    // #2713 review: the declines are classified at the estimates the fit reports. The
+    // subject's shape is rejected at every point, so the reported one declines it too,
+    // which also pins that `optimize_population` runs the classification.
+    assert!(
+        w.contains(&format!(
+            "At the reported estimates the analytic outer gradient still declines 1 of \
+             {n_total} subjects (1 shape)."
+        )),
+        "the reported estimates' declines must be reported; got: {w}"
+    );
     assert!(
         !w.contains("correlated across observation rows"),
         "a diagonal-error subject must not be told its residuals are correlated; got: {w}"
