@@ -250,6 +250,105 @@ fn a_forward_step_compiles_every_candidate_and_reports_it() {
         .exists());
 }
 
+/// `data/two_cpt_oral_cov.csv` with every dose coded `RATE=-2`, so its infusion
+/// duration comes from `D1` and from nowhere else.
+fn write_modeled_duration_data(dir: &Path) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(DATA);
+    let mut out = String::new();
+    let mut coded = 0;
+    for line in std::fs::read_to_string(source).unwrap().lines() {
+        let mut cols: Vec<&str> = line.split(',').collect();
+        if cols[3] == "1" {
+            cols[6] = "-2";
+            coded += 1;
+        }
+        out.push_str(&cols.join(","));
+        out.push('\n');
+    }
+    assert!(coded > 0);
+    let path = dir.join("modeled_duration.csv");
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
+/// #2789: the shape that lost its backward phase. `D1` is on no `pk` line and
+/// is read by name for `RATE=-2` doses. The levels are set so that an
+/// evaluation-only search still adds a relation and then removes it: anything
+/// that lowers the OFV at all is added, and any removal is accepted.
+#[test]
+fn a_backward_step_removes_a_relation_and_refits_a_model_with_a_modeled_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = base_model("")
+        .replace(
+            "  theta TVKA(1.0, 0.01, 10.0)\n",
+            "  theta TVKA(1.0, 0.01, 10.0)\n  theta TVD1(0.5, 0.01, 10.0)\n",
+        )
+        .replace(
+            "  omega ETA_V1 ~ 0.15\n",
+            "  omega ETA_V1 ~ 0.15\n  omega ETA_D1 ~ 0.1\n",
+        )
+        .replace("  KA = TVKA\n", "  KA = TVKA\n  D1 = TVD1 * exp(ETA_D1)\n");
+    std::fs::write(dir.path().join("base.ferx"), &model).unwrap();
+    let data = write_modeled_duration_data(dir.path());
+    let path = dir.path().join("search.ferxsearch");
+    std::fs::write(
+        &path,
+        format!(
+            "base = \"base.ferx\"\ndata = \"{}\"\n\n[space]\n\
+             mfl = \"COVARIATE?(CL, [WT,CRCL], pow)\"\n\n\
+             [strictness]\nrequire_converged = false\nreject_init_stall = false\n\
+             reject_on_boundary = false\n\n[run]\nretries = 0\nthreads = 2\n\n\
+             [covsearch]\np_forward = 0.99\np_backward = 0.0001\n",
+            data.display()
+        ),
+    )
+    .unwrap();
+
+    let config = SearchConfig::load(&path).unwrap();
+    let base = config.load_base().unwrap();
+    let result = run_covsearch(
+        &config,
+        &base,
+        CovsearchRun {
+            dir: Some(dir.path().join("run")),
+            ..CovsearchRun::default()
+        },
+    )
+    .expect("search");
+
+    let backward: Vec<_> = result
+        .steps
+        .iter()
+        .filter(|r| r.phase == Phase::Backward)
+        .collect();
+    assert!(!backward.is_empty(), "{:?}", result.steps);
+    for r in &backward {
+        assert!(
+            r.passed && r.lrt.is_some(),
+            "{} was not refitted: {:?}",
+            r.candidate,
+            r.failures
+        );
+        assert!(r.ofv.expect("a refit").is_finite());
+    }
+    assert!(backward.iter().any(|r| r.selected), "{backward:?}");
+    assert!(
+        result.backward_incomplete.is_none(),
+        "{:?}",
+        result.backward_incomplete
+    );
+    assert!(result.included.is_empty(), "{:?}", result.included);
+
+    // Every removal was taken, and the modeled duration came through them all.
+    let final_model = result.final_model.render();
+    assert!(
+        final_model.contains("D1 = TVD1 * exp(ETA_D1)"),
+        "{final_model}"
+    );
+    assert!(final_model.contains("theta TVD1("), "{final_model}");
+    assert!(final_model.contains("omega ETA_D1"), "{final_model}");
+}
+
 #[test]
 fn allometry_scales_clearances_and_volumes_and_fits_both_models() {
     let dir = tempfile::tempdir().unwrap();

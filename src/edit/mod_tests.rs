@@ -2736,3 +2736,210 @@ fn the_additive_operator_is_rendered_as_a_trailing_token_and_parses_back() {
     // re-propose a relation it found in the parent model.
     assert_eq!(Relation::from(&relations[0]).op, CovariateOp::Add);
 }
+
+// ── names the engine reads without any equation mentioning them (#2789) ─────
+
+/// A dose route's model around one parameter under test: `{name} = TVX *
+/// exp(KAPPA_X)`, which nothing in the file reads, beside a `CL ~ WT` relation
+/// to drop. The κ is the shape #2789 was reported on; the θ and κ are what the
+/// pruner takes with the name when it wrongly calls it dead.
+fn model_around(structural: &str, name: &str) -> ModelText {
+    ModelText::parse(&format!(
+        "\
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVX(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_X ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  {name} = TVX * exp(KAPPA_X)
+
+[structural_model]
+{structural}
+
+[covariates]
+  WT continuous
+
+[covariate_model]
+  CL ~ WT power(center = median)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+    ))
+    .unwrap()
+}
+
+const ANALYTIC_ROUTE: &str = "  pk one_cpt_oral(cl=CL, v=V, ka=KA)";
+const ODE_ROUTE: &str = "  ode(states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central
+
+[scaling]
+  y = central / V";
+const TEMPLATE_ROUTE: &str = "  ode_template one_cpt_oral(cl=CL, v=V, ka=KA)";
+const NO_ROUTE: &str = "  y = CL + V + KA";
+
+fn drop_relation(text: &mut ModelText) {
+    apply(
+        text,
+        ModelEdit::DropCovariateRelation {
+            param: "CL".into(),
+            cov: "WT".into(),
+        },
+    );
+    assert!(text.block_lines("covariate_model").is_empty());
+}
+
+fn assert_survives(structural: &str, name: &str) {
+    let mut text = model_around(structural, name);
+    drop_relation(&mut text);
+    let indiv = text.block_lines("individual_parameters");
+    let params = text.block_lines("parameters");
+    assert!(
+        indiv.contains(&format!("{name} = TVX * exp(KAPPA_X)")),
+        "`{name}` was pruned under {structural:?}: {indiv:?}"
+    );
+    for kept in ["theta TVX(", "kappa KAPPA_X"] {
+        assert!(
+            params.iter().any(|l| l.starts_with(kept)),
+            "`{kept}` was pruned with `{name}` under {structural:?}: {params:?}"
+        );
+    }
+}
+
+fn assert_pruned(structural: &str, name: &str) {
+    let mut text = model_around(structural, name);
+    drop_relation(&mut text);
+    let indiv = text.block_lines("individual_parameters");
+    let params = text.block_lines("parameters");
+    assert!(
+        !indiv.iter().any(|l| l.starts_with(&format!("{name} ="))),
+        "`{name}` survived under {structural:?}: {indiv:?}"
+    );
+    assert!(
+        !params
+            .iter()
+            .any(|l| l.contains("TVX") || l.contains("KAPPA_X")),
+        "`{name}`'s θ or κ survived under {structural:?}: {params:?}"
+    );
+    // The control: the pruner ran on a model that kept everything else.
+    assert!(indiv.contains(&"KA = TVKA".to_string()), "{indiv:?}");
+}
+
+#[test]
+fn dropping_a_relation_keeps_a_modeled_duration_and_its_theta_and_kappa() {
+    // The #2789 report: `D1` feeds `RATE=-2` doses and appears on no `pk` line.
+    assert_survives(ANALYTIC_ROUTE, "D1");
+}
+
+#[test]
+fn every_attribute_the_analytic_engine_reads_by_name_survives_a_prune() {
+    for name in ["D1", "D2", "R1", "R2", "d1", "r1"] {
+        assert_survives(ANALYTIC_ROUTE, name);
+    }
+}
+
+#[test]
+fn every_attribute_the_ode_engine_reads_by_name_survives_a_prune() {
+    for route in [ODE_ROUTE, TEMPLATE_ROUTE] {
+        for name in [
+            "D1", "D2", "R1", "R2", "F1", "F2", "ALAG1", "LAGTIME2", "F", "ALAG", "LAGTIME",
+            "lagtime", "f",
+        ] {
+            assert_survives(route, name);
+        }
+    }
+}
+
+/// The differential half: each of these sits one character or one route from
+/// a name that survives above, and each is really unused where it stands.
+#[test]
+fn a_parameter_nothing_reads_is_still_pruned() {
+    for name in ["UNUSED", "D0", "R0", "DUR1", "D1X"] {
+        for route in [ANALYTIC_ROUTE, ODE_ROUTE, TEMPLATE_ROUTE] {
+            assert_pruned(route, name);
+        }
+    }
+    // Analytic F / lag reach the dose only through the `pk` line's roles, so
+    // one the line does not bind is dead, bare or indexed.
+    for name in ["F", "ALAG", "LAGTIME", "F1", "ALAG1", "LAGTIME1"] {
+        assert_pruned(ANALYTIC_ROUTE, name);
+    }
+    // Nothing is dosed on a compartment-free model, so no name is load-bearing.
+    for name in ["D1", "R1", "F1", "ALAG1", "F", "ALAG"] {
+        assert_pruned(NO_ROUTE, name);
+    }
+}
+
+#[test]
+fn an_analytic_f_the_pk_line_binds_survives_because_the_line_reads_it() {
+    assert_survives("  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F1)", "F1");
+}
+
+/// An edited model has to reach the fitter, not only look right: this is the
+/// step #2789's backward candidates died on.
+#[test]
+fn a_pruned_model_keeps_its_modeled_duration_through_the_parser() {
+    let mut text = model_around(ANALYTIC_ROUTE, "D1");
+    drop_relation(&mut text);
+    let model = crate::parser::model_parser::parse_model_string(&text.render()).unwrap();
+    assert!(model.indiv_param_names.iter().any(|n| n == "D1"));
+    assert!(model
+        .active_dose_attr_map()
+        .indexed_slot(crate::types::DoseAttr::Duration, 1)
+        .is_some());
+}
+
+/// The other caller of the pruner. `D1` sits on no `pk` line, so a swap that
+/// rewrites the line has to leave it alone while it still takes `Q` and `V2`.
+#[test]
+fn set_structural_keeps_a_modeled_duration_while_it_prunes_the_rest() {
+    let src = TWO_CPT.replace("[structural_model]", "  D1 = TVD1\n\n[structural_model]");
+    let src = src.replacen(
+        "[parameters]\n",
+        "[parameters]\n  theta TVD1(1.0, 0.01, 10.0)\n",
+        1,
+    );
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, narrow_to_one_cpt());
+    let indiv = text.block_lines("individual_parameters");
+    assert!(indiv.contains(&"D1 = TVD1".to_string()), "{indiv:?}");
+    assert!(!indiv.iter().any(|l| l.starts_with("V2 =")), "{indiv:?}");
+    let params = text.block_lines("parameters");
+    assert!(params.iter().any(|l| l.contains("TVD1")), "{params:?}");
+}
+
+/// `DropIiv` / `DropIov` delete only the random effect they name and never run
+/// the pruner, so a by-name attribute keeps its line and θ. Pinned because the
+/// issue asked, and because routing them through the pruner would be natural.
+#[test]
+fn dropping_a_random_effect_off_a_modeled_duration_keeps_the_duration() {
+    let mut text = model_around(ANALYTIC_ROUTE, "D1");
+    apply(&mut text, ModelEdit::DropIov { param: "D1".into() });
+    let indiv = text.block_lines("individual_parameters");
+    assert!(indiv.contains(&"D1 = TVX".to_string()), "{indiv:?}");
+
+    apply(
+        &mut text,
+        ModelEdit::AddIiv {
+            param: "D1".into(),
+            form: IivForm::Exponential {
+                eta: "ETA_D1".into(),
+                variance: 0.1,
+            },
+        },
+    );
+    apply(&mut text, ModelEdit::DropIiv { param: "D1".into() });
+    let indiv = text.block_lines("individual_parameters");
+    assert!(indiv.contains(&"D1 = TVX".to_string()), "{indiv:?}");
+}

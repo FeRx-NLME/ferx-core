@@ -60,7 +60,14 @@ pub fn write_report(dir: &Path, result: &CovsearchResult) -> Result<(), String> 
         model.apply(ModelEdit::SeedInits(fit))?;
     }
     let path = final_model_path(dir);
-    std::fs::write(&path, model.render())
+    // The file outlives the summary, so it carries the warning itself.
+    let header: String = result
+        .backward_incomplete
+        .iter()
+        .flat_map(|note| note.lines())
+        .map(|line| format!("# {line}\n"))
+        .collect();
+    std::fs::write(&path, header + &model.render())
         .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     Ok(())
 }
@@ -180,6 +187,8 @@ pub fn render_summary(result: &CovsearchResult) -> String {
         "\nFinal model{}: OFV {:.3} (step {}), {} relation{}",
         if result.cancelled {
             " (search cancelled)"
+        } else if result.backward_incomplete.is_some() {
+            " (backward elimination incomplete)"
         } else {
             ""
         },
