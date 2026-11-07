@@ -2471,7 +2471,7 @@ fn level_blocks_over_levels_are_the_theta_hessian() {
     for sidx in 0..free.len() {
         // Well below the stencil's default: the blocks are exact now (#2109), so the
         // oracle's truncation is the whole gap.
-        let floor = fd_step_floor(&hold, &c.model.default_params, free[sidx]);
+        let floor = fd_step_floor(&hold, &c.model, free[sidx]);
         let hs = fd_step(LEVEL_BLOCKS_ORACLE_STEP, x[free[sidx]], floor);
         for a in 0..n {
             let h = hl[a];
@@ -4893,7 +4893,7 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
         .free
         .iter()
         .map(|&i| {
-            let floor = fd_step_floor(&cp.hold, &c.model.default_params, i);
+            let floor = fd_step_floor(&cp.hold, &c.model, i);
             fd_step(LEVEL_BLOCKS_ORACLE_STEP, cp.x_hat[i], floor)
         })
         .collect();
@@ -4903,7 +4903,7 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
         .free
         .iter()
         .map(|&i| {
-            let floor = fd_step_floor(&cp.hold, &c.model.default_params, i);
+            let floor = fd_step_floor(&cp.hold, &c.model, i);
             fd_step(a_step, cp.x_hat[i], floor)
         })
         .collect();
@@ -5012,7 +5012,7 @@ fn the_schur_profile_hessian_is_the_profile_stencil() {
                 c.solve(&unpack_params(xv, &cp.hold), &warm)
                     .map_or(f64::NAN, |s| s.ofv)
             };
-            let floor = fd_step_floors(&cp.hold, &c.model.default_params);
+            let floor = fd_step_floors(&cp.hold, &c.model);
             let st = fd_ofv_hessian(
                 cp.x_hat.len(),
                 &cp.x_hat,

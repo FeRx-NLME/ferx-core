@@ -415,7 +415,7 @@ pub(crate) fn mixture_gradient_with_modes(
     }
 
     // Softmax mixing gradient: −2 Σ_i Σ_k w_ik ∂ln p_ik/∂θ_j (theta slots).
-    let theta_floor = fd_theta_step_floors(&model.default_params);
+    let theta_floor = fd_theta_step_floors(model);
     for (i, subject) in population.subjects.iter().enumerate() {
         let dlnp = mixing_logp_grad(spec, &params.theta, &subject.covariates, &theta_floor)?;
         for (cls, dlnp_c) in dlnp.iter().enumerate() {
@@ -753,7 +753,7 @@ impl MixtureScoreContext {
         let covariates = &population.subjects[i].covariates;
         // The p-form has no analytic mixing gradient; S, unlike the outer gradient, has no
         // whole-objective FD to fall back to, so difference the mixing map itself.
-        let floor = fd_theta_step_floors(&model.default_params);
+        let floor = fd_theta_step_floors(model);
         let dlnp = mixing_logp_grad(spec, &self.params.theta, covariates, &floor)
             .unwrap_or_else(|| mixing_logp_grad_fd(spec, &self.params.theta, covariates, &floor));
         let mut g = vec![0.0f64; packed_segments(&self.params).total()];
@@ -795,7 +795,7 @@ impl MixtureScoreContext {
 /// is absolute in its own units — 1.2 % of a θ of 8e-4. There it is `1e-5·|θ₀|` (#2187).
 ///
 /// Each probe is clamped to `init_params`' packed box — the box the outer optimizer
-/// searches — and the difference divided by the clamped span, as `central_diff_packed`
+/// searches — and the difference divided by the clamped span, as `central_diff_packed_gated`
 /// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
 /// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
 /// to a point, so its span is zero and its gradient stays 0.
@@ -806,7 +806,7 @@ pub fn mixture_gradient_fd(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     let bounds = crate::estimation::parameterization::compute_bounds(init_params);
     let n = x.len();
     let mut g = vec![0.0f64; n];
@@ -816,7 +816,7 @@ pub fn mixture_gradient_fd(
         let mut xm = x.to_vec();
         xp[i] = (x[i] + h).min(bounds.upper[i]);
         xm[i] = (x[i] - h).max(bounds.lower[i]);
-        // Collapsed probes only — see `central_diff_packed`: an absolute cutoff on the span
+        // Collapsed probes only — see `central_diff_packed_gated`: an absolute cutoff on the span
         // would zero a θ declared below ~1e-11 (#2187 review).
         if xp[i] <= xm[i] {
             continue;
@@ -928,7 +928,7 @@ mod tests {
             let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
             let spec = model.mixture.as_ref().unwrap();
             let theta = &model.default_params.theta;
-            let floor = fd_theta_step_floors(&model.default_params);
+            let floor = fd_theta_step_floors(&model);
             assert_eq!(floor, vec![1.0, tiny], "{mixing}: floors");
             // The closed form: softmax with logit g, or the p form p₁ = g (both unclamped
             // here, p₁ = 2.8e-4).
