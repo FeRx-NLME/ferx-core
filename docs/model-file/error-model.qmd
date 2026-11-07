@@ -404,8 +404,9 @@ exponent and a magnitude on a `CMT=N:` line, with IIV on the residual error,
 
 A magnitude that evaluates to zero, a negative number or a non-finite value at a
 decision stops the run with `E_RUV_MAGNITUDE_NONPOSITIVE`. The data check behind that
-code sees the observation rows only. A decision can sit on a row it never evaluates,
-such as an `EVID=2` row. A model without a magnitude draws exactly what it drew before.
+code sees the observation rows only, at the initial θ. A decision can sit on a row it
+never evaluates, such as an `EVID=2` row, and the run can use a θ it never evaluated,
+such as a fitted one. A model without a magnitude draws exactly what it drew before.
 
 ### On `CMT=N:` lines and in `if/else` branches {#endpoint-magnitude}
 

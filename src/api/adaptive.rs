@@ -1629,10 +1629,10 @@ fn assay_magnitude_message(
     };
     format!(
         "[error_model] the residual-error {what} of sigma {name}{line} evaluates to {value} at \
-         this `Dv` reading, TIME {} — it must be strictly positive and finite. The assay draws \
-         the reading's residual error from it, and the check on the data's observation rows \
-         does not see a decision. Check the covariates its expression reads in the row in \
-         force at this decision.",
+         this `Dv` reading, TIME {} as written — it must be strictly positive and finite. The \
+         assay draws the reading's residual error from it, and the check on the data's \
+         observation rows does not see a decision. Check θ and the covariates its expression \
+         reads in the row in force at this decision.",
         row.time
     )
 }

@@ -813,13 +813,16 @@ fn a_time_magnitude_reads_the_written_time_the_monitor_reads() {
 
 /// The decision at 4 sits on an `EVID=2` row whose `MAG` makes the magnitude non-positive;
 /// every observation row is positive, so `check_residual_magnitude` passes and the assay's
-/// own check is the one that fires. Two fixtures: a single-endpoint σ (`MAG = 0`, names no
-/// `CMT=`), and a `CMT=1:` line (`MAG = −2`, names `CMT=1` and not the other endpoint).
-/// Each message is asserted whole.
+/// own check is the one that fires. Three fixtures: a single-endpoint σ (`MAG = 0`, names no
+/// `CMT=`), a `CMT=1:` line (`MAG = −2`, names `CMT=1` and not the other endpoint), and a
+/// `power(PROP, MAG)` exponent (`MAG = 0`: the upper half of the row, named a power
+/// exponent of `PROP`, not a magnitude of a slot past the σs). Each message is asserted
+/// whole.
 ///
-/// Regressions: the guard deleted (the reading would be `L`, silently); any sentence of
-/// the message deleted or changed; the endpoint named on a single-endpoint model, or the
-/// wrong one on a `CMT=N:` block.
+/// Regressions: the guard deleted (the reading would be `L`, silently); the guard scanning
+/// only the multiplier half (an exponent of 0 drawn silently); the exponent half reported
+/// as a magnitude; any sentence of the message deleted or changed; the endpoint named on a
+/// single-endpoint model, or the wrong one on a `CMT=N:` block.
 #[test]
 fn a_non_positive_magnitude_at_a_decision_is_refused() {
     let rows = |mag: &str| {
@@ -839,6 +842,7 @@ fn a_non_positive_magnitude_at_a_decision_is_refused() {
         "  CMT=1: DV ~ proportional(PROP2)\n  CMT=2: DV ~ proportional(PROP * MAG)",
         "",
     );
+    let exponent = model("", "", "  sigma PROP ~ 0.04", "  DV ~ power(PROP, MAG)", "");
     // `CMT=1:` reads PROP2; the magnitude sits on the endpoint the monitor does not read
     // in this fixture, so it runs. The refused one reads it on its own line.
     let cmt_refused = model(
@@ -859,10 +863,10 @@ fn a_non_positive_magnitude_at_a_decision_is_refused() {
     };
     run(&cmt, "-2").expect("a magnitude on the endpoint the monitor does not read");
 
-    let tail = "— it must be strictly positive and finite. The assay draws the reading's \
-                residual error from it, and the check on the data's observation rows does not \
-                see a decision. Check the covariates its expression reads in the row in force \
-                at this decision.";
+    let tail = "as written — it must be strictly positive and finite. The assay draws the \
+                reading's residual error from it, and the check on the data's observation rows \
+                does not see a decision. Check θ and the covariates its expression reads in the \
+                row in force at this decision.";
     for (name, m, mag, want) in [
         (
             "single",
@@ -884,6 +888,16 @@ fn a_non_positive_magnitude_at_a_decision_is_refused() {
                  at this `Dv` reading, TIME 4 {tail}"
             ),
         ),
+        (
+            "exponent",
+            &exponent,
+            "0",
+            format!(
+                "subject '1' (sim 1): decision 1 at t=4: monitor 'A': [error_model] the \
+                 residual-error power exponent of sigma `PROP` evaluates to 0 at this `Dv` \
+                 reading, TIME 4 {tail}"
+            ),
+        ),
     ] {
         let err = run(m, mag).expect_err(name);
         assert_eq!(
@@ -893,7 +907,7 @@ fn a_non_positive_magnitude_at_a_decision_is_refused() {
         );
         assert_eq!(err.message(), want, "{name}");
         let msg = err.message();
-        if name == "single" {
+        if name != "CMT line" {
             assert!(!msg.contains("CMT="), "{name}: names no endpoint");
         } else {
             assert!(msg.contains("`CMT=1:`") && !msg.contains("CMT=2"), "{name}");
