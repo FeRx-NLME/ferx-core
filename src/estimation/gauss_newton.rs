@@ -588,8 +588,16 @@ pub fn run_foce_gn(
             warnings: cov_warnings,
             sir_fallback_proposal,
             method: covariance_method,
+            newton_decrement,
+            non_stationary_optimum,
         } = out;
         warnings.extend(cov_warnings);
+        // #2785: the LM stop rule is a small step, which a stall satisfies too.
+        crate::estimation::covariance::demote_non_stationary_optimum(
+            non_stationary_optimum,
+            &mut converged,
+            &mut warnings,
+        );
 
         // #1303: `converged` here is the LM loop's own stop rule (a small
         // parameter/objective step), which a run whose objective went `NaN`
@@ -644,6 +652,8 @@ pub fn run_foce_gn(
             start_eval: None,
             mcem_lowest_objective: None,
             mcem_objective_trail: None,
+            newton_decrement,
+            optimizer_stop: None,
         };
     }
 
@@ -772,8 +782,16 @@ pub fn run_foce_gn(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum,
     } = out;
     warnings.extend(cov_warnings);
+    // #2785: whichever half supplied the estimate, it is not a stationary point.
+    crate::estimation::covariance::demote_non_stationary_optimum(
+        non_stationary_optimum,
+        &mut converged,
+        &mut warnings,
+    );
 
     // #1303 — the hybrid's verdict is `polish_result.converged || converged`, an
     // OR that can keep a `true` from whichever half did *not* supply `final_ofv`.
@@ -824,6 +842,8 @@ pub fn run_foce_gn(
         start_eval: None,
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement,
+        optimizer_stop: None,
     }
 }
 

@@ -2938,6 +2938,20 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let source = result.final_gradient_source.as_deref().unwrap_or("unknown");
         writeln!(f, "  final_gradient_source: {source}").map_err(|e| e.to_string())?;
     }
+    // #2785: the scale-aware stationarity measure `converged` is gated on, and the
+    // optimizer's own stop state, which the verdict can overrule either way. Each omitted
+    // when the fit has none to report.
+    if let Some(d) = result.newton_decrement {
+        let v = if d.is_nan() {
+            ".nan".to_string()
+        } else {
+            fmt_cov_entry(d)
+        };
+        writeln!(f, "  newton_decrement: {v}").map_err(|e| e.to_string())?;
+    }
+    if let Some(stop) = &result.optimizer_stop {
+        writeln!(f, "  optimizer_stop: {stop}").map_err(|e| e.to_string())?;
+    }
     writeln!(f, "  method: {}", result.method.label()).map_err(|e| e.to_string())?;
     if result.method_chain.len() > 1 {
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
@@ -4183,6 +4197,8 @@ mod tests {
             stationary_start: false,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
+            newton_decrement: None,
+            optimizer_stop: None,
         }
     }
 
@@ -4397,6 +4413,29 @@ mod tests {
         r.final_gradient_source = None;
         let s = format_summary(&r);
         assert!(!s.contains("Final gradient"), "{s}");
+    }
+
+    /// #2785: the fit YAML records the Newton decrement and the NLopt stop state in the
+    /// `model:` block, beside the verdict they qualify, and omits each when the fit has none.
+    #[test]
+    fn write_estimates_yaml_records_the_decrement_and_the_stop_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml_of = |d: Option<f64>, stop: Option<&str>, name: &str| {
+            let mut r = comprehensive_result();
+            r.newton_decrement = d;
+            r.optimizer_stop = stop.map(String::from);
+            let path = dir.path().join(name);
+            write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+        let yaml = yaml_of(Some(337.4), Some("Failure"), "both.yaml");
+        assert!(yaml.contains("  newton_decrement: 3.374000e+2\n"), "{yaml}");
+        assert!(yaml.contains("  optimizer_stop: Failure\n"), "{yaml}");
+        let yaml = yaml_of(Some(f64::NAN), None, "nan.yaml");
+        assert!(yaml.contains("  newton_decrement: .nan\n"), "{yaml}");
+        assert!(!yaml.contains("optimizer_stop"), "{yaml}");
+        let yaml = yaml_of(None, None, "none.yaml");
+        assert!(!yaml.contains("newton_decrement"), "{yaml}");
     }
 
     /// #1934: the fit YAML records |g|∞ and its source in the `model:` block,
@@ -5372,6 +5411,8 @@ mod tests {
             stationary_start: false,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
+            newton_decrement: None,
+            optimizer_stop: None,
         }
     }
 
