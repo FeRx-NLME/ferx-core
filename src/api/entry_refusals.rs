@@ -214,6 +214,9 @@ pub(crate) fn adaptive_driver_refusal(
         K::Options => adaptive_options(message),
         K::Unsupported => adaptive_unsupported(None, message),
         K::ControllerAction => adaptive_controller_action(message),
+        // The data-row check's code (`check_residual_magnitude`): the same mistake, met
+        // at a decision instead of an observation row (#2741).
+        K::RuvMagnitude => coded("E_RUV_MAGNITUDE_NONPOSITIVE", Some("error_model"), message),
     }
 }
 

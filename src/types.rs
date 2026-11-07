@@ -1622,26 +1622,42 @@ impl Subject {
     /// shared time, so the same trough reads `0` — which is also how ferx's
     /// predictor breaks the tie; see `time_after_dose_at_or_before`.
     pub fn time_after_dose(&self, j: usize) -> f64 {
-        let strict = self.data_tad(j, false);
+        match self.obs_times.get(j) {
+            Some(&obs_t) => self.time_after_dose_at(obs_t),
+            None => f64::NAN,
+        }
+    }
+
+    /// [`Self::time_after_dose`] at engine time `obs_t`, which need not be an
+    /// observation of this subject: the adaptive controller's assay reads it at a
+    /// decision time (#2741), on the record of doses realized so far. At an
+    /// observation's time it is that observation's value, bit for bit. Never `NaN`
+    /// for a finite `obs_t`: with no dose at or before it, the time since the
+    /// earliest record ahead of the first dose, `obs_t` itself counted.
+    pub(crate) fn time_after_dose_at(&self, obs_t: f64) -> f64 {
+        let strict = self.data_tad_at(obs_t, false);
         if strict.is_finite() {
             return strict;
         }
         // Pharmpy's first-dose exception: nothing precedes the dose, so an
         // observation at its time keeps it (`TAD = 0`).
-        let at_or_before = self.data_tad(j, true);
+        let at_or_before = self.data_tad_at(obs_t, true);
         if at_or_before.is_finite() {
             return at_or_before;
         }
-        self.pre_dose_tad(j)
+        self.pre_dose_tad_at(obs_t)
     }
 
-    /// Pharmpy's dose group `0` for observation `j`: the time since the
+    /// Pharmpy's dose group `0` at engine time `obs_t`: the time since the
     /// subject's first record ahead of the first dose. See
     /// [`Self::time_after_dose`].
-    fn pre_dose_tad(&self, j: usize) -> f64 {
-        let Some(&obs_t) = self.obs_times.get(j) else {
-            return f64::NAN;
-        };
+    ///
+    /// `obs_t` is folded into the minimum. Through [`Self::time_after_dose`] that
+    /// changes nothing, since `obs_t` is then an observation ahead of the first dose
+    /// and already in the set. At a decision time with no record there it is what
+    /// keeps the value at `0` rather than negative: a decision at `0` on records from
+    /// `1` would otherwise read `−1` (#2741).
+    fn pre_dose_tad_at(&self, obs_t: f64) -> f64 {
         let first_dose = self
             .doses
             .iter()
@@ -1654,12 +1670,8 @@ impl Subject {
             .chain(self.reset_times.iter())
             .copied()
             .filter(|&t| t < first_dose - 1e-12)
-            .fold(f64::INFINITY, f64::min);
-        if first_record.is_finite() {
-            obs_t - first_record
-        } else {
-            f64::NAN
-        }
+            .fold(obs_t, f64::min);
+        obs_t - first_record
     }
 
     /// The sdtab `TAD` fallback: time after the last dose **at or before**
@@ -1670,7 +1682,10 @@ impl Subject {
     /// the first dose. See [`Self::time_after_dose`] for why the `TAD`
     /// built-in reads the same-time trough differently.
     pub(crate) fn time_after_dose_at_or_before(&self, j: usize) -> f64 {
-        self.data_tad(j, true)
+        match self.obs_times.get(j) {
+            Some(&obs_t) => self.data_tad_at(obs_t, true),
+            None => f64::NAN,
+        }
     }
 
     /// The one data-TAD kernel behind both conventions. `same_time_counts`
@@ -1679,10 +1694,7 @@ impl Subject {
     /// observation reads from the dose before it (`false`, Pharmpy's
     /// `get_doseid`). An `SS` dose at the observation's time counts under both
     /// (Pharmpy: "no swap for SS dosing").
-    fn data_tad(&self, j: usize, same_time_counts: bool) -> f64 {
-        let Some(&obs_t) = self.obs_times.get(j) else {
-            return f64::NAN;
-        };
+    fn data_tad_at(&self, obs_t: f64, same_time_counts: bool) -> f64 {
         let last_eff = self
             .doses
             .iter()
@@ -3671,6 +3683,30 @@ impl RuvMagnitude {
         self.per_endpoint.get(&spec.obs_key(subject, j))
     }
 
+    /// The per-sigma programs endpoint `key` reads: its own when the block has an
+    /// entry for it, else the single-endpoint tables.
+    fn fns_for_key(&self, key: usize) -> &[Option<RuvMagFn>] {
+        self.per_endpoint
+            .get(&key)
+            .map_or(&self.per_sigma, |ep| &ep.per_sigma)
+    }
+
+    /// [`eval_obs`](Self::eval_obs) on the programs of endpoint `key` (keyed as
+    /// [`ErrorSpec::obs_key`] keys a row), at the given covariate row, `TIME` and
+    /// `TAD`. A magnitude reads `(θ, covariates, TIME, TAD)` and nothing else, so it
+    /// needs no observation row: the adaptive controller's assay evaluates it at a
+    /// decision (#2741), and [`eval_subject_obs`](Self::eval_subject_obs) at a data row.
+    pub(crate) fn eval_key(
+        &self,
+        key: usize,
+        theta: &[f64],
+        covariates: &HashMap<String, f64>,
+        time: f64,
+        tad: f64,
+    ) -> Vec<f64> {
+        self.eval_row(self.fns_for_key(key), theta, covariates, time, tad)
+    }
+
     /// Whether any slot carries a `power(...)` exponent (#1182). When true,
     /// [`eval_obs`](Self::eval_obs) rows carry the exponent half.
     pub fn has_exponent(&self) -> bool {
@@ -3716,11 +3752,15 @@ impl RuvMagnitude {
         j: usize,
         theta: &[f64],
     ) -> Vec<f64> {
-        let fns = self
-            .endpoint_for(spec, subject, j)
-            .map_or(&self.per_sigma, |ep| &ep.per_sigma);
-        self.eval_row(
-            fns,
+        // The key is resolved only for a block with endpoint magnitudes: a `Selected`
+        // key evaluates the selector, and this runs on the inner objective's path.
+        let key = if self.per_endpoint.is_empty() {
+            0
+        } else {
+            spec.obs_key(subject, j)
+        };
+        self.eval_key(
+            key,
             theta,
             subject.obs_cov(j),
             subject.readout_time(j),
@@ -6613,14 +6653,39 @@ impl CompiledModel {
                 return (s * s).max(1e-12);
             }
         }
-        let cmt = self.error_spec.obs_key(subject, j);
+        self.residual_variance_for_key(
+            self.error_spec.obs_key(subject, j),
+            f_pred,
+            sigma,
+            correlations,
+            ruv_scale,
+            mult,
+        )
+    }
+
+    /// The PK residual variance of one row on endpoint `key` (as
+    /// [`ErrorSpec::obs_key`] keys it): the tail of
+    /// [`sim_residual_variance`](Self::sim_residual_variance) after its FREM branch,
+    /// shared with the adaptive controller's assay (#2741), which has a key and no
+    /// row. `mult = None` is the legacy unscaled form, bit for bit: the `_scaled`
+    /// form at a row of ones is *not* (it associates the product differently), so a
+    /// model without a magnitude must pass `None`.
+    pub(crate) fn residual_variance_for_key(
+        &self,
+        key: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        correlations: &[ResidualCorrelation],
+        ruv_scale: f64,
+        mult: Option<&[f64]>,
+    ) -> f64 {
         let v = match mult {
             Some(m) => self
                 .error_spec
-                .variance_at_scaled(cmt, f_pred, sigma, correlations, m),
+                .variance_at_scaled(key, f_pred, sigma, correlations, m),
             None => self
                 .error_spec
-                .variance_at_with_correlations(cmt, f_pred, sigma, correlations),
+                .variance_at_with_correlations(key, f_pred, sigma, correlations),
         };
         v * ruv_scale
     }

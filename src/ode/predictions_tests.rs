@@ -1,4 +1,5 @@
 use super::*;
+use crate::sim::adaptive::AssayRow;
 use crate::types::DoseEvent;
 use approx::assert_relative_eq;
 
@@ -3189,9 +3190,10 @@ fn adaptive_dv_no_error_model_errors() {
     let pk = pk_one(1.0, 10.0);
     let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
     let base = make_subject(vec![], vec![1.0]);
-    let no_model = |_cmt: usize, _ipred: f64| None;
+    let no_model = |_row: &AssayRow| Ok(None);
     let assay = AssayNoise {
         resid_var: &no_model,
+        needs_tad: false,
         base_seed: 7,
     };
     let err = ode_predictions_adaptive(
@@ -3240,9 +3242,10 @@ fn adaptive_dv_zero_variance_equals_ipred() {
     .expect("ipred run");
     let ipred = ref_run.decisions[1].observed_signals[0].value;
 
-    let zero_var = |_cmt: usize, _ipred: f64| Some(0.0);
+    let zero_var = |_row: &AssayRow| Ok(Some(0.0));
     let assay = AssayNoise {
         resid_var: &zero_var,
+        needs_tad: false,
         base_seed: 12345,
     };
     let mut ctrl_dv = dose;
@@ -3273,11 +3276,12 @@ fn adaptive_dv_noised_and_deterministic() {
     let pk = pk_one(1.0, 10.0);
     let decisions = [0.0, 24.0];
     let base = make_subject(vec![], vec![24.0]);
-    let var4 = |_cmt: usize, _ipred: f64| Some(4.0); // sd = 2
+    let var4 = |_row: &AssayRow| Ok(Some(4.0)); // sd = 2
 
     let observe = |seed: u64| {
         let assay = AssayNoise {
             resid_var: &var4,
+            needs_tad: false,
             base_seed: seed,
         };
         let mut ctrl = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
@@ -3323,9 +3327,10 @@ fn adaptive_dv_clamps_negative_at_zero() {
     let neg_seed = (0u64..)
         .find(|&s| assay_standard_normal(s, 0, "A") < 0.0)
         .expect("some seed gives a negative draw");
-    let big_var = |_cmt: usize, _ipred: f64| Some(1.0e6);
+    let big_var = |_row: &AssayRow| Ok(Some(1.0e6));
     let assay = AssayNoise {
         resid_var: &big_var,
+        needs_tad: false,
         base_seed: neg_seed,
     };
     let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
@@ -3362,9 +3367,10 @@ fn adaptive_dv_form_c_monitor_keeps_negative_sample() {
         |s: &[f64], _pk: &[f64], _t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| s[0] - 5.0,
     )));
     let pk = pk_one(1.0, 1.0);
-    let small_var = |_cmt: usize, _ipred: f64| Some(0.01);
+    let small_var = |_row: &AssayRow| Ok(Some(0.01));
     let assay = AssayNoise {
         resid_var: &small_var,
+        needs_tad: false,
         base_seed: 4242,
     };
     let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
@@ -3440,9 +3446,10 @@ fn adaptive_dv_zero_variance_equals_ipred_on_signed_form_c() {
     };
 
     let ipred = sample(&[MonitorSpec::new("A", 1, ObserveMode::Ipred)], None);
-    let zero_var = |_cmt: usize, _ipred: f64| Some(0.0);
+    let zero_var = |_row: &AssayRow| Ok(Some(0.0));
     let assay = AssayNoise {
         resid_var: &zero_var,
+        needs_tad: false,
         base_seed: 7,
     };
     let dv = sample(&dv_monitor(), Some(&assay));
@@ -3464,11 +3471,12 @@ fn adaptive_dv_added_monitor_does_not_perturb_other_draw() {
     let pk = pk_one(1.0, 10.0);
     let decisions = [0.0, 24.0];
     let base = make_subject(vec![], vec![24.0]);
-    let var4 = |_cmt: usize, _ipred: f64| Some(4.0);
+    let var4 = |_row: &AssayRow| Ok(Some(4.0));
 
     let signal_a = |monitors: &[MonitorSpec]| {
         let assay = AssayNoise {
             resid_var: &var4,
+            needs_tad: false,
             base_seed: 555,
         };
         let mut ctrl = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
@@ -15742,9 +15750,10 @@ fn adaptive_dv_monitor_never_doses_on_a_fabricated_zero() {
             vec![DoseAction::Hold]
         }
     };
-    let unit_var = |_cmt: usize, _ipred: f64| Some(1.0);
+    let unit_var = |_row: &AssayRow| Ok(Some(1.0));
     let assay = AssayNoise {
         resid_var: &unit_var,
+        needs_tad: false,
         base_seed: 7,
     };
     let run = ode_predictions_adaptive(
