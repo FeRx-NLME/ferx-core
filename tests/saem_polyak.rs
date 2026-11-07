@@ -287,3 +287,72 @@ fn polyak_accumulation_beats_the_classic_one_on_the_1445_design() {
         "polyak's mean IS −2 log L {polyak:.2} is not 0.5 below classic's {classic:.2}"
     );
 }
+
+/// Tier 2: every coordinate kind and every fallback the accumulation has. An additive
+/// mu-reference (`TLAG = TVTLAG + ETA_TLAG`, stepped on the natural scale) next to a
+/// θ without an η (`KA`, data-scored), with the control variate both on and off; then
+/// the scope gate's refusals, each named in the warnings with the classic fit kept.
+#[test]
+fn polyak_accumulation_covers_each_coordinate_kind_and_fallback() {
+    let src = std::fs::read_to_string("examples/warfarin_additive_eta.ferx").unwrap();
+    let (model, pop) = load(&src, "data/warfarin_additive_eta.csv");
+    for cv in [true, false] {
+        let mut o = saem_opts(3, SaemAccumulation::Polyak, 10, 10);
+        o.saem_control_variate = cv;
+        let r = fit(&model, &pop, &model.default_params, &o).expect("fits");
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("saem_accumulation")),
+            "cv {cv}: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.ofv.is_finite() && r.theta.iter().all(|v| v.is_finite()),
+            "cv {cv}: OFV {} θ {:?}",
+            r.ofv,
+            r.theta
+        );
+    }
+
+    // No accumulation iterations: nothing to replace.
+    let r = fit(
+        &model,
+        &pop,
+        &model.default_params,
+        &saem_opts(3, SaemAccumulation::Polyak, 10, 0),
+    )
+    .expect("fits");
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("saem_accumulation = polyak") && w.contains("without accumulation")),
+        "{:?}",
+        r.warnings
+    );
+
+    // An η on the residual error is out of scope.
+    let ruv = parse_full_model_file(Path::new("examples/iiv_on_ruv.ferx")).unwrap();
+    let (pop_ruv, _) = read_population_for(
+        &ruv.model,
+        &ruv.covariate_decls,
+        "data/warfarin.csv",
+        None,
+        None,
+        None,
+        &[],
+    )
+    .expect("data reads");
+    let r = fit(
+        &ruv.model,
+        &pop_ruv,
+        &ruv.model.default_params,
+        &saem_opts(3, SaemAccumulation::Polyak, 5, 5),
+    )
+    .expect("fits");
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("saem_accumulation = polyak") && w.contains("residual error")),
+        "{:?}",
+        r.warnings
+    );
+}
