@@ -1895,8 +1895,8 @@ fn section_has_barrier(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], seed: &[f64]) -> 
 /// those seeds — into `V2 = 1e-60 … 1e110`, a hopelessly stiff ODE — made that plateau's cold
 /// solve of 68 subjects take 78 s; it takes 1.3 s on the same optimizer path now. A
 /// coordinate uncorrelated with `i` (every one, for a diagonal Ω) is not touched, so its seeds
-/// are bit-identical. The IOV scan passes `None`: its flat vector's κ blocks have their own
-/// priors, and it keeps the held seeds it had.
+/// are bit-identical. The IOV scan passes the BSV Ω, which covers the leading η block of its
+/// flat vector: a κ coordinate (past `Ω`'s rows) is neither shifted nor shifts anything.
 fn axis_seed_starts(
     base: &[f64],
     centre: &[f64],
@@ -2409,6 +2409,10 @@ thread_local! {
     /// Descents this thread has started from an IOV axis seed (#2730).
     pub(crate) static IOV_AXIS_SEEDS_RUN: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// The largest `ΔᵀΩ⁻¹Δ` of an IOV axis seed's move `Δ` of the BSV block away from the
+    /// incumbent, on this thread; `NaN` once any was non-finite (#2788).
+    pub(crate) static IOV_SEED_MAX_BSV_MAHA: std::cell::Cell<f64> =
+        const { std::cell::Cell::new(0.0) };
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     /// This thread's [`MULTISTART_PROFILE`] moves — twin seed, screen, axis scan — so a test
@@ -4130,7 +4134,8 @@ fn find_ebe_iov_seeded(
     // differs in one occasion's κ is as invisible to a single descent as one in η, and the
     // reset / TV-covariate subjects whose individual objective is multimodal are the same
     // ones here. The same gates apply: cold starts only, every coordinate on a family-1
-    // subject and the flat ones otherwise, seeds from each coordinate's own prior SD.
+    // subject and the flat ones otherwise, seeds from each coordinate's own prior SD, an η
+    // seed moving the correlated η along Ω's column (#2788).
     //
     // Three differences. A seed is placed about the prior's centre, which for ψ is `μ`, not
     // 0. A candidate must also lie more than `SCREEN_MIN_OMEGA_DIST` from the incumbent in
@@ -4154,6 +4159,10 @@ fn find_ebe_iov_seeded(
         let sds: Vec<f64> = prior.iter().map(|p| p.var.max(0.0).sqrt()).collect();
         let mut centre = vec![0.0; n_flat];
         centre[..n_eta].copy_from_slice(&mu);
+        // The BSV block's seeds follow Ω's column (#2788); `axis_seed_starts` shifts only the
+        // leading `n_eta` coordinates Ω covers, so a κ seed, and the κ block of an η seed, are
+        // left to their own priors.
+        let bsv_omega = Some(&params.omega.matrix);
         let scan_coord: Vec<bool> = if scan_all {
             vec![true; n_flat]
         } else {
@@ -4162,16 +4171,25 @@ fn find_ebe_iov_seeded(
                 .enumerate()
                 .map(|(i, flat)| {
                     let only_i: Vec<bool> = (0..n_flat).map(|j| j == i).collect();
-                    flat || axis_seed_starts(&x, &centre, &only_i, &sds, restarts, None)
+                    flat || axis_seed_starts(&x, &centre, &only_i, &sds, restarts, bsv_omega)
                         .iter()
                         .any(|seed| section_has_barrier(&obj, &x, seed))
                 })
                 .collect()
         };
         let mut axis_moved = false;
-        for mut cand in axis_seed_starts(&x, &centre, &scan_coord, &sds, restarts, None) {
+        for mut cand in axis_seed_starts(&x, &centre, &scan_coord, &sds, restarts, bsv_omega) {
             #[cfg(test)]
-            IOV_AXIS_SEEDS_RUN.with(|n| n.set(n.get() + 1));
+            {
+                IOV_AXIS_SEEDS_RUN.with(|n| n.set(n.get() + 1));
+                let moved: Vec<f64> = (0..n_eta).map(|j| cand[j] - x[j]).collect();
+                let maha = ebe_prior_maha(&moved, &params.omega);
+                IOV_SEED_MAX_BSV_MAHA.with(|c| {
+                    if !(maha <= c.get()) {
+                        c.set(maha);
+                    }
+                });
+            }
             let ok = inner_minimize_with_grad(
                 &obj, &agrad, &mut cand, n_flat, max_iter, tol, None, None, None, &stall_at, false,
             );

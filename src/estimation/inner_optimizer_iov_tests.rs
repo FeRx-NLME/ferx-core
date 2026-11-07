@@ -6960,6 +6960,79 @@ fn axis_seeds_follow_the_prior_column_of_a_correlated_omega() {
     );
 }
 
+/// The flat IOV vector `[ψ, κ…]` gets the BSV shift on its η block only (#2788): an η seed
+/// moves the correlated η and no κ; a κ seed moves nothing else.
+#[test]
+fn iov_axis_seeds_shift_only_the_bsv_block() {
+    let rho = 0.999;
+    let omega = DMatrix::from_row_slice(2, 2, &[0.09, rho * 0.09, rho * 0.09, 0.09]);
+    let base = [0.1, 0.2, 0.3, -0.4];
+    let sd = [0.3, 0.3, 1.0, 1.0];
+    let starts = axis_seed_starts(
+        &base,
+        &[0.0; 4],
+        &[true, false, true, false],
+        &sd,
+        1,
+        Some(&omega),
+    );
+    assert_eq!(starts.len(), 4);
+    for s in &starts[..2] {
+        let delta = s[0] - base[0];
+        assert!((s[1] - (base[1] + rho * delta)).abs() < 1e-15, "{s:?}");
+        assert_eq!(&s[2..], &base[2..], "an η seed leaves κ alone: {s:?}");
+    }
+    for s in &starts[2..] {
+        assert_eq!(&s[..2], &base[..2], "a κ seed leaves η alone: {s:?}");
+        assert_eq!(s[3], base[3]);
+    }
+}
+
+/// The IOV cold multi-start hands the BSV Ω to its axis seeds (#2788): on the two-mode reset
+/// fixture (every coordinate scanned) with the two η made correlated at ρ = 0.999, no seed
+/// moves the η block farther than its own ladder in the prior's metric. The seeds are 2 SDs
+/// about `μ = 0`, from an incumbent within an SD of it, so `ΔᵀΩ⁻¹Δ ≤ 9`; held, the same move
+/// is ~`1/(1 − ρ²)` = 500× that.
+///
+/// Mutation (run): pass `None` at the scan's `axis_seed_starts` call — the recorded maximum
+/// is in the thousands.
+#[test]
+fn iov_axis_seeds_follow_a_correlated_bsv_omega() {
+    let src = include_str!("../../nonmem_anchor/iov_kappa_two_mode.ferx").replace(
+        "  omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.09\n",
+        "  block_omega (ETA_CL, ETA_V) = [0.09, 0.0899, 0.09]\n",
+    );
+    assert!(
+        src.contains("block_omega"),
+        "premise: the fixture's Ω changed"
+    );
+    let model = crate::parser::model_parser::parse_model_string(&src).expect("model");
+    let pop = crate::io::datareader::read_nonmem_csv(
+        std::path::Path::new("nonmem_anchor/iov_kappa_two_mode.csv"),
+        None,
+        Some("OCC"),
+    )
+    .expect("anchor data");
+    let subject = pop.subjects.iter().find(|s| s.id == "1").expect("subject");
+    assert!(
+        subject.has_resets(),
+        "family 1: every coordinate is scanned"
+    );
+    IOV_SEED_MAX_BSV_MAHA.with(|c| c.set(0.0));
+    let before = IOV_AXIS_SEEDS_RUN.with(|n| n.get());
+    let r = cold_iov_solve(&model, subject, 1, 1e-6, None);
+    assert!(r.nll.is_finite());
+    assert!(
+        IOV_AXIS_SEEDS_RUN.with(|n| n.get()) > before,
+        "premise: seeds ran"
+    );
+    let worst = IOV_SEED_MAX_BSV_MAHA.with(|c| c.get());
+    assert!(
+        worst.is_finite() && worst > 1.0 && worst <= 9.0,
+        "largest η-block seed move in Ω⁻¹ units: {worst}"
+    );
+}
+
 #[test]
 fn section_has_barrier_needs_a_rise_and_a_fall() {
     let x = [0.0];
