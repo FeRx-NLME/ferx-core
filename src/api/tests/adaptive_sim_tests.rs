@@ -3388,6 +3388,7 @@ fn simple_titration_spec() -> AdaptiveDosingSpec {
         levels: None,
         target_window: None,
         auc_target: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: 50.0,
@@ -4139,6 +4140,7 @@ fn from_spec_three_witnesses_equals_handwritten_closure() {
         levels: None,
         target_window: None,
         auc_target: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: 50.0,
@@ -4724,6 +4726,7 @@ fn from_spec_dv_collapses_to_ipred_as_sigma_to_zero() {
         levels: None,
         target_window: None,
         auc_target: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: 50.0,

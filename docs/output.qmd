@@ -218,6 +218,8 @@ model:
   converged: true
   final_gradient_max_abs: 2.290000e-4
   final_gradient_source: optimizer
+  newton_decrement: 4.311000e-9
+  optimizer_stop: Failure
   method: FOCE
   covariance_method: r
 objective_function:
@@ -319,6 +321,18 @@ absent when there is nothing to list.
   reads](estimation/optimizers.qmd#what-the-reporting-gradient-reads). Both keys
   are omitted when the fit reported no gradient; a non-finite component is
   written as `.nan`.
+- **newton_decrement**: the OFV a Newton step from the estimates is predicted to
+  remove, `½·gᵀH⁻¹g`, taken by the covariance step. Its square root is the distance
+  to the minimum in standard errors, so unlike `final_gradient_max_abs` it does not
+  depend on how a coordinate is scaled. Above 1 it demotes `converged` for FOCE,
+  FOCEI, Laplace / AGQ and Gauss–Newton (`W_NON_STATIONARY_OPTIMUM`). Omitted when
+  the covariance step did not test it — see [What `converged`
+  guarantees](estimation/optimizers.qmd#what-converged-guarantees) (#2785).
+- **optimizer_stop**: the NLopt stop state of the leg that produced the estimates
+  (`FtolReached`, `XtolReached`, `MaxEvalReached`, `Failure`, `RoundoffLimited`,
+  …). `converged` is a verdict built on it, not a copy: a bare `Failure` at a
+  plateau is converged, an `FtolReached` at a non-stationary point is not. Omitted
+  for optimizers other than NLopt's (#2785).
 - **ofv**: Objective Function Value (-2 log-likelihood)
 - **aic**: Akaike Information Criterion (OFV + 2p)
 - **bic**: Bayesian Information Criterion (OFV + p * ln(n), with n the number of

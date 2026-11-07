@@ -747,6 +747,30 @@ impl DoseAttr {
         }
     }
 
+    /// Whether `name` is a compartment-indexed dose attribute the engine reads
+    /// **by name**, so that no textual reference is needed to keep it alive.
+    ///
+    /// `is_ode` picks the route; a compartment-free model has no doses, so it
+    /// takes neither and must not ask.
+    ///
+    /// * ODE: every indexed form — `F{n}`, `ALAG{n}`/`LAGTIME{n}`, `D{n}`, `R{n}`.
+    /// * Analytical: only `D{n}` and `R{n}`, which the parser routes to spare
+    ///   `PkParams` slots and which are consulted solely through coded-`RATE`
+    ///   data. An `F{n}`/`ALAG{n}` reaches the single analytical dose route only
+    ///   through a `pk(...)` mapping, which is a textual reference, and an unmapped
+    ///   one is a parse error.
+    ///
+    /// Single source of truth for the "computed but never used" census and the
+    /// `edit` layer's declaration pruner, which must agree: a name the census
+    /// calls load-bearing and the pruner deletes is how #2789 lost `D1`.
+    pub(crate) fn is_read_by_name(name: &str, is_ode: bool) -> bool {
+        match Self::from_indexed_name(name) {
+            Some((DoseAttr::Duration | DoseAttr::Rate, _)) => true,
+            Some((DoseAttr::F | DoseAttr::Lag, _)) => is_ode,
+            None => false,
+        }
+    }
+
     /// Recognise a compartment-indexed dose-attribute parameter name, returning
     /// `(attr, 1-based compartment)`. Case-insensitive; the numeric suffix must
     /// be a positive integer (so `F0` is *not* an attribute, and bare `F` /
@@ -6516,6 +6540,17 @@ impl CompiledModel {
         self.indiv_param_partials.nested_levels.as_ref()
     }
 
+    /// Whether individual parameter `name` depends on a draw — an η or κ, or `MIXNUM`,
+    /// through any intermediate or `if` condition (#944). `true` for every name on a
+    /// hand-built model that never went through the parser (no record of its
+    /// dependencies), so a caller never treats a drawn value as known.
+    pub(crate) fn indiv_param_is_random(&self, name: &str) -> bool {
+        self.indiv_param_partials
+            .random_indiv_params
+            .as_ref()
+            .is_none_or(|r| r.binary_search_by(|n| n.as_str().cmp(name)).is_ok())
+    }
+
     /// The names a `[derived]` expression looks up at evaluation time, other than
     /// its built-ins (`IPRED`, `DV`, `TIME`, …) and earlier `[derived]` columns (#2599).
     /// A covariate overrides an individual parameter or a compartment of the same
@@ -7895,6 +7930,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // which is prose a later edit could grow into a phrase one of the arms below
         // claims.
         (WarningSeverity::Critical, WarningCode::Convergence)
+    } else if lower.contains("w_non_stationary_optimum") {
+        // #2785: the covariance step's Newton decrement says an estimate its method minimised
+        // is not a stationary point, and the verdict was demoted. `(Critical, Convergence)`
+        // like the generic line it accompanies, so `require_converged` and a consumer keyed
+        // on `convergence` read the same thing. A token arm ahead of the prose ones: the
+        // message names "standard errors" and quotes coordinate labels, which spell
+        // whatever the model's θ are called.
+        (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("w_per_cmt_unmatched") {
         // #1405: a declared per-CMT `[scaling]` / `[error_model]` / `y[CMT=N]` entry
         // that no observation matched. Matched on its `W_` token and placed with the
@@ -8671,6 +8714,30 @@ pub struct FitResult {
     /// a worse optimum and reporting `converged = true`) #997 was filed about.
     #[serde(default)]
     pub final_gradient_source: Option<String>,
+    /// The Newton decrement `½·gᵀH⁻¹g` of the OFV at the reported estimates, in OFV units
+    /// (#2541, #2785): the OFV a Newton step from them is predicted to remove. Because the
+    /// covariance is `R⁻¹ = 2·H⁻¹`, its square root is the distance to the quadratic model's
+    /// minimum in standard errors, so it is scale-aware where
+    /// [`Self::final_gradient`]'s raw magnitude is not.
+    ///
+    /// Computed by the covariance step at the modes it reconverges, so `None` whenever that
+    /// step did not test it: no step (`run_covariance_step = false`), `covariance_method = s`
+    /// (no `R`), an `R` that needed an eigenvalue floor at a FOCE-family estimate, a
+    /// profiled fit, or a cancelled run. For FOCE, FOCEI, Laplace / AGQ and Gauss–Newton a
+    /// value above 1 demotes [`Self::converged`] with `W_NON_STATIONARY_OPTIMUM`; for SAEM,
+    /// IMP, IMPMAP and VI it raises `W_COV_NON_STATIONARY_ESTIMATE` and leaves the verdict.
+    #[serde(default)]
+    pub newton_decrement: Option<f64>,
+    /// The outer optimizer's own stop state (#2785): on the NLopt path the
+    /// `SuccessState` / `FailState` name (`"FtolReached"`, `"XtolReached"`,
+    /// `"MaxEvalReached"`, `"Failure"`, `"RoundoffLimited"`, …) of the leg that produced
+    /// the reported estimates. `None` for every other optimizer.
+    ///
+    /// [`Self::converged`] is a verdict *built on* this, not a copy of it: a bare
+    /// `"Failure"` the plateau check accepts is converged (#751), and an `"FtolReached"` at
+    /// a non-stationary point is not (#2785). Kept so a reader can see which.
+    #[serde(default)]
+    pub optimizer_stop: Option<String>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the

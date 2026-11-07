@@ -770,8 +770,7 @@ const ODE_LTBS_COMBINED_PER_CMT: &str = r#"
 #[test]
 fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt() {
     let model = parse_model_string(ODE_LTBS_COMBINED_PER_CMT).unwrap();
-    // Measured 2.0e-9 (Linux x86_64); 5× headroom.
-    ltbs_combined_per_cmt_parity(model, 1e-8);
+    ltbs_combined_per_cmt_parity(model, LTBS_PER_CMT_BOUND);
 }
 
 /// The same with the motivating model's early-time factor on the plasma `PROP` only,
@@ -791,9 +790,17 @@ fn analytic_adjoint_matches_reconverged_fd_ltbs_combined_per_cmt_magnitude() {
         );
     let model = parse_model_string(&src).unwrap();
     assert!(model.has_custom_ruv_magnitude());
-    // Measured 2.2e-9 (Linux x86_64); ~5× headroom.
-    ltbs_combined_per_cmt_parity(model, 1e-8);
+    ltbs_combined_per_cmt_parity(model, LTBS_PER_CMT_BOUND);
 }
+
+/// Measured on Padé 2.0e-9 / 2.2e-9 (plain / magnitude, Linux x86_64); on the spectral path
+/// (#2706 follow-up) 1.1e-8 / 1.3e-8 (CI, release semantics). The analytic gradient is the
+/// same on both engines to the 11 printed digits; what moves is the reconverged-FD oracle's
+/// objective: the spectral propagation's values carry ~10× Padé's rounding (a sum of modes;
+/// `spectral_is_exact_on_a_stiff_spectrum` measures 1.6e-12 against Padé's 1.0e-13 on an
+/// exact solution), which the oracle's re-solved η̂ and its Richardson step amplify.
+/// ~5× over the worst.
+const LTBS_PER_CMT_BOUND: f64 = 6e-8;
 
 fn ltbs_combined_per_cmt_parity(model: CompiledModel, bound: f64) {
     let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
@@ -2986,9 +2993,14 @@ fn ode_iov_past_24_axes_matches_fd() {
     );
     let model = tight(parse_model_string(&src).unwrap());
     let s = iov_subject(&model);
-    // Measured (macOS arm64): Jacobian 5.0e-13, FOCEI 3.1e-9 (the Richardson floor at EBE
-    // tol 1e-12, as on the 7-axis fixture); 10× headroom each.
-    assert_wide_iov_parity("ODE", &model, &s, (5e-12, 3e-8));
+    // Measured: Jacobian 5.0e-13 (macOS arm64), 4.3e-13 (Linux); FOCEI 3.1e-9 on Padé, 3.8e-8
+    // on the spectral path (#2706 follow-up). The analytic gradient is the same on both
+    // engines (to the 11 printed digits); the gap is the oracle's. Its inner objective is flat
+    // to 4e-15 along one direction at `x[22] + 1e-3`, so the re-solved η̂ lands 1e-10 apart on
+    // the two engines, and the FOCEI objective, not stationary in η, moves 9e-11 there — a kink
+    // a Richardson step of 1e-3 reads as 3.8e-8. A tighter EBE tol (1e-15) changes neither
+    // point. 10× headroom on the Jacobian, 5× on the FOCEI gap.
+    assert_wide_iov_parity("ODE", &model, &s, (5e-12, 2e-7));
 }
 
 #[test]
@@ -7651,7 +7663,15 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         // where the taped side solves `W` through the vector tape's block LU and the
         // forward side element by element over the dual, and the stiff `W`'s conditioning
         // amplifies that rounding difference. ~25× and ~9× headroom.
-        let bound = if name.contains("rodas") { 1e-9 } else { 1e-14 };
+        // `additive_four_eta` is a linear ODE served by the spectral path (#2706 follow-up),
+        // whose propagation is a sum of modes: measured 1.9e-14 there; 1e-13 keeps ~5×.
+        let bound = if name.contains("rodas") {
+            1e-9
+        } else if name == "additive_four_eta" {
+            1e-13
+        } else {
+            1e-14
+        };
         assert!(worst < bound, "{name}: worst relative difference {worst:e}");
         worst_all = worst_all.max(worst);
     }
@@ -8552,6 +8572,103 @@ fn the_quadrature_mode_hessian_is_the_exact_inner_hessian() {
         worst < 1e-12,
         "mode Hessian vs exact_inner_hessian {worst:.2e}"
     );
+}
+
+/// The covariance step's 6-wide Hessian bucket (#2706 follow-up) is the padded 8-wide one
+/// minus its zero lanes: on a five-effect subject the Hessian and the mode response agree
+/// to round-off. Both legs are asserted to dispatch where they claim (6, then 8), so the
+/// pair cannot collapse into one bucket compared with itself.
+#[test]
+fn the_six_wide_hessian_bucket_equals_the_padded_eight() {
+    const FIVE_ETA: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(30.0, 1.0, 500.0)
+  theta TVQ(6.0, 0.1, 100.0)
+  theta TVV2(60.0, 1.0, 1000.0)
+  theta TVKA(1.1, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.06
+  omega ETA_Q ~ 0.05
+  omega ETA_V2 ~ 0.07
+  omega ETA_KA ~ 0.12
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q = TVQ * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = parse_model_string(FIVE_ETA).unwrap();
+    let s = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.08, -0.1, 0.15],
+    );
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-12, true);
+    assert_eq!(hessian::hessian_bucket(5, Objective::Focei), Some(6));
+    let run = |skip6: bool| {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    hessian::SKIP_HESSIAN_BUCKET_6.with(|c| c.set(skip6));
+                    assert_eq!(
+                        hessian::hessian_bucket(5, Objective::Focei),
+                        Some(if skip6 { 8 } else { 6 })
+                    );
+                    let pt = PackedPoint::new(&params, &x).unwrap();
+                    let h = subject_adjoint_cov_hessian_at(
+                        &model,
+                        &s,
+                        &pt,
+                        eta.as_slice(),
+                        Objective::Focei,
+                    )
+                    .expect("Hessian in scope");
+                    let dx = subject_adjoint_eta_dx_at(&model, &s, &pt, eta.as_slice(), true)
+                        .expect("mode response in scope");
+                    (h, dx)
+                })
+                .expect("spawn")
+                .join()
+                .expect("join")
+        })
+    };
+    let ((h6, dx6), (h8, dx8)) = (run(false), run(true));
+    assert_eq!((h6.nrows(), h6.ncols()), (h8.nrows(), h8.ncols()));
+    assert!(
+        h6.nrows() > 0,
+        "an empty Hessian compares equal to anything"
+    );
+    let mut worst = 0.0_f64;
+    let mut gap = |u: f64, v: f64| {
+        assert!(u.is_finite() && v.is_finite(), "{u} vs {v}");
+        worst = worst.max((u - v).abs() / (1.0 + v.abs()));
+    };
+    for (u, v) in h6.iter().zip(h8.iter()) {
+        gap(*u, *v);
+    }
+    assert_eq!(dx6.len(), dx8.len());
+    for (a, b) in dx6.iter().zip(&dx8) {
+        for (u, v) in a.iter().zip(b.iter()) {
+            gap(*u, *v);
+        }
+    }
+    // Measured 0 (bit-identical: the padding lanes are exact zeros); any difference is a
+    // defect in the 6-wide instantiation.
+    assert!(worst == 0.0, "bucket 6 vs padded 8: worst {worst:.2e}");
 }
 
 // ---- compartment on/off records (#2732) ------------------------------------------------

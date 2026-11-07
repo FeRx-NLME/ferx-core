@@ -429,6 +429,8 @@ pub(crate) fn empty_fit_result() -> FitResult {
         stationary_start: false,
         omega_is_diagonal: None,
         kappa_is_diagonal: None,
+        newton_decrement: None,
+        optimizer_stop: None,
     }
 }
 
@@ -603,6 +605,8 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         stationary_start: false,
         omega_is_diagonal: Some(true),
         kappa_is_diagonal: None,
+        newton_decrement: None,
+        optimizer_stop: None,
     }
 }
 

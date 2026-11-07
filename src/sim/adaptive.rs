@@ -533,6 +533,11 @@ pub struct AdaptiveSubjectMetrics {
     /// on, not simulated: across replicates it varies by κ and a `Dv` monitor's assay
     /// only (adaptive trajectories carry no residual error).
     pub eta_supplied: bool,
+    /// Whether this run's dose expressions read the subject's **drawn** individual
+    /// parameters, random effects or mixture class (`dose_knowledge = oracle`, #944): a
+    /// perfect-information dose that no prescriber could compute. `false` for a supplied
+    /// subject, whose values are known input, and whenever no dose expression reads one.
+    pub dose_oracle: bool,
 }
 
 /// `true` if any logged decision is a `Stop` that *also* issued a dose — the
@@ -668,6 +673,7 @@ pub(crate) fn compute_subject_metrics(
         auc_target_attainment,
         // The caller knows where the η came from; the ledger does not.
         eta_supplied: false,
+        dose_oracle: false,
     }
 }
 
@@ -889,6 +895,12 @@ pub struct AdaptiveDosingSpec {
     /// one level; mutually exclusive with percentage steps. Each rung is a number
     /// or a per-subject expression, like `start_dose` (#944).
     pub levels: Option<Vec<DoseValue>>,
+    /// What a dose expression may know about the subject (#944): with
+    /// [`DoseKnowledge::Known`] (the default) it may read a subject's individual
+    /// parameters and random effects only when that subject's η are supplied
+    /// (`AdaptiveInputs::with_etas`); with [`DoseKnowledge::Oracle`] it may also read
+    /// the values the simulation draws, and each subject dosed from them is flagged.
+    pub dose_knowledge: DoseKnowledge,
     /// Optional therapeutic target band `[low, high]` (inclusive) for the
     /// monitored signal. It feeds **only** the `pct_time_in_window` outcome metric
     /// (#391 S2.4) — it never influences dosing (the `when` rules do). `high` may
@@ -939,6 +951,30 @@ pub enum DoseValue {
     Literal(f64),
     /// An expression, evaluated per subject.
     Expr(String),
+}
+
+/// What an `[adaptive_dosing]` dose expression may know about a subject
+/// (`dose_knowledge`, #944).
+///
+/// A dose expression may always read θ and data covariates. A subject's individual
+/// parameters, random effects and mixture class are known at dosing time only when
+/// they come from input — η supplied from a previous fit — not when the simulation
+/// draws them.
+///
+/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum DoseKnowledge {
+    /// `dose_knowledge = known` (the default): a dose expression reads a subject's
+    /// individual parameters only when its η are supplied; a run with a drawn subject
+    /// is refused (`E_ADAPTIVE_DOSE_KNOWLEDGE`).
+    #[default]
+    Known,
+    /// `dose_knowledge = oracle`: a drawn subject's dose expressions read its drawn η
+    /// and first-occasion κ — a perfect-information comparison arm. Each such subject
+    /// has [`AdaptiveSubjectMetrics::dose_oracle`] set, and the run warns
+    /// (`W_ADAPTIVE_DOSE_ORACLE`).
+    Oracle,
 }
 
 impl From<f64> for DoseValue {
@@ -1156,18 +1192,24 @@ impl DosePlanViolation {
         }
     }
 
-    /// The per-subject text (#944): the subject, each value involved as written and as
-    /// evaluated, and — when the expressions read any — the covariate values they read.
+    /// The per-subject text (#944): the subject (and, for an oracle subject, the
+    /// replicate whose drawn values it read), each value involved as written and as
+    /// evaluated, and — when the expressions read any — the covariate and subject values
+    /// they read.
     pub(crate) fn subject_message(
         &self,
         spec: &AdaptiveDosingSpec,
         plan: &SubjectDosePlan,
         subject_id: &str,
+        replicate: Option<usize>,
         reads: &[(String, f64)],
     ) -> String {
         let (lo, hi) = plan.dose_bounds;
         let d = plan.start_dose;
-        let head = format!("[adaptive_dosing] subject {subject_id}:");
+        let head = match replicate {
+            None => format!("[adaptive_dosing] subject {subject_id}:"),
+            Some(k) => format!("[adaptive_dosing] subject {subject_id}, replicate {k}:"),
+        };
         let start = spec.start_dose.source();
         let bounds = format!(
             "[{}, {}]",
@@ -1743,6 +1785,7 @@ mod tests {
             levels: None,
             target_window: None,
             auc_target: None,
+            dose_knowledge: Default::default(),
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 10.0,
