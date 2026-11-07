@@ -980,6 +980,38 @@ impl RhsRegProgram {
 /// tape node (`vtape::record_rhs`), so a gated term `G·k·x` with the gate `G = 0` reads as
 /// a live coefficient to the exact linear path's sparsity skips; this is what lets the
 /// block leave such an output off the tape (#2760).
+/// Whether `code` holds an instruction [`structural_zeros`] marks a structural zero without
+/// a structural-zero operand: a literal `0`, a product with the constant `0`, or a
+/// comparison or connective (whose `0` is the dual constant). Every other rule needs a
+/// structural-zero input, so for a program without one of these, loaded inputs
+/// ([`loaded_inputs`]) none of which is a structural zero leave every output live — and the
+/// analysis can be skipped, exactly.
+pub(super) fn makes_structural_zeros(code: &[Flat]) -> bool {
+    code.iter().any(|f| match *f {
+        Flat::LoadK { c, .. } | Flat::MulK { c, .. } => c == 0.0,
+        Flat::Cmp { .. } | Flat::And { .. } | Flat::Or { .. } | Flat::Not { .. } => true,
+        Flat::Present { .. } => true,
+        _ => false,
+    })
+}
+
+/// The inputs `code` loads: its states, its `params` slots and its seeds, each listed once.
+/// [`structural_zeros`] reads an input's structural-zero flag only through these loads, so
+/// a flag on any other input — a `params` slot below the extent the program never reads —
+/// cannot mark an output.
+pub(super) fn loaded_inputs(code: &[Flat]) -> (Vec<u32>, Vec<u32>, [bool; 4]) {
+    let (mut u, mut p, mut s) = (Vec::new(), Vec::new(), [false; 4]);
+    for f in code {
+        match *f {
+            Flat::LoadState { i, .. } if !u.contains(&i) => u.push(i),
+            Flat::LoadParam { slot, .. } if !p.contains(&slot) => p.push(slot),
+            Flat::LoadSeed { k, .. } => s[usize::from(k)] = true,
+            _ => {}
+        }
+    }
+    (u, p, s)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn structural_zeros(
     code: &[Flat],

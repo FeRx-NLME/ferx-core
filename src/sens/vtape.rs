@@ -385,8 +385,18 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
         // not move. An output is dropped only if every lane the forward wrote is `0` too — the
         // analysis may under-report, and this keeps an over-report from ever losing a lane.
         let mut dead = vec![false; edu];
-        let known = {
-            let sz = |x: &DualV<N, M, TH>| crate::sens::linsolve::structural_zero(*x);
+        let sz = |x: &DualV<N, M, TH>| crate::sens::linsolve::structural_zero(*x);
+        // With no structural zero among the inputs the program loads and no instruction
+        // that makes one, the analysis marks nothing (`RhsKernel::may_mark_structural_zeros`),
+        // so it is skipped: a model with no gated term pays a scan of its loaded inputs, not
+        // a second interpretation of the program. Only the loaded ones: `params[..ep]` holds
+        // every slot below the highest read, and an unused slot is an untaped `0`.
+        let analyse = kernel.may_mark_structural_zeros(
+            &|i| u[..eu].get(i).is_none_or(sz),
+            &|k| params[..ep].get(k).is_none_or(sz),
+            &|k| sz(&seeds[k]),
+        );
+        let known = analyse && {
             let val = |l: &[f64]| l[0];
             let uv: Vec<f64> = xin[..eu * wf].chunks_exact(wf).map(val).collect();
             let pv: Vec<f64> = xin[eu * wf..(eu + ep) * wf]

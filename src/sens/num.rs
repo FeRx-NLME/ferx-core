@@ -577,6 +577,8 @@ pub(crate) mod vm {
         /// inputs' values (`u`, `params`, `seeds`) and which inputs are structural zeros
         /// (`zu`, `zp`, `zs`). `false`, with `out` unspecified, when the kernel cannot tell;
         /// then every output must be treated as live. It may under-report, never over-report.
+        ///
+        /// See [`Self::may_mark_structural_zeros`] for when a caller may skip it.
         #[allow(clippy::too_many_arguments)]
         fn structural_zeros(
             &self,
@@ -589,6 +591,19 @@ pub(crate) mod vm {
             _out: &mut [bool],
         ) -> bool {
             false
+        }
+        /// Whether [`Self::structural_zeros`] can mark any output, given which inputs are
+        /// structural zeros (`zero_u(i)`, `zero_p(slot)`, `zero_s(k)`; an index past an input
+        /// slice is a structural zero, as the binding reads it). `false` only when it would
+        /// mark nothing, so the caller may skip it; `true`, the conservative answer, by
+        /// default.
+        fn may_mark_structural_zeros(
+            &self,
+            _zero_u: &dyn Fn(usize) -> bool,
+            _zero_p: &dyn Fn(usize) -> bool,
+            _zero_s: &dyn Fn(usize) -> bool,
+        ) -> bool {
+            true
         }
         /// The forward over `layout`.
         ///

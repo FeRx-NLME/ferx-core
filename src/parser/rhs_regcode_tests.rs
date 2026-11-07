@@ -1730,6 +1730,160 @@ fn a_reported_structural_zero_is_identically_zero_on_random_programs() {
     assert!(reported >= 100, "only {reported} outputs reported");
 }
 
+/// Every instruction kind [`super::makes_structural_zeros`] names is one the analysis marks a
+/// zero from unflagged inputs, and the predicate names it (#2761 review). The random
+/// programs cannot show this for comparisons and connectives, whose results only feed a
+/// branch there, so each kind gets a two-or-three-instruction program whose one output is
+/// that instruction's zero: params `[1, 2, 0, NaN]`, none flagged (the `0` a live zero). The
+/// control, a sum of two live inputs, is the straddle: marks nothing, names nothing.
+#[test]
+fn each_zero_source_kind_marks_from_unflagged_inputs_and_is_named() {
+    use super::Cc;
+    use super::Flat;
+    let (one, two, zero, nan) = (0u32, 1u32, 2u32, 3u32);
+    let p = |d: u16, slot: u32| Flat::LoadParam { d, slot };
+    let out = |a: u16| Flat::Deriv { state: 0, a };
+    let cases: Vec<(&str, Vec<Flat>, bool)> = vec![
+        (
+            "literal 0",
+            vec![Flat::LoadK { d: 0, c: 0.0 }, out(0)],
+            true,
+        ),
+        (
+            "product with 0",
+            vec![p(0, one), Flat::MulK { d: 1, a: 0, c: 0.0 }, out(1)],
+            true,
+        ),
+        (
+            "comparison",
+            vec![
+                p(0, one),
+                p(1, two),
+                Flat::Cmp {
+                    d: 2,
+                    cc: Cc::Gt,
+                    a: 0,
+                    b: 1,
+                },
+                out(2),
+            ],
+            true,
+        ),
+        (
+            "and",
+            vec![
+                p(0, one),
+                p(1, zero),
+                Flat::And { d: 2, a: 0, b: 1 },
+                out(2),
+            ],
+            true,
+        ),
+        (
+            "or",
+            vec![p(0, zero), Flat::Or { d: 1, a: 0, b: 0 }, out(1)],
+            true,
+        ),
+        (
+            "not",
+            vec![p(0, one), Flat::Not { d: 1, a: 0 }, out(1)],
+            true,
+        ),
+        (
+            "present",
+            vec![p(0, nan), Flat::Present { d: 1, a: 0 }, out(1)],
+            true,
+        ),
+        (
+            "control: a sum",
+            vec![p(0, one), p(1, two), Flat::Add { d: 2, a: 0, b: 1 }, out(2)],
+            false,
+        ),
+    ];
+    let params = [1.0, 2.0, 0.0, f64::NAN];
+    for (name, code, source) in cases {
+        let mut marked = [false];
+        super::structural_zeros(
+            &code,
+            4,
+            &[],
+            &params,
+            &[0.5; 4],
+            &[],
+            &[false; 4],
+            &[false; 4],
+            &mut marked,
+        );
+        assert_eq!(marked[0], source, "{name}: the analysis marks its output");
+        assert_eq!(
+            super::makes_structural_zeros(&code),
+            source,
+            "{name}: named as a source"
+        );
+    }
+}
+
+/// The skip `vtape::record_rhs` takes (#2761 review): for a program without an instruction
+/// [`super::makes_structural_zeros`] names, inputs whose *loaded* ones
+/// ([`super::loaded_inputs`]) are none of them structural zeros leave every output live, so
+/// not running the analysis changes nothing. On the soundness test's random programs, with
+/// zero-valued inputs flagged at random as there: a flag on a `params` slot the program does
+/// not load must mark nothing (production `params` hold such slots, as untaped zeros). Two
+/// straddles keep the predicate honest: programs that make zeros must reach a marked output
+/// from unflagged inputs, and skippable cases must include ones with an unloaded input
+/// flagged, or the loaded-only rule is never exercised.
+#[test]
+fn a_program_that_makes_no_zeros_marks_nothing_from_unflagged_loaded_inputs() {
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let (mut skippable, mut with_unloaded_flag, mut marked_by_a_source) = (0usize, 0usize, 0usize);
+    for case in 0..400 {
+        let odes = random_odes(&mut rng);
+        let prog = program(&odes);
+        let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog))
+            .unwrap_or_else(|e| panic!("case {case} did not compile ({e:?}):\n{odes}"));
+        let raw_u = seed_values(&mut rng, 3);
+        let raw_p = seed_values(&mut rng, n_params);
+        let raw_s = [1.75, rng.unit() * 5.0, 0.0, f64::EPSILON];
+        let (nu, np) = (raw_u.len(), raw_p.len());
+        let zero: Vec<bool> = raw_u
+            .iter()
+            .chain(&raw_p)
+            .chain(&raw_s)
+            .map(|&v| v == 0.0 && rng.below(2) == 0)
+            .collect();
+        let (lu, lp, ls) = super::loaded_inputs(&reg.code);
+        let loaded_flagged = lu.iter().any(|&i| zero[i as usize])
+            || lp.iter().any(|&k| zero[nu + k as usize])
+            || (0..4).any(|k| ls[k] && zero[nu + np + k]);
+        let _time = ModelTimeGuard::enter(1.75);
+        let dead = zeros_of(&reg, (&raw_u[..], &raw_p[..], &raw_s), &zero);
+        if super::makes_structural_zeros(&reg.code) {
+            let none = vec![false; zero.len()];
+            let dead_unflagged = zeros_of(&reg, (&raw_u[..], &raw_p[..], &raw_s), &none);
+            marked_by_a_source += usize::from(dead_unflagged.iter().any(|&d| d));
+        } else if !loaded_flagged {
+            skippable += 1;
+            with_unloaded_flag += usize::from(zero.iter().any(|&z| z));
+            assert!(
+                dead.iter().all(|&d| !d),
+                "case {case}: no zero source and no loaded input flagged, but marked {dead:?}\n{odes}"
+            );
+        }
+    }
+    // Measured (Linux x86_64): 32 skippable, all 32 with an unloaded input flagged, 19
+    // zero-source programs marked. All three arms must be reached for the test to say
+    // anything; the floors sit well under the measurement.
+    eprintln!(
+        "{skippable} skippable ({with_unloaded_flag} with an unloaded input flagged), \
+         {marked_by_a_source} zero-source programs marked"
+    );
+    assert!(
+        skippable >= 15 && with_unloaded_flag >= 10 && marked_by_a_source >= 10,
+        "{skippable}, {with_unloaded_flag}, {marked_by_a_source}"
+    );
+}
+
 /// #2760: the analysis on the shape it exists for, and its guards. A gated term `G·k·x`
 /// is a structural zero exactly when the gate is, and a structural zero against a value
 /// that is not finite (`0·∞`, `0/0`) is not one, since IEEE arithmetic makes it `NaN`.
