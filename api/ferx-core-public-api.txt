@@ -2754,6 +2754,9 @@ pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
 pub enum ferx_core::types::RtteClock
 pub ferx_core::types::RtteClock::Forward
 pub ferx_core::types::RtteClock::Reset
+pub enum ferx_core::types::SaemAccumulation
+pub ferx_core::types::SaemAccumulation::Classic
+pub ferx_core::types::SaemAccumulation::Polyak
 pub enum ferx_core::types::SaemKernel
 pub ferx_core::types::SaemKernel::Imh
 pub ferx_core::types::SaemKernel::RandomWalk
@@ -3262,11 +3265,13 @@ pub ferx_core::types::FitOptions::parameter_scaling: ferx_core::ParameterScaling
 pub ferx_core::types::FitOptions::reconverge_gradient_interval: usize
 pub ferx_core::types::FitOptions::report_final_gradient: bool
 pub ferx_core::types::FitOptions::run_covariance_step: bool
+pub ferx_core::types::FitOptions::saem_accumulation: ferx_core::SaemAccumulation
 pub ferx_core::types::FitOptions::saem_adapt_interval: usize
 pub ferx_core::types::FitOptions::saem_conddist: bool
 pub ferx_core::types::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::types::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::types::FitOptions::saem_conddist_nsamp: usize
+pub ferx_core::types::FitOptions::saem_control_variate: bool
 pub ferx_core::types::FitOptions::saem_imh_defensive: f64
 pub ferx_core::types::FitOptions::saem_imh_min_obs_per_eta: f64
 pub ferx_core::types::FitOptions::saem_imh_proposals: usize
@@ -4200,6 +4205,9 @@ pub fn ferx_core::ResidualSerialKind::keyword(self) -> &'static str
 pub enum ferx_core::RtteClock
 pub ferx_core::RtteClock::Forward
 pub ferx_core::RtteClock::Reset
+pub enum ferx_core::SaemAccumulation
+pub ferx_core::SaemAccumulation::Classic
+pub ferx_core::SaemAccumulation::Polyak
 pub enum ferx_core::SaemKernel
 pub ferx_core::SaemKernel::Imh
 pub ferx_core::SaemKernel::RandomWalk
@@ -4873,11 +4881,13 @@ pub ferx_core::FitOptions::parameter_scaling: ferx_core::ParameterScaling
 pub ferx_core::FitOptions::reconverge_gradient_interval: usize
 pub ferx_core::FitOptions::report_final_gradient: bool
 pub ferx_core::FitOptions::run_covariance_step: bool
+pub ferx_core::FitOptions::saem_accumulation: ferx_core::SaemAccumulation
 pub ferx_core::FitOptions::saem_adapt_interval: usize
 pub ferx_core::FitOptions::saem_conddist: bool
 pub ferx_core::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::FitOptions::saem_conddist_nsamp: usize
+pub ferx_core::FitOptions::saem_control_variate: bool
 pub ferx_core::FitOptions::saem_imh_defensive: f64
 pub ferx_core::FitOptions::saem_imh_min_obs_per_eta: f64
 pub ferx_core::FitOptions::saem_imh_proposals: usize

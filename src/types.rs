@@ -9371,6 +9371,12 @@ pub struct FitOptions {
     /// [`SaemMstepSolver::Bobyqa`], the historical single-draw re-maximisation,
     /// so an existing fit's estimates do not change.
     pub saem_mstep_solver: SaemMstepSolver,
+    /// How SAEM's accumulation phase moves the parameters (#2721). Defaults to
+    /// [`SaemAccumulation::Classic`], the historical M-step.
+    pub saem_accumulation: SaemAccumulation,
+    /// Under [`SaemAccumulation::Polyak`], subtract the zero-variance control variate
+    /// `Bᵢ·∇η lᵢ` from each subject's score (#2721). Ignored otherwise.
+    pub saem_control_variate: bool,
     /// Number of E-step draws the **`bobyqa`** M-step objective is averaged over
     /// (#1458). `1` (the default) is the historical single-draw objective.
     ///
@@ -10131,6 +10137,8 @@ impl Default for FitOptions {
             saem_scale_deadband: Some(DEFAULT_SCALE_DEADBAND),
             saem_mstep_damping: None,
             saem_mstep_solver: SaemMstepSolver::default(),
+            saem_accumulation: SaemAccumulation::default(),
+            saem_control_variate: true,
             saem_mstep_draws: 1,
             saem_omega_burnin: 20,
             saem_seed: None,
@@ -10516,6 +10524,26 @@ pub enum SaemKernel {
     /// scheduled refresh (`saem_imh_refresh` iterations later). Neither gate reads a clock, so a seeded fit is
     /// reproducible whichever kernel it ran.
     Imh,
+}
+
+/// How SAEM's accumulation phase moves the parameters, set via
+/// `[fit_options] saem_accumulation` (#2721).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaemAccumulation {
+    /// The historical M-step, and **the default**: closed-form EM for Ω and the
+    /// mu-referenced θ, the `mstep_solver` step for every other θ and σ, steps `1/k`.
+    #[default]
+    Classic,
+    /// One stochastic-approximation recursion on the marginal score for every parameter,
+    /// with the complete-data information as gain, steps `k^{−2/3}`, the Polyak–Ruppert
+    /// average of the second half of accumulation as the estimate, and the zero-variance
+    /// control variate on the score (`saem_control_variate`). Exploration is unchanged.
+    ///
+    /// Restricted to models without a mixture, IOV, an η on the residual error, FREM or a
+    /// covariate mu-reference group, and to likelihoods the exact fixed-η data score
+    /// covers; elsewhere the fit keeps [`SaemAccumulation::Classic`] with a warning naming
+    /// the reason.
+    Polyak,
 }
 
 /// Which solver moves the SAEM numerical θ/σ M-step, set via
@@ -11704,6 +11732,10 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_mstep_damping",
             "mstep_solver",
             "saem_mstep_solver",
+            "accumulation",
+            "saem_accumulation",
+            "control_variate",
+            "saem_control_variate",
             "mstep_draws",
             "saem_mstep_draws",
             "saem_kernel",

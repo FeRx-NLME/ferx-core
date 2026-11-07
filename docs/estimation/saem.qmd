@@ -1091,6 +1091,90 @@ so a script can check mixing without matching on the warning text.
   runs with fewer than 25 post-burn-in iterations, where the realised rate
   describes the starting scale rather than a failure to reach target.
 
+## Accumulation on the marginal score (`saem_accumulation = polyak`) {#saem-polyak}
+
+SAEM is stochastic root-finding on the **marginal** score. By Fisher's identity,
+$h(\psi) = \sum_i E[s_i(\eta_i, \psi) \mid y_i]$, where $s_i$ is subject $i$'s
+complete-data score. Every accumulation step is $\psi \leftarrow \psi + \gamma_k G \hat h$
+for some gain $G$, whether it is spelled as the closed-form EM update or the numerical
+M-step. The closed forms and `score_sa` use the complete-data information as $G$.
+
+`saem_accumulation = polyak` (#2721, opt-in) replaces the M-step during accumulation with
+one such recursion over every parameter, in three parts:
+
+- **One recursion, current-point gain.** The gain is the complete-data information at the
+  current point. On Ω and the mu-referenced θ it is exact, which makes each step the
+  EM-type convex combination $\gamma(S - \Omega)$ and keeps Ω positive definite. On every
+  other θ and σ it is the stochastic-approximation average of the expected Fisher
+  information, as `score_sa` keeps it.
+- **Polyak–Ruppert averaging.** Steps are $\gamma_k = k^{-2/3}$, and the estimate is the
+  average of the iterates over the second half of accumulation. The averaged iterate's
+  asymptotic variance does not depend on the gain (Polyak & Juditsky 1992).
+- **A zero-variance control variate** (`saem_control_variate`, on by default). Under each
+  subject's posterior $E[\nabla_\eta l] = 0$ (Stein's identity), and the adjoint returns
+  $\nabla_\eta l$ exactly. Each subject's score is used as
+  $s_i - B_i \nabla_\eta l_i$, with $B_i$ the regression of $s$ on $\nabla_\eta l$ over a
+  burst of 50 posterior draws taken at the start of accumulation. $B_i$ is fixed before
+  the draws it corrects, so the expectation, and with it the estimate, is unchanged; only
+  the variance falls.
+
+Exploration is unchanged. The fit is restricted to models without a mixture, IOV, an η on
+the residual error, FREM or a covariate mu-reference group, and to likelihoods the exact
+fixed-η data score covers. Outside that scope it keeps the classic accumulation, and a
+warning names the reason.
+
+### Why: most of the information can be missing {#saem-polyak-why}
+
+With $\gamma_k = 1/k$, stochastic approximation converges at the $\sqrt{k}$ rate only if
+every eigenvalue of $G \cdot I_{obs}$ exceeds ½. Louis's identity gives
+$I_c = I_{obs} + I_{mis}$, where $I_{mis} = \sum_i \mathrm{Var}(s_i \mid y_i)$. So with the
+complete-data gain those eigenvalues are 1 minus the fraction of missing information.
+
+A diagnostic (`saem_gain_diag_tests.rs`) measured that fraction on #1445's sparse
+combined-error fixture: 300 subjects with 1–3 samples each, at its simulation truth. It
+used long per-subject chains of SAEM's own kernel and exact scores. σ_add, σ_prop, the
+V1/V2 typical values and every V1/V2-related Ω entry miss **70–99 %** of their
+information, and the smallest eigenvalue is 0.006. On warfarin, with rich sampling, the
+fraction is below 1 % for the typical values and Ω, and 27 % for σ.
+
+### Measured {#saem-polyak-measured}
+
+Importance-sampled −2 log L (3000 samples, fixed seed; lower is better) at each fit's
+estimates. Default 150/250 schedule; 10 seeds on the sparse fixture and 6 elsewhere;
+mean ± standard deviation across seeds.
+
+| model | `bobyqa` (default) | `score_sa` | `polyak` |
+|---|---|---|---|
+| #1445 sparse combined | 3183.46 ± 0.68 | 3183.14 ± 0.70 | **3181.96 ± 0.51** |
+| `schnider` | −3052.89 ± 0.27 | −3053.26 ± 0.36 | **−3053.49 ± 0.05** |
+| `emax_pkpd` | −35.30 ± 1.21 | **−36.80 ± 0.06** | −36.23 ± 0.68 |
+| `pkpd_nonmem` | −60.13 ± 0.03 | −60.15 ± 0.01 | **−60.17 ± 0.00** |
+| `three_cpt_iv` | −732.71 ± 0.45 | −732.78 ± 0.10 | −732.71 ± 0.71 |
+| `warfarin_saem`, `two_cpt_iv`, `warfarin_block_omega` | tie | tie | tie |
+| `mm_oral` | **−449.07 ± 4.63** | −437.44 ± 2.82 | −431.34 ± 14.80 |
+
+The control variate is worth 0.64 units on the sparse fixture (3182.60 ± 0.72 without
+it). `mm_oral` is the limitation, and `score_sa` shares it. Its no-η `KM` and `KA` sit on
+a ridge with `VMAX`, and a score-based recursion moves along that ridge more slowly than
+`bobyqa`'s re-maximisation. In 250 iterations both stop short: `VMAX` ≈ 3.98 and `KM` ≈
+5.67, against `bobyqa`'s best seeds at 4.09 and 5.96.
+
+### Why the gain is not the Newton (Louis) gain {#saem-polyak-not-louis}
+
+The natural fix for a rate problem is the Newton gain $I_{obs}^{-1}$, estimated by Louis's
+identity. It was built and measured, and it loses. It accelerates a direction with
+observed-to-complete ratio λ by 1/λ, and with it the Monte Carlo noise of the one-draw
+score: the iterates' fluctuation grows as $\gamma(1-\lambda)/(2\lambda)$ statistical
+variances.
+
+On the sparse fixture the Louis gain landed at 3193.9–3212.5 on every seed tried with λ
+floored at 0.01. Capped at a full EM step per direction, it went above 3190 on 1 seed in
+10 with the control variate and 5 in 10 without (up to 3354). At most 2× acceleration
+never failed, but was within two standard errors of none.
+
+In the directions where the gain would matter, the binding constraint is the Monte Carlo
+noise. Averaging and the control variate reduce it; acceleration amplifies it.
+
 ## Post-SAEM Finalization
 
 After the SAEM iterations complete:
