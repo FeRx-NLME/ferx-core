@@ -656,29 +656,106 @@ fn tad_before_the_first_arrival_keeps_a_dose_that_arrives_first() {
     );
 }
 
-/// A hazard line is outside the PK block `pk_reads_tad` looks at, but reads the same anchor.
-#[cfg(feature = "survival")]
-#[test]
-fn a_hazard_reading_tad_counts() {
-    let model = lagged_model("").replace(
-        "[error_model]",
-        "[event_model]\n  cmt = 3\n  hazard = 0.01 * exp(0.001*TAD)\n\n[error_model]",
+/// A lag estimated with no lower bound, which `fit()` checks only at the start: on the
+/// depot (`ALAG1`), or on the absorption route into `central` (`first_order(.., lag=)`).
+/// Returns the model and the compartment its observations are on.
+fn searched_lag_model(on_route: bool) -> (String, u32) {
+    let params = PARAMS.replace(
+        "  omega ETA_CL",
+        "  theta TVLAG(1.0, -50.0, 50.0)\n  omega ETA_CL",
     );
-    let run = prepared(&model, LAGGED);
-    assert!(tad_reads_a_lagged_arrival(&run.parsed.model));
+    let (lag, states, odes, obs_cmt) = if on_route {
+        (
+            "LAG",
+            "central, periph",
+            "  d/dt(central) = first_order(ka=KA, lag=LAG) - CL/V*central\n  d/dt(periph)  = 0",
+            1,
+        )
+    } else {
+        (
+            "ALAG1",
+            "depot, central",
+            "  d/dt(depot)   = -KA*depot\n  d/dt(central) = KA*depot/V - CL/V*central",
+            2,
+        )
+    };
+    let model = format!(
+        "{params}
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+  {lag} = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[{states}])
+
+[odes]
+{odes}
+{ERROR_MODEL}"
+    );
+    (model, obs_cmt)
 }
 
-/// Only a lag and a `TAD` read together keep the doses: each alone is cut as usual.
+/// Doses into compartment 1 at 0 and at 20, past the last observation at 10.
+fn searched_lag_data(obs_cmt: u32) -> String {
+    let mut csv = String::from("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n");
+    for id in 1..=2 {
+        csv += &format!("{id},0,.,1,100,1,0,1\n");
+        csv += &format!("{id},5,1.2,0,.,{obs_cmt},0,0\n");
+        csv += &format!("{id},10,0.9,0,.,{obs_cmt},0,0\n");
+        csv += &format!("{id},20,.,1,100,1,0,1\n");
+    }
+    csv
+}
+
+/// Once the search reaches a lag of -15 the dose at 20 arrives at 5, before the last
+/// observation: the engines apply every dose at `time + lag`. So a model with a lag of either
+/// kind keeps every record, and scores the dose the view would have dropped.
 #[test]
-fn a_lag_or_a_tad_read_alone_still_cuts() {
+fn a_lag_the_search_drives_negative_keeps_a_dose_it_pulls_ahead() {
+    for on_route in [false, true] {
+        let (text, obs_cmt) = searched_lag_model(on_route);
+        let run = prepared(&text, &searched_lag_data(obs_cmt));
+        let model = &run.parsed.model;
+        let view = scored_population(model, Cow::Borrowed(&run.population));
+        assert!(
+            matches!(view, Cow::Borrowed(_)),
+            "on_route = {on_route}: the view cut"
+        );
+
+        let mut params = run.init_params.clone();
+        let lag = model.theta_names.iter().position(|n| n == "TVLAG").unwrap();
+        params.theta[lag] = -15.0;
+        let mut cut = run.population.clone();
+        for s in &mut cut.subjects {
+            s.doses.truncate(1);
+        }
+        let at_10 =
+            |p: &Population| crate::api::predict(model, p, &params).expect("predict")[1].pred;
+        let (every_dose, one_dose) = (at_10(&run.population), at_10(&cut));
+        assert!(
+            every_dose.is_finite() && one_dose.is_finite(),
+            "on_route = {on_route}"
+        );
+        assert!(
+            (every_dose - one_dose).abs() > 0.01,
+            "on_route = {on_route}: {every_dose} {one_dose}"
+        );
+    }
+}
+
+/// A model with no lag is cut as usual, `TAD` read or not.
+#[test]
+fn a_model_without_a_lag_still_cuts() {
     let cut = |text: &str| {
         let run = prepared(text, LAGGED);
         let view = scored_population(&run.parsed.model, Cow::Borrowed(&run.population));
         view.subjects[0].doses.len()
     };
-    assert_eq!(cut(&lagged_model("")), 1, "a lag, no TAD");
-    let no_lag = lagged_model(" + 0.01*TAD").replace("  ALAG1 = 100\n  ALAG2 = 0\n", "");
-    assert_eq!(cut(&no_lag), 1, "TAD, no lag");
+    let no_lag = |extra: &str| lagged_model(extra).replace("  ALAG1 = 100\n  ALAG2 = 0\n", "");
+    assert_eq!(cut(&no_lag("")), 1, "no TAD");
+    assert_eq!(cut(&no_lag(" + 0.01*TAD")), 1, "TAD");
 }
 
 // ── what still reads the whole dataset ───────────────────────────────────────

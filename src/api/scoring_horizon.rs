@@ -17,9 +17,10 @@
 //! subject on the view takes the route the same data with those rows deleted would, so one
 //! tail record of an unsupported kind no longer sends the subject to finite differences.
 //!
-//! A cut dose must not arrive by the horizon, which a lag of at least 0 guarantees: `fit()`
-//! refuses a negative lag at the start (`E_NEGATIVE_LAGTIME`). A search that reaches one
-//! later, through a lag with no lower bound, would no longer see a cut dose it pulled ahead.
+//! A cut dose must not arrive by the horizon, and only a lag can move a dose ahead of its
+//! record. `fit()` refuses a negative lag at the start (`E_NEGATIVE_LAGTIME`), but not during
+//! the search, which can reach one through a lag with no lower bound. So a model with a lag
+//! keeps every record ([`dose_can_arrive_before_its_record`]).
 //!
 //! That route change is the one way the view moves a result by more than rounding: two routes
 //! break an integrated walk at different records, so they agree only to solver tolerance.
@@ -148,8 +149,7 @@ struct Kept {
 /// The earliest dose always stays: `TAD` and `TAFD` read it before it arrives
 /// (`tad_anchor_for`, `earliest_dose_time`), and a subject with only pre-dose observations
 /// would otherwise lose that anchor. It is the earliest record, not the first listed, for a
-/// subject built in memory. The earliest *arrival* can be another dose: see
-/// [`tad_reads_a_lagged_arrival`].
+/// subject built in memory. With no lag that is also the earliest arrival.
 fn kept_records(subject: &Subject) -> Option<Kept> {
     let cutoff = cutoff(subject)?;
     let kept = Kept {
@@ -183,21 +183,16 @@ fn cut_subject(subject: &mut Subject, kept: Kept) {
     cut_occasions(&mut subject.reset_occasions, kept.resets);
 }
 
-/// Whether `[odes]` can read `TAD` off a dose past the horizon.
+/// Whether a dose can arrive before its own record, so a dose past the horizon can reach
+/// a scored record.
 ///
-/// Before any dose has arrived, `TAD` is anchored at the earliest `time + lag` over **all**
-/// doses (`tad_anchor_for`). With lags that differ between doses (per compartment, per
-/// occasion, or from a time-varying covariate) that can be a later dose: with doses at 0
-/// (`ALAG1 = 100`) and 20 (`ALAG2 = 0`) it is the second, however early the sampling stops.
-/// A lag is a function of the parameters, so which doses can matter is not known here, and
-/// such a model keeps them all. `TAD` in an `[error_model]` is the data TAD, which is lag-free
-/// and needs only the earliest dose.
-fn tad_reads_a_lagged_arrival(model: &CompiledModel) -> bool {
-    model.has_lagtime()
-        && model
-            .ode_spec
-            .as_ref()
-            .is_some_and(|ode| ode.rhs_program.as_ref().is_none_or(|p| p.reads_tad()))
+/// Any lag can: the engines apply a dose at `time + lag`, and a lag is a function of the
+/// parameters, which the search can take negative (a lag of -15 brings a dose at 20 to 5).
+/// That holds for a compartment lag (`lagtime` / `ALAG{n}`) and for a per-route `lag=`.
+/// A lag also moves the `TAD` anchor before any dose has arrived (`tad_anchor_for`) to the
+/// earliest `time + lag` over all doses, which can be a later dose when lags differ.
+fn dose_can_arrive_before_its_record(model: &CompiledModel) -> bool {
+    model.has_lagtime() || model.has_route_absorption_lag()
 }
 
 /// `population` with every subject's records past its horizon removed; see the module docs.
@@ -210,7 +205,7 @@ fn tad_reads_a_lagged_arrival(model: &CompiledModel) -> bool {
 ///
 /// A nested-level model is left whole: its cells are checked to be parallel to the records
 /// (`cells_ready`), which [`cut_occasions`] does not promise.
-/// So is a model where [`tad_reads_a_lagged_arrival`] holds.
+/// So is a model where [`dose_can_arrive_before_its_record`] holds.
 pub(crate) fn scored_population<'a>(
     model: &CompiledModel,
     population: Cow<'a, Population>,
@@ -219,7 +214,7 @@ pub(crate) fn scored_population<'a>(
     if SCORE_ALL_RECORDS.with(std::cell::Cell::get) {
         return population;
     }
-    if model.has_nested_levels() || tad_reads_a_lagged_arrival(model) {
+    if model.has_nested_levels() || dose_can_arrive_before_its_record(model) {
         return population;
     }
     let kept: Vec<Option<Kept>> = population.subjects.iter().map(kept_records).collect();

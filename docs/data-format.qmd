@@ -660,9 +660,9 @@ record at the same `TIME` stays, since it acts on the observation. Later `EVID=2
   which closes the interval holding that record.
 - A subject's first dose always stays, because `TAD` and `TAFD` read it before
   it arrives.
-- A model with a lag whose `[odes]` reads `TAD` keeps every record. Before any
-  dose arrives, `TAD` counts from the earliest arrival, and with lags that differ
-  between doses that can be a later dose.
+- A model with a lag keeps every record: a compartment lag (`lagtime`,
+  `ALAG{n}`) or a per-route `lag=`. The estimation search can take a lag
+  negative, which brings a later dose ahead of the last observation.
 - A model with more than one `level` keeps every record.
 
 Only the estimation steps use the shorter list, including `run_covariance()` and
