@@ -6184,15 +6184,22 @@ pub(crate) const UNPROFILED_VERIFY_GAIN: f64 = 3e-5;
 /// stops are bare `Failure`s the plateau rule accepts or tolerance stops met mid-descent.
 /// Not a quadrature objective, which has reachable stops
 /// (`gradient_run_has_reachable_stops`) and its own noise floor, and not a mixture, whose
-/// objective is a different solve.
+/// objective is a different solve. And not a model with no random effects
+/// (`n_random_effects = n_eta + n_kappa = 0`, #2763): the leg's one lever is the inner
+/// tolerance, and with no inner solve there is nothing for it to tighten. On every bundled
+/// such model (`one_cpt_iv_pooled`, `binary_logistic`, `ctmm_2state`, `mctmm_3state`,
+/// `nonmem_anchor/pktte_tdep_fit.ferx` with its hazard θ free) the leg gained 0 OFV (3.4e-13
+/// on `ctmm_2state`), and without it each fit stops `converged` at the same OFV.
 pub(crate) fn unprofiled_verify_applies(
     algo: nlopt::Algorithm,
     reachable_stops: bool,
     is_mixture: bool,
+    n_random_effects: usize,
 ) -> bool {
     matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp)
         && !reachable_stops
         && !is_mixture
+        && n_random_effects > 0
 }
 
 /// Does a stop need a verification leg before it may be called converged (#2462)? Every
@@ -6992,15 +6999,12 @@ fn optimize_nlopt_attempt_probed(
     // ranked in `leg_best`, the leg's own incumbent, instead of `best_seen`, which holds
     // objectives at the user's tolerance; `leg_first` is the leg's first feasible
     // objective, for its gain.
-    // No random effects → no inner solve to tighten, so the verification leg has nothing to
-    // re-solve at a different tolerance. On a 240-subject ODE-hazard model at `n_eta = 0`
-    // the leg is 12 evaluations / ~42% of the estimation time, gain 0 OFV (#2739 lead 5e).
-    let verify_on = (model.n_eta + model.n_kappa) > 0
-        && unprofiled_verify_enabled()
+    let verify_on = unprofiled_verify_enabled()
         && unprofiled_verify_applies(
             algo,
             gradient_run_has_reachable_stops(options),
             init_params.mixture.is_some(),
+            model.n_eta + model.n_kappa,
         );
     let leg_options = FitOptions {
         inner_tol: options.inner_tol.min(UNPROFILED_VERIFY_INNER_TOL),

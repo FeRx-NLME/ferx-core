@@ -8598,3 +8598,49 @@ fn a_toggle_alone_takes_the_event_driven_walk() {
     assert!(!static_walk_subject_supported(&model, &s));
     assert!(event_walk_subject_supported(&model, &s));
 }
+
+/// #2763: with no random effects `ng_jets3` evaluates the non-Gaussian term over `f64`
+/// instead of the third-order jet its `n = 1` bucket used to run unseeded. The jet's value
+/// part is that same arithmetic, so `q` must agree **bit for bit**, on every subject of the
+/// drug-driven ODE-hazard anchor (an ODE walk with a `[scaling]` readout and an
+/// `[event_model]` on its states, at the anchor's `reltol = 1e-9`). If the stepper's error
+/// control read a jet's derivative lanes, the two would take different steps and part here.
+#[cfg(feature = "survival")]
+#[test]
+fn ng_jets3_without_random_effects_is_the_jet_value() {
+    use crate::sens::eta_jets::EtaFunction;
+    use crate::survival::{FixedTheta, NonGaussianTerm};
+    type J = crate::sens::taylor::Taylor<1, 3, { crate::sens::taylor::binom(4, 3) }>;
+    let src = std::fs::read_to_string("nonmem_anchor/pktte_tdep_fit.ferx").expect("anchor model");
+    let model = parse_model_string(&src).expect("anchor model parses");
+    assert_eq!(model.n_eta + model.n_kappa, 0, "fixture: no random effects");
+    let (pop, _) = crate::api::read_population_for(
+        &model,
+        &None,
+        "nonmem_anchor/pktte_tdep.csv",
+        None,
+        None,
+        None,
+        &[],
+    )
+    .expect("anchor data loads");
+    let theta = &model.default_params.theta;
+    let mut live = 0;
+    for s in &pop.subjects {
+        let term = NonGaussianTerm::new(&model, s);
+        let f = FixedTheta { theta, term: &term };
+        let jet = f.eval::<J>(&[]).expect("the jet path evaluates").c[0];
+        let q = ng_jets3(&model, s, theta, &[])
+            .expect("ng_jets3 serves every anchor subject")
+            .q;
+        assert!(q.is_finite(), "subject {}: q = {q}", s.id);
+        assert_eq!(
+            q.to_bits(),
+            jet.to_bits(),
+            "subject {}: f64 {q:e} vs jet {jet:e}",
+            s.id
+        );
+        live += usize::from(q != 0.0);
+    }
+    assert!(live > 0, "fixture: some subject's term is non-zero");
+}

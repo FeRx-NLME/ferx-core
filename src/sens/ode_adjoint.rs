@@ -3763,19 +3763,6 @@ fn ng_jets3(
     let n = eta.len();
     let term = NonGaussianTerm::new(model, subject);
     let f = FixedTheta { theta, term: &term };
-    // No random effects: only the value `q` is read (the gradient, Hessian and third
-    // derivative are empty), so evaluate it over `f64` instead of carrying a third-order
-    // Taylor jet through the ODE walk. On a 240-subject ODE-hazard model at `reltol = 1e-9`
-    // this removes ~50% of the per-evaluation cost (#2739 lead 5e).
-    if n == 0 {
-        let q = f.eval::<f64>(&[])?;
-        return (q.is_finite() && q < 1e19).then_some(NgJets {
-            q,
-            g: Vec::new(),
-            h: Vec::new(),
-            t: Vec::new(),
-        });
-    }
     macro_rules! go {
         ($p:literal) => {{
             const L: usize = crate::sens::taylor::binom($p + 3, 3);
@@ -3829,8 +3816,18 @@ fn ng_jets3(
         }};
     }
     let jets = match n {
-        // No random effects: the value, with empty derivatives.
-        0 | 1 => go!(1),
+        // No random effects: only the value `q` is read (the gradient, Hessian and third
+        // derivative are empty), so it is evaluated over `f64` rather than through the ODE
+        // walk on an unseeded third-order jet (#2763). The jet's value part is the `f64`
+        // arithmetic, so `q` is the same bit for bit
+        // (`ng_jets3_without_random_effects_is_the_jet_value`).
+        0 => Some(NgJets {
+            q: f.eval::<f64>(&[])?,
+            g: Vec::new(),
+            h: Vec::new(),
+            t: Vec::new(),
+        }),
+        1 => go!(1),
         2 => go!(2),
         3 | 4 => go!(4),
         5..=8 => go!(8),
