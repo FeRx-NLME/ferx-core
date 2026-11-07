@@ -747,6 +747,30 @@ impl DoseAttr {
         }
     }
 
+    /// Whether `name` is a compartment-indexed dose attribute the engine reads
+    /// **by name**, so that no textual reference is needed to keep it alive.
+    ///
+    /// `is_ode` picks the route; a compartment-free model has no doses, so it
+    /// takes neither and must not ask.
+    ///
+    /// * ODE: every indexed form — `F{n}`, `ALAG{n}`/`LAGTIME{n}`, `D{n}`, `R{n}`.
+    /// * Analytical: only `D{n}` and `R{n}`, which the parser routes to spare
+    ///   `PkParams` slots and which are consulted solely through coded-`RATE`
+    ///   data. An `F{n}`/`ALAG{n}` reaches the single analytical dose route only
+    ///   through a `pk(...)` mapping, which is a textual reference, and an unmapped
+    ///   one is a parse error.
+    ///
+    /// Single source of truth for the "computed but never used" census and the
+    /// `edit` layer's declaration pruner, which must agree: a name the census
+    /// calls load-bearing and the pruner deletes is how #2789 lost `D1`.
+    pub(crate) fn is_read_by_name(name: &str, is_ode: bool) -> bool {
+        match Self::from_indexed_name(name) {
+            Some((DoseAttr::Duration | DoseAttr::Rate, _)) => true,
+            Some((DoseAttr::F | DoseAttr::Lag, _)) => is_ode,
+            None => false,
+        }
+    }
+
     /// Recognise a compartment-indexed dose-attribute parameter name, returning
     /// `(attr, 1-based compartment)`. Case-insensitive; the numeric suffix must
     /// be a positive integer (so `F0` is *not* an attribute, and bare `F` /

@@ -7748,19 +7748,12 @@ pub fn parse_full_model_with(
             //    name is load-bearing without a textual reference (#1443).
             .filter(|(i, name)| {
                 use crate::types::DoseAttr;
-                let exempt = if is_algebraic {
-                    false
-                } else if is_ode {
-                    ode_slot_map
-                        .get(*i)
-                        .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot))
-                        || DoseAttr::from_indexed_name(name).is_some()
-                } else {
-                    matches!(
-                        DoseAttr::from_indexed_name(name),
-                        Some((DoseAttr::Duration | DoseAttr::Rate, _))
-                    )
-                };
+                let exempt = !is_algebraic
+                    && (DoseAttr::is_read_by_name(name, is_ode)
+                        || is_ode
+                            && ode_slot_map
+                                .get(*i)
+                                .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot)));
                 !exempt
             })
             .map(|(_, name)| name.clone())
