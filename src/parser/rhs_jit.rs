@@ -31,7 +31,7 @@
 //! binding does).
 use super::ir::{self, Cc, Func, Inst, Layout, Shim1};
 use super::Flat;
-use crate::sens::num::vm::RhsKernel;
+use crate::sens::num::vm::{LoadedInputs, RhsKernel};
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Value};
 use cranelift_codegen::settings::{self, Configurable};
@@ -624,17 +624,13 @@ impl RhsKernel for JitInner {
     fn has_reverse(&self, layout: Layout) -> bool {
         self.resolve_vjp(layout).is_some()
     }
-    fn may_mark_structural_zeros(
-        &self,
-        zero_u: &dyn Fn(usize) -> bool,
-        zero_p: &dyn Fn(usize) -> bool,
-        zero_s: &dyn Fn(usize) -> bool,
-    ) -> bool {
-        let (u, p, s) = &self.loads;
-        self.zero_sources
-            || u.iter().any(|&i| zero_u(i as usize))
-            || p.iter().any(|&k| zero_p(k as usize))
-            || (0..4).any(|k| s[k] && zero_s(k))
+    fn structural_zero_inputs(&self) -> Option<LoadedInputs<'_>> {
+        let (states, params, seeds) = &self.loads;
+        (!self.zero_sources).then_some(LoadedInputs {
+            states,
+            params,
+            seeds: *seeds,
+        })
     }
     fn structural_zeros(
         &self,

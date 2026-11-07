@@ -562,6 +562,15 @@ pub(crate) mod vm {
     /// A compiled RHS a tape can record whole and differentiate later (`parser::rhs_jit`):
     /// its native forward and reverse pass over a [`Layout`]'s lanes, `fn(u, params, seeds,
     /// du)` and `fn(u, params, seeds, du, ū, p̄, s̄, dū)`.
+    /// The inputs a compiled RHS loads ([`RhsKernel::structural_zero_inputs`]): its states,
+    /// its `params` slots, and which of the four seeds.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct LoadedInputs<'a> {
+        pub(crate) states: &'a [u32],
+        pub(crate) params: &'a [u32],
+        pub(crate) seeds: [bool; 4],
+    }
+
     pub(crate) trait RhsKernel: Send + Sync {
         /// How many elements of `u`, `params` and `du` the program touches.
         fn extent(&self) -> (usize, usize, usize);
@@ -578,7 +587,7 @@ pub(crate) mod vm {
         /// (`zu`, `zp`, `zs`). `false`, with `out` unspecified, when the kernel cannot tell;
         /// then every output must be treated as live. It may under-report, never over-report.
         ///
-        /// See [`Self::may_mark_structural_zeros`] for when a caller may skip it.
+        /// See [`Self::structural_zero_inputs`] for when a caller may skip it.
         #[allow(clippy::too_many_arguments)]
         fn structural_zeros(
             &self,
@@ -592,18 +601,14 @@ pub(crate) mod vm {
         ) -> bool {
             false
         }
-        /// Whether [`Self::structural_zeros`] can mark any output, given which inputs are
-        /// structural zeros (`zero_u(i)`, `zero_p(slot)`, `zero_s(k)`; an index past an input
-        /// slice is a structural zero, as the binding reads it). `false` only when it would
-        /// mark nothing, so the caller may skip it; `true`, the conservative answer, by
-        /// default.
-        fn may_mark_structural_zeros(
-            &self,
-            _zero_u: &dyn Fn(usize) -> bool,
-            _zero_p: &dyn Fn(usize) -> bool,
-            _zero_s: &dyn Fn(usize) -> bool,
-        ) -> bool {
-            true
+        /// When [`Self::structural_zeros`] can mark an output only through a structural-zero
+        /// *input*, the inputs it reads: then, if none of them is one (an index past an input
+        /// slice counts as one, as the binding reads it), it marks nothing and the caller may
+        /// skip it. `None`, the conservative answer and the default, when it may also mark
+        /// one from inputs none of which is a structural zero (a literal `0`, a product with
+        /// `0`, a comparison), so the caller always runs it.
+        fn structural_zero_inputs(&self) -> Option<LoadedInputs<'_>> {
+            None
         }
         /// The forward over `layout`.
         ///

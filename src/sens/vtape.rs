@@ -293,6 +293,18 @@ fn vrollback(mark: usize) {
 thread_local! {
     /// Lane buffers for [`record_rhs`] (kept apart from the tape, which it pushes to).
     static RHS_LANES: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// [`record_rhs`]'s per-output structural-zero marks, reused so a call allocates none.
+    static RHS_DEAD: std::cell::Cell<Vec<bool>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// [`RHS_DEAD`] taken for one [`record_rhs`] call and put back when it ends, on every return
+/// path. A nested call finds the cell empty and allocates its own, which is all it costs.
+struct DeadMarks(Vec<bool>);
+
+impl Drop for DeadMarks {
+    fn drop(&mut self) {
+        RHS_DEAD.set(std::mem::take(&mut self.0));
+    }
 }
 
 /// Record one RHS call whole (`VmArith::tape_rhs`): `du` from the kernel's native forward
@@ -384,18 +396,28 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
         // states, #2760). Their adjoint is exactly 0 either way, so the sweep's values do
         // not move. An output is dropped only if every lane the forward wrote is `0` too — the
         // analysis may under-report, and this keeps an over-report from ever losing a lane.
-        let mut dead = vec![false; edu];
+        let mut marks = DeadMarks(RHS_DEAD.take());
+        marks.0.clear();
+        marks.0.resize(edu, false);
+        let dead = &mut marks.0[..];
         let sz = |x: &DualV<N, M, TH>| crate::sens::linsolve::structural_zero(*x);
         // With no structural zero among the inputs the program loads and no instruction
-        // that makes one, the analysis marks nothing (`RhsKernel::may_mark_structural_zeros`),
+        // that makes one, the analysis marks nothing (`RhsKernel::structural_zero_inputs`),
         // so it is skipped: a model with no gated term pays a scan of its loaded inputs, not
         // a second interpretation of the program. Only the loaded ones: `params[..ep]` holds
         // every slot below the highest read, and an unused slot is an untaped `0`.
-        let analyse = kernel.may_mark_structural_zeros(
-            &|i| u[..eu].get(i).is_none_or(sz),
-            &|k| params[..ep].get(k).is_none_or(sz),
-            &|k| sz(&seeds[k]),
-        );
+        let analyse = match kernel.structural_zero_inputs() {
+            None => true,
+            Some(l) => {
+                l.states
+                    .iter()
+                    .any(|&i| u[..eu].get(i as usize).is_none_or(sz))
+                    || l.params
+                        .iter()
+                        .any(|&k| params[..ep].get(k as usize).is_none_or(sz))
+                    || (0..4).any(|k| l.seeds[k] && sz(&seeds[k]))
+            }
+        };
         let known = analyse && {
             let val = |l: &[f64]| l[0];
             let uv: Vec<f64> = xin[..eu * wf].chunks_exact(wf).map(val).collect();
@@ -410,7 +432,7 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
             let zu: Vec<bool> = u[..eu].iter().map(sz).collect();
             let zp: Vec<bool> = params[..ep].iter().map(sz).collect();
             let zs = [sz(&seeds[0]), sz(&seeds[1]), sz(&seeds[2]), sz(&seeds[3])];
-            kernel.structural_zeros(&uv, &pv, &sv, &zu, &zp, &zs, &mut dead)
+            kernel.structural_zeros(&uv, &pv, &sv, &zu, &zp, &zs, dead)
         };
         #[cfg(test)]
         let known = known && !RHS_DEAD_KEPT.with(|c| c.get());
