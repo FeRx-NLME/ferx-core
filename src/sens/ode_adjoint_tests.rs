@@ -1064,6 +1064,39 @@ fn addl_implied_lag_subject(model: &CompiledModel, tv: bool) -> Subject {
     s
 }
 
+/// The implied dose (`doses[1]`) of `s` carries its parent's lag in slot `lag`, **and** that
+/// differs from the governing record's (#1909, #2367). The governing value is computed, not
+/// assumed: on a twin whose dose 1 is an ordinary dose (no parent), the same snapshot
+/// builder reads dose 1's lag at its own inputs — the governing record's, which is what the
+/// implied dose read before the copy. So the pair straddles the copy under the old
+/// behaviour: dropping the copy fails the first assertion, and a fixture edit that made the
+/// two lags equal fails the second.
+fn assert_implied_lag_is_the_parents(
+    model: &CompiledModel,
+    s: &Subject,
+    theta: &[f64],
+    lag: usize,
+    label: &str,
+) {
+    let mut dose = Vec::new();
+    crate::pk::compute_dose_pk_params_into(model, s, theta, &[0.0, 0.0], &mut dose);
+    let parent = dose[0].values[lag];
+    assert_eq!(
+        dose[1].values[lag], parent,
+        "{label}: the implied dose takes the parent's lag"
+    );
+    let mut own = s.clone();
+    own.doses[1].implied = None;
+    let mut own_dose = Vec::new();
+    crate::pk::compute_dose_pk_params_into(model, &own, theta, &[0.0, 0.0], &mut own_dose);
+    let governing = own_dose[1].values[lag];
+    assert!(
+        governing.is_finite() && (governing - parent).abs() > 0.1 * parent.abs(),
+        "{label}: the governing record's lag {governing} must differ from the parent's \
+         {parent}, or the copy assertion cannot fail"
+    );
+}
+
 #[test]
 fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
     // (ODE, IOV, time-varying X, bound): one row per seeder that copies the lag — the
@@ -1091,10 +1124,8 @@ fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
         if !iov {
             // The copy is live: the parent's lag is half the governing record's.
             let lag = model.active_dose_attr_map().lag_slot(1);
-            let mut dose = Vec::new();
             let theta = &model.default_params.theta;
-            crate::pk::compute_dose_pk_params_into(&model, &s, theta, &[0.0, 0.0], &mut dose);
-            assert_eq!(dose[1].values[lag], dose[0].values[lag], "{label}");
+            assert_implied_lag_is_the_parents(&model, &s, theta, lag, &label);
             let params = moved_params(&model);
             let (gf, gl) = objective_gaps::<2>(&model, &s, &params, &[0.1, -0.05]);
             assert!(
@@ -1145,21 +1176,8 @@ fn an_addl_implied_dose_route_lag_from_its_parent_matches_reconverged_fd() {
         let s = addl_implied_lag_subject(&model, tv);
         if !iov {
             // The copy is live: the parent's route lag is half the governing record's.
-            let mut dose = Vec::new();
             let theta = &model.default_params.theta;
-            crate::pk::compute_dose_pk_params_into(&model, &s, theta, &[0.0, 0.0], &mut dose);
-            assert_eq!(dose[1].values[lag], dose[0].values[lag], "{label}: copy");
-            // Straddle: the parent's lag (X = 1, TVLAG = 0.4) is half the governing record's
-            // (X = 2, TVLAG·2 = 0.8). The copy gives the implied dose the parent's value, so
-            // it must differ from what the governing record alone would give. Without this a
-            // fixture edit that equalised the two would turn the copy assertion into a tautology.
-            let parent_lag = dose[0].values[lag];
-            let gov_lag = parent_lag * 2.0; // the governing record is at X = 2
-            assert!(
-                (gov_lag - parent_lag).abs() > 0.1,
-                "{label}: the governing lag {gov_lag} must differ from the parent's {parent_lag} \
-                 for the copy to be testable"
-            );
+            assert_implied_lag_is_the_parents(&model, &s, theta, lag, &label);
             let params = moved_params(&model);
             let (gf, gl) = objective_gaps::<2>(&model, &s, &params, &[0.1, -0.05]);
             assert!(

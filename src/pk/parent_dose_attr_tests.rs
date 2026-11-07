@@ -179,9 +179,32 @@ const ROUTE_LAG_MODEL: &str = r#"
 
 #[test]
 fn an_implied_dose_takes_its_own_routes_lag_from_its_parent() {
+    assert_route_lags_follow_the_parent(ROUTE_LAG_MODEL);
+}
+
+/// The same with both routes `zero_order(dur=…, lag=…)` (#2367's changelog covers every
+/// lagged absorption kind). The copy is per forcing and blind to its kind, so this pins
+/// that a second kind reaches it with the same slots, through the same three builders.
+#[test]
+fn an_implied_dose_takes_its_zero_order_routes_lag_from_its_parent() {
+    let src = ROUTE_LAG_MODEL
+        .replace("  LC = 0.1 * X\n", "  LC = 0.1 * X\n  DUR = 2.0\n")
+        .replace(
+            "first_order(ka=KA, lag=LA) - KA*depot",
+            "zero_order(dur=DUR, lag=LA) - KA*depot",
+        )
+        .replace(
+            "first_order(ka=KA, lag=LC) + KA*depot",
+            "zero_order(dur=DUR, lag=LC) + KA*depot",
+        );
+    assert!(src.matches("zero_order(").count() == 2, "{src}");
+    assert_route_lags_follow_the_parent(&src);
+}
+
+fn assert_route_lags_follow_the_parent(model_src: &str) {
     let (_, mut pop) = fixture_population();
     let subject = pop.subjects.remove(0);
-    let model = crate::parser::model_parser::parse_full_model(ROUTE_LAG_MODEL)
+    let model = crate::parser::model_parser::parse_full_model(model_src)
         .expect("route-lag fixture parses")
         .model;
     let forcings = &model.ode_spec.as_ref().expect("ode model").input_rate;
@@ -217,6 +240,37 @@ fn an_implied_dose_takes_its_own_routes_lag_from_its_parent() {
     assert_eq!((v(2, la), v(2, lc)), (0.25, 0.4));
     // The dose at 13 (into central): LC from its parent; LA is the governing record's.
     assert_eq!((v(3, lc), v(3, la)), (0.1, 1.0));
+
+    // The adaptive driver's per-event builder and the generic copy over seed vectors make
+    // the same copy (the PR's other builders; each would read the governing record's
+    // route lag, 1.0 and 0.4, without it).
+    let got = compute_event_pk_params_iov(&model, &subject, theta, &eta, &[], &[]);
+    assert_eq!(
+        got.dose[2].values[la], 0.25,
+        "adaptive builder: the parent's LA"
+    );
+    for (k, (g, w)) in got.dose.iter().zip(&dose).enumerate() {
+        assert_eq!(g.values, w.values, "adaptive builder, dose {k}");
+    }
+    let mut seeds: Vec<Vec<f64>> = (0..subject.doses.len())
+        .map(|k| {
+            (model.pk_param_fn)(theta, &eta, subject.dose_cov(k), subject.dose_param_time(k))
+                .values
+                .to_vec()
+        })
+        .collect();
+    assert_ne!(
+        seeds[2][la], dose[2].values[la],
+        "the seed copy is not a no-op here"
+    );
+    inherit_parent_dose_attrs_g(&model, &subject, &mut seeds);
+    for (k, s) in seeds.iter().enumerate() {
+        assert_eq!(
+            s.as_slice(),
+            &dose[k].values[..s.len()],
+            "seed copy, dose {k}"
+        );
+    }
 }
 
 #[test]
