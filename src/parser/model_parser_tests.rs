@@ -3869,6 +3869,39 @@ fn test_mstep_damping_round_trips_and_validates() {
     assert_eq!(opts.saem_mstep_damping, Some(1.0));
 }
 
+/// `saem_accumulation` and `saem_control_variate` (#2721) round-trip under both
+/// spellings, default to the historical accumulation with the control variate armed, and
+/// reject an unknown accumulation.
+#[test]
+fn test_saem_accumulation_and_control_variate_round_trip() {
+    use crate::types::SaemAccumulation;
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.saem_accumulation, SaemAccumulation::Classic);
+    assert!(opts.saem_control_variate);
+    assert_eq!(
+        apply_fit_option(&mut opts, "saem_accumulation", "Polyak"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_accumulation, SaemAccumulation::Polyak);
+    assert_eq!(
+        apply_fit_option(&mut opts, "accumulation", "classic"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_accumulation, SaemAccumulation::Classic);
+    let err = apply_fit_option(&mut opts, "saem_accumulation", "louis").unwrap_err();
+    assert!(err.contains("classic/polyak"), "{err}");
+    assert_eq!(
+        apply_fit_option(&mut opts, "control_variate", "false"),
+        Ok(true)
+    );
+    assert!(!opts.saem_control_variate);
+    assert_eq!(
+        apply_fit_option(&mut opts, "saem_control_variate", "true"),
+        Ok(true)
+    );
+    assert!(opts.saem_control_variate);
+}
+
 /// `mstep_solver` and `mstep_draws` (#1458) round-trip under both spellings,
 /// default to the historical single-draw maximiser, and reject what they cannot
 /// act on.

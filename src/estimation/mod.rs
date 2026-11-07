@@ -28,6 +28,7 @@ pub mod saem;
 pub mod saem_conddist;
 pub(crate) mod saem_imh;
 pub(crate) mod saem_mixture;
+pub(crate) mod saem_polyak;
 pub mod sens_outer_gradient;
 pub mod sir;
 pub mod trace;
