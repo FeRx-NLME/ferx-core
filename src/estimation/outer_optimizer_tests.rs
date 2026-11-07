@@ -13522,12 +13522,25 @@ fn unprofiled_stop_needs_verify_takes_every_stop_that_could_be_reported_converge
 #[test]
 fn unprofiled_verify_applies_to_foce_gradient_fits_only() {
     use nlopt::Algorithm as A;
-    assert!(unprofiled_verify_applies(A::Lbfgs, false, false));
-    assert!(unprofiled_verify_applies(A::Slsqp, false, false));
-    assert!(!unprofiled_verify_applies(A::Bobyqa, false, false));
-    assert!(!unprofiled_verify_applies(A::Mma, false, false));
-    assert!(!unprofiled_verify_applies(A::Lbfgs, true, false), "AGQ");
-    assert!(!unprofiled_verify_applies(A::Lbfgs, false, true), "mixture");
+    assert!(unprofiled_verify_applies(A::Lbfgs, false, false, 1));
+    assert!(unprofiled_verify_applies(A::Slsqp, false, false, 1));
+    assert!(!unprofiled_verify_applies(A::Bobyqa, false, false, 1));
+    assert!(!unprofiled_verify_applies(A::Mma, false, false, 1));
+    assert!(!unprofiled_verify_applies(A::Lbfgs, true, false, 1), "AGQ");
+    assert!(
+        !unprofiled_verify_applies(A::Lbfgs, false, true, 1),
+        "mixture"
+    );
+    // #2763: no random effects, no inner solve for the leg to tighten — under both gradient
+    // optimizers, and only at zero (one random effect, BSV or IOV alone, keeps the leg).
+    assert!(
+        !unprofiled_verify_applies(A::Lbfgs, false, false, 0),
+        "n_eta = 0"
+    );
+    assert!(
+        !unprofiled_verify_applies(A::Slsqp, false, false, 0),
+        "n_eta = 0"
+    );
 }
 
 /// Every exit of the #2462 loop, with the legs scripted.
