@@ -2216,8 +2216,9 @@ fn the_m3_sigma_forward_difference_is_relative_to_sigma() {
                 worst = worst.max(rel);
             }
             eprintln!("MEASURE #2406 iov={iov} sd={sd:e}: worst rel {worst:.2e}");
-            // Measured (macOS arm64): 1.5e-5..2.0e-5 at every sd, both paths; the bound is 2×
-            // the worst. Reverting either path's step to `h·(1 + σ)` fails it at sd = 0.3 (8.7e-5).
+            // Measured 1.50e-5..2.01e-5 at every sd, both paths, on Linux x86_64 and macOS arm64
+            // alike; the bound is 2× the worst. Reverting either path's step to `h·(1 + σ)`
+            // fails it at sd = 0.3 (8.7e-5).
             assert!(worst < 4e-5, "iov={iov} sd={sd:e}: worst rel {worst:e}");
         }
     }

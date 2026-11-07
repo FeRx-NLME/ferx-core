@@ -10162,7 +10162,9 @@ fn reporting_fd_gradient(
 /// Coordinate `k` is stepped by [`fd_step`]`(1e-4, xₖ, floor[k])`, `floor` from
 /// [`fd_step_floors`]: `1e-4·(1 + |xₖ|)` on every coordinate but a small identity-packed θ,
 /// which is stepped relative to its declared magnitude rather than by an absolute `1e-4` in
-/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187).
+/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187). A
+/// `[covariate_nn]` weight is identity-packed too but keeps the unit floor, since its θ₀ is
+/// a draw rather than a declared magnitude (#2406).
 fn central_diff_packed(
     x: &[f64],
     fixed: &[bool],
