@@ -1813,8 +1813,8 @@ mod tests {
     /// `φ`, faster than any power, so each limit is `0`. But the factors overflow before `z`
     /// does: `z²` from `|z| ≈ 1.3e154` (so `C = h(z² + hz − 1)` was `0·∞`), and at
     /// `z = +∞` `m` and `∂m/∂f` themselves (`∞ − ∞` in `∂m/∂f`), so `g1` and `g2` were `NaN`
-    /// too. Both tails, both straddles; the control row at `±1e6` is the ungated region,
-    /// where every coefficient is already `0`.
+    /// too. Both tails, both straddles. Every row, `±1e6` included, is past `h`'s underflow,
+    /// so the oracle is the exact limit `0`, not a neighbouring row.
     #[test]
     fn m3_censored_outer_is_zero_where_inv_mills_underflows() {
         // Proportional error at f = 1, σ = 0.1: v = σ²f², d = 2σ²f, d2 = 2σ².

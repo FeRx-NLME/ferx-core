@@ -263,7 +263,8 @@ fn m3_censored_dterm_df_matches_fd() {
 /// #2772 on the inner gradient's censored row (`residual_inner_obs`): `coef = h·m` and the
 /// `iiv_on_ruv` column `h·z`. Past `h = φ/Φ`'s underflow both limits are `0`, but at a limit
 /// far enough out that `z = +∞` the factors are infinite, and `0·∞` was `NaN`. Both tails,
-/// against the control at `±1e300`, where `z` is still finite and the products already `0`.
+/// plus the `±1e300` row, where `z` is still finite. Both rows are past `h`'s underflow, so
+/// the oracle is the exact limit `0`, not the `±1e300` row.
 #[test]
 fn residual_inner_obs_is_zero_where_inv_mills_underflows() {
     let model = crate::parser::model_parser::parse_model_string(
