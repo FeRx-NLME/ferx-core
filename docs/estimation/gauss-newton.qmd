@@ -92,6 +92,26 @@ via Cholesky decomposition. If the Cholesky fails (singular Hessian), $\lambda$ 
 
 Each step uses backtracking line search (up to 15 halvings). At each trial point, EBEs are re-estimated via the inner loop (warm-started from the previous EBEs), ensuring the FOCE objective is evaluated consistently.
 
+### Bounds and stalled steps
+
+A parameter that reaches its bound while the gradient still pushes it outward is held for that
+iteration, the way a `FIX` parameter is, and the rest of the step is solved without it. When a
+step does run into a bound, the trust region judges it against the reduction the quadratic model
+predicts for the step actually taken, not the unclamped one. Before
+[#2777](https://github.com/FeRx-NLME/ferx-core/issues/2777) the clamped coordinate still claimed
+its share of the prediction, so the ratio of actual to predicted reduction stayed at a fixed
+value below 0.25 at every radius and the fit stopped on "trust radius collapsed"
+(`examples/one_cpt_transit.ferx` under `method = gn`: 1513.94; now 1492.17, with `TVV` on its
+upper bound of 500 and no collapse).
+
+After three rejected steps in a row that no bound clamped, GN checks whether one subject's
+EBE-response term sets the step direction: its term is at least 10 times every other subject's,
+and on some parameter it outweighs the rest of the gradient. That happens when the subject's EBE
+mode moves sharply with the parameters (for example near a fold), so its slope is exact at the
+point but wrong over any step GN can take. GN then uses that subject's raw score for the rest of
+the fit and adds a warning that names it. The reported final gradient keeps the subject's full
+term.
+
 ### Convergence
 
 The algorithm converges when:

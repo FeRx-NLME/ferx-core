@@ -3191,6 +3191,8 @@ pub(crate) fn optimize_profiled(
         start_eval: start_eval.into_inner().unwrap(),
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement: None,
+        optimizer_stop: None,
     }
 }
 
@@ -3375,6 +3377,8 @@ fn failed_result(
         start_eval: None,
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement: None,
+        optimizer_stop: None,
     }
 }
 
@@ -3486,6 +3490,8 @@ impl ProfileCtx<'_> {
             warnings: vec![reason],
             sir_fallback_proposal: None,
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         };
         let fail = |reason: String| (failed(reason), None);
         let layout = self.layout;
@@ -3661,6 +3667,8 @@ impl ProfileCtx<'_> {
                     warnings: Vec::new(),
                     sir_fallback_proposal: None,
                     method: Some(CovarianceMethod::CrossProduct),
+                    newton_decrement: None,
+                    non_stationary_optimum: false,
                 },
                 Err(reason) => CovStepOutcome {
                     matrix: None,
@@ -3668,6 +3676,8 @@ impl ProfileCtx<'_> {
                     warnings: vec![reason],
                     sir_fallback_proposal: None,
                     method: None,
+                    newton_decrement: None,
+                    non_stationary_optimum: false,
                 },
             };
         }
@@ -3753,6 +3763,8 @@ impl ProfileCtx<'_> {
             warnings: vec![reason],
             sir_fallback_proposal: None,
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         };
         let blocks = match self.level_blocks(hold, x_hat, free, solve) {
             Ok(v) => v,
@@ -3820,6 +3832,8 @@ impl ProfileCtx<'_> {
             warnings: vec![reason],
             sir_fallback_proposal: None,
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         };
         let options = self.options;
         let n = x_hat.len();
@@ -3874,6 +3888,8 @@ impl ProfileCtx<'_> {
             warnings: vec![reason],
             sir_fallback_proposal: None,
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         };
         let options = self.options;
         let n = x_hat.len();
@@ -3937,6 +3953,8 @@ impl ProfileCtx<'_> {
                 warnings: vec![reason],
                 sir_fallback_proposal: Some(full),
                 method: None,
+                newton_decrement: None,
+                non_stationary_optimum: false,
             };
         }
         // `rsr`: `R⁻¹SR⁻¹` with `full` as `R⁻¹`, through the unprofiled step's own
@@ -3970,6 +3988,8 @@ impl ProfileCtx<'_> {
             warnings: Vec::new(),
             sir_fallback_proposal: None,
             method: Some(method),
+            newton_decrement: None,
+            non_stationary_optimum: false,
         }
     }
 

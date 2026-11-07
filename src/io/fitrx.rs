@@ -313,6 +313,11 @@ struct FitWire {
     final_gradient: Option<Vec<f64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_gradient_source: Option<String>,
+    // The covariance step's Newton decrement and the optimizer's stop state (#2785).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    newton_decrement: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    optimizer_stop: Option<String>,
     // ── Run settings ─────────────────────────────────────────────────────────
     optimizer: String,
     n_starts: usize,
@@ -1787,6 +1792,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         obs_time_range: r.obs_time_range,
         final_gradient: r.final_gradient.clone(),
         final_gradient_source: r.final_gradient_source.clone(),
+        newton_decrement: r.newton_decrement,
+        optimizer_stop: r.optimizer_stop.clone(),
         optimizer: r.optimizer.clone(),
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
@@ -3913,6 +3920,8 @@ fn wire_to_fit_result(
         obs_time_range: w.obs_time_range,
         final_gradient: w.final_gradient,
         final_gradient_source: w.final_gradient_source,
+        newton_decrement: w.newton_decrement,
+        optimizer_stop: w.optimizer_stop,
         optimizer: w.optimizer,
         n_starts: w.n_starts,
         multi_start_seed: w.multi_start_seed,

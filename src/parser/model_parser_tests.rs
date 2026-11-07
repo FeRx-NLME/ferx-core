@@ -1596,6 +1596,68 @@ fn test_ode_dead_indiv_param_warns() {
     );
 }
 
+/// The census and the `edit` pruner share `DoseAttr::is_read_by_name` (#2789), so
+/// each engine's exemption is pinned here on the names where the two engines differ:
+/// `F{n}`/`ALAG{n}` are read by name on ODE only, `D{n}`/`R{n}` on both.
+#[test]
+fn indexed_dose_attributes_are_not_flagged_dead_on_the_engine_that_reads_them() {
+    let model = |structural: &str, attrs: &str| {
+        format!(
+            "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.001, 10.0)
+  theta TVX(0.5, 0.001, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+{attrs}
+
+[structural_model]
+{structural}
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        )
+    };
+    let ode = "  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central";
+    let analytic = "  pk one_cpt_oral(cl=CL, v=V, ka=KA)";
+
+    for (structural, attrs) in [
+        (ode, "  F1 = TVX\n  ALAG2 = TVX\n  D1 = TVX\n  R2 = TVX"),
+        (analytic, "  D1 = TVX\n  R2 = TVX"),
+    ] {
+        let ws = super::parse_full_model(&model(structural, attrs))
+            .expect("a read-by-name dose attribute must parse")
+            .model
+            .parse_warnings;
+        assert!(
+            !ws.iter().any(|w| w.contains("computed but never used")),
+            "{attrs:?} under {structural:?} flagged dead: {ws:?}"
+        );
+    }
+    // The control: the census is live on this fixture.
+    let ws = super::parse_full_model(&model(ode, "  UNUSED = TVX"))
+        .unwrap()
+        .model
+        .parse_warnings;
+    assert!(
+        ws.iter()
+            .any(|w| w.contains("`UNUSED`") && w.contains("computed but never used")),
+        "{ws:?}"
+    );
+}
+
 #[test]
 fn test_ode_engine_applied_f_lagtime_not_flagged_dead() {
     // #315 carve-out: F and lagtime on an ODE model are routed to the

@@ -3003,6 +3003,8 @@ fn run_mcem(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum: _,
     } = out;
     warnings.extend(cov_warnings);
 
@@ -3133,6 +3135,8 @@ fn run_mcem(
         mcem_objective_trail: stopped_after
             .is_none()
             .then(|| recenter.objective_trail(iteration_objectives, iteration_mc_se, label)),
+        newton_decrement,
+        optimizer_stop: None,
     })
 }
 
@@ -4079,6 +4083,8 @@ fn run_mcem_mixture(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum: _,
     } = cov_out;
     warnings.extend(cov_warnings);
 
@@ -4136,6 +4142,8 @@ fn run_mcem_mixture(
         mcem_objective_trail: stopped_after
             .is_none()
             .then(|| recenter.objective_trail(iteration_objectives, iteration_mc_se, label)),
+        newton_decrement,
+        optimizer_stop: None,
     })
 }
 
