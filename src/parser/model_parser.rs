@@ -7348,13 +7348,13 @@ pub fn parse_full_model_with(
     // Only compiled when the `survival` feature is enabled; the field
     // `model.endpoints` is always present (cfg-gated) and stays empty otherwise.
     //
-    // Theta/eta indices used in event_model expressions are collected here so
-    // that check_unused_parameters (below) can suppress false "not referenced"
-    // warnings for parameters that only appear in [event_model].
-    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    // Theta/eta indices read anywhere outside `[individual_parameters]` are collected
+    // here, so that check_unused_parameters (below) does not report them "not
+    // referenced". Despite the name the set is not only [event_model]'s: a custom RUV
+    // magnitude, a `correlation` line's ρ, a `[covariate_model]` relation, a `[scaling]`
+    // readout and a `[mixture]` mixing expression (#2766) add theirs too.
     let mut event_model_used_thetas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
-    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_etas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     // Every endpoint block's parameter expressions as synthetic assignments,
