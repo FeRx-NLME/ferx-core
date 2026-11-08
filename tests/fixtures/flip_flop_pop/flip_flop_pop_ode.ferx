@@ -1,9 +1,10 @@
 # One-compartment oral population with flip-flop subjects (ODE twin)
 #
-# The ODE twin of examples/flip_flop_pop.ferx, on the same data (data/flip_flop_pop.csv,
-# tools/sim_flip_flop_pop.py). The flip-flop twin seed (`inner_twin_seed`) applies only to
-# the closed form, so here a flip-flop subject's second mode is reached by the Sobol
-# screen (`inner_screen`) alone. The fixture for #2096's descent-budget ablation.
+# The ODE twin of flip_flop_pop.ferx, on the same data (flip_flop_pop.csv in this
+# directory, simulated by sim_flip_flop_pop.py). The flip-flop twin seed (`inner_twin_seed`)
+# applies only to the closed form, so here a flip-flop subject's second mode is reached by
+# the Sobol screen (`inner_screen`) alone. The fixture for #2096's descent-budget ablation,
+# and for #2707's basin-shift restart (tests/restart_probe_flip_flop.rs).
 
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)

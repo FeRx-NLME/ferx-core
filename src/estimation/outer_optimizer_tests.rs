@@ -14474,7 +14474,7 @@ fn the_attempt_hands_an_unmoved_start_to_the_probe() {
         None,
         &[],
         false,
-        Some(&probe),
+        Some((&probe, ProbeWhen::Unmoved)),
     );
     assert!(
         !outcome.left_init,
@@ -14510,7 +14510,7 @@ fn the_attempt_hands_an_unmoved_start_to_the_probe() {
         None,
         &[],
         false,
-        Some(&probe),
+        Some((&probe, ProbeWhen::Unmoved)),
     );
     assert!(!ran.get() && !result.stationary_start);
     // Nor does a leg that left its start with budget to spare — the guard the budget one
@@ -14540,7 +14540,7 @@ fn the_attempt_hands_an_unmoved_start_to_the_probe() {
         None,
         &[],
         false,
-        Some(&probe),
+        Some((&probe, ProbeWhen::Unmoved)),
     );
     assert!(outcome.left_init, "fixture precondition: the leg moves");
     assert!(
@@ -15024,6 +15024,205 @@ fn a_verified_start_takes_every_point_field_from_the_lower_run() {
         assert_eq!(result.stationary_start, start_wins);
         assert_eq!(result.left_init, Some(!start_wins));
     }
+}
+
+/// #2707, the gate inside the attempt, per PR and with no convergence loop: one leg stopped
+/// at its start, handed the same probe under each gate. Under `Unmoved` (the first attempt)
+/// the probe runs; under `DisplacementAloneRejects` (a restart leg) it does not, because a
+/// one-evaluation leg's stop is not one its acceptance rule decides — displacement is not
+/// what rejects it. Both arms run on one fixture, so the test straddles the gate.
+#[test]
+fn an_unmoved_leg_rejected_on_other_grounds_is_not_probed_as_a_restart() {
+    let (mut model, pop) = two_cpt_iv_fixture();
+    let opts = options_2506(crate::types::Optimizer::NloptLbfgs);
+    let init = model.default_params.clone();
+    for (when, runs) in [
+        (ProbeWhen::Unmoved, true),
+        (ProbeWhen::DisplacementAloneRejects, false),
+    ] {
+        model.name = format!("restart_probe_gate_2707_{when:?}");
+        forced_stop_at_start::set(&model.name, None, false);
+        let calls = std::cell::Cell::new(0);
+        let probe = |_: &ModelParameters, _: f64, _: usize| calls.set(calls.get() + 1);
+        let (result, outcome) = optimize_nlopt_attempt_probed(
+            &model,
+            &pop,
+            &init,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            None,
+            &[],
+            false,
+            Some((&probe, when)),
+        );
+        assert!(
+            !outcome.left_init && !result.converged,
+            "{when:?}: fixture precondition — one evaluation neither leaves the start nor \
+             converges"
+        );
+        assert_eq!(calls.get(), usize::from(runs), "{when:?}: probe calls");
+    }
+}
+
+/// #2707: the first attempt is probed whenever it did not leave its start; a restart leg
+/// only when displacement is the one thing its acceptance rule rejects it on. From the one
+/// input set where the restart gate opens, each condition flipped alone closes it — so the
+/// test dies if any of the four is dropped — while the first attempt's gate stays open on
+/// every input.
+#[test]
+fn a_restart_is_probed_only_when_displacement_alone_rejects_it() {
+    // (decided here, accepted without displacement, accepted with it, basin shift)
+    let open = (true, false, true, false);
+    let flips = [
+        (
+            "converged not decided by the acceptance rule",
+            (false, false, true, false),
+        ),
+        ("accepted without displacement", (true, true, true, false)),
+        (
+            "rejected with displacement too",
+            (true, false, false, false),
+        ),
+        (
+            "a basin shift restarts it instead",
+            (true, false, true, true),
+        ),
+    ];
+    let due = |when, (decided, without, with, basin): (bool, bool, bool, bool)| {
+        start_probe_due(
+            when,
+            decided,
+            |left| if left { with } else { without },
+            basin,
+        )
+    };
+    assert!(
+        due(ProbeWhen::DisplacementAloneRejects, open),
+        "the restart gate opens"
+    );
+    for (label, inputs) in flips {
+        assert!(
+            !due(ProbeWhen::DisplacementAloneRejects, inputs),
+            "{label}: no probe on a restart"
+        );
+        assert!(
+            due(ProbeWhen::Unmoved, inputs),
+            "{label}: the first attempt is probed regardless"
+        );
+    }
+}
+
+/// #2707: what a restart leg reports once its probe has answered. A verified restart reports
+/// the probe's verdict, warnings and restart cause through `verified_start_result`, at the
+/// lower of the two points; any other verdict reports the restart as its own rule left it —
+/// unconverged, its own warnings and cause, and **no** "stalled on its initial estimates"
+/// warning, since a restart starts at the previous leg's estimates, not the user's. The
+/// probe's evaluations count every time it ran; with no probe the restart is untouched.
+#[test]
+fn a_restart_probe_reports_a_verified_restart_and_leaves_any_other_one_as_it_was() {
+    let (model, pop) = two_cpt_iv_fixture();
+    let opts = options_2506(crate::types::Optimizer::NloptLbfgs);
+    let init = model.default_params.clone();
+    let mut off = init.clone();
+    off.theta = init.theta.iter().map(|t| 1.1 * t).collect();
+    let init_packed = pack_params(&init);
+    let (restart_tag, probe_tag) = ("the restart's own warning", "the probe's own warning");
+    let restarted_at = |left: bool| OuterResult {
+        converged: false,
+        warnings: vec![restart_tag.to_string()],
+        left_init: Some(left),
+        n_iterations: 7,
+        ..evaluate_at_initial_params(&model, &pop, &init, &opts)
+    };
+    let restarted = || restarted_at(true);
+    let restart_ofv = restarted().ofv;
+    let restart_cause = Some(RestartCause::MidDescent);
+    let probe_cause = Some(RestartCause::BasinShift);
+    for (verdict, probe_delta, reports_probe, restart_left) in [
+        (Some(true), -1e-3, true, true),
+        (Some(true), -1e-3, true, false),
+        // Verified but higher: the restart's own point, with the probe's verdict.
+        (Some(true), 1e-3, false, true),
+        (Some(true), 1e-3, false, false),
+        (Some(false), -1.0, false, true),
+        (None, -1e-3, false, true),
+    ] {
+        let label = format!(
+            "{verdict:?}, probe − restart = {probe_delta:+e}, restart left the user's start \
+             = {restart_left}"
+        );
+        let probe = OuterResult {
+            ofv: restart_ofv + probe_delta,
+            converged: true,
+            warnings: vec![probe_tag.to_string()],
+            left_init: Some(true),
+            n_iterations: 4,
+            ..evaluate_at_initial_params(&model, &pop, &off, &opts)
+        };
+        let (result, cause) = settle_restart_probe(
+            (restarted_at(restart_left), restart_cause),
+            Some((probe, probe_cause, verdict)),
+            |r| r.ofv,
+        );
+        let verified = verdict == Some(true);
+        assert_eq!(
+            pack_params(&result.params) != init_packed,
+            reports_probe,
+            "{label}: which point is reported"
+        );
+        assert_eq!(
+            (
+                result.converged,
+                result.warnings.iter().any(|w| w == probe_tag),
+                result.warnings.iter().any(|w| w == restart_tag),
+                cause,
+            ),
+            (
+                verified,
+                verified,
+                !verified,
+                if verified { probe_cause } else { restart_cause }
+            ),
+            "{label}: whose verdict, warnings and restart cause: {:?}",
+            result.warnings
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("stalled on its initial estimates")),
+            "{label}: a restart is never reported as a stall at the user's inits: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.n_iterations, 11, "{label}: both legs count");
+        // The published displacement is the reported point's own, from the user's start:
+        // the probe's (`Some(true)`) when it wins, else the restart's. A verified restart
+        // whose own point wins is not read as a start the fit never left, which is what
+        // `verified_start_result` alone would publish (`Some(false)`, stationary).
+        let left = if reports_probe { true } else { restart_left };
+        assert_eq!(result.left_init, Some(left), "{label}");
+        assert_eq!(result.stationary_start, verified && !left, "{label}");
+    }
+    let (result, cause) = settle_restart_probe((restarted(), restart_cause), None, |r| r.ofv);
+    assert_eq!(
+        (
+            result.n_iterations,
+            result.converged,
+            result.ofv,
+            result.warnings.clone(),
+            cause
+        ),
+        (
+            7,
+            false,
+            restart_ofv,
+            vec![restart_tag.to_string()],
+            restart_cause
+        ),
+        "no probe: the restart as it was"
+    );
 }
 
 /// #2506, the stall half end to end, per PR: a fit whose first leg stops on the model-file

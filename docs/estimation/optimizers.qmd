@@ -274,7 +274,10 @@ restart ends with the objective at the start.
 Because the question is answered by the optimizer itself, bounds, flat directions and
 saddles are handled the way every fit handles them, and the check covers any model and
 objective, AGQ and mixtures included. It costs one extra optimization from near the start,
-paid only by a fit that did not move.
+paid only by a fit that did not move. A basin-shift restart that does not leave its own start
+is asked the same question
+([#2707](https://github.com/FeRx-NLME/ferx-core/issues/2707),
+[details](foce.qmd#restart-at-its-own-start)).
 
 A model with a `profile`d θ block runs the same check
 ([#2591](https://github.com/FeRx-NLME/ferx-core/issues/2591)). Only its structural

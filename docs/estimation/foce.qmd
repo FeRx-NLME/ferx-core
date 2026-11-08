@@ -1164,6 +1164,35 @@ search gets enough starts (`MCETA=200`), a gap of 8.935 against ferx's 8.938. Wi
 `MCETA`, NONMEM's cold η search puts one subject in the higher mode at the optimum. Its own
 estimation from these starting values stops with rounding errors at 814.84.
 
+#### A restart that does not leave its own start {#restart-at-its-own-start}
+
+A basin-shift restart starts at the previous leg's estimates, and most of what it gains is
+the EBE modes the cold solve found, not a step in θ. So it often ends closer to its own start
+than the escape step of 0.01 in the optimizer's scaled space. The plateau rule and the
+verified-stop rule both require that step of a stop NLopt reported as a bare `Failure`, to
+tell a fit that descended from one that twitched and died at its start (#751). Before
+[#2707](https://github.com/FeRx-NLME/ferx-core/issues/2707), that alone made such a restart
+`converged: false`, however sound its stop: flat tail, a cold solve that reproduces the best
+objective seen, no subject off its modes.
+
+Now a restart rejected on that one ground is asked the question a
+[warm start at an optimum](optimizers.qmd#warm-start-at-an-optimum) is asked: the optimizer is
+restarted from a perturbation of the restart's point, and if it comes back to within 0.01 OFV,
+the point is reported converged. On a multimodal inner problem that perturbed run can trap in
+a higher mode as the fit did, so it runs the same restart chain before its answer is read.
+Only the fit's own restarts are announced in `FitResult.warnings`, not the perturbed run's.
+
+The check costs nothing on a restart that converged on its own terms, or that was rejected
+for any other reason. A restart that cannot move from a point that is not an optimum is
+still reported `converged: false`: the perturbed run then finds a lower objective, or
+reaches no verdict.
+
+On a simulated population of 80 subjects, 24 of them flip-flop
+(`tests/fixtures/flip_flop_pop/`, fitted in closed form and as an ODE), both fits end at the
+optimum, OFV −3051.439163, and are now reported converged. The closed form stops through the
+verified-stop rule and the ODE twin through the plateau rule. The check costs about 110 more
+objective evaluations (87 → 197 and 85 → 202), about twice each fit's run time (Linux).
+
 ## Configuration Example
 
 ```

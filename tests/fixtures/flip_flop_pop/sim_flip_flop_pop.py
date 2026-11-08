@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Simulate a one-compartment oral population in which some subjects are flip-flop.
 
-For #2096 (the inner screen's descent budget). Fitted by examples/flip_flop_pop.ferx (the
-closed form) and examples/flip_flop_pop_ode.ferx (its ODE twin).
+For #2096 (the inner screen's descent budget) and #2707 (a basin-shift restart's verdict).
+Fitted by flip_flop_pop.ferx (the closed form) and flip_flop_pop_ode.ferx (its ODE twin),
+both in this directory.
 
 Each subject gets one oral dose into the depot. Its concentration is the Bateman function
 
@@ -18,9 +19,9 @@ ODE twin takes no seed, so only the Sobol screen (`inner_screen`, #2013) reaches
 The generator is plain Python and never runs ferx, so the data do not depend on the
 engine they test. It is deterministic given SEED, so the committed CSV is reproducible.
 
-Writes data/flip_flop_pop.csv (columns ID,TIME,DV,EVID,AMT,CMT,MDV): one dose row per
-subject (EVID=1, CMT=1) plus its 12 observations (EVID=0, CMT=1, the readout of the closed
-form; the ODE twin reads `central`). Prints the number of flip-flop subjects to stderr.
+Writes flip_flop_pop.csv next to this script (columns ID,TIME,DV,EVID,AMT,CMT,MDV): one
+dose row per subject (EVID=1, CMT=1) plus its 12 observations (EVID=0, CMT=1, the readout of
+the closed form; the ODE twin reads `central`). Prints the number of flip-flop subjects to stderr.
 """
 import math
 import os
@@ -64,7 +65,7 @@ def main():
             dv = ipred * (1.0 + SIGMA_PROP * rng.gauss(0.0, 1.0))
             assert dv > 0.0, f"subject {sid}, t = {t}: non-positive DV {dv}"
             rows.append(f"{sid},{t:g},{dv:.6g},0,.,1,0")
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "flip_flop_pop.csv")
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flip_flop_pop.csv")
     with open(out, "w") as f:
         f.write("\n".join(rows) + "\n")
     print(f"wrote {os.path.normpath(out)}: {N_SUBJECTS} subjects, {n_flip_flop} flip-flop (KA < CL/V)", file=sys.stderr)
