@@ -283,7 +283,7 @@ fn assert_fit_pushes_only_the_helpers_message(model: &CompiledModel, label: &str
         biexponential_subject("1", 1.0, 1.0),
         biexponential_subject("2", 1.1, 2.5),
     ]);
-    assert_fit_pushes_only_the_helpers_message_on(model, &pop, label)
+    assert_fit_pushes_only_the_helpers_message_on(model, &pop, FitOptions::default(), label)
 }
 
 fn population(subjects: Vec<Subject>) -> Population {
@@ -297,12 +297,14 @@ fn population(subjects: Vec<Subject>) -> Population {
     }
 }
 
-/// [`assert_fit_pushes_only_the_helpers_message`] on a given population; the
-/// expected message is the helper's for the advice `dw_advice` resolves (#2798).
-/// Returns that message so a caller can pin which advice reached it.
+/// [`assert_fit_pushes_only_the_helpers_message`] on a given population, fitted
+/// under `base` (one outer iteration, no covariance step); the expected message is
+/// the helper's for the advice `dw_advice` resolves under those same options
+/// (#2798). Returns that message so a caller can pin which advice reached it.
 fn assert_fit_pushes_only_the_helpers_message_on(
     model: &CompiledModel,
     pop: &Population,
+    base: FitOptions,
     label: &str,
 ) -> String {
     // One outer iteration: the statistic comes from the post-fit residual pass,
@@ -310,7 +312,7 @@ fn assert_fit_pushes_only_the_helpers_message_on(
     let opts = FitOptions {
         outer_maxiter: 1,
         run_covariance_step: false,
-        ..Default::default()
+        ..base
     };
 
     let result = fit(model, pop, &model.default_params, &opts).expect("fit should succeed");
@@ -450,10 +452,60 @@ fn fit_pushes_the_compartment_free_message_for_an_algebraic_model() {
         parabola_subject("2", 14.0),
         parabola_subject("3", 7.0),
     ]);
-    let pushed = assert_fit_pushes_only_the_helpers_message_on(&model, &pop, "algebraic");
+    let pushed = assert_fit_pushes_only_the_helpers_message_on(
+        &model,
+        &pop,
+        FitOptions::default(),
+        "algebraic",
+    );
     assert!(
         pushed.contains("correlation ar1(RHO) by COL") && !pushed.contains("transit"),
         "the compartment-free advice must reach the user: {pushed}"
+    );
+}
+
+/// The grouping reaches the pushed message through the **fit's** options: the
+/// same line model with `iov_column = OCC` in `[fit_options]`, fitted under the
+/// parsed options, pushes `by OCC` (#2815 review round 1, row 2). `dw_advice`
+/// takes `options` because the occasion rule a fit runs under is the caller's
+/// (#1783); every other test calls it directly, and the end-to-end fixture above
+/// declares no grouping, so its advice is the same whatever options reach it.
+///
+/// Mutation that must redden this: `dw_advice(model, &FitOptions::default())` at
+/// the call site in `fit_inner`.
+#[test]
+fn fit_pushes_the_grouping_its_options_carry() {
+    let parsed = crate::parser::model_parser::parse_full_model(
+        "[parameters]\n  theta TVA(10.0, 0.1, 500.0)\n  theta TVB(0.5, -50.0, 50.0)\n  \
+         omega ETA_A ~ 0.09\n  sigma ADD ~ 1.0\n[individual_parameters]\n  \
+         A = TVA * exp(ETA_A)\n  B = TVB\n[structural_model]\n  y = A + B * TIME\n\
+         [error_model]\n  DV ~ additive(ADD)\n[fit_options]\n  iov_column = OCC\n",
+    )
+    .expect("parse");
+    assert_eq!(parsed.fit_options.iov_column.as_deref(), Some("OCC"));
+    assert!(
+        parsed.model.is_algebraic(),
+        "the fixture must be compartment-free"
+    );
+    let mut subjects = vec![
+        parabola_subject("1", 10.0),
+        parabola_subject("2", 14.0),
+        parabola_subject("3", 7.0),
+    ];
+    for s in &mut subjects {
+        s.covariates.insert("OCC".into(), 1.0);
+    }
+    let mut pop = population(subjects);
+    pop.covariate_names = vec!["OCC".into()];
+    let pushed = assert_fit_pushes_only_the_helpers_message_on(
+        &parsed.model,
+        &pop,
+        parsed.fit_options.clone(),
+        "algebraic, iov_column = OCC",
+    );
+    assert!(
+        pushed.contains("correlation ar1(RHO) by OCC`") && !pushed.contains("by COL"),
+        "the options' grouping must reach the user: {pushed}"
     );
 }
 
@@ -575,10 +627,11 @@ const COMPARTMENTAL: &str = "Positive IWRES autocorrelation detected (Durbin-Wat
 /// The compartment-free text when the model declares no grouping a `by` can read.
 const ALGEBRAIC_UNGROUPED: &str = "Positive IWRES autocorrelation detected (Durbin-Watson = \
      1.20). Rows of one subject may share what the structural model leaves out, such as the \
-     visits of one arm or occasion. Declare that grouping (a `level` with a `kappa … at` it, \
-     or `iov_column`) and add a `correlation ar1(RHO) by COL` line to [error_model], with COL \
-     the column that labels the group; `car1(RHO)` decays the correlation with the time \
-     between rows instead. The line needs method = foce or focei.";
+     visits of one arm or occasion. A `correlation ar1(RHO) by COL` line in [error_model] \
+     lets them correlate, with COL any data column that labels the group (the innermost \
+     level's name when levels are nested); `car1(RHO)` decays the correlation with the time \
+     between rows instead. The line needs method = foce or focei. A `level` for that \
+     grouping with a `kappa … at` it can absorb the shared part instead.";
 
 /// The compartment-free text for group `g`.
 fn algebraic_grouped(g: &str) -> String {
@@ -607,17 +660,24 @@ enum Grouping {
     IovColumn,
     SingleLevel,
     Nested,
-    /// `iov_column = OCC` **and** `iov_occasion = time(...)`: the rule overrides the
-    /// column, so the column must not leak into the advice.
+    /// `iov_column = OCC` **and** `iov_occasion = time(...)`, with a kappa: the rule
+    /// overrides the column, so the column must not leak into the advice.
     IovTime,
+    /// The same with `iov_occasion = dose`.
+    IovDose,
+    /// `iov_column = OCC` and `iov_occasion = time(...)` **without** a kappa: the fit
+    /// derives no occasions (`run::occasions_are_derived`), so the column stands.
+    IovTimeNoKappa,
 }
 
-const GROUPINGS: [Grouping; 5] = [
+const GROUPINGS: [Grouping; 7] = [
     Grouping::None,
     Grouping::IovColumn,
     Grouping::SingleLevel,
     Grouping::Nested,
     Grouping::IovTime,
+    Grouping::IovDose,
+    Grouping::IovTimeNoKappa,
 ];
 
 fn grouped_model(class: Class, grouping: Grouping) -> crate::types::ParsedModel {
@@ -640,6 +700,18 @@ fn grouped_model(class: Class, grouping: Grouping) -> crate::types::ParsedModel 
             "",
             "  kappa K ~ 0.04\n",
             " + K",
+            "  iov_column = OCC\n  iov_occasion = time(24, 48)\n",
+        ),
+        Grouping::IovDose => (
+            "",
+            "  kappa K ~ 0.04\n",
+            " + K",
+            "  iov_column = OCC\n  iov_occasion = dose\n",
+        ),
+        Grouping::IovTimeNoKappa => (
+            "",
+            "",
+            "",
             "  iov_column = OCC\n  iov_occasion = time(24, 48)\n",
         ),
     };
@@ -735,6 +807,7 @@ fn algebraic_without_grouping_names_a_level_and_a_placeholder_column() {
     for must in [
         "kappa … at",
         "correlation ar1(RHO) by COL",
+        "innermost level's name",
         "foce",
         "focei",
         "car1",
@@ -807,23 +880,59 @@ fn algebraic_nested_levels_correlate_by_the_innermost_level_name() {
     }
 }
 
-/// Compartment-free with `iov_occasion = time(...)`: the occasions come from the
-/// timeline, so no column labels them, and the rule overrides the `iov_column` the
-/// fixture also sets. The ungrouped text.
+/// Compartment-free with `iov_occasion = time(...)` or `dose` and a kappa: the
+/// occasions come from the timeline, so no column labels them, and the rule
+/// overrides the `iov_column` the fixture also sets. The ungrouped text.
 ///
-/// Mutation that must redden this: dropping the `iov_occasion` arm of `dw_advice`.
+/// Mutation that must redden this: dropping the derived-occasions arm of
+/// `dw_advice`.
 #[test]
 fn algebraic_derived_occasions_get_the_ungrouped_text() {
-    let parsed = grouped_model(Class::Algebraic, Grouping::IovTime);
-    assert_eq!(
-        parsed.fit_options.iov_column.as_deref(),
-        Some("OCC"),
-        "the straddle: a column is set, and only the rule keeps it out"
+    for g in [Grouping::IovTime, Grouping::IovDose] {
+        let parsed = grouped_model(Class::Algebraic, g);
+        assert_eq!(
+            parsed.fit_options.iov_column.as_deref(),
+            Some("OCC"),
+            "{g:?}: the straddle: a column is set, and only the rule keeps it out"
+        );
+        assert!(
+            crate::api::run::occasions_are_derived(&parsed.model, &parsed.fit_options),
+            "{g:?}: the fixture must derive its occasions"
+        );
+        let (advice, msg) = cell(Class::Algebraic, g);
+        assert_eq!(advice, DwAdvice::Algebraic { group: None }, "{g:?}");
+        assert_eq!(msg, ALGEBRAIC_UNGROUPED, "{g:?}");
+        assert!(!msg.contains("OCC"), "{g:?}: {msg}");
+    }
+}
+
+/// Compartment-free with `iov_column = OCC` and `iov_occasion = time(...)` but no
+/// kappa: the fit derives no occasions, so the column grouping stands and the
+/// advice correlates by it (#2815 review round 1, row 1).
+///
+/// Mutation that must redden this: dropping the `n_kappa > 0` term, i.e. keying the
+/// arm on `iov_occasion != Column` alone.
+#[test]
+fn algebraic_derived_rule_without_a_kappa_keeps_the_column() {
+    let parsed = grouped_model(Class::Algebraic, Grouping::IovTimeNoKappa);
+    assert_ne!(
+        parsed.fit_options.iov_occasion,
+        crate::types::IovOccasionRule::Column,
+        "the straddle: a derived rule is set, and only the missing kappa voids it"
     );
-    let (advice, msg) = cell(Class::Algebraic, Grouping::IovTime);
-    assert_eq!(advice, DwAdvice::Algebraic { group: None });
-    assert_eq!(msg, ALGEBRAIC_UNGROUPED);
-    assert!(!msg.contains("OCC"), "{msg}");
+    assert!(!crate::api::run::occasions_are_derived(
+        &parsed.model,
+        &parsed.fit_options
+    ));
+    let (advice, msg) = cell(Class::Algebraic, Grouping::IovTimeNoKappa);
+    assert_eq!(
+        advice,
+        DwAdvice::Algebraic {
+            group: Some("OCC".into())
+        }
+    );
+    assert_eq!(msg, algebraic_grouped("OCC"));
+    assert!(msg.contains("by OCC`") && !msg.contains("COL"), "{msg}");
 }
 
 /// The negative branch is the same for every model: no model-class remedy.

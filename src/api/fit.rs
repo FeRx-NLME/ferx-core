@@ -419,9 +419,11 @@ pub(crate) enum DwAdvice {
 /// - `iov_column`, which a **single** `level X by COL in ID` also sets (the parser
 ///   writes the level's column into it): that **column**. A one-level model has no
 ///   named level a `by` can read (`residual_level` needs more than one);
-/// - `iov_occasion = per_dose` / `time(...)`: `None` — the occasions are derived from
-///   the timeline, so there is no column a `by` can read, and it overrides
-///   `iov_column`;
+/// - derived occasions (`iov_occasion = dose` / `time(...)` on a model with a
+///   kappa, `run::occasions_are_derived`): `None` — the occasions come from the
+///   timeline, so there is no column a `by` can read, and the rule overrides
+///   `iov_column`. Without a kappa the fit derives nothing and the `iov_column`
+///   grouping stands, so that cell takes the column arm;
 /// - no grouping: `None`.
 ///
 /// `options`, not `model.fit_options`, because the occasion rule a fit runs under is
@@ -432,7 +434,7 @@ pub(crate) fn dw_advice(model: &CompiledModel, options: &FitOptions) -> DwAdvice
     }
     let group = if let Some(levels) = model.nested_levels() {
         levels.levels.last().map(|l| l.name.clone())
-    } else if options.iov_occasion != crate::types::IovOccasionRule::Column {
+    } else if crate::api::run::occasions_are_derived(model, options) {
         None
     } else {
         options.iov_column.clone()
@@ -451,8 +453,8 @@ pub(crate) fn dw_advice(model: &CompiledModel, options: &FitOptions) -> DwAdvice
 /// from a unit test without running a fit (the suffix dropped below outlived
 /// #1285 precisely because nothing tested it), and deliberately the same for an
 /// ODE and a closed-form model (only a compartment-free one differs): it used
-/// to append " For ODE models, SDE process noise may also help." whenever `model.ode_spec` was present. `[diffusion]` is not that
-/// remedy. The EKF propagates the state covariance and never corrects the state
+/// to append " For ODE models, SDE process noise may also help." whenever
+/// `model.ode_spec` was present. `[diffusion]` is not that remedy. The EKF propagates the state covariance and never corrects the state
 /// mean with the observed data (#1285), so the fitted object is the
 /// deterministic ODE mean with an inflated residual variance: it re-weights the
 /// fit rather than supplying the missing dynamics the statistic is reporting.
@@ -484,10 +486,11 @@ pub(crate) fn dw_autocorrelation_warning(dw: f64, advice: &DwAdvice) -> Option<S
             ),
             DwAdvice::Algebraic { group: None } => format!(
                 "{what} Rows of one subject may share what the structural model leaves \
-                 out, such as the visits of one arm or occasion. Declare that grouping \
-                 (a `level` with a `kappa … at` it, or `iov_column`) and add a \
-                 `correlation ar1(RHO) by COL` line to [error_model], with COL the \
-                 column that labels the group; {CAR1_AND_METHOD}"
+                 out, such as the visits of one arm or occasion. A `correlation \
+                 ar1(RHO) by COL` line in [error_model] lets them correlate, with COL any \
+                 data column that labels the group (the innermost level's name when \
+                 levels are nested); {CAR1_AND_METHOD} A `level` for that grouping with a \
+                 `kappa … at` it can absorb the shared part instead."
             ),
         })
     } else if dw > 2.5 {
