@@ -966,8 +966,9 @@ censorings, so the subjects censored at that time are still in the risk set of i
 quantile (type 7, the one `vpc::vpc_tte` uses) over the replicate curves still defined there.
 A replicate past its last follow-up time is left out unless its curve has reached zero; it
 is not counted as 0 or 1. A band point with fewer replicates than `⌈1 / min(p, 1 − p)⌉ − 1`
-(19 for 5 %/95 %) is empty, because its outer quantile would just be the sample minimum or
-maximum. So `n_sim` must be at least one more than that, 20 for the default band.
+(19 for 5 %/95 %) is empty: with fewer than about 1/p curves the p-tail holds less than one
+curve, so its quantile is only an interpolation between the two most extreme values. So
+`n_sim` must be at least one more than that, 20 for the default band.
 
 The automatic grid is 0, the stratum's observed times and 101 evenly spaced points up to the
 horizon `H`. `VpcGrid::Times` takes your own times. `VpcGrid::AllSteps` adds every step of
@@ -981,10 +982,11 @@ unbounded, and a horizon replaces every record's window. So `vpc_tte()` simulate
 `VpcCensoring::Observed`, gives each subject a censoring time: a draw after it becomes a
 censoring there. A subject observed censored keeps its own time. A subject observed with an
 event was never seen censored, only known to be censored later than its event time, so it
-draws a censoring time from the reverse Kaplan–Meier curve of the observed censorings,
-conditional on exceeding its event time (`H` if no censoring is left past it). Every
-subject's replicate censoring time then has the observed censoring distribution, so the
-replicates are exchangeable with the data under independent censoring. Keeping `H` for event
+draws a censoring time from the reverse Kaplan–Meier curve of the observed censorings in
+its own stratum, conditional on exceeding its event time (`H` if no censoring is left past
+it). Every subject's replicate censoring time then has its stratum's censoring distribution,
+so the replicates are exchangeable with the data when censoring is independent of the event
+time within a stratum. Keeping `H` for event
 subjects, the common administrative-end shortcut, censors the replicates too little: with
 45 % censored the band covered the data in 85.5 % of datasets at 3H/4 for a nominal 90 %,
 against 91 % with the draw. A

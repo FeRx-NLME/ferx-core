@@ -15,10 +15,11 @@
 //! A subject observed with an event has no observed censoring time, only the fact
 //! that it exceeds its event time `tᵢ`, so it draws one from the censoring
 //! distribution `G` conditional on `c > tᵢ`, where `G` is the reverse Kaplan–Meier
-//! curve of the observed censorings (`H` when `G` has no mass past `tᵢ`). The
-//! replicate `cᵢ` is then marginally distributed as `G` for every subject, which is
-//! what makes the replicates exchangeable with the data under independent
-//! censoring. Keeping `H` for event subjects instead (#1886 plan D4) gives the
+//! curve of the observed censorings **in its own stratum** (`H` when `G` has no mass
+//! past `tᵢ`). The replicate `cᵢ` is then marginally distributed as its stratum's `G`,
+//! which is what makes the replicates exchangeable with the data when censoring is
+//! independent of the event time within a stratum. A `G` pooled across strata would
+//! give one arm's event subjects another arm's dropout (#2807 review r1). Keeping `H` for event subjects instead (#1886 plan D4) gives the
 //! replicates too little censoring and a band too narrow: measured coverage 0.855
 //! for a nominal 0.90 at 3H/4 with 45 % censored, against 0.91 with the draw.
 //! [`VpcCensoring::Horizon`] skips the step and censors every replicate at `H`.
@@ -159,13 +160,13 @@ fn post_censor(t: f64, observed: bool, c: f64) -> (f64, bool) {
     }
 }
 
-/// The censoring distribution `G` of the observed rows: their reverse Kaplan–Meier
-/// curve, a subject observed censored counting as a censoring "event" and every other
-/// subject as censored for it.
-fn censoring_curve(rows: &[ObsRow]) -> KmCurve {
-    let (t, c): (Vec<f64>, Vec<bool>) =
-        rows.iter().map(|r| (r.time, r.censor_at.is_some())).unzip();
-    kaplan_meier(&t, &c).expect("observed times were checked finite and non-negative")
+/// The censoring distribution `G` of `rows`: their reverse Kaplan–Meier curve, a subject
+/// observed censored counting as a censoring "event" and every other subject as censored
+/// for it. Built per stratum by the caller.
+fn censoring_curve<'a>(rows: impl Iterator<Item = &'a ObsRow>) -> KmCurve {
+    let (t, c): (Vec<f64>, Vec<bool>) = rows.map(|r| (r.time, r.censor_at.is_some())).unzip();
+    kaplan_meier(&t, &c)
+        .expect("`observed_rows` refuses a time that is not finite and non-negative")
 }
 
 /// A censoring time drawn from `g` conditional on `c > t`, by inversion with `u ∈ [0, 1)`:
@@ -307,6 +308,13 @@ fn observed_rows(
             all_censored &= matches!(event_type, EventType::RightCensored);
             if *rc != cmt {
                 continue;
+            }
+            if !(time.is_finite() && *time >= 0.0) {
+                return Err(refuse(format!(
+                    "vpc_tte: subject {} has time {time} on cmt {cmt}, which is not a finite, \
+                     non-negative number.",
+                    s.id
+                )));
             }
             if *entry_time > 0.0 {
                 return Err(refuse(format!(
@@ -477,9 +485,11 @@ pub fn vpc_tte(
         .enumerate()
         .map(|(i, r)| (r.id.as_str(), (i, r)))
         .collect();
-    let g = censoring_curve(&rows);
-    let seed = opts.sim.seed.unwrap_or_else(rand::random);
     let n_strata = values.len();
+    let g: Vec<KmCurve> = (0..n_strata)
+        .map(|k| censoring_curve(rows.iter().filter(|r| r.stratum == k)))
+        .collect();
+    let seed = opts.sim.seed.unwrap_or_else(rand::random);
     // reps[sim][stratum] = (times, events)
     let mut reps: Vec<Vec<(Vec<f64>, Vec<bool>)>> =
         vec![vec![(Vec::new(), Vec::new()); n_strata]; opts.n_sim];
@@ -503,7 +513,12 @@ pub fn vpc_tte(
         let (t, e) = match opts.censoring {
             VpcCensoring::Observed => {
                 let c = row.censor_at.unwrap_or_else(|| {
-                    draw_censoring(&g, row.time, censoring_uniform(seed, *sim, i), horizon)
+                    draw_censoring(
+                        &g[row.stratum],
+                        row.time,
+                        censoring_uniform(seed, *sim, i),
+                        horizon,
+                    )
                 });
                 post_censor(*time, *observed, c)
             }

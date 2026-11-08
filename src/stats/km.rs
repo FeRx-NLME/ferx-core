@@ -166,8 +166,9 @@ pub fn probs_valid(probs: [f64; 3]) -> bool {
 
 /// The fewest curves a band point needs before its outer quantiles are read:
 /// `⌈1 / min(p, 1 − p)⌉ − 1` over the three probabilities, 19 for 5 % / 95 %.
-/// With fewer, the outer quantile is the sample minimum or maximum under any
-/// rule, not an estimate of the tail. Assumes [`probs_valid`].
+/// With fewer than about `1 / p` curves a `p`-tail holds less than one curve, so
+/// the outer quantile is an interpolation between the two most extreme values
+/// rather than an estimate of the tail. Assumes [`probs_valid`].
 pub fn min_curves_for(probs: [f64; 3]) -> usize {
     // Increasing probabilities: the smallest tail is the first one's or the last one's.
     let tail = if probs[0] < 1.0 - probs[2] {

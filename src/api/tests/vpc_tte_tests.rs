@@ -149,7 +149,7 @@ fn draw_censoring_inverts_the_conditional_censoring_distribution() {
         stratum: 0,
     })
     .collect();
-    let g = censoring_curve(&rows);
+    let g = censoring_curve(rows.iter());
     assert_eq!(g.surv, [1.0, 0.75, 0.75, 0.375, 0.0]);
     assert_eq!(draw_censoring(&g, 1.0, 0.8, 9.0), 2.0);
     assert_eq!(draw_censoring(&g, 1.0, 0.5, 9.0), 4.0);
@@ -219,6 +219,71 @@ fn event_subjects_draw_censoring_from_the_observed_censorings() {
     assert_eq!(v.strata[0].n_used, [20, 0]);
 }
 
+/// Two arms with different dropout (review r1 row 1). ARM = 0: 15 censored at 2 and 15
+/// events at 1. ARM = 1: 15 censored at 8 and 15 events at 1. Horizon 10. Within ARM 0
+/// the censoring distribution puts all its mass at 2, so its event subjects draw `c = 2`
+/// and no ARM-0 replicate is followed past 2: at t = 5 none is defined. A censoring
+/// distribution pooled across the arms lets ARM-0 event subjects draw ARM 1's 8, and the
+/// ARM-0 count at 5 becomes 20 (a band under another arm's dropout).
+#[test]
+fn censoring_distribution_is_per_stratum() {
+    let subjects = (1..=60)
+        .map(|i| {
+            let arm = if i <= 30 { 0.0 } else { 1.0 };
+            let censored_at = if arm == 0.0 { 2.0 } else { 8.0 };
+            let r = if i % 2 == 0 {
+                rec(censored_at, EventType::RightCensored, 2)
+            } else {
+                rec(1.0, EventType::Exact, 2)
+            };
+            let mut s = subj(&i.to_string(), vec![r]);
+            s.covariates.insert("ARM".into(), arm);
+            s
+        })
+        .collect();
+    let mut o = opts(20);
+    o.sim.horizon = Some(10.0);
+    o.grid = VpcGrid::Times(vec![1.5, 5.0]);
+    o.stratify = VpcStratify::Covariate("ARM".into());
+    let v = run(EXP_TTE, &pop(subjects), &o).unwrap();
+    assert_eq!(v.strata[0].label, "ARM=0");
+    assert_eq!(
+        v.strata[0].n_used,
+        [20, 0],
+        "ARM 0 is never followed past 2"
+    );
+    assert_eq!(v.strata[1].n_used, [20, 20], "ARM 1 is followed to 8");
+}
+
+/// Competing risks under the default `Observed` censoring (review r1 row 2). Every subject
+/// had cause 2 at time 1, so its cause-3 record is right-censored at 1. That censoring is
+/// the competing event, not an observed dropout: the subject was never seen censored
+/// (no observed censoring at all, so the horizon applies), and the simulator draws the
+/// competing cause itself. So replicates are followed to 10 and at t = 5 curves are
+/// defined. Treating the cause-3 record as the subject's own censoring time censors every
+/// replicate at 1 a second time and makes the count at 5 zero.
+#[test]
+fn competing_event_is_not_an_observed_censoring() {
+    let subjects = (1..=30)
+        .map(|i| {
+            subj(
+                &i.to_string(),
+                vec![
+                    rec(1.0, EventType::Exact, 2),
+                    rec(1.0, EventType::RightCensored, 3),
+                ],
+            )
+        })
+        .collect();
+    let mut o = opts(20);
+    o.cmt = Some(3);
+    o.sim.horizon = Some(10.0);
+    o.grid = VpcGrid::Times(vec![0.5, 5.0]);
+    let v = run(COMPETING, &pop(subjects), &o).unwrap();
+    assert_eq!(v.censoring, VpcCensoring::Observed);
+    assert_eq!(v.strata[0].n_used, [20, 20]);
+}
+
 /// Subjects observed with an event at 1, and no censoring observed at all: the
 /// censoring distribution has no mass, so every replicate keeps the horizon. Using the
 /// event time as a censoring time would end every replicate at 1 and make the count at 5
@@ -271,19 +336,14 @@ fn horizon_defaults_to_latest_record_and_wins_when_below_it() {
     let mut o = opts(20);
     o.sim.horizon = Some(5.0);
     let v = run(EXP_TTE, &p, &o).unwrap();
-    let s = &v.strata[0];
-    assert_eq!(s.grid.last(), Some(&5.0));
-    // Past H every replicate has ended, unless it reached zero.
-    assert_eq!(
-        vpc_band(
-            &[kaplan_meier(&[5.0], &[false]).unwrap()],
-            &[6.0],
-            [0.25, 0.5, 0.75]
-        )
-        .unwrap()
-        .n_used,
-        [0]
-    );
+    assert_eq!(v.horizon, 5.0);
+    assert_eq!(v.strata[0].grid.last(), Some(&5.0));
+    // No replicate is followed past H = 5, although subject 26 is censored at 30 and
+    // every event subject's drawn censoring time is 30: at 6 no curve is defined, at 4
+    // all are. Simulating to the subject's own 30 instead makes the count at 6 twenty.
+    o.grid = VpcGrid::Times(vec![4.0, 6.0]);
+    let v = run(EXP_TTE, &p, &o).unwrap();
+    assert_eq!(v.strata[0].n_used, [20, 0]);
 }
 
 /// `AllSteps` puts every replicate step time on the grid, so it is at least as long as
@@ -555,6 +615,25 @@ fn refuses_several_records_duplicate_ids_and_no_records() {
         run(EXP_TTE, &pop(vec![subj("6", vec![])]), &opts(20)),
         "vpc_tte: no subject has a record on cmt 2.",
     );
+}
+
+/// A hand-built population can carry a time the data reader would have skipped (review r1
+/// row 5); it is refused, not panicked on.
+#[test]
+fn refuses_a_bad_observed_time() {
+    for (t, shown) in [(f64::NAN, "NaN"), (-1.0, "-1")] {
+        let p = pop(vec![
+            subj("1", vec![rec(2.0, EventType::Exact, 2)]),
+            subj("9", vec![rec(t, EventType::Exact, 2)]),
+        ]);
+        assert_refusal(
+            run(EXP_TTE, &p, &opts(20)),
+            &format!(
+                "vpc_tte: subject 9 has time {shown} on cmt 2, which is not a finite, \
+                 non-negative number."
+            ),
+        );
+    }
 }
 
 #[test]
