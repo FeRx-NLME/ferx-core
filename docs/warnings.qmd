@@ -431,7 +431,7 @@ covariance step that followed produced usable standard errors.
 
 | Code (`category`) | Severity | Flags | Typical agent response |
 |-------------------|----------|-------|------------------------|
-| `dw_autocorrelation` | Warning | IWRES autocorrelation (Durbin–Watson out of range). | Revisit the residual-error / structural model. |
+| `dw_autocorrelation` | Warning | IWRES autocorrelation (Durbin–Watson out of range). | Revisit the residual-error / structural model. The positive message's advice depends on the model: structural remedies for a model with compartments, a `correlation ar1(RHO) by …` line for a compartment-free one ([MBMA](model-file/mbma.qmd#within-arm-residual-correlation)). |
 | `eta_normality` | Warning | ETA departs from normality. | Consider a mixture or transform. |
 
 ### Censoring, resampling, and experimental features {#codes-methods}

@@ -936,6 +936,30 @@ fn classify_warning_dw_is_warning() {
     assert_eq!(w.category.as_str(), "dw_autocorrelation");
 }
 
+/// #2798: every positive-DW message, whatever the model class, lands in
+/// `dw_autocorrelation`. The compartment-free text reaches that arm only after
+/// ~60 earlier ones, so a wording that hits one of their keys (`degenerate`,
+/// `did not converge`, `covariance step`, …) would silently re-file it; ferx-r
+/// classifies through this same function. The full messages, not a prefix.
+#[test]
+fn classify_warning_dw_advice_messages_are_dw() {
+    use crate::api::{dw_autocorrelation_warning, DwAdvice};
+    for advice in [
+        DwAdvice::Compartmental,
+        DwAdvice::Algebraic { group: None },
+        DwAdvice::Algebraic {
+            group: Some("ARM".into()),
+        },
+    ] {
+        for dw in [1.2, 2.8] {
+            let msg = dw_autocorrelation_warning(dw, &advice).expect("outside the band");
+            let w = classify_warning(&msg);
+            assert_eq!(w.severity, WarningSeverity::Warning, "{msg}");
+            assert_eq!(w.category.as_str(), "dw_autocorrelation", "{msg}");
+        }
+    }
+}
+
 /// #2041: the reader's missing-covariate warning is `data_quality` on its token,
 /// whatever the covariate is called. `DURBIN` is the name a prose arm would claim
 /// (the Durbin-Watson arm) without the token arm ahead of it.

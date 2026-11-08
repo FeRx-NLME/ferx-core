@@ -170,6 +170,16 @@ kappa-carrying level is refused; with a kappa at the arm, use `ar1` or `car1`
 fits next to a profiled level block, and its refusals come first
 ([With a profiled level block](residual-correlation.qmd#with-a-profiled-level-block)).
 
+A positive Durbin–Watson warning ([`dw_autocorrelation`](../warnings.qmd#codes-residuals))
+on a compartment-free model suggests this line, `by` the grouping the model
+declares: its `iov_column` (which a single `level` also sets), or the innermost
+level's name when levels are nested. With no grouping declared, it asks you to
+declare one first. A model with compartments keeps the structural advice. The
+bundled `mbma_naproxen` model, whose arms are not declared, reads DW 1.08 and
+gets the no-grouping advice. Declaring the arms alone (`kappa K_E0` on `E0`, with
+`iov_column = ARM`) silences the warning, before any `correlation` line is
+added.
+
 With few studies, do not read the OFV drop for `ρ` against a χ² distribution.
 On the 6-study `mbma_placebo` data, which the generator draws with no serial
 correlation, `car1(RHO) by OCC` lowers the OFV by 7.6. In 50 data sets simulated
