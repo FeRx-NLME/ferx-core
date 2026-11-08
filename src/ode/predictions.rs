@@ -271,8 +271,11 @@ pub(crate) fn earliest_reset_at_break(reset_times: &[f64], t_start: f64, t_next:
 /// too; `f64::INFINITY` on the constant path, whose replay is the static engine, which stays
 /// band-only (see [`event_on_break`]). Driver and replay must apply each dose at the same
 /// break, or the verifier refuses the run.
-fn doses_next_break(break_times: &[f64], k: usize, tv: bool) -> f64 {
-    if tv {
+///
+/// `bounded` is the time-varying path, or any subject with a compartment on/off record
+/// (#2753), on which the static engine takes the real next break too.
+fn doses_next_break(break_times: &[f64], k: usize, bounded: bool) -> f64 {
+    if bounded {
         break_times.get(k + 1).copied().unwrap_or(f64::INFINITY)
     } else {
         f64::INFINITY
@@ -2916,6 +2919,71 @@ pub(crate) fn apply_cmt_toggle<T: Copy>(
     }
 }
 
+/// Apply every compartment on/off record of `subject` that falls on the break `t_start`
+/// ([`event_on_break`], with `t_next` the real next break) through [`apply_cmt_toggle`], in
+/// record order, and return the earliest such record's time (`+∞` when none), the
+/// toggles' share of [`band_read_state`]'s `first_event` (#2753).
+///
+/// The one spelling for the walks built on [`integrate_segment`] — the static dense
+/// engine the adaptive constant-path replay drives, the adaptive driver, and its
+/// time-varying replay — so the verifier and the run it checks cannot apply a record
+/// differently. A walk that calls this must keep each record time a break of its own
+/// (see [`cmt_toggle_times`]): one ULP from a co-timed dose is exactly where the
+/// reader puts an on/off row (`order_cmt_toggle_ties`), and merged into the dose's break it
+/// would lose its side of the dose.
+pub(crate) fn apply_cmt_toggles_at_break(
+    subject: &Subject,
+    t_start: f64,
+    t_next: f64,
+    u: &mut [f64],
+    off: &mut Vec<usize>,
+) -> f64 {
+    let mut first = f64::INFINITY;
+    for toggle in &subject.cmt_toggles {
+        let Some(&t) = subject.pk_only_times.get(toggle.pk_only) else {
+            continue;
+        };
+        if event_on_break(t, t_start, t_next) {
+            apply_cmt_toggle(toggle, u, off, 0.0);
+            first = first.min(t);
+        }
+    }
+    first
+}
+
+/// The record times of `subject`'s compartment on/off rows (#2753). A walk applying them
+/// adds each to its breaks and to the record set it hands [`dedup_breaks_keeping_records`],
+/// so each stays a break of its own and [`apply_cmt_toggles_at_break`] finds it there.
+/// Empty for a subject with no such record.
+fn cmt_toggle_times(subject: &Subject) -> impl Iterator<Item = f64> + '_ {
+    subject
+        .cmt_toggles
+        .iter()
+        .filter_map(|c| subject.pk_only_times.get(c.pk_only).copied())
+}
+
+/// The record set a constant-path walk on a toggled subject hands
+/// [`dedup_breaks_keeping_records`] (#2753): its decisions, its on/off rows and its dose
+/// arrivals. The arrivals are there because the reader puts an on/off row one ULP from a
+/// co-timed dose (`order_cmt_toggle_ties`); merged into one break the two would fire in the
+/// walk's fixed order rather than in time order, so a dose listed before an off row would
+/// survive it. Each kept apart, [`event_on_break`] with the real next break applies each at
+/// its own. The driver (base arrivals; its controller doses sit at decisions) and the static
+/// engine replaying it (base ∪ ledger arrivals) build the same set.
+fn adaptive_toggle_record_bits(
+    subject: &Subject,
+    decisions: &[f64],
+    dose_arrivals: impl Iterator<Item = f64>,
+) -> std::collections::HashSet<u64> {
+    decisions
+        .iter()
+        .copied()
+        .chain(cmt_toggle_times(subject))
+        .chain(dose_arrivals)
+        .map(f64::to_bits)
+        .collect()
+}
+
 /// One segment's forcing ([`forcing_adder`]): a value rather than a closure, so an
 /// integrator calling the model's native code directly adds it inline
 /// (`DirectStep`).
@@ -4141,6 +4209,13 @@ impl OdeReadout {
 /// this call — this function owns only the integration of the open interval,
 /// which is the piece a reactive (state-dependent) driver reuses unchanged
 /// (#391 S1.2). Behaviour is identical to the inline segment body it replaced.
+///
+/// The compartments in `off` are held at zero over the segment (#2732, #2753): the forcing's
+/// [`SegmentForcing::holding`], as the event-driven walk integrates a segment while a
+/// compartment is off. The walks on this function — the static dense engine (the adaptive
+/// constant-path replay), the adaptive driver and its time-varying replay — carry the off
+/// list and apply the records through [`apply_cmt_toggles_at_break`]; it is empty for a
+/// subject with no on/off record.
 #[allow(clippy::too_many_arguments)]
 fn integrate_segment(
     ode: &OdeSpec,
@@ -4172,6 +4247,8 @@ fn integrate_segment(
     // the advanced `u` are therefore bit-identical to a `chz_times = &[]` call.
     // Must be sorted ascending and lie in `(t_start, t_end]`; the caller filters.
     chz_times: &[f64],
+    // Compartments off for the whole segment, held at zero (#2732).
+    off: &[usize],
 ) -> Vec<Vec<f64>> {
     let opts = ode.effective_solver_opts();
 
@@ -4231,7 +4308,8 @@ fn integrate_segment(
         &prepared,
         InfusionInput::Spanning(active),
         &zero_order,
-    );
+    )
+    .holding(off);
     let wrapped_rhs = forced(ode, &force);
     let columns = forced_columns(ode, &force);
     let direct = direct_step(ode, &force);
@@ -4284,12 +4362,16 @@ pub fn ode_predictions(
     eta: &[f64],
     subject: &Subject,
 ) -> Vec<f64> {
+    // A compartment on/off record (#2732) stops a dose's input at the row: the engine
+    // honours the rows and reads that from `DoseEvent::off_at`, which the stored subject
+    // never carries, so the cutoffs are set here (borrowed, unchanged, without a row). Not
+    // in the engine, whose adaptive verifier passes its own cutoffs (#2753 review r1 #4).
     ode_predictions_with_extra_breaks_and_stats(
         ode,
         pk_params_flat,
         theta,
         eta,
-        subject,
+        &subject.with_cmt_cutoffs(),
         &[],
         None,
         &[],
@@ -4324,12 +4406,13 @@ pub(crate) fn ode_predictions_and_chz(
     subject: &Subject,
     chz_times: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
+    // Cutoffs as in [`ode_predictions`].
     ode_predictions_with_extra_breaks_and_stats(
         ode,
         pk_params_flat,
         theta,
         eta,
-        subject,
+        &subject.with_cmt_cutoffs(),
         &[],
         None,
         chz_times,
@@ -4352,12 +4435,13 @@ pub fn ode_predictions_with_solver_stats(
     subject: &Subject,
 ) -> (Vec<f64>, OdeSolverStats) {
     let mut stats = OdeSolverStats::default();
+    // Cutoffs as in [`ode_predictions`].
     let (predictions, _chz) = ode_predictions_with_extra_breaks_and_stats(
         ode,
         pk_params_flat,
         theta,
         eta,
-        subject,
+        &subject.with_cmt_cutoffs(),
         &[],
         Some(&mut stats),
         &[],
@@ -4577,6 +4661,11 @@ fn apply_prescheduled_boluses_at(
     t_next: f64,
     reset_floor: f64,
     applied: &mut [bool],
+    // Compartments off (#2732). A live arrival turns its own back on, whatever kind of dose
+    // it is, as the event-driven walk does: `nonmem_anchor/cmt_toggle.ctl` holds the amount
+    // at zero across a lag and restarts it at the arrival. Empty on every walk with no
+    // on/off record.
+    off: &mut Vec<usize>,
 ) -> f64 {
     debug_assert!(applied.len() >= doses.len());
     let mut first_event = f64::INFINITY;
@@ -4598,10 +4687,11 @@ fn apply_prescheduled_boluses_at(
         // the arrival event, so marking it here closes the whole arrival (#1186).
         applied[i] = true;
         first_event = first_event.min(dose.time + dose_lagtimes[i]);
-        if !is_real_infusion(dose)
-            && !input_rate_consumes_cmt(ode, dose.cmt_raw())
-            && gate.live(doses, i)
-        {
+        let live = gate.live(doses, i);
+        if live {
+            off.retain(|&c| c != dose.cmt_idx());
+        }
+        if !is_real_infusion(dose) && !input_rate_consumes_cmt(ode, dose.cmt_raw()) && live {
             // dose.cmt is 1-based; state indices are 0-based. A dose into a built-in
             // input-rate compartment (transit/etc.) is delivered as R_in over time by
             // the wrapped RHS — not as a bolus — so it's skipped to avoid double-count.
@@ -4644,6 +4734,8 @@ fn apply_prescheduled_doses_at(
     // Apply-once masks (#1186), owned by the walk and threaded through both halves.
     seed_applied: &mut [bool],
     applied: &mut [bool],
+    // See [`apply_prescheduled_boluses_at`].
+    off: &mut Vec<usize>,
 ) -> f64 {
     let reseeded = reseed_prescheduled_states_at(
         u,
@@ -4668,6 +4760,7 @@ fn apply_prescheduled_doses_at(
         t_next,
         reset_floor,
         applied,
+        off,
     );
     reseeded.min(arrived)
 }
@@ -4763,11 +4856,30 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // on the reset-aware adaptive frozen-replay constant path (#716), which drives
     // this engine with a reset-carrying static subject.
     break_times.extend(subject.reset_times.iter().copied());
+    // Compartment on/off records (#2753): only the adaptive constant-path replay brings a
+    // subject with one here (the dispatcher sends a toggled subject to the event-driven
+    // walk), and it must break where the driver it checks does. Empty otherwise.
+    break_times.extend(cmt_toggle_times(subject));
     // No-event break points (the reactive driver's decision times) — they only
     // re-segment the integration, never change state, and none before the origin (#2125).
     push_breaks_after_origin(&mut break_times, extra_breaks, origin);
     break_times.sort_by(|a, b| a.total_cmp(b));
-    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    let toggled = subject.has_cmt_toggles();
+    if toggled {
+        // Each on/off row, decision and dose arrival keeps its own break, on the same record
+        // set as the driver (`adaptive_toggle_record_bits`).
+        let arrivals = subject
+            .doses
+            .iter()
+            .zip(&dose_lagtimes)
+            .map(|(d, lag)| d.time + lag);
+        dedup_breaks_keeping_records(
+            &mut break_times,
+            &adaptive_toggle_record_bits(subject, extra_breaks, arrivals),
+        );
+    } else {
+        break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    }
 
     // A non-finite break time makes the whole subject non-finite (#1189) — see
     // [`timeline_has_non_finite`]. `predictions` and `chz_states` are already
@@ -4786,6 +4898,11 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // its `1e20` sentinel. One function with `ode_dense_solve_states`, which is the point: see
     // [`fill_prestart_states`] for why there is no second copy to keep in step.
     fill_prestart_states(chz_times, &mut chz_states, break_times.first().copied(), &u);
+
+    // Compartments currently off (#2753), empty and never touched for a subject with no
+    // on/off record. The caller sets the doses' `off_at`: the public wrappers from
+    // `with_cmt_cutoffs`, `verify_adaptive_frozen_replay` with each ledger dose's own.
+    let mut off_states: Vec<usize> = Vec::new();
 
     // Most-recent system-reset time; `NEG_INFINITY` until the first reset is
     // crossed. Threaded into `integrate_segment` so infusions / zero-order windows
@@ -4843,6 +4960,21 @@ fn ode_predictions_with_extra_breaks_and_stats(
         if first_event.is_finite() {
             u = ode.initial_state(pk_params_flat);
             reset_floor = t_start;
+            // A reset turns every compartment back on (#2732).
+            off_states.clear();
+        }
+        // Compartment on/off records at this break (#2753), after the reset and before the
+        // doses, as the adaptive driver this engine replays orders them. Each has a break of
+        // its own (the record-keeping dedup above), so a dose one ULP away is not here.
+        let next_break = break_times.get(k + 1).copied().unwrap_or(f64::INFINITY);
+        if toggled {
+            first_event = first_event.min(apply_cmt_toggles_at_break(
+                subject,
+                t_start,
+                next_break,
+                &mut u,
+                &mut off_states,
+            ));
         }
 
         // Apply every pre-scheduled dose landing at t_start — SS tail seed, SS
@@ -4861,12 +4993,16 @@ fn ode_predictions_with_extra_breaks_and_stats(
             t_start,
             // Band-only (first break): the static engine's dual / state / EKF twins match
             // that way, so moving it alone would split value from gradient. See
-            // [`event_on_break`] and #2534.
-            f64::INFINITY,
+            // [`event_on_break`] and #2534. A toggled subject has no such twin here (the
+            // dispatcher sends it to the event-driven walk), and its doses must fire at their
+            // own breaks around a co-timed on/off row, so it takes the real next break, as
+            // the driver does (`doses_next_break`).
+            if toggled { next_break } else { f64::INFINITY },
             reset_floor,
             &opts,
             &mut seed_applied,
             &mut applied,
+            &mut off_states,
         ));
 
         // Record observations read *at* t_start (after the reset/dose passes above) —
@@ -4967,6 +5103,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
                 stats.as_deref_mut(),
                 &mut auto_state,
                 &seg_chz,
+                &off_states,
             );
             // Place each soft sample at its global `chz_times` index (NaN slots left for
             // any time no segment covered).
@@ -5756,7 +5893,13 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // frozen `pk_params_flat`, while the
     // per-event-PK path (a time-varying covariate #930 and/or IOV #931) overwrites each base
     // dose's F per-occasion from `event_pk.dose[k]` in the block ~40 lines below.
-    let resolved_base = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    //
+    // A compartment on/off record (#2753) stops a base dose's input at the row, as on the
+    // static walks: `with_cmt_cutoffs` sets each base dose's `off_at` (borrowed, unchanged,
+    // for a subject with no such row). A controller dose gets its own at injection.
+    let toggled = subject.has_cmt_toggles();
+    let with_cutoffs = subject.with_cmt_cutoffs();
+    let resolved_base = resolve_subject_doses(&with_cutoffs, &ode.dose_attr_map, pk_params_flat);
     let (base_lagtimes, mut base_f_bio) = subject_dose_attrs(&resolved_base, ode, pk_params_flat);
     let n_base = resolved_base.doses.len();
 
@@ -5973,6 +6116,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // landing at the reset instant (Reset < Dose). Empty for a reset-free subject, so the
     // bolus-only path stays byte-identical.
     break_times.extend(subject.reset_times.iter().copied());
+    // Compartment on/off records (#2753): each a break, where `apply_cmt_toggles_at_break`
+    // applies it. Already there on the time-varying path (they are pk-only rows); empty for
+    // a subject with none.
+    break_times.extend(cmt_toggle_times(subject));
     // #702/#930: fold in the pre-scheduled base regimen's breaks via the shared builder so the
     // reactive segmentation matches the static engine's exactly (the frozen-replay oracle).
     // `shadow.doses` here is precisely the base regimen — controller doses are appended
@@ -6017,6 +6164,20 @@ pub(crate) fn ode_predictions_adaptive_impl(
             .map(f64::to_bits)
             .collect();
         dedup_breaks_keeping_records(&mut break_times, &record_bits);
+    } else if toggled {
+        // #2753: decisions, on/off rows and base arrivals keep their own breaks, on the record
+        // set the replaying static engine builds (`adaptive_toggle_record_bits`). On the
+        // time-varying path above they already do: an on/off row is a pk-only row, and a base
+        // dose there arrives at its record.
+        let arrivals = shadow
+            .doses
+            .iter()
+            .zip(&base_lagtimes)
+            .map(|(d, lag)| d.time + lag);
+        dedup_breaks_keeping_records(
+            &mut break_times,
+            &adaptive_toggle_record_bits(subject, decision_times, arrivals),
+        );
     } else {
         break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     }
@@ -6100,6 +6261,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // observations still use exact-bit lookups — they key `HashMap`s — hence the #700
     // survival guard above; resets need no such guard.)
     let mut reset_floor = f64::NEG_INFINITY;
+    // Compartments currently off (#2753); never touched for a subject with no on/off row.
+    let mut off_states: Vec<usize> = Vec::new();
 
     // Apply-once masks (#1186), parallel to the *growing* `shadow.doses`: base doses
     // occupy `0..n_base` and controller-injected doses append after, so both vectors are
@@ -6236,10 +6399,27 @@ pub(crate) fn ode_predictions_adaptive_impl(
             };
             u = ode.initial_state(seed_pk);
             reset_floor = t_start;
+            // A reset turns every compartment back on (#2732).
+            off_states.clear();
             first_event = first_event.min(earliest_reset_at_break(
                 &subject.reset_times,
                 t_start,
                 f64::INFINITY,
+            ));
+        }
+
+        // Compartment on/off records at this break (#2753): after a co-timed reset, as the
+        // static walks order them, and BEFORE the decision hook, so a monitor reads the
+        // state the row leaves (an off compartment reads 0) and a dose decided here is a
+        // record after the row (`CoTimedOff::After`). Each row has a break of its own, so a
+        // base dose one ULP away fires at its own break, on its own side of the row.
+        if toggled {
+            first_event = first_event.min(apply_cmt_toggles_at_break(
+                subject,
+                t_start,
+                break_times.get(k + 1).copied().unwrap_or(f64::INFINITY),
+                &mut u,
+                &mut off_states,
             ));
         }
 
@@ -6269,7 +6449,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &base_lagtimes,
                 pk_params_flat,
                 t_start,
-                doses_next_break(&break_times, k, tv),
+                doses_next_break(&break_times, k, tv || toggled),
                 reset_floor,
                 &ode.effective_solver_opts(),
                 &mut seed_applied[..n_base],
@@ -6567,9 +6747,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             // + `injected_f` here is what that pass then applies.
                             update_tafd_anchor(&mut ext_params, t_start);
                             started = true;
-                            shadow
-                                .doses
-                                .push(DoseEvent::new(t_start, amt, cmt, 0.0, false, 0.0));
+                            let mut dose = DoseEvent::new(t_start, amt, cmt, 0.0, false, 0.0);
+                            dose.off_at = shadow.controller_dose_off_at(t_start, dose.cmt_idx());
+                            shadow.doses.push(dose);
                             injected_f.push(f);
                             ledger.push(DoseLedgerEntry {
                                 subject: shadow.id.clone(),
@@ -6615,7 +6795,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             // end. `bioavailable_infusion` is the SAME mode-aware window (#419) the
                             // static engine and `active_infusions` use, so the adaptive timeline
                             // reproduces the static segmentation exactly (the degenerate oracle).
-                            let dose = DoseEvent::new(t_start, amt, cmt, rate, false, 0.0);
+                            let mut dose = DoseEvent::new(t_start, amt, cmt, rate, false, 0.0);
+                            // An off row on its compartment stops it, and it does not resume
+                            // at the on row (#2753, `DoseEvent::off_at`).
+                            dose.off_at = shadow.controller_dose_off_at(t_start, dose.cmt_idx());
                             let (_, dur_eff) = dose.bioavailable_infusion(f);
                             insert_break(&mut break_times, t_start + dur_eff);
                             update_tafd_anchor(&mut ext_params, t_start);
@@ -6733,9 +6916,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
             &dose_lagtimes,
             &injected_f,
             t_start,
-            doses_next_break(&break_times, k, tv),
+            doses_next_break(&break_times, k, tv || toggled),
             reset_floor,
             &mut applied,
+            &mut off_states,
         ));
 
         // Record the observations read *at* t_start (post-dose), mirroring
@@ -6935,6 +7119,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     None,
                     &mut auto_state,
                     &soft_times,
+                    &off_states,
                 );
                 if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
                     for (&t, &i) in auc_grid.iter().zip(&auc_at) {
@@ -7099,12 +7284,17 @@ pub(crate) fn verify_adaptive_frozen_replay(
     // the per-event-PK branch the base doses' F is recomputed from each dose's own snapshot
     // — the covariate active at, and the occasion κ of, its administration time (below) —
     // matching the driver.
-    let mut static_subject = base_subject.clone();
-    static_subject.doses.extend(
-        run.ledger
-            .iter()
-            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
-    );
+    //
+    // Each dose carries the `off_at` the driver gave it (#2753): a base dose its own from
+    // `with_cmt_cutoffs`, a ledger dose `controller_dose_off_at`. Recomputing a ledger dose's
+    // from `cmt_off_times` would read a decision at an on/off row's time as a dose the row
+    // stops, which is not what the driver ran.
+    let mut static_subject = base_subject.with_cmt_cutoffs().into_owned();
+    static_subject.doses.extend(run.ledger.iter().map(|e| {
+        let mut d = DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0);
+        d.off_at = base_subject.controller_dose_off_at(e.time, d.cmt_idx());
+        d
+    }));
 
     // On the time-varying path (#700) the static replay must resolve PK per event
     // exactly as the reactive driver did — a single frozen snapshot would diverge.
@@ -7389,6 +7579,10 @@ fn adaptive_frozen_replay_tv(
     // *derived* break can still land within `EVENT_MATCH_TOL` of a dose time here, and
     // this verifier must stay bit-aligned with the driver it checks.
     let mut applied = vec![false; subject.doses.len()];
+    // Compartments currently off (#2753); never touched for a subject with no on/off row.
+    // The caller set each dose's `off_at` (`verify_adaptive_frozen_replay`).
+    let toggled = subject.has_cmt_toggles();
+    let mut off_states: Vec<usize> = Vec::new();
 
     // Records read *at* the current break (#1226) — sorted once, hoisted, as in the driver.
     let obs_index = RecordIndex::new(&subject.obs_times);
@@ -7440,10 +7634,24 @@ fn adaptive_frozen_replay_tv(
             );
             u = ode.initial_state(&event_pk.reset[r].values);
             reset_floor = t_start;
+            off_states.clear();
             first_event = first_event.min(earliest_reset_at_break(
                 &subject.reset_times,
                 t_start,
                 f64::INFINITY,
+            ));
+        }
+
+        // Compartment on/off records (#2753), after the reset and before the doses, as the
+        // driver orders them; an on/off row is a pk-only row, so it has a break of its own.
+        let t_next = break_times.get(k + 1).copied().unwrap_or(f64::INFINITY);
+        if toggled {
+            first_event = first_event.min(apply_cmt_toggles_at_break(
+                subject,
+                t_start,
+                t_next,
+                &mut u,
+                &mut off_states,
             ));
         }
 
@@ -7458,12 +7666,20 @@ fn adaptive_frozen_replay_tv(
             if applied[i] {
                 continue;
             }
-            let t_next = break_times.get(k + 1).copied().unwrap_or(f64::INFINITY);
             if !event_on_break(d.time, t_start, t_next) {
                 continue;
             }
             applied[i] = true;
             first_event = first_event.min(d.time);
+            // The arrival turns its compartment back on (#2753), as in the driver's
+            // `apply_prescheduled_boluses_at`. Without its `ResetGate::live` test: every dose
+            // here is lag-free and fires at its own record, which no EVID=3/4 reset reached
+            // there can postdate, and no off row stops at its record (the reader keeps data
+            // rows off a dose's TIME; a controller dose takes `CoTimedOff::After`). Measured:
+            // the gate could not change the answer for any input that reaches it (review r1
+            // #3). If a lagged base dose is ever admitted on this path, the driver keeps its
+            // gate, and the verifier refuses the run rather than return a wrong value.
+            off_states.retain(|&c| c != d.cmt_idx());
             if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt_raw()) {
                 let cmt_idx = d.cmt_idx();
                 if cmt_idx < n {
@@ -7555,6 +7771,7 @@ fn adaptive_frozen_replay_tv(
                 None,
                 &mut auto_state,
                 &[],
+                &off_states,
             );
 
             // Advance the LOCF carry only at an actual record — the identical rule the

@@ -422,7 +422,7 @@ Limits:
 
 - There is no equivalent of `$MODEL` `INITIALOFF` or `NOOFF`. To start a compartment off, put an off row at the subject's first record. After a reset it is on again, where `INITIALOFF` would restore it to off, so repeat the row.
 - An `SS=1` dose while a compartment is off is refused (`E_CMT_TOGGLE_SS`). After a lagged dose into the compartment that holds until an `EVID=2` on row or a reset, even once the dose has arrived, because the check cannot read the lag.
-- A compartment fed by a built-in absorption input cannot be switched, and neither SDE nor endpoint models nor adaptive dosing support the rows (`E_CMT_TOGGLE_UNSUPPORTED`, and `E_ADAPTIVE_UNSUPPORTED` for adaptive dosing). An off row naming a compartment past the model's states is `E_CMT_TOGGLE_OUT_OF_RANGE`.
+- A compartment fed by a built-in absorption input cannot be switched, and neither SDE nor endpoint models support the rows (`E_CMT_TOGGLE_UNSUPPORTED`). An off row naming a compartment past the model's states is `E_CMT_TOGGLE_OUT_OF_RANGE`. Adaptive dosing honours them; see [Compartment on/off records](model-file/adaptive-dosing.qmd#compartment-onoff-records) for how a decision and a controller dose meet one.
 - `[derived]` outputs on the grid read `NaN` for such a subject. Per-observation compartment amounts are exact.
 - A lagged or modeled-rate dose into a switched compartment routes that subject to finite-difference gradients, reported in the usual warning.
 - A `[data_selection]` clause reading `CMT` sees compartment 1 on a negative cell, as on any other unreadable one, and `W_CMT_DEFAULTED` reports a row removed that way. An off row removed by such a clause is ignored.

@@ -555,6 +555,11 @@ mod adaptive_written_time_tests;
 #[path = "tests/adaptive_assay_magnitude_tests.rs"]
 mod adaptive_assay_magnitude_tests;
 
+// #2753: compartment on/off records on the adaptive path.
+#[cfg(test)]
+#[path = "tests/adaptive_cmt_toggle_tests.rs"]
+mod adaptive_cmt_toggle_tests;
+
 // #2156: FREM covariate rows on the adaptive path.
 #[cfg(test)]
 #[path = "tests/adaptive_frem_tests.rs"]
