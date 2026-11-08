@@ -4693,3 +4693,52 @@ fn time_after_dose_at_a_decision_before_every_record_is_zero() {
         "at the first dose: that dose's"
     );
 }
+
+/// #2799: the multi-start notes `fit()` appends to the returned run classify `(Info,
+/// MultiStart)` whatever sibling-start error text they interpolate. Each phrase below is one a
+/// Critical prose arm claims on its own (convergence, covariance failure, condition number), and
+/// the control row shows that phrase *without* the prefix still lands Critical, so the pair
+/// straddles the arm. Mutation: delete the `multi-start:` prefix arm → every prefixed row
+/// classifies Critical and this test names it.
+#[test]
+fn multi_start_notes_classify_info_whatever_error_text_they_carry() {
+    let embedded = [
+        "Outer optimizer did not converge after 3 iterations",
+        "Covariance step failed: Hessian is not positive definite",
+        "Covariance step: Hessian is not positive definite",
+        "condition number 3.2e9 exceeds 1e6",
+        "optimizer stopped without converging (Failure)",
+    ];
+    for phrase in embedded {
+        let bare = classify_warning(phrase);
+        assert_eq!(
+            bare.severity,
+            WarningSeverity::Critical,
+            "control: `{phrase}` must be Critical on its own, or this row tests nothing"
+        );
+        for msg in [
+            format!("Multi-start: 1 of 4 starts failed: start 2: {phrase}"),
+            format!("[FOCEI] Multi-start: 2 of 3 starts failed: x; {phrase}"),
+        ] {
+            let w = classify_warning(&msg);
+            assert_eq!(
+                (w.severity, w.category),
+                (WarningSeverity::Info, WarningCode::MultiStart),
+                "{msg}"
+            );
+        }
+    }
+    let best = classify_warning("Multi-start: best result from start 2/4 (OFV = 123.4560)");
+    assert_eq!(
+        (best.severity, best.category),
+        (WarningSeverity::Info, WarningCode::MultiStart)
+    );
+    // The no-run-converged note is a real verdict on the returned run and keeps its class.
+    let none = classify_warning(
+        "No multi-start run converged (4 starts); returning best OFV from start 2",
+    );
+    assert_eq!(
+        (none.severity, none.category),
+        (WarningSeverity::Critical, WarningCode::Convergence)
+    );
+}

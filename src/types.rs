@@ -7744,7 +7744,15 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     // rewrite instead of a one-line edit. Scoped to this statement rather than
     // the whole fn so a future duplicated arm in another chain still lints.
     #[allow(clippy::if_same_then_else)]
-    let (severity, category) = if lower.contains("w_vi_bad_basin") {
+    let (severity, category) = if lower.starts_with("multi-start:") {
+        // #2799: the multi-start notes `fit()` appends to the returned run — "k of n starts
+        // failed: <errors>" and "best result from start k/n". A prefix-token arm ahead of
+        // *every* other arm, because the failure note interpolates the sibling starts' own
+        // error text: a "did not converge" or covariance-failure phrase in it would land on a
+        // Critical arm and mark a healthy returned fit as failing. The note is about runs that
+        // were not returned, so it is informational.
+        (WarningSeverity::Info, WarningCode::MultiStart)
+    } else if lower.contains("w_vi_bad_basin") {
         // #1098: VI's final bound-quality check demotes `converged`; keep this
         // distinct from a budget-limited convergence failure so programmatic
         // consumers can choose new starts or a chained initializer.
