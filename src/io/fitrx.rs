@@ -245,6 +245,11 @@ struct FitWire {
     // #2112. Absent on every fit with no profiled level on its bound.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     profiled_levels_at_bound: Vec<usize>,
+    // #2797. Absent on every fit with no held coordinate, and on every bundle written
+    // before the field existed; such a bundle's `profiled_levels_at_bound` is synthesised
+    // into `ProfiledBound` entries on load (`held_at_bound_on_load`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    held_at_bound: Vec<crate::types::HeldAtBound>,
 
     sir: Option<SirWire>,
     iov: Option<IovWire>,
@@ -1716,6 +1721,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         bic_inputs: r.bic_inputs,
         profiled_blocks: r.profiled_blocks.clone(),
         profiled_levels_at_bound: r.profiled_levels_at_bound.clone(),
+        held_at_bound: r.held_at_bound.clone(),
         sir: if r.sir_ci_theta.is_some() || r.sir_ess.is_some() || r.sir_resamples_packed.is_some()
         {
             Some(SirWire {
@@ -3786,6 +3792,11 @@ fn wire_to_fit_result(
         imp
     });
 
+    let held_at_bound = held_at_bound_on_load(
+        std::mem::take(&mut w.held_at_bound),
+        &w.profiled_levels_at_bound,
+        &w.theta.names,
+    );
     let mut fit = FitResult {
         restored_from_checkpoint: true,
         covariate_relations: Vec::new(),
@@ -3906,6 +3917,7 @@ fn wire_to_fit_result(
         bic_inputs: w.bic_inputs,
         profiled_blocks: w.profiled_blocks,
         profiled_levels_at_bound: w.profiled_levels_at_bound,
+        held_at_bound,
         eta_log_transformed: w.omega.log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -3991,6 +4003,30 @@ fn parse_csv_row(line: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// A bundle's `held_at_bound` (#2797): its own, or — for a bundle written before the field
+/// existed, which carries only `profiled_levels_at_bound` — those levels as
+/// [`crate::types::HeldReason::ProfiledBound`] entries, so a reader has one rule for old
+/// and new bundles. A θ's packed index is its θ index.
+fn held_at_bound_on_load(
+    held: Vec<crate::types::HeldAtBound>,
+    profiled_levels_at_bound: &[usize],
+    theta_names: &[String],
+) -> Vec<crate::types::HeldAtBound> {
+    if !held.is_empty() {
+        return held;
+    }
+    profiled_levels_at_bound
+        .iter()
+        .map(|&k| crate::types::HeldAtBound {
+            name: theta_names.get(k).cloned().unwrap_or_default(),
+            kind: crate::types::ParameterKind::Theta,
+            index: k,
+            packed_index: k,
+            reason: crate::types::HeldReason::ProfiledBound,
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -4860,6 +4896,71 @@ mod tests {
         let loaded = load_fit(&path).unwrap().fit;
         assert!(loaded.profiled_blocks.is_empty());
         assert!(loaded.profiled_levels_at_bound.is_empty());
+    }
+
+    /// #2797 (D8): `held_at_bound` round-trips, as `snake_case` reasons, is omitted when
+    /// empty, and a bundle written before the field existed — `profiled_levels_at_bound`
+    /// only — loads with those levels as `ProfiledBound` entries, so a reader has one rule
+    /// for old and new bundles.
+    #[test]
+    fn held_at_bound_round_trips_and_an_old_bundle_synthesises_its_profiled_levels() {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+
+        let mut r = minimal_fit_result();
+        r.held_at_bound = vec![HeldAtBound {
+            name: "ETA_KA".into(),
+            kind: ParameterKind::Omega,
+            index: 0,
+            packed_index: r.theta.len(),
+            reason: HeldReason::CollapsedAtGuard,
+        }];
+        let path = dir.path().join("held.fitrx");
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        assert_eq!(
+            fit_json(&path)["held_at_bound"][0]["reason"],
+            "collapsed_at_guard"
+        );
+        assert_eq!(load_fit(&path).unwrap().fit.held_at_bound, r.held_at_bound);
+
+        // Omitted when empty.
+        let wire = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        assert!(wire.get("held_at_bound").is_none(), "{wire}");
+
+        // An old bundle: only `profiled_levels_at_bound = [0, 2]`.
+        let mut old = minimal_fit_result();
+        old.theta_names = (0..old.theta.len()).map(|i| format!("L{i}")).collect();
+        old.profiled_levels_at_bound = vec![0, 2];
+        let path = dir.path().join("old.fitrx");
+        save_fit(&old, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        assert!(fit_json(&path).get("held_at_bound").is_none());
+        let loaded = load_fit(&path).unwrap().fit;
+        let got: Vec<(String, ParameterKind, usize, usize, HeldReason)> = loaded
+            .held_at_bound
+            .iter()
+            .map(|h| (h.name.clone(), h.kind, h.index, h.packed_index, h.reason))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "L0".to_string(),
+                    ParameterKind::Theta,
+                    0,
+                    0,
+                    HeldReason::ProfiledBound
+                ),
+                (
+                    "L2".to_string(),
+                    ParameterKind::Theta,
+                    2,
+                    2,
+                    HeldReason::ProfiledBound
+                ),
+            ]
+        );
+        assert_eq!(loaded.profiled_levels_at_bound, [0, 2]);
     }
 
     /// `final_gradient_source` has to survive the checkpoint alongside the vector

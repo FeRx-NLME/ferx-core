@@ -2723,6 +2723,11 @@ pub ferx_core::types::HazardSpec::OdeAccumulated
 pub ferx_core::types::HazardSpec::OdeAccumulated::chz_state: usize
 impl core::fmt::Debug for ferx_core::HazardSpec
 pub fn ferx_core::HazardSpec::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum ferx_core::types::HeldReason
+pub ferx_core::types::HeldReason::CollapsedAtGuard
+pub ferx_core::types::HeldReason::ProfiledBound
+impl ferx_core::HeldReason
+pub fn ferx_core::HeldReason::as_str(self) -> &'static str
 pub enum ferx_core::types::HessianAnchor
 pub ferx_core::types::HessianAnchor::Exact
 pub ferx_core::types::HessianAnchor::GaussNewton
@@ -3441,6 +3446,7 @@ pub ferx_core::types::FitResult::final_gradient: core::option::Option<alloc::vec
 pub ferx_core::types::FitResult::final_gradient_source: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::gradient_method_inner: alloc::string::String
 pub ferx_core::types::FitResult::gradient_method_outer: alloc::string::String
+pub ferx_core::types::FitResult::held_at_bound: alloc::vec::Vec<ferx_core::HeldAtBound>
 pub ferx_core::types::FitResult::imp_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::impmap_trace: core::option::Option<ferx_core::ImpmapTrace>
 pub ferx_core::types::FitResult::importance_sampling: core::option::Option<ferx_core::ImportanceSamplingResult>
@@ -3557,6 +3563,12 @@ pub fn ferx_core::FitResult::to_json_value(&self) -> serde_json::value::Value
 pub struct ferx_core::types::FremConfig
 pub ferx_core::types::FremConfig::covariate_sigma_index: usize
 pub ferx_core::types::FremConfig::fremtype_to_indices: std::collections::hash::map::HashMap<u16, (usize, usize)>
+pub struct ferx_core::types::HeldAtBound
+pub ferx_core::types::HeldAtBound::index: usize
+pub ferx_core::types::HeldAtBound::kind: ferx_core::ParameterKind
+pub ferx_core::types::HeldAtBound::name: alloc::string::String
+pub ferx_core::types::HeldAtBound::packed_index: usize
+pub ferx_core::types::HeldAtBound::reason: ferx_core::HeldReason
 pub struct ferx_core::types::ImpmapTrace
 pub ferx_core::types::ImpmapTrace::omega_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::ImpmapTrace::rows: alloc::vec::Vec<ferx_core::ImpmapTraceRow>
@@ -4157,6 +4169,11 @@ pub ferx_core::HazardSpec::OdeAccumulated
 pub ferx_core::HazardSpec::OdeAccumulated::chz_state: usize
 impl core::fmt::Debug for ferx_core::HazardSpec
 pub fn ferx_core::HazardSpec::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum ferx_core::HeldReason
+pub ferx_core::HeldReason::CollapsedAtGuard
+pub ferx_core::HeldReason::ProfiledBound
+impl ferx_core::HeldReason
+pub fn ferx_core::HeldReason::as_str(self) -> &'static str
 pub enum ferx_core::HessianAnchor
 pub ferx_core::HessianAnchor::Exact
 pub ferx_core::HessianAnchor::GaussNewton
@@ -5068,6 +5085,7 @@ pub ferx_core::FitResult::final_gradient: core::option::Option<alloc::vec::Vec<f
 pub ferx_core::FitResult::final_gradient_source: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::gradient_method_inner: alloc::string::String
 pub ferx_core::FitResult::gradient_method_outer: alloc::string::String
+pub ferx_core::FitResult::held_at_bound: alloc::vec::Vec<ferx_core::HeldAtBound>
 pub ferx_core::FitResult::imp_seed: core::option::Option<u64>
 pub ferx_core::FitResult::impmap_trace: core::option::Option<ferx_core::ImpmapTrace>
 pub ferx_core::FitResult::importance_sampling: core::option::Option<ferx_core::ImportanceSamplingResult>
@@ -5202,6 +5220,12 @@ pub ferx_core::FremPrepareResult::fremtype_map: alloc::vec::Vec<(alloc::string::
 pub ferx_core::FremPrepareResult::model_path: std::path::PathBuf
 pub ferx_core::FremPrepareResult::n_total_etas: usize
 pub ferx_core::FremPrepareResult::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::HeldAtBound
+pub ferx_core::HeldAtBound::index: usize
+pub ferx_core::HeldAtBound::kind: ferx_core::ParameterKind
+pub ferx_core::HeldAtBound::name: alloc::string::String
+pub ferx_core::HeldAtBound::packed_index: usize
+pub ferx_core::HeldAtBound::reason: ferx_core::HeldReason
 pub struct ferx_core::ImpmapTrace
 pub ferx_core::ImpmapTrace::omega_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::ImpmapTrace::rows: alloc::vec::Vec<ferx_core::ImpmapTraceRow>

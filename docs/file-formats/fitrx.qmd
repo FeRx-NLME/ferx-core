@@ -325,6 +325,14 @@ told from a degenerate one without reading it off a zero diagonal. It is absent 
 there is no matrix or no mask for it, and otherwise has the matrix's dimension; any
 other length is refused on save and on load.
 
+`held_at_bound` (#2797) lists the parameters whose standard error is not available,
+in packed order, each as `{name, kind, index, packed_index, reason}`, with `reason`
+`profiled_bound` or `collapsed_at_guard`
+([held parameters](../estimation/parameterization.qmd#held-parameters)). It is absent
+when the list is empty. A bundle written before the field existed carries only
+`profiled_levels_at_bound`; on load those levels become `profiled_bound` entries, so
+old and new bundles read the same way.
+
 #### Engine results
 
 `bayes`, `importance_sampling`, `impmap_trace` and `exclusions` hold the

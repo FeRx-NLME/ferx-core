@@ -3091,7 +3091,11 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
-    if let Some((msg, entry)) = runaway_guard_warning(&mut converged, &result.params) {
+    if let Some((msg, entry)) = runaway_guard_warning_for(
+        &mut converged,
+        &result.params,
+        result.covariance_matrix.as_ref(),
+    ) {
         warnings.push(msg);
         native_warnings.push(entry);
     }
@@ -3433,6 +3437,7 @@ fn fit_inner(
         bic_inputs,
         profiled_blocks: model.indiv_param_partials.theta_blocks.profiled_names(),
         profiled_levels_at_bound,
+        held_at_bound: Vec::new(),
         eta_log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -3573,6 +3578,11 @@ fn fit_inner(
         fit_result.se_theta.as_ref(),
         &fit_result.theta_fixed,
     );
+    // #2797: every coordinate whose SE is not available because it sits on a bound, from
+    // the reported estimate — after any floor-escape restart, which wraps the whole
+    // estimator run, its covariance step included, so the list and the matrix describe one
+    // point. Before `cov_fixed`, which marks the collapses the step held.
+    crate::api::apply_held_at_bound(&result.params, &mut fit_result);
     // The final parameters, not `init_params`: an estimator can hold more than it was
     // given, as SAEM does a mixture's σ overrides, and the step ran on these.
     fit_result.cov_fixed =

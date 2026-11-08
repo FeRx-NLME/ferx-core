@@ -563,6 +563,55 @@ pub(crate) fn embed_free(m: &DMatrix<f64>, free_idx: &[usize], n: usize) -> DMat
     full
 }
 
+/// The positions in `free_idx` of the coordinates the covariance step holds at the internal
+/// guard (#2797): the free coordinates the post-fit guard warning calls a collapse, read off
+/// `x_hat` — the point the matrix is taken at — through
+/// [`crate::api::held_guard_coordinates`]. Never off `template`: the estimators hand the
+/// **start** as the template (`outer_optimizer.rs`), whose coordinates are not on the rail.
+pub(crate) fn held_free_positions(
+    x_hat: &[f64],
+    template: &ModelParameters,
+    free_idx: &[usize],
+) -> Vec<usize> {
+    let held = crate::api::held_guard_coordinates(&unpack_params(x_hat, template));
+    free_idx
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| held.contains(i))
+        .map(|(a, _)| a)
+        .collect()
+}
+
+/// The covariance **conditional on the held rows** (#2797): the inverse of `m_free`'s
+/// sub-block over the coordinates not in `held` (positions into the free block), embedded
+/// back into the free block with zero rows and columns at `held` — exactly the matrix the
+/// step returns when those coordinates are FIX.
+///
+/// `invert(sub, keep)` inverts the sub-block (`keep`: the kept positions, in order) the way
+/// the caller inverted the whole block, and returns `None` when that inverse is not clean.
+/// `None` — the caller keeps its unconditional matrix — when nothing is held, every
+/// coordinate is held, or `invert` declined. The caller decides *whether* to condition: only
+/// on a clean verdict for the whole block (no eigenvalue clipped, no `S` fallback), so a
+/// collapsed coordinate that is itself a negative-curvature direction at a poor point keeps
+/// its floor warning and its matrix (#2797 audit, probe G).
+pub(crate) fn condition_on_held(
+    m_free: &DMatrix<f64>,
+    held: &[usize],
+    invert: impl FnOnce(&DMatrix<f64>, &[usize]) -> Option<DMatrix<f64>>,
+) -> Option<DMatrix<f64>> {
+    let nf = m_free.nrows();
+    if held.is_empty() {
+        return None;
+    }
+    let keep: Vec<usize> = (0..nf).filter(|a| !held.contains(a)).collect();
+    if keep.is_empty() {
+        return None;
+    }
+    let sub = DMatrix::from_fn(keep.len(), keep.len(), |a, b| m_free[(keep[a], keep[b])]);
+    let inv = invert(&sub, &keep)?;
+    Some(embed_free(&inv, &keep, nf))
+}
+
 /// [`combine_covariance`] applied to the returned inverse **and** to the eigen-floor's
 /// unclipped reference, so both go through the same estimator (#1508 review §1).
 ///
@@ -2409,6 +2458,14 @@ fn covariance_step(
         let Some(cov_free) = invert_cross_product(&s_free, &unit_coords) else {
             return Some(CovarianceStepResult::Unusable(S_SINGULAR_MSG.to_string()));
         };
+        // #2797: `S⁻¹` conditional on the coordinates collapsed on the guard, once `S` itself
+        // inverted cleanly — the verdict this estimator has instead of `R`'s.
+        let held = held_free_positions(x_hat, template, &free_idx);
+        let cov_free = condition_on_held(&s_free, &held, |sub, keep| {
+            let units: Vec<CoordUnits> = keep.iter().map(|&a| unit_coords[a]).collect();
+            invert_cross_product(sub, &units)
+        })
+        .unwrap_or(cov_free);
         if options.verbose {
             eprintln!("  Covariance step successful");
         }
@@ -2785,6 +2842,23 @@ fn covariance_step(
     // inverse observed Fisher information R = Hessian of −logL = ½·H_ofv, so
     // R⁻¹ = 2·H_ofv⁻¹. Without this factor every SE is 1/√2 too small.
     let r_inv = inv.inverse.clone() * 2.0;
+    // #2797: on a clean `R` (nothing clipped, so no #1781 fallback either), a coordinate
+    // collapsed on the internal guard is held — the covariance becomes conditional on it at
+    // its estimate, as for a FIX coordinate. After the verdict, never before: every
+    // diagnostic below (the floor, the fallback, the stationarity test on the full `R⁻¹`)
+    // reads the unconditional `R`, so holding cannot turn a floor into a clean matrix.
+    let r_inv = if inv.n_clipped == 0 {
+        let held = held_free_positions(x_hat, template, &free_idx);
+        condition_on_held(&hess_free_sym, &held, |sub, keep| {
+            let units: Vec<CoordUnits> = keep.iter().map(|&a| unit_coords[a]).collect();
+            invert_psd_with_floor_unit_free(sub, &units)
+                .filter(|i| i.n_clipped == 0)
+                .map(|i| i.inverse * 2.0)
+        })
+        .unwrap_or(r_inv)
+    } else {
+        r_inv
+    };
     // #1781: an `R` the floor had to clip, at an estimate its objective never optimised
     // (SAEM / IMP / IMPMAP / VI), is not inverted at all — the estimator becomes `S⁻¹`. The
     // floored direction is the objective's slope at a non-stationary point, not a precision,
