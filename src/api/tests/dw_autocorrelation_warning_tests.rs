@@ -104,7 +104,11 @@ fn non_finite_dw_never_warns() {
 /// | `omega ETA_CL ~ 0.09` (ODE arm) | 0.2394 | 0.2439 | 0.068 |
 /// | the same, `[diffusion]` arm | 0.2468 | 0.2468 | 0.069 |
 ///
-/// Worst case 0.25 against a bound of 1.5, so the `omega` is free. Keeping it
+/// Those are the classic `÷ Σ e²` values. Under the pair-normalised statistic
+/// (#2798) the two arms the test runs read 0.2660 (ODE) and 0.2776 (`[diffusion]`)
+/// at `outer_maxiter: 1` (native macOS arm64; the `[DW]` line the helper prints).
+///
+/// Worst case 0.28 against a bound of 1.5, so the `omega` is free. Keeping it
 /// matters for what the test can *see*: with `n_eta = 0` the fixture cannot
 /// observe a suffix gated on `model.n_eta > 0`, and it sits off the analytic
 /// inner-gradient path (see #1432).
@@ -316,6 +320,7 @@ fn assert_fit_pushes_only_the_helpers_message_on(
     };
 
     let result = fit(model, pop, &model.default_params, &opts).expect("fit should succeed");
+    eprintln!("[{label}] DW {:.4}", result.dw_statistic);
 
     assert!(
         result.dw_statistic.is_finite() && result.dw_statistic < 1.5,
@@ -609,6 +614,94 @@ fn decorrelated_warning_band_and_category() {
             "{msg}"
         );
     }
+}
+
+/// B8 (#2798 PR B): the decorrelated `cs` advice, end to end. Before #2798 the NONMEM
+/// anchor's `cs` fit (`durbin_watson_is_taken_on_decorrelated_residuals`) was the only
+/// fit that reached it; the grouped, pair-normalised statistic moved that fixture to
+/// 1.63, silent, so this synthetic one takes its place.
+///
+/// A straight line fitted to a parabola inside each arm, `correlation cs(RHO) by
+/// ARM`: compound symmetry correlates the rows of an arm equally, which absorbs the
+/// arm's shared offset but not the smooth U of the misfit along its visits — serial
+/// dependence that decays with the lag, which is what the `cs` advice points at
+/// `ar1` for. The statistic is the whitened one, split by arm: 0.678 at
+/// `outer_maxiter: 1` (native macOS arm64), far below 1.5.
+///
+/// Mutations that must redden this: dropping the decorrelated arm at the call site
+/// (the plain advice, or nothing, pushed instead); the `Cs` advice text deleted.
+#[test]
+fn fit_pushes_the_decorrelated_cs_advice() {
+    let parsed = crate::parser::model_parser::parse_full_model(
+        "[parameters]\n  theta TVA(10.0, 0.1, 500.0)\n  theta TVB(0.5, -50.0, 50.0)\n  \
+         theta RHO(0.3, -0.1, 0.99)\n  omega ETA_A ~ 0.09\n  sigma ADD ~ 1.0\n\
+         [individual_parameters]\n  A = TVA * exp(ETA_A)\n  B = TVB\n[structural_model]\n  \
+         y = A + B * TIME\n[error_model]\n  DV ~ additive(ADD)\n  \
+         correlation cs(RHO) by ARM\n[fit_options]\n  method = focei\n",
+    )
+    .expect("parse");
+    let model = parsed.model;
+    let serial = model.residual_serial.as_ref().expect("the line parses");
+    assert_eq!(serial.kind, crate::types::ResidualSerialKind::Cs);
+    // Two arms per subject, eight visits each, a parabola around a per-arm offset.
+    let arm_subject = |id: &str, offsets: [f64; 2]| {
+        let mut s = parabola_subject(id, 0.0);
+        let times: Vec<f64> = (0..8).map(|i| 2.0 * f64::from(i)).collect();
+        s.obs_times = times.iter().chain(&times).copied().collect();
+        s.observations = offsets
+            .iter()
+            .flat_map(|&o| {
+                times
+                    .iter()
+                    .map(move |t| o + 0.5 * t + 0.2 * (t - 7.0) * (t - 7.0))
+            })
+            .collect();
+        let n = s.obs_times.len();
+        s.obs_cmts = vec![1; n];
+        s.cens = vec![0; n];
+        s.obs_covariates = (0..n)
+            .map(|j| HashMap::from([("ARM".to_string(), if j < 8 { 1.0 } else { 2.0 })]))
+            .collect();
+        s.covariates.insert("ARM".into(), 1.0);
+        s
+    };
+    let mut pop = population(vec![
+        arm_subject("1", [10.0, 13.0]),
+        arm_subject("2", [14.0, 12.0]),
+        arm_subject("3", [7.0, 9.0]),
+    ]);
+    pop.covariate_names = vec!["ARM".into()];
+    let opts = FitOptions {
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        ..parsed.fit_options
+    };
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+    eprintln!("B8 decorrelated cs DW {:.4}", result.dw_statistic);
+    assert!(
+        result.dw_statistic.is_finite() && result.dw_statistic < 1.5,
+        "the fixture must land on the positive branch; DW = {}",
+        result.dw_statistic
+    );
+    let expected = dw_autocorrelation_warning_decorrelated(
+        result.dw_statistic,
+        "correlation cs(RHO) by ARM",
+        crate::types::ResidualSerialKind::Cs,
+    )
+    .expect("a DW below 1.5 warns");
+    let dw_entries: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| {
+            crate::types::classify_warning(w).category
+                == crate::types::WarningCode::DwAutocorrelation
+        })
+        .collect();
+    assert_eq!(dw_entries, vec![&expected], "{:#?}", result.warnings);
+    assert!(
+        expected.contains("`ar1` models that") && !expected.contains("transit"),
+        "{expected}"
+    );
 }
 
 // ── #2798: the positive advice names only remedies the model can take ─────────────

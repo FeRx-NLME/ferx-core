@@ -413,48 +413,61 @@ fn fd_stencil_se_of_rho_runs_low_by_its_truncation_error() {
 
 /// #1081 follow-up: under a `correlation` line the Durbin–Watson statistic is taken
 /// on the residuals decorrelated by the fitted `R`, and on this dataset that is a
-/// live diagnostic, not a constant. At NONMEM's optima (macOS arm64 and Linux
-/// alike):
+/// live diagnostic, not a constant. Since #2798 it is pair-normalised and taken
+/// within each arm (the `by ARM` blocks), which moved both values up:
 ///
-/// | | raw IWRES DW | decorrelated DW |
-/// |---|---|---|
-/// | `cs` | 0.987 | 1.427 |
-/// | `ar1` | 0.938 | 1.691 |
+/// | | raw IWRES DW (public, whole subject) | decorrelated DW, #2798 | before #2798 |
+/// |---|---|---|---|
+/// | `cs` | 1.114 | 1.634244701 | 1.4267 (warned) |
+/// | `ar1` | 1.062 | 1.956695864 | 1.6909 |
 ///
-/// Raw IWRES would warn on both — they are correlated by construction. Decorrelated,
-/// `cs` still warns (a serial decay compound symmetry cannot carry), and with the
-/// `ar1` advice; `ar1` does not. The `ar1` fit is the 6-OFV-better one.
+/// The new values were predicted before the change by whitening in Python at
+/// NONMEM's optima (plan on #2798, §0.4), a computation outside ferx that first
+/// reproduced the old 1.4267 / 1.6909; it predicted 1.6342 / 1.9567, which ferx
+/// matches to the 4 decimals it printed. The constants are ferx's Linux aarch64
+/// digits (`tools/linux-test.sh`); native macOS arm64 prints the same nine decimals
+/// for both kinds, so the realised `|ferx − want|` is < 5e-10 (the print) on both.
+/// Bound 1e-6, above the print and the FOCE inner tolerance's reach into the
+/// whitened residuals, and 2e5× below the 0.21 the change moved `cs` by.
+///
+/// Raw IWRES would still warn on both — they are correlated by construction.
+/// Decorrelated, neither warns any more: `cs` sits at 1.63, above the 1.5 threshold
+/// that the calibrated statistic is a ~1% test at (#2798 plan §4), so this fixture
+/// no longer reaches the `cs` advice — `fit_pushes_the_decorrelated_cs_advice` in
+/// `src/api/tests/dw_autocorrelation_warning_tests.rs` keeps that end to end. What
+/// survives here without depending on the threshold is the ordering: `cs` leaves
+/// more serial dependence than `ar1` explains (1.63 < 1.96), and the `ar1` fit is the
+/// 6-OFV-better one.
 #[test]
 fn durbin_watson_is_taken_on_decorrelated_residuals() {
     let mut seen = Vec::new();
-    for (kind, est, want_dw) in [("cs", &CS_EST, 1.4267), ("ar1", &AR1_EST, 1.6909)] {
+    for (kind, est, want_dw) in [
+        ("cs", &CS_EST, 1.634_244_701),
+        ("ar1", &AR1_EST, 1.956_695_864),
+    ] {
         let r = run(&at_optimum(kind, est), Some(0), false);
         let raw = ferx_core::stats::residual_error::iwres_autocorrelation(&r.subjects);
         assert!(r.dw_statistic.is_finite() && raw.1.is_finite());
         eprintln!(
-            "{kind}: decorrelated DW {:.4}, raw IWRES DW {:.4}",
-            r.dw_statistic, raw.1
+            "{kind}: decorrelated DW {:.9} (|Δ| {:.3e}), raw IWRES DW {:.6}",
+            r.dw_statistic,
+            (r.dw_statistic - want_dw).abs(),
+            raw.1
         );
         assert!(
-            (r.dw_statistic - want_dw).abs() < 1e-3,
+            (r.dw_statistic - want_dw).abs() < 1e-6,
             "{kind}: DW {}",
             r.dw_statistic
         );
-        assert!(raw.1 < 1.5, "{kind}: raw IWRES would warn (the straddle)");
+        assert!(raw.1 < 1.5, "{kind}: raw IWRES would warn");
         let dw: Vec<&String> = r.warnings.iter().filter(|w| w.contains("Durbin")).collect();
-        seen.push((kind, dw.len()));
-        if kind == "cs" {
-            assert_eq!(dw.len(), 1, "{dw:?}");
-            assert!(dw[0].starts_with(
-                "Positive autocorrelation remains in the residuals decorrelated by \
-                 `correlation cs(RHO) by ARM` (Durbin-Watson = 1.43)"
-            ));
-            assert!(dw[0].contains("`ar1` models that"), "{}", dw[0]);
-        } else {
-            assert!(dw.is_empty(), "{dw:?}");
-        }
+        assert!(dw.is_empty(), "{kind}: {dw:?}");
+        seen.push(r.dw_statistic);
     }
-    assert_eq!(seen, vec![("cs", 1), ("ar1", 0)]);
+    assert!(
+        seen[0] < seen[1],
+        "cs leaves more serial dependence than ar1: {seen:?}"
+    );
 }
 
 /// Plan T13, SIR leg (#1081 review r1 #8): a short SIR at NONMEM's `cs` optimum
