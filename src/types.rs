@@ -9119,9 +9119,17 @@ pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize
 /// [`omega_se_at`] over a borrowed SE slice, for a caller holding the packed
 /// vector without its `Option<Vec<_>>` (`OmegaRowsInput`, #1859).
 pub(crate) fn omega_se_at_in(se: &[f64], n_eta: usize, i: usize, j: usize) -> Option<f64> {
+    se.get(omega_se_slot(se.len(), n_eta, i, j)?).copied()
+}
+
+/// The position of Ω element `(i, j)` in an `se_omega` vector of length `len`, or `None`
+/// when that layout has no slot for it. The one reading of the layout, shared by the
+/// lookup ([`omega_se_at_in`]) and the writer that zeroes a held variance's SE
+/// (`apply_held_at_bound`, #2797), so the two cannot disagree on a block Ω.
+pub(crate) fn omega_se_slot(len: usize, n_eta: usize, i: usize, j: usize) -> Option<usize> {
     let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
     let n_lt = crate::estimation::parameterization::omega_packed_len(n_eta, false);
-    if se.len() == n_lt && n_lt != n_eta {
+    if len == n_lt && n_lt != n_eta {
         // Full lower-triangle format (block omega). The packed index is the
         // shared column-major `chol_lt_idx` (same convention as `pack_params`).
         //
@@ -9133,21 +9141,10 @@ pub(crate) fn omega_se_at_in(se: &[f64], n_eta: usize, i: usize, j: usize) -> Op
         // answer. This is only reachable by an external caller: every in-repo
         // caller loops `i,j < n_eta`, so the guard is inert internally. The
         // guard also keeps `chol_lt_idx`'s `debug_assert!(i < n)` from firing.
-        if r < n_eta {
-            se.get(crate::estimation::parameterization::chol_lt_idx(
-                r, c, n_eta,
-            ))
-            .copied()
-        } else {
-            None
-        }
+        (r < n_eta).then(|| crate::estimation::parameterization::chol_lt_idx(r, c, n_eta))
     } else {
         // Diagonal-only format: only (i, i) is available.
-        if r == c {
-            se.get(r).copied()
-        } else {
-            None
-        }
+        (r == c).then_some(r)
     }
 }
 

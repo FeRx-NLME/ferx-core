@@ -2038,13 +2038,23 @@ pub(crate) fn apply_held_at_bound(params: &ModelParameters, result: &mut FitResu
         if h.reason != HeldReason::CollapsedAtGuard || !step_held(cov.as_ref(), h.packed_index) {
             continue;
         }
-        let se = match h.kind {
-            ParameterKind::Theta => result.se_theta.as_mut(),
-            ParameterKind::Omega => result.se_omega.as_mut(),
-            ParameterKind::Sigma => result.se_sigma.as_mut(),
-            ParameterKind::Kappa => result.se_kappa.as_mut(),
+        // `se_omega` of a block Ω is its whole lower triangle, so the held variance's slot
+        // is read off the layout, not the ETA index (#2812 review r1 #1); `se_kappa` is one
+        // per κ whatever the block structure, as are `se_theta` and `se_sigma`.
+        let n_eta = result.omega.nrows();
+        let (se, slot) = match h.kind {
+            ParameterKind::Theta => (result.se_theta.as_mut(), Some(h.index)),
+            ParameterKind::Omega => {
+                let len = result.se_omega.as_ref().map_or(0, Vec::len);
+                (
+                    result.se_omega.as_mut(),
+                    crate::types::omega_se_slot(len, n_eta, h.index, h.index),
+                )
+            }
+            ParameterKind::Sigma => (result.se_sigma.as_mut(), Some(h.index)),
+            ParameterKind::Kappa => (result.se_kappa.as_mut(), Some(h.index)),
         };
-        if let Some(v) = se.and_then(|se| se.get_mut(h.index)) {
+        if let Some(v) = se.zip(slot).and_then(|(se, k)| se.get_mut(k)) {
             *v = 0.0;
         }
     }

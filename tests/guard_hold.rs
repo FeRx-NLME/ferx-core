@@ -333,13 +333,36 @@ fn no_collapse_lists_nothing_and_a_re_run_rebuilds_the_report() {
     assert!(!f.cov_fixed.iter().any(|&b| b), "{:?}", f.cov_fixed);
     assert!(!f.warnings.iter().any(|w| w.contains("parameter guard")));
 
+    // The re-run rebuilds the report from its own step, not from the incoming fit — which
+    // `run_covariance` clones, so an incoming fit that already carried the right report
+    // could not tell (#2812 review r1 #2). The incoming fit here is stale on every count:
+    // no list, the no-matrix wording of the guard warning, no mask, and ETA_KA's
+    // unconditional SE. Mutation: drop `refresh_held_at_bound_report` → every assertion
+    // below fails.
     let (f, model, pop, _d) = evaluate("rerun", &model_source(SIGMA_HAT, false, true));
+    let stale_text = guard_warning(&f)
+        .split(" Their standard errors")
+        .next()
+        .unwrap()
+        .to_string();
+    let mut stale = f.clone();
+    stale.held_at_bound.clear();
+    stale.cov_fixed.clear();
+    stale.se_omega.as_mut().unwrap()[2] = 1.2e-4;
+    for w in stale.warnings.iter_mut() {
+        if w.starts_with("Internal optimizer parameter guard") {
+            *w = stale_text.clone();
+        }
+    }
     let options = FitOptions::default();
-    let again = run_covariance(&f, Some(&model), Some(&pop), &options).expect("re-run");
+    let again = run_covariance(&stale, Some(&model), Some(&pop), &options).expect("re-run");
     assert_eq!(again.held_at_bound, f.held_at_bound);
     assert_eq!(again.cov_fixed, f.cov_fixed);
+    assert!(again.cov_fixed[ETA_KA_ROW]);
     assert_eq!(all_ses(&again), all_ses(&f));
+    assert_eq!(again.se_omega.as_ref().unwrap()[2], 0.0);
     assert_eq!(guard_warning(&again), guard_warning(&f));
+    assert_ne!(guard_warning(&again), stale_text);
     assert_eq!(
         again
             .warnings
@@ -348,5 +371,83 @@ fn no_collapse_lists_nothing_and_a_re_run_rebuilds_the_report() {
             .count(),
         1,
         "the stale copy is dropped"
+    );
+}
+
+/// #2812 review r1 #3: under `covariance_method = s` the step holds the collapse on `S⁻¹`
+/// (once `S` itself inverts cleanly), equal to the same model with ETA_KA FIX. Measured:
+/// bit-equal on every SE (macOS arm64). Mutation: drop the `condition_on_held` call on
+/// the `s` arm → the zero row and the equality fail.
+#[test]
+fn a_collapse_is_held_under_covariance_method_s() {
+    let held_src = model_source(SIGMA_HAT, false, true).replace(
+        "covariance = true",
+        "covariance = true\n  covariance_method = s",
+    );
+    let (h, _, _, _d) = evaluate("held_s", &held_src);
+    let fix_src = held_src.replace(
+        &format!("omega ETA_KA ~ {RAIL}\n"),
+        &format!("omega ETA_KA ~ {RAIL} FIX\n"),
+    );
+    assert_ne!(fix_src, held_src);
+    let (f, _, _, _d) = evaluate("fix_s", &fix_src);
+    assert_eq!(h.covariance_method, f.covariance_method);
+    let cov = h.covariance_matrix.as_ref().expect("an S⁻¹");
+    for k in 0..cov.nrows() {
+        assert_eq!(cov[(ETA_KA_ROW, k)], 0.0, "row {k}");
+    }
+    assert!(h.cov_fixed[ETA_KA_ROW], "{:?}", h.cov_fixed);
+    assert_eq!(h.held_at_bound.len(), 1);
+    assert!(f.held_at_bound.is_empty(), "a FIX parameter is not listed");
+    assert_eq!(all_ses(&h), all_ses(&f));
+    assert_eq!(h.covariance_matrix, f.covariance_matrix);
+}
+
+/// #2812 review r1 #1: on a block Ω, `se_omega` is the whole lower triangle, so the held
+/// variance's SE is zeroed at `chol_lt_idx(i, i, n)`, not at the ETA index. ETA_KA is the
+/// **third** ETA of a 3×3 block, so the two layouts disagree: index 2 is
+/// `ETA_KA × ETA_CL`'s slot, and Ω_KA,KA's is 5. The reviewer's fixture: Ω_KA,KA set so
+/// that `L_22` packs onto the rail. Before the fix the table printed
+/// `ETA_KA × ETA_CL … SE 0.000000` and Ω_KA,KA kept 3.16e-4.
+#[test]
+fn a_held_variance_in_a_block_omega_zeroes_its_own_se_slot() {
+    let src = model_source(SIGMA_HAT, false, true)
+        .replace("  omega ETA_CL ~ 0.0792688562315328\n", "")
+        .replace("  omega ETA_V  ~ 0.05944155243978235\n", "")
+        .replace(
+            &format!("  omega ETA_KA ~ {RAIL}\n"),
+            "  block_omega (ETA_CL, ETA_V, ETA_KA) = [0.0792688562315328, 0.01, \
+             0.05944155243978235, 0.002, 0.001, 6.621429974700735e-05]\n",
+        );
+    let (f, _, _, _d) = evaluate("block3", &src);
+    // Packed: [θ×3, L00, L10, L20, L11, L21, L22, σ] — L22 is row 8.
+    let held: Vec<(&str, ParameterKind, usize, usize)> = f
+        .held_at_bound
+        .iter()
+        .map(|h| (h.name.as_str(), h.kind, h.index, h.packed_index))
+        .collect();
+    assert_eq!(held, [("ETA_KA", ParameterKind::Omega, 2, 8)]);
+    assert!(f.cov_fixed[8], "the step held L22: {:?}", f.warnings);
+    let se = f.se_omega.as_ref().unwrap();
+    assert_eq!(se.len(), 6, "a block Ω's se_omega is its lower triangle");
+    assert_eq!(se[5], 0.0, "Ω_KA,KA's own slot is zeroed: {se:?}");
+    for (k, v) in se.iter().enumerate().filter(|&(k, _)| k != 5) {
+        assert!(v.is_finite() && *v > 0.0, "slot {k} keeps its SE: {se:?}");
+    }
+    let table = parameter_table(&f);
+    let cells = |name: &str| {
+        let l = table
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("{name}: {table}"))
+            .to_string();
+        let w: Vec<String> = l.split_whitespace().map(str::to_string).collect();
+        w[w.len() - 4..w.len() - 2].join(" ")
+    };
+    assert_eq!(cells("ETA_KA "), "N/A N/A", "{table}");
+    assert_ne!(
+        cells("ETA_KA × ETA_CL").split(' ').next().unwrap(),
+        "0.000000",
+        "{table}"
     );
 }
