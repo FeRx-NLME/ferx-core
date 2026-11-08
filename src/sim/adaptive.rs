@@ -1096,7 +1096,20 @@ fn grid_index_bounds(lo: f64, hi: f64, s: f64) -> (f64, f64) {
 /// `f64::round` sends such ties down.
 pub(crate) fn round_to_grid(x: f64, s: f64) -> f64 {
     let q = x / s;
-    (q + 0.5 + GRID_SNAP * q.abs().max(1.0)).floor() * s
+    grid_point((q + 0.5 + GRID_SNAP * q.abs().max(1.0)).floor(), s)
+}
+
+/// The `k`-th multiple of `s`. For a step that divides 1 (`0.1`, `0.25`, `0.5`, … —
+/// `1 / s` within [`GRID_SNAP`] of an integer `n >= 2`) it is `k / n`, the correctly
+/// rounded decimal, where `k * s` carries the step's own representation error into
+/// the ledger (`7 * 0.1` is `0.7000000000000001`, `7 / 10` is `0.7`; #2805 review r1
+/// row 7). Any other step, every integer step included, is `k * s`, bit for bit as
+/// before; a step such as `0.3` keeps that ulp noise.
+fn grid_point(k: f64, s: f64) -> f64 {
+    match snapped_integer(1.0 / s) {
+        Some(n) if n >= 2.0 => k / n,
+        _ => k * s,
+    }
 }
 
 /// The dose grid of one subject (#944): the step and the grid-aligned bounds
@@ -1120,8 +1133,8 @@ impl DoseGrid {
         }
         // Each multiple kept inside `[lo, hi]`: a snapped multiple can miss its bound by an
         // ulp either way. The clamp is monotone and `kl <= kh`, so `low <= high`.
-        let low = (kl * step).clamp(lo, hi);
-        let high = (kh * step).clamp(lo, hi);
+        let low = grid_point(kl, step).clamp(lo, hi);
+        let high = grid_point(kh, step).clamp(lo, hi);
         Some(Self { step, low, high })
     }
 
@@ -2014,6 +2027,34 @@ mod tests {
         assert_eq!(round_to_grid(375.0, 250.0).to_bits(), 500.0f64.to_bits());
         assert_eq!(round_to_grid(374.999, 250.0).to_bits(), 250.0f64.to_bits());
         assert_eq!(round_to_grid(0.0, 250.0).to_bits(), 0.0f64.to_bits());
+    }
+
+    /// A step that divides 1 gives the decimal multiple, not `k * s`: `7 * 0.1` is
+    /// `0.7000000000000001`, but the grid dose for 0.7 at `s = 0.1` is `0.7` exactly, as
+    /// are `0.3` (`3 * 0.1 = 0.30000000000000004`) and the multiples of 0.25. An integer
+    /// step is `k * s` bit for bit, so integer grids (and D2) are unchanged (#2805 review
+    /// r1 row 7).
+    ///
+    /// Mutation: `grid_point` back to `k * s` (the decimal cases print ulp noise).
+    #[test]
+    fn a_step_dividing_one_gives_the_decimal_multiple() {
+        assert_eq!(7.0 * 0.1, 0.7000000000000001, "premise: k * s is noisy");
+        assert_eq!(round_to_grid(0.7, 0.1).to_bits(), 0.7f64.to_bits());
+        assert_eq!(round_to_grid(0.3, 0.1).to_bits(), 0.3f64.to_bits());
+        assert_eq!(round_to_grid(0.35, 0.1).to_bits(), 0.4f64.to_bits());
+        assert_eq!(round_to_grid(1.3, 0.25).to_bits(), 1.25f64.to_bits());
+        let g = DoseGrid::new(0.1, (0.05, 0.75)).expect("grid");
+        assert_eq!(
+            (g.low.to_bits(), g.high.to_bits()),
+            (0.1f64.to_bits(), 0.7f64.to_bits())
+        );
+        for (x, k) in [(1300.0, 5.0), (375.0, 2.0), (4000.0, 16.0)] {
+            assert_eq!(
+                round_to_grid(x, 250.0).to_bits(),
+                (k * 250.0f64).to_bits(),
+                "{x}"
+            );
+        }
     }
 
     /// `hi = 0.3, s = 0.1, x = 0.3 → 0.3`: `0.3 / 0.1` is `2.9999999999999996`, which a
