@@ -1388,9 +1388,11 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
     Ok(levels)
 }
 
-/// The sentence [`no_levels_message`] ends on when the data has no discrete-state record
-/// off a CTMM endpoint ([`LevelBlockDecl::ctmm_cmts`], #2808): then no reader the user
-/// could add defines a level on it, whichever arm names the cause.
+/// The sentence [`no_levels_message`] ends on, in the unread and the non-definer arms, when
+/// the data has no discrete-state record on a binary or DTMM endpoint
+/// ([`LevelBlockDecl::level_capable_cmts`], #2808): then no reader the user could add
+/// defines a level on it. The definer arm never appends it: there, that the data has no
+/// record on the reading endpoint is the fact the user can act on.
 const NO_DEFINING_RECORDS: &str = " Only Gaussian rows and the discrete-state records of a \
                                    `[binary_model]` or DTMM `[markov_model]` endpoint define a \
                                    level, and this data has neither, so it cannot estimate the \
@@ -1413,7 +1415,8 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     // One exhaustive pass, so a new `ObsRecord` variant fails to compile here rather than
     // falling through to "no observation rows" (#2751 review r1 #4).
     let mut discrete = false;
-    // A discrete-state record some reader could make define a level: one not on a CTMM.
+    // A discrete-state record some reader could make define a level: one on a binary or
+    // DTMM endpoint.
     let mut definable = false;
     // Only the `survival` build has an `Event` variant to set it.
     #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
@@ -1423,8 +1426,9 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
         match record {
             ObsRecord::DiscreteState { cmt, .. } => {
                 discrete = true;
-                // A CTMM state row defines no level whatever reads it (#2808).
-                definable |= !decl.ctmm_cmts.contains(cmt);
+                // Only a binary or DTMM record can (#2808): a CTMM state row defines no
+                // level whatever reads it.
+                definable |= decl.level_capable_cmts.contains(cmt);
             }
             #[cfg(feature = "survival")]
             ObsRecord::Event { .. } => events = true,

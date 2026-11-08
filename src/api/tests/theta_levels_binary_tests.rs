@@ -1357,6 +1357,18 @@ fn reader_model(reader: Reader) -> String {
     }
 }
 
+/// #2795 review r1b #1: the data paragraph is closed by its own full stop before the read
+/// arm starts. Since #2751 that paragraph is assembled from optional clauses, so the stop
+/// is a code path of its own, and deleting it leaves every clause and arm sentence intact.
+fn assert_data_paragraph_closed(cell: &str, m: &str) {
+    assert!(
+        m.contains(". Nothing reads it:")
+            || m.contains(". The block is read bare by an endpoint")
+            || m.contains(". The block is read bare, but only"),
+        "{cell}: the data paragraph is not closed before the read arm: {m}"
+    );
+}
+
 /// #2751. The refusal's input space is the record kinds the data carries (none; or any
 /// non-empty set of discrete-state, time-to-event and count, none of them defining a
 /// level) × how the block is read (unread, bare by a level-defining endpoint, bare only by
@@ -1368,8 +1380,9 @@ fn reader_model(reader: Reader) -> String {
 ///
 /// Mutations: gate on discrete-state records alone (the #2623 gate) and every event-only
 /// and count-only cell says `NO_ROWS`; drop a kind's clause, or emit it unconditionally,
-/// and that kind's present or absent cells fail; swap the non-definer advice and the
-/// discrete and non-discrete cells each get the other's sentence.
+/// and that kind's present or absent cells fail; give the `[binary_model]` advice whenever
+/// a discrete-state record is present and the discrete non-definer cells fail; delete the
+/// data paragraph's full stop and every cell fails.
 #[test]
 fn record_kind_cells() {
     let sets = [
@@ -1397,6 +1410,7 @@ fn record_kind_cells() {
             let m = &d.message;
             // Data side: the data has rows, so it is not blamed.
             assert!(!m.contains(NO_ROWS), "{cell}: blames the data: {m}");
+            assert_data_paragraph_closed(&cell, m);
             for sentence in [NO_LEVELS, NO_GAUSSIAN] {
                 assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
             }
@@ -1411,12 +1425,14 @@ fn record_kind_cells() {
                     "{cell}: {clause:?} present = {present} in {m}"
                 );
             }
-            // Expression side: exactly one read arm.
+            // Expression side: exactly one read arm. The discrete-state record sits on CMT 3,
+            // which no binary or DTMM endpoint scores, so no cell here has a record a reader
+            // could make define a level: the unread and non-definer arms end on the
+            // cannot-estimate sentence (#2808). `ctmm_records_define_no_level_cells` holds the
+            // other side of that gate.
             let want: &[&str] = match reader {
-                Reader::Unread if discrete => &[UNREAD, READ_BARE],
                 Reader::Unread => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA],
                 Reader::Definer => &[BARE_NO_RECORDS],
-                Reader::NonDefiner if discrete => &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
                 Reader::NonDefiner => &[BARE_NO_DEFINER, BARE_WHY, BARE_NO_DEFINER_DATA],
             };
             for sentence in [UNREAD, READ_BARE].into_iter().chain(BARE_ANY) {
@@ -1517,7 +1533,7 @@ fn tte_only_csv_is_not_called_rowless() {
 /// define a level, and their CMT has no other endpoint. So on data whose discrete-state
 /// records are all on a CTMM, the refusal ends on the cannot-estimate sentence in the
 /// unread and the non-definer arms, never on the "read it in a `[binary_model]`" advice.
-/// The input space is data (CTMM-only, or CTMM plus one off-CTMM record) × read state
+/// The input space is data (CTMM-only, or CTMM plus one record on a non-reading DTMM) × read state
 /// (unread, bare by the CTMM alone, bare by a binary endpoint whose CMT has no record).
 /// Each pair of rows on the same model differs only by the off-CTMM record, so the two
 /// straddle the gate: the CTMM-only row asserts the cannot-estimate sentence and not the
@@ -1525,7 +1541,7 @@ fn tte_only_csv_is_not_called_rowless() {
 ///
 /// Mutations: gate on any discrete-state record (the pre-#2808 `discrete`) and every
 /// CTMM-only row fails; gate on none (always cannot-estimate) and every mixed row fails;
-/// stop the parse filling `ctmm_cmts` and the CTMM-only rows fail.
+/// stop the parse filling `level_capable_cmts` and the mixed rows fail.
 #[cfg(feature = "markov")]
 #[test]
 fn ctmm_records_define_no_level_cells() {
@@ -1533,11 +1549,13 @@ fn ctmm_records_define_no_level_cells() {
         format!(
             "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  \
              theta TVL(-0.3, -5.0, 5.0)\n  theta PLACEBO[STUDY](0.0)\n[covariates]\n  \
-             STUDY categorical\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
+             STUDY categorical\n[markov_model gen]\n  type   = ctmm\n  cmt    = 5\n  \
              states = [awake=0, asleep=1]\n  \
              transition awake  -> asleep = exp(LQ01{ctmm_read})\n  \
              transition asleep -> awake  = exp(LQ10)\n[binary_model]\n  cmt   = 1\n  \
-             logit = TVL{binary_read}\n",
+             logit = TVL{binary_read}\n[markov_model other]\n  type   = dtmm\n  cmt    = 2\n  \
+             states = [awake=0, asleep=1]\n  transition awake  -> asleep = inv_logit(TVL)\n  \
+             transition asleep -> awake  = inv_logit(TVL)\n",
             ctmm_read = if read == "ctmm" { " + PLACEBO" } else { "" },
             binary_read = if read == "binary" { " + PLACEBO" } else { "" },
         )
@@ -1550,21 +1568,22 @@ fn ctmm_records_define_no_level_cells() {
         let text = ctmm(read);
         let parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{read}: {e}"));
         assert_eq!(
-            parsed.model.theta_blocks().level_blocks()[0].ctmm_cmts,
-            [5],
-            "fixture precondition: the parse records the CTMM's CMT"
+            parsed.model.theta_blocks().level_blocks()[0].level_capable_cmts,
+            [1, 2],
+            "fixture precondition: the binary and DTMM CMTs, not the CTMM's"
         );
         for mixed in [false, true] {
             let cell = format!("read {read} × mixed {mixed}");
             let mut pop = state_population();
             if mixed {
-                // One off-CTMM discrete-state record, on a CMT no endpoint reads the block
-                // from, so it defines no level either and the refusal is still reached.
+                // One record on the DTMM at CMT 2, which does not read the block, so it
+                // defines no level either and the refusal is still reached; but a reader
+                // there could make it define one, so the advice is actionable.
                 pop.subjects[0].obs_records.push(ObsRecord::DiscreteState {
                     time: 9.0,
                     raw_time: 9.0,
                     state: 1,
-                    cmt: 3,
+                    cmt: 2,
                 });
             }
             let mut parsed = parse_full_model(&text).unwrap();
@@ -1576,6 +1595,7 @@ fn ctmm_records_define_no_level_cells() {
                 assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
             }
             assert!(!m.contains(NO_ROWS), "{cell}: blames the data: {m}");
+            assert_data_paragraph_closed(&cell, m);
             let want: &[&str] = match (reader, mixed) {
                 (Reader::Unread, false) => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA],
                 (Reader::Unread, true) => &[UNREAD, READ_BARE],

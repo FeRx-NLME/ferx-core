@@ -7543,17 +7543,25 @@ pub fn parse_full_model_with(
     {
         decl.record_cmts = level_record_cmts(&model.endpoints, &decl.index_covariate);
     }
-    // #2808: the CMTs whose discrete-state records no reader can make define a level.
-    #[cfg(feature = "markov")]
+    // #2808: the CMTs whose discrete-state records a reader can make define a level, the
+    // binary and DTMM endpoints. A positive set, so a discrete family added later is not
+    // advised a `[binary_model]` read until it is listed here (review r1b #2).
+    #[cfg(feature = "survival")]
     {
-        let ctmm_cmts = model.ctmm_cmts();
+        #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
+        let mut level_capable_cmts = model.binary_cmts();
+        #[cfg(feature = "markov")]
+        {
+            level_capable_cmts.extend(model.dtmm_cmts());
+            level_capable_cmts.sort_unstable();
+        }
         for decl in model
             .indiv_param_partials
             .theta_blocks
             .level_blocks
             .iter_mut()
         {
-            decl.ctmm_cmts.clone_from(&ctmm_cmts);
+            decl.level_capable_cmts.clone_from(&level_capable_cmts);
         }
     }
 
@@ -19976,7 +19984,7 @@ fn parse_parameters(
                                 eta_readers: Vec::new(),
                                 index_covariate: index_covariate.clone(),
                                 record_cmts: Vec::new(),
-                                ctmm_cmts: Vec::new(),
+                                level_capable_cmts: Vec::new(),
                                 read_bare: false,
                             });
                             (levels, theta_names, Some(index_covariate), columns)
@@ -24631,12 +24639,12 @@ pub struct LevelBlockDecl {
     /// CTMM generator is built once per subject from the baseline, and one time-to-event
     /// data row can yield zero or two records, so neither defines levels.
     pub(crate) record_cmts: Vec<usize>,
-    /// Set by the parse: the CMTs of the model's CTMM `[markov_model]` endpoints, sorted
-    /// (#2808). A discrete-state record there defines no level whatever reads the block,
-    /// and its CMT has no other endpoint, so the binder's no-levels refusal must not advise
-    /// reading the block in a `[binary_model]` or DTMM on data whose discrete-state records
-    /// are all there.
-    pub(crate) ctmm_cmts: Vec<usize>,
+    /// Set by the parse: the CMTs of the model's `[binary_model]` and DTMM `[markov_model]`
+    /// endpoints, sorted (#2808) — the endpoints whose discrete-state records a reader of
+    /// this block would make define levels. The binder's no-levels refusal advises reading
+    /// the block in one of them only when the data has a record on one: a CTMM state row
+    /// defines no level whatever reads it, and its CMT has no other endpoint.
+    pub(crate) level_capable_cmts: Vec<usize>,
     /// Set by the parse: some expression reads this block bare, through
     /// `index_covariate` — the model's referenced covariates include it (#2623 review).
     /// Bare is the only way to read a data-driven block: the parse refuses a
