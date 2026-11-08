@@ -603,9 +603,9 @@ pub fn analytic_outer_gradient_for_interaction(model: &CompiledModel, interactio
 // The inner/outer "η" for an IOV subject is the **stacked** random-effects vector
 //   `[η_bsv (n_eta) , κ_group0 (n_kappa) , κ_group1 , … , κ_group(K−1)]`
 // with `K = iov_occasion_groups(subject).len()`. The adjoint differentiates over that
-// stacked vector (`subject_width`, capped at `MAX_WIDTH = 24`), so the caller's block-Ω
-// (BSV ⊕ K·IOV) assembly consumes it directly. (Much of the clause-by-clause history
-// below describes the pre-#2093 forward provider; the predicate now only gates the
+// stacked vector (`subject_width`, capped at `MAX_WIDTH` in `ode_adjoint.rs`), so the
+// caller's block-Ω (BSV ⊕ K·IOV) assembly consumes it directly. (Much of the
+// clause-by-clause history below describes the pre-#2093 forward provider; the predicate now only gates the
 // absorption-walk routing, `absorption_walk_sens_in_scope`.)
 
 /// Dual width of one IOV program evaluation on the outer builder: the declared θ, the
