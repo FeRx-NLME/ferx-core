@@ -8845,6 +8845,25 @@ pub struct FitResult {
     /// a non-stationary point is not (#2785). Kept so a reader can see which.
     #[serde(default)]
     pub optimizer_stop: Option<String>,
+    /// Whether the outer optimizer spent its evaluation budget (`maxiter`) on the leg that
+    /// produced the reported estimates (#2799) — the typed form of the "increase maxiter"
+    /// warnings. Read from the optimizer's final state, after a stagnation latch that
+    /// landed on the last permitted evaluation has been attributed to the guard rather than
+    /// the budget, and after a polish that spent it (which [`Self::optimizer_stop`], taken
+    /// from the primary leg, does not see). Set on the NLopt path, profiled or not; `false`
+    /// for every other optimizer and estimator (Gauss–Newton, trust region, SAEM, IMP,
+    /// IMPMAP, Bayes, VI), which report their own iteration caps in warnings. Read by
+    /// [`Self::status`].
+    #[serde(default)]
+    pub eval_budget_spent: bool,
+    /// Whether no stage of the run estimated: it scored the given values by request
+    /// (#2799). That is `maxiter = 0` on an estimator that reads it as NONMEM's
+    /// `MAXEVAL=0` (FOCE, FOCEI, Laplace/AGQ, pure Gauss–Newton, profiled and mixture fits),
+    /// or a standalone `imp_eval_only` / `agq_eval_only` chain. Not `maxiter = 0` alone:
+    /// SAEM, IMP, IMPMAP, Bayes, VI and the Gauss–Newton hybrid's polish search
+    /// regardless of it. Read by [`Self::status`].
+    #[serde(default)]
+    pub evaluation_only: bool,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
@@ -11392,6 +11411,30 @@ impl FitOptions {
     pub(crate) fn evaluation_only_chain(&self) -> bool {
         let eval_only = self.eval_only_methods();
         self.method_chain().iter().all(|m| eval_only.contains(m))
+    }
+
+    /// Whether no stage of the run estimates (#2799), the source of
+    /// [`FitResult::evaluation_only`]: every stage is either a standalone evaluator
+    /// ([`Self::evaluation_only_chain`]'s `imp_eval_only` / `agq_eval_only`) or one that reads
+    /// `outer_maxiter = 0` as NONMEM `MAXEVAL=0`. Those are the stages `fit()` routes through
+    /// `optimize_population` (FOCE, FOCEI, Laplace — profiled and mixture fits included, and
+    /// the trust region beneath them), which short-circuits to `evaluate_at_initial_params`,
+    /// and pure Gauss–Newton, whose loop runs `1..=maxiter`. Not SAEM, IMP, IMPMAP, Bayes or
+    /// VI, which carry their own iteration counts, nor the Gauss–Newton hybrid, whose FOCEI
+    /// polish runs a fixed 100-evaluation budget whatever `maxiter` says.
+    pub(crate) fn evaluation_only_run(&self) -> bool {
+        let eval_only = self.eval_only_methods();
+        self.method_chain().iter().all(|m| {
+            eval_only.contains(m)
+                || (self.outer_maxiter == 0
+                    && matches!(
+                        m,
+                        EstimationMethod::Foce
+                            | EstimationMethod::FoceI
+                            | EstimationMethod::FoceGn
+                            | EstimationMethod::Laplace
+                    ))
+        })
     }
 
     /// The chain stage that would run the post-fit covariance step: the last stage that

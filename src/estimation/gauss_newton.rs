@@ -654,6 +654,7 @@ pub fn run_foce_gn(
             mcem_objective_trail: None,
             newton_decrement,
             optimizer_stop: None,
+            eval_budget_spent: false,
         };
     }
 
@@ -844,6 +845,7 @@ pub fn run_foce_gn(
         mcem_objective_trail: None,
         newton_decrement,
         optimizer_stop: None,
+        eval_budget_spent: false,
     }
 }
 

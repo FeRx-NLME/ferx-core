@@ -323,6 +323,13 @@ struct FitWire {
     newton_decrement: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     optimizer_stop: Option<String>,
+    // #2799: the facts `FitResult::status` reads beside `converged`. A bundle from before
+    // them reads `false`, which is what such a fit reported (no typed budget fact, and an
+    // evaluation-only run was told apart only by `outer_maxiter = 0`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    eval_budget_spent: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    evaluation_only: bool,
     // ── Run settings ─────────────────────────────────────────────────────────
     optimizer: String,
     n_starts: usize,
@@ -1800,6 +1807,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         final_gradient_source: r.final_gradient_source.clone(),
         newton_decrement: r.newton_decrement,
         optimizer_stop: r.optimizer_stop.clone(),
+        eval_budget_spent: r.eval_budget_spent,
+        evaluation_only: r.evaluation_only,
         optimizer: r.optimizer.clone(),
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
@@ -3934,6 +3943,8 @@ fn wire_to_fit_result(
         final_gradient_source: w.final_gradient_source,
         newton_decrement: w.newton_decrement,
         optimizer_stop: w.optimizer_stop,
+        eval_budget_spent: w.eval_budget_spent,
+        evaluation_only: w.evaluation_only,
         optimizer: w.optimizer,
         n_starts: w.n_starts,
         multi_start_seed: w.multi_start_seed,
@@ -8271,6 +8282,34 @@ mod tests {
         });
         let loaded = load_fit(&edited).expect("core does not interpret the entry");
         assert_eq!(loaded.fit.interface_extras.as_deref(), Some("{not json"));
+    }
+
+    /// #2799: `eval_budget_spent` and `evaluation_only` round-trip, and a bundle written
+    /// before them (neither key present) loads both as `false`.
+    #[test]
+    fn roundtrip_status_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        r.eval_budget_spent = true;
+        r.evaluation_only = true;
+        let path = saved(&dir, &r);
+        let back = load_fit(&path).unwrap().fit;
+        assert!(back.eval_budget_spent && back.evaluation_only);
+
+        let edited = dir.path().join("old.fitrx");
+        rewrite_bundle(&path, &edited, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, |f| {
+                    let m = f.as_object_mut().unwrap();
+                    assert!(m.remove("eval_budget_spent").is_some());
+                    assert!(m.remove("evaluation_only").is_some());
+                })
+            } else {
+                body
+            })
+        });
+        let old = load_fit(&edited).unwrap().fit;
+        assert!(!old.eval_budget_spent && !old.evaluation_only);
     }
 
     /// #2695: `cov_fixed` round-trips, its pattern not all one value, and holds to the

@@ -1100,6 +1100,8 @@ mod tests {
             kappa_is_diagonal: None,
             newton_decrement: None,
             optimizer_stop: None,
+            eval_budget_spent: false,
+            evaluation_only: false,
         }
     }
 

@@ -4742,3 +4742,49 @@ fn multi_start_notes_classify_info_whatever_error_text_they_carry() {
         (WarningSeverity::Critical, WarningCode::Convergence)
     );
 }
+
+/// #2799: `FitOptions::evaluation_only_run`, the source of `FitResult::evaluation_only`. Every
+/// stage must be an evaluator: `maxiter = 0` on a method that reads it as `MAXEVAL=0` (FOCE,
+/// FOCEI, Laplace, pure GN), or a standalone `imp_eval_only` / `agq_eval_only`. SAEM, IMP,
+/// IMPMAP, Bayes, VI and the GN hybrid (fixed 100-eval polish) search regardless, so
+/// `maxiter = 0` on them is not evaluation-only; one estimating stage in a chain makes the run
+/// estimate. Mutation: widen the method list to any method → the SAEM/VI/hybrid rows; drop the
+/// `eval_only_methods` arm → the IMP/AGQ rows.
+#[test]
+fn evaluation_only_run_reads_each_estimators_own_meaning_of_maxiter_zero() {
+    use EstimationMethod::*;
+    let opts = |methods: &[EstimationMethod], maxiter: usize, imp: bool, agq: bool| FitOptions {
+        method: methods[methods.len() - 1],
+        methods: if methods.len() > 1 {
+            methods.to_vec()
+        } else {
+            Vec::new()
+        },
+        outer_maxiter: maxiter,
+        imp_eval_only: imp,
+        agq_eval_only: agq,
+        ..FitOptions::default()
+    };
+    #[rustfmt::skip]
+    let rows: Vec<(&str, FitOptions, bool)> = vec![
+        ("foce maxiter 0", opts(&[Foce], 0, false, false), true),
+        ("focei maxiter 0", opts(&[FoceI], 0, false, false), true),
+        ("laplace maxiter 0", opts(&[Laplace], 0, false, false), true),
+        ("pure gn maxiter 0", opts(&[FoceGn], 0, false, false), true),
+        ("focei maxiter 500", opts(&[FoceI], 500, false, false), false),
+        ("gn hybrid maxiter 0", opts(&[FoceGnHybrid], 0, false, false), false),
+        ("saem maxiter 0", opts(&[Saem], 0, false, false), false),
+        ("imp maxiter 0", opts(&[Imp], 0, false, false), false),
+        ("impmap maxiter 0", opts(&[Impmap], 0, false, false), false),
+        ("bayes maxiter 0", opts(&[Bayes], 0, false, false), false),
+        ("vi maxiter 0", opts(&[Vi], 0, false, false), false),
+        ("standalone imp_eval_only", opts(&[Imp], 500, true, false), true),
+        ("standalone agq_eval_only", opts(&[Laplace], 500, false, true), true),
+        ("focei then imp_eval_only", opts(&[FoceI, Imp], 500, true, false), false),
+        ("focei maxiter 0 then imp_eval_only", opts(&[FoceI, Imp], 0, true, false), true),
+        ("saem then focei, maxiter 0", opts(&[Saem, FoceI], 0, false, false), false),
+    ];
+    for (name, o, want) in rows {
+        assert_eq!(o.evaluation_only_run(), want, "{name}");
+    }
+}

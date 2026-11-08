@@ -2148,6 +2148,7 @@ fn fit_inner(
                         mixture_posteriors: None,
                         newton_decrement: None,
                         optimizer_stop: None,
+                        eval_budget_spent: false,
                     });
                 }
             }
@@ -2249,6 +2250,7 @@ fn fit_inner(
                     mcem_objective_trail: None,
                     newton_decrement: None,
                     optimizer_stop: None,
+                    eval_budget_spent: false,
                 });
             }
             let prev = result.as_ref().expect(
@@ -3460,6 +3462,8 @@ fn fit_inner(
         final_gradient_source: result.final_gradient_source.clone(),
         newton_decrement: result.newton_decrement,
         optimizer_stop: result.optimizer_stop.clone(),
+        eval_budget_spent: result.eval_budget_spent,
+        evaluation_only: options.evaluation_only_run(),
         optimizer: optimizer_label,
         n_starts: options.n_starts,
         multi_start_seed: options.multi_start_seed,

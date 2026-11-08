@@ -432,6 +432,8 @@ pub(crate) fn empty_fit_result() -> FitResult {
         kappa_is_diagonal: None,
         newton_decrement: None,
         optimizer_stop: None,
+        eval_budget_spent: false,
+        evaluation_only: false,
     }
 }
 
@@ -609,6 +611,8 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         kappa_is_diagonal: None,
         newton_decrement: None,
         optimizer_stop: None,
+        eval_budget_spent: false,
+        evaluation_only: false,
     }
 }
 

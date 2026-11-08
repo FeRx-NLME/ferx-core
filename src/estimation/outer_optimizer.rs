@@ -97,6 +97,10 @@ pub struct OuterResult {
     /// `Failure`, …) on the NLopt path — lifted onto
     /// [`crate::types::FitResult::optimizer_stop`]. `None` where no optimizer reports one.
     pub optimizer_stop: Option<String>,
+    /// Whether the outer optimizer spent its evaluation budget on the leg that produced
+    /// these estimates (#2799), lifted onto [`crate::types::FitResult::eval_budget_spent`].
+    /// The final state, after the latch and polish adjustments; `false` off the NLopt path.
+    pub eval_budget_spent: bool,
     /// Fallback proposal covariance for the SIR sampler, set when the FD
     /// Hessian is non-PD. Built from the `|eigenvalue|`-rectified free-block
     /// Hessian, inflated 4×, and embedded into the full packed parameter space.
@@ -1260,6 +1264,7 @@ fn evaluate_at_initial_params(
         cond_dist: None,
         newton_decrement,
         optimizer_stop: None,
+        eval_budget_spent: false,
     }
 }
 
@@ -9169,6 +9174,10 @@ fn optimize_nlopt_attempt_probed(
         mcem_objective_trail: None,
         newton_decrement,
         optimizer_stop,
+        // #2799: the final budget state — after the polish (`PolishEnd::BudgetSpent`), a
+        // verified stop and a stagnation latch on the last permitted eval have each had their
+        // say above, so it is the same fact the "increase maxiter" warning is gated on.
+        eval_budget_spent: max_eval_reached,
     };
     (
         result,
@@ -9852,6 +9861,7 @@ fn optimize_bfgs(
         cond_dist: None,
         newton_decrement,
         optimizer_stop: None,
+        eval_budget_spent: false,
     }
 }
 

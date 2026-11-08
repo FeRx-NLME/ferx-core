@@ -1101,6 +1101,7 @@ pub(crate) fn optimize_trust_region_seeded(
         mcem_objective_trail: None,
         newton_decrement,
         optimizer_stop: None,
+        eval_budget_spent: false,
     }
 }
 
