@@ -7647,7 +7647,6 @@ fn adaptive_frozen_replay_tv(
                 &mut off_states,
             ));
         }
-        let gate = ResetGate::at_segment(&subject.doses, reset_floor, t_start);
 
         // Apply boluses landing at t_start (lag 0) with their realized F — at EVERY
         // break, including the last. The driver's while-loop processes the final
@@ -7665,11 +7664,15 @@ fn adaptive_frozen_replay_tv(
             }
             applied[i] = true;
             first_event = first_event.min(d.time);
-            // A live arrival turns its compartment back on (#2753), as in the driver's
-            // `apply_prescheduled_boluses_at`.
-            if gate.live(&subject.doses, i) {
-                off_states.retain(|&c| c != d.cmt_idx());
-            }
+            // The arrival turns its compartment back on (#2753), as in the driver's
+            // `apply_prescheduled_boluses_at`. Without its `ResetGate::live` test: every dose
+            // here is lag-free and fires at its own record, which no EVID=3/4 reset reached
+            // there can postdate, and no off row stops at its record (the reader keeps data
+            // rows off a dose's TIME; a controller dose takes `CoTimedOff::After`). Measured:
+            // the gate could not change the answer for any input that reaches it (review r1
+            // #3). If a lagged base dose is ever admitted on this path, the driver keeps its
+            // gate, and the verifier refuses the run rather than return a wrong value.
+            off_states.retain(|&c| c != d.cmt_idx());
             if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt_raw()) {
                 let cmt_idx = d.cmt_idx();
                 if cmt_idx < n {

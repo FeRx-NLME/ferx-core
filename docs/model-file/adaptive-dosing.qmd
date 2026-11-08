@@ -878,14 +878,20 @@ on the static path (#2753). Four points are specific to a controller:
 - **A decision at the same time as an on/off row comes after it.** The monitors read the
   state the row leaves, and a dose decided there is a record after the row: it lands. This
   is the order of a reset and a decision, and the order the reader gives a dose row written
-  after the off row.
+  after the off row. One exception follows file order: a row written *after* a dose row at
+  the same `TIME` takes effect after that dose, and a decision reads before the doses at its
+  time, so a decision there comes before the row. Its monitors read the amount, and a dose
+  it gives into that compartment is wiped by the row. Write the row before the dose row, or
+  give it its own `TIME`, to have the decision see it.
 - **A controller dose into an off compartment turns it on** when it arrives, as a recorded
   dose does. A controller infusion running when an off row on its compartment arrives
   stops there and does not resume when the compartment comes back.
 - **A monitor on an off compartment reads 0**, the amount held there. The static path
   refuses an observation row of an off compartment (`E_OBS_CMT_OFF`), but a monitor is not
-  a data record. A `Dv` monitor reads the assay noise at 0: under a proportional error
-  model, the residual-error floor's (σ = 1e-6).
+  a data record. A `Dv` monitor there under a proportional error model reads a draw of
+  σ = 1e-6 around 0, possibly negative. That σ is the floor the residual-error variance is
+  held at to keep the likelihood finite, not a modelled assay error, so a controller should
+  not treat the reading as an assay result.
 - **`E_OBS_CMT_OFF` is checked on the data alone.** An observation row of a compartment
   that only a controller dose would turn back on is still refused. Write an `EVID=2` on
   row before it.
