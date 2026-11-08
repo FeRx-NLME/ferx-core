@@ -1601,7 +1601,7 @@ fn classify_warning_roundtrips_every_engine_message() {
             "multi_start",
         ),
         (
-            "12 threads configured but only 10 subject(s)",
+            "12 threads configured (engine default) but only 10 subject(s)",
             Info,
             "threads",
         ),

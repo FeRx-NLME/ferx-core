@@ -10,7 +10,7 @@
 //! automatic count is 7: an env pin of exactly 8 then tells "used as given" apart from
 //! "minus one", and 16 tells it apart from the cap of 8.
 
-use super::{resolve_fit_threads, thread_warnings, ThreadSource};
+use super::{fit_thread_warnings_with, resolve_fit_threads, thread_warnings, ThreadSource};
 use crate::types::{classify_warning, WarningCode, WarningSeverity};
 
 const AVAILABLE: usize = 8;
@@ -175,6 +175,43 @@ fn a_declared_width_above_the_cpus_names_the_flag() {
         "{}",
         w[0]
     );
+    // `threads = 0` resolves to the declared width, so advising it would change nothing
+    // (#2813 review row 2): the advice names the flag that set the width instead.
+    assert!(w[0].contains("lower --threads to at most 8"), "{}", w[0]);
+    assert!(!w[0].contains("threads = 0"), "{}", w[0]);
+}
+
+// ── the hand-off `fit()` uses: resolution → warnings (#2813 review row 1) ─────
+
+#[test]
+fn a_fit_reports_the_source_its_resolution_chose() {
+    // One more worker than subjects, so the subjects note fires and carries the source.
+    // A wrapper that hard-coded a source, or resolved without `threads`, reddens one cell.
+    let note = |threads, env| {
+        fit_thread_warnings_with(threads, 0, env, AVAILABLE, 4, 3, false)
+            .into_iter()
+            .find(|w| w.contains("threads configured"))
+            .expect("4 workers over 3 subjects must produce the subjects note")
+    };
+    assert!(note(Some(4), Some("4")).contains("(pinned by `threads`)"));
+    assert!(note(None, Some("4")).contains("(from `RAYON_NUM_THREADS`)"));
+    assert!(note(None, None).contains("(engine default)"));
+}
+
+#[test]
+fn a_fit_reports_an_ignored_environment_only_when_it_was_consulted() {
+    let env_warned = |threads| {
+        fit_thread_warnings_with(threads, 0, Some("x"), AVAILABLE, AUTO, 100, false)
+            .iter()
+            .any(|w| w.contains("RAYON_NUM_THREADS = \"x\""))
+    };
+    // Dropping `env_ignored` on the way to `thread_warnings` reddens the first; passing it
+    // regardless of the pin reddens the second.
+    assert!(
+        env_warned(None),
+        "an unpinned fit read the variable and must say so"
+    );
+    assert!(!env_warned(Some(3)), "a pinned fit never read it");
 }
 
 #[test]

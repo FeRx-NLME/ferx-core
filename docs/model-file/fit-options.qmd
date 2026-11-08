@@ -143,8 +143,9 @@ honoured but warned about, because the workers then time-share the cores. When
 a fit has more workers than subjects, the note that says so also says where the
 count came from.
 
-The variable is read **once per process**, by the first fit, because the shared
-worker pool is sized then and cannot be resized. Changing it later in the same R
+The variable is read **once per process**, the first time ferx sizes a worker
+pool (any fit, prediction or simulation), because the shared worker pool is sized
+then and cannot be resized. Changing it later in the same R
 session or process has no effect; pass `threads` for a different count.
 
 **Bootstrap.** `ferx-tools`' bootstrap with no `threads` set runs as many

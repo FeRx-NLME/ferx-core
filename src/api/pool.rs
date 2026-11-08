@@ -155,12 +155,13 @@ pub(crate) fn reconfiguration_result(already: usize, requested: usize) -> Result
 /// spawn-and-tear-down a fresh `N × 32 MiB` pool (which oversubscribes CPUs and can
 /// exhaust address space).
 ///
-/// Sized by [`default_thread_count`] (available cores minus one, at least two where two cores exist, capped at 8 — #707): most
-/// fits gain little from spreading across every core, and not all cores are equal on
-/// asymmetric platforms (e.g. Apple Silicon E-cores). A caller that declared an explicit
-/// process-wide width via [`configure_global_thread_pool`] (the CLI's `--threads N`) is
-/// honored instead — that call records [`EXPLICIT_THREADS`] before this pool is built, and
-/// this is then the only pool `N` sizes (#1460).
+/// Sized by [`effective_default_threads`]: a width declared via
+/// [`configure_global_thread_pool`] if any — that call records [`EXPLICIT_THREADS`] before
+/// this pool is built, and this is then the only pool `N` sizes (#1460) — else a positive
+/// `RAYON_NUM_THREADS` (#2800), else [`default_thread_count`] (available cores minus one, at
+/// least two where two cores exist, capped at 8 — #707): most fits gain little from
+/// spreading across every core, and not all cores are equal on asymmetric platforms (e.g.
+/// Apple Silicon E-cores).
 ///
 /// Returns `None` only if the one-time build fails (e.g. resource limits); callers then
 /// run on the ambient pool rather than aborting the fit.
@@ -681,6 +682,48 @@ pub(crate) fn resolve_default_threads(
     }
 }
 
+/// The thread warnings `fit()` reports after its chain: [`fit_thread_resolution`] for this
+/// call's `threads`, handed to [`thread_warnings`]. One function so the hand-off — which
+/// source, which ignored env value — is the code [`fit_thread_warnings_with`] tests, not a
+/// copy of it in `fit.rs` (#2813 review row 1).
+pub(crate) fn fit_thread_warnings(
+    threads: Option<usize>,
+    n_used: usize,
+    n_subjects: usize,
+    saem: bool,
+) -> Vec<String> {
+    fit_thread_warnings_with(
+        threads,
+        EXPLICIT_THREADS.load(std::sync::atomic::Ordering::Acquire),
+        rayon_num_threads_env(),
+        available_cpus(),
+        n_used,
+        n_subjects,
+        saem,
+    )
+}
+
+/// [`fit_thread_warnings`] with every process-global input injected.
+pub(crate) fn fit_thread_warnings_with(
+    threads: Option<usize>,
+    explicit: usize,
+    env: Option<&str>,
+    available: usize,
+    n_used: usize,
+    n_subjects: usize,
+    saem: bool,
+) -> Vec<String> {
+    let r = resolve_fit_threads(threads, explicit, env, available);
+    thread_warnings(
+        n_used,
+        r.source,
+        r.env_ignored.as_deref(),
+        available,
+        n_subjects,
+        saem,
+    )
+}
+
 /// The thread warnings a fit reports after its chain (#2800, #1811), as a pure function
 /// of what was measured so each sentence is testable without a fit.
 ///
@@ -710,6 +753,8 @@ pub(crate) fn thread_warnings(
             ThreadSource::Env => {
                 format!("unset {RAYON_NUM_THREADS_ENV} or lower it to at most {available}")
             }
+            // `threads = 0` resolves to the declared width, so it cannot lower it.
+            ThreadSource::Declared => format!("lower --threads to at most {available}"),
             _ => format!("consider threads = 0 (engine default) or at most {available}"),
         };
         out.push(format!(

@@ -180,8 +180,9 @@ pub(crate) use fit::{
 };
 #[cfg(test)]
 pub(crate) use pool::{
-    cap_default_threads, default_thread_count, effective_default_threads, reconfiguration_result,
-    resolve_default_threads, resolve_fit_threads, thread_warnings, ThreadSource,
+    cap_default_threads, default_thread_count, effective_default_threads, fit_thread_warnings_with,
+    reconfiguration_result, resolve_default_threads, resolve_fit_threads, thread_warnings,
+    ThreadSource,
 };
 #[cfg(test)]
 pub(crate) use postfit::{

@@ -534,9 +534,10 @@ pub(crate) fn nn_regularization_unapplied_warning(
 /// When `options.threads` is `Some(n)`, the fit runs inside a scoped rayon
 /// pool of `n` workers, so this setting is per-call (different fits in the
 /// same process can use different thread counts). When `None`, the shared
-/// big-stack fit pool is used, sized to available cores minus one and capped
-/// at 8 (#707) unless a front end declared a width with
-/// [`configure_global_thread_pool`](crate::configure_global_thread_pool).
+/// big-stack fit pool is used, sized to the width a front end declared with
+/// [`configure_global_thread_pool`](crate::configure_global_thread_pool) if any,
+/// else a positive `RAYON_NUM_THREADS` (#2800), else available cores minus one
+/// capped at 8 (#707).
 /// Rayon's own global pool is not used either way, and `--threads N` no longer
 /// sizes it (#1460).
 ///
@@ -2448,17 +2449,12 @@ fn fit_inner(
     // Thread warnings (post-chain, uses n_threads_used captured above): where the count
     // came from, an unusable `RAYON_NUM_THREADS`, oversubscribed cores (#2800, #1811), and
     // more workers than subjects.
-    {
-        let resolved = super::pool::fit_thread_resolution(options.threads);
-        result.warnings.extend(super::pool::thread_warnings(
-            n_threads_used,
-            resolved.source,
-            resolved.env_ignored.as_deref(),
-            super::pool::available_cpus(),
-            population.subjects.len(),
-            chain.iter().any(|&m| m == EstimationMethod::Saem),
-        ));
-    }
+    result.warnings.extend(super::pool::fit_thread_warnings(
+        options.threads,
+        n_threads_used,
+        population.subjects.len(),
+        chain.iter().any(|&m| m == EstimationMethod::Saem),
+    ));
 
     // Compute per-subject diagnostics. For a mixture (#985) each subject's
     // diagnostics are evaluated under its own MIXEST class: `result.eta_hats` are
