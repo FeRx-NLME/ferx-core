@@ -575,6 +575,47 @@ the same rows with the same weight column and cancels out of every ΔOFV,
 likelihood-ratio test, and AIC comparison. Only the absolute number differs from
 a published figure.
 
+### OFV conventions across tools {#ofv-conventions}
+
+Two constants separate one tool's objective from another's: the `N·log 2π` term
+(`N` = number of observations), and the Jacobian of a weighting written as a
+change of variable. ferx reports `−2 log L` **without** `N·log 2π`, the NONMEM
+convention, on the **natural scale** of `DV`. `W` is the `weight =` expression: a
+**standard-deviation** factor, so a row's residual variance is $W^2\sigma^2$. A
+precision weight $w = 1/W^2$ (what `DV·√w` uses) carries the same information.
+
+To turn another tool's figure into ferx's `weight = W` OFV, add:
+
+| Run | Its reported figure | Add |
+|---|---|---|
+| ferx, `DV ~ additive(S) weight = W` | `ofv` | 0 |
+| NONMEM, natural scale, `Y = F + W*EPS(1)` | `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT` (`#OBJV`) | 0 |
+| NONMEM, same model | `... WITH CONSTANT` | $-N\log 2\pi$ |
+| ferx / NONMEM hand-built: `DV/W` in the data, prediction `/W`, σ² = 1 | OFV without constant | $+\sum_j 2\ln W_j$ |
+| nlmixr2 FOCEi hand-built with a precision weight: `DV·√w`, prediction `·√w`, `add()` sd 1 | `fit$objf` (any `adjLik`) | $-\sum_j \ln w_j \;=\; +\sum_j 2\ln W_j$ |
+| nlmixr2, same fit | $-2\,$`logLik(fit)` | $-N\log 2\pi - \sum_j \ln w_j$ |
+
+Measured on one dataset (6 subjects, 18 rows, `W` from 0.3 to 2.5, a model linear
+in its only η so FOCE is the exact marginal), every run at the same initial
+estimates (`maxiter = 0` / `MAXEVAL=0` / `est = "posthoc"`), against the exact
+Gaussian marginal computed outside all three tools:
+
+| | Natural scale | Hand-built |
+|---|---|---|
+| exact marginal, no `N·log 2π` | 44.0745525243 | 41.1483038026 |
+| ferx (`weight = W` / `y = E0/W`) | 44.0745525243 | 41.1483038026 |
+| NONMEM 7.6.0 `#OBJV` | 44.0745525243 | 41.1483038026 |
+| nlmixr2 7.0.1 (nlmixr2est 7.1.0) `objf` | — | 41.1483038026 |
+
+The difference between the columns is $\sum_j 2\ln W_j = 2.9262487217$ for this
+data, and $N\log 2\pi = 33.0817871954$ is what nlmixr2's `−2·logLik` adds. In
+nlmixr2's FOCEi `objf` the `adjLik` switch changes nothing: it gave the same
+figure set to `TRUE` and `FALSE`.
+
+Both constants depend only on the data, so they cancel from every ΔOFV between
+models fitted to the same rows with the same weights. They matter only when an
+absolute objective is compared across tools, or against a published figure.
+
 ### Rules and restrictions (current)
 
 - The weight expression may reference declared covariates, `TIME`, and thetas —

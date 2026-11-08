@@ -99,8 +99,11 @@ and the VPC stay on the natural scale
 sigma is fixed stays your choice: fix it for a continuous endpoint with a known
 SE, estimate it for a weighted logit of a proportion
 ([Is sigma fixed?](error-model.qmd#is-sigma-fixed)). The reported OFV differs
-from a hand-built `DV/SE` fit by a constant that cancels from every ΔOFV
-([Objective-function value](error-model.qmd#objective-function-value)).
+from a hand-built `DV/SE` fit by $\sum_j 2\ln SE_j$, a constant that cancels from
+every ΔOFV ([Objective-function value](error-model.qmd#objective-function-value)).
+[OFV conventions across tools](error-model.qmd#ofv-conventions) gives the term to
+add for each of NONMEM (with and without `N·log 2π`) and nlmixr2's
+precision-weighted `DV·√w` form.
 
 ## 3. Between-arm variability
 

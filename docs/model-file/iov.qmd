@@ -441,6 +441,33 @@ Nested levels (more than one `level`) are estimated with `method = foce` or `foc
 - **A `theta NAME[COL, …]` level block** is checked against the kappas as with one level. Whether a block can absorb a kappa is decided per group of the kappa's level: a kappa at `STUDY` is absorbed by `PLACEBO[STUDY, TIME]` when each of the block's levels lies inside one study, and the block then takes the within-study contrast, or is refused when no contrast identifies both. When measuring, the binder moves the kappa on every arm of its study at once, since the arms share it. A block whose levels cross those groups (`PLACEBO[TIME]`, say) cannot absorb the kappa.
 - **Post-fit output is per level** ([below](#nested-levels-output)).
 
+### Cost grows with the groups inside each subject {#nested-levels-cost}
+
+Each subject's inner problem is over all of its random effects at once: its η
+plus one κ per group of every level it contains. For `ID ⊃ STUDY ⊃ ARM` with one
+kappa at each level, a subject holding `S` studies of `A` arms each solves for
+$n_\eta + S + S \cdot A$ random effects. Making a coarse grouping the subject — a
+sponsor or a programme as `ID` — therefore stacks every arm of every study into
+one inner problem, and its cost rises much faster than the number of rows.
+
+Measured on one synthetic dataset of 48 arms (192 rows; compartment-free model,
+one η, one kappa per level, `threads = 1`, macOS arm64), regrouped so only the
+stacked width changes:
+
+| Subjects × studies × arms | Stacked width | `wall_time_secs` | `n_iterations` (all converged) |
+|---|---|---|---|
+| 8 × 2 × 3 | 9 | 0.56 | 45 |
+| 4 × 4 × 3 | 17 | 1.57 | 50 |
+| 2 × 8 × 3 | 33 | 6.97 | 51 |
+
+The iteration count barely moves, so the growth is the cost of each inner solve.
+Past **48** stacked random effects a subject also loses the exact gradient and
+takes finite differences, named per subject in `FitResult.warnings`: in the same
+setup a width of 46 stayed analytic and 49 switched to finite differences.
+
+To keep the width down, make `ID` the coarsest grouping that genuinely needs its
+own random effect, and declare a level only where its kappa is needed.
+
 ### Output per level {#nested-levels-output}
 
 A kappa at a level has one estimate per group of that level, so each post-fit quantity is taken over those groups:
@@ -505,7 +532,7 @@ $$
 
 where $k_j$ is the occasion of observation *j* and $f_{ij}^{(k)} = f(\theta, \eta_i, \kappa_{ik})$.
 
-Optimization uses BFGS. The inner gradient and the H-matrix (the Jacobian ∂f/∂[η, κ] over the stacked random effects) come from the adjoint's exact recordings for every engine they serve: the closed forms, the event walks and user `[odes]`, with steady-state doses, lag times, resets, `iiv_on_ruv` and FREM. A subject takes finite differences only when its stacked `[η, κ₁…κ_K]` count exceeds **24**, or when its data shape is one no recorder serves (named per subject in `FitResult.warnings`).
+Optimization uses BFGS. The inner gradient and the H-matrix (the Jacobian ∂f/∂[η, κ] over the stacked random effects) come from the adjoint's exact recordings for every engine they serve: the closed forms, the event walks and user `[odes]`, with steady-state doses, lag times, resets, `iiv_on_ruv` and FREM. A subject takes finite differences only when its stacked `[η, κ₁…κ_K]` count exceeds **48**, or when its data shape is one no recorder serves (named per subject in `FitResult.warnings`).
 
 ### Outer loop
 
@@ -539,9 +566,9 @@ The IOV variance components — especially Ω_IOV — are *weakly identified*, a
 
 For IOV models within the analytical 1-/2-/3-compartment scope, under a **gradient-based outer optimizer** (`lbfgs`, `bfgs`, `slsqp`), the outer gradient is now the **exact analytic marginal gradient** (Almquist et al. 2015) assembled over the stacked random-effect vector `[η_bsv, κ₁, …, κ_K]` with the block-diagonal prior `Ω_bsv ⊕ K·Ω_iov`. It carries the EBE response (Eq. 46) in closed form on every θ/Ω/σ/Ω_iov block — including the κ-variance — so it sees the un-shrinkage effect directly and converges Ω_IOV without re-solving the inner loop. Both FOCEI (Laplace marginal) and FOCE (Sheiner–Beal linearized marginal) have exact closed-form gradients here, and the cross-occasion dose carryover is differentiated exactly through the second-order-dual event-driven walk. Validated against reconverged finite differences (~1e-6 on every packed parameter) and against NONMEM on the warfarin IOV model.
 
-For closed-form models the number of θ is not capped. The `[individual_parameters]` program is differentiated a few θ at a time, each batch alongside the whole `[η, κ]` block, so a closed-form model with many θ — fixed ones included, as in a translated model that pins structural constants — keeps the exact gradient on both loops; before #1907 one with more than 24 `(θ, η, κ)` in total quietly ran finite differences for every subject. The one model-level width limit left is `n_eta + n_kappa` reaching 24, which leaves no room for a θ beside the random effects; such a model reports finite differences on the outer loop.
+For closed-form models the number of θ is not capped. The `[individual_parameters]` program is differentiated a few θ at a time, each batch alongside the whole `[η, κ]` block, so a closed-form model with many θ — fixed ones included, as in a translated model that pins structural constants — keeps the exact gradient on both loops; before #1907 one with more than 24 `(θ, η, κ)` in total quietly ran finite differences for every subject. No model-level width limit is left on the gradient: a closed-form model with `n_eta + n_kappa = 24` (12 + 12, two occasions) reports the exact gradient on both loops. The only width limit is the per-subject count below. (The 24 that remains is a prediction routing rule for the transit/IG absorption walk, in [Structural-model scope](#structural-model-scope); it does not decide the gradient.)
 
-The exact outer gradient is the adjoint's, for the same engines as the inner loop. The number of θ does not limit it (the adjoint's cost does not grow with θ); the per-subject stacked `[η, κ₁…κ_K]` count does, at 24. The outer gradient is assembled **per subject**: a subject past that count, one whose data shape no recorder serves, or one with a non-finite analytic component at a trial point falls back to **central finite differences that re-converge that subject's inner loop at each perturbed point** (`subject_reconverged_fd_gradient_iov`), so one such subject does not force the whole population onto finite differences. **BOBYQA** (`optimizer = bobyqa`) is derivative-free and uses neither path. Setting `reconverge_gradient_interval = 1` forces the reconverged-FD gradient even within the analytical scope, as a documented escape hatch.
+The exact outer gradient is the adjoint's, for the same engines as the inner loop. The number of θ does not limit it (the adjoint's cost does not grow with θ); the per-subject stacked `[η, κ₁…κ_K]` count does, past 48. The outer gradient is assembled **per subject**: a subject past that count, one whose data shape no recorder serves, or one with a non-finite analytic component at a trial point falls back to **central finite differences that re-converge that subject's inner loop at each perturbed point** (`subject_reconverged_fd_gradient_iov`), so one such subject does not force the whole population onto finite differences. **BOBYQA** (`optimizer = bobyqa`) is derivative-free and uses neither path. Setting `reconverge_gradient_interval = 1` forces the reconverged-FD gradient even within the analytical scope, as a documented escape hatch.
 
 In addition, on the **SLSQP** path IOV models auto-enable per-coordinate scaling. SLSQP applies a uniform gradient cap that rescales the whole gradient by its largest (theta) component; with the disparate-magnitude IOV parameters (block-diagonal omega + kappa) that cap otherwise starves the omega/Ω_IOV step and leaves the variances pinned at their initial values. Presenting O(1) scaled coordinates removes the starvation, so a *pure* FOCEI/SLSQP fit moves the variance components off their initial values and descends toward the marginal minimum from a cold start. It does not always *reach* it: the final descent is driven by a noisy re-converged FD gradient on a weakly-identified variance surface, and SLSQP can terminate a few OFV units high in a platform-dependent way (see [Limitations](#limitations)). An explicit `optimizer = bobyqa` and the `method = [saem, focei]` chain reach the true minimum platform-independently. (This scaling is scoped to IOV + SLSQP: it is unnecessary for BFGS, which optimizes in unscaled space, and counter-productive for MMA — and the global `scale_params` default stays off to preserve the issue-#99 non-IOV behaviour.)
 
