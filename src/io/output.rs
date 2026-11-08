@@ -26,10 +26,27 @@ fn se_cell(se: Option<f64>) -> String {
 
 /// The `(SE, %RSE)` cells of a THETA table row: both `N/A` when the SE is
 /// missing or not finite (#2225).
-/// Whether θ `i` is a profiled level the covariance step held on its declared bound
-/// (#2112): its SE is not available, as a FIX θ's is not, but it was estimated.
+/// Why parameter `i` of family `kind` has no standard error (#2797), or `None` when it
+/// has one: it is in `FitResult::held_at_bound` — a profiled level on its declared bound
+/// (#2112) or a coordinate collapsed on the internal guard. Its SE is not available, as a
+/// FIX parameter's is not, but it was estimated. The one predicate every renderer reads,
+/// so the console, the YAML and the parameter table cannot disagree. A hand-built result
+/// that sets only the deprecated `profiled_levels_at_bound` is still honoured.
+pub(crate) fn se_held(result: &FitResult, kind: ParameterKind, i: usize) -> Option<HeldReason> {
+    result
+        .held_at_bound
+        .iter()
+        .find(|h| h.kind == kind && h.index == i)
+        .map(|h| h.reason)
+        .or_else(|| {
+            (kind == ParameterKind::Theta && result.profiled_levels_at_bound.contains(&i))
+                .then_some(HeldReason::ProfiledBound)
+        })
+}
+
+/// Whether θ `i` is held ([`se_held`]).
 fn theta_held_at_bound(result: &FitResult, i: usize) -> bool {
-    result.profiled_levels_at_bound.contains(&i)
+    se_held(result, ParameterKind::Theta, i).is_some()
 }
 
 /// θ `i`'s label, SE and %RSE cells in the console θ tables (`print_results` and
@@ -383,9 +400,10 @@ pub struct OmegaRowsOptions {
 
 /// The `--- OMEGA Estimates ---` diagonal rows of [`print_results`].
 fn format_omega_rows(result: &FitResult) -> String {
-    format_omega_rows_from(
+    format_omega_rows_held(
         &OmegaRowsInput::from_result(result),
         OmegaRowsOptions::default(),
+        &|i| se_held(result, ParameterKind::Omega, i).is_some(),
     )
 }
 
@@ -453,6 +471,16 @@ fn typical_value_clause(
 /// rows. One line per `\n`; empty for a zero-row `omega`. Off-diagonal
 /// block-Ω correlations are not part of the rows.
 pub fn format_omega_rows_from(input: &OmegaRowsInput, opts: OmegaRowsOptions) -> String {
+    format_omega_rows_held(input, opts, &|_| false)
+}
+
+/// [`format_omega_rows_from`] with `held(i)` marking the ETAs whose SE is not available
+/// (#2797, [`se_held`]): their SE cell prints `N/A`.
+fn format_omega_rows_held(
+    input: &OmegaRowsInput,
+    opts: OmegaRowsOptions,
+    held: &dyn Fn(usize) -> bool,
+) -> String {
     use std::fmt::Write;
     // Destructured so a flag added later fails to compile here until honoured.
     let OmegaRowsOptions {
@@ -478,7 +506,8 @@ pub fn format_omega_rows_from(input: &OmegaRowsInput, opts: OmegaRowsOptions) ->
             se_cell(
                 input
                     .se_omega
-                    .and_then(|se| crate::types::omega_se_at_in(se, n_eta, i, i)),
+                    .and_then(|se| crate::types::omega_se_at_in(se, n_eta, i, i))
+                    .filter(|_| !held(i)),
             )
         };
         let eta_type = input.eta_param_types.get(i).copied().flatten();
@@ -536,7 +565,13 @@ fn format_sigma_rows(result: &FitResult) -> String {
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            se_cell(result.se_sigma.as_ref().and_then(|se| se.get(i).copied()))
+            se_cell(
+                result
+                    .se_sigma
+                    .as_ref()
+                    .and_then(|se| se.get(i).copied())
+                    .filter(|_| se_held(result, ParameterKind::Sigma, i).is_none()),
+            )
         };
         let _ = match result.sigma_types.get(i).copied() {
             Some(SigmaType::Proportional) => writeln!(
@@ -642,7 +677,9 @@ pub struct KappaRowsOptions {
 /// followed by its weighted-kappa line (#1031) when it has one.
 fn format_kappa_rows(result: &FitResult) -> String {
     KappaRowsInput::from_result(result).map_or_else(String::new, |input| {
-        format_kappa_rows_from(&input, KappaRowsOptions::default())
+        format_kappa_rows_held(&input, KappaRowsOptions::default(), &|i| {
+            se_held(result, ParameterKind::Kappa, i).is_some()
+        })
     })
 }
 
@@ -652,6 +689,16 @@ fn format_kappa_rows(result: &FitResult) -> String {
 /// `\n`; empty for a zero-row `omega_iov`. Off-diagonal `block_kappa`
 /// correlations are not part of the rows.
 pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) -> String {
+    format_kappa_rows_held(input, opts, &|_| false)
+}
+
+/// [`format_kappa_rows_from`] with `held(i)` marking the kappas whose SE is not available
+/// (#2797, [`se_held`]): their SE cell prints `N/A`.
+fn format_kappa_rows_held(
+    input: &KappaRowsInput,
+    opts: KappaRowsOptions,
+    held: &dyn Fn(usize) -> bool,
+) -> String {
     use std::fmt::Write;
     let (arrow, kappa) = if opts.ascii {
         ("->", "kappa")
@@ -678,7 +725,12 @@ pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) ->
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            se_cell(input.se_kappa.and_then(|se| se.get(i).copied()))
+            se_cell(
+                input
+                    .se_kappa
+                    .and_then(|se| se.get(i).copied())
+                    .filter(|_| !held(i)),
+            )
         };
         let weight = kappa_weight_facts(input.kappa_weights, input.kappa_weight_typical, i, var);
         let kappa_type = input.kappa_param_types.get(i).copied();
@@ -3083,10 +3135,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
             writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
             writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
-        } else if theta_held_at_bound(result, i) {
-            writeln!(f, "    at_bound: true").map_err(|e| e.to_string())?;
+        } else if let Some(reason) = se_held(result, ParameterKind::Theta, i) {
+            if reason == HeldReason::ProfiledBound {
+                writeln!(f, "    at_bound: true").map_err(|e| e.to_string())?;
+            }
             writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
             writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
+            writeln!(f, "    held: {}", reason.as_str()).map_err(|e| e.to_string())?;
         } else {
             match se {
                 Some(s) => {
@@ -3141,11 +3196,23 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     ),
                     // A profiled level held on its bound (#2112): estimated, but held by
                     // the covariance step, so no SE.
-                    _ if theta_held_at_bound(result, i) => writeln!(
-                        f,
-                        "      - {{ label: \"{}\", estimate: {:.6}, at_bound: true, se: ~, rse_pct: ~ }}",
-                        label, result.theta[i]
-                    ),
+                    _ if theta_held_at_bound(result, i) => {
+                        let reason = se_held(result, ParameterKind::Theta, i)
+                            .unwrap_or(HeldReason::ProfiledBound);
+                        let at_bound = if reason == HeldReason::ProfiledBound {
+                            "at_bound: true, "
+                        } else {
+                            ""
+                        };
+                        writeln!(
+                            f,
+                            "      - {{ label: \"{}\", estimate: {:.6}, {}se: ~, rse_pct: ~, held: {} }}",
+                            label,
+                            result.theta[i],
+                            at_bound,
+                            reason.as_str()
+                        )
+                    }
                     Some(se) => writeln!(
                         f,
                         "      - {{ label: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
@@ -3291,6 +3358,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         if is_fixed {
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
             writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+        } else if let Some(reason) = se_held(result, ParameterKind::Omega, i) {
+            writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+            writeln!(f, "    held: {}", reason.as_str()).map_err(|e| e.to_string())?;
         } else {
             match se {
                 Some(s) => writeln!(f, "    se: {:.6}", s).map_err(|e| e.to_string())?,
@@ -3370,6 +3440,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         if is_fixed {
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
             writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+        } else if let Some(reason) = se_held(result, ParameterKind::Sigma, i) {
+            writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+            writeln!(f, "    held: {}", reason.as_str()).map_err(|e| e.to_string())?;
         } else {
             match se {
                 Some(sv) => writeln!(f, "    se: {:.6}", sv).map_err(|e| e.to_string())?,
@@ -3488,6 +3561,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             if is_fixed {
                 writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
                 writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+            } else if let Some(reason) = se_held(result, ParameterKind::Kappa, i) {
+                writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+                writeln!(f, "    held: {}", reason.as_str()).map_err(|e| e.to_string())?;
             } else {
                 match se {
                     Some(sv) => writeln!(f, "    se: {:.6}", sv).map_err(|e| e.to_string())?,
@@ -3868,14 +3944,23 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 /// parameter is labelled `[FIX]` and has no SE; so does a free one whose SE
 /// the covariance step did not produce (`se = None`). Both print `---`. The
 /// %RSE of an estimate at zero (`|est| <= 1e-12`, where [`rse_pct`] is `NaN`)
-/// is undefined and also prints `---`, beside its SE.
-fn parameter_table_row(name: &str, est: f64, se: Option<f64>, fixed: bool, kind: &str) -> String {
+/// is undefined and also prints `---`, beside its SE. A free parameter whose SE is not
+/// available because it sits on a bound (`held`, [`se_held`], #2797) prints `N/A` in both.
+fn parameter_table_row(
+    name: &str,
+    est: f64,
+    se: Option<f64>,
+    fixed: bool,
+    held: bool,
+    kind: &str,
+) -> String {
     let label = if fixed {
         fixed_label(name)
     } else {
         name.to_string()
     };
     let (se_str, rse_str) = match se.filter(|_| !fixed) {
+        _ if held && !fixed => ("N/A".to_string(), "N/A".to_string()),
         Some(s) => {
             let rse = rse_pct(est, s);
             let rse_str = if rse.is_finite() {
@@ -3975,6 +4060,7 @@ pub fn parameter_table(result: &FitResult) -> String {
             result.theta[i],
             result.se_theta.as_ref().and_then(|se| se.get(i).copied()),
             result.theta_fixed.get(i).copied().unwrap_or(false),
+            theta_held_at_bound(result, i),
             "THETA",
         ));
     }
@@ -3987,6 +4073,7 @@ pub fn parameter_table(result: &FitResult) -> String {
             result.omega[(i, i)],
             crate::types::omega_se_at(&result.se_omega, n_eta, i, i),
             eta_fixed(i),
+            se_held(result, ParameterKind::Omega, i).is_some(),
             "OMEGA var",
         ));
     }
@@ -4001,6 +4088,7 @@ pub fn parameter_table(result: &FitResult) -> String {
             result.omega[(i, j)],
             crate::types::omega_se_at(&result.se_omega, n_eta, i, j),
             eta_fixed(i) && eta_fixed(j),
+            false,
             "OMEGA cov",
         ));
     }
@@ -4011,6 +4099,7 @@ pub fn parameter_table(result: &FitResult) -> String {
             s,
             result.se_sigma.as_ref().and_then(|se| se.get(i).copied()),
             result.sigma_fixed.get(i).copied().unwrap_or(false),
+            se_held(result, ParameterKind::Sigma, i).is_some(),
             "SIGMA SD",
         ));
     }
@@ -4023,6 +4112,7 @@ pub fn parameter_table(result: &FitResult) -> String {
                 iov[(i, i)],
                 result.se_kappa.as_ref().and_then(|se| se.get(i).copied()),
                 kappa_fixed(i),
+                se_held(result, ParameterKind::Kappa, i).is_some(),
                 "KAPPA var",
             ));
         }
@@ -4033,6 +4123,7 @@ pub fn parameter_table(result: &FitResult) -> String {
                 iov[(i, j)],
                 None,
                 kappa_fixed(i) && kappa_fixed(j),
+                false,
                 "KAPPA cov",
             ));
         }
@@ -4155,6 +4246,7 @@ mod tests {
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
             profiled_levels_at_bound: Vec::new(),
+            held_at_bound: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -4624,7 +4716,7 @@ mod tests {
                 assert!(
                     yaml.contains(
                         "      - { label: \"L=2\", estimate: 0.500000, at_bound: true, se: ~, \
-                         rse_pct: ~ }\n"
+                         rse_pct: ~, held: profiled_bound }\n"
                     ),
                     "{yaml}"
                 );
@@ -4636,7 +4728,7 @@ mod tests {
                 assert!(
                     yaml.contains(
                         "  PLACEBO[L=2]:\n    estimate: 0.500000\n    at_bound: true\n    se: ~\n    \
-                         rse_pct: ~\n"
+                         rse_pct: ~\n    held: profiled_bound\n"
                     ),
                     "{yaml}"
                 );
@@ -4662,6 +4754,184 @@ mod tests {
             assert_eq!(yaml.matches("at_bound: true").count(), 1, "{yaml}");
             assert!(!yaml.contains("fixed: true"), "{yaml}");
         }
+    }
+
+    /// #2797 test 2: every renderer reads `se_held`, for every kind × reason. A held row
+    /// prints `N/A` (console and parameter table) or `se: ~` plus `held: <reason>` (YAML),
+    /// a profiled level keeps its `at_bound: true`, and — the negative — a row that is not
+    /// held prints its number. The stored SE of a held row is deliberately non-zero here,
+    /// so a renderer that reads the number instead of the list prints it and fails.
+    #[test]
+    fn a_held_parameter_prints_no_se_in_every_renderer() {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1, 0.2]);
+        r.sigma_names = vec!["PROP_A".into(), "PROP_B".into()];
+        r.sigma_fixed = vec![false; 2];
+        r.se_sigma = Some(vec![0.0123, 0.0456]);
+        r.theta = vec![0.5, 2.0, 3.0];
+        r.theta_names = vec!["TVCL".into(), "TVV".into(), "TVKA".into()];
+        r.theta_fixed = vec![false; 3];
+        r.se_theta = Some(vec![0.0311, 0.0322, 0.0333]);
+        r.eta_names = vec!["ETA_CL".into(), "ETA_KA".into()];
+        r.omega = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.09, 6.1e-6]));
+        r.omega_fixed = vec![false; 2];
+        r.se_omega = Some(vec![0.0177, 0.0188]);
+        r.kappa_names = vec!["K_CL".into(), "K_KA".into()];
+        r.omega_iov = Some(DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![
+            0.04, 6.1e-6,
+        ])));
+        r.kappa_fixed = vec![false; 2];
+        r.se_kappa = Some(vec![0.0144, 0.0155]);
+        let held = |name: &str, kind, index, packed_index, reason| HeldAtBound {
+            name: name.into(),
+            kind,
+            index,
+            packed_index,
+            reason,
+        };
+        r.held_at_bound = vec![
+            held("TVV", ParameterKind::Theta, 1, 1, HeldReason::ProfiledBound),
+            held(
+                "TVKA",
+                ParameterKind::Theta,
+                2,
+                2,
+                HeldReason::CollapsedAtGuard,
+            ),
+            held(
+                "ETA_KA",
+                ParameterKind::Omega,
+                1,
+                4,
+                HeldReason::CollapsedAtGuard,
+            ),
+            held(
+                "PROP_B",
+                ParameterKind::Sigma,
+                1,
+                6,
+                HeldReason::CollapsedAtGuard,
+            ),
+            held(
+                "K_KA",
+                ParameterKind::Kappa,
+                1,
+                8,
+                HeldReason::CollapsedAtGuard,
+            ),
+        ];
+        // The predicate itself, each kind × reason, and its negative.
+        assert_eq!(
+            se_held(&r, ParameterKind::Theta, 1),
+            Some(HeldReason::ProfiledBound)
+        );
+        assert_eq!(
+            se_held(&r, ParameterKind::Theta, 2),
+            Some(HeldReason::CollapsedAtGuard)
+        );
+        assert_eq!(se_held(&r, ParameterKind::Theta, 0), None);
+        assert_eq!(
+            se_held(&r, ParameterKind::Omega, 1),
+            Some(HeldReason::CollapsedAtGuard)
+        );
+        assert_eq!(se_held(&r, ParameterKind::Omega, 0), None);
+        assert_eq!(
+            se_held(&r, ParameterKind::Sigma, 1),
+            Some(HeldReason::CollapsedAtGuard)
+        );
+        assert_eq!(
+            se_held(&r, ParameterKind::Kappa, 1),
+            Some(HeldReason::CollapsedAtGuard)
+        );
+        assert_eq!(se_held(&r, ParameterKind::Kappa, 0), None);
+
+        // Console (`format_summary`, whose rows `print_results` shares).
+        let summary = format_summary(&r);
+        let line = |name: &str| {
+            summary
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name}: {summary}"))
+                .to_string()
+        };
+        for name in ["TVV", "TVKA"] {
+            assert_eq!(
+                line(name).split_whitespace().collect::<Vec<_>>()[2..],
+                ["N/A", "N/A"],
+                "{summary}"
+            );
+        }
+        assert!(line("TVCL").contains("0.031100"), "{summary}");
+        assert!(line("ETA_KA").ends_with("SE = N/A"), "{summary}");
+        assert!(line("ETA_CL").contains("SE = 0.017700"), "{summary}");
+        assert!(line("PROP_B").ends_with("SE = N/A"), "{summary}");
+        assert!(line("PROP_A").ends_with("SE = 0.012300"), "{summary}");
+        let print = format_kappa_rows(&r);
+        assert!(print.contains("SE = N/A"), "{print}");
+        assert!(print.contains("SE = 0.014400"), "{print}");
+        assert!(!print.contains("0.015500"), "{print}");
+
+        // Parameter table.
+        let table = parameter_table(&r);
+        let cells = |name: &str| {
+            let l = table
+                .lines()
+                .find(|l| l.starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name}: {table}"));
+            l.split_whitespace().collect::<Vec<_>>()[2..4].join(" ")
+        };
+        for name in ["TVV", "TVKA", "ETA_KA", "PROP_B", "K_KA"] {
+            assert_eq!(cells(name), "N/A N/A", "{name}: {table}");
+        }
+        for (name, se) in [
+            ("TVCL", "0.031100"),
+            ("ETA_CL", "0.017700"),
+            ("PROP_A", "0.012300"),
+            ("K_CL", "0.014400"),
+        ] {
+            assert!(cells(name).starts_with(se), "{name}: {table}");
+        }
+
+        // YAML.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            yaml.contains("  TVV:\n    estimate: 2.000000\n    at_bound: true\n    se: ~\n    rse_pct: ~\n    held: profiled_bound\n"),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains("  TVKA:\n    estimate: 3.000000\n    se: ~\n    rse_pct: ~\n    held: collapsed_at_guard\n"),
+            "{yaml}"
+        );
+        for name in ["ETA_KA", "PROP_B", "K_KA"] {
+            let block = yaml
+                .split(&format!("  {name}:\n"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}: {yaml}"));
+            let block: Vec<&str> = block
+                .lines()
+                .take_while(|l| l.starts_with("    "))
+                .collect();
+            let block = block.join("\n");
+            assert!(
+                block.contains("    se: ~\n    held: collapsed_at_guard"),
+                "{name}: {block}"
+            );
+        }
+        assert!(yaml.contains("    se: 0.017700\n"), "{yaml}");
+        assert!(yaml.contains("    se: 0.012300\n"), "{yaml}");
+        assert!(yaml.contains("    se: 0.014400\n"), "{yaml}");
+        assert!(
+            !yaml.contains("0.018800") && !yaml.contains("0.045600"),
+            "{yaml}"
+        );
+        assert_eq!(yaml.matches("at_bound: true").count(), 1, "{yaml}");
+        assert_eq!(
+            yaml.matches("held: collapsed_at_guard").count(),
+            4,
+            "{yaml}"
+        );
     }
 
     #[test]
@@ -5369,6 +5639,7 @@ mod tests {
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
             profiled_levels_at_bound: Vec::new(),
+            held_at_bound: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,

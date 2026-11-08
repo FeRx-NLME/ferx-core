@@ -3898,7 +3898,19 @@ impl ProfileCtx<'_> {
         // the non-PD fallback's |λ|-rectified proposal (`build_non_pd_fallback_proposal`,
         // as the unprofiled step builds it, at the same 4× inflation), with the reason.
         let (cov_s, non_pd) = match a_p.clone().cholesky() {
-            Some(ch) => (ch.inverse() * 2.0, None),
+            // #2797: on a positive-definite `A_p`, the structural coordinates collapsed on the
+            // internal guard are held — `A_p⁻¹` becomes the inverse of its sub-block over the
+            // rest, embedded with zero rows — so the level blocks and the sandwich built from
+            // it below are conditional on them too. Only after the verdict, as in the
+            // unprofiled step.
+            Some(ch) => {
+                let held = crate::estimation::covariance::held_free_positions(x_hat, hold, free);
+                let cov = crate::estimation::covariance::condition_on_held(a_p, &held, |sub, _| {
+                    sub.clone().cholesky().map(|c| c.inverse() * 2.0)
+                })
+                .unwrap_or_else(|| ch.inverse() * 2.0);
+                (cov, None)
+            }
             None => {
                 let sym = (a_p + a_p.transpose()) * 0.5;
                 let Some(eigvals) = crate::estimation::covariance::extract_eigenvalues(&sym) else {
