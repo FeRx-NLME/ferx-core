@@ -12165,6 +12165,11 @@ pub struct ParsedModel {
 /// Factories that build minimal `CompiledModel` instances for unit tests.
 /// Exposed `pub(crate)` (gated on `#[cfg(test)]`) so other modules' tests
 /// can construct models without duplicating the boilerplate.
+// #2799: the usability verdict beside `converged`, in its own file.
+#[path = "types_fit_status.rs"]
+mod fit_status;
+pub use fit_status::{FitStatus, StatusReason};
+
 #[cfg(test)]
 #[path = "types_test_helpers.rs"]
 pub(crate) mod test_helpers;
