@@ -56,6 +56,7 @@ with the run, never with a fitted model's parameters.
 | `dose_bounds` | ✓ | Inclusive `[low, high]` clamp applied to every emitted dose. Each side is a number or a per-subject expression (e.g. `[0, min(30 * WT, 4000)]`). |
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. Each rung is a number or a per-subject expression. |
+| `round_to` | | Dose grid step, a number `> 0` (e.g. `250` for 250 mg vials): every dose the controller sets is rounded to the nearest multiple, then clamped to the multiples inside `dose_bounds`. Not with `levels`. See [Rounding doses to a grid](#rounding-doses-to-a-grid). |
 | `dose_knowledge` | | `known` (default) or `oracle`: whether a dose expression may read a drawn subject's individual parameters. See [Which subjects' values are known](#which-subjects-values-are-known). |
 | `intervals` | | Dosing-interval ladder `[d1, d2, …]`, strictly increasing and positive. Rules step it with `lengthen` / `shorten`. Requires `start_interval`. See [Changing the dosing interval](#changing-the-dosing-interval). |
 | `start_interval` | | The dosing interval in force from the first decision; one of `intervals`, and required with it. |
@@ -241,6 +242,73 @@ the model's own expressions read that column directly. The `W_FREM_DRAWN_ETA` wa
 then names the covariates the dose expressions read and the model does not, each with
 the first key that reads it.
 
+### Rounding doses to a grid
+
+`round_to = <step>` puts every dose the controller sets on a grid of multiples of
+`<step>` — the vial or tablet size a real order is written in
+([#944](https://github.com/FeRx-NLME/ferx-core/issues/944)):
+
+```
+  start_dose  = 15 * WT
+  dose_bounds = [250, min(30 * WT, 4000)]
+  round_to    = 250
+```
+
+The step is one number for every subject, finite and `> 0`. Each dose — the start
+dose, and the dose after each percentage step — goes through the same three steps:
+
+1. **Round** to the nearest multiple of the step. A value exactly halfway goes **up**
+   (375 → 500 with a step of 250). The halfway test allows for decimal steps, whose
+   quotients are rarely exact in binary (`0.35 / 0.1` is `3.4999999999999996`, and
+   still rounds up to 0.4).
+2. **Clamp** to the multiples inside `dose_bounds`: the lowest multiple at or above
+   the low bound and the highest at or below the high bound. With
+   `dose_bounds = [250, 1150]` and a step of 250, a step to 1300 rounds to 1250 and is
+   clamped to 1000; a dose never leaves the bounds as written. Rounding comes first:
+   clamping first would give 1150, which rounds to 1250, above the bound.
+3. **Carry** the rounded dose. The next step starts from the dose actually given:
+   500 +30% is 650, given as 750; the next +30% starts from 750 and gives 1000 (from
+   650 it would be 845, given as 750).
+
+The rounded dose is what every later decision re-issues when no rule fires; it is
+rounded once, when it is set.
+
+**An absorbed step looks like a clamped step.** A step the grid absorbs (500 +10% is
+550, which rounds back to 500) leaves the dose unchanged. The dose ledger records the
+rule that fired (`rule_fired`) and the unchanged `amt` — exactly the record a step
+clamped at a bound produces — and the metrics count it as neither an increase nor a
+decrease, since they count realized changes. There is no separate field for it.
+
+`round_to` does not combine with `levels`: a ladder is already discrete, so write
+the rounded doses as the rungs. Without `round_to`, nothing changes: doses are clamped
+to `dose_bounds` only, as before.
+
+### When a grid is refused
+
+Bounds can be expressions, so the grid is checked for each subject before any subject
+runs (an oracle subject in each replicate, after its draw), and for numeric bounds when
+the file is parsed. Each refusal is `E_ADAPTIVE_DOSE_VALUE` and names the subject (and
+the replicate, for an oracle subject):
+
+- **No multiple inside the bounds.** With `dose_bounds = [10 * WT, 12 * WT]` and a step
+  of 250, a 20 kg subject's bounds are `[200, 240]`, which hold no multiple of 250.
+- **A low bound that aligns to 0, with percentage steps.** A dose could then round to
+  0, a dose of 0 is a hold, and a running dose of 0 cannot rise again under percentage
+  steps. Set the low bound above 0: any value up to the step is lifted to the step, so
+  `dose_bounds = [1e-6, …]` and `[250, …]` both give a lowest dose of 250. A block
+  whose rules take no percentage step is not refused.
+
+```
+[adaptive_dosing] subject 1: with round_to = 250, dose_bounds = [WT - 20, 4000]
+evaluate to [0, 4000]: a low of 0 lets a dose round to 0, and a running dose of 0
+cannot rise again under percentage steps; set the lower bound above 0 (any value up
+to 250 raises it to 250). The dose expressions read WT = 20, at the first decision
+(t = 0).
+```
+
+A step that is not a finite number `> 0`, and `round_to` together with `levels`, are
+parse errors. Example: `examples/adaptive_vanco_mgkg_rounded.ferx`.
+
 ### Rules — `when signal <op> <value> : <action>`
 
 Rules are evaluated top to bottom and the **first match wins**, so order the
@@ -260,8 +328,9 @@ order: `when signal > 20 : decrease 25%, lengthen`. A rule with only an interval
 effect re-issues the running dose. `stop` cannot be combined with an interval
 effect.
 
-A dose change is clamped to `dose_bounds`; a level step saturates at the ends of
-the ladder. When no rule matches (or a matched rule has not yet `confirm`-ed),
+A dose change is clamped to `dose_bounds` (with `round_to`, rounded first; see
+[Rounding doses to a grid](#rounding-doses-to-a-grid)); a level step saturates at the
+ends of the ladder. When no rule matches (or a matched rule has not yet `confirm`-ed),
 the running dose is **re-issued** unchanged — the regimen continues, an explicit
 no-op rather than a silent skip.
 
@@ -830,6 +899,23 @@ within the cross-solver band at a supplied η = 0. The kit lives in
 `tests/adaptive_vanco_mgkg_anchor.rs`. Beside it, a constant expression (`25 * WT` at
 `WT = 40`) reproduces the literal block (`1000`) bit for bit, and a block whose rules
 never fire matches `predict()` on each subject's frozen weight-based regimen.
+
+### The rounded-dose vancomycin anchor
+
+`round_to` is cross-checked against the same mrgsolve kit, in a second arm
+(`examples/adaptive_vanco_mgkg_rounded.ferx`, `expected_round_to.md`): the same model
+and rules with `round_to = 250` and `dose_bounds = [250, min(30 * WT, 4000)]`, on a
+40 kg and an 80 kg patient. The R loop rounds with the same rule (nearest multiple,
+ties up, then clamp to the multiples inside the bounds, then carry). Between them the
+two patients exercise each part of it: the 40 kg start dose of 600 mg is given as
+500 mg; a tie goes up (625 → 750 at 40 kg, 1875 → 2000 at 80 kg); the 30 mg/kg cap
+needs aligning (1200 → 1000, 2400 → 2250), where clamping before rounding would give a
+dose above the cap; and the 40 kg patient's second step starts from the carried
+750 mg and gives 1000 mg, where the unrounded 625 mg would give 750 mg. Every dose
+matches mrgsolve exactly, and the troughs agree within the same cross-solver band.
+Beside it, every shipped adaptive example runs bit-identically with and without this
+feature in the engine when `round_to` is absent, and a `round_to` whose grid already
+holds every dose the controller would set reproduces the run without it.
 
 ## Model time in a reactive run
 
