@@ -534,9 +534,10 @@ pub(crate) fn nn_regularization_unapplied_warning(
 /// When `options.threads` is `Some(n)`, the fit runs inside a scoped rayon
 /// pool of `n` workers, so this setting is per-call (different fits in the
 /// same process can use different thread counts). When `None`, the shared
-/// big-stack fit pool is used, sized to available cores minus one and capped
-/// at 8 (#707) unless a front end declared a width with
-/// [`configure_global_thread_pool`](crate::configure_global_thread_pool).
+/// big-stack fit pool is used, sized to the width a front end declared with
+/// [`configure_global_thread_pool`](crate::configure_global_thread_pool) if any,
+/// else a positive `RAYON_NUM_THREADS` (#2800), else available cores minus one
+/// capped at 8 (#707).
 /// Rayon's own global pool is not used either way, and `--threads N` no longer
 /// sizes it (#1460).
 ///
@@ -2445,31 +2446,15 @@ fn fit_inner(
 
     result.warnings = accumulated_warnings;
 
-    // Thread efficiency warnings (post-chain, uses n_threads_used captured above).
-    let n_subjects = population.subjects.len();
-    if n_subjects > 0 && n_threads_used > n_subjects {
-        // `threads = 0` is not a valid Rayon pool size, so for n_subjects = 1
-        // we still suggest a 1-thread pool.
-        let suggested = n_subjects.max(1);
-        result.warnings.push(format!(
-            "{} threads configured but only {} subject(s) — consider threads = {} to reduce \
-             scheduling overhead (no speed benefit beyond n_subjects)",
-            n_threads_used, n_subjects, suggested
-        ));
-    }
-    // SAEM-specific: MH scheduling has higher per-subject overhead than FOCE.
-    // Skip when n_subjects < 2 (n_subjects/2 = 0 is meaningless and the prior
-    // warning already covers the n_threads > n_subjects case).
-    if chain.iter().any(|&m| m == EstimationMethod::Saem) && n_subjects >= 2 {
-        let suggested = (n_subjects / 2).max(1);
-        if n_threads_used > suggested {
-            result.warnings.push(format!(
-                "SAEM with more threads than subjects/2 may be slower due to MH scheduling \
-                 overhead. Consider threads = {} for SAEM.",
-                suggested
-            ));
-        }
-    }
+    // Thread warnings (post-chain, uses n_threads_used captured above): where the count
+    // came from, an unusable `RAYON_NUM_THREADS`, oversubscribed cores (#2800, #1811), and
+    // more workers than subjects.
+    result.warnings.extend(super::pool::fit_thread_warnings(
+        options.threads,
+        n_threads_used,
+        population.subjects.len(),
+        chain.iter().any(|&m| m == EstimationMethod::Saem),
+    ));
 
     // Compute per-subject diagnostics. For a mixture (#985) each subject's
     // diagnostics are evaluated under its own MIXEST class: `result.eta_hats` are

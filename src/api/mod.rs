@@ -187,8 +187,9 @@ pub(crate) use fit::{
 };
 #[cfg(test)]
 pub(crate) use pool::{
-    cap_default_threads, default_thread_count, effective_default_threads, reconfiguration_result,
-    resolve_default_threads,
+    cap_default_threads, default_thread_count, effective_default_threads, fit_thread_warnings_with,
+    reconfiguration_result, resolve_default_threads, resolve_fit_threads, thread_warnings,
+    ThreadSource,
 };
 #[cfg(test)]
 pub(crate) use postfit::{
@@ -302,6 +303,10 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/threads_override_tests.rs"]
 mod threads_override_tests;
+
+#[cfg(test)]
+#[path = "tests/thread_env_tests.rs"]
+mod thread_env_tests;
 
 #[cfg(test)]
 #[path = "tests/dose_compartment_tests.rs"]
