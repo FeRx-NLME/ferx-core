@@ -474,6 +474,27 @@ fn a_profiled_fit_lists_a_collapse_even_when_its_step_fails() {
         ]
     );
     assert!(f.cov_fixed.is_empty());
+    // #2799, the status's step-failed arm (plan cell F): a collapse beside a failed step is
+    // `collapsed_at_guard`, the failure is read once from `covariance_status` (its Critical
+    // warning is not counted again), and the profiled level on its box is not a reason.
+    assert_eq!(
+        f.covariance_status,
+        ferx_core::types::CovarianceStatus::Failed
+    );
+    assert_eq!(
+        f.status(),
+        ferx_core::types::FitStatus::NotConverged {
+            reasons: vec![
+                ferx_core::types::StatusReason::EvaluationOnly,
+                ferx_core::types::StatusReason::CovarianceFailed,
+                ferx_core::types::StatusReason::CollapsedAtGuard {
+                    parameters: vec!["ETA_EM".into()]
+                },
+            ]
+        },
+        "{:?}",
+        f.warnings
+    );
     let guard = f
         .warnings
         .iter()
