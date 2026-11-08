@@ -4455,8 +4455,9 @@ fn settle_start_probe(
             ((first, first_cause), first_left_init)
         }
         Some((found, found_cause, Some(true))) => {
-            let left = found.left_init != Some(false);
             let start_wins = penalized(&first) <= penalized(&found);
+            // A start that wins is the user's own, never left.
+            let left = found.left_init != Some(false) && !start_wins;
             (
                 (
                     verified_start_result(found, left, first, start_wins),
@@ -4474,7 +4475,8 @@ fn settle_start_probe(
 }
 
 /// What a restart leg reports once its start probe (#2707, [`ProbeWhen::DisplacementAloneRejects`])
-/// has answered, with the restart cause to carry on.
+/// has answered, with the restart cause to carry on and whether the reported point is the
+/// probe's (for the restart's warning, which names where the estimates come from).
 ///
 /// - `Some(true)` — the probe's result, through [`verified_start_result`] as for the first
 ///   attempt ([`settle_start_probe`]): the restart's point is an optimum an independent run
@@ -4482,38 +4484,46 @@ fn settle_start_probe(
 ///   restart's point when that is at or below the probe's. One difference: the published
 ///   `left_init` is the reported point's own, measured from the user's start, and
 ///   `stationary_start` its negation, whichever point wins.
-/// - `Some(false)` or `None` — the restart, unconverged as its own rule left it, with the
-///   probe's evaluations added. Unlike the first attempt's, no stall warning: the restart's
-///   start is the previous leg's estimates, not the user's, and a probe that went lower in
-///   `Some(false)` says only that the restart is not finished, which it is not reported to be.
+/// - `Some(false)` — the probe's result as it is, verdict, warnings and displacement its own:
+///   the probe ended more than [`START_PROBE_TOL`] below the restart, so the restart was not
+///   finished and the probe's is the better fit. Unlike the first attempt's (#2506), this is
+///   no stall to keep flagged: the restart's start is the previous leg's estimates, not the
+///   user's, and a fit does not publish a point worse than one it already reached.
+/// - `None` — the restart, unconverged as its own rule left it.
 ///
-/// No probe ran (`probed` is `None`) unless the restart did not leave its start and
-/// displacement was all its acceptance rule rejected it on.
+/// Every probe's evaluations count in `n_iterations`, whichever result is kept. No probe ran
+/// (`probed` is `None`) unless the restart did not leave its start and displacement was all
+/// its acceptance rule rejected it on.
 fn settle_restart_probe(
     restarted: (OuterResult, Option<RestartCause>),
     probed: Option<ProbedAttempt>,
     penalized: impl Fn(&OuterResult) -> f64,
-) -> (OuterResult, Option<RestartCause>) {
+) -> (OuterResult, Option<RestartCause>, bool) {
     let (mut restarted, cause) = restarted;
     match probed {
         Some((found, found_cause, Some(true))) => {
             let start_wins = penalized(&restarted) <= penalized(&found);
             // The displacement published is the reported point's own, from the user's start
-            // (both legs measure it against `escape_from`). `verified_start_result` reads a
-            // start that wins as the user's own start, never left; a restart's start is the
-            // previous leg's estimates, so that reading would publish a recovered fit as a
-            // stall at the inits.
+            // (both legs measure it against `escape_from`): a restart's start is the previous
+            // leg's estimates, so a restart whose point wins is not, as on the first attempt,
+            // a start the fit never left.
             let left = if start_wins { &restarted } else { &found }.left_init != Some(false);
-            let mut verified = verified_start_result(found, left, restarted, start_wins);
-            verified.left_init = Some(left);
-            verified.stationary_start = !left;
-            (verified, found_cause)
+            (
+                verified_start_result(found, left, restarted, start_wins),
+                found_cause,
+                !start_wins,
+            )
         }
-        Some((spent, _, _)) => {
+        Some((mut found, found_cause, Some(false))) => {
+            found.start_eval = restarted.start_eval;
+            found.n_iterations += restarted.n_iterations;
+            (found, found_cause, true)
+        }
+        Some((spent, _, None)) => {
             restarted.n_iterations += spent.n_iterations;
-            (restarted, cause)
+            (restarted, cause, false)
         }
-        None => (restarted, cause),
+        None => (restarted, cause, false),
     }
 }
 
@@ -4524,10 +4534,13 @@ fn settle_restart_probe(
 /// a start that was already the optimum (measured on `two_cpt_iv`, Linux), and a fit
 /// must not publish a point worse than one it already evaluated. When the start wins,
 /// everything tied to the point — estimates, objective, EBEs, covariance, final gradient
-/// — is the unmoved run's. `left` is whether the reported estimates are off the user's
-/// start by [`INIT_ESCAPE_STEP_S`] (never, when the start wins); within it the result is
-/// published `left_init = Some(false)` with `stationary_start = true`, which
-/// `model_selection::stalled_at_init` reads as a warm start rather than a stall. The
+/// — is the unmoved run's. `left` is whether the **reported** estimates are off the user's
+/// start by [`INIT_ESCAPE_STEP_S`], decided by the caller for the point that wins: on the
+/// first attempt the start that wins is the user's own, so never; on a restart leg it is the
+/// previous leg's estimates, so the restart's own displacement ([`settle_restart_probe`]).
+/// Within it the result is published `left_init = Some(false)` with
+/// `stationary_start = true`, which `model_selection::stalled_at_init` reads as a warm
+/// start rather than a stall. The
 /// unmoved run's evaluations count in `n_iterations`, and its `start_eval` — the fit's
 /// first evaluation, at the user's start — is the one published (#2461).
 fn verified_start_result(
@@ -4536,7 +4549,6 @@ fn verified_start_result(
     unmoved: OuterResult,
     start_wins: bool,
 ) -> OuterResult {
-    let left = left && !start_wins;
     probe.start_eval = unmoved.start_eval;
     probe.left_init = Some(left);
     probe.stationary_start = !left;
@@ -4699,8 +4711,9 @@ pub(crate) fn verify_unmoved_start(
             stalled
         }
         Some(true) => {
-            let left = off_start(&probe);
-            verified_start_result(probe, left, result, start_ofv <= probe_ofv)
+            let start_wins = start_ofv <= probe_ofv;
+            let left = off_start(&probe) && !start_wins;
+            verified_start_result(probe, left, result, start_wins)
         }
         None => OuterResult {
             n_iterations: result.n_iterations + probe.n_iterations,
@@ -5595,7 +5608,7 @@ pub(crate) fn optimize_nlopt(
             true,
             probe.map(|p| (p, ProbeWhen::DisplacementAloneRejects)),
         );
-        let (mut restarted, restarted_cause) = settle_restart_probe(
+        let (mut restarted, restarted_cause, from_probe) = settle_restart_probe(
             (restarted, restarted_outcome.restart_cause()),
             probe.and_then(|_| probed.take()),
             &penalized,
@@ -5616,9 +5629,10 @@ pub(crate) fn optimize_nlopt(
                     options.optimizer,
                     stalled.ofv,
                     stalled.n_iterations,
+                    from_probe,
                 ),
                 RestartCause::BasinShift => {
-                    basin_shift_restart_warning(stalled.ofv, stalled.n_iterations)
+                    basin_shift_restart_warning(stalled.ofv, stalled.n_iterations, from_probe)
                 }
             });
         }
@@ -9408,15 +9422,29 @@ fn mid_descent_restart_warning(
     optimizer: Optimizer,
     stalled_ofv: f64,
     stalled_evals: usize,
+    from_probe: bool,
 ) -> String {
     format!(
         "Outer optimizer ({}) stopped mid-descent (bare Failure at OFV = {:.6} after {} \
          evaluations) and was resumed from the best point seen on the remaining maxiter \
-         budget; the reported estimates are from the resumed run.",
+         budget; {}",
         optimizer.label(),
         stalled_ofv,
         stalled_evals,
+        restart_provenance(from_probe),
     )
+}
+
+/// The closing clause of a restart's warning: where the reported estimates come from. When
+/// the resumed run did not leave its start and its #2707 start probe reported a lower point
+/// ([`settle_restart_probe`]), they are the probe's, not the resumed run's.
+fn restart_provenance(from_probe: bool) -> &'static str {
+    if from_probe {
+        "the resumed run did not leave its start, and the reported estimates are from a \
+         restart from a perturbation of that point, which reached a lower objective."
+    } else {
+        "the reported estimates are from the resumed run."
+    }
 }
 
 /// The `FitResult` warning a fit carries when it was restarted for a basin shift
@@ -9424,13 +9452,18 @@ fn mid_descent_restart_warning(
 /// files it under `optimizer_health` with the #1277 notice: the gap itself was
 /// resolved (had it survived, the restart's own `W_EBE_START_DEPENDENT` would say so),
 /// so what remains to report is that the fit took a second leg, and why.
-fn basin_shift_restart_warning(first_cold_ofv: f64, first_evals: usize) -> String {
+fn basin_shift_restart_warning(
+    first_cold_ofv: f64,
+    first_evals: usize,
+    from_probe: bool,
+) -> String {
     format!(
         "Outer optimization had minimised against empirical Bayes estimates that some \
          subjects held in a higher individual mode than a cold re-solve finds (cold OFV = \
          {first_cold_ofv:.6} after {first_evals} evaluations, below the objective the \
          optimizer saw there), and was resumed from the best point seen with cold EBEs on \
-         the remaining maxiter budget; the reported estimates are from the resumed run."
+         the remaining maxiter budget; {}",
+        restart_provenance(from_probe),
     )
 }
 

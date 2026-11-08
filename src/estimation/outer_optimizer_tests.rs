@@ -5390,7 +5390,7 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert_eq!(entry.category, crate::types::WarningCode::EbeStartDependent);
     assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
 
-    let r = basin_shift_restart_warning(-143.472619, 47);
+    let r = basin_shift_restart_warning(-143.472619, 47, false);
     assert!(
         r.contains("cold OFV = -143.472619 after 47 evaluations"),
         "{r}"
@@ -5402,6 +5402,37 @@ fn the_basin_shift_messages_report_what_was_measured() {
     );
     let entry = crate::types::classify_warning(&r);
     assert_eq!(entry.category, crate::types::WarningCode::OptimizerHealth);
+}
+
+/// #2707: both restart notices name where the reported estimates come from — the resumed
+/// run, or, when that run did not leave its start and its start probe reported a lower point
+/// (`settle_restart_probe`), the probe. Each clause is asserted with the other's absence, on
+/// both notices, so a notice stuck on either clause fails; the category is the same either
+/// way (`classify_warning` keys on "resumed from the best point seen").
+#[test]
+fn a_restart_notice_names_the_run_its_estimates_come_from() {
+    let resumed = "the reported estimates are from the resumed run.";
+    let probe = "the resumed run did not leave its start, and the reported estimates are from \
+                 a restart from a perturbation of that point, which reached a lower objective.";
+    for from_probe in [false, true] {
+        for w in [
+            basin_shift_restart_warning(-143.472619, 47, from_probe),
+            mid_descent_restart_warning(
+                crate::types::Optimizer::NloptLbfgs,
+                -143.472619,
+                47,
+                from_probe,
+            ),
+        ] {
+            assert!(w.ends_with(if from_probe { probe } else { resumed }), "{w}");
+            assert!(!w.contains(if from_probe { resumed } else { probe }), "{w}");
+            assert_eq!(
+                crate::types::classify_warning(&w).category,
+                crate::types::WarningCode::OptimizerHealth,
+                "{w}"
+            );
+        }
+    }
 }
 
 /// #2013 / #2095: the screen's and twin seed's warning, one assertion per sentence a reader acts on — what moved
@@ -15004,7 +15035,7 @@ fn a_verified_start_takes_every_point_field_from_the_lower_run() {
             params: off.clone(),
             ..tagged(2.0, crate::types::CovarianceMethod::Sandwich)
         };
-        let result = verified_start_result(probe, true, unmoved, start_wins);
+        let result = verified_start_result(probe, !start_wins, unmoved, start_wins);
         let want = if start_wins { 1.0 } else { 2.0 };
         for (field, got) in point(&result) {
             assert_eq!(got, want, "start wins = {start_wins}: `{field}`");
@@ -15118,10 +15149,13 @@ fn a_restart_is_probed_only_when_displacement_alone_rejects_it() {
 /// the probe's verdict, warnings and restart cause through `verified_start_result`, at the
 /// lower of the two points; any other verdict reports the restart as its own rule left it —
 /// unconverged, its own warnings and cause, and **no** "stalled on its initial estimates"
-/// warning, since a restart starts at the previous leg's estimates, not the user's. The
-/// probe's evaluations count every time it ran; with no probe the restart is untouched.
+/// warning, since a restart starts at the previous leg's estimates, not the user's. A probe
+/// that went lower (`Some(false)`) is reported as it is — its verdict, warnings, cause and
+/// displacement — since the restart was not finished and this is no stall at the user's
+/// inits to keep flagged. The probe's evaluations count every time it ran; with no probe the
+/// restart is untouched.
 #[test]
-fn a_restart_probe_reports_a_verified_restart_and_leaves_any_other_one_as_it_was() {
+fn a_restart_probe_reports_a_verified_or_lower_probe_and_leaves_any_other_restart_as_it_was() {
     let (model, pop) = two_cpt_iv_fixture();
     let opts = options_2506(crate::types::Optimizer::NloptLbfgs);
     let init = model.default_params.clone();
@@ -15140,14 +15174,16 @@ fn a_restart_probe_reports_a_verified_restart_and_leaves_any_other_one_as_it_was
     let restart_ofv = restarted().ofv;
     let restart_cause = Some(RestartCause::MidDescent);
     let probe_cause = Some(RestartCause::BasinShift);
-    for (verdict, probe_delta, reports_probe, restart_left) in [
-        (Some(true), -1e-3, true, true),
-        (Some(true), -1e-3, true, false),
+    for (verdict, probe_delta, reports_probe, restart_left, probe_converged) in [
+        (Some(true), -1e-3, true, true, true),
+        (Some(true), -1e-3, true, false, true),
         // Verified but higher: the restart's own point, with the probe's verdict.
-        (Some(true), 1e-3, false, true),
-        (Some(true), 1e-3, false, false),
-        (Some(false), -1.0, false, true),
-        (None, -1e-3, false, true),
+        (Some(true), 1e-3, false, true, true),
+        (Some(true), 1e-3, false, false, true),
+        // Lower: the probe's result, whatever its own verdict.
+        (Some(false), -1.0, true, true, true),
+        (Some(false), -1.0, true, false, false),
+        (None, -1e-3, false, true, true),
     ] {
         let label = format!(
             "{verdict:?}, probe − restart = {probe_delta:+e}, restart left the user's start \
@@ -15155,23 +15191,28 @@ fn a_restart_probe_reports_a_verified_restart_and_leaves_any_other_one_as_it_was
         );
         let probe = OuterResult {
             ofv: restart_ofv + probe_delta,
-            converged: true,
+            converged: probe_converged,
             warnings: vec![probe_tag.to_string()],
             left_init: Some(true),
             n_iterations: 4,
             ..evaluate_at_initial_params(&model, &pop, &off, &opts)
         };
-        let (result, cause) = settle_restart_probe(
+        let (result, cause, from_probe) = settle_restart_probe(
             (restarted_at(restart_left), restart_cause),
             Some((probe, probe_cause, verdict)),
             |r| r.ofv,
         );
-        let verified = verdict == Some(true);
         assert_eq!(
             pack_params(&result.params) != init_packed,
             reports_probe,
             "{label}: which point is reported"
         );
+        assert_eq!(
+            from_probe, reports_probe,
+            "{label}: the notice's provenance"
+        );
+        // The probe's run stands whenever its verdict is not `None`: verified, or lower.
+        let probe_run = verdict.is_some();
         assert_eq!(
             (
                 result.converged,
@@ -15180,10 +15221,14 @@ fn a_restart_probe_reports_a_verified_restart_and_leaves_any_other_one_as_it_was
                 cause,
             ),
             (
-                verified,
-                verified,
-                !verified,
-                if verified { probe_cause } else { restart_cause }
+                if probe_run { probe_converged } else { false },
+                probe_run,
+                !probe_run,
+                if probe_run {
+                    probe_cause
+                } else {
+                    restart_cause
+                }
             ),
             "{label}: whose verdict, warnings and restart cause: {:?}",
             result.warnings
@@ -15198,14 +15243,19 @@ fn a_restart_probe_reports_a_verified_restart_and_leaves_any_other_one_as_it_was
         );
         assert_eq!(result.n_iterations, 11, "{label}: both legs count");
         // The published displacement is the reported point's own, from the user's start:
-        // the probe's (`Some(true)`) when it wins, else the restart's. A verified restart
-        // whose own point wins is not read as a start the fit never left, which is what
-        // `verified_start_result` alone would publish (`Some(false)`, stationary).
+        // the probe's when it is reported, else the restart's. A verified restart whose own
+        // point wins is not read as a start the fit never left (`Some(false)`, stationary).
         let left = if reports_probe { true } else { restart_left };
         assert_eq!(result.left_init, Some(left), "{label}");
-        assert_eq!(result.stationary_start, verified && !left, "{label}");
+        assert_eq!(
+            result.stationary_start,
+            verdict == Some(true) && !left,
+            "{label}"
+        );
     }
-    let (result, cause) = settle_restart_probe((restarted(), restart_cause), None, |r| r.ofv);
+    let (result, cause, from_probe) =
+        settle_restart_probe((restarted(), restart_cause), None, |r| r.ofv);
+    assert!(!from_probe, "no probe: the restart's own notice");
     assert_eq!(
         (
             result.n_iterations,
