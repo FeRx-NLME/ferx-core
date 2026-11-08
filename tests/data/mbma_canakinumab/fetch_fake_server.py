@@ -64,6 +64,9 @@ WRONG_B = GOOD + b"\n\n"
 TRICKLE = "trickle"
 HTTP_500 = "500"
 SILENT = "silent"
+TRICKLE_THEN_STALL = "trickle_then_stall"
+TRUNCATED = "truncated"
+SLOW_HEADERS = "slow_headers"
 
 SCENARIOS = {
     "wrong_then_right": [payload(WRONG_A), payload(GOOD)],
@@ -74,6 +77,10 @@ SCENARIOS = {
     "always_500": [HTTP_500],
     "trickle": [TRICKLE],
     "silent": [SILENT],
+    "same_wrong_then_trickle": [payload(WRONG_A), payload(WRONG_A), TRICKLE],
+    "trickle_then_stall": [TRICKLE_THEN_STALL],
+    "truncated_then_right": [TRUNCATED, payload(GOOD)],
+    "slow_headers": [SLOW_HEADERS],
 }
 replies = SCENARIOS[scenario]
 hits = []
@@ -94,17 +101,47 @@ class Handler(BaseHTTPRequestHandler):
             # Accept the request and never answer: only a socket timeout ends it.
             time.sleep(WATCHDOG_SECONDS + 5)
             return
-        if reply == TRICKLE:
+        if reply == SLOW_HEADERS:
+            # Trickle the response *headers* for ~2.5 s, then send a whole valid body:
+            # `urlopen` itself returns after a 2 s deadline, before any body read.
+            whole = payload(GOOD)
+            try:
+                self.wfile.write(b"HTTP/1.0 200 OK\r\nX-Slow: ")
+                for _ in range(25):
+                    self.wfile.write(b"z")
+                    self.wfile.flush()
+                    time.sleep(0.1)
+                self.wfile.write(f"\r\nContent-Length: {len(whole)}\r\n\r\n".encode())
+                self.wfile.write(whole)
+            except OSError:
+                pass
+            self.close_connection = True
+            return
+        if reply == TRUNCATED:
+            # Promise the whole payload, send half of it, close the connection.
+            whole = payload(GOOD)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(whole)))
+            self.end_headers()
+            self.wfile.write(whole[: len(whole) // 2])
+            self.close_connection = True
+            return
+        if reply in (TRICKLE, TRICKLE_THEN_STALL):
             self.send_response(200)
             self.send_header("Content-Length", "10000000")
             self.end_headers()
+            # TRICKLE_THEN_STALL sends bytes for 1.8 s, then goes silent: a socket
+            # timeout set once at open would let the stalled read outlast the deadline.
+            until = time.monotonic() + (1.8 if reply == TRICKLE_THEN_STALL else 1e9)
             try:
-                while True:
+                while time.monotonic() < until:
                     self.wfile.write(b"P")
                     self.wfile.flush()
                     time.sleep(0.1)
+                time.sleep(WATCHDOG_SECONDS + 5)
             except OSError:
-                return
+                pass
+            return
         self.send_response(200)
         self.send_header("Content-Length", str(len(reply)))
         self.end_headers()
@@ -123,8 +160,19 @@ server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 server.daemon_threads = True
 threading.Thread(target=server.serve_forever, daemon=True).start()
 
+# A virtual clock for the script: `sleep` returns at once but moves its `monotonic`
+# forward by the requested amount, so the backoff spends deadline without spending
+# wall time, and the server threads keep the real `time`.
 sleeps = []
-m.time = types.SimpleNamespace(monotonic=time.monotonic, sleep=lambda s: sleeps.append(s))
+
+
+def virtual_sleep(s):
+    sleeps.append(s)
+
+
+m.time = types.SimpleNamespace(
+    monotonic=lambda: time.monotonic() + sum(sleeps), sleep=virtual_sleep
+)
 m.URL = f"http://127.0.0.1:{server.server_address[1]}/supplementaryFiles"
 m.UPSTREAM_SHA256 = hashlib.sha256(GOOD).hexdigest()
 m.DERIVED_SHA256 = hashlib.sha256(m.derive(GOOD)).hexdigest()
@@ -145,6 +193,7 @@ except SystemExit as e:
 print(f"ELAPSED: {time.monotonic() - t0:.2f}")
 print(f"HITS: {len(hits)}")
 print(f"SLEEPS: {len(sleeps)}")
+print(f"SLEEP_TOTAL: {sum(sleeps):.3f}")
 try:
     written = hashlib.sha256(open(out, "rb").read()).hexdigest() == m.DERIVED_SHA256
 except OSError:

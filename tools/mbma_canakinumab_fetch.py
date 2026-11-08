@@ -64,9 +64,11 @@ final model (run r03) uses none of them.
 import argparse
 import csv
 import hashlib
+import http.client
 import io
 import math
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -112,23 +114,48 @@ def read_within(url, timeout, deadline):
     """The response body of `url`; `TimeoutError` once `deadline` (monotonic) passes.
 
     `urlopen(timeout=...)` limits each socket operation, not the download: a server
-    that trickles bytes never trips it (#1938). So no blocking call may outlast the
-    time left, and the deadline is re-checked after every chunk.
+    that trickles bytes never trips it (#1938). So the request opens with at most the
+    time left, and before every read the socket timeout is re-set to
+    `min(timeout, time left)`: no read outlasts the deadline, including one that
+    stalls after the body has started.
     """
+    # The caller's loop only starts an attempt with time left, so this is positive.
     left = deadline - time.monotonic()
-    if left <= 0:
-        raise TimeoutError("deadline reached before the request")
     # URL is the https constant above, never user input (asserted in main).
     with urllib.request.urlopen(url, timeout=min(timeout, left)) as r:  # nosec B310
+        # The connection's socket, to re-cap per read. It is private CPython API, so
+        # if it is ever missing the fetch still works and only loses the re-cap: the
+        # worst case is then the deadline plus one `timeout`, which the workflow's
+        # budget test already counts.
+        sock = getattr(getattr(r.fp, "raw", None), "_sock", None)
         parts = []
         while True:
-            chunk = r.read1(1 << 16)
-            if not chunk:
-                return b"".join(parts)
-            parts.append(chunk)
-            if time.monotonic() >= deadline:
+            left = deadline - time.monotonic()
+            if left <= 0:
                 got = sum(len(p) for p in parts)
                 raise TimeoutError(f"deadline reached mid-download ({got} bytes received)")
+            if sock is not None:
+                sock.settimeout(min(timeout, left))
+            try:
+                chunk = r.read1(1 << 16)
+            except socket.timeout:
+                # A read cut by the time left is the deadline, and is reported as one;
+                # a read cut by `timeout` is a stalled server, and stays a timeout.
+                if left < timeout:
+                    got = sum(len(p) for p in parts)
+                    raise TimeoutError(
+                        f"deadline reached mid-download ({got} bytes received)"
+                    ) from None
+                raise
+            if not chunk:
+                break
+            parts.append(chunk)
+        body = b"".join(parts)
+        # `read1` returns b"" when the server closes early, where `read()` raised;
+        # `length` is what Content-Length promised and has not arrived.
+        if r.length:
+            raise http.client.IncompleteRead(body, r.length)
+        return body
 
 
 def attempt(url, timeout, deadline):
@@ -145,7 +172,11 @@ def attempt(url, timeout, deadline):
     # The endpoint always answers with a zip; anything else is a garbled reply, not
     # a bare CSV to hash.
     if not zipfile.is_zipfile(io.BytesIO(blob)):
-        raise AttemptFailed(f"unreadable payload: not a zip ({len(blob)} bytes)")
+        # Show the start of it: on CI it has been a short non-zip body three times in a
+        # row (run 42516551049, 292 bytes), and its text is the only clue what it was.
+        raise AttemptFailed(
+            f"unreadable payload: not a zip ({len(blob)} bytes): {blob[:120]!r}"
+        )
     try:
         raw = upstream_csv(blob)
     except (ValueError, zipfile.BadZipFile, KeyError, EOFError) as e:
@@ -161,43 +192,55 @@ def fetch_upstream(attempts, timeout, deadline_seconds):
     `deadline_seconds` budget run out; then exit with a report naming every attempt."""
     deadline = time.monotonic() + deadline_seconds
     failed = []
-    out_of_time = False
     for i in range(attempts):
+        # The one deadline gate: no attempt starts without time left.
+        if time.monotonic() >= deadline:
+            break
         print(f"downloading {URL} (attempt {i + 1}/{attempts}) ...", file=sys.stderr)
         try:
             return attempt(URL, timeout, deadline)
         except AttemptFailed as e:
             failed.append(e)
             print(f"attempt {i + 1}: {e.log}", file=sys.stderr)
-        if i + 1 == attempts:
-            break  # no sleep after the last attempt
-        left = deadline - time.monotonic()
-        if left > 0:
-            time.sleep(min(BACKOFF_SECONDS * (i + 1), left))
-        if deadline - time.monotonic() <= 0:
-            out_of_time = True
-            break
+        if i + 1 < attempts:  # no sleep after the last attempt
+            time.sleep(max(0.0, min(BACKOFF_SECONDS * (i + 1), deadline - time.monotonic())))
+    out_of_time = time.monotonic() >= deadline
     sys.exit(fetch_report(failed, out_of_time, deadline_seconds))
 
 
 def fetch_report(failed, out_of_time, deadline_seconds):
-    """The exit message once every attempt failed: the verdict, then one line each."""
+    """The exit message once every attempt failed: the verdict, then one line each.
+
+    The verdict reads the complete downloads' hashes only. A transport error or an
+    unreadable payload says nothing about the file, so it neither confirms nor
+    contradicts a repeated hash.
+    """
     n = len(failed)
-    shas = {e.sha for e in failed}
-    if n >= 2 and len(shas) == 1 and None not in shas:
+    hashes = [e.sha for e in failed if e.sha is not None]
+    distinct = set(hashes)
+    if len(hashes) >= 2 and len(distinct) == 1:
         lines = [
-            f"upstream {INNER_CSV} hashed sha256 {failed[0].sha} on all {n} attempts, "
-            f"not the pinned {UPSTREAM_SHA256}.",
-            "The same wrong hash on every attempt means the upstream file really changed: "
-            "inspect it, then re-pin UPSTREAM_SHA256 (and DERIVED_SHA256) deliberately.",
+            f"upstream {INNER_CSV} hashed sha256 {hashes[0]} on all {len(hashes)} "
+            f"complete downloads, not the pinned {UPSTREAM_SHA256}.",
+            "The same wrong hash on every complete download means the upstream file "
+            "really changed: inspect it, then re-pin UPSTREAM_SHA256 (and "
+            "DERIVED_SHA256) deliberately.",
         ]
     else:
         lines = [
             f"no attempt of {n} delivered the pinned upstream {INNER_CSV} "
             f"(sha256 {UPSTREAM_SHA256}).",
-            "Mixed hashes or transport errors mean the endpoint is flaky, not that the "
-            "file changed: re-run the fetch, and do not re-pin.",
         ]
+        if len(distinct) >= 2:
+            lines.append(
+                f"{len(distinct)} different wrong hashes mean the endpoint is flaky, not "
+                "that the file changed: re-run the fetch, and do not re-pin."
+            )
+        else:
+            lines.append(
+                "Fewer than two complete downloads cannot tell a changed file from a "
+                "flaky endpoint: re-run the fetch."
+            )
     if out_of_time:
         lines.append(f"Stopped at the {deadline_seconds:g} s --deadline-seconds budget.")
     lines += [f"  attempt {i + 1}: {e.log}" for i, e in enumerate(failed)]
@@ -277,9 +320,9 @@ def main():
     ap.add_argument(
         "--deadline-seconds",
         type=float,
-        default=780,
-        help="wall-time budget for all attempts and backoffs together (default 780 = "
-        "13 min, inside slow-tests.yml's 15-min step cap)",
+        default=720,
+        help="wall-time budget for all attempts and backoffs together (default 720 = "
+        "12 min: plus one --timeout, inside slow-tests.yml's 15-min step cap)",
     )
     ap.add_argument(
         "--check",
@@ -287,6 +330,10 @@ def main():
         help="only verify that --out already holds the pinned derived file; exit 1 if not",
     )
     a = ap.parse_args()
+    if a.attempts < 1:
+        ap.error(f"--attempts: must be at least 1, got {a.attempts}")
+    if not (a.timeout > 0 and a.deadline_seconds > 0):
+        ap.error("--timeout and --deadline-seconds must be positive")
     if a.check:
         try:
             got = hashlib.sha256(open(a.out, "rb").read()).hexdigest()
